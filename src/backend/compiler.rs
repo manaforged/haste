@@ -27,8 +27,38 @@ fn compiler() -> std::sync::mpsc::Sender<CompileJob> {
         .clone()
 }
 
-pub fn forget_compiler() {
-    std::mem::forget(COMPILER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take());
+type Held = (
+    std::sync::MutexGuard<'static, Option<std::sync::mpsc::Sender<CompileJob>>>,
+    std::sync::MutexGuard<'static, Option<crate::patch::Engine>>,
+);
+
+std::thread_local! {
+    static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+}
+
+extern "C" fn before_fork() {
+    let compiler = COMPILER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let engine = crate::patch::ENGINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    HELD.set(Some((compiler, engine)));
+}
+
+extern "C" fn after_fork_parent() {
+    HELD.take();
+}
+
+extern "C" fn after_fork_child() {
+    if let Some((mut compiler, _engine)) = HELD.take() {
+        std::mem::forget(compiler.take());
+    }
+}
+
+pub fn watch_forks() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: the three handlers are plain functions that stay valid for the life of the process.
+        let failed = unsafe { libc::pthread_atfork(Some(before_fork), Some(after_fork_parent), Some(after_fork_child)) };
+        assert_eq!(failed, 0, "fork handlers registered");
+    });
 }
 
 pub extern "C" fn compile_slot(slot: u64) {

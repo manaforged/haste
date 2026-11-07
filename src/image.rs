@@ -26,7 +26,6 @@ fn words(bytes: &[u8]) -> Vec<u64> {
 }
 
 fn child(table: &'static [std::sync::atomic::AtomicUsize], slot: usize, mut report: std::io::PipeWriter) -> ! {
-    backend::forget_compiler();
     let started = Instant::now();
     let value = call(table, slot, INPUT);
     let program_us = started.elapsed().as_micros() as u64;

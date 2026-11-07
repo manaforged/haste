@@ -8,6 +8,7 @@ mod index;
 #[cfg(target_os = "macos")]
 mod park;
 mod patch;
+mod script;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -22,7 +23,7 @@ use hir_ty::db::HirDatabase;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use project_model::{CargoConfig, RustLibSource};
 
-const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | index PATH | demand PATH ENTRY | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH";
+const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | index PATH | demand PATH ENTRY | scripts PATH | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH";
 
 fn main() -> Result<()> {
     let program = std::thread::Builder::new().name("program".to_owned()).stack_size(patch::PROGRAM_STACK).spawn(|| {
@@ -58,6 +59,9 @@ fn program() -> Result<()> {
         index::oracle::run(&db, &vfs);
         index::headers::run(&db, &vfs);
         return Ok(());
+    }
+    if args[0] == "scripts" {
+        return script::run(db, &path);
     }
     if args[0] == "demand" {
         return demand::run(db, args.get(2).context(USAGE)?);

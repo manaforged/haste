@@ -7,7 +7,7 @@ use hir_def::{AdtId, ImplId, Lookup};
 use hir_ty::attach_db;
 use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::{Ty, TyKind};
-use rustc_type_ir::inherent::{AdtDef as _, IntoKind};
+use rustc_type_ir::inherent::IntoKind;
 use vfs::{FileId, Vfs};
 
 use super::{Head, Header, Kind, Scanned, scan_all};

@@ -19,7 +19,7 @@ use rustc_abi::{TagEncoding, Variants};
 use super::{Lower, Place, intrinsic};
 use crate::backend::{Key, Sig};
 
-const EVALUATOR_ADDRESSES: usize = 1 << 60;
+const EVALUATOR_ADDRESSES: usize = 1 << 59;
 
 fn leak(bytes: &[u8]) -> usize {
     let words = bytes.len().div_ceil(8).max(1);
@@ -239,7 +239,14 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn relocate(&mut self, reloc: &mut Reloc<'_, 'db>, ty: Ty<'db>, at: usize) -> Result<(), String> {
         match ty.kind() {
-            TyKind::Ref(_, inner, _) | TyKind::RawPtr(inner, _) => self.relocate_pointer(reloc, inner, at),
+            TyKind::Ref(_, inner, _) => {
+                self.relocate_pointer(reloc, inner, at)?;
+                if read_word(at) == 0 {
+                    write_word(at, self.layout(inner)?.align.abi.bytes() as usize);
+                }
+                Ok(())
+            }
+            TyKind::RawPtr(inner, _) => self.relocate_pointer(reloc, inner, at),
             TyKind::FnPtr(..) => {
                 let id = read_word(at);
                 let target = reloc.map.vtable_ty(id).map_err(|error| format!("fn pointer constant: {error:?}"))?;

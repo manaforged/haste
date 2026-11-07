@@ -30,7 +30,7 @@ mod compiler;
 mod slots;
 mod specialize;
 
-pub use compiler::{compile_slot, forget_compiler};
+pub use compiler::{compile_slot, watch_forks};
 pub use slots::{Key, Sig, Slots};
 use slots::TABLE_SLOTS;
 

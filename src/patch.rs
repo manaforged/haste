@@ -42,6 +42,7 @@ pub static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 pub(crate) fn start(db: RootDatabase, dump: bool, verbose: bool) -> Result<()> {
     let backend = Backend::new(dump, verbose)?;
     *lock() = Some(Engine { db, backend });
+    crate::backend::watch_forks();
     Ok(())
 }
 
