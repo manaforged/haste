@@ -153,6 +153,10 @@ impl Backend {
         })
     }
 
+    pub fn functions(&self) -> Vec<FunctionId> {
+        self.slots.functions()
+    }
+
     pub fn table(&self) -> &'static [AtomicUsize] {
         self.slots.table
     }

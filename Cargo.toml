@@ -13,6 +13,7 @@ either = "1"
 libc = "0.2"
 triomphe = "0.1"
 rustc_abi = { package = "ra-ap-rustc_abi", version = "0.166", default-features = false }
+rustc_lexer = { package = "ra-ap-rustc_lexer", version = "0.180", default-features = false }
 rustc_type_ir = { package = "ra-ap-rustc_type_ir", version = "0.166", default-features = false }
 base-db = { path = "ra/crates/base-db" }
 hir-def = { path = "ra/crates/hir-def" }

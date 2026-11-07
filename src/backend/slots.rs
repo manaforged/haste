@@ -50,6 +50,14 @@ pub struct Slots {
 }
 
 impl Slots {
+    pub fn functions(&self) -> Vec<FunctionId> {
+        let plain = |info: &SlotInfo| match &info.key {
+            Key::Func(function, _) | Key::Derive(_, function, _) => Some(*function),
+            _ => None,
+        };
+        self.info.iter().filter_map(plain).collect()
+    }
+
     pub fn sig_of(&self, slot: usize) -> Sig {
         self.info[slot].sig
     }

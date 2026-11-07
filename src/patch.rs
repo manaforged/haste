@@ -57,15 +57,7 @@ pub(crate) fn with_engine<T>(work: impl FnOnce(&dyn HirDatabase, &mut Backend) -
     attach_db(db, || work(db, backend))
 }
 
-pub fn run(mut db: RootDatabase, vfs: &Vfs, root: &Path, entry: &str, edits: &Path, dump: bool) -> Result<()> {
-    let edits = read_edits(edits)?;
-    let mut texts = HashMap::new();
-    let (seeds, edits): (Vec<&Edit>, Vec<&Edit>) = edits.iter().partition(|edit| edit.label == "seed");
-    for seed in seeds {
-        apply(&mut db, vfs, root, &mut texts, seed)?;
-    }
-    start(db, dump, true)?;
-    let started = Instant::now();
+pub(crate) fn launch(entry: &str) -> Result<(&'static [AtomicUsize], usize)> {
     let (slot, callable, table) = with_engine(|db, backend| {
         let func = crate::find(db, entry).map_err(|e| e.to_string())?;
         let (slot, callable) = backend.entry(db, func)?;
@@ -75,6 +67,19 @@ pub fn run(mut db: RootDatabase, vfs: &Vfs, root: &Path, entry: &str, edits: &Pa
     if !callable {
         bail!("{entry} is not (i64) -> i64");
     }
+    Ok((table, slot))
+}
+
+pub fn run(mut db: RootDatabase, vfs: &Vfs, root: &Path, entry: &str, edits: &Path, dump: bool) -> Result<()> {
+    let edits = read_edits(edits)?;
+    let mut texts = HashMap::new();
+    let (seeds, edits): (Vec<&Edit>, Vec<&Edit>) = edits.iter().partition(|edit| edit.label == "seed");
+    for seed in seeds {
+        apply(&mut db, vfs, root, &mut texts, seed)?;
+    }
+    start(db, dump, true)?;
+    let started = Instant::now();
+    let (table, slot) = launch(entry)?;
     let first = crate::backend::call(table, slot, 20);
     println!("first call: total_us={} entry(20)={first} compiled={}", started.elapsed().as_micros(), compiled());
     if dump {

@@ -3,6 +3,8 @@ mod fault;
 mod collect;
 mod lower;
 mod image;
+mod demand;
+mod index;
 #[cfg(target_os = "macos")]
 mod park;
 mod patch;
@@ -20,7 +22,7 @@ use hir_ty::db::HirDatabase;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use project_model::{CargoConfig, RustLibSource};
 
-const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH";
+const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | index PATH | demand PATH ENTRY | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH";
 
 fn main() -> Result<()> {
     let program = std::thread::Builder::new().name("program".to_owned()).stack_size(patch::PROGRAM_STACK).spawn(|| {
@@ -46,9 +48,20 @@ fn program() -> Result<()> {
         num_worker_threads: 1,
         proc_macro_processes: PROC_MACRO_PROCESSES,
     };
+    if args[0] == "demand" {
+        base_db::demand::enable();
+    }
     let started = Instant::now();
     let (db, vfs, _proc) = load_workspace_at(&path, &config, &load, &|_| {})?;
     println!("load {:.2}s", started.elapsed().as_secs_f64());
+    if args[0] == "index" {
+        index::oracle::run(&db, &vfs);
+        index::headers::run(&db, &vfs);
+        return Ok(());
+    }
+    if args[0] == "demand" {
+        return demand::run(db, args.get(2).context(USAGE)?);
+    }
     let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
     let primed = Instant::now();
     ide_db::prime_caches::prime_semantics(&db, &all_crates(&db), cores);
