@@ -2,6 +2,9 @@ mod backend;
 mod fault;
 mod collect;
 mod lower;
+mod image;
+#[cfg(target_os = "macos")]
+mod park;
 mod patch;
 
 use std::path::PathBuf;
@@ -17,10 +20,19 @@ use hir_ty::db::HirDatabase;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use project_model::{CargoConfig, RustLibSource};
 
-const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | coverage PATH CRATE | check PATH";
+const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH";
 
 fn main() -> Result<()> {
-    fault::install();
+    let program = std::thread::Builder::new().name("program".to_owned()).stack_size(patch::PROGRAM_STACK).spawn(|| {
+        fault::install();
+        program()
+    })?;
+    program.join().map_err(|_| anyhow::anyhow!("the program thread panicked"))?
+}
+
+const PROC_MACRO_PROCESSES: usize = 4;
+
+fn program() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let path = std::path::absolute(PathBuf::from(args.get(1).context(USAGE)?))?;
     let config = CargoConfig {
@@ -32,11 +44,15 @@ fn main() -> Result<()> {
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,
         prefill_caches: false,
         num_worker_threads: 1,
-        proc_macro_processes: 1,
+        proc_macro_processes: PROC_MACRO_PROCESSES,
     };
     let started = Instant::now();
     let (db, vfs, _proc) = load_workspace_at(&path, &config, &load, &|_| {})?;
     println!("load {:.2}s", started.elapsed().as_secs_f64());
+    let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let primed = Instant::now();
+    ide_db::prime_caches::prime_semantics(&db, &all_crates(&db), cores);
+    println!("prime {:.2}s", primed.elapsed().as_secs_f64());
     match args[0].as_str() {
         "collect" => {
             let main = find(&db, "main")?;
@@ -48,6 +64,11 @@ fn main() -> Result<()> {
             let edits = args.get(3).context(USAGE)?;
             let dump = args.get(4).is_some_and(|arg| arg == "dump");
             patch::run(db, &vfs, &path, entry, edits.as_ref(), dump)
+        }
+        "image" => {
+            let entry = args.get(2).context(USAGE)?;
+            let edits = args.get(3).context(USAGE)?;
+            image::run(db, &vfs, &path, entry, edits.as_ref())
         }
         "check" => patch::check(db, &args[2..]),
         "coverage" => {

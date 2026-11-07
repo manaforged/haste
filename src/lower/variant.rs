@@ -3,7 +3,7 @@ use cranelift_codegen::ir::{InstBuilder, Type, Value, types};
 use hir_def::{AdtId, VariantId};
 use hir_ty::layout::{Layout, RustcEnumVariantIdx};
 use hir_ty::next_solver::TyKind;
-use rustc_abi::{Primitive, Scalar as AbiScalar, TagEncoding, Variants};
+use rustc_abi::{FieldsShape, Primitive, Scalar as AbiScalar, TagEncoding, Variants};
 use rustc_type_ir::inherent::IntoKind;
 
 use super::{Lower, Place};
@@ -45,7 +45,15 @@ impl<'db> Lower<'_, '_, 'db> {
         fields: &[Place<'db>],
     ) -> Result<(), String> {
         let layout = self.layout(dest.ty.ty)?;
+        let absent = matches!((variant, &layout.variants), (VariantId::EnumVariantId(id), Variants::Single { index }) if index.0 != id.index(self.db) as usize);
+        if absent || layout.is_uninhabited() {
+            self.trap_and_continue();
+            return Ok(());
+        }
         let shape = self.variant_fields(&layout, Some(variant))?;
+        if fields.len() > shape.fields.count() || matches!(shape.fields, FieldsShape::Primitive) && !fields.is_empty() {
+            return Err(format!("{} fields into {:?} of shape {:?} variant {variant:?}", fields.len(), dest.ty.ty, shape.fields));
+        }
         for (index, field) in fields.iter().enumerate() {
             let size = self.layout(field.ty.ty)?.size.bytes();
             let to = self.builder.ins().iadd_imm(dest.addr, shape.fields.offset(index).bytes() as i64);

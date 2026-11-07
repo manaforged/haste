@@ -11,7 +11,6 @@ use hir_ty::next_solver::infer::traits::{Obligation, ObligationCause};
 use hir_ty::next_solver::obligation_ctxt::ObligationCtxt;
 use hir_ty::next_solver::{AnyImplId, DbInterner, GenericArgs, TraitRef, TypingMode};
 use rustc_type_ir::TypeFoldable;
-use rustc_type_ir::inherent::GenericArgs as _;
 
 fn item_of(db: &dyn HirDatabase, imp: ImplId, name: &hir_expand::name::Name) -> Option<FunctionId> {
     imp.impl_items(db).items.iter().find_map(|(found, item)| match item {

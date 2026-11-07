@@ -1,5 +1,5 @@
+use hir_def::attrs::AttrFlags;
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
@@ -11,22 +11,28 @@ use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use either::Either;
 use hir_def::builtin_derive::BuiltinDeriveImplMethod as Method;
 use hir_def::signatures::FunctionSignature;
-use hir_def::{CallableDefId, FunctionId, HasModule, ItemContainerId, StaticId, VariantId};
-use hir_ty::traits::StoredParamEnvAndCrate;
-use hir_ty::{ParamEnvAndCrate, attach_db};
+use hir_def::{CallableDefId, FunctionId, HasModule, ItemContainerId, VariantId};
+use hir_ty::ParamEnvAndCrate;
 use hir_ty::db::{HirDatabase, InternedClosureId};
 use hir_ty::method_resolution::is_dyn_method;
 use hir_ty::mir::{MirBody, Operand, OperandKind, PlaceTy};
 use hir_ty::next_solver::infer::DbInternerInferExt;
-use hir_ty::next_solver::{DbInterner, GenericArgs, StoredGenericArgs, StoredTy, Ty, TyKind, TypingMode};
+use hir_ty::next_solver::{DbInterner, GenericArgs, Ty, TyKind, TypingMode};
 use rustc_type_ir::IntTy;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 
 use hir_ty::mir::MirLowerError;
 
 use crate::lower::Lower;
+use crate::lower::native::NativeSig;
 
+mod compiler;
+mod slots;
 mod specialize;
+
+pub use compiler::{compile_slot, forget_compiler};
+pub use slots::{Key, Sig, Slots};
+use slots::TABLE_SLOTS;
 
 const PANIC_HANDLER: &str = "panic_impl";
 const STD_CRATE: &str = "std";
@@ -34,18 +40,8 @@ const STD_PANIC_HANDLER: &str = "panic_handler";
 const CLONE: &str = "clone";
 const DROP_GLUE: &str = "drop_glue";
 const CONST_EVAL_SELECT: &str = "const_eval_select";
-const TABLE_SLOTS: usize = 1 << 20;
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub enum Key {
-    Func(FunctionId, StoredGenericArgs),
-    Closure(InternedClosureId<'static>, StoredGenericArgs),
-    Glue(StoredTy),
-    Thunk(Box<Key>, bool),
-    Derive(Method, FunctionId, StoredGenericArgs),
-    Const(hir_def::ConstId, StoredGenericArgs),
-    Shim(StoredTy),
-}
+const STD_SYSCALLS: [&str; 7] = ["copy_file_range", "getrandom", "gettid", "preadv", "pwritev", "splice", "statx"];
+const STD_ALIASES: [(&str, &str); 1] = [("min_stack_size", "__pthread_get_minstack")];
 
 pub enum Target<'db> {
     Func(FunctionId, GenericArgs<'db>),
@@ -95,48 +91,7 @@ enum Work<'db> {
     Thunk(Target<'db>, bool),
     Derive(Method, FunctionId, GenericArgs<'db>),
     Shim(Ty<'db>),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Sig {
-    pub params: usize,
-    pub ret: bool,
-}
-
-struct SlotInfo {
-    key: Key,
-    sig: Sig,
-    env: StoredParamEnvAndCrate,
-}
-
-pub struct Slots {
-    table: &'static [AtomicUsize],
-    by_key: HashMap<(Key, Sig), usize>,
-    info: Vec<SlotInfo>,
-    pending: Vec<usize>,
-    pub statics: HashMap<StaticId, usize>,
-    pub vtables: HashMap<(StoredTy, StoredTy), i64>,
-    pub notes: Vec<String>,
-}
-
-impl Slots {
-    pub fn get(&mut self, key: Key, sig: Sig, env: StoredParamEnvAndCrate) -> Result<usize, String> {
-        if let Some(slot) = self.by_key.get(&(key.clone(), sig)) {
-            return Ok(*slot);
-        }
-        let slot = self.info.len();
-        if slot == TABLE_SLOTS {
-            return Err("call table is full".to_owned());
-        }
-        self.info.push(SlotInfo { key: key.clone(), sig, env });
-        self.by_key.insert((key, sig), slot);
-        self.pending.push(slot);
-        Ok(slot)
-    }
-
-    pub fn address(&self, slot: usize) -> i64 {
-        &self.table[slot] as *const AtomicUsize as i64
-    }
+    Native(Target<'db>, NativeSig),
 }
 
 pub struct Backend {
@@ -146,6 +101,7 @@ pub struct Backend {
     slots: Slots,
     digests: HashMap<usize, u64>,
     pub stubs: Vec<(String, String)>,
+    order: Vec<usize>,
     pub compiled_total: usize,
     unmapped: Vec<(FuncId, usize, String)>,
     cursor: usize,
@@ -165,7 +121,8 @@ pub fn call(table: &[AtomicUsize], slot: usize, value: i64) -> i64 {
 
 impl Backend {
     pub fn new(dump: bool, verbose: bool) -> Result<Self> {
-        let builder = JITBuilder::new(default_libcall_names()).map_err(|e| anyhow!("{e}"))?;
+        let flags = [("enable_llvm_abi_extensions", "true"), ("preserve_frame_pointers", "true")];
+        let builder = JITBuilder::with_flags(&flags, default_libcall_names()).map_err(|e| anyhow!("{e}"))?;
         let module = JITModule::new(builder);
         let table = (0..TABLE_SLOTS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
         Ok(Self {
@@ -177,12 +134,16 @@ impl Backend {
                 by_key: HashMap::new(),
                 info: Vec::new(),
                 pending: Vec::new(),
+                native_words: Vec::new(),
                 statics: HashMap::new(),
+                lazy_statics: HashMap::new(),
+                thread_locals: HashMap::new(),
                 vtables: HashMap::new(),
                 notes: Vec::new(),
             },
             digests: HashMap::new(),
             stubs: Vec::new(),
+            order: Vec::new(),
             compiled_total: 0,
             unmapped: Vec::new(),
             cursor: 0,
@@ -207,7 +168,21 @@ impl Backend {
         Ok((slot, takes_and_returns_i64(body)))
     }
 
+    pub fn replay<'db>(&mut self, db: &'db dyn HirDatabase, order: &[usize]) {
+        for slot in order.iter().copied() {
+            if slot < self.slots.info.len() && !self.digests.contains_key(&slot) {
+                self.compile(db, slot);
+            }
+        }
+        self.order.clear();
+    }
+
+    pub fn take_order(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.order)
+    }
+
     pub fn compile<'db>(&mut self, db: &'db dyn HirDatabase, slot: usize) {
+        self.order.push(slot);
         let info = &self.slots.info[slot];
         let (key, sig, env) = (info.key.clone(), info.sig, info.env.clone());
         let env = env.as_ref(db);
@@ -220,8 +195,8 @@ impl Backend {
             self.stubs.push((name.clone(), note));
         }
         match lowered {
-            Ok((id, digest)) => {
-                self.digests.insert(slot, digest);
+            Ok(id) => {
+                self.digests.insert(slot, target_digest(db, env, &target_of(&key)));
                 self.finish(slot, id);
             }
             Err(reason) => {
@@ -231,7 +206,7 @@ impl Backend {
                 let message = format!("{name}: {reason}");
                 self.stubs.push((name, reason));
                 self.digests.insert(slot, 0);
-                if let Ok(id) = self.trap_function(sig, &message) {
+                if let Ok(id) = self.trap_function(sig, native_of(&key), &message) {
                     self.finish(slot, id);
                 }
             }
@@ -245,7 +220,7 @@ impl Backend {
         name: &str,
         key: &Key,
         sig: Sig,
-    ) -> Result<(FuncId, u64), String> {
+    ) -> Result<FuncId, String> {
         match key {
             Key::Func(..) | Key::Closure(..) => {
                 let target = target_of(key);
@@ -271,6 +246,12 @@ impl Backend {
                     .map_err(|error| format!("constant: {error:?}"))?;
                 self.lower(db, env, name, body, sig, Work::Body)
             }
+            Key::Static(id) => {
+                let body = db
+                    .monomorphized_mir_body((*id).into(), GenericArgs::empty().store(), env.store())
+                    .map_err(|error| format!("static: {error:?}"))?;
+                self.lower(db, env, name, body, sig, Work::Body)
+            }
             Key::Derive(method, func, args) => {
                 let entry = self.slots.info.first().ok_or("no entry")?.key.clone();
                 let body = body_of(db, env, &target_of(&entry))?;
@@ -280,6 +261,11 @@ impl Backend {
                 let entry = self.slots.info.first().ok_or("no entry")?.key.clone();
                 let body = body_of(db, env, &target_of(&entry))?;
                 self.lower(db, env, name, body, sig, Work::Shim(ty.as_ref()))
+            }
+            Key::Native(inner, native) => {
+                let target = target_of(inner);
+                let body = body_of(db, env, &target)?;
+                self.lower(db, env, name, body, sig, Work::Native(target, native.clone()))
             }
             Key::Thunk(inner, data) => {
                 let target = target_of(inner);
@@ -314,19 +300,21 @@ impl Backend {
             }
             let env = env.as_ref(db);
             let target = target_of(&key);
-            let body = body_of(db, env, &target).map_err(|why| format!("{}: {why}", name_of(db, &target)))?;
-            if self.digests.get(&slot) != Some(&digest(body)) {
-                changed.push((slot, name_of(db, &target), body, env));
+            let digest = target_digest(db, env, &target);
+            if self.digests.get(&slot) == Some(&digest) {
+                continue;
             }
+            let body = body_of(db, env, &target).map_err(|why| format!("{}: {why}", name_of(db, &target)))?;
+            changed.push((slot, name_of(db, &target), body, env, digest));
         }
         let mut names = Vec::with_capacity(changed.len());
         let mut done = Vec::with_capacity(changed.len());
-        for (slot, name, body, env) in changed {
+        for (slot, name, body, env, digest) in changed {
             let sig = self.slots.info[slot].sig;
             if signature_of(db, env, body)? != sig {
                 return Err(format!("{name}: signature changed"));
             }
-            let (id, digest) = self.lower(db, env, &name, body, sig, Work::Body).map_err(|why| format!("{name}: {why}"))?;
+            let id = self.lower(db, env, &name, body, sig, Work::Body).map_err(|why| format!("{name}: {why}"))?;
             done.push((slot, id, digest));
             names.push(name);
         }
@@ -362,14 +350,22 @@ impl Backend {
             let code = self.module.get_finalized_function(id);
             self.slots.table[slot].store(code as usize, Ordering::Release);
         }
+        for (word, slot) in std::mem::take(&mut self.slots.native_words) {
+            let code = self.slots.table[slot].load(Ordering::Acquire);
+            // SAFETY: word is a function pointer field inside constant data this engine leaked, and nothing runs that data until publish returns.
+            unsafe { (word as *mut usize).write_unaligned(code) };
+        }
         Ok(())
     }
 
-    fn declare(&mut self, sig: Sig) -> Result<FuncId, String> {
+    fn declare(&mut self, sig: Sig, native: Option<&NativeSig>) -> Result<FuncId, String> {
         let name = format!("f{}", self.serial);
         self.serial += 1;
         let mut signature = self.module.make_signature();
-        pointer_signature(&mut signature, sig);
+        match native {
+            Some(native) => native.signature(&mut signature),
+            None => pointer_signature(&mut signature, sig),
+        }
         let id = self.module.declare_function(&name, Linkage::Local, &signature).map_err(|e| e.to_string())?;
         self.ctx.func.signature = signature;
         Ok(id)
@@ -391,7 +387,8 @@ impl Backend {
 
     fn compile_stub(&mut self, slot: usize) -> Result<FuncId, String> {
         let sig = self.slots.info[slot].sig;
-        let id = self.declare(sig)?;
+        let native = native_of(&self.slots.info[slot].key).cloned();
+        let id = self.declare(sig, native.as_ref())?;
         let config = self.module.target_config();
         let address = self.slots.address(slot);
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder);
@@ -407,18 +404,22 @@ impl Backend {
         let number = builder.ins().iconst(types::I64, slot as i64);
         builder.ins().call_indirect(host, code, &[number]);
         let mut target = Signature::new(config.default_call_conv);
-        pointer_signature(&mut target, sig);
+        match &native {
+            Some(native) => native.signature(&mut target),
+            None => pointer_signature(&mut target, sig),
+        }
         let target = builder.import_signature(target);
         let address = builder.ins().iconst(types::I64, address);
         let code = builder.ins().load(types::I64, MemFlagsData::trusted(), address, 0);
-        builder.ins().call_indirect(target, code, &params);
-        builder.ins().return_(&[]);
+        let call = builder.ins().call_indirect(target, code, &params);
+        let results = builder.inst_results(call).to_vec();
+        builder.ins().return_(&results);
         builder.finalize(config);
         self.define(id)
     }
 
-    fn trap_function(&mut self, sig: Sig, reason: &str) -> Result<FuncId, String> {
-        let id = self.declare(sig)?;
+    fn trap_function(&mut self, sig: Sig, native: Option<&NativeSig>, reason: &str) -> Result<FuncId, String> {
+        let id = self.declare(sig, native)?;
         let config = self.module.target_config();
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder);
         let block = builder.create_block();
@@ -446,8 +447,9 @@ impl Backend {
         body: &'db MirBody<'db>,
         sig: Sig,
         work: Work<'db>,
-    ) -> Result<(FuncId, u64), String> {
-        let id = self.declare(sig)?;
+    ) -> Result<FuncId, String> {
+        let native = if let Work::Native(_, native) = &work { Some(native.clone()) } else { None };
+        let id = self.declare(sig, native.as_ref())?;
         let config = self.module.target_config();
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder);
         let lower = Lower::new(db, env, body, &mut builder, &mut self.slots, config.default_call_conv, sig);
@@ -456,6 +458,7 @@ impl Backend {
             Work::Glue(ty) => lower.glue(ty),
             Work::Thunk(target, data) => lower.thunk(target, data),
             Work::Shim(ty) => lower.shim(ty),
+            Work::Native(target, native) => lower.native(target, &native),
             Work::Derive(method, func, args) => lower.derive(method, func, args),
         };
         match result {
@@ -464,8 +467,7 @@ impl Backend {
                 if self.dump {
                     println!("=== {name}\n{}", self.ctx.func.display());
                 }
-                let id = self.define_named(id, name)?;
-                Ok((id, digest(body)))
+                self.define_named(id, name)
             }
             Err(reason) => {
                 drop(builder);
@@ -476,6 +478,7 @@ impl Backend {
         }
     }
 }
+
 
 pub fn leak_text(text: &str) -> (i64, i64) {
     let text: &'static str = Box::leak(text.to_owned().into_boxed_str());
@@ -488,14 +491,8 @@ pub extern "C" fn report_trap(text: *const u8, size: usize) {
     eprintln!("trap: {text}");
 }
 
-pub extern "C" fn compile_slot(slot: u64) {
-    let mut guard = crate::patch::ENGINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let engine = guard.as_mut().expect("engine is running");
-    let (db, backend) = engine.parts();
-    let db: &dyn HirDatabase = db;
-    if !backend.digests.contains_key(&(slot as usize)) {
-        attach_db(db, || backend.compile(db, slot as usize));
-    }
+fn native_of(key: &Key) -> Option<&NativeSig> {
+    if let Key::Native(_, native) = key { Some(native) } else { None }
 }
 
 fn env_of(db: &dyn HirDatabase, func: FunctionId) -> ParamEnvAndCrate<'_> {
@@ -507,9 +504,9 @@ fn target_of<'db>(key: &Key) -> Target<'db> {
         Key::Func(func, args) => Target::Func(*func, args.as_ref()),
         Key::Closure(closure, args) => Target::Closure(*closure, args.as_ref()),
         Key::Glue(ty) => Target::Glue(ty.as_ref()),
-        Key::Thunk(inner, _) => target_of(inner),
+        Key::Thunk(inner, _) | Key::Native(inner, _) => target_of(inner),
         Key::Derive(method, func, args) => Target::Derive(*method, *func, args.as_ref()),
-        Key::Const(..) | Key::Shim(_) => Target::Abort,
+        Key::Const(..) | Key::Shim(_) | Key::Static(_) => Target::Abort,
     }
 }
 
@@ -517,9 +514,14 @@ fn key_name(db: &dyn HirDatabase, key: &Key) -> String {
     match key {
         Key::Glue(ty) => format!("drop glue {:?}", ty.as_ref()),
         Key::Const(..) => "constant".to_owned(),
+        Key::Static(_) => "static".to_owned(),
         Key::Shim(ty) => format!("shim {:?}", ty.as_ref()),
         Key::Derive(method, _, args) => format!("derive {} {:?}", method.name().as_str(), args.as_ref().as_slice().first()),
         Key::Thunk(inner, _) => format!("thunk {}", key_name(db, inner)),
+        Key::Native(inner, _) => format!("native {}", key_name(db, inner)),
+        Key::Func(func, args) if !args.as_ref().as_slice().is_empty() => {
+            format!("{} {:?}", FunctionSignature::of(db, *func).name.as_str(), args.as_ref().as_slice())
+        }
         _ => name_of(db, &target_of(key)),
     }
 }
@@ -578,10 +580,16 @@ pub fn body_of<'db>(
     body.map_err(|error| format!("{error:?}"))
 }
 
-fn digest(body: &MirBody<'_>) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    format!("{body:?}").hash(&mut hasher);
-    hasher.finish()
+fn target_digest<'db>(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>, target: &Target<'db>) -> u64 {
+    let found = match target {
+        Target::Func(func, args) => *hir_ty::mir::monomorphized_mir_digest(db, (*func).into(), args.store(), env.store()),
+        Target::Closure(closure, args) => *hir_ty::mir::monomorphized_closure_digest(db, *closure, args.store(), env.store()),
+        _ => return 1,
+    };
+    if found != 0 {
+        return found;
+    }
+    body_of(db, env, target).map_or(0, hir_ty::mir::mir_body_digest)
 }
 
 fn return_fits<'db>(
@@ -689,6 +697,15 @@ pub fn resolve_def<'db>(
     {
         return Ok(Resolved { target: Target::Intrinsic(order.to_owned(), original), shape: Shape::Direct });
     }
+    if let Some((_, symbol)) = STD_ALIASES.iter().find(|(alias, _)| *alias == name)
+        && imp.module(db).krate(db).data(db).origin.is_lang()
+        && crate::lower::intrinsic::symbol(symbol).is_some()
+    {
+        return Ok(Resolved { target: Target::Foreign((*symbol).to_owned()), shape: Shape::Direct });
+    }
+    if STD_SYSCALLS.contains(&name.as_str()) && imp.module(db).block(db).is_some() && !imp.module(db).krate(db).data(db).origin.is_local() {
+        return Ok(Resolved { target: Target::Foreign(name), shape: Shape::Direct });
+    }
     if name == CONST_EVAL_SELECT {
         let chosen = args.as_slice().get(2).and_then(|arg| arg.ty()).ok_or("const_eval_select arguments")?;
         let TyKind::FnDef(def, inner) = chosen.kind() else {
@@ -715,7 +732,7 @@ pub fn resolve_def<'db>(
             };
             return Ok(Resolved { target, shape: Shape::Direct });
         }
-        return Ok(Resolved { target: Target::Foreign(name), shape: Shape::Direct });
+        return Ok(Resolved { target: Target::Foreign(AttrFlags::link_name(db, imp.into()).map_or(name, |symbol| symbol.as_str().to_owned())), shape: Shape::Direct });
     }
     if let Some((func, args)) = specialize::specialized(db, env, imp, args) {
         return Ok(Resolved { target: Target::Func(func, args), shape: Shape::Direct });

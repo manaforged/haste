@@ -104,6 +104,34 @@ extern "C" fn powi_f32(base: f32, power: i32) -> f32 {
     base.powi(power)
 }
 
+std::thread_local! {
+    static THREAD_STATICS: std::cell::Cell<*mut Vec<usize>> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+extern "C" fn thread_local_address(index: usize, template: *const u8, size: usize) -> usize {
+    THREAD_STATICS.with(|cell| {
+        if cell.get().is_null() {
+            cell.set(Box::into_raw(Box::new(Vec::new())));
+        }
+        // SAFETY: the table is leaked and only this thread holds its pointer, and the program's thread-local destructors may still reach it at thread exit.
+        let statics = unsafe { &mut *cell.get() };
+        if statics.len() <= index {
+            statics.resize(index + 1, 0);
+        }
+        if statics[index] == 0 {
+            let storage = Box::leak(vec![0_u128; size.div_ceil(16).max(1)].into_boxed_slice());
+            // SAFETY: template points at the leaked initial value of this static, which is size bytes, and storage is at least that long.
+            unsafe { std::ptr::copy_nonoverlapping(template, storage.as_mut_ptr().cast::<u8>(), size) };
+            statics[index] = storage.as_ptr() as usize;
+        }
+        statics[index]
+    })
+}
+
+pub(super) fn thread_local_code() -> usize {
+    thread_local_address as *const () as usize
+}
+
 pub(super) fn compare_bytes_code() -> usize {
     memcmp as *const () as usize
 }
@@ -118,7 +146,6 @@ const ALLOCATOR: &[(&str, fn() -> usize)] = &[
 ];
 
 const UNKNOWN_FILE: &str = "<engine>";
-const RTLD_DEFAULT: *mut std::ffi::c_void = -2_isize as *mut std::ffi::c_void;
 
 pub fn is_known(name: &str) -> bool {
     TABLE.iter().any(|(known, _)| *known == name)
@@ -128,13 +155,22 @@ pub fn is_core_override(name: &str) -> bool {
     OVERRIDES.contains(&name) || (name.starts_with("atomic_") && is_known(name))
 }
 
-pub(super) fn symbol(name: &str) -> Option<usize> {
+static DSO_HANDLE: u8 = 0;
+
+pub(crate) fn symbol(name: &str) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    if let Some(code) = crate::park::symbol(name) {
+        return Some(code);
+    }
+    if name == "__dso_handle" {
+        return Some(&raw const DSO_HANDLE as usize);
+    }
     if let Some((_, code)) = ALLOCATOR.iter().find(|(known, _)| *known == name) {
         return Some(code());
     }
     let name = std::ffi::CString::new(name).ok()?;
-    // SAFETY: name is a valid C string and RTLD_DEFAULT is the macOS default-search handle.
-    let code = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
+    // SAFETY: name is a valid C string and RTLD_DEFAULT is the platform's default-search handle.
+    let code = unsafe { dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
     (!code.is_null()).then_some(code as usize)
 }
 

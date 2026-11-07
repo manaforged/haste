@@ -42,9 +42,19 @@ impl<'db> Lower<'_, '_, 'db> {
         if matches!(left.ty.kind(), TyKind::RawPtr(..)) && self.layout(left.ty)?.size.bytes() == FAT {
             return Ok(self.fat_compare(op, &left, &right));
         }
-        let scalar = self.scalar(left.ty)?;
-        let (a, b) = (self.load(scalar.ty, left.addr, 0), self.load(scalar.ty, right.addr, 0));
-        self.binary(op, a, b, scalar)
+        if let Ok(scalar) = self.scalar(left.ty) {
+            let (a, b) = (self.load(scalar.ty, left.addr, 0), self.load(scalar.ty, right.addr, 0));
+            return self.binary(op, a, b, scalar);
+        }
+        self.structural_equal(op, &left, &right)
+    }
+
+    fn structural_equal(&mut self, op: &BinOp, left: &Side<'db>, right: &Side<'db>) -> Result<Value, String> {
+        let (a, _) = self.size_align(left.ty, left.meta)?;
+        let (b, _) = self.size_align(right.ty, right.meta)?;
+        let size = Side { addr: a, ty: left.ty, meta: Some(a) };
+        let other = Side { addr: b, ty: right.ty, meta: Some(b) };
+        self.bytes_equal(op, (left.addr, &size), (right.addr, &other))
     }
 
     pub(super) fn pointer_order(&mut self, op: &BinOp, dest: Place<'db>, args: &[Place<'db>]) -> Result<(), String> {
@@ -74,7 +84,11 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     fn str_equal(&mut self, op: &BinOp, left: &Side<'db>, right: &Side<'db>) -> Result<Value, String> {
-        let (a, b) = (left.meta.ok_or("str without a length")?, right.meta.ok_or("str without a length")?);
+        self.bytes_equal(op, (left.addr, left), (right.addr, right))
+    }
+
+    fn bytes_equal(&mut self, op: &BinOp, left: (Value, &Side<'db>), right: (Value, &Side<'db>)) -> Result<Value, String> {
+        let (a, b) = (left.1.meta.ok_or("compare without a length")?, right.1.meta.ok_or("compare without a length")?);
         let same = self.builder.create_block();
         let done = self.builder.create_block();
         self.builder.append_block_param(done, types::I8);
@@ -87,7 +101,7 @@ impl<'db> Lower<'_, '_, 'db> {
         signature.returns.push(AbiParam::new(types::I32));
         let signature = self.builder.import_signature(signature);
         let code = self.builder.ins().iconst(types::I64, intrinsic::compare_bytes_code() as i64);
-        let call = self.builder.ins().call_indirect(signature, code, &[left.addr, right.addr, a]);
+        let call = self.builder.ins().call_indirect(signature, code, &[left.0, right.0, a]);
         let order = self.builder.inst_results(call)[0];
         let equal = self.builder.ins().icmp_imm(IntCC::Equal, order, 0);
         self.builder.ins().jump(done, &[equal.into()]);
@@ -96,7 +110,7 @@ impl<'db> Lower<'_, '_, 'db> {
         match op {
             BinOp::Eq => Ok(equal),
             BinOp::Ne => Ok(self.builder.ins().bxor_imm(equal, 1)),
-            other => Err(format!("{other:?} on str")),
+            other => Err(format!("{other:?} on bytes")),
         }
     }
 

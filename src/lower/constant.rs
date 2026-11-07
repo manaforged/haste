@@ -1,3 +1,4 @@
+use hir_def::attrs::AttrFlags;
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::{InstBuilder, types};
@@ -59,6 +60,7 @@ struct Reloc<'m, 'db> {
     map: &'m MemoryMap<'db>,
     seen: HashMap<usize, usize>,
 }
+
 
 impl<'db> Lower<'_, '_, 'db> {
     pub(super) fn allocation(&mut self, allocation: Allocation<'db>) -> Result<Place<'db>, String> {
@@ -156,10 +158,22 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn static_cell(&mut self, id: StaticId) -> Result<Place<'db>, String> {
         let at = self.static_address(id)?;
-        let cell = leak(&at.to_le_bytes());
-        let addr = self.builder.ins().iconst(types::I64, cell as i64);
+        if let Some((slot, done)) = self.slots.lazy_statics.get(&id).copied() {
+            self.init_once(slot, at, done);
+        }
         let region = Region::new_erased(self.infcx.interner);
         let ty = Ty::new_imm_ref(self.infcx.interner, region, self.static_type(id));
+        if self.is_thread_local(id) {
+            let size = self.layout(self.static_type(id))?.size.bytes();
+            let address = self.thread_local_address(id, at, size);
+            let data = cranelift_codegen::ir::StackSlotData::new(cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 8, 3);
+            let slot = self.builder.create_sized_stack_slot(data);
+            let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+            self.store(address, addr, 0);
+            return Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None });
+        }
+        let cell = leak(&at.to_le_bytes());
+        let addr = self.builder.ins().iconst(types::I64, cell as i64);
         Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None })
     }
 
@@ -173,14 +187,54 @@ impl<'db> Lower<'_, '_, 'db> {
         }
         let signature = StaticSignature::of(self.db, id);
         let at = if signature.flags.contains(StaticFlags::EXTERN) {
-            intrinsic::symbol(signature.name.as_str()).ok_or_else(|| format!("no extern static {}", signature.name.as_str()))?
+            let named = AttrFlags::link_name(self.db, id.into());
+            let symbol = intrinsic::symbol(named.as_ref().map_or(signature.name.as_str(), |symbol| symbol.as_str()));
+            if AttrFlags::has_attr(self.db, id.into(), "linkage") {
+                leak(&symbol.unwrap_or(0).to_le_bytes())
+            } else {
+                symbol.ok_or_else(|| format!("no extern static {}", signature.name.as_str()))?
+            }
         } else {
-            let allocation = self.db.const_eval_static(id).map_err(|error| format!("static: {error:?}"))?;
-            let data = &*allocation;
-            self.load_constant(data.ty, &data.memory, &data.memory_map)?
+            match self.db.const_eval_static(id) {
+                Ok(allocation) => {
+                    let data = &*allocation;
+                    self.load_constant(data.ty, &data.memory, &data.memory_map)?
+                }
+                Err(_) => self.lazy_static(id)?,
+            }
         };
         self.slots.statics.insert(id, at);
         Ok(at)
+    }
+
+    fn lazy_static(&mut self, id: StaticId) -> Result<usize, String> {
+        let layout = self.layout(self.static_type(id))?;
+        let buffer = leak(&vec![0_u8; layout.size.bytes() as usize + 8]);
+        let sig = Sig { params: 0, ret: layout.size.bytes() != 0 };
+        let slot = self.slots.get(Key::Static(id), sig, self.env.store())?;
+        let done = leak(&[0_u8; 8]);
+        self.slots.lazy_statics.insert(id, (slot, done as usize));
+        Ok(buffer as usize)
+    }
+
+    fn init_once(&mut self, slot: usize, at: usize, done: usize) {
+        let sig = self.slots.sig_of(slot);
+        let flag = self.builder.ins().iconst(types::I64, done as i64);
+        let seen = self.load(types::I64, flag, 0);
+        let (run, next) = (self.builder.create_block(), self.builder.create_block());
+        self.builder.ins().brif(seen, next, &[], run, &[]);
+        self.builder.switch_to_block(run);
+        let one = self.builder.ins().iconst(types::I64, 1);
+        self.store(one, flag, 0);
+        let code = self.builder.ins().iconst(types::I64, self.slots.address(slot));
+        let addr = self.builder.ins().iconst(types::I64, at as i64);
+        if sig.ret {
+            self.call_cell(code, sig, &[addr]);
+        } else {
+            self.call_cell(code, sig, &[]);
+        }
+        self.builder.ins().jump(next, &[]);
+        self.builder.switch_to_block(next);
     }
 
     fn relocate(&mut self, reloc: &mut Reloc<'_, 'db>, ty: Ty<'db>, at: usize) -> Result<(), String> {
@@ -189,7 +243,12 @@ impl<'db> Lower<'_, '_, 'db> {
             TyKind::FnPtr(..) => {
                 let id = read_word(at);
                 let target = reloc.map.vtable_ty(id).map_err(|error| format!("fn pointer constant: {error:?}"))?;
-                write_word(at, self.reify(target)? as usize);
+                if self.is_native_fn(target) && self.native_symbol(target)?.is_none() {
+                    let slot = self.native_slot(target)?;
+                    self.slots.native_words.push((at, slot));
+                } else {
+                    write_word(at, self.reify(target)? as usize);
+                }
                 Ok(())
             }
             TyKind::Tuple(items) => {
@@ -212,6 +271,23 @@ impl<'db> Lower<'_, '_, 'db> {
         }
     }
 
+    fn unsized_bytes(&self, ty: Ty<'db>, meta: usize) -> Result<usize, String> {
+        match ty.kind() {
+            TyKind::Str => Ok(meta),
+            TyKind::Slice(item) => Ok(meta * self.layout(item)?.size.bytes() as usize),
+            TyKind::Adt(adt, args) => {
+                let AdtId::StructId(id) = adt.def_id() else {
+                    return Err(format!("constant pointer to {ty:?}"));
+                };
+                let fields = self.fields_of(id.into(), args);
+                let last = *fields.last().ok_or("empty unsized struct")?;
+                let offset = self.layout(ty)?.fields.offset(fields.len() - 1).bytes() as usize;
+                Ok(offset + self.unsized_bytes(last, meta)?)
+            }
+            _ => Err(format!("constant pointer to {ty:?}")),
+        }
+    }
+
     fn relocate_pointer(&mut self, reloc: &mut Reloc<'_, 'db>, inner: Ty<'db>, at: usize) -> Result<(), String> {
         let old = read_word(at);
         let meta = read_word(at + 8);
@@ -224,7 +300,7 @@ impl<'db> Lower<'_, '_, 'db> {
                 write_word(at + 8, self.vtable(concrete, inner)? as usize);
                 (self.layout(concrete)?.size.bytes() as usize, None)
             }
-            _ if unsized_inner => return Err(format!("constant pointer to {inner:?}")),
+            _ if unsized_inner => (self.unsized_bytes(inner, meta)?, None),
             _ => (self.layout(inner)?.size.bytes() as usize, None),
         };
         if size == 0 {
@@ -267,7 +343,12 @@ impl<'db> Lower<'_, '_, 'db> {
         let layout = self.layout(ty)?;
         let (variant, shape): (hir_def::VariantId, _) = match adt {
             AdtId::StructId(id) => (id.into(), &*layout),
-            AdtId::UnionId(_) => return Ok(()),
+            AdtId::UnionId(id) => {
+                for field in self.fields_of(id.into(), args) {
+                    let _unknown_active_field = self.relocate(reloc, field, at);
+                }
+                return Ok(());
+            }
             AdtId::EnumId(id) => {
                 let variants = &id.enum_variants(self.db).variants;
                 let index = match &layout.variants {

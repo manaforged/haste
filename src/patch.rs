@@ -16,8 +16,8 @@ use vfs::{Vfs, VfsPath};
 
 use crate::backend::Backend;
 
-struct Edit {
-    label: String,
+pub(crate) struct Edit {
+    pub(crate) label: String,
     path: String,
     find: String,
     replace: String,
@@ -39,7 +39,7 @@ impl Engine {
 
 pub static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 
-fn start(db: RootDatabase, dump: bool, verbose: bool) -> Result<()> {
+pub(crate) fn start(db: RootDatabase, dump: bool, verbose: bool) -> Result<()> {
     let backend = Backend::new(dump, verbose)?;
     *lock() = Some(Engine { db, backend });
     Ok(())
@@ -49,7 +49,7 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Engine>> {
     ENGINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn with_engine<T>(work: impl FnOnce(&dyn HirDatabase, &mut Backend) -> T) -> T {
+pub(crate) fn with_engine<T>(work: impl FnOnce(&dyn HirDatabase, &mut Backend) -> T) -> T {
     let mut guard = lock();
     let engine = guard.as_mut().expect("engine is running");
     let (db, backend) = engine.parts();
@@ -83,14 +83,7 @@ pub fn run(mut db: RootDatabase, vfs: &Vfs, root: &Path, entry: &str, edits: &Pa
     let caller = Caller::start(table, slot);
     for edit in edits {
         let started = Instant::now();
-        let outcome = {
-            let mut guard = lock();
-            let engine = guard.as_mut().expect("engine is running");
-            apply(&mut engine.db, vfs, root, &mut texts, edit)?;
-            let (db, backend) = engine.parts();
-            let db: &dyn HirDatabase = db;
-            attach_db(db, || backend.refresh(db))
-        };
+        let outcome = apply_edit(vfs, root, &mut texts, edit)?;
         let refresh_us = started.elapsed().as_micros();
         match outcome {
             Ok(names) => {
@@ -208,10 +201,12 @@ fn print_ranked(kind: &str, reasons: HashMap<String, usize>) {
 }
 
 const WALK_SECONDS: u64 = 1200;
-const SAMPLES: usize = 2;
+const SAMPLES: usize = 6;
 const CHECK_INPUTS: [i64; 5] = [-5, 0, 1, 3, 20];
-const CASE_SECONDS: u32 = 5;
+const CASE_SECONDS: u32 = 120;
 const CASE_PREFIX: &str = "case_";
+
+pub const PROGRAM_STACK: usize = 1 << 30;
 
 unsafe extern "C" {
     fn alarm(seconds: u32) -> u32;
@@ -259,7 +254,7 @@ fn bucket(reason: &str) -> String {
     reason.chars().take(34).collect()
 }
 
-fn read_edits(path: &Path) -> Result<Vec<Edit>> {
+pub(crate) fn read_edits(path: &Path) -> Result<Vec<Edit>> {
     let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
     let mut edits = Vec::new();
     for line in text.lines().filter(|line| !line.is_empty()) {
@@ -275,6 +270,20 @@ fn read_edits(path: &Path) -> Result<Vec<Edit>> {
         });
     }
     Ok(edits)
+}
+
+pub(crate) fn apply_edit(
+    vfs: &Vfs,
+    root: &Path,
+    texts: &mut HashMap<String, String>,
+    edit: &Edit,
+) -> Result<std::result::Result<Vec<String>, String>> {
+    let mut guard = lock();
+    let engine = guard.as_mut().expect("engine is running");
+    apply(&mut engine.db, vfs, root, texts, edit)?;
+    let (db, backend) = engine.parts();
+    let db: &dyn HirDatabase = db;
+    Ok(attach_db(db, || backend.refresh(db)))
 }
 
 fn apply(
@@ -293,7 +302,7 @@ fn apply(
         bail!("edit {}: text not found: {}", edit.label, edit.find);
     }
     *text = text.replacen(&edit.find, &edit.replace, 1);
-    let abs = AbsPathBuf::assert_utf8(full);
+    let abs = AbsPathBuf::assert_utf8(std::fs::canonicalize(full)?);
     let (file, _) = vfs
         .file_id(&VfsPath::from(abs))
         .with_context(|| format!("{} is not in the loaded project", edit.path))?;
@@ -313,12 +322,14 @@ impl Caller {
         let calls = Arc::new(AtomicU64::new(0));
         let thread = {
             let (stop, calls) = (stop.clone(), calls.clone());
-            Some(std::thread::spawn(move || {
+            let body = move || {
+                crate::fault::install();
                 while !stop.load(Ordering::Relaxed) {
                     std::hint::black_box(crate::backend::call(table, slot, 20));
                     calls.fetch_add(1, Ordering::Relaxed);
                 }
-            }))
+            };
+            Some(std::thread::Builder::new().stack_size(PROGRAM_STACK).spawn(body).expect("caller thread"))
         };
         Self { stop, calls, thread }
     }

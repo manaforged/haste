@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 const FRAMES: usize = 24;
-const SIGNALS: [i32; 3] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL];
+const SIGNALS: [i32; 4] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP];
 const STACK_BYTES: usize = 1 << 18;
 
 struct Code {
@@ -22,15 +22,39 @@ fn name_at(code: &[Code], pc: usize) -> Option<&str> {
     code.iter().rev().find(|item| pc >= item.start && pc < item.start + item.size).map(|item| item.name.as_str())
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn registers(context: *mut libc::c_void) -> (usize, usize) {
+    // SAFETY: context is the ucontext the kernel passed to an SA_SIGINFO handler.
+    let state = unsafe { (*(*context.cast::<libc::ucontext_t>()).uc_mcontext).__ss };
+    (state.__pc as usize, state.__fp as usize)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe fn registers(context: *mut libc::c_void) -> (usize, usize) {
+    // SAFETY: context is the ucontext the kernel passed to an SA_SIGINFO handler.
+    let state = unsafe { &(*context.cast::<libc::ucontext_t>()).uc_mcontext };
+    (state.gregs[libc::REG_RIP as usize] as usize, state.gregs[libc::REG_RBP as usize] as usize)
+}
+
+fn host_name(pc: usize) -> Option<String> {
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: dladdr only reads pc as a number and fills the local info.
+    let found = unsafe { libc::dladdr(pc as *const libc::c_void, &mut info) } != 0 && !info.dli_sname.is_null();
+    // SAFETY: dladdr returned a nul-terminated symbol name that lives as long as the image.
+    found.then(|| unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy().into_owned())
+}
+
 extern "C" fn on_fault(signal: i32, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     // SAFETY: the kernel passes a valid siginfo and ucontext to an SA_SIGINFO handler.
-    let (fault, state) = unsafe { ((*info).si_addr() as usize, (*(*context.cast::<libc::ucontext_t>()).uc_mcontext).__ss) };
+    let (fault, (start_pc, start_frame)) = unsafe { ((*info).si_addr() as usize, registers(context)) };
     eprintln!("fault: signal {signal} address {fault:#x}");
     if let Ok(code) = CODE.try_lock() {
-        let (mut pc, mut frame) = (state.__pc as usize, state.__fp as usize);
+        let (mut pc, mut frame) = (start_pc, start_frame);
         for _ in 0..FRAMES {
             if let Some(name) = name_at(&code, pc) {
                 eprintln!("  at {name}");
+            } else if let Some(name) = host_name(pc) {
+                eprintln!("  in {name}");
             }
             if frame == 0 || frame % 8 != 0 {
                 break;

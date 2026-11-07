@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [workspace]
-exclude = ["hello", "patch"]
+exclude = ["hello", "patch", "ra"]
 
 [dependencies]
 anyhow = "1"
@@ -14,16 +14,15 @@ libc = "0.2"
 triomphe = "0.1"
 rustc_abi = { package = "ra-ap-rustc_abi", version = "0.166", default-features = false }
 rustc_type_ir = { package = "ra-ap-rustc_type_ir", version = "0.166", default-features = false }
-base-db = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
-hir-def = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
-hir-ty = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
-load-cargo = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
-project-model = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
-ide-db = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
-paths = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
-syntax = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
-hir-expand = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
-vfs = { git = "https://github.com/rust-lang/rust-analyzer", rev = "55effabb762bbd0a21c5af530ea447bd6772881d" }
+base-db = { path = "ra/crates/base-db" }
+hir-def = { path = "ra/crates/hir-def" }
+hir-ty = { path = "ra/crates/hir-ty" }
+load-cargo = { path = "ra/crates/load-cargo" }
+project-model = { path = "ra/crates/project-model" }
+ide-db = { path = "ra/crates/ide-db" }
+paths = { path = "ra/crates/paths" }
+hir-expand = { path = "ra/crates/hir-expand" }
+vfs = { path = "ra/crates/vfs" }
 cranelift-codegen = "0.137.1"
 cranelift-frontend = "0.137.1"
 cranelift-jit = "0.137.1"

@@ -161,6 +161,12 @@ impl<'db> Lower<'_, '_, 'db> {
             return Err("generic method".to_owned());
         }
         let args = GenericArgs::new_from_iter(std::iter::once(concrete.into()).chain(existential.iter()));
+        let ItemContainerId::TraitId(owner) = func.loc(self.db).container else {
+            return Err("vtable method outside a trait".to_owned());
+        };
+        if hir_def::hir::generics::GenericParams::of(self.db, owner.into()).len() > args.as_slice().len() {
+            return Err("supertrait with its own arguments".to_owned());
+        }
         let resolved = resolve_def(self.db, self.env, hir_def::CallableDefId::FunctionId(func), args)?;
         let key = key_of(&resolved.target).ok_or("vtable entry without code")?;
         let slot = if resolved.shape == Shape::FnTrait {
@@ -195,7 +201,7 @@ impl<'db> Lower<'_, '_, 'db> {
         Ok(Sig { params: count, ret: self.layout(ret)?.size.bytes() != 0 })
     }
 
-    fn target_shape(&self, target: &Target<'db>) -> Result<(Vec<Ty<'db>>, Ty<'db>), String> {
+    pub(super) fn target_shape(&self, target: &Target<'db>) -> Result<(Vec<Ty<'db>>, Ty<'db>), String> {
         let body = crate::backend::body_of(self.db, self.env, target)?;
         let skip = usize::from(matches!(target, Target::Closure(..)));
         let params = body.param_locals[skip..].iter().map(|local| body.locals[*local].ty.as_ref()).collect();
@@ -204,6 +210,9 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     pub(super) fn reify(&mut self, ty: Ty<'db>) -> Result<i64, String> {
+        if self.is_native_fn(ty) {
+            return self.native_symbol(ty)?.map(|code| code as i64).ok_or_else(|| "C callback in constant data".to_owned());
+        }
         let target = match ty.kind() {
             TyKind::FnDef(def, args) => resolve_def(self.db, self.env, def.0, args)?.target,
             TyKind::Closure(closure, args) => {
@@ -265,11 +274,7 @@ impl<'db> Lower<'_, '_, 'db> {
         let TyKind::Dynamic(predicates, _) = self_ty.kind() else {
             return Err(format!("dyn call on {self_ty:?}"));
         };
-        let principal = predicates.principal_def_id().ok_or("dyn call without a principal")?.0;
-        let index = methods_of(self.db, principal)
-            .iter()
-            .position(|(_, method)| *method == func)
-            .ok_or("method is not in the vtable")?;
+        let index = self.vtable_index(func, self_ty)?;
         let (receiver, rest) = args.split_first().ok_or("dyn call without a receiver")?;
         let receiver = self.operand(receiver)?;
         let fn_family = self.is_fn_trait(func);
@@ -286,17 +291,56 @@ impl<'db> Lower<'_, '_, 'db> {
             Binder::skip_binder(principal).args.as_slice().first().and_then(|arg| arg.ty())
         });
         let places = self.operands(rest)?;
+        let items: Option<Vec<Ty<'db>>> = tupled.and_then(|tuple| match tuple.kind() {
+            TyKind::Tuple(items) => Some(items.as_slice().to_vec()),
+            _ => None,
+        });
         let places = match places[..] {
-            [only] if fn_family && Some(only.ty.ty) == tupled => self.spread(&rest[0])?,
+            [only] if fn_family && super::is_tupled(only.ty.ty, items.as_deref()) => self.spread(&rest[0])?,
             _ => places,
         };
+        self.invoke_vtable(index, table, first, dest, &places)
+    }
+
+    fn vtable_index(&self, func: FunctionId, self_ty: Ty<'db>) -> Result<usize, String> {
+        let TyKind::Dynamic(predicates, _) = self_ty.kind() else {
+            return Err(format!("dyn call on {self_ty:?}"));
+        };
+        let principal = predicates.principal_def_id().ok_or("dyn call without a principal")?.0;
+        methods_of(self.db, principal)
+            .iter()
+            .position(|(_, method)| *method == func)
+            .ok_or_else(|| "method is not in the vtable".to_owned())
+    }
+
+    pub(super) fn dyn_item_call(
+        &mut self,
+        func: FunctionId,
+        self_ty: Ty<'db>,
+        dest: Place<'db>,
+        places: &[Place<'db>],
+    ) -> Result<(), String> {
+        let index = self.vtable_index(func, self_ty)?;
+        let (receiver, rest) = places.split_first().ok_or("dyn call without a receiver")?;
+        let table = self.load(types::I64, receiver.addr, 8);
+        self.invoke_vtable(index, table, receiver.addr, dest, rest)
+    }
+
+    fn invoke_vtable(
+        &mut self,
+        index: usize,
+        table: Value,
+        first: Value,
+        dest: Place<'db>,
+        places: &[Place<'db>],
+    ) -> Result<(), String> {
         let mut values = Vec::with_capacity(places.len() + 2);
         let ret = self.layout(dest.ty.ty)?.size.bytes() != 0;
         if ret {
             values.push(dest.addr);
         }
         values.push(first);
-        for place in &places {
+        for place in places {
             if self.layout(place.ty.ty)?.size.bytes() != 0 {
                 values.push(place.addr);
             }
@@ -434,6 +478,7 @@ impl<'db> Lower<'_, '_, 'db> {
             Target::Ctor(variant) => self.write_variant(dest, variant, &places)?,
             Target::Foreign(name) => self.foreign(&name, dest, &places)?,
             Target::Intrinsic(name, generics) => self.intrinsic(&name, generics, dest, &places)?,
+            Target::Dyn(method, self_ty) => self.dyn_item_call(method, self_ty, dest, &places)?,
             _ => return Err("shim of a target with code".to_owned()),
         }
         self.builder.ins().return_(&[]);

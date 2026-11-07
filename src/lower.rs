@@ -28,6 +28,7 @@ mod constant;
 pub mod derive;
 mod drop;
 pub mod intrinsic;
+pub mod native;
 mod pointer;
 mod promote;
 mod variant;
@@ -339,6 +340,15 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         let dest = self.place(target)?;
         let layout = self.layout(dest.ty.ty)?;
         if layout.size.bytes() == 0 && !matches!(rvalue, Rvalue::CheckedBinaryOp(..) | Rvalue::Cast(..)) {
+            match rvalue {
+                Rvalue::Use(op) => {
+                    self.operand(op)?;
+                }
+                Rvalue::Aggregate(_, ops) => {
+                    self.operands(ops)?;
+                }
+                _ => {}
+            }
             self.initialized(target);
             return Ok(());
         }
@@ -509,7 +519,12 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         };
         let dest = self.place(destination)?;
         if let Target::Dyn(method, self_ty) = callee {
-            self.dyn_call(method, self_ty, dest, args)?;
+            if shape == Shape::FnTrait {
+                let (_, places) = self.untuple(&callee, args)?;
+                self.dyn_item_call(method, self_ty, dest, &places)?;
+            } else {
+                self.dyn_call(method, self_ty, dest, args)?;
+            }
             self.initialized(destination);
             self.end_call(target);
             return Ok(());
@@ -517,7 +532,11 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         if matches!(callee, Target::Pointer) && shape == Shape::Direct {
             let cell = self.indirect_callee(func)?;
             let places = self.operands(args)?;
-            self.call_pointer(cell, dest, &places)?;
+            if self.is_native_fn(crate::backend::operand_ty(self.db, self.env, self.body, func)) {
+                self.native_call(cell, dest, &places)?;
+            } else {
+                self.call_pointer(cell, dest, &places)?;
+            }
             self.initialized(destination);
             self.end_call(target);
             return Ok(());
@@ -652,13 +671,14 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             ty = inner;
         }
         let places = self.operands(rest)?;
-        let params = self.params_of(callee)?;
+        let params = match self.params_of(callee)? {
+            Some(params) => Some(params),
+            None => ty.callable_sig(self.infcx.interner).map(|sig| rustc_type_ir::Binder::skip_binder(sig).inputs().iter().copied().collect()),
+        };
         let [only] = places[..] else {
             return Ok((Some(addr), places));
         };
-        let is_tuple = matches!(only.ty.ty.kind(), TyKind::Tuple(_));
-        let takes_it = params.is_some_and(|params| params.len() == 1 && params[0] == only.ty.ty);
-        if !is_tuple || takes_it {
+        if !is_tupled(only.ty.ty, params.as_deref()) {
             return Ok((Some(addr), places));
         }
         Ok((Some(addr), self.spread(&rest[0])?))
@@ -676,25 +696,8 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
 
     fn foreign(&mut self, name: &str, dest: Place<'db>, places: &[Place<'db>]) -> Result<(), String> {
         let code = intrinsic::symbol(name).ok_or_else(|| format!("no symbol: {name}"))?;
-        let mut signature = Signature::new(self.call_conv);
-        let mut values = Vec::with_capacity(places.len());
-        for place in places {
-            let scalar = self.scalar(place.ty.ty)?;
-            signature.params.push(cranelift_codegen::ir::AbiParam::new(scalar.ty));
-            values.push(self.load(scalar.ty, place.addr, 0));
-        }
-        let ret = if self.layout(dest.ty.ty)?.size.bytes() == 0 { None } else { Some(self.scalar(dest.ty.ty)?) };
-        if let Some(ret) = ret {
-            signature.returns.push(cranelift_codegen::ir::AbiParam::new(ret.ty));
-        }
-        let signature = self.builder.import_signature(signature);
         let code = self.builder.ins().iconst(types::I64, code as i64);
-        let call = self.builder.ins().call_indirect(signature, code, &values);
-        if ret.is_some() {
-            let result = self.builder.inst_results(call)[0];
-            self.store(result, dest.addr, 0);
-        }
-        Ok(())
+        self.native_call(code, dest, places)
     }
 
     fn direct(
@@ -740,5 +743,22 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         let code = self.load(types::I64, address, 0);
         self.builder.ins().call_indirect(signature, code, &values);
         Ok(())
+    }
+}
+
+fn single_depth(ty: Ty<'_>) -> usize {
+    match ty.kind() {
+        TyKind::Tuple(items) if items.as_slice().len() == 1 => 1 + single_depth(items.as_slice()[0]),
+        _ => 0,
+    }
+}
+
+fn is_tupled<'db>(only: Ty<'db>, params: Option<&[Ty<'db>]>) -> bool {
+    if !matches!(only.kind(), TyKind::Tuple(_)) {
+        return false;
+    }
+    match params {
+        Some([param]) => single_depth(only) == single_depth(*param) + 1,
+        _ => true,
     }
 }

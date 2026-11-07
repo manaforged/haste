@@ -1,4 +1,4 @@
-use hir_def::Lookup;
+use hir_def::attrs::AttrFlags;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{Block, InstBuilder, StackSlotData, StackSlotKind, Value, types};
 use hir_def::builtin_derive::BuiltinDeriveImplMethod as Method;
@@ -211,10 +211,7 @@ impl<'db> Lower<'_, '_, 'db> {
         let hir_def::AdtId::EnumId(id) = adt.def_id() else {
             return None;
         };
-        id.enum_variants(self.db).variants.iter().map(|(_, variant)| variant.0).find(|variant| {
-            let node = variant.lookup(self.db).id.to_node(self.db);
-            syntax::ast::HasAttrs::attrs(&node).any(|attr| attr.simple_name().as_deref() == Some(DEFAULT_ATTR))
-        })
+        id.enum_variants(self.db).variants.iter().map(|(_, variant)| variant.0).find(|variant| AttrFlags::has_attr(self.db, (*variant).into(), DEFAULT_ATTR))
     }
 
     fn derive_default(&mut self, func: FunctionId, ty: Ty<'db>, ret: Value) -> Result<(), String> {
