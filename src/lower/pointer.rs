@@ -157,10 +157,13 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn vtable_entry(&mut self, concrete: Ty<'db>, func: FunctionId, existential: GenericArgs<'db>) -> Result<i64, String> {
         let params = hir_def::GenericDefId::from(func);
-        if !hir_def::hir::generics::GenericParams::of(self.db, params).is_empty() {
+        let own = hir_def::hir::generics::GenericParams::of(self.db, params);
+        if own.len_type_or_consts() != 0 {
             return Err("generic method".to_owned());
         }
-        let args = GenericArgs::new_from_iter(std::iter::once(concrete.into()).chain(existential.iter()));
+        let erased = hir_ty::next_solver::Region::new_erased(self.infcx.interner);
+        let lifetimes = std::iter::repeat_n(erased.into(), own.len_early_bound_lifetimes());
+        let args = GenericArgs::new_from_iter(std::iter::once(concrete.into()).chain(existential.iter()).chain(lifetimes));
         let ItemContainerId::TraitId(owner) = func.loc(self.db).container else {
             return Err("vtable method outside a trait".to_owned());
         };

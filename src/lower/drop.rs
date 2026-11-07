@@ -9,6 +9,7 @@ use hir_ty::next_solver::{GenericArgs, Ty, TyKind};
 use rustc_type_ir::IntTy;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 
+use super::moves::{Cut, Step};
 use super::{Lower, Place};
 use crate::backend::{Key, Sig};
 
@@ -50,6 +51,7 @@ impl<'db> Lower<'_, '_, 'db> {
             self.builder.ins().stack_store(types::I64, zero, slot, 0);
             self.flags.insert(local, slot);
         }
+        self.make_move_paths();
         Ok(())
     }
 
@@ -61,35 +63,17 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     pub(super) fn initialized(&mut self, target: &StoredPlace) {
-        let target = target.as_ref();
-        if target.projection.as_slice().is_empty() {
-            self.set_flag(target.local, true);
+        let local = target.as_ref().local;
+        let Some(steps) = self.owned_paths(target).and_then(|paths| paths.into_iter().next()) else {
+            return;
+        };
+        if steps.is_empty() {
+            self.set_flag(local, true);
         }
+        self.clear_moved(local, &steps);
     }
 
-    pub(super) fn moved(&mut self, place: &StoredPlace) -> Result<(), String> {
-        let stored = place.as_ref();
-        if !self.flags.contains_key(&stored.local) {
-            return Ok(());
-        }
-        let mut ty = PlaceTy::from_ty(self.body.locals[stored.local].ty.as_ref());
-        let mut boxed = false;
-        for element in stored.projection.as_slice() {
-            if matches!(element, ProjectionElem::Deref) {
-                if !self.is_box(ty.ty) {
-                    return Ok(());
-                }
-                boxed = true;
-            }
-            ty = ty.projection_ty(&self.infcx, element, self.env.param_env);
-        }
-        if boxed || self.needs_drop(ty.ty) {
-            self.set_flag(stored.local, false);
-        }
-        Ok(())
-    }
-
-    fn is_box(&self, ty: Ty<'db>) -> bool {
+    pub(super) fn is_box(&self, ty: Ty<'db>) -> bool {
         let TyKind::Adt(adt, _) = ty.kind() else {
             return false;
         };
@@ -116,7 +100,8 @@ impl<'db> Lower<'_, '_, 'db> {
         };
         let done = self.if_flag(slot);
         self.set_flag(stored.local, false);
-        self.call_glue(found.ty.ty, found.addr, found.meta)?;
+        let paths = self.move_paths.get(&stored.local).cloned().unwrap_or_default();
+        self.drop_open(found.ty.ty, found.addr, found.meta, Cut::whole(&paths))?;
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
         Ok(())
@@ -127,15 +112,18 @@ impl<'db> Lower<'_, '_, 'db> {
             return Ok(());
         }
         let stored = target.as_ref();
-        let through_pointer = stored.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Deref));
-        if through_pointer {
+        let Some(steps) = self.owned_paths(target).and_then(|paths| paths.into_iter().next()) else {
             return self.call_glue(dest.ty.ty, dest.addr, dest.meta);
-        }
+        };
         let Some(slot) = self.flags.get(&stored.local).copied() else {
+            if steps.contains(&Step::Box) {
+                return self.call_glue(dest.ty.ty, dest.addr, dest.meta);
+            }
             return Ok(());
         };
+        let paths = self.paths_under(stored.local, &steps);
         let done = self.if_flag(slot);
-        self.call_glue(dest.ty.ty, dest.addr, dest.meta)?;
+        self.drop_open(dest.ty.ty, dest.addr, dest.meta, Cut::at(&paths, steps.len()))?;
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
         Ok(())
@@ -181,13 +169,13 @@ impl<'db> Lower<'_, '_, 'db> {
             self.call_glue_holder(inner, addr)?;
         }
         self.drop_impl(ty, holder)?;
-        self.drop_parts(ty, addr, meta)?;
+        self.drop_parts(ty, addr, meta, Cut::none())?;
         self.builder.ins().return_(&[]);
         self.builder.seal_all_blocks();
         Ok(())
     }
 
-    fn drop_impl(&mut self, ty: Ty<'db>, holder: Value) -> Result<(), String> {
+    pub(super) fn drop_impl(&mut self, ty: Ty<'db>, holder: Value) -> Result<(), String> {
         let Some(drop_fn) = self.infcx.interner.lang_items().Drop_drop else {
             return Ok(());
         };
@@ -208,7 +196,13 @@ impl<'db> Lower<'_, '_, 'db> {
         Ok(())
     }
 
-    fn drop_parts(&mut self, ty: Ty<'db>, addr: Value, meta: Option<Value>) -> Result<(), String> {
+    pub(super) fn drop_parts(
+        &mut self,
+        ty: Ty<'db>,
+        addr: Value,
+        meta: Option<Value>,
+        cut: Cut<'_>,
+    ) -> Result<(), String> {
         match ty.kind() {
             TyKind::Adt(adt, args) => match adt.def_id() {
                 AdtId::StructId(id) => {
@@ -218,21 +212,20 @@ impl<'db> Lower<'_, '_, 'db> {
                     let layout = self.layout(ty)?;
                     let offsets = |index: usize| layout.fields.offset(index).bytes();
                     let fields = self.fields_of(id.into(), args);
-                    self.drop_fields(&fields, &offsets, addr, meta)
+                    self.drop_fields(&fields, &offsets, addr, meta, cut)
                 }
                 AdtId::UnionId(_) => Ok(()),
-                AdtId::EnumId(id) => self.drop_enum(ty, id, args, addr),
+                AdtId::EnumId(id) => self.drop_enum(ty, id, args, addr, cut),
             },
             TyKind::Tuple(items) => {
                 let layout = self.layout(ty)?;
                 let offsets = |index: usize| layout.fields.offset(index).bytes();
-                self.drop_fields(items.as_slice(), &offsets, addr, meta)
+                self.drop_fields(items.as_slice(), &offsets, addr, meta, cut)
             }
-            TyKind::Closure(_, args) => self.drop_parts(args.as_closure().tupled_upvars_ty(), addr, meta),
+            TyKind::Closure(_, args) => self.drop_parts(args.as_closure().tupled_upvars_ty(), addr, meta, cut),
             TyKind::Array(item, _) => {
                 let count = self.layout(ty)?.fields.count();
-                let count = self.builder.ins().iconst(types::I64, count as i64);
-                self.drop_items(item, addr, count)
+                self.drop_open_items(item, addr, count as u64, cut)
             }
             TyKind::Slice(item) => self.drop_items(item, addr, meta.ok_or("slice without a length")?),
             TyKind::Dynamic(..) => {
@@ -249,6 +242,7 @@ impl<'db> Lower<'_, '_, 'db> {
         offsets: &dyn Fn(usize) -> u64,
         addr: Value,
         meta: Option<Value>,
+        cut: Cut<'_>,
     ) -> Result<(), String> {
         for (index, field) in fields.iter().enumerate() {
             if !self.needs_drop(*field) {
@@ -256,12 +250,13 @@ impl<'db> Lower<'_, '_, 'db> {
             }
             let unsized_field = self.layout(*field)?.is_unsized();
             let at = self.field_address(addr, offsets(index), *field, meta.filter(|_| unsized_field))?;
-            self.call_glue(*field, at, meta.filter(|_| unsized_field))?;
+            let paths = cut.field(index as u32);
+            self.drop_open(*field, at, meta.filter(|_| unsized_field), cut.into(&paths))?;
         }
         Ok(())
     }
 
-    fn drop_items(&mut self, item: Ty<'db>, addr: Value, count: Value) -> Result<(), String> {
+    pub(super) fn drop_items(&mut self, item: Ty<'db>, addr: Value, count: Value) -> Result<(), String> {
         if !self.needs_drop(item) {
             return Ok(());
         }
@@ -301,6 +296,7 @@ impl<'db> Lower<'_, '_, 'db> {
         id: hir_def::EnumId,
         args: GenericArgs<'db>,
         addr: Value,
+        cut: Cut<'_>,
     ) -> Result<(), String> {
         let layout = self.layout(ty)?;
         let wide = Ty::new_int(self.infcx.interner, IntTy::Isize);
@@ -326,7 +322,7 @@ impl<'db> Lower<'_, '_, 'db> {
             self.builder.switch_to_block(run);
             let shape = self.variant_fields(&layout, Some(VariantId::EnumVariantId(variant)))?;
             let offsets = |index: usize| shape.fields.offset(index).bytes();
-            self.drop_fields(&fields, &offsets, addr, None)?;
+            self.drop_fields(&fields, &offsets, addr, None, cut.variant(variant))?;
             self.builder.ins().jump(done, &[]);
             self.builder.switch_to_block(next);
         }

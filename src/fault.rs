@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 const FRAMES: usize = 24;
-const SIGNALS: [i32; 4] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP];
+const SIGNALS: [i32; 5] = [libc::SIGABRT, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP];
 const STACK_BYTES: usize = 1 << 18;
 
 struct Code {

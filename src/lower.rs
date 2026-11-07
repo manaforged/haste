@@ -27,6 +27,7 @@ mod compare;
 mod constant;
 pub mod derive;
 mod drop;
+mod moves;
 pub mod intrinsic;
 pub mod native;
 mod pointer;
@@ -67,6 +68,7 @@ pub struct Lower<'a, 'f, 'db> {
     blocks: HashMap<BasicBlockId, Block>,
     frames: HashMap<LocalId, Option<StackSlot>>,
     flags: HashMap<LocalId, StackSlot>,
+    move_paths: HashMap<LocalId, Vec<moves::MovePath>>,
     statics: HashMap<LocalId, i64>,
     slots: &'a mut Slots,
     call_conv: CallConv,
@@ -94,6 +96,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             blocks: HashMap::new(),
             frames: HashMap::new(),
             flags: HashMap::new(),
+            move_paths: HashMap::new(),
             statics: HashMap::new(),
             slots,
             call_conv,
@@ -370,6 +373,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             Rvalue::CopyForDeref(place) => {
                 let from = self.place(place)?;
                 self.copy(dest.addr, from.addr, layout.size.bytes());
+                return Ok(());
             }
             Rvalue::Ref(_, borrowed) => {
                 let place = self.place(borrowed)?;
