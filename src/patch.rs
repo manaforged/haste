@@ -46,6 +46,14 @@ pub(crate) fn start(db: RootDatabase, dump: bool, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn stop() -> RootDatabase {
+    lock().take().expect("engine is running").db
+}
+
+pub(crate) fn with_database<T>(work: impl FnOnce(&mut RootDatabase) -> T) -> T {
+    work(&mut lock().as_mut().expect("engine is running").db)
+}
+
 fn lock() -> std::sync::MutexGuard<'static, Option<Engine>> {
     ENGINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

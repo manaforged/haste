@@ -1,3 +1,5 @@
+pub mod census;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -11,32 +13,82 @@ use hir_def::FunctionId;
 use hir_def::signatures::FunctionSignature;
 use hir_ty::db::HirDatabase;
 use ide_db::RootDatabase;
+use load_cargo::SourceRootConfig;
+use paths::AbsPathBuf;
 
-use crate::{backend, patch};
+use crate::patch;
 
 const SCRIPT_CRATE: &str = "build-script-build";
 const ENTRY: &str = "main";
-const OUT_ROOT: &str = "target/engine-scripts";
+const OUT_ENV: &str = "OUT_DIR";
+const LINKS_ENV: &str = "CARGO_MANIFEST_LINKS";
 const LIMIT_SECONDS: u32 = 120;
 const RESULT_WORDS: usize = 64;
 const SHOWN_LINES: usize = 4;
 const SHOWN_FRAMES: usize = 8;
+const RESERVED_KEYS: &[&str] = &[
+    "rerun-if-changed",
+    "rerun-if-env-changed",
+    "rustc-link-lib",
+    "rustc-link-search",
+    "rustc-flags",
+    "rustc-cdylib-link-arg",
+    "rustc-bin-link-arg",
+    "rustc-link-arg",
+    "rustc-link-arg-bin",
+    "rustc-link-arg-bins",
+    "rustc-link-arg-tests",
+    "rustc-link-arg-examples",
+    "rustc-link-arg-benches",
+    "rustc-check-cfg",
+    "warning",
+    "error",
+];
 
 type Table = &'static [AtomicUsize];
+type Units = BTreeMap<String, Vec<Crate>>;
+type Exports = BTreeMap<String, Vec<(String, String)>>;
 
 struct Script {
     label: String,
     function: FunctionId,
     env: BTreeMap<String, String>,
     manifest: PathBuf,
-    real_out: Option<PathBuf>,
+    name: String,
+    out: PathBuf,
+    out_text: String,
 }
 
-enum Verdict {
-    Agree,
-    Differ(Vec<String>),
+enum Directive<'a> {
+    Cfg(&'a str),
+    Env(&'a str, &'a str),
+    Metadata(&'a str, &'a str),
+}
+
+struct Forked {
+    pid: libc::pid_t,
+    read: std::io::PipeReader,
+}
+
+struct Loaded<'a> {
+    vfs: &'a mut vfs::Vfs,
+    roots: &'a SourceRootConfig,
+    shared: &'a BTreeMap<String, String>,
+    exports: Exports,
+}
+
+/// What a build script did.
+pub enum Run {
+    Done(String),
     Failed(String),
-    NoRecord,
+}
+
+/// One build script run and the out dir of its unit.
+pub struct Outcome {
+    pub label: String,
+    pub name: String,
+    pub out: PathBuf,
+    pub run: Run,
 }
 
 fn envs_of(db: &dyn HirDatabase, krate: Crate) -> BTreeMap<String, String> {
@@ -90,28 +142,24 @@ fn main_of(db: &dyn HirDatabase, krate: Crate) -> Option<FunctionId> {
     crate::free_functions_of(db, krate).into_iter().find(|id| FunctionSignature::of(db, *id).name.as_str() == ENTRY)
 }
 
-fn scripts(db: &dyn HirDatabase, shared: &BTreeMap<String, String>) -> Vec<Script> {
-    let mut libs = BTreeMap::new();
-    for krate in all_crates(db).iter().copied().filter(|krate| !is_script(db, *krate)) {
-        if let Some(key) = package_key(&envs_of(db, krate)) {
-            libs.insert(key, krate);
-        }
-    }
-    let mut found = Vec::new();
-    for krate in all_crates(db).iter().copied().filter(|krate| is_script(db, *krate)) {
-        let mut env = envs_of(db, krate);
-        let Some(key) = package_key(&env) else { continue };
-        let Some(function) = main_of(db, krate) else { continue };
-        let lib = libs.get(&key).copied();
-        let real_out = lib.and_then(|lib| envs_of(db, lib).get("OUT_DIR").map(PathBuf::from));
-        if let Some(lib) = lib {
-            feature_envs(db, lib, &mut env);
-        }
-        let manifest = PathBuf::from(env.get("CARGO_MANIFEST_DIR").cloned().unwrap_or_default());
-        env.extend(shared.clone());
-        found.push(Script { label: format!("{} {}", key.0, key.1), function, env, manifest, real_out });
-    }
-    found
+fn dep_envs(db: &dyn HirDatabase, members: &[Crate], exports: &Exports) -> Vec<(String, String)> {
+    let libs = members.iter().copied().filter(|krate| !is_script(db, *krate));
+    let deps = libs.flat_map(|krate| krate.data(db).dependencies.iter().map(|dep| dep.crate_id));
+    let outs = deps.filter_map(|dep| dep.env(db).get(OUT_ENV));
+    outs.filter_map(|out| exports.get(&out)).flatten().cloned().collect()
+}
+
+fn script_of(db: &dyn HirDatabase, members: &[Crate], shared: &BTreeMap<String, String>, exports: &Exports) -> Option<Script> {
+    let krate = members.iter().copied().find(|krate| is_script(db, *krate))?;
+    let mut env = envs_of(db, krate);
+    let (name, version) = package_key(&env)?;
+    let function = main_of(db, krate)?;
+    feature_envs(db, krate, &mut env);
+    let manifest = PathBuf::from(env.get("CARGO_MANIFEST_DIR").cloned().unwrap_or_default());
+    let out_text = env.get(OUT_ENV)?.clone();
+    env.extend(shared.clone());
+    env.extend(dep_envs(db, members, exports));
+    Some(Script { label: format!("{name} {version}"), function, env, manifest, name, out: PathBuf::from(&out_text), out_text })
 }
 
 fn run_main(table: Table, slot: usize) {
@@ -123,7 +171,7 @@ fn run_main(table: Table, slot: usize) {
     main(result.as_mut_ptr(), &argument);
 }
 
-fn child(table: Table, slot: usize, script: &Script, out: &Path, write: std::io::PipeWriter) -> ! {
+fn child(table: Table, slot: usize, script: &Script, write: std::io::PipeWriter) -> ! {
     use std::os::fd::AsRawFd;
     // SAFETY: alarm only arms a timer for this forked child.
     unsafe { libc::alarm(LIMIT_SECONDS) };
@@ -135,7 +183,6 @@ fn child(table: Table, slot: usize, script: &Script, out: &Path, write: std::io:
         for (key, value) in &script.env {
             std::env::set_var(key, value);
         }
-        std::env::set_var("OUT_DIR", out);
     }
     let moved = std::env::set_current_dir(&script.manifest);
     if moved.is_ok() {
@@ -145,22 +192,27 @@ fn child(table: Table, slot: usize, script: &Script, out: &Path, write: std::io:
     unsafe { libc::_exit(i32::from(moved.is_err())) }
 }
 
-fn fork_script(table: Table, slot: usize, script: &Script, out: &Path) -> Result<(String, i32)> {
-    let (mut read, write) = std::io::pipe()?;
-    // SAFETY: the parent holds no engine lock here, and the child only uses state that the fork copied.
+fn fork_script(table: Table, slot: usize, script: &Script) -> Result<Forked> {
+    let (read, write) = std::io::pipe()?;
+    // SAFETY: the parent holds no engine lock and runs no other thread here, and the child only uses state that the fork copied.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         bail!("fork failed: {}", std::io::Error::last_os_error());
     }
     if pid == 0 {
         drop(read);
-        child(table, slot, script, out, write);
+        child(table, slot, script, write);
     }
     drop(write);
+    Ok(Forked { pid, read })
+}
+
+fn collect_forked(forked: Forked) -> Result<(String, i32)> {
+    let Forked { pid, mut read } = forked;
     let mut bytes = Vec::new();
     read.read_to_end(&mut bytes)?;
     let mut status = 0;
-    // SAFETY: pid is the child forked above, and status is a live local.
+    // SAFETY: pid is the child forked for this pipe, and status is a live local.
     unsafe { libc::waitpid(pid, &mut status, 0) };
     Ok((String::from_utf8_lossy(&bytes).into_owned(), status))
 }
@@ -169,79 +221,177 @@ fn directives(text: &str) -> BTreeSet<String> {
     text.lines().filter(|line| line.starts_with("cargo:")).map(str::to_owned).collect()
 }
 
-fn compare(output: &str, status: i32, out: &Path, real_out: Option<&Path>) -> Verdict {
-    if status != 0 {
-        let notes: Vec<&str> = output.lines().filter(|line| !line.starts_with("cargo:")).collect();
-        let (frames, others): (Vec<&str>, Vec<&str>) = notes.iter().partition(|line| line.starts_with("  at"));
-        let shown = others.iter().rev().take(SHOWN_LINES).rev().chain(frames.iter().take(SHOWN_FRAMES));
-        let tail = shown.copied().collect::<Vec<_>>().join(" | ");
-        return Verdict::Failed(format!("status {status:#x}: {tail}"));
+fn run_of(output: String, status: i32) -> Run {
+    if status == 0 {
+        return Run::Done(output);
     }
-    let Some(real_out) = real_out else { return Verdict::NoRecord };
-    let Some(record) = real_out.parent().map(|build| build.join("output")) else { return Verdict::NoRecord };
-    let Ok(real) = std::fs::read_to_string(record) else { return Verdict::NoRecord };
-    let real = directives(&real.replace(&*real_out.to_string_lossy(), &out.to_string_lossy()));
-    let ours = directives(output);
-    if real == ours {
-        return Verdict::Agree;
+    let notes: Vec<&str> = output.lines().filter(|line| !line.starts_with("cargo:")).collect();
+    let (frames, others): (Vec<&str>, Vec<&str>) = notes.iter().partition(|line| line.starts_with("  at"));
+    let shown = others.iter().rev().take(SHOWN_LINES).rev().chain(frames.iter().take(SHOWN_FRAMES));
+    let tail = shown.copied().collect::<Vec<_>>().join(" | ");
+    Run::Failed(format!("status {status:#x}: {tail}"))
+}
+
+fn run_batch(scripts: &[Script]) -> Result<Vec<Run>> {
+    let mut started = Vec::new();
+    for script in scripts {
+        let entered = patch::with_engine(|db, backend| backend.entry(db, script.function).map(|(slot, _)| (slot, backend.table())));
+        started.push(match entered {
+            Ok((slot, table)) => {
+                std::fs::create_dir_all(&script.out)?;
+                Ok(fork_script(table, slot, script)?)
+            }
+            Err(reason) => Err(reason),
+        });
     }
-    let extra = ours.difference(&real).map(|line| format!("+{line}"));
-    Verdict::Differ(extra.chain(real.difference(&ours).map(|line| format!("-{line}"))).collect())
+    std::thread::scope(|scope| {
+        let readers: Vec<_> = started.into_iter().map(|forked| scope.spawn(move || forked.map(collect_forked))).collect();
+        readers.into_iter().map(|reader| finish_run(reader.join().expect("reader thread"))).collect()
+    })
 }
 
-fn run_one(table: Table, slot: usize, script: &Script, root: &Path) -> Result<Verdict> {
-    let out = root.join(script.label.replace(' ', "-"));
-    std::fs::create_dir_all(&out)?;
-    let (output, status) = fork_script(table, slot, script, &out)?;
-    Ok(compare(&output, status, &out, script.real_out.as_deref()))
+fn finish_run(joined: Result<Result<(String, i32)>, String>) -> Result<Run> {
+    match joined {
+        Ok(collected) => {
+            let (output, status) = collected?;
+            Ok(run_of(output, status))
+        }
+        Err(reason) => Ok(Run::Failed(reason)),
+    }
 }
 
-#[derive(Default)]
-struct Tally {
-    agree: usize,
-    differ: usize,
-    failed: usize,
-    no_record: usize,
+fn parse_directive(line: &str) -> Option<Directive<'_>> {
+    let (rest, modern) = match line.strip_prefix("cargo::") {
+        Some(rest) => (rest, true),
+        None => (line.strip_prefix("cargo:")?, false),
+    };
+    let (key, value) = rest.split_once('=')?;
+    match key {
+        "rustc-cfg" => Some(Directive::Cfg(value)),
+        "rustc-env" => value.split_once('=').map(|(name, text)| Directive::Env(name, text)),
+        "metadata" if modern => value.split_once('=').map(|(name, text)| Directive::Metadata(name, text)),
+        _ if modern || RESERVED_KEYS.contains(&key) => None,
+        _ => Some(Directive::Metadata(key, value)),
+    }
 }
 
-impl Tally {
-    fn add(&mut self, label: &str, verdict: Verdict) {
-        match verdict {
-            Verdict::Agree => self.agree += 1,
-            Verdict::NoRecord => self.no_record += 1,
-            Verdict::Differ(lines) => {
-                self.differ += 1;
-                println!("script_differ {label}: {lines:?}");
-            }
-            Verdict::Failed(reason) => {
-                self.failed += 1;
-                println!("script_failed {label}: {reason}");
-            }
+fn add_files_under(dir: &Path, into: &mut Vec<(AbsPathBuf, Vec<u8>)>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            add_files_under(&path, into)?;
+        } else {
+            into.push((AbsPathBuf::assert_utf8(path.clone()), std::fs::read(&path)?));
         }
     }
+    Ok(())
 }
 
-pub fn run(db: RootDatabase, project: &Path) -> Result<()> {
+fn export_key(links: &str, key: &str) -> String {
+    format!("DEP_{links}_{key}").to_uppercase().replace('-', "_")
+}
+
+fn apply_output(state: &mut Loaded<'_>, members: &[Crate], script: &Script, output: &str) -> Result<()> {
+    let mut cfgs = Vec::new();
+    let mut envs = Vec::new();
+    let mut exports = Vec::new();
+    for directive in output.lines().filter_map(parse_directive) {
+        match directive {
+            Directive::Cfg(text) => cfgs.push(project_model::parse_cfg(text).map_err(anyhow::Error::msg)?),
+            Directive::Env(name, text) => envs.push((name.to_owned(), text.to_owned())),
+            Directive::Metadata(name, text) => exports.push((name.to_owned(), text.to_owned())),
+        }
+    }
+    if let Some(links) = script.env.get(LINKS_ENV) {
+        let keyed = exports.into_iter().map(|(key, text)| (export_key(links, &key), text));
+        state.exports.insert(script.out_text.clone(), keyed.collect());
+    }
+    let mut files = Vec::new();
+    add_files_under(&script.out, &mut files)?;
+    patch::with_database(|db| {
+        let built: Vec<Crate> = members.iter().copied().filter(|krate| !is_script(db, *krate)).collect();
+        for krate in built {
+            krate.add_script_output(db, &cfgs, &envs);
+        }
+        if !files.is_empty() {
+            load_cargo::add_files(db, state.vfs, state.roots, files);
+        }
+    });
+    Ok(())
+}
+
+fn units_of(db: &dyn HirDatabase) -> Units {
+    let mut units = Units::new();
+    for krate in all_crates(db).iter().copied() {
+        if let Some(out) = krate.env(db).get(OUT_ENV) {
+            units.entry(out).or_default().push(krate);
+        }
+    }
+    units
+}
+
+fn visit(db: &dyn HirDatabase, units: &Units, krate: Crate, levels: &mut BTreeMap<Crate, usize>) -> usize {
+    if let Some(level) = levels.get(&krate) {
+        return *level;
+    }
+    let out = krate.env(db).get(OUT_ENV);
+    let members = out.as_ref().and_then(|out| units.get(out)).map_or(std::slice::from_ref(&krate), Vec::as_slice);
+    levels.extend(members.iter().map(|member| (*member, 0)));
+    let mut deepest = 0;
+    for member in members {
+        for dep in &member.data(db).dependencies {
+            deepest = deepest.max(visit(db, units, dep.crate_id, levels));
+        }
+    }
+    let level = deepest + usize::from(out.is_some());
+    levels.extend(members.iter().map(|member| (*member, level)));
+    level
+}
+
+fn layers_of(db: &dyn HirDatabase, units: &Units) -> Vec<Vec<String>> {
+    let mut levels = BTreeMap::new();
+    for krate in all_crates(db).iter().copied() {
+        visit(db, units, krate, &mut levels);
+    }
+    let mut layers: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (out, members) in units {
+        layers.entry(levels[&members[0]]).or_default().push(out.clone());
+    }
+    layers.into_values().collect()
+}
+
+fn run_outs(state: &mut Loaded<'_>, units: &Units, outs: &[String], outcomes: &mut Vec<Outcome>) -> Result<()> {
+    let scripts = patch::with_engine(|db, _| {
+        let found = outs.iter().filter_map(|out| script_of(db, &units[out], state.shared, &state.exports));
+        found.collect::<Vec<_>>()
+    });
+    let runs = run_batch(&scripts)?;
+    for (script, run) in scripts.into_iter().zip(runs) {
+        match &run {
+            Run::Done(output) => apply_output(state, &units[&script.out_text], &script, output)?,
+            Run::Failed(reason) => println!("script_failed {}: {reason}", script.label),
+        }
+        outcomes.push(Outcome { label: script.label, name: script.name, out: script.out, run });
+    }
+    Ok(())
+}
+
+/// Runs the build scripts layer by layer in parallel and applies each output to its unit.
+pub fn run_all(db: RootDatabase, vfs: &mut vfs::Vfs, roots: &SourceRootConfig) -> Result<(RootDatabase, Vec<Outcome>)> {
     let shared = target_envs()?;
     patch::start(db, false, false)?;
-    let found = patch::with_engine(|db, _| scripts(db, &shared));
-    let root = project.join(OUT_ROOT);
-    let mut tally = Tally::default();
-    for script in &found {
-        let entered = patch::with_engine(|db, backend| backend.entry(db, script.function).map(|(slot, _)| (slot, backend.table())));
-        let verdict = match entered {
-            Ok((slot, table)) => run_one(table, slot, script, &root)?,
-            Err(reason) => Verdict::Failed(reason),
-        };
-        tally.add(&script.label, verdict);
+    let (units, layers) = patch::with_engine(|db, _| {
+        let units = units_of(db);
+        let layers = layers_of(db, &units);
+        (units, layers)
+    });
+    let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let mut state = Loaded { vfs, roots, shared: &shared, exports: BTreeMap::new() };
+    let mut outcomes = Vec::new();
+    for layer in &layers {
+        for outs in layer.chunks(cores) {
+            run_outs(&mut state, &units, outs, &mut outcomes)?;
+        }
     }
-    println!(
-        "scripts total={} agree={} differ={} failed={} no_record={}",
-        found.len(),
-        tally.agree,
-        tally.differ,
-        tally.failed,
-        tally.no_record
-    );
-    Ok(())
+    Ok((patch::stop(), outcomes))
 }

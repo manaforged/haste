@@ -20,7 +20,7 @@ use hir_def::nameres::crate_def_map;
 use hir_def::signatures::FunctionSignature;
 use hir_def::ModuleDefId;
 use hir_ty::db::HirDatabase;
-use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
+use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_units_at};
 use project_model::{CargoConfig, RustLibSource};
 
 const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | index PATH | demand PATH ENTRY | scripts PATH | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH";
@@ -53,15 +53,18 @@ fn program() -> Result<()> {
         base_db::demand::enable();
     }
     let started = Instant::now();
-    let (db, vfs, _proc) = load_workspace_at(&path, &config, &load, &|_| {})?;
+    let (db, mut vfs, _proc, roots) = load_units_at(&path, &config, &load, &|_| {})?;
     println!("load {:.2}s", started.elapsed().as_secs_f64());
+    let ran = Instant::now();
+    let (db, outcomes) = script::run_all(db, &mut vfs, &roots)?;
+    println!("build_scripts {:.2}s", ran.elapsed().as_secs_f64());
     if args[0] == "index" {
         index::oracle::run(&db, &vfs);
         index::headers::run(&db, &vfs);
         return Ok(());
     }
     if args[0] == "scripts" {
-        return script::run(db, &path);
+        return script::census::run(&outcomes, &path);
     }
     if args[0] == "demand" {
         return demand::run(db, args.get(2).context(USAGE)?);
