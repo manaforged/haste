@@ -7,6 +7,11 @@ use cranelift_codegen::{LabelOrOffset, MachExceptionHandler};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{Linkage, Module};
 
+use hir_ty::mir::MirBody;
+use hir_ty::next_solver::{Ty, TyKind};
+use rustc_type_ir::IntTy;
+use rustc_type_ir::inherent::IntoKind;
+
 use super::{Backend, INTERNAL_CONV, Sig, pointer_signature};
 
 fn handler_offset(target: LabelOrOffset) -> Option<u32> {
@@ -82,4 +87,13 @@ impl Backend {
         ENTRY.store(self.module.get_finalized_function(id) as usize, Ordering::Release);
         Ok(())
     }
+}
+
+pub(super) fn takes_and_returns_i64(body: &MirBody<'_>) -> bool {
+    let long = |ty: Ty<'_>| matches!(ty.kind(), TyKind::Int(IntTy::I64));
+    let ret = body.locals.iter().next().is_some_and(|(_, local)| long(local.ty.as_ref()));
+    let [param] = body.param_locals[..] else {
+        return false;
+    };
+    ret && long(body.locals[param].ty.as_ref())
 }

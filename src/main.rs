@@ -3,6 +3,7 @@ mod fault;
 mod unwind;
 mod collect;
 mod lower;
+mod macros;
 mod image;
 mod demand;
 mod index;
@@ -24,7 +25,7 @@ use hir_ty::db::HirDatabase;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_units_at};
 use project_model::{CargoConfig, RustLibSource};
 
-const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | index PATH | demand PATH ENTRY | scripts PATH | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH";
+const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | index PATH | demand PATH ENTRY | scripts PATH | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH | macros PATH";
 
 fn main() -> Result<()> {
     let program = std::thread::Builder::new().name("program".to_owned()).stack_size(patch::PROGRAM_STACK).spawn(|| {
@@ -44,8 +45,8 @@ fn program() -> Result<()> {
         ..Default::default()
     };
     let load = LoadCargoConfig {
-        load_out_dirs_from_check: true,
-        with_proc_macro_server: ProcMacroServerChoice::Sysroot,
+        load_out_dirs_from_check: false,
+        with_proc_macro_server: ProcMacroServerChoice::Engine,
         prefill_caches: false,
         num_worker_threads: 1,
         proc_macro_processes: PROC_MACRO_PROCESSES,
@@ -54,7 +55,8 @@ fn program() -> Result<()> {
         base_db::demand::enable();
     }
     let started = Instant::now();
-    let (db, mut vfs, _proc, roots) = load_units_at(&path, &config, &load, &|_| {})?;
+    let (mut db, mut vfs, _proc, roots) = load_units_at(&path, &config, &load, &|_| {})?;
+    macros::declare(&mut db, &vfs);
     println!("load {:.2}s", started.elapsed().as_secs_f64());
     let ran = Instant::now();
     let (db, outcomes) = script::run_all(db, &mut vfs, &roots)?;
@@ -63,6 +65,9 @@ fn program() -> Result<()> {
         index::oracle::run(&db, &vfs);
         index::headers::run(&db, &vfs);
         return Ok(());
+    }
+    if args[0] == "macros" {
+        return macros::census::run(&db, &vfs, &path, &config);
     }
     if args[0] == "scripts" {
         return script::census::run(&outcomes, &path);

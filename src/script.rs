@@ -389,6 +389,7 @@ pub fn run_all(db: RootDatabase, vfs: &mut vfs::Vfs, roots: &SourceRootConfig) -
     for layer in &layers {
         for outs in layer.chunks(cores) {
             run_outs(&mut state, &units, outs, &mut outcomes)?;
+            crate::macros::refresh();
         }
     }
     Ok((patch::stop(), outcomes))

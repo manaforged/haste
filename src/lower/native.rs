@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind, Type, Value, types};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind, Value, types};
 use hir_def::StaticId;
 use hir_def::attrs::AttrFlags;
 use hir_ty::mir::PlaceTy;

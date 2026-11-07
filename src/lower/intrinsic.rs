@@ -548,7 +548,11 @@ impl<'db> Lower<'_, '_, 'db> {
                 self.store(value, dest.addr, 0);
             }
             Op::TypeId => {
-                let text = format!("{:?}", generic.ok_or("type_id without a type")?);
+                let erased = hir_ty::next_solver::Region::new_erased(self.infcx.interner);
+                let generic = generic.ok_or("type_id without a type")?;
+                let text = format!("{:?}", rustc_type_ir::fold_regions(self.infcx.interner, generic, |region, _| {
+                    if matches!(region.kind(), rustc_type_ir::RegionKind::ReBound(..)) { region } else { erased }
+                }));
                 let mut hasher = std::hash::DefaultHasher::new();
                 std::hash::Hash::hash(&text, &mut hasher);
                 let low = std::hash::Hasher::finish(&hasher);

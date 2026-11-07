@@ -19,7 +19,6 @@ use hir_ty::method_resolution::is_dyn_method;
 use hir_ty::mir::{MirBody, Operand, OperandKind, PlaceTy};
 use hir_ty::next_solver::infer::DbInternerInferExt;
 use hir_ty::next_solver::{DbInterner, GenericArgs, Ty, TyKind, TypingMode};
-use rustc_type_ir::IntTy;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 
 use hir_ty::mir::MirLowerError;
@@ -172,14 +171,26 @@ impl Backend {
     }
 
     pub fn entry<'db>(&mut self, db: &'db dyn HirDatabase, func: FunctionId) -> Result<(usize, bool), String> {
-        let env = env_of(db, func);
-        let target = Target::Func(func, GenericArgs::empty());
+        let (slot, body) = self.instance(db, func, GenericArgs::empty(), func)?;
+        Ok((slot, entry::takes_and_returns_i64(body)))
+    }
+
+    /// Gives the table slot of `func` with `args`, resolving impls as `scope` sees them, called through `enter`.
+    pub fn instance<'db>(
+        &mut self,
+        db: &'db dyn HirDatabase,
+        func: FunctionId,
+        args: GenericArgs<'db>,
+        scope: FunctionId,
+    ) -> Result<(usize, &'db MirBody<'db>), String> {
+        let env = env_of(db, scope);
+        let target = Target::Func(func, args);
         let body = body_of(db, env, &target)?;
         let sig = signature_of(db, env, body)?;
         let key = key_of(&target).ok_or("entry is not compiled")?;
         let slot = self.slots.get(key, sig, env.store())?;
         self.publish_stubs()?;
-        Ok((slot, takes_and_returns_i64(body)))
+        Ok((slot, body))
     }
 
     pub fn replay<'db>(&mut self, db: &'db dyn HirDatabase, order: &[usize]) {
@@ -564,15 +575,6 @@ pub fn key_of(target: &Target<'_>) -> Option<Key> {
 pub fn pointer_signature(signature: &mut Signature, sig: Sig) {
     let count = sig.params + usize::from(sig.ret);
     signature.params.extend((0..count).map(|_| AbiParam::new(types::I64)));
-}
-
-fn takes_and_returns_i64(body: &MirBody<'_>) -> bool {
-    let long = |ty: Ty<'_>| matches!(ty.kind(), TyKind::Int(IntTy::I64));
-    let ret = body.locals.iter().next().is_some_and(|(_, local)| long(local.ty.as_ref()));
-    let [param] = body.param_locals[..] else {
-        return false;
-    };
-    ret && long(body.locals[param].ty.as_ref())
 }
 
 fn name_of(db: &dyn HirDatabase, target: &Target<'_>) -> String {

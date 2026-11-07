@@ -26,6 +26,12 @@ ide-db = { path = "ra/crates/ide-db" }
 paths = { path = "ra/crates/paths" }
 hir-expand = { path = "ra/crates/hir-expand" }
 vfs = { path = "ra/crates/vfs" }
+syntax = { path = "ra/crates/syntax" }
+span = { path = "ra/crates/span" }
+tt = { path = "ra/crates/tt" }
+intern = { path = "ra/crates/intern" }
+proc-macro-api = { path = "ra/crates/proc-macro-api", features = ["engine"] }
+proc-macro-srv = { path = "ra/crates/proc-macro-srv", features = ["engine"] }
 cranelift-codegen = "0.137.1"
 cranelift-frontend = "0.137.1"
 cranelift-jit = "0.137.1"

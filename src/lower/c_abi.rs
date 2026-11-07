@@ -1,7 +1,7 @@
 use cranelift_codegen::ir::{AbiParam, ArgumentPurpose, Signature, Type, types};
 use hir_def::{AdtId, VariantId};
 use hir_ty::next_solver::{Ty, TyKind};
-use rustc_type_ir::inherent::{IntoKind, SliceLike as _};
+use rustc_type_ir::inherent::IntoKind;
 
 use super::Lower;
 
