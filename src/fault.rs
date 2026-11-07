@@ -4,17 +4,45 @@ const FRAMES: usize = 24;
 const SIGNALS: [i32; 5] = [libc::SIGABRT, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP];
 const STACK_BYTES: usize = 1 << 18;
 
+/// A call site that has an exception handler, as offsets into its function.
+#[derive(Clone, Copy)]
+pub struct Site {
+    pub ret: u32,
+    pub handler: u32,
+    pub frame_offset: u32,
+}
+
 struct Code {
     start: usize,
     size: usize,
     name: String,
+    sites: Vec<Site>,
+}
+
+/// What owns a return address.
+pub enum Frame {
+    Handler { pc: usize, frame_offset: usize },
+    Generated,
+    Native(String),
 }
 
 static CODE: Mutex<Vec<Code>> = Mutex::new(Vec::new());
 
-pub fn remember(start: usize, size: usize, name: String) {
+pub fn remember(start: usize, size: usize, name: String, sites: Vec<Site>) {
     if let Ok(mut code) = CODE.lock() {
-        code.push(Code { start, size, name });
+        code.push(Code { start, size, name, sites });
+    }
+}
+
+pub fn frame_at(ret: usize) -> Frame {
+    let code = CODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(item) = code.iter().rev().find(|item| ret >= item.start && ret < item.start + item.size) else {
+        return Frame::Native(host_name(ret).unwrap_or_else(|| format!("{ret:#x}")));
+    };
+    let offset = ret - item.start;
+    match item.sites.iter().find(|site| site.ret as usize == offset) {
+        Some(site) => Frame::Handler { pc: item.start + site.handler as usize, frame_offset: site.frame_offset as usize },
+        None => Frame::Generated,
     }
 }
 
@@ -39,9 +67,12 @@ unsafe fn registers(context: *mut libc::c_void) -> (usize, usize) {
 fn host_name(pc: usize) -> Option<String> {
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
     // SAFETY: dladdr only reads pc as a number and fills the local info.
-    let found = unsafe { libc::dladdr(pc as *const libc::c_void, &mut info) } != 0 && !info.dli_sname.is_null();
-    // SAFETY: dladdr returned a nul-terminated symbol name that lives as long as the image.
-    found.then(|| unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy().into_owned())
+    if unsafe { libc::dladdr(pc as *const libc::c_void, &mut info) } == 0 {
+        return None;
+    }
+    let text = if info.dli_sname.is_null() { info.dli_fname } else { info.dli_sname };
+    // SAFETY: dladdr filled text with a nul-terminated name that lives as long as the image, or left it null.
+    (!text.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned())
 }
 
 extern "C" fn on_fault(signal: i32, info: *mut libc::siginfo_t, context: *mut libc::c_void) {

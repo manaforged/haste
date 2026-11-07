@@ -566,12 +566,7 @@ impl<'db> Lower<'_, '_, 'db> {
                 self.store(data, dest.addr, 0);
                 self.store(len, dest.addr, 8);
             }
-            Op::CatchUnwind => {
-                let cell = self.load(types::I64, args[0].addr, 0);
-                self.call_cell(cell, crate::backend::Sig { params: 1, ret: false }, &[args[1].addr]);
-                let zero = self.builder.ins().iconst(types::I8, 0);
-                self.store(zero, dest.addr, 0);
-            }
+            Op::CatchUnwind => self.catch_unwind(dest, args)?,
             Op::Offset => self.offset(dest, args)?,
             Op::RawPtr => self.raw_ptr(dest, args)?,
             Op::Metadata => {

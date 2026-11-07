@@ -166,9 +166,7 @@ fn run_main(table: Table, slot: usize) {
     let mut result = [0_u64; RESULT_WORDS];
     let argument = 0_i64;
     let code = table[slot].load(std::sync::atomic::Ordering::Acquire);
-    // SAFETY: the slot holds code taking a return pointer and an argument pointer; main reads neither past these live locals.
-    let main: extern "C" fn(*mut u64, *const i64) = unsafe { std::mem::transmute(code) };
-    main(result.as_mut_ptr(), &argument);
+    crate::backend::enter(code, result.as_mut_ptr(), &argument);
 }
 
 fn child(table: Table, slot: usize, script: &Script, write: std::io::PipeWriter) -> ! {

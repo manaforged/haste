@@ -260,11 +260,11 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     pub(super) fn call_cell(&mut self, cell: Value, sig: Sig, values: &[Value]) {
-        let mut signature = Signature::new(self.call_conv);
+        let mut signature = Signature::new(crate::backend::INTERNAL_CONV);
         pointer_signature(&mut signature, sig);
         let signature = self.builder.import_signature(signature);
         let code = self.load(types::I64, cell, 0);
-        self.builder.ins().call_indirect(signature, code, values);
+        self.invoke(signature, code, values);
     }
 
     pub(super) fn dyn_call(

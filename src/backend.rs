@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Result, anyhow};
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature, TrapCode, types};
+use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
@@ -27,6 +28,7 @@ use crate::lower::Lower;
 use crate::lower::native::NativeSig;
 
 mod compiler;
+mod entry;
 mod slots;
 mod specialize;
 
@@ -37,6 +39,12 @@ use slots::TABLE_SLOTS;
 const PANIC_HANDLER: &str = "panic_impl";
 const STD_CRATE: &str = "std";
 const STD_PANIC_HANDLER: &str = "panic_handler";
+const RUST_SYMBOLS: &[(&str, &str)] = &[
+    ("__rust_start_panic", "panic_unwind"),
+    ("__rust_panic_cleanup", "panic_unwind"),
+    ("__rust_drop_panic", STD_CRATE),
+    ("__rust_foreign_exception", STD_CRATE),
+];
 const CLONE: &str = "clone";
 const DROP_GLUE: &str = "drop_glue";
 const CONST_EVAL_SELECT: &str = "const_eval_select";
@@ -103,21 +111,21 @@ pub struct Backend {
     pub stubs: Vec<(String, String)>,
     order: Vec<usize>,
     pub compiled_total: usize,
-    unmapped: Vec<(FuncId, usize, String)>,
+    unmapped: Vec<(FuncId, usize, String, Vec<crate::fault::Site>)>,
     cursor: usize,
     serial: usize,
     dump: bool,
     pub verbose: bool,
 }
 
-pub fn call(table: &[AtomicUsize], slot: usize, value: i64) -> i64 {
-    let code = table[slot].load(Ordering::Acquire);
-    // SAFETY: slot holds finalized code taking (return pointer, argument pointer) for (i64) -> i64, checked by entry, and code memory is never freed.
-    let code: extern "C" fn(*mut i64, *const i64) = unsafe { std::mem::transmute(code) };
-    let mut result = 0;
-    code(&mut result, &value);
-    result
-}
+/// The calling convention of generated functions, which lets a try_call handler assume no preserved registers.
+pub const INTERNAL_CONV: CallConv = CallConv::Tail;
+
+const STUB_NAME: &str = "stub";
+
+pub use entry::{call, enter};
+use entry::handler_sites;
+
 
 impl Backend {
     pub fn new(dump: bool, verbose: bool) -> Result<Self> {
@@ -125,7 +133,7 @@ impl Backend {
         let builder = JITBuilder::with_flags(&flags, default_libcall_names()).map_err(|e| anyhow!("{e}"))?;
         let module = JITModule::new(builder);
         let table = (0..TABLE_SLOTS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
-        Ok(Self {
+        let mut backend = Self {
             ctx: module.make_context(),
             module,
             builder: FunctionBuilderContext::new(),
@@ -150,7 +158,9 @@ impl Backend {
             serial: 0,
             dump,
             verbose,
-        })
+        };
+        backend.compile_entry().map_err(|e| anyhow!("{e}"))?;
+        Ok(backend)
     }
 
     pub fn functions(&self) -> Vec<FunctionId> {
@@ -347,8 +357,8 @@ impl Backend {
             made.push((slot, self.compile_stub(slot)?));
         }
         self.module.finalize_definitions().map_err(|e| e.to_string())?;
-        for (id, size, name) in std::mem::take(&mut self.unmapped) {
-            crate::fault::remember(self.module.get_finalized_function(id) as usize, size, name);
+        for (id, size, name, sites) in std::mem::take(&mut self.unmapped) {
+            crate::fault::remember(self.module.get_finalized_function(id) as usize, size, name, sites);
         }
         for (slot, id) in made {
             let code = self.module.get_finalized_function(id);
@@ -368,7 +378,10 @@ impl Backend {
         let mut signature = self.module.make_signature();
         match native {
             Some(native) => native.signature(&mut signature),
-            None => pointer_signature(&mut signature, sig),
+            None => {
+                signature.call_conv = INTERNAL_CONV;
+                pointer_signature(&mut signature, sig);
+            }
         }
         let id = self.module.declare_function(&name, Linkage::Local, &signature).map_err(|e| e.to_string())?;
         self.ctx.func.signature = signature;
@@ -376,17 +389,18 @@ impl Backend {
     }
 
     fn define(&mut self, id: FuncId) -> Result<FuncId, String> {
-        let defined = self.module.define_function(id, &mut self.ctx).map_err(|e| format!("{e:?}"));
-        self.module.clear_context(&mut self.ctx);
-        defined.map(|()| id)
+        self.define_named(id, STUB_NAME)
     }
 
     fn define_named(&mut self, id: FuncId, name: &str) -> Result<FuncId, String> {
-        self.module.define_function(id, &mut self.ctx).map_err(|e| format!("{e:?}"))?;
-        let size = self.ctx.compiled_code().map_or(0, |code| code.code_info().total_size as usize);
-        self.unmapped.push((id, size, name.to_owned()));
+        let defined = self.module.define_function(id, &mut self.ctx).map_err(|e| format!("{e:?}"));
+        if defined.is_ok() {
+            let size = self.ctx.compiled_code().map_or(0, |code| code.code_info().total_size as usize);
+            let sites = self.ctx.compiled_code().map(handler_sites).unwrap_or_default();
+            self.unmapped.push((id, size, name.to_owned(), sites));
+        }
         self.module.clear_context(&mut self.ctx);
-        Ok(id)
+        defined.map(|()| id)
     }
 
     fn compile_stub(&mut self, slot: usize) -> Result<FuncId, String> {
@@ -410,7 +424,10 @@ impl Backend {
         let mut target = Signature::new(config.default_call_conv);
         match &native {
             Some(native) => native.signature(&mut target),
-            None => pointer_signature(&mut target, sig),
+            None => {
+                target.call_conv = INTERNAL_CONV;
+                pointer_signature(&mut target, sig);
+            }
         }
         let target = builder.import_signature(target);
         let address = builder.ins().iconst(types::I64, address);
@@ -624,13 +641,22 @@ fn signature_of<'db>(
     Ok(Sig { params, ret: sized(ret.ty.as_ref())? })
 }
 
-fn std_panic_handler(db: &dyn HirDatabase) -> Option<FunctionId> {
+fn crate_function(db: &dyn HirDatabase, crate_name: &str, name: &str) -> Option<FunctionId> {
     let krate = base_db::all_crates(db).iter().copied().find(|krate| {
-        krate.extra_data(db).display_name.as_ref().is_some_and(|name| name.to_string() == STD_CRATE)
+        krate.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == crate_name)
     })?;
     crate::free_functions_of(db, krate)
         .into_iter()
-        .find(|func| FunctionSignature::of(db, *func).name.as_str() == STD_PANIC_HANDLER)
+        .find(|func| FunctionSignature::of(db, *func).name.as_str() == name && FunctionSignature::of(db, *func).has_body())
+}
+
+fn std_panic_handler(db: &dyn HirDatabase) -> Option<FunctionId> {
+    crate_function(db, STD_CRATE, STD_PANIC_HANDLER)
+}
+
+fn rust_symbol(db: &dyn HirDatabase, symbol: &str) -> Option<FunctionId> {
+    let (_, crate_name) = RUST_SYMBOLS.iter().find(|(name, _)| *name == symbol)?;
+    crate_function(db, crate_name, symbol)
 }
 
 pub fn operand_ty<'db>(
@@ -736,7 +762,11 @@ pub fn resolve_def<'db>(
             };
             return Ok(Resolved { target, shape: Shape::Direct });
         }
-        return Ok(Resolved { target: Target::Foreign(AttrFlags::link_name(db, imp.into()).map_or(name, |symbol| symbol.as_str().to_owned())), shape: Shape::Direct });
+        let symbol = AttrFlags::link_name(db, imp.into()).map_or(name.clone(), |symbol| symbol.as_str().to_owned());
+        if let Some(defined) = rust_symbol(db, &symbol) {
+            return Ok(Resolved { target: Target::Func(defined, GenericArgs::empty()), shape: Shape::Direct });
+        }
+        return Ok(Resolved { target: Target::Foreign(symbol), shape: Shape::Direct });
     }
     if let Some((func, args)) = specialize::specialized(db, env, imp, args) {
         return Ok(Resolved { target: Target::Func(func, args), shape: Shape::Direct });

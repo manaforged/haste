@@ -6,6 +6,7 @@ use hir_ty::next_solver::{Ty, TyKind};
 use rustc_type_ir::Binder;
 use rustc_type_ir::inherent::IntoKind;
 
+use super::c_abi::Pass;
 use super::{Lower, Place, intrinsic};
 use crate::backend::{Key, Sig, Target, key_of, resolve_def};
 
@@ -13,14 +14,22 @@ const THREAD_LOCAL_ATTR: &str = "thread_local";
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct NativeSig {
-    pub params: Vec<Type>,
-    pub ret: Option<Type>,
+    pub params: Vec<Pass>,
+    pub ret: Option<Pass>,
 }
 
 impl NativeSig {
     pub fn signature(&self, signature: &mut Signature) {
-        signature.params.extend(self.params.iter().map(|ty| AbiParam::new(*ty)));
-        signature.returns.extend(self.ret.iter().map(|ty| AbiParam::new(*ty)));
+        for param in &self.params {
+            param.add_param(signature);
+        }
+        if let Some(ret) = &self.ret {
+            ret.add_return(signature);
+        }
+    }
+
+    pub fn arity(&self) -> usize {
+        self.params.len()
     }
 }
 
@@ -59,20 +68,31 @@ impl<'db> Lower<'_, '_, 'db> {
         let key = key_of(&target).ok_or("native pointer to a target without code")?;
         let (params, ret) = self.target_shape(&target)?;
         let native = self.native_sig(&params, ret)?;
-        let sig = Sig { params: native.params.len(), ret: native.ret.is_some() };
+        let sig = Sig { params: native.arity(), ret: native.ret.is_some() };
         self.slots.get(Key::Native(Box::new(key), native), sig, self.env.store())
     }
 
     fn native_sig(&self, params: &[Ty<'db>], ret: Ty<'db>) -> Result<NativeSig, String> {
-        let mut types = Vec::with_capacity(params.len());
+        let mut passes = Vec::with_capacity(params.len());
         for param in params {
-            if self.layout(*param)?.size.bytes() != 0 {
-                types.push(self.scalar(*param)?.ty);
-            }
+            passes.extend(self.pass_of(*param)?);
         }
-        let layout = self.layout(ret)?;
-        let ret = if layout.size.bytes() == 0 || layout.is_uninhabited() { None } else { Some(self.scalar(ret)?.ty) };
-        Ok(NativeSig { params: types, ret })
+        let ret = if self.layout(ret)?.is_uninhabited() { None } else { self.pass_of(ret)? };
+        Ok(NativeSig { params: passes, ret })
+    }
+
+    fn take_param(&mut self, pass: &Pass, values: &mut impl Iterator<Item = Value>, size: u64) -> Result<Value, String> {
+        match pass {
+            Pass::Words(words) => {
+                let addr = self.frame(size);
+                for (_, offset) in words {
+                    let value = values.next().ok_or("native argument")?;
+                    self.store(value, addr, *offset as i32);
+                }
+                Ok(addr)
+            }
+            Pass::Stack(_) | Pass::Pointer(_) => values.next().ok_or_else(|| "native argument".to_owned()),
+        }
     }
 
     pub fn native(mut self, target: Target<'db>, native: &NativeSig) -> Result<(), String> {
@@ -80,26 +100,36 @@ impl<'db> Lower<'_, '_, 'db> {
         self.builder.append_block_params_for_function_params(entry);
         self.builder.switch_to_block(entry);
         let mut values = self.builder.block_params(entry).to_vec().into_iter();
+        let sret = match &native.ret {
+            Some(ret) if ret.in_memory() => Some(values.next().ok_or("struct return pointer")?),
+            _ => None,
+        };
         let (params, ret) = self.target_shape(&target)?;
+        let mut passes = native.params.iter();
         let mut places = Vec::with_capacity(params.len());
         for param in params {
             let size = self.layout(param)?.size.bytes();
-            let addr = self.frame(size);
-            if size != 0 {
-                let value = values.next().ok_or("native argument")?;
-                self.store(value, addr, 0);
-            }
+            let addr = match size {
+                0 => self.frame(0),
+                _ => {
+                    let pass = passes.next().ok_or("native parameter shape")?;
+                    self.take_param(pass, &mut values, size)?
+                }
+            };
             places.push(Place { addr, ty: PlaceTy::from_ty(param), meta: None });
         }
-        let addr = self.frame(self.layout(ret)?.size.bytes());
+        let addr = match sret {
+            Some(pointer) => pointer,
+            None => self.frame(self.layout(ret)?.size.bytes()),
+        };
         let dest = Place { addr, ty: PlaceTy::from_ty(ret), meta: None };
         self.direct(&target, dest, None, &places)?;
-        match native.ret {
-            Some(ty) => {
-                let value = self.load(ty, addr, 0);
-                self.builder.ins().return_(&[value]);
+        match &native.ret {
+            Some(Pass::Words(words)) => {
+                let results: Vec<Value> = words.iter().map(|(ty, offset)| self.load(*ty, addr, *offset as i32)).collect();
+                self.builder.ins().return_(&results);
             }
-            None => {
+            _ => {
                 self.builder.ins().return_(&[]);
             }
         }
@@ -113,27 +143,42 @@ impl<'db> Lower<'_, '_, 'db> {
         self.builder.ins().stack_addr(types::I64, slot, 0)
     }
 
+    fn push_arg(&mut self, pass: &Pass, place: &Place<'db>, values: &mut Vec<Value>) -> Result<(), String> {
+        match pass {
+            Pass::Words(words) => values.extend(words.iter().map(|(ty, offset)| self.load(*ty, place.addr, *offset as i32))),
+            Pass::Stack(_) => values.push(place.addr),
+            Pass::Pointer(size) => {
+                let copy = self.frame(u64::from(*size));
+                self.copy(copy, place.addr, u64::from(*size));
+                values.push(copy);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn native_call(&mut self, code: Value, dest: Place<'db>, places: &[Place<'db>]) -> Result<(), String> {
         let mut signature = Signature::new(self.call_conv);
-        let mut values = Vec::with_capacity(places.len());
-        for place in places {
-            if self.layout(place.ty.ty)?.size.bytes() == 0 {
-                continue;
-            }
-            let scalar = self.scalar(place.ty.ty)?;
-            signature.params.push(AbiParam::new(scalar.ty));
-            values.push(self.load(scalar.ty, place.addr, 0));
-        }
+        let mut values = Vec::with_capacity(places.len() + 1);
         let layout = self.layout(dest.ty.ty)?;
-        let ret = if layout.size.bytes() == 0 || layout.is_uninhabited() { None } else { Some(self.scalar(dest.ty.ty)?) };
-        if let Some(ret) = ret {
-            signature.returns.push(AbiParam::new(ret.ty));
+        let ret = if layout.is_uninhabited() { None } else { self.pass_of(dest.ty.ty)? };
+        if let Some(ret) = &ret {
+            ret.add_return(&mut signature);
+            if ret.in_memory() {
+                values.push(dest.addr);
+            }
+        }
+        for place in places {
+            let Some(pass) = self.pass_of(place.ty.ty)? else { continue };
+            pass.add_param(&mut signature);
+            self.push_arg(&pass, place, &mut values)?;
         }
         let signature = self.builder.import_signature(signature);
         let call = self.builder.ins().call_indirect(signature, code, &values);
-        if ret.is_some() {
-            let result = self.builder.inst_results(call)[0];
-            self.store(result, dest.addr, 0);
+        if let Some(Pass::Words(words)) = &ret {
+            let results = self.builder.inst_results(call).to_vec();
+            for ((_, offset), result) in words.iter().zip(results) {
+                self.store(result, dest.addr, *offset as i32);
+            }
         }
         Ok(())
     }

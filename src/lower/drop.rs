@@ -91,16 +91,19 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn drop_local(&mut self, place: &StoredPlace) -> Result<(), String> {
         let found = self.place(place)?;
+        self.drop_flagged(place.as_ref().local, found)
+    }
+
+    pub(super) fn drop_flagged(&mut self, local: LocalId, found: Place<'db>) -> Result<(), String> {
         if !self.needs_drop(found.ty.ty) {
             return Ok(());
         }
-        let stored = place.as_ref();
-        let Some(slot) = self.flags.get(&stored.local).copied() else {
+        let Some(slot) = self.flags.get(&local).copied() else {
             return Ok(());
         };
         let done = self.if_flag(slot);
-        self.set_flag(stored.local, false);
-        let paths = self.move_paths.get(&stored.local).cloned().unwrap_or_default();
+        self.set_flag(local, false);
+        let paths = self.move_paths.get(&local).cloned().unwrap_or_default();
         self.drop_open(found.ty.ty, found.addr, found.meta, Cut::whole(&paths))?;
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);

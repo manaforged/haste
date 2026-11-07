@@ -23,6 +23,7 @@ use rustc_type_ir::{FloatTy, IntTy, UintTy};
 use crate::backend::{Resolved, Shape, Sig, Slots, Target, key_of, pointer_signature, resolve};
 
 mod arith;
+mod c_abi;
 mod compare;
 mod constant;
 pub mod derive;
@@ -32,6 +33,7 @@ pub mod intrinsic;
 pub mod native;
 mod pointer;
 mod promote;
+mod unwind;
 mod variant;
 
 #[derive(Clone, Copy)]
@@ -74,6 +76,8 @@ pub struct Lower<'a, 'f, 'db> {
     call_conv: CallConv,
     sig: Sig,
     ret_pointer: Option<Value>,
+    landing: Option<Block>,
+    cleaning: bool,
 }
 
 impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
@@ -102,6 +106,8 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             call_conv,
             sig,
             ret_pointer: None,
+            landing: None,
+            cleaning: false,
         }
     }
 
@@ -159,6 +165,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
                 None => self.trap(),
             }
         }
+        self.fill_landing()?;
         self.builder.seal_all_blocks();
         Ok(())
     }
@@ -553,6 +560,12 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         match &callee {
             Target::Ctor(variant) => self.write_variant(dest, *variant, &places)?,
             Target::Intrinsic(name, generics) => self.intrinsic(name, *generics, dest, &places)?,
+            Target::Foreign(name) if name == crate::unwind::RAISE_SYMBOL => {
+                let exception = self.load(types::I64, places.first().ok_or("raise without an exception")?.addr, 0);
+                self.raise(exception);
+                let after = self.builder.create_block();
+                self.builder.switch_to_block(after);
+            }
             Target::Foreign(name) if intrinsic::symbol(name).is_none() => {
                 return Ok(self.site_trap(format!("no symbol: {name}"), target));
             }
@@ -740,12 +753,12 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         }
         let sig = Sig { params: values.len() - usize::from(ret), ret };
         let slot = self.slots.get(key, sig, self.env.store())?;
-        let mut signature = Signature::new(self.call_conv);
+        let mut signature = Signature::new(crate::backend::INTERNAL_CONV);
         pointer_signature(&mut signature, sig);
         let signature = self.builder.import_signature(signature);
         let address = self.builder.ins().iconst(types::I64, self.slots.address(slot));
         let code = self.load(types::I64, address, 0);
-        self.builder.ins().call_indirect(signature, code, &values);
+        self.invoke(signature, code, &values);
         Ok(())
     }
 }
