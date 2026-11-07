@@ -489,7 +489,7 @@ fn native_of(key: &Key) -> Option<&NativeSig> {
     if let Key::Native(_, native) = key { Some(native) } else { None }
 }
 
-fn env_of(db: &dyn HirDatabase, func: FunctionId) -> ParamEnvAndCrate<'_> {
+pub(super) fn env_of(db: &dyn HirDatabase, func: FunctionId) -> ParamEnvAndCrate<'_> {
     ParamEnvAndCrate { param_env: db.trait_environment(func.into()), krate: func.module(db).krate(db) }
 }
 

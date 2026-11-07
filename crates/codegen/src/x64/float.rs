@@ -136,6 +136,9 @@ impl Emit<'_> {
                 self.asm.sse(&[scalar(self.ty(x))], &[0x0F, 0x5A], X0.0, at);
                 self.fstore(result, X0);
             }
+            Convert::FromSint | Convert::FromUint if self.ty(x) == Type::I128 => {
+                return Err(format!("{op:?} from I128 to {to:?}"));
+            }
             Convert::FromSint => {
                 self.get(Reg::Rax, x, Ext::Sign);
                 self.asm.sse_wide(scalar(to), 0x2A, X0.0, Reg::Rax);

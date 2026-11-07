@@ -149,27 +149,41 @@ fn dep_envs(db: &dyn HirDatabase, members: &[Crate], exports: &Exports) -> Vec<(
     outs.filter_map(|out| exports.get(&out)).flatten().cloned().collect()
 }
 
-fn script_of(db: &dyn HirDatabase, members: &[Crate], shared: &BTreeMap<String, String>, exports: &Exports) -> Option<Script> {
+fn script_of(db: &dyn HirDatabase, members: &[Crate], shared: &BTreeMap<String, String>, exports: &Exports) -> Option<Result<Script, String>> {
     let krate = members.iter().copied().find(|krate| is_script(db, *krate))?;
     let mut env = envs_of(db, krate);
-    let (name, version) = package_key(&env)?;
-    let function = main_of(db, krate)?;
-    feature_envs(db, krate, &mut env);
-    let manifest = PathBuf::from(env.get("CARGO_MANIFEST_DIR").cloned().unwrap_or_default());
-    let out_text = env.get(OUT_ENV)?.clone();
-    env.extend(shared.clone());
-    env.extend(dep_envs(db, members, exports));
-    Some(Script { label: format!("{name} {version}"), function, env, manifest, name, out: PathBuf::from(&out_text), out_text })
+    Some((|| {
+        let (name, version) = package_key(&env).ok_or("the script has no CARGO_PKG_NAME or CARGO_PKG_VERSION")?;
+        let function = main_of(db, krate).ok_or_else(|| format!("{name} {version}: the script has no main"))?;
+        let manifest = PathBuf::from(env.get("CARGO_MANIFEST_DIR").ok_or_else(|| format!("{name} {version}: no CARGO_MANIFEST_DIR"))?);
+        let out_text = env.get(OUT_ENV).ok_or_else(|| format!("{name} {version}: no {OUT_ENV}"))?.clone();
+        feature_envs(db, krate, &mut env);
+        env.extend(shared.clone());
+        env.extend(dep_envs(db, members, exports));
+        Ok(Script { label: format!("{name} {version}"), function, env, manifest, name, out: PathBuf::from(&out_text), out_text })
+    })())
 }
 
-fn run_main(table: Table, slot: usize) {
+#[derive(Clone, Copy)]
+struct Entry {
+    main: usize,
+    report: Option<usize>,
+}
+
+fn run_main(table: Table, entry: Entry) -> i32 {
+    use std::sync::atomic::Ordering::Acquire;
     let mut result = [0_u64; RESULT_WORDS];
     let argument = 0_i64;
-    let code = table[slot].load(std::sync::atomic::Ordering::Acquire);
-    crate::backend::enter(code, result.as_mut_ptr(), &argument);
+    crate::backend::enter(table[entry.main].load(Acquire), result.as_mut_ptr(), &argument);
+    let Some(report) = entry.report else {
+        return 0;
+    };
+    let mut code = [0_u64; RESULT_WORDS];
+    crate::backend::enter(table[report].load(Acquire), code.as_mut_ptr(), result.as_ptr().cast());
+    i32::from(code[0] as u8)
 }
 
-fn child(table: Table, slot: usize, script: &Script, write: std::io::PipeWriter) -> ! {
+fn child(table: Table, entry: Entry, script: &Script, write: std::io::PipeWriter) -> ! {
     use std::os::fd::AsRawFd;
     // SAFETY: alarm only arms a timer for this forked child.
     unsafe { libc::alarm(LIMIT_SECONDS) };
@@ -183,15 +197,15 @@ fn child(table: Table, slot: usize, script: &Script, write: std::io::PipeWriter)
             std::env::set_var(key, value);
         }
     }
-    let moved = std::env::set_current_dir(&script.manifest);
-    if moved.is_ok() {
-        run_main(table, slot);
-    }
+    let status = match std::env::set_current_dir(&script.manifest) {
+        Ok(()) => run_main(table, entry),
+        Err(_) => 1,
+    };
     // SAFETY: _exit ends the forked copy without running destructors that belong to the parent's state.
-    unsafe { libc::_exit(i32::from(moved.is_err())) }
+    unsafe { libc::_exit(status) }
 }
 
-fn fork_script(table: Table, slot: usize, script: &Script) -> Result<Forked> {
+fn fork_script(table: Table, entry: Entry, script: &Script) -> Result<Forked> {
     let (read, write) = std::io::pipe()?;
     // SAFETY: the parent holds no engine lock and runs no other thread here, and the child only uses state that the fork copied.
     let pid = unsafe { libc::fork() };
@@ -200,7 +214,7 @@ fn fork_script(table: Table, slot: usize, script: &Script) -> Result<Forked> {
     }
     if pid == 0 {
         drop(read);
-        child(table, slot, script, write);
+        child(table, entry, script, write);
     }
     drop(write);
     Ok(Forked { pid, read })
@@ -209,10 +223,12 @@ fn fork_script(table: Table, slot: usize, script: &Script) -> Result<Forked> {
 fn collect_forked(forked: Forked) -> Result<(String, i32)> {
     let Forked { pid, mut read } = forked;
     let mut bytes = Vec::new();
-    read.read_to_end(&mut bytes)?;
+    let outcome = read.read_to_end(&mut bytes);
+    drop(read);
     let mut status = 0;
     // SAFETY: pid is the child forked for this pipe, and status is a live local.
     unsafe { libc::waitpid(pid, &mut status, 0) };
+    outcome?;
     Ok((String::from_utf8_lossy(&bytes).into_owned(), status))
 }
 
@@ -234,12 +250,16 @@ fn run_of(output: String, status: i32) -> Run {
 fn run_batch(scripts: &[Script]) -> Result<Vec<Run>> {
     let mut started = Vec::new();
     for script in scripts {
-        let entered = patch::with_engine(|db, backend| backend.entry(db, script.function).map(|(slot, _)| (slot, backend.table())));
+        let entered = patch::with_engine(|db, backend| {
+            let (main, _) = backend.entry(db, script.function)?;
+            let report = backend.report(db, script.function).map_err(|why| format!("main's result: {why}"))?;
+            Ok::<_, String>((Entry { main, report }, backend.table()))
+        });
         started.push(match entered {
-            Ok((slot, table)) => {
-                std::fs::create_dir_all(&script.out)?;
-                Ok(fork_script(table, slot, script)?)
-            }
+            Ok((entry, table)) => std::fs::create_dir_all(&script.out)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| fork_script(table, entry, script))
+                .map_err(|error| format!("could not start: {error}")),
             Err(reason) => Err(reason),
         });
     }
@@ -251,10 +271,8 @@ fn run_batch(scripts: &[Script]) -> Result<Vec<Run>> {
 
 fn finish_run(joined: Result<Result<(String, i32)>, String>) -> Result<Run> {
     match joined {
-        Ok(collected) => {
-            let (output, status) = collected?;
-            Ok(run_of(output, status))
-        }
+        Ok(Ok((output, status))) => Ok(run_of(output, status)),
+        Ok(Err(error)) => Ok(Run::Failed(format!("reading the script output: {error}"))),
         Err(reason) => Ok(Run::Failed(reason)),
     }
 }
@@ -362,7 +380,11 @@ fn layers_of(db: &dyn HirDatabase, units: &Units) -> Vec<Vec<String>> {
 fn run_outs(state: &mut Loaded<'_>, units: &Units, outs: &[String], outcomes: &mut Vec<Outcome>) -> Result<()> {
     let scripts = patch::with_engine(|db, _| {
         let found = outs.iter().filter_map(|out| script_of(db, &units[out], state.shared, &state.exports));
-        found.collect::<Vec<_>>()
+        let (scripts, skipped): (Vec<_>, Vec<_>) = found.partition(Result::is_ok);
+        for reason in skipped.into_iter().filter_map(Result::err) {
+            println!("script_failed {reason}");
+        }
+        scripts.into_iter().filter_map(Result::ok).collect::<Vec<_>>()
     });
     let runs = run_batch(&scripts)?;
     for (script, run) in scripts.into_iter().zip(runs) {

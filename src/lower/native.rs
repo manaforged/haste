@@ -143,7 +143,18 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn push_arg(&mut self, pass: &Pass, place: &Place<'db>, values: &mut Vec<Value>) -> Result<(), String> {
         match pass {
-            Pass::Words(words) => values.extend(words.iter().map(|(ty, offset)| self.load(*ty, place.addr, *offset as i32))),
+            Pass::Words(words) => {
+                let size = self.layout(place.ty.ty)?.size.bytes();
+                let from = match padded(words, size) {
+                    Some(end) => {
+                        let staged = self.frame(end);
+                        self.copy(staged, place.addr, size);
+                        staged
+                    }
+                    None => place.addr,
+                };
+                values.extend(words.iter().map(|(ty, offset)| self.load(*ty, from, *offset as i32)));
+            }
             Pass::Stack(_) => values.push(place.addr),
             Pass::Pointer(size) => {
                 let copy = self.frame(u64::from(*size));
@@ -174,8 +185,13 @@ impl<'db> Lower<'_, '_, 'db> {
         let call = self.builder.ins().call_indirect(signature, code, &values);
         if let Some(Pass::Words(words)) = &ret {
             let results = self.builder.inst_results(call).to_vec();
+            let size = layout.size.bytes();
+            let staged = padded(words, size).map(|end| self.frame(end));
             for ((_, offset), result) in words.iter().zip(results) {
-                self.store(result, dest.addr, *offset as i32);
+                self.store(result, staged.unwrap_or(dest.addr), *offset as i32);
+            }
+            if let Some(staged) = staged {
+                self.copy(dest.addr, staged, size);
             }
         }
         Ok(())
@@ -199,4 +215,9 @@ impl<'db> Lower<'_, '_, 'db> {
         let call = self.builder.ins().call_indirect(signature, code, &[index, template, size]);
         self.builder.inst_results(call)[0]
     }
+}
+
+fn padded(words: &[(Type, u32)], size: u64) -> Option<u64> {
+    let end = words.iter().map(|(ty, at)| u64::from(*at) + u64::from(ty.bytes())).max()?;
+    (end > size).then_some(end)
 }

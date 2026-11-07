@@ -1,7 +1,9 @@
 use hir_def::attrs::AttrFlags;
 use std::collections::HashMap;
 
-use haste_codegen::Type;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use haste_codegen::{AbiParam, CallConv, IntCC, Signature, Type};
 use hir_def::expr_store::Body;
 use hir_def::signatures::{StaticFlags, StaticSignature};
 use hir_def::{AdtId, DefWithBodyId, StaticId};
@@ -20,6 +22,25 @@ use super::{Lower, Place, intrinsic};
 use crate::backend::{Key, Sig};
 
 const EVALUATOR_ADDRESSES: usize = 1 << 59;
+
+const ONCE_DONE: u64 = 2;
+
+thread_local! {
+    static THREAD_MARK: u8 = const { 0 };
+}
+
+extern "C" fn claim_once(flag: *const AtomicU64) -> u64 {
+    // SAFETY: flag is an 8-aligned word from leak that generated code touches only through once.
+    let flag = unsafe { &*flag };
+    let running = THREAD_MARK.with(|mark| std::ptr::from_ref(mark) as u64) << 2 | 1;
+    loop {
+        match flag.compare_exchange(0, running, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return 1,
+            Err(state) if state == ONCE_DONE || state == running => return 0,
+            Err(_) => std::thread::yield_now(),
+        }
+    }
+}
 
 fn leak(bytes: &[u8]) -> usize {
     let words = bytes.len().div_ceil(8).max(1);
@@ -113,17 +134,10 @@ impl<'db> Lower<'_, '_, 'db> {
         let cell = leak(&[0_u8; 8]);
         let slot = self.slots.get(Key::Const(id, args.store()), Sig { params: 0, ret: true }, self.env.store())?;
         let addr = self.builder.ins().iconst(Type::I64, buffer as i64);
-        let done_at = self.builder.ins().iconst(Type::I64, cell as i64);
-        let done = self.load(Type::I64, done_at, 0);
-        let (run, next) = (self.builder.create_block(), self.builder.create_block());
-        self.builder.ins().brif(done, next, &[], run, &[]);
-        self.builder.switch_to_block(run);
-        let code = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
-        self.call_cell(code, Sig { params: 0, ret: true }, &[addr]);
-        let one = self.builder.ins().iconst(Type::I64, 1);
-        self.store(one, done_at, 0);
-        self.builder.ins().jump(next, &[]);
-        self.builder.switch_to_block(next);
+        self.once(cell, |this| {
+            let code = this.builder.ins().iconst(Type::I64, this.slots.address(slot));
+            this.call_cell(code, Sig { params: 0, ret: true }, &[addr]);
+        });
         Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None })
     }
 
@@ -218,20 +232,33 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn init_once(&mut self, slot: usize, at: usize, done: usize) {
         let sig = self.slots.sig_of(slot);
-        let flag = self.builder.ins().iconst(Type::I64, done as i64);
-        let seen = self.load(Type::I64, flag, 0);
-        let (run, next) = (self.builder.create_block(), self.builder.create_block());
-        self.builder.ins().brif(seen, next, &[], run, &[]);
+        self.once(done, |this| {
+            let code = this.builder.ins().iconst(Type::I64, this.slots.address(slot));
+            let addr = this.builder.ins().iconst(Type::I64, at as i64);
+            let args: &[_] = if sig.ret { &[addr] } else { &[] };
+            this.call_cell(code, sig, args);
+        });
+    }
+
+    fn once(&mut self, flag: usize, init: impl FnOnce(&mut Self)) {
+        let flag = self.builder.ins().iconst(Type::I64, flag as i64);
+        let state = self.builder.ins().atomic_load(Type::I64, flag);
+        let finished = self.builder.ins().icmp_imm(IntCC::Equal, state, ONCE_DONE as i64);
+        let (claim, run, next) = (self.builder.create_block(), self.builder.create_block(), self.builder.create_block());
+        self.builder.ins().brif(finished, next, &[], claim, &[]);
+        self.builder.switch_to_block(claim);
+        let mut host = Signature::new(CallConv::Native);
+        host.params.push(AbiParam::new(Type::I64));
+        host.returns.push(AbiParam::new(Type::I64));
+        let host = self.builder.import_signature(host);
+        let code = self.builder.ins().iconst(Type::I64, claim_once as *const () as usize as i64);
+        let call = self.builder.ins().call_indirect(host, code, &[flag]);
+        let won = self.builder.inst_results(call)[0];
+        self.builder.ins().brif(won, run, &[], next, &[]);
         self.builder.switch_to_block(run);
-        let one = self.builder.ins().iconst(Type::I64, 1);
-        self.store(one, flag, 0);
-        let code = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
-        let addr = self.builder.ins().iconst(Type::I64, at as i64);
-        if sig.ret {
-            self.call_cell(code, sig, &[addr]);
-        } else {
-            self.call_cell(code, sig, &[]);
-        }
+        init(self);
+        let done = self.builder.ins().iconst(Type::I64, ONCE_DONE as i64);
+        self.builder.ins().atomic_store(done, flag);
         self.builder.ins().jump(next, &[]);
         self.builder.switch_to_block(next);
     }

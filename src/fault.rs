@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 const FRAMES: usize = 24;
-const SIGNALS: [i32; 5] = [libc::SIGABRT, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP];
+const SIGNALS: [i32; 6] = [libc::SIGABRT, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP, libc::SIGALRM];
+const LINE_BYTES: usize = 256;
 const STACK_BYTES: usize = 1 << 18;
 
 pub use haste_codegen::Site;
@@ -20,7 +23,7 @@ pub enum Frame {
     Native(String),
 }
 
-static CODE: Mutex<Vec<Code>> = Mutex::new(Vec::new());
+static CODE: Mutex<BTreeMap<usize, Code>> = Mutex::new(BTreeMap::new());
 
 const PERF_MAP: &str = "HASTE_PERF_MAP";
 
@@ -42,9 +45,7 @@ pub fn remember(start: usize, size: usize, name: String, sites: Vec<Site>) {
     if perf_map_on() {
         append_perf_map(&[&item]);
     }
-    if let Ok(mut code) = CODE.lock() {
-        code.push(item);
-    }
+    CODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(start, item);
 }
 
 /// Writes every generated function to this process's perf map when `HASTE_PERF_MAP` is set, for a forked child.
@@ -53,13 +54,14 @@ pub fn write_perf_map() {
         return;
     }
     let code = CODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    append_perf_map(&code.iter().collect::<Vec<_>>());
+    append_perf_map(&code.values().collect::<Vec<_>>());
 }
 
 pub fn frame_at(ret: usize) -> Frame {
     let code = CODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(item) = code.iter().rev().find(|item| ret >= item.start && ret < item.start + item.size) else {
-        return Frame::Native(host_name(ret).unwrap_or_else(|| format!("{ret:#x}")));
+    let Some(item) = owner(&code, ret) else {
+        let name = host_name(ret).map(|name| String::from_utf8_lossy(name).into_owned());
+        return Frame::Native(name.unwrap_or_else(|| format!("{ret:#x}")));
     };
     let offset = ret - item.start;
     match item.sites.iter().find(|site| site.ret as usize == offset) {
@@ -68,8 +70,34 @@ pub fn frame_at(ret: usize) -> Frame {
     }
 }
 
-fn name_at(code: &[Code], pc: usize) -> Option<&str> {
-    code.iter().rev().find(|item| pc >= item.start && pc < item.start + item.size).map(|item| item.name.as_str())
+fn owner(code: &BTreeMap<usize, Code>, pc: usize) -> Option<&Code> {
+    code.range(..=pc).next_back().map(|(_, item)| item).filter(|item| pc < item.start + item.size)
+}
+
+struct Line {
+    bytes: [u8; LINE_BYTES],
+    len: usize,
+}
+
+impl std::fmt::Write for Line {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let room = (LINE_BYTES - 1 - self.len).min(text.len());
+        self.bytes[self.len..self.len + room].copy_from_slice(&text.as_bytes()[..room]);
+        self.len += room;
+        Ok(())
+    }
+}
+
+impl Line {
+    fn emit(&mut self, text: &[u8]) {
+        let room = (LINE_BYTES - 1 - self.len).min(text.len());
+        self.bytes[self.len..self.len + room].copy_from_slice(&text[..room]);
+        self.len += room;
+        self.bytes[self.len] = b'\n';
+        // SAFETY: write reads len + 1 initialized bytes of this stack buffer and is async-signal-safe.
+        unsafe { libc::write(libc::STDERR_FILENO, self.bytes.as_ptr().cast(), self.len + 1) };
+        self.len = 0;
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -86,7 +114,7 @@ unsafe fn registers(context: *mut libc::c_void) -> (usize, usize) {
     (state.gregs[libc::REG_RIP as usize] as usize, state.gregs[libc::REG_RBP as usize] as usize)
 }
 
-fn host_name(pc: usize) -> Option<String> {
+fn host_name(pc: usize) -> Option<&'static [u8]> {
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
     // SAFETY: dladdr only reads pc as a number and fills the local info.
     if unsafe { libc::dladdr(pc as *const libc::c_void, &mut info) } == 0 {
@@ -94,20 +122,24 @@ fn host_name(pc: usize) -> Option<String> {
     }
     let text = if info.dli_sname.is_null() { info.dli_fname } else { info.dli_sname };
     // SAFETY: dladdr filled text with a nul-terminated name that lives as long as the image, or left it null.
-    (!text.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned())
+    (!text.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(text) }.to_bytes())
 }
 
 extern "C" fn on_fault(signal: i32, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     // SAFETY: the kernel passes a valid siginfo and ucontext to an SA_SIGINFO handler.
     let (fault, (start_pc, start_frame)) = unsafe { ((*info).si_addr() as usize, registers(context)) };
-    eprintln!("fault: signal {signal} address {fault:#x}");
+    let mut line = Line { bytes: [0; LINE_BYTES], len: 0 };
+    let _ = write!(line, "fault: signal {signal} address {fault:#x}");
+    line.emit(b"");
     if let Ok(code) = CODE.try_lock() {
         let (mut pc, mut frame) = (start_pc, start_frame);
         for _ in 0..FRAMES {
-            if let Some(name) = name_at(&code, pc) {
-                eprintln!("  at {name}");
+            if let Some(item) = owner(&code, pc) {
+                let _ = line.write_str("  at ");
+                line.emit(item.name.as_bytes());
             } else if let Some(name) = host_name(pc) {
-                eprintln!("  in {name}");
+                let _ = line.write_str("  in ");
+                line.emit(name);
             }
             if frame == 0 || frame % 8 != 0 {
                 break;
@@ -120,8 +152,11 @@ extern "C" fn on_fault(signal: i32, info: *mut libc::siginfo_t, context: *mut li
             (pc, frame) = (ret, next);
         }
     }
-    // SAFETY: restoring the default action and returning re-raises the fault with its normal exit status.
-    unsafe { libc::signal(signal, libc::SIG_DFL) };
+    // SAFETY: the default action is restored and the signal raised again, so it ends the process with its normal status once the handler returns.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
 }
 
 pub fn install() {

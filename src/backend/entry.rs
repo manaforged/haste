@@ -2,12 +2,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use haste_codegen::{AbiParam, CallConv, Function, FunctionBuilder, Signature, Type};
 
+use hir_def::FunctionId;
+use hir_expand::name::Name;
+use hir_ty::db::HirDatabase;
 use hir_ty::mir::MirBody;
-use hir_ty::next_solver::{Ty, TyKind};
+use hir_ty::next_solver::{DbInterner, GenericArgs, Ty, TyKind};
 use rustc_type_ir::IntTy;
 use rustc_type_ir::inherent::IntoKind;
 
-use super::{Backend, INTERNAL_CONV, Sig, pointer_signature};
+use super::{Backend, INTERNAL_CONV, Sig, Target, body_of, env_of, pointer_signature};
 
 static ENTRY: AtomicUsize = AtomicUsize::new(0);
 
@@ -29,6 +32,22 @@ pub fn call(table: &[AtomicUsize], slot: usize, value: i64) -> i64 {
 }
 
 impl Backend {
+    /// Gives the slot of `<T as Termination>::report` for the type `main` returns, or `None` when it returns `()`.
+    pub fn report<'db>(&mut self, db: &'db dyn HirDatabase, main: FunctionId) -> Result<Option<usize>, String> {
+        let env = env_of(db, main);
+        let body = body_of(db, env, &Target::Func(main, GenericArgs::empty()))?;
+        let ret = body.locals.iter().next().ok_or("main has no return local")?.1.ty.as_ref();
+        if matches!(ret.kind(), TyKind::Tuple(items) if items.is_empty()) {
+            return Ok(None);
+        }
+        let termination = DbInterner::new_with(db, env.krate).lang_items().Termination.ok_or("no Termination trait")?;
+        let report = termination.trait_items(db).method_by_name(&Name::new_root("report")).ok_or("no Termination::report")?;
+        let (imp, args) = db.lookup_impl_method(env, report, GenericArgs::new_from_slice(&[ret.into()]));
+        let imp = imp.left().ok_or("Termination::report resolved to a derive")?;
+        let (slot, _) = self.instance(db, imp, args, main)?;
+        Ok(Some(slot))
+    }
+
     pub(super) fn compile_entry(&mut self) -> Result<(), String> {
         let mut signature = Signature::new(CallConv::Native);
         signature.params.extend([AbiParam::new(Type::I64); 3]);

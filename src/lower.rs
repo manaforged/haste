@@ -366,6 +366,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
                 }
                 _ => {}
             }
+            self.replace_old(target, dest)?;
             self.initialized(target);
             return Ok(());
         }

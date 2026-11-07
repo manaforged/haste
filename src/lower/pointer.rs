@@ -145,7 +145,10 @@ impl<'db> Lower<'_, '_, 'db> {
         if let Some(principal) = predicates.principal() {
             let principal = Binder::skip_binder(principal);
             for (_, func) in methods_of(self.db, principal.def_id.0) {
-                let entry = self.vtable_entry(concrete, func, principal.args).unwrap_or(0);
+                let entry = self.vtable_entry(concrete, func, principal.args).unwrap_or_else(|why| {
+                    self.slots.notes.push(format!("vtable of {concrete:?} leaves a method out: {why}"));
+                    0
+                });
                 entries.push(entry);
             }
         }

@@ -124,6 +124,9 @@ impl<'db> Lower<'_, '_, 'db> {
         };
         let paths = self.paths_under(stored.local, &steps);
         let done = self.if_flag(slot);
+        if steps.is_empty() {
+            self.set_flag(stored.local, false);
+        }
         self.drop_open(dest.ty.ty, dest.addr, dest.meta, Cut::at(&paths, steps.len()))?;
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);

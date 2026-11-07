@@ -21,30 +21,75 @@ use super::{Declared, declared};
 
 struct Child {
     pid: i32,
+    owner: i32,
     requests: PipeWriter,
     replies: BufReader<PipeReader>,
 }
 
-static ZYGOTE: Mutex<Option<Child>> = Mutex::new(None);
-
-/// Replaces the zygote with a fork of this process; the fork handlers hold the engine lock across the fork.
-pub fn refresh() {
-    let mut zygote = ZYGOTE.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(old) = zygote.take() {
-        end(old);
-    }
-    match fork_child(|requests, replies| run_zygote(requests, replies)) {
-        Ok(child) => *zygote = Some(child),
-        Err(reason) => eprintln!("proc macro zygote: {reason}"),
+impl Child {
+    fn ours(&self) -> bool {
+        self.owner == this_process()
     }
 }
 
-/// Sends one request for the proc-macro crate at `root` through the zygote to that crate's host.
+static ZYGOTE: Mutex<Option<Child>> = Mutex::new(None);
+
+fn this_process() -> i32 {
+    // SAFETY: getpid has no preconditions.
+    unsafe { libc::getpid() }
+}
+
+fn zygote() -> std::sync::MutexGuard<'static, Option<Child>> {
+    ZYGOTE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Replaces the zygote with a fork of this process; the fork handlers hold the engine lock across the fork.
+pub fn refresh() {
+    let old = zygote().take();
+    if let Some(old) = old {
+        release(old);
+    }
+    if let Err(reason) = start() {
+        eprintln!("proc macro zygote: {reason}");
+    }
+}
+
+fn start() -> Result<(), String> {
+    let started = fork_child(|requests, replies| run_zygote(requests, replies))?;
+    let mut slot = zygote();
+    match slot.as_ref() {
+        Some(current) if current.ours() => release(started),
+        _ => {
+            if let Some(stale) = slot.replace(started) {
+                release(stale);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn release(child: Child) {
+    if child.ours() {
+        end(child);
+    }
+}
+
+/// Sends one request for the proc-macro crate at `root` through this process's zygote to that crate's host.
 pub(super) fn ask(root: FileId, request: Request) -> Result<Response, String> {
-    let mut zygote = ZYGOTE.lock().unwrap_or_else(PoisonError::into_inner);
-    let zygote = zygote.as_mut().ok_or("the engine has not started a proc macro zygote")?;
-    writeln!(zygote.requests, "{}", root.index()).map_err(|e| e.to_string())?;
-    exchange(zygote, request)
+    if !zygote().as_ref().is_some_and(Child::ours) {
+        start()?;
+    }
+    let mut slot = zygote();
+    let child = slot.as_mut().filter(|child| child.ours()).ok_or("this process has no proc macro zygote")?;
+    let reply = writeln!(child.requests, "{}", root.index()).map_err(|e| e.to_string()).and_then(|()| exchange(child, request));
+    if let Err(reason) = &reply
+        && let Some(dead) = slot.take()
+    {
+        drop(slot);
+        let status = end(dead);
+        return Err(format!("the proc macro zygote exited with status {status:#x} ({reason}); the next expansion starts a new one"));
+    }
+    reply
 }
 
 fn exchange(child: &mut Child, request: Request) -> Result<Response, String> {
@@ -54,7 +99,7 @@ fn exchange(child: &mut Child, request: Request) -> Result<Response, String> {
 }
 
 fn end(child: Child) -> i32 {
-    let Child { pid, requests, replies } = child;
+    let Child { pid, requests, replies, .. } = child;
     drop((requests, replies));
     let mut status = 0;
     // SAFETY: pid is a child this process forked, and status is a live local.
@@ -77,7 +122,7 @@ fn fork_child(body: impl FnOnce(PipeReader, PipeWriter)) -> Result<Child, String
         unsafe { libc::_exit(0) }
     }
     drop((request_read, reply_write));
-    Ok(Child { pid, requests: request_write, replies: BufReader::new(reply_read) })
+    Ok(Child { pid, owner: this_process(), requests: request_write, replies: BufReader::new(reply_read) })
 }
 
 fn run_zygote(requests: PipeReader, mut replies: PipeWriter) {
