@@ -1,11 +1,6 @@
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{
-    Block, InstBuilder, MemFlagsData, Signature, StackSlot, StackSlotData, StackSlotKind, TrapCode, Type, Value, types,
-};
-use cranelift_codegen::isa::CallConv;
-use cranelift_frontend::FunctionBuilder;
+use haste_codegen::{AbiParam, Block, CallConv, FunctionBuilder, IntCC, Signature, StackSlot, Type, Value};
 use hir_def::signatures::FunctionSignature;
 use hir_ty::ParamEnvAndCrate;
 use hir_ty::db::HirDatabase;
@@ -28,6 +23,7 @@ mod compare;
 mod constant;
 pub mod derive;
 mod drop;
+mod inline;
 mod moves;
 pub mod intrinsic;
 pub mod native;
@@ -78,6 +74,8 @@ pub struct Lower<'a, 'f, 'db> {
     ret_pointer: Option<Value>,
     landing: Option<Block>,
     cleaning: bool,
+    exit: Option<Block>,
+    inlined: Vec<&'db MirBody<'db>>,
 }
 
 impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
@@ -108,6 +106,8 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             ret_pointer: None,
             landing: None,
             cleaning: false,
+            exit: None,
+            inlined: Vec::new(),
         }
     }
 
@@ -115,6 +115,27 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
         self.builder.switch_to_block(entry);
+        self.prepare()?;
+        let mut values = self.builder.block_params(entry).to_vec().into_iter();
+        if self.sig.ret {
+            self.ret_pointer = values.next();
+        }
+        for param in &self.body.param_locals {
+            let ty = self.body.locals[*param].ty.as_ref();
+            let size = self.layout(ty)?.size.bytes();
+            if size != 0 {
+                let from = values.next().ok_or("parameter count")?;
+                let to = self.local_addr(*param);
+                self.copy(to, from, size);
+            }
+            self.set_flag(*param, true);
+        }
+        self.lower_blocks()?;
+        self.fill_landing()?;
+        Ok(())
+    }
+
+    fn prepare(&mut self) -> Result<(), String> {
         for (id, _) in self.body.basic_blocks.iter() {
             let block = self.builder.create_block();
             self.blocks.insert(id, block);
@@ -131,26 +152,14 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             }
             let slot = (size != 0).then(|| {
                 let align = layout.align.abi.bytes().trailing_zeros() as u8;
-                let data = StackSlotData::new(StackSlotKind::ExplicitSlot, size as u32, align);
-                self.builder.create_sized_stack_slot(data)
+                                self.builder.create_stack_slot(size as u32, align)
             });
             self.frames.insert(id, slot);
         }
-        self.make_flags()?;
-        let mut values = self.builder.block_params(entry).to_vec().into_iter();
-        if self.sig.ret {
-            self.ret_pointer = values.next();
-        }
-        for param in &self.body.param_locals {
-            let ty = self.body.locals[*param].ty.as_ref();
-            let size = self.layout(ty)?.size.bytes();
-            if size != 0 {
-                let from = values.next().ok_or("parameter count")?;
-                let to = self.local_addr(*param);
-                self.copy(to, from, size);
-            }
-            self.set_flag(*param, true);
-        }
+        self.make_flags()
+    }
+
+    fn lower_blocks(&mut self) -> Result<(), String> {
         self.builder.ins().jump(self.blocks[&self.body.start_block], &[]);
         let body = self.body;
         for (id, block) in body.basic_blocks.iter() {
@@ -165,8 +174,6 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
                 None => self.trap(),
             }
         }
-        self.fill_landing()?;
-        self.builder.seal_all_blocks();
         Ok(())
     }
 
@@ -175,20 +182,20 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
     }
 
     fn trap(&mut self) {
-        self.builder.ins().trap(TrapCode::unwrap_user(1));
+        self.builder.ins().trap();
     }
 
     fn load(&mut self, ty: Type, addr: Value, offset: i32) -> Value {
-        self.builder.ins().load(ty, MemFlagsData::trusted(), addr, offset)
+        self.builder.ins().load(ty, addr, offset)
     }
 
     fn store(&mut self, value: Value, addr: Value, offset: i32) {
-        self.builder.ins().store(MemFlagsData::trusted(), value, addr, offset);
+        self.builder.ins().store(value, addr, offset);
     }
 
     fn copy(&mut self, to: Value, from: Value, size: u64) {
         let mut offset = 0_u64;
-        for (ty, width) in [(types::I64, 8), (types::I32, 4), (types::I16, 2), (types::I8, 1)] {
+        for (ty, width) in [(Type::I64, 8), (Type::I32, 4), (Type::I16, 2), (Type::I8, 1)] {
             while size - offset >= width {
                 let value = self.load(ty, from, offset as i32);
                 self.store(value, to, offset as i32);
@@ -199,11 +206,11 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
 
     fn local_addr(&mut self, local: LocalId) -> Value {
         if let Some(storage) = self.statics.get(&local).copied() {
-            return self.builder.ins().iconst(types::I64, storage);
+            return self.builder.ins().iconst(Type::I64, storage);
         }
         match self.frames[&local] {
-            Some(slot) => self.builder.ins().stack_addr(types::I64, slot, 0),
-            None => self.builder.ins().iconst(types::I64, 16),
+            Some(slot) => self.builder.ins().stack_addr(Type::I64, slot, 0),
+            None => self.builder.ins().iconst(Type::I64, 16),
         }
     }
 
@@ -221,9 +228,9 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
                 ProjectionElem::Deref => {
                     place.meta = None;
                     if self.layout(place.ty.ty)?.is_unsized() {
-                        place.meta = Some(self.load(types::I64, place.addr, 8));
+                        place.meta = Some(self.load(Type::I64, place.addr, 8));
                     }
-                    place.addr = self.load(types::I64, place.addr, 0);
+                    place.addr = self.load(Type::I64, place.addr, 0);
                 }
                 ProjectionElem::Field(field) => {
                     let layout = self.layout(previous.ty)?;
@@ -236,7 +243,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
                 ProjectionElem::Index(index) => {
                     let size = self.layout(place.ty.ty)?.size.bytes();
                     let index_addr = self.local_addr(*index);
-                    let index = self.load(types::I64, index_addr, 0);
+                    let index = self.load(Type::I64, index_addr, 0);
                     let offset = self.builder.ins().imul_imm(index, size as i64);
                     place.addr = self.builder.ins().iadd(place.addr, offset);
                     place.meta = None;
@@ -276,7 +283,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             Some(meta) => Ok(meta),
             None => {
                 let count = self.layout(ty)?.fields.count();
-                Ok(self.builder.ins().iconst(types::I64, count as i64))
+                Ok(self.builder.ins().iconst(Type::I64, count as i64))
             }
         }
     }
@@ -296,22 +303,22 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
     fn scalar(&self, ty: Ty<'db>) -> Result<Scalar, String> {
         let plain = |ty, signed| Ok(Scalar { ty, signed, boolean: false });
         match ty.kind() {
-            TyKind::Bool => Ok(Scalar { ty: types::I8, signed: false, boolean: true }),
-            TyKind::Char => plain(types::I32, false),
-            TyKind::Int(IntTy::I8) => plain(types::I8, true),
-            TyKind::Int(IntTy::I16) => plain(types::I16, true),
-            TyKind::Int(IntTy::I32) => plain(types::I32, true),
-            TyKind::Int(IntTy::I64 | IntTy::Isize) => plain(types::I64, true),
-            TyKind::Int(IntTy::I128) => plain(types::I128, true),
-            TyKind::Uint(UintTy::U128) => plain(types::I128, false),
-            TyKind::Uint(UintTy::U8) => plain(types::I8, false),
-            TyKind::Uint(UintTy::U16) => plain(types::I16, false),
-            TyKind::Uint(UintTy::U32) => plain(types::I32, false),
-            TyKind::Uint(UintTy::U64 | UintTy::Usize) => plain(types::I64, false),
-            TyKind::Float(FloatTy::F32) => plain(types::F32, false),
-            TyKind::Float(FloatTy::F64) => plain(types::F64, false),
+            TyKind::Bool => Ok(Scalar { ty: Type::I8, signed: false, boolean: true }),
+            TyKind::Char => plain(Type::I32, false),
+            TyKind::Int(IntTy::I8) => plain(Type::I8, true),
+            TyKind::Int(IntTy::I16) => plain(Type::I16, true),
+            TyKind::Int(IntTy::I32) => plain(Type::I32, true),
+            TyKind::Int(IntTy::I64 | IntTy::Isize) => plain(Type::I64, true),
+            TyKind::Int(IntTy::I128) => plain(Type::I128, true),
+            TyKind::Uint(UintTy::U128) => plain(Type::I128, false),
+            TyKind::Uint(UintTy::U8) => plain(Type::I8, false),
+            TyKind::Uint(UintTy::U16) => plain(Type::I16, false),
+            TyKind::Uint(UintTy::U32) => plain(Type::I32, false),
+            TyKind::Uint(UintTy::U64 | UintTy::Usize) => plain(Type::I64, false),
+            TyKind::Float(FloatTy::F32) => plain(Type::F32, false),
+            TyKind::Float(FloatTy::F64) => plain(Type::F64, false),
             TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(..) if self.layout(ty)?.size.bytes() == 8 => {
-                plain(types::I64, false)
+                plain(Type::I64, false)
             }
             _ => self.repr_scalar(ty),
         }
@@ -325,17 +332,17 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         match scalar.primitive() {
             rustc_abi::Primitive::Int(integer, signed) => {
                 let width = match integer.size().bytes() {
-                    1 => types::I8,
-                    2 => types::I16,
-                    4 => types::I32,
-                    8 => types::I64,
-                    _ => types::I128,
+                    1 => Type::I8,
+                    2 => Type::I16,
+                    4 => Type::I32,
+                    8 => Type::I64,
+                    _ => Type::I128,
                 };
                 Ok(Scalar { ty: width, signed, boolean: false })
             }
-            rustc_abi::Primitive::Pointer(_) => Ok(Scalar { ty: types::I64, signed: false, boolean: false }),
-            rustc_abi::Primitive::Float(rustc_abi::Float::F32) => Ok(Scalar { ty: types::F32, signed: false, boolean: false }),
-            rustc_abi::Primitive::Float(rustc_abi::Float::F64) => Ok(Scalar { ty: types::F64, signed: false, boolean: false }),
+            rustc_abi::Primitive::Pointer(_) => Ok(Scalar { ty: Type::I64, signed: false, boolean: false }),
+            rustc_abi::Primitive::Float(rustc_abi::Float::F32) => Ok(Scalar { ty: Type::F32, signed: false, boolean: false }),
+            rustc_abi::Primitive::Float(rustc_abi::Float::F64) => Ok(Scalar { ty: Type::F64, signed: false, boolean: false }),
             other => Err(format!("scalar {other:?}")),
         }
     }
@@ -370,7 +377,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             }
             Rvalue::Repeat(op, _) => {
                 let from = self.operand(op)?;
-                let count = self.builder.ins().iconst(types::I64, layout.fields.count() as i64);
+                let count = self.builder.ins().iconst(Type::I64, layout.fields.count() as i64);
                 let stride = self.layout(from.ty.ty)?.size.bytes();
                 self.for_each_item(dest.addr, count, stride as i64, |lower, at| {
                     lower.copy(at, from.addr, stride);
@@ -487,15 +494,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
                 }
                 self.builder.ins().jump(self.blocks[&targets.otherwise()], &[]);
             }
-            TerminatorKind::Return => {
-                if let Some(pointer) = self.ret_pointer {
-                    let (ret, local) = self.body.locals.iter().next().ok_or("no return local")?;
-                    let size = self.layout(local.ty.as_ref())?.size.bytes();
-                    let from = self.local_addr(ret);
-                    self.copy(pointer, from, size);
-                }
-                self.builder.ins().return_(&[]);
-            }
+            TerminatorKind::Return => self.leave()?,
             TerminatorKind::Unreachable | TerminatorKind::UnwindResume | TerminatorKind::Abort => self.trap(),
             TerminatorKind::Assert { cond, expected, target, .. } => {
                 let (value, _) = self.read(cond)?;
@@ -561,7 +560,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             Target::Ctor(variant) => self.write_variant(dest, *variant, &places)?,
             Target::Intrinsic(name, generics) => self.intrinsic(name, *generics, dest, &places)?,
             Target::Foreign(name) if name == crate::unwind::RAISE_SYMBOL => {
-                let exception = self.load(types::I64, places.first().ok_or("raise without an exception")?.addr, 0);
+                let exception = self.load(Type::I64, places.first().ok_or("raise without an exception")?.addr, 0);
                 self.raise(exception);
                 let after = self.builder.create_block();
                 self.builder.switch_to_block(after);
@@ -573,12 +572,14 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             Target::Abort => self.trap_and_continue(),
             Target::Glue(ty) if !self.needs_drop(*ty) => {}
             Target::Pointer => {
-                let cell = self.load(types::I64, receiver.ok_or("fn pointer without a receiver")?, 0);
+                let cell = self.load(Type::I64, receiver.ok_or("fn pointer without a receiver")?, 0);
                 self.call_pointer(cell, dest, &places)?;
             }
             Target::Dyn(..) => return Err("dyn call reached the direct path".to_owned()),
             Target::Func(..) | Target::Closure(..) | Target::Glue(_) | Target::Derive(..) => {
-                self.direct(&callee, dest, receiver, &places)?
+                if shape != Shape::Direct || !self.inline(&callee, dest, &places)? {
+                    self.direct(&callee, dest, receiver, &places)?;
+                }
             }
         }
         self.initialized(destination);
@@ -596,11 +597,11 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
     fn report_trap(&mut self, reason: &str) {
         let (text, size) = crate::backend::leak_text(reason);
         let mut signature = Signature::new(self.call_conv);
-        signature.params.extend([cranelift_codegen::ir::AbiParam::new(types::I64); 2]);
+        signature.params.extend([AbiParam::new(Type::I64); 2]);
         let signature = self.builder.import_signature(signature);
-        let code = self.builder.ins().iconst(types::I64, crate::backend::report_trap as *const () as usize as i64);
-        let text = self.builder.ins().iconst(types::I64, text);
-        let size = self.builder.ins().iconst(types::I64, size);
+        let code = self.builder.ins().iconst(Type::I64, crate::backend::report_trap as *const () as usize as i64);
+        let text = self.builder.ins().iconst(Type::I64, text);
+        let size = self.builder.ins().iconst(Type::I64, size);
         self.builder.ins().call_indirect(signature, code, &[text, size]);
     }
 
@@ -648,9 +649,8 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
     fn pack(&mut self, tuple: Ty<'db>, items: &[Place<'db>]) -> Result<Place<'db>, String> {
         let layout = self.layout(tuple)?;
         let align = layout.align.abi.bytes().trailing_zeros() as u8;
-        let data = StackSlotData::new(StackSlotKind::ExplicitSlot, layout.size.bytes() as u32, align);
-        let slot = self.builder.create_sized_stack_slot(data);
-        let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                let slot = self.builder.create_stack_slot(layout.size.bytes() as u32, align);
+        let addr = self.builder.ins().stack_addr(Type::I64, slot, 0);
         for (index, item) in items.iter().enumerate() {
             let size = self.layout(item.ty.ty)?.size.bytes();
             let to = self.builder.ins().iadd_imm(addr, layout.fields.offset(index).bytes() as i64);
@@ -684,7 +684,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         let receiver = self.operand(receiver)?;
         let (mut ty, mut addr) = (receiver.ty.ty, receiver.addr);
         while let TyKind::Ref(_, inner, _) = ty.kind() {
-            addr = self.load(types::I64, addr, 0);
+            addr = self.load(Type::I64, addr, 0);
             ty = inner;
         }
         let places = self.operands(rest)?;
@@ -703,17 +703,17 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
 
     fn scalar_call(&mut self, code: usize, ty: Type, values: &[Value]) -> Value {
         let mut signature = Signature::new(self.call_conv);
-        signature.params.extend(values.iter().map(|_| cranelift_codegen::ir::AbiParam::new(ty)));
-        signature.returns.push(cranelift_codegen::ir::AbiParam::new(ty));
+        signature.params.extend(values.iter().map(|_| AbiParam::new(ty)));
+        signature.returns.push(AbiParam::new(ty));
         let signature = self.builder.import_signature(signature);
-        let code = self.builder.ins().iconst(types::I64, code as i64);
+        let code = self.builder.ins().iconst(Type::I64, code as i64);
         let call = self.builder.ins().call_indirect(signature, code, values);
         self.builder.inst_results(call)[0]
     }
 
     fn foreign(&mut self, name: &str, dest: Place<'db>, places: &[Place<'db>]) -> Result<(), String> {
         let code = intrinsic::symbol(name).ok_or_else(|| format!("no symbol: {name}"))?;
-        let code = self.builder.ins().iconst(types::I64, code as i64);
+        let code = self.builder.ins().iconst(Type::I64, code as i64);
         self.native_call(code, dest, places)
     }
 
@@ -738,8 +738,8 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             let param = body.locals[body.param_locals[0]].ty.as_ref();
             let data = receiver.ok_or("closure without a receiver")?;
             if matches!(param.kind(), TyKind::Ref(..)) {
-                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-                let holder = self.builder.ins().stack_addr(types::I64, slot, 0);
+                let slot = self.builder.create_stack_slot(8, 3);
+                let holder = self.builder.ins().stack_addr(Type::I64, slot, 0);
                 self.store(data, holder, 0);
                 values.push(holder);
             } else if self.layout(param)?.size.bytes() != 0 {
@@ -756,8 +756,8 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         let mut signature = Signature::new(crate::backend::INTERNAL_CONV);
         pointer_signature(&mut signature, sig);
         let signature = self.builder.import_signature(signature);
-        let address = self.builder.ins().iconst(types::I64, self.slots.address(slot));
-        let code = self.load(types::I64, address, 0);
+        let address = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
+        let code = self.load(Type::I64, address, 0);
         self.invoke(signature, code, &values);
         Ok(())
     }

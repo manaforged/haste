@@ -33,7 +33,4 @@ tt = { path = "ra/crates/tt" }
 intern = { path = "ra/crates/intern" }
 proc-macro-api = { path = "ra/crates/proc-macro-api", features = ["engine"] }
 proc-macro-srv = { path = "ra/crates/proc-macro-srv", features = ["engine"] }
-cranelift-codegen = "0.137.1"
-cranelift-frontend = "0.137.1"
-cranelift-jit = "0.137.1"
-cranelift-module = "0.137.1"
+haste-codegen = { path = "crates/codegen" }

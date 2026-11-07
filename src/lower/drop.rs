@@ -1,5 +1,4 @@
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Block, InstBuilder, StackSlot, StackSlotData, StackSlotKind, Value, types};
+use haste_codegen::{Block, IntCC, StackSlot, Type, Value};
 use either::Either;
 use hir_def::{AdtId, ItemContainerId, VariantId};
 use hir_def::signatures::{StructFlags, StructSignature};
@@ -45,10 +44,9 @@ impl<'db> Lower<'_, '_, 'db> {
             if self.flags.contains_key(&local) || !self.needs_drop(body.locals[local].ty.as_ref()) {
                 continue;
             }
-            let data = StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0);
-            let slot = self.builder.create_sized_stack_slot(data);
-            let zero = self.builder.ins().iconst(types::I8, 0);
-            self.builder.ins().stack_store(types::I64, zero, slot, 0);
+                        let slot = self.builder.create_stack_slot(1, 0);
+            let zero = self.builder.ins().iconst(Type::I8, 0);
+            self.builder.ins().stack_store(zero, slot, 0);
             self.flags.insert(local, slot);
         }
         self.make_move_paths();
@@ -57,8 +55,8 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn set_flag(&mut self, local: LocalId, on: bool) {
         if let Some(slot) = self.flags.get(&local).copied() {
-            let value = self.builder.ins().iconst(types::I8, i64::from(on));
-            self.builder.ins().stack_store(types::I64, value, slot, 0);
+            let value = self.builder.ins().iconst(Type::I8, i64::from(on));
+            self.builder.ins().stack_store(value, slot, 0);
         }
     }
 
@@ -81,7 +79,7 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     fn if_flag(&mut self, slot: StackSlot) -> Block {
-        let value = self.builder.ins().stack_load(types::I64, types::I8, slot, 0);
+        let value = self.builder.ins().stack_load(Type::I8, slot, 0);
         let run = self.builder.create_block();
         let done = self.builder.create_block();
         self.builder.ins().brif(value, run, &[], done, &[]);
@@ -133,9 +131,9 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     pub(super) fn thin_holder(&mut self, data: Value) -> Value {
-        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
-        self.builder.ins().stack_store(types::I64, data, slot, 0);
-        self.builder.ins().stack_addr(types::I64, slot, 0)
+        let slot = self.builder.create_stack_slot(16, 3);
+        self.builder.ins().stack_store(data, slot, 0);
+        self.builder.ins().stack_addr(Type::I64, slot, 0)
     }
 
     pub(super) fn call_glue(&mut self, ty: Ty<'db>, addr: Value, meta: Option<Value>) -> Result<(), String> {
@@ -151,7 +149,7 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn call_glue_holder(&mut self, ty: Ty<'db>, holder: Value) -> Result<(), String> {
         let slot = self.glue_slot(ty)?;
-        let cell = self.builder.ins().iconst(types::I64, self.slots.address(slot));
+        let cell = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
         self.call_cell(cell, GLUE, &[holder]);
         Ok(())
     }
@@ -162,8 +160,8 @@ impl<'db> Lower<'_, '_, 'db> {
         self.builder.switch_to_block(entry);
         let holder = self.builder.block_params(entry)[0];
         let ty = self.normalized(ty);
-        let addr = self.load(types::I64, holder, 0);
-        let meta = if self.layout(ty)?.is_unsized() { Some(self.load(types::I64, holder, 8)) } else { None };
+        let addr = self.load(Type::I64, holder, 0);
+        let meta = if self.layout(ty)?.is_unsized() { Some(self.load(Type::I64, holder, 8)) } else { None };
         if self.is_box(ty)
             && let TyKind::Adt(_, args) = ty.kind()
             && let Some(inner) = args.as_slice().first().and_then(|arg| arg.ty())
@@ -174,7 +172,6 @@ impl<'db> Lower<'_, '_, 'db> {
         self.drop_impl(ty, holder)?;
         self.drop_parts(ty, addr, meta, Cut::none())?;
         self.builder.ins().return_(&[]);
-        self.builder.seal_all_blocks();
         Ok(())
     }
 
@@ -194,7 +191,7 @@ impl<'db> Lower<'_, '_, 'db> {
             return Ok(());
         }
         let slot = self.slots.get(Key::Func(imp, args.store()), GLUE, self.env.store())?;
-        let cell = self.builder.ins().iconst(types::I64, self.slots.address(slot));
+        let cell = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
         self.call_cell(cell, GLUE, &[holder]);
         Ok(())
     }
@@ -275,10 +272,10 @@ impl<'db> Lower<'_, '_, 'db> {
         mut work: impl FnMut(&mut Self, Value) -> Result<(), String>,
     ) -> Result<(), String> {
         let head = self.builder.create_block();
-        let index = self.builder.append_block_param(head, types::I64);
+        let index = self.builder.append_block_param(head, Type::I64);
         let run = self.builder.create_block();
         let done = self.builder.create_block();
-        let zero = self.builder.ins().iconst(types::I64, 0);
+        let zero = self.builder.ins().iconst(Type::I64, 0);
         self.builder.ins().jump(head, &[zero.into()]);
         self.builder.switch_to_block(head);
         let more = self.builder.ins().icmp(IntCC::UnsignedLessThan, index, count);
@@ -303,13 +300,13 @@ impl<'db> Lower<'_, '_, 'db> {
     ) -> Result<(), String> {
         let layout = self.layout(ty)?;
         let wide = Ty::new_int(self.infcx.interner, IntTy::Isize);
-        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-        let tag_at = self.builder.ins().stack_addr(types::I64, slot, 0);
+        let slot = self.builder.create_stack_slot(8, 3);
+        let tag_at = self.builder.ins().stack_addr(Type::I64, slot, 0);
         self.discriminant(
             Place { addr: tag_at, ty: PlaceTy::from_ty(wide), meta: None },
             Place { addr, ty: PlaceTy::from_ty(ty), meta: None },
         )?;
-        let tag = self.load(types::I64, tag_at, 0);
+        let tag = self.load(Type::I64, tag_at, 0);
         let done = self.builder.create_block();
         let variants: Vec<_> = id.enum_variants(self.db).variants.values().map(|variant| variant.0).collect();
         for variant in variants {

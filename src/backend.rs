@@ -3,12 +3,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
-use cranelift_codegen::Context;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature, TrapCode, types};
-use cranelift_codegen::isa::CallConv;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use haste_codegen::{AbiParam, CallConv, Function, FunctionBuilder, Memory, Signature, Type};
 use either::Either;
 use hir_def::builtin_derive::BuiltinDeriveImplMethod as Method;
 use hir_def::signatures::FunctionSignature;
@@ -102,40 +97,37 @@ enum Work<'db> {
 }
 
 pub struct Backend {
-    module: JITModule,
-    ctx: Context,
-    builder: FunctionBuilderContext,
+    memory: Memory,
     slots: Slots,
     digests: HashMap<usize, u64>,
     pub stubs: Vec<(String, String)>,
     order: Vec<usize>,
     pub compiled_total: usize,
-    unmapped: Vec<(FuncId, usize, String, Vec<crate::fault::Site>)>,
+    unmapped: Vec<(usize, usize, String, Vec<crate::fault::Site>)>,
     cursor: usize,
-    serial: usize,
     dump: bool,
     pub verbose: bool,
 }
 
 /// The calling convention of generated functions, which lets a try_call handler assume no preserved registers.
-pub const INTERNAL_CONV: CallConv = CallConv::Tail;
+pub const INTERNAL_CONV: CallConv = CallConv::Internal;
 
 const STUB_NAME: &str = "stub";
 
+extern "C" fn missing_code() -> ! {
+    eprintln!("haste: called a function whose code and trap both failed to build; the stub list names it");
+    std::process::abort()
+}
+
+
 pub use entry::{call, enter};
-use entry::handler_sites;
 
 
 impl Backend {
     pub fn new(dump: bool, verbose: bool) -> Result<Self> {
-        let flags = [("enable_llvm_abi_extensions", "true"), ("preserve_frame_pointers", "true")];
-        let builder = JITBuilder::with_flags(&flags, default_libcall_names()).map_err(|e| anyhow!("{e}"))?;
-        let module = JITModule::new(builder);
         let table = (0..TABLE_SLOTS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
         let mut backend = Self {
-            ctx: module.make_context(),
-            module,
-            builder: FunctionBuilderContext::new(),
+            memory: Memory::default(),
             slots: Slots {
                 table: Box::leak(table.into_boxed_slice()),
                 by_key: HashMap::new(),
@@ -154,7 +146,6 @@ impl Backend {
             compiled_total: 0,
             unmapped: Vec::new(),
             cursor: 0,
-            serial: 0,
             dump,
             verbose,
         };
@@ -231,9 +222,11 @@ impl Backend {
                 let message = format!("{name}: {reason}");
                 self.stubs.push((name, reason));
                 self.digests.insert(slot, 0);
-                if let Ok(id) = self.trap_function(sig, native_of(&key), &message) {
-                    self.finish(slot, id);
-                }
+                let id = self.trap_function(sig, native_of(&key), &message).unwrap_or_else(|why| {
+                    self.stubs.push(("trap".to_owned(), why));
+                    missing_code as *const () as usize
+                });
+                self.finish(slot, id);
             }
         }
     }
@@ -245,7 +238,7 @@ impl Backend {
         name: &str,
         key: &Key,
         sig: Sig,
-    ) -> Result<FuncId, String> {
+    ) -> Result<usize, String> {
         match key {
             Key::Func(..) | Key::Closure(..) => {
                 let target = target_of(key);
@@ -313,6 +306,7 @@ impl Backend {
 
     pub fn mark_failed(&mut self, slot: usize) {
         self.digests.insert(slot, 0);
+        self.slots.table[slot].store(missing_code as *const () as usize, Ordering::Release);
     }
 
     pub fn refresh<'db>(&mut self, db: &'db dyn HirDatabase) -> Result<Vec<String>, String> {
@@ -346,34 +340,41 @@ impl Backend {
         self.publish_stubs()?;
         for (slot, id, digest) in done {
             self.digests.insert(slot, digest);
-            let code = self.module.get_finalized_function(id);
-            self.slots.table[slot].store(code as usize, Ordering::Release);
+            self.slots.table[slot].store(id, Ordering::Release);
         }
         Ok(names)
     }
 
-    fn finish(&mut self, slot: usize, id: FuncId) {
+    fn finish(&mut self, slot: usize, id: usize) {
         self.compiled_total += 1;
-        if let Err(reason) = self.publish_stubs() {
-            self.stubs.push(("table".to_owned(), reason));
-        }
-        let code = self.module.get_finalized_function(id);
-        self.slots.table[slot].store(code as usize, Ordering::Release);
+        let id = match self.publish_stubs() {
+            Ok(()) => id,
+            Err(reason) => {
+                self.stubs.push(("table".to_owned(), reason));
+                missing_code as *const () as usize
+            }
+        };
+        self.slots.table[slot].store(id, Ordering::Release);
     }
 
     fn publish_stubs(&mut self) -> Result<(), String> {
         let pending = std::mem::take(&mut self.slots.pending);
         let mut made = Vec::with_capacity(pending.len());
-        for slot in pending {
-            made.push((slot, self.compile_stub(slot)?));
+        for (done, slot) in pending.iter().copied().enumerate() {
+            match self.compile_stub(slot) {
+                Ok(code) => made.push((slot, code)),
+                Err(reason) => {
+                    self.slots.pending.extend_from_slice(&pending[done..]);
+                    return Err(reason);
+                }
+            }
         }
-        self.module.finalize_definitions().map_err(|e| e.to_string())?;
-        for (id, size, name, sites) in std::mem::take(&mut self.unmapped) {
-            crate::fault::remember(self.module.get_finalized_function(id) as usize, size, name, sites);
+        self.memory.publish()?;
+        for (code, size, name, sites) in std::mem::take(&mut self.unmapped) {
+            crate::fault::remember(code, size, name, sites);
         }
-        for (slot, id) in made {
-            let code = self.module.get_finalized_function(id);
-            self.slots.table[slot].store(code as usize, Ordering::Release);
+        for (slot, code) in made {
+            self.slots.table[slot].store(code, Ordering::Release);
         }
         for (word, slot) in std::mem::take(&mut self.slots.native_words) {
             let code = self.slots.table[slot].load(Ordering::Acquire);
@@ -383,92 +384,54 @@ impl Backend {
         Ok(())
     }
 
-    fn declare(&mut self, sig: Sig, native: Option<&NativeSig>) -> Result<FuncId, String> {
-        let name = format!("f{}", self.serial);
-        self.serial += 1;
-        let mut signature = self.module.make_signature();
-        match native {
-            Some(native) => native.signature(&mut signature),
-            None => {
-                signature.call_conv = INTERNAL_CONV;
-                pointer_signature(&mut signature, sig);
-            }
-        }
-        let id = self.module.declare_function(&name, Linkage::Local, &signature).map_err(|e| e.to_string())?;
-        self.ctx.func.signature = signature;
-        Ok(id)
+    fn define(&mut self, func: &Function, name: &str) -> Result<usize, String> {
+        let compiled = haste_codegen::compile(func)?;
+        let code = self.memory.write(&compiled.code)?;
+        self.unmapped.push((code, compiled.code.len(), name.to_owned(), compiled.sites));
+        Ok(code)
     }
 
-    fn define(&mut self, id: FuncId) -> Result<FuncId, String> {
-        self.define_named(id, STUB_NAME)
-    }
-
-    fn define_named(&mut self, id: FuncId, name: &str) -> Result<FuncId, String> {
-        let defined = self.module.define_function(id, &mut self.ctx).map_err(|e| format!("{e:?}"));
-        if defined.is_ok() {
-            let size = self.ctx.compiled_code().map_or(0, |code| code.code_info().total_size as usize);
-            let sites = self.ctx.compiled_code().map(handler_sites).unwrap_or_default();
-            self.unmapped.push((id, size, name.to_owned(), sites));
-        }
-        self.module.clear_context(&mut self.ctx);
-        defined.map(|()| id)
-    }
-
-    fn compile_stub(&mut self, slot: usize) -> Result<FuncId, String> {
+    fn compile_stub(&mut self, slot: usize) -> Result<usize, String> {
         let sig = self.slots.info[slot].sig;
-        let native = native_of(&self.slots.info[slot].key).cloned();
-        let id = self.declare(sig, native.as_ref())?;
-        let config = self.module.target_config();
+        let signature = signature_for(sig, native_of(&self.slots.info[slot].key));
         let address = self.slots.address(slot);
-        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder);
+        let mut func = Function::new(signature.clone());
+        let mut builder = FunctionBuilder::new(&mut func);
         let block = builder.create_block();
         builder.append_block_params_for_function_params(block);
         builder.switch_to_block(block);
-        builder.seal_block(block);
         let params = builder.block_params(block).to_vec();
-        let mut host = Signature::new(config.default_call_conv);
-        host.params.push(AbiParam::new(types::I64));
+        let mut host = Signature::new(CallConv::Native);
+        host.params.push(AbiParam::new(Type::I64));
         let host = builder.import_signature(host);
-        let code = builder.ins().iconst(types::I64, compile_slot as *const () as usize as i64);
-        let number = builder.ins().iconst(types::I64, slot as i64);
+        let code = builder.ins().iconst(Type::I64, compile_slot as *const () as usize as i64);
+        let number = builder.ins().iconst(Type::I64, slot as i64);
         builder.ins().call_indirect(host, code, &[number]);
-        let mut target = Signature::new(config.default_call_conv);
-        match &native {
-            Some(native) => native.signature(&mut target),
-            None => {
-                target.call_conv = INTERNAL_CONV;
-                pointer_signature(&mut target, sig);
-            }
-        }
-        let target = builder.import_signature(target);
-        let address = builder.ins().iconst(types::I64, address);
-        let code = builder.ins().load(types::I64, MemFlagsData::trusted(), address, 0);
+        let target = builder.import_signature(signature);
+        let address = builder.ins().iconst(Type::I64, address);
+        let code = builder.ins().load(Type::I64, address, 0);
         let call = builder.ins().call_indirect(target, code, &params);
         let results = builder.inst_results(call).to_vec();
         builder.ins().return_(&results);
-        builder.finalize(config);
-        self.define(id)
+        self.define(&func, STUB_NAME)
     }
 
-    fn trap_function(&mut self, sig: Sig, native: Option<&NativeSig>, reason: &str) -> Result<FuncId, String> {
-        let id = self.declare(sig, native)?;
-        let config = self.module.target_config();
-        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder);
+    fn trap_function(&mut self, sig: Sig, native: Option<&NativeSig>, reason: &str) -> Result<usize, String> {
+        let mut func = Function::new(signature_for(sig, native));
+        let mut builder = FunctionBuilder::new(&mut func);
         let block = builder.create_block();
         builder.append_block_params_for_function_params(block);
         builder.switch_to_block(block);
-        builder.seal_block(block);
         let (text, size) = leak_text(reason);
-        let mut host = Signature::new(config.default_call_conv);
-        host.params.extend([AbiParam::new(types::I64); 2]);
+        let mut host = Signature::new(CallConv::Native);
+        host.params.extend([AbiParam::new(Type::I64); 2]);
         let host = builder.import_signature(host);
-        let code = builder.ins().iconst(types::I64, report_trap as *const () as usize as i64);
-        let text = builder.ins().iconst(types::I64, text);
-        let size = builder.ins().iconst(types::I64, size);
+        let code = builder.ins().iconst(Type::I64, report_trap as *const () as usize as i64);
+        let text = builder.ins().iconst(Type::I64, text);
+        let size = builder.ins().iconst(Type::I64, size);
         builder.ins().call_indirect(host, code, &[text, size]);
-        builder.ins().trap(TrapCode::unwrap_user(2));
-        builder.finalize(config);
-        self.define(id)
+        builder.ins().trap();
+        self.define(&func, STUB_NAME)
     }
 
     fn lower<'db>(
@@ -479,38 +442,37 @@ impl Backend {
         body: &'db MirBody<'db>,
         sig: Sig,
         work: Work<'db>,
-    ) -> Result<FuncId, String> {
+    ) -> Result<usize, String> {
         let native = if let Work::Native(_, native) = &work { Some(native.clone()) } else { None };
-        let id = self.declare(sig, native.as_ref())?;
-        let config = self.module.target_config();
-        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder);
-        let lower = Lower::new(db, env, body, &mut builder, &mut self.slots, config.default_call_conv, sig);
-        let result = match work {
+        let mut func = Function::new(signature_for(sig, native.as_ref()));
+        let mut builder = FunctionBuilder::new(&mut func);
+        let lower = Lower::new(db, env, body, &mut builder, &mut self.slots, CallConv::Native, sig);
+        match work {
             Work::Body => lower.run(),
             Work::Glue(ty) => lower.glue(ty),
             Work::Thunk(target, data) => lower.thunk(target, data),
             Work::Shim(ty) => lower.shim(ty),
             Work::Native(target, native) => lower.native(target, &native),
             Work::Derive(method, func, args) => lower.derive(method, func, args),
-        };
-        match result {
-            Ok(()) => {
-                builder.finalize(config);
-                if self.dump {
-                    println!("=== {name}\n{}", self.ctx.func.display());
-                }
-                self.define_named(id, name)
-            }
-            Err(reason) => {
-                drop(builder);
-                self.builder = FunctionBuilderContext::new();
-                self.module.clear_context(&mut self.ctx);
-                Err(reason)
-            }
+        }?;
+        if self.dump {
+            println!("=== {name}\n{func}");
         }
+        self.define(&func, name)
     }
 }
 
+fn signature_for(sig: Sig, native: Option<&NativeSig>) -> Signature {
+    let mut signature = Signature::new(CallConv::Native);
+    match native {
+        Some(native) => native.signature(&mut signature),
+        None => {
+            signature.call_conv = INTERNAL_CONV;
+            pointer_signature(&mut signature, sig);
+        }
+    }
+    signature
+}
 
 pub fn leak_text(text: &str) -> (i64, i64) {
     let text: &'static str = Box::leak(text.to_owned().into_boxed_str());
@@ -574,7 +536,7 @@ pub fn key_of(target: &Target<'_>) -> Option<Key> {
 
 pub fn pointer_signature(signature: &mut Signature, sig: Sig) {
     let count = sig.params + usize::from(sig.ret);
-    signature.params.extend((0..count).map(|_| AbiParam::new(types::I64)));
+    signature.params.extend((0..count).map(|_| AbiParam::new(Type::I64)));
 }
 
 fn name_of(db: &dyn HirDatabase, target: &Target<'_>) -> String {

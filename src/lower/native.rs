@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind, Value, types};
+use haste_codegen::{AbiParam, Signature, Type, Value};
 use hir_def::StaticId;
 use hir_def::attrs::AttrFlags;
 use hir_ty::mir::PlaceTy;
@@ -53,11 +53,11 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn native_pointer(&mut self, ty: Ty<'db>) -> Result<Value, String> {
         if let Some(code) = self.native_symbol(ty)? {
-            return Ok(self.builder.ins().iconst(types::I64, code as i64));
+            return Ok(self.builder.ins().iconst(Type::I64, code as i64));
         }
         let slot = self.native_slot(ty)?;
-        let cell = self.builder.ins().iconst(types::I64, self.slots.address(slot));
-        Ok(self.load(types::I64, cell, 0))
+        let cell = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
+        Ok(self.load(Type::I64, cell, 0))
     }
 
     pub(super) fn native_slot(&mut self, ty: Ty<'db>) -> Result<usize, String> {
@@ -133,14 +133,12 @@ impl<'db> Lower<'_, '_, 'db> {
                 self.builder.ins().return_(&[]);
             }
         }
-        self.builder.seal_all_blocks();
         Ok(())
     }
 
     fn frame(&mut self, size: u64) -> Value {
-        let data = StackSlotData::new(StackSlotKind::ExplicitSlot, size.max(8) as u32, 4);
-        let slot = self.builder.create_sized_stack_slot(data);
-        self.builder.ins().stack_addr(types::I64, slot, 0)
+                let slot = self.builder.create_stack_slot(size.max(8) as u32, 4);
+        self.builder.ins().stack_addr(Type::I64, slot, 0)
     }
 
     fn push_arg(&mut self, pass: &Pass, place: &Place<'db>, values: &mut Vec<Value>) -> Result<(), String> {
@@ -191,13 +189,13 @@ impl<'db> Lower<'_, '_, 'db> {
         let next = self.slots.thread_locals.len();
         let index = *self.slots.thread_locals.entry(id).or_insert(next);
         let mut signature = Signature::new(self.call_conv);
-        signature.params.extend([AbiParam::new(types::I64); 3]);
-        signature.returns.push(AbiParam::new(types::I64));
+        signature.params.extend([AbiParam::new(Type::I64); 3]);
+        signature.returns.push(AbiParam::new(Type::I64));
         let signature = self.builder.import_signature(signature);
-        let code = self.builder.ins().iconst(types::I64, intrinsic::thread_local_code() as i64);
-        let index = self.builder.ins().iconst(types::I64, index as i64);
-        let template = self.builder.ins().iconst(types::I64, template as i64);
-        let size = self.builder.ins().iconst(types::I64, size as i64);
+        let code = self.builder.ins().iconst(Type::I64, intrinsic::thread_local_code() as i64);
+        let index = self.builder.ins().iconst(Type::I64, index as i64);
+        let template = self.builder.ins().iconst(Type::I64, template as i64);
+        let size = self.builder.ins().iconst(Type::I64, size as i64);
         let call = self.builder.ins().call_indirect(signature, code, &[index, template, size]);
         self.builder.inst_results(call)[0]
     }

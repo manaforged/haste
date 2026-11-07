@@ -1,9 +1,6 @@
 use std::cmp::Reverse;
 
-use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, BlockCall, ExceptionTableData, ExceptionTableItem, InstBuilder, SigRef, Signature, StackSlotData,
-    StackSlotKind, Value, types,
-};
+use haste_codegen::{AbiParam, Block, SigRef, Signature, Type, Value};
 use hir_ty::mir::PlaceTy;
 
 use super::{Lower, Place};
@@ -13,13 +10,19 @@ const TRY: Sig = Sig { params: 1, ret: false };
 const CATCH: Sig = Sig { params: 2, ret: false };
 
 impl<'db> Lower<'_, '_, 'db> {
-    fn landing(&mut self) -> Option<Block> {
-        if self.cleaning || self.flags.is_empty() {
+    /// Tells whether a panic at a call here runs cleanup in this frame.
+    pub(super) fn has_landing(&self) -> bool {
+        !self.cleaning && (self.landing.is_some() || !self.flags.is_empty())
+    }
+
+    /// Gives the block that cleans this frame on a panic, made on first use, or an inlined callee's caller block.
+    pub(super) fn landing(&mut self) -> Option<Block> {
+        if self.cleaning {
             return None;
         }
-        if self.landing.is_none() {
+        if self.landing.is_none() && !self.flags.is_empty() {
             let block = self.builder.create_block();
-            self.builder.append_block_param(block, types::I64);
+            self.builder.append_block_param(block, Type::I64);
             self.landing = Some(block);
         }
         self.landing
@@ -27,12 +30,7 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn try_call(&mut self, signature: SigRef, code: Value, values: &[Value], handler: Block) {
         let next = self.builder.create_block();
-        let pool = &mut self.builder.func.dfg.value_lists;
-        let normal = BlockCall::new(next, [], pool);
-        let caught = BlockCall::new(handler, [BlockArg::TryCallExn(0)], pool);
-        let table = ExceptionTableData::new(signature, normal, [ExceptionTableItem::Default(caught)]);
-        let table = self.builder.func.dfg.exception_tables.push(table);
-        self.builder.ins().try_call_indirect(code, values, table);
+        self.builder.ins().try_call_indirect(signature, code, values, next, handler);
         self.builder.switch_to_block(next);
     }
 
@@ -47,11 +45,11 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     pub(super) fn raise(&mut self, exception: Value) {
-        let frame = self.builder.ins().get_frame_pointer(types::I64);
+        let frame = self.builder.ins().get_frame_pointer(Type::I64);
         let mut signature = Signature::new(self.call_conv);
-        signature.params.extend([AbiParam::new(types::I64); 2]);
+        signature.params.extend([AbiParam::new(Type::I64); 2]);
         let signature = self.builder.import_signature(signature);
-        let code = self.builder.ins().iconst(types::I64, crate::unwind::raise as *const () as usize as i64);
+        let code = self.builder.ins().iconst(Type::I64, crate::unwind::raise as *const () as usize as i64);
         self.builder.ins().call_indirect(signature, code, &[frame, exception]);
         self.trap();
     }
@@ -74,25 +72,25 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn catch_unwind(&mut self, dest: Place<'db>, args: &[Place<'db>]) -> Result<(), String> {
         let [try_fn, data, catch_fn] = args else { return Err("catch_unwind takes three arguments".to_owned()) };
-        let try_cell = self.load(types::I64, try_fn.addr, 0);
-        let catch_cell = self.load(types::I64, catch_fn.addr, 0);
+        let try_cell = self.load(Type::I64, try_fn.addr, 0);
+        let catch_cell = self.load(Type::I64, catch_fn.addr, 0);
         let mut signature = Signature::new(INTERNAL_CONV);
         pointer_signature(&mut signature, TRY);
         let signature = self.builder.import_signature(signature);
-        let code = self.load(types::I64, try_cell, 0);
+        let code = self.load(Type::I64, try_cell, 0);
         let (caught, done) = (self.builder.create_block(), self.builder.create_block());
-        self.builder.append_block_param(caught, types::I64);
+        self.builder.append_block_param(caught, Type::I64);
         self.try_call(signature, code, &[data.addr], caught);
-        let zero = self.builder.ins().iconst(types::I32, 0);
+        let zero = self.builder.ins().iconst(Type::I32, 0);
         self.store(zero, dest.addr, 0);
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(caught);
         let exception = self.builder.block_params(caught)[0];
-        let holder = self.builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-        let holder = self.builder.ins().stack_addr(types::I64, holder, 0);
+        let holder = self.builder.create_stack_slot(8, 3);
+        let holder = self.builder.ins().stack_addr(Type::I64, holder, 0);
         self.store(exception, holder, 0);
         self.call_cell(catch_cell, CATCH, &[data.addr, holder]);
-        let one = self.builder.ins().iconst(types::I32, 1);
+        let one = self.builder.ins().iconst(Type::I32, 1);
         self.store(one, dest.addr, 0);
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);

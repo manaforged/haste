@@ -1,6 +1,5 @@
 use hir_def::attrs::AttrFlags;
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Block, InstBuilder, StackSlotData, StackSlotKind, Value, types};
+use haste_codegen::{Block, IntCC, Type, Value};
 use hir_def::builtin_derive::BuiltinDeriveImplMethod as Method;
 use hir_def::{AdtId, CallableDefId, EnumVariantId, FunctionId, ImplId, VariantId};
 use hir_ty::db::HirDatabase;
@@ -92,13 +91,13 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn tag_of(&mut self, ty: Ty<'db>, addr: Value) -> Result<Value, String> {
         let wide = Ty::new_int(self.infcx.interner, IntTy::Isize);
-        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-        let at = self.builder.ins().stack_addr(types::I64, slot, 0);
+        let slot = self.builder.create_stack_slot(8, 3);
+        let at = self.builder.ins().stack_addr(Type::I64, slot, 0);
         self.discriminant(
             Place { addr: at, ty: PlaceTy::from_ty(wide), meta: None },
             Place { addr, ty: PlaceTy::from_ty(ty), meta: None },
         )?;
-        Ok(self.load(types::I64, at, 0))
+        Ok(self.load(Type::I64, at, 0))
     }
 
     fn each_part(
@@ -152,9 +151,8 @@ impl<'db> Lower<'_, '_, 'db> {
     fn temp(&mut self, ty: Ty<'db>) -> Result<Place<'db>, String> {
         let layout = self.layout(ty)?;
         let align = layout.align.abi.bytes().trailing_zeros() as u8;
-        let data = StackSlotData::new(StackSlotKind::ExplicitSlot, layout.size.bytes().max(1) as u32, align);
-        let slot = self.builder.create_sized_stack_slot(data);
-        let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                let slot = self.builder.create_stack_slot(layout.size.bytes().max(1) as u32, align);
+        let addr = self.builder.ins().stack_addr(Type::I64, slot, 0);
         Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None })
     }
 
@@ -174,7 +172,7 @@ impl<'db> Lower<'_, '_, 'db> {
         let self_ty = self.normalized(self_ty);
         let sig = self.sig;
         let (ret, rest) = if sig.ret { (Some(params[0]), &params[1..]) } else { (None, &params[..]) };
-        let ret = ret.unwrap_or_else(|| self.builder.ins().iconst(types::I64, 16));
+        let ret = ret.unwrap_or_else(|| self.builder.ins().iconst(Type::I64, 16));
         match method {
             Method::clone => self.derive_clone(func, self_ty, ret, rest[0])?,
             Method::default => self.derive_default(func, self_ty, ret)?,
@@ -184,13 +182,12 @@ impl<'db> Lower<'_, '_, 'db> {
             Method::fmt => self.derive_debug(self_ty, ret, rest)?,
         }
         self.builder.ins().return_(&[]);
-        self.builder.seal_all_blocks();
         Ok(())
     }
 
     fn derive_clone(&mut self, func: FunctionId, ty: Ty<'db>, ret: Value, holder: Value) -> Result<(), String> {
         let size = self.layout(ty)?.size.bytes();
-        let from = self.load(types::I64, holder, 0);
+        let from = self.load(Type::I64, holder, 0);
         self.copy(ret, from, size);
         self.each_part(ty, from, |lower, part| {
             for (field, offset, _) in &part.fields {
@@ -232,8 +229,8 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     fn derive_compare(&mut self, kind: Compare, func: FunctionId, ty: Ty<'db>, ret: Value, rest: &[Value]) -> Result<(), String> {
-        let left = self.load(types::I64, rest[0], 0);
-        let right = self.load(types::I64, rest[1], 0);
+        let left = self.load(Type::I64, rest[0], 0);
+        let right = self.load(Type::I64, rest[1], 0);
         let done = self.builder.create_block();
         let parts = self.parts(ty)?;
         if parts.iter().any(|part| part.variant.is_some()) {
@@ -253,7 +250,7 @@ impl<'db> Lower<'_, '_, 'db> {
                     _ => vec![(*field).into()],
                 };
                 lower.call_method(func, args, temp, &[first, second])?;
-                let value = lower.load(types::I8, temp.addr, 0);
+                let value = lower.load(Type::I8, temp.addr, 0);
                 lower.store(value, ret, 0);
                 let stop = match kind {
                     Compare::Eq => lower.builder.ins().icmp_imm_u(IntCC::Equal, value, 0),
@@ -265,7 +262,7 @@ impl<'db> Lower<'_, '_, 'db> {
             }
             Ok(())
         })?;
-        let same = self.builder.ins().iconst(types::I8, kind.same_value());
+        let same = self.builder.ins().iconst(Type::I8, kind.same_value());
         self.store(same, ret, 0);
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
@@ -283,7 +280,7 @@ impl<'db> Lower<'_, '_, 'db> {
         self.builder.ins().brif(same, next, &[], differ, &[]);
         self.builder.switch_to_block(differ);
         let value = match kind {
-            Compare::Eq => self.builder.ins().iconst(types::I8, 0),
+            Compare::Eq => self.builder.ins().iconst(Type::I8, 0),
             Compare::Order => {
                 let up = self.builder.ins().icmp(IntCC::SignedGreaterThan, a, b);
                 let down = self.builder.ins().icmp(IntCC::SignedLessThan, a, b);
@@ -296,7 +293,7 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     fn derive_hash(&mut self, func: FunctionId, args: GenericArgs<'db>, ty: Ty<'db>, rest: &[Value]) -> Result<(), String> {
-        let from = self.load(types::I64, rest[0], 0);
+        let from = self.load(Type::I64, rest[0], 0);
         let state = rest[1];
         let hasher = args.as_slice().get(1).copied().ok_or("hash without a hasher")?;
         let state_ty = self.state_ty(hasher)?;
@@ -344,7 +341,7 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     fn derive_debug(&mut self, ty: Ty<'db>, ret: Value, rest: &[Value]) -> Result<(), String> {
-        let from = self.load(types::I64, rest[0], 0);
+        let from = self.load(Type::I64, rest[0], 0);
         let formatter_holder = rest[1];
         let debug_fmt = self.infcx.interner.lang_items().Debug.ok_or("no Debug trait")?;
         let fmt = debug_fmt.trait_items(self.db).items.iter().find_map(|(_, item)| match item {
@@ -398,7 +395,7 @@ impl<'db> Lower<'_, '_, 'db> {
     fn text_place(&mut self, text: &str) -> Place<'db> {
         let text: &'static str = Box::leak(text.to_owned().into_boxed_str());
         let cell: &'static [usize; 2] = Box::leak(Box::new([text.as_ptr() as usize, text.len()]));
-        let addr = self.builder.ins().iconst(types::I64, cell.as_ptr() as i64);
+        let addr = self.builder.ins().iconst(Type::I64, cell.as_ptr() as i64);
         let region = hir_ty::next_solver::Region::new_erased(self.infcx.interner);
         let ty = Ty::new_imm_ref(self.infcx.interner, region, Ty::new(self.infcx.interner, TyKind::Str));
         Place { addr, ty: PlaceTy::from_ty(ty), meta: None }
@@ -413,24 +410,23 @@ impl<'db> Lower<'_, '_, 'db> {
         }
         let pairs: &'static [usize] = Box::leak(pairs.into_boxed_slice());
         let cell: &'static [usize; 2] = Box::leak(Box::new([pairs.as_ptr() as usize, part.fields.len()]));
-        let addr = self.builder.ins().iconst(types::I64, cell.as_ptr() as i64);
+        let addr = self.builder.ins().iconst(Type::I64, cell.as_ptr() as i64);
         Place { addr, ty: PlaceTy::from_ty(ty), meta: None }
     }
 
     fn debug_values(&mut self, part: &Part<'db>, from: Value, dyn_ty: Ty<'db>) -> Result<Value, String> {
         let count = part.fields.len();
-        let data = StackSlotData::new(StackSlotKind::ExplicitSlot, (count * 16) as u32, 3);
-        let slot = self.builder.create_sized_stack_slot(data);
-        let array = self.builder.ins().stack_addr(types::I64, slot, 0);
+                let slot = self.builder.create_stack_slot((count * 16) as u32, 3);
+        let array = self.builder.ins().stack_addr(Type::I64, slot, 0);
         for (index, (field, offset, _)) in part.fields.iter().enumerate() {
             let table = self.vtable(*field, dyn_ty)?;
             let at = self.builder.ins().iadd_imm(from, *offset as i64);
-            let table = self.builder.ins().iconst(types::I64, table);
+            let table = self.builder.ins().iconst(Type::I64, table);
             self.store(at, array, (index * 16) as i32);
             self.store(table, array, (index * 16 + 8) as i32);
         }
         let holder = self.thin_holder(array);
-        let count = self.builder.ins().iconst(types::I64, count as i64);
+        let count = self.builder.ins().iconst(Type::I64, count as i64);
         self.store(count, holder, 8);
         Ok(holder)
     }

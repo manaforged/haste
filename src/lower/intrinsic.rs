@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{AbiParam, AtomicRmwOp, InstBuilder, MemFlagsData, Signature, Type, Value, types};
+use haste_codegen::{AbiParam, AtomicRmwOp, Signature, Type, Value};
 use hir_def::AdtId;
 use hir_ty::next_solver::{GenericArgs, Ty, TyKind};
 use rustc_type_ir::inherent::IntoKind;
@@ -63,12 +63,12 @@ fn bin_op(kind: BinOpKind) -> BinOp {
 
 pub(super) fn wide_call(op: &BinOp, ty: Type, signed: bool) -> Option<usize> {
     let code = match (op, ty, signed) {
-        (BinOp::Div, types::I128, true) => __divti3 as *const () as usize,
-        (BinOp::Rem, types::I128, true) => __modti3 as *const () as usize,
-        (BinOp::Div, types::I128, false) => __udivti3 as *const () as usize,
-        (BinOp::Rem, types::I128, false) => __umodti3 as *const () as usize,
-        (BinOp::Rem, types::F64, _) => fmod as *const () as usize,
-        (BinOp::Rem, types::F32, _) => fmodf as *const () as usize,
+        (BinOp::Div, Type::I128, true) => __divti3 as *const () as usize,
+        (BinOp::Rem, Type::I128, true) => __modti3 as *const () as usize,
+        (BinOp::Div, Type::I128, false) => __udivti3 as *const () as usize,
+        (BinOp::Rem, Type::I128, false) => __umodti3 as *const () as usize,
+        (BinOp::Rem, Type::F64, _) => fmod as *const () as usize,
+        (BinOp::Rem, Type::F32, _) => fmodf as *const () as usize,
         _ => return None,
     };
     Some(code)
@@ -396,40 +396,40 @@ const TABLE: &[(&str, Op)] = &[
     ("truncf64", Op::FloatUnary(Float::Trunc)),
     ("copysignf32", Op::CopySign),
     ("copysignf64", Op::CopySign),
-    ("roundf64", Op::Libm(libm!(round), types::F64, 1)),
-    ("roundf32", Op::Libm(libm!(roundf), types::F32, 1)),
-    ("fmaf64", Op::Libm(libm!(fma), types::F64, 3)),
-    ("fmaf32", Op::Libm(libm!(fmaf), types::F32, 3)),
-    ("powf64", Op::Libm(libm!(pow), types::F64, 2)),
-    ("powf32", Op::Libm(libm!(powf), types::F32, 2)),
-    ("expf64", Op::Libm(libm!(exp), types::F64, 1)),
-    ("expf32", Op::Libm(libm!(expf), types::F32, 1)),
-    ("sinf64", Op::Libm(libm!(sin), types::F64, 1)),
-    ("sinf32", Op::Libm(libm!(sinf), types::F32, 1)),
-    ("cosf64", Op::Libm(libm!(cos), types::F64, 1)),
-    ("cosf32", Op::Libm(libm!(cosf), types::F32, 1)),
-    ("exp2f64", Op::Libm(libm!(exp2), types::F64, 1)),
-    ("exp2f32", Op::Libm(libm!(exp2f), types::F32, 1)),
-    ("logf64", Op::Libm(libm!(log), types::F64, 1)),
-    ("logf32", Op::Libm(libm!(logf), types::F32, 1)),
-    ("log2f64", Op::Libm(libm!(log2), types::F64, 1)),
-    ("log2f32", Op::Libm(libm!(log2f), types::F32, 1)),
-    ("log10f64", Op::Libm(libm!(log10), types::F64, 1)),
-    ("log10f32", Op::Libm(libm!(log10f), types::F32, 1)),
-    ("round_ties_even_f64", Op::Libm(libm!(rint), types::F64, 1)),
-    ("round_ties_even_f32", Op::Libm(libm!(rintf), types::F32, 1)),
-    ("powif64", Op::Powi(|| powi_f64 as *const () as usize, types::F64)),
-    ("powif32", Op::Powi(|| powi_f32 as *const () as usize, types::F32)),
+    ("roundf64", Op::Libm(libm!(round), Type::F64, 1)),
+    ("roundf32", Op::Libm(libm!(roundf), Type::F32, 1)),
+    ("fmaf64", Op::Libm(libm!(fma), Type::F64, 3)),
+    ("fmaf32", Op::Libm(libm!(fmaf), Type::F32, 3)),
+    ("powf64", Op::Libm(libm!(pow), Type::F64, 2)),
+    ("powf32", Op::Libm(libm!(powf), Type::F32, 2)),
+    ("expf64", Op::Libm(libm!(exp), Type::F64, 1)),
+    ("expf32", Op::Libm(libm!(expf), Type::F32, 1)),
+    ("sinf64", Op::Libm(libm!(sin), Type::F64, 1)),
+    ("sinf32", Op::Libm(libm!(sinf), Type::F32, 1)),
+    ("cosf64", Op::Libm(libm!(cos), Type::F64, 1)),
+    ("cosf32", Op::Libm(libm!(cosf), Type::F32, 1)),
+    ("exp2f64", Op::Libm(libm!(exp2), Type::F64, 1)),
+    ("exp2f32", Op::Libm(libm!(exp2f), Type::F32, 1)),
+    ("logf64", Op::Libm(libm!(log), Type::F64, 1)),
+    ("logf32", Op::Libm(libm!(logf), Type::F32, 1)),
+    ("log2f64", Op::Libm(libm!(log2), Type::F64, 1)),
+    ("log2f32", Op::Libm(libm!(log2f), Type::F32, 1)),
+    ("log10f64", Op::Libm(libm!(log10), Type::F64, 1)),
+    ("log10f32", Op::Libm(libm!(log10f), Type::F32, 1)),
+    ("round_ties_even_f64", Op::Libm(libm!(rint), Type::F64, 1)),
+    ("round_ties_even_f32", Op::Libm(libm!(rintf), Type::F32, 1)),
+    ("powif64", Op::Powi(|| powi_f64 as *const () as usize, Type::F64)),
+    ("powif32", Op::Powi(|| powi_f32 as *const () as usize, Type::F32)),
     ("float_to_int_unchecked", Op::FloatToInt),
     ("caller_location", Op::CallerLocation),
     ("pointer_lt", Op::PointerOrder(Order::Lt)),
     ("pointer_le", Op::PointerOrder(Order::Le)),
     ("pointer_gt", Op::PointerOrder(Order::Gt)),
     ("pointer_ge", Op::PointerOrder(Order::Ge)),
-    ("maximum_number_nsz_f64", Op::Libm(libm!(fmax), types::F64, 2)),
-    ("maximum_number_nsz_f32", Op::Libm(libm!(fmaxf), types::F32, 2)),
-    ("minimum_number_nsz_f64", Op::Libm(libm!(fmin), types::F64, 2)),
-    ("minimum_number_nsz_f32", Op::Libm(libm!(fminf), types::F32, 2)),
+    ("maximum_number_nsz_f64", Op::Libm(libm!(fmax), Type::F64, 2)),
+    ("maximum_number_nsz_f32", Op::Libm(libm!(fmaxf), Type::F32, 2)),
+    ("minimum_number_nsz_f64", Op::Libm(libm!(fmin), Type::F64, 2)),
+    ("minimum_number_nsz_f32", Op::Libm(libm!(fminf), Type::F32, 2)),
 ];
 
 impl<'db> Lower<'_, '_, 'db> {
@@ -447,7 +447,7 @@ impl<'db> Lower<'_, '_, 'db> {
             Op::Trap => self.trap_and_continue(),
             Op::Nop => {}
             Op::False => {
-                let zero = self.builder.ins().iconst(types::I8, 0);
+                let zero = self.builder.ins().iconst(Type::I8, 0);
                 self.store(zero, dest.addr, 0);
             }
             Op::CopyFirst => self.copy_sized(dest, args[0].addr)?,
@@ -457,33 +457,33 @@ impl<'db> Lower<'_, '_, 'db> {
                 self.copy_sized(dest, args[0].addr)?;
             }
             Op::Read => {
-                let pointer = self.load(types::I64, args[0].addr, 0);
+                let pointer = self.load(Type::I64, args[0].addr, 0);
                 self.copy_sized(dest, pointer)?;
             }
             Op::CopyMemory => self.copy_memory(generic.ok_or("copy without a type")?, args)?,
             Op::LayoutOf(kind) => self.layout_value(generic.ok_or("layout without a type")?, kind, dest)?,
             Op::LayoutOfVal(kind) => {
                 let ty = generic.ok_or("layout without a type")?;
-                let meta = self.layout(ty)?.is_unsized().then(|| self.load(types::I64, args[0].addr, 8));
+                let meta = self.layout(ty)?.is_unsized().then(|| self.load(Type::I64, args[0].addr, 8));
                 let (size, align) = self.size_align(ty, meta)?;
                 let value = if matches!(kind, Layout::Size) { size } else { align };
                 self.store(value, dest.addr, 0);
             }
             Op::NeedsDrop => {
                 let needs = self.needs_drop(generic.ok_or("needs_drop without a type")?);
-                let value = self.builder.ins().iconst(types::I8, i64::from(needs));
+                let value = self.builder.ins().iconst(Type::I8, i64::from(needs));
                 self.store(value, dest.addr, 0);
             }
             Op::DiscriminantValue => {
-                let pointer = self.load(types::I64, args[0].addr, 0);
+                let pointer = self.load(Type::I64, args[0].addr, 0);
                 let ty = generic.ok_or("discriminant without a type")?;
                 let place = Place { addr: pointer, ty: hir_ty::mir::PlaceTy::from_ty(ty), meta: None };
                 self.discriminant(dest, place)?;
             }
             Op::SliceItem => {
                 let item = generics.as_slice().get(2).and_then(|arg| arg.ty()).ok_or("slice item without a type")?;
-                let base = self.load(types::I64, args[0].addr, 0);
-                let index = self.load(types::I64, args[1].addr, 0);
+                let base = self.load(Type::I64, args[0].addr, 0);
+                let index = self.load(Type::I64, args[1].addr, 0);
                 let size = self.layout(item)?.size.bytes() as i64;
                 let delta = self.builder.ins().imul_imm(index, size);
                 let value = self.builder.ins().iadd(base, delta);
@@ -491,21 +491,21 @@ impl<'db> Lower<'_, '_, 'db> {
             }
             Op::AtomicLoad => {
                 let scalar = self.scalar(generic.ok_or("atomic without a type")?)?;
-                let pointer = self.load(types::I64, args[0].addr, 0);
-                let value = self.builder.ins().atomic_load(scalar.ty, MemFlagsData::trusted(), pointer);
+                let pointer = self.load(Type::I64, args[0].addr, 0);
+                let value = self.builder.ins().atomic_load(scalar.ty, pointer);
                 self.store(value, dest.addr, 0);
             }
             Op::AtomicStore => {
                 let scalar = self.scalar(generic.ok_or("atomic without a type")?)?;
-                let pointer = self.load(types::I64, args[0].addr, 0);
+                let pointer = self.load(Type::I64, args[0].addr, 0);
                 let value = self.load(scalar.ty, args[1].addr, 0);
-                self.builder.ins().atomic_store(MemFlagsData::trusted(), value, pointer);
+                self.builder.ins().atomic_store(value, pointer);
             }
             Op::AtomicRmw(op) => {
                 let scalar = self.scalar(generic.ok_or("atomic without a type")?)?;
-                let pointer = self.load(types::I64, args[0].addr, 0);
+                let pointer = self.load(Type::I64, args[0].addr, 0);
                 let value = self.load(scalar.ty, args[1].addr, 0);
-                let old = self.builder.ins().atomic_rmw(scalar.ty, MemFlagsData::trusted(), op, pointer, value);
+                let old = self.builder.ins().atomic_rmw(scalar.ty, op, pointer, value);
                 self.store(old, dest.addr, 0);
             }
             Op::AtomicExchange => self.atomic_exchange(generic.ok_or("atomic without a type")?, dest, args)?,
@@ -519,7 +519,7 @@ impl<'db> Lower<'_, '_, 'db> {
             Op::SwapBytes => {
                 let scalar = self.scalar(args[0].ty.ty)?;
                 let mut value = self.load(scalar.ty, args[0].addr, 0);
-                if scalar.ty != types::I8 {
+                if scalar.ty != Type::I8 {
                     value = self.builder.ins().bswap(value);
                 }
                 self.store(value, dest.addr, 0);
@@ -531,8 +531,8 @@ impl<'db> Lower<'_, '_, 'db> {
                 self.store(value, dest.addr, 0);
             }
             Op::PointerMask => {
-                let pointer = self.load(types::I64, args[0].addr, 0);
-                let mask = self.load(types::I64, args[1].addr, 0);
+                let pointer = self.load(Type::I64, args[0].addr, 0);
+                let mask = self.load(Type::I64, args[1].addr, 0);
                 let value = self.builder.ins().band(pointer, mask);
                 self.store(value, dest.addr, 0);
             }
@@ -544,7 +544,7 @@ impl<'db> Lower<'_, '_, 'db> {
                     },
                     _ => 0,
                 };
-                let value = self.builder.ins().iconst(types::I64, count as i64);
+                let value = self.builder.ins().iconst(Type::I64, count as i64);
                 self.store(value, dest.addr, 0);
             }
             Op::TypeId => {
@@ -558,15 +558,15 @@ impl<'db> Lower<'_, '_, 'db> {
                 let low = std::hash::Hasher::finish(&hasher);
                 std::hash::Hash::hash(&1_u8, &mut hasher);
                 let high = std::hash::Hasher::finish(&hasher);
-                let low = self.builder.ins().iconst(types::I64, low as i64);
-                let high = self.builder.ins().iconst(types::I64, high as i64);
+                let low = self.builder.ins().iconst(Type::I64, low as i64);
+                let high = self.builder.ins().iconst(Type::I64, high as i64);
                 self.store(low, dest.addr, 0);
                 self.store(high, dest.addr, 8);
             }
             Op::TypeName => {
                 let text: &'static str = Box::leak(format!("{:?}", generic.ok_or("type_name without a type")?).into_boxed_str());
-                let data = self.builder.ins().iconst(types::I64, text.as_ptr() as i64);
-                let len = self.builder.ins().iconst(types::I64, text.len() as i64);
+                let data = self.builder.ins().iconst(Type::I64, text.as_ptr() as i64);
+                let len = self.builder.ins().iconst(Type::I64, text.len() as i64);
                 self.store(data, dest.addr, 0);
                 self.store(len, dest.addr, 8);
             }
@@ -575,7 +575,7 @@ impl<'db> Lower<'_, '_, 'db> {
             Op::RawPtr => self.raw_ptr(dest, args)?,
             Op::Metadata => {
                 if self.layout(dest.ty.ty)?.size.bytes() != 0 {
-                    let meta = self.load(types::I64, args[0].addr, 8);
+                    let meta = self.load(Type::I64, args[0].addr, 8);
                     self.store(meta, dest.addr, 0);
                 }
             }
@@ -613,12 +613,12 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn powi(&mut self, code: usize, ty: Type, dest: Place<'db>, args: &[Place<'db>]) {
         let mut signature = Signature::new(self.call_conv);
-        signature.params.extend([AbiParam::new(ty), AbiParam::new(types::I32)]);
+        signature.params.extend([AbiParam::new(ty), AbiParam::new(Type::I32)]);
         signature.returns.push(AbiParam::new(ty));
         let signature = self.builder.import_signature(signature);
-        let code = self.builder.ins().iconst(types::I64, code as i64);
+        let code = self.builder.ins().iconst(Type::I64, code as i64);
         let base = self.load(ty, args[0].addr, 0);
-        let power = self.load(types::I32, args[1].addr, 0);
+        let power = self.load(Type::I32, args[1].addr, 0);
         let call = self.builder.ins().call_indirect(signature, code, &[base, power]);
         let result = self.builder.inst_results(call)[0];
         self.store(result, dest.addr, 0);
@@ -637,7 +637,7 @@ impl<'db> Lower<'_, '_, 'db> {
             base.add(line).cast::<u32>().write_unaligned(0);
             base.add(column).cast::<u32>().write_unaligned(0);
         }
-        let value = self.builder.ins().iconst(types::I64, Box::leak(storage).as_ptr() as i64);
+        let value = self.builder.ins().iconst(Type::I64, Box::leak(storage).as_ptr() as i64);
         self.store(value, dest.addr, 0);
         Ok(())
     }
@@ -655,7 +655,7 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     fn write_through(&mut self, args: &[Place<'db>]) -> Result<(), String> {
-        let pointer = self.load(types::I64, args[0].addr, 0);
+        let pointer = self.load(Type::I64, args[0].addr, 0);
         let size = self.layout(args[1].ty.ty)?.size.bytes();
         self.copy(pointer, args[1].addr, size);
         Ok(())
@@ -663,15 +663,15 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn copy_memory(&mut self, ty: Ty<'db>, args: &[Place<'db>]) -> Result<(), String> {
         let size = self.layout(ty)?.size.bytes();
-        let from = self.load(types::I64, args[0].addr, 0);
-        let to = self.load(types::I64, args[1].addr, 0);
-        let count = self.load(types::I64, args[2].addr, 0);
+        let from = self.load(Type::I64, args[0].addr, 0);
+        let to = self.load(Type::I64, args[1].addr, 0);
+        let count = self.load(Type::I64, args[2].addr, 0);
         let bytes = self.builder.ins().imul_imm(count, size as i64);
         let mut signature = Signature::new(self.call_conv);
-        signature.params.extend([AbiParam::new(types::I64); 3]);
-        signature.returns.push(AbiParam::new(types::I64));
+        signature.params.extend([AbiParam::new(Type::I64); 3]);
+        signature.returns.push(AbiParam::new(Type::I64));
         let signature = self.builder.import_signature(signature);
-        let code = self.builder.ins().iconst(types::I64, memcpy as *const () as usize as i64);
+        let code = self.builder.ins().iconst(Type::I64, memcpy as *const () as usize as i64);
         self.builder.ins().call_indirect(signature, code, &[to, from, bytes]);
         Ok(())
     }
@@ -682,13 +682,13 @@ impl<'db> Lower<'_, '_, 'db> {
             Layout::Size => layout.size.bytes(),
             Layout::Align => layout.align.abi.bytes(),
         };
-        let value = self.builder.ins().iconst(types::I64, value as i64);
+        let value = self.builder.ins().iconst(Type::I64, value as i64);
         self.store(value, dest.addr, 0);
         Ok(())
     }
 
     fn offset(&mut self, dest: Place<'db>, args: &[Place<'db>]) -> Result<(), String> {
-        let pointer = self.load(types::I64, args[0].addr, 0);
+        let pointer = self.load(Type::I64, args[0].addr, 0);
         let index_scalar = self.scalar(args[1].ty.ty)?;
         let index = self.load(index_scalar.ty, args[1].addr, 0);
         let pointee = crate::lower::pointee(args[0].ty.ty)?;
@@ -700,10 +700,10 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     fn raw_ptr(&mut self, dest: Place<'db>, args: &[Place<'db>]) -> Result<(), String> {
-        let data = self.load(types::I64, args[0].addr, 0);
+        let data = self.load(Type::I64, args[0].addr, 0);
         self.store(data, dest.addr, 0);
         if self.layout(args[1].ty.ty)?.size.bytes() != 0 {
-            let meta = self.load(types::I64, args[1].addr, 0);
+            let meta = self.load(Type::I64, args[1].addr, 0);
             self.store(meta, dest.addr, 8);
         }
         Ok(())
@@ -712,7 +712,7 @@ impl<'db> Lower<'_, '_, 'db> {
     fn rotate(&mut self, left: bool, dest: Place<'db>, args: &[Place<'db>]) -> Result<(), String> {
         let scalar = self.scalar(args[0].ty.ty)?;
         let value = self.load(scalar.ty, args[0].addr, 0);
-        let shift = self.load(types::I32, args[1].addr, 0);
+        let shift = self.load(Type::I32, args[1].addr, 0);
         let ins = self.builder.ins();
         let result = if left { ins.rotl(value, shift) } else { ins.rotr(value, shift) };
         self.store(result, dest.addr, 0);
@@ -751,9 +751,9 @@ impl<'db> Lower<'_, '_, 'db> {
     fn to_u32(&mut self, value: Value, from: Type) -> Value {
         let ins = self.builder.ins();
         if from.bits() > 32 {
-            ins.ireduce(types::I32, value)
+            ins.ireduce(Type::I32, value)
         } else if from.bits() < 32 {
-            ins.uextend(types::I32, value)
+            ins.uextend(Type::I32, value)
         } else {
             value
         }

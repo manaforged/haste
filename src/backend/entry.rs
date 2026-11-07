@@ -1,11 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use cranelift_codegen::ir::{
-    AbiParam, BlockArg, BlockCall, ExceptionTableData, ExceptionTableItem, InstBuilder, Signature, TrapCode, types,
-};
-use cranelift_codegen::{LabelOrOffset, MachExceptionHandler};
-use cranelift_frontend::FunctionBuilder;
-use cranelift_module::{Linkage, Module};
+use haste_codegen::{AbiParam, CallConv, Function, FunctionBuilder, Signature, Type};
 
 use hir_ty::mir::MirBody;
 use hir_ty::next_solver::{Ty, TyKind};
@@ -13,10 +8,6 @@ use rustc_type_ir::IntTy;
 use rustc_type_ir::inherent::IntoKind;
 
 use super::{Backend, INTERNAL_CONV, Sig, pointer_signature};
-
-fn handler_offset(target: LabelOrOffset) -> Option<u32> {
-    target.is_offset().then(|| target.as_offset())
-}
 
 static ENTRY: AtomicUsize = AtomicUsize::new(0);
 
@@ -37,25 +28,12 @@ pub fn call(table: &[AtomicUsize], slot: usize, value: i64) -> i64 {
     result as i64
 }
 
-pub(super) fn handler_sites(code: &cranelift_codegen::CompiledCode) -> Vec<crate::fault::Site> {
-    let found = code.buffer.call_sites().filter_map(|site| {
-        let handler = site.exception_handlers.iter().find_map(|handler| match handler {
-            MachExceptionHandler::Default(target) | MachExceptionHandler::Tag(_, target) => handler_offset(*target),
-            _ => None,
-        })?;
-        Some(crate::fault::Site { ret: site.ret_addr, handler, frame_offset: site.frame_offset? })
-    });
-    found.collect()
-}
-
 impl Backend {
     pub(super) fn compile_entry(&mut self) -> Result<(), String> {
-        let mut signature = self.module.make_signature();
-        signature.params.extend([AbiParam::new(types::I64); 3]);
-        let id = self.module.declare_function("entry", Linkage::Local, &signature).map_err(|e| e.to_string())?;
-        self.ctx.func.signature = signature;
-        let config = self.module.target_config();
-        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder);
+        let mut signature = Signature::new(CallConv::Native);
+        signature.params.extend([AbiParam::new(Type::I64); 3]);
+        let mut func = Function::new(signature);
+        let mut builder = FunctionBuilder::new(&mut func);
         let block = builder.create_block();
         builder.append_block_params_for_function_params(block);
         builder.switch_to_block(block);
@@ -64,27 +42,20 @@ impl Backend {
         pointer_signature(&mut target, Sig { params: 1, ret: true });
         let target = builder.import_signature(target);
         let (done, caught) = (builder.create_block(), builder.create_block());
-        builder.append_block_param(caught, types::I64);
-        let normal = BlockCall::new(done, [], &mut builder.func.dfg.value_lists);
-        let handler = BlockCall::new(caught, [BlockArg::TryCallExn(0)], &mut builder.func.dfg.value_lists);
-        let table = ExceptionTableData::new(target, normal, [ExceptionTableItem::Default(handler)]);
-        let table = builder.func.dfg.exception_tables.push(table);
-        builder.ins().try_call_indirect(params[0], &params[1..], table);
+        let exception = builder.append_block_param(caught, Type::I64);
+        builder.ins().try_call_indirect(target, params[0], &params[1..], done, caught);
         builder.switch_to_block(done);
         builder.ins().return_(&[]);
         builder.switch_to_block(caught);
-        let exception = builder.block_params(caught)[0];
-        let mut host = Signature::new(config.default_call_conv);
-        host.params.push(AbiParam::new(types::I64));
+        let mut host = Signature::new(CallConv::Native);
+        host.params.push(AbiParam::new(Type::I64));
         let host = builder.import_signature(host);
-        let code = builder.ins().iconst(types::I64, crate::unwind::uncaught as *const () as usize as i64);
+        let code = builder.ins().iconst(Type::I64, crate::unwind::uncaught as *const () as usize as i64);
         builder.ins().call_indirect(host, code, &[exception]);
-        builder.ins().trap(TrapCode::unwrap_user(2));
-        builder.seal_all_blocks();
-        builder.finalize(config);
-        self.define_named(id, "entry")?;
+        builder.ins().trap();
+        let entry = self.define(&func, "entry")?;
         self.publish_stubs()?;
-        ENTRY.store(self.module.get_finalized_function(id) as usize, Ordering::Release);
+        ENTRY.store(entry, Ordering::Release);
         Ok(())
     }
 }

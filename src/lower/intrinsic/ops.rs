@@ -1,5 +1,4 @@
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind, Type, Value, types};
+use haste_codegen::{AbiParam, IntCC, Signature, Type, Value};
 use hir_def::AdtId;
 use hir_ty::next_solver::{Ty, TyKind};
 use rustc_type_ir::inherent::IntoKind;
@@ -10,10 +9,10 @@ use crate::lower::{Lower, Place};
 impl<'db> Lower<'_, '_, 'db> {
     pub(super) fn offset_from(&mut self, ty: Ty<'db>, dest: Place<'db>, args: &[Place<'db>]) -> Result<(), String> {
         let size = self.layout(ty)?.size.bytes().max(1) as i64;
-        let left = self.load(types::I64, args[0].addr, 0);
-        let right = self.load(types::I64, args[1].addr, 0);
+        let left = self.load(Type::I64, args[0].addr, 0);
+        let right = self.load(Type::I64, args[1].addr, 0);
         let bytes = self.builder.ins().isub(left, right);
-        let size = self.builder.ins().iconst(types::I64, size);
+        let size = self.builder.ins().iconst(Type::I64, size);
         let value = self.builder.ins().sdiv(bytes, size);
         self.store(value, dest.addr, 0);
         Ok(())
@@ -24,7 +23,7 @@ impl<'db> Lower<'_, '_, 'db> {
         signature.params.extend(params.iter().map(|ty| AbiParam::new(*ty)));
         signature.returns.push(AbiParam::new(ret));
         let signature = self.builder.import_signature(signature);
-        let code = self.builder.ins().iconst(types::I64, code as i64);
+        let code = self.builder.ins().iconst(Type::I64, code as i64);
         let call = self.builder.ins().call_indirect(signature, code, values);
         self.builder.inst_results(call)[0]
     }
@@ -41,24 +40,24 @@ impl<'db> Lower<'_, '_, 'db> {
             (MemKind::Compare, _) | (_, None) => 1,
             (_, Some(ty)) => self.layout(ty)?.size.bytes() as i64,
         };
-        let count = self.load(types::I64, args[2].addr, 0);
+        let count = self.load(Type::I64, args[2].addr, 0);
         let bytes = self.builder.ins().imul_imm(count, width);
         match kind {
             MemKind::Move => {
-                let from = self.load(types::I64, args[0].addr, 0);
-                let to = self.load(types::I64, args[1].addr, 0);
-                self.c_call(code, &[types::I64; 3], types::I64, &[to, from, bytes]);
+                let from = self.load(Type::I64, args[0].addr, 0);
+                let to = self.load(Type::I64, args[1].addr, 0);
+                self.c_call(code, &[Type::I64; 3], Type::I64, &[to, from, bytes]);
             }
             MemKind::Fill => {
-                let to = self.load(types::I64, args[0].addr, 0);
-                let value = self.load(types::I8, args[1].addr, 0);
-                let value = self.builder.ins().uextend(types::I32, value);
-                self.c_call(code, &[types::I64, types::I32, types::I64], types::I64, &[to, value, bytes]);
+                let to = self.load(Type::I64, args[0].addr, 0);
+                let value = self.load(Type::I8, args[1].addr, 0);
+                let value = self.builder.ins().uextend(Type::I32, value);
+                self.c_call(code, &[Type::I64, Type::I32, Type::I64], Type::I64, &[to, value, bytes]);
             }
             MemKind::Compare => {
-                let left = self.load(types::I64, args[0].addr, 0);
-                let right = self.load(types::I64, args[1].addr, 0);
-                let value = self.c_call(code, &[types::I64; 3], types::I32, &[left, right, bytes]);
+                let left = self.load(Type::I64, args[0].addr, 0);
+                let right = self.load(Type::I64, args[1].addr, 0);
+                let value = self.c_call(code, &[Type::I64; 3], Type::I32, &[left, right, bytes]);
                 self.store(value, dest.addr, 0);
             }
         }
@@ -67,10 +66,10 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn raw_eq(&mut self, ty: Ty<'db>, dest: Place<'db>, args: &[Place<'db>]) -> Result<(), String> {
         let size = self.layout(ty)?.size.bytes() as i64;
-        let left = self.load(types::I64, args[0].addr, 0);
-        let right = self.load(types::I64, args[1].addr, 0);
-        let size = self.builder.ins().iconst(types::I64, size);
-        let order = self.c_call(super::memcmp as *const () as usize, &[types::I64; 3], types::I32, &[left, right, size]);
+        let left = self.load(Type::I64, args[0].addr, 0);
+        let right = self.load(Type::I64, args[1].addr, 0);
+        let size = self.builder.ins().iconst(Type::I64, size);
+        let order = self.c_call(super::memcmp as *const () as usize, &[Type::I64; 3], Type::I32, &[left, right, size]);
         let value = self.builder.ins().icmp_imm_u(IntCC::Equal, order, 0);
         self.store(value, dest.addr, 0);
         Ok(())
@@ -102,12 +101,12 @@ impl<'db> Lower<'_, '_, 'db> {
         };
         let variants = &result.enum_variants(self.db).variants;
         let (ok, err) = (variants[0].0, variants[1].0);
-        let pointer = self.load(types::I64, args[0].addr, 0);
+        let pointer = self.load(Type::I64, args[0].addr, 0);
         let expected = self.load(scalar.ty, args[1].addr, 0);
         let new = self.load(scalar.ty, args[2].addr, 0);
-        let old = self.builder.ins().atomic_cas(MemFlagsData::trusted(), pointer, expected, new);
-        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
-        let holder = self.builder.ins().stack_addr(types::I64, slot, 0);
+        let old = self.builder.ins().atomic_cas(pointer, expected, new);
+        let slot = self.builder.create_stack_slot(16, 4);
+        let holder = self.builder.ins().stack_addr(Type::I64, slot, 0);
         self.store(old, holder, 0);
         let value = Place { addr: holder, ty: hir_ty::mir::PlaceTy::from_ty(ty), meta: None };
         let same = self.builder.ins().icmp(IntCC::Equal, old, expected);
@@ -126,7 +125,7 @@ impl<'db> Lower<'_, '_, 'db> {
     pub(super) fn overflow(&mut self, kind: BinOpKind, dest: Place<'db>, args: &[Place<'db>]) -> Result<(), String> {
         let scalar = self.scalar(args[0].ty.ty)?;
         let ty = scalar.ty;
-        if ty == types::I128 {
+        if ty == Type::I128 {
             return Err("128-bit overflow check".to_owned());
         }
         let a = self.load(ty, args[0].addr, 0);
@@ -161,21 +160,21 @@ impl<'db> Lower<'_, '_, 'db> {
     pub(super) fn mul_overflow(&mut self, a: Value, b: Value, ty: Type, signed: bool) -> (Value, Value) {
         let result = self.builder.ins().imul(a, b);
         let ins = self.builder.ins();
-        if ty == types::I64 {
+        if ty == Type::I64 {
             let high = if signed { ins.smulhi(a, b) } else { ins.umulhi(a, b) };
             let expected = if signed {
                 self.builder.ins().sshr_imm(result, 63)
             } else {
-                self.builder.ins().iconst(types::I64, 0)
+                self.builder.ins().iconst(Type::I64, 0)
             };
             return (result, self.builder.ins().icmp(IntCC::NotEqual, high, expected));
         }
-        let wide_a = if signed { ins.sextend(types::I64, a) } else { ins.uextend(types::I64, a) };
+        let wide_a = if signed { ins.sextend(Type::I64, a) } else { ins.uextend(Type::I64, a) };
         let ins = self.builder.ins();
-        let wide_b = if signed { ins.sextend(types::I64, b) } else { ins.uextend(types::I64, b) };
+        let wide_b = if signed { ins.sextend(Type::I64, b) } else { ins.uextend(Type::I64, b) };
         let product = self.builder.ins().imul(wide_a, wide_b);
         let ins = self.builder.ins();
-        let back = if signed { ins.sextend(types::I64, result) } else { ins.uextend(types::I64, result) };
+        let back = if signed { ins.sextend(Type::I64, result) } else { ins.uextend(Type::I64, result) };
         (result, self.builder.ins().icmp(IntCC::NotEqual, product, back))
     }
 

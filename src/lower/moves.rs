@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{InstBuilder, StackSlot, StackSlotData, StackSlotKind, Value, types};
+use haste_codegen::{StackSlot, Type, Value};
 use hir_def::{EnumVariantId, VariantId};
 use hir_ty::mir::{LocalId, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind};
 use hir_ty::next_solver::{Ty, TyKind};
@@ -105,16 +105,15 @@ impl<'db> Lower<'_, '_, 'db> {
             if known {
                 continue;
             }
-            let data = StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0);
-            let slot = self.builder.create_sized_stack_slot(data);
+                        let slot = self.builder.create_stack_slot(1, 0);
             self.store_flag(slot, false);
             self.move_paths.entry(local).or_default().push(MovePath { steps, slot });
         }
     }
 
     fn store_flag(&mut self, slot: StackSlot, on: bool) {
-        let value = self.builder.ins().iconst(types::I8, i64::from(on));
-        self.builder.ins().stack_store(types::I64, value, slot, 0);
+        let value = self.builder.ins().iconst(Type::I8, i64::from(on));
+        self.builder.ins().stack_store(value, slot, 0);
     }
 
     pub(super) fn owned_paths(&self, place: &StoredPlace) -> Option<Vec<Vec<Step>>> {
@@ -208,7 +207,7 @@ impl<'db> Lower<'_, '_, 'db> {
         let own = cut.paths.iter().find(|path| path.steps.len() == cut.depth).map(|path| path.slot);
         let done = self.builder.create_block();
         if let Some(slot) = own {
-            let flag = self.builder.ins().stack_load(types::I64, types::I8, slot, 0);
+            let flag = self.builder.ins().stack_load(Type::I8, slot, 0);
             let run = self.builder.create_block();
             self.builder.ins().brif(flag, done, &[], run, &[]);
             self.builder.switch_to_block(run);
@@ -232,7 +231,7 @@ impl<'db> Lower<'_, '_, 'db> {
             return Err(format!("box of {ty:?}"));
         };
         let inner = args.as_slice().first().and_then(|arg| arg.ty()).ok_or("box without a type")?;
-        let pointer = self.load(types::I64, addr, 0);
+        let pointer = self.load(Type::I64, addr, 0);
         let paths = cut.under(Step::Box);
         self.drop_open(inner, pointer, None, cut.into(&paths))?;
         let holder = self.thin_holder(addr);
@@ -248,7 +247,7 @@ impl<'db> Lower<'_, '_, 'db> {
         cut: Cut<'_>,
     ) -> Result<(), String> {
         if cut.is_empty() {
-            let count = self.builder.ins().iconst(types::I64, count as i64);
+            let count = self.builder.ins().iconst(Type::I64, count as i64);
             return self.drop_items(item, addr, count);
         }
         let stride = self.layout(item)?.size.bytes() as i64;

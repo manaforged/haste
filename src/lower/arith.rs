@@ -1,6 +1,4 @@
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{InstBuilder, Value, types};
-use cranelift_codegen::ir::Type;
+use haste_codegen::{AbiParam, FloatCC, IntCC, Signature, Type, Value};
 use hir_ty::PointerCast;
 use hir_ty::mir::{BinOp, CastKind, Operand};
 
@@ -35,7 +33,7 @@ fn wide_from_float(signed: bool) -> usize {
 }
 
 fn float_from_wide(signed: bool, to: Type) -> usize {
-    match (signed, to == types::F32) {
+    match (signed, to == Type::F32) {
         (true, true) => signed_wide_to_f32 as *const () as usize,
         (true, false) => signed_wide_to_f64 as *const () as usize,
         (false, true) => unsigned_wide_to_f32 as *const () as usize,
@@ -58,10 +56,10 @@ impl<'db> Lower<'_, '_, 'db> {
         if matches!(kind, CastKind::FloatToInt) && to.ty.bits() < 32 {
             return self.float_to_narrow(dest, value, to);
         }
-        if matches!(kind, CastKind::FloatToInt) && to.ty == types::I128 {
+        if matches!(kind, CastKind::FloatToInt) && to.ty == Type::I128 {
             return self.float_to_wide(dest, value, from, to);
         }
-        if matches!(kind, CastKind::IntToFloat) && from.ty == types::I128 {
+        if matches!(kind, CastKind::IntToFloat) && from.ty == Type::I128 {
             let code = float_from_wide(from.signed, to.ty);
             let result = self.convert_call(code, from.ty, to.ty, value);
             self.store(result, dest.addr, 0);
@@ -77,7 +75,7 @@ impl<'db> Lower<'_, '_, 'db> {
             CastKind::FloatToFloat if to.ty.bits() < from.ty.bits() => ins.fdemote(to.ty, value),
             CastKind::FloatToFloat => value,
             CastKind::IntToFloat if from.ty.bits() < 32 => {
-                let wide = if from.signed { ins.sextend(types::I32, value) } else { ins.uextend(types::I32, value) };
+                let wide = if from.signed { ins.sextend(Type::I32, value) } else { ins.uextend(Type::I32, value) };
                 let ins = self.builder.ins();
                 if from.signed { ins.fcvt_from_sint(to.ty, wide) } else { ins.fcvt_from_uint(to.ty, wide) }
             }
@@ -110,7 +108,7 @@ impl<'db> Lower<'_, '_, 'db> {
                     return Ok(());
                 }
                 let cell = self.reify(source)?;
-                let cell = self.builder.ins().iconst(types::I64, cell);
+                let cell = self.builder.ins().iconst(Type::I64, cell);
                 self.store(cell, dest.addr, 0);
                 Ok(())
             }
@@ -124,7 +122,7 @@ impl<'db> Lower<'_, '_, 'db> {
         if to.ty.bits() < 32 {
             return self.float_to_narrow(dest, value, to);
         }
-        if to.ty == types::I128 {
+        if to.ty == Type::I128 {
             return self.float_to_wide(dest, value, source, to);
         }
         let ins = self.builder.ins();
@@ -134,19 +132,19 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     fn float_to_wide(&mut self, dest: Place<'db>, value: Value, from: Scalar, to: Scalar) -> Result<(), String> {
-        let double = if from.ty == types::F32 { self.builder.ins().fpromote(types::F64, value) } else { value };
+        let double = if from.ty == Type::F32 { self.builder.ins().fpromote(Type::F64, value) } else { value };
         let code = wide_from_float(to.signed);
-        let result = self.convert_call(code, types::F64, types::I128, double);
+        let result = self.convert_call(code, Type::F64, Type::I128, double);
         self.store(result, dest.addr, 0);
         Ok(())
     }
 
     fn convert_call(&mut self, code: usize, from: Type, to: Type, value: Value) -> Value {
-        let mut signature = cranelift_codegen::ir::Signature::new(self.call_conv);
-        signature.params.push(cranelift_codegen::ir::AbiParam::new(from));
-        signature.returns.push(cranelift_codegen::ir::AbiParam::new(to));
+        let mut signature = Signature::new(self.call_conv);
+        signature.params.push(AbiParam::new(from));
+        signature.returns.push(AbiParam::new(to));
         let signature = self.builder.import_signature(signature);
-        let code = self.builder.ins().iconst(types::I64, code as i64);
+        let code = self.builder.ins().iconst(Type::I64, code as i64);
         let call = self.builder.ins().call_indirect(signature, code, &[value]);
         self.builder.inst_results(call)[0]
     }
@@ -158,9 +156,9 @@ impl<'db> Lower<'_, '_, 'db> {
         } else {
             (0, (1_i64 << bits) - 1)
         };
-        let wide = self.builder.ins().fcvt_to_sint_sat(types::I32, value);
-        let low = self.builder.ins().iconst(types::I32, low);
-        let high = self.builder.ins().iconst(types::I32, high);
+        let wide = self.builder.ins().fcvt_to_sint_sat(Type::I32, value);
+        let low = self.builder.ins().iconst(Type::I32, low);
+        let high = self.builder.ins().iconst(Type::I32, high);
         let raised = self.builder.ins().smax(wide, low);
         let clamped = self.builder.ins().smin(raised, high);
         let narrow = self.builder.ins().ireduce(to.ty, clamped);

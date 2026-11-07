@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{AbiParam, ArgumentPurpose, Signature, Type, types};
+use haste_codegen::{AbiParam, ArgumentPurpose, Signature, Type};
 use hir_def::{AdtId, VariantId};
 use hir_ty::next_solver::{Ty, TyKind};
 use rustc_type_ir::inherent::IntoKind;
@@ -23,15 +23,15 @@ impl Pass {
     pub fn add_param(&self, signature: &mut Signature) {
         match self {
             Pass::Words(words) => signature.params.extend(words.iter().map(|(ty, _)| AbiParam::new(*ty))),
-            Pass::Stack(size) => signature.params.push(AbiParam::special(types::I64, ArgumentPurpose::StructArgument(*size))),
-            Pass::Pointer(_) => signature.params.push(AbiParam::new(types::I64)),
+            Pass::Stack(size) => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructArgument(*size))),
+            Pass::Pointer(_) => signature.params.push(AbiParam::new(Type::I64)),
         }
     }
 
     pub fn add_return(&self, signature: &mut Signature) {
         match self {
             Pass::Words(words) => signature.returns.extend(words.iter().map(|(ty, _)| AbiParam::new(*ty))),
-            Pass::Stack(_) | Pass::Pointer(_) => signature.params.insert(0, AbiParam::special(types::I64, ArgumentPurpose::StructReturn)),
+            Pass::Stack(_) | Pass::Pointer(_) => signature.params.insert(0, AbiParam::special(Type::I64, ArgumentPurpose::StructReturn)),
         }
     }
 
@@ -42,10 +42,10 @@ impl Pass {
 
 fn int_of(bytes: u64) -> Type {
     match bytes {
-        1 => types::I8,
-        2 => types::I16,
-        3 | 4 => types::I32,
-        _ => types::I64,
+        1 => Type::I8,
+        2 => Type::I16,
+        3 | 4 => Type::I32,
+        _ => Type::I64,
     }
 }
 
@@ -105,8 +105,8 @@ impl<'db> Lower<'_, '_, 'db> {
             let inside: Vec<_> = leaves.iter().filter(|(at, _)| *at >= start && *at < start + WORD).collect();
             let all_float = !inside.is_empty() && inside.iter().all(|(_, float)| float.is_some());
             let ty = match (all_float, bytes > 4) {
-                (true, true) => types::F64,
-                (true, false) => types::F32,
+                (true, true) => Type::F64,
+                (true, false) => Type::F32,
                 (false, _) => int_of(bytes),
             };
             (ty, start as u32)

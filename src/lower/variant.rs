@@ -1,5 +1,4 @@
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{InstBuilder, Type, Value, types};
+use haste_codegen::{IntCC, Type, Value};
 use hir_def::{AdtId, VariantId};
 use hir_ty::layout::{Layout, RustcEnumVariantIdx};
 use hir_ty::next_solver::TyKind;
@@ -10,11 +9,11 @@ use super::{Lower, Place};
 
 fn int_type(bytes: u64) -> Result<Type, String> {
     match bytes {
-        1 => Ok(types::I8),
-        2 => Ok(types::I16),
-        4 => Ok(types::I32),
-        8 => Ok(types::I64),
-        16 => Ok(types::I128),
+        1 => Ok(Type::I8),
+        2 => Ok(Type::I16),
+        4 => Ok(Type::I32),
+        8 => Ok(Type::I64),
+        16 => Ok(Type::I128),
         other => Err(format!("{other}-byte tag")),
     }
 }
@@ -154,9 +153,9 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     pub(super) fn int_const(&mut self, ty: Type, value: i128) -> Value {
-        if ty == types::I128 {
-            let low = self.builder.ins().iconst(types::I64, value as i64);
-            let high = self.builder.ins().iconst(types::I64, (value >> 64) as i64);
+        if ty == Type::I128 {
+            let low = self.builder.ins().iconst(Type::I64, value as i64);
+            let high = self.builder.ins().iconst(Type::I64, (value >> 64) as i64);
             return self.builder.ins().iconcat(low, high);
         }
         let mask = if ty.bytes() == 8 { -1_i128 } else { (1_i128 << ty.bits()) - 1 };

@@ -174,6 +174,7 @@ fn child(table: Table, slot: usize, script: &Script, write: std::io::PipeWriter)
     // SAFETY: alarm only arms a timer for this forked child.
     unsafe { libc::alarm(LIMIT_SECONDS) };
     crate::fault::install();
+    crate::fault::write_perf_map();
     // SAFETY: these calls change only this forked child's descriptors and environment, and it has one thread.
     unsafe {
         libc::dup2(write.as_raw_fd(), libc::STDOUT_FILENO);

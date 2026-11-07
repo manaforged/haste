@@ -1,7 +1,7 @@
 use hir_def::attrs::AttrFlags;
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::{InstBuilder, types};
+use haste_codegen::Type;
 use hir_def::expr_store::Body;
 use hir_def::signatures::{StaticFlags, StaticSignature};
 use hir_def::{AdtId, DefWithBodyId, StaticId};
@@ -66,7 +66,7 @@ impl<'db> Lower<'_, '_, 'db> {
     pub(super) fn allocation(&mut self, allocation: Allocation<'db>) -> Result<Place<'db>, String> {
         let data = &*allocation;
         let at = self.load_constant(data.ty, &data.memory, &data.memory_map)?;
-        let addr = self.builder.ins().iconst(types::I64, at as i64);
+        let addr = self.builder.ins().iconst(Type::I64, at as i64);
         Ok(Place { addr, ty: PlaceTy::from_ty(data.ty), meta: None })
     }
 
@@ -79,7 +79,7 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn constant(&mut self, konst: Const<'db>, ty: Ty<'db>) -> Result<Place<'db>, String> {
         if self.layout(ty)?.size.bytes() == 0 {
-            let addr = self.builder.ins().iconst(types::I64, 16);
+            let addr = self.builder.ins().iconst(Type::I64, 16);
             return Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None });
         }
         let unevaluated = match konst.kind() {
@@ -97,7 +97,7 @@ impl<'db> Lower<'_, '_, 'db> {
             }
             GeneralConstId::StaticId(id) => {
                 let at = self.static_address(id)?;
-                let addr = self.builder.ins().iconst(types::I64, at as i64);
+                let addr = self.builder.ins().iconst(Type::I64, at as i64);
                 return Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None });
             }
             GeneralConstId::AnonConstId(id) => {
@@ -112,15 +112,15 @@ impl<'db> Lower<'_, '_, 'db> {
         let buffer = leak(&vec![0_u8; layout.size.bytes() as usize + 8]);
         let cell = leak(&[0_u8; 8]);
         let slot = self.slots.get(Key::Const(id, args.store()), Sig { params: 0, ret: true }, self.env.store())?;
-        let addr = self.builder.ins().iconst(types::I64, buffer as i64);
-        let done_at = self.builder.ins().iconst(types::I64, cell as i64);
-        let done = self.load(types::I64, done_at, 0);
+        let addr = self.builder.ins().iconst(Type::I64, buffer as i64);
+        let done_at = self.builder.ins().iconst(Type::I64, cell as i64);
+        let done = self.load(Type::I64, done_at, 0);
         let (run, next) = (self.builder.create_block(), self.builder.create_block());
         self.builder.ins().brif(done, next, &[], run, &[]);
         self.builder.switch_to_block(run);
-        let code = self.builder.ins().iconst(types::I64, self.slots.address(slot));
+        let code = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
         self.call_cell(code, Sig { params: 0, ret: true }, &[addr]);
-        let one = self.builder.ins().iconst(types::I64, 1);
+        let one = self.builder.ins().iconst(Type::I64, 1);
         self.store(one, done_at, 0);
         self.builder.ins().jump(next, &[]);
         self.builder.switch_to_block(next);
@@ -129,7 +129,7 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn value_constant(&mut self, value: ValueConst<'db>) -> Result<Place<'db>, String> {
         let bytes = self.value_bytes(value.ty, value.value)?;
-        let addr = self.builder.ins().iconst(types::I64, leak(&bytes) as i64);
+        let addr = self.builder.ins().iconst(Type::I64, leak(&bytes) as i64);
         Ok(Place { addr, ty: PlaceTy::from_ty(value.ty), meta: None })
     }
 
@@ -166,14 +166,13 @@ impl<'db> Lower<'_, '_, 'db> {
         if self.is_thread_local(id) {
             let size = self.layout(self.static_type(id))?.size.bytes();
             let address = self.thread_local_address(id, at, size);
-            let data = cranelift_codegen::ir::StackSlotData::new(cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 8, 3);
-            let slot = self.builder.create_sized_stack_slot(data);
-            let addr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                        let slot = self.builder.create_stack_slot(8, 3);
+            let addr = self.builder.ins().stack_addr(Type::I64, slot, 0);
             self.store(address, addr, 0);
             return Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None });
         }
         let cell = leak(&at.to_le_bytes());
-        let addr = self.builder.ins().iconst(types::I64, cell as i64);
+        let addr = self.builder.ins().iconst(Type::I64, cell as i64);
         Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None })
     }
 
@@ -219,15 +218,15 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn init_once(&mut self, slot: usize, at: usize, done: usize) {
         let sig = self.slots.sig_of(slot);
-        let flag = self.builder.ins().iconst(types::I64, done as i64);
-        let seen = self.load(types::I64, flag, 0);
+        let flag = self.builder.ins().iconst(Type::I64, done as i64);
+        let seen = self.load(Type::I64, flag, 0);
         let (run, next) = (self.builder.create_block(), self.builder.create_block());
         self.builder.ins().brif(seen, next, &[], run, &[]);
         self.builder.switch_to_block(run);
-        let one = self.builder.ins().iconst(types::I64, 1);
+        let one = self.builder.ins().iconst(Type::I64, 1);
         self.store(one, flag, 0);
-        let code = self.builder.ins().iconst(types::I64, self.slots.address(slot));
-        let addr = self.builder.ins().iconst(types::I64, at as i64);
+        let code = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
+        let addr = self.builder.ins().iconst(Type::I64, at as i64);
         if sig.ret {
             self.call_cell(code, sig, &[addr]);
         } else {

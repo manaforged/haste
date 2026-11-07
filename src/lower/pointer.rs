@@ -1,5 +1,4 @@
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{InstBuilder, Signature, TrapCode, Value, types};
+use haste_codegen::{IntCC, Signature, Type, Value};
 use hir_def::{AdtId, FunctionId, ItemContainerId, TraitId, VariantId};
 use hir_ty::mir::PlaceTy;
 use hir_ty::next_solver::{GenericArgs, Ty, TyKind};
@@ -63,8 +62,8 @@ impl<'db> Lower<'_, '_, 'db> {
         if is_pointer(source) && is_pointer(target) {
             let (old, new) = (pointee(source)?, pointee(target)?);
             let previous =
-                if self.layout(old)?.is_unsized() { Some(self.load(types::I64, from.addr, 8)) } else { None };
-            let data = self.load(types::I64, from.addr, 0);
+                if self.layout(old)?.is_unsized() { Some(self.load(Type::I64, from.addr, 8)) } else { None };
+            let data = self.load(Type::I64, from.addr, 0);
             let meta = self.unsize_meta(old, new, previous)?;
             self.store(data, to.addr, 0);
             self.store(meta, to.addr, 8);
@@ -105,7 +104,7 @@ impl<'db> Lower<'_, '_, 'db> {
         match (old.kind(), new.kind()) {
             (TyKind::Array(..), TyKind::Slice(_)) => {
                 let count = self.layout(old)?.fields.count();
-                Ok(self.builder.ins().iconst(types::I64, count as i64))
+                Ok(self.builder.ins().iconst(Type::I64, count as i64))
             }
             (TyKind::Dynamic(left, _), TyKind::Dynamic(right, _)) => {
                 if left.principal_def_id() != right.principal_def_id() {
@@ -115,7 +114,7 @@ impl<'db> Lower<'_, '_, 'db> {
             }
             (_, TyKind::Dynamic(..)) => {
                 let table = self.vtable(old, new)?;
-                Ok(self.builder.ins().iconst(types::I64, table))
+                Ok(self.builder.ins().iconst(Type::I64, table))
             }
             (TyKind::Adt(left, left_args), TyKind::Adt(right, right_args)) if left.def_id() == right.def_id() => {
                 let AdtId::StructId(id) = left.def_id() else {
@@ -263,7 +262,7 @@ impl<'db> Lower<'_, '_, 'db> {
         let mut signature = Signature::new(crate::backend::INTERNAL_CONV);
         pointer_signature(&mut signature, sig);
         let signature = self.builder.import_signature(signature);
-        let code = self.load(types::I64, cell, 0);
+        let code = self.load(Type::I64, cell, 0);
         self.invoke(signature, code, values);
     }
 
@@ -283,12 +282,12 @@ impl<'db> Lower<'_, '_, 'db> {
         let fn_family = self.is_fn_trait(func);
         let (first, table) = if fn_family {
             if matches!(receiver.ty.ty.kind(), TyKind::Ref(..)) {
-                (self.load(types::I64, receiver.addr, 0), self.load(types::I64, receiver.addr, 8))
+                (self.load(Type::I64, receiver.addr, 0), self.load(Type::I64, receiver.addr, 8))
             } else {
                 (receiver.addr, receiver.meta.ok_or("unsized receiver without a vtable")?)
             }
         } else {
-            (receiver.addr, self.load(types::I64, receiver.addr, 8))
+            (receiver.addr, self.load(Type::I64, receiver.addr, 8))
         };
         let tupled = predicates.principal().and_then(|principal| {
             Binder::skip_binder(principal).args.as_slice().first().and_then(|arg| arg.ty())
@@ -325,7 +324,7 @@ impl<'db> Lower<'_, '_, 'db> {
     ) -> Result<(), String> {
         let index = self.vtable_index(func, self_ty)?;
         let (receiver, rest) = places.split_first().ok_or("dyn call without a receiver")?;
-        let table = self.load(types::I64, receiver.addr, 8);
+        let table = self.load(Type::I64, receiver.addr, 8);
         self.invoke_vtable(index, table, receiver.addr, dest, rest)
     }
 
@@ -348,14 +347,14 @@ impl<'db> Lower<'_, '_, 'db> {
                 values.push(place.addr);
             }
         }
-        let cell = self.load(types::I64, table, ((VTABLE_HEADER + index) * 8) as i32);
-        self.builder.ins().trapz(cell, TrapCode::unwrap_user(3));
+        let cell = self.load(Type::I64, table, ((VTABLE_HEADER + index) * 8) as i32);
+        self.builder.ins().trapz(cell);
         self.call_cell(cell, Sig { params: values.len() - usize::from(ret), ret }, &values);
         Ok(())
     }
 
     pub(super) fn drop_dyn(&mut self, data: Value, table: Value) {
-        let cell = self.load(types::I64, table, VTABLE_DROP);
+        let cell = self.load(Type::I64, table, VTABLE_DROP);
         let call = self.builder.create_block();
         let done = self.builder.create_block();
         self.builder.ins().brif(cell, call, &[], done, &[]);
@@ -369,19 +368,19 @@ impl<'db> Lower<'_, '_, 'db> {
     pub(super) fn size_align(&mut self, ty: Ty<'db>, meta: Option<Value>) -> Result<(Value, Value), String> {
         let layout = self.layout(ty)?;
         if !layout.is_unsized() {
-            let size = self.builder.ins().iconst(types::I64, layout.size.bytes() as i64);
-            let align = self.builder.ins().iconst(types::I64, layout.align.abi.bytes() as i64);
+            let size = self.builder.ins().iconst(Type::I64, layout.size.bytes() as i64);
+            let align = self.builder.ins().iconst(Type::I64, layout.align.abi.bytes() as i64);
             return Ok((size, align));
         }
         let meta = meta.ok_or_else(|| format!("{ty:?} without metadata"))?;
         match ty.kind() {
-            TyKind::Str => Ok((meta, self.builder.ins().iconst(types::I64, 1))),
+            TyKind::Str => Ok((meta, self.builder.ins().iconst(Type::I64, 1))),
             TyKind::Slice(item) => {
                 let item = self.layout(item)?;
                 let size = self.builder.ins().imul_imm(meta, item.size.bytes() as i64);
-                Ok((size, self.builder.ins().iconst(types::I64, item.align.abi.bytes() as i64)))
+                Ok((size, self.builder.ins().iconst(Type::I64, item.align.abi.bytes() as i64)))
             }
-            TyKind::Dynamic(..) => Ok((self.load(types::I64, meta, VTABLE_SIZE), self.load(types::I64, meta, VTABLE_ALIGN))),
+            TyKind::Dynamic(..) => Ok((self.load(Type::I64, meta, VTABLE_SIZE), self.load(Type::I64, meta, VTABLE_ALIGN))),
             TyKind::Adt(adt, args) => {
                 let AdtId::StructId(id) = adt.def_id() else {
                     return Err("unsized enum".to_owned());
@@ -390,10 +389,10 @@ impl<'db> Lower<'_, '_, 'db> {
                 let last = *fields.last().ok_or("empty unsized struct")?;
                 let offset = layout.fields.offset(fields.len() - 1).bytes() as i64;
                 let (size, align) = self.size_align(last, Some(meta))?;
-                let start = self.builder.ins().iconst(types::I64, offset);
+                let start = self.builder.ins().iconst(Type::I64, offset);
                 let start = self.round_up(start, align);
                 let end = self.builder.ins().iadd(start, size);
-                let base = self.builder.ins().iconst(types::I64, layout.align.abi.bytes() as i64);
+                let base = self.builder.ins().iconst(Type::I64, layout.align.abi.bytes() as i64);
                 let wider = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, base, align);
                 let align = self.builder.ins().select(wider, base, align);
                 Ok((self.round_up(end, align), align))
@@ -420,7 +419,7 @@ impl<'db> Lower<'_, '_, 'db> {
             && self.dyn_tail(field)
         {
             let (_, align) = self.size_align(field, Some(meta))?;
-            let start = self.builder.ins().iconst(types::I64, offset as i64);
+            let start = self.builder.ins().iconst(Type::I64, offset as i64);
             let start = self.round_up(start, align);
             return Ok(self.builder.ins().iadd(base, start));
         }
@@ -442,7 +441,7 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn indirect_callee(&mut self, func: &hir_ty::mir::Operand) -> Result<Value, String> {
         let place = self.operand(func)?;
-        Ok(self.load(types::I64, place.addr, 0))
+        Ok(self.load(Type::I64, place.addr, 0))
     }
 
     fn callable(&self, ty: Ty<'db>) -> Result<(Vec<Ty<'db>>, Ty<'db>), String> {
@@ -467,10 +466,10 @@ impl<'db> Lower<'_, '_, 'db> {
         self.builder.switch_to_block(entry);
         let mut values = self.builder.block_params(entry).to_vec().into_iter();
         let (params, ret) = self.callable(ty)?;
-        let dest = if self.layout(ret)?.size.bytes() != 0 { values.next().ok_or("shim return pointer")? } else { self.builder.ins().iconst(types::I64, 16) };
+        let dest = if self.layout(ret)?.size.bytes() != 0 { values.next().ok_or("shim return pointer")? } else { self.builder.ins().iconst(Type::I64, 16) };
         let mut places = Vec::with_capacity(params.len());
         for param in params {
-            let addr = if self.layout(param)?.size.bytes() != 0 { values.next().ok_or("shim argument")? } else { self.builder.ins().iconst(types::I64, 16) };
+            let addr = if self.layout(param)?.size.bytes() != 0 { values.next().ok_or("shim argument")? } else { self.builder.ins().iconst(Type::I64, 16) };
             places.push(Place { addr, ty: PlaceTy::from_ty(param), meta: None });
         }
         let dest = Place { addr: dest, ty: PlaceTy::from_ty(ret), meta: None };
@@ -485,7 +484,6 @@ impl<'db> Lower<'_, '_, 'db> {
             _ => return Err("shim of a target with code".to_owned()),
         }
         self.builder.ins().return_(&[]);
-        self.builder.seal_all_blocks();
         Ok(())
     }
 
@@ -498,26 +496,25 @@ impl<'db> Lower<'_, '_, 'db> {
         let dest = if self.layout(ret)?.size.bytes() != 0 {
             values.next().ok_or("thunk return pointer")?
         } else {
-            self.builder.ins().iconst(types::I64, 16)
+            self.builder.ins().iconst(Type::I64, 16)
         };
         let receiver = if data {
             values.next().ok_or("thunk data pointer")?
         } else {
-            self.builder.ins().iconst(types::I64, 16)
+            self.builder.ins().iconst(Type::I64, 16)
         };
         let mut places = Vec::with_capacity(params.len());
         for param in params {
             let addr = if self.layout(param)?.size.bytes() != 0 {
                 values.next().ok_or("thunk argument")?
             } else {
-                self.builder.ins().iconst(types::I64, 16)
+                self.builder.ins().iconst(Type::I64, 16)
             };
             places.push(Place { addr, ty: PlaceTy::from_ty(param), meta: None });
         }
         let dest = Place { addr: dest, ty: PlaceTy::from_ty(ret), meta: None };
         self.direct(&target, dest, Some(receiver), &places)?;
         self.builder.ins().return_(&[]);
-        self.builder.seal_all_blocks();
         Ok(())
     }
 }

@@ -4,13 +4,7 @@ const FRAMES: usize = 24;
 const SIGNALS: [i32; 5] = [libc::SIGABRT, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP];
 const STACK_BYTES: usize = 1 << 18;
 
-/// A call site that has an exception handler, as offsets into its function.
-#[derive(Clone, Copy)]
-pub struct Site {
-    pub ret: u32,
-    pub handler: u32,
-    pub frame_offset: u32,
-}
+pub use haste_codegen::Site;
 
 struct Code {
     start: usize,
@@ -28,10 +22,38 @@ pub enum Frame {
 
 static CODE: Mutex<Vec<Code>> = Mutex::new(Vec::new());
 
+const PERF_MAP: &str = "HASTE_PERF_MAP";
+
+fn perf_map_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(PERF_MAP).is_some())
+}
+
+fn append_perf_map(items: &[&Code]) {
+    use std::io::Write;
+    let path = format!("/tmp/perf-{}.map", std::process::id());
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+    let text: String = items.iter().map(|item| format!("{:x} {:x} {}\n", item.start, item.size, item.name)).collect();
+    let _ = file.write_all(text.as_bytes());
+}
+
 pub fn remember(start: usize, size: usize, name: String, sites: Vec<Site>) {
-    if let Ok(mut code) = CODE.lock() {
-        code.push(Code { start, size, name, sites });
+    let item = Code { start, size, name, sites };
+    if perf_map_on() {
+        append_perf_map(&[&item]);
     }
+    if let Ok(mut code) = CODE.lock() {
+        code.push(item);
+    }
+}
+
+/// Writes every generated function to this process's perf map when `HASTE_PERF_MAP` is set, for a forked child.
+pub fn write_perf_map() {
+    if !perf_map_on() {
+        return;
+    }
+    let code = CODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    append_perf_map(&code.iter().collect::<Vec<_>>());
 }
 
 pub fn frame_at(ret: usize) -> Frame {
