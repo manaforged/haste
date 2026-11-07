@@ -137,7 +137,7 @@ pub fn coverage(db: RootDatabase, crate_name: &str) -> Result<()> {
         let text = if text.is_empty() { info.payload().downcast_ref::<&str>().map(|it| (*it).to_owned()).unwrap_or_default() } else { text };
         let shown: String = text.chars().take(80).collect();
         let trace = std::backtrace::Backtrace::force_capture().to_string();
-        let frames: Vec<&str> = trace.lines().filter(|line| line.contains("engine_tracer::")).filter_map(|line| line.split("engine_tracer::").nth(1)).take(3).collect();
+        let frames: Vec<&str> = trace.lines().filter(|line| line.contains("haste::")).filter_map(|line| line.split("haste::").nth(1)).take(3).collect();
         *PANIC.lock().expect("panic note") = format!("{place} {shown} {frames:?}");
     }));
     let started = Instant::now();

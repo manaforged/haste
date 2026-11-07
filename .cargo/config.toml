@@ -1,2 +1,0 @@
-[env]
-RUSTC_BOOTSTRAP = "proc_macro_srv,proc_macro_api"

@@ -25,9 +25,13 @@ use hir_ty::db::HirDatabase;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_units_at};
 use project_model::{CargoConfig, RustLibSource};
 
-const USAGE: &str = "usage: engine-tracer collect PATH | patch PATH ENTRY EDITS [dump] | index PATH | demand PATH ENTRY | scripts PATH | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH | macros PATH";
+const USAGE: &str = "usage: haste collect PATH | patch PATH ENTRY EDITS [dump] | index PATH | demand PATH ENTRY | scripts PATH | image PATH ENTRY EDITS | coverage PATH CRATE | check PATH | macros PATH";
 
 fn main() -> Result<()> {
+    if std::env::var("RUSTC_BOOTSTRAP").ok().as_deref() == option_env!("RUSTC_BOOTSTRAP") {
+        // SAFETY: no other thread runs yet, so nothing reads the environment while it changes.
+        unsafe { std::env::remove_var("RUSTC_BOOTSTRAP") };
+    }
     let program = std::thread::Builder::new().name("program".to_owned()).stack_size(patch::PROGRAM_STACK).spawn(|| {
         fault::install();
         program()

@@ -3,7 +3,7 @@ set -u
 cd "$(dirname "$0")/.."
 dir="${1:-patch/diff}"
 rustc_side=$(cargo run --quiet --manifest-path $dir/Cargo.toml </dev/null 2>/dev/null | grep '^case_' | sort)
-engine_all=$(cargo run --quiet --release -- check $dir </dev/null 2>/dev/null)
+engine_all=$(cargo RUSTC_BOOTSTRAP=proc_macro_srv,proc_macro_api run --quiet --release -- check $dir </dev/null 2>/dev/null)
 engine_side=$(printf '%s\n' "$engine_all" | grep '^case_' | sort)
 printf '%s\n' "$engine_all" | grep '^summary' | cut -c1-200
 [ -n "$rustc_side" ] || { echo "no rustc output"; cargo run --quiet --manifest-path $dir/Cargo.toml </dev/null 2>&1 | grep -E '^error|panicked' -A4 | head -20 | cut -c1-160; exit 2; }
