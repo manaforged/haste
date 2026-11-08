@@ -60,6 +60,9 @@ impl<'a> Infer<'_, 'a> {
     /// Resolves the value path expression `expr` to a local or an item, and returns its type.
     pub fn path_expr(&mut self, expr: syntax::ExprId, path: PathId) -> Result<Ty> {
         let (ty, res) = self.value_path(path)?;
+        if let Res::Local(local) = res {
+            self.note_read(expr, local);
+        }
         self.out.res.insert(expr, res);
         Ok(ty)
     }
@@ -69,21 +72,35 @@ impl<'a> Infer<'_, 'a> {
         let body = self.body;
         let entry = body.path(path);
         let single = entry.qself.is_none() && !entry.global && entry.segments.len == 1;
-        if single {
-            let name = crate::names::plain(self.src.text(body.segments[body.list(entry.segments)[0] as usize].name));
-            if let Some(&(_, local)) = self.scopes.iter().rev().find(|(bound, _)| *bound == name) {
-                return Ok((self.out.locals[local as usize].ty, Res::Local(local)));
-            }
+        if single && let Some(found) = self.bound_value(crate::names::plain(self.src.text(body.segments[body.list(entry.segments)[0] as usize].name)))? {
+            return Ok(found);
         }
         if let Some(ctor) = self.ctor(body, path, true)? {
             return self.ctor_value(ctor);
         }
         match self.value_item(body, path) {
-            Ok(Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Fn => self.fn_item(item, Vec::new()),
-            Ok(Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => self.const_item(item, Vec::new()),
-            Ok(other) => bail!("unsupported value {other:?}"),
+            Ok(def) => self.item_value(path, def),
             Err(error) => self.assoc_value(path)?.ok_or(error),
         }
+    }
+
+    fn item_value(&mut self, path: PathId, def: Def) -> Result<(Ty, Res)> {
+        match def {
+            Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Fn => {
+                let given = self.segment_args(self.body, path, self.body.path(path).segments.len as usize)?;
+                self.fn_item(item, Vec::new(), given)
+            }
+            Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Const => self.const_item(item, Vec::new()),
+            other => bail!("unsupported value {other:?}"),
+        }
+    }
+
+    fn bound_value(&mut self, name: &str) -> Result<Option<(Ty, Res)>> {
+        if let Some(&(_, local)) = self.scopes.iter().rev().find(|(bound, _)| *bound == name) {
+            self.note_use(local);
+            return Ok(Some((self.out.locals[local as usize].ty, Res::Local(local))));
+        }
+        Ok(self.const_param(name)?.map(|(ty, value)| (ty, Res::Const(value))))
     }
 
     pub(super) fn const_item(&mut self, item: ItemRef, outer: Vec<Ty>) -> Result<(Ty, Res)> {
@@ -91,22 +108,20 @@ impl<'a> Infer<'_, 'a> {
         Ok((ty, Res::Fn(item, outer)))
     }
 
-    pub(super) fn fn_item(&mut self, item: ItemRef, outer: Vec<Ty>) -> Result<(Ty, Res)> {
-        let sig = self.cx.signature(item)?;
-        let count = sig.generics.iter().filter(|generic| generic.kind != GenericKind::Lifetime).count();
+    /// The function item `item` inside the type arguments `outer`, with its own type parameters set to `given`.
+    pub(super) fn fn_item(&mut self, item: ItemRef, outer: Vec<Ty>, given: Vec<Ty>) -> Result<(Ty, Res)> {
         let mut substs = outer;
-        substs.extend((0..count).map(|_| self.fresh(Kind::Var)));
+        substs.extend(self.own_args(item, given)?);
         Ok((self.cx.types.intern(Kind::FnDef(item, substs.clone())), Res::Fn(item, substs)))
     }
 
     /// Runs `run` as if inside the type item `item`, with its type parameters set to `args`.
     fn within<T>(&mut self, item: ItemRef, params: &[Generic], args: &[Ty], run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let file = self.cx.file(item);
-        let names = super::scope::type_params(params).map(|generic| file.source.text(generic.name));
-        let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics: names.zip(args.iter().copied()).collect(), self_ty: None, block: None };
+        let frame = self.item_frame(item, (params, args), (None, None))?;
         self.with_frame(frame, run)
     }
 
+    /// The type and const arguments of segment `count` of `path`, skipping lifetimes.
     pub(super) fn segment_args(&mut self, arena: &Body, path: PathId, count: usize) -> Result<Vec<Ty>> {
         let Some(&last) = arena.list(arena.path(path).segments)[..count].last() else { return Ok(Vec::new()) };
         let list = match arena.segments[last as usize].args {
@@ -117,13 +132,24 @@ impl<'a> Infer<'_, 'a> {
         self.arg_list(arena, list)
     }
 
-    /// The types that the generic argument list `list` gives, skipping lifetimes.
+    /// The own type arguments of function `item`: the turbofish arguments `given`, then fresh variables for the parameters they leave out.
+    pub(super) fn own_args(&mut self, item: ItemRef, mut given: Vec<Ty>) -> Result<Vec<Ty>> {
+        let count = super::scope::type_params(&self.cx.signature(item)?.generics).count();
+        if given.len() > count {
+            bail!("`{}` takes {count} type arguments, {} given", self.cx.name(item), given.len());
+        }
+        given.extend((given.len()..count).map(|_| self.fresh(Kind::Var)));
+        Ok(given)
+    }
+
+    /// The types and const values that the generic argument list `list` gives, skipping lifetimes.
     pub(super) fn arg_list(&mut self, arena: &Body, list: syntax::List) -> Result<Vec<Ty>> {
         let mut tys = Vec::new();
         for &at in arena.list(list) {
             match arena.args[at as usize] {
                 GenericArg::Ty(ty) => tys.push(self.lower_ty(arena, ty)?),
                 GenericArg::Lifetime(_) => {}
+                GenericArg::Const(expr) => tys.push(self.const_arg(arena, expr)?),
                 other => bail!("unsupported generic argument {other:?}"),
             }
         }
@@ -152,21 +178,62 @@ impl<'a> Infer<'_, 'a> {
 
     /// The type that the syntax type `ty` in `arena` names.
     pub fn lower_ty(&mut self, arena: &Body, ty: TyId) -> Result<Ty> {
-        let kind = match *arena.ty(ty) {
-            syntax::Ty::Path(path) => return self.path_ty(arena, path),
-            syntax::Ty::Paren(inner) => return self.lower_ty(arena, inner),
-            syntax::Ty::Infer => return Ok(self.fresh(Kind::Var)),
+        match *arena.ty(ty) {
+            syntax::Ty::Path(path) => self.path_ty(arena, path),
+            syntax::Ty::Paren(inner) => self.lower_ty(arena, inner),
+            syntax::Ty::Infer => Ok(self.fresh(Kind::Var)),
+            syntax::Ty::Macro { path, open } => self.macro_ty(arena, path, open),
+            syntax::Ty::ImplTrait(at, _) => self.impl_param(at),
+            _ => {
+                let kind = self.lower_kind(arena, ty)?;
+                Ok(self.cx.types.intern(kind))
+            }
+        }
+    }
+
+    fn lower_kind(&mut self, arena: &Body, ty: TyId) -> Result<Kind> {
+        match *arena.ty(ty) {
             syntax::Ty::Ref { mutable, ty, .. } => self.lower_ty(arena, ty).map(|inner| Kind::Ref(mutability(mutable), inner)),
             syntax::Ty::Ptr { mutable, ty } => self.lower_ty(arena, ty).map(|inner| Kind::Ptr(mutability(mutable), inner)),
             syntax::Ty::Slice(ty) => self.lower_ty(arena, ty).map(Kind::Slice),
             syntax::Ty::Array(ty, len) => self.array_ty(arena, ty, len),
             syntax::Ty::Tuple(list) => self.lower_list(arena, list).map(Kind::Tuple),
             syntax::Ty::Never => Ok(Kind::Never),
-            syntax::Ty::Macro { path, open } => return self.macro_ty(arena, path, open),
-            syntax::Ty::ImplTrait(at, _) => return self.impl_param(at),
+            syntax::Ty::DynTrait(bounds) => self.object_ty(arena, bounds),
+            syntax::Ty::Fn { params, ret, variadic } => self.fn_ptr_ty(arena, (params, ret), variadic),
             other => bail!("unsupported type {other:?}"),
+        }
+    }
+
+    fn fn_ptr_ty(&mut self, arena: &Body, (params, ret): (syntax::List, Option<TyId>), variadic: bool) -> Result<Kind> {
+        if variadic {
+            bail!("variadic function pointer types are not supported yet");
+        }
+        let params = self.lower_list(arena, params)?;
+        let ret = match ret {
+            Some(ret) => self.lower_ty(arena, ret)?,
+            None => self.cx.types.unit(),
         };
-        Ok(self.cx.types.intern(kind?))
+        Ok(Kind::FnPtr(params, ret))
+    }
+
+    fn object_ty(&mut self, arena: &Body, bounds: syntax::List) -> Result<Kind> {
+        let mut principal = None;
+        for &bound in arena.list(bounds) {
+            let syntax::Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else { continue };
+            let Some(of) = self.trait_named(arena, path, self.home) else { bail!("a trait object bound that names no trait") };
+            if !self.cx.is_auto_trait(of) && principal.replace((of, path)).is_some() {
+                bail!("a trait object with two traits that are not auto traits");
+            }
+        }
+        let Some((of, path)) = principal else { bail!("a trait object of auto traits only") };
+        let count = arena.list(arena.path(path).segments).len();
+        let given = self.segment_args(arena, path, count)?;
+        let wanted = super::scope::type_params(&self.cx.trait_generics(of)?.1.params).count();
+        if given.len() != wanted {
+            bail!("a trait object of `{}` that leaves trait arguments to their defaults", self.cx.name(of));
+        }
+        Ok(Kind::Dyn(of, given))
     }
 
     /// The type that the associated type `name` of impl `block` is, read in the current frame, when the impl has one.
@@ -186,7 +253,7 @@ impl<'a> Infer<'_, 'a> {
         let mut args = given.into_iter();
         let names: Vec<&str> = params.iter().map(|generic| file.source.text(generic.name)).collect();
         let generics = names.into_iter().map(|name| (name, args.next().unwrap_or_else(|| self.fresh(Kind::Var)))).collect();
-        let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty: None, block: None };
+        let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty: None, block: None, item: None };
         self.with_frame(frame, |infer| infer.lower_ty(&arena, ty))
     }
 
@@ -211,16 +278,13 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn array_ty(&mut self, arena: &Body, ty: TyId, len: syntax::ExprId) -> Result<Kind> {
-        Ok(Kind::Array(self.lower_ty(arena, ty)?, self.const_len(arena, len)?))
+        Ok(Kind::Array(self.lower_ty(arena, ty)?, self.const_arg(arena, len)?))
     }
 
     fn lower_list(&mut self, arena: &Body, list: syntax::List) -> Result<Vec<Ty>> {
         arena.list(list).iter().map(|&item| self.lower_ty(arena, TyId(item))).collect()
     }
 
-    pub(super) fn const_len(&mut self, arena: &Body, len: syntax::ExprId) -> Result<u64> {
-        self.const_eval(arena, len, (64, false)).map(|(value, _)| value as u64)
-    }
 
     fn path_ty(&mut self, arena: &Body, path: PathId) -> Result<Ty> {
         if let Some((qself, Some(trait_path))) = arena.path(path).qself {
@@ -262,18 +326,21 @@ impl<'a> Infer<'_, 'a> {
         Ok(self.cx.types.intern(Kind::Adt(item, args)))
     }
 
-    /// The type that `segments` names through the frame: `Self`, a type parameter, or an associated type `Self::Name` of the impl.
+    /// The type that `segments` names through the frame: `Self`, a type parameter, or an associated type `Param::Name` of one.
     fn scoped_ty(&mut self, segments: &[Sym]) -> Result<Option<Ty>> {
-        let text = |infer: &Self, at: usize| infer.cx.names.symbols.text(segments[at]);
-        match (segments.len(), self.self_ty, self.block) {
-            (1, Some(self_ty), _) if text(self, 0) == "Self" => Ok(Some(self_ty)),
-            (1, _, _) => Ok(self.generics.iter().find(|(generic, _)| *generic == text(self, 0)).map(|&(_, ty)| ty)),
-            (2, _, Some(block)) if text(self, 0) == "Self" => self.impl_alias(block, text(self, 1)),
+        let symbols = &self.cx.names.symbols;
+        match *segments {
+            [one] if symbols.text(one) == "Self" && self.self_ty.is_some() => Ok(self.self_ty),
+            [one] => Ok(self.generics.iter().find(|(generic, _)| *generic == symbols.text(one)).map(|&(_, ty)| ty)),
+            [param, name] if symbols.text(param) == "Self" || self.generics.iter().any(|(generic, _)| *generic == symbols.text(param)) => {
+                let (param, name) = (symbols.text(param).to_string(), symbols.text(name).to_string());
+                self.param_projection(&param, &name)
+            }
             _ => Ok(None),
         }
     }
 
-    /// The type `<qself as Trait>::Name` names, for the traits whose impls the compiler provides.
+    /// The type `<qself as Trait>::Name` names: the impl's associated type, or the pointer metadata the compiler provides.
     fn projection(&mut self, arena: &Body, path: PathId, qself: TyId, trait_path: PathId) -> Result<Ty> {
         let ty = self.lower_ty(arena, qself)?;
         let (segments, absolute, dollar) = self.segments(arena, trait_path);
@@ -281,16 +348,24 @@ impl<'a> Infer<'_, 'a> {
         let def = paths.resolve(&NamePath { segments: &segments, absolute, dollar }, self.home);
         let name = arena.list(arena.path(path).segments).last().map(|&at| plain(self.src.text(arena.segments[at as usize].name)));
         let Some(Def::Item(item)) = def else { bail!("projection through `{}`, which is not a trait", self.spell(&segments)) };
-        match (self.cx.lang(item), name) {
-            (Some("pointee_trait"), Some("Metadata")) => self.metadata_of(ty),
-            _ => bail!("associated type projections through `{}` are not supported yet", self.cx.name(item)),
+        let Some(name) = name else { bail!("a projection with no name") };
+        if self.cx.lang(item) == Some("pointee_trait") && name == "Metadata" {
+            return self.metadata_of(ty);
         }
+        let count = arena.list(arena.path(trait_path).segments).len();
+        let given = self.segment_args(arena, trait_path, count)?;
+        let args = self.trait_args(item, given, ty)?;
+        self.project(item, ty, args, name)
     }
 
     /// The pointer metadata of `ty`: a length for slices and `str`, nothing for sized types, or a variable until `ty` is known.
     pub fn metadata_of(&mut self, ty: Ty) -> Result<Ty> {
         match self.cx.types.kind(self.resolve(ty)) {
             Kind::Slice(_) | Kind::Prim(Primitive::Str) => Ok(self.cx.types.prim(Primitive::Usize)),
+            Kind::Dyn(..) => {
+                let Some(metadata) = self.cx.lang_item("dyn_metadata") else { bail!("core has no `DynMetadata`") };
+                Ok(self.cx.types.intern(Kind::Adt(metadata, vec![ty])))
+            }
             Kind::Var(_) => {
                 let result = self.fresh(Kind::Var);
                 self.metadata.push((ty, result));

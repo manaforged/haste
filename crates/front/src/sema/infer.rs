@@ -2,23 +2,32 @@ mod adt;
 mod assoc;
 mod consts;
 mod array;
+mod closure;
+mod coerce;
+mod deref;
 mod expr;
 mod matching;
 mod looping;
 mod method;
+mod object;
 mod pat;
 mod path;
 mod pattern;
+mod project;
 mod scope;
 mod drop;
 mod select;
 mod stmt;
 
+pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, closure_typed, register};
 pub use drop::Glue;
 pub use looping::{For, Tried};
 pub use method::Adjust;
+pub use coerce::Coercion;
+pub use object::{ALIGN_SLOT, FIRST_METHOD, SIZE_SLOT, Vtable};
 pub use pat::{Mode, position, rest_split};
 pub use path::{parse_int, segments};
+pub use scope::type_params;
 
 use rustc_hash::FxHashMap as HashMap;
 
@@ -38,6 +47,8 @@ pub enum Res {
     Local(u32),
     Fn(ItemRef, Vec<Ty>),
     Ctor(ItemRef, u32, Vec<Ty>),
+    /// The value of a const parameter, as the const value it is set to.
+    Const(Ty),
 }
 
 /// One local variable of a body.
@@ -47,16 +58,32 @@ pub struct Local {
     pub mutable: bool,
 }
 
+/// What the code of an instance is: a body, drop glue, a closure's body, or a call through the vtable slot of a trait object.
+#[derive(Clone, Debug, Default)]
+pub enum Shape {
+    #[default]
+    Body,
+    Glue(Glue),
+    Closure(ClosureBody),
+    Virtual(u32),
+}
+
 /// The inferred types and resolutions of one function body at one set of type arguments.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Typed {
     pub exprs: Vec<Ty>,
     pub res: HashMap<ExprId, Res>,
     pub locals: Vec<Local>,
     pub binds: HashMap<PatId, u32>,
     pub adjusts: HashMap<ExprId, Adjust>,
-    /// The expressions whose pointer to an array of this length coerces to a pointer to a slice.
-    pub unsize: HashMap<ExprId, u64>,
+    /// The field accesses and calls that dereference their base or callee this many times first, through references and `Box`es.
+    pub autoderefs: HashMap<ExprId, u32>,
+    /// The dereferences that call `Deref::deref` or `DerefMut::deref_mut`, by expression and step: step 0 of a `*`, or one step of an autoderef.
+    pub derefs: HashMap<(ExprId, u32), Res>,
+    /// The operator expressions that call a trait method: `Index::index`, `IndexMut::index_mut`, or a binary operator trait such as `Add::add` or `PartialEq::eq`.
+    pub operators: HashMap<ExprId, Res>,
+    /// The expressions whose value coerces to the type it is used at, and how.
+    pub coercions: HashMap<ExprId, Coercion>,
     pub fields: HashMap<ExprId, u32>,
     pub field_pats: HashMap<PatId, u32>,
     pub pat_res: HashMap<PatId, Res>,
@@ -69,8 +96,10 @@ pub struct Typed {
     pub tries: HashMap<ExprId, Tried>,
     /// The drop glue of each type that a local or a temporary of the body holds and that needs drop.
     pub drops: Vec<Res>,
-    /// The calls of the drop glue that this instance is, when it is one.
-    pub glue: Option<Glue>,
+    /// The closure expressions of the body.
+    pub closures: HashMap<ExprId, Closure>,
+    /// What the code of this instance is.
+    pub shape: Shape,
 }
 
 impl Typed {
@@ -78,8 +107,19 @@ impl Typed {
     pub fn calls(&self) -> impl Iterator<Item = (ItemRef, &[Ty])> {
         let loops = self.fors.values().flat_map(|each| [&each.into_iter, &each.next]);
         let tries = self.tries.values().flat_map(|each| [&each.branch, &each.from_residual]);
-        let glue = self.glue.iter().flat_map(|glue| glue.drop.iter().chain(&glue.parts));
-        self.res.values().chain(self.pat_res.values()).chain(loops).chain(tries).chain(&self.drops).chain(glue).filter_map(|res| match res {
+        let glue = match &self.shape {
+            Shape::Glue(glue) => Some(glue),
+            _ => None,
+        };
+        let glue = glue.into_iter().flat_map(|glue| glue.drop.iter().chain(&glue.parts));
+        let coerced = self.coercions.values().flat_map(|coercion| -> Box<dyn Iterator<Item = &Res>> {
+            match coercion {
+                Coercion::Vtable(vtable) => Box::new(vtable.drop.iter().chain(vtable.methods.iter().flatten())),
+                Coercion::Reify(res) => Box::new(std::iter::once(res)),
+                Coercion::Len(_) => Box::new(std::iter::empty()),
+            }
+        });
+        self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(loops).chain(tries).chain(&self.drops).chain(glue).chain(coerced).filter_map(|res| match res {
             Res::Fn(item, substs) => Some((*item, &substs[..])),
             _ => None,
         })
@@ -93,16 +133,21 @@ pub struct Infer<'c, 'a> {
     sig: &'c Signature,
     src: &'a Source,
     root: Option<ItemRef>,
+    instance: Option<(ItemRef, Vec<Ty>)>,
     home: ModRef,
     generics: Vec<(&'a str, Ty)>,
     self_ty: Option<Ty>,
     block: Option<super::impls::ImplRef>,
+    frame_item: Option<ItemRef>,
     vars: Vec<Option<Ty>>,
     metadata: Vec<(Ty, Ty)>,
+    obligations: Vec<(ItemRef, Vec<Ty>)>,
+    projections: Vec<project::Projection>,
     out: Typed,
     scopes: Vec<(&'a str, u32)>,
     items: Vec<(&'a str, ItemRef)>,
     loops: Vec<Breaks>,
+    uses: Vec<closure::Uses>,
     diverges: bool,
 }
 
@@ -115,25 +160,56 @@ struct Breaks {
 
 /// Infers the body of the function `item` with its generic parameters set to `substs`.
 pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed> {
-    if cx.lang(item) == Some("drop_glue") {
-        let Some(&ty) = substs.first() else { bail!("drop glue with no type") };
-        return drop::glue_typed(cx, item, ty);
+    if let Some(typed) = compiler_made(cx, item, substs)? {
+        return Ok(typed);
     }
     let sig = cx.signature(item)?;
-    let foreign = cx.foreign(item);
+    let slot = object::virtual_slot(cx, item, substs)?;
+    let foreign = cx.foreign(item) || slot.is_some();
     let body = if foreign { std::rc::Rc::default() } else { cx.body(item)? };
     let src = cx.body_src(item);
     let home = cx.module_of(item)?;
     let root = Some(item.outer().map_or(item, |(outer, _)| outer));
-    let mut infer = Infer { cx, body: &body, sig: &sig, src, root, home, generics: Vec::new(), self_ty: None, block: None, vars: Vec::new(), metadata: Vec::new(), out: Typed::default(), scopes: Vec::new(), items: Vec::new(), loops: Vec::new(), diverges: false };
+    let mut infer = Infer::start(cx, (&body, &sig, src), home);
+    (infer.root, infer.instance) = (root, Some((item, substs.to_vec())));
     let mut frame = infer.frame(item, substs)?;
     frame.src = src;
     infer.swap_frame(frame);
     infer.out.exprs = vec![Ty(u32::MAX); body.exprs.len()];
     infer.run(foreign)?;
     let mut typed = infer.finish()?;
+    if let Some(slot) = slot {
+        typed.shape = Shape::Virtual(slot);
+    }
+    settle(cx, (item, substs), typed)
+}
+
+fn settle(cx: &mut Context<'_>, instance: (ItemRef, &[Ty]), mut typed: Typed) -> Result<Typed> {
+    closure::register(cx, instance, &typed);
+    if object::fill_drops(cx, &mut typed)? {
+        closure::register(cx, instance, &typed);
+    }
     typed.drops = drop::drop_calls(cx, &typed)?;
     Ok(typed)
+}
+
+/// The typed form of an instance that the compiler writes instead of a body: drop glue, or the `call_once` of a closure.
+fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Option<Typed>> {
+    if cx.lang(item) == Some("drop_glue") {
+        let Some(&ty) = substs.first() else { bail!("drop glue with no type") };
+        return drop::glue_typed(cx, item, ty).map(Some);
+    }
+    match substs.first() {
+        Some(&ty) if matches!(cx.types.kind(ty), Kind::Closure(..)) && cx.call_once() == Some(item) => closure::closure_typed(cx, ty).map(Some),
+        _ => Ok(None),
+    }
+}
+
+impl<'c, 'a> Infer<'c, 'a> {
+    fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
+        let (generics, vars, metadata, obligations, projections, scopes, items, loops, uses) = Default::default();
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, out: Typed::default(), scopes, items, loops, uses, diverges: false }
+    }
 }
 
 impl Infer<'_, '_> {
@@ -152,7 +228,7 @@ impl Infer<'_, '_> {
         }
         for &(pat, ty) in &sig.params {
             let ty = self.lower_ty(&sig.body, ty)?;
-            let local = self.param_pat(pat, ty)?;
+            let local = self.param_pat(&sig.body, pat, ty)?;
             self.out.params.push(local);
         }
         let Some(root) = self.body.root else {
@@ -162,8 +238,8 @@ impl Infer<'_, '_> {
         self.coerce_expr(root, found, ret)
     }
 
-    fn param_pat(&mut self, pat: PatId, ty: Ty) -> Result<u32> {
-        match *self.sig.body.pat(pat) {
+    fn param_pat(&mut self, arena: &Body, pat: PatId, ty: Ty) -> Result<u32> {
+        match *arena.pat(pat) {
             crate::body::Pat::Bind { name, mutable, sub: None, by_ref: false } => {
                 let local = self.new_local(ty, mutable);
                 self.scopes.push((self.src.text(name), local));
@@ -223,12 +299,7 @@ impl Infer<'_, '_> {
         if self.var_of(ty) == Some(var) {
             return true;
         }
-        match self.cx.types.kind(ty) {
-            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) => items.iter().any(|item| self.occurs(var, *item)),
-            Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Array(inner, _) | Kind::Slice(inner) | Kind::Pat(inner, ..) => self.occurs(var, *inner),
-            Kind::FnPtr(params, ret) => params.iter().any(|param| self.occurs(var, *param)) || self.occurs(var, *ret),
-            _ => false,
-        }
+        self.cx.types.kind(ty).children().any(|item| self.occurs(var, item))
     }
 
     /// Makes `a` and `b` the same type.
@@ -251,10 +322,10 @@ impl Infer<'_, '_> {
         let pairs: Vec<(Ty, Ty)> = match (a, b) {
             (Kind::Tuple(x), Kind::Tuple(y)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).collect(),
             (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => vec![(*x, *y)],
-            (Kind::Array(x, m), Kind::Array(y, n)) if m == n => vec![(*x, *y)],
+            (Kind::Array(x, m), Kind::Array(y, n)) => vec![(*x, *y), (*m, *n)],
             (Kind::Slice(x), Kind::Slice(y)) => vec![(*x, *y)],
             (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => vec![(*x, *y)],
-            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) if i == j && x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).collect(),
+            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x), Kind::Dyn(j, y)) if i == j && x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).collect(),
             (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).chain([(*r, *s)]).collect(),
             _ => bail!("mismatch"),
         };
@@ -270,7 +341,9 @@ impl Infer<'_, '_> {
             (Kind::Ref(from, a), Kind::Ptr(to, b)) if from == to => self.unify(a, b),
             _ => self.unify(found, expected),
         }?;
-        self.settle_metadata()
+        self.settle_metadata()?;
+        self.settle_projections()?;
+        self.settle_obligations()
     }
 
     /// Coerces the value of `expr`, of type `found`, to `expected`, at each branch value it ends in, recording an array-to-slice unsizing.
@@ -283,9 +356,9 @@ impl Infer<'_, '_> {
             self.out.exprs[expr.0 as usize] = expected;
             return Ok(());
         }
-        match self.unsize(found, expected)? {
-            Some(len) => {
-                self.out.unsize.insert(expr, len);
+        match self.coercion(found, expected)? {
+            Some(coercion) => {
+                self.out.coercions.insert(expr, coercion);
                 Ok(())
             }
             None => self.coerce(found, expected),
@@ -307,16 +380,29 @@ impl Infer<'_, '_> {
         expected.filter(|ty| !matches!(self.cx.types.kind(self.resolve(*ty)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)))
     }
 
-    fn unsize(&mut self, found: Ty, expected: Ty) -> Result<Option<u64>> {
-        let (found, expected) = (self.resolve(found), self.resolve(expected));
-        let (Kind::Ref(from, a) | Kind::Ptr(from, a), Kind::Ref(to, b) | Kind::Ptr(to, b)) = (self.cx.types.kind(found).clone(), self.cx.types.kind(expected).clone()) else { return Ok(None) };
-        let (a, b) = (self.resolve(a), self.resolve(b));
-        let (Kind::Array(element, len), Kind::Slice(target)) = (self.cx.types.kind(a).clone(), self.cx.types.kind(b).clone()) else { return Ok(None) };
-        if from == Mut::Not && to == Mut::Mut {
-            bail!("cannot coerce a shared pointer to a mutable one");
+    fn settle_obligations(&mut self) -> Result<()> {
+        let mut at = 0;
+        while at < self.obligations.len() {
+            let (of, substs) = self.obligations[at].clone();
+            let self_ty = self.resolve(substs[0]);
+            if matches!(self.cx.types.kind(self_ty), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
+                at += 1;
+                continue;
+            }
+            let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
+            if self.select(of, self_ty, &substs[1..])?.is_some() || known {
+                self.obligations.swap_remove(at);
+            } else {
+                at += 1;
+            }
         }
-        self.unify(element, target)?;
-        Ok(Some(len))
+        Ok(())
+    }
+
+    fn has_vars(&self, ty: Ty) -> bool {
+        let ty = self.resolve(ty);
+        let kind = self.cx.types.kind(ty);
+        matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || kind.children().any(|item| self.has_vars(item))
     }
 
     fn settle_metadata(&mut self) -> Result<()> {
@@ -351,23 +437,12 @@ impl Infer<'_, '_> {
         if let Some(fallback) = fallback {
             return fallback;
         }
-        let items = |infer: &mut Self, items: &[Ty]| items.iter().map(|item| infer.zonk(*item)).collect::<Vec<_>>();
-        let kind = match kind {
-            Kind::Tuple(list) => Kind::Tuple(items(self, &list)),
-            Kind::Ref(m, inner) => Kind::Ref(m, self.zonk(inner)),
-            Kind::Ptr(m, inner) => Kind::Ptr(m, self.zonk(inner)),
-            Kind::Array(inner, len) => Kind::Array(self.zonk(inner), len),
-            Kind::Slice(inner) => Kind::Slice(self.zonk(inner)),
-            Kind::Adt(item, args) => Kind::Adt(item, items(self, &args)),
-            Kind::FnDef(item, args) => Kind::FnDef(item, items(self, &args)),
-            Kind::FnPtr(params, ret) => Kind::FnPtr(items(self, &params), self.zonk(ret)),
-            Kind::Pat(base, start, end) => Kind::Pat(self.zonk(base), start, end),
-            other => other,
-        };
+        let kind = kind.map(|item| self.zonk(item));
         self.cx.types.intern(kind)
     }
 
     fn finish(mut self) -> Result<Typed> {
+        self.settle_projections()?;
         let exprs = std::mem::take(&mut self.out.exprs);
         self.out.exprs = exprs.into_iter().map(|ty| if ty.0 == u32::MAX { ty } else { self.zonk(ty) }).collect();
         let locals = std::mem::take(&mut self.out.locals);
@@ -375,15 +450,27 @@ impl Infer<'_, '_> {
         let pats = std::mem::take(&mut self.out.pats);
         self.out.pats = pats.into_iter().map(|(pat, ty)| (pat, self.zonk(ty))).collect();
         let res = std::mem::take(&mut self.out.res);
-        self.out.res = res.into_iter().map(|(expr, res)| Ok((expr, self.zonk_res(res)?))).collect::<Result<_>>()?;
+        self.out.res = self.zonk_all(res)?;
         let pat_res = std::mem::take(&mut self.out.pat_res);
-        self.out.pat_res = pat_res.into_iter().map(|(pat, res)| Ok((pat, self.zonk_res(res)?))).collect::<Result<_>>()?;
+        self.out.pat_res = self.zonk_all(pat_res)?;
         self.out.ret = self.out.ret.map(|ret| self.zonk(ret));
+        let closures = std::mem::take(&mut self.out.closures);
+        self.out.closures = closures.into_iter().map(|(expr, closure)| (expr, Closure { ret: self.zonk(closure.ret), ..closure })).collect();
         let fors = std::mem::take(&mut self.out.fors);
         self.out.fors = fors.into_iter().map(|(expr, each)| Ok((expr, self.zonk_for(each)?))).collect::<Result<_>>()?;
         let tries = std::mem::take(&mut self.out.tries);
         self.out.tries = tries.into_iter().map(|(expr, each)| Ok((expr, self.zonk_try(each)?))).collect::<Result<_>>()?;
+        let derefs = std::mem::take(&mut self.out.derefs);
+        self.out.derefs = self.zonk_all(derefs)?;
+        let operators = std::mem::take(&mut self.out.operators);
+        self.out.operators = self.zonk_all(operators)?;
+        let coercions = std::mem::take(&mut self.out.coercions);
+        self.out.coercions = coercions.into_iter().map(|(expr, coercion)| Ok((expr, self.zonk_coercion(coercion)?))).collect::<Result<_>>()?;
         Ok(self.out)
+    }
+
+    fn zonk_all<K: Eq + std::hash::Hash>(&mut self, map: HashMap<K, Res>) -> Result<HashMap<K, Res>> {
+        map.into_iter().map(|(key, res)| Ok((key, self.zonk_res(res)?))).collect()
     }
 
     fn zonk_for(&mut self, each: For) -> Result<For> {
@@ -401,6 +488,7 @@ impl Infer<'_, '_> {
                 self.trait_call(item, substs)
             }
             Res::Ctor(item, variant, args) => Ok(Res::Ctor(item, variant, args.into_iter().map(|ty| self.zonk(ty)).collect())),
+            Res::Const(value) => Ok(Res::Const(self.zonk(value))),
             other => Ok(other),
         }
     }
@@ -409,6 +497,11 @@ impl Infer<'_, '_> {
 /// The field types of each variant of the struct, enum or union `item` at `args`.
 pub fn field_types(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Vec<Vec<Ty>>> {
     detached(cx, item, |infer| infer.adt_fields(item, args))
+}
+
+/// The discriminant of each variant of the enum `item`, whose tags are integers of type `primitive`.
+pub fn discriminants(cx: &mut Context<'_>, item: ItemRef, primitive: Primitive) -> Result<Vec<i128>> {
+    detached(cx, item, |infer| infer.discriminants(item, primitive))
 }
 
 /// Whether dropping a value of `ty` runs code.
@@ -427,6 +520,6 @@ pub(crate) fn detached<T>(cx: &mut Context<'_>, item: ItemRef, run: impl FnOnce(
     let (body, sig) = (Body::default(), Signature::default());
     let src = &cx.file(item).source;
     let home = cx.module_of(item)?;
-    let mut infer = Infer { cx, body: &body, sig: &sig, src, root: None, home, generics: Vec::new(), self_ty: None, block: None, vars: Vec::new(), metadata: Vec::new(), out: Typed::default(), scopes: Vec::new(), items: Vec::new(), loops: Vec::new(), diverges: false };
+    let mut infer = Infer::start(cx, (&body, &sig, src), home);
     run(&mut infer)
 }

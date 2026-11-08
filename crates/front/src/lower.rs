@@ -1,7 +1,9 @@
 //! Lowering of inferred function bodies at concrete types to `haste-codegen` SSA.
 
+mod abi;
 mod adt;
 mod array;
+mod closure;
 mod drop;
 mod equal;
 mod expr;
@@ -10,9 +12,11 @@ mod looping;
 mod matching;
 mod memory;
 mod moves;
+mod object;
 mod ops;
 mod place;
 mod promote;
+mod slice_pat;
 
 use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, Function, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
@@ -21,7 +25,7 @@ use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
 use crate::names::Primitive;
 use crate::outline::source::Source;
 use crate::sema::Context;
-use crate::sema::infer::Typed;
+use crate::sema::infer::{Shape, Typed};
 use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty, Types};
 
@@ -31,6 +35,15 @@ pub trait Slots {
     fn entry(&self, index: usize) -> i64;
     /// The address of a 16-byte-aligned copy of `bytes` that lives as long as the program.
     fn data(&self, bytes: &[u8]) -> i64;
+    /// The address of a table of `words` that lives as long as the program, each `Word::Code` holding a code address once every function is compiled.
+    fn table(&self, words: &[Word]) -> i64;
+}
+
+/// One machine word of a constant table: a number, or the code address of reached function `index`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Word {
+    Int(u64),
+    Code(usize),
 }
 
 /// How a value of one type travels: not at all, in one register, or as the address of its bytes.
@@ -53,7 +66,8 @@ pub fn machine(types: &Types, ty: Ty) -> Option<Type> {
         Kind::Prim(F32) => Type::F32,
         Kind::Prim(F64) => Type::F64,
         Kind::Pat(base, ..) => return machine(types, *base),
-        Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) if !matches!(types.kind(*pointee), Kind::Slice(_) | Kind::Prim(Str)) => Type::I64,
+        Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) if !types.kind(*pointee).is_unsized() => Type::I64,
+        Kind::FnPtr(..) => Type::I64,
         _ => return None,
     })
 }
@@ -73,16 +87,21 @@ pub fn repr(cx: &mut Context<'_>, ty: Ty) -> Result<Repr> {
 
 /// The native signature of a reached function: memory values travel by address, and a memory result through a first `StructReturn` pointer.
 pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
+    signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))
+}
+
+/// The native signature of a function that returns `ret` and takes `params`.
+pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIterator<Item = Ty>) -> Result<Signature> {
     let mut signature = Signature::new(CallConv::Native);
-    if let Some(ret) = typed.ret {
+    if let Some(ret) = ret {
         match repr(cx, ret)? {
             Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
             Repr::Mem { .. } => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn)),
             Repr::Zst => {}
         }
     }
-    for &local in &typed.params {
-        match repr(cx, typed.locals[local as usize].ty)? {
+    for param in params {
+        match repr(cx, param)? {
             Repr::Scalar(ty) => signature.params.push(AbiParam::new(ty)),
             Repr::Mem { .. } => signature.params.push(AbiParam::new(Type::I64)),
             Repr::Zst => {}
@@ -108,7 +127,7 @@ pub struct Lower<'l, 'a> {
     src: &'a Source,
     typed: &'l Typed,
     b: FunctionBuilder<'l>,
-    locals: Vec<Option<(StackSlot, Repr)>>,
+    locals: Vec<Option<place::Place>>,
     loops: Vec<Loop>,
     open: bool,
     dead: Option<Block>,
@@ -124,8 +143,15 @@ pub struct Lower<'l, 'a> {
 pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<Function> {
     let ((item, _), typed) = &reached.list[index];
     let Ok(typed) = typed else { bail!("{} did not type-check", cx.name(*item)) };
-    let body = if typed.glue.is_some() { std::rc::Rc::default() } else { cx.body(*item)? };
-    let src = cx.body_src(*item);
+    let source = match &typed.shape {
+        Shape::Closure(closure) => closure.parent,
+        _ => *item,
+    };
+    let body = match typed.shape {
+        Shape::Body | Shape::Closure(_) => cx.body(source)?,
+        Shape::Glue(_) | Shape::Virtual(_) => std::rc::Rc::default(),
+    };
+    let src = cx.body_src(source);
     let mut func = Function::new(signature(cx, typed)?);
     let b = FunctionBuilder::new(&mut func);
     let mut lower = Lower {
@@ -170,13 +196,7 @@ impl Lower<'_, '_> {
             };
             self.declare(local, value)?;
         }
-        let value = match &self.typed.glue {
-            Some(_) => self.glue_target().map(|_| None)?,
-            None => {
-                let Some(root) = self.body.root else { bail!("body has no root") };
-                self.expr(root)?
-            }
-        };
+        let value = self.root_value()?;
         self.finish(value)?;
         self.enter(prologue);
         for slot in std::mem::take(&mut self.flags) {
@@ -189,10 +209,26 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
+    fn root_value(&mut self) -> Result<Option<Value>> {
+        match &self.typed.shape {
+            Shape::Glue(_) => self.glue_target().map(|_| None),
+            Shape::Virtual(slot) => self.virtual_call(*slot).map(|_| None),
+            Shape::Closure(closure) => {
+                let root = closure.closure.body;
+                self.bind_captures()?;
+                self.expr(root)
+            }
+            Shape::Body => {
+                let Some(root) = self.body.root else { bail!("body has no root") };
+                self.expr(root)
+            }
+        }
+    }
+
     fn glue_target(&mut self) -> Result<()> {
         let local = self.typed.params[0];
         let Kind::Ref(_, ty) = *self.cx.types.kind(self.typed.locals[local as usize].ty) else { bail!("drop glue takes a reference") };
-        let target = self.locals[local as usize].map(|(slot, repr)| place::Place::slot(slot, repr)).and_then(|place| self.read(place));
+        let target = self.locals[local as usize].and_then(|place| self.read(place));
         self.glue_body(ty, target)
     }
 
@@ -280,7 +316,7 @@ impl Lower<'_, '_> {
         let repr = self.local_repr(local)?;
         let slot = self.slot(repr);
         if let Some(slot) = slot {
-            self.locals[local as usize] = Some((slot, repr));
+            self.locals[local as usize] = Some(place::Place::slot(slot, repr));
             if let Some(value) = value {
                 self.write(place::Place::slot(slot, repr), value);
             }
@@ -300,6 +336,14 @@ impl Lower<'_, '_> {
 
     fn ty_of(&self, expr: ExprId) -> Ty {
         self.typed.exprs[expr.0 as usize]
+    }
+
+    /// The length that the array length `len` holds, which inference has made known.
+    fn len(&self, len: Ty) -> Result<i64> {
+        match self.cx.types.len(len) {
+            Some(len) => Ok(len as i64),
+            None => bail!("an array whose length is not known"),
+        }
     }
 
     fn repr_of(&mut self, expr: ExprId) -> Result<Repr> {

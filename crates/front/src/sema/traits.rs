@@ -6,14 +6,14 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::body::Body;
 use crate::body::sig::{self, Generics};
 use crate::names::{ItemRef, ModRef};
-use crate::outline::item::ItemKind;
+use crate::outline::item::{Item, ItemKind};
 
 use super::Context;
 
 /// The generic parameters and where clause of a trait, in their own arena.
 pub type TraitGenerics = (Body, Generics);
 
-impl Context<'_> {
+impl<'a> Context<'a> {
     /// The generic parameters and where clause of trait `item`.
     pub fn trait_generics(&mut self, item: ItemRef) -> Result<Rc<TraitGenerics>> {
         if let Some(found) = self.trait_defs.get(&item) {
@@ -38,12 +38,23 @@ impl Context<'_> {
 
     /// The member of trait `of` named `name`.
     pub fn trait_member(&self, of: ItemRef, name: &str) -> Option<ItemRef> {
-        if of.outer().is_some() {
-            return None;
+        self.trait_items(of).find(|member| self.name(*member) == name)
+    }
+
+    fn trait_items(&self, of: ItemRef) -> impl Iterator<Item = ItemRef> + 'a {
+        let items: &'a [Item] = if of.outer().is_some() { &[] } else { &self.file(of).items.items };
+        (0..items.len() as u32).filter(move |&at| items[at as usize].parent == Some(of.item)).map(move |at| ItemRef { item: at, ..of })
+    }
+
+    /// The methods of trait `of` in vtable order: each one that takes `self` and has no type parameters of its own, and none for the rest.
+    pub fn vtable_methods(&mut self, of: ItemRef) -> Result<Vec<Option<ItemRef>>> {
+        let mut methods = Vec::new();
+        for member in self.trait_items(of).filter(|member| self.item(*member).1.kind == ItemKind::Fn).collect::<Vec<_>>() {
+            let sig = self.signature(member)?;
+            let callable = sig.receiver.is_some() && super::infer::type_params(&sig.generics).next().is_none();
+            methods.push(callable.then_some(member));
         }
-        let items = &self.file(of).items.items;
-        let members = (0..items.len() as u32).filter(|&at| items[at as usize].parent == Some(of.item));
-        members.map(|at| ItemRef { item: at, ..of }).find(|member| self.name(*member) == name)
+        Ok(methods)
     }
 
     /// The traits in scope in module `home`.
@@ -67,14 +78,15 @@ impl Context<'_> {
 
     /// The item that `#[lang = "name"]` marks in the standard crates.
     pub fn lang_item(&mut self, name: &str) -> Option<ItemRef> {
-        if let Some(table) = &self.langs {
+        if let Some((table, partial)) = &self.langs {
+            self.asks.crates.borrow_mut().extend(partial.iter().copied());
             return table.get(name).copied();
         }
-        let mut table = HashMap::default();
+        let (mut table, mut partial) = (HashMap::default(), Vec::new());
         for krate in self.primitive_holders() {
             let tree = &self.outline.crates[krate as usize];
             if tree.partial() {
-                self.asks.crates.borrow_mut().push(krate);
+                partial.push(krate);
             }
             for (file, items) in tree.files.iter().map(|file| &file.items.items).enumerate() {
                 for at in 0..items.len() {
@@ -86,7 +98,8 @@ impl Context<'_> {
             }
         }
         let found = table.get(name).copied();
-        self.langs = Some(Rc::new(table));
+        self.asks.crates.borrow_mut().extend(partial.iter().copied());
+        self.langs = Some((Rc::new(table), partial.into()));
         found
     }
 }

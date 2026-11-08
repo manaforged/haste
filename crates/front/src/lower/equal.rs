@@ -26,7 +26,8 @@ impl Lower<'_, '_> {
     fn equal_parts(&mut self, ty: Ty, kind: Kind, x: Value, y: Value) -> Result<Value> {
         let fields = match kind {
             Kind::Array(element, count) => {
-                let count = self.ins().iconst(Type::I64, count as i64);
+                let count = self.len(count)?;
+                let count = self.ins().iconst(Type::I64, count);
                 return self.equal_items(element, (x, y), count);
             }
             Kind::Tuple(items) => items,

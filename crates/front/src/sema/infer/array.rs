@@ -4,7 +4,7 @@ use crate::body::{ExprId, List};
 use crate::names::Primitive;
 
 use super::super::ty::{Kind, Ty};
-use super::Infer;
+use super::{Infer, Res};
 
 impl Infer<'_, '_> {
     /// Infers the array expression `[items]`.
@@ -18,7 +18,7 @@ impl Infer<'_, '_> {
             let found = self.expr(ExprId(item), Some(element))?;
             self.coerce_expr(ExprId(item), found, element)?;
         }
-        Ok(self.cx.types.intern(Kind::Array(element, items.len() as u64)))
+        Ok(self.cx.types.array(element, items.len() as u64))
     }
 
     /// Infers the repeat expression `[value; len]`.
@@ -35,20 +35,50 @@ impl Infer<'_, '_> {
             }
             None => found,
         };
-        let count = self.const_len(self.body, len)?;
+        let count = self.const_arg(self.body, len)?;
         Ok(self.cx.types.intern(Kind::Array(element, count)))
     }
 
-    /// Infers the builtin index `base[index]` of an array or slice, through references.
-    pub fn index_expr(&mut self, base: ExprId, index: ExprId) -> Result<Ty> {
+    /// Infers the index `expr` of `base` by `index`, through the autoderef steps of `base`: the builtin index of an array or slice by an integer, or `Index::index`.
+    pub fn index_expr(&mut self, expr: ExprId, base: ExprId, index: ExprId) -> Result<Ty> {
         let found = self.expr(base, None)?;
+        let at = self.expr(index, None)?;
+        let (mut step, mut steps) = (self.resolve(found), 0);
+        loop {
+            if let Some(ty) = self.index_step(expr, step, at)? {
+                if steps > 0 {
+                    self.out.autoderefs.insert(expr, steps);
+                }
+                return Ok(ty);
+            }
+            let next = match self.cx.types.kind(step) {
+                Kind::Ptr(..) | Kind::Var(_) => None,
+                _ => match self.builtin_deref(step) {
+                    Some(inner) => Some(inner),
+                    None => self.deref_step(expr, steps, step)?,
+                },
+            };
+            let Some(next) = next else { bail!("cannot index {} by {}", self.show(found), self.show(at)) };
+            (step, steps) = (self.resolve(next), steps + 1);
+        }
+    }
+
+    fn index_step(&mut self, expr: ExprId, step: Ty, at: Ty) -> Result<Option<Ty>> {
         let usize_ty = self.cx.types.prim(Primitive::Usize);
-        let at = self.expr(index, Some(usize_ty))?;
-        let element = match self.cx.types.kind(self.autoderef(found)).clone() {
-            Kind::Array(element, _) | Kind::Slice(element) => element,
-            _ => bail!("indexing {} through the Index trait is not supported yet", self.show(found)),
-        };
-        self.coerce(at, usize_ty)?;
-        Ok(element)
+        if let Kind::Array(element, _) | Kind::Slice(element) = *self.cx.types.kind(step)
+            && matches!(self.cx.types.kind(self.resolve(at)), Kind::IntVar(_) | Kind::Prim(Primitive::Usize))
+        {
+            self.coerce(at, usize_ty)?;
+            return Ok(Some(element));
+        }
+        let Some(of) = self.cx.lang_item("index") else { bail!("core has no `Index` trait") };
+        let saved = self.vars.clone();
+        if self.select(of, step, &[at])?.is_none() {
+            self.vars = saved;
+            return Ok(None);
+        }
+        let Some(method) = self.cx.trait_member(of, "index") else { bail!("`Index` has no `index`") };
+        self.out.operators.insert(expr, Res::Fn(method, vec![step, at]));
+        self.project(of, step, vec![at], "Output").map(Some)
     }
 }

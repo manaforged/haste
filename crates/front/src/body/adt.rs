@@ -42,6 +42,13 @@ pub struct AdtDef {
     pub variants: Vec<VariantDef>,
 }
 
+impl AdtDef {
+    /// The position among the variants that are configured in of the variant whose declaration index is `index`.
+    pub fn position(&self, index: u32) -> Option<usize> {
+        self.variants.iter().position(|variant| variant.index == index)
+    }
+}
+
 /// Parses the struct, union or enum whose name is token `name`, reading no further than `to`.
 pub fn adt(src: &Source, name: u32, to: u32, is_enum: bool) -> Result<AdtDef> {
     let mut cursor = Cursor::new(src, name + 1, to);

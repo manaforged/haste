@@ -17,6 +17,13 @@ pub struct Asks {
     pub scopes: RefCell<Vec<ModRef>>,
 }
 
+impl Asks {
+    /// How many lookups have asked for something so far.
+    pub fn count(&self) -> usize {
+        self.modules.borrow().len() + self.names.borrow().len() + self.crates.borrow().len() + self.scopes.borrow().len()
+    }
+}
+
 /// What path resolution in one crate can see.
 pub struct Paths<'a> {
     pub krate: u32,

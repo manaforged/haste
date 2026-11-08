@@ -1,14 +1,15 @@
-use anyhow::{Result, anyhow, bail};
+use std::rc::Rc;
+
+use anyhow::{Result, anyhow};
 use rustc_abi::{Integer, IntegerType, LayoutCalculator, ReprFlags, ReprOptions, TargetDataLayout};
 use rustc_index::IndexVec;
 
-use crate::body::{Expr, Lit, UnOp};
 use crate::names::{ItemRef, Primitive};
 use crate::outline::attr::split_commas;
 use crate::outline::item::{Attr, ItemKind};
 
 use super::Context;
-use super::infer::{field_types, parse_int};
+use super::infer::field_types;
 use super::layout::{Field, Layout, Variant};
 
 const REPR_INTS: [(&str, Primitive); 12] = {
@@ -18,26 +19,14 @@ const REPR_INTS: [(&str, Primitive); 12] = {
 
 impl Context<'_> {
     /// The discriminant of each variant of the enum `item`: its written value, or one more than the previous.
-    pub fn discriminants(&mut self, item: ItemRef) -> Result<Vec<i128>> {
-        let def = self.adt_def(item)?;
-        let src = &self.file(item).source;
-        let mut next = 0_i128;
-        let mut values = Vec::with_capacity(def.variants.len());
-        for variant in &def.variants {
-            if let Some(expr) = variant.discriminant {
-                next = match *def.body.expr(expr) {
-                    Expr::Lit(Lit::Int, at) => parse_int(src.text(at))?.0 as i128,
-                    Expr::Unary(UnOp::Neg, inner) => match *def.body.expr(inner) {
-                        Expr::Lit(Lit::Int, at) => -(parse_int(src.text(at))?.0 as i128),
-                        _ => bail!("discriminants other than literals are not supported yet"),
-                    },
-                    _ => bail!("discriminants other than literals are not supported yet"),
-                };
-            }
-            values.push(next);
-            next = next.wrapping_add(1);
+    pub fn discriminants(&mut self, item: ItemRef) -> Result<Rc<[i128]>> {
+        if let Some(found) = self.discriminants.get(&item) {
+            return Ok(found.clone());
         }
-        Ok(values)
+        let primitive = self.repr(item).int.map_or(Primitive::Isize, repr_primitive);
+        let found: Rc<[i128]> = super::infer::discriminants(self, item, primitive)?.into();
+        self.discriminants.insert(item, found.clone());
+        Ok(found)
     }
 
     /// The `#[repr]` options of `item`.
@@ -86,14 +75,19 @@ impl Context<'_> {
         let result = match kind {
             ItemKind::Union => calc.layout_of_union(&repr, &variants),
             _ => {
-                let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { vec![0] };
+                let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { Rc::from([0]) };
                 let no_niche = matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned"));
-                let tagged = discriminants.into_iter().enumerate().map(|(at, value)| (rustc_index::Idx::new(at), value));
+                let tagged = discriminants.iter().enumerate().map(|(at, &value)| (rustc_index::Idx::new(at), value));
                 calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, no_niche, |min, max| discr_range(&dl, &repr, min, max), tagged, true)
             }
         };
         result.map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))
     }
+}
+
+/// The integer type that the `#[repr]` integer `int` names.
+pub(super) fn repr_primitive(int: IntegerType) -> Primitive {
+    REPR_INTS.iter().map(|(_, primitive)| *primitive).find(|primitive| integer_type(*primitive) == int).unwrap_or(Primitive::Isize)
 }
 
 fn integer_type(primitive: Primitive) -> IntegerType {

@@ -21,17 +21,63 @@ pub enum Kind {
     Tuple(Vec<Ty>),
     Ref(Mut, Ty),
     Ptr(Mut, Ty),
-    Array(Ty, u64),
+    /// An array of `0` whose length is the const value `1`.
+    Array(Ty, Ty),
     Slice(Ty),
     Adt(ItemRef, Vec<Ty>),
     FnDef(ItemRef, Vec<Ty>),
     FnPtr(Vec<Ty>, Ty),
+    /// The closure expression `2` of the body of `0` at type arguments `1`.
+    Closure(ItemRef, Vec<Ty>, u32),
+    /// A trait object of the trait `0` at trait arguments `1`.
+    Dyn(ItemRef, Vec<Ty>),
     Pat(Ty, u128, u128),
+    /// The value of a const generic argument, as the bits of its type.
+    Value(u128),
     Param(u32),
     Var(u32),
     IntVar(u32),
     FloatVar(u32),
     Error,
+}
+
+impl Kind {
+    /// The types directly inside this shape.
+    pub fn children(&self) -> impl Iterator<Item = Ty> + '_ {
+        let (items, last): (&[Ty], Option<&Ty>) = match self {
+            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Dyn(_, items) => (items, None),
+            Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => (std::slice::from_ref(inner), None),
+            Kind::Array(inner, len) => (std::slice::from_ref(inner), Some(len)),
+            Kind::FnPtr(params, ret) => (params, Some(ret)),
+            _ => (&[], None),
+        };
+        items.iter().chain(last).copied()
+    }
+
+    /// This shape with each type directly inside it replaced by `f` of that type.
+    pub fn map(self, mut f: impl FnMut(Ty) -> Ty) -> Kind {
+        match self {
+            Kind::Tuple(items) => Kind::Tuple(items.into_iter().map(&mut f).collect()),
+            Kind::Ref(mutable, inner) => Kind::Ref(mutable, f(inner)),
+            Kind::Ptr(mutable, inner) => Kind::Ptr(mutable, f(inner)),
+            Kind::Array(inner, len) => Kind::Array(f(inner), f(len)),
+            Kind::Slice(inner) => Kind::Slice(f(inner)),
+            Kind::Adt(item, args) => Kind::Adt(item, args.into_iter().map(&mut f).collect()),
+            Kind::FnDef(item, args) => Kind::FnDef(item, args.into_iter().map(&mut f).collect()),
+            Kind::Dyn(of, args) => Kind::Dyn(of, args.into_iter().map(&mut f).collect()),
+            Kind::FnPtr(params, ret) => {
+                let params = params.into_iter().map(&mut f).collect();
+                Kind::FnPtr(params, f(ret))
+            }
+            Kind::Pat(base, start, end) => Kind::Pat(f(base), start, end),
+            other => other,
+        }
+    }
+
+    /// Whether a value of this shape has no size known before it runs, so a pointer to it carries metadata.
+    pub fn is_unsized(&self) -> bool {
+        matches!(self, Kind::Slice(_) | Kind::Prim(Primitive::Str) | Kind::Dyn(..))
+    }
 }
 
 /// The type interner.
@@ -73,6 +119,20 @@ impl Types {
         self.prim(Primitive::Bool)
     }
 
+    /// The array of `element` with the known length `len`.
+    pub fn array(&mut self, element: Ty, len: u64) -> Ty {
+        let len = self.intern(Kind::Value(u128::from(len)));
+        self.intern(Kind::Array(element, len))
+    }
+
+    /// The length that the const value `len` of an array type holds, once it is known.
+    pub fn len(&self, len: Ty) -> Option<u64> {
+        match *self.kind(len) {
+            Kind::Value(bits) => u64::try_from(bits).ok(),
+            _ => None,
+        }
+    }
+
     /// Whether `ty` is `()`.
     pub fn is_unit(&self, ty: Ty) -> bool {
         matches!(self.kind(ty), Kind::Tuple(items) if items.is_empty())
@@ -80,20 +140,9 @@ impl Types {
 
     /// `ty` with every `Param(i)` replaced by `substs[i]`.
     pub fn subst(&mut self, ty: Ty, substs: &[Ty]) -> Ty {
-        let kind = self.kind(ty).clone();
-        let map = |types: &mut Types, items: &[Ty]| items.iter().map(|item| types.subst(*item, substs)).collect::<Vec<_>>();
-        let kind = match kind {
+        let kind = match self.kind(ty).clone() {
             Kind::Param(index) => return substs.get(index as usize).copied().unwrap_or(ty),
-            Kind::Tuple(items) => Kind::Tuple(map(self, &items)),
-            Kind::Ref(mutable, inner) => Kind::Ref(mutable, self.subst(inner, substs)),
-            Kind::Ptr(mutable, inner) => Kind::Ptr(mutable, self.subst(inner, substs)),
-            Kind::Array(inner, len) => Kind::Array(self.subst(inner, substs), len),
-            Kind::Slice(inner) => Kind::Slice(self.subst(inner, substs)),
-            Kind::Adt(item, args) => Kind::Adt(item, map(self, &args)),
-            Kind::FnDef(item, args) => Kind::FnDef(item, map(self, &args)),
-            Kind::FnPtr(params, ret) => Kind::FnPtr(map(self, &params), self.subst(ret, substs)),
-            Kind::Pat(base, start, end) => Kind::Pat(self.subst(base, substs), start, end),
-            other => return self.intern(other),
+            other => other.map(|item| self.subst(item, substs)),
         };
         self.intern(kind)
     }

@@ -26,7 +26,12 @@ pub fn position(at: usize, count: usize, rest: Option<usize>, fields: usize) -> 
 /// The items of pattern list `list` in `body`, and where its one `..` is.
 pub fn rest_split(body: &Body, list: List) -> Result<(Vec<PatId>, Option<usize>)> {
     let pats: Vec<PatId> = body.list(list).iter().map(|&at| PatId(at)).collect();
-    let rests: Vec<usize> = pats.iter().enumerate().filter(|(_, pat)| matches!(body.pat(**pat), Pat::Rest)).map(|(at, _)| at).collect();
+    let is_rest = |pat: PatId| match *body.pat(pat) {
+        Pat::Rest => true,
+        Pat::Bind { sub: Some(sub), .. } => matches!(body.pat(sub), Pat::Rest),
+        _ => false,
+    };
+    let rests: Vec<usize> = pats.iter().enumerate().filter(|(_, pat)| is_rest(**pat)).map(|(at, _)| at).collect();
     match rests[..] {
         [] => Ok((pats, None)),
         [at] => Ok((pats, Some(at))),
@@ -50,6 +55,7 @@ impl Infer<'_, '_> {
             Pat::Lit(expr) => self.value_pat(expr, ty),
             Pat::Range { from, to, .. } => from.into_iter().chain(to).try_for_each(|end| self.value_pat(end, ty)),
             Pat::Tuple(list) => self.tuple_pat(list, ty, mode),
+            Pat::Slice(list) => self.slice_pat(list, ty, mode),
             Pat::Ref { mutable, pat: inner } => self.ref_pat(inner, mutable, ty),
             Pat::Path(path) => self.path_pat(pat, path, ty),
             Pat::TupleStruct(path, list) => self.variant_pat(pat, path, ty, (list, mode)),
@@ -134,6 +140,32 @@ impl Infer<'_, '_> {
         self.positional(&pats, rest, &items, mode)
     }
 
+    fn slice_pat(&mut self, list: List, ty: Ty, mode: Mode) -> Result<()> {
+        let (pats, rest) = rest_split(self.body, list)?;
+        let element = self.slice_element(ty, pats.len() - usize::from(rest.is_some()), rest.is_some())?;
+        for (at, &pat) in pats.iter().enumerate() {
+            match Some(at) == rest {
+                true if !matches!(self.body.pat(pat), Pat::Rest) => bail!("a binding of the rest of a slice is not supported yet"),
+                true => {}
+                false => self.pat(pat, element, mode)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn slice_element(&mut self, ty: Ty, given: usize, rest: bool) -> Result<Ty> {
+        let (element, len) = match *self.cx.types.kind(ty) {
+            Kind::Slice(element) => return Ok(element),
+            Kind::Array(element, len) => (element, self.cx.types.len(len)),
+            _ => bail!("slice pattern on {}", self.show(ty)),
+        };
+        match len {
+            Some(len) if given as u64 > len || (!rest && given as u64 != len) => bail!("pattern has {given} elements, the array has {len}"),
+            Some(_) => Ok(element),
+            None => bail!("a slice pattern on an array of unknown length"),
+        }
+    }
+
     fn positional(&mut self, pats: &[PatId], rest: Option<usize>, items: &[Ty], mode: Mode) -> Result<()> {
         let given = pats.len() - usize::from(rest.is_some());
         if given > items.len() || (rest.is_none() && given != items.len()) {
@@ -204,8 +236,7 @@ impl Infer<'_, '_> {
         let found = paths.first(sym, self.home, &path).values.map(|binding| binding.def);
         let (item, variant) = match found {
             Some(crate::names::Def::Variant(item, index)) => {
-                let def = self.cx.adt_def(item)?;
-                let Some(at) = def.variants.iter().position(|variant| variant.index == index) else { return Ok(None) };
+                let Some(at) = self.cx.adt_def(item)?.position(index) else { return Ok(None) };
                 (item, at as u32)
             }
             Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Struct => (item, 0),

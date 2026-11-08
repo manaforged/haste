@@ -33,6 +33,8 @@ pub enum Intrinsic {
     Trap,
     SizeOf,
     AlignOf,
+    SizeOfVal,
+    AlignOfVal,
     NeedsDrop,
     NoOp,
     BlackBox,
@@ -40,6 +42,7 @@ pub enum Intrinsic {
     OffsetFrom(bool),
     Read,
     Write,
+    WriteBox,
     MemCopy(bool),
     WriteBytes,
     Unchecked(BinOp),
@@ -48,7 +51,7 @@ pub enum Intrinsic {
     RawPointer,
 }
 
-const NAMES: [(&str, Intrinsic); 74] = {
+const NAMES: [(&str, Intrinsic); 78] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -102,6 +105,9 @@ const NAMES: [(&str, Intrinsic); 74] = {
         ("align_of", AlignOf),
         ("min_align_of", AlignOf),
         ("pref_align_of", AlignOf),
+        ("size_of_val", SizeOfVal),
+        ("align_of_val", AlignOfVal),
+        ("min_align_of_val", AlignOfVal),
         ("needs_drop", NeedsDrop),
         ("forget", NoOp),
         ("assert_inhabited", NoOp),
@@ -116,6 +122,7 @@ const NAMES: [(&str, Intrinsic); 74] = {
         ("volatile_load", Read),
         ("write_via_move", Write),
         ("volatile_store", Write),
+        ("write_box_via_move", WriteBox),
         ("copy_nonoverlapping", MemCopy(false)),
         ("copy", MemCopy(true)),
         ("write_bytes", WriteBytes),

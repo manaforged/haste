@@ -16,32 +16,38 @@ impl Infer<'_, '_> {
         let entry = body.path(path);
         let Some((&last, prefix)) = body.list(entry.segments).split_last() else { return Ok(None) };
         let name = plain(self.src.text(body.segments[last as usize].name));
+        let given = self.segment_args(body, path, prefix.len() + 1)?;
         let owner = match entry.qself {
             Some((ty, Some(trait_path))) if prefix.is_empty() => {
                 let self_ty = self.lower_ty(body, ty)?;
                 let Some(of) = self.trait_named(body, trait_path, self.home) else { bail!("`as` names something that is not a trait") };
-                return self.trait_value(of, Some(self_ty), name).map(Some);
+                return self.trait_value(of, (Some(self_ty), None), (name, given)).map(Some);
             }
             Some((ty, None)) if prefix.is_empty() => self.lower_ty(body, ty)?,
             None if !prefix.is_empty() => {
                 if let Some(of) = self.prefix_trait(path, prefix.len()) {
-                    return self.trait_value(of, None, name).map(Some);
+                    return self.trait_value(of, (None, None), (name, given)).map(Some);
+                }
+                if let [first] = prefix
+                    && let Some(found) = self.param_value(plain(self.src.text(body.segments[*first as usize].name)), (name, given.clone()))?
+                {
+                    return Ok(Some(found));
                 }
                 let Ok(ty) = self.named_ty(body, path, prefix.len(), true) else { return Ok(None) };
                 ty
             }
             _ => return Ok(None),
         };
-        self.type_value(owner, name).map(Some)
+        self.type_value(owner, (name, given)).map(Some)
     }
 
-    fn type_value(&mut self, owner: Ty, name: &str) -> Result<(Ty, Res)> {
+    fn type_value(&mut self, owner: Ty, (name, given): (&str, Vec<Ty>)) -> Result<(Ty, Res)> {
         if let Some((member, args)) = self.inherent_member(owner, name)? {
-            return self.member_value(member, args);
+            return self.member_value(member, args, given);
         }
         for of in self.cx.traits_in_scope(self.home) {
             if self.cx.trait_member(of, name).is_some() && self.implements(of, owner)? {
-                return self.trait_value(of, Some(owner), name);
+                return self.trait_value(of, (Some(owner), None), (name, given));
             }
         }
         bail!("no associated item `{name}` on {}", self.show(owner))
@@ -59,7 +65,7 @@ impl Infer<'_, '_> {
     fn implements(&mut self, of: ItemRef, ty: Ty) -> Result<bool> {
         let saved = self.vars.clone();
         let args = self.fresh_trait_args(of)?;
-        let found = self.select(of, ty, &args)?.is_some();
+        let found = self.may_implement(of, ty, &args)?;
         self.vars = saved;
         Ok(found)
     }
@@ -69,17 +75,27 @@ impl Infer<'_, '_> {
         Ok((0..count).map(|_| self.fresh(Kind::Var)).collect())
     }
 
-    fn trait_value(&mut self, of: ItemRef, self_ty: Option<Ty>, name: &str) -> Result<(Ty, Res)> {
+    fn param_value(&mut self, param: &str, (name, given): (&str, Vec<Ty>)) -> Result<Option<(Ty, Res)>> {
+        let Some(ty) = self.param_ty(param).filter(|_| param != "Self") else { return Ok(None) };
+        let Some((of, args)) = self.bound_trait((param, ty), name, |infer, of, name| infer.cx.trait_member(of, name).is_some())? else { return Ok(None) };
+        self.trait_value(of, (Some(ty), Some(args)), (name, given)).map(Some)
+    }
+
+    fn trait_value(&mut self, of: ItemRef, (self_ty, args): (Option<Ty>, Option<Vec<Ty>>), (name, given): (&str, Vec<Ty>)) -> Result<(Ty, Res)> {
         let Some(member) = self.cx.trait_member(of, name) else { bail!("trait `{}` has no item `{name}`", self.cx.name(of)) };
         let self_ty = self_ty.unwrap_or_else(|| self.fresh(Kind::Var));
         let mut outer = vec![self_ty];
-        outer.extend(self.fresh_trait_args(of)?);
-        self.member_value(member, outer)
+        match args {
+            Some(args) => outer.extend(args),
+            None => outer.extend(self.fresh_trait_args(of)?),
+        }
+        self.obligations.push((of, outer.clone()));
+        self.member_value(member, outer, given)
     }
 
-    fn member_value(&mut self, member: ItemRef, outer: Vec<Ty>) -> Result<(Ty, Res)> {
+    fn member_value(&mut self, member: ItemRef, outer: Vec<Ty>, given: Vec<Ty>) -> Result<(Ty, Res)> {
         match self.cx.item(member).1.kind {
-            ItemKind::Fn => self.fn_item(member, outer),
+            ItemKind::Fn => self.fn_item(member, outer, given),
             ItemKind::Const => self.const_item(member, outer),
             other => bail!("associated {other:?} values are not supported yet"),
         }

@@ -7,7 +7,6 @@ use crate::names::{Def, ItemRef, plain};
 use crate::outline::item::ItemKind;
 
 use super::super::ty::{Kind, Ty};
-use super::scope::{Frame, type_params};
 use super::{Infer, Res};
 
 /// A constructor that a path names: the ADT, the index of its variant, and its type arguments.
@@ -17,10 +16,8 @@ impl<'a> Infer<'_, 'a> {
     /// The field types of each variant of the struct, enum or union `item` at `args`.
     pub fn adt_fields(&mut self, item: ItemRef, args: &[Ty]) -> Result<Vec<Vec<Ty>>> {
         let def = self.cx.adt_def(item)?;
-        let file = self.cx.file(item);
-        let generics = type_params(&def.generics.params).map(|generic| file.source.text(generic.name)).zip(args.iter().copied()).collect();
         let self_ty = Some(self.cx.types.intern(Kind::Adt(item, args.to_vec())));
-        let frame = Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty, block: None };
+        let frame = self.item_frame(item, (&def.generics.params, args), (self_ty, Some(item)))?;
         self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty)).collect()).collect())
     }
 
@@ -43,8 +40,7 @@ impl<'a> Infer<'_, 'a> {
             Some(Def::Variant(item, index)) => {
                 let given = if count >= 2 { self.segment_args(arena, path, count - 1)? } else { Vec::new() };
                 let args = self.adt_args(item, given, true)?;
-                let def = self.cx.adt_def(item)?;
-                let Some(variant) = def.variants.iter().position(|variant| variant.index == index) else { bail!("variant {index} of {} is configured out", self.cx.name(item)) };
+                let variant = self.cx.variant_position(item, index)?;
                 Ok(Some((item, variant as u32, args)))
             }
             _ => Ok(None),
@@ -118,7 +114,7 @@ impl<'a> Infer<'_, 'a> {
     /// Infers the field access `expr` on `base`, through references.
     pub fn field_expr(&mut self, expr: ExprId, base: ExprId, name: &str) -> Result<Ty> {
         let found = self.expr(base, None)?;
-        let ty = self.autoderef(found);
+        let ty = self.field_base(expr, found, name)?;
         let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("no field `{name}` on {}", self.show(ty)) };
         if self.cx.item(item).1.kind == ItemKind::Enum {
             bail!("no field `{name}` on enum {}", self.cx.name(item));

@@ -19,12 +19,13 @@ pub enum Builtin {
     Cfg,
     Assert,
     FormatArgs,
+    FormatArgsNl,
     Panic,
     Unreachable,
     PatternType,
 }
 
-const BUILTINS: [(&str, Builtin); 12] = [
+const BUILTINS: [(&str, Builtin); 13] = [
     ("concat", Builtin::Concat),
     ("stringify", Builtin::Stringify),
     ("line", Builtin::Line),
@@ -34,6 +35,7 @@ const BUILTINS: [(&str, Builtin); 12] = [
     ("assert", Builtin::Assert),
     ("format_args", Builtin::FormatArgs),
     ("const_format_args", Builtin::FormatArgs),
+    ("format_args_nl", Builtin::FormatArgsNl),
     ("panic", Builtin::Panic),
     ("unreachable", Builtin::Unreachable),
     ("pattern_type", Builtin::PatternType),

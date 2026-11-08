@@ -179,13 +179,12 @@ impl<'a> Context<'a> {
     }
 
     fn index_of(&mut self, krate: u32) -> Rc<Index> {
+        let tree = &self.outline.crates[krate as usize];
+        if tree.partial() {
+            self.asks.crates.borrow_mut().push(krate);
+        }
         if let Some(found) = self.heads.get(&krate) {
             return found.clone();
-        }
-        let tree = &self.outline.crates[krate as usize];
-        let partial = tree.partial();
-        if partial {
-            self.asks.crates.borrow_mut().push(krate);
         }
         let mut index = Index::default();
         for at in 0..tree.impls.len() as u32 {

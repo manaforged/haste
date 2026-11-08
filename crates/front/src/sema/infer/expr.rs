@@ -1,10 +1,10 @@
 use anyhow::{Result, bail};
 
-use crate::body::{BinOp, Expr, ExprId, Lit, UnOp};
+use crate::body::{BinOp, Expr, ExprId, List, Lit, TyId, UnOp};
 use crate::names::Primitive;
 
 use super::super::ty::{Kind, Mut, Ty, float_bits, int_info};
-use super::{Breaks, Infer};
+use super::{Breaks, Infer, Res};
 use super::path::parse_int;
 
 impl Infer<'_, '_> {
@@ -23,23 +23,32 @@ impl Infer<'_, '_> {
             Expr::Lit(lit, at) => self.lit(lit, at),
             Expr::Path(path) => self.path_expr(expr, path),
             Expr::Paren(inner) => self.expr(inner, expected),
-            Expr::Unary(op, operand) => self.unary(op, operand, expected),
-            Expr::Binary(op, lhs, rhs) => self.binary(op, lhs, rhs, expected),
+            Expr::Unary(op, operand) => self.unary(expr, (op, operand), expected),
+            Expr::Binary(op, lhs, rhs) => self.binary(expr, op, (lhs, rhs), expected),
             Expr::Assign(lhs, rhs) => self.assign(lhs, rhs, None),
             Expr::AssignOp(op, lhs, rhs) => self.assign(lhs, rhs, Some(op)),
-            Expr::Cast(inner, ty) => {
-                self.expr(inner, None)?;
-                self.lower_ty(self.body, ty)
-            }
-            Expr::Call(callee, args) => self.call(callee, args),
-            Expr::Tuple(list) => {
-                let items = self.body.list(list).iter().map(|&item| self.expr(ExprId(item), None)).collect::<Result<Vec<_>>>()?;
-                Ok(self.cx.types.intern(Kind::Tuple(items)))
-            }
+            Expr::Cast(inner, ty) => self.cast(inner, ty),
+            Expr::Call(callee, args) => self.call(expr, callee, args),
+            Expr::Closure { params, ret, body, capture } => self.closure_expr(expr, (params, ret, body, capture), expected),
+            Expr::Tuple(list) => self.tuple(list),
             Expr::Ref { mutable, raw, expr: inner } => self.reference(inner, (mutable, raw), expected),
-            Expr::TupleField(base, index) => self.tuple_field(base, index),
+            Expr::TupleField(base, index) => self.tuple_field(expr, base, index),
             _ => self.flow(expr, expected),
         }
+    }
+
+    fn cast(&mut self, inner: ExprId, ty: TyId) -> Result<Ty> {
+        let found = self.expr(inner, None)?;
+        let target = self.lower_ty(self.body, ty)?;
+        if let Some(coercion) = self.coercion(found, target)? {
+            self.out.coercions.insert(inner, coercion);
+        }
+        Ok(target)
+    }
+
+    fn tuple(&mut self, list: List) -> Result<Ty> {
+        let items = self.body.list(list).iter().map(|&item| self.expr(ExprId(item), None)).collect::<Result<Vec<_>>>()?;
+        Ok(self.cx.types.intern(Kind::Tuple(items)))
     }
 
     fn reference(&mut self, inner: ExprId, (mutable, raw): (bool, bool), expected: Option<Ty>) -> Result<Ty> {
@@ -48,24 +57,16 @@ impl Infer<'_, '_> {
             _ => None,
         });
         let ty = self.expr(inner, pointee)?;
+        if mutable {
+            self.note_mut(inner)?;
+        }
         let mutability = if mutable { Mut::Mut } else { Mut::Not };
         Ok(self.cx.types.intern(if raw { Kind::Ptr(mutability, ty) } else { Kind::Ref(mutability, ty) }))
     }
 
-    /// `ty` with every outer reference followed, as field access sees it.
-    pub fn autoderef(&self, mut ty: Ty) -> Ty {
-        loop {
-            ty = self.resolve(ty);
-            match self.cx.types.kind(ty) {
-                Kind::Ref(_, inner) => ty = *inner,
-                _ => return ty,
-            }
-        }
-    }
-
-    fn tuple_field(&mut self, base: ExprId, index: u32) -> Result<Ty> {
+    fn tuple_field(&mut self, expr: ExprId, base: ExprId, index: u32) -> Result<Ty> {
         let found = self.expr(base, None)?;
-        let ty = self.autoderef(found);
+        let ty = self.field_base(expr, found, &index.to_string())?;
         match self.cx.types.kind(ty).clone() {
             Kind::Tuple(items) if (index as usize) < items.len() => Ok(items[index as usize]),
             Kind::Adt(item, args) if self.cx.item(item).1.kind == crate::outline::item::ItemKind::Struct => {
@@ -112,7 +113,7 @@ impl Infer<'_, '_> {
             Lit::ByteStr => {
                 let len = crate::body::literal::string_bytes(text)?.len() as u64;
                 let byte = self.cx.types.prim(Primitive::U8);
-                let array = self.cx.types.intern(Kind::Array(byte, len));
+                let array = self.cx.types.array(byte, len);
                 self.cx.types.intern(Kind::Ref(Mut::Not, array))
             }
             other => bail!("unsupported literal {other:?}"),
@@ -136,14 +137,10 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn unary(&mut self, op: UnOp, operand: ExprId, expected: Option<Ty>) -> Result<Ty> {
+    fn unary(&mut self, expr: ExprId, (op, operand): (UnOp, ExprId), expected: Option<Ty>) -> Result<Ty> {
         if op == UnOp::Deref {
             let found = self.expr(operand, None)?;
-            let ty = self.resolve(found);
-            return match self.cx.types.kind(ty) {
-                Kind::Ref(_, inner) | Kind::Ptr(_, inner) => Ok(*inner),
-                _ => bail!("cannot dereference {}", self.show(ty)),
-            };
+            return self.deref(expr, found);
         }
         let ty = self.expr(operand, expected)?;
         match op {
@@ -152,22 +149,42 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn binary(&mut self, op: BinOp, lhs: ExprId, rhs: ExprId, expected: Option<Ty>) -> Result<Ty> {
+    fn binary(&mut self, expr: ExprId, op: BinOp, (lhs, rhs): (ExprId, ExprId), expected: Option<Ty>) -> Result<Ty> {
         if matches!(op, BinOp::And | BinOp::Or) {
             return self.logical(lhs, rhs);
         }
-        let compare = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
-        let left = self.expr(lhs, if compare { None } else { expected })?;
-        if matches!(op, BinOp::Shl | BinOp::Shr) {
+        let left = self.expr(lhs, if is_compare(op) { None } else { expected })?;
+        self.right_operand(expr, op, (left, rhs))
+    }
+
+    fn right_operand(&mut self, expr: ExprId, op: BinOp, (left, rhs): (Ty, ExprId)) -> Result<Ty> {
+        let compare = is_compare(op);
+        let builtin = self.is_scalar(left) || compare && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..));
+        if builtin && matches!(op, BinOp::Shl | BinOp::Shr) {
             return self.shift(left, rhs);
         }
-        let right = self.expr(rhs, Some(left))?;
-        let pointers = compare && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..));
-        if !self.is_scalar(left) && !pointers {
+        let right = self.expr(rhs, (builtin || compare).then_some(left))?;
+        if builtin && !matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..)) {
+            self.unify(left, right)?;
+            return Ok(if compare { self.cx.types.bool() } else { left });
+        }
+        self.overloaded(expr, op, (left, right))
+    }
+
+    fn overloaded(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
+        let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
+        let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
+        let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
+        let saved = self.vars.clone();
+        if self.has_vars(left) || self.select(of, left, &[right])?.is_none() {
+            self.vars = saved;
             bail!("unsupported operator {op:?} on {}", self.show(left));
         }
-        self.unify(left, right)?;
-        Ok(if compare { self.cx.types.bool() } else { left })
+        self.out.operators.insert(expr, Res::Fn(method, vec![left, right]));
+        match is_compare(op) {
+            true => Ok(self.cx.types.bool()),
+            false => self.project(of, left, vec![right], "Output"),
+        }
     }
 
     fn logical(&mut self, lhs: ExprId, rhs: ExprId) -> Result<Ty> {
@@ -196,6 +213,7 @@ impl Infer<'_, '_> {
 
     fn assign(&mut self, lhs: ExprId, rhs: ExprId, op: Option<BinOp>) -> Result<Ty> {
         let place = self.expr(lhs, None)?;
+        self.note_mut(lhs)?;
         let value = self.expr(rhs, Some(place))?;
         match op {
             Some(BinOp::Shl | BinOp::Shr) => {}
@@ -205,11 +223,19 @@ impl Infer<'_, '_> {
         Ok(self.cx.types.unit())
     }
 
-    fn call(&mut self, callee: ExprId, args: crate::body::List) -> Result<Ty> {
-        let callee_ty = self.expr(callee, None)?;
-        let (params, ret) = match self.cx.types.kind(self.resolve(callee_ty)).clone() {
-            Kind::FnDef(item, substs) => self.fn_types(item, &substs)?,
-            Kind::FnPtr(params, ret) => (params, ret),
+    fn call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Ty> {
+        let found = self.expr(callee, None)?;
+        let callee_ty = self.callee_base(expr, found);
+        let (params, ret, def) = match self.cx.types.kind(callee_ty).clone() {
+            Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
+            Kind::FnDef(item, substs) => {
+                if matches!(self.out.res.get(&callee), Some(Res::Local(_))) {
+                    self.out.res.insert(expr, Res::Fn(item, substs.clone()));
+                }
+                let (params, ret) = self.fn_types(item, &substs)?;
+                (params, ret, Some((item, substs)))
+            }
+            Kind::FnPtr(params, ret) => (params, ret, None),
             _ => bail!("calling {} is not supported yet", self.show(callee_ty)),
         };
         let args = self.body.list(args).to_vec();
@@ -217,8 +243,7 @@ impl Infer<'_, '_> {
             bail!("call takes {} arguments, {} given", params.len(), args.len());
         }
         for (arg, param) in args.into_iter().zip(params) {
-            let found = self.expr(ExprId(arg), Some(param))?;
-            self.coerce_expr(ExprId(arg), found, param)?;
+            self.call_arg(def.as_ref().map(|(item, substs)| (*item, &substs[..])), ExprId(arg), param)?;
         }
         Ok(ret)
     }
@@ -328,4 +353,34 @@ impl Infer<'_, '_> {
         }
         Ok(self.cx.types.intern(Kind::Never))
     }
+}
+
+/// Whether `op` compares its operands and gives a `bool`.
+pub(super) fn is_compare(op: BinOp) -> bool {
+    matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+}
+
+/// Each binary operator that a trait overloads, with the trait's lang item and its method.
+const OPERATORS: [(BinOp, &str, &str); 16] = [
+    (BinOp::Add, "add", "add"),
+    (BinOp::Sub, "sub", "sub"),
+    (BinOp::Mul, "mul", "mul"),
+    (BinOp::Div, "div", "div"),
+    (BinOp::Rem, "rem", "rem"),
+    (BinOp::BitAnd, "bitand", "bitand"),
+    (BinOp::BitOr, "bitor", "bitor"),
+    (BinOp::BitXor, "bitxor", "bitxor"),
+    (BinOp::Shl, "shl", "shl"),
+    (BinOp::Shr, "shr", "shr"),
+    (BinOp::Eq, "eq", "eq"),
+    (BinOp::Ne, "eq", "ne"),
+    (BinOp::Lt, "partial_ord", "lt"),
+    (BinOp::Le, "partial_ord", "le"),
+    (BinOp::Gt, "partial_ord", "gt"),
+    (BinOp::Ge, "partial_ord", "ge"),
+];
+
+/// The lang item of the trait that overloads `op`, and its method.
+fn operator_trait(op: BinOp) -> Option<(&'static str, &'static str)> {
+    OPERATORS.iter().find(|(each, ..)| *each == op).map(|&(_, lang, name)| (lang, name))
 }

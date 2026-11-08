@@ -8,12 +8,17 @@ use crate::outline::item::ItemKind;
 use super::super::impls::{ImplRef, head};
 use super::super::ty::{Kind, Ty};
 use super::Infer;
-use super::scope::{Frame, type_params};
+use super::scope::{Frame, named_args, type_params};
 
 /// An impl that a trait obligation picked, with its type arguments.
 pub type Picked = (ImplRef, Vec<Ty>);
 
+type Vars = Vec<Option<Ty>>;
+
 const DEPTH: u32 = 8;
+
+/// The traits that closures, function items and function pointers implement by the compiler, with no impl to select.
+pub(super) const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
 
 const BUILTIN: [&str; 12] = ["sized", "meta_sized", "pointee_sized", "copy", "clone", "destruct", "tuple_trait", "freeze", "pointee_trait", "unsize", "sync", "unpin"];
 
@@ -24,9 +29,21 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
+        let found = self.applicable(of, self_ty, args, depth)?;
+        let Ok([(picked, vars)]) = <[_; 1]>::try_from(found) else { return Ok(None) };
+        self.vars = vars;
+        Ok(Some(picked))
+    }
+
+    /// Whether some impl of trait `of` at `args` may apply to `self_ty`, even when inference cannot pick one yet.
+    pub fn may_implement(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
+        Ok(!self.applicable(of, self_ty, args, 0)?.is_empty())
+    }
+
+    fn applicable(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
         let self_ty = self.resolve(self_ty);
         if depth > DEPTH || matches!(self.cx.types.kind(self_ty), Kind::Var(_)) {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let holders = self.holders(of, self_ty, args);
         let blocks = self.cx.trait_impls(of, head(self.cx.types.kind(self_ty)), &holders);
@@ -51,9 +68,7 @@ impl<'a> Infer<'_, 'a> {
         if found.len() > 1 {
             found.retain(|((block, _), _)| !self.cx.specializable(*block));
         }
-        let Ok([(picked, vars)]) = <[_; 1]>::try_from(found) else { return Ok(None) };
-        self.vars = vars;
-        Ok(Some(picked))
+        Ok(found)
     }
 
     fn blanket(&mut self, block: ImplRef) -> Result<bool> {
@@ -67,17 +82,13 @@ impl<'a> Infer<'_, 'a> {
         let mut crates = vec![of.krate];
         let mut stack: Vec<Ty> = std::iter::once(self_ty).chain(args.iter().copied()).collect();
         while let Some(ty) = stack.pop() {
-            match self.cx.types.kind(self.resolve(ty)).clone() {
-                Kind::Adt(item, inner) => {
-                    if !crates.contains(&item.krate) {
-                        crates.push(item.krate);
-                    }
-                    stack.extend(inner);
-                }
-                Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Array(inner, _) | Kind::Pat(inner, ..) => stack.push(inner),
-                Kind::Tuple(items) => stack.extend(items),
-                _ => {}
+            let kind = self.cx.types.kind(self.resolve(ty));
+            if let Kind::Adt(item, _) | Kind::Dyn(item, _) = kind
+                && !crates.contains(&item.krate)
+            {
+                crates.push(item.krate);
             }
+            stack.extend(kind.children());
         }
         crates
     }
@@ -101,11 +112,11 @@ impl<'a> Infer<'_, 'a> {
         Ok(Some(impl_args))
     }
 
-    fn impl_frame_of(&mut self, block: ImplRef, impl_args: &[Ty], self_ty: Option<Ty>) -> Result<Frame<'a>> {
+    pub(super) fn impl_frame_of(&mut self, block: ImplRef, impl_args: &[Ty], self_ty: Option<Ty>) -> Result<Frame<'a>> {
         let header = self.cx.impl_header(block)?;
         let file = self.cx.impl_file(block);
-        let generics = type_params(&header.generics).map(|generic| file.source.text(generic.name)).zip(impl_args.iter().copied()).collect();
-        Ok(Frame { src: &file.source, home: self.cx.impl_module(block), generics, self_ty, block: Some(block) })
+        let generics = named_args(&file.source, &header.generics, impl_args);
+        Ok(Frame { src: &file.source, home: self.cx.impl_module(block), generics, self_ty, block: Some(block), item: None })
     }
 
     /// The trait arguments of impl `block` at `impl_args`, with the trait's defaults filled in.
@@ -122,13 +133,10 @@ impl<'a> Infer<'_, 'a> {
     /// The arguments `given` to trait `of` for `self_ty`, completed with the trait's defaults.
     pub fn trait_args(&mut self, of: ItemRef, mut given: Vec<Ty>, self_ty: Ty) -> Result<Vec<Ty>> {
         let def = self.cx.trait_generics(of)?;
-        let file = self.cx.file(of);
-        let home = self.cx.module_of(of)?;
         let params: Vec<_> = type_params(&def.1.params).copied().collect();
         for param in params.iter().skip(given.len()) {
             let Some(default) = param.default else { bail!("`{}` needs {} type arguments", self.cx.name(of), params.len()) };
-            let generics = params.iter().map(|generic| file.source.text(generic.name)).zip(given.iter().copied()).collect();
-            let frame = Frame { src: &file.source, home, generics, self_ty: Some(self_ty), block: None };
+            let frame = self.item_frame(of, (&params, &given), (Some(self_ty), None))?;
             given.push(self.with_frame(frame, |infer| infer.lower_ty(&def.0, default))?);
         }
         Ok(given)
@@ -163,13 +171,31 @@ impl<'a> Infer<'_, 'a> {
         if self.cx.lang(of).is_some_and(|lang| BUILTIN.contains(&lang)) || self.cx.is_auto_trait(of) {
             return Ok(true);
         }
-        if matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
+        let kind = self.cx.types.kind(self.resolve(ty));
+        if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
             return Ok(true);
+        }
+        if self.cx.lang(of).is_some_and(|lang| CALLABLE.contains(&lang)) {
+            return Ok(matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)));
         }
         let count = arena.list(arena.path(path).segments).len();
         let given = self.segment_args(arena, path, count)?;
         let args = self.trait_args(of, given, ty)?;
+        if let Some(held) = self.object_holds(of, ty, &args) {
+            return Ok(held);
+        }
         Ok(self.select_at(of, ty, &args, depth + 1)?.is_some())
+    }
+
+    /// Whether the trait object `ty` implements trait `of` at `args`, by being an object of it, or none when `ty` is not a trait object.
+    pub(super) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
+        let Kind::Dyn(object, given) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
+        let saved = self.vars.clone();
+        let held = object == of && given.len() == args.len() && given.iter().zip(args).all(|(found, wanted)| self.unify(*found, *wanted).is_ok());
+        if !held {
+            self.vars = saved;
+        }
+        Some(held)
     }
 
     /// The trait that `path` in `arena` names from module `home`.

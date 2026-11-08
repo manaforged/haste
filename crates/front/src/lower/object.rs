@@ -1,0 +1,50 @@
+use anyhow::{Result, bail};
+use haste_codegen::{Type, Value};
+
+use crate::sema::infer::{Res, Vtable};
+
+use super::{Lower, Word};
+
+impl Lower<'_, '_> {
+    /// The address of the vtable `vtable`: the drop glue, the size, the alignment, then each method's code.
+    pub(super) fn vtable(&mut self, vtable: &Vtable) -> Result<i64> {
+        let layout = self.cx.layout(vtable.ty)?;
+        let mut words = vec![self.code_word(vtable.drop.as_ref())?, Word::Int(layout.size.bytes()), Word::Int(layout.align.abi.bytes())];
+        for method in &vtable.methods {
+            words.push(self.code_word(method.as_ref())?);
+        }
+        Ok(self.slots.table(&words))
+    }
+
+    fn code_word(&self, res: Option<&Res>) -> Result<Word> {
+        match res {
+            None => Ok(Word::Int(0)),
+            Some(Res::Fn(item, substs)) => self.reached_index(*item, substs).map(Word::Code),
+            Some(_) => bail!("a vtable entry that is not a function"),
+        }
+    }
+
+    /// Lowers a trait object method: calls slot `slot` of the receiver's vtable with the receiver's data pointer and the other arguments.
+    pub(super) fn virtual_call(&mut self, slot: u32) -> Result<()> {
+        let Some(&receiver) = self.typed.params.first() else { bail!("a trait object method with no receiver") };
+        let Some(wide) = self.locals[receiver as usize] else { bail!("a trait object receiver with no place") };
+        let pointer = self.address(wide);
+        let data = self.ins().load(Type::I64, pointer, 0);
+        let vtable = self.ins().load(Type::I64, pointer, 8);
+        let code = self.ins().load(Type::I64, vtable, slot as i32 * 8);
+        let mut values: Vec<Value> = self.sret.into_iter().chain([data]).collect();
+        for &local in &self.typed.params[1..] {
+            if let Some(place) = self.locals[local as usize] {
+                values.extend(self.read(place));
+            }
+        }
+        let signature = super::signature(self.cx, self.typed)?;
+        let returns = !signature.returns.is_empty();
+        let sig = self.b.import_signature(signature);
+        let call = self.ins().call_indirect(sig, code, &values);
+        let results: Vec<Value> = if returns { vec![self.b.inst_results(call)[0]] } else { Vec::new() };
+        self.ins().return_(&results);
+        self.close();
+        Ok(())
+    }
+}

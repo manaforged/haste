@@ -171,7 +171,7 @@ fn reach_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<(outli
     loop {
         let mut cx = sema::Context::new(&outline, &names, store);
         let reached = reach(&mut cx, &roots);
-        let done = reached.list.iter().all(|(_, typed)| typed.is_ok());
+        let done = reached.unlaid.is_empty() && reached.list.iter().all(|(_, typed)| typed.is_ok());
         let asks;
         (store, asks) = cx.release();
         if done || !names.answer(&mut outline, asks)? {
@@ -244,12 +244,12 @@ fn report_bodies(outline: &outline::Outline, threads: usize) {
             scope.spawn(|| {
                 while let Some(tree) = outline.crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                     let result = parse_bodies(tree);
-                    results.lock().map(|mut results| results.push(result)).ok();
+                    results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(result);
                 }
             });
         }
     });
-    let results = results.into_inner().unwrap_or_default();
+    let results = results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
     let parsed: usize = results.iter().map(|(parsed, _)| parsed).sum();
     let errors: Vec<&String> = results.iter().flat_map(|(_, errors)| errors).collect();
     for error in &errors {

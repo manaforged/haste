@@ -3,10 +3,12 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rustc_hash::FxHashMap as HashMap;
+
 use anyhow::{Result, anyhow, bail};
 use haste_codegen::Memory;
 
-use crate::lower::{self, Slots};
+use crate::lower::{self, Slots, Word};
 use crate::sema::Context;
 use crate::sema::reach::Reached;
 
@@ -15,6 +17,8 @@ pub struct Image {
     table: Box<[AtomicUsize]>,
     memory: Memory,
     data: RefCell<Vec<Box<[u128]>>>,
+    tables: RefCell<HashMap<Vec<Word>, i64>>,
+    fixups: RefCell<Vec<(usize, usize, usize)>>,
 }
 
 impl Slots for Image {
@@ -30,12 +34,26 @@ impl Slots for Image {
         self.data.borrow_mut().push(copy);
         address
     }
+
+    fn table(&self, words: &[Word]) -> i64 {
+        if let Some(&address) = self.tables.borrow().get(words) {
+            return address;
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|word| (if let Word::Int(value) = *word { value } else { 0 }).to_le_bytes()).collect();
+        let address = self.data(&bytes);
+        let block = self.data.borrow().len() - 1;
+        let codes = words.iter().enumerate().filter_map(|(at, word)| if let Word::Code(index) = *word { Some((block, at, index)) } else { None });
+        self.fixups.borrow_mut().extend(codes);
+        self.tables.borrow_mut().insert(words.to_vec(), address);
+        address
+    }
 }
 
 impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Image {
-        Image { table: (0..reached.list.len()).map(|_| AtomicUsize::new(0)).collect(), memory: Memory::default(), data: RefCell::default() }
+        let table = (0..reached.list.len()).map(|_| AtomicUsize::new(0)).collect();
+        Image { table, memory: Memory::default(), data: RefCell::default(), tables: RefCell::default(), fixups: RefCell::default() }
     }
 
     /// Lowers and encodes every reached function that type-checked, and returns the errors of those that did not compile, by index.
@@ -59,7 +77,18 @@ impl Image {
                 Err(error) => errors.push((index, format!("{}: {error:#}", cx.name(reached.list[index].0.0)))),
             }
         }
+        self.link();
         errors
+    }
+
+    fn link(&mut self) {
+        let data = self.data.get_mut();
+        for &(block, at, index) in self.fixups.get_mut().iter() {
+            let code = self.table[index].load(Ordering::Acquire) as u128;
+            let shift = (at % 2) * 64;
+            let cell = &mut data[block][at / 2];
+            *cell = (*cell & !(u128::from(u64::MAX) << shift)) | (code << shift);
+        }
     }
 
     fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {

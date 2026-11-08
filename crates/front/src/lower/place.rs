@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{StackSlot, Type, Value};
 
 use crate::body::{Expr, ExprId, List, UnOp};
-use crate::sema::infer::{Adjust, Res};
+use crate::sema::infer::{Adjust, Coercion, Res};
 use crate::sema::ty::{Kind, Ty};
 
 use super::{Lower, Repr, repr};
@@ -62,6 +62,45 @@ impl Lower<'_, '_> {
         }
     }
 
+    /// The place that the dereference `expr` of `operand` names: through a pointer, through the pointer that a `Box` holds, or through the reference that `Deref::deref` returns.
+    fn deref_place(&mut self, expr: ExprId, operand: ExprId) -> Result<Option<Place>> {
+        let place = self.place_or_temp(operand)?;
+        Ok(self.deref_step((expr, 0), place, self.ty_of(operand))?.map(|(place, _)| place))
+    }
+
+    /// The place and type that dereference step `step` of `expr` reaches from `place` of type `ty`: through the `Deref` call inference picked, or the builtin dereference.
+    fn deref_step(&mut self, (expr, step): (ExprId, u32), place: Option<Place>, ty: Ty) -> Result<Option<(Place, Ty)>> {
+        match self.typed.derefs.get(&(expr, step)).cloned() {
+            Some(Res::Fn(item, substs)) => {
+                let receiver = self.address_or_dangling(place, ty)?;
+                let Some(pointer) = self.invoke(item, &substs, vec![receiver])? else { return Ok(None) };
+                let index = self.reached_index(item, &substs)?;
+                let ret = self.reached.list[index].1.as_ref().ok().and_then(|callee| callee.ret);
+                let Some(Kind::Ref(_, target)) = ret.map(|ret| self.cx.types.kind(ret).clone()) else { bail!("`{}` returns no reference", self.cx.name(item)) };
+                Ok(Some((self.pointee_place(pointer, target)?, target)))
+            }
+            Some(_) => bail!("a dereference through something that is not a function"),
+            None => place.map(|place| self.step_in(place, ty)).transpose(),
+        }
+    }
+
+    /// The pointer that the value `value` of the reference, raw pointer or `Box` type `ty` holds, and its pointee.
+    pub(super) fn builtin_pointer(&mut self, value: Value, ty: Ty) -> Result<(Value, Ty)> {
+        match self.cx.types.kind(ty).clone() {
+            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => Ok((value, pointee)),
+            _ if let Some(pointee) = self.cx.boxed(ty) => {
+                let pointer = if self.is_unsized(pointee) { value } else { self.box_data(value) };
+                Ok((pointer, pointee))
+            }
+            other => bail!("dereference of {other:?}"),
+        }
+    }
+
+    /// The data pointer that the value `boxed` of a `Box` of a sized type holds.
+    pub(super) fn box_data(&mut self, boxed: Value) -> Value {
+        self.ins().load(Type::I64, boxed, 0)
+    }
+
     /// The place that `pointer` to `pointee` names, which for a slice or `str` is the wide pointer itself.
     pub(super) fn pointee_place(&mut self, pointer: Value, pointee: Ty) -> Result<Place> {
         let repr = if self.is_unsized(pointee) { super::ops::WIDE } else { repr(self.cx, pointee)? };
@@ -94,16 +133,13 @@ impl Lower<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Paren(inner) => self.place_of(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
-                Some(Res::Local(local)) => Ok(self.locals[*local as usize].map(|(slot, repr)| Place::slot(slot, repr))),
+                Some(Res::Local(local)) => Ok(self.locals[*local as usize]),
                 _ => Ok(None),
             },
-            Expr::Unary(UnOp::Deref, pointer) => match self.expr(pointer)? {
-                Some(addr) => self.pointee_place(addr, self.ty_of(expr)).map(Some),
-                None => Ok(None),
-            },
-            Expr::TupleField(base, index) => self.field_place(base, index),
+            Expr::Unary(UnOp::Deref, operand) => self.deref_place(expr, operand),
+            Expr::TupleField(base, index) => self.field_place(expr, base, index),
             Expr::Field(base, _) => match self.typed.fields.get(&expr) {
-                Some(&index) => self.field_place(base, index),
+                Some(&index) => self.field_place(expr, base, index),
                 None => bail!("field read has no field"),
             },
             Expr::Index(base, index) => self.index_place(expr, base, index),
@@ -113,7 +149,7 @@ impl Lower<'_, '_> {
 
     /// The place of `expr`, holding its value in a new frame slot when it is not a place already.
     pub fn place_or_temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
-        let widened = self.typed.unsize.contains_key(&expr);
+        let widened = self.typed.coercions.get(&expr).is_some_and(Coercion::widens);
         if !widened && let Some(place) = self.place_of(expr)? {
             return Ok(Some(place));
         }
@@ -140,15 +176,27 @@ impl Lower<'_, '_> {
         Ok(layout.fields.offset(index as usize).bytes() as i32)
     }
 
-    fn field_place(&mut self, base: ExprId, index: u32) -> Result<Option<Place>> {
+    fn field_place(&mut self, expr: ExprId, base: ExprId, index: u32) -> Result<Option<Place>> {
+        let Some((place, ty)) = self.autoderef_place(expr, base)? else { return Ok(None) };
+        self.part_place(place, ty, (0, index)).map(Some)
+    }
+
+    /// The place of `base` and its type, after the dereferences that inference recorded on `expr`.
+    pub(super) fn autoderef_place(&mut self, expr: ExprId, base: ExprId) -> Result<Option<(Place, Ty)>> {
         let Some(mut place) = self.place_or_temp(base)? else { return Ok(None) };
         let mut ty = self.ty_of(base);
-        while let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *self.cx.types.kind(ty) {
-            let Some(pointer) = self.read(place) else { bail!("reference with no value") };
-            place = self.pointee_place(pointer, inner)?;
-            ty = inner;
+        for step in 0..self.typed.autoderefs.get(&expr).copied().unwrap_or(0) {
+            let Some(next) = self.deref_step((expr, step), Some(place), ty)? else { return Ok(None) };
+            (place, ty) = next;
         }
-        self.part_place(place, ty, (0, index)).map(Some)
+        Ok(Some((place, ty)))
+    }
+
+    /// The place that the reference, raw pointer or `Box` of type `ty` at `place` points at, and its pointee type.
+    fn step_in(&mut self, place: Place, ty: Ty) -> Result<(Place, Ty)> {
+        let Some(value) = self.read(place) else { bail!("a pointer with no value") };
+        let (pointer, inner) = self.builtin_pointer(value, ty)?;
+        Ok((self.pointee_place(pointer, inner)?, inner))
     }
 
     /// The place of field `index` of variant `variant` of the tuple or ADT `ty` at `place`.
@@ -196,22 +244,21 @@ impl Lower<'_, '_> {
     }
 
     /// The receiver of a method call after `adjust`: read through its references, then borrowed or read.
-    pub fn receiver(&mut self, receiver: ExprId, adjust: Adjust) -> Result<Option<Value>> {
+    pub fn receiver(&mut self, (expr, receiver): (ExprId, ExprId), adjust: Adjust) -> Result<Option<Value>> {
         if adjust == (Adjust { derefs: 0, autoref: None }) {
             return self.expr(receiver);
         }
         let mut place = self.place_or_temp(receiver)?;
         let mut ty = self.ty_of(receiver);
-        for _ in 0..adjust.derefs {
+        for step in 0..adjust.derefs {
             if let Kind::Array(_, len) = *self.cx.types.kind(ty) {
                 let Some(_) = adjust.autoref else { bail!("a slice receiver by value") };
                 let data = self.address_or_dangling(place, ty)?;
-                return Ok(Some(self.wide_pointer(data, len as i64)));
+                let len = self.len(len)?;
+                return Ok(Some(self.wide_pointer(data, len)));
             }
-            let Kind::Ref(_, inner) = *self.cx.types.kind(ty) else { bail!("receiver deref through {:?}", self.cx.types.kind(ty)) };
-            let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
-            place = Some(self.pointee_place(pointer, inner)?);
-            ty = inner;
+            let Some((inner_place, inner)) = self.deref_step((expr, step), place, ty)? else { return Ok(None) };
+            (place, ty) = (Some(inner_place), inner);
         }
         match adjust.autoref {
             Some(_) => self.address_or_dangling(place, ty).map(Some),

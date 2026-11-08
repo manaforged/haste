@@ -93,7 +93,7 @@ impl Lower<'_, '_> {
         self.enter(pass);
     }
 
-    fn pass(&mut self, ok: Value, fail: Block) {
+    pub(super) fn pass(&mut self, ok: Value, fail: Block) {
         let pass = self.b.create_block();
         self.brif(ok, (pass, &[]), (fail, &[]));
         self.enter(pass);
@@ -103,8 +103,10 @@ impl Lower<'_, '_> {
         let derefs = self.typed.pat_derefs.get(&pat).copied().unwrap_or(0);
         for level in 0..derefs {
             let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
-            let inner = if level + 1 == derefs { self.pat_repr(pat)? } else { Repr::Scalar(Type::I64) };
-            place = Some(Place { base: Base::Addr(pointer), offset: 0, repr: inner });
+            place = Some(match level + 1 == derefs {
+                true => self.pointee_place(pointer, self.pat_ty(pat)?)?,
+                false => Place { base: Base::Addr(pointer), offset: 0, repr: Repr::Scalar(Type::I64) },
+            });
         }
         Ok(place)
     }
@@ -134,8 +136,8 @@ impl Lower<'_, '_> {
                 self.test(inner, Some(Place { base: Base::Addr(pointer), offset: 0, repr: pointee }), fail)
             }
             Pat::Or(list) => self.test_or(list, place, fail),
-            Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } => {
-                for (sub, sub_place, _) in self.parts(pat, place)? {
+            Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } | Pat::Slice(_) => {
+                for (sub, sub_place, _) in self.subpatterns(pat, place, Some(fail))? {
                     self.test(sub, sub_place, fail)?;
                 }
                 Ok(())
@@ -214,8 +216,11 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    /// The sub-patterns of a tuple, tuple-struct or struct pattern `pat`, each with the place of the field it matches.
-    fn parts(&mut self, pat: PatId, place: Option<Place>) -> Result<Vec<(PatId, Option<Place>, (u32, u32))>> {
+    /// The sub-patterns of a tuple, tuple-struct, struct or slice pattern `pat`, each with its place and the field it matches; a slice tests its length against `fail` first.
+    fn subpatterns(&mut self, pat: PatId, place: Option<Place>, fail: Option<Block>) -> Result<Vec<(PatId, Option<Place>, Option<(u32, u32)>)>> {
+        if let Pat::Slice(list) = *self.body.pat(pat) {
+            return Ok(self.slice_parts((pat, list), place, fail)?.into_iter().map(|(sub, at)| (sub, at, None)).collect());
+        }
         let ty = self.pat_ty(pat)?;
         let mut found = Vec::new();
         for (sub, (variant, index)) in self.part_indices(pat)? {
@@ -223,7 +228,7 @@ impl Lower<'_, '_> {
                 Some(place) => Some(self.part_place(place, ty, (variant, index))?),
                 None => None,
             };
-            found.push((sub, sub_place, (variant, index)));
+            found.push((sub, sub_place, Some((variant, index))));
         }
         Ok(found)
     }
@@ -270,17 +275,25 @@ impl Lower<'_, '_> {
                 let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
                 self.bind_matched(inner, Some(Place { base: Base::Addr(pointer), offset: 0, repr: pointee }), None)
             }
-            Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } => {
-                for (sub, sub_place, step) in self.parts(pat, place)? {
-                    let sub_at = at.clone().map(|(root, mut path)| {
-                        path.push(step);
-                        (root, path)
-                    });
+            Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } | Pat::Slice(_) => {
+                for (sub, sub_place, step) in self.subpatterns(pat, place, None)? {
+                    let sub_at = self.sub_at(at.clone(), step, sub)?;
                     self.bind_matched(sub, sub_place, sub_at)?;
                 }
                 Ok(())
             }
             _ => Ok(()),
+        }
+    }
+
+    fn sub_at(&mut self, at: Option<(Root, MovePath)>, step: Option<(u32, u32)>, sub: PatId) -> Result<Option<(Root, MovePath)>> {
+        match (at, step) {
+            (Some((root, mut path)), Some(step)) => {
+                path.push(step);
+                Ok(Some((root, path)))
+            }
+            (Some(_), None) if crate::sema::infer::needs_drop(self.cx, self.pat_ty(sub)?)? => bail!("moving out of an array by a slice pattern is not supported yet"),
+            _ => Ok(None),
         }
     }
 

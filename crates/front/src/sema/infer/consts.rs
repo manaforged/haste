@@ -4,7 +4,7 @@ use crate::body::{BinOp, Body, Expr, ExprId, Lit, PathId, TyId, UnOp};
 use crate::names::{Def, ItemRef, Primitive, Sym};
 use crate::outline::item::ItemKind;
 
-use super::super::ty::{Kind, int_info};
+use super::super::ty::{Kind, Ty, int_info};
 use super::Infer;
 use super::path::parse_int;
 
@@ -72,6 +72,58 @@ impl Infer<'_, '_> {
         })
     }
 
+    fn variant_value(&mut self, item: ItemRef, index: u32) -> Result<(u128, Int)> {
+        let at = self.cx.variant_position(item, index)?;
+        if !self.cx.adt_def(item)?.variants[at].fields.is_empty() {
+            bail!("a constant variant of {} that has fields", self.cx.name(item));
+        }
+        let primitive = self.cx.repr(item).int.map_or(Primitive::Isize, super::super::adt::repr_primitive);
+        let Some(int) = int_info(primitive) else { bail!("an enum tag that is not an integer") };
+        let value = self.cx.discriminants(item)?[at];
+        Ok((value as u128 & mask(int.0), int))
+    }
+
+    /// The discriminant of each variant of the enum `item`: its written value read as `primitive`, or one more than the previous.
+    pub(super) fn discriminants(&mut self, item: ItemRef, primitive: Primitive) -> Result<Vec<i128>> {
+        let def = self.cx.adt_def(item)?;
+        let Some(int) = int_info(primitive) else { bail!("an enum tag that is not an integer") };
+        let mut next = 0_i128;
+        let mut values = Vec::with_capacity(def.variants.len());
+        for variant in &def.variants {
+            if let Some(expr) = variant.discriminant {
+                let (value, _) = self.const_eval(&def.body, expr, int)?;
+                next = if int.1 { signed(value & mask(int.0), int.0) } else { (value & mask(int.0)) as i128 };
+            }
+            values.push(next);
+            next = next.wrapping_add(1);
+        }
+        Ok(values)
+    }
+
+    /// The const value that `expr` of `arena` gives as a generic argument or an array length: a const parameter of the frame as it stands, or the value it evaluates to.
+    pub(super) fn const_arg(&mut self, arena: &Body, expr: ExprId) -> Result<Ty> {
+        if let Some(param) = self.named_param(arena, expr) {
+            return Ok(param);
+        }
+        let (value, (bits, _)) = self.const_eval(arena, expr, (64, false))?;
+        Ok(self.cx.types.intern(Kind::Value(value & mask(bits))))
+    }
+
+    fn named_param(&self, arena: &Body, expr: ExprId) -> Option<Ty> {
+        match *arena.expr(expr) {
+            Expr::Paren(inner) => self.named_param(arena, inner),
+            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.named_param(arena, tail),
+            Expr::Path(path) => {
+                let entry = arena.path(path);
+                let [segment] = arena.list(entry.segments) else { return None };
+                let name = self.src.text(arena.segments[*segment as usize].name);
+                let named = entry.qself.is_none() && arena.segments[*segment as usize].args.is_none();
+                named.then(|| self.generics.iter().find(|(generic, _)| *generic == name).map(|&(_, ty)| ty)).flatten()
+            }
+            _ => None,
+        }
+    }
+
     /// The value of the integer constant expression `expr` of `arena`, read as `want` unless it says its own type.
     pub(super) fn const_eval(&mut self, arena: &Body, expr: ExprId, want: Int) -> Result<(u128, Int)> {
         match *arena.expr(expr) {
@@ -84,7 +136,13 @@ impl Infer<'_, '_> {
             Expr::Unary(op, inner) => self.const_unary(arena, op, inner, want),
             Expr::Binary(op, lhs, rhs) => self.const_binary(arena, op, (lhs, rhs), want),
             Expr::Cast(inner, ty) => self.const_cast(arena, inner, ty),
-            Expr::Path(path) => self.const_path(arena, path),
+            Expr::Path(path) => match self.named_param(arena, expr) {
+                Some(param) => match *self.cx.types.kind(self.resolve(param)) {
+                    Kind::Value(bits) => Ok((bits, want)),
+                    _ => bail!("a const parameter whose value is not known yet"),
+                },
+                None => self.const_path(arena, path),
+            },
             _ => bail!("constant expressions of this kind are not evaluated yet"),
         }
     }
@@ -139,6 +197,7 @@ impl Infer<'_, '_> {
         let def = self.value_def(segments, absolute, dollar).ok();
         match def {
             Some(Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => self.const_value(item),
+            Some(Def::Variant(item, index)) => self.variant_value(item, index),
             _ => bail!("constant `{}` is not an integer constant item", self.spell(segments)),
         }
     }

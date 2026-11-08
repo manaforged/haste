@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{IntCC, Type, Value};
 
 use crate::body::BinOp;
+use crate::sema::infer::{ALIGN_SLOT, SIZE_SLOT};
 use crate::sema::intrinsic::Intrinsic;
 use crate::sema::ty::{Kind, Ty};
 
@@ -16,6 +17,7 @@ impl Lower<'_, '_> {
         let ty = substs.first().copied();
         match (which, ty, args) {
             (SizeOf | AlignOf, Some(ty), _) => self.layout_const(which, ty).map(Some),
+            (SizeOfVal | AlignOfVal, Some(ty), &[pointer]) => self.value_layout(which == SizeOfVal, ty, pointer).map(Some),
             (NeedsDrop, Some(ty), _) => {
                 let needs = crate::sema::infer::needs_drop(self.cx, ty)?;
                 Ok(Some(self.ins().iconst(Type::I8, i64::from(needs))))
@@ -28,7 +30,7 @@ impl Lower<'_, '_> {
             (BlackBox, _, _) => Ok(args.first().copied()),
             (Unchecked(op), Some(ty), &[x, y]) => self.unchecked(op, (ty, substs.get(1).copied()), x, y).map(Some),
             (ThreeWayCompare, Some(ty), &[x, y]) => self.compare(ty, x, y).map(Some),
-            (RawPointer | Offset(_) | OffsetFrom(_) | Read | Write | MemCopy(_) | WriteBytes, Some(ty), _) => self.access_intrinsic(which, ty, args),
+            (RawPointer | Offset(_) | OffsetFrom(_) | Read | Write | WriteBox | MemCopy(_) | WriteBytes, Some(ty), _) => self.access_intrinsic(which, ty, args),
             _ => self.value_intrinsic(which, substs, args).map(Some),
         }
     }
@@ -50,16 +52,47 @@ impl Lower<'_, '_> {
                 Ok(None)
             }
             (Write, &[_]) => Ok(None),
+            (WriteBox, &[boxed, ..]) => self.write_box(ty, boxed, args.get(1).copied()).map(Some),
             (MemCopy(overlapping), &[from, to, count]) => self.copy_items(ty, overlapping, (from, to), count).map(|()| None),
             (WriteBytes, &[to, byte, count]) => self.write_bytes(ty, to, byte, count).map(|()| None),
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
         }
     }
 
+    fn write_box(&mut self, ty: Ty, boxed: Value, value: Option<Value>) -> Result<Value> {
+        if let Some(value) = value {
+            let data = self.box_data(boxed);
+            let at = Place { base: Base::Addr(data), offset: 0, repr: repr(self.cx, ty)? };
+            self.write(at, value);
+        }
+        Ok(boxed)
+    }
+
     fn layout_const(&mut self, which: Intrinsic, ty: Ty) -> Result<Value> {
         let layout = self.cx.layout(ty)?;
         let value = if which == Intrinsic::SizeOf { layout.size.bytes() } else { layout.align.abi.bytes() };
         Ok(self.ins().iconst(Type::I64, value as i64))
+    }
+
+    fn value_layout(&mut self, size: bool, ty: Ty, pointer: Value) -> Result<Value> {
+        let which = if size { Intrinsic::SizeOf } else { Intrinsic::AlignOf };
+        match self.cx.types.kind(ty).clone() {
+            Kind::Slice(element) if size => {
+                let len = self.ins().load(Type::I64, pointer, 8);
+                let bytes = self.size(element)?;
+                Ok(self.ins().imul_imm(len, bytes))
+            }
+            Kind::Slice(element) => self.layout_const(which, element),
+            Kind::Prim(crate::names::Primitive::Str) if size => Ok(self.ins().load(Type::I64, pointer, 8)),
+            Kind::Prim(crate::names::Primitive::Str) => Ok(self.ins().iconst(Type::I64, 1)),
+            Kind::Dyn(..) => {
+                let vtable = self.ins().load(Type::I64, pointer, 8);
+                let slot = if size { SIZE_SLOT } else { ALIGN_SLOT };
+                Ok(self.ins().load(Type::I64, vtable, slot as i32 * 8))
+            }
+            Kind::Adt(_, args) if args.iter().any(|arg| self.cx.types.kind(*arg).is_unsized()) => bail!("the size of a value whose type ends in an unsized field is not supported yet"),
+            _ => self.layout_const(which, ty),
+        }
     }
 
     fn size(&mut self, ty: Ty) -> Result<i64> {

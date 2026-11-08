@@ -90,18 +90,16 @@ impl Context<'_> {
 
     fn compute(&mut self, ty: Ty) -> Result<Layout> {
         let dl = target()?;
+        if let Some(layout) = self.leaf(&dl, ty)? {
+            return Ok(layout);
+        }
         let calc = LayoutCalculator::new(&dl);
         let fields = match self.types.kind(ty).clone() {
-            Kind::Prim(prim) => return primitive(&dl, prim),
-            Kind::Never => return Ok(Layout::never_type(&dl)),
-            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => return Ok(self.pointer(&dl, matches!(self.types.kind(ty), Kind::Ref(..)), pointee)),
             Kind::Tuple(items) => items,
-            Kind::Pat(base, start, end) => {
-                let BackendRepr::Scalar(Scalar::Initialized { value, .. }) = self.layout(base)?.backend_repr else { bail!("a pattern type on a type that is not one scalar") };
-                return Ok(Layout::scalar(&dl, Scalar::Initialized { value, valid_range: WrappingRange { start, end } }));
-            }
             Kind::Adt(item, args) => return self.adt_layout(item, &args),
+            Kind::Closure(..) => return self.closure_layout(ty),
             Kind::Array(element, count) => {
+                let Some(count) = self.types.len(count) else { bail!("layout of an array whose length is not known") };
                 let element = self.layout(element)?;
                 return calc.array_like::<Field, Variant, ()>(&element, Some(count)).map_err(|error| anyhow!("layout of an array: {error:?}"));
             }
@@ -113,16 +111,44 @@ impl Context<'_> {
         calc.univariant(&refs, &ReprOptions::default(), StructKind::AlwaysSized).map_err(|error| anyhow!("layout: {error:?}"))
     }
 
+    fn leaf(&mut self, dl: &TargetDataLayout, ty: Ty) -> Result<Option<Layout>> {
+        Ok(Some(match self.types.kind(ty).clone() {
+            Kind::Prim(prim) => primitive(dl, prim)?,
+            Kind::Never => Layout::never_type(dl),
+            Kind::FnPtr(..) => Layout::scalar(dl, pointer_scalar(dl, true)),
+            Kind::Ref(_, pointee) => self.pointer(dl, true, pointee),
+            Kind::Ptr(_, pointee) => self.pointer(dl, false, pointee),
+            Kind::Pat(base, start, end) => self.pattern(dl, base, WrappingRange { start, end })?,
+            _ => return Ok(None),
+        }))
+    }
+
+    fn pattern(&mut self, dl: &TargetDataLayout, base: Ty, valid_range: WrappingRange) -> Result<Layout> {
+        match self.layout(base)?.backend_repr {
+            BackendRepr::Scalar(Scalar::Initialized { value, .. }) => Ok(Layout::scalar(dl, Scalar::Initialized { value, valid_range })),
+            BackendRepr::ScalarPair(Scalar::Initialized { value, .. }, metadata) => Ok(Layout::scalar_pair(dl, Scalar::Initialized { value, valid_range }, metadata)),
+            _ => bail!("a pattern type on a type that is not a scalar or a pointer with metadata"),
+        }
+    }
+
+    fn closure_layout(&mut self, ty: Ty) -> Result<Layout> {
+        let Some(env) = self.closure_env(ty) else { bail!("layout of a closure whose defining body was not inferred") };
+        Ok((*self.layout(env)?).clone())
+    }
+
     fn pointer(&self, dl: &TargetDataLayout, nonnull: bool, pointee: Ty) -> Layout {
         let data = pointer_scalar(dl, nonnull);
         if self.thin(pointee) {
             return Layout::scalar(dl, data);
         }
-        let len = Scalar::Initialized { value: Abi::Int(Integer::I64, false), valid_range: WrappingRange::full(Size::from_bytes(8)) };
-        Layout::scalar_pair(dl, data, len)
+        let metadata = match self.types.kind(pointee) {
+            Kind::Dyn(..) => pointer_scalar(dl, true),
+            _ => Scalar::Initialized { value: Abi::Int(Integer::I64, false), valid_range: WrappingRange::full(Size::from_bytes(8)) },
+        };
+        Layout::scalar_pair(dl, data, metadata)
     }
 
     fn thin(&self, pointee: Ty) -> bool {
-        !matches!(self.types.kind(pointee), Kind::Slice(_) | Kind::Prim(Primitive::Str))
+        !self.types.kind(pointee).is_unsized()
     }
 }

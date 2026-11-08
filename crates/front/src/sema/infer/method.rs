@@ -6,7 +6,7 @@ use crate::names::{ItemRef, plain};
 
 use super::super::impls::{ImplRef, head};
 use super::super::ty::{Kind, Mut, Ty};
-use super::scope::{Frame, type_params};
+use super::scope::{Frame, named_args, type_params};
 use super::{Infer, Res};
 
 /// How a method call adjusts its receiver: through how many references it reads, then whether it borrows the result.
@@ -24,6 +24,14 @@ struct TraitCandidate {
     kind: SelfKind,
 }
 
+/// The method a call picked: its item, the arguments of its impl or trait, the arguments of its own type parameters when its receiver type named them, and how it borrows the receiver.
+struct Pick {
+    item: ItemRef,
+    args: Vec<Ty>,
+    own: Vec<Ty>,
+    autoref: Option<Mut>,
+}
+
 /// One method a call may pick: its impl, its item and how it takes `self`.
 #[derive(Clone, Copy)]
 struct Candidate {
@@ -37,65 +45,73 @@ impl<'a> Infer<'_, 'a> {
     pub fn method_call(&mut self, expr: ExprId, receiver: ExprId, name: u32, params: (Option<List>, List)) -> Result<Ty> {
         let found = self.expr(receiver, None)?;
         let name = plain(self.src.text(name));
-        let steps = self.deref_steps(found)?;
-        let candidates = self.candidates(&steps, name)?;
         let traits = self.trait_candidates(name)?;
+        let mut steps = vec![self.resolve(found)];
+        while let Some(next) = self.next_step(expr, steps.len() as u32 - 1, steps[steps.len() - 1])? {
+            steps.push(next);
+        }
+        let mut candidates = Vec::new();
+        for &step in &steps {
+            self.candidates(step, name, &mut candidates)?;
+        }
         for (derefs, &step) in steps.iter().enumerate() {
-            for autoref in [None, Some(Mut::Not), Some(Mut::Mut)] {
-                let adjusted = match autoref {
-                    None => step,
-                    Some(mutability) => self.cx.types.intern(Kind::Ref(mutability, step)),
-                };
-                let adjust = Adjust { derefs: derefs as u32, autoref };
-                for &candidate in &candidates {
-                    if let Some(args) = self.try_receiver(candidate, adjusted)? {
-                        return self.picked(expr, candidate.item, args, adjust, params);
-                    }
+            if let Some(pick) = self.probe_step(step, (&candidates, &traits))? {
+                if pick.autoref == Some(Mut::Mut) {
+                    self.steps_mutably(expr, found, derefs as u32)?;
                 }
-                for &candidate in &traits {
-                    if let Some((item, args)) = self.try_trait(candidate, adjusted)? {
-                        return self.picked(expr, item, args, adjust, params);
-                    }
-                }
+                return self.picked(expr, pick, derefs as u32, params);
             }
         }
-        bail!("no method `{name}` on {}", self.show(found))
-    }
-
-    fn deref_steps(&mut self, ty: Ty) -> Result<Vec<Ty>> {
-        let mut steps = vec![self.resolve(ty)];
-        loop {
-            let last = *steps.last().expect("steps start with the receiver");
-            match self.cx.types.kind(last).clone() {
-                Kind::Ref(_, inner) => steps.push(self.resolve(inner)),
-                Kind::Array(element, _) => {
-                    steps.push(self.cx.types.intern(Kind::Slice(element)));
-                    return Ok(steps);
-                }
-                Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => bail!("the type of a method receiver must be known here"),
-                _ => return Ok(steps),
-            }
+        match self.cx.types.kind(steps[steps.len() - 1]) {
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => bail!("the type of a method receiver must be known here"),
+            _ => bail!("no method `{name}` on {}", self.show(found)),
         }
     }
 
-    fn candidates(&mut self, steps: &[Ty], name: &str) -> Result<Vec<Candidate>> {
-        let mut blocks = Vec::new();
-        for &step in steps {
-            let Some(head) = head(self.cx.types.kind(step)) else { continue };
-            for block in self.cx.inherent(head) {
-                if !blocks.contains(&block) {
-                    blocks.push(block);
+    fn probe_step(&mut self, step: Ty, (candidates, traits): (&[Candidate], &[TraitCandidate])) -> Result<Option<Pick>> {
+        for autoref in [None, Some(Mut::Not), Some(Mut::Mut)] {
+            let adjusted = match autoref {
+                None => step,
+                Some(mutability) => self.cx.types.intern(Kind::Ref(mutability, step)),
+            };
+            for &candidate in candidates {
+                if let Some((args, own)) = self.try_receiver(candidate, adjusted)? {
+                    return Ok(Some(Pick { item: candidate.item, args, own, autoref }));
+                }
+            }
+            for &candidate in traits {
+                if let Some((item, args)) = self.try_trait(candidate, adjusted)? {
+                    return Ok(Some(Pick { item, args, own: Vec::new(), autoref }));
                 }
             }
         }
-        let mut found = Vec::new();
-        for block in blocks {
+        Ok(None)
+    }
+
+    fn next_step(&mut self, expr: ExprId, derefs: u32, step: Ty) -> Result<Option<Ty>> {
+        let next = match self.cx.types.kind(step).clone() {
+            Kind::Array(element, _) => return Ok(Some(self.cx.types.intern(Kind::Slice(element)))),
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Ptr(..) | Kind::Slice(_) => None,
+            _ => match self.builtin_deref(step) {
+                Some(inner) => Some(inner),
+                None => self.deref_step(expr, derefs, step)?,
+            },
+        };
+        Ok(next.map(|next| self.resolve(next)))
+    }
+
+    fn candidates(&mut self, step: Ty, name: &str, found: &mut Vec<Candidate>) -> Result<()> {
+        let Some(head) = head(self.cx.types.kind(step)) else { return Ok(()) };
+        for block in self.cx.inherent(head) {
+            if found.iter().any(|candidate| candidate.block == block) {
+                continue;
+            }
             let Some(item) = self.cx.member(block, name) else { continue };
             if let Some((kind, _)) = self.cx.signature(item)?.receiver {
                 found.push(Candidate { block, item, kind });
             }
         }
-        Ok(found)
+        Ok(())
     }
 
     fn trait_candidates(&mut self, name: &str) -> Result<Vec<TraitCandidate>> {
@@ -127,10 +143,18 @@ impl<'a> Infer<'_, 'a> {
         };
         let count = type_params(&self.cx.trait_generics(candidate.of)?.1.params).count();
         let args: Vec<Ty> = (0..count).map(|_| self.fresh(Kind::Var)).collect();
+        if let Some(held) = self.object_holds(candidate.of, self_ty, &args) {
+            return Ok(held.then(|| (candidate.item, std::iter::once(self_ty).chain(args).collect())));
+        }
         let saved = self.vars.clone();
         let Some((block, impl_args)) = self.select(candidate.of, self_ty, &args)? else {
             self.vars = saved;
-            return Ok(None);
+            if !self.may_implement(candidate.of, self_ty, &args)? {
+                return Ok(None);
+            }
+            let substs: Vec<Ty> = std::iter::once(self_ty).chain(args).collect();
+            self.obligations.push((candidate.of, substs.clone()));
+            return Ok(Some((candidate.item, substs)));
         };
         Ok(Some(match self.cx.member(block, self.cx.name(candidate.item)) {
             Some(item) => (item, impl_args),
@@ -138,7 +162,7 @@ impl<'a> Infer<'_, 'a> {
         }))
     }
 
-    fn try_receiver(&mut self, candidate: Candidate, adjusted: Ty) -> Result<Option<Vec<Ty>>> {
+    fn try_receiver(&mut self, candidate: Candidate, adjusted: Ty) -> Result<Option<(Vec<Ty>, Vec<Ty>)>> {
         let saved = self.vars.clone();
         let matched = self.receiver_matches(candidate, adjusted);
         if matched.is_none() {
@@ -147,40 +171,47 @@ impl<'a> Infer<'_, 'a> {
         Ok(matched)
     }
 
-    fn receiver_matches(&mut self, candidate: Candidate, adjusted: Ty) -> Option<Vec<Ty>> {
+    fn receiver_matches(&mut self, candidate: Candidate, adjusted: Ty) -> Option<(Vec<Ty>, Vec<Ty>)> {
         let count = self.impl_params(candidate.block).ok()?;
         let args: Vec<Ty> = (0..count).map(|_| self.fresh(Kind::Var)).collect();
-        let (generics, self_ty) = self.impl_frame(candidate.block, &args).ok()?;
+        let (mut generics, self_ty) = self.impl_frame(candidate.block, &args).ok()?;
         let sig = self.cx.signature(candidate.item).ok()?;
-        let frame = Frame { src: &self.cx.file(candidate.item).source, home: self.cx.module_of(candidate.item).ok()?, generics, self_ty: Some(self_ty), block: Some(candidate.block) };
+        let src = &self.cx.file(candidate.item).source;
+        let own = match candidate.kind {
+            SelfKind::Typed(_) => self.own_args(candidate.item, Vec::new()).ok()?,
+            _ => Vec::new(),
+        };
+        generics.extend(named_args(src, &sig.generics, &own));
+        let frame = Frame { src, home: self.cx.module_of(candidate.item).ok()?, generics, self_ty: Some(self_ty), block: Some(candidate.block), item: None };
         let receiver = self.with_frame(frame, |infer| infer.receiver_ty(&sig.body, candidate.kind)).ok()?;
-        self.unify(receiver, adjusted).ok().map(|_| args)
+        self.unify(receiver, adjusted).ok().map(|_| (args, own))
     }
 
-    fn picked(&mut self, expr: ExprId, item: ItemRef, args: Vec<Ty>, adjust: Adjust, (explicit, params): (Option<List>, List)) -> Result<Ty> {
-        let sig = self.cx.signature(item)?;
-        let own = super::scope::type_params(&sig.generics).count();
-        let mut substs = args;
+    fn picked(&mut self, expr: ExprId, pick: Pick, derefs: u32, (explicit, params): (Option<List>, List)) -> Result<Ty> {
+        let Pick { item, args: mut substs, own, autoref } = pick;
+        let adjust = Adjust { derefs, autoref };
         let body = self.body;
         let given = match explicit {
             Some(list) => self.arg_list(body, list)?,
             None => Vec::new(),
         };
-        match given.len() {
-            0 => substs.extend((0..own).map(|_| self.fresh(Kind::Var))),
-            count if count == own => substs.extend(given),
-            count => bail!("{} takes {own} type arguments, {count} given", self.cx.name(item)),
+        let given = self.own_args(item, given)?;
+        for (&from, &to) in given.iter().zip(&own) {
+            self.unify(from, to)?;
         }
+        substs.extend(given);
         self.out.res.insert(expr, Res::Fn(item, substs.clone()));
         self.out.adjusts.insert(expr, adjust);
+        if let (Some(Mut::Mut), crate::body::Expr::Method { receiver, .. }) = (adjust.autoref, *self.body.expr(expr)) {
+            self.note_mut(receiver)?;
+        }
         let (types, ret) = self.fn_types(item, &substs)?;
         let given = self.body.list(params).to_vec();
         if given.len() + 1 != types.len() {
             bail!("{} takes {} arguments, {} given", self.cx.name(item), types.len() - 1, given.len());
         }
         for (arg, param) in given.into_iter().zip(types.into_iter().skip(1)) {
-            let found = self.expr(ExprId(arg), Some(param))?;
-            self.coerce_expr(ExprId(arg), found, param)?;
+            self.call_arg(Some((item, &substs[..])), ExprId(arg), param)?;
         }
         Ok(ret)
     }

@@ -125,7 +125,7 @@ impl Writer {
         let input = (open + 1, src.pair(open));
         match site.builtin {
             Builtin::Concat => return self.concat(cx, run, open, out),
-            Builtin::FormatArgs => return self.format_args(cx, run, site, out),
+            Builtin::FormatArgs | Builtin::FormatArgsNl => return self.format_args(cx, run, site, out),
             Builtin::PatternType => return Ok(false),
             Builtin::Line | Builtin::Column | Builtin::File if run.depth > 0 => return Ok(false),
             Builtin::Line => out.lexed(&format!("{}u32", src.line(site.start))),
@@ -164,9 +164,16 @@ impl Writer {
 
     fn format_args(&self, cx: &Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
         let args = builtin::args(run.src, site.open);
-        let Some(&template) = args.first().filter(|_| args.len() == 1) else { return Ok(false) };
-        let Some(template) = self.literal(cx, run, template)? else { return Ok(false) };
-        Ok(builtin::format_literal(&template, site.krate, out))
+        let Some((&template, rest)) = args.split_first() else { return Ok(false) };
+        let Some(mut template) = self.literal(cx, run, template)? else { return Ok(false) };
+        if site.builtin == Builtin::FormatArgsNl {
+            template.push('\n');
+        }
+        if rest.is_empty() && builtin::format_literal(&template, site.krate, out) {
+            return Ok(true);
+        }
+        super::format::expand(&template, &super::format::Call::new(run.src, rest), site.krate, out)?;
+        Ok(true)
     }
 
     fn literal(&self, cx: &Context<'_>, run: Run<'_>, (from, to): (u32, u32)) -> Result<Option<String>> {

@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{StackSlot, Type, Value};
 
 use crate::body::ExprId;
-use crate::sema::infer::{Res, field_types, has_drop_impl, needs_drop};
+use crate::sema::infer::{Res, Shape, field_types, has_drop_impl, needs_drop};
 use crate::sema::ty::{Kind, Ty};
 
 use super::moves::{MovePath, Root};
@@ -215,15 +215,21 @@ impl Lower<'_, '_> {
             Kind::Adt(item, args) => field_types(self.cx, item, &args)?,
             other => bail!("a partly moved {other:?}"),
         };
+        self.each_field((ty, place), variants, &mut |lower, field, field_ty, part| {
+            let mut sub = path.to_vec();
+            sub.push(field);
+            lower.drop_path(at, &sub, field_ty, Some(part))
+        })
+    }
+
+    fn each_field(&mut self, (ty, place): (Ty, Place), variants: Vec<Vec<Ty>>, visit: &mut dyn FnMut(&mut Self, (u32, u32), Ty, Place) -> Result<()>) -> Result<()> {
         let enumerated = variants.len() > 1;
         for (variant, fields) in variants.into_iter().enumerate() {
             let variant = variant as u32;
             let mut each = |lower: &mut Self| -> Result<()> {
-                for (index, field) in fields.iter().enumerate() {
-                    let mut sub = path.to_vec();
-                    sub.push((variant, index as u32));
+                for (index, &field) in fields.iter().enumerate() {
                     let part = lower.part_place(place, ty, (variant, index as u32))?;
-                    lower.drop_path(at, &sub, *field, Some(part))?;
+                    visit(lower, (variant, index as u32), field, part)?;
                 }
                 Ok(())
             };
@@ -255,15 +261,16 @@ impl Lower<'_, '_> {
     /// Lowers the body of the drop glue for `ty` whose target is `target`: `Drop::drop`, then the parts.
     pub fn glue_body(&mut self, ty: Ty, target: Option<Value>) -> Result<()> {
         let Some(target) = target else { return Ok(()) };
-        let glue = self.typed.glue.clone().unwrap_or_default();
+        let glue = match &self.typed.shape {
+            Shape::Glue(glue) => glue.clone(),
+            _ => Default::default(),
+        };
         let drop_fn = match glue.drop {
             Some(Res::Fn(item, substs)) => Some((item, substs)),
             _ => None,
         };
-        if let Kind::Adt(item, args) = self.cx.types.kind(ty).clone()
-            && self.cx.lang(item) == Some("owned_box")
-        {
-            self.box_contents(args[0], target)?;
+        if let Some(owned) = self.cx.boxed(ty) {
+            self.box_contents(owned, target)?;
             if let Some((item, substs)) = drop_fn {
                 self.invoke(item, &substs, vec![target])?;
             }
@@ -299,7 +306,8 @@ impl Lower<'_, '_> {
     fn drop_parts(&mut self, ty: Ty, target: Value) -> Result<()> {
         match self.cx.types.kind(ty).clone() {
             Kind::Array(inner, count) => {
-                let count = self.ins().iconst(Type::I64, count as i64);
+                let count = self.len(count)?;
+                let count = self.ins().iconst(Type::I64, count);
                 self.drop_elements(inner, target, count)
             }
             Kind::Slice(inner) => {
@@ -310,6 +318,10 @@ impl Lower<'_, '_> {
                 let place = Place { base: Base::Addr(target), offset: 0, repr: repr(self.cx, ty)? };
                 self.drop_fields(ty, place)
             }
+            Kind::Closure(..) => match self.cx.closure_env(ty) {
+                Some(env) => self.drop_parts(env, target),
+                None => bail!("drop of a closure whose defining body was not inferred"),
+            },
             _ => Ok(()),
         }
     }
@@ -321,22 +333,7 @@ impl Lower<'_, '_> {
             Kind::Adt(item, args) => field_types(self.cx, item, &args)?,
             _ => return Ok(()),
         };
-        let enumerated = variants.len() > 1;
-        for (variant, fields) in variants.into_iter().enumerate() {
-            let variant = variant as u32;
-            let mut each = |lower: &mut Self| -> Result<()> {
-                for (index, &field) in fields.iter().enumerate() {
-                    let part = lower.part_place(place, ty, (variant, index as u32))?;
-                    lower.glue(field, Some(part))?;
-                }
-                Ok(())
-            };
-            match enumerated {
-                true => self.when_variant(place, ty, variant, &mut each)?,
-                false => each(self)?,
-            }
-        }
-        Ok(())
+        self.each_field((ty, place), variants, &mut |lower, _, field_ty, part| lower.glue(field_ty, Some(part)))
     }
 
     fn drop_elements(&mut self, inner: Ty, data: Value, count: Value) -> Result<()> {

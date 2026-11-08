@@ -22,7 +22,7 @@ pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
     fields.offset(index as usize).bytes() as i32
 }
 
-fn tag_type(bytes: u64) -> Result<Type> {
+pub(super) fn tag_type(bytes: u64) -> Result<Type> {
     Ok(match bytes {
         1 => Type::I8,
         2 => Type::I16,
@@ -139,7 +139,8 @@ impl Lower<'_, '_> {
     pub fn variant_field(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
         let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("field of a type that is not an ADT") };
         let layout = self.cx.layout(ty)?;
-        let field = field_types(self.cx, item, &args)?[variant as usize][index as usize];
+        let fields = field_types(self.cx, item, &args)?;
+        let Some(&field) = fields.get(variant as usize).and_then(|fields| fields.get(index as usize)) else { bail!("{} has no field {index} in variant {variant}", self.cx.name(item)) };
         Ok(place.at(field_offset(&layout, variant, index), repr(self.cx, field)?))
     }
 

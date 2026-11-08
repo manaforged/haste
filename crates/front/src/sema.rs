@@ -3,6 +3,7 @@
 pub mod adt;
 mod builtin;
 mod expand;
+mod format;
 pub mod impls;
 pub mod infer;
 pub mod intrinsic;
@@ -14,7 +15,7 @@ pub mod ty;
 use rustc_hash::FxHashMap as HashMap;
 use std::rc::Rc;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::body::sig::{self, Signature};
 use crate::body::adt::{AdtDef, adt as parse_adt};
@@ -37,6 +38,7 @@ pub struct Store {
     adts: HashMap<ItemRef, Rc<AdtDef>>,
     layouts: HashMap<ty::Ty, Rc<layout::Layout>>,
     headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
+    finals: HashMap<reach::Instance, infer::Typed>,
 }
 
 /// Everything Sema reads in one pass, with its caches and the lookups that found nothing loaded yet.
@@ -54,22 +56,25 @@ pub struct Context<'a> {
     heads: HashMap<u32, Rc<impls::Index>>,
     owners: HashMap<u32, Rc<HashMap<(u32, Option<u32>), u32>>>,
     trait_defs: HashMap<ItemRef, Rc<traits::TraitGenerics>>,
-    langs: Option<Rc<HashMap<String, ItemRef>>>,
+    discriminants: HashMap<ItemRef, Rc<[i128]>>,
+    langs: Option<(Rc<HashMap<String, ItemRef>>, Rc<[u32]>)>,
     drops: HashMap<ty::Ty, bool>,
+    closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
+    finals: HashMap<reach::Instance, infer::Typed>,
 }
 
 impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, store: Store) -> Context<'a> {
-        let Store { types, signatures, bodies, adts, layouts, headers } = store;
+        let Store { types, signatures, bodies, adts, layouts, headers, finals } = store;
         let (modules, heads, owners) = (HashMap::default(), HashMap::default(), HashMap::default());
         let (trait_defs, langs, drops) = (HashMap::default(), None, HashMap::default());
-        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, langs, drops }
+        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants: HashMap::default(), langs, drops, closures: HashMap::default(), finals }
     }
 
     /// Ends the pass: the store for the next one, and what lookups asked the front end to load or resolve.
     pub fn release(self) -> (Store, Asks) {
-        (Store { types: self.types, signatures: self.signatures, bodies: self.bodies, adts: self.adts, layouts: self.layouts, headers: self.headers }, self.asks)
+        (Store { types: self.types, signatures: self.signatures, bodies: self.bodies, adts: self.adts, layouts: self.layouts, headers: self.headers, finals: self.finals }, self.asks)
     }
 
     /// The source file and outline entry of `item`.
@@ -84,6 +89,45 @@ impl<'a> Context<'a> {
         let (_, entry) = self.item(item);
         let items = &self.file(item).items.items;
         item.outer().is_none() && entry.kind == ItemKind::Fn && entry.body.is_none() && entry.parent.is_some_and(|parent| items[parent as usize].kind == ItemKind::ExternBlock)
+    }
+
+    /// What the body that defines the closure type `ty` inferred for it.
+    pub fn closure(&self, ty: ty::Ty) -> Option<Rc<infer::ClosureInfo>> {
+        self.closures.get(&ty).cloned()
+    }
+
+    /// Records what the body that defines the closure type `ty` inferred for it.
+    pub fn set_closure(&mut self, ty: ty::Ty, info: infer::ClosureInfo) {
+        self.closures.insert(ty, Rc::new(info));
+    }
+
+    /// The tuple of the captures of the closure type `ty`, which is how the closure is laid out and dropped.
+    pub fn closure_env(&self, ty: ty::Ty) -> Option<ty::Ty> {
+        self.closures.get(&ty).map(|info| info.env)
+    }
+
+    /// Whether the code of the closure type `ty` takes the address of its environment first, which only a closure that captures something does.
+    pub fn closure_takes_env(&self, ty: ty::Ty) -> bool {
+        self.closures.get(&ty).is_some_and(|info| !info.closure.captures.is_empty())
+    }
+
+    /// The type that `ty` owns when it is a `Box`.
+    pub fn boxed(&self, ty: ty::Ty) -> Option<ty::Ty> {
+        match self.types.kind(ty) {
+            ty::Kind::Adt(item, args) if self.lang(*item) == Some("owned_box") => args.first().copied(),
+            _ => None,
+        }
+    }
+
+    /// Whether a call of the closure type `ty` consumes the closure, because its body moves a captured value out.
+    pub fn closure_consumes(&self, ty: ty::Ty) -> bool {
+        self.closures.get(&ty).is_some_and(|info| info.closure.consumes)
+    }
+
+    /// `FnOnce::call_once`, which every call of a closure value is an instance of.
+    pub fn call_once(&mut self) -> Option<ItemRef> {
+        let of = self.lang_item("fn_once")?;
+        self.trait_member(of, "call_once")
     }
 
     /// The outline file that holds `item`, or the expansion of the body that declares it.
@@ -153,6 +197,14 @@ impl<'a> Context<'a> {
         let parsed = Rc::new(self.parse_body(item)?);
         self.bodies.insert(item, parsed.clone());
         Ok(parsed)
+    }
+
+    /// The position of the variant with declaration index `index` among the configured variants of the enum `item`.
+    pub fn variant_position(&mut self, item: ItemRef, index: u32) -> Result<usize> {
+        match self.adt_def(item)?.position(index) {
+            Some(at) => Ok(at),
+            None => bail!("variant {index} of {} is configured out", self.name(item)),
+        }
     }
 
     /// The parsed definition of the struct, enum or union `item`.

@@ -3,9 +3,10 @@ use haste_codegen::{FloatCC, IntCC, Type, Value};
 
 use crate::body::literal::{char_value, string_bytes};
 use crate::body::{BinOp, Expr, ExprId, Lit, UnOp};
-use crate::names::Primitive;
+use crate::names::{ItemRef, Primitive};
+use crate::sema::infer::{Adjust, Res};
 use crate::sema::infer::parse_int;
-use crate::sema::ty::{Kind, Ty, int_info};
+use crate::sema::ty::{Kind, Mut, Ty, int_info};
 
 use super::{Lower, Repr};
 
@@ -96,9 +97,6 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn unary(&mut self, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
-        if op == UnOp::Deref {
-            return self.deref(operand);
-        }
         let num = self.num(self.ty_of(operand))?;
         if let (UnOp::Neg, Num::Int { ty, .. }, Some(at)) = (op, num, self.int_literal(operand)) {
             let value = parse_int(self.src.text(at))?.0;
@@ -141,10 +139,24 @@ impl Lower<'_, '_> {
         if matches!(op, BinOp::And | BinOp::Or) {
             return self.logical(expr, op, lhs, rhs);
         }
+        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
+            return self.overloaded(expr, op, (lhs, rhs), (item, &substs));
+        }
         let num = self.num(self.ty_of(lhs))?;
         let shift = self.num(self.ty_of(rhs))?;
         let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else { return Ok(None) };
         self.apply(op, num, (x, y), shift).map(Some)
+    }
+
+    fn overloaded(&mut self, expr: ExprId, op: BinOp, operands: (ExprId, ExprId), (item, substs): (ItemRef, &[Ty])) -> Result<Option<Value>> {
+        let by_ref = Adjust { derefs: 0, autoref: Some(Mut::Not) };
+        let mut values = Vec::with_capacity(2);
+        for operand in [operands.0, operands.1] {
+            let value = if compare(op).is_some() { self.receiver((expr, operand), by_ref)? } else { self.expr(operand)? };
+            let Some(value) = value else { return Ok(None) };
+            values.push(value);
+        }
+        self.invoke(item, substs, values)
     }
 
     fn apply(&mut self, op: BinOp, num: Num, (x, y): (Value, Value), rhs: Num) -> Result<Value> {
@@ -311,15 +323,8 @@ impl Lower<'_, '_> {
         Ok(None)
     }
 
-    fn deref(&mut self, operand: ExprId) -> Result<Option<Value>> {
-        let Some(pointer) = self.expr(operand)? else { return Ok(None) };
-        let (Kind::Ref(_, pointee) | Kind::Ptr(_, pointee)) = *self.cx.types.kind(self.ty_of(operand)) else { bail!("dereference of a non-pointer") };
-        let place = self.pointee_place(pointer, pointee)?;
-        Ok(self.read(place))
-    }
-
     pub(super) fn cast(&mut self, expr: ExprId, inner: ExprId) -> Result<Option<Value>> {
-        if self.is_wide(self.ty_of(expr)) {
+        if self.is_wide(self.ty_of(expr)) || self.typed.coercions.contains_key(&inner) {
             return self.expr(inner);
         }
         let to = self.num(self.ty_of(expr))?;
@@ -364,7 +369,7 @@ impl Lower<'_, '_> {
 
     /// Whether `ty` is a slice or `str`, which a pointer reaches through a wide pointer.
     pub(super) fn is_unsized(&self, ty: Ty) -> bool {
-        matches!(self.cx.types.kind(ty), Kind::Slice(_) | Kind::Prim(Primitive::Str))
+        self.cx.types.kind(ty).is_unsized()
     }
 
     pub(super) fn resize(&mut self, value: Value, (from, signed): (Type, bool), to: Type) -> Value {

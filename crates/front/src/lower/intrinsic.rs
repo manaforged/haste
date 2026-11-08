@@ -80,7 +80,8 @@ impl Lower<'_, '_> {
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&pointee), Some(&pointer)) = (substs.first(), args.first()) else { bail!("ptr_metadata takes a pointer") };
         match self.cx.types.kind(pointee) {
-            Kind::Slice(_) | Kind::Prim(Primitive::Str) => Ok(Some(self.ins().load(Type::I64, pointer, 8))),
+            Kind::Dyn(..) => Ok(Some(self.ins().iadd_imm(pointer, 8))),
+            kind if kind.is_unsized() => Ok(Some(self.ins().load(Type::I64, pointer, 8))),
             _ => Ok(None),
         }
     }
