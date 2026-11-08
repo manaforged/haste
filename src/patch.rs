@@ -25,15 +25,15 @@ pub(crate) struct Edit {
 
 pub struct Engine {
     db: RootDatabase,
-    backend: Backend,
+    backend: std::sync::Arc<Backend>,
 }
 
 // SAFETY: the engine is only reached through ENGINE's mutex, so one thread uses the database and JIT module at a time.
 unsafe impl Send for Engine {}
 
 impl Engine {
-    pub fn parts(&mut self) -> (&RootDatabase, &mut Backend) {
-        (&self.db, &mut self.backend)
+    pub fn parts(&mut self) -> (&RootDatabase, &std::sync::Arc<Backend>) {
+        (&self.db, &self.backend)
     }
 }
 
@@ -41,7 +41,7 @@ pub static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 
 pub(crate) fn start(db: RootDatabase, dump: bool, verbose: bool) -> Result<()> {
     let backend = Backend::new(dump, verbose)?;
-    *lock() = Some(Engine { db, backend });
+    *lock() = Some(Engine { db, backend: std::sync::Arc::new(backend) });
     crate::backend::watch_forks();
     crate::macros::refresh();
     Ok(())
@@ -52,14 +52,20 @@ pub(crate) fn stop() -> RootDatabase {
 }
 
 pub(crate) fn with_database<T>(work: impl FnOnce(&mut RootDatabase) -> T) -> T {
+    crate::backend::quiesce();
     work(&mut lock().as_mut().expect("engine is running").db)
+}
+
+/// A handle on the running engine's database for work beside the engine; a database change cancels it.
+pub(crate) fn snapshot() -> RootDatabase {
+    lock().as_ref().expect("engine is running").db.clone()
 }
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Engine>> {
     ENGINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(crate) fn with_engine<T>(work: impl FnOnce(&dyn HirDatabase, &mut Backend) -> T) -> T {
+pub(crate) fn with_engine<T>(work: impl FnOnce(&dyn HirDatabase, &Backend) -> T) -> T {
     let mut guard = lock();
     let engine = guard.as_mut().expect("engine is running");
     let (db, backend) = engine.parts();
@@ -125,7 +131,7 @@ pub fn run(mut db: RootDatabase, vfs: &Vfs, root: &Path, entry: &str, edits: &Pa
 }
 
 fn compiled() -> usize {
-    with_engine(|_, backend| backend.compiled_total)
+    with_engine(|_, backend| backend.compiled_total())
 }
 
 pub fn coverage(db: RootDatabase, crate_name: &str) -> Result<()> {
@@ -178,7 +184,7 @@ pub fn coverage(db: RootDatabase, crate_name: &str) -> Result<()> {
             }
         }
         println!("walk {:.2}s", walk.elapsed().as_secs_f64());
-        (attempted, generic, entry_reasons, std::mem::take(&mut backend.stubs), backend.compiled_total)
+        (attempted, generic, entry_reasons, backend.take_stubs(), backend.compiled_total())
     });
     let mut reasons: HashMap<String, usize> = HashMap::new();
     let mut samples: HashMap<String, Vec<String>> = HashMap::new();
@@ -295,6 +301,7 @@ pub(crate) fn apply_edit(
 ) -> Result<std::result::Result<Vec<String>, String>> {
     let mut guard = lock();
     let engine = guard.as_mut().expect("engine is running");
+    crate::backend::quiesce();
     apply(&mut engine.db, vfs, root, texts, edit)?;
     let (db, backend) = engine.parts();
     let db: &dyn HirDatabase = db;

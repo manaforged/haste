@@ -75,23 +75,27 @@ fn op(func: &Function, op: &Op) -> Result<(), String> {
         Op::Jump(block, args) => edge(func, *block, args),
         Op::Brif(_, then, then_args, otherwise, else_args) => edge(func, *then, then_args).and(edge(func, *otherwise, else_args)),
         Op::Call { sig, args, .. } => call(func, sig.index(), args),
-        Op::TryCall { sig, args, normal, handler, .. } => {
-            call(func, sig.index(), args)?;
-            edge(func, *normal, &[])?;
-            match types(func, &func.blocks[handler.index()].params)[..] {
-                [Type::I64] if func.sigs[sig.index()].returns.is_empty() => Ok(()),
-                _ => Err("a try_call returns nothing and its handler takes only the exception".to_owned()),
-            }
-        }
-        Op::Return(values) => {
-            let wanted: Vec<Type> = func.signature.returns.iter().map(|param| param.value_type).collect();
-            if wanted != types(func, values) {
-                return Err(format!("return of {:?} from a function returning {wanted:?}", types(func, values)));
-            }
-            Ok(())
-        }
+        Op::TryCall { sig, args, normal, handler, .. } => try_call(func, sig.index(), args, *normal, *handler),
+        Op::Return(values) => returned(func, values),
         _ => Ok(()),
     }
+}
+
+fn try_call(func: &Function, sig: usize, args: &[Value], normal: Block, handler: Block) -> Result<(), String> {
+    call(func, sig, args)?;
+    edge(func, normal, &[])?;
+    match types(func, &func.blocks[handler.index()].params)[..] {
+        [Type::I64] if func.sigs[sig].returns.is_empty() => Ok(()),
+        _ => Err("a try_call returns nothing and its handler takes only the exception".to_owned()),
+    }
+}
+
+fn returned(func: &Function, values: &[Value]) -> Result<(), String> {
+    let wanted: Vec<Type> = func.signature.returns.iter().map(|param| param.value_type).collect();
+    if wanted != types(func, values) {
+        return Err(format!("return of {:?} from a function returning {wanted:?}", types(func, values)));
+    }
+    Ok(())
 }
 
 /// Checks that every instruction agrees with the types of its operands, blocks and signatures, and every block ends with one terminator.

@@ -132,10 +132,11 @@ impl<'db> Lower<'_, '_, 'db> {
         let layout = self.layout(ty)?;
         let buffer = leak(&vec![0_u8; layout.size.bytes() as usize + 8]);
         let cell = leak(&[0_u8; 8]);
-        let slot = self.slots.get(Key::Const(id, args.store()), Sig::new(0, true), self.env.store())?;
+        let slot = self.slots().get(Key::Const(id, args.store()), Sig::new(0, true), self.env.store())?;
         let addr = self.builder.ins().iconst(Type::I64, buffer as i64);
         self.once(cell, |this| {
-            let code = this.builder.ins().iconst(Type::I64, this.slots.address(slot));
+            let at = this.slots().address(slot);
+            let code = this.builder.ins().iconst(Type::I64, at);
             this.call_cell(code, Sig::new(0, true), &[addr]);
         });
         Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None })
@@ -172,7 +173,8 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn static_cell(&mut self, id: StaticId) -> Result<Place<'db>, String> {
         let at = self.static_address(id)?;
-        if let Some((slot, done)) = self.slots.lazy_statics.get(&id).copied() {
+        let lazy = self.slots().lazy_statics.get(&id).copied();
+        if let Some((slot, done)) = lazy {
             self.init_once(slot, at, done);
         }
         let region = Region::new_erased(self.infcx.interner);
@@ -195,7 +197,7 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     fn static_address(&mut self, id: StaticId) -> Result<usize, String> {
-        if let Some(at) = self.slots.statics.get(&id) {
+        if let Some(at) = self.slots().statics.get(&id) {
             return Ok(*at);
         }
         let signature = StaticSignature::of(self.db, id);
@@ -216,24 +218,24 @@ impl<'db> Lower<'_, '_, 'db> {
                 Err(_) => self.lazy_static(id)?,
             }
         };
-        self.slots.statics.insert(id, at);
-        Ok(at)
+        Ok(*self.slots().statics.entry(id).or_insert(at))
     }
 
     fn lazy_static(&mut self, id: StaticId) -> Result<usize, String> {
         let layout = self.layout(self.static_type(id))?;
         let buffer = leak(&vec![0_u8; layout.size.bytes() as usize + 8]);
         let sig = Sig::new(0, layout.size.bytes() != 0);
-        let slot = self.slots.get(Key::Static(id), sig, self.env.store())?;
+        let slot = self.slots().get(Key::Static(id), sig, self.env.store())?;
         let done = leak(&[0_u8; 8]);
-        self.slots.lazy_statics.insert(id, (slot, done as usize));
+        self.slots().lazy_statics.entry(id).or_insert((slot, done as usize));
         Ok(buffer as usize)
     }
 
     fn init_once(&mut self, slot: usize, at: usize, done: usize) {
-        let sig = self.slots.sig_of(slot);
+        let sig = self.slots().sig_of(slot);
         self.once(done, |this| {
-            let code = this.builder.ins().iconst(Type::I64, this.slots.address(slot));
+            let cell = this.slots().address(slot);
+            let code = this.builder.ins().iconst(Type::I64, cell);
             let addr = this.builder.ins().iconst(Type::I64, at as i64);
             let args: &[_] = if sig.ret { &[addr] } else { &[] };
             this.call_cell(code, sig, args);
@@ -278,7 +280,7 @@ impl<'db> Lower<'_, '_, 'db> {
                 let target = reloc.map.vtable_ty(id).map_err(|error| format!("fn pointer constant: {error:?}"))?;
                 if self.is_native_fn(target) && self.native_symbol(target)?.is_none() {
                     let slot = self.native_slot(target)?;
-                    self.slots.native_words.push((at, slot));
+                    self.slots().native_words.push((at, slot));
                 } else {
                     write_word(at, self.reify(target)? as usize);
                 }

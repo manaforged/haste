@@ -20,6 +20,7 @@ use vfs::FileId;
 
 pub mod census;
 mod host;
+pub mod replay;
 
 pub use host::refresh;
 
@@ -35,6 +36,7 @@ struct Expander {
     root: FileId,
     path: AbsPathBuf,
     name: String,
+    registry: bool,
 }
 
 /// Gives every registered proc-macro crate the macros its name resolution declares, each run by a forked host.
@@ -45,15 +47,34 @@ pub fn declare(db: &mut RootDatabase, vfs: &Vfs) {
         let Some(path) = vfs.file_path(root).as_path().map(AbsPath::to_path_buf) else {
             continue;
         };
-        let made = declared(db, *krate).into_iter().map(|declared| ProcMacro {
-            name: Symbol::intern(&declared.name),
-            kind: declared.kind,
-            expander: Arc::new(Expander { root, path: path.clone(), name: declared.name }),
+        let registry = !krate.data(db).origin.is_local();
+        let made = names(db, *krate, registry).into_iter().map(|(name, kind)| ProcMacro {
+            name: Symbol::intern(&name),
+            kind,
+            expander: Arc::new(Expander { root, path: path.clone(), name, registry }),
             disabled: false,
         });
         *macros = triomphe::Arc::new(CrateProcMacros::new(Ok(made.collect())));
     }
     ProcMacros::get(db).set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
+}
+
+fn label(db: &dyn SourceDatabase, krate: Crate) -> String {
+    let extra = krate.extra_data(db);
+    let name = extra.display_name.as_ref().map_or_else(String::new, |name| name.to_string());
+    format!("{name} {}", extra.version.as_deref().unwrap_or(""))
+}
+
+fn names(db: &dyn SourceDatabase, krate: Crate, registry: bool) -> replay::Declared {
+    let label = label(db, krate);
+    if let Some(saved) = replay::declared(&label).filter(|_| registry) {
+        return saved;
+    }
+    let found: replay::Declared = declared(db, krate).into_iter().map(|declared| (declared.name, declared.kind)).collect();
+    if registry {
+        replay::keep_declared(&label, &found);
+    }
+    found
 }
 
 fn declared(db: &dyn SourceDatabase, krate: Crate) -> Vec<Declared> {
@@ -97,7 +118,15 @@ impl ProcMacroExpander for Expander {
         current_dir: String,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         let request = self.request(subtree, attrs, env, [def_site, call_site, mixed_site], current_dir);
-        match host::ask(self.root, request).map_err(ProcMacroExpansionError::System)? {
+        let canon = replay::canon(&request).filter(|_| self.registry);
+        let reply = match canon.as_ref().and_then(replay::find) {
+            Some(reply) => reply,
+            None => host::ask(self.root, request).map_err(ProcMacroExpansionError::System)?,
+        };
+        if let Some(canon) = &canon {
+            replay::keep(canon, &reply);
+        }
+        match reply {
             Response::ExpandMacroExtended(Ok(done)) => {
                 let table = deserialize_span_data_index_map(&done.span_data_table);
                 Ok(FlatTree::to_subtree_resolved(done.tree, CURRENT_API_VERSION, &table))

@@ -51,19 +51,19 @@ impl<'db> Lower<'_, '_, 'db> {
             return Ok(false);
         };
         let landing = self.landing();
-        let (mark, notes) = (self.builder.mark(), self.slots.notes.len());
+        let (mark, notes) = (self.builder.mark(), crate::backend::note_count());
         let exit = self.builder.create_block();
         let ret_pointer = (self.layout(dest.ty.ty)?.size.bytes() != 0).then_some(dest.addr);
         let mut inlined = self.inlined.clone();
         inlined.push(self.body);
-        let mut inner = Lower::new(self.db, self.env, body, &mut *self.builder, &mut *self.slots, self.call_conv, self.sig);
+        let mut inner = Lower::new(self.db, self.env, body, &mut *self.builder, self.slots, self.call_conv, self.sig);
         inner.landing = landing;
         inner.exit = Some(exit);
         inner.ret_pointer = ret_pointer;
         inner.inlined = inlined;
         if inner.enter(places).is_err() {
             self.builder.rewind(mark);
-            self.slots.notes.truncate(notes);
+            crate::backend::truncate_notes(notes);
             return Ok(false);
         }
         self.builder.switch_to_block(exit);

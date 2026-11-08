@@ -130,7 +130,7 @@ impl<'db> Lower<'_, '_, 'db> {
 
     pub(super) fn vtable(&mut self, concrete: Ty<'db>, dynamic: Ty<'db>) -> Result<i64, String> {
         let key = (concrete.store(), dynamic.store());
-        if let Some(table) = self.slots.vtables.get(&key) {
+        if let Some(table) = self.slots().vtables.get(&key) {
             return Ok(*table);
         }
         let TyKind::Dynamic(predicates, _) = dynamic.kind() else {
@@ -140,21 +140,20 @@ impl<'db> Lower<'_, '_, 'db> {
         let mut entries = vec![0_i64, layout.size.bytes() as i64, layout.align.abi.bytes() as i64];
         if self.needs_drop(concrete) {
             let slot = self.glue_slot(concrete)?;
-            entries[0] = self.slots.address(slot);
+            entries[0] = self.slots().address(slot);
         }
         if let Some(principal) = predicates.principal() {
             let principal = Binder::skip_binder(principal);
             for (_, func) in methods_of(self.db, principal.def_id.0) {
                 let entry = self.vtable_entry(concrete, func, principal.args).unwrap_or_else(|why| {
-                    self.slots.notes.push(format!("vtable of {concrete:?} leaves a method out: {why}"));
+                    crate::backend::note(format!("vtable of {concrete:?} leaves a method out: {why}"));
                     0
                 });
                 entries.push(entry);
             }
         }
         let table = Box::leak(entries.into_boxed_slice()).as_ptr() as i64;
-        self.slots.vtables.insert(key, table);
-        Ok(table)
+        Ok(*self.slots().vtables.entry(key).or_insert(table))
     }
 
     fn vtable_entry(&mut self, concrete: Ty<'db>, func: FunctionId, existential: GenericArgs<'db>) -> Result<i64, String> {
@@ -176,12 +175,12 @@ impl<'db> Lower<'_, '_, 'db> {
         let key = key_of(&resolved.target).ok_or("vtable entry without code")?;
         let slot = if resolved.shape == Shape::FnTrait {
             let sig = self.thunk_sig(&resolved.target, true)?;
-            self.slots.get(Key::Thunk(Box::new(key), true), sig, self.env.store())?
+            self.slots().get(Key::Thunk(Box::new(key), true), sig, self.env.store())?
         } else {
             let sig = self.target_sig(&resolved.target)?;
-            self.slots.get(key, sig, self.env.store())?
+            self.slots().get(key, sig, self.env.store())?
         };
-        Ok(self.slots.address(slot))
+        Ok(self.slots().address(slot))
     }
 
     pub(super) fn thunk_sig(&self, target: &Target<'db>, data: bool) -> Result<Sig, String> {
@@ -228,17 +227,17 @@ impl<'db> Lower<'_, '_, 'db> {
         };
         let Some(key) = key_of(&target) else {
             let sig = self.shim_sig(ty)?;
-            let slot = self.slots.get(Key::Shim(ty.store()), sig, self.env.store())?;
-            return Ok(self.slots.address(slot));
+            let slot = self.slots().get(Key::Shim(ty.store()), sig, self.env.store())?;
+            return Ok(self.slots().address(slot));
         };
         let slot = if matches!(target, Target::Closure(..)) {
             let sig = self.thunk_sig(&target, false)?;
-            self.slots.get(Key::Thunk(Box::new(key), false), sig, self.env.store())?
+            self.slots().get(Key::Thunk(Box::new(key), false), sig, self.env.store())?
         } else {
             let sig = self.target_sig(&target)?;
-            self.slots.get(key, sig, self.env.store())?
+            self.slots().get(key, sig, self.env.store())?
         };
-        Ok(self.slots.address(slot))
+        Ok(self.slots().address(slot))
     }
 
     pub(super) fn call_pointer(

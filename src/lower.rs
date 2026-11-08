@@ -69,7 +69,7 @@ pub struct Lower<'a, 'f, 'db> {
     flags: HashMap<LocalId, StackSlot>,
     move_paths: HashMap<LocalId, Vec<moves::MovePath>>,
     statics: HashMap<LocalId, i64>,
-    slots: &'a mut Slots,
+    slots: &'a std::sync::Mutex<Slots>,
     call_conv: CallConv,
     sig: Sig,
     ret_pointer: Option<Value>,
@@ -85,7 +85,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         env: ParamEnvAndCrate<'db>,
         body: &'db MirBody<'db>,
         builder: &'a mut FunctionBuilder<'f>,
-        slots: &'a mut Slots,
+        slots: &'a std::sync::Mutex<Slots>,
         call_conv: CallConv,
         sig: Sig,
     ) -> Self {
@@ -110,6 +110,10 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             exit: None,
             inlined: Vec::new(),
         }
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'a, Slots> {
+        self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn run(mut self) -> Result<(), String> {
@@ -221,6 +225,16 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         }
     }
 
+    fn field_offset(&self, owner: PlaceTy<'db>, index: usize) -> Result<u64, String> {
+        let layout = self.layout(owner.ty)?;
+        let variant = self.variant_fields(&layout, owner.variant_id)?;
+        match index {
+            index if index < variant.fields.count() => Ok(variant.fields.offset(index).bytes()),
+            _ if layout.is_uninhabited() || variant.is_uninhabited() => Ok(0),
+            index => Err(format!("field {index} of a layout with {} fields", variant.fields.count())),
+        }
+    }
+
     fn place(&mut self, stored: &StoredPlace) -> Result<Place<'db>, String> {
         let stored = stored.as_ref();
         let mut place = Place {
@@ -240,8 +254,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
                     place.addr = self.load(Type::I64, place.addr, 0);
                 }
                 ProjectionElem::Field(field) => {
-                    let layout = self.layout(previous.ty)?;
-                    let offset = self.variant_fields(&layout, previous.variant_id)?.fields.offset(field.0 as usize).bytes();
+                    let offset = self.field_offset(previous, field.0 as usize)?;
                     place.addr = self.field_address(place.addr, offset, place.ty.ty, place.meta)?;
                     if !self.layout(place.ty.ty)?.is_unsized() {
                         place.meta = None;
@@ -597,7 +610,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
 
     fn site_trap(&mut self, reason: String, target: Option<BasicBlockId>) {
         self.report_trap(&reason);
-        self.slots.notes.push(reason);
+        crate::backend::note(reason);
         self.trap_and_continue();
         self.end_call(target);
     }
@@ -756,11 +769,12 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         let body = matches!(key, Key::Func(..) | Key::Closure(..));
         let by_value = self.pass(places, usize::from(ret), &mut values, body.then_some(by_value))?;
         let sig = Sig { params: values.len() - usize::from(ret), ret, by_value };
-        let slot = self.slots.get(key, sig, self.env.store())?;
+        let slot = self.slots().get(key, sig, self.env.store())?;
         let mut signature = Signature::new(crate::backend::INTERNAL_CONV);
         pointer_signature(&mut signature, sig);
         let signature = self.builder.import_signature(signature);
-        let address = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
+        let at = self.slots().address(slot);
+        let address = self.builder.ins().iconst(Type::I64, at);
         let code = self.load(Type::I64, address, 0);
         self.invoke(signature, code, &values);
         Ok(())

@@ -28,7 +28,7 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     pub(super) fn glue_slot(&mut self, ty: Ty<'db>) -> Result<usize, String> {
-        self.slots.get(Key::Glue(ty.store()), GLUE, self.env.store())
+        self.slots().get(Key::Glue(ty.store()), GLUE, self.env.store())
     }
 
     pub(super) fn make_flags(&mut self) -> Result<(), String> {
@@ -152,7 +152,8 @@ impl<'db> Lower<'_, '_, 'db> {
 
     fn call_glue_holder(&mut self, ty: Ty<'db>, holder: Value) -> Result<(), String> {
         let slot = self.glue_slot(ty)?;
-        let cell = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
+        let at = self.slots().address(slot);
+        let cell = self.builder.ins().iconst(Type::I64, at);
         self.call_cell(cell, GLUE, &[holder]);
         Ok(())
     }
@@ -193,8 +194,9 @@ impl<'db> Lower<'_, '_, 'db> {
         if !matches!(imp.loc(self.db).container, ItemContainerId::ImplId(_)) {
             return Ok(());
         }
-        let slot = self.slots.get(Key::Func(imp, args.store()), GLUE, self.env.store())?;
-        let cell = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
+        let slot = self.slots().get(Key::Func(imp, args.store()), GLUE, self.env.store())?;
+        let at = self.slots().address(slot);
+        let cell = self.builder.ins().iconst(Type::I64, at);
         self.call_cell(cell, GLUE, &[holder]);
         Ok(())
     }

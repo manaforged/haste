@@ -1,9 +1,10 @@
 use hir_def::attrs::AttrFlags;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use anyhow::{Result, anyhow};
-use haste_codegen::{AbiParam, CallConv, Function, FunctionBuilder, Memory, Signature, Type};
+use haste_codegen::{AbiParam, CallConv, Memory, Signature, Type};
 use either::Either;
 use hir_def::builtin_derive::BuiltinDeriveImplMethod as Method;
 use hir_def::signatures::FunctionSignature;
@@ -18,15 +19,15 @@ use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 
 use hir_ty::mir::MirLowerError;
 
-use crate::lower::Lower;
 use crate::lower::native::NativeSig;
 
+mod build;
 mod compiler;
 mod entry;
 mod slots;
 mod specialize;
 
-pub use compiler::{compile_slot, watch_forks};
+pub use compiler::{compile_slot, quiesce, watch_forks};
 pub use slots::{Key, Sig, Slots};
 use slots::TABLE_SLOTS;
 
@@ -96,15 +97,24 @@ enum Work<'db> {
     Native(Target<'db>, NativeSig),
 }
 
-pub struct Backend {
+struct State {
     memory: Memory,
-    slots: Slots,
     digests: HashMap<usize, u64>,
-    pub stubs: Vec<(String, String)>,
+    claimed: std::collections::HashSet<usize>,
+    stubs: Vec<(String, String)>,
     order: Vec<usize>,
-    pub compiled_total: usize,
+    compiled_total: usize,
     unmapped: Vec<(usize, usize, String, Vec<crate::fault::Site>)>,
     cursor: usize,
+}
+
+/// The JIT: the slot table, code memory and what is compiled, shared by every thread that compiles.
+pub struct Backend {
+    slots: Mutex<Slots>,
+    state: Mutex<State>,
+    done: Condvar,
+    publish: Mutex<()>,
+    table: &'static [AtomicUsize],
     dump: bool,
     pub verbose: bool,
 }
@@ -119,33 +129,61 @@ extern "C" fn missing_code() -> ! {
     std::process::abort()
 }
 
-
 pub use entry::{call, enter};
 
+std::thread_local! {
+    static NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records why the function being compiled on this thread got a stub in place of some call.
+pub fn note(text: String) {
+    NOTES.with_borrow_mut(|notes| notes.push(text));
+}
+
+/// How many notes this thread has recorded, to drop the ones an abandoned inline attempt made.
+pub fn note_count() -> usize {
+    NOTES.with_borrow(Vec::len)
+}
+
+/// Drops this thread's notes after the first `count`.
+pub fn truncate_notes(count: usize) {
+    NOTES.with_borrow_mut(|notes| notes.truncate(count));
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 impl Backend {
     pub fn new(dump: bool, verbose: bool) -> Result<Self> {
-        let table = (0..TABLE_SLOTS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
-        let mut backend = Self {
+        let table: &'static [AtomicUsize] = Box::leak((0..TABLE_SLOTS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>().into_boxed_slice());
+        let slots = Slots {
+            table,
+            by_key: HashMap::new(),
+            info: Vec::new(),
+            pending: Vec::new(),
+            native_words: Vec::new(),
+            statics: HashMap::new(),
+            lazy_statics: HashMap::new(),
+            thread_locals: HashMap::new(),
+            vtables: HashMap::new(),
+        };
+        let state = State {
             memory: Memory::default(),
-            slots: Slots {
-                table: Box::leak(table.into_boxed_slice()),
-                by_key: HashMap::new(),
-                info: Vec::new(),
-                pending: Vec::new(),
-                native_words: Vec::new(),
-                statics: HashMap::new(),
-                lazy_statics: HashMap::new(),
-                thread_locals: HashMap::new(),
-                vtables: HashMap::new(),
-                notes: Vec::new(),
-            },
             digests: HashMap::new(),
+            claimed: std::collections::HashSet::new(),
             stubs: Vec::new(),
             order: Vec::new(),
             compiled_total: 0,
             unmapped: Vec::new(),
             cursor: 0,
+        };
+        let backend = Self {
+            slots: Mutex::new(slots),
+            state: Mutex::new(state),
+            done: Condvar::new(),
+            publish: Mutex::new(()),
+            table,
             dump,
             verbose,
         };
@@ -153,22 +191,48 @@ impl Backend {
         Ok(backend)
     }
 
+    fn slots(&self) -> MutexGuard<'_, Slots> {
+        locked(&self.slots)
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        locked(&self.state)
+    }
+
     pub fn functions(&self) -> Vec<FunctionId> {
-        self.slots.functions()
+        self.slots().functions()
     }
 
     pub fn table(&self) -> &'static [AtomicUsize] {
-        self.slots.table
+        self.table
     }
 
-    pub fn entry<'db>(&mut self, db: &'db dyn HirDatabase, func: FunctionId) -> Result<(usize, bool), String> {
+    /// How many slots exist; the slots one compile adds are the callees it found.
+    pub fn slot_count(&self) -> usize {
+        self.slots().info.len()
+    }
+
+    /// Whether `slot` has code or a trap.
+    pub fn compiled(&self, slot: usize) -> bool {
+        self.state().digests.contains_key(&slot)
+    }
+
+    pub fn compiled_total(&self) -> usize {
+        self.state().compiled_total
+    }
+
+    pub fn take_stubs(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.state().stubs)
+    }
+
+    pub fn entry<'db>(&self, db: &'db dyn HirDatabase, func: FunctionId) -> Result<(usize, bool), String> {
         let (slot, body) = self.instance(db, func, GenericArgs::empty(), func)?;
         Ok((slot, entry::takes_and_returns_i64(body)))
     }
 
     /// Gives the table slot of `func` with `args`, resolving impls as `scope` sees them, called through `enter`.
     pub fn instance<'db>(
-        &mut self,
+        &self,
         db: &'db dyn HirDatabase,
         func: FunctionId,
         args: GenericArgs<'db>,
@@ -179,141 +243,57 @@ impl Backend {
         let body = body_of(db, env, &target)?;
         let sig = Sig { by_value: 0, ..signature_of(db, env, body)? };
         let key = key_of(&target).ok_or("entry is not compiled")?;
-        let slot = self.slots.get(key, sig, env.store())?;
+        let slot = self.slots().get(key, sig, env.store())?;
         self.publish_stubs()?;
         Ok((slot, body))
     }
 
-    pub fn replay<'db>(&mut self, db: &'db dyn HirDatabase, order: &[usize]) {
+    pub fn replay<'db>(&self, db: &'db dyn HirDatabase, order: &[usize]) {
         for slot in order.iter().copied() {
-            if slot < self.slots.info.len() && !self.digests.contains_key(&slot) {
+            if slot < self.slot_count() {
                 self.compile(db, slot);
             }
         }
-        self.order.clear();
+        self.state().order.clear();
     }
 
-    pub fn take_order(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.order)
+    pub fn take_order(&self) -> Vec<usize> {
+        std::mem::take(&mut self.state().order)
     }
 
-    pub fn compile<'db>(&mut self, db: &'db dyn HirDatabase, slot: usize) {
-        self.order.push(slot);
-        let info = &self.slots.info[slot];
-        let (key, sig, env) = (info.key.clone(), info.sig, info.env.clone());
-        let env = env.as_ref(db);
-        let name = key_name(db, &key);
-        let lowered = self.compile_key(db, env, &name, &key, sig);
-        for note in std::mem::take(&mut self.slots.notes) {
-            if self.verbose {
-                println!("stub {name}: {note}");
-            }
-            self.stubs.push((name.clone(), note));
-        }
-        match lowered {
-            Ok(id) => {
-                self.digests.insert(slot, target_digest(db, env, &target_of(&key)));
-                self.finish(slot, id);
-            }
-            Err(reason) => {
-                if self.verbose {
-                    println!("stub {name}: {reason}");
-                }
-                let message = format!("{name}: {reason}");
-                self.stubs.push((name, reason));
-                self.digests.insert(slot, 0);
-                let id = self.trap_function(sig, native_of(&key), &message).unwrap_or_else(|why| {
-                    self.stubs.push(("trap".to_owned(), why));
-                    missing_code as *const () as usize
-                });
-                self.finish(slot, id);
-            }
-        }
-    }
-
-    fn compile_key<'db>(
-        &mut self,
-        db: &'db dyn HirDatabase,
-        env: ParamEnvAndCrate<'db>,
-        name: &str,
-        key: &Key,
-        sig: Sig,
-    ) -> Result<usize, String> {
-        match key {
-            Key::Func(..) | Key::Closure(..) => {
-                let target = target_of(key);
-                let body = body_of(db, env, &target)?;
-                site_fits(db, env, body, sig)?;
-                self.lower(db, env, name, body, sig, Work::Body)
-            }
-            Key::Glue(ty) => {
-                let entry = self.slots.info.first().ok_or("no entry")?.key.clone();
-                let body = body_of(db, env, &target_of(&entry))?;
-                self.lower(db, env, name, body, sig, Work::Glue(ty.as_ref()))
-            }
-            Key::Const(id, args) => {
-                let body = db
-                    .monomorphized_mir_body((*id).into(), args.clone(), env.store())
-                    .map_err(|error| format!("constant: {error:?}"))?;
-                self.lower(db, env, name, body, sig, Work::Body)
-            }
-            Key::Static(id) => {
-                let body = db
-                    .monomorphized_mir_body((*id).into(), GenericArgs::empty().store(), env.store())
-                    .map_err(|error| format!("static: {error:?}"))?;
-                self.lower(db, env, name, body, sig, Work::Body)
-            }
-            Key::Derive(method, func, args) => {
-                let entry = self.slots.info.first().ok_or("no entry")?.key.clone();
-                let body = body_of(db, env, &target_of(&entry))?;
-                self.lower(db, env, name, body, sig, Work::Derive(*method, *func, args.as_ref()))
-            }
-            Key::Shim(ty) => {
-                let entry = self.slots.info.first().ok_or("no entry")?.key.clone();
-                let body = body_of(db, env, &target_of(&entry))?;
-                self.lower(db, env, name, body, sig, Work::Shim(ty.as_ref()))
-            }
-            Key::Native(inner, native) => {
-                let target = target_of(inner);
-                let body = body_of(db, env, &target)?;
-                self.lower(db, env, name, body, sig, Work::Native(target, native.clone()))
-            }
-            Key::Thunk(inner, data) => {
-                let target = target_of(inner);
-                let body = body_of(db, env, &target)?;
-                self.lower(db, env, name, body, sig, Work::Thunk(target, *data))
-            }
-        }
-    }
-
-    pub fn next_uncompiled(&mut self) -> Option<usize> {
-        while self.cursor < self.slots.info.len() {
-            let slot = self.cursor;
-            self.cursor += 1;
-            if !self.digests.contains_key(&slot) {
+    pub fn next_uncompiled(&self) -> Option<usize> {
+        let count = self.slot_count();
+        let mut state = self.state();
+        while state.cursor < count {
+            let slot = state.cursor;
+            state.cursor += 1;
+            if !state.digests.contains_key(&slot) {
                 return Some(slot);
             }
         }
         None
     }
 
-    pub fn mark_failed(&mut self, slot: usize) {
-        self.digests.insert(slot, 0);
-        self.slots.table[slot].store(missing_code as *const () as usize, Ordering::Release);
+    pub fn mark_failed(&self, slot: usize) {
+        self.state().digests.insert(slot, 0);
+        self.table[slot].store(missing_code as *const () as usize, Ordering::Release);
     }
 
-    pub fn refresh<'db>(&mut self, db: &'db dyn HirDatabase) -> Result<Vec<String>, String> {
+    pub fn refresh<'db>(&self, db: &'db dyn HirDatabase) -> Result<Vec<String>, String> {
         let mut changed = Vec::new();
-        for slot in self.digests.keys().copied().collect::<Vec<_>>() {
-            let info = &self.slots.info[slot];
-            let (key, env) = (info.key.clone(), info.env.clone());
+        let digests: Vec<(usize, u64)> = self.state().digests.iter().map(|(slot, digest)| (*slot, *digest)).collect();
+        for (slot, old) in digests {
+            let (key, env) = {
+                let slots = self.slots();
+                (slots.info[slot].key.clone(), slots.info[slot].env.clone())
+            };
             if !matches!(key, Key::Func(..) | Key::Closure(..)) {
                 continue;
             }
             let env = env.as_ref(db);
             let target = target_of(&key);
             let digest = target_digest(db, env, &target);
-            if self.digests.get(&slot) == Some(&digest) {
+            if old == digest {
                 continue;
             }
             let body = body_of(db, env, &target).map_err(|why| format!("{}: {why}", name_of(db, &target)))?;
@@ -322,7 +302,7 @@ impl Backend {
         let mut names = Vec::with_capacity(changed.len());
         let mut done = Vec::with_capacity(changed.len());
         for (slot, name, body, env, digest) in changed {
-            let sig = self.slots.info[slot].sig;
+            let sig = self.slots().info[slot].sig;
             let found = signature_of(db, env, body)?;
             if found.params != sig.params || found.ret != sig.ret || sig.by_value & !found.by_value != 0 {
                 return Err(format!("{name}: signature changed"));
@@ -333,126 +313,12 @@ impl Backend {
         }
         self.publish_stubs()?;
         for (slot, id, digest) in done {
-            self.digests.insert(slot, digest);
-            self.slots.table[slot].store(id, Ordering::Release);
+            self.state().digests.insert(slot, digest);
+            self.table[slot].store(id, Ordering::Release);
         }
         Ok(names)
     }
 
-    fn finish(&mut self, slot: usize, id: usize) {
-        self.compiled_total += 1;
-        let id = match self.publish_stubs() {
-            Ok(()) => id,
-            Err(reason) => {
-                self.stubs.push(("table".to_owned(), reason));
-                missing_code as *const () as usize
-            }
-        };
-        self.slots.table[slot].store(id, Ordering::Release);
-    }
-
-    fn publish_stubs(&mut self) -> Result<(), String> {
-        let pending = std::mem::take(&mut self.slots.pending);
-        let mut made = Vec::with_capacity(pending.len());
-        for (done, slot) in pending.iter().copied().enumerate() {
-            match self.compile_stub(slot) {
-                Ok(code) => made.push((slot, code)),
-                Err(reason) => {
-                    self.slots.pending.extend_from_slice(&pending[done..]);
-                    return Err(reason);
-                }
-            }
-        }
-        for (code, size, name, sites) in std::mem::take(&mut self.unmapped) {
-            crate::fault::remember(code, size, name, sites);
-        }
-        for (slot, code) in made {
-            self.slots.table[slot].store(code, Ordering::Release);
-        }
-        for (word, slot) in std::mem::take(&mut self.slots.native_words) {
-            let code = self.slots.table[slot].load(Ordering::Acquire);
-            // SAFETY: word is a function pointer field inside constant data this engine leaked, and nothing runs that data until publish returns.
-            unsafe { (word as *mut usize).write_unaligned(code) };
-        }
-        Ok(())
-    }
-
-    fn define(&mut self, func: &Function, name: &str) -> Result<usize, String> {
-        let compiled = haste_codegen::compile(func)?;
-        let code = self.memory.write(&compiled.code)?;
-        self.unmapped.push((code, compiled.code.len(), name.to_owned(), compiled.sites));
-        Ok(code)
-    }
-
-    fn compile_stub(&mut self, slot: usize) -> Result<usize, String> {
-        let sig = self.slots.info[slot].sig;
-        let signature = signature_for(sig, native_of(&self.slots.info[slot].key));
-        let address = self.slots.address(slot);
-        let mut func = Function::new(signature.clone());
-        let mut builder = FunctionBuilder::new(&mut func);
-        let block = builder.create_block();
-        builder.append_block_params_for_function_params(block);
-        builder.switch_to_block(block);
-        let params = builder.block_params(block).to_vec();
-        let mut host = Signature::new(CallConv::Native);
-        host.params.push(AbiParam::new(Type::I64));
-        let host = builder.import_signature(host);
-        let code = builder.ins().iconst(Type::I64, compile_slot as *const () as usize as i64);
-        let number = builder.ins().iconst(Type::I64, slot as i64);
-        builder.ins().call_indirect(host, code, &[number]);
-        let target = builder.import_signature(signature);
-        let address = builder.ins().iconst(Type::I64, address);
-        let code = builder.ins().load(Type::I64, address, 0);
-        let call = builder.ins().call_indirect(target, code, &params);
-        let results = builder.inst_results(call).to_vec();
-        builder.ins().return_(&results);
-        self.define(&func, STUB_NAME)
-    }
-
-    fn trap_function(&mut self, sig: Sig, native: Option<&NativeSig>, reason: &str) -> Result<usize, String> {
-        let mut func = Function::new(signature_for(sig, native));
-        let mut builder = FunctionBuilder::new(&mut func);
-        let block = builder.create_block();
-        builder.append_block_params_for_function_params(block);
-        builder.switch_to_block(block);
-        let (text, size) = leak_text(reason);
-        let mut host = Signature::new(CallConv::Native);
-        host.params.extend([AbiParam::new(Type::I64); 2]);
-        let host = builder.import_signature(host);
-        let code = builder.ins().iconst(Type::I64, report_trap as *const () as usize as i64);
-        let text = builder.ins().iconst(Type::I64, text);
-        let size = builder.ins().iconst(Type::I64, size);
-        builder.ins().call_indirect(host, code, &[text, size]);
-        builder.ins().trap();
-        self.define(&func, STUB_NAME)
-    }
-
-    fn lower<'db>(
-        &mut self,
-        db: &'db dyn HirDatabase,
-        env: ParamEnvAndCrate<'db>,
-        name: &str,
-        body: &'db MirBody<'db>,
-        sig: Sig,
-        work: Work<'db>,
-    ) -> Result<usize, String> {
-        let native = if let Work::Native(_, native) = &work { Some(native.clone()) } else { None };
-        let mut func = Function::new(signature_for(sig, native.as_ref()));
-        let mut builder = FunctionBuilder::new(&mut func);
-        let lower = Lower::new(db, env, body, &mut builder, &mut self.slots, CallConv::Native, sig);
-        match work {
-            Work::Body => lower.run(),
-            Work::Glue(ty) => lower.glue(ty),
-            Work::Thunk(target, data) => lower.thunk(target, data),
-            Work::Shim(ty) => lower.shim(ty),
-            Work::Native(target, native) => lower.native(target, &native),
-            Work::Derive(method, func, args) => lower.derive(method, func, args),
-        }?;
-        if self.dump {
-            println!("=== {name}\n{func}");
-        }
-        self.define(&func, name)
-    }
 }
 
 fn signature_for(sig: Sig, native: Option<&NativeSig>) -> Signature {

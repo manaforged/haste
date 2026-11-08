@@ -70,7 +70,7 @@ pub fn run(db: RootDatabase, entry: &str) -> Result<()> {
     Ok(())
 }
 
-fn report(db: &dyn HirDatabase, backend: &mut crate::backend::Backend) {
+fn report(db: &dyn HirDatabase, backend: &crate::backend::Backend) {
     let mut needed = Needed::default();
     let functions = backend.functions();
     for function in &functions {

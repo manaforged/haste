@@ -56,7 +56,8 @@ impl<'db> Lower<'_, '_, 'db> {
             return Ok(self.builder.ins().iconst(Type::I64, code as i64));
         }
         let slot = self.native_slot(ty)?;
-        let cell = self.builder.ins().iconst(Type::I64, self.slots.address(slot));
+        let at = self.slots().address(slot);
+        let cell = self.builder.ins().iconst(Type::I64, at);
         Ok(self.load(Type::I64, cell, 0))
     }
 
@@ -69,7 +70,7 @@ impl<'db> Lower<'_, '_, 'db> {
         let (params, ret) = self.target_shape(&target)?;
         let native = self.native_sig(&params, ret)?;
         let sig = Sig::new(native.arity(), native.ret.is_some());
-        self.slots.get(Key::Native(Box::new(key), native), sig, self.env.store())
+        self.slots().get(Key::Native(Box::new(key), native), sig, self.env.store())
     }
 
     fn native_sig(&self, params: &[Ty<'db>], ret: Ty<'db>) -> Result<NativeSig, String> {
@@ -202,8 +203,11 @@ impl<'db> Lower<'_, '_, 'db> {
     }
 
     pub(super) fn thread_local_address(&mut self, id: StaticId, template: usize, size: u64) -> Value {
-        let next = self.slots.thread_locals.len();
-        let index = *self.slots.thread_locals.entry(id).or_insert(next);
+        let index = {
+            let mut slots = self.slots();
+            let next = slots.thread_locals.len();
+            *slots.thread_locals.entry(id).or_insert(next)
+        };
         let mut signature = Signature::new(self.call_conv);
         signature.params.extend([AbiParam::new(Type::I64); 3]);
         signature.returns.push(AbiParam::new(Type::I64));

@@ -59,7 +59,6 @@ pub struct Slots {
     pub lazy_statics: HashMap<StaticId, (usize, usize)>,
     pub thread_locals: HashMap<StaticId, usize>,
     pub vtables: HashMap<(StoredTy, StoredTy), i64>,
-    pub notes: Vec<String>,
 }
 
 impl Slots {

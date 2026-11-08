@@ -33,7 +33,7 @@ pub fn call(table: &[AtomicUsize], slot: usize, value: i64) -> i64 {
 
 impl Backend {
     /// Gives the slot of `<T as Termination>::report` for the type `main` returns, or `None` when it returns `()`.
-    pub fn report<'db>(&mut self, db: &'db dyn HirDatabase, main: FunctionId) -> Result<Option<usize>, String> {
+    pub fn report<'db>(&self, db: &'db dyn HirDatabase, main: FunctionId) -> Result<Option<usize>, String> {
         let env = env_of(db, main);
         let body = body_of(db, env, &Target::Func(main, GenericArgs::empty()))?;
         let ret = body.locals.iter().next().ok_or("main has no return local")?.1.ty.as_ref();
@@ -48,7 +48,7 @@ impl Backend {
         Ok(Some(slot))
     }
 
-    pub(super) fn compile_entry(&mut self) -> Result<(), String> {
+    pub(super) fn compile_entry(&self) -> Result<(), String> {
         let mut signature = Signature::new(CallConv::Native);
         signature.params.extend([AbiParam::new(Type::I64); 3]);
         let mut func = Function::new(signature);

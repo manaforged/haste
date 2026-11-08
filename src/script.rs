@@ -1,4 +1,5 @@
 pub mod census;
+mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -51,7 +52,9 @@ type Exports = BTreeMap<String, Vec<(String, String)>>;
 
 struct Script {
     label: String,
-    function: FunctionId,
+    version: String,
+    krate: Crate,
+    registry: bool,
     env: BTreeMap<String, String>,
     manifest: PathBuf,
     name: String,
@@ -70,7 +73,21 @@ struct Forked {
     read: std::io::PipeReader,
 }
 
+/// How a build reaches each build script's output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Scripts {
+    /// Runs every script and keeps nothing.
+    Live,
+    /// Uses the saved output under the project when its key matches, and runs the rest.
+    Saved,
+    /// Runs every script and saves its output under the project.
+    Generate,
+}
+
 struct Loaded<'a> {
+    root: &'a Path,
+    mode: Scripts,
+    release: String,
     vfs: &'a mut vfs::Vfs,
     roots: &'a SourceRootConfig,
     shared: &'a BTreeMap<String, String>,
@@ -118,7 +135,7 @@ fn rustc_text(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(Command::new("rustc").args(args).output()?.stdout)?)
 }
 
-fn target_envs() -> Result<BTreeMap<String, String>> {
+fn target_envs() -> Result<(BTreeMap<String, String>, String)> {
     let mut env = BTreeMap::new();
     let version = rustc_text(&["-vV"])?;
     let Some(host) = version.lines().find_map(|line| line.strip_prefix("host: ")) else {
@@ -135,7 +152,7 @@ fn target_envs() -> Result<BTreeMap<String, String>> {
     for (key, values) in cfgs {
         env.insert(format!("CARGO_CFG_{key}"), values.join(","));
     }
-    Ok(env)
+    Ok((env, version))
 }
 
 fn main_of(db: &dyn HirDatabase, krate: Crate) -> Option<FunctionId> {
@@ -154,13 +171,13 @@ fn script_of(db: &dyn HirDatabase, members: &[Crate], shared: &BTreeMap<String, 
     let mut env = envs_of(db, krate);
     Some((|| {
         let (name, version) = package_key(&env).ok_or("the script has no CARGO_PKG_NAME or CARGO_PKG_VERSION")?;
-        let function = main_of(db, krate).ok_or_else(|| format!("{name} {version}: the script has no main"))?;
         let manifest = PathBuf::from(env.get("CARGO_MANIFEST_DIR").ok_or_else(|| format!("{name} {version}: no CARGO_MANIFEST_DIR"))?);
         let out_text = env.get(OUT_ENV).ok_or_else(|| format!("{name} {version}: no {OUT_ENV}"))?.clone();
         feature_envs(db, krate, &mut env);
         env.extend(shared.clone());
         env.extend(dep_envs(db, members, exports));
-        Ok(Script { label: format!("{name} {version}"), function, env, manifest, name, out: PathBuf::from(&out_text), out_text })
+        let registry = !krate.data(db).origin.is_local();
+        Ok(Script { label: format!("{name} {version}"), version, krate, registry, env, manifest, name, out: PathBuf::from(&out_text), out_text })
     })())
 }
 
@@ -247,12 +264,13 @@ fn run_of(output: String, status: i32) -> Run {
     Run::Failed(format!("status {status:#x}: {tail}"))
 }
 
-fn run_batch(scripts: &[Script]) -> Result<Vec<Run>> {
+fn start_batch<'a>(scripts: impl Iterator<Item = &'a Script>) -> Vec<Result<Forked, String>> {
     let mut started = Vec::new();
     for script in scripts {
         let entered = patch::with_engine(|db, backend| {
-            let (main, _) = backend.entry(db, script.function)?;
-            let report = backend.report(db, script.function).map_err(|why| format!("main's result: {why}"))?;
+            let function = main_of(db, script.krate).ok_or_else(|| format!("{}: the script has no main", script.label))?;
+            let (main, _) = backend.entry(db, function)?;
+            let report = backend.report(db, function).map_err(|why| format!("main's result: {why}"))?;
             Ok::<_, String>((Entry { main, report }, backend.table()))
         });
         started.push(match entered {
@@ -263,6 +281,10 @@ fn run_batch(scripts: &[Script]) -> Result<Vec<Run>> {
             Err(reason) => Err(reason),
         });
     }
+    started
+}
+
+fn collect_batch(started: Vec<Result<Forked, String>>) -> Result<Vec<Run>> {
     std::thread::scope(|scope| {
         let readers: Vec<_> = started.into_iter().map(|forked| scope.spawn(move || forked.map(collect_forked))).collect();
         readers.into_iter().map(|reader| finish_run(reader.join().expect("reader thread"))).collect()
@@ -308,7 +330,7 @@ fn export_key(links: &str, key: &str) -> String {
     format!("DEP_{links}_{key}").to_uppercase().replace('-', "_")
 }
 
-fn apply_output(state: &mut Loaded<'_>, members: &[Crate], script: &Script, output: &str) -> Result<()> {
+fn apply_output(state: &mut Loaded<'_>, members: &[Crate], script: &Script, output: &str, files: Vec<(AbsPathBuf, Vec<u8>)>) -> Result<()> {
     let mut cfgs = Vec::new();
     let mut envs = Vec::new();
     let mut exports = Vec::new();
@@ -323,8 +345,6 @@ fn apply_output(state: &mut Loaded<'_>, members: &[Crate], script: &Script, outp
         let keyed = exports.into_iter().map(|(key, text)| (export_key(links, &key), text));
         state.exports.insert(script.out_text.clone(), keyed.collect());
     }
-    let mut files = Vec::new();
-    add_files_under(&script.out, &mut files)?;
     patch::with_database(|db| {
         let built: Vec<Crate> = members.iter().copied().filter(|krate| !is_script(db, *krate)).collect();
         for krate in built {
@@ -335,6 +355,19 @@ fn apply_output(state: &mut Loaded<'_>, members: &[Crate], script: &Script, outp
         }
     });
     Ok(())
+}
+
+fn macro_units(units: &Units) -> BTreeSet<String> {
+    patch::with_engine(|db, _| {
+        let mut reach = BTreeSet::new();
+        let mut stack: Vec<Crate> = all_crates(db).iter().copied().filter(|krate| krate.data(db).target_kind.is_proc_macro()).collect();
+        while let Some(krate) = stack.pop() {
+            if reach.insert(krate) {
+                stack.extend(krate.data(db).dependencies.iter().map(|dep| dep.crate_id));
+            }
+        }
+        units.iter().filter(|(_, members)| members.iter().any(|member| reach.contains(member))).map(|(out, _)| out.clone()).collect()
+    })
 }
 
 fn units_of(db: &dyn HirDatabase) -> Units {
@@ -377,7 +410,15 @@ fn layers_of(db: &dyn HirDatabase, units: &Units) -> Vec<Vec<String>> {
     layers.into_values().collect()
 }
 
-fn run_outs(state: &mut Loaded<'_>, units: &Units, outs: &[String], outcomes: &mut Vec<Outcome>) -> Result<()> {
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(1, |count| count.get())
+}
+
+fn binaries() -> Vec<Crate> {
+    patch::with_engine(|db, _| crate::local_crates(db).into_iter().filter(|krate| !is_script(db, *krate)).collect())
+}
+
+fn run_outs(state: &mut Loaded<'_>, units: &Units, outs: &[String], warm: bool, outcomes: &mut Vec<Outcome>) -> Result<()> {
     let scripts = patch::with_engine(|db, _| {
         let found = outs.iter().filter_map(|out| script_of(db, &units[out], state.shared, &state.exports));
         let (scripts, skipped): (Vec<_>, Vec<_>) = found.partition(Result::is_ok);
@@ -386,32 +427,108 @@ fn run_outs(state: &mut Loaded<'_>, units: &Units, outs: &[String], outcomes: &m
         }
         scripts.into_iter().filter_map(Result::ok).collect::<Vec<_>>()
     });
-    let runs = run_batch(&scripts)?;
-    for (script, run) in scripts.into_iter().zip(runs) {
-        match &run {
-            Run::Done(output) => apply_output(state, &units[&script.out_text], &script, output)?,
-            Run::Failed(reason) => println!("script_failed {}: {reason}", script.label),
+    let mut live = Vec::new();
+    for script in scripts {
+        let place = place_of(state, &script);
+        match (state.mode == Scripts::Saved && script.registry).then(|| store::load(&place)).flatten() {
+            Some(saved) => {
+                store::write(&saved.files)?;
+                apply_output(state, &units[&script.out_text], &script, &saved.stdout, saved.files)?;
+                outcomes.push(Outcome { label: script.label, name: script.name, out: script.out, run: Run::Done(saved.stdout) });
+            }
+            None => live.push((script, place)),
         }
+    }
+    let started = start_batch(live.iter().map(|(script, _)| script));
+    let warmer = warm.then(|| crate::warm::Warmer::start(binaries(), cores()));
+    let runs = collect_batch(started);
+    if let Some(warmer) = warmer {
+        warmer.stop();
+    }
+    let runs = runs?;
+    for ((script, place), run) in live.into_iter().zip(runs) {
+        finish_live(state, &units[&script.out_text], &script, &place, &run)?;
         outcomes.push(Outcome { label: script.label, name: script.name, out: script.out, run });
     }
     Ok(())
 }
 
+fn finish_live(state: &mut Loaded<'_>, members: &[Crate], script: &Script, place: &store::Place, run: &Run) -> Result<()> {
+    match run {
+        Run::Done(output) => {
+            let mut files = Vec::new();
+            add_files_under(&script.out, &mut files)?;
+            if state.mode == Scripts::Generate && script.registry {
+                store::save(place, output, &files)?;
+            }
+            apply_output(state, members, script, output, files)
+        }
+        Run::Failed(reason) => {
+            println!("script_failed {}: {reason}", script.label);
+            Ok(())
+        }
+    }
+}
+
+const KEY_PREFIXES: &[&str] = &["CARGO_FEATURE_", "CARGO_CFG_", "DEP_", "TARGET"];
+
+fn place_of(state: &Loaded<'_>, script: &Script) -> store::Place {
+    let keyed = script.env.iter().filter(|(key, _)| KEY_PREFIXES.iter().any(|prefix| key.starts_with(prefix)));
+    let mut key: String = keyed.map(|(key, value)| format!("{key}={value}\n")).collect();
+    key.push_str(&state.release);
+    store::Place::new(state.root, &script.name, &script.version, key, &script.out)
+}
+
+/// Runs the local binary's main in this process and returns its exit code.
+pub fn run_binary(db: RootDatabase) -> Result<i32> {
+    let warmed = std::time::Instant::now();
+    let binaries: Vec<Crate> = crate::local_crates(&db).into_iter().filter(|krate| !is_script(&db, *krate)).collect();
+    crate::warm::warm(&db, &binaries, cores());
+    eprintln!("warm {:.2}s", warmed.elapsed().as_secs_f64());
+    patch::start(db, false, false)?;
+    let entered = patch::with_engine(|db, backend| {
+        let binaries = crate::local_crates(db).into_iter().filter(|krate| !is_script(db, *krate));
+        let function = binaries.filter_map(|krate| main_of(db, krate)).next().ok_or("no local crate has a main")?;
+        let (main, _) = backend.entry(db, function)?;
+        let report = backend.report(db, function).map_err(|why| format!("main's result: {why}"))?;
+        Ok::<_, String>((Entry { main, report }, backend.table()))
+    });
+    let (entry, table) = entered.map_err(anyhow::Error::msg)?;
+    let code = run_main(table, entry);
+    let (compiled, slots) = patch::with_engine(|_, backend| (backend.compiled_total(), backend.slot_count()));
+    let (replayed, live) = crate::macros::replay::counts();
+    eprintln!("compiled {compiled} of {slots} functions, replayed {replayed} expansions, expanded {live} live");
+    Ok(code)
+}
+
+/// Expands every crate's item macros and saves the recorded expansions.
+pub fn expand_all(db: RootDatabase) -> Result<usize> {
+    patch::start(db, false, false)?;
+    patch::with_engine(|db, _| {
+        for krate in all_crates(db).iter().copied() {
+            hir_def::nameres::crate_def_map(db, krate);
+        }
+    });
+    crate::macros::replay::save()
+}
+
 /// Runs the build scripts layer by layer in parallel and applies each output to its unit.
-pub fn run_all(db: RootDatabase, vfs: &mut vfs::Vfs, roots: &SourceRootConfig) -> Result<(RootDatabase, Vec<Outcome>)> {
-    let shared = target_envs()?;
+pub fn run_all(db: RootDatabase, vfs: &mut vfs::Vfs, roots: &SourceRootConfig, root: &Path, mode: Scripts) -> Result<(RootDatabase, Vec<Outcome>)> {
+    let (shared, release) = target_envs()?;
     patch::start(db, false, false)?;
     let (units, layers) = patch::with_engine(|db, _| {
         let units = units_of(db);
         let layers = layers_of(db, &units);
         (units, layers)
     });
-    let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
-    let mut state = Loaded { vfs, roots, shared: &shared, exports: BTreeMap::new() };
+    let macro_units = macro_units(&units);
+    let chunks: Vec<&[String]> = layers.iter().flat_map(|layer| layer.chunks(cores())).collect();
+    let mut state = Loaded { root, mode, release, vfs, roots, shared: &shared, exports: BTreeMap::new() };
     let mut outcomes = Vec::new();
-    for layer in &layers {
-        for outs in layer.chunks(cores) {
-            run_outs(&mut state, &units, outs, &mut outcomes)?;
+    for (index, outs) in chunks.iter().enumerate() {
+        let warm = chunks[index..].iter().flat_map(|chunk| chunk.iter()).all(|out| !macro_units.contains(out));
+        run_outs(&mut state, &units, outs, warm, &mut outcomes)?;
+        if outs.iter().any(|out| macro_units.contains(out)) {
             crate::macros::refresh();
         }
     }
