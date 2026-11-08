@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::ir::{Binary, Block, Function, Inst, InstData, Op, StackSlot, Type, Value};
 
@@ -57,7 +57,7 @@ impl Scan {
     }
 
     fn addresses(&mut self, func: &Function) {
-        let mut consts = HashMap::new();
+        let mut consts = HashMap::default();
         let mut adds = Vec::new();
         for inst in func.blocks.iter().flat_map(|block| &block.insts) {
             let data = &func.insts[inst.index()];
@@ -187,7 +187,7 @@ impl Local {
     fn new(scan: &Scan) -> Self {
         let count = scan.vars.len();
         let mut local =
-            Local { defs: vec![HashMap::new(); count], exposed: vec![Vec::new(); count], forward: vec![Vec::new(); count] };
+            Local { defs: vec![HashMap::default(); count], exposed: vec![Vec::new(); count], forward: vec![Vec::new(); count] };
         for access in &scan.accesses {
             let defs = &mut local.defs[access.var];
             match access.kind {
@@ -530,7 +530,7 @@ pub(crate) fn run(func: &mut Function) {
     let local = Local::new(&scan);
     let fresh = Fresh { base: func.types.len(), types: Vec::new(), zeros: Vec::new() };
     let promoted = vec![false; func.slots.len()];
-    let mut pass = Pass { cfg: Cfg::new(func, entry), scan, local, fresh, subst: HashMap::new(), promoted };
+    let mut pass = Pass { cfg: Cfg::new(func, entry), scan, local, fresh, subst: HashMap::default(), promoted };
     for slot in 0..func.slots.len() {
         if !pass.scan.promotable(slot) {
             continue;

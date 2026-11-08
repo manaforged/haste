@@ -12,7 +12,7 @@ use super::moves::{Cut, Step};
 use super::{Lower, Place};
 use crate::backend::{Key, Sig};
 
-const GLUE: Sig = Sig { params: 1, ret: false };
+const GLUE: Sig = Sig::new(1, false);
 
 impl<'db> Lower<'_, '_, 'db> {
     pub(super) fn needs_drop(&self, ty: Ty<'db>) -> bool {

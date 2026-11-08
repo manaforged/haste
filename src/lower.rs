@@ -15,7 +15,7 @@ use triomphe::Arc;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
 
-use crate::backend::{Resolved, Shape, Sig, Slots, Target, key_of, pointer_signature, resolve};
+use crate::backend::{Key, Resolved, Shape, Sig, Slots, Target, key_of, pointer_signature, resolve};
 
 mod arith;
 mod c_abi;
@@ -25,6 +25,7 @@ pub mod derive;
 mod drop;
 mod inline;
 mod moves;
+mod pass;
 pub mod intrinsic;
 pub mod native;
 mod pointer;
@@ -120,13 +121,19 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         if self.sig.ret {
             self.ret_pointer = values.next();
         }
+        let mut index = 0;
         for param in &self.body.param_locals {
             let ty = self.body.locals[*param].ty.as_ref();
             let size = self.layout(ty)?.size.bytes();
             if size != 0 {
                 let from = values.next().ok_or("parameter count")?;
                 let to = self.local_addr(*param);
-                self.copy(to, from, size);
+                if self.sig.passes_value(index) {
+                    self.store(from, to, 0);
+                } else {
+                    self.copy(to, from, size);
+                }
+                index += 1;
             }
             self.set_flag(*param, true);
         }
@@ -731,6 +738,7 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
         if ret {
             values.push(dest.addr);
         }
+        let mut by_value = 0_u64;
         if let Target::Closure(closure, args) = callee {
             let body = self
                 .db
@@ -739,20 +747,15 @@ impl<'a, 'f, 'db> Lower<'a, 'f, 'db> {
             let param = body.locals[body.param_locals[0]].ty.as_ref();
             let data = receiver.ok_or("closure without a receiver")?;
             if matches!(param.kind(), TyKind::Ref(..)) {
-                let slot = self.builder.create_stack_slot(8, 3);
-                let holder = self.builder.ins().stack_addr(Type::I64, slot, 0);
-                self.store(data, holder, 0);
-                values.push(holder);
+                by_value |= 1;
+                values.push(data);
             } else if self.layout(param)?.size.bytes() != 0 {
                 values.push(data);
             }
         }
-        for place in places {
-            if self.layout(place.ty.ty)?.size.bytes() != 0 {
-                values.push(place.addr);
-            }
-        }
-        let sig = Sig { params: values.len() - usize::from(ret), ret };
+        let body = matches!(key, Key::Func(..) | Key::Closure(..));
+        let by_value = self.pass(places, usize::from(ret), &mut values, body.then_some(by_value))?;
+        let sig = Sig { params: values.len() - usize::from(ret), ret, by_value };
         let slot = self.slots.get(key, sig, self.env.store())?;
         let mut signature = Signature::new(crate::backend::INTERNAL_CONV);
         pointer_signature(&mut signature, sig);

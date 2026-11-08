@@ -132,11 +132,11 @@ impl<'db> Lower<'_, '_, 'db> {
         let layout = self.layout(ty)?;
         let buffer = leak(&vec![0_u8; layout.size.bytes() as usize + 8]);
         let cell = leak(&[0_u8; 8]);
-        let slot = self.slots.get(Key::Const(id, args.store()), Sig { params: 0, ret: true }, self.env.store())?;
+        let slot = self.slots.get(Key::Const(id, args.store()), Sig::new(0, true), self.env.store())?;
         let addr = self.builder.ins().iconst(Type::I64, buffer as i64);
         self.once(cell, |this| {
             let code = this.builder.ins().iconst(Type::I64, this.slots.address(slot));
-            this.call_cell(code, Sig { params: 0, ret: true }, &[addr]);
+            this.call_cell(code, Sig::new(0, true), &[addr]);
         });
         Ok(Place { addr, ty: PlaceTy::from_ty(ty), meta: None })
     }
@@ -223,7 +223,7 @@ impl<'db> Lower<'_, '_, 'db> {
     fn lazy_static(&mut self, id: StaticId) -> Result<usize, String> {
         let layout = self.layout(self.static_type(id))?;
         let buffer = leak(&vec![0_u8; layout.size.bytes() as usize + 8]);
-        let sig = Sig { params: 0, ret: layout.size.bytes() != 0 };
+        let sig = Sig::new(0, layout.size.bytes() != 0);
         let slot = self.slots.get(Key::Static(id), sig, self.env.store())?;
         let done = leak(&[0_u8; 8]);
         self.slots.lazy_statics.insert(id, (slot, done as usize));

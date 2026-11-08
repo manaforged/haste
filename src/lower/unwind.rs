@@ -6,8 +6,8 @@ use hir_ty::mir::PlaceTy;
 use super::{Lower, Place};
 use crate::backend::{INTERNAL_CONV, Sig, pointer_signature};
 
-const TRY: Sig = Sig { params: 1, ret: false };
-const CATCH: Sig = Sig { params: 2, ret: false };
+const TRY: Sig = Sig::new(1, false);
+const CATCH: Sig = Sig::new(2, false);
 
 impl<'db> Lower<'_, '_, 'db> {
     /// Tells whether a panic at a call here runs cleanup in this frame.

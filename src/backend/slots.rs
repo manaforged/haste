@@ -28,6 +28,19 @@ pub enum Key {
 pub struct Sig {
     pub params: usize,
     pub ret: bool,
+    pub by_value: u64,
+}
+
+impl Sig {
+    /// A signature that passes every parameter by address.
+    pub const fn new(params: usize, ret: bool) -> Self {
+        Sig { params, ret, by_value: 0 }
+    }
+
+    /// Whether parameter `index` arrives as its 8-byte value instead of its address.
+    pub fn passes_value(self, index: usize) -> bool {
+        index < 64 && self.by_value & (1 << index) != 0
+    }
 }
 
 pub(super) struct SlotInfo {

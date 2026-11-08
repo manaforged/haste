@@ -58,7 +58,7 @@ impl Backend {
         builder.switch_to_block(block);
         let params = builder.block_params(block).to_vec();
         let mut target = Signature::new(INTERNAL_CONV);
-        pointer_signature(&mut target, Sig { params: 1, ret: true });
+        pointer_signature(&mut target, Sig::new(1, true));
         let target = builder.import_signature(target);
         let (done, caught) = (builder.create_block(), builder.create_block());
         let exception = builder.append_block_param(caught, Type::I64);

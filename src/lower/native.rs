@@ -68,7 +68,7 @@ impl<'db> Lower<'_, '_, 'db> {
         let key = key_of(&target).ok_or("native pointer to a target without code")?;
         let (params, ret) = self.target_shape(&target)?;
         let native = self.native_sig(&params, ret)?;
-        let sig = Sig { params: native.arity(), ret: native.ret.is_some() };
+        let sig = Sig::new(native.arity(), native.ret.is_some());
         self.slots.get(Key::Native(Box::new(key), native), sig, self.env.store())
     }
 

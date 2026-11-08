@@ -26,10 +26,10 @@ struct Part<'db> {
 
 pub fn derive_sig<'db>(lower_size: impl Fn(Ty<'db>) -> Result<u64, String>, method: Method, self_ty: Ty<'db>) -> Result<Sig, String> {
     Ok(match method {
-        Method::clone => Sig { params: 1, ret: lower_size(self_ty)? != 0 },
-        Method::default => Sig { params: 0, ret: lower_size(self_ty)? != 0 },
-        Method::hash => Sig { params: 2, ret: false },
-        Method::fmt | Method::cmp | Method::partial_cmp | Method::eq => Sig { params: 2, ret: true },
+        Method::clone => Sig::new(1, lower_size(self_ty)? != 0),
+        Method::default => Sig::new(0, lower_size(self_ty)? != 0),
+        Method::hash => Sig::new(2, false),
+        Method::fmt | Method::cmp | Method::partial_cmp | Method::eq => Sig::new(2, true),
     })
 }
 

@@ -24,7 +24,7 @@ pub(crate) fn compile(func: &Function) -> Result<Compiled, String> {
     let abi = classify(&func.signature)?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), plan, flags: None }.run()
+    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), plan, flags: None, next: None }.run()
 }
 
 fn save_slot(index: usize) -> Mem {
@@ -46,6 +46,7 @@ pub(super) struct Emit<'a> {
     sites: Vec<Site>,
     plan: Plan,
     flags: Option<(Value, Cond)>,
+    next: Option<Block>,
 }
 
 impl Emit<'_> {
@@ -53,9 +54,11 @@ impl Emit<'_> {
         let entry = self.func.entry.ok_or("the function has no entry block")?;
         self.prologue();
         self.intake(entry)?;
-        let order = std::iter::once(entry).chain((0..self.func.blocks.len() as u32).map(Block).filter(|block| *block != entry));
-        for block in order.collect::<Vec<_>>() {
-            self.block(block)?;
+        let order = std::iter::once(entry).chain((0..self.func.blocks.len() as u32).map(Block).filter(|block| *block != entry && !self.func.blocks[block.index()].insts.is_empty()));
+        let order: Vec<Block> = order.collect();
+        for (index, block) in order.iter().enumerate() {
+            self.next = order.get(index + 1).copied();
+            self.block(*block)?;
         }
         Ok(Compiled { code: self.asm.finish()?, sites: self.sites })
     }
@@ -179,7 +182,7 @@ impl Emit<'_> {
             Op::TryCall { sig, callee, args, normal, handler } => self.try_call(*sig, *callee, args, *normal, *handler),
             Op::Jump(block, args) => {
                 self.edge(*block, args)?;
-                self.asm.jmp(self.blocks[block.index()]);
+                self.goto(*block, true);
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
@@ -253,11 +256,31 @@ impl Emit<'_> {
             }
         }
         self.edge(then.0, then.1)?;
-        self.asm.jmp(self.blocks[then.0.index()]);
+        self.goto(then.0, false);
         self.asm.bind(other);
         self.edge(otherwise.0, otherwise.1)?;
-        self.asm.jmp(self.blocks[otherwise.0.index()]);
+        self.goto(otherwise.0, true);
         Ok(())
+    }
+
+    fn goto(&mut self, block: Block, last: bool) {
+        let target = self.target(block);
+        if last && (self.next == Some(block) || self.next == Some(target)) {
+            return;
+        }
+        self.asm.jmp(self.blocks[target.index()]);
+    }
+
+    fn target(&self, mut block: Block) -> Block {
+        for _ in 0..self.func.blocks.len() {
+            let data = &self.func.blocks[block.index()];
+            let [only] = data.insts[..] else { return block };
+            match &self.func.insts[only.index()].op {
+                Op::Jump(next, args) if data.params.is_empty() && args.is_empty() => block = *next,
+                _ => return block,
+            }
+        }
+        block
     }
 
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {

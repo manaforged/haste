@@ -3,6 +3,7 @@
 mod builder;
 mod ir;
 mod memory;
+mod merge;
 mod promote;
 mod verify;
 #[cfg(target_arch = "x86_64")]
@@ -31,6 +32,7 @@ pub fn compile(func: &Function) -> Result<Compiled, String> {
     verify::verify(func)?;
     let mut func = func.clone();
     promote::run(&mut func);
+    merge::run(&mut func);
     verify::verify(&func).map_err(|error| format!("after slot promotion: {error}"))?;
     #[cfg(target_arch = "x86_64")]
     return x64::compile(&func);

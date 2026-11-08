@@ -177,7 +177,7 @@ impl Backend {
         let env = env_of(db, scope);
         let target = Target::Func(func, args);
         let body = body_of(db, env, &target)?;
-        let sig = signature_of(db, env, body)?;
+        let sig = Sig { by_value: 0, ..signature_of(db, env, body)? };
         let key = key_of(&target).ok_or("entry is not compiled")?;
         let slot = self.slots.get(key, sig, env.store())?;
         self.publish_stubs()?;
@@ -243,14 +243,7 @@ impl Backend {
             Key::Func(..) | Key::Closure(..) => {
                 let target = target_of(key);
                 let body = body_of(db, env, &target)?;
-                let found = signature_of(db, env, body)?;
-                if found.params != sig.params || !return_fits(db, env, body, found, sig)? {
-                    let params: Vec<String> = body.locals.iter().map(|(_, it)| format!("{:?}", it.ty.as_ref())).take(body.param_locals.len() + 1).collect();
-                    return Err(format!(
-                        "call site and callee disagree on the signature: site {}+{} callee {}+{} ret,params {params:?}",
-                        sig.params, sig.ret, found.params, found.ret
-                    ));
-                }
+                site_fits(db, env, body, sig)?;
                 self.lower(db, env, name, body, sig, Work::Body)
             }
             Key::Glue(ty) => {
@@ -330,7 +323,8 @@ impl Backend {
         let mut done = Vec::with_capacity(changed.len());
         for (slot, name, body, env, digest) in changed {
             let sig = self.slots.info[slot].sig;
-            if signature_of(db, env, body)? != sig {
+            let found = signature_of(db, env, body)?;
+            if found.params != sig.params || found.ret != sig.ret || sig.by_value & !found.by_value != 0 {
                 return Err(format!("{name}: signature changed"));
             }
             let id = self.lower(db, env, &name, body, sig, Work::Body).map_err(|why| format!("{name}: {why}"))?;
@@ -369,7 +363,6 @@ impl Backend {
                 }
             }
         }
-        self.memory.publish()?;
         for (code, size, name, sites) in std::mem::take(&mut self.unmapped) {
             crate::fault::remember(code, size, name, sites);
         }
@@ -577,6 +570,18 @@ fn target_digest<'db>(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>, targ
     body_of(db, env, target).map_or(0, hir_ty::mir::mir_body_digest)
 }
 
+fn site_fits<'db>(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>, body: &MirBody<'db>, sig: Sig) -> Result<(), String> {
+    let found = signature_of(db, env, body)?;
+    if found.params == sig.params && sig.by_value & !found.by_value == 0 && return_fits(db, env, body, found, sig)? {
+        return Ok(());
+    }
+    let params: Vec<String> = body.locals.iter().map(|(_, it)| format!("{:?}", it.ty.as_ref())).take(body.param_locals.len() + 1).collect();
+    Err(format!(
+        "call site and callee disagree on the signature: site {}+{} {:#x} callee {}+{} {:#x} ret,params {params:?}",
+        sig.params, sig.ret, sig.by_value, found.params, found.ret, found.by_value
+    ))
+}
+
 fn return_fits<'db>(
     db: &'db dyn HirDatabase,
     env: ParamEnvAndCrate<'db>,
@@ -598,11 +603,26 @@ fn signature_of<'db>(
 ) -> Result<Sig, String> {
     let sized = |ty: Ty<'db>| crate::lower::layout_of(db, env, ty).map(|layout| layout.size.bytes() != 0);
     let (_, ret) = body.locals.iter().next().ok_or("body has no return local")?;
-    let mut params = 0;
+    let mut sig = Sig::new(0, sized(ret.ty.as_ref())?);
     for param in &body.param_locals {
-        params += usize::from(sized(body.locals[*param].ty.as_ref())?);
+        let layout = crate::lower::layout_of(db, env, body.locals[*param].ty.as_ref())?;
+        if layout.size.bytes() == 0 {
+            continue;
+        }
+        if passes_by_value(&layout) && sig.params < 64 {
+            sig.by_value |= 1 << sig.params;
+        }
+        sig.params += 1;
     }
-    Ok(Sig { params, ret: sized(ret.ty.as_ref())? })
+    Ok(sig)
+}
+
+/// Whether a parameter of this layout travels as its 8-byte integer or pointer value instead of its address.
+pub fn passes_by_value(layout: &hir_ty::layout::Layout) -> bool {
+    let rustc_abi::BackendRepr::Scalar(scalar) = layout.backend_repr else {
+        return false;
+    };
+    layout.size.bytes() == 8 && matches!(scalar.primitive(), rustc_abi::Primitive::Int(..) | rustc_abi::Primitive::Pointer(_))
 }
 
 fn crate_function(db: &dyn HirDatabase, crate_name: &str, name: &str) -> Option<FunctionId> {

@@ -190,7 +190,7 @@ impl<'db> Lower<'_, '_, 'db> {
         for param in params {
             count += usize::from(self.layout(param)?.size.bytes() != 0);
         }
-        Ok(Sig { params: count, ret: self.layout(ret)?.size.bytes() != 0 })
+        Ok(Sig::new(count, self.layout(ret)?.size.bytes() != 0))
     }
 
     fn target_sig(&self, target: &Target<'db>) -> Result<Sig, String> {
@@ -203,7 +203,7 @@ impl<'db> Lower<'_, '_, 'db> {
         for param in params {
             count += usize::from(self.layout(param)?.size.bytes() != 0);
         }
-        Ok(Sig { params: count, ret: self.layout(ret)?.size.bytes() != 0 })
+        Ok(Sig::new(count, self.layout(ret)?.size.bytes() != 0))
     }
 
     pub(super) fn target_shape(&self, target: &Target<'db>) -> Result<(Vec<Ty<'db>>, Ty<'db>), String> {
@@ -257,7 +257,7 @@ impl<'db> Lower<'_, '_, 'db> {
                 values.push(place.addr);
             }
         }
-        self.call_cell(code_cell, Sig { params: values.len() - usize::from(ret), ret }, &values);
+        self.call_cell(code_cell, Sig::new(values.len() - usize::from(ret), ret), &values);
         Ok(())
     }
 
@@ -352,7 +352,7 @@ impl<'db> Lower<'_, '_, 'db> {
         }
         let cell = self.load(Type::I64, table, ((VTABLE_HEADER + index) * 8) as i32);
         self.builder.ins().trapz(cell);
-        self.call_cell(cell, Sig { params: values.len() - usize::from(ret), ret }, &values);
+        self.call_cell(cell, Sig::new(values.len() - usize::from(ret), ret), &values);
         Ok(())
     }
 
@@ -363,7 +363,7 @@ impl<'db> Lower<'_, '_, 'db> {
         self.builder.ins().brif(cell, call, &[], done, &[]);
         self.builder.switch_to_block(call);
         let holder = self.thin_holder(data);
-        self.call_cell(cell, Sig { params: 1, ret: false }, &[holder]);
+        self.call_cell(cell, Sig::new(1, false), &[holder]);
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
     }
@@ -460,7 +460,7 @@ impl<'db> Lower<'_, '_, 'db> {
         for param in params {
             count += usize::from(self.layout(param)?.size.bytes() != 0);
         }
-        Ok(Sig { params: count, ret: self.layout(ret)?.size.bytes() != 0 })
+        Ok(Sig::new(count, self.layout(ret)?.size.bytes() != 0))
     }
 
     pub fn shim(mut self, ty: Ty<'db>) -> Result<(), String> {
