@@ -1,8 +1,15 @@
 //! Lowering of inferred function bodies at concrete types to `haste-codegen` SSA.
 
+mod adt;
+mod array;
 mod expr;
+mod intrinsic;
+mod looping;
+mod matching;
+mod memory;
 mod ops;
 mod place;
+mod promote;
 
 use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, Function, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
@@ -15,10 +22,12 @@ use crate::sema::infer::Typed;
 use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty, Types};
 
-/// Where the function at each reached index lives: the address of its call table entry.
+/// Where lowered code finds what it refers to: call table entries and constant data.
 pub trait Slots {
     /// The address of the table entry that holds the code address of reached function `index`.
     fn entry(&self, index: usize) -> i64;
+    /// The address of a 16-byte-aligned copy of `bytes` that lives as long as the program.
+    fn data(&self, bytes: &[u8]) -> i64;
 }
 
 /// How a value of one type travels: not at all, in one register, or as the address of its bytes.
@@ -40,6 +49,7 @@ pub fn machine(types: &Types, ty: Ty) -> Option<Type> {
         Kind::Prim(I128 | U128) => Type::I128,
         Kind::Prim(F32) => Type::F32,
         Kind::Prim(F64) => Type::F64,
+        Kind::Pat(base, ..) => return machine(types, *base),
         Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) if !matches!(types.kind(*pointee), Kind::Slice(_) | Kind::Prim(Str)) => Type::I64,
         _ => return None,
     })
@@ -104,8 +114,13 @@ pub struct Lower<'l, 'a> {
 pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<Function> {
     let ((item, _), typed) = &reached.list[index];
     let Ok(typed) = typed else { bail!("{} did not type-check", cx.name(*item)) };
+    for ty in typed.exprs.iter().chain(typed.locals.iter().map(|local| &local.ty)).filter(|ty| ty.0 != u32::MAX).copied().collect::<rustc_hash::FxHashSet<_>>() {
+        if crate::sema::infer::needs_drop(cx, ty)? {
+            bail!("{} holds a value that needs drop glue, which is not lowered yet", cx.name(*item));
+        }
+    }
     let body = cx.body(*item)?;
-    let src = &cx.file(*item).source;
+    let src = cx.body_src(*item);
     let mut func = Function::new(signature(cx, typed)?);
     let b = FunctionBuilder::new(&mut func);
     let mut lower = Lower { cx, reached, slots, body: &body, src, typed, b, locals: vec![None; typed.locals.len()], loops: Vec::new(), open: true, sret: None };
@@ -218,6 +233,7 @@ impl Lower<'_, '_> {
     fn stmt(&mut self, stmt: Stmt) -> Result<()> {
         match stmt {
             Stmt::Let { pat, init, otherwise: None, .. } => self.let_stmt(pat, init),
+            Stmt::Let { pat, init: Some(init), otherwise: Some(otherwise), .. } => self.let_else(pat, init, otherwise),
             Stmt::Expr(expr, _) => self.expr(expr).map(drop),
             Stmt::Item(..) | Stmt::Empty => Ok(()),
             other => bail!("cannot lower statement {other:?} yet"),
@@ -225,24 +241,16 @@ impl Lower<'_, '_> {
     }
 
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<()> {
-        let value = match init {
-            Some(init) => self.expr(init)?,
-            None => None,
+        let Some(init) = init else {
+            return match (self.body.pat(pat), self.typed.binds.get(&pat)) {
+                (Pat::Bind { .. }, Some(&local)) => self.declare(local, None),
+                _ => bail!("uninitialized `let` with a pattern"),
+            };
         };
-        self.bind(pat, value)
-    }
-
-    /// Binds the names of irrefutable pattern `pat` to parts of `value`.
-    pub fn bind(&mut self, pat: PatId, value: Option<Value>) -> Result<()> {
-        match *self.body.pat(pat) {
-            Pat::Bind { sub: None, by_ref: false, .. } => {
-                let Some(&local) = self.typed.binds.get(&pat) else { bail!("pattern has no local") };
-                self.declare(local, value)
-            }
-            Pat::Wild => Ok(()),
-            Pat::Paren(inner) => self.bind(inner, value),
-            Pat::Tuple(list) => self.bind_tuple(pat, list, value),
-            ref other => bail!("cannot lower pattern {other:?} yet"),
+        let place = self.place_or_temp(init)?;
+        if !self.open {
+            return Ok(());
         }
+        self.bind_matched(pat, place)
     }
 }

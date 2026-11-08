@@ -222,7 +222,7 @@ pub fn expand(def: &Source, rules: &[Rule], input: &Source, (open, krate): (u32,
             return writer.out.finish(input.path.clone());
         }
     }
-    bail!("no rule of the macro matches the call at byte {} of {}", input.tokens[open as usize].start, input.path.display())
+    bail!("no rule of the macro matches the call at byte {} of {}", input.byte(open), input.path.display())
 }
 
 /// The tokens of the first `cfg_select!` arm whose predicate `holds`, or `None` when no arm applies.
@@ -236,7 +236,7 @@ pub fn select(src: &Source, open: u32, holds: impl Fn(&crate::graph::cfg::Cfg) -
         }
         let body = arrow + 2;
         if arrow >= close || src.kind(body) != TokenKind::OpenBrace {
-            bail!("malformed cfg_select! arm at byte {} of {}", src.tokens[at as usize].start, src.path.display());
+            bail!("malformed cfg_select! arm at byte {} of {}", src.byte(at), src.path.display());
         }
         let predicate = (at..arrow).map(|token| src.text(token)).collect::<Vec<_>>().join(" ");
         if predicate == "_" || holds(&crate::graph::cfg::parse(&predicate)?) {

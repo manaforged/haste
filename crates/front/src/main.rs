@@ -155,7 +155,8 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
     };
     let failed: usize = failures.values().map(Vec::len).sum();
     for (error, items) in &failures {
-        eprintln!("{:>4} {error} [{}]", items.len(), items.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(" "));
+        let names: Vec<&str> = items.iter().take(3).filter_map(|item| item.split(':').next()).collect();
+        eprintln!("{:>4} {error} [{}]\n       {}", items.len(), names.join(" "), items[0].chars().take(300).collect::<String>());
     }
     let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
     eprintln!("typeck {} cases, {} passed, {failed} failed, {passes} passes, {}, front {:.1} ms, total {:.1} ms", cases.len(), cases.len() - failed, summary(&outline), ms(front), ms(started.elapsed()));
@@ -192,10 +193,10 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let mut ran = 0;
     for (root, item) in cases.iter().enumerate() {
         let closure = reached.closure(root);
-        let failure = closure.iter().find_map(|at| reached.list[*at].1.as_ref().err().or(broken.get(at)));
+        let failure = closure.iter().find_map(|at| reached.list[*at].1.as_ref().err()).or_else(|| closure.iter().find_map(|at| broken.get(at)));
         let name = cx.name(*item);
         match failure {
-            Some(error) => failures.entry(error_kind(error)).or_default().push(name.to_owned()),
+            Some(error) => failures.entry(error_kind(error)).or_default().push(format!("{name}: {error}")),
             None => {
                 let status = image.run_case(root, name, &[-5, 0, 1, 3, 20])?;
                 ran += 1;
@@ -206,7 +207,8 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
         }
     }
     for (error, items) in &failures {
-        eprintln!("{:>4} {error} [{}]", items.len(), items.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(" "));
+        let names: Vec<&str> = items.iter().take(3).filter_map(|item| item.split(':').next()).collect();
+        eprintln!("{:>4} {error} [{}]\n       {}", items.len(), names.join(" "), items[0].chars().take(300).collect::<String>());
     }
     let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
     eprintln!("cases {} found, {ran} ran, {} functions reached, built in {:.1} ms, total {:.1} ms", cases.len(), reached.list.len(), ms(built), ms(started.elapsed()));
@@ -224,7 +226,7 @@ fn parse_bodies(tree: &outline::tree::Crate) -> (usize, Vec<String>) {
     for file in &tree.files {
         for item in &file.items.items {
             let Some(open) = item.body.filter(|_| item.kind == outline::item::ItemKind::Fn) else { continue };
-            match haste_front::body::parse(&file.source, open) {
+            match haste_front::body::parse(&file.source, open, None) {
                 Ok(_) => parsed += 1,
                 Err(error) => errors.push(format!("{error:#}")),
             }

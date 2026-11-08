@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::names::ItemRef;
 
 use super::Context;
-use super::infer::{Res, Typed, infer};
+use super::infer::{Typed, infer};
 use super::ty::Ty;
 
 /// One function at concrete type arguments.
@@ -35,10 +35,7 @@ impl Reached {
 
     /// The indexes of the functions that `typed` calls.
     pub fn callees<'r>(&'r self, typed: &'r Typed) -> impl Iterator<Item = usize> + 'r {
-        typed.res.values().filter_map(|res| match res {
-            Res::Fn(item, substs) => self.index.get(&(*item, substs.clone())).copied(),
-            Res::Local(_) => None,
-        })
+        typed.calls().filter_map(|(item, substs)| self.index.get(&(item, substs.to_vec())).copied())
     }
 }
 
@@ -55,10 +52,7 @@ pub fn reach(cx: &mut Context<'_>, roots: &[Instance]) -> Reached {
         }
         let typed = infer(cx, instance.0, &instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)));
         if let Ok(typed) = &typed {
-            let calls = typed.res.values().filter_map(|res| match res {
-                Res::Fn(item, substs) => Some((*item, substs.clone())),
-                Res::Local(_) => None,
-            });
+            let calls = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_none()).map(|(item, substs)| (item, substs.to_vec()));
             queue.extend(calls);
         }
         reached.index.insert(instance.clone(), reached.list.len());

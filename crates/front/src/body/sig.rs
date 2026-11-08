@@ -188,7 +188,13 @@ pub fn signature(src: &Source, from: u32, to: u32) -> Result<Signature> {
     cursor.at += 1;
     let mut sig = Signature { name: cursor.name()?, ..Signature::default() };
     sig.generics = cursor.generic_params()?;
+    let first = cursor.body.tys.len();
     cursor.fn_params(&mut sig)?;
+    for ty in &cursor.body.tys[first..] {
+        if let super::Ty::ImplTrait(name, bounds) = *ty {
+            sig.generics.push(Generic { name, kind: GenericKind::Type, bounds, default: None });
+        }
+    }
     sig.ret = if cursor.eat("->") { Some(cursor.ty()?) } else { None };
     sig.predicates = cursor.where_clause()?;
     sig.body = cursor.body;
@@ -201,4 +207,52 @@ pub fn generics(src: &Source, at: u32, to: u32) -> Result<(Body, Generics)> {
     let params = cursor.generic_params()?;
     let predicates = cursor.where_clause()?;
     Ok((cursor.body, Generics { params, predicates }))
+}
+
+/// An impl header: generics, the trait it implements if any, the self type and the where clause, in its own arena.
+#[derive(Debug)]
+pub struct ImplHeader {
+    pub body: Body,
+    pub generics: Vec<Generic>,
+    pub negative: bool,
+    pub trait_ref: Option<TyId>,
+    pub self_ty: TyId,
+    pub predicates: Vec<Predicate>,
+}
+
+/// Parses the header of the impl item whose tokens run from `from` to `to` in `src`.
+pub fn impl_header(src: &Source, from: u32, to: u32) -> Result<ImplHeader> {
+    let mut cursor = Cursor::new(src, from, to);
+    while !cursor.done() && !cursor.is_word("impl") {
+        cursor.at += 1;
+    }
+    cursor.at += 1;
+    let generics = cursor.generic_params()?;
+    cursor.eat_word("const");
+    let negative = cursor.eat("!");
+    let first = cursor.ty_no_bounds()?;
+    let (trait_ref, self_ty) = if cursor.eat_word("for") { (Some(first), cursor.ty_no_bounds()?) } else { (None, first) };
+    let predicates = cursor.where_clause()?;
+    Ok(ImplHeader { body: cursor.body, generics, negative, trait_ref, self_ty, predicates })
+}
+
+/// Parses the type of the constant item whose name is token `name`, as the return type of a header with no parameters.
+pub fn const_signature(src: &Source, name: u32, to: u32) -> Result<Signature> {
+    let mut cursor = Cursor::new(src, name + 1, to);
+    cursor.expect(":")?;
+    let ret = cursor.ty()?;
+    Ok(Signature { body: cursor.body, name, ret: Some(ret), ..Signature::default() })
+}
+
+/// The token after the `=` of the constant or static item whose name is token `name`, searching no further than `to`.
+pub fn initializer(src: &Source, name: u32, to: u32) -> Option<u32> {
+    let mut at = name + 1;
+    while at < to {
+        match src.kind(at) {
+            TokenKind::Eq => return Some(at + 1),
+            TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => at = src.pair(at) + 1,
+            _ => at += 1,
+        }
+    }
+    None
 }

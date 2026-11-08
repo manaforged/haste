@@ -1,5 +1,6 @@
-//! One process image: a call table with one entry per reached function, and the code it points at.
+//! One process image: a call table with one entry per reached function, the code it points at, and constant data.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow, bail};
@@ -13,18 +14,28 @@ use crate::sema::reach::Reached;
 pub struct Image {
     table: Box<[AtomicUsize]>,
     memory: Memory,
+    data: RefCell<Vec<Box<[u128]>>>,
 }
 
 impl Slots for Image {
     fn entry(&self, index: usize) -> i64 {
         &self.table[index] as *const AtomicUsize as i64
     }
+
+    fn data(&self, bytes: &[u8]) -> i64 {
+        let mut copy: Box<[u128]> = vec![0; bytes.len().div_ceil(16)].into();
+        // SAFETY: the buffer holds at least `bytes.len()` bytes and does not overlap `bytes`.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), copy.as_mut_ptr().cast::<u8>(), bytes.len()) };
+        let address = copy.as_ptr() as i64;
+        self.data.borrow_mut().push(copy);
+        address
+    }
 }
 
 impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Image {
-        Image { table: (0..reached.list.len()).map(|_| AtomicUsize::new(0)).collect(), memory: Memory::default() }
+        Image { table: (0..reached.list.len()).map(|_| AtomicUsize::new(0)).collect(), memory: Memory::default(), data: RefCell::default() }
     }
 
     /// Lowers and encodes every reached function that type-checked, and returns the errors of those that did not compile, by index.
@@ -32,6 +43,15 @@ impl Image {
         let mut errors = Vec::new();
         for index in 0..reached.list.len() {
             if reached.list[index].1.is_err() {
+                continue;
+            }
+            let item = reached.list[index].0.0;
+            if cx.foreign(item) {
+                let (src, entry) = cx.item(item);
+                match entry.name.and_then(|at| crate::host::symbol(src.text(at))) {
+                    Some(address) => self.table[index].store(address, Ordering::Release),
+                    None => errors.push((index, format!("{}: no host symbol links to it", cx.name(item)))),
+                }
                 continue;
             }
             match self.compile_one(cx, reached, index) {

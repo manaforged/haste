@@ -6,7 +6,7 @@ use rustc_lexer::TokenKind;
 
 use super::item::{Attr, Item, ItemKind};
 use super::source::Source;
-use super::tree::{Cache, Crate, Decl, File, Macro, Module, State, Textual, Truth, textual};
+use super::tree::{Cache, Crate, Decl, File, Impl, Macro, Module, State, Textual, Truth, textual};
 use super::{mbe, rules, scan};
 
 const DEPTH: usize = 128;
@@ -92,10 +92,46 @@ impl Loader<'_> {
                 ItemKind::Mod => self.child(file, index, module, (at as u32, item))?,
                 ItemKind::MacroRules | ItemKind::Macro => self.define(file, (index as u32, at as u32), item),
                 ItemKind::MacroCall => self.call(file, module, at as u32)?,
+                ItemKind::Impl => self.impl_block(index, module, at as u32, file)?,
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    fn impl_block(&mut self, index: usize, module: usize, at: u32, file: &Arc<File>) -> Result<()> {
+        self.out.impls.push(Impl { file: index, at, module, parts: Vec::new() });
+        self.members(file, self.out.impls.len() - 1, Some(at))
+    }
+
+    fn members(&mut self, file: &Arc<File>, block: usize, owner: Option<u32>) -> Result<()> {
+        for (at, item) in file.items.items.iter().enumerate() {
+            if item.parent == owner && item.kind == ItemKind::MacroCall && self.out.env.enabled(&item.attrs) {
+                self.member_call(file, block, at as u32)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn member_call(&mut self, file: &Arc<File>, block: usize, at: u32) -> Result<()> {
+        let item = &file.items.items[at as usize];
+        let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
+        let name = strip_raw(file.source.text(name));
+        let Some(definition) = self.lookup(file, item, name) else {
+            self.out.members.push((file.clone(), block, at));
+            return Ok(());
+        };
+        if self.depth >= DEPTH {
+            self.out.errors.push(format!("{}: macro {name} recursed past {DEPTH} levels", file.source.path.display()));
+            return Ok(());
+        }
+        let expanded = mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32));
+        let Some(expanded) = self.scanned(expanded, name) else { return Ok(()) };
+        self.out.impls[block].parts.push(self.out.files.len() - 1);
+        self.depth += 1;
+        let result = self.members(&expanded, block, None);
+        self.depth -= 1;
+        result
     }
 
     fn child(&mut self, file: &Arc<File>, index: usize, parent: usize, (at, item): (u32, &Item)) -> Result<()> {
@@ -206,6 +242,9 @@ impl Loader<'_> {
         for (file, module, at) in std::mem::take(&mut self.out.deferred) {
             self.call(&file, module, at)?;
         }
+        for (file, block, at) in std::mem::take(&mut self.out.members) {
+            self.member_call(&file, block, at)?;
+        }
         Ok(())
     }
 
@@ -251,16 +290,23 @@ impl Loader<'_> {
         self.splice(module, Ok(selected), "cfg_select")
     }
 
-    fn splice(&mut self, module: usize, source: Result<Source>, name: &str) -> Result<()> {
-        let expanded = source.and_then(|source| scan::scan(&source).map(|items| File { source, items, expanded: true }));
-        let expanded = match expanded {
-            Ok(expanded) => Arc::new(expanded),
+    fn scanned(&mut self, source: Result<Source>, name: &str) -> Option<Arc<File>> {
+        let expanded = source.and_then(|source| scan::scan(&source).map(|items| File::new(source, items, true)));
+        match expanded {
+            Ok(expanded) => {
+                let expanded = Arc::new(expanded);
+                self.out.files.push(expanded.clone());
+                Some(expanded)
+            }
             Err(error) => {
                 self.out.errors.push(format!("{name}!: {error:#}"));
-                return Ok(());
+                None
             }
-        };
-        self.out.files.push(expanded.clone());
+        }
+    }
+
+    fn splice(&mut self, module: usize, source: Result<Source>, name: &str) -> Result<()> {
+        let Some(expanded) = self.scanned(source, name) else { return Ok(()) };
         let index = self.out.files.len() - 1;
         self.out.modules[module].parts.push(index);
         self.out.expansions += 1;

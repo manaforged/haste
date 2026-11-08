@@ -42,9 +42,10 @@ impl Cursor<'_> {
     fn word_ty(&mut self) -> Result<TyId> {
         match self.word() {
             "impl" => {
+                let at = self.at;
                 self.at += 1;
                 let bounds = self.bounds()?;
-                Ok(self.push_ty(Ty::ImplTrait(bounds)))
+                Ok(self.push_ty(Ty::ImplTrait(at, bounds)))
             }
             "dyn" => {
                 self.at += 1;

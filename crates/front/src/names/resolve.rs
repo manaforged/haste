@@ -7,7 +7,8 @@ use rustc_lexer::TokenKind;
 
 use crate::graph::Workspace;
 use crate::outline::Outline;
-use crate::outline::item::{Attr, Vis};
+use crate::outline::item::{Attr, ItemKind, Vis};
+use crate::outline::source::Source;
 use crate::outline::tree::{Crate as Tree, File, Macro};
 
 use super::collect::{self, Context, Pending};
@@ -128,6 +129,9 @@ fn apply(scopes: &mut [Scope], module: u32, found: Found) -> bool {
 const PRELUDES: [(&str, &str); 4] = [("2015", "rust_2015"), ("2018", "rust_2018"), ("2021", "rust_2021"), ("2024", "rust_2024")];
 
 fn prelude(paths: &Paths<'_>, tree: &Tree, edition: &str) -> Option<ModRef> {
+    if let Some(found) = own_prelude(paths, tree) {
+        return Some(found);
+    }
     let no_std = tree.files.get(tree.modules.first()?.file)?.items.inner.iter().any(|attr| matches!(attr, Attr::NoStd | Attr::NoCore));
     let root = paths.symbols.intern(if no_std { "core" } else { "std" });
     let (_, krate) = paths.deps.iter().find(|(name, _)| *name == root)?;
@@ -139,19 +143,42 @@ fn prelude(paths: &Paths<'_>, tree: &Tree, edition: &str) -> Option<ModRef> {
     }
 }
 
-/// Path resolution in crate `krate` over the scopes resolved so far, recording the unread modules it reaches.
+fn own_prelude(paths: &Paths<'_>, tree: &Tree) -> Option<ModRef> {
+    let file = tree.files.get(tree.modules.first()?.file)?;
+    let src = &file.source;
+    let marked = |item: &&crate::outline::item::Item| item.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "prelude_import"));
+    let import = file.items.items.iter().filter(|item| item.kind == ItemKind::Use && item.parent.is_none()).find(marked)?;
+    let words = (import.start..import.end).map(|at| src.text(at)).skip_while(|word| *word != "use").skip(1);
+    let mut def = Def::Module(ModRef { krate: paths.krate, module: 0 });
+    for word in words.filter(|word| !matches!(*word, ":" | "::" | "*" | ";")) {
+        def = paths.member(def, paths.symbols.intern(word)).types?.def;
+    }
+    match def {
+        Def::Module(found) => Some(found),
+        _ => None,
+    }
+}
+
 fn resolve_macro(paths: &Paths<'_>, file: &File, (call, at): (u32, ModRef)) -> Option<ItemRef> {
     let item = &file.items.items[call as usize];
-    let src = &file.source;
-    let dollar = if src.kind(item.start) == TokenKind::Dollar { src.dollar(item.start) } else { None };
-    let words = (item.start..=item.name?).filter(|token| matches!(src.kind(*token), TokenKind::Ident | TokenKind::RawIdent));
+    macro_at(paths, &file.source, (item.start, item.name?), at)
+}
+
+/// The macro that the path from token `start` to name token `name` of `src` names in module `at`.
+pub fn macro_at(paths: &Paths<'_>, src: &Source, (start, name): (u32, u32), at: ModRef) -> Option<ItemRef> {
+    let dollar = if src.kind(start) == TokenKind::Dollar { src.dollar(start) } else { None };
+    let words = (start..=name).filter(|token| matches!(src.kind(*token), TokenKind::Ident | TokenKind::RawIdent));
     let segments: Vec<Sym> = words.map(|token| paths.symbols.intern(plain(src.text(token)))).collect();
-    let path = Path { segments: &segments, absolute: src.kind(item.start) == TokenKind::Colon, dollar };
-    let (last, prefix) = segments.split_last()?;
+    macro_path(paths, &Path { segments: &segments, absolute: src.kind(start) == TokenKind::Colon, dollar }, at)
+}
+
+/// The macro that `path` names in module `at`.
+pub fn macro_path(paths: &Paths<'_>, path: &Path<'_>, at: ModRef) -> Option<ItemRef> {
+    let (last, prefix) = path.segments.split_last()?;
     let binding = if prefix.is_empty() {
-        paths.first(*last, at, &path).macros?
+        paths.first(*last, at, path).macros?
     } else {
-        paths.member(paths.resolve(&Path { segments: prefix, ..path }, at)?, *last).macros?
+        paths.member(paths.resolve(&Path { segments: prefix, ..*path }, at)?, *last).macros?
     };
     match binding.def {
         Def::Item(item) => Some(item),
@@ -196,7 +223,7 @@ impl Names {
             let demands = Asks::default();
             while {
                 let changed = self.pass(outline, &demands);
-                self.want(demands.names.take()) || changed
+                self.want(demands.names.take()) | self.spread_whole() || changed
             } {}
             self.preludes(outline, &demands);
             let expanded = self.expand_imported(outline, &demands)?;

@@ -1,0 +1,178 @@
+use anyhow::{Result, bail};
+use haste_codegen::{IntCC, Type, Value};
+use rustc_abi::{Primitive, TagEncoding, Variants};
+use rustc_index::Idx;
+
+use crate::body::{ExprId, List};
+use crate::names::ItemRef;
+use crate::sema::infer::field_types;
+use crate::sema::layout::{Layout, Variant, target};
+use crate::sema::ty::{Kind, Ty};
+
+use super::ops::Num;
+use super::place::{Base, Place};
+use super::{Lower, Repr, repr};
+
+/// The byte offset of field `index` of variant `variant` in a value of `layout`.
+pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
+    let fields = match &layout.variants {
+        Variants::Multiple { variants, .. } => &variants[Variant::new(variant as usize)].fields,
+        _ => &layout.fields,
+    };
+    fields.offset(index as usize).bytes() as i32
+}
+
+fn tag_type(bytes: u64) -> Result<Type> {
+    Ok(match bytes {
+        1 => Type::I8,
+        2 => Type::I16,
+        4 => Type::I32,
+        8 => Type::I64,
+        16 => Type::I128,
+        other => bail!("no tag of {other} bytes"),
+    })
+}
+
+/// Where an enum keeps its tag and how it encodes its variants in it.
+struct Tag {
+    offset: i32,
+    ty: Type,
+    mask: u128,
+    encoding: TagEncoding<Variant>,
+}
+
+impl Lower<'_, '_> {
+    fn tag(&mut self, layout: &Layout) -> Result<Option<Tag>> {
+        let Variants::Multiple { tag, tag_encoding, tag_field, .. } = &layout.variants else { return Ok(None) };
+        let size = tag.size(&target()?);
+        let mask = if size.bits() == 128 { u128::MAX } else { (1u128 << size.bits()) - 1 };
+        Ok(Some(Tag { offset: layout.fields.offset(tag_field.index()).bytes() as i32, ty: tag_type(size.bytes())?, mask, encoding: tag_encoding.clone() }))
+    }
+
+    /// Writes variant `variant` of `ty`, an ADT `item` at `args`, with `fields` given by index, over a copy of `base`; returns the value.
+    pub fn construct(&mut self, ty: Ty, variant: u32, fields: Vec<(u32, Option<Value>)>, base: Option<Value>) -> Result<Option<Value>> {
+        let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("constructing a type that is not an ADT") };
+        let whole = repr(self.cx, ty)?;
+        let Some(slot) = self.slot(whole) else { return Ok(None) };
+        let place = Place::slot(slot, whole);
+        if let Some(base) = base {
+            self.write(place, base);
+        }
+        let layout = self.cx.layout(ty)?;
+        let types = field_types(self.cx, item, &args)?.swap_remove(variant as usize);
+        for (index, value) in fields {
+            let field = repr(self.cx, types[index as usize])?;
+            if let Some(value) = value {
+                self.write(place.at(field_offset(&layout, variant, index), field), value);
+            }
+        }
+        self.set_tag(place, item, &layout, variant)?;
+        Ok(self.read(place))
+    }
+
+    fn set_tag(&mut self, place: Place, item: ItemRef, layout: &Layout, variant: u32) -> Result<()> {
+        let Some(tag) = self.tag(layout)? else { return Ok(()) };
+        let value = match &tag.encoding {
+            TagEncoding::Direct => self.cx.discriminants(item)?[variant as usize] as u128,
+            TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                if untagged_variant.index() == variant as usize {
+                    return Ok(());
+                }
+                ((variant as u128).wrapping_sub(niche_variants.start().index() as u128)).wrapping_add(*niche_start)
+            }
+        };
+        let value = self.int_const(tag.ty, value & tag.mask);
+        self.write(place.at(tag.offset, Repr::Scalar(tag.ty)), value);
+        Ok(())
+    }
+
+    /// Whether the value of ADT `ty` at `place` holds variant `variant`, or none when it can hold no other.
+    pub fn is_variant(&mut self, place: Place, ty: Ty, variant: u32) -> Result<Option<Value>> {
+        let Kind::Adt(item, _) = self.cx.types.kind(ty).clone() else { bail!("variant test on a type that is not an ADT") };
+        let layout = self.cx.layout(ty)?;
+        let Some(tag) = self.tag(&layout)? else { return Ok(None) };
+        let Some(value) = self.read(place.at(tag.offset, Repr::Scalar(tag.ty))) else { bail!("tag with no value") };
+        Ok(Some(match &tag.encoding {
+            TagEncoding::Direct => {
+                let expected = self.cx.discriminants(item)?[variant as usize] as u128 & tag.mask;
+                let expected = self.int_const(tag.ty, expected);
+                self.ins().icmp(IntCC::Equal, value, expected)
+            }
+            TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                let start = self.int_const(tag.ty, *niche_start & tag.mask);
+                let relative = self.ins().isub(value, start);
+                let first = niche_variants.start().index() as u128;
+                let span = self.int_const(tag.ty, niche_variants.end().index() as u128 - first);
+                if untagged_variant.index() == variant as usize {
+                    self.ins().icmp(IntCC::UnsignedGreaterThan, relative, span)
+                } else {
+                    let expected = self.int_const(tag.ty, (variant as u128).wrapping_sub(first));
+                    self.ins().icmp(IntCC::Equal, relative, expected)
+                }
+            }
+        }))
+    }
+
+    /// The discriminant of the fieldless enum `ty` at `place`, in the integer type of its tag.
+    pub(super) fn discriminant(&mut self, place: Option<Place>, ty: Ty) -> Result<(Value, Num)> {
+        let Kind::Adt(item, _) = self.cx.types.kind(ty).clone() else { bail!("discriminant of a type that is not an enum") };
+        let layout = self.cx.layout(ty)?;
+        let Variants::Multiple { tag: scalar, .. } = &layout.variants else {
+            let value = self.cx.discriminants(item)?.first().copied().unwrap_or(0);
+            return Ok((self.int_const(Type::I64, value as u128), Num::Int { ty: Type::I64, signed: true }));
+        };
+        let signed = matches!(scalar.primitive(), Primitive::Int(_, true));
+        let Some(tag) = self.tag(&layout)? else { bail!("enum with variants has no tag") };
+        if !matches!(tag.encoding, TagEncoding::Direct) {
+            bail!("casting an enum with fields");
+        }
+        let Some(value) = place.and_then(|place| self.read(place.at(tag.offset, Repr::Scalar(tag.ty)))) else { bail!("enum with no value") };
+        Ok((value, Num::Int { ty: tag.ty, signed }))
+    }
+
+    /// The place of field `index` of variant `variant` inside the ADT `ty` at `place`.
+    pub fn variant_field(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
+        let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("field of a type that is not an ADT") };
+        let layout = self.cx.layout(ty)?;
+        let field = field_types(self.cx, item, &args)?[variant as usize][index as usize];
+        Ok(place.at(field_offset(&layout, variant, index), repr(self.cx, field)?))
+    }
+
+    /// The place of the struct field read `expr` on `base`, through references.
+    pub fn field_read_place(&mut self, expr: ExprId, base: ExprId) -> Result<Option<Place>> {
+        let Some(&index) = self.typed.fields.get(&expr) else { bail!("field read has no field") };
+        let Some(mut place) = self.place_or_temp(base)? else { return Ok(None) };
+        let mut ty = self.ty_of(base);
+        while let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *self.cx.types.kind(ty) {
+            let Some(pointer) = self.read(place) else { bail!("reference with no value") };
+            place = Place { base: Base::Addr(pointer), offset: 0, repr: repr(self.cx, inner)? };
+            ty = inner;
+        }
+        self.variant_field(place, ty, (0, index)).map(Some)
+    }
+
+    /// Lowers the struct literal `expr` with field initializers `fields`.
+    pub fn struct_literal(&mut self, expr: ExprId, fields: List, base: Option<ExprId>) -> Result<Option<Value>> {
+        let Some(crate::sema::infer::Res::Ctor(_, variant, _)) = self.typed.res.get(&expr).cloned() else { bail!("struct literal has no constructor") };
+        let mut values = Vec::new();
+        for at in self.body.list(fields).to_vec() {
+            let init = self.body.fields[at as usize];
+            let Some(&index) = self.typed.fields.get(&init.value) else { bail!("field initializer has no field") };
+            values.push((index, self.expr(init.value)?));
+        }
+        let base = match base {
+            Some(base) => self.expr(base)?,
+            None => None,
+        };
+        self.construct(self.ty_of(expr), variant, values, base)
+    }
+
+    /// Lowers a call of the tuple constructor of variant `variant` with `args`.
+    pub fn ctor_call(&mut self, expr: ExprId, variant: u32, args: List) -> Result<Option<Value>> {
+        let mut values = Vec::new();
+        for (index, at) in self.body.list(args).to_vec().into_iter().enumerate() {
+            values.push((index as u32, self.expr(ExprId(at))?));
+        }
+        self.construct(self.ty_of(expr), variant, values, None)
+    }
+}

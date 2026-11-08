@@ -6,13 +6,15 @@ use crate::outline::attr::split_commas;
 use crate::outline::item::{ItemKind, Vis};
 use crate::outline::tree::Crate as Tree;
 
-use super::{Binding, CRATE, Crate, Def, ItemRef, ModRef, Origin, PerNs, SELF, SUPER, Scope, Sym, Symbols, plain};
+use super::{Binding, CRATE, Crate, Def, ItemRef, ModRef, Origin, PerNs, SELF, SUPER, Scope, Sym, Symbols, UNDERSCORE, plain};
 
-/// What lookups asked for that is not there yet: modules to read, and names whose imports must resolve.
+/// What lookups asked for that is not there yet: modules to read, names whose imports must resolve, crates to read whole, and modules whose every import must resolve.
 #[derive(Debug, Default)]
 pub struct Asks {
     pub modules: RefCell<Vec<ModRef>>,
     pub names: RefCell<Vec<(ModRef, Sym)>>,
+    pub crates: RefCell<Vec<u32>>,
+    pub scopes: RefCell<Vec<ModRef>>,
 }
 
 /// What path resolution in one crate can see.
@@ -145,6 +147,25 @@ impl<'a> Paths<'a> {
             current = self.parent(module);
         }
         None
+    }
+
+    /// The traits in scope in module `at`: declared or imported there, imported as `_`, or in the prelude; asks for every import to resolve first.
+    pub fn traits_in(&self, at: ModRef) -> Vec<ItemRef> {
+        let mut found = Vec::new();
+        for module in std::iter::once(at).chain(self.prelude) {
+            let Some(entry) = self.done.get(module.krate as usize) else { continue };
+            if !entry.whole.contains(&module.module) && let Some(demands) = self.demands {
+                demands.scopes.borrow_mut().push(module);
+            }
+            let named = self.scope(module).into_iter().flat_map(|scope| scope.names.values()).filter_map(|names| names.types.map(|binding| binding.def));
+            let hidden = entry.pending.iter().filter(|pending| pending.module == module.module && pending.name == Some(UNDERSCORE)).filter_map(|pending| pending.stamp.map(|(def, _)| def));
+            for def in named.chain(hidden) {
+                if let Def::Item(item) = def && self.trees[item.krate as usize].files[item.file as usize].items.items[item.item as usize].kind == ItemKind::Trait && !found.contains(&item) {
+                    found.push(item);
+                }
+            }
+        }
+        found
     }
 
     /// The bindings of the first segment `word` of a path used in module `at`, merged across namespaces from the local scope, the extern prelude and the std prelude.

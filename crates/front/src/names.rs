@@ -85,6 +85,22 @@ pub struct ItemRef {
     pub item: u32,
 }
 
+const INNER: u32 = 1 << 31;
+const INNER_BITS: u32 = 10;
+
+impl ItemRef {
+    /// Item `index` of those declared in the body of `self`.
+    pub fn inner(self, index: u32) -> ItemRef {
+        ItemRef { item: INNER | self.item << INNER_BITS | index, ..self }
+    }
+
+    /// The item whose body declares `self`, and the index of `self` there, when a body declares it.
+    pub fn outer(self) -> Option<(ItemRef, u32)> {
+        let at = self.item & !INNER;
+        (self.item & INNER != 0).then_some((ItemRef { item: at >> INNER_BITS, ..self }, at & ((1 << INNER_BITS) - 1)))
+    }
+}
+
 /// What a name refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Def {
@@ -260,6 +276,7 @@ pub struct Crate {
     pub pending: Vec<collect::Pending>,
     pub eager: bool,
     wanted: FxHashMap<u32, rustc_hash::FxHashSet<Sym>>,
+    whole: rustc_hash::FxHashSet<u32>,
     named: FxHashMap<(u32, Sym), Vec<usize>>,
     globs: FxHashMap<u32, Vec<usize>>,
 }

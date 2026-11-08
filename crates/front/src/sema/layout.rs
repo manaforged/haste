@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow, bail};
-use rustc_abi::{AddressSpace, Float, Integer, LayoutCalculator, LayoutData, Primitive as Abi, ReprOptions, Scalar, StructKind, TargetDataLayout, WrappingRange};
+use rustc_abi::{AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, LayoutData, Primitive as Abi, ReprOptions, Scalar, Size, StructKind, TargetDataLayout, WrappingRange};
 use rustc_index::{Idx, IndexVec};
 
 use crate::names::Primitive;
@@ -54,6 +54,12 @@ fn scalar(dl: &TargetDataLayout, value: Abi, valid: Option<(u128, u128)>) -> Lay
     Layout::scalar(dl, Scalar::Initialized { value, valid_range })
 }
 
+fn pointer_scalar(dl: &TargetDataLayout, nonnull: bool) -> Scalar {
+    let value = Abi::Pointer(AddressSpace::ZERO);
+    let valid_range = if nonnull { WrappingRange { start: 1, end: u64::MAX as u128 } } else { WrappingRange::full(value.size(dl)) };
+    Scalar::Initialized { value, valid_range }
+}
+
 fn primitive(dl: &TargetDataLayout, primitive: Primitive) -> Result<Layout> {
     use Primitive::*;
     let int = |integer, signed| Abi::Int(integer, signed);
@@ -88,11 +94,13 @@ impl Context<'_> {
         let fields = match self.types.kind(ty).clone() {
             Kind::Prim(prim) => return primitive(&dl, prim),
             Kind::Never => return Ok(Layout::never_type(&dl)),
-            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) if self.thin(pointee) => {
-                let nonnull = matches!(self.types.kind(ty), Kind::Ref(..));
-                return Ok(scalar(&dl, Abi::Pointer(AddressSpace::ZERO), nonnull.then(|| (1, u64::MAX as u128))));
-            }
+            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => return Ok(self.pointer(&dl, matches!(self.types.kind(ty), Kind::Ref(..)), pointee)),
             Kind::Tuple(items) => items,
+            Kind::Pat(base, start, end) => {
+                let BackendRepr::Scalar(Scalar::Initialized { value, .. }) = self.layout(base)?.backend_repr else { bail!("a pattern type on a type that is not one scalar") };
+                return Ok(Layout::scalar(&dl, Scalar::Initialized { value, valid_range: WrappingRange { start, end } }));
+            }
+            Kind::Adt(item, args) => return self.adt_layout(item, &args),
             Kind::Array(element, count) => {
                 let element = self.layout(element)?;
                 return calc.array_like::<Field, Variant, ()>(&element, Some(count)).map_err(|error| anyhow!("layout of an array: {error:?}"));
@@ -103,6 +111,15 @@ impl Context<'_> {
         let refs: Vec<&Layout> = layouts.iter().map(|layout| &**layout).collect();
         let refs: IndexVec<Field, &&Layout> = refs.iter().collect();
         calc.univariant(&refs, &ReprOptions::default(), StructKind::AlwaysSized).map_err(|error| anyhow!("layout: {error:?}"))
+    }
+
+    fn pointer(&self, dl: &TargetDataLayout, nonnull: bool, pointee: Ty) -> Layout {
+        let data = pointer_scalar(dl, nonnull);
+        if self.thin(pointee) {
+            return Layout::scalar(dl, data);
+        }
+        let len = Scalar::Initialized { value: Abi::Int(Integer::I64, false), valid_range: WrappingRange::full(Size::from_bytes(8)) };
+        Layout::scalar_pair(dl, data, len)
     }
 
     fn thin(&self, pointee: Ty) -> bool {

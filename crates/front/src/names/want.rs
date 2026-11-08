@@ -15,7 +15,7 @@ impl Crate {
                 None => self.globs.entry(pending.module).or_default().push(index),
             }
             let asked = self.wanted.get(&pending.module).is_some_and(|names| pending.name.is_none_or(|name| names.contains(&name)));
-            pending.active = self.eager || asked;
+            pending.active = self.eager || asked || self.whole.contains(&pending.module);
             self.pending.push(pending);
         }
     }
@@ -50,14 +50,46 @@ impl Names {
         new
     }
 
+    /// Activates every import of the modules `modules` and of the modules their globs read; returns whether anything was new.
+    pub fn want_whole(&mut self, mut modules: Vec<ModRef>) -> bool {
+        let mut new = false;
+        while let Some(at) = modules.pop() {
+            let Some(entry) = self.crates.get_mut(at.krate as usize) else { continue };
+            if entry.whole.insert(at.module) {
+                new = true;
+                entry.pending.iter_mut().filter(|pending| pending.module == at.module).for_each(|pending| pending.active = true);
+            }
+            let globs = entry.globs.get(&at.module).into_iter().flatten();
+            let targets: Vec<ModRef> = globs.filter_map(|index| match entry.pending[*index].stamp {
+                Some((Def::Module(target), _)) => Some(target),
+                _ => None,
+            }).collect();
+            modules.extend(targets.into_iter().filter(|target| self.crates.get(target.krate as usize).is_some_and(|other| !other.whole.contains(&target.module))));
+        }
+        new
+    }
+
+    pub(super) fn spread_whole(&mut self) -> bool {
+        let modules = self.crates.iter().enumerate().flat_map(|(krate, entry)| entry.whole.iter().map(move |&module| ModRef { krate: krate as u32, module }));
+        let modules: Vec<ModRef> = modules.collect();
+        self.want_whole(modules)
+    }
+
     /// Loads the modules and resolves the names that later lookups asked for, then settles; returns whether anything was new.
     pub fn answer(&mut self, outline: &mut Outline, asks: Asks) -> Result<bool> {
-        let wanted = self.want(asks.names.into_inner());
+        let wanted = self.want(asks.names.into_inner()) | self.want_whole(asks.scopes.into_inner());
         let mut modules: Vec<(usize, usize)> = asks.modules.into_inner().iter().map(|module| (module.krate as usize, module.module as usize)).collect();
         modules.sort_unstable();
         modules.dedup();
         outline.load_many(&modules)?;
+        let mut crates = asks.crates.into_inner();
+        crates.sort_unstable();
+        crates.dedup();
+        crates.retain(|krate| outline.crates[*krate as usize].partial());
+        for &krate in &crates {
+            outline.load_crate(krate as usize)?;
+        }
         self.settle(outline)?;
-        Ok(wanted || !modules.is_empty())
+        Ok(wanted || !modules.is_empty() || !crates.is_empty())
     }
 }

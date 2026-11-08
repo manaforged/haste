@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use rustc_hash::FxHashMap as HashMap;
 use rustc_lexer::TokenKind;
 
 use crate::outline::source::Source;
@@ -12,6 +13,7 @@ pub struct Cursor<'a> {
     pub end: u32,
     pub body: Body,
     pub no_struct: bool,
+    pub calls: Option<&'a HashMap<u32, u32>>,
 }
 
 /// Whether `kind` is an identifier.
@@ -19,13 +21,13 @@ pub fn is_name(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Ident | TokenKind::RawIdent)
 }
 
-const RESERVED: [&str; 38] = [
+pub const RESERVED: [&str; 38] = [
     "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await", "dyn",
 ];
 
 impl<'a> Cursor<'a> {
     pub fn new(src: &'a Source, at: u32, end: u32) -> Cursor<'a> {
-        Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false }
+        Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false, calls: None }
     }
 
     pub fn kind_at(&self, at: u32) -> TokenKind {
@@ -108,7 +110,7 @@ impl<'a> Cursor<'a> {
 
     pub fn fail<T>(&self, what: &str) -> Result<T> {
         let near = if self.at < self.end { self.src.text(self.at).to_owned() } else { "end".to_owned() };
-        let line = self.src.tokens.get(self.at.min(self.src.len().saturating_sub(1)) as usize).map_or(0, |token| self.src.text[..token.start as usize].matches('\n').count() + 1);
+        let line = if self.src.is_empty() { 0 } else { self.src.line(self.at.min(self.src.len() - 1)) };
         bail!("{}:{line}: {what}, found `{near}`", self.src.path.display())
     }
 

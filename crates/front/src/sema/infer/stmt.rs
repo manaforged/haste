@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::body::{ExprId, List, Pat, PatId, Stmt};
+use crate::body::{ExprId, List, PatId, Stmt};
 
 use super::super::ty::{Kind, Ty};
 use super::Infer;
@@ -8,14 +8,29 @@ use super::Infer;
 impl Infer<'_, '_> {
     /// Infers a block's statements and tail in a new scope.
     pub fn block(&mut self, stmts: List, tail: Option<ExprId>, expected: Option<Ty>) -> Result<Ty> {
-        let depth = self.scopes.len();
+        let (depth, items) = (self.scopes.len(), self.items.len());
         let diverges = std::mem::replace(&mut self.diverges, false);
+        self.declare_items(stmts);
         let result = self.block_inner(stmts, tail, expected);
         self.scopes.truncate(depth);
+        self.items.truncate(items);
         let ty = result?;
         let ty = if tail.is_none() && self.diverges { self.cx.types.intern(Kind::Never) } else { ty };
         self.diverges |= diverges;
         Ok(ty)
+    }
+
+    fn declare_items(&mut self, stmts: List) {
+        let Some((root, found)) = self.root.and_then(|root| Some((root, self.cx.expansion(root)?))) else { return };
+        let (src, items) = (&found.file.source, &found.file.items.items);
+        for &stmt in self.body.list(stmts) {
+            let Stmt::Item(start, end) = self.body.stmts[stmt as usize] else { continue };
+            for at in super::super::expand::stmt_items(items, (start, end)) {
+                if let Some(name) = items[at].name {
+                    self.items.push((crate::names::plain(src.text(name)), root.inner(at as u32)));
+                }
+            }
+        }
     }
 
     fn block_inner(&mut self, stmts: List, tail: Option<ExprId>, expected: Option<Ty>) -> Result<Ty> {
@@ -30,7 +45,7 @@ impl Infer<'_, '_> {
 
     fn stmt(&mut self, stmt: Stmt) -> Result<()> {
         match stmt {
-            Stmt::Let { pat, ty, init, otherwise: None } => self.let_stmt(pat, ty, init),
+            Stmt::Let { pat, ty, init, otherwise } => self.let_stmt(pat, ty, init, otherwise),
             Stmt::Expr(expr, semi) => {
                 let ty = self.expr(expr, None)?;
                 if !semi {
@@ -44,7 +59,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn let_stmt(&mut self, pat: PatId, ty: Option<crate::body::TyId>, init: Option<ExprId>) -> Result<()> {
+    fn let_stmt(&mut self, pat: PatId, ty: Option<crate::body::TyId>, init: Option<ExprId>, otherwise: Option<ExprId>) -> Result<()> {
         let declared = match ty {
             Some(ty) => Some(self.lower_ty(self.body, ty)?),
             None => None,
@@ -53,44 +68,18 @@ impl Infer<'_, '_> {
             (Some(init), _) => {
                 let found = self.expr(init, declared)?;
                 match declared {
-                    Some(declared) => self.coerce(found, declared).map(|_| declared)?,
+                    Some(declared) => self.coerce_expr(init, found, declared).map(|_| declared)?,
                     None => found,
                 }
             }
             (None, Some(declared)) => declared,
             (None, None) => self.fresh(Kind::Var),
         };
+        if let Some(otherwise) = otherwise {
+            let before = self.diverges;
+            self.expr(otherwise, None)?;
+            self.diverges = before;
+        }
         self.bind_pat(pat, ty)
-    }
-
-    /// Binds the names in pattern `pat` of the body to parts of a value of type `ty`.
-    pub fn bind_pat(&mut self, pat: PatId, ty: Ty) -> Result<()> {
-        self.out.pats.insert(pat, ty);
-        match *self.body.pat(pat) {
-            Pat::Bind { name, mutable, by_ref: false, sub: None } => {
-                let local = self.new_local(ty, mutable);
-                self.out.binds.insert(pat, local);
-                self.scopes.push((crate::names::plain(self.src.text(name)), local));
-                Ok(())
-            }
-            Pat::Wild => Ok(()),
-            Pat::Paren(inner) => self.bind_pat(inner, ty),
-            Pat::Tuple(list) => self.tuple_pat(list, ty),
-            ref other => bail!("unsupported pattern {other:?}"),
-        }
-    }
-
-    fn tuple_pat(&mut self, list: crate::body::List, ty: Ty) -> Result<()> {
-        let pats = self.body.list(list).to_vec();
-        if pats.iter().any(|&pat| matches!(self.body.pat(PatId(pat)), Pat::Rest)) {
-            bail!("`..` in tuple patterns is not supported yet");
-        }
-        let items: Vec<Ty> = (0..pats.len()).map(|_| self.fresh(Kind::Var)).collect();
-        let tuple = self.cx.types.intern(Kind::Tuple(items.clone()));
-        self.unify(ty, tuple)?;
-        for (pat, item) in pats.into_iter().zip(items) {
-            self.bind_pat(PatId(pat), item)?;
-        }
-        Ok(())
     }
 }

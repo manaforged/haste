@@ -147,6 +147,14 @@ impl Outline {
         }
     }
 
+    /// Reads every module of crate `krate`, as a lookup over all of a crate's impls needs.
+    pub fn load_crate(&mut self, krate: usize) -> Result<()> {
+        while self.crates[krate].partial() {
+            self.settle(vec![krate])?;
+        }
+        Ok(())
+    }
+
     /// Expands the deferred calls of crate `krate` at the given indexes with the definitions that name resolution found for them.
     pub fn expand(&mut self, krate: usize, found: Vec<(usize, Arc<Macro>)>) -> Result<()> {
         let deferred = std::mem::take(&mut self.crates[krate].deferred);
@@ -167,11 +175,11 @@ impl Outline {
     pub fn fall_back(&mut self) -> Result<bool> {
         let mut demands = Vec::new();
         for krate in 0..self.crates.len() {
-            if !self.crates[krate].deferred.is_empty() {
+            if !self.crates[krate].deferred.is_empty() || !self.crates[krate].members.is_empty() {
                 self.with_loader(krate, &mut demands, |loader| loader.retry())?;
             }
         }
-        let waiting = self.crates.iter().filter(|krate| !krate.deferred.is_empty());
+        let waiting = self.crates.iter().filter(|krate| !krate.deferred.is_empty() || !krate.members.is_empty());
         demands.extend(waiting.flat_map(|krate| krate.fallback.iter().copied()));
         demands.sort_unstable();
         demands.dedup();
@@ -244,14 +252,14 @@ impl Outline {
             demands.sort_unstable();
             demands.dedup();
             let mut next = Vec::new();
-            for krate in demands {
-                let declared: Vec<usize> = (0..self.crates[krate].modules.len()).filter(|at| matches!(self.crates[krate].modules[*at].state, State::Declared(_))).collect();
-                for module in declared {
-                    self.load_one(krate, module, &mut next)?;
-                }
+            let crates = &self.crates;
+            let declared: Vec<(usize, usize)> = demands.iter().flat_map(|&krate| (0..crates[krate].modules.len()).filter(move |at| matches!(crates[krate].modules[*at].state, State::Declared(_))).map(move |at| (krate, at))).collect();
+            self.read_ahead(&declared);
+            for (krate, module) in declared {
+                self.load_one(krate, module, &mut next)?;
             }
             for krate in 0..self.crates.len() {
-                if !self.crates[krate].deferred.is_empty() {
+                if !self.crates[krate].deferred.is_empty() || !self.crates[krate].members.is_empty() {
                     self.with_loader(krate, &mut next, |loader| loader.retry())?;
                 }
             }

@@ -187,7 +187,7 @@ impl Parser<'_> {
         }
         match op_of(self.src.kind(last + 1)) {
             Some(op) => Ok((Some((at, last)), op, last + 2)),
-            None => bail!("{}: repetition without an operator at byte {}", self.src.path.display(), self.src.tokens[at as usize].start),
+            None => bail!("{}: repetition without an operator at byte {}", self.src.path.display(), self.src.byte(at)),
         }
     }
 }
@@ -219,7 +219,7 @@ pub fn parse(src: &Source, open: u32) -> Result<Vec<Rule>> {
         let arrow = src.pair(at) + 1;
         let body = arrow + 2;
         if !is_open(src.kind(at)) || src.kind(arrow) != TokenKind::Eq || !is_open(src.kind(body)) {
-            bail!("{}: malformed macro rule at byte {}", src.path.display(), src.tokens[at as usize].start);
+            bail!("{}: malformed macro rule at byte {}", src.path.display(), src.byte(at));
         }
         let matcher = matchers.pieces(at + 1, src.pair(at))?;
         rules.push(Rule { matcher, body: bodies.pieces(body + 1, src.pair(body))? });

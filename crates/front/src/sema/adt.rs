@@ -1,0 +1,117 @@
+use anyhow::{Result, anyhow, bail};
+use rustc_abi::{Integer, IntegerType, LayoutCalculator, ReprFlags, ReprOptions, TargetDataLayout};
+use rustc_index::IndexVec;
+
+use crate::body::{Expr, Lit, UnOp};
+use crate::names::{ItemRef, Primitive};
+use crate::outline::attr::split_commas;
+use crate::outline::item::{Attr, ItemKind};
+
+use super::Context;
+use super::infer::{field_types, parse_int};
+use super::layout::{Field, Layout, Variant};
+
+const REPR_INTS: [(&str, Primitive); 12] = {
+    use Primitive::*;
+    [("u8", U8), ("u16", U16), ("u32", U32), ("u64", U64), ("u128", U128), ("usize", Usize), ("i8", I8), ("i16", I16), ("i32", I32), ("i64", I64), ("i128", I128), ("isize", Isize)]
+};
+
+impl Context<'_> {
+    /// The discriminant of each variant of the enum `item`: its written value, or one more than the previous.
+    pub fn discriminants(&mut self, item: ItemRef) -> Result<Vec<i128>> {
+        let def = self.adt_def(item)?;
+        let src = &self.file(item).source;
+        let mut next = 0_i128;
+        let mut values = Vec::with_capacity(def.variants.len());
+        for variant in &def.variants {
+            if let Some(expr) = variant.discriminant {
+                next = match *def.body.expr(expr) {
+                    Expr::Lit(Lit::Int, at) => parse_int(src.text(at))?.0 as i128,
+                    Expr::Unary(UnOp::Neg, inner) => match *def.body.expr(inner) {
+                        Expr::Lit(Lit::Int, at) => -(parse_int(src.text(at))?.0 as i128),
+                        _ => bail!("discriminants other than literals are not supported yet"),
+                    },
+                    _ => bail!("discriminants other than literals are not supported yet"),
+                };
+            }
+            values.push(next);
+            next = next.wrapping_add(1);
+        }
+        Ok(values)
+    }
+
+    /// The `#[repr]` options of `item`.
+    pub fn repr(&self, item: ItemRef) -> ReprOptions {
+        let (src, entry) = self.item(item);
+        let mut repr = ReprOptions::default();
+        for attr in &entry.attrs {
+            let Attr::Other(at) = *attr else { continue };
+            if src.text(at) != "repr" || src.kind(at + 1) != rustc_lexer::TokenKind::OpenParen {
+                continue;
+            }
+            for (from, _) in split_commas(src, at + 2, src.pair(at + 1)) {
+                match src.text(from) {
+                    "C" => repr.flags |= ReprFlags::IS_C,
+                    "transparent" => repr.flags |= ReprFlags::IS_TRANSPARENT,
+                    word => repr.int = REPR_INTS.iter().find(|(name, _)| *name == word).map(|(_, int)| integer_type(*int)).or(repr.int),
+                }
+            }
+        }
+        repr
+    }
+
+    /// The value of `#[lang = "..."]` on `item`.
+    pub fn lang(&self, item: ItemRef) -> Option<&str> {
+        let (src, entry) = self.item(item);
+        let at = entry.attrs.iter().find_map(|attr| match attr {
+            Attr::Other(at) if src.text(*at) == "lang" => Some(*at),
+            _ => None,
+        })?;
+        Some(src.text(at + 2).trim_matches('"'))
+    }
+
+    /// The layout of the struct, enum or union `item` at `args`.
+    pub fn adt_layout(&mut self, item: ItemRef, args: &[super::ty::Ty]) -> Result<Layout> {
+        let fields = field_types(self, item, args)?;
+        let mut layouts = Vec::with_capacity(fields.len());
+        for variant in &fields {
+            layouts.push(variant.iter().map(|ty| self.layout(*ty)).collect::<Result<Vec<_>>>()?);
+        }
+        let refs: Vec<Vec<&Layout>> = layouts.iter().map(|variant| variant.iter().map(|layout| &**layout).collect()).collect();
+        let variants: IndexVec<Variant, IndexVec<Field, &&Layout>> = refs.iter().map(|variant| variant.iter().collect()).collect();
+        let dl = super::layout::target()?;
+        let calc = LayoutCalculator::new(&dl);
+        let repr = self.repr(item);
+        let kind = self.item(item).1.kind;
+        let result = match kind {
+            ItemKind::Union => calc.layout_of_union(&repr, &variants),
+            _ => {
+                let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { vec![0] };
+                let no_niche = matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned"));
+                let tagged = discriminants.into_iter().enumerate().map(|(at, value)| (rustc_index::Idx::new(at), value));
+                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, no_niche, |min, max| discr_range(&dl, &repr, min, max), tagged, true)
+            }
+        };
+        result.map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))
+    }
+}
+
+fn integer_type(primitive: Primitive) -> IntegerType {
+    let (bits, signed) = super::ty::int_info(primitive).expect("repr integers are integers");
+    match primitive {
+        Primitive::Usize | Primitive::Isize => IntegerType::Pointer(signed),
+        _ => IntegerType::Fixed(Integer::from_size(rustc_abi::Size::from_bits(bits)).expect("a repr integer has a size"), signed),
+    }
+}
+
+fn discr_range(dl: &TargetDataLayout, repr: &ReprOptions, min: i128, max: i128) -> (Integer, bool) {
+    match repr.int {
+        Some(IntegerType::Fixed(integer, signed)) => return (integer, signed),
+        Some(IntegerType::Pointer(signed)) => return (dl.ptr_sized_integer(), signed),
+        None => {}
+    }
+    let unsigned = Integer::fit_unsigned(std::cmp::max(min as u128, max as u128));
+    let signed = std::cmp::max(Integer::fit_signed(min), Integer::fit_signed(max));
+    let at_least = if repr.c() { Integer::I32 } else { Integer::I8 };
+    if min >= 0 { (std::cmp::max(unsigned, at_least), false) } else { (std::cmp::max(signed, at_least), true) }
+}

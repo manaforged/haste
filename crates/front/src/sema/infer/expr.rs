@@ -66,14 +66,19 @@ impl Infer<'_, '_> {
     fn tuple_field(&mut self, base: ExprId, index: u32) -> Result<Ty> {
         let found = self.expr(base, None)?;
         let ty = self.autoderef(found);
-        match self.cx.types.kind(ty) {
+        match self.cx.types.kind(ty).clone() {
             Kind::Tuple(items) if (index as usize) < items.len() => Ok(items[index as usize]),
+            Kind::Adt(item, args) if self.cx.item(item).1.kind == crate::outline::item::ItemKind::Struct => {
+                let fields = self.adt_fields(item, &args)?.swap_remove(0);
+                fields.get(index as usize).copied().ok_or_else(|| anyhow::anyhow!("no field {index} on {}", self.cx.name(item)))
+            }
             _ => bail!("no field {index} on {}", self.show(ty)),
         }
     }
 
     fn flow(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
         match *self.body.expr(expr) {
+            Expr::Method { receiver, name, args, params } => self.method_call(expr, receiver, name, (args, params)),
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail, expected),
             Expr::If(cond, then, otherwise) => self.if_expr(cond, then, otherwise, expected),
             Expr::While { cond, body, label: None } => self.while_expr(cond, body),
@@ -81,7 +86,8 @@ impl Infer<'_, '_> {
             Expr::Break(None, value) => self.break_expr(value),
             Expr::Continue(None) => Ok(self.cx.types.intern(Kind::Never)),
             Expr::Return(value) => self.return_expr(value),
-            ref other => bail!("unsupported expression {other:?}"),
+            Expr::Try(inner) => self.try_expr(expr, inner),
+            _ => self.data(expr, expected),
         }
     }
 
@@ -102,6 +108,12 @@ impl Infer<'_, '_> {
             Lit::Str => {
                 let str_ty = self.cx.types.prim(Primitive::Str);
                 self.cx.types.intern(Kind::Ref(Mut::Not, str_ty))
+            }
+            Lit::ByteStr => {
+                let len = crate::body::literal::string_bytes(text)?.len() as u64;
+                let byte = self.cx.types.prim(Primitive::U8);
+                let array = self.cx.types.intern(Kind::Array(byte, len));
+                self.cx.types.intern(Kind::Ref(Mut::Not, array))
             }
             other => bail!("unsupported literal {other:?}"),
         })
@@ -150,7 +162,8 @@ impl Infer<'_, '_> {
             return self.shift(left, rhs);
         }
         let right = self.expr(rhs, Some(left))?;
-        if !self.is_scalar(left) {
+        let pointers = compare && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..));
+        if !self.is_scalar(left) && !pointers {
             bail!("unsupported operator {op:?} on {}", self.show(left));
         }
         self.unify(left, right)?;
@@ -194,32 +207,38 @@ impl Infer<'_, '_> {
 
     fn call(&mut self, callee: ExprId, args: crate::body::List) -> Result<Ty> {
         let callee_ty = self.expr(callee, None)?;
-        let Kind::FnDef(item, substs) = self.cx.types.kind(self.resolve(callee_ty)).clone() else { bail!("calling {} is not supported yet", self.show(callee_ty)) };
-        let (params, ret) = self.fn_types(item, &substs)?;
+        let (params, ret) = match self.cx.types.kind(self.resolve(callee_ty)).clone() {
+            Kind::FnDef(item, substs) => self.fn_types(item, &substs)?,
+            Kind::FnPtr(params, ret) => (params, ret),
+            _ => bail!("calling {} is not supported yet", self.show(callee_ty)),
+        };
         let args = self.body.list(args).to_vec();
         if args.len() != params.len() {
-            bail!("{} takes {} arguments, {} given", self.cx.name(item), params.len(), args.len());
+            bail!("call takes {} arguments, {} given", params.len(), args.len());
         }
         for (arg, param) in args.into_iter().zip(params) {
             let found = self.expr(ExprId(arg), Some(param))?;
-            self.coerce(found, param)?;
+            self.coerce_expr(ExprId(arg), found, param)?;
         }
         Ok(ret)
     }
 
     fn if_expr(&mut self, cond: ExprId, then: ExprId, otherwise: Option<ExprId>, expected: Option<Ty>) -> Result<Ty> {
         let bool_ty = self.cx.types.bool();
+        let depth = self.scopes.len();
         let found = self.expr(cond, Some(bool_ty))?;
         self.coerce(found, bool_ty)?;
         let before = std::mem::replace(&mut self.diverges, false);
         let Some(otherwise) = otherwise else {
             let then_ty = self.expr(then, None);
+            self.scopes.truncate(depth);
             self.diverges = before;
             let unit = self.cx.types.unit();
             self.coerce(then_ty?, unit)?;
             return Ok(unit);
         };
         let then_ty = self.expr(then, expected)?;
+        self.scopes.truncate(depth);
         let then_diverges = std::mem::replace(&mut self.diverges, false);
         let else_ty = self.expr(otherwise, expected.or(Some(then_ty)))?;
         self.diverges = before || (then_diverges && self.diverges);
@@ -240,12 +259,14 @@ impl Infer<'_, '_> {
 
     fn while_expr(&mut self, cond: ExprId, body: ExprId) -> Result<Ty> {
         let bool_ty = self.cx.types.bool();
+        let depth = self.scopes.len();
         let found = self.expr(cond, Some(bool_ty))?;
         self.coerce(found, bool_ty)?;
         let unit = self.cx.types.unit();
         self.loops.push(Some(unit));
         let diverges = self.diverges;
         let body_ty = self.expr(body, Some(unit));
+        self.scopes.truncate(depth);
         self.diverges = diverges;
         self.loops.pop();
         self.coerce(body_ty?, unit)?;
@@ -283,11 +304,16 @@ impl Infer<'_, '_> {
 
     fn return_expr(&mut self, value: Option<ExprId>) -> Result<Ty> {
         let ret = self.out.ret.unwrap_or_else(|| self.cx.types.unit());
-        let ty = match value {
-            Some(value) => self.expr(value, Some(ret))?,
-            None => self.cx.types.unit(),
-        };
-        self.coerce(ty, ret)?;
+        match value {
+            Some(value) => {
+                let ty = self.expr(value, Some(ret))?;
+                self.coerce_expr(value, ty, ret)?;
+            }
+            None => {
+                let unit = self.cx.types.unit();
+                self.coerce(unit, ret)?;
+            }
+        }
         Ok(self.cx.types.intern(Kind::Never))
     }
 }

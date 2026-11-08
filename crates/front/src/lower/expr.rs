@@ -2,13 +2,24 @@ use anyhow::{Result, bail};
 use haste_codegen::{Block, Signature, Type, Value};
 
 use crate::body::{Expr, ExprId, List};
+use crate::names::ItemRef;
+use crate::outline::item::ItemKind;
 use crate::sema::infer::Res;
+use crate::sema::ty::{Kind, Ty};
 
 use super::{Loop, Lower, Repr, repr};
 
 impl Lower<'_, '_> {
     /// Lowers `expr` and returns its value, or none for `()`, `!` and code after a jump.
     pub fn expr(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        let value = self.expr_kind(expr)?;
+        match (self.typed.unsize.get(&expr), value) {
+            (Some(&len), Some(data)) => Ok(Some(self.wide_pointer(data, len as i64))),
+            _ => Ok(value),
+        }
+    }
+
+    fn expr_kind(&mut self, expr: ExprId) -> Result<Option<Value>> {
         match *self.body.expr(expr) {
             Expr::Lit(lit, at) => self.lit(expr, lit, at).map(Some),
             Expr::Path(_) => self.path(expr),
@@ -18,7 +29,8 @@ impl Lower<'_, '_> {
             Expr::Assign(lhs, rhs) => self.assign(lhs, rhs, None),
             Expr::AssignOp(op, lhs, rhs) => self.assign(lhs, rhs, Some(op)),
             Expr::Cast(inner, _) => self.cast(expr, inner),
-            Expr::Call(callee, args) => self.call(callee, args),
+            Expr::Call(callee, args) => self.call(expr, callee, args),
+            Expr::Method { receiver, params, .. } => self.method(expr, receiver, params),
             _ => self.memory(expr),
         }
     }
@@ -26,6 +38,7 @@ impl Lower<'_, '_> {
     fn memory(&mut self, expr: ExprId) -> Result<Option<Value>> {
         match *self.body.expr(expr) {
             Expr::Tuple(list) => self.tuple(expr, list),
+            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner) => self.promoted(inner),
             Expr::Ref { expr: inner, .. } => self.reference(inner),
             Expr::TupleField(..) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
             _ => self.flow(expr),
@@ -41,6 +54,22 @@ impl Lower<'_, '_> {
             Expr::Break(None, value) => self.break_expr(value),
             Expr::Continue(None) => self.continue_expr(),
             Expr::Return(value) => self.return_expr(value),
+            _ => self.data(expr),
+        }
+    }
+
+    fn data(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        match *self.body.expr(expr) {
+            Expr::Struct { fields, base, .. } => self.struct_literal(expr, fields, base),
+            Expr::Field(..) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
+            Expr::Match(scrutinee, arms) => self.match_expr(expr, scrutinee, arms),
+            Expr::Let(pat, init) => self.let_expr(pat, init),
+            Expr::Array(items) => self.array(expr, items),
+            Expr::Repeat(value, _) => self.repeat(expr, value),
+            Expr::Index(..) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
+            Expr::For { label: None, pat, iter, body } => self.for_expr(expr, pat, iter, body),
+            Expr::Try(inner) => self.try_expr(expr, inner),
+            Expr::Range { from, to, .. } => self.range(expr, from, to),
             ref other => bail!("cannot lower expression {other:?} yet"),
         }
     }
@@ -48,7 +77,15 @@ impl Lower<'_, '_> {
     fn path(&mut self, expr: ExprId) -> Result<Option<Value>> {
         match self.typed.res.get(&expr) {
             Some(Res::Local(_)) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
+            Some(Res::Fn(item, substs)) if self.cx.item(*item).1.kind == ItemKind::Const => {
+                let (item, substs) = (*item, substs.clone());
+                self.invoke(item, &substs, Vec::new())
+            }
             Some(Res::Fn(..)) => Ok(None),
+            Some(Res::Ctor(_, variant, _)) => {
+                let variant = *variant;
+                self.construct(self.ty_of(expr), variant, Vec::new(), None)
+            }
             None => bail!("path has no resolution"),
         }
     }
@@ -62,26 +99,49 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn call(&mut self, callee: ExprId, args: List) -> Result<Option<Value>> {
-        let Some(Res::Fn(item, substs)) = self.typed.res.get(&callee) else { bail!("cannot lower calls through values yet") };
-        let Some(&index) = self.reached.index.get(&(*item, substs.clone())) else { bail!("call to a function that was not reached") };
-        let Ok(callee_typed) = &self.reached.list[index].1 else { bail!("{} did not type-check", self.cx.name(*item)) };
+    fn call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
+        let (item, substs) = match self.typed.res.get(&callee).cloned() {
+            Some(Res::Fn(item, substs)) => (item, substs),
+            Some(Res::Ctor(_, variant, _)) => return self.ctor_call(expr, variant, args),
+            _ => bail!("cannot lower calls through values yet"),
+        };
+        let values = self.args(args, Vec::new())?;
+        self.invoke(item, &substs, values)
+    }
+
+    fn method(&mut self, expr: ExprId, receiver: ExprId, params: List) -> Result<Option<Value>> {
+        let Some(Res::Fn(item, substs)) = self.typed.res.get(&expr).cloned() else { bail!("method call has no resolution") };
+        let Some(&adjust) = self.typed.adjusts.get(&expr) else { bail!("method call has no receiver adjustment") };
+        let first = self.receiver(receiver, adjust)?;
+        let values = self.args(params, first.into_iter().collect())?;
+        self.invoke(item, &substs, values)
+    }
+
+    fn args(&mut self, args: List, mut values: Vec<Value>) -> Result<Vec<Value>> {
+        for arg in self.body.list(args).to_vec() {
+            values.extend(self.expr(ExprId(arg))?);
+        }
+        Ok(values)
+    }
+
+    pub(super) fn invoke(&mut self, item: ItemRef, substs: &[Ty], mut values: Vec<Value>) -> Result<Option<Value>> {
+        if !self.open {
+            return Ok(None);
+        }
+        if let Some(which) = self.cx.intrinsic(item) {
+            return self.intrinsic(which, substs, &values);
+        }
+        let Some(&index) = self.reached.index.get(&(item, substs.to_vec())) else { bail!("call to a function that was not reached") };
+        let Ok(callee_typed) = &self.reached.list[index].1 else { bail!("{} did not type-check", self.cx.name(item)) };
         let signature: Signature = super::signature(self.cx, callee_typed)?;
         let ret = callee_typed.ret.map(|ret| repr(self.cx, ret)).transpose()?.unwrap_or(Repr::Zst);
         let out = match ret {
             Repr::Mem { .. } => self.slot(ret),
             _ => None,
         };
-        let mut values = Vec::new();
         if let Some(out) = out {
-            values.push(self.ins().stack_addr(Type::I64, out, 0));
-        }
-        for &arg in self.body.list(args) {
-            let value = self.expr(ExprId(arg))?;
-            values.extend(value);
-        }
-        if !self.open {
-            return Ok(None);
+            let address = self.ins().stack_addr(Type::I64, out, 0);
+            values.insert(0, address);
         }
         let returns = signature.returns.first().map(|param| param.value_type);
         let sig = self.b.import_signature(signature);
@@ -89,13 +149,18 @@ impl Lower<'_, '_> {
         let table = self.ins().iconst(Type::I64, entry);
         let code = self.ins().load(Type::I64, table, 0);
         let call = self.ins().call_indirect(sig, code, &values);
+        if callee_typed.ret.is_some_and(|ret| matches!(self.cx.types.kind(ret), Kind::Never)) {
+            self.ins().trap();
+            self.close();
+            return Ok(None);
+        }
         if let Some(out) = out {
             return Ok(Some(self.ins().stack_addr(Type::I64, out, 0)));
         }
         Ok(returns.map(|_| self.b.inst_results(call)[0]))
     }
 
-    fn branch_value(&mut self, value: Option<Value>, join: Block) {
+    pub(super) fn branch_value(&mut self, value: Option<Value>, join: Block) {
         if self.open {
             let args: Vec<Value> = value.into_iter().collect();
             let args = if self.b.block_params(join).is_empty() { Vec::new() } else { args };

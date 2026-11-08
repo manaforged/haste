@@ -1,0 +1,51 @@
+//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, and every other name through the dynamic linker.
+
+use std::alloc::Layout;
+use std::ffi::CString;
+
+/// The address of the host function that the foreign function `name` links to, when the host has one.
+pub fn symbol(name: &str) -> Option<usize> {
+    let shim = match name {
+        "__rust_alloc" => alloc as *const () as usize,
+        "__rust_alloc_zeroed" => alloc_zeroed as *const () as usize,
+        "__rust_dealloc" => dealloc as *const () as usize,
+        "__rust_realloc" => realloc as *const () as usize,
+        "__rust_alloc_error_handler" => alloc_error as *const () as usize,
+        "__rust_no_alloc_shim_is_unstable_v2" => nothing as *const () as usize,
+        _ => return dynamic(name),
+    };
+    Some(shim)
+}
+
+fn dynamic(name: &str) -> Option<usize> {
+    let name = CString::new(name).ok()?;
+    // SAFETY: name is a NUL-terminated string that lives across the call.
+    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    (!address.is_null()).then_some(address as usize)
+}
+
+extern "C" fn alloc(size: usize, align: usize) -> *mut u8 {
+    // SAFETY: compiled code calls the shim with the nonzero size and power-of-two alignment of a valid layout, as `GlobalAlloc::alloc` requires.
+    unsafe { std::alloc::alloc(Layout::from_size_align_unchecked(size, align)) }
+}
+
+extern "C" fn alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+    // SAFETY: as for `alloc`.
+    unsafe { std::alloc::alloc_zeroed(Layout::from_size_align_unchecked(size, align)) }
+}
+
+extern "C" fn dealloc(pointer: *mut u8, size: usize, align: usize) {
+    // SAFETY: compiled code frees a block that the shims allocated with this layout.
+    unsafe { std::alloc::dealloc(pointer, Layout::from_size_align_unchecked(size, align)) }
+}
+
+extern "C" fn realloc(pointer: *mut u8, size: usize, align: usize, new_size: usize) -> *mut u8 {
+    // SAFETY: compiled code grows or shrinks a block that the shims allocated with this layout.
+    unsafe { std::alloc::realloc(pointer, Layout::from_size_align_unchecked(size, align), new_size) }
+}
+
+extern "C" fn alloc_error(_size: usize, _align: usize) {
+    std::process::abort()
+}
+
+extern "C" fn nothing() {}

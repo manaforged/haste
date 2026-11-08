@@ -50,6 +50,9 @@ impl Cursor<'_> {
     }
 
     pub(super) fn assign_tail(&mut self, lhs: ExprId) -> Result<ExprId> {
+        if !self.operator_ahead() {
+            return Ok(lhs);
+        }
         if self.punct("=") && !self.punct("==") && !self.punct("=>") {
             self.at += 1;
             let rhs = self.expr()?;
@@ -82,10 +85,18 @@ impl Cursor<'_> {
         if self.is_word("as") {
             return Some((0, BinOp::Add, CAST));
         }
+        if !self.operator_ahead() {
+            return None;
+        }
         if COMPOUND.iter().any(|(text, _)| self.punct(text)) || self.punct("..") {
             return None;
         }
         BINARY.iter().find(|(text, _, _)| self.punct(text)).map(|(text, op, prec)| (text.len(), *op, *prec))
+    }
+
+    fn operator_ahead(&self) -> bool {
+        use TokenKind::*;
+        matches!(self.kind(), Or | And | Eq | Bang | Lt | Gt | Caret | Plus | Minus | Star | Slash | Percent | Dot)
     }
 
     /// Parses binary operators that bind at least as tightly as `min`.
@@ -313,12 +324,23 @@ impl Cursor<'_> {
         if self.punct("!") && !self.punct("!=") && matches!(self.kind_at(self.at + 1), TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace) {
             self.at += 1;
             let open = self.group();
+            if let Some(&block) = self.calls.and_then(|calls| calls.get(&open)) {
+                return self.expanded(block);
+            }
             return Ok(self.push_expr(Expr::Macro { path, open }));
         }
         if self.kind() == TokenKind::OpenBrace && !self.no_struct {
             return self.struct_expr(path);
         }
         Ok(self.push_expr(Expr::Path(path)))
+    }
+
+    fn expanded(&mut self, block: u32) -> Result<ExprId> {
+        let (at, end) = (self.at, self.end);
+        (self.at, self.end) = (block, self.src.pair(block) + 1);
+        let expr = self.block_expr(None, BlockKind::Plain);
+        (self.at, self.end) = (at, end);
+        expr
     }
 
     fn struct_expr(&mut self, path: super::PathId) -> Result<ExprId> {

@@ -1,7 +1,9 @@
 //! Function bodies parsed into an arena of expressions, patterns and types, over the outline's tokens.
 
-mod cursor;
+pub mod adt;
+pub(crate) mod cursor;
 mod expr;
+pub mod literal;
 mod pat;
 pub mod sig;
 mod path;
@@ -9,6 +11,7 @@ mod stmt;
 mod ty;
 
 use anyhow::Result;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::outline::source::Source;
 
@@ -205,7 +208,7 @@ pub enum Ty {
     Array(TyId, ExprId),
     Tuple(List),
     Fn { params: List, ret: Option<TyId>, variadic: bool },
-    ImplTrait(List),
+    ImplTrait(u32, List),
     DynTrait(List),
     Never,
     Infer,
@@ -312,21 +315,31 @@ impl Body {
     }
 }
 
-/// Parses the block that opens at token `open` of `src`.
-pub fn parse(src: &Source, open: u32) -> Result<Body> {
+/// Parses the block that opens at token `open` of `src`, reading each macro call that `calls` maps as the block its expansion became.
+pub fn parse(src: &Source, open: u32, calls: Option<&HashMap<u32, u32>>) -> Result<Body> {
     let mut cursor = Cursor::new(src, open, src.pair(open) + 1);
+    cursor.calls = calls;
     let root = cursor.block_expr(None, BlockKind::Plain)?;
     cursor.body.root = Some(root);
     Ok(cursor.body)
 }
 
-/// Parses the tokens from `from` up to `to` of `src` as one expression.
-pub fn parse_expr(src: &Source, from: u32, to: u32) -> Result<Body> {
+/// Parses the tokens from `from` up to `to` of `src` as one expression, with expanded macro calls as in [`parse`].
+pub fn parse_expr(src: &Source, from: u32, to: u32, calls: Option<&HashMap<u32, u32>>) -> Result<Body> {
     let mut cursor = Cursor::new(src, from, to);
+    cursor.calls = calls;
     let root = cursor.expr()?;
     cursor.finish()?;
     cursor.body.root = Some(root);
     Ok(cursor.body)
+}
+
+/// Parses the tokens from `from` up to `to` of `src` as one type.
+pub fn parse_ty(src: &Source, from: u32, to: u32) -> Result<(Body, TyId)> {
+    let mut cursor = Cursor::new(src, from, to);
+    let ty = cursor.ty()?;
+    cursor.finish()?;
+    Ok((cursor.body, ty))
 }
 
 /// A macro fragment kind that the body parser measures.

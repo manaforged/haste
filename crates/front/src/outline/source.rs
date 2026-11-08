@@ -1,4 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use super::tree::File;
 
 use anyhow::{Context, Result, bail};
 use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
@@ -23,13 +26,15 @@ pub fn doc(kind: TokenKind) -> Option<bool> {
     }
 }
 
-/// A source file and its tokens.
+/// A source file and its tokens, or tokens laid after those of a base file, numbered on from its last one.
 #[derive(Debug)]
 pub struct Source {
     pub path: PathBuf,
     pub text: String,
     pub tokens: Vec<Token>,
     pub dollars: Vec<(u32, u32)>,
+    pub base: Option<Arc<File>>,
+    pub offset: u32,
 }
 
 /// Tokens being written by a macro expansion, copied from other sources without lexing them again.
@@ -57,10 +62,12 @@ impl Tokens {
 
     /// Copies token `at` of `src`, with its spacing and its `$crate` origin.
     pub fn copy(&mut self, src: &Source, at: u32) {
-        if let Some(krate) = src.dollar(at) {
+        let (layer, local) = src.layer(at);
+        let token = layer.tokens[local];
+        if let Some(krate) = layer.own_dollar(local as u32) {
             self.dollars.push((self.tokens.len() as u32, krate));
         }
-        self.append(src.kind(at), src.text(at), src.joint(at));
+        self.append(token.kind, &layer.text[token.start as usize..(token.start + token.len) as usize], token.joint);
     }
 
     /// Writes `$crate` for the crate `krate`.
@@ -70,14 +77,16 @@ impl Tokens {
         self.append(TokenKind::Ident, "crate", false);
     }
 
-    /// Lexes `text`, a short piece a metavariable expression made, and writes its tokens.
+    /// Lexes `text`, a short piece that a metavariable expression or a builtin macro made, and writes its tokens.
     pub fn lexed(&mut self, text: &str) {
         let mut at = 0;
-        for token in tokenize(text, FrontmatterAllowed::No) {
+        let mut tokens = tokenize(text, FrontmatterAllowed::No).peekable();
+        while let Some(token) = tokens.next() {
             let piece = &text[at..at + token.len as usize];
             at += token.len as usize;
             if !is_trivia(token.kind) {
-                self.append(token.kind, piece, false);
+                let joint = tokens.peek().is_some_and(|next| !is_trivia(next.kind));
+                self.append(token.kind, piece, joint);
             }
         }
     }
@@ -94,7 +103,28 @@ impl Tokens {
     pub fn finish(self, path: PathBuf) -> Result<Source> {
         let mut tokens = self.tokens;
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text: self.text, tokens, dollars: self.dollars })
+        Ok(Source { path, text: self.text, tokens, dollars: self.dollars, base: None, offset: 0 })
+    }
+
+    /// The written tokens laid after every token of `base`, so that the indices of `base` still name its tokens.
+    pub fn finish_over(self, base: Arc<File>) -> Result<Source> {
+        if base.source.base.is_some() {
+            bail!("a layered source cannot be the base of another");
+        }
+        let mut source = self.finish(base.source.path.clone())?;
+        source.offset = base.source.len();
+        source.base = Some(base);
+        Ok(source)
+    }
+
+    /// The number of tokens written so far.
+    pub fn len(&self) -> u32 {
+        self.tokens.len() as u32
+    }
+
+    /// Whether no token is written yet.
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
     }
 }
 
@@ -211,48 +241,94 @@ impl Source {
         let mut text = text;
         let mut tokens = lex(&mut text);
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text, tokens, dollars: Vec::new() })
+        Ok(Source { path, text, tokens, dollars: Vec::new(), base: None, offset: 0 })
+    }
+
+    #[inline]
+    fn layer(&self, at: u32) -> (&Source, usize) {
+        if at >= self.offset {
+            return (self, (at - self.offset) as usize);
+        }
+        self.base_layer(at)
+    }
+
+    #[cold]
+    fn base_layer(&self, at: u32) -> (&Source, usize) {
+        match &self.base {
+            Some(base) => (&base.source, at as usize),
+            None => (self, at as usize),
+        }
     }
 
     /// The text of token `at`.
     pub fn text(&self, at: u32) -> &str {
-        let token = self.tokens[at as usize];
-        &self.text[token.start as usize..(token.start + token.len) as usize]
+        let (src, local) = self.layer(at);
+        let token = src.tokens[local];
+        &src.text[token.start as usize..(token.start + token.len) as usize]
     }
 
-    /// The source text from the start of token `from` to the end of token `to`, inclusive.
+    /// The source text from the start of token `from` to the end of token `to`, inclusive, within the layer of `from`.
     pub fn span(&self, from: u32, to: u32) -> &str {
-        let (first, last) = (self.tokens[from as usize], self.tokens[to as usize]);
-        &self.text[first.start as usize..(last.start + last.len) as usize]
+        let (src, first) = self.layer(from);
+        let last = if src.offset == self.offset { (to - self.offset) as usize } else { (to.min(self.offset - 1)) as usize };
+        let (first, last) = (src.tokens[first], src.tokens[last]);
+        &src.text[first.start as usize..(last.start + last.len) as usize]
     }
 
     /// The kind of token `at`, or `Eof` past the end.
     pub fn kind(&self, at: u32) -> TokenKind {
-        self.tokens.get(at as usize).map_or(TokenKind::Eof, |token| token.kind)
+        let (src, local) = self.layer(at);
+        src.tokens.get(local).map_or(TokenKind::Eof, |token| token.kind)
     }
 
     /// The index of the delimiter that matches token `at`.
     pub fn pair(&self, at: u32) -> u32 {
-        self.tokens[at as usize].pair
+        let (src, local) = self.layer(at);
+        src.tokens[local].pair + (at - local as u32)
     }
 
     /// Whether token `at` is followed by the next token with no space between them.
     pub fn joint(&self, at: u32) -> bool {
-        self.tokens[at as usize].joint
+        let (src, local) = self.layer(at);
+        src.tokens[local].joint
     }
 
     /// The crate that the `$crate` starting at token `at` names, when a macro wrote it.
     pub fn dollar(&self, at: u32) -> Option<u32> {
-        self.dollars.binary_search_by_key(&at, |(token, _)| *token).ok().map(|found| self.dollars[found].1)
+        let (src, local) = self.layer(at);
+        src.own_dollar(local as u32)
     }
 
-    /// The number of tokens.
+    fn own_dollar(&self, local: u32) -> Option<u32> {
+        self.dollars.binary_search_by_key(&local, |(token, _)| *token).ok().map(|found| self.dollars[found].1)
+    }
+
+    /// The byte offset of token `at` in the text of its layer.
+    pub fn byte(&self, at: u32) -> u32 {
+        let (src, local) = self.layer(at);
+        src.tokens.get(local).map_or(src.text.len() as u32, |token| token.start)
+    }
+
+    /// The line of token `at` in the text of its layer, counting from one.
+    pub fn line(&self, at: u32) -> usize {
+        let (src, _) = self.layer(at);
+        src.text[..self.byte(at) as usize].matches('\n').count() + 1
+    }
+
+    /// The column of token `at` in its line, counting characters from one.
+    pub fn column(&self, at: u32) -> usize {
+        let (src, _) = self.layer(at);
+        let before = &src.text[..self.byte(at) as usize];
+        before[before.rfind('\n').map_or(0, |newline| newline + 1)..].chars().count() + 1
+    }
+
+    /// The number of tokens, those of the base included.
     pub fn len(&self) -> u32 {
-        self.tokens.len() as u32
+        self.offset + self.tokens.len() as u32
     }
 
-    /// Whether the file has no tokens.
+    /// Whether the source has no tokens.
     pub fn is_empty(&self) -> bool {
-        self.tokens.is_empty()
+        self.len() == 0
     }
 }

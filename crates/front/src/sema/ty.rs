@@ -26,6 +26,7 @@ pub enum Kind {
     Adt(ItemRef, Vec<Ty>),
     FnDef(ItemRef, Vec<Ty>),
     FnPtr(Vec<Ty>, Ty),
+    Pat(Ty, u128, u128),
     Param(u32),
     Var(u32),
     IntVar(u32),
@@ -91,6 +92,7 @@ impl Types {
             Kind::Adt(item, args) => Kind::Adt(item, map(self, &args)),
             Kind::FnDef(item, args) => Kind::FnDef(item, map(self, &args)),
             Kind::FnPtr(params, ret) => Kind::FnPtr(map(self, &params), self.subst(ret, substs)),
+            Kind::Pat(base, start, end) => Kind::Pat(self.subst(base, substs), start, end),
             other => return self.intern(other),
         };
         self.intern(kind)

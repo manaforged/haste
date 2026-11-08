@@ -35,6 +35,15 @@ pub fn scan(src: &Source) -> Result<Items> {
     Ok(scanner.out)
 }
 
+/// Adds to `items` the items declared in a body, which start at each of `starts`.
+pub fn body_items(src: &Source, starts: impl IntoIterator<Item = u32>, items: Items) -> Result<Items> {
+    let mut scanner = Scanner { src, out: items };
+    for at in starts {
+        scanner.item(at, None)?;
+    }
+    Ok(scanner.out)
+}
+
 /// The token after the item that starts at `at`.
 pub fn item_end(src: &Source, at: u32) -> Result<u32> {
     Scanner { src, out: Items::default() }.item(at, None)
@@ -46,9 +55,7 @@ impl Scanner<'_> {
     }
 
     fn is_path_sep(&self, at: u32) -> bool {
-        let tokens = &self.src.tokens;
-        let (Some(first), Some(second)) = (tokens.get(at as usize), tokens.get(at as usize + 1)) else { return false };
-        first.kind == TokenKind::Colon && second.kind == TokenKind::Colon && first.start + 1 == second.start
+        self.src.kind(at) == TokenKind::Colon && self.src.kind(at + 1) == TokenKind::Colon && self.src.joint(at)
     }
 
     fn items(&mut self, mut at: u32, to: u32, parent: Option<u32>) -> Result<()> {
@@ -288,7 +295,7 @@ impl Scanner<'_> {
                     at += 3;
                 }
                 TokenKind::Ident | TokenKind::RawIdent => return Ok(self.leaf(at, path, absolute, item)),
-                _ => bail!("{}: bad use tree at byte {}", self.src.path.display(), self.src.tokens[at as usize].start),
+                _ => bail!("{}: bad use tree at byte {}", self.src.path.display(), self.src.byte(at)),
             }
         }
     }

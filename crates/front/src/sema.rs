@@ -1,8 +1,14 @@
 //! Semantic analysis of reached function bodies at concrete types, lowered to `haste-codegen` SSA.
 
+pub mod adt;
+mod builtin;
+mod expand;
+pub mod impls;
 pub mod infer;
+pub mod intrinsic;
 pub mod layout;
 pub mod reach;
+pub mod traits;
 pub mod ty;
 
 use rustc_hash::FxHashMap as HashMap;
@@ -11,7 +17,8 @@ use std::rc::Rc;
 use anyhow::{Context as _, Result, anyhow};
 
 use crate::body::sig::{self, Signature};
-use crate::body::{self as syntax, Body};
+use crate::body::adt::{AdtDef, adt as parse_adt};
+use crate::body::Body;
 use crate::names::collect::items_of;
 use crate::names::path::{Asks, Paths};
 use crate::names::{ItemRef, ModRef, Names};
@@ -27,8 +34,9 @@ pub struct Store {
     types: Types,
     signatures: HashMap<ItemRef, Rc<Signature>>,
     bodies: HashMap<ItemRef, Rc<Body>>,
-    generics: HashMap<ItemRef, Rc<(Body, sig::Generics)>>,
+    adts: HashMap<ItemRef, Rc<AdtDef>>,
     layouts: HashMap<ty::Ty, Rc<layout::Layout>>,
+    headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
 }
 
 /// Everything Sema reads in one pass, with its caches and the lookups that found nothing loaded yet.
@@ -40,31 +48,50 @@ pub struct Context<'a> {
     modules: HashMap<u32, Rc<HashMap<(u32, u32), u32>>>,
     signatures: HashMap<ItemRef, Rc<Signature>>,
     bodies: HashMap<ItemRef, Rc<Body>>,
-    generics: HashMap<ItemRef, Rc<(Body, sig::Generics)>>,
+    adts: HashMap<ItemRef, Rc<AdtDef>>,
     layouts: HashMap<ty::Ty, Rc<layout::Layout>>,
+    headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
+    heads: HashMap<u32, Rc<impls::Index>>,
+    owners: HashMap<u32, Rc<HashMap<(u32, Option<u32>), u32>>>,
+    trait_defs: HashMap<ItemRef, Rc<traits::TraitGenerics>>,
+    langs: Option<Rc<HashMap<String, ItemRef>>>,
+    drops: HashMap<ty::Ty, bool>,
 }
 
 impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, store: Store) -> Context<'a> {
-        let Store { types, signatures, bodies, generics, layouts } = store;
-        Context { outline, names, types, asks: Asks::default(), modules: HashMap::default(), signatures, bodies, generics, layouts }
+        let Store { types, signatures, bodies, adts, layouts, headers } = store;
+        let (modules, heads, owners) = (HashMap::default(), HashMap::default(), HashMap::default());
+        let (trait_defs, langs, drops) = (HashMap::default(), None, HashMap::default());
+        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, langs, drops }
     }
 
     /// Ends the pass: the store for the next one, and what lookups asked the front end to load or resolve.
     pub fn release(self) -> (Store, Asks) {
-        (Store { types: self.types, signatures: self.signatures, bodies: self.bodies, generics: self.generics, layouts: self.layouts }, self.asks)
+        (Store { types: self.types, signatures: self.signatures, bodies: self.bodies, adts: self.adts, layouts: self.layouts, headers: self.headers }, self.asks)
     }
 
     /// The source file and outline entry of `item`.
     pub fn item(&self, item: ItemRef) -> (&'a Source, &'a Item) {
-        let file = &self.outline.crates[item.krate as usize].files[item.file as usize];
-        (&file.source, &file.items.items[item.item as usize])
+        let file = self.file(item);
+        let index = item.outer().map_or(item.item, |(_, index)| index);
+        (&file.source, &file.items.items[index as usize])
     }
 
-    /// The outline file that holds `item`.
+    /// Whether `item` is a function declared in an `extern` block: a signature with no body.
+    pub fn foreign(&self, item: ItemRef) -> bool {
+        let (_, entry) = self.item(item);
+        let items = &self.file(item).items.items;
+        item.outer().is_none() && entry.kind == ItemKind::Fn && entry.body.is_none() && entry.parent.is_some_and(|parent| items[parent as usize].kind == ItemKind::ExternBlock)
+    }
+
+    /// The outline file that holds `item`, or the expansion of the body that declares it.
     pub fn file(&self, item: ItemRef) -> &'a crate::outline::tree::File {
-        &self.outline.crates[item.krate as usize].files[item.file as usize]
+        match item.outer() {
+            Some((outer, _)) => &self.expansion(outer).expect("a body that declares items is read").file,
+            None => &self.outline.crates[item.krate as usize].files[item.file as usize],
+        }
     }
 
     /// Path resolution inside crate `krate`, recording what it finds not loaded yet.
@@ -74,6 +101,12 @@ impl<'a> Context<'a> {
 
     /// The module that holds `item`, through any impl, trait or extern block around it.
     pub fn module_of(&mut self, item: ItemRef) -> Result<ModRef> {
+        if let Some((outer, _)) = item.outer() {
+            return self.module_of(outer);
+        }
+        if let Some(block) = self.owner_impl(item) {
+            return Ok(self.impl_module(block));
+        }
         let map = self.modules_of(item.krate);
         let (_, mut entry) = self.item(item);
         let mut top = item.item;
@@ -103,7 +136,11 @@ impl<'a> Context<'a> {
             return Ok(found.clone());
         }
         let (src, entry) = self.item(item);
-        let parsed = Rc::new(sig::signature(src, entry.start, entry.body.unwrap_or(entry.end))?);
+        let parsed = match (entry.kind, entry.name) {
+            (ItemKind::Const | ItemKind::Static, Some(name)) => sig::const_signature(src, name, entry.end)?,
+            _ => sig::signature(src, entry.start, entry.body.unwrap_or(entry.end))?,
+        };
+        let parsed = Rc::new(parsed);
         self.signatures.insert(item, parsed.clone());
         Ok(parsed)
     }
@@ -113,22 +150,30 @@ impl<'a> Context<'a> {
         if let Some(found) = self.bodies.get(&item) {
             return Ok(found.clone());
         }
-        let (src, entry) = self.item(item);
-        let open = entry.body.ok_or_else(|| anyhow!("function {} has no body", src.text(entry.name.unwrap_or(entry.start))))?;
-        let parsed = Rc::new(syntax::parse(src, open)?);
+        let parsed = Rc::new(self.parse_body(item)?);
         self.bodies.insert(item, parsed.clone());
         Ok(parsed)
     }
 
-    /// The parsed generics and where clause of the struct, enum or union `item`.
-    pub fn adt_generics(&mut self, item: ItemRef) -> Result<Rc<(Body, sig::Generics)>> {
-        if let Some(found) = self.generics.get(&item) {
+    /// The parsed definition of the struct, enum or union `item`.
+    pub fn adt_def(&mut self, item: ItemRef) -> Result<Rc<AdtDef>> {
+        if let Some(found) = self.adts.get(&item) {
             return Ok(found.clone());
         }
         let (src, entry) = self.item(item);
         let name = entry.name.ok_or_else(|| anyhow!("type item has no name"))?;
-        let parsed = Rc::new(sig::generics(src, name + 1, entry.body.unwrap_or(entry.end))?);
-        self.generics.insert(item, parsed.clone());
+        let mut parsed = parse_adt(src, name, entry.end, entry.kind == ItemKind::Enum)?;
+        let env = &self.outline.crates[item.krate as usize].env;
+        let enabled = |at: Option<u32>| {
+            let mut attrs = Vec::new();
+            at.is_none_or(|at| crate::outline::attr::attrs(src, at, false, &mut attrs).is_ok() && env.enabled(&attrs))
+        };
+        parsed.variants.retain(|variant| enabled(variant.attrs));
+        for variant in &mut parsed.variants {
+            variant.fields.retain(|field| enabled(field.attrs));
+        }
+        let parsed = Rc::new(parsed);
+        self.adts.insert(item, parsed.clone());
         Ok(parsed)
     }
 

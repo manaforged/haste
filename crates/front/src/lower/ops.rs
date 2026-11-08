@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{FloatCC, IntCC, Type, Value};
 
+use crate::body::literal::{char_value, string_bytes};
 use crate::body::{BinOp, ExprId, Lit, UnOp};
 use crate::names::Primitive;
 use crate::sema::infer::parse_int;
@@ -10,20 +11,21 @@ use super::Lower;
 
 /// What arithmetic means for one operand type.
 #[derive(Clone, Copy)]
-enum Num {
+pub(super) enum Num {
     Int { ty: Type, signed: bool },
     Float(Type),
     Bool,
 }
 
 impl Lower<'_, '_> {
-    fn num(&self, ty: Ty) -> Result<Num> {
+    pub(super) fn num(&self, ty: Ty) -> Result<Num> {
         let machine = super::machine(&self.cx.types, ty);
         Ok(match (self.cx.types.kind(ty), machine) {
             (Kind::Prim(Primitive::Bool), _) => Num::Bool,
             (Kind::Prim(Primitive::F32 | Primitive::F64), Some(ty)) => Num::Float(ty),
             (Kind::Prim(Primitive::Char), Some(ty)) => Num::Int { ty, signed: false },
             (Kind::Prim(primitive), Some(ty)) if int_info(*primitive).is_some() => Num::Int { ty, signed: int_info(*primitive).is_some_and(|(_, signed)| signed) },
+            (Kind::Ref(..) | Kind::Ptr(..), Some(Type::I64)) => Num::Int { ty: Type::I64, signed: false },
             (other, _) => bail!("no arithmetic on {other:?}"),
         })
     }
@@ -37,11 +39,36 @@ impl Lower<'_, '_> {
             Lit::Float => self.float_const(ty, parse_float(text)?),
             Lit::Char => Ok(self.ins().iconst(Type::I32, i64::from(u32::from(char_value(text)?)))),
             Lit::Byte => Ok(self.ins().iconst(Type::I8, i64::from(char_value(text)? as u8))),
+            Lit::Str => {
+                let bytes = string_bytes(text)?;
+                let address = self.slots.data(&bytes);
+                let data = self.ins().iconst(Type::I64, address);
+                Ok(self.wide_pointer(data, bytes.len() as i64))
+            }
+            Lit::ByteStr => {
+                let address = self.slots.data(&string_bytes(text)?);
+                Ok(self.ins().iconst(Type::I64, address))
+            }
             other => bail!("cannot lower literal {other:?} yet"),
         }
     }
 
-    fn int_const(&mut self, ty: Type, value: u128) -> Value {
+    /// A new wide pointer to `len` items at the constant address `data`, as the address of its two words.
+    /// A new 16-byte slot that holds the pointer `data` and the length `len`, as a reference to a slice or `str`.
+    pub(super) fn wide_pointer(&mut self, data: Value, len: i64) -> Value {
+        let len = self.ins().iconst(Type::I64, len);
+        self.wide(data, len)
+    }
+
+    /// A wide pointer in a new frame slot: the address `data`, then the metadata `len`.
+    pub(super) fn wide(&mut self, data: Value, len: Value) -> Value {
+        let slot = self.b.create_stack_slot(16, 3);
+        self.ins().stack_store(data, slot, 0);
+        self.ins().stack_store(len, slot, 8);
+        self.ins().stack_addr(Type::I64, slot, 0)
+    }
+
+    pub(super) fn int_const(&mut self, ty: Type, value: u128) -> Value {
         if ty != Type::I128 {
             return self.ins().iconst(ty, value as i64);
         }
@@ -50,7 +77,7 @@ impl Lower<'_, '_> {
         self.ins().iconcat(low, high)
     }
 
-    fn float_const(&mut self, ty: Type, value: f64) -> Result<Value> {
+    pub(super) fn float_const(&mut self, ty: Type, value: f64) -> Result<Value> {
         let (bits, int) = match ty {
             Type::F32 => (i64::from((value as f32).to_bits()), Type::I32),
             Type::F64 => (value.to_bits() as i64, Type::I64),
@@ -82,7 +109,7 @@ impl Lower<'_, '_> {
         }))
     }
 
-    fn min_value(&mut self, ty: Type) -> Value {
+    pub(super) fn min_value(&mut self, ty: Type) -> Value {
         let bits = ty.bits();
         self.int_const(ty, 1u128 << (bits - 1))
     }
@@ -145,7 +172,14 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn checked(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
+    fn checked(&mut self, op: BinOp, num: (Type, bool), x: Value, y: Value) -> Result<Value> {
+        let (result, ok) = self.overflowing(op, num, x, y)?;
+        self.check(ok);
+        Ok(result)
+    }
+
+    /// `op` on `x` and `y` with wrapping, and whether the result did not overflow.
+    pub(super) fn overflowing(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<(Value, Value)> {
         let result = match op {
             BinOp::Add => self.ins().iadd(x, y),
             BinOp::Sub => self.ins().isub(x, y),
@@ -163,11 +197,10 @@ impl Lower<'_, '_> {
                 self.ins().icmp(IntCC::SignedGreaterThanOrEqual, both, zero)
             }
         };
-        self.check(ok);
-        Ok(result)
+        Ok((result, ok))
     }
 
-    fn multiply(&mut self, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
+    fn multiply(&mut self, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<(Value, Value)> {
         let result = self.ins().imul(x, y);
         let ok = match (ty, signed) {
             (Type::I128, _) => bail!("cannot lower checked 128-bit multiplication yet"),
@@ -188,8 +221,7 @@ impl Lower<'_, '_> {
                 self.ins().icmp(IntCC::Equal, wide, back)
             }
         };
-        self.check(ok);
-        Ok(result)
+        Ok((result, ok))
     }
 
     fn divide(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
@@ -268,9 +300,11 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn cast(&mut self, expr: ExprId, inner: ExprId) -> Result<Option<Value>> {
-        let from = self.num(self.ty_of(inner))?;
+        if self.is_wide(self.ty_of(expr)) {
+            return self.expr(inner);
+        }
         let to = self.num(self.ty_of(expr))?;
-        let Some(value) = self.expr(inner)? else { return Ok(None) };
+        let Some((value, from)) = self.cast_source(inner)? else { return Ok(None) };
         Ok(Some(match (from, to) {
             (Num::Int { ty: a, signed }, Num::Int { ty: b, .. }) => self.resize(value, (a, signed), b),
             (Num::Bool, Num::Int { ty: b, .. }) => self.resize(value, (Type::I8, false), b),
@@ -287,7 +321,29 @@ impl Lower<'_, '_> {
         }))
     }
 
-    fn resize(&mut self, value: Value, (from, signed): (Type, bool), to: Type) -> Value {
+    fn cast_source(&mut self, inner: ExprId) -> Result<Option<(Value, Num)>> {
+        let source = self.ty_of(inner);
+        if let Kind::Adt(..) = self.cx.types.kind(source) {
+            let place = self.place_or_temp(inner)?;
+            return self.discriminant(place, source).map(Some);
+        }
+        if self.is_wide(source) {
+            let Some(pair) = self.expr(inner)? else { return Ok(None) };
+            return Ok(Some((self.ins().load(Type::I64, pair, 0), Num::Int { ty: Type::I64, signed: false })));
+        }
+        let from = self.num(source)?;
+        Ok(self.expr(inner)?.map(|value| (value, from)))
+    }
+
+    /// Whether `ty` is a pointer that carries a length after its address.
+    fn is_wide(&self, ty: Ty) -> bool {
+        match self.cx.types.kind(ty) {
+            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => matches!(self.cx.types.kind(*pointee), Kind::Slice(_) | Kind::Prim(Primitive::Str)),
+            _ => false,
+        }
+    }
+
+    pub(super) fn resize(&mut self, value: Value, (from, signed): (Type, bool), to: Type) -> Value {
         match from.bits().cmp(&to.bits()) {
             std::cmp::Ordering::Equal => value,
             std::cmp::Ordering::Greater => self.ins().ireduce(to, value),
@@ -351,16 +407,3 @@ fn parse_float(text: &str) -> Result<f64> {
     Ok(digits.parse()?)
 }
 
-const ESCAPES: [(&str, char); 7] = [("n", '\n'), ("t", '\t'), ("r", '\r'), ("0", '\0'), ("\\", '\\'), ("'", '\''), ("\"", '"')];
-
-/// The value of a char or byte literal, quotes included.
-fn char_value(text: &str) -> Result<char> {
-    let inner = text.trim_start_matches('b').strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')).ok_or_else(|| anyhow::anyhow!("bad char literal {text}"))?;
-    let Some(escape) = inner.strip_prefix('\\') else { return inner.chars().next().ok_or_else(|| anyhow::anyhow!("empty char literal")) };
-    if let Some(&(_, ch)) = ESCAPES.iter().find(|(name, _)| *name == escape) {
-        return Ok(ch);
-    }
-    let hex = escape.strip_prefix('x').or_else(|| escape.strip_prefix("u{").and_then(|rest| rest.strip_suffix('}'))).ok_or_else(|| anyhow::anyhow!("bad escape {text}"))?;
-    let code = u32::from_str_radix(&hex.replace('_', ""), 16)?;
-    char::from_u32(code).ok_or_else(|| anyhow::anyhow!("bad char {text}"))
-}

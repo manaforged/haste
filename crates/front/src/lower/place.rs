@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 use haste_codegen::{StackSlot, Type, Value};
 
-use crate::body::{Expr, ExprId, List, PatId, UnOp};
-use crate::sema::infer::Res;
+use crate::body::{Expr, ExprId, List, UnOp};
+use crate::sema::infer::{Adjust, Res};
 use crate::sema::ty::{Kind, Ty};
 
 use super::{Lower, Repr, repr};
@@ -28,7 +28,8 @@ impl Place {
         Place { base: Base::Slot(slot), offset: 0, repr }
     }
 
-    fn at(self, offset: i32, repr: Repr) -> Place {
+    /// The place `offset` bytes further on, holding a value of `repr`.
+    pub fn at(self, offset: i32, repr: Repr) -> Place {
         Place { base: self.base, offset: self.offset + offset, repr }
     }
 }
@@ -95,6 +96,8 @@ impl Lower<'_, '_> {
                 Ok(self.expr(pointer)?.map(|addr| Place { base: Base::Addr(addr), offset: 0, repr }))
             }
             Expr::TupleField(base, index) => self.field_place(expr, base, index).map(Some),
+            Expr::Field(base, _) => self.field_read_place(expr, base),
+            Expr::Index(base, index) => self.index_place(expr, base, index),
             _ => Ok(None),
         }
     }
@@ -118,7 +121,7 @@ impl Lower<'_, '_> {
         })
     }
 
-    fn field_offset(&mut self, tuple: Ty, index: u32) -> Result<i32> {
+    pub(super) fn field_offset(&mut self, tuple: Ty, index: u32) -> Result<i32> {
         let layout = self.cx.layout(tuple)?;
         Ok(layout.fields.offset(index as usize).bytes() as i32)
     }
@@ -154,30 +157,42 @@ impl Lower<'_, '_> {
 
     /// Lowers `&inner` to the address of `inner`'s place.
     pub fn reference(&mut self, inner: ExprId) -> Result<Option<Value>> {
-        match self.place_or_temp(inner)? {
-            Some(place) => Ok(Some(self.address(place))),
+        let place = self.place_or_temp(inner)?;
+        self.address_or_dangling(place, self.ty_of(inner)).map(Some)
+    }
+
+    /// The address of `place`, or for a value with no bytes the alignment of `ty` as a dangling address.
+    pub fn address_or_dangling(&mut self, place: Option<Place>, ty: Ty) -> Result<Value> {
+        match place {
+            Some(place) => Ok(self.address(place)),
             None => {
-                let layout = self.cx.layout(self.ty_of(inner))?;
-                Ok(Some(self.ins().iconst(Type::I64, layout.align.abi.bytes() as i64)))
+                let layout = self.cx.layout(ty)?;
+                Ok(self.ins().iconst(Type::I64, layout.align.abi.bytes() as i64))
             }
         }
     }
 
-    /// Binds the parts of tuple pattern `pat` to the fields of the tuple at address `value`.
-    pub fn bind_tuple(&mut self, pat: PatId, list: List, value: Option<Value>) -> Result<()> {
-        let Some(&ty) = self.typed.pats.get(&pat) else { bail!("tuple pattern has no type") };
-        let whole = repr(self.cx, ty)?;
-        for (index, &sub) in self.body.list(list).to_vec().iter().enumerate() {
-            let sub = PatId(sub);
-            let Some(&field_ty) = self.typed.pats.get(&sub) else { bail!("pattern has no type") };
-            let field = repr(self.cx, field_ty)?;
-            let offset = self.field_offset(ty, index as u32)?;
-            let part = match value {
-                Some(addr) => self.read(Place { base: Base::Addr(addr), offset: 0, repr: whole }.at(offset, field)),
-                None => None,
-            };
-            self.bind(sub, part)?;
+    /// The receiver of a method call after `adjust`: read through its references, then borrowed or read.
+    pub fn receiver(&mut self, receiver: ExprId, adjust: Adjust) -> Result<Option<Value>> {
+        if adjust == (Adjust { derefs: 0, autoref: None }) {
+            return self.expr(receiver);
         }
-        Ok(())
+        let mut place = self.place_or_temp(receiver)?;
+        let mut ty = self.ty_of(receiver);
+        for _ in 0..adjust.derefs {
+            if let Kind::Array(_, len) = *self.cx.types.kind(ty) {
+                let Some(_) = adjust.autoref else { bail!("a slice receiver by value") };
+                let data = self.address_or_dangling(place, ty)?;
+                return Ok(Some(self.wide_pointer(data, len as i64)));
+            }
+            let Kind::Ref(_, inner) = *self.cx.types.kind(ty) else { bail!("receiver deref through {:?}", self.cx.types.kind(ty)) };
+            let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
+            place = Some(Place { base: Base::Addr(pointer), offset: 0, repr: repr(self.cx, inner)? });
+            ty = inner;
+        }
+        match adjust.autoref {
+            Some(_) => self.address_or_dangling(place, ty).map(Some),
+            None => Ok(place.and_then(|place| self.read(place))),
+        }
     }
 }

@@ -19,6 +19,39 @@ pub struct File {
     pub source: Source,
     pub items: Items,
     pub expanded: bool,
+    bodies: OnceLock<Box<[OnceLock<Option<Box<Expansion>>>]>>,
+}
+
+/// A body read in full: its file with the expansions of its macro calls laid after it and the items it declares, and the braced block that each call's opening group became.
+#[derive(Debug)]
+pub struct Expansion {
+    pub file: File,
+    pub calls: HashMap<u32, u32>,
+}
+
+impl File {
+    /// A file of `source` scanned to `items`, with no body expanded yet.
+    pub fn new(source: Source, items: Items, expanded: bool) -> File {
+        File { source, items, expanded, bodies: OnceLock::new() }
+    }
+
+    /// The expansion of the body of item `item`, once a pass read it and found macro calls or items in it.
+    pub fn expansion(&self, item: u32) -> Option<&Expansion> {
+        self.bodies.get()?.get(item as usize)?.get()?.as_deref()
+    }
+
+    /// Whether a pass already read the body of item `item`.
+    pub fn body_read(&self, item: u32) -> bool {
+        self.bodies.get().and_then(|slots| slots.get(item as usize)).is_some_and(|slot| slot.get().is_some())
+    }
+
+    /// Records what reading the body of item `item` found, unless a pass already did.
+    pub fn set_expansion(&self, item: u32, found: Option<Box<Expansion>>) {
+        let slots = self.bodies.get_or_init(|| (0..self.items.items.len()).map(|_| OnceLock::new()).collect());
+        if let Some(slot) = slots.get(item as usize) {
+            let _ = slot.set(found);
+        }
+    }
 }
 
 /// A `macro_rules!` definition and the crate that defines it.
@@ -86,6 +119,15 @@ impl Module {
     }
 }
 
+/// One impl block: its file and item, the module around it, and the expansions of the macro calls among its items.
+#[derive(Clone, Debug)]
+pub struct Impl {
+    pub file: usize,
+    pub at: u32,
+    pub module: usize,
+    pub parts: Vec<usize>,
+}
+
 /// The module tree of one crate, read as far as lookups needed it.
 #[derive(Debug, Default)]
 pub struct Crate {
@@ -98,6 +140,8 @@ pub struct Crate {
     pub exports: HashMap<String, Arc<Macro>>,
     pub defined: HashMap<(u32, u32), Arc<Macro>>,
     pub deferred: Vec<(Arc<File>, usize, u32)>,
+    pub impls: Vec<Impl>,
+    pub members: Vec<(Arc<File>, usize, u32)>,
     pub fallback: Vec<usize>,
     pub foreign: Vec<(Arc<File>, usize, u32)>,
     pub macro_use: Vec<usize>,
@@ -273,5 +317,5 @@ impl Cache {
 fn read(path: &Path) -> Result<File> {
     let source = Source::read(path)?;
     let items = scan::scan(&source)?;
-    Ok(File { source, items, expanded: false })
+    Ok(File::new(source, items, false))
 }
