@@ -1,5 +1,9 @@
+use anyhow::Result;
+
 use super::collect::Pending;
+use super::path::Asks;
 use super::{Crate, Def, ModRef, Names, Sym};
+use crate::outline::Outline;
 
 impl Crate {
     /// Adds imports found by collection, active at once in an eager crate or where a lookup already asked for their name.
@@ -44,5 +48,16 @@ impl Names {
             asked.extend(targets);
         }
         new
+    }
+
+    /// Loads the modules and resolves the names that later lookups asked for, then settles; returns whether anything was new.
+    pub fn answer(&mut self, outline: &mut Outline, asks: Asks) -> Result<bool> {
+        let wanted = self.want(asks.names.into_inner());
+        let mut modules: Vec<(usize, usize)> = asks.modules.into_inner().iter().map(|module| (module.krate as usize, module.module as usize)).collect();
+        modules.sort_unstable();
+        modules.dedup();
+        outline.load_many(&modules)?;
+        self.settle(outline)?;
+        Ok(wanted || !modules.is_empty())
     }
 }

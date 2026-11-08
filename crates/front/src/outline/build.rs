@@ -110,7 +110,6 @@ impl Loader<'_> {
                 Some(path) => vec![file.source.path.parent().unwrap_or(Path::new("")).join(path)],
                 None => vec![base.dir.join(format!("{name}.rs")), base.dir.join(&name).join("mod.rs")],
             };
-            candidates.iter().for_each(|candidate| self.cache.prefetch(candidate.clone()));
             (Decl::File { candidates, by_attr: path.is_some() }, PathBuf::new())
         };
         let macro_use = item.attrs.contains(&Attr::MacroUse);

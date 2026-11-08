@@ -67,18 +67,8 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn punct_at(&self, at: u32, text: &str) -> bool {
-        let mut at = at;
-        let count = text.len() as u32;
-        for (index, ch) in text.char_indices() {
-            if at >= self.end || !is_punct(self.src.kind(at)) || self.src.text(at) != &text[index..index + ch.len_utf8()] {
-                return false;
-            }
-            if (index as u32) + 1 < count && !self.src.joint(at) {
-                return false;
-            }
-            at += 1;
-        }
-        true
+        let last = at + text.len() as u32 - 1;
+        last < self.end && text.bytes().zip(at..).all(|(byte, here)| Some(self.src.kind(here)) == punct_kind(byte) && (here == last || self.src.joint(here)))
     }
 
     pub fn punct(&self, text: &str) -> bool {
@@ -207,7 +197,40 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn is_punct(kind: TokenKind) -> bool {
-    use TokenKind::*;
-    matches!(kind, Semi | Comma | Dot | At | Pound | Tilde | Question | Colon | Dollar | Eq | Bang | Lt | Gt | Minus | And | Or | Plus | Star | Slash | Caret | Percent)
+const PUNCT: [(u8, TokenKind); 21] = [
+    (b';', TokenKind::Semi),
+    (b',', TokenKind::Comma),
+    (b'.', TokenKind::Dot),
+    (b'@', TokenKind::At),
+    (b'#', TokenKind::Pound),
+    (b'~', TokenKind::Tilde),
+    (b'?', TokenKind::Question),
+    (b':', TokenKind::Colon),
+    (b'$', TokenKind::Dollar),
+    (b'=', TokenKind::Eq),
+    (b'!', TokenKind::Bang),
+    (b'<', TokenKind::Lt),
+    (b'>', TokenKind::Gt),
+    (b'-', TokenKind::Minus),
+    (b'&', TokenKind::And),
+    (b'|', TokenKind::Or),
+    (b'+', TokenKind::Plus),
+    (b'*', TokenKind::Star),
+    (b'/', TokenKind::Slash),
+    (b'^', TokenKind::Caret),
+    (b'%', TokenKind::Percent),
+];
+
+const PUNCT_KINDS: [Option<TokenKind>; 128] = {
+    let mut table = [None; 128];
+    let mut at = 0;
+    while at < PUNCT.len() {
+        table[PUNCT[at].0 as usize] = Some(PUNCT[at].1);
+        at += 1;
+    }
+    table
+};
+
+fn punct_kind(byte: u8) -> Option<TokenKind> {
+    PUNCT_KINDS.get(byte as usize).copied().flatten()
 }

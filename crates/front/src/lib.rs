@@ -2,5 +2,8 @@
 
 pub mod body;
 pub mod graph;
+pub mod image;
+pub mod lower;
 pub mod names;
 pub mod outline;
+pub mod sema;

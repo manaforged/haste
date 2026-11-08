@@ -127,6 +127,7 @@ impl Outline {
 
     /// Reads each listed `(crate, module)` that is only declared, then expands what that made resolvable.
     pub fn load_many(&mut self, modules: &[(usize, usize)]) -> Result<()> {
+        self.read_ahead(modules);
         let mut demands = Vec::new();
         for &(krate, module) in modules {
             self.load_one(krate, module, &mut demands)?;
@@ -137,14 +138,9 @@ impl Outline {
     /// Reads every module of every crate.
     pub fn load_all(&mut self) -> Result<()> {
         loop {
-            let mut demands = Vec::new();
-            for krate in 0..self.crates.len() {
-                let declared: Vec<usize> = (0..self.crates[krate].modules.len()).filter(|at| matches!(self.crates[krate].modules[*at].state, State::Declared(_))).collect();
-                for module in declared {
-                    self.load_one(krate, module, &mut demands)?;
-                }
-            }
-            self.settle(demands)?;
+            let declared = |(krate, tree): (usize, &Crate)| (0..tree.modules.len()).filter(|at| matches!(tree.modules[*at].state, State::Declared(_))).map(move |at| (krate, at)).collect::<Vec<_>>();
+            let modules: Vec<(usize, usize)> = self.crates.iter().enumerate().flat_map(declared).collect();
+            self.load_many(&modules)?;
             if !self.crates.iter().any(Crate::partial) {
                 return Ok(());
             }
@@ -210,6 +206,15 @@ impl Outline {
     fn prelude_crates(&self, krate: usize) -> Vec<usize> {
         let named = |name: &str| self.deps[krate].iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
         ["std", "core"].iter().find_map(|name| named(name)).into_iter().collect()
+    }
+
+    fn read_ahead(&self, modules: &[(usize, usize)]) {
+        let files = modules.iter().filter_map(|&(krate, module)| match &self.crates[krate].modules[module].state {
+            State::Declared(Decl::File { candidates, .. }) => Some(candidates),
+            _ => None,
+        });
+        let paths: Vec<PathBuf> = files.flatten().cloned().collect();
+        self.cache.read_all(&paths);
     }
 
     fn load_one(&mut self, krate: usize, module: usize, demands: &mut Vec<usize>) -> Result<()> {

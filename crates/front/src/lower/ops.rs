@@ -1,0 +1,366 @@
+use anyhow::{Result, bail};
+use haste_codegen::{FloatCC, IntCC, Type, Value};
+
+use crate::body::{BinOp, ExprId, Lit, UnOp};
+use crate::names::Primitive;
+use crate::sema::infer::parse_int;
+use crate::sema::ty::{Kind, Ty, int_info};
+
+use super::Lower;
+
+/// What arithmetic means for one operand type.
+#[derive(Clone, Copy)]
+enum Num {
+    Int { ty: Type, signed: bool },
+    Float(Type),
+    Bool,
+}
+
+impl Lower<'_, '_> {
+    fn num(&self, ty: Ty) -> Result<Num> {
+        let machine = super::machine(&self.cx.types, ty);
+        Ok(match (self.cx.types.kind(ty), machine) {
+            (Kind::Prim(Primitive::Bool), _) => Num::Bool,
+            (Kind::Prim(Primitive::F32 | Primitive::F64), Some(ty)) => Num::Float(ty),
+            (Kind::Prim(Primitive::Char), Some(ty)) => Num::Int { ty, signed: false },
+            (Kind::Prim(primitive), Some(ty)) if int_info(*primitive).is_some() => Num::Int { ty, signed: int_info(*primitive).is_some_and(|(_, signed)| signed) },
+            (other, _) => bail!("no arithmetic on {other:?}"),
+        })
+    }
+
+    pub(super) fn lit(&mut self, expr: ExprId, lit: Lit, at: u32) -> Result<Value> {
+        let text = self.src.text(at);
+        let ty = super::machine(&self.cx.types, self.ty_of(expr)).unwrap_or(Type::I8);
+        match lit {
+            Lit::Bool(value) => Ok(self.ins().iconst(Type::I8, i64::from(value))),
+            Lit::Int => Ok(self.int_const(ty, parse_int(text)?.0)),
+            Lit::Float => self.float_const(ty, parse_float(text)?),
+            Lit::Char => Ok(self.ins().iconst(Type::I32, i64::from(u32::from(char_value(text)?)))),
+            Lit::Byte => Ok(self.ins().iconst(Type::I8, i64::from(char_value(text)? as u8))),
+            other => bail!("cannot lower literal {other:?} yet"),
+        }
+    }
+
+    fn int_const(&mut self, ty: Type, value: u128) -> Value {
+        if ty != Type::I128 {
+            return self.ins().iconst(ty, value as i64);
+        }
+        let low = self.ins().iconst(Type::I64, value as u64 as i64);
+        let high = self.ins().iconst(Type::I64, (value >> 64) as u64 as i64);
+        self.ins().iconcat(low, high)
+    }
+
+    fn float_const(&mut self, ty: Type, value: f64) -> Result<Value> {
+        let (bits, int) = match ty {
+            Type::F32 => (i64::from((value as f32).to_bits()), Type::I32),
+            Type::F64 => (value.to_bits() as i64, Type::I64),
+            other => bail!("no float constant of {other:?}"),
+        };
+        let slot = self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8);
+        let bits = self.ins().iconst(int, bits);
+        self.ins().stack_store(bits, slot, 0);
+        Ok(self.ins().stack_load(ty, slot, 0))
+    }
+
+    pub(super) fn unary(&mut self, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
+        if op == UnOp::Deref {
+            return self.deref(operand);
+        }
+        let num = self.num(self.ty_of(operand))?;
+        let Some(value) = self.expr(operand)? else { return Ok(None) };
+        Ok(Some(match (op, num) {
+            (UnOp::Not, Num::Bool) => self.ins().bxor_imm(value, 1),
+            (UnOp::Not, Num::Int { .. }) => self.ins().bnot(value),
+            (UnOp::Neg, Num::Float(_)) => self.ins().fneg(value),
+            (UnOp::Neg, Num::Int { ty, signed: true }) => {
+                let min = self.min_value(ty);
+                let ok = self.ins().icmp(IntCC::NotEqual, value, min);
+                self.check(ok);
+                self.ins().ineg(value)
+            }
+            _ => bail!("cannot lower {op:?} on this type"),
+        }))
+    }
+
+    fn min_value(&mut self, ty: Type) -> Value {
+        let bits = ty.bits();
+        self.int_const(ty, 1u128 << (bits - 1))
+    }
+
+    /// Traps unless `ok` is nonzero, where rustc's debug build panics.
+    fn check(&mut self, ok: Value) {
+        self.ins().trapz(ok);
+    }
+
+    pub(super) fn binary(&mut self, expr: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<Option<Value>> {
+        if matches!(op, BinOp::And | BinOp::Or) {
+            return self.logical(expr, op, lhs, rhs);
+        }
+        let num = self.num(self.ty_of(lhs))?;
+        let shift = self.num(self.ty_of(rhs))?;
+        let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else { return Ok(None) };
+        self.apply(op, num, (x, y), shift).map(Some)
+    }
+
+    fn apply(&mut self, op: BinOp, num: Num, (x, y): (Value, Value), rhs: Num) -> Result<Value> {
+        if let Some(cc) = compare(op) {
+            return Ok(match num {
+                Num::Float(_) => self.ins().fcmp(float_cc(cc), x, y),
+                Num::Int { signed, .. } => self.ins().icmp(int_cc(cc, signed), x, y),
+                Num::Bool => self.ins().icmp(int_cc(cc, false), x, y),
+            });
+        }
+        match num {
+            Num::Float(_) => self.float_op(op, x, y),
+            Num::Int { ty, signed } => self.int_op(op, (ty, signed), (x, y), rhs),
+            Num::Bool => self.bits_op(op, x, y),
+        }
+    }
+
+    fn bits_op(&mut self, op: BinOp, x: Value, y: Value) -> Result<Value> {
+        Ok(match op {
+            BinOp::BitAnd => self.ins().band(x, y),
+            BinOp::BitOr => self.ins().bor(x, y),
+            BinOp::BitXor => self.ins().bxor(x, y),
+            other => bail!("cannot lower {other:?} on this type"),
+        })
+    }
+
+    fn float_op(&mut self, op: BinOp, x: Value, y: Value) -> Result<Value> {
+        Ok(match op {
+            BinOp::Add => self.ins().fadd(x, y),
+            BinOp::Sub => self.ins().fsub(x, y),
+            BinOp::Mul => self.ins().fmul(x, y),
+            BinOp::Div => self.ins().fdiv(x, y),
+            other => bail!("cannot lower float {other:?} yet"),
+        })
+    }
+
+    fn int_op(&mut self, op: BinOp, (ty, signed): (Type, bool), (x, y): (Value, Value), rhs: Num) -> Result<Value> {
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul => self.checked(op, (ty, signed), x, y),
+            BinOp::Div | BinOp::Rem => self.divide(op, (ty, signed), x, y),
+            BinOp::Shl | BinOp::Shr => self.shift(op, (ty, signed), x, (y, rhs)),
+            _ => self.bits_op(op, x, y),
+        }
+    }
+
+    fn checked(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
+        let result = match op {
+            BinOp::Add => self.ins().iadd(x, y),
+            BinOp::Sub => self.ins().isub(x, y),
+            _ => return self.multiply((ty, signed), x, y),
+        };
+        let ok = match (op, signed) {
+            (BinOp::Add, false) => self.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, result, x),
+            (_, false) => self.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, x, y),
+            (_, true) => {
+                let first = self.ins().bxor(x, result);
+                let other = if op == BinOp::Add { y } else { x };
+                let second = if op == BinOp::Add { self.ins().bxor(other, result) } else { self.ins().bxor(other, y) };
+                let both = self.ins().band(first, second);
+                let zero = self.int_const(ty, 0);
+                self.ins().icmp(IntCC::SignedGreaterThanOrEqual, both, zero)
+            }
+        };
+        self.check(ok);
+        Ok(result)
+    }
+
+    fn multiply(&mut self, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
+        let result = self.ins().imul(x, y);
+        let ok = match (ty, signed) {
+            (Type::I128, _) => bail!("cannot lower checked 128-bit multiplication yet"),
+            (Type::I64, true) => {
+                let high = self.ins().smulhi(x, y);
+                let sign = self.ins().sshr_imm(result, 63);
+                self.ins().icmp(IntCC::Equal, high, sign)
+            }
+            (Type::I64, false) => {
+                let high = self.ins().umulhi(x, y);
+                self.ins().icmp_imm(IntCC::Equal, high, 0)
+            }
+            (_, signed) => {
+                let widen = |lower: &mut Self, value: Value| if signed { lower.ins().sextend(Type::I64, value) } else { lower.ins().uextend(Type::I64, value) };
+                let (wide_x, wide_y) = (widen(self, x), widen(self, y));
+                let wide = self.ins().imul(wide_x, wide_y);
+                let back = widen(self, result);
+                self.ins().icmp(IntCC::Equal, wide, back)
+            }
+        };
+        self.check(ok);
+        Ok(result)
+    }
+
+    fn divide(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
+        let nonzero = self.ins().icmp_imm(IntCC::NotEqual, y, 0);
+        self.check(nonzero);
+        if signed {
+            let min = self.min_value(ty);
+            let not_min = self.ins().icmp(IntCC::NotEqual, x, min);
+            let not_minus_one = self.ins().icmp_imm(IntCC::NotEqual, y, -1);
+            let ok = self.ins().bor(not_min, not_minus_one);
+            self.check(ok);
+        }
+        Ok(match (op, signed) {
+            (BinOp::Div, true) => self.ins().sdiv(x, y),
+            (BinOp::Div, false) => self.ins().udiv(x, y),
+            (_, true) => self.ins().srem(x, y),
+            (_, false) => self.ins().urem(x, y),
+        })
+    }
+
+    fn shift(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, (y, rhs): (Value, Num)) -> Result<Value> {
+        let Num::Int { ty: by, .. } = rhs else { bail!("shift by a non-integer") };
+        let bits = self.int_const(by, u128::from(ty.bits()));
+        let ok = self.ins().icmp(IntCC::UnsignedLessThan, y, bits);
+        self.check(ok);
+        Ok(match (op, signed) {
+            (BinOp::Shl, _) => self.ins().ishl(x, y),
+            (_, true) => self.ins().sshr(x, y),
+            (_, false) => self.ins().ushr(x, y),
+        })
+    }
+
+    fn logical(&mut self, expr: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<Option<Value>> {
+        let Some(left) = self.expr(lhs)? else { return Ok(None) };
+        let (right_block, join) = (self.b.create_block(), self.b.create_block());
+        let result = self.b.append_block_param(join, super::machine(&self.cx.types, self.ty_of(expr)).unwrap_or(Type::I8));
+        let short = self.ins().iconst(Type::I8, i64::from(op == BinOp::Or));
+        match op {
+            BinOp::Or => self.ins().brif(left, join, &[short], right_block, &[]),
+            _ => self.ins().brif(left, right_block, &[], join, &[short]),
+        };
+        self.b.switch_to_block(right_block);
+        self.open = true;
+        let right = self.expr(rhs)?;
+        if self.open
+            && let Some(right) = right
+        {
+            self.ins().jump(join, &[right]);
+        }
+        self.b.switch_to_block(join);
+        self.open = true;
+        Ok(Some(result))
+    }
+
+    pub(super) fn assign(&mut self, lhs: ExprId, rhs: ExprId, op: Option<BinOp>) -> Result<Option<Value>> {
+        let rhs_num = self.num(self.ty_of(rhs)).ok();
+        let Some(value) = self.expr(rhs)? else { return Ok(None) };
+        let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
+        let value = match op {
+            Some(op) => {
+                let Some(current) = self.read(place) else { return Ok(None) };
+                let num = self.num(self.ty_of(lhs))?;
+                self.apply(op, num, (current, value), rhs_num.unwrap_or(num))?
+            }
+            None => value,
+        };
+        self.write(place, value);
+        Ok(None)
+    }
+
+    fn deref(&mut self, operand: ExprId) -> Result<Option<Value>> {
+        let Some(pointer) = self.expr(operand)? else { return Ok(None) };
+        let (Kind::Ref(_, pointee) | Kind::Ptr(_, pointee)) = *self.cx.types.kind(self.ty_of(operand)) else { bail!("dereference of a non-pointer") };
+        let repr = super::repr(self.cx, pointee)?;
+        Ok(self.read(super::place::Place { base: super::place::Base::Addr(pointer), offset: 0, repr }))
+    }
+
+    pub(super) fn cast(&mut self, expr: ExprId, inner: ExprId) -> Result<Option<Value>> {
+        let from = self.num(self.ty_of(inner))?;
+        let to = self.num(self.ty_of(expr))?;
+        let Some(value) = self.expr(inner)? else { return Ok(None) };
+        Ok(Some(match (from, to) {
+            (Num::Int { ty: a, signed }, Num::Int { ty: b, .. }) => self.resize(value, (a, signed), b),
+            (Num::Bool, Num::Int { ty: b, .. }) => self.resize(value, (Type::I8, false), b),
+            (Num::Int { signed, ty: a }, Num::Float(b)) => {
+                let wide = self.resize(value, (a, signed), Type::I64);
+                if signed { self.ins().fcvt_from_sint(b, wide) } else { self.ins().fcvt_from_uint(b, wide) }
+            }
+            (Num::Float(_), Num::Int { ty: b, signed: true }) => self.ins().fcvt_to_sint_sat(b, value),
+            (Num::Float(_), Num::Int { ty: b, signed: false }) => self.ins().fcvt_to_uint_sat(b, value),
+            (Num::Float(a), Num::Float(b)) if a == b => value,
+            (Num::Float(Type::F32), Num::Float(b)) => self.ins().fpromote(b, value),
+            (Num::Float(_), Num::Float(b)) => self.ins().fdemote(b, value),
+            _ => bail!("cannot lower this cast yet"),
+        }))
+    }
+
+    fn resize(&mut self, value: Value, (from, signed): (Type, bool), to: Type) -> Value {
+        match from.bits().cmp(&to.bits()) {
+            std::cmp::Ordering::Equal => value,
+            std::cmp::Ordering::Greater => self.ins().ireduce(to, value),
+            std::cmp::Ordering::Less if signed => self.ins().sextend(to, value),
+            std::cmp::Ordering::Less => self.ins().uextend(to, value),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Cmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+fn compare(op: BinOp) -> Option<Cmp> {
+    Some(match op {
+        BinOp::Eq => Cmp::Eq,
+        BinOp::Ne => Cmp::Ne,
+        BinOp::Lt => Cmp::Lt,
+        BinOp::Le => Cmp::Le,
+        BinOp::Gt => Cmp::Gt,
+        BinOp::Ge => Cmp::Ge,
+        _ => return None,
+    })
+}
+
+fn int_cc(cmp: Cmp, signed: bool) -> IntCC {
+    match (cmp, signed) {
+        (Cmp::Eq, _) => IntCC::Equal,
+        (Cmp::Ne, _) => IntCC::NotEqual,
+        (Cmp::Lt, true) => IntCC::SignedLessThan,
+        (Cmp::Le, true) => IntCC::SignedLessThanOrEqual,
+        (Cmp::Gt, true) => IntCC::SignedGreaterThan,
+        (Cmp::Ge, true) => IntCC::SignedGreaterThanOrEqual,
+        (Cmp::Lt, false) => IntCC::UnsignedLessThan,
+        (Cmp::Le, false) => IntCC::UnsignedLessThanOrEqual,
+        (Cmp::Gt, false) => IntCC::UnsignedGreaterThan,
+        (Cmp::Ge, false) => IntCC::UnsignedGreaterThanOrEqual,
+    }
+}
+
+fn float_cc(cmp: Cmp) -> FloatCC {
+    match cmp {
+        Cmp::Eq => FloatCC::Equal,
+        Cmp::Ne => FloatCC::NotEqual,
+        Cmp::Lt => FloatCC::LessThan,
+        Cmp::Le => FloatCC::LessThanOrEqual,
+        Cmp::Gt => FloatCC::GreaterThan,
+        Cmp::Ge => FloatCC::GreaterThanOrEqual,
+    }
+}
+
+fn parse_float(text: &str) -> Result<f64> {
+    let digits: String = text.chars().filter(|ch| *ch != '_').collect();
+    let digits = ["f16", "f32", "f64", "f128"].iter().find_map(|suffix| digits.strip_suffix(suffix)).unwrap_or(&digits);
+    Ok(digits.parse()?)
+}
+
+const ESCAPES: [(&str, char); 7] = [("n", '\n'), ("t", '\t'), ("r", '\r'), ("0", '\0'), ("\\", '\\'), ("'", '\''), ("\"", '"')];
+
+/// The value of a char or byte literal, quotes included.
+fn char_value(text: &str) -> Result<char> {
+    let inner = text.trim_start_matches('b').strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')).ok_or_else(|| anyhow::anyhow!("bad char literal {text}"))?;
+    let Some(escape) = inner.strip_prefix('\\') else { return inner.chars().next().ok_or_else(|| anyhow::anyhow!("empty char literal")) };
+    if let Some(&(_, ch)) = ESCAPES.iter().find(|(name, _)| *name == escape) {
+        return Ok(ch);
+    }
+    let hex = escape.strip_prefix('x').or_else(|| escape.strip_prefix("u{").and_then(|rest| rest.strip_suffix('}'))).ok_or_else(|| anyhow::anyhow!("bad escape {text}"))?;
+    let code = u32::from_str_radix(&hex.replace('_', ""), 16)?;
+    char::from_u32(code).ok_or_else(|| anyhow::anyhow!("bad char {text}"))
+}

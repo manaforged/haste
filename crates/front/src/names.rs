@@ -95,7 +95,7 @@ pub enum Def {
 }
 
 /// A built-in type that paths can name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Primitive {
     Bool,
     Char,

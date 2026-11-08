@@ -3,7 +3,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use haste_front::graph::{self, Targets, cfg};
-use haste_front::outline;
+use haste_front::names::{ItemRef, Names};
+use haste_front::sema::reach::{Instance, reach};
+use haste_front::{outline, sema};
 
 fn print_graph(workspace: &graph::Workspace) {
     for line in workspace.unit_lines() {
@@ -61,7 +63,7 @@ fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usiz
     outline.load_all()?;
     let elapsed = started.elapsed();
     let started = Instant::now();
-    let mut names = haste_front::names::Names::new(workspace, &outline);
+    let mut names = Names::new(workspace, &outline);
     names.crates.iter_mut().for_each(|krate| krate.eager = true);
     names.settle(&mut outline)?;
     for error in outline.crates.iter().flat_map(|krate| &krate.errors) {
@@ -81,19 +83,139 @@ fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usiz
     Ok(())
 }
 
-fn report_demand(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
-    let started = Instant::now();
+/// Loads the member crates' roots and settles names, reading only what their lookups reach.
+fn demand_front(workspace: &graph::Workspace, targets: &Targets) -> Result<(outline::Outline, Names)> {
     let mut outline = outline::new(workspace, targets);
-    let members: Vec<usize> = (0..outline.roots.len()).filter(|at| workspace.graph.members.contains(&workspace.graph.units[outline.roots[*at].unit].package)).collect();
+    let members: Vec<usize> = (0..outline.roots.len()).filter(|at| is_member(workspace, &outline.roots[*at])).collect();
     for &krate in &members {
         outline.load(krate, 0)?;
     }
-    let mut names = haste_front::names::Names::new(workspace, &outline);
+    let mut names = Names::new(workspace, &outline);
     members.iter().for_each(|krate| names.crates[*krate].eager = true);
     names.settle(&mut outline)?;
-    eprintln!("demand {} in {:.1} ms", summary(&outline), started.elapsed().as_secs_f64() * 1e3);
+    Ok((outline, names))
+}
+
+fn is_member(workspace: &graph::Workspace, root: &outline::Root) -> bool {
+    workspace.graph.members.contains(&workspace.graph.units[root.unit].package)
+}
+
+fn report_demand(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let started = Instant::now();
+    let (outline, names) = demand_front(workspace, targets)?;
+    eprintln!("demand {} cached {} in {:.1} ms", summary(&outline), outline.cache.len(), started.elapsed().as_secs_f64() * 1e3);
     report_names(&outline, &names, started);
     Ok(())
+}
+
+fn case_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
+    let mut found = Vec::new();
+    for (krate, (_, tree)) in outline.roots.iter().zip(&outline.crates).enumerate().filter(|(_, (root, _))| is_member(workspace, root)) {
+        for (file_at, file) in tree.files.iter().enumerate() {
+            for (at, item) in file.items.items.iter().enumerate() {
+                let named = item.name.is_some_and(|name| file.source.text(name).starts_with("case_"));
+                if named && item.kind == outline::item::ItemKind::Fn {
+                    found.push(ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 });
+                }
+            }
+        }
+    }
+    found
+}
+
+type Failures = std::collections::BTreeMap<String, Vec<String>>;
+
+fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
+    let mut failures = Failures::new();
+    for &item in cases {
+        if let Err(error) = sema::infer::infer(cx, item, &[]) {
+            let text = format!("{error:#}");
+            let kind = text.split([' ', '(', '`']).take(3).collect::<Vec<_>>().join(" ");
+            failures.entry(kind).or_default().push(cx.name(item).to_owned());
+        }
+    }
+    failures
+}
+
+fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let started = Instant::now();
+    let (mut outline, mut names) = demand_front(workspace, targets)?;
+    let front = started.elapsed();
+    let cases = case_items(workspace, &outline);
+    let (mut store, mut passes) = (sema::Store::default(), 0);
+    let failures = loop {
+        passes += 1;
+        let mut cx = sema::Context::new(&outline, &names, store);
+        let failures = typeck_pass(&mut cx, &cases);
+        let asks;
+        (store, asks) = cx.release();
+        if failures.is_empty() || !names.answer(&mut outline, asks)? {
+            break failures;
+        }
+    };
+    let failed: usize = failures.values().map(Vec::len).sum();
+    for (error, items) in &failures {
+        eprintln!("{:>4} {error} [{}]", items.len(), items.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(" "));
+    }
+    let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
+    eprintln!("typeck {} cases, {} passed, {failed} failed, {passes} passes, {}, front {:.1} ms, total {:.1} ms", cases.len(), cases.len() - failed, summary(&outline), ms(front), ms(started.elapsed()));
+    Ok(())
+}
+
+fn reach_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<(outline::Outline, Names, sema::Store, Vec<ItemRef>)> {
+    let (mut outline, mut names) = demand_front(workspace, targets)?;
+    let cases = case_items(workspace, &outline);
+    let roots: Vec<Instance> = cases.iter().map(|item| (*item, Vec::new())).collect();
+    let mut store = sema::Store::default();
+    loop {
+        let mut cx = sema::Context::new(&outline, &names, store);
+        let reached = reach(&mut cx, &roots);
+        let done = reached.list.iter().all(|(_, typed)| typed.is_ok());
+        let asks;
+        (store, asks) = cx.release();
+        if done || !names.answer(&mut outline, asks)? {
+            return Ok((outline, names, store, cases));
+        }
+    }
+}
+
+fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let started = Instant::now();
+    let (outline, names, store, cases) = reach_cases(workspace, targets)?;
+    let mut cx = sema::Context::new(&outline, &names, store);
+    let roots: Vec<Instance> = cases.iter().map(|item| (*item, Vec::new())).collect();
+    let reached = reach(&mut cx, &roots);
+    let mut image = haste_front::image::Image::new(&reached);
+    let broken: std::collections::HashMap<usize, String> = image.compile(&mut cx, &reached).into_iter().collect();
+    let built = started.elapsed();
+    let mut failures = Failures::new();
+    let mut ran = 0;
+    for (root, item) in cases.iter().enumerate() {
+        let closure = reached.closure(root);
+        let failure = closure.iter().find_map(|at| reached.list[*at].1.as_ref().err().or(broken.get(at)));
+        let name = cx.name(*item);
+        match failure {
+            Some(error) => failures.entry(error_kind(error)).or_default().push(name.to_owned()),
+            None => {
+                let status = image.run_case(root, name, &[-5, 0, 1, 3, 20])?;
+                ran += 1;
+                if status != 0 {
+                    failures.entry(format!("crashed with status {status}")).or_default().push(name.to_owned());
+                }
+            }
+        }
+    }
+    for (error, items) in &failures {
+        eprintln!("{:>4} {error} [{}]", items.len(), items.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(" "));
+    }
+    let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
+    eprintln!("cases {} found, {ran} ran, {} functions reached, built in {:.1} ms, total {:.1} ms", cases.len(), reached.list.len(), ms(built), ms(started.elapsed()));
+    Ok(())
+}
+
+fn error_kind(text: &str) -> String {
+    let text = text.split_once(": ").map_or(text, |(_, rest)| rest);
+    text.split([' ', '(', '`']).take(4).collect::<Vec<_>>().join(" ")
 }
 
 fn parse_bodies(tree: &outline::tree::Crate) -> (usize, Vec<String>) {
@@ -134,7 +256,7 @@ fn report_bodies(outline: &outline::Outline, threads: usize) {
     eprintln!("bodies {parsed} parsed, {} failed in {:.1} ms", errors.len(), started.elapsed().as_secs_f64() * 1e3);
 }
 
-fn report_names(outline: &outline::Outline, names: &haste_front::names::Names, started: Instant) {
+fn report_names(outline: &outline::Outline, names: &Names, started: Instant) {
     let elapsed = started.elapsed();
     let mut total = 0;
     for (index, krate) in names.crates.iter().enumerate() {
@@ -158,27 +280,34 @@ fn report_names(outline: &outline::Outline, names: &haste_front::names::Names, s
     eprintln!("names {bindings} names, {total} unresolved imports in {:.1} ms", elapsed.as_secs_f64() * 1e3);
 }
 
+const USAGE: &str = "usage: haste-front graph|outline|demand|typeck|cases|items|expand PATH";
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let mode = args.next().context("usage: haste-front graph|outline|items PATH")?;
+    let mode = args.next().context(USAGE)?;
+    let path = PathBuf::from(args.next().context(USAGE)?);
     match mode.as_str() {
-        "items" => return print_items(&PathBuf::from(args.next().context("usage: haste-front items FILE")?)),
-        "expand" => return print_expanded(&PathBuf::from(args.next().context("usage: haste-front expand FILE")?)),
-        _ => {}
+        "items" => print_items(&path),
+        "expand" => print_expanded(&path),
+        _ => report(&mode, &std::path::absolute(path)?),
     }
-    let root = std::path::absolute(PathBuf::from(args.next().context("usage: haste-front graph|outline PATH")?))?;
+}
+
+fn report(mode: &str, root: &std::path::Path) -> Result<()> {
     let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
     let targets = Targets { target: cfg::Target::x86_64_linux_gnu(), host: cfg::Target::x86_64_linux_gnu() };
     let started = Instant::now();
-    let mut workspace = graph::load(&root, &targets)?;
+    let mut workspace = graph::load(root, &targets)?;
     if mode != "graph" {
         workspace.merge(graph::load_sysroot(&graph::library()?, &targets)?);
     }
     let loaded = started.elapsed();
-    match mode.as_str() {
+    match mode {
         "graph" => print_graph(&workspace),
         "outline" => report_outline(&workspace, &targets, threads)?,
         "demand" => report_demand(&workspace, &targets)?,
+        "typeck" => report_typeck(&workspace, &targets)?,
+        "cases" => report_cases(&workspace, &targets)?,
         other => bail!("unknown mode {other}"),
     }
     eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);

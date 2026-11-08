@@ -3,6 +3,7 @@
 mod cursor;
 mod expr;
 mod pat;
+pub mod sig;
 mod path;
 mod stmt;
 mod ty;

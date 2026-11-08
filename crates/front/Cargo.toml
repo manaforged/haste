@@ -7,8 +7,12 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+haste-codegen = { path = "../codegen" }
+libc = "0.2"
 rustc-hash = "2"
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+rustc_abi = { package = "ra-ap-rustc_abi", version = "0.166", default-features = false }
+rustc_index = { package = "ra-ap-rustc_index", version = "0.166", default-features = false }
 rustc_lexer = { package = "ra-ap-rustc_lexer", version = "0.180", default-features = false }

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use rustc_hash::FxHashMap as HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
@@ -216,12 +216,13 @@ fn not(value: Truth) -> Truth {
 
 type Slot = Arc<OnceLock<Result<Arc<File>, String>>>;
 
-/// Files read and scanned once, shared by every crate that includes them. Worker threads read files ahead of use.
+/// Files read and scanned once, shared by every crate that includes them.
 #[derive(Default)]
 pub struct Cache {
-    slots: Arc<Mutex<HashMap<PathBuf, Slot>>>,
-    queue: OnceLock<Sender<PathBuf>>,
+    slots: Mutex<HashMap<PathBuf, Slot>>,
 }
+
+const PER_WORKER: usize = 4;
 
 fn slot(slots: &Mutex<HashMap<PathBuf, Slot>>, path: &Path) -> Result<Slot> {
     Ok(slots.lock().map_err(|_| anyhow!("file cache poisoned"))?.entry(path.to_owned()).or_default().clone())
@@ -237,27 +238,25 @@ impl Cache {
         fill(&slot(&self.slots, path)?, path).map_err(|error| anyhow!(error))
     }
 
-    /// Starts reading `path` on a worker thread if it exists, so a later `file` finds it read.
-    pub fn prefetch(&self, path: PathBuf) {
-        let queue = self.queue.get_or_init(|| {
-            let (sender, receiver) = channel::<PathBuf>();
-            let receiver = Arc::new(Mutex::new(receiver));
-            let workers = std::thread::available_parallelism().map_or(1, |count| count.get().saturating_sub(1).max(1));
+    /// Reads and scans the existing files among `paths` on scoped threads that finish before it returns.
+    pub fn read_all(&self, paths: &[PathBuf]) {
+        let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
+        let workers = cores.min(paths.len() / PER_WORKER);
+        if workers < 2 {
+            return;
+        }
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
             for _ in 0..workers {
-                let (receiver, slots) = (receiver.clone(), self.slots.clone());
-                std::thread::spawn(move || {
-                    loop {
-                        let next = receiver.lock().ok().and_then(|queue| queue.recv().ok());
-                        let Some(path) = next else { return };
-                        if path.is_file() && let Ok(slot) = slot(&slots, &path) {
-                            let _ = fill(&slot, &path);
+                scope.spawn(|| {
+                    while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        if path.is_file() && let Ok(slot) = slot(&self.slots, path) {
+                            let _ = fill(&slot, path);
                         }
                     }
                 });
             }
-            sender
         });
-        let _ = queue.send(path);
     }
 
     /// The number of files read.
