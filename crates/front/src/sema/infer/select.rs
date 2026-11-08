@@ -33,15 +33,20 @@ impl<'a> Infer<'_, 'a> {
         let mut found = Vec::new();
         for block in blocks {
             let saved = self.vars.clone();
-            if let Some(impl_args) = self.match_trait_impl(block, self_ty, args).ok().flatten()
-                && self.bounds_hold(block, &impl_args, depth).unwrap_or(false)
-            {
-                found.push(((block, impl_args), self.vars.clone()));
+            let applies = self.impl_applies(block, self_ty, args, depth);
+            let vars = std::mem::replace(&mut self.vars, saved);
+            if let Some(impl_args) = applies? {
+                found.push(((block, impl_args), vars));
             }
-            self.vars = saved;
         }
         if found.len() > 1 {
-            found.retain(|((block, _), _)| !self.blanket(*block));
+            let mut kept = Vec::new();
+            for entry in found {
+                if !self.blanket(entry.0.0)? {
+                    kept.push(entry);
+                }
+            }
+            found = kept;
         }
         if found.len() > 1 {
             found.retain(|((block, _), _)| !self.cx.specializable(*block));
@@ -51,10 +56,11 @@ impl<'a> Infer<'_, 'a> {
         Ok(Some(picked))
     }
 
-    fn blanket(&mut self, block: ImplRef) -> bool {
-        let Ok(count) = self.impl_params(block) else { return false };
+    fn blanket(&mut self, block: ImplRef) -> Result<bool> {
+        let count = self.impl_params(block)?;
         let args: Vec<Ty> = (0..count).map(|_| self.fresh(Kind::Var)).collect();
-        self.impl_frame(block, &args).is_ok_and(|(_, self_ty)| args.contains(&self_ty))
+        let (_, self_ty) = self.impl_frame(block, &args)?;
+        Ok(args.contains(&self_ty))
     }
 
     fn holders(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Vec<u32> {
@@ -76,9 +82,17 @@ impl<'a> Infer<'_, 'a> {
         crates
     }
 
+    fn impl_applies(&mut self, block: ImplRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Vec<Ty>>> {
+        let Some(impl_args) = self.match_trait_impl(block, self_ty, args)? else { return Ok(None) };
+        Ok(self.bounds_hold(block, &impl_args, depth)?.then_some(impl_args))
+    }
+
     fn match_trait_impl(&mut self, block: ImplRef, self_ty: Ty, args: &[Ty]) -> Result<Option<Vec<Ty>>> {
         let Some(impl_args) = self.match_impl(block, self_ty) else { return Ok(None) };
         let given = self.impl_trait_args(block, &impl_args, self_ty)?;
+        if given.len() != args.len() {
+            bail!("an impl gives {} trait arguments where {} are wanted", given.len(), args.len());
+        }
         for (found, wanted) in given.iter().zip(args) {
             if self.unify(*found, *wanted).is_err() {
                 return Ok(None);
@@ -132,7 +146,7 @@ impl<'a> Infer<'_, 'a> {
         self.with_frame(frame, |infer| {
             for predicate in &header.predicates {
                 let Some(ty) = predicate.ty else { continue };
-                let Ok(ty) = infer.lower_ty(&header.body, ty) else { continue };
+                let ty = infer.lower_ty(&header.body, ty)?;
                 wanted.extend(header.body.list(predicate.bounds).iter().map(|&bound| (ty, bound)));
             }
             for (ty, bound) in wanted {

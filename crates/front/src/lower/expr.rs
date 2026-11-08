@@ -12,9 +12,13 @@ use super::{Loop, Lower, Repr, repr};
 impl Lower<'_, '_> {
     /// Lowers `expr` and returns its value, or none for `()`, `!` and code after a jump.
     pub fn expr(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        if !self.open {
+            return Ok(None);
+        }
         let value = self.expr_kind(expr)?;
         match (self.typed.unsize.get(&expr), value) {
-            (Some(&len), Some(data)) => Ok(Some(self.wide_pointer(data, len as i64))),
+            (Some(&len), Some(data)) if self.open => Ok(Some(self.wide_pointer(data, len as i64))),
+            _ if !self.open => Ok(None),
             _ => Ok(value),
         }
     }
@@ -40,7 +44,7 @@ impl Lower<'_, '_> {
             Expr::Tuple(list) => self.tuple(expr, list),
             Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner) => self.promoted(inner),
             Expr::Ref { expr: inner, .. } => self.reference(inner),
-            Expr::TupleField(..) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
+            Expr::TupleField(..) => self.field_value(expr),
             _ => self.flow(expr),
         }
     }
@@ -61,7 +65,7 @@ impl Lower<'_, '_> {
     fn data(&mut self, expr: ExprId) -> Result<Option<Value>> {
         match *self.body.expr(expr) {
             Expr::Struct { fields, base, .. } => self.struct_literal(expr, fields, base),
-            Expr::Field(..) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
+            Expr::Field(..) => self.field_value(expr),
             Expr::Match(scrutinee, arms) => self.match_expr(expr, scrutinee, arms),
             Expr::Let(pat, init) => self.let_expr(pat, init),
             Expr::Array(items) => self.array(expr, items),
@@ -74,9 +78,25 @@ impl Lower<'_, '_> {
         }
     }
 
+    fn field_value(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        let value = self.place_of(expr)?.and_then(|place| self.read(place));
+        if let Some((root, path)) = self.move_path(expr)
+            && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))?
+        {
+            self.moved_out(root, &path)?;
+        }
+        Ok(value)
+    }
+
     fn path(&mut self, expr: ExprId) -> Result<Option<Value>> {
         match self.typed.res.get(&expr) {
-            Some(Res::Local(_)) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
+            Some(&Res::Local(local)) => {
+                let value = self.place_of(expr)?.and_then(|place| self.read(place));
+                if crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))? {
+                    self.moved_out(super::moves::Root::Local(local), &[])?;
+                }
+                Ok(value)
+            }
             Some(Res::Fn(item, substs)) if self.cx.item(*item).1.kind == ItemKind::Const => {
                 let (item, substs) = (*item, substs.clone());
                 self.invoke(item, &substs, Vec::new())
@@ -164,12 +184,13 @@ impl Lower<'_, '_> {
         if self.open {
             let args: Vec<Value> = value.into_iter().collect();
             let args = if self.b.block_params(join).is_empty() { Vec::new() } else { args };
-            self.ins().jump(join, &args);
+            self.jump(join, &args);
             self.close();
         }
     }
 
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
+        let mark = self.owned.len();
         let Some(test) = self.expr(cond)? else { return Ok(None) };
         let (then_block, else_block, join) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         let result = match otherwise {
@@ -177,40 +198,46 @@ impl Lower<'_, '_> {
             None => None,
         };
         let joined = result.map(|ty| self.b.append_block_param(join, ty));
-        self.ins().brif(test, then_block, &[], else_block, &[]);
-        self.b.switch_to_block(then_block);
-        self.open = true;
+        self.brif(test, (then_block, &[]), (else_block, &[]));
+        self.enter(then_block);
         let value = self.expr(then)?;
+        if self.open {
+            self.drop_to(mark)?;
+        }
         self.branch_value(value, join);
-        self.b.switch_to_block(else_block);
-        self.open = true;
+        self.enter(else_block);
+        self.drop_to(mark)?;
         let value = match otherwise {
             Some(otherwise) => self.expr(otherwise)?,
             None => None,
         };
         self.branch_value(value, join);
-        self.b.switch_to_block(join);
-        self.open = true;
+        self.owned.truncate(mark);
+        self.enter(join);
         Ok(joined)
     }
 
     fn while_expr(&mut self, cond: ExprId, body: ExprId) -> Result<Option<Value>> {
         let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
-        self.ins().jump(head, &[]);
-        self.b.switch_to_block(head);
+        self.jump(head, &[]);
+        self.enter(head);
+        let depth = self.owned.len();
         let test = self.expr(cond)?;
         if let Some(test) = test {
-            self.ins().brif(test, inner, &[], exit, &[]);
+            let fail = self.b.create_block();
+            self.brif(test, (inner, &[]), (fail, &[]));
+            self.enter(fail);
+            self.drop_to(depth)?;
+            self.jump(exit, &[]);
         }
-        self.b.switch_to_block(inner);
-        self.open = true;
-        self.loops.push(Loop { head, exit, value: None });
+        self.enter(inner);
+        self.loops.push(Loop { head, exit, value: None, depth });
         let result = self.expr(body);
         self.loops.pop();
         result?;
+        self.end_scope(depth)?;
         self.branch_value(None, head);
-        self.b.switch_to_block(exit);
-        self.open = true;
+        self.enter(exit);
         Ok(None)
     }
 
@@ -220,15 +247,15 @@ impl Lower<'_, '_> {
             Some(ty) => Some((self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8), ty)),
             None => None,
         };
-        self.ins().jump(head, &[]);
-        self.b.switch_to_block(head);
-        self.loops.push(Loop { head, exit, value });
+        self.jump(head, &[]);
+        self.enter(head);
+        let depth = self.owned.len();
+        self.loops.push(Loop { head, exit, value, depth });
         let result = self.expr(body);
         self.loops.pop();
         result?;
         self.branch_value(None, head);
-        self.b.switch_to_block(exit);
-        self.open = true;
+        self.enter(exit);
         Ok(value.map(|(slot, ty)| self.ins().stack_load(ty, slot, 0)))
     }
 
@@ -237,16 +264,18 @@ impl Lower<'_, '_> {
             Some(value) => self.expr(value)?,
             None => None,
         };
-        let Some(&Loop { exit, value: slot, .. }) = self.loops.last() else { bail!("`break` outside a loop") };
+        let Some(&Loop { exit, value: slot, depth, .. }) = self.loops.last() else { bail!("`break` outside a loop") };
         if let (Some(value), Some((slot, _))) = (value, slot) {
             self.ins().stack_store(value, slot, 0);
         }
+        self.drop_to(depth)?;
         self.branch_value(None, exit);
         Ok(None)
     }
 
     fn continue_expr(&mut self) -> Result<Option<Value>> {
-        let Some(head) = self.loops.last().map(|lp| lp.head) else { bail!("`continue` outside a loop") };
+        let Some(&Loop { head, depth, .. }) = self.loops.last() else { bail!("`continue` outside a loop") };
+        self.drop_to(depth)?;
         self.branch_value(None, head);
         Ok(None)
     }

@@ -2,7 +2,6 @@ use anyhow::{Result, bail};
 use haste_codegen::{IntCC, Type, Value};
 
 use crate::body::{ExprId, List};
-use crate::names::Primitive;
 use crate::sema::ty::Kind;
 
 use super::place::{Base, Place};
@@ -52,13 +51,14 @@ impl Lower<'_, '_> {
                     let data = self.address(at);
                     break (data, self.ins().iconst(Type::I64, count as i64));
                 }
-                Kind::Ref(_, inner) | Kind::Ptr(_, inner) if matches!(self.cx.types.kind(inner), Kind::Slice(_) | Kind::Prim(Primitive::Str)) => {
-                    let Some(wide) = place.and_then(|at| self.read(at)) else { bail!("slice reference with no value") };
+                _ if self.is_unsized(ty) => {
+                    let Some(at) = place else { bail!("slice with no wide pointer") };
+                    let wide = self.address(at);
                     break (self.ins().load(Type::I64, wide, 0), self.ins().load(Type::I64, wide, 8));
                 }
                 Kind::Ref(_, inner) | Kind::Ptr(_, inner) => {
                     let Some(pointer) = place.and_then(|at| self.read(at)) else { bail!("reference with no value") };
-                    place = Some(Place { base: Base::Addr(pointer), offset: 0, repr: repr(self.cx, inner)? });
+                    place = Some(self.pointee_place(pointer, inner)?);
                     ty = inner;
                 }
                 _ => bail!("builtin index of a type that is not an array or slice"),

@@ -15,27 +15,28 @@ impl Lower<'_, '_> {
         let value = self.expr(iter)?;
         let iterator = self.invoke(*into, into_substs, value.into_iter().collect())?;
         let place = self.spill(iterator, each.iter)?;
+        self.own(super::moves::Root::Temp(iter), each.iter, place, true)?;
+        let depth = self.owned.len();
         let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
-        self.ins().jump(head, &[]);
-        self.b.switch_to_block(head);
+        self.jump(head, &[]);
+        self.enter(head);
         let address = self.address_or_dangling(place, each.iter)?;
         let option = self.invoke(*next, next_substs, vec![address])?;
         let Some(option) = self.spill(option, each.option)? else { bail!("`next` returned no value") };
         match self.is_variant(option, each.option, each.some)? {
-            Some(some) => self.ins().brif(some, inner, &[], exit, &[]),
-            None => self.ins().jump(inner, &[]),
+            Some(some) => self.brif(some, (inner, &[]), (exit, &[])),
+            None => self.jump(inner, &[]),
         };
-        self.b.switch_to_block(inner);
-        self.open = true;
+        self.enter(inner);
         let item = self.variant_field(option, each.option, (each.some, 0))?;
-        self.bind_matched(pat, Some(item))?;
-        self.loops.push(Loop { head, exit, value: None });
+        self.bind_matched(pat, Some(item), None)?;
+        self.loops.push(Loop { head, exit, value: None, depth });
         let result = self.expr(body);
         self.loops.pop();
         result?;
+        self.end_scope(depth)?;
         self.branch_value(None, head);
-        self.b.switch_to_block(exit);
-        self.open = true;
+        self.enter(exit);
         Ok(None)
     }
 
@@ -48,15 +49,13 @@ impl Lower<'_, '_> {
         let Some(flow) = self.spill(flow, tried.flow)? else { bail!("`branch` returned no value") };
         let Some(stopped) = self.is_variant(flow, tried.flow, tried.stop)? else { bail!("`?` on a `ControlFlow` with one variant") };
         let (stop, proceed) = (self.b.create_block(), self.b.create_block());
-        self.ins().brif(stopped, stop, &[], proceed, &[]);
-        self.b.switch_to_block(stop);
-        self.open = true;
+        self.brif(stopped, (stop, &[]), (proceed, &[]));
+        self.enter(stop);
         let residual = self.variant_field(flow, tried.flow, (tried.stop, 0))?;
         let residual = self.read(residual);
         let result = self.invoke(*from, from_substs, residual.into_iter().collect())?;
         self.finish(result)?;
-        self.b.switch_to_block(proceed);
-        self.open = true;
+        self.enter(proceed);
         let output = self.variant_field(flow, tried.flow, (tried.proceed, 0))?;
         Ok(self.read(output))
     }

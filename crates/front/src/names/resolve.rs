@@ -334,8 +334,8 @@ impl Names {
     fn imported_macros(&self, outline: &Outline, krate: usize, demands: &Asks) -> (Vec<(usize, Arc<Macro>)>, Vec<usize>) {
         let paths = paths_of(self, outline, krate, demands);
         let (mut found, mut foreign) = (Vec::new(), Vec::new());
-        for (index, (file, module, at)) in outline.crates[krate].deferred.iter().enumerate() {
-            let Some(item) = resolve_macro(&paths, file, (*at, ModRef { krate: krate as u32, module: *module as u32 })) else { continue };
+        for (index, call) in outline.crates[krate].deferred.iter().enumerate() {
+            let Some(item) = resolve_macro(&paths, &call.file, (call.at, ModRef { krate: krate as u32, module: call.owner as u32 })) else { continue };
             match outline.crates[item.krate as usize].defined.get(&(item.file, item.item)) {
                 Some(definition) => found.push((index, definition.clone())),
                 None => foreign.push(index),

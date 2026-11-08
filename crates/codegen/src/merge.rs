@@ -1,14 +1,5 @@
 use crate::ir::{Block, Function, Inst, Op, Value};
 
-fn successors(op: &Op) -> Vec<Block> {
-    match op {
-        Op::Jump(block, _) => vec![*block],
-        Op::Brif(_, then, _, otherwise, _) => vec![*then, *otherwise],
-        Op::TryCall { normal, handler, .. } => vec![*normal, *handler],
-        _ => Vec::new(),
-    }
-}
-
 fn terminator(func: &Function, block: usize) -> Option<Inst> {
     func.blocks[block].insts.last().copied()
 }
@@ -18,7 +9,7 @@ pub(crate) fn run(func: &mut Function) {
     let mut preds = vec![0_u32; func.blocks.len()];
     for block in 0..func.blocks.len() {
         if let Some(last) = terminator(func, block) {
-            for target in successors(&func.insts[last.index()].op) {
+            for target in func.insts[last.index()].op.targets() {
                 preds[target.index()] += 1;
             }
         }

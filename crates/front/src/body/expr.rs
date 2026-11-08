@@ -144,8 +144,7 @@ impl Cursor<'_> {
     }
 
     fn ref_expr(&mut self) -> Result<ExprId> {
-        let double = self.punct("&&");
-        self.at += if double { 2 } else { 1 };
+        self.at += 1;
         let raw = self.is_word("raw") && (self.word_at(self.at + 1) == "const" || self.word_at(self.at + 1) == "mut");
         if raw {
             self.at += 1;
@@ -155,8 +154,7 @@ impl Cursor<'_> {
             self.eat_word("const");
         }
         let expr = self.unary_operand()?;
-        let inner = self.push_expr(Expr::Ref { mutable, raw, expr });
-        Ok(if double { self.push_expr(Expr::Ref { mutable: false, raw: false, expr: inner }) } else { inner })
+        Ok(self.push_expr(Expr::Ref { mutable, raw, expr }))
     }
 
     /// Applies postfix operators to `expr`: calls, methods, fields, indexing, `?` and `.await`.

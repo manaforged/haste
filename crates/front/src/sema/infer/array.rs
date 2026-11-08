@@ -16,7 +16,7 @@ impl Infer<'_, '_> {
         let items = self.body.list(items).to_vec();
         for &item in &items {
             let found = self.expr(ExprId(item), Some(element))?;
-            self.coerce(found, element)?;
+            self.coerce_expr(ExprId(item), found, element)?;
         }
         Ok(self.cx.types.intern(Kind::Array(element, items.len() as u64)))
     }
@@ -28,8 +28,15 @@ impl Infer<'_, '_> {
             _ => None,
         };
         let found = self.expr(value, element)?;
+        let element = match element {
+            Some(element) => {
+                self.coerce_expr(value, found, element)?;
+                element
+            }
+            None => found,
+        };
         let count = self.const_len(self.body, len)?;
-        Ok(self.cx.types.intern(Kind::Array(found, count)))
+        Ok(self.cx.types.intern(Kind::Array(element, count)))
     }
 
     /// Infers the builtin index `base[index]` of an array or slice, through references.

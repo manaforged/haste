@@ -53,7 +53,9 @@ fn call_path(src: &Source, bang: u32, from: u32) -> Option<(u32, u32)> {
     while start >= from + 3 && src.kind(start - 1) == TokenKind::Colon && src.kind(start - 2) == TokenKind::Colon && is_name(src.kind(start - 3)) {
         start -= 3;
     }
-    if start > from && src.text(start) == "crate" && src.kind(start - 1) == TokenKind::Dollar {
+    if start >= from + 2 && src.kind(start - 1) == TokenKind::Colon && src.kind(start - 2) == TokenKind::Colon {
+        start -= 2;
+    } else if start > from && src.text(start) == "crate" && src.kind(start - 1) == TokenKind::Dollar {
         start -= 1;
     }
     Some((start, name))

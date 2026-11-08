@@ -10,7 +10,7 @@ use crate::sema::layout::{Layout, Variant, target};
 use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
-use super::place::{Base, Place};
+use super::place::Place;
 use super::{Lower, Repr, repr};
 
 /// The byte offset of field `index` of variant `variant` in a value of `layout`.
@@ -86,11 +86,16 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    /// Whether the value of ADT `ty` at `place` holds variant `variant`, or none when it can hold no other.
+    /// Whether the value of ADT `ty` at `place` holds variant `variant`, or none when it is the only variant the value can hold.
     pub fn is_variant(&mut self, place: Place, ty: Ty, variant: u32) -> Result<Option<Value>> {
         let Kind::Adt(item, _) = self.cx.types.kind(ty).clone() else { bail!("variant test on a type that is not an ADT") };
         let layout = self.cx.layout(ty)?;
-        let Some(tag) = self.tag(&layout)? else { return Ok(None) };
+        let Some(tag) = self.tag(&layout)? else {
+            return Ok(match layout.variants {
+                Variants::Single { index } if index.index() != variant as usize => Some(self.ins().iconst(Type::I8, 0)),
+                _ => None,
+            });
+        };
         let Some(value) = self.read(place.at(tag.offset, Repr::Scalar(tag.ty))) else { bail!("tag with no value") };
         Ok(Some(match &tag.encoding {
             TagEncoding::Direct => {
@@ -136,19 +141,6 @@ impl Lower<'_, '_> {
         let layout = self.cx.layout(ty)?;
         let field = field_types(self.cx, item, &args)?[variant as usize][index as usize];
         Ok(place.at(field_offset(&layout, variant, index), repr(self.cx, field)?))
-    }
-
-    /// The place of the struct field read `expr` on `base`, through references.
-    pub fn field_read_place(&mut self, expr: ExprId, base: ExprId) -> Result<Option<Place>> {
-        let Some(&index) = self.typed.fields.get(&expr) else { bail!("field read has no field") };
-        let Some(mut place) = self.place_or_temp(base)? else { return Ok(None) };
-        let mut ty = self.ty_of(base);
-        while let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *self.cx.types.kind(ty) {
-            let Some(pointer) = self.read(place) else { bail!("reference with no value") };
-            place = Place { base: Base::Addr(pointer), offset: 0, repr: repr(self.cx, inner)? };
-            ty = inner;
-        }
-        self.variant_field(place, ty, (0, index)).map(Some)
     }
 
     /// Lowers the struct literal `expr` with field initializers `fields`.

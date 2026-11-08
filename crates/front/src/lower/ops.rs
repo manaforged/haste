@@ -2,12 +2,12 @@ use anyhow::{Result, bail};
 use haste_codegen::{FloatCC, IntCC, Type, Value};
 
 use crate::body::literal::{char_value, string_bytes};
-use crate::body::{BinOp, ExprId, Lit, UnOp};
+use crate::body::{BinOp, Expr, ExprId, Lit, UnOp};
 use crate::names::Primitive;
 use crate::sema::infer::parse_int;
 use crate::sema::ty::{Kind, Ty, int_info};
 
-use super::Lower;
+use super::{Lower, Repr};
 
 /// What arithmetic means for one operand type.
 #[derive(Clone, Copy)]
@@ -16,6 +16,12 @@ pub(super) enum Num {
     Float(Type),
     Bool,
 }
+
+const WIDE_SIZE: u32 = 16;
+const WIDE_ALIGN: u8 = 3;
+
+/// How a reference to a slice or `str` is held: its address, then its length.
+pub(super) const WIDE: Repr = Repr::Mem { size: WIDE_SIZE, align: WIDE_ALIGN };
 
 impl Lower<'_, '_> {
     pub(super) fn num(&self, ty: Ty) -> Result<Num> {
@@ -62,7 +68,7 @@ impl Lower<'_, '_> {
 
     /// A wide pointer in a new frame slot: the address `data`, then the metadata `len`.
     pub(super) fn wide(&mut self, data: Value, len: Value) -> Value {
-        let slot = self.b.create_stack_slot(16, 3);
+        let slot = self.b.create_stack_slot(WIDE_SIZE, WIDE_ALIGN);
         self.ins().stack_store(data, slot, 0);
         self.ins().stack_store(len, slot, 8);
         self.ins().stack_addr(Type::I64, slot, 0)
@@ -94,6 +100,10 @@ impl Lower<'_, '_> {
             return self.deref(operand);
         }
         let num = self.num(self.ty_of(operand))?;
+        if let (UnOp::Neg, Num::Int { ty, .. }, Some(at)) = (op, num, self.int_literal(operand)) {
+            let value = parse_int(self.src.text(at))?.0;
+            return Ok(Some(self.int_const(ty, value.wrapping_neg())));
+        }
         let Some(value) = self.expr(operand)? else { return Ok(None) };
         Ok(Some(match (op, num) {
             (UnOp::Not, Num::Bool) => self.ins().bxor_imm(value, 1),
@@ -107,6 +117,14 @@ impl Lower<'_, '_> {
             }
             _ => bail!("cannot lower {op:?} on this type"),
         }))
+    }
+
+    fn int_literal(&self, expr: ExprId) -> Option<u32> {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) => self.int_literal(inner),
+            Expr::Lit(Lit::Int, at) => Some(at),
+            _ => None,
+        }
     }
 
     pub(super) fn min_value(&mut self, ty: Type) -> Value {
@@ -260,19 +278,17 @@ impl Lower<'_, '_> {
         let result = self.b.append_block_param(join, super::machine(&self.cx.types, self.ty_of(expr)).unwrap_or(Type::I8));
         let short = self.ins().iconst(Type::I8, i64::from(op == BinOp::Or));
         match op {
-            BinOp::Or => self.ins().brif(left, join, &[short], right_block, &[]),
-            _ => self.ins().brif(left, right_block, &[], join, &[short]),
+            BinOp::Or => self.brif(left, (join, &[short]), (right_block, &[])),
+            _ => self.brif(left, (right_block, &[]), (join, &[short])),
         };
-        self.b.switch_to_block(right_block);
-        self.open = true;
+        self.enter(right_block);
         let right = self.expr(rhs)?;
         if self.open
             && let Some(right) = right
         {
-            self.ins().jump(join, &[right]);
+            self.jump(join, &[right]);
         }
-        self.b.switch_to_block(join);
-        self.open = true;
+        self.enter(join);
         Ok(Some(result))
     }
 
@@ -280,6 +296,9 @@ impl Lower<'_, '_> {
         let rhs_num = self.num(self.ty_of(rhs)).ok();
         let Some(value) = self.expr(rhs)? else { return Ok(None) };
         let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
+        if op.is_none() && self.replace(lhs, place, value)? {
+            return Ok(None);
+        }
         let value = match op {
             Some(op) => {
                 let Some(current) = self.read(place) else { return Ok(None) };
@@ -295,8 +314,8 @@ impl Lower<'_, '_> {
     fn deref(&mut self, operand: ExprId) -> Result<Option<Value>> {
         let Some(pointer) = self.expr(operand)? else { return Ok(None) };
         let (Kind::Ref(_, pointee) | Kind::Ptr(_, pointee)) = *self.cx.types.kind(self.ty_of(operand)) else { bail!("dereference of a non-pointer") };
-        let repr = super::repr(self.cx, pointee)?;
-        Ok(self.read(super::place::Place { base: super::place::Base::Addr(pointer), offset: 0, repr }))
+        let place = self.pointee_place(pointer, pointee)?;
+        Ok(self.read(place))
     }
 
     pub(super) fn cast(&mut self, expr: ExprId, inner: ExprId) -> Result<Option<Value>> {
@@ -338,9 +357,14 @@ impl Lower<'_, '_> {
     /// Whether `ty` is a pointer that carries a length after its address.
     fn is_wide(&self, ty: Ty) -> bool {
         match self.cx.types.kind(ty) {
-            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => matches!(self.cx.types.kind(*pointee), Kind::Slice(_) | Kind::Prim(Primitive::Str)),
+            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => self.is_unsized(*pointee),
             _ => false,
         }
+    }
+
+    /// Whether `ty` is a slice or `str`, which a pointer reaches through a wide pointer.
+    pub(super) fn is_unsized(&self, ty: Ty) -> bool {
+        matches!(self.cx.types.kind(ty), Kind::Slice(_) | Kind::Prim(Primitive::Str))
     }
 
     pub(super) fn resize(&mut self, value: Value, (from, signed): (Type, bool), to: Type) -> Value {

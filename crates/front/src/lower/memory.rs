@@ -129,19 +129,19 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    fn each(&mut self, count: Value, mut body: impl FnMut(&mut Self, Value)) {
+    pub(super) fn each(&mut self, count: Value, mut body: impl FnMut(&mut Self, Value)) {
         let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         let index = self.b.append_block_param(head, Type::I64);
         let zero = self.ins().iconst(Type::I64, 0);
-        self.ins().jump(head, &[zero]);
-        self.b.switch_to_block(head);
+        self.jump(head, &[zero]);
+        self.enter(head);
         let more = self.ins().icmp(IntCC::UnsignedLessThan, index, count);
-        self.ins().brif(more, inner, &[], exit, &[]);
-        self.b.switch_to_block(inner);
+        self.brif(more, (inner, &[]), (exit, &[]));
+        self.enter(inner);
         body(self, index);
         let next = self.ins().iadd_imm(index, 1);
-        self.ins().jump(head, &[next]);
-        self.b.switch_to_block(exit);
+        self.jump(head, &[next]);
+        self.enter(exit);
     }
 
     fn unchecked(&mut self, op: BinOp, (ty, by): (Ty, Option<Ty>), x: Value, y: Value) -> Result<Value> {

@@ -83,20 +83,11 @@ impl Cursor<'_> {
     }
 
     fn ref_ty(&mut self) -> Result<TyId> {
-        let double = self.punct("&&");
         self.at += 1;
         let lifetime = self.lifetime();
         let mutable = self.eat_word("mut");
-        let ty = if double { self.ref_ty_inner()? } else { self.ty_no_bounds()? };
-        let outer = self.push_ty(Ty::Ref { lifetime, mutable, ty });
-        Ok(outer)
-    }
-
-    fn ref_ty_inner(&mut self) -> Result<TyId> {
-        let lifetime = self.lifetime();
-        let mutable = self.eat_word("mut");
-        let inner = self.ty_no_bounds()?;
-        Ok(self.push_ty(Ty::Ref { lifetime, mutable, ty: inner }))
+        let ty = self.ty_no_bounds()?;
+        Ok(self.push_ty(Ty::Ref { lifetime, mutable, ty }))
     }
 
     fn paren_ty(&mut self) -> Result<TyId> {

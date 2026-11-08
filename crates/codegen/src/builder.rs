@@ -7,18 +7,26 @@ use crate::ir::{
 pub struct FunctionBuilder<'f> {
     pub func: &'f mut Function,
     current: Option<Block>,
+    incoming: Vec<u32>,
 }
 
 impl<'f> FunctionBuilder<'f> {
     /// A builder that appends to `func`.
     pub fn new(func: &'f mut Function) -> Self {
-        Self { func, current: None }
+        let incoming = vec![0; func.blocks.len()];
+        Self { func, current: None, incoming }
     }
 
     /// Adds an empty block.
     pub fn create_block(&mut self) -> Block {
         self.func.blocks.push(BlockData::default());
+        self.incoming.push(0);
         Block(self.func.blocks.len() as u32 - 1)
+    }
+
+    /// Whether an instruction built so far branches to `block`.
+    pub fn has_branch_to(&self, block: Block) -> bool {
+        self.incoming.get(block.index()).is_some_and(|count| *count > 0)
     }
 
     /// Sends the next instructions to `block`.
@@ -76,6 +84,14 @@ impl<'f> FunctionBuilder<'f> {
     /// Removes everything appended since `mark`, in every block.
     pub fn rewind(&mut self, mark: Mark) {
         let func = &mut *self.func;
+        for data in &func.insts[mark.insts..] {
+            for target in data.op.targets() {
+                if let Some(count) = self.incoming.get_mut(target.index()) {
+                    *count -= 1;
+                }
+            }
+        }
+        self.incoming.truncate(mark.blocks);
         func.types.truncate(mark.types);
         func.blocks.truncate(mark.blocks);
         func.insts.truncate(mark.insts);
@@ -91,7 +107,7 @@ impl<'f> FunctionBuilder<'f> {
     /// Appends one instruction to the current block.
     pub fn ins(&mut self) -> Ins<'_> {
         let block = self.current.expect("a block is selected");
-        Ins { func: self.func, block }
+        Ins { func: self.func, block, incoming: &mut self.incoming }
     }
 }
 
@@ -115,6 +131,7 @@ fn new_value(func: &mut Function, ty: Type) -> Value {
 pub struct Ins<'b> {
     func: &'b mut Function,
     block: Block,
+    incoming: &'b mut Vec<u32>,
 }
 
 impl Ins<'_> {
@@ -131,6 +148,11 @@ impl Ins<'_> {
     }
 
     fn effect(&mut self, op: Op) -> Inst {
+        for target in op.targets() {
+            if let Some(count) = self.incoming.get_mut(target.index()) {
+                *count += 1;
+            }
+        }
         self.push(op, None).0
     }
 

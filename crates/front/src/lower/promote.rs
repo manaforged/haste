@@ -29,16 +29,16 @@ impl Lower<'_, '_> {
         let address = self.ins().iconst(Type::I64, cell);
         let filled = self.ins().load(Type::I8, address, size as i32);
         let (fill, done) = (self.b.create_block(), self.b.create_block());
-        self.ins().brif(filled, done, &[], fill, &[]);
-        self.b.switch_to_block(fill);
+        self.brif(filled, (done, &[]), (fill, &[]));
+        self.enter(fill);
         let whole = repr(self.cx, ty)?;
         if let Some(value) = self.expr(expr)? {
             self.write(Place { base: Base::Addr(address), offset: 0, repr: whole }, value);
         }
         let one = self.ins().iconst(Type::I8, 1);
         self.ins().store(one, address, size as i32);
-        self.ins().jump(done, &[]);
-        self.b.switch_to_block(done);
+        self.jump(done, &[]);
+        self.enter(done);
         Ok(Some(address))
     }
 }

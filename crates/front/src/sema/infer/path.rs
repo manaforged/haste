@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use rustc_lexer::TokenKind;
 
 use crate::body::sig::{Generic, GenericKind};
-use crate::body::{self as syntax, Args, Body, GenericArg, Lit, PathId, TyId};
+use crate::body::{self as syntax, Args, Body, GenericArg, PathId, TyId};
 use crate::names::path::Path as NamePath;
 use crate::names::{Def, ItemRef, Primitive, Sym, Symbols, plain};
 use crate::outline::item::ItemKind;
@@ -29,64 +29,74 @@ impl<'a> Infer<'_, 'a> {
     /// The item a value path names, resolved from the body's module.
     pub fn value_item(&mut self, arena: &Body, path: PathId) -> Result<Def> {
         let (segments, absolute, dollar) = self.segments(arena, path);
+        self.value_def(&segments, absolute, dollar)
+    }
+
+    /// The item in the value namespace that the path `segments` names.
+    pub(super) fn value_def(&mut self, segments: &[Sym], absolute: bool, dollar: Option<u32>) -> Result<Def> {
         let paths = self.cx.paths(self.home.krate);
         let Some((last, prefix)) = segments.split_last() else { bail!("empty path") };
         if let (true, Some(found)) = (prefix.is_empty(), self.declared_item(self.cx.names.symbols.text(*last))) {
             return Ok(Def::Item(found));
         }
         let found = if prefix.is_empty() {
-            paths.first(*last, self.home, &NamePath { segments: &segments, absolute, dollar }).values
+            paths.first(*last, self.home, &NamePath { segments, absolute, dollar }).values
         } else {
             let head = NamePath { segments: prefix, absolute, dollar };
             paths.resolve(&head, self.home).map(|def| paths.member(def, *last)).and_then(|entry| entry.values)
         };
         match found {
             Some(binding) => Ok(binding.def),
-            None => bail!("cannot find value `{}`", self.spell(&segments)),
+            None => bail!("cannot find value `{}`", self.spell(segments)),
         }
     }
 
     /// The item named `name` that a block around the use declares, or else some block of the body.
-    fn declared_item(&self, name: &str) -> Option<ItemRef> {
+    pub(super) fn declared_item(&self, name: &str) -> Option<ItemRef> {
         let scoped = self.items.iter().rev().find(|(bound, _)| *bound == name).map(|(_, item)| *item);
         scoped.or_else(|| self.root.and_then(|root| self.cx.body_item(root, name)))
     }
 
     /// Resolves the value path expression `expr` to a local or an item, and returns its type.
     pub fn path_expr(&mut self, expr: syntax::ExprId, path: PathId) -> Result<Ty> {
+        let (ty, res) = self.value_path(path)?;
+        self.out.res.insert(expr, res);
+        Ok(ty)
+    }
+
+    /// The type and resolution of the value path `path`: a local, a constructor, a function or a constant.
+    pub(super) fn value_path(&mut self, path: PathId) -> Result<(Ty, Res)> {
         let body = self.body;
         let entry = body.path(path);
         let single = entry.qself.is_none() && !entry.global && entry.segments.len == 1;
         if single {
             let name = crate::names::plain(self.src.text(body.segments[body.list(entry.segments)[0] as usize].name));
             if let Some(&(_, local)) = self.scopes.iter().rev().find(|(bound, _)| *bound == name) {
-                self.out.res.insert(expr, Res::Local(local));
-                return Ok(self.out.locals[local as usize].ty);
+                return Ok((self.out.locals[local as usize].ty, Res::Local(local)));
             }
         }
         if let Some(ctor) = self.ctor(body, path, true)? {
-            return self.ctor_value(expr, ctor);
+            return self.ctor_value(ctor);
         }
         match self.value_item(body, path) {
-            Ok(Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Fn => self.fn_item(expr, item, Vec::new()),
-            Ok(Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => self.const_item(expr, item, Vec::new()),
+            Ok(Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Fn => self.fn_item(item, Vec::new()),
+            Ok(Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => self.const_item(item, Vec::new()),
             Ok(other) => bail!("unsupported value {other:?}"),
-            Err(error) => self.assoc_value(expr, path)?.ok_or(error),
+            Err(error) => self.assoc_value(path)?.ok_or(error),
         }
     }
 
-    pub(super) fn const_item(&mut self, expr: syntax::ExprId, item: ItemRef, outer: Vec<Ty>) -> Result<Ty> {
-        self.out.res.insert(expr, Res::Fn(item, outer.clone()));
-        Ok(self.fn_types(item, &outer)?.1)
+    pub(super) fn const_item(&mut self, item: ItemRef, outer: Vec<Ty>) -> Result<(Ty, Res)> {
+        let ty = self.fn_types(item, &outer)?.1;
+        Ok((ty, Res::Fn(item, outer)))
     }
 
-    pub(super) fn fn_item(&mut self, expr: syntax::ExprId, item: ItemRef, outer: Vec<Ty>) -> Result<Ty> {
+    pub(super) fn fn_item(&mut self, item: ItemRef, outer: Vec<Ty>) -> Result<(Ty, Res)> {
         let sig = self.cx.signature(item)?;
         let count = sig.generics.iter().filter(|generic| generic.kind != GenericKind::Lifetime).count();
         let mut substs = outer;
         substs.extend((0..count).map(|_| self.fresh(Kind::Var)));
-        self.out.res.insert(expr, Res::Fn(item, substs.clone()));
-        Ok(self.cx.types.intern(Kind::FnDef(item, substs)))
+        Ok((self.cx.types.intern(Kind::FnDef(item, substs.clone())), Res::Fn(item, substs)))
     }
 
     /// Runs `run` as if inside the type item `item`, with its type parameters set to `args`.
@@ -208,11 +218,8 @@ impl<'a> Infer<'_, 'a> {
         arena.list(list).iter().map(|&item| self.lower_ty(arena, TyId(item))).collect()
     }
 
-    pub(super) fn const_len(&self, arena: &Body, len: syntax::ExprId) -> Result<u64> {
-        match *arena.expr(len) {
-            syntax::Expr::Lit(Lit::Int, at) => parse_int(self.src.text(at)).map(|(value, _)| value as u64),
-            _ => bail!("array lengths other than literals are not supported yet"),
-        }
+    pub(super) fn const_len(&mut self, arena: &Body, len: syntax::ExprId) -> Result<u64> {
+        self.const_eval(arena, len, (64, false)).map(|(value, _)| value as u64)
     }
 
     fn path_ty(&mut self, arena: &Body, path: PathId) -> Result<Ty> {

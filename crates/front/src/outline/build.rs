@@ -6,7 +6,7 @@ use rustc_lexer::TokenKind;
 
 use super::item::{Attr, Item, ItemKind};
 use super::source::Source;
-use super::tree::{Cache, Crate, Decl, File, Impl, Macro, Module, State, Textual, Truth, textual};
+use super::tree::{Cache, Crate, Decl, File, Impl, Macro, Module, State, Textual, Truth, Waiting, textual};
 use super::{mbe, rules, scan};
 
 const DEPTH: usize = 128;
@@ -118,7 +118,7 @@ impl Loader<'_> {
         let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
         let name = strip_raw(file.source.text(name));
         let Some(definition) = self.lookup(file, item, name) else {
-            self.out.members.push((file.clone(), block, at));
+            self.out.members.push(self.waiting(file, block, at));
             return Ok(());
         };
         if self.depth >= DEPTH {
@@ -237,15 +237,21 @@ impl Loader<'_> {
 
     /// Expands again the calls that found no definition, now that more modules are read.
     pub fn retry(&mut self) -> Result<()> {
-        self.scope = None;
         self.out.fallback.clear();
-        for (file, module, at) in std::mem::take(&mut self.out.deferred) {
-            self.call(&file, module, at)?;
+        for call in std::mem::take(&mut self.out.deferred) {
+            self.scope = call.scope;
+            self.call(&call.file, call.owner, call.at)?;
         }
-        for (file, block, at) in std::mem::take(&mut self.out.members) {
-            self.member_call(&file, block, at)?;
+        for call in std::mem::take(&mut self.out.members) {
+            self.scope = call.scope;
+            self.member_call(&call.file, call.owner, call.at)?;
         }
+        self.scope = None;
         Ok(())
+    }
+
+    fn waiting(&self, file: &Arc<File>, owner: usize, at: u32) -> Waiting {
+        Waiting { file: file.clone(), owner, at, scope: self.scope.clone() }
     }
 
     fn call(&mut self, file: &Arc<File>, module: usize, at: u32) -> Result<()> {
@@ -259,14 +265,19 @@ impl Loader<'_> {
             if name == "cfg_select" {
                 return self.cfg_select(file, module, open);
             }
-            self.out.deferred.push((file.clone(), module, at));
+            self.out.deferred.push(self.waiting(file, module, at));
             return Ok(());
         };
-        self.expand(file, module, at, &definition)
+        self.expand_at(file, module, at, &definition)
     }
 
-    /// Expands the macro call item `at` of `file` in `module` with `definition`.
-    pub fn expand(&mut self, file: &Arc<File>, module: usize, at: u32, definition: &Macro) -> Result<()> {
+    /// Expands the waiting macro call `call` with `definition`, in the textual scope it was written in.
+    pub fn expand(&mut self, call: Waiting, definition: &Macro) -> Result<()> {
+        self.scope = call.scope;
+        self.expand_at(&call.file, call.owner, call.at, definition)
+    }
+
+    fn expand_at(&mut self, file: &Arc<File>, module: usize, at: u32, definition: &Macro) -> Result<()> {
         let item = &file.items.items[at as usize];
         let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
         let name = strip_raw(file.source.text(name));

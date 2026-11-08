@@ -35,21 +35,12 @@ fn condition(func: &Function, value: Value) -> Result<(), String> {
     Ok(())
 }
 
-fn enter_targets(op: &Op, entered: &mut [bool]) {
-    let (first, second) = match op {
-        Op::Jump(block, _) => (*block, *block),
-        Op::Brif(_, then, _, otherwise, _) => (*then, *otherwise),
-        Op::TryCall { normal, handler, .. } => (*normal, *handler),
-        _ => return,
-    };
-    entered[first.index()] = true;
-    entered[second.index()] = true;
-}
-
 fn shape(func: &Function) -> Result<(), String> {
     let mut entered = vec![false; func.blocks.len()];
     for inst in &func.insts {
-        enter_targets(&inst.op, &mut entered);
+        for target in inst.op.targets() {
+            entered[target.index()] = true;
+        }
     }
     for (index, block) in func.blocks.iter().enumerate() {
         let Some((last, body)) = block.insts.split_last() else {

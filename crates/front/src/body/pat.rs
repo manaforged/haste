@@ -89,12 +89,10 @@ impl Cursor<'_> {
             return Ok(self.push_pat(Pat::Lit(lit)));
         }
         if self.punct("&") {
-            let double = self.punct("&&");
             self.at += 1;
             let mutable = self.eat_word("mut");
             let inner = self.pat_no_alt()?;
-            let pat = self.push_pat(Pat::Ref { mutable, pat: inner });
-            return Ok(if double { self.push_pat(Pat::Ref { mutable: false, pat }) } else { pat });
+            return Ok(self.push_pat(Pat::Ref { mutable, pat: inner }));
         }
         if self.punct("..=") || self.punct("...") {
             self.at += 3;

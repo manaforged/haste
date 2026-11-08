@@ -26,7 +26,7 @@ impl Infer<'_, '_> {
     fn match_expr(&mut self, scrutinee: ExprId, arms: List, expected: Option<Ty>) -> Result<Ty> {
         let ty = self.expr(scrutinee, None)?;
         let before = std::mem::replace(&mut self.diverges, false);
-        let result = self.fresh(Kind::Var);
+        let result = self.known(expected).unwrap_or_else(|| self.fresh(Kind::Var));
         let mut all_diverge = true;
         for &at in self.body.list(arms) {
             let arm = self.body.arms[at as usize];
@@ -38,8 +38,8 @@ impl Infer<'_, '_> {
                 self.coerce(found, bool_ty)?;
             }
             self.diverges = false;
-            let found = self.expr(arm.body, expected.or(Some(result)))?;
-            self.coerce(found, result)?;
+            let found = self.expr(arm.body, Some(result))?;
+            self.coerce_expr(arm.body, found, result)?;
             all_diverge &= self.diverges;
             self.scopes.truncate(depth);
         }

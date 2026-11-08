@@ -167,7 +167,7 @@ impl Outline {
             }
         }
         let mut demands = Vec::new();
-        self.with_loader(krate, &mut demands, |loader| calls.into_iter().try_for_each(|((file, module, at), definition)| loader.expand(&file, module, at, &definition)))?;
+        self.with_loader(krate, &mut demands, |loader| calls.into_iter().try_for_each(|(call, definition)| loader.expand(call, &definition)))?;
         self.settle(demands)
     }
 

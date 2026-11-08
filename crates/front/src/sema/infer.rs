@@ -1,5 +1,6 @@
 mod adt;
 mod assoc;
+mod consts;
 mod array;
 mod expr;
 mod matching;
@@ -13,6 +14,7 @@ mod drop;
 mod select;
 mod stmt;
 
+pub use drop::Glue;
 pub use looping::{For, Tried};
 pub use method::Adjust;
 pub use pat::{Mode, position, rest_split};
@@ -23,7 +25,7 @@ use rustc_hash::FxHashMap as HashMap;
 use anyhow::{Result, bail};
 
 use crate::body::sig::Signature;
-use crate::body::{Body, ExprId, PatId};
+use crate::body::{Body, BlockKind, Expr, ExprId, PatId};
 use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::source::Source;
 
@@ -65,6 +67,10 @@ pub struct Typed {
     pub ret: Option<Ty>,
     pub fors: HashMap<ExprId, For>,
     pub tries: HashMap<ExprId, Tried>,
+    /// The drop glue of each type that a local or a temporary of the body holds and that needs drop.
+    pub drops: Vec<Res>,
+    /// The calls of the drop glue that this instance is, when it is one.
+    pub glue: Option<Glue>,
 }
 
 impl Typed {
@@ -72,7 +78,8 @@ impl Typed {
     pub fn calls(&self) -> impl Iterator<Item = (ItemRef, &[Ty])> {
         let loops = self.fors.values().flat_map(|each| [&each.into_iter, &each.next]);
         let tries = self.tries.values().flat_map(|each| [&each.branch, &each.from_residual]);
-        self.res.values().chain(loops).chain(tries).filter_map(|res| match res {
+        let glue = self.glue.iter().flat_map(|glue| glue.drop.iter().chain(&glue.parts));
+        self.res.values().chain(self.pat_res.values()).chain(loops).chain(tries).chain(&self.drops).chain(glue).filter_map(|res| match res {
             Res::Fn(item, substs) => Some((*item, &substs[..])),
             _ => None,
         })
@@ -95,12 +102,23 @@ pub struct Infer<'c, 'a> {
     out: Typed,
     scopes: Vec<(&'a str, u32)>,
     items: Vec<(&'a str, ItemRef)>,
-    loops: Vec<Option<Ty>>,
+    loops: Vec<Breaks>,
     diverges: bool,
+}
+
+/// What the `break`s of one loop give: the type they coerce to once it is known, and whether any `break` was seen.
+#[derive(Clone, Copy)]
+struct Breaks {
+    ty: Option<Ty>,
+    broke: bool,
 }
 
 /// Infers the body of the function `item` with its generic parameters set to `substs`.
 pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed> {
+    if cx.lang(item) == Some("drop_glue") {
+        let Some(&ty) = substs.first() else { bail!("drop glue with no type") };
+        return drop::glue_typed(cx, item, ty);
+    }
     let sig = cx.signature(item)?;
     let foreign = cx.foreign(item);
     let body = if foreign { std::rc::Rc::default() } else { cx.body(item)? };
@@ -113,7 +131,9 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed
     infer.swap_frame(frame);
     infer.out.exprs = vec![Ty(u32::MAX); body.exprs.len()];
     infer.run(foreign)?;
-    Ok(infer.finish())
+    let mut typed = infer.finish()?;
+    typed.drops = drop::drop_calls(cx, &typed)?;
+    Ok(typed)
 }
 
 impl Infer<'_, '_> {
@@ -253,8 +273,16 @@ impl Infer<'_, '_> {
         self.settle_metadata()
     }
 
-    /// Coerces the value of `expr`, of type `found`, to `expected`, recording an array-to-slice unsizing.
+    /// Coerces the value of `expr`, of type `found`, to `expected`, at each branch value it ends in, recording an array-to-slice unsizing.
     pub fn coerce_expr(&mut self, expr: ExprId, found: Ty, expected: Ty) -> Result<()> {
+        if let Some(ends) = self.branch_ends(expr) {
+            for end in ends {
+                let found = self.out.exprs[end.0 as usize];
+                self.coerce_expr(end, found, expected)?;
+            }
+            self.out.exprs[expr.0 as usize] = expected;
+            return Ok(());
+        }
         match self.unsize(found, expected)? {
             Some(len) => {
                 self.out.unsize.insert(expr, len);
@@ -262,6 +290,21 @@ impl Infer<'_, '_> {
             }
             None => self.coerce(found, expected),
         }
+    }
+
+    fn branch_ends(&self, expr: ExprId) -> Option<Vec<ExprId>> {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) => Some(vec![inner]),
+            Expr::Block { tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe, .. } => Some(vec![tail]),
+            Expr::If(_, then, Some(otherwise)) => Some(vec![then, otherwise]),
+            Expr::Match(_, arms) => Some(self.body.list(arms).iter().map(|&at| self.body.arms[at as usize].body).collect()),
+            _ => None,
+        }
+    }
+
+    /// The expected type `expected` when it is already known, so that branches coerce to it instead of to each other.
+    pub(super) fn known(&self, expected: Option<Ty>) -> Option<Ty> {
+        expected.filter(|ty| !matches!(self.cx.types.kind(self.resolve(*ty)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)))
     }
 
     fn unsize(&mut self, found: Ty, expected: Ty) -> Result<Option<u64>> {
@@ -324,7 +367,7 @@ impl Infer<'_, '_> {
         self.cx.types.intern(kind)
     }
 
-    fn finish(mut self) -> Typed {
+    fn finish(mut self) -> Result<Typed> {
         let exprs = std::mem::take(&mut self.out.exprs);
         self.out.exprs = exprs.into_iter().map(|ty| if ty.0 == u32::MAX { ty } else { self.zonk(ty) }).collect();
         let locals = std::mem::take(&mut self.out.locals);
@@ -332,33 +375,33 @@ impl Infer<'_, '_> {
         let pats = std::mem::take(&mut self.out.pats);
         self.out.pats = pats.into_iter().map(|(pat, ty)| (pat, self.zonk(ty))).collect();
         let res = std::mem::take(&mut self.out.res);
-        self.out.res = res.into_iter().map(|(expr, res)| (expr, self.zonk_res(res))).collect();
+        self.out.res = res.into_iter().map(|(expr, res)| Ok((expr, self.zonk_res(res)?))).collect::<Result<_>>()?;
         let pat_res = std::mem::take(&mut self.out.pat_res);
-        self.out.pat_res = pat_res.into_iter().map(|(pat, res)| (pat, self.zonk_res(res))).collect();
+        self.out.pat_res = pat_res.into_iter().map(|(pat, res)| Ok((pat, self.zonk_res(res)?))).collect::<Result<_>>()?;
         self.out.ret = self.out.ret.map(|ret| self.zonk(ret));
         let fors = std::mem::take(&mut self.out.fors);
-        self.out.fors = fors.into_iter().map(|(expr, each)| (expr, self.zonk_for(each))).collect();
+        self.out.fors = fors.into_iter().map(|(expr, each)| Ok((expr, self.zonk_for(each)?))).collect::<Result<_>>()?;
         let tries = std::mem::take(&mut self.out.tries);
-        self.out.tries = tries.into_iter().map(|(expr, each)| (expr, self.zonk_try(each))).collect();
-        self.out
+        self.out.tries = tries.into_iter().map(|(expr, each)| Ok((expr, self.zonk_try(each)?))).collect::<Result<_>>()?;
+        Ok(self.out)
     }
 
-    fn zonk_for(&mut self, each: For) -> For {
-        For { into_iter: self.zonk_res(each.into_iter), next: self.zonk_res(each.next), iter: self.zonk(each.iter), option: self.zonk(each.option), some: each.some }
+    fn zonk_for(&mut self, each: For) -> Result<For> {
+        Ok(For { into_iter: self.zonk_res(each.into_iter)?, next: self.zonk_res(each.next)?, iter: self.zonk(each.iter), option: self.zonk(each.option), some: each.some })
     }
 
-    fn zonk_try(&mut self, each: Tried) -> Tried {
-        Tried { branch: self.zonk_res(each.branch), from_residual: self.zonk_res(each.from_residual), flow: self.zonk(each.flow), ..each }
+    fn zonk_try(&mut self, each: Tried) -> Result<Tried> {
+        Ok(Tried { branch: self.zonk_res(each.branch)?, from_residual: self.zonk_res(each.from_residual)?, flow: self.zonk(each.flow), ..each })
     }
 
-    fn zonk_res(&mut self, res: Res) -> Res {
+    fn zonk_res(&mut self, res: Res) -> Result<Res> {
         match res {
             Res::Fn(item, substs) => {
                 let substs = substs.into_iter().map(|ty| self.zonk(ty)).collect();
                 self.trait_call(item, substs)
             }
-            Res::Ctor(item, variant, args) => Res::Ctor(item, variant, args.into_iter().map(|ty| self.zonk(ty)).collect()),
-            other => other,
+            Res::Ctor(item, variant, args) => Ok(Res::Ctor(item, variant, args.into_iter().map(|ty| self.zonk(ty)).collect())),
+            other => Ok(other),
         }
     }
 }
@@ -374,7 +417,13 @@ pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
     detached(cx, anchor, |infer| infer.needs_drop(ty))
 }
 
-fn detached<T>(cx: &mut Context<'_>, item: ItemRef, run: impl FnOnce(&mut Infer<'_, '_>) -> Result<T>) -> Result<T> {
+/// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
+pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
+    detached(cx, anchor, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
+}
+
+pub(crate) fn detached<T>(cx: &mut Context<'_>, item: ItemRef, run: impl FnOnce(&mut Infer<'_, '_>) -> Result<T>) -> Result<T> {
     let (body, sig) = (Body::default(), Signature::default());
     let src = &cx.file(item).source;
     let home = cx.module_of(item)?;

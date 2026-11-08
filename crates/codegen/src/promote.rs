@@ -219,15 +219,6 @@ fn terminator(func: &Function, block: Block) -> Option<&Op> {
     Some(&func.insts[inst.index()].op).filter(|op| op.is_terminator())
 }
 
-fn targets(op: &Op) -> Vec<Block> {
-    match op {
-        Op::Jump(block, _) => vec![*block],
-        Op::Brif(_, then, _, otherwise, _) => vec![*then, *otherwise],
-        Op::TryCall { normal, handler, .. } => vec![*normal, *handler],
-        _ => Vec::new(),
-    }
-}
-
 impl Cfg {
     fn new(func: &Function, entry: Block) -> Self {
         let count = func.blocks.len();
@@ -236,7 +227,7 @@ impl Cfg {
         for index in 0..count {
             let block = Block(index as u32);
             let Some(op) = terminator(func, block) else { continue };
-            for target in targets(op) {
+            for target in op.targets() {
                 let preds = &mut cfg.preds[target.index()];
                 if !preds.contains(&block) {
                     preds.push(block);
@@ -257,7 +248,7 @@ impl Cfg {
                 continue;
             }
             if let Some(op) = terminator(func, block) {
-                stack.extend(targets(op));
+                stack.extend(op.targets());
             }
         }
     }

@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::body::{ExprId, PathId};
+use crate::body::PathId;
 use crate::names::path::Path as NamePath;
 use crate::names::{Def, ItemRef, plain};
 use crate::outline::item::ItemKind;
@@ -11,7 +11,7 @@ use super::{Infer, Res};
 
 impl Infer<'_, '_> {
     /// Resolves a path to an associated function or constant: `Type::name`, `Trait::name`, `<T>::name` or `<T as Trait>::name`.
-    pub(super) fn assoc_value(&mut self, expr: ExprId, path: PathId) -> Result<Option<Ty>> {
+    pub(super) fn assoc_value(&mut self, path: PathId) -> Result<Option<(Ty, Res)>> {
         let body = self.body;
         let entry = body.path(path);
         let Some((&last, prefix)) = body.list(entry.segments).split_last() else { return Ok(None) };
@@ -20,28 +20,28 @@ impl Infer<'_, '_> {
             Some((ty, Some(trait_path))) if prefix.is_empty() => {
                 let self_ty = self.lower_ty(body, ty)?;
                 let Some(of) = self.trait_named(body, trait_path, self.home) else { bail!("`as` names something that is not a trait") };
-                return self.trait_value(expr, of, Some(self_ty), name).map(Some);
+                return self.trait_value(of, Some(self_ty), name).map(Some);
             }
             Some((ty, None)) if prefix.is_empty() => self.lower_ty(body, ty)?,
             None if !prefix.is_empty() => {
                 if let Some(of) = self.prefix_trait(path, prefix.len()) {
-                    return self.trait_value(expr, of, None, name).map(Some);
+                    return self.trait_value(of, None, name).map(Some);
                 }
                 let Ok(ty) = self.named_ty(body, path, prefix.len(), true) else { return Ok(None) };
                 ty
             }
             _ => return Ok(None),
         };
-        self.type_value(expr, owner, name).map(Some)
+        self.type_value(owner, name).map(Some)
     }
 
-    fn type_value(&mut self, expr: ExprId, owner: Ty, name: &str) -> Result<Ty> {
+    fn type_value(&mut self, owner: Ty, name: &str) -> Result<(Ty, Res)> {
         if let Some((member, args)) = self.inherent_member(owner, name)? {
-            return self.member_value(expr, member, args);
+            return self.member_value(member, args);
         }
         for of in self.cx.traits_in_scope(self.home) {
             if self.cx.trait_member(of, name).is_some() && self.implements(of, owner)? {
-                return self.trait_value(expr, of, Some(owner), name);
+                return self.trait_value(of, Some(owner), name);
             }
         }
         bail!("no associated item `{name}` on {}", self.show(owner))
@@ -69,36 +69,36 @@ impl Infer<'_, '_> {
         Ok((0..count).map(|_| self.fresh(Kind::Var)).collect())
     }
 
-    fn trait_value(&mut self, expr: ExprId, of: ItemRef, self_ty: Option<Ty>, name: &str) -> Result<Ty> {
+    fn trait_value(&mut self, of: ItemRef, self_ty: Option<Ty>, name: &str) -> Result<(Ty, Res)> {
         let Some(member) = self.cx.trait_member(of, name) else { bail!("trait `{}` has no item `{name}`", self.cx.name(of)) };
         let self_ty = self_ty.unwrap_or_else(|| self.fresh(Kind::Var));
         let mut outer = vec![self_ty];
         outer.extend(self.fresh_trait_args(of)?);
-        self.member_value(expr, member, outer)
+        self.member_value(member, outer)
     }
 
-    fn member_value(&mut self, expr: ExprId, member: ItemRef, outer: Vec<Ty>) -> Result<Ty> {
+    fn member_value(&mut self, member: ItemRef, outer: Vec<Ty>) -> Result<(Ty, Res)> {
         match self.cx.item(member).1.kind {
-            ItemKind::Fn => self.fn_item(expr, member, outer),
-            ItemKind::Const => self.const_item(expr, member, outer),
+            ItemKind::Fn => self.fn_item(member, outer),
+            ItemKind::Const => self.const_item(member, outer),
             other => bail!("associated {other:?} values are not supported yet"),
         }
     }
 
     /// The impl member that a call of trait item `item` at `substs` runs, once `Self` is known, or the trait's own default.
-    pub(super) fn trait_call(&mut self, item: ItemRef, substs: Vec<Ty>) -> Res {
-        let Some(of) = self.cx.owner_trait(item) else { return Res::Fn(item, substs) };
-        let Ok(count) = self.cx.trait_generics(of).map(|def| 1 + type_params(&def.1.params).count()) else { return Res::Fn(item, substs) };
+    pub(super) fn trait_call(&mut self, item: ItemRef, substs: Vec<Ty>) -> Result<Res> {
+        let Some(of) = self.cx.owner_trait(item) else { return Ok(Res::Fn(item, substs)) };
+        let count = 1 + type_params(&self.cx.trait_generics(of)?.1.params).count();
         if substs.len() < count {
-            return Res::Fn(item, substs);
+            return Ok(Res::Fn(item, substs));
         }
-        let Ok(Some((block, mut args))) = self.select(of, substs[0], &substs[1..count]) else { return Res::Fn(item, substs) };
-        match self.cx.member(block, self.cx.name(item)) {
+        let Some((block, mut args)) = self.select(of, substs[0], &substs[1..count])? else { return Ok(Res::Fn(item, substs)) };
+        Ok(match self.cx.member(block, self.cx.name(item)) {
             Some(member) => {
                 args.extend(substs[count..].iter().map(|ty| self.zonk(*ty)));
                 Res::Fn(member, args.into_iter().map(|ty| self.zonk(ty)).collect())
             }
             None => Res::Fn(item, substs),
-        }
+        })
     }
 }

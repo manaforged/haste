@@ -62,6 +62,12 @@ impl Lower<'_, '_> {
         }
     }
 
+    /// The place that `pointer` to `pointee` names, which for a slice or `str` is the wide pointer itself.
+    pub(super) fn pointee_place(&mut self, pointer: Value, pointee: Ty) -> Result<Place> {
+        let repr = if self.is_unsized(pointee) { super::ops::WIDE } else { repr(self.cx, pointee)? };
+        Ok(Place { base: Base::Addr(pointer), offset: 0, repr })
+    }
+
     /// The address of `place`.
     pub fn address(&mut self, place: Place) -> Value {
         match place.base {
@@ -91,12 +97,15 @@ impl Lower<'_, '_> {
                 Some(Res::Local(local)) => Ok(self.locals[*local as usize].map(|(slot, repr)| Place::slot(slot, repr))),
                 _ => Ok(None),
             },
-            Expr::Unary(UnOp::Deref, pointer) => {
-                let repr = self.repr_of(expr)?;
-                Ok(self.expr(pointer)?.map(|addr| Place { base: Base::Addr(addr), offset: 0, repr }))
-            }
-            Expr::TupleField(base, index) => self.field_place(expr, base, index).map(Some),
-            Expr::Field(base, _) => self.field_read_place(expr, base),
+            Expr::Unary(UnOp::Deref, pointer) => match self.expr(pointer)? {
+                Some(addr) => self.pointee_place(addr, self.ty_of(expr)).map(Some),
+                None => Ok(None),
+            },
+            Expr::TupleField(base, index) => self.field_place(base, index),
+            Expr::Field(base, _) => match self.typed.fields.get(&expr) {
+                Some(&index) => self.field_place(base, index),
+                None => bail!("field read has no field"),
+            },
             Expr::Index(base, index) => self.index_place(expr, base, index),
             _ => Ok(None),
         }
@@ -104,12 +113,13 @@ impl Lower<'_, '_> {
 
     /// The place of `expr`, holding its value in a new frame slot when it is not a place already.
     pub fn place_or_temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
-        if let Some(place) = self.place_of(expr)? {
+        let widened = self.typed.unsize.contains_key(&expr);
+        if !widened && let Some(place) = self.place_of(expr)? {
             return Ok(Some(place));
         }
-        let repr = self.repr_of(expr)?;
+        let repr = if widened { super::ops::WIDE } else { self.repr_of(expr)? };
         let value = self.expr(expr)?;
-        Ok(match (repr, value) {
+        let place = match (repr, value) {
             (Repr::Mem { .. }, Some(addr)) => Some(Place { base: Base::Addr(addr), offset: 0, repr }),
             (Repr::Scalar(_), Some(value)) => {
                 let slot = self.slot(repr).expect("a scalar has a slot");
@@ -118,7 +128,11 @@ impl Lower<'_, '_> {
                 Some(place)
             }
             _ => None,
-        })
+        };
+        if self.open {
+            self.own(super::moves::Root::Temp(expr), self.ty_of(expr), place, true)?;
+        }
+        Ok(place)
     }
 
     pub(super) fn field_offset(&mut self, tuple: Ty, index: u32) -> Result<i32> {
@@ -126,17 +140,26 @@ impl Lower<'_, '_> {
         Ok(layout.fields.offset(index as usize).bytes() as i32)
     }
 
-    fn field_place(&mut self, expr: ExprId, base: ExprId, index: u32) -> Result<Place> {
-        let Some(mut place) = self.place_or_temp(base)? else { bail!("field of a value with no place") };
+    fn field_place(&mut self, base: ExprId, index: u32) -> Result<Option<Place>> {
+        let Some(mut place) = self.place_or_temp(base)? else { return Ok(None) };
         let mut ty = self.ty_of(base);
         while let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *self.cx.types.kind(ty) {
             let Some(pointer) = self.read(place) else { bail!("reference with no value") };
-            place = Place { base: Base::Addr(pointer), offset: 0, repr: repr(self.cx, inner)? };
+            place = self.pointee_place(pointer, inner)?;
             ty = inner;
         }
-        let offset = self.field_offset(ty, index)?;
-        let field = self.repr_of(expr)?;
-        Ok(place.at(offset, field))
+        self.part_place(place, ty, (0, index)).map(Some)
+    }
+
+    /// The place of field `index` of variant `variant` of the tuple or ADT `ty` at `place`.
+    pub(super) fn part_place(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
+        match self.cx.types.kind(ty).clone() {
+            Kind::Tuple(items) => {
+                let offset = self.field_offset(ty, index)?;
+                Ok(place.at(offset, repr(self.cx, items[index as usize])?))
+            }
+            _ => self.variant_field(place, ty, (variant, index)),
+        }
     }
 
     /// Lowers the tuple expression `expr` into a new frame slot and returns its address.
@@ -187,7 +210,7 @@ impl Lower<'_, '_> {
             }
             let Kind::Ref(_, inner) = *self.cx.types.kind(ty) else { bail!("receiver deref through {:?}", self.cx.types.kind(ty)) };
             let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
-            place = Some(Place { base: Base::Addr(pointer), offset: 0, repr: repr(self.cx, inner)? });
+            place = Some(self.pointee_place(pointer, inner)?);
             ty = inner;
         }
         match adjust.autoref {

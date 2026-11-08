@@ -70,6 +70,15 @@ pub struct Textual {
     pub next: Option<Arc<Textual>>,
 }
 
+/// An item macro call that waits for its definition, with the textual scope it was written in.
+#[derive(Clone, Debug)]
+pub struct Waiting {
+    pub file: Arc<File>,
+    pub owner: usize,
+    pub at: u32,
+    pub scope: Option<Arc<Textual>>,
+}
+
 /// The macro named `name` in textual scope `scope`.
 pub fn textual(mut scope: Option<&Arc<Textual>>, name: &str) -> Option<Arc<Macro>> {
     while let Some(entry) = scope {
@@ -139,11 +148,11 @@ pub struct Crate {
     pub errors: Vec<String>,
     pub exports: HashMap<String, Arc<Macro>>,
     pub defined: HashMap<(u32, u32), Arc<Macro>>,
-    pub deferred: Vec<(Arc<File>, usize, u32)>,
+    pub deferred: Vec<Waiting>,
     pub impls: Vec<Impl>,
-    pub members: Vec<(Arc<File>, usize, u32)>,
+    pub members: Vec<Waiting>,
     pub fallback: Vec<usize>,
-    pub foreign: Vec<(Arc<File>, usize, u32)>,
+    pub foreign: Vec<Waiting>,
     pub macro_use: Vec<usize>,
     pub expansions: usize,
 }
@@ -156,7 +165,7 @@ impl Crate {
 
     /// The names of the item macro calls that no definition matched.
     pub fn unresolved(&self) -> Vec<String> {
-        let names = self.deferred.iter().filter_map(|(file, _, at)| file.items.items[*at as usize].name.map(|name| file.source.text(name).to_owned()));
+        let names = self.deferred.iter().filter_map(|call| call.file.items.items[call.at as usize].name.map(|name| call.file.source.text(name).to_owned()));
         names.collect()
     }
 }

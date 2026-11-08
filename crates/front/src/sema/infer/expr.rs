@@ -4,7 +4,7 @@ use crate::body::{BinOp, Expr, ExprId, Lit, UnOp};
 use crate::names::Primitive;
 
 use super::super::ty::{Kind, Mut, Ty, float_bits, int_info};
-use super::Infer;
+use super::{Breaks, Infer};
 use super::path::parse_int;
 
 impl Infer<'_, '_> {
@@ -82,7 +82,7 @@ impl Infer<'_, '_> {
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail, expected),
             Expr::If(cond, then, otherwise) => self.if_expr(cond, then, otherwise, expected),
             Expr::While { cond, body, label: None } => self.while_expr(cond, body),
-            Expr::Loop { body, label: None } => self.loop_expr(body),
+            Expr::Loop { body, label: None } => self.loop_expr(body, expected),
             Expr::Break(None, value) => self.break_expr(value),
             Expr::Continue(None) => Ok(self.cx.types.intern(Kind::Never)),
             Expr::Return(value) => self.return_expr(value),
@@ -200,7 +200,7 @@ impl Infer<'_, '_> {
         match op {
             Some(BinOp::Shl | BinOp::Shr) => {}
             Some(_) if !(self.is_int(place) || self.is_float(place) || self.resolve(place) == self.cx.types.bool()) => bail!("unsupported compound assignment on {}", self.show(place)),
-            _ => self.coerce(value, place)?,
+            _ => self.coerce_expr(rhs, value, place)?,
         }
         Ok(self.cx.types.unit())
     }
@@ -242,7 +242,10 @@ impl Infer<'_, '_> {
         let then_diverges = std::mem::replace(&mut self.diverges, false);
         let else_ty = self.expr(otherwise, expected.or(Some(then_ty)))?;
         self.diverges = before || (then_diverges && self.diverges);
-        self.join(then_ty, else_ty)
+        let Some(target) = self.known(expected) else { return self.join(then_ty, else_ty) };
+        self.coerce_expr(then, then_ty, target)?;
+        self.coerce_expr(otherwise, else_ty, target)?;
+        Ok(target)
     }
 
     /// The common type of two branches, where a diverging branch takes the other's type.
@@ -262,8 +265,13 @@ impl Infer<'_, '_> {
         let depth = self.scopes.len();
         let found = self.expr(cond, Some(bool_ty))?;
         self.coerce(found, bool_ty)?;
+        self.unit_loop_body(body, depth)
+    }
+
+    /// Infers the body of a `while` or `for` loop, whose `break`s give unit, and drops the scopes above `depth` after it.
+    pub(super) fn unit_loop_body(&mut self, body: ExprId, depth: usize) -> Result<Ty> {
         let unit = self.cx.types.unit();
-        self.loops.push(Some(unit));
+        self.loops.push(Breaks { ty: Some(unit), broke: false });
         let diverges = self.diverges;
         let body_ty = self.expr(body, Some(unit));
         self.scopes.truncate(depth);
@@ -273,31 +281,35 @@ impl Infer<'_, '_> {
         Ok(unit)
     }
 
-    fn loop_expr(&mut self, body: ExprId) -> Result<Ty> {
+    fn loop_expr(&mut self, body: ExprId, expected: Option<Ty>) -> Result<Ty> {
         let before = self.diverges;
-        self.loops.push(None);
+        self.loops.push(Breaks { ty: self.known(expected), broke: false });
         let unit = self.cx.types.unit();
         let body_ty = self.expr(body, Some(unit));
-        let broke = self.loops.pop().flatten();
+        let breaks = self.loops.pop().expect("the loop pushed its breaks");
         self.coerce(body_ty?, unit)?;
-        match broke {
-            Some(ty) => {
+        match (breaks.broke, breaks.ty) {
+            (true, Some(ty)) => {
                 self.diverges = before;
                 Ok(ty)
             }
-            None => Ok(self.cx.types.intern(Kind::Never)),
+            _ => Ok(self.cx.types.intern(Kind::Never)),
         }
     }
 
     fn break_expr(&mut self, value: Option<ExprId>) -> Result<Ty> {
-        let ty = match value {
-            Some(value) => self.expr(value, None)?,
+        let Some(&slot) = self.loops.last() else { bail!("`break` outside a loop") };
+        let found = match value {
+            Some(value) => self.expr(value, slot.ty)?,
             None => self.cx.types.unit(),
         };
-        let Some(slot) = self.loops.last().copied() else { bail!("`break` outside a loop") };
-        match slot {
-            Some(known) => self.coerce(ty, known)?,
-            None => *self.loops.last_mut().unwrap_or(&mut None) = Some(ty),
+        let ty = match (slot.ty, value) {
+            (Some(known), Some(value)) => self.coerce_expr(value, found, known).map(|_| known)?,
+            (Some(known), None) => self.coerce(found, known).map(|_| known)?,
+            (None, _) => found,
+        };
+        if let Some(last) = self.loops.last_mut() {
+            *last = Breaks { ty: Some(ty), broke: true };
         }
         Ok(self.cx.types.intern(Kind::Never))
     }

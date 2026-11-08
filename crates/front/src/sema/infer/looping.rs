@@ -52,15 +52,7 @@ impl Infer<'_, '_> {
         self.out.fors.insert(expr, For { into_iter, next, iter: iter_ty, option, some });
         let depth = self.scopes.len();
         self.bind_pat(pat, args[0])?;
-        let unit = self.cx.types.unit();
-        self.loops.push(Some(unit));
-        let diverges = self.diverges;
-        let body_ty = self.expr(body, Some(unit));
-        self.scopes.truncate(depth);
-        self.diverges = diverges;
-        self.loops.pop();
-        self.coerce(body_ty?, unit)?;
-        Ok(unit)
+        self.unit_loop_body(body, depth)
     }
 
     fn lang_call(&mut self, lang: &str, receiver: Ty) -> Result<(Res, Ty)> {

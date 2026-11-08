@@ -2,11 +2,14 @@
 
 mod adt;
 mod array;
+mod drop;
+mod equal;
 mod expr;
 mod intrinsic;
 mod looping;
 mod matching;
 mod memory;
+mod moves;
 mod ops;
 mod place;
 mod promote;
@@ -14,7 +17,7 @@ mod promote;
 use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, Function, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
 
-use crate::body::{Body, ExprId, List, Pat, PatId, Stmt};
+use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
 use crate::names::Primitive;
 use crate::outline::source::Source;
 use crate::sema::Context;
@@ -93,6 +96,7 @@ struct Loop {
     head: Block,
     exit: Block,
     value: Option<(StackSlot, Type)>,
+    depth: usize,
 }
 
 /// The lowering of one body.
@@ -107,23 +111,42 @@ pub struct Lower<'l, 'a> {
     locals: Vec<Option<(StackSlot, Repr)>>,
     loops: Vec<Loop>,
     open: bool,
+    dead: Option<Block>,
     sret: Option<Value>,
+    owned: Vec<drop::Owned>,
+    flags: Vec<StackSlot>,
+    moved: rustc_hash::FxHashMap<moves::Root, Vec<moves::MovePath>>,
+    extended: rustc_hash::FxHashSet<ExprId>,
+    pending: Vec<(moves::Root, moves::MovePath)>,
 }
 
 /// Lowers reached function `index` to SSA, with calls through `slots`.
 pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<Function> {
     let ((item, _), typed) = &reached.list[index];
     let Ok(typed) = typed else { bail!("{} did not type-check", cx.name(*item)) };
-    for ty in typed.exprs.iter().chain(typed.locals.iter().map(|local| &local.ty)).filter(|ty| ty.0 != u32::MAX).copied().collect::<rustc_hash::FxHashSet<_>>() {
-        if crate::sema::infer::needs_drop(cx, ty)? {
-            bail!("{} holds a value that needs drop glue, which is not lowered yet", cx.name(*item));
-        }
-    }
-    let body = cx.body(*item)?;
+    let body = if typed.glue.is_some() { std::rc::Rc::default() } else { cx.body(*item)? };
     let src = cx.body_src(*item);
     let mut func = Function::new(signature(cx, typed)?);
     let b = FunctionBuilder::new(&mut func);
-    let mut lower = Lower { cx, reached, slots, body: &body, src, typed, b, locals: vec![None; typed.locals.len()], loops: Vec::new(), open: true, sret: None };
+    let mut lower = Lower {
+        cx,
+        reached,
+        slots,
+        body: &body,
+        src,
+        typed,
+        b,
+        locals: vec![None; typed.locals.len()],
+        loops: Vec::new(),
+        open: true,
+        dead: None,
+        sret: None,
+        owned: Vec::new(),
+        flags: Vec::new(),
+        moved: Default::default(),
+        extended: Default::default(),
+        pending: Vec::new(),
+    };
     lower.run()?;
     Ok(func)
 }
@@ -133,6 +156,10 @@ impl Lower<'_, '_> {
         let entry = self.b.create_block();
         self.b.append_block_params_for_function_params(entry);
         self.b.switch_to_block(entry);
+        let (prologue, start) = (self.b.create_block(), self.b.create_block());
+        self.jump(prologue, &[]);
+        self.b.switch_to_block(start);
+        self.moved = self.moved_paths()?;
         let mut params = self.b.block_params(entry).to_vec().into_iter();
         let sret = self.b.func.signature.params.first().is_some_and(|param| param.purpose == ArgumentPurpose::StructReturn);
         self.sret = if sret { params.next() } else { None };
@@ -143,9 +170,30 @@ impl Lower<'_, '_> {
             };
             self.declare(local, value)?;
         }
-        let Some(root) = self.body.root else { bail!("body has no root") };
-        let value = self.expr(root)?;
-        self.finish(value)
+        let value = match &self.typed.glue {
+            Some(_) => self.glue_target().map(|_| None)?,
+            None => {
+                let Some(root) = self.body.root else { bail!("body has no root") };
+                self.expr(root)?
+            }
+        };
+        self.finish(value)?;
+        self.enter(prologue);
+        for slot in std::mem::take(&mut self.flags) {
+            let zero = self.ins().iconst(Type::I8, 0);
+            self.ins().stack_store(zero, slot, 0);
+        }
+        self.jump(start, &[]);
+        self.close();
+        self.seal();
+        Ok(())
+    }
+
+    fn glue_target(&mut self) -> Result<()> {
+        let local = self.typed.params[0];
+        let Kind::Ref(_, ty) = *self.cx.types.kind(self.typed.locals[local as usize].ty) else { bail!("drop glue takes a reference") };
+        let target = self.locals[local as usize].map(|(slot, repr)| place::Place::slot(slot, repr)).and_then(|place| self.read(place));
+        self.glue_body(ty, target)
     }
 
     /// Returns `value` from the function, through the result pointer when the result lives in memory.
@@ -154,10 +202,13 @@ impl Lower<'_, '_> {
             return Ok(());
         }
         let ret = self.typed.ret.unwrap_or(Ty(u32::MAX));
+        if let (Some(out), Some(value)) = (self.sret, value) {
+            let Repr::Mem { size, .. } = repr(self.cx, ret)? else { bail!("result pointer for a non-memory result") };
+            self.copy(out, value, size);
+        }
+        self.drop_to(0)?;
         match (self.sret, value) {
-            (Some(out), Some(value)) => {
-                let Repr::Mem { size, .. } = repr(self.cx, ret)? else { bail!("result pointer for a non-memory result") };
-                self.copy(out, value, size);
+            (Some(_), Some(_)) => {
                 self.ins().return_(&[]);
             }
             (None, Some(value)) if !self.b.func.signature.returns.is_empty() => {
@@ -178,29 +229,64 @@ impl Lower<'_, '_> {
         repr(self.cx, self.typed.locals[local as usize].ty)
     }
 
-    /// The instruction cursor, in a fresh block when the current one already ended.
+    /// The instruction cursor, in a block that nothing enters when the current one already ended.
     fn ins(&mut self) -> Ins<'_> {
         if !self.open {
-            let dead = self.b.create_block();
+            let dead = *self.dead.get_or_insert_with(|| self.b.create_block());
             self.b.switch_to_block(dead);
-            self.open = true;
         }
         self.b.ins()
     }
 
     fn close(&mut self) {
         self.open = false;
+        self.dead = None;
     }
 
-    /// Gives `local` its own frame slot, holding a copy of `value` when there is one.
-    pub fn declare(&mut self, local: u32, value: Option<Value>) -> Result<()> {
-        let repr = self.local_repr(local)?;
-        let Some(slot) = self.slot(repr) else { return Ok(()) };
-        self.locals[local as usize] = Some((slot, repr));
-        if let Some(value) = value {
-            self.write(place::Place::slot(slot, repr), value);
+    fn seal(&mut self) {
+        if let Some(dead) = self.dead.take() {
+            self.b.switch_to_block(dead);
+            self.b.ins().trap();
         }
-        Ok(())
+    }
+
+    /// Moves the cursor to `block`, which code runs into only when some branch goes there.
+    fn enter(&mut self, block: Block) {
+        self.seal();
+        self.b.switch_to_block(block);
+        self.open = self.b.has_branch_to(block);
+    }
+
+    /// Goes to `block` with `args`, when the cursor is in code that runs.
+    fn jump(&mut self, block: Block, args: &[Value]) {
+        if self.open {
+            self.b.ins().jump(block, args);
+        }
+    }
+
+    /// Goes to `then` when `test` is nonzero and to `otherwise` when not, when the cursor is in code that runs.
+    fn brif(&mut self, test: Value, (then, then_args): (Block, &[Value]), (otherwise, else_args): (Block, &[Value])) {
+        if self.open {
+            self.b.ins().brif(test, then, then_args, otherwise, else_args);
+        }
+    }
+
+    /// Gives the initialized `local` its own frame slot, holding a copy of `value` when there is one, and owns what it holds.
+    pub fn declare(&mut self, local: u32, value: Option<Value>) -> Result<()> {
+        self.declare_as(local, value, true)
+    }
+
+    fn declare_as(&mut self, local: u32, value: Option<Value>, init: bool) -> Result<()> {
+        let repr = self.local_repr(local)?;
+        let slot = self.slot(repr);
+        if let Some(slot) = slot {
+            self.locals[local as usize] = Some((slot, repr));
+            if let Some(value) = value {
+                self.write(place::Place::slot(slot, repr), value);
+            }
+        }
+        let place = slot.map(|slot| place::Place::slot(slot, repr));
+        self.own(moves::Root::Local(local), self.typed.locals[local as usize].ty, place, init)
     }
 
     /// A fresh frame slot for a value of `repr`, or none for a zero-sized one.
@@ -221,36 +307,71 @@ impl Lower<'_, '_> {
     }
 
     fn block(&mut self, stmts: List, tail: Option<ExprId>) -> Result<Option<Value>> {
+        let mark = self.owned.len();
         for &stmt in self.body.list(stmts) {
             self.stmt(self.body.stmts[stmt as usize])?;
         }
-        match tail {
-            Some(tail) => self.expr(tail),
-            None => Ok(None),
-        }
+        let value = match tail {
+            Some(tail) => self.expr(tail)?,
+            None => None,
+        };
+        self.end_scope(mark)?;
+        Ok(value)
     }
 
     fn stmt(&mut self, stmt: Stmt) -> Result<()> {
+        let mark = self.owned.len();
         match stmt {
-            Stmt::Let { pat, init, otherwise: None, .. } => self.let_stmt(pat, init),
-            Stmt::Let { pat, init: Some(init), otherwise: Some(otherwise), .. } => self.let_else(pat, init, otherwise),
-            Stmt::Expr(expr, _) => self.expr(expr).map(drop),
-            Stmt::Item(..) | Stmt::Empty => Ok(()),
+            Stmt::Let { pat, init, otherwise: None, .. } => self.let_stmt(pat, init)?,
+            Stmt::Let { pat, init: Some(init), otherwise: Some(otherwise), .. } => self.let_else(pat, init, otherwise)?,
+            Stmt::Expr(expr, _) => self.discard(expr)?,
+            Stmt::Item(..) | Stmt::Empty => {}
             other => bail!("cannot lower statement {other:?} yet"),
+        }
+        self.end_statement(mark)
+    }
+
+    fn discard(&mut self, expr: ExprId) -> Result<()> {
+        let value = self.expr(expr)?;
+        if !self.open {
+            return Ok(());
+        }
+        let ty = self.ty_of(expr);
+        let repr = repr(self.cx, ty)?;
+        let place = value.map(|value| place::Place { base: place::Base::Addr(value), offset: 0, repr });
+        match (repr, place) {
+            (Repr::Scalar(_), _) => Ok(()),
+            (_, place) => self.glue(ty, place),
         }
     }
 
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<()> {
         let Some(init) = init else {
             return match (self.body.pat(pat), self.typed.binds.get(&pat)) {
-                (Pat::Bind { .. }, Some(&local)) => self.declare(local, None),
+                (Pat::Bind { .. }, Some(&local)) => self.declare_as(local, None, false),
                 _ => bail!("uninitialized `let` with a pattern"),
             };
         };
+        self.extend(init);
         let place = self.place_or_temp(init)?;
         if !self.open {
             return Ok(());
         }
-        self.bind_matched(pat, place)
+        self.bind_matched(pat, place, self.scrutinee_path(init))?;
+        self.commit_moves()
+    }
+
+    fn extend(&mut self, expr: ExprId) {
+        match *self.body.expr(expr) {
+            Expr::Ref { expr: inner, .. } => {
+                self.extended.insert(inner);
+                self.extend(inner);
+            }
+            Expr::Paren(inner) | Expr::Cast(inner, _) => self.extend(inner),
+            Expr::Block { tail: Some(tail), .. } => self.extend(tail),
+            Expr::Tuple(list) | Expr::Array(list) => self.body.list(list).to_vec().into_iter().for_each(|item| self.extend(ExprId(item))),
+            Expr::Struct { fields, .. } => self.body.list(fields).to_vec().into_iter().for_each(|at| self.extend(self.body.fields[at as usize].value)),
+            _ => {}
+        }
     }
 }

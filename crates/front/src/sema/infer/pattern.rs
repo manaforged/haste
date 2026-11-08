@@ -73,7 +73,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn range(&self, bits: Bits, (from, to): (u32, u32)) -> Result<(u128, u128)> {
+    fn range(&mut self, bits: Bits, (from, to): (u32, u32)) -> Result<(u128, u128)> {
         let src = self.src;
         let Some(dots) = (from..to).find(|&at| src.kind(at) == TokenKind::Dot && src.kind(at + 1) == TokenKind::Dot && src.joint(at)) else {
             let value = self.bound(bits, (from, to))?;
@@ -90,7 +90,7 @@ impl Infer<'_, '_> {
         Ok((low, high))
     }
 
-    fn bound(&self, bits: Bits, (from, to): (u32, u32)) -> Result<u128> {
+    fn bound(&mut self, bits: Bits, (from, to): (u32, u32)) -> Result<u128> {
         let src = self.src;
         let negative = src.text(from) == "-";
         let at = from + u32::from(negative);
@@ -98,6 +98,10 @@ impl Infer<'_, '_> {
             (1, TokenKind::Literal { .. }) => parse_int(src.text(at))?.0,
             (4, TokenKind::Ident) if Primitive::named(src.text(at)).is_some() && matches!(src.text(at + 3), "MAX" | "MIN") => {
                 return Ok(if src.text(at + 3) == "MAX" { bits.max } else { bits.min });
+            }
+            (1, TokenKind::Ident) => {
+                let name = self.cx.names.symbols.intern(src.text(at));
+                self.const_named(&[name], false, None)?.0
             }
             _ => bail!("pattern type bound `{}` is not a literal", src.span(from, to - 1)),
         };

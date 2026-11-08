@@ -1,10 +1,11 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Block, FloatCC, IntCC, Type, Value};
+use haste_codegen::{Block, IntCC, Type, Value};
 
 use crate::body::{ExprId, List, Pat, PatId};
 use crate::sema::infer::{Res, position, rest_split};
 use crate::sema::ty::{Kind, Ty};
 
+use super::moves::{MovePath, Root};
 use super::ops::Num;
 use super::place::{Base, Place};
 use super::{Lower, Repr, repr};
@@ -16,28 +17,33 @@ impl Lower<'_, '_> {
         if !self.open {
             return Ok(None);
         }
+        let from = self.scrutinee_path(scrutinee);
         let join = self.b.create_block();
         let joined = Self::carrier(self.repr_of(expr)?).map(|ty| self.b.append_block_param(join, ty));
         for at in self.body.list(arms).to_vec() {
-            let arm = self.body.arms[at as usize];
-            for alt in self.alternatives(arm.pat) {
-                let next = self.b.create_block();
-                self.test(alt, place, next)?;
-                self.bind_matched(alt, place)?;
-                if let Some(guard) = arm.guard {
-                    let Some(ok) = self.expr(guard)? else { bail!("guard with no value") };
-                    self.pass(ok, next);
-                }
-                let value = self.expr(arm.body)?;
-                self.branch_value(value, join);
-                self.b.switch_to_block(next);
-                self.open = true;
+            if !self.open {
+                break;
             }
+            let arm = self.body.arms[at as usize];
+            let next = self.b.create_block();
+            self.test(arm.pat, place, next)?;
+            let mark = self.owned.len();
+            self.bind_matched(arm.pat, place, from.clone())?;
+            if let Some(guard) = arm.guard {
+                let Some(ok) = self.expr(guard)? else { bail!("guard with no value") };
+                self.guard_pass(ok, mark, next);
+            }
+            self.commit_moves()?;
+            let value = self.expr(arm.body)?;
+            self.end_scope(mark)?;
+            self.branch_value(value, join);
+            self.enter(next);
         }
-        self.ins().trap();
-        self.close();
-        self.b.switch_to_block(join);
-        self.open = true;
+        if self.open {
+            self.ins().trap();
+            self.close();
+        }
+        self.enter(join);
         Ok(joined)
     }
 
@@ -47,14 +53,14 @@ impl Lower<'_, '_> {
         let (fail, done) = (self.b.create_block(), self.b.create_block());
         let matched = self.b.append_block_param(done, Type::I8);
         self.test(pat, place, fail)?;
-        self.bind_matched(pat, place)?;
+        self.bind_matched(pat, place, self.scrutinee_path(init))?;
+        self.commit_moves()?;
         let yes = self.ins().iconst(Type::I8, 1);
-        self.ins().jump(done, &[yes]);
-        self.b.switch_to_block(fail);
-        self.open = true;
+        self.jump(done, &[yes]);
+        self.enter(fail);
         let no = self.ins().iconst(Type::I8, 0);
-        self.ins().jump(done, &[no]);
-        self.b.switch_to_block(done);
+        self.jump(done, &[no]);
+        self.enter(done);
         Ok(Some(matched))
     }
 
@@ -66,30 +72,31 @@ impl Lower<'_, '_> {
         }
         let (fail, matched) = (self.b.create_block(), self.b.create_block());
         self.test(pat, place, fail)?;
-        self.ins().jump(matched, &[]);
-        self.b.switch_to_block(fail);
-        self.open = true;
+        self.jump(matched, &[]);
+        self.enter(fail);
         self.expr(otherwise)?;
         if self.open {
             self.ins().trap();
             self.close();
         }
-        self.b.switch_to_block(matched);
-        self.open = true;
-        self.bind_matched(pat, place)
+        self.enter(matched);
+        self.bind_matched(pat, place, self.scrutinee_path(init))?;
+        self.commit_moves()
     }
 
-    fn alternatives(&self, pat: PatId) -> Vec<PatId> {
-        match *self.body.pat(pat) {
-            Pat::Or(list) => self.body.list(list).iter().map(|&at| PatId(at)).collect(),
-            _ => vec![pat],
-        }
+    fn guard_pass(&mut self, ok: Value, mark: usize, next: Block) {
+        let (pass, fail) = (self.b.create_block(), self.b.create_block());
+        self.brif(ok, (pass, &[]), (fail, &[]));
+        self.enter(fail);
+        self.forget_from(mark);
+        self.jump(next, &[]);
+        self.enter(pass);
     }
 
     fn pass(&mut self, ok: Value, fail: Block) {
         let pass = self.b.create_block();
-        self.ins().brif(ok, pass, &[], fail, &[]);
-        self.b.switch_to_block(pass);
+        self.brif(ok, (pass, &[]), (fail, &[]));
+        self.enter(pass);
     }
 
     fn peeled(&mut self, pat: PatId, mut place: Option<Place>) -> Result<Option<Place>> {
@@ -102,7 +109,7 @@ impl Lower<'_, '_> {
         Ok(place)
     }
 
-    fn pat_ty(&self, pat: PatId) -> Result<Ty> {
+    pub(super) fn pat_ty(&self, pat: PatId) -> Result<Ty> {
         self.typed.pats.get(&pat).copied().ok_or_else(|| anyhow::anyhow!("pattern has no type"))
     }
 
@@ -115,6 +122,7 @@ impl Lower<'_, '_> {
     fn test(&mut self, pat: PatId, place: Option<Place>, fail: Block) -> Result<()> {
         let place = self.peeled(pat, place)?;
         self.test_variant(pat, place, fail)?;
+        self.test_const(pat, place, fail)?;
         match *self.body.pat(pat) {
             Pat::Bind { sub: Some(sub), .. } => self.test(sub, place, fail),
             Pat::Paren(inner) => self.test(inner, place, fail),
@@ -127,7 +135,7 @@ impl Lower<'_, '_> {
             }
             Pat::Or(list) => self.test_or(list, place, fail),
             Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } => {
-                for (sub, sub_place) in self.parts(pat, place)? {
+                for (sub, sub_place, _) in self.parts(pat, place)? {
                     self.test(sub, sub_place, fail)?;
                 }
                 Ok(())
@@ -151,12 +159,12 @@ impl Lower<'_, '_> {
         for (at, alt) in alts.iter().enumerate() {
             let next = if at + 1 == alts.len() { fail } else { self.b.create_block() };
             self.test(*alt, place, next)?;
-            self.ins().jump(matched, &[]);
+            self.jump(matched, &[]);
             if next != fail {
-                self.b.switch_to_block(next);
+                self.enter(next);
             }
         }
-        self.b.switch_to_block(matched);
+        self.enter(matched);
         Ok(())
     }
 
@@ -166,13 +174,21 @@ impl Lower<'_, '_> {
         Ok((value, num))
     }
 
+    fn test_const(&mut self, pat: PatId, place: Option<Place>, fail: Block) -> Result<()> {
+        let Some(Res::Fn(item, substs)) = self.typed.pat_res.get(&pat).cloned() else { return Ok(()) };
+        let Some(expected) = self.invoke(item, &substs, Vec::new())? else { bail!("constant pattern with no value") };
+        self.test_equal(pat, place, expected, fail)
+    }
+
     fn test_lit(&mut self, pat: PatId, lit: ExprId, place: Option<Place>, fail: Block) -> Result<()> {
-        let (value, num) = self.scalar(pat, place)?;
         let Some(expected) = self.expr(lit)? else { bail!("literal with no value") };
-        let ok = match num {
-            Num::Float(_) => self.ins().fcmp(FloatCC::Equal, value, expected),
-            _ => self.ins().icmp(IntCC::Equal, value, expected),
-        };
+        self.test_equal(pat, place, expected, fail)
+    }
+
+    fn test_equal(&mut self, pat: PatId, place: Option<Place>, expected: Value, fail: Block) -> Result<()> {
+        let ty = self.pat_ty(pat)?;
+        let Some(value) = place.and_then(|place| self.read(place)) else { bail!("literal pattern on a value with no bytes") };
+        let ok = self.equal(ty, value, expected)?;
         self.pass(ok, fail);
         Ok(())
     }
@@ -199,7 +215,21 @@ impl Lower<'_, '_> {
     }
 
     /// The sub-patterns of a tuple, tuple-struct or struct pattern `pat`, each with the place of the field it matches.
-    fn parts(&mut self, pat: PatId, place: Option<Place>) -> Result<Vec<(PatId, Option<Place>)>> {
+    fn parts(&mut self, pat: PatId, place: Option<Place>) -> Result<Vec<(PatId, Option<Place>, (u32, u32))>> {
+        let ty = self.pat_ty(pat)?;
+        let mut found = Vec::new();
+        for (sub, (variant, index)) in self.part_indices(pat)? {
+            let sub_place = match place {
+                Some(place) => Some(self.part_place(place, ty, (variant, index))?),
+                None => None,
+            };
+            found.push((sub, sub_place, (variant, index)));
+        }
+        Ok(found)
+    }
+
+    /// The sub-patterns of a tuple, tuple-struct or struct pattern `pat`, each with the variant and field it matches.
+    pub(super) fn part_indices(&mut self, pat: PatId) -> Result<Vec<(PatId, (u32, u32))>> {
         let ty = self.pat_ty(pat)?;
         let variant = match self.typed.pat_res.get(&pat) {
             Some(Res::Ctor(_, variant, _)) => *variant,
@@ -214,15 +244,7 @@ impl Lower<'_, '_> {
             }
             _ => Vec::new(),
         };
-        let mut found = Vec::with_capacity(subs.len());
-        for (sub, index) in subs {
-            let sub_place = match place {
-                Some(place) => Some(self.part_place(place, ty, (variant, index))?),
-                None => None,
-            };
-            found.push((sub, sub_place));
-        }
-        Ok(found)
+        Ok(subs.into_iter().map(|(sub, index)| (sub, (variant, index))).collect())
     }
 
     fn field_count(&mut self, ty: Ty, variant: u32) -> Result<usize> {
@@ -233,40 +255,45 @@ impl Lower<'_, '_> {
         })
     }
 
-    fn part_place(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
-        match self.cx.types.kind(ty).clone() {
-            Kind::Tuple(items) => {
-                let layout = self.cx.layout(ty)?;
-                let field = repr(self.cx, items[index as usize])?;
-                Ok(place.at(layout.fields.offset(index as usize).bytes() as i32, field))
-            }
-            _ => self.variant_field(place, ty, (variant, index)),
-        }
-    }
-
-    /// Declares the bindings of `pat`, which matched the value at `place`.
-    pub fn bind_matched(&mut self, pat: PatId, place: Option<Place>) -> Result<()> {
+    /// Declares the bindings of `pat`, which matched the value at `place`, and notes which parts of `at` its by-value bindings move out.
+    pub fn bind_matched(&mut self, pat: PatId, place: Option<Place>, at: Option<(Root, MovePath)>) -> Result<()> {
+        let at = at.filter(|_| self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) == 0);
         let place = self.peeled(pat, place)?;
         match *self.body.pat(pat) {
-            Pat::Bind { sub, .. } if !self.typed.pat_res.contains_key(&pat) => {
-                let Some(&local) = self.typed.binds.get(&pat) else { bail!("binding has no local") };
-                let value = if self.typed.ref_binds.contains_key(&pat) { Some(self.address_or_dangling(place, self.pat_ty(pat)?)?) } else { place.and_then(|place| self.read(place)) };
-                self.declare(local, value)?;
-                sub.map_or(Ok(()), |sub| self.bind_matched(sub, place))
+            Pat::Bind { sub, by_ref, .. } if !self.typed.pat_res.contains_key(&pat) => {
+                self.bind_local(pat, by_ref, place, at)?;
+                sub.map_or(Ok(()), |sub| self.bind_matched(sub, place, None))
             }
-            Pat::Paren(inner) => self.bind_matched(inner, place),
+            Pat::Paren(inner) => self.bind_matched(inner, place, at),
             Pat::Ref { pat: inner, .. } => {
                 let pointee = self.pat_repr(inner)?;
                 let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
-                self.bind_matched(inner, Some(Place { base: Base::Addr(pointer), offset: 0, repr: pointee }))
+                self.bind_matched(inner, Some(Place { base: Base::Addr(pointer), offset: 0, repr: pointee }), None)
             }
             Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } => {
-                for (sub, sub_place) in self.parts(pat, place)? {
-                    self.bind_matched(sub, sub_place)?;
+                for (sub, sub_place, step) in self.parts(pat, place)? {
+                    let sub_at = at.clone().map(|(root, mut path)| {
+                        path.push(step);
+                        (root, path)
+                    });
+                    self.bind_matched(sub, sub_place, sub_at)?;
                 }
                 Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    fn bind_local(&mut self, pat: PatId, by_ref: bool, place: Option<Place>, at: Option<(Root, MovePath)>) -> Result<()> {
+        let Some(&local) = self.typed.binds.get(&pat) else { bail!("binding has no local") };
+        let referenced = by_ref || self.typed.ref_binds.contains_key(&pat);
+        let value = if referenced { Some(self.address_or_dangling(place, self.pat_ty(pat)?)?) } else { place.and_then(|place| self.read(place)) };
+        self.declare(local, value)?;
+        if let Some(at) = at.filter(|_| !referenced)
+            && crate::sema::infer::needs_drop(self.cx, self.pat_ty(pat)?)?
+        {
+            self.pending.push(at);
+        }
+        Ok(())
     }
 }

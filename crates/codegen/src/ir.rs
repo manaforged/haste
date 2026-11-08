@@ -260,6 +260,16 @@ impl Op {
         matches!(self, Op::TryCall { .. } | Op::Jump(..) | Op::Brif(..) | Op::Return(_) | Op::Trap)
     }
 
+    /// Every block this instruction can go to.
+    pub(crate) fn targets(&self) -> Vec<Block> {
+        match self {
+            Op::Jump(block, _) => vec![*block],
+            Op::Brif(_, then, _, otherwise, _) => vec![*then, *otherwise],
+            Op::TryCall { normal, handler, .. } => vec![*normal, *handler],
+            _ => Vec::new(),
+        }
+    }
+
     /// Every value this instruction reads, once per read.
     pub(crate) fn operands(&self) -> Vec<Value> {
         match self {

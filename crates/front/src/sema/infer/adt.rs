@@ -78,18 +78,18 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The type of a path that names the constructor `ctor`: the value of a unit variant, or a function from the fields of a tuple variant.
-    pub fn ctor_value(&mut self, expr: ExprId, (item, variant, args): Ctor) -> Result<Ty> {
+    pub fn ctor_value(&mut self, (item, variant, args): Ctor) -> Result<(Ty, Res)> {
         let shape = self.cx.adt_def(item)?.variants[variant as usize].shape;
         let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
-        self.out.res.insert(expr, Res::Ctor(item, variant, args.clone()));
-        match shape {
-            Shape::Unit => Ok(adt),
+        let ty = match shape {
+            Shape::Unit => adt,
             Shape::Tuple => {
                 let fields = self.adt_fields(item, &args)?.swap_remove(variant as usize);
-                Ok(self.cx.types.intern(Kind::FnPtr(fields, adt)))
+                self.cx.types.intern(Kind::FnPtr(fields, adt))
             }
             Shape::Named => bail!("`{}` needs its fields named", self.cx.name(item)),
-        }
+        };
+        Ok((ty, Res::Ctor(item, variant, args)))
     }
 
     /// Infers the struct literal `expr`.

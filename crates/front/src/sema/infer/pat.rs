@@ -2,9 +2,9 @@ use anyhow::{Result, bail};
 
 use crate::body::{Body, Expr, List, Lit, Pat, PatId, PathId};
 use crate::names::plain;
+use crate::outline::item::ItemKind;
 
 use super::super::ty::{Kind, Mut, Ty};
-use super::adt::Ctor;
 use super::{Infer, Res};
 
 /// How the bindings of a pattern take their values: by value, or by reference after the pattern matched through one.
@@ -60,10 +60,9 @@ impl Infer<'_, '_> {
     }
 
     fn bind_name(&mut self, pat: PatId, (name, mutable, by_ref): (u32, bool, bool), sub: Option<PatId>, (ty, mode): (Ty, Mode)) -> Result<()> {
-        if !mutable && !by_ref && sub.is_none() && let Some((item, variant, args)) = self.unit_named(name)? {
-            let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
-            self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
-            return self.unify(ty, adt);
+        if !mutable && !by_ref && sub.is_none() && let Some((found, res)) = self.named_pat(name)? {
+            self.out.pat_res.insert(pat, res);
+            return self.unify(ty, found);
         }
         let explicit = if mutable { Mut::Mut } else { Mut::Not };
         let reference = match (by_ref, mode) {
@@ -86,7 +85,7 @@ impl Infer<'_, '_> {
 
     fn value_pat(&mut self, expr: crate::body::ExprId, ty: Ty) -> Result<()> {
         let found = self.expr(expr, Some(ty))?;
-        self.unify(found, ty)
+        self.coerce_expr(expr, found, ty)
     }
 
     fn ref_pat(&mut self, inner: PatId, mutable: bool, ty: Ty) -> Result<()> {
@@ -148,11 +147,14 @@ impl Infer<'_, '_> {
     }
 
     fn path_pat(&mut self, pat: PatId, path: PathId, ty: Ty) -> Result<()> {
-        let body = self.body;
-        let Some((item, variant, args)) = self.ctor(body, path, true)? else { bail!("pattern path is not a unit constructor") };
-        let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
-        self.unify(ty, adt)?;
-        self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
+        let (found, res) = self.value_path(path)?;
+        match &res {
+            Res::Ctor(..) => {}
+            Res::Fn(item, _) if self.cx.item(*item).1.kind == ItemKind::Const => {}
+            _ => bail!("pattern path is not a unit constructor or a constant"),
+        }
+        self.unify(ty, found)?;
+        self.out.pat_res.insert(pat, res);
         Ok(())
     }
 
@@ -195,7 +197,7 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    fn unit_named(&mut self, name: u32) -> Result<Option<Ctor>> {
+    fn named_pat(&mut self, name: u32) -> Result<Option<(Ty, Res)>> {
         let sym = self.cx.names.symbols.intern(plain(self.src.text(name)));
         let paths = self.cx.paths(self.home.krate);
         let path = crate::names::path::Path { segments: &[sym], absolute: false, dollar: None };
@@ -206,13 +208,15 @@ impl Infer<'_, '_> {
                 let Some(at) = def.variants.iter().position(|variant| variant.index == index) else { return Ok(None) };
                 (item, at as u32)
             }
-            Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == crate::outline::item::ItemKind::Struct => (item, 0),
+            Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Struct => (item, 0),
+            Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => return self.const_item(item, Vec::new()).map(Some),
             _ => return Ok(None),
         };
         if self.cx.adt_def(item)?.variants[variant as usize].shape != crate::body::adt::Shape::Unit {
             return Ok(None);
         }
         let args = self.adt_args(item, Vec::new(), true)?;
-        Ok(Some((item, variant, args)))
+        let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
+        Ok(Some((adt, Res::Ctor(item, variant, args))))
     }
 }
