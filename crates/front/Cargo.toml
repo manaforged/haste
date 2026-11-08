@@ -1,0 +1,14 @@
+[package]
+name = "haste-front"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+rustc-hash = "2"
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rustc_lexer = { package = "ra-ap-rustc_lexer", version = "0.180", default-features = false }

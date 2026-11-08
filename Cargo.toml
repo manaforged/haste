@@ -6,6 +6,7 @@ publish = false
 license = "MIT"
 
 [workspace]
+members = ["crates/codegen", "crates/front"]
 exclude = ["hello", "patch", "ra"]
 
 [dependencies]
