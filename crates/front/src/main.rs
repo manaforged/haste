@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use haste_front::graph::{self, Targets, cfg};
 use haste_front::names::{ItemRef, Names};
-use haste_front::sema::reach::{Instance, reach};
 use haste_front::{outline, sema};
+
+mod cases;
+mod serve;
 
 fn print_graph(workspace: &graph::Workspace) {
     for line in workspace.unit_lines() {
@@ -142,6 +144,13 @@ fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
     failures
 }
 
+/// Loads and resolves what a sema pass asked for, and returns the store for the next pass and whether the outline changed.
+fn answer(names: &mut Names, outline: &mut outline::Outline, (mut store, asks): (sema::Store, haste_front::names::path::Asks)) -> Result<(sema::Store, bool)> {
+    let more = names.answer(outline, asks)?;
+    store.forget_lookups();
+    Ok((store, more))
+}
+
 fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let started = Instant::now();
     let (mut outline, mut names) = demand_front(workspace, targets)?;
@@ -152,71 +161,33 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
         passes += 1;
         let mut cx = sema::Context::new(&outline, &names, store);
         let failures = typeck_pass(&mut cx, &cases);
-        let asks;
-        (store, asks) = cx.release();
-        if !names.answer(&mut outline, asks)? {
+        let released = cx.release();
+        let more;
+        (store, more) = answer(&mut names, &mut outline, released)?;
+        if !more {
             break failures;
         }
     };
     let failed: usize = failures.values().map(Vec::len).sum();
-    for (error, items) in &failures {
-        let names: Vec<&str> = items.iter().take(3).filter_map(|item| item.split(':').next()).collect();
-        eprintln!("{:>4} {error} [{}]\n       {}", items.len(), names.join(" "), items[0].chars().take(300).collect::<String>());
-    }
+    print_failures(&failures);
     let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
     eprintln!("typeck {} cases, {} passed, {failed} failed, {passes} passes, {}, front {:.1} ms, total {:.1} ms", cases.len(), cases.len() - failed, summary(&outline), ms(front), ms(started.elapsed()));
     Ok(())
 }
 
-fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+fn report_cases(workspace: &graph::Workspace, targets: &Targets, request: serve::Request) -> Result<()> {
     let started = Instant::now();
-    let (mut outline, mut names) = eager_front(workspace, targets)?;
-    let cases = case_items(workspace, &outline);
-    let roots: Vec<Instance> = cases.iter().map(|item| (*item, Vec::new())).collect();
-    let (mut store, mut last) = (sema::Store::default(), false);
-    loop {
-        let mut cx = sema::Context::new(&outline, &names, store);
-        let reached = reach(&mut cx, &roots);
-        if last || cx.settled() {
-            let result = run_cases(&mut cx, &reached, &cases, started);
-            std::mem::forget((cx, reached));
-            std::mem::forget((outline, names));
-            return result;
-        }
-        let asks;
-        (store, asks) = cx.release();
-        last = !names.answer(&mut outline, asks)?;
-    }
+    let build = cases::Build::cold(workspace, targets)?;
+    let result = serve::finish(&build, request, started);
+    std::mem::forget(build);
+    result
 }
 
-fn run_cases(cx: &mut sema::Context<'_>, reached: &sema::reach::Reached, cases: &[ItemRef], started: Instant) -> Result<()> {
-    let mut image = haste_front::image::Image::new(reached)?;
-    let broken: std::collections::HashMap<usize, String> = image.compile(cx, reached).into_iter().collect();
-    let built = started.elapsed();
-    let mut failures = Failures::new();
-    let mut runnable = Vec::new();
-    for (root, item) in cases.iter().enumerate() {
-        let closure = reached.closure(root);
-        let failure = closure.iter().rev().find_map(|at| reached.list[*at].1.as_ref().err()).or_else(|| closure.iter().rev().find_map(|at| broken.get(at)));
-        let name = cx.name(*item);
-        match failure {
-            Some(error) => failures.entry(error_kind(error)).or_default().push(format!("{name}: {error}")),
-            None => runnable.push((root, closure, name)),
-        }
-    }
-    let statuses = image.run_cases(&runnable, &[-5, 0, 1, 3, 20])?;
-    let ran = runnable.len();
-    for ((_, _, name), status) in runnable.iter().zip(statuses).filter(|(_, status)| *status != 0) {
-        failures.entry(format!("crashed with status {status}")).or_default().push((*name).to_owned());
-    }
-    for (error, items) in &failures {
+fn print_failures(failures: &Failures) {
+    for (error, items) in failures {
         let names: Vec<&str> = items.iter().take(3).filter_map(|item| item.split(':').next()).collect();
         eprintln!("{:>4} {error} [{}]\n       {}", items.len(), names.join(" "), items[0].chars().take(300).collect::<String>());
     }
-    let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
-    eprintln!("cases {} found, {ran} ran, {} functions reached, built in {:.1} ms, total {:.1} ms", cases.len(), reached.list.len(), ms(built), ms(started.elapsed()));
-    std::mem::forget(image);
-    Ok(())
 }
 
 fn error_kind(text: &str) -> String {
@@ -286,7 +257,7 @@ fn report_names(outline: &outline::Outline, names: &Names, started: Instant) {
     eprintln!("names {bindings} names, {total} unresolved imports in {:.1} ms", elapsed.as_secs_f64() * 1e3);
 }
 
-const USAGE: &str = "usage: haste-front graph|outline|demand|typeck|cases|items|expand PATH";
+const USAGE: &str = "usage: haste-front graph|outline|demand|typeck|cases|build|serve|items|expand PATH";
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -295,7 +266,13 @@ fn main() -> Result<()> {
     match mode.as_str() {
         "items" => print_items(&path),
         "expand" => print_expanded(&path),
-        _ => report(&mode, &std::path::absolute(path)?),
+        _ => {
+            let root = std::path::absolute(path)?;
+            if let Some(status) = serve::Request::parse_mode(&mode).map(|request| serve::ask(&root, request)).transpose()?.flatten() {
+                std::process::exit(status);
+            }
+            report(&mode, &root)
+        }
     }
 }
 
@@ -308,14 +285,15 @@ fn report(mode: &str, root: &std::path::Path) -> Result<()> {
         workspace.merge(graph::load_sysroot(&graph::library()?, &targets)?);
     }
     let loaded = started.elapsed();
-    match mode {
-        "graph" => print_graph(&workspace),
-        "outline" => report_outline(&workspace, &targets, threads)?,
-        "demand" => report_demand(&workspace, &targets)?,
-        "typeck" => report_typeck(&workspace, &targets)?,
-        "cases" => report_cases(&workspace, &targets)?,
-        other => bail!("unknown mode {other}"),
-    }
+    match (mode, serve::Request::parse_mode(mode)) {
+        (_, Some(request)) => report_cases(&workspace, &targets, request),
+        ("graph", _) => Ok(print_graph(&workspace)),
+        ("outline", _) => report_outline(&workspace, &targets, threads),
+        ("demand", _) => report_demand(&workspace, &targets),
+        ("typeck", _) => report_typeck(&workspace, &targets),
+        ("serve", _) => serve::serve(&workspace, &targets, root),
+        (other, _) => Err(anyhow::anyhow!("unknown mode {other}")),
+    }?;
     eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);
     Ok(())
 }

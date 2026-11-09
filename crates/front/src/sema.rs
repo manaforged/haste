@@ -40,6 +40,130 @@ pub struct Store {
     tails: HashMap<ty::Ty, ty::Ty>,
     headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
     finals: HashMap<reach::Instance, infer::Typed>,
+    lookups: Lookups,
+}
+
+/// The lookups Sema caches about one outline, which hold while only function bodies change.
+#[derive(Default)]
+struct Lookups {
+    modules: HashMap<u32, Rc<HashMap<(u32, u32), u32>>>,
+    heads: HashMap<impls::Holder, Rc<impls::Index>>,
+    owners: HashMap<u32, Rc<HashMap<(u32, Option<u32>), u32>>>,
+    trait_defs: HashMap<ItemRef, Rc<traits::TraitGenerics>>,
+    discriminants: HashMap<ItemRef, Rc<[i128]>>,
+    langs: Option<(Rc<HashMap<String, ItemRef>>, Rc<[u32]>)>,
+    drops: HashMap<ty::Ty, bool>,
+    closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
+    reveals: HashMap<reach::Instance, Option<ty::Ty>>,
+    lang_of: HashMap<ItemRef, Option<u32>>,
+    scope_traits: HashMap<ModRef, Rc<[ItemRef]>>,
+    type_defs: HashMap<TypeKey, crate::names::Def>,
+    impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
+}
+
+impl Store {
+    /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.
+    pub fn forget_lookups(&mut self) {
+        self.lookups = Lookups::default();
+    }
+
+    /// Drops what the store keeps about the items that `edited` holds, and about the instances, types and lookups that name one of them.
+    pub fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
+        let mine = |item: ItemRef| edited.holds(item.krate, item.file);
+        let block_kept = |block: &impls::ImplRef| match *block {
+            impls::ImplRef::Module { krate, index } => outline.crates[krate as usize].impls.get(index as usize).is_some_and(|entry| !edited.holds(krate, entry.file as u32) && !entry.parts.iter().any(|&part| edited.holds(krate, part as u32))),
+            impls::ImplRef::Body(item) => !mine(item),
+        };
+        self.signatures.retain(|item, _| !mine(*item));
+        self.bodies.retain(|item, _| !mine(*item));
+        self.adts.retain(|item, _| !mine(*item));
+        self.headers.retain(|block, _| block_kept(block));
+        let mut naming = Naming { types: &self.types, mine: &mine, memo: HashMap::default() };
+        self.finals.retain(|instance, _| !naming.touches(instance));
+        self.layouts.retain(|ty, _| !naming.names(*ty));
+        self.tails.retain(|ty, _| !naming.names(*ty));
+        let kept = &mut self.lookups;
+        kept.drops.retain(|ty, _| !naming.names(*ty));
+        kept.closures.retain(|ty, _| !naming.names(*ty));
+        kept.reveals.retain(|instance, _| !naming.touches(instance));
+        kept.impl_traits.retain(|block, _| block_kept(block));
+        kept.heads.retain(|holder, _| match *holder {
+            impls::Holder::Crate(krate) => !edited.touches_crate(krate),
+            impls::Holder::Body(item) => !mine(item),
+        });
+        kept.modules.retain(|krate, _| !edited.touches_crate(*krate));
+        kept.owners.retain(|krate, _| !edited.touches_crate(*krate));
+        kept.scope_traits.retain(|home, _| !edited.touches_crate(home.krate));
+        kept.type_defs.retain(|key, _| !edited.touches_crate(key.0.krate));
+        kept.trait_defs.retain(|item, _| !mine(*item));
+        kept.discriminants.retain(|item, _| !mine(*item));
+        kept.lang_of.retain(|item, _| !mine(*item));
+    }
+
+    /// The indexes of the instances in `list` that are functions `edited` holds or take a type that names one of its items.
+    pub fn touched<'l>(&self, list: impl Iterator<Item = &'l reach::Instance>, edited: Edited<'_>) -> Vec<usize> {
+        let mine = |item: ItemRef| edited.holds(item.krate, item.file);
+        let mut naming = Naming { types: &self.types, mine: &mine, memo: HashMap::default() };
+        list.enumerate().filter(|(_, instance)| naming.touches(instance)).map(|(at, _)| at).collect()
+    }
+}
+
+/// What an edit changed: function bodies in some `(crate, file)` slots, or whole crates read again.
+#[derive(Clone, Copy, Debug)]
+pub enum Edited<'e> {
+    /// Function bodies in these `(crate, file)` slots.
+    Files(&'e [(u32, u32)]),
+    /// Every file of these crates.
+    Crates(&'e [u32]),
+}
+
+impl Edited<'_> {
+    fn holds(self, krate: u32, file: u32) -> bool {
+        match self {
+            Edited::Files(files) => files.contains(&(krate, file)),
+            Edited::Crates(crates) => crates.contains(&krate),
+        }
+    }
+
+    fn touches_crate(self, krate: u32) -> bool {
+        match self {
+            Edited::Files(files) => files.iter().any(|&(owner, _)| owner == krate),
+            Edited::Crates(crates) => crates.contains(&krate),
+        }
+    }
+}
+
+/// Which types name an item for which `mine` holds, remembered per type.
+struct Naming<'t, F> {
+    types: &'t Types,
+    mine: &'t F,
+    memo: HashMap<ty::Ty, bool>,
+}
+
+impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
+    fn touches(&mut self, (item, substs): &reach::Instance) -> bool {
+        (self.mine)(*item) || substs.iter().any(|ty| self.names(*ty))
+    }
+
+    /// Whether `ty` names, at any depth, an item or a closure of an item for which `mine` holds.
+    fn names(&mut self, ty: ty::Ty) -> bool {
+        if let Some(&known) = self.memo.get(&ty) {
+            return known;
+        }
+        let kind = self.types.kind(ty);
+        let own = match kind {
+            ty::Kind::Adt(item, _) | ty::Kind::FnDef(item, _) | ty::Kind::Closure(item, ..) | ty::Kind::Dyn(item, ..) => (self.mine)(*item),
+            _ => false,
+        };
+        let closure_args = match kind {
+            ty::Kind::Closure(_, args, _) => args.clone(),
+            _ => Vec::new(),
+        };
+        let inner: Vec<ty::Ty> = kind.children().chain(closure_args).collect();
+        let found = own || inner.into_iter().any(|inner| self.names(inner));
+        self.memo.insert(ty, found);
+        found
+    }
 }
 
 /// Everything Sema reads in one pass, with its caches and the lookups that found nothing loaded yet.
@@ -65,8 +189,8 @@ pub struct Context<'a> {
     tails: HashMap<ty::Ty, ty::Ty>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
     kids: std::cell::RefCell<HashMap<usize, Rc<Kids>>>,
-    lang_of: std::cell::RefCell<HashMap<ItemRef, Option<&'a str>>>,
-    scope_traits: std::cell::RefCell<HashMap<crate::names::ModRef, Rc<[ItemRef]>>>,
+    lang_of: std::cell::RefCell<HashMap<ItemRef, Option<u32>>>,
+    scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
     trait_members: std::cell::RefCell<HashMap<ItemRef, Rc<HashMap<&'a str, ItemRef>>>>,
     /// The type-namespace items that paths name, by home module, body root, nested instance, segments, `::` and `$crate`.
     pub type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
@@ -83,10 +207,11 @@ type Kids = HashMap<Option<u32>, Rc<[u32]>>;
 impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, store: Store) -> Context<'a> {
-        let Store { types, signatures, bodies, adts, layouts, tails, headers, finals } = store;
-        let (modules, heads, owners) = (HashMap::default(), HashMap::default(), HashMap::default());
-        let (trait_defs, langs, drops) = (HashMap::default(), None, HashMap::default());
-        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants: HashMap::default(), langs, drops, closures: HashMap::default(), finals, reveals: HashMap::default(), tails, kids: Default::default(), lang_of: Default::default(), scope_traits: Default::default(), trait_members: Default::default(), type_defs: Default::default(), impl_traits: HashMap::default(), impl_members: Default::default() }
+        let Store { types, signatures, bodies, adts, layouts, tails, headers, finals, lookups } = store;
+        let Lookups { modules, heads, owners, trait_defs, discriminants, langs, drops, closures, reveals, lang_of, scope_traits, type_defs, impl_traits } = lookups;
+        let (lang_of, scope_traits, type_defs) = (lang_of.into(), scope_traits.into(), type_defs.into());
+        let (kids, trait_members, impl_members, asks) = Default::default();
+        Context { outline, names, types, asks, modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants, langs, drops, closures, finals, reveals, tails, kids, lang_of, scope_traits, trait_members, type_defs, impl_traits, impl_members }
     }
 
     /// Whether no lookup in this pass asked the front end for anything, so another pass would find the same.
@@ -96,7 +221,22 @@ impl<'a> Context<'a> {
 
     /// Ends the pass: the store for the next one, and what lookups asked the front end to load or resolve.
     pub fn release(self) -> (Store, Asks) {
-        (Store { types: self.types, signatures: self.signatures, bodies: self.bodies, adts: self.adts, layouts: self.layouts, tails: self.tails, headers: self.headers, finals: self.finals }, self.asks)
+        let lookups = Lookups {
+            modules: self.modules,
+            heads: self.heads,
+            owners: self.owners,
+            trait_defs: self.trait_defs,
+            discriminants: self.discriminants,
+            langs: self.langs,
+            drops: self.drops,
+            closures: self.closures,
+            reveals: self.reveals,
+            lang_of: self.lang_of.into_inner(),
+            scope_traits: self.scope_traits.into_inner(),
+            type_defs: self.type_defs.into_inner(),
+            impl_traits: self.impl_traits,
+        };
+        (Store { types: self.types, signatures: self.signatures, bodies: self.bodies, adts: self.adts, layouts: self.layouts, tails: self.tails, headers: self.headers, finals: self.finals, lookups }, self.asks)
     }
 
     /// The source file and outline entry of `item`.
@@ -201,6 +341,12 @@ impl<'a> Context<'a> {
     pub fn call_once(&mut self) -> Option<ItemRef> {
         let of = self.lang_item("fn_once")?;
         self.trait_member(of, "call_once")
+    }
+
+    /// Whether `instance` names, in its function or its type arguments, an item that a body declared before an edit and declares no longer.
+    pub fn undeclared(&self, instance: &reach::Instance) -> bool {
+        let gone = |item: ItemRef| item.outer().is_some_and(|(outer, index)| self.expansion(outer).is_none_or(|found| index as usize >= found.file.items.items.len()));
+        Naming { types: &self.types, mine: &gone, memo: HashMap::default() }.touches(instance)
     }
 
     /// The outline file that holds `item`, or the expansion of the body that declares it.

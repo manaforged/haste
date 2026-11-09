@@ -53,7 +53,10 @@ impl Image {
                 Err(error) => return work.iter().map(|&index| (index, format!("compile worker {part}: {error}"))).collect(),
             }
         }
-        workers.into_iter().flat_map(|worker| self.collect(worker, work, jobs)).collect()
+        let errors = workers.into_iter().flat_map(|worker| self.collect(worker, work, jobs)).collect();
+        self.memory.close();
+        self.shared.get_mut().close();
+        errors
     }
 
     fn compile_into(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<(), String> {

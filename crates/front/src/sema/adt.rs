@@ -69,20 +69,24 @@ impl<'a> Context<'a> {
 
     /// The value of `#[lang = "..."]` on `item`.
     pub fn lang(&self, item: ItemRef) -> Option<&'a str> {
-        if let Some(&known) = self.lang_of.borrow().get(&item) {
-            return known;
-        }
-        let found = self.attr_value(item, "lang");
-        self.lang_of.borrow_mut().insert(item, found);
-        found
+        let cached = self.lang_of.borrow().get(&item).copied();
+        let at = cached.unwrap_or_else(|| {
+            let found = self.attr_at(item, "lang");
+            self.lang_of.borrow_mut().insert(item, found);
+            found
+        })?;
+        Some(self.item(item).0.text(at + 2).trim_matches('"'))
     }
 
     /// The value of the name-value attribute `#[key = "..."]` on `item`, written directly or through a `cfg_attr` that holds.
     pub fn attr_value(&self, item: ItemRef, key: &str) -> Option<&'a str> {
+        let at = self.attr_at(item, key)?;
+        Some(self.item(item).0.text(at + 2).trim_matches('"'))
+    }
+
+    fn attr_at(&self, item: ItemRef, key: &str) -> Option<u32> {
         let (src, entry) = self.item(item);
-        let env = &self.outline.crates[item.krate as usize].env;
-        let at = named_attr((src, env), &entry.attrs, key)?;
-        Some(src.text(at + 2).trim_matches('"'))
+        named_attr((src, &self.outline.crates[item.krate as usize].env), &entry.attrs, key)
     }
 
     /// The layout of the struct, enum or union `item` at `args`.

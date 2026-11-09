@@ -16,6 +16,7 @@ pub struct Reached {
     pub index: HashMap<Instance, usize>,
     /// The bodies whose types have no layout yet, which lowering would fail on.
     pub unlaid: Vec<String>,
+    calls: Vec<Vec<usize>>,
 }
 
 impl Reached {
@@ -32,15 +33,20 @@ impl Reached {
                 continue;
             }
             stack.push((at, true));
-            if let Ok(typed) = &self.list[at].1 {
-                stack.extend(self.callees(typed).map(|callee| (callee, false)));
-            }
+            stack.extend(self.calls[at].iter().map(|&callee| (callee, false)));
         }
         found
     }
 
-    /// The indexes of the functions that `typed` calls.
-    pub fn callees<'r>(&'r self, typed: &'r Typed) -> impl Iterator<Item = usize> + 'r {
+    fn link(&mut self, indices: &[usize]) {
+        self.calls.resize(self.list.len(), Vec::new());
+        for &at in indices {
+            let callees = self.list[at].1.as_ref().map(|typed| self.callees(typed).collect()).unwrap_or_default();
+            self.calls[at] = callees;
+        }
+    }
+
+    fn callees<'r>(&'r self, typed: &'r Typed) -> impl Iterator<Item = usize> + 'r {
         typed.calls().filter_map(|(item, substs)| self.index.get(&(item, substs.to_vec())).copied())
     }
 }
@@ -48,7 +54,45 @@ impl Reached {
 /// Infers `roots` and every function their bodies call, at the type arguments the calls give.
 pub fn reach(cx: &mut Context<'_>, roots: &[Instance]) -> Reached {
     let mut reached = Reached::default();
-    let mut queue: Vec<Instance> = roots.to_vec();
+    let found = drain(cx, &mut reached, roots.to_vec());
+    reached.link(&found);
+    reached
+}
+
+/// Infers again the reached functions `stale` that an edit did not replace, whose source changed, and every function they now call that was not reached yet, and returns the indexes of both.
+pub fn reach_again(cx: &mut Context<'_>, reached: &mut Reached, stale: &[usize]) -> Vec<usize> {
+    let mut queue = Vec::new();
+    let stale: Vec<usize> = stale.iter().copied().filter(|index| reached.index.get(&reached.list[*index].0) == Some(index)).collect();
+    for &index in &stale {
+        let instance = reached.list[index].0.clone();
+        let typed = if cx.undeclared(&instance) { Err("no longer declared".to_owned()) } else { typed_once(cx, &instance, &mut reached.unlaid) };
+        queue.extend(calls(cx, &typed));
+        reached.list[index].1 = typed;
+    }
+    let mut found = stale.to_vec();
+    found.extend(drain(cx, reached, queue));
+    reached.link(&found);
+    found
+}
+
+/// Drops the reached functions `dead`, whose items an edit replaced, then infers `roots` and every function they call that is not reached, and returns the indexes of those.
+pub fn reach_anew(cx: &mut Context<'_>, reached: &mut Reached, dead: &[usize], roots: &[Instance]) -> Vec<usize> {
+    for &index in dead {
+        reached.index.remove(&reached.list[index].0);
+        reached.list[index].1 = Err("replaced by an edit".to_owned());
+    }
+    reached.link(dead);
+    let found = drain(cx, reached, roots.to_vec());
+    reached.link(&found);
+    found
+}
+
+fn calls<'t>(cx: &'t Context<'_>, typed: &'t Result<Typed, String>) -> impl Iterator<Item = Instance> + 't {
+    typed.iter().flat_map(|typed| typed.calls()).filter(|(item, _)| cx.intrinsic(*item).is_none()).map(|(item, substs)| (item, substs.to_vec()))
+}
+
+fn drain(cx: &mut Context<'_>, reached: &mut Reached, mut queue: Vec<Instance>) -> Vec<usize> {
+    let mut added = Vec::new();
     let mut next = 0;
     while next < queue.len() {
         let instance = queue[next].clone();
@@ -57,14 +101,12 @@ pub fn reach(cx: &mut Context<'_>, roots: &[Instance]) -> Reached {
             continue;
         }
         let typed = typed_once(cx, &instance, &mut reached.unlaid);
-        if let Ok(typed) = &typed {
-            let calls = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_none()).map(|(item, substs)| (item, substs.to_vec()));
-            queue.extend(calls);
-        }
+        queue.extend(calls(cx, &typed));
+        added.push(reached.list.len());
         reached.index.insert(instance.clone(), reached.list.len());
         reached.list.push((instance, typed));
     }
-    reached
+    added
 }
 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.

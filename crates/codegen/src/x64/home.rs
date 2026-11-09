@@ -3,7 +3,7 @@ use super::{Emit, Ext};
 use crate::ir::{Binary, Function, InstData, Op, StackSlot, Type, Value};
 
 /// Registers that hold block-local values; the emitter never uses them as scratch, and a frame saves each one it uses.
-pub(super) const POOL: [Reg; 5] = [Reg::Rbx, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+pub(super) const POOL: [Reg; 5] = super::frame::SAVED;
 
 const FOLD_LIMIT: i64 = 1 << 24;
 

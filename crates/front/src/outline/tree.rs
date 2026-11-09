@@ -316,6 +316,13 @@ impl Cache {
         });
     }
 
+    /// Forgets the files at `paths`, so that the next use reads them again.
+    pub fn forget(&self, paths: &[PathBuf]) {
+        if let Ok(mut slots) = self.slots.lock() {
+            paths.iter().for_each(|path| _ = slots.remove(path));
+        }
+    }
+
     /// The number of files read.
     pub fn len(&self) -> usize {
         self.slots.lock().map_or(0, |slots| slots.len())
@@ -327,7 +334,8 @@ impl Cache {
     }
 }
 
-fn read(path: &Path) -> Result<File> {
+/// Reads and scans the file at `path`.
+pub fn read(path: &Path) -> Result<File> {
     let source = Source::read(path)?;
     let items = scan::scan(&source)?;
     Ok(File::new(source, items, false))

@@ -1,6 +1,7 @@
 pub mod attr;
 pub mod build;
 pub mod derive;
+pub mod edit;
 pub mod fragment;
 pub mod item;
 pub mod mbe;
@@ -102,20 +103,20 @@ pub fn new(workspace: &Workspace, targets: &Targets) -> Outline {
 fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root) -> Crate {
     let unit = &workspace.graph.units[root.unit];
     let env = Env { target: targets.of(unit.side).clone(), features: unit.features.clone() };
-    let dir = root.path.parent().map(PathBuf::from).unwrap_or_default();
-    let decl = Decl::File { candidates: vec![root.path.clone()], by_attr: true };
-    let module = Module { file: usize::MAX, item: None, parent: None, name: String::new(), dir, parts: Vec::new(), vis: Vis::Pub, macro_use: false, state: State::Declared(decl), textual: None };
-    Crate { env, modules: vec![module], ..Crate::default() }
+    Crate { env, modules: vec![root_module(&root.path)], ..Crate::default() }
+}
+
+fn root_module(path: &std::path::Path) -> Module {
+    let dir = path.parent().map(PathBuf::from).unwrap_or_default();
+    let decl = Decl::File { candidates: vec![path.to_owned()], by_attr: true };
+    Module { file: usize::MAX, item: None, parent: None, name: String::new(), dir, parts: Vec::new(), vis: Vis::Pub, macro_use: false, state: State::Declared(decl), textual: None }
 }
 
 impl Outline {
     /// The outline of the single crate whose root file is `path`, with no dependencies.
     pub fn file(path: &std::path::Path, target: crate::graph::cfg::Target) -> Outline {
         let root = Root { unit: 0, name: String::new(), path: path.to_owned(), lib: true };
-        let dir = path.parent().map(PathBuf::from).unwrap_or_default();
-        let decl = Decl::File { candidates: vec![path.to_owned()], by_attr: true };
-        let module = Module { file: usize::MAX, item: None, parent: None, name: String::new(), dir, parts: Vec::new(), vis: Vis::Pub, macro_use: false, state: State::Declared(decl), textual: None };
-        let krate = Crate { env: Env { target, features: Default::default() }, modules: vec![module], ..Crate::default() };
+        let krate = Crate { env: Env { target, features: Default::default() }, modules: vec![root_module(path)], ..Crate::default() };
         Outline { roots: vec![root], crates: vec![krate], deps: vec![Vec::new()], cache: Cache::default() }
     }
 
@@ -146,6 +147,18 @@ impl Outline {
                 return Ok(());
             }
         }
+    }
+
+    /// Reads crate `krate` again from its root after its files changed outside function bodies; no other crate may depend on it.
+    pub fn reload(&mut self, krate: usize) -> Result<()> {
+        if self.deps.iter().any(|deps| deps.iter().any(|(_, at)| *at == krate)) {
+            anyhow::bail!("crate {} has dependents", self.roots[krate].name);
+        }
+        let paths: Vec<PathBuf> = self.crates[krate].files.iter().map(|file| file.source.path.clone()).collect();
+        self.cache.forget(&paths);
+        let env = std::mem::take(&mut self.crates[krate].env);
+        self.crates[krate] = Crate { env, modules: vec![root_module(&self.roots[krate].path)], ..Crate::default() };
+        self.load_crate(krate)
     }
 
     /// Reads every module of crate `krate`, as a lookup over all of a crate's impls needs.

@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const CHUNK: usize = 64 << 20;
 const ALIGN: usize = 16;
@@ -53,6 +52,13 @@ impl Memory {
         Ok(())
     }
 
+    /// Stops writing into the last chunk, whose free space forked workers filled, so that the next write maps a new chunk.
+    pub fn close(&mut self) {
+        if let Some(chunk) = self.chunks.last_mut() {
+            chunk.used = chunk.size;
+        }
+    }
+
     /// Gives this forked process part `part` of `parts` of the free space of the last chunk, and no other chunk.
     pub fn split(&mut self, parts: usize, part: usize) {
         self.sealed = true;
@@ -74,46 +80,58 @@ pub struct Shared {
     base: usize,
     used: usize,
     size: usize,
+    split: bool,
 }
 
 impl Shared {
     /// Maps `size` bytes of shared memory, which the kernel backs only where they are written.
     pub fn new(size: usize) -> Result<Shared, String> {
-        let flags = libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
-        // SAFETY: a new anonymous mapping touches no existing memory.
-        let base = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
-        if base == libc::MAP_FAILED {
-            return Err(format!("mmap: {}", std::io::Error::last_os_error()));
-        }
-        Ok(Shared { base: base as usize, used: 0, size })
+        Ok(Shared { base: map_shared(size)?, used: 0, size, split: false })
     }
 
-    /// The address of `len` zeroed bytes aligned to 16.
+    /// The address of `len` zeroed bytes aligned to 16, in a new mapping when this one is full and no worker shares it.
     pub fn alloc(&mut self, len: usize) -> Result<usize, String> {
         let at = self.used.next_multiple_of(ALIGN);
-        if at + len > self.size {
+        if at + len <= self.size {
+            self.used = at + len;
+            return Ok(self.base + at);
+        }
+        if self.split {
             return Err(format!("shared memory is full: {len} bytes past {at} of {}", self.size));
         }
-        self.used = at + len;
-        Ok(self.base + at)
+        let size = self.size.max(len.next_multiple_of(page()));
+        (self.base, self.used, self.size) = (map_shared(size)?, 0, size);
+        self.alloc(len)
     }
 
     /// Gives this forked process part `part` of `parts` of the free space.
     pub fn split(&mut self, parts: usize, part: usize) {
         (self.used, self.size) = window((self.used, self.size), parts, part);
+        self.split = true;
+    }
+
+    /// Stops handing out the free space that forked workers filled, so that the next allocation maps new memory.
+    pub fn close(&mut self) {
+        self.used = self.size;
     }
 }
 
-fn map(size: usize, owner: i32) -> Result<Chunk, String> {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let name = std::ffi::CString::new(format!("/haste-code-{owner}-{}", NEXT.fetch_add(1, Ordering::Relaxed))).map_err(|e| e.to_string())?;
-    // SAFETY: name is a live NUL-terminated string; the object is private to this process until it is unlinked below.
-    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600) };
-    if fd < 0 {
-        return Err(format!("shm_open: {}", std::io::Error::last_os_error()));
+fn map_shared(size: usize) -> Result<usize, String> {
+    let flags = libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+    // SAFETY: a new anonymous mapping touches no existing memory.
+    let base = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
+    if base == libc::MAP_FAILED {
+        return Err(format!("mmap: {}", std::io::Error::last_os_error()));
     }
-    // SAFETY: name names the object this call created; unlinking it leaves the open descriptor valid.
-    unsafe { libc::shm_unlink(name.as_ptr()) };
+    Ok(base as usize)
+}
+
+fn map(size: usize, owner: i32) -> Result<Chunk, String> {
+    // SAFETY: the name is a static NUL-terminated string; memfd_create makes an anonymous file with no path.
+    let fd = unsafe { libc::memfd_create(c"haste-code".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(format!("memfd_create: {}", std::io::Error::last_os_error()));
+    }
     let mapped = views(fd, size);
     // SAFETY: fd is the descriptor opened above; the mappings keep the object alive after it closes.
     unsafe { libc::close(fd) };

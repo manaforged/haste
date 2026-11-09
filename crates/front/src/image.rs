@@ -17,10 +17,12 @@ use crate::sema::reach::Reached;
 
 const SHARED_BYTES: usize = 4 << 30;
 const CODE_BYTES: usize = 1 << 30;
+const TABLE_SLOTS: usize = 1 << 22;
 
 /// The call table, code memory and data of the running program, all in memory that compile workers forked from this process share.
 pub struct Image {
     table: usize,
+    capacity: usize,
     memory: Memory,
     shared: RefCell<Shared>,
     tables: RefCell<HashMap<Vec<Word>, i64>>,
@@ -73,23 +75,25 @@ impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Result<Image> {
         let mut shared = Shared::new(SHARED_BYTES).map_err(|error| anyhow!(error))?;
-        let table = shared.alloc(reached.list.len() * size_of::<AtomicUsize>()).map_err(|error| anyhow!(error))?;
+        let capacity = reached.list.len().max(TABLE_SLOTS);
+        let table = shared.alloc(capacity * size_of::<AtomicUsize>()).map_err(|error| anyhow!(error))?;
         let mut memory = Memory::default();
         memory.reserve(CODE_BYTES).map_err(|error| anyhow!(error))?;
-        Ok(Image { table, memory, shared: RefCell::new(shared), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), statics: Default::default() })
+        Ok(Image { table, capacity, memory, shared: RefCell::new(shared), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), statics: Default::default() })
     }
 
     fn slot(&self, index: usize) -> &AtomicUsize {
-        // SAFETY: new allocated one zeroed, aligned AtomicUsize per reached function at table, in a mapping that lives as long as the process.
+        assert!(index < self.capacity, "call table index {index} past its {} slots", self.capacity);
+        // SAFETY: index is below capacity, and new allocated capacity zeroed, aligned AtomicUsize slots at table, in a mapping that lives as long as the process.
         unsafe { &*(self.table as *const AtomicUsize).add(index) }
     }
 
-    /// Lowers and encodes every reached function that type-checked, on every core, and returns the errors of those that did not compile, by index.
-    pub fn compile(&mut self, cx: &mut Context<'_>, reached: &Reached) -> Vec<(usize, String)> {
-        self.bind_foreign_statics(cx, reached);
+    /// Lowers and encodes the reached functions `indices` that type-checked, on every core when there are many, links them, and returns the errors of those that did not compile, by index.
+    pub fn compile(&mut self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize]) -> Vec<(usize, String)> {
+        self.bind_foreign_statics(cx, reached, indices);
         let mut errors = Vec::new();
         let mut work = Vec::new();
-        for index in 0..reached.list.len() {
+        for &index in indices {
             if reached.list[index].1.is_err() {
                 continue;
             }
@@ -107,13 +111,19 @@ impl Image {
         self.place_statics(cx, reached, &work);
         errors.extend(self.compile_all(cx, reached, &work));
         let failed: rustc_hash::FxHashSet<usize> = errors.iter().map(|(index, _)| *index).collect();
-        self.statics = work.iter().copied().filter(|index| !failed.contains(index) && lower::is_static(cx, reached.list[*index].0.0)).collect();
+        for &index in &work {
+            if !failed.contains(&index) && lower::is_static(cx, reached.list[index].0.0) {
+                self.statics.insert(index);
+            } else {
+                self.statics.remove(&index);
+            }
+        }
         self.link();
         errors
     }
 
-    fn bind_foreign_statics(&self, cx: &Context<'_>, reached: &Reached) {
-        for (index, ((item, _), typed)) in reached.list.iter().enumerate() {
+    fn bind_foreign_statics(&self, cx: &Context<'_>, reached: &Reached, indices: &[usize]) {
+        for (index, ((item, _), typed)) in indices.iter().map(|&index| (index, &reached.list[index])) {
             if typed.is_err() || !cx.foreign(*item) || !lower::is_static(cx, *item) {
                 continue;
             }

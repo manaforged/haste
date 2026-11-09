@@ -225,6 +225,12 @@ impl Names {
         names
     }
 
+    /// Forgets what crate `krate` resolved, keeping its edition and dependencies, so that `settle` resolves it again from its reloaded outline.
+    pub fn reset(&mut self, krate: usize) {
+        let old = &self.crates[krate];
+        self.crates[krate] = Crate { edition_2015: old.edition_2015, edition: old.edition.clone(), deps: old.deps.clone(), eager: old.eager, ..Crate::default() };
+    }
+
     /// Collects every loaded module not collected yet and resolves imports until nothing changes, loading the modules that lookups reach.
     pub fn settle(&mut self, outline: &mut Outline) -> Result<()> {
         loop {

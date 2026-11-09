@@ -1,5 +1,5 @@
 use super::asm::Reg;
-use crate::ir::{ArgumentPurpose, CallConv, Function, Op, Signature, Type};
+use crate::ir::{ArgumentPurpose, Function, Op, Signature, Type};
 
 const INT_ARGS: [Reg; 6] = [Reg::Rdi, Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
 const FLOAT_ARGS: u8 = 8;
@@ -110,10 +110,10 @@ pub(super) struct Frame {
     pub saves: Vec<Reg>,
 }
 
-/// The registers a frame saves: all of `SAVED` for a native function or one with a handler, else the pool registers it uses.
+/// The registers a frame saves: all of `SAVED` for a function with a handler, which restores what the frames it unwinds clobbered, else the pool registers it uses.
 pub(super) fn saved(func: &Function, used: &[Reg]) -> Vec<Reg> {
     let handles = func.insts.iter().any(|inst| matches!(inst.op, Op::TryCall { .. }));
-    if func.signature.call_conv == CallConv::Native || handles { SAVED.to_vec() } else { used.to_vec() }
+    if handles { SAVED.to_vec() } else { used.to_vec() }
 }
 
 fn needs(func: &Function) -> Result<(u32, u32), String> {
