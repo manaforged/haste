@@ -11,7 +11,7 @@ impl Infer<'_, '_> {
     /// Infers `expr`, with the type the context expects when it knows one.
     pub fn expr(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
         let ty = self.expr_kind(expr, expected)?;
-        if matches!(self.cx.types.kind(self.resolve(ty)), Kind::Never) {
+        if self.is_never(ty) {
             self.diverges = true;
         }
         self.out.exprs[expr.0 as usize] = ty;
@@ -398,7 +398,8 @@ impl Infer<'_, '_> {
         let then_ty = self.expr(then, expected)?;
         self.scopes.truncate(depth);
         let then_diverges = std::mem::replace(&mut self.diverges, false);
-        let else_ty = self.expr(otherwise, expected.or(Some(then_ty)))?;
+        let hint = Some(then_ty).filter(|&ty| !self.is_never(ty));
+        let else_ty = self.expr(otherwise, expected.or(hint))?;
         self.diverges = before || (then_diverges && self.diverges);
         let Some(target) = self.known(expected) else { return self.join(then_ty, else_ty) };
         self.coerce_expr(then, then_ty, target)?;
@@ -406,13 +407,17 @@ impl Infer<'_, '_> {
         Ok(target)
     }
 
+    /// Whether `ty` is the never type `!`.
+    pub(super) fn is_never(&self, ty: Ty) -> bool {
+        matches!(self.cx.types.kind(self.resolve(ty)), Kind::Never)
+    }
+
     /// The common type of two branches, where a diverging branch takes the other's type.
     pub fn join(&mut self, a: Ty, b: Ty) -> Result<Ty> {
-        let never = |infer: &Self, ty: Ty| matches!(infer.cx.types.kind(infer.resolve(ty)), Kind::Never);
-        if never(self, a) {
+        if self.is_never(a) {
             return Ok(b);
         }
-        if never(self, b) {
+        if self.is_never(b) {
             return Ok(a);
         }
         if let Some(shared) = self.shared_pointer(a, b)? {
@@ -462,7 +467,7 @@ impl Infer<'_, '_> {
         let found = found?;
         match (breaks.broke, breaks.ty) {
             (true, Some(ty)) => {
-                if !matches!(self.cx.types.kind(self.resolve(found)), Kind::Never) {
+                if !self.is_never(found) {
                     self.coerce(found, ty)?;
                 }
                 self.diverges = before;

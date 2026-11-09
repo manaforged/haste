@@ -10,7 +10,7 @@ impl Infer<'_, '_> {
     /// Infers struct literals, field reads, `match` and `let` conditions.
     pub fn data(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
         match *self.body.expr(expr) {
-            Expr::Struct { path, fields, base, .. } => self.struct_expr(expr, path, fields, base),
+            Expr::Struct { path, fields, base, .. } => self.struct_expr(expr, path, (fields, base), expected),
             Expr::Field(base, name) => self.field_expr(expr, base, plain(self.src.text(name))),
             Expr::Match(scrutinee, arms) => self.match_expr(scrutinee, arms, expected),
             Expr::Let(pat, init) => self.let_expr(pat, init),

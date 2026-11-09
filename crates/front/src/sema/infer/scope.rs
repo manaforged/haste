@@ -199,9 +199,10 @@ impl<'a> Infer<'_, 'a> {
     pub fn fn_types(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(Vec<Ty>, Ty)> {
         let sig = self.cx.signature(item)?;
         let frame = self.frame(item, substs)?;
-        let types = self.with_frame(frame, |infer| infer.sig_types(&sig))?;
-        if sig.opaque && self.instance.as_ref().is_none_or(|(own, _)| *own != item) {
-            self.opaque_ret(item, substs, types.1)?;
+        let foreign = sig.opaque && self.instance.as_ref().is_none_or(|(own, _)| *own != item);
+        let (types, bound) = self.with_frame(frame, |infer| Ok((infer.sig_types(&sig)?, if foreign { infer.ret_fn_sig(&sig)? } else { None })))?;
+        if foreign {
+            self.opaque_ret(item, substs, (types.1, bound))?;
         }
         Ok(types)
     }

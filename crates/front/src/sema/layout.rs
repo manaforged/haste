@@ -160,7 +160,7 @@ impl Context<'_> {
 
     fn leaf(&mut self, dl: &TargetDataLayout, ty: Ty) -> Result<Option<Layout>> {
         Ok(Some(match self.types.kind(ty).clone() {
-            Kind::Prim(prim) => primitive(dl, prim)?,
+            Kind::Prim(prim) if prim != Primitive::Str => primitive(dl, prim)?,
             Kind::Never => Layout::never_type(dl),
             Kind::FnPtr(..) => Layout::scalar(dl, pointer_scalar(dl, true)),
             Kind::Ref(_, pointee) => self.pointer(dl, true, pointee)?,

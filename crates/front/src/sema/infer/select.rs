@@ -45,17 +45,7 @@ impl<'a> Infer<'_, 'a> {
         if depth > DEPTH || matches!(self.cx.types.kind(self_ty), Kind::Var(_)) {
             return Ok(Vec::new());
         }
-        let holders = self.holders(of, self_ty, args);
-        let blocks = self.cx.trait_impls(of, head(self.cx.types.kind(self_ty)), &holders);
-        let mut found = Vec::new();
-        for block in blocks {
-            let saved = self.vars.clone();
-            let applies = self.impl_applies(block, self_ty, args, depth);
-            let vars = std::mem::replace(&mut self.vars, saved);
-            if let Some(impl_args) = applies? {
-                found.push(((block, impl_args), vars));
-            }
-        }
+        let mut found = self.impl_candidates(of, self_ty, args, depth)?;
         if found.len() > 1 {
             let mut kept = Vec::new();
             for entry in &found {
@@ -67,10 +57,48 @@ impl<'a> Infer<'_, 'a> {
                 found = kept;
             }
         }
-        if found.len() > 1 {
+        if found.len() > 1 && self.same_trait_args(&found, args) {
             found = self.most_specialized(found)?;
         }
         Ok(found)
+    }
+
+    fn impl_candidates(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
+        let holders = self.holders(of, self_ty, args);
+        let blocks = self.cx.trait_impls(of, head(self.cx.types.kind(self_ty)), &holders);
+        let mut found = Vec::new();
+        let blocks: Vec<ImplRef> = blocks.into_iter().filter(|&block| !self.cx.reserved(block)).collect();
+        for block in blocks {
+            let saved = self.vars.clone();
+            let applies = self.impl_applies(block, self_ty, args, depth);
+            let vars = std::mem::replace(&mut self.vars, saved);
+            if let Some(impl_args) = applies? {
+                found.push(((block, impl_args), vars));
+            }
+        }
+        Ok(found)
+    }
+
+    /// The impl of trait `of` at `args` for `self_ty` that defines the member `name`, among those that apply, as a specializing impl inherits it from the impl it specializes.
+    pub(super) fn defining_impl(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], name: &str) -> Result<Option<Picked>> {
+        let self_ty = self.resolve(self_ty);
+        let found = self.impl_candidates(of, self_ty, args, 0)?;
+        let Some((picked, vars)) = found.into_iter().find(|((block, _), _)| self.cx.member(*block, name).is_some()) else { return Ok(None) };
+        self.vars = vars;
+        Ok(Some(picked))
+    }
+
+    /// Whether every impl in `found` sets the trait arguments `args` alike, so that specialization, not inference, picks among them.
+    fn same_trait_args(&mut self, found: &[(Picked, Vars)], args: &[Ty]) -> bool {
+        let saved = self.vars.clone();
+        let mut each = found.iter().map(|(_, vars)| {
+            self.vars = vars.clone();
+            args.iter().map(|&arg| self.substitute(arg)).collect::<Vec<Ty>>()
+        });
+        let first = each.next();
+        let same = each.all(|other| Some(&other) == first.as_ref());
+        self.vars = saved;
+        same
     }
 
     fn most_specialized(&mut self, found: Vec<(Picked, Vars)>) -> Result<Vec<(Picked, Vars)>> {
@@ -216,10 +244,7 @@ impl<'a> Infer<'_, 'a> {
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
             return Ok(true);
         }
-        if self.is_callable_trait(of) {
-            if !matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
-                return Ok(false);
-            }
+        if self.is_callable_trait(of) && matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
             let Some(sig) = self.fn_bound(arena, home, bound)? else { return Ok(true) };
             return Ok(self.tie_callable(ty, sig).is_ok());
         }
@@ -234,8 +259,12 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
         let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
         let given = super::super::ty::object_parts(&parts, &members).0;
-        if object != of {
+        let same_args = object == of || (self.is_callable_trait(object) && self.is_callable_trait(of));
+        if !same_args {
             return Some(args.is_empty() && self.implied_traits(vec![object]).is_ok_and(|traits| traits.contains(&of)));
+        }
+        if object != of && !self.implied_traits(vec![object]).is_ok_and(|traits| traits.contains(&of)) {
+            return Some(false);
         }
         if given.len() != args.len() {
             return Some(false);

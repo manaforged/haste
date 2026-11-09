@@ -509,7 +509,17 @@ impl Infer<'_, '_> {
 
     /// A short spelling of `ty` for messages.
     pub fn show(&self, ty: Ty) -> String {
-        format!("{:?}", self.cx.types.kind(self.resolve(ty)))
+        let list = |tys: &[Ty]| tys.iter().map(|&ty| self.show(ty)).collect::<Vec<_>>().join(", ");
+        match self.cx.types.kind(self.resolve(ty)).clone() {
+            Kind::Adt(item, args) if args.is_empty() => self.cx.name(item).to_owned(),
+            Kind::Adt(item, args) => format!("{}<{}>", self.cx.name(item), list(&args)),
+            Kind::Ref(Mut::Not, inner) => format!("&{}", self.show(inner)),
+            Kind::Ref(Mut::Mut, inner) => format!("&mut {}", self.show(inner)),
+            Kind::Tuple(items) => format!("({})", list(&items)),
+            Kind::Slice(element) => format!("[{}]", self.show(element)),
+            Kind::Prim(primitive) => format!("{primitive:?}").to_lowercase(),
+            other => format!("{other:?}"),
+        }
     }
 
     fn zonk(&mut self, ty: Ty) -> Ty {

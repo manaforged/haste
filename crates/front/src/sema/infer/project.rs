@@ -197,7 +197,13 @@ impl Infer<'_, '_> {
         if let Some(found) = self.builtin_alias(of, ty, name)? {
             return Ok(Some(found));
         }
-        let Some((block, impl_args)) = self.select(of, ty, args)? else { return Ok(None) };
+        let Some(mut picked) = self.select(of, ty, args)? else { return Ok(None) };
+        if self.cx.member(picked.0, name).is_none()
+            && let Some(general) = self.defining_impl(of, ty, args, name)?
+        {
+            picked = general;
+        }
+        let (block, impl_args) = picked;
         let frame = self.impl_frame_of(block, &impl_args, Some(ty))?;
         match self.with_frame(frame, |infer| infer.impl_alias(block, name))? {
             Some(found) => Ok(Some(found)),
@@ -225,7 +231,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// Holds the call of function `item` at `substs` to the bounds on its own type parameters: each trait bound whose types are not known yet becomes an obligation, and each associated type a bound binds, as in `I: Iterator<Item = A>`, is tied to the bound type.
+    /// Holds the call of function `item` at `substs` to the bounds its header puts on any type parameter of its frame, its impl's included: each trait bound whose types are not known yet becomes an obligation, and each associated type a bound binds, as in `I: Iterator<Item = A>`, is tied to the bound type.
     pub(super) fn bind_bounds(&mut self, item: ItemRef, substs: &[Ty]) -> Result<()> {
         let sig = self.cx.signature(item)?;
         if sig.generics.iter().all(|generic| generic.bounds.len == 0) && sig.predicates.is_empty() {
@@ -233,7 +239,7 @@ impl Infer<'_, '_> {
         }
         let frame = self.frame(item, substs)?;
         let (src, home) = (frame.src, frame.home);
-        let params: Vec<(String, Ty)> = sig.generics.iter().filter_map(|generic| frame.generics.iter().find(|(name, _)| *name == src.text(generic.name)).map(|&(name, ty)| (name.to_owned(), ty))).collect();
+        let params: Vec<(String, Ty)> = frame.generics.iter().map(|&(name, ty)| (name.to_owned(), ty)).collect();
         self.with_frame(frame, |infer| {
             for (name, ty) in params {
                 for bound in named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), &name) {

@@ -1,8 +1,12 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Type, Value};
+use rustc_abi::Variants;
+use rustc_index::Idx;
 
 use crate::body::{ExprId, List, PatId};
-use crate::sema::infer::Res;
+use crate::names::ItemRef;
+use crate::sema::infer::{Res, Tried};
+use crate::sema::ty::Ty;
 
 use super::place::Place;
 use super::{Loop, Lower, repr};
@@ -46,21 +50,37 @@ impl Lower<'_, '_> {
         let (Res::Fn(branch, branch_substs), Res::Fn(from, from_substs)) = (&tried.branch, &tried.from_residual) else { bail!("`?` calls are not functions") };
         let value = self.expr(inner)?;
         let flow = self.invoke(*branch, branch_substs, value.into_iter().collect())?;
-        let Some(flow) = self.spill(flow, tried.flow)? else { bail!("`branch` returned no value") };
+        let Some(flow) = self.spill(flow, tried.flow)? else { return self.zero_sized_try(&tried, (*from, from_substs)) };
         let Some(stopped) = self.is_variant(flow, tried.flow, tried.stop)? else { bail!("`?` on a `ControlFlow` with one variant") };
         let (stop, proceed) = (self.b.create_block(), self.b.create_block());
         self.brif(stopped, (stop, &[]), (proceed, &[]));
         self.enter(stop);
         let residual = self.variant_field(flow, tried.flow, (tried.stop, 0))?;
         let residual = self.read(residual);
-        let result = self.invoke(*from, from_substs, residual.into_iter().collect())?;
-        match tried.target {
-            Some(block) => self.leave_try(block, result)?,
-            None => self.finish(result)?,
-        }
+        self.leave_residual(&tried, (*from, from_substs), residual.into_iter().collect())?;
         self.enter(proceed);
         let output = self.variant_field(flow, tried.flow, (tried.proceed, 0))?;
         Ok(self.read(output))
+    }
+
+    /// Lowers `?` on a zero-sized `ControlFlow`, whose one inhabited variant says at compile time whether it proceeds or stops.
+    fn zero_sized_try(&mut self, tried: &Tried, from: (ItemRef, &[Ty])) -> Result<Option<Value>> {
+        if matches!(self.cx.layout(tried.flow)?.variants, Variants::Single { index } if index.index() == tried.proceed as usize) {
+            return Ok(None);
+        }
+        self.leave_residual(tried, from, Vec::new())?;
+        let unreachable = self.b.create_block();
+        self.enter(unreachable);
+        Ok(None)
+    }
+
+    /// Returns `FromResidual::from_residual` on the `Break` value `residual` from the function, or leaves the `try` block with it.
+    fn leave_residual(&mut self, tried: &Tried, (from, from_substs): (ItemRef, &[Ty]), residual: Vec<Value>) -> Result<()> {
+        let result = self.invoke(from, from_substs, residual)?;
+        match tried.target {
+            Some(block) => self.leave_try(block, result),
+            None => self.finish(result),
+        }
     }
 
     /// Lowers `try { .. }`: the block, then `Try::from_output` on its value, joined with the values that each `?` inside it leaves with.

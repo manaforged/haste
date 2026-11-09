@@ -39,6 +39,11 @@ impl Infer<'_, '_> {
         let Some(method) = self.cx.lang_item("from_residual") else { bail!("no `from_residual` lang item") };
         let target = self.try_blocks.last().copied();
         let ret = target.map(|(_, ty)| ty).or(self.out.ret).unwrap_or_else(|| self.cx.types.unit());
+        if let Some(of) = self.cx.owner_trait(method)
+            && (self.has_vars(ret) || self.has_vars(args[0]))
+        {
+            self.obligations.push((of, vec![ret, args[0]]));
+        }
         let from_residual = Res::Fn(method, vec![ret, args[0]]);
         self.out.tries.insert(expr, Tried { branch, from_residual, flow, proceed, stop, target: target.map(|(block, _)| block) });
         Ok(args[1])

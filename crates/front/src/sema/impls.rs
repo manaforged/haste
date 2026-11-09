@@ -83,15 +83,24 @@ impl<'a> Context<'a> {
         if let Some(found) = self.headers.get(&block) {
             return Ok(found.clone());
         }
-        let file = self.impl_file(block);
+        let (file, item) = (self.impl_file(block), self.impl_entry(block));
+        let parsed = Rc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
+        self.headers.insert(block, parsed.clone());
+        Ok(parsed)
+    }
+
+    fn impl_entry(&self, block: ImplRef) -> &'a crate::outline::item::Item {
         let at = match block {
             ImplRef::Module { krate, index } => self.outline.crates[krate as usize].impls[index as usize].at,
             ImplRef::Body(item) => item.outer().map_or(item.item, |(_, at)| at),
         };
-        let item = &file.items.items[at as usize];
-        let parsed = Rc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
-        self.headers.insert(block, parsed.clone());
-        Ok(parsed)
+        &self.impl_file(block).items.items[at as usize]
+    }
+
+    /// Whether impl `block` is a `#[rustc_reservation_impl]`, which selection never picks.
+    pub fn reserved(&self, block: ImplRef) -> bool {
+        let src = &self.impl_file(block).source;
+        self.impl_entry(block).attrs.iter().any(|attr| matches!(attr, crate::outline::item::Attr::Other(at) if src.text(*at) == "rustc_reservation_impl"))
     }
 
     /// The outline file that holds the header of impl `block`.

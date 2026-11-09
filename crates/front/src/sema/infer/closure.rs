@@ -3,6 +3,7 @@ use std::rc::Rc;
 use anyhow::{Result, bail};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use crate::body::sig::Signature;
 use crate::body::{Args, Body, Expr, ExprId, List, Param, PathId, TyId, UnOp};
 use crate::names::{ItemRef, ModRef};
 
@@ -346,6 +347,10 @@ impl Infer<'_, '_> {
             }
             Kind::FnDef(item, substs) => self.fn_types(item, &substs)?,
             Kind::FnPtr(params, ret) => (params, ret),
+            Kind::Var(_) => match self.opaque_sig(ty).map(|sig| self.cx.types.kind(sig).clone()) {
+                Some(Kind::FnPtr(params, ret)) => (params, ret),
+                _ => return Ok(None),
+            },
             _ => return Ok(None),
         }))
     }
@@ -409,7 +414,11 @@ impl Infer<'_, '_> {
 
     /// The function pointer type that an `impl Fn(A) -> B` return type of the body spells, which a closure it returns takes its signature from.
     pub(super) fn opaque_fn_sig(&mut self) -> Result<Option<Ty>> {
-        let sig = self.sig;
+        self.ret_fn_sig(self.sig)
+    }
+
+    /// The function pointer type that an `impl Fn(A) -> B` return type of `sig` spells in the current frame.
+    pub(super) fn ret_fn_sig(&mut self, sig: &Signature) -> Result<Option<Ty>> {
         let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else { return Ok(None) };
         for &bound in sig.body.list(bounds) {
             if let Some(found) = self.fn_bound(&sig.body, self.home, bound)? {

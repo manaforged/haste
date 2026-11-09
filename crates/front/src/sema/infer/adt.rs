@@ -49,7 +49,8 @@ impl<'a> Infer<'_, 'a> {
                 Ok(Some((item, 0, self.adt_args(item, given, true)?)))
             }
             Some(Def::Variant(item, index)) => {
-                let given = if count >= 2 { self.segment_args(arena, path, count - 1)? } else { Vec::new() };
+                let on_enum = if count >= 2 { self.segment_args(arena, path, count - 1)? } else { Vec::new() };
+                let given = if on_enum.is_empty() { self.segment_args(arena, path, count)? } else { on_enum };
                 let args = self.adt_args(item, given, true)?;
                 let variant = self.cx.variant_position(item, index)?;
                 Ok(Some((item, variant as u32, args)))
@@ -100,9 +101,13 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Infers the struct literal `expr`.
-    pub fn struct_expr(&mut self, expr: ExprId, path: PathId, fields: List, base: Option<ExprId>) -> Result<Ty> {
+    pub fn struct_expr(&mut self, expr: ExprId, path: PathId, (fields, base): (List, Option<ExprId>), expected: Option<Ty>) -> Result<Ty> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, false)? else { bail!("struct literal of something that is not a struct") };
+        if let Some(expected) = expected {
+            let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
+            self.trial(|infer| Ok(infer.unify(adt, expected).ok()))?;
+        }
         let tys = self.adt_fields(item, &args)?.swap_remove(variant as usize);
         for &init in body.list(fields) {
             let field = body.fields[init as usize];

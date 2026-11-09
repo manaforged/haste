@@ -95,9 +95,13 @@ impl<'a> Infer<'_, 'a> {
         rest.iter().try_fold(binding.def, |def, segment| paths.member(def, *segment).types.map(|found| found.def))
     }
 
-    /// The bindings that the `use` declarations inside the body give `word`.
+    /// The bindings that the `use` declarations inside the body give `word`, each namespace from the first one that binds it.
     fn body_use(&mut self, word: Sym) -> PerNs {
-        self.body_imports(Some(word)).into_iter().next().unwrap_or_default()
+        self.body_imports(Some(word)).into_iter().fold(PerNs::default(), |found, entry| PerNs {
+            types: found.types.or(entry.types),
+            values: found.values.or(entry.values),
+            macros: found.macros.or(entry.macros),
+        })
     }
 
     /// The traits in scope through the body: those it declares and those its `use` declarations name.
@@ -119,7 +123,7 @@ impl<'a> Infer<'_, 'a> {
         }
         let Ok(home) = self.cx.module_of(root) else { return Vec::new() };
         let paths = self.cx.paths(home.krate);
-        let mut out = Vec::new();
+        let (mut out, mut globs) = (Vec::new(), Vec::new());
         let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()).map(|item| self.cx.item(item).1.start);
         for import in 0..file.items.imports.len() as u32 {
             if !import_visible(file, import, here) {
@@ -143,9 +147,10 @@ impl<'a> Infer<'_, 'a> {
                 },
             };
             if entry.types.is_some() || entry.values.is_some() {
-                out.push(entry);
+                if name.is_some() { out.push(entry) } else { globs.push(entry) }
             }
         }
+        out.extend(globs);
         out
     }
 

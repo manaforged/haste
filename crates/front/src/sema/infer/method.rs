@@ -156,16 +156,17 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn bound_candidates(&mut self, name: &str, steps: &[Ty]) -> Result<Vec<(ItemRef, Ty)>> {
-        let params: Vec<(&str, Ty)> = self.generics.iter().copied().filter(|&(_, ty)| steps.contains(&self.resolve(ty))).collect();
+        let steps: Vec<Ty> = steps.iter().map(|&step| self.substitute(step)).collect();
+        let params: Vec<(&str, Ty)> = self.generics.clone().into_iter().filter(|&(_, ty)| steps.contains(&self.substitute(ty))).collect();
         let mut found = Vec::new();
         for param in params {
             if let Some((of, _)) = self.bound_trait(param, name, Self::reaches_member)? {
-                let ty = self.resolve(param.1);
+                let ty = self.substitute(param.1);
                 found.extend(self.implied_traits(vec![of])?.into_iter().map(|of| (of, ty)));
             }
         }
         let owner = self.instance.as_ref().and_then(|(item, _)| self.cx.owner_trait(*item)).filter(|_| self.block.is_none());
-        if let (Some(of), Some(ty)) = (owner, self.self_ty.map(|ty| self.resolve(ty)))
+        if let (Some(of), Some(ty)) = (owner, self.self_ty.map(|ty| self.substitute(ty)))
             && steps.contains(&ty)
         {
             found.extend(self.implied_traits(vec![of])?.into_iter().map(|of| (of, ty)));
@@ -213,7 +214,7 @@ impl<'a> Infer<'_, 'a> {
             (SelfKind::Ref, Kind::Ref(Mut::Not, inner)) | (SelfKind::RefMut, Kind::Ref(Mut::Mut, inner)) => inner,
             _ => return None,
         };
-        candidate.bound.is_none_or(|param| param == self.resolve(self_ty)).then_some(self_ty)
+        candidate.bound.is_none_or(|param| param == self.substitute(self_ty)).then_some(self_ty)
     }
 
     fn try_receiver(&mut self, candidate: Candidate, adjusted: Ty) -> Result<Option<(Vec<Ty>, Vec<Ty>)>> {
