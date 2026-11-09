@@ -15,7 +15,7 @@ impl Crate {
                 None => self.globs.entry(pending.module).or_default().push(index),
             }
             let asked = self.wanted.get(&pending.module).is_some_and(|names| pending.name.is_none_or(|name| names.contains(&name)));
-            pending.active = self.eager || asked || self.whole.contains(&pending.module);
+            pending.active = asked || self.resolves_all(pending.module);
             self.pending.push(pending);
         }
     }

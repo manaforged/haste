@@ -64,7 +64,7 @@ impl Infer<'_, '_> {
     }
 
     fn object_of(&mut self, of: ItemRef, from: Ty, given: &[Ty]) -> Result<bool> {
-        if !self.cx.lang(of).is_some_and(|lang| super::select::CALLABLE.contains(&lang)) {
+        if !self.is_callable_trait(of) {
             return Ok(self.select(of, from, given)?.is_some());
         }
         let (Some((params, _)), Some(&wanted)) = (self.callable_sig(from)?, given.first()) else { return Ok(false) };

@@ -59,13 +59,8 @@ fn summary(outline: &outline::Outline) -> String {
 
 fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usize) -> Result<()> {
     let started = Instant::now();
-    let mut outline = outline::new(workspace, targets);
-    outline.load_all()?;
+    let (outline, names) = eager_front(workspace, targets)?;
     let elapsed = started.elapsed();
-    let started = Instant::now();
-    let mut names = Names::new(workspace, &outline);
-    names.crates.iter_mut().for_each(|krate| krate.eager = true);
-    names.settle(&mut outline)?;
     for error in outline.crates.iter().flat_map(|krate| &krate.errors) {
         eprintln!("error: {error}");
     }
@@ -81,6 +76,16 @@ fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usiz
     print_outline(workspace, &outline);
     report_bodies(&outline, threads);
     Ok(())
+}
+
+/// Loads every module of every crate and resolves every import.
+fn eager_front(workspace: &graph::Workspace, targets: &Targets) -> Result<(outline::Outline, Names)> {
+    let mut outline = outline::new(workspace, targets);
+    outline.load_all()?;
+    let mut names = Names::new(workspace, &outline);
+    names.crates.iter_mut().for_each(|krate| krate.eager = true);
+    names.settle(&mut outline)?;
+    Ok((outline, names))
 }
 
 /// Loads the member crates' roots and settles names, reading only what their lookups reach.
@@ -164,7 +169,7 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
 }
 
 fn reach_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<(outline::Outline, Names, sema::Store, Vec<ItemRef>)> {
-    let (mut outline, mut names) = demand_front(workspace, targets)?;
+    let (mut outline, mut names) = eager_front(workspace, targets)?;
     let cases = case_items(workspace, &outline);
     let roots: Vec<Instance> = cases.iter().map(|item| (*item, Vec::new())).collect();
     let mut store = sema::Store::default();

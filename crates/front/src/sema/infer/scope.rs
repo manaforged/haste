@@ -140,18 +140,19 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The headers whose generic parameters and where clauses the frame's type parameters come from: the item's own, its impl's, and its trait's.
-    pub(super) fn headers(&mut self) -> Result<Vec<Header>> {
+    pub(super) fn headers(&mut self) -> Result<Vec<(Header, &'a Source)>> {
         let mut headers = Vec::new();
         if let Some(item) = self.frame_item {
-            headers.push(match self.cx.item(item).1.kind {
+            let header = match self.cx.item(item).1.kind {
                 ItemKind::Struct | ItemKind::Enum | ItemKind::Union => Header::Adt(self.cx.adt_def(item)?),
                 _ => Header::Fn(self.cx.signature(item)?),
-            });
+            };
+            headers.push((header, &self.cx.file(item).source));
         }
         if let Some(block) = self.block {
-            headers.push(Header::Impl(self.cx.impl_header(block)?));
+            headers.push((Header::Impl(self.cx.impl_header(block)?), &self.cx.impl_file(block).source));
         } else if let Some(of) = self.frame_item.and_then(|item| self.cx.owner_trait(item)) {
-            headers.push(Header::Trait(self.cx.trait_generics(of)?));
+            headers.push((Header::Trait(self.cx.trait_generics(of)?), &self.cx.file(of).source));
         }
         Ok(headers)
     }
@@ -159,11 +160,11 @@ impl<'a> Infer<'_, 'a> {
     /// The declared type and the value of the const parameter `name` of the frame, when it has one.
     pub(super) fn const_param(&mut self, name: &str) -> Result<Option<(Ty, Ty)>> {
         let Some(&(_, value)) = self.generics.iter().find(|(generic, _)| *generic == name) else { return Ok(None) };
-        for header in self.headers()? {
+        for (header, src) in self.headers()? {
             let (arena, generics, _) = header.parts();
-            let declared = generics.iter().find(|generic| self.src.text(generic.name) == name).map(|generic| generic.kind);
+            let declared = generics.iter().find(|generic| src.text(generic.name) == name).map(|generic| generic.kind);
             if let Some(GenericKind::Const(ty)) = declared {
-                return Ok(Some((self.lower_ty(arena, ty)?, value)));
+                return Ok(Some((self.in_source(src, |infer| infer.lower_ty(arena, ty))?, value)));
             }
         }
         Ok(None)
@@ -175,6 +176,15 @@ impl<'a> Infer<'_, 'a> {
         let result = run(self);
         self.swap_frame(saved);
         result
+    }
+
+    /// Runs `run` in the current frame with token text read from `src`, the source of the syntax it lowers.
+    pub(super) fn in_source<T>(&mut self, src: &'a Source, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if std::ptr::eq(self.src, src) {
+            return run(self);
+        }
+        let frame = Frame { src, home: self.home, generics: self.generics.clone(), self_ty: self.self_ty, block: self.block, item: self.frame_item, root: self.root };
+        self.with_frame(frame, run)
     }
 
     /// Reads names through `frame` from now on, and returns the frame it replaces.

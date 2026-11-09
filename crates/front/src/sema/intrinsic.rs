@@ -53,6 +53,7 @@ pub enum Intrinsic {
     RawPointer,
     DiscriminantValue,
     CompareBytes,
+    RawEq,
     Atomic(Atomic),
     SliceElement,
     Simd(Simd),
@@ -75,7 +76,7 @@ pub enum Atomic {
     Exchange,
 }
 
-const NAMES: [(&str, Intrinsic); 110] = {
+const NAMES: [(&str, Intrinsic); 111] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -132,6 +133,7 @@ const NAMES: [(&str, Intrinsic); 110] = {
         ("size_of_val", SizeOfVal),
         ("discriminant_value", DiscriminantValue),
         ("compare_bytes", CompareBytes),
+        ("raw_eq", RawEq),
         ("align_of_val", AlignOfVal),
         ("min_align_of_val", AlignOfVal),
         ("needs_drop", NeedsDrop),

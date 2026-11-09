@@ -199,7 +199,7 @@ impl<'a> Paths<'a> {
         let mut found = Vec::new();
         for module in std::iter::once(at).chain(self.prelude) {
             let Some(entry) = self.done.get(module.krate as usize) else { continue };
-            if !entry.whole.contains(&module.module) && let Some(demands) = self.demands {
+            if !entry.resolves_all(module.module) && let Some(demands) = self.demands {
                 demands.scopes.borrow_mut().push(module);
             }
             let named = self.scope(module).into_iter().flat_map(|scope| scope.names.values()).filter_map(|names| names.types.map(|binding| binding.def));

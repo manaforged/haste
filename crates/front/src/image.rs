@@ -60,6 +60,11 @@ impl Slots for Image {
     }
 }
 
+fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, String> {
+    let (src, entry) = cx.item(item);
+    entry.name.and_then(|at| crate::host::symbol(src.text(at))).ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
+}
+
 impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Image {
@@ -69,6 +74,7 @@ impl Image {
 
     /// Lowers and encodes every reached function that type-checked, and returns the errors of those that did not compile, by index.
     pub fn compile(&mut self, cx: &mut Context<'_>, reached: &Reached) -> Vec<(usize, String)> {
+        self.bind_foreign_statics(cx, reached);
         let mut errors = Vec::new();
         for index in 0..reached.list.len() {
             if reached.list[index].1.is_err() {
@@ -76,10 +82,10 @@ impl Image {
             }
             let item = reached.list[index].0.0;
             if cx.foreign(item) {
-                let (src, entry) = cx.item(item);
-                match entry.name.and_then(|at| crate::host::symbol(src.text(at))) {
-                    Some(address) => self.table[index].store(address, Ordering::Release),
-                    None => errors.push((index, format!("{}: no host symbol links to it", cx.name(item)))),
+                match host_symbol(cx, item) {
+                    Ok(address) if !lower::is_static(cx, item) => self.table[index].store(address, Ordering::Release),
+                    Ok(_) => {}
+                    Err(error) => errors.push((index, error)),
                 }
                 continue;
             }
@@ -94,6 +100,20 @@ impl Image {
         }
         self.link();
         errors
+    }
+
+    fn bind_foreign_statics(&self, cx: &Context<'_>, reached: &Reached) {
+        for (index, ((item, _), typed)) in reached.list.iter().enumerate() {
+            if typed.is_err() || !cx.foreign(*item) || !lower::is_static(cx, *item) {
+                continue;
+            }
+            let cell = match (host_symbol(cx, *item), cx.attr_value(*item, "linkage") == Some("extern_weak")) {
+                (found, true) => self.data(&found.unwrap_or(0).to_le_bytes()),
+                (Ok(address), false) => address as i64,
+                (Err(_), false) => continue,
+            };
+            self.cells.borrow_mut().insert(index, cell);
+        }
     }
 
     fn link(&mut self) {

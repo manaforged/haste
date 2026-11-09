@@ -339,6 +339,7 @@ impl Cursor<'_> {
         (self.at, self.end) = (block, self.src.pair(block) + 1);
         let expr = self.block_expr(None, BlockKind::Plain);
         (self.at, self.end) = (at, end);
+        self.expansion = expr.as_ref().ok().copied();
         expr
     }
 

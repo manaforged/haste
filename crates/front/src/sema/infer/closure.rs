@@ -3,7 +3,7 @@ use std::rc::Rc;
 use anyhow::{Result, bail};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::body::{Args, Body, Bound, Expr, ExprId, List, Param, TyId, UnOp};
+use crate::body::{Args, Body, Expr, ExprId, List, Param, TyId, UnOp};
 use crate::names::{ItemRef, ModRef};
 
 use super::super::Context;
@@ -235,7 +235,7 @@ impl Infer<'_, '_> {
         let expected = self.ret_sig.filter(|_| own_ret).unwrap_or(expected);
         match self.cx.types.kind(expected).clone() {
             Kind::FnPtr(inputs, output) => Some((inputs, output)),
-            Kind::Dyn(of, parts, members) if self.cx.lang(of).is_some_and(|lang| super::select::CALLABLE.contains(&lang)) => {
+            Kind::Dyn(of, parts, members) if self.is_callable_trait(of) => {
                 let (given, mut bound) = super::super::ty::object_parts(&parts, &members);
                 let Kind::Tuple(inputs) = self.cx.types.kind(self.resolve(*given.first()?)).clone() else { return None };
                 let output = bound.next().map_or_else(|| self.cx.types.unit(), |(_, ty)| ty);
@@ -325,10 +325,11 @@ impl Infer<'_, '_> {
         self.unify(ret, output)
     }
 
-    /// The parameters and return type of the closure, function item or function pointer `ty`.
+    /// The parameters and return type of the closure, function item or function pointer `ty`, or the one a reference to it calls.
     pub(super) fn callable_sig(&mut self, ty: Ty) -> Result<Option<(Vec<Ty>, Ty)>> {
         let ty = self.resolve(ty);
         Ok(Some(match self.cx.types.kind(ty).clone() {
+            Kind::Ref(_, inner) => return self.callable_sig(inner),
             Kind::Closure(..) => {
                 let (params, ret, _) = self.closure_sig(ty)?;
                 (params, ret)
@@ -398,9 +399,8 @@ impl Infer<'_, '_> {
     }
 
     pub(super) fn fn_bound(&mut self, arena: &Body, home: ModRef, bound: u32) -> Result<Option<Ty>> {
-        let Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else { return Ok(None) };
-        let Some(of) = self.trait_named(arena, path, home) else { return Ok(None) };
-        if !self.cx.lang(of).is_some_and(|lang| super::select::CALLABLE.contains(&lang)) {
+        let Some((of, path)) = self.bound_trait_at(arena, bound, home) else { return Ok(None) };
+        if !self.is_callable_trait(of) {
             return Ok(None);
         }
         let Some(&last) = arena.list(arena.path(path).segments).last() else { return Ok(None) };

@@ -439,13 +439,24 @@ impl Infer<'_, '_> {
                 continue;
             }
             let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
-            if self.select(of, self_ty, &substs[1..])?.is_some() || known {
+            if self.select(of, self_ty, &substs[1..])?.is_some() || known || self.assume(of, &substs)? {
                 self.obligations.swap_remove(at);
             } else {
                 at += 1;
             }
         }
         Ok(())
+    }
+
+    /// Ties `substs` of trait `of` to the one bound of the frame they match, and whether one did.
+    pub(super) fn assume(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
+        for (held, types) in self.assumptions()? {
+            let holds = |infer: &mut Self| Ok(substs.iter().zip(&types).all(|(&a, &b)| infer.unify(a, b).is_ok()).then_some(()));
+            if held == of && self.trial(holds)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn has_vars(&self, ty: Ty) -> bool {
@@ -475,26 +486,36 @@ impl Infer<'_, '_> {
     }
 
     fn zonk(&mut self, ty: Ty) -> Ty {
+        self.fill(ty, true)
+    }
+
+    /// `ty` with every bound inference variable replaced by its binding, and the unbound ones kept.
+    pub(super) fn substitute(&mut self, ty: Ty) -> Ty {
+        self.fill(ty, false)
+    }
+
+    fn fill(&mut self, ty: Ty, fall_back: bool) -> Ty {
         let ty = self.resolve(ty);
         let kind = self.cx.types.kind(ty).clone();
         let fallback = match kind {
-            Kind::IntVar(_) => Some(self.cx.types.prim(Primitive::I32)),
-            Kind::FloatVar(_) => Some(self.cx.types.prim(Primitive::F64)),
-            Kind::Var(_) => Some(self.cx.types.unit()),
-            _ => None,
+            Kind::IntVar(_) => self.cx.types.prim(Primitive::I32),
+            Kind::FloatVar(_) => self.cx.types.prim(Primitive::F64),
+            Kind::Var(_) => self.cx.types.unit(),
+            _ => {
+                let kind = kind.map(|item| self.fill(item, fall_back));
+                return self.cx.types.intern(kind);
+            }
         };
-        if let Some(fallback) = fallback {
-            return fallback;
-        }
-        let kind = kind.map(|item| self.zonk(item));
-        self.cx.types.intern(kind)
+        if fall_back { fallback } else { ty }
     }
 
     fn finish(mut self) -> Result<Typed> {
         self.settle_projections()?;
         self.settle_opaques(true)?;
-        self.settle_operators(true)?;
+        self.settle_operators(false)?;
+        self.settle_obligations()?;
         self.fall_back_numbers()?;
+        self.settle_operators(true)?;
         self.settle_projections()?;
         self.zonk_types()?;
         self.zonk_calls()?;
@@ -601,7 +622,7 @@ fn dyn_members(kind: &Kind) -> &[ItemRef] {
     }
 }
 
-/// Whether the struct `item` may end in an unsized field, which its definition decides for every instantiation as rustc's layout does.
+/// Whether the struct `item` may end in an unsized field, which its definition decides for every instantiation as rustc's layout does; with no `?Sized` parameter, a tail the stand-ins cannot lower, such as a projection on one, is sized.
 pub fn maybe_unsized(cx: &mut Context<'_>, item: ItemRef) -> Result<bool> {
     if cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
         return Ok(false);
@@ -610,13 +631,17 @@ pub fn maybe_unsized(cx: &mut Context<'_>, item: ItemRef) -> Result<bool> {
     let src = &cx.file(item).source;
     let byte = cx.types.intern(Kind::Prim(Primitive::U8));
     let stand_ins = [cx.types.intern(Kind::Value(1)), cx.types.intern(Kind::Slice(byte)), byte];
-    let args = scope::type_params(&def.generics.params).map(|generic| match generic.kind {
+    let args: Vec<Ty> = scope::type_params(&def.generics.params).map(|generic| match generic.kind {
         crate::body::sig::GenericKind::Const(_) => stand_ins[0],
         _ if relaxed(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
         _ => stand_ins[2],
-    });
-    let ty = cx.types.intern(Kind::Adt(item, args.collect()));
-    cx.is_unsized(ty)
+    }).collect();
+    let any_relaxed = args.contains(&stand_ins[1]);
+    let ty = cx.types.intern(Kind::Adt(item, args));
+    match cx.is_unsized(ty) {
+        Err(_) if !any_relaxed => Ok(false),
+        found => found,
+    }
 }
 
 fn relaxed(arena: &Body, src: &Source, predicates: &[crate::body::sig::Predicate], generic: &crate::body::sig::Generic) -> bool {

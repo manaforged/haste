@@ -17,7 +17,7 @@ impl<'a> Infer<'_, 'a> {
     pub fn adt_fields(&mut self, item: ItemRef, args: &[Ty]) -> Result<Vec<Vec<Ty>>> {
         let def = self.cx.adt_def(item)?;
         let frame = self.adt_frame(item, &def.generics.params, args)?;
-        self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty)).collect()).collect())
+        self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty).map(|ty| infer.substitute(ty))).collect()).collect())
     }
 
     /// The type of the last field of the first variant of `item` at `args`, the only field that can make a struct unsized.
@@ -25,7 +25,7 @@ impl<'a> Infer<'_, 'a> {
         let def = self.cx.adt_def(item)?;
         let Some(last) = def.variants.first().and_then(|variant| variant.fields.last()) else { return Ok(None) };
         let frame = self.adt_frame(item, &def.generics.params, args)?;
-        self.with_frame(frame, |infer| infer.lower_ty(&def.body, last.ty)).map(Some)
+        self.with_frame(frame, |infer| infer.lower_ty(&def.body, last.ty).map(|ty| infer.substitute(ty))).map(Some)
     }
 
     fn adt_frame(&mut self, item: ItemRef, params: &[crate::body::sig::Generic], args: &[Ty]) -> Result<super::scope::Frame<'a>> {

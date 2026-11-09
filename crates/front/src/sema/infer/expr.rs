@@ -177,7 +177,7 @@ impl Infer<'_, '_> {
         let shift = matches!(op, BinOp::Shl | BinOp::Shr);
         let hint = (self.builtin_left(op, left) && !shift).then_some(left);
         let right = self.expr(rhs, hint)?;
-        if matches!(self.cx.types.kind(self.resolve(left)), Kind::Var(_)) {
+        if self.pending(op, (left, right))? {
             let out = if is_compare(op) { self.cx.types.bool() } else { self.fresh(Kind::Var) };
             self.operands.push((expr, op, (left, right), out));
             return Ok(out);
@@ -202,21 +202,45 @@ impl Infer<'_, '_> {
 
     /// Types each operator whose left operand was not known when it was read, once it is.
     pub(super) fn settle_operators(&mut self, force: bool) -> Result<()> {
-        let mut at = 0;
-        while at < self.operands.len() {
-            let (expr, op, operands, out) = self.operands[at];
-            if matches!(self.cx.types.kind(self.resolve(operands.0)), Kind::Var(_)) {
-                if force {
-                    bail!("the type of the left operand of {op:?} is not known");
+        loop {
+            let before = self.operands.len();
+            let mut at = 0;
+            while at < self.operands.len() {
+                let (expr, op, operands, out) = self.operands[at];
+                if self.pending(op, operands)? {
+                    at += 1;
+                    continue;
                 }
-                at += 1;
-                continue;
+                self.operands.swap_remove(at);
+                let found = self.operator_type(expr, op, operands)?;
+                self.unify(found, out)?;
             }
-            self.operands.swap_remove(at);
-            let found = self.operator_type(expr, op, operands)?;
-            self.unify(found, out)?;
+            if self.operands.is_empty() || self.operands.len() == before {
+                break;
+            }
         }
-        Ok(())
+        match self.operands.first() {
+            Some((_, op, ..)) if force => bail!("the type of the left operand of {op:?} is not known"),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether operator `op` on `left` and `right` must wait to pick its impl: the left operand is a variable or a reference to one, or several impls fit only because the right operand is an untyped number.
+    fn pending(&mut self, op: BinOp, (left, right): (Ty, Ty)) -> Result<bool> {
+        let unknown_left = match self.cx.types.kind(self.resolve(left)) {
+            Kind::Var(_) => true,
+            Kind::Ref(_, inner) => matches!(self.cx.types.kind(self.resolve(*inner)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)),
+            _ => false,
+        };
+        if unknown_left {
+            return Ok(true);
+        }
+        if self.builtin_left(op, left) || !matches!(self.cx.types.kind(self.resolve(right)), Kind::IntVar(_) | Kind::FloatVar(_)) {
+            return Ok(false);
+        }
+        let Some((lang, _)) = operator_trait(op) else { return Ok(false) };
+        let Some(of) = self.cx.lang_item(lang) else { return Ok(false) };
+        Ok(self.probe(|infer| infer.select(of, left, &[right]))?.is_none())
     }
 
     fn overloaded(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
@@ -279,7 +303,7 @@ impl Infer<'_, '_> {
         let callee_ty = self.callee_base(expr, found);
         let (params, ret, def) = match self.cx.types.kind(callee_ty).clone() {
             Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
-            Kind::Dyn(of, ..) if self.cx.lang(of).is_some_and(|lang| super::select::CALLABLE.contains(&lang)) => return self.object_call((expr, found), callee_ty, args),
+            Kind::Dyn(of, ..) if self.is_callable_trait(of) => return self.object_call((expr, found), callee_ty, args),
             Kind::FnDef(item, substs) => {
                 if !matches!(self.out.res.get(&callee), Some(Res::Fn(..))) {
                     self.out.res.insert(expr, Res::Fn(item, substs.clone()));

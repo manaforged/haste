@@ -13,6 +13,8 @@ pub struct Cursor<'a> {
     pub body: Body,
     pub no_struct: bool,
     pub config: super::Config<'a>,
+    /// The block that the last macro expansion parsed to, which a statement macro splices into its enclosing block.
+    pub expansion: Option<ExprId>,
 }
 
 /// Whether `kind` is an identifier.
@@ -26,7 +28,7 @@ pub const RESERVED: [&str; 38] = [
 
 impl<'a> Cursor<'a> {
     pub fn new(src: &'a Source, at: u32, end: u32) -> Cursor<'a> {
-        Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false, config: super::Config::default() }
+        Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false, config: super::Config::default(), expansion: None }
     }
 
     /// Whether the outer attributes at `attrs` hold a `#[cfg]` that the environment turns off.

@@ -31,17 +31,19 @@ impl<'a> Infer<'_, 'a> {
         let (segments, absolute, dollar) = self.segments(arena, path);
         let found = self.value_def(&segments, absolute, dollar);
         let [name] = segments[..] else { return found };
-        let first = arena.list(arena.path(path).segments)[0];
-        match (found, self.src.mark(arena.segments[first as usize].name)) {
-            (Err(error), Some(Mark::Home { krate, file, item })) => self.home_value(ItemRef { krate, file, item }, name).ok_or(error),
-            (found, _) => found,
+        match found {
+            Err(error) => self.def_site(arena, path, name).and_then(|found| found.values).map(|binding| binding.def).ok_or(error),
+            found => found,
         }
     }
 
-    fn home_value(&mut self, written_by: ItemRef, name: Sym) -> Option<Def> {
-        let module = self.cx.module_of(written_by).ok()?;
+    /// The bindings of the single name `name` at `path` in the module of the `macro` item that wrote it, when one did.
+    fn def_site(&mut self, arena: &Body, path: PathId, name: Sym) -> Option<PerNs> {
+        let first = arena.list(arena.path(path).segments)[0];
+        let Some(Mark::Home { krate, file, item }) = self.src.mark(arena.segments[first as usize].name) else { return None };
+        let module = self.cx.module_of(ItemRef { krate, file, item }).ok()?;
         let path = NamePath { segments: &[name], absolute: false, dollar: None };
-        Some(self.cx.paths(module.krate).first(name, module, &path).values?.def)
+        Some(self.cx.paths(module.krate).first(name, module, &path))
     }
 
     /// The item in the value namespace that the path `segments` names.
@@ -360,14 +362,15 @@ impl<'a> Infer<'_, 'a> {
         Ok(Kind::Dyn(of, given.into_iter().chain(tys).collect(), members))
     }
 
-    /// The type that the associated type `name` of impl `block` is, read in the current frame, when the impl has one.
+    /// The type that the associated type `name` of impl `block` is, read in the current frame over the alias's own source, when the impl has one.
     pub(super) fn impl_alias(&mut self, block: ImplRef, name: &str) -> Result<Option<Ty>> {
         let Some(member) = self.cx.member(block, name) else { return Ok(None) };
         if self.cx.item(member).1.kind != ItemKind::Type {
             return Ok(None);
         }
         let (_, arena, ty) = self.cx.alias_parts(member)?;
-        self.lower_ty(&arena, ty).map(Some)
+        let src = &self.cx.file(member).source;
+        self.in_source(src, |infer| infer.lower_ty(&arena, ty)).map(Some)
     }
 
     /// The type that the type alias `item` names at the type arguments `given`, with fresh ones for the rest.
@@ -416,6 +419,7 @@ impl<'a> Infer<'_, 'a> {
         let def = self.type_def(&NamePath { segments: &segments, absolute, dollar });
         let def = match (def, &segments[..]) {
             (Some(Def::Module(_)), [name]) => crate::names::Symbols::primitive(*name).map(Def::Primitive).or(def),
+            (None, [name]) => self.def_site(arena, path, *name).and_then(|found| found.types).map(|binding| binding.def),
             _ => def,
         };
         match def {

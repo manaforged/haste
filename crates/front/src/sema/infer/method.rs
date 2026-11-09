@@ -16,12 +16,13 @@ pub struct Adjust {
     pub autoref: Option<Mut>,
 }
 
-/// A trait method a call may pick: its trait, its declaration in the trait and how it takes `self`.
+/// A trait method a call may pick: its trait, its declaration in the trait, how it takes `self`, and the type of the parameter whose bound names the trait, which is then its `Self`.
 #[derive(Clone, Copy)]
 struct TraitCandidate {
     of: ItemRef,
     item: ItemRef,
     kind: SelfKind,
+    bound: Option<Ty>,
 }
 
 /// The method a call picked: its item, the arguments of its impl or trait, the arguments of its own type parameters when its receiver type named them, and how it borrows the receiver.
@@ -123,7 +124,7 @@ impl<'a> Infer<'_, 'a> {
         }).collect();
         let bounded = self.bound_candidates(name, steps)?;
         let current = self.current_trait();
-        for local in self.body_traits().into_iter().chain(principals).chain(bounded).chain(current) {
+        for local in self.body_traits().into_iter().chain(principals).chain(bounded.iter().map(|&(of, _)| of)).chain(current) {
             if !traits.contains(&local) {
                 traits.push(local);
             }
@@ -131,7 +132,8 @@ impl<'a> Infer<'_, 'a> {
         for of in traits {
             let Some(item) = self.cx.trait_member(of, name) else { continue };
             if let Some((kind, _)) = self.cx.signature(item)?.receiver {
-                found.push(TraitCandidate { of, item, kind });
+                let bound = bounded.iter().find(|&&(bounded, _)| bounded == of).map(|&(_, param)| param);
+                found.push(TraitCandidate { of, item, kind, bound });
             }
         }
         Ok(found)
@@ -142,12 +144,13 @@ impl<'a> Infer<'_, 'a> {
         self.block.and_then(|block| self.cx.impl_trait(block)).or(owner)
     }
 
-    fn bound_candidates(&mut self, name: &str, steps: &[Ty]) -> Result<Vec<ItemRef>> {
+    fn bound_candidates(&mut self, name: &str, steps: &[Ty]) -> Result<Vec<(ItemRef, Ty)>> {
         let params: Vec<(&str, Ty)> = self.generics.iter().copied().filter(|&(_, ty)| steps.contains(&self.resolve(ty))).collect();
         let mut found = Vec::new();
         for param in params {
-            if let Some((of, _)) = self.bound_trait(param, name, Self::has_member)? {
-                found.push(of);
+            if let Some((of, _)) = self.bound_trait(param, name, Self::reaches_member)? {
+                let ty = self.resolve(param.1);
+                found.extend(self.implied_traits(vec![of])?.into_iter().map(|of| (of, ty)));
             }
         }
         Ok(found)
@@ -157,7 +160,7 @@ impl<'a> Infer<'_, 'a> {
     pub fn trait_method(&mut self, method: ItemRef, receiver: Ty) -> Result<Option<(ItemRef, Vec<Ty>)>> {
         let Some(of) = self.cx.owner_trait(method) else { bail!("{} is not a trait method", self.cx.name(method)) };
         let Some((kind, _)) = self.cx.signature(method)?.receiver else { bail!("{} takes no `self`", self.cx.name(method)) };
-        let Some((item, mut substs)) = self.try_trait(TraitCandidate { of, item: method, kind }, receiver)? else { return Ok(None) };
+        let Some((item, mut substs)) = self.try_trait(TraitCandidate { of, item: method, kind, bound: None }, receiver)? else { return Ok(None) };
         let own = type_params(&self.cx.signature(item)?.generics).count();
         substs.extend((0..own).map(|_| self.fresh(Kind::Var)));
         Ok(Some((item, substs)))
@@ -169,8 +172,13 @@ impl<'a> Infer<'_, 'a> {
             (SelfKind::Ref, Kind::Ref(Mut::Not, inner)) | (SelfKind::RefMut, Kind::Ref(Mut::Mut, inner)) => inner,
             _ => return Ok(None),
         };
-        let count = type_params(&self.cx.trait_generics(candidate.of)?.1.params).count();
-        let args: Vec<Ty> = (0..count).map(|_| self.fresh(Kind::Var)).collect();
+        if candidate.bound.is_some_and(|param| param != self.resolve(self_ty)) {
+            return Ok(None);
+        }
+        let args = self.fresh_trait_args(candidate.of)?;
+        if candidate.bound.is_some() {
+            self.assume(candidate.of, &std::iter::once(self_ty).chain(args.iter().copied()).collect::<Vec<_>>())?;
+        }
         if let Some(held) = self.object_holds(candidate.of, self_ty, &args) {
             return Ok(held.then(|| (candidate.item, std::iter::once(self_ty).chain(args).collect())));
         }
@@ -221,6 +229,7 @@ impl<'a> Infer<'_, 'a> {
             self.unify(from, to)?;
         }
         substs.extend(given);
+        self.bind_bounds(item, &substs)?;
         self.out.res.insert(expr, Res::Fn(item, substs.clone()));
         self.out.adjusts.insert(expr, adjust);
         if let (Some(Mut::Mut), crate::body::Expr::Method { receiver, .. }) = (adjust.autoref, *self.body.expr(expr)) {

@@ -292,9 +292,14 @@ pub struct Crate {
 }
 
 impl Crate {
-    /// Whether a lookup of `name` in `module` already made its imports resolve.
+    /// Whether the imports that can bind `name` in `module` resolve: in an eager crate all do, elsewhere those a lookup asked for.
     pub fn wants(&self, module: u32, name: Sym) -> bool {
-        self.wanted.get(&module).is_some_and(|names| names.contains(&name))
+        self.eager || self.wanted.get(&module).is_some_and(|names| names.contains(&name))
+    }
+
+    /// Whether every import of `module` resolves: in an eager crate, or once a lookup asked for its whole scope.
+    pub fn resolves_all(&self, module: u32) -> bool {
+        self.eager || self.whole.contains(&module)
     }
 }
 

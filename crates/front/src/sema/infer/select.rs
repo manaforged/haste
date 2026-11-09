@@ -18,7 +18,7 @@ type Vars = Vec<Option<Ty>>;
 const DEPTH: u32 = 8;
 
 /// The traits that closures, function items and function pointers implement by the compiler, with no impl to select.
-pub(super) const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
+const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
 
 const BUILTIN: [&str; 12] = ["sized", "meta_sized", "pointee_sized", "copy", "clone", "destruct", "tuple_trait", "freeze", "pointee_trait", "unsize", "sync", "unpin"];
 
@@ -68,11 +68,42 @@ impl<'a> Infer<'_, 'a> {
             }
         }
         if found.len() > 1 {
-            found.retain(|((block, _), _)| !self.cx.specializable(*block));
+            found = self.most_specialized(found)?;
         }
         Ok(found)
     }
 
+    fn most_specialized(&mut self, found: Vec<(Picked, Vars)>) -> Result<Vec<(Picked, Vars)>> {
+        let mut facts = Vec::new();
+        for ((block, impl_args), _) in &found {
+            let direct = self.impl_bound_traits(*block, impl_args)?;
+            let implied = self.implied_traits(direct.clone())?;
+            facts.push(Specialty { default: self.cx.specializable(*block), direct, implied });
+        }
+        let kept = (0..found.len()).map(|at| !facts.iter().enumerate().any(|(by, other)| by != at && other.specializes(&facts[at])));
+        Ok(found.into_iter().zip(kept.collect::<Vec<_>>()).filter_map(|(entry, keep)| keep.then_some(entry)).collect())
+    }
+
+    fn impl_bound_traits(&mut self, block: ImplRef, impl_args: &[Ty]) -> Result<Vec<ItemRef>> {
+        let header = self.cx.impl_header(block)?;
+        let frame = self.impl_frame_of(block, impl_args, None)?;
+        let home = frame.home;
+        let on_params = type_params(&header.generics).flat_map(|generic| header.body.list(generic.bounds).iter().copied());
+        let bounds: Vec<u32> = on_params.chain(header.predicates.iter().flat_map(|predicate| header.body.list(predicate.bounds).iter().copied())).collect();
+        self.with_frame(frame, |infer| Ok(bounds.into_iter().filter_map(|bound| infer.bound_trait_at(&header.body, bound, home)).map(|(of, _)| of).collect()))
+    }
+
+    /// The traits in `stack` with every supertrait they imply.
+    pub(super) fn implied_traits(&mut self, mut stack: Vec<ItemRef>) -> Result<Vec<ItemRef>> {
+        let mut found = Vec::new();
+        while let Some(of) = stack.pop() {
+            if !found.contains(&of) {
+                found.push(of);
+                stack.extend(self.parent_traits(of)?);
+            }
+        }
+        Ok(found)
+    }
     fn blanket(&mut self, block: ImplRef) -> Result<bool> {
         let count = self.impl_params(block)?;
         let args: Vec<Ty> = (0..count).map(|_| self.fresh(Kind::Var)).collect();
@@ -177,16 +208,15 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn bound_holds(&mut self, arena: &Body, home: ModRef, (ty, bound): (Ty, u32), depth: u32) -> Result<bool> {
-        let Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else { return Ok(true) };
-        let Some(of) = self.trait_named(arena, path, home) else { return Ok(true) };
-        if self.cx.lang(of).is_some_and(|lang| BUILTIN.contains(&lang)) || self.cx.is_auto_trait(of) {
+        let Some((of, path)) = self.bound_trait_at(arena, bound, home) else { return Ok(true) };
+        if self.compiler_trait(of) {
             return Ok(true);
         }
         let kind = self.cx.types.kind(self.resolve(ty));
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
             return Ok(true);
         }
-        if self.cx.lang(of).is_some_and(|lang| CALLABLE.contains(&lang)) {
+        if self.is_callable_trait(of) {
             if !matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
                 return Ok(false);
             }
@@ -211,6 +241,22 @@ impl<'a> Infer<'_, 'a> {
         Some(matches!(held, Ok(Some(()))))
     }
 
+    /// Whether trait `of` is one the compiler proves for every type that reaches selection: a marker such as `Sized` or `Copy`, or an auto trait.
+    pub(super) fn compiler_trait(&self, of: ItemRef) -> bool {
+        self.cx.lang(of).is_some_and(|lang| BUILTIN.contains(&lang)) || self.cx.is_auto_trait(of)
+    }
+
+    /// Whether trait `of` is `Fn`, `FnMut` or `FnOnce`, which callables implement with no impl to select.
+    pub(super) fn is_callable_trait(&self, of: ItemRef) -> bool {
+        self.cx.lang(of).is_some_and(|lang| CALLABLE.contains(&lang))
+    }
+
+    /// The trait that bound `bound` in `arena` requires from module `home`, with its path, or none for a lifetime, a `?Sized` or a name that is not a trait.
+    pub(super) fn bound_trait_at(&mut self, arena: &Body, bound: u32, home: ModRef) -> Option<(ItemRef, PathId)> {
+        let Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else { return None };
+        Some((self.trait_named(arena, path, home)?, path))
+    }
+
     /// The trait that `path` in `arena` names from module `home`.
     pub fn trait_named(&mut self, arena: &Body, path: PathId, home: ModRef) -> Option<ItemRef> {
         let (segments, absolute, dollar) = self.segments(arena, path);
@@ -224,5 +270,23 @@ impl<'a> Infer<'_, 'a> {
             Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Trait => Some(item),
             _ => None,
         }
+    }
+}
+
+/// What ranks one applicable impl against another under specialization: whether it has `default` items, the traits its bounds name, and those with every supertrait.
+struct Specialty {
+    default: bool,
+    direct: Vec<ItemRef>,
+    implied: Vec<ItemRef>,
+}
+
+impl Specialty {
+    /// Whether this impl specializes `other`: `other` has `default` items, and this one has none or its bounds imply the bounds of `other` and not the reverse.
+    fn specializes(&self, other: &Specialty) -> bool {
+        other.default && (!self.default || (self.covers(other) && !other.covers(self)))
+    }
+
+    fn covers(&self, other: &Specialty) -> bool {
+        other.direct.iter().all(|of| self.implied.contains(of))
     }
 }

@@ -30,7 +30,7 @@ impl Lower<'_, '_> {
             Expr::TupleField(base, index) => (base, index),
             _ => return None,
         };
-        if matches!(self.cx.types.kind(self.ty_of(base)), Kind::Ref(..) | Kind::Ptr(..)) {
+        if self.typed.exprs[base.0 as usize].0 == u32::MAX || matches!(self.cx.types.kind(self.ty_of(base)), Kind::Ref(..) | Kind::Ptr(..)) {
             return None;
         }
         let (root, mut path) = self.move_path(base).or_else(|| (!self.is_place(base)).then(|| (Root::Temp(base), Vec::new())))?;

@@ -28,7 +28,7 @@ impl Lower<'_, '_> {
                 Ok(None)
             }
             (BlackBox, _, _) => Ok(args.first().copied()),
-            (CompareBytes, _, &[x, y, count]) => Ok(Some(self.compare_bytes((x, y), count))),
+            (CompareBytes | RawEq, _, _) => self.byte_compare(which, ty, args).map(Some),
             (DiscriminantValue, Some(ty), &[pointer]) => {
                 let place = self.pointee_place(pointer, ty)?;
                 self.discriminant_value(place, ty).map(Some)
@@ -201,6 +201,18 @@ impl Lower<'_, '_> {
             lower.ins().store(byte, at, 0);
         });
         Ok(())
+    }
+
+    fn byte_compare(&mut self, which: Intrinsic, ty: Option<Ty>, args: &[Value]) -> Result<Value> {
+        match (which, ty, args) {
+            (Intrinsic::CompareBytes, _, &[x, y, count]) => Ok(self.compare_bytes((x, y), count)),
+            (Intrinsic::RawEq, Some(ty), &[x, y]) => {
+                let size = self.layout_const(Intrinsic::SizeOf, ty)?;
+                let order = self.compare_bytes((x, y), size);
+                Ok(self.ins().icmp_imm(IntCC::Equal, order, 0))
+            }
+            _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
+        }
     }
 
     fn compare_bytes(&mut self, (x, y): (Value, Value), count: Value) -> Value {

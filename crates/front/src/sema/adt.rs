@@ -56,9 +56,14 @@ impl Context<'_> {
 
     /// The value of `#[lang = "..."]` on `item`.
     pub fn lang(&self, item: ItemRef) -> Option<&str> {
+        self.attr_value(item, "lang")
+    }
+
+    /// The value of the name-value attribute `#[key = "..."]` on `item`.
+    pub fn attr_value(&self, item: ItemRef, key: &str) -> Option<&str> {
         let (src, entry) = self.item(item);
         let at = entry.attrs.iter().find_map(|attr| match attr {
-            Attr::Other(at) if src.text(*at) == "lang" => Some(*at),
+            Attr::Other(at) if src.text(*at) == key => Some(*at),
             _ => None,
         })?;
         Some(src.text(at + 2).trim_matches('"'))

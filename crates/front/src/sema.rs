@@ -107,11 +107,10 @@ impl<'a> Context<'a> {
         })
     }
 
-    /// Whether `item` is a function declared in an `extern` block: a signature with no body.
+    /// Whether `item` is a function or static declared in an `extern` block, which the host links by name.
     pub fn foreign(&self, item: ItemRef) -> bool {
         let (_, entry) = self.item(item);
-        let items = &self.file(item).items.items;
-        item.outer().is_none() && entry.kind == ItemKind::Fn && entry.body.is_none() && entry.parent.is_some_and(|parent| items[parent as usize].kind == ItemKind::ExternBlock)
+        matches!(entry.kind, ItemKind::Fn | ItemKind::Static) && entry.body.is_none() && self.parent_item(item).is_some_and(|parent| self.item(parent).1.kind == ItemKind::ExternBlock)
     }
 
     /// What the body that defines the closure type `ty` inferred for it.

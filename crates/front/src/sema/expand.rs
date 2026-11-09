@@ -31,6 +31,7 @@ struct Writer {
     offset: u32,
     home: ModRef,
     locals: Vec<Local>,
+    uses: Vec<(String, Source)>,
 }
 
 /// A token range being scanned for macro calls: its source, where it starts, how far its indices sit from those of the body, and how deep in expansions it is.
@@ -61,6 +62,13 @@ fn call_path(src: &Source, bang: u32, from: u32) -> Option<(u32, u32)> {
     Some((start, name))
 }
 
+/// The macro that the single name at `path` calls, resolved from the module of the `macro` item that wrote the name.
+fn def_site_macro(cx: &mut Context<'_>, src: &Source, path: (u32, u32)) -> Option<ItemRef> {
+    let Some(Mark::Home { krate, file, item }) = src.mark(path.0).filter(|_| path.0 == path.1) else { return None };
+    let module = cx.module_of(ItemRef { krate, file, item }).ok()?;
+    macro_at(&cx.paths(module.krate), src, path, module)
+}
+
 fn body_range(file: &File, item: u32) -> Option<(u32, u32)> {
     let entry = &file.items.items[item as usize];
     match (entry.kind, entry.name) {
@@ -70,7 +78,7 @@ fn body_range(file: &File, item: u32) -> Option<(u32, u32)> {
 }
 
 impl Writer {
-    fn scan(&mut self, cx: &Context<'_>, run: Run<'_>, to: u32) -> Result<()> {
+    fn scan(&mut self, cx: &mut Context<'_>, run: Run<'_>, to: u32) -> Result<()> {
         let mut at = run.from;
         while at < to {
             at = self.step(cx, run, at)?;
@@ -78,9 +86,14 @@ impl Writer {
         Ok(())
     }
 
-    fn step(&mut self, cx: &Context<'_>, run: Run<'_>, at: u32) -> Result<u32> {
+    fn step(&mut self, cx: &mut Context<'_>, run: Run<'_>, at: u32) -> Result<u32> {
         let src = run.src;
         if src.kind(at) != TokenKind::Bang {
+            if src.text(at) == "use"
+                && let Some(next) = self.note_use(src, at)?
+            {
+                return Ok(next);
+            }
             return Ok(at + 1);
         }
         let next = at + 1;
@@ -96,7 +109,7 @@ impl Writer {
         Ok(src.pair(next) + 1)
     }
 
-    fn call(&mut self, cx: &Context<'_>, run: Run<'_>, path: (u32, u32), open: u32) -> Result<()> {
+    fn call(&mut self, cx: &mut Context<'_>, run: Run<'_>, path: (u32, u32), open: u32) -> Result<()> {
         let Some(output) = self.expand_one(cx, run, path, open)? else { return Ok(()) };
         let block = self.offset + self.out.len();
         self.calls.insert(run.shift + open, block);
@@ -105,6 +118,24 @@ impl Writer {
         self.out.space();
         self.out.lexed("}");
         self.scan(cx, Run { src: &output, from: 0, shift: block + 1, depth: run.depth + 1 }, output.len())
+    }
+
+    fn note_use(&mut self, src: &Source, at: u32) -> Result<Option<u32>> {
+        let mut end = at + 1;
+        while src.kind(end) != TokenKind::Semi {
+            if !is_name(src.kind(end)) && src.kind(end) != TokenKind::Colon {
+                return Ok(None);
+            }
+            end += 1;
+        }
+        let (last, alias) = if end >= at + 4 && src.text(end - 2) == "as" { (end - 3, end - 1) } else { (end - 1, end - 1) };
+        if last <= at || !is_name(src.kind(last)) {
+            return Ok(None);
+        }
+        let mut copy = Tokens::default();
+        (at + 1..=last).for_each(|token| copy.copy(src, token));
+        self.uses.push((plain(src.text(alias)).to_owned(), copy.finish(src.path.clone())?));
+        Ok(Some(end + 1))
     }
 
     fn define(&mut self, src: &Source, name: u32) -> Result<()> {
@@ -116,7 +147,7 @@ impl Writer {
         Ok(())
     }
 
-    fn expand_one(&self, cx: &Context<'_>, run: Run<'_>, path: (u32, u32), open: u32) -> Result<Option<Source>> {
+    fn expand_one(&self, cx: &mut Context<'_>, run: Run<'_>, path: (u32, u32), open: u32) -> Result<Option<Source>> {
         if run.depth >= DEPTH {
             bail!("macro {} recursed past {DEPTH} levels", run.src.text(path.1));
         }
@@ -124,7 +155,12 @@ impl Writer {
         if let Some(local) = self.locals.iter().rev().find(|local| path.0 == path.1 && local.name == name) {
             return mbe::expand(&local.source, &local.rules, run.src, (open, self.home.krate), None).map(Some);
         }
-        let Some(found) = macro_at(&cx.paths(self.home.krate), run.src, path, self.home) else { return Ok(None) };
+        let imported = self.uses.iter().rev().find(|(alias, _)| path.0 == path.1 && *alias == name).map(|(_, source)| source);
+        let found = match imported {
+            Some(source) => macro_at(&cx.paths(self.home.krate), source, (0, source.len() - 1), self.home),
+            None => macro_at(&cx.paths(self.home.krate), run.src, path, self.home).or_else(|| def_site_macro(cx, run.src, path)),
+        };
+        let Some(found) = found else { return Ok(None) };
         if let Some(definition) = cx.outline.crates[found.krate as usize].defined.get(&(found.file, found.item)) {
             let home = (cx.item(found).1.kind == ItemKind::Macro).then_some(Mark::Home { krate: found.krate, file: found.file, item: found.item });
             return mbe::expand(&definition.file.source, &definition.rules, run.src, (open, definition.krate as u32), home).map(Some);
@@ -138,7 +174,7 @@ impl Writer {
         out.finish(run.src.path.clone()).map(Some)
     }
 
-    fn builtin(&self, cx: &Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
+    fn builtin(&self, cx: &mut Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
         let (src, open) = (run.src, site.open);
         let input = (open + 1, src.pair(open));
         match site.builtin {
@@ -159,7 +195,7 @@ impl Writer {
         Ok(true)
     }
 
-    fn cfg_select(&self, cx: &Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<bool> {
+    fn cfg_select(&self, cx: &mut Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<bool> {
         let env = &cx.outline.crates[self.home.krate as usize].env;
         let Some(arm) = crate::outline::mbe::select_arm(run.src, open, env)? else { bail!("no cfg_select! arm applies") };
         out.lexed(if arm.braced { "{" } else { "(" });
@@ -168,7 +204,7 @@ impl Writer {
         Ok(true)
     }
 
-    fn panic(&self, cx: &Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) {
+    fn panic(&self, cx: &mut Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) {
         let edition = if cx.names.crates[self.home.krate as usize].edition.as_str() < "2021" { "2015" } else { "2021" };
         let name = if site.builtin == Builtin::Panic { "panic" } else { "unreachable" };
         builtin::crate_path(out, site.krate, &format!("::panic::{name}_{edition}!"));
@@ -177,7 +213,7 @@ impl Writer {
         out.lexed(")");
     }
 
-    fn concat(&self, cx: &Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<bool> {
+    fn concat(&self, cx: &mut Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<bool> {
         let mut text = String::new();
         for range in builtin::args(run.src, open) {
             let Some(piece) = self.literal(cx, run, range)? else { return Ok(false) };
@@ -187,7 +223,7 @@ impl Writer {
         Ok(true)
     }
 
-    fn format_args(&self, cx: &Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
+    fn format_args(&self, cx: &mut Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
         let args = builtin::args(run.src, site.open);
         let Some((&template, rest)) = args.split_first() else { return Ok(false) };
         let Some(mut template) = self.literal(cx, run, template)? else { return Ok(false) };
@@ -201,7 +237,7 @@ impl Writer {
         Ok(true)
     }
 
-    fn literal(&self, cx: &Context<'_>, run: Run<'_>, (from, to): (u32, u32)) -> Result<Option<String>> {
+    fn literal(&self, cx: &mut Context<'_>, run: Run<'_>, (from, to): (u32, u32)) -> Result<Option<String>> {
         let src = run.src;
         if to > from + 1 && src.kind(from) == TokenKind::OpenParen && src.pair(from) == to - 1 {
             return self.literal(cx, run, (from + 1, to - 1));
@@ -278,7 +314,7 @@ impl<'a> Context<'a> {
         let Some((from, to)) = body_range(file, item.item) else { return parse_in(&file.source, self.body_config(item, None), self.item(item).1) };
         let home = self.module_of(item)?;
         let before = self.asks.count();
-        let mut writer = Writer { out: Tokens::default(), calls: HashMap::default(), offset: file.source.len(), home, locals: Vec::new() };
+        let mut writer = Writer { out: Tokens::default(), calls: HashMap::default(), offset: file.source.len(), home, locals: Vec::new(), uses: Vec::new() };
         writer.scan(self, Run { src: &file.source, from, shift: 0, depth: 0 }, to)?;
         if self.asks.count() > before {
             bail!("the macros that {} calls are not resolved yet", self.name(item));

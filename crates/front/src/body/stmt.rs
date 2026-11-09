@@ -39,11 +39,36 @@ impl Cursor<'_> {
                 if self.configured_out(attrs) {
                     return Ok(self.last_as_tail(stmts));
                 }
+                if let Some((inner, inner_tail)) = self.spliced(tail) {
+                    stmts.extend(inner);
+                    return Ok((stmts, inner_tail));
+                }
                 return Ok((stmts, Some(tail)));
+            }
+            if let Stmt::Expr(expr, semi) = stmt
+                && !self.configured_out(attrs)
+                && let Some((inner, inner_tail)) = self.spliced(expr)
+            {
+                stmts.extend(inner);
+                if let Some(inner_tail) = inner_tail {
+                    self.push_stmt(Stmt::Expr(inner_tail, semi), None, &mut stmts);
+                }
+                continue;
             }
             self.push_stmt(stmt, attrs, &mut stmts);
         }
         Ok((stmts, None))
+    }
+
+    /// The statements and tail of `expr` when it is the block a macro call in statement position expanded to, whose statements belong to the enclosing block as in rustc.
+    fn spliced(&self, expr: ExprId) -> Option<(Vec<u32>, Option<ExprId>)> {
+        if self.expansion != Some(expr) {
+            return None;
+        }
+        match self.body.exprs[expr.0 as usize] {
+            super::Expr::Block { stmts, tail, label: None, kind: super::BlockKind::Plain } => Some((self.body.list(stmts).to_vec(), tail)),
+            _ => None,
+        }
     }
 
     fn last_as_tail(&self, mut stmts: Vec<u32>) -> (Vec<u32>, Option<ExprId>) {

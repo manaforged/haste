@@ -72,7 +72,8 @@ impl Infer<'_, '_> {
         })
     }
 
-    fn fresh_trait_args(&mut self, of: ItemRef) -> Result<Vec<Ty>> {
+    /// A fresh variable for each type parameter of trait `of`.
+    pub(super) fn fresh_trait_args(&mut self, of: ItemRef) -> Result<Vec<Ty>> {
         let count = type_params(&self.cx.trait_generics(of)?.1.params).count();
         Ok((0..count).map(|_| self.fresh(Kind::Var)).collect())
     }
