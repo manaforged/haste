@@ -284,12 +284,12 @@ impl Cursor<'_> {
 
     fn prefixed(&mut self) -> Result<Option<ExprId>> {
         let word = self.word();
-        let closure_next = self.punct_at(self.at + 1, "|") || self.word_at(self.at + 1) == "move";
-        if matches!(word, "move" | "static" | "const" | "async") && closure_next {
-            return self.closure().map(Some);
-        }
         if matches!(word, "async" | "gen" | "unsafe" | "const" | "try") && self.block_kind_ahead() {
             return self.kinded_block().map(Some);
+        }
+        let closure_next = self.punct_at(self.at + 1, "|") || self.punct_at(self.at + 1, "||") || self.word_at(self.at + 1) == "move";
+        if matches!(word, "move" | "static" | "const" | "async") && closure_next {
+            return self.closure().map(Some);
         }
         if word == "builtin" && self.punct_at(self.at + 1, "#") {
             self.at += 2;
@@ -326,7 +326,9 @@ impl Cursor<'_> {
     }
 
     fn kinded_block(&mut self) -> Result<ExprId> {
+        let by_move = self.word_at(self.at + 1) == "move";
         let kind = match self.word() {
+            "async" if by_move => BlockKind::AsyncMove,
             "async" => BlockKind::Async,
             "gen" => BlockKind::Gen,
             "unsafe" => BlockKind::Unsafe,
@@ -357,7 +359,7 @@ impl Cursor<'_> {
     fn expanded(&mut self, block: u32) -> Result<ExprId> {
         let (at, end) = (self.at, self.end);
         (self.at, self.end) = (block, self.src.pair(block) + 1);
-        let expr = self.block_expr(None, BlockKind::Plain);
+        let expr = self.block_expr(None, BlockKind::Expansion);
         (self.at, self.end) = (at, end);
         self.expansion = expr.as_ref().ok().copied();
         expr
@@ -582,21 +584,26 @@ impl Cursor<'_> {
     }
 
     fn closure(&mut self) -> Result<ExprId> {
-        let capture = self.closure_head();
+        let (capture, asynchronous) = self.closure_head();
         let params = if self.eat("||") { Vec::new() } else { self.closure_params()? };
         let params = self.list(&params);
         let ret = if self.eat("->") { Some(self.ty_no_bounds()?) } else { None };
         let body = if ret.is_some() { self.block_expr(None, BlockKind::Plain)? } else { self.expr()? };
+        let (ret, body) = match asynchronous {
+            true => (None, self.push_expr(Expr::Block { stmts: super::List::default(), tail: Some(body), label: None, kind: BlockKind::AsyncMove })),
+            false => (ret, body),
+        };
         Ok(self.push_expr(Expr::Closure { params, ret, body, capture }))
     }
 
-    fn closure_head(&mut self) -> bool {
-        let mut capture = false;
+    fn closure_head(&mut self) -> (bool, bool) {
+        let (mut capture, mut asynchronous) = (false, false);
         while matches!(self.word(), "move" | "static" | "async" | "const") {
             capture |= self.word() == "move";
+            asynchronous |= self.word() == "async";
             self.at += 1;
         }
-        capture
+        (capture, asynchronous)
     }
 
     fn closure_params(&mut self) -> Result<Vec<u32>> {

@@ -70,6 +70,7 @@ impl Scanner<'_> {
             return Ok(at + 1);
         }
         let mut attrs = Vec::new();
+        let lead = at;
         let at = attr::attrs(self.src, at, false, &mut attrs)?;
         let (vis, at) = self.vis(at);
         let start = at;
@@ -78,7 +79,7 @@ impl Scanner<'_> {
         if let Some(open) = head.body {
             self.inner_attrs(open, head.kind, &mut attrs)?;
         }
-        self.out.items.push(Item { kind: head.kind, name: head.name, vis, attrs, start, end: head.end, body: head.body, parent });
+        self.out.items.push(Item { kind: head.kind, name: head.name, vis, attrs, lead, start, end: head.end, body: head.body, parent });
         self.children(index, &head)?;
         Ok(head.end)
     }

@@ -49,8 +49,9 @@ impl Lower<'_, '_> {
         let code = self.ins().load(Type::I64, vtable, slot as i32 * 8);
         let mut values: Vec<Value> = self.sret.into_iter().chain([data]).collect();
         for &local in &self.typed.params[1..] {
-            if let Some(place) = self.locals[local as usize] {
-                values.extend(self.read(place));
+            if let Some(value) = self.locals[local as usize].and_then(|place| self.read(place)) {
+                let ty = self.typed.locals[local as usize].ty;
+                values.push(self.passed(ty, value)?);
             }
         }
         let signature = super::signature(self.cx, self.typed)?;

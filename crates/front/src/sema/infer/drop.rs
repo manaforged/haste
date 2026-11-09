@@ -32,6 +32,7 @@ impl Infer<'_, '_> {
             Kind::Array(_, len) if self.cx.types.len(len) == Some(0) => return Ok(false),
             Kind::Adt(..) if self.drop_impl(ty)?.is_some() => return Ok(true),
             Kind::Dyn(..) => return Ok(true),
+            Kind::Closure(..) if self.coroutine_output(ty).is_some() => return Ok(true),
             _ => {}
         }
         let parts = self.drop_parts(ty)?;
@@ -48,6 +49,8 @@ impl Infer<'_, '_> {
 pub struct Glue {
     pub drop: Option<Res>,
     pub parts: Vec<Res>,
+    /// The `Future::poll` that a suspended coroutine runs in its drop mode.
+    pub resume: Option<Res>,
 }
 
 /// The typed form of the drop glue `drop_glue::<ty>`: one `&mut ty` parameter, no body, and the calls the glue makes.
@@ -95,7 +98,11 @@ impl Infer<'_, '_> {
                 parts.push(Res::Fn(glue, vec![part]));
             }
         }
-        Ok(Glue { drop, parts })
+        let resume = match self.coroutine_output(ty) {
+            Some(_) => self.cx.lang_item("poll").map(|poll| Res::Fn(poll, vec![ty])),
+            None => None,
+        };
+        Ok(Glue { drop, parts, resume })
     }
 
     /// The parts of `ty` that its drop glue drops after its own `Drop::drop`: fields, elements, or the value a `Box` owns.
@@ -106,6 +113,10 @@ impl Infer<'_, '_> {
             Kind::Adt(item, args) => self.adt_fields(item, &args)?.into_iter().flatten().collect(),
             Kind::Tuple(items) => items,
             Kind::Closure(..) => match self.cx.closure_env(ty).map(|env| self.cx.types.kind(env).clone()) {
+                Some(Kind::Tuple(items)) if self.coroutine_output(ty).is_some() => match items.last().map(|env| self.cx.types.kind(*env).clone()) {
+                    Some(Kind::Tuple(captures)) => captures,
+                    _ => bail!("a coroutine with no captures tuple"),
+                },
                 Some(Kind::Tuple(items)) => items,
                 _ => bail!("drop of a closure whose defining body was not inferred"),
             },

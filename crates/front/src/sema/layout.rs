@@ -42,7 +42,6 @@ impl Idx for Variant {
 /// The memory layout of one type, computed by rustc's own layout algorithm.
 pub type Layout = LayoutData<Field, Variant>;
 
-/// The target's data layout.
 /// The byte offset of field `index` of variant `variant` in a value of `layout`.
 pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
     let fields = match &layout.variants {
@@ -52,6 +51,7 @@ pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
     fields.offset(index as usize).bytes() as i32
 }
 
+/// The target's data layout.
 pub fn target() -> Result<TargetDataLayout> {
     TargetDataLayout::parse_from_llvm_datalayout_string(DATA_LAYOUT, AddressSpace::ZERO).map_err(|_| anyhow!("bad data layout"))
 }

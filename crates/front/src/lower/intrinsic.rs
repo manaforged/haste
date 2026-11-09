@@ -36,8 +36,7 @@ impl Lower<'_, '_> {
         let byte = self.cx.types.prim(Primitive::U8);
         let pointer = self.cx.types.intern(Kind::Ptr(crate::sema::ty::Mut::Mut, byte));
         let unit = self.cx.types.unit();
-        let signature = super::signature_of(self.cx, Some(unit), [pointer])?;
-        self.call_code(try_fn, (signature, Some(unit)), vec![data])?;
+        self.call_code(try_fn, (vec![pointer], Some(unit)), vec![data])?;
         Ok(self.ins().iconst(Type::I32, 0))
     }
 

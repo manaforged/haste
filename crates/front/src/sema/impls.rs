@@ -268,7 +268,7 @@ impl<'a> Context<'a> {
     /// The standard crates, which hold the impls and lang items of primitive types.
     pub fn primitive_holders(&self) -> Vec<u32> {
         let roots = self.outline.roots.iter().enumerate();
-        roots.filter(|(_, root)| root.lib && PRIMITIVE_HOLDERS.contains(&root.name.as_str())).map(|(krate, _)| krate as u32).collect()
+        roots.filter(|(_, root)| root.role == crate::outline::Role::Lib && PRIMITIVE_HOLDERS.contains(&root.name.as_str())).map(|(krate, _)| krate as u32).collect()
     }
 
     fn index_of(&mut self, holder: Holder) -> Rc<Index> {

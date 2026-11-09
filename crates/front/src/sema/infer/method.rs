@@ -185,7 +185,11 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn try_trait(&mut self, candidate: TraitCandidate, adjusted: Ty) -> Result<Option<(ItemRef, Vec<Ty>)>> {
-        let Some(self_ty) = self.trait_self(candidate, adjusted) else { return Ok(None) };
+        let self_ty = match candidate.kind {
+            SelfKind::Typed(ty) => self.typed_self(candidate, ty, adjusted)?,
+            _ => self.trait_self(candidate, adjusted),
+        };
+        let Some(self_ty) = self_ty else { return Ok(None) };
         let args = self.fresh_trait_args(candidate.of)?;
         if candidate.bound.is_some() || !args.is_empty() {
             self.assume(candidate.of, &std::iter::once(self_ty).chain(args.iter().copied()).collect::<Vec<_>>())?;
@@ -208,6 +212,17 @@ impl<'a> Infer<'_, 'a> {
             Some(item) => (item, impl_args),
             None => (candidate.item, std::iter::once(self_ty).chain(args).collect()),
         }))
+    }
+
+    /// The `Self` that makes the declared receiver type `ty` of a trait method, such as `Pin<&mut Self>`, equal `adjusted`.
+    fn typed_self(&mut self, candidate: TraitCandidate, ty: crate::body::TyId, adjusted: Ty) -> Result<Option<Ty>> {
+        let sig = self.cx.signature(candidate.item)?;
+        let self_ty = self.fresh(Kind::Var);
+        let substs: Vec<Ty> = std::iter::once(self_ty).chain(self.fresh_trait_args(candidate.of)?).collect();
+        let frame = self.frame(candidate.item, &substs)?;
+        let declared = self.with_frame(frame, |infer| infer.lower_ty(&sig.body, ty))?;
+        let found = self.trial(|infer| Ok(infer.unify(declared, adjusted).ok().map(|()| infer.resolve(self_ty))))?;
+        Ok(found.filter(|found| !matches!(self.cx.types.kind(*found), Kind::Var(_)) && candidate.bound.is_none_or(|param| param == self.substitute(*found))))
     }
 
     fn trait_self(&mut self, candidate: TraitCandidate, adjusted: Ty) -> Option<Ty> {

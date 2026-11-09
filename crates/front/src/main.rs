@@ -82,17 +82,12 @@ fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usiz
 
 /// Loads every module of every crate and resolves every import.
 fn eager_front(workspace: &graph::Workspace, targets: &Targets) -> Result<(outline::Outline, Names)> {
-    let mut outline = outline::new(workspace, targets);
-    outline.load_all()?;
-    let mut names = Names::new(workspace, &outline);
-    names.crates.iter_mut().for_each(|krate| krate.eager = true);
-    names.settle(&mut outline)?;
-    Ok((outline, names))
+    haste_front::macros::front(workspace, targets, &[])
 }
 
 /// Loads the member crates' roots and settles names, reading only what their lookups reach.
 fn demand_front(workspace: &graph::Workspace, targets: &Targets) -> Result<(outline::Outline, Names)> {
-    let mut outline = outline::new(workspace, targets);
+    let mut outline = outline::new(workspace, targets, &[]);
     let members: Vec<usize> = (0..outline.roots.len()).filter(|at| is_member(workspace, &outline.roots[*at])).collect();
     for &krate in &members {
         outline.load(krate, 0)?;
@@ -146,7 +141,7 @@ fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
 
 /// Loads and resolves what a sema pass asked for, and returns the store for the next pass and whether the outline changed.
 fn answer(names: &mut Names, outline: &mut outline::Outline, (mut store, asks): (sema::Store, haste_front::names::path::Asks)) -> Result<(sema::Store, bool)> {
-    let more = names.answer(outline, asks)?;
+    let more = haste_front::macros::answer(outline, names, asks)?;
     store.forget_lookups();
     Ok((store, more))
 }
@@ -175,10 +170,10 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
     Ok(())
 }
 
-fn report_cases(workspace: &graph::Workspace, targets: &Targets, request: serve::Request) -> Result<()> {
+fn report_cases(workspace: &graph::Workspace, targets: &Targets, request: serve::Request, args: &[String]) -> Result<i32> {
     let started = Instant::now();
     let build = cases::Build::cold(workspace, targets)?;
-    let result = serve::finish(&build, request, started);
+    let result = serve::finish(&build, request, args, started);
     std::mem::forget(build);
     result
 }
@@ -257,7 +252,7 @@ fn report_names(outline: &outline::Outline, names: &Names, started: Instant) {
     eprintln!("names {bindings} names, {total} unresolved imports in {:.1} ms", elapsed.as_secs_f64() * 1e3);
 }
 
-const USAGE: &str = "usage: haste-front graph|outline|demand|typeck|cases|build|serve|items|expand PATH";
+const USAGE: &str = "usage: haste-front graph|outline|demand|typeck|cases|build|run|serve|items|expand PATH [ARGS...]";
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -268,32 +263,47 @@ fn main() -> Result<()> {
         "expand" => print_expanded(&path),
         _ => {
             let root = std::path::absolute(path)?;
-            if let Some(status) = serve::Request::parse_mode(&mode).map(|request| serve::ask(&root, request)).transpose()?.flatten() {
+            let argv: Vec<String> = std::iter::once(program_name(&root)).chain(args).collect();
+            if let Some(status) = serve::Request::parse_mode(&mode).map(|request| serve::ask(&root, request, &argv)).transpose()?.flatten() {
                 std::process::exit(status);
             }
-            report(&mode, &root)
+            match report(&mode, &root, &argv)? {
+                0 => Ok(()),
+                status => std::process::exit(status),
+            }
         }
     }
 }
 
-fn report(mode: &str, root: &std::path::Path) -> Result<()> {
+fn report_mode(mode: &str, (workspace, targets): (&graph::Workspace, &Targets), root: &std::path::Path) -> Result<()> {
     let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
+    match mode {
+        "graph" => Ok(print_graph(workspace)),
+        "outline" => report_outline(workspace, targets, threads),
+        "demand" => report_demand(workspace, targets),
+        "typeck" => report_typeck(workspace, targets),
+        "serve" => serve::serve(workspace, targets, root),
+        other => Err(anyhow::anyhow!("unknown mode {other}")),
+    }
+}
+
+fn program_name(root: &std::path::Path) -> String {
+    root.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+}
+
+fn report(mode: &str, root: &std::path::Path, argv: &[String]) -> Result<i32> {
     let targets = Targets { target: cfg::Target::x86_64_linux_gnu(), host: cfg::Target::x86_64_linux_gnu() };
     let started = Instant::now();
     let mut workspace = graph::load(root, &targets)?;
     if mode != "graph" {
         workspace.merge(graph::load_sysroot(&graph::library()?, &targets)?);
+        haste_front::scripts::settle(&mut workspace, &targets)?;
     }
     let loaded = started.elapsed();
-    match (mode, serve::Request::parse_mode(mode)) {
-        (_, Some(request)) => report_cases(&workspace, &targets, request),
-        ("graph", _) => Ok(print_graph(&workspace)),
-        ("outline", _) => report_outline(&workspace, &targets, threads),
-        ("demand", _) => report_demand(&workspace, &targets),
-        ("typeck", _) => report_typeck(&workspace, &targets),
-        ("serve", _) => serve::serve(&workspace, &targets, root),
-        (other, _) => Err(anyhow::anyhow!("unknown mode {other}")),
-    }?;
+    let status = match serve::Request::parse_mode(mode) {
+        Some(request) => report_cases(&workspace, &targets, request, argv)?,
+        None => report_mode(mode, (&workspace, &targets), root).map(|()| 0)?,
+    };
     eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);
-    Ok(())
+    Ok(status)
 }

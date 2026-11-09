@@ -12,7 +12,7 @@ use super::{Lower, Repr, repr};
 /// The machine values that a value of one type travels as in the platform convention, each with its byte offset inside the value.
 type Parts = Vec<(Type, i32)>;
 
-fn scalar_type(dl: &TargetDataLayout, scalar: &Scalar) -> Result<Type> {
+pub(super) fn scalar_type(dl: &TargetDataLayout, scalar: &Scalar) -> Result<Type> {
     match scalar.primitive() {
         Primitive::Float(Float::F32) => Ok(Type::F32),
         Primitive::Float(Float::F64) => Ok(Type::F64),

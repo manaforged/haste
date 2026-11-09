@@ -1,5 +1,6 @@
 pub mod collect;
 pub mod path;
+pub mod procs;
 pub mod resolve;
 mod want;
 
@@ -78,7 +79,7 @@ pub struct ModRef {
 }
 
 /// An item of one crate, by file and item index in the crate's outline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ItemRef {
     pub krate: u32,
     pub file: u32,

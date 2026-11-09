@@ -54,6 +54,8 @@ pub struct Signature {
     pub variadic: bool,
     /// Whether the return type holds `impl Trait`, which the body's value decides.
     pub opaque: bool,
+    /// Whether the function is `async`, so it returns a future of its declared return type.
+    pub is_async: bool,
     /// The first token of each parameter's pattern.
     pub param_starts: Vec<u32>,
 }
@@ -196,7 +198,9 @@ impl Cursor<'_> {
 /// Parses the header of the function item whose tokens run from `from` to `to` in `src`.
 pub fn signature(src: &Source, from: u32, to: u32) -> Result<Signature> {
     let mut cursor = Cursor::new(src, from, to);
+    let mut is_async = false;
     while !cursor.done() && !cursor.is_word("fn") {
+        is_async |= cursor.is_word("async");
         cursor.at += if cursor.kind() == TokenKind::OpenParen { cursor.src.pair(cursor.at) + 1 - cursor.at } else { 1 };
     }
     cursor.at += 1;
@@ -211,7 +215,8 @@ pub fn signature(src: &Source, from: u32, to: u32) -> Result<Signature> {
     }
     let ret_first = cursor.body.tys.len();
     sig.ret = if cursor.eat("->") { Some(cursor.ty()?) } else { None };
-    sig.opaque = cursor.body.tys[ret_first..].iter().any(|ty| matches!(ty, super::Ty::ImplTrait(..)));
+    sig.opaque = is_async || cursor.body.tys[ret_first..].iter().any(|ty| matches!(ty, super::Ty::ImplTrait(..)));
+    sig.is_async = is_async;
     sig.predicates = cursor.where_clause()?;
     sig.body = cursor.body;
     Ok(sig)

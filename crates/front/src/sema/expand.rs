@@ -4,9 +4,10 @@ use rustc_lexer::TokenKind;
 
 use crate::body::cursor::{RESERVED, is_name};
 use crate::body::{self as syntax, Body, Stmt, sig};
+use crate::names::collect::proc_kind;
 use crate::names::resolve::macro_at;
 use crate::names::{ItemRef, ModRef, plain};
-use crate::outline::item::{ItemKind, Items};
+use crate::outline::item::{ItemKind, Items, ProcKind};
 use crate::outline::rules::{self, Rule};
 use crate::outline::{mbe, scan};
 use crate::outline::source::{Mark, Source, Tokens, opens};
@@ -67,6 +68,21 @@ fn def_site_macro(cx: &mut Context<'_>, src: &Source, path: (u32, u32)) -> Optio
     let Some(Mark::Home { krate, file, item }) = src.mark(path.0).filter(|_| path.0 == path.1) else { return None };
     let module = cx.module_of(ItemRef { krate, file, item }).ok()?;
     macro_at(&cx.paths(module.krate), src, path, module)
+}
+
+/// The output of the procedural macro `run` called with the delimiter at `open`, once the front end ran it; until then the call asks for it.
+fn proc_bang(cx: &mut Context<'_>, src: &Source, run: ItemRef, open: u32) -> Result<Option<Source>> {
+    let close = src.pair(open);
+    let input = if close > open + 1 { src.span(open + 1, close - 1).to_owned() } else { String::new() };
+    let key = (run, input);
+    match cx.outline.procs.get(&key) {
+        Some(Ok(text)) => Source::parse(src.path.clone(), text.clone()).map(Some),
+        Some(Err(error)) => bail!("{}!: {error}", cx.name(run)),
+        None => {
+            cx.asks.procs.borrow_mut().push(key);
+            Ok(None)
+        }
+    }
 }
 
 fn body_range(file: &File, item: u32) -> Option<(u32, u32)> {
@@ -178,6 +194,9 @@ impl Writer {
         if let Some(definition) = cx.outline.crates[found.krate as usize].defined.get(&(found.file, found.item)) {
             let home = (cx.item(found).1.kind == ItemKind::Macro).then_some(Mark::Home { krate: found.krate, file: found.file, item: found.item });
             return mbe::expand(&definition.file.source, &definition.rules, run.src, (open, definition.krate as u32), home).map(Some);
+        }
+        if let Some((_, ProcKind::Bang)) = found.outer().is_none().then(|| cx.item(found)).and_then(|(src, item)| proc_kind(src, item)) {
+            return proc_bang(cx, run.src, found, open);
         }
         let Some(builtin) = cx.builtin(found) else { return Ok(None) };
         let mut out = Tokens::default();

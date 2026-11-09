@@ -101,6 +101,8 @@ impl Infer<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Method { receiver, name, args, params } => self.method_call(expr, receiver, name, (args, params)),
             Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Try } => self.try_block(expr, (stmts, tail), expected),
+            Expr::Block { kind: kind @ (crate::body::BlockKind::Async | crate::body::BlockKind::AsyncMove), .. } => self.coroutine_expr(expr, (None, kind == crate::body::BlockKind::AsyncMove), &[]),
+            Expr::Await(inner) => self.await_expr(expr, inner),
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail, expected),
             Expr::Block { stmts, tail, label: Some(label), .. } => self.labeled_block((stmts, tail), label, expected),
             Expr::If(cond, then, otherwise) => self.if_expr(cond, then, otherwise, expected),

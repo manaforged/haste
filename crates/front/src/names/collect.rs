@@ -1,4 +1,4 @@
-use crate::outline::item::{Attr, Item, ItemKind, Leaf, Vis};
+use crate::outline::item::{Attr, Item, ItemKind, Leaf, PROC_MACROS, ProcKind, Vis};
 use crate::outline::tree::{Crate as Tree, Env};
 
 use super::{Binding, Def, ItemRef, ModRef, Ns, Origin, SELF, Scope, Sym, Symbols, UNDERSCORE, plain};
@@ -70,7 +70,7 @@ pub fn collect_module(tree: &Tree, index: usize, files: &[(u32, Option<u32>)], c
     for (file, at) in items_in(tree, files) {
         let source = &tree.files[file as usize];
         let item = &source.items.items[at as usize];
-        if !context.env.enabled(&item.attrs) {
+        if !context.env.enabled(&item.attrs) || tree.consumed.contains(&(file, at)) {
             continue;
         }
         if item.kind == ItemKind::Use {
@@ -162,14 +162,15 @@ pub fn lift_macro_use(tree: &Tree, scopes: &mut [Scope]) {
     }
 }
 
-const PROC_MACROS: [&str; 3] = ["proc_macro", "proc_macro_attribute", "proc_macro_derive"];
-
 fn proc_macro_name<'a>(source: &'a crate::outline::source::Source, item: &Item, name: &'a str) -> Option<&'a str> {
+    let (at, kind) = proc_kind(source, item)?;
+    Some(if kind == ProcKind::Derive { plain(source.text(at + 2)) } else { name })
+}
+
+/// The procedural macro that the function `item` of `source` defines, with the token of its attribute.
+pub fn proc_kind(source: &crate::outline::source::Source, item: &Item) -> Option<(u32, ProcKind)> {
     item.attrs.iter().find_map(|attr| match attr {
-        Attr::Other(at) if PROC_MACROS.contains(&source.text(*at)) => {
-            let derive = source.text(*at) == "proc_macro_derive";
-            Some(if derive { plain(source.text(*at + 2)) } else { name })
-        }
+        Attr::Other(at) => PROC_MACROS.iter().find(|(name, _)| *name == source.text(*at)).map(|&(_, kind)| (*at, kind)),
         _ => None,
     })
 }

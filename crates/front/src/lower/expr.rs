@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, bail};
-use haste_codegen::{Block, Signature, StackSlot, Type, Value};
+use haste_codegen::{Block, StackSlot, Type, Value};
 
 use crate::body::{Expr, ExprId, List, UnOp};
 use crate::names::ItemRef;
@@ -7,6 +7,7 @@ use crate::outline::item::ItemKind;
 use crate::sema::infer::{Coercion, Res};
 use crate::sema::ty::{Kind, Ty};
 
+use super::place::Place;
 use super::{Loop, Lower, Repr, repr};
 
 impl Lower<'_, '_> {
@@ -101,6 +102,9 @@ impl Lower<'_, '_> {
     fn flow(&mut self, expr: ExprId) -> Result<Option<Value>> {
         match *self.body.expr(expr) {
             Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Try } => self.try_block(expr, stmts, tail),
+            Expr::Block { kind: crate::body::BlockKind::Async | crate::body::BlockKind::AsyncMove, .. } => self.closure(expr),
+            Expr::Await(inner) => self.await_expr(expr, inner),
+            Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Expansion } => self.expansion(stmts, tail),
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail),
             Expr::Block { stmts, tail, label: Some(label), .. } => self.labeled_block(expr, (stmts, tail), label),
             Expr::If(cond, then, otherwise) => self.if_expr(expr, cond, then, otherwise),
@@ -233,8 +237,8 @@ impl Lower<'_, '_> {
             let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
             return self.native_call(code, (params, callee.ret), values);
         }
-        let signature = super::signature(self.cx, callee)?;
-        self.call_code(code, (signature, callee.ret), values)
+        let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
+        self.call_code(code, (params, callee.ret), values)
     }
 
     fn pointer_call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
@@ -255,8 +259,7 @@ impl Lower<'_, '_> {
         if !self.open {
             return Ok(None);
         }
-        let signature = super::signature_of(self.cx, Some(ret), params)?;
-        self.call_code(code, (signature, Some(ret)), values)
+        self.call_code(code, (params, Some(ret)), values)
     }
 
     /// The index of the reached instance of `item` at `substs`.
@@ -271,13 +274,17 @@ impl Lower<'_, '_> {
         self.ins().load(Type::I64, table, 0)
     }
 
-    pub(super) fn call_code(&mut self, code: Value, (signature, ret): (Signature, Option<Ty>), mut values: Vec<Value>) -> Result<Option<Value>> {
+    /// Calls the generated code at `code`, which takes `params` and returns `ret`, with the values of its arguments that are not zero-sized.
+    pub(super) fn call_code(&mut self, code: Value, (params, ret): (Vec<Ty>, Option<Ty>), values: Vec<Value>) -> Result<Option<Value>> {
+        let signature = super::signature_of(self.cx, ret, params.iter().copied())?;
+        let mut values = self.pass_all(&params, values)?;
         let result = ret.map(|ret| repr(self.cx, ret)).transpose()?.unwrap_or(Repr::Zst);
+        let unwrapped = ret.map(|ret| super::unwrapped(self.cx, ret)).transpose()?.flatten();
         let out = match result {
             Repr::Mem { .. } => self.slot(result),
             _ => None,
         };
-        if let Some(out) = out {
+        if let Some(out) = out.filter(|_| unwrapped.is_none()) {
             let address = self.ins().stack_addr(Type::I64, out, 0);
             values.insert(0, address);
         }
@@ -289,10 +296,29 @@ impl Lower<'_, '_> {
             self.close();
             return Ok(None);
         }
+        if let (Some(out), Some(machine)) = (out, unwrapped) {
+            let value = self.b.inst_results(call)[0];
+            self.write(Place::slot(out, result).at(0, Repr::Scalar(machine)), value);
+        }
         if let Some(out) = out {
             return Ok(Some(self.ins().stack_addr(Type::I64, out, 0)));
         }
         Ok(returns.map(|_| self.b.inst_results(call)[0]))
+    }
+
+    /// The argument `values` of a call that takes `params`, as they cross it: zero-sized parameters take no value, and a value whose type travels unwrapped crosses as its scalar.
+    pub(super) fn pass_all(&mut self, params: &[Ty], values: Vec<Value>) -> Result<Vec<Value>> {
+        let mut values = values.into_iter();
+        let mut passed = Vec::new();
+        for &param in params {
+            if repr(self.cx, param)? == Repr::Zst {
+                continue;
+            }
+            let Some(value) = values.next() else { break };
+            passed.push(self.passed(param, value)?);
+        }
+        passed.extend(values);
+        Ok(passed)
     }
 
     pub(super) fn branch_value(&mut self, value: Option<Value>, join: Block) {

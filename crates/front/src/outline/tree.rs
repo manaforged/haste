@@ -79,6 +79,15 @@ pub struct Waiting {
     pub scope: Option<Arc<Textual>>,
 }
 
+/// A derive or attribute that may name a procedural macro, on item `at` of `file` in module `owner`, written by the path from token `path.0` to token `path.1`.
+#[derive(Clone, Debug)]
+pub struct Held {
+    pub file: Arc<File>,
+    pub owner: usize,
+    pub at: u32,
+    pub path: (u32, u32),
+}
+
 /// The macro named `name` in textual scope `scope`.
 pub fn textual(mut scope: Option<&Arc<Textual>>, name: &str) -> Option<Arc<Macro>> {
     while let Some(entry) = scope {
@@ -153,6 +162,9 @@ pub struct Crate {
     pub members: Vec<Waiting>,
     pub fallback: Vec<usize>,
     pub foreign: Vec<Waiting>,
+    pub derived: Vec<Held>,
+    pub attributed: Vec<Held>,
+    pub consumed: rustc_hash::FxHashSet<(u32, u32)>,
     pub macro_use: Vec<usize>,
     pub expansions: usize,
 }
@@ -178,11 +190,13 @@ pub enum Truth {
     Unknown,
 }
 
-/// The cfg values known before build scripts run: the target, the unit's features and the profile.
+/// The cfg values of a crate: the target, the unit's features, the profile and what the unit's build script set; `known` is false while a build script that may set more has not run.
 #[derive(Debug, Default)]
 pub struct Env {
     pub target: Target,
     pub features: BTreeSet<String>,
+    pub script: Option<std::sync::Arc<crate::graph::script::Output>>,
+    pub known: bool,
 }
 
 const PROFILE: [&str; 3] = ["debug_assertions", "overflow_checks", "ub_checks"];
@@ -205,9 +219,9 @@ impl Env {
     }
 
     fn name(&self, name: &str) -> Truth {
-        if self.target.has_name(name) || PROFILE.contains(&name) {
+        if self.target.has_name(name) || PROFILE.contains(&name) || self.script.as_ref().is_some_and(|set| set.names.contains(name)) {
             Truth::Yes
-        } else if OFF.contains(&name) {
+        } else if self.known || OFF.contains(&name) {
             Truth::No
         } else {
             Truth::Unknown
@@ -219,6 +233,10 @@ impl Env {
             truth(self.features.contains(value))
         } else if key.starts_with("target_") || matches!(key, "panic" | "fmt_debug" | "relocation_model") {
             truth(self.target.has_pair(key, value))
+        } else if self.script.as_ref().is_some_and(|set| set.pairs.contains(&(key.to_owned(), value.to_owned()))) {
+            Truth::Yes
+        } else if self.known {
+            Truth::No
         } else {
             Truth::Unknown
         }
@@ -307,7 +325,7 @@ impl Cache {
             for _ in 0..workers {
                 scope.spawn(|| {
                     while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if path.is_file() && let Ok(slot) = slot(&self.slots, path) {
+                        if exists(path) && let Ok(slot) = slot(&self.slots, path) {
                             let _ = fill(&slot, path);
                         }
                     }
@@ -334,9 +352,31 @@ impl Cache {
     }
 }
 
+/// The files that haste supplies itself, read from these paths: its `proc_macro` crate, which stands in for the toolchain's.
+const EMBEDDED: [(&str, &str); 3] = [
+    ("/haste/proc_macro/lib.rs", include_str!("../../proc_macro/lib.rs")),
+    ("/haste/proc_macro/lex.rs", include_str!("../../proc_macro/lex.rs")),
+    ("/haste/proc_macro/literal.rs", include_str!("../../proc_macro/literal.rs")),
+];
+
+/// The root file of the `proc_macro` crate that haste supplies.
+pub const PROC_MACRO_ROOT: &str = EMBEDDED[0].0;
+
+fn embedded(path: &Path) -> Option<&'static str> {
+    EMBEDDED.iter().find(|(at, _)| Path::new(at) == path).map(|(_, text)| *text)
+}
+
+/// Whether there is a file at `path`, on disk or among the files haste supplies.
+pub fn exists(path: &Path) -> bool {
+    embedded(path).is_some() || path.is_file()
+}
+
 /// Reads and scans the file at `path`.
 pub fn read(path: &Path) -> Result<File> {
-    let source = Source::read(path)?;
+    let source = match embedded(path) {
+        Some(text) => Source::parse(path.to_owned(), text.to_owned())?,
+        None => Source::read(path)?,
+    };
     let items = scan::scan(&source)?;
     Ok(File::new(source, items, false))
 }

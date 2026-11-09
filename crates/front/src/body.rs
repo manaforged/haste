@@ -153,9 +153,13 @@ pub enum Expr {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     Plain,
+    /// The output of a macro call in expression position, whose temporaries belong to the enclosing statement as if the call were its output.
+    Expansion,
     Unsafe,
     Const,
     Async,
+    /// An `async move` block, which captures by value.
+    AsyncMove,
     Gen,
     Try,
 }

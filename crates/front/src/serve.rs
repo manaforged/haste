@@ -16,9 +16,11 @@ pub enum Request {
     Build,
     /// Bring the build up to date and run every case.
     Cases,
+    /// Bring the build up to date and run the binary's `main`.
+    Run,
 }
 
-const MODES: [(Request, &str); 2] = [(Request::Build, "build"), (Request::Cases, "cases")];
+const MODES: [(Request, &str); 3] = [(Request::Build, "build"), (Request::Cases, "cases"), (Request::Run, "run")];
 
 impl Request {
     fn byte(self) -> u8 {
@@ -59,8 +61,8 @@ fn socket() -> Result<RawFd> {
     Ok(fd)
 }
 
-/// Sends `request` with this process's stdout and stderr to the server of `root`, waits for it, and returns its status, or none when no server runs.
-pub fn ask(root: &std::path::Path, request: Request) -> Result<Option<i32>> {
+/// Sends `request` and `args` with this process's stdout and stderr to the server of `root`, waits for it, and returns its status, or none when no server runs.
+pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<Option<i32>> {
     let fd = socket()?;
     let (addr, len) = address(root);
     // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
@@ -73,6 +75,7 @@ pub fn ask(root: &std::path::Path, request: Request) -> Result<Option<i32>> {
     let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
     std::io::stdout().flush()?;
     send(fd, request.byte(), &[1, 2])?;
+    write_args(&mut conn, args)?;
     let mut status = [0; 4];
     conn.read_exact(&mut status)?;
     Ok(Some(i32::from_le_bytes(status)))
@@ -93,7 +96,10 @@ pub fn serve(workspace: &graph::Workspace, targets: &Targets, root: &std::path::
         // SAFETY: fd is the accepted connection, which this File owns from here on.
         let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
         let status = match receive(fd) {
-            Ok((byte, fds)) => answer(&mut build, (workspace, targets), Request::parse(byte), &fds),
+            Ok((byte, fds)) => match read_args(&mut conn) {
+                Ok(args) => answer(&mut build, (workspace, targets), Request::parse(byte).map(|request| (request, args)), &fds),
+                Err(_) => 1,
+            },
             Err(_) => 1,
         };
         let _ = conn.write_all(&status.to_le_bytes());
@@ -110,29 +116,58 @@ fn listen(root: &std::path::Path) -> Result<RawFd> {
     Ok(fd)
 }
 
-fn answer(build: &mut Build, (workspace, targets): (&graph::Workspace, &Targets), request: Option<Request>, fds: &[RawFd]) -> i32 {
+fn write_args(conn: &mut std::fs::File, args: &[String]) -> Result<()> {
+    let mut bytes = (args.len() as u32).to_le_bytes().to_vec();
+    for arg in args {
+        bytes.extend((arg.len() as u32).to_le_bytes());
+        bytes.extend(arg.as_bytes());
+    }
+    Ok(conn.write_all(&bytes)?)
+}
+
+fn read_args(conn: &mut std::fs::File) -> Result<Vec<String>> {
+    let mut word = [0; 4];
+    let mut next = |conn: &mut std::fs::File| -> Result<u32> {
+        conn.read_exact(&mut word)?;
+        Ok(u32::from_le_bytes(word))
+    };
+    let count = next(conn)?;
+    let mut args = Vec::new();
+    for _ in 0..count {
+        let mut arg = vec![0; next(conn)? as usize];
+        conn.read_exact(&mut arg)?;
+        args.push(String::from_utf8(arg)?);
+    }
+    Ok(args)
+}
+
+fn answer(build: &mut Build, (workspace, targets): (&graph::Workspace, &Targets), request: Option<(Request, Vec<String>)>, fds: &[RawFd]) -> i32 {
     let [out, err] = fds else { return 1 };
     let saved = redirect(*out, *err);
     let started = Instant::now();
     let done = match request {
-        Some(request) => build.refresh(workspace, targets).and_then(|()| finish(build, request, started)),
+        Some((request, args)) => build.refresh(workspace, targets).and_then(|()| finish(build, request, &args, started)),
         None => Err(anyhow::anyhow!("unknown request")),
     };
     if let Err(error) = &done {
         eprintln!("error: {error:#}");
     }
     restore(saved, fds);
-    i32::from(done.is_err())
+    done.unwrap_or(1)
 }
 
-/// Prints how long building took since `started`, and for `cases` runs every case first.
-pub fn finish(build: &Build, request: Request, started: Instant) -> Result<()> {
+/// Prints how long building took since `started`, runs every case for `cases` and `main` with `args` for `run`, and returns the exit status.
+pub fn finish(build: &Build, request: Request, args: &[String], started: Instant) -> Result<i32> {
     let built = started.elapsed();
     match request {
-        Request::Cases => build.report(started, built),
+        Request::Cases => build.report(started, built).map(|()| 0),
         Request::Build => {
             eprintln!("built in {:.1} ms", built.as_secs_f64() * 1e3);
-            Ok(())
+            Ok(0)
+        }
+        Request::Run => {
+            eprintln!("built in {:.1} ms", built.as_secs_f64() * 1e3);
+            build.run(args)
         }
     }
 }

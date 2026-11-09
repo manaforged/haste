@@ -26,6 +26,10 @@ pub fn clone_typed(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<Typed>
 impl Infer<'_, '_> {
     /// Whether the compiler implements trait `of` for `ty` with no impl to select, as it does `Clone` for a tuple or closure.
     pub(super) fn compiler_impl(&self, of: ItemRef, ty: Ty) -> bool {
-        self.cx.lang(of) == Some("clone") && cloned_tuple(self.cx, self.resolve(ty)).is_some()
+        match self.cx.lang(of) {
+            Some("clone") => cloned_tuple(self.cx, self.resolve(ty)).is_some(),
+            Some("future_trait") => self.coroutine_output(ty).is_some(),
+            _ => false,
+        }
     }
 }

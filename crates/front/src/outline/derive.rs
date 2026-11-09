@@ -37,15 +37,17 @@ const DERIVES: [(&str, Derive, &str); 9] = [
     ("Default", Derive::Default, "default::Default"),
 ];
 
-/// The builtin derives that the attributes `attrs` in `src` ask for, through every `cfg_attr` whose predicate `holds`.
-pub fn derives(src: &Source, attrs: &[Attr], holds: &dyn Fn(&Cfg) -> bool, into: &mut Vec<Derive>) {
+/// The derives that the attributes `attrs` in `src` ask for, through every `cfg_attr` whose predicate `holds`: the builtin ones, and the paths from first to last token of the others.
+pub fn derives(src: &Source, attrs: &[Attr], holds: &dyn Fn(&Cfg) -> bool, into: &mut (Vec<Derive>, Vec<(u32, u32)>)) {
     for attr in attrs {
         match attr {
             Attr::Derive(open) => {
                 for (from, to) in split_commas(src, open + 1, src.pair(*open)) {
-                    let last = (from..to).rev().find(|at| src.kind(*at) == TokenKind::Ident);
-                    let known = last.and_then(|at| DERIVES.iter().find(|(name, ..)| *name == src.text(at)));
-                    into.extend(known.map(|&(_, derive, _)| derive));
+                    let Some(last) = (from..to).rev().find(|at| matches!(src.kind(*at), TokenKind::Ident | TokenKind::RawIdent)) else { continue };
+                    match DERIVES.iter().find(|(name, ..)| *name == src.text(last)) {
+                        Some(&(_, derive, _)) => into.0.push(derive),
+                        None => into.1.push((from, last)),
+                    }
                 }
             }
             Attr::CfgAttr(cfg, inner) if holds(cfg) => derives(src, inner, holds, into),

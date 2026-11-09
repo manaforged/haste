@@ -5,6 +5,7 @@ mod adt;
 mod array;
 mod atomic;
 mod closure;
+mod coroutine;
 mod drop;
 mod equal;
 mod expr;
@@ -89,7 +90,18 @@ pub fn repr(cx: &mut Context<'_>, ty: Ty) -> Result<Repr> {
     Ok(if size == 0 { Repr::Zst } else { Repr::Mem { size, align: layout.align.abi.bytes().trailing_zeros() as u8 } })
 }
 
-/// The native signature of a reached function: memory values travel by address, and a memory result through a first `StructReturn` pointer.
+/// The register that a value of `ty` crosses a call in when it lives in memory but its layout is one scalar, as rustc passes such a value.
+pub fn unwrapped(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Type>> {
+    if !matches!(repr(cx, ty)?, Repr::Mem { .. }) {
+        return Ok(None);
+    }
+    match &cx.layout(ty)?.backend_repr {
+        rustc_abi::BackendRepr::Scalar(scalar) => abi::scalar_type(&crate::sema::layout::target()?, scalar).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// The native signature of a reached function: memory values travel by address unless their layout is one scalar, and a memory result through a first `StructReturn` pointer.
 pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
     signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))
 }
@@ -100,14 +112,17 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
     if let Some(ret) = ret {
         match repr(cx, ret)? {
             Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
-            Repr::Mem { .. } => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn)),
+            Repr::Mem { .. } => match unwrapped(cx, ret)? {
+                Some(machine) => signature.returns.push(AbiParam::new(machine)),
+                None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn)),
+            },
             Repr::Zst => {}
         }
     }
     for param in params {
         match repr(cx, param)? {
             Repr::Scalar(ty) => signature.params.push(AbiParam::new(ty)),
-            Repr::Mem { .. } => signature.params.push(AbiParam::new(Type::I64)),
+            Repr::Mem { .. } => signature.params.push(AbiParam::new(unwrapped(cx, param)?.unwrap_or(Type::I64))),
             Repr::Zst => {}
         }
     }
@@ -145,6 +160,7 @@ pub struct Lower<'l, 'a> {
     extended: rustc_hash::FxHashSet<ExprId>,
     pending: Vec<(moves::Root, moves::MovePath)>,
     index: usize,
+    resume: Option<coroutine::Resume>,
 }
 
 /// Whether `item` is a static, whose reached instance writes its value into the static's cell.
@@ -188,6 +204,7 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
         extended: Default::default(),
         pending: Vec::new(),
         index,
+        resume: None,
     };
     lower.run()?;
     Ok(func)
@@ -216,7 +233,7 @@ impl Lower<'_, '_> {
         self.jump(start, &[]);
         self.close();
         self.seal();
-        Ok(())
+        self.finish_resume()
     }
 
     fn declare_params(&mut self, entry: Block) -> Result<()> {
@@ -228,7 +245,7 @@ impl Lower<'_, '_> {
                 Repr::Zst => None,
                 _ => params.next(),
             };
-            self.declare(local, value)?;
+            self.declare_passed(local, value)?;
             if let Some(&pat) = self.typed.unpacks.get(&local) {
                 self.bind_matched(pat, self.locals[local as usize], Some((moves::Root::Local(local), Vec::new())))?;
                 self.commit_moves()?;
@@ -244,6 +261,7 @@ impl Lower<'_, '_> {
             Shape::Untuple(res) => self.untuple_call(res.clone()),
             &Shape::Ctor(variant) => self.ctor_body(variant),
             Shape::Clone(calls) => self.clone_body(calls.clone()),
+            Shape::Closure(closure) if closure.closure.coroutine => self.resume_root(closure.closure.body),
             Shape::Closure(closure) => {
                 let root = closure.closure.body;
                 self.bind_captures()?;
@@ -251,7 +269,10 @@ impl Lower<'_, '_> {
             }
             Shape::Body => {
                 let Some(root) = self.body.root else { bail!("body has no root") };
-                self.expr(root)
+                match self.typed.closures.get(&root).is_some_and(|closure| closure.coroutine) {
+                    true => self.closure(root),
+                    false => self.expr(root),
+                }
             }
         }
     }
@@ -268,6 +289,9 @@ impl Lower<'_, '_> {
         if !self.open {
             return Ok(());
         }
+        if self.resume.is_some() {
+            return self.resume_finish(value);
+        }
         let ret = self.typed.ret.unwrap_or(Ty(u32::MAX));
         if let (Some(out), Some(value)) = (self.sret, value) {
             let Repr::Mem { size, .. } = repr(self.cx, ret)? else { bail!("result pointer for a non-memory result") };
@@ -279,6 +303,7 @@ impl Lower<'_, '_> {
                 self.ins().return_(&[]);
             }
             (None, Some(value)) if !self.b.func.signature.returns.is_empty() => {
+                let value = self.passed(ret, value)?;
                 self.ins().return_(&[value]);
             }
             (_, _) if self.b.func.signature.returns.is_empty() && self.sret.is_none() => {
@@ -339,6 +364,32 @@ impl Lower<'_, '_> {
     }
 
     /// Gives the initialized `local` its own frame slot, holding a copy of `value` when there is one, and owns what it holds.
+    /// Declares parameter `local` with the value that crossed the call: a scalar is stored into the memory of a local whose type travels unwrapped.
+    fn declare_passed(&mut self, local: u32, value: Option<Value>) -> Result<()> {
+        self.declare(local, None)?;
+        if let (Some(place), Some(value)) = (self.locals[local as usize], value) {
+            self.store_passed(local, place, value)?;
+        }
+        Ok(())
+    }
+
+    /// Stores into `place` the value that parameter `local` received.
+    pub(super) fn store_passed(&mut self, local: u32, place: place::Place, value: Value) -> Result<()> {
+        match unwrapped(self.cx, self.typed.locals[local as usize].ty)? {
+            Some(machine) => self.write(place.at(0, Repr::Scalar(machine)), value),
+            None => self.write(place, value),
+        }
+        Ok(())
+    }
+
+    /// `value`, a value of `ty`, as it crosses a call: the scalar loaded from its memory when `ty` travels unwrapped.
+    pub(super) fn passed(&mut self, ty: Ty, value: Value) -> Result<Value> {
+        Ok(match unwrapped(self.cx, ty)? {
+            Some(machine) => self.ins().load(machine, value, 0),
+            None => value,
+        })
+    }
+
     pub fn declare(&mut self, local: u32, value: Option<Value>) -> Result<()> {
         self.declare_as(local, value, true)
     }
@@ -392,6 +443,14 @@ impl Lower<'_, '_> {
         };
         self.end_scope(mark)?;
         Ok(value)
+    }
+
+    /// Lowers the output of a macro call in expression position: its statements, then its tail, whose temporaries the enclosing statement drops.
+    fn expansion(&mut self, stmts: List, tail: Option<ExprId>) -> Result<Option<Value>> {
+        for &stmt in self.body.list(stmts) {
+            self.stmt(self.body.stmts[stmt as usize])?;
+        }
+        tail.map_or(Ok(None), |tail| self.expr(tail))
     }
 
     fn stmt(&mut self, stmt: Stmt) -> Result<()> {

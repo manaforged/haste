@@ -52,7 +52,7 @@ impl<'a> Infer<'_, 'a> {
         if let (true, Some(found)) = (prefix.is_empty(), self.declared_item(self.cx.names.symbols.text(*last))) {
             return Ok(Def::Item(found));
         }
-        if let Some(found) = self.local_variant(segments) {
+        if let Some(found) = self.local_member(segments) {
             return Ok(found);
         }
         let found = if prefix.is_empty() {
@@ -85,19 +85,32 @@ impl<'a> Infer<'_, 'a> {
 
     fn type_def_here(&mut self, path: &NamePath<'_>) -> Option<Def> {
         let inner = if let [name] = path.segments { self.declared_item(self.cx.names.symbols.text(*name)) } else { None };
-        inner.map(Def::Item).or_else(|| self.local_variant(path.segments)).or_else(|| self.resolve_local(path))
+        inner.map(Def::Item).or_else(|| self.local_member(path.segments)).or_else(|| self.resolve_local(path))
     }
 
-    /// The variant that `Enum::Variant` names when the body declares the enum.
-    fn local_variant(&mut self, segments: &[Sym]) -> Option<Def> {
+    /// The variant that `Enum::Variant` names, or the item that `module::name` names, when the body declares the enum or module.
+    fn local_member(&mut self, segments: &[Sym]) -> Option<Def> {
         let [head, name] = segments else { return None };
         let item = self.declared_item(self.cx.names.symbols.text(*head))?;
-        if self.cx.item(item).1.kind != ItemKind::Enum {
-            return None;
+        let text = self.cx.names.symbols.text(*name);
+        match self.cx.item(item).1.kind {
+            ItemKind::Enum => {
+                let def = self.cx.adt_def(item).ok()?;
+                let src = self.cx.item(item).0;
+                def.variants.iter().find(|variant| plain(src.text(variant.name)) == text).map(|variant| Def::Variant(item, variant.index))
+            }
+            ItemKind::Mod => self.local_child(item, text).map(Def::Item),
+            _ => None,
         }
-        let def = self.cx.adt_def(item).ok()?;
-        let (src, text) = (self.cx.item(item).0, self.cx.names.symbols.text(*name));
-        def.variants.iter().find(|variant| plain(src.text(variant.name)) == text).map(|variant| Def::Variant(item, variant.index))
+    }
+
+    /// The item named `name` inside the body-declared module `module`.
+    fn local_child(&self, module: ItemRef, name: &str) -> Option<ItemRef> {
+        let (root, at) = module.outer()?;
+        let file = &self.cx.expansion(root)?.file;
+        let named = |entry: &crate::outline::item::Item| entry.parent == Some(at) && entry.name.is_some_and(|word| plain(file.source.text(word)) == name);
+        let child = file.items.items.iter().position(named)?;
+        Some(root.inner(child as u32))
     }
 
     /// Resolves every segment of `path` in the type namespace, its first through the body's own `use` declarations when one binds it.

@@ -7,6 +7,7 @@ pub mod cfg;
 mod features;
 pub mod lock;
 pub mod manifest;
+pub mod script;
 
 use lock::Locked;
 use manifest::{Kind, Manifest};
@@ -48,6 +49,7 @@ pub struct Unit {
     pub side: Side,
     pub features: BTreeSet<String>,
     pub deps: Vec<(String, usize, Kind)>,
+    pub script: Option<std::sync::Arc<script::Output>>,
 }
 
 /// The resolved build graph of a workspace.
@@ -59,17 +61,28 @@ pub struct Graph {
 /// The packages of a workspace and its resolved graph.
 pub struct Workspace {
     pub root: PathBuf,
+    pub top: PathBuf,
     pub packages: Vec<Package>,
     pub graph: Graph,
 }
 
-fn registry_dirs() -> Result<Vec<PathBuf>> {
+fn cargo_home() -> Result<PathBuf> {
     let home = std::env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
-    let src = home.context("no CARGO_HOME or HOME")?.join("registry/src");
-    Ok(std::fs::read_dir(&src).with_context(|| format!("reading {}", src.display()))?.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect())
+    home.context("no CARGO_HOME or HOME")
+}
+
+fn subdirs(dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?.filter_map(|entry| entry.ok().map(|entry| entry.path())).filter(|path| path.is_dir()).collect())
+}
+
+fn registry_dirs() -> Result<Vec<PathBuf>> {
+    subdirs(&cargo_home()?.join("registry/src"))
 }
 
 fn source_dir(locked: &Locked, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<PathBuf> {
+    if let Some((url, commit)) = locked.git() {
+        return git_dir(&locked.name, url, commit);
+    }
     if !locked.is_registry() {
         return paths.get(&locked.name).cloned().with_context(|| format!("no path for local package {}", locked.name));
     }
@@ -77,12 +90,67 @@ fn source_dir(locked: &Locked, registries: &[PathBuf], paths: &BTreeMap<String, 
     registries.iter().map(|dir| dir.join(&leaf)).find(|dir| dir.is_dir()).with_context(|| format!("{leaf} is not in the registry source cache"))
 }
 
+fn git_dir(name: &str, url: &str, commit: &str) -> Result<PathBuf> {
+    let repo = url.trim_end_matches('/').rsplit('/').next().unwrap_or_default().trim_end_matches(".git");
+    let short = commit.get(..7).unwrap_or(commit);
+    let checkouts = subdirs(&cargo_home()?.join("git/checkouts"))?;
+    let mine = checkouts.into_iter().filter(|dir| dir.file_name().is_some_and(|leaf| leaf.to_string_lossy().starts_with(&format!("{repo}-"))));
+    mine.map(|dir| dir.join(short)).filter(|dir| dir.is_dir()).find_map(|root| find_package(&root, name)).with_context(|| format!("{name} at {short} is not in the git checkouts of {url}"))
+}
+
+fn find_package(root: &Path, name: &str) -> Option<PathBuf> {
+    let mut stack = vec![root.to_owned()];
+    while let Some(dir) = stack.pop() {
+        if manifest_name(&dir).as_deref() == Some(name) {
+            return Some(dir);
+        }
+        let skip = |path: &PathBuf| path.file_name().is_some_and(|leaf| leaf == "target" || leaf.to_string_lossy().starts_with('.'));
+        stack.extend(subdirs(&dir).unwrap_or_default().into_iter().filter(|path| !skip(path)));
+    }
+    None
+}
+
+fn manifest_name(dir: &Path) -> Option<String> {
+    let table: toml::Table = toml::from_str(&std::fs::read_to_string(dir.join("Cargo.toml")).ok()?).ok()?;
+    Some(table.get("package")?.get("name")?.as_str()?.to_owned())
+}
+
+/// The `[workspace]` table of the nearest manifest at or above `dir` that has one, which a local or git package inherits from.
+fn owning_workspace(dir: &Path) -> Result<Option<toml::Table>> {
+    for at in dir.ancestors().filter(|at| at.join("Cargo.toml").is_file()) {
+        if let Some(workspace) = manifest::workspace_of(at)? {
+            return Ok(Some(workspace));
+        }
+    }
+    Ok(None)
+}
+
 fn patch_paths(dir: &Path) -> Result<Vec<PathBuf>> {
-    let text = std::fs::read_to_string(dir.join("Cargo.toml"))?;
-    let table: toml::Table = toml::from_str(&text)?;
+    let mut paths = patches_in(&dir.join("Cargo.toml"), dir)?;
+    for at in dir.ancestors() {
+        let config = [".cargo/config.toml", ".cargo/config"].map(|leaf| at.join(leaf)).into_iter().find(|path| path.is_file());
+        if let Some(config) = config {
+            paths.extend(patches_in(&config, at)?);
+        }
+    }
+    Ok(paths)
+}
+
+fn patches_in(file: &Path, base: &Path) -> Result<Vec<PathBuf>> {
+    let table: toml::Table = toml::from_str(&std::fs::read_to_string(file)?).with_context(|| format!("parsing {}", file.display()))?;
     let patches = table.get("patch").and_then(toml::Value::as_table).into_iter().flat_map(|patch| patch.values());
     let entries = patches.filter_map(toml::Value::as_table).flat_map(|source| source.values());
-    Ok(entries.filter_map(|entry| entry.get("path")?.as_str()).map(|path| dir.join(path)).collect())
+    Ok(entries.filter_map(|entry| entry.get("path")?.as_str()).map(|path| base.join(path)).collect())
+}
+
+fn members(top: &Path, workspace: Option<&toml::Table>) -> Vec<PathBuf> {
+    let listed = workspace.and_then(|ws| ws.get("members")).and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str);
+    listed
+        .flat_map(|member| match member.strip_suffix("/*") {
+            Some(parent) => subdirs(&top.join(parent)).unwrap_or_default().into_iter().filter(|dir| dir.join("Cargo.toml").is_file()).collect(),
+            None => vec![top.join(member)],
+        })
+        .collect()
 }
 
 fn workspace_root(root: &Path) -> Result<PathBuf> {
@@ -94,10 +162,9 @@ fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Resu
     let mut paths = BTreeMap::new();
     let mut stack = vec![root.to_owned()];
     stack.extend(patch_paths(top)?);
-    let members = workspace.and_then(|ws| ws.get("members")).and_then(toml::Value::as_array).into_iter().flatten();
-    stack.extend(members.filter_map(toml::Value::as_str).filter(|member| !member.contains('*')).map(|member| top.join(member)));
+    stack.extend(members(top, workspace));
     while let Some(dir) = stack.pop() {
-        let manifest = manifest::read(&dir, workspace)?;
+        let manifest = manifest::read(&dir, owning_workspace(&dir)?.as_ref())?;
         if paths.insert(manifest.name.clone(), dir.clone()).is_some() {
             continue;
         }
@@ -143,17 +210,18 @@ pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Wo
     let mut packages = Vec::with_capacity(locked.len());
     for entry in locked {
         let dir = source_dir(&entry, &registries, &paths)?;
-        let manifest = manifest::read(&dir, if entry.is_registry() { None } else { workspace.as_ref() })?;
+        let owner = if entry.is_registry() { None } else { owning_workspace(&dir)? };
+        let manifest = manifest::read(&dir, owner.as_ref())?;
         packages.push(Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false });
     }
     resolve_deps(&mut packages);
-    let root_name = manifest::read(root, workspace.as_ref())?.name;
+    let root_name = manifest::read(root, owning_workspace(root)?.as_ref())?.name;
     let members: Vec<usize> = packages.iter().enumerate().filter(|(_, package)| !package.locked.is_registry() && package.locked.name == root_name).map(|(at, _)| at).collect();
     if members.is_empty() {
         bail!("{root_name} is not in Cargo.lock");
     }
     let graph = features::resolve(&packages, targets, &members, features);
-    Ok(Workspace { root: root.to_owned(), packages, graph })
+    Ok(Workspace { root: root.to_owned(), top, packages, graph })
 }
 
 /// The standard library sources of the toolchain: `HASTE_LIBRARY`, or rust-src of the first stable toolchain.

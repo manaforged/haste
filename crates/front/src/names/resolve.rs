@@ -189,7 +189,7 @@ pub fn macro_path(paths: &Paths<'_>, path: &Path<'_>, at: ModRef) -> Option<Item
     }
 }
 
-fn paths_of<'a>(names: &'a Names, outline: &'a Outline, krate: usize, demands: &'a Asks) -> Paths<'a> {
+pub(super) fn paths_of<'a>(names: &'a Names, outline: &'a Outline, krate: usize, demands: &'a Asks) -> Paths<'a> {
     let entry = &names.crates[krate];
     Paths {
         krate: krate as u32,

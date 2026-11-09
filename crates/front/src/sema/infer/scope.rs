@@ -217,6 +217,7 @@ impl<'a> Infer<'_, 'a> {
             params.push(self.lower_ty(&sig.body, ty)?);
         }
         let ret = match sig.ret {
+            _ if sig.is_async => self.fresh(Kind::Var),
             Some(ty) => self.lower_ty(&sig.body, ty)?,
             None => self.cx.types.unit(),
         };

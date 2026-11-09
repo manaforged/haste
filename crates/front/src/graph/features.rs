@@ -32,7 +32,7 @@ impl Resolver<'_> {
             return *unit;
         }
         let unit = self.units.len();
-        self.units.push(Unit { package, side, features: BTreeSet::new(), deps: Vec::new() });
+        self.units.push(Unit { package, side, features: BTreeSet::new(), deps: Vec::new(), script: None });
         self.by_key.insert((package, side), unit);
         self.enabled.push(BTreeSet::new());
         self.want.push(BTreeMap::new());

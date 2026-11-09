@@ -22,6 +22,17 @@ pub enum ItemKind {
     ExternBlock,
 }
 
+/// What a procedural macro function is invoked as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcKind {
+    Bang,
+    Attribute,
+    Derive,
+}
+
+/// Each procedural macro attribute with the kind of macro it makes its function.
+pub const PROC_MACROS: [(&str, ProcKind); 3] = [("proc_macro", ProcKind::Bang), ("proc_macro_attribute", ProcKind::Attribute), ("proc_macro_derive", ProcKind::Derive)];
+
 /// An item's visibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vis {
@@ -55,6 +66,7 @@ pub struct Item {
     pub name: Option<u32>,
     pub vis: Vis,
     pub attrs: Vec<Attr>,
+    pub lead: u32,
     pub start: u32,
     pub end: u32,
     pub body: Option<u32>,

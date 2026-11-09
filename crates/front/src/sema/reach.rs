@@ -12,7 +12,7 @@ pub type Instance = (ItemRef, Vec<Ty>);
 /// Every function reached from some roots, each with its inferred body or the reason it has none.
 #[derive(Default)]
 pub struct Reached {
-    pub list: Vec<(Instance, Result<Typed, String>)>,
+    pub list: Vec<(Instance, Result<std::rc::Rc<Typed>, String>)>,
     pub index: HashMap<Instance, usize>,
     /// The bodies whose types have no layout yet, which lowering would fail on.
     pub unlaid: Vec<String>,
@@ -87,7 +87,7 @@ pub fn reach_anew(cx: &mut Context<'_>, reached: &mut Reached, dead: &[usize], r
     found
 }
 
-fn calls<'t>(cx: &'t Context<'_>, typed: &'t Result<Typed, String>) -> impl Iterator<Item = Instance> + 't {
+fn calls<'t>(cx: &'t Context<'_>, typed: &'t Result<std::rc::Rc<Typed>, String>) -> impl Iterator<Item = Instance> + 't {
     typed.iter().flat_map(|typed| typed.calls()).filter(|(item, _)| cx.intrinsic(*item).is_none()).map(|(item, substs)| (item, substs.to_vec()))
 }
 
@@ -110,13 +110,13 @@ fn drain(cx: &mut Context<'_>, reached: &mut Reached, mut queue: Vec<Instance>) 
 }
 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
-fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Typed, String> {
+fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<std::rc::Rc<Typed>, String> {
     if let Some(typed) = cx.finals.get(instance).cloned() {
         register(cx, (instance.0, &instance.1), &typed);
         return Ok(typed);
     }
     let asked = cx.asks.count();
-    let typed = infer(cx, instance.0, &instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?;
+    let typed = std::rc::Rc::new(infer(cx, instance.0, &instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?);
     let laid = lay_out(cx, &typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
     if laid.is_ok() && cx.asks.count() == asked {
         cx.finals.insert(instance.clone(), typed.clone());
@@ -134,4 +134,11 @@ fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The two roots a program run calls: std's `start` lang item at the return type of `main`, and `main`.
+pub fn main_roots(cx: &mut Context<'_>, main: ItemRef) -> anyhow::Result<[Instance; 2]> {
+    let start = cx.lang_item("start").ok_or_else(|| anyhow::anyhow!("no `start` lang item"))?;
+    let ret = super::infer::return_type(cx, main)?;
+    Ok([(start, vec![ret]), (main, Vec::new())])
 }

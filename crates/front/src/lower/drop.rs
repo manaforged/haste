@@ -265,6 +265,9 @@ impl Lower<'_, '_> {
             Shape::Glue(glue) => glue.clone(),
             _ => Default::default(),
         };
+        if let Some(resume) = glue.resume.clone() {
+            return self.coroutine_glue(ty, target, resume);
+        }
         let drop_fn = match glue.drop {
             Some(Res::Fn(item, substs)) => Some((item, substs)),
             _ => None,
@@ -333,11 +336,10 @@ impl Lower<'_, '_> {
         let code = self.ins().load(Type::I64, vtable, 0);
         let unit = self.cx.types.unit();
         let pointer = self.cx.types.intern(Kind::Ptr(crate::sema::ty::Mut::Mut, unit));
-        let signature = super::signature_of(self.cx, None, [pointer])?;
-        self.when(code, |lower| lower.call_code(code, (signature, None), vec![data]).map(drop))
+        self.when(code, |lower| lower.call_code(code, (vec![pointer], None), vec![data]).map(drop))
     }
 
-    fn drop_fields(&mut self, ty: Ty, place: Place) -> Result<()> {
+    pub(super) fn drop_fields(&mut self, ty: Ty, place: Place) -> Result<()> {
         let variants = match self.cx.types.kind(ty).clone() {
             Kind::Tuple(items) => vec![items],
             Kind::Adt(item, _) if self.cx.lang(item) == Some("manually_drop") || self.cx.item(item).1.kind == crate::outline::item::ItemKind::Union => return Ok(()),

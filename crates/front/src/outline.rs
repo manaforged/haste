@@ -22,13 +22,21 @@ use build::Loader;
 use item::{Attr, ItemKind, Vis};
 use tree::{Cache, Crate, Decl, Env, Macro, Module, State};
 
-/// One crate to outline: a library or binary target of a unit.
+/// What a crate is to its package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Lib,
+    Bin,
+    Script,
+}
+
+/// One crate to outline: the library, a binary or the build script of a unit.
 #[derive(Clone, Debug)]
 pub struct Root {
     pub unit: usize,
     pub name: String,
     pub path: PathBuf,
-    pub lib: bool,
+    pub role: Role,
 }
 
 /// The module trees of every crate in a workspace graph, read as far as lookups needed them.
@@ -37,20 +45,27 @@ pub struct Outline {
     pub crates: Vec<Crate>,
     pub deps: Vec<Vec<(String, usize)>>,
     pub cache: Cache,
+    /// The output text of each procedural macro called in a body, by macro function and input text, or why it failed.
+    pub procs: HashMap<(crate::names::ItemRef, String), Result<String, String>>,
 }
 
-/// The library and member binary targets of every unit.
-pub fn roots(workspace: &Workspace) -> Vec<Root> {
+/// The library and member binary targets of every unit, and the build scripts of the units `scripts`.
+pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
     let mut roots = Vec::new();
     for (unit, entry) in workspace.graph.units.iter().enumerate() {
         let manifest = &workspace.packages[entry.package].manifest;
         if let Some(lib) = &manifest.lib {
-            let name = manifest.lib_name.as_ref().unwrap_or(&manifest.name);
-            roots.push(Root { unit, name: name.replace('-', "_"), path: lib.clone(), lib: true });
+            let name = manifest.lib_name.as_ref().unwrap_or(&manifest.name).replace('-', "_");
+            let supplied = workspace.packages[entry.package].sysroot && name == "proc_macro";
+            let path = if supplied { PathBuf::from(tree::PROC_MACRO_ROOT) } else { lib.clone() };
+            roots.push(Root { unit, name, path, role: Role::Lib });
         }
         if workspace.graph.members.contains(&entry.package) {
-            let bins = manifest.bins.iter().map(|(name, path)| Root { unit, name: name.clone(), path: path.clone(), lib: false });
+            let bins = manifest.bins.iter().map(|(name, path)| Root { unit, name: name.clone(), path: path.clone(), role: Role::Bin });
             roots.extend(bins);
+        }
+        if let Some(path) = manifest.build.as_ref().filter(|_| scripts.contains(&unit)) {
+            roots.push(Root { unit, name: "build_script_build".to_owned(), path: path.clone(), role: Role::Script });
         }
     }
     roots
@@ -60,30 +75,31 @@ const IMPLICIT: [&str; 3] = ["std", "core", "alloc"];
 
 fn implicit(workspace: &Workspace, roots: &[Root]) -> Vec<(String, usize)> {
     let named = |name: &str| {
-        let found = roots.iter().position(|root| root.lib && workspace.packages[workspace.graph.units[root.unit].package].sysroot && root.name == name);
+        let found = roots.iter().position(|root| root.role == Role::Lib && workspace.packages[workspace.graph.units[root.unit].package].sysroot && root.name == name);
         found.map(|at| (name.to_owned(), at))
     };
     IMPLICIT.iter().chain(&["proc_macro"]).filter_map(|name| named(name)).collect()
 }
 
 fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize)>> {
-    let libs: HashMap<usize, usize> = roots.iter().enumerate().filter(|(_, root)| root.lib).map(|(index, root)| (root.unit, index)).collect();
+    let libs: HashMap<usize, usize> = roots.iter().enumerate().filter(|(_, root)| root.role == Role::Lib).map(|(index, root)| (root.unit, index)).collect();
     let implicit = implicit(workspace, roots);
     roots
         .iter()
         .map(|root| {
             let unit = &workspace.graph.units[root.unit];
             let package = &workspace.packages[unit.package];
-            let normal = unit.deps.iter().filter(|(_, _, kind)| *kind == Kind::Normal);
+            let wanted = if root.role == Role::Script { Kind::Build } else { Kind::Normal };
+            let normal = unit.deps.iter().filter(|(_, _, kind)| *kind == wanted);
             let extern_name = |key: &str, dep: usize, lib: usize| {
                 let renamed = workspace.packages[workspace.graph.units[dep].package].manifest.name != key;
                 if renamed { key.replace('-', "_") } else { roots[lib].name.clone() }
             };
             let mut deps: Vec<(String, usize)> = normal.filter_map(|(key, dep, _)| libs.get(dep).map(|&lib| (extern_name(key, *dep, lib), lib))).collect();
-            if !root.lib && let Some(&lib) = libs.get(&root.unit) {
+            if root.role == Role::Bin && let Some(&lib) = libs.get(&root.unit) {
                 deps.push((root.name.replace('-', "_"), lib));
             }
-            if !package.sysroot {
+            if !package.sysroot || root.role == Role::Script {
                 let wanted = |name: &str| IMPLICIT.contains(&name) || (name == "proc_macro" && package.manifest.proc_macro);
                 deps.extend(implicit.iter().filter(|(name, _)| wanted(name)).cloned());
             }
@@ -92,17 +108,20 @@ fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize
         .collect()
 }
 
-/// Creates the outline of every root with only the root modules declared; `load` reads modules as lookups need them.
-pub fn new(workspace: &Workspace, targets: &Targets) -> Outline {
-    let roots = roots(workspace);
+/// Creates the outline of every root, with the build scripts of the units `scripts`, with only the root modules declared; `load` reads modules as lookups need them.
+pub fn new(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Outline {
+    let roots = roots(workspace, scripts);
     let deps = dependencies(workspace, &roots);
     let crates = roots.iter().map(|root| root_crate(workspace, targets, root)).collect();
-    Outline { roots, crates, deps, cache: Cache::default() }
+    Outline { roots, crates, deps, cache: Cache::default(), procs: HashMap::default() }
 }
 
 fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root) -> Crate {
     let unit = &workspace.graph.units[root.unit];
-    let env = Env { target: targets.of(unit.side).clone(), features: unit.features.clone() };
+    let script = root.role == Role::Script;
+    let known = script || unit.script.is_some() || workspace.packages[unit.package].manifest.build.is_none();
+    let side = if script { crate::graph::Side::Host } else { unit.side };
+    let env = Env { target: targets.of(side).clone(), features: unit.features.clone(), script: unit.script.clone().filter(|_| !script), known };
     Crate { env, modules: vec![root_module(&root.path)], ..Crate::default() }
 }
 
@@ -115,9 +134,18 @@ fn root_module(path: &std::path::Path) -> Module {
 impl Outline {
     /// The outline of the single crate whose root file is `path`, with no dependencies.
     pub fn file(path: &std::path::Path, target: crate::graph::cfg::Target) -> Outline {
-        let root = Root { unit: 0, name: String::new(), path: path.to_owned(), lib: true };
-        let krate = Crate { env: Env { target, features: Default::default() }, modules: vec![root_module(path)], ..Crate::default() };
-        Outline { roots: vec![root], crates: vec![krate], deps: vec![Vec::new()], cache: Cache::default() }
+        let root = Root { unit: 0, name: String::new(), path: path.to_owned(), role: Role::Lib };
+        let krate = Crate { env: Env { target, ..Env::default() }, modules: vec![root_module(path)], ..Crate::default() };
+        Outline { roots: vec![root], crates: vec![krate], deps: vec![Vec::new()], cache: Cache::default(), procs: HashMap::default() }
+    }
+
+    /// The top-level `fn main` in the root file of crate `krate`.
+    pub fn main(&self, krate: usize) -> Option<crate::names::ItemRef> {
+        let tree = &self.crates[krate];
+        let (file_at, file) = tree.files.iter().enumerate().find(|(_, file)| !file.expanded && file.source.path == self.roots[krate].path)?;
+        let is_main = |item: &item::Item| item.kind == ItemKind::Fn && item.parent.is_none() && item.name.is_some_and(|name| file.source.text(name) == "main");
+        let at = file.items.items.iter().position(is_main)?;
+        Some(crate::names::ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 })
     }
 
     /// Reads module `module` of crate `krate` if it is only declared, then expands what that made resolvable.
@@ -203,6 +231,34 @@ impl Outline {
         }
         self.settle(demands)?;
         Ok(true)
+    }
+
+    /// Adds to crate `krate` the items that procedural macros wrote, each `(module, source, macro name)`, and reads what they declare.
+    pub fn insert(&mut self, krate: usize, outputs: Vec<(usize, source::Source, String)>) -> Result<()> {
+        let mut demands = Vec::new();
+        self.with_loader(krate, &mut demands, |loader| outputs.into_iter().try_for_each(|(module, source, name)| loader.insert(module, source, &name)))?;
+        self.settle(demands)
+    }
+
+    /// Takes item `at` of `file` in crate `krate` out of the crate, as an attribute macro does with the item it replaces.
+    pub fn consume(&mut self, krate: usize, file: &Arc<tree::File>, at: u32) {
+        let holder = &mut self.crates[krate];
+        let Some(index) = holder.files.iter().position(|entry| Arc::ptr_eq(entry, file)) else { return };
+        holder.consumed.insert((index as u32, at));
+        holder.impls.retain(|block| (block.file, block.at) != (index, at));
+    }
+
+    /// The crates that depend on crate `krate`, directly or through others, with `krate` itself.
+    pub fn dependents(&self, krate: usize) -> Vec<usize> {
+        let mut found = vec![krate];
+        let mut at = 0;
+        while let Some(&next) = found.get(at) {
+            let users = (0..self.deps.len()).filter(|user| self.deps[*user].iter().any(|(_, dep)| *dep == next));
+            let fresh: Vec<usize> = users.filter(|user| !found.contains(user)).collect();
+            found.extend(fresh);
+            at += 1;
+        }
+        found
     }
 
     /// Moves the deferred calls of crate `krate` at the given indexes, which name resolution bound to procedural macros, out of the calls left to expand.

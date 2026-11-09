@@ -3,7 +3,7 @@ use haste_codegen::{Type, Value};
 
 use crate::body::{ExprId, List};
 use crate::names::ItemRef;
-use crate::sema::infer::{By, ClosureBody, Res, Shape, needs_drop};
+use crate::sema::infer::{By, Capture, ClosureBody, Res, Shape, needs_drop};
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::moves::Root;
@@ -16,36 +16,53 @@ impl Lower<'_, '_> {
         let ty = self.ty_of(expr);
         let Some(env) = self.cx.closure_env(ty) else { bail!("a closure whose captures are not known") };
         let Some(closure) = self.typed.closures.get(&expr).cloned() else { bail!("a closure expression with no inferred closure") };
-        let whole = repr(self.cx, env)?;
-        let Some(slot) = self.slot(whole) else { return Ok(None) };
-        let whole = Place::slot(slot, whole);
+        let shape = repr(self.cx, env)?;
+        let Some(slot) = self.slot(shape) else { return Ok(None) };
+        let object = Place::slot(slot, shape);
+        let (whole, env) = match closure.coroutine {
+            true => self.coroutine_header(ty, object, env)?,
+            false => (object, env),
+        };
         for (index, capture) in closure.captures.iter().enumerate() {
-            let held = self.locals[capture.local as usize];
-            let local_ty = self.typed.locals[capture.local as usize].ty;
-            let value = match capture.by {
-                By::Value => {
-                    let value = held.and_then(|place| self.read(place));
-                    if needs_drop(self.cx, local_ty)? {
-                        self.moved_out(Root::Local(capture.local), &[])?;
-                    }
-                    value
-                }
-                By::Ref | By::Mut => Some(self.address_or_dangling(held, local_ty)?),
-            };
+            let value = self.capture_value(capture)?;
             let part = self.part_place(whole, env, (0, index as u32))?;
             if let Some(value) = value {
                 self.write(part, value);
             }
         }
-        Ok(self.read(whole))
+        Ok(self.read(object))
+    }
+
+    /// Zeroes the state word and frame pointer of the coroutine object at `object`, and gives the place and type of its captures.
+    fn coroutine_header(&mut self, ty: Ty, object: Place, env: Ty) -> Result<(Place, Ty)> {
+        let zero = self.ins().iconst(Type::I64, 0);
+        for word in 0..2 {
+            let part = self.part_place(object, env, (0, word))?;
+            self.write(part, zero);
+        }
+        let (inner, offset) = self.captures_of(ty)?;
+        Ok((object.at(offset, repr(self.cx, inner)?), inner))
+    }
+
+    fn capture_value(&mut self, capture: &Capture) -> Result<Option<Value>> {
+        let held = self.locals[capture.local as usize];
+        let local_ty = self.typed.locals[capture.local as usize].ty;
+        Ok(match capture.by {
+            By::Value => {
+                let value = held.and_then(|place| self.read(place));
+                if needs_drop(self.cx, local_ty)? {
+                    self.moved_out(Root::Local(capture.local), &[])?;
+                }
+                value
+            }
+            By::Ref | By::Mut => Some(self.address_or_dangling(held, local_ty)?),
+        })
     }
 
     /// Points each local that the closure being lowered captures at its place in the environment.
     pub(super) fn bind_captures(&mut self) -> Result<()> {
         let Shape::Closure(ClosureBody { env: Some(local), closure, .. }) = self.typed.shape.clone() else { return Ok(()) };
-        let Kind::Ref(_, env) = *self.cx.types.kind(self.typed.locals[local as usize].ty) else { bail!("a closure environment that is not a reference") };
-        let Some(pointer) = self.locals[local as usize].and_then(|place| self.read(place)) else { bail!("a closure environment with no address") };
-        let whole = Place { base: Base::Addr(pointer), offset: 0, repr: repr(self.cx, env)? };
+        let (whole, env) = self.env_place(local, closure.coroutine)?;
         for (index, capture) in closure.captures.iter().enumerate() {
             let part = self.part_place(whole, env, (0, index as u32))?;
             let local_ty = self.typed.locals[capture.local as usize].ty;
@@ -61,6 +78,30 @@ impl Lower<'_, '_> {
             });
         }
         Ok(())
+    }
+
+    /// The place of the captures tuple that the closure or coroutine parameter `local` points at, and its type.
+    fn env_place(&mut self, local: u32, coroutine: bool) -> Result<(Place, Ty)> {
+        let local_ty = self.typed.locals[local as usize].ty;
+        let Some(held) = self.locals[local as usize] else { bail!("a closure environment with no place") };
+        let (pointer, pointee) = match (coroutine, self.cx.types.kind(local_ty).clone()) {
+            (true, Kind::Adt(_, args)) => {
+                let field = self.part_place(held, local_ty, (0, 0))?;
+                (self.read(field), args.first().copied())
+            }
+            (false, Kind::Ref(_, env)) => (self.read(held), Some(env)),
+            _ => bail!("a closure environment that is not a reference"),
+        };
+        let (Some(pointer), Some(pointee)) = (pointer, pointee) else { bail!("a closure environment with no address") };
+        let pointee = match self.cx.types.kind(pointee).clone() {
+            Kind::Ref(_, inner) => inner,
+            _ => pointee,
+        };
+        if !coroutine {
+            return Ok((Place { base: Base::Addr(pointer), offset: 0, repr: repr(self.cx, pointee)? }, pointee));
+        }
+        let (inner, offset) = self.captures_of(pointee)?;
+        Ok((Place { base: Base::Addr(pointer), offset, repr: repr(self.cx, inner)? }, inner))
     }
 
     /// Lowers a call of the callee value `callee`, a closure, a function item, a trait object or a value with its own `Fn` impl, which inference resolved to `(item, substs)`.
@@ -148,8 +189,7 @@ impl Lower<'_, '_> {
         let ret = self.ty_of(expr);
         let unit = self.cx.types.unit();
         let pointer = self.cx.types.intern(Kind::Ptr(Mut::Mut, unit));
-        let signature = super::signature_of(self.cx, Some(ret), [pointer, tuple])?;
-        let result = self.call_code(code, (signature, Some(ret)), std::iter::once(data).chain(packed).collect())?;
+        let result = self.call_code(code, (vec![pointer, tuple], Some(ret)), std::iter::once(data).chain(packed).collect())?;
         self.moved_out(root, &path)?;
         let target = self.address(boxed);
         self.invoke(free, &free_substs, vec![target])?;

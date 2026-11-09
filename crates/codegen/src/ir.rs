@@ -352,12 +352,14 @@ pub struct Function {
     pub(crate) slots: Vec<SlotData>,
     pub(crate) sigs: Vec<Signature>,
     pub(crate) entry: Option<Block>,
+    /// The split that turns this function into a coroutine's resume function, when it is one.
+    pub coroutine: Option<crate::coroutine::Coroutine>,
 }
 
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None }
     }
 
     /// The type of `value`.

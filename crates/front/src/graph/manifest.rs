@@ -189,11 +189,18 @@ pub fn read(dir: &Path, workspace: Option<&Table>) -> Result<Manifest> {
     manifest_of(dir, &root, workspace)
 }
 
-/// Reads the `[workspace]` table of the manifest at `dir/Cargo.toml`, if it has one.
+/// Reads the `[workspace]` table of the manifest at `dir/Cargo.toml`, if it has one, with its dependency paths made absolute.
 pub fn workspace_of(dir: &Path) -> Result<Option<Table>> {
     let path = dir.join("Cargo.toml");
     let root: Table = toml::from_str(&std::fs::read_to_string(&path)?).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(root.get("workspace").and_then(Value::as_table).cloned())
+    let Some(mut workspace) = root.get("workspace").and_then(Value::as_table).cloned() else { return Ok(None) };
+    let deps = workspace.get_mut("dependencies").and_then(Value::as_table_mut).into_iter().flat_map(|deps| deps.iter_mut());
+    for entry in deps.filter_map(|(_, spec)| spec.as_table_mut()) {
+        let Some(relative) = entry.get("path").and_then(Value::as_str) else { continue };
+        let absolute = normalize(&dir.join(relative)).to_string_lossy().into_owned();
+        entry.insert("path".to_owned(), Value::String(absolute));
+    }
+    Ok(Some(workspace))
 }
 
 fn edition_of(package: &Table, workspace: Option<&Table>) -> String {

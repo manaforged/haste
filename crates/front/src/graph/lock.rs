@@ -31,6 +31,13 @@ impl Locked {
         self.source.as_deref().is_some_and(|source| source.starts_with("registry+") || source.starts_with("sparse+"))
     }
 
+    /// The repository URL and commit of a package from git.
+    pub fn git(&self) -> Option<(&str, &str)> {
+        let rest = self.source.as_deref()?.strip_prefix("git+")?;
+        let (url, commit) = rest.split_once('#')?;
+        Some((url.split('?').next().unwrap_or(url), commit))
+    }
+
     /// The parsed dependency lines.
     pub fn deps(&self) -> impl Iterator<Item = LockedDep<'_>> {
         self.dependencies.iter().map(|line| {

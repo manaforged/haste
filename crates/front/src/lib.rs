@@ -5,6 +5,8 @@ pub mod graph;
 pub mod host;
 pub mod image;
 pub mod lower;
+pub mod macros;
 pub mod names;
 pub mod outline;
+pub mod scripts;
 pub mod sema;

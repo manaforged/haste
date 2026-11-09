@@ -35,6 +35,8 @@ pub struct Closure {
     pub captures: Vec<Capture>,
     /// Whether the body moves a captured value out, so a call consumes the closure and its body owns the captures it takes by value.
     pub consumes: bool,
+    /// Whether this is an `async` block or body: a coroutine that implements `Future` and holds a state word and a frame before its captures.
+    pub coroutine: bool,
 }
 
 /// What a closure's own function lowers: the closure expression of `parent`, and the local that holds its environment when it captures anything.
@@ -85,21 +87,77 @@ impl Infer<'_, '_> {
             (None, Some((_, output))) => output,
             (None, None) => self.fresh(Kind::Var),
         };
-        let outer = (self.out.ret.replace(ret), std::mem::take(&mut self.loops), std::mem::take(&mut self.try_blocks), self.diverges);
-        let found = self.expr(body, Some(ret)).and_then(|found| self.coerce_expr(body, found, ret));
-        (self.out.ret, self.loops, self.try_blocks, self.diverges) = outer;
+        let found = self.closure_body(ret, |infer| infer.expr(body, Some(ret)).and_then(|found| infer.coerce_expr(body, found, ret)));
         self.scopes.truncate(depth);
         let uses = self.uses.pop().expect("the closure pushed its uses");
         found?;
         let moved = self.moved_reads(&uses.reads)?;
-        let consumes = !moved.is_empty();
-        let captures = self.captures(uses, (by_move, &moved));
-        self.out.closures.insert(expr, Closure { params: locals, ret, body, captures, consumes });
+        let captures = self.captures(uses, (by_move, &moved), &[]);
+        self.out.closures.insert(expr, Closure { params: locals, ret, body, captures, consumes: !moved.is_empty(), coroutine: false });
         Ok(self.cx.types.intern(Kind::Closure(parent, substs, expr.0)))
     }
 
-    fn captures(&mut self, uses: Uses, (by_move, moved): (bool, &[u32])) -> Vec<Capture> {
-        let mut captures: Vec<Capture> = Vec::new();
+    /// Infers the `async` block or body `expr` as a coroutine whose output is `output` when known, capturing by value when `by_move` and always capturing `forced`.
+    pub(super) fn coroutine_expr(&mut self, expr: ExprId, (output, by_move): (Option<Ty>, bool), forced: &[u32]) -> Result<Ty> {
+        let Some((parent, substs)) = self.instance.clone() else { bail!("an `async` block outside a function body") };
+        let Expr::Block { stmts, tail, .. } = *self.body.expr(expr) else { bail!("an `async` body that is not a block") };
+        let depth = self.scopes.len();
+        self.uses.push(Uses { first: self.out.locals.len() as u32, ..Uses::default() });
+        let ret = output.unwrap_or_else(|| self.fresh(Kind::Var));
+        let found = self.closure_body(ret, |infer| {
+            let found = infer.block(stmts, tail, Some(ret))?;
+            infer.coerce(found, ret)
+        });
+        self.scopes.truncate(depth);
+        let uses = self.uses.pop().expect("the coroutine pushed its uses");
+        found?;
+        let moved = self.moved_reads(&uses.reads)?;
+        let captures = self.captures(uses, (by_move, &moved), forced);
+        self.out.closures.insert(expr, Closure { params: Vec::new(), ret, body: expr, captures, consumes: true, coroutine: true });
+        Ok(self.cx.types.intern(Kind::Closure(parent, substs, expr.0)))
+    }
+
+    fn closure_body(&mut self, ret: Ty, run: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let outer = (self.out.ret.replace(ret), std::mem::take(&mut self.loops), std::mem::take(&mut self.try_blocks), self.diverges);
+        let found = run(self);
+        (self.out.ret, self.loops, self.try_blocks, self.diverges) = outer;
+        found
+    }
+
+    /// The output of `ty` when it is a coroutine: one this body defines, or one whose defining body is inferred.
+    pub(super) fn coroutine_output(&self, ty: Ty) -> Option<Ty> {
+        let Kind::Closure(parent, substs, at) = self.cx.types.kind(self.resolve(ty)) else { return None };
+        let here = self.instance.as_ref().is_some_and(|(item, args)| item == parent && args == substs);
+        let local = here.then(|| self.out.closures.get(&ExprId(*at))).flatten().filter(|closure| closure.coroutine).map(|closure| closure.ret);
+        local.or_else(|| self.cx.closure(self.resolve(ty)).filter(|info| info.closure.coroutine).map(|info| info.closure.ret))
+    }
+
+    /// Infers `inner.await`: the future that `IntoFuture::into_future` makes of `inner`, polled until it gives its output.
+    pub(super) fn await_expr(&mut self, expr: ExprId, inner: ExprId) -> Result<Ty> {
+        let found = self.expr(inner, None)?;
+        let (into_future, future) = self.lang_call("into_future", found)?;
+        let Some(future_trait) = self.cx.lang_item("future_trait") else { bail!("core has no `Future`") };
+        let output = self.project(future_trait, future, Vec::new(), "Output")?;
+        let Some(poll) = self.cx.lang_item("poll") else { bail!("core has no `Future::poll`") };
+        let (item, substs) = self.future_poll(future_trait, poll, future)?;
+        let polled = self.fn_types(item, &substs)?.1;
+        self.out.awaits.insert(expr, super::Awaited { into_future, future, poll: Res::Fn(item, substs), polled });
+        Ok(output)
+    }
+
+    /// The `Future::poll` that polls a future of type `future`: the compiler's for a coroutine or a trait object, else the one of the impl that applies.
+    fn future_poll(&mut self, of: ItemRef, poll: ItemRef, future: Ty) -> Result<(ItemRef, Vec<Ty>)> {
+        let future = self.resolve(future);
+        if self.compiler_impl(of, future) || self.object_holds(of, future, &[]) == Some(true) {
+            return Ok((poll, vec![future]));
+        }
+        let Some((block, args)) = self.select(of, future, &[])? else { bail!("{} is not a future", self.show(future)) };
+        let Some(member) = self.cx.member(block, "poll") else { bail!("the `Future` impl of {} has no `poll`", self.show(future)) };
+        Ok((member, args.into_iter().map(|arg| self.zonk(arg)).collect()))
+    }
+
+    fn captures(&mut self, uses: Uses, (by_move, moved): (bool, &[u32]), forced: &[u32]) -> Vec<Capture> {
+        let mut captures: Vec<Capture> = forced.iter().map(|&local| Capture { local, by: By::Value }).collect();
         for local in uses.used {
             if captures.iter().any(|capture| capture.local == local) {
                 continue;
@@ -407,7 +465,7 @@ impl Infer<'_, '_> {
     fn wrapped(&self, expr: ExprId) -> ExprId {
         match *self.body.expr(expr) {
             Expr::Paren(inner) => self.wrapped(inner),
-            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe } if self.body.list(stmts).is_empty() => self.wrapped(tail),
+            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Expansion | BlockKind::Unsafe } if self.body.list(stmts).is_empty() => self.wrapped(tail),
             _ => expr,
         }
     }
@@ -549,9 +607,27 @@ pub fn register(cx: &mut Context<'_>, (parent, substs): (ItemRef, &[Ty]), typed:
             }
         });
         let env = Kind::Tuple(parts.collect());
-        let env = cx.types.intern(env);
+        let mut env = cx.types.intern(env);
+        if closure.coroutine {
+            let word = cx.types.prim(crate::names::Primitive::Usize);
+            env = cx.types.intern(Kind::Tuple(vec![word, word, env]));
+        }
         cx.set_closure(ty, ClosureInfo { parent, typed: shared.clone(), closure: closure.clone(), env });
     }
+}
+
+/// The typed form of `Future::poll` at the coroutine type `ty`: its defining body, resumed with the pinned coroutine and the task context, returning `Poll` of its output.
+pub fn coroutine_typed(cx: &mut Context<'_>, poll: ItemRef, ty: Ty) -> Result<Typed> {
+    let Some(info) = cx.closure(ty) else { bail!("a coroutine whose defining body was not inferred") };
+    let (params, ret) = super::detached(cx, poll, |infer| infer.fn_types(poll, &[ty]))?;
+    let mut typed = (*info.typed).clone();
+    let first = typed.locals.len() as u32;
+    typed.locals.extend(params.iter().map(|&ty| Local { ty, mutable: false }));
+    typed.params = vec![first, first + 1];
+    typed.ret = Some(ret);
+    typed.shape = Shape::Closure(ClosureBody { parent: info.parent, closure: info.closure.clone(), env: Some(first) });
+    typed.drops = super::drop::drop_calls(cx, &typed)?;
+    Ok(typed)
 }
 
 /// The typed form of the function that the closure type `ty` runs: its defining body, with an environment parameter and the closure's own parameters.

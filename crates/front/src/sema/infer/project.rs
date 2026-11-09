@@ -220,6 +220,9 @@ impl Infer<'_, '_> {
         if self.cx.lang(of) == Some("fn_once") && name == "Output" {
             return Ok(self.callable_sig(ty)?.map(|(_, ret)| ret));
         }
+        if self.cx.lang(of) == Some("future_trait") && name == "Output" && let Some(output) = self.coroutine_output(ty) {
+            return Ok(Some(output));
+        }
         Ok(None)
     }
 

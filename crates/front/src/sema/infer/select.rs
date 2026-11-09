@@ -221,6 +221,7 @@ impl<'a> Infer<'_, 'a> {
             wanted.extend(header.body.list(generic.bounds).iter().map(|&bound| (arg, bound)));
         }
         self.with_frame(frame, |infer| {
+            infer.self_ty = Some(infer.lower_ty(&header.body, header.self_ty)?);
             for (ty, bound) in wanted {
                 if !infer.bound_holds(&header.body, home, (ty, bound), depth)? {
                     return Ok(false);
@@ -247,6 +248,10 @@ impl<'a> Infer<'_, 'a> {
         let kind = self.cx.types.kind(self.resolve(ty));
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
             return Ok(true);
+        }
+        if self.compiler_impl(of, ty) {
+            let args = self.bound_args(of, arena, path, ty)?;
+            return self.bindings_hold(arena, path, (of, ty, &args));
         }
         if self.is_callable_trait(of) && matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
             let Some(sig) = self.fn_bound(arena, home, bound)? else { return Ok(true) };

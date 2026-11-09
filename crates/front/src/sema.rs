@@ -39,7 +39,7 @@ pub struct Store {
     layouts: HashMap<ty::Ty, Rc<layout::Layout>>,
     tails: HashMap<ty::Ty, ty::Ty>,
     headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
-    finals: HashMap<reach::Instance, infer::Typed>,
+    finals: HashMap<reach::Instance, Rc<infer::Typed>>,
     lookups: Lookups,
 }
 
@@ -185,7 +185,7 @@ pub struct Context<'a> {
     langs: Option<(Rc<HashMap<String, ItemRef>>, Rc<[u32]>)>,
     drops: HashMap<ty::Ty, bool>,
     closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
-    finals: HashMap<reach::Instance, infer::Typed>,
+    finals: HashMap<reach::Instance, Rc<infer::Typed>>,
     tails: HashMap<ty::Ty, ty::Ty>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
     kids: std::cell::RefCell<HashMap<usize, Rc<Kids>>>,

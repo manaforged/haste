@@ -6,10 +6,16 @@ use rustc_lexer::TokenKind;
 
 use super::item::{Attr, Item, ItemKind};
 use super::source::Source;
-use super::tree::{Cache, Crate, Decl, File, Impl, Macro, Module, State, Textual, Waiting, textual};
+use super::tree::{Cache, Crate, Decl, File, Held, Impl, Macro, Module, State, Textual, Waiting, textual};
 use super::{derive, mbe, rules, scan};
 
 const DEPTH: usize = 128;
+/// The item kinds that an attribute macro can stand on.
+const ATTRIBUTED: [ItemKind; 9] = [ItemKind::Fn, ItemKind::Struct, ItemKind::Enum, ItemKind::Union, ItemKind::Impl, ItemKind::Trait, ItemKind::Const, ItemKind::Static, ItemKind::Type];
+/// Builtin attributes, which never name a macro; any other attribute is looked up as one.
+const INERT: &[&str] = &[
+    "allow", "warn", "deny", "forbid", "expect", "inline", "cold", "must_use", "doc", "repr", "test", "ignore", "should_panic", "deprecated", "non_exhaustive", "track_caller", "automatically_derived", "no_mangle", "export_name", "link_section", "link_name", "used", "target_feature", "stable", "unstable", "const_stable", "feature", "lang", "diagnostic", "rustfmt", "clippy",
+];
 const BUILTIN: [&str; 6] = ["include", "global_asm", "compile_error", "concat", "env", "asm"];
 /// The dependencies, in order of preference, whose `$crate` names core's traits in a derived impl: core, the shim that standard crates depend on in its place, and std.
 const CORE_HOLDERS: [&str; 3] = ["core", "rustc_std_workspace_core", "std"];
@@ -59,7 +65,7 @@ impl Loader<'_> {
     }
 
     fn open(&mut self, module: usize, candidates: &[PathBuf], by_attr: bool) -> Option<usize> {
-        let Some(found) = candidates.iter().find(|candidate| candidate.is_file()) else {
+        let Some(found) = candidates.iter().find(|candidate| super::tree::exists(candidate)) else {
             self.out.missing.extend_from_slice(candidates);
             self.out.modules[module].state = State::Missing;
             return None;
@@ -90,25 +96,50 @@ impl Loader<'_> {
             if item.parent != owner || !self.out.env.enabled(&item.attrs) {
                 continue;
             }
+            if self.out.consumed.contains(&(index as u32, at as u32)) {
+                continue;
+            }
+            self.attributes(file, module, (at as u32, item));
             match item.kind {
                 ItemKind::Mod => self.child(file, index, module, (at as u32, item))?,
                 ItemKind::MacroRules | ItemKind::Macro => self.define(file, (index as u32, at as u32), item),
                 ItemKind::MacroCall => self.call(file, module, at as u32)?,
                 ItemKind::Impl => self.impl_block(index, module, at as u32, file)?,
-                ItemKind::Struct | ItemKind::Enum | ItemKind::Union => self.derive(file, module, item)?,
+                ItemKind::Struct | ItemKind::Enum | ItemKind::Union => self.derive(file, module, (at as u32, item))?,
                 _ => {}
             }
         }
         Ok(())
     }
 
-    fn derive(&mut self, file: &Arc<File>, module: usize, item: &Item) -> Result<()> {
-        let env = &self.out.env;
-        let mut wanted = Vec::new();
-        derive::derives(&file.source, &item.attrs, &|cfg| env.allows(cfg), &mut wanted);
+    fn attributes(&mut self, file: &Arc<File>, module: usize, (at, item): (u32, &Item)) {
+        if !ATTRIBUTED.contains(&item.kind) {
+            return;
+        }
+        let src = &file.source;
+        for attr in &item.attrs {
+            let Attr::Other(first) = *attr else { continue };
+            let name = src.text(first);
+            if INERT.contains(&name) || name.starts_with("rustc_") {
+                continue;
+            }
+            let mut last = first;
+            while src.kind(last + 1) == TokenKind::Colon && src.kind(last + 2) == TokenKind::Colon && src.kind(last + 3) == TokenKind::Ident {
+                last += 3;
+            }
+            self.out.attributed.push(Held { file: file.clone(), owner: module, at, path: (first, last) });
+        }
+    }
+
+    fn derive(&mut self, file: &Arc<File>, module: usize, (at, item): (u32, &Item)) -> Result<()> {
+        let mut found = (Vec::new(), Vec::new());
+        derive::derives(&file.source, &item.attrs, &|cfg| self.out.env.allows(cfg), &mut found);
+        let (wanted, foreign) = found;
+        self.out.derived.extend(foreign.into_iter().map(|path| Held { file: file.clone(), owner: module, at, path }));
         if wanted.is_empty() {
             return Ok(());
         }
+        let env = &self.out.env;
         let named = |name: &&str| self.deps.iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
         let holder = CORE_HOLDERS.iter().find_map(named).unwrap_or(self.krate) as u32;
         let expanded = derive::expand(&file.source, item, (&wanted, holder), &|attrs| env.enabled(attrs));
@@ -291,6 +322,14 @@ impl Loader<'_> {
     pub fn expand(&mut self, call: Waiting, definition: &Macro) -> Result<()> {
         self.scope = call.scope;
         self.expand_at(&call.file, call.owner, call.at, definition)
+    }
+
+    /// Adds `source`, the output of procedural macro `name`, to module `module` in the module's textual scope.
+    pub fn insert(&mut self, module: usize, source: Source, name: &str) -> Result<()> {
+        self.scope = self.out.modules[module].textual.clone();
+        let result = self.splice(module, Ok(source), name);
+        self.scope = None;
+        result
     }
 
     fn expand_at(&mut self, file: &Arc<File>, module: usize, at: u32, definition: &Macro) -> Result<()> {

@@ -45,7 +45,9 @@ impl Image {
         if jobs == 1 || work.len() < MIN_PARALLEL {
             return work.iter().filter_map(|&index| self.compile_into(cx, reached, index).err().map(|error| (index, error))).collect();
         }
-        std::io::stdout().flush().ok();
+        if let Err(error) = std::io::stdout().flush() {
+            return work.iter().map(|&index| (index, format!("flushing stdout before compile workers fork: {error}"))).collect();
+        }
         let mut workers = Vec::new();
         for part in 0..jobs {
             match self.fork_worker(cx, reached, work, (jobs, part)) {

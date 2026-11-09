@@ -115,6 +115,8 @@ pub struct Typed {
     pub ret: Option<Ty>,
     pub fors: HashMap<ExprId, For>,
     pub tries: HashMap<ExprId, Tried>,
+    /// The `.await` expressions of the body, with the calls each makes.
+    pub awaits: HashMap<ExprId, Awaited>,
     /// The drop glue of each type that a local or a temporary of the body holds and that needs drop.
     pub drops: Vec<Res>,
     /// The closure expressions of the body.
@@ -134,11 +136,12 @@ impl Typed {
     pub fn calls(&self) -> impl Iterator<Item = (ItemRef, &[Ty])> {
         let loops = self.fors.values().flat_map(|each| [&each.into_iter, &each.next]);
         let tries = self.tries.values().flat_map(|each| [&each.branch, &each.from_residual]);
+        let awaits = self.awaits.values().flat_map(|each| [&each.into_future, &each.poll]);
         let glue = match &self.shape {
             Shape::Glue(glue) => Some(glue),
             _ => None,
         };
-        let glue = glue.into_iter().flat_map(|glue| glue.drop.iter().chain(&glue.parts));
+        let glue = glue.into_iter().flat_map(|glue| glue.drop.iter().chain(&glue.parts).chain(&glue.resume));
         let untuple = match &self.shape {
             Shape::Untuple(res) => Some(res),
             _ => None,
@@ -155,7 +158,7 @@ impl Typed {
                 Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
             }
         });
-        self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values()).chain(loops).chain(tries).chain(&self.drops).chain(glue).chain(untuple).chain(cloned).chain(coerced).filter_map(|res| match res {
+        self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values()).chain(loops).chain(tries).chain(awaits).chain(&self.drops).chain(glue).chain(untuple).chain(cloned).chain(coerced).filter_map(|res| match res {
             Res::Fn(item, substs) => Some((*item, &substs[..])),
             _ => None,
         })
@@ -237,6 +240,15 @@ fn settle(cx: &mut Context<'_>, instance: (ItemRef, &[Ty]), mut typed: Typed) ->
     Ok(typed)
 }
 
+/// One `.await`: the `IntoFuture::into_future` of the awaited value, the future it gives, the `Future::poll` of that future, and the `Poll` it returns.
+#[derive(Clone, Debug)]
+pub struct Awaited {
+    pub into_future: Res,
+    pub future: Ty,
+    pub poll: Res,
+    pub polled: Ty,
+}
+
 /// The typed form of an instance that the compiler writes instead of a body: drop glue, or the `call_once` of a closure.
 fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Option<Typed>> {
     if matches!(cx.item(item).1.kind, crate::outline::item::ItemKind::Struct | crate::outline::item::ItemKind::Enum) {
@@ -249,6 +261,9 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
     let Some(&ty) = substs.first() else { return Ok(None) };
     if cx.lang(item) == Some("clone_fn") && clone::cloned_tuple(cx, ty).is_some() {
         return clone::clone_typed(cx, item, ty).map(Some);
+    }
+    if cx.lang(item) == Some("poll") && cx.closure(ty).is_some_and(|info| info.closure.coroutine) {
+        return closure::coroutine_typed(cx, item, ty).map(Some);
     }
     let (once, by_ref) = (cx.call_once() == Some(item), closure::by_reference(cx, item).is_some());
     match cx.types.kind(ty) {
@@ -268,13 +283,29 @@ impl<'c, 'a> Infer<'c, 'a> {
 impl Infer<'_, '_> {
     fn run(&mut self, foreign: bool) -> Result<()> {
         self.hidden.clear();
-        let ret = match self.sig.ret {
+        let declared = match self.sig.ret {
             Some(ty) => self.lower_ty(&self.sig.body, ty)?,
             None => self.cx.types.unit(),
         };
+        let ret = if self.sig.is_async { self.fresh(Kind::Var) } else { declared };
         self.out.ret = Some(ret);
         self.bind_hidden()?;
         self.ret_sig = self.opaque_fn_sig()?;
+        self.bind_params()?;
+        let Some(root) = self.body.root else {
+            return if foreign { Ok(()) } else { bail!("body has no root") };
+        };
+        if self.sig.is_async {
+            let params = self.out.params.clone();
+            let found = self.coroutine_expr(root, (Some(declared), true), &params)?;
+            self.out.exprs[root.0 as usize] = found;
+            return self.unify(ret, found);
+        }
+        let found = self.expr(root, Some(ret))?;
+        self.coerce_expr(root, found, ret)
+    }
+
+    fn bind_params(&mut self) -> Result<()> {
         let sig = self.sig;
         if let Some((kind, mutable)) = sig.receiver {
             let ty = self.receiver_ty(&sig.body, kind)?;
@@ -288,11 +319,7 @@ impl Infer<'_, '_> {
             let local = self.param_pat(&sig.body, pat, ty, own)?;
             self.out.params.push(local);
         }
-        let Some(root) = self.body.root else {
-            return if foreign { Ok(()) } else { bail!("body has no root") };
-        };
-        let found = self.expr(root, Some(ret))?;
-        self.coerce_expr(root, found, ret)
+        Ok(())
     }
 
     fn param_pat(&mut self, arena: &Body, pat: PatId, ty: Ty, own: Option<PatId>) -> Result<u32> {
@@ -474,7 +501,7 @@ impl Infer<'_, '_> {
     fn branch_ends(&self, expr: ExprId) -> Option<Vec<ExprId>> {
         match *self.body.expr(expr) {
             Expr::Paren(inner) => Some(vec![inner]),
-            Expr::Block { tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe, .. } => Some(vec![tail]),
+            Expr::Block { tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Expansion | BlockKind::Unsafe, .. } => Some(vec![tail]),
             Expr::If(_, then, Some(otherwise)) => Some(vec![then, otherwise]),
             Expr::Match(_, arms) => Some(self.body.list(arms).iter().map(|&at| self.body.arms[at as usize].body).collect()),
             _ => None,
@@ -622,6 +649,8 @@ impl Infer<'_, '_> {
     fn zonk_calls(&mut self) -> Result<()> {
         let fors = std::mem::take(&mut self.out.fors);
         self.out.fors = fors.into_iter().map(|(expr, each)| Ok((expr, self.zonk_for(each)?))).collect::<Result<_>>()?;
+        let awaits = std::mem::take(&mut self.out.awaits);
+        self.out.awaits = awaits.into_iter().map(|(expr, each)| Ok((expr, self.zonk_await(each)?))).collect::<Result<_>>()?;
         let tries = std::mem::take(&mut self.out.tries);
         self.out.tries = tries.into_iter().map(|(expr, each)| Ok((expr, self.zonk_try(each)?))).collect::<Result<_>>()?;
         let derefs = std::mem::take(&mut self.out.derefs);
@@ -643,6 +672,10 @@ impl Infer<'_, '_> {
 
     fn zonk_for(&mut self, each: For) -> Result<For> {
         Ok(For { into_iter: self.zonk_res(each.into_iter)?, next: self.zonk_res(each.next)?, iter: self.zonk(each.iter), option: self.zonk(each.option), some: each.some })
+    }
+
+    fn zonk_await(&mut self, each: Awaited) -> Result<Awaited> {
+        Ok(Awaited { into_future: self.zonk_res(each.into_future)?, future: self.zonk(each.future), poll: self.zonk_res(each.poll)?, polled: self.zonk(each.polled) })
     }
 
     fn zonk_try(&mut self, each: Tried) -> Result<Tried> {
@@ -727,6 +760,11 @@ pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
 pub fn drop_fn(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
     let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
     detached(cx, anchor, |infer| infer.own_drop(ty))
+}
+
+/// The return type of the non-generic function `item`.
+pub fn return_type(cx: &mut Context<'_>, item: ItemRef) -> Result<Ty> {
+    detached(cx, item, |infer| Ok(infer.fn_types(item, &[])?.1))
 }
 
 pub(crate) fn detached<T>(cx: &mut Context<'_>, item: ItemRef, run: impl FnOnce(&mut Infer<'_, '_>) -> Result<T>) -> Result<T> {

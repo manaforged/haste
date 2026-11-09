@@ -15,26 +15,28 @@ pub struct Asks {
     pub names: RefCell<Vec<(ModRef, Sym)>>,
     pub crates: RefCell<Vec<u32>>,
     pub scopes: RefCell<Vec<ModRef>>,
+    pub procs: RefCell<Vec<(ItemRef, String)>>,
 }
 
 impl Asks {
     /// How many lookups have asked for something so far.
     pub fn count(&self) -> usize {
-        self.modules.borrow().len() + self.names.borrow().len() + self.crates.borrow().len() + self.scopes.borrow().len()
+        self.modules.borrow().len() + self.names.borrow().len() + self.crates.borrow().len() + self.scopes.borrow().len() + self.procs.borrow().len()
     }
 
     /// Where each list of asks ends now, to take what later lookups add with `since`.
-    pub fn mark(&self) -> [usize; 4] {
-        [self.modules.borrow().len(), self.names.borrow().len(), self.crates.borrow().len(), self.scopes.borrow().len()]
+    pub fn mark(&self) -> [usize; 5] {
+        [self.modules.borrow().len(), self.names.borrow().len(), self.crates.borrow().len(), self.scopes.borrow().len(), self.procs.borrow().len()]
     }
 
     /// The asks added after `mark`.
-    pub fn since(&self, mark: [usize; 4]) -> Asks {
+    pub fn since(&self, mark: [usize; 5]) -> Asks {
         Asks {
             modules: RefCell::new(self.modules.borrow()[mark[0]..].to_vec()),
             names: RefCell::new(self.names.borrow()[mark[1]..].to_vec()),
             crates: RefCell::new(self.crates.borrow()[mark[2]..].to_vec()),
             scopes: RefCell::new(self.scopes.borrow()[mark[3]..].to_vec()),
+            procs: RefCell::new(self.procs.borrow()[mark[4]..].to_vec()),
         }
     }
 
@@ -44,6 +46,7 @@ impl Asks {
         self.names.borrow_mut().extend(other.names.borrow().iter().copied());
         self.crates.borrow_mut().extend(other.crates.borrow().iter().copied());
         self.scopes.borrow_mut().extend(other.scopes.borrow().iter().copied());
+        self.procs.borrow_mut().extend(other.procs.borrow().iter().cloned());
     }
 }
 

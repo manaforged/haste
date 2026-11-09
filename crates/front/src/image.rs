@@ -1,6 +1,11 @@
 //! One process image: a call table with one entry per reached function, the code it points at, and constant data.
 
+mod expand;
+mod script;
 mod workers;
+
+pub use expand::Job;
+pub use script::Script;
 
 use std::cell::RefCell;
 use std::os::fd::FromRawFd;
@@ -146,7 +151,7 @@ impl Image {
 
     fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
         let func = lower::lower(cx, reached, self, index)?;
-        let compiled = haste_codegen::compile(&func).map_err(|error| anyhow!(error))?;
+        let compiled = haste_codegen::compile(func).map_err(|error| anyhow!(error))?;
         self.memory.write(&compiled.code).map_err(|error| anyhow!(error))
     }
 
@@ -198,10 +203,7 @@ impl Image {
         };
         let mut done = Vec::new();
         std::io::Read::read_to_end(&mut progress, &mut done)?;
-        let mut status = 0;
-        // SAFETY: pid is the child forked above, and status is a live local.
-        unsafe { libc::waitpid(pid, &mut status, 0) };
-        Ok((done.len(), status))
+        Ok((done.len(), wait(pid)))
     }
 
     fn run_in_child(&self, cases: &[(usize, Vec<usize>, &str)], inputs: &[i64], mut progress: std::fs::File) -> std::io::Result<()> {
@@ -222,6 +224,39 @@ impl Image {
         Ok(())
     }
 
+    /// Runs the program in a forked child the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling, and returns the child's exit status.
+    pub fn run_main(&self, entry: (usize, usize), closure: &[usize], args: &[String]) -> Result<i32> {
+        let pid = self.fork_main(entry, closure, args, || {})?;
+        Ok(wait(pid))
+    }
+
+    /// Forks a child that runs `setup` and then the program from `lang_start` with `main` and `args`, and returns its pid.
+    fn fork_main(&self, (start, main): (usize, usize), closure: &[usize], args: &[String], setup: impl FnOnce()) -> Result<libc::pid_t> {
+        let (start, main) = (self.slot(start).load(Ordering::Acquire), self.slot(main).load(Ordering::Acquire));
+        if start == 0 || main == 0 {
+            bail!("`main` or `lang_start` has no code");
+        }
+        let owned: Vec<std::ffi::CString> = args.iter().map(|arg| std::ffi::CString::new(arg.as_str())).collect::<Result<_, _>>()?;
+        let mut argv: Vec<*const u8> = owned.iter().map(|arg| arg.as_ptr().cast()).collect();
+        argv.push(std::ptr::null());
+        std::io::Write::flush(&mut std::io::stdout())?;
+        // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            bail!("fork failed: {}", std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            setup();
+            self.fill_statics(closure, &mut rustc_hash::FxHashSet::default());
+            // SAFETY: start is code that the encoder wrote for `lang_start::<T>(fn() -> T, isize, *const *const u8, u8) -> isize`, and main for the `fn() -> T` it takes.
+            let lang_start: extern "C" fn(usize, isize, *const *const u8, u8) -> isize = unsafe { std::mem::transmute::<usize, _>(start) };
+            let code = lang_start(main, owned.len() as isize, argv.as_ptr(), 0);
+            // SAFETY: _exit ends the child without running the parent's destructors; lang_start flushed the program's own output.
+            unsafe { libc::_exit(code as i32) }
+        }
+        Ok(pid)
+    }
+
     fn fill_statics(&self, closure: &[usize], filled: &mut rustc_hash::FxHashSet<usize>) {
         for &index in closure.iter().filter(|index| self.statics.contains(index)) {
             if !filled.insert(index) {
@@ -233,4 +268,12 @@ impl Image {
             fill();
         }
     }
+}
+
+/// Waits for child `pid` and gives its exit status, or 128 plus the signal that ended it.
+fn wait(pid: libc::pid_t) -> i32 {
+    let mut status = 0;
+    // SAFETY: pid is a child of this process, and status is a live local.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) }
 }

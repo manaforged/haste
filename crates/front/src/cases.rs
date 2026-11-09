@@ -3,16 +3,16 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use haste_front::graph::{self, Targets};
 use haste_front::image::Image;
 use haste_front::names::{ItemRef, Names};
 use haste_front::outline::{self, edit::Edit};
-use haste_front::sema::reach::{Instance, Reached, reach, reach_again, reach_anew};
+use haste_front::sema::reach::{Instance, Reached, main_roots, reach_again, reach_anew};
 use haste_front::sema::{self, Edited, Store};
 use rustc_hash::FxHashMap as HashMap;
 
-use super::{Failures, answer, case_items, eager_front, error_kind, is_member, print_failures};
+use super::{Failures, case_items, eager_front, error_kind, is_member, print_failures};
 
 const INPUTS: [i64; 5] = [-5, 0, 1, 3, 20];
 
@@ -23,6 +23,7 @@ pub struct Build {
     store: Option<Store>,
     labels: Vec<String>,
     roots: Vec<usize>,
+    entry: Option<[usize; 2]>,
     reached: Reached,
     image: Image,
     broken: HashMap<usize, String>,
@@ -44,6 +45,24 @@ fn case_roots(workspace: &graph::Workspace, outline: &outline::Outline) -> (Vec<
     (cases, roots)
 }
 
+/// The `main` of the first member binary.
+fn main_item(workspace: &graph::Workspace, outline: &outline::Outline) -> Option<ItemRef> {
+    let krate = outline.roots.iter().position(|root| root.role == outline::Role::Bin && is_member(workspace, root))?;
+    outline.main(krate)
+}
+
+fn with_entry(roots: &[Instance], entry: &Result<Option<[Instance; 2]>>) -> Vec<Instance> {
+    let mut all = roots.to_vec();
+    if let Ok(Some(pair)) = entry {
+        all.extend(pair.iter().cloned());
+    }
+    all
+}
+
+fn entry_at(reached: &Reached, entry: Result<Option<[Instance; 2]>>) -> Result<Option<[usize; 2]>> {
+    Ok(entry?.map(|[start, main]| [reached.index[&start], reached.index[&main]]))
+}
+
 fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reached): (&mut sema::Context<'_>, &Reached), fresh: &[usize]) {
     fresh.iter().for_each(|at| _ = broken.remove(at));
     broken.extend(image.compile(cx, reached, fresh));
@@ -54,24 +73,20 @@ impl Build {
     pub fn cold(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
         let (mut outline, mut names) = eager_front(workspace, targets)?;
         let (cases, roots) = case_roots(workspace, &outline);
-        let (mut store, mut last) = (Store::default(), false);
-        loop {
-            let mut cx = sema::Context::new(&outline, &names, store);
-            let reached = reach(&mut cx, &roots);
-            if last || cx.settled() {
-                let mut image = Image::new(&reached)?;
-                let (mut broken, all) = (HashMap::default(), (0..reached.list.len()).collect::<Vec<_>>());
-                recompile(&mut image, &mut broken, (&mut cx, &reached), &all);
-                let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
-                let store = Some(cx.release().0);
-                let (roots, stamps) = (roots.iter().map(|root| reached.index[root]).collect(), stamps(workspace, &outline));
-                return Ok(Build { outline, names, store, labels, roots, reached, image, broken, stamps });
-            }
-            let released = cx.release();
-            let more;
-            (store, more) = answer(&mut names, &mut outline, released)?;
-            last = !more;
-        }
+        let main = main_item(workspace, &outline);
+        let entry_of = |cx: &mut sema::Context<'_>| main.map(|item| main_roots(cx, item)).transpose();
+        let built = haste_front::macros::reach_settled(&mut outline, &mut names, |cx| with_entry(&roots, &entry_of(cx)), |mut cx, reached| {
+            let entry = entry_at(&reached, entry_of(&mut cx))?;
+            let mut image = Image::new(&reached)?;
+            let (mut broken, all) = (HashMap::default(), (0..reached.list.len()).collect::<Vec<_>>());
+            recompile(&mut image, &mut broken, (&mut cx, &reached), &all);
+            let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
+            let roots = roots.iter().map(|root| reached.index[root]).collect();
+            Ok((Some(cx.release().0), labels, roots, entry, reached, image, broken))
+        })?;
+        let (store, labels, roots, entry, reached, image, broken) = built;
+        let stamps = stamps(workspace, &outline);
+        Ok(Build { outline, names, store, labels, roots, entry, reached, image, broken, stamps })
     }
 
     /// Brings the build up to date with the member files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and builds from nothing when that fails.
@@ -131,11 +146,15 @@ impl Build {
         }
         store.forget(&self.outline, Edited::Crates(&crates));
         let (cases, roots) = case_roots(workspace, &self.outline);
+        let main = main_item(workspace, &self.outline);
         let mut cx = sema::Context::new(&self.outline, &self.names, store);
-        let fresh = reach_anew(&mut cx, &mut self.reached, &touched, &roots);
+        let entry = main.map(|item| main_roots(&mut cx, item)).transpose();
+        let fresh = reach_anew(&mut cx, &mut self.reached, &touched, &with_entry(&roots, &entry));
         if !cx.settled() {
             return false;
         }
+        let Ok(entry) = entry_at(&self.reached, entry) else { return false };
+        self.entry = entry;
         recompile(&mut self.image, &mut self.broken, (&mut cx, &self.reached), &fresh);
         self.labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
         self.roots = roots.iter().map(|root| self.reached.index[root]).collect();
@@ -169,6 +188,27 @@ impl Build {
         let ms = |at: Duration| at.as_secs_f64() * 1e3;
         eprintln!("cases {} found, {} ran, {} functions reached, built in {:.1} ms, total {:.1} ms", self.labels.len(), runnable.len(), self.reached.list.len(), ms(built), ms(started.elapsed()));
         Ok(())
+    }
+}
+
+impl Build {
+    /// Runs the binary's `main` with `args` as argv, or fails with every reason a function it reaches did not compile.
+    pub fn run(&self, args: &[String]) -> Result<i32> {
+        let Some([start, main]) = self.entry else { bail!("no member binary has a `main`") };
+        let mut seen = rustc_hash::FxHashSet::default();
+        let closure: Vec<usize> = self.reached.closure(start).into_iter().chain(self.reached.closure(main)).filter(|at| seen.insert(*at)).collect();
+        let mut failures = Failures::new();
+        for at in &closure {
+            if let Some(error) = self.reached.list[*at].1.as_ref().err().or_else(|| self.broken.get(at)) {
+                failures.entry(error_kind(error)).or_default().push(error.clone());
+            }
+        }
+        if !failures.is_empty() {
+            print_failures(&failures);
+            let total = self.reached.list.iter().filter(|(_, typed)| typed.is_err()).count() + self.broken.len();
+            bail!("{} of {} functions that `main` reaches did not compile ({total} of {} reached in all)", failures.values().map(Vec::len).sum::<usize>(), closure.len(), self.reached.list.len());
+        }
+        self.image.run_main((start, main), &closure, args)
     }
 }
 
