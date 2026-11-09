@@ -13,6 +13,7 @@ use super::scope::{named_bounds, type_params};
 pub(super) type Projection = (ItemRef, Ty, Vec<Ty>, String, Ty);
 
 const SUPER_DEPTH: u32 = 8;
+const MAX_ASSUMPTIONS: usize = 256;
 
 impl Infer<'_, '_> {
     /// The type that `param::name` names, when `param` is `Self` or a type parameter of the frame and a trait that bounds it has the associated type `name`.
@@ -42,7 +43,7 @@ impl Infer<'_, '_> {
 
     /// The associated type `name` of `Self` inside impl `block`: the impl's own alias, or the one a supertrait of the implemented trait gives `Self`.
     fn impl_self_alias(&mut self, block: ImplRef, name: &str) -> Result<Option<Ty>> {
-        if let Some(ty) = self.impl_alias(block, name)? {
+        if let Some(ty) = self.impl_alias(block, (name, &[]))? {
             return Ok(Some(ty));
         }
         let (Some(of), Some(self_ty)) = (self.cx.impl_trait(block), self.self_ty) else { return Ok(None) };
@@ -74,26 +75,89 @@ impl Infer<'_, '_> {
                 found.push((of, std::iter::once(ty).chain(args).collect()));
             }
         }
-        found.extend(self.assoc_assumptions()?);
+        found.extend(self.own_trait()?);
+        let mut at = 0;
+        while at < found.len() && found.len() < MAX_ASSUMPTIONS {
+            let (of, substs) = found[at].clone();
+            let mut implied = self.super_bounds(of, &substs)?;
+            implied.extend(self.alias_bounds(of, &substs)?);
+            for implied in implied {
+                if !found.contains(&implied) {
+                    found.push(implied);
+                }
+            }
+            at += 1;
+        }
         Ok(found)
     }
 
-    /// The bounds that the associated types of the trait whose default method the frame types declare, as in `type Word: Into<u64>`, put on their values for the frame's `Self`.
-    fn assoc_assumptions(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
-        let (Some(of), Some(self_ty), None) = (self.frame_item.and_then(|item| self.cx.owner_trait(item)), self.self_ty, self.block) else { return Ok(Vec::new()) };
+    /// The supertrait bounds that `substs[0]: of<substs[1..]>` implies, each with its arguments.
+    pub(super) fn super_bounds(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        Ok(self.super_bindings(of, substs)?.into_iter().map(|(bound, _)| bound).collect())
+    }
+
+    /// The supertrait bounds that `substs[0]: of<substs[1..]>` implies, each with its arguments and the associated types its path binds, as `Iterator<Item = T>`.
+    fn super_bindings(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Vec<((ItemRef, Vec<Ty>), Vec<(String, Ty)>)>> {
         let def = self.cx.trait_generics(of)?;
         let params: Vec<_> = type_params(&def.1.params).copied().collect();
+        if def.1.supers.len == 0 || substs.len() != params.len() + 1 {
+            return Ok(Vec::new());
+        }
+        let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), None))?;
+        let home = frame.home;
+        self.with_frame(frame, |infer| {
+            let mut found = Vec::new();
+            for &bound in def.0.list(def.1.supers) {
+                let Some((parent, path)) = infer.bound_trait_at(&def.0, bound, home) else { continue };
+                if let Ok(args) = infer.bound_args(parent, &def.0, path, substs[0]) {
+                    let bindings = infer.path_bindings(&def.0, path)?;
+                    found.push(((parent, std::iter::once(substs[0]).chain(args).collect()), bindings));
+                }
+            }
+            Ok(found)
+        })
+    }
+
+    /// The associated type `name` of trait `of` that a supertrait path of the trait object `ty`'s principal binds, as `trait Walk: Iterator<Item = u8>`.
+    fn object_super_alias(&mut self, of: ItemRef, ty: Ty, (principal, args): (ItemRef, Vec<Ty>), name: &str) -> Result<Option<Ty>> {
+        let mut stack = vec![(principal, std::iter::once(ty).chain(args).collect::<Vec<Ty>>(), 0)];
+        while let Some((trait_of, substs, depth)) = stack.pop() {
+            if depth > SUPER_DEPTH {
+                continue;
+            }
+            for ((parent, parent_substs), bindings) in self.super_bindings(trait_of, &substs)? {
+                if let Some((_, found)) = bindings.into_iter().find(|(bound, _)| bound == name)
+                    && self.assoc_owner((parent, parent_substs[1..].to_vec()), ty, name, 0)?.is_some_and(|(owner, _)| owner == of)
+                {
+                    return Ok(Some(found));
+                }
+                stack.push((parent, parent_substs, depth + 1));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The trait whose default method the frame types, with its `Self` and arguments, which the method may assume holds.
+    fn own_trait(&mut self) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        let (Some(of), Some(self_ty), None) = (self.frame_item.and_then(|item| self.cx.owner_trait(item)), self.self_ty, self.block) else { return Ok(None) };
+        let def = self.cx.trait_generics(of)?;
         let src = &self.cx.file(of).source;
-        let args: Option<Vec<Ty>> = params.iter().map(|param| self.generics.iter().find(|(name, _)| *name == src.text(param.name)).map(|&(_, ty)| ty)).collect();
-        let Some(args) = args else { return Ok(Vec::new()) };
+        let args: Option<Vec<Ty>> = type_params(&def.1.params).map(|param| self.generics.iter().find(|(name, _)| *name == src.text(param.name)).map(|&(_, ty)| ty)).collect();
+        Ok(args.map(|args| (of, std::iter::once(self_ty).chain(args).collect())))
+    }
+
+    /// The bounds that the associated types of trait `of` declare, as in `type Word: Into<u64>`, on their values for `substs[0]: of<substs[1..]>`.
+    fn alias_bounds(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        let def = self.cx.trait_generics(of)?;
+        let params: Vec<_> = type_params(&def.1.params).copied().collect();
         let mut found = Vec::new();
         for member in self.cx.children(of).filter(|&member| self.cx.item(member).1.kind == ItemKind::Type).collect::<Vec<_>>() {
             let bounds = self.cx.trait_generics(member)?;
-            if bounds.1.supers.len == 0 {
+            if bounds.1.supers.len == 0 || substs.len() != params.len() + 1 {
                 continue;
             }
-            let Some(value) = self.picked_alias(of, self_ty, &args, self.cx.name(member))? else { continue };
-            let frame = self.item_frame(of, (&params, &args), (Some(self_ty), None))?;
+            let Some(value) = self.picked_alias(of, substs[0], &substs[1..], (self.cx.name(member), &[]))? else { continue };
+            let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), None))?;
             let home = frame.home;
             self.with_frame(frame, |infer| {
                 for &bound in bounds.0.list(bounds.1.supers) {
@@ -179,7 +243,12 @@ impl Infer<'_, '_> {
 
     /// The associated type `name` of trait `of` at `args` for `ty`: read from the impl that selection picks, or a variable until `ty` is known.
     pub(super) fn project(&mut self, of: ItemRef, ty: Ty, args: Vec<Ty>, name: &str) -> Result<Ty> {
-        if let Some(found) = self.picked_alias(of, ty, &args, name)? {
+        self.project_own(of, ty, args, (name, &[]))
+    }
+
+    /// The generic associated type `name` of trait `of` at `args` for `ty`, at its own arguments `own`.
+    pub(super) fn project_own(&mut self, of: ItemRef, ty: Ty, args: Vec<Ty>, (name, own): (&str, &[Ty])) -> Result<Ty> {
+        if let Some(found) = self.picked_alias(of, ty, &args, (name, own))? {
             return Ok(found);
         }
         if !self.has_vars(ty) && !args.iter().any(|arg| self.has_vars(*arg)) {
@@ -190,7 +259,7 @@ impl Infer<'_, '_> {
         Ok(result)
     }
 
-    fn picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], name: &str) -> Result<Option<Ty>> {
+    fn picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
         if self.cx.lang(of) == Some("discriminant_kind") {
             return self.discriminant_ty(ty);
         }
@@ -205,7 +274,7 @@ impl Infer<'_, '_> {
         }
         let (block, impl_args) = picked;
         let frame = self.impl_frame_of(block, &impl_args, Some(ty))?;
-        match self.with_frame(frame, |infer| infer.impl_alias(block, name))? {
+        match self.with_frame(frame, |infer| infer.impl_alias(block, (name, own)))? {
             Some(found) => Ok(Some(found)),
             None => bail!("the impl of `{}` for {} has no type `{name}`", self.cx.name(of), self.show(ty)),
         }
@@ -213,9 +282,14 @@ impl Infer<'_, '_> {
 
     fn builtin_alias(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
         let kind = self.cx.types.kind(self.resolve(ty)).clone();
-        if let Kind::Dyn(_, args, members, _) = &kind {
+        if let Kind::Dyn(principal, args, members, _) = &kind {
             let member = self.cx.trait_member(of, name);
-            return Ok(super::super::ty::object_parts(args, members).1.find(|(bound, _)| Some(*bound) == member).map(|(_, found)| found));
+            let (trait_args, mut bound) = super::super::ty::object_parts(args, members);
+            if let Some((_, found)) = bound.find(|(bound, _)| Some(*bound) == member) {
+                return Ok(Some(found));
+            }
+            let trait_args = trait_args.to_vec();
+            return self.object_super_alias(of, ty, (*principal, trait_args), name);
         }
         if self.cx.lang(of) == Some("fn_once") && name == "Output" {
             return Ok(self.callable_sig(ty)?.map(|(_, ret)| ret));
@@ -242,10 +316,10 @@ impl Infer<'_, '_> {
         }
         let frame = self.frame(item, substs)?;
         let (src, home) = (frame.src, frame.home);
-        let params: Vec<(String, Ty)> = frame.generics.iter().map(|&(name, ty)| (name.to_owned(), ty)).collect();
+        let params = frame.generics.clone();
         self.with_frame(frame, |infer| {
             for (name, ty) in params {
-                for bound in named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), &name) {
+                for bound in named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), name) {
                     infer.bind_bound(&sig.body, home, (bound, ty))?;
                 }
             }
@@ -337,7 +411,7 @@ impl Infer<'_, '_> {
         let mut at = 0;
         while at < self.projections.len() {
             let (of, ty, args, name, result) = self.projections[at].clone();
-            match self.picked_alias(of, ty, &args, &name)? {
+            match self.picked_alias(of, ty, &args, (&name, &[]))? {
                 Some(found) => {
                     self.projections.swap_remove(at);
                     self.unify(found, result)?;

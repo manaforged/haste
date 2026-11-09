@@ -65,6 +65,7 @@ pub enum Piece {
     Group(u32, Vec<Piece>),
     Var(u32, Option<Frag>),
     Crate,
+    CratePath,
     Meta(Meta),
     Repeat(Vec<Piece>, Option<(u32, u32)>, Op),
 }
@@ -196,6 +197,33 @@ fn frag(name: &str) -> Result<Frag> {
 }
 
 /// Parses a `macro` definition whose body opens at `open`: one `(args) { body }` rule or a braced list of rules.
+/// The rules of a `#[macro_export(local_inner_macros)]` macro, whose transcribers call each macro named by one word as `$crate::name!`.
+pub fn local_inner(src: &Source, rules: Vec<Rule>) -> Vec<Rule> {
+    rules.into_iter().map(|rule| Rule { matcher: rule.matcher, body: qualified(src, rule.body) }).collect()
+}
+
+fn qualified(src: &Source, pieces: Vec<Piece>) -> Vec<Piece> {
+    let mut out = Vec::with_capacity(pieces.len());
+    for (at, piece) in pieces.iter().enumerate() {
+        let after_path = at > 0 && matches!(pieces[at - 1], Piece::Token(token) if src.text(token) == ":");
+        let called = matches!(pieces.get(at + 1), Some(Piece::Token(bang)) if src.text(*bang) == "!");
+        if let Piece::Token(name) = piece
+            && called
+            && !after_path
+            && is_name(src.kind(*name))
+            && src.text(*name) != "macro_rules"
+        {
+            out.push(Piece::CratePath);
+        }
+        out.push(match piece.clone() {
+            Piece::Group(open, inner) => Piece::Group(open, qualified(src, inner)),
+            Piece::Repeat(inner, sep, op) => Piece::Repeat(qualified(src, inner), sep, op),
+            other => other,
+        });
+    }
+    out
+}
+
 pub fn parse_macro(src: &Source, open: u32) -> Result<Vec<Rule>> {
     if src.kind(open) != TokenKind::OpenParen {
         return parse(src, open);

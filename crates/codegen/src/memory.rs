@@ -75,18 +75,24 @@ fn window((used, size): (usize, usize), parts: usize, part: usize) -> (usize, us
     (from, from + share)
 }
 
-/// Read-write memory that the processes forked after it is made share at the same addresses, handed out by a bump pointer.
+/// Read-write memory at the same addresses in the processes forked after it is made, handed out by a bump pointer; shared memory holds what workers write for the parent, and private memory what each run of a program writes for itself.
 pub struct Shared {
     base: usize,
     used: usize,
     size: usize,
     split: bool,
+    private: bool,
 }
 
 impl Shared {
     /// Maps `size` bytes of shared memory, which the kernel backs only where they are written.
     pub fn new(size: usize) -> Result<Shared, String> {
-        Ok(Shared { base: map_shared(size)?, used: 0, size, split: false })
+        Ok(Shared { base: map_data(size, false)?, used: 0, size, split: false, private: false })
+    }
+
+    /// Maps `size` bytes that each forked process holds its own copy of, which the kernel backs only where they are written.
+    pub fn private(size: usize) -> Result<Shared, String> {
+        Ok(Shared { base: map_data(size, true)?, used: 0, size, split: false, private: true })
     }
 
     /// The address of `len` zeroed bytes aligned to 16, in a new mapping when this one is full and no worker shares it.
@@ -100,7 +106,7 @@ impl Shared {
             return Err(format!("shared memory is full: {len} bytes past {at} of {}", self.size));
         }
         let size = self.size.max(len.next_multiple_of(page()));
-        (self.base, self.used, self.size) = (map_shared(size)?, 0, size);
+        (self.base, self.used, self.size) = (map_data(size, self.private)?, 0, size);
         self.alloc(len)
     }
 
@@ -116,8 +122,8 @@ impl Shared {
     }
 }
 
-fn map_shared(size: usize) -> Result<usize, String> {
-    let flags = libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+fn map_data(size: usize, private: bool) -> Result<usize, String> {
+    let flags = if private { libc::MAP_PRIVATE } else { libc::MAP_SHARED } | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
     // SAFETY: a new anonymous mapping touches no existing memory.
     let base = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
     if base == libc::MAP_FAILED {

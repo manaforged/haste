@@ -47,6 +47,7 @@ impl Infer<'_, '_> {
             (Kind::Adt(item, from), Kind::Adt(other, to)) if item == other && from != to && self.cx.item(item).1.kind == ItemKind::Struct => self.unsize_tail(item, &from, &to),
             (Kind::Dyn(..), Kind::Dyn(..)) => self.object_to_object(from, to),
             (Kind::Dyn(..) | Kind::Var(_), _) => Ok(None),
+            (_, Kind::Dyn(..)) if self.cx.is_unsized(from)? => Ok(None),
             (_, Kind::Dyn(of, args, members, _)) => self.to_object(from, to, (of, &args, &members)),
             _ => Ok(None),
         }

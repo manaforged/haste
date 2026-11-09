@@ -452,7 +452,7 @@ impl Lower<'_, '_> {
         self.convert(value, from, to).map(Some)
     }
 
-    fn convert(&mut self, value: Value, from: Num, to: Num) -> Result<Value> {
+    pub(super) fn convert(&mut self, value: Value, from: Num, to: Num) -> Result<Value> {
         Ok(match (from, to) {
             (Num::Int { ty: a, signed }, Num::Int { ty: b, .. }) => self.resize(value, (a, signed), b),
             (Num::Bool, Num::Int { ty: b, .. }) => self.resize(value, (Type::I8, false), b),

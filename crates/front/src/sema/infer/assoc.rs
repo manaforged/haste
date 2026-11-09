@@ -24,20 +24,24 @@ impl Infer<'_, '_> {
                 return self.trait_value(of, (Some(self_ty), Some(args)), (name, given)).map(Some);
             }
             Some((ty, None)) if prefix.is_empty() => self.lower_ty(body, ty)?,
-            None if !prefix.is_empty() => {
-                if let Some(of) = self.prefix_trait(body, path, prefix.len()) {
-                    return self.trait_value(of, (None, None), (name, given)).map(Some);
-                }
-                if let [first] = prefix
-                    && let Some(found) = self.param_value(plain(self.src.text(body.segments[*first as usize].name)), (name, given.clone()))?
-                {
-                    return Ok(Some(found));
-                }
-                let Ok(ty) = self.named_ty(body, path, prefix.len(), true) else { return Ok(None) };
-                ty
-            }
+            Some((ty, Some(trait_path))) if prefix.len() == 1 => self.projection(body, (ty, trait_path), prefix[0])?,
+            None if !prefix.is_empty() => return self.unqualified_value(body, (path, prefix), (name, given)),
             _ => return Ok(None),
         };
+        self.type_value(owner, (name, given)).map(Some)
+    }
+
+    /// Resolves `T::name`, `Trait::name` or `Type::name` with no `<..>` qualifier, its owner named by the segments `prefix` of `path`.
+    fn unqualified_value(&mut self, body: &Body, (path, prefix): (PathId, &[u32]), (name, given): (&str, Vec<Ty>)) -> Result<Option<(Ty, Res)>> {
+        if let [first] = prefix
+            && let Some(found) = self.param_value(plain(self.src.text(body.segments[*first as usize].name)), (name, given.clone()))?
+        {
+            return Ok(Some(found));
+        }
+        if let Some(of) = self.prefix_trait(body, path, prefix.len()) {
+            return self.trait_value(of, (None, None), (name, given)).map(Some);
+        }
+        let Ok(owner) = self.named_ty(body, path, prefix.len(), true) else { return Ok(None) };
         self.type_value(owner, (name, given)).map(Some)
     }
 
@@ -51,7 +55,10 @@ impl Infer<'_, '_> {
             let args = super::super::ty::object_parts(&args, &members).0.to_vec();
             return self.trait_value(of, (Some(owner), Some(args)), (name, given));
         }
-        let traits: Vec<ItemRef> = self.cx.traits_in_scope(self.home).into_iter().chain(self.body_traits()).filter(|&of| self.cx.trait_member(of, name).is_some()).collect();
+        let current = self.current_trait().into_iter().collect();
+        let current = self.implied_traits(current)?;
+        let scope = current.into_iter().chain(self.cx.traits_in_scope(self.home)).chain(self.body_traits());
+        let traits: Vec<ItemRef> = scope.filter(|&of| self.cx.trait_member(of, name).is_some()).collect();
         for &of in &traits {
             if let Some(args) = self.own_trait_args(of, owner)? {
                 return self.trait_value(of, (Some(owner), Some(args)), (name, given));

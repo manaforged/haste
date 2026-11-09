@@ -38,6 +38,8 @@ pub trait Slots {
     fn entry(&self, index: usize) -> i64;
     /// The address of a 16-byte-aligned copy of `bytes` that lives as long as the program.
     fn data(&self, bytes: &[u8]) -> i64;
+    /// The address of `len` zeroed, 16-byte-aligned bytes that each run of the program writes for itself.
+    fn zeroed(&self, len: usize) -> i64;
     /// The address of a table of `words` that lives as long as the program, each `Word::Code` holding a code address once every function is compiled.
     fn table(&self, words: &[Word]) -> i64;
     /// The address of the zeroed, 16-byte-aligned cell of `size` bytes that holds the value of the static whose initializer is reached function `index`.
@@ -158,7 +160,7 @@ pub struct Lower<'l, 'a> {
     flags: Vec<StackSlot>,
     moved: rustc_hash::FxHashMap<moves::Root, Vec<moves::MovePath>>,
     extended: rustc_hash::FxHashSet<ExprId>,
-    pending: Vec<(moves::Root, moves::MovePath)>,
+    pending: Vec<drop::Pending>,
     index: usize,
     resume: Option<coroutine::Resume>,
 }

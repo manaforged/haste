@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{StackSlot, Type, Value};
+use haste_codegen::{IntCC, StackSlot, Type, Value};
 
 use crate::body::ExprId;
 use crate::sema::infer::{Res, Shape, field_types, has_drop_impl, needs_drop};
@@ -18,6 +18,14 @@ pub struct Owned {
     flag: StackSlot,
     parts: Vec<(MovePath, StackSlot)>,
     life: Life,
+}
+
+/// A move that a matched pattern's binding makes, applied once the arm is taken: only when each `(which, alternative)` holds, for a move inside or-pattern alternatives.
+#[derive(Clone, Debug)]
+pub struct Pending {
+    pub root: Root,
+    pub path: MovePath,
+    pub when: Vec<(Value, i64)>,
 }
 
 /// How long an owned value lives.
@@ -67,15 +75,35 @@ impl Lower<'_, '_> {
 
     /// Marks the part `path` of `root` as moved out, so that its scope does not drop it.
     pub fn moved_out(&mut self, root: Root, path: &[(u32, u32)]) -> Result<()> {
-        let Some(at) = self.owner(root) else { return Ok(()) };
-        let slot = match path {
+        if let Some(slot) = self.move_flag(root, path)? {
+            self.set(slot, false);
+        }
+        Ok(())
+    }
+
+    fn move_flag(&self, root: Root, path: &[(u32, u32)]) -> Result<Option<StackSlot>> {
+        let Some(at) = self.owner(root) else { return Ok(None) };
+        Ok(Some(match path {
             [] => self.owned[at].flag,
             _ => match self.owned[at].parts.iter().find(|(part, _)| part == path) {
                 Some(&(_, slot)) => slot,
                 None => bail!("a move out of {root:?} at {path:?} that the move analysis did not find"),
             },
-        };
-        self.set(slot, false);
+        }))
+    }
+
+    /// Marks the part `path` of `root` as moved out when every `(which, alternative)` of `when` holds.
+    fn moved_out_when(&mut self, root: Root, path: &[(u32, u32)], when: &[(Value, i64)]) -> Result<()> {
+        let Some(slot) = self.move_flag(root, path)? else { return Ok(()) };
+        let mut taken = self.ins().iconst(Type::I8, 1);
+        for &(which, alternative) in when {
+            let holds = self.ins().icmp_imm(IntCC::Equal, which, alternative);
+            taken = self.ins().band(taken, holds);
+        }
+        let present = self.ins().stack_load(Type::I8, slot, 0);
+        let zero = self.ins().iconst(Type::I8, 0);
+        let kept = self.ins().select(taken, zero, present);
+        self.ins().stack_store(kept, slot, 0);
         Ok(())
     }
 
@@ -129,8 +157,11 @@ impl Lower<'_, '_> {
 
     /// Applies the moves that the bindings of a matched pattern made.
     pub fn commit_moves(&mut self) -> Result<()> {
-        for (root, path) in std::mem::take(&mut self.pending) {
-            self.moved_out(root, &path)?;
+        for Pending { root, path, when } in std::mem::take(&mut self.pending) {
+            match when.is_empty() {
+                true => self.moved_out(root, &path)?,
+                false => self.moved_out_when(root, &path, &when)?,
+            }
         }
         Ok(())
     }
@@ -318,7 +349,8 @@ impl Lower<'_, '_> {
                 self.drop_elements(inner, data, len)
             }
             Kind::Tuple(_) | Kind::Adt(..) => {
-                let place = Place { base: Base::Addr(target), offset: 0, repr: repr(self.cx, ty)? };
+                let repr = if self.cx.is_unsized(ty)? { super::ops::WIDE } else { repr(self.cx, ty)? };
+                let place = Place { base: Base::Addr(target), offset: 0, repr };
                 self.drop_fields(ty, place)
             }
             Kind::Closure(..) => match self.cx.closure_env(ty) {

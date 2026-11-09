@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::outline::source::{Source, Tokens};
+use crate::outline::source::{Mark, Source, Tokens};
 
 use super::builtin::crate_path;
 
@@ -62,17 +62,18 @@ enum Origin {
     Captured(String),
 }
 
-/// The arguments of one `format_args!` call after its template: positional token ranges, then `name = value` ones.
+/// The arguments of one `format_args!` call after its template: positional token ranges, then `name = value` ones, and the mark of the template, which the names it captures take.
 pub struct Call<'s> {
     pub src: &'s Source,
+    pub mark: Option<Mark>,
     pub positional: Vec<(u32, u32)>,
     pub named: Vec<(&'s str, (u32, u32))>,
 }
 
 impl<'s> Call<'s> {
-    /// Splits the arguments `args` of a call in `src` into positional and named ones.
-    pub fn new(src: &'s Source, args: &[(u32, u32)]) -> Call<'s> {
-        let mut call = Call { src, positional: Vec::new(), named: Vec::new() };
+    /// Splits the arguments `args` of a call in `src` whose template starts at token `template` into positional and named ones.
+    pub fn new(src: &'s Source, template: u32, args: &[(u32, u32)]) -> Call<'s> {
+        let mut call = Call { src, mark: src.mark(template), positional: Vec::new(), named: Vec::new() };
         for &(from, to) in args {
             let assigns = to > from + 2 && src.text(from + 1) == "=" && !(src.joint(from + 1) && src.text(from + 2) == "=");
             match assigns && src.kind(from) == rustc_lexer::TokenKind::Ident {
@@ -138,7 +139,7 @@ fn write_call(out: &mut Tokens, krate: u32, (bytes, sources, call): (&[u8], &[Or
             Origin::Positional(index) => call.positional[*index],
             Origin::Named(index) => call.named[*index].1,
             Origin::Captured(name) => {
-                out.lexed(name);
+                out.ident(name, call.mark);
                 out.lexed(",");
                 continue;
             }

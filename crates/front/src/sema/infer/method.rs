@@ -43,16 +43,27 @@ struct Candidate {
 
 impl<'a> Infer<'_, 'a> {
     /// Infers the method call `expr`: picks the method by the receiver's type through references and borrows, as rustc probes.
-    pub fn method_call(&mut self, expr: ExprId, receiver: ExprId, name: u32, params: (Option<List>, List)) -> Result<Ty> {
+    pub fn method_call(&mut self, expr: ExprId, receiver: ExprId, name: u32, params: (Option<List>, List), expected: Option<Ty>) -> Result<Ty> {
         let found = self.expr(receiver, None)?;
         let name = plain(self.src.text(name));
         let mut steps = vec![self.known_ty(found)?];
         while let Some(next) = self.next_step(expr, steps.len() as u32 - 1, steps[steps.len() - 1])? {
             steps.push(next);
         }
-        let traits = self.trait_candidates(name, &steps)?;
+        if let Some(pick) = self.opaque_pick(steps[0], name)? {
+            return self.picked(expr, (pick, 0), params, expected);
+        }
+        match self.probe_steps((expr, found), name, &steps)? {
+            Some((pick, derefs)) => self.picked(expr, (pick, derefs), params, expected),
+            None => Err(self.no_method(steps[steps.len() - 1], found, name)),
+        }
+    }
+
+    /// The method `name` that the first of `steps` to have one picks, and how many references it reads through.
+    fn probe_steps(&mut self, (expr, found): (ExprId, Ty), name: &str, steps: &[Ty]) -> Result<Option<(Pick, u32)>> {
+        let traits = self.trait_candidates(name, steps)?;
         let mut candidates = Vec::new();
-        for &step in &steps {
+        for &step in steps {
             self.candidates(step, name, &mut candidates)?;
         }
         for (derefs, &step) in steps.iter().enumerate() {
@@ -60,22 +71,40 @@ impl<'a> Infer<'_, 'a> {
                 if pick.autoref == Some(Mut::Mut) {
                     self.steps_mutably(expr, found, derefs as u32)?;
                 }
-                return self.picked(expr, pick, derefs as u32, params);
+                return Ok(Some((pick, derefs as u32)));
             }
         }
-        match self.cx.types.kind(steps[steps.len() - 1]) {
-            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => bail!("the type of a method receiver must be known here"),
-            _ => bail!("no method `{name}` on {}", self.show(found)),
+        Ok(None)
+    }
+
+    fn no_method(&self, last: Ty, found: Ty, name: &str) -> anyhow::Error {
+        match self.cx.types.kind(last) {
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => anyhow::anyhow!("the type of a method receiver must be known here"),
+            _ => anyhow::anyhow!("no method `{name}` on {}", self.show(found)),
         }
     }
 
+    /// The trait method `name` that a bound of the pending `impl Trait` value `ty`, or a supertrait of one, declares, as rustc picks it by value before the hidden type is known.
+    fn opaque_pick(&mut self, ty: Ty, name: &str) -> Result<Option<Pick>> {
+        for (of, substs) in self.opaque_bounds(ty)? {
+            if let Some(item) = self.cx.trait_member(of, name)
+                && let Some(autoref) = borrow_of(self.cx.signature(item)?.receiver.map(|(kind, _)| kind))
+            {
+                self.obligations.push((of, substs.clone()));
+                return Ok(Some(Pick { item, args: substs, own: Vec::new(), autoref }));
+            }
+        }
+        Ok(None)
+    }
+
     fn probe_step(&mut self, step: Ty, (candidates, traits): (&[Candidate], &[TraitCandidate])) -> Result<Option<Pick>> {
+        let (bounded, unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits.iter().partition(|candidate| candidate.bound.is_some());
+        let unbounded: Vec<TraitCandidate> = unbounded.into_iter().filter(|candidate| !shadowed(&bounded, candidate.of, step)).collect();
         for autoref in [None, Some(Mut::Not), Some(Mut::Mut)] {
             let adjusted = match autoref {
                 None => step,
                 Some(mutability) => self.cx.types.intern(Kind::Ref(mutability, step)),
             };
-            let (bounded, unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits.iter().partition(|candidate| candidate.bound.is_some());
             if let Some(pick) = self.probe_traits(&bounded, (adjusted, autoref))? {
                 return Ok(Some(pick));
             }
@@ -135,22 +164,27 @@ impl<'a> Infer<'_, 'a> {
         }).collect();
         let bounded = self.bound_candidates(name, steps)?;
         let current = self.current_trait();
-        for local in self.body_traits().into_iter().chain(principals).chain(bounded.iter().map(|&(of, _)| of)).chain(current) {
+        for local in self.body_traits().into_iter().chain(principals).chain(current) {
             if !traits.contains(&local) {
                 traits.push(local);
             }
         }
-        for of in traits {
+        let scoped = traits.len();
+        traits.extend(bounded.iter().map(|&(of, _)| of).filter(|of| !traits[..scoped].contains(of)).collect::<Vec<_>>());
+        for (at, of) in traits.into_iter().enumerate() {
             let Some(item) = self.cx.trait_member(of, name) else { continue };
-            if let Some((kind, _)) = self.cx.signature(item)?.receiver {
-                let bound = bounded.iter().find(|&&(bounded, _)| bounded == of).map(|&(_, param)| param);
-                found.push(TraitCandidate { of, item, kind, bound });
+            let Some((kind, _)) = self.cx.signature(item)?.receiver else { continue };
+            if let Some(&(_, param)) = bounded.iter().find(|&&(bounded, _)| bounded == of) {
+                found.push(TraitCandidate { of, item, kind, bound: Some(param) });
+            }
+            if at < scoped {
+                found.push(TraitCandidate { of, item, kind, bound: None });
             }
         }
         Ok(found)
     }
 
-    fn current_trait(&mut self) -> Option<ItemRef> {
+    pub(super) fn current_trait(&mut self) -> Option<ItemRef> {
         let owner = self.instance.as_ref().and_then(|(item, _)| self.cx.owner_trait(*item));
         self.block.and_then(|block| self.cx.impl_trait(block)).or(owner)
     }
@@ -197,8 +231,8 @@ impl<'a> Infer<'_, 'a> {
         if self.compiler_impl(candidate.of, self_ty) {
             return Ok(Some((candidate.item, std::iter::once(self_ty).chain(args).collect())));
         }
-        if let Some(held) = self.object_holds(candidate.of, self_ty, &args) {
-            return Ok(held.then(|| (candidate.item, std::iter::once(self_ty).chain(args).collect())));
+        if self.object_holds(candidate.of, self_ty, &args) == Some(true) {
+            return Ok(Some((candidate.item, std::iter::once(self_ty).chain(args).collect())));
         }
         let Some((block, impl_args)) = self.trial(|infer| infer.select(candidate.of, self_ty, &args))? else {
             if !self.may_implement(candidate.of, self_ty, &args)? {
@@ -255,7 +289,7 @@ impl<'a> Infer<'_, 'a> {
         self.unify(receiver, adjusted).ok().map(|_| (args, own))
     }
 
-    fn picked(&mut self, expr: ExprId, pick: Pick, derefs: u32, (explicit, params): (Option<List>, List)) -> Result<Ty> {
+    fn picked(&mut self, expr: ExprId, (pick, derefs): (Pick, u32), (explicit, params): (Option<List>, List), expected: Option<Ty>) -> Result<Ty> {
         let Pick { item, args: mut substs, own, autoref } = pick;
         let adjust = Adjust { derefs, autoref };
         let body = self.body;
@@ -279,9 +313,25 @@ impl<'a> Infer<'_, 'a> {
         if given.len() + 1 != types.len() {
             bail!("{} takes {} arguments, {} given", self.cx.name(item), types.len() - 1, given.len());
         }
-        for (arg, param) in given.into_iter().zip(types.into_iter().skip(1)) {
-            self.call_arg(Some((item, &substs[..])), ExprId(arg), (param, None))?;
+        let hints = self.expected_inputs(&types[1..], ret, expected);
+        for ((arg, param), hint) in given.into_iter().zip(types.into_iter().skip(1)).zip(hints) {
+            self.call_arg(Some((item, &substs[..])), ExprId(arg), (param, hint))?;
         }
         Ok(ret)
+    }
+}
+
+/// How a call borrows its receiver for a method that takes `self` as `kind`, or none for a typed `self`.
+/// Whether a where-clause bound of `of` on the type parameter that `step` instantiates hides the trait's impls, as rustc sees only the bound on a parameter.
+fn shadowed(bounded: &[TraitCandidate], of: ItemRef, step: Ty) -> bool {
+    bounded.iter().any(|candidate| candidate.of == of && candidate.bound == Some(step))
+}
+
+fn borrow_of(kind: Option<SelfKind>) -> Option<Option<Mut>> {
+    match kind? {
+        SelfKind::Value => Some(None),
+        SelfKind::Ref => Some(Some(Mut::Not)),
+        SelfKind::RefMut => Some(Some(Mut::Mut)),
+        SelfKind::Typed(_) => None,
     }
 }

@@ -190,7 +190,8 @@ impl Lower<'_, '_> {
         if let Some(Res::Fn(item, substs)) = self.typed.res.get(&expr).cloned() {
             return self.call_value((expr, callee), (item, substs), args);
         }
-        let (item, substs) = match self.typed.res.get(&callee).cloned() {
+        let named = self.typed.res.get(&callee).filter(|_| self.body.names_callee(callee));
+        let (item, substs) = match named.cloned() {
             Some(Res::Fn(item, _)) if matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static) => return self.pointer_call(expr, callee, args),
             Some(Res::Fn(item, substs)) => (item, substs),
             Some(Res::Ctor(_, variant, _)) => return self.ctor_call(expr, variant, args),

@@ -71,6 +71,8 @@ pub enum Simd {
     Splat,
     Bitmask,
     Lanewise(BinOp),
+    /// Each lane converted as `as` converts it.
+    Cast,
     Shuffle,
     Extract,
     Insert,
@@ -90,7 +92,7 @@ pub enum Atomic {
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
 const LLVM: [(&str, Intrinsic); 2] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32))];
 
-const NAMES: [(&str, Intrinsic); 125] = {
+const NAMES: [(&str, Intrinsic); 127] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -196,6 +198,8 @@ const NAMES: [(&str, Intrinsic); 125] = {
         ("simd_splat", Simd(self::Simd::Splat)),
         ("simd_bitmask", Simd(self::Simd::Bitmask)),
         ("simd_shuffle", Simd(self::Simd::Shuffle)),
+        ("simd_cast", Simd(self::Simd::Cast)),
+        ("simd_as", Simd(self::Simd::Cast)),
         ("simd_extract", Simd(self::Simd::Extract)),
         ("simd_extract_dyn", Simd(self::Simd::Extract)),
         ("simd_insert", Simd(self::Simd::Insert)),

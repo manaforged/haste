@@ -21,15 +21,17 @@ use crate::sema::Context;
 use crate::sema::reach::Reached;
 
 const SHARED_BYTES: usize = 4 << 30;
+const STATE_BYTES: usize = 1 << 30;
 const CODE_BYTES: usize = 1 << 30;
 const TABLE_SLOTS: usize = 1 << 22;
 
-/// The call table, code memory and data of the running program, all in memory that compile workers forked from this process share.
+/// The call table, code memory and data of the running program, in memory that compile workers forked from this process share, and the cells the program writes, in memory each run holds its own copy of.
 pub struct Image {
     table: usize,
     capacity: usize,
     memory: Memory,
     shared: RefCell<Shared>,
+    state: RefCell<Shared>,
     tables: RefCell<HashMap<Vec<Word>, i64>>,
     fixups: RefCell<Vec<(usize, usize)>>,
     cells: RefCell<HashMap<usize, i64>>,
@@ -60,11 +62,15 @@ impl Slots for Image {
         address
     }
 
+    fn zeroed(&self, len: usize) -> i64 {
+        self.state.borrow_mut().alloc(len).unwrap_or_else(|error| panic!("{error}")) as i64
+    }
+
     fn cell(&self, index: usize, size: u32) -> i64 {
         if let Some(&address) = self.cells.borrow().get(&index) {
             return address;
         }
-        let address = self.data(&vec![0; size as usize]);
+        let address = self.zeroed(size as usize);
         self.cells.borrow_mut().insert(index, address);
         address
     }
@@ -76,6 +82,11 @@ fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, S
     name.and_then(crate::host::symbol).ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
 }
 
+/// Whether the foreign item `item` links weakly, so a missing symbol reads as null.
+fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {
+    cx.attr_value(item, "linkage") == Some("extern_weak")
+}
+
 impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Result<Image> {
@@ -84,7 +95,8 @@ impl Image {
         let table = shared.alloc(capacity * size_of::<AtomicUsize>()).map_err(|error| anyhow!(error))?;
         let mut memory = Memory::default();
         memory.reserve(CODE_BYTES).map_err(|error| anyhow!(error))?;
-        Ok(Image { table, capacity, memory, shared: RefCell::new(shared), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), statics: Default::default() })
+        let state = Shared::private(STATE_BYTES).map_err(|error| anyhow!(error))?;
+        Ok(Image { table, capacity, memory, shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), statics: Default::default() })
     }
 
     fn slot(&self, index: usize) -> &AtomicUsize {
@@ -110,6 +122,7 @@ impl Image {
             match host_symbol(cx, item) {
                 Ok(address) if !lower::is_static(cx, item) => self.slot(index).store(address, Ordering::Release),
                 Ok(_) => {}
+                Err(_) if lower::is_static(cx, item) && weak(cx, item) => {}
                 Err(error) => errors.push((index, error)),
             }
         }
@@ -132,7 +145,7 @@ impl Image {
             if typed.is_err() || !cx.foreign(*item) || !lower::is_static(cx, *item) {
                 continue;
             }
-            let cell = match (host_symbol(cx, *item), cx.attr_value(*item, "linkage") == Some("extern_weak")) {
+            let cell = match (host_symbol(cx, *item), weak(cx, *item)) {
                 (found, true) => self.data(&found.unwrap_or(0).to_le_bytes()),
                 (Ok(address), false) => address as i64,
                 (Err(_), false) => continue,

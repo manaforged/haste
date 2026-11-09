@@ -162,12 +162,25 @@ impl Loader<'_> {
 
     fn member_call(&mut self, file: &Arc<File>, block: usize, at: u32) -> Result<()> {
         let item = &file.items.items[at as usize];
-        let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
+        let (Some(name), Some(_)) = (item.name, item.body) else { return Ok(()) };
         let name = strip_raw(file.source.text(name));
         let Some(definition) = self.lookup(file, item, name) else {
             self.out.members.push(self.waiting(file, block, at));
             return Ok(());
         };
+        self.member_at(file, block, at, &definition)
+    }
+
+    /// Expands the waiting macro call `call` in an impl body with `definition`, in the textual scope it was written in.
+    pub fn expand_member(&mut self, call: Waiting, definition: &Macro) -> Result<()> {
+        self.scope = call.scope;
+        self.member_at(&call.file, call.owner, call.at, definition)
+    }
+
+    fn member_at(&mut self, file: &Arc<File>, block: usize, at: u32, definition: &Macro) -> Result<()> {
+        let item = &file.items.items[at as usize];
+        let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
+        let name = strip_raw(file.source.text(name));
         if self.depth >= DEPTH {
             self.out.errors.push(format!("{}: macro {name} recursed past {DEPTH} levels", file.source.path.display()));
             return Ok(());
@@ -216,11 +229,12 @@ impl Loader<'_> {
         let parsed = if item.kind == ItemKind::Macro { rules::parse_macro(&file.source, open) } else { rules::parse(&file.source, open) };
         match parsed {
             Ok(rules) => {
+                let rules = if item.attrs.contains(&Attr::MacroExport(true)) { rules::local_inner(&file.source, rules) } else { rules };
                 let name = strip_raw(file.source.text(name)).to_owned();
                 let definition = Arc::new(Macro { file: file.clone(), rules, krate: self.krate });
                 self.out.defined.insert(place, definition.clone());
                 let public = item.kind == ItemKind::Macro && item.vis != super::item::Vis::Private;
-                if public || item.attrs.iter().any(|attr| *attr == Attr::MacroExport) {
+                if public || item.attrs.iter().any(|attr| matches!(attr, Attr::MacroExport(_))) {
                     self.out.exports.insert(name.clone(), definition.clone());
                 }
                 if item.kind == ItemKind::MacroRules {
@@ -305,6 +319,9 @@ impl Loader<'_> {
         let item = &file.items.items[at as usize];
         let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
         let name = strip_raw(file.source.text(name));
+        if name == "include" {
+            return self.include(file, module, open);
+        }
         if BUILTIN.contains(&name) {
             return Ok(());
         }
@@ -356,6 +373,13 @@ impl Loader<'_> {
         self.splice(module, Ok(selected), "cfg_select")
     }
 
+    fn include(&mut self, file: &Arc<File>, module: usize, open: u32) -> Result<()> {
+        let src = &file.source;
+        let path = path_text(src, (open + 1, src.pair(open)), &self.out.env).ok_or_else(|| anyhow::anyhow!("a path that is not a literal, `concat!` or `env!`"));
+        let source = path.and_then(|path| Source::read(&src.path.parent().unwrap_or(Path::new("")).join(path)));
+        self.splice(module, source, "include")
+    }
+
     fn scanned(&mut self, source: Result<Source>, name: &str) -> Option<Arc<File>> {
         let expanded = source.and_then(|source| scan::scan(&source).map(|items| File::new(source, items, true)));
         match expanded {
@@ -380,6 +404,22 @@ impl Loader<'_> {
         let result = self.children(&expanded, index, module, None);
         self.depth -= 1;
         result
+    }
+}
+
+/// The text of the tokens from `from` up to `to` when they are a string literal or a `concat!` or `env!` of them.
+fn path_text(src: &Source, (from, to): (u32, u32), env: &super::tree::Env) -> Option<String> {
+    if to == from + 1 {
+        return src.literal_text(from).ok().flatten();
+    }
+    if to < from + 3 || src.text(from + 1) != "!" {
+        return None;
+    }
+    let parts = src.args(from + 2);
+    match src.text(from) {
+        "concat" => parts.into_iter().map(|range| path_text(src, range, env)).collect(),
+        "env" => env.var(&path_text(src, *parts.first()?, env)?),
+        _ => None,
     }
 }
 

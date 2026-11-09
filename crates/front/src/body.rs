@@ -301,6 +301,11 @@ impl Body {
         &self.exprs[id.0 as usize]
     }
 
+    /// Whether the resolution of call callee `id` names the function the call runs, which is false for a method call whose result is called.
+    pub fn names_callee(&self, id: ExprId) -> bool {
+        !matches!(self.expr(id), Expr::Method { .. })
+    }
+
     /// The pattern `id`.
     pub fn pat(&self, id: PatId) -> &Pat {
         &self.pats[id.0 as usize]

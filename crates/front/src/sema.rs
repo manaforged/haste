@@ -196,6 +196,7 @@ pub struct Context<'a> {
     pub type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
     impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
     impl_members: std::cell::RefCell<HashMap<impls::ImplRef, Rc<HashMap<&'a str, ItemRef>>>>,
+    macro_outputs: std::cell::RefCell<HashMap<(usize, u32), &'a crate::outline::source::Source>>,
 }
 
 /// Where a type path is resolved and what it says: home module, body root, nested instance, segments, leading `::` and `$crate`.
@@ -210,8 +211,8 @@ impl<'a> Context<'a> {
         let Store { types, signatures, bodies, adts, layouts, tails, headers, finals, lookups } = store;
         let Lookups { modules, heads, owners, trait_defs, discriminants, langs, drops, closures, reveals, lang_of, scope_traits, type_defs, impl_traits } = lookups;
         let (lang_of, scope_traits, type_defs) = (lang_of.into(), scope_traits.into(), type_defs.into());
-        let (kids, trait_members, impl_members, asks) = Default::default();
-        Context { outline, names, types, asks, modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants, langs, drops, closures, finals, reveals, tails, kids, lang_of, scope_traits, trait_members, type_defs, impl_traits, impl_members }
+        let (kids, trait_members, impl_members, asks, macro_outputs) = Default::default();
+        Context { outline, names, types, asks, modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants, langs, drops, closures, finals, reveals, tails, kids, lang_of, scope_traits, trait_members, type_defs, impl_traits, impl_members, macro_outputs }
     }
 
     /// Whether no lookup in this pass asked the front end for anything, so another pass would find the same.

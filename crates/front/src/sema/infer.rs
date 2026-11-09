@@ -165,6 +165,9 @@ impl Typed {
     }
 }
 
+/// A local variable's name and the `macro_rules!` hygiene scope that wrote it.
+pub(super) type Name<'a> = (&'a str, u32);
+
 /// The inference of one body.
 pub struct Infer<'c, 'a> {
     cx: &'c mut Context<'a>,
@@ -187,13 +190,15 @@ pub struct Infer<'c, 'a> {
     try_blocks: Vec<(ExprId, Ty)>,
     ret_sig: Option<Ty>,
     out: Typed,
-    scopes: Vec<(&'a str, u32)>,
+    scopes: Vec<(Name<'a>, u32)>,
     items: Vec<(&'a str, ItemRef)>,
     loops: Vec<Breaks>,
     uses: Vec<closure::Uses>,
     diverges: bool,
     /// The `impl Trait` types that no frame parameter stands for: the token of each and the variable for its hidden type.
     hidden: Vec<(u32, Ty)>,
+    /// The values of the parameters of the const fns that a constant expression is calling, innermost last.
+    const_args: Vec<(String, (u128, (u32, bool)))>,
 }
 
 /// What the `break`s of one loop or labeled block give: the type they coerce to once it is known, whether any `break` was seen, its label, and whether it is a block.
@@ -276,7 +281,7 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
 impl<'c, 'a> Infer<'c, 'a> {
     fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false, hidden: Vec::new() }
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false, hidden: Vec::new(), const_args: Vec::new() }
     }
 }
 
@@ -310,7 +315,7 @@ impl Infer<'_, '_> {
         if let Some((kind, mutable)) = sig.receiver {
             let ty = self.receiver_ty(&sig.body, kind)?;
             let local = self.new_local(ty, mutable);
-            self.scopes.push(("self", local));
+            self.scopes.push((("self", 0), local));
             self.out.params.push(local);
         }
         for (index, &(pat, ty)) in sig.params.iter().enumerate() {
@@ -326,7 +331,7 @@ impl Infer<'_, '_> {
         match *arena.pat(pat) {
             crate::body::Pat::Bind { name, mutable, sub: None, by_ref: false } => {
                 let local = self.new_local(ty, mutable);
-                self.scopes.push((self.src.text(name), local));
+                self.scopes.push(((self.src.text(name), self.src.scope(name).0), local));
                 Ok(local)
             }
             crate::body::Pat::Wild => Ok(self.new_local(ty, false)),
@@ -375,9 +380,9 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// `ty` with its outer inference variables followed.
+    /// `ty` with its outer inference variables followed; a variable of another inference stays as it is.
     pub fn resolve(&self, mut ty: Ty) -> Ty {
-        while let Some(bound) = self.var_of(ty).and_then(|index| self.vars[index as usize]) {
+        while let Some(bound) = self.var_of(ty).and_then(|index| self.vars.get(index as usize).copied().flatten()) {
             ty = bound;
         }
         ty
@@ -519,11 +524,15 @@ impl Infer<'_, '_> {
             let (of, substs) = self.obligations[at].clone();
             let self_ty = self.resolve(substs[0]);
             if matches!(self.cx.types.kind(self_ty), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
-                at += 1;
+                if self.opaque_holds(of, &substs)? == Some(true) {
+                    self.obligations.swap_remove(at);
+                } else {
+                    at += 1;
+                }
                 continue;
             }
             let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
-            if self.select(of, self_ty, &substs[1..])?.is_some() || known || self.assume(of, &substs)? {
+            if (!known && self.assume(of, &substs)?) || self.settled_by_impl(of, self_ty, &substs[1..])? || known {
                 self.obligations.swap_remove(at);
             } else {
                 at += 1;
@@ -532,15 +541,26 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    /// Ties `substs` of trait `of` to the one bound of the frame they match, and whether one did.
+    /// Whether the one impl that selection picks settles the obligation: its nested bounds wait while `self_ty` still holds variables, so it is tried again once they are known.
+    fn settled_by_impl(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
+        Ok(self.select(of, self_ty, args)?.is_some() && !self.has_vars(self_ty))
+    }
+
+    /// Ties `substs` of trait `of` to the one bound of the frame they match, and whether exactly one did, as rustc prefers a where-clause over impls.
     pub(super) fn assume(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
+        let mut matched = Vec::new();
         for (held, types) in self.assumptions()? {
-            let holds = |infer: &mut Self| Ok(substs.iter().zip(&types).all(|(&a, &b)| infer.unify(a, b).is_ok()).then_some(()));
-            if held == of && self.trial(holds)?.is_some() {
-                return Ok(true);
+            if held != of || matched.contains(&types) {
+                continue;
+            }
+            let fits = |infer: &mut Self| -> Result<Option<()>> { Ok(substs.iter().zip(&types).all(|(&a, &b)| infer.unify(a, b).is_ok()).then_some(())) };
+            if self.probe(fits)?.is_some() {
+                matched.push(types);
             }
         }
-        Ok(false)
+        let [types] = &matched[..] else { return Ok(false) };
+        substs.iter().zip(types).try_for_each(|(&a, &b)| self.unify(a, b))?;
+        Ok(true)
     }
 
     fn has_vars(&self, ty: Ty) -> bool {

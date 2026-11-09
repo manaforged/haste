@@ -7,21 +7,55 @@ use super::super::ty::{Kind, Ty};
 use super::closure::Closure;
 use super::{Infer, Local, Typed};
 
-/// A return type that holds `impl Trait`: the function, its type arguments, the type that stands for the return value at the call, and the function pointer type of its `Fn` bound.
-pub(super) type Opaque = (ItemRef, Vec<Ty>, Ty, Option<Ty>);
+/// A return type that holds `impl Trait`, until its type arguments are known.
+#[derive(Clone)]
+pub(super) struct Opaque {
+    pub item: ItemRef,
+    pub substs: Vec<Ty>,
+    /// The type that stands for the return value at the call.
+    pub ret: Ty,
+    /// The function pointer type of its `Fn` bound.
+    pub sig: Option<Ty>,
+    /// Its other trait bounds, each with `Self` first, which method calls on it read before it is revealed.
+    pub bounds: Vec<(ItemRef, Vec<Ty>)>,
+}
 
 impl Infer<'_, '_> {
-    /// Ties `ret`, the return type of `item` at `substs` that holds `impl Trait`, to the type that its body returns, once `substs` are known.
-    pub(super) fn opaque_ret(&mut self, item: ItemRef, substs: &[Ty], (ret, sig): (Ty, Option<Ty>)) -> Result<()> {
-        self.opaques.push((item, substs.to_vec(), ret, sig));
+    /// Ties the return value of `opaque` to the type that its body returns, once its type arguments are known.
+    pub(super) fn opaque_ret(&mut self, opaque: Opaque) -> Result<()> {
+        self.opaques.push(opaque);
         self.settle_opaques(false)
+    }
+
+    /// The trait bounds of the pending `impl Trait` return value `ty` and the supertrait bounds they imply, each with `Self` first.
+    pub(super) fn opaque_bounds(&mut self, ty: Ty) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        let mut bounds = self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).map(|opaque| opaque.bounds.clone()).unwrap_or_default();
+        let mut at = 0;
+        while at < bounds.len() {
+            let (of, substs) = bounds[at].clone();
+            for implied in self.super_bounds(of, &substs)? {
+                if !bounds.contains(&implied) {
+                    bounds.push(implied);
+                }
+            }
+            at += 1;
+        }
+        Ok(bounds)
+    }
+
+    /// Ties `substs` of trait `of`, whose `Self` is a pending `impl Trait` value, to the one bound of it of that trait: whether they unify, or none when it has no one such bound.
+    pub(super) fn opaque_holds(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Option<bool>> {
+        let held: Vec<Vec<Ty>> = self.opaque_bounds(self.resolve(substs[0]))?.into_iter().filter(|(bound, _)| *bound == of).map(|(_, types)| types).collect();
+        let [types] = &held[..] else { return Ok(None) };
+        let tied = self.trial(|infer| Ok(substs.iter().zip(types).all(|(&a, &b)| infer.unify(a, b).is_ok()).then_some(())))?;
+        Ok(Some(tied.is_some()))
     }
 
     /// Reveals each `impl Trait` return type whose type arguments are known, or every one when `force` is set.
     pub(super) fn settle_opaques(&mut self, force: bool) -> Result<()> {
         let mut at = 0;
         while at < self.opaques.len() {
-            let (item, substs, ret, _) = self.opaques[at].clone();
+            let Opaque { item, substs, ret, .. } = self.opaques[at].clone();
             if !force && substs.iter().any(|ty| self.has_vars(*ty)) {
                 at += 1;
                 continue;
@@ -54,7 +88,7 @@ impl Infer<'_, '_> {
         super::closure::register(self.cx, (item, &args), &Typed { locals, closures, ..Typed::default() });
     }
 
-    /// Ties the associated types that the bounds of each `impl Trait` in this function's return type name, as `Output = T`, to its hidden type, which rustc reads to infer the body.
+    /// Holds the hidden type of each `impl Trait` in this function's return type to its bounds, tying the associated types they name, as `Output = T`, and their trait arguments, which rustc reads to infer the body.
     pub(super) fn bind_hidden(&mut self) -> Result<()> {
         let sig = self.sig;
         for (at, hidden) in std::mem::take(&mut self.hidden) {
@@ -69,6 +103,7 @@ impl Infer<'_, '_> {
                 }
                 let args = self.bound_args(of, &sig.body, path, hidden)?;
                 self.bindings_hold(&sig.body, path, (of, hidden, &args))?;
+                self.obligations.push((of, std::iter::once(hidden).chain(args).collect()));
             }
         }
         Ok(())
@@ -76,7 +111,7 @@ impl Infer<'_, '_> {
 
     /// The function pointer type of the `Fn` bound on the pending `impl Trait` return value `ty`.
     pub(super) fn opaque_sig(&self, ty: Ty) -> Option<Ty> {
-        self.opaques.iter().find(|(_, _, ret, _)| self.resolve(*ret) == ty).and_then(|opaque| opaque.3)
+        self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).and_then(|opaque| opaque.sig)
     }
 }
 

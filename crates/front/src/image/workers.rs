@@ -58,6 +58,7 @@ impl Image {
         let errors = workers.into_iter().flat_map(|worker| self.collect(worker, work, jobs)).collect();
         self.memory.close();
         self.shared.get_mut().close();
+        self.state.get_mut().close();
         errors
     }
 
@@ -103,6 +104,7 @@ impl Image {
     fn work_share(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize], (jobs, part): (usize, usize), mut report: std::fs::File) -> std::io::Result<()> {
         self.memory.split(jobs, part);
         self.shared.get_mut().split(jobs, part);
+        self.state.get_mut().split(jobs, part);
         let mut text = String::new();
         for &index in work.iter().skip(part).step_by(jobs) {
             if let Err(error) = self.compile_into(cx, reached, index) {

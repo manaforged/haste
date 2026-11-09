@@ -214,10 +214,35 @@ impl<'a> Paths<'a> {
         }
         let named = self.scope(module).into_iter().flat_map(|scope| scope.names.values()).filter_map(|names| names.types.map(|binding| binding.def));
         let hidden = entry.pending.iter().filter(|pending| pending.module == module.module && pending.name == Some(UNDERSCORE)).filter_map(|pending| pending.stamp.map(|(def, _)| def));
-        for def in named.chain(hidden) {
+        let mut defs: Vec<Def> = named.chain(hidden).collect();
+        self.glob_hidden(module, (module, &mut vec![module]), &mut defs);
+        for def in defs {
             if let Def::Item(item) = def && self.trees[item.krate as usize].files[item.file as usize].items.items[item.item as usize].kind == ItemKind::Trait && !found.contains(&item) {
                 found.push(item);
             }
+        }
+    }
+
+    /// Adds to `found` what the `use … as _` imports of the modules that `module` glob-imports bind, through further globs, when visible to `importer`.
+    fn glob_hidden(&self, module: ModRef, (importer, seen): (ModRef, &mut Vec<ModRef>), found: &mut Vec<Def>) {
+        let Some(entry) = self.done.get(module.krate as usize) else { return };
+        let globs = entry.globs.get(&module.module).into_iter().flatten();
+        let targets: Vec<ModRef> = globs.filter_map(|&index| match entry.pending[index].stamp {
+            Some((Def::Module(target), _)) => Some(target),
+            _ => None,
+        }).collect();
+        for target in targets {
+            if seen.contains(&target) {
+                continue;
+            }
+            seen.push(target);
+            let Some(other) = self.done.get(target.krate as usize) else { continue };
+            if !other.resolves_all(target.module) && let Some(demands) = self.demands {
+                demands.scopes.borrow_mut().push(target);
+            }
+            let hidden = other.pending.iter().filter(|pending| pending.module == target.module && pending.name == Some(UNDERSCORE) && super::resolve::visible(self, pending.vis, target, importer));
+            found.extend(hidden.filter_map(|pending| pending.stamp.map(|(def, _)| def)));
+            self.glob_hidden(target, (importer, seen), found);
         }
     }
 

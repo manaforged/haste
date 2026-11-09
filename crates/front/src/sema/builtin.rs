@@ -1,10 +1,7 @@
-use anyhow::Result;
-use rustc_lexer::TokenKind;
-
-use crate::body::literal::{char_value, string_bytes};
+use anyhow::{Result, bail};
 use crate::names::ItemRef;
 use crate::outline::item::Attr;
-use crate::outline::source::{Source, Tokens, opens};
+use crate::outline::source::{Source, Tokens};
 
 use super::Context;
 
@@ -24,9 +21,12 @@ pub enum Builtin {
     Unreachable,
     PatternType,
     CfgSelect,
+    Env,
+    OptionEnv,
+    Asm,
 }
 
-const BUILTINS: [(&str, Builtin); 14] = [
+const BUILTINS: [(&str, Builtin); 17] = [
     ("concat", Builtin::Concat),
     ("stringify", Builtin::Stringify),
     ("line", Builtin::Line),
@@ -41,6 +41,9 @@ const BUILTINS: [(&str, Builtin); 14] = [
     ("unreachable", Builtin::Unreachable),
     ("pattern_type", Builtin::PatternType),
     ("cfg_select", Builtin::CfgSelect),
+    ("env", Builtin::Env),
+    ("option_env", Builtin::OptionEnv),
+    ("asm", Builtin::Asm),
 ];
 
 impl Builtin {
@@ -57,39 +60,6 @@ impl Context<'_> {
         let marked = entry.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_builtin_macro"));
         Builtin::named(src.text(entry.name?)).filter(|_| marked)
     }
-}
-
-/// The token ranges of the comma-separated arguments in the group that opens at `open`.
-pub fn args(src: &Source, open: u32) -> Vec<(u32, u32)> {
-    let close = src.pair(open);
-    let (mut found, mut from, mut at) = (Vec::new(), open + 1, open + 1);
-    while at < close {
-        match src.kind(at) {
-            TokenKind::Comma => {
-                found.push((from, at));
-                from = at + 1;
-                at += 1;
-            }
-            kind if opens(kind) => at = src.pair(at) + 1,
-            _ => at += 1,
-        }
-    }
-    if from < close {
-        found.push((from, close));
-    }
-    found
-}
-
-/// The text a literal token or `true` and `false` adds to `concat!`, or none for any other token.
-pub fn literal_text(src: &Source, at: u32) -> Result<Option<String>> {
-    let text = src.text(at);
-    Ok(match src.kind(at) {
-        TokenKind::Literal { kind: rustc_lexer::LiteralKind::Str { .. } | rustc_lexer::LiteralKind::RawStr { .. }, .. } => Some(String::from_utf8(string_bytes(text)?)?),
-        TokenKind::Literal { kind: rustc_lexer::LiteralKind::Char { .. }, .. } => Some(char_value(text)?.to_string()),
-        TokenKind::Literal { kind: rustc_lexer::LiteralKind::Int { .. } | rustc_lexer::LiteralKind::Float { .. }, suffix_start } => Some(text[..suffix_start as usize].to_owned()),
-        TokenKind::Ident if matches!(text, "true" | "false") => Some(text.to_owned()),
-        _ => None,
-    })
 }
 
 /// The tokens from `from` up to `to` as `stringify!` spells them.
@@ -129,6 +99,36 @@ pub fn assert(src: &Source, args: &[(u32, u32)], krate: u32, out: &mut Tokens) {
         }
     }
     out.lexed("}");
+}
+
+/// The expansion of an `asm!` whose templates hold only comments and placeholders and whose operands only read or keep their places: an optimization barrier with no effect.
+pub fn asm_barrier(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
+    for &(from, to) in args {
+        match src.literal_text(from)? {
+            Some(template) if to == from + 1 => {
+                if !strip_comments(&template).chars().all(|c| c.is_whitespace()) {
+                    bail!("inline assembly with instructions is not supported");
+                }
+            }
+            _ if matches!(src.text(from), "in" | "inout") && !(from..to).any(|at| src.text(at) == "=>") => {}
+            _ if src.text(from) == "options" => {}
+            _ => bail!("inline assembly operand `{}` is not supported", spelled(src, (from, to))),
+        }
+    }
+    out.lexed("()");
+    Ok(())
+}
+
+fn strip_comments(template: &str) -> String {
+    let mut rest = template;
+    let mut kept = String::new();
+    while let Some(start) = rest.find(['/', '{']) {
+        kept.push_str(&rest[..start]);
+        let close = if rest[start..].starts_with("/*") { rest[start..].find("*/").map(|end| start + end + 2) } else if rest[start..].starts_with('{') { rest[start..].find('}').map(|end| start + end + 1) } else { None };
+        let Some(close) = close else { return kept + &rest[start..] };
+        rest = &rest[close..];
+    }
+    kept + rest
 }
 
 /// The expansion of `format_args!` whose whole template is `template` with no placeholder, or none when it has one.

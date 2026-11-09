@@ -190,19 +190,26 @@ pub enum Truth {
     Unknown,
 }
 
-/// The cfg values of a crate: the target, the unit's features, the profile and what the unit's build script set; `known` is false while a build script that may set more has not run.
+/// The cfg values and compile-time variables of a crate: the target, the unit's features, the profile, Cargo's variables and what the unit's build script set; `known` is false while a build script that may set more has not run.
 #[derive(Debug, Default)]
 pub struct Env {
     pub target: Target,
     pub features: BTreeSet<String>,
     pub script: Option<std::sync::Arc<crate::graph::script::Output>>,
     pub known: bool,
+    pub vars: Vec<(String, String)>,
 }
 
 const PROFILE: [&str; 3] = ["debug_assertions", "overflow_checks", "ub_checks"];
 const OFF: [&str; 10] = ["test", "doc", "doctest", "miri", "rustfmt", "clippy", "windows", "wasm", "bootstrap", "docsrs"];
 
 impl Env {
+    /// The value `env!` gives variable `name`: what the build script or Cargo set for this crate, else the process environment's.
+    pub fn var(&self, name: &str) -> Option<String> {
+        let set = self.script.iter().flat_map(|output| &output.vars).chain(&self.vars);
+        set.filter(|(key, _)| key == name).map(|(_, value)| value.clone()).next().or_else(|| std::env::var(name).ok())
+    }
+
     /// Whether `cfg` may hold here: true unless this environment rules it out.
     pub fn allows(&self, cfg: &Cfg) -> bool {
         self.eval(cfg) != Truth::No

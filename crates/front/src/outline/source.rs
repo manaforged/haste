@@ -31,6 +31,8 @@ pub fn doc(kind: TokenKind) -> Option<bool> {
 pub enum Mark {
     Crate(u32),
     Home { krate: u32, file: u32, item: u32 },
+    /// A name from the body of a `macro_rules!` expansion, which binds local variables only within that expansion and also finds those of the scope where the macro was defined.
+    Scope { id: u32, parent: u32 },
 }
 
 /// A source file and its tokens, or tokens laid after those of a base file, numbered on from its last one.
@@ -82,6 +84,14 @@ impl Tokens {
             self.marks.push((self.tokens.len() as u32, mark));
         }
         self.append(token.kind, &layer.text[token.start as usize..(token.start + token.len) as usize], token.joint);
+    }
+
+    /// Writes the name `name`, marked as coming from `mark`.
+    pub fn ident(&mut self, name: &str, mark: Option<Mark>) {
+        if let Some(mark) = mark {
+            self.marks.push((self.tokens.len() as u32, mark));
+        }
+        self.append(TokenKind::Ident, name, false);
     }
 
     /// Writes `$crate` for the crate `krate`.
@@ -296,6 +306,39 @@ impl Source {
         src.tokens.get(local).map_or(TokenKind::Eof, |token| token.kind)
     }
 
+    /// The token ranges of the comma-separated arguments in the group that opens at `open`.
+    pub fn args(&self, open: u32) -> Vec<(u32, u32)> {
+        let close = self.pair(open);
+        let (mut found, mut from, mut at) = (Vec::new(), open + 1, open + 1);
+        while at < close {
+            match self.kind(at) {
+                TokenKind::Comma => {
+                    found.push((from, at));
+                    from = at + 1;
+                    at += 1;
+                }
+                kind if opens(kind) => at = self.pair(at) + 1,
+                _ => at += 1,
+            }
+        }
+        if from < close {
+            found.push((from, close));
+        }
+        found
+    }
+
+    /// The text a literal token or `true` and `false` adds to `concat!`, or none for any other token.
+    pub fn literal_text(&self, at: u32) -> Result<Option<String>> {
+        let text = self.text(at);
+        Ok(match self.kind(at) {
+            TokenKind::Literal { kind: rustc_lexer::LiteralKind::Str { .. } | rustc_lexer::LiteralKind::RawStr { .. }, .. } => Some(String::from_utf8(crate::body::literal::string_bytes(text)?)?),
+            TokenKind::Literal { kind: rustc_lexer::LiteralKind::Char { .. }, .. } => Some(crate::body::literal::char_value(text)?.to_string()),
+            TokenKind::Literal { kind: rustc_lexer::LiteralKind::Int { .. } | rustc_lexer::LiteralKind::Float { .. }, suffix_start } => Some(text[..suffix_start as usize].to_owned()),
+            TokenKind::Ident if matches!(text, "true" | "false") => Some(text.to_owned()),
+            _ => None,
+        })
+    }
+
     /// The index of the delimiter that matches token `at`.
     pub fn pair(&self, at: u32) -> u32 {
         let (src, local) = self.layer(at);
@@ -313,6 +356,14 @@ impl Source {
         match self.mark(at) {
             Some(Mark::Crate(krate)) => Some(krate),
             _ => None,
+        }
+    }
+
+    /// The hygiene scope of name `at` for local variables and the scope its macro was defined in: the `macro_rules!` expansion that wrote it, or zero for a name the program spelled.
+    pub fn scope(&self, at: u32) -> (u32, u32) {
+        match self.mark(at) {
+            Some(Mark::Scope { id, parent }) => (id, parent),
+            _ => (0, 0),
         }
     }
 

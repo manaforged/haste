@@ -51,7 +51,7 @@ pub enum Attr {
     CfgAttr(Cfg, Vec<Attr>),
     Path(String),
     MacroUse,
-    MacroExport,
+    MacroExport(bool),
     Derive(u32),
     NoStd,
     NoCore,

@@ -101,6 +101,19 @@ pub fn dir(workspace: &Workspace, unit: usize) -> PathBuf {
     workspace.top.join("target/haste/build").join(format!("{}-{}-{side}-{key:016x}", locked.name, locked.version))
 }
 
+fn out_dir(workspace: &Workspace, unit: usize) -> String {
+    dir(workspace, unit).join("out").display().to_string()
+}
+
+/// The variables `env!` reads in the crates of `unit`: Cargo's package variables and, when the package has a build script, its `OUT_DIR`.
+pub fn crate_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)> {
+    let mut vars = package_vars(workspace, unit);
+    if workspace.packages[workspace.graph.units[unit].package].manifest.build.is_some() {
+        vars.push(("OUT_DIR".to_owned(), out_dir(workspace, unit)));
+    }
+    vars
+}
+
 /// The kept output of `unit`'s build script, if no file it watches changed since the script ran.
 pub fn kept(workspace: &Workspace, unit: usize) -> Option<Output> {
     let path = dir(workspace, unit).join("output");
@@ -155,7 +168,7 @@ pub fn script_vars(workspace: &Workspace, targets: &Targets, unit: usize, metada
     vars.extend(manifest.links.iter().map(|links| ("CARGO_MANIFEST_LINKS".to_owned(), links.clone())));
     vars.extend(metadata.iter().cloned());
     let fixed = [
-        ("OUT_DIR", dir(workspace, unit).join("out").display().to_string()),
+        ("OUT_DIR", out_dir(workspace, unit)),
         ("TARGET", target.triple.clone()),
         ("HOST", targets.host.triple.clone()),
         ("NUM_JOBS", std::thread::available_parallelism().map_or(1, |count| count.get()).to_string()),

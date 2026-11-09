@@ -43,7 +43,7 @@ impl Lower<'_, '_> {
 
     /// The place that `base[index]` names after the autoderef steps of `base`: an element of an array or slice after a bounds check, or the target of `Index::index`.
     pub fn index_place(&mut self, expr: ExprId, base: ExprId, index: ExprId) -> Result<Option<Place>> {
-        let Some((place, ty)) = self.autoderef_place(expr, base)? else { return Ok(None) };
+        let Some((place, ty)) = self.autoderef_place(expr, base)? else { return self.empty_index(expr, base, index) };
         if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
             let receiver = self.address(place);
             let values = self.expr(index)?.into_iter();
@@ -52,9 +52,25 @@ impl Lower<'_, '_> {
         }
         let Some((data, len)) = self.data_len(Some(place), ty)? else { return Ok(None) };
         let Some(at) = self.expr(index)? else { return Ok(None) };
+        self.check_bounds(at, len);
+        self.element_place(data, at, self.ty_of(expr)).map(Some)
+    }
+
+    /// The place of element `index` of the array `base` that has no bytes: a dangling one past a bounds check, which rustc also keeps.
+    fn empty_index(&mut self, expr: ExprId, base: ExprId, index: ExprId) -> Result<Option<Place>> {
+        let ty = self.ty_of(base);
+        let Kind::Array(_, count) = *self.cx.types.kind(ty) else { return Ok(None) };
+        let Some(at) = self.expr(index)? else { return Ok(None) };
+        let count = self.len(count)?;
+        let len = self.ins().iconst(Type::I64, count);
+        self.check_bounds(at, len);
+        let data = self.address_or_dangling(None, ty)?;
+        self.element_place(data, at, self.ty_of(expr)).map(Some)
+    }
+
+    fn check_bounds(&mut self, at: Value, len: Value) {
         let inside = self.ins().icmp(IntCC::UnsignedLessThan, at, len);
         self.ins().trapz(inside);
-        self.element_place(data, at, self.ty_of(expr)).map(Some)
     }
 
     /// The data pointer and length of the array or slice of type `ty` at `place`; `None` when it has no bytes.

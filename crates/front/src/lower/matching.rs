@@ -5,6 +5,7 @@ use crate::body::{ExprId, List, Pat, PatId};
 use crate::sema::infer::{Res, position, rest_split};
 use crate::sema::ty::{Kind, Ty};
 
+use super::drop::Pending;
 use super::moves::{MovePath, Root};
 use super::ops::Num;
 use super::place::{Base, Place};
@@ -270,7 +271,7 @@ impl Lower<'_, '_> {
                 sub.map_or(Ok(()), |sub| self.bind_matched(sub, place, None))
             }
             Pat::Paren(inner) => self.bind_matched(inner, place, at),
-            Pat::Or(list) if self.typed.or_binds.contains(&pat) => self.bind_or(list, place),
+            Pat::Or(list) if self.typed.or_binds.contains(&pat) => self.bind_or(list, place, at),
             Pat::Ref { pat: inner, .. } => {
                 let pointee = self.pat_repr(inner)?;
                 let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
@@ -287,16 +288,20 @@ impl Lower<'_, '_> {
         }
     }
 
-    fn bind_or(&mut self, list: List, place: Option<Place>) -> Result<()> {
+    fn bind_or(&mut self, list: List, place: Option<Place>, from: Option<(Root, MovePath)>) -> Result<()> {
         let join = self.b.create_block();
+        let which = self.b.append_block_param(join, Type::I8);
         let alts: Vec<PatId> = self.body.list(list).iter().map(|&at| PatId(at)).collect();
         for (at, &alt) in alts.iter().enumerate() {
             let next = (at + 1 < alts.len()).then(|| self.b.create_block());
             if let Some(next) = next {
                 self.test(alt, place, next)?;
             }
-            self.bind_matched(alt, place, None)?;
-            self.jump(join, &[]);
+            let mark = self.pending.len();
+            self.bind_matched(alt, place, from.clone())?;
+            self.pending[mark..].iter_mut().for_each(|pending| pending.when.push((which, at as i64)));
+            let index = self.ins().iconst(Type::I8, at as i64);
+            self.jump(join, &[index]);
             if let Some(next) = next {
                 self.enter(next);
             }
@@ -320,18 +325,16 @@ impl Lower<'_, '_> {
         let Some(&local) = self.typed.binds.get(&pat) else { bail!("binding has no local") };
         let referenced = by_ref || self.typed.ref_binds.contains_key(&pat);
         let value = if referenced { Some(self.address_or_dangling(place, self.pat_ty(pat)?)?) } else { place.and_then(|place| self.read(place)) };
-        if let Some(bound) = self.locals[local as usize] {
-            if !referenced && crate::sema::infer::needs_drop(self.cx, self.pat_ty(pat)?)? {
-                bail!("moving out of an or-pattern is not supported yet");
+        let moves = !referenced && crate::sema::infer::needs_drop(self.cx, self.pat_ty(pat)?)?;
+        match self.locals[local as usize] {
+            Some(bound) => {
+                value.into_iter().for_each(|value| self.write(bound, value));
+                self.reinit(Root::Local(local), &[]);
             }
-            value.into_iter().for_each(|value| self.write(bound, value));
-            return Ok(());
+            None => self.declare(local, value)?,
         }
-        self.declare(local, value)?;
-        if let Some(at) = at.filter(|_| !referenced)
-            && crate::sema::infer::needs_drop(self.cx, self.pat_ty(pat)?)?
-        {
-            self.pending.push(at);
+        if let Some((root, path)) = at.filter(|_| moves) {
+            self.pending.push(Pending { root, path, when: Vec::new() });
         }
         Ok(())
     }

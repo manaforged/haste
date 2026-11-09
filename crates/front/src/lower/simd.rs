@@ -23,6 +23,7 @@ impl Lower<'_, '_> {
             (Simd::Splat, _, _) => self.splat(vector, first)?,
             (Simd::Bitmask, _, Some(out)) => self.bitmask(vector, first, out)?,
             (Simd::Lanewise(bin), &[x, y], out) => self.lanewise(bin, (vector, out.unwrap_or(vector)), (x, y))?,
+            (Simd::Cast, _, Some(out)) => self.lane_cast((vector, out), first)?,
             (Simd::Shuffle, &[x, y, idx], _) => self.shuffle(substs, (x, y), idx)?,
             (Simd::Extract, &[x, at], _) => {
                 let (lanes, lane) = self.lane_address(vector, x, at)?;
@@ -66,6 +67,20 @@ impl Lower<'_, '_> {
             let a = self.ins().load(from.machine, x, lane * from.size);
             let b = self.ins().load(from.machine, y, lane * from.size);
             let value = self.lane_op(op, from.num, (a, b), to.machine)?;
+            self.ins().stack_store(value, slot, lane * to.size);
+        }
+        Ok(address)
+    }
+
+    fn lane_cast(&mut self, (input, output): (Ty, Ty), x: Value) -> Result<Value> {
+        let (from, to) = (self.lanes(input)?, self.lanes(output)?);
+        if from.count != to.count {
+            bail!("`simd_cast` between vectors of {} and {} lanes", from.count, to.count);
+        }
+        let (slot, address) = self.vector_slot(output)?;
+        for lane in 0..from.count {
+            let value = self.ins().load(from.machine, x, lane * from.size);
+            let value = self.convert(value, from.num, to.num)?;
             self.ins().stack_store(value, slot, lane * to.size);
         }
         Ok(address)

@@ -68,7 +68,7 @@ impl<'a> Infer<'_, 'a> {
             return Ok(None);
         }
         let given = self.segment_args(arena, path, prefix.len())?;
-        let named = self.alias(alias, given)?;
+        let named = self.alias(alias, given, true)?;
         let Kind::Adt(item, args) = self.cx.types.kind(named).clone() else { return Ok(None) };
         let name = self.cx.names.symbols.text(*name).to_string();
         Ok(self.variant_named(item, &name)?.map(|variant| (item, variant, args)))

@@ -46,7 +46,7 @@ impl<'a> Context<'a> {
         members.get(name).copied()
     }
 
-    /// The methods of trait `of` and then of its supertraits in vtable order: each one that takes `self` and has no type parameters of its own, and none for the rest or for a generic supertrait.
+    /// The methods of trait `of` and then of its supertraits in vtable order: each one that takes `self`, has no type parameters of its own and no `Self: Sized` bound, and none for the rest or for a generic supertrait.
     pub fn vtable_methods(&mut self, of: ItemRef) -> Result<Vec<Option<ItemRef>>> {
         let traits = super::infer::detached(self, of, |infer| infer.implied_traits(vec![of]))?;
         let mut methods = Vec::new();
@@ -54,7 +54,7 @@ impl<'a> Context<'a> {
             let open = owner != of && self.is_generic_trait(owner)?;
             for member in self.children(owner).filter(|member| self.item(*member).1.kind == ItemKind::Fn).collect::<Vec<_>>() {
                 let sig = self.signature(member)?;
-                let callable = !open && sig.receiver.is_some() && super::infer::type_params(&sig.generics).next().is_none();
+                let callable = !open && sig.receiver.is_some() && super::infer::type_params(&sig.generics).next().is_none() && !super::infer::detached(self, member, |infer| infer.needs_sized_self(member))?;
                 methods.push(callable.then_some(member));
             }
         }

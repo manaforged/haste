@@ -390,7 +390,8 @@ impl Infer<'_, '_> {
             None => (None, None),
         };
         let closure = self.is_closure(arg);
-        let hint = hint.or(expectation.filter(|_| closure));
+        let soft = closure || matches!(self.body.expr(arg), Expr::Tuple(_));
+        let hint = hint.or(expectation.filter(|_| soft));
         let found = self.expr(arg, Some(hint.unwrap_or(param)))?;
         self.coerce_arg((arg, found, closure), param, expectation)?;
         match bound {
@@ -533,6 +534,19 @@ impl Infer<'_, '_> {
             }
         }
         Ok(None)
+    }
+
+    /// The trait bounds other than `Fn` that an `impl Trait` return type of `sig` spells in the current frame, each with `ret` as `Self`.
+    pub(super) fn ret_bounds(&mut self, sig: &Signature, ret: Ty) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else { return Ok(Vec::new()) };
+        let mut found = Vec::new();
+        for &bound in sig.body.list(bounds) {
+            let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else { continue };
+            if !self.is_callable_trait(of) && let Ok(args) = self.bound_args(of, &sig.body, path, ret) {
+                found.push((of, std::iter::once(ret).chain(args).collect()));
+            }
+        }
+        Ok(found)
     }
 
     pub(super) fn fn_bound(&mut self, arena: &Body, home: ModRef, bound: u32) -> Result<Option<Ty>> {

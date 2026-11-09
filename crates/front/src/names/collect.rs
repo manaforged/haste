@@ -143,7 +143,7 @@ fn bind_item(tree: &Tree, (file, at): (u32, u32), index: usize, context: &Contex
     if item.kind == ItemKind::Fn && let Some(exported) = proc_macro_name(&source.source, item, text) {
         scopes[0].bind(context.symbols.intern(exported), Ns::Macros, public);
     }
-    if item.attrs.iter().any(|attr| *attr == Attr::MacroExport) {
+    if item.attrs.iter().any(|attr| matches!(attr, Attr::MacroExport(_))) {
         scopes[0].bind(name, Ns::Macros, public);
     }
     for ns in namespaces(item) {

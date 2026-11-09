@@ -59,8 +59,13 @@ impl Header {
 
 /// The bounds that a header puts on its type parameter `name`: those on the parameter, then those of the where predicates on it.
 pub(super) fn named_bounds(arena: &Body, src: &Source, (generics, predicates): (&[Generic], &[Predicate]), name: &str) -> Vec<u32> {
-    let declared = generics.iter().filter(|generic| src.text(generic.name) == name).flat_map(|generic| arena.list(generic.bounds).iter().copied());
+    let declared = generics.iter().filter(|generic| same_param(src.text(generic.name), name)).flat_map(|generic| arena.list(generic.bounds).iter().copied());
     declared.chain(predicate_bounds(arena, src, predicates, name)).collect()
+}
+
+/// Whether two parameter names read from source are the same parameter: equal text, and for an anonymous `impl Trait` parameter the same token.
+pub(super) fn same_param(a: &str, b: &str) -> bool {
+    a == b && (a != "impl" || std::ptr::eq(a, b))
 }
 
 /// The bounds on the one generic parameter `generic`: its own, then the where-clause bounds on its name.
@@ -84,6 +89,14 @@ fn names_param(arena: &Body, src: &Source, ty: TyId, name: &str) -> bool {
 }
 
 impl<'a> Infer<'_, 'a> {
+    /// Whether trait method `member` says `where Self: Sized`, which keeps it out of the trait's vtable.
+    pub(crate) fn needs_sized_self(&mut self, member: ItemRef) -> Result<bool> {
+        let (sig, src, home) = (self.cx.signature(member)?, &self.cx.file(member).source, self.cx.module_of(member)?);
+        let Some(sized) = self.cx.lang_item("sized") else { return Ok(false) };
+        let bounds: Vec<u32> = predicate_bounds(&sig.body, src, &sig.predicates, "Self").collect();
+        self.in_source(src, |infer| Ok(bounds.into_iter().any(|bound| infer.bound_trait_at(&sig.body, bound, home).is_some_and(|(of, _)| of == sized))))
+    }
+
     /// The frame of the type item or trait `item` with its type parameters `params` set to `args`, `Self` as `self_ty`, and the bounds of `bounds`.
     pub(super) fn item_frame(&mut self, item: ItemRef, (params, args): (&[Generic], &[Ty]), (self_ty, bounds): (Option<Ty>, Option<ItemRef>)) -> Result<Frame<'a>> {
         let file = self.cx.file(item);
@@ -200,9 +213,16 @@ impl<'a> Infer<'_, 'a> {
         let sig = self.cx.signature(item)?;
         let frame = self.frame(item, substs)?;
         let foreign = sig.opaque && self.instance.as_ref().is_none_or(|(own, _)| *own != item);
-        let (types, bound) = self.with_frame(frame, |infer| Ok((infer.sig_types(&sig)?, if foreign { infer.ret_fn_sig(&sig)? } else { None })))?;
-        if foreign {
-            self.opaque_ret(item, substs, (types.1, bound))?;
+        let (types, opaque) = self.with_frame(frame, |infer| {
+            let types = infer.sig_types(&sig)?;
+            let opaque = match foreign {
+                true => Some((infer.ret_fn_sig(&sig)?, infer.ret_bounds(&sig, types.1)?)),
+                false => None,
+            };
+            Ok((types, opaque))
+        })?;
+        if let Some((sig, bounds)) = opaque {
+            self.opaque_ret(super::opaque::Opaque { item, substs: substs.to_vec(), ret: types.1, sig, bounds })?;
         }
         Ok(types)
     }

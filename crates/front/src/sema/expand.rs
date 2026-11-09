@@ -70,6 +70,13 @@ fn def_site_macro(cx: &mut Context<'_>, src: &Source, path: (u32, u32)) -> Optio
     macro_at(&cx.paths(module.krate), src, path, module)
 }
 
+/// The output of the `macro_rules!` or `macro` item `found` called with the group at `open` of `src`, or none when `found` is not one.
+fn defined_expand(cx: &Context<'_>, found: ItemRef, src: &Source, open: u32) -> Option<Result<Source>> {
+    let definition = cx.outline.crates[found.krate as usize].defined.get(&(found.file, found.item))?;
+    let home = (cx.item(found).1.kind == ItemKind::Macro).then_some(Mark::Home { krate: found.krate, file: found.file, item: found.item });
+    Some(mbe::expand(&definition.file.source, &definition.rules, src, (open, definition.krate as u32), home))
+}
+
 /// The output of the procedural macro `run` called with the delimiter at `open`, once the front end ran it; until then the call asks for it.
 fn proc_bang(cx: &mut Context<'_>, src: &Source, run: ItemRef, open: u32) -> Result<Option<Source>> {
     let close = src.pair(open);
@@ -191,9 +198,8 @@ impl Writer {
             None => macro_at(&cx.paths(self.home.krate), run.src, path, self.home).or_else(|| def_site_macro(cx, run.src, path)),
         };
         let Some(found) = found else { return Ok(None) };
-        if let Some(definition) = cx.outline.crates[found.krate as usize].defined.get(&(found.file, found.item)) {
-            let home = (cx.item(found).1.kind == ItemKind::Macro).then_some(Mark::Home { krate: found.krate, file: found.file, item: found.item });
-            return mbe::expand(&definition.file.source, &definition.rules, run.src, (open, definition.krate as u32), home).map(Some);
+        if let Some(output) = defined_expand(cx, found, run.src, open) {
+            return output.map(Some);
         }
         if let Some((_, ProcKind::Bang)) = found.outer().is_none().then(|| cx.item(found)).and_then(|(src, item)| proc_kind(src, item)) {
             return proc_bang(cx, run.src, found, open);
@@ -212,28 +218,37 @@ impl Writer {
         let input = (open + 1, src.pair(open));
         match site.builtin {
             Builtin::Concat => return self.concat(cx, run, open, out),
+            Builtin::Env | Builtin::OptionEnv => return self.env(cx, run, site, out),
             Builtin::FormatArgs | Builtin::FormatArgsNl => return self.format_args(cx, run, site, out),
             Builtin::PatternType => return Ok(false),
             Builtin::Line | Builtin::Column | Builtin::File if run.depth > 0 => return Ok(false),
             Builtin::Line | Builtin::Column | Builtin::File | Builtin::Stringify => position(src, site, input, out),
-            Builtin::Cfg => {
-                let predicate = (input.0..input.1).map(|at| src.text(at)).collect::<Vec<_>>().join(" ");
-                let holds = cx.outline.crates[self.home.krate as usize].env.eval(&crate::graph::cfg::parse(&predicate)?) == Truth::Yes;
-                out.lexed(if holds { "true" } else { "false" });
-            }
+            Builtin::Cfg => self.cfg(cx, src, input, out)?,
             Builtin::CfgSelect => return self.cfg_select(cx, run, open, out),
-            Builtin::Assert => builtin::assert(src, &builtin::args(src, open), site.krate, out),
+            Builtin::Assert => builtin::assert(src, &src.args(open), site.krate, out),
+            Builtin::Asm => builtin::asm_barrier(src, &src.args(open), out)?,
             Builtin::Panic | Builtin::Unreachable => self.panic(cx, run, site, out),
         }
         Ok(true)
     }
 
+    fn cfg(&self, cx: &Context<'_>, src: &Source, (from, to): (u32, u32), out: &mut Tokens) -> Result<()> {
+        let predicate = (from..to).map(|at| src.text(at)).collect::<Vec<_>>().join(" ");
+        let holds = cx.outline.crates[self.home.krate as usize].env.eval(&crate::graph::cfg::parse(&predicate)?) == Truth::Yes;
+        out.lexed(if holds { "true" } else { "false" });
+        Ok(())
+    }
+
     fn cfg_select(&self, cx: &mut Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<bool> {
         let env = &cx.outline.crates[self.home.krate as usize].env;
         let Some(arm) = crate::outline::mbe::select_arm(run.src, open, env)? else { bail!("no cfg_select! arm applies") };
-        out.lexed(if arm.braced { "{" } else { "(" });
+        if !arm.braced {
+            out.lexed("(");
+        }
         (arm.from..arm.to).for_each(|at| out.copy(run.src, at));
-        out.lexed(if arm.braced { "}" } else { ")" });
+        if !arm.braced {
+            out.lexed(")");
+        }
         Ok(true)
     }
 
@@ -248,7 +263,7 @@ impl Writer {
 
     fn concat(&self, cx: &mut Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<bool> {
         let mut text = String::new();
-        for range in builtin::args(run.src, open) {
+        for range in run.src.args(open) {
             let Some(piece) = self.literal(cx, run, range)? else { return Ok(false) };
             text.push_str(&piece);
         }
@@ -256,9 +271,25 @@ impl Writer {
         Ok(true)
     }
 
+    fn env(&self, cx: &mut Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
+        let Some(&name) = run.src.args(site.open).first() else { bail!("env! takes the name of a variable") };
+        let Some(name) = self.literal(cx, run, name)? else { return Ok(false) };
+        match (site.builtin, cx.outline.crates[self.home.krate as usize].env.var(&name)) {
+            (Builtin::Env, Some(value)) => out.lexed(&format!("{value:?}")),
+            (Builtin::Env, None) => bail!("environment variable `{name}` is not defined at compile time"),
+            (_, Some(value)) => {
+                builtin::crate_path(out, site.krate, "::option::Option::Some(");
+                out.lexed(&format!("{value:?})"));
+            }
+            (_, None) => builtin::crate_path(out, site.krate, "::option::Option::None::<&'static str>"),
+        }
+        Ok(true)
+    }
+
     fn format_args(&self, cx: &mut Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
-        let args = builtin::args(run.src, site.open);
+        let args = run.src.args(site.open);
         let Some((&template, rest)) = args.split_first() else { return Ok(false) };
+        let start = template.0;
         let Some(mut template) = self.literal(cx, run, template)? else { return Ok(false) };
         if site.builtin == Builtin::FormatArgsNl {
             template.push('\n');
@@ -266,7 +297,7 @@ impl Writer {
         if rest.is_empty() && builtin::format_literal(&template, site.krate, out) {
             return Ok(true);
         }
-        super::format::expand(&template, &super::format::Call::new(run.src, rest), site.krate, out)?;
+        super::format::expand(&template, &super::format::Call::new(run.src, start, rest), site.krate, out)?;
         Ok(true)
     }
 
@@ -276,10 +307,10 @@ impl Writer {
             return self.literal(cx, run, (from + 1, to - 1));
         }
         if to == from + 1 {
-            return builtin::literal_text(src, from);
+            return src.literal_text(from);
         }
         if to == from + 2 && src.text(from) == "-" {
-            return Ok(builtin::literal_text(src, from + 1)?.map(|text| format!("-{text}")));
+            return Ok(src.literal_text(from + 1)?.map(|text| format!("-{text}")));
         }
         let open = src.pair(to - 1);
         if !matches!(src.kind(to - 1), TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace) || open <= from || src.kind(open - 1) != TokenKind::Bang {
@@ -302,6 +333,18 @@ struct Site {
 
 
 impl<'a> Context<'a> {
+    /// The tokens that the macro `item` writes for the call whose group opens at `open` of `src`, expanded once per call and kept for the pass; none when `item` is not a `macro_rules!` or `macro`.
+    pub fn macro_output(&self, src: &'a Source, item: ItemRef, open: u32) -> Result<Option<&'a Source>> {
+        let key = (std::ptr::from_ref(src) as usize, open);
+        if let Some(&found) = self.macro_outputs.borrow().get(&key) {
+            return Ok(Some(found));
+        }
+        let Some(output) = defined_expand(self, item, src, open) else { return Ok(None) };
+        let output: &'a Source = Box::leak(Box::new(output?));
+        self.macro_outputs.borrow_mut().insert(key, output);
+        Ok(Some(output))
+    }
+
     /// The expansion of the body of `item`, or of the body that declares it, once a pass read that body and found macro calls or items in it.
     pub fn expansion(&self, item: ItemRef) -> Option<&'a Expansion> {
         let item = item.body_owner();
@@ -372,7 +415,7 @@ fn declared(source: &Source, config: syntax::Config<'_>, body: &Body) -> Result<
     let mut starts: Vec<u32> = item_starts(body).collect();
     while !starts.is_empty() {
         let first = items.items.len();
-        items = scan::body_items(source, std::mem::take(&mut starts), items)?;
+        items = scan::body_items(source, std::mem::take(&mut starts), (items, config.calls))?;
         for entry in &items.items[first..] {
             let has_body = match entry.kind {
                 ItemKind::Fn => entry.body.is_some(),

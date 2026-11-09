@@ -176,6 +176,12 @@ impl Cursor<'_> {
         if self.punct("!") && opens(self.kind_at(self.at + 1)) {
             self.at += 1;
             let open = self.group();
+            if let Some(&block) = self.config.calls.and_then(|calls| calls.get(&open)) {
+                let at = self.at;
+                let pat = self.inside(block, Self::pat);
+                self.at = at;
+                return pat;
+            }
             return Ok(self.push_pat(Pat::Macro { path, open }));
         }
         match self.kind() {
@@ -195,12 +201,15 @@ impl Cursor<'_> {
         let fields = self.inside(open, |cursor| {
             let mut fields = Vec::new();
             while !cursor.done() {
-                cursor.skip_attrs()?;
+                let attrs = cursor.skip_attrs()?;
                 if cursor.eat("..") {
                     rest = true;
                     break;
                 }
-                fields.push(cursor.field_pat()?);
+                let field = cursor.field_pat()?;
+                if !cursor.configured_out(attrs) {
+                    fields.push(field);
+                }
                 if !cursor.eat(",") {
                     break;
                 }

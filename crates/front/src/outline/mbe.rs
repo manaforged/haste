@@ -26,7 +26,7 @@ fn names(def: &Source, pieces: &[Piece], into: &mut Vec<String>) {
         match piece {
             Piece::Var(name, _) | Piece::Meta(Meta::Ignore(name) | Meta::Count(name)) => into.push(def.text(*name).to_owned()),
             Piece::Group(_, inner) | Piece::Repeat(inner, ..) => names(def, inner, into),
-            Piece::Token(_) | Piece::Crate | Piece::Meta(_) => {}
+            Piece::Token(_) | Piece::Crate | Piece::CratePath | Piece::Meta(_) => {}
         }
     }
 }
@@ -61,7 +61,7 @@ impl Matcher<'_> {
                 binds.insert(self.def.text(*name).to_owned(), Bind::One(at, to, grouped));
                 Some(to)
             }
-            Piece::Var(_, None) | Piece::Crate | Piece::Meta(_) => None,
+            Piece::Var(_, None) | Piece::Crate | Piece::CratePath | Piece::Meta(_) => None,
             Piece::Repeat(inner, sep, op) => self.repeat(inner, *sep, *op, (at, end), binds),
         }
     }
@@ -105,8 +105,12 @@ struct Writer<'a> {
     lens: Vec<usize>,
     krate: u32,
     home: Option<Mark>,
+    scope: u32,
     out: Tokens,
 }
+
+/// The next `macro_rules!` expansion's hygiene scope; zero stays for names the program spelled.
+static SCOPES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 fn leaves(bind: &Bind) -> usize {
     match bind {
@@ -131,7 +135,12 @@ impl Writer<'_> {
         for piece in pieces {
             match piece {
                 Piece::Token(token) => {
-                    let home = self.home.filter(|_| matches!(self.def.kind(*token), TokenKind::Ident | TokenKind::RawIdent));
+                    let scope = Mark::Scope { id: self.scope, parent: self.def.scope(*token).0 };
+                    let home = match self.def.kind(*token) {
+                        TokenKind::Ident | TokenKind::RawIdent => Some(self.home.unwrap_or(scope)),
+                        TokenKind::Literal { .. } => Some(scope),
+                        _ => None,
+                    };
                     self.out.copy_marked(self.def, *token, home);
                 }
                 Piece::Group(open, inner) => {
@@ -140,6 +149,10 @@ impl Writer<'_> {
                     self.out.copy(self.def, self.def.pair(*open));
                 }
                 Piece::Crate => self.out.dollar_crate(self.krate),
+                Piece::CratePath => {
+                    self.out.dollar_crate(self.krate);
+                    self.out.lexed("::");
+                }
                 Piece::Meta(meta) => self.meta(meta, rounds),
                 Piece::Var(name, _) => self.var(*name, rounds)?,
                 Piece::Repeat(inner, sep, _) => self.repeat(inner, *sep, rounds)?,
@@ -228,7 +241,7 @@ pub fn expand(def: &Source, rules: &[Rule], input: &Source, (open, krate): (u32,
     for rule in rules {
         let mut binds = Binds::default();
         if matcher.seq(&rule.matcher, open + 1, close, &mut binds) == Some(close) {
-            let mut writer = Writer { def, input, binds, lens: Vec::new(), krate, home, out: Tokens::default() };
+            let mut writer = Writer { def, input, binds, lens: Vec::new(), krate, home, scope: SCOPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed), out: Tokens::default() };
             writer.emit(&rule.body, &mut Vec::new())?;
             return writer.out.finish(input.path.clone());
         }

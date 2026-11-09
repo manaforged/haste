@@ -57,7 +57,7 @@ impl Infer<'_, '_> {
             Pat::Tuple(list) => self.tuple_pat(list, ty, mode),
             Pat::Slice(list) => self.slice_pat(list, ty, mode),
             Pat::Ref { mutable, pat: inner } => self.ref_pat(inner, mutable, ty),
-            Pat::Path(path) => self.path_pat(pat, path, ty),
+            Pat::Path(path) => self.path_pat(pat, path, (ty, mode)),
             Pat::TupleStruct(path, list) => self.variant_pat(pat, path, ty, (list, mode)),
             Pat::Struct { path, fields, .. } => self.struct_pat(pat, path, ty, (fields, mode)),
             Pat::Or(list) => self.or_pat(pat, list, ty, mode),
@@ -67,10 +67,7 @@ impl Infer<'_, '_> {
 
     fn bind_name(&mut self, pat: PatId, (name, mutable, by_ref): (u32, bool, bool), sub: Option<PatId>, (ty, mode): (Ty, Mode)) -> Result<()> {
         if !mutable && !by_ref && sub.is_none() && let Some((found, res)) = self.named_pat(name)? {
-            self.out.pat_res.insert(pat, res);
-            let (peeled, _) = self.peel_refs(pat, ty, mode);
-            self.out.pats.insert(pat, peeled);
-            return self.unify(peeled, found);
+            return self.named_value(pat, (found, res), ty, mode);
         }
         let explicit = if mutable { Mut::Mut } else { Mut::Not };
         let reference = match (by_ref, mode) {
@@ -87,7 +84,7 @@ impl Infer<'_, '_> {
         };
         let local = self.new_local(local_ty, mutable && !by_ref);
         self.out.binds.insert(pat, local);
-        self.scopes.push((plain(self.src.text(name)), local));
+        self.scopes.push(((plain(self.src.text(name)), self.src.scope(name).0), local));
         sub.map_or(Ok(()), |sub| self.pat(sub, ty, mode))
     }
 
@@ -105,7 +102,7 @@ impl Infer<'_, '_> {
 
     fn peel(&mut self, pat: PatId, ty: Ty, mode: Mode) -> (Ty, Mode) {
         let keeps = match *self.body.pat(pat) {
-            Pat::Bind { .. } | Pat::Wild | Pat::Rest | Pat::Ref { .. } | Pat::Paren(_) => true,
+            Pat::Bind { .. } | Pat::Path(_) | Pat::Wild | Pat::Rest | Pat::Ref { .. } | Pat::Paren(_) | Pat::Or(_) => true,
             Pat::Lit(expr) => matches!(self.body.expr(expr), Expr::Lit(Lit::Str | Lit::ByteStr | Lit::CStr, _)),
             _ => false,
         };
@@ -192,16 +189,23 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    fn path_pat(&mut self, pat: PatId, path: PathId, ty: Ty) -> Result<()> {
+    fn path_pat(&mut self, pat: PatId, path: PathId, (ty, mode): (Ty, Mode)) -> Result<()> {
         let (found, res) = self.value_path(path)?;
-        match &res {
-            Res::Ctor(..) => {}
-            Res::Fn(item, _) if self.cx.item(*item).1.kind == ItemKind::Const => {}
-            _ => bail!("pattern path is not a unit constructor or a constant"),
+        if !matches!(res, Res::Ctor(..)) && !self.is_const(&res) {
+            bail!("pattern path is not a unit constructor or a constant");
         }
-        self.unify(ty, found)?;
+        self.named_value(pat, (found, res), ty, mode)
+    }
+
+    fn is_const(&self, res: &Res) -> bool {
+        matches!(res, Res::Fn(item, _) if self.cx.item(*item).1.kind == ItemKind::Const)
+    }
+
+    fn named_value(&mut self, pat: PatId, (found, res): (Ty, Res), ty: Ty, mode: Mode) -> Result<()> {
+        let peeled = if self.is_const(&res) { ty } else { self.peel_refs(pat, ty, mode).0 };
+        self.out.pats.insert(pat, peeled);
         self.out.pat_res.insert(pat, res);
-        Ok(())
+        self.unify(peeled, found)
     }
 
     fn variant_pat(&mut self, pat: PatId, path: PathId, ty: Ty, (list, mode): (List, Mode)) -> Result<()> {
@@ -234,7 +238,7 @@ impl Infer<'_, '_> {
 
     fn or_pat(&mut self, pat: PatId, list: List, ty: Ty, mode: Mode) -> Result<()> {
         let depth = self.scopes.len();
-        let mut first: Option<Vec<(&str, u32)>> = None;
+        let mut first: Option<Vec<(super::Name, u32)>> = None;
         for &alt in self.body.list(list) {
             self.pat(PatId(alt), ty, mode)?;
             let bound = self.scopes.split_off(depth);
@@ -251,12 +255,12 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    fn merge_alt(&mut self, names: &[(&str, u32)], bound: Vec<(&str, u32)>) -> Result<()> {
+    fn merge_alt(&mut self, names: &[(super::Name, u32)], bound: Vec<(super::Name, u32)>) -> Result<()> {
         if names.len() != bound.len() {
             bail!("the alternatives of an or-pattern bind different names");
         }
         for (name, local) in bound {
-            let Some(&(_, kept)) = names.iter().find(|(other, _)| *other == name) else { bail!("`{name}` is not bound in every alternative") };
+            let Some(&(_, kept)) = names.iter().find(|(other, _)| *other == name) else { bail!("`{}` is not bound in every alternative", name.0) };
             self.unify(self.out.locals[local as usize].ty, self.out.locals[kept as usize].ty)?;
             self.out.binds.values_mut().filter(|at| **at == local).for_each(|at| *at = kept);
         }

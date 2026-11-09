@@ -88,20 +88,26 @@ impl<'a> Infer<'_, 'a> {
         inner.map(Def::Item).or_else(|| self.local_member(path.segments)).or_else(|| self.resolve_local(path))
     }
 
-    /// The variant that `Enum::Variant` names, or the item that `module::name` names, when the body declares the enum or module.
+    /// The item that `module::inner::name` names, or the variant that a last `Enum::Variant` names, when the body declares the first module or enum.
     fn local_member(&mut self, segments: &[Sym]) -> Option<Def> {
-        let [head, name] = segments else { return None };
-        let item = self.declared_item(self.cx.names.symbols.text(*head))?;
-        let text = self.cx.names.symbols.text(*name);
-        match self.cx.item(item).1.kind {
-            ItemKind::Enum => {
-                let def = self.cx.adt_def(item).ok()?;
-                let src = self.cx.item(item).0;
-                def.variants.iter().find(|variant| plain(src.text(variant.name)) == text).map(|variant| Def::Variant(item, variant.index))
-            }
-            ItemKind::Mod => self.local_child(item, text).map(Def::Item),
-            _ => None,
+        let (head, rest) = segments.split_first()?;
+        if rest.is_empty() {
+            return None;
         }
+        let mut item = self.declared_item(self.cx.names.symbols.text(*head))?;
+        for (at, name) in rest.iter().enumerate() {
+            let text = self.cx.names.symbols.text(*name);
+            match self.cx.item(item).1.kind {
+                ItemKind::Enum if at + 1 == rest.len() => {
+                    let def = self.cx.adt_def(item).ok()?;
+                    let src = self.cx.item(item).0;
+                    return def.variants.iter().find(|variant| plain(src.text(variant.name)) == text).map(|variant| Def::Variant(item, variant.index));
+                }
+                ItemKind::Mod => item = self.local_child(item, text)?,
+                _ => return None,
+            }
+        }
+        Some(Def::Item(item))
     }
 
     /// The item named `name` inside the body-declared module `module`.
@@ -218,7 +224,8 @@ impl<'a> Infer<'_, 'a> {
         let body = self.body;
         let entry = body.path(path);
         let single = entry.qself.is_none() && !entry.global && entry.segments.len == 1;
-        if single && let Some(found) = self.bound_value(crate::names::plain(self.src.text(body.segments[body.list(entry.segments)[0] as usize].name)))? {
+        let first = body.segments[body.list(entry.segments)[0] as usize].name;
+        if single && let Some(found) = self.bound_value(crate::names::plain(self.src.text(first)), self.src.scope(first))? {
             return Ok(found);
         }
         if let Some(ctor) = self.ctor(body, path, true)? {
@@ -251,8 +258,10 @@ impl<'a> Infer<'_, 'a> {
         }
     }
 
-    fn bound_value(&mut self, name: &str) -> Result<Option<(Ty, Res)>> {
-        if let Some(&(_, local)) = self.scopes.iter().rev().find(|(bound, _)| *bound == name) {
+    /// The local that `name` written in hygiene scope `(id, parent)` finds: one its own expansion bound, else one of the scope its macro was defined in, else one the program bound; or a const parameter.
+    fn bound_value(&mut self, name: &str, (id, parent): (u32, u32)) -> Result<Option<(Ty, Res)>> {
+        let found = [id, parent, 0].into_iter().find_map(|scope| self.scopes.iter().rev().find(|(bound, _)| *bound == (name, scope)));
+        if let Some(&(_, local)) = found {
             self.note_use(local);
             return Ok(Some((self.out.locals[local as usize].ty, Res::Local(local))));
         }
@@ -439,30 +448,46 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The type that the associated type `name` of impl `block` is, read in the current frame over the alias's own source, when the impl has one.
-    pub(super) fn impl_alias(&mut self, block: ImplRef, name: &str) -> Result<Option<Ty>> {
+    pub(super) fn impl_alias(&mut self, block: ImplRef, (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
         let Some(member) = self.cx.member(block, name) else { return Ok(None) };
         if self.cx.item(member).1.kind != ItemKind::Type {
             return Ok(None);
         }
-        let (_, arena, ty) = self.cx.alias_parts(member)?;
+        let (params, arena, ty) = self.cx.alias_parts(member)?;
         let src = &self.cx.file(member).source;
-        self.in_source(src, |infer| infer.lower_ty(&arena, ty)).map(Some)
+        let outer = self.generics.len();
+        self.generics.extend(params.iter().map(|param| src.text(param.name)).zip(own.iter().copied()));
+        let found = self.in_source(src, |infer| infer.lower_ty(&arena, ty));
+        self.generics.truncate(outer);
+        found.map(Some)
     }
 
-    /// The type that the type alias `item` names at the type arguments `given`, with fresh ones for the rest.
-    pub(super) fn alias(&mut self, item: ItemRef, given: Vec<Ty>) -> Result<Ty> {
+    /// The type that the type alias `item` names at the type arguments `given`, then the defaults of the rest, or fresh ones in a value path that gives none.
+    pub(super) fn alias(&mut self, item: ItemRef, given: Vec<Ty>, fresh: bool) -> Result<Ty> {
         let (params, arena, ty) = self.cx.alias_parts(item)?;
+        let declared = self.cx.alias_generics(item)?;
         let file = self.cx.file(item);
-        let mut args = given.into_iter();
+        let mut args = given;
+        let infer_all = fresh && args.is_empty();
+        for param in &params[args.len().min(params.len())..] {
+            let arg = match param.default.filter(|_| !infer_all) {
+                Some(default) => {
+                    let known = args.clone();
+                    self.within(item, &params[..known.len()], &known, |infer| infer.lower_ty(&declared.0, default))?
+                }
+                None => self.fresh(Kind::Var),
+            };
+            args.push(arg);
+        }
         let names: Vec<&str> = params.iter().map(|generic| file.source.text(generic.name)).collect();
-        let generics = names.into_iter().map(|name| (name, args.next().unwrap_or_else(|| self.fresh(Kind::Var)))).collect();
+        let generics = names.into_iter().zip(args).collect();
         let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty: None, block: None, item: Some(item), root: item.declaring_body() };
         self.with_frame(frame, |infer| infer.lower_ty(&arena, ty))
     }
 
     fn impl_param(&mut self, at: u32) -> Ty {
-        let key = self.src.text(at).as_ptr();
-        match self.generics.iter().find(|(name, _)| name.as_ptr() == key) {
+        let key = self.src.text(at);
+        match self.generics.iter().find(|(name, _)| super::scope::same_param(name, key)) {
             Some(&(_, ty)) => ty,
             None => {
                 let hidden = self.fresh(Kind::Var);
@@ -483,7 +508,8 @@ impl<'a> Infer<'_, 'a> {
 
     fn path_ty(&mut self, arena: &Body, path: PathId) -> Result<Ty> {
         if let Some((qself, Some(trait_path))) = arena.path(path).qself {
-            return self.projection(arena, path, qself, trait_path);
+            let Some(&last) = arena.list(arena.path(path).segments).last() else { bail!("a projection with no name") };
+            return self.projection(arena, (qself, trait_path), last);
         }
         let count = arena.path(path).segments.len as usize;
         self.named_ty(arena, path, count, false)
@@ -514,7 +540,7 @@ impl<'a> Infer<'_, 'a> {
 
     fn item_ty(&mut self, item: ItemRef, given: Vec<Ty>, fresh: bool) -> Result<Ty> {
         if self.cx.item(item).1.kind == ItemKind::Type {
-            return self.alias(item, given);
+            return self.alias(item, given, fresh);
         }
         let args = self.adt_args(item, given, fresh)?;
         Ok(self.cx.types.intern(Kind::Adt(item, args)))
@@ -535,18 +561,22 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The type `<qself as Trait>::Name` names: the impl's associated type, or the pointer metadata the compiler provides.
-    fn projection(&mut self, arena: &Body, path: PathId, qself: TyId, trait_path: PathId) -> Result<Ty> {
+    /// The associated type that segment `segment` names on `<qself as trait_path>`.
+    pub(super) fn projection(&mut self, arena: &Body, (qself, trait_path): (TyId, PathId), segment: u32) -> Result<Ty> {
         let ty = self.lower_ty(arena, qself)?;
         let (segments, absolute, dollar) = self.segments(arena, trait_path);
         let found = self.trait_at(&NamePath { segments: &segments, absolute, dollar }, self.home);
-        let name = arena.list(arena.path(path).segments).last().map(|&at| plain(self.src.text(arena.segments[at as usize].name)));
+        let name = plain(self.src.text(arena.segments[segment as usize].name));
         let Some(item) = found else { bail!("projection through `{}`, which is not a trait", self.spell(&segments)) };
-        let Some(name) = name else { bail!("a projection with no name") };
+        let own = match arena.segments[segment as usize].args {
+            Some(Args::Angle(list)) => self.arg_list(arena, list)?,
+            _ => Vec::new(),
+        };
         if self.cx.lang(item) == Some("pointee_trait") && name == "Metadata" {
             return self.metadata_of(ty);
         }
         let args = self.bound_args(item, arena, trait_path, ty)?;
-        self.project(item, ty, args, name)
+        self.project_own(item, ty, args, (name, &own))
     }
 
     /// The pointer metadata of `ty`: a length for slices and `str`, nothing for sized types, or a variable until `ty` is known.

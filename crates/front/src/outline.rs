@@ -100,7 +100,7 @@ fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize
                 deps.push((root.name.replace('-', "_"), lib));
             }
             if !package.sysroot || root.role == Role::Script {
-                let wanted = |name: &str| IMPLICIT.contains(&name) || (name == "proc_macro" && package.manifest.proc_macro);
+                let wanted = |name: &str| IMPLICIT.contains(&name) || name == "proc_macro";
                 deps.extend(implicit.iter().filter(|(name, _)| wanted(name)).cloned());
             }
             deps
@@ -121,8 +121,22 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root) -> Crate {
     let script = root.role == Role::Script;
     let known = script || unit.script.is_some() || workspace.packages[unit.package].manifest.build.is_none();
     let side = if script { crate::graph::Side::Host } else { unit.side };
-    let env = Env { target: targets.of(side).clone(), features: unit.features.clone(), script: unit.script.clone().filter(|_| !script), known };
+    let vars = if script { crate::graph::script::package_vars(workspace, root.unit) } else { crate::graph::script::crate_vars(workspace, root.unit) };
+    let env = Env { target: targets.of(side).clone(), features: unit.features.clone(), script: unit.script.clone().filter(|_| !script), known, vars };
     Crate { env, modules: vec![root_module(&root.path)], ..Crate::default() }
+}
+
+/// Takes out of `waiting` the calls at the indexes of `found`, each with its definition, and keeps the rest waiting.
+fn take_found(waiting: &mut Vec<tree::Waiting>, found: Vec<(usize, Arc<Macro>)>) -> Vec<(tree::Waiting, Arc<Macro>)> {
+    let mut found = found.into_iter().peekable();
+    let mut calls = Vec::new();
+    for (index, call) in std::mem::take(waiting).into_iter().enumerate() {
+        match found.next_if(|(at, _)| *at == index) {
+            Some((_, definition)) => calls.push((call, definition)),
+            None => waiting.push(call),
+        }
+    }
+    calls
 }
 
 fn root_module(path: &std::path::Path) -> Module {
@@ -139,11 +153,11 @@ impl Outline {
         Outline { roots: vec![root], crates: vec![krate], deps: vec![Vec::new()], cache: Cache::default(), procs: HashMap::default() }
     }
 
-    /// The top-level `fn main` in the root file of crate `krate`.
+    /// The top-level `fn main` that the cfgs of crate `krate` keep in its root file.
     pub fn main(&self, krate: usize) -> Option<crate::names::ItemRef> {
         let tree = &self.crates[krate];
         let (file_at, file) = tree.files.iter().enumerate().find(|(_, file)| !file.expanded && file.source.path == self.roots[krate].path)?;
-        let is_main = |item: &item::Item| item.kind == ItemKind::Fn && item.parent.is_none() && item.name.is_some_and(|name| file.source.text(name) == "main");
+        let is_main = |item: &item::Item| item.kind == ItemKind::Fn && item.parent.is_none() && item.name.is_some_and(|name| file.source.text(name) == "main") && tree.env.enabled(&item.attrs);
         let at = file.items.items.iter().position(is_main)?;
         Some(crate::names::ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 })
     }
@@ -199,17 +213,17 @@ impl Outline {
 
     /// Expands the deferred calls of crate `krate` at the given indexes with the definitions that name resolution found for them.
     pub fn expand(&mut self, krate: usize, found: Vec<(usize, Arc<Macro>)>) -> Result<()> {
-        let deferred = std::mem::take(&mut self.crates[krate].deferred);
-        let mut found = found.into_iter().peekable();
-        let mut calls = Vec::new();
-        for (index, call) in deferred.into_iter().enumerate() {
-            match found.next_if(|(at, _)| *at == index) {
-                Some((_, definition)) => calls.push((call, definition)),
-                None => self.crates[krate].deferred.push(call),
-            }
-        }
+        let calls = take_found(&mut self.crates[krate].deferred, found);
         let mut demands = Vec::new();
         self.with_loader(krate, &mut demands, |loader| calls.into_iter().try_for_each(|(call, definition)| loader.expand(call, &definition)))?;
+        self.settle(demands)
+    }
+
+    /// Expands the waiting macro calls in impl bodies of crate `krate` at the given indexes with the definitions that name resolution found for them.
+    pub fn expand_members(&mut self, krate: usize, found: Vec<(usize, Arc<Macro>)>) -> Result<()> {
+        let calls = take_found(&mut self.crates[krate].members, found);
+        let mut demands = Vec::new();
+        self.with_loader(krate, &mut demands, |loader| calls.into_iter().try_for_each(|(call, definition)| loader.expand_member(call, &definition)))?;
         self.settle(demands)
     }
 

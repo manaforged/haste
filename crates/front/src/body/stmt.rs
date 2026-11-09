@@ -88,14 +88,15 @@ impl Cursor<'_> {
     }
 
     fn push_stmt(&mut self, stmt: Stmt, attrs: Option<(u32, u32)>, into: &mut Vec<u32>) {
+        if self.configured_out(attrs) {
+            return;
+        }
         self.body.stmts.push(stmt);
         let index = self.body.stmts.len() as u32 - 1;
         if let Some((from, to)) = attrs {
             self.body.attrs.push((Node::Stmt(index), from, to));
         }
-        if !self.configured_out(attrs) {
-            into.push(index);
-        }
+        into.push(index);
     }
 
     fn stmt(&mut self, start: u32) -> Result<(Stmt, Option<ExprId>)> {

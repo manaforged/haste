@@ -34,8 +34,9 @@ fn stamp(paths: &Paths<'_>, target: Def) -> Option<(Def, u32)> {
 
 const NAMESPACES: [Ns; 3] = [Ns::Types, Ns::Values, Ns::Macros];
 
-fn visible(paths: &Paths<'_>, binding: Binding, home: ModRef, importer: ModRef) -> bool {
-    match binding.vis {
+/// Whether a name of visibility `vis` declared in module `home` is visible to module `importer`.
+pub(super) fn visible(paths: &Paths<'_>, vis: Vis, home: ModRef, importer: ModRef) -> bool {
+    match vis {
         Vis::Pub => true,
         _ if home.krate != importer.krate => false,
         Vis::Private => paths.within(importer, home),
@@ -53,7 +54,7 @@ fn glob(paths: &Paths<'_>, target: Def, (at, vis): (ModRef, Vis), since: u32) ->
                 let entry = &scope.names[name];
                 for ns in NAMESPACES {
                     let Some(binding) = entry.get(ns) else { continue };
-                    if visible(paths, binding, home, at) {
+                    if visible(paths, binding.vis, home, at) {
                         found.push((*name, ns, Binding { def: binding.def, vis, origin: Origin::Glob }));
                     }
                 }
@@ -113,7 +114,7 @@ fn import(paths: &Paths<'_>, pending: &Pending) -> Outcome {
     let mut out = Found::new();
     for ns in NAMESPACES {
         let Some(binding) = found.get(ns) else { continue };
-        if home.is_none_or(|home| visible(paths, binding, home, at)) {
+        if home.is_none_or(|home| visible(paths, binding.vis, home, at)) {
             out.push((name, ns, Binding { def: binding.def, vis: pending.vis, origin: Origin::Import }));
         }
     }
@@ -336,22 +337,33 @@ impl Names {
     fn expand_imported(&self, outline: &mut Outline, demands: &Asks) -> Result<bool> {
         let mut expanded = false;
         for krate in 0..outline.crates.len() {
-            let (found, foreign) = self.imported_macros(outline, krate, demands);
+            let (found, foreign) = self.imported_macros(outline, krate, demands, false);
             outline.set_foreign(krate, &foreign);
             if !found.is_empty() {
                 let found = found.into_iter().map(|(index, definition)| (index - foreign.iter().filter(|at| **at < index).count(), definition)).collect();
                 outline.expand(krate, found)?;
                 expanded = true;
             }
+            let (members, _) = self.imported_macros(outline, krate, demands, true);
+            if !members.is_empty() {
+                outline.expand_members(krate, members)?;
+                expanded = true;
+            }
         }
         Ok(expanded)
     }
 
-    fn imported_macros(&self, outline: &Outline, krate: usize, demands: &Asks) -> (Vec<(usize, Arc<Macro>)>, Vec<usize>) {
+    /// The waiting macro calls of crate `krate` that name resolution binds, in modules or, when `members`, in impl bodies: those with a definition, and the indexes of the others.
+    fn imported_macros(&self, outline: &Outline, krate: usize, demands: &Asks, members: bool) -> (Vec<(usize, Arc<Macro>)>, Vec<usize>) {
         let paths = paths_of(self, outline, krate, demands);
+        let tree = &outline.crates[krate];
+        let (calls, module): (&[crate::outline::tree::Waiting], &dyn Fn(usize) -> usize) = match members {
+            true => (&tree.members, &|block| tree.impls[block].module),
+            false => (&tree.deferred, &|module| module),
+        };
         let (mut found, mut foreign) = (Vec::new(), Vec::new());
-        for (index, call) in outline.crates[krate].deferred.iter().enumerate() {
-            let Some(item) = resolve_macro(&paths, &call.file, (call.at, ModRef { krate: krate as u32, module: call.owner as u32 })) else { continue };
+        for (index, call) in calls.iter().enumerate() {
+            let Some(item) = resolve_macro(&paths, &call.file, (call.at, ModRef { krate: krate as u32, module: module(call.owner) as u32 })) else { continue };
             match outline.crates[item.krate as usize].defined.get(&(item.file, item.item)) {
                 Some(definition) => found.push((index, definition.clone())),
                 None => foreign.push(index),

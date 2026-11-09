@@ -46,6 +46,8 @@ pub type Layout = LayoutData<Field, Variant>;
 pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
     let fields = match &layout.variants {
         rustc_abi::Variants::Multiple { variants, .. } => &variants[Variant::new(variant as usize)].fields,
+        rustc_abi::Variants::Single { index } if index.0 != variant => return 0,
+        rustc_abi::Variants::Empty => return 0,
         _ => &layout.fields,
     };
     fields.offset(index as usize).bytes() as i32

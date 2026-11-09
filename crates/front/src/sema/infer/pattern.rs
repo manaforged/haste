@@ -43,7 +43,11 @@ impl Infer<'_, '_> {
                 let (inner, ty) = syntax::parse_ty(src, arm.from, arm.to)?;
                 return self.lower_ty(&inner, ty);
             }
-            _ => bail!("type macro `{}` is not supported", self.spell(&segments)),
+            _ => {
+                let Some(output) = found.map(|item| self.cx.macro_output(src, item, open)).transpose()?.flatten() else { bail!("type macro `{}` is not supported", self.spell(&segments)) };
+                let (inner, ty) = syntax::parse_ty(output, 0, output.len())?;
+                return self.in_source(output, |infer| infer.lower_ty(&inner, ty));
+            }
         }
         let Some(is) = (open + 1..close).find(|&at| src.kind(at) == TokenKind::Ident && src.text(at) == "is") else { bail!("pattern_type! needs `is`") };
         let (inner, base) = syntax::parse_ty(src, open + 1, is)?;

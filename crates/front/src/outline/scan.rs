@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use rustc_hash::FxHashMap as HashMap;
 use rustc_lexer::TokenKind;
 
 use super::attr;
@@ -8,6 +9,7 @@ use super::source::{Source, opens};
 struct Scanner<'a> {
     src: &'a Source,
     out: Items,
+    calls: Option<&'a HashMap<u32, u32>>,
 }
 
 struct Head {
@@ -27,7 +29,7 @@ const AFTER_CONST: [&str; 7] = ["fn", "async", "unsafe", "extern", "safe", "impl
 
 /// Scans the items of a whole file.
 pub fn scan(src: &Source) -> Result<Items> {
-    let mut scanner = Scanner { src, out: Items::default() };
+    let mut scanner = Scanner { src, out: Items::default(), calls: None };
     let mut inner = Vec::new();
     let at = attr::attrs(src, 0, true, &mut inner)?;
     scanner.out.inner = inner;
@@ -35,9 +37,9 @@ pub fn scan(src: &Source) -> Result<Items> {
     Ok(scanner.out)
 }
 
-/// Adds to `items` the items declared in a body, which start at each of `starts`.
-pub fn body_items(src: &Source, starts: impl IntoIterator<Item = u32>, items: Items) -> Result<Items> {
-    let mut scanner = Scanner { src, out: items };
+/// Adds to `items` the items declared in a body, which start at each of `starts`, reading a module's macro calls through their expansions in `calls`.
+pub fn body_items(src: &Source, starts: impl IntoIterator<Item = u32>, (items, calls): (Items, Option<&HashMap<u32, u32>>)) -> Result<Items> {
+    let mut scanner = Scanner { src, out: items, calls };
     for at in starts {
         scanner.item(at, None)?;
     }
@@ -46,7 +48,7 @@ pub fn body_items(src: &Source, starts: impl IntoIterator<Item = u32>, items: It
 
 /// The token after the item that starts at `at`.
 pub fn item_end(src: &Source, at: u32) -> Result<u32> {
-    Scanner { src, out: Items::default() }.item(at, None)
+    Scanner { src, out: Items::default(), calls: None }.item(at, None)
 }
 
 impl Scanner<'_> {
@@ -81,6 +83,11 @@ impl Scanner<'_> {
         }
         self.out.items.push(Item { kind: head.kind, name: head.name, vis, attrs, lead, start, end: head.end, body: head.body, parent });
         self.children(index, &head)?;
+        if let (ItemKind::MacroCall, Some(_), Some(open)) = (head.kind, parent, head.body)
+            && let Some(&block) = self.calls.and_then(|calls| calls.get(&open))
+        {
+            self.items(block + 1, self.src.pair(block), parent)?;
+        }
         Ok(head.end)
     }
 

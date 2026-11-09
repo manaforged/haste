@@ -59,9 +59,8 @@ fn path_end(src: &Source, mut at: u32, to: u32) -> u32 {
     at
 }
 
-const FLAGS: [(&str, Attr); 5] = [
+const FLAGS: [(&str, Attr); 4] = [
     ("macro_use", Attr::MacroUse),
-    ("macro_export", Attr::MacroExport),
     ("no_std", Attr::NoStd),
     ("no_core", Attr::NoCore),
     ("no_implicit_prelude", Attr::NoImplicitPrelude),
@@ -81,6 +80,7 @@ pub fn content(src: &Source, from: u32, to: u32) -> Result<Attr> {
         ("cfg_attr", TokenKind::OpenParen) => cfg_attr(src, after)?,
         ("path", TokenKind::Eq) if after + 1 < to => Attr::Path(unquote(src.text(after + 1))),
         ("derive" | "derive_const", TokenKind::OpenParen) => Attr::Derive(after),
+        ("macro_export", next) => Attr::MacroExport(next == TokenKind::OpenParen && joined(src, after + 1, src.pair(after)).contains("local_inner_macros")),
         _ => FLAGS.iter().find(|(name, _)| *name == path).map_or(Attr::Other(from), |(_, attr)| attr.clone()),
     })
 }

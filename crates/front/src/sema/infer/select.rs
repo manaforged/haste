@@ -13,9 +13,16 @@ use super::scope::{Frame, named_args, type_params};
 /// An impl that a trait obligation picked, with its type arguments.
 pub type Picked = (ImplRef, Vec<Ty>);
 
-type Vars = Vec<Option<Ty>>;
+/// What trying one impl left: its variable bindings, and the projections and obligations it deferred.
+#[derive(Clone)]
+struct Vars {
+    bound: Vec<Option<Ty>>,
+    projections: Vec<super::project::Projection>,
+    obligations: Vec<(ItemRef, Vec<Ty>)>,
+}
 
-const DEPTH: u32 = 8;
+/// How deep impl selection follows nested where-clauses, the rustc default recursion limit.
+const DEPTH: u32 = 128;
 
 /// The traits that closures, function items and function pointers implement by the compiler, with no impl to select.
 const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
@@ -34,7 +41,7 @@ impl<'a> Infer<'_, 'a> {
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
         let found = self.applicable(of, self_ty, args, depth)?;
         let Ok([(picked, vars)]) = <[_; 1]>::try_from(found) else { return Ok(None) };
-        self.vars = vars;
+        self.adopt(vars);
         Ok(Some(picked))
     }
 
@@ -73,14 +80,23 @@ impl<'a> Infer<'_, 'a> {
         let mut found = Vec::new();
         let blocks: Vec<ImplRef> = blocks.into_iter().filter(|&block| !self.cx.reserved(block)).collect();
         for block in blocks {
-            let saved = self.vars.clone();
+            let (saved, deferred) = (self.vars.clone(), (self.projections.len(), self.obligations.len()));
             let applies = self.impl_applies(block, self_ty, args, depth);
-            let vars = std::mem::replace(&mut self.vars, saved);
+            let bound = std::mem::replace(&mut self.vars, saved);
+            let projections = self.projections.split_off(deferred.0.min(self.projections.len()));
+            let obligations = self.obligations.split_off(deferred.1.min(self.obligations.len()));
             if let Some(impl_args) = applies? {
-                found.push(((block, impl_args), vars));
+                found.push(((block, impl_args), Vars { bound, projections, obligations }));
             }
         }
         Ok(found)
+    }
+
+    /// Takes on the bindings and deferred work of the impl trial `vars`.
+    fn adopt(&mut self, vars: Vars) {
+        self.vars = vars.bound;
+        self.projections.extend(vars.projections);
+        self.obligations.extend(vars.obligations);
     }
 
     /// The impl of trait `of` at `args` for `self_ty` that defines the member `name`, among those that apply, as a specializing impl inherits it from the impl it specializes.
@@ -88,7 +104,7 @@ impl<'a> Infer<'_, 'a> {
         let self_ty = self.resolve(self_ty);
         let found = self.impl_candidates(of, self_ty, args, 0)?;
         let Some((picked, vars)) = found.into_iter().find(|((block, _), _)| self.cx.member(*block, name).is_some()) else { return Ok(None) };
-        self.vars = vars;
+        self.adopt(vars);
         Ok(Some(picked))
     }
 
@@ -96,7 +112,7 @@ impl<'a> Infer<'_, 'a> {
     fn same_trait_args(&mut self, found: &[(Picked, Vars)], args: &[Ty]) -> bool {
         let saved = self.vars.clone();
         let mut each = found.iter().map(|(_, vars)| {
-            self.vars = vars.clone();
+            self.vars = vars.bound.clone();
             args.iter().map(|&arg| self.substitute(arg)).collect::<Vec<Ty>>()
         });
         let first = each.next();
@@ -247,24 +263,60 @@ impl<'a> Infer<'_, 'a> {
         }
         let kind = self.cx.types.kind(self.resolve(ty));
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
-            return Ok(true);
+            return self.var_holds(arena, (of, path), ty);
         }
         if self.compiler_impl(of, ty) {
             let args = self.bound_args(of, arena, path, ty)?;
-            return self.bindings_hold(arena, path, (of, ty, &args));
+            return self.assoc_bounds_hold((arena, home, path), (of, ty, &args), depth);
         }
         if self.is_callable_trait(of) && matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
             let Some(sig) = self.fn_bound(arena, home, bound)? else { return Ok(true) };
             return Ok(self.tie_callable(ty, sig).is_ok());
         }
         let args = self.bound_args(of, arena, path, ty)?;
-        if let Some(held) = self.object_holds(of, ty, &args) {
-            return Ok(held);
+        if self.object_holds(of, ty, &args) == Some(true) {
+            return Ok(true);
         }
-        Ok(self.select_at(of, ty, &args, depth + 1)?.is_some() && self.bindings_hold(arena, path, (of, ty, &args))?)
+        match <[_; 1]>::try_from(self.applicable(of, ty, &args, depth + 1)?) {
+            Ok([(_, vars)]) => {
+                self.adopt(vars);
+                self.assoc_bounds_hold((arena, home, path), (of, ty, &args), depth)
+            }
+            Err(found) => Ok(!found.is_empty()),
+        }
     }
 
-    /// Whether the trait object `ty` implements trait `of` at `args`, by being an object of it, or none when `ty` is not a trait object.
+    /// Whether the associated types of `of` for `ty` meet the bound path's bindings, as `Item = T`, and its constraints, as `Item: Trait`.
+    fn assoc_bounds_hold(&mut self, (arena, home, path): (&Body, ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
+        if !self.bindings_hold(arena, path, (of, ty, args))? {
+            return Ok(false);
+        }
+        let Some(&last) = arena.list(arena.path(path).segments).last() else { return Ok(true) };
+        let Some(crate::body::Args::Angle(list)) = arena.segments[last as usize].args else { return Ok(true) };
+        for &at in arena.list(list) {
+            let crate::body::GenericArg::Constraint { name, bounds } = arena.args[at as usize] else { continue };
+            let name = self.src.text(name);
+            let Some((owner, owner_args)) = self.assoc_owner((of, args.to_vec()), ty, name, 0)? else { bail!("`{}` has no associated type `{name}`", self.cx.name(of)) };
+            let assoc = self.project(owner, ty, owner_args, name)?;
+            for &bound in arena.list(bounds) {
+                if !self.bound_holds(arena, home, (assoc, bound), depth + 1)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether the bound `of` at `path` can hold for the unknown type `ty`: false only when `ty` is a pending `impl Trait` value whose own bound of that trait does not unify.
+    fn var_holds(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty) -> Result<bool> {
+        if !matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
+            return Ok(true);
+        }
+        let args = self.bound_args(of, arena, path, ty)?;
+        Ok(self.opaque_holds(of, &std::iter::once(ty).chain(args).collect::<Vec<_>>())? != Some(false))
+    }
+
+    /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.
     pub(super) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
         let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
         let given = super::super::ty::object_parts(&parts, &members).0;
@@ -287,11 +339,13 @@ impl<'a> Infer<'_, 'a> {
         self.cx.lang(of).is_some_and(|lang| BUILTIN.contains(&lang)) || self.cx.is_auto_trait(of)
     }
 
-    /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one is neither `Sized`, `Copy` nor `Clone`, and `&mut T` is neither `Copy` nor `Clone`.
-    fn compiler_holds(&self, of: ItemRef, ty: Ty) -> bool {
+    /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one, such as a struct that ends in a slice, is neither `Sized`, `Copy` nor `Clone`, and `&mut T` is neither `Copy` nor `Clone`.
+    fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
         let Some(lang) = self.cx.lang(of) else { return true };
-        match self.cx.types.kind(self.resolve(ty)) {
+        let ty = self.resolve(ty);
+        match self.cx.types.kind(ty) {
             Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str) | Kind::Dyn(..) => !SIZED_ONLY.contains(&lang),
+            Kind::Adt(..) if SIZED_ONLY.contains(&lang) => !self.cx.is_unsized(ty).unwrap_or(false),
             Kind::Ref(Mut::Mut, _) => !matches!(lang, "copy" | "clone"),
             _ => true,
         }

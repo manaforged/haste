@@ -11,12 +11,12 @@ use super::place::{Base, Place};
 use super::{Lower, repr};
 
 impl Lower<'_, '_> {
-    /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a function, a closure that captures nothing, a constructor, an aggregate or constructor call of them, or a field of one.
+    /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a function, a closure that captures nothing, a constructor, a shared reference to one, an aggregate or constructor call of them, or a field of one.
     pub fn promotable(&self, expr: ExprId) -> bool {
         match *self.body.expr(expr) {
             Expr::Lit(..) => true,
             Expr::Closure { .. } => !self.cx.closure_takes_env(self.ty_of(expr)),
-            Expr::Paren(inner) | Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) => self.promotable(inner),
+            Expr::Paren(inner) | Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Ref { mutable: false, raw: false, expr: inner } => self.promotable(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Fn(item, _)) => matches!(self.cx.item(*item).1.kind, ItemKind::Const | ItemKind::Fn),
                 Some(Res::Ctor(..) | Res::Const(_)) => true,
@@ -33,7 +33,7 @@ impl Lower<'_, '_> {
     pub fn promoted(&mut self, expr: ExprId) -> Result<Option<Value>> {
         let ty = self.ty_of(expr);
         let size = self.cx.layout(ty)?.size.bytes() as usize;
-        let cell = self.slots.data(&vec![0; size + 1]);
+        let cell = self.slots.zeroed(size + 1);
         let address = self.ins().iconst(Type::I64, cell);
         let filled = self.ins().load(Type::I8, address, size as i32);
         let (fill, done) = (self.b.create_block(), self.b.create_block());

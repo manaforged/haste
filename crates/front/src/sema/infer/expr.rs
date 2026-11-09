@@ -76,6 +76,8 @@ impl Infer<'_, '_> {
             Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => Some(*pointee),
             _ => None,
         });
+        let closure = matches!(self.body.expr(inner), crate::body::Expr::Closure { .. });
+        let pointee = pointee.filter(|&ty| closure || !matches!(self.cx.types.kind(self.resolve(ty)), Kind::Dyn(..)));
         let ty = self.expr(inner, pointee)?;
         if mutable {
             self.note_mut(inner)?;
@@ -99,7 +101,7 @@ impl Infer<'_, '_> {
 
     fn flow(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
         match *self.body.expr(expr) {
-            Expr::Method { receiver, name, args, params } => self.method_call(expr, receiver, name, (args, params)),
+            Expr::Method { receiver, name, args, params } => self.method_call(expr, receiver, name, (args, params), expected),
             Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Try } => self.try_block(expr, (stmts, tail), expected),
             Expr::Block { kind: kind @ (crate::body::BlockKind::Async | crate::body::BlockKind::AsyncMove), .. } => self.coroutine_expr(expr, (None, kind == crate::body::BlockKind::AsyncMove), &[]),
             Expr::Await(inner) => self.await_expr(expr, inner),
@@ -354,7 +356,7 @@ impl Infer<'_, '_> {
             Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
             Kind::Dyn(of, ..) if self.is_callable_trait(of) => return self.object_call((expr, found), callee_ty, args),
             Kind::FnDef(item, substs) => {
-                if !matches!(self.out.res.get(&callee), Some(Res::Fn(..))) {
+                if !self.body.names_callee(callee) || !matches!(self.out.res.get(&callee), Some(Res::Fn(..))) {
                     self.out.res.insert(expr, Res::Fn(item, substs.clone()));
                 }
                 let (params, ret) = self.fn_types(item, &substs)?;
@@ -426,7 +428,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn expected_inputs(&mut self, params: &[Ty], ret: Ty, expected: Option<Ty>) -> Vec<Option<Ty>> {
+    pub(super) fn expected_inputs(&mut self, params: &[Ty], ret: Ty, expected: Option<Ty>) -> Vec<Option<Ty>> {
         let Some(expected) = expected else { return vec![None; params.len()] };
         self.probe(|infer| match infer.unify(ret, expected) {
             Ok(()) => params.iter().map(|&param| Some(infer.zonk(param))).collect(),
