@@ -1,4 +1,4 @@
-//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hint as a no-op, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
+//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hint as a no-op, `xgetbv` as no extended state enabled, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
 
 use std::alloc::Layout;
 use std::ffi::CString;
@@ -11,6 +11,7 @@ pub fn symbol(name: &str) -> Option<usize> {
         "__rust_dealloc" => dealloc as *const () as usize,
         "__rust_realloc" => realloc as *const () as usize,
         "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" => nothing as *const () as usize,
+        "llvm.x86.xgetbv" => no_extended_state as *const () as usize,
         "__dso_handle" => &DSO_HANDLE as *const u8 as usize,
         "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => abort as *const () as usize,
         _ => return dynamic(name),
@@ -26,6 +27,10 @@ fn dynamic(name: &str) -> Option<usize> {
     // SAFETY: name is a NUL-terminated string that lives across the call.
     let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
     (!address.is_null()).then_some(address as usize)
+}
+
+extern "C" fn no_extended_state(_register: u32) -> u64 {
+    0
 }
 
 extern "C" fn alloc(size: usize, align: usize) -> *mut u8 {

@@ -162,7 +162,7 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
     };
     let body = match typed.shape {
         Shape::Body | Shape::Closure(_) => cx.body(source)?,
-        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) => std::rc::Rc::default(),
+        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => std::rc::Rc::default(),
     };
     let src = cx.body_src(source);
     let signature = if is_static(cx, *item) { signature_of(cx, None, [])? } else { signature(cx, typed)? };
@@ -243,6 +243,7 @@ impl Lower<'_, '_> {
             Shape::Virtual(slot) => self.virtual_call(*slot).map(|_| None),
             Shape::Untuple(res) => self.untuple_call(res.clone()),
             &Shape::Ctor(variant) => self.ctor_body(variant),
+            Shape::Clone(calls) => self.clone_body(calls.clone()),
             Shape::Closure(closure) => {
                 let root = closure.closure.body;
                 self.bind_captures()?;
@@ -420,12 +421,7 @@ impl Lower<'_, '_> {
     }
 
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<()> {
-        let Some(init) = init else {
-            return match (self.body.pat(pat), self.typed.binds.get(&pat)) {
-                (Pat::Bind { .. }, Some(&local)) => self.declare_as(local, None, false),
-                _ => bail!("uninitialized `let` with a pattern"),
-            };
-        };
+        let Some(init) = init else { return self.declare_uninit(pat) };
         self.extend(init);
         let place = self.place_or_temp(init)?;
         if !self.open {
@@ -433,6 +429,19 @@ impl Lower<'_, '_> {
         }
         self.bind_matched(pat, place, self.scrutinee_path(init))?;
         self.commit_moves()
+    }
+
+    fn declare_uninit(&mut self, pat: PatId) -> Result<()> {
+        match *self.body.pat(pat) {
+            Pat::Bind { sub: None, .. } => match self.typed.binds.get(&pat) {
+                Some(&local) => self.declare_as(local, None, false),
+                None => bail!("an uninitialized binding with no local"),
+            },
+            Pat::Wild => Ok(()),
+            Pat::Paren(inner) => self.declare_uninit(inner),
+            Pat::Tuple(items) => self.body.list(items).to_vec().into_iter().try_for_each(|item| self.declare_uninit(PatId(item))),
+            _ => bail!("uninitialized `let` with a pattern"),
+        }
     }
 
     fn extend(&mut self, expr: ExprId) {

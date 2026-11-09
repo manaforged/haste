@@ -33,6 +33,9 @@ pub enum Intrinsic {
     WithOverflow(BinOp),
     ConstEvalSelect,
     Trap,
+    Cpuid,
+    /// SSSE3 or AVX2 `pshufb` on a vector of this many bytes.
+    BytePermute(u8),
     CatchUnwind,
     SizeOf,
     AlignOf,
@@ -40,6 +43,7 @@ pub enum Intrinsic {
     AlignOfVal,
     NeedsDrop,
     TypeId,
+    TypeName,
     NoOp,
     BlackBox,
     Offset(bool),
@@ -67,6 +71,11 @@ pub enum Simd {
     Splat,
     Bitmask,
     Lanewise(BinOp),
+    Shuffle,
+    Extract,
+    Insert,
+    /// Whether every lane, or any lane, of a mask is set.
+    Reduce { all: bool },
 }
 
 /// An atomic access, which lowering makes sequentially consistent.
@@ -78,7 +87,10 @@ pub enum Atomic {
     Exchange,
 }
 
-const NAMES: [(&str, Intrinsic); 113] = {
+/// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
+const LLVM: [(&str, Intrinsic); 2] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32))];
+
+const NAMES: [(&str, Intrinsic); 125] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -141,6 +153,7 @@ const NAMES: [(&str, Intrinsic); 113] = {
         ("min_align_of_val", AlignOfVal),
         ("needs_drop", NeedsDrop),
         ("type_id", TypeId),
+        ("type_name", TypeName),
         ("forget", NoOp),
         ("assert_inhabited", NoOp),
         ("assert_zero_valid", NoOp),
@@ -182,12 +195,23 @@ const NAMES: [(&str, Intrinsic); 113] = {
         ("atomic_umin", Atomic(self::Atomic::Rmw(AtomicRmwOp::Umin))),
         ("simd_splat", Simd(self::Simd::Splat)),
         ("simd_bitmask", Simd(self::Simd::Bitmask)),
+        ("simd_shuffle", Simd(self::Simd::Shuffle)),
+        ("simd_extract", Simd(self::Simd::Extract)),
+        ("simd_extract_dyn", Simd(self::Simd::Extract)),
+        ("simd_insert", Simd(self::Simd::Insert)),
+        ("simd_insert_dyn", Simd(self::Simd::Insert)),
+        ("simd_reduce_all", Simd(self::Simd::Reduce { all: true })),
+        ("simd_reduce_any", Simd(self::Simd::Reduce { all: false })),
         ("simd_add", Simd(self::Simd::Lanewise(BinOp::Add))),
         ("simd_sub", Simd(self::Simd::Lanewise(BinOp::Sub))),
         ("simd_mul", Simd(self::Simd::Lanewise(BinOp::Mul))),
         ("simd_and", Simd(self::Simd::Lanewise(BinOp::BitAnd))),
         ("simd_or", Simd(self::Simd::Lanewise(BinOp::BitOr))),
         ("simd_xor", Simd(self::Simd::Lanewise(BinOp::BitXor))),
+        ("simd_shl", Simd(self::Simd::Lanewise(BinOp::Shl))),
+        ("simd_shr", Simd(self::Simd::Lanewise(BinOp::Shr))),
+        ("simd_div", Simd(self::Simd::Lanewise(BinOp::Div))),
+        ("simd_rem", Simd(self::Simd::Lanewise(BinOp::Rem))),
         ("simd_eq", Simd(self::Simd::Lanewise(BinOp::Eq))),
         ("simd_ne", Simd(self::Simd::Lanewise(BinOp::Ne))),
         ("simd_lt", Simd(self::Simd::Lanewise(BinOp::Lt))),
@@ -206,6 +230,14 @@ impl Context<'_> {
         }
         let marked = entry.kind == ItemKind::Fn && entry.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_intrinsic"));
         let name = src.text(entry.name?);
+        if let Some(link) = self.attr_value(item, "link_name")
+            && let Some(&(_, which)) = LLVM.iter().find(|(known, _)| *known == link)
+        {
+            return Some(which);
+        }
+        if entry.kind == ItemKind::Fn && name == "__cpuid_count" && self.outline.roots[item.krate as usize].name == "core" {
+            return Some(Intrinsic::Cpuid);
+        }
         marked.then(|| NAMES.iter().find(|(known, _)| *known == name).map(|(_, which)| *which)).flatten()
     }
 }

@@ -190,6 +190,9 @@ impl<'a> Infer<'_, 'a> {
         if candidate.bound.is_some() || !args.is_empty() {
             self.assume(candidate.of, &std::iter::once(self_ty).chain(args.iter().copied()).collect::<Vec<_>>())?;
         }
+        if self.compiler_impl(candidate.of, self_ty) {
+            return Ok(Some((candidate.item, std::iter::once(self_ty).chain(args).collect())));
+        }
         if let Some(held) = self.object_holds(candidate.of, self_ty, &args) {
             return Ok(held.then(|| (candidate.item, std::iter::once(self_ty).chain(args).collect())));
         }

@@ -54,6 +54,26 @@ impl Infer<'_, '_> {
         super::closure::register(self.cx, (item, &args), &Typed { locals, closures, ..Typed::default() });
     }
 
+    /// Ties the associated types that the bounds of each `impl Trait` in this function's return type name, as `Output = T`, to its hidden type, which rustc reads to infer the body.
+    pub(super) fn bind_hidden(&mut self) -> Result<()> {
+        let sig = self.sig;
+        for (at, hidden) in std::mem::take(&mut self.hidden) {
+            let bounds = sig.body.tys.iter().find_map(|ty| match *ty {
+                crate::body::Ty::ImplTrait(token, bounds) if token == at => Some(bounds),
+                _ => None,
+            });
+            for &bound in bounds.map(|bounds| sig.body.list(bounds)).unwrap_or_default() {
+                let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else { continue };
+                if self.is_callable_trait(of) {
+                    continue;
+                }
+                let args = self.bound_args(of, &sig.body, path, hidden)?;
+                self.bindings_hold(&sig.body, path, (of, hidden, &args))?;
+            }
+        }
+        Ok(())
+    }
+
     /// The function pointer type of the `Fn` bound on the pending `impl Trait` return value `ty`.
     pub(super) fn opaque_sig(&self, ty: Ty) -> Option<Ty> {
         self.opaques.iter().find(|(_, _, ret, _)| self.resolve(*ret) == ty).and_then(|opaque| opaque.3)

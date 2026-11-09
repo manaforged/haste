@@ -23,6 +23,13 @@ impl Lower<'_, '_> {
             (Simd::Splat, _, _) => self.splat(vector, first)?,
             (Simd::Bitmask, _, Some(out)) => self.bitmask(vector, first, out)?,
             (Simd::Lanewise(bin), &[x, y], out) => self.lanewise(bin, (vector, out.unwrap_or(vector)), (x, y))?,
+            (Simd::Shuffle, &[x, y, idx], _) => self.shuffle(substs, (x, y), idx)?,
+            (Simd::Extract, &[x, at], _) => {
+                let (lanes, lane) = self.lane_address(vector, x, at)?;
+                self.ins().load(lanes.machine, lane, 0)
+            }
+            (Simd::Insert, &[x, at, value], _) => self.insert(vector, x, (at, value))?,
+            (Simd::Reduce { all }, _, _) => self.reduce(vector, first, all)?,
             _ => bail!("SIMD intrinsic {op:?} takes other arguments"),
         };
         Ok(Some(value))
@@ -74,6 +81,87 @@ impl Lower<'_, '_> {
             (BinOp::Add | BinOp::Sub | BinOp::Mul, Num::Int { ty, signed }) => Ok(self.overflowing(op, (ty, signed), x, y)?.0),
             _ => self.apply(op, num, (x, y), num),
         }
+    }
+
+    /// The vector whose lane `i` is lane `idx[i]` of `x` followed by `y`, as `simd_shuffle` at `[T, U, V]` builds it.
+    fn shuffle(&mut self, substs: &[Ty], (x, y): (Value, Value), idx: Value) -> Result<Value> {
+        let &[input, indices, output] = substs else { bail!("`simd_shuffle` takes three types") };
+        let (from, to) = (self.lanes(input)?, self.lanes(output)?);
+        let (both, joined) = self.pair_slot(&from)?;
+        for lane in 0..from.count {
+            let a = self.ins().load(from.machine, x, lane * from.size);
+            let b = self.ins().load(from.machine, y, lane * from.size);
+            self.ins().stack_store(a, both, lane * from.size);
+            self.ins().stack_store(b, both, (from.count + lane) * from.size);
+        }
+        let Some(held) = self.spill(Some(idx), indices)? else { bail!("`simd_shuffle` indices take no bytes") };
+        let idx = self.address(held);
+        let (slot, address) = self.vector_slot(output)?;
+        for lane in 0..to.count {
+            let at = self.ins().load(Type::I32, idx, lane * 4);
+            let at = self.ins().uextend(Type::I64, at);
+            let offset = self.ins().imul_imm(at, i64::from(from.size));
+            let source = self.ins().iadd(joined, offset);
+            let value = self.ins().load(to.machine, source, 0);
+            self.ins().stack_store(value, slot, lane * to.size);
+        }
+        Ok(address)
+    }
+
+    fn lane_address(&mut self, vector: Ty, x: Value, at: Value) -> Result<(Lanes, Value)> {
+        let lanes = self.lanes(vector)?;
+        let at = self.ins().uextend(Type::I64, at);
+        let offset = self.ins().imul_imm(at, i64::from(lanes.size));
+        let lane = self.ins().iadd(x, offset);
+        Ok((lanes, lane))
+    }
+
+    fn insert(&mut self, vector: Ty, x: Value, (at, value): (Value, Value)) -> Result<Value> {
+        let lanes = self.lanes(vector)?;
+        let (slot, address) = self.vector_slot(vector)?;
+        for lane in 0..lanes.count {
+            let held = self.ins().load(lanes.machine, x, lane * lanes.size);
+            self.ins().stack_store(held, slot, lane * lanes.size);
+        }
+        let (_, lane) = self.lane_address(vector, address, at)?;
+        self.ins().store(value, lane, 0);
+        Ok(address)
+    }
+
+    fn pair_slot(&mut self, lanes: &Lanes) -> Result<(StackSlot, Value)> {
+        let bytes = (2 * lanes.count * lanes.size) as u32;
+        let slot = self.b.create_stack_slot(bytes, lanes.size.trailing_zeros() as u8);
+        Ok((slot, self.ins().stack_addr(Type::I64, slot, 0)))
+    }
+
+    fn reduce(&mut self, vector: Ty, x: Value, all: bool) -> Result<Value> {
+        let lanes = self.lanes(vector)?;
+        let mut found = self.ins().iconst(Type::I8, i64::from(all));
+        for lane in 0..lanes.count {
+            let value = self.ins().load(lanes.machine, x, lane * lanes.size);
+            let set = self.ins().icmp_imm(IntCC::NotEqual, value, 0);
+            found = if all { self.ins().band(found, set) } else { self.ins().bor(found, set) };
+        }
+        Ok(found)
+    }
+
+    /// The `bytes` bytes whose byte `i` is byte `index[i] & 15` of the 16-byte lane of `table` that holds byte `i`, or zero when bit 7 of `index[i]` is set, as `pshufb` gives.
+    pub(super) fn byte_permute(&mut self, args: &[Value], bytes: u8) -> Result<Value> {
+        let &[table, index] = args else { bail!("`pshufb` takes two vectors") };
+        let slot = self.b.create_stack_slot(u32::from(bytes), 5);
+        let (low, zero) = (self.ins().iconst(Type::I8, 15), self.ins().iconst(Type::I8, 0));
+        for lane in 0..i32::from(bytes) {
+            let at = self.ins().load(Type::I8, index, lane);
+            let pick = self.ins().band(at, low);
+            let pick = self.ins().uextend(Type::I64, pick);
+            let base = self.ins().iadd_imm(table, i64::from(lane & !15));
+            let source = self.ins().iadd(base, pick);
+            let byte = self.ins().load(Type::I8, source, 0);
+            let cleared = self.ins().icmp_imm(IntCC::SignedLessThan, at, 0);
+            let value = self.ins().select(cleared, zero, byte);
+            self.ins().stack_store(value, slot, lane);
+        }
+        Ok(self.ins().stack_addr(Type::I64, slot, 0))
     }
 
     fn bitmask(&mut self, vector: Ty, x: Value, out: Ty) -> Result<Value> {

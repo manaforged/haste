@@ -25,6 +25,8 @@ impl Lower<'_, '_> {
                 Ok(None)
             }
             Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
+            Intrinsic::Cpuid => Ok(Some(self.no_cpuid())),
+            Intrinsic::BytePermute(bytes) => self.byte_permute(args, bytes).map(Some),
             _ => self.memory_intrinsic(which, substs, args),
         }
     }
@@ -37,6 +39,15 @@ impl Lower<'_, '_> {
         let signature = super::signature_of(self.cx, Some(unit), [pointer])?;
         self.call_code(try_fn, (signature, Some(unit)), vec![data])?;
         Ok(self.ins().iconst(Type::I32, 0))
+    }
+
+    fn no_cpuid(&mut self) -> Value {
+        let slot = self.b.create_stack_slot(16, 3);
+        let zero = self.ins().iconst(Type::I64, 0);
+        for offset in [0, 8] {
+            self.ins().stack_store(zero, slot, offset);
+        }
+        self.ins().stack_addr(Type::I64, slot, 0)
     }
 
     fn transmute(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {

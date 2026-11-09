@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{FloatCC, IntCC, Type, Value};
 
-use crate::body::literal::{char_value, string_bytes};
+use crate::body::literal::{byte_value, char_value, string_bytes};
 use crate::body::{BinOp, Expr, ExprId, Lit, UnOp};
 use crate::names::{ItemRef, Primitive};
 use crate::sema::infer::{Adjust, Res};
@@ -32,7 +32,7 @@ impl Lower<'_, '_> {
             (Kind::Prim(Primitive::F32 | Primitive::F64), Some(ty)) => Num::Float(ty),
             (Kind::Prim(Primitive::Char), Some(ty)) => Num::Int { ty, signed: false },
             (Kind::Prim(primitive), Some(ty)) if int_info(*primitive).is_some() => Num::Int { ty, signed: int_info(*primitive).is_some_and(|(_, signed)| signed) },
-            (Kind::Ref(..) | Kind::Ptr(..), Some(Type::I64)) => Num::Int { ty: Type::I64, signed: false },
+            (Kind::Ref(..) | Kind::Ptr(..) | Kind::FnPtr(..), Some(Type::I64)) => Num::Int { ty: Type::I64, signed: false },
             (other, _) => bail!("no arithmetic on {other:?}"),
         })
     }
@@ -45,7 +45,7 @@ impl Lower<'_, '_> {
             Lit::Int => Ok(self.int_const(ty, parse_int(text)?.0)),
             Lit::Float => self.float_const(ty, parse_float(text)?),
             Lit::Char => Ok(self.ins().iconst(Type::I32, i64::from(u32::from(char_value(text)?)))),
-            Lit::Byte => Ok(self.ins().iconst(Type::I8, i64::from(char_value(text)? as u8))),
+            Lit::Byte => Ok(self.ins().iconst(Type::I8, i64::from(byte_value(text)?))),
             Lit::Str | Lit::ByteStr | Lit::CStr => self.string_lit(lit, text),
         }
     }
@@ -142,10 +142,36 @@ impl Lower<'_, '_> {
         if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
             return self.overloaded(expr, op, (lhs, rhs), (item, &substs));
         }
+        if self.is_wide(self.ty_of(lhs))? {
+            let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else { return Ok(None) };
+            return self.wide_compare(op, (x, y)).map(Some);
+        }
         let num = self.num(self.ty_of(lhs))?;
         let shift = self.num(self.ty_of(rhs))?;
         let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else { return Ok(None) };
         self.apply(op, num, (x, y), shift).map(Some)
+    }
+
+    /// Compares two wide pointers held in memory by address, then by metadata, as rustc compares them.
+    fn wide_compare(&mut self, op: BinOp, (x, y): (Value, Value)) -> Result<Value> {
+        let Some(cmp) = compare(op) else { bail!("no arithmetic on wide pointers") };
+        let (a, b) = (self.ins().load(Type::I64, x, 0), self.ins().load(Type::I64, y, 0));
+        let (c, d) = (self.ins().load(Type::I64, x, 8), self.ins().load(Type::I64, y, 8));
+        let same = self.ins().icmp(IntCC::Equal, a, b);
+        let tail = self.ins().icmp(int_cc(cmp, false), c, d);
+        Ok(match cmp {
+            Cmp::Eq => self.ins().band(same, tail),
+            Cmp::Ne => {
+                let apart = self.ins().icmp(IntCC::NotEqual, a, b);
+                self.ins().bor(apart, tail)
+            }
+            Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge => {
+                let strict = if matches!(cmp, Cmp::Lt | Cmp::Le) { IntCC::UnsignedLessThan } else { IntCC::UnsignedGreaterThan };
+                let head = self.ins().icmp(strict, a, b);
+                let tied = self.ins().band(same, tail);
+                self.ins().bor(head, tied)
+            }
+        })
     }
 
     fn overloaded(&mut self, expr: ExprId, op: BinOp, operands: (ExprId, ExprId), (item, substs): (ItemRef, &[Ty])) -> Result<Option<Value>> {
@@ -157,6 +183,14 @@ impl Lower<'_, '_> {
             values.push(value);
         }
         self.invoke(item, substs, values)
+    }
+
+    fn overloaded_assign(&mut self, (expr, lhs, rhs): (ExprId, ExprId, ExprId), (item, substs): (ItemRef, &[Ty])) -> Result<Option<Value>> {
+        let by_mut = Adjust { derefs: 0, autoref: Some(Mut::Mut) };
+        let Some(place) = self.receiver((expr, lhs), by_mut)? else { return Ok(None) };
+        let mut values = vec![place];
+        values.extend(self.expr(rhs)?);
+        self.invoke(item, substs, values).map(|_| None)
     }
 
     pub(super) fn apply(&mut self, op: BinOp, num: Num, (x, y): (Value, Value), rhs: Num) -> Result<Value> {
@@ -352,25 +386,32 @@ impl Lower<'_, '_> {
         Ok(Some(result))
     }
 
-    pub(super) fn assign(&mut self, lhs: ExprId, rhs: ExprId, op: Option<BinOp>) -> Result<Option<Value>> {
-        let rhs_num = self.num(self.ty_of(rhs)).ok();
-        if op.is_none() && matches!(self.body.expr(lhs), Expr::Tuple(_) | Expr::Underscore) {
+    pub(super) fn assign(&mut self, expr: ExprId, (lhs, rhs): (ExprId, ExprId), op: Option<BinOp>) -> Result<Option<Value>> {
+        if let Some(op) = op {
+            return self.compound(expr, (lhs, rhs), op);
+        }
+        if matches!(self.body.expr(lhs), Expr::Tuple(_) | Expr::Underscore) {
             let value = self.expr(rhs)?;
             return self.assign_parts(lhs, value).map(|_| None);
         }
         let Some(value) = self.expr(rhs)? else { return Ok(None) };
         let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
-        if op.is_none() && self.replace(lhs, place, value)? {
-            return Ok(None);
+        if !self.replace(lhs, place, value)? {
+            self.write(place, value);
         }
-        let value = match op {
-            Some(op) => {
-                let Some(current) = self.read(place) else { return Ok(None) };
-                let num = self.num(self.ty_of(lhs))?;
-                self.apply(op, num, (current, value), rhs_num.unwrap_or(num))?
-            }
-            None => value,
-        };
+        Ok(None)
+    }
+
+    fn compound(&mut self, expr: ExprId, (lhs, rhs): (ExprId, ExprId), op: BinOp) -> Result<Option<Value>> {
+        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
+            return self.overloaded_assign((expr, lhs, rhs), (item, &substs));
+        }
+        let rhs_num = self.num(self.ty_of(rhs)).ok();
+        let Some(value) = self.expr(rhs)? else { return Ok(None) };
+        let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
+        let Some(current) = self.read(place) else { return Ok(None) };
+        let num = self.num(self.ty_of(lhs))?;
+        let value = self.apply(op, num, (current, value), rhs_num.unwrap_or(num))?;
         self.write(place, value);
         Ok(None)
     }

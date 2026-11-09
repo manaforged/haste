@@ -242,7 +242,7 @@ impl Lower<'_, '_> {
     }
 
     fn when_variant(&mut self, place: Place, ty: Ty, variant: u32, run: &mut dyn FnMut(&mut Self) -> Result<()>) -> Result<()> {
-        match self.is_variant(place, ty, variant)? {
+        match self.is_variant(Some(place), ty, variant)? {
             Some(test) => self.when(test, run),
             None => run(self),
         }

@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow};
-use rustc_abi::{Integer, IntegerType, LayoutCalculator, ReprFlags, ReprOptions, TargetDataLayout};
+use rustc_abi::{Align, Integer, IntegerType, LayoutCalculator, ReprFlags, ReprOptions, TargetDataLayout};
 use rustc_index::IndexVec;
 
 use crate::names::{ItemRef, Primitive};
@@ -47,11 +47,24 @@ impl Context<'_> {
                 match src.text(from) {
                     "C" => repr.flags |= ReprFlags::IS_C,
                     "transparent" => repr.flags |= ReprFlags::IS_TRANSPARENT,
+                    "packed" => repr.pack = Some(repr_align(src, from).unwrap_or(Align::ONE)),
+                    "align" => repr.align = repr_align(src, from).or(repr.align),
                     word => repr.int = REPR_INTS.iter().find(|(name, _)| *name == word).map(|(_, int)| integer_type(*int)).or(repr.int),
                 }
             }
         }
         repr
+    }
+
+    /// The argument positions that `#[rustc_legacy_const_generics(..)]` on the function `item` gives its const generics, in order.
+    pub fn legacy_const_args(&self, item: ItemRef) -> Vec<usize> {
+        let (src, entry) = self.item(item);
+        let named = entry.attrs.iter().find_map(|attr| match *attr {
+            Attr::Other(at) if src.text(at) == "rustc_legacy_const_generics" && src.kind(at + 1) == rustc_lexer::TokenKind::OpenParen => Some(at),
+            _ => None,
+        });
+        let Some(at) = named else { return Vec::new() };
+        split_commas(src, at + 2, src.pair(at + 1)).into_iter().filter_map(|(from, _)| src.text(from).parse().ok()).collect()
     }
 
     /// The value of `#[lang = "..."]` on `item`.
@@ -92,6 +105,15 @@ impl Context<'_> {
         };
         result.map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))
     }
+}
+
+/// The alignment that the `(N)` after the `#[repr]` word at `at` gives, as in `packed(2)` or `align(16)`.
+fn repr_align(src: &crate::outline::source::Source, at: u32) -> Option<Align> {
+    if src.kind(at + 1) != rustc_lexer::TokenKind::OpenParen {
+        return None;
+    }
+    let bytes = super::infer::parse_int(src.text(at + 2)).ok()?.0;
+    Align::from_bytes(u64::try_from(bytes).ok()?).ok()
 }
 
 /// The integer type that the `#[repr]` integer `int` names.

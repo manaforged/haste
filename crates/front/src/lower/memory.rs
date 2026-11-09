@@ -19,6 +19,12 @@ impl Lower<'_, '_> {
             (SizeOf | AlignOf, Some(ty), _) => self.layout_const(which, ty).map(Some),
             (SizeOfVal | AlignOfVal, Some(ty), &[pointer]) => self.value_layout(which == SizeOfVal, ty, pointer).map(Some),
             (NeedsDrop | TypeId, Some(ty), _) => self.type_fact(which, ty).map(Some),
+            (TypeName, Some(ty), _) => {
+                let name = self.cx.type_text(ty, &|ty| ty);
+                let data = self.slots.data(name.as_bytes());
+                let data = self.ins().iconst(Type::I64, data);
+                Ok(Some(self.wide_pointer(data, name.len() as i64)))
+            }
             (NoOp, _, _) => Ok(None),
             (Fence, _, _) => {
                 self.ins().fence();

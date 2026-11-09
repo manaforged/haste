@@ -63,10 +63,10 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    /// Lowers a call of the callee value `callee`, a closure or a function item, which inference resolved to `(item, substs)`.
+    /// Lowers a call of the callee value `callee`, a closure, a function item, a trait object or a value with its own `Fn` impl, which inference resolved to `(item, substs)`.
     pub(super) fn call_value(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Vec<Ty>), args: List) -> Result<Option<Value>> {
         let item_value = matches!(self.cx.types.kind(self.ty_of(callee)), Kind::FnDef(..));
-        if !item_value && substs.first().is_some_and(|ty| matches!(self.cx.types.kind(*ty), Kind::Dyn(..))) {
+        if self.typed.overloaded.contains(&expr) || !item_value && substs.first().is_some_and(|ty| matches!(self.cx.types.kind(*ty), Kind::Dyn(..))) {
             return self.object_call((expr, callee), (item, substs), args);
         }
         if self.typed.autoderefs.contains_key(&expr) {
@@ -120,7 +120,13 @@ impl Lower<'_, '_> {
         }
         let Some((place, _)) = self.autoderef_place(expr, callee)? else { return Ok(None) };
         let receiver = self.address(place);
-        let Some(&tuple) = substs.get(1) else { bail!("a trait object call with no argument tuple") };
+        let tuple = match self.typed.overloaded.contains(&expr) {
+            true => {
+                let items = self.body.list(args).iter().map(|&arg| self.ty_of(ExprId(arg))).collect();
+                self.cx.types.intern(Kind::Tuple(items))
+            }
+            false => *substs.get(1).ok_or_else(|| anyhow::anyhow!("a trait object call with no argument tuple"))?,
+        };
         let packed = self.tuple_of(tuple, args)?;
         self.invoke(item, &substs, std::iter::once(receiver).chain(packed).collect())
     }

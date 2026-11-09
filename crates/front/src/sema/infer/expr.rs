@@ -25,8 +25,8 @@ impl Infer<'_, '_> {
             Expr::Paren(inner) => self.expr(inner, expected),
             Expr::Unary(op, operand) => self.unary(expr, (op, operand), expected),
             Expr::Binary(op, lhs, rhs) => self.binary(expr, op, (lhs, rhs), expected),
-            Expr::Assign(lhs, rhs) => self.assign(lhs, rhs, None),
-            Expr::AssignOp(op, lhs, rhs) => self.assign(lhs, rhs, Some(op)),
+            Expr::Assign(lhs, rhs) => self.assign(expr, (lhs, rhs), None),
+            Expr::AssignOp(op, lhs, rhs) => self.assign(expr, (lhs, rhs), Some(op)),
             Expr::Cast(inner, ty) => self.cast(inner, ty),
             Expr::Call(callee, args) => self.call(expr, (callee, args), expected),
             Expr::Closure { params, ret, body, capture } => self.closure_expr(expr, (params, ret, body, capture), expected),
@@ -40,7 +40,12 @@ impl Infer<'_, '_> {
     fn cast(&mut self, inner: ExprId, ty: TyId) -> Result<Ty> {
         let found = self.expr(inner, None)?;
         let target = self.lower_ty(self.body, ty)?;
-        if let Some(coercion) = self.coercion(found, target)? {
+        let address = matches!(self.cx.types.kind(self.resolve(target)), Kind::Ptr(..) | Kind::Prim(Primitive::Usize | Primitive::Isize));
+        let coercion = match self.cx.types.kind(self.resolve(found)).clone() {
+            Kind::FnDef(item, substs) if address => Some(super::coerce::Coercion::Reify(Res::Fn(item, substs))),
+            _ => self.coercion(found, target)?,
+        };
+        if let Some(coercion) = coercion {
             self.out.coercions.insert(inner, coercion);
         }
         Ok(target)
@@ -271,16 +276,19 @@ impl Infer<'_, '_> {
 
     fn overloaded(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
         let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
-        let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
-        let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
-        if self.trial(|infer| infer.select(of, left, &[right]))?.is_none() {
-            bail!("unsupported operator {op:?} on {}", self.show(left));
-        }
+        let Some((of, method)) = self.operator_impl((lang, name), (left, right))? else { bail!("unsupported operator {op:?} on {}", self.show(left)) };
         self.out.operators.insert(expr, Res::Fn(method, vec![left, right]));
         match is_compare(op) {
             true => Ok(self.cx.types.bool()),
             false => self.project(of, left, vec![right], "Output"),
         }
+    }
+
+    /// The trait with lang item `lang` and its method `name`, when an impl of that trait applies to `left` with `right`.
+    fn operator_impl(&mut self, (lang, name): (&str, &str), (left, right): (Ty, Ty)) -> Result<Option<(ItemRef, ItemRef)>> {
+        let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
+        let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
+        Ok(self.trial(|infer| infer.select(of, left, &[right]))?.map(|_| (of, method)))
     }
 
     fn logical(&mut self, lhs: ExprId, rhs: ExprId) -> Result<Ty> {
@@ -306,17 +314,30 @@ impl Infer<'_, '_> {
         scalar || self.is_int(ty) || self.is_float(ty)
     }
 
-    fn assign(&mut self, lhs: ExprId, rhs: ExprId, op: Option<BinOp>) -> Result<Ty> {
+    fn assign(&mut self, expr: ExprId, (lhs, rhs): (ExprId, ExprId), op: Option<BinOp>) -> Result<Ty> {
         let place = self.expr(lhs, None)?;
         self.note_mut(lhs)?;
+        let builtin = op.is_none_or(|bin| self.builtin_compound(bin, place));
         let shift = matches!(op, Some(BinOp::Shl | BinOp::Shr));
-        let value = self.expr(rhs, (!shift).then_some(place))?;
+        let value = self.expr(rhs, (builtin && !shift).then_some(place))?;
         match op {
+            Some(bin) if !builtin => self.overloaded_assign(expr, bin, (place, value))?,
             Some(BinOp::Shl | BinOp::Shr) => {}
-            Some(bin) if !self.builtin_compound(bin, place) => bail!("unsupported compound assignment on {}", self.show(place)),
             _ => self.coerce_expr(rhs, value, place)?,
         }
         Ok(self.cx.types.unit())
+    }
+
+    fn overloaded_assign(&mut self, expr: ExprId, op: BinOp, (place, value): (Ty, Ty)) -> Result<()> {
+        let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
+        let Some((of, method)) = self.operator_impl((&format!("{lang}_assign"), &format!("{name}_assign")), (place, value))? else {
+            bail!("unsupported compound assignment on {}", self.show(place))
+        };
+        if self.has_vars(value) {
+            self.obligations.push((of, vec![place, value]));
+        }
+        self.out.operators.insert(expr, Res::Fn(method, vec![place, value]));
+        Ok(())
     }
 
     fn builtin_compound(&mut self, op: BinOp, place: Ty) -> bool {
@@ -338,9 +359,39 @@ impl Infer<'_, '_> {
                 (params, ret, Some((item, substs)))
             }
             Kind::FnPtr(params, ret) => (params, ret, None),
+            Kind::Adt(..) => return self.overloaded_call(expr, found, args),
             _ => bail!("calling {} is not supported yet", self.show(callee_ty)),
         };
-        let args = self.body.list(args).to_vec();
+        let args = match &def {
+            Some((item, substs)) => self.legacy_const_args((*item, substs), args, params.len())?,
+            None => self.body.list(args).to_vec(),
+        };
+        self.call_args(args, (params, ret, def), expected)
+    }
+
+    /// The arguments `args` of a call of `item` at `substs`, which takes `params` values, that pass values, after the ones that `#[rustc_legacy_const_generics]` names are tied to its const generics.
+    fn legacy_const_args(&mut self, (item, substs): (ItemRef, &[Ty]), args: List, params: usize) -> Result<Vec<u32>> {
+        use crate::body::sig::GenericKind;
+        let all = self.body.list(args).to_vec();
+        let positions = self.cx.legacy_const_args(item);
+        if positions.is_empty() || all.len() != params + positions.len() {
+            return Ok(all);
+        }
+        let sig = self.cx.signature(item)?;
+        let own: Vec<_> = sig.generics.iter().filter(|generic| generic.kind != GenericKind::Lifetime).collect();
+        let outer = substs.len().saturating_sub(own.len());
+        let consts: Vec<usize> = own.iter().enumerate().filter(|(_, generic)| matches!(generic.kind, GenericKind::Const(_))).map(|(at, _)| outer + at).collect();
+        for (&position, &slot) in positions.iter().zip(&consts) {
+            let (Some(&arg), Some(&param)) = (all.get(position), substs.get(slot)) else { bail!("`{}` has no argument {position} for a const generic", self.cx.name(item)) };
+            let value = self.const_arg(self.body, ExprId(arg))?;
+            self.unify(param, value)?;
+            self.out.const_args.insert(ExprId(arg));
+        }
+        Ok(all.into_iter().enumerate().filter(|(at, _)| !positions.contains(at)).map(|(_, arg)| arg).collect())
+    }
+
+    /// Infers the arguments `args` of a call of a function with `params` that returns `ret`, the function item `def` when it is one, and returns `ret`.
+    fn call_args(&mut self, args: Vec<u32>, (params, ret, def): (Vec<Ty>, Ty, Option<(ItemRef, Vec<Ty>)>), expected: Option<Ty>) -> Result<Ty> {
         let extra = self.variadic_extra(def.as_ref().map(|(item, _)| *item), args.len(), params.len())?;
         let hints = self.expected_inputs(&params, ret, expected);
         for ((&arg, param), hint) in args.iter().zip(params).zip(hints) {
@@ -401,7 +452,13 @@ impl Infer<'_, '_> {
         let hint = Some(then_ty).filter(|&ty| !self.is_never(ty));
         let else_ty = self.expr(otherwise, expected.or(hint))?;
         self.diverges = before || (then_diverges && self.diverges);
-        let Some(target) = self.known(expected) else { return self.join(then_ty, else_ty) };
+        let target = match self.known(expected) {
+            Some(target) => target,
+            None => match self.slice_branch(then_ty, else_ty) {
+                Some(target) => target,
+                None => return self.join(then_ty, else_ty),
+            },
+        };
         self.coerce_expr(then, then_ty, target)?;
         self.coerce_expr(otherwise, else_ty, target)?;
         Ok(target)
@@ -425,6 +482,19 @@ impl Infer<'_, '_> {
         }
         self.unify(a, b)?;
         Ok(a)
+    }
+
+    /// The branch type that the other branch unsizes to, when one branch points to an array and the other to a slice, as rustc's common type of two branches does.
+    fn slice_branch(&self, a: Ty, b: Ty) -> Option<Ty> {
+        let pointee = |ty: Ty| match self.cx.types.kind(self.resolve(ty)) {
+            Kind::Ref(_, inner) | Kind::Ptr(_, inner) => Some(self.cx.types.kind(self.resolve(*inner)).clone()),
+            _ => None,
+        };
+        match (pointee(a)?, pointee(b)?) {
+            (Kind::Array(..), Kind::Slice(_)) => Some(b),
+            (Kind::Slice(_), Kind::Array(..)) => Some(a),
+            _ => None,
+        }
     }
 
     fn shared_pointer(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {

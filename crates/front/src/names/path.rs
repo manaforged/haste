@@ -198,19 +198,24 @@ impl<'a> Paths<'a> {
     pub fn traits_in(&self, at: ModRef) -> Vec<ItemRef> {
         let mut found = Vec::new();
         for module in std::iter::once(at).chain(self.prelude) {
-            let Some(entry) = self.done.get(module.krate as usize) else { continue };
-            if !entry.resolves_all(module.module) && let Some(demands) = self.demands {
-                demands.scopes.borrow_mut().push(module);
-            }
-            let named = self.scope(module).into_iter().flat_map(|scope| scope.names.values()).filter_map(|names| names.types.map(|binding| binding.def));
-            let hidden = entry.pending.iter().filter(|pending| pending.module == module.module && pending.name == Some(UNDERSCORE)).filter_map(|pending| pending.stamp.map(|(def, _)| def));
-            for def in named.chain(hidden) {
-                if let Def::Item(item) = def && self.trees[item.krate as usize].files[item.file as usize].items.items[item.item as usize].kind == ItemKind::Trait && !found.contains(&item) {
-                    found.push(item);
-                }
-            }
+            self.traits_of(module, &mut found);
         }
         found
+    }
+
+    /// Adds to `found` the traits that module `module` declares or imports.
+    pub fn traits_of(&self, module: ModRef, found: &mut Vec<ItemRef>) {
+        let Some(entry) = self.done.get(module.krate as usize) else { return };
+        if !entry.resolves_all(module.module) && let Some(demands) = self.demands {
+            demands.scopes.borrow_mut().push(module);
+        }
+        let named = self.scope(module).into_iter().flat_map(|scope| scope.names.values()).filter_map(|names| names.types.map(|binding| binding.def));
+        let hidden = entry.pending.iter().filter(|pending| pending.module == module.module && pending.name == Some(UNDERSCORE)).filter_map(|pending| pending.stamp.map(|(def, _)| def));
+        for def in named.chain(hidden) {
+            if let Def::Item(item) = def && self.trees[item.krate as usize].files[item.file as usize].items.items[item.item as usize].kind == ItemKind::Trait && !found.contains(&item) {
+                found.push(item);
+            }
+        }
     }
 
     /// The bindings of the first segment `word` of a path used in module `at`, merged across namespaces from the local scope, the extern prelude and the std prelude.

@@ -1,5 +1,6 @@
 mod adt;
 mod assoc;
+mod clone;
 mod consts;
 mod array;
 mod closure;
@@ -71,6 +72,8 @@ pub enum Shape {
     Untuple(Res),
     /// The tuple constructor of this variant, called as a function.
     Ctor(u32),
+    /// The `Clone::clone` of a tuple that the compiler writes, with the clone call of each field.
+    Clone(Vec<Res>),
 }
 
 /// The inferred types and resolutions of one function body at one set of type arguments.
@@ -102,6 +105,10 @@ pub struct Typed {
     pub ref_binds: HashMap<PatId, crate::sema::ty::Mut>,
     /// The or-patterns whose alternatives bind names, which every alternative binds to the same locals.
     pub or_binds: rustc_hash::FxHashSet<PatId>,
+    /// The calls of values that implement `Fn` or `FnMut` themselves, which pass the callee's address and the argument tuple.
+    pub overloaded: rustc_hash::FxHashSet<ExprId>,
+    /// The call arguments that `#[rustc_legacy_const_generics]` turns into const generic arguments, which pass no value.
+    pub const_args: rustc_hash::FxHashSet<ExprId>,
     pub pats: HashMap<PatId, Ty>,
     pub params: Vec<u32>,
     pub ret: Option<Ty>,
@@ -135,6 +142,10 @@ impl Typed {
             Shape::Untuple(res) => Some(res),
             _ => None,
         };
+        let cloned = match &self.shape {
+            Shape::Clone(calls) => &calls[..],
+            _ => &[],
+        };
         let coerced = self.coercions.values().flat_map(|coercion| -> Box<dyn Iterator<Item = &Res>> {
             match coercion {
                 Coercion::Vtable(vtable) => Box::new(vtable.calls().into_iter()),
@@ -143,7 +154,7 @@ impl Typed {
                 Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
             }
         });
-        self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values()).chain(loops).chain(tries).chain(&self.drops).chain(glue).chain(untuple).chain(coerced).filter_map(|res| match res {
+        self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values()).chain(loops).chain(tries).chain(&self.drops).chain(glue).chain(untuple).chain(cloned).chain(coerced).filter_map(|res| match res {
             Res::Fn(item, substs) => Some((*item, &substs[..])),
             _ => None,
         })
@@ -177,6 +188,8 @@ pub struct Infer<'c, 'a> {
     loops: Vec<Breaks>,
     uses: Vec<closure::Uses>,
     diverges: bool,
+    /// The `impl Trait` types that no frame parameter stands for: the token of each and the variable for its hidden type.
+    hidden: Vec<(u32, Ty)>,
 }
 
 /// What the `break`s of one loop or labeled block give: the type they coerce to once it is known, whether any `break` was seen, its label, and whether it is a block.
@@ -233,6 +246,9 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
         return drop::glue_typed(cx, item, ty).map(Some);
     }
     let Some(&ty) = substs.first() else { return Ok(None) };
+    if cx.lang(item) == Some("clone_fn") && matches!(cx.types.kind(ty), Kind::Tuple(_)) {
+        return clone::clone_typed(cx, item, ty).map(Some);
+    }
     let (once, by_ref) = (cx.call_once() == Some(item), closure::by_reference(cx, item).is_some());
     match cx.types.kind(ty) {
         Kind::Closure(..) if once => closure::closure_typed(cx, ty).map(Some),
@@ -244,17 +260,19 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
 impl<'c, 'a> Infer<'c, 'a> {
     fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false }
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false, hidden: Vec::new() }
     }
 }
 
 impl Infer<'_, '_> {
     fn run(&mut self, foreign: bool) -> Result<()> {
+        self.hidden.clear();
         let ret = match self.sig.ret {
             Some(ty) => self.lower_ty(&self.sig.body, ty)?,
             None => self.cx.types.unit(),
         };
         self.out.ret = Some(ret);
+        self.bind_hidden()?;
         self.ret_sig = self.opaque_fn_sig()?;
         let sig = self.sig;
         if let Some((kind, mutable)) = sig.receiver {
@@ -407,11 +425,22 @@ impl Infer<'_, '_> {
     }
 
     fn settle_pending(&mut self) -> Result<()> {
-        self.settle_metadata()?;
-        self.settle_projections()?;
-        self.settle_opaques(false)?;
-        self.settle_operators(false)?;
-        self.settle_obligations()
+        loop {
+            let before = self.backlog();
+            self.settle_metadata()?;
+            self.settle_projections()?;
+            self.settle_opaques(false)?;
+            self.settle_operators(false)?;
+            self.settle_obligations()?;
+            if self.backlog() >= before {
+                return Ok(());
+            }
+        }
+    }
+
+    /// How many deferred items inference still waits on, which each pass of `settle_pending` must cut to run again.
+    fn backlog(&self) -> usize {
+        self.metadata.len() + self.projections.len() + self.opaques.len() + self.operands.len() + self.obligations.len()
     }
 
     /// The type `ty` resolved, after settling what is pending when it is still an unknown variable, as rustc does before it needs a type.
@@ -509,17 +538,7 @@ impl Infer<'_, '_> {
 
     /// A short spelling of `ty` for messages.
     pub fn show(&self, ty: Ty) -> String {
-        let list = |tys: &[Ty]| tys.iter().map(|&ty| self.show(ty)).collect::<Vec<_>>().join(", ");
-        match self.cx.types.kind(self.resolve(ty)).clone() {
-            Kind::Adt(item, args) if args.is_empty() => self.cx.name(item).to_owned(),
-            Kind::Adt(item, args) => format!("{}<{}>", self.cx.name(item), list(&args)),
-            Kind::Ref(Mut::Not, inner) => format!("&{}", self.show(inner)),
-            Kind::Ref(Mut::Mut, inner) => format!("&mut {}", self.show(inner)),
-            Kind::Tuple(items) => format!("({})", list(&items)),
-            Kind::Slice(element) => format!("[{}]", self.show(element)),
-            Kind::Prim(primitive) => format!("{primitive:?}").to_lowercase(),
-            other => format!("{other:?}"),
-        }
+        self.cx.type_text(ty, &|ty| self.resolve(ty))
     }
 
     fn zonk(&mut self, ty: Ty) -> Ty {

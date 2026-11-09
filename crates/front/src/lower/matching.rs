@@ -147,7 +147,7 @@ impl Lower<'_, '_> {
     }
 
     fn test_variant(&mut self, pat: PatId, place: Option<Place>, fail: Block) -> Result<()> {
-        let (Some(Res::Ctor(_, variant, _)), Some(place)) = (self.typed.pat_res.get(&pat).cloned(), place) else { return Ok(()) };
+        let Some(Res::Ctor(_, variant, _)) = self.typed.pat_res.get(&pat).cloned() else { return Ok(()) };
         let ty = self.pat_ty(pat)?;
         if let Some(ok) = self.is_variant(place, ty, variant)? {
             self.pass(ok, fail);

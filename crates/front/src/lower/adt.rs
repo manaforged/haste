@@ -78,8 +78,8 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    /// Whether the value of ADT `ty` at `place` holds variant `variant`, or none when it is the only variant the value can hold.
-    pub fn is_variant(&mut self, place: Place, ty: Ty, variant: u32) -> Result<Option<Value>> {
+    /// Whether the value of ADT `ty` at `place`, which a zero-sized value lacks, holds variant `variant`, or none when it is the only variant the value can hold.
+    pub fn is_variant(&mut self, place: Option<Place>, ty: Ty, variant: u32) -> Result<Option<Value>> {
         let Kind::Adt(item, _) = self.cx.types.kind(ty).clone() else { bail!("variant test on a type that is not an ADT") };
         let layout = self.cx.layout(ty)?;
         let Some(tag) = self.tag(&layout)? else {
@@ -88,7 +88,7 @@ impl Lower<'_, '_> {
                 _ => None,
             });
         };
-        let Some(value) = self.read(place.at(tag.offset, Repr::Scalar(tag.ty))) else { bail!("tag with no value") };
+        let Some(value) = place.and_then(|place| self.read(place.at(tag.offset, Repr::Scalar(tag.ty)))) else { bail!("tag with no value") };
         Ok(Some(match &tag.encoding {
             TagEncoding::Direct => {
                 let expected = self.cx.discriminants(item)?[variant as usize] as u128 & tag.mask;
@@ -136,7 +136,7 @@ impl Lower<'_, '_> {
         let Some((&last, rest)) = values.split_last() else { bail!("discriminant_value of an enum with no variants") };
         let mut found = self.int_const(to, last as u128);
         for (variant, &value) in rest.iter().enumerate() {
-            let Some(test) = self.is_variant(place, ty, variant as u32)? else { continue };
+            let Some(test) = self.is_variant(Some(place), ty, variant as u32)? else { continue };
             let value = self.int_const(to, value as u128);
             found = self.ins().select(test, value, found);
         }

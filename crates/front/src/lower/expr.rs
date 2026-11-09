@@ -47,8 +47,8 @@ impl Lower<'_, '_> {
             Expr::Unary(UnOp::Deref, operand) => self.deref_read(expr, operand),
             Expr::Unary(op, operand) => self.unary(op, operand),
             Expr::Binary(op, lhs, rhs) => self.binary(expr, op, lhs, rhs),
-            Expr::Assign(lhs, rhs) => self.assign(lhs, rhs, None),
-            Expr::AssignOp(op, lhs, rhs) => self.assign(lhs, rhs, Some(op)),
+            Expr::Assign(lhs, rhs) => self.assign(expr, (lhs, rhs), None),
+            Expr::AssignOp(op, lhs, rhs) => self.assign(expr, (lhs, rhs), Some(op)),
             Expr::Cast(inner, _) => self.cast(expr, inner),
             Expr::Call(callee, args) => self.call(expr, callee, args),
             Expr::Method { receiver, params, .. } => self.method(expr, receiver, params),
@@ -193,7 +193,9 @@ impl Lower<'_, '_> {
 
     pub(super) fn args(&mut self, args: List, mut values: Vec<Value>) -> Result<Vec<Value>> {
         for arg in self.body.list(args).to_vec() {
-            values.extend(self.expr(ExprId(arg))?);
+            if !self.typed.const_args.contains(&ExprId(arg)) {
+                values.extend(self.expr(ExprId(arg))?);
+            }
         }
         Ok(values)
     }

@@ -4,8 +4,8 @@ use crate::body::sig::{Generic, GenericKind};
 use crate::body::{self as syntax, Args, Body, GenericArg, PathId, TyId};
 use crate::names::path::Path as NamePath;
 use crate::names::collect::import_parts;
-use crate::names::{Def, ItemRef, PerNs, Primitive, SELF, Sym, Symbols, plain};
-use crate::outline::item::ItemKind;
+use crate::names::{Binding, Def, ItemRef, Origin, PerNs, Primitive, SELF, Sym, Symbols, plain};
+use crate::outline::item::{ItemKind, Vis};
 use crate::outline::source::{Mark, Source};
 
 use super::super::impls::ImplRef;
@@ -108,10 +108,14 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn body_traits(&mut self) -> Vec<ItemRef> {
         let mut traits = self.root.map(|root| self.cx.body_declared_traits(root)).unwrap_or_default();
         let found = self.body_imports(None).into_iter().filter_map(|entry| entry.types);
-        traits.extend(found.filter_map(|binding| match binding.def {
-            Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Trait => Some(item),
-            _ => None,
-        }));
+        let home = self.home;
+        for binding in found.collect::<Vec<_>>() {
+            match binding.def {
+                Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Trait => traits.push(item),
+                Def::Module(module) => self.cx.paths(home.krate).traits_of(module, &mut traits),
+                _ => {}
+            }
+        }
         traits
     }
 
@@ -137,6 +141,11 @@ impl<'a> Infer<'_, 'a> {
             let (head, leaf) = match (name, segments.split_last(), word) {
                 (None, _, Some(word)) => (segments, word),
                 (Some(_), Some((&leaf, head)), _) => (head, leaf),
+                (None, Some(_), None) => {
+                    let glob = paths.resolve(&NamePath { segments, absolute, dollar }, home);
+                    globs.extend(glob.map(|def| PerNs { types: Some(Binding { def, vis: Vis::Pub, origin: Origin::Glob }), values: None, macros: None }));
+                    continue;
+                }
                 _ => continue,
             };
             let entry = match head {
@@ -427,7 +436,11 @@ impl<'a> Infer<'_, 'a> {
         let key = self.src.text(at).as_ptr();
         match self.generics.iter().find(|(name, _)| name.as_ptr() == key) {
             Some(&(_, ty)) => ty,
-            None => self.fresh(Kind::Var),
+            None => {
+                let hidden = self.fresh(Kind::Var);
+                self.hidden.push((at, hidden));
+                hidden
+            }
         }
     }
 

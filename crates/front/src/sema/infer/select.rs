@@ -6,7 +6,7 @@ use crate::names::{Def, ItemRef, ModRef};
 use crate::outline::item::ItemKind;
 
 use super::super::impls::{ImplRef, head};
-use super::super::ty::{Kind, Ty};
+use super::super::ty::{Kind, Mut, Ty};
 use super::Infer;
 use super::scope::{Frame, named_args, type_params};
 
@@ -21,6 +21,9 @@ const DEPTH: u32 = 8;
 const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
 
 const BUILTIN: [&str; 12] = ["sized", "meta_sized", "pointee_sized", "copy", "clone", "destruct", "tuple_trait", "freeze", "pointee_trait", "unsize", "sync", "unpin"];
+
+/// The compiler traits that no unsized type implements.
+const SIZED_ONLY: [&str; 3] = ["sized", "copy", "clone"];
 
 impl<'a> Infer<'_, 'a> {
     /// The one impl of trait `of` at trait arguments `args` for `self_ty`, or none when no impl or several apply.
@@ -46,7 +49,8 @@ impl<'a> Infer<'_, 'a> {
             return Ok(Vec::new());
         }
         let mut found = self.impl_candidates(of, self_ty, args, depth)?;
-        if found.len() > 1 {
+        let open = args.iter().any(|&arg| matches!(self.cx.types.kind(self.resolve(arg)), Kind::Var(_)));
+        if found.len() > 1 && !open {
             let mut kept = Vec::new();
             for entry in &found {
                 if !self.blanket(entry.0.0)? {
@@ -238,7 +242,7 @@ impl<'a> Infer<'_, 'a> {
     fn bound_holds(&mut self, arena: &Body, home: ModRef, (ty, bound): (Ty, u32), depth: u32) -> Result<bool> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else { return Ok(true) };
         if self.compiler_trait(of) {
-            return Ok(true);
+            return Ok(self.compiler_holds(of, ty));
         }
         let kind = self.cx.types.kind(self.resolve(ty));
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
@@ -276,6 +280,16 @@ impl<'a> Infer<'_, 'a> {
     /// Whether trait `of` is one the compiler proves for every type that reaches selection: a marker such as `Sized` or `Copy`, or an auto trait.
     pub(super) fn compiler_trait(&self, of: ItemRef) -> bool {
         self.cx.lang(of).is_some_and(|lang| BUILTIN.contains(&lang)) || self.cx.is_auto_trait(of)
+    }
+
+    /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one is neither `Sized`, `Copy` nor `Clone`, and `&mut T` is neither `Copy` nor `Clone`.
+    fn compiler_holds(&self, of: ItemRef, ty: Ty) -> bool {
+        let Some(lang) = self.cx.lang(of) else { return true };
+        match self.cx.types.kind(self.resolve(ty)) {
+            Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str) | Kind::Dyn(..) => !SIZED_ONLY.contains(&lang),
+            Kind::Ref(Mut::Mut, _) => !matches!(lang, "copy" | "clone"),
+            _ => true,
+        }
     }
 
     /// Whether trait `of` is `Fn`, `FnMut` or `FnOnce`, which callables implement with no impl to select.

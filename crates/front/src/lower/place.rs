@@ -257,11 +257,32 @@ impl Lower<'_, '_> {
 
     /// Lowers the expressions `list` into a new frame slot as a tuple of type `ty`, and returns its value.
     pub(super) fn tuple_of(&mut self, ty: Ty, list: List) -> Result<Option<Value>> {
+        let mut values = Vec::new();
+        for &item in self.body.list(list).to_vec().iter() {
+            values.push(self.expr(ExprId(item))?);
+        }
+        self.tuple_from(ty, values)
+    }
+
+    /// Lowers the compiler-made `Clone::clone` of a tuple: each field of the referenced tuple cloned through its call in `calls`, into a new tuple.
+    pub fn clone_body(&mut self, calls: Vec<Res>) -> Result<Option<Value>> {
+        let (Some(ty), Some(local)) = (self.typed.ret, self.typed.params.first().copied()) else { bail!("a compiler-made clone with no parameter or result") };
+        let Some(source) = self.locals[local as usize].and_then(|place| self.read(place)) else { bail!("a compiler-made clone with no source") };
+        let mut values = Vec::new();
+        for (index, call) in calls.into_iter().enumerate() {
+            let Res::Fn(item, substs) = call else { bail!("a field clone that is not a call") };
+            let offset = self.field_offset(ty, index as u32)?;
+            let field = self.ins().iadd_imm(source, i64::from(offset));
+            values.push(self.invoke(item, &substs, vec![field])?);
+        }
+        self.tuple_from(ty, values)
+    }
+
+    fn tuple_from(&mut self, ty: Ty, values: Vec<Option<Value>>) -> Result<Option<Value>> {
         let whole = repr(self.cx, ty)?;
         let Kind::Tuple(items) = self.cx.types.kind(ty).clone() else { bail!("a tuple of a type that is not a tuple") };
         let slot = self.slot(whole);
-        for (index, &item) in self.body.list(list).to_vec().iter().enumerate() {
-            let value = self.expr(ExprId(item))?;
+        for (index, value) in values.into_iter().enumerate() {
             let field = repr(self.cx, items[index])?;
             let offset = self.field_offset(ty, index as u32)?;
             if let (Some(slot), Some(value)) = (slot, value) {

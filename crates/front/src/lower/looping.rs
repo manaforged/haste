@@ -27,7 +27,7 @@ impl Lower<'_, '_> {
         let address = self.address_or_dangling(place, each.iter)?;
         let option = self.invoke(*next, next_substs, vec![address])?;
         let Some(option) = self.spill(option, each.option)? else { bail!("`next` returned no value") };
-        match self.is_variant(option, each.option, each.some)? {
+        match self.is_variant(Some(option), each.option, each.some)? {
             Some(some) => self.brif(some, (inner, &[]), (exit, &[])),
             None => self.jump(inner, &[]),
         };
@@ -51,7 +51,7 @@ impl Lower<'_, '_> {
         let value = self.expr(inner)?;
         let flow = self.invoke(*branch, branch_substs, value.into_iter().collect())?;
         let Some(flow) = self.spill(flow, tried.flow)? else { return self.zero_sized_try(&tried, (*from, from_substs)) };
-        let Some(stopped) = self.is_variant(flow, tried.flow, tried.stop)? else { bail!("`?` on a `ControlFlow` with one variant") };
+        let Some(stopped) = self.is_variant(Some(flow), tried.flow, tried.stop)? else { bail!("`?` on a `ControlFlow` with one variant") };
         let (stop, proceed) = (self.b.create_block(), self.b.create_block());
         self.brif(stopped, (stop, &[]), (proceed, &[]));
         self.enter(stop);

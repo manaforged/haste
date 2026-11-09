@@ -273,6 +273,42 @@ impl Infer<'_, '_> {
         Ok(ret)
     }
 
+    /// Infers the call `expr` of a value of type `found`, which implements `Fn` or `FnMut` itself at some step of its autoderef, recording it as a call of `call` or `call_mut` at that step's type and the argument tuple.
+    pub(super) fn overloaded_call(&mut self, expr: ExprId, found: Ty, args: List) -> Result<Ty> {
+        let args = self.body.list(args).to_vec();
+        let params: Vec<Ty> = args.iter().map(|_| self.fresh(Kind::Var)).collect();
+        let tuple = self.cx.types.intern(Kind::Tuple(params.clone()));
+        let (mut ty, mut steps) = (self.resolve(found), 0);
+        loop {
+            if let Some(method) = self.callable_impl(ty, tuple)? {
+                self.out.autoderefs.remove(&expr);
+                if steps > 0 {
+                    self.out.autoderefs.insert(expr, steps);
+                }
+                for (&arg, &param) in args.iter().zip(&params) {
+                    self.call_arg(None, ExprId(arg), (param, None))?;
+                }
+                self.out.res.insert(expr, Res::Fn(method, vec![ty, tuple]));
+                self.out.overloaded.insert(expr);
+                let Some(once) = self.cx.lang_item("fn_once") else { bail!("core has no `FnOnce`") };
+                return self.project(once, ty, vec![tuple], "Output");
+            }
+            let Some(inner) = self.builtin_deref(ty) else { bail!("calling {} is not supported yet", self.show(found)) };
+            (ty, steps) = (self.resolve(inner), steps + 1);
+        }
+    }
+
+    /// `Fn::call` or `FnMut::call_mut`, the first that an impl gives `ty` at the argument tuple `tuple`.
+    fn callable_impl(&mut self, ty: Ty, tuple: Ty) -> Result<Option<ItemRef>> {
+        for (lang, name) in [("fn", "call"), ("fn_mut", "call_mut")] {
+            let Some(of) = self.cx.lang_item(lang) else { continue };
+            if self.trial(|infer| Ok(infer.select(of, ty, &[tuple])?.map(|_| ())))?.is_some() {
+                return Ok(self.cx.trait_member(of, name));
+            }
+        }
+        Ok(None)
+    }
+
     fn free_box(&mut self, expr: ExprId, found: Ty) -> Result<()> {
         let found = self.resolve(found);
         if self.cx.boxed(found).is_none() || self.out.autoderefs.get(&expr) != Some(&1) {
@@ -328,12 +364,21 @@ impl Infer<'_, '_> {
     /// Unifies the signature of the callable `ty`, a closure, function item or function pointer, with `bound`, the function pointer type that an `Fn(A) -> B` bound on it spells.
     pub(super) fn tie_callable(&mut self, ty: Ty, bound: Ty) -> Result<()> {
         let Kind::FnPtr(inputs, output) = self.cx.types.kind(bound).clone() else { return Ok(()) };
-        let Some((params, ret)) = self.callable_sig(ty)? else { return Ok(()) };
+        let Some((params, ret)) = self.callable_sig(ty)? else { return self.tie_output(ty, inputs, output) };
         if params.len() != inputs.len() {
             bail!("a callable of {} arguments where its bound takes {}", params.len(), inputs.len());
         }
         params.into_iter().zip(inputs).try_for_each(|(param, input)| self.unify(param, input))?;
         self.unify(ret, output)
+    }
+
+    /// Unifies `output` with the `FnOnce::Output` at `inputs` of `ty`, a known type that is callable through its own `Fn` impls.
+    fn tie_output(&mut self, ty: Ty, inputs: Vec<Ty>, output: Ty) -> Result<()> {
+        let once = self.cx.lang_item("fn_once");
+        let (Some(once), false) = (once, matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_))) else { return Ok(()) };
+        let tuple = self.cx.types.intern(Kind::Tuple(inputs));
+        let found = self.project(once, ty, vec![tuple], "Output")?;
+        self.unify(found, output)
     }
 
     /// The parameters and return type of the closure, function item or function pointer `ty`, or the one a reference to it calls.

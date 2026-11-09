@@ -146,6 +146,22 @@ impl<'a> Context<'a> {
         self.closures.get(&ty).is_some_and(|info| info.closure.consumes)
     }
 
+    /// A short spelling of `ty`, each type in it first passed through `resolve`.
+    pub fn type_text(&self, ty: ty::Ty, resolve: &dyn Fn(ty::Ty) -> ty::Ty) -> String {
+        use ty::{Kind, Mut};
+        let list = |tys: &[ty::Ty]| tys.iter().map(|&ty| self.type_text(ty, resolve)).collect::<Vec<_>>().join(", ");
+        match self.types.kind(resolve(ty)).clone() {
+            Kind::Adt(item, args) if args.is_empty() => self.name(item).to_owned(),
+            Kind::Adt(item, args) => format!("{}<{}>", self.name(item), list(&args)),
+            Kind::Ref(Mut::Not, inner) => format!("&{}", self.type_text(inner, resolve)),
+            Kind::Ref(Mut::Mut, inner) => format!("&mut {}", self.type_text(inner, resolve)),
+            Kind::Tuple(items) => format!("({})", list(&items)),
+            Kind::Slice(element) => format!("[{}]", self.type_text(element, resolve)),
+            Kind::Prim(primitive) => format!("{primitive:?}").to_lowercase(),
+            other => format!("{other:?}"),
+        }
+    }
+
     /// `FnOnce::call_once`, which every call of a closure value is an instance of.
     pub fn call_once(&mut self) -> Option<ItemRef> {
         let of = self.lang_item("fn_once")?;
@@ -271,7 +287,20 @@ impl<'a> Context<'a> {
     fn alias_eq(&self, item: ItemRef) -> Result<(u32, u32)> {
         let (src, entry) = self.item(item);
         let Some(at) = entry.name else { bail!("type alias with no name") };
-        let Some(eq) = (at + 1..entry.end).find(|&token| src.kind(token) == rustc_lexer::TokenKind::Eq) else { bail!("type `{}` has no `=`", src.text(at)) };
+        let mut depth = 0i32;
+        let mut found = None;
+        for token in at + 1..entry.end {
+            match src.kind(token) {
+                rustc_lexer::TokenKind::Lt => depth += 1,
+                rustc_lexer::TokenKind::Gt if src.kind(token - 1) != rustc_lexer::TokenKind::Minus => depth -= 1,
+                rustc_lexer::TokenKind::Eq if depth == 0 => {
+                    found = Some(token);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(eq) = found else { bail!("type `{}` has no `=`", src.text(at)) };
         Ok((at, eq))
     }
 

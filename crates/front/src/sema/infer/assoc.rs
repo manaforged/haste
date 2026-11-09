@@ -53,6 +53,9 @@ impl Infer<'_, '_> {
         }
         let traits: Vec<ItemRef> = self.cx.traits_in_scope(self.home).into_iter().chain(self.body_traits()).filter(|&of| self.cx.trait_member(of, name).is_some()).collect();
         for &of in &traits {
+            if let Some(args) = self.own_trait_args(of, owner)? {
+                return self.trait_value(of, (Some(owner), Some(args)), (name, given));
+            }
             if self.implements(of, owner)? {
                 return self.trait_value(of, (Some(owner), None), (name, given));
             }
@@ -61,6 +64,17 @@ impl Infer<'_, '_> {
             [of] if matches!(self.cx.types.kind(self.resolve(owner)), Kind::Var(_)) => self.trait_value(of, (Some(owner), None), (name, given)),
             _ => bail!("no associated item `{name}` on {}", self.show(owner)),
         }
+    }
+
+    /// The arguments of trait `of` when this body is a default method of `of` and `owner` is its `Self`, which `Self::NAME` in that body reads at.
+    fn own_trait_args(&mut self, of: ItemRef, owner: Ty) -> Result<Option<Vec<Ty>>> {
+        let Some((item, substs)) = self.instance.clone() else { return Ok(None) };
+        let default = self.block.is_none() && self.cx.owner_trait(item) == Some(of);
+        if !default || substs.first().map(|&ty| self.resolve(ty)) != Some(self.resolve(owner)) {
+            return Ok(None);
+        }
+        let count = type_params(&self.cx.trait_generics(of)?.1.params).count();
+        Ok(substs.get(1..1 + count).map(<[Ty]>::to_vec))
     }
 
     fn prefix_trait(&mut self, body: &Body, path: PathId, count: usize) -> Option<ItemRef> {
