@@ -60,7 +60,7 @@ impl Infer<'_, '_> {
             Pat::Path(path) => self.path_pat(pat, path, ty),
             Pat::TupleStruct(path, list) => self.variant_pat(pat, path, ty, (list, mode)),
             Pat::Struct { path, fields, .. } => self.struct_pat(pat, path, ty, (fields, mode)),
-            Pat::Or(list) => self.or_pat(list, ty, mode),
+            Pat::Or(list) => self.or_pat(pat, list, ty, mode),
             ref other => bail!("unsupported pattern {other:?}"),
         }
     }
@@ -232,13 +232,33 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    fn or_pat(&mut self, list: List, ty: Ty, mode: Mode) -> Result<()> {
+    fn or_pat(&mut self, pat: PatId, list: List, ty: Ty, mode: Mode) -> Result<()> {
         let depth = self.scopes.len();
+        let mut first: Option<Vec<(&str, u32)>> = None;
         for &alt in self.body.list(list) {
             self.pat(PatId(alt), ty, mode)?;
-            if self.scopes.len() != depth {
-                bail!("bindings in or-patterns are not supported yet");
+            let bound = self.scopes.split_off(depth);
+            match &first {
+                None => first = Some(bound),
+                Some(names) => self.merge_alt(names, bound)?,
             }
+        }
+        let names = first.unwrap_or_default();
+        if !names.is_empty() {
+            self.out.or_binds.insert(pat);
+        }
+        self.scopes.extend(names);
+        Ok(())
+    }
+
+    fn merge_alt(&mut self, names: &[(&str, u32)], bound: Vec<(&str, u32)>) -> Result<()> {
+        if names.len() != bound.len() {
+            bail!("the alternatives of an or-pattern bind different names");
+        }
+        for (name, local) in bound {
+            let Some(&(_, kept)) = names.iter().find(|(other, _)| *other == name) else { bail!("`{name}` is not bound in every alternative") };
+            self.unify(self.out.locals[local as usize].ty, self.out.locals[kept as usize].ty)?;
+            self.out.binds.values_mut().filter(|at| **at == local).for_each(|at| *at = kept);
         }
         Ok(())
     }

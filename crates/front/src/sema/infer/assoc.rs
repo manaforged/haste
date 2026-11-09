@@ -84,8 +84,12 @@ impl Infer<'_, '_> {
 
     fn param_value(&mut self, param: &str, (name, given): (&str, Vec<Ty>)) -> Result<Option<(Ty, Res)>> {
         let Some(ty) = self.param_ty(param).filter(|_| param != "Self") else { return Ok(None) };
-        let Some((of, args)) = self.bound_trait((param, ty), name, Self::has_member)? else { return Ok(None) };
-        self.trait_value(of, (Some(ty), Some(args)), (name, given)).map(Some)
+        if let Some((of, args)) = self.bound_trait((param, ty), name, Self::has_member)? {
+            return self.trait_value(of, (Some(ty), Some(args)), (name, given)).map(Some);
+        }
+        let Some((of, _)) = self.bound_trait((param, ty), name, Self::reaches_member)? else { return Ok(None) };
+        let Some(owner) = self.implied_traits(vec![of])?.into_iter().find(|&owner| self.cx.trait_member(owner, name).is_some()) else { return Ok(None) };
+        self.trait_value(owner, (Some(ty), None), (name, given)).map(Some)
     }
 
     fn trait_value(&mut self, of: ItemRef, (self_ty, args): (Option<Ty>, Option<Vec<Ty>>), (name, given): (&str, Vec<Ty>)) -> Result<(Ty, Res)> {

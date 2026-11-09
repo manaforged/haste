@@ -89,6 +89,9 @@ impl Writer {
     fn step(&mut self, cx: &mut Context<'_>, run: Run<'_>, at: u32) -> Result<u32> {
         let src = run.src;
         if src.kind(at) != TokenKind::Bang {
+            if src.text(at) == "macro" && is_name(src.kind(at + 1)) && opens(src.kind(at + 2)) {
+                return self.define_macro(src, at + 1);
+            }
             if src.text(at) == "use"
                 && let Some(next) = self.note_use(src, at)?
             {
@@ -139,10 +142,21 @@ impl Writer {
     }
 
     fn define(&mut self, src: &Source, name: u32) -> Result<()> {
+        self.local(src, (name, src.pair(name + 1)), rules::parse)
+    }
+
+    fn define_macro(&mut self, src: &Source, name: u32) -> Result<u32> {
+        let open = name + 1;
+        let last = if src.kind(open) == TokenKind::OpenParen { src.pair(src.pair(open) + 1) } else { src.pair(open) };
+        self.local(src, (name, last), rules::parse_macro)?;
+        Ok(last + 1)
+    }
+
+    fn local(&mut self, src: &Source, (name, last): (u32, u32), parse: fn(&Source, u32) -> Result<Vec<Rule>>) -> Result<()> {
         let mut copy = Tokens::default();
-        (name + 1..=src.pair(name + 1)).for_each(|at| copy.copy(src, at));
+        (name + 1..=last).for_each(|at| copy.copy(src, at));
         let source = copy.finish(src.path.clone())?;
-        let rules = rules::parse(&source, 0)?;
+        let rules = parse(&source, 0)?;
         self.locals.push(Local { name: plain(src.text(name)).to_owned(), source, rules });
         Ok(())
     }

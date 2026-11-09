@@ -162,7 +162,7 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
     };
     let body = match typed.shape {
         Shape::Body | Shape::Closure(_) => cx.body(source)?,
-        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) => std::rc::Rc::default(),
+        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) => std::rc::Rc::default(),
     };
     let src = cx.body_src(source);
     let signature = if is_static(cx, *item) { signature_of(cx, None, [])? } else { signature(cx, typed)? };
@@ -242,6 +242,7 @@ impl Lower<'_, '_> {
             Shape::Glue(_) => self.glue_target().map(|_| None),
             Shape::Virtual(slot) => self.virtual_call(*slot).map(|_| None),
             Shape::Untuple(res) => self.untuple_call(res.clone()),
+            &Shape::Ctor(variant) => self.ctor_body(variant),
             Shape::Closure(closure) => {
                 let root = closure.closure.body;
                 self.bind_captures()?;

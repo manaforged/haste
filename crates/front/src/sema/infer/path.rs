@@ -52,6 +52,9 @@ impl<'a> Infer<'_, 'a> {
         if let (true, Some(found)) = (prefix.is_empty(), self.declared_item(self.cx.names.symbols.text(*last))) {
             return Ok(Def::Item(found));
         }
+        if let Some(found) = self.local_variant(segments) {
+            return Ok(found);
+        }
         let found = if prefix.is_empty() {
             let local = if absolute { None } else { self.body_use(*last).values };
             local.or_else(|| self.cx.paths(self.home.krate).first(*last, self.home, &NamePath { segments, absolute, dollar }).values)
@@ -68,7 +71,19 @@ impl<'a> Infer<'_, 'a> {
     /// The type-namespace item that `path` names, a single segment first among the items that the body declares.
     pub(super) fn type_def(&mut self, path: &NamePath<'_>) -> Option<Def> {
         let inner = if let [name] = path.segments { self.declared_item(self.cx.names.symbols.text(*name)) } else { None };
-        inner.map(Def::Item).or_else(|| self.resolve_local(path))
+        inner.map(Def::Item).or_else(|| self.local_variant(path.segments)).or_else(|| self.resolve_local(path))
+    }
+
+    /// The variant that `Enum::Variant` names when the body declares the enum.
+    fn local_variant(&mut self, segments: &[Sym]) -> Option<Def> {
+        let [head, name] = segments else { return None };
+        let item = self.declared_item(self.cx.names.symbols.text(*head))?;
+        if self.cx.item(item).1.kind != ItemKind::Enum {
+            return None;
+        }
+        let def = self.cx.adt_def(item).ok()?;
+        let (src, text) = (self.cx.item(item).0, self.cx.names.symbols.text(*name));
+        def.variants.iter().find(|variant| plain(src.text(variant.name)) == text).map(|variant| Def::Variant(item, variant.index))
     }
 
     /// Resolves every segment of `path` in the type namespace, its first through the body's own `use` declarations when one binds it.
@@ -105,7 +120,11 @@ impl<'a> Infer<'_, 'a> {
         let Ok(home) = self.cx.module_of(root) else { return Vec::new() };
         let paths = self.cx.paths(home.krate);
         let mut out = Vec::new();
+        let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()).map(|item| self.cx.item(item).1.start);
         for import in 0..file.items.imports.len() as u32 {
+            if !import_visible(file, import, here) {
+                continue;
+            }
             let (segments, absolute, dollar, name) = import_parts(file, import, &self.cx.names.symbols);
             if name.zip(word).is_some_and(|(name, word)| name != word) {
                 continue;
@@ -141,6 +160,12 @@ impl<'a> Infer<'_, 'a> {
         let (ty, res) = self.value_path(path)?;
         if let Res::Local(local) = res {
             self.note_read(expr, local);
+        }
+        if let Res::Ctor(item, variant, args) = &res
+            && matches!(self.cx.types.kind(ty), Kind::FnPtr(..))
+        {
+            let reify = super::adt::ctor_fn(self.cx, (*item, *variant, args.clone()));
+            self.out.coercions.insert(expr, super::coerce::Coercion::Reify(reify));
         }
         self.out.res.insert(expr, res);
         Ok(ty)
@@ -389,7 +414,7 @@ impl<'a> Infer<'_, 'a> {
         let mut args = given.into_iter();
         let names: Vec<&str> = params.iter().map(|generic| file.source.text(generic.name)).collect();
         let generics = names.into_iter().map(|name| (name, args.next().unwrap_or_else(|| self.fresh(Kind::Var)))).collect();
-        let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty: None, block: None, item: None, root: item.declaring_body() };
+        let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty: None, block: None, item: Some(item), root: item.declaring_body() };
         self.with_frame(frame, |infer| infer.lower_ty(&arena, ty))
     }
 
@@ -518,4 +543,12 @@ pub fn parse_int(text: &str) -> Result<(u128, Option<Primitive>)> {
     let value = u128::from_str_radix(number, radix)?;
     let suffix = if suffix.is_empty() { None } else { Some(Primitive::named(suffix).ok_or_else(|| anyhow::anyhow!("bad suffix {suffix}"))?) };
     Ok((value, suffix))
+}
+
+/// Whether the `use` declaration `import` of a body's expansion `file` is in scope at token `here`, or in the body itself when `here` is none: it is unless a function declared in the body holds it and not `here`.
+fn import_visible(file: &crate::outline::tree::File, import: u32, here: Option<u32>) -> bool {
+    let items = &file.items.items;
+    let at = items[file.items.imports[import as usize].item as usize].start;
+    let holds = |entry: &crate::outline::item::Item, token: u32| entry.start <= token && token < entry.end;
+    items.iter().all(|entry| entry.kind != ItemKind::Fn || !holds(entry, at) || here.is_some_and(|here| holds(entry, here)))
 }

@@ -20,6 +20,7 @@ impl Infer<'_, '_> {
             Expr::For { label, pat, iter, body } => self.for_expr(expr, pat, iter, (label, body)),
             Expr::Range { from, to, inclusive } => self.range_expr(expr, (from, to), inclusive),
             Expr::OffsetOf { ty, fields } => self.offset_of(expr, ty, fields),
+            Expr::Underscore => Ok(expected.unwrap_or_else(|| self.fresh(Kind::Var))),
             ref other => bail!("unsupported expression {other:?}"),
         }
     }

@@ -3,7 +3,7 @@ use std::rc::Rc;
 use anyhow::{Result, bail};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::body::{Args, Body, Expr, ExprId, List, Param, TyId, UnOp};
+use crate::body::{Args, Body, Expr, ExprId, List, Param, PathId, TyId, UnOp};
 use crate::names::{ItemRef, ModRef};
 
 use super::super::Context;
@@ -315,8 +315,13 @@ impl Infer<'_, '_> {
         }
     }
 
+    /// Whether `found` coerces to `wanted` by a coercion or by giving up the `mut` of a reference.
     pub(super) fn coerces_to(&mut self, found: Ty, wanted: Ty) -> bool {
-        self.probe(|infer| matches!(infer.coercion(found, wanted), Ok(Some(_))))
+        let shared = match (self.cx.types.kind(self.resolve(found)), self.cx.types.kind(self.resolve(wanted))) {
+            (&Kind::Ref(Mut::Mut, a), &Kind::Ref(Mut::Not, b)) => Some((a, b)),
+            _ => None,
+        };
+        self.probe(|infer| matches!(infer.coercion(found, wanted), Ok(Some(_))) || shared.is_some_and(|(a, b)| infer.unify(a, b).is_ok()))
     }
 
     /// Unifies the signature of the callable `ty`, a closure, function item or function pointer, with `bound`, the function pointer type that an `Fn(A) -> B` bound on it spells.
@@ -376,11 +381,9 @@ impl Infer<'_, '_> {
         let sig = self.cx.signature(item)?;
         let src = &self.cx.file(item).source;
         let own: Vec<_> = super::scope::type_params(&sig.generics).collect();
-        let bounds = match at.checked_sub(frame.generics.len() - own.len()) {
-            Some(index) => super::scope::generic_bounds(&sig.body, src, &sig.predicates, own[index]),
-            None => super::scope::named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), frame.generics[at].0),
-        };
-        let home = frame.home;
+        let (home, name) = (frame.home, frame.generics[at].0);
+        let Some(index) = at.checked_sub(frame.generics.len() - own.len()) else { return self.with_frame(frame, |infer| infer.header_fn_bound(name, home)) };
+        let bounds = super::scope::generic_bounds(&sig.body, src, &sig.predicates, own[index]);
         self.with_frame(frame, |infer| {
             for bound in bounds {
                 if let Some(hint) = infer.fn_bound(&sig.body, home, bound)? {
@@ -389,6 +392,19 @@ impl Infer<'_, '_> {
             }
             Ok(None)
         })
+    }
+
+    /// The function pointer type that an `Fn` bound on the outer parameter `name` spells in a header of the frame: the function's own, or its impl's or trait's.
+    fn header_fn_bound(&mut self, name: &str, home: ModRef) -> Result<Option<Ty>> {
+        for (header, src) in self.headers()? {
+            let (arena, generics, predicates) = header.parts();
+            for bound in super::scope::named_bounds(arena, src, (generics, predicates), name) {
+                if let Some(hint) = self.in_source(src, |infer| infer.fn_bound(arena, home, bound))? {
+                    return Ok(Some(hint));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The function pointer type that an `impl Fn(A) -> B` return type of the body spells, which a closure it returns takes its signature from.
@@ -409,9 +425,24 @@ impl Infer<'_, '_> {
             return Ok(None);
         }
         let Some(&last) = arena.list(arena.path(path).segments).last() else { return Ok(None) };
-        let Some(Args::Paren { inputs, output }) = arena.segments[last as usize].args else { return Ok(None) };
-        let (inputs, output) = self.paren_sig(arena, inputs, output)?;
+        let (inputs, output) = match arena.segments[last as usize].args {
+            Some(Args::Paren { inputs, output }) => self.paren_sig(arena, inputs, output)?,
+            Some(Args::Angle(_)) => match self.angle_sig(arena, (of, path))? {
+                Some(sig) => sig,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
         Ok(Some(self.cx.types.intern(Kind::FnPtr(inputs, output))))
+    }
+
+    /// The inputs and output that the angle form `FnOnce<(A, B), Output = R>` of callable trait `of` names, once its argument tuple is known.
+    fn angle_sig(&mut self, arena: &Body, (of, path): (ItemRef, PathId)) -> Result<Option<(Vec<Ty>, Ty)>> {
+        let self_ty = self.fresh(Kind::Var);
+        let Some(&tuple) = self.bound_args(of, arena, path, self_ty)?.first() else { return Ok(None) };
+        let Kind::Tuple(inputs) = self.cx.types.kind(self.resolve(tuple)).clone() else { return Ok(None) };
+        let output = self.path_bindings(arena, path)?.into_iter().find(|(name, _)| name == "Output").map(|(_, ty)| ty);
+        Ok(Some((inputs, output.unwrap_or_else(|| self.fresh(Kind::Var)))))
     }
 }
 
@@ -424,15 +455,23 @@ pub fn by_reference(cx: &Context<'_>, item: ItemRef) -> Option<Mut> {
     }
 }
 
-/// The typed form of `Fn::call` or `FnMut::call_mut` at a closure and its argument tuple, which calls the closure's body with the tuple's fields.
+/// The typed form of a call trait method at a closure or function item and its argument tuple, which calls the closure's body or the function with the tuple's fields.
 pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed> {
-    let (Some(&closure), Some(&tuple), Some(by)) = (substs.first(), substs.get(1), by_reference(cx, item)) else { bail!("a closure trait call with no closure and arguments") };
-    let Some(info) = cx.closure(closure) else { bail!("a closure whose defining body was not inferred") };
-    let Some(call_once) = cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
-    let receiver = cx.types.intern(Kind::Ref(by, closure));
+    let (Some(&callee), Some(&tuple)) = (substs.first(), substs.get(1)) else { bail!("a call trait method with no callee and arguments") };
+    let (target, ret) = match cx.types.kind(callee).clone() {
+        Kind::FnDef(target, args) => {
+            let ret = super::detached(cx, target, |infer| infer.fn_types(target, &args))?.1;
+            (Res::Fn(target, args), ret)
+        }
+        _ => {
+            let Some(info) = cx.closure(callee) else { bail!("a closure whose defining body was not inferred") };
+            let Some(call_once) = cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
+            (Res::Fn(call_once, vec![callee, tuple]), info.closure.ret)
+        }
+    };
+    let receiver = by_reference(cx, item).map_or(callee, |by| cx.types.intern(Kind::Ref(by, callee)));
     let locals = vec![Local { ty: receiver, mutable: false }, Local { ty: tuple, mutable: false }];
-    let shape = Shape::Untuple(Res::Fn(call_once, vec![closure, tuple]));
-    Ok(Typed { locals, params: vec![0, 1], ret: Some(info.closure.ret), shape, ..Typed::default() })
+    Ok(Typed { locals, params: vec![0, 1], ret: Some(ret), shape: Shape::Untuple(target), ..Typed::default() })
 }
 
 /// Records the closures of the finished body `typed` of `parent` at `substs` in `cx`, so other bodies can call them.

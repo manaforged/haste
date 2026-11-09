@@ -59,7 +59,7 @@ pub struct Local {
     pub mutable: bool,
 }
 
-/// What the code of an instance is: a body, drop glue, a closure's body, or a call through the vtable slot of a trait object.
+/// What the code of an instance is: a body, drop glue, a closure's body, a call through the vtable slot of a trait object, or a constructor.
 #[derive(Clone, Debug, Default)]
 pub enum Shape {
     #[default]
@@ -67,8 +67,10 @@ pub enum Shape {
     Glue(Glue),
     Closure(ClosureBody),
     Virtual(u32),
-    /// A call of a closure through `Fn::call` or `FnMut::call_mut`, which spreads the argument tuple into this call of the closure's own body.
+    /// A call of a closure or function item through a call trait method, which spreads the argument tuple into this call of the closure's body or the function.
     Untuple(Res),
+    /// The tuple constructor of this variant, called as a function.
+    Ctor(u32),
 }
 
 /// The inferred types and resolutions of one function body at one set of type arguments.
@@ -88,6 +90,8 @@ pub struct Typed {
     /// The expressions whose value coerces to the type it is used at, and how.
     pub coercions: HashMap<ExprId, Coercion>,
     pub fields: HashMap<ExprId, u32>,
+    /// The field that each struct literal initializer fills, by its value expression, apart from `fields` because that value may itself be a field read.
+    pub inits: HashMap<ExprId, u32>,
     /// The byte offset that each `offset_of!` names.
     pub offsets: HashMap<ExprId, u64>,
     /// The fields that each range expression fills: one per end it gives, in order, then `exhausted` for an inclusive range.
@@ -96,6 +100,8 @@ pub struct Typed {
     pub pat_res: HashMap<PatId, Res>,
     pub pat_derefs: HashMap<PatId, u32>,
     pub ref_binds: HashMap<PatId, crate::sema::ty::Mut>,
+    /// The or-patterns whose alternatives bind names, which every alternative binds to the same locals.
+    pub or_binds: rustc_hash::FxHashSet<PatId>,
     pub pats: HashMap<PatId, Ty>,
     pub params: Vec<u32>,
     pub ret: Option<Ty>,
@@ -219,13 +225,18 @@ fn settle(cx: &mut Context<'_>, instance: (ItemRef, &[Ty]), mut typed: Typed) ->
 
 /// The typed form of an instance that the compiler writes instead of a body: drop glue, or the `call_once` of a closure.
 fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Option<Typed>> {
+    if matches!(cx.item(item).1.kind, crate::outline::item::ItemKind::Struct | crate::outline::item::ItemKind::Enum) {
+        return adt::ctor_typed(cx, item, substs).map(Some);
+    }
     if cx.lang(item) == Some("drop_glue") {
         let Some(&ty) = substs.first() else { bail!("drop glue with no type") };
         return drop::glue_typed(cx, item, ty).map(Some);
     }
-    match substs.first() {
-        Some(&ty) if matches!(cx.types.kind(ty), Kind::Closure(..)) && cx.call_once() == Some(item) => closure::closure_typed(cx, ty).map(Some),
-        Some(&ty) if matches!(cx.types.kind(ty), Kind::Closure(..)) && closure::by_reference(cx, item).is_some() => closure::untuple_typed(cx, item, substs).map(Some),
+    let Some(&ty) = substs.first() else { return Ok(None) };
+    let (once, by_ref) = (cx.call_once() == Some(item), closure::by_reference(cx, item).is_some());
+    match cx.types.kind(ty) {
+        Kind::Closure(..) if once => closure::closure_typed(cx, ty).map(Some),
+        Kind::Closure(..) | Kind::FnDef(..) if once || by_ref => closure::untuple_typed(cx, item, substs).map(Some),
         _ => Ok(None),
     }
 }
@@ -392,11 +403,23 @@ impl Infer<'_, '_> {
             (Kind::Ref(from, a), Kind::Ptr(to, b)) if from == to => self.unify(a, b),
             _ => self.unify(found, expected),
         }?;
+        self.settle_pending()
+    }
+
+    fn settle_pending(&mut self) -> Result<()> {
         self.settle_metadata()?;
         self.settle_projections()?;
         self.settle_opaques(false)?;
         self.settle_operators(false)?;
         self.settle_obligations()
+    }
+
+    /// The type `ty` resolved, after settling what is pending when it is still an unknown variable, as rustc does before it needs a type.
+    pub(super) fn known_ty(&mut self, ty: Ty) -> Result<Ty> {
+        if matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
+            self.settle_pending()?;
+        }
+        Ok(self.resolve(ty))
     }
 
     /// Coerces the value of `expr`, of type `found`, to `expected`, at each branch value it ends in, recording an array-to-slice unsizing.

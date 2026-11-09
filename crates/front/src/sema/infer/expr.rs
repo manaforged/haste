@@ -133,7 +133,11 @@ impl Infer<'_, '_> {
                 let array = self.cx.types.array(byte, len);
                 self.cx.types.intern(Kind::Ref(Mut::Not, array))
             }
-            other => bail!("unsupported literal {other:?}"),
+            Lit::CStr => {
+                let Some(cstr) = self.cx.lang_item("CStr") else { bail!("core has no `CStr`") };
+                let cstr = self.cx.types.intern(Kind::Adt(cstr, Vec::new()));
+                self.cx.types.intern(Kind::Ref(Mut::Not, cstr))
+            }
         })
     }
 
@@ -181,6 +185,10 @@ impl Infer<'_, '_> {
             None => self.unique_right(op, left),
         };
         let right = self.expr(rhs, hint)?;
+        if is_compare(op) && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..)) {
+            self.coerce_expr(rhs, right, left)?;
+            return Ok(self.cx.types.bool());
+        }
         if self.pending(op, (left, right))? {
             let out = if is_compare(op) { self.cx.types.bool() } else { self.fresh(Kind::Var) };
             self.operands.push((expr, op, (left, right), out));
@@ -317,7 +325,7 @@ impl Infer<'_, '_> {
     }
 
     fn call(&mut self, expr: ExprId, (callee, args): (ExprId, List), expected: Option<Ty>) -> Result<Ty> {
-        let found = self.expr(callee, None)?;
+        let found = self.callee(callee)?;
         let callee_ty = self.callee_base(expr, found);
         let (params, ret, def) = match self.cx.types.kind(callee_ty).clone() {
             Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
@@ -342,6 +350,14 @@ impl Infer<'_, '_> {
             self.expr(ExprId(arg), None)?;
         }
         Ok(ret)
+    }
+
+    fn callee(&mut self, callee: ExprId) -> Result<Ty> {
+        let found = self.expr(callee, None)?;
+        if matches!(self.out.res.get(&callee), Some(Res::Ctor(..))) {
+            self.out.coercions.remove(&callee);
+        }
+        Ok(found)
     }
 
     /// How many arguments past its `params` a call of `callee` with `given` arguments passes, which only a C-variadic foreign function takes.

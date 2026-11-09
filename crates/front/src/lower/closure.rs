@@ -98,9 +98,9 @@ impl Lower<'_, '_> {
     /// Lowers the body of `Fn::call` or `FnMut::call_mut` at a closure: the call `res` of the closure's body with the fields of the argument tuple.
     pub(super) fn untuple_call(&mut self, res: Res) -> Result<Option<Value>> {
         let Res::Fn(item, substs) = res else { bail!("a closure trait call that calls no function") };
-        let (Some(&closure), Some(&tuple)) = (substs.first(), substs.get(1)) else { bail!("a closure trait call with no closure and arguments") };
+        let tuple = self.typed.locals[self.typed.params[1] as usize].ty;
         let mut values = Vec::new();
-        if self.cx.closure_takes_env(closure) {
+        if self.cx.call_once() == Some(item) && self.cx.closure_takes_env(substs[0]) {
             let Some(receiver) = self.locals[self.typed.params[0] as usize] else { bail!("a closure trait call with no receiver") };
             values.extend(self.read(receiver));
         }

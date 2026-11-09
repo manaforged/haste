@@ -181,7 +181,7 @@ impl Lower<'_, '_> {
         let mut values = Vec::new();
         for at in self.body.list(fields).to_vec() {
             let init = self.body.fields[at as usize];
-            let Some(&index) = self.typed.fields.get(&init.value) else { bail!("field initializer has no field") };
+            let Some(&index) = self.typed.inits.get(&init.value) else { bail!("field initializer has no field") };
             values.push((index, self.expr(init.value)?));
         }
         let base = match base {
@@ -189,6 +189,16 @@ impl Lower<'_, '_> {
             None => None,
         };
         self.construct(self.ty_of(expr), variant, values, base)
+    }
+
+    /// Lowers the body of a constructor function: variant `variant` of the return type, built from the parameters.
+    pub fn ctor_body(&mut self, variant: u32) -> Result<Option<Value>> {
+        let Some(ret) = self.typed.ret else { bail!("a constructor function with no return type") };
+        let mut values = Vec::new();
+        for (index, &local) in self.typed.params.iter().enumerate() {
+            values.push((index as u32, self.locals[local as usize].and_then(|place| self.read(place))));
+        }
+        self.construct(ret, variant, values, None)
     }
 
     /// Lowers a call of the tuple constructor of variant `variant` with `args`.

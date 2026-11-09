@@ -135,8 +135,9 @@ fn prelude(paths: &Paths<'_>, tree: &Tree, edition: &str) -> Option<ModRef> {
         return Some(found);
     }
     let no_std = tree.files.get(tree.modules.first()?.file)?.items.inner.iter().any(|attr| matches!(attr, Attr::NoStd | Attr::NoCore));
-    let root = paths.symbols.intern(if no_std { "core" } else { "std" });
-    let (_, krate) = paths.deps.iter().find(|(name, _)| *name == root)?;
+    let (core, std) = (paths.symbols.intern("core"), paths.symbols.intern("std"));
+    let dep = |root| paths.deps.iter().find(|(name, _)| *name == root);
+    let (_, krate) = if no_std { dep(core) } else { dep(std).or_else(|| dep(core)) }?;
     let module = PRELUDES.iter().find(|(year, _)| *year == edition).map_or("rust_2021", |(_, module)| module);
     let prelude = paths.member(Def::Module(ModRef { krate: *krate as u32, module: 0 }), paths.symbols.intern("prelude")).types?.def;
     match paths.member(prelude, paths.symbols.intern(module)).types?.def {

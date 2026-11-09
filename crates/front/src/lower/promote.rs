@@ -11,11 +11,11 @@ use super::place::{Base, Place};
 use super::{Lower, repr};
 
 impl Lower<'_, '_> {
-    /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a constructor, or an aggregate or constructor call of them.
+    /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a constructor, an aggregate or constructor call of them, or a field of one.
     pub fn promotable(&self, expr: ExprId) -> bool {
         match *self.body.expr(expr) {
             Expr::Lit(..) => true,
-            Expr::Paren(inner) | Expr::Unary(UnOp::Neg, inner) => self.promotable(inner),
+            Expr::Paren(inner) | Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) => self.promotable(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Fn(item, _)) => self.cx.item(*item).1.kind == ItemKind::Const,
                 Some(Res::Ctor(..) | Res::Const(_)) => true,

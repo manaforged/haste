@@ -42,7 +42,7 @@ pub(super) enum Header {
     Fn(Rc<Signature>),
     Adt(Rc<AdtDef>),
     Impl(Rc<ImplHeader>),
-    Trait(Rc<TraitGenerics>),
+    Generics(Rc<TraitGenerics>),
 }
 
 impl Header {
@@ -52,7 +52,7 @@ impl Header {
             Header::Fn(sig) => (&sig.body, &sig.generics, &sig.predicates),
             Header::Adt(def) => (&def.body, &def.generics.params, &def.generics.predicates),
             Header::Impl(header) => (&header.body, &header.generics, &header.predicates),
-            Header::Trait(def) => (&def.0, &def.1.params, &def.1.predicates),
+            Header::Generics(def) => (&def.0, &def.1.params, &def.1.predicates),
         }
     }
 }
@@ -145,6 +145,7 @@ impl<'a> Infer<'_, 'a> {
         if let Some(item) = self.frame_item {
             let header = match self.cx.item(item).1.kind {
                 ItemKind::Struct | ItemKind::Enum | ItemKind::Union => Header::Adt(self.cx.adt_def(item)?),
+                ItemKind::Type => Header::Generics(Rc::new(self.cx.alias_generics(item)?)),
                 _ => Header::Fn(self.cx.signature(item)?),
             };
             headers.push((header, &self.cx.file(item).source));
@@ -152,7 +153,7 @@ impl<'a> Infer<'_, 'a> {
         if let Some(block) = self.block {
             headers.push((Header::Impl(self.cx.impl_header(block)?), &self.cx.impl_file(block).source));
         } else if let Some(of) = self.frame_item.and_then(|item| self.cx.owner_trait(item)) {
-            headers.push((Header::Trait(self.cx.trait_generics(of)?), &self.cx.file(of).source));
+            headers.push((Header::Generics(self.cx.trait_generics(of)?), &self.cx.file(of).source));
         }
         Ok(headers)
     }

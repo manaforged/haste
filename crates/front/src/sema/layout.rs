@@ -106,6 +106,7 @@ impl Context<'_> {
         let calc = LayoutCalculator::new(&dl);
         let fields = match self.types.kind(ty).clone() {
             Kind::Tuple(items) => items,
+            Kind::FnDef(..) => Vec::new(),
             Kind::Adt(item, args) => return self.adt_layout(item, &args),
             Kind::Closure(..) => return self.closure_layout(ty),
             Kind::Array(element, count) => {

@@ -74,6 +74,37 @@ impl Infer<'_, '_> {
                 found.push((of, std::iter::once(ty).chain(args).collect()));
             }
         }
+        found.extend(self.assoc_assumptions()?);
+        Ok(found)
+    }
+
+    /// The bounds that the associated types of the trait whose default method the frame types declare, as in `type Word: Into<u64>`, put on their values for the frame's `Self`.
+    fn assoc_assumptions(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        let (Some(of), Some(self_ty), None) = (self.frame_item.and_then(|item| self.cx.owner_trait(item)), self.self_ty, self.block) else { return Ok(Vec::new()) };
+        let def = self.cx.trait_generics(of)?;
+        let params: Vec<_> = type_params(&def.1.params).copied().collect();
+        let src = &self.cx.file(of).source;
+        let args: Option<Vec<Ty>> = params.iter().map(|param| self.generics.iter().find(|(name, _)| *name == src.text(param.name)).map(|&(_, ty)| ty)).collect();
+        let Some(args) = args else { return Ok(Vec::new()) };
+        let mut found = Vec::new();
+        for member in self.cx.children(of).filter(|&member| self.cx.item(member).1.kind == ItemKind::Type).collect::<Vec<_>>() {
+            let bounds = self.cx.trait_generics(member)?;
+            if bounds.1.supers.len == 0 {
+                continue;
+            }
+            let Some(value) = self.picked_alias(of, self_ty, &args, self.cx.name(member))? else { continue };
+            let frame = self.item_frame(of, (&params, &args), (Some(self_ty), None))?;
+            let home = frame.home;
+            self.with_frame(frame, |infer| {
+                for &bound in bounds.0.list(bounds.1.supers) {
+                    let Some((trait_of, path)) = infer.bound_trait_at(&bounds.0, bound, home) else { continue };
+                    if let Ok(args) = infer.bound_args(trait_of, &bounds.0, path, value) {
+                        found.push((trait_of, std::iter::once(value).chain(args).collect()));
+                    }
+                }
+                Ok(())
+            })?;
+        }
         Ok(found)
     }
 
@@ -216,7 +247,7 @@ impl Infer<'_, '_> {
     fn bind_bound(&mut self, arena: &Body, home: ModRef, (bound, ty): (u32, Ty)) -> Result<()> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else { return Ok(()) };
         if self.is_callable_trait(of) {
-            return Ok(());
+            return self.bind_callable(arena, (of, path), ty);
         }
         let args = self.bound_args(of, arena, path, ty)?;
         if !self.compiler_trait(of) && (self.has_vars(ty) || args.iter().any(|arg| self.has_vars(*arg))) {
@@ -224,6 +255,26 @@ impl Infer<'_, '_> {
         }
         if !self.bindings_hold(arena, path, (of, ty, &args))? {
             bail!("{} does not give the associated types that a bound of `{}` binds", self.show(ty), self.cx.name(of));
+        }
+        self.bind_constraints((arena, home), (of, path, &args), ty)
+    }
+
+    fn bind_callable(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty) -> Result<()> {
+        if angle_args(arena, path).is_some() {
+            let args = self.bound_args(of, arena, path, ty)?;
+            self.bindings_hold(arena, path, (of, ty, &args))?;
+        }
+        Ok(())
+    }
+
+    fn bind_constraints(&mut self, (arena, home): (&Body, ModRef), (of, path, args): (ItemRef, PathId, &[Ty]), ty: Ty) -> Result<()> {
+        for (name, bounds) in path_constraints(arena, path) {
+            let name = self.src.text(name).to_string();
+            let Some((owner, owner_args)) = self.assoc_owner((of, args.to_vec()), ty, &name, 0)? else { bail!("`{}` has no associated type `{name}`", self.cx.name(of)) };
+            let assoc = self.project(owner, ty, owner_args, &name)?;
+            for &bound in arena.list(bounds) {
+                self.bind_bound(arena, home, (bound, assoc))?;
+            }
         }
         Ok(())
     }
@@ -287,4 +338,22 @@ impl Infer<'_, '_> {
         }
         Ok(())
     }
+}
+
+/// The angle-bracketed arguments of the last segment of the bound path `path`, as in `FnOnce<A, Output = R>`.
+fn angle_args(arena: &Body, path: PathId) -> Option<crate::body::List> {
+    let &last = arena.list(arena.path(path).segments).last()?;
+    match arena.segments[last as usize].args {
+        Some(crate::body::Args::Angle(list)) => Some(list),
+        _ => None,
+    }
+}
+
+/// The associated type bounds that the last segment of the bound path `path` puts, as in `Iterator<Item: Try<Output = T>>`: each name and its bounds.
+fn path_constraints(arena: &Body, path: PathId) -> Vec<(u32, crate::body::List)> {
+    let Some(list) = angle_args(arena, path) else { return Vec::new() };
+    arena.list(list).iter().filter_map(|&at| match arena.args[at as usize] {
+        crate::body::GenericArg::Constraint { name, bounds } => Some((name, bounds)),
+        _ => None,
+    }).collect()
 }

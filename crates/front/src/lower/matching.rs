@@ -270,6 +270,7 @@ impl Lower<'_, '_> {
                 sub.map_or(Ok(()), |sub| self.bind_matched(sub, place, None))
             }
             Pat::Paren(inner) => self.bind_matched(inner, place, at),
+            Pat::Or(list) if self.typed.or_binds.contains(&pat) => self.bind_or(list, place),
             Pat::Ref { pat: inner, .. } => {
                 let pointee = self.pat_repr(inner)?;
                 let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
@@ -284,6 +285,24 @@ impl Lower<'_, '_> {
             }
             _ => Ok(()),
         }
+    }
+
+    fn bind_or(&mut self, list: List, place: Option<Place>) -> Result<()> {
+        let join = self.b.create_block();
+        let alts: Vec<PatId> = self.body.list(list).iter().map(|&at| PatId(at)).collect();
+        for (at, &alt) in alts.iter().enumerate() {
+            let next = (at + 1 < alts.len()).then(|| self.b.create_block());
+            if let Some(next) = next {
+                self.test(alt, place, next)?;
+            }
+            self.bind_matched(alt, place, None)?;
+            self.jump(join, &[]);
+            if let Some(next) = next {
+                self.enter(next);
+            }
+        }
+        self.enter(join);
+        Ok(())
     }
 
     fn sub_at(&mut self, at: Option<(Root, MovePath)>, step: Option<(u32, u32)>, sub: PatId) -> Result<Option<(Root, MovePath)>> {
@@ -301,6 +320,13 @@ impl Lower<'_, '_> {
         let Some(&local) = self.typed.binds.get(&pat) else { bail!("binding has no local") };
         let referenced = by_ref || self.typed.ref_binds.contains_key(&pat);
         let value = if referenced { Some(self.address_or_dangling(place, self.pat_ty(pat)?)?) } else { place.and_then(|place| self.read(place)) };
+        if let Some(bound) = self.locals[local as usize] {
+            if !referenced && crate::sema::infer::needs_drop(self.cx, self.pat_ty(pat)?)? {
+                bail!("moving out of an or-pattern is not supported yet");
+            }
+            value.into_iter().for_each(|value| self.write(bound, value));
+            return Ok(());
+        }
         self.declare(local, value)?;
         if let Some(at) = at.filter(|_| !referenced)
             && crate::sema::infer::needs_drop(self.cx, self.pat_ty(pat)?)?

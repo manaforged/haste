@@ -46,13 +46,16 @@ impl Lower<'_, '_> {
             Lit::Float => self.float_const(ty, parse_float(text)?),
             Lit::Char => Ok(self.ins().iconst(Type::I32, i64::from(u32::from(char_value(text)?)))),
             Lit::Byte => Ok(self.ins().iconst(Type::I8, i64::from(char_value(text)? as u8))),
-            Lit::Str | Lit::ByteStr => self.string_lit(lit == Lit::Str, text),
-            other => bail!("cannot lower literal {other:?} yet"),
+            Lit::Str | Lit::ByteStr | Lit::CStr => self.string_lit(lit, text),
         }
     }
 
-    fn string_lit(&mut self, wide: bool, text: &str) -> Result<Value> {
-        let bytes = string_bytes(text)?;
+    fn string_lit(&mut self, lit: Lit, text: &str) -> Result<Value> {
+        let mut bytes = string_bytes(text)?;
+        if lit == Lit::CStr {
+            bytes.push(0);
+        }
+        let wide = lit != Lit::ByteStr;
         let address = self.slots.data(&bytes);
         let data = self.ins().iconst(Type::I64, address);
         Ok(if wide { self.wide_pointer(data, bytes.len() as i64) } else { data })
@@ -351,6 +354,10 @@ impl Lower<'_, '_> {
 
     pub(super) fn assign(&mut self, lhs: ExprId, rhs: ExprId, op: Option<BinOp>) -> Result<Option<Value>> {
         let rhs_num = self.num(self.ty_of(rhs)).ok();
+        if op.is_none() && matches!(self.body.expr(lhs), Expr::Tuple(_) | Expr::Underscore) {
+            let value = self.expr(rhs)?;
+            return self.assign_parts(lhs, value).map(|_| None);
+        }
         let Some(value) = self.expr(rhs)? else { return Ok(None) };
         let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
         if op.is_none() && self.replace(lhs, place, value)? {
@@ -366,6 +373,33 @@ impl Lower<'_, '_> {
         };
         self.write(place, value);
         Ok(None)
+    }
+
+    fn assign_parts(&mut self, lhs: ExprId, value: Option<Value>) -> Result<()> {
+        match *self.body.expr(lhs) {
+            Expr::Underscore => Ok(()),
+            Expr::Paren(inner) => self.assign_parts(inner, value),
+            Expr::Tuple(items) => {
+                let ty = self.ty_of(lhs);
+                let whole = self.spill(value, ty)?;
+                for (index, &item) in self.body.list(items).to_vec().iter().enumerate() {
+                    let part = match whole {
+                        Some(whole) => self.part_place(whole, ty, (0, index as u32)).map(|part| self.read(part))?,
+                        None => None,
+                    };
+                    self.assign_parts(ExprId(item), part)?;
+                }
+                Ok(())
+            }
+            _ => {
+                let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
+                let Some(value) = value else { return Ok(()) };
+                if !self.replace(lhs, place, value)? {
+                    self.write(place, value);
+                }
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn cast(&mut self, expr: ExprId, inner: ExprId) -> Result<Option<Value>> {

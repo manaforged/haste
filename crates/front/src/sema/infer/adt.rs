@@ -109,7 +109,7 @@ impl<'a> Infer<'_, 'a> {
             let name = plain(self.src.text(field.name));
             let Some(index) = self.field_index(item, variant, name)? else { bail!("no field `{name}` on {}", self.cx.name(item)) };
             let ty = tys[index as usize];
-            self.out.fields.insert(field.value, index);
+            self.out.inits.insert(field.value, index);
             let found = self.expr(field.value, Some(ty))?;
             self.coerce_expr(field.value, found, ty)?;
         }
@@ -163,4 +163,21 @@ impl<'a> Infer<'_, 'a> {
         self.out.fields.insert(expr, index);
         Ok(self.adt_fields(item, &args)?[0][index as usize])
     }
+}
+
+/// The function that the tuple constructor of variant `variant` of `item` at `args` is when a path uses it as a value: `item` at `args` and then the variant.
+pub fn ctor_fn(cx: &mut super::super::Context<'_>, (item, variant, args): Ctor) -> Res {
+    let marker = cx.types.intern(Kind::Value(u128::from(variant)));
+    Res::Fn(item, args.into_iter().chain(std::iter::once(marker)).collect())
+}
+
+/// The typed form of the constructor function that `ctor_fn` names, which builds the variant from its parameters.
+pub fn ctor_typed(cx: &mut super::super::Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<super::Typed> {
+    let Some((&marker, args)) = substs.split_last() else { bail!("a constructor function with no variant") };
+    let Kind::Value(variant) = *cx.types.kind(marker) else { bail!("a constructor function with no variant") };
+    let variant = u32::try_from(variant)?;
+    let fields = super::detached(cx, item, |infer| infer.adt_fields(item, args))?.swap_remove(variant as usize);
+    let locals = fields.iter().map(|&ty| super::Local { ty, mutable: false }).collect();
+    let ret = cx.types.intern(Kind::Adt(item, args.to_vec()));
+    Ok(super::Typed { locals, params: (0..fields.len() as u32).collect(), ret: Some(ret), shape: super::Shape::Ctor(variant), ..super::Typed::default() })
 }

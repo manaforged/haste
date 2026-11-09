@@ -33,10 +33,10 @@ impl Infer<'_, '_> {
 
     /// The type whose field `field` the access `expr` on a value of type `found` reads, after it dereferences references, every `Box` whose own fields are private here, and `Deref` impls; records the steps on `expr`.
     pub(super) fn field_base(&mut self, expr: ExprId, found: Ty, field: &str) -> Result<Ty> {
-        let (mut ty, mut steps) = (self.resolve(found), 0);
+        let (mut ty, mut steps) = (self.known_ty(found)?, 0);
         loop {
             let next = match self.cx.types.kind(ty).clone() {
-                Kind::Ref(_, inner) => Some(inner),
+                Kind::Ref(_, inner) => Some(self.known_ty(inner)?),
                 Kind::Adt(item, _) if self.cx.boxed(ty).is_some() && !self.sees_private(item)? => self.cx.boxed(ty),
                 Kind::Adt(..) if !self.has_field(ty, field)? => self.deref_step(expr, steps, ty)?,
                 _ => None,

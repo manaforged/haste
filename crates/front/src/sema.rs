@@ -252,14 +252,27 @@ impl<'a> Context<'a> {
     /// The type parameters, arena and target type of the type alias `item`.
     pub fn alias_parts(&self, item: ItemRef) -> Result<(Vec<sig::Generic>, Body, crate::body::TyId)> {
         let (src, entry) = self.item(item);
-        let Some(at) = entry.name else { bail!("type alias with no name") };
-        let Some(eq) = (at + 1..entry.end).find(|&token| src.kind(token) == rustc_lexer::TokenKind::Eq) else { bail!("type `{}` has no `=`", src.text(at)) };
-        let params = match src.text(at + 1) {
-            "<" => sig::generics(src, at + 1, eq)?.1.params.into_iter().filter(|generic| generic.kind != sig::GenericKind::Lifetime).collect(),
-            _ => Vec::new(),
-        };
+        let (_, eq) = self.alias_eq(item)?;
+        let params = self.alias_generics(item)?.1.params.into_iter().filter(|generic| generic.kind != sig::GenericKind::Lifetime).collect();
         let (arena, ty) = crate::body::parse_ty(src, eq + 1, entry.end - 1)?;
         Ok((params, arena, ty))
+    }
+
+    /// The generic parameters and where clause of the type alias `item`, with the bounds that its target may rely on.
+    pub fn alias_generics(&self, item: ItemRef) -> Result<traits::TraitGenerics> {
+        let (src, _) = self.item(item);
+        let (at, eq) = self.alias_eq(item)?;
+        match src.text(at + 1) {
+            "<" => sig::generics(src, at + 1, eq),
+            _ => Ok(Default::default()),
+        }
+    }
+
+    fn alias_eq(&self, item: ItemRef) -> Result<(u32, u32)> {
+        let (src, entry) = self.item(item);
+        let Some(at) = entry.name else { bail!("type alias with no name") };
+        let Some(eq) = (at + 1..entry.end).find(|&token| src.kind(token) == rustc_lexer::TokenKind::Eq) else { bail!("type `{}` has no `=`", src.text(at)) };
+        Ok((at, eq))
     }
 
     /// The name of `item`, for messages.

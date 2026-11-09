@@ -94,7 +94,8 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    fn spill(&mut self, value: Option<Value>, ty: crate::sema::ty::Ty) -> Result<Option<Place>> {
+    /// A new frame slot for a value of `ty`, holding `value` when one is given.
+    pub(super) fn spill(&mut self, value: Option<Value>, ty: crate::sema::ty::Ty) -> Result<Option<Place>> {
         let whole = repr(self.cx, ty)?;
         let Some(slot) = self.slot(whole) else { return Ok(None) };
         let place = Place::slot(slot, whole);

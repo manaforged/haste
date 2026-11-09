@@ -137,6 +137,7 @@ impl Lower<'_, '_> {
                 let (Kind::Value(bits), Repr::Scalar(machine)) = (self.cx.types.kind(value).clone(), self.repr_of(expr)?) else { bail!("a const parameter whose value is not known") };
                 Ok(Some(self.int_const(machine, bits)))
             }
+            Some(Res::Ctor(..)) if self.typed.coercions.contains_key(&expr) => Ok(None),
             Some(Res::Ctor(_, variant, _)) => {
                 let variant = *variant;
                 self.construct(self.ty_of(expr), variant, Vec::new(), None)
