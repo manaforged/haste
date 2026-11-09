@@ -120,6 +120,12 @@ impl Shared {
     pub fn close(&mut self) {
         self.used = self.size;
     }
+
+    /// Maps fresh space of the same size for workers about to fork, keeping the old mapping alive for what it holds.
+    pub fn renew(&mut self) -> Result<(), String> {
+        (self.base, self.used, self.split) = (map_data(self.size, self.private)?, 0, false);
+        Ok(())
+    }
 }
 
 fn map_data(size: usize, private: bool) -> Result<usize, String> {

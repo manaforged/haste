@@ -267,7 +267,11 @@ fn main() -> Result<()> {
             if let Some(status) = serve::Request::parse_mode(&mode).map(|request| serve::ask(&root, request, &argv)).transpose()?.flatten() {
                 std::process::exit(status);
             }
-            match report(&mode, &root, &argv)? {
+            let reported = report(&mode, &root, &argv);
+            if let Err(error) = std::fs::remove_dir_all(graph::script::scratch()).or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) }) {
+                eprintln!("cannot remove the build script directory {}: {error}", graph::script::scratch().display());
+            }
+            match reported? {
                 0 => Ok(()),
                 status => std::process::exit(status),
             }
@@ -276,7 +280,7 @@ fn main() -> Result<()> {
 }
 
 fn report_mode(mode: &str, (workspace, targets): (&graph::Workspace, &Targets), root: &std::path::Path) -> Result<()> {
-    let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let threads = haste_front::cores();
     match mode {
         "graph" => Ok(print_graph(workspace)),
         "outline" => report_outline(workspace, targets, threads),

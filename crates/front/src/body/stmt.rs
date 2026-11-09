@@ -106,7 +106,11 @@ impl Cursor<'_> {
             return Ok((Stmt::Item(start, end), None));
         }
         if self.is_word("let") {
-            return Ok((self.let_stmt()?, None));
+            return Ok((self.let_stmt(false)?, None));
+        }
+        if self.is_word("super") && self.word_at(self.at + 1) == "let" {
+            self.at += 1;
+            return Ok((self.let_stmt(true)?, None));
         }
         let (expr, ends) = self.stmt_expr()?;
         if self.eat(";") {
@@ -176,13 +180,13 @@ impl Cursor<'_> {
         }
     }
 
-    fn let_stmt(&mut self) -> Result<Stmt> {
+    fn let_stmt(&mut self, extend: bool) -> Result<Stmt> {
         self.at += 1;
         let pat = self.pat()?;
         let ty = if self.eat(":") { Some(self.ty()?) } else { None };
         let init = if self.eat("=") { Some(self.expr()?) } else { None };
         let otherwise = if self.eat_word("else") { Some(self.block_expr(None, BlockKind::Plain)?) } else { None };
         self.expect(";")?;
-        Ok(Stmt::Let { pat, ty, init, otherwise })
+        Ok(Stmt::Let { pat, ty, init, otherwise, extend })
     }
 }

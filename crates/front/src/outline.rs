@@ -71,14 +71,14 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
     roots
 }
 
-const IMPLICIT: [&str; 3] = ["std", "core", "alloc"];
+const IMPLICIT: [&str; 4] = ["std", "core", "alloc", "proc_macro"];
 
 fn implicit(workspace: &Workspace, roots: &[Root]) -> Vec<(String, usize)> {
     let named = |name: &str| {
         let found = roots.iter().position(|root| root.role == Role::Lib && workspace.packages[workspace.graph.units[root.unit].package].sysroot && root.name == name);
         found.map(|at| (name.to_owned(), at))
     };
-    IMPLICIT.iter().chain(&["proc_macro"]).filter_map(|name| named(name)).collect()
+    IMPLICIT.iter().filter_map(|name| named(name)).collect()
 }
 
 fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize)>> {
@@ -100,8 +100,7 @@ fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize
                 deps.push((root.name.replace('-', "_"), lib));
             }
             if !package.sysroot || root.role == Role::Script {
-                let wanted = |name: &str| IMPLICIT.contains(&name) || name == "proc_macro";
-                deps.extend(implicit.iter().filter(|(name, _)| wanted(name)).cloned());
+                deps.extend(implicit.iter().cloned());
             }
             deps
         })

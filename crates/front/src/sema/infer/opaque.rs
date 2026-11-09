@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 
 use crate::names::ItemRef;
 
@@ -18,6 +18,8 @@ pub(super) struct Opaque {
     pub sig: Option<Ty>,
     /// Its other trait bounds, each with `Self` first, which method calls on it read before it is revealed.
     pub bounds: Vec<(ItemRef, Vec<Ty>)>,
+    /// The declared output of an async fn, which `.await` gives before the future is revealed.
+    pub output: Option<Ty>,
 }
 
 impl Infer<'_, '_> {
@@ -55,7 +57,7 @@ impl Infer<'_, '_> {
     pub(super) fn settle_opaques(&mut self, force: bool) -> Result<()> {
         let mut at = 0;
         while at < self.opaques.len() {
-            let Opaque { item, substs, ret, .. } = self.opaques[at].clone();
+            let Opaque { item, substs, ret, output, .. } = self.opaques[at].clone();
             if !force && substs.iter().any(|ty| self.has_vars(*ty)) {
                 at += 1;
                 continue;
@@ -64,6 +66,10 @@ impl Infer<'_, '_> {
             let substs: Vec<Ty> = substs.into_iter().map(|ty| self.zonk(ty)).collect();
             self.share_closures(&substs);
             let found = revealed(self.cx, item, &substs)?;
+            if let Some(output) = output.filter(|_| self.cx.closure(found).is_none()) {
+                let output = self.zonk(output);
+                self.cx.futures.insert(found, output);
+            }
             self.unify(ret, found)?;
         }
         Ok(())
@@ -109,6 +115,11 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
+    /// The declared output of the pending async fn future `ty`.
+    pub(super) fn opaque_output(&self, ty: Ty) -> Option<Ty> {
+        self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).and_then(|opaque| opaque.output)
+    }
+
     /// The function pointer type of the `Fn` bound on the pending `impl Trait` return value `ty`.
     pub(super) fn opaque_sig(&self, ty: Ty) -> Option<Ty> {
         self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).and_then(|opaque| opaque.sig)
@@ -120,7 +131,7 @@ pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Re
     let key = (item, substs.to_vec());
     match cx.reveals.get(&key) {
         Some(Some(ty)) => return Ok(*ty),
-        Some(None) => bail!("the `impl Trait` return type of `{}` depends on itself", cx.name(item)),
+        Some(None) => return async_future(cx, item, substs)?.ok_or_else(|| anyhow!("the `impl Trait` return type of `{}` depends on itself", cx.name(item))),
         None => {}
     }
     cx.reveals.insert(key.clone(), None);
@@ -130,6 +141,24 @@ pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Re
         Err(_) => cx.reveals.remove(&key),
     };
     ret
+}
+
+/// The future of the async fn `item` at `substs`, which names its body's coroutine without inferring it, as a call inside that body's own inference needs; none for other functions.
+fn async_future(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Option<Ty>> {
+    if !cx.signature(item)?.is_async {
+        return Ok(None);
+    }
+    let root = cx.body(item)?.root.ok_or_else(|| anyhow!("`{}` has no body", cx.name(item)))?;
+    Ok(Some(cx.types.intern(Kind::Closure(item, substs.to_vec(), root.0))))
+}
+
+/// The function that a `#[define_opaque]` attribute in the same file names as the definer of the type alias `alias`, whose body holds `impl Trait`.
+pub(super) fn opaque_definer(cx: &Context<'_>, alias: ItemRef) -> Option<ItemRef> {
+    let (src, entry) = cx.item(alias);
+    let name = crate::names::plain(src.text(entry.name?));
+    let items = &cx.file(alias).items.items;
+    let definers = items.iter().enumerate().filter(|(_, item)| item.kind == crate::outline::item::ItemKind::Fn).map(|(at, _)| ItemRef { item: at as u32, ..alias });
+    definers.into_iter().find(|&candidate| cx.attr_at(candidate, "define_opaque").is_some_and(|at| src.text(at + 2) == name))
 }
 
 fn holds_closure(cx: &Context<'_>, ty: Ty, (item, args): (ItemRef, &[Ty])) -> bool {

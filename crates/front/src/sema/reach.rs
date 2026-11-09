@@ -20,10 +20,10 @@ pub struct Reached {
 }
 
 impl Reached {
-    /// `root` and every function it reaches through the bodies that type-checked, each after every function it reaches.
-    pub fn closure(&self, root: usize) -> Vec<usize> {
+    /// `roots` and every function they reach through the bodies that type-checked, each once and after every function it reaches.
+    pub fn closure(&self, roots: &[usize]) -> Vec<usize> {
         let mut seen = vec![false; self.list.len()];
-        let (mut stack, mut found) = (vec![(root, false)], Vec::new());
+        let (mut stack, mut found) = (roots.iter().rev().map(|&root| (root, false)).collect::<Vec<_>>(), Vec::new());
         while let Some((at, done)) = stack.pop() {
             if done {
                 found.push(at);
@@ -36,6 +36,11 @@ impl Reached {
             stack.extend(self.calls[at].iter().map(|&callee| (callee, false)));
         }
         found
+    }
+
+    /// The first function in `closure` that did not type-check or, by `broken`, did not compile, with why.
+    pub fn failure<'r>(&'r self, closure: &[usize], broken: &'r HashMap<usize, String>) -> Option<(usize, &'r String)> {
+        closure.iter().find_map(|&at| Some((at, self.list[at].1.as_ref().err().or_else(|| broken.get(&at))?)))
     }
 
     fn link(&mut self, indices: &[usize]) {

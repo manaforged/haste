@@ -188,12 +188,7 @@ impl Infer<'_, '_> {
     }
 
     fn right_operand(&mut self, expr: ExprId, op: BinOp, (left, rhs): (Ty, ExprId)) -> Result<Ty> {
-        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
-        let hint = match (self.builtin_left(op, left) && !shift).then_some(left) {
-            Some(hint) => Some(hint),
-            None => self.unique_right(op, left),
-        };
-        let right = self.expr(rhs, hint)?;
+        let right = self.right_value(op, left, rhs)?;
         if is_compare(op) && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..)) {
             self.coerce_expr(rhs, right, left)?;
             return Ok(self.cx.types.bool());
@@ -206,12 +201,32 @@ impl Infer<'_, '_> {
         self.operator_type(expr, op, (left, right))
     }
 
-    /// The right operand type of comparison `op` when one impl of its trait applies to the ADT `left`, as for `Option<T>`, which rustc learns before it reads the right operand.
+    /// The type of the right operand `rhs` of `op`, coerced to the one type an overloaded operator on `left` takes there.
+    fn right_value(&mut self, op: BinOp, left: Ty, rhs: ExprId) -> Result<Ty> {
+        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        let builtin = self.builtin_left(op, left);
+        let hint = match (builtin && !shift).then_some(left) {
+            Some(hint) => Some(hint),
+            None => self.unique_right(op, left),
+        };
+        let right = self.expr(rhs, hint)?;
+        match hint.filter(|_| !is_compare(op) && !builtin) {
+            Some(want) => self.coerce_expr(rhs, right, want).map(|()| want),
+            None => Ok(right),
+        }
+    }
+
+    /// The right operand type of `op` when one impl of its trait applies to the ADT `left`, as for `Option<T>` or `String + &str`, which rustc learns before it reads the right operand.
     fn unique_right(&mut self, op: BinOp, left: Ty) -> Option<Ty> {
-        if !is_compare(op) || !matches!(self.cx.types.kind(self.resolve(left)), Kind::Adt(..)) {
+        let of = operator_trait(op).and_then(|(lang, _)| self.cx.lang_item(lang))?;
+        self.only_right(of, left)
+    }
+
+    /// The right operand type of the operator trait `of` when one impl of it applies to the ADT `left`.
+    fn only_right(&mut self, of: ItemRef, left: Ty) -> Option<Ty> {
+        if !matches!(self.cx.types.kind(self.resolve(left)), Kind::Adt(..)) {
             return None;
         }
-        let of = operator_trait(op).and_then(|(lang, _)| self.cx.lang_item(lang))?;
         self.probe(|infer| {
             let right = infer.fresh(Kind::Var);
             infer.select(of, left, &[right]).ok().flatten()?;
@@ -321,20 +336,28 @@ impl Infer<'_, '_> {
     fn assign(&mut self, expr: ExprId, (lhs, rhs): (ExprId, ExprId), op: Option<BinOp>) -> Result<Ty> {
         let place = self.expr(lhs, None)?;
         self.note_mut(lhs)?;
-        let builtin = op.is_none_or(|bin| self.builtin_compound(bin, place));
-        let shift = matches!(op, Some(BinOp::Shl | BinOp::Shr));
-        let value = self.expr(rhs, (builtin && !shift).then_some(place))?;
         match op {
-            Some(bin) if !builtin => self.overloaded_assign(expr, bin, (place, value))?,
-            Some(BinOp::Shl | BinOp::Shr) => {}
-            _ => self.coerce_expr(rhs, value, place)?,
+            Some(bin) if !self.builtin_compound(bin, place) => self.overloaded_assign(expr, bin, (place, rhs))?,
+            Some(BinOp::Shl | BinOp::Shr) => drop(self.expr(rhs, None)?),
+            _ => {
+                let value = self.expr(rhs, Some(place))?;
+                self.coerce_expr(rhs, value, place)?;
+            }
         }
         Ok(self.cx.types.unit())
     }
 
-    fn overloaded_assign(&mut self, expr: ExprId, op: BinOp, (place, value): (Ty, Ty)) -> Result<()> {
+    /// Types `place op= rhs` through the operator's assign trait, coercing `rhs` to the right operand type when one impl fixes it, as rustc does.
+    fn overloaded_assign(&mut self, expr: ExprId, op: BinOp, (place, rhs): (Ty, ExprId)) -> Result<()> {
         let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
-        let Some((of, method)) = self.operator_impl((&format!("{lang}_assign"), &format!("{name}_assign")), (place, value))? else {
+        let (lang, name) = (format!("{lang}_assign"), format!("{name}_assign"));
+        let right = self.cx.lang_item(&lang).and_then(|of| self.only_right(of, place));
+        let found = self.expr(rhs, right)?;
+        let value = match right {
+            Some(want) => self.coerce_expr(rhs, found, want).map(|()| want)?,
+            None => found,
+        };
+        let Some((of, method)) = self.operator_impl((&lang, &name), (place, value))? else {
             bail!("unsupported compound assignment on {}", self.show(place))
         };
         if self.has_vars(value) {

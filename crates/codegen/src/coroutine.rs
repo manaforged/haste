@@ -106,6 +106,9 @@ fn push(func: &mut Function, insts: &mut Vec<crate::ir::Inst>, op: Op, ty: Optio
 
 fn rewrite(func: &mut Function, block: Block, (frame, anchor): (&Frame, StackSlot), free: Option<i64>) {
     let old = std::mem::take(&mut func.blocks[block.index()].insts);
+    if old.is_empty() {
+        return;
+    }
     let mut insts = Vec::new();
     let fp = push(func, &mut insts, Op::StackLoad(anchor, 0), Some(Type::I64)).expect("a load has a result");
     for value in func.blocks[block.index()].params.clone() {

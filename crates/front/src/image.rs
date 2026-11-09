@@ -93,8 +93,7 @@ impl Image {
         let mut shared = Shared::new(SHARED_BYTES).map_err(|error| anyhow!(error))?;
         let capacity = reached.list.len().max(TABLE_SLOTS);
         let table = shared.alloc(capacity * size_of::<AtomicUsize>()).map_err(|error| anyhow!(error))?;
-        let mut memory = Memory::default();
-        memory.reserve(CODE_BYTES).map_err(|error| anyhow!(error))?;
+        let memory = Memory::default();
         let state = Shared::private(STATE_BYTES).map_err(|error| anyhow!(error))?;
         Ok(Image { table, capacity, memory, shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), statics: Default::default() })
     }
@@ -103,6 +102,14 @@ impl Image {
         assert!(index < self.capacity, "call table index {index} past its {} slots", self.capacity);
         // SAFETY: index is below capacity, and new allocated capacity zeroed, aligned AtomicUsize slots at table, in a mapping that lives as long as the process.
         unsafe { &*(self.table as *const AtomicUsize).add(index) }
+    }
+
+    /// An image of every function in `reached`, compiled, with why each one that did not compile failed.
+    pub fn build(cx: &mut Context<'_>, reached: &Reached) -> Result<(Image, HashMap<usize, String>)> {
+        let mut image = Image::new(reached)?;
+        let all: Vec<usize> = (0..reached.list.len()).collect();
+        let broken = image.compile(cx, reached, &all).into_iter().collect();
+        Ok((image, broken))
     }
 
     /// Lowers and encodes the reached functions `indices` that type-checked, on every core when there are many, links them, and returns the errors of those that did not compile, by index.
@@ -188,32 +195,8 @@ impl Image {
     }
 
     fn run_from(&self, cases: &[(usize, Vec<usize>, &str)], inputs: &[i64]) -> Result<(usize, i32)> {
-        let mut ends = [0; 2];
-        // SAFETY: ends is a live two-element array for the new descriptors.
-        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-            bail!("pipe failed: {}", std::io::Error::last_os_error());
-        }
         std::io::Write::flush(&mut std::io::stdout())?;
-        // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            bail!("fork failed: {}", std::io::Error::last_os_error());
-        }
-        if pid == 0 {
-            // SAFETY: ends[0] is the read end this child does not use, and ends[1] is the write end it owns from here on.
-            let progress = unsafe {
-                libc::close(ends[0]);
-                std::fs::File::from_raw_fd(ends[1])
-            };
-            let wrote = self.run_in_child(cases, inputs, progress);
-            // SAFETY: _exit ends the child without running the parent's destructors.
-            unsafe { libc::_exit(i32::from(wrote.is_err())) }
-        }
-        // SAFETY: ends[1] is the write end that only the child uses, and ends[0] is the read end this process owns from here on.
-        let mut progress = unsafe {
-            libc::close(ends[1]);
-            std::fs::File::from_raw_fd(ends[0])
-        };
+        let (pid, mut progress) = fork_piped(|progress| self.run_in_child(cases, inputs, progress))?;
         let mut done = Vec::new();
         std::io::Read::read_to_end(&mut progress, &mut done)?;
         Ok((done.len(), wait(pid)))
@@ -289,4 +272,34 @@ fn wait(pid: libc::pid_t) -> i32 {
     // SAFETY: pid is a child of this process, and status is a live local.
     unsafe { libc::waitpid(pid, &mut status, 0) };
     if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) }
+}
+
+/// Forks a child that runs `child` on the write end of a new pipe and exits with status 1 when it fails, and returns its pid and the read end.
+pub(crate) fn fork_piped<E>(child: impl FnOnce(std::fs::File) -> Result<(), E>) -> Result<(libc::pid_t, std::fs::File)> {
+    let mut ends = [0; 2];
+    // SAFETY: ends is a live two-element array for the new descriptors.
+    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+        bail!("pipe failed: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        bail!("fork failed: {}", std::io::Error::last_os_error());
+    }
+    if pid == 0 {
+        // SAFETY: ends[0] is the read end this child does not use, and ends[1] is the write end it owns from here on.
+        let out = unsafe {
+            libc::close(ends[0]);
+            std::fs::File::from_raw_fd(ends[1])
+        };
+        let wrote = child(out);
+        // SAFETY: _exit ends the child without running the parent's destructors.
+        unsafe { libc::_exit(i32::from(wrote.is_err())) }
+    }
+    // SAFETY: ends[1] is the write end that only the child uses, and ends[0] is the read end this process owns from here on.
+    let input = unsafe {
+        libc::close(ends[1]);
+        std::fs::File::from_raw_fd(ends[0])
+    };
+    Ok((pid, input))
 }

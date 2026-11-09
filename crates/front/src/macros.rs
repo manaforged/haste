@@ -29,6 +29,11 @@ pub fn front(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Res
 
 /// Reaches from the instances `roots` gives, answering what each pass asks for until a pass settles or nothing new can load, then hands that pass's context and what it reached to `finish`.
 pub fn reach_settled<R>(outline: &mut Outline, names: &mut Names, roots: impl Fn(&mut Context<'_>) -> Vec<Instance>, finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
+    reach_answered(outline, names, (roots, answer), finish)
+}
+
+/// Reaches from `roots` as `reach_settled` does, answering each pass's asks with `ask`, which says whether anything new loaded.
+fn reach_answered<R>(outline: &mut Outline, names: &mut Names, (roots, ask): (impl Fn(&mut Context<'_>) -> Vec<Instance>, impl Fn(&mut Outline, &mut Names, Asks) -> Result<bool>), finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
     let (mut store, mut last) = (Store::default(), false);
     loop {
         let mut cx = Context::new(outline, names, store);
@@ -38,7 +43,7 @@ pub fn reach_settled<R>(outline: &mut Outline, names: &mut Names, roots: impl Fn
             return finish(cx, reached);
         }
         let (mut kept, asks) = cx.release();
-        last = !answer(outline, names, asks)?;
+        last = !ask(outline, names, asks)?;
         kept.forget_lookups();
         store = kept;
     }
@@ -174,35 +179,19 @@ fn run(outline: &mut Outline, names: &mut Names, bound: &[(ItemRef, ProcKind)], 
     let mut roots: Vec<Instance> = pair.iter().map(|item| (*item, Vec::new())).collect();
     roots.extend(bound.iter().map(|(run, _)| (*run, Vec::new())));
     roots.dedup();
-    let mut store = Store::default();
-    loop {
-        let mut cx = Context::new(outline, names, store);
-        let reached = reach(&mut cx, &roots);
-        if cx.settled() {
-            return execute(&mut cx, &reached, (pair, bound), inputs);
-        }
-        let (mut kept, asks) = cx.release();
-        if !names.answer(outline, asks)? {
-            let mut cx = Context::new(outline, names, kept);
-            let reached = reach(&mut cx, &roots);
-            return execute(&mut cx, &reached, (pair, bound), inputs);
-        }
-        kept.forget_lookups();
-        store = kept;
-    }
+    let ask = |outline: &mut Outline, names: &mut Names, asks: Asks| names.answer(outline, asks);
+    reach_answered(outline, names, (|_: &mut Context<'_>| roots.clone(), ask), |mut cx, reached| execute(&mut cx, &reached, (pair, bound), inputs))
 }
 
 fn execute(cx: &mut Context<'_>, reached: &Reached, (pair, bound): ([ItemRef; 2], &[(ItemRef, ProcKind)]), inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
-    let mut image = Image::new(reached)?;
-    let all: Vec<usize> = (0..reached.list.len()).collect();
-    let broken: HashMap<usize, String> = image.compile(cx, reached, &all).into_iter().collect();
+    let (image, broken) = Image::build(cx, reached)?;
     let mut results: Vec<Result<String, String>> = Vec::new();
     let mut jobs = Vec::new();
     for (&(call, kind), texts) in bound.iter().zip(inputs) {
         let entry = reached.index[&(pair[usize::from(kind == ProcKind::Attribute)], Vec::new())];
         let run = reached.index[&(call, Vec::new())];
-        let closure: Vec<usize> = reached.closure(entry).into_iter().chain(reached.closure(run)).collect();
-        let failure = closure.iter().find_map(|at| reached.list[*at].1.as_ref().err().or_else(|| broken.get(at)));
+        let closure = reached.closure(&[entry, run]);
+        let failure = reached.failure(&closure, &broken).map(|(_, error)| error);
         match failure {
             Some(error) => results.push(Err(error.clone())),
             None => {

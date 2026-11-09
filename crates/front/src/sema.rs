@@ -1,6 +1,7 @@
 //! Semantic analysis of reached function bodies at concrete types, lowered to `haste-codegen` SSA.
 
 pub mod adt;
+mod body_scope;
 mod builtin;
 mod expand;
 mod format;
@@ -55,6 +56,7 @@ struct Lookups {
     drops: HashMap<ty::Ty, bool>,
     closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
+    futures: HashMap<ty::Ty, ty::Ty>,
     lang_of: HashMap<ItemRef, Option<u32>>,
     scope_traits: HashMap<ModRef, Rc<[ItemRef]>>,
     type_defs: HashMap<TypeKey, crate::names::Def>,
@@ -86,6 +88,7 @@ impl Store {
         kept.drops.retain(|ty, _| !naming.names(*ty));
         kept.closures.retain(|ty, _| !naming.names(*ty));
         kept.reveals.retain(|instance, _| !naming.touches(instance));
+        kept.futures.retain(|ty, _| !naming.names(*ty));
         kept.impl_traits.retain(|block, _| block_kept(block));
         kept.heads.retain(|holder, _| match *holder {
             impls::Holder::Crate(krate) => !edited.touches_crate(krate),
@@ -188,6 +191,7 @@ pub struct Context<'a> {
     finals: HashMap<reach::Instance, Rc<infer::Typed>>,
     tails: HashMap<ty::Ty, ty::Ty>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
+    futures: HashMap<ty::Ty, ty::Ty>,
     kids: std::cell::RefCell<HashMap<usize, Rc<Kids>>>,
     lang_of: std::cell::RefCell<HashMap<ItemRef, Option<u32>>>,
     scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
@@ -196,7 +200,6 @@ pub struct Context<'a> {
     pub type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
     impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
     impl_members: std::cell::RefCell<HashMap<impls::ImplRef, Rc<HashMap<&'a str, ItemRef>>>>,
-    macro_outputs: std::cell::RefCell<HashMap<(usize, u32), &'a crate::outline::source::Source>>,
 }
 
 /// Where a type path is resolved and what it says: home module, body root, nested instance, segments, leading `::` and `$crate`.
@@ -209,10 +212,10 @@ impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, store: Store) -> Context<'a> {
         let Store { types, signatures, bodies, adts, layouts, tails, headers, finals, lookups } = store;
-        let Lookups { modules, heads, owners, trait_defs, discriminants, langs, drops, closures, reveals, lang_of, scope_traits, type_defs, impl_traits } = lookups;
+        let Lookups { modules, heads, owners, trait_defs, discriminants, langs, drops, closures, reveals, futures, lang_of, scope_traits, type_defs, impl_traits } = lookups;
         let (lang_of, scope_traits, type_defs) = (lang_of.into(), scope_traits.into(), type_defs.into());
-        let (kids, trait_members, impl_members, asks, macro_outputs) = Default::default();
-        Context { outline, names, types, asks, modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants, langs, drops, closures, finals, reveals, tails, kids, lang_of, scope_traits, trait_members, type_defs, impl_traits, impl_members, macro_outputs }
+        let (kids, trait_members, impl_members, asks) = Default::default();
+        Context { outline, names, types, asks, modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants, langs, drops, closures, finals, reveals, futures, tails, kids, lang_of, scope_traits, trait_members, type_defs, impl_traits, impl_members }
     }
 
     /// Whether no lookup in this pass asked the front end for anything, so another pass would find the same.
@@ -232,6 +235,7 @@ impl<'a> Context<'a> {
             drops: self.drops,
             closures: self.closures,
             reveals: self.reveals,
+            futures: self.futures,
             lang_of: self.lang_of.into_inner(),
             scope_traits: self.scope_traits.into_inner(),
             type_defs: self.type_defs.into_inner(),
@@ -292,6 +296,11 @@ impl<'a> Context<'a> {
     /// What the body that defines the closure type `ty` inferred for it.
     pub fn closure(&self, ty: ty::Ty) -> Option<Rc<infer::ClosureInfo>> {
         self.closures.get(&ty).cloned()
+    }
+
+    /// The output of the async fn future `ty` that a call named while its body was still being inferred, from the declared return type.
+    pub fn future_output(&self, ty: ty::Ty) -> Option<ty::Ty> {
+        self.futures.get(&ty).copied()
     }
 
     /// Records what the body that defines the closure type `ty` inferred for it.
@@ -402,7 +411,7 @@ impl<'a> Context<'a> {
         let (src, entry) = self.item(item);
         let parsed = match (entry.kind, entry.name) {
             (ItemKind::Const | ItemKind::Static, Some(name)) => sig::const_signature(src, name, entry.end)?,
-            _ => sig::signature(src, entry.start, entry.body.unwrap_or(entry.end))?,
+            _ => sig::signature(src, entry.start, entry.body.unwrap_or(entry.end), &self.outline.crates[item.krate as usize].env)?,
         };
         let parsed = Rc::new(parsed);
         self.signatures.insert(item, parsed.clone());

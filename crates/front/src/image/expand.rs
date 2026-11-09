@@ -1,7 +1,6 @@
 //! Running procedural macros in a forked child: each job calls an entry of haste's `proc_macro` crate on input text and sends back the output text.
 
 use std::io::{Read, Write};
-use std::os::fd::FromRawFd;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Result, bail};
@@ -37,32 +36,8 @@ impl Image {
     }
 
     fn macros_from(&self, jobs: &[Job<'_>]) -> Result<(Vec<Vec<u8>>, i32)> {
-        let mut ends = [0; 2];
-        // SAFETY: ends is a live two-element array for the new descriptors.
-        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-            bail!("pipe failed: {}", std::io::Error::last_os_error());
-        }
         std::io::stdout().flush()?;
-        // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            bail!("fork failed: {}", std::io::Error::last_os_error());
-        }
-        if pid == 0 {
-            // SAFETY: ends[0] is the read end this child does not use, and ends[1] is the write end it owns from here on.
-            let out = unsafe {
-                libc::close(ends[0]);
-                std::fs::File::from_raw_fd(ends[1])
-            };
-            let wrote = self.macros_in_child(jobs, out);
-            // SAFETY: _exit ends the child without running the parent's destructors.
-            unsafe { libc::_exit(i32::from(wrote.is_err())) }
-        }
-        // SAFETY: ends[1] is the write end that only the child uses, and ends[0] is the read end this process owns from here on.
-        let mut input = unsafe {
-            libc::close(ends[1]);
-            std::fs::File::from_raw_fd(ends[0])
-        };
+        let (pid, mut input) = super::fork_piped(|out| self.macros_in_child(jobs, out))?;
         let mut bytes = Vec::new();
         input.read_to_end(&mut bytes)?;
         Ok((frames(&bytes), super::wait(pid)))

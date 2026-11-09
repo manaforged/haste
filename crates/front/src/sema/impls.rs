@@ -6,12 +6,13 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::body::sig::{self, ImplHeader};
 use crate::body::{self as syntax, Body};
 use crate::names::path::Path as NamePath;
-use crate::names::{Def, ItemRef, ModRef, Primitive};
+use crate::names::{Def, ItemRef, ModRef, Ns, Primitive};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 use crate::outline::tree::File;
 
 use super::Context;
+use super::body_scope::{BodyPath, outside};
 use super::infer::segments;
 use super::ty::{Kind, Mut};
 
@@ -28,6 +29,14 @@ impl ImplRef {
         match self {
             ImplRef::Module { .. } => None,
             ImplRef::Body(item) => item.declaring_body(),
+        }
+    }
+
+    /// The impl's item in the body that declares it, when a body does.
+    pub fn item(self) -> Option<ItemRef> {
+        match self {
+            ImplRef::Module { .. } => None,
+            ImplRef::Body(item) => Some(item),
         }
     }
 }
@@ -250,19 +259,22 @@ impl<'a> Context<'a> {
         let src = &self.impl_file(block).source;
         let home = self.impl_module(block).ok()?;
         let (segments, absolute, dollar) = segments(&self.names.symbols, src, &header.body, path);
-        match self.resolve_in(block.root(), &NamePath { segments: &segments, absolute, dollar }, home)? {
+        match self.resolve_in(block.item(), &NamePath { segments: &segments, absolute, dollar }, home)? {
             Def::Item(item) if self.item(item).1.kind == ItemKind::Trait => Some(item),
             _ => None,
         }
     }
 
-    /// The item that `path` names from `home`, a single segment first among the items that the body of `root` declares.
-    fn resolve_in(&self, root: Option<ItemRef>, path: &NamePath<'_>, home: ModRef) -> Option<Def> {
-        let declared = match (root, path.segments) {
-            (Some(root), [name]) if !path.absolute => self.body_item(root, self.names.symbols.text(*name)),
-            _ => None,
-        };
-        declared.map(Def::Item).or_else(|| self.paths(home.krate).resolve(path, home))
+    /// The item that `path`, written at the item `at`, names from `home`, first among the items that the body declaring `at` holds.
+    fn resolve_in(&self, at: Option<ItemRef>, path: &NamePath<'_>, home: ModRef) -> Option<Def> {
+        let anchor = at.and_then(ItemRef::outer).map(|(root, from)| (root, Some(from)));
+        let paths = self.paths(home.krate);
+        match self.local_path(anchor, path, Ns::Types) {
+            Some(BodyPath::Item(item)) => Some(Def::Item(item)),
+            Some(BodyPath::Variant(_)) => None,
+            Some(BodyPath::Outside(skip)) => paths.resolve(&outside(path, skip), home),
+            None => paths.resolve(path, home),
+        }
     }
 
     /// The standard crates, which hold the impls and lang items of primitive types.
@@ -303,8 +315,9 @@ impl<'a> Context<'a> {
 
     fn body_impls(&self, root: ItemRef) -> Vec<ImplRef> {
         let Some(found) = self.expansion(root) else { return Vec::new() };
-        let items = found.file.items.items.iter().enumerate();
-        items.filter(|(_, item)| item.kind == ItemKind::Impl && item.parent.is_none()).map(|(at, _)| ImplRef::Body(root.inner(at as u32))).collect()
+        let items = &found.file.items.items;
+        let blocks = items.iter().enumerate().filter(|(_, item)| item.kind == ItemKind::Impl);
+        blocks.map(|(at, _)| ImplRef::Body(root.inner(at as u32))).collect()
     }
 
     fn index_block(&mut self, index: &mut Index, block: ImplRef) {
@@ -314,7 +327,7 @@ impl<'a> Context<'a> {
         }
         let src = &self.impl_file(block).source;
         let Ok(home) = self.impl_module(block) else { return };
-        let head = if generic_self(src, &header) { None } else { self.syntax_head(src, &header.body, header.self_ty, (home, block.root())) };
+        let head = if generic_self(src, &header) { None } else { self.syntax_head(src, &header.body, header.self_ty, (home, block.item())) };
         match (header.trait_ref.is_some(), head) {
             (false, Some(head)) => index.inherent.entry(head).or_default().push(block),
             (false, None) => {}
@@ -360,7 +373,7 @@ impl<'a> Context<'a> {
             Def::Item(item) if self.item(item).1.kind == ItemKind::Type => {
                 let (_, arena, ty) = self.alias_parts(item).ok()?;
                 let home = self.module_of(item).ok()?;
-                self.syntax_head(self.item(item).0, &arena, ty, (home, item.declaring_body()))
+                self.syntax_head(self.item(item).0, &arena, ty, (home, Some(item)))
             }
             _ => None,
         }

@@ -64,6 +64,10 @@ impl Infer<'_, '_> {
             if let Some(unsize) = self.unsize_pointee(a, b)? {
                 return Ok(Some((at, unsize)));
             }
+            let nested = matches!((self.cx.types.kind(self.resolve(a)), self.cx.types.kind(self.resolve(b))), (Kind::Adt(x, _), Kind::Adt(y, _)) if x == y);
+            if nested && let Some(unsize) = self.coercion(a, b)? {
+                return Ok(Some((at, unsize)));
+            }
         }
         Ok(None)
     }

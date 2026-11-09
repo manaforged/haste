@@ -5,16 +5,18 @@ use super::item::Attr;
 use super::source::{Source, opens};
 use crate::graph::cfg;
 
-/// The top-level comma-separated ranges of tokens in `from..to`.
+/// The top-level comma-separated ranges of tokens in `from..to`, where the generic arguments of a `::<...>` turbofish nest like a group.
 pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
     let mut parts = Vec::new();
-    let (mut start, mut at) = (from, from);
+    let (mut start, mut at, mut angles) = (from, from, 0u32);
     while at < to {
         match src.kind(at) {
-            TokenKind::Comma => {
+            TokenKind::Comma if angles == 0 => {
                 parts.push((start, at));
                 start = at + 1;
             }
+            TokenKind::Lt if angles > 0 || turbofish(src, at) => angles += 1,
+            TokenKind::Gt if angles > 0 && !(src.kind(at - 1) == TokenKind::Minus && src.joint(at - 1)) => angles -= 1,
             kind if opens(kind) => at = src.pair(at),
             _ => {}
         }
@@ -24,6 +26,10 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
         parts.push((start, to));
     }
     parts
+}
+
+fn turbofish(src: &Source, at: u32) -> bool {
+    at >= 2 && src.kind(at - 1) == TokenKind::Colon && src.kind(at - 2) == TokenKind::Colon && src.joint(at - 2)
 }
 
 fn unquote(text: &str) -> String {

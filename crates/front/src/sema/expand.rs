@@ -333,16 +333,13 @@ struct Site {
 
 
 impl<'a> Context<'a> {
-    /// The tokens that the macro `item` writes for the call whose group opens at `open` of `src`, expanded once per call and kept for the pass; none when `item` is not a `macro_rules!` or `macro`.
+    /// The tokens that the macro `item` writes for the call whose group opens at `open` of `src`, expanded once per call and kept with `src`; none when `item` is not a `macro_rules!` or `macro`.
     pub fn macro_output(&self, src: &'a Source, item: ItemRef, open: u32) -> Result<Option<&'a Source>> {
-        let key = (std::ptr::from_ref(src) as usize, open);
-        if let Some(&found) = self.macro_outputs.borrow().get(&key) {
+        if let Some(found) = src.outputs.get(open)? {
             return Ok(Some(found));
         }
         let Some(output) = defined_expand(self, item, src, open) else { return Ok(None) };
-        let output: &'a Source = Box::leak(Box::new(output?));
-        self.macro_outputs.borrow_mut().insert(key, output);
-        Ok(Some(output))
+        src.outputs.keep(open, output?).map(Some)
     }
 
     /// The expansion of the body of `item`, or of the body that declares it, once a pass read that body and found macro calls or items in it.
@@ -356,21 +353,10 @@ impl<'a> Context<'a> {
         self.expansion(item).map_or(&self.file(item).source, |found| &found.file.source)
     }
 
-    /// The item named `name` that the body of `root` declares.
-    pub fn body_item(&self, root: ItemRef, name: &str) -> Option<ItemRef> {
-        let src = &self.expansion(root)?.file.source;
-        self.body_items(root).find(|(_, entry)| entry.name.is_some_and(|at| plain(src.text(at)) == name)).map(|(item, _)| item)
-    }
-
-    /// The traits that the body of `root` declares.
+    /// The traits that the body of `root` declares, at any depth.
     pub fn body_declared_traits(&self, root: ItemRef) -> Vec<ItemRef> {
-        self.body_items(root).filter(|(_, entry)| entry.kind == ItemKind::Trait).map(|(item, _)| item).collect()
-    }
-
-    fn body_items(&self, root: ItemRef) -> impl Iterator<Item = (ItemRef, &'a crate::outline::item::Item)> {
         let items = self.expansion(root).map_or(&[][..], |found| &found.file.items.items[..]);
-        let open = move |entry: &crate::outline::item::Item| entry.parent.is_none_or(|parent| items[parent as usize].kind == ItemKind::ExternBlock);
-        items.iter().enumerate().filter(move |(_, entry)| open(entry)).map(move |(index, entry)| (root.inner(index as u32), entry))
+        items.iter().enumerate().filter(|(_, entry)| entry.kind == ItemKind::Trait).map(|(at, _)| root.inner(at as u32)).collect()
     }
 
     fn body_config<'c>(&self, item: ItemRef, calls: Option<&'c HashMap<u32, u32>>) -> syntax::Config<'c>
@@ -412,11 +398,11 @@ fn item_starts(body: &Body) -> impl Iterator<Item = u32> + '_ {
 /// The items that `body` declares, and those that the bodies of its functions declare in turn.
 fn declared(source: &Source, config: syntax::Config<'_>, body: &Body) -> Result<Items> {
     let mut items = Items::default();
-    let mut starts: Vec<u32> = item_starts(body).collect();
+    let mut starts: Vec<(u32, Option<u32>)> = item_starts(body).map(|at| (at, None)).collect();
     while !starts.is_empty() {
         let first = items.items.len();
         items = scan::body_items(source, std::mem::take(&mut starts), (items, config.calls))?;
-        for entry in &items.items[first..] {
+        for (index, entry) in items.items.iter().enumerate().skip(first) {
             let has_body = match entry.kind {
                 ItemKind::Fn => entry.body.is_some(),
                 ItemKind::Const | ItemKind::Static => true,
@@ -426,7 +412,7 @@ fn declared(source: &Source, config: syntax::Config<'_>, body: &Body) -> Result<
                 continue;
             }
             if let Ok(inner) = parse_in(source, config, entry) {
-                starts.extend(item_starts(&inner));
+                starts.extend(item_starts(&inner).map(|at| (at, Some(index as u32))));
             }
         }
     }
@@ -435,7 +421,8 @@ fn declared(source: &Source, config: syntax::Config<'_>, body: &Body) -> Result<
 
 /// The items that the item statement from `start` up to `end` declares in `items`, with the functions of an extern block it is.
 pub fn stmt_items(items: &[crate::outline::item::Item], (start, end): (u32, u32)) -> impl Iterator<Item = usize> + '_ {
-    let top = items.iter().position(|entry| entry.parent.is_none() && entry.start >= start && entry.start < end);
+    let in_block = |entry: &crate::outline::item::Item| entry.parent.is_none_or(|parent| matches!(items[parent as usize].kind, ItemKind::Fn | ItemKind::Const | ItemKind::Static));
+    let top = items.iter().position(|entry| in_block(entry) && entry.start >= start && entry.start < end);
     let block = top.filter(|&at| items[at].kind == ItemKind::ExternBlock);
     let children = items.iter().enumerate().filter(move |(_, entry)| block.is_some() && entry.parent == block.map(|at| at as u32)).map(|(at, _)| at);
     top.into_iter().chain(children)

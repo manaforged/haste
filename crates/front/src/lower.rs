@@ -464,7 +464,11 @@ impl Lower<'_, '_> {
             Stmt::Item(..) | Stmt::Empty => {}
             other => bail!("cannot lower statement {other:?} yet"),
         }
-        self.end_statement(mark)
+        self.end_statement(mark)?;
+        if let Stmt::Let { extend: true, .. } = stmt {
+            self.extend_owned(mark);
+        }
+        Ok(())
     }
 
     fn discard(&mut self, expr: ExprId) -> Result<()> {

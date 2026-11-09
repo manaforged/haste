@@ -37,11 +37,11 @@ pub fn scan(src: &Source) -> Result<Items> {
     Ok(scanner.out)
 }
 
-/// Adds to `items` the items declared in a body, which start at each of `starts`, reading a module's macro calls through their expansions in `calls`.
-pub fn body_items(src: &Source, starts: impl IntoIterator<Item = u32>, (items, calls): (Items, Option<&HashMap<u32, u32>>)) -> Result<Items> {
+/// Adds to `items` the items declared in a body, each starting at its token under the item whose body declares it, reading a module's macro calls through their expansions in `calls`.
+pub fn body_items(src: &Source, starts: impl IntoIterator<Item = (u32, Option<u32>)>, (items, calls): (Items, Option<&HashMap<u32, u32>>)) -> Result<Items> {
     let mut scanner = Scanner { src, out: items, calls };
-    for at in starts {
-        scanner.item(at, None)?;
+    for (at, owner) in starts {
+        scanner.item(at, owner)?;
     }
     Ok(scanner.out)
 }

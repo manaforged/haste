@@ -188,6 +188,8 @@ pub struct Infer<'c, 'a> {
     opaques: Vec<opaque::Opaque>,
     operands: Vec<(ExprId, crate::body::BinOp, (Ty, Ty), Ty)>,
     try_blocks: Vec<(ExprId, Ty)>,
+    /// The `.await` expressions on a pending async fn's future, with that future, finished once it is revealed.
+    awaits: Vec<(ExprId, Ty)>,
     ret_sig: Option<Ty>,
     out: Typed,
     scopes: Vec<(Name<'a>, u32)>,
@@ -281,7 +283,7 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
 impl<'c, 'a> Infer<'c, 'a> {
     fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false, hidden: Vec::new(), const_args: Vec::new() }
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false, hidden: Vec::new(), const_args: Vec::new() }
     }
 }
 
@@ -616,6 +618,7 @@ impl Infer<'_, '_> {
     fn finish(mut self) -> Result<Typed> {
         self.settle_projections()?;
         self.settle_opaques(true)?;
+        self.settle_awaits()?;
         self.settle_operators(false)?;
         self.settle_obligations()?;
         self.fall_back_numbers()?;

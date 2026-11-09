@@ -167,7 +167,7 @@ pub enum BlockKind {
 /// A statement.
 #[derive(Clone, Copy, Debug)]
 pub enum Stmt {
-    Let { pat: PatId, ty: Option<TyId>, init: Option<ExprId>, otherwise: Option<ExprId> },
+    Let { pat: PatId, ty: Option<TyId>, init: Option<ExprId>, otherwise: Option<ExprId>, extend: bool },
     Expr(ExprId, bool),
     Item(u32, u32),
     Macro { path: PathId, open: u32, semi: bool },

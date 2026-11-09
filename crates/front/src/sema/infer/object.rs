@@ -99,8 +99,11 @@ impl Infer<'_, '_> {
     }
 
     fn object_of(&mut self, of: ItemRef, from: Ty, given: &[Ty]) -> Result<bool> {
+        if self.compiler_trait(of) {
+            return Ok(self.compiler_holds(of, from));
+        }
         if !self.is_callable_trait(of) {
-            return Ok(self.select(of, from, given)?.is_some());
+            return Ok(self.compiler_impl(of, from) || self.select(of, from, given)?.is_some());
         }
         let (Some((params, _)), Some(&wanted)) = (self.callable_sig(from)?, given.first()) else { return Ok(false) };
         let inputs = self.cx.types.intern(Kind::Tuple(params));

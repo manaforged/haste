@@ -172,7 +172,7 @@ impl Cursor<'_> {
         let mut variadic = false;
         let mut starts = Vec::new();
         self.comma_list(open, |cursor| {
-            cursor.skip_attrs()?;
+            let attrs = cursor.skip_attrs()?;
             if receiver.is_none() && params.is_empty() && let Some(found) = cursor.receiver()? {
                 receiver = Some(found);
                 return Ok(0);
@@ -181,10 +181,14 @@ impl Cursor<'_> {
                 variadic = true;
                 return Ok(0);
             }
-            starts.push(cursor.at);
+            let start = cursor.at;
             let pat = cursor.pat_no_alt()?;
             cursor.expect(":")?;
-            params.push((pat, cursor.ty()?));
+            let ty = cursor.ty()?;
+            if !cursor.configured_out(attrs) {
+                starts.push(start);
+                params.push((pat, ty));
+            }
             Ok(0)
         })?;
         sig.params = params;
@@ -195,9 +199,10 @@ impl Cursor<'_> {
     }
 }
 
-/// Parses the header of the function item whose tokens run from `from` to `to` in `src`.
-pub fn signature(src: &Source, from: u32, to: u32) -> Result<Signature> {
+/// Parses the header of the function item whose tokens run from `from` to `to` in `src`, leaving out the parameters that `#[cfg]` in `env` turns off.
+pub fn signature(src: &Source, from: u32, to: u32, env: &crate::outline::tree::Env) -> Result<Signature> {
     let mut cursor = Cursor::new(src, from, to);
+    cursor.config.env = Some(env);
     let mut is_async = false;
     while !cursor.done() && !cursor.is_word("fn") {
         is_async |= cursor.is_word("async");

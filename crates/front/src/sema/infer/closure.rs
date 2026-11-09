@@ -124,17 +124,39 @@ impl Infer<'_, '_> {
         found
     }
 
-    /// The output of `ty` when it is a coroutine: one this body defines, or one whose defining body is inferred.
+    /// The output of `ty` when it is a coroutine: one this body defines, one whose defining body is inferred, or an async fn future named while its body is inferred.
     pub(super) fn coroutine_output(&self, ty: Ty) -> Option<Ty> {
         let Kind::Closure(parent, substs, at) = self.cx.types.kind(self.resolve(ty)) else { return None };
         let here = self.instance.as_ref().is_some_and(|(item, args)| item == parent && args == substs);
         let local = here.then(|| self.out.closures.get(&ExprId(*at))).flatten().filter(|closure| closure.coroutine).map(|closure| closure.ret);
-        local.or_else(|| self.cx.closure(self.resolve(ty)).filter(|info| info.closure.coroutine).map(|info| info.closure.ret))
+        local.or_else(|| self.cx.closure(self.resolve(ty)).filter(|info| info.closure.coroutine).map(|info| info.closure.ret)).or_else(|| self.cx.future_output(self.resolve(ty)))
     }
 
     /// Infers `inner.await`: the future that `IntoFuture::into_future` makes of `inner`, polled until it gives its output.
     pub(super) fn await_expr(&mut self, expr: ExprId, inner: ExprId) -> Result<Ty> {
         let found = self.expr(inner, None)?;
+        if matches!(self.cx.types.kind(self.resolve(found)), Kind::Var(_)) {
+            self.settle_opaques(false)?;
+        }
+        if let Some(output) = self.opaque_output(self.resolve(found)) {
+            self.awaits.push((expr, found));
+            return Ok(output);
+        }
+        self.awaited(expr, found)
+    }
+
+    /// Finishes each `.await` on an async fn future that was pending, once the futures are revealed.
+    pub(super) fn settle_awaits(&mut self) -> Result<()> {
+        for (expr, found) in std::mem::take(&mut self.awaits) {
+            let output = self.awaited(expr, found)?;
+            let declared = self.out.exprs[expr.0 as usize];
+            self.unify(output, declared)?;
+        }
+        Ok(())
+    }
+
+    /// Records how `.await` polls the value of type `found`, and returns its output.
+    fn awaited(&mut self, expr: ExprId, found: Ty) -> Result<Ty> {
         let (into_future, future) = self.lang_call("into_future", found)?;
         let Some(future_trait) = self.cx.lang_item("future_trait") else { bail!("core has no `Future`") };
         let output = self.project(future_trait, future, Vec::new(), "Output")?;

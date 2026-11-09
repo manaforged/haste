@@ -84,9 +84,11 @@ impl<'a> Context<'a> {
         Some(self.item(item).0.text(at + 2).trim_matches('"'))
     }
 
-    fn attr_at(&self, item: ItemRef, key: &str) -> Option<u32> {
+    /// The token of the attribute `key` that `item` carries, through `cfg_attr` whose cfg holds.
+    pub(super) fn attr_at(&self, item: ItemRef, key: &str) -> Option<u32> {
         let (src, entry) = self.item(item);
-        named_attr((src, &self.outline.crates[item.krate as usize].env), &entry.attrs, key)
+        let pick = |attr: &Attr| if let Attr::Other(at) = attr { (src.text(*at) == key).then_some(*at) } else { None };
+        self.outline.crates[item.krate as usize].env.find_attr(&entry.attrs, crate::outline::tree::Truth::Yes, &pick)
     }
 
     /// The layout of the struct, enum or union `item` at `args`.
@@ -150,10 +152,3 @@ fn discr_range(dl: &TargetDataLayout, repr: &ReprOptions, min: i128, max: i128) 
     if min >= 0 { (std::cmp::max(unsigned, at_least), false) } else { (std::cmp::max(signed, at_least), true) }
 }
 
-fn named_attr((src, env): (&crate::outline::source::Source, &crate::outline::tree::Env), attrs: &[Attr], key: &str) -> Option<u32> {
-    attrs.iter().find_map(|attr| match attr {
-        Attr::Other(at) if src.text(*at) == key => Some(*at),
-        Attr::CfgAttr(cfg, inner) if env.eval(cfg) == crate::outline::tree::Truth::Yes => named_attr((src, env), inner, key),
-        _ => None,
-    })
-}

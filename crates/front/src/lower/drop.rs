@@ -179,6 +179,13 @@ impl Lower<'_, '_> {
         self.end(mark, |life| life == Life::Extended)
     }
 
+    /// Hands every value owned from `mark` on to the scope around the enclosing block, as a `super let` binding lives.
+    pub fn extend_owned(&mut self, mark: usize) {
+        for owned in &mut self.owned[mark..] {
+            owned.life = Life::Extended;
+        }
+    }
+
     /// Ends a statement that began at `mark`: drops its temporaries and keeps its bindings and the temporaries it extends.
     pub fn end_statement(&mut self, mark: usize) -> Result<()> {
         self.end(mark, |life| life != Life::Statement)?;

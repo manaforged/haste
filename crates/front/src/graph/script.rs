@@ -1,9 +1,8 @@
-//! Build scripts as Cargo runs them: the directives a script prints, the environment it runs in, and where its output is kept.
+//! Build scripts as Cargo runs them: the directives a script prints, the environment it runs in, and the directory it writes into.
 
 use std::collections::BTreeSet;
 use std::hash::BuildHasher as _;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::path::PathBuf;
 
 use super::{Side, Targets, Workspace};
 
@@ -16,7 +15,6 @@ pub struct Output {
     pub libs: Vec<String>,
     pub search: Vec<String>,
     pub metadata: Vec<(String, String)>,
-    pub watched: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25,7 +23,6 @@ enum Directive {
     Env,
     LinkLib,
     LinkSearch,
-    Watch,
     Metadata,
     Other,
 }
@@ -35,7 +32,7 @@ const DIRECTIVES: [(&str, Directive); 19] = [
     ("rustc-env", Directive::Env),
     ("rustc-link-lib", Directive::LinkLib),
     ("rustc-link-search", Directive::LinkSearch),
-    ("rerun-if-changed", Directive::Watch),
+    ("rerun-if-changed", Directive::Other),
     ("metadata", Directive::Metadata),
     ("rerun-if-env-changed", Directive::Other),
     ("rustc-link-arg", Directive::Other),
@@ -85,20 +82,24 @@ impl Output {
             Directive::Metadata => self.metadata.extend(value.split_once('=').map(|(key, value)| (key.to_owned(), value.to_owned()))),
             Directive::LinkLib => self.libs.push(value.to_owned()),
             Directive::LinkSearch => self.search.push(value.to_owned()),
-            Directive::Watch => self.watched.push(PathBuf::from(value)),
             Directive::Other => {}
         }
     }
 }
 
-/// The directory that holds the build script output of `unit`: the script's `OUT_DIR` under it and the text it printed.
+/// The directory under which this process runs build scripts, removed when the command ends, so that nothing is kept between runs.
+pub fn scratch() -> PathBuf {
+    std::env::temp_dir().join(format!("haste-{}", std::process::id()))
+}
+
+/// The directory that holds the build script output of `unit`: the script's `OUT_DIR` under it and its standard error.
 pub fn dir(workspace: &Workspace, unit: usize) -> PathBuf {
     let entry = &workspace.graph.units[unit];
     let locked = &workspace.packages[entry.package].locked;
     let side = if entry.side == Side::Host { "host" } else { "target" };
     let features: Vec<&str> = entry.features.iter().map(String::as_str).collect();
     let key = rustc_hash::FxBuildHasher.hash_one(features.join(","));
-    workspace.top.join("target/haste/build").join(format!("{}-{}-{side}-{key:016x}", locked.name, locked.version))
+    scratch().join(format!("{}-{}-{side}-{key:016x}", locked.name, locked.version))
 }
 
 fn out_dir(workspace: &Workspace, unit: usize) -> String {
@@ -112,29 +113,6 @@ pub fn crate_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)> {
         vars.push(("OUT_DIR".to_owned(), out_dir(workspace, unit)));
     }
     vars
-}
-
-/// The kept output of `unit`'s build script, if no file it watches changed since the script ran.
-pub fn kept(workspace: &Workspace, unit: usize) -> Option<Output> {
-    let path = dir(workspace, unit).join("output");
-    let ran = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok()?;
-    let output = Output::parse(&std::fs::read_to_string(&path).ok()?);
-    let manifest = &workspace.packages[workspace.graph.units[unit].package].manifest;
-    let script = manifest.build.iter().cloned();
-    let watched: Vec<PathBuf> = if output.watched.is_empty() { script.collect() } else { output.watched.iter().map(|path| manifest.dir.join(path)).collect() };
-    watched.iter().all(|path| modified(path).is_some_and(|at| at <= ran)).then_some(output)
-}
-
-/// Whether `unit`'s build script failed in a run newer than both the script and this program, so running it again would fail the same way.
-pub fn failed_before(workspace: &Workspace, unit: usize) -> bool {
-    let Some(failed) = modified(&dir(workspace, unit).join("failed")) else { return false };
-    let manifest = &workspace.packages[workspace.graph.units[unit].package].manifest;
-    let newer = |path: Option<PathBuf>| path.and_then(|path| modified(&path)).is_some_and(|at| at <= failed);
-    newer(manifest.build.clone()) && newer(std::env::current_exe().ok())
-}
-
-fn modified(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
 /// The variables Cargo sets for the package of `unit` when it builds the package's crates: its name, version and manifest paths.
@@ -171,7 +149,7 @@ pub fn script_vars(workspace: &Workspace, targets: &Targets, unit: usize, metada
         ("OUT_DIR", out_dir(workspace, unit)),
         ("TARGET", target.triple.clone()),
         ("HOST", targets.host.triple.clone()),
-        ("NUM_JOBS", std::thread::available_parallelism().map_or(1, |count| count.get()).to_string()),
+        ("NUM_JOBS", crate::cores().to_string()),
         ("OPT_LEVEL", "0".to_owned()),
         ("DEBUG", "true".to_owned()),
         ("PROFILE", "debug".to_owned()),

@@ -340,7 +340,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one, such as a struct that ends in a slice, is neither `Sized`, `Copy` nor `Clone`, and `&mut T` is neither `Copy` nor `Clone`.
-    fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
+    pub(super) fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
         let Some(lang) = self.cx.lang(of) else { return true };
         let ty = self.resolve(ty);
         match self.cx.types.kind(ty) {

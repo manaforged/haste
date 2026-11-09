@@ -45,7 +45,7 @@ impl Infer<'_, '_> {
 
     fn stmt(&mut self, stmt: Stmt) -> Result<()> {
         match stmt {
-            Stmt::Let { pat, ty, init, otherwise } => self.let_stmt(pat, ty, init, otherwise),
+            Stmt::Let { pat, ty, init, otherwise, .. } => self.let_stmt(pat, ty, init, otherwise),
             Stmt::Expr(expr, semi) => {
                 let ty = self.expr(expr, None)?;
                 if !semi {

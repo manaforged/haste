@@ -99,7 +99,9 @@ impl<'a> Infer<'_, 'a> {
 
     fn probe_step(&mut self, step: Ty, (candidates, traits): (&[Candidate], &[TraitCandidate])) -> Result<Option<Pick>> {
         let (bounded, unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits.iter().partition(|candidate| candidate.bound.is_some());
-        let unbounded: Vec<TraitCandidate> = unbounded.into_iter().filter(|candidate| !shadowed(&bounded, candidate.of, step)).collect();
+        let step_ty = self.substitute(step);
+        let bounded_at: Vec<TraitCandidate> = bounded.iter().map(|candidate| TraitCandidate { bound: candidate.bound.map(|bound| self.substitute(bound)), ..*candidate }).collect();
+        let unbounded: Vec<TraitCandidate> = unbounded.into_iter().filter(|candidate| !shadowed(&bounded_at, candidate.of, step_ty)).collect();
         for autoref in [None, Some(Mut::Not), Some(Mut::Mut)] {
             let adjusted = match autoref {
                 None => step,
@@ -224,6 +226,9 @@ impl<'a> Infer<'_, 'a> {
             _ => self.trait_self(candidate, adjusted),
         };
         let Some(self_ty) = self_ty else { return Ok(None) };
+        if candidate.bound.is_some_and(|bound| self.substitute(bound) != self.substitute(self_ty)) {
+            return Ok(None);
+        }
         let args = self.fresh_trait_args(candidate.of)?;
         if candidate.bound.is_some() || !args.is_empty() {
             self.assume(candidate.of, &std::iter::once(self_ty).chain(args.iter().copied()).collect::<Vec<_>>())?;
@@ -321,12 +326,12 @@ impl<'a> Infer<'_, 'a> {
     }
 }
 
-/// How a call borrows its receiver for a method that takes `self` as `kind`, or none for a typed `self`.
 /// Whether a where-clause bound of `of` on the type parameter that `step` instantiates hides the trait's impls, as rustc sees only the bound on a parameter.
 fn shadowed(bounded: &[TraitCandidate], of: ItemRef, step: Ty) -> bool {
     bounded.iter().any(|candidate| candidate.of == of && candidate.bound == Some(step))
 }
 
+/// How a call borrows its receiver for a method that takes `self` as `kind`, or none for a typed `self`.
 fn borrow_of(kind: Option<SelfKind>) -> Option<Option<Mut>> {
     match kind? {
         SelfKind::Value => Some(None),

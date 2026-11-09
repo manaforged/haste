@@ -19,21 +19,29 @@ impl Lower<'_, '_> {
     /// Emits the SIMD intrinsic `op` one lane at a time on vectors held in memory, as a scalar backend does.
     pub(super) fn simd(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&vector), Some(&first)) = (substs.first(), args.first()) else { bail!("a SIMD intrinsic with no vector") };
-        let value = match (op, args, substs.get(1).copied()) {
-            (Simd::Splat, _, _) => self.splat(vector, first)?,
-            (Simd::Bitmask, _, Some(out)) => self.bitmask(vector, first, out)?,
-            (Simd::Lanewise(bin), &[x, y], out) => self.lanewise(bin, (vector, out.unwrap_or(vector)), (x, y))?,
-            (Simd::Cast, _, Some(out)) => self.lane_cast((vector, out), first)?,
-            (Simd::Shuffle, &[x, y, idx], _) => self.shuffle(substs, (x, y), idx)?,
-            (Simd::Extract, &[x, at], _) => {
+        let out = substs.get(1).copied();
+        let value = match (op, out) {
+            (Simd::Splat, _) => self.splat(vector, first)?,
+            (Simd::Bitmask, Some(out)) => self.bitmask(vector, first, out)?,
+            (Simd::Cast, Some(out)) => self.lane_cast((vector, out), first)?,
+            (Simd::Reduce { all }, _) => self.reduce(vector, first, all)?,
+            _ => self.simd_lanes(op, substs, args)?,
+        };
+        Ok(Some(value))
+    }
+
+    fn simd_lanes(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Value> {
+        let vector = substs[0];
+        Ok(match (op, args) {
+            (Simd::Lanewise(bin), &[x, y]) => self.lanewise(bin, (vector, substs.get(1).copied().unwrap_or(vector)), (x, y))?,
+            (Simd::Shuffle, &[x, y, idx]) => self.shuffle(substs, (x, y), idx)?,
+            (Simd::Extract, &[x, at]) => {
                 let (lanes, lane) = self.lane_address(vector, x, at)?;
                 self.ins().load(lanes.machine, lane, 0)
             }
-            (Simd::Insert, &[x, at, value], _) => self.insert(vector, x, (at, value))?,
-            (Simd::Reduce { all }, _, _) => self.reduce(vector, first, all)?,
+            (Simd::Insert, &[x, at, value]) => self.insert(vector, x, (at, value))?,
             _ => bail!("SIMD intrinsic {op:?} takes other arguments"),
-        };
-        Ok(Some(value))
+        })
     }
 
     fn lanes(&mut self, ty: Ty) -> Result<Lanes> {

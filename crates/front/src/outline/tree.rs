@@ -260,10 +260,14 @@ impl Env {
 
     /// The `#[path]` value in `attrs`, including one that `cfg_attr` may enable.
     pub fn path<'a>(&self, attrs: &'a [Attr]) -> Option<&'a str> {
+        self.find_attr(attrs, Truth::Unknown, &|attr| if let Attr::Path(path) = attr { Some(path.as_str()) } else { None })
+    }
+
+    /// The first value that `pick` finds in `attrs`, including in those of each `cfg_attr` whose condition is `least` or `Yes`.
+    pub fn find_attr<'a, T>(&self, attrs: &'a [Attr], least: Truth, pick: &impl Fn(&'a Attr) -> Option<T>) -> Option<T> {
         attrs.iter().find_map(|attr| match attr {
-            Attr::Path(path) => Some(path.as_str()),
-            Attr::CfgAttr(cfg, inner) if self.allows(cfg) => self.path(inner),
-            _ => None,
+            Attr::CfgAttr(cfg, inner) if matches!((self.eval(cfg), least), (Truth::Yes, _) | (Truth::Unknown, Truth::Unknown)) => self.find_attr(inner, least, pick),
+            attr => pick(attr),
         })
     }
 }
@@ -322,7 +326,7 @@ impl Cache {
 
     /// Reads and scans the existing files among `paths` on scoped threads that finish before it returns.
     pub fn read_all(&self, paths: &[PathBuf]) {
-        let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
+        let cores = crate::cores();
         let workers = cores.min(paths.len() / PER_WORKER);
         if workers < 2 {
             return;

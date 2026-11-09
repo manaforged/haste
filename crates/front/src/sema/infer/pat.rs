@@ -72,6 +72,7 @@ impl Infer<'_, '_> {
         let explicit = if mutable { Mut::Mut } else { Mut::Not };
         let reference = match (by_ref, mode) {
             (true, _) => Some(explicit),
+            (false, Mode::Ref(_)) if mutable => None,
             (false, Mode::Ref(mutability)) => Some(mutability),
             (false, Mode::Value) => None,
         };
@@ -167,13 +168,17 @@ impl Infer<'_, '_> {
     fn slice_element(&mut self, ty: Ty, given: usize, rest: bool) -> Result<Ty> {
         let (element, len) = match *self.cx.types.kind(ty) {
             Kind::Slice(element) => return Ok(element),
-            Kind::Array(element, len) => (element, self.cx.types.len(len)),
+            Kind::Array(element, len) => (element, len),
             _ => bail!("slice pattern on {}", self.show(ty)),
         };
-        match len {
+        match self.cx.types.len(self.resolve(len)) {
             Some(len) if given as u64 > len || (!rest && given as u64 != len) => bail!("pattern has {given} elements, the array has {len}"),
             Some(_) => Ok(element),
-            None => bail!("a slice pattern on an array of unknown length"),
+            None if !rest => {
+                let known = self.cx.types.intern(Kind::Value(given as u128));
+                self.unify(len, known).map(|()| element)
+            }
+            None => bail!("a slice pattern with `..` on an array of unknown length"),
         }
     }
 

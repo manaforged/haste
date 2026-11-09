@@ -1,7 +1,6 @@
 //! Compile workers: forked copies of the compiler that each encode a share of the reached functions into the image's shared memory.
 
 use std::io::{Read, Write};
-use std::os::fd::FromRawFd;
 use std::sync::atomic::Ordering;
 
 use crate::lower::{self, Slots};
@@ -14,7 +13,7 @@ const MIN_PARALLEL: usize = 256;
 
 /// The number of compile workers: `HASTE_JOBS`, or one per core.
 fn jobs() -> usize {
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let cores = crate::cores();
     std::env::var("HASTE_JOBS").ok().and_then(|text| text.parse().ok()).unwrap_or(cores).max(1)
 }
 
@@ -45,14 +44,18 @@ impl Image {
         if jobs == 1 || work.len() < MIN_PARALLEL {
             return work.iter().filter_map(|&index| self.compile_into(cx, reached, index).err().map(|error| (index, error))).collect();
         }
+        let fail_all = |error: String| -> Vec<(usize, String)> { work.iter().map(|&index| (index, error.clone())).collect() };
         if let Err(error) = std::io::stdout().flush() {
-            return work.iter().map(|&index| (index, format!("flushing stdout before compile workers fork: {error}"))).collect();
+            return fail_all(format!("flushing stdout before compile workers fork: {error}"));
+        }
+        if let Err(error) = self.open_space() {
+            return fail_all(format!("mapping memory for compile workers: {error}"));
         }
         let mut workers = Vec::new();
         for part in 0..jobs {
             match self.fork_worker(cx, reached, work, (jobs, part)) {
                 Ok(worker) => workers.push(worker),
-                Err(error) => return work.iter().map(|&index| (index, format!("compile worker {part}: {error}"))).collect(),
+                Err(error) => return fail_all(format!("compile worker {part}: {error}")),
             }
         }
         let errors = workers.into_iter().flat_map(|worker| self.collect(worker, work, jobs)).collect();
@@ -60,6 +63,13 @@ impl Image {
         self.shared.get_mut().close();
         self.state.get_mut().close();
         errors
+    }
+
+    /// Maps fresh code, shared and state space for the workers about to fork, since what earlier workers split stays closed.
+    fn open_space(&mut self) -> Result<(), String> {
+        self.memory.reserve(super::CODE_BYTES)?;
+        self.shared.get_mut().renew()?;
+        self.state.get_mut().renew()
     }
 
     fn compile_into(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<(), String> {
@@ -73,31 +83,7 @@ impl Image {
     }
 
     fn fork_worker(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize], (jobs, part): (usize, usize)) -> Result<Worker, String> {
-        let mut ends = [0; 2];
-        // SAFETY: ends is a live two-element array for the new descriptors.
-        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-            return Err(format!("pipe: {}", std::io::Error::last_os_error()));
-        }
-        // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err(format!("fork: {}", std::io::Error::last_os_error()));
-        }
-        if pid == 0 {
-            // SAFETY: ends[0] is the read end this child does not use, and ends[1] is the write end it owns from here on.
-            let report = unsafe {
-                libc::close(ends[0]);
-                std::fs::File::from_raw_fd(ends[1])
-            };
-            let wrote = self.work_share(cx, reached, work, (jobs, part), report);
-            // SAFETY: _exit ends the child without running the parent's destructors.
-            unsafe { libc::_exit(i32::from(wrote.is_err())) }
-        }
-        // SAFETY: ends[1] is the write end that only the child uses, and ends[0] is the read end this process owns from here on.
-        let report = unsafe {
-            libc::close(ends[1]);
-            std::fs::File::from_raw_fd(ends[0])
-        };
+        let (pid, report) = super::fork_piped(|report| self.work_share(cx, reached, work, (jobs, part), report)).map_err(|error| format!("{error:#}"))?;
         Ok(Worker { pid, report, part })
     }
 

@@ -224,6 +224,11 @@ impl Lexer {
             return self.suffixed(from);
         }
         self.eat_while(|ch| ch.is_ascii_digit() || ch == '_');
+        self.decimal_tail();
+        self.suffixed(from)
+    }
+
+    fn decimal_tail(&mut self) {
         let fraction = self.peek(0) == Some('.') && self.peek(1).is_none_or(|next| next != '.' && !ident_start(next));
         if fraction {
             self.at += 1;
@@ -235,7 +240,6 @@ impl Lexer {
             self.at += if signed { 2 } else { 1 };
             self.eat_while(|ch| ch.is_ascii_digit() || ch == '_');
         }
-        self.suffixed(from)
     }
 
     fn suffixed(&mut self, from: usize) -> Literal {

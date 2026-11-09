@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::tree::File;
 
 use anyhow::{Context, Result, bail};
+use rustc_hash::FxHashMap;
 use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
 
 /// One non-trivia token, with the index of its matching delimiter when it opens or closes a group.
@@ -44,6 +45,29 @@ pub struct Source {
     pub marks: Vec<(u32, Mark)>,
     pub base: Option<Arc<File>>,
     pub offset: u32,
+    /// The tokens that each macro call in type position writes, by the token that opens its group.
+    pub outputs: Outputs,
+}
+
+/// Macro outputs kept for as long as the source that holds their calls.
+#[derive(Debug, Default)]
+pub struct Outputs(Mutex<FxHashMap<u32, Box<Source>>>);
+
+impl Outputs {
+    /// The output kept for the call whose group opens at `open`.
+    pub fn get(&self, open: u32) -> Result<Option<&Source>> {
+        let kept = self.0.lock().map_err(|_| anyhow::anyhow!("macro outputs poisoned"))?;
+        // SAFETY: entries are never removed or replaced while self lives, and a box keeps its heap address when the map grows.
+        Ok(kept.get(&open).map(|found| unsafe { &*std::ptr::from_ref::<Source>(found) }))
+    }
+
+    /// Keeps `output` for the call whose group opens at `open`, or the output another caller kept first.
+    pub fn keep(&self, open: u32, output: Source) -> Result<&Source> {
+        let mut kept = self.0.lock().map_err(|_| anyhow::anyhow!("macro outputs poisoned"))?;
+        let found = kept.entry(open).or_insert_with(|| Box::new(output));
+        // SAFETY: entries are never removed or replaced while self lives, and a box keeps its heap address when the map grows.
+        Ok(unsafe { &*std::ptr::from_ref::<Source>(found) })
+    }
 }
 
 /// Tokens being written by a macro expansion, copied from other sources without lexing them again.
@@ -127,7 +151,7 @@ impl Tokens {
     pub fn finish(self, path: PathBuf) -> Result<Source> {
         let mut tokens = self.tokens;
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text: self.text, tokens, marks: self.marks, base: None, offset: 0 })
+        Ok(Source { path, text: self.text, tokens, marks: self.marks, base: None, offset: 0, outputs: Outputs::default() })
     }
 
     /// The written tokens laid after every token of `base`, so that the indices of `base` still name its tokens.
@@ -266,7 +290,7 @@ impl Source {
         let mut text = text;
         let mut tokens = lex(&mut text);
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text, tokens, marks: Vec::new(), base: None, offset: 0 })
+        Ok(Source { path, text, tokens, marks: Vec::new(), base: None, offset: 0, outputs: Outputs::default() })
     }
 
     #[inline]
@@ -308,23 +332,7 @@ impl Source {
 
     /// The token ranges of the comma-separated arguments in the group that opens at `open`.
     pub fn args(&self, open: u32) -> Vec<(u32, u32)> {
-        let close = self.pair(open);
-        let (mut found, mut from, mut at) = (Vec::new(), open + 1, open + 1);
-        while at < close {
-            match self.kind(at) {
-                TokenKind::Comma => {
-                    found.push((from, at));
-                    from = at + 1;
-                    at += 1;
-                }
-                kind if opens(kind) => at = self.pair(at) + 1,
-                _ => at += 1,
-            }
-        }
-        if from < close {
-            found.push((from, close));
-        }
-        found
+        super::attr::split_commas(self, open + 1, self.pair(open))
     }
 
     /// The text a literal token or `true` and `false` adds to `concat!`, or none for any other token.

@@ -28,7 +28,8 @@ pub fn items_of(tree: &Tree, module: usize) -> Vec<(u32, u32)> {
     items_in(tree, &files)
 }
 
-fn namespaces(item: &Item) -> &'static [Ns] {
+/// The namespaces that the item `item` binds its name in.
+pub fn namespaces(item: &Item) -> &'static [Ns] {
     match item.kind {
         ItemKind::Struct if item.body.is_none() => &[Ns::Types, Ns::Values],
         ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::Trait | ItemKind::TraitAlias | ItemKind::Type => &[Ns::Types],

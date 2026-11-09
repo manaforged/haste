@@ -216,15 +216,26 @@ impl<'a> Infer<'_, 'a> {
         let (types, opaque) = self.with_frame(frame, |infer| {
             let types = infer.sig_types(&sig)?;
             let opaque = match foreign {
-                true => Some((infer.ret_fn_sig(&sig)?, infer.ret_bounds(&sig, types.1)?)),
+                true => Some((infer.ret_fn_sig(&sig)?, infer.ret_bounds(&sig, types.1)?, infer.async_output(&sig)?)),
                 false => None,
             };
             Ok((types, opaque))
         })?;
-        if let Some((sig, bounds)) = opaque {
-            self.opaque_ret(super::opaque::Opaque { item, substs: substs.to_vec(), ret: types.1, sig, bounds })?;
+        if let Some((sig, bounds, output)) = opaque {
+            self.opaque_ret(super::opaque::Opaque { item, substs: substs.to_vec(), ret: types.1, sig, bounds, output })?;
         }
         Ok(types)
+    }
+
+    /// The output type that the async fn `sig` declares.
+    fn async_output(&mut self, sig: &Signature) -> Result<Option<Ty>> {
+        if !sig.is_async {
+            return Ok(None);
+        }
+        match sig.ret {
+            Some(ty) => self.lower_ty(&sig.body, ty).map(Some),
+            None => Ok(Some(self.cx.types.unit())),
+        }
     }
 
     /// The parameter types of `sig`, its receiver first, and its return type.

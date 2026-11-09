@@ -77,9 +77,7 @@ impl Build {
         let entry_of = |cx: &mut sema::Context<'_>| main.map(|item| main_roots(cx, item)).transpose();
         let built = haste_front::macros::reach_settled(&mut outline, &mut names, |cx| with_entry(&roots, &entry_of(cx)), |mut cx, reached| {
             let entry = entry_at(&reached, entry_of(&mut cx))?;
-            let mut image = Image::new(&reached)?;
-            let (mut broken, all) = (HashMap::default(), (0..reached.list.len()).collect::<Vec<_>>());
-            recompile(&mut image, &mut broken, (&mut cx, &reached), &all);
+            let (image, broken) = Image::build(&mut cx, &reached)?;
             let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
             let roots = roots.iter().map(|root| reached.index[root]).collect();
             Ok((Some(cx.release().0), labels, roots, entry, reached, image, broken))
@@ -141,7 +139,7 @@ impl Build {
             }
             self.names.reset(krate as usize);
         }
-        if self.names.settle(&mut self.outline).is_err() {
+        if haste_front::macros::settle(&mut self.outline, &mut self.names).is_err() {
             return false;
         }
         store.forget(&self.outline, Edited::Crates(&crates));
@@ -173,7 +171,7 @@ impl Build {
         let mut failures = Failures::new();
         let mut runnable = Vec::new();
         for (&root, name) in self.roots.iter().zip(&self.labels) {
-            let closure = self.reached.closure(root);
+            let closure = self.reached.closure(&[root]);
             let failure = closure.iter().rev().find_map(|at| self.reached.list[*at].1.as_ref().err()).or_else(|| closure.iter().rev().find_map(|at| self.broken.get(at)));
             match failure {
                 Some(error) => failures.entry(error_kind(error)).or_default().push(format!("{name}: {error}")),
@@ -195,8 +193,7 @@ impl Build {
     /// Runs the binary's `main` with `args` as argv, or fails with every reason a function it reaches did not compile.
     pub fn run(&self, args: &[String]) -> Result<i32> {
         let Some([start, main]) = self.entry else { bail!("no member binary has a `main`") };
-        let mut seen = rustc_hash::FxHashSet::default();
-        let closure: Vec<usize> = self.reached.closure(start).into_iter().chain(self.reached.closure(main)).filter(|at| seen.insert(*at)).collect();
+        let closure = self.reached.closure(&[start, main]);
         let mut failures = Failures::new();
         for at in &closure {
             if let Some(error) = self.reached.list[*at].1.as_ref().err().or_else(|| self.broken.get(at)) {

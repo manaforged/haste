@@ -4,10 +4,11 @@ use crate::body::sig::{Generic, GenericKind};
 use crate::body::{self as syntax, Args, Body, GenericArg, PathId, TyId};
 use crate::names::path::Path as NamePath;
 use crate::names::collect::import_parts;
-use crate::names::{Binding, Def, ItemRef, Origin, PerNs, Primitive, SELF, Sym, Symbols, plain};
+use crate::names::{Binding, Def, ItemRef, Ns, Origin, PerNs, Primitive, SELF, Sym, Symbols, plain};
 use crate::outline::item::{ItemKind, Vis};
 use crate::outline::source::{Mark, Source};
 
+use super::super::body_scope::{BodyPath, outside};
 use super::super::impls::ImplRef;
 use super::super::ty::{Kind, Mut, Ty};
 use super::{Infer, Res};
@@ -48,18 +49,19 @@ impl<'a> Infer<'_, 'a> {
 
     /// The item in the value namespace that the path `segments` names.
     pub(super) fn value_def(&mut self, segments: &[Sym], absolute: bool, dollar: Option<u32>) -> Result<Def> {
+        let (segments, inside) = match self.local_def(&NamePath { segments, absolute, dollar }, Ns::Values) {
+            Some(Ok(def)) => return Ok(def),
+            Some(Err(skip)) => (&segments[skip..], false),
+            None => (segments, true),
+        };
+        let absolute = absolute && inside;
         let Some((last, prefix)) = segments.split_last() else { bail!("empty path") };
-        if let (true, Some(found)) = (prefix.is_empty(), self.declared_item(self.cx.names.symbols.text(*last))) {
-            return Ok(Def::Item(found));
-        }
-        if let Some(found) = self.local_member(segments) {
-            return Ok(found);
-        }
         let found = if prefix.is_empty() {
-            let local = if absolute { None } else { self.body_use(*last).values };
+            let local = if absolute || !inside { None } else { self.body_use(*last).values };
             local.or_else(|| self.cx.paths(self.home.krate).first(*last, self.home, &NamePath { segments, absolute, dollar }).values)
         } else {
-            let head = self.type_def(&NamePath { segments: prefix, absolute, dollar });
+            let path = NamePath { segments: prefix, absolute, dollar };
+            let head = if inside { self.type_def(&path) } else { self.cx.paths(self.home.krate).resolve(&path, self.home) };
             head.map(|def| self.cx.paths(self.home.krate).member(def, *last)).and_then(|entry| entry.values)
         };
         match found {
@@ -73,7 +75,7 @@ impl<'a> Infer<'_, 'a> {
         if !self.items.is_empty() {
             return self.type_def_here(path);
         }
-        let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some());
+        let here = self.anchor().and_then(|(root, from)| from.map(|at| root.inner(at)));
         let key = (self.home, self.root, here, path.segments.to_vec(), path.absolute, path.dollar);
         if let Some(&found) = self.cx.type_defs.borrow().get(&key) {
             return Some(found);
@@ -84,39 +86,41 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn type_def_here(&mut self, path: &NamePath<'_>) -> Option<Def> {
-        let inner = if let [name] = path.segments { self.declared_item(self.cx.names.symbols.text(*name)) } else { None };
-        inner.map(Def::Item).or_else(|| self.local_member(path.segments)).or_else(|| self.resolve_local(path))
+        match self.local_def(path, Ns::Types) {
+            Some(Ok(def)) => Some(def),
+            Some(Err(skip)) => self.cx.paths(self.home.krate).resolve(&outside(path, skip), self.home),
+            None => self.resolve_local(path),
+        }
     }
 
-    /// The item that `module::inner::name` names, or the variant that a last `Enum::Variant` names, when the body declares the first module or enum.
-    fn local_member(&mut self, segments: &[Sym]) -> Option<Def> {
-        let (head, rest) = segments.split_first()?;
-        if rest.is_empty() {
-            return None;
+    /// The body item that a path written here starts from: the current item when the body declares it, otherwise the body itself.
+    fn anchor(&self) -> Option<(ItemRef, Option<u32>)> {
+        let here = self.frame_item.or_else(|| self.block.and_then(ImplRef::item));
+        match here.and_then(ItemRef::outer) {
+            Some((root, at)) => Some((root, Some(at))),
+            None => self.root.map(|root| (root, None)),
         }
-        let mut item = self.declared_item(self.cx.names.symbols.text(*head))?;
-        for (at, name) in rest.iter().enumerate() {
-            let text = self.cx.names.symbols.text(*name);
-            match self.cx.item(item).1.kind {
-                ItemKind::Enum if at + 1 == rest.len() => {
-                    let def = self.cx.adt_def(item).ok()?;
-                    let src = self.cx.item(item).0;
-                    return def.variants.iter().find(|variant| plain(src.text(variant.name)) == text).map(|variant| Def::Variant(item, variant.index));
-                }
-                ItemKind::Mod => item = self.local_child(item, text)?,
-                _ => return None,
-            }
-        }
-        Some(Def::Item(item))
     }
 
-    /// The item named `name` inside the body-declared module `module`.
-    fn local_child(&self, module: ItemRef, name: &str) -> Option<ItemRef> {
-        let (root, at) = module.outer()?;
-        let file = &self.cx.expansion(root)?.file;
-        let named = |entry: &crate::outline::item::Item| entry.parent == Some(at) && entry.name.is_some_and(|word| plain(file.source.text(word)) == name);
-        let child = file.items.items.iter().position(named)?;
-        Some(root.inner(child as u32))
+    /// Where `path` leads among the items that the body declares: the item or variant it names, or `Err` with the count of segments that led out through `super`.
+    fn local_def(&mut self, path: &NamePath<'_>, ns: Ns) -> Option<Result<Def, usize>> {
+        let head = path.segments.first().filter(|_| !path.absolute).and_then(|first| self.block_item(self.cx.names.symbols.text(*first)));
+        let found = match head {
+            Some(item) => self.cx.local_descend(item, &path.segments[1..], ns)?,
+            None => self.cx.local_path(self.anchor(), path, ns)?,
+        };
+        Some(match found {
+            BodyPath::Item(item) => Ok(Def::Item(item)),
+            BodyPath::Variant(item) => Ok(self.variant_def(item, *path.segments.last()?)?),
+            BodyPath::Outside(skip) => Err(skip),
+        })
+    }
+
+    /// The variant named `name` of the enum `item`.
+    fn variant_def(&mut self, item: ItemRef, name: Sym) -> Option<Def> {
+        let def = self.cx.adt_def(item).ok()?;
+        let (src, text) = (self.cx.item(item).0, self.cx.names.symbols.text(name));
+        def.variants.iter().find(|variant| plain(src.text(variant.name)) == text).map(|variant| Def::Variant(item, variant.index))
     }
 
     /// Resolves every segment of `path` in the type namespace, its first through the body's own `use` declarations when one binds it.
@@ -197,10 +201,9 @@ impl<'a> Infer<'_, 'a> {
         out
     }
 
-    /// The item named `name` that a block around the use declares, or else some block of the body.
-    pub(super) fn declared_item(&self, name: &str) -> Option<ItemRef> {
-        let scoped = self.items.iter().rev().find(|(bound, _)| *bound == name).map(|(_, item)| *item);
-        scoped.or_else(|| self.root.and_then(|root| self.cx.body_item(root, name)))
+    /// The item named `name` that a block around the use declares.
+    fn block_item(&self, name: &str) -> Option<ItemRef> {
+        self.items.iter().rev().find(|(bound, _)| *bound == name).map(|(_, item)| *item)
     }
 
     /// Resolves the value path expression `expr` to a local or an item, and returns its type.
@@ -428,7 +431,13 @@ impl<'a> Infer<'_, 'a> {
         }
         autos.sort_by_key(|item| (item.krate, item.file, item.item));
         autos.dedup();
-        let Some((of, path)) = principal else { bail!("a trait object of auto traits only") };
+        let Some((of, path)) = principal else {
+            if autos.is_empty() {
+                bail!("a trait object with no trait");
+            }
+            let first = autos.remove(0);
+            return Ok(Kind::Dyn(first, Vec::new(), Vec::new(), autos));
+        };
         let count = arena.list(arena.path(path).segments).len();
         let given = self.segment_args(arena, path, count)?;
         let wanted = super::scope::type_params(&self.cx.trait_generics(of)?.1.params).count();
@@ -465,6 +474,9 @@ impl<'a> Infer<'_, 'a> {
     /// The type that the type alias `item` names at the type arguments `given`, then the defaults of the rest, or fresh ones in a value path that gives none.
     pub(super) fn alias(&mut self, item: ItemRef, given: Vec<Ty>, fresh: bool) -> Result<Ty> {
         let (params, arena, ty) = self.cx.alias_parts(item)?;
+        if let Some(definer) = self.opaque_alias(item, &params, &arena) {
+            return super::opaque::revealed(self.cx, definer, &[]);
+        }
         let declared = self.cx.alias_generics(item)?;
         let file = self.cx.file(item);
         let mut args = given;
@@ -483,6 +495,15 @@ impl<'a> Infer<'_, 'a> {
         let generics = names.into_iter().zip(args).collect();
         let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty: None, block: None, item: Some(item), root: item.declaring_body() };
         self.with_frame(frame, |infer| infer.lower_ty(&arena, ty))
+    }
+
+    /// The function that defines the hidden types of the alias `item` when its body holds `impl Trait`, it has no type parameters, and this body is not that function, which binds them itself.
+    fn opaque_alias(&self, item: ItemRef, params: &[crate::body::sig::Generic], arena: &Body) -> Option<ItemRef> {
+        if !params.is_empty() || item.outer().is_some() || !arena.tys.iter().any(|ty| matches!(ty, syntax::Ty::ImplTrait(..))) {
+            return None;
+        }
+        let definer = super::opaque::opaque_definer(self.cx, item)?;
+        self.instance.as_ref().is_none_or(|(at, _)| *at != definer).then_some(definer)
     }
 
     fn impl_param(&mut self, at: u32) -> Ty {
