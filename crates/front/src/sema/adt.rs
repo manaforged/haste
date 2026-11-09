@@ -59,13 +59,11 @@ impl Context<'_> {
         self.attr_value(item, "lang")
     }
 
-    /// The value of the name-value attribute `#[key = "..."]` on `item`.
+    /// The value of the name-value attribute `#[key = "..."]` on `item`, written directly or through a `cfg_attr` that holds.
     pub fn attr_value(&self, item: ItemRef, key: &str) -> Option<&str> {
         let (src, entry) = self.item(item);
-        let at = entry.attrs.iter().find_map(|attr| match attr {
-            Attr::Other(at) if src.text(*at) == key => Some(*at),
-            _ => None,
-        })?;
+        let env = &self.outline.crates[item.krate as usize].env;
+        let at = named_attr((src, env), &entry.attrs, key)?;
         Some(src.text(at + 2).trim_matches('"'))
     }
 
@@ -119,4 +117,12 @@ fn discr_range(dl: &TargetDataLayout, repr: &ReprOptions, min: i128, max: i128) 
     let signed = std::cmp::max(Integer::fit_signed(min), Integer::fit_signed(max));
     let at_least = if repr.c() { Integer::I32 } else { Integer::I8 };
     if min >= 0 { (std::cmp::max(unsigned, at_least), false) } else { (std::cmp::max(signed, at_least), true) }
+}
+
+fn named_attr((src, env): (&crate::outline::source::Source, &crate::outline::tree::Env), attrs: &[Attr], key: &str) -> Option<u32> {
+    attrs.iter().find_map(|attr| match attr {
+        Attr::Other(at) if src.text(*at) == key => Some(*at),
+        Attr::CfgAttr(cfg, inner) if env.eval(cfg) == crate::outline::tree::Truth::Yes => named_attr((src, env), inner, key),
+        _ => None,
+    })
 }

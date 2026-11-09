@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, bail};
-use haste_codegen::{Block, Signature, Type, Value};
+use haste_codegen::{Block, Signature, StackSlot, Type, Value};
 
 use crate::body::{Expr, ExprId, List, UnOp};
 use crate::names::ItemRef;
@@ -51,6 +51,10 @@ impl Lower<'_, '_> {
             Expr::Cast(inner, _) => self.cast(expr, inner),
             Expr::Call(callee, args) => self.call(expr, callee, args),
             Expr::Method { receiver, params, .. } => self.method(expr, receiver, params),
+            Expr::OffsetOf { .. } => {
+                let Some(&offset) = self.typed.offsets.get(&expr) else { bail!("offset_of with no offset") };
+                Ok(Some(self.int_const(haste_codegen::Type::I64, u128::from(offset))))
+            }
             _ => self.memory(expr),
         }
     }
@@ -78,11 +82,12 @@ impl Lower<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Try } => self.try_block(expr, stmts, tail),
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail),
+            Expr::Block { stmts, tail, label: Some(label), .. } => self.labeled_block(expr, (stmts, tail), label),
             Expr::If(cond, then, otherwise) => self.if_expr(expr, cond, then, otherwise),
-            Expr::While { cond, body, label: None } => self.while_expr(cond, body),
-            Expr::Loop { body, label: None } => self.loop_expr(expr, body),
-            Expr::Break(None, value) => self.break_expr(value),
-            Expr::Continue(None) => self.continue_expr(),
+            Expr::While { cond, body, label } => self.while_expr(cond, body, label),
+            Expr::Loop { body, label } => self.loop_expr(expr, body, label),
+            Expr::Break(label, value) => self.break_expr(label, value),
+            Expr::Continue(label) => self.continue_expr(label),
             Expr::Return(value) => self.return_expr(value),
             _ => self.data(expr),
         }
@@ -97,7 +102,7 @@ impl Lower<'_, '_> {
             Expr::Array(items) => self.array(expr, items),
             Expr::Repeat(value, _) => self.repeat(expr, value),
             Expr::Index(..) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
-            Expr::For { label: None, pat, iter, body } => self.for_expr(expr, pat, iter, body),
+            Expr::For { label, pat, iter, body } => self.for_expr(expr, pat, iter, (label, body)),
             Expr::Try(inner) => self.try_expr(expr, inner),
             Expr::Range { from, to, .. } => self.range(expr, from, to),
             ref other => bail!("cannot lower expression {other:?} yet"),
@@ -162,6 +167,7 @@ impl Lower<'_, '_> {
         }
         let (item, substs) = match self.typed.res.get(&callee).cloned() {
             Some(Res::Fn(item, substs)) => (item, substs),
+            Some(Res::Fn(item, _)) if matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static) => return self.pointer_call(expr, callee, args),
             Some(Res::Ctor(_, variant, _)) => return self.ctor_call(expr, variant, args),
             _ => return self.pointer_call(expr, callee, args),
         };
@@ -303,7 +309,7 @@ impl Lower<'_, '_> {
         Ok(joined)
     }
 
-    fn while_expr(&mut self, cond: ExprId, body: ExprId) -> Result<Option<Value>> {
+    fn while_expr(&mut self, cond: ExprId, body: ExprId, label: Option<u32>) -> Result<Option<Value>> {
         let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.jump(head, &[]);
         self.enter(head);
@@ -317,7 +323,7 @@ impl Lower<'_, '_> {
             self.jump(exit, &[]);
         }
         self.enter(inner);
-        self.loops.push(Loop { head, exit, value: None, depth });
+        self.loops.push(Loop { head, exit, value: None, depth, label, block: false });
         let result = self.expr(body);
         self.loops.pop();
         result?;
@@ -327,16 +333,34 @@ impl Lower<'_, '_> {
         Ok(None)
     }
 
-    fn loop_expr(&mut self, expr: ExprId, body: ExprId) -> Result<Option<Value>> {
+    fn labeled_block(&mut self, expr: ExprId, (stmts, tail): (List, Option<ExprId>), label: u32) -> Result<Option<Value>> {
+        let exit = self.b.create_block();
+        let value = self.value_slot(expr)?;
+        self.loops.push(Loop { head: exit, exit, value, depth: self.owned.len(), label: Some(label), block: true });
+        let output = self.block(stmts, tail);
+        self.loops.pop();
+        if let (Some(output), Some((slot, _))) = (output?, value)
+            && self.open
+        {
+            self.ins().stack_store(output, slot, 0);
+        }
+        self.branch_value(None, exit);
+        self.enter(exit);
+        Ok(value.map(|(slot, ty)| self.ins().stack_load(ty, slot, 0)))
+    }
+
+    /// A stack slot for the value of the loop or block `expr` that its `break`s leave with, when it has a scalar value.
+    pub(super) fn value_slot(&mut self, expr: ExprId) -> Result<Option<(StackSlot, Type)>> {
+        Ok(Self::carrier(self.repr_of(expr)?).map(|ty| (self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8), ty)))
+    }
+
+    fn loop_expr(&mut self, expr: ExprId, body: ExprId, label: Option<u32>) -> Result<Option<Value>> {
         let (head, exit) = (self.b.create_block(), self.b.create_block());
-        let value = match Self::carrier(self.repr_of(expr)?) {
-            Some(ty) => Some((self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8), ty)),
-            None => None,
-        };
+        let value = self.value_slot(expr)?;
         self.jump(head, &[]);
         self.enter(head);
         let depth = self.owned.len();
-        self.loops.push(Loop { head, exit, value, depth });
+        self.loops.push(Loop { head, exit, value, depth, label, block: false });
         let result = self.expr(body);
         self.loops.pop();
         result?;
@@ -345,12 +369,16 @@ impl Lower<'_, '_> {
         Ok(value.map(|(slot, ty)| self.ins().stack_load(ty, slot, 0)))
     }
 
-    fn break_expr(&mut self, value: Option<ExprId>) -> Result<Option<Value>> {
+    fn jump_target(&self, label: Option<u32>) -> Option<Loop> {
+        self.loops.iter().rev().find(|frame| crate::body::jumps_to(self.src, (frame.label, frame.block), label)).copied()
+    }
+
+    fn break_expr(&mut self, label: Option<u32>, value: Option<ExprId>) -> Result<Option<Value>> {
         let value = match value {
             Some(value) => self.expr(value)?,
             None => None,
         };
-        let Some(&Loop { exit, value: slot, depth, .. }) = self.loops.last() else { bail!("`break` outside a loop") };
+        let Some(Loop { exit, value: slot, depth, .. }) = self.jump_target(label) else { bail!("`break` outside a loop") };
         if let (Some(value), Some((slot, _))) = (value, slot) {
             self.ins().stack_store(value, slot, 0);
         }
@@ -359,8 +387,8 @@ impl Lower<'_, '_> {
         Ok(None)
     }
 
-    fn continue_expr(&mut self) -> Result<Option<Value>> {
-        let Some(&Loop { head, depth, .. }) = self.loops.last() else { bail!("`continue` outside a loop") };
+    fn continue_expr(&mut self, label: Option<u32>) -> Result<Option<Value>> {
+        let Some(Loop { head, depth, .. }) = self.jump_target(label) else { bail!("`continue` outside a loop") };
         self.drop_to(depth)?;
         self.branch_value(None, head);
         Ok(None)

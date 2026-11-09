@@ -174,9 +174,10 @@ impl<'a> Context<'a> {
 
     /// The inherent impls of types with head `head`, asking for every module of the crates that may hold one.
     pub fn inherent(&mut self, head: Head) -> Vec<ImplRef> {
+        let standard = self.primitive_holders();
         let holders = match head {
-            Head::Adt(item) => vec![item.krate],
-            _ => self.primitive_holders(),
+            Head::Adt(item) if !standard.contains(&item.krate) => vec![item.krate],
+            _ => standard,
         };
         let mut found = Vec::new();
         for holder in self.holders_with_body(&holders, (Some(head), None)) {

@@ -1,4 +1,4 @@
-//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, and every other name through the dynamic linker.
+//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
 
 use std::alloc::Layout;
 use std::ffi::CString;
@@ -10,12 +10,16 @@ pub fn symbol(name: &str) -> Option<usize> {
         "__rust_alloc_zeroed" => alloc_zeroed as *const () as usize,
         "__rust_dealloc" => dealloc as *const () as usize,
         "__rust_realloc" => realloc as *const () as usize,
-        "__rust_alloc_error_handler" => alloc_error as *const () as usize,
         "__rust_no_alloc_shim_is_unstable_v2" => nothing as *const () as usize,
+        "__dso_handle" => &DSO_HANDLE as *const u8 as usize,
+        "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => abort as *const () as usize,
         _ => return dynamic(name),
     };
     Some(shim)
 }
+
+/// The object whose address stands for the host program where the linker's hidden `__dso_handle` would, which the C runtime reads as the main program.
+static DSO_HANDLE: u8 = 0;
 
 fn dynamic(name: &str) -> Option<usize> {
     let name = CString::new(name).ok()?;
@@ -44,8 +48,8 @@ extern "C" fn realloc(pointer: *mut u8, size: usize, align: usize, new_size: usi
     unsafe { std::alloc::realloc(pointer, Layout::from_size_align_unchecked(size, align), new_size) }
 }
 
-extern "C" fn alloc_error(_size: usize, _align: usize) {
+extern "C" fn nothing() {}
+
+extern "C" fn abort() -> ! {
     std::process::abort()
 }
-
-extern "C" fn nothing() {}

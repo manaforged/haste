@@ -24,8 +24,19 @@ impl Lower<'_, '_> {
                 self.close();
                 Ok(None)
             }
+            Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
             _ => self.memory_intrinsic(which, substs, args),
         }
+    }
+
+    fn catch_unwind(&mut self, args: &[Value]) -> Result<Value> {
+        let &[try_fn, data, _] = args else { bail!("catch_unwind takes three arguments") };
+        let byte = self.cx.types.prim(Primitive::U8);
+        let pointer = self.cx.types.intern(Kind::Ptr(crate::sema::ty::Mut::Mut, byte));
+        let unit = self.cx.types.unit();
+        let signature = super::signature_of(self.cx, Some(unit), [pointer])?;
+        self.call_code(try_fn, (signature, Some(unit)), vec![data])?;
+        Ok(self.ins().iconst(Type::I32, 0))
     }
 
     fn transmute(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {

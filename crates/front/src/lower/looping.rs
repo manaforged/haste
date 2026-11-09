@@ -9,7 +9,7 @@ use super::{Loop, Lower, repr};
 
 impl Lower<'_, '_> {
     /// Lowers `for pat in iter { body }`: `into_iter` once, then `next` until it returns `None`.
-    pub fn for_expr(&mut self, expr: ExprId, pat: PatId, iter: ExprId, body: ExprId) -> Result<Option<Value>> {
+    pub fn for_expr(&mut self, expr: ExprId, pat: PatId, iter: ExprId, (label, body): (Option<u32>, ExprId)) -> Result<Option<Value>> {
         let Some(each) = self.typed.fors.get(&expr).cloned() else { bail!("`for` loop has no iterator calls") };
         let (Res::Fn(into, into_substs), Res::Fn(next, next_substs)) = (&each.into_iter, &each.next) else { bail!("`for` loop calls are not functions") };
         let value = self.expr(iter)?;
@@ -30,7 +30,7 @@ impl Lower<'_, '_> {
         self.enter(inner);
         let item = self.variant_field(option, each.option, (each.some, 0))?;
         self.bind_matched(pat, Some(item), None)?;
-        self.loops.push(Loop { head, exit, value: None, depth });
+        self.loops.push(Loop { head, exit, value: None, depth, label, block: false });
         let result = self.expr(body);
         self.loops.pop();
         result?;
@@ -67,8 +67,8 @@ impl Lower<'_, '_> {
     pub fn try_block(&mut self, expr: ExprId, stmts: List, tail: Option<ExprId>) -> Result<Option<Value>> {
         let Some(Res::Fn(from_output, substs)) = self.typed.try_blocks.get(&expr).cloned() else { bail!("`try` block has no `from_output` call") };
         let exit = self.b.create_block();
-        let value = Self::carrier(self.repr_of(expr)?).map(|ty| (self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8), ty));
-        self.try_exits.push((expr, Loop { head: exit, exit, value, depth: self.owned.len() }));
+        let value = self.value_slot(expr)?;
+        self.try_exits.push((expr, Loop { head: exit, exit, value, depth: self.owned.len(), label: None, block: true }));
         let output = self.block(stmts, tail);
         let wrapped = match output {
             Ok(output) if self.open => self.invoke(from_output, &substs, output.into_iter().collect()),

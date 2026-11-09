@@ -293,11 +293,31 @@ impl Cursor<'_> {
         }
         if word == "builtin" && self.punct_at(self.at + 1, "#") {
             self.at += 2;
-            self.name()?;
+            let name = self.name()?;
             let open = self.group();
+            if self.src.text(name) == "offset_of" {
+                return self.offset_of(open).map(Some);
+            }
             return Ok(Some(self.push_expr(Expr::FormatArgs(open))));
         }
         Ok(None)
+    }
+
+    fn offset_of(&mut self, open: u32) -> Result<ExprId> {
+        let (ty, fields) = self.inside(open, |cursor| {
+            let ty = cursor.ty()?;
+            cursor.expect(",")?;
+            let mut fields = Vec::new();
+            while !cursor.done() {
+                if !matches!(cursor.src.text(cursor.at), "." | "(" | ")") {
+                    fields.push(cursor.at);
+                }
+                cursor.at += 1;
+            }
+            Ok((ty, fields))
+        })?;
+        let fields = self.list(&fields);
+        Ok(self.push_expr(Expr::OffsetOf { ty, fields }))
     }
 
     fn block_kind_ahead(&self) -> bool {

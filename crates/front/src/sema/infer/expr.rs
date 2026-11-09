@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::body::{BinOp, Expr, ExprId, List, Lit, TyId, UnOp};
-use crate::names::Primitive;
+use crate::names::{ItemRef, Primitive};
 
 use super::super::ty::{Kind, Mut, Ty, float_bits, int_info};
 use super::{Breaks, Infer, Res};
@@ -97,11 +97,12 @@ impl Infer<'_, '_> {
             Expr::Method { receiver, name, args, params } => self.method_call(expr, receiver, name, (args, params)),
             Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Try } => self.try_block(expr, (stmts, tail), expected),
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail, expected),
+            Expr::Block { stmts, tail, label: Some(label), .. } => self.labeled_block((stmts, tail), label, expected),
             Expr::If(cond, then, otherwise) => self.if_expr(cond, then, otherwise, expected),
-            Expr::While { cond, body, label: None } => self.while_expr(cond, body),
-            Expr::Loop { body, label: None } => self.loop_expr(body, expected),
-            Expr::Break(None, value) => self.break_expr(value),
-            Expr::Continue(None) => Ok(self.cx.types.intern(Kind::Never)),
+            Expr::While { cond, body, label } => self.while_expr(cond, body, label),
+            Expr::Loop { body, label } => self.loop_expr(body, label, expected),
+            Expr::Break(label, value) => self.break_expr(label, value),
+            Expr::Continue(_) => Ok(self.cx.types.intern(Kind::Never)),
             Expr::Return(value) => self.return_expr(value),
             Expr::Try(inner) => self.try_expr(expr, inner),
             _ => self.data(expr, expected),
@@ -315,14 +316,28 @@ impl Infer<'_, '_> {
             _ => bail!("calling {} is not supported yet", self.show(callee_ty)),
         };
         let args = self.body.list(args).to_vec();
-        if args.len() != params.len() {
-            bail!("call takes {} arguments, {} given", params.len(), args.len());
-        }
+        let extra = self.variadic_extra(def.as_ref().map(|(item, _)| *item), args.len(), params.len())?;
         let hints = self.expected_inputs(&params, ret, expected);
-        for ((arg, param), hint) in args.into_iter().zip(params).zip(hints) {
+        for ((&arg, param), hint) in args.iter().zip(params).zip(hints) {
             self.call_arg(def.as_ref().map(|(item, substs)| (*item, &substs[..])), ExprId(arg), (param, hint))?;
         }
+        for &arg in &args[args.len() - extra..] {
+            self.expr(ExprId(arg), None)?;
+        }
         Ok(ret)
+    }
+
+    /// How many arguments past its `params` a call of `callee` with `given` arguments passes, which only a C-variadic foreign function takes.
+    fn variadic_extra(&mut self, callee: Option<ItemRef>, given: usize, params: usize) -> Result<usize> {
+        let variadic = match callee {
+            Some(item) => self.cx.foreign(item) && self.cx.signature(item)?.variadic,
+            None => false,
+        };
+        match given.checked_sub(params) {
+            Some(0) => Ok(0),
+            Some(extra) if variadic => Ok(extra),
+            _ => bail!("call takes {params} arguments, {given} given"),
+        }
     }
 
     fn expected_inputs(&mut self, params: &[Ty], ret: Ty, expected: Option<Ty>) -> Vec<Option<Ty>> {
@@ -385,18 +400,18 @@ impl Infer<'_, '_> {
         Ok(Some(self.cx.types.intern(shared)))
     }
 
-    fn while_expr(&mut self, cond: ExprId, body: ExprId) -> Result<Ty> {
+    fn while_expr(&mut self, cond: ExprId, body: ExprId, label: Option<u32>) -> Result<Ty> {
         let bool_ty = self.cx.types.bool();
         let depth = self.scopes.len();
         let found = self.expr(cond, Some(bool_ty))?;
         self.coerce(found, bool_ty)?;
-        self.unit_loop_body(body, depth)
+        self.unit_loop_body(body, label, depth)
     }
 
-    /// Infers the body of a `while` or `for` loop, whose `break`s give unit, and drops the scopes above `depth` after it.
-    pub(super) fn unit_loop_body(&mut self, body: ExprId, depth: usize) -> Result<Ty> {
+    /// Infers the body of a `while` or `for` loop labeled `label`, whose `break`s give unit, and drops the scopes above `depth` after it.
+    pub(super) fn unit_loop_body(&mut self, body: ExprId, label: Option<u32>, depth: usize) -> Result<Ty> {
         let unit = self.cx.types.unit();
-        self.loops.push(Breaks { ty: Some(unit), broke: false });
+        self.loops.push(Breaks { ty: Some(unit), broke: false, label, block: false });
         let diverges = self.diverges;
         let body_ty = self.expr(body, Some(unit));
         self.scopes.truncate(depth);
@@ -406,9 +421,27 @@ impl Infer<'_, '_> {
         Ok(unit)
     }
 
-    fn loop_expr(&mut self, body: ExprId, expected: Option<Ty>) -> Result<Ty> {
+    fn labeled_block(&mut self, (stmts, tail): (List, Option<ExprId>), label: u32, expected: Option<Ty>) -> Result<Ty> {
         let before = self.diverges;
-        self.loops.push(Breaks { ty: self.known(expected), broke: false });
+        self.loops.push(Breaks { ty: self.known(expected), broke: false, label: Some(label), block: true });
+        let found = self.block(stmts, tail, expected);
+        let breaks = self.loops.pop().expect("the block pushed its breaks");
+        let found = found?;
+        match (breaks.broke, breaks.ty) {
+            (true, Some(ty)) => {
+                if !matches!(self.cx.types.kind(self.resolve(found)), Kind::Never) {
+                    self.coerce(found, ty)?;
+                }
+                self.diverges = before;
+                Ok(ty)
+            }
+            _ => Ok(found),
+        }
+    }
+
+    fn loop_expr(&mut self, body: ExprId, label: Option<u32>, expected: Option<Ty>) -> Result<Ty> {
+        let before = self.diverges;
+        self.loops.push(Breaks { ty: self.known(expected), broke: false, label, block: false });
         let unit = self.cx.types.unit();
         let body_ty = self.expr(body, Some(unit));
         let breaks = self.loops.pop().expect("the loop pushed its breaks");
@@ -422,8 +455,10 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn break_expr(&mut self, value: Option<ExprId>) -> Result<Ty> {
-        let Some(&slot) = self.loops.last() else { bail!("`break` outside a loop") };
+    fn break_expr(&mut self, label: Option<u32>, value: Option<ExprId>) -> Result<Ty> {
+        let src = self.src;
+        let Some(at) = self.loops.iter().rposition(|frame| crate::body::jumps_to(src, (frame.label, frame.block), label)) else { bail!("`break` outside a loop") };
+        let slot = self.loops[at];
         let found = match value {
             Some(value) => self.expr(value, slot.ty)?,
             None => self.cx.types.unit(),
@@ -433,9 +468,7 @@ impl Infer<'_, '_> {
             (Some(known), None) => self.coerce(found, known).map(|_| known)?,
             (None, _) => found,
         };
-        if let Some(last) = self.loops.last_mut() {
-            *last = Breaks { ty: Some(ty), broke: true };
-        }
+        self.loops[at] = Breaks { ty: Some(ty), broke: true, ..slot };
         Ok(self.cx.types.intern(Kind::Never))
     }
 

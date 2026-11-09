@@ -88,6 +88,8 @@ pub struct Typed {
     /// The expressions whose value coerces to the type it is used at, and how.
     pub coercions: HashMap<ExprId, Coercion>,
     pub fields: HashMap<ExprId, u32>,
+    /// The byte offset that each `offset_of!` names.
+    pub offsets: HashMap<ExprId, u64>,
     /// The fields that each range expression fills: one per end it gives, in order, then `exhausted` for an inclusive range.
     pub ranges: HashMap<ExprId, Vec<u32>>,
     pub field_pats: HashMap<PatId, u32>,
@@ -171,11 +173,13 @@ pub struct Infer<'c, 'a> {
     diverges: bool,
 }
 
-/// What the `break`s of one loop give: the type they coerce to once it is known, and whether any `break` was seen.
+/// What the `break`s of one loop or labeled block give: the type they coerce to once it is known, whether any `break` was seen, its label, and whether it is a block.
 #[derive(Clone, Copy)]
 struct Breaks {
     ty: Option<Ty>,
     broke: bool,
+    label: Option<u32>,
+    block: bool,
 }
 
 /// Infers the body of the function `item` with its generic parameters set to `substs`.

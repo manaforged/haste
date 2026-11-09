@@ -123,6 +123,35 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Infers the field access `expr` on `base`, through references.
+    /// Infers `offset_of!(ty, fields)`: a `usize` whose value, the byte offset of the field path in `ty`, lowering reads.
+    pub fn offset_of(&mut self, expr: ExprId, ty: crate::body::TyId, fields: crate::body::List) -> Result<Ty> {
+        let mut current = self.lower_ty(self.body, ty)?;
+        let mut offset = 0;
+        for &at in self.body.list(fields) {
+            for name in self.src.text(at).split('.').map(plain) {
+                let (index, field) = self.field_at(current, name)?;
+                offset += crate::sema::layout::field_offset(&*self.cx.layout(current)?, 0, index) as u64;
+                current = field;
+            }
+        }
+        self.out.offsets.insert(expr, offset);
+        Ok(self.cx.types.prim(crate::names::Primitive::Usize))
+    }
+
+    fn field_at(&mut self, ty: Ty, name: &str) -> Result<(u32, Ty)> {
+        match self.cx.types.kind(self.resolve(ty)).clone() {
+            Kind::Tuple(items) => {
+                let index: u32 = name.parse()?;
+                items.get(index as usize).map(|&item| (index, item)).ok_or_else(|| anyhow::anyhow!("no field {index} on a tuple of {}", items.len()))
+            }
+            Kind::Adt(item, args) => {
+                let Some(index) = self.field_index(item, 0, name)? else { bail!("no field `{name}` on {}", self.cx.name(item)) };
+                Ok((index, self.adt_fields(item, &args)?[0][index as usize]))
+            }
+            _ => bail!("offset_of on {}", self.show(ty)),
+        }
+    }
+
     pub fn field_expr(&mut self, expr: ExprId, base: ExprId, name: &str) -> Result<Ty> {
         let found = self.expr(base, None)?;
         let ty = self.field_base(expr, found, name)?;

@@ -341,7 +341,12 @@ fn declared(source: &Source, config: syntax::Config<'_>, body: &Body) -> Result<
         let first = items.items.len();
         items = scan::body_items(source, std::mem::take(&mut starts), items)?;
         for entry in &items.items[first..] {
-            if entry.kind != ItemKind::Fn || entry.body.is_none() {
+            let has_body = match entry.kind {
+                ItemKind::Fn => entry.body.is_some(),
+                ItemKind::Const | ItemKind::Static => true,
+                _ => false,
+            };
+            if !has_body {
                 continue;
             }
             if let Ok(inner) = parse_in(source, config, entry) {

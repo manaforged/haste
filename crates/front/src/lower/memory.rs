@@ -18,10 +18,7 @@ impl Lower<'_, '_> {
         match (which, ty, args) {
             (SizeOf | AlignOf, Some(ty), _) => self.layout_const(which, ty).map(Some),
             (SizeOfVal | AlignOfVal, Some(ty), &[pointer]) => self.value_layout(which == SizeOfVal, ty, pointer).map(Some),
-            (NeedsDrop, Some(ty), _) => {
-                let needs = crate::sema::infer::needs_drop(self.cx, ty)?;
-                Ok(Some(self.ins().iconst(Type::I8, i64::from(needs))))
-            }
+            (NeedsDrop | TypeId, Some(ty), _) => self.type_fact(which, ty).map(Some),
             (NoOp, _, _) => Ok(None),
             (Fence, _, _) => {
                 self.ins().fence();
@@ -76,6 +73,23 @@ impl Lower<'_, '_> {
         Ok(boxed)
     }
 
+    fn type_fact(&mut self, which: Intrinsic, ty: Ty) -> Result<Value> {
+        if which == Intrinsic::TypeId {
+            return Ok(self.type_id(ty));
+        }
+        let needs = crate::sema::infer::needs_drop(self.cx, ty)?;
+        Ok(self.ins().iconst(Type::I8, i64::from(needs)))
+    }
+
+    fn type_id(&mut self, ty: Ty) -> Value {
+        let slot = self.b.create_stack_slot(16, 3);
+        let id = self.ins().iconst(Type::I64, i64::from(ty.0));
+        let zero = self.ins().iconst(Type::I64, 0);
+        self.ins().stack_store(id, slot, 0);
+        self.ins().stack_store(zero, slot, 8);
+        self.ins().stack_addr(Type::I64, slot, 0)
+    }
+
     fn layout_const(&mut self, which: Intrinsic, ty: Ty) -> Result<Value> {
         let layout = self.cx.layout(ty)?;
         let value = if which == Intrinsic::SizeOf { layout.size.bytes() } else { layout.align.abi.bytes() };
@@ -107,7 +121,7 @@ impl Lower<'_, '_> {
         let layout = self.cx.layout(ty)?;
         let fields = crate::sema::infer::field_types(self.cx, item, args)?;
         let Some((index, &field)) = fields.first().and_then(|fields| fields.iter().enumerate().last()) else { bail!("an unsized struct with no fields") };
-        let offset = super::adt::field_offset(&layout, 0, index as u32);
+        let offset = crate::sema::layout::field_offset(&layout, 0, index as u32);
         let field_align = self.value_layout(false, field, pointer)?;
         let own_align = self.ins().iconst(Type::I64, layout.align.abi.bytes() as i64);
         let wider = self.ins().icmp(IntCC::UnsignedGreaterThan, own_align, field_align);

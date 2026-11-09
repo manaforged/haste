@@ -146,6 +146,7 @@ pub enum Expr {
     Paren(ExprId),
     Underscore,
     FormatArgs(u32),
+    OffsetOf { ty: TyId, fields: List },
 }
 
 /// What kind of block a block expression is.
@@ -330,6 +331,14 @@ pub struct Config<'a> {
 }
 
 /// Parses the block that opens at token `open` of `src` with `config`, leaving out the statements, arms, fields and arguments that `#[cfg]` turns off.
+/// Whether a `break` or `continue` with `label` jumps to the loop or labeled block `frame`, given as its own label and whether it is a block; one with no label skips labeled blocks.
+pub fn jumps_to(src: &Source, (own, block): (Option<u32>, bool), label: Option<u32>) -> bool {
+    match label {
+        Some(wanted) => own.is_some_and(|own| src.text(own) == src.text(wanted)),
+        None => !block,
+    }
+}
+
 pub fn parse(src: &Source, open: u32, config: Config<'_>) -> Result<Body> {
     let mut cursor = Cursor::new(src, open, src.pair(open) + 1);
     cursor.config = config;

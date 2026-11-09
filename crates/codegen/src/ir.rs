@@ -360,7 +360,8 @@ impl Function {
         Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None }
     }
 
-    pub(crate) fn ty(&self, value: Value) -> Type {
+    /// The type of `value`.
+    pub fn ty(&self, value: Value) -> Type {
         self.types[value.index()]
     }
 }

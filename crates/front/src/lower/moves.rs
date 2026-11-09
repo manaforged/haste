@@ -38,8 +38,11 @@ impl Lower<'_, '_> {
         Some((root, path))
     }
 
-    /// The root and path whose value a pattern matched against `scrutinee` takes parts of.
+    /// The root and path whose value a pattern matched against `scrutinee` takes parts of: the temporary that holds a coerced value.
     pub fn scrutinee_path(&self, scrutinee: ExprId) -> Option<(Root, MovePath)> {
+        if self.typed.coercions.contains_key(&scrutinee) {
+            return Some((Root::Temp(scrutinee), Vec::new()));
+        }
         self.move_path(scrutinee).or_else(|| (!self.is_place(scrutinee)).then(|| (Root::Temp(scrutinee), Vec::new())))
     }
 
@@ -100,7 +103,7 @@ impl Lower<'_, '_> {
     }
 
     fn pattern_paths(&mut self, pat: PatId, at: Option<(Root, MovePath)>, found: &mut FxHashMap<Root, Vec<MovePath>>) -> Result<()> {
-        let Some(at) = at else { return Ok(()) };
+        let Some(at) = at.filter(|_| self.typed.pats.contains_key(&pat)) else { return Ok(()) };
         if self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) > 0 {
             return Ok(());
         }

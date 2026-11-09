@@ -217,8 +217,7 @@ impl Infer<'_, '_> {
                 Ok((value, suffix.and_then(int_info).unwrap_or(want)))
             }
             Expr::Lit(Lit::Bool(value), _) => Ok((u128::from(value), BOOL)),
-            Expr::Paren(inner) => self.const_eval(arena, inner, want),
-            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.const_eval(arena, tail, want),
+            Expr::Paren(_) | Expr::Block { .. } | Expr::If(..) => self.const_flow(arena, expr, want),
             Expr::Unary(op, inner) => self.const_unary(arena, op, inner, want),
             Expr::Binary(op, lhs, rhs) => self.const_binary(arena, op, (lhs, rhs), want),
             Expr::Cast(inner, ty) => self.const_cast(arena, inner, ty),
@@ -226,6 +225,18 @@ impl Infer<'_, '_> {
             Expr::Path(path) => self.const_name(arena, (expr, path), want),
             Expr::Method { receiver, name, args: None, params } => self.const_method(arena, (receiver, name, params), want),
             other => bail!("constant expressions like {other:?} are not evaluated yet"),
+        }
+    }
+
+    fn const_flow(&mut self, arena: &Body, expr: ExprId, want: Int) -> Result<(u128, Int)> {
+        match *arena.expr(expr) {
+            Expr::Paren(inner) => self.const_eval(arena, inner, want),
+            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.const_eval(arena, tail, want),
+            Expr::If(cond, then, Some(otherwise)) => {
+                let (test, _) = self.const_eval(arena, cond, BOOL)?;
+                self.const_eval(arena, if test != 0 { then } else { otherwise }, want)
+            }
+            _ => bail!("constant blocks with statements and `if` with no `else` are not evaluated yet"),
         }
     }
 

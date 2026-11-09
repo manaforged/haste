@@ -120,6 +120,8 @@ struct Loop {
     exit: Block,
     value: Option<(StackSlot, Type)>,
     depth: usize,
+    label: Option<u32>,
+    block: bool,
 }
 
 /// The lowering of one body.

@@ -59,7 +59,7 @@ impl Infer<'_, '_> {
     }
 
     /// Infers `for pat in iter { body }`.
-    pub fn for_expr(&mut self, expr: ExprId, pat: PatId, iter: ExprId, body: ExprId) -> Result<Ty> {
+    pub fn for_expr(&mut self, expr: ExprId, pat: PatId, iter: ExprId, (label, body): (Option<u32>, ExprId)) -> Result<Ty> {
         let found = self.expr(iter, None)?;
         let (into_iter, iter_ty) = self.lang_call("into_iter", found)?;
         let by_mut = self.cx.types.intern(Kind::Ref(Mut::Mut, iter_ty));
@@ -69,7 +69,7 @@ impl Infer<'_, '_> {
         self.out.fors.insert(expr, For { into_iter, next, iter: iter_ty, option, some });
         let depth = self.scopes.len();
         self.bind_pat(pat, args[0])?;
-        self.unit_loop_body(body, depth)
+        self.unit_loop_body(body, label, depth)
     }
 
     fn lang_call(&mut self, lang: &str, receiver: Ty) -> Result<(Res, Ty)> {

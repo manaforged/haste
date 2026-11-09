@@ -17,8 +17,9 @@ impl Infer<'_, '_> {
             Expr::Array(items) => self.array_expr(items, expected),
             Expr::Repeat(value, len) => self.repeat_expr(value, len, expected),
             Expr::Index(base, index) => self.index_expr(expr, base, index),
-            Expr::For { label: None, pat, iter, body } => self.for_expr(expr, pat, iter, body),
+            Expr::For { label, pat, iter, body } => self.for_expr(expr, pat, iter, (label, body)),
             Expr::Range { from, to, inclusive } => self.range_expr(expr, (from, to), inclusive),
+            Expr::OffsetOf { ty, fields } => self.offset_of(expr, ty, fields),
             ref other => bail!("unsupported expression {other:?}"),
         }
     }

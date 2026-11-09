@@ -230,7 +230,7 @@ impl Lower<'_, '_> {
     fn multiply(&mut self, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<(Value, Value)> {
         let result = self.ins().imul(x, y);
         let ok = match (ty, signed) {
-            (Type::I128, _) => bail!("cannot lower checked 128-bit multiplication yet"),
+            (Type::I128, signed) => self.wide_product_fits(signed, x, y),
             (Type::I64, true) => {
                 let high = self.ins().smulhi(x, y);
                 let sign = self.ins().sshr_imm(result, 63);
@@ -249,6 +249,53 @@ impl Lower<'_, '_> {
             }
         };
         Ok((result, ok))
+    }
+
+    fn wide_product_fits(&mut self, signed: bool, x: Value, y: Value) -> Value {
+        if !signed {
+            return self.unsigned_wide_product_fits(x, y);
+        }
+        let shift = self.int_const(Type::I64, 127);
+        let (x_sign, y_sign) = (self.ins().sshr(x, shift), self.ins().sshr(y, shift));
+        let magnitude = |lower: &mut Self, value: Value, sign: Value| {
+            let flipped = lower.ins().bxor(value, sign);
+            lower.ins().isub(flipped, sign)
+        };
+        let (x_magnitude, y_magnitude) = (magnitude(self, x, x_sign), magnitude(self, y, y_sign));
+        let fits = self.unsigned_wide_product_fits(x_magnitude, y_magnitude);
+        let product = self.ins().imul(x_magnitude, y_magnitude);
+        let negative = self.ins().bxor(x_sign, y_sign);
+        let max = self.int_const(Type::I128, i128::MAX as u128);
+        let limit = self.ins().isub(max, negative);
+        let in_range = self.ins().icmp(IntCC::UnsignedLessThanOrEqual, product, limit);
+        self.ins().band(fits, in_range)
+    }
+
+    fn unsigned_wide_product_fits(&mut self, x: Value, y: Value) -> Value {
+        let shift = self.int_const(Type::I64, 64);
+        let halves = |lower: &mut Self, value: Value| {
+            let high = lower.ins().ushr(value, shift);
+            (lower.ins().ireduce(Type::I64, value), lower.ins().ireduce(Type::I64, high))
+        };
+        let ((x_low, x_high), (y_low, y_high)) = (halves(self, x), halves(self, y));
+        let both_high = {
+            let x_wide = self.ins().icmp_imm(IntCC::NotEqual, x_high, 0);
+            let y_wide = self.ins().icmp_imm(IntCC::NotEqual, y_high, 0);
+            self.ins().band(x_wide, y_wide)
+        };
+        let mut overflow = both_high;
+        let mut sum = self.ins().umulhi(x_low, y_low);
+        for (high, low) in [(x_high, y_low), (x_low, y_high)] {
+            let spill = self.ins().umulhi(high, low);
+            let spilled = self.ins().icmp_imm(IntCC::NotEqual, spill, 0);
+            let part = self.ins().imul(high, low);
+            let next = self.ins().iadd(sum, part);
+            let carried = self.ins().icmp(IntCC::UnsignedLessThan, next, part);
+            let either = self.ins().bor(spilled, carried);
+            overflow = self.ins().bor(overflow, either);
+            sum = next;
+        }
+        self.ins().icmp_imm(IntCC::Equal, overflow, 0)
     }
 
     fn divide(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {

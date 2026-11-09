@@ -33,11 +33,13 @@ pub enum Intrinsic {
     WithOverflow(BinOp),
     ConstEvalSelect,
     Trap,
+    CatchUnwind,
     SizeOf,
     AlignOf,
     SizeOfVal,
     AlignOfVal,
     NeedsDrop,
+    TypeId,
     NoOp,
     BlackBox,
     Offset(bool),
@@ -76,7 +78,7 @@ pub enum Atomic {
     Exchange,
 }
 
-const NAMES: [(&str, Intrinsic); 111] = {
+const NAMES: [(&str, Intrinsic); 113] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -124,6 +126,7 @@ const NAMES: [(&str, Intrinsic); 111] = {
         ("mul_with_overflow", WithOverflow(BinOp::Mul)),
         ("const_eval_select", ConstEvalSelect),
         ("abort", Trap),
+        ("catch_unwind", CatchUnwind),
         ("unreachable", Trap),
         ("caller_location", Trap),
         ("size_of", SizeOf),
@@ -137,6 +140,7 @@ const NAMES: [(&str, Intrinsic); 111] = {
         ("align_of_val", AlignOfVal),
         ("min_align_of_val", AlignOfVal),
         ("needs_drop", NeedsDrop),
+        ("type_id", TypeId),
         ("forget", NoOp),
         ("assert_inhabited", NoOp),
         ("assert_zero_valid", NoOp),

@@ -56,6 +56,10 @@ impl Lower<'_, '_> {
             }
             signature.params.extend(parts.iter().map(|&(ty, _)| AbiParam::new(ty)));
         }
+        for value in values {
+            signature.params.push(AbiParam::new(self.b.func.ty(value)));
+            args.push(value);
+        }
         let returned = ret.map(|ret| self.native_parts(&dl, ret)).transpose()?.unwrap_or_default();
         signature.returns.extend(returned.iter().map(|&(ty, _)| AbiParam::new(ty)));
         let sig = self.b.import_signature(signature);

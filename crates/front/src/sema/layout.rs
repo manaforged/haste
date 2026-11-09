@@ -43,6 +43,15 @@ impl Idx for Variant {
 pub type Layout = LayoutData<Field, Variant>;
 
 /// The target's data layout.
+/// The byte offset of field `index` of variant `variant` in a value of `layout`.
+pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
+    let fields = match &layout.variants {
+        rustc_abi::Variants::Multiple { variants, .. } => &variants[Variant::new(variant as usize)].fields,
+        _ => &layout.fields,
+    };
+    fields.offset(index as usize).bytes() as i32
+}
+
 pub fn target() -> Result<TargetDataLayout> {
     TargetDataLayout::parse_from_llvm_datalayout_string(DATA_LAYOUT, AddressSpace::ZERO).map_err(|_| anyhow!("bad data layout"))
 }

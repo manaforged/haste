@@ -6,21 +6,12 @@ use rustc_index::Idx;
 use crate::body::{ExprId, List};
 use crate::names::ItemRef;
 use crate::sema::infer::{ALIGN_SLOT, field_types};
-use crate::sema::layout::{Layout, Variant, target};
+use crate::sema::layout::{Layout, Variant, field_offset, target};
 use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
 use super::place::{Base, Place};
 use super::{Lower, Repr, repr};
-
-/// The byte offset of field `index` of variant `variant` in a value of `layout`.
-pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
-    let fields = match &layout.variants {
-        Variants::Multiple { variants, .. } => &variants[Variant::new(variant as usize)].fields,
-        _ => &layout.fields,
-    };
-    fields.offset(index as usize).bytes() as i32
-}
 
 pub(super) fn tag_type(bytes: u64) -> Result<Type> {
     Ok(match bytes {
@@ -51,7 +42,7 @@ impl Lower<'_, '_> {
 
     /// Writes variant `variant` of `ty`, an ADT `item` at `args`, with `fields` given by index, over a copy of `base`; returns the value.
     pub fn construct(&mut self, ty: Ty, variant: u32, fields: Vec<(u32, Option<Value>)>, base: Option<Value>) -> Result<Option<Value>> {
-        let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("constructing a type that is not an ADT") };
+        let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
         let whole = repr(self.cx, ty)?;
         let Some(slot) = self.slot(whole) else { return Ok(None) };
         let place = Place::slot(slot, whole);

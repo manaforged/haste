@@ -245,9 +245,7 @@ impl Infer<'_, '_> {
 
     fn named_pat(&mut self, name: u32) -> Result<Option<(Ty, Res)>> {
         let sym = self.cx.names.symbols.intern(plain(self.src.text(name)));
-        let paths = self.cx.paths(self.home.krate);
-        let path = crate::names::path::Path { segments: &[sym], absolute: false, dollar: None };
-        let found = paths.first(sym, self.home, &path).values.map(|binding| binding.def);
+        let found = self.value_def(&[sym], false, None).ok();
         let (item, variant) = match found {
             Some(crate::names::Def::Variant(item, index)) => {
                 let Some(at) = self.cx.adt_def(item)?.position(index) else { return Ok(None) };
