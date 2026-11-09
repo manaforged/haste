@@ -190,7 +190,7 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let mut cx = sema::Context::new(&outline, &names, store);
     let roots: Vec<Instance> = cases.iter().map(|item| (*item, Vec::new())).collect();
     let reached = reach(&mut cx, &roots);
-    let mut image = haste_front::image::Image::new(&reached);
+    let mut image = haste_front::image::Image::new(&reached)?;
     let broken: std::collections::HashMap<usize, String> = image.compile(&mut cx, &reached).into_iter().collect();
     let built = started.elapsed();
     let mut failures = Failures::new();

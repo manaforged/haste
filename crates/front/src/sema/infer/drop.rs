@@ -80,14 +80,15 @@ pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
 }
 
 impl Infer<'_, '_> {
+    /// The `Drop::drop` of `ty`'s own `Drop` impl, without the drops of its parts.
+    pub(super) fn own_drop(&mut self, ty: Ty) -> Result<Option<Res>> {
+        let Some((block, args)) = self.drop_impl(ty)? else { return Ok(None) };
+        let args = args.into_iter().map(|arg| self.zonk(arg)).collect();
+        Ok(self.cx.member(block, "drop").map(|member| Res::Fn(member, args)))
+    }
+
     fn glue(&mut self, glue: ItemRef, ty: Ty) -> Result<Glue> {
-        let drop = match self.drop_impl(ty)? {
-            Some((block, args)) => {
-                let args = args.into_iter().map(|arg| self.zonk(arg)).collect();
-                self.cx.member(block, "drop").map(|member| Res::Fn(member, args))
-            }
-            None => None,
-        };
+        let drop = self.own_drop(ty)?;
         let mut parts = Vec::new();
         for part in self.drop_parts(ty)? {
             if self.needs_drop(part)? && !parts.contains(&Res::Fn(glue, vec![part])) {

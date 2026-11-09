@@ -89,7 +89,7 @@ fn named(paths: &Paths<'_>, path: &Path<'_>, at: ModRef) -> Option<(PerNs, Optio
 }
 
 fn import(paths: &Paths<'_>, pending: &Pending) -> Outcome {
-    let path = Path { segments: &pending.segments, absolute: pending.absolute, dollar: pending.dollar };
+    let path = paths.use_path(Path { segments: &pending.segments, absolute: pending.absolute, dollar: pending.dollar });
     let at = ModRef { krate: paths.krate, module: pending.module };
     let Some(name) = pending.name else {
         let Some(target) = paths.resolve(&path, at) else { return Outcome::Missing };

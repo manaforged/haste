@@ -50,6 +50,7 @@ pub enum Head {
     Array,
     Tuple,
     Never,
+    Dyn(ItemRef),
 }
 
 /// The head of a type of shape `kind`, or none for a type with no impls of its own.
@@ -63,6 +64,7 @@ pub fn head(kind: &Kind) -> Option<Head> {
         Kind::Array(..) => Head::Array,
         Kind::Tuple(_) => Head::Tuple,
         Kind::Never => Head::Never,
+        Kind::Dyn(principal, ..) => Head::Dyn(*principal),
         _ => return None,
     })
 }
@@ -133,9 +135,11 @@ impl<'a> Context<'a> {
         let parts = std::iter::once((entry.file, Some(entry.at))).chain(entry.parts.iter().map(|&part| (part, None)));
         let mut found = Vec::new();
         for (file, owner) in parts {
-            for (at, item) in tree.files[file].items.items.iter().enumerate() {
-                if item.parent == owner && matches!(item.kind, ItemKind::Fn | ItemKind::Const | ItemKind::Type) && tree.env.enabled(&item.attrs) {
-                    found.push(ItemRef { krate, file: file as u32, item: at as u32 });
+            let items = &tree.files[file].items.items;
+            for &at in self.kids_of(items, owner).iter() {
+                let item = &items[at as usize];
+                if matches!(item.kind, ItemKind::Fn | ItemKind::Const | ItemKind::Type) && tree.env.enabled(&item.attrs) {
+                    found.push(ItemRef { krate, file: file as u32, item: at });
                 }
             }
         }
@@ -185,7 +189,7 @@ impl<'a> Context<'a> {
     pub fn inherent(&mut self, head: Head) -> Vec<ImplRef> {
         let standard = self.primitive_holders();
         let holders = match head {
-            Head::Adt(item) if !standard.contains(&item.krate) => vec![item.krate],
+            Head::Adt(item) | Head::Dyn(item) if !standard.contains(&item.krate) => vec![item.krate],
             _ => standard,
         };
         let mut found = Vec::new();
@@ -313,7 +317,19 @@ impl<'a> Context<'a> {
             syntax::Ty::Tuple(_) => Head::Tuple,
             syntax::Ty::Never => Head::Never,
             syntax::Ty::Path(path) => return self.path_head(src, arena, path, home),
+            syntax::Ty::DynTrait(bounds) => return self.dyn_head(src, arena, bounds, home),
             _ => return None,
+        })
+    }
+
+    fn dyn_head(&mut self, src: &Source, arena: &Body, bounds: crate::body::List, (home, root): (ModRef, Option<ItemRef>)) -> Option<Head> {
+        arena.list(bounds).iter().find_map(|&at| {
+            let crate::body::Bound::Trait { path, .. } = arena.bounds[at as usize] else { return None };
+            let (segments, absolute, dollar) = segments(&self.names.symbols, src, arena, path);
+            match self.resolve_in(root, &NamePath { segments: &segments, absolute, dollar }, home)? {
+                Def::Item(item) if self.item(item).1.kind == ItemKind::Trait && !self.is_auto_trait(item) => Some(Head::Dyn(item)),
+                _ => None,
+            }
         })
     }
 

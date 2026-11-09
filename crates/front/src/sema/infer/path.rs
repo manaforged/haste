@@ -138,6 +138,7 @@ impl<'a> Infer<'_, 'a> {
                 continue;
             }
             let segments = segments.strip_suffix(&[SELF]).unwrap_or(&segments);
+            let absolute = paths.use_path(NamePath { segments, absolute, dollar }).absolute;
             let (head, leaf) = match (name, segments.split_last(), word) {
                 (None, _, Some(word)) => (segments, word),
                 (Some(_), Some((&leaf, head)), _) => (head, leaf),
@@ -422,7 +423,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The type that the type alias `item` names at the type arguments `given`, with fresh ones for the rest.
-    fn alias(&mut self, item: ItemRef, given: Vec<Ty>) -> Result<Ty> {
+    pub(super) fn alias(&mut self, item: ItemRef, given: Vec<Ty>) -> Result<Ty> {
         let (params, arena, ty) = self.cx.alias_parts(item)?;
         let file = self.cx.file(item);
         let mut args = given.into_iter();

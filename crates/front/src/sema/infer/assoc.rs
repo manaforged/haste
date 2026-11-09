@@ -126,11 +126,11 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// The impl member that a call of trait item `item` at `substs` runs, once `Self` is known, or the trait's own default.
+    /// The impl member that a call of trait item `item` at `substs` runs, once `Self` is known, or the trait item itself when `Self` is a trait object that dispatches it.
     pub(super) fn trait_call(&mut self, item: ItemRef, substs: Vec<Ty>) -> Result<Res> {
         let Some(of) = self.cx.owner_trait(item) else { return Ok(Res::Fn(item, substs)) };
         let count = 1 + type_params(&self.cx.trait_generics(of)?.1.params).count();
-        if substs.len() < count {
+        if substs.len() < count || self.object_holds(of, substs[0], &substs[1..count]) == Some(true) {
             return Ok(Res::Fn(item, substs));
         }
         let Some((block, mut args)) = self.select(of, substs[0], &substs[1..count])? else { return Ok(Res::Fn(item, substs)) };

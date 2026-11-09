@@ -193,6 +193,12 @@ impl Lower<'_, '_> {
         if coerced.is_none() && let Some(place) = self.place_of(expr)? {
             return Ok(Some(place));
         }
+        self.temp(expr)
+    }
+
+    /// The value of `expr` in a new temporary that the statement owns.
+    pub fn temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
+        let coerced = self.typed.coercions.get(&expr);
         let repr = self.coerced_repr(expr, coerced)?;
         let value = self.expr(expr)?;
         let place = match (repr, value) {
@@ -275,7 +281,8 @@ impl Lower<'_, '_> {
             let field = self.ins().iadd_imm(source, i64::from(offset));
             values.push(self.invoke(item, &substs, vec![field])?);
         }
-        self.tuple_from(ty, values)
+        let Some(tuple) = crate::sema::infer::cloned_tuple(self.cx, ty) else { bail!("a compiler-made clone of a type that is not a tuple or closure") };
+        self.tuple_from(tuple, values)
     }
 
     fn tuple_from(&mut self, ty: Ty, values: Vec<Option<Value>>) -> Result<Option<Value>> {

@@ -423,11 +423,13 @@ impl Lower<'_, '_> {
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<()> {
         let Some(init) = init else { return self.declare_uninit(pat) };
         self.extend(init);
-        let place = self.place_or_temp(init)?;
+        let unboxed = self.moves_whole_box(pat, init)?;
+        let place = if unboxed { self.temp(init)? } else { self.place_or_temp(init)? };
         if !self.open {
             return Ok(());
         }
-        self.bind_matched(pat, place, self.scrutinee_path(init))?;
+        let path = if unboxed { Some((moves::Root::Temp(init), Vec::new())) } else { self.scrutinee_path(init) };
+        self.bind_matched(pat, place, path)?;
         self.commit_moves()
     }
 

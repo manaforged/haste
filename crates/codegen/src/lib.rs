@@ -11,7 +11,7 @@ mod x64;
 
 pub use builder::{FunctionBuilder, Ins, Mark};
 pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst, IntCC, SigRef, Signature, StackSlot, Type, Value};
-pub use memory::Memory;
+pub use memory::{Memory, Shared};
 
 /// A call site that has an exception handler, as offsets into its function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

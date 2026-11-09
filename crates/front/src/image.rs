@@ -1,40 +1,43 @@
 //! One process image: a call table with one entry per reached function, the code it points at, and constant data.
 
+mod workers;
+
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap as HashMap;
 
 use anyhow::{Result, anyhow, bail};
-use haste_codegen::Memory;
+use haste_codegen::{Memory, Shared};
 
 use crate::lower::{self, Slots, Word};
 use crate::sema::Context;
 use crate::sema::reach::Reached;
 
-/// The call table and code memory of the running program.
+const SHARED_BYTES: usize = 4 << 30;
+const CODE_BYTES: usize = 1 << 30;
+
+/// The call table, code memory and data of the running program, all in memory that compile workers forked from this process share.
 pub struct Image {
-    table: Box<[AtomicUsize]>,
+    table: usize,
     memory: Memory,
-    data: RefCell<Vec<Box<[u128]>>>,
+    shared: RefCell<Shared>,
     tables: RefCell<HashMap<Vec<Word>, i64>>,
-    fixups: RefCell<Vec<(usize, usize, usize)>>,
+    fixups: RefCell<Vec<(usize, usize)>>,
     cells: RefCell<HashMap<usize, i64>>,
     statics: rustc_hash::FxHashSet<usize>,
 }
 
 impl Slots for Image {
     fn entry(&self, index: usize) -> i64 {
-        &self.table[index] as *const AtomicUsize as i64
+        self.slot(index) as *const AtomicUsize as i64
     }
 
     fn data(&self, bytes: &[u8]) -> i64 {
-        let mut copy: Box<[u128]> = vec![0; bytes.len().div_ceil(16)].into();
-        // SAFETY: the buffer holds at least `bytes.len()` bytes and does not overlap `bytes`.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), copy.as_mut_ptr().cast::<u8>(), bytes.len()) };
-        let address = copy.as_ptr() as i64;
-        self.data.borrow_mut().push(copy);
-        address
+        let address = self.shared.borrow_mut().alloc(bytes.len()).unwrap_or_else(|error| panic!("{error}"));
+        // SAFETY: alloc handed out `bytes.len()` writable bytes at address that nothing else uses, and they do not overlap `bytes`.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
+        address as i64
     }
 
     fn table(&self, words: &[Word]) -> i64 {
@@ -43,8 +46,7 @@ impl Slots for Image {
         }
         let bytes: Vec<u8> = words.iter().flat_map(|word| (if let Word::Int(value) = *word { value } else { 0 }).to_le_bytes()).collect();
         let address = self.data(&bytes);
-        let block = self.data.borrow().len() - 1;
-        let codes = words.iter().enumerate().filter_map(|(at, word)| if let Word::Code(index) = *word { Some((block, at, index)) } else { None });
+        let codes = words.iter().enumerate().filter_map(|(at, word)| if let Word::Code(index) = *word { Some((address as usize + at * 8, index)) } else { None });
         self.fixups.borrow_mut().extend(codes);
         self.tables.borrow_mut().insert(words.to_vec(), address);
         address
@@ -68,37 +70,43 @@ fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, S
 
 impl Image {
     /// An image with one table entry per reached function and no code yet.
-    pub fn new(reached: &Reached) -> Image {
-        let table = (0..reached.list.len()).map(|_| AtomicUsize::new(0)).collect();
-        Image { table, memory: Memory::default(), data: RefCell::default(), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), statics: Default::default() }
+    pub fn new(reached: &Reached) -> Result<Image> {
+        let mut shared = Shared::new(SHARED_BYTES).map_err(|error| anyhow!(error))?;
+        let table = shared.alloc(reached.list.len() * size_of::<AtomicUsize>()).map_err(|error| anyhow!(error))?;
+        let mut memory = Memory::default();
+        memory.reserve(CODE_BYTES).map_err(|error| anyhow!(error))?;
+        Ok(Image { table, memory, shared: RefCell::new(shared), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), statics: Default::default() })
     }
 
-    /// Lowers and encodes every reached function that type-checked, and returns the errors of those that did not compile, by index.
+    fn slot(&self, index: usize) -> &AtomicUsize {
+        // SAFETY: new allocated one zeroed, aligned AtomicUsize per reached function at table, in a mapping that lives as long as the process.
+        unsafe { &*(self.table as *const AtomicUsize).add(index) }
+    }
+
+    /// Lowers and encodes every reached function that type-checked, on every core, and returns the errors of those that did not compile, by index.
     pub fn compile(&mut self, cx: &mut Context<'_>, reached: &Reached) -> Vec<(usize, String)> {
         self.bind_foreign_statics(cx, reached);
         let mut errors = Vec::new();
+        let mut work = Vec::new();
         for index in 0..reached.list.len() {
             if reached.list[index].1.is_err() {
                 continue;
             }
             let item = reached.list[index].0.0;
-            if cx.foreign(item) {
-                match host_symbol(cx, item) {
-                    Ok(address) if !lower::is_static(cx, item) => self.table[index].store(address, Ordering::Release),
-                    Ok(_) => {}
-                    Err(error) => errors.push((index, error)),
-                }
+            if !cx.foreign(item) {
+                work.push(index);
                 continue;
             }
-            match self.compile_one(cx, reached, index) {
-                Ok(address) if lower::is_static(cx, item) => {
-                    self.table[index].store(address, Ordering::Release);
-                    self.statics.insert(index);
-                }
-                Ok(address) => self.table[index].store(address, Ordering::Release),
-                Err(error) => errors.push((index, format!("{}: {error:#}", cx.name(reached.list[index].0.0)))),
+            match host_symbol(cx, item) {
+                Ok(address) if !lower::is_static(cx, item) => self.slot(index).store(address, Ordering::Release),
+                Ok(_) => {}
+                Err(error) => errors.push((index, error)),
             }
         }
+        self.place_statics(cx, reached, &work);
+        errors.extend(self.compile_all(cx, reached, &work));
+        let failed: rustc_hash::FxHashSet<usize> = errors.iter().map(|(index, _)| *index).collect();
+        self.statics = work.iter().copied().filter(|index| !failed.contains(index) && lower::is_static(cx, reached.list[*index].0.0)).collect();
         self.link();
         errors
     }
@@ -118,12 +126,10 @@ impl Image {
     }
 
     fn link(&mut self) {
-        let data = self.data.get_mut();
-        for &(block, at, index) in self.fixups.get_mut().iter() {
-            let code = self.table[index].load(Ordering::Acquire) as u128;
-            let shift = (at % 2) * 64;
-            let cell = &mut data[block][at / 2];
-            *cell = (*cell & !(u128::from(u64::MAX) << shift)) | (code << shift);
+        for &(address, index) in self.fixups.borrow().iter() {
+            let code = self.slot(index).load(Ordering::Acquire) as u64;
+            // SAFETY: address is a word of a constant table that data handed out, which stays mapped for the life of the process.
+            unsafe { (address as *mut u64).write_unaligned(code) };
         }
     }
 
@@ -135,7 +141,7 @@ impl Image {
 
     /// Runs reached function `index`, an `fn(i64) -> i64` that reaches the functions `closure`, on each input in a forked child that fills the statics it reaches and prints `name input value` lines.
     pub fn run_case(&self, (index, closure): (usize, &[usize]), name: &str, inputs: &[i64]) -> Result<i32> {
-        let address = self.table[index].load(Ordering::Acquire);
+        let address = self.slot(index).load(Ordering::Acquire);
         if address == 0 {
             bail!("{name} has no code");
         }
@@ -163,7 +169,7 @@ impl Image {
 
     fn fill_statics(&self, closure: &[usize]) {
         for &index in closure.iter().filter(|index| self.statics.contains(index)) {
-            let address = self.table[index].load(Ordering::Acquire);
+            let address = self.slot(index).load(Ordering::Acquire);
             // SAFETY: address is code that the encoder wrote for a static's initializer, a native fn() that writes the static's cell.
             let fill: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
             fill();

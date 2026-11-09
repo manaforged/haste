@@ -225,17 +225,26 @@ impl<'a> Paths<'a> {
             return PerNs { types: def.map(item), values: None, macros: None };
         }
         let external = self.extern_crate(word).map(item);
-        if path.absolute {
-            return if self.edition_2015 { self.member(module(self.krate, 0), word) } else { PerNs { types: external, values: None, macros: None } };
+        if path.absolute && self.edition_2015 {
+            let root = self.member(module(self.krate, 0), word);
+            return PerNs { types: root.types.or(external), ..root };
         }
-        let home = if self.edition_2015 { ModRef { krate: self.krate, module: 0 } } else { at };
-        let local = self.member(Def::Module(home), word);
+        if path.absolute {
+            return PerNs { types: external, values: None, macros: None };
+        }
+        let local = self.member(Def::Module(at), word);
         let prelude = self.prelude.map(|prelude| self.member(Def::Module(prelude), word)).unwrap_or_default();
         PerNs {
             types: local.types.or(external).or(prelude.types).or_else(|| Symbols::primitive(word).map(|found| item(Def::Primitive(found)))),
             values: local.values.or(prelude.values),
             macros: local.macros.or_else(|| self.textual(word, at)).or(prelude.macros),
         }
+    }
+
+    /// The path that a `use` declaration of `path` names: in edition 2015 it starts at the crate root unless it starts with a keyword.
+    pub fn use_path<'p>(&self, path: Path<'p>) -> Path<'p> {
+        let keyword = path.segments.first().is_some_and(|word| [CRATE, SELF, SUPER].contains(word));
+        Path { absolute: path.absolute || (self.edition_2015 && !keyword), ..path }
     }
 
     /// Resolves every segment of `path` in the type namespace, from module `at`.

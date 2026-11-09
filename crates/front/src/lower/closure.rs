@@ -103,6 +103,7 @@ impl Lower<'_, '_> {
         if self.cx.call_once() == Some(item) && self.cx.closure_takes_env(substs[0]) {
             let Some(receiver) = self.locals[self.typed.params[0] as usize] else { bail!("a closure trait call with no receiver") };
             values.extend(self.read(receiver));
+            self.moved_out(Root::Local(self.typed.params[0]), &[])?;
         }
         let Kind::Tuple(items) = self.cx.types.kind(tuple).clone() else { bail!("closure arguments that are not a tuple") };
         if let Some(args) = self.locals[self.typed.params[1] as usize] {
@@ -110,6 +111,7 @@ impl Lower<'_, '_> {
                 let part = self.part_place(args, tuple, (0, index))?;
                 values.extend(self.read(part));
             }
+            self.moved_out(Root::Local(self.typed.params[1]), &[])?;
         }
         self.invoke(item, &substs, values)
     }

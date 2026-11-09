@@ -64,7 +64,11 @@ pub struct Context<'a> {
     finals: HashMap<reach::Instance, infer::Typed>,
     tails: HashMap<ty::Ty, ty::Ty>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
+    kids: std::cell::RefCell<HashMap<usize, Rc<Kids>>>,
 }
+
+/// The items of one file or body grouped by the item they are declared inside, in order.
+type Kids = HashMap<Option<u32>, Rc<[u32]>>;
 
 impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
@@ -72,7 +76,7 @@ impl<'a> Context<'a> {
         let Store { types, signatures, bodies, adts, layouts, tails, headers, finals } = store;
         let (modules, heads, owners) = (HashMap::default(), HashMap::default(), HashMap::default());
         let (trait_defs, langs, drops) = (HashMap::default(), None, HashMap::default());
-        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants: HashMap::default(), langs, drops, closures: HashMap::default(), finals, reveals: HashMap::default(), tails }
+        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants: HashMap::default(), langs, drops, closures: HashMap::default(), finals, reveals: HashMap::default(), tails, kids: Default::default() }
     }
 
     /// Ends the pass: the store for the next one, and what lookups asked the front end to load or resolve.
@@ -98,13 +102,29 @@ impl<'a> Context<'a> {
 
     /// The items declared directly inside `of`: the members of a trait or impl, in the file or body that holds it.
     pub fn children(&self, of: ItemRef) -> impl Iterator<Item = ItemRef> + 'a {
-        let items: &'a [Item] = &self.file(of).items.items;
         let at = of.outer().map_or(of.item, |(_, at)| at);
+        let list = self.kids_of(&self.file(of).items.items, Some(at));
         let body = of.declaring_body();
-        (0..items.len() as u32).filter(move |&index| items[index as usize].parent == Some(at)).map(move |index| match body {
-            Some(root) => root.inner(index),
-            None => ItemRef { item: index, ..of },
+        (0..list.len()).map(move |index| match body {
+            Some(root) => root.inner(list[index]),
+            None => ItemRef { item: list[index], ..of },
         })
+    }
+
+    /// The indices of the items in `items` declared directly inside item `parent`, or at the top level for none.
+    pub fn kids_of(&self, items: &[Item], parent: Option<u32>) -> Rc<[u32]> {
+        let key = items.as_ptr() as usize;
+        let cached = self.kids.borrow().get(&key).cloned();
+        let kids = cached.unwrap_or_else(|| {
+            let mut grouped: HashMap<Option<u32>, Vec<u32>> = HashMap::default();
+            for (at, item) in items.iter().enumerate() {
+                grouped.entry(item.parent).or_default().push(at as u32);
+            }
+            let kids: Rc<Kids> = Rc::new(grouped.into_iter().map(|(parent, list)| (parent, list.into())).collect());
+            self.kids.borrow_mut().insert(key, kids.clone());
+            kids
+        });
+        kids.get(&parent).cloned().unwrap_or_else(|| Rc::from([]))
     }
 
     /// Whether `item` is a function or static declared in an `extern` block, which the host links by name.

@@ -46,6 +46,13 @@ impl Lower<'_, '_> {
         self.move_path(scrutinee).or_else(|| (!self.is_place(scrutinee)).then(|| (Root::Temp(scrutinee), Vec::new())))
     }
 
+    /// Whether binding `pat` to `init` moves the whole value out of a `Box` that `init` dereferences.
+    pub fn moves_whole_box(&mut self, pat: PatId, init: ExprId) -> Result<bool> {
+        let by_value = matches!(*self.body.pat(pat), Pat::Bind { by_ref: false, sub: None, .. }) && !self.typed.ref_binds.contains_key(&pat);
+        let Expr::Unary(UnOp::Deref, operand) = *self.body.expr(init) else { return Ok(false) };
+        Ok(by_value && self.cx.boxed(self.ty_of(operand)).is_some() && needs_drop(self.cx, self.ty_of(init))?)
+    }
+
     fn is_place(&self, expr: ExprId) -> bool {
         match *self.body.expr(expr) {
             Expr::Paren(inner) => self.is_place(inner),

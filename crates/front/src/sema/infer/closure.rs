@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::body::sig::Signature;
-use crate::body::{Args, Body, Expr, ExprId, List, Param, PathId, TyId, UnOp};
+use crate::body::{Args, Body, BlockKind, Expr, ExprId, List, Param, PathId, TyId, UnOp};
 use crate::names::{ItemRef, ModRef};
 
 use super::super::Context;
@@ -401,16 +401,20 @@ impl Infer<'_, '_> {
     }
 
     fn is_closure(&self, arg: ExprId) -> bool {
-        match *self.body.expr(arg) {
-            Expr::Paren(inner) => self.is_closure(inner),
-            Expr::Closure { .. } => true,
-            _ => false,
+        matches!(*self.body.expr(self.wrapped(arg)), Expr::Closure { .. })
+    }
+
+    fn wrapped(&self, expr: ExprId) -> ExprId {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) => self.wrapped(inner),
+            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe } if self.body.list(stmts).is_empty() => self.wrapped(tail),
+            _ => expr,
         }
     }
 
     fn closure_hint(&mut self, callee: (ItemRef, &[Ty]), arg: ExprId, param: Ty) -> Result<Option<Ty>> {
+        let arg = self.wrapped(arg);
         match *self.body.expr(arg) {
-            Expr::Paren(inner) => self.closure_hint(callee, inner, param),
             Expr::Closure { .. } => self.callable_hint(callee, param),
             Expr::Ref { raw: false, expr: inner, .. } => {
                 let Kind::Ref(mutability, pointee) = *self.cx.types.kind(self.resolve(param)) else { return Ok(None) };

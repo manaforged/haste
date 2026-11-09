@@ -195,8 +195,9 @@ impl Lower<'_, '_> {
     pub fn ctor_body(&mut self, variant: u32) -> Result<Option<Value>> {
         let Some(ret) = self.typed.ret else { bail!("a constructor function with no return type") };
         let mut values = Vec::new();
-        for (index, &local) in self.typed.params.iter().enumerate() {
+        for (index, local) in self.typed.params.clone().into_iter().enumerate() {
             values.push((index as u32, self.locals[local as usize].and_then(|place| self.read(place))));
+            self.moved_out(super::moves::Root::Local(local), &[])?;
         }
         self.construct(ret, variant, values, None)
     }

@@ -3,7 +3,7 @@ use anyhow::{Result, bail};
 use crate::body::adt::Shape;
 use crate::body::{Body, ExprId, List, PathId};
 use crate::names::path::Path as NamePath;
-use crate::names::{Def, ItemRef, plain};
+use crate::names::{Def, ItemRef, Sym, plain};
 use crate::outline::item::ItemKind;
 
 use super::super::ty::{Kind, Ty};
@@ -55,8 +55,23 @@ impl<'a> Infer<'_, 'a> {
                 let variant = self.cx.variant_position(item, index)?;
                 Ok(Some((item, variant as u32, args)))
             }
-            _ => Ok(None),
+            _ => self.alias_variant(arena, path, &segments),
         }
+    }
+
+    /// The variant that `Alias::Variant` names, when the type alias names an enum.
+    fn alias_variant(&mut self, arena: &Body, path: PathId, segments: &[Sym]) -> Result<Option<Ctor>> {
+        let Some((name, prefix)) = segments.split_last().filter(|(_, prefix)| !prefix.is_empty()) else { return Ok(None) };
+        let (_, absolute, dollar) = self.segments(arena, path);
+        let Some(Def::Item(alias)) = self.type_def(&NamePath { segments: prefix, absolute, dollar }) else { return Ok(None) };
+        if self.cx.item(alias).1.kind != ItemKind::Type {
+            return Ok(None);
+        }
+        let given = self.segment_args(arena, path, prefix.len())?;
+        let named = self.alias(alias, given)?;
+        let Kind::Adt(item, args) = self.cx.types.kind(named).clone() else { return Ok(None) };
+        let name = self.cx.names.symbols.text(*name).to_string();
+        Ok(self.variant_named(item, &name)?.map(|variant| (item, variant, args)))
     }
 
     fn self_ctor(&mut self, rest: &[&str]) -> Result<Option<Ctor>> {

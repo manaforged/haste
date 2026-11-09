@@ -62,10 +62,29 @@ impl Lower<'_, '_> {
 
     fn deref_read(&mut self, expr: ExprId, operand: ExprId) -> Result<Option<Value>> {
         if self.cx.boxed(self.ty_of(operand)).is_some() && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))? {
-            bail!("moving a value that needs dropping out of a `Box` is not supported yet");
+            return self.move_out_of_box(expr, operand);
         }
         let place = self.place_of(expr)?;
         Ok(place.and_then(|place| self.read(place)))
+    }
+
+    fn move_out_of_box(&mut self, expr: ExprId, operand: ExprId) -> Result<Option<Value>> {
+        let Some((root, path)) = self.move_path(operand) else { bail!("moving out of a `Box` that no local owns is not supported yet") };
+        let boxed = self.ty_of(operand);
+        let Some(Res::Fn(free, substs)) = crate::sema::infer::drop_fn(self.cx, boxed)? else { bail!("`Box` has no `Drop` impl") };
+        let contents = self.place_of(expr)?;
+        let value = match contents {
+            Some(place) if matches!(place.repr, Repr::Mem { .. }) => {
+                let read = self.read(place);
+                self.spill(read, self.ty_of(expr))?.and_then(|copy| self.read(copy))
+            }
+            place => place.and_then(|place| self.read(place)),
+        };
+        let owner = self.place_of(operand)?;
+        let target = self.address_or_dangling(owner, boxed)?;
+        self.invoke(free, &substs, vec![target])?;
+        self.moved_out(root, &path)?;
+        Ok(value)
     }
 
     fn memory(&mut self, expr: ExprId) -> Result<Option<Value>> {

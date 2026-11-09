@@ -21,6 +21,7 @@ mod drop;
 mod select;
 mod stmt;
 
+pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, closure_typed, register};
 pub use drop::Glue;
 pub use looping::{For, Tried};
@@ -246,7 +247,7 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
         return drop::glue_typed(cx, item, ty).map(Some);
     }
     let Some(&ty) = substs.first() else { return Ok(None) };
-    if cx.lang(item) == Some("clone_fn") && matches!(cx.types.kind(ty), Kind::Tuple(_)) {
+    if cx.lang(item) == Some("clone_fn") && clone::cloned_tuple(cx, ty).is_some() {
         return clone::clone_typed(cx, item, ty).map(Some);
     }
     let (once, by_ref) = (cx.call_once() == Some(item), closure::by_reference(cx, item).is_some());
@@ -720,6 +721,12 @@ pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
 pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
     let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
     detached(cx, anchor, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
+}
+
+/// The `Drop::drop` of `ty`'s own `Drop` impl, which for a `Box` frees the allocation without dropping what it owns.
+pub fn drop_fn(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
+    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
+    detached(cx, anchor, |infer| infer.own_drop(ty))
 }
 
 pub(crate) fn detached<T>(cx: &mut Context<'_>, item: ItemRef, run: impl FnOnce(&mut Infer<'_, '_>) -> Result<T>) -> Result<T> {
