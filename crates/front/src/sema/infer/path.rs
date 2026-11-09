@@ -70,6 +70,20 @@ impl<'a> Infer<'_, 'a> {
 
     /// The type-namespace item that `path` names, a single segment first among the items that the body declares.
     pub(super) fn type_def(&mut self, path: &NamePath<'_>) -> Option<Def> {
+        if !self.items.is_empty() {
+            return self.type_def_here(path);
+        }
+        let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some());
+        let key = (self.home, self.root, here, path.segments.to_vec(), path.absolute, path.dollar);
+        if let Some(&found) = self.cx.type_defs.borrow().get(&key) {
+            return Some(found);
+        }
+        let found = self.type_def_here(path)?;
+        self.cx.type_defs.borrow_mut().insert(key, found);
+        Some(found)
+    }
+
+    fn type_def_here(&mut self, path: &NamePath<'_>) -> Option<Def> {
         let inner = if let [name] = path.segments { self.declared_item(self.cx.names.symbols.text(*name)) } else { None };
         inner.map(Def::Item).or_else(|| self.local_variant(path.segments)).or_else(|| self.resolve_local(path))
     }

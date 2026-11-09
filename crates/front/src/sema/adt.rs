@@ -17,7 +17,7 @@ const REPR_INTS: [(&str, Primitive); 12] = {
     [("u8", U8), ("u16", U16), ("u32", U32), ("u64", U64), ("u128", U128), ("usize", Usize), ("i8", I8), ("i16", I16), ("i32", I32), ("i64", I64), ("i128", I128), ("isize", Isize)]
 };
 
-impl Context<'_> {
+impl<'a> Context<'a> {
     /// The discriminant of each variant of the enum `item`: its written value, or one more than the previous.
     pub fn discriminants(&mut self, item: ItemRef) -> Result<Rc<[i128]>> {
         if let Some(found) = self.discriminants.get(&item) {
@@ -68,12 +68,17 @@ impl Context<'_> {
     }
 
     /// The value of `#[lang = "..."]` on `item`.
-    pub fn lang(&self, item: ItemRef) -> Option<&str> {
-        self.attr_value(item, "lang")
+    pub fn lang(&self, item: ItemRef) -> Option<&'a str> {
+        if let Some(&known) = self.lang_of.borrow().get(&item) {
+            return known;
+        }
+        let found = self.attr_value(item, "lang");
+        self.lang_of.borrow_mut().insert(item, found);
+        found
     }
 
     /// The value of the name-value attribute `#[key = "..."]` on `item`, written directly or through a `cfg_attr` that holds.
-    pub fn attr_value(&self, item: ItemRef, key: &str) -> Option<&str> {
+    pub fn attr_value(&self, item: ItemRef, key: &str) -> Option<&'a str> {
         let (src, entry) = self.item(item);
         let env = &self.outline.crates[item.krate as usize].env;
         let at = named_attr((src, env), &entry.attrs, key)?;

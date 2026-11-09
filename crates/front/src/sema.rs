@@ -65,7 +65,17 @@ pub struct Context<'a> {
     tails: HashMap<ty::Ty, ty::Ty>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
     kids: std::cell::RefCell<HashMap<usize, Rc<Kids>>>,
+    lang_of: std::cell::RefCell<HashMap<ItemRef, Option<&'a str>>>,
+    scope_traits: std::cell::RefCell<HashMap<crate::names::ModRef, Rc<[ItemRef]>>>,
+    trait_members: std::cell::RefCell<HashMap<ItemRef, Rc<HashMap<&'a str, ItemRef>>>>,
+    /// The type-namespace items that paths name, by home module, body root, nested instance, segments, `::` and `$crate`.
+    pub type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
+    impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
+    impl_members: std::cell::RefCell<HashMap<impls::ImplRef, Rc<HashMap<&'a str, ItemRef>>>>,
 }
+
+/// Where a type path is resolved and what it says: home module, body root, nested instance, segments, leading `::` and `$crate`.
+pub type TypeKey = (ModRef, Option<ItemRef>, Option<ItemRef>, Vec<crate::names::Sym>, bool, Option<u32>);
 
 /// The items of one file or body grouped by the item they are declared inside, in order.
 type Kids = HashMap<Option<u32>, Rc<[u32]>>;
@@ -76,7 +86,12 @@ impl<'a> Context<'a> {
         let Store { types, signatures, bodies, adts, layouts, tails, headers, finals } = store;
         let (modules, heads, owners) = (HashMap::default(), HashMap::default(), HashMap::default());
         let (trait_defs, langs, drops) = (HashMap::default(), None, HashMap::default());
-        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants: HashMap::default(), langs, drops, closures: HashMap::default(), finals, reveals: HashMap::default(), tails, kids: Default::default() }
+        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants: HashMap::default(), langs, drops, closures: HashMap::default(), finals, reveals: HashMap::default(), tails, kids: Default::default(), lang_of: Default::default(), scope_traits: Default::default(), trait_members: Default::default(), type_defs: Default::default(), impl_traits: HashMap::default(), impl_members: Default::default() }
+    }
+
+    /// Whether no lookup in this pass asked the front end for anything, so another pass would find the same.
+    pub fn settled(&self) -> bool {
+        self.asks.count() == 0
     }
 
     /// Ends the pass: the store for the next one, and what lookups asked the front end to load or resolve.

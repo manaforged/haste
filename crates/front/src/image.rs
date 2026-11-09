@@ -3,6 +3,7 @@
 mod workers;
 
 use std::cell::RefCell;
+use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap as HashMap;
@@ -139,14 +140,31 @@ impl Image {
         self.memory.write(&compiled.code).map_err(|error| anyhow!(error))
     }
 
-    /// Runs reached function `index`, an `fn(i64) -> i64` that reaches the functions `closure`, on each input in a forked child that fills the statics it reaches and prints `name input value` lines.
-    pub fn run_case(&self, (index, closure): (usize, &[usize]), name: &str, inputs: &[i64]) -> Result<i32> {
-        let address = self.slot(index).load(Ordering::Acquire);
-        if address == 0 {
+    /// Runs each case `(index, closure, name)`, a reached `fn(i64) -> i64` that reaches the functions `closure`, on each input and prints `name input value` lines, all in one forked child that fills each static once; a case that crashes gets its status and the cases after it run in a new child.
+    pub fn run_cases(&self, cases: &[(usize, Vec<usize>, &str)], inputs: &[i64]) -> Result<Vec<i32>> {
+        if let Some((_, _, name)) = cases.iter().find(|(index, ..)| self.slot(*index).load(Ordering::Acquire) == 0) {
             bail!("{name} has no code");
         }
-        // SAFETY: address is code that the encoder wrote for a native fn(i64) -> i64 signature.
-        let case: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute::<usize, extern "C" fn(i64) -> i64>(address) };
+        let mut statuses = vec![0; cases.len()];
+        let mut from = 0;
+        while from < cases.len() {
+            let (done, status) = self.run_from(&cases[from..], inputs)?;
+            if status == 0 {
+                break;
+            }
+            let crashed = (from + done).min(cases.len() - 1);
+            statuses[crashed] = status;
+            from = crashed + 1;
+        }
+        Ok(statuses)
+    }
+
+    fn run_from(&self, cases: &[(usize, Vec<usize>, &str)], inputs: &[i64]) -> Result<(usize, i32)> {
+        let mut ends = [0; 2];
+        // SAFETY: ends is a live two-element array for the new descriptors.
+        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+            bail!("pipe failed: {}", std::io::Error::last_os_error());
+        }
         std::io::Write::flush(&mut std::io::stdout())?;
         // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
         let pid = unsafe { libc::fork() };
@@ -154,21 +172,51 @@ impl Image {
             bail!("fork failed: {}", std::io::Error::last_os_error());
         }
         if pid == 0 {
-            use std::io::Write;
-            self.fill_statics(closure);
-            let mut out = std::io::stdout().lock();
-            let wrote = inputs.iter().try_for_each(|&input| writeln!(out, "{name} {input} {}", case(input)).and_then(|_| out.flush()));
+            // SAFETY: ends[0] is the read end this child does not use, and ends[1] is the write end it owns from here on.
+            let progress = unsafe {
+                libc::close(ends[0]);
+                std::fs::File::from_raw_fd(ends[1])
+            };
+            let wrote = self.run_in_child(cases, inputs, progress);
             // SAFETY: _exit ends the child without running the parent's destructors.
             unsafe { libc::_exit(i32::from(wrote.is_err())) }
         }
+        // SAFETY: ends[1] is the write end that only the child uses, and ends[0] is the read end this process owns from here on.
+        let mut progress = unsafe {
+            libc::close(ends[1]);
+            std::fs::File::from_raw_fd(ends[0])
+        };
+        let mut done = Vec::new();
+        std::io::Read::read_to_end(&mut progress, &mut done)?;
         let mut status = 0;
         // SAFETY: pid is the child forked above, and status is a live local.
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        Ok(status)
+        Ok((done.len(), status))
     }
 
-    fn fill_statics(&self, closure: &[usize]) {
+    fn run_in_child(&self, cases: &[(usize, Vec<usize>, &str)], inputs: &[i64], mut progress: std::fs::File) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut filled = rustc_hash::FxHashSet::default();
+        let mut out = std::io::stdout().lock();
+        for (index, closure, name) in cases {
+            self.fill_statics(closure, &mut filled);
+            let address = self.slot(*index).load(Ordering::Acquire);
+            // SAFETY: address is code that the encoder wrote for a native fn(i64) -> i64 signature, checked to be set before the fork.
+            let case: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute::<usize, extern "C" fn(i64) -> i64>(address) };
+            for &input in inputs {
+                writeln!(out, "{name} {input} {}", case(input))?;
+                out.flush()?;
+            }
+            progress.write_all(&[1])?;
+        }
+        Ok(())
+    }
+
+    fn fill_statics(&self, closure: &[usize], filled: &mut rustc_hash::FxHashSet<usize>) {
         for &index in closure.iter().filter(|index| self.statics.contains(index)) {
+            if !filled.insert(index) {
+                continue;
+            }
             let address = self.slot(index).load(Ordering::Acquire);
             // SAFETY: address is code that the encoder wrote for a static's initializer, a native fn() that writes the static's cell.
             let fill: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };

@@ -152,7 +152,17 @@ impl<'a> Context<'a> {
 
     /// The member of impl `block` named `name`.
     pub fn member(&self, block: ImplRef, name: &str) -> Option<ItemRef> {
-        self.members(block).into_iter().find(|member| self.name(*member) == name)
+        let known = self.impl_members.borrow().get(&block).cloned();
+        let members = known.unwrap_or_else(|| {
+            let mut members = HashMap::default();
+            for member in self.members(block) {
+                members.entry(self.name(member)).or_insert(member);
+            }
+            let members = Rc::new(members);
+            self.impl_members.borrow_mut().insert(block, members.clone());
+            members
+        });
+        members.get(name).copied()
     }
 
     /// The impl block whose member `item` is.
@@ -226,6 +236,15 @@ impl<'a> Context<'a> {
 
     /// The trait that impl `block` implements, or none for an inherent impl.
     pub fn impl_trait(&mut self, block: ImplRef) -> Option<ItemRef> {
+        if let Some(&known) = self.impl_traits.get(&block) {
+            return known;
+        }
+        let found = self.impl_trait_here(block);
+        self.impl_traits.insert(block, found);
+        found
+    }
+
+    fn impl_trait_here(&mut self, block: ImplRef) -> Option<ItemRef> {
         let header = self.impl_header(block).ok()?;
         let syntax::Ty::Path(path) = *header.body.ty(header.trait_ref?) else { return None };
         let src = &self.impl_file(block).source;

@@ -33,7 +33,17 @@ impl<'a> Context<'a> {
 
     /// The member of trait `of` named `name`.
     pub fn trait_member(&self, of: ItemRef, name: &str) -> Option<ItemRef> {
-        self.children(of).find(|member| self.name(*member) == name)
+        let known = self.trait_members.borrow().get(&of).cloned();
+        let members = known.unwrap_or_else(|| {
+            let mut members = HashMap::default();
+            for member in self.children(of) {
+                members.entry(self.name(member)).or_insert(member);
+            }
+            let members = Rc::new(members);
+            self.trait_members.borrow_mut().insert(of, members.clone());
+            members
+        });
+        members.get(name).copied()
     }
 
     /// The methods of trait `of` and then of its supertraits in vtable order: each one that takes `self` and has no type parameters of its own, and none for the rest or for a generic supertrait.
@@ -69,7 +79,12 @@ impl<'a> Context<'a> {
 
     /// The traits in scope in module `home`.
     pub fn traits_in_scope(&self, home: ModRef) -> Vec<ItemRef> {
-        self.paths(home.krate).traits_in(home)
+        if let Some(known) = self.scope_traits.borrow().get(&home) {
+            return known.to_vec();
+        }
+        let found = self.paths(home.krate).traits_in(home);
+        self.scope_traits.borrow_mut().insert(home, found.as_slice().into());
+        found
     }
 
     /// Whether impl `block` marks a member `default`, so that a more specific impl may override it.

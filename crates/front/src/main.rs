@@ -168,47 +168,46 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
     Ok(())
 }
 
-fn reach_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<(outline::Outline, Names, sema::Store, Vec<ItemRef>)> {
+fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let started = Instant::now();
     let (mut outline, mut names) = eager_front(workspace, targets)?;
     let cases = case_items(workspace, &outline);
     let roots: Vec<Instance> = cases.iter().map(|item| (*item, Vec::new())).collect();
-    let mut store = sema::Store::default();
+    let (mut store, mut last) = (sema::Store::default(), false);
     loop {
         let mut cx = sema::Context::new(&outline, &names, store);
-        reach(&mut cx, &roots);
+        let reached = reach(&mut cx, &roots);
+        if last || cx.settled() {
+            let result = run_cases(&mut cx, &reached, &cases, started);
+            std::mem::forget((cx, reached));
+            std::mem::forget((outline, names));
+            return result;
+        }
         let asks;
         (store, asks) = cx.release();
-        if !names.answer(&mut outline, asks)? {
-            return Ok((outline, names, store, cases));
-        }
+        last = !names.answer(&mut outline, asks)?;
     }
 }
 
-fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
-    let started = Instant::now();
-    let (outline, names, store, cases) = reach_cases(workspace, targets)?;
-    let mut cx = sema::Context::new(&outline, &names, store);
-    let roots: Vec<Instance> = cases.iter().map(|item| (*item, Vec::new())).collect();
-    let reached = reach(&mut cx, &roots);
-    let mut image = haste_front::image::Image::new(&reached)?;
-    let broken: std::collections::HashMap<usize, String> = image.compile(&mut cx, &reached).into_iter().collect();
+fn run_cases(cx: &mut sema::Context<'_>, reached: &sema::reach::Reached, cases: &[ItemRef], started: Instant) -> Result<()> {
+    let mut image = haste_front::image::Image::new(reached)?;
+    let broken: std::collections::HashMap<usize, String> = image.compile(cx, reached).into_iter().collect();
     let built = started.elapsed();
     let mut failures = Failures::new();
-    let mut ran = 0;
+    let mut runnable = Vec::new();
     for (root, item) in cases.iter().enumerate() {
         let closure = reached.closure(root);
         let failure = closure.iter().rev().find_map(|at| reached.list[*at].1.as_ref().err()).or_else(|| closure.iter().rev().find_map(|at| broken.get(at)));
         let name = cx.name(*item);
         match failure {
             Some(error) => failures.entry(error_kind(error)).or_default().push(format!("{name}: {error}")),
-            None => {
-                let status = image.run_case((root, &closure), name, &[-5, 0, 1, 3, 20])?;
-                ran += 1;
-                if status != 0 {
-                    failures.entry(format!("crashed with status {status}")).or_default().push(name.to_owned());
-                }
-            }
+            None => runnable.push((root, closure, name)),
         }
+    }
+    let statuses = image.run_cases(&runnable, &[-5, 0, 1, 3, 20])?;
+    let ran = runnable.len();
+    for ((_, _, name), status) in runnable.iter().zip(statuses).filter(|(_, status)| *status != 0) {
+        failures.entry(format!("crashed with status {status}")).or_default().push((*name).to_owned());
     }
     for (error, items) in &failures {
         let names: Vec<&str> = items.iter().take(3).filter_map(|item| item.split(':').next()).collect();
@@ -216,6 +215,7 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     }
     let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
     eprintln!("cases {} found, {ran} ran, {} functions reached, built in {:.1} ms, total {:.1} ms", cases.len(), reached.list.len(), ms(built), ms(started.elapsed()));
+    std::mem::forget(image);
     Ok(())
 }
 
