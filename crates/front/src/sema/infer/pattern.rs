@@ -34,10 +34,17 @@ impl Infer<'_, '_> {
     pub(super) fn macro_ty(&mut self, arena: &Body, path: PathId, open: u32) -> Result<Ty> {
         let (segments, absolute, dollar) = self.segments(arena, path);
         let found = macro_path(&self.cx.paths(self.home.krate), &NamePath { segments: &segments, absolute, dollar }, self.home);
-        if found.and_then(|item| self.cx.builtin(item)) != Some(Builtin::PatternType) {
-            bail!("type macro `{}` is not supported", self.spell(&segments));
-        }
         let (src, close) = (self.src, self.src.pair(open));
+        match found.and_then(|item| self.cx.builtin(item)) {
+            Some(Builtin::PatternType) => {}
+            Some(Builtin::CfgSelect) => {
+                let env = &self.cx.outline.crates[self.home.krate as usize].env;
+                let Some(arm) = crate::outline::mbe::select_arm(src, open, env)? else { bail!("no cfg_select! arm applies") };
+                let (inner, ty) = syntax::parse_ty(src, arm.from, arm.to)?;
+                return self.lower_ty(&inner, ty);
+            }
+            _ => bail!("type macro `{}` is not supported", self.spell(&segments)),
+        }
         let Some(is) = (open + 1..close).find(|&at| src.kind(at) == TokenKind::Ident && src.text(at) == "is") else { bail!("pattern_type! needs `is`") };
         let (inner, base) = syntax::parse_ty(src, open + 1, is)?;
         let base = self.lower_ty(&inner, base)?;

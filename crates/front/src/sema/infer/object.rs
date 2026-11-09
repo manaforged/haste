@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::names::ItemRef;
+use crate::outline::item::ItemKind;
 
 use super::super::Context;
 use super::super::ty::{Kind, Ty};
@@ -26,7 +27,7 @@ pub const ALIGN_SLOT: u32 = 2;
 pub const FIRST_METHOD: u32 = 3;
 
 impl Infer<'_, '_> {
-    /// The unsizing of the pointee `from` to the pointee `to`: an array to a slice, or a sized type to a trait object that it implements.
+    /// The unsizing of the pointee `from` to the pointee `to`: an array to a slice, a struct through its last field, or a sized type to a trait object that it implements.
     pub(super) fn unsize_pointee(&mut self, from: Ty, to: Ty) -> Result<Option<Coercion>> {
         let (from, to) = (self.resolve(from), self.resolve(to));
         match (self.cx.types.kind(from).clone(), self.cx.types.kind(to).clone()) {
@@ -34,10 +35,19 @@ impl Infer<'_, '_> {
                 self.unify(element, target)?;
                 Ok(Some(Coercion::Len(len)))
             }
+            (Kind::Adt(item, from), Kind::Adt(other, to)) if item == other && from != to && self.cx.item(item).1.kind == ItemKind::Struct => self.unsize_tail(item, &from, &to),
             (Kind::Dyn(..) | Kind::Var(_), _) => Ok(None),
-            (_, Kind::Dyn(of, args)) => {
-                if self.select(of, from, &args)?.is_none() {
+            (_, Kind::Dyn(of, args, members)) => {
+                let (given, bound) = super::super::ty::object_parts(&args, &members);
+                if !self.object_of(of, from, given)? {
                     bail!("{} does not implement `{}`", self.show(from), self.cx.name(of));
+                }
+                let given = given.to_vec();
+                for (member, ty) in bound.collect::<Vec<_>>() {
+                    let name = self.cx.name(member);
+                    if !self.binding_holds((of, &given), from, (&name, ty))? {
+                        bail!("{} does not give `{name}` as the trait object wants", self.show(from));
+                    }
                 }
                 Ok(Some(Coercion::Vtable(Vtable { ty: from, object: to, drop: None, methods: Vec::new() })))
             }
@@ -45,13 +55,45 @@ impl Infer<'_, '_> {
         }
     }
 
+    fn closure_slot(&mut self, method: ItemRef, ty: Ty) -> Option<ItemRef> {
+        if !matches!(self.cx.types.kind(ty), Kind::Closure(..)) || self.cx.call_once() != Some(method) {
+            return None;
+        }
+        let of = self.cx.lang_item("fn_mut")?;
+        self.cx.trait_member(of, "call_mut")
+    }
+
+    fn object_of(&mut self, of: ItemRef, from: Ty, given: &[Ty]) -> Result<bool> {
+        if !self.cx.lang(of).is_some_and(|lang| super::select::CALLABLE.contains(&lang)) {
+            return Ok(self.select(of, from, given)?.is_some());
+        }
+        let (Some((params, _)), Some(&wanted)) = (self.callable_sig(from)?, given.first()) else { return Ok(false) };
+        let inputs = self.cx.types.intern(Kind::Tuple(params));
+        Ok(self.unify(inputs, wanted).is_ok())
+    }
+
+    fn unsize_tail(&mut self, item: ItemRef, from: &[Ty], to: &[Ty]) -> Result<Option<Coercion>> {
+        let (have, want) = (self.adt_fields(item, from)?, self.adt_fields(item, to)?);
+        let (Some(&a), Some(&b)) = (have.first().and_then(|fields| fields.last()), want.first().and_then(|fields| fields.last())) else { return Ok(None) };
+        let Some(unsize) = self.unsize_pointee(a, b)? else { return Ok(None) };
+        for (&found, &wanted) in from.iter().zip(to) {
+            let saved = self.vars.clone();
+            if self.unify(found, wanted).is_err() {
+                self.vars = saved;
+            }
+        }
+        Ok(Some(unsize))
+    }
+
     /// The vtable `vtable` once its types are known, with each slot resolved to the function that it calls.
     pub(super) fn zonk_vtable(&mut self, vtable: Vtable) -> Result<Vtable> {
         let (ty, object) = (self.zonk(vtable.ty), self.zonk(vtable.object));
-        let Kind::Dyn(of, args) = self.cx.types.kind(object).clone() else { bail!("a vtable for a type that is not a trait object") };
+        let Kind::Dyn(of, args, members) = self.cx.types.kind(object).clone() else { bail!("a vtable for a type that is not a trait object") };
+        let args = super::super::ty::object_parts(&args, &members).0.to_vec();
         let mut methods = Vec::new();
         for method in self.cx.vtable_methods(of)? {
             let substs = std::iter::once(ty).chain(args.iter().copied()).collect();
+            let method = method.map(|method| self.closure_slot(method, ty).unwrap_or(method));
             methods.push(method.map(|method| self.trait_call(method, substs)).transpose()?);
         }
         Ok(Vtable { ty, object, drop: None, methods })
@@ -73,7 +115,7 @@ pub fn fill_drops(cx: &mut Context<'_>, typed: &mut super::Typed) -> Result<bool
 /// The vtable slot that a call of trait method `item` at `substs` reads its code from, when `Self` is a trait object of the method's trait.
 pub fn virtual_slot(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Option<u32>> {
     let Some(of) = cx.owner_trait(item) else { return Ok(None) };
-    let Some(&Kind::Dyn(object, _)) = substs.first().map(|ty| cx.types.kind(*ty)) else { return Ok(None) };
+    let Some(&Kind::Dyn(object, ..)) = substs.first().map(|ty| cx.types.kind(*ty)) else { return Ok(None) };
     if object != of {
         bail!("a supertrait method through a trait object is not supported yet");
     }

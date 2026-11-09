@@ -19,6 +19,8 @@ pub struct Image {
     data: RefCell<Vec<Box<[u128]>>>,
     tables: RefCell<HashMap<Vec<Word>, i64>>,
     fixups: RefCell<Vec<(usize, usize, usize)>>,
+    cells: RefCell<HashMap<usize, i64>>,
+    statics: rustc_hash::FxHashSet<usize>,
 }
 
 impl Slots for Image {
@@ -47,13 +49,22 @@ impl Slots for Image {
         self.tables.borrow_mut().insert(words.to_vec(), address);
         address
     }
+
+    fn cell(&self, index: usize, size: u32) -> i64 {
+        if let Some(&address) = self.cells.borrow().get(&index) {
+            return address;
+        }
+        let address = self.data(&vec![0; size as usize]);
+        self.cells.borrow_mut().insert(index, address);
+        address
+    }
 }
 
 impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Image {
         let table = (0..reached.list.len()).map(|_| AtomicUsize::new(0)).collect();
-        Image { table, memory: Memory::default(), data: RefCell::default(), tables: RefCell::default(), fixups: RefCell::default() }
+        Image { table, memory: Memory::default(), data: RefCell::default(), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), statics: Default::default() }
     }
 
     /// Lowers and encodes every reached function that type-checked, and returns the errors of those that did not compile, by index.
@@ -73,6 +84,10 @@ impl Image {
                 continue;
             }
             match self.compile_one(cx, reached, index) {
+                Ok(address) if lower::is_static(cx, item) => {
+                    self.table[index].store(address, Ordering::Release);
+                    self.statics.insert(index);
+                }
                 Ok(address) => self.table[index].store(address, Ordering::Release),
                 Err(error) => errors.push((index, format!("{}: {error:#}", cx.name(reached.list[index].0.0)))),
             }
@@ -97,8 +112,8 @@ impl Image {
         self.memory.write(&compiled.code).map_err(|error| anyhow!(error))
     }
 
-    /// Runs reached function `index`, an `fn(i64) -> i64`, on each input in a forked child that prints `name input value` lines.
-    pub fn run_case(&self, index: usize, name: &str, inputs: &[i64]) -> Result<i32> {
+    /// Runs reached function `index`, an `fn(i64) -> i64` that reaches the functions `closure`, on each input in a forked child that fills the statics it reaches and prints `name input value` lines.
+    pub fn run_case(&self, (index, closure): (usize, &[usize]), name: &str, inputs: &[i64]) -> Result<i32> {
         let address = self.table[index].load(Ordering::Acquire);
         if address == 0 {
             bail!("{name} has no code");
@@ -113,6 +128,7 @@ impl Image {
         }
         if pid == 0 {
             use std::io::Write;
+            self.fill_statics(closure);
             let mut out = std::io::stdout().lock();
             let wrote = inputs.iter().try_for_each(|&input| writeln!(out, "{name} {input} {}", case(input)).and_then(|_| out.flush()));
             // SAFETY: _exit ends the child without running the parent's destructors.
@@ -122,5 +138,14 @@ impl Image {
         // SAFETY: pid is the child forked above, and status is a live local.
         unsafe { libc::waitpid(pid, &mut status, 0) };
         Ok(status)
+    }
+
+    fn fill_statics(&self, closure: &[usize]) {
+        for &index in closure.iter().rev().filter(|index| self.statics.contains(index)) {
+            let address = self.table[index].load(Ordering::Acquire);
+            // SAFETY: address is code that the encoder wrote for a static's initializer, a native fn() that writes the static's cell.
+            let fill: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
+            fill();
+        }
     }
 }

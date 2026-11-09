@@ -80,7 +80,7 @@ pub fn content(src: &Source, from: u32, to: u32) -> Result<Attr> {
         ("cfg", TokenKind::OpenParen) => Attr::Cfg(cfg_of(src, after)?),
         ("cfg_attr", TokenKind::OpenParen) => cfg_attr(src, after)?,
         ("path", TokenKind::Eq) if after + 1 < to => Attr::Path(unquote(src.text(after + 1))),
-        ("derive", TokenKind::OpenParen) => Attr::Derive(after),
+        ("derive" | "derive_const", TokenKind::OpenParen) => Attr::Derive(after),
         _ => FLAGS.iter().find(|(name, _)| *name == path).map_or(Attr::Other(from), |(_, attr)| attr.clone()),
     })
 }

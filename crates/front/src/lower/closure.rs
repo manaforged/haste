@@ -1,10 +1,10 @@
 use anyhow::{Result, bail};
-use haste_codegen::Value;
+use haste_codegen::{Type, Value};
 
 use crate::body::{ExprId, List};
 use crate::names::ItemRef;
-use crate::sema::infer::{By, ClosureBody, Shape, needs_drop};
-use crate::sema::ty::{Kind, Ty};
+use crate::sema::infer::{By, ClosureBody, Res, Shape, needs_drop};
+use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::moves::Root;
 use super::place::{Base, Place};
@@ -65,26 +65,87 @@ impl Lower<'_, '_> {
 
     /// Lowers a call of the callee value `callee`, a closure or a function item, which inference resolved to `(item, substs)`.
     pub(super) fn call_value(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Vec<Ty>), args: List) -> Result<Option<Value>> {
+        let item_value = matches!(self.cx.types.kind(self.ty_of(callee)), Kind::FnDef(..));
+        if !item_value && substs.first().is_some_and(|ty| matches!(self.cx.types.kind(*ty), Kind::Dyn(..))) {
+            return self.object_call((expr, callee), (item, substs), args);
+        }
         if self.typed.autoderefs.contains_key(&expr) {
             let values = self.pointed_env(expr, callee)?;
             let values = self.args(args, values)?;
             return self.invoke(item, &substs, values);
         }
-        let callee_ty = self.ty_of(callee);
-        let mut values = Vec::new();
-        if self.cx.closure_takes_env(callee_ty) {
-            let place = self.place_or_temp(callee)?;
-            values.push(self.address_or_dangling(place, callee_ty)?);
-            if self.cx.closure_consumes(callee_ty)
-                && let Some((root, path)) = self.scrutinee_path(callee)
-            {
-                self.moved_out(root, &path)?;
-            }
-        } else {
-            self.expr(callee)?;
-        }
+        let values = self.callee_env(callee)?;
         let values = self.args(args, values)?;
         self.invoke(item, &substs, values)
+    }
+
+    fn callee_env(&mut self, callee: ExprId) -> Result<Vec<Value>> {
+        let callee_ty = self.ty_of(callee);
+        if !self.cx.closure_takes_env(callee_ty) {
+            self.expr(callee)?;
+            return Ok(Vec::new());
+        }
+        let place = self.place_or_temp(callee)?;
+        let env = self.address_or_dangling(place, callee_ty)?;
+        if self.cx.closure_consumes(callee_ty)
+            && let Some((root, path)) = self.scrutinee_path(callee)
+        {
+            self.moved_out(root, &path)?;
+        }
+        Ok(vec![env])
+    }
+
+    /// Lowers the body of `Fn::call` or `FnMut::call_mut` at a closure: the call `res` of the closure's body with the fields of the argument tuple.
+    pub(super) fn untuple_call(&mut self, res: Res) -> Result<Option<Value>> {
+        let Res::Fn(item, substs) = res else { bail!("a closure trait call that calls no function") };
+        let (Some(&closure), Some(&tuple)) = (substs.first(), substs.get(1)) else { bail!("a closure trait call with no closure and arguments") };
+        let mut values = Vec::new();
+        if self.cx.closure_takes_env(closure) {
+            let Some(receiver) = self.locals[self.typed.params[0] as usize] else { bail!("a closure trait call with no receiver") };
+            values.extend(self.read(receiver));
+        }
+        let Kind::Tuple(items) = self.cx.types.kind(tuple).clone() else { bail!("closure arguments that are not a tuple") };
+        if let Some(args) = self.locals[self.typed.params[1] as usize] {
+            for index in 0..items.len() as u32 {
+                let part = self.part_place(args, tuple, (0, index))?;
+                values.extend(self.read(part));
+            }
+        }
+        self.invoke(item, &substs, values)
+    }
+
+    fn object_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Vec<Ty>), args: List) -> Result<Option<Value>> {
+        if self.cx.call_once() == Some(item) {
+            return self.boxed_once_call((expr, callee), (item, substs), args);
+        }
+        let Some((place, _)) = self.autoderef_place(expr, callee)? else { return Ok(None) };
+        let receiver = self.address(place);
+        let Some(&tuple) = substs.get(1) else { bail!("a trait object call with no argument tuple") };
+        let packed = self.tuple_of(tuple, args)?;
+        self.invoke(item, &substs, std::iter::once(receiver).chain(packed).collect())
+    }
+
+    fn boxed_once_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Vec<Ty>), args: List) -> Result<Option<Value>> {
+        let Some((root, path)) = self.scrutinee_path(callee) else { bail!("calling a temporary `Box<dyn FnOnce>` is not supported yet") };
+        let Some(Res::Fn(free, free_substs)) = self.typed.box_frees.get(&expr).cloned() else { bail!("a `Box<dyn FnOnce>` call with no box to free") };
+        let Some(boxed) = self.place_or_temp(callee)? else { return Ok(None) };
+        let Some((place, _)) = self.deref_step((expr, 0), Some(boxed), self.ty_of(callee))? else { return Ok(None) };
+        let Some(slot) = crate::sema::infer::virtual_slot(self.cx, item, &substs)? else { bail!("`call_once` has no vtable slot") };
+        let pair = self.address(place);
+        let data = self.ins().load(Type::I64, pair, 0);
+        let vtable = self.ins().load(Type::I64, pair, 8);
+        let code = self.ins().load(Type::I64, vtable, slot as i32 * 8);
+        let Some(&tuple) = substs.get(1) else { bail!("a trait object call with no argument tuple") };
+        let packed = self.tuple_of(tuple, args)?;
+        let ret = self.ty_of(expr);
+        let unit = self.cx.types.unit();
+        let pointer = self.cx.types.intern(Kind::Ptr(Mut::Mut, unit));
+        let signature = super::signature_of(self.cx, Some(ret), [pointer, tuple])?;
+        let result = self.call_code(code, (signature, Some(ret)), std::iter::once(data).chain(packed).collect())?;
+        self.moved_out(root, &path)?;
+        let target = self.address(boxed);
+        self.invoke(free, &free_substs, vec![target])?;
+        Ok(result)
     }
 
     fn pointed_env(&mut self, expr: ExprId, callee: ExprId) -> Result<Vec<Value>> {

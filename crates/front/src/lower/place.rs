@@ -69,7 +69,7 @@ impl Lower<'_, '_> {
     }
 
     /// The place and type that dereference step `step` of `expr` reaches from `place` of type `ty`: through the `Deref` call inference picked, or the builtin dereference.
-    fn deref_step(&mut self, (expr, step): (ExprId, u32), place: Option<Place>, ty: Ty) -> Result<Option<(Place, Ty)>> {
+    pub(super) fn deref_step(&mut self, (expr, step): (ExprId, u32), place: Option<Place>, ty: Ty) -> Result<Option<(Place, Ty)>> {
         match self.typed.derefs.get(&(expr, step)).cloned() {
             Some(Res::Fn(item, substs)) => {
                 let receiver = self.address_or_dangling(place, ty)?;
@@ -89,10 +89,18 @@ impl Lower<'_, '_> {
         match self.cx.types.kind(ty).clone() {
             Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => Ok((value, pointee)),
             _ if let Some(pointee) = self.cx.boxed(ty) => {
-                let pointer = if self.is_unsized(pointee) { value } else { self.box_data(value) };
+                let pointer = if self.cx.is_unsized(pointee)? { value } else { self.box_data(value) };
                 Ok((pointer, pointee))
             }
             other => bail!("dereference of {other:?}"),
+        }
+    }
+
+    /// The address that the value `value` of the sized pointer type `ty` holds, whether a reference, a raw pointer, or a smart pointer such as `Box` or `Rc`.
+    pub(super) fn sized_pointer(&mut self, value: Value, ty: Ty) -> Value {
+        match self.cx.types.kind(ty) {
+            Kind::Ref(..) | Kind::Ptr(..) => value,
+            _ => self.box_data(value),
         }
     }
 
@@ -103,7 +111,7 @@ impl Lower<'_, '_> {
 
     /// The place that `pointer` to `pointee` names, which for a slice or `str` is the wide pointer itself.
     pub(super) fn pointee_place(&mut self, pointer: Value, pointee: Ty) -> Result<Place> {
-        let repr = if self.is_unsized(pointee) { super::ops::WIDE } else { repr(self.cx, pointee)? };
+        let repr = if self.cx.is_unsized(pointee)? { super::ops::WIDE } else { repr(self.cx, pointee)? };
         Ok(Place { base: Base::Addr(pointer), offset: 0, repr })
     }
 
@@ -134,6 +142,10 @@ impl Lower<'_, '_> {
             Expr::Paren(inner) => self.place_of(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Local(local)) => Ok(self.locals[*local as usize]),
+                Some(Res::Fn(item, substs)) if super::is_static(self.cx, *item) => {
+                    let (item, substs) = (*item, substs.clone());
+                    self.static_place((item, &substs), self.ty_of(expr)).map(Some)
+                }
                 _ => Ok(None),
             },
             Expr::Unary(UnOp::Deref, operand) => self.deref_place(expr, operand),
@@ -149,11 +161,15 @@ impl Lower<'_, '_> {
 
     /// The place of `expr`, holding its value in a new frame slot when it is not a place already.
     pub fn place_or_temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
-        let widened = self.typed.coercions.get(&expr).is_some_and(Coercion::widens);
-        if !widened && let Some(place) = self.place_of(expr)? {
+        let coerced = self.typed.coercions.get(&expr);
+        if coerced.is_none() && let Some(place) = self.place_of(expr)? {
             return Ok(Some(place));
         }
-        let repr = if widened { super::ops::WIDE } else { self.repr_of(expr)? };
+        let repr = match coerced {
+            Some(coercion) if coercion.widens() => super::ops::WIDE,
+            Some(Coercion::Reify(_)) => Repr::Scalar(Type::I64),
+            _ => self.repr_of(expr)?,
+        };
         let value = self.expr(expr)?;
         let place = match (repr, value) {
             (Repr::Mem { .. }, Some(addr)) => Some(Place { base: Base::Addr(addr), offset: 0, repr }),
@@ -212,18 +228,23 @@ impl Lower<'_, '_> {
 
     /// Lowers the tuple expression `expr` into a new frame slot and returns its address.
     pub fn tuple(&mut self, expr: ExprId, list: List) -> Result<Option<Value>> {
-        let repr = self.repr_of(expr)?;
-        let ty = self.ty_of(expr);
-        let slot = self.slot(repr);
+        self.tuple_of(self.ty_of(expr), list)
+    }
+
+    /// Lowers the expressions `list` into a new frame slot as a tuple of type `ty`, and returns its value.
+    pub(super) fn tuple_of(&mut self, ty: Ty, list: List) -> Result<Option<Value>> {
+        let whole = repr(self.cx, ty)?;
+        let Kind::Tuple(items) = self.cx.types.kind(ty).clone() else { bail!("a tuple of a type that is not a tuple") };
+        let slot = self.slot(whole);
         for (index, &item) in self.body.list(list).to_vec().iter().enumerate() {
             let value = self.expr(ExprId(item))?;
-            let field = self.repr_of(ExprId(item))?;
+            let field = repr(self.cx, items[index])?;
             let offset = self.field_offset(ty, index as u32)?;
             if let (Some(slot), Some(value)) = (slot, value) {
-                self.write(Place::slot(slot, repr).at(offset, field), value);
+                self.write(Place::slot(slot, whole).at(offset, field), value);
             }
         }
-        Ok(slot.map(|slot| self.read(Place::slot(slot, repr))).flatten())
+        Ok(slot.map(|slot| self.read(Place::slot(slot, whole))).flatten())
     }
 
     /// Lowers `&inner` to the address of `inner`'s place.

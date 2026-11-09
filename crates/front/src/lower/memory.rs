@@ -28,15 +28,22 @@ impl Lower<'_, '_> {
                 Ok(None)
             }
             (BlackBox, _, _) => Ok(args.first().copied()),
+            (CompareBytes, _, &[x, y, count]) => Ok(Some(self.compare_bytes((x, y), count))),
+            (DiscriminantValue, Some(ty), &[pointer]) => {
+                let place = self.pointee_place(pointer, ty)?;
+                self.discriminant_value(place, ty).map(Some)
+            }
+            (Atomic(atomic), Some(ty), _) => self.atomic(atomic, ty, args),
             (Unchecked(op), Some(ty), &[x, y]) => self.unchecked(op, (ty, substs.get(1).copied()), x, y).map(Some),
             (ThreeWayCompare, Some(ty), &[x, y]) => self.compare(ty, x, y).map(Some),
-            (RawPointer | Offset(_) | OffsetFrom(_) | Read | Write | WriteBox | MemCopy(_) | WriteBytes, Some(ty), _) => self.access_intrinsic(which, ty, args),
+            (RawPointer | Offset(_) | OffsetFrom(_) | Read | Write | WriteBox | MemCopy(_) | WriteBytes | SliceElement, Some(_), _) => self.access_intrinsic(which, substs, args),
             _ => self.value_intrinsic(which, substs, args).map(Some),
         }
     }
 
-    fn access_intrinsic(&mut self, which: Intrinsic, ty: Ty, args: &[Value]) -> Result<Option<Value>> {
+    fn access_intrinsic(&mut self, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         use Intrinsic::*;
+        let ty = substs[0];
         match (which, args) {
             (RawPointer, &[data, ..]) => match (repr(self.cx, ty)?, args.get(1)) {
                 (Repr::Mem { .. }, Some(&meta)) => Ok(Some(self.wide(data, meta))),
@@ -55,6 +62,7 @@ impl Lower<'_, '_> {
             (WriteBox, &[boxed, ..]) => self.write_box(ty, boxed, args.get(1).copied()).map(Some),
             (MemCopy(overlapping), &[from, to, count]) => self.copy_items(ty, overlapping, (from, to), count).map(|()| None),
             (WriteBytes, &[to, byte, count]) => self.write_bytes(ty, to, byte, count).map(|()| None),
+            (SliceElement, &[slice, index]) => self.slice_element(substs, slice, index).map(Some),
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
         }
     }
@@ -90,9 +98,42 @@ impl Lower<'_, '_> {
                 let slot = if size { SIZE_SLOT } else { ALIGN_SLOT };
                 Ok(self.ins().load(Type::I64, vtable, slot as i32 * 8))
             }
-            Kind::Adt(_, args) if args.iter().any(|arg| self.cx.types.kind(*arg).is_unsized()) => bail!("the size of a value whose type ends in an unsized field is not supported yet"),
+            Kind::Adt(item, args) if self.cx.is_unsized(ty)? => self.tail_layout(size, (ty, item, &args), pointer),
             _ => self.layout_const(which, ty),
         }
+    }
+
+    fn tail_layout(&mut self, size: bool, (ty, item, args): (Ty, crate::names::ItemRef, &[Ty]), pointer: Value) -> Result<Value> {
+        let layout = self.cx.layout(ty)?;
+        let fields = crate::sema::infer::field_types(self.cx, item, args)?;
+        let Some((index, &field)) = fields.first().and_then(|fields| fields.iter().enumerate().last()) else { bail!("an unsized struct with no fields") };
+        let offset = super::adt::field_offset(&layout, 0, index as u32);
+        let field_align = self.value_layout(false, field, pointer)?;
+        let own_align = self.ins().iconst(Type::I64, layout.align.abi.bytes() as i64);
+        let wider = self.ins().icmp(IntCC::UnsignedGreaterThan, own_align, field_align);
+        let align = self.ins().select(wider, own_align, field_align);
+        if !size {
+            return Ok(align);
+        }
+        let field_size = self.value_layout(true, field, pointer)?;
+        let end = self.ins().iadd_imm(field_size, i64::from(offset));
+        Ok(self.align_up(end, align))
+    }
+
+    /// The least multiple of `align`, a power of two, that is at least `value`.
+    pub(super) fn align_up(&mut self, value: Value, align: Value) -> Value {
+        let up = self.ins().iadd(value, align);
+        let up = self.ins().iadd_imm(up, -1);
+        let mask = self.ins().ineg(align);
+        self.ins().band(up, mask)
+    }
+
+    fn slice_element(&mut self, substs: &[Ty], slice: Value, index: Value) -> Result<Value> {
+        let Some(&element) = substs.get(2) else { bail!("slice_get_unchecked takes three type arguments") };
+        let size = self.size(element)?;
+        let data = self.ins().load(Type::I64, slice, 0);
+        let bytes = self.ins().imul_imm(index, size);
+        Ok(self.ins().iadd(data, bytes))
     }
 
     fn size(&mut self, ty: Ty) -> Result<i64> {
@@ -160,6 +201,24 @@ impl Lower<'_, '_> {
             lower.ins().store(byte, at, 0);
         });
         Ok(())
+    }
+
+    fn compare_bytes(&mut self, (x, y): (Value, Value), count: Value) -> Value {
+        let order = self.b.create_stack_slot(4, 2);
+        let zero = self.ins().iconst(Type::I32, 0);
+        self.ins().stack_store(zero, order, 0);
+        self.each(count, |lower, index| {
+            let (left, right) = (lower.ins().iadd(x, index), lower.ins().iadd(y, index));
+            let (left, right) = (lower.ins().load(Type::I8, left, 0), lower.ins().load(Type::I8, right, 0));
+            let (left, right) = (lower.ins().uextend(Type::I32, left), lower.ins().uextend(Type::I32, right));
+            let difference = lower.ins().isub(left, right);
+            let so_far = lower.ins().stack_load(Type::I32, order, 0);
+            let zero = lower.ins().iconst(Type::I32, 0);
+            let undecided = lower.ins().icmp(IntCC::Equal, so_far, zero);
+            let next = lower.ins().select(undecided, difference, so_far);
+            lower.ins().stack_store(next, order, 0);
+        });
+        self.ins().stack_load(Type::I32, order, 0)
     }
 
     pub(super) fn each(&mut self, count: Value, mut body: impl FnMut(&mut Self, Value)) {

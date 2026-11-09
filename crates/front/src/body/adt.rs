@@ -40,9 +40,23 @@ pub struct AdtDef {
     pub body: Body,
     pub generics: Generics,
     pub variants: Vec<VariantDef>,
+    /// The tokens of each `where` clause, after the keyword.
+    pub wheres: Vec<(u32, u32)>,
 }
 
 impl AdtDef {
+    /// Drops the variants and fields whose attributes `enabled` rejects, as `#[cfg]` configures them out.
+    pub fn configure(&mut self, src: &Source, enabled: &dyn Fn(&[crate::outline::item::Attr]) -> bool) {
+        let kept = |at: Option<u32>| {
+            let mut attrs = Vec::new();
+            at.is_none_or(|at| crate::outline::attr::attrs(src, at, false, &mut attrs).is_ok() && enabled(&attrs))
+        };
+        self.variants.retain(|variant| kept(variant.attrs));
+        for variant in &mut self.variants {
+            variant.fields.retain(|field| kept(field.attrs));
+        }
+    }
+
     /// The position among the variants that are configured in of the variant whose declaration index is `index`.
     pub fn position(&self, index: u32) -> Option<usize> {
         self.variants.iter().position(|variant| variant.index == index)
@@ -53,7 +67,8 @@ impl AdtDef {
 pub fn adt(src: &Source, name: u32, to: u32, is_enum: bool) -> Result<AdtDef> {
     let mut cursor = Cursor::new(src, name + 1, to);
     let params = cursor.generic_params()?;
-    let mut predicates = cursor.where_clause()?;
+    let mut wheres = Vec::new();
+    let mut predicates = cursor.where_span(&mut wheres)?;
     let variants = if is_enum {
         let open = cursor.expect_kind(TokenKind::OpenBrace)?;
         let mut variants = Vec::new();
@@ -65,13 +80,22 @@ pub fn adt(src: &Source, name: u32, to: u32, is_enum: bool) -> Result<AdtDef> {
         variants
     } else {
         let (shape, fields) = cursor.fields()?;
-        predicates.extend(cursor.where_clause()?);
+        predicates.extend(cursor.where_span(&mut wheres)?);
         vec![VariantDef { name, shape, fields, discriminant: None, attrs: None, index: 0 }]
     };
-    Ok(AdtDef { body: cursor.body, generics: Generics { params, predicates }, variants })
+    Ok(AdtDef { body: cursor.body, generics: Generics { params, predicates, ..Default::default() }, variants, wheres })
 }
 
 impl Cursor<'_> {
+    fn where_span(&mut self, into: &mut Vec<(u32, u32)>) -> Result<Vec<super::sig::Predicate>> {
+        let start = self.at + 1;
+        let predicates = self.where_clause()?;
+        if self.at > start {
+            into.push((start, self.at));
+        }
+        Ok(predicates)
+    }
+
     fn variant(&mut self) -> Result<VariantDef> {
         let attrs = self.skip_attrs()?.map(|(start, _)| start);
         self.visibility();

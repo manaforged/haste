@@ -5,7 +5,8 @@ use crate::names::{Def, ItemRef, Primitive, Sym};
 use crate::outline::item::ItemKind;
 
 use super::super::ty::{Kind, Ty, int_info};
-use super::Infer;
+use super::super::intrinsic::Intrinsic;
+use super::{Infer, Res};
 use super::path::parse_int;
 
 /// The width and signedness of an integer type.
@@ -56,13 +57,13 @@ fn fold_unsigned(op: BinOp, x: u128, y: u128) -> u128 {
 
 impl Infer<'_, '_> {
     /// The value of the integer constant item `item`, as the bits of its type.
-    pub(super) fn const_value(&mut self, item: ItemRef) -> Result<(u128, Int)> {
+    pub(super) fn const_value(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(u128, Int)> {
         let sig = self.cx.signature(item)?;
         let Some(ret) = sig.ret else { bail!("constant {} has no type", self.cx.name(item)) };
         let body = self.cx.body(item)?;
         let Some(root) = body.root else { bail!("constant {} has no value", self.cx.name(item)) };
-        let mut frame = self.frame(item, &[])?;
-        frame.src = self.cx.body_src(item);
+        let mut frame = self.frame(item, substs)?;
+        (frame.src, frame.root) = (self.cx.body_src(item), Some(item.body_owner()));
         self.with_frame(frame, |infer| {
             let ty = infer.lower_ty(&sig.body, ret)?;
             let Kind::Prim(primitive) = *infer.cx.types.kind(ty) else { bail!("constant of a type that is not an integer") };
@@ -77,8 +78,7 @@ impl Infer<'_, '_> {
         if !self.cx.adt_def(item)?.variants[at].fields.is_empty() {
             bail!("a constant variant of {} that has fields", self.cx.name(item));
         }
-        let primitive = self.cx.repr(item).int.map_or(Primitive::Isize, super::super::adt::repr_primitive);
-        let Some(int) = int_info(primitive) else { bail!("an enum tag that is not an integer") };
+        let Some(int) = int_info(self.cx.discriminant_primitive(item)) else { bail!("an enum tag that is not an integer") };
         let value = self.cx.discriminants(item)?[at];
         Ok((value as u128 & mask(int.0), int))
     }
@@ -136,14 +136,9 @@ impl Infer<'_, '_> {
             Expr::Unary(op, inner) => self.const_unary(arena, op, inner, want),
             Expr::Binary(op, lhs, rhs) => self.const_binary(arena, op, (lhs, rhs), want),
             Expr::Cast(inner, ty) => self.const_cast(arena, inner, ty),
-            Expr::Path(path) => match self.named_param(arena, expr) {
-                Some(param) => match *self.cx.types.kind(self.resolve(param)) {
-                    Kind::Value(bits) => Ok((bits, want)),
-                    _ => bail!("a const parameter whose value is not known yet"),
-                },
-                None => self.const_path(arena, path),
-            },
-            _ => bail!("constant expressions of this kind are not evaluated yet"),
+            Expr::Call(callee, args) if arena.list(args).is_empty() => self.const_call(arena, callee, want),
+            Expr::Path(path) => self.const_name(arena, (expr, path), want),
+            other => bail!("constant expressions like {other:?} are not evaluated yet"),
         }
     }
 
@@ -173,9 +168,68 @@ impl Infer<'_, '_> {
         Ok((fold(op, x, y, int)? & mask(int.0), int))
     }
 
+    fn const_name(&mut self, arena: &Body, (expr, path): (ExprId, PathId), want: Int) -> Result<(u128, Int)> {
+        let Some(param) = self.named_param(arena, expr) else { return self.const_path(arena, path) };
+        match *self.cx.types.kind(self.resolve(param)) {
+            Kind::Value(bits) => Ok((bits, want)),
+            _ => bail!("a const parameter whose value is not known yet"),
+        }
+    }
+
     fn const_path(&mut self, arena: &Body, path: PathId) -> Result<(u128, Int)> {
-        let (segments, absolute, dollar) = self.segments(arena, path);
-        self.const_named(&segments, absolute, dollar)
+        let named = match arena.path(path).qself {
+            Some(_) => None,
+            None => {
+                let (segments, absolute, dollar) = self.segments(arena, path);
+                Some(self.const_named(&segments, absolute, dollar))
+            }
+        };
+        match named {
+            Some(Ok(found)) => Ok(found),
+            Some(Err(error)) => self.const_member(arena, path).map_err(|_| error),
+            None => self.const_member(arena, path),
+        }
+    }
+
+    fn const_member(&mut self, arena: &Body, path: PathId) -> Result<(u128, Int)> {
+        let (item, substs) = self.const_target(arena, path)?;
+        match self.cx.item(item).1.kind {
+            ItemKind::Const => self.const_value(item, &substs),
+            other => bail!("a {other:?} used as a constant"),
+        }
+    }
+
+    fn const_call(&mut self, arena: &Body, callee: ExprId, want: Int) -> Result<(u128, Int)> {
+        let Expr::Path(path) = *arena.expr(callee) else { bail!("a constant call of something that is not a path") };
+        let (item, substs) = self.const_target(arena, path)?;
+        let layout_of = |infer: &mut Self| match substs.first() {
+            Some(&ty) => infer.cx.layout(ty),
+            None => bail!("a layout intrinsic with no type"),
+        };
+        match self.cx.intrinsic(item) {
+            Some(Intrinsic::SizeOf) => Ok((u128::from(layout_of(self)?.size.bytes()), (64, false))),
+            Some(Intrinsic::AlignOf) => Ok((u128::from(layout_of(self)?.align.abi.bytes()), (64, false))),
+            Some(other) => bail!("the intrinsic {other:?} in a constant is not evaluated yet"),
+            None => self.const_body(item, &substs, want),
+        }
+    }
+
+    fn const_target(&mut self, arena: &Body, path: PathId) -> Result<(ItemRef, Vec<Ty>)> {
+        let (_, res) = self.path_value(arena, path)?;
+        let Res::Fn(item, substs) = res else { bail!("a constant path that names no item") };
+        let substs = substs.into_iter().map(|ty| self.zonk(ty)).collect();
+        match self.trait_call(item, substs)? {
+            Res::Fn(item, substs) => Ok((item, substs)),
+            _ => bail!("a constant path that names no item"),
+        }
+    }
+
+    fn const_body(&mut self, item: ItemRef, substs: &[Ty], want: Int) -> Result<(u128, Int)> {
+        let body = self.cx.body(item)?;
+        let Some(root) = body.root else { bail!("{} has no body to evaluate", self.cx.name(item)) };
+        let mut frame = self.frame(item, substs)?;
+        (frame.src, frame.root) = (self.cx.body_src(item), Some(item.body_owner()));
+        self.with_frame(frame, |infer| infer.const_eval(&body, root, want))
     }
 
     /// The value of the integer constant that the path `segments` names: an associated constant of an integer type, or a constant item.
@@ -196,7 +250,7 @@ impl Infer<'_, '_> {
         }
         let def = self.value_def(segments, absolute, dollar).ok();
         match def {
-            Some(Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => self.const_value(item),
+            Some(Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => self.const_value(item, &[]),
             Some(Def::Variant(item, index)) => self.variant_value(item, index),
             _ => bail!("constant `{}` is not an integer constant item", self.spell(segments)),
         }

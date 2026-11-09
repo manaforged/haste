@@ -28,7 +28,7 @@ impl Infer<'_, '_> {
             Expr::Assign(lhs, rhs) => self.assign(lhs, rhs, None),
             Expr::AssignOp(op, lhs, rhs) => self.assign(lhs, rhs, Some(op)),
             Expr::Cast(inner, ty) => self.cast(inner, ty),
-            Expr::Call(callee, args) => self.call(expr, callee, args),
+            Expr::Call(callee, args) => self.call(expr, (callee, args), expected),
             Expr::Closure { params, ret, body, capture } => self.closure_expr(expr, (params, ret, body, capture), expected),
             Expr::Tuple(list) => self.tuple(list),
             Expr::Ref { mutable, raw, expr: inner } => self.reference(inner, (mutable, raw), expected),
@@ -80,6 +80,7 @@ impl Infer<'_, '_> {
     fn flow(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
         match *self.body.expr(expr) {
             Expr::Method { receiver, name, args, params } => self.method_call(expr, receiver, name, (args, params)),
+            Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Try } => self.try_block(expr, (stmts, tail), expected),
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail, expected),
             Expr::If(cond, then, otherwise) => self.if_expr(cond, then, otherwise, expected),
             Expr::While { cond, body, label: None } => self.while_expr(cond, body),
@@ -158,17 +159,49 @@ impl Infer<'_, '_> {
     }
 
     fn right_operand(&mut self, expr: ExprId, op: BinOp, (left, rhs): (Ty, ExprId)) -> Result<Ty> {
-        let compare = is_compare(op);
-        let builtin = self.is_scalar(left) || compare && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..));
-        if builtin && matches!(op, BinOp::Shl | BinOp::Shr) {
-            return self.shift(left, rhs);
+        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        let hint = (self.builtin_left(op, left) && !shift || is_compare(op)).then_some(left);
+        let right = self.expr(rhs, hint)?;
+        if matches!(self.cx.types.kind(self.resolve(left)), Kind::Var(_)) {
+            let out = if is_compare(op) { self.cx.types.bool() } else { self.fresh(Kind::Var) };
+            self.operands.push((expr, op, (left, right), out));
+            return Ok(out);
         }
-        let right = self.expr(rhs, (builtin || compare).then_some(left))?;
-        if builtin && !matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..)) {
-            self.unify(left, right)?;
-            return Ok(if compare { self.cx.types.bool() } else { left });
+        self.operator_type(expr, op, (left, right))
+    }
+
+    fn builtin_left(&self, op: BinOp, left: Ty) -> bool {
+        self.is_scalar(left) || is_compare(op) && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..))
+    }
+
+    fn operator_type(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
+        if !self.builtin_left(op, left) || matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..)) {
+            return self.overloaded(expr, op, (left, right));
         }
-        self.overloaded(expr, op, (left, right))
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            return self.shift(left, right);
+        }
+        self.unify(left, right)?;
+        Ok(if is_compare(op) { self.cx.types.bool() } else { left })
+    }
+
+    /// Types each operator whose left operand was not known when it was read, once it is.
+    pub(super) fn settle_operators(&mut self, force: bool) -> Result<()> {
+        let mut at = 0;
+        while at < self.operands.len() {
+            let (expr, op, operands, out) = self.operands[at];
+            if matches!(self.cx.types.kind(self.resolve(operands.0)), Kind::Var(_)) {
+                if force {
+                    bail!("the type of the left operand of {op:?} is not known");
+                }
+                at += 1;
+                continue;
+            }
+            self.operands.swap_remove(at);
+            let found = self.operator_type(expr, op, operands)?;
+            self.unify(found, out)?;
+        }
+        Ok(())
     }
 
     fn overloaded(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
@@ -176,7 +209,7 @@ impl Infer<'_, '_> {
         let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
         let saved = self.vars.clone();
-        if self.has_vars(left) || self.select(of, left, &[right])?.is_none() {
+        if self.select(of, left, &[right])?.is_none() {
             self.vars = saved;
             bail!("unsupported operator {op:?} on {}", self.show(left));
         }
@@ -198,8 +231,7 @@ impl Infer<'_, '_> {
         Ok(bool_ty)
     }
 
-    fn shift(&mut self, left: Ty, rhs: ExprId) -> Result<Ty> {
-        let right = self.expr(rhs, None)?;
+    fn shift(&mut self, left: Ty, right: Ty) -> Result<Ty> {
         if !self.is_int(left) || !self.is_int(right) {
             bail!("unsupported shift on {}", self.show(left));
         }
@@ -223,11 +255,12 @@ impl Infer<'_, '_> {
         Ok(self.cx.types.unit())
     }
 
-    fn call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Ty> {
+    fn call(&mut self, expr: ExprId, (callee, args): (ExprId, List), expected: Option<Ty>) -> Result<Ty> {
         let found = self.expr(callee, None)?;
         let callee_ty = self.callee_base(expr, found);
         let (params, ret, def) = match self.cx.types.kind(callee_ty).clone() {
             Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
+            Kind::Dyn(of, ..) if self.cx.lang(of).is_some_and(|lang| super::select::CALLABLE.contains(&lang)) => return self.object_call((expr, found), callee_ty, args),
             Kind::FnDef(item, substs) => {
                 if matches!(self.out.res.get(&callee), Some(Res::Local(_))) {
                     self.out.res.insert(expr, Res::Fn(item, substs.clone()));
@@ -242,10 +275,22 @@ impl Infer<'_, '_> {
         if args.len() != params.len() {
             bail!("call takes {} arguments, {} given", params.len(), args.len());
         }
-        for (arg, param) in args.into_iter().zip(params) {
-            self.call_arg(def.as_ref().map(|(item, substs)| (*item, &substs[..])), ExprId(arg), param)?;
+        let hints = self.expected_inputs(&params, ret, expected);
+        for ((arg, param), hint) in args.into_iter().zip(params).zip(hints) {
+            self.call_arg(def.as_ref().map(|(item, substs)| (*item, &substs[..])), ExprId(arg), (param, hint))?;
         }
         Ok(ret)
+    }
+
+    fn expected_inputs(&mut self, params: &[Ty], ret: Ty, expected: Option<Ty>) -> Vec<Option<Ty>> {
+        let Some(expected) = expected else { return vec![None; params.len()] };
+        let saved = self.vars.clone();
+        let hints = match self.unify(ret, expected) {
+            Ok(()) => params.iter().map(|&param| Some(self.zonk(param))).collect(),
+            Err(_) => vec![None; params.len()],
+        };
+        self.vars = saved;
+        hints
     }
 
     fn if_expr(&mut self, cond: ExprId, then: ExprId, otherwise: Option<ExprId>, expected: Option<Ty>) -> Result<Ty> {
@@ -279,10 +324,25 @@ impl Infer<'_, '_> {
         if never(self, a) {
             return Ok(b);
         }
-        if !never(self, b) {
-            self.unify(a, b)?;
+        if never(self, b) {
+            return Ok(a);
         }
+        if let Some(shared) = self.shared_pointer(a, b)? {
+            return Ok(shared);
+        }
+        self.unify(a, b)?;
         Ok(a)
+    }
+
+    fn shared_pointer(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
+        let (a, b) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
+        let (shared, inner, other) = match (a, b) {
+            (Kind::Ptr(x, inner), Kind::Ptr(y, other)) if x != y => (Kind::Ptr(Mut::Not, inner), inner, other),
+            (Kind::Ref(x, inner), Kind::Ref(y, other)) if x != y => (Kind::Ref(Mut::Not, inner), inner, other),
+            _ => return Ok(None),
+        };
+        self.unify(inner, other)?;
+        Ok(Some(self.cx.types.intern(shared)))
     }
 
     fn while_expr(&mut self, cond: ExprId, body: ExprId) -> Result<Ty> {

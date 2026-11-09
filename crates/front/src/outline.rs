@@ -1,5 +1,6 @@
 pub mod attr;
 pub mod build;
+pub mod derive;
 pub mod fragment;
 pub mod item;
 pub mod mbe;

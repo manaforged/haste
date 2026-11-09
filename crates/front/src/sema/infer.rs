@@ -10,6 +10,7 @@ mod matching;
 mod looping;
 mod method;
 mod object;
+mod opaque;
 mod pat;
 mod path;
 mod pattern;
@@ -24,7 +25,7 @@ pub use drop::Glue;
 pub use looping::{For, Tried};
 pub use method::Adjust;
 pub use coerce::Coercion;
-pub use object::{ALIGN_SLOT, FIRST_METHOD, SIZE_SLOT, Vtable};
+pub use object::{ALIGN_SLOT, FIRST_METHOD, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{Mode, position, rest_split};
 pub use path::{parse_int, segments};
 pub use scope::type_params;
@@ -66,6 +67,8 @@ pub enum Shape {
     Glue(Glue),
     Closure(ClosureBody),
     Virtual(u32),
+    /// A call of a closure through `Fn::call` or `FnMut::call_mut`, which spreads the argument tuple into this call of the closure's own body.
+    Untuple(Res),
 }
 
 /// The inferred types and resolutions of one function body at one set of type arguments.
@@ -98,6 +101,12 @@ pub struct Typed {
     pub drops: Vec<Res>,
     /// The closure expressions of the body.
     pub closures: HashMap<ExprId, Closure>,
+    /// The `try` blocks of the body, each with the `Try::from_output` call that wraps its value.
+    pub try_blocks: HashMap<ExprId, Res>,
+    /// The `Drop::drop` of the `Box` that each by-value call of a `Box<dyn FnOnce>` frees once the call consumed its contents.
+    pub box_frees: HashMap<ExprId, Res>,
+    /// The parameter locals whose pattern takes the argument apart, with that pattern in the body's arena.
+    pub unpacks: HashMap<u32, PatId>,
     /// What the code of this instance is.
     pub shape: Shape,
 }
@@ -112,6 +121,10 @@ impl Typed {
             _ => None,
         };
         let glue = glue.into_iter().flat_map(|glue| glue.drop.iter().chain(&glue.parts));
+        let untuple = match &self.shape {
+            Shape::Untuple(res) => Some(res),
+            _ => None,
+        };
         let coerced = self.coercions.values().flat_map(|coercion| -> Box<dyn Iterator<Item = &Res>> {
             match coercion {
                 Coercion::Vtable(vtable) => Box::new(vtable.drop.iter().chain(vtable.methods.iter().flatten())),
@@ -119,7 +132,7 @@ impl Typed {
                 Coercion::Len(_) => Box::new(std::iter::empty()),
             }
         });
-        self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(loops).chain(tries).chain(&self.drops).chain(glue).chain(coerced).filter_map(|res| match res {
+        self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values()).chain(loops).chain(tries).chain(&self.drops).chain(glue).chain(untuple).chain(coerced).filter_map(|res| match res {
             Res::Fn(item, substs) => Some((*item, &substs[..])),
             _ => None,
         })
@@ -143,6 +156,9 @@ pub struct Infer<'c, 'a> {
     metadata: Vec<(Ty, Ty)>,
     obligations: Vec<(ItemRef, Vec<Ty>)>,
     projections: Vec<project::Projection>,
+    opaques: Vec<opaque::Opaque>,
+    operands: Vec<(ExprId, crate::body::BinOp, (Ty, Ty), Ty)>,
+    try_blocks: Vec<(ExprId, Ty)>,
     out: Typed,
     scopes: Vec<(&'a str, u32)>,
     items: Vec<(&'a str, ItemRef)>,
@@ -169,11 +185,11 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed
     let body = if foreign { std::rc::Rc::default() } else { cx.body(item)? };
     let src = cx.body_src(item);
     let home = cx.module_of(item)?;
-    let root = Some(item.outer().map_or(item, |(outer, _)| outer));
+    let root = Some(item.body_owner());
     let mut infer = Infer::start(cx, (&body, &sig, src), home);
     (infer.root, infer.instance) = (root, Some((item, substs.to_vec())));
     let mut frame = infer.frame(item, substs)?;
-    frame.src = src;
+    (frame.src, frame.root) = (src, root);
     infer.swap_frame(frame);
     infer.out.exprs = vec![Ty(u32::MAX); body.exprs.len()];
     infer.run(foreign)?;
@@ -201,14 +217,15 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
     }
     match substs.first() {
         Some(&ty) if matches!(cx.types.kind(ty), Kind::Closure(..)) && cx.call_once() == Some(item) => closure::closure_typed(cx, ty).map(Some),
+        Some(&ty) if matches!(cx.types.kind(ty), Kind::Closure(..)) && closure::by_reference(cx, item).is_some() => closure::untuple_typed(cx, item, substs).map(Some),
         _ => Ok(None),
     }
 }
 
 impl<'c, 'a> Infer<'c, 'a> {
     fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
-        let (generics, vars, metadata, obligations, projections, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, out: Typed::default(), scopes, items, loops, uses, diverges: false }
+        let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, out: Typed::default(), scopes, items, loops, uses, diverges: false }
     }
 }
 
@@ -226,9 +243,10 @@ impl Infer<'_, '_> {
             self.scopes.push(("self", local));
             self.out.params.push(local);
         }
-        for &(pat, ty) in &sig.params {
+        for (index, &(pat, ty)) in sig.params.iter().enumerate() {
             let ty = self.lower_ty(&sig.body, ty)?;
-            let local = self.param_pat(&sig.body, pat, ty)?;
+            let own = self.body.fn_params.get(index).copied();
+            let local = self.param_pat(&sig.body, pat, ty, own)?;
             self.out.params.push(local);
         }
         let Some(root) = self.body.root else {
@@ -238,7 +256,7 @@ impl Infer<'_, '_> {
         self.coerce_expr(root, found, ret)
     }
 
-    fn param_pat(&mut self, arena: &Body, pat: PatId, ty: Ty) -> Result<u32> {
+    fn param_pat(&mut self, arena: &Body, pat: PatId, ty: Ty, own: Option<PatId>) -> Result<u32> {
         match *arena.pat(pat) {
             crate::body::Pat::Bind { name, mutable, sub: None, by_ref: false } => {
                 let local = self.new_local(ty, mutable);
@@ -246,7 +264,13 @@ impl Infer<'_, '_> {
                 Ok(local)
             }
             crate::body::Pat::Wild => Ok(self.new_local(ty, false)),
-            _ => bail!("parameter patterns other than names are not supported yet"),
+            _ => {
+                let Some(own) = own else { bail!("a parameter pattern outside the body's arena") };
+                let local = self.new_local(ty, false);
+                self.bind_pat(own, ty)?;
+                self.out.unpacks.insert(local, own);
+                Ok(local)
+            }
         }
     }
 
@@ -325,7 +349,7 @@ impl Infer<'_, '_> {
             (Kind::Array(x, m), Kind::Array(y, n)) => vec![(*x, *y), (*m, *n)],
             (Kind::Slice(x), Kind::Slice(y)) => vec![(*x, *y)],
             (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => vec![(*x, *y)],
-            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x), Kind::Dyn(j, y)) if i == j && x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).collect(),
+            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, _), Kind::Dyn(j, y, _)) if i == j && x.len() == y.len() && dyn_members(a) == dyn_members(b) => x.iter().copied().zip(y.iter().copied()).collect(),
             (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).chain([(*r, *s)]).collect(),
             _ => bail!("mismatch"),
         };
@@ -343,6 +367,8 @@ impl Infer<'_, '_> {
         }?;
         self.settle_metadata()?;
         self.settle_projections()?;
+        self.settle_opaques(false)?;
+        self.settle_operators(false)?;
         self.settle_obligations()
     }
 
@@ -443,6 +469,15 @@ impl Infer<'_, '_> {
 
     fn finish(mut self) -> Result<Typed> {
         self.settle_projections()?;
+        self.settle_opaques(true)?;
+        self.settle_operators(true)?;
+        self.settle_projections()?;
+        self.zonk_types()?;
+        self.zonk_calls()?;
+        Ok(self.out)
+    }
+
+    fn zonk_types(&mut self) -> Result<()> {
         let exprs = std::mem::take(&mut self.out.exprs);
         self.out.exprs = exprs.into_iter().map(|ty| if ty.0 == u32::MAX { ty } else { self.zonk(ty) }).collect();
         let locals = std::mem::take(&mut self.out.locals);
@@ -456,6 +491,10 @@ impl Infer<'_, '_> {
         self.out.ret = self.out.ret.map(|ret| self.zonk(ret));
         let closures = std::mem::take(&mut self.out.closures);
         self.out.closures = closures.into_iter().map(|(expr, closure)| (expr, Closure { ret: self.zonk(closure.ret), ..closure })).collect();
+        Ok(())
+    }
+
+    fn zonk_calls(&mut self) -> Result<()> {
         let fors = std::mem::take(&mut self.out.fors);
         self.out.fors = fors.into_iter().map(|(expr, each)| Ok((expr, self.zonk_for(each)?))).collect::<Result<_>>()?;
         let tries = std::mem::take(&mut self.out.tries);
@@ -464,9 +503,13 @@ impl Infer<'_, '_> {
         self.out.derefs = self.zonk_all(derefs)?;
         let operators = std::mem::take(&mut self.out.operators);
         self.out.operators = self.zonk_all(operators)?;
+        let try_blocks = std::mem::take(&mut self.out.try_blocks);
+        self.out.try_blocks = self.zonk_all(try_blocks)?;
+        let box_frees = std::mem::take(&mut self.out.box_frees);
+        self.out.box_frees = self.zonk_all(box_frees)?;
         let coercions = std::mem::take(&mut self.out.coercions);
         self.out.coercions = coercions.into_iter().map(|(expr, coercion)| Ok((expr, self.zonk_coercion(coercion)?))).collect::<Result<_>>()?;
-        Ok(self.out)
+        Ok(())
     }
 
     fn zonk_all<K: Eq + std::hash::Hash>(&mut self, map: HashMap<K, Res>) -> Result<HashMap<K, Res>> {
@@ -497,6 +540,36 @@ impl Infer<'_, '_> {
 /// The field types of each variant of the struct, enum or union `item` at `args`.
 pub fn field_types(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Vec<Vec<Ty>>> {
     detached(cx, item, |infer| infer.adt_fields(item, args))
+}
+
+fn dyn_members(kind: &Kind) -> &[ItemRef] {
+    match kind {
+        Kind::Dyn(_, _, members) => members,
+        _ => &[],
+    }
+}
+
+/// Whether the struct `item` may end in an unsized field, which its definition decides for every instantiation as rustc's layout does.
+pub fn maybe_unsized(cx: &mut Context<'_>, item: ItemRef) -> Result<bool> {
+    if cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
+        return Ok(false);
+    }
+    let def = cx.adt_def(item)?;
+    let src = &cx.file(item).source;
+    let byte = cx.types.intern(Kind::Prim(Primitive::U8));
+    let stand_ins = [cx.types.intern(Kind::Value(1)), cx.types.intern(Kind::Slice(byte)), byte];
+    let args = scope::type_params(&def.generics.params).map(|generic| match generic.kind {
+        crate::body::sig::GenericKind::Const(_) => stand_ins[0],
+        _ if relaxed(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
+        _ => stand_ins[2],
+    });
+    let ty = cx.types.intern(Kind::Adt(item, args.collect()));
+    cx.is_unsized(ty)
+}
+
+fn relaxed(arena: &Body, src: &Source, predicates: &[crate::body::sig::Predicate], generic: &crate::body::sig::Generic) -> bool {
+    let bounds = scope::generic_bounds(arena, src, predicates, generic);
+    bounds.iter().any(|&bound| matches!(arena.bounds[bound as usize], crate::body::Bound::Trait { maybe: true, .. }))
 }
 
 /// The discriminant of each variant of the enum `item`, whose tags are integers of type `primitive`.

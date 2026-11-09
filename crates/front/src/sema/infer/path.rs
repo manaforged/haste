@@ -1,10 +1,10 @@
 use anyhow::{Result, bail};
-use rustc_lexer::TokenKind;
 
 use crate::body::sig::{Generic, GenericKind};
 use crate::body::{self as syntax, Args, Body, GenericArg, PathId, TyId};
 use crate::names::path::Path as NamePath;
-use crate::names::{Def, ItemRef, Primitive, Sym, Symbols, plain};
+use crate::names::collect::import_parts;
+use crate::names::{Def, ItemRef, PerNs, Primitive, SELF, Sym, Symbols, plain};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 
@@ -34,21 +34,84 @@ impl<'a> Infer<'_, 'a> {
 
     /// The item in the value namespace that the path `segments` names.
     pub(super) fn value_def(&mut self, segments: &[Sym], absolute: bool, dollar: Option<u32>) -> Result<Def> {
-        let paths = self.cx.paths(self.home.krate);
         let Some((last, prefix)) = segments.split_last() else { bail!("empty path") };
         if let (true, Some(found)) = (prefix.is_empty(), self.declared_item(self.cx.names.symbols.text(*last))) {
             return Ok(Def::Item(found));
         }
         let found = if prefix.is_empty() {
-            paths.first(*last, self.home, &NamePath { segments, absolute, dollar }).values
+            let local = if absolute { None } else { self.body_use(*last).values };
+            local.or_else(|| self.cx.paths(self.home.krate).first(*last, self.home, &NamePath { segments, absolute, dollar }).values)
         } else {
-            let head = NamePath { segments: prefix, absolute, dollar };
-            paths.resolve(&head, self.home).map(|def| paths.member(def, *last)).and_then(|entry| entry.values)
+            let head = self.resolve_local(&NamePath { segments: prefix, absolute, dollar });
+            head.map(|def| self.cx.paths(self.home.krate).member(def, *last)).and_then(|entry| entry.values)
         };
         match found {
             Some(binding) => Ok(binding.def),
             None => bail!("cannot find value `{}`", self.spell(segments)),
         }
+    }
+
+    /// The type-namespace item that `path` names, a single segment first among the items that the body declares.
+    pub(super) fn type_def(&mut self, path: &NamePath<'_>) -> Option<Def> {
+        let inner = if let [name] = path.segments { self.declared_item(self.cx.names.symbols.text(*name)) } else { None };
+        inner.map(Def::Item).or_else(|| self.resolve_local(path))
+    }
+
+    /// Resolves every segment of `path` in the type namespace, its first through the body's own `use` declarations when one binds it.
+    pub(super) fn resolve_local(&mut self, path: &NamePath<'_>) -> Option<Def> {
+        let (first, rest) = path.segments.split_first()?;
+        let local = if path.absolute { None } else { self.body_use(*first).types };
+        let paths = self.cx.paths(self.home.krate);
+        let Some(binding) = local else { return paths.resolve(path, self.home) };
+        rest.iter().try_fold(binding.def, |def, segment| paths.member(def, *segment).types.map(|found| found.def))
+    }
+
+    /// The bindings that the `use` declarations inside the body give `word`.
+    fn body_use(&mut self, word: Sym) -> PerNs {
+        self.body_imports(Some(word)).into_iter().next().unwrap_or_default()
+    }
+
+    /// The traits that the `use` declarations inside the body name.
+    pub(super) fn body_traits(&mut self) -> Vec<ItemRef> {
+        let found = self.body_imports(None).into_iter().filter_map(|entry| entry.types);
+        found.filter_map(|binding| match binding.def {
+            Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Trait => Some(item),
+            _ => None,
+        }).collect()
+    }
+
+    fn body_imports(&mut self, word: Option<Sym>) -> Vec<PerNs> {
+        let Some((root, found)) = self.root.and_then(|root| Some((root, self.cx.expansion(root)?))) else { return Vec::new() };
+        let file = &found.file;
+        if file.items.imports.is_empty() {
+            return Vec::new();
+        }
+        let Ok(home) = self.cx.module_of(root) else { return Vec::new() };
+        let paths = self.cx.paths(home.krate);
+        let mut out = Vec::new();
+        for import in 0..file.items.imports.len() as u32 {
+            let (segments, absolute, dollar, name) = import_parts(file, import, &self.cx.names.symbols);
+            if name.zip(word).is_some_and(|(name, word)| name != word) {
+                continue;
+            }
+            let segments = segments.strip_suffix(&[SELF]).unwrap_or(&segments);
+            let (head, leaf) = match (name, segments.split_last(), word) {
+                (None, _, Some(word)) => (segments, word),
+                (Some(_), Some((&leaf, head)), _) => (head, leaf),
+                _ => continue,
+            };
+            let entry = match head {
+                [] => paths.first(leaf, home, &NamePath { segments: &[leaf], absolute, dollar }),
+                _ => match paths.resolve(&NamePath { segments: head, absolute, dollar }, home) {
+                    Some(def) => paths.member(def, leaf),
+                    None => continue,
+                },
+            };
+            if entry.types.is_some() || entry.values.is_some() {
+                out.push(entry);
+            }
+        }
+        out
     }
 
     /// The item named `name` that a block around the use declares, or else some block of the body.
@@ -78,19 +141,24 @@ impl<'a> Infer<'_, 'a> {
         if let Some(ctor) = self.ctor(body, path, true)? {
             return self.ctor_value(ctor);
         }
+        self.path_value(body, path)
+    }
+
+    /// The function or constant that the value path `path` of `body` names: an item, or an associated item of a type or trait.
+    pub(super) fn path_value(&mut self, body: &Body, path: PathId) -> Result<(Ty, Res)> {
         match self.value_item(body, path) {
-            Ok(def) => self.item_value(path, def),
-            Err(error) => self.assoc_value(path)?.ok_or(error),
+            Ok(def) => self.item_value(body, path, def),
+            Err(error) => self.assoc_value(body, path)?.ok_or(error),
         }
     }
 
-    fn item_value(&mut self, path: PathId, def: Def) -> Result<(Ty, Res)> {
+    fn item_value(&mut self, body: &Body, path: PathId, def: Def) -> Result<(Ty, Res)> {
         match def {
             Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Fn => {
-                let given = self.segment_args(self.body, path, self.body.path(path).segments.len as usize)?;
+                let given = self.segment_args(body, path, body.path(path).segments.len as usize)?;
                 self.fn_item(item, Vec::new(), given)
             }
-            Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Const => self.const_item(item, Vec::new()),
+            Def::Item(item) if matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static) => self.const_item(item, Vec::new()),
             other => bail!("unsupported value {other:?}"),
         }
     }
@@ -112,6 +180,7 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn fn_item(&mut self, item: ItemRef, outer: Vec<Ty>, given: Vec<Ty>) -> Result<(Ty, Res)> {
         let mut substs = outer;
         substs.extend(self.own_args(item, given)?);
+        self.bind_bounds(item, &substs)?;
         Ok((self.cx.types.intern(Kind::FnDef(item, substs.clone())), Res::Fn(item, substs)))
     }
 
@@ -127,9 +196,41 @@ impl<'a> Infer<'_, 'a> {
         let list = match arena.segments[last as usize].args {
             None => return Ok(Vec::new()),
             Some(Args::Angle(list)) => list,
-            Some(other) => bail!("unsupported generic arguments {other:?}"),
+            Some(Args::Paren { inputs, output }) => {
+                let (inputs, _) = self.paren_sig(arena, inputs, output)?;
+                return Ok(vec![self.cx.types.intern(Kind::Tuple(inputs))]);
+            }
+            Some(Args::ReturnType) => bail!("return type notation is not supported yet"),
         };
         self.arg_list(arena, list)
+    }
+
+    /// The inputs and output of the `Fn(A, B) -> C` arguments `inputs` and `output`.
+    pub(super) fn paren_sig(&mut self, arena: &Body, inputs: syntax::List, output: Option<TyId>) -> Result<(Vec<Ty>, Ty)> {
+        let inputs = arena.list(inputs).iter().map(|&at| self.lower_ty(arena, TyId(at))).collect::<Result<Vec<_>>>()?;
+        let output = match output {
+            Some(ty) => self.lower_ty(arena, ty)?,
+            None => self.cx.types.unit(),
+        };
+        Ok((inputs, output))
+    }
+
+    /// The associated types that the last segment of `path` binds, as `Name = T` or the output of `Fn(A) -> T`.
+    pub(super) fn path_bindings(&mut self, arena: &Body, path: PathId) -> Result<Vec<(String, Ty)>> {
+        let Some(&last) = arena.list(arena.path(path).segments).last() else { return Ok(Vec::new()) };
+        match arena.segments[last as usize].args {
+            Some(Args::Paren { inputs, output }) => Ok(vec![("Output".to_string(), self.paren_sig(arena, inputs, output)?.1)]),
+            Some(Args::Angle(list)) => {
+                let mut found = Vec::new();
+                for &at in arena.list(list) {
+                    let GenericArg::Binding { name, args: None, ty } = arena.args[at as usize] else { continue };
+                    found.push((self.src.text(name).to_string(), self.lower_ty(arena, ty)?));
+                }
+                Ok(found)
+            }
+            Some(Args::ReturnType) => bail!("return type notation is not supported yet"),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The own type arguments of function `item`: the turbofish arguments `given`, then fresh variables for the parameters they leave out.
@@ -150,7 +251,7 @@ impl<'a> Infer<'_, 'a> {
                 GenericArg::Ty(ty) => tys.push(self.lower_ty(arena, ty)?),
                 GenericArg::Lifetime(_) => {}
                 GenericArg::Const(expr) => tys.push(self.const_arg(arena, expr)?),
-                other => bail!("unsupported generic argument {other:?}"),
+                GenericArg::Binding { .. } | GenericArg::Constraint { .. } => {}
             }
         }
         Ok(tys)
@@ -183,7 +284,7 @@ impl<'a> Infer<'_, 'a> {
             syntax::Ty::Paren(inner) => self.lower_ty(arena, inner),
             syntax::Ty::Infer => Ok(self.fresh(Kind::Var)),
             syntax::Ty::Macro { path, open } => self.macro_ty(arena, path, open),
-            syntax::Ty::ImplTrait(at, _) => self.impl_param(at),
+            syntax::Ty::ImplTrait(at, _) => Ok(self.impl_param(at)),
             _ => {
                 let kind = self.lower_kind(arena, ty)?;
                 Ok(self.cx.types.intern(kind))
@@ -233,7 +334,16 @@ impl<'a> Infer<'_, 'a> {
         if given.len() != wanted {
             bail!("a trait object of `{}` that leaves trait arguments to their defaults", self.cx.name(of));
         }
-        Ok(Kind::Dyn(of, given))
+        let object = self.fresh(Kind::Var);
+        let mut bound = Vec::new();
+        for (name, ty) in self.path_bindings(arena, path)? {
+            let Some((owner, _)) = self.assoc_owner((of, given.clone()), object, &name, 0)? else { bail!("`{}` has no associated type `{name}`", self.cx.name(of)) };
+            let Some(member) = self.cx.trait_member(owner, &name) else { bail!("`{}` has no member `{name}`", self.cx.name(owner)) };
+            bound.push((member, ty));
+        }
+        bound.sort_by_key(|(member, _)| (member.krate, member.file, member.item));
+        let (members, tys): (Vec<ItemRef>, Vec<Ty>) = bound.into_iter().unzip();
+        Ok(Kind::Dyn(of, given.into_iter().chain(tys).collect(), members))
     }
 
     /// The type that the associated type `name` of impl `block` is, read in the current frame, when the impl has one.
@@ -242,38 +352,26 @@ impl<'a> Infer<'_, 'a> {
         if self.cx.item(member).1.kind != ItemKind::Type {
             return Ok(None);
         }
-        let (_, arena, ty) = self.alias_parts(member)?;
+        let (_, arena, ty) = self.cx.alias_parts(member)?;
         self.lower_ty(&arena, ty).map(Some)
     }
 
     /// The type that the type alias `item` names at the type arguments `given`, with fresh ones for the rest.
     fn alias(&mut self, item: ItemRef, given: Vec<Ty>) -> Result<Ty> {
-        let (params, arena, ty) = self.alias_parts(item)?;
+        let (params, arena, ty) = self.cx.alias_parts(item)?;
         let file = self.cx.file(item);
         let mut args = given.into_iter();
         let names: Vec<&str> = params.iter().map(|generic| file.source.text(generic.name)).collect();
         let generics = names.into_iter().map(|name| (name, args.next().unwrap_or_else(|| self.fresh(Kind::Var)))).collect();
-        let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty: None, block: None, item: None };
+        let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty: None, block: None, item: None, root: item.declaring_body() };
         self.with_frame(frame, |infer| infer.lower_ty(&arena, ty))
     }
 
-    fn alias_parts(&mut self, item: ItemRef) -> Result<(Vec<Generic>, Body, TyId)> {
-        let (src, entry) = self.cx.item(item);
-        let Some(at) = entry.name else { bail!("type alias with no name") };
-        let Some(eq) = (at + 1..entry.end).find(|&token| src.kind(token) == TokenKind::Eq) else { bail!("type `{}` has no `=`", src.text(at)) };
-        let params = match src.text(at + 1) {
-            "<" => crate::body::sig::generics(src, at + 1, eq)?.1.params.into_iter().filter(|generic| generic.kind != GenericKind::Lifetime).collect(),
-            _ => Vec::new(),
-        };
-        let (arena, ty) = syntax::parse_ty(src, eq + 1, entry.end - 1)?;
-        Ok((params, arena, ty))
-    }
-
-    fn impl_param(&self, at: u32) -> Result<Ty> {
+    fn impl_param(&mut self, at: u32) -> Ty {
         let key = self.src.text(at).as_ptr();
         match self.generics.iter().find(|(name, _)| name.as_ptr() == key) {
-            Some(&(_, ty)) => Ok(ty),
-            None => bail!("`impl Trait` is only supported in argument position"),
+            Some(&(_, ty)) => ty,
+            None => self.fresh(Kind::Var),
         }
     }
 
@@ -301,9 +399,7 @@ impl<'a> Infer<'_, 'a> {
         if let Some(ty) = self.scoped_ty(&segments)? {
             return Ok(ty);
         }
-        let paths = self.cx.paths(self.home.krate);
-        let inner = if let [name] = segments[..] { self.declared_item(self.cx.names.symbols.text(name)) } else { None };
-        let def = inner.map(Def::Item).or_else(|| paths.resolve(&NamePath { segments: &segments, absolute, dollar }, self.home));
+        let def = self.type_def(&NamePath { segments: &segments, absolute, dollar });
         let def = match (def, &segments[..]) {
             (Some(Def::Module(_)), [name]) => crate::names::Symbols::primitive(*name).map(Def::Primitive).or(def),
             _ => def,
@@ -352,9 +448,7 @@ impl<'a> Infer<'_, 'a> {
         if self.cx.lang(item) == Some("pointee_trait") && name == "Metadata" {
             return self.metadata_of(ty);
         }
-        let count = arena.list(arena.path(trait_path).segments).len();
-        let given = self.segment_args(arena, trait_path, count)?;
-        let args = self.trait_args(item, given, ty)?;
+        let args = self.bound_args(item, arena, trait_path, ty)?;
         self.project(item, ty, args, name)
     }
 

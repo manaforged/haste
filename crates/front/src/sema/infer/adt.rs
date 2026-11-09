@@ -28,9 +28,8 @@ impl<'a> Infer<'_, 'a> {
         if texts.first() == Some(&"Self") {
             return self.self_ctor(&texts[1..]);
         }
-        let paths = self.cx.paths(self.home.krate);
         let name_path = NamePath { segments: &segments, absolute, dollar };
-        let def = if values { self.value_item(arena, path).ok() } else { paths.resolve(&name_path, self.home) };
+        let def = if values { self.value_item(arena, path).ok() } else { self.type_def(&name_path) };
         let count = segments.len();
         match def {
             Some(Def::Item(item)) if matches!(self.cx.item(item).1.kind, ItemKind::Struct | ItemKind::Union) => {

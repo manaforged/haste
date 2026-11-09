@@ -175,7 +175,7 @@ impl Cursor<'_> {
     }
 
     fn bound_start(&self) -> bool {
-        matches!(self.kind(), TokenKind::Lifetime { .. } | TokenKind::OpenParen | TokenKind::OpenBracket) || self.punct("?") || self.punct("~") || self.punct("::") || self.punct("<") || is_name(self.kind())
+        matches!(self.kind(), TokenKind::Lifetime { .. } | TokenKind::OpenParen | TokenKind::OpenBracket) || self.punct("?") || self.punct("~") || self.punct("::") || self.punct("<") || self.punct("$") || is_name(self.kind())
     }
 
     fn bound(&mut self) -> Result<u32> {

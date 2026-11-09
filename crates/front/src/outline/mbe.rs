@@ -225,29 +225,54 @@ pub fn expand(def: &Source, rules: &[Rule], input: &Source, (open, krate): (u32,
     bail!("no rule of the macro matches the call at byte {} of {}", input.byte(open), input.path.display())
 }
 
-/// The tokens of the first `cfg_select!` arm whose predicate `holds`, or `None` when no arm applies.
-pub fn select(src: &Source, open: u32, holds: impl Fn(&crate::graph::cfg::Cfg) -> bool) -> Result<Option<Source>> {
+/// The tokens of the first `cfg_select!` arm that `env` may enable, or `None` when no arm applies.
+pub fn select(src: &Source, open: u32, env: &super::tree::Env) -> Result<Option<Source>> {
+    let Some(arm) = select_arm(src, open, env)? else { return Ok(None) };
+    if !arm.braced {
+        bail!("a cfg_select! arm of items needs braces at byte {} of {}", src.byte(arm.from), src.path.display());
+    }
+    let mut out = Tokens::default();
+    (arm.from..arm.to).for_each(|token| out.copy(src, token));
+    out.finish(src.path.clone()).map(Some)
+}
+
+/// The body of one `cfg_select!` arm: its tokens inside any braces, and whether braces held them.
+pub struct Arm {
+    pub from: u32,
+    pub to: u32,
+    pub braced: bool,
+}
+
+/// The first arm of the `cfg_select!` call at `open` whose predicate `env` does not rule out, where `_` always applies and an arm without braces runs to the next top-level comma.
+pub fn select_arm(src: &Source, open: u32, env: &super::tree::Env) -> Result<Option<Arm>> {
     let close = src.pair(open);
     let mut at = open + 1;
     while at < close {
-        let mut arrow = at;
-        while arrow < close && !(src.kind(arrow) == TokenKind::Eq && src.kind(arrow + 1) == TokenKind::Gt && src.joint(arrow)) {
-            arrow = if matches!(src.kind(arrow), TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace) { src.pair(arrow) + 1 } else { arrow + 1 };
-        }
-        let body = arrow + 2;
-        if arrow >= close || src.kind(body) != TokenKind::OpenBrace {
+        let arrow = skip_until(src, (at, close), |at| src.kind(at) == TokenKind::Eq && src.kind(at + 1) == TokenKind::Gt && src.joint(at));
+        if arrow >= close {
             bail!("malformed cfg_select! arm at byte {} of {}", src.byte(at), src.path.display());
         }
+        let body = arrow + 2;
+        let arm = if src.kind(body) == TokenKind::OpenBrace {
+            Arm { from: body + 1, to: src.pair(body), braced: true }
+        } else {
+            Arm { from: body, to: skip_until(src, (body, close), |at| src.kind(at) == TokenKind::Comma), braced: false }
+        };
         let predicate = (at..arrow).map(|token| src.text(token)).collect::<Vec<_>>().join(" ");
-        if predicate == "_" || holds(&crate::graph::cfg::parse(&predicate)?) {
-            let mut out = Tokens::default();
-            (body + 1..src.pair(body)).for_each(|token| out.copy(src, token));
-            return out.finish(src.path.clone()).map(Some);
+        if predicate == "_" || env.allows(&crate::graph::cfg::parse(&predicate)?) {
+            return Ok(Some(arm));
         }
-        at = src.pair(body) + 1;
+        at = if arm.braced { arm.to + 1 } else { arm.to };
         if src.kind(at) == TokenKind::Comma {
             at += 1;
         }
     }
     Ok(None)
+}
+
+fn skip_until(src: &Source, (mut at, close): (u32, u32), stop: impl Fn(u32) -> bool) -> u32 {
+    while at < close && !stop(at) {
+        at = if matches!(src.kind(at), TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace) { src.pair(at) + 1 } else { at + 1 };
+    }
+    at
 }

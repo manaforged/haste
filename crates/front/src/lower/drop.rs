@@ -290,7 +290,7 @@ impl Lower<'_, '_> {
         };
         let place = Place { base: Base::Addr(contents), offset: 0, repr: repr(self.cx, inner).unwrap_or(Repr::Zst) };
         match self.cx.types.kind(inner) {
-            Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str) => self.glue_wide(inner, contents),
+            Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str) | Kind::Dyn(..) => self.glue_wide(inner, contents),
             _ => self.glue(inner, Some(place)),
         }
     }
@@ -322,8 +322,19 @@ impl Lower<'_, '_> {
                 Some(env) => self.drop_parts(env, target),
                 None => bail!("drop of a closure whose defining body was not inferred"),
             },
+            Kind::Dyn(..) => self.drop_object(target),
             _ => Ok(()),
         }
+    }
+
+    fn drop_object(&mut self, wide: Value) -> Result<()> {
+        let data = self.ins().load(Type::I64, wide, 0);
+        let vtable = self.ins().load(Type::I64, wide, 8);
+        let code = self.ins().load(Type::I64, vtable, 0);
+        let unit = self.cx.types.unit();
+        let pointer = self.cx.types.intern(Kind::Ptr(crate::sema::ty::Mut::Mut, unit));
+        let signature = super::signature_of(self.cx, None, [pointer])?;
+        self.when(code, |lower| lower.call_code(code, (signature, None), vec![data]).map(drop))
     }
 
     fn drop_fields(&mut self, ty: Ty, place: Place) -> Result<()> {

@@ -1,3 +1,5 @@
+use haste_codegen::AtomicRmwOp;
+
 use crate::body::BinOp;
 use crate::names::ItemRef;
 use crate::outline::item::{Attr, ItemKind};
@@ -49,9 +51,22 @@ pub enum Intrinsic {
     ThreeWayCompare,
     Fence,
     RawPointer,
+    DiscriminantValue,
+    CompareBytes,
+    Atomic(Atomic),
+    SliceElement,
 }
 
-const NAMES: [(&str, Intrinsic); 78] = {
+/// An atomic access, which lowering makes sequentially consistent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Atomic {
+    Load,
+    Store,
+    Rmw(AtomicRmwOp),
+    Exchange,
+}
+
+const NAMES: [(&str, Intrinsic); 96] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -106,6 +121,8 @@ const NAMES: [(&str, Intrinsic); 78] = {
         ("min_align_of", AlignOf),
         ("pref_align_of", AlignOf),
         ("size_of_val", SizeOfVal),
+        ("discriminant_value", DiscriminantValue),
+        ("compare_bytes", CompareBytes),
         ("align_of_val", AlignOfVal),
         ("min_align_of_val", AlignOfVal),
         ("needs_drop", NeedsDrop),
@@ -132,6 +149,22 @@ const NAMES: [(&str, Intrinsic); 78] = {
         ("unchecked_shl", Unchecked(BinOp::Shl)),
         ("unchecked_shr", Unchecked(BinOp::Shr)),
         ("three_way_compare", ThreeWayCompare),
+        ("slice_get_unchecked", SliceElement),
+        ("atomic_load", Atomic(self::Atomic::Load)),
+        ("atomic_store", Atomic(self::Atomic::Store)),
+        ("atomic_cxchg", Atomic(self::Atomic::Exchange)),
+        ("atomic_cxchgweak", Atomic(self::Atomic::Exchange)),
+        ("atomic_xchg", Atomic(self::Atomic::Rmw(AtomicRmwOp::Xchg))),
+        ("atomic_xadd", Atomic(self::Atomic::Rmw(AtomicRmwOp::Add))),
+        ("atomic_xsub", Atomic(self::Atomic::Rmw(AtomicRmwOp::Sub))),
+        ("atomic_and", Atomic(self::Atomic::Rmw(AtomicRmwOp::And))),
+        ("atomic_nand", Atomic(self::Atomic::Rmw(AtomicRmwOp::Nand))),
+        ("atomic_or", Atomic(self::Atomic::Rmw(AtomicRmwOp::Or))),
+        ("atomic_xor", Atomic(self::Atomic::Rmw(AtomicRmwOp::Xor))),
+        ("atomic_max", Atomic(self::Atomic::Rmw(AtomicRmwOp::Smax))),
+        ("atomic_min", Atomic(self::Atomic::Rmw(AtomicRmwOp::Smin))),
+        ("atomic_umax", Atomic(self::Atomic::Rmw(AtomicRmwOp::Umax))),
+        ("atomic_umin", Atomic(self::Atomic::Rmw(AtomicRmwOp::Umin))),
     ]
 };
 

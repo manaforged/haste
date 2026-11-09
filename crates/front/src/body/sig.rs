@@ -21,6 +21,8 @@ pub struct Generic {
     pub kind: GenericKind,
     pub bounds: List,
     pub default: Option<TyId>,
+    /// The tokens of the parameter and its bounds, before any default.
+    pub span: (u32, u32),
 }
 
 /// One where-clause predicate: a type or lifetime and its bounds.
@@ -50,6 +52,10 @@ pub struct Signature {
     pub ret: Option<TyId>,
     pub predicates: Vec<Predicate>,
     pub variadic: bool,
+    /// Whether the return type holds `impl Trait`, which the body's value decides.
+    pub opaque: bool,
+    /// The first token of each parameter's pattern.
+    pub param_starts: Vec<u32>,
 }
 
 /// Generic parameters and a where clause, for items other than functions.
@@ -57,6 +63,8 @@ pub struct Signature {
 pub struct Generics {
     pub params: Vec<Generic>,
     pub predicates: Vec<Predicate>,
+    /// The supertrait bounds of a trait, after its `:`.
+    pub supers: List,
 }
 
 impl Cursor<'_> {
@@ -78,21 +86,24 @@ impl Cursor<'_> {
     }
 
     fn generic_param(&mut self) -> Result<Generic> {
+        let start = self.at;
         if let Some(name) = self.lifetime() {
             let bounds = if self.eat(":") { self.bounds()? } else { List::default() };
-            return Ok(Generic { name, kind: GenericKind::Lifetime, bounds, default: None });
+            return Ok(Generic { name, kind: GenericKind::Lifetime, bounds, default: None, span: (start, self.at) });
         }
         if self.eat_word("const") {
             let name = self.name()?;
             self.expect(":")?;
             let ty = self.ty()?;
+            let span = (start, self.at);
             let default = if self.eat("=") { Some(self.const_default()?) } else { None };
-            return Ok(Generic { name, kind: GenericKind::Const(ty), bounds: List::default(), default });
+            return Ok(Generic { name, kind: GenericKind::Const(ty), bounds: List::default(), default, span });
         }
         let name = self.name()?;
         let bounds = if self.eat(":") { self.bounds()? } else { List::default() };
+        let span = (start, self.at);
         let default = if self.eat("=") { Some(self.ty()?) } else { None };
-        Ok(Generic { name, kind: GenericKind::Type, bounds, default })
+        Ok(Generic { name, kind: GenericKind::Type, bounds, default, span })
     }
 
     fn const_default(&mut self) -> Result<TyId> {
@@ -157,6 +168,7 @@ impl Cursor<'_> {
         let mut params = Vec::new();
         let mut receiver = None;
         let mut variadic = false;
+        let mut starts = Vec::new();
         self.comma_list(open, |cursor| {
             cursor.skip_attrs()?;
             if receiver.is_none() && params.is_empty() && let Some(found) = cursor.receiver()? {
@@ -167,6 +179,7 @@ impl Cursor<'_> {
                 variadic = true;
                 return Ok(0);
             }
+            starts.push(cursor.at);
             let pat = cursor.pat_no_alt()?;
             cursor.expect(":")?;
             params.push((pat, cursor.ty()?));
@@ -175,6 +188,7 @@ impl Cursor<'_> {
         sig.params = params;
         sig.receiver = receiver;
         sig.variadic = variadic;
+        sig.param_starts = starts;
         Ok(())
     }
 }
@@ -192,10 +206,12 @@ pub fn signature(src: &Source, from: u32, to: u32) -> Result<Signature> {
     cursor.fn_params(&mut sig)?;
     for ty in &cursor.body.tys[first..] {
         if let super::Ty::ImplTrait(name, bounds) = *ty {
-            sig.generics.push(Generic { name, kind: GenericKind::Type, bounds, default: None });
+            sig.generics.push(Generic { name, kind: GenericKind::Type, bounds, default: None, span: (name, name + 1) });
         }
     }
+    let ret_first = cursor.body.tys.len();
     sig.ret = if cursor.eat("->") { Some(cursor.ty()?) } else { None };
+    sig.opaque = cursor.body.tys[ret_first..].iter().any(|ty| matches!(ty, super::Ty::ImplTrait(..)));
     sig.predicates = cursor.where_clause()?;
     sig.body = cursor.body;
     Ok(sig)
@@ -205,8 +221,9 @@ pub fn signature(src: &Source, from: u32, to: u32) -> Result<Signature> {
 pub fn generics(src: &Source, at: u32, to: u32) -> Result<(Body, Generics)> {
     let mut cursor = Cursor::new(src, at, to);
     let params = cursor.generic_params()?;
+    let supers = if cursor.eat(":") { cursor.bounds()? } else { List::default() };
     let predicates = cursor.where_clause()?;
-    Ok((cursor.body, Generics { params, predicates }))
+    Ok((cursor.body, Generics { params, predicates, supers }))
 }
 
 /// An impl header: generics, the trait it implements if any, the self type and the where clause, in its own arena.

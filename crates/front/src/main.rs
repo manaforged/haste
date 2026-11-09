@@ -149,7 +149,7 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
         let failures = typeck_pass(&mut cx, &cases);
         let asks;
         (store, asks) = cx.release();
-        if failures.is_empty() || !names.answer(&mut outline, asks)? {
+        if !names.answer(&mut outline, asks)? {
             break failures;
         }
     };
@@ -170,11 +170,10 @@ fn reach_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<(outli
     let mut store = sema::Store::default();
     loop {
         let mut cx = sema::Context::new(&outline, &names, store);
-        let reached = reach(&mut cx, &roots);
-        let done = reached.unlaid.is_empty() && reached.list.iter().all(|(_, typed)| typed.is_ok());
+        reach(&mut cx, &roots);
         let asks;
         (store, asks) = cx.release();
-        if done || !names.answer(&mut outline, asks)? {
+        if !names.answer(&mut outline, asks)? {
             return Ok((outline, names, store, cases));
         }
     }
@@ -198,7 +197,7 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
         match failure {
             Some(error) => failures.entry(error_kind(error)).or_default().push(format!("{name}: {error}")),
             None => {
-                let status = image.run_case(root, name, &[-5, 0, 1, 3, 20])?;
+                let status = image.run_case((root, &closure), name, &[-5, 0, 1, 3, 20])?;
                 ran += 1;
                 if status != 0 {
                     failures.entry(format!("crashed with status {status}")).or_default().push(name.to_owned());

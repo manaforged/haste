@@ -6,8 +6,8 @@ use rustc_lexer::TokenKind;
 
 use super::item::{Attr, Item, ItemKind};
 use super::source::Source;
-use super::tree::{Cache, Crate, Decl, File, Impl, Macro, Module, State, Textual, Truth, Waiting, textual};
-use super::{mbe, rules, scan};
+use super::tree::{Cache, Crate, Decl, File, Impl, Macro, Module, State, Textual, Waiting, textual};
+use super::{derive, mbe, rules, scan};
 
 const DEPTH: usize = 128;
 const BUILTIN: [&str; 6] = ["include", "global_asm", "compile_error", "concat", "env", "asm"];
@@ -93,10 +93,24 @@ impl Loader<'_> {
                 ItemKind::MacroRules | ItemKind::Macro => self.define(file, (index as u32, at as u32), item),
                 ItemKind::MacroCall => self.call(file, module, at as u32)?,
                 ItemKind::Impl => self.impl_block(index, module, at as u32, file)?,
+                ItemKind::Struct | ItemKind::Enum | ItemKind::Union => self.derive(file, module, item)?,
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    fn derive(&mut self, file: &Arc<File>, module: usize, item: &Item) -> Result<()> {
+        let env = &self.out.env;
+        let mut wanted = Vec::new();
+        derive::derives(&file.source, &item.attrs, &|cfg| env.allows(cfg), &mut wanted);
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let named = |name: &str| self.deps.iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
+        let holder = named("core").or_else(|| named("std")).unwrap_or(self.krate) as u32;
+        let expanded = derive::expand(&file.source, item, (&wanted, holder), &|attrs| env.enabled(attrs));
+        self.splice(module, expanded, "derive")
     }
 
     fn impl_block(&mut self, index: usize, module: usize, at: u32, file: &Arc<File>) -> Result<()> {
@@ -290,7 +304,7 @@ impl Loader<'_> {
     }
 
     fn cfg_select(&mut self, file: &Arc<File>, module: usize, open: u32) -> Result<()> {
-        let selected = match mbe::select(&file.source, open, |cfg| self.out.env.eval(cfg) != Truth::No) {
+        let selected = match mbe::select(&file.source, open, &self.out.env) {
             Ok(Some(selected)) => selected,
             Ok(None) => return Ok(()),
             Err(error) => {

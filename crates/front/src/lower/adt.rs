@@ -5,12 +5,12 @@ use rustc_index::Idx;
 
 use crate::body::{ExprId, List};
 use crate::names::ItemRef;
-use crate::sema::infer::field_types;
+use crate::sema::infer::{ALIGN_SLOT, field_types};
 use crate::sema::layout::{Layout, Variant, target};
 use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
-use super::place::Place;
+use super::place::{Base, Place};
 use super::{Lower, Repr, repr};
 
 /// The byte offset of field `index` of variant `variant` in a value of `layout`.
@@ -135,13 +135,52 @@ impl Lower<'_, '_> {
         Ok((value, Num::Int { ty: tag.ty, signed }))
     }
 
+    /// The declared discriminant of the enum `ty` at `place`, in its discriminant integer type, whatever its tag encoding.
+    pub(super) fn discriminant_value(&mut self, place: Place, ty: Ty) -> Result<Value> {
+        let Kind::Adt(item, _) = self.cx.types.kind(ty).clone() else { bail!("discriminant_value of a type that is not an enum") };
+        let int = self.cx.types.prim(self.cx.discriminant_primitive(item));
+        let Repr::Scalar(to) = repr(self.cx, int)? else { bail!("a discriminant that is not a scalar") };
+        let values = self.cx.discriminants(item)?;
+        let Some((&last, rest)) = values.split_last() else { bail!("discriminant_value of an enum with no variants") };
+        let mut found = self.int_const(to, last as u128);
+        for (variant, &value) in rest.iter().enumerate() {
+            let Some(test) = self.is_variant(place, ty, variant as u32)? else { continue };
+            let value = self.int_const(to, value as u128);
+            found = self.ins().select(test, value, found);
+        }
+        Ok(found)
+    }
+
     /// The place of field `index` of variant `variant` inside the ADT `ty` at `place`.
     pub fn variant_field(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
         let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("field of a type that is not an ADT") };
         let layout = self.cx.layout(ty)?;
         let fields = field_types(self.cx, item, &args)?;
         let Some(&field) = fields.get(variant as usize).and_then(|fields| fields.get(index as usize)) else { bail!("{} has no field {index} in variant {variant}", self.cx.name(item)) };
+        if layout.is_unsized() {
+            return self.unsized_field(place, field_offset(&layout, variant, index), field);
+        }
         Ok(place.at(field_offset(&layout, variant, index), repr(self.cx, field)?))
+    }
+
+    fn unsized_field(&mut self, wide: Place, offset: i32, field: Ty) -> Result<Place> {
+        let Some(pair) = self.read(wide) else { bail!("an unsized value with no pointer") };
+        let data = self.ins().load(Type::I64, pair, 0);
+        if !self.cx.is_unsized(field)? {
+            let at = self.ins().iadd_imm(data, i64::from(offset));
+            return Ok(Place { base: Base::Addr(at), offset: 0, repr: repr(self.cx, field)? });
+        }
+        let metadata = self.ins().load(Type::I64, pair, 8);
+        let tail = self.cx.tail(field)?;
+        let offset = if matches!(self.cx.types.kind(tail), Kind::Dyn(..)) {
+            let align = self.ins().load(Type::I64, metadata, ALIGN_SLOT as i32 * 8);
+            let start = self.ins().iconst(Type::I64, i64::from(offset));
+            self.align_up(start, align)
+        } else {
+            self.ins().iconst(Type::I64, i64::from(offset))
+        };
+        let at = self.ins().iadd(data, offset);
+        Ok(Place { base: Base::Addr(self.wide(at, metadata)), offset: 0, repr: super::ops::WIDE })
     }
 
     /// Lowers the struct literal `expr` with field initializers `fields`.

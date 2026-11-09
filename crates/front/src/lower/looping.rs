@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Type, Value};
 
-use crate::body::{ExprId, PatId};
+use crate::body::{ExprId, List, PatId};
 use crate::sema::infer::Res;
 
 use super::place::Place;
@@ -54,10 +54,44 @@ impl Lower<'_, '_> {
         let residual = self.variant_field(flow, tried.flow, (tried.stop, 0))?;
         let residual = self.read(residual);
         let result = self.invoke(*from, from_substs, residual.into_iter().collect())?;
-        self.finish(result)?;
+        match tried.target {
+            Some(block) => self.leave_try(block, result)?,
+            None => self.finish(result)?,
+        }
         self.enter(proceed);
         let output = self.variant_field(flow, tried.flow, (tried.proceed, 0))?;
         Ok(self.read(output))
+    }
+
+    /// Lowers `try { .. }`: the block, then `Try::from_output` on its value, joined with the values that each `?` inside it leaves with.
+    pub fn try_block(&mut self, expr: ExprId, stmts: List, tail: Option<ExprId>) -> Result<Option<Value>> {
+        let Some(Res::Fn(from_output, substs)) = self.typed.try_blocks.get(&expr).cloned() else { bail!("`try` block has no `from_output` call") };
+        let exit = self.b.create_block();
+        let value = Self::carrier(self.repr_of(expr)?).map(|ty| (self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8), ty));
+        self.try_exits.push((expr, Loop { head: exit, exit, value, depth: self.owned.len() }));
+        let output = self.block(stmts, tail);
+        let wrapped = match output {
+            Ok(output) if self.open => self.invoke(from_output, &substs, output.into_iter().collect()),
+            other => other,
+        };
+        let left = wrapped.and_then(|wrapped| self.leave_try(expr, wrapped));
+        self.try_exits.pop();
+        left?;
+        self.enter(exit);
+        Ok(value.map(|(slot, ty)| self.ins().stack_load(ty, slot, 0)))
+    }
+
+    fn leave_try(&mut self, block: ExprId, value: Option<Value>) -> Result<()> {
+        let Some(&(_, Loop { exit, value: slot, depth, .. })) = self.try_exits.iter().rev().find(|(at, _)| *at == block) else { bail!("`?` outside its `try` block") };
+        if !self.open {
+            return Ok(());
+        }
+        if let (Some(value), Some((slot, _))) = (value, slot) {
+            self.ins().stack_store(value, slot, 0);
+        }
+        self.drop_to(depth)?;
+        self.branch_value(None, exit);
+        Ok(())
     }
 
     fn spill(&mut self, value: Option<Value>, ty: crate::sema::ty::Ty) -> Result<Option<Place>> {

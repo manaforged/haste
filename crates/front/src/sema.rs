@@ -37,6 +37,7 @@ pub struct Store {
     bodies: HashMap<ItemRef, Rc<Body>>,
     adts: HashMap<ItemRef, Rc<AdtDef>>,
     layouts: HashMap<ty::Ty, Rc<layout::Layout>>,
+    tails: HashMap<ty::Ty, ty::Ty>,
     headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
     finals: HashMap<reach::Instance, infer::Typed>,
 }
@@ -53,7 +54,7 @@ pub struct Context<'a> {
     adts: HashMap<ItemRef, Rc<AdtDef>>,
     layouts: HashMap<ty::Ty, Rc<layout::Layout>>,
     headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
-    heads: HashMap<u32, Rc<impls::Index>>,
+    heads: HashMap<impls::Holder, Rc<impls::Index>>,
     owners: HashMap<u32, Rc<HashMap<(u32, Option<u32>), u32>>>,
     trait_defs: HashMap<ItemRef, Rc<traits::TraitGenerics>>,
     discriminants: HashMap<ItemRef, Rc<[i128]>>,
@@ -61,20 +62,22 @@ pub struct Context<'a> {
     drops: HashMap<ty::Ty, bool>,
     closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
     finals: HashMap<reach::Instance, infer::Typed>,
+    tails: HashMap<ty::Ty, ty::Ty>,
+    reveals: HashMap<reach::Instance, Option<ty::Ty>>,
 }
 
 impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, store: Store) -> Context<'a> {
-        let Store { types, signatures, bodies, adts, layouts, headers, finals } = store;
+        let Store { types, signatures, bodies, adts, layouts, tails, headers, finals } = store;
         let (modules, heads, owners) = (HashMap::default(), HashMap::default(), HashMap::default());
         let (trait_defs, langs, drops) = (HashMap::default(), None, HashMap::default());
-        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants: HashMap::default(), langs, drops, closures: HashMap::default(), finals }
+        Context { outline, names, types, asks: Asks::default(), modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants: HashMap::default(), langs, drops, closures: HashMap::default(), finals, reveals: HashMap::default(), tails }
     }
 
     /// Ends the pass: the store for the next one, and what lookups asked the front end to load or resolve.
     pub fn release(self) -> (Store, Asks) {
-        (Store { types: self.types, signatures: self.signatures, bodies: self.bodies, adts: self.adts, layouts: self.layouts, headers: self.headers, finals: self.finals }, self.asks)
+        (Store { types: self.types, signatures: self.signatures, bodies: self.bodies, adts: self.adts, layouts: self.layouts, tails: self.tails, headers: self.headers, finals: self.finals }, self.asks)
     }
 
     /// The source file and outline entry of `item`.
@@ -149,7 +152,7 @@ impl<'a> Context<'a> {
             return self.module_of(outer);
         }
         if let Some(block) = self.owner_impl(item) {
-            return Ok(self.impl_module(block));
+            return self.impl_module(block);
         }
         let map = self.modules_of(item.krate);
         let (_, mut entry) = self.item(item);
@@ -194,7 +197,12 @@ impl<'a> Context<'a> {
         if let Some(found) = self.bodies.get(&item) {
             return Ok(found.clone());
         }
-        let parsed = Rc::new(self.parse_body(item)?);
+        let mut parsed = self.parse_body(item)?;
+        let sig = self.signature(item)?;
+        if sig.params.iter().any(|&(pat, _)| !sig.body.plain_param(pat)) {
+            parsed = crate::body::parse_params(self.body_src(item), parsed, &sig.param_starts)?;
+        }
+        let parsed = Rc::new(parsed);
         self.bodies.insert(item, parsed.clone());
         Ok(parsed)
     }
@@ -216,17 +224,23 @@ impl<'a> Context<'a> {
         let name = entry.name.ok_or_else(|| anyhow!("type item has no name"))?;
         let mut parsed = parse_adt(src, name, entry.end, entry.kind == ItemKind::Enum)?;
         let env = &self.outline.crates[item.krate as usize].env;
-        let enabled = |at: Option<u32>| {
-            let mut attrs = Vec::new();
-            at.is_none_or(|at| crate::outline::attr::attrs(src, at, false, &mut attrs).is_ok() && env.enabled(&attrs))
-        };
-        parsed.variants.retain(|variant| enabled(variant.attrs));
-        for variant in &mut parsed.variants {
-            variant.fields.retain(|field| enabled(field.attrs));
-        }
+        parsed.configure(src, &|attrs| env.enabled(attrs));
         let parsed = Rc::new(parsed);
         self.adts.insert(item, parsed.clone());
         Ok(parsed)
+    }
+
+    /// The type parameters, arena and target type of the type alias `item`.
+    pub fn alias_parts(&self, item: ItemRef) -> Result<(Vec<sig::Generic>, Body, crate::body::TyId)> {
+        let (src, entry) = self.item(item);
+        let Some(at) = entry.name else { bail!("type alias with no name") };
+        let Some(eq) = (at + 1..entry.end).find(|&token| src.kind(token) == rustc_lexer::TokenKind::Eq) else { bail!("type `{}` has no `=`", src.text(at)) };
+        let params = match src.text(at + 1) {
+            "<" => sig::generics(src, at + 1, eq)?.1.params.into_iter().filter(|generic| generic.kind != sig::GenericKind::Lifetime).collect(),
+            _ => Vec::new(),
+        };
+        let (arena, ty) = crate::body::parse_ty(src, eq + 1, entry.end - 1)?;
+        Ok((params, arena, ty))
     }
 
     /// The name of `item`, for messages.

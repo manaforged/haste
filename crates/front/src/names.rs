@@ -94,6 +94,16 @@ impl ItemRef {
         ItemRef { item: INNER | self.item << INNER_BITS | index, ..self }
     }
 
+    /// The function whose body declares `self`, when a body declares it.
+    pub fn declaring_body(self) -> Option<ItemRef> {
+        self.outer().map(|(root, _)| root)
+    }
+
+    /// The item whose body holds the items that `self` may name: the declaring body of a body-declared item, otherwise `self`.
+    pub fn body_owner(self) -> ItemRef {
+        self.declaring_body().unwrap_or(self)
+    }
+
     /// The item whose body declares `self`, and the index of `self` there, when a body declares it.
     pub fn outer(self) -> Option<(ItemRef, u32)> {
         let at = self.item & !INNER;

@@ -190,6 +190,11 @@ const OFF: [&str; 10] = ["test", "doc", "doctest", "miri", "rustfmt", "clippy", 
 
 impl Env {
     /// Evaluates `cfg`.
+    /// Whether `cfg` may hold here: true unless this environment rules it out.
+    pub fn allows(&self, cfg: &Cfg) -> bool {
+        self.eval(cfg) != Truth::No
+    }
+
     pub fn eval(&self, cfg: &Cfg) -> Truth {
         match cfg {
             Cfg::Name(name) => self.name(name),
@@ -223,7 +228,7 @@ impl Env {
     /// Whether every `cfg` attribute in `attrs`, including those `cfg_attr` enables, may hold.
     pub fn enabled(&self, attrs: &[Attr]) -> bool {
         attrs.iter().all(|attr| match attr {
-            Attr::Cfg(cfg) => self.eval(cfg) != Truth::No,
+            Attr::Cfg(cfg) => self.allows(cfg),
             Attr::CfgAttr(cfg, inner) => self.eval(cfg) == Truth::No || self.enabled(inner),
             _ => true,
         })
@@ -233,7 +238,7 @@ impl Env {
     pub fn path<'a>(&self, attrs: &'a [Attr]) -> Option<&'a str> {
         attrs.iter().find_map(|attr| match attr {
             Attr::Path(path) => Some(path.as_str()),
-            Attr::CfgAttr(cfg, inner) if self.eval(cfg) != Truth::No => self.path(inner),
+            Attr::CfgAttr(cfg, inner) if self.allows(cfg) => self.path(inner),
             _ => None,
         })
     }

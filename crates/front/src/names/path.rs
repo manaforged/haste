@@ -22,6 +22,29 @@ impl Asks {
     pub fn count(&self) -> usize {
         self.modules.borrow().len() + self.names.borrow().len() + self.crates.borrow().len() + self.scopes.borrow().len()
     }
+
+    /// Where each list of asks ends now, to take what later lookups add with `since`.
+    pub fn mark(&self) -> [usize; 4] {
+        [self.modules.borrow().len(), self.names.borrow().len(), self.crates.borrow().len(), self.scopes.borrow().len()]
+    }
+
+    /// The asks added after `mark`.
+    pub fn since(&self, mark: [usize; 4]) -> Asks {
+        Asks {
+            modules: RefCell::new(self.modules.borrow()[mark[0]..].to_vec()),
+            names: RefCell::new(self.names.borrow()[mark[1]..].to_vec()),
+            crates: RefCell::new(self.crates.borrow()[mark[2]..].to_vec()),
+            scopes: RefCell::new(self.scopes.borrow()[mark[3]..].to_vec()),
+        }
+    }
+
+    /// Asks again for everything that `other` asked for, so that a lookup reading a result built from those asks counts as asking too.
+    pub fn repeat(&self, other: &Asks) {
+        self.modules.borrow_mut().extend(other.modules.borrow().iter().copied());
+        self.names.borrow_mut().extend(other.names.borrow().iter().copied());
+        self.crates.borrow_mut().extend(other.crates.borrow().iter().copied());
+        self.scopes.borrow_mut().extend(other.scopes.borrow().iter().copied());
+    }
 }
 
 /// What path resolution in one crate can see.

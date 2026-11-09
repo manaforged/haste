@@ -5,6 +5,7 @@ use rustc_abi::{AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, Lay
 use rustc_index::{Idx, IndexVec};
 
 use crate::names::Primitive;
+use crate::outline::item::ItemKind;
 
 use super::Context;
 use super::ty::{Kind, Ty};
@@ -103,6 +104,7 @@ impl Context<'_> {
                 let element = self.layout(element)?;
                 return calc.array_like::<Field, Variant, ()>(&element, Some(count)).map_err(|error| anyhow!("layout of an array: {error:?}"));
             }
+            kind if kind.is_unsized() => return self.unsized_layout(&calc, kind),
             other => bail!("no layout for {other:?} yet"),
         };
         let layouts = fields.iter().map(|field| self.layout(*field)).collect::<Result<Vec<_>>>()?;
@@ -111,13 +113,48 @@ impl Context<'_> {
         calc.univariant(&refs, &ReprOptions::default(), StructKind::AlwaysSized).map_err(|error| anyhow!("layout: {error:?}"))
     }
 
+    fn unsized_layout(&mut self, calc: &LayoutCalculator<&TargetDataLayout>, kind: Kind) -> Result<Layout> {
+        let element = match kind {
+            Kind::Slice(element) => element,
+            Kind::Prim(Primitive::Str) => self.types.intern(Kind::Prim(Primitive::U8)),
+            _ => {
+                let mut unit = calc.univariant::<Field, Variant, &&Layout>(&IndexVec::new(), &ReprOptions::default(), StructKind::AlwaysSized).map_err(|error| anyhow!("layout of a trait object: {error:?}"))?;
+                unit.backend_repr = BackendRepr::Memory { sized: false };
+                return Ok(unit);
+            }
+        };
+        let element = self.layout(element)?;
+        calc.array_like::<Field, Variant, ()>(&element, None).map_err(|error| anyhow!("layout of a slice: {error:?}"))
+    }
+
+    /// The type at the end of `ty` whose metadata a pointer to `ty` carries: `ty` itself, or the tail of its last struct field.
+    pub fn tail(&mut self, ty: Ty) -> Result<Ty> {
+        let Kind::Adt(item, args) = self.types.kind(ty).clone() else { return Ok(ty) };
+        if let Some(found) = self.tails.get(&ty) {
+            return Ok(*found);
+        }
+        let last = if self.item(item).1.kind == ItemKind::Struct { super::infer::field_types(self, item, &args)?.first().and_then(|fields| fields.last().copied()) } else { None };
+        let found = match last {
+            Some(last) => self.tail(last)?,
+            None => ty,
+        };
+        self.tails.insert(ty, found);
+        Ok(found)
+    }
+
+    /// Whether a pointer to `ty` carries metadata after its address.
+    pub fn is_unsized(&mut self, ty: Ty) -> Result<bool> {
+        let tail = self.tail(ty)?;
+        Ok(self.types.kind(tail).is_unsized())
+    }
+
     fn leaf(&mut self, dl: &TargetDataLayout, ty: Ty) -> Result<Option<Layout>> {
         Ok(Some(match self.types.kind(ty).clone() {
             Kind::Prim(prim) => primitive(dl, prim)?,
             Kind::Never => Layout::never_type(dl),
             Kind::FnPtr(..) => Layout::scalar(dl, pointer_scalar(dl, true)),
-            Kind::Ref(_, pointee) => self.pointer(dl, true, pointee),
-            Kind::Ptr(_, pointee) => self.pointer(dl, false, pointee),
+            Kind::Ref(_, pointee) => self.pointer(dl, true, pointee)?,
+            Kind::Ptr(_, pointee) => self.pointer(dl, false, pointee)?,
             Kind::Pat(base, start, end) => self.pattern(dl, base, WrappingRange { start, end })?,
             _ => return Ok(None),
         }))
@@ -136,19 +173,14 @@ impl Context<'_> {
         Ok((*self.layout(env)?).clone())
     }
 
-    fn pointer(&self, dl: &TargetDataLayout, nonnull: bool, pointee: Ty) -> Layout {
+    fn pointer(&mut self, dl: &TargetDataLayout, nonnull: bool, pointee: Ty) -> Result<Layout> {
         let data = pointer_scalar(dl, nonnull);
-        if self.thin(pointee) {
-            return Layout::scalar(dl, data);
-        }
-        let metadata = match self.types.kind(pointee) {
+        let tail = self.tail(pointee)?;
+        let metadata = match self.types.kind(tail) {
             Kind::Dyn(..) => pointer_scalar(dl, true),
-            _ => Scalar::Initialized { value: Abi::Int(Integer::I64, false), valid_range: WrappingRange::full(Size::from_bytes(8)) },
+            kind if kind.is_unsized() => Scalar::Initialized { value: Abi::Int(Integer::I64, false), valid_range: WrappingRange::full(Size::from_bytes(8)) },
+            _ => return Ok(Layout::scalar(dl, data)),
         };
-        Layout::scalar_pair(dl, data, metadata)
-    }
-
-    fn thin(&self, pointee: Ty) -> bool {
-        !self.types.kind(pointee).is_unsized()
+        Ok(Layout::scalar_pair(dl, data, metadata))
     }
 }

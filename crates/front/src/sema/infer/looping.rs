@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::body::{ExprId, PatId};
+use crate::body::{ExprId, List, PatId};
 use crate::names::ItemRef;
 
 use super::super::ty::{Kind, Mut, Ty};
@@ -24,6 +24,8 @@ pub struct Tried {
     pub flow: Ty,
     pub proceed: u32,
     pub stop: u32,
+    /// The `try` block that a `Break` leaves, or none when it returns from the function.
+    pub target: Option<ExprId>,
 }
 
 impl Infer<'_, '_> {
@@ -35,10 +37,25 @@ impl Infer<'_, '_> {
         let Kind::Adt(item, args) = self.cx.types.kind(self.resolve(flow)).clone() else { bail!("`branch` does not return a `ControlFlow`") };
         let (Some(stop), Some(proceed)) = (self.variant_named(item, "Break")?, self.variant_named(item, "Continue")?) else { bail!("`ControlFlow` has no `Break` or `Continue`") };
         let Some(method) = self.cx.lang_item("from_residual") else { bail!("no `from_residual` lang item") };
-        let ret = self.out.ret.unwrap_or_else(|| self.cx.types.unit());
+        let target = self.try_blocks.last().copied();
+        let ret = target.map(|(_, ty)| ty).or(self.out.ret).unwrap_or_else(|| self.cx.types.unit());
         let from_residual = Res::Fn(method, vec![ret, args[0]]);
-        self.out.tries.insert(expr, Tried { branch, from_residual, flow, proceed, stop });
+        self.out.tries.insert(expr, Tried { branch, from_residual, flow, proceed, stop, target: target.map(|(block, _)| block) });
         Ok(args[1])
+    }
+
+    /// Infers `try { .. }` to a `Try` type whose `Output` its value is, and which each `?` inside it leaves with.
+    pub fn try_block(&mut self, expr: ExprId, (stmts, tail): (List, Option<ExprId>), expected: Option<Ty>) -> Result<Ty> {
+        let ty = expected.unwrap_or_else(|| self.fresh(Kind::Var));
+        self.try_blocks.push((expr, ty));
+        let found = self.block(stmts, tail, None);
+        self.try_blocks.pop();
+        let found = found?;
+        let (Some(of), Some(method)) = (self.cx.lang_item("Try"), self.cx.lang_item("from_output")) else { bail!("core has no `Try::from_output`") };
+        let output = self.project(of, ty, Vec::new(), "Output")?;
+        self.coerce(found, output)?;
+        self.out.try_blocks.insert(expr, Res::Fn(method, vec![ty]));
+        Ok(ty)
     }
 
     /// Infers `for pat in iter { body }`.

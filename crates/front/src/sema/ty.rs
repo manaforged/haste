@@ -29,8 +29,8 @@ pub enum Kind {
     FnPtr(Vec<Ty>, Ty),
     /// The closure expression `2` of the body of `0` at type arguments `1`.
     Closure(ItemRef, Vec<Ty>, u32),
-    /// A trait object of the trait `0` at trait arguments `1`.
-    Dyn(ItemRef, Vec<Ty>),
+    /// A trait object of the trait `0`: its trait arguments, then the type bound to each associated type in `2`.
+    Dyn(ItemRef, Vec<Ty>, Vec<ItemRef>),
     Pat(Ty, u128, u128),
     /// The value of a const generic argument, as the bits of its type.
     Value(u128),
@@ -41,11 +41,17 @@ pub enum Kind {
     Error,
 }
 
+/// The trait arguments of a trait object's types `args`, and the types bound to its associated types `members`.
+pub fn object_parts<'k>(args: &'k [Ty], members: &'k [ItemRef]) -> (&'k [Ty], impl Iterator<Item = (ItemRef, Ty)> + 'k) {
+    let (trait_args, bound) = args.split_at(args.len() - members.len());
+    (trait_args, members.iter().copied().zip(bound.iter().copied()))
+}
+
 impl Kind {
     /// The types directly inside this shape.
     pub fn children(&self) -> impl Iterator<Item = Ty> + '_ {
         let (items, last): (&[Ty], Option<&Ty>) = match self {
-            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Dyn(_, items) => (items, None),
+            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Dyn(_, items, _) => (items, None),
             Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => (std::slice::from_ref(inner), None),
             Kind::Array(inner, len) => (std::slice::from_ref(inner), Some(len)),
             Kind::FnPtr(params, ret) => (params, Some(ret)),
@@ -64,7 +70,7 @@ impl Kind {
             Kind::Slice(inner) => Kind::Slice(f(inner)),
             Kind::Adt(item, args) => Kind::Adt(item, args.into_iter().map(&mut f).collect()),
             Kind::FnDef(item, args) => Kind::FnDef(item, args.into_iter().map(&mut f).collect()),
-            Kind::Dyn(of, args) => Kind::Dyn(of, args.into_iter().map(&mut f).collect()),
+            Kind::Dyn(of, args, members) => Kind::Dyn(of, args.into_iter().map(&mut f).collect(), members),
             Kind::FnPtr(params, ret) => {
                 let params = params.into_iter().map(&mut f).collect();
                 Kind::FnPtr(params, f(ret))

@@ -3,6 +3,7 @@
 mod abi;
 mod adt;
 mod array;
+mod atomic;
 mod closure;
 mod drop;
 mod equal;
@@ -22,12 +23,12 @@ use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, Function, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
 
 use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
-use crate::names::Primitive;
+use crate::names::{ItemRef, Primitive};
 use crate::outline::source::Source;
 use crate::sema::Context;
 use crate::sema::infer::{Shape, Typed};
 use crate::sema::reach::Reached;
-use crate::sema::ty::{Kind, Ty, Types};
+use crate::sema::ty::{Kind, Ty};
 
 /// Where lowered code finds what it refers to: call table entries and constant data.
 pub trait Slots {
@@ -37,6 +38,8 @@ pub trait Slots {
     fn data(&self, bytes: &[u8]) -> i64;
     /// The address of a table of `words` that lives as long as the program, each `Word::Code` holding a code address once every function is compiled.
     fn table(&self, words: &[Word]) -> i64;
+    /// The address of the zeroed, 16-byte-aligned cell of `size` bytes that holds the value of the static whose initializer is reached function `index`.
+    fn cell(&self, index: usize, size: u32) -> i64;
 }
 
 /// One machine word of a constant table: a number, or the code address of reached function `index`.
@@ -55,9 +58,9 @@ pub enum Repr {
 }
 
 /// The register type that holds a scalar value of `ty`, or none when `ty` is not a scalar.
-pub fn machine(types: &Types, ty: Ty) -> Option<Type> {
+pub fn machine(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Type>> {
     use Primitive::*;
-    Some(match types.kind(ty) {
+    Ok(Some(match cx.types.kind(ty).clone() {
         Kind::Prim(Bool | I8 | U8) => Type::I8,
         Kind::Prim(I16 | U16) => Type::I16,
         Kind::Prim(I32 | U32 | Char) => Type::I32,
@@ -65,16 +68,16 @@ pub fn machine(types: &Types, ty: Ty) -> Option<Type> {
         Kind::Prim(I128 | U128) => Type::I128,
         Kind::Prim(F32) => Type::F32,
         Kind::Prim(F64) => Type::F64,
-        Kind::Pat(base, ..) => return machine(types, *base),
-        Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) if !types.kind(*pointee).is_unsized() => Type::I64,
+        Kind::Pat(base, ..) => return machine(cx, base),
+        Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) if !cx.is_unsized(pointee)? => Type::I64,
         Kind::FnPtr(..) => Type::I64,
-        _ => return None,
-    })
+        _ => return Ok(None),
+    }))
 }
 
 /// How values of `ty` travel.
 pub fn repr(cx: &mut Context<'_>, ty: Ty) -> Result<Repr> {
-    if let Some(machine) = machine(&cx.types, ty) {
+    if let Some(machine) = machine(cx, ty)? {
         return Ok(Repr::Scalar(machine));
     }
     if matches!(cx.types.kind(ty), Kind::FnDef(..)) {
@@ -129,6 +132,7 @@ pub struct Lower<'l, 'a> {
     b: FunctionBuilder<'l>,
     locals: Vec<Option<place::Place>>,
     loops: Vec<Loop>,
+    try_exits: Vec<(ExprId, Loop)>,
     open: bool,
     dead: Option<Block>,
     sret: Option<Value>,
@@ -137,6 +141,12 @@ pub struct Lower<'l, 'a> {
     moved: rustc_hash::FxHashMap<moves::Root, Vec<moves::MovePath>>,
     extended: rustc_hash::FxHashSet<ExprId>,
     pending: Vec<(moves::Root, moves::MovePath)>,
+    index: usize,
+}
+
+/// Whether `item` is a static, whose reached instance writes its value into the static's cell.
+pub fn is_static(cx: &Context<'_>, item: ItemRef) -> bool {
+    cx.item(item).1.kind == crate::outline::item::ItemKind::Static
 }
 
 /// Lowers reached function `index` to SSA, with calls through `slots`.
@@ -149,10 +159,11 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
     };
     let body = match typed.shape {
         Shape::Body | Shape::Closure(_) => cx.body(source)?,
-        Shape::Glue(_) | Shape::Virtual(_) => std::rc::Rc::default(),
+        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) => std::rc::Rc::default(),
     };
     let src = cx.body_src(source);
-    let mut func = Function::new(signature(cx, typed)?);
+    let signature = if is_static(cx, *item) { signature_of(cx, None, [])? } else { signature(cx, typed)? };
+    let mut func = Function::new(signature);
     let b = FunctionBuilder::new(&mut func);
     let mut lower = Lower {
         cx,
@@ -164,6 +175,7 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
         b,
         locals: vec![None; typed.locals.len()],
         loops: Vec::new(),
+        try_exits: Vec::new(),
         open: true,
         dead: None,
         sret: None,
@@ -172,6 +184,7 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
         moved: Default::default(),
         extended: Default::default(),
         pending: Vec::new(),
+        index,
     };
     lower.run()?;
     Ok(func)
@@ -186,18 +199,12 @@ impl Lower<'_, '_> {
         self.jump(prologue, &[]);
         self.b.switch_to_block(start);
         self.moved = self.moved_paths()?;
-        let mut params = self.b.block_params(entry).to_vec().into_iter();
-        let sret = self.b.func.signature.params.first().is_some_and(|param| param.purpose == ArgumentPurpose::StructReturn);
-        self.sret = if sret { params.next() } else { None };
-        for &local in &self.typed.params {
-            let value = match self.local_repr(local)? {
-                Repr::Zst => None,
-                _ => params.next(),
-            };
-            self.declare(local, value)?;
-        }
+        self.declare_params(entry)?;
         let value = self.root_value()?;
-        self.finish(value)?;
+        match is_static(self.cx, self.reached.list[self.index].0.0) {
+            true => self.fill_static(value)?,
+            false => self.finish(value)?,
+        }
         self.enter(prologue);
         for slot in std::mem::take(&mut self.flags) {
             let zero = self.ins().iconst(Type::I8, 0);
@@ -209,10 +216,29 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
+    fn declare_params(&mut self, entry: Block) -> Result<()> {
+        let mut params = self.b.block_params(entry).to_vec().into_iter();
+        let sret = self.b.func.signature.params.first().is_some_and(|param| param.purpose == ArgumentPurpose::StructReturn);
+        self.sret = if sret { params.next() } else { None };
+        for &local in &self.typed.params {
+            let value = match self.local_repr(local)? {
+                Repr::Zst => None,
+                _ => params.next(),
+            };
+            self.declare(local, value)?;
+            if let Some(&pat) = self.typed.unpacks.get(&local) {
+                self.bind_matched(pat, self.locals[local as usize], Some((moves::Root::Local(local), Vec::new())))?;
+                self.commit_moves()?;
+            }
+        }
+        Ok(())
+    }
+
     fn root_value(&mut self) -> Result<Option<Value>> {
         match &self.typed.shape {
             Shape::Glue(_) => self.glue_target().map(|_| None),
             Shape::Virtual(slot) => self.virtual_call(*slot).map(|_| None),
+            Shape::Untuple(res) => self.untuple_call(res.clone()),
             Shape::Closure(closure) => {
                 let root = closure.closure.body;
                 self.bind_captures()?;

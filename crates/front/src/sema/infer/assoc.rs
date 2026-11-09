@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::body::PathId;
+use crate::body::{Body, PathId};
 use crate::names::path::Path as NamePath;
 use crate::names::{Def, ItemRef, plain};
 use crate::outline::item::ItemKind;
@@ -11,8 +11,7 @@ use super::{Infer, Res};
 
 impl Infer<'_, '_> {
     /// Resolves a path to an associated function or constant: `Type::name`, `Trait::name`, `<T>::name` or `<T as Trait>::name`.
-    pub(super) fn assoc_value(&mut self, path: PathId) -> Result<Option<(Ty, Res)>> {
-        let body = self.body;
+    pub(super) fn assoc_value(&mut self, body: &Body, path: PathId) -> Result<Option<(Ty, Res)>> {
         let entry = body.path(path);
         let Some((&last, prefix)) = body.list(entry.segments).split_last() else { return Ok(None) };
         let name = plain(self.src.text(body.segments[last as usize].name));
@@ -21,11 +20,12 @@ impl Infer<'_, '_> {
             Some((ty, Some(trait_path))) if prefix.is_empty() => {
                 let self_ty = self.lower_ty(body, ty)?;
                 let Some(of) = self.trait_named(body, trait_path, self.home) else { bail!("`as` names something that is not a trait") };
-                return self.trait_value(of, (Some(self_ty), None), (name, given)).map(Some);
+                let args = self.bound_args(of, body, trait_path, self_ty)?;
+                return self.trait_value(of, (Some(self_ty), Some(args)), (name, given)).map(Some);
             }
             Some((ty, None)) if prefix.is_empty() => self.lower_ty(body, ty)?,
             None if !prefix.is_empty() => {
-                if let Some(of) = self.prefix_trait(path, prefix.len()) {
+                if let Some(of) = self.prefix_trait(body, path, prefix.len()) {
                     return self.trait_value(of, (None, None), (name, given)).map(Some);
                 }
                 if let [first] = prefix
@@ -45,6 +45,12 @@ impl Infer<'_, '_> {
         if let Some((member, args)) = self.inherent_member(owner, name)? {
             return self.member_value(member, args, given);
         }
+        if let Kind::Dyn(of, args, members) = self.cx.types.kind(owner).clone()
+            && self.cx.trait_member(of, name).is_some()
+        {
+            let args = super::super::ty::object_parts(&args, &members).0.to_vec();
+            return self.trait_value(of, (Some(owner), Some(args)), (name, given));
+        }
         for of in self.cx.traits_in_scope(self.home) {
             if self.cx.trait_member(of, name).is_some() && self.implements(of, owner)? {
                 return self.trait_value(of, (Some(owner), None), (name, given));
@@ -53,8 +59,8 @@ impl Infer<'_, '_> {
         bail!("no associated item `{name}` on {}", self.show(owner))
     }
 
-    fn prefix_trait(&mut self, path: PathId, count: usize) -> Option<ItemRef> {
-        let (mut segments, absolute, dollar) = self.segments(self.body, path);
+    fn prefix_trait(&mut self, body: &Body, path: PathId, count: usize) -> Option<ItemRef> {
+        let (mut segments, absolute, dollar) = self.segments(body, path);
         segments.truncate(count);
         match self.cx.paths(self.home.krate).resolve(&NamePath { segments: &segments, absolute, dollar }, self.home)? {
             Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Trait => Some(item),

@@ -20,12 +20,12 @@ impl Lower<'_, '_> {
         match (typed.coercions.get(&expr), value) {
             _ if !self.open => Ok(None),
             (Some(Coercion::Len(len)), Some(value)) => {
-                let (data, _) = self.builtin_pointer(value, self.ty_of(expr))?;
+                let data = self.sized_pointer(value, self.ty_of(expr));
                 let len = self.len(*len)?;
                 Ok(Some(self.wide_pointer(data, len)))
             }
             (Some(Coercion::Vtable(vtable)), Some(value)) => {
-                let (data, _) = self.builtin_pointer(value, self.ty_of(expr))?;
+                let data = self.sized_pointer(value, self.ty_of(expr));
                 let table = self.vtable(vtable)?;
                 Ok(Some(self.wide_pointer(data, table)))
             }
@@ -75,6 +75,7 @@ impl Lower<'_, '_> {
 
     fn flow(&mut self, expr: ExprId) -> Result<Option<Value>> {
         match *self.body.expr(expr) {
+            Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Try } => self.try_block(expr, stmts, tail),
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail),
             Expr::If(cond, then, otherwise) => self.if_expr(expr, cond, then, otherwise),
             Expr::While { cond, body, label: None } => self.while_expr(cond, body),
@@ -121,11 +122,10 @@ impl Lower<'_, '_> {
                 }
                 Ok(value)
             }
-            Some(Res::Fn(item, substs)) if self.cx.item(*item).1.kind == ItemKind::Const => {
+            Some(Res::Fn(item, substs)) => {
                 let (item, substs) = (*item, substs.clone());
-                self.invoke(item, &substs, Vec::new())
+                self.item_path(expr, item, &substs)
             }
-            Some(Res::Fn(..)) => Ok(None),
             Some(&Res::Const(value)) => {
                 let (Kind::Value(bits), Repr::Scalar(machine)) = (self.cx.types.kind(value).clone(), self.repr_of(expr)?) else { bail!("a const parameter whose value is not known") };
                 Ok(Some(self.int_const(machine, bits)))
@@ -135,6 +135,14 @@ impl Lower<'_, '_> {
                 self.construct(self.ty_of(expr), variant, Vec::new(), None)
             }
             None => bail!("path has no resolution"),
+        }
+    }
+
+    fn item_path(&mut self, expr: ExprId, item: ItemRef, substs: &[Ty]) -> Result<Option<Value>> {
+        match self.cx.item(item).1.kind {
+            ItemKind::Static => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
+            ItemKind::Const => self.invoke(item, substs, Vec::new()),
+            _ => Ok(None),
         }
     }
 
@@ -229,7 +237,7 @@ impl Lower<'_, '_> {
         self.ins().load(Type::I64, table, 0)
     }
 
-    fn call_code(&mut self, code: Value, (signature, ret): (Signature, Option<Ty>), mut values: Vec<Value>) -> Result<Option<Value>> {
+    pub(super) fn call_code(&mut self, code: Value, (signature, ret): (Signature, Option<Ty>), mut values: Vec<Value>) -> Result<Option<Value>> {
         let result = ret.map(|ret| repr(self.cx, ret)).transpose()?.unwrap_or(Repr::Zst);
         let out = match result {
             Repr::Mem { .. } => self.slot(result),

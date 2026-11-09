@@ -128,18 +128,25 @@ impl Writer {
             Builtin::FormatArgs | Builtin::FormatArgsNl => return self.format_args(cx, run, site, out),
             Builtin::PatternType => return Ok(false),
             Builtin::Line | Builtin::Column | Builtin::File if run.depth > 0 => return Ok(false),
-            Builtin::Line => out.lexed(&format!("{}u32", src.line(site.start))),
-            Builtin::Column => out.lexed(&format!("{}u32", src.column(site.start))),
-            Builtin::File => out.lexed(&format!("{:?}", src.path.display().to_string())),
-            Builtin::Stringify => out.lexed(&format!("{:?}", builtin::spelled(src, input))),
+            Builtin::Line | Builtin::Column | Builtin::File | Builtin::Stringify => position(src, site, input, out),
             Builtin::Cfg => {
                 let predicate = (input.0..input.1).map(|at| src.text(at)).collect::<Vec<_>>().join(" ");
                 let holds = cx.outline.crates[self.home.krate as usize].env.eval(&crate::graph::cfg::parse(&predicate)?) == Truth::Yes;
                 out.lexed(if holds { "true" } else { "false" });
             }
+            Builtin::CfgSelect => return self.cfg_select(cx, run, open, out),
             Builtin::Assert => builtin::assert(src, &builtin::args(src, open), site.krate, out),
             Builtin::Panic | Builtin::Unreachable => self.panic(cx, run, site, out),
         }
+        Ok(true)
+    }
+
+    fn cfg_select(&self, cx: &Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<bool> {
+        let env = &cx.outline.crates[self.home.krate as usize].env;
+        let Some(arm) = crate::outline::mbe::select_arm(run.src, open, env)? else { bail!("no cfg_select! arm applies") };
+        out.lexed(if arm.braced { "{" } else { "(" });
+        (arm.from..arm.to).for_each(|at| out.copy(run.src, at));
+        out.lexed(if arm.braced { "}" } else { ")" });
         Ok(true)
     }
 
@@ -207,7 +214,7 @@ struct Site {
 impl<'a> Context<'a> {
     /// The expansion of the body of `item`, or of the body that declares it, once a pass read that body and found macro calls or items in it.
     pub fn expansion(&self, item: ItemRef) -> Option<&'a Expansion> {
-        let item = item.outer().map_or(item, |(outer, _)| outer);
+        let item = item.body_owner();
         self.outline.crates[item.krate as usize].files[item.file as usize].expansion(item.item)
     }
 
@@ -288,5 +295,14 @@ fn parse_in(src: &Source, calls: Option<&HashMap<u32, u32>>, entry: &crate::outl
             syntax::parse_expr(src, from, entry.end - 1, calls)
         }
         _ => syntax::parse(src, entry.body.ok_or_else(|| anyhow!("function {} has no body", src.text(entry.name.unwrap_or(entry.start))))?, calls),
+    }
+}
+
+fn position(src: &Source, site: Site, input: (u32, u32), out: &mut Tokens) {
+    match site.builtin {
+        Builtin::Line => out.lexed(&format!("{}u32", src.line(site.start))),
+        Builtin::Column => out.lexed(&format!("{}u32", src.column(site.start))),
+        Builtin::File => out.lexed(&format!("{:?}", src.path.display().to_string())),
+        _ => out.lexed(&format!("{:?}", builtin::spelled(src, input))),
     }
 }

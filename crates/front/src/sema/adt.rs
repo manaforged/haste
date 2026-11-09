@@ -23,10 +23,15 @@ impl Context<'_> {
         if let Some(found) = self.discriminants.get(&item) {
             return Ok(found.clone());
         }
-        let primitive = self.repr(item).int.map_or(Primitive::Isize, repr_primitive);
+        let primitive = self.discriminant_primitive(item);
         let found: Rc<[i128]> = super::infer::discriminants(self, item, primitive)?.into();
         self.discriminants.insert(item, found.clone());
         Ok(found)
+    }
+
+    /// The integer type of the discriminants of the enum `item`: its `#[repr]` integer, or `isize`.
+    pub fn discriminant_primitive(&self, item: ItemRef) -> Primitive {
+        self.repr(item).int.map_or(Primitive::Isize, repr_primitive)
     }
 
     /// The `#[repr]` options of `item`.
@@ -62,6 +67,7 @@ impl Context<'_> {
     /// The layout of the struct, enum or union `item` at `args`.
     pub fn adt_layout(&mut self, item: ItemRef, args: &[super::ty::Ty]) -> Result<Layout> {
         let fields = field_types(self, item, args)?;
+        let sized = !super::infer::maybe_unsized(self, item)?;
         let mut layouts = Vec::with_capacity(fields.len());
         for variant in &fields {
             layouts.push(variant.iter().map(|ty| self.layout(*ty)).collect::<Result<Vec<_>>>()?);
@@ -78,7 +84,7 @@ impl Context<'_> {
                 let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { Rc::from([0]) };
                 let no_niche = matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned"));
                 let tagged = discriminants.iter().enumerate().map(|(at, &value)| (rustc_index::Idx::new(at), value));
-                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, no_niche, |min, max| discr_range(&dl, &repr, min, max), tagged, true)
+                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, no_niche, |min, max| discr_range(&dl, &repr, min, max), tagged, sized)
             }
         };
         result.map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))

@@ -31,6 +31,7 @@ impl Infer<'_, '_> {
         match self.cx.types.kind(ty).clone() {
             Kind::Array(_, len) if self.cx.types.len(len) == Some(0) => return Ok(false),
             Kind::Adt(..) if self.drop_impl(ty)?.is_some() => return Ok(true),
+            Kind::Dyn(..) => return Ok(true),
             _ => {}
         }
         let parts = self.drop_parts(ty)?;

@@ -116,7 +116,13 @@ impl<'a> Infer<'_, 'a> {
 
     fn trait_candidates(&mut self, name: &str) -> Result<Vec<TraitCandidate>> {
         let mut found = Vec::new();
-        for of in self.cx.traits_in_scope(self.home) {
+        let mut traits = self.cx.traits_in_scope(self.home);
+        for local in self.body_traits() {
+            if !traits.contains(&local) {
+                traits.push(local);
+            }
+        }
+        for of in traits {
             let Some(item) = self.cx.trait_member(of, name) else { continue };
             if let Some((kind, _)) = self.cx.signature(item)?.receiver {
                 found.push(TraitCandidate { of, item, kind });
@@ -182,7 +188,7 @@ impl<'a> Infer<'_, 'a> {
             _ => Vec::new(),
         };
         generics.extend(named_args(src, &sig.generics, &own));
-        let frame = Frame { src, home: self.cx.module_of(candidate.item).ok()?, generics, self_ty: Some(self_ty), block: Some(candidate.block), item: None };
+        let frame = Frame { src, home: self.cx.module_of(candidate.item).ok()?, generics, self_ty: Some(self_ty), block: Some(candidate.block), item: None, root: candidate.block.root() };
         let receiver = self.with_frame(frame, |infer| infer.receiver_ty(&sig.body, candidate.kind)).ok()?;
         self.unify(receiver, adjusted).ok().map(|_| (args, own))
     }
@@ -211,7 +217,7 @@ impl<'a> Infer<'_, 'a> {
             bail!("{} takes {} arguments, {} given", self.cx.name(item), types.len() - 1, given.len());
         }
         for (arg, param) in given.into_iter().zip(types.into_iter().skip(1)) {
-            self.call_arg(Some((item, &substs[..])), ExprId(arg), param)?;
+            self.call_arg(Some((item, &substs[..])), ExprId(arg), (param, None))?;
         }
         Ok(ret)
     }

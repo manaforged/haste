@@ -101,12 +101,14 @@ fn import(paths: &Paths<'_>, pending: &Pending) -> Outcome {
         return Outcome::Bound(glob(paths, target, (at, pending.vis), since), stamp);
     };
     let Some((found, home, target)) = named(paths, &path, at) else { return Outcome::Missing };
+    if name == UNDERSCORE {
+        let Some(binding) = found.types else { return Outcome::Missing };
+        let stamp = Some((binding.def, 0));
+        return if stamp == pending.stamp { Outcome::Unchanged } else { Outcome::Bound(Found::new(), stamp) };
+    }
     let stamp = target.and_then(|target| stamp(paths, target));
     if stamp.is_some() && stamp == pending.stamp {
         return Outcome::Unchanged;
-    }
-    if name == UNDERSCORE {
-        return Outcome::Bound(Found::new(), stamp);
     }
     let mut out = Found::new();
     for ns in NAMESPACES {

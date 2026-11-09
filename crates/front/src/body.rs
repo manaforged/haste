@@ -286,6 +286,8 @@ pub struct Body {
     pub ids: Vec<u32>,
     pub attrs: Vec<(Node, u32, u32)>,
     pub root: Option<ExprId>,
+    /// The function's parameter patterns, parsed into this arena when one of them is more than a name.
+    pub fn_params: Vec<PatId>,
 }
 
 impl Body {
@@ -297,6 +299,11 @@ impl Body {
     /// The pattern `id`.
     pub fn pat(&self, id: PatId) -> &Pat {
         &self.pats[id.0 as usize]
+    }
+
+    /// Whether the parameter pattern `id` is a plain name or `_`, which binds the argument without taking it apart.
+    pub fn plain_param(&self, id: PatId) -> bool {
+        matches!(self.pat(id), Pat::Bind { sub: None, by_ref: false, .. } | Pat::Wild)
     }
 
     /// The type `id`.
@@ -321,6 +328,18 @@ pub fn parse(src: &Source, open: u32, calls: Option<&HashMap<u32, u32>>) -> Resu
     cursor.calls = calls;
     let root = cursor.block_expr(None, BlockKind::Plain)?;
     cursor.body.root = Some(root);
+    Ok(cursor.body)
+}
+
+/// Adds to `body` the parameter patterns that start at tokens `starts` of `src`.
+pub fn parse_params(src: &Source, body: Body, starts: &[u32]) -> Result<Body> {
+    let mut cursor = Cursor::new(src, 0, src.len());
+    cursor.body = body;
+    for &start in starts {
+        cursor.at = start;
+        let pat = cursor.pat_no_alt()?;
+        cursor.body.fn_params.push(pat);
+    }
     Ok(cursor.body)
 }
 

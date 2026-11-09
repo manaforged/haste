@@ -23,9 +23,10 @@ pub enum Builtin {
     Panic,
     Unreachable,
     PatternType,
+    CfgSelect,
 }
 
-const BUILTINS: [(&str, Builtin); 13] = [
+const BUILTINS: [(&str, Builtin); 14] = [
     ("concat", Builtin::Concat),
     ("stringify", Builtin::Stringify),
     ("line", Builtin::Line),
@@ -39,6 +40,7 @@ const BUILTINS: [(&str, Builtin); 13] = [
     ("panic", Builtin::Panic),
     ("unreachable", Builtin::Unreachable),
     ("pattern_type", Builtin::PatternType),
+    ("cfg_select", Builtin::CfgSelect),
 ];
 
 impl Builtin {

@@ -15,11 +15,28 @@ use super::Context;
 use super::infer::segments;
 use super::ty::{Kind, Mut};
 
-/// One impl block: its crate and its index among the crate's impls.
+/// One impl block: one that a module holds, by its index among its crate's impls, or one that a function body declares, by its item there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ImplRef {
-    pub krate: u32,
-    pub index: u32,
+pub enum ImplRef {
+    Module { krate: u32, index: u32 },
+    Body(ItemRef),
+}
+
+impl ImplRef {
+    /// The function whose body declares the impl, when a body does.
+    pub fn root(self) -> Option<ItemRef> {
+        match self {
+            ImplRef::Module { .. } => None,
+            ImplRef::Body(item) => item.declaring_body(),
+        }
+    }
+}
+
+/// What holds a set of impls: the modules of a crate, or the body of a function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Holder {
+    Crate(u32),
+    Body(ItemRef),
 }
 
 /// The outer shape of a type, by which its inherent impls are found.
@@ -55,6 +72,7 @@ pub fn head(kind: &Kind) -> Option<Head> {
 pub struct Index {
     inherent: HashMap<Head, Vec<ImplRef>>,
     traits: HashMap<ItemRef, Vec<(ImplRef, Option<Head>)>>,
+    asked: crate::names::path::Asks,
 }
 
 const PRIMITIVE_HOLDERS: [&str; 3] = ["core", "alloc", "std"];
@@ -66,8 +84,11 @@ impl<'a> Context<'a> {
             return Ok(found.clone());
         }
         let file = self.impl_file(block);
-        let entry = &self.outline.crates[block.krate as usize].impls[block.index as usize];
-        let item = &file.items.items[entry.at as usize];
+        let at = match block {
+            ImplRef::Module { krate, index } => self.outline.crates[krate as usize].impls[index as usize].at,
+            ImplRef::Body(item) => item.outer().map_or(item.item, |(_, at)| at),
+        };
+        let item = &file.items.items[at as usize];
         let parsed = Rc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
         self.headers.insert(block, parsed.clone());
         Ok(parsed)
@@ -75,29 +96,48 @@ impl<'a> Context<'a> {
 
     /// The outline file that holds the header of impl `block`.
     pub fn impl_file(&self, block: ImplRef) -> &'a File {
-        let tree = &self.outline.crates[block.krate as usize];
-        &tree.files[tree.impls[block.index as usize].file]
+        match block {
+            ImplRef::Module { krate, index } => {
+                let tree = &self.outline.crates[krate as usize];
+                &tree.files[tree.impls[index as usize].file]
+            }
+            ImplRef::Body(item) => self.file(item),
+        }
     }
 
     /// The module around impl `block`.
-    pub fn impl_module(&self, block: ImplRef) -> ModRef {
-        ModRef { krate: block.krate, module: self.outline.crates[block.krate as usize].impls[block.index as usize].module as u32 }
+    pub fn impl_module(&mut self, block: ImplRef) -> Result<ModRef> {
+        match block {
+            ImplRef::Module { krate, index } => Ok(ModRef { krate, module: self.outline.crates[krate as usize].impls[index as usize].module as u32 }),
+            ImplRef::Body(item) => self.module_of(item),
+        }
     }
 
     /// The functions, constants and types of impl `block`, its own and those its macro calls expand to.
     pub fn members(&self, block: ImplRef) -> Vec<ItemRef> {
-        let tree = &self.outline.crates[block.krate as usize];
-        let entry = &tree.impls[block.index as usize];
+        let (krate, index) = match block {
+            ImplRef::Module { krate, index } => (krate, index),
+            ImplRef::Body(item) => return self.body_members(item),
+        };
+        let tree = &self.outline.crates[krate as usize];
+        let entry = &tree.impls[index as usize];
         let parts = std::iter::once((entry.file, Some(entry.at))).chain(entry.parts.iter().map(|&part| (part, None)));
         let mut found = Vec::new();
         for (file, owner) in parts {
             for (at, item) in tree.files[file].items.items.iter().enumerate() {
                 if item.parent == owner && matches!(item.kind, ItemKind::Fn | ItemKind::Const | ItemKind::Type) && tree.env.enabled(&item.attrs) {
-                    found.push(ItemRef { krate: block.krate, file: file as u32, item: at as u32 });
+                    found.push(ItemRef { krate, file: file as u32, item: at as u32 });
                 }
             }
         }
         found
+    }
+
+    fn body_members(&self, block: ItemRef) -> Vec<ItemRef> {
+        let Some((root, at)) = block.outer() else { return Vec::new() };
+        let items = &self.file(block).items.items;
+        let member = |item: &crate::outline::item::Item| item.parent == Some(at) && matches!(item.kind, ItemKind::Fn | ItemKind::Const | ItemKind::Type);
+        items.iter().enumerate().filter(|(_, item)| member(item)).map(|(index, _)| root.inner(index as u32)).collect()
     }
 
     /// The member of impl `block` named `name`.
@@ -107,8 +147,9 @@ impl<'a> Context<'a> {
 
     /// The impl block whose member `item` is.
     pub fn owner_impl(&mut self, item: ItemRef) -> Option<ImplRef> {
-        if item.outer().is_some() {
-            return None;
+        if let Some((root, _)) = item.outer() {
+            let parent = self.item(item).1.parent?;
+            return (self.file(item).items.items[parent as usize].kind == ItemKind::Impl).then(|| ImplRef::Body(root.inner(parent)));
         }
         let owners = self.owners_of(item.krate);
         let file = self.file(item);
@@ -117,7 +158,7 @@ impl<'a> Context<'a> {
             Some(_) => return None,
             None => (item.file, None),
         };
-        owners.get(&key).map(|&index| ImplRef { krate: item.krate, index })
+        owners.get(&key).map(|&index| ImplRef::Module { krate: item.krate, index })
     }
 
     fn owners_of(&mut self, krate: u32) -> Rc<HashMap<(u32, Option<u32>), u32>> {
@@ -142,17 +183,27 @@ impl<'a> Context<'a> {
             _ => self.primitive_holders(),
         };
         let mut found = Vec::new();
-        for krate in holders {
-            found.extend(self.index_of(krate).inherent.get(&head).into_iter().flatten().copied());
+        for holder in self.holders_with_body(&holders, Some(head)) {
+            found.extend(self.index_of(holder).inherent.get(&head).into_iter().flatten().copied());
         }
         found
+    }
+
+    fn holders_with_body(&self, crates: &[u32], head: Option<Head>) -> Vec<Holder> {
+        let mut holders: Vec<Holder> = crates.iter().map(|&krate| Holder::Crate(krate)).collect();
+        if let Some(Head::Adt(item)) = head
+            && let Some((root, _)) = item.outer()
+        {
+            holders.push(Holder::Body(root));
+        }
+        holders
     }
 
     /// The impls of trait `of` in crates `holders` whose self type may have head `head`.
     pub fn trait_impls(&mut self, of: ItemRef, head: Option<Head>, holders: &[u32]) -> Vec<ImplRef> {
         let mut found = Vec::new();
-        for &krate in holders {
-            let index = self.index_of(krate);
+        for holder in self.holders_with_body(holders, head) {
+            let index = self.index_of(holder);
             let blocks = index.traits.get(&of).into_iter().flatten();
             found.extend(blocks.filter(|(_, own)| own.is_none() || head.is_none() || *own == head).map(|(block, _)| *block));
         }
@@ -164,12 +215,21 @@ impl<'a> Context<'a> {
         let header = self.impl_header(block).ok()?;
         let syntax::Ty::Path(path) = *header.body.ty(header.trait_ref?) else { return None };
         let src = &self.impl_file(block).source;
-        let home = self.impl_module(block);
+        let home = self.impl_module(block).ok()?;
         let (segments, absolute, dollar) = segments(&self.names.symbols, src, &header.body, path);
-        match self.paths(home.krate).resolve(&NamePath { segments: &segments, absolute, dollar }, home)? {
+        match self.resolve_in(block.root(), &NamePath { segments: &segments, absolute, dollar }, home)? {
             Def::Item(item) if self.item(item).1.kind == ItemKind::Trait => Some(item),
             _ => None,
         }
+    }
+
+    /// The item that `path` names from `home`, a single segment first among the items that the body of `root` declares.
+    fn resolve_in(&self, root: Option<ItemRef>, path: &NamePath<'_>, home: ModRef) -> Option<Def> {
+        let declared = match (root, path.segments) {
+            (Some(root), [name]) if !path.absolute => self.body_item(root, self.names.symbols.text(*name)),
+            _ => None,
+        };
+        declared.map(Def::Item).or_else(|| self.paths(home.krate).resolve(path, home))
     }
 
     /// The standard crates, which hold the impls and lang items of primitive types.
@@ -178,39 +238,62 @@ impl<'a> Context<'a> {
         roots.filter(|(_, root)| root.lib && PRIMITIVE_HOLDERS.contains(&root.name.as_str())).map(|(krate, _)| krate as u32).collect()
     }
 
-    fn index_of(&mut self, krate: u32) -> Rc<Index> {
-        let tree = &self.outline.crates[krate as usize];
-        if tree.partial() {
+    fn index_of(&mut self, holder: Holder) -> Rc<Index> {
+        if let Holder::Crate(krate) = holder
+            && self.outline.crates[krate as usize].partial()
+        {
             self.asks.crates.borrow_mut().push(krate);
         }
-        if let Some(found) = self.heads.get(&krate) {
+        if let Some(found) = self.heads.get(&holder) {
+            self.asks.repeat(&found.asked);
             return found.clone();
         }
-        let mut index = Index::default();
-        for at in 0..tree.impls.len() as u32 {
-            let block = ImplRef { krate, index: at };
-            let Ok(header) = self.impl_header(block) else { continue };
-            if header.negative {
-                continue;
-            }
-            let src = &self.impl_file(block).source;
-            let head = if generic_self(src, &header) { None } else { self.syntax_head(src, &header.body, header.self_ty, self.impl_module(block)) };
-            match (header.trait_ref.is_some(), head) {
-                (false, Some(head)) => index.inherent.entry(head).or_default().push(block),
-                (false, None) => {}
-                (true, _) => {
-                    if let Some(of) = self.impl_trait(block) {
-                        index.traits.entry(of).or_default().push((block, head));
-                    }
-                }
-            }
+        if let Holder::Body(root) = holder
+            && self.expansion(root).is_none()
+        {
+            return Rc::default();
         }
+        let blocks = match holder {
+            Holder::Crate(krate) => (0..self.outline.crates[krate as usize].impls.len() as u32).map(|index| ImplRef::Module { krate, index }).collect(),
+            Holder::Body(root) => self.body_impls(root),
+        };
+        let mark = self.asks.mark();
+        let mut index = Index::default();
+        for block in blocks {
+            self.index_block(&mut index, block);
+        }
+        index.asked = self.asks.since(mark);
         let index = Rc::new(index);
-        self.heads.insert(krate, index.clone());
+        self.heads.insert(holder, index.clone());
         index
     }
 
-    fn syntax_head(&self, src: &Source, arena: &Body, ty: syntax::TyId, home: ModRef) -> Option<Head> {
+    fn body_impls(&self, root: ItemRef) -> Vec<ImplRef> {
+        let Some(found) = self.expansion(root) else { return Vec::new() };
+        let items = found.file.items.items.iter().enumerate();
+        items.filter(|(_, item)| item.kind == ItemKind::Impl && item.parent.is_none()).map(|(at, _)| ImplRef::Body(root.inner(at as u32))).collect()
+    }
+
+    fn index_block(&mut self, index: &mut Index, block: ImplRef) {
+        let Ok(header) = self.impl_header(block) else { return };
+        if header.negative {
+            return;
+        }
+        let src = &self.impl_file(block).source;
+        let Ok(home) = self.impl_module(block) else { return };
+        let head = if generic_self(src, &header) { None } else { self.syntax_head(src, &header.body, header.self_ty, (home, block.root())) };
+        match (header.trait_ref.is_some(), head) {
+            (false, Some(head)) => index.inherent.entry(head).or_default().push(block),
+            (false, None) => {}
+            (true, _) => {
+                if let Some(of) = self.impl_trait(block) {
+                    index.traits.entry(of).or_default().push((block, head));
+                }
+            }
+        }
+    }
+
+    fn syntax_head(&mut self, src: &Source, arena: &Body, ty: syntax::TyId, home: (ModRef, Option<ItemRef>)) -> Option<Head> {
         Some(match *arena.ty(ty) {
             syntax::Ty::Paren(inner) => return self.syntax_head(src, arena, inner, home),
             syntax::Ty::Ref { mutable, .. } => Head::Ref(if mutable { Mut::Mut } else { Mut::Not }),
@@ -224,11 +307,16 @@ impl<'a> Context<'a> {
         })
     }
 
-    fn path_head(&self, src: &Source, arena: &Body, path: syntax::PathId, home: ModRef) -> Option<Head> {
+    fn path_head(&mut self, src: &Source, arena: &Body, path: syntax::PathId, (home, root): (ModRef, Option<ItemRef>)) -> Option<Head> {
         let (segments, absolute, dollar) = segments(&self.names.symbols, src, arena, path);
-        match self.paths(home.krate).resolve(&NamePath { segments: &segments, absolute, dollar }, home)? {
+        match self.resolve_in(root, &NamePath { segments: &segments, absolute, dollar }, home)? {
             Def::Primitive(primitive) => Some(Head::Prim(primitive)),
             Def::Item(item) if matches!(self.item(item).1.kind, ItemKind::Struct | ItemKind::Enum | ItemKind::Union) => Some(Head::Adt(item)),
+            Def::Item(item) if self.item(item).1.kind == ItemKind::Type => {
+                let (_, arena, ty) = self.alias_parts(item).ok()?;
+                let home = self.module_of(item).ok()?;
+                self.syntax_head(self.item(item).0, &arena, ty, (home, item.declaring_body()))
+            }
             _ => None,
         }
     }

@@ -23,6 +23,8 @@ pub struct Frame<'a> {
     pub block: Option<ImplRef>,
     /// The function or type whose header the frame reads, whose bounds name the traits of its type parameters.
     pub item: Option<ItemRef>,
+    /// The function whose body declares the items that the frame's names may refer to.
+    pub root: Option<ItemRef>,
 }
 
 /// The names of the type parameters of `params` in `src`, each paired with its argument in `args`.
@@ -58,8 +60,18 @@ impl Header {
 /// The bounds that a header puts on its type parameter `name`: those on the parameter, then those of the where predicates on it.
 pub(super) fn named_bounds(arena: &Body, src: &Source, (generics, predicates): (&[Generic], &[Predicate]), name: &str) -> Vec<u32> {
     let declared = generics.iter().filter(|generic| src.text(generic.name) == name).flat_map(|generic| arena.list(generic.bounds).iter().copied());
-    let named = predicates.iter().filter(|predicate| predicate.ty.is_some_and(|ty| names_param(arena, src, ty, name)));
-    declared.chain(named.flat_map(|predicate| arena.list(predicate.bounds).iter().copied())).collect()
+    declared.chain(predicate_bounds(arena, src, predicates, name)).collect()
+}
+
+/// The bounds on the one generic parameter `generic`: its own, then the where-clause bounds on its name.
+pub(super) fn generic_bounds(arena: &Body, src: &Source, predicates: &[Predicate], generic: &Generic) -> Vec<u32> {
+    let declared = arena.list(generic.bounds).iter().copied();
+    declared.chain(predicate_bounds(arena, src, predicates, src.text(generic.name))).collect()
+}
+
+fn predicate_bounds<'b>(arena: &'b Body, src: &'b Source, predicates: &'b [Predicate], name: &'b str) -> impl Iterator<Item = u32> + 'b {
+    let named = predicates.iter().filter(move |predicate| predicate.ty.is_some_and(|ty| names_param(arena, src, ty, name)));
+    named.flat_map(|predicate| arena.list(predicate.bounds).iter().copied())
 }
 
 fn names_param(arena: &Body, src: &Source, ty: TyId, name: &str) -> bool {
@@ -76,7 +88,7 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn item_frame(&mut self, item: ItemRef, (params, args): (&[Generic], &[Ty]), (self_ty, bounds): (Option<Ty>, Option<ItemRef>)) -> Result<Frame<'a>> {
         let file = self.cx.file(item);
         let generics = named_args(&file.source, params, args);
-        Ok(Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty, block: None, item: bounds })
+        Ok(Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty, block: None, item: bounds, root: item.declaring_body() })
     }
 
     /// The frame of function `item` at `substs`: the type parameters of its impl, then its own.
@@ -87,7 +99,7 @@ impl<'a> Infer<'_, 'a> {
         let (mut generics, self_ty, rest) = self.parent_frame(item, substs)?;
         generics.extend(type_params(&sig.generics).map(|generic| file.source.text(generic.name)).zip(rest.iter().copied()));
         let block = self.cx.owner_impl(item);
-        Ok(Frame { src: &file.source, home, generics, self_ty, block, item: Some(item) })
+        Ok(Frame { src: &file.source, home, generics, self_ty, block, item: Some(item), root: item.declaring_body() })
     }
 
     fn parent_frame<'s>(&mut self, item: ItemRef, substs: &'s [Ty]) -> Result<(Vec<(&'a str, Ty)>, Option<Ty>, &'s [Ty])> {
@@ -122,7 +134,7 @@ impl<'a> Infer<'_, 'a> {
         let header = self.cx.impl_header(block)?;
         let file = self.cx.impl_file(block);
         let generics: Vec<(&'a str, Ty)> = type_params(&header.generics).map(|generic| file.source.text(generic.name)).zip(args.iter().copied()).collect();
-        let frame = Frame { src: &file.source, home: self.cx.impl_module(block), generics: generics.clone(), self_ty: None, block: Some(block), item: None };
+        let frame = Frame { src: &file.source, home: self.cx.impl_module(block)?, generics: generics.clone(), self_ty: None, block: Some(block), item: None, root: block.root() };
         let self_ty = self.with_frame(frame, |infer| infer.lower_ty(&header.body, header.self_ty))?;
         Ok((generics, self_ty))
     }
@@ -167,8 +179,8 @@ impl<'a> Infer<'_, 'a> {
 
     /// Reads names through `frame` from now on, and returns the frame it replaces.
     pub fn swap_frame(&mut self, frame: Frame<'a>) -> Frame<'a> {
-        let old = Frame { src: self.src, home: self.home, generics: std::mem::take(&mut self.generics), self_ty: self.self_ty, block: self.block, item: self.frame_item };
-        (self.src, self.home, self.generics, self.self_ty, self.block, self.frame_item) = (frame.src, frame.home, frame.generics, frame.self_ty, frame.block, frame.item);
+        let old = Frame { src: self.src, home: self.home, generics: std::mem::take(&mut self.generics), self_ty: self.self_ty, block: self.block, item: self.frame_item, root: self.root };
+        (self.src, self.home, self.generics, self.self_ty, self.block, self.frame_item, self.root) = (frame.src, frame.home, frame.generics, frame.self_ty, frame.block, frame.item, frame.root);
         old
     }
 
@@ -176,7 +188,11 @@ impl<'a> Infer<'_, 'a> {
     pub fn fn_types(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(Vec<Ty>, Ty)> {
         let sig = self.cx.signature(item)?;
         let frame = self.frame(item, substs)?;
-        self.with_frame(frame, |infer| infer.sig_types(&sig))
+        let types = self.with_frame(frame, |infer| infer.sig_types(&sig))?;
+        if sig.opaque && self.instance.as_ref().is_none_or(|(own, _)| *own != item) {
+            self.opaque_ret(item, substs, types.1)?;
+        }
+        Ok(types)
     }
 
     /// The parameter types of `sig`, its receiver first, and its return type.

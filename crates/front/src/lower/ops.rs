@@ -25,8 +25,8 @@ const WIDE_ALIGN: u8 = 3;
 pub(super) const WIDE: Repr = Repr::Mem { size: WIDE_SIZE, align: WIDE_ALIGN };
 
 impl Lower<'_, '_> {
-    pub(super) fn num(&self, ty: Ty) -> Result<Num> {
-        let machine = super::machine(&self.cx.types, ty);
+    pub(super) fn num(&mut self, ty: Ty) -> Result<Num> {
+        let machine = super::machine(self.cx, ty)?;
         Ok(match (self.cx.types.kind(ty), machine) {
             (Kind::Prim(Primitive::Bool), _) => Num::Bool,
             (Kind::Prim(Primitive::F32 | Primitive::F64), Some(ty)) => Num::Float(ty),
@@ -39,25 +39,23 @@ impl Lower<'_, '_> {
 
     pub(super) fn lit(&mut self, expr: ExprId, lit: Lit, at: u32) -> Result<Value> {
         let text = self.src.text(at);
-        let ty = super::machine(&self.cx.types, self.ty_of(expr)).unwrap_or(Type::I8);
+        let ty = super::machine(self.cx, self.ty_of(expr))?.unwrap_or(Type::I8);
         match lit {
             Lit::Bool(value) => Ok(self.ins().iconst(Type::I8, i64::from(value))),
             Lit::Int => Ok(self.int_const(ty, parse_int(text)?.0)),
             Lit::Float => self.float_const(ty, parse_float(text)?),
             Lit::Char => Ok(self.ins().iconst(Type::I32, i64::from(u32::from(char_value(text)?)))),
             Lit::Byte => Ok(self.ins().iconst(Type::I8, i64::from(char_value(text)? as u8))),
-            Lit::Str => {
-                let bytes = string_bytes(text)?;
-                let address = self.slots.data(&bytes);
-                let data = self.ins().iconst(Type::I64, address);
-                Ok(self.wide_pointer(data, bytes.len() as i64))
-            }
-            Lit::ByteStr => {
-                let address = self.slots.data(&string_bytes(text)?);
-                Ok(self.ins().iconst(Type::I64, address))
-            }
+            Lit::Str | Lit::ByteStr => self.string_lit(lit == Lit::Str, text),
             other => bail!("cannot lower literal {other:?} yet"),
         }
+    }
+
+    fn string_lit(&mut self, wide: bool, text: &str) -> Result<Value> {
+        let bytes = string_bytes(text)?;
+        let address = self.slots.data(&bytes);
+        let data = self.ins().iconst(Type::I64, address);
+        Ok(if wide { self.wide_pointer(data, bytes.len() as i64) } else { data })
     }
 
     /// A new wide pointer to `len` items at the constant address `data`, as the address of its two words.
@@ -287,7 +285,8 @@ impl Lower<'_, '_> {
     fn logical(&mut self, expr: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<Option<Value>> {
         let Some(left) = self.expr(lhs)? else { return Ok(None) };
         let (right_block, join) = (self.b.create_block(), self.b.create_block());
-        let result = self.b.append_block_param(join, super::machine(&self.cx.types, self.ty_of(expr)).unwrap_or(Type::I8));
+        let machine = super::machine(self.cx, self.ty_of(expr))?.unwrap_or(Type::I8);
+        let result = self.b.append_block_param(join, machine);
         let short = self.ins().iconst(Type::I8, i64::from(op == BinOp::Or));
         match op {
             BinOp::Or => self.brif(left, (join, &[short]), (right_block, &[])),
@@ -324,12 +323,16 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn cast(&mut self, expr: ExprId, inner: ExprId) -> Result<Option<Value>> {
-        if self.is_wide(self.ty_of(expr)) || self.typed.coercions.contains_key(&inner) {
+        if self.is_wide(self.ty_of(expr))? || self.typed.coercions.contains_key(&inner) {
             return self.expr(inner);
         }
         let to = self.num(self.ty_of(expr))?;
         let Some((value, from)) = self.cast_source(inner)? else { return Ok(None) };
-        Ok(Some(match (from, to) {
+        self.convert(value, from, to).map(Some)
+    }
+
+    fn convert(&mut self, value: Value, from: Num, to: Num) -> Result<Value> {
+        Ok(match (from, to) {
             (Num::Int { ty: a, signed }, Num::Int { ty: b, .. }) => self.resize(value, (a, signed), b),
             (Num::Bool, Num::Int { ty: b, .. }) => self.resize(value, (Type::I8, false), b),
             (Num::Int { signed, ty: a }, Num::Float(b)) => {
@@ -342,7 +345,7 @@ impl Lower<'_, '_> {
             (Num::Float(Type::F32), Num::Float(b)) => self.ins().fpromote(b, value),
             (Num::Float(_), Num::Float(b)) => self.ins().fdemote(b, value),
             _ => bail!("cannot lower this cast yet"),
-        }))
+        })
     }
 
     fn cast_source(&mut self, inner: ExprId) -> Result<Option<(Value, Num)>> {
@@ -351,7 +354,7 @@ impl Lower<'_, '_> {
             let place = self.place_or_temp(inner)?;
             return self.discriminant(place, source).map(Some);
         }
-        if self.is_wide(source) {
+        if self.is_wide(source)? {
             let Some(pair) = self.expr(inner)? else { return Ok(None) };
             return Ok(Some((self.ins().load(Type::I64, pair, 0), Num::Int { ty: Type::I64, signed: false })));
         }
@@ -360,16 +363,11 @@ impl Lower<'_, '_> {
     }
 
     /// Whether `ty` is a pointer that carries a length after its address.
-    fn is_wide(&self, ty: Ty) -> bool {
-        match self.cx.types.kind(ty) {
-            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => self.is_unsized(*pointee),
-            _ => false,
+    fn is_wide(&mut self, ty: Ty) -> Result<bool> {
+        match self.cx.types.kind(ty).clone() {
+            Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => self.cx.is_unsized(pointee),
+            _ => Ok(false),
         }
-    }
-
-    /// Whether `ty` is a slice or `str`, which a pointer reaches through a wide pointer.
-    pub(super) fn is_unsized(&self, ty: Ty) -> bool {
-        self.cx.types.kind(ty).is_unsized()
     }
 
     pub(super) fn resize(&mut self, value: Value, (from, signed): (Type, bool), to: Type) -> Value {

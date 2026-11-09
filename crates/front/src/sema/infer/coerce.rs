@@ -34,7 +34,7 @@ impl Infer<'_, '_> {
                 }
                 Ok(unsize)
             }
-            (Kind::Adt(_, from), Kind::Adt(_, to)) if self.cx.boxed(found).is_some() && self.cx.boxed(expected).is_some() => self.unsize_box(&from, &to),
+            (Kind::Adt(a, from), Kind::Adt(b, to)) if a == b && from != to && self.coerces(found, expected)? => self.unsize_args(&from, &to),
             (Kind::FnDef(item, substs), Kind::FnPtr(params, ret)) => {
                 let have = self.fn_types(item, &substs)?;
                 self.unify_fn(have, (params, ret))?;
@@ -45,12 +45,25 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn unsize_box(&mut self, from: &[Ty], to: &[Ty]) -> Result<Option<Coercion>> {
-        let unsize = self.unsize_pointee(from[0], to[0])?;
-        if unsize.is_some() {
-            from[1..].iter().zip(&to[1..]).try_for_each(|(&a, &b)| self.unify(a, b))?;
+    fn coerces(&mut self, found: Ty, expected: Ty) -> Result<bool> {
+        let Some(of) = self.cx.lang_item("coerce_unsized") else { return Ok(false) };
+        self.may_implement(of, found, &[expected])
+    }
+
+    fn unsize_args(&mut self, from: &[Ty], to: &[Ty]) -> Result<Option<Coercion>> {
+        let Some((at, unsize)) = self.unsized_arg(from, to)? else { return Ok(None) };
+        let rest = from.iter().zip(to).enumerate().filter(|(index, _)| *index != at);
+        rest.map(|(_, pair)| pair).try_for_each(|(&a, &b)| self.unify(a, b))?;
+        Ok(Some(unsize))
+    }
+
+    fn unsized_arg(&mut self, from: &[Ty], to: &[Ty]) -> Result<Option<(usize, Coercion)>> {
+        for (at, (&a, &b)) in from.iter().zip(to).enumerate() {
+            if let Some(unsize) = self.unsize_pointee(a, b)? {
+                return Ok(Some((at, unsize)));
+            }
         }
-        Ok(unsize)
+        Ok(None)
     }
 
     fn reify_closure(&mut self, found: Ty, (params, ret): (Vec<Ty>, Ty)) -> Result<Option<Coercion>> {

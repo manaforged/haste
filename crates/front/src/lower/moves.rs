@@ -46,7 +46,12 @@ impl Lower<'_, '_> {
     fn is_place(&self, expr: ExprId) -> bool {
         match *self.body.expr(expr) {
             Expr::Paren(inner) => self.is_place(inner),
-            Expr::Path(_) | Expr::Field(..) | Expr::TupleField(..) | Expr::Index(..) | Expr::Unary(UnOp::Deref, _) => true,
+            Expr::Path(_) => match self.typed.res.get(&expr) {
+                Some(Res::Local(_)) => true,
+                Some(Res::Fn(item, _)) => super::is_static(self.cx, *item),
+                _ => false,
+            },
+            Expr::Field(..) | Expr::TupleField(..) | Expr::Index(..) | Expr::Unary(UnOp::Deref, _) => true,
             _ => false,
         }
     }
@@ -69,12 +74,20 @@ impl Lower<'_, '_> {
                 _ => {}
             }
         }
+        self.binding_paths(&mut found)?;
+        Ok(found)
+    }
+
+    fn binding_paths(&mut self, found: &mut FxHashMap<Root, Vec<MovePath>>) -> Result<()> {
         for stmt in self.body.stmts.clone() {
             if let Stmt::Let { pat, init: Some(init), .. } = stmt {
-                self.pattern_paths(pat, self.scrutinee_path(init), &mut found)?;
+                self.pattern_paths(pat, self.scrutinee_path(init), found)?;
             }
         }
-        Ok(found)
+        for (&local, &pat) in &self.typed.unpacks.clone() {
+            self.pattern_paths(pat, Some((Root::Local(local), Vec::new())), found)?;
+        }
+        Ok(())
     }
 
     fn add_path(&self, found: &mut FxHashMap<Root, Vec<MovePath>>, path: Option<(Root, MovePath)>) {

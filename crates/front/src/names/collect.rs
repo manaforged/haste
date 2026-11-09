@@ -83,7 +83,11 @@ pub fn collect_module(tree: &Tree, index: usize, files: &[(u32, Option<u32>)], c
     pending
 }
 
-fn pending_import(file: &crate::outline::tree::File, (index, import): (u32, u32), module: usize, symbols: &Symbols) -> Pending {
+/// An import's path, whether it starts at the crate root, the `$crate` it starts from, and the name it binds, or none for a glob.
+pub type ImportParts = (Box<[Sym]>, bool, Option<u32>, Option<Sym>);
+
+/// The path and bound name of import `import` of `file`.
+pub fn import_parts(file: &crate::outline::tree::File, import: u32, symbols: &Symbols) -> ImportParts {
     let entry = &file.items.imports[import as usize];
     let src = &file.source;
     let segments: Box<[Sym]> = entry.path.iter().map(|at| symbols.intern(plain(src.text(*at)))).collect();
@@ -95,8 +99,13 @@ fn pending_import(file: &crate::outline::tree::File, (index, import): (u32, u32)
         Leaf::Underscore => Some(UNDERSCORE),
         Leaf::Name(alias) => alias.map(|token| symbols.intern(plain(src.text(token)))).or(named),
     };
-    let vis = file.items.items[entry.item as usize].vis;
-    Pending { module: module as u32, file: index, import, segments, absolute: entry.absolute, dollar, name, vis, stamp: None, active: false }
+    (segments, entry.absolute, dollar, name)
+}
+
+fn pending_import(file: &crate::outline::tree::File, (index, import): (u32, u32), module: usize, symbols: &Symbols) -> Pending {
+    let (segments, absolute, dollar, name) = import_parts(file, import, symbols);
+    let vis = file.items.items[file.items.imports[import as usize].item as usize].vis;
+    Pending { module: module as u32, file: index, import, segments, absolute, dollar, name, vis, stamp: None, active: false }
 }
 
 fn items_in(tree: &Tree, files: &[(u32, Option<u32>)]) -> Vec<(u32, u32)> {

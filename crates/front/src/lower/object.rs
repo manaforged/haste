@@ -27,7 +27,11 @@ impl Lower<'_, '_> {
     /// Lowers a trait object method: calls slot `slot` of the receiver's vtable with the receiver's data pointer and the other arguments.
     pub(super) fn virtual_call(&mut self, slot: u32) -> Result<()> {
         let Some(&receiver) = self.typed.params.first() else { bail!("a trait object method with no receiver") };
-        let Some(wide) = self.locals[receiver as usize] else { bail!("a trait object receiver with no place") };
+        let Some(wide) = self.locals[receiver as usize] else {
+            self.ins().trap();
+            self.close();
+            return Ok(());
+        };
         let pointer = self.address(wide);
         let data = self.ins().load(Type::I64, pointer, 0);
         let vtable = self.ins().load(Type::I64, pointer, 8);

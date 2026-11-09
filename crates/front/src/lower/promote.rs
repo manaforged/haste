@@ -1,9 +1,11 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use haste_codegen::{Type, Value};
 
 use crate::body::{Expr, ExprId, UnOp};
+use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::infer::Res;
+use crate::sema::ty::Ty;
 
 use super::place::{Base, Place};
 use super::{Lower, repr};
@@ -40,5 +42,26 @@ impl Lower<'_, '_> {
         self.jump(done, &[]);
         self.enter(done);
         Ok(Some(address))
+    }
+
+    /// The place of the static `item` at `substs`, of type `ty`: its cell, which the image fills before the program runs.
+    pub fn static_place(&mut self, (item, substs): (ItemRef, &[Ty]), ty: Ty) -> Result<Place> {
+        let Some(&index) = self.reached.index.get(&(item, substs.to_vec())) else { bail!("static `{}` was not reached", self.cx.name(item)) };
+        let size = self.cx.layout(ty)?.size.bytes() as u32;
+        let cell = self.slots.cell(index, size);
+        let address = self.ins().iconst(Type::I64, cell);
+        Ok(Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? })
+    }
+
+    /// Writes `value`, the value of the static that this function initializes, into the static's cell, and returns.
+    pub fn fill_static(&mut self, value: Option<Value>) -> Result<()> {
+        let ((item, substs), ty) = (self.reached.list[self.index].0.clone(), self.typed.ret.unwrap_or(Ty(u32::MAX)));
+        if self.open {
+            let place = self.static_place((item, &substs), ty)?;
+            if let Some(value) = value {
+                self.write(place, value);
+            }
+        }
+        self.finish(None)
     }
 }

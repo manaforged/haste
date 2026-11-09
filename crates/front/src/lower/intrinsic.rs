@@ -51,13 +51,18 @@ impl Lower<'_, '_> {
         let Num::Int { ty: machine, signed } = self.num(ty)? else { bail!("{op:?} with overflow on a non-integer") };
         let (result, ok) = self.overflowing(op, (machine, signed), x, y)?;
         let overflowed = self.ins().icmp_imm(IntCC::Equal, ok, 0);
+        self.flagged(ty, result, overflowed)
+    }
+
+    /// The address of a `(ty, bool)` pair in a new frame slot that holds `value` and `flag`.
+    pub(super) fn flagged(&mut self, ty: Ty, value: Value, flag: Value) -> Result<Value> {
         let bool_ty = self.cx.types.prim(Primitive::Bool);
         let tuple = self.cx.types.intern(Kind::Tuple(vec![ty, bool_ty]));
         let tuple_repr = repr(self.cx, tuple)?;
-        let Some(slot) = self.slot(tuple_repr) else { bail!("an overflow pair takes no bytes") };
+        let Some(slot) = self.slot(tuple_repr) else { bail!("a flagged pair takes no bytes") };
         let (first, second) = (self.field_offset(tuple, 0)?, self.field_offset(tuple, 1)?);
-        self.ins().stack_store(result, slot, first);
-        self.ins().stack_store(overflowed, slot, second);
+        self.ins().stack_store(value, slot, first);
+        self.ins().stack_store(flag, slot, second);
         Ok(self.ins().stack_addr(Type::I64, slot, 0))
     }
 
@@ -79,7 +84,8 @@ impl Lower<'_, '_> {
 
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&pointee), Some(&pointer)) = (substs.first(), args.first()) else { bail!("ptr_metadata takes a pointer") };
-        match self.cx.types.kind(pointee) {
+        let tail = self.cx.tail(pointee)?;
+        match self.cx.types.kind(tail) {
             Kind::Dyn(..) => Ok(Some(self.ins().iadd_imm(pointer, 8))),
             kind if kind.is_unsized() => Ok(Some(self.ins().load(Type::I64, pointer, 8))),
             _ => Ok(None),
