@@ -176,7 +176,7 @@ impl Infer<'_, '_> {
 
     fn builtin_alias(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
         let kind = self.cx.types.kind(self.resolve(ty)).clone();
-        if let Kind::Dyn(_, args, members) = &kind {
+        if let Kind::Dyn(_, args, members, _) = &kind {
             let member = self.cx.trait_member(of, name);
             return Ok(super::super::ty::object_parts(args, members).1.find(|(bound, _)| Some(*bound) == member).map(|(_, found)| found));
         }

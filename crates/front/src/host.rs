@@ -1,4 +1,4 @@
-//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
+//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hint as a no-op, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
 
 use std::alloc::Layout;
 use std::ffi::CString;
@@ -10,7 +10,7 @@ pub fn symbol(name: &str) -> Option<usize> {
         "__rust_alloc_zeroed" => alloc_zeroed as *const () as usize,
         "__rust_dealloc" => dealloc as *const () as usize,
         "__rust_realloc" => realloc as *const () as usize,
-        "__rust_no_alloc_shim_is_unstable_v2" => nothing as *const () as usize,
+        "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" => nothing as *const () as usize,
         "__dso_handle" => &DSO_HANDLE as *const u8 as usize,
         "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => abort as *const () as usize,
         _ => return dynamic(name),

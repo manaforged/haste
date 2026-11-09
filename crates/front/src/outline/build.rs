@@ -11,6 +11,8 @@ use super::{derive, mbe, rules, scan};
 
 const DEPTH: usize = 128;
 const BUILTIN: [&str; 6] = ["include", "global_asm", "compile_error", "concat", "env", "asm"];
+/// The dependencies, in order of preference, whose `$crate` names core's traits in a derived impl: core, the shim that standard crates depend on in its place, and std.
+const CORE_HOLDERS: [&str; 3] = ["core", "rustc_std_workspace_core", "std"];
 
 /// What a macro lookup in a crate's exports found.
 enum Found {
@@ -107,8 +109,8 @@ impl Loader<'_> {
         if wanted.is_empty() {
             return Ok(());
         }
-        let named = |name: &str| self.deps.iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
-        let holder = named("core").or_else(|| named("std")).unwrap_or(self.krate) as u32;
+        let named = |name: &&str| self.deps.iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
+        let holder = CORE_HOLDERS.iter().find_map(named).unwrap_or(self.krate) as u32;
         let expanded = derive::expand(&file.source, item, (&wanted, holder), &|attrs| env.enabled(attrs));
         self.splice(module, expanded, "derive")
     }

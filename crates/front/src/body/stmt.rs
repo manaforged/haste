@@ -36,14 +36,7 @@ impl Cursor<'_> {
             let attrs = self.skip_attrs()?;
             let (stmt, tail) = self.stmt(start)?;
             if let Some(tail) = tail {
-                if self.configured_out(attrs) {
-                    return Ok(self.last_as_tail(stmts));
-                }
-                if let Some((inner, inner_tail)) = self.spliced(tail) {
-                    stmts.extend(inner);
-                    return Ok((stmts, inner_tail));
-                }
-                return Ok((stmts, Some(tail)));
+                return Ok(self.ended(stmts, tail, attrs));
             }
             if let Stmt::Expr(expr, semi) = stmt
                 && !self.configured_out(attrs)
@@ -58,6 +51,19 @@ impl Cursor<'_> {
             self.push_stmt(stmt, attrs, &mut stmts);
         }
         Ok((stmts, None))
+    }
+
+    /// The statements and tail of a block whose last expression is `tail` with attributes `attrs`: the last statement without a semicolon when `tail` is configured out or a macro that expands to no tail.
+    fn ended(&self, mut stmts: Vec<u32>, tail: ExprId, attrs: Option<(u32, u32)>) -> (Vec<u32>, Option<ExprId>) {
+        if self.configured_out(attrs) {
+            return self.last_as_tail(stmts);
+        }
+        let Some((inner, inner_tail)) = self.spliced(tail) else { return (stmts, Some(tail)) };
+        stmts.extend(inner);
+        match inner_tail {
+            Some(inner_tail) => (stmts, Some(inner_tail)),
+            None => self.last_as_tail(stmts),
+        }
     }
 
     /// The statements and tail of `expr` when it is the block a macro call in statement position expanded to, whose statements belong to the enclosing block as in rustc.

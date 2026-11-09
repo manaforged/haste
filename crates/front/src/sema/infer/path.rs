@@ -160,8 +160,13 @@ impl<'a> Infer<'_, 'a> {
         self.path_value(body, path)
     }
 
-    /// The function or constant that the value path `path` of `body` names: an item, or an associated item of a type or trait.
+    /// The function or constant that the value path `path` of `body` names: an item, or an associated item of a type or trait, which a qualified path names first.
     pub(super) fn path_value(&mut self, body: &Body, path: PathId) -> Result<(Ty, Res)> {
+        if body.path(path).qself.is_some()
+            && let Some(found) = self.assoc_value(body, path)?
+        {
+            return Ok(found);
+        }
         match self.value_item(body, path) {
             Ok(def) => self.item_value(body, path, def),
             Err(error) => self.assoc_value(body, path)?.ok_or(error),
@@ -335,14 +340,18 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn object_ty(&mut self, arena: &Body, bounds: syntax::List) -> Result<Kind> {
-        let mut principal = None;
+        let (mut principal, mut autos) = (None, Vec::new());
         for &bound in arena.list(bounds) {
             let syntax::Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else { continue };
             let Some(of) = self.trait_named(arena, path, self.home) else { bail!("a trait object bound that names no trait") };
-            if !self.cx.is_auto_trait(of) && principal.replace((of, path)).is_some() {
+            if self.cx.is_auto_trait(of) {
+                autos.push(of);
+            } else if principal.replace((of, path)).is_some() {
                 bail!("a trait object with two traits that are not auto traits");
             }
         }
+        autos.sort_by_key(|item| (item.krate, item.file, item.item));
+        autos.dedup();
         let Some((of, path)) = principal else { bail!("a trait object of auto traits only") };
         let count = arena.list(arena.path(path).segments).len();
         let given = self.segment_args(arena, path, count)?;
@@ -359,7 +368,7 @@ impl<'a> Infer<'_, 'a> {
         }
         bound.sort_by_key(|(member, _)| (member.krate, member.file, member.item));
         let (members, tys): (Vec<ItemRef>, Vec<Ty>) = bound.into_iter().unzip();
-        Ok(Kind::Dyn(of, given.into_iter().chain(tys).collect(), members))
+        Ok(Kind::Dyn(of, given.into_iter().chain(tys).collect(), members, autos))
     }
 
     /// The type that the associated type `name` of impl `block` is, read in the current frame over the alias's own source, when the impl has one.

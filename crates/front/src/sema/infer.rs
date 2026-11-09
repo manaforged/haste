@@ -131,9 +131,9 @@ impl Typed {
         };
         let coerced = self.coercions.values().flat_map(|coercion| -> Box<dyn Iterator<Item = &Res>> {
             match coercion {
-                Coercion::Vtable(vtable) => Box::new(vtable.drop.iter().chain(vtable.methods.iter().flatten())),
+                Coercion::Vtable(vtable) => Box::new(vtable.calls().into_iter()),
                 Coercion::Reify(res) => Box::new(std::iter::once(res)),
-                Coercion::Len(_) => Box::new(std::iter::empty()),
+                Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => Box::new(std::iter::empty()),
                 Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
             }
         });
@@ -376,7 +376,7 @@ impl Infer<'_, '_> {
             (Kind::Array(x, m), Kind::Array(y, n)) => vec![(*x, *y), (*m, *n)],
             (Kind::Slice(x), Kind::Slice(y)) => vec![(*x, *y)],
             (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => vec![(*x, *y)],
-            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, _), Kind::Dyn(j, y, _)) if i == j && x.len() == y.len() && dyn_members(a) == dyn_members(b) => x.iter().copied().zip(y.iter().copied()).collect(),
+            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, ..), Kind::Dyn(j, y, ..)) if i == j && x.len() == y.len() && dyn_members(a) == dyn_members(b) => x.iter().copied().zip(y.iter().copied()).collect(),
             (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).chain([(*r, *s)]).collect(),
             _ => bail!("mismatch"),
         };
@@ -619,10 +619,10 @@ pub fn tail_field(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Op
     detached(cx, item, |infer| infer.adt_tail_field(item, args))
 }
 
-fn dyn_members(kind: &Kind) -> &[ItemRef] {
+fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
     match kind {
-        Kind::Dyn(_, _, members) => members,
-        _ => &[],
+        Kind::Dyn(_, _, members, autos) => (members, autos),
+        _ => (&[], &[]),
     }
 }
 

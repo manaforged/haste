@@ -94,7 +94,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The traits in `stack` with every supertrait they imply.
-    pub(super) fn implied_traits(&mut self, mut stack: Vec<ItemRef>) -> Result<Vec<ItemRef>> {
+    pub(crate) fn implied_traits(&mut self, mut stack: Vec<ItemRef>) -> Result<Vec<ItemRef>> {
         let mut found = Vec::new();
         while let Some(of) = stack.pop() {
             if !found.contains(&of) {
@@ -232,9 +232,12 @@ impl<'a> Infer<'_, 'a> {
 
     /// Whether the trait object `ty` implements trait `of` at `args`, by being an object of it, or none when `ty` is not a trait object.
     pub(super) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
-        let Kind::Dyn(object, parts, members) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
+        let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
         let given = super::super::ty::object_parts(&parts, &members).0;
-        if object != of || given.len() != args.len() {
+        if object != of {
+            return Some(args.is_empty() && self.implied_traits(vec![object]).is_ok_and(|traits| traits.contains(&of)));
+        }
+        if given.len() != args.len() {
             return Some(false);
         }
         let held = self.trial(|infer| Ok(given.iter().zip(args).all(|(found, wanted)| infer.unify(*found, *wanted).is_ok()).then_some(())));

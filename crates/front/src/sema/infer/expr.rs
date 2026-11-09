@@ -176,7 +176,10 @@ impl Infer<'_, '_> {
 
     fn right_operand(&mut self, expr: ExprId, op: BinOp, (left, rhs): (Ty, ExprId)) -> Result<Ty> {
         let shift = matches!(op, BinOp::Shl | BinOp::Shr);
-        let hint = (self.builtin_left(op, left) && !shift).then_some(left);
+        let hint = match (self.builtin_left(op, left) && !shift).then_some(left) {
+            Some(hint) => Some(hint),
+            None => self.unique_right(op, left),
+        };
         let right = self.expr(rhs, hint)?;
         if self.pending(op, (left, right))? {
             let out = if is_compare(op) { self.cx.types.bool() } else { self.fresh(Kind::Var) };
@@ -184,6 +187,20 @@ impl Infer<'_, '_> {
             return Ok(out);
         }
         self.operator_type(expr, op, (left, right))
+    }
+
+    /// The right operand type of comparison `op` when one impl of its trait applies to the ADT `left`, as for `Option<T>`, which rustc learns before it reads the right operand.
+    fn unique_right(&mut self, op: BinOp, left: Ty) -> Option<Ty> {
+        if !is_compare(op) || !matches!(self.cx.types.kind(self.resolve(left)), Kind::Adt(..)) {
+            return None;
+        }
+        let of = operator_trait(op).and_then(|(lang, _)| self.cx.lang_item(lang))?;
+        self.probe(|infer| {
+            let right = infer.fresh(Kind::Var);
+            infer.select(of, left, &[right]).ok().flatten()?;
+            let found = infer.substitute(right);
+            (!infer.has_vars(found)).then_some(found)
+        })
     }
 
     fn builtin_left(&self, op: BinOp, left: Ty) -> bool {

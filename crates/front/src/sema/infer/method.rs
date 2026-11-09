@@ -168,6 +168,7 @@ impl<'a> Infer<'_, 'a> {
 
     fn try_trait(&mut self, candidate: TraitCandidate, adjusted: Ty) -> Result<Option<(ItemRef, Vec<Ty>)>> {
         let self_ty = match (candidate.kind, self.cx.types.kind(adjusted).clone()) {
+            (SelfKind::Value, Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str)) => return Ok(None),
             (SelfKind::Value, _) => adjusted,
             (SelfKind::Ref, Kind::Ref(Mut::Not, inner)) | (SelfKind::RefMut, Kind::Ref(Mut::Mut, inner)) => inner,
             _ => return Ok(None),

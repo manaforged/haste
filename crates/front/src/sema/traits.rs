@@ -36,15 +36,35 @@ impl<'a> Context<'a> {
         self.children(of).find(|member| self.name(*member) == name)
     }
 
-    /// The methods of trait `of` in vtable order: each one that takes `self` and has no type parameters of its own, and none for the rest.
+    /// The methods of trait `of` and then of its supertraits in vtable order: each one that takes `self` and has no type parameters of its own, and none for the rest or for a generic supertrait.
     pub fn vtable_methods(&mut self, of: ItemRef) -> Result<Vec<Option<ItemRef>>> {
+        let traits = super::infer::detached(self, of, |infer| infer.implied_traits(vec![of]))?;
         let mut methods = Vec::new();
-        for member in self.children(of).filter(|member| self.item(*member).1.kind == ItemKind::Fn).collect::<Vec<_>>() {
-            let sig = self.signature(member)?;
-            let callable = sig.receiver.is_some() && super::infer::type_params(&sig.generics).next().is_none();
-            methods.push(callable.then_some(member));
+        for owner in traits {
+            let open = owner != of && self.is_generic_trait(owner)?;
+            for member in self.children(owner).filter(|member| self.item(*member).1.kind == ItemKind::Fn).collect::<Vec<_>>() {
+                let sig = self.signature(member)?;
+                let callable = !open && sig.receiver.is_some() && super::infer::type_params(&sig.generics).next().is_none();
+                methods.push(callable.then_some(member));
+            }
         }
         Ok(methods)
+    }
+
+    /// The supertraits of trait `of` that a trait object of it can become, in vtable order: each one it implies that has no type parameters.
+    pub fn vtable_supers(&mut self, of: ItemRef) -> Result<Vec<ItemRef>> {
+        let traits = super::infer::detached(self, of, |infer| infer.implied_traits(vec![of]))?;
+        let mut supers = Vec::new();
+        for owner in traits.into_iter().filter(|&owner| owner != of) {
+            if !self.is_generic_trait(owner)? {
+                supers.push(owner);
+            }
+        }
+        Ok(supers)
+    }
+
+    fn is_generic_trait(&mut self, of: ItemRef) -> Result<bool> {
+        Ok(super::infer::type_params(&self.trait_generics(of)?.1.params).next().is_some())
     }
 
     /// The traits in scope in module `home`.

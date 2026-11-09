@@ -30,6 +30,7 @@ impl Lower<'_, '_> {
                 Ok(Some(self.wide_pointer(data, table)))
             }
             (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(value, steps.clone()),
+            (Some(&Coercion::Upcast(slot)), Some(value)) => Ok(Some(self.upcast(value, slot))),
             (Some(Coercion::Reify(Res::Fn(item, substs))), _) => {
                 let index = self.reached_index(*item, substs)?;
                 Ok(Some(self.code_of(index)))
@@ -166,8 +167,8 @@ impl Lower<'_, '_> {
             return self.call_value((expr, callee), (item, substs), args);
         }
         let (item, substs) = match self.typed.res.get(&callee).cloned() {
-            Some(Res::Fn(item, substs)) => (item, substs),
             Some(Res::Fn(item, _)) if matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static) => return self.pointer_call(expr, callee, args),
+            Some(Res::Fn(item, substs)) => (item, substs),
             Some(Res::Ctor(_, variant, _)) => return self.ctor_call(expr, variant, args),
             _ => return self.pointer_call(expr, callee, args),
         };

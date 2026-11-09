@@ -235,7 +235,7 @@ impl Infer<'_, '_> {
         let expected = self.ret_sig.filter(|_| own_ret).unwrap_or(expected);
         match self.cx.types.kind(expected).clone() {
             Kind::FnPtr(inputs, output) => Some((inputs, output)),
-            Kind::Dyn(of, parts, members) if self.is_callable_trait(of) => {
+            Kind::Dyn(of, parts, members, _) if self.is_callable_trait(of) => {
                 let (given, mut bound) = super::super::ty::object_parts(&parts, &members);
                 let Kind::Tuple(inputs) = self.cx.types.kind(self.resolve(*given.first()?)).clone() else { return None };
                 let output = bound.next().map_or_else(|| self.cx.types.unit(), |(_, ty)| ty);
@@ -247,7 +247,7 @@ impl Infer<'_, '_> {
 
     /// Infers the call `expr` of the `dyn Fn` or `dyn FnMut` value of type `ty`, recording it as a call of `call` or `call_mut` on the trait object.
     pub(super) fn object_call(&mut self, (expr, found): (ExprId, Ty), ty: Ty, args: List) -> Result<Ty> {
-        let Kind::Dyn(of, parts, members) = self.cx.types.kind(ty).clone() else { bail!("an object call of a type that is not a trait object") };
+        let Kind::Dyn(of, parts, members, _) = self.cx.types.kind(ty).clone() else { bail!("an object call of a type that is not a trait object") };
         let (given, mut bound) = super::super::ty::object_parts(&parts, &members);
         let Some(&tuple) = given.first() else { bail!("a callable trait object with no argument tuple") };
         let ret = bound.next().map_or_else(|| self.cx.types.unit(), |(_, ret)| ret);
@@ -297,16 +297,21 @@ impl Infer<'_, '_> {
         let closure = self.is_closure(arg);
         let hint = hint.or(expectation.filter(|_| closure));
         let found = self.expr(arg, Some(hint.unwrap_or(param)))?;
-        match expectation.filter(|_| !closure) {
-            Some(wanted) if self.coerces_to(found, wanted) => {
-                self.coerce_expr(arg, found, wanted)?;
-                self.unify(param, wanted)?;
-            }
-            _ => self.coerce_expr(arg, found, param)?,
-        }
+        self.coerce_arg((arg, found, closure), param, expectation)?;
         match bound {
             Some(bound) => self.tie_callable(callable, bound),
             None => Ok(()),
+        }
+    }
+
+    fn coerce_arg(&mut self, (arg, found, closure): (ExprId, Ty, bool), param: Ty, expectation: Option<Ty>) -> Result<()> {
+        let reified = expectation.is_some_and(|wanted| matches!(self.cx.types.kind(self.resolve(wanted)), Kind::FnPtr(..)));
+        match expectation.filter(|_| !closure || reified) {
+            Some(wanted) if self.coerces_to(found, wanted) => {
+                self.coerce_expr(arg, found, wanted)?;
+                self.unify(param, wanted)
+            }
+            _ => self.coerce_expr(arg, found, param),
         }
     }
 

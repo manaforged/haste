@@ -6,14 +6,25 @@ use crate::sema::infer::{Res, Vtable};
 use super::{Lower, Word};
 
 impl Lower<'_, '_> {
-    /// The address of the vtable `vtable`: the drop glue, the size, the alignment, then each method's code.
+    /// The address of the vtable `vtable`: the drop glue, the size, the alignment, each method's code, then the address of each supertrait vtable.
     pub(super) fn vtable(&mut self, vtable: &Vtable) -> Result<i64> {
         let layout = self.cx.layout(vtable.ty)?;
         let mut words = vec![self.code_word(vtable.drop.as_ref())?, Word::Int(layout.size.bytes()), Word::Int(layout.align.abi.bytes())];
         for method in &vtable.methods {
             words.push(self.code_word(method.as_ref())?);
         }
+        for inner in &vtable.supers {
+            words.push(Word::Int(self.vtable(inner)? as u64));
+        }
         Ok(self.slots.table(&words))
+    }
+
+    /// The wide pointer `wide` to a trait object as a pointer to the supertrait object whose vtable slot `slot` of its vtable holds.
+    pub(super) fn upcast(&mut self, wide: Value, slot: u32) -> Value {
+        let data = self.ins().load(Type::I64, wide, 0);
+        let table = self.ins().load(Type::I64, wide, 8);
+        let inner = self.ins().load(Type::I64, table, slot as i32 * 8);
+        self.wide(data, inner)
     }
 
     fn code_word(&self, res: Option<&Res>) -> Result<Word> {

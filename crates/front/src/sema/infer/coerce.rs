@@ -17,6 +17,10 @@ pub enum Coercion {
     Reify(Res),
     /// A reference becomes a reference to what dereferencing its pointee reaches: each step names the type it dereferences and, unless the compiler dereferences it, the `Deref::deref` call; then the type reached.
     Deref(Vec<(Ty, Option<Res>)>, Ty),
+    /// A pointer to a trait object becomes a pointer to the same trait object with fewer auto traits, with its value unchanged.
+    Autos,
+    /// A pointer to a trait object becomes a pointer to a trait object of a supertrait, whose vtable this slot of the old one holds.
+    Upcast(u32),
 }
 
 impl Coercion {
@@ -138,6 +142,7 @@ impl Infer<'_, '_> {
     pub(super) fn zonk_coercion(&mut self, coercion: Coercion) -> Result<Coercion> {
         match coercion {
             Coercion::Len(len) => Ok(Coercion::Len(self.zonk(len))),
+            Coercion::Autos | Coercion::Upcast(_) => Ok(coercion),
             Coercion::Vtable(vtable) => self.zonk_vtable(vtable).map(Coercion::Vtable),
             Coercion::Reify(res) => self.zonk_res(res).map(Coercion::Reify),
             Coercion::Deref(steps, to) => {

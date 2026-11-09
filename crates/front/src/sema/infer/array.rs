@@ -7,10 +7,10 @@ use super::super::ty::{Kind, Ty};
 use super::{Infer, Res};
 
 impl Infer<'_, '_> {
-    /// Infers the array expression `[items]`.
+    /// Infers the array expression `[items]`, coercing each item to the element type of an expected array or slice.
     pub fn array_expr(&mut self, items: List, expected: Option<Ty>) -> Result<Ty> {
         let element = match expected.map(|ty| self.cx.types.kind(self.resolve(ty)).clone()) {
-            Some(Kind::Array(element, _)) => element,
+            Some(Kind::Array(element, _) | Kind::Slice(element)) => element,
             _ => self.fresh(Kind::Var),
         };
         let items = self.body.list(items).to_vec();

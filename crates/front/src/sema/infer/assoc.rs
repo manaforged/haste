@@ -45,18 +45,22 @@ impl Infer<'_, '_> {
         if let Some((member, args)) = self.inherent_member(owner, name)? {
             return self.member_value(member, args, given);
         }
-        if let Kind::Dyn(of, args, members) = self.cx.types.kind(owner).clone()
+        if let Kind::Dyn(of, args, members, _) = self.cx.types.kind(owner).clone()
             && self.cx.trait_member(of, name).is_some()
         {
             let args = super::super::ty::object_parts(&args, &members).0.to_vec();
             return self.trait_value(of, (Some(owner), Some(args)), (name, given));
         }
-        for of in self.cx.traits_in_scope(self.home).into_iter().chain(self.body_traits()) {
-            if self.cx.trait_member(of, name).is_some() && self.implements(of, owner)? {
+        let traits: Vec<ItemRef> = self.cx.traits_in_scope(self.home).into_iter().chain(self.body_traits()).filter(|&of| self.cx.trait_member(of, name).is_some()).collect();
+        for &of in &traits {
+            if self.implements(of, owner)? {
                 return self.trait_value(of, (Some(owner), None), (name, given));
             }
         }
-        bail!("no associated item `{name}` on {}", self.show(owner))
+        match traits[..] {
+            [of] if matches!(self.cx.types.kind(self.resolve(owner)), Kind::Var(_)) => self.trait_value(of, (Some(owner), None), (name, given)),
+            _ => bail!("no associated item `{name}` on {}", self.show(owner)),
+        }
     }
 
     fn prefix_trait(&mut self, body: &Body, path: PathId, count: usize) -> Option<ItemRef> {
