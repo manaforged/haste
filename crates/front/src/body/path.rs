@@ -2,6 +2,7 @@ use anyhow::Result;
 use rustc_lexer::TokenKind;
 
 use super::cursor::{Cursor, is_name};
+use crate::outline::source::opens;
 use super::{Args, Bound, GenericArg, Path, PathId, Segment, Ty};
 
 /// Where a path is written, which decides how generic arguments open.
@@ -131,7 +132,7 @@ impl Cursor<'_> {
                     if depth == 0 {
                         return self.assoc_after(at + 1);
                     }
-                } else if matches!(self.kind_at(at), TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace) {
+                } else if opens(self.kind_at(at)) {
                     at = self.src.pair(at);
                 }
                 at += 1;

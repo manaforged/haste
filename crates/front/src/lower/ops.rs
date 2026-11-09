@@ -58,7 +58,6 @@ impl Lower<'_, '_> {
         Ok(if wide { self.wide_pointer(data, bytes.len() as i64) } else { data })
     }
 
-    /// A new wide pointer to `len` items at the constant address `data`, as the address of its two words.
     /// A new 16-byte slot that holds the pointer `data` and the length `len`, as a reference to a slice or `str`.
     pub(super) fn wide_pointer(&mut self, data: Value, len: i64) -> Value {
         let len = self.ins().iconst(Type::I64, len);

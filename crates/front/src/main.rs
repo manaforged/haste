@@ -192,7 +192,7 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let mut ran = 0;
     for (root, item) in cases.iter().enumerate() {
         let closure = reached.closure(root);
-        let failure = closure.iter().find_map(|at| reached.list[*at].1.as_ref().err()).or_else(|| closure.iter().find_map(|at| broken.get(at)));
+        let failure = closure.iter().rev().find_map(|at| reached.list[*at].1.as_ref().err()).or_else(|| closure.iter().rev().find_map(|at| broken.get(at)));
         let name = cx.name(*item);
         match failure {
             Some(error) => failures.entry(error_kind(error)).or_default().push(format!("{name}: {error}")),

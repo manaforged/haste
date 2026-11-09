@@ -4,14 +4,10 @@ use crate::body::{Fragment, fragment_end};
 
 use super::rules::Frag;
 use super::scan;
-use super::source::Source;
+use super::source::{Source, opens};
 
 fn is_name(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Ident | TokenKind::RawIdent)
-}
-
-fn is_open(kind: TokenKind) -> bool {
-    matches!(kind, TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace)
 }
 
 const OPERATORS: [&str; 24] = [
@@ -28,7 +24,7 @@ fn glued(src: &Source, at: u32, operator: &str) -> bool {
 
 /// The end of the token tree that starts at `at`.
 pub(super) fn tree(src: &Source, at: u32) -> u32 {
-    if is_open(src.kind(at)) {
+    if opens(src.kind(at)) {
         return src.pair(at) + 1;
     }
     let operator = OPERATORS.iter().find(|operator| glued(src, at, operator));
@@ -52,7 +48,7 @@ fn is_punct(kind: TokenKind) -> bool {
 }
 
 fn single_eq(src: &Source, at: u32) -> bool {
-    let glued_before = at > 0 && src.joint(at - 1) && is_punct(src.kind(at - 1)) && !is_open(src.kind(at - 1));
+    let glued_before = at > 0 && src.joint(at - 1) && is_punct(src.kind(at - 1)) && !opens(src.kind(at - 1));
     let glued_after = src.joint(at) && matches!(src.kind(at + 1), TokenKind::Eq | TokenKind::Gt);
     src.kind(at) == TokenKind::Eq && !glued_before && !glued_after
 }
@@ -153,7 +149,7 @@ fn after_operand(src: &Source, at: u32) -> Option<(u32, bool)> {
     }
     match kind {
         TokenKind::Literal { .. } | TokenKind::Lifetime { .. } => None,
-        TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => Some((src.pair(at) + 1, true)),
+        kind if opens(kind) => Some((src.pair(at) + 1, true)),
         TokenKind::Question => Some((at + 1, true)),
         TokenKind::Bang if is_open_at(src, at + 1) => Some((src.pair(at + 1) + 1, true)),
         _ => Some((at + 1, false)),
@@ -161,7 +157,7 @@ fn after_operand(src: &Source, at: u32) -> Option<(u32, bool)> {
 }
 
 fn is_open_at(src: &Source, at: u32) -> bool {
-    is_open(src.kind(at))
+    opens(src.kind(at))
 }
 
 fn turbofish(src: &Source, at: u32, end: u32) -> Option<u32> {
@@ -190,7 +186,7 @@ fn before_operand(src: &Source, at: u32, end: u32) -> (u32, bool) {
     }
     match kind {
         TokenKind::Literal { .. } | TokenKind::Lifetime { .. } => (at + 1, true),
-        TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => (src.pair(at) + 1, true),
+        kind if opens(kind) => (src.pair(at) + 1, true),
         TokenKind::Or => (closure_params(src, at, end), false),
         _ => (at + 1, false),
     }
@@ -228,7 +224,7 @@ fn path(src: &Source, mut at: u32, end: u32) -> u32 {
 fn meta(src: &Source, at: u32, end: u32) -> u32 {
     let after = path(src, at, end);
     match src.kind(after) {
-        TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace if after < end => src.pair(after) + 1,
+        kind if opens(kind) && after < end => src.pair(after) + 1,
         TokenKind::Eq if after < end => expr(src, after + 1, end),
         _ => after,
     }

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rustc_lexer::TokenKind;
 
 use super::item::Attr;
-use super::source::Source;
+use super::source::{Source, opens};
 use crate::graph::cfg;
 
 /// The top-level comma-separated ranges of tokens in `from..to`.
@@ -15,7 +15,7 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
                 parts.push((start, at));
                 start = at + 1;
             }
-            TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => at = src.pair(at),
+            kind if opens(kind) => at = src.pair(at),
             _ => {}
         }
         at += 1;

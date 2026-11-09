@@ -141,7 +141,7 @@ impl Image {
     }
 
     fn fill_statics(&self, closure: &[usize]) {
-        for &index in closure.iter().rev().filter(|index| self.statics.contains(index)) {
+        for &index in closure.iter().filter(|index| self.statics.contains(index)) {
             let address = self.table[index].load(Ordering::Acquire);
             // SAFETY: address is code that the encoder wrote for a static's initializer, a native fn() that writes the static's cell.
             let fill: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };

@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::body::{Body, PathId};
 use crate::names::path::Path as NamePath;
-use crate::names::{Def, ItemRef, plain};
+use crate::names::{ItemRef, plain};
 use crate::outline::item::ItemKind;
 
 use super::super::ty::{Kind, Ty};
@@ -62,18 +62,14 @@ impl Infer<'_, '_> {
     fn prefix_trait(&mut self, body: &Body, path: PathId, count: usize) -> Option<ItemRef> {
         let (mut segments, absolute, dollar) = self.segments(body, path);
         segments.truncate(count);
-        match self.cx.paths(self.home.krate).resolve(&NamePath { segments: &segments, absolute, dollar }, self.home)? {
-            Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Trait => Some(item),
-            _ => None,
-        }
+        self.trait_at(&NamePath { segments: &segments, absolute, dollar }, self.home)
     }
 
     fn implements(&mut self, of: ItemRef, ty: Ty) -> Result<bool> {
-        let saved = self.vars.clone();
-        let args = self.fresh_trait_args(of)?;
-        let found = self.may_implement(of, ty, &args)?;
-        self.vars = saved;
-        Ok(found)
+        self.probe(|infer| {
+            let args = infer.fresh_trait_args(of)?;
+            infer.may_implement(of, ty, &args)
+        })
     }
 
     fn fresh_trait_args(&mut self, of: ItemRef) -> Result<Vec<Ty>> {
@@ -83,7 +79,7 @@ impl Infer<'_, '_> {
 
     fn param_value(&mut self, param: &str, (name, given): (&str, Vec<Ty>)) -> Result<Option<(Ty, Res)>> {
         let Some(ty) = self.param_ty(param).filter(|_| param != "Self") else { return Ok(None) };
-        let Some((of, args)) = self.bound_trait((param, ty), name, |infer, of, name| infer.cx.trait_member(of, name).is_some())? else { return Ok(None) };
+        let Some((of, args)) = self.bound_trait((param, ty), name, Self::has_member)? else { return Ok(None) };
         self.trait_value(of, (Some(ty), Some(args)), (name, given)).map(Some)
     }
 

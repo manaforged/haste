@@ -111,13 +111,8 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn trial_unify(&mut self, a: Ty, b: Ty) -> bool {
-        let saved = self.vars.clone();
-        let unified = self.unify(a, b).is_ok();
-        if !unified {
-            self.vars = saved;
-        }
-        unified
+    pub(super) fn trial_unify(&mut self, a: Ty, b: Ty) -> bool {
+        matches!(self.trial(|infer| Ok(infer.unify(a, b).ok())), Ok(Some(())))
     }
 
     fn reify_closure(&mut self, found: Ty, (params, ret): (Vec<Ty>, Ty)) -> Result<Option<Coercion>> {

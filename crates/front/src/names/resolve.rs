@@ -204,6 +204,12 @@ fn paths_of<'a>(names: &'a Names, outline: &'a Outline, krate: usize, demands: &
     }
 }
 
+fn declared(outline: &Outline, krate: usize) -> impl Iterator<Item = ModRef> + '_ {
+    let modules = outline.crates[krate].modules.iter().enumerate();
+    let declared = modules.filter(|(_, module)| matches!(module.state, crate::outline::tree::State::Declared(_)));
+    declared.map(move |(module, _)| ModRef { krate: krate as u32, module: module as u32 })
+}
+
 impl Names {
     /// Empty scopes for every crate of `outline`; `settle` fills them as modules load.
     pub fn new(workspace: &Workspace, outline: &Outline) -> Names {
@@ -230,10 +236,11 @@ impl Names {
             self.preludes(outline, &demands);
             let expanded = self.expand_imported(outline, &demands)?;
             let wanted = self.want(demands.names.take());
+            let crates = demands.crates.take();
             let mut demands = demands.modules.into_inner();
-            for (krate, tree) in outline.crates.iter().enumerate().filter(|(krate, _)| self.crates[*krate].eager) {
-                let declared = tree.modules.iter().enumerate().filter(|(_, module)| matches!(module.state, crate::outline::tree::State::Declared(_)));
-                demands.extend(declared.map(|(module, _)| ModRef { krate: krate as u32, module: module as u32 }));
+            demands.extend(crates.into_iter().flat_map(|krate| declared(outline, krate as usize)));
+            for krate in (0..outline.crates.len()).filter(|krate| self.crates[*krate].eager) {
+                demands.extend(declared(outline, krate));
             }
             if demands.is_empty() && !expanded && !wanted {
                 if outline.fall_back()? {

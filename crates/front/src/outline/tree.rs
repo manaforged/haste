@@ -189,7 +189,6 @@ const PROFILE: [&str; 3] = ["debug_assertions", "overflow_checks", "ub_checks"];
 const OFF: [&str; 10] = ["test", "doc", "doctest", "miri", "rustfmt", "clippy", "windows", "wasm", "bootstrap", "docsrs"];
 
 impl Env {
-    /// Evaluates `cfg`.
     /// Whether `cfg` may hold here: true unless this environment rules it out.
     pub fn allows(&self, cfg: &Cfg) -> bool {
         self.eval(cfg) != Truth::No

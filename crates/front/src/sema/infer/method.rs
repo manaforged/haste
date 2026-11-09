@@ -146,7 +146,7 @@ impl<'a> Infer<'_, 'a> {
         let params: Vec<(&str, Ty)> = self.generics.iter().copied().filter(|&(_, ty)| steps.contains(&self.resolve(ty))).collect();
         let mut found = Vec::new();
         for param in params {
-            if let Some((of, _)) = self.bound_trait(param, name, |me, of, name| me.cx.trait_member(of, name).is_some())? {
+            if let Some((of, _)) = self.bound_trait(param, name, Self::has_member)? {
                 found.push(of);
             }
         }
@@ -174,9 +174,7 @@ impl<'a> Infer<'_, 'a> {
         if let Some(held) = self.object_holds(candidate.of, self_ty, &args) {
             return Ok(held.then(|| (candidate.item, std::iter::once(self_ty).chain(args).collect())));
         }
-        let saved = self.vars.clone();
-        let Some((block, impl_args)) = self.select(candidate.of, self_ty, &args)? else {
-            self.vars = saved;
+        let Some((block, impl_args)) = self.trial(|infer| infer.select(candidate.of, self_ty, &args))? else {
             if !self.may_implement(candidate.of, self_ty, &args)? {
                 return Ok(None);
             }
@@ -191,12 +189,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn try_receiver(&mut self, candidate: Candidate, adjusted: Ty) -> Result<Option<(Vec<Ty>, Vec<Ty>)>> {
-        let saved = self.vars.clone();
-        let matched = self.receiver_matches(candidate, adjusted);
-        if matched.is_none() {
-            self.vars = saved;
-        }
-        Ok(matched)
+        self.trial(|infer| Ok(infer.receiver_matches(candidate, adjusted)))
     }
 
     fn receiver_matches(&mut self, candidate: Candidate, adjusted: Ty) -> Option<(Vec<Ty>, Vec<Ty>)> {

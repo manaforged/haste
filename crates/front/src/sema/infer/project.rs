@@ -32,7 +32,8 @@ impl Infer<'_, '_> {
                 return self.project(owner, ty, args, name).map(Some);
             }
         }
-        match self.bound_trait((param, ty), name, Self::has_assoc_ty)? {
+        let Some(bound) = self.bound_trait((param, ty), name, Self::reaches_assoc_ty)? else { return Ok(None) };
+        match self.assoc_owner(bound, ty, name, 0)? {
             Some((of, args)) => self.project(of, ty, args, name).map(Some),
             None => Ok(None),
         }
@@ -47,13 +48,13 @@ impl Infer<'_, '_> {
     }
 
     /// The first trait that bounds `param`, standing for `ty`, in the frame's headers and has a member `name` that `wants` accepts, with its arguments.
-    pub(super) fn bound_trait(&mut self, (param, ty): (&str, Ty), name: &str, wants: fn(&Self, ItemRef, &str) -> bool) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+    pub(super) fn bound_trait(&mut self, (param, ty): (&str, Ty), name: &str, wants: fn(&mut Self, ItemRef, &str) -> Result<bool>) -> Result<Option<(ItemRef, Vec<Ty>)>> {
         for header in self.headers()? {
             let (arena, generics, predicates) = header.parts();
             for bound in named_bounds(arena, self.src, (generics, predicates), param) {
                 let Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else { continue };
                 let Some(of) = self.trait_named(arena, path, self.home) else { continue };
-                if !wants(self, of, name) {
+                if !wants(self, of, name)? {
                     continue;
                 }
                 return Ok(Some((of, self.bound_args(of, arena, path, ty)?)));
@@ -62,8 +63,42 @@ impl Infer<'_, '_> {
         Ok(None)
     }
 
+    /// Whether trait `of` has a member `name`.
+    pub(super) fn has_member(&mut self, of: ItemRef, name: &str) -> Result<bool> {
+        Ok(self.cx.trait_member(of, name).is_some())
+    }
+
     fn has_assoc_ty(&self, of: ItemRef, name: &str) -> bool {
         self.cx.trait_member(of, name).is_some_and(|member| self.cx.item(member).1.kind == ItemKind::Type)
+    }
+
+    fn reaches_assoc_ty(&mut self, of: ItemRef, name: &str) -> Result<bool> {
+        self.declares_assoc_ty(of, name, 0)
+    }
+
+    fn declares_assoc_ty(&mut self, of: ItemRef, name: &str, depth: u32) -> Result<bool> {
+        if self.has_assoc_ty(of, name) {
+            return Ok(true);
+        }
+        let def = self.cx.trait_generics(of)?;
+        if depth > SUPER_DEPTH || def.1.supers.len == 0 {
+            return Ok(false);
+        }
+        let params: Vec<_> = type_params(&def.1.params).copied().collect();
+        let args: Vec<Ty> = params.iter().map(|_| self.fresh(Kind::Var)).collect();
+        let frame = self.item_frame(of, (&params, &args), (None, None))?;
+        let home = frame.home;
+        let parents = self.with_frame(frame, |infer| {
+            let bounds = def.0.list(def.1.supers).iter().map(|&bound| def.0.bounds[bound as usize]);
+            let paths: Vec<PathId> = bounds.filter_map(|bound| if let Bound::Trait { path, maybe: false, .. } = bound { Some(path) } else { None }).collect();
+            Ok(paths.into_iter().filter_map(|path| infer.trait_named(&def.0, path, home)).collect::<Vec<_>>())
+        })?;
+        for parent in parents {
+            if self.declares_assoc_ty(parent, name, depth + 1)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The associated type `name` of trait `of` at `args` for `ty`: read from the impl that selection picks, or a variable until `ty` is known.

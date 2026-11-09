@@ -4,13 +4,12 @@ use rustc_lexer::TokenKind;
 
 use crate::body::cursor::{RESERVED, is_name};
 use crate::body::{self as syntax, Body, Stmt, sig};
-use crate::names::path::Asks;
 use crate::names::resolve::macro_at;
 use crate::names::{ItemRef, ModRef, plain};
 use crate::outline::item::{ItemKind, Items};
 use crate::outline::rules::{self, Rule};
 use crate::outline::{mbe, scan};
-use crate::outline::source::{Mark, Source, Tokens};
+use crate::outline::source::{Mark, Source, Tokens, opens};
 use crate::outline::tree::{Expansion, File, Truth};
 
 use super::Context;
@@ -41,14 +40,6 @@ struct Run<'s> {
     from: u32,
     shift: u32,
     depth: u32,
-}
-
-fn asked(asks: &Asks) -> usize {
-    asks.modules.borrow().len() + asks.names.borrow().len() + asks.crates.borrow().len() + asks.scopes.borrow().len()
-}
-
-fn opens(kind: TokenKind) -> bool {
-    matches!(kind, TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace)
 }
 
 /// The first token and the name token of the path of the macro call whose `!` is token `bang`.
@@ -286,10 +277,10 @@ impl<'a> Context<'a> {
         }
         let Some((from, to)) = body_range(file, item.item) else { return parse_in(&file.source, self.body_config(item, None), self.item(item).1) };
         let home = self.module_of(item)?;
-        let before = asked(&self.asks);
+        let before = self.asks.count();
         let mut writer = Writer { out: Tokens::default(), calls: HashMap::default(), offset: file.source.len(), home, locals: Vec::new() };
         writer.scan(self, Run { src: &file.source, from, shift: 0, depth: 0 }, to)?;
-        if asked(&self.asks) > before {
+        if self.asks.count() > before {
             bail!("the macros that {} calls are not resolved yet", self.name(item));
         }
         let (source, calls) = (writer.out.finish_over(self.outline.crates[item.krate as usize].files[item.file as usize].clone())?, writer.calls);

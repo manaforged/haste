@@ -4,7 +4,7 @@ use rustc_lexer::TokenKind;
 use crate::body::literal::{char_value, string_bytes};
 use crate::names::ItemRef;
 use crate::outline::item::Attr;
-use crate::outline::source::{Source, Tokens};
+use crate::outline::source::{Source, Tokens, opens};
 
 use super::Context;
 
@@ -70,7 +70,7 @@ pub fn args(src: &Source, open: u32) -> Vec<(u32, u32)> {
                 from = at + 1;
                 at += 1;
             }
-            TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => at = src.pair(at) + 1,
+            kind if opens(kind) => at = src.pair(at) + 1,
             _ => at += 1,
         }
     }

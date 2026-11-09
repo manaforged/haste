@@ -11,12 +11,17 @@ use super::place::{Base, Place};
 use super::{Lower, repr};
 
 impl Lower<'_, '_> {
-    /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, or an aggregate of them.
+    /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a constructor, or an aggregate or constructor call of them.
     pub fn promotable(&self, expr: ExprId) -> bool {
         match *self.body.expr(expr) {
             Expr::Lit(..) => true,
             Expr::Paren(inner) | Expr::Unary(UnOp::Neg, inner) => self.promotable(inner),
-            Expr::Path(_) => matches!(self.typed.res.get(&expr), Some(Res::Fn(item, _)) if self.cx.item(*item).1.kind == ItemKind::Const),
+            Expr::Path(_) => match self.typed.res.get(&expr) {
+                Some(Res::Fn(item, _)) => self.cx.item(*item).1.kind == ItemKind::Const,
+                Some(Res::Ctor(..) | Res::Const(_)) => true,
+                _ => false,
+            },
+            Expr::Call(callee, list) => matches!(self.typed.res.get(&callee), Some(Res::Ctor(..))) && self.body.list(list).iter().all(|&at| self.promotable(ExprId(at))),
             Expr::Array(list) | Expr::Tuple(list) => self.body.list(list).iter().all(|&at| self.promotable(ExprId(at))),
             Expr::Struct { fields, base: None, .. } => self.body.list(fields).iter().all(|&at| self.promotable(self.body.fields[at as usize].value)),
             _ => false,

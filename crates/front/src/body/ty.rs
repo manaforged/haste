@@ -3,6 +3,7 @@ use rustc_lexer::TokenKind;
 
 use super::cursor::Cursor;
 use super::path::Style;
+use crate::outline::source::opens;
 use super::{Ty, TyId};
 
 impl Cursor<'_> {
@@ -68,7 +69,7 @@ impl Cursor<'_> {
 
     fn path_ty(&mut self) -> Result<TyId> {
         let path = self.path(Style::Type)?;
-        if self.punct("!") && matches!(self.kind_at(self.at + 1), TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace) {
+        if self.punct("!") && opens(self.kind_at(self.at + 1)) {
             self.at += 1;
             let open = self.group();
             return Ok(self.push_ty(Ty::Macro { path, open }));

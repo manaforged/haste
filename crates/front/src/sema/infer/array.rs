@@ -72,9 +72,7 @@ impl Infer<'_, '_> {
             return Ok(Some(element));
         }
         let Some(of) = self.cx.lang_item("index") else { bail!("core has no `Index` trait") };
-        let saved = self.vars.clone();
-        if self.select(of, step, &[at])?.is_none() {
-            self.vars = saved;
+        if self.trial(|infer| infer.select(of, step, &[at]))?.is_none() {
             return Ok(None);
         }
         let Some(method) = self.cx.trait_member(of, "index") else { bail!("`Index` has no `index`") };

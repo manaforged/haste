@@ -45,7 +45,7 @@ impl Lower<'_, '_> {
     fn tag(&mut self, layout: &Layout) -> Result<Option<Tag>> {
         let Variants::Multiple { tag, tag_encoding, tag_field, .. } = &layout.variants else { return Ok(None) };
         let size = tag.size(&target()?);
-        let mask = if size.bits() == 128 { u128::MAX } else { (1u128 << size.bits()) - 1 };
+        let mask = crate::sema::ty::mask(size.bits() as u32);
         Ok(Some(Tag { offset: layout.fields.offset(tag_field.index()).bytes() as i32, ty: tag_type(size.bytes())?, mask, encoding: tag_encoding.clone() }))
     }
 

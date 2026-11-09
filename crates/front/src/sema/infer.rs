@@ -162,6 +162,7 @@ pub struct Infer<'c, 'a> {
     opaques: Vec<opaque::Opaque>,
     operands: Vec<(ExprId, crate::body::BinOp, (Ty, Ty), Ty)>,
     try_blocks: Vec<(ExprId, Ty)>,
+    ret_sig: Option<Ty>,
     out: Typed,
     scopes: Vec<(&'a str, u32)>,
     items: Vec<(&'a str, ItemRef)>,
@@ -228,7 +229,7 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
 impl<'c, 'a> Infer<'c, 'a> {
     fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, out: Typed::default(), scopes, items, loops, uses, diverges: false }
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false }
     }
 }
 
@@ -239,6 +240,7 @@ impl Infer<'_, '_> {
             None => self.cx.types.unit(),
         };
         self.out.ret = Some(ret);
+        self.ret_sig = self.opaque_fn_sig()?;
         let sig = self.sig;
         if let Some((kind, mutable)) = sig.receiver {
             let ty = self.receiver_ty(&sig.body, kind)?;
@@ -280,6 +282,24 @@ impl Infer<'_, '_> {
     fn new_local(&mut self, ty: Ty, mutable: bool) -> u32 {
         self.out.locals.push(Local { ty, mutable });
         self.out.locals.len() as u32 - 1
+    }
+
+    /// Runs `f` and keeps the variable bindings it made only when it gives a value.
+    fn trial<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<Option<T>>) -> Result<Option<T>> {
+        let saved = self.vars.clone();
+        let out = f(self);
+        if !matches!(out, Ok(Some(_))) {
+            self.vars = saved;
+        }
+        out
+    }
+
+    /// Runs `f` and undoes every variable binding it made.
+    fn probe<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.vars.clone();
+        let out = f(self);
+        self.vars = saved;
+        out
     }
 
     fn fresh(&mut self, kind: fn(u32) -> Kind) -> Ty {
@@ -474,10 +494,34 @@ impl Infer<'_, '_> {
         self.settle_projections()?;
         self.settle_opaques(true)?;
         self.settle_operators(true)?;
+        self.fall_back_numbers()?;
         self.settle_projections()?;
         self.zonk_types()?;
         self.zonk_calls()?;
         Ok(self.out)
+    }
+
+    fn fall_back_numbers(&mut self) -> Result<()> {
+        let exprs = self.out.exprs.iter().copied().filter(|ty| ty.0 != u32::MAX);
+        let mut stack: Vec<Ty> = exprs.chain(self.out.locals.iter().map(|local| local.ty)).collect();
+        let mut seen = rustc_hash::FxHashSet::default();
+        while let Some(ty) = stack.pop() {
+            let ty = self.resolve(ty);
+            if !seen.insert(ty) {
+                continue;
+            }
+            let fallback = match self.cx.types.kind(ty) {
+                Kind::IntVar(_) => Primitive::I32,
+                Kind::FloatVar(_) => Primitive::F64,
+                kind => {
+                    stack.extend(kind.children());
+                    continue;
+                }
+            };
+            let prim = self.cx.types.prim(fallback);
+            self.unify(ty, prim)?;
+        }
+        Ok(())
     }
 
     fn zonk_types(&mut self) -> Result<()> {
@@ -543,6 +587,11 @@ impl Infer<'_, '_> {
 /// The field types of each variant of the struct, enum or union `item` at `args`.
 pub fn field_types(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Vec<Vec<Ty>>> {
     detached(cx, item, |infer| infer.adt_fields(item, args))
+}
+
+/// The type of the last field of the struct `item` at `args`.
+pub fn tail_field(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Option<Ty>> {
+    detached(cx, item, |infer| infer.adt_tail_field(item, args))
 }
 
 fn dyn_members(kind: &Kind) -> &[ItemRef] {

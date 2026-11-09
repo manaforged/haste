@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rustc_lexer::TokenKind;
 
-use crate::outline::source::Source;
+use crate::outline::source::{Source, opens};
 
 use super::cursor::Cursor;
 use super::{Body, List, PatId, TyId};
@@ -267,7 +267,7 @@ pub fn initializer(src: &Source, name: u32, to: u32) -> Option<u32> {
     while at < to {
         match src.kind(at) {
             TokenKind::Eq => return Some(at + 1),
-            TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => at = src.pair(at) + 1,
+            kind if opens(kind) => at = src.pair(at) + 1,
             _ => at += 1,
         }
     }

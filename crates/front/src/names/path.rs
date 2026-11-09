@@ -140,7 +140,11 @@ impl<'a> Paths<'a> {
                 if let Some(asks) = self.demands && !self.done.get(at.krate as usize).is_some_and(|krate| krate.wants(at.module, name)) {
                     asks.names.borrow_mut().push((at, name));
                 }
-                self.scope(at).and_then(|scope| scope.names.get(&name).copied()).unwrap_or_default()
+                let found = self.scope(at).and_then(|scope| scope.names.get(&name).copied());
+                if found.is_none() {
+                    self.ask_crate(at);
+                }
+                found.unwrap_or_default()
             }
             Def::Item(item) if self.item_kind(item) == Some(ItemKind::Enum) => {
                 let text = self.symbols.text(name);
@@ -149,6 +153,17 @@ impl<'a> Paths<'a> {
                 PerNs { types: binding, values: binding, macros: None }
             }
             _ => PerNs::default(),
+        }
+    }
+
+    fn ask_crate(&self, root: ModRef) {
+        let partial = self.trees.get(root.krate as usize).is_some_and(|tree| tree.partial());
+        if let Some(demands) = self.demands
+            && root.module == 0
+            && root.krate != self.krate
+            && partial
+        {
+            demands.crates.borrow_mut().push(root.krate);
         }
     }
 

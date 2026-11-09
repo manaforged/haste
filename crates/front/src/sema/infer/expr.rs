@@ -175,7 +175,7 @@ impl Infer<'_, '_> {
 
     fn right_operand(&mut self, expr: ExprId, op: BinOp, (left, rhs): (Ty, ExprId)) -> Result<Ty> {
         let shift = matches!(op, BinOp::Shl | BinOp::Shr);
-        let hint = (self.builtin_left(op, left) && !shift || is_compare(op)).then_some(left);
+        let hint = (self.builtin_left(op, left) && !shift).then_some(left);
         let right = self.expr(rhs, hint)?;
         if matches!(self.cx.types.kind(self.resolve(left)), Kind::Var(_)) {
             let out = if is_compare(op) { self.cx.types.bool() } else { self.fresh(Kind::Var) };
@@ -223,9 +223,7 @@ impl Infer<'_, '_> {
         let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
         let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
-        let saved = self.vars.clone();
-        if self.select(of, left, &[right])?.is_none() {
-            self.vars = saved;
+        if self.trial(|infer| infer.select(of, left, &[right]))?.is_none() {
             bail!("unsupported operator {op:?} on {}", self.show(left));
         }
         self.out.operators.insert(expr, Res::Fn(method, vec![left, right]));
@@ -261,13 +259,19 @@ impl Infer<'_, '_> {
     fn assign(&mut self, lhs: ExprId, rhs: ExprId, op: Option<BinOp>) -> Result<Ty> {
         let place = self.expr(lhs, None)?;
         self.note_mut(lhs)?;
-        let value = self.expr(rhs, Some(place))?;
+        let shift = matches!(op, Some(BinOp::Shl | BinOp::Shr));
+        let value = self.expr(rhs, (!shift).then_some(place))?;
         match op {
             Some(BinOp::Shl | BinOp::Shr) => {}
-            Some(_) if !(self.is_int(place) || self.is_float(place) || self.resolve(place) == self.cx.types.bool()) => bail!("unsupported compound assignment on {}", self.show(place)),
+            Some(bin) if !self.builtin_compound(bin, place) => bail!("unsupported compound assignment on {}", self.show(place)),
             _ => self.coerce_expr(rhs, value, place)?,
         }
         Ok(self.cx.types.unit())
+    }
+
+    fn builtin_compound(&mut self, op: BinOp, place: Ty) -> bool {
+        let logical = matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor);
+        self.is_int(place) || self.is_float(place) || logical && self.resolve(place) == self.cx.types.bool()
     }
 
     fn call(&mut self, expr: ExprId, (callee, args): (ExprId, List), expected: Option<Ty>) -> Result<Ty> {
@@ -299,13 +303,10 @@ impl Infer<'_, '_> {
 
     fn expected_inputs(&mut self, params: &[Ty], ret: Ty, expected: Option<Ty>) -> Vec<Option<Ty>> {
         let Some(expected) = expected else { return vec![None; params.len()] };
-        let saved = self.vars.clone();
-        let hints = match self.unify(ret, expected) {
-            Ok(()) => params.iter().map(|&param| Some(self.zonk(param))).collect(),
+        self.probe(|infer| match infer.unify(ret, expected) {
+            Ok(()) => params.iter().map(|&param| Some(infer.zonk(param))).collect(),
             Err(_) => vec![None; params.len()],
-        };
-        self.vars = saved;
-        hints
+        })
     }
 
     fn if_expr(&mut self, cond: ExprId, then: ExprId, otherwise: Option<ExprId>, expected: Option<Ty>) -> Result<Ty> {

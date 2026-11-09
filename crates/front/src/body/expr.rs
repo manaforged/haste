@@ -3,6 +3,7 @@ use rustc_lexer::TokenKind;
 
 use super::cursor::Cursor;
 use super::path::Style;
+use crate::outline::source::opens;
 use super::{Arm, BinOp, BlockKind, Expr, ExprId, FieldInit, Param, UnOp};
 
 const BINARY: [(&str, BinOp, u8); 18] = [
@@ -319,7 +320,7 @@ impl Cursor<'_> {
 
     fn path_expr(&mut self) -> Result<ExprId> {
         let path = self.path(Style::Expr)?;
-        if self.punct("!") && !self.punct("!=") && matches!(self.kind_at(self.at + 1), TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace) {
+        if self.punct("!") && !self.punct("!=") && opens(self.kind_at(self.at + 1)) {
             self.at += 1;
             let open = self.group();
             if let Some(&block) = self.config.calls.and_then(|calls| calls.get(&open)) {

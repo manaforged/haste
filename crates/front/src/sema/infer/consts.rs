@@ -4,7 +4,7 @@ use crate::body::{BinOp, Body, Expr, ExprId, Lit, PathId, TyId, UnOp};
 use crate::names::{Def, ItemRef, Primitive, Sym};
 use crate::outline::item::ItemKind;
 
-use super::super::ty::{Kind, Ty, int_info};
+use super::super::ty::{Kind, Ty, int_info, mask};
 use super::super::intrinsic::Intrinsic;
 use super::{Infer, Res};
 use super::path::parse_int;
@@ -15,6 +15,10 @@ type Int = (u32, bool);
 const U32: Int = (32, false);
 
 const USIZE: Int = (64, false);
+
+const BOOL: Int = (1, false);
+
+const I32: Int = (32, true);
 
 /// A method that constant expressions call: a pure method of the integer types, or the length of a string, byte string or array.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,7 +71,7 @@ fn int_log(method: ConstMethod, x: u128, base: Option<u128>, (bits, is_signed): 
     }
     Ok(match (method, base) {
         (ConstMethod::Ilog2, _) => u128::from(127 - x.leading_zeros()),
-        (ConstMethod::Ilog, Some(base)) if base >= 2 => ilog(x, base),
+        (ConstMethod::Ilog, Some(base)) if !(is_signed && signed(base, bits) < 2) && base >= 2 => ilog(x, base),
         (ConstMethod::Ilog, _) => bail!("a logarithm of base below 2 in a constant"),
         _ => ilog(x, 10),
     })
@@ -80,10 +84,6 @@ fn int_bits(method: ConstMethod, x: u128, bits: u32) -> u128 {
         ConstMethod::LeadingZeros => x.leading_zeros() - (128 - bits),
         _ => x.trailing_zeros().min(bits),
     })
-}
-
-fn mask(bits: u32) -> u128 {
-    if bits == 128 { u128::MAX } else { (1 << bits) - 1 }
 }
 
 fn signed(value: u128, bits: u32) -> i128 {
@@ -216,6 +216,7 @@ impl Infer<'_, '_> {
                 let (value, suffix) = parse_int(self.src.text(at))?;
                 Ok((value, suffix.and_then(int_info).unwrap_or(want)))
             }
+            Expr::Lit(Lit::Bool(value), _) => Ok((u128::from(value), BOOL)),
             Expr::Paren(inner) => self.const_eval(arena, inner, want),
             Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.const_eval(arena, tail, want),
             Expr::Unary(op, inner) => self.const_unary(arena, op, inner, want),
@@ -263,10 +264,33 @@ impl Infer<'_, '_> {
     }
 
     fn const_binary(&mut self, arena: &Body, op: BinOp, (lhs, rhs): (ExprId, ExprId), want: Int) -> Result<(u128, Int)> {
+        if matches!(op, BinOp::And | BinOp::Or) {
+            let (x, _) = self.const_eval(arena, lhs, BOOL)?;
+            let decided = (x == 1) == (op == BinOp::Or);
+            return if decided { Ok((x, BOOL)) } else { Ok((self.const_eval(arena, rhs, BOOL)?.0, BOOL)) };
+        }
+        if super::expr::is_compare(op) {
+            return self.const_compare(arena, op, (lhs, rhs));
+        }
         let (x, int) = self.const_eval(arena, lhs, want)?;
         let shift = matches!(op, BinOp::Shl | BinOp::Shr);
         let (y, _) = self.const_eval(arena, rhs, if shift { (32, false) } else { int })?;
         Ok((fold(op, x, y, int)? & mask(int.0), int))
+    }
+
+    fn const_compare(&mut self, arena: &Body, op: BinOp, (lhs, rhs): (ExprId, ExprId)) -> Result<(u128, Int)> {
+        let (x, int) = self.const_eval(arena, lhs, I32)?;
+        let (y, _) = self.const_eval(arena, rhs, int)?;
+        let order = if int.1 { signed(x, int.0).cmp(&signed(y, int.0)) } else { x.cmp(&y) };
+        let holds = match op {
+            BinOp::Eq => order.is_eq(),
+            BinOp::Ne => order.is_ne(),
+            BinOp::Lt => order.is_lt(),
+            BinOp::Le => order.is_le(),
+            BinOp::Gt => order.is_gt(),
+            _ => order.is_ge(),
+        };
+        Ok((u128::from(holds), BOOL))
     }
 
     fn const_name(&mut self, arena: &Body, (expr, path): (ExprId, PathId), want: Int) -> Result<(u128, Int)> {

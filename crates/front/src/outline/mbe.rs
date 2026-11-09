@@ -5,7 +5,7 @@ use rustc_lexer::TokenKind;
 
 use super::fragment;
 use super::rules::{Frag, Meta, Op, Piece, Rule};
-use super::source::{Mark, Source, Tokens};
+use super::source::{Mark, Source, Tokens, opens};
 
 /// What a metavariable matched: a token range of the input, grouped when it is a compound expression, or one binding per repetition.
 #[derive(Clone, Debug)]
@@ -283,7 +283,7 @@ pub fn select_arm(src: &Source, open: u32, env: &super::tree::Env) -> Result<Opt
 
 fn skip_until(src: &Source, (mut at, close): (u32, u32), stop: impl Fn(u32) -> bool) -> u32 {
     while at < close && !stop(at) {
-        at = if matches!(src.kind(at), TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace) { src.pair(at) + 1 } else { at + 1 };
+        at = if opens(src.kind(at)) { src.pair(at) + 1 } else { at + 1 };
     }
     at
 }

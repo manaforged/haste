@@ -154,6 +154,11 @@ impl Types {
     }
 }
 
+/// The value with the low `bits` bits set: the mask of an integer that wide.
+pub fn mask(bits: u32) -> u128 {
+    if bits == 128 { u128::MAX } else { (1 << bits) - 1 }
+}
+
 /// The width in bits and signedness of an integer primitive, with `isize` and `usize` at 64 bits.
 pub fn int_info(primitive: Primitive) -> Option<(u32, bool)> {
     use Primitive::*;

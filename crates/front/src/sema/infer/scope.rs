@@ -228,11 +228,9 @@ impl<'a> Infer<'_, 'a> {
         let Some(head) = head(self.cx.types.kind(ty)) else { return Ok(None) };
         for block in self.cx.inherent(head) {
             let Some(member) = self.cx.member(block, name) else { continue };
-            let saved = self.vars.clone();
-            if let Some(args) = self.match_impl(block, ty) {
+            if let Some(args) = self.trial(|infer| Ok(infer.match_impl(block, ty)))? {
                 return Ok(Some((member, args)));
             }
-            self.vars = saved;
         }
         Ok(None)
     }

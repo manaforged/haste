@@ -16,9 +16,21 @@ impl<'a> Infer<'_, 'a> {
     /// The field types of each variant of the struct, enum or union `item` at `args`.
     pub fn adt_fields(&mut self, item: ItemRef, args: &[Ty]) -> Result<Vec<Vec<Ty>>> {
         let def = self.cx.adt_def(item)?;
-        let self_ty = Some(self.cx.types.intern(Kind::Adt(item, args.to_vec())));
-        let frame = self.item_frame(item, (&def.generics.params, args), (self_ty, Some(item)))?;
+        let frame = self.adt_frame(item, &def.generics.params, args)?;
         self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty)).collect()).collect())
+    }
+
+    /// The type of the last field of the first variant of `item` at `args`, the only field that can make a struct unsized.
+    pub fn adt_tail_field(&mut self, item: ItemRef, args: &[Ty]) -> Result<Option<Ty>> {
+        let def = self.cx.adt_def(item)?;
+        let Some(last) = def.variants.first().and_then(|variant| variant.fields.last()) else { return Ok(None) };
+        let frame = self.adt_frame(item, &def.generics.params, args)?;
+        self.with_frame(frame, |infer| infer.lower_ty(&def.body, last.ty)).map(Some)
+    }
+
+    fn adt_frame(&mut self, item: ItemRef, params: &[crate::body::sig::Generic], args: &[Ty]) -> Result<super::scope::Frame<'a>> {
+        let self_ty = Some(self.cx.types.intern(Kind::Adt(item, args.to_vec())));
+        self.item_frame(item, (params, args), (self_ty, Some(item)))
     }
 
     /// The constructor that `path` names in the value namespace when `values` holds, else in the type namespace.

@@ -3,7 +3,7 @@ use rustc_lexer::TokenKind;
 
 use super::attr;
 use super::item::{Attr, Import, Item, ItemKind, Items, Leaf, Vis};
-use super::source::Source;
+use super::source::{Source, opens};
 
 struct Scanner<'a> {
     src: &'a Source,
@@ -185,7 +185,7 @@ impl Scanner<'_> {
             match self.src.kind(at) {
                 TokenKind::OpenBrace if angles == 0 => return (Some(at), self.src.pair(at) + 1),
                 TokenKind::Semi | TokenKind::Eof => return (None, at + 1),
-                TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => at = self.src.pair(at),
+                kind if opens(kind) => at = self.src.pair(at),
                 TokenKind::Lt => angles += 1,
                 TokenKind::Gt if !self.is_arrow(at) => angles = angles.saturating_sub(1),
                 _ => {}
@@ -198,7 +198,7 @@ impl Scanner<'_> {
         loop {
             match self.src.kind(at) {
                 TokenKind::Semi | TokenKind::Eof => return at + 1,
-                TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => at = self.src.pair(at) + 1,
+                kind if opens(kind) => at = self.src.pair(at) + 1,
                 _ => at += 1,
             }
         }

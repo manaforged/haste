@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use rustc_lexer::TokenKind;
 
-use super::source::Source;
+use super::source::{Source, opens};
 
 /// How often a repetition may match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,10 +89,6 @@ fn op_of(kind: TokenKind) -> Option<Op> {
     }
 }
 
-fn is_open(kind: TokenKind) -> bool {
-    matches!(kind, TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace)
-}
-
 struct Parser<'a> {
     src: &'a Source,
     matcher: bool,
@@ -105,7 +101,7 @@ impl Parser<'_> {
             let kind = self.src.kind(at);
             at = if kind == TokenKind::Dollar && at + 1 < to {
                 self.dollar(at + 1, &mut out)?
-            } else if is_open(kind) {
+            } else if opens(kind) {
                 let close = self.src.pair(at);
                 out.push(Piece::Group(at, self.pieces(at + 1, close)?));
                 close + 1
@@ -218,7 +214,7 @@ pub fn parse(src: &Source, open: u32) -> Result<Vec<Rule>> {
     while at < close {
         let arrow = src.pair(at) + 1;
         let body = arrow + 2;
-        if !is_open(src.kind(at)) || src.kind(arrow) != TokenKind::Eq || !is_open(src.kind(body)) {
+        if !opens(src.kind(at)) || src.kind(arrow) != TokenKind::Eq || !opens(src.kind(body)) {
             bail!("{}: malformed macro rule at byte {}", src.path.display(), src.byte(at));
         }
         let matcher = matchers.pieces(at + 1, src.pair(at))?;

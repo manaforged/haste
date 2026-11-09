@@ -230,7 +230,10 @@ impl Infer<'_, '_> {
     }
 
     fn expected_sig(&mut self, expected: Ty) -> Option<(Vec<Ty>, Ty)> {
-        match self.cx.types.kind(self.resolve(expected)).clone() {
+        let expected = self.resolve(expected);
+        let own_ret = self.out.ret.is_some_and(|ret| self.resolve(ret) == expected);
+        let expected = self.ret_sig.filter(|_| own_ret).unwrap_or(expected);
+        match self.cx.types.kind(expected).clone() {
             Kind::FnPtr(inputs, output) => Some((inputs, output)),
             Kind::Dyn(of, parts, members) if self.cx.lang(of).is_some_and(|lang| super::select::CALLABLE.contains(&lang)) => {
                 let (given, mut bound) = super::super::ty::object_parts(&parts, &members);
@@ -283,8 +286,12 @@ impl Infer<'_, '_> {
 
     /// Infers and coerces the argument `arg` of a call of `callee` to its parameter type `param`, giving a closure argument the signature of the parameter's `Fn` bound.
     pub(super) fn call_arg(&mut self, callee: Option<(ItemRef, &[Ty])>, arg: ExprId, (param, expectation): (Ty, Option<Ty>)) -> Result<()> {
+        let callable = match *self.cx.types.kind(self.resolve(param)) {
+            Kind::Ref(_, pointee) => pointee,
+            _ => param,
+        };
         let (hint, bound) = match callee {
-            Some(callee) => (self.closure_hint(callee, arg, param)?, self.callable_hint(callee, param)?),
+            Some(callee) => (self.closure_hint(callee, arg, param)?, self.callable_hint(callee, callable)?),
             None => (None, None),
         };
         let closure = self.is_closure(arg);
@@ -298,16 +305,13 @@ impl Infer<'_, '_> {
             _ => self.coerce_expr(arg, found, param)?,
         }
         match bound {
-            Some(bound) => self.tie_callable(param, bound),
+            Some(bound) => self.tie_callable(callable, bound),
             None => Ok(()),
         }
     }
 
     pub(super) fn coerces_to(&mut self, found: Ty, wanted: Ty) -> bool {
-        let saved = self.vars.clone();
-        let coerces = matches!(self.coercion(found, wanted), Ok(Some(_)));
-        self.vars = saved;
-        coerces
+        self.probe(|infer| matches!(infer.coercion(found, wanted), Ok(Some(_))))
     }
 
     /// Unifies the signature of the callable `ty`, a closure, function item or function pointer, with `bound`, the function pointer type that an `Fn(A) -> B` bound on it spells.
@@ -379,6 +383,18 @@ impl Infer<'_, '_> {
             }
             Ok(None)
         })
+    }
+
+    /// The function pointer type that an `impl Fn(A) -> B` return type of the body spells, which a closure it returns takes its signature from.
+    pub(super) fn opaque_fn_sig(&mut self) -> Result<Option<Ty>> {
+        let sig = self.sig;
+        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else { return Ok(None) };
+        for &bound in sig.body.list(bounds) {
+            if let Some(found) = self.fn_bound(&sig.body, self.home, bound)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
     }
 
     pub(super) fn fn_bound(&mut self, arena: &Body, home: ModRef, bound: u32) -> Result<Option<Ty>> {

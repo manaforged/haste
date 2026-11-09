@@ -54,7 +54,7 @@ impl<'a> Infer<'_, 'a> {
             let local = if absolute { None } else { self.body_use(*last).values };
             local.or_else(|| self.cx.paths(self.home.krate).first(*last, self.home, &NamePath { segments, absolute, dollar }).values)
         } else {
-            let head = self.resolve_local(&NamePath { segments: prefix, absolute, dollar });
+            let head = self.type_def(&NamePath { segments: prefix, absolute, dollar });
             head.map(|def| self.cx.paths(self.home.krate).member(def, *last)).and_then(|entry| entry.values)
         };
         match found {
@@ -454,10 +454,9 @@ impl<'a> Infer<'_, 'a> {
     fn projection(&mut self, arena: &Body, path: PathId, qself: TyId, trait_path: PathId) -> Result<Ty> {
         let ty = self.lower_ty(arena, qself)?;
         let (segments, absolute, dollar) = self.segments(arena, trait_path);
-        let paths = self.cx.paths(self.home.krate);
-        let def = paths.resolve(&NamePath { segments: &segments, absolute, dollar }, self.home);
+        let found = self.trait_at(&NamePath { segments: &segments, absolute, dollar }, self.home);
         let name = arena.list(arena.path(path).segments).last().map(|&at| plain(self.src.text(arena.segments[at as usize].name)));
-        let Some(Def::Item(item)) = def else { bail!("projection through `{}`, which is not a trait", self.spell(&segments)) };
+        let Some(item) = found else { bail!("projection through `{}`, which is not a trait", self.spell(&segments)) };
         let Some(name) = name else { bail!("a projection with no name") };
         if self.cx.lang(item) == Some("pointee_trait") && name == "Metadata" {
             return self.metadata_of(ty);

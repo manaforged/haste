@@ -146,7 +146,8 @@ fn is_trivia(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Whitespace | TokenKind::LineComment { doc_style: None } | TokenKind::BlockComment { doc_style: None, .. })
 }
 
-fn opens(kind: TokenKind) -> bool {
+/// Whether `kind` opens a delimited group: `(`, `[` or `{`.
+pub fn opens(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::OpenParen | TokenKind::OpenBrace | TokenKind::OpenBracket)
 }
 

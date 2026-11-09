@@ -21,7 +21,7 @@ struct Bits {
 
 impl Bits {
     fn of(bits: u32, signed: bool) -> Bits {
-        let mask = if bits == 128 { u128::MAX } else { (1 << bits) - 1 };
+        let mask = crate::sema::ty::mask(bits);
         match signed {
             true => Bits { mask, min: 1 << (bits - 1), max: mask >> 1 },
             false => Bits { mask, min: 0, max: mask },

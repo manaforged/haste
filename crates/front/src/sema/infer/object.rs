@@ -77,10 +77,7 @@ impl Infer<'_, '_> {
         let (Some(&a), Some(&b)) = (have.first().and_then(|fields| fields.last()), want.first().and_then(|fields| fields.last())) else { return Ok(None) };
         let Some(unsize) = self.unsize_pointee(a, b)? else { return Ok(None) };
         for (&found, &wanted) in from.iter().zip(to) {
-            let saved = self.vars.clone();
-            if self.unify(found, wanted).is_err() {
-                self.vars = saved;
-            }
+            self.trial_unify(found, wanted);
         }
         Ok(Some(unsize))
     }

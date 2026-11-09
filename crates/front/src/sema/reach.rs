@@ -19,17 +19,21 @@ pub struct Reached {
 }
 
 impl Reached {
-    /// `root` and every function it reaches, through the bodies that type-checked.
+    /// `root` and every function it reaches through the bodies that type-checked, each after every function it reaches.
     pub fn closure(&self, root: usize) -> Vec<usize> {
         let mut seen = vec![false; self.list.len()];
-        let (mut stack, mut found) = (vec![root], Vec::new());
-        while let Some(at) = stack.pop() {
+        let (mut stack, mut found) = (vec![(root, false)], Vec::new());
+        while let Some((at, done)) = stack.pop() {
+            if done {
+                found.push(at);
+                continue;
+            }
             if std::mem::replace(&mut seen[at], true) {
                 continue;
             }
-            found.push(at);
+            stack.push((at, true));
             if let Ok(typed) = &self.list[at].1 {
-                stack.extend(self.callees(typed));
+                stack.extend(self.callees(typed).map(|callee| (callee, false)));
             }
         }
         found

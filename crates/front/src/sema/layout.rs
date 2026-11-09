@@ -133,7 +133,7 @@ impl Context<'_> {
         if let Some(found) = self.tails.get(&ty) {
             return Ok(*found);
         }
-        let last = if self.item(item).1.kind == ItemKind::Struct { super::infer::field_types(self, item, &args)?.first().and_then(|fields| fields.last().copied()) } else { None };
+        let last = if self.item(item).1.kind == ItemKind::Struct { super::infer::tail_field(self, item, &args)? } else { None };
         let found = match last {
             Some(last) => self.tail(last)?,
             None => ty,

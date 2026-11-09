@@ -157,19 +157,23 @@ impl<'a> Infer<'_, 'a> {
         for (generic, &arg) in type_params(&header.generics).zip(impl_args) {
             wanted.extend(header.body.list(generic.bounds).iter().map(|&bound| (arg, bound)));
         }
-        let mut held = true;
         self.with_frame(frame, |infer| {
+            for (ty, bound) in wanted {
+                if !infer.bound_holds(&header.body, home, (ty, bound), depth)? {
+                    return Ok(false);
+                }
+            }
             for predicate in &header.predicates {
                 let Some(ty) = predicate.ty else { continue };
                 let ty = infer.lower_ty(&header.body, ty)?;
-                wanted.extend(header.body.list(predicate.bounds).iter().map(|&bound| (ty, bound)));
+                for &bound in header.body.list(predicate.bounds) {
+                    if !infer.bound_holds(&header.body, home, (ty, bound), depth)? {
+                        return Ok(false);
+                    }
+                }
             }
-            for (ty, bound) in wanted {
-                held &= infer.bound_holds(&header.body, home, (ty, bound), depth)?;
-            }
-            Ok(())
-        })?;
-        Ok(held)
+            Ok(true)
+        })
     }
 
     fn bound_holds(&mut self, arena: &Body, home: ModRef, (ty, bound): (Ty, u32), depth: u32) -> Result<bool> {
@@ -200,18 +204,23 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
         let Kind::Dyn(object, parts, members) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
         let given = super::super::ty::object_parts(&parts, &members).0;
-        let saved = self.vars.clone();
-        let held = object == of && given.len() == args.len() && given.iter().zip(args).all(|(found, wanted)| self.unify(*found, *wanted).is_ok());
-        if !held {
-            self.vars = saved;
+        if object != of || given.len() != args.len() {
+            return Some(false);
         }
-        Some(held)
+        let held = self.trial(|infer| Ok(given.iter().zip(args).all(|(found, wanted)| infer.unify(*found, *wanted).is_ok()).then_some(())));
+        Some(matches!(held, Ok(Some(()))))
     }
 
     /// The trait that `path` in `arena` names from module `home`.
     pub fn trait_named(&mut self, arena: &Body, path: PathId, home: ModRef) -> Option<ItemRef> {
         let (segments, absolute, dollar) = self.segments(arena, path);
-        match self.cx.paths(home.krate).resolve(&NamePath { segments: &segments, absolute, dollar }, home)? {
+        self.trait_at(&NamePath { segments: &segments, absolute, dollar }, home)
+    }
+
+    /// The trait that `path` names from module `home`, through the body's own items and `use` declarations when `home` is the frame's module.
+    pub(super) fn trait_at(&mut self, path: &NamePath<'_>, home: ModRef) -> Option<ItemRef> {
+        let def = if home == self.home { self.type_def(path) } else { self.cx.paths(home.krate).resolve(path, home) };
+        match def? {
             Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Trait => Some(item),
             _ => None,
         }
