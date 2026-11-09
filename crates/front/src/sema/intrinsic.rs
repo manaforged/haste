@@ -55,6 +55,15 @@ pub enum Intrinsic {
     CompareBytes,
     Atomic(Atomic),
     SliceElement,
+    Simd(Simd),
+}
+
+/// A SIMD intrinsic, which lowering runs one lane at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Simd {
+    Splat,
+    Bitmask,
+    Lanewise(BinOp),
 }
 
 /// An atomic access, which lowering makes sequentially consistent.
@@ -66,7 +75,7 @@ pub enum Atomic {
     Exchange,
 }
 
-const NAMES: [(&str, Intrinsic); 96] = {
+const NAMES: [(&str, Intrinsic); 110] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -165,6 +174,20 @@ const NAMES: [(&str, Intrinsic); 96] = {
         ("atomic_min", Atomic(self::Atomic::Rmw(AtomicRmwOp::Smin))),
         ("atomic_umax", Atomic(self::Atomic::Rmw(AtomicRmwOp::Umax))),
         ("atomic_umin", Atomic(self::Atomic::Rmw(AtomicRmwOp::Umin))),
+        ("simd_splat", Simd(self::Simd::Splat)),
+        ("simd_bitmask", Simd(self::Simd::Bitmask)),
+        ("simd_add", Simd(self::Simd::Lanewise(BinOp::Add))),
+        ("simd_sub", Simd(self::Simd::Lanewise(BinOp::Sub))),
+        ("simd_mul", Simd(self::Simd::Lanewise(BinOp::Mul))),
+        ("simd_and", Simd(self::Simd::Lanewise(BinOp::BitAnd))),
+        ("simd_or", Simd(self::Simd::Lanewise(BinOp::BitOr))),
+        ("simd_xor", Simd(self::Simd::Lanewise(BinOp::BitXor))),
+        ("simd_eq", Simd(self::Simd::Lanewise(BinOp::Eq))),
+        ("simd_ne", Simd(self::Simd::Lanewise(BinOp::Ne))),
+        ("simd_lt", Simd(self::Simd::Lanewise(BinOp::Lt))),
+        ("simd_le", Simd(self::Simd::Lanewise(BinOp::Le))),
+        ("simd_gt", Simd(self::Simd::Lanewise(BinOp::Gt))),
+        ("simd_ge", Simd(self::Simd::Lanewise(BinOp::Ge))),
     ]
 };
 

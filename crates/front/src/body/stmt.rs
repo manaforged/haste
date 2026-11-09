@@ -36,9 +36,8 @@ impl Cursor<'_> {
             let attrs = self.skip_attrs()?;
             let (stmt, tail) = self.stmt(start)?;
             if let Some(tail) = tail {
-                if let Some((from, to)) = attrs {
-                    self.push_stmt(Stmt::Expr(tail, false), Some((from, to)), &mut stmts);
-                    return Ok((stmts, None));
+                if self.configured_out(attrs) {
+                    return Ok(self.last_as_tail(stmts));
                 }
                 return Ok((stmts, Some(tail)));
             }
@@ -47,13 +46,25 @@ impl Cursor<'_> {
         Ok((stmts, None))
     }
 
+    fn last_as_tail(&self, mut stmts: Vec<u32>) -> (Vec<u32>, Option<ExprId>) {
+        match stmts.last().map(|&index| &self.body.stmts[index as usize]) {
+            Some(&Stmt::Expr(expr, false)) => {
+                stmts.pop();
+                (stmts, Some(expr))
+            }
+            _ => (stmts, None),
+        }
+    }
+
     fn push_stmt(&mut self, stmt: Stmt, attrs: Option<(u32, u32)>, into: &mut Vec<u32>) {
         self.body.stmts.push(stmt);
         let index = self.body.stmts.len() as u32 - 1;
         if let Some((from, to)) = attrs {
             self.body.attrs.push((Node::Stmt(index), from, to));
         }
-        into.push(index);
+        if !self.configured_out(attrs) {
+            into.push(index);
+        }
     }
 
     fn stmt(&mut self, start: u32) -> Result<(Stmt, Option<ExprId>)> {

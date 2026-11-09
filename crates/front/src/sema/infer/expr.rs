@@ -30,7 +30,7 @@ impl Infer<'_, '_> {
             Expr::Cast(inner, ty) => self.cast(inner, ty),
             Expr::Call(callee, args) => self.call(expr, (callee, args), expected),
             Expr::Closure { params, ret, body, capture } => self.closure_expr(expr, (params, ret, body, capture), expected),
-            Expr::Tuple(list) => self.tuple(list),
+            Expr::Tuple(list) => self.tuple(list, expected),
             Expr::Ref { mutable, raw, expr: inner } => self.reference(inner, (mutable, raw), expected),
             Expr::TupleField(base, index) => self.tuple_field(expr, base, index),
             _ => self.flow(expr, expected),
@@ -46,8 +46,23 @@ impl Infer<'_, '_> {
         Ok(target)
     }
 
-    fn tuple(&mut self, list: List) -> Result<Ty> {
-        let items = self.body.list(list).iter().map(|&item| self.expr(ExprId(item), None)).collect::<Result<Vec<_>>>()?;
+    fn tuple(&mut self, list: List, expected: Option<Ty>) -> Result<Ty> {
+        let wanted = match expected.map(|ty| self.cx.types.kind(self.resolve(ty)).clone()) {
+            Some(Kind::Tuple(wanted)) if wanted.len() == list.len as usize => wanted,
+            _ => Vec::new(),
+        };
+        let mut items = Vec::new();
+        for (index, &item) in self.body.list(list).iter().enumerate() {
+            let want = wanted.get(index).copied();
+            let found = self.expr(ExprId(item), want)?;
+            items.push(match want {
+                Some(want) if self.coerces_to(found, want) => {
+                    self.coerce_expr(ExprId(item), found, want)?;
+                    want
+                }
+                _ => found,
+            });
+        }
         Ok(self.cx.types.intern(Kind::Tuple(items)))
     }
 
@@ -262,7 +277,7 @@ impl Infer<'_, '_> {
             Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
             Kind::Dyn(of, ..) if self.cx.lang(of).is_some_and(|lang| super::select::CALLABLE.contains(&lang)) => return self.object_call((expr, found), callee_ty, args),
             Kind::FnDef(item, substs) => {
-                if matches!(self.out.res.get(&callee), Some(Res::Local(_))) {
+                if !matches!(self.out.res.get(&callee), Some(Res::Fn(..))) {
                     self.out.res.insert(expr, Res::Fn(item, substs.clone()));
                 }
                 let (params, ret) = self.fn_types(item, &substs)?;

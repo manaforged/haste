@@ -139,7 +139,7 @@ impl Loader<'_> {
             self.out.errors.push(format!("{}: macro {name} recursed past {DEPTH} levels", file.source.path.display()));
             return Ok(());
         }
-        let expanded = mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32));
+        let expanded = mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32), None);
         let Some(expanded) = self.scanned(expanded, name) else { return Ok(()) };
         self.out.impls[block].parts.push(self.out.files.len() - 1);
         self.depth += 1;
@@ -299,7 +299,7 @@ impl Loader<'_> {
             self.out.errors.push(format!("{}: macro {name} recursed past {DEPTH} levels", file.source.path.display()));
             return Ok(());
         }
-        let expanded = mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32));
+        let expanded = mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32), None);
         self.splice(module, expanded, name)
     }
 

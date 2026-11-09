@@ -26,7 +26,8 @@ fn glued(src: &Source, at: u32, operator: &str) -> bool {
     })
 }
 
-fn tree(src: &Source, at: u32) -> u32 {
+/// The end of the token tree that starts at `at`.
+pub(super) fn tree(src: &Source, at: u32) -> u32 {
     if is_open(src.kind(at)) {
         return src.pair(at) + 1;
     }

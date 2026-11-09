@@ -322,10 +322,17 @@ impl Body {
     }
 }
 
-/// Parses the block that opens at token `open` of `src`, reading each macro call that `calls` maps as the block its expansion became.
-pub fn parse(src: &Source, open: u32, calls: Option<&HashMap<u32, u32>>) -> Result<Body> {
+/// What a body is parsed with besides its tokens: the block each macro call became, and the environment that `#[cfg]` attributes read.
+#[derive(Clone, Copy, Default)]
+pub struct Config<'a> {
+    pub calls: Option<&'a HashMap<u32, u32>>,
+    pub env: Option<&'a crate::outline::tree::Env>,
+}
+
+/// Parses the block that opens at token `open` of `src` with `config`, leaving out the statements, arms, fields and arguments that `#[cfg]` turns off.
+pub fn parse(src: &Source, open: u32, config: Config<'_>) -> Result<Body> {
     let mut cursor = Cursor::new(src, open, src.pair(open) + 1);
-    cursor.calls = calls;
+    cursor.config = config;
     let root = cursor.block_expr(None, BlockKind::Plain)?;
     cursor.body.root = Some(root);
     Ok(cursor.body)
@@ -344,9 +351,9 @@ pub fn parse_params(src: &Source, body: Body, starts: &[u32]) -> Result<Body> {
 }
 
 /// Parses the tokens from `from` up to `to` of `src` as one expression, with expanded macro calls as in [`parse`].
-pub fn parse_expr(src: &Source, from: u32, to: u32, calls: Option<&HashMap<u32, u32>>) -> Result<Body> {
+pub fn parse_expr(src: &Source, from: u32, to: u32, config: Config<'_>) -> Result<Body> {
     let mut cursor = Cursor::new(src, from, to);
-    cursor.calls = calls;
+    cursor.config = config;
     let root = cursor.expr()?;
     cursor.finish()?;
     cursor.body.root = Some(root);

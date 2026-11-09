@@ -303,7 +303,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn coerces_to(&mut self, found: Ty, wanted: Ty) -> bool {
+    pub(super) fn coerces_to(&mut self, found: Ty, wanted: Ty) -> bool {
         let saved = self.vars.clone();
         let coerces = matches!(self.coercion(found, wanted), Ok(Some(_)));
         self.vars = saved;

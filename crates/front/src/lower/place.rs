@@ -96,6 +96,25 @@ impl Lower<'_, '_> {
         }
     }
 
+    /// The reference that the deref coercion `steps` reaches from the reference `pointer`, one builtin dereference or `Deref::deref` call per step.
+    pub(super) fn deref_coerced(&mut self, mut pointer: Value, steps: Vec<(Ty, Option<Res>)>) -> Result<Option<Value>> {
+        for (ty, res) in steps {
+            pointer = match res {
+                Some(Res::Fn(item, substs)) => match self.invoke(item, &substs, vec![pointer])? {
+                    Some(next) => next,
+                    None => return Ok(None),
+                },
+                Some(_) => bail!("a deref coercion through something that is not a function"),
+                None => {
+                    let place = self.pointee_place(pointer, ty)?;
+                    let Some(value) = self.read(place) else { bail!("a pointer with no value") };
+                    self.builtin_pointer(value, ty)?.0
+                }
+            };
+        }
+        Ok(Some(pointer))
+    }
+
     /// The address that the value `value` of the sized pointer type `ty` holds, whether a reference, a raw pointer, or a smart pointer such as `Box` or `Rc`.
     pub(super) fn sized_pointer(&mut self, value: Value, ty: Ty) -> Value {
         match self.cx.types.kind(ty) {
@@ -159,17 +178,22 @@ impl Lower<'_, '_> {
         }
     }
 
+    fn coerced_repr(&mut self, expr: ExprId, coerced: Option<&Coercion>) -> Result<Repr> {
+        Ok(match coerced {
+            Some(coercion) if coercion.widens() => super::ops::WIDE,
+            Some(Coercion::Deref(_, to)) if self.cx.is_unsized(*to)? => super::ops::WIDE,
+            Some(Coercion::Deref(..) | Coercion::Reify(_)) => Repr::Scalar(Type::I64),
+            _ => self.repr_of(expr)?,
+        })
+    }
+
     /// The place of `expr`, holding its value in a new frame slot when it is not a place already.
     pub fn place_or_temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
         let coerced = self.typed.coercions.get(&expr);
         if coerced.is_none() && let Some(place) = self.place_of(expr)? {
             return Ok(Some(place));
         }
-        let repr = match coerced {
-            Some(coercion) if coercion.widens() => super::ops::WIDE,
-            Some(Coercion::Reify(_)) => Repr::Scalar(Type::I64),
-            _ => self.repr_of(expr)?,
-        };
+        let repr = self.coerced_repr(expr, coerced)?;
         let value = self.expr(expr)?;
         let place = match (repr, value) {
             (Repr::Mem { .. }, Some(addr)) => Some(Place { base: Base::Addr(addr), offset: 0, repr }),

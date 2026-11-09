@@ -157,7 +157,7 @@ impl Lower<'_, '_> {
         self.invoke(item, substs, values)
     }
 
-    fn apply(&mut self, op: BinOp, num: Num, (x, y): (Value, Value), rhs: Num) -> Result<Value> {
+    pub(super) fn apply(&mut self, op: BinOp, num: Num, (x, y): (Value, Value), rhs: Num) -> Result<Value> {
         if let Some(cc) = compare(op) {
             return Ok(match num {
                 Num::Float(_) => self.ins().fcmp(float_cc(cc), x, y),
@@ -380,8 +380,9 @@ impl Lower<'_, '_> {
     }
 }
 
+/// An ordering or equality test.
 #[derive(Clone, Copy)]
-enum Cmp {
+pub(super) enum Cmp {
     Eq,
     Ne,
     Lt,
@@ -390,7 +391,8 @@ enum Cmp {
     Ge,
 }
 
-fn compare(op: BinOp) -> Option<Cmp> {
+/// The comparison that `op` is, when it compares.
+pub(super) fn compare(op: BinOp) -> Option<Cmp> {
     Some(match op {
         BinOp::Eq => Cmp::Eq,
         BinOp::Ne => Cmp::Ne,

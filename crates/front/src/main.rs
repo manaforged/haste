@@ -225,7 +225,7 @@ fn parse_bodies(tree: &outline::tree::Crate) -> (usize, Vec<String>) {
     for file in &tree.files {
         for item in &file.items.items {
             let Some(open) = item.body.filter(|_| item.kind == outline::item::ItemKind::Fn) else { continue };
-            match haste_front::body::parse(&file.source, open, None) {
+            match haste_front::body::parse(&file.source, open, haste_front::body::Config::default()) {
                 Ok(_) => parsed += 1,
                 Err(error) => errors.push(format!("{error:#}")),
             }

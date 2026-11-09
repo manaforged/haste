@@ -29,6 +29,7 @@ impl Lower<'_, '_> {
                 let table = self.vtable(vtable)?;
                 Ok(Some(self.wide_pointer(data, table)))
             }
+            (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(value, steps.clone()),
             (Some(Coercion::Reify(Res::Fn(item, substs))), _) => {
                 let index = self.reached_index(*item, substs)?;
                 Ok(Some(self.code_of(index)))
@@ -215,6 +216,10 @@ impl Lower<'_, '_> {
             },
             false => (self.expr(callee)?, self.ty_of(callee)),
         };
+        if let Kind::FnDef(item, substs) = self.cx.types.kind(ty).clone() {
+            let values = self.args(args, Vec::new())?;
+            return self.invoke(item, &substs, values);
+        }
         let Kind::FnPtr(params, ret) = self.cx.types.kind(ty).clone() else { bail!("cannot lower calls through values yet") };
         let Some(code) = code else { return Ok(None) };
         let values = self.args(args, Vec::new())?;

@@ -4,13 +4,13 @@ use anyhow::{Result, bail};
 use rustc_lexer::TokenKind;
 
 use super::fragment;
-use super::rules::{Meta, Op, Piece, Rule};
-use super::source::{Source, Tokens};
+use super::rules::{Frag, Meta, Op, Piece, Rule};
+use super::source::{Mark, Source, Tokens};
 
-/// What a metavariable matched: a token range of the input, or one binding per repetition.
+/// What a metavariable matched: a token range of the input, grouped when it is a compound expression, or one binding per repetition.
 #[derive(Clone, Debug)]
 pub enum Bind {
-    One(u32, u32),
+    One(u32, u32, bool),
     Many(Vec<Bind>),
 }
 
@@ -57,7 +57,8 @@ impl Matcher<'_> {
             }
             Piece::Var(name, Some(frag)) => {
                 let to = fragment::extent(self.input, *frag, at, end)?;
-                binds.insert(self.def.text(*name).to_owned(), Bind::One(at, to));
+                let grouped = *frag == Frag::Expr && fragment::tree(self.input, at) != to;
+                binds.insert(self.def.text(*name).to_owned(), Bind::One(at, to, grouped));
                 Some(to)
             }
             Piece::Var(_, None) | Piece::Crate | Piece::Meta(_) => None,
@@ -103,6 +104,7 @@ struct Writer<'a> {
     binds: Binds,
     lens: Vec<usize>,
     krate: u32,
+    home: Option<Mark>,
     out: Tokens,
 }
 
@@ -128,7 +130,10 @@ impl Writer<'_> {
     fn emit(&mut self, pieces: &[Piece], rounds: &mut Vec<usize>) -> Result<()> {
         for piece in pieces {
             match piece {
-                Piece::Token(token) => self.out.copy(self.def, *token),
+                Piece::Token(token) => {
+                    let home = self.home.filter(|_| matches!(self.def.kind(*token), TokenKind::Ident | TokenKind::RawIdent));
+                    self.out.copy_marked(self.def, *token, home);
+                }
                 Piece::Group(open, inner) => {
                     self.out.copy(self.def, *open);
                     self.emit(inner, rounds)?;
@@ -145,8 +150,14 @@ impl Writer<'_> {
 
     fn var(&mut self, name: u32, rounds: &[usize]) -> Result<()> {
         match lookup(&self.binds, self.def.text(name), rounds) {
-            Some(&Bind::One(from, to)) => {
+            Some(&Bind::One(from, to, grouped)) => {
+                if grouped {
+                    self.out.lexed("(");
+                }
                 (from..to).for_each(|at| self.out.copy(self.input, at));
+                if grouped {
+                    self.out.lexed(")");
+                }
                 self.out.space();
             }
             Some(Bind::Many(_)) => bail!("metavariable ${} is still repeating", self.def.text(name)),
@@ -177,7 +188,7 @@ impl Writer<'_> {
         let text = self.def.text(token);
         let bound = if variable { lookup(&self.binds, text, rounds) } else { None };
         let part = match bound {
-            Some(&Bind::One(from, _)) => self.input.text(from),
+            Some(&Bind::One(from, ..)) => self.input.text(from),
             _ => text,
         };
         part.trim_start_matches("r#").trim_matches('"').to_owned()
@@ -210,14 +221,14 @@ impl Writer<'_> {
     }
 }
 
-/// Expands the call whose input is the group opening at `open` in `input` with the first rule that matches, written by a macro of crate `krate`.
-pub fn expand(def: &Source, rules: &[Rule], input: &Source, (open, krate): (u32, u32)) -> Result<Source> {
+/// Expands the call whose input is the group opening at `open` in `input` with the first rule that matches, written by a macro of crate `krate` whose own names carry the mark `home`.
+pub fn expand(def: &Source, rules: &[Rule], input: &Source, (open, krate): (u32, u32), home: Option<Mark>) -> Result<Source> {
     let matcher = Matcher { def, input };
     let close = input.pair(open);
     for rule in rules {
         let mut binds = Binds::default();
         if matcher.seq(&rule.matcher, open + 1, close, &mut binds) == Some(close) {
-            let mut writer = Writer { def, input, binds, lens: Vec::new(), krate, out: Tokens::default() };
+            let mut writer = Writer { def, input, binds, lens: Vec::new(), krate, home, out: Tokens::default() };
             writer.emit(&rule.body, &mut Vec::new())?;
             return writer.out.finish(input.path.clone());
         }

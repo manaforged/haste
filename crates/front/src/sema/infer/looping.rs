@@ -92,17 +92,18 @@ impl Infer<'_, '_> {
         let Some(item) = self.cx.lang_item(lang) else { bail!("no `{lang}` lang item") };
         let args = self.adt_args(item, Vec::new(), true)?;
         let fields = self.adt_fields(item, &args)?.swap_remove(0);
+        let mut filled = Vec::new();
         for (end, name) in [(from, "start"), (to, "end")] {
             let Some(end) = end else { continue };
             let index = self.range_field(item, name)?;
             let found = self.expr(end, Some(fields[index as usize]))?;
             self.coerce_expr(end, found, fields[index as usize])?;
-            self.out.fields.insert(end, index);
+            filled.push(index);
         }
         if lang == "RangeInclusive" {
-            let exhausted = self.range_field(item, "exhausted")?;
-            self.out.fields.insert(expr, exhausted);
+            filled.push(self.range_field(item, "exhausted")?);
         }
+        self.out.ranges.insert(expr, filled);
         self.out.res.insert(expr, Res::Ctor(item, 0, args.clone()));
         Ok(self.cx.types.intern(Kind::Adt(item, args)))
     }

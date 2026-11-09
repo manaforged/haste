@@ -18,6 +18,7 @@ impl Lower<'_, '_> {
             Intrinsic::PtrMetadata => self.metadata(substs, args),
             Intrinsic::ConstEvalSelect => self.const_eval_select(substs, args),
             Intrinsic::WithOverflow(op) => self.with_overflow(op, substs, args).map(Some),
+            Intrinsic::Simd(op) => self.simd(op, substs, args),
             Intrinsic::Trap => {
                 self.ins().trap();
                 self.close();

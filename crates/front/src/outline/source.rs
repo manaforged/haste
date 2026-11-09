@@ -26,13 +26,20 @@ pub fn doc(kind: TokenKind) -> Option<bool> {
     }
 }
 
+/// Where a token that a macro wrote came from: the `$` of a `$crate` naming a crate, or a name from the body of a `macro` item, which also resolves where that item is defined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    Crate(u32),
+    Home { krate: u32, file: u32, item: u32 },
+}
+
 /// A source file and its tokens, or tokens laid after those of a base file, numbered on from its last one.
 #[derive(Debug)]
 pub struct Source {
     pub path: PathBuf,
     pub text: String,
     pub tokens: Vec<Token>,
-    pub dollars: Vec<(u32, u32)>,
+    pub marks: Vec<(u32, Mark)>,
     pub base: Option<Arc<File>>,
     pub offset: u32,
 }
@@ -42,7 +49,7 @@ pub struct Source {
 pub struct Tokens {
     text: String,
     tokens: Vec<Token>,
-    dollars: Vec<(u32, u32)>,
+    marks: Vec<(u32, Mark)>,
 }
 
 fn is_punct_kind(kind: TokenKind) -> bool {
@@ -60,19 +67,26 @@ impl Tokens {
         self.tokens.push(Token { kind, start, len: text.len() as u32, pair: u32::MAX, joint });
     }
 
-    /// Copies token `at` of `src`, with its spacing and its `$crate` origin.
+    /// Copies token `at` of `src`, with its spacing and its origin mark.
     pub fn copy(&mut self, src: &Source, at: u32) {
         let (layer, local) = src.layer(at);
+        let mark = layer.own_mark(local as u32);
+        self.copy_marked(src, at, mark);
+    }
+
+    /// Copies token `at` of `src` with its spacing, marked as coming from `mark`.
+    pub fn copy_marked(&mut self, src: &Source, at: u32, mark: Option<Mark>) {
+        let (layer, local) = src.layer(at);
         let token = layer.tokens[local];
-        if let Some(krate) = layer.own_dollar(local as u32) {
-            self.dollars.push((self.tokens.len() as u32, krate));
+        if let Some(mark) = mark {
+            self.marks.push((self.tokens.len() as u32, mark));
         }
         self.append(token.kind, &layer.text[token.start as usize..(token.start + token.len) as usize], token.joint);
     }
 
     /// Writes `$crate` for the crate `krate`.
     pub fn dollar_crate(&mut self, krate: u32) {
-        self.dollars.push((self.tokens.len() as u32, krate));
+        self.marks.push((self.tokens.len() as u32, Mark::Crate(krate)));
         self.append(TokenKind::Dollar, "$", true);
         self.append(TokenKind::Ident, "crate", false);
     }
@@ -103,7 +117,7 @@ impl Tokens {
     pub fn finish(self, path: PathBuf) -> Result<Source> {
         let mut tokens = self.tokens;
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text: self.text, tokens, dollars: self.dollars, base: None, offset: 0 })
+        Ok(Source { path, text: self.text, tokens, marks: self.marks, base: None, offset: 0 })
     }
 
     /// The written tokens laid after every token of `base`, so that the indices of `base` still name its tokens.
@@ -241,7 +255,7 @@ impl Source {
         let mut text = text;
         let mut tokens = lex(&mut text);
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text, tokens, dollars: Vec::new(), base: None, offset: 0 })
+        Ok(Source { path, text, tokens, marks: Vec::new(), base: None, offset: 0 })
     }
 
     #[inline]
@@ -295,12 +309,20 @@ impl Source {
 
     /// The crate that the `$crate` starting at token `at` names, when a macro wrote it.
     pub fn dollar(&self, at: u32) -> Option<u32> {
-        let (src, local) = self.layer(at);
-        src.own_dollar(local as u32)
+        match self.mark(at) {
+            Some(Mark::Crate(krate)) => Some(krate),
+            _ => None,
+        }
     }
 
-    fn own_dollar(&self, local: u32) -> Option<u32> {
-        self.dollars.binary_search_by_key(&local, |(token, _)| *token).ok().map(|found| self.dollars[found].1)
+    /// The origin mark of token `at`, when a macro wrote it.
+    pub fn mark(&self, at: u32) -> Option<Mark> {
+        let (src, local) = self.layer(at);
+        src.own_mark(local as u32)
+    }
+
+    fn own_mark(&self, local: u32) -> Option<Mark> {
+        self.marks.binary_search_by_key(&local, |(token, _)| *token).ok().map(|found| self.marks[found].1)
     }
 
     /// The byte offset of token `at` in the text of its layer.

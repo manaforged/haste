@@ -6,7 +6,7 @@ use crate::names::path::Path as NamePath;
 use crate::names::collect::import_parts;
 use crate::names::{Def, ItemRef, PerNs, Primitive, SELF, Sym, Symbols, plain};
 use crate::outline::item::ItemKind;
-use crate::outline::source::Source;
+use crate::outline::source::{Mark, Source};
 
 use super::super::impls::ImplRef;
 use super::super::ty::{Kind, Mut, Ty};
@@ -26,10 +26,22 @@ impl<'a> Infer<'_, 'a> {
         segments(&self.cx.names.symbols, self.src, arena, path)
     }
 
-    /// The item a value path names, resolved from the body's module.
+    /// The item a value path names, resolved from the body's module, then for a single name that a `macro` item wrote, from that macro's module.
     pub fn value_item(&mut self, arena: &Body, path: PathId) -> Result<Def> {
         let (segments, absolute, dollar) = self.segments(arena, path);
-        self.value_def(&segments, absolute, dollar)
+        let found = self.value_def(&segments, absolute, dollar);
+        let [name] = segments[..] else { return found };
+        let first = arena.list(arena.path(path).segments)[0];
+        match (found, self.src.mark(arena.segments[first as usize].name)) {
+            (Err(error), Some(Mark::Home { krate, file, item })) => self.home_value(ItemRef { krate, file, item }, name).ok_or(error),
+            (found, _) => found,
+        }
+    }
+
+    fn home_value(&mut self, written_by: ItemRef, name: Sym) -> Option<Def> {
+        let module = self.cx.module_of(written_by).ok()?;
+        let path = NamePath { segments: &[name], absolute: false, dollar: None };
+        Some(self.cx.paths(module.krate).first(name, module, &path).values?.def)
     }
 
     /// The item in the value namespace that the path `segments` names.
@@ -71,13 +83,15 @@ impl<'a> Infer<'_, 'a> {
         self.body_imports(Some(word)).into_iter().next().unwrap_or_default()
     }
 
-    /// The traits that the `use` declarations inside the body name.
+    /// The traits in scope through the body: those it declares and those its `use` declarations name.
     pub(super) fn body_traits(&mut self) -> Vec<ItemRef> {
+        let mut traits = self.root.map(|root| self.cx.body_declared_traits(root)).unwrap_or_default();
         let found = self.body_imports(None).into_iter().filter_map(|entry| entry.types);
-        found.filter_map(|binding| match binding.def {
+        traits.extend(found.filter_map(|binding| match binding.def {
             Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Trait => Some(item),
             _ => None,
-        }).collect()
+        }));
+        traits
     }
 
     fn body_imports(&mut self, word: Option<Sym>) -> Vec<PerNs> {
@@ -248,7 +262,7 @@ impl<'a> Infer<'_, 'a> {
         let mut tys = Vec::new();
         for &at in arena.list(list) {
             match arena.args[at as usize] {
-                GenericArg::Ty(ty) => tys.push(self.lower_ty(arena, ty)?),
+                GenericArg::Ty(ty) => tys.push(self.ty_or_const_arg(arena, ty)?),
                 GenericArg::Lifetime(_) => {}
                 GenericArg::Const(expr) => tys.push(self.const_arg(arena, expr)?),
                 GenericArg::Binding { .. } | GenericArg::Constraint { .. } => {}

@@ -134,10 +134,7 @@ impl<'a> Context<'a> {
     }
 
     fn body_members(&self, block: ItemRef) -> Vec<ItemRef> {
-        let Some((root, at)) = block.outer() else { return Vec::new() };
-        let items = &self.file(block).items.items;
-        let member = |item: &crate::outline::item::Item| item.parent == Some(at) && matches!(item.kind, ItemKind::Fn | ItemKind::Const | ItemKind::Type);
-        items.iter().enumerate().filter(|(_, item)| member(item)).map(|(index, _)| root.inner(index as u32)).collect()
+        self.children(block).filter(|member| matches!(self.item(*member).1.kind, ItemKind::Fn | ItemKind::Const | ItemKind::Type)).collect()
     }
 
     /// The member of impl `block` named `name`.
@@ -147,9 +144,8 @@ impl<'a> Context<'a> {
 
     /// The impl block whose member `item` is.
     pub fn owner_impl(&mut self, item: ItemRef) -> Option<ImplRef> {
-        if let Some((root, _)) = item.outer() {
-            let parent = self.item(item).1.parent?;
-            return (self.file(item).items.items[parent as usize].kind == ItemKind::Impl).then(|| ImplRef::Body(root.inner(parent)));
+        if item.declaring_body().is_some() {
+            return self.parent_item(item).filter(|parent| self.item(*parent).1.kind == ItemKind::Impl).map(ImplRef::Body);
         }
         let owners = self.owners_of(item.krate);
         let file = self.file(item);
@@ -183,18 +179,22 @@ impl<'a> Context<'a> {
             _ => self.primitive_holders(),
         };
         let mut found = Vec::new();
-        for holder in self.holders_with_body(&holders, Some(head)) {
+        for holder in self.holders_with_body(&holders, (Some(head), None)) {
             found.extend(self.index_of(holder).inherent.get(&head).into_iter().flatten().copied());
         }
         found
     }
 
-    fn holders_with_body(&self, crates: &[u32], head: Option<Head>) -> Vec<Holder> {
+    fn holders_with_body(&self, crates: &[u32], (head, of): (Option<Head>, Option<ItemRef>)) -> Vec<Holder> {
         let mut holders: Vec<Holder> = crates.iter().map(|&krate| Holder::Crate(krate)).collect();
-        if let Some(Head::Adt(item)) = head
-            && let Some((root, _)) = item.outer()
-        {
-            holders.push(Holder::Body(root));
+        let local_self = match head {
+            Some(Head::Adt(item)) => item.declaring_body(),
+            _ => None,
+        };
+        for root in [local_self, of.and_then(ItemRef::declaring_body)].into_iter().flatten() {
+            if !holders.contains(&Holder::Body(root)) {
+                holders.push(Holder::Body(root));
+            }
         }
         holders
     }
@@ -202,7 +202,7 @@ impl<'a> Context<'a> {
     /// The impls of trait `of` in crates `holders` whose self type may have head `head`.
     pub fn trait_impls(&mut self, of: ItemRef, head: Option<Head>, holders: &[u32]) -> Vec<ImplRef> {
         let mut found = Vec::new();
-        for holder in self.holders_with_body(holders, head) {
+        for holder in self.holders_with_body(holders, (head, Some(of))) {
             let index = self.index_of(holder);
             let blocks = index.traits.get(&of).into_iter().flatten();
             found.extend(blocks.filter(|(_, own)| own.is_none() || head.is_none() || *own == head).map(|(block, _)| *block));

@@ -8,8 +8,9 @@ use crate::names::path::Asks;
 use crate::names::resolve::macro_at;
 use crate::names::{ItemRef, ModRef, plain};
 use crate::outline::item::{ItemKind, Items};
+use crate::outline::rules::{self, Rule};
 use crate::outline::{mbe, scan};
-use crate::outline::source::{Source, Tokens};
+use crate::outline::source::{Mark, Source, Tokens};
 use crate::outline::tree::{Expansion, File, Truth};
 
 use super::Context;
@@ -17,12 +18,20 @@ use super::builtin::{self, Builtin};
 
 const DEPTH: u32 = 64;
 
+/// A `macro_rules!` that a body defines, copied out so that its rules index its own tokens.
+struct Local {
+    name: String,
+    source: Source,
+    rules: Vec<Rule>,
+}
+
 /// The expansions of one body being written after the tokens of its file.
 struct Writer {
     out: Tokens,
     calls: HashMap<u32, u32>,
     offset: u32,
     home: ModRef,
+    locals: Vec<Local>,
 }
 
 /// A token range being scanned for macro calls: its source, where it starts, how far its indices sit from those of the body, and how deep in expansions it is.
@@ -85,7 +94,11 @@ impl Writer {
         }
         let next = at + 1;
         if at > run.from && src.text(at - 1) == "macro_rules" && is_name(src.kind(next)) {
-            return Ok(if opens(src.kind(next + 1)) { src.pair(next + 1) + 1 } else { next + 1 });
+            if !opens(src.kind(next + 1)) {
+                return Ok(next + 1);
+            }
+            self.define(src, next)?;
+            return Ok(src.pair(next + 1) + 1);
         }
         let Some(path) = call_path(src, at, run.from).filter(|_| opens(src.kind(next))) else { return Ok(next) };
         self.call(cx, run, path, next)?;
@@ -103,13 +116,27 @@ impl Writer {
         self.scan(cx, Run { src: &output, from: 0, shift: block + 1, depth: run.depth + 1 }, output.len())
     }
 
+    fn define(&mut self, src: &Source, name: u32) -> Result<()> {
+        let mut copy = Tokens::default();
+        (name + 1..=src.pair(name + 1)).for_each(|at| copy.copy(src, at));
+        let source = copy.finish(src.path.clone())?;
+        let rules = rules::parse(&source, 0)?;
+        self.locals.push(Local { name: plain(src.text(name)).to_owned(), source, rules });
+        Ok(())
+    }
+
     fn expand_one(&self, cx: &Context<'_>, run: Run<'_>, path: (u32, u32), open: u32) -> Result<Option<Source>> {
-        let Some(found) = macro_at(&cx.paths(self.home.krate), run.src, path, self.home) else { return Ok(None) };
         if run.depth >= DEPTH {
             bail!("macro {} recursed past {DEPTH} levels", run.src.text(path.1));
         }
+        let name = plain(run.src.text(path.1));
+        if let Some(local) = self.locals.iter().rev().find(|local| path.0 == path.1 && local.name == name) {
+            return mbe::expand(&local.source, &local.rules, run.src, (open, self.home.krate), None).map(Some);
+        }
+        let Some(found) = macro_at(&cx.paths(self.home.krate), run.src, path, self.home) else { return Ok(None) };
         if let Some(definition) = cx.outline.crates[found.krate as usize].defined.get(&(found.file, found.item)) {
-            return mbe::expand(&definition.file.source, &definition.rules, run.src, (open, definition.krate as u32)).map(Some);
+            let home = (cx.item(found).1.kind == ItemKind::Macro).then_some(Mark::Home { krate: found.krate, file: found.file, item: found.item });
+            return mbe::expand(&definition.file.source, &definition.rules, run.src, (open, definition.krate as u32), home).map(Some);
         }
         let Some(builtin) = cx.builtin(found) else { return Ok(None) };
         let mut out = Tokens::default();
@@ -185,6 +212,9 @@ impl Writer {
 
     fn literal(&self, cx: &Context<'_>, run: Run<'_>, (from, to): (u32, u32)) -> Result<Option<String>> {
         let src = run.src;
+        if to > from + 1 && src.kind(from) == TokenKind::OpenParen && src.pair(from) == to - 1 {
+            return self.literal(cx, run, (from + 1, to - 1));
+        }
         if to == from + 1 {
             return builtin::literal_text(src, from);
         }
@@ -225,12 +255,26 @@ impl<'a> Context<'a> {
 
     /// The item named `name` that the body of `root` declares.
     pub fn body_item(&self, root: ItemRef, name: &str) -> Option<ItemRef> {
-        let found = self.expansion(root)?;
-        let src = &found.file.source;
-        let items = &found.file.items.items;
-        let open = |entry: &crate::outline::item::Item| entry.parent.is_none_or(|parent| items[parent as usize].kind == ItemKind::ExternBlock);
-        let named = |entry: &crate::outline::item::Item| open(entry) && entry.name.is_some_and(|at| plain(src.text(at)) == name);
-        found.file.items.items.iter().position(named).map(|index| root.inner(index as u32))
+        let src = &self.expansion(root)?.file.source;
+        self.body_items(root).find(|(_, entry)| entry.name.is_some_and(|at| plain(src.text(at)) == name)).map(|(item, _)| item)
+    }
+
+    /// The traits that the body of `root` declares.
+    pub fn body_declared_traits(&self, root: ItemRef) -> Vec<ItemRef> {
+        self.body_items(root).filter(|(_, entry)| entry.kind == ItemKind::Trait).map(|(item, _)| item).collect()
+    }
+
+    fn body_items(&self, root: ItemRef) -> impl Iterator<Item = (ItemRef, &'a crate::outline::item::Item)> {
+        let items = self.expansion(root).map_or(&[][..], |found| &found.file.items.items[..]);
+        let open = move |entry: &crate::outline::item::Item| entry.parent.is_none_or(|parent| items[parent as usize].kind == ItemKind::ExternBlock);
+        items.iter().enumerate().filter(move |(_, entry)| open(entry)).map(move |(index, entry)| (root.inner(index as u32), entry))
+    }
+
+    fn body_config<'c>(&self, item: ItemRef, calls: Option<&'c HashMap<u32, u32>>) -> syntax::Config<'c>
+    where
+        'a: 'c,
+    {
+        syntax::Config { calls, env: Some(&self.outline.crates[item.krate as usize].env) }
     }
 
     /// Parses the body of `item`, expanding its macro calls and scanning the items it declares when no pass did yet.
@@ -238,19 +282,20 @@ impl<'a> Context<'a> {
         let file = self.file(item);
         if item.outer().is_some() || file.body_read(item.item) {
             let found = self.expansion(item);
-            return parse_in(self.body_src(item), found.map(|found| &found.calls), self.item(item).1);
+            return parse_in(self.body_src(item), self.body_config(item, found.map(|found| &found.calls)), self.item(item).1);
         }
-        let Some((from, to)) = body_range(file, item.item) else { return parse_in(&file.source, None, self.item(item).1) };
+        let Some((from, to)) = body_range(file, item.item) else { return parse_in(&file.source, self.body_config(item, None), self.item(item).1) };
         let home = self.module_of(item)?;
         let before = asked(&self.asks);
-        let mut writer = Writer { out: Tokens::default(), calls: HashMap::default(), offset: file.source.len(), home };
+        let mut writer = Writer { out: Tokens::default(), calls: HashMap::default(), offset: file.source.len(), home, locals: Vec::new() };
         writer.scan(self, Run { src: &file.source, from, shift: 0, depth: 0 }, to)?;
         if asked(&self.asks) > before {
             bail!("the macros that {} calls are not resolved yet", self.name(item));
         }
         let (source, calls) = (writer.out.finish_over(self.outline.crates[item.krate as usize].files[item.file as usize].clone())?, writer.calls);
-        let body = parse_in(&source, Some(&calls), self.item(item).1)?;
-        let items = declared(&source, &calls, &body)?;
+        let config = self.body_config(item, Some(&calls));
+        let body = parse_in(&source, config, self.item(item).1)?;
+        let items = declared(&source, config, &body)?;
         let found = (!calls.is_empty() || !items.items.is_empty()).then(|| Box::new(Expansion { file: File::new(source, items, true), calls }));
         file.set_expansion(item.item, found);
         Ok(body)
@@ -262,7 +307,7 @@ fn item_starts(body: &Body) -> impl Iterator<Item = u32> + '_ {
 }
 
 /// The items that `body` declares, and those that the bodies of its functions declare in turn.
-fn declared(source: &Source, calls: &HashMap<u32, u32>, body: &Body) -> Result<Items> {
+fn declared(source: &Source, config: syntax::Config<'_>, body: &Body) -> Result<Items> {
     let mut items = Items::default();
     let mut starts: Vec<u32> = item_starts(body).collect();
     while !starts.is_empty() {
@@ -272,7 +317,7 @@ fn declared(source: &Source, calls: &HashMap<u32, u32>, body: &Body) -> Result<I
             if entry.kind != ItemKind::Fn || entry.body.is_none() {
                 continue;
             }
-            if let Ok(inner) = parse_in(source, Some(calls), entry) {
+            if let Ok(inner) = parse_in(source, config, entry) {
                 starts.extend(item_starts(&inner));
             }
         }
@@ -288,13 +333,13 @@ pub fn stmt_items(items: &[crate::outline::item::Item], (start, end): (u32, u32)
     top.into_iter().chain(children)
 }
 
-fn parse_in(src: &Source, calls: Option<&HashMap<u32, u32>>, entry: &crate::outline::item::Item) -> Result<Body> {
+fn parse_in(src: &Source, config: syntax::Config<'_>, entry: &crate::outline::item::Item) -> Result<Body> {
     match (entry.kind, entry.name) {
         (ItemKind::Const | ItemKind::Static, Some(name)) => {
             let from = sig::initializer(src, name, entry.end).ok_or_else(|| anyhow!("constant {} has no value", src.text(name)))?;
-            syntax::parse_expr(src, from, entry.end - 1, calls)
+            syntax::parse_expr(src, from, entry.end - 1, config)
         }
-        _ => syntax::parse(src, entry.body.ok_or_else(|| anyhow!("function {} has no body", src.text(entry.name.unwrap_or(entry.start))))?, calls),
+        _ => syntax::parse(src, entry.body.ok_or_else(|| anyhow!("function {} has no body", src.text(entry.name.unwrap_or(entry.start))))?, config),
     }
 }
 

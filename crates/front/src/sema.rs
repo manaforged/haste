@@ -87,6 +87,26 @@ impl<'a> Context<'a> {
         (&file.source, &file.items.items[index as usize])
     }
 
+    /// The item that `item` is declared directly inside, in the same file or body.
+    pub fn parent_item(&self, item: ItemRef) -> Option<ItemRef> {
+        let parent = self.item(item).1.parent?;
+        Some(match item.declaring_body() {
+            Some(root) => root.inner(parent),
+            None => ItemRef { item: parent, ..item },
+        })
+    }
+
+    /// The items declared directly inside `of`: the members of a trait or impl, in the file or body that holds it.
+    pub fn children(&self, of: ItemRef) -> impl Iterator<Item = ItemRef> + 'a {
+        let items: &'a [Item] = &self.file(of).items.items;
+        let at = of.outer().map_or(of.item, |(_, at)| at);
+        let body = of.declaring_body();
+        (0..items.len() as u32).filter(move |&index| items[index as usize].parent == Some(at)).map(move |index| match body {
+            Some(root) => root.inner(index),
+            None => ItemRef { item: index, ..of },
+        })
+    }
+
     /// Whether `item` is a function declared in an `extern` block: a signature with no body.
     pub fn foreign(&self, item: ItemRef) -> bool {
         let (_, entry) = self.item(item);

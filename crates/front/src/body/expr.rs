@@ -167,7 +167,7 @@ impl Cursor<'_> {
                 }
                 TokenKind::OpenParen => {
                     let open = self.group();
-                    let args = self.comma_list(open, Cursor::arg)?;
+                    let args = self.kept_list(open, Cursor::arg)?;
                     self.push_expr(Expr::Call(expr, args))
                 }
                 TokenKind::OpenBracket => {
@@ -181,13 +181,13 @@ impl Cursor<'_> {
         }
     }
 
-    fn arg(&mut self) -> Result<u32> {
+    fn arg(&mut self) -> Result<Option<u32>> {
         let attrs = self.skip_attrs()?;
         let expr = self.expr()?;
         if let Some((from, to)) = attrs {
             self.body.attrs.push((super::Node::Expr(expr), from, to));
         }
-        Ok(expr.0)
+        Ok((!self.configured_out(attrs)).then_some(expr.0))
     }
 
     fn dot(&mut self, expr: ExprId) -> Result<ExprId> {
@@ -217,7 +217,7 @@ impl Cursor<'_> {
             return Ok(self.push_expr(Expr::Field(expr, name)));
         }
         let open = self.group();
-        let params = self.comma_list(open, Cursor::arg)?;
+        let params = self.kept_list(open, Cursor::arg)?;
         let args = generics.map(|args| match args {
             super::Args::Angle(list) => list,
             _ => super::List::default(),
@@ -322,7 +322,7 @@ impl Cursor<'_> {
         if self.punct("!") && !self.punct("!=") && matches!(self.kind_at(self.at + 1), TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace) {
             self.at += 1;
             let open = self.group();
-            if let Some(&block) = self.calls.and_then(|calls| calls.get(&open)) {
+            if let Some(&block) = self.config.calls.and_then(|calls| calls.get(&open)) {
                 return self.expanded(block);
             }
             return Ok(self.push_expr(Expr::Macro { path, open }));
@@ -358,7 +358,9 @@ impl Cursor<'_> {
                 if let Some((from, to)) = attrs {
                     cursor.body.attrs.push((super::Node::Field(field), from, to));
                 }
-                fields.push(field);
+                if !cursor.configured_out(attrs) {
+                    fields.push(field);
+                }
                 if !cursor.eat(",") {
                     break;
                 }
@@ -394,7 +396,7 @@ impl Cursor<'_> {
             let mut items = Vec::new();
             let mut trailing = false;
             while !cursor.done() {
-                items.push(cursor.arg()?);
+                items.extend(cursor.arg()?);
                 trailing = cursor.eat(",");
                 if !trailing {
                     break;
@@ -414,7 +416,7 @@ impl Cursor<'_> {
         let (items, len) = self.inside(open, |cursor| {
             let mut items = Vec::new();
             while !cursor.done() {
-                items.push(cursor.arg()?);
+                items.extend(cursor.arg()?);
                 if items.len() == 1 && cursor.eat(";") {
                     return Ok((items, Some(cursor.expr()?)));
                 }
@@ -496,7 +498,7 @@ impl Cursor<'_> {
         let arms = self.inside(open, |cursor| {
             let mut arms = Vec::new();
             while !cursor.done() {
-                arms.push(cursor.arm()?);
+                arms.extend(cursor.arm()?);
             }
             Ok(arms)
         })?;
@@ -504,7 +506,7 @@ impl Cursor<'_> {
         Ok(self.push_expr(Expr::Match(scrutinee, arms)))
     }
 
-    fn arm(&mut self) -> Result<u32> {
+    fn arm(&mut self) -> Result<Option<u32>> {
         let attrs = self.skip_attrs()?;
         let pat = self.pat()?;
         let guard = if self.eat_word("if") { Some(self.expr()?) } else { None };
@@ -518,7 +520,7 @@ impl Cursor<'_> {
         if let Some((from, to)) = attrs {
             self.body.attrs.push((super::Node::Arm(index), from, to));
         }
-        Ok(index)
+        Ok((!self.configured_out(attrs)).then_some(index))
     }
 
     /// Whether the next expression is block-like: a block, `if`, `match`, a loop, or a kinded block.

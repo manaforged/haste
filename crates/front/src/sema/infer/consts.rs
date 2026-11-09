@@ -12,6 +12,76 @@ use super::path::parse_int;
 /// The width and signedness of an integer type.
 type Int = (u32, bool);
 
+const U32: Int = (32, false);
+
+const USIZE: Int = (64, false);
+
+/// A method that constant expressions call: a pure method of the integer types, or the length of a string, byte string or array.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstMethod {
+    Ilog,
+    Ilog2,
+    Ilog10,
+    Pow,
+    CountOnes,
+    CountZeros,
+    LeadingZeros,
+    TrailingZeros,
+    Len,
+}
+
+const CONST_METHODS: [(&str, ConstMethod); 9] = [
+    ("ilog", ConstMethod::Ilog),
+    ("ilog2", ConstMethod::Ilog2),
+    ("ilog10", ConstMethod::Ilog10),
+    ("pow", ConstMethod::Pow),
+    ("count_ones", ConstMethod::CountOnes),
+    ("count_zeros", ConstMethod::CountZeros),
+    ("leading_zeros", ConstMethod::LeadingZeros),
+    ("trailing_zeros", ConstMethod::TrailingZeros),
+    ("len", ConstMethod::Len),
+];
+
+fn ilog(value: u128, base: u128) -> u128 {
+    let (mut value, mut log) = (value, 0);
+    while value >= base {
+        value /= base;
+        log += 1;
+    }
+    log
+}
+
+fn int_method(method: ConstMethod, x: u128, args: &[u128], int: Int) -> Result<(u128, Int)> {
+    let arg = args.first().copied();
+    match (method, arg) {
+        (ConstMethod::Ilog | ConstMethod::Ilog2 | ConstMethod::Ilog10, _) => int_log(method, x, arg, int).map(|log| (log, U32)),
+        (ConstMethod::Pow, Some(exp)) => Ok((x.wrapping_pow(exp as u32) & mask(int.0), int)),
+        (ConstMethod::Pow, None) => bail!("`pow` in a constant has no exponent"),
+        _ => Ok((int_bits(method, x & mask(int.0), int.0), U32)),
+    }
+}
+
+fn int_log(method: ConstMethod, x: u128, base: Option<u128>, (bits, is_signed): Int) -> Result<u128> {
+    if x == 0 || (is_signed && signed(x, bits) < 0) {
+        bail!("the logarithm of a value that is not positive in a constant");
+    }
+    Ok(match (method, base) {
+        (ConstMethod::Ilog2, _) => u128::from(127 - x.leading_zeros()),
+        (ConstMethod::Ilog, Some(base)) if base >= 2 => ilog(x, base),
+        (ConstMethod::Ilog, _) => bail!("a logarithm of base below 2 in a constant"),
+        _ => ilog(x, 10),
+    })
+}
+
+fn int_bits(method: ConstMethod, x: u128, bits: u32) -> u128 {
+    u128::from(match method {
+        ConstMethod::CountOnes => x.count_ones(),
+        ConstMethod::CountZeros => bits - x.count_ones(),
+        ConstMethod::LeadingZeros => x.leading_zeros() - (128 - bits),
+        _ => x.trailing_zeros().min(bits),
+    })
+}
+
 fn mask(bits: u32) -> u128 {
     if bits == 128 { u128::MAX } else { (1 << bits) - 1 }
 }
@@ -60,17 +130,22 @@ impl Infer<'_, '_> {
     pub(super) fn const_value(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(u128, Int)> {
         let sig = self.cx.signature(item)?;
         let Some(ret) = sig.ret else { bail!("constant {} has no type", self.cx.name(item)) };
-        let body = self.cx.body(item)?;
-        let Some(root) = body.root else { bail!("constant {} has no value", self.cx.name(item)) };
-        let mut frame = self.frame(item, substs)?;
-        (frame.src, frame.root) = (self.cx.body_src(item), Some(item.body_owner()));
-        self.with_frame(frame, |infer| {
+        self.with_const_body(item, substs, |infer, body, root| {
             let ty = infer.lower_ty(&sig.body, ret)?;
             let Kind::Prim(primitive) = *infer.cx.types.kind(ty) else { bail!("constant of a type that is not an integer") };
             let Some(int) = int_info(primitive) else { bail!("constant of a type that is not an integer") };
-            let (value, _) = infer.const_eval(&body, root, int)?;
+            let (value, _) = infer.const_eval(body, root, int)?;
             Ok((value & mask(int.0), int))
         })
+    }
+
+    /// Runs `run` on the body and value expression of the constant or const fn `item` at `substs`, with names read as that body reads them.
+    fn with_const_body<T>(&mut self, item: ItemRef, substs: &[Ty], run: impl FnOnce(&mut Self, &Body, ExprId) -> Result<T>) -> Result<T> {
+        let body = self.cx.body(item)?;
+        let Some(root) = body.root else { bail!("{} has no value to evaluate", self.cx.name(item)) };
+        let mut frame = self.frame(item, substs)?;
+        (frame.src, frame.root) = (self.cx.body_src(item), Some(item.body_owner()));
+        self.with_frame(frame, |infer| run(infer, &body, root))
     }
 
     fn variant_value(&mut self, item: ItemRef, index: u32) -> Result<(u128, Int)> {
@@ -105,8 +180,18 @@ impl Infer<'_, '_> {
         if let Some(param) = self.named_param(arena, expr) {
             return Ok(param);
         }
-        let (value, (bits, _)) = self.const_eval(arena, expr, (64, false))?;
+        let (value, (bits, _)) = self.const_eval(arena, expr, USIZE)?;
         Ok(self.cx.types.intern(Kind::Value(value & mask(bits))))
+    }
+
+    /// The generic argument `ty`: a type, or, when a plain path names no type, the constant it names, as rustc reads an argument that could be either.
+    pub(super) fn ty_or_const_arg(&mut self, arena: &Body, ty: TyId) -> Result<Ty> {
+        let lowered = self.lower_ty(arena, ty);
+        let (Err(error), &crate::body::Ty::Path(path)) = (&lowered, arena.ty(ty)) else { return lowered };
+        match self.const_path(arena, path) {
+            Ok((value, (bits, _))) => Ok(self.cx.types.intern(Kind::Value(value & mask(bits)))),
+            Err(_) => bail!("{error:#}"),
+        }
     }
 
     fn named_param(&self, arena: &Body, expr: ExprId) -> Option<Ty> {
@@ -138,8 +223,24 @@ impl Infer<'_, '_> {
             Expr::Cast(inner, ty) => self.const_cast(arena, inner, ty),
             Expr::Call(callee, args) if arena.list(args).is_empty() => self.const_call(arena, callee, want),
             Expr::Path(path) => self.const_name(arena, (expr, path), want),
+            Expr::Method { receiver, name, args: None, params } => self.const_method(arena, (receiver, name, params), want),
             other => bail!("constant expressions like {other:?} are not evaluated yet"),
         }
+    }
+
+    fn const_method(&mut self, arena: &Body, (receiver, name, params): (ExprId, u32, crate::body::List), want: Int) -> Result<(u128, Int)> {
+        let text = crate::names::plain(self.src.text(name));
+        let Some(&(_, method)) = CONST_METHODS.iter().find(|(known, _)| *known == text) else { bail!("the method `{text}` is not evaluated in constants yet") };
+        if method == ConstMethod::Len {
+            return Ok((self.const_len(arena, receiver)?, USIZE));
+        }
+        let (x, int) = self.const_eval(arena, receiver, want)?;
+        let wanted = if method == ConstMethod::Pow { U32 } else { int };
+        let mut args = Vec::new();
+        for &arg in arena.list(params) {
+            args.push(self.const_eval(arena, ExprId(arg), wanted)?.0);
+        }
+        int_method(method, x, &args, int)
     }
 
     fn const_unary(&mut self, arena: &Body, op: UnOp, inner: ExprId, want: Int) -> Result<(u128, Int)> {
@@ -207,8 +308,8 @@ impl Infer<'_, '_> {
             None => bail!("a layout intrinsic with no type"),
         };
         match self.cx.intrinsic(item) {
-            Some(Intrinsic::SizeOf) => Ok((u128::from(layout_of(self)?.size.bytes()), (64, false))),
-            Some(Intrinsic::AlignOf) => Ok((u128::from(layout_of(self)?.align.abi.bytes()), (64, false))),
+            Some(Intrinsic::SizeOf) => Ok((u128::from(layout_of(self)?.size.bytes()), USIZE)),
+            Some(Intrinsic::AlignOf) => Ok((u128::from(layout_of(self)?.align.abi.bytes()), USIZE)),
             Some(other) => bail!("the intrinsic {other:?} in a constant is not evaluated yet"),
             None => self.const_body(item, &substs, want),
         }
@@ -225,11 +326,24 @@ impl Infer<'_, '_> {
     }
 
     fn const_body(&mut self, item: ItemRef, substs: &[Ty], want: Int) -> Result<(u128, Int)> {
-        let body = self.cx.body(item)?;
-        let Some(root) = body.root else { bail!("{} has no body to evaluate", self.cx.name(item)) };
-        let mut frame = self.frame(item, substs)?;
-        (frame.src, frame.root) = (self.cx.body_src(item), Some(item.body_owner()));
-        self.with_frame(frame, |infer| infer.const_eval(&body, root, want))
+        self.with_const_body(item, substs, |infer, body, root| infer.const_eval(body, root, want))
+    }
+
+    fn const_len(&mut self, arena: &Body, expr: ExprId) -> Result<u128> {
+        Ok(match *arena.expr(expr) {
+            Expr::Lit(Lit::Str | Lit::ByteStr, at) => crate::body::literal::string_bytes(self.src.text(at))?.len() as u128,
+            Expr::Array(items) => arena.list(items).len() as u128,
+            Expr::Repeat(_, count) => self.const_eval(arena, count, USIZE)?.0,
+            Expr::Paren(inner) | Expr::Ref { expr: inner, .. } => self.const_len(arena, inner)?,
+            Expr::Path(path) => {
+                let (segments, absolute, dollar) = self.segments(arena, path);
+                match self.value_def(&segments, absolute, dollar)? {
+                    Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Const => self.with_const_body(item, &[], |infer, body, root| infer.const_len(body, root))?,
+                    _ => bail!("`{}` is not a constant whose length is known", self.spell(&segments)),
+                }
+            }
+            ref other => bail!("the length of {other:?} in a constant"),
+        })
     }
 
     /// The value of the integer constant that the path `segments` names: an associated constant of an integer type, or a constant item.

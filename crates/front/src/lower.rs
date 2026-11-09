@@ -17,6 +17,7 @@ mod object;
 mod ops;
 mod place;
 mod promote;
+mod simd;
 mod slice_pat;
 
 use anyhow::{Result, bail};

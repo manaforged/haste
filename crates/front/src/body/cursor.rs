@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use rustc_hash::FxHashMap as HashMap;
 use rustc_lexer::TokenKind;
 
 use crate::outline::source::Source;
@@ -13,7 +12,7 @@ pub struct Cursor<'a> {
     pub end: u32,
     pub body: Body,
     pub no_struct: bool,
-    pub calls: Option<&'a HashMap<u32, u32>>,
+    pub config: super::Config<'a>,
 }
 
 /// Whether `kind` is an identifier.
@@ -27,7 +26,14 @@ pub const RESERVED: [&str; 38] = [
 
 impl<'a> Cursor<'a> {
     pub fn new(src: &'a Source, at: u32, end: u32) -> Cursor<'a> {
-        Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false, calls: None }
+        Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false, config: super::Config::default() }
+    }
+
+    /// Whether the outer attributes at `attrs` hold a `#[cfg]` that the environment turns off.
+    pub fn configured_out(&self, attrs: Option<(u32, u32)>) -> bool {
+        let (Some(env), Some((from, _))) = (self.config.env, attrs) else { return false };
+        let mut parsed = Vec::new();
+        crate::outline::attr::attrs(self.src, from, false, &mut parsed).is_ok() && !env.enabled(&parsed)
     }
 
     pub fn kind_at(&self, at: u32) -> TokenKind {
@@ -144,10 +150,15 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn comma_list(&mut self, open: u32, mut item: impl FnMut(&mut Self) -> Result<u32>) -> Result<List> {
+        self.kept_list(open, |cursor| item(cursor).map(Some))
+    }
+
+    /// The comma-separated items inside the group at `open`, keeping those that `item` returns.
+    pub fn kept_list(&mut self, open: u32, mut item: impl FnMut(&mut Self) -> Result<Option<u32>>) -> Result<List> {
         let ids = self.inside(open, |cursor| {
             let mut ids = Vec::new();
             while !cursor.done() {
-                ids.push(item(cursor)?);
+                ids.extend(item(cursor)?);
                 if !cursor.eat(",") {
                     break;
                 }

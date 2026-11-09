@@ -68,7 +68,9 @@ impl Infer<'_, '_> {
     fn bind_name(&mut self, pat: PatId, (name, mutable, by_ref): (u32, bool, bool), sub: Option<PatId>, (ty, mode): (Ty, Mode)) -> Result<()> {
         if !mutable && !by_ref && sub.is_none() && let Some((found, res)) = self.named_pat(name)? {
             self.out.pat_res.insert(pat, res);
-            return self.unify(ty, found);
+            let (peeled, _) = self.peel_refs(pat, ty, mode);
+            self.out.pats.insert(pat, peeled);
+            return self.unify(peeled, found);
         }
         let explicit = if mutable { Mut::Mut } else { Mut::Not };
         let reference = match (by_ref, mode) {
@@ -101,7 +103,7 @@ impl Infer<'_, '_> {
         self.pat(inner, pointee, Mode::Value)
     }
 
-    fn peel(&mut self, pat: PatId, mut ty: Ty, mut mode: Mode) -> (Ty, Mode) {
+    fn peel(&mut self, pat: PatId, ty: Ty, mode: Mode) -> (Ty, Mode) {
         let keeps = match *self.body.pat(pat) {
             Pat::Bind { .. } | Pat::Wild | Pat::Rest | Pat::Ref { .. } | Pat::Paren(_) => true,
             Pat::Lit(expr) => matches!(self.body.expr(expr), Expr::Lit(Lit::Str | Lit::ByteStr | Lit::CStr, _)),
@@ -110,6 +112,10 @@ impl Infer<'_, '_> {
         if keeps {
             return (ty, mode);
         }
+        self.peel_refs(pat, ty, mode)
+    }
+
+    fn peel_refs(&mut self, pat: PatId, mut ty: Ty, mut mode: Mode) -> (Ty, Mode) {
         let mut derefs = 0;
         while let Kind::Ref(mutability, inner) = *self.cx.types.kind(self.resolve(ty)) {
             mode = match mode {
@@ -142,15 +148,23 @@ impl Infer<'_, '_> {
 
     fn slice_pat(&mut self, list: List, ty: Ty, mode: Mode) -> Result<()> {
         let (pats, rest) = rest_split(self.body, list)?;
-        let element = self.slice_element(ty, pats.len() - usize::from(rest.is_some()), rest.is_some())?;
+        let given = pats.len() - usize::from(rest.is_some());
+        let element = self.slice_element(ty, given, rest.is_some())?;
         for (at, &pat) in pats.iter().enumerate() {
-            match Some(at) == rest {
-                true if !matches!(self.body.pat(pat), Pat::Rest) => bail!("a binding of the rest of a slice is not supported yet"),
-                true => {}
-                false => self.pat(pat, element, mode)?,
-            }
+            let item = if Some(at) == rest { self.rest_ty(ty, element, given) } else { element };
+            self.pat(pat, item, mode)?;
         }
         Ok(())
+    }
+
+    fn rest_ty(&mut self, ty: Ty, element: Ty, given: usize) -> Ty {
+        match *self.cx.types.kind(ty) {
+            Kind::Array(_, len) => {
+                let left = self.cx.types.len(len).unwrap_or(0) - given as u64;
+                self.cx.types.array(element, left)
+            }
+            _ => self.cx.types.intern(Kind::Slice(element)),
+        }
     }
 
     fn slice_element(&mut self, ty: Ty, given: usize, rest: bool) -> Result<Ty> {

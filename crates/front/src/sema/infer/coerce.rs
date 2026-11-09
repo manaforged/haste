@@ -4,6 +4,8 @@ use super::super::ty::{Kind, Mut, Ty};
 use super::object::Vtable;
 use super::{Infer, Res};
 
+const DEREF_LIMIT: usize = 8;
+
 /// How the value of an expression changes as it coerces to the type that it is used at.
 #[derive(Clone, Debug)]
 pub enum Coercion {
@@ -13,12 +15,14 @@ pub enum Coercion {
     Vtable(Vtable),
     /// A function item, or a closure that captures nothing, becomes a pointer to the code of this function.
     Reify(Res),
+    /// A reference becomes a reference to what dereferencing its pointee reaches: each step names the type it dereferences and, unless the compiler dereferences it, the `Deref::deref` call; then the type reached.
+    Deref(Vec<(Ty, Option<Res>)>, Ty),
 }
 
 impl Coercion {
     /// Whether the coerced value is a pointer that carries metadata after its address.
     pub fn widens(&self) -> bool {
-        !matches!(self, Coercion::Reify(_))
+        !matches!(self, Coercion::Reify(_) | Coercion::Deref(..))
     }
 }
 
@@ -27,13 +31,7 @@ impl Infer<'_, '_> {
     pub(super) fn coercion(&mut self, found: Ty, expected: Ty) -> Result<Option<Coercion>> {
         let (found, expected) = (self.resolve(found), self.resolve(expected));
         match (self.cx.types.kind(found).clone(), self.cx.types.kind(expected).clone()) {
-            (Kind::Ref(from, a) | Kind::Ptr(from, a), Kind::Ref(to, b) | Kind::Ptr(to, b)) => {
-                let unsize = self.unsize_pointee(a, b)?;
-                if unsize.is_some() && from == Mut::Not && to == Mut::Mut {
-                    bail!("cannot coerce a shared pointer to a mutable one");
-                }
-                Ok(unsize)
-            }
+            (Kind::Ref(from, a) | Kind::Ptr(from, a), Kind::Ref(to, b) | Kind::Ptr(to, b)) => self.pointer_coercion((found, expected), (from, a), (to, b)),
             (Kind::Adt(a, from), Kind::Adt(b, to)) if a == b && from != to && self.coerces(found, expected)? => self.unsize_args(&from, &to),
             (Kind::FnDef(item, substs), Kind::FnPtr(params, ret)) => {
                 let have = self.fn_types(item, &substs)?;
@@ -66,6 +64,62 @@ impl Infer<'_, '_> {
         Ok(None)
     }
 
+    fn pointer_coercion(&mut self, (found, expected): (Ty, Ty), (from, a): (Mut, Ty), (to, b): (Mut, Ty)) -> Result<Option<Coercion>> {
+        let unsize = self.unsize_pointee(a, b)?;
+        let loosens = from == Mut::Not && to == Mut::Mut;
+        if unsize.is_some() && loosens {
+            bail!("cannot coerce a shared pointer to a mutable one");
+        }
+        let both_refs = matches!(self.cx.types.kind(found), Kind::Ref(..)) && matches!(self.cx.types.kind(expected), Kind::Ref(..));
+        match unsize {
+            None if both_refs && !loosens => self.deref_coercion(a, b, to),
+            unsize => Ok(unsize),
+        }
+    }
+
+    fn deref_coercion(&mut self, from: Ty, to: Ty, mutability: Mut) -> Result<Option<Coercion>> {
+        let (mut ty, to) = (self.resolve(from), self.resolve(to));
+        let mut steps = Vec::new();
+        while steps.len() < DEREF_LIMIT {
+            if self.same_head(ty, to) {
+                if steps.is_empty() {
+                    return Ok(None);
+                }
+                if self.trial_unify(ty, to) {
+                    return Ok(Some(Coercion::Deref(steps, to)));
+                }
+            }
+            let next = match self.cx.types.kind(ty).clone() {
+                Kind::Ref(_, inner) => Some((inner, None)),
+                Kind::Adt(..) if self.cx.boxed(ty).is_some() => self.cx.boxed(ty).map(|inner| (inner, None)),
+                Kind::Adt(..) => self.overloaded_deref(ty, mutability)?.map(|(res, target)| (target, Some(res))),
+                _ => None,
+            };
+            let Some((inner, res)) = next else { return Ok(None) };
+            steps.push((ty, res));
+            ty = self.resolve(inner);
+        }
+        Ok(None)
+    }
+
+    fn same_head(&self, a: Ty, b: Ty) -> bool {
+        let (a, b) = (self.cx.types.kind(a), self.cx.types.kind(b));
+        match (a, b) {
+            (Kind::Var(_), _) | (_, Kind::Var(_)) => true,
+            (Kind::Adt(x, _), Kind::Adt(y, _)) => x == y,
+            _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+        }
+    }
+
+    fn trial_unify(&mut self, a: Ty, b: Ty) -> bool {
+        let saved = self.vars.clone();
+        let unified = self.unify(a, b).is_ok();
+        if !unified {
+            self.vars = saved;
+        }
+        unified
+    }
+
     fn reify_closure(&mut self, found: Ty, (params, ret): (Vec<Ty>, Ty)) -> Result<Option<Coercion>> {
         let (inputs, output, captures) = self.closure_sig(found)?;
         if captures {
@@ -91,6 +145,13 @@ impl Infer<'_, '_> {
             Coercion::Len(len) => Ok(Coercion::Len(self.zonk(len))),
             Coercion::Vtable(vtable) => self.zonk_vtable(vtable).map(Coercion::Vtable),
             Coercion::Reify(res) => self.zonk_res(res).map(Coercion::Reify),
+            Coercion::Deref(steps, to) => {
+                let mut zonked = Vec::new();
+                for (ty, res) in steps {
+                    zonked.push((self.zonk(ty), res.map(|res| self.zonk_res(res)).transpose()?));
+                }
+                Ok(Coercion::Deref(zonked, self.zonk(to)))
+            }
         }
     }
 }

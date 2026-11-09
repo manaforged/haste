@@ -88,6 +88,8 @@ pub struct Typed {
     /// The expressions whose value coerces to the type it is used at, and how.
     pub coercions: HashMap<ExprId, Coercion>,
     pub fields: HashMap<ExprId, u32>,
+    /// The fields that each range expression fills: one per end it gives, in order, then `exhausted` for an inclusive range.
+    pub ranges: HashMap<ExprId, Vec<u32>>,
     pub field_pats: HashMap<PatId, u32>,
     pub pat_res: HashMap<PatId, Res>,
     pub pat_derefs: HashMap<PatId, u32>,
@@ -130,6 +132,7 @@ impl Typed {
                 Coercion::Vtable(vtable) => Box::new(vtable.drop.iter().chain(vtable.methods.iter().flatten())),
                 Coercion::Reify(res) => Box::new(std::iter::once(res)),
                 Coercion::Len(_) => Box::new(std::iter::empty()),
+                Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
             }
         });
         self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values()).chain(loops).chain(tries).chain(&self.drops).chain(glue).chain(untuple).chain(coerced).filter_map(|res| match res {

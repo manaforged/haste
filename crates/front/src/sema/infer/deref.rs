@@ -106,7 +106,7 @@ impl Infer<'_, '_> {
         Ok(self.cx.paths(self.home.krate).within(self.home, module))
     }
 
-    fn overloaded_deref(&mut self, ty: Ty, mutability: Mut) -> Result<Option<(Res, Ty)>> {
+    pub(super) fn overloaded_deref(&mut self, ty: Ty, mutability: Mut) -> Result<Option<(Res, Ty)>> {
         let (lang, name) = match mutability {
             Mut::Not => ("deref", "deref"),
             Mut::Mut => ("deref_mut", "deref_mut"),

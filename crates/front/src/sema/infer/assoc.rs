@@ -51,7 +51,7 @@ impl Infer<'_, '_> {
             let args = super::super::ty::object_parts(&args, &members).0.to_vec();
             return self.trait_value(of, (Some(owner), Some(args)), (name, given));
         }
-        for of in self.cx.traits_in_scope(self.home) {
+        for of in self.cx.traits_in_scope(self.home).into_iter().chain(self.body_traits()) {
             if self.cx.trait_member(of, name).is_some() && self.implements(of, owner)? {
                 return self.trait_value(of, (Some(owner), None), (name, given));
             }

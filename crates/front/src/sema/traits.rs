@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::body::Body;
 use crate::body::sig::{self, Generics};
 use crate::names::{ItemRef, ModRef};
-use crate::outline::item::{Item, ItemKind};
+use crate::outline::item::ItemKind;
 
 use super::Context;
 
@@ -28,28 +28,18 @@ impl<'a> Context<'a> {
 
     /// The trait whose member `item` is.
     pub fn owner_trait(&self, item: ItemRef) -> Option<ItemRef> {
-        if item.outer().is_some() {
-            return None;
-        }
-        let items = &self.file(item).items.items;
-        let parent = items[item.item as usize].parent?;
-        (items[parent as usize].kind == ItemKind::Trait).then_some(ItemRef { item: parent, ..item })
+        self.parent_item(item).filter(|parent| self.item(*parent).1.kind == ItemKind::Trait)
     }
 
     /// The member of trait `of` named `name`.
     pub fn trait_member(&self, of: ItemRef, name: &str) -> Option<ItemRef> {
-        self.trait_items(of).find(|member| self.name(*member) == name)
-    }
-
-    fn trait_items(&self, of: ItemRef) -> impl Iterator<Item = ItemRef> + 'a {
-        let items: &'a [Item] = if of.outer().is_some() { &[] } else { &self.file(of).items.items };
-        (0..items.len() as u32).filter(move |&at| items[at as usize].parent == Some(of.item)).map(move |at| ItemRef { item: at, ..of })
+        self.children(of).find(|member| self.name(*member) == name)
     }
 
     /// The methods of trait `of` in vtable order: each one that takes `self` and has no type parameters of its own, and none for the rest.
     pub fn vtable_methods(&mut self, of: ItemRef) -> Result<Vec<Option<ItemRef>>> {
         let mut methods = Vec::new();
-        for member in self.trait_items(of).filter(|member| self.item(*member).1.kind == ItemKind::Fn).collect::<Vec<_>>() {
+        for member in self.children(of).filter(|member| self.item(*member).1.kind == ItemKind::Fn).collect::<Vec<_>>() {
             let sig = self.signature(member)?;
             let callable = sig.receiver.is_some() && super::infer::type_params(&sig.generics).next().is_none();
             methods.push(callable.then_some(member));

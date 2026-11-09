@@ -45,11 +45,11 @@ impl<'a> Infer<'_, 'a> {
     pub fn method_call(&mut self, expr: ExprId, receiver: ExprId, name: u32, params: (Option<List>, List)) -> Result<Ty> {
         let found = self.expr(receiver, None)?;
         let name = plain(self.src.text(name));
-        let traits = self.trait_candidates(name)?;
         let mut steps = vec![self.resolve(found)];
         while let Some(next) = self.next_step(expr, steps.len() as u32 - 1, steps[steps.len() - 1])? {
             steps.push(next);
         }
+        let traits = self.trait_candidates(name, &steps)?;
         let mut candidates = Vec::new();
         for &step in &steps {
             self.candidates(step, name, &mut candidates)?;
@@ -114,10 +114,16 @@ impl<'a> Infer<'_, 'a> {
         Ok(())
     }
 
-    fn trait_candidates(&mut self, name: &str) -> Result<Vec<TraitCandidate>> {
+    fn trait_candidates(&mut self, name: &str, steps: &[Ty]) -> Result<Vec<TraitCandidate>> {
         let mut found = Vec::new();
         let mut traits = self.cx.traits_in_scope(self.home);
-        for local in self.body_traits() {
+        let principals: Vec<ItemRef> = steps.iter().filter_map(|&step| match self.cx.types.kind(step) {
+            Kind::Dyn(of, ..) => Some(*of),
+            _ => None,
+        }).collect();
+        let bounded = self.bound_candidates(name, steps)?;
+        let current = self.current_trait();
+        for local in self.body_traits().into_iter().chain(principals).chain(bounded).chain(current) {
             if !traits.contains(&local) {
                 traits.push(local);
             }
@@ -126,6 +132,22 @@ impl<'a> Infer<'_, 'a> {
             let Some(item) = self.cx.trait_member(of, name) else { continue };
             if let Some((kind, _)) = self.cx.signature(item)?.receiver {
                 found.push(TraitCandidate { of, item, kind });
+            }
+        }
+        Ok(found)
+    }
+
+    fn current_trait(&mut self) -> Option<ItemRef> {
+        let owner = self.instance.as_ref().and_then(|(item, _)| self.cx.owner_trait(*item));
+        self.block.and_then(|block| self.cx.impl_trait(block)).or(owner)
+    }
+
+    fn bound_candidates(&mut self, name: &str, steps: &[Ty]) -> Result<Vec<ItemRef>> {
+        let params: Vec<(&str, Ty)> = self.generics.iter().copied().filter(|&(_, ty)| steps.contains(&self.resolve(ty))).collect();
+        let mut found = Vec::new();
+        for param in params {
+            if let Some((of, _)) = self.bound_trait(param, name, |me, of, name| me.cx.trait_member(of, name).is_some())? {
+                found.push(of);
             }
         }
         Ok(found)

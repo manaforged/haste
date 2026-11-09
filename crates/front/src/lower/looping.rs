@@ -107,13 +107,15 @@ impl Lower<'_, '_> {
     /// Lowers the range expression `expr` as the struct it builds.
     pub fn range(&mut self, expr: ExprId, from: Option<ExprId>, to: Option<ExprId>) -> Result<Option<Value>> {
         let Some(Res::Ctor(_, variant, _)) = self.typed.res.get(&expr).cloned() else { bail!("range has no constructor") };
+        let Some(fields) = self.typed.ranges.get(&expr).cloned() else { bail!("range has no fields") };
+        let ends: Vec<ExprId> = [from, to].into_iter().flatten().collect();
         let mut values = Vec::new();
-        for end in [from, to].into_iter().flatten() {
-            let Some(&index) = self.typed.fields.get(&end) else { bail!("range end has no field") };
-            values.push((index, self.expr(end)?));
-        }
-        if let Some(&exhausted) = self.typed.fields.get(&expr) {
-            values.push((exhausted, Some(self.ins().iconst(Type::I8, 0))));
+        for (at, index) in fields.into_iter().enumerate() {
+            let value = match ends.get(at) {
+                Some(&end) => self.expr(end)?,
+                None => Some(self.ins().iconst(Type::I8, 0)),
+            };
+            values.push((index, value));
         }
         self.construct(self.ty_of(expr), variant, values, None)
     }
