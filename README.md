@@ -7,12 +7,12 @@ calls it. Nothing is written to `target/`.
 
 ```bash
 cargo build --release -p haste
-./target/release/haste run hello
+./target/release/haste run examples/hello
 ```
 
 The project needs a `Cargo.lock`; run `cargo generate-lockfile` in it
-first if it has none. `haste run` starts `main`. Functions that the run never reaches are never
-compiled, and build scripts and procedural macros run inside haste.
+first if it has none. `haste run` starts `main`. Functions that the run
+never reaches are never compiled, and build scripts and procedural macros run inside haste.
 Results that do not change between runs, such as build script output and
 macro expansions, are kept in `~/.cache/haste`, keyed by their inputs.
 
@@ -50,15 +50,15 @@ the number of cores the process may run on.
 
 ## Check it against rustc
 
-`patch/diff` holds a crate of `case_*` functions. `patch/check.sh` runs
+`tests/diff` holds a crate of `case_*` functions. `scripts/check.sh` runs
 it once with cargo and once with `haste test`, and fails when an output
 differs.
 
 ```bash
-bash patch/check.sh
-bash patch/check.sh patch/asy
-bash patch/check.sh patch/pm
-bash patch/probes.sh
+bash scripts/check.sh
+bash scripts/check.sh tests/async
+bash scripts/check.sh tests/proc-macro
+bash scripts/probes.sh
 ```
 
 The scripts run `cargo`, or the command in `$CARGO` or in
@@ -69,8 +69,8 @@ The scripts run `cargo`, or the command in `$CARGO` or in
 - Only the `x86_64-unknown-linux-gnu` target. There is no macOS, Windows
   or ARM support.
 - Some Rust code does not compile yet. 400 of the 425 checks in
-  `patch/diff` agree with rustc; haste gives no result for the other 25. 128-bit
-  division and float-to-`i128` casts are among the gaps.
+  `tests/diff` agree with rustc; haste gives no result for the other 25.
+  128-bit division and float-to-`i128` casts are among the gaps.
 - `haste build` does not write a binary.
 - The first `serve` load of a large workspace takes about a minute.
 

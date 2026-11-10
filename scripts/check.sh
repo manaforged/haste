@@ -1,8 +1,8 @@
 #!/bin/bash
 set -u
 cd "$(dirname "$0")/.."
-source patch/cargo.sh
-dir="${1:-patch/diff}"
+source scripts/cargo.sh
+dir="${1:-tests/diff}"
 rustc_side=$(run_cargo run --quiet --manifest-path $dir/Cargo.toml </dev/null 2>/dev/null | grep '^case_' | sort)
 engine_all=$(run_cargo run --quiet --release -p haste -- test $dir </dev/null 2>&1); finished='^cases '
 engine_side=$(printf '%s\n' "$engine_all" | grep '^case_' | sort)
