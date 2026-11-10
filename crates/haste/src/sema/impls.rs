@@ -225,7 +225,8 @@ impl<'a> Context<'a> {
             _ => None,
         };
         for root in [local_self, of.and_then(ItemRef::declaring_body)].into_iter().flatten() {
-            if !holders.contains(&Holder::Body(root)) {
+            let in_crate_index = crates.contains(&root.krate) && self.outline.crates[root.krate as usize].anonymous.iter().any(|&(file, item)| file as u32 == root.file && item == root.item);
+            if !in_crate_index && !holders.contains(&Holder::Body(root)) {
                 holders.push(Holder::Body(root));
             }
         }
