@@ -152,7 +152,7 @@ impl Arena {
 
     /// Maps `size` bytes of shared memory below 2 GiB when an address there is free, so code reaches it with a 32-bit absolute address.
     pub fn low(size: usize) -> Result<Arena, Error> {
-        let base = LOW_HINTS.map(|hint| map_low(size, hint)).into_iter().flatten().next();
+        let base = LOW_HINTS.into_iter().find_map(|hint| map_low(size, hint));
         Ok(Arena::over(base.map_or_else(|| map_data(size, Sharing::Shared), Ok)?, size, Sharing::Shared))
     }
 
@@ -302,7 +302,7 @@ mod mach {
         pub fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: i32) -> i32;
         pub fn mach_vm_inherit(task: u32, address: u64, size: u64, inherit: u32) -> i32;
         pub fn mach_vm_protect(task: u32, address: u64, size: u64, set_maximum: u32, protection: i32) -> i32;
-        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments, reason = "the declaration mirrors the eleven-argument Mach call")]
         pub fn mach_vm_remap(target: u32, address: *mut u64, size: u64, mask: u64, flags: i32, source: u32, source_address: u64, copy: u32, current: *mut i32, max: *mut i32, inherit: u32) -> i32;
         pub fn sys_icache_invalidate(start: *mut std::ffi::c_void, len: usize);
     }
