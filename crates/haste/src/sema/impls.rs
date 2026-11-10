@@ -88,6 +88,13 @@ pub struct Index {
 
 const PRIMITIVE_HOLDERS: [&str; 3] = ["core", "alloc", "std"];
 
+impl Index {
+    /// Whether building the index asked for nothing, so it holds every impl its holder has.
+    pub fn complete(&self) -> bool {
+        self.asked.count() == 0
+    }
+}
+
 impl<'a> Context<'a> {
     /// The parsed header of impl `block`.
     pub fn impl_header(&mut self, block: ImplRef) -> Result<Rc<ImplHeader>> {
