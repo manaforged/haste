@@ -107,7 +107,7 @@ impl Infer<'_, '_> {
         }
         let (Some((params, _)), Some(&wanted)) = (self.callable_sig(from)?, given.first()) else { return Ok(false) };
         let inputs = self.cx.types.intern(Kind::Tuple(params));
-        Ok(self.unify(inputs, wanted).is_ok())
+        Ok(self.unifies(inputs, wanted))
     }
 
     fn unsize_tail(&mut self, item: ItemRef, from: &[Ty], to: &[Ty]) -> Result<Option<Coercion>> {

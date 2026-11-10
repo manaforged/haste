@@ -49,7 +49,7 @@ impl Infer<'_, '_> {
     pub(super) fn opaque_holds(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Option<bool>> {
         let held: Vec<Vec<Ty>> = self.opaque_bounds(self.resolve(substs[0]))?.into_iter().filter(|(bound, _)| *bound == of).map(|(_, types)| types).collect();
         let [types] = &held[..] else { return Ok(None) };
-        let tied = self.trial(|infer| Ok(substs.iter().zip(types).all(|(&a, &b)| infer.unify(a, b).is_ok()).then_some(())))?;
+        let tied = self.trial(|infer| Ok(substs.iter().zip(types).all(|(&a, &b)| infer.unifies(a, b)).then_some(())))?;
         Ok(Some(tied.is_some()))
     }
 

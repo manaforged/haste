@@ -371,7 +371,7 @@ impl Infer<'_, '_> {
     pub(super) fn binding_holds(&mut self, (of, args): (ItemRef, &[Ty]), ty: Ty, (name, bound): (&str, Ty)) -> Result<bool> {
         let Some((owner, owner_args)) = self.assoc_owner((of, args.to_vec()), ty, name, 0)? else { bail!("`{}` has no associated type `{name}`", self.cx.name(of)) };
         let found = self.project(owner, ty, owner_args, name)?;
-        Ok(self.unify(found, bound).is_ok())
+        Ok(self.unifies(found, bound))
     }
 
     pub(super) fn assoc_owner(&mut self, (of, args): (ItemRef, Vec<Ty>), ty: Ty, name: &str, depth: u32) -> Result<Option<(ItemRef, Vec<Ty>)>> {

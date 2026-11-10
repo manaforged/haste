@@ -284,6 +284,6 @@ impl<'a> Infer<'_, 'a> {
         let count = self.impl_params(block).ok()?;
         let args: Vec<Ty> = (0..count).map(|_| self.fresh(Kind::Var)).collect();
         let (_, self_ty) = self.impl_frame(block, &args).ok()?;
-        self.unify(self_ty, ty).ok().map(|_| args)
+        self.unifies(self_ty, ty).then_some(args)
     }
 }

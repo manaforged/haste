@@ -198,7 +198,7 @@ impl<'a> Infer<'_, 'a> {
             bail!("an impl gives {} trait arguments where {} are wanted", given.len(), args.len());
         }
         for (found, wanted) in given.iter().zip(args) {
-            if self.unify(*found, *wanted).is_err() {
+            if !self.unifies(*found, *wanted) {
                 return Ok(None);
             }
         }
@@ -383,7 +383,7 @@ impl<'a> Infer<'_, 'a> {
         if given.len() != args.len() {
             return Some(false);
         }
-        let held = self.trial(|infer| Ok(given.iter().zip(args).all(|(found, wanted)| infer.unify(*found, *wanted).is_ok()).then_some(())));
+        let held = self.trial(|infer| Ok(given.iter().zip(args).all(|(found, wanted)| infer.unifies(*found, *wanted)).then_some(())));
         Some(matches!(held, Ok(Some(()))))
     }
 

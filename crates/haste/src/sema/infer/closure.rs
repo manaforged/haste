@@ -441,7 +441,7 @@ impl Infer<'_, '_> {
     /// Whether `found` coerces to `wanted` by a coercion or by giving up the `mut` of a reference.
     pub(super) fn coerces_to(&mut self, found: Ty, wanted: Ty) -> bool {
         let shared = self.weakened(found, wanted);
-        self.probe(|infer| matches!(infer.coercion(found, wanted), Ok(Some(_))) || shared.is_some_and(|(a, b)| infer.unify(a, b).is_ok()))
+        self.probe(|infer| matches!(infer.coercion(found, wanted), Ok(Some(_))) || shared.is_some_and(|(a, b)| infer.unifies(a, b)))
     }
 
     /// Unifies the signature of the callable `ty`, a closure, function item or function pointer, with `bound`, the function pointer type that an `Fn(A) -> B` bound on it spells.
