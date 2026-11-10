@@ -160,7 +160,7 @@ fn answer(build: &mut Option<Build>, (workspace, targets): (&graph::Workspace, &
 }
 
 /// Prints how long building took since `started`, runs every case for `cases` and `main` with `args` for `run`, and returns the exit status.
-pub fn finish(build: &Build, request: Request, args: &[String], started: Instant) -> Result<i32> {
+pub fn finish(build: &mut Build, request: Request, args: &[String], started: Instant) -> Result<i32> {
     let built = started.elapsed();
     match request {
         Request::Test => build.report(started, built).map(|()| 0),

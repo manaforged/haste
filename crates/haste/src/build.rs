@@ -190,22 +190,16 @@ impl Build {
 }
 
 impl Build {
-    /// Runs the binary's `main` with `args` as argv, or fails with every reason a function it reaches did not compile.
-    pub fn run(&self, args: &[String]) -> Result<i32> {
-        let Some([start, main]) = self.entry else { bail!("no member binary has a `main`") };
-        let closure = self.reached.closure(&[start, main]);
-        let mut failures = Failures::new();
-        for at in &closure {
-            if let Some(error) = self.reached.list[*at].1.as_ref().err().or_else(|| self.broken.get(at)) {
-                failures.entry(error_kind(error)).or_default().push(error.clone());
-            }
-        }
-        if !failures.is_empty() {
-            print_failures(&failures);
-            let total = self.reached.list.iter().filter(|(_, typed)| typed.is_err()).count() + self.broken.len();
-            bail!("{} of {} functions that `main` reaches did not compile ({total} of {} reached in all)", failures.values().map(Vec::len).sum::<usize>(), closure.len(), self.reached.list.len());
-        }
-        self.image.run_main((start, main), args)
+    /// Runs the binary's `main` with `args` as argv in a forked child that compiles each function on its first call, so the run leaves this build as it was.
+    pub fn run(&mut self, args: &[String]) -> Result<i32> {
+        let Some([_, main]) = self.entry else { bail!("no member binary has a `main`") };
+        let main = self.reached.list[main].0.0;
+        let (outline, names, store) = (&mut self.outline, &mut self.names, &mut self.store);
+        let child = crate::image::fork_child(|| crate::image::run_on_demand(outline, names, (store.take().unwrap_or_default(), main), args).unwrap_or_else(|error| {
+            eprintln!("error: {error:#}");
+            1
+        }))?;
+        Ok(crate::image::wait(child))
     }
 }
 
@@ -213,7 +207,7 @@ impl Build {
 pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> Result<i32> {
     let (mut outline, mut names) = crate::macros::load_eager(workspace, targets, &[])?;
     let Some(main) = main_item(workspace, &outline) else { bail!("no member binary has a `main`") };
-    let status = crate::image::run_on_demand(&mut outline, &mut names, main, args);
+    let status = crate::image::run_on_demand(&mut outline, &mut names, (sema::Cache::default(), main), args);
     std::mem::forget((outline, names));
     status
 }

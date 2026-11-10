@@ -159,7 +159,8 @@ impl<'a> Paths<'a> {
         }
     }
 
-    fn ask_crate(&self, root: ModRef) {
+    /// Asks to load every module of the partial crate whose root is `root`, when this lookup records asks.
+    pub(super) fn ask_crate(&self, root: ModRef) {
         if let Some(demands) = self.demands
             && root.module == 0
             && root.krate != self.krate

@@ -27,6 +27,19 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
     Ok((outline, names))
 }
 
+/// Loads the member crates' roots, resolves their names and expands their procedural macro calls, reading of other crates only what those lookups reach.
+pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<(Outline, Names)> {
+    let mut outline = crate::outline::new(workspace, targets, &[]);
+    let members: Vec<usize> = (0..outline.roots.len()).filter(|at| crate::cli::is_member(workspace, &outline.roots[*at])).collect();
+    for &krate in &members {
+        outline.load(krate, 0)?;
+    }
+    let mut names = Names::new(workspace, &outline);
+    members.iter().for_each(|krate| names.crates[*krate].eager = true);
+    resolve(&mut outline, &mut names)?;
+    Ok((outline, names))
+}
+
 /// Reaches from the instances `roots` gives, answering what each pass asks for until a pass settles or nothing new can load, then hands that pass's context and what it reached to `finish`.
 pub fn reach_resolved<R>(outline: &mut Outline, names: &mut Names, roots: impl Fn(&mut Context<'_>) -> Vec<Instance>, finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
     reach_with(outline, names, (roots, load), finish)
@@ -35,7 +48,7 @@ pub fn reach_resolved<R>(outline: &mut Outline, names: &mut Names, roots: impl F
 /// Reaches from `roots` as `reach_resolved` does, answering each pass's asks with `ask`, which says whether anything new loaded.
 fn reach_with<R>(outline: &mut Outline, names: &mut Names, (roots, ask): (impl Fn(&mut Context<'_>) -> Vec<Instance>, impl Fn(&mut Outline, &mut Names, Requests) -> Result<bool>), finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
     let mut finish = Some(finish);
-    resolve_sema(outline, names, ask, |mut cx, last| {
+    resolve_sema(outline, names, (Cache::default(), ask), |mut cx, last| {
         let from = roots(&mut cx);
         let reached = reach(&mut cx, &from);
         match finish.take_if(|_| last || cx.resolved()) {
@@ -45,9 +58,9 @@ fn reach_with<R>(outline: &mut Outline, names: &mut Names, (roots, ask): (impl F
     })
 }
 
-/// Runs `pass` on a fresh context, answering with `ask` what it asked for, until it gives a result: `pass` returns its result, or the released context to answer and run again, and learns whether the last answer loaded nothing new.
-pub fn resolve_sema<R>(outline: &mut Outline, names: &mut Names, ask: impl Fn(&mut Outline, &mut Names, Requests) -> Result<bool>, mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
-    let (mut store, mut last) = (Cache::default(), false);
+/// Runs `pass` on a context over `store`, answering with `ask` what it asked for, until it gives a result: `pass` returns its result, or the released context to answer and run again, and learns whether the last answer loaded nothing new.
+pub fn resolve_sema<R>(outline: &mut Outline, names: &mut Names, (mut store, ask): (Cache, impl Fn(&mut Outline, &mut Names, Requests) -> Result<bool>), mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
+    let mut last = false;
     loop {
         let (mut kept, asks) = match pass(Context::new(outline, names, store), last)? {
             Ok(done) => return Ok(done),
@@ -65,12 +78,15 @@ pub fn resolve(outline: &mut Outline, names: &mut Names) -> Result<()> {
     expand_bound(outline, names)
 }
 
-/// Expands every procedural macro call that settled names bind and settles again, until no call is left to bind.
+/// Expands every procedural macro call that resolved names bind and resolves again, loading what the binding asked for, until no call is left to bind.
 fn expand_bound(outline: &mut Outline, names: &mut Names) -> Result<()> {
     loop {
-        let bound = names.bind_procs(outline);
+        let (bound, asks) = names.bind_procs(outline);
         if bound.is_empty() {
-            return Ok(());
+            if asks.count() == 0 || !names.load(outline, asks)? {
+                return Ok(());
+            }
+            continue;
         }
         let inputs: Vec<Vec<String>> = bound.iter().map(inputs).collect();
         let calls: Vec<Call> = bound.iter().map(|call| (call.run, call.kind, call.krate)).collect();
@@ -179,9 +195,10 @@ fn item_text(src: &Source, item: &crate::outline::item::Item, keep: &dyn Fn(u32)
     parts.join(" ")
 }
 
-/// The two entry functions of haste's `proc_macro` crate.
-fn entries(outline: &Outline) -> Result<[ItemRef; 2]> {
+/// The two entry functions of haste's `proc_macro` crate, reading its root first if it is only declared.
+fn entries(outline: &mut Outline) -> Result<[ItemRef; 2]> {
     let Some(krate) = outline.roots.iter().position(|root| root.path.as_os_str() == PROC_MACRO_ROOT) else { bail!("no `proc_macro` crate in the graph") };
+    outline.load(krate, 0)?;
     let tree = &outline.crates[krate];
     let Some(file) = tree.files.iter().position(|file| !file.expanded && file.source.path.as_os_str() == PROC_MACRO_ROOT) else { bail!("`proc_macro` is not read") };
     let items = &tree.files[file].items.items;

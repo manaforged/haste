@@ -62,17 +62,17 @@ pub struct Jit {
     expanded: HashSet<usize>,
 }
 
-/// Runs the binary whose `main` is `main` with `args` as argv, compiling each function when the program first calls it, and returns the program's exit status.
-pub fn run_on_demand(outline: &mut Outline, names: &mut Names, main: ItemRef, args: &[String]) -> Result<i32> {
-    let (mut entries, store) = entries(outline, names, &[Some(main)])?;
+/// Runs the binary whose `main` is `main` with `args` as argv, starting inference from `store`, compiling each function when the program first calls it, and returns the program's exit status.
+pub fn run_on_demand(outline: &mut Outline, names: &mut Names, (store, main): (Cache, ItemRef), args: &[String]) -> Result<i32> {
+    let (mut entries, store) = entries(outline, names, (store, &[Some(main)]))?;
     let roots = entries.pop().unwrap_or_else(|| Err("no `main`".to_owned())).map_err(|error| anyhow!(error))?;
     let mut demand = Jit::new()?;
     let [start, main] = roots.map(|root| demand.declare(root));
     let mut program = Program { entry: (start, main), args, status: None };
-    serve(outline, names, (store, &crate::macros::load), &mut demand, &mut program)?;
+    let store = serve(outline, names, (store, &crate::macros::load), &mut demand, &mut program)?;
     eprintln!("compiled {} of {} functions declared", demand.compiled.len(), demand.reached.list.len());
     let status = program.status.ok_or_else(|| anyhow!("the program did not start"));
-    std::mem::forget(demand);
+    std::mem::forget((demand, store));
     status
 }
 
@@ -101,9 +101,9 @@ impl Driver for Program<'_> {
     }
 }
 
-/// For each program whose `main` is in `mains`, its two roots, `lang_start` at the return type of `main` and `main`, or why it has none, once inference settles on them; with the store inference kept.
-pub fn entries(outline: &mut Outline, names: &mut Names, mains: &[Option<ItemRef>]) -> Result<(Vec<Result<[Instance; 2], String>>, Cache)> {
-    crate::macros::resolve_sema(outline, names, crate::macros::load, |mut cx, last| {
+/// For each program whose `main` is in `mains`, starting inference from `store`, its two roots, `lang_start` at the return type of `main` and `main`, or why it has none, once inference settles on them; with the store inference kept.
+pub fn entries(outline: &mut Outline, names: &mut Names, (store, mains): (Cache, &[Option<ItemRef>])) -> Result<(Vec<Result<[Instance; 2], String>>, Cache)> {
+    crate::macros::resolve_sema(outline, names, (store, crate::macros::load), |mut cx, last| {
         let roots = mains.iter().map(|main| main.ok_or_else(|| "no `fn main`".to_owned()).and_then(|item| main_roots(&mut cx, item).map_err(|error| format!("{error:#}")))).collect();
         let settled = cx.resolved();
         let released = cx.release();

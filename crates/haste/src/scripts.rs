@@ -122,7 +122,7 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize]) -> Result<Outc
     let (mut outline, mut names) = crate::macros::load_eager(workspace, targets, units)?;
     let scripts: Vec<(usize, usize)> = outline.roots.iter().enumerate().filter(|(_, root)| root.role == Role::Script).map(|(krate, root)| (root.unit, krate)).collect();
     let mains: Vec<Option<crate::names::ItemRef>> = scripts.iter().map(|(_, krate)| outline.main(*krate)).collect();
-    let (entries, store) = image::entries(&mut outline, &mut names, &mains)?;
+    let (entries, store) = image::entries(&mut outline, &mut names, (crate::sema::Cache::default(), &mains))?;
     let mut demand = Jit::new()?;
     let left = scripts.iter().zip(entries).map(|(&(unit, _), entry)| (unit, entry.map(|pair| pair.map(|root| demand.declare(root))))).collect();
     let owners = outline.roots.iter().map(|root| root.unit).collect();

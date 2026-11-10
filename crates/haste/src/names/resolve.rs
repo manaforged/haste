@@ -176,13 +176,18 @@ pub fn macro_at(paths: &Paths<'_>, src: &Source, (start, name): (u32, u32), at: 
     macro_path(paths, &Path { segments: &segments, absolute: src.kind(start) == TokenKind::Colon, dollar }, at)
 }
 
-/// The macro that `path` names in module `at`.
+/// The macro that `path` names in module `at`; a crate root that names no such macro asks for its whole crate, since `#[macro_export]` puts a macro from any module there.
 pub fn macro_path(paths: &Paths<'_>, path: &Path<'_>, at: ModRef) -> Option<ItemRef> {
     let (last, prefix) = path.segments.split_last()?;
     let binding = if prefix.is_empty() {
         paths.first(*last, at, path).macros?
     } else {
-        paths.member(paths.resolve(&Path { segments: prefix, ..*path }, at)?, *last).macros?
+        let owner = paths.resolve(&Path { segments: prefix, ..*path }, at)?;
+        let found = paths.member(owner, *last).macros;
+        if let (None, Def::Module(root)) = (found, owner) {
+            paths.ask_crate(root);
+        }
+        found?
     };
     match binding.def {
         Def::Item(item) => Some(item),

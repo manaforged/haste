@@ -228,14 +228,6 @@ impl Image {
         Ok(())
     }
 
-    /// Runs the program in a forked child the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling, and returns the child's exit status.
-    pub fn run_main(&self, entry: (usize, usize), args: &[String]) -> Result<i32> {
-        if self.slot(entry.0).load(Ordering::Acquire) == 0 || self.slot(entry.1).load(Ordering::Acquire) == 0 {
-            bail!("`main` or `lang_start` has no code");
-        }
-        Ok(wait(fork_child(|| self.enter_main(entry, args))?))
-    }
-
     /// Runs the program the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling; returns its exit status.
     fn enter_main(&self, (start, main): (usize, usize), args: &[String]) -> i32 {
         let (start, main) = (self.slot(start).load(Ordering::Acquire), self.slot(main).load(Ordering::Acquire));
@@ -249,7 +241,7 @@ impl Image {
 }
 
 /// Waits for child `pid` and gives its exit status, or 128 plus the signal that ended it.
-fn wait(pid: libc::pid_t) -> i32 {
+pub(crate) fn wait(pid: libc::pid_t) -> i32 {
     let mut status = 0;
     // SAFETY: pid is a child of this process, and status is a live local.
     unsafe { libc::waitpid(pid, &mut status, 0) };

@@ -53,28 +53,38 @@ impl Site {
 }
 
 impl Names {
-    /// Takes from the outline every held-back procedural macro call whose path names a macro function now; bang calls and derives that name none stay held back, and attributes that name none are inert.
-    pub fn bind_procs(&self, outline: &mut Outline) -> Vec<Bound> {
-        let mut bound = Vec::new();
+    /// Takes from the outline every held-back procedural macro call whose path names a macro function now, with what the lookups asked to load; a call that names none stays held back while its lookup asked for something or it is a bang call or derive, and is inert otherwise.
+    pub fn bind_procs(&self, outline: &mut Outline) -> (Vec<Bound>, Requests) {
+        let (mut bound, demands) = (Vec::new(), Requests::default());
         for krate in 0..outline.crates.len() {
             let holder = &mut outline.crates[krate];
             let bangs = std::mem::take(&mut holder.foreign).into_iter().map(Site::Bang);
             let derives = std::mem::take(&mut holder.derived).into_iter().map(Site::Derive);
             let sites: Vec<Site> = bangs.chain(derives).chain(std::mem::take(&mut holder.attributed).into_iter().map(Site::Attribute)).collect();
-            let demands = Requests::default();
             let paths = paths_of(self, outline, krate, &demands);
-            let (found, left): (Vec<_>, Vec<_>) = sites.into_iter().map(|site| (proc_at(outline, &paths, &site, krate), site)).partition(|(found, _)| found.is_some());
-            bound.extend(found.into_iter().filter_map(|(found, site)| found.map(|(run, kind)| Bound { krate, run, kind, site })));
-            drop(paths);
-            for (_, site) in left {
-                match site {
-                    Site::Bang(call) => outline.crates[krate].foreign.push(call),
-                    Site::Derive(held) => outline.crates[krate].derived.push(held),
-                    Site::Attribute(_) => {}
+            let mut left = Vec::new();
+            for site in sites {
+                let before = demands.count();
+                match proc_at(outline, &paths, &site, krate) {
+                    Some((run, kind)) => bound.push(Bound { krate, run, kind, site }),
+                    None => left.push((demands.count() > before, site)),
                 }
             }
+            drop(paths);
+            left.into_iter().for_each(|(asked, site)| hold(outline, krate, asked, site));
         }
-        bound
+        (bound, demands)
+    }
+}
+
+/// Puts back a call that names no macro function yet: a bang call or derive always, an attribute only while its lookup asked for something to load.
+fn hold(outline: &mut Outline, krate: usize, asked: bool, site: Site) {
+    let holder = &mut outline.crates[krate];
+    match site {
+        Site::Bang(call) => holder.foreign.push(call),
+        Site::Derive(held) => holder.derived.push(held),
+        Site::Attribute(held) if asked => holder.attributed.push(held),
+        Site::Attribute(_) => {}
     }
 }
 

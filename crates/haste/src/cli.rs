@@ -78,26 +78,13 @@ fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usiz
     Ok(())
 }
 
-/// Loads the member crates' roots and settles names, reading only what their lookups reach.
-fn load_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<(outline::Outline, Names)> {
-    let mut outline = outline::new(workspace, targets, &[]);
-    let members: Vec<usize> = (0..outline.roots.len()).filter(|at| is_member(workspace, &outline.roots[*at])).collect();
-    for &krate in &members {
-        outline.load(krate, 0)?;
-    }
-    let mut names = Names::new(workspace, &outline);
-    members.iter().for_each(|krate| names.crates[*krate].eager = true);
-    names.resolve(&mut outline)?;
-    Ok((outline, names))
-}
-
 pub(crate) fn is_member(workspace: &graph::Workspace, root: &outline::Root) -> bool {
     workspace.graph.members.contains(&workspace.graph.units[root.unit].package)
 }
 
 fn report_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let started = Instant::now();
-    let (outline, names) = load_lazy(workspace, targets)?;
+    let (outline, names) = crate::macros::load_lazy(workspace, targets)?;
     eprintln!("lazy {} cached {} in {:.1} ms", summary(&outline), outline.cache.len(), started.elapsed().as_secs_f64() * 1e3);
     report_names(&outline, &names, started);
     Ok(())
@@ -135,11 +122,11 @@ fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
 /// Loads and resolves what a sema pass asked for, and returns the store for the next pass and whether the outline changed.
 fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let started = Instant::now();
-    let (mut outline, mut names) = load_lazy(workspace, targets)?;
+    let (mut outline, mut names) = crate::macros::load_lazy(workspace, targets)?;
     let load = started.elapsed();
     let cases = case_items(workspace, &outline);
     let mut passes = 0;
-    let failures = crate::macros::resolve_sema(&mut outline, &mut names, crate::macros::load, |mut cx, last| {
+    let failures = crate::macros::resolve_sema(&mut outline, &mut names, (sema::Cache::default(), crate::macros::load), |mut cx, last| {
         passes += 1;
         let failures = typeck_pass(&mut cx, &cases);
         let settled = cx.resolved();
@@ -158,8 +145,8 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets, request: Reques
         return crate::build::run(workspace, targets, args);
     }
     let started = Instant::now();
-    let build = crate::build::Build::cold(workspace, targets)?;
-    let result = crate::serve::finish(&build, request, args, started);
+    let mut build = crate::build::Build::cold(workspace, targets)?;
+    let result = crate::serve::finish(&mut build, request, args, started);
     std::mem::forget(build);
     result
 }
