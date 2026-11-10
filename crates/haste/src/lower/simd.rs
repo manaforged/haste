@@ -25,6 +25,7 @@ impl Lower<'_, '_> {
             (Simd::Bitmask, Some(out)) => self.bitmask(vector, first, out)?,
             (Simd::Cast, Some(out)) => self.lane_cast((vector, out), first)?,
             (Simd::Reduce { all }, _) => self.reduce(vector, first, all)?,
+            (Simd::Extreme { max }, _) => self.extreme(vector, first, max)?,
             _ => self.simd_lanes(op, substs, args)?,
         };
         Ok(Some(value))
@@ -166,6 +167,18 @@ impl Lower<'_, '_> {
             found = if all { self.ins().band(found, set) } else { self.ins().bor(found, set) };
         }
         Ok(found)
+    }
+
+    fn extreme(&mut self, vector: Ty, x: Value, max: bool) -> Result<Value> {
+        let lanes = self.lanes(vector)?;
+        let better = if max { BinOp::Gt } else { BinOp::Lt };
+        let mut best = self.ins().load(lanes.machine, x, 0);
+        for lane in 1..lanes.count {
+            let value = self.ins().load(lanes.machine, x, lane * lanes.size);
+            let wins = self.apply(better, lanes.num, (value, best), lanes.num)?;
+            best = self.ins().select(wins, value, best);
+        }
+        Ok(best)
     }
 
     /// The `bytes` bytes whose byte `i` is byte `index[i] & 15` of the 16-byte lane of `table` that holds byte `i`, or zero when bit 7 of `index[i]` is set, as `pshufb` gives.

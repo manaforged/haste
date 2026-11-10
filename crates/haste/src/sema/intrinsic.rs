@@ -80,6 +80,8 @@ pub enum Simd {
     Insert,
     /// Whether every lane, or any lane, of a mask is set.
     Reduce { all: bool },
+    /// The largest, or smallest, lane of a vector.
+    Extreme { max: bool },
 }
 
 /// An atomic access, which lowering makes sequentially consistent.
@@ -94,7 +96,7 @@ pub enum Atomic {
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
 const LLVM: [(&str, Intrinsic); 2] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32))];
 
-const NAMES: [(&str, Intrinsic); 128] = {
+const NAMES: [(&str, Intrinsic); 130] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -209,6 +211,8 @@ const NAMES: [(&str, Intrinsic); 128] = {
         ("simd_insert_dyn", Simd(self::Simd::Insert)),
         ("simd_reduce_all", Simd(self::Simd::Reduce { all: true })),
         ("simd_reduce_any", Simd(self::Simd::Reduce { all: false })),
+        ("simd_reduce_max", Simd(self::Simd::Extreme { max: true })),
+        ("simd_reduce_min", Simd(self::Simd::Extreme { max: false })),
         ("simd_add", Simd(self::Simd::Lanewise(BinOp::Add))),
         ("simd_sub", Simd(self::Simd::Lanewise(BinOp::Sub))),
         ("simd_mul", Simd(self::Simd::Lanewise(BinOp::Mul))),
