@@ -35,7 +35,37 @@ const SIZED_ONLY: [&str; 3] = ["sized", "copy", "clone"];
 impl<'a> Infer<'_, 'a> {
     /// The one impl of trait `of` at trait arguments `args` for `self_ty`, or none when no impl or several apply.
     pub fn select(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<Option<Picked>> {
-        self.select_at(of, self_ty, args, 0)
+        let key = self.selection_key(of, self_ty, args);
+        if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
+            return Ok(found.clone());
+        }
+        let before = (self.cx.asks.mark(), self.projections.len(), self.obligations.len());
+        let picked = self.select_at(of, self_ty, args, 0)?;
+        let Some(key) = key else { return Ok(picked) };
+        let settled = (self.cx.asks.mark(), self.projections.len(), self.obligations.len()) == before;
+        let kept = match &picked {
+            None => Some(None),
+            Some((block, impl_args)) => {
+                let filled: Vec<Ty> = impl_args.iter().map(|&ty| self.substitute(ty)).collect();
+                filled.iter().all(|&ty| self.closed(ty)).then_some(Some((*block, filled)))
+            }
+        };
+        if let Some(kept) = kept.filter(|_| settled) {
+            self.cx.store.lookups.selections.insert(key, kept);
+        }
+        Ok(picked)
+    }
+
+    /// The key that caches selecting `of<args>` for `self_ty` across bodies: the query with its variables filled in, when it is made at the top level and every type in it is known and holds no closure.
+    fn selection_key(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Option<(ItemRef, Ty, Vec<Ty>)> {
+        let known = self.selecting.is_empty() && self.closed(self_ty) && args.iter().all(|&arg| self.closed(arg));
+        known.then(|| (of, self.substitute(self_ty), args.iter().map(|&arg| self.substitute(arg)).collect()))
+    }
+
+    /// Whether `ty` holds no inference variable and no closure, whose signature may still hold one, so selecting with it gives the same answer in every body.
+    fn closed(&self, ty: Ty) -> bool {
+        let kind = self.cx.types.kind(self.resolve(ty));
+        !matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Closure(..)) && kind.children().all(|item| self.closed(item))
     }
 
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
