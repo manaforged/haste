@@ -210,17 +210,17 @@ fn entries(outline: &mut Outline) -> Result<[ItemRef; 2]> {
 /// A procedural macro call: the macro function, its kind, and the crate that calls it, `usize::MAX` for a call in a function body.
 type Call = (ItemRef, ProcKind, usize);
 
-/// The output of each call `bound` on its `inputs`: the one the store kept for a macro of a pinned crate, else from running it, kept when it succeeds.
+/// The output of each call `bound` on its `inputs`, or why it failed: the result the store kept for a macro of a pinned crate, else from running it, kept when it ran.
 fn run(outline: &mut Outline, names: &mut Names, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
     let keys: Vec<Option<u64>> = bound.iter().zip(inputs).map(|(&(call, ..), texts)| Some(store::expansion_key(outline.pins[call.krate as usize]?, &macro_name(outline, call), texts))).collect();
-    let mut results: Vec<Option<Result<String, String>>> = keys.iter().map(|key| key.and_then(store::kept_expansion).map(Ok)).collect();
+    let mut results: Vec<Option<Result<String, String>>> = keys.iter().map(|key| key.and_then(store::kept_expansion)).collect();
     let missing: Vec<usize> = (0..bound.len()).filter(|&at| results[at].is_none()).collect();
     if !missing.is_empty() {
         let calls: Vec<Call> = missing.iter().map(|&at| bound[at]).collect();
         let texts: Vec<Vec<String>> = missing.iter().map(|&at| inputs[at].clone()).collect();
         for (at, result) in missing.into_iter().zip(expand(outline, names, &calls, &texts)?) {
-            if let (Some(Ok(text)), Some(key)) = (&result, keys[at])
-                && let Err(error) = store::keep_expansion(key, text)
+            if let (Some(ran), Some(key)) = (&result, keys[at])
+                && let Err(error) = store::keep_expansion(key, ran)
             {
                 eprintln!("cannot keep the output of {}: {error}", macro_name(outline, bound[at].0));
             }

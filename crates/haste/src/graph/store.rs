@@ -13,6 +13,8 @@ use super::{Side, Workspace};
 const STAMP: &str = "stamp";
 const OUTPUT: &str = "output";
 const FAILED: &str = "failed";
+const OK_MARK: &str = "+";
+const FAILED_MARK: &str = "-";
 
 /// The directory of the store: `$HASTE_HOME`, else `$XDG_CACHE_HOME/haste`, else `$HOME/.cache/haste`.
 fn home() -> PathBuf {
@@ -31,16 +33,25 @@ pub fn expansion_key(pin: u64, name: &str, texts: &[String]) -> u64 {
     rustc_hash::FxBuildHasher.hash_one((pin, name, texts, program()))
 }
 
-/// What the macro call with key `key` printed, when a run kept it.
-pub fn kept_expansion(key: u64) -> Option<String> {
-    std::fs::read_to_string(expansion(key)).ok()
+/// What the macro call with key `key` printed, or why it failed, when a run kept it.
+pub fn kept_expansion(key: u64) -> Option<Result<String, String>> {
+    let text = std::fs::read_to_string(expansion(key)).ok()?;
+    match text.split_at_checked(1)? {
+        (OK_MARK, output) => Some(Ok(output.to_owned())),
+        (FAILED_MARK, error) => Some(Err(error.to_owned())),
+        _ => None,
+    }
 }
 
-/// Keeps what the macro call with key `key` printed.
-pub fn keep_expansion(key: u64, text: &str) -> io::Result<()> {
+/// Keeps what the macro call with key `key` printed, or why it failed, since this program fails the same call the same way.
+pub fn keep_expansion(key: u64, result: &Result<String, String>) -> io::Result<()> {
     let path = expansion(key);
     std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
-    write_new(&path, text)
+    let (mark, text) = match result {
+        Ok(output) => (OK_MARK, output),
+        Err(error) => (FAILED_MARK, error),
+    };
+    write_new(&path, &format!("{mark}{text}"))
 }
 
 fn expansion(key: u64) -> PathBuf {
