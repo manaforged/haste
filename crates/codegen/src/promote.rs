@@ -1,8 +1,46 @@
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::ir::{Binary, Block, Function, Inst, InstData, Op, StackSlot, Type, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, Op, StackSlot, Type, Value};
 
-type Var = (StackSlot, i64, Type);
+/// One promoted place: the bytes at `offset` in `slot`, read and written at one or more integer widths.
+struct Var {
+    slot: StackSlot,
+    offset: i64,
+    end: i64,
+    first: Type,
+    store: Option<Type>,
+    uniform: bool,
+    narrow: bool,
+    clash: bool,
+}
+
+impl Var {
+    fn home(&self) -> Type {
+        self.store.unwrap_or(self.first)
+    }
+
+    fn sound(&self) -> bool {
+        !self.clash && (self.uniform || self.narrow)
+    }
+
+    fn add(&mut self, ty: Type, store: bool) {
+        self.end = self.end.max(self.offset + i64::from(ty.bytes()));
+        self.uniform &= ty == self.first;
+        self.narrow &= narrow(ty);
+        if store {
+            self.clash |= self.store.is_some_and(|home| home != ty);
+            self.store = Some(ty);
+        }
+    }
+}
+
+fn narrow(ty: Type) -> bool {
+    matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+}
+
+fn convert(from: Type, to: Type) -> Option<Convert> {
+    (from != to).then(|| if to.bytes() < from.bytes() { Convert::Ireduce } else { Convert::Uextend })
+}
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -23,6 +61,7 @@ struct Access {
     inst: Inst,
     var: usize,
     kind: Kind,
+    ty: Type,
 }
 
 struct Touch {
@@ -38,7 +77,7 @@ struct Scan {
     addr_insts: Vec<(Inst, StackSlot)>,
     escaped: Vec<bool>,
     vars: Vec<Var>,
-    ids: HashMap<Var, usize>,
+    ids: HashMap<(StackSlot, i64), usize>,
     slot_vars: Vec<Vec<usize>>,
     accesses: Vec<Access>,
 }
@@ -141,31 +180,26 @@ impl Scan {
             self.escaped[slot.index()] = true;
             return;
         };
-        let key = (slot, offset, ty);
-        let var = match self.ids.get(&key) {
+        let var = match self.ids.get(&(slot, offset)) {
             Some(var) => *var,
             None => {
                 let var = self.vars.len();
-                self.vars.push(key);
-                self.ids.insert(key, var);
+                let end = offset + i64::from(ty.bytes());
+                self.vars.push(Var { slot, offset, end, first: ty, store: None, uniform: true, narrow: true, clash: false });
+                self.ids.insert((slot, offset), var);
                 self.slot_vars[slot.index()].push(var);
                 var
             }
         };
-        self.accesses.push(Access { block: at.0, inst: at.1, var, kind });
+        self.vars[var].add(ty, matches!(kind, Kind::Store(_)));
+        self.accesses.push(Access { block: at.0, inst: at.1, var, kind, ty });
     }
 
     fn promotable(&self, slot: usize) -> bool {
-        if self.escaped[slot] {
+        if self.escaped[slot] || self.slot_vars[slot].iter().any(|var| !self.vars[*var].sound()) {
             return false;
         }
-        let mut spans: Vec<(i64, i64)> = self.slot_vars[slot]
-            .iter()
-            .map(|var| {
-                let (_, offset, ty) = self.vars[*var];
-                (offset, offset + i64::from(ty.bytes()))
-            })
-            .collect();
+        let mut spans: Vec<(i64, i64)> = self.slot_vars[slot].iter().map(|var| (self.vars[*var].offset, self.vars[*var].end)).collect();
         spans.sort_unstable();
         !spans.windows(2).any(|pair| pair[1].0 < pair[0].1)
     }
@@ -177,10 +211,18 @@ fn take(uses: &mut Vec<Value>, value: Value) {
     }
 }
 
+/// A load that promotion replaces, with the type it reads.
+#[derive(Clone, Copy)]
+struct Load {
+    inst: Inst,
+    result: Value,
+    ty: Type,
+}
+
 struct Local {
     defs: Vec<HashMap<Block, Value>>,
-    exposed: Vec<Vec<(Block, Value)>>,
-    forward: Vec<Vec<(Value, Value)>>,
+    exposed: Vec<Vec<(Block, Load)>>,
+    forward: Vec<Vec<(Load, Value)>>,
 }
 
 impl Local {
@@ -194,13 +236,18 @@ impl Local {
                 Kind::Store(value) => {
                     defs.insert(access.block, value);
                 }
-                Kind::Load(result) => match defs.get(&access.block) {
-                    Some(def) => local.forward[access.var].push((result, *def)),
-                    None => {
-                        local.exposed[access.var].push((access.block, result));
-                        defs.insert(access.block, result);
+                Kind::Load(result) => {
+                    let load = Load { inst: access.inst, result, ty: access.ty };
+                    match defs.get(&access.block) {
+                        Some(def) => local.forward[access.var].push((load, *def)),
+                        None => {
+                            local.exposed[access.var].push((access.block, load));
+                            if access.ty == scan.vars[access.var].home() {
+                                defs.insert(access.block, result);
+                            }
+                        }
                     }
-                },
+                }
             }
         }
         local
@@ -295,6 +342,18 @@ struct Build {
     memo: HashMap<(usize, Block), Value>,
     phis: Vec<Phi>,
     staged: HashMap<Value, Value>,
+    converts: Vec<(Inst, Convert, Value)>,
+}
+
+impl Build {
+    fn bind(&mut self, home: Type, load: Load, value: Value) {
+        match convert(home, load.ty) {
+            Some(op) => self.converts.push((load.inst, op, value)),
+            None => {
+                self.staged.insert(load.result, value);
+            }
+        }
+    }
 }
 
 enum Step {
@@ -309,6 +368,7 @@ struct Pass {
     fresh: Fresh,
     subst: HashMap<Value, Value>,
     promoted: Vec<bool>,
+    kept: Vec<bool>,
 }
 
 impl Pass {
@@ -320,7 +380,7 @@ impl Pass {
     }
 
     fn step(&mut self, build: &mut Build, var: usize, block: Block) -> Option<Step> {
-        let ty = self.scan.vars[var].2;
+        let ty = self.scan.vars[var].home();
         let preds = &self.cfg.preds[block.index()];
         if block == self.cfg.entry && !preds.is_empty() {
             return None;
@@ -395,7 +455,7 @@ impl Pass {
             }
             same = Some(value);
         }
-        let ty = self.scan.vars[phi.var].2;
+        let ty = self.scan.vars[phi.var].home();
         Some(same.unwrap_or_else(|| self.fresh.zero(ty)))
     }
 
@@ -421,12 +481,13 @@ impl Pass {
     fn build(&mut self, slot: usize) -> Option<Build> {
         let mut build = Build::default();
         for var in self.scan.slot_vars[slot].clone() {
+            let home = self.scan.vars[var].home();
             for (block, load) in self.local.exposed[var].clone() {
                 let value = self.entry(&mut build, var, block)?;
-                build.staged.insert(load, value);
+                build.bind(home, load, value);
             }
             for &(load, def) in &self.local.forward[var] {
-                build.staged.insert(load, def);
+                build.bind(home, load, def);
             }
         }
         self.fill(&mut build)?;
@@ -437,6 +498,10 @@ impl Pass {
 
     fn apply(&mut self, func: &mut Function, slot: usize, build: Build) {
         self.subst.extend(build.staged);
+        for (inst, op, value) in build.converts {
+            func.insts[inst.index()].op = Op::Convert(op, value);
+            self.kept[inst.index()] = true;
+        }
         for phi in build.phis.into_iter().filter(|phi| phi.live) {
             func.blocks[phi.block.index()].params.push(phi.value);
             for (pred, arg) in self.cfg.preds[phi.block.index()].iter().zip(&phi.args) {
@@ -449,7 +514,7 @@ impl Pass {
     fn dropped(&self, count: usize) -> Vec<bool> {
         let mut dropped = vec![false; count];
         for access in &self.scan.accesses {
-            if self.promoted[self.scan.vars[access.var].0.index()] {
+            if self.promoted[self.scan.vars[access.var].slot.index()] && !self.kept[access.inst.index()] {
                 dropped[access.inst.index()] = true;
             }
         }
@@ -521,7 +586,8 @@ pub(crate) fn run(func: &mut Function) {
     let local = Local::new(&scan);
     let fresh = Fresh { base: func.types.len(), types: Vec::new(), zeros: Vec::new() };
     let promoted = vec![false; func.slots.len()];
-    let mut pass = Pass { cfg: Cfg::new(func, entry), scan, local, fresh, subst: HashMap::default(), promoted };
+    let kept = vec![false; func.insts.len()];
+    let mut pass = Pass { cfg: Cfg::new(func, entry), scan, local, fresh, subst: HashMap::default(), promoted, kept };
     for slot in 0..func.slots.len() {
         if !pass.scan.promotable(slot) {
             continue;

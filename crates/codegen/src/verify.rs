@@ -60,7 +60,7 @@ fn op(func: &Function, op: &Op) -> Result<(), String> {
     match op {
         Op::Brif(cond, ..) | Op::Select(cond, ..) | Op::Trapz(cond) if func.ty(*cond) == Type::I128 => condition(func, *cond),
         Op::Binary(kind, x, y) => binary(func, *kind, *x, *y),
-        Op::Icmp(_, x, y) | Op::Fcmp(_, x, y) | Op::Select(_, x, y) if func.ty(*x) != func.ty(*y) => {
+        Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Select(_, x, y) if func.ty(*x) != func.ty(*y) => {
             Err(format!("{op:?} mixes {:?} and {:?}", func.ty(*x), func.ty(*y)))
         }
         Op::Jump(block, args) => edge(func, *block, args),

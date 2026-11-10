@@ -416,6 +416,21 @@ impl Ins<'_> {
         self.value(Op::Icmp(cc, x, y), Type::I8)
     }
 
+    /// 1 as an `I8` when `x + y` fits the type of `x`, read as signed when `signed`, else 0.
+    pub fn add_fits(mut self, signed: bool, x: Value, y: Value) -> Value {
+        self.value(Op::Fits(Binary::Iadd, signed, x, y), Type::I8)
+    }
+
+    /// 1 as an `I8` when `x - y` fits the type of `x`, read as signed when `signed`, else 0.
+    pub fn sub_fits(mut self, signed: bool, x: Value, y: Value) -> Value {
+        self.value(Op::Fits(Binary::Isub, signed, x, y), Type::I8)
+    }
+
+    /// 1 as an `I8` when `x * y` fits the type of `x`, read as signed when `signed`, else 0.
+    pub fn mul_fits(mut self, signed: bool, x: Value, y: Value) -> Value {
+        self.value(Op::Fits(Binary::Imul, signed, x, y), Type::I8)
+    }
+
     /// Integer comparison with a constant.
     pub fn icmp_imm(self, cc: IntCC, x: Value, imm: i64) -> Value {
         self.compare_imm(cc, x, imm, true)
@@ -545,6 +560,11 @@ impl Ins<'_> {
     /// Reads a `ty` at `addr + offset`.
     pub fn load(mut self, ty: Type, addr: Value, offset: i32) -> Value {
         self.value(Op::Load(addr, offset), ty)
+    }
+
+    /// Copies `bytes` bytes from `from` to `to`, which may overlap.
+    pub fn copy(mut self, to: Value, from: Value, bytes: Value) -> Inst {
+        self.effect(Op::Copy(to, from, bytes))
     }
 
     /// Writes `value` at `addr + offset`.

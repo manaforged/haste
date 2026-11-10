@@ -41,6 +41,7 @@ pub struct Store {
     tails: HashMap<ty::Ty, ty::Ty>,
     headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
     finals: HashMap<reach::Instance, Rc<infer::Typed>>,
+    closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
     lookups: Lookups,
 }
 
@@ -54,7 +55,6 @@ struct Lookups {
     discriminants: HashMap<ItemRef, Rc<[i128]>>,
     langs: Option<(Rc<HashMap<String, ItemRef>>, Rc<[u32]>)>,
     drops: HashMap<ty::Ty, bool>,
-    closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
     futures: HashMap<ty::Ty, ty::Ty>,
     lang_of: std::cell::RefCell<HashMap<ItemRef, Option<u32>>>,
@@ -84,9 +84,9 @@ impl Store {
         self.finals.retain(|instance, _| !naming.touches(instance));
         self.layouts.retain(|ty, _| !naming.names(*ty));
         self.tails.retain(|ty, _| !naming.names(*ty));
+        self.closures.retain(|ty, _| !naming.names(*ty));
         let kept = &mut self.lookups;
         kept.drops.retain(|ty, _| !naming.names(*ty));
-        kept.closures.retain(|ty, _| !naming.names(*ty));
         kept.reveals.retain(|instance, _| !naming.touches(instance));
         kept.futures.retain(|ty, _| !naming.names(*ty));
         kept.impl_traits.retain(|block, _| block_kept(block));
@@ -262,7 +262,7 @@ impl<'a> Context<'a> {
 
     /// What the body that defines the closure type `ty` inferred for it.
     pub fn closure(&self, ty: ty::Ty) -> Option<Rc<infer::ClosureInfo>> {
-        self.store.lookups.closures.get(&ty).cloned()
+        self.store.closures.get(&ty).cloned()
     }
 
     /// The output of the async fn future `ty` that a call named while its body was still being inferred, from the declared return type.
@@ -272,17 +272,17 @@ impl<'a> Context<'a> {
 
     /// Records what the body that defines the closure type `ty` inferred for it.
     pub fn set_closure(&mut self, ty: ty::Ty, info: infer::ClosureInfo) {
-        self.store.lookups.closures.insert(ty, Rc::new(info));
+        self.store.closures.insert(ty, Rc::new(info));
     }
 
     /// The tuple of the captures of the closure type `ty`, which is how the closure is laid out and dropped.
     pub fn closure_env(&self, ty: ty::Ty) -> Option<ty::Ty> {
-        self.store.lookups.closures.get(&ty).map(|info| info.env)
+        self.store.closures.get(&ty).map(|info| info.env)
     }
 
     /// Whether the code of the closure type `ty` takes the address of its environment first, which only a closure that captures something does.
     pub fn closure_takes_env(&self, ty: ty::Ty) -> bool {
-        self.store.lookups.closures.get(&ty).is_some_and(|info| !info.closure.captures.is_empty())
+        self.store.closures.get(&ty).is_some_and(|info| !info.closure.captures.is_empty())
     }
 
     /// The type that `ty` owns when it is a `Box`.
@@ -295,7 +295,7 @@ impl<'a> Context<'a> {
 
     /// Whether a call of the closure type `ty` consumes the closure, because its body moves a captured value out.
     pub fn closure_consumes(&self, ty: ty::Ty) -> bool {
-        self.store.lookups.closures.get(&ty).is_some_and(|info| info.closure.consumes)
+        self.store.closures.get(&ty).is_some_and(|info| info.closure.consumes)
     }
 
     /// A short spelling of `ty`, each type in it first passed through `resolve`.

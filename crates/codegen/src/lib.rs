@@ -2,8 +2,10 @@
 
 mod builder;
 mod coroutine;
+mod copy;
 mod ir;
 mod memory;
+mod fold;
 mod merge;
 mod promote;
 mod verify;
@@ -29,9 +31,15 @@ pub struct Compiled {
     pub sites: Vec<Site>,
 }
 
-/// Promotes `func`'s frame slots to values and folds its straight-line blocks, as `compile` does before encoding.
+/// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks as `compile` does before encoding, and drops the dead entries of a body kept for copying.
 pub fn simplify(func: &mut Function) {
+    optimize(func);
+    fold::compact(func);
+}
+
+fn optimize(func: &mut Function) {
     promote::run(func);
+    fold::run(func);
     merge::run(func);
 }
 
@@ -39,9 +47,9 @@ pub fn simplify(func: &mut Function) {
 pub fn compile(mut func: Function) -> Result<Compiled, String> {
     coroutine::split(&mut func);
     verify::verify(&func)?;
-    promote::run(&mut func);
-    merge::run(&mut func);
-    verify::verify(&func).map_err(|error| format!("after slot promotion: {error}"))?;
+    optimize(&mut func);
+    copy::lower(&mut func);
+    verify::verify(&func).map_err(|error| format!("after simplification: {error}"))?;
     #[cfg(target_arch = "x86_64")]
     return x64::compile(&func);
     #[cfg(not(target_arch = "x86_64"))]

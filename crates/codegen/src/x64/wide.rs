@@ -3,6 +3,9 @@ use super::asm::{Alu, Cond, Count, Group3, Reg, Shift, Size};
 use super::int::alu_of;
 use crate::ir::{Binary, IntCC, Unary, Value};
 
+/// The registers 128-bit rotates use as scratch besides rax, rcx and rdx.
+pub(super) const WIDE_SCRATCH: [Reg; 3] = [Reg::R8, Reg::R9, Reg::R10];
+
 impl Emit<'_> {
     fn halves(&mut self, x: Value) {
         self.raw(Reg::Rax, x);
@@ -149,17 +152,18 @@ impl Emit<'_> {
 
     fn wide_rotate(&mut self, left: bool, x: Value, y: Value) {
         let (first, second) = if left { (Binary::Ishl, Binary::Ushr) } else { (Binary::Ushr, Binary::Ishl) };
+        let [low, high, spare] = WIDE_SCRATCH;
         self.halves(x);
-        self.asm.mov(Reg::R8, Reg::Rax);
-        self.asm.mov(Reg::R9, Reg::Rdx);
+        self.asm.mov(low, Reg::Rax);
+        self.asm.mov(high, Reg::Rdx);
         self.raw(Reg::Rcx, y);
         self.asm.alu_imm32(Alu::And, Reg::Rcx, 127);
-        self.wide_shift(first, (Reg::Rax, Reg::Rdx), Reg::R10);
+        self.wide_shift(first, (Reg::Rax, Reg::Rdx), spare);
         self.asm.group3(Group3::Neg, Reg::Rcx);
         self.asm.alu_imm32(Alu::And, Reg::Rcx, 127);
-        self.wide_shift(second, (Reg::R8, Reg::R9), Reg::R10);
-        self.asm.alu(Alu::Or, Reg::Rax, Reg::R8);
-        self.asm.alu(Alu::Or, Reg::Rdx, Reg::R9);
+        self.wide_shift(second, (low, high), spare);
+        self.asm.alu(Alu::Or, Reg::Rax, low);
+        self.asm.alu(Alu::Or, Reg::Rdx, high);
     }
 
     pub(super) fn wide_icmp(&mut self, cc: IntCC, x: Value, y: Value) -> Cond {

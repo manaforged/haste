@@ -89,6 +89,11 @@ impl<'a> Context<'a> {
         self.attr_at(item, "thread_local").is_some()
     }
 
+    /// Whether the function `item` is `#[inline(always)]`.
+    pub fn inline_always(&self, item: ItemRef) -> bool {
+        self.attr_at(item, "inline").is_some_and(|at| self.item(item).0.text(at + 2) == "always")
+    }
+
     /// The token of the attribute `key` that `item` carries, through `cfg_attr` whose cfg holds.
     pub(super) fn attr_at(&self, item: ItemRef, key: &str) -> Option<u32> {
         let (src, entry) = self.item(item);

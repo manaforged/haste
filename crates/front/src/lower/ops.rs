@@ -258,10 +258,17 @@ impl Lower<'_, '_> {
 
     /// `op` on `x` and `y` with wrapping, and whether the result did not overflow.
     pub(super) fn overflowing(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<(Value, Value)> {
+        if ty != Type::I128 {
+            return Ok(match op {
+                BinOp::Add => (self.ins().iadd(x, y), self.ins().add_fits(signed, x, y)),
+                BinOp::Sub => (self.ins().isub(x, y), self.ins().sub_fits(signed, x, y)),
+                _ => (self.ins().imul(x, y), self.ins().mul_fits(signed, x, y)),
+            });
+        }
         let result = match op {
             BinOp::Add => self.ins().iadd(x, y),
             BinOp::Sub => self.ins().isub(x, y),
-            _ => return self.multiply((ty, signed), x, y),
+            _ => return self.multiply(signed, x, y),
         };
         let ok = match (op, signed) {
             (BinOp::Add, false) => self.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, result, x),
@@ -278,28 +285,9 @@ impl Lower<'_, '_> {
         Ok((result, ok))
     }
 
-    fn multiply(&mut self, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<(Value, Value)> {
+    fn multiply(&mut self, signed: bool, x: Value, y: Value) -> Result<(Value, Value)> {
         let result = self.ins().imul(x, y);
-        let ok = match (ty, signed) {
-            (Type::I128, signed) => self.wide_product_fits(signed, x, y),
-            (Type::I64, true) => {
-                let high = self.ins().smulhi(x, y);
-                let sign = self.ins().sshr_imm(result, 63);
-                self.ins().icmp(IntCC::Equal, high, sign)
-            }
-            (Type::I64, false) => {
-                let high = self.ins().umulhi(x, y);
-                self.ins().icmp_imm(IntCC::Equal, high, 0)
-            }
-            (_, signed) => {
-                let widen = |lower: &mut Self, value: Value| if signed { lower.ins().sextend(Type::I64, value) } else { lower.ins().uextend(Type::I64, value) };
-                let (wide_x, wide_y) = (widen(self, x), widen(self, y));
-                let wide = self.ins().imul(wide_x, wide_y);
-                let back = widen(self, result);
-                self.ins().icmp(IntCC::Equal, wide, back)
-            }
-        };
-        Ok((result, ok))
+        Ok((result, self.wide_product_fits(signed, x, y)))
     }
 
     fn wide_product_fits(&mut self, signed: bool, x: Value, y: Value) -> Value {

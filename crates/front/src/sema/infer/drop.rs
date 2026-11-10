@@ -21,6 +21,30 @@ impl Infer<'_, '_> {
         Ok(needs)
     }
 
+    /// Whether `ty` is `Copy`: every part of a tuple, array or closure is, and a struct or enum has a `Copy` impl.
+    pub fn is_copy(&mut self, ty: Ty) -> Result<bool> {
+        let ty = self.resolve(ty);
+        Ok(match self.cx.types.kind(ty).clone() {
+            Kind::Ref(Mut::Mut, _) | Kind::Slice(_) | Kind::Dyn(..) | Kind::Prim(crate::names::Primitive::Str) => false,
+            Kind::Tuple(items) => self.all_copy(items.into_iter())?,
+            Kind::Array(inner, _) => self.is_copy(inner)?,
+            Kind::Closure(..) if self.coroutine_output(ty).is_some() => false,
+            Kind::Closure(..) => match self.cx.closure_env(ty) {
+                Some(env) => self.is_copy(env)?,
+                None => true,
+            },
+            Kind::Adt(..) => {
+                let Some(copy) = self.cx.lang_item("copy") else { bail!("core has no `Copy` trait") };
+                self.select(copy, ty, &[])?.is_some()
+            }
+            _ => true,
+        })
+    }
+
+    fn all_copy(&mut self, mut tys: impl Iterator<Item = Ty>) -> Result<bool> {
+        tys.try_fold(true, |all, ty| Ok(all && self.is_copy(ty)?))
+    }
+
     /// The `Drop` impl of `ty` itself.
     pub fn drop_impl(&mut self, ty: Ty) -> Result<Option<Picked>> {
         let Some(drop) = self.cx.lang_item("drop") else { bail!("core has no `Drop` trait") };

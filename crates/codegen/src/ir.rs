@@ -138,6 +138,22 @@ impl IntCC {
             IntCC::SignedLessThan | IntCC::SignedGreaterThanOrEqual | IntCC::SignedGreaterThan | IntCC::SignedLessThanOrEqual
         )
     }
+
+    /// The comparison that holds exactly when this one does not.
+    pub fn inverse(self) -> Self {
+        match self {
+            IntCC::Equal => IntCC::NotEqual,
+            IntCC::NotEqual => IntCC::Equal,
+            IntCC::SignedLessThan => IntCC::SignedGreaterThanOrEqual,
+            IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThan,
+            IntCC::SignedGreaterThan => IntCC::SignedLessThanOrEqual,
+            IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThan,
+            IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThanOrEqual,
+            IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThan,
+            IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThanOrEqual,
+            IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThan,
+        }
+    }
 }
 
 /// A floating-point comparison; every one but `NotEqual` is false when an operand is NaN.
@@ -233,6 +249,8 @@ pub(crate) enum Op {
     Binary(Binary, Value, Value),
     Convert(Convert, Value),
     Icmp(IntCC, Value, Value),
+    /// 1 when `x op y` (add, sub or mul, signed when the flag is set) fits the type of `x`, else 0.
+    Fits(Binary, bool, Value, Value),
     Fcmp(FloatCC, Value, Value),
     Select(Value, Value, Value),
     Load(Value, i32),
@@ -246,6 +264,8 @@ pub(crate) enum Op {
     AtomicCas(Value, Value, Value),
     Fence,
     FramePointer,
+    /// Copies the number of bytes in the third value from the address in the second to the address in the first; the two may overlap.
+    Copy(Value, Value, Value),
     Call { sig: SigRef, callee: Value, args: Vec<Value>, results: Vec<Value> },
     TryCall { sig: SigRef, callee: Value, args: Vec<Value>, normal: Block, handler: Block },
     Jump(Block, Vec<Value>),
@@ -288,21 +308,34 @@ impl Op {
 
     /// Every value this instruction reads, once per read.
     pub(crate) fn operands(&self) -> Vec<Value> {
+        let mut values = Vec::new();
+        self.for_operands(|value| values.push(value));
+        values
+    }
+
+    /// Calls `f` with every value this instruction reads, once per read.
+    pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
-            Op::Const(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => Vec::new(),
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
-                vec![*x]
+            Op::Const(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
+            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) => {
+                f(*x);
+                f(*y);
             }
-            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fcmp(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) => {
-                vec![*x, *y]
+            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+                f(*c);
+                f(*x);
+                f(*y);
             }
-            Op::AtomicRmw(_, x, y) => vec![*x, *y],
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) => vec![*c, *x, *y],
             Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } => {
-                std::iter::once(*callee).chain(args.iter().copied()).collect()
+                f(*callee);
+                args.iter().for_each(|arg| f(*arg));
             }
-            Op::Jump(_, args) | Op::Return(args) => args.clone(),
-            Op::Brif(c, _, then, _, otherwise) => std::iter::once(*c).chain(then.iter().copied()).chain(otherwise.iter().copied()).collect(),
+            Op::Jump(_, args) | Op::Return(args) => args.iter().for_each(|arg| f(*arg)),
+            Op::Brif(c, _, then, _, otherwise) => {
+                f(*c);
+                then.iter().chain(otherwise).for_each(|arg| f(*arg));
+            }
         }
     }
 
@@ -315,6 +348,7 @@ impl Op {
             }
             Op::Binary(_, x, y)
             | Op::Icmp(_, x, y)
+            | Op::Fits(_, _, x, y)
             | Op::Fcmp(_, x, y)
             | Op::Store(x, y, _)
             | Op::AtomicStore(x, y)
@@ -322,7 +356,7 @@ impl Op {
                 *x = f(*x);
                 *y = f(*y);
             }
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) => {
+            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
                 *c = f(*c);
                 *x = f(*x);
                 *y = f(*y);
@@ -385,7 +419,7 @@ impl Function {
 
     /// The number of instructions in the body.
     pub fn size(&self) -> usize {
-        self.insts.len()
+        self.blocks.iter().map(|block| block.insts.len()).sum()
     }
 
     /// Whether `FunctionBuilder::inline` can copy this function into a caller: it is no coroutine, catches no unwind and reads no frame pointer.

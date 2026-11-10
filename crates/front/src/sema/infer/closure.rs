@@ -209,7 +209,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// The captured locals that the reads `reads` move out of: a read, or a field path from it, used as a value whose type needs dropping.
+    /// The captured locals that the reads `reads` move out of: a read, or a field path from it, used as a value whose type needs dropping or is not `Copy`, where a `&mut` read reborrows.
     fn moved_reads(&mut self, reads: &[(ExprId, u32)]) -> Result<Vec<u32>> {
         if reads.is_empty() {
             return Ok(Vec::new());
@@ -222,11 +222,16 @@ impl Infer<'_, '_> {
                 at = parent;
             }
             let ty = self.resolve(self.out.exprs[at.0 as usize]);
-            if !places.contains(&at) && !moved.contains(&local) && self.needs_drop(ty)? {
+            if !places.contains(&at) && !moved.contains(&local) && self.moves(ty)? {
                 moved.push(local);
             }
         }
         Ok(moved)
+    }
+
+    fn moves(&mut self, ty: Ty) -> Result<bool> {
+        let reborrows = matches!(self.cx.types.kind(self.resolve(ty)), Kind::Ref(Mut::Mut, _));
+        Ok(self.needs_drop(ty)? || (!reborrows && !self.is_copy(ty)?))
     }
 
     /// The expressions of the body used as places rather than values, and the field or parenthesis expression that projects each projected expression.

@@ -107,7 +107,7 @@ impl Emit<'_> {
 
     pub(super) fn binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {
         let ty = self.ty(x);
-        if self.is_static(result) {
+        if self.is_static(result) || self.plan.deferred[result.index()] {
             return Ok(());
         }
         if op == Binary::Iconcat {
@@ -123,29 +123,31 @@ impl Emit<'_> {
         if ty == Type::I128 {
             return self.wide_binary(op, x, y, result);
         }
-        self.int_binary(op, x, y, ty)?;
-        self.put(result, Reg::Rax);
+        let dst = self.dst(result);
+        let reg = self.int_binary(op, (x, y), ty, dst)?;
+        self.put(result, reg);
         Ok(())
     }
 
-    fn int_binary(&mut self, op: Binary, x: Value, y: Value, ty: Type) -> Result<(), String> {
+    /// Computes `x op y` into `dst` for the operations that can, or into rax, and returns the register that holds it.
+    fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<Reg, String> {
         if let Some(alu) = alu_of(op) {
-            self.raw(Reg::Rax, x);
+            self.raw(dst, x);
             match self.imm_of(y) {
-                Some(imm) => self.asm.alu_imm(alu, Reg::Rax, imm),
+                Some(imm) => self.asm.alu_imm(alu, dst, imm),
                 None => {
                     let source = self.operand(y);
-                    self.asm.alu(alu, Reg::Rax, source);
+                    self.asm.alu(alu, dst, source);
                 }
             }
-            return Ok(());
+            return Ok(dst);
         }
         match op {
             Binary::Imul => {
-                self.raw(Reg::Rax, x);
-                let source = self.operand(y);
-                self.asm.imul(Reg::Rax, source);
+                self.multiply(dst, x, y);
+                return Ok(dst);
             }
+            Binary::Udiv | Binary::Urem if self.divide_by_power(op, (x, y), dst) => return Ok(dst),
             Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem => self.divide(op, x, y),
             Binary::Umulhi | Binary::Smulhi => self.multiply_high(op == Binary::Smulhi, x, y, ty.bits() as u8),
             Binary::Smin | Binary::Smax => {
@@ -157,7 +159,44 @@ impl Emit<'_> {
             Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr => self.shift_by(op, x, y, ty),
             other => return Err(format!("{other:?} of an integer")),
         }
-        Ok(())
+        Ok(Reg::Rax)
+    }
+
+    /// Multiplies `x` by `y` into `dst`, with a shift or an immediate when either factor is a constant.
+    fn multiply(&mut self, dst: Reg, x: Value, y: Value) {
+        let (x, imm) = match (self.imm_of(x), self.imm_of(y)) {
+            (_, Some(imm)) => (x, imm),
+            (Some(imm), None) => (y, imm),
+            (None, None) => {
+                self.raw(dst, x);
+                let source = self.operand(y);
+                self.asm.imul(dst, source);
+                return;
+            }
+        };
+        if imm > 0 && imm.count_ones() == 1 {
+            self.raw(dst, x);
+            if imm > 1 {
+                self.asm.shift_imm(Size::Q, Shift::Shl, dst, imm.trailing_zeros() as u8);
+            }
+            return;
+        }
+        let source = self.operand(x);
+        self.asm.imul_imm(dst, source, imm);
+    }
+
+    /// Divides or takes the remainder by a power of two into `dst` with a shift or a mask, when `op` is unsigned and `y` is one.
+    fn divide_by_power(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) -> bool {
+        let Some(divisor) = self.imm_extended(y, Ext::Zero).filter(|imm| *imm > 0 && imm.count_ones() == 1) else { return false };
+        if !matches!(op, Binary::Udiv | Binary::Urem) {
+            return false;
+        }
+        self.get(dst, x, Ext::Zero);
+        match op {
+            Binary::Udiv => self.asm.shift_imm(Size::Q, Shift::Shr, dst, divisor.trailing_zeros() as u8),
+            _ => self.asm.alu_imm(Alu::And, dst, divisor - 1),
+        }
+        true
     }
 
     fn divide(&mut self, op: Binary, x: Value, y: Value) {
@@ -209,37 +248,95 @@ impl Emit<'_> {
     }
 
     pub(super) fn icmp(&mut self, cc: IntCC, x: Value, y: Value, result: Value) -> Result<(), String> {
+        if self.is_static(result) {
+            return Ok(());
+        }
         let flags = if self.ty(x) == Type::I128 {
             self.wide_icmp(cc, x, y)
         } else {
-            let ext = if cc.is_signed() { Ext::Sign } else { Ext::Zero };
-            self.get(Reg::Rax, x, ext);
-            match self.imm_extended(y, ext) {
-                Some(imm) => self.asm.alu_imm(Alu::Cmp, Reg::Rax, imm),
-                None => {
-                    self.get(Reg::Rcx, y, ext);
-                    self.asm.alu(Alu::Cmp, Reg::Rax, Reg::Rcx);
-                }
-            }
+            let left = self.reg_of(x).unwrap_or_else(|| {
+                self.raw(Reg::Rax, x);
+                Reg::Rax
+            });
+            self.alu_at(Size::of(self.ty(x).bytes()), Alu::Cmp, left, y);
             cond(cc)
         };
         if self.plan.fused[result.index()] {
             self.flags = Some((result, flags));
             return Ok(());
         }
-        self.asm.setcc(flags, Reg::Rax);
-        self.asm.load(Size::B, Reg::Rax, Reg::Rax);
-        self.put(result, Reg::Rax);
+        let dst = self.dst(result);
+        self.asm.setcc(flags, dst);
+        self.asm.load(Size::B, dst, dst);
+        self.put(result, dst);
         Ok(())
     }
 
+    /// Sets `result` to whether `x op y` fits its type, from the carry or overflow flag of the operation at that width; computes the paired operation's result with the same instruction.
+    pub(super) fn fits(&mut self, op: Binary, signed: bool, (x, y): (Value, Value), result: Value) -> Result<(), String> {
+        let pair = self.plan.pairs[result.index()];
+        if self.is_static(result) && pair.is_none() {
+            return Ok(());
+        }
+        let size = Size::of(self.ty(x).bytes());
+        let reg = match op {
+            Binary::Iadd | Binary::Isub => {
+                let alu = if op == Binary::Iadd { Alu::Add } else { Alu::Sub };
+                let reg = pair.and_then(|sum| self.reg_of(sum)).filter(|reg| Some(*reg) != self.reg_of(y)).unwrap_or(Reg::Rax);
+                self.raw(reg, x);
+                self.alu_at(size, alu, reg, y);
+                reg
+            }
+            Binary::Imul => {
+                self.raw(Reg::Rax, x);
+                self.raw(Reg::Rcx, y);
+                self.asm.group3_sized(size, if signed { Group3::Imul } else { Group3::Mul }, Reg::Rcx);
+                Reg::Rax
+            }
+            other => return Err(format!("{other:?} has no overflow flag")),
+        };
+        if let Some(sum) = pair {
+            self.put(sum, reg);
+        }
+        let ok = if signed { Cond::No } else { Cond::Ae };
+        if self.plan.fused[result.index()] {
+            self.flags = Some((result, ok));
+            return Ok(());
+        }
+        let dst = self.dst(result);
+        self.asm.setcc(ok, dst);
+        self.asm.load(Size::B, dst, dst);
+        self.put(result, dst);
+        Ok(())
+    }
+
+    /// `dst op= y` on the low `size` bytes, with an immediate when `y` is a constant that fits one at that width.
+    pub(super) fn alu_at(&mut self, size: Size, alu: Alu, dst: Reg, y: Value) {
+        match (size, self.imm_of(y)) {
+            (Size::Q, Some(imm)) => self.asm.alu_imm(alu, dst, imm),
+            (Size::D, Some(imm)) => self.asm.alu_imm32(alu, dst, imm),
+            (_, Some(_)) => {
+                self.raw(Reg::Rcx, y);
+                self.asm.alu_sized(size, alu, dst, Reg::Rcx);
+            }
+            (_, None) => {
+                let source = self.operand(y);
+                self.asm.alu_sized(size, alu, dst, source);
+            }
+        }
+    }
+
     pub(super) fn convert(&mut self, op: Convert, x: Value, result: Value) -> Result<(), String> {
+        if self.is_static(result) {
+            return Ok(());
+        }
         let wide = self.ty(result) == Type::I128;
         match op {
             Convert::Uextend | Convert::Sextend => {
                 let signed = op == Convert::Sextend;
-                self.get(Reg::Rax, x, if signed { Ext::Sign } else { Ext::Zero });
-                self.put(result, Reg::Rax);
+                let dst = self.dst(result);
+                self.get(dst, x, if signed { Ext::Sign } else { Ext::Zero });
+                self.put(result, dst);
                 if wide && signed {
                     self.asm.mov(Reg::Rcx, Reg::Rax);
                     self.asm.shift_imm(Size::Q, Shift::Sar, Reg::Rcx, 63);
@@ -251,8 +348,9 @@ impl Emit<'_> {
                 Ok(())
             }
             Convert::Ireduce => {
-                self.raw(Reg::Rax, x);
-                self.put(result, Reg::Rax);
+                let dst = self.dst(result);
+                self.raw(dst, x);
+                self.put(result, dst);
                 Ok(())
             }
             _ => self.float_convert(op, x, result),

@@ -52,14 +52,35 @@ pub trait Slots {
     fn bodies(&self) -> &Bodies;
 }
 
-/// What calls learned about copying reached functions inline, by reached index.
-pub type Bodies = std::cell::RefCell<rustc_hash::FxHashMap<usize, Lowered>>;
+/// What calls learned about copying reached functions inline: which reached indexes they tried, and the bodies they may copy.
+#[derive(Default)]
+pub struct Bodies {
+    tried: std::cell::RefCell<Vec<u64>>,
+    kept: std::cell::RefCell<rustc_hash::FxHashMap<usize, std::rc::Rc<Function>>>,
+}
 
-/// A reached function as calls see it: its lowered body when one was made, and whether a call may copy it inline.
-#[derive(Clone, Default)]
-pub struct Lowered {
-    pub body: Option<std::rc::Rc<Function>>,
-    pub inline: bool,
+impl Bodies {
+    /// Marks `index` tried, and whether it was not before.
+    pub fn first_try(&self, index: usize) -> bool {
+        let mut tried = self.tried.borrow_mut();
+        if tried.len() <= index / 64 {
+            tried.resize(index / 64 + 1, 0);
+        }
+        let (word, bit) = (&mut tried[index / 64], 1 << (index % 64));
+        let first = *word & bit == 0;
+        *word |= bit;
+        first
+    }
+
+    /// The body of reached function `index` that calls may copy inline.
+    pub fn body(&self, index: usize) -> Option<std::rc::Rc<Function>> {
+        self.kept.borrow().get(&index).cloned()
+    }
+
+    /// Keeps `body` as the one calls copy for reached function `index`.
+    pub fn keep(&self, index: usize, body: std::rc::Rc<Function>) {
+        self.kept.borrow_mut().insert(index, body);
+    }
 }
 
 /// One machine word of a constant table: a number, or the code address of reached function `index`.

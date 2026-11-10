@@ -63,7 +63,7 @@ impl Lower<'_, '_> {
             }
             (Write, &[_]) => Ok(None),
             (WriteBox, &[boxed, ..]) => self.write_box(ty, boxed, args.get(1).copied()).map(Some),
-            (MemCopy(overlapping), &[from, to, count]) => self.copy_items(ty, overlapping, (from, to), count).map(|()| None),
+            (MemCopy(_), &[from, to, count]) => self.copy_items(ty, (from, to), count).map(|()| None),
             (WriteBytes, &[to, byte, count]) => self.write_bytes(ty, to, byte, count).map(|()| None),
             (SliceElement, &[slice, index]) => self.slice_element(substs, slice, index).map(Some),
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
@@ -188,38 +188,28 @@ impl Lower<'_, '_> {
         Ok(Some(to))
     }
 
-    fn copy_items(&mut self, ty: Ty, overlapping: bool, (from, to): (Value, Value), count: Value) -> Result<()> {
+    fn copy_items(&mut self, ty: Ty, (from, to): (Value, Value), count: Value) -> Result<()> {
         let size = self.size(ty)?;
         if size == 0 {
             return Ok(());
         }
-        let backward = match overlapping {
-            true => Some(self.ins().icmp(IntCC::UnsignedGreaterThan, to, from)),
-            false => None,
-        };
-        let last = self.ins().iadd_imm(count, -1);
-        self.each(count, |lower, index| {
-            let item = match backward {
-                Some(backward) => {
-                    let down = lower.ins().isub(last, index);
-                    lower.ins().select(backward, down, index)
-                }
-                None => index,
-            };
-            let offset = lower.ins().imul_imm(item, size);
-            let (source, target) = (lower.ins().iadd(from, offset), lower.ins().iadd(to, offset));
-            lower.copy(target, source, size as u32);
-        });
+        let bytes = self.ins().imul_imm(count, size);
+        self.ins().copy(to, from, bytes);
         Ok(())
     }
 
     fn write_bytes(&mut self, ty: Ty, to: Value, byte: Value, count: Value) -> Result<()> {
         let size = self.size(ty)?;
         let bytes = self.ins().imul_imm(count, size);
-        self.each(bytes, |lower, index| {
-            let at = lower.ins().iadd(to, index);
-            lower.ins().store(byte, at, 0);
-        });
+        let byte = self.ins().uextend(Type::I64, byte);
+        self.call_libc(libc::memset as *const (), vec![to, byte, bytes])
+    }
+
+    /// Calls the C library function `function` of this process with word arguments `args`, ignoring its result.
+    fn call_libc(&mut self, function: *const (), args: Vec<Value>) -> Result<()> {
+        let usize_ty = self.cx.types.prim(crate::names::Primitive::Usize);
+        let code = self.ins().iconst(Type::I64, function as i64);
+        self.call_code(code, (vec![usize_ty; args.len()], None), args)?;
         Ok(())
     }
 

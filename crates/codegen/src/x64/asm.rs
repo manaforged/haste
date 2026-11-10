@@ -313,6 +313,11 @@ impl Asm {
         self.encode(&[], true, &[0x85], b as u8, a.into(), false);
     }
 
+    /// `test` of the low `size` bytes of `a` and `b`.
+    pub fn test_sized(&mut self, size: Size, a: Reg, b: Reg) {
+        self.sized(false, size, (&[0x84], &[0x85]), b as u8, a.into());
+    }
+
     pub fn test_imm8(&mut self, reg: Reg, imm: u8) {
         self.encode(&[], false, &[0xF6], 0, reg.into(), true);
         self.code.push(imm);
@@ -320,6 +325,22 @@ impl Asm {
 
     pub fn imul(&mut self, dst: Reg, src: impl Into<Rm>) {
         self.encode(&[], true, &[0x0F, 0xAF], dst as u8, src.into(), false);
+    }
+
+    /// `dst = src * imm`.
+    pub fn imul_imm(&mut self, dst: Reg, src: impl Into<Rm>, imm: i32) {
+        self.encode(&[], true, &[0x69], dst as u8, src.into(), false);
+        self.code.extend(imm.to_le_bytes());
+    }
+
+    /// `op` on the low `size` bytes of `dst` and `src`.
+    pub fn alu_sized(&mut self, size: Size, op: Alu, dst: Reg, src: impl Into<Rm>) {
+        self.sized(false, size, (&[op as u8 * 8 + 2], &[op as u8 * 8 + 3]), dst as u8, src.into());
+    }
+
+    /// The one-operand `op` on the low `size` bytes of `rm`.
+    pub fn group3_sized(&mut self, size: Size, op: Group3, rm: impl Into<Rm>) {
+        self.sized(false, size, (&[0xF6], &[0xF7]), op as u8, rm.into());
     }
 
     pub fn group3(&mut self, op: Group3, rm: impl Into<Rm>) {
@@ -396,6 +417,12 @@ impl Asm {
     pub fn push(&mut self, reg: Reg) {
         self.rex(false, 0, reg as u8, false);
         self.code.push(0x50 + (reg as u8 & 7));
+    }
+
+    /// `call` through the eight bytes at the 32-bit absolute address `at`.
+    pub fn call_absolute(&mut self, at: i32) {
+        self.code.extend([0xFF, 0x14, 0x25]);
+        self.code.extend(at.to_le_bytes());
     }
 
     pub fn call(&mut self, reg: Reg) {

@@ -12,10 +12,13 @@ use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::Place;
-use super::{Loop, Lowered, Lower, Repr, repr};
+use super::{Loop, Lower, Repr, repr};
 
 /// The most instructions a sysroot body may have, after slot promotion, for a call to copy it inline.
 const INLINE_LIMIT: usize = 30;
+
+/// The most instructions an `#[inline(always)]` sysroot body may have for a call to copy it inline.
+const ALWAYS_LIMIT: usize = 100;
 
 /// The most source expressions a sysroot body may have for lowering it to try `INLINE_LIMIT`.
 const INLINE_EXPRS: usize = 20;
@@ -26,18 +29,24 @@ enum Callee {
     Reached(usize),
 }
 
-/// Whether a call may try to copy reached function `index` inline: a sysroot function whose source body has at most `INLINE_EXPRS` expressions, or none.
+/// Whether a call may try to copy reached function `index` inline.
 pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool {
-    let ((item, _), Ok(typed)) = &reached.list[index] else { return false };
+    inline_limit(cx, reached, index).is_some()
+}
+
+/// The most instructions a call may copy inline of reached function `index`: `ALWAYS_LIMIT` for an `#[inline(always)]` sysroot function, `INLINE_LIMIT` for one whose source body has at most `INLINE_EXPRS` expressions, or none.
+fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
+    let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
     if !cx.outline.crates[item.krate as usize].env.release {
-        return false;
+        return None;
     }
     let source = match &typed.shape {
+        Shape::Body if cx.inline_always(*item) => return Some(ALWAYS_LIMIT),
         Shape::Body => *item,
         Shape::Closure(closure) => closure.parent,
-        _ => return true,
+        _ => return Some(INLINE_LIMIT),
     };
-    cx.body(source).is_ok_and(|body| body.exprs.len() <= INLINE_EXPRS)
+    cx.body(source).is_ok_and(|body| body.exprs.len() <= INLINE_EXPRS).then_some(INLINE_LIMIT)
 }
 
 impl Lower<'_, '_> {
@@ -273,24 +282,18 @@ impl Lower<'_, '_> {
 
     /// The lowered body of reached sysroot function `index` when a call may copy it inline: small, copyable, and not being lowered already.
     fn inline_body(&mut self, index: usize) -> Option<Rc<Function>> {
-        if let Some(cached) = self.slots.bodies().borrow().get(&index) {
-            return cached.inline.then(|| cached.body.clone()).flatten();
+        if !self.slots.bodies().first_try(index) {
+            return self.slots.bodies().body(index);
         }
-        self.slots.bodies().borrow_mut().insert(index, Lowered::default());
-        if !may_inline(self.cx, self.reached, index) {
+        let limit = inline_limit(self.cx, self.reached, index)?;
+        let mut body = super::lower(self.cx, self.reached, self.slots, index).ok().filter(Function::can_inline)?;
+        haste_codegen::simplify(&mut body);
+        if body.size() > limit {
             return None;
         }
-        let lowered = super::lower(self.cx, self.reached, self.slots, index).ok().map_or_else(Lowered::default, |mut body| {
-            let copyable = body.can_inline();
-            if copyable {
-                haste_codegen::simplify(&mut body);
-            }
-            let inline = copyable && body.size() <= INLINE_LIMIT;
-            Lowered { inline, body: inline.then(|| Rc::new(body)) }
-        });
-        let body = lowered.inline.then(|| lowered.body.clone()).flatten();
-        self.slots.bodies().borrow_mut().insert(index, lowered);
-        body
+        let body = Rc::new(body);
+        self.slots.bodies().keep(index, body.clone());
+        Some(body)
     }
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.

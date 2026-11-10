@@ -103,9 +103,9 @@ fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {
 impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Result<Image> {
-        let mut shared = Shared::new(SHARED_BYTES).map_err(|error| anyhow!(error))?;
+        let shared = Shared::new(SHARED_BYTES).map_err(|error| anyhow!(error))?;
         let capacity = reached.list.len().max(TABLE_SLOTS);
-        let table = shared.alloc(capacity * size_of::<AtomicUsize>()).map_err(|error| anyhow!(error))?;
+        let table = Shared::low(capacity * size_of::<AtomicUsize>()).and_then(|mut low| low.alloc(capacity * size_of::<AtomicUsize>())).map_err(|error| anyhow!(error))?;
         let memory = Memory::default();
         let state = Shared::private(STATE_BYTES).map_err(|error| anyhow!(error))?;
         Ok(Image { table, capacity, memory, stubs: Memory::default(), shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), wanted: RefCell::default(), bodies: lower::Bodies::default() })
@@ -175,7 +175,7 @@ impl Image {
     }
 
     fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
-        let lowered = self.bodies.borrow().get(&index).and_then(|lowered| lowered.body.clone());
+        let lowered = self.bodies.body(index);
         let func = match lowered {
             Some(body) => std::rc::Rc::unwrap_or_clone(body),
             None => lower::lower(cx, reached, self, index)?,

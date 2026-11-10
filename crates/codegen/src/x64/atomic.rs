@@ -4,14 +4,18 @@ use crate::ir::{AtomicRmwOp, Op, StackSlot, Type, Value};
 
 const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
 
+/// Scratch registers an inline copy holds its chunks in; none of them forms an address.
+const COPY_SCRATCH: [Reg; 4] = [Reg::Rax, Reg::Rdx, Reg::R11, Reg::Rsi];
+
 impl Emit<'_> {
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
             Op::Const(imm) => {
                 let result = result()?;
                 if !self.is_static(result) {
-                    self.asm.mov_imm(Reg::Rax, *imm);
-                    self.put(result, Reg::Rax);
+                    let dst = self.dst(result);
+                    self.asm.mov_imm(dst, *imm);
+                    self.put(result, dst);
                 }
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
@@ -22,10 +26,7 @@ impl Emit<'_> {
 
     fn access(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
-            Op::Load(addr, offset) => {
-                let from = self.address(*addr, *offset);
-                self.read(result()?, from);
-            }
+            Op::Load(addr, offset) => self.load(*addr, *offset, result()?),
             Op::Store(value, addr, offset) => {
                 let to = self.address(*addr, *offset);
                 self.write(*value, to);
@@ -33,15 +34,39 @@ impl Emit<'_> {
             Op::StackAddr(slot, offset) => {
                 let result = result()?;
                 if !self.is_static(result) {
-                    self.asm.lea(Reg::Rax, self.slot(*slot, *offset));
-                    self.put(result, Reg::Rax);
+                    let dst = self.dst(result);
+                    self.asm.lea(dst, self.slot(*slot, *offset));
+                    self.put(result, dst);
                 }
             }
             Op::StackLoad(slot, offset) => self.read(result()?, self.slot(*slot, *offset)),
             Op::StackStore(value, slot, offset) => self.write(*value, self.slot(*slot, *offset)),
             Op::Fence => self.asm.bytes(&MFENCE),
             Op::FramePointer => self.put(result()?, Reg::Rbp),
+            Op::Copy(to, from, bytes) => self.copy(*to, *from, *bytes)?,
             _ => return self.atomic(op, result),
+        }
+        Ok(())
+    }
+
+    /// Reads `result` from `addr + offset`, unless a call reads it in place.
+    fn load(&mut self, addr: Value, offset: i32, result: Value) {
+        if self.plan.through[result.index()].is_none() {
+            let from = self.address(addr, offset);
+            self.read(result, from);
+        }
+    }
+
+    /// Copies a constant number of bytes inline: every chunk into its own scratch register first, so overlapping ranges copy correctly.
+    fn copy(&mut self, to: Value, from: Value, bytes: Value) -> Result<(), String> {
+        let chunks = self.const_of(bytes).and_then(crate::copy::chunks).ok_or("a copy of a size that is not a small constant")?;
+        let source = self.address(from, 0);
+        for (&(width, offset), reg) in chunks.iter().zip(COPY_SCRATCH) {
+            self.asm.load(Size::of(width), reg, source.offset(offset as i32));
+        }
+        let target = self.address(to, 0);
+        for (&(width, offset), reg) in chunks.iter().zip(COPY_SCRATCH) {
+            self.asm.store(Size::of(width), target.offset(offset as i32), reg);
         }
         Ok(())
     }
@@ -94,20 +119,22 @@ impl Emit<'_> {
             self.put_high(result, Reg::Rax);
             return;
         }
-        self.asm.load(Size::of(ty.bytes()), Reg::Rax, from);
-        self.put(result, Reg::Rax);
+        let dst = self.dst(result);
+        self.asm.load(Size::of(ty.bytes()), dst, from);
+        self.put(result, dst);
     }
 
     fn write(&mut self, value: Value, to: Mem) {
         let ty = self.ty(value);
-        self.raw(Reg::Rax, value);
+        let source = self.reg_of(value).unwrap_or(Reg::Rax);
+        self.raw(source, value);
         if ty == Type::I128 {
             self.asm.store(Size::Q, to, Reg::Rax);
             self.high(Reg::Rax, value);
             self.asm.store(Size::Q, to.offset(8), Reg::Rax);
             return;
         }
-        self.asm.store(Size::of(ty.bytes()), to, Reg::Rax);
+        self.asm.store(Size::of(ty.bytes()), to, source);
     }
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {

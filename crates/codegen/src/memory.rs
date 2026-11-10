@@ -100,6 +100,12 @@ impl Shared {
         Ok(Shared { base: map_data(size, true)?, used: 0, size, split: false, private: true })
     }
 
+    /// Maps `size` bytes of shared memory below 2 GiB when an address there is free, so code reaches it with a 32-bit absolute address.
+    pub fn low(size: usize) -> Result<Shared, String> {
+        let base = LOW_HINTS.map(|hint| map_low(size, hint)).into_iter().flatten().next();
+        Ok(Shared { base: base.map_or_else(|| map_data(size, false), Ok)?, used: 0, size, split: false, private: false })
+    }
+
     /// The address of `len` zeroed bytes aligned to 16, in a new mapping when this one is full and no worker shares it.
     pub fn alloc(&mut self, len: usize) -> Result<usize, String> {
         let at = self.used.next_multiple_of(ALIGN);
@@ -131,6 +137,23 @@ impl Shared {
         (self.base, self.used, self.split) = (map_data(self.size, self.private)?, 0, false);
         Ok(())
     }
+}
+
+/// Addresses `Shared::low` tries in turn, each well above the null page and the start of a non-relocated program.
+const LOW_HINTS: [usize; 6] = [0x1000_0000, 0x2000_0000, 0x3000_0000, 0x4000_0000, 0x5000_0000, 0x6000_0000];
+
+fn map_low(size: usize, hint: usize) -> Option<usize> {
+    let flags = libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED_NOREPLACE;
+    // SAFETY: MAP_FIXED_NOREPLACE fails rather than replace an existing mapping, so the new mapping touches no existing memory.
+    let base = unsafe { libc::mmap(hint as *mut libc::c_void, size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
+    if base as usize == hint && hint + size <= 1 << 31 {
+        return Some(hint);
+    }
+    if base != libc::MAP_FAILED {
+        // SAFETY: base is the mapping of size bytes made above, which nothing references yet.
+        unsafe { libc::munmap(base, size) };
+    }
+    None
 }
 
 fn map_data(size: usize, private: bool) -> Result<usize, String> {
