@@ -27,6 +27,9 @@ pub(super) fn tree(src: &Source, at: u32) -> u32 {
     if opens(src.kind(at)) {
         return src.pair(at) + 1;
     }
+    if !src.joint(at) {
+        return at + 1;
+    }
     let operator = OPERATORS.iter().find(|operator| glued(src, at, operator));
     at + operator.map_or(1, |operator| operator.len() as u32)
 }
