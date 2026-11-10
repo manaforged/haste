@@ -274,15 +274,17 @@ impl Outline {
 
     /// The crates that depend on crate `krate`, directly or through others, with `krate` itself.
     pub fn dependents(&self, krate: usize) -> Vec<usize> {
-        let mut found = vec![krate];
-        let mut at = 0;
-        while let Some(&next) = found.get(at) {
-            let users = (0..self.deps.len()).filter(|user| self.deps[*user].iter().any(|(_, dep)| *dep == next));
-            let fresh: Vec<usize> = users.filter(|user| !found.contains(user)).collect();
-            found.extend(fresh);
-            at += 1;
+        let mut seen = vec![false; self.deps.len()];
+        dependents_of(&self.users(), &mut seen, [krate])
+    }
+
+    /// The crates that depend directly on each crate.
+    pub fn users(&self) -> Vec<Vec<usize>> {
+        let mut users = vec![Vec::new(); self.deps.len()];
+        for (user, deps) in self.deps.iter().enumerate() {
+            deps.iter().for_each(|&(_, dep)| users[dep].push(user));
         }
-        found
+        users
     }
 
     /// Moves the deferred calls of crate `krate` at the given indexes, which name resolution bound to procedural macros, out of the calls left to expand.
@@ -360,4 +362,19 @@ impl Outline {
         }
         Ok(())
     }
+}
+
+/// The crates `from` and the crates that depend on one of them, by the direct `users` of each crate, that `seen` does not hold yet; marks them in `seen`.
+pub fn dependents_of(users: &[Vec<usize>], seen: &mut [bool], from: impl IntoIterator<Item = usize>) -> Vec<usize> {
+    let mut found: Vec<usize> = from.into_iter().filter(|&krate| !std::mem::replace(&mut seen[krate], true)).collect();
+    let mut at = 0;
+    while let Some(&next) = found.get(at) {
+        for &user in &users[next] {
+            if !std::mem::replace(&mut seen[user], true) {
+                found.push(user);
+            }
+        }
+        at += 1;
+    }
+    found
 }
