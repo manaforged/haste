@@ -195,12 +195,12 @@ impl<'a> Context<'a> {
         Context { outline, names, types, asks, store, kids, trait_members, impl_members }
     }
 
-    /// Whether no lookup in this pass asked the front end for anything, so another pass would find the same.
+    /// Whether no lookup in this pass asked for anything to load or resolve, so another pass would find the same.
     pub fn resolved(&self) -> bool {
         self.asks.count() == 0
     }
 
-    /// Ends the pass: the store for the next one, and what lookups asked the front end to load or resolve.
+    /// Ends the pass: the store for the next one, and what lookups asked to load or resolve.
     pub fn release(mut self) -> (Cache, Requests) {
         self.store.types = self.types;
         (self.store, self.asks)

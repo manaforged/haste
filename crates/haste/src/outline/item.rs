@@ -44,7 +44,7 @@ pub enum Vis {
     In(u32),
 }
 
-/// An attribute the front end acts on. Others are kept as `Other` with the token of their path.
+/// An attribute the compiler acts on. Others are kept as `Other` with the token of their path.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Attr {
     Cfg(Cfg),

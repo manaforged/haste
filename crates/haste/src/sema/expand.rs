@@ -77,7 +77,7 @@ fn defined_expand(cx: &Context<'_>, found: ItemRef, src: &Source, open: u32) -> 
     Some(mbe::expand(&definition.file.source, &definition.rules, src, (open, definition.krate as u32), home))
 }
 
-/// The output of the procedural macro `run` called with the delimiter at `open`, once the front end ran it; until then the call asks for it.
+/// The output of the procedural macro `run` called with the delimiter at `open`, once the macro expander ran it; until then the call asks for it.
 fn proc_bang(cx: &mut Context<'_>, src: &Source, run: ItemRef, open: u32) -> Result<Option<Source>> {
     let close = src.pair(open);
     let input = if close > open + 1 { src.span(open + 1, close - 1).to_owned() } else { String::new() };
