@@ -211,16 +211,17 @@ impl Outline {
         }
     }
 
-    /// Reads crate `krate` again from its root after its files changed outside function bodies; no other crate may depend on it.
-    pub fn reload(&mut self, krate: usize) -> Result<()> {
-        if self.deps.iter().any(|deps| deps.iter().any(|(_, at)| *at == krate)) {
-            anyhow::bail!("crate {} has dependents", self.roots[krate].name);
-        }
-        let paths: Vec<PathBuf> = self.crates[krate].files.iter().map(|file| file.source.path.clone()).collect();
+    /// Reads crate `krate` and every crate that depends on it again from their roots after files of `krate` changed outside function bodies, and returns those crates.
+    pub fn reload(&mut self, krate: usize) -> Result<Vec<usize>> {
+        let crates = self.dependents(krate);
+        let paths: Vec<PathBuf> = crates.iter().flat_map(|&at| self.crates[at].files.iter().map(|file| file.source.path.clone())).collect();
         self.cache.forget(&paths);
-        let env = std::mem::take(&mut self.crates[krate].env);
-        self.crates[krate] = Crate { env, modules: vec![root_module(&self.roots[krate].path)], ..Crate::default() };
-        self.load_crate(krate)
+        for &at in &crates {
+            let env = std::mem::take(&mut self.crates[at].env);
+            self.crates[at] = Crate { env, modules: vec![root_module(&self.roots[at].path)], ..Crate::default() };
+        }
+        crates.iter().try_for_each(|&at| self.load_crate(at))?;
+        Ok(crates)
     }
 
     /// Reads every module of crate `krate`, as a lookup over all of a crate's impls needs.

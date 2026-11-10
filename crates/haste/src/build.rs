@@ -128,17 +128,20 @@ impl Build {
         true
     }
 
-    fn reload(&mut self, workspace: &graph::Workspace, mut crates: Vec<u32>) -> bool {
+    fn reload(&mut self, workspace: &graph::Workspace, edited: Vec<u32>) -> bool {
+        let Some(mut store) = self.store.take() else { return false };
+        let mut crates: Vec<u32> = Vec::new();
+        for krate in edited {
+            if crates.contains(&krate) {
+                continue;
+            }
+            let Ok(reloaded) = self.compilation.outline.reload(krate as usize) else { return false };
+            crates.extend(reloaded.into_iter().map(|at| at as u32));
+        }
         crates.sort_unstable();
         crates.dedup();
-        let Some(mut store) = self.store.take() else { return false };
         let touched = store.touched(self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(&crates));
-        for &krate in &crates {
-            if self.compilation.outline.reload(krate as usize).is_err() {
-                return false;
-            }
-            self.compilation.names.reset(krate as usize);
-        }
+        crates.iter().for_each(|&krate| self.compilation.names.reset(krate as usize));
         if crate::macros::resolve(&mut self.compilation).is_err() {
             return false;
         }
