@@ -237,18 +237,29 @@ impl Names {
         self.crates[krate] = Crate { edition_2015: old.edition_2015, edition: old.edition.clone(), deps: old.deps.clone(), eager: old.eager, ..Crate::default() };
     }
 
-    /// Collects every loaded module not collected yet and resolves imports until nothing changes, loading the modules that lookups reach.
+    /// Collects every loaded module not collected yet and resolves imports until nothing changes, loading the modules that lookups reach; each pass resolves again only the imports of crates whose own scopes, or the scopes of a crate they depend on, changed.
     pub fn resolve(&mut self, outline: &mut Outline) -> Result<()> {
+        let users = outline.users();
+        let mut changed = vec![true; self.crates.len()];
         loop {
-            self.collect(outline);
+            self.collect(outline, &mut changed);
             let demands = Requests::default();
-            while {
-                let changed = self.pass(outline, &demands);
-                self.want(demands.names.take()) | self.spread_whole() || changed
-            } {}
-            self.preludes(outline, &demands);
+            loop {
+                let mut sweep = vec![false; self.crates.len()];
+                crate::outline::dependents_of(&users, &mut sweep, (0..changed.len()).filter(|&krate| changed[krate]));
+                changed = self.pass(outline, &demands, &sweep);
+                if self.want(demands.names.take()) | self.spread_whole() {
+                    changed.fill(true);
+                } else if !changed.contains(&true) {
+                    break;
+                }
+            }
+            self.preludes(outline, &demands, &mut changed);
             let expanded = self.expand_imported(outline, &demands)?;
             let wanted = self.want(demands.names.take());
+            if wanted {
+                changed.fill(true);
+            }
             let crates = demands.crates.take();
             let mut demands = demands.modules.into_inner();
             demands.extend(crates.into_iter().flat_map(|krate| declared(outline, krate as usize)));
@@ -268,7 +279,7 @@ impl Names {
         }
     }
 
-    fn collect(&mut self, outline: &Outline) {
+    fn collect(&mut self, outline: &Outline, collected: &mut [bool]) {
         let symbols = &self.symbols;
         for (krate, tree) in outline.crates.iter().enumerate() {
             let entry = &mut self.crates[krate];
@@ -299,6 +310,7 @@ impl Names {
                 changed = true;
             }
             if changed {
+                collected[krate] = true;
                 collect::lift_macro_use(tree, &mut entry.scopes);
                 if let Some(root) = entry.scopes.first() {
                     entry.externs = collect::externs(root);
@@ -307,10 +319,11 @@ impl Names {
         }
     }
 
-    fn pass(&mut self, outline: &Outline, demands: &Requests) -> bool {
+    /// Resolves again the active imports of the crates that `sweep` marks and returns the crates whose scopes changed.
+    fn pass(&mut self, outline: &Outline, demands: &Requests, sweep: &[bool]) -> Vec<bool> {
         let mut found: Vec<(usize, usize, Found, Option<(Def, u32)>)> = Vec::new();
         let mut unresolved = vec![Vec::new(); self.crates.len()];
-        for (krate, entry) in self.crates.iter().enumerate() {
+        for (krate, entry) in self.crates.iter().enumerate().filter(|(krate, _)| sweep[*krate]) {
             let paths = paths_of(self, outline, krate, demands);
             for (index, pending) in entry.pending.iter().enumerate().filter(|(_, pending)| pending.active) {
                 match import(&paths, pending) {
@@ -320,20 +333,20 @@ impl Names {
                 }
             }
         }
-        let mut changed = false;
+        let mut changed = vec![false; self.crates.len()];
         for (krate, index, bindings, stamp) in found {
             let entry = &mut self.crates[krate];
             let pending = &mut entry.pending[index];
             let moved = pending.name.is_none() && pending.stamp.map(|(target, _)| target) != stamp.map(|(target, _)| target);
             pending.stamp = stamp;
             let module = pending.module;
-            changed |= apply(&mut entry.scopes, module, bindings);
+            changed[krate] |= apply(&mut entry.scopes, module, bindings);
             if let (true, Some((Def::Module(target), _))) = (moved, stamp) {
                 let asked = entry.wanted_in(module).into_iter().map(|name| (target, name));
                 demands.names.borrow_mut().extend(asked);
             }
         }
-        for (entry, unresolved) in self.crates.iter_mut().zip(unresolved) {
+        for ((entry, unresolved), _) in self.crates.iter_mut().zip(unresolved).zip(sweep).filter(|(_, swept)| **swept) {
             entry.unresolved = unresolved;
         }
         changed
@@ -377,14 +390,14 @@ impl Names {
         (found, foreign)
     }
 
-    fn preludes(&mut self, outline: &Outline, demands: &Requests) {
+    fn preludes(&mut self, outline: &Outline, demands: &Requests, found: &mut [bool]) {
         for krate in 0..self.crates.len() {
             if self.crates[krate].prelude.is_some() || !outline.crates[krate].modules.first().is_some_and(|root| root.loaded()) {
                 continue;
             }
             let paths = paths_of(self, outline, krate, demands);
-            let found = prelude(&paths, &outline.crates[krate], &self.crates[krate].edition);
-            self.crates[krate].prelude = found;
+            self.crates[krate].prelude = prelude(&paths, &outline.crates[krate], &self.crates[krate].edition);
+            found[krate] |= self.crates[krate].prelude.is_some();
         }
     }
 }
