@@ -1,4 +1,4 @@
-//! A resident build of one workspace that answers `build`, `test` and `run` requests over an abstract Unix socket, which leaves no file behind.
+//! A resident build of one workspace that answers `build`, `test` and `run` requests over a Unix socket: an abstract one on Linux, which leaves no file behind, else one in the temporary directory.
 
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
@@ -41,36 +41,47 @@ fn address(root: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
     root.hash(&mut hasher);
-    let name = format!("haste/{:016x}", hasher.finish());
+    let abstract_name = cfg!(target_os = "linux");
+    let name = match abstract_name {
+        true => format!("haste/{:016x}", hasher.finish()),
+        false => std::env::temp_dir().join(format!("haste-{:016x}.sock", hasher.finish())).to_string_lossy().into_owned(),
+    };
     // SAFETY: sockaddr_un is plain data, and all zero bytes are a valid value.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (slot, byte) in addr.sun_path[1..].iter_mut().zip(name.bytes()) {
+    let skip = usize::from(abstract_name);
+    let room = addr.sun_path.len() - 1;
+    for (slot, byte) in addr.sun_path[skip..room].iter_mut().zip(name.bytes()) {
         *slot = byte as libc::c_char;
     }
-    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + skip + name.len().min(room - skip);
     (addr, len as libc::socklen_t)
 }
 
 fn socket() -> Result<RawFd> {
     // SAFETY: socket takes plain integers and returns a new descriptor or -1.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         bail!("socket: {}", std::io::Error::last_os_error());
     }
-    Ok(fd)
+    crate::image::close_on_exec(fd)
 }
 
-/// Sends `request` and `args` with this process's stdout and stderr to the server of `root`, waits for it, and returns its status, or none when no server runs.
-pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<Option<i32>> {
+/// A socket connected to the server of `root`, or none when no server answers.
+fn connect(root: &std::path::Path) -> Result<Option<RawFd>> {
     let fd = socket()?;
     let (addr, len) = address(root);
     // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
     if unsafe { libc::connect(fd, (&raw const addr).cast(), len) } != 0 {
-        // SAFETY: fd is the socket made above, which nothing else holds.
-        unsafe { libc::close(fd) };
+        close_all(&[fd]);
         return Ok(None);
     }
+    Ok(Some(fd))
+}
+
+/// Sends `request` and `args` with this process's stdout and stderr to the server of `root`, waits for it, and returns its status, or none when no server runs.
+pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<Option<i32>> {
+    let Some(fd) = connect(root)? else { return Ok(None) };
     // SAFETY: fd is a connected socket that this File owns from here on.
     let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
     std::io::stdout().flush()?;
@@ -89,8 +100,8 @@ pub fn serve(workspace: &graph::Workspace, targets: &Targets, root: &std::path::
     eprintln!("serving {} after {:.1} ms", root.display(), started.elapsed().as_secs_f64() * 1e3);
     loop {
         // SAFETY: listener is a listening socket; accept returns a new descriptor or -1.
-        let fd = unsafe { libc::accept4(listener, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
-        if fd < 0 {
+        let fd = unsafe { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if fd < 0 || crate::image::close_on_exec(fd).is_err() {
             continue;
         }
         // SAFETY: fd is the accepted connection, which this File owns from here on.
@@ -109,6 +120,11 @@ pub fn serve(workspace: &graph::Workspace, targets: &Targets, root: &std::path::
 fn listen(root: &std::path::Path) -> Result<RawFd> {
     let fd = socket()?;
     let (addr, len) = address(root);
+    let answered = connect(root)?.inspect(|fd| close_all(&[*fd])).is_some();
+    if !cfg!(target_os = "linux") && !answered {
+        // SAFETY: sun_path is NUL-terminated, since address leaves its last byte zero; no server answers on it.
+        unsafe { libc::unlink(addr.sun_path.as_ptr()) };
+    }
     // SAFETY: addr is a live sockaddr_un of length len, and fd is the socket made above.
     if unsafe { libc::bind(fd, (&raw const addr).cast(), len) } != 0 || unsafe { libc::listen(fd, 16) } != 0 {
         bail!("a build server for {} runs already: {}", root.display(), std::io::Error::last_os_error());
@@ -218,13 +234,13 @@ fn send(fd: RawFd, byte: u8, fds: &[RawFd]) -> Result<()> {
     // SAFETY: msghdr is plain data, and all zero bytes are a valid value.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     (msg.msg_iov, msg.msg_iovlen) = (&raw mut iov, 1);
-    (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), control.len());
+    (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), control.len() as _);
     // SAFETY: msg points at live iov and control buffers sized by CMSG_SPACE for fds, so the first header and its data fit in control.
     let sent = unsafe {
         let header = libc::CMSG_FIRSTHDR(&msg);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(bytes as u32) as usize;
+        (*header).cmsg_len = libc::CMSG_LEN(bytes as u32) as _;
         std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(header).cast::<RawFd>(), fds.len());
         libc::sendmsg(fd, &msg, 0)
     };
@@ -242,9 +258,9 @@ fn receive(fd: RawFd) -> Result<(u8, Vec<RawFd>)> {
     // SAFETY: msghdr is plain data, and all zero bytes are a valid value.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     (msg.msg_iov, msg.msg_iovlen) = (&raw mut iov, 1);
-    (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), control.len());
+    (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), control.len() as _);
     // SAFETY: msg points at live iov and control buffers for recvmsg to fill.
-    if unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) } != 1 {
+    if unsafe { libc::recvmsg(fd, &mut msg, 0) } != 1 {
         bail!("recvmsg: {}", std::io::Error::last_os_error());
     }
     let mut fds = Vec::new();
@@ -253,12 +269,13 @@ fn receive(fd: RawFd) -> Result<(u8, Vec<RawFd>)> {
         let mut header = libc::CMSG_FIRSTHDR(&msg);
         while !header.is_null() {
             if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                let count = ((*header).cmsg_len - libc::CMSG_LEN(0) as usize) / size_of::<RawFd>();
+                let count = ((*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / size_of::<RawFd>();
                 let data = libc::CMSG_DATA(header).cast::<RawFd>();
                 fds.extend((0..count).map(|at| data.add(at).read_unaligned()));
             }
             header = libc::CMSG_NXTHDR(&msg, header);
         }
     }
+    fds.iter().try_for_each(|&fd| crate::image::close_on_exec(fd).map(drop))?;
     Ok((data[0], fds))
 }

@@ -1,5 +1,6 @@
 //! Haste's code generator: an SSA function builder, a machine encoder per target, and executable memory.
 
+mod alloc;
 mod builder;
 mod coroutine;
 mod copy;
@@ -7,10 +8,12 @@ mod error;
 mod ir;
 mod memory;
 mod fold;
+mod frame;
+mod live;
 mod merge;
 mod promote;
+mod target;
 mod verify;
-#[cfg(target_arch = "x86_64")]
 mod x64;
 
 pub use builder::{FunctionBuilder, Ins, Mark};
@@ -18,6 +21,7 @@ pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, F
 pub use coroutine::{Coroutine, FIRST_SUSPEND, RETURNED, UNRESUMED};
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
+pub use target::{Arch, CallAbi, Format, Os, TARGETS, Target};
 
 /// A call site that has an exception handler, as offsets into its function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,15 +62,16 @@ fn optimize(func: &mut Function) {
     merge::run(func);
 }
 
-/// Encodes `func` for the host machine.
-pub fn compile(mut func: Function) -> Result<Code, Error> {
+/// Encodes `func` for `target`.
+pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, message))?;
     optimize(&mut func);
     copy::lower(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
-    #[cfg(target_arch = "x86_64")]
-    return x64::compile(&func).map_err(|message| Error::new(ErrorKind::Unsupported, message));
-    #[cfg(not(target_arch = "x86_64"))]
-    return Err(Error::new(ErrorKind::Unsupported, "no encoder for this target yet"));
+    let code = match target.arch {
+        Arch::X64 => x64::compile(&func),
+        other => Err(format!("no encoder for {other:?} yet")),
+    };
+    code.map_err(|message| Error::new(ErrorKind::Unsupported, message))
 }

@@ -82,6 +82,7 @@ impl Memory {
         };
         // SAFETY: at + len is inside this chunk's writable mapping, past every byte written before, and code does not overlap it.
         unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), (write + at) as *mut u8, code.len()) };
+        flush(exec + at, code.len());
         Ok(exec + at)
     }
 
@@ -211,9 +212,15 @@ fn unmap(base: usize, size: usize) {
     unsafe { libc::munmap(base as *mut libc::c_void, size) };
 }
 
+/// Asks the kernel to fail rather than move the mapping when the hint is taken, where it can.
+#[cfg(target_os = "linux")]
+const NO_REPLACE: i32 = libc::MAP_FIXED_NOREPLACE;
+#[cfg(not(target_os = "linux"))]
+const NO_REPLACE: i32 = 0;
+
 fn map_low(size: usize, hint: usize) -> Option<usize> {
-    let flags = libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED_NOREPLACE;
-    // SAFETY: MAP_FIXED_NOREPLACE fails rather than replace an existing mapping, so the new mapping touches no existing memory.
+    let flags = libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | NO_REPLACE;
+    // SAFETY: without MAP_FIXED the kernel never replaces an existing mapping, so the new mapping touches no existing memory.
     let base = unsafe { libc::mmap(hint as *mut libc::c_void, size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
     if base as usize == hint && hint + size <= 1 << 31 {
         return Some(hint);
@@ -234,20 +241,27 @@ fn map_data(size: usize, sharing: Sharing) -> Result<usize, Error> {
     Ok(base as usize)
 }
 
+/// Maps a chunk of `size` bytes as two views of the same pages, each shared with forked processes.
 fn map(size: usize, owner: i32) -> Result<Chunk, Error> {
+    let (write, exec) = views(size)?;
+    Ok(Chunk { write, exec, len: size, bump: Bump::new(size), owner })
+}
+
+#[cfg(target_os = "linux")]
+fn views(size: usize) -> Result<(usize, usize), Error> {
     // SAFETY: the name is a static NUL-terminated string; memfd_create makes an anonymous file with no path.
     let fd = unsafe { libc::memfd_create(c"haste-code".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(memory_error(format!("memfd_create: {}", std::io::Error::last_os_error())));
     }
-    let mapped = views(fd, size);
+    let mapped = file_views(fd, size);
     // SAFETY: fd is the descriptor opened above; the mappings keep the object alive after it closes.
     unsafe { libc::close(fd) };
-    let (write, exec) = mapped?;
-    Ok(Chunk { write, exec, len: size, bump: Bump::new(size), owner })
+    mapped
 }
 
-fn views(fd: i32, size: usize) -> Result<(usize, usize), Error> {
+#[cfg(target_os = "linux")]
+fn file_views(fd: i32, size: usize) -> Result<(usize, usize), Error> {
     // SAFETY: fd is an open shared memory object that this process owns.
     if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
         return Err(memory_error(format!("ftruncate: {}", std::io::Error::last_os_error())));
@@ -258,4 +272,56 @@ fn views(fd: i32, size: usize) -> Result<(usize, usize), Error> {
         if base == libc::MAP_FAILED { Err(memory_error(format!("mmap: {}", std::io::Error::last_os_error()))) } else { Ok(base as usize) }
     };
     Ok((view(libc::PROT_READ | libc::PROT_WRITE)?, view(libc::PROT_READ | libc::PROT_EXEC)?))
+}
+
+/// Darwin runs no code from a shared file mapping, so the executable view is a second mapping of anonymous memory, remapped in the kernel; both views stay shared across `fork`.
+#[cfg(target_vendor = "apple")]
+fn views(size: usize) -> Result<(usize, usize), Error> {
+    use mach::*;
+    let check = |what: &str, code: i32| if code == 0 { Ok(()) } else { Err(memory_error(format!("{what}: kernel error {code}"))) };
+    let (mut write, mut exec, mut current, mut max) = (0_u64, 0_u64, 0, 0);
+    // SAFETY: each call takes this task's own port and the addresses it hands back; the remap aliases only the region just allocated.
+    unsafe {
+        let task = mach_task_self_;
+        check("mach_vm_allocate", mach_vm_allocate(task, &mut write, size as u64, VM_FLAGS_ANYWHERE))?;
+        check("mach_vm_inherit", mach_vm_inherit(task, write, size as u64, VM_INHERIT_SHARE))?;
+        check("mach_vm_remap", mach_vm_remap(task, &mut exec, size as u64, 0, VM_FLAGS_ANYWHERE, task, write, 0, &mut current, &mut max, VM_INHERIT_SHARE))?;
+        check("mach_vm_protect", mach_vm_protect(task, exec, size as u64, 0, VM_PROT_READ | VM_PROT_EXECUTE))?;
+    }
+    Ok((write as usize, exec as usize))
+}
+
+#[cfg(target_vendor = "apple")]
+mod mach {
+    pub const VM_FLAGS_ANYWHERE: i32 = 1;
+    pub const VM_INHERIT_SHARE: u32 = 0;
+    pub const VM_PROT_READ: i32 = 1;
+    pub const VM_PROT_EXECUTE: i32 = 4;
+    unsafe extern "C" {
+        pub static mach_task_self_: u32;
+        pub fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: i32) -> i32;
+        pub fn mach_vm_inherit(task: u32, address: u64, size: u64, inherit: u32) -> i32;
+        pub fn mach_vm_protect(task: u32, address: u64, size: u64, set_maximum: u32, protection: i32) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        pub fn mach_vm_remap(target: u32, address: *mut u64, size: u64, mask: u64, flags: i32, source: u32, source_address: u64, copy: u32, current: *mut i32, max: *mut i32, inherit: u32) -> i32;
+        pub fn sys_icache_invalidate(start: *mut std::ffi::c_void, len: usize);
+    }
+}
+
+/// Makes `len` bytes of code just written at `exec` visible to instruction fetch, which arm64 does not keep coherent with stores.
+fn flush(exec: usize, len: usize) {
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    // SAFETY: exec..exec + len is code memory this process maps.
+    unsafe {
+        mach::sys_icache_invalidate(exec as *mut std::ffi::c_void, len)
+    };
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    {
+        unsafe extern "C" {
+            fn __clear_cache(start: *mut u8, end: *mut u8);
+        }
+        // SAFETY: exec..exec + len is code memory this process maps.
+        unsafe { __clear_cache(exec as *mut u8, (exec + len) as *mut u8) };
+    }
+    let _ = (exec, len);
 }
