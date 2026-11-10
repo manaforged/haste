@@ -152,7 +152,7 @@ impl Arena {
 
     /// Maps `size` bytes of shared memory below 2 GiB when an address there is free, so code reaches it with a 32-bit absolute address.
     pub fn low(size: usize) -> Result<Arena, Error> {
-        let base = LOW_HINTS.map(|hint| map_low(size, hint)).into_iter().flatten().next();
+        let base = LOW_HINTS.into_iter().find_map(|hint| map_low(size, hint));
         Ok(Arena::over(base.map_or_else(|| map_data(size, Sharing::Shared), Ok)?, size, Sharing::Shared))
     }
 
