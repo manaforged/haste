@@ -1,0 +1,60 @@
+name: hygiene
+
+on:
+  push:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check repository content and change metadata
+        env:
+          HYGIENE_PATTERNS: ${{ secrets.HYGIENE_PATTERNS }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          patterns="$RUNNER_TEMP/hygiene.patterns"
+          printf '%s\n' "$HYGIENE_PATTERNS" | sed '/^$/d' > "$patterns"
+          if [ ! -s "$patterns" ]; then
+            echo '::error::Configure the HYGIENE_PATTERNS repository secret.'
+            exit 1
+          fi
+          failed=0
+          scan() {
+            local status=0
+            grep -qiEf "$patterns" "$1" || status=$?
+            if [ "$status" -eq 0 ]; then
+              echo "::error::$2 contains denied text"
+              failed=1
+            elif [ "$status" -ne 1 ]; then
+              exit "$status"
+            fi
+          }
+          while IFS= read -r -d '' path; do
+            git show "$HEAD:$path" | strings > "$RUNNER_TEMP/hygiene-content"
+            scan "$RUNNER_TEMP/hygiene-content" "Repository content"
+          done < <(git ls-tree -r --name-only -z "$HEAD")
+          if [ -z "$BASE" ] || [[ "$BASE" =~ ^0+$ ]]; then
+            range="$HEAD"
+          else
+            range="$BASE..$HEAD"
+          fi
+          git log --format=%B "$range" > "$RUNNER_TEMP/hygiene-messages"
+          scan "$RUNNER_TEMP/hygiene-messages" "Commit messages"
+          jq -r '.pull_request.title // "", .pull_request.body // ""' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/hygiene-pr"
+          scan "$RUNNER_TEMP/hygiene-pr" "Pull request metadata"
+          exit "$failed"
