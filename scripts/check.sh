@@ -19,4 +19,10 @@ if [ -n "$wrong" ]; then
     done
     exit 1
 fi
+missing=$(comm -23 <(printf '%s\n' "$rustc_side") <(printf '%s\n' "$engine_side") | cut -d' ' -f1 | sort -u)
+if [ -n "$missing" ]; then
+    echo "MISSING: no result for $(printf '%s\n' "$missing" | tr '\n' ' ')"
+    printf '%s\n' "$engine_all" | grep -E '^ +[0-9]+ |^       ' | cut -c1-200
+    exit 1
+fi
 echo "agree=$(comm -12 <(printf '%s\n' "$rustc_side") <(printf '%s\n' "$engine_side") | wc -l | tr -d ' ') of $(printf '%s\n' "$rustc_side" | wc -l | tr -d ' ')"
