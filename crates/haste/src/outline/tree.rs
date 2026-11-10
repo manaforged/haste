@@ -184,7 +184,7 @@ impl Crate {
     }
 }
 
-/// Whether a cfg holds, does not hold, or depends on values the front end does not know yet.
+/// Whether a cfg holds, does not hold, or depends on values not known yet, such as build script output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Truth {
     Yes,
