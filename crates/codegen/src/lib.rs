@@ -11,6 +11,7 @@ mod fold;
 mod frame;
 mod live;
 mod merge;
+mod native;
 mod promote;
 mod target;
 mod verify;
@@ -68,7 +69,7 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, message))?;
     optimize(&mut func);
-    copy::lower(&mut func);
+    native::lower(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
     let code = match target.arch {
         Arch::X64 => x64::compile(&func),
