@@ -61,6 +61,7 @@ struct Lookups {
     scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
     type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
     impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
+    selections: HashMap<(ItemRef, ty::Ty, Vec<ty::Ty>), Option<(impls::ImplRef, Vec<ty::Ty>)>>,
 }
 
 /// What answering the asks of a pass added: nothing new to infer with, the output of procedural macros that function bodies call, or loaded files, resolved names and expanded items.
@@ -123,6 +124,7 @@ impl Cache {
         kept.scope_traits.get_mut().retain(|home, _| !edited.touches_crate(home.krate));
         kept.type_defs.get_mut().retain(|key, _| !edited.touches_crate(key.0.krate));
         kept.trait_defs.retain(|item, _| !mine(*item));
+        kept.selections.clear();
         kept.discriminants.retain(|item, _| !mine(*item));
         kept.lang_of.get_mut().retain(|item, _| !mine(*item));
     }
