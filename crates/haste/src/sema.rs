@@ -63,10 +63,34 @@ struct Lookups {
     impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
 }
 
+/// What answering the asks of a pass added: nothing new to infer with, the output of procedural macros that function bodies call, or loaded files, resolved names and expanded items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    Nothing,
+    Bodies,
+    Names,
+}
+
+impl Lookups {
+    /// The lookups that still hold once function bodies can read more procedural macro output: the impl indexes of crates built without asking for anything, and the lang items.
+    fn after_bodies(&mut self) -> Lookups {
+        let complete = |(holder, index): &(impls::Holder, Rc<impls::Index>)| matches!(holder, impls::Holder::Crate(_)) && index.complete();
+        Lookups { heads: std::mem::take(&mut self.heads).into_iter().filter(complete).collect(), langs: self.langs.take(), ..Lookups::default() }
+    }
+}
+
 impl Cache {
     /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.
     pub fn forget_lookups(&mut self) {
         self.lookups = Lookups::default();
+    }
+
+    /// Drops the cached lookups that `answer` makes stale.
+    pub fn forget_after(&mut self, answer: Answer) {
+        self.lookups = match answer {
+            Answer::Bodies => self.lookups.after_bodies(),
+            Answer::Nothing | Answer::Names => Lookups::default(),
+        };
     }
 
     /// Drops what the store keeps about the items that `edited` holds, and about the instances, types and lookups that name one of them.

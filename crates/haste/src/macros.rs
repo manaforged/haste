@@ -13,7 +13,7 @@ use crate::outline::source::Source;
 use crate::outline::tree::PROC_MACRO_ROOT;
 use crate::graph::{Targets, Workspace, store};
 use crate::sema::reach::{Instance, Reached, reach};
-use crate::sema::{Context, Cache};
+use crate::sema::{Answer, Context, Cache};
 
 const ENTRIES: [&str; 2] = ["__haste_expand1", "__haste_expand2"];
 
@@ -65,7 +65,7 @@ pub fn reach_resolved<R>(compilation: &mut Compilation, roots: impl Fn(&mut Cont
 }
 
 /// Reaches from `roots` as `reach_resolved` does, answering each pass's asks with `ask`, which says whether anything new loaded.
-fn reach_with<R>(compilation: &mut Compilation, (roots, ask): (impl Fn(&mut Context<'_>) -> Vec<Instance>, impl Fn(&mut Compilation, Requests) -> Result<bool>), finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
+fn reach_with<R>(compilation: &mut Compilation, (roots, ask): (impl Fn(&mut Context<'_>) -> Vec<Instance>, impl Fn(&mut Compilation, Requests) -> Result<Answer>), finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
     let mut finish = Some(finish);
     resolve_sema(compilation, (Cache::default(), ask), |mut cx, last| {
         let from = roots(&mut cx);
@@ -78,42 +78,46 @@ fn reach_with<R>(compilation: &mut Compilation, (roots, ask): (impl Fn(&mut Cont
 }
 
 /// Runs `pass` on a context over `store`, answering with `ask` what it asked for, until it gives a result: `pass` returns its result, or the released context to answer and run again, and learns whether the last answer loaded nothing new. Drops the macro expander at the end.
-pub fn resolve_sema<R>(compilation: &mut Compilation, asking: (Cache, impl Fn(&mut Compilation, Requests) -> Result<bool>), pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
+pub fn resolve_sema<R>(compilation: &mut Compilation, asking: (Cache, impl Fn(&mut Compilation, Requests) -> Result<Answer>), pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
     let done = answer_passes(compilation, asking, pass);
     compilation.settle();
     done
 }
 
-fn answer_passes<R>(compilation: &mut Compilation, (mut store, ask): (Cache, impl Fn(&mut Compilation, Requests) -> Result<bool>), mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
+fn answer_passes<R>(compilation: &mut Compilation, (mut store, ask): (Cache, impl Fn(&mut Compilation, Requests) -> Result<Answer>), mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
     let mut last = false;
     loop {
         let (mut kept, asks) = match pass(Context::new(&compilation.outline, &compilation.names, store), last)? {
             Ok(done) => return Ok(done),
             Err(released) => released,
         };
-        last = !ask(compilation, asks)?;
-        kept.forget_lookups();
+        let answer = ask(compilation, asks)?;
+        last = answer == Answer::Nothing;
+        kept.forget_after(answer);
         store = kept;
     }
 }
 
 /// Settles names, then expands every procedural macro call they bind and settles again, until no call is left to bind, then drops the macro expander.
 pub fn resolve(compilation: &mut Compilation) -> Result<()> {
-    let done = compilation.names.resolve(&mut compilation.outline).and_then(|()| expand_bound(compilation));
+    let done = compilation.names.resolve(&mut compilation.outline).and_then(|()| expand_bound(compilation).map(drop));
     compilation.settle();
     done
 }
 
-/// Expands every procedural macro call that resolved names bind and resolves again, loading what the binding asked for, until no call is left to bind.
-fn expand_bound(compilation: &mut Compilation) -> Result<()> {
+/// Expands every procedural macro call that resolved names bind and resolves again, loading what the binding asked for, until no call is left to bind; returns whether it expanded or loaded anything.
+fn expand_bound(compilation: &mut Compilation) -> Result<bool> {
+    let mut changed = false;
     loop {
         let (bound, asks) = compilation.names.bind_procs(&mut compilation.outline);
         if bound.is_empty() {
             if asks.count() == 0 || !compilation.names.load(&mut compilation.outline, asks)? {
-                return Ok(());
+                return Ok(changed);
             }
+            changed = true;
             continue;
         }
+        changed = true;
         let inputs: Vec<Vec<String>> = bound.iter().map(inputs).collect();
         let calls: Vec<Call> = bound.iter().map(|call| (call.run, call.kind, call.krate)).collect();
         let outputs = run(compilation, &calls, &inputs)?;
@@ -122,8 +126,8 @@ fn expand_bound(compilation: &mut Compilation) -> Result<()> {
     }
 }
 
-/// Answers what a Sema pass asked for: runs the procedural macros its bodies call and keeps their output, loads and resolves the names it asked for, and expands the item macros that brings in; returns whether anything was new.
-pub fn load(compilation: &mut Compilation, asks: Requests) -> Result<bool> {
+/// Answers what a Sema pass asked for: runs the procedural macros its bodies call and keeps their output, loads and resolves the names it asked for, and expands the item macros that brings in; returns what was new.
+pub fn load(compilation: &mut Compilation, asks: Requests) -> Result<Answer> {
     let mut procs = asks.procs.take();
     procs.sort_unstable();
     procs.dedup();
@@ -135,8 +139,12 @@ pub fn load(compilation: &mut Compilation, asks: Requests) -> Result<bool> {
         compilation.outline.procs.extend(procs.iter().cloned().zip(outputs));
     }
     let more = compilation.names.load(&mut compilation.outline, asks)?;
-    expand_bound(compilation)?;
-    Ok(more || !procs.is_empty())
+    let expanded = expand_bound(compilation)?;
+    Ok(match (more, expanded, procs.is_empty()) {
+        (true, _, _) | (false, true, false) => Answer::Names,
+        (false, false, false) => Answer::Bodies,
+        (false, _, true) => Answer::Nothing,
+    })
 }
 
 /// Adds each call's output to its module, takes out the items that attribute macros replaced, and has names resolve the crates that held them again.
@@ -267,7 +275,7 @@ fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>])
     };
     let entry = pair.map(|item| demand.declare((item, Vec::new())));
     let jobs: Vec<Job<'_>> = bound.iter().zip(inputs).map(|(&(call, kind, caller), texts)| Job { entry: entry[usize::from(kind == ProcKind::Attribute)], run: demand.declare((call, Vec::new())), texts: texts.iter().map(|text| text.as_bytes()).collect(), group: (caller, call.krate) }).collect();
-    let ask = |compilation: &mut Compilation, asks: Requests| compilation.names.load(&mut compilation.outline, asks);
+    let ask = |compilation: &mut Compilation, asks: Requests| Ok(if compilation.names.load(&mut compilation.outline, asks)? { Answer::Names } else { Answer::Nothing });
     let ran = run_macros(compilation, &mut demand, &jobs, &ask);
     drop(jobs);
     compilation.expander.get_or_insert(demand);

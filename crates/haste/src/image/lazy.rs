@@ -12,12 +12,12 @@ use crate::names::ItemRef;
 use crate::names::path::Requests;
 use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
 use crate::outline::Outline;
-use crate::sema::{Context, Cache, Edited};
+use crate::sema::{Answer, Context, Cache, Edited};
 
 use super::{CODE_BYTES, Image, TABLE_SLOTS, host_symbol, stub, wait};
 
-/// What answers what a pass of inference asked for, and says whether anything new loaded.
-pub type Answerer<'f> = &'f dyn Fn(&mut Compilation, Requests) -> Result<bool>;
+/// What answers what a pass of inference asked for, and says what it added.
+pub type Answerer<'f> = &'f dyn Fn(&mut Compilation, Requests) -> Result<Answer>;
 
 /// Why a function has no code yet: inference asked for names or macro output not loaded, or it did not compile.
 enum Stop {
@@ -170,8 +170,9 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
                     }
                     Err(Stop::Asked) => {
                         let (mut kept, asked) = cx.release();
-                        demand.strict = ask(compilation, asked)?;
-                        kept.forget_lookups();
+                        let answer = ask(compilation, asked)?;
+                        demand.strict = answer != Answer::Nothing;
+                        kept.forget_after(answer);
                         cx = Context::new(&compilation.outline, &compilation.names, kept);
                     }
                 }
