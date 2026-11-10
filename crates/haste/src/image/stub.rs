@@ -6,7 +6,7 @@ use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-/// The bytes one stub takes in stub memory.
+/// The bytes one stub takes in stub memory, at most.
 pub(super) const STUB_BYTES: usize = 32;
 
 static TABLE: AtomicUsize = AtomicUsize::new(0);
@@ -16,10 +16,23 @@ static ASK: AtomicI32 = AtomicI32::new(-1);
 static ANSWER: AtomicI32 = AtomicI32::new(-1);
 static TALK: Mutex<()> = Mutex::new(());
 
+/// The text section and global label of the shared stub entry, in the object format's syntax: Mach-O symbols take a leading underscore.
+#[cfg(target_vendor = "apple")]
+macro_rules! entry_label {
+    () => {
+        ".text\n.p2align 4\n.globl _haste_stub_entry\n_haste_stub_entry:"
+    };
+}
+#[cfg(not(target_vendor = "apple"))]
+macro_rules! entry_label {
+    () => {
+        ".text\n.p2align 4\n.globl haste_stub_entry\nhaste_stub_entry:"
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
 std::arch::global_asm!(
-    ".pushsection .text",
-    ".globl haste_stub_entry",
-    "haste_stub_entry:",
+    entry_label!(),
     "push rbp",
     "mov rbp, rsp",
     "sub rsp, 192",
@@ -59,7 +72,39 @@ std::arch::global_asm!(
     "mov rsp, rbp",
     "pop rbp",
     "jmp r11",
-    ".popsection",
+    resolve = sym resolve,
+);
+
+#[cfg(target_arch = "aarch64")]
+std::arch::global_asm!(
+    entry_label!(),
+    "stp x29, x30, [sp, #-16]!",
+    "mov x29, sp",
+    "sub sp, sp, #208",
+    "stp x0, x1, [sp]",
+    "stp x2, x3, [sp, #16]",
+    "stp x4, x5, [sp, #32]",
+    "stp x6, x7, [sp, #48]",
+    "str x8, [sp, #64]",
+    "stp q0, q1, [sp, #80]",
+    "stp q2, q3, [sp, #112]",
+    "stp q4, q5, [sp, #144]",
+    "stp q6, q7, [sp, #176]",
+    "mov x0, x16",
+    "bl {resolve}",
+    "mov x16, x0",
+    "ldp x0, x1, [sp]",
+    "ldp x2, x3, [sp, #16]",
+    "ldp x4, x5, [sp, #32]",
+    "ldp x6, x7, [sp, #48]",
+    "ldr x8, [sp, #64]",
+    "ldp q0, q1, [sp, #80]",
+    "ldp q2, q3, [sp, #112]",
+    "ldp q4, q5, [sp, #144]",
+    "ldp q6, q7, [sp, #176]",
+    "mov sp, x29",
+    "ldp x29, x30, [sp], #16",
+    "br x16",
     resolve = sym resolve,
 );
 
@@ -68,13 +113,23 @@ unsafe extern "C" {
 }
 
 /// The machine code of the stub of call table slot `index`: it puts the index in r11 and jumps to the shared entry, which keeps every argument register.
-pub(super) fn code(index: usize) -> [u8; 19] {
-    let mut bytes = [0; 19];
-    bytes[..2].copy_from_slice(&[0x41, 0xBB]);
-    bytes[2..6].copy_from_slice(&(index as u32).to_le_bytes());
-    bytes[6..8].copy_from_slice(&[0x49, 0xBA]);
-    bytes[8..16].copy_from_slice(&(haste_stub_entry as *const () as usize as u64).to_le_bytes());
-    bytes[16..].copy_from_slice(&[0x41, 0xFF, 0xE2]);
+#[cfg(target_arch = "x86_64")]
+pub(super) fn code(index: usize) -> Vec<u8> {
+    let mut bytes = vec![0x41, 0xBB];
+    bytes.extend((index as u32).to_le_bytes());
+    bytes.extend([0x49, 0xBA]);
+    bytes.extend((haste_stub_entry as *const () as usize as u64).to_le_bytes());
+    bytes.extend([0x41, 0xFF, 0xE2]);
+    bytes
+}
+
+/// The machine code of the stub of call table slot `index`: `movz`/`movk` put the index in x16, a literal load puts the shared entry in x17, and `br x17` jumps to it; the entry keeps every argument register.
+#[cfg(target_arch = "aarch64")]
+pub(super) fn code(index: usize) -> Vec<u8> {
+    let index = index as u32;
+    let words = [0xD280_0010 | (index & 0xFFFF) << 5, 0xF2A0_0010 | (index >> 16) << 5, 0x5800_0051, 0xD61F_0220];
+    let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    bytes.extend((haste_stub_entry as *const () as usize as u64).to_le_bytes());
     bytes
 }
 

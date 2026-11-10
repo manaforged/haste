@@ -39,7 +39,7 @@ impl Lower<'_, '_> {
             (Atomic(atomic), Some(ty), _) => self.atomic(atomic, ty, args),
             (Unchecked(op), Some(ty), &[x, y]) => self.unchecked(op, (ty, substs.get(1).copied()), x, y).map(Some),
             (ThreeWayCompare, Some(ty), &[x, y]) => self.compare(ty, x, y).map(Some),
-            (RawPointer | Offset(_) | OffsetFrom(_) | Read | Write | WriteBox | MemCopy(_) | WriteBytes | SliceElement, Some(_), _) => self.access_intrinsic(which, substs, args),
+            (RawPointer | Offset(_) | PtrMask | OffsetFrom(_) | Read | Write | WriteBox | MemCopy(_) | WriteBytes | SliceElement, Some(_), _) => self.access_intrinsic(which, substs, args),
             _ => self.value_intrinsic(which, substs, args).map(Some),
         }
     }
@@ -54,6 +54,7 @@ impl Lower<'_, '_> {
                 _ => bail!("aggregate_raw_ptr into a pointer with metadata that is not a slice length"),
             },
             (Offset(pointer), &[base, count]) => self.offset(ty, pointer, base, count).map(Some),
+            (PtrMask, &[pointer, mask]) => Ok(Some(self.ins().band(pointer, mask))),
             (OffsetFrom(signed), &[to, from]) => self.offset_from(ty, signed, to, from).map(Some),
             (Read, &[from]) => self.read_at(ty, from),
             (Write, &[to, value]) => {
