@@ -1,4 +1,4 @@
-//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hint as a no-op, `xgetbv` as no extended state enabled, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
+//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hints as no-ops, the AArch64 barriers as one full barrier, `xgetbv` as no extended state enabled, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
 
 mod math;
 
@@ -14,7 +14,8 @@ pub fn symbol(name: &str) -> Option<usize> {
         "__rust_alloc_zeroed" => alloc_zeroed as *const () as usize,
         "__rust_dealloc" => dealloc as *const () as usize,
         "__rust_realloc" => realloc as *const () as usize,
-        "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" => nothing as *const () as usize,
+        "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" | "llvm.aarch64.hint" => nothing as *const () as usize,
+        "llvm.aarch64.isb" | "llvm.aarch64.dmb" | "llvm.aarch64.dsb" => barrier as *const () as usize,
         "llvm.x86.xgetbv" => no_extended_state as *const () as usize,
         "__dso_handle" => &DSO_HANDLE as *const u8 as usize,
         "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => abort as *const () as usize,
@@ -58,6 +59,15 @@ extern "C" fn realloc(pointer: *mut u8, size: usize, align: usize, new_size: usi
 }
 
 extern "C" fn nothing() {}
+
+/// A full system barrier and pipeline flush, at least as strong as any `dmb`, `dsb` or `isb` option that compiled code asks for.
+extern "C" fn barrier(_option: u32) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the barrier instructions read and write no memory and leave the stack alone.
+    unsafe {
+        std::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags))
+    }
+}
 
 extern "C" fn abort() -> ! {
     std::process::abort()
