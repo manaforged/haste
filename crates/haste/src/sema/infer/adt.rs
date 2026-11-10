@@ -121,7 +121,7 @@ impl<'a> Infer<'_, 'a> {
         let Some((item, variant, args)) = self.ctor(body, path, false)? else { bail!("struct literal of something that is not a struct") };
         if let Some(expected) = expected {
             let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
-            self.trial(|infer| Ok(infer.unify(adt, expected).ok()))?;
+            self.trial(|infer| Ok(infer.unifies(adt, expected).then_some(())))?;
         }
         let tys = self.adt_fields(item, &args)?.swap_remove(variant as usize);
         for &init in body.list(fields) {

@@ -120,7 +120,7 @@ impl Infer<'_, '_> {
     }
 
     pub(super) fn trial_unify(&mut self, a: Ty, b: Ty) -> bool {
-        matches!(self.trial(|infer| Ok(infer.unify(a, b).ok())), Ok(Some(())))
+        matches!(self.trial(|infer| Ok(infer.unifies(a, b).then_some(()))), Ok(Some(())))
     }
 
     fn reify_closure(&mut self, found: Ty, (params, ret): (Vec<Ty>, Ty)) -> Result<Option<Coercion>> {

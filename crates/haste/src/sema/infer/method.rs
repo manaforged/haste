@@ -260,7 +260,7 @@ impl<'a> Infer<'_, 'a> {
         let substs: Vec<Ty> = std::iter::once(self_ty).chain(self.fresh_trait_args(candidate.of)?).collect();
         let frame = self.frame(candidate.item, &substs)?;
         let declared = self.with_frame(frame, |infer| infer.lower_ty(&sig.body, ty))?;
-        let found = self.trial(|infer| Ok(infer.unify(declared, adjusted).ok().map(|()| infer.resolve(self_ty))))?;
+        let found = self.trial(|infer| Ok(infer.unifies(declared, adjusted).then(|| infer.resolve(self_ty))))?;
         Ok(found.filter(|found| !matches!(self.cx.types.kind(*found), Kind::Var(_)) && candidate.bound.is_none_or(|param| param == self.substitute(*found))))
     }
 
@@ -291,7 +291,7 @@ impl<'a> Infer<'_, 'a> {
         generics.extend(named_args(src, &sig.generics, &own));
         let frame = Frame { src, home: self.cx.module_of(candidate.item).ok()?, generics, self_ty: Some(self_ty), block: Some(candidate.block), item: None, root: candidate.block.root() };
         let receiver = self.with_frame(frame, |infer| infer.receiver_ty(&sig.body, candidate.kind)).ok()?;
-        self.unify(receiver, adjusted).ok().map(|_| (args, own))
+        self.unifies(receiver, adjusted).then_some((args, own))
     }
 
     fn picked(&mut self, expr: ExprId, (pick, derefs): (Pick, u32), (explicit, params): (Option<List>, List), expected: Option<Ty>) -> Result<Ty> {

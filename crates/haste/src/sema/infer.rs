@@ -218,6 +218,14 @@ struct Breaks {
     block: bool,
 }
 
+/// Two types that do not unify, or with `cycle` a variable that occurs in the type it would stand for.
+#[derive(Clone, Copy)]
+struct Clash {
+    a: Ty,
+    b: Ty,
+    cycle: bool,
+}
+
 /// Infers the body of the function `item` with its generic parameters set to `substs`.
 pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed> {
     if let Some(typed) = compiler_made(cx, item, substs)? {
@@ -396,7 +404,7 @@ impl Infer<'_, '_> {
         ty
     }
 
-    fn bind(&mut self, var: Ty, to: Ty) -> Result<()> {
+    fn bind(&mut self, var: Ty, to: Ty) -> Result<(), Clash> {
         let index = self.var_of(var).unwrap_or(u32::MAX) as usize;
         let accepts = match (self.cx.types.kind(var), self.cx.types.kind(to)) {
             (Kind::Var(_), _) => true,
@@ -406,10 +414,10 @@ impl Infer<'_, '_> {
             _ => false,
         };
         if !accepts {
-            bail!("mismatched types: {} and {}", self.show(var), self.show(to));
+            return Err(Clash { a: var, b: to, cycle: false });
         }
         if self.occurs(index as u32, to) {
-            bail!("cyclic type: {} occurs in {}", self.show(var), self.show(to));
+            return Err(Clash { a: var, b: to, cycle: true });
         }
         self.vars[index] = Some(to);
         Ok(())
@@ -425,6 +433,22 @@ impl Infer<'_, '_> {
 
     /// Makes `a` and `b` the same type.
     pub fn unify(&mut self, a: Ty, b: Ty) -> Result<()> {
+        self.unify_quiet(a, b).map_err(|clash| self.clash_error(clash))
+    }
+
+    /// Makes `a` and `b` the same type and says whether they unify, building no message when they do not.
+    pub(super) fn unifies(&mut self, a: Ty, b: Ty) -> bool {
+        self.unify_quiet(a, b).is_ok()
+    }
+
+    fn clash_error(&self, Clash { a, b, cycle }: Clash) -> anyhow::Error {
+        match cycle {
+            true => anyhow::anyhow!("cyclic type: {} occurs in {}", self.show(a), self.show(b)),
+            false => anyhow::anyhow!("mismatched types: {} and {}", self.show(a), self.show(b)),
+        }
+    }
+
+    fn unify_quiet(&mut self, a: Ty, b: Ty) -> Result<(), Clash> {
         let (a, b) = (self.resolve(a), self.resolve(b));
         if a == b {
             return Ok(());
@@ -435,11 +459,11 @@ impl Infer<'_, '_> {
             (_, Kind::Var(_)) => self.bind(b, a),
             (Kind::IntVar(_) | Kind::FloatVar(_), _) => self.bind(a, b),
             (_, Kind::IntVar(_) | Kind::FloatVar(_)) => self.bind(b, a),
-            _ => self.unify_shapes(&kind_a, &kind_b).map_err(|_| anyhow::anyhow!("mismatched types: {} and {}", self.show(a), self.show(b))),
+            _ => self.unify_shapes(&kind_a, &kind_b).map_err(|()| Clash { a, b, cycle: false }),
         }
     }
 
-    fn unify_shapes(&mut self, a: &Kind, b: &Kind) -> Result<()> {
+    fn unify_shapes(&mut self, a: &Kind, b: &Kind) -> Result<(), ()> {
         let pairs: Vec<(Ty, Ty)> = match (a, b) {
             (Kind::Tuple(x), Kind::Tuple(y)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).collect(),
             (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => vec![(*x, *y)],
@@ -448,9 +472,9 @@ impl Infer<'_, '_> {
             (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => vec![(*x, *y)],
             (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, ..), Kind::Dyn(j, y, ..)) if i == j && x.len() == y.len() && dyn_members(a) == dyn_members(b) => x.iter().copied().zip(y.iter().copied()).collect(),
             (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).chain([(*r, *s)]).collect(),
-            _ => bail!("mismatch"),
+            _ => return Err(()),
         };
-        pairs.into_iter().try_for_each(|(x, y)| self.unify(x, y))
+        pairs.into_iter().try_for_each(|(x, y)| self.unify_quiet(x, y).map_err(drop))
     }
 
     /// Checks that a value of type `found` can be used where `expected` is wanted, through the coercions that keep its bits.
@@ -569,7 +593,7 @@ impl Infer<'_, '_> {
             if held != of || matched.contains(&types) {
                 continue;
             }
-            let fits = |infer: &mut Self| -> Result<Option<()>> { Ok(substs.iter().zip(&types).all(|(&a, &b)| infer.unify(a, b).is_ok()).then_some(())) };
+            let fits = |infer: &mut Self| -> Result<Option<()>> { Ok(substs.iter().zip(&types).all(|(&a, &b)| infer.unifies(a, b)).then_some(())) };
             if self.probe(fits)?.is_some() {
                 matched.push(types);
             }
