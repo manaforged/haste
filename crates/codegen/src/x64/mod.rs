@@ -4,12 +4,12 @@ mod float;
 mod frame;
 mod location;
 mod int;
-mod live;
 mod wide;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
-use frame::{Abi, Frame, Loc, classify, layout, saved};
-use location::{Location, Plan, plan};
+use frame::{Abi, Loc, SAVED, classify};
+use crate::alloc::{Location, Plan, Regs, plan};
+use crate::frame::{Frame, layout, saved};
 
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::{Code, Site};
@@ -18,12 +18,15 @@ const PAGE: u32 = 4096;
 const INCOMING: i32 = 16;
 const MOVSD: (&[u8], &[u8], &[u8]) = (&[0xF2], &[0x0F, 0x10], &[0x0F, 0x11]);
 
+/// The registers planning hands out: the saved pool, and caller-saved registers the emitter never uses as scratch.
+const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg::Rdi, Reg::R9, Reg::R8, Reg::R10], wide_scratch: &wide::WIDE_SCRATCH, absolute_calls: true };
+
 /// Encodes `func` as x86-64 machine code.
 pub(crate) fn compile(func: &Function) -> Result<Code, String> {
-    let order = live::order(func);
+    let order = crate::live::order(func);
     let abi = classify(&func.signature)?;
-    let plan = plan(func, &order, &abi.params);
-    let frame = layout(func, saved(func, &plan.used), &plan.locations)?;
+    let plan = plan(func, &REGS, &order, &abi.params);
+    let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, classify)?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     Emit { func, frame, abi, asm, blocks, sites: Vec::new(), plan, flags: None, next: None }.run(order)
@@ -41,12 +44,12 @@ pub(super) enum Ext {
 
 pub(super) struct Emit<'a> {
     func: &'a Function,
-    frame: Frame,
+    frame: Frame<Reg>,
     abi: Abi,
     asm: Asm,
     blocks: Vec<Label>,
     sites: Vec<Site>,
-    plan: Plan,
+    plan: Plan<Reg>,
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
 }

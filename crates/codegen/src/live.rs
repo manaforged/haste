@@ -1,14 +1,14 @@
-use crate::ir::{Block, Function, Op, Value};
+use crate::ir::{Block, Function, InstData, Op, Value};
 
 /// The blocks in the order the emitter lays them out: the entry, then every other block that has instructions.
-pub(super) fn order(func: &Function) -> Vec<Block> {
+pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
     let rest = (0..func.blocks.len() as u32).map(Block).filter(|block| *block != entry && !func.blocks[block.index()].insts.is_empty());
     std::iter::once(entry).chain(rest).collect()
 }
 
 /// The positions, in layout order, over which each wanted value is live, the positions of calls that can unwind into a handler, and the positions of every call.
-pub(super) struct Live {
+pub(crate) struct Live {
     pub span: Vec<Option<(u32, u32)>>,
     pub unwinds: Vec<u32>,
     pub calls: Vec<u32>,
@@ -53,7 +53,7 @@ fn crossing(func: &Function, wanted: &[bool]) -> (Vec<Option<usize>>, Vec<Value>
     for (block, data) in func.blocks.iter().enumerate() {
         data.params.iter().for_each(|param| location[param.index()] = block);
         for inst in &data.insts {
-            super::location::results(&func.insts[inst.index()]).for_each(|result| location[result.index()] = block);
+            results(&func.insts[inst.index()]).for_each(|result| location[result.index()] = block);
         }
     }
     let mut dense = vec![None; func.types.len()];
@@ -86,7 +86,7 @@ fn local_sets(func: &Function, dense: &[Option<usize>], count: usize) -> (Sets, 
                     uses.insert(block, value);
                 }
             }
-            for result in super::location::results(inst).filter_map(|result| dense[result.index()]) {
+            for result in results(inst).filter_map(|result| dense[result.index()]) {
                 defs.insert(block, result);
             }
         }
@@ -126,7 +126,7 @@ fn widen(span: &mut Option<(u32, u32)>, at: u32) {
 }
 
 /// The span over the layout order of each `wanted` value: its definition, its uses, and the bounds of the blocks it is live into or out of.
-pub(super) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
+pub(crate) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
     let (dense, crossing) = crossing(func, wanted);
     let live_in = live_in(func, order, &dense, crossing.len());
     let mut span = vec![None; func.types.len()];
@@ -139,7 +139,7 @@ pub(super) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
         for inst in &func.blocks[index].insts {
             at += 1;
             let data = &func.insts[inst.index()];
-            data.op.operands().into_iter().chain(super::location::results(data)).filter(|value| wanted[value.index()]).for_each(|value| widen(&mut span[value.index()], at));
+            data.op.operands().into_iter().chain(results(data)).filter(|value| wanted[value.index()]).for_each(|value| widen(&mut span[value.index()], at));
             if matches!(data.op, Op::TryCall { .. }) {
                 unwinds.push(at);
             }
@@ -153,4 +153,13 @@ pub(super) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
         at += 1;
     }
     Live { span, unwinds, calls }
+}
+
+/// The values an instruction defines: its result, or a call's results.
+pub(crate) fn results(data: &InstData) -> impl Iterator<Item = Value> + '_ {
+    let calls: &[Value] = match &data.op {
+        Op::Call { results, .. } => results,
+        _ => &[],
+    };
+    data.result.into_iter().chain(calls.iter().copied())
 }

@@ -182,7 +182,7 @@ impl Image {
             Some(body) => std::rc::Rc::unwrap_or_clone(body),
             None => lower::lower(cx, reached, self, index)?,
         };
-        let code = haste_codegen::compile(func)?;
+        let code = haste_codegen::compile(func, haste_codegen::Target::host())?;
         Ok(self.memory.write(code.bytes())?)
     }
 
@@ -319,8 +319,11 @@ pub(crate) fn fork_child(child: impl FnOnce() -> i32) -> Result<libc::pid_t> {
         bail!("fork failed: {}", std::io::Error::last_os_error());
     }
     if pid == 0 {
+        #[cfg(target_os = "linux")]
         // SAFETY: PR_SET_DUMPABLE with 0 only clears this child's dumpable flag, so a crash dumps no core of the whole compiler.
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+        unsafe {
+            libc::prctl(libc::PR_SET_DUMPABLE, 0)
+        };
         let status = child();
         // SAFETY: _exit ends the child without running the parent's destructors.
         unsafe { libc::_exit(status) }
@@ -330,12 +333,18 @@ pub(crate) fn fork_child(child: impl FnOnce() -> i32) -> Result<libc::pid_t> {
 
 /// A new pipe whose ends close when the program executes another one.
 pub(crate) fn pipe() -> Result<[i32; 2]> {
-    let mut ends = [0; 2];
-    // SAFETY: ends is a live two-element array for the new descriptors.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        bail!("pipe failed: {}", std::io::Error::last_os_error());
+    use std::os::fd::IntoRawFd;
+    let (read, write) = std::io::pipe()?;
+    Ok([read.into_raw_fd(), write.into_raw_fd()])
+}
+
+/// Marks `fd` to close when the program executes another one.
+pub(crate) fn close_on_exec(fd: i32) -> Result<i32> {
+    // SAFETY: fcntl with F_SETFD only changes the flags of a descriptor this process holds.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        bail!("fcntl: {}", std::io::Error::last_os_error());
     }
-    Ok(ends)
+    Ok(fd)
 }
 
 /// Forks a child that runs `child` on the write end of a new pipe and exits with status 1 when it fails, and returns its pid and the read end.

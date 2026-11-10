@@ -37,7 +37,7 @@ fn print_items(path: &std::path::Path) -> Result<()> {
 }
 
 fn print_expanded(path: &std::path::Path) -> Result<()> {
-    let mut outline = outline::Outline::file(path, cfg::Target::x86_64_linux_gnu());
+    let mut outline = outline::Outline::file(path, cfg::Target::host());
     outline.load_all()?;
     let krate = &outline.crates[0];
     for file in krate.files.iter().filter(|file| file.expanded) {
@@ -282,6 +282,9 @@ const TUNABLES: &str = "glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=42949
 
 /// Starts haste again with `TUNABLES` when its environment sets no tunables, since glibc reads them only at startup; the started process takes them out of its environment, so the programs it runs do not see them.
 fn tune_malloc() {
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        return;
+    }
     match std::env::var_os("GLIBC_TUNABLES") {
         // SAFETY: no other thread runs yet, so nothing reads the environment while it changes.
         Some(set) if set == TUNABLES => unsafe { std::env::remove_var("GLIBC_TUNABLES") },
@@ -343,7 +346,7 @@ fn program_name(root: &std::path::Path) -> String {
 }
 
 fn report(command: Command, root: &std::path::Path, argv: &[String]) -> Result<i32> {
-    let targets = Targets { target: cfg::Target::x86_64_linux_gnu(), host: cfg::Target::x86_64_linux_gnu() };
+    let targets = Targets { target: cfg::Target::host(), host: cfg::Target::host() };
     let started = Instant::now();
     let mut workspace = graph::load(root, &targets)?;
     if !matches!(command, Command::Debug(Query::Graph)) {

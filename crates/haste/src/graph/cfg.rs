@@ -21,51 +21,6 @@ pub struct Target {
     pub internal: BTreeSet<(String, String)>,
 }
 
-const X86_64_LINUX_GNU: &[(&str, &str)] = &[
-    ("panic", "unwind"),
-    ("target_abi", ""),
-    ("target_arch", "x86_64"),
-    ("target_endian", "little"),
-    ("target_env", "gnu"),
-    ("target_family", "unix"),
-    ("target_feature", "fxsr"),
-    ("target_feature", "sse"),
-    ("target_feature", "sse2"),
-    ("target_has_atomic", "16"),
-    ("target_has_atomic", "32"),
-    ("target_has_atomic", "64"),
-    ("target_has_atomic", "8"),
-    ("target_has_atomic", "ptr"),
-    ("target_has_atomic_primitive_alignment", "16"),
-    ("target_has_atomic_primitive_alignment", "32"),
-    ("target_has_atomic_primitive_alignment", "64"),
-    ("target_has_atomic_primitive_alignment", "8"),
-    ("target_has_atomic_primitive_alignment", "ptr"),
-    ("target_os", "linux"),
-    ("target_pointer_width", "64"),
-    ("target_vendor", "unknown"),
-];
-
-const X86_64_LINUX_GNU_INTERNAL: &[(&str, &str)] = &[
-    ("fmt_debug", "full"),
-    ("relocation_model", "pic"),
-    ("target_feature", "x87"),
-    ("target_has_atomic", ""),
-    ("target_has_atomic_load_store", ""),
-    ("target_has_atomic_load_store", "16"),
-    ("target_has_atomic_load_store", "32"),
-    ("target_has_atomic_load_store", "64"),
-    ("target_has_atomic_load_store", "8"),
-    ("target_has_atomic_load_store", "ptr"),
-    ("target_has_reliable_f128", ""),
-    ("target_has_reliable_f128_math", ""),
-    ("target_has_reliable_f16", ""),
-    ("target_has_reliable_f16_math", ""),
-    ("target_has_threads", ""),
-    ("target_object_format", "elf"),
-    ("target_thread_local", ""),
-];
-
 impl Target {
     /// Whether the compiler sets the name `name` for source, including names Cargo does not see.
     pub fn has_name(&self, name: &str) -> bool {
@@ -78,11 +33,29 @@ impl Target {
         self.pairs.contains(&pair) || self.internal.contains(&pair)
     }
 
-    /// The x86-64 Linux GNU target: `rustc --print cfg` without `debug_assertions`, plus the internal cfgs of `rustc +nightly --print cfg -Zunstable-options`.
-    pub fn x86_64_linux_gnu() -> Self {
-        let pairs = X86_64_LINUX_GNU.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())).collect();
-        let internal = X86_64_LINUX_GNU_INTERNAL.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())).collect();
-        Target { triple: "x86_64-unknown-linux-gnu".to_owned(), names: ["unix".to_owned()].into(), pairs, internal }
+    /// The cfgs of `target`, from its catalog entry: the lines before `[internal]` are what Cargo sees.
+    pub fn of(target: &haste_codegen::Target) -> Self {
+        let mut cfg = Target { triple: target.triple.to_owned(), ..Target::default() };
+        let mut internal = false;
+        for line in target.cfg.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if line == "[internal]" {
+                internal = true;
+                continue;
+            }
+            let pair = line.split_once('=').map(|(key, value)| (key.to_owned(), value.trim_matches('"').to_owned()));
+            match (pair, internal) {
+                (Some(pair), false) => _ = cfg.pairs.insert(pair),
+                (Some(pair), true) => _ = cfg.internal.insert(pair),
+                (None, false) => _ = cfg.names.insert(line.to_owned()),
+                (None, true) => _ = cfg.internal.insert((line.to_owned(), String::new())),
+            }
+        }
+        cfg
+    }
+
+    /// The cfgs of the machine this program runs on.
+    pub fn host() -> Self {
+        Target::of(haste_codegen::Target::host())
     }
 
     /// Whether `cfg` holds for this target.

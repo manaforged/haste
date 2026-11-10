@@ -10,9 +10,6 @@ use crate::outline::item::ItemKind;
 use super::Context;
 use super::ty::{Kind, Ty};
 
-/// The x86_64-unknown-linux-gnu data layout, as `rustc --print target-spec-json` reports it.
-const DATA_LAYOUT: &str = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128";
-
 /// A field index inside a layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Field(u32);
@@ -53,9 +50,9 @@ pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
     fields.offset(index as usize).bytes() as i32
 }
 
-/// The target's data layout.
+/// The data layout of the machine the compiled code runs on.
 pub fn target() -> Result<TargetDataLayout> {
-    TargetDataLayout::parse_from_llvm_datalayout_string(DATA_LAYOUT, AddressSpace::ZERO).map_err(|_| anyhow!("bad data layout"))
+    TargetDataLayout::parse_from_llvm_datalayout_string(haste_codegen::Target::host().data_layout, AddressSpace::ZERO).map_err(|_| anyhow!("bad data layout"))
 }
 
 fn scalar(dl: &TargetDataLayout, value: Abi, valid: Option<(u128, u128)>) -> Layout {
