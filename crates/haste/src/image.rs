@@ -7,7 +7,7 @@ mod stub;
 mod workers;
 
 pub use expand::{Job, run_macros};
-pub use lazy::{Jit, Driver, Ended, entries, run_on_demand, serve};
+pub use lazy::{Jit, Driver, Ended, Program, entries, run_on_demand, serve};
 pub use script::Script;
 
 use std::cell::RefCell;

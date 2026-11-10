@@ -146,8 +146,8 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets, request: Reques
         return crate::build::run(workspace, targets, args);
     }
     let started = Instant::now();
-    let mut build = crate::build::Build::cold(workspace, targets)?;
-    let result = crate::serve::finish(&mut build, request, args, started);
+    let mut build = crate::build::Build::load(workspace, targets)?;
+    let result = crate::serve::finish(&mut build, workspace, (request, args), started);
     std::mem::forget(build);
     result
 }
