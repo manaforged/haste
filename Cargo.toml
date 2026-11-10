@@ -1,37 +1,4 @@
-[package]
-name = "haste"
-version = "0.0.0"
-edition = "2024"
-publish = false
-license = "MIT"
-
 [workspace]
-members = ["crates/codegen", "crates/front"]
-exclude = ["hello", "patch", "ra"]
-
-[dependencies]
-serde_json = "1"
-anyhow = "1"
-either = "1"
-libc = "0.2"
-triomphe = "0.1"
-rustc_abi = { package = "ra-ap-rustc_abi", version = "0.166", default-features = false }
-rustc_lexer = { package = "ra-ap-rustc_lexer", version = "0.180", default-features = false }
-rustc_type_ir = { package = "ra-ap-rustc_type_ir", version = "0.166", default-features = false }
-base-db = { path = "ra/crates/base-db" }
-cfg = { path = "ra/crates/cfg" }
-hir-def = { path = "ra/crates/hir-def" }
-hir-ty = { path = "ra/crates/hir-ty" }
-load-cargo = { path = "ra/crates/load-cargo" }
-project-model = { path = "ra/crates/project-model" }
-ide-db = { path = "ra/crates/ide-db" }
-paths = { path = "ra/crates/paths" }
-hir-expand = { path = "ra/crates/hir-expand" }
-vfs = { path = "ra/crates/vfs" }
-syntax = { path = "ra/crates/syntax" }
-span = { path = "ra/crates/span" }
-tt = { path = "ra/crates/tt" }
-intern = { path = "ra/crates/intern" }
-proc-macro-api = { path = "ra/crates/proc-macro-api", features = ["engine"] }
-proc-macro-srv = { path = "ra/crates/proc-macro-srv", features = ["engine"] }
-haste-codegen = { path = "crates/codegen" }
+members = ["crates/codegen", "crates/haste"]
+exclude = ["hello", "patch"]
+resolver = "3"

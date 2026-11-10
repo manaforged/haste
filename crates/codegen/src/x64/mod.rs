@@ -2,28 +2,28 @@ mod asm;
 mod atomic;
 mod float;
 mod frame;
-mod home;
+mod location;
 mod int;
 mod live;
 mod wide;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
 use frame::{Abi, Frame, Loc, classify, layout, saved};
-use home::{Home, Plan, plan};
+use location::{Location, Plan, plan};
 
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
-use crate::{Compiled, Site};
+use crate::{Code, Site};
 
 const PAGE: u32 = 4096;
 const INCOMING: i32 = 16;
 const MOVSD: (&[u8], &[u8], &[u8]) = (&[0xF2], &[0x0F, 0x10], &[0x0F, 0x11]);
 
 /// Encodes `func` as x86-64 machine code.
-pub(crate) fn compile(func: &Function) -> Result<Compiled, String> {
+pub(crate) fn compile(func: &Function) -> Result<Code, String> {
     let order = live::order(func);
     let abi = classify(&func.signature)?;
     let plan = plan(func, &order, &abi.params);
-    let frame = layout(func, saved(func, &plan.used), &plan.homes)?;
+    let frame = layout(func, saved(func, &plan.used), &plan.locations)?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     Emit { func, frame, abi, asm, blocks, sites: Vec::new(), plan, flags: None, next: None }.run(order)
@@ -52,7 +52,7 @@ pub(super) struct Emit<'a> {
 }
 
 impl Emit<'_> {
-    fn run(mut self, order: Vec<Block>) -> Result<Compiled, String> {
+    fn run(mut self, order: Vec<Block>) -> Result<Code, String> {
         let entry = self.func.entry.ok_or("the function has no entry block")?;
         self.prologue();
         self.intake(entry)?;
@@ -60,7 +60,7 @@ impl Emit<'_> {
             self.next = order.get(index + 1).copied();
             self.block(*block)?;
         }
-        Ok(Compiled { code: self.asm.finish()?, sites: self.sites })
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites })
     }
 
     fn block(&mut self, block: Block) -> Result<(), String> {
@@ -235,7 +235,7 @@ impl Emit<'_> {
         self.asm.bind(skip);
     }
 
-    /// Sets the zero flag from whether `value` is zero, testing its home register in place when it has one.
+    /// Sets the zero flag from whether `value` is zero, testing its location register in place when it has one.
     fn test_value(&mut self, value: Value) {
         let reg = self.reg_of(value).unwrap_or_else(|| {
             self.get(Reg::Rax, value, Ext::Zero);
@@ -246,21 +246,21 @@ impl Emit<'_> {
 
     /// Whether `a` and `b` live in the same place, so writing one overwrites the other.
     fn same_home(&self, a: Value, b: Value) -> bool {
-        a == b || matches!((self.plan.homes[a.index()], self.plan.homes[b.index()]), (Home::Reg(x), Home::Reg(y)) if x == y)
+        a == b || matches!((self.plan.locations[a.index()], self.plan.locations[b.index()]), (Location::Reg(x), Location::Reg(y)) if x == y)
     }
 
-    /// Writes `value` into the home of `param`.
+    /// Writes `value` into the location of `param`.
     fn assign(&mut self, param: Value, value: Value) {
-        match self.plan.homes[param.index()] {
-            Home::Reg(reg) => self.raw(reg, value),
+        match self.plan.locations[param.index()] {
+            Location::Reg(reg) => self.raw(reg, value),
             _ => self.move_to(self.at(param), value),
         }
     }
 
-    /// Loads the home of `value` from the bytes at `from`.
+    /// Loads the location of `value` from the bytes at `from`.
     fn load_home(&mut self, value: Value, from: Mem) {
-        match self.plan.homes[value.index()] {
-            Home::Reg(reg) => self.asm.load(Size::Q, reg, from),
+        match self.plan.locations[value.index()] {
+            Location::Reg(reg) => self.asm.load(Size::Q, reg, from),
             _ => self.copy_to(self.at(value), from, self.ty(value)),
         }
     }

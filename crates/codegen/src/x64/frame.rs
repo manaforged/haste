@@ -1,5 +1,5 @@
 use super::asm::Reg;
-use super::home::Home;
+use super::location::Location;
 use crate::ir::{ArgumentPurpose, Function, Op, Signature, Type};
 
 const INT_ARGS: [Reg; 6] = [Reg::Rdi, Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
@@ -143,7 +143,7 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
         for inst in &block.insts {
             let data = &func.insts[inst.index()];
             data.op.for_operands(|value| values[value.index()] = true);
-            super::home::results(data).for_each(|value| values[value.index()] = true);
+            super::location::results(data).for_each(|value| values[value.index()] = true);
             if let Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) = data.op {
                 slots[slot.index()] = true;
             }
@@ -153,13 +153,13 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
 }
 
 /// Lays out the frame: saved registers, the values that live in memory, the stack slots in use, edge scratch, then outgoing arguments at rsp.
-pub(super) fn layout(func: &Function, saves: Vec<Reg>, homes: &[Home]) -> Result<Frame, String> {
+pub(super) fn layout(func: &Function, saves: Vec<Reg>, locations: &[Location]) -> Result<Frame, String> {
     let (outgoing, scratch) = needs(func)?;
     let (present, addressed) = present(func);
     let mut cursor = saves.len() as u32 * WORD;
     let mut values = Vec::with_capacity(func.types.len());
     for (value, ty) in func.types.iter().enumerate() {
-        if !present[value] || matches!(homes[value], Home::Reg(_)) {
+        if !present[value] || matches!(locations[value], Location::Reg(_)) {
             values.push(0);
             continue;
         }

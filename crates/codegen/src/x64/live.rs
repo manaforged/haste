@@ -49,11 +49,11 @@ fn successors(func: &Function, block: usize) -> Vec<Block> {
 
 /// The wanted values that some block other than their defining block reads, as a dense index per value and the values in index order.
 fn crossing(func: &Function, wanted: &[bool]) -> (Vec<Option<usize>>, Vec<Value>) {
-    let mut home = vec![usize::MAX; func.types.len()];
+    let mut location = vec![usize::MAX; func.types.len()];
     for (block, data) in func.blocks.iter().enumerate() {
-        data.params.iter().for_each(|param| home[param.index()] = block);
+        data.params.iter().for_each(|param| location[param.index()] = block);
         for inst in &data.insts {
-            super::home::results(&func.insts[inst.index()]).for_each(|result| home[result.index()] = block);
+            super::location::results(&func.insts[inst.index()]).for_each(|result| location[result.index()] = block);
         }
     }
     let mut dense = vec![None; func.types.len()];
@@ -61,7 +61,7 @@ fn crossing(func: &Function, wanted: &[bool]) -> (Vec<Option<usize>>, Vec<Value>
     for (block, data) in func.blocks.iter().enumerate() {
         for inst in &data.insts {
             for value in func.insts[inst.index()].op.operands() {
-                if wanted[value.index()] && home[value.index()] != block && dense[value.index()].is_none() {
+                if wanted[value.index()] && location[value.index()] != block && dense[value.index()].is_none() {
                     dense[value.index()] = Some(values.len());
                     values.push(value);
                 }
@@ -86,7 +86,7 @@ fn local_sets(func: &Function, dense: &[Option<usize>], count: usize) -> (Sets, 
                     uses.insert(block, value);
                 }
             }
-            for result in super::home::results(inst).filter_map(|result| dense[result.index()]) {
+            for result in super::location::results(inst).filter_map(|result| dense[result.index()]) {
                 defs.insert(block, result);
             }
         }
@@ -139,7 +139,7 @@ pub(super) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
         for inst in &func.blocks[index].insts {
             at += 1;
             let data = &func.insts[inst.index()];
-            data.op.operands().into_iter().chain(super::home::results(data)).filter(|value| wanted[value.index()]).for_each(|value| widen(&mut span[value.index()], at));
+            data.op.operands().into_iter().chain(super::location::results(data)).filter(|value| wanted[value.index()]).for_each(|value| widen(&mut span[value.index()], at));
             if matches!(data.op, Op::TryCall { .. }) {
                 unwinds.push(at);
             }
