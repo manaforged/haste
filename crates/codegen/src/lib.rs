@@ -29,6 +29,12 @@ pub struct Compiled {
     pub sites: Vec<Site>,
 }
 
+/// Promotes `func`'s frame slots to values and folds its straight-line blocks, as `compile` does before encoding.
+pub fn simplify(func: &mut Function) {
+    promote::run(func);
+    merge::run(func);
+}
+
 /// Encodes `func` for the host machine.
 pub fn compile(mut func: Function) -> Result<Compiled, String> {
     coroutine::split(&mut func);

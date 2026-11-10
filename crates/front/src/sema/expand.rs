@@ -9,7 +9,7 @@ use crate::names::resolve::macro_at;
 use crate::names::{ItemRef, ModRef, plain};
 use crate::outline::item::{ItemKind, Items, ProcKind};
 use crate::outline::rules::{self, Rule};
-use crate::outline::{mbe, scan};
+use crate::outline::{derive, mbe, scan};
 use crate::outline::source::{Mark, Source, Tokens, opens};
 use crate::outline::tree::{Expansion, File, Truth};
 
@@ -385,9 +385,35 @@ impl<'a> Context<'a> {
         let config = self.body_config(item, Some(&calls));
         let body = parse_in(&source, config, self.item(item).1)?;
         let items = declared(&source, config, &body)?;
+        let (source, items) = self.body_derives(item.krate, (source, items), &calls)?;
         let found = (!calls.is_empty() || !items.items.is_empty()).then(|| Box::new(Expansion { file: File::new(source, items, true), calls }));
         file.set_expansion(item.item, found);
         Ok(body)
+    }
+}
+
+impl Context<'_> {
+    /// The body source `source` of crate `krate` with the impls that the builtin derives of its structs, enums and unions write laid after it, and its `items` with those impls.
+    fn body_derives(&self, krate: u32, (source, items): (Source, Items), calls: &HashMap<u32, u32>) -> Result<(Source, Items)> {
+        let (env, deps) = (&self.outline.crates[krate as usize].env, &self.outline.deps[krate as usize][..]);
+        let adts = items.items.iter().filter(|entry| matches!(entry.kind, ItemKind::Struct | ItemKind::Enum | ItemKind::Union));
+        let derived: Vec<(Source, Option<u32>)> = adts.filter_map(|entry| Some((derive::derived(&source, entry, env, (krate as usize, deps)).0?, entry.parent))).map(|(expanded, parent)| Ok((expanded?, parent))).collect::<Result<_>>()?;
+        let Some(base) = source.base.clone().filter(|_| !derived.is_empty()) else { return Ok((source, items)) };
+        let mut out = Tokens::default();
+        (source.offset..source.len()).for_each(|at| out.copy(&source, at));
+        let mut starts = Vec::new();
+        for (expanded, parent) in derived {
+            let mut at = 0;
+            while at < expanded.len() {
+                starts.push((source.offset + out.len() + at, parent));
+                at = scan::item_end(&expanded, at)?;
+            }
+            (0..expanded.len()).for_each(|at| out.copy(&expanded, at));
+            out.space();
+        }
+        let source = out.finish_over(base)?;
+        let items = scan::body_items(&source, starts, (items, Some(calls)))?;
+        Ok((source, items))
     }
 }
 

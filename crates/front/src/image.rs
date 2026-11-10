@@ -40,6 +40,7 @@ pub struct Image {
     fixups: RefCell<Vec<(usize, usize)>>,
     cells: RefCell<HashMap<usize, i64>>,
     wanted: RefCell<Vec<crate::sema::reach::Instance>>,
+    bodies: lower::Bodies,
 }
 
 impl Slots for Image {
@@ -74,6 +75,10 @@ impl Slots for Image {
         self.wanted.borrow_mut().push(instance);
     }
 
+    fn bodies(&self) -> &lower::Bodies {
+        &self.bodies
+    }
+
     fn cell(&self, index: usize, size: u32) -> i64 {
         if let Some(&address) = self.cells.borrow().get(&index) {
             return address;
@@ -103,7 +108,7 @@ impl Image {
         let table = shared.alloc(capacity * size_of::<AtomicUsize>()).map_err(|error| anyhow!(error))?;
         let memory = Memory::default();
         let state = Shared::private(STATE_BYTES).map_err(|error| anyhow!(error))?;
-        Ok(Image { table, capacity, memory, stubs: Memory::default(), shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), wanted: RefCell::default() })
+        Ok(Image { table, capacity, memory, stubs: Memory::default(), shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), wanted: RefCell::default(), bodies: lower::Bodies::default() })
     }
 
     fn slot(&self, index: usize) -> &AtomicUsize {
@@ -170,7 +175,11 @@ impl Image {
     }
 
     fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
-        let func = lower::lower(cx, reached, self, index)?;
+        let lowered = self.bodies.borrow().get(&index).and_then(|lowered| lowered.body.clone());
+        let func = match lowered {
+            Some(body) => std::rc::Rc::unwrap_or_clone(body),
+            None => lower::lower(cx, reached, self, index)?,
+        };
         let compiled = haste_codegen::compile(func).map_err(|error| anyhow!(error))?;
         self.memory.write(&compiled.code).map_err(|error| anyhow!(error))
     }
@@ -195,7 +204,6 @@ impl Image {
     }
 
     fn run_from(&self, cases: &[(usize, &str)], inputs: &[i64]) -> Result<(usize, i32)> {
-        std::io::Write::flush(&mut std::io::stdout())?;
         let (pid, mut progress) = fork_piped(|progress| self.run_in_child(cases, inputs, progress))?;
         let mut done = Vec::new();
         std::io::Read::read_to_end(&mut progress, &mut done)?;
@@ -220,28 +228,10 @@ impl Image {
 
     /// Runs the program in a forked child the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling, and returns the child's exit status.
     pub fn run_main(&self, entry: (usize, usize), args: &[String]) -> Result<i32> {
-        let pid = self.fork_main(entry, args, || {})?;
-        Ok(wait(pid))
-    }
-
-    /// Forks a child that runs `setup` and then the program from `lang_start` with `main` and `args`, and returns its pid.
-    fn fork_main(&self, entry: (usize, usize), args: &[String], setup: impl FnOnce()) -> Result<libc::pid_t> {
         if self.slot(entry.0).load(Ordering::Acquire) == 0 || self.slot(entry.1).load(Ordering::Acquire) == 0 {
             bail!("`main` or `lang_start` has no code");
         }
-        std::io::Write::flush(&mut std::io::stdout())?;
-        // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            bail!("fork failed: {}", std::io::Error::last_os_error());
-        }
-        if pid == 0 {
-            setup();
-            let code = self.enter_main(entry, args);
-            // SAFETY: _exit ends the child without running the parent's destructors; lang_start flushed the program's own output.
-            unsafe { libc::_exit(code) }
-        }
-        Ok(pid)
+        Ok(wait(fork_child(|| self.enter_main(entry, args))?))
     }
 
     /// Runs the program the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling; returns its exit status.
@@ -264,45 +254,111 @@ fn wait(pid: libc::pid_t) -> i32 {
     if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) }
 }
 
-/// Makes a fatal signal end this forked child at once with status 128 plus the signal, as `wait` reports it, so no core of the whole compiler is dumped.
-pub(crate) fn quiet_crashes() {
-    extern "C" fn end(signal: libc::c_int) {
-        // SAFETY: _exit is async-signal-safe and ends the child without running the parent's destructors.
-        unsafe { libc::_exit(128 + signal) }
-    }
-    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT] {
-        // SAFETY: end is an async-signal-safe handler, and signal is a valid signal number.
-        unsafe { libc::signal(signal, end as *const () as libc::sighandler_t) };
+/// The state byte of a static whose initializer has written its value.
+pub(crate) const FILLED: u8 = 1;
+const EMPTY: u8 = 0;
+const FILLING: u8 = 2;
+
+/// What the host keeps for each thread of the program: its cells of `#[thread_local]` statics by initializer, and the statics it is filling.
+#[derive(Default)]
+struct ThreadState {
+    cells: rustc_hash::FxHashMap<usize, usize>,
+    filling: Vec<usize>,
+}
+
+thread_local! {
+    static THREAD_STATE: std::cell::Cell<*mut ThreadState> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// The calling thread's state, made on first use and never freed, since the program's thread exit code may still read it after the host's own thread locals are gone.
+fn thread_state() -> &'static mut ThreadState {
+    THREAD_STATE.with(|state| {
+        if state.get().is_null() {
+            state.set(Box::into_raw(Box::default()));
+        }
+        // SAFETY: the state is this thread's own leaked allocation, never shared with another thread.
+        unsafe { &mut *state.get() }
+    })
+}
+
+/// Runs the initializer at `code` of the static whose state byte is at `flag`, unless another call filled it: a thread that finds another thread filling it waits, and the thread filling it reads it as it is.
+pub(crate) extern "C" fn fill_once(flag: usize, code: usize) {
+    // SAFETY: flag is the state byte after a static's value in a cell that lives as long as the program.
+    let state = unsafe { &*(flag as *const std::sync::atomic::AtomicU8) };
+    loop {
+        match state.compare_exchange(EMPTY, FILLING, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                thread_state().filling.push(flag);
+                // SAFETY: code is the generated initializer of this static, a function that takes and returns nothing.
+                let fill: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(code) };
+                fill();
+                thread_state().filling.retain(|&at| at != flag);
+                state.store(FILLED, Ordering::Release);
+                return;
+            }
+            Err(FILLED) => return,
+            Err(_) if thread_state().filling.contains(&flag) => return,
+            Err(_) => std::thread::yield_now(),
+        }
     }
 }
 
-/// Forks a child that runs `child` on the write end of a new pipe and exits with status 1 when it fails, and returns its pid and the read end.
-pub(crate) fn fork_piped<E>(child: impl FnOnce(std::fs::File) -> Result<(), E>) -> Result<(libc::pid_t, std::fs::File)> {
-    let mut ends = [0; 2];
-    // SAFETY: ends is a live two-element array for the new descriptors.
-    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-        bail!("pipe failed: {}", std::io::Error::last_os_error());
-    }
+/// The calling thread's cell of `size` zeroed bytes for the `#[thread_local]` static whose initializer is reached function `index`; cells are never freed, since the program's thread exit code may still read them.
+pub(crate) extern "C" fn thread_cell(index: usize, size: usize) -> usize {
+    *thread_state().cells.entry(index).or_insert_with(|| {
+        let layout = std::alloc::Layout::from_size_align(size.max(1), 64).unwrap_or_else(|_| std::alloc::Layout::new::<u8>());
+        // SAFETY: layout has a nonzero size.
+        let cell = unsafe { std::alloc::alloc_zeroed(layout) };
+        if cell.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        cell as usize
+    })
+}
+
+/// Forks a child that dumps no core when a signal ends it, runs `child` and exits with the status it returns; returns the child's pid.
+pub(crate) fn fork_child(child: impl FnOnce() -> i32) -> Result<libc::pid_t> {
+    std::io::Write::flush(&mut std::io::stdout())?;
     // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         bail!("fork failed: {}", std::io::Error::last_os_error());
     }
     if pid == 0 {
-        quiet_crashes();
-        // SAFETY: ends[0] is the read end this child does not use, and ends[1] is the write end it owns from here on.
-        let out = unsafe {
-            libc::close(ends[0]);
-            std::fs::File::from_raw_fd(ends[1])
-        };
-        let wrote = child(out);
+        // SAFETY: PR_SET_DUMPABLE with 0 only clears this child's dumpable flag, so a crash dumps no core of the whole compiler.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+        let status = child();
         // SAFETY: _exit ends the child without running the parent's destructors.
-        unsafe { libc::_exit(i32::from(wrote.is_err())) }
+        unsafe { libc::_exit(status) }
     }
-    // SAFETY: ends[1] is the write end that only the child uses, and ends[0] is the read end this process owns from here on.
+    Ok(pid)
+}
+
+/// A new pipe whose ends close when the program executes another one.
+pub(crate) fn pipe() -> Result<[i32; 2]> {
+    let mut ends = [0; 2];
+    // SAFETY: ends is a live two-element array for the new descriptors.
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        bail!("pipe failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(ends)
+}
+
+/// Forks a child that runs `child` on the write end of a new pipe and exits with status 1 when it fails, and returns its pid and the read end.
+pub(crate) fn fork_piped<E>(child: impl FnOnce(std::fs::File) -> Result<(), E>) -> Result<(libc::pid_t, std::fs::File)> {
+    let [read, write] = pipe()?;
+    let pid = fork_child(|| {
+        // SAFETY: read is the end this child does not use, and write is the end it owns from here on.
+        let out = unsafe {
+            libc::close(read);
+            std::fs::File::from_raw_fd(write)
+        };
+        i32::from(child(out).is_err())
+    })?;
+    // SAFETY: write is the end that only the child uses, and read is the end this process owns from here on.
     let input = unsafe {
-        libc::close(ends[1]);
-        std::fs::File::from_raw_fd(ends[0])
+        libc::close(write);
+        std::fs::File::from_raw_fd(read)
     };
     Ok((pid, input))
 }

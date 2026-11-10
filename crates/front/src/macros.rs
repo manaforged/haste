@@ -34,15 +34,25 @@ pub fn reach_settled<R>(outline: &mut Outline, names: &mut Names, roots: impl Fn
 
 /// Reaches from `roots` as `reach_settled` does, answering each pass's asks with `ask`, which says whether anything new loaded.
 fn reach_answered<R>(outline: &mut Outline, names: &mut Names, (roots, ask): (impl Fn(&mut Context<'_>) -> Vec<Instance>, impl Fn(&mut Outline, &mut Names, Asks) -> Result<bool>), finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
-    let (mut store, mut last) = (Store::default(), false);
-    loop {
-        let mut cx = Context::new(outline, names, store);
+    let mut finish = Some(finish);
+    settle_sema(outline, names, ask, |mut cx, last| {
         let from = roots(&mut cx);
         let reached = reach(&mut cx, &from);
-        if last || cx.settled() {
-            return finish(cx, reached);
+        match finish.take_if(|_| last || cx.settled()) {
+            Some(finish) => finish(cx, reached).map(Ok),
+            None => Ok(Err(cx.release())),
         }
-        let (mut kept, asks) = cx.release();
+    })
+}
+
+/// Runs `pass` on a fresh context, answering with `ask` what it asked for, until it gives a result: `pass` returns its result, or the released context to answer and run again, and learns whether the last answer loaded nothing new.
+pub fn settle_sema<R>(outline: &mut Outline, names: &mut Names, ask: impl Fn(&mut Outline, &mut Names, Asks) -> Result<bool>, mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Store, Asks)>>) -> Result<R> {
+    let (mut store, mut last) = (Store::default(), false);
+    loop {
+        let (mut kept, asks) = match pass(Context::new(outline, names, store), last)? {
+            Ok(done) => return Ok(done),
+            Err(released) => released,
+        };
         last = !ask(outline, names, asks)?;
         kept.forget_lookups();
         store = kept;
@@ -58,7 +68,7 @@ pub fn settle(outline: &mut Outline, names: &mut Names) -> Result<()> {
             return Ok(());
         }
         let inputs: Vec<Vec<String>> = bound.iter().map(inputs).collect();
-        let calls: Vec<(ItemRef, ProcKind)> = bound.iter().map(|call| (call.run, call.kind)).collect();
+        let calls: Vec<Call> = bound.iter().map(|call| (call.run, call.kind, call.krate)).collect();
         let outputs = run(outline, names, &calls, &inputs)?;
         apply(outline, names, &bound, outputs)?;
     }
@@ -71,7 +81,7 @@ pub fn answer(outline: &mut Outline, names: &mut Names, asks: Asks) -> Result<bo
     procs.dedup();
     procs.retain(|key| !outline.procs.contains_key(key));
     if !procs.is_empty() {
-        let calls: Vec<(ItemRef, ProcKind)> = procs.iter().map(|(run, _)| (*run, ProcKind::Bang)).collect();
+        let calls: Vec<Call> = procs.iter().map(|(run, _)| (*run, ProcKind::Bang, usize::MAX)).collect();
         let inputs: Vec<Vec<String>> = procs.iter().map(|(_, text)| vec![text.clone()]).collect();
         let outputs = run(outline, names, &calls, &inputs)?;
         outline.procs.extend(procs.iter().cloned().zip(outputs));
@@ -174,33 +184,36 @@ fn entries(outline: &Outline) -> Result<[ItemRef; 2]> {
     Ok([one, two].map(|item| ItemRef { krate: krate as u32, file: file as u32, item: item as u32 }))
 }
 
+/// A procedural macro call: the macro function, its kind, and the crate that calls it, `usize::MAX` for a call in a function body.
+type Call = (ItemRef, ProcKind, usize);
+
 /// The output of each call `bound` on its `inputs`: the one the store kept for a macro of a pinned crate, else from running it, kept when it succeeds.
-fn run(outline: &mut Outline, names: &mut Names, bound: &[(ItemRef, ProcKind)], inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
-    let keys: Vec<Option<u64>> = bound.iter().zip(inputs).map(|(&(call, _), texts)| Some(store::expansion_key(outline.pins[call.krate as usize]?, &macro_name(outline, call), texts))).collect();
+fn run(outline: &mut Outline, names: &mut Names, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
+    let keys: Vec<Option<u64>> = bound.iter().zip(inputs).map(|(&(call, ..), texts)| Some(store::expansion_key(outline.pins[call.krate as usize]?, &macro_name(outline, call), texts))).collect();
     let mut results: Vec<Option<Result<String, String>>> = keys.iter().map(|key| key.and_then(store::kept_expansion).map(Ok)).collect();
     let missing: Vec<usize> = (0..bound.len()).filter(|&at| results[at].is_none()).collect();
     if !missing.is_empty() {
-        let calls: Vec<(ItemRef, ProcKind)> = missing.iter().map(|&at| bound[at]).collect();
+        let calls: Vec<Call> = missing.iter().map(|&at| bound[at]).collect();
         let texts: Vec<Vec<String>> = missing.iter().map(|&at| inputs[at].clone()).collect();
         for (at, result) in missing.into_iter().zip(expand(outline, names, &calls, &texts)?) {
-            if let (Ok(text), Some(key)) = (&result, keys[at])
+            if let (Some(Ok(text)), Some(key)) = (&result, keys[at])
                 && let Err(error) = store::keep_expansion(key, text)
             {
                 eprintln!("cannot keep the output of {}: {error}", macro_name(outline, bound[at].0));
             }
-            results[at] = Some(result);
+            results[at] = result;
         }
     }
     Ok(results.into_iter().map(|result| result.unwrap_or_else(|| Err("no output".to_owned()))).collect())
 }
 
-/// Runs each call `bound` on its `inputs` in children that compile each function on its first call.
-fn expand(outline: &mut Outline, names: &mut Names, bound: &[(ItemRef, ProcKind)], inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
+/// Runs each call `bound` on its `inputs` in children that compile each function on its first call; `None` for a call that did not run.
+fn expand(outline: &mut Outline, names: &mut Names, bound: &[Call], inputs: &[Vec<String>]) -> Result<Vec<Option<Result<String, String>>>> {
     let pair = entries(outline)?;
     let mut demand = Demand::new()?;
     let entry = pair.map(|item| demand.declare((item, Vec::new())));
-    let jobs: Vec<Job<'_>> = bound.iter().zip(inputs).map(|(&(call, kind), texts)| Job { entry: entry[usize::from(kind == ProcKind::Attribute)], run: demand.declare((call, Vec::new())), texts: texts.iter().map(|text| text.as_bytes()).collect() }).collect();
+    let jobs: Vec<Job<'_>> = bound.iter().zip(inputs).map(|(&(call, kind, caller), texts)| Job { entry: entry[usize::from(kind == ProcKind::Attribute)], run: demand.declare((call, Vec::new())), texts: texts.iter().map(|text| text.as_bytes()).collect(), group: (caller, call.krate) }).collect();
     let ask = |outline: &mut Outline, names: &mut Names, asks: Asks| names.answer(outline, asks);
     let ran = run_macros(outline, names, &mut demand, &jobs, &ask)?;
-    Ok(ran.into_iter().map(|result| result.and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()))).collect())
+    Ok(ran.into_iter().map(|result| result.map(|result| result.and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string())))).collect())
 }

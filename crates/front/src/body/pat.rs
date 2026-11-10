@@ -196,26 +196,7 @@ impl Cursor<'_> {
     }
 
     fn struct_pat(&mut self, path: super::PathId) -> Result<PatId> {
-        let open = self.group();
-        let mut rest = false;
-        let fields = self.inside(open, |cursor| {
-            let mut fields = Vec::new();
-            while !cursor.done() {
-                let attrs = cursor.skip_attrs()?;
-                if cursor.eat("..") {
-                    rest = true;
-                    break;
-                }
-                let field = cursor.field_pat()?;
-                if !cursor.configured_out(attrs) {
-                    fields.push(field);
-                }
-                if !cursor.eat(",") {
-                    break;
-                }
-            }
-            Ok(fields)
-        })?;
+        let (fields, rest) = self.struct_fields(|cursor, _| cursor.field_pat(), |_| Ok(()))?;
         let fields = self.list(&fields);
         Ok(self.push_pat(Pat::Struct { path, fields, rest }))
     }

@@ -146,7 +146,7 @@ fn drain(cx: &mut Context<'_>, reached: &mut Reached, mut queue: Vec<Instance>) 
 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
 fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<std::rc::Rc<Typed>, String> {
-    if let Some(typed) = cx.finals.get(instance).cloned() {
+    if let Some(typed) = cx.store.finals.get(instance).cloned() {
         register(cx, (instance.0, &instance.1), &typed);
         return Ok(typed);
     }
@@ -154,7 +154,7 @@ fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String
     let typed = std::rc::Rc::new(infer(cx, instance.0, &instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?);
     let laid = lay_out(cx, &typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
     if laid.is_ok() && cx.asks.count() == asked {
-        cx.finals.insert(instance.clone(), typed.clone());
+        cx.store.finals.insert(instance.clone(), typed.clone());
     }
     Ok(typed)
 }
@@ -164,7 +164,7 @@ fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
     let intrinsic_args: Vec<Ty> = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_some()).flat_map(|(_, substs)| substs.iter().copied()).collect();
     let locals = typed.locals.iter().map(|local| local.ty);
     for ty in typed.exprs.iter().copied().chain(locals).chain(intrinsic_args) {
-        if ty != Ty(u32::MAX) && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
+        if ty != Ty::NONE && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
             cx.layout(ty)?;
         }
     }

@@ -191,7 +191,7 @@ impl Backend {
     }
 
     pub(super) fn define(&self, func: &Function, name: &str) -> Result<usize, String> {
-        let compiled = haste_codegen::compile(func)?;
+        let compiled = haste_codegen::compile(func.clone())?;
         let mut state = self.state();
         let code = state.memory.write(&compiled.code)?;
         state.unmapped.push((code, compiled.code.len(), name.to_owned(), compiled.sites));

@@ -1,0 +1,10 @@
+[package]
+name = "fp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde_json = { version = "=1.0.154", features = ["raw_value"] }
+toml = "=0.8.23"
+
+[workspace]

@@ -1,14 +1,44 @@
+use std::rc::Rc;
+
 use anyhow::{Result, bail};
-use haste_codegen::{Block, StackSlot, Type, Value};
+use haste_codegen::{Block, Function, Signature, StackSlot, Type, Value};
 
 use crate::body::{Expr, ExprId, List, UnOp};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
-use crate::sema::infer::{Coercion, Res};
+use crate::sema::Context;
+use crate::sema::infer::{Coercion, Res, Shape};
+use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::Place;
-use super::{Loop, Lower, Repr, repr};
+use super::{Loop, Lowered, Lower, Repr, repr};
+
+/// The most instructions a sysroot body may have, after slot promotion, for a call to copy it inline.
+const INLINE_LIMIT: usize = 30;
+
+/// The most source expressions a sysroot body may have for lowering it to try `INLINE_LIMIT`.
+const INLINE_EXPRS: usize = 20;
+
+/// What a call runs: code at an address, or reached function `index`, which may be copied inline.
+enum Callee {
+    Code(Value),
+    Reached(usize),
+}
+
+/// Whether a call may try to copy reached function `index` inline: a sysroot function whose source body has at most `INLINE_EXPRS` expressions, or none.
+pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool {
+    let ((item, _), Ok(typed)) = &reached.list[index] else { return false };
+    if !cx.outline.crates[item.krate as usize].env.release {
+        return false;
+    }
+    let source = match &typed.shape {
+        Shape::Body => *item,
+        Shape::Closure(closure) => closure.parent,
+        _ => return true,
+    };
+    cx.body(source).is_ok_and(|body| body.exprs.len() <= INLINE_EXPRS)
+}
 
 impl Lower<'_, '_> {
     /// Lowers `expr` and returns its value, or none for `()`, `!` and code after a jump.
@@ -233,13 +263,48 @@ impl Lower<'_, '_> {
         }
         let index = self.reached_index(item, substs)?;
         let Ok(callee) = &self.reached.list[index].1 else { bail!("{} did not type-check", self.cx.name(item)) };
-        let code = self.code_of(index);
+        let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
         if self.cx.foreign(item) {
-            let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
+            let code = self.code_of(index);
             return self.native_call(code, (params, callee.ret), values);
         }
-        let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
-        self.call_code(code, (params, callee.ret), values)
+        self.call_with(Callee::Reached(index), (params, callee.ret), values)
+    }
+
+    /// The lowered body of reached sysroot function `index` when a call may copy it inline: small, copyable, and not being lowered already.
+    fn inline_body(&mut self, index: usize) -> Option<Rc<Function>> {
+        if let Some(cached) = self.slots.bodies().borrow().get(&index) {
+            return cached.inline.then(|| cached.body.clone()).flatten();
+        }
+        self.slots.bodies().borrow_mut().insert(index, Lowered::default());
+        if !may_inline(self.cx, self.reached, index) {
+            return None;
+        }
+        let lowered = super::lower(self.cx, self.reached, self.slots, index).ok().map_or_else(Lowered::default, |mut body| {
+            let copyable = body.can_inline();
+            if copyable {
+                haste_codegen::simplify(&mut body);
+            }
+            let inline = copyable && body.size() <= INLINE_LIMIT;
+            Lowered { inline, body: inline.then(|| Rc::new(body)) }
+        });
+        let body = lowered.inline.then(|| lowered.body.clone()).flatten();
+        self.slots.bodies().borrow_mut().insert(index, lowered);
+        body
+    }
+
+    /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
+    fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Vec<Value> {
+        let code = match callee {
+            Callee::Code(code) => code,
+            Callee::Reached(index) => match self.inline_body(index) {
+                Some(body) => return self.b.inline(&body, values),
+                None => self.code_of(index),
+            },
+        };
+        let sig = self.b.import_signature(signature);
+        let call = self.ins().call_indirect(sig, code, values);
+        self.b.inst_results(call).to_vec()
     }
 
     fn pointer_call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
@@ -281,7 +346,11 @@ impl Lower<'_, '_> {
     }
 
     /// Calls the generated code at `code`, which takes `params` and returns `ret`, with the values of its arguments that are not zero-sized.
-    pub(super) fn call_code(&mut self, code: Value, (params, ret): (Vec<Ty>, Option<Ty>), values: Vec<Value>) -> Result<Option<Value>> {
+    pub(super) fn call_code(&mut self, code: Value, types: (Vec<Ty>, Option<Ty>), values: Vec<Value>) -> Result<Option<Value>> {
+        self.call_with(Callee::Code(code), types, values)
+    }
+
+    fn call_with(&mut self, callee: Callee, (params, ret): (Vec<Ty>, Option<Ty>), values: Vec<Value>) -> Result<Option<Value>> {
         let signature = super::signature_of(self.cx, ret, params.iter().copied())?;
         let mut values = self.pass_all(&params, values)?;
         let result = ret.map(|ret| repr(self.cx, ret)).transpose()?.unwrap_or(Repr::Zst);
@@ -295,21 +364,20 @@ impl Lower<'_, '_> {
             values.insert(0, address);
         }
         let returns = signature.returns.first().map(|param| param.value_type);
-        let sig = self.b.import_signature(signature);
-        let call = self.ins().call_indirect(sig, code, &values);
+        let results = self.emit_call(callee, signature, &values);
         if ret.is_some_and(|ret| matches!(self.cx.types.kind(ret), Kind::Never)) {
             self.ins().trap();
             self.close();
             return Ok(None);
         }
         if let (Some(out), Some(machine)) = (out, unwrapped) {
-            let value = self.b.inst_results(call)[0];
+            let value = results[0];
             self.write(Place::slot(out, result).at(0, Repr::Scalar(machine)), value);
         }
         if let Some(out) = out {
             return Ok(Some(self.ins().stack_addr(Type::I64, out, 0)));
         }
-        Ok(returns.map(|_| self.b.inst_results(call)[0]))
+        Ok(returns.map(|_| results[0]))
     }
 
     /// The argument `values` of a call that takes `params`, as they cross it: zero-sized parameters take no value, and a value whose type travels unwrapped crosses as its scalar.
@@ -378,14 +446,7 @@ impl Lower<'_, '_> {
             self.jump(exit, &[]);
         }
         self.enter(inner);
-        self.loops.push(Loop { head, exit, value: None, depth, label, block: false });
-        let result = self.expr(body);
-        self.loops.pop();
-        result?;
-        self.end_scope(depth)?;
-        self.branch_value(None, head);
-        self.enter(exit);
-        Ok(None)
+        self.loop_body((head, exit, depth), label, body)
     }
 
     fn labeled_block(&mut self, expr: ExprId, (stmts, tail): (List, Option<ExprId>), label: u32) -> Result<Option<Value>> {

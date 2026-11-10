@@ -110,7 +110,7 @@ impl Lower<'_, '_> {
             (UnOp::Neg, Num::Int { ty, signed: true }) => {
                 let min = self.min_value(ty);
                 let ok = self.ins().icmp(IntCC::NotEqual, value, min);
-                self.check(ok);
+                self.overflow_check(ok);
                 self.ins().ineg(value)
             }
             _ => bail!("cannot lower {op:?} on this type"),
@@ -133,6 +133,13 @@ impl Lower<'_, '_> {
     /// Traps unless `ok` is nonzero, where rustc's debug build panics.
     fn check(&mut self, ok: Value) {
         self.ins().trapz(ok);
+    }
+
+    /// Checks `ok` where the body's crate checks overflow, as rustc's MIR for that crate does.
+    fn overflow_check(&mut self, ok: Value) {
+        if self.overflow_checks {
+            self.check(ok);
+        }
     }
 
     pub(super) fn binary(&mut self, expr: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<Option<Value>> {
@@ -237,6 +244,13 @@ impl Lower<'_, '_> {
     }
 
     fn checked(&mut self, op: BinOp, num: (Type, bool), x: Value, y: Value) -> Result<Value> {
+        if !self.overflow_checks {
+            return Ok(match op {
+                BinOp::Add => self.ins().iadd(x, y),
+                BinOp::Sub => self.ins().isub(x, y),
+                _ => self.ins().imul(x, y),
+            });
+        }
         let (result, ok) = self.overflowing(op, num, x, y)?;
         self.check(ok);
         Ok(result)
@@ -355,9 +369,15 @@ impl Lower<'_, '_> {
 
     fn shift(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, (y, rhs): (Value, Num)) -> Result<Value> {
         let Num::Int { ty: by, .. } = rhs else { bail!("shift by a non-integer") };
-        let bits = self.int_const(by, u128::from(ty.bits()));
-        let ok = self.ins().icmp(IntCC::UnsignedLessThan, y, bits);
-        self.check(ok);
+        let y = if self.overflow_checks {
+            let bits = self.int_const(by, u128::from(ty.bits()));
+            let ok = self.ins().icmp(IntCC::UnsignedLessThan, y, bits);
+            self.check(ok);
+            y
+        } else {
+            let mask = self.int_const(by, u128::from(ty.bits() - 1));
+            self.ins().band(y, mask)
+        };
         Ok(match (op, signed) {
             (BinOp::Shl, _) => self.ins().ishl(x, y),
             (_, true) => self.ins().sshr(x, y),

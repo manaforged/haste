@@ -366,30 +366,17 @@ impl Cursor<'_> {
     }
 
     fn struct_expr(&mut self, path: super::PathId) -> Result<ExprId> {
-        let open = self.group();
         let mut base = None;
-        let mut rest = false;
-        let fields = self.inside(open, |cursor| {
-            let mut fields = Vec::new();
-            while !cursor.done() {
-                let attrs = cursor.skip_attrs()?;
-                if cursor.eat("..") {
-                    rest = true;
-                    base = if cursor.done() { None } else { Some(cursor.expr()?) };
-                    break;
-                }
-                let field = cursor.field_init()?;
-                if let Some((from, to)) = attrs {
-                    cursor.body.attrs.push((super::Node::Field(field), from, to));
-                }
-                if !cursor.configured_out(attrs) {
-                    fields.push(field);
-                }
-                if !cursor.eat(",") {
-                    break;
-                }
+        let record = |cursor: &mut Self, attrs: Option<(u32, u32)>| {
+            let field = cursor.field_init()?;
+            if let Some((from, to)) = attrs {
+                cursor.body.attrs.push((super::Node::Field(field), from, to));
             }
-            Ok(fields)
+            Ok(field)
+        };
+        let (fields, rest) = self.struct_fields(record, |cursor| {
+            base = if cursor.done() { None } else { Some(cursor.expr()?) };
+            Ok(())
         })?;
         let fields = self.list(&fields);
         Ok(self.push_expr(Expr::Struct { path, fields, base, rest }))

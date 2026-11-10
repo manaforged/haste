@@ -91,12 +91,12 @@ const PRIMITIVE_HOLDERS: [&str; 3] = ["core", "alloc", "std"];
 impl<'a> Context<'a> {
     /// The parsed header of impl `block`.
     pub fn impl_header(&mut self, block: ImplRef) -> Result<Rc<ImplHeader>> {
-        if let Some(found) = self.headers.get(&block) {
+        if let Some(found) = self.store.headers.get(&block) {
             return Ok(found.clone());
         }
         let (file, item) = (self.impl_file(block), self.impl_entry(block));
         let parsed = Rc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
-        self.headers.insert(block, parsed.clone());
+        self.store.headers.insert(block, parsed.clone());
         Ok(parsed)
     }
 
@@ -191,7 +191,7 @@ impl<'a> Context<'a> {
 
     fn owners_of(&mut self, krate: u32) -> Rc<HashMap<(u32, Option<u32>), u32>> {
         let tree = &self.outline.crates[krate as usize];
-        self.owners
+        self.store.lookups.owners
             .entry(krate)
             .or_insert_with(|| {
                 let mut map = HashMap::default();
@@ -245,11 +245,11 @@ impl<'a> Context<'a> {
 
     /// The trait that impl `block` implements, or none for an inherent impl.
     pub fn impl_trait(&mut self, block: ImplRef) -> Option<ItemRef> {
-        if let Some(&known) = self.impl_traits.get(&block) {
+        if let Some(&known) = self.store.lookups.impl_traits.get(&block) {
             return known;
         }
         let found = self.impl_trait_here(block);
-        self.impl_traits.insert(block, found);
+        self.store.lookups.impl_traits.insert(block, found);
         found
     }
 
@@ -273,7 +273,7 @@ impl<'a> Context<'a> {
             Some(BodyPath::Item(item)) => Some(Def::Item(item)),
             Some(BodyPath::Variant(_)) => None,
             Some(BodyPath::Outside(skip)) => paths.resolve(&outside(path, skip), home),
-            None => paths.resolve(path, home),
+            None => anchor.and_then(|(root, _)| self.body_use_path((root, home), path, at.map(|at| self.item(at).1.start))).or_else(|| paths.resolve(path, home)),
         }
     }
 
@@ -289,7 +289,7 @@ impl<'a> Context<'a> {
         {
             self.asks.crates.borrow_mut().push(krate);
         }
-        if let Some(found) = self.heads.get(&holder) {
+        if let Some(found) = self.store.lookups.heads.get(&holder) {
             self.asks.repeat(&found.asked);
             return found.clone();
         }
@@ -309,7 +309,7 @@ impl<'a> Context<'a> {
         }
         index.asked = self.asks.since(mark);
         let index = Rc::new(index);
-        self.heads.insert(holder, index.clone());
+        self.store.lookups.heads.insert(holder, index.clone());
         index
     }
 

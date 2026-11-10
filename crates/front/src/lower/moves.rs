@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap;
 
 use crate::body::{Expr, ExprId, Pat, PatId, Stmt, UnOp};
 use crate::sema::infer::{Res, needs_drop};
-use crate::sema::ty::Kind;
+use crate::sema::ty::{Kind, Ty};
 
 use super::Lower;
 
@@ -14,8 +14,11 @@ pub enum Root {
     Temp(ExprId),
 }
 
-/// The fields from a root down to a part of its value, each as a variant and a field index.
+/// The fields from a root down to a part of its value, each as a variant and a field index, or `BOX_STEP` into the value a `Box` owns.
 pub type MovePath = Vec<(u32, u32)>;
+
+/// The step of a move path from a `Box` into the value it owns.
+pub const BOX_STEP: (u32, u32) = (u32::MAX, 0);
 
 impl Lower<'_, '_> {
     /// The root and path of the place expression `expr`, or none when it reads through a pointer or names no local.
@@ -30,10 +33,15 @@ impl Lower<'_, '_> {
             Expr::TupleField(base, index) => (base, index),
             _ => return None,
         };
-        if self.typed.exprs[base.0 as usize].0 == u32::MAX || matches!(self.cx.types.kind(self.ty_of(base)), Kind::Ref(..) | Kind::Ptr(..)) {
+        if self.typed.exprs[base.0 as usize] == Ty::NONE || matches!(self.cx.types.kind(self.ty_of(base)), Kind::Ref(..) | Kind::Ptr(..)) {
             return None;
         }
         let (root, mut path) = self.move_path(base).or_else(|| (!self.is_place(base)).then(|| (Root::Temp(base), Vec::new())))?;
+        let mut ty = self.ty_of(base);
+        while let Some(owned) = self.cx.boxed(ty) {
+            path.push(BOX_STEP);
+            ty = owned;
+        }
         path.push((0, index));
         Some((root, path))
     }
@@ -73,7 +81,7 @@ impl Lower<'_, '_> {
             let expr = ExprId(at);
             let mut each = |lower: &mut Self, path: Option<(Root, MovePath)>| lower.add_path(&mut found, path);
             match *self.body.expr(expr) {
-                Expr::Field(..) | Expr::TupleField(..) if self.typed.exprs[at as usize].0 != u32::MAX && needs_drop(self.cx, self.ty_of(expr))? => each(self, self.move_path(expr)),
+                Expr::Field(..) | Expr::TupleField(..) if self.typed.exprs[at as usize] != Ty::NONE && needs_drop(self.cx, self.ty_of(expr))? => each(self, self.move_path(expr)),
                 Expr::Match(scrutinee, arms) => {
                     for arm in self.body.list(arms).to_vec() {
                         let pat = self.body.arms[arm as usize].pat;

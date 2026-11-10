@@ -76,8 +76,11 @@ impl Infer<'_, '_> {
             Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => Some(*pointee),
             _ => None,
         });
-        let closure = matches!(self.body.expr(inner), crate::body::Expr::Closure { .. });
-        let pointee = pointee.filter(|&ty| closure || !matches!(self.cx.types.kind(self.resolve(ty)), Kind::Dyn(..)));
+        let pointee = pointee.filter(|&ty| match self.cx.types.kind(self.resolve(ty)) {
+            Kind::Dyn(..) => matches!(self.body.expr(inner), Expr::Closure { .. }),
+            Kind::Slice(_) | Kind::Prim(Primitive::Str) => matches!(self.body.expr(inner), Expr::Array(_) | Expr::Repeat(..) | Expr::Lit(..)),
+            _ => true,
+        });
         let ty = self.expr(inner, pointee)?;
         if mutable {
             self.note_mut(inner)?;

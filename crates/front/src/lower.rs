@@ -21,6 +21,8 @@ mod promote;
 mod simd;
 mod slice_pat;
 
+pub use expr::may_inline;
+
 use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, Function, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
 
@@ -46,6 +48,18 @@ pub trait Slots {
     fn cell(&self, index: usize, size: u32) -> i64;
     /// Notes that lowering used `instance`, which was not reached, so a caller that reaches functions on demand can reach it and lower again.
     fn want(&self, _instance: crate::sema::reach::Instance) {}
+    /// The bodies that calls copy inline.
+    fn bodies(&self) -> &Bodies;
+}
+
+/// What calls learned about copying reached functions inline, by reached index.
+pub type Bodies = std::cell::RefCell<rustc_hash::FxHashMap<usize, Lowered>>;
+
+/// A reached function as calls see it: its lowered body when one was made, and whether a call may copy it inline.
+#[derive(Clone, Default)]
+pub struct Lowered {
+    pub body: Option<std::rc::Rc<Function>>,
+    pub inline: bool,
 }
 
 /// One machine word of a constant table: a number, or the code address of reached function `index`.
@@ -165,6 +179,7 @@ pub struct Lower<'l, 'a> {
     pending: Vec<drop::Pending>,
     index: usize,
     resume: Option<coroutine::Resume>,
+    overflow_checks: bool,
 }
 
 /// Whether `item` is a static, whose reached instance writes its value into the static's cell.
@@ -185,6 +200,7 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
         Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => std::rc::Rc::default(),
     };
     let src = cx.body_src(source);
+    let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
     let signature = if is_static(cx, *item) { signature_of(cx, None, [])? } else { signature(cx, typed)? };
     let mut func = Function::new(signature);
     let b = FunctionBuilder::new(&mut func);
@@ -209,6 +225,7 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
         pending: Vec::new(),
         index,
         resume: None,
+        overflow_checks,
     };
     lower.run()?;
     Ok(func)
@@ -225,9 +242,6 @@ impl Lower<'_, '_> {
         self.moved = self.moved_paths()?;
         self.declare_params(entry)?;
         let filling = is_static(self.cx, self.reached.list[self.index].0.0);
-        if filling {
-            self.mark_static()?;
-        }
         let value = self.root_value()?;
         match filling {
             true => self.fill_static(value)?,
@@ -300,7 +314,7 @@ impl Lower<'_, '_> {
         if self.resume.is_some() {
             return self.resume_finish(value);
         }
-        let ret = self.typed.ret.unwrap_or(Ty(u32::MAX));
+        let ret = self.typed.ret_ty();
         if let (Some(out), Some(value)) = (self.sret, value) {
             let Repr::Mem { size, .. } = repr(self.cx, ret)? else { bail!("result pointer for a non-memory result") };
             self.copy(out, value, size);

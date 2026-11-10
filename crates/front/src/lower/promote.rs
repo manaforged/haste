@@ -1,8 +1,8 @@
 use anyhow::Result;
-use haste_codegen::{Type, Value};
+use haste_codegen::{IntCC, Type, Value};
 
 use crate::body::{Expr, ExprId, UnOp};
-use crate::names::ItemRef;
+use crate::names::{ItemRef, Primitive};
 use crate::outline::item::ItemKind;
 use crate::sema::infer::Res;
 use crate::sema::ty::Ty;
@@ -55,12 +55,16 @@ impl Lower<'_, '_> {
         let index = self.reached_index(item, substs)?;
         let (address, size) = self.static_cell(index, ty)?;
         if !self.cx.foreign(item) && index != self.index {
-            let filled = self.ins().load(Type::I8, address, size);
+            let state = self.ins().load(Type::I8, address, size);
+            let filled = self.ins().icmp_imm(IntCC::Equal, state, crate::image::FILLED as i64);
             let (fill, done) = (self.b.create_block(), self.b.create_block());
             self.brif(filled, (done, &[]), (fill, &[]));
             self.enter(fill);
+            let usize_ty = self.cx.types.prim(Primitive::Usize);
+            let flag = self.ins().iadd_imm(address, i64::from(size));
             let code = self.code_of(index);
-            self.call_code(code, (Vec::new(), None), Vec::new())?;
+            let once = self.ins().iconst(Type::I64, crate::image::fill_once as *const () as i64);
+            self.call_code(once, (vec![usize_ty, usize_ty], None), vec![flag, code])?;
             self.jump(done, &[]);
             self.enter(done);
         }
@@ -70,26 +74,35 @@ impl Lower<'_, '_> {
     /// The address of the cell of the static whose initializer is reached function `index`, of type `ty`, and the offset of the byte after its value that says it is filled.
     fn static_cell(&mut self, index: usize, ty: Ty) -> Result<(Value, i32)> {
         let size = self.cx.layout(ty)?.size.bytes() as u32;
+        let item = self.reached.list[index].0.0;
+        if !self.cx.foreign(item) && self.cx.thread_local(item) {
+            let usize_ty = self.cx.types.prim(Primitive::Usize);
+            let code = self.ins().iconst(Type::I64, crate::image::thread_cell as *const () as i64);
+            let args = vec![self.ins().iconst(Type::I64, index as i64), self.ins().iconst(Type::I64, i64::from(size) + 1)];
+            let cell = self.call_code(code, (vec![usize_ty, usize_ty], Some(usize_ty)), args)?;
+            return Ok((cell.ok_or_else(|| anyhow::anyhow!("no thread cell"))?, size as i32));
+        }
         let cell = self.slots.cell(index, size);
         Ok((self.ins().iconst(Type::I64, cell), size as i32))
     }
 
-    /// Marks the static that this function initializes as filled, so that the uses its value reaches do not run this again.
-    pub fn mark_static(&mut self) -> Result<()> {
-        let (address, size) = self.static_cell(self.index, self.typed.ret.unwrap_or(Ty(u32::MAX)))?;
-        let one = self.ins().iconst(Type::I8, 1);
+    /// Marks the static that this function initializes as filled once its value is written, so that later uses read it without running this again.
+    fn mark_static(&mut self) -> Result<()> {
+        let (address, size) = self.static_cell(self.index, self.typed.ret_ty())?;
+        let one = self.ins().iconst(Type::I8, i64::from(crate::image::FILLED));
         self.ins().store(one, address, size);
         Ok(())
     }
 
     /// Writes `value`, the value of the static that this function initializes, into the static's cell, and returns.
     pub fn fill_static(&mut self, value: Option<Value>) -> Result<()> {
-        let ((item, substs), ty) = (self.reached.list[self.index].0.clone(), self.typed.ret.unwrap_or(Ty(u32::MAX)));
+        let ((item, substs), ty) = (self.reached.list[self.index].0.clone(), self.typed.ret_ty());
         if self.open {
             let place = self.static_place((item, &substs), ty)?;
             if let Some(value) = value {
                 self.write(place, value);
             }
+            self.mark_static()?;
         }
         self.finish(None)
     }

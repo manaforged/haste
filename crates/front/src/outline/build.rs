@@ -17,8 +17,6 @@ const INERT: &[&str] = &[
     "allow", "warn", "deny", "forbid", "expect", "inline", "cold", "must_use", "doc", "repr", "test", "ignore", "should_panic", "deprecated", "non_exhaustive", "track_caller", "automatically_derived", "no_mangle", "export_name", "link_section", "link_name", "used", "target_feature", "stable", "unstable", "const_stable", "feature", "lang", "diagnostic", "rustfmt", "clippy",
 ];
 const BUILTIN: [&str; 6] = ["include", "global_asm", "compile_error", "concat", "env", "asm"];
-/// The dependencies, in order of preference, whose `$crate` names core's traits in a derived impl: core, the shim that standard crates depend on in its place, and std.
-const CORE_HOLDERS: [&str; 3] = ["core", "rustc_std_workspace_core", "std"];
 
 /// What a macro lookup in a crate's exports found.
 enum Found {
@@ -37,10 +35,6 @@ pub struct Loader<'a> {
     pub demands: &'a mut Vec<usize>,
     pub depth: usize,
     pub scope: Option<Arc<Textual>>,
-}
-
-fn strip_raw(name: &str) -> &str {
-    name.strip_prefix("r#").unwrap_or(name)
 }
 
 impl Loader<'_> {
@@ -138,18 +132,12 @@ impl Loader<'_> {
     }
 
     fn derive(&mut self, file: &Arc<File>, module: usize, (at, item): (u32, &Item)) -> Result<()> {
-        let mut found = (Vec::new(), Vec::new());
-        derive::derives(&file.source, &item.attrs, &|cfg| self.out.env.allows(cfg), &mut found);
-        let (wanted, foreign) = found;
+        let (expanded, foreign) = derive::derived(&file.source, item, &self.out.env, (self.krate, self.deps));
         self.out.derived.extend(foreign.into_iter().map(|path| Held { file: file.clone(), owner: module, at, path }));
-        if wanted.is_empty() {
-            return Ok(());
+        match expanded {
+            Some(expanded) => self.splice(module, expanded, "derive"),
+            None => Ok(()),
         }
-        let env = &self.out.env;
-        let named = |name: &&str| self.deps.iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
-        let holder = CORE_HOLDERS.iter().find_map(named).unwrap_or(self.krate) as u32;
-        let expanded = derive::expand(&file.source, item, (&wanted, holder), &|attrs| env.enabled(attrs));
-        self.splice(module, expanded, "derive")
     }
 
     fn impl_block(&mut self, index: usize, module: usize, at: u32, file: &Arc<File>) -> Result<()> {
@@ -169,7 +157,7 @@ impl Loader<'_> {
     fn member_call(&mut self, file: &Arc<File>, block: usize, at: u32) -> Result<()> {
         let item = &file.items.items[at as usize];
         let (Some(name), Some(_)) = (item.name, item.body) else { return Ok(()) };
-        let name = strip_raw(file.source.text(name));
+        let name = crate::names::plain(file.source.text(name));
         let Some(definition) = self.lookup(file, item, name) else {
             self.out.members.push(self.waiting(file, block, at));
             return Ok(());
@@ -184,14 +172,7 @@ impl Loader<'_> {
     }
 
     fn member_at(&mut self, file: &Arc<File>, block: usize, at: u32, definition: &Macro) -> Result<()> {
-        let item = &file.items.items[at as usize];
-        let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
-        let name = strip_raw(file.source.text(name));
-        if self.depth >= DEPTH {
-            self.out.errors.push(format!("{}: macro {name} recursed past {DEPTH} levels", file.source.path.display()));
-            return Ok(());
-        }
-        let expanded = mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32), None);
+        let Some((name, expanded)) = self.expand_call(file, at, definition) else { return Ok(()) };
         let Some(expanded) = self.scanned(expanded, name) else { return Ok(()) };
         self.out.impls[block].parts.push(self.out.files.len() - 1);
         self.depth += 1;
@@ -201,7 +182,7 @@ impl Loader<'_> {
     }
 
     fn child(&mut self, file: &Arc<File>, index: usize, parent: usize, (at, item): (u32, &Item)) -> Result<()> {
-        let name = strip_raw(file.source.text(item.name.unwrap_or(item.start))).to_owned();
+        let name = crate::names::plain(file.source.text(item.name.unwrap_or(item.start))).to_owned();
         let base = &self.out.modules[parent];
         let path = self.out.env.path(&item.attrs);
         let (decl, dir) = if item.body.is_some() {
@@ -236,7 +217,7 @@ impl Loader<'_> {
         match parsed {
             Ok(rules) => {
                 let rules = if item.attrs.contains(&Attr::MacroExport(true)) { rules::local_inner(&file.source, rules) } else { rules };
-                let name = strip_raw(file.source.text(name)).to_owned();
+                let name = crate::names::plain(file.source.text(name)).to_owned();
                 let definition = Arc::new(Macro { file: file.clone(), rules, krate: self.krate });
                 self.out.defined.insert(place, definition.clone());
                 let public = item.kind == ItemKind::Macro && item.vis != super::item::Vis::Private;
@@ -324,7 +305,7 @@ impl Loader<'_> {
     fn call(&mut self, file: &Arc<File>, module: usize, at: u32) -> Result<()> {
         let item = &file.items.items[at as usize];
         let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
-        let name = strip_raw(file.source.text(name));
+        let name = crate::names::plain(file.source.text(name));
         if name == "include" {
             return self.include(file, module, open);
         }
@@ -355,15 +336,20 @@ impl Loader<'_> {
         result
     }
 
-    fn expand_at(&mut self, file: &Arc<File>, module: usize, at: u32, definition: &Macro) -> Result<()> {
+    /// The name and expansion by `definition` of the macro call item `at` of `file`, or none when it has no body or recursed too deep.
+    fn expand_call<'f>(&mut self, file: &'f Arc<File>, at: u32, definition: &Macro) -> Option<(&'f str, Result<Source>)> {
         let item = &file.items.items[at as usize];
-        let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
-        let name = strip_raw(file.source.text(name));
+        let (Some(name), Some(open)) = (item.name, item.body) else { return None };
+        let name = crate::names::plain(file.source.text(name));
         if self.depth >= DEPTH {
             self.out.errors.push(format!("{}: macro {name} recursed past {DEPTH} levels", file.source.path.display()));
-            return Ok(());
+            return None;
         }
-        let expanded = mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32), None);
+        Some((name, mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32), None)))
+    }
+
+    fn expand_at(&mut self, file: &Arc<File>, module: usize, at: u32, definition: &Macro) -> Result<()> {
+        let Some((name, expanded)) = self.expand_call(file, at, definition) else { return Ok(()) };
         self.splice(module, expanded, name)
     }
 

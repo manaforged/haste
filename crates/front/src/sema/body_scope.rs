@@ -1,9 +1,9 @@
 //! Names inside a function body: the items that its blocks and the modules it declares hold, found from the innermost scope out, as rustc resolves them.
 
-use crate::names::collect::namespaces;
+use crate::names::collect::{import_parts, namespaces};
 use crate::names::path::Path as NamePath;
-use crate::names::{ItemRef, Ns, plain};
-use crate::outline::item::{Item, ItemKind};
+use crate::names::{Binding, Def, ItemRef, ModRef, Ns, Origin, PerNs, SELF, Sym, plain};
+use crate::outline::item::{Item, ItemKind, Vis};
 
 use super::Context;
 
@@ -113,4 +113,64 @@ impl<'a> Context<'a> {
         }
         Some(BodyPath::Item(root.inner(at)))
     }
+
+    /// The bindings that the `use` declarations of the body `root` in module `home` give `word`, or every name they import when none, as code at token `here` sees them: named imports first, then globs.
+    pub(super) fn body_imports(&self, (root, home): (ItemRef, ModRef), word: Option<Sym>, here: Option<u32>) -> Vec<PerNs> {
+        let Some(found) = self.expansion(root) else { return Vec::new() };
+        let file = &found.file;
+        if file.items.imports.is_empty() {
+            return Vec::new();
+        }
+        let paths = self.paths(home.krate);
+        let (mut out, mut globs) = (Vec::new(), Vec::new());
+        for import in 0..file.items.imports.len() as u32 {
+            if !import_visible(file, import, here) {
+                continue;
+            }
+            let (segments, absolute, dollar, name) = import_parts(file, import, &self.names.symbols);
+            if name.zip(word).is_some_and(|(name, word)| name != word) {
+                continue;
+            }
+            let segments = segments.strip_suffix(&[SELF]).unwrap_or(&segments);
+            let absolute = paths.use_path(NamePath { segments, absolute, dollar }).absolute;
+            let (head, leaf) = match (name, segments.split_last(), word) {
+                (None, _, Some(word)) => (segments, word),
+                (Some(_), Some((&leaf, head)), _) => (head, leaf),
+                (None, Some(_), None) => {
+                    let glob = paths.resolve(&NamePath { segments, absolute, dollar }, home);
+                    globs.extend(glob.map(|def| PerNs { types: Some(Binding { def, vis: Vis::Pub, origin: Origin::Glob }), values: None, macros: None }));
+                    continue;
+                }
+                _ => continue,
+            };
+            let entry = match head {
+                [] => paths.first(leaf, home, &NamePath { segments: &[leaf], absolute, dollar }),
+                _ => match paths.resolve(&NamePath { segments: head, absolute, dollar }, home) {
+                    Some(def) => paths.member(def, leaf),
+                    None => continue,
+                },
+            };
+            if entry.types.is_some() || entry.values.is_some() {
+                if name.is_some() { out.push(entry) } else { globs.push(entry) }
+            }
+        }
+        out.extend(globs);
+        out
+    }
+
+    /// Resolves `path` in the type namespace through the `use` declarations of the body `root` in module `home`, as code at token `here` sees them, when one binds its first segment.
+    pub(super) fn body_use_path(&self, (root, home): (ItemRef, ModRef), path: &NamePath<'_>, here: Option<u32>) -> Option<Def> {
+        let (first, rest) = path.segments.split_first().filter(|_| !path.absolute)?;
+        let binding = self.body_imports((root, home), Some(*first), here).into_iter().find_map(|entry| entry.types)?;
+        let paths = self.paths(home.krate);
+        rest.iter().try_fold(binding.def, |def, segment| paths.member(def, *segment).types.map(|found| found.def))
+    }
+}
+
+/// Whether the `use` declaration `import` of a body's expansion `file` is in scope at token `here`, or in the body itself when `here` is none: it is unless a function declared in the body holds it and not `here`.
+fn import_visible(file: &crate::outline::tree::File, import: u32, here: Option<u32>) -> bool {
+    let items = &file.items.items;
+    let at = items[file.items.imports[import as usize].item as usize].start;
+    let holds = |entry: &crate::outline::item::Item, token: u32| entry.start <= token && token < entry.end;
+    items.iter().all(|entry| entry.kind != ItemKind::Fn || !holds(entry, at) || here.is_some_and(|here| holds(entry, here)))
 }

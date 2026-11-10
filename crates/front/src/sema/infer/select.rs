@@ -56,8 +56,7 @@ impl<'a> Infer<'_, 'a> {
             return Ok(Vec::new());
         }
         let mut found = self.impl_candidates(of, self_ty, args, depth)?;
-        let open = args.iter().any(|&arg| matches!(self.cx.types.kind(self.resolve(arg)), Kind::Var(_)));
-        if found.len() > 1 && !open {
+        if found.len() > 1 && !self.obligation_open(self_ty, args) {
             let mut kept = Vec::new();
             for entry in &found {
                 if !self.blanket(entry.0.0)? {
@@ -258,7 +257,7 @@ impl<'a> Infer<'_, 'a> {
 
     fn bound_holds(&mut self, arena: &Body, home: ModRef, (ty, bound): (Ty, u32), depth: u32) -> Result<bool> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else { return Ok(true) };
-        if self.compiler_trait(of) {
+        if self.compiler_decides(of, ty) {
             return Ok(self.compiler_holds(of, ty));
         }
         let kind = self.cx.types.kind(self.resolve(ty));
@@ -278,6 +277,12 @@ impl<'a> Infer<'_, 'a> {
             return Ok(true);
         }
         self.impl_holds((arena, home, path), (of, ty, &args), depth)
+    }
+
+    /// Whether the compiler, not an impl, decides that `ty` implements trait `of`: for its marker and auto traits, except `Copy` and `Clone` of a struct, enum or union, which derives and std write impls for.
+    fn compiler_decides(&self, of: ItemRef, ty: Ty) -> bool {
+        let by_impl = matches!(self.cx.types.kind(self.resolve(ty)), Kind::Adt(..)) && self.cx.lang(of).is_some_and(|lang| matches!(lang, "copy" | "clone"));
+        self.compiler_trait(of) && !by_impl
     }
 
     /// Whether an impl proves `ty: of<args>` for the bound at `path`, where an obligation that repeats an enclosing one is a cycle.

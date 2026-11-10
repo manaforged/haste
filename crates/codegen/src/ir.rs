@@ -270,6 +270,22 @@ impl Op {
         }
     }
 
+    /// Replaces every block this instruction can go to with `f` of it.
+    pub(crate) fn map_targets(&mut self, mut f: impl FnMut(Block) -> Block) {
+        match self {
+            Op::Jump(block, _) => *block = f(*block),
+            Op::Brif(_, then, _, otherwise, _) => {
+                *then = f(*then);
+                *otherwise = f(*otherwise);
+            }
+            Op::TryCall { normal, handler, .. } => {
+                *normal = f(*normal);
+                *handler = f(*handler);
+            }
+            _ => {}
+        }
+    }
+
     /// Every value this instruction reads, once per read.
     pub(crate) fn operands(&self) -> Vec<Value> {
         match self {
@@ -365,6 +381,16 @@ impl Function {
     /// The type of `value`.
     pub fn ty(&self, value: Value) -> Type {
         self.types[value.index()]
+    }
+
+    /// The number of instructions in the body.
+    pub fn size(&self) -> usize {
+        self.insts.len()
+    }
+
+    /// Whether `FunctionBuilder::inline` can copy this function into a caller: it is no coroutine, catches no unwind and reads no frame pointer.
+    pub fn can_inline(&self) -> bool {
+        self.coroutine.is_none() && self.entry.is_some() && !self.insts.iter().any(|data| matches!(data.op, Op::TryCall { .. } | Op::FramePointer))
     }
 }
 

@@ -190,6 +190,29 @@ impl<'a> Cursor<'a> {
         PathId(self.body.paths.len() as u32 - 1)
     }
 
+    /// The fields of the brace group at the cursor that the configuration keeps, each read by `field` with its attributes, and whether a `..` ends them, after which `rest` reads what follows.
+    pub fn struct_fields(&mut self, mut field: impl FnMut(&mut Self, Option<(u32, u32)>) -> Result<u32>, rest: impl FnOnce(&mut Self) -> Result<()>) -> Result<(Vec<u32>, bool)> {
+        let open = self.group();
+        self.inside(open, |cursor| {
+            let mut fields = Vec::new();
+            while !cursor.done() {
+                let attrs = cursor.skip_attrs()?;
+                if cursor.eat("..") {
+                    rest(cursor)?;
+                    return Ok((fields, true));
+                }
+                let at = field(cursor, attrs)?;
+                if !cursor.configured_out(attrs) {
+                    fields.push(at);
+                }
+                if !cursor.eat(",") {
+                    break;
+                }
+            }
+            Ok((fields, false))
+        })
+    }
+
     pub fn skip_attrs(&mut self) -> Result<Option<(u32, u32)>> {
         let start = self.at;
         while self.punct("#") {

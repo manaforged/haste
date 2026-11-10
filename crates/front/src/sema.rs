@@ -57,9 +57,9 @@ struct Lookups {
     closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
     futures: HashMap<ty::Ty, ty::Ty>,
-    lang_of: HashMap<ItemRef, Option<u32>>,
-    scope_traits: HashMap<ModRef, Rc<[ItemRef]>>,
-    type_defs: HashMap<TypeKey, crate::names::Def>,
+    lang_of: std::cell::RefCell<HashMap<ItemRef, Option<u32>>>,
+    scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
+    type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
     impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
 }
 
@@ -96,11 +96,11 @@ impl Store {
         });
         kept.modules.retain(|krate, _| !edited.touches_crate(*krate));
         kept.owners.retain(|krate, _| !edited.touches_crate(*krate));
-        kept.scope_traits.retain(|home, _| !edited.touches_crate(home.krate));
-        kept.type_defs.retain(|key, _| !edited.touches_crate(key.0.krate));
+        kept.scope_traits.get_mut().retain(|home, _| !edited.touches_crate(home.krate));
+        kept.type_defs.get_mut().retain(|key, _| !edited.touches_crate(key.0.krate));
         kept.trait_defs.retain(|item, _| !mine(*item));
         kept.discriminants.retain(|item, _| !mine(*item));
-        kept.lang_of.retain(|item, _| !mine(*item));
+        kept.lang_of.get_mut().retain(|item, _| !mine(*item));
     }
 
     /// The indexes of the instances in `list` that are functions `edited` holds or take a type that names one of its items.
@@ -175,30 +175,9 @@ pub struct Context<'a> {
     pub names: &'a Names,
     pub types: Types,
     pub asks: Asks,
-    modules: HashMap<u32, Rc<HashMap<(u32, u32), u32>>>,
-    signatures: HashMap<ItemRef, Rc<Signature>>,
-    bodies: HashMap<ItemRef, Rc<Body>>,
-    adts: HashMap<ItemRef, Rc<AdtDef>>,
-    layouts: HashMap<ty::Ty, Rc<layout::Layout>>,
-    headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
-    heads: HashMap<impls::Holder, Rc<impls::Index>>,
-    owners: HashMap<u32, Rc<HashMap<(u32, Option<u32>), u32>>>,
-    trait_defs: HashMap<ItemRef, Rc<traits::TraitGenerics>>,
-    discriminants: HashMap<ItemRef, Rc<[i128]>>,
-    langs: Option<(Rc<HashMap<String, ItemRef>>, Rc<[u32]>)>,
-    drops: HashMap<ty::Ty, bool>,
-    closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
-    finals: HashMap<reach::Instance, Rc<infer::Typed>>,
-    tails: HashMap<ty::Ty, ty::Ty>,
-    reveals: HashMap<reach::Instance, Option<ty::Ty>>,
-    futures: HashMap<ty::Ty, ty::Ty>,
+    store: Store,
     kids: std::cell::RefCell<HashMap<usize, Rc<Kids>>>,
-    lang_of: std::cell::RefCell<HashMap<ItemRef, Option<u32>>>,
-    scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
     trait_members: std::cell::RefCell<HashMap<ItemRef, Rc<HashMap<&'a str, ItemRef>>>>,
-    /// The type-namespace items that paths name, by home module, body root, nested instance, segments, `::` and `$crate`.
-    pub type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
-    impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
     impl_members: std::cell::RefCell<HashMap<impls::ImplRef, Rc<HashMap<&'a str, ItemRef>>>>,
 }
 
@@ -210,12 +189,10 @@ type Kids = HashMap<Option<u32>, Rc<[u32]>>;
 
 impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
-    pub fn new(outline: &'a Outline, names: &'a Names, store: Store) -> Context<'a> {
-        let Store { types, signatures, bodies, adts, layouts, tails, headers, finals, lookups } = store;
-        let Lookups { modules, heads, owners, trait_defs, discriminants, langs, drops, closures, reveals, futures, lang_of, scope_traits, type_defs, impl_traits } = lookups;
-        let (lang_of, scope_traits, type_defs) = (lang_of.into(), scope_traits.into(), type_defs.into());
+    pub fn new(outline: &'a Outline, names: &'a Names, mut store: Store) -> Context<'a> {
+        let types = std::mem::take(&mut store.types);
         let (kids, trait_members, impl_members, asks) = Default::default();
-        Context { outline, names, types, asks, modules, signatures, bodies, adts, layouts, headers, heads, owners, trait_defs, discriminants, langs, drops, closures, finals, reveals, futures, tails, kids, lang_of, scope_traits, trait_members, type_defs, impl_traits, impl_members }
+        Context { outline, names, types, asks, store, kids, trait_members, impl_members }
     }
 
     /// Whether no lookup in this pass asked the front end for anything, so another pass would find the same.
@@ -224,24 +201,14 @@ impl<'a> Context<'a> {
     }
 
     /// Ends the pass: the store for the next one, and what lookups asked the front end to load or resolve.
-    pub fn release(self) -> (Store, Asks) {
-        let lookups = Lookups {
-            modules: self.modules,
-            heads: self.heads,
-            owners: self.owners,
-            trait_defs: self.trait_defs,
-            discriminants: self.discriminants,
-            langs: self.langs,
-            drops: self.drops,
-            closures: self.closures,
-            reveals: self.reveals,
-            futures: self.futures,
-            lang_of: self.lang_of.into_inner(),
-            scope_traits: self.scope_traits.into_inner(),
-            type_defs: self.type_defs.into_inner(),
-            impl_traits: self.impl_traits,
-        };
-        (Store { types: self.types, signatures: self.signatures, bodies: self.bodies, adts: self.adts, layouts: self.layouts, tails: self.tails, headers: self.headers, finals: self.finals, lookups }, self.asks)
+    pub fn release(mut self) -> (Store, Asks) {
+        self.store.types = self.types;
+        (self.store, self.asks)
+    }
+
+    /// The type-namespace items that paths name, by home module, body root, nested instance, segments, `::` and `$crate`.
+    pub fn type_defs(&self) -> &std::cell::RefCell<HashMap<TypeKey, crate::names::Def>> {
+        &self.store.lookups.type_defs
     }
 
     /// The source file and outline entry of `item`.
@@ -295,27 +262,27 @@ impl<'a> Context<'a> {
 
     /// What the body that defines the closure type `ty` inferred for it.
     pub fn closure(&self, ty: ty::Ty) -> Option<Rc<infer::ClosureInfo>> {
-        self.closures.get(&ty).cloned()
+        self.store.lookups.closures.get(&ty).cloned()
     }
 
     /// The output of the async fn future `ty` that a call named while its body was still being inferred, from the declared return type.
     pub fn future_output(&self, ty: ty::Ty) -> Option<ty::Ty> {
-        self.futures.get(&ty).copied()
+        self.store.lookups.futures.get(&ty).copied()
     }
 
     /// Records what the body that defines the closure type `ty` inferred for it.
     pub fn set_closure(&mut self, ty: ty::Ty, info: infer::ClosureInfo) {
-        self.closures.insert(ty, Rc::new(info));
+        self.store.lookups.closures.insert(ty, Rc::new(info));
     }
 
     /// The tuple of the captures of the closure type `ty`, which is how the closure is laid out and dropped.
     pub fn closure_env(&self, ty: ty::Ty) -> Option<ty::Ty> {
-        self.closures.get(&ty).map(|info| info.env)
+        self.store.lookups.closures.get(&ty).map(|info| info.env)
     }
 
     /// Whether the code of the closure type `ty` takes the address of its environment first, which only a closure that captures something does.
     pub fn closure_takes_env(&self, ty: ty::Ty) -> bool {
-        self.closures.get(&ty).is_some_and(|info| !info.closure.captures.is_empty())
+        self.store.lookups.closures.get(&ty).is_some_and(|info| !info.closure.captures.is_empty())
     }
 
     /// The type that `ty` owns when it is a `Box`.
@@ -328,7 +295,7 @@ impl<'a> Context<'a> {
 
     /// Whether a call of the closure type `ty` consumes the closure, because its body moves a captured value out.
     pub fn closure_consumes(&self, ty: ty::Ty) -> bool {
-        self.closures.get(&ty).is_some_and(|info| info.closure.consumes)
+        self.store.lookups.closures.get(&ty).is_some_and(|info| info.closure.consumes)
     }
 
     /// A short spelling of `ty`, each type in it first passed through `resolve`.
@@ -400,7 +367,7 @@ impl<'a> Context<'a> {
 
     fn modules_of(&mut self, krate: u32) -> Rc<HashMap<(u32, u32), u32>> {
         let tree = &self.outline.crates[krate as usize];
-        self.modules
+        self.store.lookups.modules
             .entry(krate)
             .or_insert_with(|| {
                 let pairs = (0..tree.modules.len()).flat_map(|module| items_of(tree, module).into_iter().map(move |pair| (pair, module as u32)));
@@ -411,7 +378,7 @@ impl<'a> Context<'a> {
 
     /// The parsed header of the function `item`.
     pub fn signature(&mut self, item: ItemRef) -> Result<Rc<Signature>> {
-        if let Some(found) = self.signatures.get(&item) {
+        if let Some(found) = self.store.signatures.get(&item) {
             return Ok(found.clone());
         }
         let (src, entry) = self.item(item);
@@ -420,13 +387,13 @@ impl<'a> Context<'a> {
             _ => sig::signature(src, entry.start, entry.body.unwrap_or(entry.end), &self.outline.crates[item.krate as usize].env)?,
         };
         let parsed = Rc::new(parsed);
-        self.signatures.insert(item, parsed.clone());
+        self.store.signatures.insert(item, parsed.clone());
         Ok(parsed)
     }
 
     /// The parsed body of the function `item`.
     pub fn body(&mut self, item: ItemRef) -> Result<Rc<Body>> {
-        if let Some(found) = self.bodies.get(&item) {
+        if let Some(found) = self.store.bodies.get(&item) {
             return Ok(found.clone());
         }
         let mut parsed = self.parse_body(item)?;
@@ -435,7 +402,7 @@ impl<'a> Context<'a> {
             parsed = crate::body::parse_params(self.body_src(item), parsed, &sig.param_starts)?;
         }
         let parsed = Rc::new(parsed);
-        self.bodies.insert(item, parsed.clone());
+        self.store.bodies.insert(item, parsed.clone());
         Ok(parsed)
     }
 
@@ -449,7 +416,7 @@ impl<'a> Context<'a> {
 
     /// The parsed definition of the struct, enum or union `item`.
     pub fn adt_def(&mut self, item: ItemRef) -> Result<Rc<AdtDef>> {
-        if let Some(found) = self.adts.get(&item) {
+        if let Some(found) = self.store.adts.get(&item) {
             return Ok(found.clone());
         }
         let (src, entry) = self.item(item);
@@ -458,7 +425,7 @@ impl<'a> Context<'a> {
         let env = &self.outline.crates[item.krate as usize].env;
         parsed.configure(src, &|attrs| env.enabled(attrs));
         let parsed = Rc::new(parsed);
-        self.adts.insert(item, parsed.clone());
+        self.store.adts.insert(item, parsed.clone());
         Ok(parsed)
     }
 

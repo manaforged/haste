@@ -3,9 +3,8 @@ use anyhow::{Result, bail};
 use crate::body::sig::{Generic, GenericKind};
 use crate::body::{self as syntax, Args, Body, GenericArg, PathId, TyId};
 use crate::names::path::Path as NamePath;
-use crate::names::collect::import_parts;
-use crate::names::{Binding, Def, ItemRef, Ns, Origin, PerNs, Primitive, SELF, Sym, Symbols, plain};
-use crate::outline::item::{ItemKind, Vis};
+use crate::names::{Def, ItemRef, Ns, PerNs, Primitive, Sym, Symbols, plain};
+use crate::outline::item::ItemKind;
 use crate::outline::source::{Mark, Source};
 
 use super::super::body_scope::{BodyPath, outside};
@@ -77,11 +76,11 @@ impl<'a> Infer<'_, 'a> {
         }
         let here = self.anchor().and_then(|(root, from)| from.map(|at| root.inner(at)));
         let key = (self.home, self.root, here, path.segments.to_vec(), path.absolute, path.dollar);
-        if let Some(&found) = self.cx.type_defs.borrow().get(&key) {
+        if let Some(&found) = self.cx.type_defs().borrow().get(&key) {
             return Some(found);
         }
         let found = self.type_def_here(path)?;
-        self.cx.type_defs.borrow_mut().insert(key, found);
+        self.cx.type_defs().borrow_mut().insert(key, found);
         Some(found)
     }
 
@@ -157,48 +156,10 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn body_imports(&mut self, word: Option<Sym>) -> Vec<PerNs> {
-        let Some((root, found)) = self.root.and_then(|root| Some((root, self.cx.expansion(root)?))) else { return Vec::new() };
-        let file = &found.file;
-        if file.items.imports.is_empty() {
-            return Vec::new();
-        }
+        let Some(root) = self.root.filter(|&root| self.cx.expansion(root).is_some_and(|found| !found.file.items.imports.is_empty())) else { return Vec::new() };
         let Ok(home) = self.cx.module_of(root) else { return Vec::new() };
-        let paths = self.cx.paths(home.krate);
-        let (mut out, mut globs) = (Vec::new(), Vec::new());
         let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()).map(|item| self.cx.item(item).1.start);
-        for import in 0..file.items.imports.len() as u32 {
-            if !import_visible(file, import, here) {
-                continue;
-            }
-            let (segments, absolute, dollar, name) = import_parts(file, import, &self.cx.names.symbols);
-            if name.zip(word).is_some_and(|(name, word)| name != word) {
-                continue;
-            }
-            let segments = segments.strip_suffix(&[SELF]).unwrap_or(&segments);
-            let absolute = paths.use_path(NamePath { segments, absolute, dollar }).absolute;
-            let (head, leaf) = match (name, segments.split_last(), word) {
-                (None, _, Some(word)) => (segments, word),
-                (Some(_), Some((&leaf, head)), _) => (head, leaf),
-                (None, Some(_), None) => {
-                    let glob = paths.resolve(&NamePath { segments, absolute, dollar }, home);
-                    globs.extend(glob.map(|def| PerNs { types: Some(Binding { def, vis: Vis::Pub, origin: Origin::Glob }), values: None, macros: None }));
-                    continue;
-                }
-                _ => continue,
-            };
-            let entry = match head {
-                [] => paths.first(leaf, home, &NamePath { segments: &[leaf], absolute, dollar }),
-                _ => match paths.resolve(&NamePath { segments: head, absolute, dollar }, home) {
-                    Some(def) => paths.member(def, leaf),
-                    None => continue,
-                },
-            };
-            if entry.types.is_some() || entry.values.is_some() {
-                if name.is_some() { out.push(entry) } else { globs.push(entry) }
-            }
-        }
-        out.extend(globs);
-        out
+        self.cx.body_imports((root, home), word, here)
     }
 
     /// The item named `name` that a block around the use declares.
@@ -640,12 +601,4 @@ pub fn parse_int(text: &str) -> Result<(u128, Option<Primitive>)> {
     let value = u128::from_str_radix(number, radix)?;
     let suffix = if suffix.is_empty() { None } else { Some(Primitive::named(suffix).ok_or_else(|| anyhow::anyhow!("bad suffix {suffix}"))?) };
     Ok((value, suffix))
-}
-
-/// Whether the `use` declaration `import` of a body's expansion `file` is in scope at token `here`, or in the body itself when `here` is none: it is unless a function declared in the body holds it and not `here`.
-fn import_visible(file: &crate::outline::tree::File, import: u32, here: Option<u32>) -> bool {
-    let items = &file.items.items;
-    let at = items[file.items.imports[import as usize].item as usize].start;
-    let holds = |entry: &crate::outline::item::Item, token: u32| entry.start <= token && token < entry.end;
-    items.iter().all(|entry| entry.kind != ItemKind::Fn || !holds(entry, at) || here.is_some_and(|here| holds(entry, here)))
 }

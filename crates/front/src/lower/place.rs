@@ -281,8 +281,13 @@ impl Lower<'_, '_> {
             let field = self.ins().iadd_imm(source, i64::from(offset));
             values.push(self.invoke(item, &substs, vec![field])?);
         }
-        let Some(tuple) = crate::sema::infer::cloned_tuple(self.cx, ty) else { bail!("a compiler-made clone of a type that is not a tuple or closure") };
-        self.tuple_from(tuple, values)
+        match crate::sema::infer::cloned_tuple(self.cx, ty) {
+            Some(tuple) => self.tuple_from(tuple, values),
+            None => {
+                let whole = repr(self.cx, ty)?;
+                Ok(self.read(Place { base: Base::Addr(source), offset: 0, repr: whole }))
+            }
+        }
     }
 
     fn tuple_from(&mut self, ty: Ty, values: Vec<Option<Value>>) -> Result<Option<Value>> {

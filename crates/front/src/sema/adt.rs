@@ -20,12 +20,12 @@ const REPR_INTS: [(&str, Primitive); 12] = {
 impl<'a> Context<'a> {
     /// The discriminant of each variant of the enum `item`: its written value, or one more than the previous.
     pub fn discriminants(&mut self, item: ItemRef) -> Result<Rc<[i128]>> {
-        if let Some(found) = self.discriminants.get(&item) {
+        if let Some(found) = self.store.lookups.discriminants.get(&item) {
             return Ok(found.clone());
         }
         let primitive = self.discriminant_primitive(item);
         let found: Rc<[i128]> = super::infer::discriminants(self, item, primitive)?.into();
-        self.discriminants.insert(item, found.clone());
+        self.store.lookups.discriminants.insert(item, found.clone());
         Ok(found)
     }
 
@@ -69,10 +69,10 @@ impl<'a> Context<'a> {
 
     /// The value of `#[lang = "..."]` on `item`.
     pub fn lang(&self, item: ItemRef) -> Option<&'a str> {
-        let cached = self.lang_of.borrow().get(&item).copied();
+        let cached = self.store.lookups.lang_of.borrow().get(&item).copied();
         let at = cached.unwrap_or_else(|| {
             let found = self.attr_at(item, "lang");
-            self.lang_of.borrow_mut().insert(item, found);
+            self.store.lookups.lang_of.borrow_mut().insert(item, found);
             found
         })?;
         Some(self.item(item).0.text(at + 2).trim_matches('"'))
@@ -82,6 +82,11 @@ impl<'a> Context<'a> {
     pub fn attr_value(&self, item: ItemRef, key: &str) -> Option<&'a str> {
         let at = self.attr_at(item, key)?;
         Some(self.item(item).0.text(at + 2).trim_matches('"'))
+    }
+
+    /// Whether the static `item` is `#[thread_local]`, with one cell per thread.
+    pub fn thread_local(&self, item: ItemRef) -> bool {
+        self.attr_at(item, "thread_local").is_some()
     }
 
     /// The token of the attribute `key` that `item` carries, through `cfg_attr` whose cfg holds.

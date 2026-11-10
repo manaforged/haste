@@ -85,8 +85,13 @@ impl Infer<'_, '_> {
         };
         let local = self.new_local(local_ty, mutable && !by_ref);
         self.out.binds.insert(pat, local);
-        self.scopes.push(((plain(self.src.text(name)), self.src.scope(name).0), local));
+        self.scope_name(name, local);
         sub.map_or(Ok(()), |sub| self.pat(sub, ty, mode))
+    }
+
+    /// Puts `local` in scope under the name at token `name`, without its `r#` prefix.
+    pub(super) fn scope_name(&mut self, name: u32, local: u32) {
+        self.scopes.push(((plain(self.src.text(name)), self.src.scope(name).0), local));
     }
 
     fn value_pat(&mut self, expr: crate::body::ExprId, ty: Ty) -> Result<()> {

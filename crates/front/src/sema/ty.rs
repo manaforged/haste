@@ -6,6 +6,11 @@ use crate::names::{ItemRef, Primitive};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ty(pub u32);
 
+impl Ty {
+    /// The type of an expression or result that inference gave no type.
+    pub const NONE: Ty = Ty(u32::MAX);
+}
+
 /// Whether a reference or pointer allows writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mut {

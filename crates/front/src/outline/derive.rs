@@ -9,6 +9,10 @@ use crate::names::Primitive;
 use super::attr::split_commas;
 use super::item::{Attr, Item, ItemKind};
 use super::source::{Source, Tokens};
+use super::tree::Env;
+
+/// The dependencies, in order of preference, whose `$crate` names core's traits in a derived impl: core, the shim that standard crates depend on in its place, and std.
+const CORE_HOLDERS: [&str; 3] = ["core", "rustc_std_workspace_core", "std"];
 
 /// A trait whose impl `#[derive]` writes by the compiler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +58,19 @@ pub fn derives(src: &Source, attrs: &[Attr], holds: &dyn Fn(&Cfg) -> bool, into:
             _ => {}
         }
     }
+}
+
+/// The impls of the builtin derives that `item` of `src` asks for in crate `krate` with dependencies `deps` under `env`, and the paths of the other derives it asks for.
+pub fn derived(src: &Source, item: &Item, env: &Env, (krate, deps): (usize, &[(String, usize)])) -> (Option<Result<Source>>, Vec<(u32, u32)>) {
+    let mut found = (Vec::new(), Vec::new());
+    derives(src, &item.attrs, &|cfg| env.allows(cfg), &mut found);
+    let (wanted, foreign) = found;
+    if wanted.is_empty() {
+        return (None, foreign);
+    }
+    let named = |name: &&str| deps.iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
+    let holder = CORE_HOLDERS.iter().find_map(named).unwrap_or(krate) as u32;
+    (Some(expand(src, item, (&wanted, holder), &|attrs| env.enabled(attrs))), foreign)
 }
 
 /// The impls of the builtin derives `wanted` for the struct, enum or union `item` of `src`, naming core's traits through `$crate` of crate `holder`, over the variants and fields that `enabled` keeps.

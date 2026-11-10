@@ -140,29 +140,19 @@ fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
 }
 
 /// Loads and resolves what a sema pass asked for, and returns the store for the next pass and whether the outline changed.
-fn answer(names: &mut Names, outline: &mut outline::Outline, (mut store, asks): (sema::Store, haste_front::names::path::Asks)) -> Result<(sema::Store, bool)> {
-    let more = haste_front::macros::answer(outline, names, asks)?;
-    store.forget_lookups();
-    Ok((store, more))
-}
-
 fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let started = Instant::now();
     let (mut outline, mut names) = demand_front(workspace, targets)?;
     let front = started.elapsed();
     let cases = case_items(workspace, &outline);
-    let (mut store, mut passes) = (sema::Store::default(), 0);
-    let failures = loop {
+    let mut passes = 0;
+    let failures = haste_front::macros::settle_sema(&mut outline, &mut names, haste_front::macros::answer, |mut cx, last| {
         passes += 1;
-        let mut cx = sema::Context::new(&outline, &names, store);
         let failures = typeck_pass(&mut cx, &cases);
+        let settled = cx.settled();
         let released = cx.release();
-        let more;
-        (store, more) = answer(&mut names, &mut outline, released)?;
-        if !more {
-            break failures;
-        }
-    };
+        Ok(if settled || last { Ok(failures) } else { Err(released) })
+    })?;
     let failed: usize = failures.values().map(Vec::len).sum();
     print_failures(&failures);
     let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;

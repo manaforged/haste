@@ -1,0 +1,10 @@
+[package]
+name = "pm-probe"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+members = ["derive"]
+
+[dependencies]
+pm-derive = { path = "derive" }

@@ -106,9 +106,7 @@ impl Image {
     fn collect(&mut self, mut worker: Worker, work: &[usize], jobs: usize) -> Vec<(usize, String)> {
         let mut text = String::new();
         let read = worker.report.read_to_string(&mut text);
-        let mut status = 0;
-        // SAFETY: pid is a child this process forked, and status is a live local.
-        unsafe { libc::waitpid(worker.pid, &mut status, 0) };
+        let status = super::wait(worker.pid);
         let mut errors = Vec::new();
         for line in text.lines() {
             let mut parts = line.splitn(3, ' ');

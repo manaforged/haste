@@ -59,6 +59,7 @@ pub struct Demand {
     compiled: HashSet<usize>,
     children: Vec<Option<Child>>,
     strict: bool,
+    expanded: HashSet<usize>,
 }
 
 /// Runs the binary whose `main` is `main` with `args` as argv, compiling each function when the program first calls it, and returns the program's exit status.
@@ -102,18 +103,12 @@ impl Driver for Program<'_> {
 
 /// For each program whose `main` is in `mains`, its two roots, `lang_start` at the return type of `main` and `main`, or why it has none, once inference settles on them; with the store inference kept.
 pub fn entries(outline: &mut Outline, names: &mut Names, mains: &[Option<ItemRef>]) -> Result<(Vec<Result<[Instance; 2], String>>, Store)> {
-    let mut store = Store::default();
-    loop {
-        let mut cx = Context::new(outline, names, store);
+    crate::macros::settle_sema(outline, names, crate::macros::answer, |mut cx, last| {
         let roots = mains.iter().map(|main| main.ok_or_else(|| "no `fn main`".to_owned()).and_then(|item| main_roots(&mut cx, item).map_err(|error| format!("{error:#}")))).collect();
         let settled = cx.settled();
-        let (mut kept, asked) = cx.release();
-        if settled || !crate::macros::answer(outline, names, asked)? {
-            return Ok((roots, kept));
-        }
-        kept.forget_lookups();
-        store = kept;
-    }
+        let released = cx.release();
+        Ok(if settled || last { Ok((roots, released.0)) } else { Err(released) })
+    })
 }
 
 /// Answers the asks of the children `driver` forks on `demand` until none is left, answering what inference asks for with `ask`, and returns the store inference kept.
@@ -162,7 +157,7 @@ impl Demand {
         let mut image = Image::new(&reached)?;
         image.stubs.reserve(TABLE_SLOTS * stub::STUB_BYTES).map_err(|error| anyhow!(error))?;
         image.memory.reserve(CODE_BYTES).map_err(|error| anyhow!(error))?;
-        Ok(Demand { reached, image, compiled: HashSet::default(), children: Vec::new(), strict: true })
+        Ok(Demand { reached, image, compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
     }
 
     /// The index of `instance`, whose slot holds its stub when it is new.
@@ -178,17 +173,11 @@ impl Demand {
     /// Forks a child that runs `body` on the image, with an output pipe when `piped`, and exits with the status `body` returns; returns the child's id.
     pub fn fork(&mut self, piped: bool, body: impl FnOnce(&Image, Option<std::fs::File>) -> i32) -> Result<usize> {
         let Some(stubs) = self.image.stubs.span() else { bail!("no stub memory") };
-        let (ask, answer) = (pipe()?, pipe()?);
-        let out = if piped { Some(pipe()?) } else { None };
+        let (ask, answer) = (super::pipe()?, super::pipe()?);
+        let out = if piped { Some(super::pipe()?) } else { None };
         stub::connect(self.image.table, stubs, (ask[1], answer[0]));
-        std::io::stdout().flush()?;
-        // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            bail!("fork failed: {}", std::io::Error::last_os_error());
-        }
-        if pid == 0 {
-            super::quiet_crashes();
+        let image = &self.image;
+        let pid = super::fork_child(|| {
             // SAFETY: the child closes the ends that only the compiler uses and owns the write end of its output pipe from here on.
             let out = unsafe {
                 libc::close(ask[0]);
@@ -198,10 +187,8 @@ impl Demand {
                     std::fs::File::from_raw_fd(write)
                 })
             };
-            let status = body(&self.image, out);
-            // SAFETY: _exit ends the child without running the parent's destructors.
-            unsafe { libc::_exit(status) }
-        }
+            body(image, out)
+        })?;
         // SAFETY: the parent owns ask[0], answer[1] and the read end of the output pipe from here on, and closes the ends that only the child uses.
         let child = unsafe {
             libc::close(ask[1]);
@@ -285,6 +272,7 @@ impl Demand {
         let answer = self.code(cx, index, &mut journal);
         if matches!(answer, Err(Stop::Asked)) {
             journal.iter().for_each(|&at| self.reached.forget(at));
+            self.expanded.clear();
         }
         answer
     }
@@ -318,7 +306,7 @@ impl Demand {
         Ok(self.image.slot(index).load(Ordering::Acquire))
     }
 
-    /// Infers function `index` and every function it calls, declaring those, and returns their indexes.
+    /// Infers function `index`, every function it calls, and every function that a callee calls copies inline, declaring those, and returns their indexes.
     fn infer(&mut self, cx: &mut Context<'_>, index: usize, journal: &mut Journal) -> Result<Vec<usize>, Stop> {
         if infer_declared(cx, &mut self.reached, index) {
             journal.push(index);
@@ -327,7 +315,19 @@ impl Demand {
             return Err(self.stop(cx, error.clone(), self.reached.list[index].0.0));
         }
         let wanted: Vec<Instance> = calls(cx, &self.reached.list[index].1).collect();
-        self.reach(cx, wanted, journal)
+        let mut callees = self.reach(cx, wanted, journal)?;
+        let mut seen: rustc_hash::FxHashSet<usize> = callees.iter().copied().collect();
+        let mut next = 0;
+        while let Some(&at) = callees.get(next) {
+            next += 1;
+            if !self.expanded.insert(at) || !crate::lower::may_inline(cx, &self.reached, at) {
+                continue;
+            }
+            let inner: Vec<Instance> = calls(cx, &self.reached.list[at].1).collect();
+            let reached = self.reach(cx, inner, journal)?;
+            callees.extend(reached.into_iter().filter(|callee| seen.insert(*callee)));
+        }
+        Ok(callees)
     }
 
     /// Declares and infers the functions `wanted`, and returns their indexes.
@@ -356,14 +356,4 @@ impl Demand {
     fn stop(&self, cx: &Context<'_>, error: String, item: ItemRef) -> Stop {
         if self.strict && !cx.settled() { Stop::Asked } else { Stop::Failed(error, item) }
     }
-}
-
-/// A new pipe whose ends close when the program executes another one.
-fn pipe() -> Result<[i32; 2]> {
-    let mut ends = [0; 2];
-    // SAFETY: ends is a live two-element array for the new descriptors.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        bail!("pipe failed: {}", std::io::Error::last_os_error());
-    }
-    Ok(ends)
 }

@@ -12,12 +12,12 @@ impl Infer<'_, '_> {
     /// Whether dropping a value of `ty` runs code: a `Drop` impl of its own or of a part.
     pub fn needs_drop(&mut self, ty: Ty) -> Result<bool> {
         let ty = self.resolve(ty);
-        if let Some(&known) = self.cx.drops.get(&ty) {
+        if let Some(&known) = self.cx.store.lookups.drops.get(&ty) {
             return Ok(known);
         }
-        self.cx.drops.insert(ty, false);
+        self.cx.store.lookups.drops.insert(ty, false);
         let needs = self.parts_need_drop(ty)?;
-        self.cx.drops.insert(ty, needs);
+        self.cx.store.lookups.drops.insert(ty, needs);
         Ok(needs)
     }
 
@@ -75,7 +75,7 @@ pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
     let mut seen = rustc_hash::FxHashSet::default();
     let mut calls = Vec::new();
     for ty in typed.locals.iter().map(|local| local.ty).chain(typed.exprs.iter().copied()) {
-        if ty.0 != u32::MAX && seen.insert(ty) {
+        if ty != Ty::NONE && seen.insert(ty) {
             calls.extend(glue_call(cx, ty)?);
         }
     }

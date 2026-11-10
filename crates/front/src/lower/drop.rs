@@ -2,10 +2,10 @@ use anyhow::{Result, bail};
 use haste_codegen::{IntCC, StackSlot, Type, Value};
 
 use crate::body::ExprId;
-use crate::sema::infer::{Res, Shape, field_types, has_drop_impl, needs_drop};
+use crate::sema::infer::{Res, Shape, drop_fn, field_types, has_drop_impl, needs_drop};
 use crate::sema::ty::{Kind, Ty};
 
-use super::moves::{MovePath, Root};
+use super::moves::{BOX_STEP, MovePath, Root};
 use super::place::{Base, Place};
 use super::{Lower, Repr, repr};
 
@@ -238,12 +238,29 @@ impl Lower<'_, '_> {
         let parts = &self.owned[at].parts;
         let below = parts.iter().any(|(part, _)| part.len() > path.len() && part.starts_with(path));
         let flag = parts.iter().find(|(part, _)| part == path).map(|&(_, slot)| slot).filter(|_| !path.is_empty());
+        let inside: MovePath = path.iter().copied().chain([BOX_STEP]).collect();
+        let into_box = parts.iter().any(|(part, _)| part.starts_with(&inside));
         let opened = below && !has_drop_impl(self.cx, ty)?;
-        let run = |lower: &mut Self| if opened { lower.open_drop(at, path, ty, place) } else { lower.glue(ty, place) };
+        let run = |lower: &mut Self| match (into_box, opened) {
+            (true, _) => lower.open_box(at, &inside, ty, place),
+            (false, true) => lower.open_drop(at, path, ty, place),
+            (false, false) => lower.glue(ty, place),
+        };
         match flag {
             Some(flag) => self.guarded(flag, run),
             None => run(self),
         }
+    }
+
+    /// Drops what is left of the value the `Box` of type `ty` at `place` owns, part by part, then frees the box with its own `Drop::drop`.
+    fn open_box(&mut self, at: usize, inside: &[(u32, u32)], ty: Ty, place: Option<Place>) -> Result<()> {
+        let (Some(place), Some(owned)) = (place, self.cx.boxed(ty)) else { bail!("a partly moved box with no bytes") };
+        let target = self.address(place);
+        let contents = self.ins().load(Type::I64, target, 0);
+        let part = Place { base: Base::Addr(contents), offset: 0, repr: repr(self.cx, owned)? };
+        self.drop_path(at, inside, owned, Some(part))?;
+        let Some(Res::Fn(item, substs)) = drop_fn(self.cx, ty)? else { bail!("`Box` has no `Drop::drop`") };
+        self.invoke(item, &substs, vec![target]).map(drop)
     }
 
     fn open_drop(&mut self, at: usize, path: &[(u32, u32)], ty: Ty, place: Option<Place>) -> Result<()> {

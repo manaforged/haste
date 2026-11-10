@@ -16,13 +16,13 @@ pub type TraitGenerics = (Body, Generics);
 impl<'a> Context<'a> {
     /// The generic parameters and where clause of trait `item`.
     pub fn trait_generics(&mut self, item: ItemRef) -> Result<Rc<TraitGenerics>> {
-        if let Some(found) = self.trait_defs.get(&item) {
+        if let Some(found) = self.store.lookups.trait_defs.get(&item) {
             return Ok(found.clone());
         }
         let (src, entry) = self.item(item);
         let name = entry.name.ok_or_else(|| anyhow!("trait has no name"))?;
         let parsed = Rc::new(sig::generics(src, name + 1, entry.body.unwrap_or(entry.end))?);
-        self.trait_defs.insert(item, parsed.clone());
+        self.store.lookups.trait_defs.insert(item, parsed.clone());
         Ok(parsed)
     }
 
@@ -79,11 +79,11 @@ impl<'a> Context<'a> {
 
     /// The traits in scope in module `home`.
     pub fn traits_in_scope(&self, home: ModRef) -> Vec<ItemRef> {
-        if let Some(known) = self.scope_traits.borrow().get(&home) {
+        if let Some(known) = self.store.lookups.scope_traits.borrow().get(&home) {
             return known.to_vec();
         }
         let found = self.paths(home.krate).traits_in(home);
-        self.scope_traits.borrow_mut().insert(home, found.as_slice().into());
+        self.store.lookups.scope_traits.borrow_mut().insert(home, found.as_slice().into());
         found
     }
 
@@ -103,7 +103,7 @@ impl<'a> Context<'a> {
 
     /// The item that `#[lang = "name"]` marks in the standard crates.
     pub fn lang_item(&mut self, name: &str) -> Option<ItemRef> {
-        if let Some((table, partial)) = &self.langs {
+        if let Some((table, partial)) = &self.store.lookups.langs {
             self.asks.crates.borrow_mut().extend(partial.iter().copied());
             return table.get(name).copied();
         }
@@ -124,7 +124,7 @@ impl<'a> Context<'a> {
         }
         let found = table.get(name).copied();
         self.asks.crates.borrow_mut().extend(partial.iter().copied());
-        self.langs = Some((Rc::new(table), partial.into()));
+        self.store.lookups.langs = Some((Rc::new(table), partial.into()));
         found
     }
 }

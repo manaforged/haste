@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Type, Value};
+use haste_codegen::{Block, Type, Value};
 use rustc_abi::Variants;
 use rustc_index::Idx;
 
@@ -34,6 +34,11 @@ impl Lower<'_, '_> {
         self.enter(inner);
         let item = self.variant_field(option, each.option, (each.some, 0))?;
         self.bind_matched(pat, Some(item), None)?;
+        self.loop_body((head, exit, depth), label, body)
+    }
+
+    /// Lowers the body of a loop whose iterations start at block `head` and leave to `exit`, with `depth` owned values outside it, then the jump back to `head`; the loop's value is `()`.
+    pub(super) fn loop_body(&mut self, (head, exit, depth): (Block, Block, usize), label: Option<u32>, body: ExprId) -> Result<Option<Value>> {
         self.loops.push(Loop { head, exit, value: None, depth, label, block: false });
         let result = self.expr(body);
         self.loops.pop();

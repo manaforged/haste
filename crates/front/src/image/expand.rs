@@ -11,43 +11,55 @@ use crate::names::Names;
 use crate::outline::Outline;
 use crate::sema::Store;
 
-/// One macro call: the declared `proc_macro` entry function, the declared macro function it runs, and the one or two input texts.
+/// One macro call: the declared `proc_macro` entry function, the declared macro function it runs, the one or two input texts, and its group: the calls of one macro crate from one crate, which run in order in one child so the macro's statics carry from call to call as in one compiler process.
 pub struct Job<'a> {
     pub entry: usize,
     pub run: usize,
     pub texts: Vec<&'a [u8]>,
+    pub group: (usize, u32),
 }
 
 type One = extern "C" fn(usize, *const u8, usize, *mut usize);
 type Two = extern "C" fn(usize, *const u8, usize, *const u8, usize, *mut usize);
 
-/// Runs the jobs in children forked on `demand`, one share per core, answering what inference asks with `ask`, and gives each job's output text or why it has none; the jobs after a crash run in a new child.
-pub fn run_macros(outline: &mut Outline, names: &mut Names, demand: &mut Demand, jobs: &[Job<'_>], ask: Answerer<'_>) -> Result<Vec<Result<Vec<u8>, String>>> {
-    let parts = crate::cores().min(jobs.len()).max(1);
-    let mut shares = Shares { jobs, parts, next: vec![0; parts], running: Vec::new(), results: jobs.iter().map(|_| None).collect() };
+/// Runs the jobs in children forked on `demand`, one child per group and at most one per core, answering what inference asks with `ask`, and gives each job's output text or why it has none, or `None` when it did not run; the jobs after a crash run in a new child.
+pub fn run_macros(outline: &mut Outline, names: &mut Names, demand: &mut Demand, jobs: &[Job<'_>], ask: Answerer<'_>) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
+    let mut parts: Vec<Vec<usize>> = Vec::new();
+    let mut groups = rustc_hash::FxHashMap::default();
+    for (at, job) in jobs.iter().enumerate() {
+        let part = *groups.entry(job.group).or_insert_with(|| {
+            parts.push(Vec::new());
+            parts.len() - 1
+        });
+        parts[part].push(at);
+    }
+    let mut shares = Shares { jobs, next: vec![0; parts.len()], parts, running: Vec::new(), results: jobs.iter().map(|_| None).collect() };
     serve(outline, names, (Store::default(), ask), demand, &mut shares)?;
-    Ok(shares.results.into_iter().map(|result| result.unwrap_or_else(|| Err("no output".to_owned()))).collect())
+    Ok(shares.results)
 }
 
-/// The jobs split into `parts` shares, the next job of each share, the child running each share, and each job's result.
+/// The jobs of each group in order, the next job of each group, the child running each group, and each job's result.
 struct Shares<'j, 'a> {
     jobs: &'j [Job<'a>],
-    parts: usize,
+    parts: Vec<Vec<usize>>,
     next: Vec<usize>,
     running: Vec<(usize, usize)>,
     results: Vec<Option<Result<Vec<u8>, String>>>,
 }
 
 impl Shares<'_, '_> {
-    /// The indexes of the jobs of share `part` from its next job on.
+    /// The indexes of the jobs of group `part` from its next job on.
     fn left(&self, part: usize) -> impl Iterator<Item = usize> {
-        (part..self.jobs.len()).step_by(self.parts).skip(self.next[part])
+        self.parts[part].iter().copied().skip(self.next[part])
     }
 }
 
 impl Driver for Shares<'_, '_> {
     fn start(&mut self, demand: &mut Demand) -> Result<()> {
-        for part in 0..self.parts {
+        for part in 0..self.parts.len() {
+            if self.running.len() >= crate::cores() {
+                break;
+            }
             if self.running.iter().any(|&(_, running)| running == part) || self.left(part).next().is_none() {
                 continue;
             }

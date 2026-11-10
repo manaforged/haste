@@ -104,6 +104,38 @@ impl<'f> FunctionBuilder<'f> {
         self.current = mark.current;
     }
 
+    /// Copies `callee` into the function as if the current block called it with `args`, then continues in a new block whose parameters are its results.
+    pub fn inline(&mut self, callee: &Function, args: &[Value]) -> Vec<Value> {
+        let values: Vec<Value> = callee.types.iter().map(|ty| new_value(self.func, *ty)).collect();
+        let blocks: Vec<Block> = callee.blocks.iter().map(|_| self.create_block()).collect();
+        let after = self.create_block();
+        let results: Vec<Value> = callee.signature.returns.iter().map(|ret| self.append_block_param(after, ret.value_type)).collect();
+        let map = Remap { values, blocks, after, slots: self.func.slots.len() as u32, sigs: self.func.sigs.len() as u32 };
+        self.func.slots.extend(callee.slots.iter().cloned());
+        self.func.sigs.extend(callee.sigs.iter().cloned());
+        for (index, block) in callee.blocks.iter().enumerate() {
+            let target = map.blocks[index];
+            self.func.blocks[target.index()].params = block.params.iter().map(|param| map.values[param.index()]).collect();
+            for inst in &block.insts {
+                let data = map.inst(&callee.insts[inst.index()]);
+                self.append(target, data);
+            }
+        }
+        let entry = callee.entry.map_or(after, |entry| map.blocks[entry.index()]);
+        self.ins().jump(entry, args);
+        self.switch_to_block(after);
+        results
+    }
+
+    fn append(&mut self, block: Block, data: InstData) {
+        for target in data.op.targets() {
+            self.incoming[target.index()] += 1;
+        }
+        self.func.insts.push(data);
+        let inst = Inst(self.func.insts.len() as u32 - 1);
+        self.func.blocks[block.index()].insts.push(inst);
+    }
+
     /// Appends one instruction to the current block.
     pub fn ins(&mut self) -> Ins<'_> {
         let block = self.current.expect("a block is selected");
@@ -120,6 +152,34 @@ pub struct Mark {
     slots: usize,
     sigs: usize,
     current: Option<Block>,
+}
+
+/// Where an inlined callee's values, blocks, slots and signatures land in the caller.
+struct Remap {
+    values: Vec<Value>,
+    blocks: Vec<Block>,
+    after: Block,
+    slots: u32,
+    sigs: u32,
+}
+
+impl Remap {
+    fn inst(&self, data: &InstData) -> InstData {
+        let mut op = data.op.clone();
+        op.map_operands(|value| self.values[value.index()]);
+        op.map_targets(|block| self.blocks[block.index()]);
+        match &mut op {
+            Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) => slot.0 += self.slots,
+            Op::Call { sig, results, .. } => {
+                sig.0 += self.sigs;
+                results.iter_mut().for_each(|value| *value = self.values[value.index()]);
+            }
+            Op::TryCall { sig, .. } => sig.0 += self.sigs,
+            Op::Return(values) => op = Op::Jump(self.after, std::mem::take(values)),
+            _ => {}
+        }
+        InstData { op, result: data.result.map(|value| self.values[value.index()]) }
+    }
 }
 
 fn new_value(func: &mut Function, ty: Type) -> Value {

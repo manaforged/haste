@@ -68,7 +68,7 @@ impl Infer<'_, '_> {
             let found = revealed(self.cx, item, &substs)?;
             if let Some(output) = output.filter(|_| self.cx.closure(found).is_none()) {
                 let output = self.zonk(output);
-                self.cx.futures.insert(found, output);
+                self.cx.store.lookups.futures.insert(found, output);
             }
             self.unify(ret, found)?;
         }
@@ -129,16 +129,16 @@ impl Infer<'_, '_> {
 /// The return type of `item` at `substs`, inferring its body once per pass, which also records the closures it defines.
 pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Ty> {
     let key = (item, substs.to_vec());
-    match cx.reveals.get(&key) {
+    match cx.store.lookups.reveals.get(&key) {
         Some(Some(ty)) => return Ok(*ty),
         Some(None) => return async_future(cx, item, substs)?.ok_or_else(|| anyhow!("the `impl Trait` return type of `{}` depends on itself", cx.name(item))),
         None => {}
     }
-    cx.reveals.insert(key.clone(), None);
+    cx.store.lookups.reveals.insert(key.clone(), None);
     let ret = super::infer(cx, item, substs).and_then(|typed| typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item))));
     match &ret {
-        Ok(ty) => cx.reveals.insert(key, Some(*ty)),
-        Err(_) => cx.reveals.remove(&key),
+        Ok(ty) => cx.store.lookups.reveals.insert(key, Some(*ty)),
+        Err(_) => cx.store.lookups.reveals.remove(&key),
     };
     ret
 }
