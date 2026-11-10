@@ -100,14 +100,20 @@ impl Loader<'_> {
                 continue;
             }
             self.attributes(file, module, (at as u32, item));
-            match item.kind {
-                ItemKind::Mod => self.child(file, index, module, (at as u32, item))?,
-                ItemKind::MacroRules | ItemKind::Macro => self.define(file, (index as u32, at as u32), item),
-                ItemKind::MacroCall => self.call(file, module, at as u32)?,
-                ItemKind::Impl => self.impl_block(index, module, at as u32, file)?,
-                ItemKind::Struct | ItemKind::Enum | ItemKind::Union => self.derive(file, module, (at as u32, item))?,
-                _ => {}
-            }
+            self.module_item(file, (index, module), (at as u32, item))?;
+        }
+        Ok(())
+    }
+
+    fn module_item(&mut self, file: &Arc<File>, (index, module): (usize, usize), (at, item): (u32, &Item)) -> Result<()> {
+        match item.kind {
+            ItemKind::Mod => self.child(file, index, module, (at, item))?,
+            ItemKind::MacroRules | ItemKind::Macro => self.define(file, (index as u32, at), item),
+            ItemKind::MacroCall => self.call(file, module, at)?,
+            ItemKind::Impl => self.impl_block(index, module, at, file)?,
+            ItemKind::Const if item.name.is_some_and(|name| file.source.text(name) == "_") => self.out.anonymous.push((index, at)),
+            ItemKind::Struct | ItemKind::Enum | ItemKind::Union => self.derive(file, module, (at, item))?,
+            _ => {}
         }
         Ok(())
     }

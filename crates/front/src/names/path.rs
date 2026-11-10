@@ -160,11 +160,10 @@ impl<'a> Paths<'a> {
     }
 
     fn ask_crate(&self, root: ModRef) {
-        let partial = self.trees.get(root.krate as usize).is_some_and(|tree| tree.partial());
         if let Some(demands) = self.demands
             && root.module == 0
             && root.krate != self.krate
-            && partial
+            && self.trees.get(root.krate as usize).is_some_and(|tree| tree.partial())
         {
             demands.crates.borrow_mut().push(root.krate);
         }

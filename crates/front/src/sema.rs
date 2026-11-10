@@ -353,6 +353,12 @@ impl<'a> Context<'a> {
         self.trait_member(of, "call_once")
     }
 
+    /// Whether `item` is `FnOnce::call_once` or the `call_once` of an `FnOnce` impl, which take the callee by value.
+    pub fn takes_by_value(&mut self, item: ItemRef) -> bool {
+        let once = self.lang_item("fn_once");
+        self.call_once() == Some(item) || self.owner_impl(item).and_then(|block| self.impl_trait(block)).is_some_and(|of| Some(of) == once)
+    }
+
     /// Whether `instance` names, in its function or its type arguments, an item that a body declared before an edit and declares no longer.
     pub fn undeclared(&self, instance: &reach::Instance) -> bool {
         let gone = |item: ItemRef| item.outer().is_some_and(|(outer, index)| self.expansion(outer).is_none_or(|found| index as usize >= found.file.items.items.len()));

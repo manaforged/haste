@@ -171,6 +171,9 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
 }
 
 fn report_cases(workspace: &graph::Workspace, targets: &Targets, request: serve::Request, args: &[String]) -> Result<i32> {
+    if request == serve::Request::Run {
+        return cases::run(workspace, targets, args);
+    }
     let started = Instant::now();
     let build = cases::Build::cold(workspace, targets)?;
     let result = serve::finish(&build, request, args, started);
@@ -254,7 +257,27 @@ fn report_names(outline: &outline::Outline, names: &Names, started: Instant) {
 
 const USAGE: &str = "usage: haste-front graph|outline|demand|typeck|cases|build|run|serve|items|expand PATH [ARGS...]";
 
+/// The glibc malloc settings haste runs with: transparent huge pages for the heap, and freed memory kept for reuse instead of returned to the kernel and faulted in again.
+const TUNABLES: &str = "glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=4294967296:glibc.malloc.trim_threshold=4294967296:glibc.malloc.top_pad=268435456";
+
+/// Starts haste again with `TUNABLES` when its environment sets no tunables, since glibc reads them only at startup; the started process takes them out of its environment, so the programs it runs do not see them.
+fn tune_malloc() {
+    match std::env::var_os("GLIBC_TUNABLES") {
+        // SAFETY: no other thread runs yet, so nothing reads the environment while it changes.
+        Some(set) if set == TUNABLES => unsafe { std::env::remove_var("GLIBC_TUNABLES") },
+        Some(_) => {}
+        None => {
+            use std::os::unix::process::CommandExt;
+            let mut args = std::env::args_os();
+            let arg0 = args.next().unwrap_or_default();
+            let error = std::process::Command::new("/proc/self/exe").arg0(arg0).args(args).env("GLIBC_TUNABLES", TUNABLES).exec();
+            eprintln!("haste: running without malloc tunables: {error}");
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    tune_malloc();
     let mut args = std::env::args().skip(1);
     let mode = args.next().context(USAGE)?;
     let path = PathBuf::from(args.next().context(USAGE)?);
@@ -267,11 +290,7 @@ fn main() -> Result<()> {
             if let Some(status) = serve::Request::parse_mode(&mode).map(|request| serve::ask(&root, request, &argv)).transpose()?.flatten() {
                 std::process::exit(status);
             }
-            let reported = report(&mode, &root, &argv);
-            if let Err(error) = std::fs::remove_dir_all(graph::script::scratch()).or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) }) {
-                eprintln!("cannot remove the build script directory {}: {error}", graph::script::scratch().display());
-            }
-            match reported? {
+            match report(&mode, &root, &argv)? {
                 0 => Ok(()),
                 status => std::process::exit(status),
             }

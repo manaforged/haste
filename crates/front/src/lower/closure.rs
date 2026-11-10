@@ -107,7 +107,7 @@ impl Lower<'_, '_> {
     /// Lowers a call of the callee value `callee`, a closure, a function item, a trait object or a value with its own `Fn` impl, which inference resolved to `(item, substs)`.
     pub(super) fn call_value(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Vec<Ty>), args: List) -> Result<Option<Value>> {
         let item_value = matches!(self.cx.types.kind(self.ty_of(callee)), Kind::FnDef(..));
-        if self.typed.overloaded.contains(&expr) || !item_value && substs.first().is_some_and(|ty| matches!(self.cx.types.kind(*ty), Kind::Dyn(..))) {
+        if self.by_impl(expr, (item, &substs)) || !item_value && substs.first().is_some_and(|ty| matches!(self.cx.types.kind(*ty), Kind::Dyn(..))) {
             return self.object_call((expr, callee), (item, substs), args);
         }
         if self.typed.autoderefs.contains_key(&expr) {
@@ -158,20 +158,47 @@ impl Lower<'_, '_> {
     }
 
     fn object_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Vec<Ty>), args: List) -> Result<Option<Value>> {
+        if self.cx.takes_by_value(item) && self.by_impl(expr, (item, &substs)) {
+            return self.owned_once_call((expr, callee), (item, substs), args);
+        }
         if self.cx.call_once() == Some(item) {
             return self.boxed_once_call((expr, callee), (item, substs), args);
         }
         let Some((place, _)) = self.autoderef_place(expr, callee)? else { return Ok(None) };
         let receiver = self.address(place);
         let tuple = match self.typed.overloaded.contains(&expr) {
-            true => {
-                let items = self.body.list(args).iter().map(|&arg| self.ty_of(ExprId(arg))).collect();
-                self.cx.types.intern(Kind::Tuple(items))
-            }
+            true => self.args_tuple(args),
             false => *substs.get(1).ok_or_else(|| anyhow::anyhow!("a trait object call with no argument tuple"))?,
         };
         let packed = self.tuple_of(tuple, args)?;
         self.invoke(item, &substs, std::iter::once(receiver).chain(packed).collect())
+    }
+
+    /// Lowers the call of a value whose own `FnOnce` impl takes it by value, as `AssertUnwindSafe` has: the value moves into `call_once` with the argument tuple.
+    fn owned_once_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Vec<Ty>), args: List) -> Result<Option<Value>> {
+        if self.typed.autoderefs.contains_key(&expr) {
+            bail!("calling a value through a pointer by `FnOnce` is not supported yet");
+        }
+        let place = self.place_or_temp(callee)?;
+        let mut values: Vec<Value> = place.and_then(|place| self.read(place)).into_iter().collect();
+        if let Some((root, path)) = self.scrutinee_path(callee) {
+            self.moved_out(root, &path)?;
+        }
+        let tuple = self.args_tuple(args);
+        values.extend(self.tuple_of(tuple, args)?);
+        self.invoke(item, &substs, values)
+    }
+
+    /// Whether the call `expr` resolved to `(item, substs)` goes through the callee type's own `Fn` impl: inference saw that impl, or a generic body calls a call trait method at a struct such as `AssertUnwindSafe`.
+    fn by_impl(&mut self, expr: ExprId, (item, substs): (ItemRef, &[Ty])) -> bool {
+        let trait_call = self.cx.call_once() == Some(item) || crate::sema::infer::by_reference(self.cx, item).is_some();
+        self.typed.overloaded.contains(&expr) || trait_call && substs.first().is_some_and(|ty| matches!(self.cx.types.kind(*ty), Kind::Adt(..)))
+    }
+
+    /// The tuple type of the call arguments `args`.
+    fn args_tuple(&mut self, args: List) -> Ty {
+        let items = self.body.list(args).iter().map(|&arg| self.ty_of(ExprId(arg))).collect();
+        self.cx.types.intern(Kind::Tuple(items))
     }
 
     fn boxed_once_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Vec<Ty>), args: List) -> Result<Option<Value>> {

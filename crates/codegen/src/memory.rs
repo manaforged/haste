@@ -52,6 +52,11 @@ impl Memory {
         Ok(())
     }
 
+    /// The addresses that the code of the last chunk runs at.
+    pub fn span(&self) -> Option<std::ops::Range<usize>> {
+        self.chunks.last().map(|chunk| chunk.exec..chunk.exec + chunk.size)
+    }
+
     /// Stops writing into the last chunk, whose free space forked workers filled, so that the next write maps a new chunk.
     pub fn close(&mut self) {
         if let Some(chunk) = self.chunks.last_mut() {

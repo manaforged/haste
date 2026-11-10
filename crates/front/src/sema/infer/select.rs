@@ -277,13 +277,48 @@ impl<'a> Infer<'_, 'a> {
         if self.object_holds(of, ty, &args) == Some(true) {
             return Ok(true);
         }
-        match <[_; 1]>::try_from(self.applicable(of, ty, &args, depth + 1)?) {
+        self.impl_holds((arena, home, path), (of, ty, &args), depth)
+    }
+
+    /// Whether an impl proves `ty: of<args>` for the bound at `path`, where an obligation that repeats an enclosing one is a cycle.
+    fn impl_holds(&mut self, (arena, home, path): (&Body, ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
+        let query = self.query(of, ty, args);
+        if self.selecting.contains(&query) {
+            return Ok(self.obligation_open(ty, args));
+        }
+        self.selecting.push(query);
+        let found = self.applicable(of, ty, args, depth + 1);
+        self.selecting.pop();
+        match <[_; 1]>::try_from(found?) {
             Ok([(_, vars)]) => {
                 self.adopt(vars);
-                self.assoc_bounds_hold((arena, home, path), (of, ty, &args), depth)
+                self.assoc_bounds_hold((arena, home, path), (of, ty, args), depth)
             }
             Err(found) => Ok(!found.is_empty()),
         }
+    }
+
+    /// Whether `ty` holds an unbound inference variable.
+    pub(super) fn has_vars(&self, ty: Ty) -> bool {
+        let ty = self.resolve(ty);
+        let kind = self.cx.types.kind(ty);
+        matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || kind.children().any(|item| self.has_vars(item))
+    }
+
+    /// Whether the obligation `ty: _<args>` holds an unbound inference variable.
+    pub(super) fn obligation_open(&self, ty: Ty, args: &[Ty]) -> bool {
+        self.has_vars(ty) || args.iter().any(|&arg| self.has_vars(arg))
+    }
+
+    /// The obligation `ty: of<args>` spelled with every unbound inference variable alike, so a nested obligation that repeats an enclosing one is a cycle: rustc's evaluator treats it as ambiguous when it has variables and as failing when it has none.
+    fn query(&self, of: ItemRef, ty: Ty, args: &[Ty]) -> String {
+        let shown: Vec<String> = std::iter::once(ty).chain(args.iter().copied()).map(|ty| self.show(ty)).collect();
+        let mut text = format!("{of:?} {}", shown.join(", "));
+        while let Some(at) = text.find("Var(") {
+            let end = text[at..].find(')').map_or(text.len(), |close| at + close + 1);
+            text.replace_range(at..end, "_");
+        }
+        text
     }
 
     /// Whether the associated types of `of` for `ty` meet the bound path's bindings, as `Item = T`, and its constraints, as `Item: Trait`.

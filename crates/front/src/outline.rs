@@ -47,20 +47,23 @@ pub struct Outline {
     pub cache: Cache,
     /// The output text of each procedural macro called in a body, by macro function and input text, or why it failed.
     pub procs: HashMap<(crate::names::ItemRef, String), Result<String, String>>,
+    /// For each root whose sources cannot change, a key of its path and of the resolved graph, under which what its procedural macros print for one input is kept.
+    pub pins: Vec<Option<u64>>,
 }
 
-/// The library and member binary targets of every unit, and the build scripts of the units `scripts`.
+/// The library and member binary targets of every unit; with build scripts `scripts`, those scripts and only the libraries they build from.
 pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
     let mut roots = Vec::new();
+    let needed = (!scripts.is_empty()).then(|| script_closure(workspace, scripts));
     for (unit, entry) in workspace.graph.units.iter().enumerate() {
         let manifest = &workspace.packages[entry.package].manifest;
-        if let Some(lib) = &manifest.lib {
+        if let Some(lib) = manifest.lib.as_ref().filter(|_| needed.as_ref().is_none_or(|needed| needed.contains(&unit))) {
             let name = manifest.lib_name.as_ref().unwrap_or(&manifest.name).replace('-', "_");
             let supplied = workspace.packages[entry.package].sysroot && name == "proc_macro";
             let path = if supplied { PathBuf::from(tree::PROC_MACRO_ROOT) } else { lib.clone() };
             roots.push(Root { unit, name, path, role: Role::Lib });
         }
-        if workspace.graph.members.contains(&entry.package) {
+        if needed.is_none() && workspace.graph.members.contains(&entry.package) {
             let bins = manifest.bins.iter().map(|(name, path)| Root { unit, name: name.clone(), path: path.clone(), role: Role::Bin });
             roots.extend(bins);
         }
@@ -69,6 +72,21 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
         }
     }
     roots
+}
+
+/// The units whose libraries the build scripts of `scripts` build from: the sysroot and every library their build dependencies reach.
+fn script_closure(workspace: &Workspace, scripts: &[usize]) -> rustc_hash::FxHashSet<usize> {
+    let units = &workspace.graph.units;
+    let sysroot = (0..units.len()).filter(|&unit| workspace.packages[units[unit].package].sysroot);
+    let builds = scripts.iter().flat_map(|&unit| units[unit].deps.iter().filter(|(_, _, kind)| *kind == Kind::Build).map(|(_, dep, _)| *dep));
+    let mut left: Vec<usize> = sysroot.chain(builds).collect();
+    let mut needed = rustc_hash::FxHashSet::default();
+    while let Some(unit) = left.pop() {
+        if needed.insert(unit) {
+            left.extend(units[unit].deps.iter().filter(|(_, _, kind)| *kind == Kind::Normal).map(|(_, dep, _)| *dep));
+        }
+    }
+    needed
 }
 
 const IMPLICIT: [&str; 4] = ["std", "core", "alloc", "proc_macro"];
@@ -112,7 +130,16 @@ pub fn new(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Outli
     let roots = roots(workspace, scripts);
     let deps = dependencies(workspace, &roots);
     let crates = roots.iter().map(|root| root_crate(workspace, targets, root)).collect();
-    Outline { roots, crates, deps, cache: Cache::default(), procs: HashMap::default() }
+    let pins = pins(workspace, &roots);
+    Outline { roots, crates, deps, cache: Cache::default(), procs: HashMap::default(), pins }
+}
+
+/// The key of each root from a registry or git source: its path, and every unit's package, version, source, features and side.
+fn pins(workspace: &Workspace, roots: &[Root]) -> Vec<Option<u64>> {
+    use std::hash::BuildHasher as _;
+    let units: Vec<_> = workspace.graph.units.iter().map(|unit| (&workspace.packages[unit.package].locked, &unit.features, unit.side == crate::graph::Side::Host)).map(|(locked, features, host)| (&locked.name, locked.version.to_string(), &locked.source, features, host)).collect();
+    let graph = rustc_hash::FxBuildHasher.hash_one(&units);
+    roots.iter().map(|root| workspace.packages[workspace.graph.units[root.unit].package].locked.source.is_some().then(|| rustc_hash::FxBuildHasher.hash_one((graph, &root.path)))).collect()
 }
 
 fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root) -> Crate {
@@ -149,7 +176,7 @@ impl Outline {
     pub fn file(path: &std::path::Path, target: crate::graph::cfg::Target) -> Outline {
         let root = Root { unit: 0, name: String::new(), path: path.to_owned(), role: Role::Lib };
         let krate = Crate { env: Env { target, ..Env::default() }, modules: vec![root_module(path)], ..Crate::default() };
-        Outline { roots: vec![root], crates: vec![krate], deps: vec![Vec::new()], cache: Cache::default(), procs: HashMap::default() }
+        Outline { roots: vec![root], crates: vec![krate], deps: vec![Vec::new()], cache: Cache::default(), procs: HashMap::default(), pins: vec![None] }
     }
 
     /// The top-level `fn main` that the cfgs of crate `krate` keep in its root file.

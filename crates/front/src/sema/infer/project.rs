@@ -251,7 +251,7 @@ impl Infer<'_, '_> {
         if let Some(found) = self.picked_alias(of, ty, &args, (name, own))? {
             return Ok(found);
         }
-        if !self.has_vars(ty) && !args.iter().any(|arg| self.has_vars(*arg)) {
+        if !self.obligation_open(ty, &args) {
             bail!("no one impl of `{}` gives `{name}` for {}", self.cx.name(of), self.show(ty));
         }
         let result = self.fresh(Kind::Var);
@@ -333,7 +333,7 @@ impl Infer<'_, '_> {
             return self.bind_callable(arena, (of, path), ty);
         }
         let args = self.bound_args(of, arena, path, ty)?;
-        if !self.compiler_trait(of) && (self.has_vars(ty) || args.iter().any(|arg| self.has_vars(*arg))) {
+        if !self.compiler_trait(of) && self.obligation_open(ty, &args) {
             self.obligations.push((of, std::iter::once(ty).chain(args.iter().copied()).collect()));
         }
         if !self.bindings_hold(arena, path, (of, ty, &args))? {

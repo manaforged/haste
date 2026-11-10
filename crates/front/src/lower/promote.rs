@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use haste_codegen::{Type, Value};
 
 use crate::body::{Expr, ExprId, UnOp};
@@ -50,13 +50,36 @@ impl Lower<'_, '_> {
         Ok(Some(address))
     }
 
-    /// The place of the static `item` at `substs`, of type `ty`: its cell, which the image fills before the program runs.
+    /// The place of the static `item` at `substs`, of type `ty`: its cell, which the static's initializer fills on the first use that finds it empty.
     pub fn static_place(&mut self, (item, substs): (ItemRef, &[Ty]), ty: Ty) -> Result<Place> {
-        let Some(&index) = self.reached.index.get(&(item, substs.to_vec())) else { bail!("static `{}` was not reached", self.cx.name(item)) };
+        let index = self.reached_index(item, substs)?;
+        let (address, size) = self.static_cell(index, ty)?;
+        if !self.cx.foreign(item) && index != self.index {
+            let filled = self.ins().load(Type::I8, address, size);
+            let (fill, done) = (self.b.create_block(), self.b.create_block());
+            self.brif(filled, (done, &[]), (fill, &[]));
+            self.enter(fill);
+            let code = self.code_of(index);
+            self.call_code(code, (Vec::new(), None), Vec::new())?;
+            self.jump(done, &[]);
+            self.enter(done);
+        }
+        Ok(Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? })
+    }
+
+    /// The address of the cell of the static whose initializer is reached function `index`, of type `ty`, and the offset of the byte after its value that says it is filled.
+    fn static_cell(&mut self, index: usize, ty: Ty) -> Result<(Value, i32)> {
         let size = self.cx.layout(ty)?.size.bytes() as u32;
         let cell = self.slots.cell(index, size);
-        let address = self.ins().iconst(Type::I64, cell);
-        Ok(Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? })
+        Ok((self.ins().iconst(Type::I64, cell), size as i32))
+    }
+
+    /// Marks the static that this function initializes as filled, so that the uses its value reaches do not run this again.
+    pub fn mark_static(&mut self) -> Result<()> {
+        let (address, size) = self.static_cell(self.index, self.typed.ret.unwrap_or(Ty(u32::MAX)))?;
+        let one = self.ins().iconst(Type::I8, 1);
+        self.ins().store(one, address, size);
+        Ok(())
     }
 
     /// Writes `value`, the value of the static that this function initializes, into the static's cell, and returns.

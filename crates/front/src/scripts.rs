@@ -7,16 +7,19 @@ use rustc_hash::FxHashSet as HashSet;
 
 use crate::graph::manifest::Kind;
 use crate::graph::script::{self, Output};
-use crate::graph::{Targets, Workspace};
-use crate::image::{Image, Script};
+use crate::graph::{Targets, Workspace, store};
+use crate::image::{self, Demand, Driver, Ended, Script};
 use crate::outline::Role;
-use crate::sema::reach::{Instance, Reached, main_roots};
-use crate::sema::Context;
 
-/// Gives every unit with a build script the output of running that script in this run: all of them build into one image, then run in waves so a script that reads a `links` dependency's metadata runs after it; a script that does not build or fails stays without output, so its package's unknown cfgs stay open.
+/// Gives every unit with a build script its output: the stored one while it is current, else from running the script. The scripts to run build into one image, then run in waves so a script that reads a `links` dependency's metadata runs after it; a script that does not build or fails stays without output, so its package's unknown cfgs stay open.
 pub fn settle(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
     let mut failed = HashSet::default();
     loop {
+        take_kept(workspace, targets, &mut failed);
+        let mut missing = pending(workspace, &failed);
+        missing.sort_by_cached_key(|&unit| store::dir(workspace, unit));
+        let _held = missing.iter().map(|&unit| store::lock(workspace, unit)).collect::<std::io::Result<Vec<_>>>()?;
+        take_kept(workspace, targets, &mut failed);
         let pending = pending(workspace, &failed);
         if pending.is_empty() {
             return Ok(());
@@ -32,11 +35,28 @@ pub fn settle(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
         for (unit, failure) in errors {
             let ran = failure.broken.is_some_and(|at| pending.contains(&at) && workspace.graph.units[at].script.is_some());
             if !ran {
-                eprintln!("build script of {}: {}", workspace.packages[workspace.graph.units[unit].package].locked.name, failure.error);
-                failed.insert(unit);
+                give_up(workspace, targets, unit, &failure.error, &mut failed);
             }
         }
     }
+}
+
+/// Reports that `unit`'s script did not build or run, keeps that failure for later runs, and builds its package with the script's cfgs open.
+fn give_up(workspace: &Workspace, targets: &Targets, unit: usize, error: &str, failed: &mut HashSet<usize>) {
+    report(workspace, unit, error, failed);
+    if let Err(write) = store::keep_failure(workspace, unit, &vars(workspace, targets, unit), error) {
+        eprintln!("cannot keep that failure: {write}");
+    }
+}
+
+fn report(workspace: &Workspace, unit: usize, error: &str, failed: &mut HashSet<usize>) {
+    eprintln!("build script of {}: {error}", workspace.packages[workspace.graph.units[unit].package].locked.name);
+    failed.insert(unit);
+}
+
+/// The variables the script of `unit` runs with, given the outputs that units already have.
+fn vars(workspace: &Workspace, targets: &Targets, unit: usize) -> Vec<(String, String)> {
+    script::script_vars(workspace, targets, unit, &metadata(workspace, unit, &known(workspace)))
 }
 
 /// Why a script has no output, with the unit of the crate whose function did not build, when one did not: a script whose broken crate had its own script run since builds again, since that script's cfgs may fix it.
@@ -57,6 +77,30 @@ fn pending(workspace: &Workspace, failed: &HashSet<usize>) -> Vec<usize> {
     units.filter(|(unit, entry)| entry.script.is_none() && !failed.contains(unit) && workspace.packages[entry.package].manifest.build.is_some()).map(|(unit, _)| unit).collect()
 }
 
+/// Takes the stored result of each pending script that is still current, a script whose `links` dependency is pending only once that dependency has its result.
+fn take_kept(workspace: &mut Workspace, targets: &Targets, failed: &mut HashSet<usize>) {
+    loop {
+        let pending = pending(workspace, failed);
+        let ready = pending.iter().copied().filter(|&unit| !waits(workspace, unit, &pending));
+        let found: Vec<(usize, Result<Output, String>)> = ready.filter_map(|unit| store::kept(workspace, unit, &vars(workspace, targets, unit)).map(|kept| (unit, kept))).collect();
+        if found.is_empty() {
+            return;
+        }
+        for (unit, kept) in found {
+            match kept {
+                Ok(output) => workspace.graph.units[unit].script = Some(Arc::new(output)),
+                Err(error) => report(workspace, unit, &error, failed),
+            }
+        }
+    }
+}
+
+/// The script outputs that units already have.
+fn known(workspace: &Workspace) -> Ran {
+    let units = workspace.graph.units.iter().enumerate();
+    units.filter_map(|(unit, entry)| Some((unit, entry.script.clone()?))).collect()
+}
+
 /// Whether the script of `unit` needs the metadata of a dependency's script that has not run.
 fn waits(workspace: &Workspace, unit: usize, left: &[usize]) -> bool {
     let deps = workspace.graph.units[unit].deps.iter().filter(|(_, _, kind)| *kind == Kind::Normal);
@@ -72,75 +116,88 @@ fn metadata(workspace: &Workspace, unit: usize, ran: &Ran) -> Vec<(String, Strin
 
 type Ran = rustc_hash::FxHashMap<usize, Arc<Output>>;
 type Outcome = Vec<(usize, Result<Arc<Output>, Failure>)>;
-type Built<'r> = (&'r Image, &'r Reached, &'r rustc_hash::FxHashMap<usize, String>, &'r [usize]);
 
-/// Builds the scripts of the units `units` into one image and runs each one that built.
+/// Builds and runs the scripts of the units `units` in children that compile each function on its first call.
 fn run(workspace: &Workspace, targets: &Targets, units: &[usize]) -> Result<Outcome> {
     let (mut outline, mut names) = crate::macros::front(workspace, targets, units)?;
     let scripts: Vec<(usize, usize)> = outline.roots.iter().enumerate().filter(|(_, root)| root.role == Role::Script).map(|(krate, root)| (root.unit, krate)).collect();
     let mains: Vec<Option<crate::names::ItemRef>> = scripts.iter().map(|(_, krate)| outline.main(*krate)).collect();
-    let entries = |cx: &mut Context<'_>| -> Vec<Result<[Instance; 2], String>> {
-        mains.iter().map(|main| main.ok_or_else(|| "no `fn main`".to_owned()).and_then(|item| main_roots(cx, item).map_err(|error| format!("{error:#}")))).collect()
-    };
-    let roots = |cx: &mut Context<'_>| entries(cx).into_iter().flatten().flatten().collect();
-    let finish = |mut cx: Context<'_>, reached: Reached| {
-        let entries = entries(&mut cx);
-        let (image, broken) = Image::build(&mut cx, &reached)?;
-        let owners: Vec<usize> = cx.outline.roots.iter().map(|root| root.unit).collect();
-        waves(workspace, targets, (&image, &reached, &broken, &owners), scripts.iter().map(|(unit, _)| *unit).zip(entries).collect())
-    };
-    crate::macros::reach_settled(&mut outline, &mut names, roots, finish)
+    let (entries, store) = image::entries(&mut outline, &mut names, &mains)?;
+    let mut demand = Demand::new()?;
+    let left = scripts.iter().zip(entries).map(|(&(unit, _), entry)| (unit, entry.map(|pair| pair.map(|root| demand.declare(root))))).collect();
+    let owners = outline.roots.iter().map(|root| root.unit).collect();
+    let mut driver = Runs { workspace, targets, owners, left, running: Vec::new(), ran: known(workspace), outcome: Outcome::new() };
+    image::serve(&mut outline, &mut names, (store, &crate::macros::answer), &mut demand, &mut driver)?;
+    std::mem::forget((outline, names, demand));
+    Ok(driver.outcome)
 }
 
-/// Runs the built scripts in waves: each wave holds the scripts whose `links` dependencies already ran or failed.
-fn waves(workspace: &Workspace, targets: &Targets, built: Built<'_>, mut left: Vec<(usize, Result<[Instance; 2], String>)>) -> Result<Outcome> {
-    let (mut outcome, mut ran) = (Outcome::new(), Ran::default());
-    while !left.is_empty() {
-        let units: Vec<usize> = left.iter().map(|(unit, _)| *unit).collect();
-        let (mut wave, rest): (Vec<_>, Vec<_>) = left.into_iter().partition(|(unit, _)| !waits(workspace, *unit, &units));
-        left = if wave.is_empty() { std::mem::replace(&mut wave, rest) } else { rest };
-        for (unit, result) in execute(workspace, targets, built, wave, &ran)? {
-            if let Ok(output) = &result {
-                ran.insert(unit, output.clone());
+/// The scripts left to run with their declared entries, the ones running by child, the outputs known so far and each script's outcome.
+struct Runs<'w> {
+    workspace: &'w Workspace,
+    targets: &'w Targets,
+    owners: Vec<usize>,
+    left: Vec<(usize, Result<[usize; 2], String>)>,
+    running: Vec<(usize, usize, Script)>,
+    ran: Ran,
+    outcome: Outcome,
+}
+
+impl Runs<'_> {
+    /// The next script that can start: one whose `links` dependencies ran or failed, else any when every one left waits.
+    fn next(&mut self) -> Option<(usize, Result<[usize; 2], String>)> {
+        let waiting: Vec<usize> = self.left.iter().map(|(unit, _)| *unit).chain(self.running.iter().map(|(_, unit, _)| *unit)).collect();
+        let ready = self.left.iter().position(|(unit, _)| !waits(self.workspace, *unit, &waiting));
+        let at = ready.or_else(|| self.running.is_empty().then_some(0)).filter(|_| !self.left.is_empty())?;
+        Some(self.left.remove(at))
+    }
+}
+
+impl Driver for Runs<'_> {
+    fn start(&mut self, demand: &mut Demand) -> Result<()> {
+        while self.running.len() < crate::cores() {
+            let Some((unit, entry)) = self.next() else { return Ok(()) };
+            let script = entry.map_err(Failure::from).and_then(|[start, main]| job(self.workspace, self.targets, unit, (start, main), &self.ran));
+            match script {
+                Ok(script) => {
+                    let id = demand.fork(true, |image, out| out.map_or(101, |out| image.enter_script(&script, out)))?;
+                    self.running.push((id, unit, script));
+                }
+                Err(failure) => self.outcome.push((unit, Err(failure))),
             }
-            outcome.push((unit, result));
         }
+        Ok(())
     }
-    Ok(outcome)
-}
 
-fn execute(workspace: &Workspace, targets: &Targets, built: Built<'_>, entries: Vec<(usize, Result<[Instance; 2], String>)>, ran: &Ran) -> Result<Outcome> {
-    let mut outcome: Outcome = Vec::new();
-    let mut jobs = Vec::new();
-    for (unit, entry) in entries {
-        let job = entry.map_err(Failure::from).and_then(|[start, main]| job(workspace, targets, unit, (built.1.index[&start], built.1.index[&main]), built, ran));
-        match job {
-            Ok(job) => jobs.push((unit, job)),
-            Err(failure) => outcome.push((unit, Err(failure))),
-        }
-    }
-    let threads = crate::cores();
-    let (units, scripts): (Vec<usize>, Vec<Script>) = jobs.into_iter().unzip();
-    let results = built.0.run_scripts(&scripts, threads)?;
-    for ((unit, job), (status, text)) in units.into_iter().zip(&scripts).zip(results) {
-        let result = match status {
-            0 => String::from_utf8(text).map(|text| Arc::new(Output::parse(&text))).map_err(|_| Failure::from("printed output that is not UTF-8".to_owned())),
-            _ => Err(Failure::from(format!("exited with status {status}; its errors are in {}", job.log.display()))),
+    fn ended(&mut self, id: usize, ended: Ended) -> Result<()> {
+        let Some(at) = self.running.iter().position(|(running, ..)| *running == id) else { return Ok(()) };
+        let (_, unit, script) = self.running.swap_remove(at);
+        let result = match (ended.status, ended.failure) {
+            (0, _) => String::from_utf8(ended.bytes).map(|text| finished(self.workspace, unit, &script, &text)).map_err(|_| Failure::from("printed output that is not UTF-8".to_owned())),
+            (_, Some((error, item))) => Err(Failure { error: format!("does not build: {error}"), broken: self.owners.get(item.krate as usize).copied() }),
+            (status, None) => Err(Failure::from(format!("exited with status {status}; its errors are in {}", script.log.display()))),
         };
-        outcome.push((unit, result));
+        if let Ok(output) = &result {
+            self.ran.insert(unit, output.clone());
+        }
+        self.outcome.push((unit, result));
+        Ok(())
     }
-    Ok(outcome)
 }
 
-fn job(workspace: &Workspace, targets: &Targets, unit: usize, entry: (usize, usize), (_, reached, broken, owners): Built<'_>, ran: &Ran) -> Result<Script, Failure> {
-    let closure = reached.closure(&[entry.0, entry.1]);
-    if let Some((at, error)) = reached.failure(&closure, broken) {
-        let broken = owners.get(reached.list[at].0.0.krate as usize).copied();
-        return Err(Failure { error: format!("does not build: {error}"), broken });
+/// The output of a script that exited cleanly, kept in the store for later runs.
+fn finished(workspace: &Workspace, unit: usize, job: &Script, text: &str) -> Arc<Output> {
+    if let Err(error) = store::keep(workspace, unit, &job.vars, text) {
+        eprintln!("cannot keep the output of {}'s build script: {error}", workspace.packages[workspace.graph.units[unit].package].locked.name);
     }
-    let dir = script::dir(workspace, unit);
-    std::fs::create_dir_all(dir.join("out")).map_err(|error| Failure::from(format!("cannot make {}: {error}", dir.display())))?;
+    Arc::new(Output::parse(text))
+}
+
+fn job(workspace: &Workspace, targets: &Targets, unit: usize, entry: (usize, usize), ran: &Ran) -> Result<Script, Failure> {
+    let dir = store::dir(workspace, unit);
+    let made = store::forget(workspace, unit).and_then(|()| std::fs::create_dir_all(dir.join("out")));
+    made.map_err(|error| Failure::from(format!("cannot make {}: {error}", dir.display())))?;
     let vars = script::script_vars(workspace, targets, unit, &metadata(workspace, unit, ran));
     let package = &workspace.packages[workspace.graph.units[unit].package].manifest;
-    Ok(Script { entry, closure, vars, dir: package.dir.clone(), log: dir.join("stderr") })
+    Ok(Script { entry, vars, dir: package.dir.clone(), log: dir.join("stderr") })
 }

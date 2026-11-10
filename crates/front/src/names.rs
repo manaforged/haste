@@ -87,11 +87,12 @@ pub struct ItemRef {
 }
 
 const INNER: u32 = 1 << 31;
-const INNER_BITS: u32 = 10;
+const INNER_BITS: u32 = 16;
 
 impl ItemRef {
     /// Item `index` of those declared in the body of `self`.
     pub fn inner(self, index: u32) -> ItemRef {
+        assert!(self.item < INNER >> INNER_BITS && index < 1 << INNER_BITS, "item {} of a body in item {} does not fit an ItemRef", index, self.item);
         ItemRef { item: INNER | self.item << INNER_BITS | index, ..self }
     }
 

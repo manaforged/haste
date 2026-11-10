@@ -378,9 +378,9 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// `Fn::call` or `FnMut::call_mut`, the first that an impl gives `ty` at the argument tuple `tuple`.
+    /// `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once`, the first that an impl gives `ty` at the argument tuple `tuple`.
     fn callable_impl(&mut self, ty: Ty, tuple: Ty) -> Result<Option<ItemRef>> {
-        for (lang, name) in [("fn", "call"), ("fn_mut", "call_mut")] {
+        for (lang, name) in [("fn", "call"), ("fn_mut", "call_mut"), ("fn_once", "call_once")] {
             let Some(of) = self.cx.lang_item(lang) else { continue };
             if self.trial(|infer| Ok(infer.select(of, ty, &[tuple])?.map(|_| ())))?.is_some() {
                 return Ok(self.cx.trait_member(of, name));
@@ -435,10 +435,7 @@ impl Infer<'_, '_> {
 
     /// Whether `found` coerces to `wanted` by a coercion or by giving up the `mut` of a reference.
     pub(super) fn coerces_to(&mut self, found: Ty, wanted: Ty) -> bool {
-        let shared = match (self.cx.types.kind(self.resolve(found)), self.cx.types.kind(self.resolve(wanted))) {
-            (&Kind::Ref(Mut::Mut, a), &Kind::Ref(Mut::Not, b)) => Some((a, b)),
-            _ => None,
-        };
+        let shared = self.weakened(found, wanted);
         self.probe(|infer| matches!(infer.coercion(found, wanted), Ok(Some(_))) || shared.is_some_and(|(a, b)| infer.unify(a, b).is_ok()))
     }
 

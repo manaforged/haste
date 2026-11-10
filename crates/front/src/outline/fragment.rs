@@ -56,7 +56,7 @@ fn single_eq(src: &Source, at: u32) -> bool {
 fn ty_stops(src: &Source, at: u32, first: bool) -> bool {
     let kind = src.kind(at);
     let word = if is_name(kind) { src.text(at) } else { "" };
-    let block = !first && (kind == TokenKind::OpenBrace || (kind == TokenKind::OpenBracket && ends_type(src, at)));
+    let block = kind == TokenKind::OpenBrace || (!first && kind == TokenKind::OpenBracket && ends_type(src, at));
     single_eq(src, at) || kind == TokenKind::Or || single_colon(src, at) || matches!(word, "as" | "where") || block
 }
 

@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use haste_codegen::{Block, StackSlot, Type, Value};
 
 use crate::body::{Expr, ExprId, List, UnOp};
@@ -265,7 +265,12 @@ impl Lower<'_, '_> {
 
     /// The index of the reached instance of `item` at `substs`.
     pub(super) fn reached_index(&self, item: ItemRef, substs: &[Ty]) -> Result<usize> {
-        self.reached.index.get(&(item, substs.to_vec())).copied().ok_or_else(|| anyhow!("a use of `{}` that was not reached", self.cx.name(item)))
+        let instance = (item, substs.to_vec());
+        if let Some(&index) = self.reached.index.get(&instance) {
+            return Ok(index);
+        }
+        self.slots.want(instance);
+        bail!("a use of `{}` that was not reached", self.cx.name(item))
     }
 
     /// The code address of reached function `index`, read from its call table entry.

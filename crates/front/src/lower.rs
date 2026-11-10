@@ -42,8 +42,10 @@ pub trait Slots {
     fn zeroed(&self, len: usize) -> i64;
     /// The address of a table of `words` that lives as long as the program, each `Word::Code` holding a code address once every function is compiled.
     fn table(&self, words: &[Word]) -> i64;
-    /// The address of the zeroed, 16-byte-aligned cell of `size` bytes that holds the value of the static whose initializer is reached function `index`.
+    /// The address of the zeroed, 16-byte-aligned cell of `size` bytes and one more that holds the value of the static whose initializer is reached function `index`, then whether it is filled.
     fn cell(&self, index: usize, size: u32) -> i64;
+    /// Notes that lowering used `instance`, which was not reached, so a caller that reaches functions on demand can reach it and lower again.
+    fn want(&self, _instance: crate::sema::reach::Instance) {}
 }
 
 /// One machine word of a constant table: a number, or the code address of reached function `index`.
@@ -222,8 +224,12 @@ impl Lower<'_, '_> {
         self.b.switch_to_block(start);
         self.moved = self.moved_paths()?;
         self.declare_params(entry)?;
+        let filling = is_static(self.cx, self.reached.list[self.index].0.0);
+        if filling {
+            self.mark_static()?;
+        }
         let value = self.root_value()?;
-        match is_static(self.cx, self.reached.list[self.index].0.0) {
+        match filling {
             true => self.fill_static(value)?,
             false => self.finish(value)?,
         }

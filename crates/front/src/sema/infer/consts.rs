@@ -410,15 +410,22 @@ impl Infer<'_, '_> {
             Expr::Array(items) => arena.list(items).len() as u128,
             Expr::Repeat(_, count) => self.const_eval(arena, count, USIZE)?.0,
             Expr::Paren(inner) | Expr::Ref { expr: inner, .. } => self.const_len(arena, inner)?,
-            Expr::Path(path) => {
-                let (segments, absolute, dollar) = self.segments(arena, path);
-                match self.value_def(&segments, absolute, dollar)? {
-                    Def::Item(item) if self.cx.item(item).1.kind == ItemKind::Const => self.with_const_body(item, &[], |infer, body, root| infer.const_len(body, root))?,
-                    _ => bail!("`{}` is not a constant whose length is known", self.spell(&segments)),
-                }
-            }
+            Expr::Path(path) => self.const_len_path(arena, path)?,
             ref other => bail!("the length of {other:?} in a constant"),
         })
+    }
+
+    /// The length of the constant array or string that `path` names: a constant item, or an associated constant such as `Kind::ALL`.
+    fn const_len_path(&mut self, arena: &Body, path: PathId) -> Result<u128> {
+        let (segments, absolute, dollar) = self.segments(arena, path);
+        let (item, substs) = match self.value_def(&segments, absolute, dollar) {
+            Ok(Def::Item(item)) => (item, Vec::new()),
+            _ => self.const_target(arena, path)?,
+        };
+        if self.cx.item(item).1.kind != ItemKind::Const {
+            bail!("`{}` is not a constant whose length is known", self.spell(&segments));
+        }
+        self.with_const_body(item, &substs, |infer, body, root| infer.const_len(body, root))
     }
 
     /// The value of the integer constant that the path `segments` names: an associated constant of an integer type, or a constant item.

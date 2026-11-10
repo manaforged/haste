@@ -17,6 +17,7 @@ pub struct Reached {
     /// The bodies whose types have no layout yet, which lowering would fail on.
     pub unlaid: Vec<String>,
     calls: Vec<Vec<usize>>,
+    untyped: rustc_hash::FxHashSet<usize>,
 }
 
 impl Reached {
@@ -41,6 +42,24 @@ impl Reached {
     /// The first function in `closure` that did not type-check or, by `broken`, did not compile, with why.
     pub fn failure<'r>(&'r self, closure: &[usize], broken: &'r HashMap<usize, String>) -> Option<(usize, &'r String)> {
         closure.iter().find_map(|&at| Some((at, self.list[at].1.as_ref().err().or_else(|| broken.get(&at))?)))
+    }
+
+    /// The index of `instance`, and whether it is new: a new one is listed without its body until `infer_declared` infers it.
+    pub fn declare(&mut self, instance: Instance) -> (usize, bool) {
+        if let Some(&at) = self.index.get(&instance) {
+            return (at, false);
+        }
+        let at = self.list.len();
+        self.index.insert(instance.clone(), at);
+        self.list.push((instance, Err(String::new())));
+        self.untyped.insert(at);
+        (at, true)
+    }
+
+    /// Takes back the body of declared function `index`, so the next `infer_declared` infers it again.
+    pub fn forget(&mut self, index: usize) {
+        self.list[index].1 = Err(String::new());
+        self.untyped.insert(index);
     }
 
     fn link(&mut self, indices: &[usize]) {
@@ -92,7 +111,18 @@ pub fn reach_anew(cx: &mut Context<'_>, reached: &mut Reached, dead: &[usize], r
     found
 }
 
-fn calls<'t>(cx: &'t Context<'_>, typed: &'t Result<std::rc::Rc<Typed>, String>) -> impl Iterator<Item = Instance> + 't {
+/// Infers declared function `index` when it has no body yet, and returns whether it did.
+pub fn infer_declared(cx: &mut Context<'_>, reached: &mut Reached, index: usize) -> bool {
+    if !reached.untyped.remove(&index) {
+        return false;
+    }
+    let instance = reached.list[index].0.clone();
+    reached.list[index].1 = typed_once(cx, &instance, &mut reached.unlaid);
+    true
+}
+
+/// The functions that the inferred body `typed` calls, other than intrinsics.
+pub fn calls<'t>(cx: &'t Context<'_>, typed: &'t Result<std::rc::Rc<Typed>, String>) -> impl Iterator<Item = Instance> + 't {
     typed.iter().flat_map(|typed| typed.calls()).filter(|(item, _)| cx.intrinsic(*item).is_none()).map(|(item, substs)| (item, substs.to_vec()))
 }
 

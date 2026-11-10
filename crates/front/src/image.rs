@@ -1,10 +1,13 @@
 //! One process image: a call table with one entry per reached function, the code it points at, and constant data.
 
 mod expand;
+mod lazy;
 mod script;
+mod stub;
 mod workers;
 
-pub use expand::Job;
+pub use expand::{Job, run_macros};
+pub use lazy::{Answerer, Demand, Driver, Ended, entries, run_on_demand, serve};
 pub use script::Script;
 
 use std::cell::RefCell;
@@ -30,12 +33,13 @@ pub struct Image {
     table: usize,
     capacity: usize,
     memory: Memory,
+    stubs: Memory,
     shared: RefCell<Shared>,
     state: RefCell<Shared>,
     tables: RefCell<HashMap<Vec<Word>, i64>>,
     fixups: RefCell<Vec<(usize, usize)>>,
     cells: RefCell<HashMap<usize, i64>>,
-    statics: rustc_hash::FxHashSet<usize>,
+    wanted: RefCell<Vec<crate::sema::reach::Instance>>,
 }
 
 impl Slots for Image {
@@ -66,11 +70,15 @@ impl Slots for Image {
         self.state.borrow_mut().alloc(len).unwrap_or_else(|error| panic!("{error}")) as i64
     }
 
+    fn want(&self, instance: crate::sema::reach::Instance) {
+        self.wanted.borrow_mut().push(instance);
+    }
+
     fn cell(&self, index: usize, size: u32) -> i64 {
         if let Some(&address) = self.cells.borrow().get(&index) {
             return address;
         }
-        let address = self.zeroed(size as usize);
+        let address = self.zeroed(size as usize + 1);
         self.cells.borrow_mut().insert(index, address);
         address
     }
@@ -95,7 +103,7 @@ impl Image {
         let table = shared.alloc(capacity * size_of::<AtomicUsize>()).map_err(|error| anyhow!(error))?;
         let memory = Memory::default();
         let state = Shared::private(STATE_BYTES).map_err(|error| anyhow!(error))?;
-        Ok(Image { table, capacity, memory, shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), statics: Default::default() })
+        Ok(Image { table, capacity, memory, stubs: Memory::default(), shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), wanted: RefCell::default() })
     }
 
     fn slot(&self, index: usize) -> &AtomicUsize {
@@ -135,14 +143,6 @@ impl Image {
         }
         self.place_statics(cx, reached, &work);
         errors.extend(self.compile_all(cx, reached, &work));
-        let failed: rustc_hash::FxHashSet<usize> = errors.iter().map(|(index, _)| *index).collect();
-        for &index in &work {
-            if !failed.contains(&index) && lower::is_static(cx, reached.list[index].0.0) {
-                self.statics.insert(index);
-            } else {
-                self.statics.remove(&index);
-            }
-        }
         self.link();
         errors
     }
@@ -175,9 +175,9 @@ impl Image {
         self.memory.write(&compiled.code).map_err(|error| anyhow!(error))
     }
 
-    /// Runs each case `(index, closure, name)`, a reached `fn(i64) -> i64` that reaches the functions `closure`, on each input and prints `name input value` lines, all in one forked child that fills each static once; a case that crashes gets its status and the cases after it run in a new child.
-    pub fn run_cases(&self, cases: &[(usize, Vec<usize>, &str)], inputs: &[i64]) -> Result<Vec<i32>> {
-        if let Some((_, _, name)) = cases.iter().find(|(index, ..)| self.slot(*index).load(Ordering::Acquire) == 0) {
+    /// Runs each case `(index, name)`, a reached `fn(i64) -> i64`, on each input and prints `name input value` lines, all in one forked child; a case that crashes gets its status and the cases after it run in a new child.
+    pub fn run_cases(&self, cases: &[(usize, &str)], inputs: &[i64]) -> Result<Vec<i32>> {
+        if let Some((_, name)) = cases.iter().find(|(index, _)| self.slot(*index).load(Ordering::Acquire) == 0) {
             bail!("{name} has no code");
         }
         let mut statuses = vec![0; cases.len()];
@@ -194,7 +194,7 @@ impl Image {
         Ok(statuses)
     }
 
-    fn run_from(&self, cases: &[(usize, Vec<usize>, &str)], inputs: &[i64]) -> Result<(usize, i32)> {
+    fn run_from(&self, cases: &[(usize, &str)], inputs: &[i64]) -> Result<(usize, i32)> {
         std::io::Write::flush(&mut std::io::stdout())?;
         let (pid, mut progress) = fork_piped(|progress| self.run_in_child(cases, inputs, progress))?;
         let mut done = Vec::new();
@@ -202,12 +202,10 @@ impl Image {
         Ok((done.len(), wait(pid)))
     }
 
-    fn run_in_child(&self, cases: &[(usize, Vec<usize>, &str)], inputs: &[i64], mut progress: std::fs::File) -> std::io::Result<()> {
+    fn run_in_child(&self, cases: &[(usize, &str)], inputs: &[i64], mut progress: std::fs::File) -> std::io::Result<()> {
         use std::io::Write;
-        let mut filled = rustc_hash::FxHashSet::default();
         let mut out = std::io::stdout().lock();
-        for (index, closure, name) in cases {
-            self.fill_statics(closure, &mut filled);
+        for (index, name) in cases {
             let address = self.slot(*index).load(Ordering::Acquire);
             // SAFETY: address is code that the encoder wrote for a native fn(i64) -> i64 signature, checked to be set before the fork.
             let case: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute::<usize, extern "C" fn(i64) -> i64>(address) };
@@ -221,20 +219,16 @@ impl Image {
     }
 
     /// Runs the program in a forked child the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling, and returns the child's exit status.
-    pub fn run_main(&self, entry: (usize, usize), closure: &[usize], args: &[String]) -> Result<i32> {
-        let pid = self.fork_main(entry, closure, args, || {})?;
+    pub fn run_main(&self, entry: (usize, usize), args: &[String]) -> Result<i32> {
+        let pid = self.fork_main(entry, args, || {})?;
         Ok(wait(pid))
     }
 
     /// Forks a child that runs `setup` and then the program from `lang_start` with `main` and `args`, and returns its pid.
-    fn fork_main(&self, (start, main): (usize, usize), closure: &[usize], args: &[String], setup: impl FnOnce()) -> Result<libc::pid_t> {
-        let (start, main) = (self.slot(start).load(Ordering::Acquire), self.slot(main).load(Ordering::Acquire));
-        if start == 0 || main == 0 {
+    fn fork_main(&self, entry: (usize, usize), args: &[String], setup: impl FnOnce()) -> Result<libc::pid_t> {
+        if self.slot(entry.0).load(Ordering::Acquire) == 0 || self.slot(entry.1).load(Ordering::Acquire) == 0 {
             bail!("`main` or `lang_start` has no code");
         }
-        let owned: Vec<std::ffi::CString> = args.iter().map(|arg| std::ffi::CString::new(arg.as_str())).collect::<Result<_, _>>()?;
-        let mut argv: Vec<*const u8> = owned.iter().map(|arg| arg.as_ptr().cast()).collect();
-        argv.push(std::ptr::null());
         std::io::Write::flush(&mut std::io::stdout())?;
         // SAFETY: no other thread runs at this point, so the child gets a consistent copy of every lock.
         let pid = unsafe { libc::fork() };
@@ -243,26 +237,22 @@ impl Image {
         }
         if pid == 0 {
             setup();
-            self.fill_statics(closure, &mut rustc_hash::FxHashSet::default());
-            // SAFETY: start is code that the encoder wrote for `lang_start::<T>(fn() -> T, isize, *const *const u8, u8) -> isize`, and main for the `fn() -> T` it takes.
-            let lang_start: extern "C" fn(usize, isize, *const *const u8, u8) -> isize = unsafe { std::mem::transmute::<usize, _>(start) };
-            let code = lang_start(main, owned.len() as isize, argv.as_ptr(), 0);
+            let code = self.enter_main(entry, args);
             // SAFETY: _exit ends the child without running the parent's destructors; lang_start flushed the program's own output.
-            unsafe { libc::_exit(code as i32) }
+            unsafe { libc::_exit(code) }
         }
         Ok(pid)
     }
 
-    fn fill_statics(&self, closure: &[usize], filled: &mut rustc_hash::FxHashSet<usize>) {
-        for &index in closure.iter().filter(|index| self.statics.contains(index)) {
-            if !filled.insert(index) {
-                continue;
-            }
-            let address = self.slot(index).load(Ordering::Acquire);
-            // SAFETY: address is code that the encoder wrote for a static's initializer, a native fn() that writes the static's cell.
-            let fill: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(address) };
-            fill();
-        }
+    /// Runs the program the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling; returns its exit status.
+    fn enter_main(&self, (start, main): (usize, usize), args: &[String]) -> i32 {
+        let (start, main) = (self.slot(start).load(Ordering::Acquire), self.slot(main).load(Ordering::Acquire));
+        let Ok(owned) = args.iter().map(|arg| std::ffi::CString::new(arg.as_str())).collect::<Result<Vec<_>, _>>() else { return 101 };
+        let mut argv: Vec<*const u8> = owned.iter().map(|arg| arg.as_ptr().cast()).collect();
+        argv.push(std::ptr::null());
+        // SAFETY: start is code that the encoder wrote, or a stub that compiles it, for `lang_start::<T>(fn() -> T, isize, *const *const u8, u8) -> isize`, and main for the `fn() -> T` it takes.
+        let lang_start: extern "C" fn(usize, isize, *const *const u8, u8) -> isize = unsafe { std::mem::transmute::<usize, _>(start) };
+        lang_start(main, owned.len() as isize, argv.as_ptr(), 0) as i32
     }
 }
 
@@ -272,6 +262,18 @@ fn wait(pid: libc::pid_t) -> i32 {
     // SAFETY: pid is a child of this process, and status is a live local.
     unsafe { libc::waitpid(pid, &mut status, 0) };
     if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) }
+}
+
+/// Makes a fatal signal end this forked child at once with status 128 plus the signal, as `wait` reports it, so no core of the whole compiler is dumped.
+pub(crate) fn quiet_crashes() {
+    extern "C" fn end(signal: libc::c_int) {
+        // SAFETY: _exit is async-signal-safe and ends the child without running the parent's destructors.
+        unsafe { libc::_exit(128 + signal) }
+    }
+    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT] {
+        // SAFETY: end is an async-signal-safe handler, and signal is a valid signal number.
+        unsafe { libc::signal(signal, end as *const () as libc::sighandler_t) };
+    }
 }
 
 /// Forks a child that runs `child` on the write end of a new pipe and exits with status 1 when it fails, and returns its pid and the read end.
@@ -287,6 +289,7 @@ pub(crate) fn fork_piped<E>(child: impl FnOnce(std::fs::File) -> Result<(), E>) 
         bail!("fork failed: {}", std::io::Error::last_os_error());
     }
     if pid == 0 {
+        quiet_crashes();
         // SAFETY: ends[0] is the read end this child does not use, and ends[1] is the write end it owns from here on.
         let out = unsafe {
             libc::close(ends[0]);

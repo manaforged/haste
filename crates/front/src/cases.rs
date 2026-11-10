@@ -175,11 +175,11 @@ impl Build {
             let failure = closure.iter().rev().find_map(|at| self.reached.list[*at].1.as_ref().err()).or_else(|| closure.iter().rev().find_map(|at| self.broken.get(at)));
             match failure {
                 Some(error) => failures.entry(error_kind(error)).or_default().push(format!("{name}: {error}")),
-                None => runnable.push((root, closure, name.as_str())),
+                None => runnable.push((root, name.as_str())),
             }
         }
         let statuses = self.image.run_cases(&runnable, &INPUTS)?;
-        for ((_, _, name), status) in runnable.iter().zip(statuses).filter(|(_, status)| *status != 0) {
+        for ((_, name), status) in runnable.iter().zip(statuses).filter(|(_, status)| *status != 0) {
             failures.entry(format!("crashed with status {status}")).or_default().push((*name).to_owned());
         }
         print_failures(&failures);
@@ -205,8 +205,17 @@ impl Build {
             let total = self.reached.list.iter().filter(|(_, typed)| typed.is_err()).count() + self.broken.len();
             bail!("{} of {} functions that `main` reaches did not compile ({total} of {} reached in all)", failures.values().map(Vec::len).sum::<usize>(), closure.len(), self.reached.list.len());
         }
-        self.image.run_main((start, main), &closure, args)
+        self.image.run_main((start, main), args)
     }
+}
+
+/// Runs the binary's `main` with `args` as argv, compiling each function on its first call.
+pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> Result<i32> {
+    let (mut outline, mut names) = eager_front(workspace, targets)?;
+    let Some(main) = main_item(workspace, &outline) else { bail!("no member binary has a `main`") };
+    let status = haste_front::image::run_on_demand(&mut outline, &mut names, main, args);
+    std::mem::forget((outline, names));
+    status
 }
 
 fn member_files(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<PathBuf> {

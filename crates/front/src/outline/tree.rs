@@ -159,6 +159,8 @@ pub struct Crate {
     pub defined: HashMap<(u32, u32), Arc<Macro>>,
     pub deferred: Vec<Waiting>,
     pub impls: Vec<Impl>,
+    /// The file and item of each module-level `const _`, whose body may hold impls that apply crate-wide.
+    pub anonymous: Vec<(usize, u32)>,
     pub members: Vec<Waiting>,
     pub fallback: Vec<usize>,
     pub foreign: Vec<Waiting>,

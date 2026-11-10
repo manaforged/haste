@@ -8,6 +8,7 @@ mod features;
 pub mod lock;
 pub mod manifest;
 pub mod script;
+pub mod store;
 
 use lock::Locked;
 use manifest::{Kind, Manifest};

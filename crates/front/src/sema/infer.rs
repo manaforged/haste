@@ -22,7 +22,7 @@ mod select;
 mod stmt;
 
 pub use clone::cloned_tuple;
-pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, closure_typed, register};
+pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, closure_typed, register};
 pub use drop::Glue;
 pub use looping::{For, Tried};
 pub use method::Adjust;
@@ -201,6 +201,7 @@ pub struct Infer<'c, 'a> {
     hidden: Vec<(u32, Ty)>,
     /// The values of the parameters of the const fns that a constant expression is calling, innermost last.
     const_args: Vec<(String, (u128, (u32, bool)))>,
+    selecting: Vec<String>,
 }
 
 /// What the `break`s of one loop or labeled block give: the type they coerce to once it is known, whether any `break` was seen, its label, and whether it is a block.
@@ -283,7 +284,7 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
 impl<'c, 'a> Infer<'c, 'a> {
     fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false, hidden: Vec::new(), const_args: Vec::new() }
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new() }
     }
 }
 
@@ -450,13 +451,21 @@ impl Infer<'_, '_> {
     /// Checks that a value of type `found` can be used where `expected` is wanted, through the coercions that keep its bits.
     pub fn coerce(&mut self, found: Ty, expected: Ty) -> Result<()> {
         let (found, expected) = (self.resolve(found), self.resolve(expected));
-        match (self.cx.types.kind(found).clone(), self.cx.types.kind(expected).clone()) {
+        match (self.cx.types.kind(found), self.weakened(found, expected)) {
             (Kind::Never, _) => Ok(()),
-            (Kind::Ref(from, a), Kind::Ptr(to, b)) | (Kind::Ref(from, a), Kind::Ref(to, b)) | (Kind::Ptr(from, a), Kind::Ptr(to, b)) if from == Mut::Mut && to == Mut::Not => self.unify(a, b),
-            (Kind::Ref(from, a), Kind::Ptr(to, b)) if from == to => self.unify(a, b),
+            (_, Some((a, b))) => self.unify(a, b),
             _ => self.unify(found, expected),
         }?;
         self.settle_pending()
+    }
+
+    /// The pointees of `found` and `expected` when a pointer of type `found` coerces to `expected` by dropping `mut` or by turning a reference into a raw pointer.
+    pub(super) fn weakened(&self, found: Ty, expected: Ty) -> Option<(Ty, Ty)> {
+        match (self.cx.types.kind(self.resolve(found)), self.cx.types.kind(self.resolve(expected))) {
+            (&Kind::Ref(from, a), &Kind::Ptr(to, b)) | (&Kind::Ref(from, a), &Kind::Ref(to, b)) | (&Kind::Ptr(from, a), &Kind::Ptr(to, b)) if from == Mut::Mut && to == Mut::Not => Some((a, b)),
+            (&Kind::Ref(from, a), &Kind::Ptr(to, b)) if from == to => Some((a, b)),
+            _ => None,
+        }
     }
 
     fn settle_pending(&mut self) -> Result<()> {
@@ -563,12 +572,6 @@ impl Infer<'_, '_> {
         let [types] = &matched[..] else { return Ok(false) };
         substs.iter().zip(types).try_for_each(|(&a, &b)| self.unify(a, b))?;
         Ok(true)
-    }
-
-    fn has_vars(&self, ty: Ty) -> bool {
-        let ty = self.resolve(ty);
-        let kind = self.cx.types.kind(ty);
-        matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || kind.children().any(|item| self.has_vars(item))
     }
 
     fn settle_metadata(&mut self) -> Result<()> {

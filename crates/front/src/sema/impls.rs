@@ -299,7 +299,7 @@ impl<'a> Context<'a> {
             return Rc::default();
         }
         let blocks = match holder {
-            Holder::Crate(krate) => (0..self.outline.crates[krate as usize].impls.len() as u32).map(|index| ImplRef::Module { krate, index }).collect(),
+            Holder::Crate(krate) => self.crate_impls(krate),
             Holder::Body(root) => self.body_impls(root),
         };
         let mark = self.asks.mark();
@@ -311,6 +311,19 @@ impl<'a> Context<'a> {
         let index = Rc::new(index);
         self.heads.insert(holder, index.clone());
         index
+    }
+
+    /// The impls of crate `krate`: those of its modules, then those in the bodies of its module-level `const _` items.
+    fn crate_impls(&mut self, krate: u32) -> Vec<ImplRef> {
+        let tree = &self.outline.crates[krate as usize];
+        let mut blocks: Vec<ImplRef> = (0..tree.impls.len() as u32).map(|index| ImplRef::Module { krate, index }).collect();
+        for &(file, item) in &tree.anonymous {
+            let root = ItemRef { krate, file: file as u32, item };
+            if self.parse_body(root).is_ok() {
+                blocks.extend(self.body_impls(root));
+            }
+        }
+        blocks
     }
 
     fn body_impls(&self, root: ItemRef) -> Vec<ImplRef> {

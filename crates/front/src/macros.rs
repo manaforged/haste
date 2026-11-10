@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::image::{Image, Job};
+use crate::image::{Demand, Job, run_macros};
 use crate::names::procs::{Bound, Site};
 use crate::names::path::Asks;
 use crate::names::{ItemRef, Names};
@@ -11,7 +11,7 @@ use crate::outline::Outline;
 use crate::outline::item::{ItemKind, ProcKind};
 use crate::outline::source::Source;
 use crate::outline::tree::PROC_MACRO_ROOT;
-use crate::graph::{Targets, Workspace};
+use crate::graph::{Targets, Workspace, store};
 use crate::sema::reach::{Instance, Reached, reach};
 use crate::sema::{Context, Store};
 
@@ -174,35 +174,33 @@ fn entries(outline: &Outline) -> Result<[ItemRef; 2]> {
     Ok([one, two].map(|item| ItemRef { krate: krate as u32, file: file as u32, item: item as u32 }))
 }
 
+/// The output of each call `bound` on its `inputs`: the one the store kept for a macro of a pinned crate, else from running it, kept when it succeeds.
 fn run(outline: &mut Outline, names: &mut Names, bound: &[(ItemRef, ProcKind)], inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
-    let pair = entries(outline)?;
-    let mut roots: Vec<Instance> = pair.iter().map(|item| (*item, Vec::new())).collect();
-    roots.extend(bound.iter().map(|(run, _)| (*run, Vec::new())));
-    roots.dedup();
-    let ask = |outline: &mut Outline, names: &mut Names, asks: Asks| names.answer(outline, asks);
-    reach_answered(outline, names, (|_: &mut Context<'_>| roots.clone(), ask), |mut cx, reached| execute(&mut cx, &reached, (pair, bound), inputs))
-}
-
-fn execute(cx: &mut Context<'_>, reached: &Reached, (pair, bound): ([ItemRef; 2], &[(ItemRef, ProcKind)]), inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
-    let (image, broken) = Image::build(cx, reached)?;
-    let mut results: Vec<Result<String, String>> = Vec::new();
-    let mut jobs = Vec::new();
-    for (&(call, kind), texts) in bound.iter().zip(inputs) {
-        let entry = reached.index[&(pair[usize::from(kind == ProcKind::Attribute)], Vec::new())];
-        let run = reached.index[&(call, Vec::new())];
-        let closure = reached.closure(&[entry, run]);
-        let failure = reached.failure(&closure, &broken).map(|(_, error)| error);
-        match failure {
-            Some(error) => results.push(Err(error.clone())),
-            None => {
-                results.push(Ok(String::new()));
-                jobs.push(Job { entry, run, closure, texts: texts.iter().map(|text| text.as_bytes()).collect() });
+    let keys: Vec<Option<u64>> = bound.iter().zip(inputs).map(|(&(call, _), texts)| Some(store::expansion_key(outline.pins[call.krate as usize]?, &macro_name(outline, call), texts))).collect();
+    let mut results: Vec<Option<Result<String, String>>> = keys.iter().map(|key| key.and_then(store::kept_expansion).map(Ok)).collect();
+    let missing: Vec<usize> = (0..bound.len()).filter(|&at| results[at].is_none()).collect();
+    if !missing.is_empty() {
+        let calls: Vec<(ItemRef, ProcKind)> = missing.iter().map(|&at| bound[at]).collect();
+        let texts: Vec<Vec<String>> = missing.iter().map(|&at| inputs[at].clone()).collect();
+        for (at, result) in missing.into_iter().zip(expand(outline, names, &calls, &texts)?) {
+            if let (Ok(text), Some(key)) = (&result, keys[at])
+                && let Err(error) = store::keep_expansion(key, text)
+            {
+                eprintln!("cannot keep the output of {}: {error}", macro_name(outline, bound[at].0));
             }
+            results[at] = Some(result);
         }
     }
-    let mut ran = image.run_macros(&jobs)?.into_iter();
-    for result in results.iter_mut().filter(|result| result.is_ok()) {
-        *result = ran.next().unwrap_or_else(|| Err("no output".to_owned())).and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()));
-    }
-    Ok(results)
+    Ok(results.into_iter().map(|result| result.unwrap_or_else(|| Err("no output".to_owned()))).collect())
+}
+
+/// Runs each call `bound` on its `inputs` in children that compile each function on its first call.
+fn expand(outline: &mut Outline, names: &mut Names, bound: &[(ItemRef, ProcKind)], inputs: &[Vec<String>]) -> Result<Vec<Result<String, String>>> {
+    let pair = entries(outline)?;
+    let mut demand = Demand::new()?;
+    let entry = pair.map(|item| demand.declare((item, Vec::new())));
+    let jobs: Vec<Job<'_>> = bound.iter().zip(inputs).map(|(&(call, kind), texts)| Job { entry: entry[usize::from(kind == ProcKind::Attribute)], run: demand.declare((call, Vec::new())), texts: texts.iter().map(|text| text.as_bytes()).collect() }).collect();
+    let ask = |outline: &mut Outline, names: &mut Names, asks: Asks| names.answer(outline, asks);
+    let ran = run_macros(outline, names, &mut demand, &jobs, &ask)?;
+    Ok(ran.into_iter().map(|result| result.and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()))).collect())
 }

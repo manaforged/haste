@@ -1,10 +1,8 @@
-//! Build scripts as Cargo runs them: the directives a script prints, the environment it runs in, and the directory it writes into.
+//! Build scripts as Cargo runs them: the directives a script prints and the environment it runs in.
 
 use std::collections::BTreeSet;
-use std::hash::BuildHasher as _;
-use std::path::PathBuf;
 
-use super::{Side, Targets, Workspace};
+use super::{Targets, Workspace};
 
 /// What a build script printed that changes how its package builds.
 #[derive(Clone, Debug, Default)]
@@ -15,6 +13,10 @@ pub struct Output {
     pub libs: Vec<String>,
     pub search: Vec<String>,
     pub metadata: Vec<(String, String)>,
+    /// The `rerun-if-changed` paths, relative to the package.
+    pub watched: Vec<String>,
+    /// The `rerun-if-env-changed` variables.
+    pub watched_vars: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +26,8 @@ enum Directive {
     LinkLib,
     LinkSearch,
     Metadata,
+    Watch,
+    WatchVar,
     Other,
 }
 
@@ -32,9 +36,9 @@ const DIRECTIVES: [(&str, Directive); 19] = [
     ("rustc-env", Directive::Env),
     ("rustc-link-lib", Directive::LinkLib),
     ("rustc-link-search", Directive::LinkSearch),
-    ("rerun-if-changed", Directive::Other),
+    ("rerun-if-changed", Directive::Watch),
     ("metadata", Directive::Metadata),
-    ("rerun-if-env-changed", Directive::Other),
+    ("rerun-if-env-changed", Directive::WatchVar),
     ("rustc-link-arg", Directive::Other),
     ("rustc-link-arg-cdylib", Directive::Other),
     ("rustc-cdylib-link-arg", Directive::Other),
@@ -82,28 +86,15 @@ impl Output {
             Directive::Metadata => self.metadata.extend(value.split_once('=').map(|(key, value)| (key.to_owned(), value.to_owned()))),
             Directive::LinkLib => self.libs.push(value.to_owned()),
             Directive::LinkSearch => self.search.push(value.to_owned()),
+            Directive::Watch => self.watched.push(value.to_owned()),
+            Directive::WatchVar => self.watched_vars.push(value.to_owned()),
             Directive::Other => {}
         }
     }
 }
 
-/// The directory under which this process runs build scripts, removed when the command ends, so that nothing is kept between runs.
-pub fn scratch() -> PathBuf {
-    std::env::temp_dir().join(format!("haste-{}", std::process::id()))
-}
-
-/// The directory that holds the build script output of `unit`: the script's `OUT_DIR` under it and its standard error.
-pub fn dir(workspace: &Workspace, unit: usize) -> PathBuf {
-    let entry = &workspace.graph.units[unit];
-    let locked = &workspace.packages[entry.package].locked;
-    let side = if entry.side == Side::Host { "host" } else { "target" };
-    let features: Vec<&str> = entry.features.iter().map(String::as_str).collect();
-    let key = rustc_hash::FxBuildHasher.hash_one(features.join(","));
-    scratch().join(format!("{}-{}-{side}-{key:016x}", locked.name, locked.version))
-}
-
 fn out_dir(workspace: &Workspace, unit: usize) -> String {
-    dir(workspace, unit).join("out").display().to_string()
+    super::store::dir(workspace, unit).join("out").display().to_string()
 }
 
 /// The variables `env!` reads in the crates of `unit`: Cargo's package variables and, when the package has a build script, its `OUT_DIR`.
