@@ -266,13 +266,8 @@ impl Infer<'_, '_> {
         if let Some(found) = self.builtin_alias(of, ty, name)? {
             return Ok(Some(found));
         }
-        let Some(mut picked) = self.select(of, ty, args)? else { return Ok(None) };
-        if self.cx.member(picked.0, name).is_none()
-            && let Some(general) = self.defining_impl(of, ty, args, name)?
-        {
-            picked = general;
-        }
-        let (block, impl_args) = picked;
+        let Some(selected) = self.select(of, ty, args)? else { return Ok(None) };
+        let (block, impl_args) = self.impl_member(of, (ty, args), selected.clone(), name)?.map_or(selected, |(_, picked)| picked);
         let frame = self.impl_frame_of(block, &impl_args, Some(ty))?;
         match self.with_frame(frame, |infer| infer.impl_alias(block, (name, own)))? {
             Some(found) => Ok(Some(found)),

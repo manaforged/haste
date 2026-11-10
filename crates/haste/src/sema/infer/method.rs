@@ -233,24 +233,24 @@ impl<'a> Infer<'_, 'a> {
         if candidate.bound.is_some() || !args.is_empty() {
             self.assume(candidate.of, &std::iter::once(self_ty).chain(args.iter().copied()).collect::<Vec<_>>())?;
         }
-        if self.compiler_impl(candidate.of, self_ty) {
+        if self.compiler_impl(candidate.of, self_ty) || self.object_holds(candidate.of, self_ty, &args) == Some(true) {
             return Ok(Some((candidate.item, std::iter::once(self_ty).chain(args).collect())));
         }
-        if self.object_holds(candidate.of, self_ty, &args) == Some(true) {
-            return Ok(Some((candidate.item, std::iter::once(self_ty).chain(args).collect())));
-        }
-        let Some((block, impl_args)) = self.trial(|infer| infer.select(candidate.of, self_ty, &args))? else {
-            if !self.may_implement(candidate.of, self_ty, &args)? {
-                return Ok(None);
-            }
-            let substs: Vec<Ty> = std::iter::once(self_ty).chain(args).collect();
-            self.obligations.push((candidate.of, substs.clone()));
-            return Ok(Some((candidate.item, substs)));
-        };
-        Ok(Some(match self.cx.member(block, self.cx.name(candidate.item)) {
-            Some(item) => (item, impl_args),
+        let Some(selected) = self.trial(|infer| infer.select(candidate.of, self_ty, &args))? else { return self.unselected_trait(candidate, self_ty, args) };
+        Ok(Some(match self.impl_member(candidate.of, (self_ty, &args), selected, self.cx.name(candidate.item))? {
+            Some((item, (_, impl_args))) => (item, impl_args),
             None => (candidate.item, std::iter::once(self_ty).chain(args).collect()),
         }))
+    }
+
+    /// The trait item itself when no one impl of its trait is selected for `self_ty` yet but one may apply, with the obligation to prove later.
+    fn unselected_trait(&mut self, candidate: TraitCandidate, self_ty: Ty, args: Vec<Ty>) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        if !self.may_implement(candidate.of, self_ty, &args)? {
+            return Ok(None);
+        }
+        let substs: Vec<Ty> = std::iter::once(self_ty).chain(args).collect();
+        self.obligations.push((candidate.of, substs.clone()));
+        Ok(Some((candidate.item, substs)))
     }
 
     /// The `Self` that makes the declared receiver type `ty` of a trait method, such as `Pin<&mut Self>`, equal `adjusted`.

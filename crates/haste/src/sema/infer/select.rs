@@ -98,13 +98,26 @@ impl<'a> Infer<'_, 'a> {
         self.obligations.extend(vars.obligations);
     }
 
-    /// The impl of trait `of` at `args` for `self_ty` that defines the member `name`, among those that apply, as a specializing impl inherits it from the impl it specializes.
-    pub(super) fn defining_impl(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], name: &str) -> Result<Option<Picked>> {
+    /// The most specialized impl of trait `of` at `args` for `self_ty` that defines the member `name`, among those that apply, as a specializing impl inherits it from the impl it specializes.
+    fn defining_impl(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], name: &str) -> Result<Option<Picked>> {
         let self_ty = self.resolve(self_ty);
-        let found = self.impl_candidates(of, self_ty, args, 0)?;
-        let Some((picked, vars)) = found.into_iter().find(|((block, _), _)| self.cx.member(*block, name).is_some()) else { return Ok(None) };
+        let mut found = self.impl_candidates(of, self_ty, args, 0)?;
+        found.retain(|((block, _), _)| self.cx.member(*block, name).is_some());
+        if found.len() > 1 {
+            found = self.most_specialized(found)?;
+        }
+        let Some((picked, vars)) = found.into_iter().next() else { return Ok(None) };
         self.adopt(vars);
         Ok(Some(picked))
+    }
+
+    /// The member `name` of the selected impl `picked` of trait `of`, or else of the impl it specializes, with the impl that defines it.
+    pub(super) fn impl_member(&mut self, of: ItemRef, (self_ty, args): (Ty, &[Ty]), picked: Picked, name: &str) -> Result<Option<(ItemRef, Picked)>> {
+        if let Some(member) = self.cx.member(picked.0, name) {
+            return Ok(Some((member, picked)));
+        }
+        let Some(general) = self.defining_impl(of, self_ty, args, name)? else { return Ok(None) };
+        Ok(self.cx.member(general.0, name).map(|member| (member, general)))
     }
 
     /// Whether every impl in `found` sets the trait arguments `args` alike, so that specialization, not inference, picks among them.
