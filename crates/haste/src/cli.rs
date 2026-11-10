@@ -59,7 +59,8 @@ fn summary(outline: &outline::Outline) -> String {
 
 fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usize) -> Result<()> {
     let started = Instant::now();
-    let (outline, names) = crate::macros::load_eager(workspace, targets, &[])?;
+    let compilation = crate::macros::load_eager(workspace, targets, &[])?;
+    let (outline, names) = (&compilation.outline, &compilation.names);
     let elapsed = started.elapsed();
     for error in outline.crates.iter().flat_map(|krate| &krate.errors) {
         eprintln!("error: {error}");
@@ -71,10 +72,10 @@ fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usiz
     eprintln!("unresolved macros {unresolved:?}");
     let foreign: usize = outline.crates.iter().map(|krate| krate.foreign.len()).sum();
     eprintln!("procedural macro calls {foreign}");
-    eprintln!("outline {} in {:.1} ms", summary(&outline), elapsed.as_secs_f64() * 1e3);
-    report_names(&outline, &names, started);
-    print_outline(workspace, &outline);
-    report_bodies(&outline, threads);
+    eprintln!("outline {} in {:.1} ms", summary(outline), elapsed.as_secs_f64() * 1e3);
+    report_names(outline, names, started);
+    print_outline(workspace, outline);
+    report_bodies(outline, threads);
     Ok(())
 }
 
@@ -84,9 +85,9 @@ pub(crate) fn is_member(workspace: &graph::Workspace, root: &outline::Root) -> b
 
 fn report_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let started = Instant::now();
-    let (outline, names) = crate::macros::load_lazy(workspace, targets)?;
-    eprintln!("lazy {} cached {} in {:.1} ms", summary(&outline), outline.cache.len(), started.elapsed().as_secs_f64() * 1e3);
-    report_names(&outline, &names, started);
+    let compilation = crate::macros::load_lazy(workspace, targets)?;
+    eprintln!("lazy {} cached {} in {:.1} ms", summary(&compilation.outline), compilation.outline.cache.len(), started.elapsed().as_secs_f64() * 1e3);
+    report_names(&compilation.outline, &compilation.names, started);
     Ok(())
 }
 
@@ -122,11 +123,11 @@ fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
 /// Loads and resolves what a sema pass asked for, and returns the store for the next pass and whether the outline changed.
 fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let started = Instant::now();
-    let (mut outline, mut names) = crate::macros::load_lazy(workspace, targets)?;
+    let mut compilation = crate::macros::load_lazy(workspace, targets)?;
     let load = started.elapsed();
-    let cases = case_items(workspace, &outline);
+    let cases = case_items(workspace, &compilation.outline);
     let mut passes = 0;
-    let failures = crate::macros::resolve_sema(&mut outline, &mut names, (sema::Cache::default(), crate::macros::load), |mut cx, last| {
+    let failures = crate::macros::resolve_sema(&mut compilation, (sema::Cache::default(), crate::macros::load), |mut cx, last| {
         passes += 1;
         let failures = typeck_pass(&mut cx, &cases);
         let settled = cx.resolved();
@@ -136,7 +137,7 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
     let failed: usize = failures.values().map(Vec::len).sum();
     print_failures(&failures);
     let ms = |at: std::time::Duration| at.as_secs_f64() * 1e3;
-    eprintln!("typeck {} cases, {} passed, {failed} failed, {passes} passes, {}, load {:.1} ms, total {:.1} ms", cases.len(), cases.len() - failed, summary(&outline), ms(load), ms(started.elapsed()));
+    eprintln!("typeck {} cases, {} passed, {failed} failed, {passes} passes, {}, load {:.1} ms, total {:.1} ms", cases.len(), cases.len() - failed, summary(&compilation.outline), ms(load), ms(started.elapsed()));
     Ok(())
 }
 
@@ -333,8 +334,8 @@ fn report_query(query: Query, (workspace, targets): (&graph::Workspace, &Targets
         Query::Typeck => report_typeck(workspace, targets),
         Query::Scope => {
             let name = argv.get(1).context(USAGE)?;
-            let (outline, names) = crate::macros::load_eager(workspace, targets, &[])?;
-            print_scope(&outline, &names, name);
+            let compilation = crate::macros::load_eager(workspace, targets, &[])?;
+            print_scope(&compilation.outline, &compilation.names, name);
             Ok(())
         }
         Query::Items | Query::Expand => Ok(()),

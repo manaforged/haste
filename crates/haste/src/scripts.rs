@@ -119,16 +119,17 @@ type Outcome = Vec<(usize, Result<Arc<Output>, Failure>)>;
 
 /// Builds and runs the scripts of the units `units` in children that compile each function on its first call.
 fn run(workspace: &Workspace, targets: &Targets, units: &[usize]) -> Result<Outcome> {
-    let (mut outline, mut names) = crate::macros::load_eager(workspace, targets, units)?;
+    let mut compilation = crate::macros::load_eager(workspace, targets, units)?;
+    let outline = &compilation.outline;
     let scripts: Vec<(usize, usize)> = outline.roots.iter().enumerate().filter(|(_, root)| root.role == Role::Script).map(|(krate, root)| (root.unit, krate)).collect();
     let mains: Vec<Option<crate::names::ItemRef>> = scripts.iter().map(|(_, krate)| outline.main(*krate)).collect();
-    let (entries, store) = image::entries(&mut outline, &mut names, (crate::sema::Cache::default(), &mains))?;
-    let mut demand = Jit::new()?;
-    let left = scripts.iter().zip(entries).map(|(&(unit, _), entry)| (unit, entry.map(|pair| pair.map(|root| demand.declare(root))))).collect();
     let owners = outline.roots.iter().map(|root| root.unit).collect();
+    let (entries, store) = image::entries(&mut compilation, (crate::sema::Cache::default(), &mains))?;
+    let mut demand = Jit::new(store)?;
+    let left = scripts.iter().zip(entries).map(|(&(unit, _), entry)| (unit, entry.map(|pair| pair.map(|root| demand.declare(root))))).collect();
     let mut driver = Runs { workspace, targets, owners, left, running: Vec::new(), ran: known(workspace), outcome: Outcome::new() };
-    image::serve(&mut outline, &mut names, (store, &crate::macros::load), &mut demand, &mut driver)?;
-    std::mem::forget((outline, names, demand));
+    image::serve(&mut compilation, &crate::macros::load, &mut demand, &mut driver)?;
+    std::mem::forget((compilation, demand));
     Ok(driver.outcome)
 }
 

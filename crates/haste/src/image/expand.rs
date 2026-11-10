@@ -7,9 +7,7 @@ use anyhow::{Result, bail};
 
 use super::Image;
 use super::lazy::{Answerer, Jit, Driver, Ended, serve};
-use crate::names::Names;
-use crate::outline::Outline;
-use crate::sema::Cache;
+use crate::macros::Compilation;
 
 /// One macro call: the declared `proc_macro` entry function, the declared macro function it runs, the one or two input texts, and its group: the calls of one macro crate from one crate, which run in order in one child so the macro's statics carry from call to call as in one compiler process.
 pub struct Job<'a> {
@@ -23,7 +21,7 @@ type One = extern "C" fn(usize, *const u8, usize, *mut usize);
 type Two = extern "C" fn(usize, *const u8, usize, *const u8, usize, *mut usize);
 
 /// Runs the jobs in children forked on `demand`, one child per group and at most one per core, answering what inference asks with `ask`, and gives each job's output text or why it has none, or `None` when it did not run; the jobs after a crash run in a new child.
-pub fn run_macros(outline: &mut Outline, names: &mut Names, demand: &mut Jit, jobs: &[Job<'_>], ask: Answerer<'_>) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
+pub fn run_macros(compilation: &mut Compilation, demand: &mut Jit, jobs: &[Job<'_>], ask: Answerer<'_>) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
     let mut parts: Vec<Vec<usize>> = Vec::new();
     let mut groups = rustc_hash::FxHashMap::default();
     for (at, job) in jobs.iter().enumerate() {
@@ -34,7 +32,7 @@ pub fn run_macros(outline: &mut Outline, names: &mut Names, demand: &mut Jit, jo
         parts[part].push(at);
     }
     let mut shares = Shares { jobs, next: vec![0; parts.len()], parts, running: Vec::new(), results: jobs.iter().map(|_| None).collect() };
-    serve(outline, names, (Cache::default(), ask), demand, &mut shares)?;
+    serve(compilation, ask, demand, &mut shares)?;
     Ok(shares.results)
 }
 

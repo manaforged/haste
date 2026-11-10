@@ -7,16 +7,16 @@ use std::sync::atomic::Ordering;
 use anyhow::{Result, anyhow, bail};
 use rustc_hash::FxHashSet as HashSet;
 
+use crate::macros::Compilation;
+use crate::names::ItemRef;
 use crate::names::path::Requests;
-use crate::names::{ItemRef, Names};
-use crate::outline::Outline;
 use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
 use crate::sema::{Context, Cache};
 
 use super::{CODE_BYTES, Image, TABLE_SLOTS, host_symbol, stub, wait};
 
 /// What answers what a pass of inference asked for, and says whether anything new loaded.
-pub type Answerer<'f> = &'f dyn Fn(&mut Outline, &mut Names, Requests) -> Result<bool>;
+pub type Answerer<'f> = &'f dyn Fn(&mut Compilation, Requests) -> Result<bool>;
 
 /// Why a function has no code yet: inference asked for names or macro output not loaded, or it did not compile.
 enum Stop {
@@ -52,9 +52,10 @@ pub trait Driver {
     fn ended(&mut self, id: usize, ended: Ended) -> Result<()>;
 }
 
-/// The functions declared so far, the image that holds their stubs and code, and the children that run it.
+/// The functions declared so far, the inference store whose types their instances name, the image that holds their stubs and code, and the children that run it.
 pub struct Jit {
     reached: Reached,
+    store: Cache,
     image: Image,
     compiled: HashSet<usize>,
     children: Vec<Option<Child>>,
@@ -63,16 +64,16 @@ pub struct Jit {
 }
 
 /// Runs the binary whose `main` is `main` with `args` as argv, starting inference from `store`, compiling each function when the program first calls it, and returns the program's exit status.
-pub fn run_on_demand(outline: &mut Outline, names: &mut Names, (store, main): (Cache, ItemRef), args: &[String]) -> Result<i32> {
-    let (mut entries, store) = entries(outline, names, (store, &[Some(main)]))?;
+pub fn run_on_demand(compilation: &mut Compilation, (store, main): (Cache, ItemRef), args: &[String]) -> Result<i32> {
+    let (mut entries, store) = entries(compilation, (store, &[Some(main)]))?;
     let roots = entries.pop().unwrap_or_else(|| Err("no `main`".to_owned())).map_err(|error| anyhow!(error))?;
-    let mut demand = Jit::new()?;
+    let mut demand = Jit::new(store)?;
     let [start, main] = roots.map(|root| demand.declare(root));
     let mut program = Program { entry: (start, main), args, status: None };
-    let store = serve(outline, names, (store, &crate::macros::load), &mut demand, &mut program)?;
+    serve(compilation, &crate::macros::load, &mut demand, &mut program)?;
     eprintln!("compiled {} of {} functions declared", demand.compiled.len(), demand.reached.list.len());
     let status = program.status.ok_or_else(|| anyhow!("the program did not start"));
-    std::mem::forget((demand, store));
+    std::mem::forget(demand);
     status
 }
 
@@ -102,8 +103,8 @@ impl Driver for Program<'_> {
 }
 
 /// For each program whose `main` is in `mains`, starting inference from `store`, its two roots, `lang_start` at the return type of `main` and `main`, or why it has none, once inference settles on them; with the store inference kept.
-pub fn entries(outline: &mut Outline, names: &mut Names, (store, mains): (Cache, &[Option<ItemRef>])) -> Result<(Vec<Result<[Instance; 2], String>>, Cache)> {
-    crate::macros::resolve_sema(outline, names, (store, crate::macros::load), |mut cx, last| {
+pub fn entries(compilation: &mut Compilation, (store, mains): (Cache, &[Option<ItemRef>])) -> Result<(Vec<Result<[Instance; 2], String>>, Cache)> {
+    crate::macros::resolve_sema(compilation, (store, crate::macros::load), |mut cx, last| {
         let roots = mains.iter().map(|main| main.ok_or_else(|| "no `fn main`".to_owned()).and_then(|item| main_roots(&mut cx, item).map_err(|error| format!("{error:#}")))).collect();
         let settled = cx.resolved();
         let released = cx.release();
@@ -111,9 +112,11 @@ pub fn entries(outline: &mut Outline, names: &mut Names, (store, mains): (Cache,
     })
 }
 
-/// Answers the asks of the children `driver` forks on `demand` until none is left, answering what inference asks for with `ask`, and returns the store inference kept.
-pub fn serve(outline: &mut Outline, names: &mut Names, (store, ask): (Cache, Answerer<'_>), demand: &mut Jit, driver: &mut dyn Driver) -> Result<Cache> {
-    let mut cx = Context::new(outline, names, store);
+/// Answers the asks of the children `driver` forks on `demand` until none is left, answering what inference asks for with `ask`; `demand` keeps what inference did.
+pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit, driver: &mut dyn Driver) -> Result<()> {
+    let mut store = std::mem::take(&mut demand.store);
+    store.forget_lookups();
+    let mut cx = Context::new(&compilation.outline, &compilation.names, store);
     driver.start(demand)?;
     while demand.children.iter().any(Option::is_some) {
         for (id, asking) in demand.ready()? {
@@ -133,9 +136,9 @@ pub fn serve(outline: &mut Outline, names: &mut Names, (store, ask): (Cache, Ans
                     }
                     Err(Stop::Asked) => {
                         let (mut kept, asked) = cx.release();
-                        demand.strict = ask(outline, names, asked)?;
+                        demand.strict = ask(compilation, asked)?;
                         kept.forget_lookups();
-                        cx = Context::new(outline, names, kept);
+                        cx = Context::new(&compilation.outline, &compilation.names, kept);
                     }
                 }
             };
@@ -147,17 +150,18 @@ pub fn serve(outline: &mut Outline, names: &mut Names, (store, ask): (Cache, Ans
         }
         driver.start(demand)?;
     }
-    Ok(cx.release().0)
+    demand.store = cx.release().0;
+    Ok(())
 }
 
 impl Jit {
-    /// A demand with no function declared, its stub and code memory mapped so that every child forked later shares them.
-    pub fn new() -> Result<Jit> {
+    /// A demand with no function declared that infers on from `store`, its stub and code memory mapped so that every child forked later shares them.
+    pub fn new(store: Cache) -> Result<Jit> {
         let reached = Reached::default();
         let mut image = Image::new(&reached)?;
         image.stubs.reserve(TABLE_SLOTS * stub::STUB_BYTES)?;
         image.memory.reserve(CODE_BYTES)?;
-        Ok(Jit { reached, image, compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
+        Ok(Jit { reached, store, image, compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
     }
 
     /// The index of `instance`, whose slot holds its stub when it is new.

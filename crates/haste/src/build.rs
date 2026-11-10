@@ -6,7 +6,8 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Result, bail};
 use crate::graph::{self, Targets};
 use crate::image::Image;
-use crate::names::{ItemRef, Names};
+use crate::macros::Compilation;
+use crate::names::ItemRef;
 use crate::outline::{self, edit::Edit};
 use crate::sema::reach::{Instance, Reached, main_roots, reach_again, reach_anew};
 use crate::sema::{self, Edited, Cache};
@@ -16,10 +17,9 @@ use crate::cli::{Failures, case_items, error_kind, is_member, print_failures};
 
 const INPUTS: [i64; 5] = [-5, 0, 1, 3, 20];
 
-/// A built workspace: its outline, names and inference store, the reached functions, and their image.
+/// A built workspace: its compilation end and inference store, the reached functions, and their image.
 pub struct Build {
-    outline: outline::Outline,
-    names: Names,
+    compilation: Compilation,
     store: Option<Cache>,
     labels: Vec<String>,
     roots: Vec<usize>,
@@ -71,11 +71,11 @@ fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reache
 impl Build {
     /// Reads, infers and compiles every case of `workspace` from nothing.
     pub fn cold(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
-        let (mut outline, mut names) = crate::macros::load_eager(workspace, targets, &[])?;
-        let (cases, roots) = case_roots(workspace, &outline);
-        let main = main_item(workspace, &outline);
+        let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
+        let (cases, roots) = case_roots(workspace, &compilation.outline);
+        let main = main_item(workspace, &compilation.outline);
         let entry_of = |cx: &mut sema::Context<'_>| main.map(|item| main_roots(cx, item)).transpose();
-        let built = crate::macros::reach_resolved(&mut outline, &mut names, |cx| with_entry(&roots, &entry_of(cx)), |mut cx, reached| {
+        let built = crate::macros::reach_resolved(&mut compilation, |cx| with_entry(&roots, &entry_of(cx)), |mut cx, reached| {
             let entry = entry_at(&reached, entry_of(&mut cx))?;
             let (image, broken) = Image::build(&mut cx, &reached)?;
             let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
@@ -83,8 +83,8 @@ impl Build {
             Ok((Some(cx.release().0), labels, roots, entry, reached, image, broken))
         })?;
         let (store, labels, roots, entry, reached, image, broken) = built;
-        let stamps = stamps(workspace, &outline);
-        Ok(Build { outline, names, store, labels, roots, entry, reached, image, broken, stamps })
+        let stamps = stamps(workspace, &compilation.outline);
+        Ok(Build { compilation, store, labels, roots, entry, reached, image, broken, stamps })
     }
 
     /// Brings the build up to date with the member files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and builds from nothing when that fails.
@@ -96,7 +96,7 @@ impl Build {
                 continue;
             }
             self.stamps[at].1 = now;
-            match self.outline.reread(&self.stamps[at].0) {
+            match self.compilation.outline.reread(&self.stamps[at].0) {
                 Ok(Edit::Same) => {}
                 Ok(Edit::Bodies(slots)) => stale.extend(slots),
                 Ok(Edit::Items(edited)) => crates.extend(edited),
@@ -117,8 +117,8 @@ impl Build {
     fn again(&mut self, stale: &[(u32, u32)]) -> bool {
         let Some(mut store) = self.store.take() else { return false };
         let touched = store.touched(self.reached.list.iter().map(|(instance, _)| instance), Edited::Files(stale));
-        store.forget(&self.outline, Edited::Files(stale));
-        let mut cx = sema::Context::new(&self.outline, &self.names, store);
+        store.forget(&self.compilation.outline, Edited::Files(stale));
+        let mut cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
         let fresh = reach_again(&mut cx, &mut self.reached, &touched);
         if !cx.resolved() {
             return false;
@@ -134,18 +134,18 @@ impl Build {
         let Some(mut store) = self.store.take() else { return false };
         let touched = store.touched(self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(&crates));
         for &krate in &crates {
-            if self.outline.reload(krate as usize).is_err() {
+            if self.compilation.outline.reload(krate as usize).is_err() {
                 return false;
             }
-            self.names.reset(krate as usize);
+            self.compilation.names.reset(krate as usize);
         }
-        if crate::macros::resolve(&mut self.outline, &mut self.names).is_err() {
+        if crate::macros::resolve(&mut self.compilation).is_err() {
             return false;
         }
-        store.forget(&self.outline, Edited::Crates(&crates));
-        let (cases, roots) = case_roots(workspace, &self.outline);
-        let main = main_item(workspace, &self.outline);
-        let mut cx = sema::Context::new(&self.outline, &self.names, store);
+        store.forget(&self.compilation.outline, Edited::Crates(&crates));
+        let (cases, roots) = case_roots(workspace, &self.compilation.outline);
+        let main = main_item(workspace, &self.compilation.outline);
+        let mut cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
         let entry = main.map(|item| main_roots(&mut cx, item)).transpose();
         let fresh = reach_anew(&mut cx, &mut self.reached, &touched, &with_entry(&roots, &entry));
         if !cx.resolved() {
@@ -157,7 +157,7 @@ impl Build {
         self.labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
         self.roots = roots.iter().map(|root| self.reached.index[root]).collect();
         self.store = Some(cx.release().0);
-        self.stamps = stamps(workspace, &self.outline);
+        self.stamps = stamps(workspace, &self.compilation.outline);
         true
     }
 
@@ -194,8 +194,8 @@ impl Build {
     pub fn run(&mut self, args: &[String]) -> Result<i32> {
         let Some([_, main]) = self.entry else { bail!("no member binary has a `main`") };
         let main = self.reached.list[main].0.0;
-        let (outline, names, store) = (&mut self.outline, &mut self.names, &mut self.store);
-        let child = crate::image::fork_child(|| crate::image::run_on_demand(outline, names, (store.take().unwrap_or_default(), main), args).unwrap_or_else(|error| {
+        let (compilation, store) = (&mut self.compilation, &mut self.store);
+        let child = crate::image::fork_child(|| crate::image::run_on_demand(compilation, (store.take().unwrap_or_default(), main), args).unwrap_or_else(|error| {
             eprintln!("error: {error:#}");
             1
         }))?;
@@ -205,10 +205,10 @@ impl Build {
 
 /// Runs the binary's `main` with `args` as argv, compiling each function on its first call.
 pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> Result<i32> {
-    let (mut outline, mut names) = crate::macros::load_eager(workspace, targets, &[])?;
-    let Some(main) = main_item(workspace, &outline) else { bail!("no member binary has a `main`") };
-    let status = crate::image::run_on_demand(&mut outline, &mut names, (sema::Cache::default(), main), args);
-    std::mem::forget((outline, names));
+    let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
+    let Some(main) = main_item(workspace, &compilation.outline) else { bail!("no member binary has a `main`") };
+    let status = crate::image::run_on_demand(&mut compilation, (sema::Cache::default(), main), args);
+    std::mem::forget(compilation);
     status
 }
 
