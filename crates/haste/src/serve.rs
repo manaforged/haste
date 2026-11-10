@@ -92,11 +92,11 @@ pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<
     Ok(Some(i32::from_le_bytes(status)))
 }
 
-/// Builds `workspace` once, then answers requests until the process is killed.
+/// Loads `workspace` once, then answers requests until the process is killed.
 pub fn serve(workspace: &graph::Workspace, targets: &Targets, root: &std::path::Path) -> Result<()> {
     let listener = listen(root)?;
     let started = Instant::now();
-    let mut build = Some(Build::cold(workspace, targets)?);
+    let mut build = Some(Build::load(workspace, targets)?);
     eprintln!("serving {} after {:.1} ms", root.display(), started.elapsed().as_secs_f64() * 1e3);
     loop {
         // SAFETY: listener is a listening socket; accept returns a new descriptor or -1.
@@ -165,7 +165,7 @@ fn answer(build: &mut Option<Build>, (workspace, targets): (&graph::Workspace, &
     let saved = redirect(*out, *err);
     let started = Instant::now();
     let done = match request {
-        Some((request, args)) => current(build.take(), workspace, targets).and_then(|fresh| finish(build.insert(fresh), request, &args, started)),
+        Some((request, args)) => current(build.take(), workspace, targets).and_then(|fresh| finish(build.insert(fresh), workspace, (request, &args), started)),
         None => Err(anyhow::anyhow!("unknown request")),
     };
     if let Err(error) = &done {
@@ -175,8 +175,11 @@ fn answer(build: &mut Option<Build>, (workspace, targets): (&graph::Workspace, &
     done.unwrap_or(1)
 }
 
-/// Prints how long building took since `started`, runs every case for `cases` and `main` with `args` for `run`, and returns the exit status.
-pub fn finish(build: &mut Build, request: Request, args: &[String], started: Instant) -> Result<i32> {
+/// Prints how long building took since `started`, runs every case for `test` and `main` with `args` for `run`, and returns the exit status.
+pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, args): (Request, &[String]), started: Instant) -> Result<i32> {
+    if request == Request::Test {
+        build.compile_cases(workspace)?;
+    }
     let built = started.elapsed();
     match request {
         Request::Test => build.report(started, built).map(|()| 0),
@@ -186,7 +189,7 @@ pub fn finish(build: &mut Build, request: Request, args: &[String], started: Ins
         }
         Request::Run => {
             eprintln!("built in {:.1} ms", built.as_secs_f64() * 1e3);
-            build.run(args)
+            build.run(workspace, args)
         }
     }
 }
@@ -221,7 +224,7 @@ fn close_all(fds: &[RawFd]) {
 fn current(build: Option<Build>, workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
     match build {
         Some(mut build) => build.refresh(workspace, targets).map(|()| build),
-        None => Build::cold(workspace, targets),
+        None => Build::load(workspace, targets),
     }
 }
 

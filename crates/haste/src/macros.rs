@@ -29,6 +29,11 @@ impl Compilation {
         let names = Names::new(workspace, &outline);
         Compilation { outline, names, expander: None }
     }
+
+    /// Drops the macro expander once loading settles, so that a later expansion compiles the macros again from the current outline.
+    pub fn settle(&mut self) {
+        self.expander = None;
+    }
 }
 
 /// Loads every module of every crate, with the build scripts of the units `scripts`, resolves every import and expands every procedural macro call, then drops the macro expander.
@@ -38,7 +43,6 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
     let mut compilation = Compilation::new(workspace, outline);
     compilation.names.crates.iter_mut().for_each(|krate| krate.eager = true);
     resolve(&mut compilation)?;
-    compilation.expander = None;
     Ok(compilation)
 }
 
@@ -52,7 +56,6 @@ pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<Compilation
     let mut compilation = Compilation::new(workspace, outline);
     members.iter().for_each(|krate| compilation.names.crates[*krate].eager = true);
     resolve(&mut compilation)?;
-    compilation.expander = None;
     Ok(compilation)
 }
 
@@ -74,8 +77,14 @@ fn reach_with<R>(compilation: &mut Compilation, (roots, ask): (impl Fn(&mut Cont
     })
 }
 
-/// Runs `pass` on a context over `store`, answering with `ask` what it asked for, until it gives a result: `pass` returns its result, or the released context to answer and run again, and learns whether the last answer loaded nothing new.
-pub fn resolve_sema<R>(compilation: &mut Compilation, (mut store, ask): (Cache, impl Fn(&mut Compilation, Requests) -> Result<bool>), mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
+/// Runs `pass` on a context over `store`, answering with `ask` what it asked for, until it gives a result: `pass` returns its result, or the released context to answer and run again, and learns whether the last answer loaded nothing new. Drops the macro expander at the end.
+pub fn resolve_sema<R>(compilation: &mut Compilation, asking: (Cache, impl Fn(&mut Compilation, Requests) -> Result<bool>), pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
+    let done = answer_passes(compilation, asking, pass);
+    compilation.settle();
+    done
+}
+
+fn answer_passes<R>(compilation: &mut Compilation, (mut store, ask): (Cache, impl Fn(&mut Compilation, Requests) -> Result<bool>), mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
     let mut last = false;
     loop {
         let (mut kept, asks) = match pass(Context::new(&compilation.outline, &compilation.names, store), last)? {
@@ -88,10 +97,11 @@ pub fn resolve_sema<R>(compilation: &mut Compilation, (mut store, ask): (Cache, 
     }
 }
 
-/// Settles names, then expands every procedural macro call they bind and settles again, until no call is left to bind.
+/// Settles names, then expands every procedural macro call they bind and settles again, until no call is left to bind, then drops the macro expander.
 pub fn resolve(compilation: &mut Compilation) -> Result<()> {
-    compilation.names.resolve(&mut compilation.outline)?;
-    expand_bound(compilation)
+    let done = compilation.names.resolve(&mut compilation.outline).and_then(|()| expand_bound(compilation));
+    compilation.settle();
+    done
 }
 
 /// Expands every procedural macro call that resolved names bind and resolves again, loading what the binding asked for, until no call is left to bind.

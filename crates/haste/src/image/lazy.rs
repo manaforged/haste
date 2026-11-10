@@ -11,7 +11,8 @@ use crate::macros::Compilation;
 use crate::names::ItemRef;
 use crate::names::path::Requests;
 use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
-use crate::sema::{Context, Cache};
+use crate::outline::Outline;
+use crate::sema::{Context, Cache, Edited};
 
 use super::{CODE_BYTES, Image, TABLE_SLOTS, host_symbol, stub, wait};
 
@@ -57,34 +58,67 @@ pub struct Jit {
     reached: Reached,
     store: Cache,
     image: Image,
+    stubs: Vec<usize>,
     compiled: HashSet<usize>,
     children: Vec<Option<Child>>,
     strict: bool,
     expanded: HashSet<usize>,
 }
 
+/// A binary kept between runs: its `main`, and each function it called, compiled on that first call.
+pub struct Program {
+    jit: Jit,
+    entry: (usize, usize),
+}
+
+impl Program {
+    /// The binary whose `main` is `main`, inferring on from `store`, with nothing compiled yet.
+    pub fn new(compilation: &mut Compilation, store: Cache, main: ItemRef) -> Result<Program> {
+        let (mut entries, store) = entries(compilation, (store, &[Some(main)]))?;
+        let roots = entries.pop().unwrap_or_else(|| Err("no `main`".to_owned())).map_err(|error| anyhow!(error))?;
+        let mut jit = Jit::new(store)?;
+        let [start, main] = roots.map(|root| jit.declare(root));
+        Ok(Program { jit, entry: (start, main) })
+    }
+
+    /// Runs `main` with `args` as argv in a forked child, compiling each function it calls that has no code yet, and returns its exit status.
+    pub fn run(&mut self, compilation: &mut Compilation, args: &[String]) -> Result<i32> {
+        let mut run = Run { entry: self.entry, args, status: None };
+        let served = serve(compilation, &crate::macros::load, &mut self.jit, &mut run);
+        compilation.settle();
+        served?;
+        eprintln!("compiled {} of {} functions declared", self.jit.compiled.len(), self.jit.reached.list.len());
+        run.status.ok_or_else(|| anyhow!("the program did not start"))
+    }
+
+    /// Takes back the code and inference of the functions that the bodies `edited` touch, so that the next run compiles them again.
+    pub fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
+        self.jit.forget(outline, edited);
+    }
+
+    /// The inference store, without what the crates `edited` touch.
+    pub fn into_store(mut self, outline: &Outline, edited: Edited<'_>) -> Cache {
+        self.jit.store.forget(outline, edited);
+        std::mem::take(&mut self.jit.store)
+    }
+}
+
 /// Runs the binary whose `main` is `main` with `args` as argv, starting inference from `store`, compiling each function when the program first calls it, and returns the program's exit status.
 pub fn run_on_demand(compilation: &mut Compilation, (store, main): (Cache, ItemRef), args: &[String]) -> Result<i32> {
-    let (mut entries, store) = entries(compilation, (store, &[Some(main)]))?;
-    let roots = entries.pop().unwrap_or_else(|| Err("no `main`".to_owned())).map_err(|error| anyhow!(error))?;
-    let mut demand = Jit::new(store)?;
-    let [start, main] = roots.map(|root| demand.declare(root));
-    let mut program = Program { entry: (start, main), args, status: None };
-    serve(compilation, &crate::macros::load, &mut demand, &mut program)?;
-    eprintln!("compiled {} of {} functions declared", demand.compiled.len(), demand.reached.list.len());
-    let status = program.status.ok_or_else(|| anyhow!("the program did not start"));
-    std::mem::forget(demand);
+    let mut program = Program::new(compilation, store, main)?;
+    let status = program.run(compilation, args);
+    std::mem::forget(program);
     status
 }
 
-/// The program `main` runs, and its exit status once it ends.
-struct Program<'a> {
+/// One run of a program's `main`, and its exit status once it ends.
+struct Run<'a> {
     entry: (usize, usize),
     args: &'a [String],
     status: Option<i32>,
 }
 
-impl Driver for Program<'_> {
+impl Driver for Run<'_> {
     fn start(&mut self, demand: &mut Jit) -> Result<()> {
         if self.status.is_none() && demand.children.is_empty() {
             let (entry, args) = (self.entry, self.args);
@@ -150,6 +184,7 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
         }
         driver.start(demand)?;
     }
+    demand.children.clear();
     demand.store = cx.release().0;
     Ok(())
 }
@@ -161,7 +196,19 @@ impl Jit {
         let mut image = Image::new(&reached)?;
         image.stubs.reserve(TABLE_SLOTS * stub::STUB_BYTES)?;
         image.memory.reserve(CODE_BYTES)?;
-        Ok(Jit { reached, store, image, compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
+        Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
+    }
+
+    /// Drops the inference and code of the declared functions that `edited` touches and points their slots back at their stubs, so that the next call compiles them again.
+    fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
+        let touched = self.store.touched(self.reached.list.iter().map(|(instance, _)| instance), edited);
+        self.store.forget(outline, edited);
+        for at in touched {
+            self.reached.forget(at);
+            self.compiled.remove(&at);
+            self.image.slot(at).store(self.stubs[at], Ordering::Release);
+        }
+        self.expanded.clear();
     }
 
     /// The index of `instance`, whose slot holds its stub when it is new.
@@ -170,6 +217,7 @@ impl Jit {
         if new {
             let code = self.image.stubs.write(&stub::code(at)).unwrap_or_else(|error| panic!("{error}"));
             self.image.slot(at).store(code, Ordering::Release);
+            self.stubs.push(code);
         }
         at
     }
