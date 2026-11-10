@@ -47,6 +47,8 @@ pub enum Intrinsic {
     NoOp,
     BlackBox,
     Offset(bool),
+    /// A thin pointer with only the address bits a mask keeps.
+    PtrMask,
     OffsetFrom(bool),
     Read,
     Write,
@@ -92,7 +94,7 @@ pub enum Atomic {
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
 const LLVM: [(&str, Intrinsic); 2] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32))];
 
-const NAMES: [(&str, Intrinsic); 127] = {
+const NAMES: [(&str, Intrinsic); 128] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -163,6 +165,7 @@ const NAMES: [(&str, Intrinsic); 127] = {
         ("black_box", BlackBox),
         ("offset", Offset(true)),
         ("arith_offset", Offset(false)),
+        ("ptr_mask", PtrMask),
         ("ptr_offset_from", OffsetFrom(true)),
         ("ptr_offset_from_unsigned", OffsetFrom(false)),
         ("read_via_copy", Read),

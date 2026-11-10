@@ -14,6 +14,7 @@ mod merge;
 mod promote;
 mod target;
 mod verify;
+mod arm64;
 mod x64;
 
 pub use builder::{FunctionBuilder, Ins, Mark};
@@ -71,6 +72,7 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
     let code = match target.arch {
         Arch::X64 => x64::compile(&func),
+        Arch::Arm64 => arm64::compile(&func, target),
         other => Err(format!("no encoder for {other:?} yet")),
     };
     code.map_err(|message| Error::new(ErrorKind::Unsupported, message))

@@ -484,7 +484,7 @@ impl Infer<'_, '_> {
         self.diverges = before || (then_diverges && self.diverges);
         let target = match self.known(expected) {
             Some(target) => target,
-            None => match self.slice_branch(then_ty, else_ty) {
+            None => match self.slice_branch(then_ty, else_ty).map_or_else(|| self.fn_branch(then_ty, else_ty), |target| Ok(Some(target)))? {
                 Some(target) => target,
                 None => return self.join(then_ty, else_ty),
             },
@@ -525,6 +525,17 @@ impl Infer<'_, '_> {
             (Kind::Slice(_), Kind::Array(..)) => Some(a),
             _ => None,
         }
+    }
+
+    /// The function pointer type both branches reify to, when they are two different function items, as rustc's common type of two branches does.
+    fn fn_branch(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
+        let (a, b) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
+        let (Kind::FnDef(item, substs), Kind::FnDef(..)) = (&a, &b) else { return Ok(None) };
+        if a == b {
+            return Ok(None);
+        }
+        let (params, ret) = self.fn_types(*item, substs)?;
+        Ok(Some(self.cx.types.intern(Kind::FnPtr(params, ret))))
     }
 
     fn shared_pointer(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
