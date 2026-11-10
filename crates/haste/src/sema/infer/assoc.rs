@@ -140,9 +140,9 @@ impl Infer<'_, '_> {
         if substs.len() < count || self.object_holds(of, substs[0], &substs[1..count]) == Some(true) {
             return Ok(Res::Fn(item, substs));
         }
-        let Some((block, mut args)) = self.select(of, substs[0], &substs[1..count])? else { return Ok(Res::Fn(item, substs)) };
-        Ok(match self.cx.member(block, self.cx.name(item)) {
-            Some(member) => {
+        let Some(selected) = self.select(of, substs[0], &substs[1..count])? else { return Ok(Res::Fn(item, substs)) };
+        Ok(match self.impl_member(of, (substs[0], &substs[1..count]), selected, self.cx.name(item))? {
+            Some((member, (_, mut args))) => {
                 args.extend(substs[count..].iter().map(|ty| self.zonk(*ty)));
                 Res::Fn(member, args.into_iter().map(|ty| self.zonk(ty)).collect())
             }
