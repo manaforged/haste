@@ -235,7 +235,7 @@ impl Context<'_> {
         if self.lang(item) == Some("panic_impl") {
             return Some(Intrinsic::Trap);
         }
-        let marked = entry.kind == ItemKind::Fn && entry.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_intrinsic"));
+        let marked = self.rustc_intrinsic(item);
         let name = src.text(entry.name?);
         if let Some(link) = self.attr_value(item, "link_name")
             && let Some(&(_, which)) = LLVM.iter().find(|(known, _)| *known == link)
@@ -246,5 +246,11 @@ impl Context<'_> {
             return Some(Intrinsic::Cpuid);
         }
         marked.then(|| NAMES.iter().find(|(known, _)| *known == name).map(|(_, which)| *which)).flatten()
+    }
+
+    /// Whether the function `item` carries `#[rustc_intrinsic]`.
+    pub fn rustc_intrinsic(&self, item: ItemRef) -> bool {
+        let (src, entry) = self.item(item);
+        entry.kind == ItemKind::Fn && entry.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_intrinsic"))
     }
 }

@@ -254,10 +254,14 @@ impl<'a> Context<'a> {
         kids.get(&parent).cloned().unwrap_or_else(|| Rc::from([]))
     }
 
-    /// Whether `item` is a function or static declared in an `extern` block, which the host links by name.
+    /// Whether `item` is a function or static declared in an `extern` block, or a bodyless float intrinsic with a host function, which the host links by name.
     pub fn foreign(&self, item: ItemRef) -> bool {
-        let (_, entry) = self.item(item);
-        matches!(entry.kind, ItemKind::Fn | ItemKind::Static) && entry.body.is_none() && self.parent_item(item).is_some_and(|parent| self.item(parent).1.kind == ItemKind::ExternBlock)
+        let (src, entry) = self.item(item);
+        if !matches!(entry.kind, ItemKind::Fn | ItemKind::Static) || entry.body.is_some() {
+            return false;
+        }
+        let external = self.parent_item(item).is_some_and(|parent| self.item(parent).1.kind == ItemKind::ExternBlock);
+        external || (self.rustc_intrinsic(item) && entry.name.is_some_and(|at| crate::host::intrinsic(src.text(at)).is_some()))
     }
 
     /// What the body that defines the closure type `ty` inferred for it.

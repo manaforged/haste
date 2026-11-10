@@ -1,5 +1,9 @@
 //! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hint as a no-op, `xgetbv` as no extended state enabled, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
 
+mod math;
+
+pub use math::symbol as intrinsic;
+
 use std::alloc::Layout;
 use std::ffi::CString;
 
@@ -14,7 +18,7 @@ pub fn symbol(name: &str) -> Option<usize> {
         "llvm.x86.xgetbv" => no_extended_state as *const () as usize,
         "__dso_handle" => &DSO_HANDLE as *const u8 as usize,
         "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => abort as *const () as usize,
-        _ => return dynamic(name),
+        _ => return math::symbol(name).or_else(|| dynamic(name)),
     };
     Some(shim)
 }
