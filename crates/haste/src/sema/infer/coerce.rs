@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 
 use super::super::ty::{Kind, Mut, Ty};
-use super::RECURSION_LIMIT;
+use crate::RECURSION_LIMIT;
 use super::object::Vtable;
 use super::{Infer, Res};
 

@@ -16,6 +16,9 @@ mod serve;
 
 use std::sync::OnceLock;
 
+/// How deep macro expansion, autoderef, trait selection and nested item frames go before failing, rustc's default `recursion_limit`.
+pub(crate) const RECURSION_LIMIT: usize = 128;
+
 pub use cli::main;
 
 static JOBS: OnceLock<usize> = OnceLock::new();

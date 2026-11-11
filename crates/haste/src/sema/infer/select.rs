@@ -21,9 +21,6 @@ struct Vars {
     obligations: Vec<(ItemRef, Vec<Ty>)>,
 }
 
-/// How deep impl selection follows nested where-clauses, the rustc default recursion limit.
-const DEPTH: u32 = 128;
-
 /// The traits that closures, function items and function pointers implement by the compiler, with no impl to select.
 const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
 
@@ -82,7 +79,7 @@ impl<'a> Infer<'_, 'a> {
 
     fn applicable(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
         let self_ty = self.resolve(self_ty);
-        if depth > DEPTH || matches!(self.cx.types.kind(self_ty), Kind::Var(_)) {
+        if depth as usize > crate::RECURSION_LIMIT || matches!(self.cx.types.kind(self_ty), Kind::Var(_)) {
             return Ok(Vec::new());
         }
         let mut found = self.impl_candidates(of, self_ty, args, depth)?;

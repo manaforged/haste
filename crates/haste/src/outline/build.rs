@@ -9,7 +9,6 @@ use super::source::Source;
 use super::tree::{Files, Crate, Decl, File, Held, Impl, Macro, Module, State, Textual, Waiting, textual};
 use super::{derive, mbe, rules, scan};
 
-const DEPTH: usize = 128;
 /// The item kinds that an attribute macro can stand on.
 const ATTRIBUTED: [ItemKind; 9] = [ItemKind::Fn, ItemKind::Struct, ItemKind::Enum, ItemKind::Union, ItemKind::Impl, ItemKind::Trait, ItemKind::Const, ItemKind::Static, ItemKind::Type];
 /// Builtin attributes, which never name a macro; any other attribute is looked up as one.
@@ -341,8 +340,8 @@ impl Loader<'_> {
         let item = &file.items.items[at as usize];
         let (Some(name), Some(open)) = (item.name, item.body) else { return None };
         let name = crate::names::plain(file.source.text(name));
-        if self.depth >= DEPTH {
-            self.out.errors.push(format!("{}: macro {name} recursed past {DEPTH} levels", file.source.path.display()));
+        if self.depth >= crate::RECURSION_LIMIT {
+            self.out.errors.push(format!("{}: macro {name} recursed past {} levels", file.source.path.display(), crate::RECURSION_LIMIT));
             return None;
         }
         Some((name, mbe::expand(&definition.file.source, &definition.rules, &file.source, (open, definition.krate as u32), None)))
