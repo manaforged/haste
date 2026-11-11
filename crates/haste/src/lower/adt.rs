@@ -50,7 +50,8 @@ impl Lower<'_, '_> {
             self.write(place, base);
         }
         let layout = self.cx.layout(ty)?;
-        let types = field_types(self.cx, item, &args)?.swap_remove(variant as usize);
+        let all = field_types(self.cx, item, &args)?;
+        let types = &all[variant as usize];
         for (index, value) in fields {
             let Some(&field_ty) = types.get(index as usize) else { bail!("variant {variant} of {} has no field {index}", self.cx.name(item)) };
             let field = repr(self.cx, field_ty)?;

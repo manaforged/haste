@@ -106,7 +106,7 @@ impl<'a> Context<'a> {
         let fields = field_types(self, item, args)?;
         let sized = !super::infer::maybe_unsized(self, item)?;
         let mut layouts = Vec::with_capacity(fields.len());
-        for variant in &fields {
+        for variant in fields.iter() {
             layouts.push(variant.iter().map(|ty| self.layout(*ty)).collect::<Result<Vec<_>>>()?);
         }
         let refs: Vec<Vec<&Layout>> = layouts.iter().map(|variant| variant.iter().map(|layout| &**layout).collect()).collect();

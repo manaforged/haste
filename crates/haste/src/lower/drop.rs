@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{IntCC, StackSlot, Type, Value};
 
 use crate::body::ExprId;
-use crate::sema::infer::{Res, Shape, drop_fn, field_types, has_drop_impl, needs_drop};
+use crate::sema::infer::{Fields, Res, Shape, drop_fn, field_types, has_drop_impl, needs_drop};
 use crate::sema::ty::{Kind, Ty};
 
 use super::moves::{BOX_STEP, MovePath, Root};
@@ -265,21 +265,21 @@ impl Lower<'_, '_> {
 
     fn open_drop(&mut self, at: usize, path: &[(u32, u32)], ty: Ty, place: Option<Place>) -> Result<()> {
         let Some(place) = place else { bail!("a partly moved value with no bytes") };
-        let variants = match self.cx.types.kind(ty).clone() {
-            Kind::Tuple(items) => vec![items],
+        let variants: Fields = match self.cx.types.kind(ty).clone() {
+            Kind::Tuple(items) => vec![items].into(),
             Kind::Adt(item, args) => field_types(self.cx, item, &args)?,
             other => bail!("a partly moved {other:?}"),
         };
-        self.each_field((ty, place), variants, &mut |lower, field, field_ty, part| {
+        self.each_field((ty, place), &variants, &mut |lower, field, field_ty, part| {
             let mut sub = path.to_vec();
             sub.push(field);
             lower.drop_path(at, &sub, field_ty, Some(part))
         })
     }
 
-    fn each_field(&mut self, (ty, place): (Ty, Place), variants: Vec<Vec<Ty>>, visit: &mut dyn FnMut(&mut Self, (u32, u32), Ty, Place) -> Result<()>) -> Result<()> {
+    fn each_field(&mut self, (ty, place): (Ty, Place), variants: &[Vec<Ty>], visit: &mut dyn FnMut(&mut Self, (u32, u32), Ty, Place) -> Result<()>) -> Result<()> {
         let enumerated = variants.len() > 1;
-        for (variant, fields) in variants.into_iter().enumerate() {
+        for (variant, fields) in variants.iter().enumerate() {
             let variant = variant as u32;
             let mut each = |lower: &mut Self| -> Result<()> {
                 for (index, &field) in fields.iter().enumerate() {
@@ -396,13 +396,13 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn drop_fields(&mut self, ty: Ty, place: Place) -> Result<()> {
-        let variants = match self.cx.types.kind(ty).clone() {
-            Kind::Tuple(items) => vec![items],
+        let variants: Fields = match self.cx.types.kind(ty).clone() {
+            Kind::Tuple(items) => vec![items].into(),
             Kind::Adt(item, _) if self.cx.lang(item) == Some("manually_drop") || self.cx.item(item).1.kind == crate::outline::item::ItemKind::Union => return Ok(()),
             Kind::Adt(item, args) => field_types(self.cx, item, &args)?,
             _ => return Ok(()),
         };
-        self.each_field((ty, place), variants, &mut |lower, _, field_ty, part| lower.glue(field_ty, Some(part)))
+        self.each_field((ty, place), &variants, &mut |lower, _, field_ty, part| lower.glue(field_ty, Some(part)))
     }
 
     fn drop_elements(&mut self, inner: Ty, data: Value, count: Value) -> Result<()> {

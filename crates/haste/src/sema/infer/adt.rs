@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use anyhow::{Result, bail};
 
 use crate::body::adt::Shape;
@@ -12,16 +14,42 @@ use super::{Infer, Res};
 /// A constructor that a path names: the ADT, the index of its variant, and its type arguments.
 pub type Ctor = (ItemRef, u32, Vec<Ty>);
 
+/// The field types of each variant of an ADT at some type arguments, shared with the cache that holds them.
+pub type Fields = Rc<[Vec<Ty>]>;
+
 impl<'a> Infer<'_, 'a> {
-    /// The field types of each variant of the struct, enum or union `item` at `args`.
-    pub fn adt_fields(&mut self, item: ItemRef, args: &[Ty]) -> Result<Vec<Vec<Ty>>> {
+    /// The field types of each variant of the struct, enum or union `item` at `args`, lowered once per ADT type when no body state can change them.
+    pub fn adt_fields(&mut self, item: ItemRef, args: &[Ty]) -> Result<Fields> {
+        let (key, cached) = self.cached_fields(item, args);
+        if let Some(found) = cached {
+            return Ok(found);
+        }
+        let before = self.unsettled();
         let def = self.cx.adt_def(item)?;
         let frame = self.adt_frame(item, &def.generics.params, args)?;
-        self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty).map(|ty| infer.substitute(ty))).collect()).collect())
+        let fields: Fields = self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty).map(|ty| infer.substitute(ty))).collect()).collect::<Result<Vec<Vec<Ty>>>>())?.into();
+        let closed = self.unsettled() == before && !fields.iter().flatten().any(|&ty| self.has_vars(ty));
+        if let Some(key) = key.filter(|_| closed) {
+            self.cx.store.lookups.fields.insert(key, fields.clone());
+        }
+        Ok(fields)
     }
 
-    /// The type of the last field of the first variant of `item` at `args`, the only field that can make a struct unsized.
+    /// The key that caches the field types of `item` at `args` across bodies, the ADT type with its variables filled in, and what it holds; no key when body state or an unbound inference variable could change the answer.
+    fn cached_fields(&mut self, item: ItemRef, args: &[Ty]) -> (Option<Ty>, Option<Fields>) {
+        if !self.bodiless() || args.iter().any(|&arg| self.has_vars(arg)) {
+            return (None, None);
+        }
+        let args = args.iter().map(|&arg| self.substitute(arg)).collect();
+        let key = self.cx.types.intern(Kind::Adt(item, args));
+        (Some(key), self.cx.store.lookups.fields.get(&key).cloned())
+    }
+
+    /// The type of the last field of the first variant of `item` at `args`, the only field that can make a struct unsized, read from the cached field types when they are there.
     pub fn adt_tail_field(&mut self, item: ItemRef, args: &[Ty]) -> Result<Option<Ty>> {
+        if let (_, Some(found)) = self.cached_fields(item, args) {
+            return Ok(found.first().and_then(|variant| variant.last()).copied());
+        }
         let def = self.cx.adt_def(item)?;
         let Some(last) = def.variants.first().and_then(|variant| variant.fields.last()) else { return Ok(None) };
         let frame = self.adt_frame(item, &def.generics.params, args)?;
@@ -120,7 +148,7 @@ impl<'a> Infer<'_, 'a> {
         let ty = match shape {
             Shape::Unit => adt,
             Shape::Tuple => {
-                let fields = self.adt_fields(item, &args)?.swap_remove(variant as usize);
+                let fields = self.adt_fields(item, &args)?[variant as usize].clone();
                 self.cx.types.intern(Kind::FnPtr(fields, adt))
             }
             Shape::Named => bail!("`{}` needs its fields named", self.cx.name(item)),
@@ -136,7 +164,7 @@ impl<'a> Infer<'_, 'a> {
             let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
             self.trial(|infer| Ok(infer.unifies(adt, expected).then_some(())))?;
         }
-        let tys = self.adt_fields(item, &args)?.swap_remove(variant as usize);
+        let tys = self.adt_fields(item, &args)?[variant as usize].clone();
         for &init in body.list(fields) {
             let field = body.fields[init as usize];
             let name = plain(self.src.text(field.name));
@@ -209,7 +237,8 @@ pub fn ctor_typed(cx: &mut super::super::Context<'_>, item: ItemRef, substs: &[T
     let Some((&marker, args)) = substs.split_last() else { bail!("a constructor function with no variant") };
     let Kind::Value(variant) = *cx.types.kind(marker) else { bail!("a constructor function with no variant") };
     let variant = u32::try_from(variant)?;
-    let fields = super::detached(cx, item, |infer| infer.adt_fields(item, args))?.swap_remove(variant as usize);
+    let all = super::field_types(cx, item, args)?;
+    let fields = &all[variant as usize];
     let locals = fields.iter().map(|&ty| super::Local { ty }).collect();
     let ret = cx.types.intern(Kind::Adt(item, args.to_vec()));
     Ok(super::Typed { locals, params: (0..fields.len() as u32).collect(), ret: Some(ret), shape: super::Shape::Ctor(variant), ..super::Typed::default() })
