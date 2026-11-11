@@ -13,6 +13,9 @@ use super::Context;
 /// The generic parameters and where clause of a trait, in their own arena.
 pub type TraitGenerics = (Body, Generics);
 
+/// The lang-table key of the function `#[panic_handler]` marks, which no `#[lang]` value can spell.
+const PANIC_HANDLER: &str = "#[panic_handler]";
+
 impl<'a> Context<'a> {
     /// The generic parameters and where clause of trait `item`.
     pub fn trait_generics(&mut self, item: ItemRef) -> Result<Rc<TraitGenerics>> {
@@ -101,6 +104,14 @@ impl<'a> Context<'a> {
         entry.name.is_some_and(|name| (entry.start..name).any(|at| src.text(at) == "auto"))
     }
 
+    /// The function that a call to `item` runs: std's `#[panic_handler]` for core's `panic_impl` declaration, as the linker binds it, else `item`.
+    pub fn linked(&mut self, item: ItemRef) -> ItemRef {
+        if !self.foreign(item) || self.lang(item) != Some("panic_impl") {
+            return item;
+        }
+        self.lang_item(PANIC_HANDLER).unwrap_or(item)
+    }
+
     /// The item that `#[lang = "name"]` marks in the standard crates.
     pub fn lang_item(&mut self, name: &str) -> Option<ItemRef> {
         if let Some((table, partial)) = &self.store.lookups.langs {
@@ -110,6 +121,7 @@ impl<'a> Context<'a> {
         let (mut table, mut partial) = (HashMap::default(), Vec::new());
         for krate in self.primitive_holders() {
             let tree = &self.outline.crates[krate as usize];
+            let std = self.outline.roots[krate as usize].name == "std";
             if tree.partial() {
                 partial.push(krate);
             }
@@ -118,6 +130,8 @@ impl<'a> Context<'a> {
                     let item = ItemRef { krate, file: file as u32, item: at as u32 };
                     if let Some(lang) = self.lang(item) {
                         table.insert(lang.to_owned(), item);
+                    } else if std && items[at].kind == ItemKind::Fn && self.attr_at(item, "panic_handler").is_some() {
+                        table.insert(PANIC_HANDLER.to_owned(), item);
                     }
                 }
             }
