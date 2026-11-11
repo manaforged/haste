@@ -224,6 +224,7 @@ impl Writer {
             Builtin::Line | Builtin::Column | Builtin::File if run.depth > 0 => return Ok(false),
             Builtin::Line | Builtin::Column | Builtin::File | Builtin::Stringify => position(src, site, input, out),
             Builtin::Cfg => self.cfg(cx, src, input, out)?,
+            Builtin::ModulePath => out.lexed(&format!("{:?}", cx.outline.module_path(self.home))),
             Builtin::CfgSelect => return self.cfg_select(cx, run, open, out),
             Builtin::Assert => builtin::assert(src, &src.args(open), site.krate, out),
             Builtin::Asm => builtin::asm_barrier(src, &src.args(open), out)?,
