@@ -6,7 +6,7 @@ use rustc_index::Idx;
 use crate::body::{ExprId, List};
 use crate::names::ItemRef;
 use crate::sema::infer::{ALIGN_SLOT, field_types};
-use crate::sema::layout::{Layout, Variant, field_offset};
+use crate::sema::layout::{Layout, Variant, field_offset, target};
 use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
@@ -35,7 +35,7 @@ struct Tag {
 impl Lower<'_, '_> {
     fn tag(&mut self, layout: &Layout) -> Result<Option<Tag>> {
         let Variants::Multiple { tag, tag_encoding, tag_field, .. } = &layout.variants else { return Ok(None) };
-        let size = tag.size(super::abi::host()?);
+        let size = tag.size(target()?);
         let mask = crate::sema::ty::mask(size.bits() as u32);
         Ok(Some(Tag { offset: layout.fields.offset(tag_field.index()).bytes() as i32, ty: tag_type(size.bytes())?, mask, encoding: tag_encoding.clone() }))
     }

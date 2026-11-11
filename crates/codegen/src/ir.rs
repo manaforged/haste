@@ -33,6 +33,11 @@ impl Type {
     pub fn is_float(self) -> bool {
         matches!(self, Type::F32 | Type::F64)
     }
+
+    /// Whether the type holds an integer that fits in one general-purpose register.
+    pub fn is_small_int(self) -> bool {
+        matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+    }
 }
 
 macro_rules! ids {

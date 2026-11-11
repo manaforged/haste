@@ -43,13 +43,9 @@ pub(crate) struct Plan<R> {
     pub through: Vec<Option<i32>>,
 }
 
-pub(crate) fn small_int(ty: Type) -> bool {
-    matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
-}
-
 /// Whether planning may give a value of type `ty` a register of `regs`.
 fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
-    small_int(ty) || (ty.is_float() && !regs.float.is_empty())
+    ty.is_small_int() || (ty.is_float() && !regs.float.is_empty())
 }
 
 type Position = Option<(usize, usize)>;
@@ -86,7 +82,7 @@ fn census(func: &Function) -> Uses {
 fn consts<R>(func: &Function, locations: &mut [Location<R>]) {
     for data in &func.insts {
         if let (Some(result), Op::Const(imm)) = (data.result, &data.op)
-            && small_int(func.ty(result))
+            && func.ty(result).is_small_int()
         {
             locations[result.index()] = Location::Imm(*imm);
         }
@@ -105,16 +101,16 @@ fn static_location<R: Copy>(func: &Function, locations: &[Location<R>], op: &Op)
     match *op {
         Op::StackAddr(slot, offset) => Some(Location::Frame(slot, offset)),
         Op::Icmp(cc, x, y) => match (locations[x.index()], locations[y.index()]) {
-            (Location::Imm(a), Location::Imm(b)) if small_int(func.ty(x)) => Some(Location::Imm(i64::from(holds(cc, func.ty(x), a, b)))),
+            (Location::Imm(a), Location::Imm(b)) if func.ty(x).is_small_int() => Some(Location::Imm(i64::from(holds(cc, func.ty(x), a, b)))),
             _ => None,
         },
         Op::Binary(op, x, y) => match (locations[x.index()], locations[y.index()]) {
             (Location::Frame(slot, offset), Location::Imm(imm)) | (Location::Imm(imm), Location::Frame(slot, offset)) if op == Binary::Iadd => fold(slot, offset, imm),
-            (Location::Imm(a), Location::Imm(b)) if small_int(func.ty(x)) => constant(op, a, b).map(Location::Imm),
+            (Location::Imm(a), Location::Imm(b)) if func.ty(x).is_small_int() => constant(op, a, b).map(Location::Imm),
             _ => None,
         },
         Op::Convert(Convert::Uextend | Convert::Ireduce, x) => match locations[x.index()] {
-            Location::Imm(imm) if small_int(func.ty(x)) => Some(Location::Imm(crate::fold::extend(imm, func.ty(x), false))),
+            Location::Imm(imm) if func.ty(x).is_small_int() => Some(Location::Imm(crate::fold::extend(imm, func.ty(x), false))),
             _ => None,
         },
         _ => None,
@@ -128,7 +124,7 @@ fn statics<R: Copy>(func: &Function, locations: &mut [Location<R>]) {
         changed = false;
         for data in &func.insts {
             let Some(result) = data.result else { continue };
-            if !matches!(locations[result.index()], Location::Slot) || !small_int(func.ty(result)) {
+            if !matches!(locations[result.index()], Location::Slot) || !func.ty(result).is_small_int() {
                 continue;
             }
             if let Some(location) = static_location(func, locations, &data.op).filter(|location| func.ty(result) == Type::I64 || matches!(location, Location::Imm(_))) {
@@ -165,7 +161,7 @@ fn pairs<R>(func: &Function, locations: &[Location<R>]) -> (Vec<Option<Value>>, 
             if let (Op::Binary(op, x, y), Op::Fits(check, _, a, b), Some(sum), Some(fits)) = (&first.op, &second.op, first.result, second.result)
                 && op == check
                 && (x, y) == (a, b)
-                && small_int(func.ty(sum))
+                && func.ty(sum).is_small_int()
                 && dynamic(sum)
                 && dynamic(fits)
             {
@@ -345,7 +341,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, order: 
     let candidates: Vec<bool> = (0..count).map(|value| eligible(&live, &wanted, value)).collect();
     let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches)).collect();
     let through = if regs.absolute_calls { through(func, &locations, &census) } else { vec![None; count] };
-    let ints: Vec<bool> = (0..count).map(|value| candidates[value] && small_int(func.types[value]) && !fused[value] && through[value].is_none()).collect();
+    let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_float() && live.span[value].is_some_and(|span| !crosses(&live.calls, span))).collect();
     let (homes, used) = allocate(func, &live, &int_class(func, regs, order, params), &ints);
     place(&mut locations, homes, Location::Reg);

@@ -26,16 +26,12 @@ impl Var {
     fn add(&mut self, ty: Type, store: bool) {
         self.end = self.end.max(self.offset + i64::from(ty.bytes()));
         self.uniform &= ty == self.first;
-        self.narrow &= narrow(ty);
+        self.narrow &= ty.is_small_int();
         if store {
             self.clash |= self.store.is_some_and(|home| home != ty);
             self.store = Some(ty);
         }
     }
-}
-
-fn narrow(ty: Type) -> bool {
-    matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
 }
 
 fn convert(from: Type, to: Type) -> Option<Convert> {

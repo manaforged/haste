@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow, bail};
 use rustc_abi::{AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, LayoutData, Primitive as Abi, ReprOptions, Scalar, Size, StructKind, TargetDataLayout, WrappingRange};
@@ -51,8 +52,14 @@ pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
 }
 
 /// The data layout of the machine the compiled code runs on.
-pub fn target() -> Result<TargetDataLayout> {
-    TargetDataLayout::parse_from_llvm_datalayout_string(haste_codegen::Target::host().data_layout, AddressSpace::ZERO).map_err(|_| anyhow!("bad data layout"))
+pub fn target() -> Result<&'static TargetDataLayout> {
+    static TARGET: OnceLock<TargetDataLayout> = OnceLock::new();
+    if let Some(dl) = TARGET.get() {
+        return Ok(dl);
+    }
+    let spec = haste_codegen::Target::host().data_layout;
+    let Ok(parsed) = TargetDataLayout::parse_from_llvm_datalayout_string(spec, AddressSpace::ZERO) else { bail!("bad data layout: {spec}") };
+    Ok(TARGET.get_or_init(|| parsed))
 }
 
 fn scalar(dl: &TargetDataLayout, value: Abi, valid: Option<(u128, u128)>) -> Layout {
@@ -99,10 +106,10 @@ impl Context<'_> {
 
     fn compute(&mut self, ty: Ty) -> Result<Layout> {
         let dl = target()?;
-        if let Some(layout) = self.leaf(&dl, ty)? {
+        if let Some(layout) = self.leaf(dl, ty)? {
             return Ok(layout);
         }
-        let calc = LayoutCalculator::new(&dl);
+        let calc = LayoutCalculator::new(dl);
         let fields = match self.types.kind(ty).clone() {
             Kind::Tuple(items) => items,
             Kind::FnDef(..) => Vec::new(),
