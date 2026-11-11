@@ -293,6 +293,23 @@ impl Outline {
         dependents_of(&self.users(), &mut seen, [krate])
     }
 
+    /// The package that crate `krate` belongs to.
+    pub fn package<'w>(&self, workspace: &'w Workspace, krate: usize) -> &'w crate::graph::Package {
+        &workspace.packages[workspace.graph.units[self.roots[krate].unit].package]
+    }
+
+    /// The outline errors and missing module files of every crate whose package is local, where rustc would stop the build.
+    pub fn local_errors(&self, workspace: &Workspace) -> Vec<String> {
+        let local = self.crates.iter().enumerate().filter(|(krate, _)| self.package(workspace, *krate).local());
+        let mut found: Vec<String> = local.flat_map(|(_, tree)| {
+            let missing = tree.missing.chunks(2).map(|tried| format!("file not found for module: tried {}", tried.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(" and ")));
+            tree.errors.iter().cloned().chain(missing)
+        }).collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
     /// The crates that depend directly on each crate.
     pub fn users(&self) -> Vec<Vec<usize>> {
         let mut users = vec![Vec::new(); self.deps.len()];
