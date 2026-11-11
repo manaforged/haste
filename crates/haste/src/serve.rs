@@ -175,18 +175,17 @@ fn answer(build: &mut Option<Build>, (workspace, targets): (&graph::Workspace, &
     done.unwrap_or(1)
 }
 
-/// Prints how long building took since `started`, runs every case for `test` and `main` with `args` for `run`, and returns the exit status.
+/// Builds what `request` needs, prints how long that took since `started`, then prints what failed for `build`, runs every case for `test` or `main` with `args` for `run`, and returns the exit status.
 pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, args): (Request, &[String]), started: Instant) -> Result<i32> {
-    if request == Request::Test {
-        build.compile_cases(workspace)?;
+    match request {
+        Request::Test => build.compile_cases(workspace)?,
+        Request::Build => build.compile_binary(workspace)?,
+        Request::Run => {}
     }
     let built = started.elapsed();
     match request {
         Request::Test => build.report(started, built).map(|()| 0),
-        Request::Build => {
-            eprintln!("built in {:.1} ms", built.as_secs_f64() * 1e3);
-            Ok(0)
-        }
+        Request::Build => build.check(built),
         Request::Run => {
             eprintln!("built in {:.1} ms", built.as_secs_f64() * 1e3);
             build.run(workspace, args)
