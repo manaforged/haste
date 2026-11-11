@@ -269,6 +269,11 @@ impl<'a> Paths<'a> {
         }
     }
 
+    /// The macro `word` that a crate this crate names in `#[macro_use] extern crate` exports at its root.
+    pub fn macro_use(&self, word: Sym) -> Option<Binding> {
+        self.trees[self.krate as usize].macro_use.iter().find_map(|&krate| self.member(module(krate as u32, 0), word).macros)
+    }
+
     /// The path that a `use` declaration of `path` names: in edition 2015 it starts at the crate root unless it starts with a keyword.
     pub fn use_path<'p>(&self, path: Path<'p>) -> Path<'p> {
         let keyword = path.segments.first().is_some_and(|word| [CRATE, SELF, SUPER].contains(word));
