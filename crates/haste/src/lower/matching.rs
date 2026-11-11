@@ -112,13 +112,16 @@ impl Lower<'_, '_> {
         Ok(place)
     }
 
-    pub(super) fn pat_ty(&self, pat: PatId) -> Result<Ty> {
-        self.typed.pats.get(&pat).copied().ok_or_else(|| anyhow::anyhow!("pattern has no type"))
+    /// The place that the reference matched by the `&` pattern `pat` points to, laid out as the reference's pointee type, which the inner pattern may deref again.
+    fn ref_target(&mut self, pat: PatId, place: Option<Place>) -> Result<Place> {
+        let Kind::Ref(_, pointee) = *self.cx.types.kind(self.pat_ty(pat)?) else { bail!("a `&` pattern on a value that is not a reference") };
+        let repr = repr(self.cx, pointee)?;
+        let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
+        Ok(Place { base: Base::Addr(pointer), offset: 0, repr })
     }
 
-    fn pat_repr(&mut self, pat: PatId) -> Result<Repr> {
-        let ty = self.pat_ty(pat)?;
-        repr(self.cx, ty)
+    pub(super) fn pat_ty(&self, pat: PatId) -> Result<Ty> {
+        self.typed.pats.get(&pat).copied().ok_or_else(|| anyhow::anyhow!("pattern has no type"))
     }
 
     /// Branches to `fail` unless the value at `place` matches `pat`.
@@ -132,9 +135,8 @@ impl Lower<'_, '_> {
             Pat::Lit(lit) => self.test_lit(pat, lit, place, fail),
             Pat::Range { from, to, inclusive } => self.test_range(pat, (from, to, inclusive), place, fail),
             Pat::Ref { pat: inner, .. } => {
-                let pointee = self.pat_repr(inner)?;
-                let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
-                self.test(inner, Some(Place { base: Base::Addr(pointer), offset: 0, repr: pointee }), fail)
+                let pointee = self.ref_target(pat, place)?;
+                self.test(inner, Some(pointee), fail)
             }
             Pat::Or(list) => self.test_or(list, place, fail),
             Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } | Pat::Slice(_) => {
@@ -273,9 +275,8 @@ impl Lower<'_, '_> {
             Pat::Paren(inner) => self.bind_matched(inner, place, at),
             Pat::Or(list) if self.typed.or_binds.contains(&pat) => self.bind_or(list, place, at),
             Pat::Ref { pat: inner, .. } => {
-                let pointee = self.pat_repr(inner)?;
-                let Some(pointer) = place.and_then(|place| self.read(place)) else { bail!("reference with no value") };
-                self.bind_matched(inner, Some(Place { base: Base::Addr(pointer), offset: 0, repr: pointee }), None)
+                let pointee = self.ref_target(pat, place)?;
+                self.bind_matched(inner, Some(pointee), None)
             }
             Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } | Pat::Slice(_) => {
                 for (sub, sub_place, step) in self.subpatterns(pat, place, None)? {
