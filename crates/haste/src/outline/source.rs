@@ -309,6 +309,21 @@ impl Source {
         }
     }
 
+    /// Whether a token from `from` up to `to` reads `word`, searching the raw text first when the tokens share one layer.
+    pub fn holds_word(&self, (from, to): (u32, u32), word: &str) -> bool {
+        if from >= to {
+            return false;
+        }
+        let ((first, start), (last, end)) = (self.layer(from), self.layer(to - 1));
+        if std::ptr::eq(first, last) {
+            let span = &first.text[first.tokens[start].start as usize..(last.tokens[end].start + last.tokens[end].len) as usize];
+            if !span.contains(word) {
+                return false;
+            }
+        }
+        (from..to).any(|at| self.text(at) == word)
+    }
+
     /// The text of token `at`.
     pub fn text(&self, at: u32) -> &str {
         let (src, local) = self.layer(at);
