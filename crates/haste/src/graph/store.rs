@@ -28,39 +28,52 @@ pub fn root() -> PathBuf {
     home().join("scripts")
 }
 
-/// The key of a call of procedural macro `name` of the pinned crate `pin` on `texts`, by this program.
-pub fn expansion_key(pin: u64, name: &str, texts: &[String]) -> u64 {
-    rustc_hash::FxBuildHasher.hash_one((pin, name, texts, program()))
+/// A call of a procedural macro of a pinned crate as the store keeps it: the file its inputs hash to, and the inputs, which a kept result must match exactly.
+pub struct Expansion {
+    path: PathBuf,
+    inputs: String,
 }
 
-/// What the macro call with key `key` printed, or why it failed, when a run kept it.
-pub fn kept_expansion(key: u64) -> Option<Result<String, String>> {
-    let text = std::fs::read_to_string(expansion(key)).ok()?;
-    match text.split_at_checked(1)? {
-        (OK_MARK, output) => Some(Ok(output.to_owned())),
-        (FAILED_MARK, error) => Some(Err(error.to_owned())),
-        _ => None,
+impl Expansion {
+    /// The call of procedural macro `name` of the pinned crate `pin` on `texts`, by this program.
+    pub fn new(pin: u64, name: &str, texts: &[String]) -> Expansion {
+        let program = program();
+        let key = rustc_hash::FxBuildHasher.hash_one((pin, name, texts, program));
+        let inputs = format!("{pin:016x} {program:?} {name}\0{}", texts.join("\0"));
+        Expansion { path: home().join("macros").join(format!("{key:016x}")), inputs }
     }
-}
 
-/// Keeps what the macro call with key `key` printed, or why it failed, since this program fails the same call the same way.
-pub fn keep_expansion(key: u64, result: &Result<String, String>) -> io::Result<()> {
-    let path = expansion(key);
-    std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
-    let (mark, text) = match result {
-        Ok(output) => (OK_MARK, output),
-        Err(error) => (FAILED_MARK, error),
-    };
-    write_new(&path, &format!("{mark}{text}"))
-}
+    /// What this call printed, or why it failed, when a run kept it for the same inputs.
+    pub fn kept(&self) -> Option<Result<String, String>> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        let (mark, rest) = text.split_at_checked(1)?;
+        let (len, rest) = rest.split_once('\n')?;
+        let (inputs, output) = rest.split_at_checked(len.parse().ok()?)?;
+        if inputs != self.inputs {
+            return None;
+        }
+        match mark {
+            OK_MARK => Some(Ok(output.to_owned())),
+            FAILED_MARK => Some(Err(output.to_owned())),
+            _ => None,
+        }
+    }
 
-fn expansion(key: u64) -> PathBuf {
-    home().join("macros").join(format!("{key:016x}"))
+    /// Keeps what this call printed, or why it failed, since this program fails the same call the same way.
+    pub fn keep(&self, result: &Result<String, String>) -> io::Result<()> {
+        std::fs::create_dir_all(self.path.parent().unwrap_or(&self.path))?;
+        let (mark, text) = match result {
+            Ok(output) => (OK_MARK, output),
+            Err(error) => (FAILED_MARK, error),
+        };
+        write_new(&self.path, &format!("{mark}{}\n{}{text}", self.inputs.len(), self.inputs))
+    }
 }
 
 /// The size and modification time of this program, whose changes make what the store kept stale.
 fn program() -> Option<(u64, i64, i64)> {
-    std::env::current_exe().and_then(std::fs::metadata).map(|meta| (meta.len(), meta.mtime(), meta.mtime_nsec())).ok()
+    static PROGRAM: std::sync::OnceLock<Option<(u64, i64, i64)>> = std::sync::OnceLock::new();
+    *PROGRAM.get_or_init(|| std::env::current_exe().and_then(std::fs::metadata).map(|meta| (meta.len(), meta.mtime(), meta.mtime_nsec())).ok())
 }
 
 /// The directory that holds the build script output of `unit`: the script's `OUT_DIR`, its standard error, what it printed and the stamp that says when it is current.
