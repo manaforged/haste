@@ -1,4 +1,4 @@
 [workspace]
 members = ["crates/codegen", "crates/haste"]
-exclude = ["examples", "tests"]
+exclude = ["crates/prep-driver", "examples", "tests"]
 resolver = "3"
