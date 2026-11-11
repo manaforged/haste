@@ -3,6 +3,7 @@
 pub mod adt;
 mod body_scope;
 mod builtin;
+pub mod census;
 pub mod evaluate;
 mod expand;
 mod format;
@@ -11,6 +12,8 @@ pub mod infer;
 pub mod intrinsic;
 pub mod layout;
 pub mod reach;
+pub mod substs;
+pub mod summary;
 pub mod traits;
 pub mod ty;
 
@@ -44,6 +47,7 @@ pub struct Cache {
     finals: HashMap<reach::Instance, Rc<infer::Typed>>,
     closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
     lookups: Lookups,
+    pub summary_fallbacks: usize,
 }
 
 /// The lookups Sema caches about one outline, which hold while only function bodies change.
@@ -63,7 +67,8 @@ struct Lookups {
     scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
     type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
     impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
-    selections: HashMap<(ItemRef, ty::Ty, Vec<ty::Ty>), Option<(impls::ImplRef, Vec<ty::Ty>)>>,
+    selections: HashMap<(ItemRef, ty::Ty, substs::Substs), Option<(impls::ImplRef, substs::Substs)>>,
+    summaries: HashMap<ItemRef, summary::SummaryKind>,
     loaded: Vec<[usize; 5]>,
 }
 
@@ -144,6 +149,7 @@ impl Cache {
         kept.type_defs.get_mut().retain(|key, _| !edited.touches_crate(key.0.krate));
         kept.trait_defs.retain(|item, _| !mine(*item));
         kept.selections.clear();
+        kept.summaries.clear();
         kept.discriminants.retain(|item, _| !mine(*item));
         if kept.langs.as_ref().is_some_and(|langs| langs.crates.iter().any(|&krate| edited.touches_crate(krate))) {
             kept.langs = None;
@@ -199,7 +205,7 @@ struct Naming<'t, F> {
 
 impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
     fn touches(&mut self, (item, substs): &reach::Instance) -> bool {
-        (self.mine)(*item) || substs.iter().any(|ty| self.names(*ty))
+        (self.mine)(*item) || self.types.substs(*substs).iter().any(|ty| self.names(*ty))
     }
 
     /// Whether `ty` names, at any depth, an item or a closure of an item for which `mine` holds.
@@ -210,13 +216,17 @@ impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
         let kind = self.types.kind(ty);
         let own = match kind {
             ty::Kind::Adt(item, _) | ty::Kind::FnDef(item, _) | ty::Kind::Closure(item, ..) | ty::Kind::Dyn(item, ..) => (self.mine)(*item),
+            ty::Kind::Proj(id) => {
+                let def = self.types.proj(*id);
+                (self.mine)(def.of) || (self.mine)(def.assoc)
+            }
             _ => false,
         };
         let closure_args = match kind {
-            ty::Kind::Closure(_, args, _) => args.clone(),
-            _ => Vec::new(),
+            ty::Kind::Closure(_, args, _) => self.types.substs(*args),
+            _ => &[],
         };
-        let inner: Vec<ty::Ty> = kind.children().chain(closure_args).collect();
+        let inner: Vec<ty::Ty> = kind.children(self.types).chain(closure_args.iter().copied()).collect();
         let found = own || inner.into_iter().any(|inner| self.names(inner));
         self.memo.insert(ty, found);
         found
@@ -357,7 +367,7 @@ impl<'a> Context<'a> {
     /// The type that `ty` owns when it is a `Box`.
     pub fn boxed(&self, ty: ty::Ty) -> Option<ty::Ty> {
         match self.types.kind(ty) {
-            ty::Kind::Adt(item, args) if self.lang(*item) == Some("owned_box") => args.first().copied(),
+            ty::Kind::Adt(item, args) if self.lang(*item) == Some("owned_box") => self.types.substs(*args).first().copied(),
             _ => None,
         }
     }
@@ -373,12 +383,17 @@ impl<'a> Context<'a> {
         let list = |tys: &[ty::Ty]| tys.iter().map(|&ty| self.type_text(ty, resolve)).collect::<Vec<_>>().join(", ");
         match self.types.kind(resolve(ty)).clone() {
             Kind::Adt(item, args) if args.is_empty() => self.name(item).to_owned(),
-            Kind::Adt(item, args) => format!("{}<{}>", self.name(item), list(&args)),
+            Kind::Adt(item, args) => format!("{}<{}>", self.name(item), list(self.types.substs(args))),
             Kind::Ref(Mut::Not, inner) => format!("&{}", self.type_text(inner, resolve)),
             Kind::Ref(Mut::Mut, inner) => format!("&mut {}", self.type_text(inner, resolve)),
-            Kind::Tuple(items) => format!("({})", list(&items)),
+            Kind::Tuple(items) => format!("({})", list(self.types.substs(items))),
             Kind::Slice(element) => format!("[{}]", self.type_text(element, resolve)),
             Kind::Prim(primitive) => format!("{primitive:?}").to_lowercase(),
+            Kind::Param(index) => format!("Param({index})"),
+            Kind::Proj(id) => {
+                let def = self.types.proj(id);
+                format!("<{} as {}>::{}", self.type_text(def.self_ty, resolve), self.name(def.of), self.name(def.assoc))
+            }
             other => format!("{other:?}"),
         }
     }

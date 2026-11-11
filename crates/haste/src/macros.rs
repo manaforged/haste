@@ -301,8 +301,8 @@ fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>])
         Some(kept) => kept,
         None => Jit::new(Cache::default())?,
     };
-    let entry = pair.map(|item| demand.declare((item, Vec::new())));
-    let jobs: Vec<Job<'_>> = bound.iter().zip(inputs).map(|(&(call, kind, caller), texts)| Job { entry: entry[usize::from(kind == ProcKind::Attribute)], run: demand.declare((call, Vec::new())), texts: texts.iter().map(|text| text.as_bytes()).collect(), group: (caller, call.krate) }).collect();
+    let entry = pair.map(|item| demand.declare((item, crate::sema::substs::Substs::EMPTY)));
+    let jobs: Vec<Job<'_>> = bound.iter().zip(inputs).map(|(&(call, kind, caller), texts)| Job { entry: entry[usize::from(kind == ProcKind::Attribute)], run: demand.declare((call, crate::sema::substs::Substs::EMPTY)), texts: texts.iter().map(|text| text.as_bytes()).collect(), group: (caller, call.krate) }).collect();
     let ask = |compilation: &mut Compilation, asks: Requests| Ok(if compilation.names.load(&mut compilation.outline, asks)? { Answer::Names } else { Answer::Nothing });
     let ran = run_macros(compilation, &mut demand, &jobs, &ask);
     drop(jobs);

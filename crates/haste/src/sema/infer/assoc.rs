@@ -5,6 +5,7 @@ use crate::names::path::Path as NamePath;
 use crate::names::{ItemRef, plain};
 use crate::outline::item::ItemKind;
 
+use super::super::substs::Substs;
 use super::super::ty::{Kind, Ty};
 use super::scope::type_params;
 use super::{Infer, Res};
@@ -52,7 +53,7 @@ impl Infer<'_, '_> {
         if let Kind::Dyn(of, args, members, _) = self.cx.types.kind(owner).clone()
             && self.cx.trait_member(of, name).is_some()
         {
-            let args = super::super::ty::object_parts(&args, &members).0.to_vec();
+            let args = super::super::ty::object_parts(self.cx.types.substs(args), &members).0.to_vec();
             return self.trait_value(of, (Some(owner), Some(args)), (name, given));
         }
         let current = self.current_trait().into_iter().collect();
@@ -75,13 +76,14 @@ impl Infer<'_, '_> {
 
     /// The arguments of trait `of` when this body is a default method of `of` and `owner` is its `Self`, which `Self::NAME` in that body reads at.
     fn own_trait_args(&mut self, of: ItemRef, owner: Ty) -> Result<Option<Vec<Ty>>> {
-        let Some((item, substs)) = self.instance.clone() else { return Ok(None) };
+        let Some((item, substs)) = self.instance else { return Ok(None) };
+        let first = self.cx.types.substs(substs).first().copied();
         let default = self.block.is_none() && self.cx.owner_trait(item) == Some(of);
-        if !default || substs.first().map(|&ty| self.resolve(ty)) != Some(self.resolve(owner)) {
+        if !default || first.map(|ty| self.resolve(ty)) != Some(self.resolve(owner)) {
             return Ok(None);
         }
         let count = type_params(&self.cx.trait_generics(of)?.1.params).count();
-        Ok(substs.get(1..1 + count).map(<[Ty]>::to_vec))
+        Ok(self.cx.types.substs(substs).get(1..1 + count).map(<[Ty]>::to_vec))
     }
 
     fn prefix_trait(&mut self, body: &Body, path: PathId, count: usize) -> Option<ItemRef> {
@@ -134,17 +136,23 @@ impl Infer<'_, '_> {
     }
 
     /// The impl member that a call of trait item `item` at `substs` runs, once `Self` is known, or the trait item itself when `Self` is a trait object that dispatches it.
-    pub(super) fn trait_call(&mut self, item: ItemRef, substs: Vec<Ty>) -> Result<Res> {
+    pub(in crate::sema) fn trait_call(&mut self, item: ItemRef, substs: Substs) -> Result<Res> {
         let Some(of) = self.cx.owner_trait(item) else { return Ok(Res::Fn(item, substs)) };
+        let slice = self.cx.types.substs(substs).to_vec();
         let count = 1 + type_params(&self.cx.trait_generics(of)?.1.params).count();
-        if substs.len() < count || self.object_holds(of, substs[0], &substs[1..count]) == Some(true) {
+        if slice.len() < count || self.object_holds(of, slice[0], &slice[1..count]) == Some(true) {
             return Ok(Res::Fn(item, substs));
         }
-        let Some(selected) = self.select(of, substs[0], &substs[1..count])? else { return Ok(Res::Fn(item, substs)) };
-        Ok(match self.impl_member(of, (substs[0], &substs[1..count]), selected, self.cx.name(item))? {
+        if self.poly.is_some() && self.any_has_params(&slice[..count]) {
+            self.poly_prove(of, slice[0], &slice[1..count]);
+            return Ok(Res::Fn(item, substs));
+        }
+        let Some(selected) = self.select(of, slice[0], &slice[1..count])? else { return Ok(Res::Fn(item, substs)) };
+        Ok(match self.impl_member(of, (slice[0], &slice[1..count]), selected, self.cx.name(item))? {
             Some((member, (_, mut args))) => {
-                args.extend(substs[count..].iter().map(|ty| self.zonk(*ty)));
-                Res::Fn(member, args.into_iter().map(|ty| self.zonk(ty)).collect())
+                args.extend(slice[count..].iter().map(|ty| self.zonk(*ty)));
+                let zonked: Vec<Ty> = args.into_iter().map(|ty| self.zonk(ty)).collect();
+                Res::fn_of(&self.cx.types, member, &zonked)
             }
             None => Res::Fn(item, substs),
         })

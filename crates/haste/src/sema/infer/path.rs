@@ -9,6 +9,7 @@ use crate::outline::source::{Mark, Source};
 
 use super::super::body_scope::{BodyPath, outside};
 use super::super::impls::ImplRef;
+use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty};
 use super::{Infer, Res};
 
@@ -189,10 +190,10 @@ impl<'a> Infer<'_, 'a> {
         if let Res::Local(local) = res {
             self.note_read(expr, local);
         }
-        if let Res::Ctor(item, variant, args) = &res
+        if let Res::Ctor(item, variant, args) = res
             && matches!(self.cx.types.kind(ty), Kind::FnPtr(..))
         {
-            let reify = super::adt::ctor_fn(self.cx, (*item, *variant, args.clone()));
+            let reify = super::adt::ctor_fn(self.cx, (item, variant, args));
             self.out.coercions.insert(expr, super::coerce::Coercion::Reify(reify));
         }
         self.out.res.insert(expr, res);
@@ -250,7 +251,7 @@ impl<'a> Infer<'_, 'a> {
 
     pub(super) fn const_item(&mut self, item: ItemRef, outer: Vec<Ty>) -> Result<(Ty, Res)> {
         let ty = self.fn_types(item, &outer)?.1;
-        Ok((ty, Res::Fn(item, outer)))
+        Ok((ty, Res::fn_of(&self.cx.types, item, &outer)))
     }
 
     /// The function item `item` inside the type arguments `outer`, with its own type parameters set to `given`.
@@ -258,7 +259,8 @@ impl<'a> Infer<'_, 'a> {
         let mut substs = outer;
         substs.extend(self.own_args(item, given)?);
         self.bind_bounds(item, &substs)?;
-        Ok((self.cx.types.intern(Kind::FnDef(item, substs.clone())), Res::Fn(item, substs)))
+        let interned = self.cx.types.intern_substs(&substs);
+        Ok((self.cx.types.intern(Kind::FnDef(item, interned)), Res::Fn(item, interned)))
     }
 
     /// Runs `run` as if inside the type item `item`, with its type parameters set to `args`.
@@ -275,7 +277,7 @@ impl<'a> Infer<'_, 'a> {
             Some(Args::Angle(list)) => list,
             Some(Args::Paren { inputs, output }) => {
                 let (inputs, _) = self.paren_sig(arena, inputs, output)?;
-                return Ok(vec![self.cx.types.intern(Kind::Tuple(inputs))]);
+                return Ok(vec![self.cx.types.tuple(&inputs)]);
             }
             Some(Args::ReturnType) => bail!("return type notation is not supported yet"),
         };
@@ -375,7 +377,10 @@ impl<'a> Infer<'_, 'a> {
             syntax::Ty::Ptr { mutable, ty } => self.lower_ty(arena, ty).map(|inner| Kind::Ptr(mutability(mutable), inner)),
             syntax::Ty::Slice(ty) => self.lower_ty(arena, ty).map(Kind::Slice),
             syntax::Ty::Array(ty, len) => self.array_ty(arena, ty, len),
-            syntax::Ty::Tuple(list) => self.lower_list(arena, list).map(Kind::Tuple),
+            syntax::Ty::Tuple(list) => {
+                let items = self.lower_list(arena, list)?;
+                Ok(Kind::Tuple(self.cx.types.intern_substs(&items)))
+            }
             syntax::Ty::Never => Ok(Kind::Never),
             syntax::Ty::DynTrait(bounds) => self.object_ty(arena, bounds),
             syntax::Ty::Fn { params, ret, variadic } => self.fn_ptr_ty(arena, (params, ret), variadic),
@@ -392,7 +397,7 @@ impl<'a> Infer<'_, 'a> {
             Some(ret) => self.lower_ty(arena, ret)?,
             None => self.cx.types.unit(),
         };
-        Ok(Kind::FnPtr(params, ret))
+        Ok(Kind::FnPtr(self.cx.types.intern_substs(&params), ret))
     }
 
     fn object_ty(&mut self, arena: &Body, bounds: syntax::List) -> Result<Kind> {
@@ -413,7 +418,7 @@ impl<'a> Infer<'_, 'a> {
                 bail!("a trait object with no trait");
             }
             let first = autos.remove(0);
-            return Ok(Kind::Dyn(first, Vec::new(), Vec::new(), autos));
+            return Ok(Kind::Dyn(first, Substs::EMPTY, Vec::new(), autos));
         };
         let count = arena.list(arena.path(path).segments).len();
         let given = self.segment_args(arena, path, count)?;
@@ -430,7 +435,8 @@ impl<'a> Infer<'_, 'a> {
         }
         bound.sort_by_key(|(member, _)| (member.krate, member.file, member.item));
         let (members, tys): (Vec<ItemRef>, Vec<Ty>) = bound.into_iter().unzip();
-        Ok(Kind::Dyn(of, given.into_iter().chain(tys).collect(), members, autos))
+        let parts: Vec<Ty> = given.into_iter().chain(tys).collect();
+        Ok(Kind::Dyn(of, self.cx.types.intern_substs(&parts), members, autos))
     }
 
     /// The type that the associated type `name` of impl `block` is, read in the current frame over the alias's own source, when the impl has one.
@@ -453,7 +459,7 @@ impl<'a> Infer<'_, 'a> {
         let alias = self.cx.alias_def(item)?;
         let (params, arena, ty, declared) = (&alias.params, &alias.arena, alias.ty, &alias.generics);
         if let Some(definer) = self.opaque_alias(item, params, arena) {
-            return super::opaque::revealed(self.cx, definer, &[]);
+            return super::opaque::revealed(self.cx, definer, Substs::EMPTY);
         }
         let file = self.cx.file(item);
         let mut args = given;
@@ -565,7 +571,7 @@ impl<'a> Infer<'_, 'a> {
             return self.alias(item, given, fresh);
         }
         let args = self.adt_args(item, given, fresh)?;
-        Ok(self.cx.types.intern(Kind::Adt(item, args)))
+        Ok(self.cx.types.adt(item, &args))
     }
 
     /// The type that `segments` names through the frame: `Self`, a type parameter, or an associated type `Param::Name` of one.
@@ -603,19 +609,32 @@ impl<'a> Infer<'_, 'a> {
 
     /// The pointer metadata of `ty`: a length for slices and `str`, nothing for sized types, or a variable until `ty` is known.
     pub fn metadata_of(&mut self, ty: Ty) -> Result<Ty> {
-        match self.cx.types.kind(self.resolve(ty)) {
+        let tailed = self.tail_ty(ty)?;
+        let tail = self.resolve(tailed);
+        match self.cx.types.kind(tail).clone() {
             Kind::Slice(_) | Kind::Prim(Primitive::Str) => Ok(self.cx.types.prim(Primitive::Usize)),
             Kind::Dyn(..) => {
                 let Some(metadata) = self.cx.lang_item("dyn_metadata") else { bail!("core has no `DynMetadata`") };
-                Ok(self.cx.types.intern(Kind::Adt(metadata, vec![ty])))
+                Ok(self.cx.types.adt(metadata, &[tail]))
             }
             Kind::Var(_) => {
                 let result = self.fresh(Kind::Var);
-                self.metadata.push((ty, result));
+                self.metadata.push((tail, result));
                 Ok(result)
             }
+            _ if self.has_params(tail) => self.param_metadata(tail),
             _ => Ok(self.cx.types.unit()),
         }
+    }
+
+    fn param_metadata(&mut self, tail: Ty) -> Result<Ty> {
+        if self.poly.is_none() {
+            bail!("metadata of open parameter requires concrete type");
+        }
+        if !self.poly_sized(tail) {
+            self.poly_fallback();
+        }
+        Ok(self.cx.types.unit())
     }
 
     pub(super) fn spell(&self, segments: &[Sym]) -> String {

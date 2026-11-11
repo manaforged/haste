@@ -15,6 +15,7 @@ mod opaque;
 mod pat;
 mod path;
 mod pattern;
+pub(super) mod poly;
 mod project;
 mod scope;
 mod drop;
@@ -22,10 +23,10 @@ mod select;
 mod stmt;
 mod zonk;
 
-pub use adt::Fields;
+pub use adt::{Fields, field_types, maybe_unsized};
 pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, register};
-pub use drop::Glue;
+pub use drop::{Glue, drop_fn, has_drop_impl, needs_drop};
 pub use looping::{For, Tried};
 pub use method::Adjust;
 pub use coerce::Coercion;
@@ -34,6 +35,9 @@ pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
 pub use scope::{Form, type_params};
+pub use select::header_bound_traits;
+
+use std::sync::{Arc, OnceLock};
 
 use rustc_hash::FxHashMap as HashMap;
 
@@ -45,16 +49,23 @@ use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::source::Source;
 
 use super::Context;
-use super::ty::{Kind, Mut, Ty, int_info};
+use super::substs::{PackedMap, PackedSet, Substs};
+use super::ty::{Kind, Mut, Ty, Types, int_info};
 
 /// What a path expression names.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Res {
     Local(u32),
-    Fn(ItemRef, Vec<Ty>),
-    Ctor(ItemRef, u32, Vec<Ty>),
-    /// The value of a const parameter, as the const value it is set to.
+    Fn(ItemRef, Substs),
+    Ctor(ItemRef, u32, Substs),
     Const(Ty),
+}
+
+impl Res {
+    /// Builds `Res::Fn` after interning `args` in `types`.
+    pub fn fn_of(types: &Types, item: ItemRef, args: &[Ty]) -> Self {
+        Res::Fn(item, types.intern_substs(args))
+    }
 }
 
 /// One local variable of a body.
@@ -71,68 +82,151 @@ pub enum Shape {
     Glue(Glue),
     Closure(ClosureBody),
     Virtual(u32),
-    /// A call of a closure or function item through a call trait method, which spreads the argument tuple into this call of the closure's body or the function.
     Untuple(Res),
-    /// The tuple constructor of this variant, called as a function.
     Ctor(u32),
-    /// The `Clone::clone` of a tuple that the compiler writes, with the clone call of each field.
     Clone(Vec<Res>),
-    /// An anonymous constant, such as an array length, whose value the folder could not compute, run as a function that takes nothing.
     Anon(Anon),
 }
 
-/// The inferred types and resolutions of one function body at one set of type arguments.
+/// The instantiation-invariant syntax tables of an inferred body.
 #[derive(Clone, Debug, Default)]
+pub struct SyntaxTables {
+    pub binds: PackedMap<PatId, u32>,
+    pub adjusts: PackedMap<ExprId, Adjust>,
+    pub fields: PackedMap<ExprId, u32>,
+    pub inits: PackedMap<ExprId, u32>,
+    pub ranges: PackedMap<ExprId, Box<[u32]>>,
+    pub field_pats: PackedMap<PatId, u32>,
+    pub pat_derefs: PackedMap<PatId, u32>,
+    pub ref_binds: PackedMap<PatId, Mut>,
+    pub or_binds: PackedSet<PatId>,
+    pub const_args: PackedSet<ExprId>,
+    pub unpacks: PackedMap<u32, PatId>,
+}
+
+impl SyntaxTables {
+    /// A shared empty syntax table set for synthetic bodies.
+    pub fn empty() -> Arc<Self> {
+        static EMPTY: OnceLock<Arc<SyntaxTables>> = OnceLock::new();
+        Arc::clone(EMPTY.get_or_init(|| Arc::new(Self::default())))
+    }
+}
+
+/// The arena-packed expression, pattern, operator, coercion and closure tables of an inferred body.
+#[derive(Clone, Debug)]
+pub struct BodyTables {
+    pub syntax: Arc<SyntaxTables>,
+    pub exprs: Box<[Ty]>,
+    pub res: PackedMap<ExprId, Res>,
+    pub autoderefs: PackedMap<ExprId, u32>,
+    pub derefs: PackedMap<(ExprId, u32), Res>,
+    pub operators: PackedMap<ExprId, Res>,
+    pub coercions: PackedMap<ExprId, Coercion>,
+    pub offsets: PackedMap<ExprId, u64>,
+    pub pat_res: PackedMap<PatId, Res>,
+    pub overloaded: PackedSet<ExprId>,
+    pub pats: PackedMap<PatId, Ty>,
+    pub fors: PackedMap<ExprId, For>,
+    pub tries: PackedMap<ExprId, Tried>,
+    pub awaits: PackedMap<ExprId, Awaited>,
+    pub closures: PackedMap<ExprId, Closure>,
+    pub try_blocks: PackedMap<ExprId, Res>,
+    pub box_frees: PackedMap<ExprId, Res>,
+}
+
+impl Default for BodyTables {
+    fn default() -> Self {
+        Self {
+            syntax: SyntaxTables::empty(),
+            exprs: Box::default(),
+            res: PackedMap::default(),
+            autoderefs: PackedMap::default(),
+            derefs: PackedMap::default(),
+            operators: PackedMap::default(),
+            coercions: PackedMap::default(),
+            offsets: PackedMap::default(),
+            pat_res: PackedMap::default(),
+            overloaded: PackedSet::default(),
+            pats: PackedMap::default(),
+            fors: PackedMap::default(),
+            tries: PackedMap::default(),
+            awaits: PackedMap::default(),
+            closures: PackedMap::default(),
+            try_blocks: PackedMap::default(),
+            box_frees: PackedMap::default(),
+        }
+    }
+}
+
+impl BodyTables {
+    /// A shared empty body table set for compiler-generated bodies.
+    pub fn empty() -> Arc<Self> {
+        static EMPTY: OnceLock<Arc<BodyTables>> = OnceLock::new();
+        Arc::clone(EMPTY.get_or_init(|| Arc::new(Self::default())))
+    }
+}
+
+impl std::ops::Deref for BodyTables {
+    type Target = SyntaxTables;
+
+    fn deref(&self) -> &Self::Target {
+        &self.syntax
+    }
+}
+
+impl std::ops::DerefMut for BodyTables {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.syntax)
+    }
+}
+
+/// The inferred types and resolutions of one function body at one set of type arguments.
+#[derive(Clone, Debug)]
 pub struct Typed {
-    pub exprs: Vec<Ty>,
-    pub res: HashMap<ExprId, Res>,
+    pub tables: Arc<BodyTables>,
     pub locals: Vec<Local>,
-    pub binds: HashMap<PatId, u32>,
-    pub adjusts: HashMap<ExprId, Adjust>,
-    /// The field accesses and calls that dereference their base or callee this many times first, through references and `Box`es.
-    pub autoderefs: HashMap<ExprId, u32>,
-    /// The dereferences that call `Deref::deref` or `DerefMut::deref_mut`, by expression and step: step 0 of a `*`, or one step of an autoderef.
-    pub derefs: HashMap<(ExprId, u32), Res>,
-    /// The operator expressions that call a trait method: `Index::index`, `IndexMut::index_mut`, or a binary operator trait such as `Add::add` or `PartialEq::eq`.
-    pub operators: HashMap<ExprId, Res>,
-    /// The expressions whose value coerces to the type it is used at, and how.
-    pub coercions: HashMap<ExprId, Coercion>,
-    pub fields: HashMap<ExprId, u32>,
-    /// The field that each struct literal initializer fills, by its value expression, apart from `fields` because that value may itself be a field read.
-    pub inits: HashMap<ExprId, u32>,
-    /// The byte offset that each `offset_of!` names.
-    pub offsets: HashMap<ExprId, u64>,
-    /// The fields that each range expression fills: one per end it gives, in order, then `exhausted` for an inclusive range.
-    pub ranges: HashMap<ExprId, Vec<u32>>,
-    pub field_pats: HashMap<PatId, u32>,
-    pub pat_res: HashMap<PatId, Res>,
-    pub pat_derefs: HashMap<PatId, u32>,
-    pub ref_binds: HashMap<PatId, crate::sema::ty::Mut>,
-    /// The or-patterns whose alternatives bind names, which every alternative binds to the same locals.
-    pub or_binds: rustc_hash::FxHashSet<PatId>,
-    /// The calls of values that implement `Fn` or `FnMut` themselves, which pass the callee's address and the argument tuple.
-    pub overloaded: rustc_hash::FxHashSet<ExprId>,
-    /// The call arguments that `#[rustc_legacy_const_generics]` turns into const generic arguments, which pass no value.
-    pub const_args: rustc_hash::FxHashSet<ExprId>,
-    pub pats: HashMap<PatId, Ty>,
     pub params: Vec<u32>,
     pub ret: Option<Ty>,
-    pub fors: HashMap<ExprId, For>,
-    pub tries: HashMap<ExprId, Tried>,
-    /// The `.await` expressions of the body, with the calls each makes.
-    pub awaits: HashMap<ExprId, Awaited>,
-    /// The drop glue of each type that a local or a temporary of the body holds and that needs drop.
     pub drops: Vec<Res>,
-    /// The closure expressions of the body.
-    pub closures: HashMap<ExprId, Closure>,
-    /// The `try` blocks of the body, each with the `Try::from_output` call that wraps its value.
-    pub try_blocks: HashMap<ExprId, Res>,
-    /// The `Drop::drop` of the `Box` that each by-value call of a `Box<dyn FnOnce>` frees once the call consumed its contents.
-    pub box_frees: HashMap<ExprId, Res>,
-    /// The parameter locals whose pattern takes the argument apart, with that pattern in the body's arena.
-    pub unpacks: HashMap<u32, PatId>,
-    /// What the code of this instance is.
     pub shape: Shape,
+}
+
+impl Default for Typed {
+    fn default() -> Self {
+        Self { tables: BodyTables::empty(), locals: Vec::new(), params: Vec::new(), ret: None, drops: Vec::new(), shape: Shape::default() }
+    }
+}
+
+impl std::ops::Deref for Typed {
+    type Target = BodyTables;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tables
+    }
+}
+
+impl std::ops::DerefMut for Typed {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.tables)
+    }
+}
+
+fn coercion_calls(coercion: &Coercion) -> Box<dyn Iterator<Item = &Res> + '_> {
+    match coercion {
+        Coercion::Vtable(vtable) => Box::new(vtable.calls().into_iter()),
+        Coercion::Reify(res) => Box::new(std::iter::once(res)),
+        Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => Box::new(std::iter::empty()),
+        Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
+    }
+}
+
+fn shape_calls(shape: &Shape) -> Box<dyn Iterator<Item = &Res> + '_> {
+    match shape {
+        Shape::Glue(glue) => Box::new(glue.drop.iter().chain(&glue.parts).chain(&glue.resume)),
+        Shape::Untuple(res) => Box::new(std::iter::once(res)),
+        Shape::Clone(calls) => Box::new(calls.iter()),
+        _ => Box::new(std::iter::empty()),
+    }
 }
 
 impl Typed {
@@ -141,50 +235,31 @@ impl Typed {
         self.ret.unwrap_or(Ty::NONE)
     }
 
-    /// Every function the body calls, with its type arguments.
-    pub fn calls(&self) -> impl Iterator<Item = (ItemRef, &[Ty])> {
+    /// Every function the body calls, with its interned type arguments.
+    pub fn calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
         let loops = self.fors.values().flat_map(|each| [&each.into_iter, &each.next]);
         let tries = self.tries.values().flat_map(|each| [&each.branch, &each.from_residual]);
         let awaits = self.awaits.values().flat_map(|each| [&each.into_future, &each.poll]);
-        let glue = match &self.shape {
-            Shape::Glue(glue) => Some(glue),
-            _ => None,
-        };
-        let glue = glue.into_iter().flat_map(|glue| glue.drop.iter().chain(&glue.parts).chain(&glue.resume));
-        let untuple = match &self.shape {
-            Shape::Untuple(res) => Some(res),
-            _ => None,
-        };
-        let cloned = match &self.shape {
-            Shape::Clone(calls) => &calls[..],
-            _ => &[],
-        };
-        let coerced = self.coercions.values().flat_map(|coercion| -> Box<dyn Iterator<Item = &Res>> {
-            match coercion {
-                Coercion::Vtable(vtable) => Box::new(vtable.calls().into_iter()),
-                Coercion::Reify(res) => Box::new(std::iter::once(res)),
-                Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => Box::new(std::iter::empty()),
-                Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
-            }
-        });
-        self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values()).chain(loops).chain(tries).chain(awaits).chain(&self.drops).chain(glue).chain(untuple).chain(cloned).chain(coerced).filter_map(|res| match res {
-            Res::Fn(item, substs) => Some((*item, &substs[..])),
+        let coerced = self.coercions.values().flat_map(coercion_calls);
+        let shaped = shape_calls(&self.shape);
+        let direct = self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values());
+        direct.chain(loops).chain(tries).chain(awaits).chain(&self.drops).chain(shaped).chain(coerced).filter_map(|res| match res {
+            Res::Fn(item, substs) => Some((*item, *substs)),
             _ => None,
         })
     }
 }
 
-/// A local variable's name and the `macro_rules!` hygiene scope that wrote it.
 pub(super) type Name<'a> = (&'a str, u32);
 
 /// The inference of one body.
 pub struct Infer<'c, 'a> {
-    cx: &'c mut Context<'a>,
+    pub(in crate::sema) cx: &'c mut Context<'a>,
     body: &'c Body,
     sig: &'c Signature,
     src: &'a Source,
     root: Option<ItemRef>,
-    instance: Option<(ItemRef, Vec<Ty>)>,
+    instance: Option<(ItemRef, Substs)>,
     home: ModRef,
     generics: Vec<(&'a str, Ty)>,
     self_ty: Option<Ty>,
@@ -197,31 +272,30 @@ pub struct Infer<'c, 'a> {
     opaques: Vec<opaque::Opaque>,
     operands: Vec<(ExprId, crate::body::BinOp, (Ty, Ty), Ty)>,
     try_blocks: Vec<(ExprId, Ty)>,
-    /// The `.await` expressions on a pending async fn's future, with that future, finished once it is revealed.
     awaits: Vec<(ExprId, Ty)>,
     ret_sig: Option<Ty>,
-    out: Typed,
+    out: zonk::InferOut,
     scopes: Vec<(Name<'a>, u32)>,
     items: Vec<(&'a str, ItemRef)>,
     loops: Vec<Breaks>,
     uses: Vec<closure::Captures>,
-    /// The closures whose captures were decided while a read's type was unknown: each one's uses, whether it moves, and what it always captures.
     unsure: Vec<(ExprId, closure::Captures, bool, Vec<u32>)>,
     diverges: bool,
-    /// The `impl Trait` types that no frame parameter stands for: the token of each and the variable for its hidden type.
     hidden: Vec<(u32, Ty)>,
-    /// The values of the parameters of the const fns that a constant expression is calling, innermost last.
     const_args: Vec<(String, (u128, (u32, bool)))>,
     selecting: Vec<String>,
-    /// How many frames of aliases, constants and other items' syntax are open, which `RECURSION_LIMIT` bounds.
     frames: usize,
-    /// The constants being evaluated, innermost last, so a constant that depends on itself is an error.
     evaluating: Vec<ItemRef>,
-    /// What the `use` declarations of each body give a name, or every name they import when none, kept when finding it asked for nothing.
     imports: HashMap<(ItemRef, Option<crate::names::Sym>), Vec<crate::names::PerNs>>,
+    pub(super) poly: Option<Box<poly::PolyState>>,
 }
 
-/// What the `break`s of one loop or labeled block give: the type they coerce to once it is known, whether any `break` was seen, its label, and whether it is a block.
+impl Drop for Infer<'_, '_> {
+    fn drop(&mut self) {
+        zonk::recycle_out(&mut self.out);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Breaks {
     ty: Option<Ty>,
@@ -230,7 +304,6 @@ struct Breaks {
     block: bool,
 }
 
-/// Two types that do not unify, or with `cycle` a variable that occurs in the type it would stand for.
 #[derive(Clone, Copy)]
 struct Clash {
     a: Ty,
@@ -239,7 +312,7 @@ struct Clash {
 }
 
 /// Infers the body of the function `item` with its generic parameters set to `substs`.
-pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed> {
+pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Typed> {
     if let Some(typed) = compiler_made(cx, item, substs)? {
         return Ok(typed);
     }
@@ -250,12 +323,13 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed
     let src = cx.body_src(item);
     let home = cx.module_of(item)?;
     let root = Some(item.body_owner());
+    let args = cx.types.substs(substs).to_vec();
     let mut infer = Infer::start(cx, (&body, &sig, src), home);
-    (infer.root, infer.instance) = (root, Some((item, substs.to_vec())));
-    let mut frame = infer.frame(item, substs)?;
+    (infer.root, infer.instance) = (root, Some((item, substs)));
+    let mut frame = infer.frame(item, &args)?;
     (frame.src, frame.root) = (src, root);
     infer.swap_frame(frame);
-    infer.out.exprs = vec![Ty::NONE; body.exprs.len()];
+    infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
     infer.run(foreign)?;
     let mut typed = infer.finish()?;
     if let Some(slot) = slot {
@@ -264,7 +338,7 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed
     settle(cx, (item, substs), typed)
 }
 
-fn settle(cx: &mut Context<'_>, instance: (ItemRef, &[Ty]), mut typed: Typed) -> Result<Typed> {
+pub(super) fn settle(cx: &mut Context<'_>, instance: (ItemRef, Substs), mut typed: Typed) -> Result<Typed> {
     closure::register(cx, instance, &typed);
     if object::fill_drops(cx, &mut typed)? {
         closure::register(cx, instance, &typed);
@@ -282,16 +356,16 @@ pub struct Awaited {
     pub polled: Ty,
 }
 
-/// The typed form of an instance that the compiler writes instead of a body: drop glue, or the `call_once` of a closure.
-fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Option<Typed>> {
+pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Option<Typed>> {
     if matches!(cx.item(item).1.kind, crate::outline::item::ItemKind::Struct | crate::outline::item::ItemKind::Enum) {
         return adt::ctor_typed(cx, item, substs).map(Some);
     }
+    let slice = cx.types.substs(substs);
     if cx.lang(item) == Some("drop_glue") {
-        let Some(&ty) = substs.first() else { bail!("drop glue with no type") };
+        let Some(&ty) = slice.first() else { bail!("drop glue with no type") };
         return drop::glue_typed(cx, item, ty).map(Some);
     }
-    let Some(&ty) = substs.first() else { return Ok(None) };
+    let Some(&ty) = slice.first() else { return Ok(None) };
     if cx.lang(item) == Some("clone_fn") && clone::compiler_clone(cx, ty) {
         return clone::clone_typed(cx, item, ty).map(Some);
     }
@@ -307,14 +381,15 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
 }
 
 impl<'c, 'a> Infer<'c, 'a> {
-    fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
+    pub(super) fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out: Typed::default(), scopes, items, loops, uses, unsure: Vec::new(), diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), frames: 0, evaluating: Vec::new(), imports: HashMap::default() }
+        let out = zonk::take_out();
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out, scopes, items, loops, uses, unsure: Vec::new(), diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), frames: 0, evaluating: Vec::new(), imports: HashMap::default(), poly: None }
     }
 }
 
 impl Infer<'_, '_> {
-    fn run(&mut self, foreign: bool) -> Result<()> {
+    pub(super) fn run(&mut self, foreign: bool) -> Result<()> {
         self.hidden.clear();
         let declared = match self.sig.ret {
             Some(ty) => self.lower_ty(&self.sig.body, ty)?,
@@ -378,7 +453,6 @@ impl Infer<'_, '_> {
         self.out.locals.len() as u32 - 1
     }
 
-    /// Runs `f` and keeps the variable bindings it made only when it gives a value.
     fn trial<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<Option<T>>) -> Result<Option<T>> {
         let saved = self.vars.clone();
         let out = f(self);
@@ -388,7 +462,6 @@ impl Infer<'_, '_> {
         out
     }
 
-    /// Runs `f` and undoes every variable binding it made.
     fn probe<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let saved = self.vars.clone();
         let out = f(self);
@@ -440,7 +513,7 @@ impl Infer<'_, '_> {
         if self.var_of(ty) == Some(var) {
             return true;
         }
-        self.cx.types.kind(ty).children().any(|item| self.occurs(var, item))
+        self.cx.types.kind(ty).children(&self.cx.types).any(|item| self.occurs(var, item))
     }
 
     /// Makes `a` and `b` the same type.
@@ -448,7 +521,6 @@ impl Infer<'_, '_> {
         self.unify_quiet(a, b).map_err(|clash| self.clash_error(clash))
     }
 
-    /// Makes `a` and `b` the same type and says whether they unify, building no message when they do not.
     pub(super) fn unifies(&mut self, a: Ty, b: Ty) -> bool {
         self.unify_quiet(a, b).is_ok()
     }
@@ -477,16 +549,31 @@ impl Infer<'_, '_> {
 
     fn unify_shapes(&mut self, a: &Kind, b: &Kind) -> Result<(), ()> {
         let pairs: Vec<(Ty, Ty)> = match (a, b) {
-            (Kind::Tuple(x), Kind::Tuple(y)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).collect(),
+            (Kind::Tuple(x), Kind::Tuple(y)) => self.zip_substs(*x, *y)?,
             (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => vec![(*x, *y)],
             (Kind::Array(x, m), Kind::Array(y, n)) => vec![(*x, *y), (*m, *n)],
             (Kind::Slice(x), Kind::Slice(y)) => vec![(*x, *y)],
             (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => vec![(*x, *y)],
-            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, ..), Kind::Dyn(j, y, ..)) if i == j && x.len() == y.len() && dyn_members(a) == dyn_members(b) => x.iter().copied().zip(y.iter().copied()).collect(),
-            (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).chain([(*r, *s)]).collect(),
+            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, ..), Kind::Dyn(j, y, ..)) if i == j && dyn_members(a) == dyn_members(b) => self.zip_substs(*x, *y)?,
+            (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) => {
+                let mut pairs = self.zip_substs(*x, *y)?;
+                pairs.push((*r, *s));
+                pairs
+            }
             _ => return Err(()),
         };
         pairs.into_iter().try_for_each(|(x, y)| self.unify_quiet(x, y).map_err(drop))
+    }
+
+    fn zip_substs(&self, a: Substs, b: Substs) -> Result<Vec<(Ty, Ty)>, ()> {
+        if a == b {
+            return Ok(Vec::new());
+        }
+        let (xs, ys) = (self.cx.types.substs(a), self.cx.types.substs(b));
+        if xs.len() != ys.len() {
+            return Err(());
+        }
+        Ok(xs.iter().copied().zip(ys.iter().copied()).collect())
     }
 
     /// Checks that a value of type `found` can be used where `expected` is wanted, through the coercions that keep its bits.
@@ -500,7 +587,6 @@ impl Infer<'_, '_> {
         self.settle_pending()
     }
 
-    /// The pointees of `found` and `expected` when a pointer of type `found` coerces to `expected` by dropping `mut` or by turning a reference into a raw pointer.
     pub(super) fn weakened(&self, found: Ty, expected: Ty) -> Option<(Ty, Ty)> {
         match (self.cx.types.kind(self.resolve(found)), self.cx.types.kind(self.resolve(expected))) {
             (&Kind::Ref(from, a), &Kind::Ptr(to, b)) | (&Kind::Ref(from, a), &Kind::Ref(to, b)) | (&Kind::Ptr(from, a), &Kind::Ptr(to, b)) if from == Mut::Mut && to == Mut::Not => Some((a, b)),
@@ -523,12 +609,10 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// How many deferred items inference still waits on, which each pass of `settle_pending` must cut to run again.
-    fn backlog(&self) -> usize {
+    pub(super) fn backlog(&self) -> usize {
         self.metadata.len() + self.projections.len() + self.opaques.len() + self.operands.len() + self.obligations.len()
     }
 
-    /// The type `ty` resolved, after settling what is pending when it is still an unknown variable, as rustc does before it needs a type.
     pub(super) fn known_ty(&mut self, ty: Ty) -> Result<Ty> {
         if matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
             self.settle_pending()?;
@@ -565,26 +649,15 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// The expected type `expected` when it is already known, so that branches coerce to it instead of to each other.
     pub(super) fn known(&self, expected: Option<Ty>) -> Option<Ty> {
         expected.filter(|ty| !matches!(self.cx.types.kind(self.resolve(*ty)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)))
     }
 
-    fn settle_obligations(&mut self) -> Result<()> {
+    pub(super) fn settle_obligations(&mut self) -> Result<()> {
         let mut at = 0;
         while at < self.obligations.len() {
             let (of, substs) = self.obligations[at].clone();
-            let self_ty = self.resolve(substs[0]);
-            if matches!(self.cx.types.kind(self_ty), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
-                if self.opaque_holds(of, &substs)? == Some(true) {
-                    self.obligations.swap_remove(at);
-                } else {
-                    at += 1;
-                }
-                continue;
-            }
-            let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
-            if (!known && self.assume(of, &substs)?) || self.settled_by_impl(of, self_ty, &substs[1..])? || known {
+            if self.step_obligation(of, &substs)? {
                 self.obligations.swap_remove(at);
             } else {
                 at += 1;
@@ -593,12 +666,22 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    /// Whether the one impl that selection picks settles the obligation: its nested bounds wait while `self_ty` still holds variables, so it is tried again once they are known.
+    fn step_obligation(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
+        let self_ty = self.resolve(substs[0]);
+        if matches!(self.cx.types.kind(self_ty), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
+            return Ok(self.opaque_holds(of, substs)? == Some(true));
+        }
+        let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
+        if self.poly.is_some() && !self.has_vars(self_ty) && known && self.any_has_params(substs) {
+            return self.poly_settle_obligation(of, self_ty, &substs[1..]);
+        }
+        Ok((!known && self.assume(of, substs)?) || self.settled_by_impl(of, self_ty, &substs[1..])? || known)
+    }
+
     fn settled_by_impl(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
         Ok(self.select(of, self_ty, args)?.is_some() && !self.has_vars(self_ty))
     }
 
-    /// Ties `substs` of trait `of` to the one bound of the frame they match, and whether exactly one did, as rustc prefers a where-clause over impls.
     pub(super) fn assume(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
         let mut matched = Vec::new();
         for (held, types) in self.assumptions()? {
@@ -630,12 +713,10 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    /// What a query can leave behind: the asks of the pass and the pending projections and obligations, which a cached answer must not have added to.
     fn unsettled(&self) -> ([usize; 5], usize, usize) {
         (self.cx.asks.mark(), self.projections.len(), self.obligations.len())
     }
 
-    /// Whether no body state can reach a lowered type: no instance, block items, locals, const fn arguments, constants being evaluated or selection in progress, so an answer here holds for every body.
     fn bodiless(&self) -> bool {
         self.instance.is_none() && self.items.is_empty() && self.scopes.is_empty() && self.const_args.is_empty() && self.evaluating.is_empty() && self.selecting.is_empty()
     }
@@ -646,16 +727,6 @@ impl Infer<'_, '_> {
     }
 }
 
-/// The field types of each variant of the struct, enum or union `item` at `args`.
-pub fn field_types(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Fields> {
-    detached(cx, item, |infer| infer.adt_fields(item, args))
-}
-
-/// The type of the last field of the struct `item` at `args`.
-pub fn tail_field(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Option<Ty>> {
-    detached(cx, item, |infer| infer.adt_tail_field(item, args))
-}
-
 fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
     match kind {
         Kind::Dyn(_, _, members, autos) => (members, autos),
@@ -663,55 +734,9 @@ fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
     }
 }
 
-/// Whether the struct `item` may end in an unsized field, which its definition decides for every instantiation as rustc's layout does; with no `?Sized` parameter, a tail the stand-ins cannot lower, such as a projection on one, is sized.
-pub fn maybe_unsized(cx: &mut Context<'_>, item: ItemRef) -> Result<bool> {
-    if cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
-        return Ok(false);
-    }
-    let def = cx.adt_def(item)?;
-    let src = &cx.file(item).source;
-    let byte = cx.types.intern(Kind::Prim(Primitive::U8));
-    let stand_ins = [cx.types.intern(Kind::Value(1)), cx.types.intern(Kind::Slice(byte)), byte];
-    let args: Vec<Ty> = scope::type_params(&def.generics.params).map(|generic| match generic.kind {
-        crate::body::sig::GenericKind::Const(_) => stand_ins[0],
-        _ if relaxed(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
-        _ => stand_ins[2],
-    }).collect();
-    let any_relaxed = args.contains(&stand_ins[1]);
-    let ty = cx.types.intern(Kind::Adt(item, args.clone()));
-    match cx.is_unsized(ty) {
-        Err(_) if !any_relaxed => Ok(false),
-        Err(_) => detached(cx, item, |infer| infer.open_tail_unsized(item, &args, stand_ins[2])),
-        found => found,
-    }
-}
-
-fn relaxed(arena: &Body, src: &Source, predicates: &[crate::body::sig::Predicate], generic: &crate::body::sig::Generic) -> bool {
-    let bounds = scope::generic_bounds(arena, src, predicates, generic);
-    bounds.iter().any(|&bound| matches!(arena.bounds[bound as usize], crate::body::Bound::Trait { maybe: true, .. }))
-}
-
 /// The discriminant of each variant of the enum `item`, whose tags are integers of type `primitive`.
 pub fn discriminants(cx: &mut Context<'_>, item: ItemRef, primitive: Primitive) -> Result<Vec<i128>> {
     detached(cx, item, |infer| infer.discriminants(item, primitive))
-}
-
-/// Whether dropping a value of `ty` runs code.
-pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
-    detached(cx, anchor, |infer| infer.needs_drop(ty))
-}
-
-/// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
-pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
-    detached(cx, anchor, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
-}
-
-/// The `Drop::drop` of `ty`'s own `Drop` impl, which for a `Box` frees the allocation without dropping what it owns.
-pub fn drop_fn(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
-    detached(cx, anchor, |infer| infer.own_drop(ty))
 }
 
 /// The return type of the non-generic function `item`.

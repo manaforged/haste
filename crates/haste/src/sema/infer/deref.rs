@@ -14,6 +14,9 @@ impl Infer<'_, '_> {
         if let Some(inner) = self.builtin_deref(ty) {
             return Ok(inner);
         }
+        if matches!(self.cx.types.kind(ty), Kind::Proj(_)) {
+            self.poly_fallback();
+        }
         match self.overloaded_deref(ty, Mut::Not)? {
             Some((res, target)) => {
                 self.out.derefs.insert((expr, 0), res);
@@ -24,7 +27,7 @@ impl Infer<'_, '_> {
     }
 
     /// The type that the compiler's own dereference of `ty` reaches: the pointee of a reference or pointer, or what a `Box` owns.
-    pub(super) fn builtin_deref(&self, ty: Ty) -> Option<Ty> {
+    pub(in crate::sema) fn builtin_deref(&self, ty: Ty) -> Option<Ty> {
         match self.cx.types.kind(ty) {
             Kind::Ref(_, inner) | Kind::Ptr(_, inner) => Some(*inner),
             _ => self.cx.boxed(ty),
@@ -35,13 +38,7 @@ impl Infer<'_, '_> {
     pub(super) fn field_base(&mut self, expr: ExprId, found: Ty, field: &str) -> Result<Ty> {
         let (mut ty, mut steps) = (self.known_ty(found)?, 0);
         loop {
-            let next = match self.cx.types.kind(ty).clone() {
-                Kind::Ref(_, inner) => Some(self.known_ty(inner)?),
-                Kind::Adt(item, _) if self.cx.boxed(ty).is_some() && !self.sees_private(item)? => self.cx.boxed(ty),
-                Kind::Adt(..) if !self.has_field(ty, field)? => self.deref_step(expr, steps, ty)?,
-                _ => None,
-            };
-            let Some(next) = next else { break };
+            let Some(next) = self.next_field_step(expr, steps, ty, field)? else { break };
             (ty, steps) = (self.resolve(next), steps + 1);
             if steps as usize == crate::RECURSION_LIMIT {
                 bail!("reached the recursion limit while dereferencing {}", self.show(found));
@@ -53,6 +50,19 @@ impl Infer<'_, '_> {
         Ok(ty)
     }
 
+    fn next_field_step(&mut self, expr: ExprId, steps: u32, ty: Ty, field: &str) -> Result<Option<Ty>> {
+        match self.cx.types.kind(ty).clone() {
+            Kind::Ref(_, inner) => self.known_ty(inner).map(Some),
+            Kind::Adt(item, _) if self.cx.boxed(ty).is_some() && !self.sees_private(item)? => Ok(self.cx.boxed(ty)),
+            Kind::Adt(..) if !self.has_field(ty, field)? => self.deref_step(expr, steps, ty),
+            Kind::Param(_) | Kind::Proj(_) => {
+                self.poly_fallback();
+                self.deref_step(expr, steps, ty)
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn has_field(&mut self, ty: Ty, field: &str) -> Result<bool> {
         let Kind::Adt(item, _) = *self.cx.types.kind(ty) else { return Ok(false) };
         Ok(self.cx.item(item).1.kind == ItemKind::Struct && self.field_index(item, 0, field)?.is_some())
@@ -60,6 +70,9 @@ impl Infer<'_, '_> {
 
     /// The type that step `step` of the autoderef of `expr` reaches from `ty` through `Deref::deref`, recorded on `(expr, step)`; `None` when `ty` has no `Deref` impl.
     pub(super) fn deref_step(&mut self, expr: ExprId, step: u32, ty: Ty) -> Result<Option<Ty>> {
+        if matches!(self.cx.types.kind(ty), Kind::Proj(_)) {
+            self.poly_fallback();
+        }
         let Some((res, target)) = self.overloaded_deref(ty, Mut::Not)? else { return Ok(None) };
         self.out.derefs.insert((expr, step), res);
         Ok(Some(target))
@@ -119,7 +132,7 @@ impl Infer<'_, '_> {
         let Some((item, substs)) = self.trait_method(method, receiver)? else { return Ok(None) };
         let (_, ret) = self.fn_types(item, &substs)?;
         let Kind::Ref(_, target) = *self.cx.types.kind(self.resolve(ret)) else { bail!("`{}` returns a value that is not a reference", self.cx.name(item)) };
-        Ok(Some((Res::Fn(item, substs), target)))
+        Ok(Some((Res::fn_of(&self.cx.types, item, &substs), target)))
     }
 
     /// Makes every overloaded dereference in the place expression `expr` call `DerefMut::deref_mut`, as a write or a unique borrow of the place needs.

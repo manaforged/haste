@@ -6,8 +6,10 @@ use crate::body::{BinOp, Expr, ExprId, Lit, UnOp};
 use crate::names::{ItemRef, Primitive};
 use crate::sema::infer::{Adjust, Res};
 use crate::sema::infer::parse_int;
+use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty, int_info};
 
+use super::stencil::SymbolSource;
 use super::{Lower, Parts, Repr};
 
 /// What arithmetic means for one operand type.
@@ -56,8 +58,8 @@ impl Lower<'_, '_> {
             bytes.push(0);
         }
         let wide = lit != Lit::ByteStr;
-        let address = self.slots.data(&bytes);
-        let data = self.ins().iconst(Type::I64, address);
+        let id = self.slots.rodata(&bytes, &[]);
+        let data = self.emit_symbol(SymbolSource::Rodata(id));
         Ok(if wide { self.wide_pointer(data, bytes.len() as i64) } else { data })
     }
 
@@ -97,9 +99,9 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn unary(&mut self, expr: ExprId, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
-        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
+        if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
             let Some(value) = self.expr(operand)? else { return Ok(None) };
-            return self.invoke(item, &substs, vec![value]);
+            return self.invoke(item, substs, vec![value]);
         }
         let num = self.num(self.ty_of(operand))?;
         if let (UnOp::Neg, Num::Int { ty, .. }, Some(at)) = (op, num, self.int_literal(operand)) {
@@ -150,8 +152,8 @@ impl Lower<'_, '_> {
         if matches!(op, BinOp::And | BinOp::Or) {
             return self.logical(expr, op, lhs, rhs);
         }
-        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
-            return self.overloaded(expr, op, (lhs, rhs), (item, &substs));
+        if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
+            return self.overloaded(expr, op, (lhs, rhs), (item, substs));
         }
         if self.is_wide(self.ty_of(lhs))? {
             let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else { return Ok(None) };
@@ -185,7 +187,7 @@ impl Lower<'_, '_> {
         })
     }
 
-    fn overloaded(&mut self, expr: ExprId, op: BinOp, operands: (ExprId, ExprId), (item, substs): (ItemRef, &[Ty])) -> Result<Option<Value>> {
+    fn overloaded(&mut self, expr: ExprId, op: BinOp, operands: (ExprId, ExprId), (item, substs): (ItemRef, Substs)) -> Result<Option<Value>> {
         let by_ref = Adjust { derefs: 0, autoref: Some(Mut::Not) };
         let mut values = Vec::with_capacity(2);
         for operand in [operands.0, operands.1] {
@@ -196,7 +198,7 @@ impl Lower<'_, '_> {
         self.invoke(item, substs, values)
     }
 
-    fn overloaded_assign(&mut self, (expr, lhs, rhs): (ExprId, ExprId, ExprId), (item, substs): (ItemRef, &[Ty])) -> Result<Option<Value>> {
+    fn overloaded_assign(&mut self, (expr, lhs, rhs): (ExprId, ExprId, ExprId), (item, substs): (ItemRef, Substs)) -> Result<Option<Value>> {
         let by_mut = Adjust { derefs: 0, autoref: Some(Mut::Mut) };
         let Some(place) = self.receiver((expr, lhs), by_mut)? else { return Ok(None) };
         let mut values = vec![place];
@@ -415,8 +417,8 @@ impl Lower<'_, '_> {
     }
 
     fn compound(&mut self, expr: ExprId, (lhs, rhs): (ExprId, ExprId), op: BinOp) -> Result<Option<Value>> {
-        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
-            return self.overloaded_assign((expr, lhs, rhs), (item, &substs));
+        if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
+            return self.overloaded_assign((expr, lhs, rhs), (item, substs));
         }
         let rhs_num = self.num(self.ty_of(rhs)).ok();
         let Some(value) = self.expr(rhs)? else { return Ok(None) };

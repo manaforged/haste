@@ -44,6 +44,7 @@ impl Counter {
     fn param(&mut self, purpose: ArgumentPurpose, ty: Type) -> Result<Loc, String> {
         match purpose {
             ArgumentPurpose::StructReturn => return Ok(Loc::Int(INDIRECT)),
+            ArgumentPurpose::Dict => return Ok(Loc::Int(Reg(9))),
             ArgumentPurpose::StructArgument(_) => return Err("a struct passed by value on the stack has no arm64 lowering yet".to_owned()),
             ArgumentPurpose::Normal => {}
         }

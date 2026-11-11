@@ -260,15 +260,18 @@ impl Lower<'_, '_> {
         let part = Place { base: Base::Addr(contents), offset: 0, repr: repr(self.cx, owned)? };
         self.drop_path(at, inside, owned, Some(part))?;
         let Some(Res::Fn(item, substs)) = drop_fn(self.cx, ty)? else { bail!("`Box` has no `Drop::drop`") };
-        self.invoke(item, &substs, vec![target]).map(drop)
+        self.invoke(item, substs, vec![target]).map(drop)
     }
 
     fn open_drop(&mut self, at: usize, path: &[(u32, u32)], ty: Ty, place: Option<Place>) -> Result<()> {
         let Some(place) = place else { bail!("a partly moved value with no bytes") };
-        let variants: Fields = match self.cx.types.kind(ty).clone() {
-            Kind::Tuple(items) => vec![items].into(),
-            Kind::Adt(item, args) => field_types(self.cx, item, &args)?,
-            other => bail!("a partly moved {other:?}"),
+        let variants: Fields = match *self.cx.types.kind(ty) {
+            Kind::Tuple(items) => vec![self.cx.types.substs(items).to_vec()].into(),
+            Kind::Adt(item, args) => {
+                let slice = self.cx.types.substs(args).to_vec();
+                field_types(self.cx, item, &slice)?
+            }
+            ref other => bail!("a partly moved {other:?}"),
         };
         self.each_field((ty, place), &variants, &mut |lower, field, field_ty, part| {
             let mut sub = path.to_vec();
@@ -310,7 +313,8 @@ impl Lower<'_, '_> {
         }
         let Some(glue) = self.cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
         let target = self.address_or_dangling(place, ty)?;
-        self.invoke(glue, &[ty], vec![target]).map(drop)
+        let substs = self.cx.types.intern_substs(&[ty]);
+        self.invoke(glue, substs, vec![target]).map(drop)
     }
 
     /// Lowers the body of the drop glue for `ty` whose target is `target`: `Drop::drop`, then the parts.
@@ -320,7 +324,7 @@ impl Lower<'_, '_> {
             Shape::Glue(glue) => glue.clone(),
             _ => Default::default(),
         };
-        if let Some(resume) = glue.resume.clone() {
+        if let Some(resume) = glue.resume {
             return self.coroutine_glue(ty, target, resume);
         }
         let drop_fn = match glue.drop {
@@ -330,12 +334,12 @@ impl Lower<'_, '_> {
         if let Some(owned) = self.cx.boxed(ty) {
             self.box_contents(owned, target)?;
             if let Some((item, substs)) = drop_fn {
-                self.invoke(item, &substs, vec![target])?;
+                self.invoke(item, substs, vec![target])?;
             }
             return Ok(());
         }
         if let Some((item, substs)) = drop_fn {
-            self.invoke(item, &substs, vec![target])?;
+            self.invoke(item, substs, vec![target])?;
         }
         self.drop_parts(ty, target)
     }
@@ -358,7 +362,8 @@ impl Lower<'_, '_> {
             return Ok(());
         }
         let Some(glue) = self.cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
-        self.invoke(glue, &[ty], vec![wide]).map(drop)
+        let substs = self.cx.types.intern_substs(&[ty]);
+        self.invoke(glue, substs, vec![wide]).map(drop)
     }
 
     fn drop_parts(&mut self, ty: Ty, target: Value) -> Result<()> {
@@ -396,10 +401,13 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn drop_fields(&mut self, ty: Ty, place: Place) -> Result<()> {
-        let variants: Fields = match self.cx.types.kind(ty).clone() {
-            Kind::Tuple(items) => vec![items].into(),
+        let variants: Fields = match *self.cx.types.kind(ty) {
+            Kind::Tuple(items) => vec![self.cx.types.substs(items).to_vec()].into(),
             Kind::Adt(item, _) if self.cx.lang(item) == Some("manually_drop") || self.cx.item(item).1.kind == crate::outline::item::ItemKind::Union => return Ok(()),
-            Kind::Adt(item, args) => field_types(self.cx, item, &args)?,
+            Kind::Adt(item, args) => {
+                let slice = self.cx.types.substs(args).to_vec();
+                field_types(self.cx, item, &slice)?
+            }
             _ => return Ok(()),
         };
         self.each_field((ty, place), &variants, &mut |lower, _, field_ty, part| lower.glue(field_ty, Some(part)))

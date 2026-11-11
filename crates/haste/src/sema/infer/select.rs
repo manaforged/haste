@@ -6,6 +6,7 @@ use crate::names::{Def, ItemRef, ModRef};
 use crate::outline::item::ItemKind;
 
 use super::super::impls::{ImplRef, head};
+use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty};
 use super::Infer;
 use super::scope::{Frame, named_args, type_params};
@@ -33,8 +34,8 @@ impl<'a> Infer<'_, 'a> {
     /// The one impl of trait `of` at trait arguments `args` for `self_ty`, or none when no impl or several apply.
     pub fn select(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<Option<Picked>> {
         let key = self.selection_key(of, self_ty, args);
-        if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
-            return Ok(found.clone());
+        if let Some(&found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
+            return Ok(found.map(|(block, impl_args)| (block, self.cx.types.substs(impl_args).to_vec())));
         }
         let before = (self.cx.asks.mark(), self.projections.len(), self.obligations.len());
         let picked = self.select_at(of, self_ty, args, 0)?;
@@ -44,7 +45,7 @@ impl<'a> Infer<'_, 'a> {
             None => Some(None),
             Some((block, impl_args)) => {
                 let filled: Vec<Ty> = impl_args.iter().map(|&ty| self.substitute(ty)).collect();
-                filled.iter().all(|&ty| self.closed(ty)).then_some(Some((*block, filled)))
+                filled.iter().all(|&ty| self.closed(ty)).then(|| Some((*block, self.cx.types.intern_substs(&filled))))
             }
         };
         if let Some(kept) = kept.filter(|_| settled) {
@@ -54,15 +55,22 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The key that caches selecting `of<args>` for `self_ty` across bodies: the query with its variables filled in, when it is made at the top level and every type in it is known and holds no closure.
-    fn selection_key(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Option<(ItemRef, Ty, Vec<Ty>)> {
-        let known = self.selecting.is_empty() && self.closed(self_ty) && args.iter().all(|&arg| self.closed(arg));
-        known.then(|| (of, self.substitute(self_ty), args.iter().map(|&arg| self.substitute(arg)).collect()))
+    fn selection_key(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Option<(ItemRef, Ty, Substs)> {
+        if !self.selecting.is_empty() || !self.closed(self_ty) || !args.iter().all(|&arg| self.closed(arg)) {
+            return None;
+        }
+        let substituted: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
+        Some((of, self.substitute(self_ty), self.cx.types.intern_substs(&substituted)))
     }
 
     /// Whether `ty` holds no inference variable and no closure, whose signature may still hold one, so selecting with it gives the same answer in every body.
     fn closed(&self, ty: Ty) -> bool {
-        let kind = self.cx.types.kind(self.resolve(ty));
-        !matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Closure(..)) && kind.children().all(|item| self.closed(item))
+        let ty = self.resolve(ty);
+        if self.has_params(ty) {
+            return false;
+        }
+        let kind = self.cx.types.kind(ty);
+        !matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Closure(..)) && kind.children(&self.cx.types).all(|item| self.closed(item))
     }
 
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
@@ -74,7 +82,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// Whether some impl of trait `of` at `args` may apply to `self_ty`, even when inference cannot pick one yet.
     pub fn may_implement(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
-        Ok(!self.applicable(of, self_ty, args, 0)?.is_empty())
+        Ok(!self.applicable(of, self_ty, args, 0)?.is_empty() || self.poly_may_implement(of, self_ty, args)?)
     }
 
     fn applicable(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
@@ -251,7 +259,7 @@ impl<'a> Infer<'_, 'a> {
             {
                 crates.push(item.krate);
             }
-            stack.extend(kind.children());
+            stack.extend(kind.children(&self.cx.types));
         }
         crates
     }
@@ -355,6 +363,11 @@ impl<'a> Infer<'_, 'a> {
             let Some(sig) = self.fn_bound(arena, home, bound)? else { return Ok(true) };
             return Ok(self.tie_callable(ty, sig).is_ok());
         }
+        if self.poly.is_some()
+            && let Some(held) = self.poly_bound_check((arena, home, bound), (of, path, ty), depth)?
+        {
+            return Ok(held);
+        }
         let args = self.bound_args(of, arena, path, ty)?;
         if self.object_holds(of, ty, &args) == Some(true) {
             return Ok(true);
@@ -363,8 +376,8 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Whether the compiler, not an impl, decides that `ty` implements trait `of`: for its marker and auto traits, except `Copy` and `Clone` of a struct, enum or union, which derives and std write impls for.
-    fn compiler_decides(&self, of: ItemRef, ty: Ty) -> bool {
-        let by_impl = matches!(self.cx.types.kind(self.resolve(ty)), Kind::Adt(..)) && self.cx.lang(of).is_some_and(|lang| matches!(lang, "copy" | "clone"));
+    pub(in crate::sema) fn compiler_decides(&self, of: ItemRef, ty: Ty) -> bool {
+        let by_impl = matches!(self.cx.types.kind(self.resolve(ty)), Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_)) && self.cx.lang(of).is_some_and(|lang| matches!(lang, "copy" | "clone"));
         self.compiler_trait(of) && !by_impl
     }
 
@@ -387,10 +400,51 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Whether `ty` holds an unbound inference variable.
-    pub(super) fn has_vars(&self, ty: Ty) -> bool {
+    pub(in crate::sema) fn has_vars(&self, ty: Ty) -> bool {
+        if !self.cx.types.has_var_flag(ty) {
+            return false;
+        }
+        let mut seen = rustc_hash::FxHashSet::default();
+        self.has_vars_seen(ty, &mut seen)
+    }
+
+    pub(in crate::sema) fn has_vars_seen(&self, ty: Ty, seen: &mut rustc_hash::FxHashSet<Ty>) -> bool {
         let ty = self.resolve(ty);
+        if !self.cx.types.has_var_flag(ty) || !seen.insert(ty) {
+            return false;
+        }
         let kind = self.cx.types.kind(ty);
-        matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || kind.children().any(|item| self.has_vars(item))
+        matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || kind.children(&self.cx.types).any(|item| self.has_vars_seen(item, seen))
+    }
+
+    pub(in crate::sema) fn has_params(&self, ty: Ty) -> bool {
+        if !self.cx.types.has_var_flag(ty) {
+            return self.cx.types.has_params(ty);
+        }
+        let mut seen = rustc_hash::FxHashSet::default();
+        self.has_params_seen(ty, &mut seen)
+    }
+
+    fn has_params_seen(&self, ty: Ty, seen: &mut rustc_hash::FxHashSet<Ty>) -> bool {
+        let ty = self.resolve(ty);
+        if self.cx.types.has_params(ty) {
+            return true;
+        }
+        if !self.cx.types.has_var_flag(ty) || !seen.insert(ty) {
+            return false;
+        }
+        match self.cx.types.kind(ty) {
+            Kind::Closure(_, args, _) => self.cx.types.substs(*args).iter().any(|&item| self.has_params_seen(item, seen)),
+            kind => kind.children(&self.cx.types).any(|item| self.has_params_seen(item, seen)),
+        }
+    }
+
+    pub(in crate::sema) fn any_has_params(&self, tys: &[Ty]) -> bool {
+        tys.iter().any(|&ty| self.has_params(ty))
+    }
+
+    pub(in crate::sema) fn substs_have_params(&self, substs: Substs) -> bool {
+        self.any_has_params(self.cx.types.substs(substs))
     }
 
     /// Whether the obligation `ty: _<args>` holds an unbound inference variable.
@@ -410,7 +464,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Whether the associated types of `of` for `ty` meet the bound path's bindings, as `Item = T`, and its constraints, as `Item: Trait`.
-    fn assoc_bounds_hold(&mut self, (arena, home, path): (&Body, ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
+    pub(super) fn assoc_bounds_hold(&mut self, (arena, home, path): (&Body, ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
         if !self.bindings_hold(arena, path, (of, ty, args))? {
             return Ok(false);
         }
@@ -440,9 +494,9 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.
-    pub(super) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
+    pub(in crate::sema) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
         let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
-        let given = super::super::ty::object_parts(&parts, &members).0;
+        let given = super::super::ty::object_parts(self.cx.types.substs(parts), &members).0.to_vec();
         let same_args = object == of || (self.is_callable_trait(object) && self.is_callable_trait(of));
         if !same_args {
             return Some(args.is_empty() && self.implied_traits(vec![object]).is_ok_and(|traits| traits.contains(&of)));
@@ -463,19 +517,20 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one, such as a struct that ends in a slice, is neither `Sized`, `Copy` nor `Clone`, and `&mut T` is neither `Copy` nor `Clone`.
-    pub(super) fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
+    pub(in crate::sema) fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
         let Some(lang) = self.cx.lang(of) else { return true };
         let ty = self.resolve(ty);
         match self.cx.types.kind(ty) {
             Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str) | Kind::Dyn(..) => !SIZED_ONLY.contains(&lang),
-            Kind::Adt(..) if SIZED_ONLY.contains(&lang) => !self.cx.is_unsized(ty).unwrap_or(false),
             Kind::Ref(Mut::Mut, _) => !matches!(lang, "copy" | "clone"),
+            Kind::Adt(..) | Kind::Tuple(..) | Kind::Param(_) | Kind::Proj(_) if SIZED_ONLY.contains(&lang) && self.poly.is_some() && self.has_params(ty) => self.poly_sized(ty),
+            Kind::Adt(..) if SIZED_ONLY.contains(&lang) => !self.is_unsized(ty).unwrap_or(false),
             _ => true,
         }
     }
 
     /// Whether trait `of` is `Fn`, `FnMut` or `FnOnce`, which callables implement with no impl to select.
-    pub(super) fn is_callable_trait(&self, of: ItemRef) -> bool {
+    pub(in crate::sema) fn is_callable_trait(&self, of: ItemRef) -> bool {
         self.cx.lang(of).is_some_and(|lang| CALLABLE.contains(&lang))
     }
 
@@ -499,6 +554,36 @@ impl<'a> Infer<'_, 'a> {
             _ => None,
         }
     }
+
+    fn collect_header_traits(&mut self, item: ItemRef) -> Result<Vec<ItemRef>> {
+        self.frame_item = Some(item);
+        self.block = self.cx.owner_impl(item);
+        let mut direct = Vec::new();
+        if let Some(of) = self.cx.owner_trait(item) {
+            direct.push(of);
+        }
+        if let Some(block) = self.block
+            && let Some(of) = self.cx.impl_trait(block)
+        {
+            direct.push(of);
+        }
+        let home = self.home;
+        for (header, src) in self.headers()? {
+            let (arena, generics, predicates) = header.parts();
+            let bounds: Vec<u32> = type_params(generics).flat_map(|g| arena.list(g.bounds).iter().copied()).chain(predicates.iter().flat_map(|p| arena.list(p.bounds).iter().copied())).collect();
+            let found = self.in_source(src, |inner| Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>()))?;
+            direct.extend(found);
+        }
+        self.implied_traits(direct)
+    }
+}
+
+/// The traits declared in `item`'s header and any enclosing impl or trait header, with every supertrait they imply.
+pub fn header_bound_traits(cx: &mut super::super::Context<'_>, item: ItemRef) -> Vec<ItemRef> {
+    if !matches!(cx.item(item).1.kind, ItemKind::Fn | ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::Type) {
+        return Vec::new();
+    }
+    super::detached(cx, item, |infer| infer.collect_header_traits(item)).unwrap_or_default()
 }
 
 /// What ranks one applicable impl against another under specialization: whether it has `default` items, the traits its bounds name, and those with every supertrait.

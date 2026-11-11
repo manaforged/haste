@@ -3,6 +3,7 @@
 mod expand;
 mod lazy;
 mod script;
+mod stencil;
 mod stub;
 mod workers;
 
@@ -40,8 +41,17 @@ pub struct Image {
     tables: RefCell<HashMap<Vec<Word>, i64>>,
     fixups: RefCell<Vec<(usize, usize)>>,
     cells: RefCell<HashMap<usize, i64>>,
+    rodata_map: RefCell<HashMap<(Vec<u8>, Vec<lower::RodataReloc>), lower::RodataId>>,
+    rodata_addrs: RefCell<Vec<u64>>,
+    vtable_map: RefCell<HashMap<Vec<lower::VtableEntry>, lower::VtableId>>,
+    vtable_addrs: RefCell<Vec<u64>>,
+    promoted_cells: RefCell<HashMap<(usize, u32), u64>>,
     wanted: RefCell<Vec<crate::sema::reach::Instance>>,
     bodies: lower::Bodies,
+    stencils: stencil::StencilState,
+    jit_mode: bool,
+    sizes: Vec<u32>,
+    times: Vec<u64>,
 }
 
 impl Slots for Image {
@@ -73,7 +83,13 @@ impl Slots for Image {
     }
 
     fn want(&self, instance: crate::sema::reach::Instance) {
-        self.wanted.borrow_mut().push(instance);
+        if self.jit_mode {
+            self.wanted.borrow_mut().push(instance);
+        }
+    }
+
+    fn wanted_len(&self) -> usize {
+        self.wanted.borrow().len()
     }
 
     fn bodies(&self) -> &lower::Bodies {
@@ -88,12 +104,29 @@ impl Slots for Image {
         self.cells.borrow_mut().insert(index, address);
         address
     }
+
+    fn low_entries(&self) -> bool {
+        self._low.is_low()
+    }
+
+    fn rodata(&self, bytes: &[u8], relocs: &[lower::RodataReloc]) -> lower::RodataId {
+        self.intern_rodata(bytes, relocs)
+    }
+
+    fn vtable_id(&self, entries: &[lower::VtableEntry]) -> lower::VtableId {
+        self.intern_vtable(entries)
+    }
+
+    fn resolve_symbol(&self, sym: &lower::SymbolSource) -> u64 {
+        self.symbol_value(sym)
+    }
 }
 
 fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, String> {
     let (src, entry) = cx.item(item);
     let name = cx.attr_value(item, "link_name").or_else(|| entry.name.map(|at| src.text(at)));
-    name.and_then(crate::host::symbol).ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
+    let resolved = name.and_then(crate::host::HostSymbol::resolve).and_then(|sym| sym.host_addr());
+    resolved.ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
 }
 
 /// Whether the foreign item `item` links weakly, so a missing symbol reads as null.
@@ -110,7 +143,49 @@ impl Image {
         let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
         let memory = Memory::default();
         let state = Arena::private(STATE_BYTES)?;
-        Ok(Image { table, _low: low, capacity, memory, stubs: Memory::default(), shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), wanted: RefCell::default(), bodies: lower::Bodies::default() })
+        let len = reached.list.len();
+        Ok(Image {
+            table,
+            _low: low,
+            capacity,
+            memory,
+            stubs: Memory::default(),
+            shared: RefCell::new(shared),
+            state: RefCell::new(state),
+            tables: RefCell::default(),
+            fixups: RefCell::default(),
+            cells: RefCell::default(),
+            rodata_map: RefCell::default(),
+            rodata_addrs: RefCell::default(),
+            vtable_map: RefCell::default(),
+            vtable_addrs: RefCell::default(),
+            promoted_cells: RefCell::default(),
+            wanted: RefCell::default(),
+            bodies: lower::Bodies::default(),
+            stencils: stencil::StencilState::default(),
+            jit_mode: false,
+            sizes: vec![0; len],
+            times: vec![0; len],
+        })
+    }
+
+    /// The encoded machine-code byte length of each reached function, or zero when not compiled.
+    pub fn code_sizes(&self) -> &[u32] {
+        &self.sizes
+    }
+
+    /// The lowering and encoding wall time in nanoseconds of each reached function, or zero when not compiled.
+    pub fn compile_times(&self) -> &[u64] {
+        &self.times
+    }
+
+    pub(super) fn record_size(&mut self, index: usize, size: u32, ns: u64) {
+        if index >= self.sizes.len() {
+            self.sizes.resize(index + 1, 0);
+            self.times.resize(index + 1, 0);
+        }
+        self.sizes[index] = self.sizes[index].saturating_add(size);
+        self.times[index] = self.times[index].saturating_add(ns);
     }
 
     fn slot(&self, index: usize) -> &AtomicUsize {
@@ -129,6 +204,13 @@ impl Image {
 
     /// Lowers and encodes the reached functions `indices` that type-checked, on every core when there are many, links them, and returns the errors of those that did not compile, by index.
     pub fn compile(&mut self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize]) -> Vec<(usize, String)> {
+        if self.sizes.len() < reached.list.len() {
+            self.sizes.resize(reached.list.len(), 0);
+            self.times.resize(reached.list.len(), 0);
+        }
+        if !indices.is_empty() && indices.len() < reached.list.len() {
+            self.reset_caches();
+        }
         self.bind_foreign_statics(cx, reached, indices);
         let mut errors = Vec::new();
         let mut work = Vec::new();
@@ -177,13 +259,7 @@ impl Image {
     }
 
     fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
-        let lowered = self.bodies.body(index);
-        let func = match lowered {
-            Some(body) => std::rc::Rc::unwrap_or_clone(body),
-            None => lower::lower(cx, reached, self, index)?,
-        };
-        let code = haste_codegen::compile(func, haste_codegen::Target::host())?;
-        Ok(self.memory.write(code.bytes())?)
+        self.compile_jit_one(cx, reached, index)
     }
 
     /// Runs each case `(index, name)`, a reached `fn(i64) -> i64`, on each input and prints `name input value` lines, all in one forked child; a case that crashes gets its status and the cases after it run in a new child.

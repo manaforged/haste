@@ -109,6 +109,9 @@ pub(crate) fn verify(func: &Function) -> Result<(), String> {
         return Err("the entry block parameters do not match the signature".to_owned());
     }
     for inst in &func.insts {
+        if matches!(inst.op, Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_)) && inst.result.map(|res| func.ty(res)) != Some(Type::I64) {
+            return Err("a symbol relocation instruction must define an I64 value".to_owned());
+        }
         op(func, &inst.op)?;
     }
     shape(func)

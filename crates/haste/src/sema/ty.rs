@@ -2,6 +2,8 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::names::{ItemRef, Primitive};
 
+use super::substs::{Pools, ProjDef, ProjId, ProjPool, Substs, SubstsPool};
+
 /// An interned type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ty(pub u32);
@@ -23,22 +25,26 @@ pub enum Mut {
 pub enum Kind {
     Prim(Primitive),
     Never,
-    Tuple(Vec<Ty>),
+    Tuple(Substs),
     Ref(Mut, Ty),
     Ptr(Mut, Ty),
     /// An array of `0` whose length is the const value `1`.
     Array(Ty, Ty),
     Slice(Ty),
-    Adt(ItemRef, Vec<Ty>),
-    FnDef(ItemRef, Vec<Ty>),
-    FnPtr(Vec<Ty>, Ty),
+    Adt(ItemRef, Substs),
+    FnDef(ItemRef, Substs),
+    FnPtr(Substs, Ty),
     /// The closure expression `2` of the body of `0` at type arguments `1`.
-    Closure(ItemRef, Vec<Ty>, u32),
+    Closure(ItemRef, Substs, u32),
     /// A trait object of the trait `0`: its trait arguments, then the type bound to each associated type in `2`, with the sorted auto traits `3`.
-    Dyn(ItemRef, Vec<Ty>, Vec<ItemRef>, Vec<ItemRef>),
+    Dyn(ItemRef, Substs, Vec<ItemRef>, Vec<ItemRef>),
     Pat(Ty, u128, u128),
     /// The value of a const generic argument, as the bits of its type.
     Value(u128),
+    /// A rigid generic type or const parameter by its slot in the item's substitutions.
+    Param(u16),
+    /// A rigid unnormalized associated type projection.
+    Proj(ProjId),
     Var(u32),
     IntVar(u32),
     FloatVar(u32),
@@ -52,34 +58,40 @@ pub fn object_parts<'k>(args: &'k [Ty], members: &'k [ItemRef]) -> (&'k [Ty], im
 
 impl Kind {
     /// The types directly inside this shape.
-    pub fn children(&self) -> impl Iterator<Item = Ty> + '_ {
-        let (items, last): (&[Ty], Option<&Ty>) = match self {
-            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Dyn(_, items, ..) => (items, None),
-            Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => (std::slice::from_ref(inner), None),
-            Kind::Array(inner, len) => (std::slice::from_ref(inner), Some(len)),
-            Kind::FnPtr(params, ret) => (params, Some(ret)),
-            _ => (&[], None),
+    pub fn children<'a>(&'a self, types: &'a Types) -> impl Iterator<Item = Ty> + 'a {
+        let (first, items, extra): (Option<Ty>, &[Ty], &[Ty]) = match self {
+            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Dyn(_, items, ..) => (None, types.substs(*items), &[]),
+            Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => (Some(*inner), &[], &[]),
+            Kind::Array(inner, len) => (Some(*inner), std::slice::from_ref(len), &[]),
+            Kind::FnPtr(params, ret) => (Some(*ret), types.substs(*params), &[]),
+            Kind::Proj(id) => {
+                let proj = types.proj(*id);
+                (Some(proj.self_ty), types.substs(proj.args), types.substs(proj.own))
+            }
+            _ => (None, &[], &[]),
         };
-        items.iter().chain(last).copied()
+        first.into_iter().chain(items.iter().copied()).chain(extra.iter().copied())
     }
 
-    /// This shape with each type directly inside it replaced by `f` of that type.
-    pub fn map(self, mut f: impl FnMut(Ty) -> Ty) -> Kind {
+    /// This shape with each type directly inside it replaced by `f` of that type, interning slices and projections in `pools`.
+    pub fn map_pool(&self, pools: &Pools, mut f: impl FnMut(Ty) -> Ty) -> Kind {
         match self {
-            Kind::Tuple(items) => Kind::Tuple(items.into_iter().map(&mut f).collect()),
-            Kind::Ref(mutable, inner) => Kind::Ref(mutable, f(inner)),
-            Kind::Ptr(mutable, inner) => Kind::Ptr(mutable, f(inner)),
-            Kind::Array(inner, len) => Kind::Array(f(inner), f(len)),
-            Kind::Slice(inner) => Kind::Slice(f(inner)),
-            Kind::Adt(item, args) => Kind::Adt(item, args.into_iter().map(&mut f).collect()),
-            Kind::FnDef(item, args) => Kind::FnDef(item, args.into_iter().map(&mut f).collect()),
-            Kind::Dyn(of, args, members, autos) => Kind::Dyn(of, args.into_iter().map(&mut f).collect(), members, autos),
+            Kind::Tuple(items) => Kind::Tuple(pools.substs.map(*items, &mut f)),
+            Kind::Ref(mutable, inner) => Kind::Ref(*mutable, f(*inner)),
+            Kind::Ptr(mutable, inner) => Kind::Ptr(*mutable, f(*inner)),
+            Kind::Array(inner, len) => Kind::Array(f(*inner), f(*len)),
+            Kind::Slice(inner) => Kind::Slice(f(*inner)),
+            Kind::Adt(item, args) => Kind::Adt(*item, pools.substs.map(*args, &mut f)),
+            Kind::FnDef(item, args) => Kind::FnDef(*item, pools.substs.map(*args, &mut f)),
+            Kind::Closure(parent, args, at) => Kind::Closure(*parent, pools.substs.map(*args, &mut f), *at),
+            Kind::Dyn(of, args, members, autos) => Kind::Dyn(*of, pools.substs.map(*args, &mut f), members.clone(), autos.clone()),
             Kind::FnPtr(params, ret) => {
-                let params = params.into_iter().map(&mut f).collect();
-                Kind::FnPtr(params, f(ret))
+                let params = pools.substs.map(*params, &mut f);
+                Kind::FnPtr(params, f(*ret))
             }
-            Kind::Pat(base, start, end) => Kind::Pat(f(base), start, end),
-            other => other,
+            Kind::Pat(base, start, end) => Kind::Pat(f(*base), *start, *end),
+            Kind::Proj(id) => map_proj(pools, *id, &mut f),
+            other => other.clone(),
         }
     }
 
@@ -89,21 +101,114 @@ impl Kind {
     }
 }
 
+fn map_proj(pools: &Pools, id: ProjId, f: &mut impl FnMut(Ty) -> Ty) -> Kind {
+    let def = pools.projs.get(id);
+    let self_ty = f(def.self_ty);
+    let args = pools.substs.map(def.args, f);
+    let own = pools.substs.map(def.own, f);
+    if self_ty == def.self_ty && args == def.args && own == def.own {
+        Kind::Proj(id)
+    } else {
+        Kind::Proj(pools.projs.intern(ProjDef { self_ty, args, own, ..def }))
+    }
+}
+
+const FLAG_PARAM: u8 = 1;
+const FLAG_VAR: u8 = 2;
+const FLAG_PROJ: u8 = 4;
+
 /// The type interner.
 #[derive(Default)]
 pub struct Types {
     kinds: Vec<Kind>,
+    flags: Vec<u8>,
     map: HashMap<Kind, Ty>,
+    substs: SubstsPool,
+    projs: ProjPool,
 }
 
 impl Types {
+    /// Clones the handle to the `[Ty]` slice interner.
+    pub fn pool(&self) -> SubstsPool {
+        self.substs.clone()
+    }
+
+    /// Clones the handles to both the slice and projection interners.
+    pub fn pools(&self) -> Pools {
+        Pools { substs: self.substs.clone(), projs: self.projs.clone() }
+    }
+
+    /// Interns `slice` into a `Substs` handle.
+    pub fn intern_substs(&self, slice: &[Ty]) -> Substs {
+        self.substs.intern(slice)
+    }
+
+    /// The slice of type arguments that `id` names.
+    pub fn substs(&self, id: Substs) -> &[Ty] {
+        self.substs.get(id)
+    }
+
+    /// Interns `def` into a `ProjId` handle.
+    pub fn intern_proj(&self, def: ProjDef) -> ProjId {
+        self.projs.intern(def)
+    }
+
+    /// The projection definition that `id` names.
+    pub fn proj(&self, id: ProjId) -> ProjDef {
+        self.projs.get(id)
+    }
+
+    fn flags_of(&self, ty: Ty) -> u8 {
+        if ty == Ty::NONE { 0 } else { self.flags.get(ty.0 as usize).copied().unwrap_or(0) }
+    }
+
+    fn substs_flags(&self, substs: Substs) -> u8 {
+        self.substs(substs).iter().fold(0, |acc, &ty| acc | self.flags_of(ty))
+    }
+
+    /// Whether `ty` contains any rigid `Param` or `Proj` at any depth.
+    pub fn has_params(&self, ty: Ty) -> bool {
+        (self.flags_of(ty) & FLAG_PARAM) != 0
+    }
+
+    /// Whether `ty` syntactically contains any inference variable slot at any depth.
+    pub fn has_var_flag(&self, ty: Ty) -> bool {
+        (self.flags_of(ty) & FLAG_VAR) != 0
+    }
+
+    /// Whether `ty` contains any rigid `Proj` at any depth.
+    pub fn has_projs(&self, ty: Ty) -> bool {
+        (self.flags_of(ty) & FLAG_PROJ) != 0
+    }
+
+    /// Whether any type in `substs` contains a rigid `Param` or `Proj`.
+    pub fn substs_have_params(&self, substs: Substs) -> bool {
+        (self.substs_flags(substs) & FLAG_PARAM) != 0
+    }
+
+    fn kind_flags(&self, kind: &Kind) -> u8 {
+        match kind {
+            Kind::Param(_) => FLAG_PARAM,
+            Kind::Proj(id) => {
+                let proj = self.proj(*id);
+                let sub = self.flags_of(proj.self_ty) | self.substs_flags(proj.args) | self.substs_flags(proj.own);
+                FLAG_PARAM | FLAG_PROJ | (sub & FLAG_VAR)
+            }
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => FLAG_VAR,
+            Kind::Closure(_, args, _) => self.substs_flags(*args),
+            other => other.children(self).fold(0, |acc, child| acc | self.flags_of(child)),
+        }
+    }
+
     /// The type of shape `kind`.
     pub fn intern(&mut self, kind: Kind) -> Ty {
         if let Some(&ty) = self.map.get(&kind) {
             return ty;
         }
+        let flag = self.kind_flags(&kind);
         let ty = Ty(self.kinds.len() as u32);
         self.kinds.push(kind.clone());
+        self.flags.push(flag);
         self.map.insert(kind, ty);
         ty
     }
@@ -120,7 +225,25 @@ impl Types {
 
     /// The unit type.
     pub fn unit(&mut self) -> Ty {
-        self.intern(Kind::Tuple(Vec::new()))
+        self.intern(Kind::Tuple(Substs::EMPTY))
+    }
+
+    /// The tuple type of `items`.
+    pub fn tuple(&mut self, items: &[Ty]) -> Ty {
+        let substs = self.intern_substs(items);
+        self.intern(Kind::Tuple(substs))
+    }
+
+    /// The ADT type `item` at `args`.
+    pub fn adt(&mut self, item: ItemRef, args: &[Ty]) -> Ty {
+        let substs = self.intern_substs(args);
+        self.intern(Kind::Adt(item, substs))
+    }
+
+    /// The function pointer type `(params) -> ret`.
+    pub fn fn_ptr(&mut self, params: &[Ty], ret: Ty) -> Ty {
+        let substs = self.intern_substs(params);
+        self.intern(Kind::FnPtr(substs, ret))
     }
 
     /// The type `bool`.

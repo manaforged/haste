@@ -42,7 +42,7 @@ impl Lower<'_, '_> {
 
     /// Writes variant `variant` of `ty`, an ADT `item` at `args`, with `fields` given by index, over a copy of `base`; returns the value.
     pub fn construct(&mut self, ty: Ty, variant: u32, fields: Vec<(u32, Option<Value>)>, base: Option<Value>) -> Result<Option<Value>> {
-        let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
+        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
         let whole = repr(self.cx, ty)?;
         let Some(slot) = self.slot(whole) else { return Ok(None) };
         let place = Place::slot(slot, whole);
@@ -50,7 +50,8 @@ impl Lower<'_, '_> {
             self.write(place, base);
         }
         let layout = self.cx.layout(ty)?;
-        let all = field_types(self.cx, item, &args)?;
+        let slice = self.cx.types.substs(args).to_vec();
+        let all = field_types(self.cx, item, &slice)?;
         let types = &all[variant as usize];
         for (index, value) in fields {
             let Some(&field_ty) = types.get(index as usize) else { bail!("variant {variant} of {} has no field {index}", self.cx.name(item)) };
@@ -146,9 +147,10 @@ impl Lower<'_, '_> {
 
     /// The place of field `index` of variant `variant` inside the ADT `ty` at `place`.
     pub fn variant_field(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
-        let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("field of a type that is not an ADT") };
+        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { bail!("field of a type that is not an ADT") };
         let layout = self.cx.layout(ty)?;
-        let fields = field_types(self.cx, item, &args)?;
+        let slice = self.cx.types.substs(args).to_vec();
+        let fields = field_types(self.cx, item, &slice)?;
         let Some(&field) = fields.get(variant as usize).and_then(|fields| fields.get(index as usize)) else { bail!("{} has no field {index} in variant {variant}", self.cx.name(item)) };
         if layout.is_unsized() {
             return self.unsized_field(place, field_offset(&layout, variant, index), field);

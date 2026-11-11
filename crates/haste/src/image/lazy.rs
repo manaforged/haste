@@ -245,18 +245,20 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
 }
 
 impl Jit {
-    /// A demand with no function declared that infers on from `store`, its stub and code memory mapped so that every child forked later shares them.
     pub fn new(store: Cache) -> Result<Jit> {
         let reached = Reached::default();
         let mut image = Image::new(&reached)?;
+        image.jit_mode = true;
         image.stubs.reserve(TABLE_SLOTS * stub::STUB_BYTES)?;
         image.memory.reserve(CODE_BYTES)?;
         Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
     }
 
-    /// Drops the inference and code of the declared functions that `edited` touches and points their slots and vtable entries back at their stubs, so that the next call compiles them again.
     fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
         let touched = self.store.invalidate(outline, self.reached.list.iter().map(|(instance, _)| instance), edited);
+        if !touched.is_empty() {
+            self.image.reset_caches();
+        }
         for at in touched {
             self.reached.forget(at);
             self.compiled.remove(&at);
@@ -435,13 +437,18 @@ impl Jit {
         true
     }
 
-    /// The code of function `index`, or why it has none; what inference did is taken back when it asked for more.
     fn answer(&mut self, cx: &mut Context<'_>, index: usize) -> Result<usize, Stop> {
+        if index & (stub::TIER_UP_BIT as usize) != 0 {
+            let real = index & !(stub::TIER_UP_BIT as usize);
+            let item = self.reached.list[real].0.0;
+            return self.image.tier_up(real).map_err(|err| Stop::Failed(format!("{}: {err:#}", cx.name(item)), item));
+        }
         let mut journal = Journal::new();
         let answer = self.code(cx, index, &mut journal);
         if matches!(answer, Err(Stop::Asked)) {
             journal.iter().for_each(|&at| self.reached.forget(at));
             self.expanded.clear();
+            self.image.bodies.clear();
         }
         answer
     }

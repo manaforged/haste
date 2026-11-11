@@ -34,7 +34,8 @@ impl Infer<'_, '_> {
         let found = self.expr(inner, None)?;
         let found = self.resolve(found);
         let (branch, flow) = self.lang_call("branch", found)?;
-        let Kind::Adt(item, args) = self.cx.types.kind(self.resolve(flow)).clone() else { bail!("`branch` does not return a `ControlFlow`") };
+        let Kind::Adt(item, args) = *self.cx.types.kind(self.resolve(flow)) else { bail!("`branch` does not return a `ControlFlow`") };
+        let args = self.cx.types.substs(args).to_vec();
         let (Some(stop), Some(proceed)) = (self.variant_named(item, "Break")?, self.variant_named(item, "Continue")?) else { bail!("`ControlFlow` has no `Break` or `Continue`") };
         let Some(method) = self.cx.lang_item("from_residual") else { bail!("no `from_residual` lang item") };
         let target = self.try_blocks.last().copied();
@@ -44,7 +45,7 @@ impl Infer<'_, '_> {
         {
             self.obligations.push((of, vec![ret, args[0]]));
         }
-        let from_residual = Res::Fn(method, vec![ret, args[0]]);
+        let from_residual = Res::fn_of(&self.cx.types, method, &[ret, args[0]]);
         self.out.tries.insert(expr, Tried { branch, from_residual, flow, proceed, stop, target: target.map(|(block, _)| block) });
         Ok(args[1])
     }
@@ -59,7 +60,7 @@ impl Infer<'_, '_> {
         let (Some(of), Some(method)) = (self.cx.lang_item("Try"), self.cx.lang_item("from_output")) else { bail!("core has no `Try::from_output`") };
         let output = self.project(of, ty, Vec::new(), "Output")?;
         self.coerce(found, output)?;
-        self.out.try_blocks.insert(expr, Res::Fn(method, vec![ty]));
+        self.out.try_blocks.insert(expr, Res::fn_of(&self.cx.types, method, &[ty]));
         Ok(ty)
     }
 
@@ -69,11 +70,12 @@ impl Infer<'_, '_> {
         let (into_iter, iter_ty) = self.lang_call("into_iter", found)?;
         let by_mut = self.cx.types.intern(Kind::Ref(Mut::Mut, iter_ty));
         let (next, option) = self.lang_call("next", by_mut)?;
-        let Kind::Adt(item, args) = self.cx.types.kind(self.resolve(option)).clone() else { bail!("`next` does not return an `Option`") };
+        let Kind::Adt(item, args) = *self.cx.types.kind(self.resolve(option)) else { bail!("`next` does not return an `Option`") };
+        let elem = self.cx.types.substs(args)[0];
         let Some(some) = self.variant_named(item, "Some")? else { bail!("`Option` has no `Some`") };
         self.out.fors.insert(expr, For { into_iter, next, iter: iter_ty, option, some });
         let depth = self.scopes.len();
-        self.bind_pat(pat, args[0])?;
+        self.bind_pat(pat, elem)?;
         self.unit_loop_body(body, label, depth)
     }
 
@@ -81,7 +83,7 @@ impl Infer<'_, '_> {
         let Some(method) = self.cx.lang_item(lang) else { bail!("no `{lang}` lang item") };
         let Some((item, substs)) = self.lang_method(method, receiver)? else { bail!("{} does not implement `{}`", self.show(receiver), self.cx.name(method)) };
         let (_, ret) = self.fn_types(item, &substs)?;
-        Ok((Res::Fn(item, substs), ret))
+        Ok((Res::fn_of(&self.cx.types, item, &substs), ret))
     }
 
     /// Infers the range expression `expr` as a struct of the lang item it names.
@@ -108,9 +110,10 @@ impl Infer<'_, '_> {
         if lang == "RangeInclusive" {
             filled.push(self.range_field(item, "exhausted")?);
         }
-        self.out.ranges.insert(expr, filled);
-        self.out.res.insert(expr, Res::Ctor(item, 0, args.clone()));
-        Ok(self.cx.types.intern(Kind::Adt(item, args)))
+        let substs = self.cx.types.intern_substs(&args);
+        self.out.ranges.insert(expr, filled.into_boxed_slice());
+        self.out.res.insert(expr, Res::Ctor(item, 0, substs));
+        Ok(self.cx.types.intern(Kind::Adt(item, substs)))
     }
 
     fn range_field(&mut self, item: ItemRef, name: &str) -> Result<u32> {

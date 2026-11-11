@@ -92,7 +92,7 @@ pub(super) fn generic_bounds(arena: &Body, src: &Source, predicates: &[Predicate
     declared.chain(predicate_bounds(arena, src, predicates, src.text(generic.name))).collect()
 }
 
-fn predicate_bounds<'b>(arena: &'b Body, src: &'b Source, predicates: &'b [Predicate], name: &'b str) -> impl Iterator<Item = u32> + 'b {
+pub(super) fn predicate_bounds<'b>(arena: &'b Body, src: &'b Source, predicates: &'b [Predicate], name: &'b str) -> impl Iterator<Item = u32> + 'b {
     let named = predicates.iter().filter(move |predicate| predicate.ty.is_some_and(|ty| names_param(arena, src, ty, name)));
     named.flat_map(|predicate| arena.list(predicate.bounds).iter().copied())
 }
@@ -204,9 +204,9 @@ impl<'a> Infer<'_, 'a> {
         let mut infer = Infer::start(self.cx, (&body, &sig, src), home);
         infer.frames = frames;
         let before = infer.cx.asks.mark();
-        let params: Vec<Ty> = (0..count).map(|_| infer.fresh(Kind::Var)).collect();
+        let params: Vec<Ty> = (0..count).map(|index| infer.cx.types.intern(Kind::Param(index as u16))).collect();
         let found = lower(&mut infer, &params).ok()?;
-        let clean = infer.cx.asks.mark() == before && infer.backlog() == 0 && infer.hidden.is_empty() && infer.vars.len() == count && infer.vars.iter().all(Option::is_none);
+        let clean = infer.cx.asks.mark() == before && infer.backlog() == 0 && infer.hidden.is_empty() && infer.vars.is_empty();
         clean.then_some(found)
     }
 
@@ -219,15 +219,17 @@ impl<'a> Infer<'_, 'a> {
         quiet && root.is_none() && self.instance.as_ref().is_none_or(|(at, _)| self.cx.attr_at(*at, "define_opaque").is_none())
     }
 
-    /// `ty` of a generic form with each placeholder variable `index` replaced by `args[index]`.
+    /// `ty` of a generic form with each rigid parameter `index` replaced by `args[index]`.
     pub(super) fn instantiate(&mut self, ty: Ty, args: &[Ty]) -> Ty {
-        match self.cx.types.kind(ty) {
-            Kind::Var(index) => return args.get(*index as usize).copied().unwrap_or(ty),
-            kind if kind.children().next().is_none() => return ty,
-            _ => {}
+        if !self.cx.types.has_params(ty) {
+            return ty;
         }
-        let kind = self.cx.types.kind(ty).clone().map(|inner| self.instantiate(inner, args));
-        self.cx.types.intern(kind)
+        if let Kind::Param(index) = *self.cx.types.kind(ty) {
+            return args.get(index as usize).copied().unwrap_or(ty);
+        }
+        let kind = self.cx.types.kind(ty).clone();
+        let mapped = self.map_kind(&kind, |this, inner| this.instantiate(inner, args));
+        self.cx.types.intern(mapped)
     }
 
     /// The headers whose generic parameters and where clauses the frame's type parameters come from: the item's own, its impl's, and its trait's.

@@ -6,7 +6,6 @@ use rustc_abi::{AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, Lay
 use rustc_index::{Idx, IndexVec};
 
 use crate::names::Primitive;
-use crate::outline::item::ItemKind;
 
 use super::Context;
 use super::ty::{Kind, Ty};
@@ -110,18 +109,21 @@ impl Context<'_> {
             return Ok(layout);
         }
         let calc = LayoutCalculator::new(dl);
-        let fields = match self.types.kind(ty).clone() {
-            Kind::Tuple(items) => items,
+        let fields = match *self.types.kind(ty) {
+            Kind::Tuple(items) => self.types.substs(items).to_vec(),
             Kind::FnDef(..) => Vec::new(),
-            Kind::Adt(item, args) => return self.adt_layout(item, &args),
+            Kind::Adt(item, args) => {
+                let args = self.types.substs(args).to_vec();
+                return self.adt_layout(item, &args);
+            }
             Kind::Closure(..) => return self.closure_layout(ty),
             Kind::Array(element, count) => {
                 let Some(count) = self.types.len(count) else { bail!("layout of an array whose length is not known") };
                 let element = self.layout(element)?;
                 return calc.array_like::<Field, Variant, ()>(&element, Some(count)).map_err(|error| anyhow!("layout of an array: {error:?}"));
             }
-            kind if kind.is_unsized() => return self.unsized_layout(&calc, kind),
-            other => bail!("no layout for {other:?} yet"),
+            ref kind if kind.is_unsized() => return self.unsized_layout(&calc, kind.clone()),
+            ref other => bail!("no layout for {other:?} yet"),
         };
         let layouts = fields.iter().map(|field| self.layout(*field)).collect::<Result<Vec<_>>>()?;
         let refs: Vec<&Layout> = layouts.iter().map(|layout| &**layout).collect();
@@ -145,17 +147,16 @@ impl Context<'_> {
 
     /// The type at the end of `ty` whose metadata a pointer to `ty` carries: `ty` itself, or the tail of its last struct field.
     pub fn tail(&mut self, ty: Ty) -> Result<Ty> {
-        let Kind::Adt(item, args) = self.types.kind(ty).clone() else { return Ok(ty) };
-        if let Some(found) = self.store.tails.get(&ty) {
-            return Ok(*found);
+        let Kind::Adt(item, _) = *self.types.kind(ty) else { return Ok(ty) };
+        if self.types.has_var_flag(ty) {
+            bail!("cannot compute tail of open inference variable outside Infer");
         }
-        let last = if self.item(item).1.kind == ItemKind::Struct { super::infer::tail_field(self, item, &args)? } else { None };
-        let found = match last {
-            Some(last) => self.tail(last)?,
-            None => ty,
-        };
-        self.store.tails.insert(ty, found);
-        Ok(found)
+        if !self.types.has_params(ty)
+            && let Some(&found) = self.store.tails.get(&ty)
+        {
+            return Ok(found);
+        }
+        super::infer::detached(self, item, |infer| infer.tail_ty(ty))
     }
 
     /// Whether a pointer to `ty` carries metadata after its address.

@@ -30,11 +30,14 @@ impl Lower<'_, '_> {
                 let count = self.ins().iconst(Type::I64, count);
                 return self.equal_items(element, (x, y), count);
             }
-            Kind::Tuple(items) => items,
-            Kind::Adt(item, args) => match &field_types(self.cx, item, &args)?[..] {
-                [fields] => fields.clone(),
-                _ => bail!("a pattern constant of an enum is not compared yet"),
-            },
+            Kind::Tuple(items) => self.cx.types.substs(items).to_vec(),
+            Kind::Adt(item, args) => {
+                let slice = self.cx.types.substs(args).to_vec();
+                match &field_types(self.cx, item, &slice)?[..] {
+                    [fields] => fields.clone(),
+                    _ => bail!("a pattern constant of an enum is not compared yet"),
+                }
+            }
             other => bail!("a pattern value of {other:?} is not compared yet"),
         };
         let whole = repr(self.cx, ty)?;

@@ -44,10 +44,10 @@ impl Lower<'_, '_> {
     /// The place that `base[index]` names after the autoderef steps of `base`: an element of an array or slice after a bounds check, or the target of `Index::index`.
     pub fn index_place(&mut self, expr: ExprId, base: ExprId, index: ExprId) -> Result<Option<Place>> {
         let Some((place, ty)) = self.autoderef_place(expr, base)? else { return self.empty_index(expr, base, index) };
-        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
+        if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
             let receiver = self.address(place);
             let values = self.expr(index)?.into_iter();
-            let Some(pointer) = self.invoke(item, &substs, std::iter::once(receiver).chain(values).collect())? else { return Ok(None) };
+            let Some(pointer) = self.invoke(item, substs, std::iter::once(receiver).chain(values).collect())? else { return Ok(None) };
             return self.pointee_place(pointer, self.ty_of(expr)).map(Some);
         }
         let Some((data, len)) = self.data_len(Some(place), ty)? else { return Ok(None) };

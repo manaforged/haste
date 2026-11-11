@@ -3,7 +3,7 @@
 use crate::frame::Loc;
 use crate::live::{Live, live, results};
 use crate::fold::{constant, holds};
-use crate::ir::{Binary, Block, Convert, FloatCC, Function, Op, StackSlot, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Op, StackSlot, Type, Value};
 
 /// The registers of one encoder that planning hands out.
 pub(crate) struct Regs<R: 'static> {
@@ -13,6 +13,8 @@ pub(crate) struct Regs<R: 'static> {
     pub leaf: &'static [R],
     /// Leaf registers that 128-bit operations use as scratch, so a function with one keeps no value in them.
     pub wide_scratch: &'static [R],
+    /// Leaf register that carries the dictionary parameter on entry, when it is in `leaf`.
+    pub dict: Option<R>,
     /// Caller-saved float registers, by number, the emitter never uses as scratch, which float values that span no call live in.
     pub float: &'static [u8],
     /// The float compares whose result the next branch reads from the flags under one condition.
@@ -28,9 +30,16 @@ const FOLD_LIMIT: i64 = 1 << 24;
 pub(crate) enum Location<R> {
     Slot,
     Imm(i64),
+    SlotAddr(u32),
     Reg(R),
     Float(u8),
     Frame(StackSlot, i32),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CallTarget {
+    Abs(i32),
+    Slot(u32),
 }
 
 /// What the emitter may do with each value, decided before emission.
@@ -40,7 +49,7 @@ pub(crate) struct Plan<R> {
     pub used: Vec<R>,
     pub pairs: Vec<Option<Value>>,
     pub deferred: Vec<bool>,
-    pub through: Vec<Option<i32>>,
+    pub through: Vec<Option<CallTarget>>,
 }
 
 /// Whether planning may give a value of type `ty` a register of `regs`.
@@ -79,12 +88,13 @@ fn census(func: &Function) -> Uses {
     census
 }
 
-fn consts<R>(func: &Function, locations: &mut [Location<R>]) {
+fn consts<R>(func: &Function, absolute_calls: bool, locations: &mut [Location<R>]) {
     for data in &func.insts {
-        if let (Some(result), Op::Const(imm)) = (data.result, &data.op)
-            && func.ty(result).is_small_int()
-        {
-            locations[result.index()] = Location::Imm(*imm);
+        let Some(result) = data.result else { continue };
+        match data.op {
+            Op::Const(imm) if func.ty(result).is_small_int() => locations[result.index()] = Location::Imm(imm),
+            Op::SlotAddr(sym) if absolute_calls => locations[result.index()] = Location::SlotAddr(sym),
+            _ => {}
         }
     }
 }
@@ -174,14 +184,16 @@ fn pairs<R>(func: &Function, locations: &[Location<R>]) -> (Vec<Option<Value>>, 
 }
 
 /// For each callee that only one call reads, loaded from a constant address below 2 GiB, that address, so the call reads it in place.
-fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> Vec<Option<i32>> {
+fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> Vec<Option<CallTarget>> {
     let mut through = vec![None; func.types.len()];
     let mut loads = vec![None; func.types.len()];
     for data in &func.insts {
-        if let (Op::Load(addr, 0), Some(result)) = (&data.op, data.result)
-            && let Location::Imm(at) = locations[addr.index()]
-        {
-            loads[result.index()] = i32::try_from(at).ok().filter(|at| *at > 0);
+        if let (Op::Load(addr, 0), Some(result)) = (&data.op, data.result) {
+            loads[result.index()] = match locations[addr.index()] {
+                Location::Imm(at) => i32::try_from(at).ok().filter(|at| *at > 0).map(CallTarget::Abs),
+                Location::SlotAddr(sym) => Some(CallTarget::Slot(sym)),
+                _ => None,
+            };
         }
     }
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
@@ -210,7 +222,8 @@ struct Class<'a, F> {
 /// The integer class; a function with a 128-bit value keeps none in the registers 128-bit operations use as scratch.
 fn int_class<'a, R: Copy + PartialEq>(func: &Function, regs: &'a Regs<R>, order: &[Block], params: &[Loc<R>]) -> Class<'a, R> {
     let wide = order.iter().flat_map(|block| &func.blocks[block.index()].insts).any(|inst| func.insts[inst.index()].result.is_some_and(|result| func.ty(result) == Type::I128));
-    let leaf = regs.leaf.iter().filter(|reg| !(wide && regs.wide_scratch.contains(*reg))).copied().collect();
+    let dict = func.signature.params.iter().any(|param| param.purpose == ArgumentPurpose::Dict);
+    let leaf = regs.leaf.iter().filter(|reg| !(wide && regs.wide_scratch.contains(*reg)) && !(dict && regs.dict == Some(**reg))).copied().collect();
     let arrivals = params
         .iter()
         .map(|loc| match *loc {
@@ -333,7 +346,7 @@ fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl 
 pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, order: &[Block], params: &[Loc<R>]) -> Plan<R> {
     let count = func.types.len();
     let mut locations = vec![Location::Slot; count];
-    consts(func, &mut locations);
+    consts(func, regs.absolute_calls, &mut locations);
     statics(func, &mut locations);
     let census = census(func);
     let wanted: Vec<bool> = (0..count).map(|value| matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
@@ -359,7 +372,7 @@ impl<R: Copy> Plan<R> {
 
     /// Whether `value` needs no code where it is defined, because its location is a constant or a frame address.
     pub(crate) fn is_static(&self, value: Value) -> bool {
-        matches!(self.location(value), Location::Imm(_) | Location::Frame(..))
+        matches!(self.location(value), Location::Imm(_) | Location::SlotAddr(_) | Location::Frame(..))
     }
 
     /// The constant `value` holds, when its location is one.

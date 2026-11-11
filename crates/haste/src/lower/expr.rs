@@ -1,7 +1,7 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Block, Function, Signature, Type, Value};
+use haste_codegen::{Block, Signature, Type, Value};
 
 use crate::body::{Expr, ExprId, List, UnOp};
 use crate::names::ItemRef;
@@ -9,9 +9,11 @@ use crate::outline::item::ItemKind;
 use crate::sema::Context;
 use crate::sema::infer::{Coercion, Res, Shape};
 use crate::sema::reach::Reached;
+use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::Place;
+use super::stencil::{InlinedCallee, LowerMode, SymbolSource, item_bits, resolve_inline};
 use super::{Loop, Lower, Parts, Repr, repr};
 
 /// The most instructions a sysroot body may have, after slot promotion, for a call to copy it inline.
@@ -34,7 +36,13 @@ pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool
     inline_limit(cx, reached, index).is_some()
 }
 
-/// The most instructions a call may copy inline of reached function `index`: `ALWAYS_LIMIT` for an `#[inline(always)]` sysroot function, `INLINE_LIMIT` for one whose source body has at most `INLINE_EXPRS` expressions, or none.
+/// Whether reached function `index` lowers to a body small and copyable enough to inline.
+pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn super::Slots, index: usize) -> bool {
+    let Some(limit) = inline_limit(cx, reached, index) else { return false };
+    resolve_inline(cx, reached, slots, index, limit).is_ok_and(|(callee, _)| callee.is_some())
+}
+
+/// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
 fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
     let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
     if !cx.outline.crates[item.krate as usize].env.release {
@@ -67,12 +75,12 @@ impl Lower<'_, '_> {
             (Some(Coercion::Vtable(vtable)), Some(value)) => {
                 let data = self.sized_pointer(value, self.ty_of(expr));
                 let table = self.vtable(vtable)?;
-                Ok(Some(self.wide_pointer(data, table)))
+                Ok(Some(self.wide(data, table)))
             }
             (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(value, steps.clone()),
             (Some(&Coercion::Upcast(slot)), Some(value)) => Ok(Some(self.upcast(value, slot))),
-            (Some(Coercion::Reify(Res::Fn(item, substs))), _) => {
-                let index = self.reached_index(*item, substs)?;
+            (Some(&Coercion::Reify(Res::Fn(item, substs))), _) => {
+                let index = self.reached_index(item, substs)?;
                 Ok(Some(self.code_of(index)))
             }
             _ => Ok(value),
@@ -122,7 +130,7 @@ impl Lower<'_, '_> {
         };
         let owner = self.place_of(operand)?;
         let target = self.address_or_dangling(owner, boxed)?;
-        self.invoke(free, &substs, vec![target])?;
+        self.invoke(free, substs, vec![target])?;
         self.moved_out(root, &path)?;
         Ok(value)
     }
@@ -191,24 +199,18 @@ impl Lower<'_, '_> {
                 }
                 Ok(value)
             }
-            Some(Res::Fn(item, substs)) => {
-                let (item, substs) = (*item, substs.clone());
-                self.item_path(expr, item, &substs)
-            }
+            Some(&Res::Fn(item, substs)) => self.item_path(expr, item, substs),
             Some(&Res::Const(value)) => {
                 let (Kind::Value(bits), Repr::Scalar(machine)) = (self.cx.types.kind(value).clone(), self.repr_of(expr)?) else { bail!("a const parameter whose value is not known") };
                 Ok(Some(self.int_const(machine, bits)))
             }
             Some(Res::Ctor(..)) if self.typed.coercions.contains_key(&expr) => Ok(None),
-            Some(Res::Ctor(_, variant, _)) => {
-                let variant = *variant;
-                self.construct(self.ty_of(expr), variant, Vec::new(), None)
-            }
+            Some(&Res::Ctor(_, variant, _)) => self.construct(self.ty_of(expr), variant, Vec::new(), None),
             None => bail!("path has no resolution"),
         }
     }
 
-    fn item_path(&mut self, expr: ExprId, item: ItemRef, substs: &[Ty]) -> Result<Option<Value>> {
+    fn item_path(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         match self.cx.item(item).1.kind {
             ItemKind::Static => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
             ItemKind::Const => self.invoke(item, substs, Vec::new()),
@@ -234,32 +236,32 @@ impl Lower<'_, '_> {
     }
 
     fn call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
-        if let Some(Res::Fn(item, substs)) = self.typed.res.get(&expr).cloned() {
+        if let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) {
             return self.call_value((expr, callee), (item, substs), args);
         }
         let named = self.typed.res.get(&callee).filter(|_| self.body.names_callee(callee));
-        let (item, substs) = match named.cloned() {
+        let (item, substs) = match named.copied() {
             Some(Res::Fn(item, _)) if matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static) => return self.pointer_call(expr, callee, args),
             Some(Res::Fn(item, substs)) => (item, substs),
             Some(Res::Ctor(_, variant, _)) => return self.ctor_call(expr, variant, args),
             _ => return self.pointer_call(expr, callee, args),
         };
-        if self.tupled_closure_call(item, &substs) {
+        if self.tupled_closure_call(item, substs) {
             bail!("a `call_once` of a closure with a tupled argument is not lowered yet");
         }
         let values = self.args(args, Vec::new())?;
-        self.invoke(item, &substs, values)
+        self.invoke(item, substs, values)
     }
 
     fn method(&mut self, expr: ExprId, receiver: ExprId, params: List) -> Result<Option<Value>> {
-        let Some(Res::Fn(item, substs)) = self.typed.res.get(&expr).cloned() else { bail!("method call has no resolution") };
+        let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) else { bail!("method call has no resolution") };
         let Some(&adjust) = self.typed.adjusts.get(&expr) else { bail!("method call has no receiver adjustment") };
-        if self.tupled_closure_call(item, &substs) {
+        if self.tupled_closure_call(item, substs) {
             bail!("a closure method call with a tupled argument is not lowered yet");
         }
         let first = self.receiver((expr, receiver), adjust)?;
         let values = self.args(params, first.into_iter().collect())?;
-        self.invoke(item, &substs, values)
+        self.invoke(item, substs, values)
     }
 
     pub(super) fn args(&mut self, args: List, mut values: Vec<Value>) -> Result<Vec<Value>> {
@@ -271,12 +273,13 @@ impl Lower<'_, '_> {
         Ok(values)
     }
 
-    pub(super) fn invoke(&mut self, item: ItemRef, substs: &[Ty], values: Vec<Value>) -> Result<Option<Value>> {
+    pub(super) fn invoke(&mut self, item: ItemRef, substs: Substs, values: Vec<Value>) -> Result<Option<Value>> {
         if !self.open {
             return Ok(None);
         }
         if let Some(which) = self.cx.intrinsic(item) {
-            return self.intrinsic(which, substs, &values);
+            let slice = self.cx.types.substs(substs).to_vec();
+            return self.intrinsic(which, &slice, &values);
         }
         let index = self.reached_index(item, substs)?;
         let Ok(callee) = &self.reached.list[index].1 else { bail!("{} did not type-check", self.cx.name(item)) };
@@ -288,34 +291,44 @@ impl Lower<'_, '_> {
         self.call_with(Callee::Reached(index), (params, callee.ret), values)
     }
 
-    /// The lowered body of reached sysroot function `index` when a call may copy it inline: small, copyable, and not being lowered already.
-    fn inline_body(&mut self, index: usize) -> Option<Rc<Function>> {
-        if !self.slots.bodies().first_try(index) {
-            return self.slots.bodies().body(index);
+    fn inline_callee(&mut self, index: usize) -> Result<Option<Arc<InlinedCallee>>> {
+        let Some(limit) = inline_limit(self.cx, self.reached, index) else {
+            return Ok(None);
+        };
+        let (callee, cycle) = resolve_inline(self.cx, self.reached, self.slots, index, limit)?;
+        self.cycle_root = self.cycle_root.min(cycle);
+        Ok(callee)
+    }
+
+    fn emit_inlined(&mut self, inlined: &InlinedCallee, values: &[Value]) -> Vec<Value> {
+        if !self.open {
+            let dead = *self.dead.get_or_insert_with(|| self.b.create_block());
+            self.b.switch_to_block(dead);
         }
-        let limit = inline_limit(self.cx, self.reached, index)?;
-        let mut body = super::lower(self.cx, self.reached, self.slots, index).ok().filter(Function::can_inline)?;
-        haste_codegen::simplify(&mut body);
-        if body.size() > limit {
-            return None;
+        let sym_base = self.relocs.len() as u32;
+        self.relocs.extend(inlined.relocs.iter().cloned());
+        match self.mode {
+            LowerMode::Probe => self.b.inline_probe(&inlined.body, values, item_bits(inlined.item), inlined.footprint.0, inlined.returns),
+            LowerMode::Stencil => self.b.inline_shifted(&inlined.body, values, sym_base),
+            LowerMode::Dict => {
+                let dict = self.dict_param.expect("dictionary parameter is set");
+                self.b.inline_dict(&inlined.body, values, dict, sym_base)
+            }
         }
-        let body = Rc::new(body);
-        self.slots.bodies().keep(index, body.clone());
-        Some(body)
     }
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
-    fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Vec<Value> {
+    fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
         let code = match callee {
             Callee::Code(code) => code,
-            Callee::Reached(index) => match self.inline_body(index) {
-                Some(body) => return self.b.inline(&body, values),
+            Callee::Reached(index) => match self.inline_callee(index)? {
+                Some(inlined) => return Ok(self.emit_inlined(&inlined, values)),
                 None => self.code_of(index),
             },
         };
         let sig = self.b.import_signature(signature);
         let call = self.ins().call_indirect(sig, code, values);
-        self.b.inst_results(call).to_vec()
+        Ok(self.b.inst_results(call).to_vec())
     }
 
     fn pointer_call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
@@ -326,12 +339,13 @@ impl Lower<'_, '_> {
             },
             false => (self.expr(callee)?, self.ty_of(callee)),
         };
-        if let Kind::FnDef(item, substs) = self.cx.types.kind(ty).clone() {
+        if let Kind::FnDef(item, substs) = *self.cx.types.kind(ty) {
             let values = self.args(args, Vec::new())?;
-            return self.invoke(item, &substs, values);
+            return self.invoke(item, substs, values);
         }
-        let Kind::FnPtr(params, ret) = self.cx.types.kind(ty).clone() else { bail!("cannot lower calls through values yet") };
+        let Kind::FnPtr(params, ret) = *self.cx.types.kind(ty) else { bail!("cannot lower calls through values yet") };
         let Some(code) = code else { return Ok(None) };
+        let params = self.cx.types.substs(params).to_vec();
         let values = self.args(args, Vec::new())?;
         if !self.open {
             return Ok(None);
@@ -340,9 +354,11 @@ impl Lower<'_, '_> {
     }
 
     /// The index of the reached instance of `item` at `substs`.
-    pub(super) fn reached_index(&self, item: ItemRef, substs: &[Ty]) -> Result<usize> {
-        let instance = (item, substs.to_vec());
-        if let Some(&index) = self.reached.index.get(&instance) {
+    pub(super) fn reached_index(&self, item: ItemRef, substs: Substs) -> Result<usize> {
+        let instance = (item, substs);
+        if let Some(&index) = self.reached.index.get(&instance)
+            && !self.reached.is_untyped(index)
+        {
             return Ok(index);
         }
         self.slots.want(instance);
@@ -351,8 +367,7 @@ impl Lower<'_, '_> {
 
     /// The code address of reached function `index`, read from its call table entry.
     pub(super) fn code_of(&mut self, index: usize) -> Value {
-        let entry = self.slots.entry(index);
-        let table = self.ins().iconst(Type::I64, entry);
+        let table = self.emit_slot(SymbolSource::Slot(index));
         self.ins().load(Type::I64, table, 0)
     }
 
@@ -370,7 +385,7 @@ impl Lower<'_, '_> {
             let address = self.ins().stack_addr(Type::I64, out, 0);
             values.insert(0, address);
         }
-        let results = self.emit_call(callee, signature, &values);
+        let results = self.emit_call(callee, signature, &values)?;
         let Some(ret) = ret else { return Ok(None) };
         if matches!(self.cx.types.kind(ret), Kind::Never) {
             self.ins().trap();
