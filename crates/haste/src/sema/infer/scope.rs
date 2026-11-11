@@ -295,15 +295,8 @@ impl<'a> Infer<'_, 'a> {
     /// The parameter and return types of the function `item` at `substs`, its receiver first.
     pub fn fn_types(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(Vec<Ty>, Ty)> {
         let sig = self.cx.signature(item)?;
-        if !sig.opaque
-            && let Some(form) = self.generic((Form::Fn(item), substs.len()), |infer, args| {
-                let frame = infer.frame(item, args)?;
-                let (params, ret) = infer.with_frame(frame, |infer| infer.sig_types(&sig))?;
-                Ok(Rc::from(vec![params, vec![ret]]))
-            })
-        {
-            let params = form[0].iter().map(|&ty| self.instantiate(ty, substs)).collect();
-            return Ok((params, self.instantiate(form[1][0], substs)));
+        if !sig.opaque && let Some(types) = self.fn_form(item, &sig, substs) {
+            return Ok(types);
         }
         let frame = self.frame(item, substs)?;
         let foreign = sig.opaque && self.instance.as_ref().is_none_or(|(own, _)| *own != item);
@@ -319,6 +312,17 @@ impl<'a> Infer<'_, 'a> {
             self.opaque_ret(super::opaque::Opaque { item, substs: substs.to_vec(), ret: types.1, sig, bounds, output })?;
         }
         Ok(types)
+    }
+
+    /// The types of the function `item` at `substs` from its form lowered once, when the signature `sig` lowers the same way for every caller.
+    fn fn_form(&mut self, item: ItemRef, sig: &Signature, substs: &[Ty]) -> Option<(Vec<Ty>, Ty)> {
+        let form = self.generic((Form::Fn(item), substs.len()), |infer, args| {
+            let frame = infer.frame(item, args)?;
+            let (params, ret) = infer.with_frame(frame, |infer| infer.sig_types(sig))?;
+            Ok(Rc::from(vec![params, vec![ret]]))
+        })?;
+        let params = form[0].iter().map(|&ty| self.instantiate(ty, substs)).collect();
+        Some((params, self.instantiate(form[1][0], substs)))
     }
 
     /// The output type that the async fn `sig` declares.
