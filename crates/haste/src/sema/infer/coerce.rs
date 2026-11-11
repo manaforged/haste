@@ -1,10 +1,9 @@
 use anyhow::{Result, bail};
 
 use super::super::ty::{Kind, Mut, Ty};
+use super::RECURSION_LIMIT;
 use super::object::Vtable;
 use super::{Infer, Res};
-
-const DEREF_LIMIT: usize = 8;
 
 /// How the value of an expression changes as it coerces to the type that it is used at.
 #[derive(Clone, Debug)]
@@ -88,7 +87,7 @@ impl Infer<'_, '_> {
     fn deref_coercion(&mut self, from: Ty, to: Ty, mutability: Mut) -> Result<Option<Coercion>> {
         let (mut ty, to) = (self.resolve(from), self.resolve(to));
         let mut steps = Vec::new();
-        while steps.len() < DEREF_LIMIT {
+        while steps.len() < RECURSION_LIMIT {
             if self.same_head(ty, to) {
                 if steps.is_empty() {
                     return Ok(None);

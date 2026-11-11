@@ -209,7 +209,14 @@ pub struct Infer<'c, 'a> {
     /// The values of the parameters of the const fns that a constant expression is calling, innermost last.
     const_args: Vec<(String, (u128, (u32, bool)))>,
     selecting: Vec<String>,
+    /// How many frames of aliases, constants and other items' syntax are open, which `RECURSION_LIMIT` bounds.
+    frames: usize,
+    /// The constants being evaluated, innermost last, so a constant that depends on itself is an error.
+    evaluating: Vec<ItemRef>,
 }
+
+/// rustc's default recursion limit, which bounds dereference steps and nested alias and constant expansion.
+pub(super) const RECURSION_LIMIT: usize = 128;
 
 /// What the `break`s of one loop or labeled block give: the type they coerce to once it is known, whether any `break` was seen, its label, and whether it is a block.
 #[derive(Clone, Copy)]
@@ -299,7 +306,7 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
 impl<'c, 'a> Infer<'c, 'a> {
     fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out: Typed::default(), scopes, items, loops, uses, unsure: Vec::new(), diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new() }
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out: Typed::default(), scopes, items, loops, uses, unsure: Vec::new(), diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), frames: 0, evaluating: Vec::new() }
     }
 }
 

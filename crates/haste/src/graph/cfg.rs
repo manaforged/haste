@@ -155,7 +155,11 @@ fn predicate(lexemes: &[Lexeme], at: &mut usize) -> Result<Cfg> {
                 other => bail!("unknown cfg operator {other}"),
             }
         }
-        _ => Ok(Cfg::Name(name.clone())),
+        _ => Ok(match name.as_str() {
+            "true" => Cfg::All(Vec::new()),
+            "false" => Cfg::Any(Vec::new()),
+            _ => Cfg::Name(name.clone()),
+        }),
     }
 }
 

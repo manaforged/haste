@@ -232,15 +232,18 @@ impl Scanner<'_> {
         self.head(self.qualifiers(after))
     }
 
-    fn delimited_end(&self, open: u32) -> u32 {
+    fn delimited_end(&self, open: u32) -> Result<u32> {
+        if !opens(self.src.kind(open)) {
+            bail!("{}: expected `(`, `[` or `{{` at byte {} after a macro name", self.src.path.display(), self.src.byte(open));
+        }
         let close = self.src.pair(open);
         let braced = self.src.kind(open) == TokenKind::OpenBrace;
-        if !braced && self.src.kind(close + 1) == TokenKind::Semi { close + 2 } else { close + 1 }
+        Ok(if !braced && self.src.kind(close + 1) == TokenKind::Semi { close + 2 } else { close + 1 })
     }
 
     fn macro_rules(&self, at: u32) -> Result<Head> {
         let open = at + 3;
-        Ok(Head { kind: ItemKind::MacroRules, name: Some(at + 2), body: Some(open), end: self.delimited_end(open) })
+        Ok(Head { kind: ItemKind::MacroRules, name: Some(at + 2), body: Some(open), end: self.delimited_end(open)? })
     }
 
     fn macro_item(&self, at: u32) -> Result<Head> {
@@ -267,7 +270,7 @@ impl Scanner<'_> {
             bail!("{}: unexpected {:?} at byte {} in item position", self.src.path.display(), self.src.text(start), self.src.byte(start));
         }
         let open = if is_name(self.src.kind(bang + 1)) { bang + 2 } else { bang + 1 };
-        Ok(Head { kind: ItemKind::MacroCall, name: Some(at), body: Some(open), end: self.delimited_end(open) })
+        Ok(Head { kind: ItemKind::MacroCall, name: Some(at), body: Some(open), end: self.delimited_end(open)? })
     }
 
     fn use_item(&mut self, at: u32) -> Result<Head> {

@@ -44,6 +44,10 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
     let mut compilation = Compilation::new(workspace, outline);
     compilation.names.crates.iter_mut().for_each(|krate| krate.eager = true);
     resolve(&mut compilation)?;
+    let errors = compilation.outline.local_errors(workspace);
+    if !errors.is_empty() {
+        anyhow::bail!("{}", errors.join("\n"));
+    }
     Ok(compilation)
 }
 

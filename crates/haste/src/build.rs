@@ -58,16 +58,12 @@ pub(crate) fn stamp(path: &std::path::Path) -> Stamp {
 
 /// The source files of every crate whose package is local, which an edit can change, the files `include!` read into them, and the files their `include_str!` and `include_bytes!` calls read.
 fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<Watch> {
-    let local: Vec<usize> = (0..outline.roots.len()).filter(|&krate| package_of(workspace, outline, krate).local()).collect();
+    let local: Vec<usize> = (0..outline.roots.len()).filter(|&krate| outline.package(workspace, krate).local()).collect();
     let mut sources: Vec<PathBuf> = local.iter().flat_map(|&krate| outline.crates[krate].files.iter().map(|file| file.source.path.clone())).collect();
     sources.sort();
     sources.dedup();
     let included = local.iter().flat_map(|&krate| outline.included(krate)).map(|(path, by)| (path, Some(by)));
     sources.into_iter().map(|path| (path, None)).chain(included).map(|(path, by)| Watch { stamp: stamp(&path), path, by }).collect()
-}
-
-fn package_of<'w>(workspace: &'w graph::Workspace, outline: &outline::Outline, krate: usize) -> &'w graph::Package {
-    &workspace.packages[workspace.graph.units[outline.roots[krate].unit].package]
 }
 
 fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, pick: Pick) -> (Vec<ItemRef>, Vec<Instance>) {
@@ -312,5 +308,5 @@ pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> 
 
 /// Whether crate `krate` is a procedural macro crate, whose bodies decide the code of the crates that call its macros.
 fn expands(workspace: &graph::Workspace, outline: &outline::Outline, krate: u32) -> bool {
-    package_of(workspace, outline, krate as usize).manifest.proc_macro
+    outline.package(workspace, krate as usize).manifest.proc_macro
 }

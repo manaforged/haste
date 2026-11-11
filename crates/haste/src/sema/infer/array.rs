@@ -60,6 +60,9 @@ impl Infer<'_, '_> {
             };
             let Some(next) = next else { bail!("cannot index {} by {}", self.show(found), self.show(at)) };
             (step, steps) = (self.resolve(next), steps + 1);
+            if steps as usize == super::RECURSION_LIMIT {
+                bail!("reached the recursion limit while dereferencing {}", self.show(found));
+            }
         }
     }
 

@@ -191,8 +191,14 @@ impl<'a> Infer<'_, 'a> {
 
     /// Runs `run` with names read through `frame`.
     pub fn with_frame<T>(&mut self, frame: Frame<'a>, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.frames == super::RECURSION_LIMIT {
+            let item = frame.item.map_or("an item", |item| self.cx.name(item));
+            anyhow::bail!("reached the recursion limit while expanding {item}");
+        }
         let saved = self.swap_frame(frame);
+        self.frames += 1;
         let result = run(self);
+        self.frames -= 1;
         self.swap_frame(saved);
         result
     }
