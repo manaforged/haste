@@ -8,7 +8,7 @@ use crate::sema::infer::{Adjust, Res};
 use crate::sema::infer::parse_int;
 use crate::sema::ty::{Kind, Mut, Ty, int_info};
 
-use super::{Lower, Repr};
+use super::{Lower, Parts, Repr};
 
 /// What arithmetic means for one operand type.
 #[derive(Clone, Copy)]
@@ -22,7 +22,7 @@ const WIDE_SIZE: u32 = 16;
 const WIDE_ALIGN: u8 = 3;
 
 /// How a reference to a slice or `str` is held: its address, then its length.
-pub(super) const WIDE: Repr = Repr::Mem { size: WIDE_SIZE, align: WIDE_ALIGN };
+pub(super) const WIDE: Repr = Repr::Mem { size: WIDE_SIZE, align: WIDE_ALIGN, parts: Parts::Pair(Type::I64, Type::I64, 8) };
 
 impl Lower<'_, '_> {
     pub(super) fn num(&mut self, ty: Ty) -> Result<Num> {

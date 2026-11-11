@@ -95,7 +95,27 @@ pub enum Word {
 pub enum Repr {
     Zst,
     Scalar(Type),
-    Mem { size: u32, align: u8 },
+    Mem { size: u32, align: u8, parts: Parts },
+}
+
+/// The scalars that a memory value is made of, each a machine type at a byte offset, which a typed copy moves one by one; `Bytes` when its layout names none exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parts {
+    Bytes,
+    One(Type),
+    Pair(Type, Type, i32),
+}
+
+impl Parts {
+    /// Each scalar's machine type and byte offset.
+    pub fn scalars(self) -> impl Iterator<Item = (Type, i32)> {
+        let list = match self {
+            Parts::Bytes => [None, None],
+            Parts::One(ty) => [Some((ty, 0)), None],
+            Parts::Pair(first, second, offset) => [Some((first, 0)), Some((second, offset))],
+        };
+        list.into_iter().flatten()
+    }
 }
 
 /// The register type that holds a scalar value of `ty`, or none when `ty` is not a scalar.
@@ -126,18 +146,15 @@ pub fn repr(cx: &mut Context<'_>, ty: Ty) -> Result<Repr> {
     }
     let layout = cx.layout(ty)?;
     let size = layout.size.bytes() as u32;
-    Ok(if size == 0 { Repr::Zst } else { Repr::Mem { size, align: layout.align.abi.bytes().trailing_zeros() as u8 } })
+    Ok(if size == 0 { Repr::Zst } else { Repr::Mem { size, align: layout.align.abi.bytes().trailing_zeros() as u8, parts: abi::copied_parts(&layout) } })
 }
 
 /// The register that a value of `ty` crosses a call in when it lives in memory but its layout is one scalar, as rustc passes such a value.
 pub fn unwrapped(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Type>> {
-    if !matches!(repr(cx, ty)?, Repr::Mem { .. }) {
-        return Ok(None);
-    }
-    match &cx.layout(ty)?.backend_repr {
-        rustc_abi::BackendRepr::Scalar(scalar) => abi::scalar_type(&crate::sema::layout::target()?, scalar).map(Some),
-        _ => Ok(None),
-    }
+    Ok(match repr(cx, ty)? {
+        Repr::Mem { parts: Parts::One(machine), .. } => Some(machine),
+        _ => None,
+    })
 }
 
 /// The native signature of a reached function: memory values travel by address unless their layout is one scalar, and a memory result through a first `StructReturn` pointer.
@@ -172,7 +189,7 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
 struct Loop {
     head: Block,
     exit: Block,
-    value: Option<(StackSlot, Type)>,
+    value: Option<place::Place>,
     depth: usize,
     label: Option<u32>,
     block: bool,
@@ -337,8 +354,8 @@ impl Lower<'_, '_> {
         }
         let ret = self.typed.ret_ty();
         if let (Some(out), Some(value)) = (self.sret, value) {
-            let Repr::Mem { size, .. } = repr(self.cx, ret)? else { bail!("result pointer for a non-memory result") };
-            self.copy(out, value, size);
+            let whole @ Repr::Mem { .. } = repr(self.cx, ret)? else { bail!("result pointer for a non-memory result") };
+            self.copy(out, value, whole);
         }
         self.drop_to(0)?;
         match (self.sret, value) {
@@ -455,7 +472,7 @@ impl Lower<'_, '_> {
         match repr {
             Repr::Zst => None,
             Repr::Scalar(ty) => Some(self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8)),
-            Repr::Mem { size, align } => Some(self.b.create_stack_slot(size, align)),
+            Repr::Mem { size, align, .. } => Some(self.b.create_stack_slot(size, align)),
         }
     }
 
