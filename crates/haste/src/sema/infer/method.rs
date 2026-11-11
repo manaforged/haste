@@ -223,9 +223,23 @@ impl<'a> Infer<'_, 'a> {
 
     /// The function a call of trait method `method` with receiver type `receiver` runs, and its leading type arguments.
     pub fn trait_method(&mut self, method: ItemRef, receiver: Ty) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        self.method_of_trait(method, receiver, false)
+    }
+
+    /// Like `trait_method` for a call that desugaring writes, such as `Iterator::next` in a `for` loop, which takes the trait item itself with an obligation while the receiver's `Self` is still unknown.
+    pub fn lang_method(&mut self, method: ItemRef, receiver: Ty) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        self.method_of_trait(method, receiver, true)
+    }
+
+    fn method_of_trait(&mut self, method: ItemRef, receiver: Ty, pending: bool) -> Result<Option<(ItemRef, Vec<Ty>)>> {
         let Some(of) = self.cx.owner_trait(method) else { bail!("{} is not a trait method", self.cx.name(method)) };
         let Some((kind, _)) = self.cx.signature(method)?.receiver else { bail!("{} takes no `self`", self.cx.name(method)) };
-        let Some((item, mut substs)) = self.try_trait(TraitCandidate { of, item: method, kind, bound: None }, receiver)? else { return Ok(None) };
+        let candidate = TraitCandidate { of, item: method, kind, bound: None };
+        let found = match self.try_trait(candidate, receiver)? {
+            None if pending => self.pending_trait(candidate, receiver)?,
+            found => found,
+        };
+        let Some((item, mut substs)) = found else { return Ok(None) };
         let own = type_params(&self.cx.signature(item)?.generics).count();
         substs.extend((0..own).map(|_| self.fresh(Kind::Var)));
         Ok(Some((item, substs)))
@@ -252,6 +266,16 @@ impl<'a> Infer<'_, 'a> {
             Some((item, (_, impl_args))) => (item, impl_args),
             None => (candidate.item, std::iter::once(self_ty).chain(args).collect()),
         }))
+    }
+
+    fn pending_trait(&mut self, candidate: TraitCandidate, receiver: Ty) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        let Some(self_ty) = self.trait_self(candidate, receiver) else { return Ok(None) };
+        if !matches!(self.cx.types.kind(self.resolve(self_ty)), Kind::Var(_)) {
+            return Ok(None);
+        }
+        let substs: Vec<Ty> = std::iter::once(self_ty).chain(self.fresh_trait_args(candidate.of)?).collect();
+        self.obligations.push((candidate.of, substs.clone()));
+        Ok(Some((candidate.item, substs)))
     }
 
     /// The trait item itself when no one impl of its trait is selected for `self_ty` yet but one may apply, with the obligation to prove later.

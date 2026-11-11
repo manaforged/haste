@@ -79,7 +79,7 @@ impl Infer<'_, '_> {
 
     pub(super) fn lang_call(&mut self, lang: &str, receiver: Ty) -> Result<(Res, Ty)> {
         let Some(method) = self.cx.lang_item(lang) else { bail!("no `{lang}` lang item") };
-        let Some((item, substs)) = self.trait_method(method, receiver)? else { bail!("{} does not implement `{}`", self.show(receiver), self.cx.name(method)) };
+        let Some((item, substs)) = self.lang_method(method, receiver)? else { bail!("{} does not implement `{}`", self.show(receiver), self.cx.name(method)) };
         let (_, ret) = self.fn_types(item, &substs)?;
         Ok((Res::Fn(item, substs), ret))
     }
