@@ -248,6 +248,11 @@ pub(crate) fn wait(pid: libc::pid_t) -> i32 {
     if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) }
 }
 
+/// Whether a child that ended with `status` was stopped from outside, by a hangup, an interrupt, a kill or a termination request, so its failure says nothing about its input.
+pub(crate) fn interrupted(status: i32) -> bool {
+    [libc::SIGHUP, libc::SIGINT, libc::SIGKILL, libc::SIGTERM].iter().any(|&signal| status == 128 + signal)
+}
+
 /// The state byte of a static whose initializer has written its value.
 pub(crate) const FILLED: u8 = 1;
 const EMPTY: u8 = 0;

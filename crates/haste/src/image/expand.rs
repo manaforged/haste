@@ -82,7 +82,8 @@ impl Driver for Shares<'_, '_> {
             if ended.status == 0 {
                 bail!("the macro child exited before its last job");
             }
-            self.results[job] = Some(Err(ended.failure.map_or_else(|| format!("the procedural macro crashed with status {}", ended.status), |(error, _)| error)));
+            let crashed = ended.failure.map_or_else(|| format!("the procedural macro crashed with status {}", ended.status), |(error, _)| error);
+            self.results[job] = (!super::interrupted(ended.status)).then_some(Err(crashed));
             self.next[part] += 1;
         }
         Ok(())

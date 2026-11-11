@@ -35,16 +35,19 @@ pub fn settle(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
         for (unit, failure) in errors {
             let ran = failure.broken.is_some_and(|at| pending.contains(&at) && workspace.graph.units[at].script.is_some());
             if !ran {
-                give_up(workspace, targets, unit, &failure.error, &mut failed);
+                give_up(workspace, targets, unit, &failure, &mut failed);
             }
         }
     }
 }
 
-/// Reports that `unit`'s script did not build or run, keeps that failure for later runs, and builds its package with the script's cfgs open.
-fn give_up(workspace: &Workspace, targets: &Targets, unit: usize, error: &str, failed: &mut HashSet<usize>) {
+/// Reports that `unit`'s script did not build or run, keeps that failure for later runs unless something outside stopped the script, and builds its package with the script's cfgs open.
+fn give_up(workspace: &Workspace, targets: &Targets, unit: usize, failure: &Failure, failed: &mut HashSet<usize>) {
+    let error = &failure.error;
     report(workspace, unit, error, failed);
-    if let Err(write) = store::keep_failure(workspace, unit, &vars(workspace, targets, unit), error) {
+    if !failure.interrupted
+        && let Err(write) = store::keep_failure(workspace, unit, &vars(workspace, targets, unit), error)
+    {
         eprintln!("cannot keep that failure: {write}");
     }
 }
@@ -63,11 +66,12 @@ fn vars(workspace: &Workspace, targets: &Targets, unit: usize) -> Vec<(String, S
 struct Failure {
     error: String,
     broken: Option<usize>,
+    interrupted: bool,
 }
 
 impl From<String> for Failure {
     fn from(error: String) -> Failure {
-        Failure { error, broken: None }
+        Failure { error, broken: None, interrupted: false }
     }
 }
 
@@ -175,8 +179,8 @@ impl Driver for Runs<'_> {
         let (_, unit, script) = self.running.swap_remove(at);
         let result = match (ended.status, ended.failure) {
             (0, _) => String::from_utf8(ended.bytes).map(|text| finished(self.workspace, unit, &script, &text)).map_err(|_| Failure::from("printed output that is not UTF-8".to_owned())),
-            (_, Some((error, item))) => Err(Failure { error: format!("does not build: {error}"), broken: self.owners.get(item.krate as usize).copied() }),
-            (status, None) => Err(Failure::from(format!("exited with status {status}; its errors are in {}", script.log.display()))),
+            (_, Some((error, item))) => Err(Failure { error: format!("does not build: {error}"), broken: self.owners.get(item.krate as usize).copied(), interrupted: false }),
+            (status, None) => Err(Failure { interrupted: crate::image::interrupted(status), ..Failure::from(format!("exited with status {status}; its errors are in {}", script.log.display())) }),
         };
         if let Ok(output) = &result {
             self.ran.insert(unit, output.clone());
