@@ -29,6 +29,28 @@ struct Matcher<'a> {
     parsed: Option<HashMap<(u32, u32, Frag), Option<u32>>>,
 }
 
+fn accepts_opaque(want: Frag, held: Frag) -> bool {
+    want == Frag::Tt
+        || want == held
+        || matches!(
+            (held, want),
+            (Frag::Expr, Frag::Stmt | Frag::Pat | Frag::PatParam)
+                | (Frag::Pat, Frag::PatParam)
+                | (Frag::PatParam, Frag::Pat)
+                | (Frag::Ty, Frag::Path)
+                | (Frag::Path, Frag::Ty | Frag::Expr | Frag::Pat | Frag::PatParam | Frag::Stmt | Frag::Meta)
+                | (Frag::Block, Frag::Expr | Frag::Stmt)
+                | (Frag::Item, Frag::Stmt)
+        )
+}
+
+fn opaque_literal(src: &Source, mut from: u32, mut to: u32) -> bool {
+    while to > from + 1 && src.kind(from) == TokenKind::OpenParen && src.pair(from) == to - 1 {
+        (from, to) = (from + 1, to - 1);
+    }
+    fragment::extent(src, Frag::Literal, from, to) == Some(to)
+}
+
 impl Matcher<'_> {
     fn seq(&mut self, pieces: &[Piece], mut at: u32, end: u32, slots: &mut Slots) -> Option<u32> {
         for piece in pieces {
@@ -51,16 +73,28 @@ impl Matcher<'_> {
         }
     }
 
+    fn opaque_piece(&mut self, piece: &Piece, (at, to, end): (u32, u32, u32), held: Frag, slots: &mut Slots) -> Option<u32> {
+        if to > end {
+            return None;
+        }
+        let (slot, from, reach, frag) = match piece {
+            Piece::Repeat(inner, sep, op, names) => return self.repeat((inner, names), (*sep, *op), (at, end), slots),
+            Piece::Var(_, Some(Frag::Tt), slot) => (slot, at, to, Frag::Tt),
+            Piece::Var(_, Some(Frag::Vis), slot) if held != Frag::Vis => (slot, at, at, Frag::Vis),
+            Piece::Var(_, Some(Frag::Literal), slot) if held == Frag::Expr && opaque_literal(self.input, at, to) => (slot, at, to, Frag::Literal),
+            Piece::Var(_, Some(frag), slot) if accepts_opaque(*frag, held) => (slot, at, self.extent(*frag, at, end).map_or(to, |parsed| parsed.max(to)), *frag),
+            _ => return None,
+        };
+        if reach > end {
+            return None;
+        }
+        bind(slots, *slot, Bind::One(from, reach, frag));
+        Some(reach)
+    }
+
     fn piece(&mut self, piece: &Piece, at: u32, end: u32, slots: &mut Slots) -> Option<u32> {
-        if let Some(to) = self.input.opaque_end(at).filter(|_| at < end) {
-            match piece {
-                Piece::Token(_) | Piece::Group(..) | Piece::Var(_, Some(Frag::Ident | Frag::Lifetime), _) => return None,
-                Piece::Var(_, Some(Frag::Tt), slot) => {
-                    bind(slots, *slot, Bind::One(at, to, Frag::Tt));
-                    return Some(to);
-                }
-                _ => {}
-            }
+        if let Some((to, held)) = self.input.opaque_at(at).filter(|_| at < end) {
+            return self.opaque_piece(piece, (at, to, end), held, slots);
         }
         match piece {
             Piece::Token(token) => (at < end && self.input.text(at) == self.def.text(*token)).then_some(at + 1),
@@ -184,12 +218,12 @@ impl Writer<'_> {
                 if grouped {
                     self.out.lexed("(");
                 }
-                (from..to).for_each(|at| self.out.copy(self.input, at));
+                self.out.copy_range(self.input, from, to);
                 if grouped {
                     self.out.lexed(")");
                 }
-                if !matches!(frag, Frag::Tt | Frag::Ident | Frag::Lifetime | Frag::Literal | Frag::Vis) {
-                    self.out.opaque_from(start);
+                if !matches!(frag, Frag::Tt | Frag::Ident | Frag::Lifetime | Frag::Literal) {
+                    self.out.opaque_from(start, frag);
                 }
                 self.out.space();
             }
@@ -274,7 +308,7 @@ pub fn select(src: &Source, open: u32, env: &super::tree::Env) -> Result<Option<
         bail!("a cfg_select! arm of items needs braces at byte {} of {}", src.byte(arm.from), src.path.display());
     }
     let mut out = Tokens::default();
-    (arm.from..arm.to).for_each(|token| out.copy(src, token));
+    out.copy_range(src, arm.from, arm.to);
     out.finish(src.path.clone()).map(Some)
 }
 

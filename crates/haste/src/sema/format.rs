@@ -145,7 +145,7 @@ fn write_call(out: &mut Tokens, krate: u32, (bytes, sources, call): (&[u8], &[Or
             }
         };
         out.lexed("(");
-        (from..to).for_each(|at| out.copy(call.src, at));
+        out.copy_range(call.src, from, to);
         out.lexed("),");
     }
     out.lexed(") { args => unsafe {");

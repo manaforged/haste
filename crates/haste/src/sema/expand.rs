@@ -146,7 +146,7 @@ impl Writer {
         let block = self.offset + self.out.len();
         self.calls.insert(run.shift + open, block);
         self.out.lexed("{");
-        (0..output.len()).for_each(|at| self.out.copy(&output, at));
+        self.out.copy_range(&output, 0, output.len());
         self.out.space();
         self.out.lexed("}");
         self.scan(cx, Run { src: &output, from: 0, shift: block + 1, depth: run.depth + 1, call: run.call_at(path.0) }, output.len())
@@ -252,7 +252,7 @@ impl Writer {
         if !arm.braced {
             out.lexed("(");
         }
-        (arm.from..arm.to).for_each(|at| out.copy(run.src, at));
+        out.copy_range(run.src, arm.from, arm.to);
         if !arm.braced {
             out.lexed(")");
         }
@@ -264,7 +264,7 @@ impl Writer {
         let name = if site.builtin == Builtin::Panic { "panic" } else { "unreachable" };
         builtin::crate_path(out, site.krate, &format!("::panic::{name}_{edition}!"));
         out.lexed("(");
-        (site.open + 1..run.src.pair(site.open)).for_each(|at| out.copy(run.src, at));
+        out.copy_range(run.src, site.open + 1, run.src.pair(site.open));
         out.lexed(")");
     }
 
@@ -420,7 +420,7 @@ impl Context<'_> {
         let derived: Vec<(Source, Option<u32>)> = adts.filter_map(|entry| Some((derive::derived(&source, entry, env, (krate as usize, deps)).0?, entry.parent))).map(|(expanded, parent)| Ok((expanded?, parent))).collect::<Result<_>>()?;
         let Some(base) = source.base.clone().filter(|_| !derived.is_empty()) else { return Ok((source, items)) };
         let mut out = Tokens::default();
-        (source.offset..source.len()).for_each(|at| out.copy(&source, at));
+        out.copy_range(&source, source.offset, source.len());
         let mut starts = Vec::new();
         for (expanded, parent) in derived {
             let mut at = 0;
@@ -428,7 +428,7 @@ impl Context<'_> {
                 starts.push((source.offset + out.len() + at, parent));
                 at = scan::item_end(&expanded, at)?;
             }
-            (0..expanded.len()).for_each(|at| out.copy(&expanded, at));
+            out.copy_range(&expanded, 0, expanded.len());
             out.space();
         }
         let source = out.finish_over(base)?;

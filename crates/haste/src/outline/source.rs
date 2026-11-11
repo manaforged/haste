@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::rules::Frag;
 use super::tree::File;
 
 use anyhow::{Context, Result, bail};
@@ -67,8 +68,8 @@ pub struct Source {
     pub text: String,
     pub tokens: Vec<Token>,
     pub marks: Vec<(u32, Mark)>,
-    /// The token ranges, by index in this layer, that a macro wrote from an expression-like fragment, which later macros match only as a whole.
-    pub opaque: Vec<(u32, u32)>,
+    /// The token ranges, by index in this layer, that a macro wrote from an opaque fragment, with its kind.
+    pub opaque: Vec<(u32, u32, Frag)>,
     pub base: Option<Arc<File>>,
     pub offset: u32,
     /// The tokens that each macro call in type position writes, by the token that opens its group.
@@ -102,7 +103,7 @@ pub struct Tokens {
     text: String,
     tokens: Vec<Token>,
     marks: Vec<(u32, Mark)>,
-    opaque: Vec<(u32, u32)>,
+    opaque: Vec<(u32, u32, Frag)>,
 }
 
 fn is_punct_kind(kind: TokenKind) -> bool {
@@ -200,10 +201,26 @@ impl Tokens {
         self.tokens.len() as u32
     }
 
-    /// Marks the tokens written since `from` as one opaque fragment.
-    pub fn opaque_from(&mut self, from: u32) {
-        if from < self.len() {
-            self.opaque.push((from, self.len()));
+    /// Copies tokens `from..to` of `src`, keeping their spacing, origin marks and opaque sub-ranges.
+    pub fn copy_range(&mut self, src: &Source, from: u32, to: u32) {
+        let base = self.len();
+        (from..to).for_each(|at| self.copy(src, at));
+        for (op_from, op_to, frag) in src.opaques_in(from, to) {
+            self.opaque.push((base + (op_from - from), base + (op_to - from), frag));
+        }
+    }
+
+    /// Marks the tokens written since `from` as one opaque fragment of kind `frag`.
+    pub fn opaque_from(&mut self, from: u32, frag: Frag) {
+        let to = self.len();
+        if from >= to {
+            return;
+        }
+        let slot = self.opaque.partition_point(|&(start, _, _)| start < from);
+        if self.opaque.get(slot).is_some_and(|&(start, _, _)| start == from) {
+            self.opaque[slot] = (from, to, frag);
+        } else {
+            self.opaque.insert(slot, (from, to, frag));
         }
     }
 }
@@ -490,6 +507,18 @@ fn pair_up(tokens: &mut [Token], path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn layer_opaques(entries: &[(u32, u32, Frag)], (low, high): (u32, u32), shift: u32, out: &mut Vec<(u32, u32, Frag)>) {
+    let start = entries.partition_point(|&(s, _, _)| s < low);
+    for &(s, e, frag) in &entries[start..] {
+        if s >= high {
+            break;
+        }
+        if e <= high {
+            out.push((s + shift, e + shift, frag));
+        }
+    }
+}
+
 impl Source {
     /// The file that `path` names from this source, as `include!` and `include_str!` read it: relative to this source's directory.
     pub fn beside(&self, path: &str) -> PathBuf {
@@ -632,11 +661,29 @@ impl Source {
         src.own_mark(local as u32)
     }
 
-    /// The end of the opaque fragment that starts at token `at`, if one does.
-    pub fn opaque_end(&self, at: u32) -> Option<u32> {
+    /// The end and fragment kind of the opaque fragment that starts at token `at`, if one does.
+    pub fn opaque_at(&self, at: u32) -> Option<(u32, Frag)> {
         let (src, local) = self.layer(at);
-        let found = src.opaque.binary_search_by_key(&(local as u32), |&(start, _)| start).ok()?;
-        Some(src.opaque[found].1 + (at - local as u32))
+        let found = src.opaque.binary_search_by_key(&(local as u32), |&(start, _, _)| start).ok()?;
+        let (_, end, frag) = src.opaque[found];
+        Some((end + (at - local as u32), frag))
+    }
+
+    /// Each opaque fragment of `self` that lies within `from..to`.
+    pub fn opaques_in(&self, from: u32, to: u32) -> Vec<(u32, u32, Frag)> {
+        let mut found = Vec::new();
+        if from >= to {
+            return found;
+        }
+        if from < self.offset
+            && let Some(base) = &self.base
+        {
+            layer_opaques(&base.source.opaque, (from, to.min(self.offset)), 0, &mut found);
+        }
+        if to > self.offset {
+            layer_opaques(&self.opaque, (from.saturating_sub(self.offset), to - self.offset), self.offset, &mut found);
+        }
+        found
     }
 
     fn own_mark(&self, local: u32) -> Option<Mark> {

@@ -980,6 +980,76 @@ fn case_const_compound_types(n: i64) -> i64 {
     CompoundConst::Total as i64 + n
 }
 
+macro_rules! mq_kind {
+    (3) => { 1 };
+    ($t:ty) => { 2 };
+    ($e:expr) => { 3 };
+}
+
+macro_rules! mq_pat_or_expr {
+    ($e:expr) => { 10 };
+    ($p:pat) => { 20 };
+}
+
+macro_rules! mq_vis_or_ident {
+    ($id:ident) => { 100 };
+    ($v:vis) => { 200 };
+}
+
+macro_rules! mq_lit_or_expr {
+    ($l:literal) => { 2 };
+    ($e:expr) => { 9 };
+}
+
+macro_rules! mq_path_or_tt {
+    ($p:path) => { 3 };
+    ($t:tt) => { 9 };
+}
+
+macro_rules! mq_pat_target {
+    ($p:pat) => { 1 };
+    ($t:tt) => { 9 };
+}
+
+macro_rules! mq_vis_ty {
+    ($v:vis $t:ty) => { 4 };
+}
+
+macro_rules! mq_tt {
+    ($t:tt) => { mq_kind!($t) };
+}
+
+macro_rules! mq_tts {
+    ($($t:tt)*) => { mq_kind!($($t)*) };
+}
+
+macro_rules! mq_from_expr {
+    ($e:expr) => { mq_kind!($e) + mq_tt!($e) * 10 + mq_tts!($e) * 100 };
+}
+
+macro_rules! mq_from_pat {
+    ($p:pat) => { mq_pat_or_expr!($p) };
+}
+
+macro_rules! mq_from_vis {
+    ($v:vis) => { mq_vis_or_ident!($v) };
+}
+
+macro_rules! mq_compat {
+    ($pp:pat_param, $lit:expr, $ty:ty) => {
+        mq_pat_target!($pp) + mq_lit_or_expr!($lit) + mq_path_or_tt!($ty) + mq_vis_ty!($ty)
+    };
+}
+
+fn case_macro_opaque_forward(n: i64) -> i64 {
+    let a = mq_from_expr!(i32);
+    let b = mq_from_expr!(3);
+    let c = mq_from_pat!(Some(1));
+    let d = mq_from_vis!(pub);
+    let e = mq_compat!(x, 42, Vec<i32>);
+    a + b + c + d + e + n
+}
+
 fn main() {
     let cases: &[(&str, fn(i64) -> i64)] = &[
         ("case_arith", case_arith),
@@ -1068,6 +1138,7 @@ fn main() {
         ("case_call_once", case_call_once),
         ("case_diverging_closure", case_diverging_closure),
         ("case_const_compound_types", case_const_compound_types),
+        ("case_macro_opaque_forward", case_macro_opaque_forward),
     ];
     for (name, case) in cases {
         for input in [-5_i64, 0, 1, 3, 20] {
