@@ -296,6 +296,11 @@ impl Outline {
         dependents_of(&self.users(), &mut seen, [krate])
     }
 
+    /// The crates whose package is a member of `workspace`.
+    pub fn members<'o>(&'o self, workspace: &'o Workspace) -> impl Iterator<Item = usize> + 'o {
+        (0..self.roots.len()).filter(|&krate| workspace.graph.members.contains(&workspace.graph.units[self.roots[krate].unit].package))
+    }
+
     /// The package that crate `krate` belongs to.
     pub fn package<'w>(&self, workspace: &'w Workspace, krate: usize) -> &'w crate::graph::Package {
         &workspace.packages[workspace.graph.units[self.roots[krate].unit].package]

@@ -54,7 +54,7 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
 /// Loads the member crates' roots, resolves their names and expands their procedural macro calls, reading of other crates only what those lookups reach, then drops the macro expander.
 pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<Compilation> {
     let mut outline = crate::outline::new(workspace, targets, &[]);
-    let members: Vec<usize> = (0..outline.roots.len()).filter(|at| crate::cli::is_member(workspace, &outline.roots[*at])).collect();
+    let members: Vec<usize> = outline.members(workspace).collect();
     for &krate in &members {
         outline.load(krate, 0)?;
     }
@@ -89,16 +89,24 @@ pub fn resolve_sema<R>(compilation: &mut Compilation, asking: (Cache, impl Fn(&m
     done
 }
 
+/// Answers the asks a pass released with `ask` and drops from the store it released what the answer made stale.
+pub fn answer(compilation: &mut Compilation, ask: impl Fn(&mut Compilation, Requests) -> Result<Answer>, (mut kept, asks): (Cache, Requests)) -> (Cache, Result<Answer>) {
+    let answer = ask(compilation, asks);
+    if let Ok(answer) = &answer {
+        kept.forget_after(*answer);
+    }
+    (kept, answer)
+}
+
 fn answer_passes<R>(compilation: &mut Compilation, (mut store, ask): (Cache, impl Fn(&mut Compilation, Requests) -> Result<Answer>), mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>) -> Result<R> {
     let mut last = false;
     loop {
-        let (mut kept, asks) = match pass(Context::new(&compilation.outline, &compilation.names, store), last)? {
+        let (kept, asks) = match pass(Context::new(&compilation.outline, &compilation.names, store), last)? {
             Ok(done) => return Ok(done),
             Err(released) => released,
         };
-        let answer = ask(compilation, asks)?;
-        last = answer == Answer::Nothing;
-        kept.forget_after(answer);
+        let (kept, answer) = answer(compilation, &ask, (kept, asks));
+        last = answer? == Answer::Nothing;
         store = kept;
     }
 }

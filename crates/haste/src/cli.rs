@@ -79,10 +79,6 @@ fn report_outline(workspace: &graph::Workspace, targets: &Targets, threads: usiz
     Ok(())
 }
 
-pub(crate) fn is_member(workspace: &graph::Workspace, root: &outline::Root) -> bool {
-    workspace.graph.members.contains(&workspace.graph.units[root.unit].package)
-}
-
 fn report_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
     let started = Instant::now();
     let compilation = crate::macros::load_lazy(workspace, targets)?;
@@ -93,7 +89,8 @@ fn report_lazy(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
 
 pub(crate) fn case_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
     let mut found = Vec::new();
-    for (krate, (_, tree)) in outline.roots.iter().zip(&outline.crates).enumerate().filter(|(_, (root, _))| is_member(workspace, root)) {
+    for krate in outline.members(workspace) {
+        let tree = &outline.crates[krate];
         for (file_at, file) in tree.files.iter().enumerate() {
             for (at, item) in file.items.items.iter().enumerate() {
                 let named = item.name.is_some_and(|name| file.source.text(name).starts_with("case_"));
