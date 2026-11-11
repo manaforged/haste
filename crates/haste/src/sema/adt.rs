@@ -69,13 +69,7 @@ impl<'a> Context<'a> {
 
     /// The value of `#[lang = "..."]` on `item`.
     pub fn lang(&self, item: ItemRef) -> Option<&'a str> {
-        let cached = self.store.lookups.lang_of.borrow().get(&item).copied();
-        let at = cached.unwrap_or_else(|| {
-            let found = self.attr_at(item, "lang");
-            self.store.lookups.lang_of.borrow_mut().insert(item, found);
-            found
-        })?;
-        Some(self.item(item).0.text(at + 2).trim_matches('"'))
+        self.attr_value(item, "lang")
     }
 
     /// The value of the name-value attribute `#[key = "..."]` on `item`, written directly or through a `cfg_attr` that holds.
@@ -96,7 +90,12 @@ impl<'a> Context<'a> {
 
     /// The token of the attribute `key` that `item` carries, through `cfg_attr` whose cfg holds.
     pub(super) fn attr_at(&self, item: ItemRef, key: &str) -> Option<u32> {
-        let (src, entry) = self.item(item);
+        let file = self.file(item);
+        let index = item.outer().map_or(item.item, |(_, index)| index);
+        if !file.items.may_carry(index, key) {
+            return None;
+        }
+        let (src, entry) = (&file.source, &file.items.items[index as usize]);
         let pick = |attr: &Attr| if let Attr::Other(at) = attr { (src.text(*at) == key).then_some(*at) } else { None };
         self.outline.crates[item.krate as usize].env.find_attr(&entry.attrs, crate::outline::tree::Truth::Yes, &pick)
     }

@@ -54,16 +54,16 @@ struct Lookups {
     owners: HashMap<u32, Rc<HashMap<(u32, Option<u32>), u32>>>,
     trait_defs: HashMap<ItemRef, Rc<traits::TraitGenerics>>,
     discriminants: HashMap<ItemRef, Rc<[i128]>>,
-    langs: Option<(Rc<HashMap<String, ItemRef>>, Rc<[u32]>)>,
+    langs: Option<traits::Langs>,
     drops: HashMap<ty::Ty, bool>,
     fields: HashMap<ty::Ty, infer::Fields>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
     futures: HashMap<ty::Ty, ty::Ty>,
-    lang_of: std::cell::RefCell<HashMap<ItemRef, Option<u32>>>,
     scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
     type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
     impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
     selections: HashMap<(ItemRef, ty::Ty, Vec<ty::Ty>), Option<(impls::ImplRef, Vec<ty::Ty>)>>,
+    loaded: Vec<[usize; 5]>,
 }
 
 /// What answering the asks of a pass added: nothing new to infer with, the output of procedural macros that function bodies call, or loaded files, resolved names and expanded items.
@@ -75,10 +75,21 @@ pub enum Answer {
 }
 
 impl Lookups {
-    /// The lookups that still hold once function bodies can read more procedural macro output: the impl indexes of crates built without asking for anything, and the lang items.
-    fn after_bodies(&mut self) -> Lookups {
+    /// The lookups that depend only on loaded source and so hold while it does: the impl indexes of crates built without asking for anything, the lang items, and the outline extent they were built at.
+    fn after_pass(&mut self) -> Lookups {
         let complete = |(holder, index): &(impls::Holder, Rc<impls::Index>)| matches!(holder, impls::Holder::Crate(_)) && index.complete();
-        Lookups { heads: std::mem::take(&mut self.heads).into_iter().filter(complete).collect(), langs: self.langs.take(), ..Lookups::default() }
+        let heads = std::mem::take(&mut self.heads).into_iter().filter(complete).collect();
+        Lookups { heads, langs: self.langs.take(), loaded: std::mem::take(&mut self.loaded), ..Lookups::default() }
+    }
+
+    /// Drops the impl indexes and lang items when `outline` loaded, expanded or consumed anything since they were built, and records its extent now.
+    fn check(&mut self, outline: &Outline) {
+        let loaded: Vec<[usize; 5]> = outline.crates.iter().map(crate::outline::tree::Crate::extent).collect();
+        if loaded != self.loaded {
+            self.heads.clear();
+            self.langs = None;
+            self.loaded = loaded;
+        }
     }
 }
 
@@ -88,12 +99,9 @@ impl Cache {
         self.lookups = Lookups::default();
     }
 
-    /// Drops the cached lookups that `answer` makes stale.
-    pub fn forget_after(&mut self, answer: Answer) {
-        self.lookups = match answer {
-            Answer::Bodies => self.lookups.after_bodies(),
-            Answer::Nothing | Answer::Names => Lookups::default(),
-        };
+    /// Drops the cached lookups that an answer may make stale, keeping those that depend only on loaded source, which the next `Context::new` drops if the answer changed that source.
+    pub fn forget_after(&mut self, _: Answer) {
+        self.lookups = self.lookups.after_pass();
     }
 
     /// Drops what the store keeps about the items that `edited` holds, and about the instances, types and lookups that name one of them.
@@ -129,7 +137,9 @@ impl Cache {
         kept.trait_defs.retain(|item, _| !mine(*item));
         kept.selections.clear();
         kept.discriminants.retain(|item, _| !mine(*item));
-        kept.lang_of.get_mut().retain(|item, _| !mine(*item));
+        if kept.langs.as_ref().is_some_and(|langs| langs.crates.iter().any(|&krate| edited.touches_crate(krate))) {
+            kept.langs = None;
+        }
     }
 
     /// The indexes of the instances in `list` that are functions `edited` holds or take a type that names one of its items.
@@ -230,6 +240,7 @@ impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, mut store: Cache) -> Context<'a> {
         let types = std::mem::take(&mut store.types);
+        store.lookups.check(outline);
         let (kids, trait_members, impl_members, aliases, asks) = Default::default();
         Context { outline, names, types, asks, store, kids, trait_members, impl_members, aliases, evaluated: evaluate::Evaluated::default() }
     }

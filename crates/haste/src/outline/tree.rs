@@ -196,6 +196,11 @@ impl Crate {
         self.modules.iter().any(|module| matches!(module.state, State::Declared(_)))
     }
 
+    /// How much of the crate is read: its files, impls, item-holding bodies and consumed items, and whether a declared module is still unread; loading, expanding or consuming changes it.
+    pub fn extent(&self) -> [usize; 5] {
+        [self.files.len(), self.impls.len(), self.impl_bodies.len(), self.consumed.len(), usize::from(self.partial())]
+    }
+
     /// The names of the item macro calls that no definition matched.
     pub fn unresolved(&self) -> Vec<String> {
         let names = self.deferred.iter().filter_map(|call| call.file.items.items[call.at as usize].name.map(|name| call.file.source.text(name).to_owned()));

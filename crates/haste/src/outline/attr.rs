@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rustc_lexer::TokenKind;
 
-use super::item::Attr;
+use super::item::{Attr, mark};
 use super::source::{Source, opens};
 use crate::graph::cfg;
 
@@ -106,4 +106,15 @@ pub fn attrs(src: &Source, mut at: u32, inner: bool, into: &mut Vec<Attr>) -> Re
         into.push(content(src, open + 1, close)?);
         at = close + 1;
     }
+}
+
+/// The bits of the `MARKED` attributes that `attrs` name, directly or inside a `cfg_attr` whatever its condition.
+pub fn marks(src: &Source, attrs: &[Attr]) -> u8 {
+    attrs.iter().fold(0, |bits, attr| {
+        bits | match attr {
+            Attr::Other(at) => mark(src.text(*at)),
+            Attr::CfgAttr(_, inner) => marks(src, inner),
+            _ => 0,
+        }
+    })
 }
