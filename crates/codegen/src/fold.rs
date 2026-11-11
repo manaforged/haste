@@ -145,16 +145,16 @@ impl Fold {
 
     /// Sends each edge that passes a constant to a block holding only a branch on that parameter straight to the target the branch takes.
     fn thread(&self, func: &mut Function, pinned: &[bool]) -> bool {
-        let uses = use_counts(func);
+        let mut uses = use_counts(func);
         let mut changed = false;
         for block in 0..func.blocks.len() {
             let Some(&last) = func.blocks[block].insts.last() else { continue };
             let mut op = std::mem::replace(&mut func.insts[last.index()].op, Op::Trap);
             match &mut op {
-                Op::Jump(target, args) => changed |= self.retarget(func, (&uses, pinned), target, args),
+                Op::Jump(target, args) => changed |= self.retarget(func, (&mut uses, pinned), target, args),
                 Op::Brif(_, then, then_args, otherwise, else_args) => {
-                    changed |= self.retarget(func, (&uses, pinned), then, then_args);
-                    changed |= self.retarget(func, (&uses, pinned), otherwise, else_args);
+                    changed |= self.retarget(func, (&mut uses, pinned), then, then_args);
+                    changed |= self.retarget(func, (&mut uses, pinned), otherwise, else_args);
                 }
                 _ => {}
             }
@@ -163,8 +163,8 @@ impl Fold {
         changed
     }
 
-    /// Moves the edge to `target` with `args` along the blocks that only jump on, or only branch on a parameter the edge makes a constant, to the first block that does more.
-    fn retarget(&self, func: &Function, (uses, pinned): (&[u32], &[bool]), target: &mut Block, args: &mut Vec<Value>) -> bool {
+    /// Moves the edge to `target` with `args` along the blocks that only jump on, or only branch on a parameter the edge makes a constant, to the first block that does more, keeping `uses` counting the edge's new arguments.
+    fn retarget(&self, func: &Function, (uses, pinned): (&mut [u32], &[bool]), target: &mut Block, args: &mut Vec<Value>) -> bool {
         let (mut at, mut values, mut seen) = (*target, args.clone(), vec![*target]);
         while let Some((next, next_values)) = self.step(func, (uses, pinned), at, &values) {
             if seen.contains(&next) {
@@ -173,17 +173,27 @@ impl Fold {
             seen.push(next);
             (at, values) = (next, next_values);
         }
-        if at == *target {
+        if at == *target || !self.agrees(func, at, &values) {
             return false;
         }
+        args.iter().for_each(|value| uses[value.index()] -= 1);
+        values.iter().for_each(|value| uses[value.index()] += 1);
         (*target, *args) = (at, values);
         true
+    }
+
+    /// Whether the parameters of `block` that an earlier round replaced stand for the values `args` gives them.
+    fn agrees(&self, func: &Function, block: Block, args: &[Value]) -> bool {
+        func.blocks[block.index()].params.iter().zip(args).all(|(param, arg)| self.subst[param.index()] == *param || self.find(*arg) == self.find(*param))
     }
 
     /// Where an edge into `block` with `args` goes next when `block` holds only a jump, or a branch on a parameter `args` makes a constant, and reads its parameters nowhere else.
     fn step(&self, func: &Function, (uses, pinned): (&[u32], &[bool]), block: Block, args: &[Value]) -> Option<(Block, Vec<Value>)> {
         let data = &func.blocks[block.index()];
         let [only] = data.insts[..] else { return None };
+        if !self.agrees(func, block, args) {
+            return None;
+        }
         let op = &func.insts[only.index()].op;
         let param = |value: &Value| data.params.iter().position(|param| param == value);
         let (next, next_args) = match op {
