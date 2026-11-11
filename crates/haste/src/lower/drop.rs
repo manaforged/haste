@@ -51,7 +51,7 @@ impl Lower<'_, '_> {
         let life = match root {
             Root::Local(_) => Life::Scope,
             Root::Temp(expr) if self.extended.contains(&expr) => Life::Extended,
-            Root::Temp(_) => Life::Statement,
+            Root::Temp(_) | Root::Held(_) => Life::Statement,
         };
         self.owned.push(Owned { root, ty, place, flag, parts, life });
         Ok(())
@@ -82,19 +82,25 @@ impl Lower<'_, '_> {
     }
 
     fn move_flag(&self, root: Root, path: &[(u32, u32)]) -> Result<Option<StackSlot>> {
-        let Some(at) = self.owner(root) else { return Ok(None) };
+        let Some(at) = self.owner(root) else {
+            return Ok(None);
+        };
         Ok(Some(match path {
             [] => self.owned[at].flag,
             _ => match self.owned[at].parts.iter().find(|(part, _)| part == path) {
                 Some(&(_, slot)) => slot,
-                None => bail!("a move out of {root:?} at {path:?} that the move analysis did not find"),
+                None => {
+                    bail!("a move out of {root:?} at {path:?} that the move analysis did not find")
+                }
             },
         }))
     }
 
     /// Marks the part `path` of `root` as moved out when every `(which, alternative)` of `when` holds.
     fn moved_out_when(&mut self, root: Root, path: &[(u32, u32)], when: &[(Value, i64)]) -> Result<()> {
-        let Some(slot) = self.move_flag(root, path)? else { return Ok(()) };
+        let Some(slot) = self.move_flag(root, path)? else {
+            return Ok(());
+        };
         let mut taken = self.ins().iconst(Type::I8, 1);
         for &(which, alternative) in when {
             let holds = self.ins().icmp_imm(IntCC::Equal, which, alternative);
@@ -149,7 +155,9 @@ impl Lower<'_, '_> {
     }
 
     fn drop_replaced(&mut self, root: Root, path: &[(u32, u32)], ty: Ty, place: Place) -> Result<bool> {
-        let Some(at) = self.owner(root) else { return Ok(false) };
+        let Some(at) = self.owner(root) else {
+            return Ok(false);
+        };
         let flag = self.owned[at].flag;
         self.guarded(flag, |lower| lower.drop_path(at, path, ty, Some(place)))?;
         Ok(true)
@@ -398,7 +406,9 @@ impl Lower<'_, '_> {
     pub(super) fn drop_fields(&mut self, ty: Ty, place: Place) -> Result<()> {
         let variants: Fields = match self.cx.types.kind(ty).clone() {
             Kind::Tuple(items) => vec![items].into(),
-            Kind::Adt(item, _) if self.cx.lang(item) == Some("manually_drop") || self.cx.item(item).1.kind == crate::outline::item::ItemKind::Union => return Ok(()),
+            Kind::Adt(item, _) if self.cx.lang(item) == Some("manually_drop") || self.cx.item(item).1.kind == crate::outline::item::ItemKind::Union => {
+                return Ok(());
+            }
             Kind::Adt(item, args) => field_types(self.cx, item, &args)?,
             _ => return Ok(()),
         };

@@ -13,6 +13,7 @@ mod outline;
 mod scripts;
 mod sema;
 mod serve;
+mod sync;
 
 use std::sync::OnceLock;
 

@@ -73,7 +73,9 @@ impl Lower<'_, '_> {
         match self.typed.derefs.get(&(expr, step)).cloned() {
             Some(Res::Fn(item, substs)) => {
                 let receiver = self.address_or_dangling(place, ty)?;
-                let Some(pointer) = self.invoke(item, &substs, vec![receiver])? else { return Ok(None) };
+                let Some(pointer) = self.invoke(item, &substs, vec![receiver])? else {
+                    return Ok(None);
+                };
                 let index = self.reached_index(item, &substs)?;
                 let ret = self.reached.list[index].1.as_ref().ok().and_then(|callee| callee.ret);
                 let Some(Kind::Ref(_, target)) = ret.map(|ret| self.cx.types.kind(ret).clone()) else { bail!("`{}` returns no reference", self.cx.name(item)) };
@@ -202,7 +204,9 @@ impl Lower<'_, '_> {
     /// The place of `expr`, holding its value in a new frame slot when it is not a place already.
     pub fn place_or_temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
         let coerced = self.typed.coercions.get(&expr);
-        if coerced.is_none() && let Some(place) = self.place_of(expr)? {
+        if coerced.is_none()
+            && let Some(place) = self.place_of(expr)?
+        {
             return Ok(Some(place));
         }
         self.temp(expr)
@@ -235,16 +239,22 @@ impl Lower<'_, '_> {
     }
 
     fn field_place(&mut self, expr: ExprId, base: ExprId, index: u32) -> Result<Option<Place>> {
-        let Some((place, ty)) = self.autoderef_place(expr, base)? else { return Ok(None) };
+        let Some((place, ty)) = self.autoderef_place(expr, base)? else {
+            return Ok(None);
+        };
         self.part_place(place, ty, (0, index)).map(Some)
     }
 
     /// The place of `base` and its type, after the dereferences that inference recorded on `expr`.
     pub(super) fn autoderef_place(&mut self, expr: ExprId, base: ExprId) -> Result<Option<(Place, Ty)>> {
-        let Some(mut place) = self.place_or_temp(base)? else { return Ok(None) };
+        let Some(mut place) = self.place_or_temp(base)? else {
+            return Ok(None);
+        };
         let mut ty = self.ty_of(base);
         for step in 0..self.typed.autoderefs.get(&expr).copied().unwrap_or(0) {
-            let Some(next) = self.deref_step((expr, step), Some(place), ty)? else { return Ok(None) };
+            let Some(next) = self.deref_step((expr, step), Some(place), ty)? else {
+                return Ok(None);
+            };
             (place, ty) = next;
         }
         Ok(Some((place, ty)))
@@ -347,7 +357,9 @@ impl Lower<'_, '_> {
                 let len = self.len(len)?;
                 return Ok(Some(self.wide_pointer(data, len)));
             }
-            let Some((inner_place, inner)) = self.deref_step((expr, step), place, ty)? else { return Ok(None) };
+            let Some((inner_place, inner)) = self.deref_step((expr, step), place, ty)? else {
+                return Ok(None);
+            };
             (place, ty) = (Some(inner_place), inner);
         }
         match adjust.autoref {

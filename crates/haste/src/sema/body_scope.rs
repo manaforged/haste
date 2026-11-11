@@ -1,17 +1,23 @@
 //! Names inside a function body: the items that its blocks and the modules it declares hold, found from the innermost scope out, as rustc resolves them.
 
-use crate::names::collect::{import_parts, namespaces};
+use anyhow::{Result, anyhow};
+use rustc_hash::FxHashMap as HashMap;
+
+use crate::body::{self as syntax, Body, Stmt, sig};
+use crate::names::collect::{extern_crate_target, import_parts, namespaces};
 use crate::names::path::{Path as NamePath, Paths};
 use crate::names::{Binding, Def, ItemRef, ModRef, Ns, Origin, PerNs, SELF, Sym, Symbols, plain};
-use crate::outline::item::{Item, ItemKind, Vis};
+use crate::outline::item::{Item, ItemKind, Items, Vis};
+use crate::outline::scan;
+use crate::outline::source::Source;
 use crate::outline::tree::{File, Index};
 
 use super::Context;
 
 /// Where a path written inside a body leads.
 pub(super) enum BodyPath {
-    /// An item that the body declares.
-    Item(ItemRef),
+    /// A definition that the body declares or links through `extern crate`.
+    Def(Def),
     /// An enum that the body declares, whose variant the last segment names.
     Variant(ItemRef),
     /// Out of the body's modules through `super`: the rest of the path, after this many segments, resolves from the home module.
@@ -24,7 +30,7 @@ pub(super) fn outside<'p>(path: &NamePath<'p>, skip: usize) -> NamePath<'p> {
 }
 
 fn in_namespace(entry: &Item, ns: Ns) -> bool {
-    if entry.kind == ItemKind::Mod { ns == Ns::Types } else { namespaces(entry).contains(&ns) }
+    if matches!(entry.kind, ItemKind::Mod | ItemKind::ExternCrate) { ns == Ns::Types } else { namespaces(entry).contains(&ns) }
 }
 
 impl<'a> Context<'a> {
@@ -32,12 +38,23 @@ impl<'a> Context<'a> {
         self.expansion(root).map_or(&[][..], |found| &found.file.items.items[..])
     }
 
-    /// The item named `name`, in namespace `ns` or any when none, that the body item `level` of `root`, or the body itself when none, holds directly or in an extern block.
-    fn body_child(&self, root: ItemRef, level: Option<u32>, name: &str, ns: Option<Ns>) -> Option<ItemRef> {
+    /// The item named `name`, in namespace `ns` or any when none, that the body item `level` of `root`, or the body itself when none, holds directly or in an extern block, visible at body item `from`.
+    fn body_child(&self, root: ItemRef, level: Option<u32>, from: Option<u32>, name: &str, ns: Option<Ns>) -> Option<ItemRef> {
         let found = self.expansion(root)?;
         let items = &found.file.items.items;
         let held = self.body_index(&found.file).items.get(&level)?.get(name)?;
-        held.iter().find(|&&at| ns.is_none_or(|ns| in_namespace(&items[at as usize], ns))).map(|&at| root.inner(at))
+        let matches = |at: u32| ns.is_none_or(|ns| in_namespace(&items[at as usize], ns));
+        if level.is_some_and(|at| items[at as usize].kind == ItemKind::Mod) || from.is_none() {
+            return held.iter().copied().find(|&at| matches(at)).map(|at| root.inner(at));
+        }
+        let mut cur = from.and_then(|at| found.item_scopes.get(at as usize).copied());
+        while let Some(scope) = cur {
+            if let Some(&at) = held.iter().rev().find(|&&at| found.item_scopes.get(at as usize) == Some(&scope) && matches(at)) {
+                return Some(root.inner(at));
+            }
+            cur = found.scopes.get(scope as usize).copied().flatten();
+        }
+        None
     }
 
     /// The name index of the body expansion `file`, made on first use and kept with it.
@@ -51,7 +68,7 @@ impl<'a> Context<'a> {
         let mut level = from;
         loop {
             let searched = level.is_none_or(|at| !matches!(items[at as usize].kind, ItemKind::Impl | ItemKind::Trait));
-            if searched && let Some(found) = self.body_child(root, level, name, ns) {
+            if searched && let Some(found) = self.body_child(root, level, from, name, ns) {
                 return Some(found);
             }
             match level {
@@ -108,20 +125,47 @@ impl<'a> Context<'a> {
 
     fn body_descend(&self, root: ItemRef, mut at: u32, rest: &[&str], ns: Ns) -> Option<BodyPath> {
         let items = self.body_entries(root);
+        if items[at as usize].kind == ItemKind::ExternCrate {
+            return self.extern_descend(root, at, rest, ns);
+        }
         for (index, name) in rest.iter().enumerate() {
             let last = index + 1 == rest.len();
             match items[at as usize].kind {
                 ItemKind::Enum if last => return Some(BodyPath::Variant(root.inner(at))),
-                ItemKind::Mod => at = self.body_child(root, Some(at), name, Some(if last { ns } else { Ns::Types }))?.outer()?.1,
+                ItemKind::Mod => {
+                    let next = self.body_child(root, Some(at), None, name, Some(if last { ns } else { Ns::Types }))?.outer()?.1;
+                    if items[next as usize].kind == ItemKind::ExternCrate {
+                        return self.extern_descend(root, next, &rest[index + 1..], ns);
+                    }
+                    at = next;
+                }
                 _ => return None,
             }
         }
-        Some(BodyPath::Item(root.inner(at)))
+        Some(BodyPath::Def(Def::Item(root.inner(at))))
+    }
+
+    fn extern_descend(&self, root: ItemRef, at: u32, rest: &[&str], ns: Ns) -> Option<BodyPath> {
+        let found = self.expansion(root)?;
+        let item = &found.file.items.items[at as usize];
+        let deps = &self.outline.deps[root.krate as usize];
+        let mut def = Def::Module(extern_crate_target(&found.file.source, item, root.krate, deps)?);
+        if rest.is_empty() {
+            return (ns == Ns::Types).then_some(BodyPath::Def(def));
+        }
+        for (index, name) in rest.iter().enumerate() {
+            let entry = self.path_member(root.krate, def, self.names.symbols.intern(name));
+            let binding = if index + 1 == rest.len() { entry.get(ns) } else { entry.types };
+            def = binding?.def;
+        }
+        Some(BodyPath::Def(def))
     }
 
     /// The bindings that the `use` declarations of the body `root` in module `home` give `word`, or every name they import when none, as code at token `here` sees them: named imports first, then globs.
     pub(super) fn body_imports(&self, (root, home): (ItemRef, ModRef), word: Option<Sym>, here: Option<u32>) -> Vec<PerNs> {
-        let Some(found) = self.expansion(root) else { return Vec::new() };
+        let Some(found) = self.expansion(root) else {
+            return Vec::new();
+        };
         let file = &found.file;
         if file.items.imports.is_empty() {
             return Vec::new();
@@ -150,16 +194,17 @@ impl<'a> Context<'a> {
         let (segments, absolute, dollar, name) = import_parts(file, import, &self.names.symbols);
         let segments = segments.strip_suffix(&[SELF]).unwrap_or(&segments);
         let absolute = paths.use_path(NamePath { segments, absolute, dollar }).absolute;
+        let from = file.items.items[file.items.imports[import as usize].item as usize].parent;
         let (head, leaf) = match (name, segments.split_last(), word) {
             (None, _, Some(word)) => (segments, word),
             (Some(_), Some((&leaf, head)), _) => (head, leaf),
             (None, Some(_), None) => {
-                let def = paths.resolve(&NamePath { segments, absolute, dollar }, home)?;
+                let path = NamePath { segments, absolute, dollar };
+                let def = self.local_path(Some((root, from)), &path, Ns::Types).and_then(|found| self.body_binding(Some(found), "").map(|binding| binding.def)).or_else(|| paths.resolve(&path, home))?;
                 return Some((false, PerNs { types: Some(Binding { def, vis: Vis::Pub, origin: Origin::Glob }), values: None, macros: None }));
             }
             _ => return None,
         };
-        let from = file.items.items[file.items.imports[import as usize].item as usize].parent;
         let local = if absolute { None } else { self.body_import(root, from, head, leaf) };
         let entry = match head {
             _ if let Some(local) = local => local,
@@ -182,7 +227,12 @@ impl<'a> Context<'a> {
 
     /// The bindings of `name` inside `def`, an enum's variants or a module's items, for a path of crate `krate`, where a body may declare `def`.
     pub(super) fn path_member(&self, krate: u32, def: Def, name: Sym) -> PerNs {
-        let Some((root, at)) = (match def { Def::Item(item) => item.outer(), _ => None }) else { return self.paths(krate).member(def, name) };
+        let Some((root, at)) = (match def {
+            Def::Item(item) => item.outer(),
+            _ => None,
+        }) else {
+            return self.paths(krate).member(def, name);
+        };
         let text = self.names.symbols.text(name);
         let found = |ns| self.body_binding(self.body_descend(root, at, &[text], ns), text);
         PerNs { types: found(Ns::Types), values: found(Ns::Values), macros: None }
@@ -191,7 +241,7 @@ impl<'a> Context<'a> {
     /// The binding of the body item or enum variant `name` that `path` reached.
     fn body_binding(&self, path: Option<BodyPath>, name: &str) -> Option<Binding> {
         let def = match path? {
-            BodyPath::Item(item) => Def::Item(item),
+            BodyPath::Def(def) => def,
             BodyPath::Variant(item) => self.body_variant(item, name)?,
             BodyPath::Outside(_) => return None,
         };
@@ -246,4 +296,245 @@ fn index_of(file: &File, symbols: &Symbols) -> Index {
         index.holders.push(fns.iter().copied().filter(|&at| holds(&items[at as usize], start)).collect());
     }
     index
+}
+
+pub(super) fn parse_in(src: &Source, config: syntax::Config<'_>, entry: &Item) -> Result<Body> {
+    match (entry.kind, entry.name) {
+        (ItemKind::Const | ItemKind::Static, Some(name)) => {
+            let from = sig::initializer(src, name, entry.end).ok_or_else(|| anyhow!("constant {} has no value", src.text(name)))?;
+            syntax::parse_expr(src, from, entry.end - 1, config)
+        }
+        _ => syntax::parse(src, entry.body.ok_or_else(|| anyhow!("function {} has no body", src.text(entry.name.unwrap_or(entry.start))))?, config),
+    }
+}
+
+/// The items that `body` declares, and those that the bodies of its functions and constants declare in turn, with their block scopes.
+pub(super) fn declared(source: &Source, config: syntax::Config<'_>, body: &Body) -> Result<(Items, Vec<Option<u32>>, Vec<u32>)> {
+    let mut items = Items::default();
+    let mut scopes = vec![None];
+    let mut item_scopes = Vec::new();
+    let starts = body_starts(body, 0, &mut scopes).into_iter().map(|(at, scope)| (at, None, scope)).collect();
+    scan_nested(source, config, starts, &mut items, &mut scopes, &mut item_scopes)?;
+    Ok((items, scopes, item_scopes))
+}
+
+pub(super) fn scan_nested(source: &Source, config: syntax::Config<'_>, mut starts: Vec<(u32, Option<u32>, u32)>, items: &mut Items, scopes: &mut Vec<Option<u32>>, item_scopes: &mut Vec<u32>) -> Result<()> {
+    while !starts.is_empty() {
+        let first = items.items.len();
+        let by_lead: HashMap<u32, u32> = starts.iter().map(|&(at, _, scope)| (at, scope)).collect();
+        let pairs = std::mem::take(&mut starts).into_iter().map(|(at, owner, _)| (at, owner));
+        *items = scan::body_items(source, pairs, (std::mem::take(items), config.calls))?;
+        for entry in &items.items[first..] {
+            let scope = by_lead.get(&entry.lead).copied().or_else(|| entry.parent.map(|parent| item_scopes[parent as usize])).unwrap_or(0);
+            item_scopes.push(scope);
+        }
+        for index in first..items.items.len() {
+            let entry = &items.items[index];
+            let has_body = matches!(entry.kind, ItemKind::Const | ItemKind::Static) || (entry.kind == ItemKind::Fn && entry.body.is_some());
+            if has_body && let Ok(inner) = parse_in(source, config, entry) {
+                starts.extend(body_starts(&inner, item_scopes[index], scopes).into_iter().map(|(at, scope)| (at, Some(index as u32), scope)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn body_starts(body: &Body, base: u32, scopes: &mut Vec<Option<u32>>) -> Vec<(u32, u32)> {
+    let mut starts = Vec::new();
+    if let Some(root) = body.root {
+        ScopeWalk { body, scopes, starts: &mut starts }.expr(root, base);
+    }
+    starts
+}
+
+struct ScopeWalk<'b> {
+    body: &'b Body,
+    scopes: &'b mut Vec<Option<u32>>,
+    starts: &'b mut Vec<(u32, u32)>,
+}
+
+impl ScopeWalk<'_> {
+    fn expr_list(&mut self, list: syntax::List, scope: u32) {
+        for &id in self.body.list(list) {
+            self.expr(syntax::ExprId(id), scope);
+        }
+    }
+
+    fn expr(&mut self, id: syntax::ExprId, scope: u32) {
+        use syntax::{BlockKind, Expr};
+        match *self.body.expr(id) {
+            Expr::Block { stmts, tail, kind, .. } => {
+                let inner = if kind == BlockKind::Expansion {
+                    scope
+                } else {
+                    let next = self.scopes.len() as u32;
+                    self.scopes.push(Some(scope));
+                    next
+                };
+                for &stmt in self.body.list(stmts) {
+                    self.stmt(stmt, inner);
+                }
+                if let Some(tail) = tail {
+                    self.expr(tail, inner);
+                }
+            }
+            Expr::If(cond, then, otherwise) => {
+                self.expr(cond, scope);
+                self.expr(then, scope);
+                if let Some(otherwise) = otherwise {
+                    self.expr(otherwise, scope);
+                }
+            }
+            Expr::Match(scrutinee, arms) => {
+                self.expr(scrutinee, scope);
+                for &arm in self.body.list(arms) {
+                    let arm = self.body.arms[arm as usize];
+                    self.pat(arm.pat, scope);
+                    if let Some(guard) = arm.guard {
+                        self.expr(guard, scope);
+                    }
+                    self.expr(arm.body, scope);
+                }
+            }
+            other => self.expr_compound(other, scope),
+        }
+    }
+
+    fn expr_compound(&mut self, expr: syntax::Expr, scope: u32) {
+        use syntax::Expr;
+        match expr {
+            Expr::Unary(_, a) | Expr::Field(a, _) | Expr::TupleField(a, _) | Expr::Ref { expr: a, .. } | Expr::Loop { body: a, .. } | Expr::Try(a) | Expr::Await(a) | Expr::Become(a) | Expr::Paren(a) => {
+                self.expr(a, scope);
+            }
+            Expr::Binary(_, a, b) | Expr::Assign(a, b) | Expr::AssignOp(_, a, b) | Expr::Index(a, b) | Expr::While { cond: a, body: b, .. } | Expr::Repeat(a, b) => {
+                self.expr(a, scope);
+                self.expr(b, scope);
+            }
+            Expr::Let(pat, init) => {
+                self.pat(pat, scope);
+                self.expr(init, scope);
+            }
+            Expr::For { pat, iter, body, .. } => {
+                self.pat(pat, scope);
+                self.expr(iter, scope);
+                self.expr(body, scope);
+            }
+            Expr::Closure { params, ret, body, .. } => {
+                for &param in self.body.list(params) {
+                    let param = self.body.params[param as usize];
+                    self.pat(param.pat, scope);
+                    if let Some(ty) = param.ty {
+                        self.ty(ty, scope);
+                    }
+                }
+                if let Some(ret) = ret {
+                    self.ty(ret, scope);
+                }
+                self.expr(body, scope);
+            }
+            other => self.expr_leaf(other, scope),
+        }
+    }
+
+    fn expr_leaf(&mut self, expr: syntax::Expr, scope: u32) {
+        use syntax::Expr;
+        match expr {
+            Expr::Call(callee, args) => {
+                self.expr(callee, scope);
+                self.expr_list(args, scope);
+            }
+            Expr::Method { receiver, params, .. } => {
+                self.expr(receiver, scope);
+                self.expr_list(params, scope);
+            }
+            Expr::Tuple(list) | Expr::Array(list) => self.expr_list(list, scope),
+            Expr::Struct { fields, base, .. } => {
+                for &field in self.body.list(fields) {
+                    self.expr(self.body.fields[field as usize].value, scope);
+                }
+                if let Some(base) = base {
+                    self.expr(base, scope);
+                }
+            }
+            Expr::Range { from, to, .. } => {
+                if let Some(from) = from {
+                    self.expr(from, scope);
+                }
+                if let Some(to) = to {
+                    self.expr(to, scope);
+                }
+            }
+            Expr::Cast(inner, ty) => {
+                self.expr(inner, scope);
+                self.ty(ty, scope);
+            }
+            Expr::Return(Some(a)) | Expr::Break(_, Some(a)) | Expr::Yield(Some(a)) => self.expr(a, scope),
+            _ => {}
+        }
+    }
+
+    fn stmt(&mut self, index: u32, scope: u32) {
+        match self.body.stmts[index as usize] {
+            Stmt::Item(start, _) => self.starts.push((start, scope)),
+            Stmt::Expr(expr, _) => self.expr(expr, scope),
+            Stmt::Let { pat, ty, init, otherwise, .. } => {
+                self.pat(pat, scope);
+                if let Some(ty) = ty {
+                    self.ty(ty, scope);
+                }
+                if let Some(init) = init {
+                    self.expr(init, scope);
+                }
+                if let Some(otherwise) = otherwise {
+                    self.expr(otherwise, scope);
+                }
+            }
+            Stmt::Macro { .. } | Stmt::Empty => {}
+        }
+    }
+
+    fn pat(&mut self, id: syntax::PatId, scope: u32) {
+        use syntax::Pat;
+        match *self.body.pat(id) {
+            Pat::Lit(expr) => self.expr(expr, scope),
+            Pat::Range { from, to, .. } => {
+                if let Some(from) = from {
+                    self.expr(from, scope);
+                }
+                if let Some(to) = to {
+                    self.expr(to, scope);
+                }
+            }
+            Pat::Bind { sub: Some(inner), .. } | Pat::Ref { pat: inner, .. } | Pat::Box(inner) | Pat::Paren(inner) | Pat::Deref(inner) => self.pat(inner, scope),
+            Pat::TupleStruct(_, list) | Pat::Tuple(list) | Pat::Slice(list) | Pat::Or(list) => {
+                for &pat in self.body.list(list) {
+                    self.pat(syntax::PatId(pat), scope);
+                }
+            }
+            Pat::Struct { fields, .. } => {
+                for &field in self.body.list(fields) {
+                    self.pat(self.body.field_pats[field as usize].pat, scope);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn ty(&mut self, id: syntax::TyId, scope: u32) {
+        use syntax::Ty;
+        match *self.body.ty(id) {
+            Ty::Array(inner, len) => {
+                self.ty(inner, scope);
+                self.expr(len, scope);
+            }
+            Ty::Const(expr) => self.expr(expr, scope),
+            Ty::Ref { ty: inner, .. } | Ty::Ptr { ty: inner, .. } | Ty::Slice(inner) | Ty::Paren(inner) | Ty::Pat(inner, _) => self.ty(inner, scope),
+            Ty::Tuple(list) => {
+                for &ty in self.body.list(list) {
+                    self.ty(syntax::TyId(ty), scope);
+                }
+            }
+            _ => {}
+        }
+    }
 }

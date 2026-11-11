@@ -57,21 +57,21 @@ impl<'a> Infer<'_, 'a> {
         if let Some(pick) = self.opaque_pick(steps[0], name)? {
             return self.picked(expr, (pick, 0), params, expected);
         }
-        match self.probe_steps((expr, found), name, &steps)? {
+        match self.probe_steps((expr, found), name, &steps, expected)? {
             Some((pick, derefs)) => self.picked(expr, (pick, derefs), params, expected),
             None => Err(self.no_method(steps[steps.len() - 1], found, (name, at))),
         }
     }
 
     /// The method `name` that the first of `steps` to have one picks, and how many references it reads through.
-    fn probe_steps(&mut self, (expr, found): (ExprId, Ty), name: &str, steps: &[Ty]) -> Result<Option<(Pick, u32)>> {
+    fn probe_steps(&mut self, (expr, found): (ExprId, Ty), name: &str, steps: &[Ty], expected: Option<Ty>) -> Result<Option<(Pick, u32)>> {
         let traits = self.trait_candidates(name, steps)?;
         let mut candidates = Vec::new();
         for &step in steps {
             self.candidates(step, name, &mut candidates)?;
         }
         for (derefs, &step) in steps.iter().enumerate() {
-            if let Some(pick) = self.probe_step(step, (&candidates, &traits))? {
+            if let Some(pick) = self.probe_step(step, (&candidates, &traits), expected)? {
                 if pick.autoref == Some(Mut::Mut) {
                     self.steps_mutably(expr, found, derefs as u32)?;
                 }
@@ -103,38 +103,62 @@ impl<'a> Infer<'_, 'a> {
         Ok(None)
     }
 
-    fn probe_step(&mut self, step: Ty, (candidates, traits): (&[Candidate], &[TraitCandidate])) -> Result<Option<Pick>> {
-        let (bounded, unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits.iter().partition(|candidate| candidate.bound.is_some());
+    fn probe_step(&mut self, step: Ty, (candidates, traits): (&[Candidate], &[TraitCandidate]), expected: Option<Ty>) -> Result<Option<Pick>> {
+        let (bounded, all_unbounded): (Vec<TraitCandidate>, Vec<TraitCandidate>) = traits.iter().partition(|candidate| candidate.bound.is_some());
         let step_ty = self.substitute(step);
+        let is_var = matches!(self.cx.types.kind(self.resolve(step)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_));
         let bounded_at: Vec<TraitCandidate> = bounded.iter().map(|candidate| TraitCandidate { bound: candidate.bound.map(|bound| self.substitute(bound)), ..*candidate }).collect();
-        let unbounded: Vec<TraitCandidate> = unbounded.into_iter().filter(|candidate| !shadowed(&bounded_at, candidate.of, step_ty)).collect();
+        let wanted = self.known(expected);
+        let unshadowed: Vec<TraitCandidate> = all_unbounded.iter().copied().filter(|candidate| !shadowed(&bounded_at, candidate.of, step_ty)).collect();
         for autoref in [None, Some(Mut::Not), Some(Mut::Mut)] {
-            let adjusted = match autoref {
-                None => step,
-                Some(mutability) => self.cx.types.intern(Kind::Ref(mutability, step)),
-            };
-            if let Some(pick) = self.probe_traits(&bounded, (adjusted, autoref))? {
-                return Ok(Some(pick));
+            if autoref.is_some() && is_var {
+                continue;
             }
-            for &candidate in candidates {
-                if let Some((args, own)) = self.try_receiver(candidate, adjusted)? {
-                    return Ok(Some(Pick { item: candidate.item, args, own, autoref }));
-                }
-            }
-            if let Some(pick) = self.probe_traits(&unbounded, (adjusted, autoref))? {
+            if let Some(pick) = self.probe_adjusted(step, autoref, candidates, (&bounded, &all_unbounded, &unshadowed), wanted)? {
                 return Ok(Some(pick));
             }
         }
         Ok(None)
     }
 
-    fn probe_traits(&mut self, traits: &[TraitCandidate], (adjusted, autoref): (Ty, Option<Mut>)) -> Result<Option<Pick>> {
+    fn probe_adjusted(&mut self, step: Ty, autoref: Option<Mut>, candidates: &[Candidate], (bounded, all_unbounded, unshadowed): (&[TraitCandidate], &[TraitCandidate], &[TraitCandidate]), wanted: Option<Ty>) -> Result<Option<Pick>> {
+        let adjusted = autoref.map_or(step, |mutability| self.cx.types.intern(Kind::Ref(mutability, step)));
+        let mut bypassed = false;
+        if let Some(pick) = self.probe_traits(bounded, (adjusted, autoref), true)? {
+            if all_unbounded.is_empty() || wanted.is_none_or(|wanted| self.fits_expected(&pick, wanted)) {
+                return Ok(Some(pick));
+            }
+            bypassed = true;
+        }
+        for &candidate in candidates {
+            if let Some((args, own)) = self.try_receiver(candidate, adjusted)? {
+                return Ok(Some(Pick { item: candidate.item, args, own, autoref }));
+            }
+        }
+        let pool = if bypassed { all_unbounded } else { unshadowed };
+        self.probe_traits(pool, (adjusted, autoref), !bypassed)
+    }
+
+    fn probe_traits(&mut self, traits: &[TraitCandidate], (adjusted, autoref): (Ty, Option<Mut>), use_bounds: bool) -> Result<Option<Pick>> {
         for &candidate in traits {
-            if let Some((item, args)) = self.try_trait(candidate, adjusted)? {
+            if let Some((item, args)) = self.try_trait(candidate, adjusted, use_bounds)? {
                 return Ok(Some(Pick { item, args, own: Vec::new(), autoref }));
             }
         }
         Ok(None)
+    }
+
+    fn fits_expected(&mut self, pick: &Pick, wanted: Ty) -> bool {
+        self.probe(|infer| {
+            let Ok(own) = infer.own_args(pick.item, Vec::new()) else {
+                return true;
+            };
+            let substs: Vec<Ty> = pick.args.iter().copied().chain(own).collect();
+            let Ok((_, ret)) = infer.fn_types(pick.item, &substs) else {
+                return true;
+            };
+            infer.unifies(ret, wanted) || infer.coerces_to(ret, wanted)
+        })
     }
 
     fn next_step(&mut self, expr: ExprId, derefs: u32, step: Ty) -> Result<Option<Ty>> {
@@ -150,12 +174,16 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn candidates(&mut self, step: Ty, name: &str, found: &mut Vec<Candidate>) -> Result<()> {
-        let Some(head) = head(self.cx.types.kind(step)) else { return Ok(()) };
+        let Some(head) = head(self.cx.types.kind(step)) else {
+            return Ok(());
+        };
         for block in self.cx.inherent(head) {
             if found.iter().any(|candidate| candidate.block == block) {
                 continue;
             }
-            let Some(item) = self.cx.member(block, name) else { continue };
+            let Some(item) = self.cx.member(block, name) else {
+                continue;
+            };
             if let Some((kind, _)) = self.cx.signature(item)?.receiver {
                 found.push(Candidate { block, item, kind });
             }
@@ -166,10 +194,13 @@ impl<'a> Infer<'_, 'a> {
     fn trait_candidates(&mut self, name: &str, steps: &[Ty]) -> Result<Vec<TraitCandidate>> {
         let mut found = Vec::new();
         let mut traits = self.cx.traits_in_scope(self.home);
-        let principals: Vec<ItemRef> = steps.iter().filter_map(|&step| match self.cx.types.kind(step) {
-            Kind::Dyn(of, ..) => Some(*of),
-            _ => None,
-        }).collect();
+        let principals: Vec<ItemRef> = steps
+            .iter()
+            .filter_map(|&step| match self.cx.types.kind(step) {
+                Kind::Dyn(of, ..) => Some(*of),
+                _ => None,
+            })
+            .collect();
         let bounded = self.bound_candidates(name, steps)?;
         let current = self.current_trait();
         for local in self.body_traits().into_iter().chain(principals).chain(current) {
@@ -180,8 +211,12 @@ impl<'a> Infer<'_, 'a> {
         let scoped = traits.len();
         traits.extend(bounded.iter().map(|&(of, _)| of).filter(|of| !traits[..scoped].contains(of)).collect::<Vec<_>>());
         for (at, of) in traits.into_iter().enumerate() {
-            let Some(item) = self.cx.trait_member(of, name) else { continue };
-            let Some((kind, _)) = self.cx.signature(item)?.receiver else { continue };
+            let Some(item) = self.cx.trait_member(of, name) else {
+                continue;
+            };
+            let Some((kind, _)) = self.cx.signature(item)?.receiver else {
+                continue;
+            };
             if let Some(&(_, param)) = bounded.iter().find(|&&(bounded, _)| bounded == of) {
                 found.push(TraitCandidate { of, item, kind, bound: Some(param) });
             }
@@ -238,41 +273,57 @@ impl<'a> Infer<'_, 'a> {
         let Some(of) = self.cx.owner_trait(method) else { bail!("{} is not a trait method", self.cx.name(method)) };
         let Some((kind, _)) = self.cx.signature(method)?.receiver else { bail!("{} takes no `self`", self.cx.name(method)) };
         let candidate = TraitCandidate { of, item: method, kind, bound: None };
-        let found = match self.try_trait(candidate, receiver)? {
+        let found = match self.try_trait(candidate, receiver, true)? {
             None if pending => self.pending_trait(candidate, receiver)?,
             found => found,
         };
-        let Some((item, mut substs)) = found else { return Ok(None) };
+        let Some((item, mut substs)) = found else {
+            return Ok(None);
+        };
         let own = type_params(&self.cx.signature(item)?.generics).count();
         substs.extend((0..own).map(|_| self.fresh(Kind::Var)));
         Ok(Some((item, substs)))
     }
 
-    fn try_trait(&mut self, candidate: TraitCandidate, adjusted: Ty) -> Result<Option<(ItemRef, Vec<Ty>)>> {
-        let self_ty = match candidate.kind {
-            SelfKind::Typed(ty) => self.typed_self(candidate, ty, adjusted)?,
-            _ => self.trait_self(candidate, adjusted),
-        };
-        let Some(self_ty) = self_ty else { return Ok(None) };
-        if candidate.bound.is_some_and(|bound| self.substitute(bound) != self.substitute(self_ty)) {
+    fn try_trait(&mut self, candidate: TraitCandidate, adjusted: Ty, use_bounds: bool) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        let Some(self_ty) = self.candidate_self(candidate, adjusted)? else {
             return Ok(None);
-        }
+        };
         let args = self.fresh_trait_args(candidate.of)?;
-        if candidate.bound.is_some() || !args.is_empty() {
+        if use_bounds && (candidate.bound.is_some() || !args.is_empty()) {
             self.assume(candidate.of, &std::iter::once(self_ty).chain(args.iter().copied()).collect::<Vec<_>>())?;
         }
         if self.compiler_impl(candidate.of, self_ty) || self.object_holds(candidate.of, self_ty, &args) == Some(true) {
             return Ok(Some((candidate.item, std::iter::once(self_ty).chain(args).collect())));
         }
-        let Some(selected) = self.trial(|infer| infer.select(candidate.of, self_ty, &args))? else { return self.unselected_trait(candidate, self_ty, args) };
+        if candidate.kind == SelfKind::Value && matches!(self.cx.types.kind(self_ty), Kind::Dyn(..)) {
+            return Ok(None);
+        }
+        self.select_trait_member(candidate, self_ty, args)
+    }
+
+    fn select_trait_member(&mut self, candidate: TraitCandidate, self_ty: Ty, args: Vec<Ty>) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        let Some(selected) = self.trial(|infer| infer.select(candidate.of, self_ty, &args))? else {
+            return self.unselected_trait(candidate, self_ty, args);
+        };
         Ok(Some(match self.impl_member(candidate.of, (self_ty, &args), selected, self.cx.name(candidate.item))? {
             Some((item, (_, impl_args))) => (item, impl_args),
             None => (candidate.item, std::iter::once(self_ty).chain(args).collect()),
         }))
     }
 
+    fn candidate_self(&mut self, candidate: TraitCandidate, adjusted: Ty) -> Result<Option<Ty>> {
+        let self_ty = match candidate.kind {
+            SelfKind::Typed(ty) => self.typed_self(candidate, ty, adjusted)?,
+            _ => self.trait_self(candidate, adjusted),
+        };
+        Ok(self_ty.filter(|&self_ty| candidate.bound.is_none_or(|bound| self.substitute(bound) == self.substitute(self_ty))))
+    }
+
     fn pending_trait(&mut self, candidate: TraitCandidate, receiver: Ty) -> Result<Option<(ItemRef, Vec<Ty>)>> {
-        let Some(self_ty) = self.trait_self(candidate, receiver) else { return Ok(None) };
+        let Some(self_ty) = self.trait_self(candidate, receiver) else {
+            return Ok(None);
+        };
         if !matches!(self.cx.types.kind(self.resolve(self_ty)), Kind::Var(_)) {
             return Ok(None);
         }
@@ -304,7 +355,12 @@ impl<'a> Infer<'_, 'a> {
 
     fn trait_self(&mut self, candidate: TraitCandidate, adjusted: Ty) -> Option<Ty> {
         let self_ty = match (candidate.kind, self.cx.types.kind(adjusted).clone()) {
-            (SelfKind::Value, Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str)) => return None,
+            (SelfKind::Value, Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str)) => {
+                return None;
+            }
+            (SelfKind::Value, Kind::Adt(item, _)) if self.cx.foreign(item) || self.cx.is_unsized(adjusted).unwrap_or(false) => {
+                return None;
+            }
             (SelfKind::Value, _) => adjusted,
             (SelfKind::Ref, Kind::Ref(Mut::Not, inner)) | (SelfKind::RefMut, Kind::Ref(Mut::Mut, inner)) => inner,
             _ => return None,

@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use anyhow::{Result, bail};
 
 use crate::body::{Body, Bound, PathId, Ty as SyntaxTy};
@@ -34,12 +36,12 @@ impl<'a> Infer<'_, 'a> {
     pub fn select(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<Option<Picked>> {
         let key = self.selection_key(of, self_ty, args);
         if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
-            return Ok(found.clone());
+            return Ok(found);
         }
-        let before = (self.cx.asks.mark(), self.projections.len(), self.obligations.len());
+        let before = self.unsettled();
         let picked = self.select_at(of, self_ty, args, 0)?;
         let Some(key) = key else { return Ok(picked) };
-        let settled = (self.cx.asks.mark(), self.projections.len(), self.obligations.len()) == before;
+        let settled = self.unsettled() == before;
         let kept = match &picked {
             None => Some(None),
             Some((block, impl_args)) => {
@@ -67,7 +69,9 @@ impl<'a> Infer<'_, 'a> {
 
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
         let found = self.applicable(of, self_ty, args, depth)?;
-        let Ok([(picked, vars)]) = <[_; 1]>::try_from(found) else { return Ok(None) };
+        let Ok([(picked, vars)]) = <[_; 1]>::try_from(found) else {
+            return Ok(None);
+        };
         self.adopt(vars);
         Ok(Some(picked))
     }
@@ -133,7 +137,9 @@ impl<'a> Infer<'_, 'a> {
         if found.len() > 1 {
             found = self.most_specialized(found)?;
         }
-        let Some((picked, vars)) = found.into_iter().next() else { return Ok(None) };
+        let Some((picked, vars)) = found.into_iter().next() else {
+            return Ok(None);
+        };
         self.adopt(vars);
         Ok(Some(picked))
     }
@@ -143,7 +149,9 @@ impl<'a> Infer<'_, 'a> {
         if let Some(member) = self.cx.member(picked.0, name) {
             return Ok(Some((member, picked)));
         }
-        let Some(general) = self.defining_impl(of, self_ty, args, name)? else { return Ok(None) };
+        let Some(general) = self.defining_impl(of, self_ty, args, name)? else {
+            return Ok(None);
+        };
         Ok(self.cx.member(general.0, name).map(|member| (member, general)))
     }
 
@@ -257,12 +265,16 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn impl_applies(&mut self, block: ImplRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Vec<Ty>>> {
-        let Some(impl_args) = self.match_trait_impl(block, self_ty, args)? else { return Ok(None) };
+        let Some(impl_args) = self.match_trait_impl(block, self_ty, args)? else {
+            return Ok(None);
+        };
         Ok(self.bounds_hold(block, &impl_args, depth)?.then_some(impl_args))
     }
 
     fn match_trait_impl(&mut self, block: ImplRef, self_ty: Ty, args: &[Ty]) -> Result<Option<Vec<Ty>>> {
-        let Some(impl_args) = self.match_impl(block, self_ty) else { return Ok(None) };
+        let Some(impl_args) = self.match_impl(block, self_ty) else {
+            return Ok(None);
+        };
         let given = self.impl_trait_args(block, &impl_args, self_ty)?;
         if given.len() != args.len() {
             bail!("an impl gives {} trait arguments where {} are wanted", given.len(), args.len());
@@ -299,13 +311,26 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The arguments `given` to trait `of` for `self_ty`, completed with the trait's defaults.
-    pub fn trait_args(&mut self, of: ItemRef, mut given: Vec<Ty>, self_ty: Ty) -> Result<Vec<Ty>> {
+    pub fn trait_args(&mut self, of: ItemRef, given: Vec<Ty>, self_ty: Ty) -> Result<Vec<Ty>> {
+        self.fill_trait_args(of, given, self_ty, false)
+    }
+
+    pub(super) fn fill_trait_args(&mut self, of: ItemRef, mut given: Vec<Ty>, self_ty: Ty, fresh: bool) -> Result<Vec<Ty>> {
         let def = self.cx.trait_generics(of)?;
         let params: Vec<_> = type_params(&def.1.params).copied().collect();
+        if given.len() > params.len() {
+            bail!("`{}` takes {} type arguments, {} given", self.cx.name(of), params.len(), given.len());
+        }
         for param in params.iter().skip(given.len()) {
-            let Some(default) = param.default else { bail!("`{}` needs {} type arguments", self.cx.name(of), params.len()) };
-            let frame = self.item_frame(of, (&params, &given), (Some(self_ty), None))?;
-            given.push(self.with_frame(frame, |infer| infer.lower_ty(&def.0, default))?);
+            let arg = match param.default {
+                Some(default) => {
+                    let frame = self.item_frame(of, (&params, &given), (Some(self_ty), None))?;
+                    self.with_frame(frame, |infer| infer.ty_or_const_arg(&def.0, default))?
+                }
+                None if fresh => self.fresh(Kind::Var),
+                None => bail!("`{}` needs {} type arguments", self.cx.name(of), params.len()),
+            };
+            given.push(arg);
         }
         Ok(given)
     }
@@ -339,7 +364,9 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn bound_holds(&mut self, arena: &Body, home: ModRef, (ty, bound): (Ty, u32), depth: u32) -> Result<bool> {
-        let Some((of, path)) = self.bound_trait_at(arena, bound, home) else { return Ok(true) };
+        let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
+            return Ok(true);
+        };
         if self.compiler_decides(of, ty) {
             return Ok(self.compiler_holds(of, ty));
         }
@@ -352,7 +379,9 @@ impl<'a> Infer<'_, 'a> {
             return self.assoc_bounds_hold((arena, home, path), (of, ty, &args), depth);
         }
         if self.is_callable_trait(of) && matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
-            let Some(sig) = self.fn_bound(arena, home, bound)? else { return Ok(true) };
+            let Some(sig) = self.fn_bound(arena, home, bound)? else {
+                return Ok(true);
+            };
             return Ok(self.tie_callable(ty, sig).is_ok());
         }
         let args = self.bound_args(of, arena, path, ty)?;
@@ -398,15 +427,57 @@ impl<'a> Infer<'_, 'a> {
         self.has_vars(ty) || args.iter().any(|&arg| self.has_vars(arg))
     }
 
-    /// The obligation `ty: of<args>` spelled with every unbound inference variable alike, so a nested obligation that repeats an enclosing one is a cycle: rustc's evaluator treats it as ambiguous when it has variables and as failing when it has none.
-    fn query(&self, of: ItemRef, ty: Ty, args: &[Ty]) -> String {
-        let shown: Vec<String> = std::iter::once(ty).chain(args.iter().copied()).map(|ty| self.show(ty)).collect();
-        let mut text = format!("{of:?} {}", shown.join(", "));
-        while let Some(at) = text.find("Var(") {
-            let end = text[at..].find(')').map_or(text.len(), |close| at + close + 1);
-            text.replace_range(at..end, "_");
+    /// The obligation `ty: of<args>` hashed with every unbound inference variable of a kind alike, so a nested obligation that repeats an enclosing one is a cycle.
+    fn query(&self, of: ItemRef, ty: Ty, args: &[Ty]) -> u64 {
+        let mut hasher = rustc_hash::FxHasher::default();
+        of.hash(&mut hasher);
+        self.hash_canonical(ty, &mut hasher);
+        self.hash_list(args, &mut hasher);
+        hasher.finish()
+    }
+
+    fn hash_canonical(&self, ty: Ty, hasher: &mut rustc_hash::FxHasher) {
+        let kind = self.cx.types.kind(self.resolve(ty));
+        std::mem::discriminant(kind).hash(hasher);
+        match kind {
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Never => {}
+            Kind::Prim(prim) => prim.hash(hasher),
+            Kind::Value(bits) => bits.hash(hasher),
+            Kind::Ref(mutable, inner) | Kind::Ptr(mutable, inner) => {
+                mutable.hash(hasher);
+                self.hash_canonical(*inner, hasher);
+            }
+            Kind::Slice(inner) => self.hash_canonical(*inner, hasher),
+            Kind::Array(inner, len) => self.hash_list(&[*inner, *len], hasher),
+            Kind::Tuple(items) => self.hash_list(items, hasher),
+            Kind::Adt(item, items) | Kind::FnDef(item, items) => {
+                item.hash(hasher);
+                self.hash_list(items, hasher);
+            }
+            Kind::FnPtr(params, ret) => {
+                self.hash_list(params, hasher);
+                self.hash_canonical(*ret, hasher);
+            }
+            Kind::Closure(item, items, id) => {
+                (item, id).hash(hasher);
+                self.hash_list(items, hasher);
+            }
+            Kind::Dyn(of, items, members, autos) => {
+                (of, members, autos).hash(hasher);
+                self.hash_list(items, hasher);
+            }
+            Kind::Pat(base, start, end) => {
+                (start, end).hash(hasher);
+                self.hash_canonical(*base, hasher);
+            }
         }
-        text
+    }
+
+    fn hash_list(&self, items: &[Ty], hasher: &mut rustc_hash::FxHasher) {
+        items.len().hash(hasher);
+        for &item in items {
+            self.hash_canonical(item, hasher);
+        }
     }
 
     /// Whether the associated types of `of` for `ty` meet the bound path's bindings, as `Item = T`, and its constraints, as `Item: Trait`.
@@ -414,10 +485,16 @@ impl<'a> Infer<'_, 'a> {
         if !self.bindings_hold(arena, path, (of, ty, args))? {
             return Ok(false);
         }
-        let Some(&last) = arena.list(arena.path(path).segments).last() else { return Ok(true) };
-        let Some(crate::body::Args::Angle(list)) = arena.segments[last as usize].args else { return Ok(true) };
+        let Some(&last) = arena.list(arena.path(path).segments).last() else {
+            return Ok(true);
+        };
+        let Some(crate::body::Args::Angle(list)) = arena.segments[last as usize].args else {
+            return Ok(true);
+        };
         for &at in arena.list(list) {
-            let crate::body::GenericArg::Constraint { name, bounds } = arena.args[at as usize] else { continue };
+            let crate::body::GenericArg::Constraint { name, bounds } = arena.args[at as usize] else {
+                continue;
+            };
             let name = self.src.text(name);
             let Some((owner, owner_args)) = self.assoc_owner((of, args.to_vec()), ty, name, 0)? else { bail!("`{}` has no associated type `{name}`", self.cx.name(of)) };
             let assoc = self.project(owner, ty, owner_args, name)?;
@@ -441,20 +518,32 @@ impl<'a> Infer<'_, 'a> {
 
     /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.
     pub(super) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
-        let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
-        let given = super::super::ty::object_parts(&parts, &members).0;
-        let same_args = object == of || (self.is_callable_trait(object) && self.is_callable_trait(of));
-        if !same_args {
-            return Some(args.is_empty() && self.implied_traits(vec![object]).is_ok_and(|traits| traits.contains(&of)));
+        let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else {
+            return None;
+        };
+        let given = super::super::ty::object_parts(&parts, &members).0.to_vec();
+        if object != of && self.is_callable_trait(object) && self.is_callable_trait(of) {
+            if !self.implied_traits(vec![object]).is_ok_and(|traits| traits.contains(&of)) || given.len() != args.len() {
+                return Some(false);
+            }
+            let held = self.trial(|infer| Ok(given.iter().zip(args).all(|(found, wanted)| infer.unifies(*found, *wanted)).then_some(())));
+            return Some(matches!(held, Ok(Some(()))));
         }
-        if object != of && !self.implied_traits(vec![object]).is_ok_and(|traits| traits.contains(&of)) {
+        let bounds = self.expand_super_bounds(vec![(object, std::iter::once(ty).chain(given).collect())]).ok()?;
+        let matching: Vec<Vec<Ty>> = bounds.into_iter().filter(|(bound, substs)| *bound == of && substs.len() == args.len() + 1).map(|(_, substs)| substs).collect();
+        if matching.is_empty() {
             return Some(false);
         }
-        if given.len() != args.len() {
+        if matching.len() == 1 {
+            let saved = self.vars.clone();
+            if matching[0][1..].iter().zip(args).all(|(&found, &wanted)| self.unifies(found, wanted)) {
+                return Some(true);
+            }
+            self.vars = saved;
             return Some(false);
         }
-        let held = self.trial(|infer| Ok(given.iter().zip(args).all(|(found, wanted)| infer.unifies(*found, *wanted)).then_some(())));
-        Some(matches!(held, Ok(Some(()))))
+        let held = matching.iter().any(|substs| matches!(self.trial(|infer| Ok(substs[1..].iter().zip(args).all(|(&found, &wanted)| infer.unifies(found, wanted)).then_some(()))), Ok(Some(()))));
+        Some(held)
     }
 
     /// Whether trait `of` is one the compiler proves for every type that reaches selection: a marker such as `Sized` or `Copy`, or an auto trait.
@@ -464,11 +553,13 @@ impl<'a> Infer<'_, 'a> {
 
     /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one, such as a struct that ends in a slice, is neither `Sized`, `Copy` nor `Clone`, and `&mut T` is neither `Copy` nor `Clone`.
     pub(super) fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
-        let Some(lang) = self.cx.lang(of) else { return true };
+        let Some(lang) = self.cx.lang(of) else {
+            return true;
+        };
         let ty = self.resolve(ty);
         match self.cx.types.kind(ty) {
             Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str) | Kind::Dyn(..) => !SIZED_ONLY.contains(&lang),
-            Kind::Adt(..) if SIZED_ONLY.contains(&lang) => !self.cx.is_unsized(ty).unwrap_or(false),
+            Kind::Adt(item, _) if SIZED_ONLY.contains(&lang) => !self.cx.foreign(*item) && !self.cx.is_unsized(ty).unwrap_or(false),
             Kind::Ref(Mut::Mut, _) => !matches!(lang, "copy" | "clone"),
             _ => true,
         }
@@ -481,7 +572,9 @@ impl<'a> Infer<'_, 'a> {
 
     /// The trait that bound `bound` in `arena` requires from module `home`, with its path, or none for a lifetime, a `?Sized` or a name that is not a trait.
     pub(super) fn bound_trait_at(&mut self, arena: &Body, bound: u32, home: ModRef) -> Option<(ItemRef, PathId)> {
-        let Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else { return None };
+        let Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else {
+            return None;
+        };
         Some((self.trait_named(arena, path, home)?, path))
     }
 

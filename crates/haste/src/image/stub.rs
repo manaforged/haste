@@ -3,8 +3,8 @@
 use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
 
 /// The bytes one stub takes in stub memory, at most.
 pub(super) const STUB_BYTES: usize = 32;
@@ -163,7 +163,7 @@ extern "C" fn resolve(index: usize) -> usize {
     if let Some(code) = compiled(index) {
         return code;
     }
-    let _talk = TALK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _talk = crate::sync::lock(&TALK);
     if let Some(code) = compiled(index) {
         return code;
     }

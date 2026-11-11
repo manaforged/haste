@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
@@ -57,10 +57,10 @@ pub fn type_params(params: &[Generic]) -> impl Iterator<Item = &Generic> {
 
 /// A header whose generic parameters and where clauses bound the type parameters of the frame.
 pub(super) enum Header {
-    Fn(Rc<Signature>),
-    Adt(Rc<AdtDef>),
-    Impl(Rc<ImplHeader>),
-    Generics(Rc<TraitGenerics>),
+    Fn(Arc<Signature>),
+    Adt(Arc<AdtDef>),
+    Impl(Arc<ImplHeader>),
+    Generics(Arc<TraitGenerics>),
 }
 
 impl Header {
@@ -103,7 +103,9 @@ fn names_param(arena: &Body, src: &Source, ty: TyId, name: &str) -> bool {
 
 /// The name that the type `ty` spells when it is a path of one segment with no qualified self, as a type parameter is.
 pub(super) fn one_name<'s>(arena: &Body, src: &'s Source, ty: TyId) -> Option<&'s str> {
-    let SyntaxTy::Path(path) = *arena.ty(ty) else { return None };
+    let SyntaxTy::Path(path) = *arena.ty(ty) else {
+        return None;
+    };
     let path = arena.path(path);
     match arena.list(path.segments) {
         [segment] if path.qself.is_none() => Some(src.text(arena.segments[*segment as usize].name)),
@@ -115,7 +117,9 @@ impl<'a> Infer<'_, 'a> {
     /// Whether trait method `member` says `where Self: Sized`, which keeps it out of the trait's vtable.
     pub(crate) fn needs_sized_self(&mut self, member: ItemRef) -> Result<bool> {
         let (sig, src, home) = (self.cx.signature(member)?, &self.cx.file(member).source, self.cx.module_of(member)?);
-        let Some(sized) = self.cx.lang_item("sized") else { return Ok(false) };
+        let Some(sized) = self.cx.lang_item("sized") else {
+            return Ok(false);
+        };
         let bounds: Vec<u32> = predicate_bounds(&sig.body, src, &sig.predicates, "Self").collect();
         self.in_source(src, |infer| Ok(bounds.into_iter().any(|bound| infer.bound_trait_at(&sig.body, bound, home).is_some_and(|(of, _)| of == sized))))
     }
@@ -148,7 +152,9 @@ impl<'a> Infer<'_, 'a> {
             let (generics, self_ty) = self.impl_frame(block, outer)?;
             return Ok((generics, Some(self_ty), rest));
         }
-        let Some(of) = self.cx.owner_trait(item) else { return Ok((Vec::new(), None, substs)) };
+        let Some(of) = self.cx.owner_trait(item) else {
+            return Ok((Vec::new(), None, substs));
+        };
         let def = self.cx.trait_generics(of)?;
         let count = 1 + type_params(&def.1.params).count();
         if substs.len() < count {
@@ -169,7 +175,7 @@ impl<'a> Infer<'_, 'a> {
     pub fn impl_frame(&mut self, block: ImplRef, args: &[Ty]) -> Result<(Vec<(&'a str, Ty)>, Ty)> {
         let header = self.cx.impl_header(block)?;
         let generics = named_args(&self.cx.impl_file(block).source, &header.generics, args);
-        let self_ty = match self.generic((Form::Impl(block), args.len()), |infer, params| Ok(Rc::from(vec![vec![infer.impl_self(block, params)?]]))) {
+        let self_ty = match self.generic((Form::Impl(block), args.len()), |infer, params| Ok(Arc::from(vec![vec![infer.impl_self(block, params)?]]))) {
             Some(form) => self.instantiate(form[0][0], args),
             None => self.impl_self(block, args)?,
         };
@@ -189,11 +195,18 @@ impl<'a> Infer<'_, 'a> {
             return None;
         }
         if let Some(found) = self.cx.store.lookups.forms.get(&(form, count)) {
-            return found.clone();
+            return found;
         }
-        self.cx.store.lookups.forms.insert((form, count), None);
+        if self.cx.form_stack.contains(&(form, count)) {
+            return None;
+        }
+        let before = self.cx.quiet_mark();
+        self.cx.form_stack.push((form, count));
         let found = self.lower_generic(count, lower);
-        self.cx.store.lookups.forms.insert((form, count), found.clone());
+        self.cx.form_stack.pop();
+        if self.cx.quiet_mark() == before {
+            self.cx.store.lookups.forms.insert((form, count), found.clone());
+        }
         found
     }
 
@@ -203,10 +216,10 @@ impl<'a> Infer<'_, 'a> {
         let (src, home, frames) = (self.src, self.home, self.frames);
         let mut infer = Infer::start(self.cx, (&body, &sig, src), home);
         infer.frames = frames;
-        let before = infer.cx.asks.mark();
+        let before = infer.cx.quiet_mark();
         let params: Vec<Ty> = (0..count).map(|_| infer.fresh(Kind::Var)).collect();
         let found = lower(&mut infer, &params).ok()?;
-        let clean = infer.cx.asks.mark() == before && infer.backlog() == 0 && infer.hidden.is_empty() && infer.vars.len() == count && infer.vars.iter().all(Option::is_none);
+        let clean = infer.cx.quiet_mark() == before && infer.backlog() == 0 && infer.hidden.is_empty() && infer.vars.len() == count && infer.vars.iter().all(Option::is_none);
         clean.then_some(found)
     }
 
@@ -251,7 +264,9 @@ impl<'a> Infer<'_, 'a> {
 
     /// The declared type and the value of the const parameter `name` of the frame, when it has one.
     pub(super) fn const_param(&mut self, name: &str) -> Result<Option<(Ty, Ty)>> {
-        let Some(&(_, value)) = self.generics.iter().find(|(generic, _)| *generic == name) else { return Ok(None) };
+        let Some(&(_, value)) = self.generics.iter().find(|(generic, _)| *generic == name) else {
+            return Ok(None);
+        };
         for (header, src) in self.headers()? {
             let (arena, generics, _) = header.parts();
             let declared = generics.iter().find(|generic| src.text(generic.name) == name).map(|generic| generic.kind);
@@ -295,23 +310,26 @@ impl<'a> Infer<'_, 'a> {
     /// The parameter and return types of the function `item` at `substs`, its receiver first.
     pub fn fn_types(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(Vec<Ty>, Ty)> {
         let sig = self.cx.signature(item)?;
-        if !sig.opaque && let Some(types) = self.fn_form(item, &sig, substs) {
+        if !sig.opaque
+            && let Some(types) = self.fn_form(item, &sig, substs)
+        {
             return Ok(types);
         }
         let frame = self.frame(item, substs)?;
         let foreign = sig.opaque && self.instance.as_ref().is_none_or(|(own, _)| *own != item);
         let (types, opaque) = self.with_frame(frame, |infer| {
             let types = infer.sig_types(&sig)?;
-            let opaque = match foreign {
-                true => Some((infer.ret_fn_sig(&sig)?, infer.ret_bounds(&sig, types.1)?, infer.async_output(&sig)?)),
-                false => None,
-            };
+            let opaque = if foreign { Some(infer.foreign_opaque(item, substs, &sig, types.1)?) } else { None };
             Ok((types, opaque))
         })?;
-        if let Some((sig, bounds, output)) = opaque {
-            self.opaque_ret(super::opaque::Opaque { item, substs: substs.to_vec(), ret: types.1, sig, bounds, output })?;
+        if let Some(opaque) = opaque {
+            self.opaque_ret(opaque)?;
         }
         Ok(types)
+    }
+
+    fn foreign_opaque(&mut self, item: ItemRef, substs: &[Ty], sig: &Signature, ret: Ty) -> Result<super::opaque::Opaque> {
+        Ok(super::opaque::Opaque { item, substs: substs.to_vec(), ret, sig: self.ret_fn_sig(sig)?, bounds: self.ret_bounds(sig, ret)?, bindings: self.ret_bindings(sig)?, output: self.async_output(sig)? })
     }
 
     /// The types of the function `item` at `substs` from its form lowered once, when the signature `sig` lowers the same way for every caller.
@@ -319,7 +337,7 @@ impl<'a> Infer<'_, 'a> {
         let form = self.generic((Form::Fn(item), substs.len()), |infer, args| {
             let frame = infer.frame(item, args)?;
             let (params, ret) = infer.with_frame(frame, |infer| infer.sig_types(sig))?;
-            Ok(Rc::from(vec![params, vec![ret]]))
+            Ok(Arc::from(vec![params, vec![ret]]))
         })?;
         let params = form[0].iter().map(|&ty| self.instantiate(ty, substs)).collect();
         Some((params, self.instantiate(form[1][0], substs)))
@@ -367,9 +385,13 @@ impl<'a> Infer<'_, 'a> {
     /// The inherent member `name` of type `ty`, with the type arguments of the impl that holds it.
     pub fn inherent_member(&mut self, ty: Ty, name: &str) -> Result<Option<(ItemRef, Vec<Ty>)>> {
         let ty = self.resolve(ty);
-        let Some(head) = head(self.cx.types.kind(ty)) else { return Ok(None) };
+        let Some(head) = head(self.cx.types.kind(ty)) else {
+            return Ok(None);
+        };
         for block in self.cx.inherent(head) {
-            let Some(member) = self.cx.member(block, name) else { continue };
+            let Some(member) = self.cx.member(block, name) else {
+                continue;
+            };
             if let Some(args) = self.trial(|infer| Ok(infer.match_impl(block, ty)))? {
                 return Ok(Some((member, args)));
             }

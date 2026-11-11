@@ -17,7 +17,9 @@ impl Lower<'_, '_> {
         let Some(env) = self.cx.closure_env(ty) else { bail!("a closure whose captures are not known") };
         let Some(closure) = self.typed.closures.get(&expr).cloned() else { bail!("a closure expression with no inferred closure") };
         let shape = repr(self.cx, env)?;
-        let Some(slot) = self.slot(shape) else { return Ok(None) };
+        let Some(slot) = self.slot(shape) else {
+            return Ok(None);
+        };
         let object = Place::slot(slot, shape);
         let (whole, env) = match closure.coroutine {
             true => self.coroutine_header(ty, object, env)?,
@@ -61,7 +63,9 @@ impl Lower<'_, '_> {
 
     /// Points each local that the closure being lowered captures at its place in the environment.
     pub(super) fn bind_captures(&mut self) -> Result<()> {
-        let Shape::Closure(ClosureBody { env: Some(local), closure, .. }) = self.typed.shape.clone() else { return Ok(()) };
+        let Shape::Closure(ClosureBody { env: Some(local), closure, .. }) = self.typed.shape.clone() else {
+            return Ok(());
+        };
         let (whole, env) = self.env_place(local, closure.coroutine)?;
         for (index, capture) in closure.captures.iter().enumerate() {
             let part = self.part_place(whole, env, (0, index as u32))?;
@@ -164,7 +168,9 @@ impl Lower<'_, '_> {
         if self.cx.call_once() == Some(item) {
             return self.boxed_once_call((expr, callee), (item, substs), args);
         }
-        let Some((place, _)) = self.autoderef_place(expr, callee)? else { return Ok(None) };
+        let Some((place, _)) = self.autoderef_place(expr, callee)? else {
+            return Ok(None);
+        };
         let receiver = self.address(place);
         let tuple = match self.typed.overloaded.contains(&expr) {
             true => self.args_tuple(args),
@@ -204,8 +210,12 @@ impl Lower<'_, '_> {
     fn boxed_once_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Vec<Ty>), args: List) -> Result<Option<Value>> {
         let Some((root, path)) = self.scrutinee_path(callee) else { bail!("calling a temporary `Box<dyn FnOnce>` is not supported yet") };
         let Some(Res::Fn(free, free_substs)) = self.typed.box_frees.get(&expr).cloned() else { bail!("a `Box<dyn FnOnce>` call with no box to free") };
-        let Some(boxed) = self.place_or_temp(callee)? else { return Ok(None) };
-        let Some((place, _)) = self.deref_step((expr, 0), Some(boxed), self.ty_of(callee))? else { return Ok(None) };
+        let Some(boxed) = self.place_or_temp(callee)? else {
+            return Ok(None);
+        };
+        let Some((place, _)) = self.deref_step((expr, 0), Some(boxed), self.ty_of(callee))? else {
+            return Ok(None);
+        };
         let Some(slot) = crate::sema::infer::virtual_slot(self.cx, item, &substs)? else { bail!("`call_once` has no vtable slot") };
         let pair = self.address(place);
         let data = self.ins().load(Type::I64, pair, 0);
@@ -224,7 +234,9 @@ impl Lower<'_, '_> {
     }
 
     fn pointed_env(&mut self, expr: ExprId, callee: ExprId) -> Result<Vec<Value>> {
-        let Some((place, ty)) = self.autoderef_place(expr, callee)? else { return Ok(Vec::new()) };
+        let Some((place, ty)) = self.autoderef_place(expr, callee)? else {
+            return Ok(Vec::new());
+        };
         if self.cx.closure_consumes(ty) {
             bail!("calling a closure that consumes itself through a pointer is not supported yet");
         }

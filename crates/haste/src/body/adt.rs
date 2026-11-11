@@ -7,11 +7,20 @@ use super::cursor::Cursor;
 use super::sig::Generics;
 use super::{Body, ExprId, TyId};
 
-/// One field: its name token, or none in a tuple variant, its type, and where its attributes start.
+/// How widely a struct or union field is visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldVis {
+    Public,
+    Crate,
+    Private,
+}
+
+/// One field: its name token, or none in a tuple variant, its type, its visibility, and where its attributes start.
 #[derive(Clone, Copy, Debug)]
 pub struct FieldDef {
     pub name: Option<u32>,
     pub ty: TyId,
+    pub vis: FieldVis,
     pub attrs: Option<u32>,
 }
 
@@ -115,7 +124,7 @@ impl Cursor<'_> {
         let mut fields = Vec::new();
         self.comma_list(open, |cursor| {
             let attrs = cursor.skip_attrs()?.map(|(start, _)| start);
-            cursor.visibility();
+            let vis = cursor.visibility();
             let name = if shape == Shape::Named {
                 let name = cursor.name()?;
                 cursor.expect(":")?;
@@ -123,15 +132,22 @@ impl Cursor<'_> {
             } else {
                 None
             };
-            fields.push(FieldDef { name, ty: cursor.ty()?, attrs });
+            fields.push(FieldDef { name, ty: cursor.ty()?, vis, attrs });
             Ok(0)
         })?;
         Ok((shape, fields))
     }
 
-    fn visibility(&mut self) {
-        if self.eat_word("pub") && self.kind() == TokenKind::OpenParen {
-            self.group();
+    fn visibility(&mut self) -> FieldVis {
+        if !self.eat_word("pub") {
+            return FieldVis::Private;
         }
+        if self.kind() != TokenKind::OpenParen {
+            return FieldVis::Public;
+        }
+        let close = self.src.pair(self.at);
+        let is_self = close == self.at + 2 && self.src.text(self.at + 1) == "self";
+        self.group();
+        if is_self { FieldVis::Private } else { FieldVis::Crate }
     }
 }

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use haste_codegen::{Block, Function, Signature, Type, Value};
@@ -36,7 +36,9 @@ pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool
 
 /// The most instructions a call may copy inline of reached function `index`: `ALWAYS_LIMIT` for an `#[inline(always)]` sysroot function, `INLINE_LIMIT` for one whose source body has at most `INLINE_EXPRS` expressions, or none.
 fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
-    let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
+    let ((item, _), Ok(typed)) = &reached.list[index] else {
+        return None;
+    };
     if !cx.outline.crates[item.krate as usize].env.release {
         return None;
     }
@@ -239,7 +241,9 @@ impl Lower<'_, '_> {
         }
         let named = self.typed.res.get(&callee).filter(|_| self.body.names_callee(callee));
         let (item, substs) = match named.cloned() {
-            Some(Res::Fn(item, _)) if matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static) => return self.pointer_call(expr, callee, args),
+            Some(Res::Fn(item, _)) if matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static) => {
+                return self.pointer_call(expr, callee, args);
+            }
             Some(Res::Fn(item, substs)) => (item, substs),
             Some(Res::Ctor(_, variant, _)) => return self.ctor_call(expr, variant, args),
             _ => return self.pointer_call(expr, callee, args),
@@ -289,19 +293,38 @@ impl Lower<'_, '_> {
     }
 
     /// The lowered body of reached sysroot function `index` when a call may copy it inline: small, copyable, and not being lowered already.
-    fn inline_body(&mut self, index: usize) -> Option<Rc<Function>> {
-        if !self.slots.bodies().first_try(index) {
-            return self.slots.bodies().body(index);
-        }
-        let limit = inline_limit(self.cx, self.reached, index)?;
-        let mut body = super::lower(self.cx, self.reached, self.slots, index).ok().filter(Function::can_inline)?;
-        haste_codegen::simplify(&mut body);
-        if body.size() > limit {
+    fn inline_body(&mut self, index: usize) -> Option<Arc<Function>> {
+        if let Some(depth) = self.inline.stack.iter().position(|&active| active == index) {
+            self.cycle_depth = self.cycle_depth.min(depth);
             return None;
         }
-        let body = Rc::new(body);
-        self.slots.bodies().keep(index, body.clone());
-        Some(body)
+        if let Some(cached) = self.slots.bodies().get(index) {
+            return cached;
+        }
+        if let Some((cached, depth)) = self.inline.local.get(&index) {
+            self.cycle_depth = self.cycle_depth.min(*depth);
+            return cached.clone();
+        }
+        let Some(limit) = inline_limit(self.cx, self.reached, index) else {
+            return self.slots.bodies().record(index, None);
+        };
+        let before = self.cx.quiet_mark();
+        let my_depth = self.inline.stack.len();
+        self.inline.stack.push(index);
+        let lowered = super::lower_nested(self.cx, self.reached, self.slots, index, self.inline);
+        self.inline.stack.pop();
+        let nested = lowered.as_ref().map_or(usize::MAX, |&(_, depth)| depth);
+        let open_cycle = if nested < my_depth { nested } else { usize::MAX };
+        self.cycle_depth = self.cycle_depth.min(open_cycle);
+        let candidate = lowered.ok().map(|(body, _)| body).filter(Function::can_inline).and_then(|mut body| {
+            haste_codegen::simplify(&mut body);
+            (body.size() <= limit).then(|| Arc::new(body))
+        });
+        if open_cycle == usize::MAX && self.cx.quiet_mark() == before {
+            return self.slots.bodies().record(index, candidate);
+        }
+        self.inline.local.insert(index, (candidate.clone(), open_cycle));
+        candidate
     }
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
@@ -438,7 +461,9 @@ impl Lower<'_, '_> {
 
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
         let mark = self.owned.len();
-        let Some(test) = self.expr(cond)? else { return Ok(None) };
+        let Some(test) = self.expr(cond)? else {
+            return Ok(None);
+        };
         let (then_block, else_block) = (self.b.create_block(), self.b.create_block());
         let (join, joined, slot) = match otherwise {
             Some(_) => self.join_block(expr)?,

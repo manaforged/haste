@@ -66,7 +66,11 @@ impl Infer<'_, '_> {
     }
 
     fn bind_name(&mut self, pat: PatId, (name, mutable, by_ref): (u32, bool, bool), sub: Option<PatId>, (ty, mode): (Ty, Mode)) -> Result<()> {
-        if !mutable && !by_ref && sub.is_none() && let Some((found, res)) = self.named_pat(name)? {
+        if !mutable
+            && !by_ref
+            && sub.is_none()
+            && let Some((found, res)) = self.named_pat(name)?
+        {
             return self.named_value(pat, (found, res), ty, mode);
         }
         let explicit = if mutable { Mut::Mut } else { Mut::Not };
@@ -177,7 +181,9 @@ impl Infer<'_, '_> {
             _ => bail!("slice pattern on {}", self.show(ty)),
         };
         match self.cx.types.len(self.resolve(len)) {
-            Some(len) if given as u64 > len || (!rest && given as u64 != len) => bail!("pattern has {given} elements, the array has {len}"),
+            Some(len) if given as u64 > len || (!rest && given as u64 != len) => {
+                bail!("pattern has {given} elements, the array has {len}")
+            }
             Some(_) => Ok(element),
             None if !rest => {
                 let known = self.cx.types.intern(Kind::Value(given as u128));
@@ -193,7 +199,9 @@ impl Infer<'_, '_> {
             bail!("pattern has {given} fields, the type has {}", items.len());
         }
         for (at, &pat) in pats.iter().enumerate() {
-            let Some(index) = position(at, pats.len(), rest, items.len()) else { continue };
+            let Some(index) = position(at, pats.len(), rest, items.len()) else {
+                continue;
+            };
             self.pat(pat, items[index], mode)?;
         }
         Ok(())
@@ -282,11 +290,15 @@ impl Infer<'_, '_> {
         let found = self.value_def(&[sym], false, None).ok();
         let (item, variant) = match found {
             Some(crate::names::Def::Variant(item, index)) => {
-                let Some(at) = self.cx.adt_def(item)?.position(index) else { return Ok(None) };
+                let Some(at) = self.cx.adt_def(item)?.position(index) else {
+                    return Ok(None);
+                };
                 (item, at as u32)
             }
             Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Struct => (item, 0),
-            Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => return self.const_item(item, Vec::new()).map(Some),
+            Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => {
+                return self.const_item(item, Vec::new()).map(Some);
+            }
             _ => return Ok(None),
         };
         if self.cx.adt_def(item)?.variants[variant as usize].shape != crate::body::adt::Shape::Unit {

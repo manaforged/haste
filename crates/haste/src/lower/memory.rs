@@ -49,11 +49,7 @@ impl Lower<'_, '_> {
         use Intrinsic::*;
         let ty = substs[0];
         match (which, args) {
-            (RawPointer, &[data, ..]) => match (repr(self.cx, ty)?, args.get(1)) {
-                (Repr::Mem { .. }, Some(&meta)) => Ok(Some(self.wide(data, meta))),
-                (Repr::Scalar(_), _) => Ok(Some(data)),
-                _ => bail!("aggregate_raw_ptr into a pointer with metadata that is not a slice length"),
-            },
+            (RawPointer, &[data, ..]) => self.raw_pointer(substs, data, args.get(1).copied()),
             (Offset(pointer), &[base, count]) => self.offset(ty, pointer, base, count).map(Some),
             (PtrMask, &[pointer, mask]) => Ok(Some(self.ins().band(pointer, mask))),
             (OffsetFrom(signed), &[to, from]) => self.offset_from(ty, signed, to, from).map(Some),
@@ -70,6 +66,27 @@ impl Lower<'_, '_> {
             (SliceElement, &[slice, index]) => self.slice_element(substs, slice, index).map(Some),
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
         }
+    }
+
+    fn raw_pointer(&mut self, substs: &[Ty], data: Value, meta: Option<Value>) -> Result<Option<Value>> {
+        let ty = substs[0];
+        let data = match substs.get(1).copied().map(|from| repr(self.cx, from)).transpose()? {
+            Some(Repr::Mem { .. }) => self.ins().load(Type::I64, data, 0),
+            _ => data,
+        };
+        if matches!(repr(self.cx, ty)?, Repr::Scalar(_)) {
+            return Ok(Some(data));
+        }
+        let (Kind::Ptr(_, pointee) | Kind::Ref(_, pointee)) = *self.cx.types.kind(ty) else {
+            bail!("aggregate_raw_ptr into a type that is not a pointer");
+        };
+        let Some(meta) = meta else { bail!("aggregate_raw_ptr into a wide pointer with no metadata") };
+        let tail = self.cx.tail(pointee)?;
+        let meta = match self.cx.types.kind(tail) {
+            Kind::Dyn(..) => self.ins().load(Type::I64, meta, 0),
+            _ => meta,
+        };
+        Ok(Some(self.wide(data, meta)))
     }
 
     fn write_box(&mut self, ty: Ty, boxed: Value, value: Option<Value>) -> Result<Value> {
@@ -183,8 +200,12 @@ impl Lower<'_, '_> {
     fn read_at(&mut self, ty: Ty, from: Value) -> Result<Option<Value>> {
         let whole = repr(self.cx, ty)?;
         let at = Place { base: Base::Addr(from), offset: 0, repr: whole };
-        let Repr::Mem { .. } = whole else { return Ok(self.read(at)) };
-        let Some(slot) = self.slot(whole) else { return Ok(None) };
+        let Repr::Mem { .. } = whole else {
+            return Ok(self.read(at));
+        };
+        let Some(slot) = self.slot(whole) else {
+            return Ok(None);
+        };
         let to = self.ins().stack_addr(Type::I64, slot, 0);
         self.copy(to, from, whole);
         Ok(Some(to))

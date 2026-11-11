@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use rustc_hash::FxHashMap as HashMap;
@@ -8,7 +8,7 @@ use crate::body::sig::{self, Generics};
 use crate::names::{ItemRef, ModRef};
 use crate::outline::item::{ItemKind, mark};
 
-use super::Context;
+use super::{Context, read_lock, write_lock};
 
 /// The generic parameters and where clause of a trait, in their own arena.
 pub type TraitGenerics = (Body, Generics);
@@ -28,14 +28,14 @@ const PANIC_HANDLER: &str = "#[panic_handler]";
 
 impl<'a> Context<'a> {
     /// The generic parameters and where clause of trait `item`.
-    pub fn trait_generics(&mut self, item: ItemRef) -> Result<Rc<TraitGenerics>> {
+    pub fn trait_generics(&mut self, item: ItemRef) -> Result<Arc<TraitGenerics>> {
         if let Some(found) = self.store.lookups.trait_defs.get(&item) {
-            return Ok(found.clone());
+            return Ok(found);
         }
         let (src, entry) = self.item(item);
         let name = entry.name.ok_or_else(|| anyhow!("trait has no name"))?;
-        let parsed = Rc::new(sig::generics(src, name + 1, entry.body.unwrap_or(entry.end))?);
-        self.store.lookups.trait_defs.insert(item, parsed.clone());
+        let parsed = Arc::new(sig::generics(src, name + 1, entry.body.unwrap_or(entry.end))?);
+        self.store.lookups.trait_defs.insert(item, Arc::clone(&parsed));
         Ok(parsed)
     }
 
@@ -46,28 +46,27 @@ impl<'a> Context<'a> {
 
     /// The member of trait `of` named `name`.
     pub fn trait_member(&self, of: ItemRef, name: &str) -> Option<ItemRef> {
-        let known = self.trait_members.borrow().get(&of).cloned();
-        let members = known.unwrap_or_else(|| {
-            let mut members = HashMap::default();
+        let members = self.trait_members.get_or_insert_with(of, || {
+            let mut map = HashMap::default();
             for member in self.children(of) {
-                members.entry(self.name(member)).or_insert(member);
+                map.entry(self.name(member)).or_insert(member);
             }
-            let members = Rc::new(members);
-            self.trait_members.borrow_mut().insert(of, members.clone());
-            members
+            Arc::new(map)
         });
         members.get(name).copied()
     }
 
-    /// The methods of trait `of` and then of its supertraits in vtable order: each one that takes `self`, has no type parameters of its own and no `Self: Sized` bound, and none for the rest or for a generic supertrait.
+    /// The methods of trait `of` and then of its supertraits in vtable order: each one that takes `self`, has no type parameters of its own and no `Self: Sized` bound, and none for the rest or for an unfixed generic supertrait.
     pub fn vtable_methods(&mut self, of: ItemRef) -> Result<Vec<Option<ItemRef>>> {
-        let traits = super::infer::detached(self, of, |infer| infer.implied_traits(vec![of]))?;
+        let traits = super::infer::detached(self, of, |infer| infer.vtable_traits(of))?;
         let mut methods = Vec::new();
-        for owner in traits {
-            let open = owner != of && self.is_generic_trait(owner)?;
-            for member in self.children(owner).filter(|member| self.item(*member).1.kind == ItemKind::Fn).collect::<Vec<_>>() {
+        for (owner, fixed) in traits {
+            for member in self.children(owner) {
+                if self.item(member).1.kind != ItemKind::Fn {
+                    continue;
+                }
                 let sig = self.signature(member)?;
-                let callable = !open && sig.receiver.is_some() && super::infer::type_params(&sig.generics).next().is_none() && !super::infer::detached(self, member, |infer| infer.needs_sized_self(member))?;
+                let callable = fixed && sig.receiver.is_some() && super::infer::type_params(&sig.generics).next().is_none() && !super::infer::detached(self, member, |infer| infer.needs_sized_self(member))?;
                 methods.push(callable.then_some(member));
             }
         }
@@ -92,11 +91,14 @@ impl<'a> Context<'a> {
 
     /// The traits in scope in module `home`.
     pub fn traits_in_scope(&self, home: ModRef) -> Vec<ItemRef> {
-        if let Some(known) = self.store.lookups.scope_traits.borrow().get(&home) {
+        if let Some(known) = self.store.lookups.scope_traits.get(&home) {
             return known.to_vec();
         }
+        let before = self.quiet_mark();
         let found = self.paths(home.krate).traits_in(home);
-        self.store.lookups.scope_traits.borrow_mut().insert(home, found.as_slice().into());
+        if self.quiet_mark() == before {
+            self.store.lookups.scope_traits.insert(home, Arc::from(found.as_slice()));
+        }
         found
     }
 
@@ -124,10 +126,13 @@ impl<'a> Context<'a> {
 
     /// The item that `#[lang = "name"]` marks in the standard crates.
     pub fn lang_item(&mut self, name: &str) -> Option<ItemRef> {
-        if self.store.lookups.langs.is_none() {
-            self.store.lookups.langs = Some(self.lang_table());
+        if let Some(langs) = read_lock(&self.store.lookups.state.langs).as_ref() {
+            self.asks.crates.borrow_mut().extend(langs.partial.iter().copied());
+            return langs.table.get(name).copied();
         }
-        let langs = self.store.lookups.langs.as_ref()?;
+        let built = self.lang_table();
+        let mut guard = write_lock(&self.store.lookups.state.langs);
+        let langs = guard.get_or_insert(built);
         self.asks.crates.borrow_mut().extend(langs.partial.iter().copied());
         langs.table.get(name).copied()
     }

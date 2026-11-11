@@ -172,7 +172,10 @@ impl Cursor<'_> {
         let mut starts = Vec::new();
         self.comma_list(open, |cursor| {
             let attrs = cursor.skip_attrs()?;
-            if receiver.is_none() && params.is_empty() && let Some(found) = cursor.receiver()? {
+            if receiver.is_none()
+                && params.is_empty()
+                && let Some(found) = cursor.receiver()?
+            {
                 receiver = Some(found);
                 return Ok(0);
             }
@@ -198,10 +201,10 @@ impl Cursor<'_> {
     }
 }
 
-/// Parses the header of the function item whose tokens run from `from` to `to` in `src`, leaving out the parameters that `#[cfg]` in `env` turns off.
-pub fn signature(src: &Source, from: u32, to: u32, env: &crate::outline::tree::Env) -> Result<Signature> {
+/// Parses the header of the function item whose tokens run from `from` to `to` in `src` with `config`.
+pub fn signature(src: &Source, from: u32, to: u32, config: super::Config<'_>) -> Result<Signature> {
     let mut cursor = Cursor::new(src, from, to);
-    cursor.config.env = Some(env);
+    cursor.config = config;
     let mut is_async = false;
     while !cursor.done() && !cursor.is_word("fn") {
         is_async |= cursor.is_word("async");
@@ -263,9 +266,10 @@ pub fn impl_header(src: &Source, from: u32, to: u32) -> Result<ImplHeader> {
     Ok(ImplHeader { body: cursor.body, generics, negative, trait_ref, self_ty, predicates })
 }
 
-/// Parses the type of the constant item whose name is token `name`, as the return type of a header with no parameters.
-pub fn const_signature(src: &Source, name: u32, to: u32) -> Result<Signature> {
+/// Parses the type of the constant item whose name is token `name` with `config`, as the return type of a header with no parameters.
+pub fn const_signature(src: &Source, name: u32, to: u32, config: super::Config<'_>) -> Result<Signature> {
     let mut cursor = Cursor::new(src, name + 1, to);
+    cursor.config = config;
     cursor.expect(":")?;
     let ret = cursor.ty()?;
     Ok(Signature { body: cursor.body, ret: Some(ret), ..Signature::default() })

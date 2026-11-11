@@ -34,6 +34,7 @@ impl Infer<'_, '_> {
         self.settle_operators(false)?;
         self.settle_obligations()?;
         self.fall_back_numbers()?;
+        self.settle_obligations()?;
         self.settle_operators(true)?;
         self.settle_projections()?;
         self.settle_captures()?;

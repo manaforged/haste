@@ -19,7 +19,7 @@ impl Lower<'_, '_> {
         let value = self.expr(iter)?;
         let iterator = self.invoke(*into, into_substs, value.into_iter().collect())?;
         let place = self.spill(iterator, each.iter)?;
-        self.own(super::moves::Root::Temp(iter), each.iter, place, true)?;
+        self.own(super::moves::Root::Held(iter), each.iter, place, true)?;
         let depth = self.owned.len();
         let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.jump(head, &[]);
@@ -55,7 +55,9 @@ impl Lower<'_, '_> {
         let (Res::Fn(branch, branch_substs), Res::Fn(from, from_substs)) = (&tried.branch, &tried.from_residual) else { bail!("`?` calls are not functions") };
         let value = self.expr(inner)?;
         let flow = self.invoke(*branch, branch_substs, value.into_iter().collect())?;
-        let Some(flow) = self.spill(flow, tried.flow)? else { return self.zero_sized_try(&tried, (*from, from_substs)) };
+        let Some(flow) = self.spill(flow, tried.flow)? else {
+            return self.zero_sized_try(&tried, (*from, from_substs));
+        };
         let Some(stopped) = self.is_variant(Some(flow), tried.flow, tried.stop)? else { bail!("`?` on a `ControlFlow` with one variant") };
         let (stop, proceed) = (self.b.create_block(), self.b.create_block());
         self.brif(stopped, (stop, &[]), (proceed, &[]));
@@ -122,7 +124,9 @@ impl Lower<'_, '_> {
     /// A new frame slot for a value of `ty`, holding `value` when one is given.
     pub(super) fn spill(&mut self, value: Option<Value>, ty: crate::sema::ty::Ty) -> Result<Option<Place>> {
         let whole = repr(self.cx, ty)?;
-        let Some(slot) = self.slot(whole) else { return Ok(None) };
+        let Some(slot) = self.slot(whole) else {
+            return Ok(None);
+        };
         let place = Place::slot(slot, whole);
         if let Some(value) = value {
             self.write(place, value);

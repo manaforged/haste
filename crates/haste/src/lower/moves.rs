@@ -7,11 +7,12 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::Lower;
 
-/// What owns a value that the body drops: a local, or the temporary that holds the value of an expression.
+/// What owns a value that the body drops: a local, the temporary that holds the value of an expression, or the hidden state of a loop or `.await`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Root {
     Local(u32),
     Temp(ExprId),
+    Held(ExprId),
 }
 
 /// The fields from a root down to a part of its value, each as a variant and a field index, or `BOX_STEP` into the value a `Box` owns.
@@ -25,10 +26,12 @@ impl Lower<'_, '_> {
     pub fn move_path(&self, expr: ExprId) -> Option<(Root, MovePath)> {
         let (base, index) = match *self.body.expr(expr) {
             Expr::Paren(inner) => return self.move_path(inner),
-            Expr::Path(_) => return match self.typed.res.get(&expr) {
-                Some(Res::Local(local)) => Some((Root::Local(*local), Vec::new())),
-                _ => None,
-            },
+            Expr::Path(_) => {
+                return match self.typed.res.get(&expr) {
+                    Some(Res::Local(local)) => Some((Root::Local(*local), Vec::new())),
+                    _ => None,
+                };
+            }
             Expr::Field(base, _) => (base, *self.typed.fields.get(&expr)?),
             Expr::TupleField(base, index) => (base, index),
             _ => return None,
@@ -57,7 +60,9 @@ impl Lower<'_, '_> {
     /// Whether binding `pat` to `init` moves the whole value out of a `Box` that `init` dereferences.
     pub fn moves_whole_box(&mut self, pat: PatId, init: ExprId) -> Result<bool> {
         let by_value = matches!(*self.body.pat(pat), Pat::Bind { by_ref: false, sub: None, .. }) && !self.typed.ref_binds.contains_key(&pat);
-        let Expr::Unary(UnOp::Deref, operand) = *self.body.expr(init) else { return Ok(false) };
+        let Expr::Unary(UnOp::Deref, operand) = *self.body.expr(init) else {
+            return Ok(false);
+        };
         Ok(by_value && self.cx.boxed(self.ty_of(operand)).is_some() && needs_drop(self.cx, self.ty_of(init))?)
     }
 
@@ -118,7 +123,9 @@ impl Lower<'_, '_> {
     }
 
     fn pattern_paths(&mut self, pat: PatId, at: Option<(Root, MovePath)>, found: &mut FxHashMap<Root, Vec<MovePath>>) -> Result<()> {
-        let Some(at) = at.filter(|_| self.typed.pats.contains_key(&pat)) else { return Ok(()) };
+        let Some(at) = at.filter(|_| self.typed.pats.contains_key(&pat)) else {
+            return Ok(());
+        };
         if self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) > 0 {
             return Ok(());
         }

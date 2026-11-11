@@ -180,8 +180,7 @@ fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Resu
 }
 
 fn resolve_deps(packages: &mut [Package]) {
-    let index: BTreeMap<(String, semver::Version), usize> =
-        packages.iter().enumerate().map(|(at, package)| ((package.locked.name.clone(), package.locked.version.clone()), at)).collect();
+    let index: BTreeMap<(String, semver::Version), usize> = packages.iter().enumerate().map(|(at, package)| ((package.locked.name.clone(), package.locked.version.clone()), at)).collect();
     for at in 0..packages.len() {
         let locked: Vec<(String, Option<semver::Version>)> = packages[at].locked.deps().map(|dep| (dep.name.to_owned(), dep.version)).collect();
         let candidates = |name: &str| -> Vec<usize> {

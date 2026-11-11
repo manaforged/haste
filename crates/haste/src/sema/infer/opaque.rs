@@ -1,10 +1,13 @@
 use anyhow::{Result, anyhow};
 
-use crate::names::ItemRef;
+use crate::body::sig::Signature;
+use crate::body::{Args, Body, PathId};
+use crate::names::{ItemRef, ModRef};
 
 use super::super::Context;
 use super::super::ty::{Kind, Ty};
 use super::closure::Closure;
+use super::scope::Frame;
 use super::{Infer, Local, Typed};
 
 /// A return type that holds `impl Trait`, until its type arguments are known.
@@ -18,11 +21,13 @@ pub(super) struct Opaque {
     pub sig: Option<Ty>,
     /// Its other trait bounds, each with `Self` first, which method calls on it read before it is revealed.
     pub bounds: Vec<(ItemRef, Vec<Ty>)>,
+    /// The associated type bindings its bounds spell, as `(trait, name, ty)`.
+    pub bindings: Vec<(ItemRef, String, Ty)>,
     /// The declared output of an async fn, which `.await` gives before the future is revealed.
     pub output: Option<Ty>,
 }
 
-impl Infer<'_, '_> {
+impl<'a> Infer<'_, 'a> {
     /// Ties the return value of `opaque` to the type that its body returns, once its type arguments are known.
     pub(super) fn opaque_ret(&mut self, opaque: Opaque) -> Result<()> {
         self.opaques.push(opaque);
@@ -31,7 +36,12 @@ impl Infer<'_, '_> {
 
     /// The trait bounds of the pending `impl Trait` return value `ty` and the supertrait bounds they imply, each with `Self` first.
     pub(super) fn opaque_bounds(&mut self, ty: Ty) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
-        let mut bounds = self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).map(|opaque| opaque.bounds.clone()).unwrap_or_default();
+        let bounds = self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).map(|opaque| opaque.bounds.clone()).unwrap_or_default();
+        self.expand_super_bounds(bounds)
+    }
+
+    /// Expands `bounds` with all supertrait bounds they transitively imply, keeping `Self` first in each entry.
+    pub(super) fn expand_super_bounds(&mut self, mut bounds: Vec<(ItemRef, Vec<Ty>)>) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let mut at = 0;
         while at < bounds.len() {
             let (of, substs) = bounds[at].clone();
@@ -66,7 +76,7 @@ impl Infer<'_, '_> {
             let substs: Vec<Ty> = substs.into_iter().map(|ty| self.zonk(ty)).collect();
             self.share_closures(&substs);
             let found = revealed(self.cx, item, &substs)?;
-            if let Some(output) = output.filter(|_| self.cx.closure(found).is_none()) {
+            if let Some(output) = output.filter(|_| !self.cx.has_closure(found)) {
                 let output = self.zonk(output);
                 self.cx.store.lookups.futures.insert(found, output);
             }
@@ -77,13 +87,15 @@ impl Infer<'_, '_> {
 
     /// Registers the closures of this body once their types are known, when `substs` hold one, so the body that reveals an `impl Trait` return can call them before this body finishes.
     fn share_closures(&mut self, substs: &[Ty]) {
-        let Some((item, args)) = self.instance.clone() else { return };
+        let Some((item, args)) = self.instance.clone() else {
+            return;
+        };
         if !substs.iter().any(|&ty| holds_closure(self.cx, ty, (item, &args))) {
             return;
         }
-        let locals: Vec<Local> = self.out.locals.clone().into_iter().map(|local| Local { ty: self.substitute(local.ty), ..local }).collect();
+        let locals: Vec<Local> = self.out.locals.clone().into_iter().map(|local| Local { ty: self.zonk(local.ty), ..local }).collect();
         let mut closures = self.out.closures.clone();
-        closures.values_mut().for_each(|closure| closure.ret = self.substitute(closure.ret));
+        closures.values_mut().for_each(|closure| closure.ret = self.zonk(closure.ret));
         let typed = |closure: &Closure| {
             let held = closure.params.iter().copied().chain(closure.captures.iter().map(|capture| capture.local));
             held.map(|local| locals[local as usize].ty).chain([closure.ret]).collect::<Vec<Ty>>()
@@ -91,7 +103,7 @@ impl Infer<'_, '_> {
         if closures.values().flat_map(typed).any(|ty| self.has_vars(ty)) {
             return;
         }
-        super::closure::register(self.cx, (item, &args), &Typed { locals, closures, ..Typed::default() });
+        super::closure::register(self.cx, (item, &args), &Typed { tables: std::sync::Arc::new(super::BodyTables { closures, ..super::BodyTables::default() }), locals, ..Typed::default() });
     }
 
     /// Holds the hidden type of each `impl Trait` in this function's return type to its bounds, tying the associated types they name, as `Output = T`, and their trait arguments, which rustc reads to infer the body.
@@ -103,7 +115,9 @@ impl Infer<'_, '_> {
                 _ => None,
             });
             for &bound in bounds.map(|bounds| sig.body.list(bounds)).unwrap_or_default() {
-                let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else { continue };
+                let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else {
+                    continue;
+                };
                 if self.is_callable_trait(of) {
                     continue;
                 }
@@ -115,32 +129,174 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    /// The declared output of the pending async fn future `ty`.
+    /// The declared output of the pending async fn or `impl Future<Output = T>` return `ty`.
     pub(super) fn opaque_output(&self, ty: Ty) -> Option<Ty> {
-        self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).and_then(|opaque| opaque.output)
+        self.opaques
+            .iter()
+            .find(|opaque| self.resolve(opaque.ret) == ty)
+            .and_then(|opaque| opaque.output.or_else(|| opaque.bindings.iter().find(|(of, name, _)| self.cx.lang(*of) == Some("future_trait") && name == "Output").map(|&(_, _, out)| out)))
+    }
+
+    /// The supertraits of `of` in vtable order, each paired with whether `of`'s parameters uniquely fix its type arguments.
+    pub(in crate::sema) fn vtable_traits(&mut self, of: ItemRef) -> Result<Vec<(ItemRef, bool)>> {
+        let traits = self.implied_traits(vec![of])?;
+        let count = super::scope::type_params(&self.cx.trait_generics(of)?.1.params).count();
+        let initial: Vec<_> = (0..=count).map(|at| self.cx.types.intern(Kind::Value(at as u128))).collect();
+        let bounds = self.expand_super_bounds(vec![(of, initial)])?;
+        Ok(traits
+            .into_iter()
+            .map(|owner| {
+                let fixed = owner == of || {
+                    let hits: Vec<_> = bounds.iter().filter(|(bound, _)| *bound == owner).collect();
+                    hits.len() == 1 && !hits[0].1[1..].iter().any(|&ty| self.has_vars(ty))
+                };
+                (owner, fixed)
+            })
+            .collect())
+    }
+
+    /// The associated type `name` of trait `of` that a bound of the pending `impl Trait` return `ty` fixes.
+    pub(super) fn opaque_binding(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
+        let bindings = self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).map(|opaque| opaque.bindings.clone()).unwrap_or_default();
+        for (bound_of, bound_name, out) in bindings {
+            if bound_name == name && (bound_of == of || self.implied_traits(vec![bound_of])?.contains(&of)) {
+                return Ok(Some(out));
+            }
+        }
+        Ok(None)
     }
 
     /// The function pointer type of the `Fn` bound on the pending `impl Trait` return value `ty`.
     pub(super) fn opaque_sig(&self, ty: Ty) -> Option<Ty> {
         self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).and_then(|opaque| opaque.sig)
     }
+
+    /// The function pointer type that the first `Fn` bound among `bounds` in `arena` spells, read through `frame`.
+    pub(super) fn first_fn_bound(&mut self, frame: Frame<'a>, arena: &Body, bounds: Vec<u32>) -> Result<Option<Ty>> {
+        let home = frame.home;
+        self.with_frame(frame, |infer| {
+            for bound in bounds {
+                if let Some(hint) = infer.fn_bound(arena, home, bound)? {
+                    return Ok(Some(hint));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    /// The function pointer type that an `Fn` bound on the outer parameter `name` spells in a header of the frame: the function's own, or its impl's or trait's.
+    pub(super) fn header_fn_bound(&mut self, name: &str, home: ModRef) -> Result<Option<Ty>> {
+        for (header, src) in self.headers()? {
+            let (arena, generics, predicates) = header.parts();
+            for bound in super::scope::named_bounds(arena, src, (generics, predicates), name) {
+                if let Some(hint) = self.in_source(src, |infer| infer.fn_bound(arena, home, bound))? {
+                    return Ok(Some(hint));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The function pointer type that an `impl Fn(A) -> B` return type of the body spells, which a closure it returns takes its signature from.
+    pub(super) fn opaque_fn_sig(&mut self) -> Result<Option<Ty>> {
+        self.ret_fn_sig(self.sig)
+    }
+
+    /// The function pointer type that an `impl Fn(A) -> B` return type of `sig` spells in the current frame.
+    pub(super) fn ret_fn_sig(&mut self, sig: &Signature) -> Result<Option<Ty>> {
+        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else {
+            return Ok(None);
+        };
+        for &bound in sig.body.list(bounds) {
+            if let Some(found) = self.fn_bound(&sig.body, self.home, bound)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The trait bounds other than `Fn` that an `impl Trait` return type of `sig` spells in the current frame, each with `ret` as `Self`.
+    pub(super) fn ret_bounds(&mut self, sig: &Signature, ret: Ty) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::new();
+        for &bound in sig.body.list(bounds) {
+            let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else {
+                continue;
+            };
+            if !self.is_callable_trait(of)
+                && let Ok(args) = self.bound_args(of, &sig.body, path, ret)
+            {
+                found.push((of, std::iter::once(ret).chain(args).collect()));
+            }
+        }
+        Ok(found)
+    }
+
+    /// The associated type bindings that an `impl Trait` return type of `sig` spells in the current frame.
+    pub(super) fn ret_bindings(&mut self, sig: &Signature) -> Result<Vec<(ItemRef, String, Ty)>> {
+        let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::new();
+        for &bound in sig.body.list(bounds) {
+            let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else {
+                continue;
+            };
+            if !self.is_callable_trait(of) {
+                for (name, ty) in self.path_bindings(&sig.body, path)? {
+                    found.push((of, name, ty));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    pub(super) fn fn_bound(&mut self, arena: &Body, home: ModRef, bound: u32) -> Result<Option<Ty>> {
+        let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
+            return Ok(None);
+        };
+        if !self.is_callable_trait(of) {
+            return Ok(None);
+        }
+        let Some(&last) = arena.list(arena.path(path).segments).last() else {
+            return Ok(None);
+        };
+        let (inputs, output) = match arena.segments[last as usize].args {
+            Some(Args::Paren { inputs, output }) => self.paren_sig(arena, inputs, output)?,
+            Some(Args::Angle(_)) => match self.angle_sig(arena, (of, path))? {
+                Some(sig) => sig,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(self.cx.types.intern(Kind::FnPtr(inputs, output))))
+    }
+
+    /// The inputs and output that the angle form `FnOnce<(A, B), Output = R>` of callable trait `of` names, once its argument tuple is known.
+    fn angle_sig(&mut self, arena: &Body, (of, path): (ItemRef, PathId)) -> Result<Option<(Vec<Ty>, Ty)>> {
+        let self_ty = self.fresh(Kind::Var);
+        let Some(&tuple) = self.bound_args(of, arena, path, self_ty)?.first() else {
+            return Ok(None);
+        };
+        let Kind::Tuple(inputs) = self.cx.types.kind(self.resolve(tuple)).clone() else {
+            return Ok(None);
+        };
+        let output = self.path_bindings(arena, path)?.into_iter().find(|(name, _)| name == "Output").map(|(_, ty)| ty);
+        Ok(Some((inputs, output.unwrap_or_else(|| self.fresh(Kind::Var)))))
+    }
 }
 
 /// The return type of `item` at `substs`, inferring its body once per pass, which also records the closures it defines.
 pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Ty> {
-    let key = (item, substs.to_vec());
-    match cx.store.lookups.reveals.get(&key) {
-        Some(Some(ty)) => return Ok(*ty),
-        Some(None) => return async_future(cx, item, substs)?.ok_or_else(|| anyhow!("the `impl Trait` return type of `{}` depends on itself", cx.name(item))),
-        None => {}
-    }
-    cx.store.lookups.reveals.insert(key.clone(), None);
-    let ret = super::infer(cx, item, substs).and_then(|typed| typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item))));
-    match &ret {
-        Ok(ty) => cx.store.lookups.reveals.insert(key, Some(*ty)),
-        Err(_) => cx.store.lookups.reveals.remove(&key),
-    };
-    ret
+    let reveals = cx.store.lookups.reveals.clone();
+    reveals.run(
+        cx,
+        (item, substs.to_vec()),
+        |cx| super::infer(cx, item, substs).and_then(|typed| typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)))),
+        |cx| async_future(cx, item, substs)?.ok_or_else(|| anyhow!("the `impl Trait` return type of `{}` depends on itself", cx.name(item))),
+    )
 }
 
 /// The future of the async fn `item` at `substs`, which names its body's coroutine without inferring it, as a call inside that body's own inference needs; none for other functions.

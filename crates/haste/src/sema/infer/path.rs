@@ -48,7 +48,9 @@ impl<'a> Infer<'_, 'a> {
     /// The bindings of the single name `name` at `path` in the module of the `macro` item that wrote it, when one did.
     fn def_site(&mut self, arena: &Body, path: PathId, name: Sym) -> Option<PerNs> {
         let first = arena.list(arena.path(path).segments)[0];
-        let Some(Mark::Home { krate, file, item }) = self.src.mark(arena.segments[first as usize].name) else { return None };
+        let Some(Mark::Home { krate, file, item }) = self.src.mark(arena.segments[first as usize].name) else {
+            return None;
+        };
         let module = self.cx.module_of(ItemRef { krate, file, item }).ok()?;
         let path = NamePath { segments: &[name], absolute: false, dollar: None };
         Some(self.cx.paths(module.krate).first(name, module, &path))
@@ -83,12 +85,12 @@ impl<'a> Infer<'_, 'a> {
             return self.type_def_here(path);
         }
         let here = self.anchor().and_then(|(root, from)| from.map(|at| root.inner(at)));
-        let key = (self.home, self.root, here, path.segments.to_vec(), path.absolute, path.dollar);
-        if let Some(&found) = self.cx.type_defs().borrow().get(&key) {
+        let scope = (self.home, self.root, here, path.absolute, path.dollar);
+        if let Some(found) = self.cx.type_def(scope, path.segments) {
             return Some(found);
         }
         let found = self.type_def_here(path)?;
-        self.cx.type_defs().borrow_mut().insert(key, found);
+        self.cx.set_type_def(scope, path.segments, found);
         Some(found)
     }
 
@@ -117,7 +119,7 @@ impl<'a> Infer<'_, 'a> {
             None => self.cx.local_path(self.anchor().filter(|(_, from)| from.is_some()), path, ns)?,
         };
         Some(match found {
-            BodyPath::Item(item) => Ok(Def::Item(item)),
+            BodyPath::Def(def) => Ok(def),
             BodyPath::Variant(item) => Ok(self.variant_def(item, *path.segments.last()?)?),
             BodyPath::Outside(skip) => Err(skip),
         })
@@ -135,17 +137,15 @@ impl<'a> Infer<'_, 'a> {
         let (first, rest) = path.segments.split_first()?;
         let local = if path.absolute { None } else { self.body_use(*first).types };
         let paths = self.cx.paths(self.home.krate);
-        let Some(binding) = local else { return paths.resolve(path, self.home) };
+        let Some(binding) = local else {
+            return paths.resolve(path, self.home);
+        };
         rest.iter().try_fold(binding.def, |def, segment| self.cx.path_member(self.home.krate, def, *segment).types.map(|found| found.def))
     }
 
     /// The bindings that the `use` declarations inside the body give `word`, each namespace from the first one that binds it.
     fn body_use(&mut self, word: Sym) -> PerNs {
-        self.body_imports(Some(word)).into_iter().fold(PerNs::default(), |found, entry| PerNs {
-            types: found.types.or(entry.types),
-            values: found.values.or(entry.values),
-            macros: found.macros.or(entry.macros),
-        })
+        self.body_imports(Some(word)).into_iter().fold(PerNs::default(), |found, entry| PerNs { types: found.types.or(entry.types), values: found.values.or(entry.values), macros: found.macros.or(entry.macros) })
     }
 
     /// The traits in scope through the body: those it declares and those its `use` declarations name.
@@ -164,11 +164,15 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn body_imports(&mut self, word: Option<Sym>) -> Vec<PerNs> {
-        let Some(root) = self.root.filter(|&root| self.cx.expansion(root).is_some_and(|found| !found.file.items.imports.is_empty())) else { return Vec::new() };
+        let Some(root) = self.root.filter(|&root| self.cx.expansion(root).is_some_and(|found| !found.file.items.imports.is_empty())) else {
+            return Vec::new();
+        };
         if let Some(found) = self.imports.get(&(root, word)) {
             return found.clone();
         }
-        let Ok(home) = self.cx.module_of(root) else { return Vec::new() };
+        let Ok(home) = self.cx.module_of(root) else {
+            return Vec::new();
+        };
         let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()).map(|item| self.cx.item(item).1.start);
         let before = self.cx.asks.mark();
         let found = self.cx.body_imports((root, home), word, here);
@@ -269,7 +273,9 @@ impl<'a> Infer<'_, 'a> {
 
     /// The type and const arguments of segment `count` of `path`, skipping lifetimes.
     pub(super) fn segment_args(&mut self, arena: &Body, path: PathId, count: usize) -> Result<Vec<Ty>> {
-        let Some(&last) = arena.list(arena.path(path).segments)[..count].last() else { return Ok(Vec::new()) };
+        let Some(&last) = arena.list(arena.path(path).segments)[..count].last() else {
+            return Ok(Vec::new());
+        };
         let list = match arena.segments[last as usize].args {
             None => return Ok(Vec::new()),
             Some(Args::Angle(list)) => list,
@@ -294,13 +300,17 @@ impl<'a> Infer<'_, 'a> {
 
     /// The associated types that the last segment of `path` binds, as `Name = T` or the output of `Fn(A) -> T`.
     pub(super) fn path_bindings(&mut self, arena: &Body, path: PathId) -> Result<Vec<(String, Ty)>> {
-        let Some(&last) = arena.list(arena.path(path).segments).last() else { return Ok(Vec::new()) };
+        let Some(&last) = arena.list(arena.path(path).segments).last() else {
+            return Ok(Vec::new());
+        };
         match arena.segments[last as usize].args {
             Some(Args::Paren { inputs, output }) => Ok(vec![("Output".to_string(), self.paren_sig(arena, inputs, output)?.1)]),
             Some(Args::Angle(list)) => {
                 let mut found = Vec::new();
                 for &at in arena.list(list) {
-                    let GenericArg::Binding { name, args: None, ty } = arena.args[at as usize] else { continue };
+                    let GenericArg::Binding { name, args: None, ty } = arena.args[at as usize] else {
+                        continue;
+                    };
                     found.push((self.src.text(name).to_string(), self.lower_ty(arena, ty)?));
                 }
                 Ok(found)
@@ -347,9 +357,9 @@ impl<'a> Infer<'_, 'a> {
             return Ok(params.iter().map(|_| self.fresh(Kind::Var)).collect());
         }
         for param in &params[args.len()..] {
-            let (GenericKind::Type, Some(default)) = (param.kind, param.default) else { bail!("`{}` needs {} type arguments, {} given", self.cx.name(item), params.len(), args.len()) };
+            let Some(default) = param.default else { bail!("`{}` needs {} type arguments, {} given", self.cx.name(item), params.len(), args.len()) };
             let known = args.clone();
-            args.push(self.within(item, &parsed.params, &known, |infer| infer.lower_ty(arena, default))?);
+            args.push(self.within(item, &parsed.params, &known, |infer| infer.ty_or_const_arg(arena, default))?);
         }
         Ok(args)
     }
@@ -362,6 +372,7 @@ impl<'a> Infer<'_, 'a> {
             syntax::Ty::Infer => Ok(self.fresh(Kind::Var)),
             syntax::Ty::Macro { path, open } => self.macro_ty(arena, path, open),
             syntax::Ty::ImplTrait(at, _) => Ok(self.impl_param(at)),
+            syntax::Ty::Const(expr) => self.const_arg(arena, expr),
             _ => {
                 let kind = self.lower_kind(arena, ty)?;
                 Ok(self.cx.types.intern(kind))
@@ -398,7 +409,9 @@ impl<'a> Infer<'_, 'a> {
     fn object_ty(&mut self, arena: &Body, bounds: syntax::List) -> Result<Kind> {
         let (mut principal, mut autos) = (None, Vec::new());
         for &bound in arena.list(bounds) {
-            let syntax::Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else { continue };
+            let syntax::Bound::Trait { path, maybe: false, .. } = arena.bounds[bound as usize] else {
+                continue;
+            };
             let Some(of) = self.trait_named(arena, path, self.home) else { bail!("a trait object bound that names no trait") };
             if self.cx.is_auto_trait(of) {
                 autos.push(of);
@@ -435,7 +448,9 @@ impl<'a> Infer<'_, 'a> {
 
     /// The type that the associated type `name` of impl `block` is, read in the current frame over the alias's own source, when the impl has one.
     pub(super) fn impl_alias(&mut self, block: ImplRef, (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
-        let Some(member) = self.cx.member(block, name) else { return Ok(None) };
+        let Some(member) = self.cx.member(block, name) else {
+            return Ok(None);
+        };
         if self.cx.item(member).1.kind != ItemKind::Type {
             return Ok(None);
         }
@@ -462,7 +477,7 @@ impl<'a> Infer<'_, 'a> {
             let arg = match param.default.filter(|_| !infer_all) {
                 Some(default) => {
                     let known = args.clone();
-                    self.within(item, &params[..known.len()], &known, |infer| infer.lower_ty(&declared.0, default))?
+                    self.within(item, &params[..known.len()], &known, |infer| infer.ty_or_const_arg(&declared.0, default))?
                 }
                 None => self.fresh(Kind::Var),
             };
@@ -502,7 +517,6 @@ impl<'a> Infer<'_, 'a> {
     fn lower_list(&mut self, arena: &Body, list: syntax::List) -> Result<Vec<Ty>> {
         arena.list(list).iter().map(|&item| self.lower_ty(arena, TyId(item))).collect()
     }
-
 
     fn path_ty(&mut self, arena: &Body, path: PathId) -> Result<Ty> {
         match arena.path(path).qself {
@@ -562,6 +576,9 @@ impl<'a> Infer<'_, 'a> {
 
     fn item_ty(&mut self, item: ItemRef, given: Vec<Ty>, fresh: bool) -> Result<Ty> {
         if self.cx.item(item).1.kind == ItemKind::Type {
+            if self.cx.foreign(item) {
+                return Ok(self.cx.types.intern(Kind::Adt(item, Vec::new())));
+            }
             return self.alias(item, given, fresh);
         }
         let args = self.adt_args(item, given, fresh)?;
@@ -582,7 +599,6 @@ impl<'a> Infer<'_, 'a> {
         }
     }
 
-    /// The type `<qself as Trait>::Name` names: the impl's associated type, or the pointer metadata the compiler provides.
     /// The associated type that segment `segment` names on `<qself as trait_path>`.
     pub(super) fn projection(&mut self, arena: &Body, (qself, trait_path): (TyId, PathId), segment: u32) -> Result<Ty> {
         let ty = self.lower_ty(arena, qself)?;
@@ -603,19 +619,13 @@ impl<'a> Infer<'_, 'a> {
 
     /// The pointer metadata of `ty`: a length for slices and `str`, nothing for sized types, or a variable until `ty` is known.
     pub fn metadata_of(&mut self, ty: Ty) -> Result<Ty> {
-        match self.cx.types.kind(self.resolve(ty)) {
-            Kind::Slice(_) | Kind::Prim(Primitive::Str) => Ok(self.cx.types.prim(Primitive::Usize)),
-            Kind::Dyn(..) => {
-                let Some(metadata) = self.cx.lang_item("dyn_metadata") else { bail!("core has no `DynMetadata`") };
-                Ok(self.cx.types.intern(Kind::Adt(metadata, vec![ty])))
-            }
-            Kind::Var(_) => {
-                let result = self.fresh(Kind::Var);
-                self.metadata.push((ty, result));
-                Ok(result)
-            }
-            _ => Ok(self.cx.types.unit()),
+        if let Some(found) = self.pointee_metadata(ty)? {
+            return Ok(found);
         }
+        let tail = self.struct_tail(ty)?;
+        let result = self.fresh(Kind::Var);
+        self.metadata.push((tail, result));
+        Ok(result)
     }
 
     pub(super) fn spell(&self, segments: &[Sym]) -> String {

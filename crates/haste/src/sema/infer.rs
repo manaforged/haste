@@ -1,14 +1,15 @@
 mod adt;
+mod array;
 mod assoc;
 mod clone;
-mod consts;
-mod array;
 mod closure;
 mod coerce;
+mod consts;
 mod deref;
+mod drop;
 mod expr;
-mod matching;
 mod looping;
+mod matching;
 mod method;
 mod object;
 mod opaque;
@@ -17,30 +18,32 @@ mod path;
 mod pattern;
 mod project;
 mod scope;
-mod drop;
 mod select;
 mod stmt;
 mod zonk;
 
-pub use adt::Fields;
+pub use adt::{Fields, maybe_unsized};
 pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, register};
-pub use drop::Glue;
-pub use looping::{For, Tried};
-pub use method::Adjust;
 pub use coerce::Coercion;
 pub use consts::{Anon, Arena};
+pub use drop::{Glue, drop_fn, has_drop_impl, needs_drop};
+pub use looping::{For, Tried};
+pub use method::Adjust;
 pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
 pub use scope::{Form, type_params};
+
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap as HashMap;
 
 use anyhow::{Result, bail};
 
 use crate::body::sig::Signature;
-use crate::body::{Body, BlockKind, Expr, ExprId, PatId};
+use crate::body::{BlockKind, Body, Expr, ExprId, PatId};
 use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::source::Source;
 
@@ -81,12 +84,11 @@ pub enum Shape {
     Anon(Anon),
 }
 
-/// The inferred types and resolutions of one function body at one set of type arguments.
+/// The shared expression, pattern, operator and closure tables of an inferred body.
 #[derive(Clone, Debug, Default)]
-pub struct Typed {
+pub struct BodyTables {
     pub exprs: Vec<Ty>,
     pub res: HashMap<ExprId, Res>,
-    pub locals: Vec<Local>,
     pub binds: HashMap<PatId, u32>,
     pub adjusts: HashMap<ExprId, Adjust>,
     /// The field accesses and calls that dereference their base or callee this many times first, through references and `Box`es.
@@ -115,14 +117,10 @@ pub struct Typed {
     /// The call arguments that `#[rustc_legacy_const_generics]` turns into const generic arguments, which pass no value.
     pub const_args: rustc_hash::FxHashSet<ExprId>,
     pub pats: HashMap<PatId, Ty>,
-    pub params: Vec<u32>,
-    pub ret: Option<Ty>,
     pub fors: HashMap<ExprId, For>,
     pub tries: HashMap<ExprId, Tried>,
     /// The `.await` expressions of the body, with the calls each makes.
     pub awaits: HashMap<ExprId, Awaited>,
-    /// The drop glue of each type that a local or a temporary of the body holds and that needs drop.
-    pub drops: Vec<Res>,
     /// The closure expressions of the body.
     pub closures: HashMap<ExprId, Closure>,
     /// The `try` blocks of the body, each with the `Try::from_output` call that wraps its value.
@@ -131,8 +129,33 @@ pub struct Typed {
     pub box_frees: HashMap<ExprId, Res>,
     /// The parameter locals whose pattern takes the argument apart, with that pattern in the body's arena.
     pub unpacks: HashMap<u32, PatId>,
+}
+
+/// The inferred types and resolutions of one function body at one set of type arguments.
+#[derive(Clone, Debug, Default)]
+pub struct Typed {
+    pub tables: Arc<BodyTables>,
+    pub locals: Vec<Local>,
+    pub params: Vec<u32>,
+    pub ret: Option<Ty>,
+    /// The drop glue of each type that a local or a temporary of the body holds and that needs drop.
+    pub drops: Vec<Res>,
     /// What the code of this instance is.
     pub shape: Shape,
+}
+
+impl Deref for Typed {
+    type Target = BodyTables;
+
+    fn deref(&self) -> &BodyTables {
+        &self.tables
+    }
+}
+
+impl DerefMut for Typed {
+    fn deref_mut(&mut self) -> &mut BodyTables {
+        Arc::make_mut(&mut self.tables)
+    }
 }
 
 impl Typed {
@@ -167,10 +190,25 @@ impl Typed {
                 Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
             }
         });
-        self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values()).chain(loops).chain(tries).chain(awaits).chain(&self.drops).chain(glue).chain(untuple).chain(cloned).chain(coerced).filter_map(|res| match res {
-            Res::Fn(item, substs) => Some((*item, &substs[..])),
-            _ => None,
-        })
+        self.res
+            .values()
+            .chain(self.pat_res.values())
+            .chain(self.derefs.values())
+            .chain(self.operators.values())
+            .chain(self.try_blocks.values())
+            .chain(self.box_frees.values())
+            .chain(loops)
+            .chain(tries)
+            .chain(awaits)
+            .chain(&self.drops)
+            .chain(glue)
+            .chain(untuple)
+            .chain(cloned)
+            .chain(coerced)
+            .filter_map(|res| match res {
+                Res::Fn(item, substs) => Some((*item, &substs[..])),
+                _ => None,
+            })
     }
 }
 
@@ -212,7 +250,7 @@ pub struct Infer<'c, 'a> {
     hidden: Vec<(u32, Ty)>,
     /// The values of the parameters of the const fns that a constant expression is calling, innermost last.
     const_args: Vec<(String, (u128, (u32, bool)))>,
-    selecting: Vec<String>,
+    selecting: Vec<u64>,
     /// How many frames of aliases, constants and other items' syntax are open, which `RECURSION_LIMIT` bounds.
     frames: usize,
     /// The constants being evaluated, innermost last, so a constant that depends on itself is an error.
@@ -246,7 +284,7 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed
     let sig = cx.signature(item)?;
     let slot = object::virtual_slot(cx, item, substs)?;
     let foreign = cx.foreign(item) || slot.is_some();
-    let body = if foreign { std::rc::Rc::default() } else { cx.body(item)? };
+    let body = if foreign { std::sync::Arc::default() } else { cx.body(item)? };
     let src = cx.body_src(item);
     let home = cx.module_of(item)?;
     let root = Some(item.body_owner());
@@ -266,7 +304,7 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed
 
 fn settle(cx: &mut Context<'_>, instance: (ItemRef, &[Ty]), mut typed: Typed) -> Result<Typed> {
     closure::register(cx, instance, &typed);
-    if object::fill_drops(cx, &mut typed)? {
+    if !typed.coercions.is_empty() && object::fill_drops(cx, &mut typed)? {
         closure::register(cx, instance, &typed);
     }
     typed.drops = drop::drop_calls(cx, &typed)?;
@@ -291,7 +329,9 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
         let Some(&ty) = substs.first() else { bail!("drop glue with no type") };
         return drop::glue_typed(cx, item, ty).map(Some);
     }
-    let Some(&ty) = substs.first() else { return Ok(None) };
+    let Some(&ty) = substs.first() else {
+        return Ok(None);
+    };
     if cx.lang(item) == Some("clone_fn") && clone::compiler_clone(cx, ty) {
         return clone::clone_typed(cx, item, ty).map(Some);
     }
@@ -309,7 +349,41 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
 impl<'c, 'a> Infer<'c, 'a> {
     fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out: Typed::default(), scopes, items, loops, uses, unsure: Vec::new(), diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), frames: 0, evaluating: Vec::new(), imports: HashMap::default() }
+        Infer {
+            cx,
+            body,
+            sig,
+            src,
+            root: None,
+            instance: None,
+            home,
+            generics,
+            self_ty: None,
+            block: None,
+            frame_item: None,
+            vars,
+            metadata,
+            obligations,
+            projections,
+            opaques,
+            operands,
+            try_blocks,
+            awaits: Vec::new(),
+            ret_sig: None,
+            out: Typed::default(),
+            scopes,
+            items,
+            loops,
+            uses,
+            unsure: Vec::new(),
+            diverges: false,
+            hidden: Vec::new(),
+            const_args: Vec::new(),
+            selecting: Vec::new(),
+            frames: 0,
+            evaluating: Vec::new(),
+            imports: HashMap::default(),
+        }
     }
 }
 
@@ -418,6 +492,9 @@ impl Infer<'_, '_> {
 
     fn bind(&mut self, var: Ty, to: Ty) -> Result<(), Clash> {
         let index = self.var_of(var).unwrap_or(u32::MAX) as usize;
+        if index >= self.vars.len() {
+            return Err(Clash { a: var, b: to, cycle: false });
+        }
         let accepts = match (self.cx.types.kind(var), self.cx.types.kind(to)) {
             (Kind::Var(_), _) => true,
             (Kind::IntVar(_), Kind::IntVar(_)) | (Kind::FloatVar(_), Kind::FloatVar(_)) => true,
@@ -478,11 +555,15 @@ impl Infer<'_, '_> {
     fn unify_shapes(&mut self, a: &Kind, b: &Kind) -> Result<(), ()> {
         let pairs: Vec<(Ty, Ty)> = match (a, b) {
             (Kind::Tuple(x), Kind::Tuple(y)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).collect(),
-            (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => vec![(*x, *y)],
+            (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => {
+                vec![(*x, *y)]
+            }
             (Kind::Array(x, m), Kind::Array(y, n)) => vec![(*x, *y), (*m, *n)],
             (Kind::Slice(x), Kind::Slice(y)) => vec![(*x, *y)],
             (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => vec![(*x, *y)],
-            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, ..), Kind::Dyn(j, y, ..)) if i == j && x.len() == y.len() && dyn_members(a) == dyn_members(b) => x.iter().copied().zip(y.iter().copied()).collect(),
+            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, ..), Kind::Dyn(j, y, ..)) if i == j && x.len() == y.len() && dyn_members(a) == dyn_members(b) => {
+                x.iter().copied().zip(y.iter().copied()).collect()
+            }
             (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).chain([(*r, *s)]).collect(),
             _ => return Err(()),
         };
@@ -538,6 +619,12 @@ impl Infer<'_, '_> {
 
     /// Coerces the value of `expr`, of type `found`, to `expected`, at each branch value it ends in, recording an array-to-slice unsizing.
     pub fn coerce_expr(&mut self, expr: ExprId, found: Ty, expected: Ty) -> Result<()> {
+        if self.known(Some(expected)).is_none() {
+            return self.coerce(found, expected);
+        }
+        if self.resolve(found) == self.resolve(expected) {
+            return Ok(());
+        }
         if let Some(ends) = self.branch_ends(expr) {
             for end in ends {
                 let found = self.out.exprs[end.0 as usize];
@@ -610,7 +697,9 @@ impl Infer<'_, '_> {
                 matched.push(types);
             }
         }
-        let [types] = &matched[..] else { return Ok(false) };
+        let [types] = &matched[..] else {
+            return Ok(false);
+        };
         substs.iter().zip(types).try_for_each(|(&a, &b)| self.unify(a, b))?;
         Ok(true)
     }
@@ -630,9 +719,9 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    /// What a query can leave behind: the asks of the pass and the pending projections and obligations, which a cached answer must not have added to.
-    fn unsettled(&self) -> ([usize; 5], usize, usize) {
-        (self.cx.asks.mark(), self.projections.len(), self.obligations.len())
+    /// What a query can leave behind: the asks and deferred evaluations of the pass and the pending projections and obligations, which a cached answer must not have added to.
+    fn unsettled(&self) -> ((usize, usize), usize, usize) {
+        (self.cx.quiet_mark(), self.projections.len(), self.obligations.len())
     }
 
     /// Whether no body state can reach a lowered type: no instance, block items, locals, const fn arguments, constants being evaluated or selection in progress, so an answer here holds for every body.
@@ -663,55 +752,9 @@ fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
     }
 }
 
-/// Whether the struct `item` may end in an unsized field, which its definition decides for every instantiation as rustc's layout does; with no `?Sized` parameter, a tail the stand-ins cannot lower, such as a projection on one, is sized.
-pub fn maybe_unsized(cx: &mut Context<'_>, item: ItemRef) -> Result<bool> {
-    if cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
-        return Ok(false);
-    }
-    let def = cx.adt_def(item)?;
-    let src = &cx.file(item).source;
-    let byte = cx.types.intern(Kind::Prim(Primitive::U8));
-    let stand_ins = [cx.types.intern(Kind::Value(1)), cx.types.intern(Kind::Slice(byte)), byte];
-    let args: Vec<Ty> = scope::type_params(&def.generics.params).map(|generic| match generic.kind {
-        crate::body::sig::GenericKind::Const(_) => stand_ins[0],
-        _ if relaxed(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
-        _ => stand_ins[2],
-    }).collect();
-    let any_relaxed = args.contains(&stand_ins[1]);
-    let ty = cx.types.intern(Kind::Adt(item, args.clone()));
-    match cx.is_unsized(ty) {
-        Err(_) if !any_relaxed => Ok(false),
-        Err(_) => detached(cx, item, |infer| infer.open_tail_unsized(item, &args, stand_ins[2])),
-        found => found,
-    }
-}
-
-fn relaxed(arena: &Body, src: &Source, predicates: &[crate::body::sig::Predicate], generic: &crate::body::sig::Generic) -> bool {
-    let bounds = scope::generic_bounds(arena, src, predicates, generic);
-    bounds.iter().any(|&bound| matches!(arena.bounds[bound as usize], crate::body::Bound::Trait { maybe: true, .. }))
-}
-
 /// The discriminant of each variant of the enum `item`, whose tags are integers of type `primitive`.
 pub fn discriminants(cx: &mut Context<'_>, item: ItemRef, primitive: Primitive) -> Result<Vec<i128>> {
     detached(cx, item, |infer| infer.discriminants(item, primitive))
-}
-
-/// Whether dropping a value of `ty` runs code.
-pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
-    detached(cx, anchor, |infer| infer.needs_drop(ty))
-}
-
-/// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
-pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
-    detached(cx, anchor, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
-}
-
-/// The `Drop::drop` of `ty`'s own `Drop` impl, which for a `Box` frees the allocation without dropping what it owns.
-pub fn drop_fn(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
-    detached(cx, anchor, |infer| infer.own_drop(ty))
 }
 
 /// The return type of the non-generic function `item`.

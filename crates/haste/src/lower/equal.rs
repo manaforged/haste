@@ -42,7 +42,9 @@ impl Lower<'_, '_> {
         for (index, field) in fields.into_iter().enumerate() {
             let at = |base| Place { base: Base::Addr(base), offset: 0, repr: whole };
             let (left, right) = (self.part_place(at(x), ty, (0, index as u32))?, self.part_place(at(y), ty, (0, index as u32))?);
-            let (Some(left), Some(right)) = (self.read(left), self.read(right)) else { continue };
+            let (Some(left), Some(right)) = (self.read(left), self.read(right)) else {
+                continue;
+            };
             let same = self.equal(field, left, right)?;
             all = self.ins().band(all, same);
         }
@@ -56,7 +58,9 @@ impl Lower<'_, '_> {
             _ => {
                 let pointee = repr(self.cx, inner)?;
                 let (left, right) = (Place { base: Base::Addr(x), offset: 0, repr: pointee }, Place { base: Base::Addr(y), offset: 0, repr: pointee });
-                let (Some(left), Some(right)) = (self.read(left), self.read(right)) else { return Ok(self.ins().iconst(Type::I8, 1)) };
+                let (Some(left), Some(right)) = (self.read(left), self.read(right)) else {
+                    return Ok(self.ins().iconst(Type::I8, 1));
+                };
                 return self.equal(inner, left, right);
             }
         };
@@ -80,7 +84,9 @@ impl Lower<'_, '_> {
             let offset = lower.ins().imul_imm(index, size);
             let (left, right) = (lower.ins().iadd(x, offset), lower.ins().iadd(y, offset));
             let at = |base| Place { base: Base::Addr(base), offset: 0, repr: part };
-            let (Some(left), Some(right)) = (lower.read(at(left)), lower.read(at(right))) else { return };
+            let (Some(left), Some(right)) = (lower.read(at(left)), lower.read(at(right))) else {
+                return;
+            };
             match lower.equal(element, left, right) {
                 Ok(same) => {
                     let so_far = lower.ins().stack_load(Type::I8, all, 0);

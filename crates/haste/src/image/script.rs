@@ -18,7 +18,9 @@ impl Image {
     /// Runs `script` in this forked child with `out` as its standard output, and returns its exit status.
     pub fn enter_script(&self, script: &Script, out: std::fs::File) -> i32 {
         let vars: Result<Vec<(CString, CString)>, std::ffi::NulError> = script.vars.iter().map(|(key, value)| Ok((CString::new(key.as_str())?, CString::new(value.as_str())?))).collect();
-        let (Ok(vars), Ok(dir), Ok(log)) = (vars, CString::new(script.dir.as_os_str().as_encoded_bytes()), std::fs::File::create(&script.log)) else { return 101 };
+        let (Ok(vars), Ok(dir), Ok(log)) = (vars, CString::new(script.dir.as_os_str().as_encoded_bytes()), std::fs::File::create(&script.log)) else {
+            return 101;
+        };
         // SAFETY: this is the forked child, which owns out and log; every string is a live C string.
         unsafe {
             libc::dup2(out.as_raw_fd(), 1);

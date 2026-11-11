@@ -2,8 +2,8 @@ use anyhow::Result;
 use rustc_lexer::TokenKind;
 
 use super::cursor::{Cursor, is_name};
-use crate::outline::source::opens;
 use super::{Args, Bound, GenericArg, Path, PathId, Segment, Ty};
+use crate::outline::source::opens;
 
 /// Where a path is written, which decides how generic arguments open.
 #[derive(Clone, Copy, PartialEq, Eq)]

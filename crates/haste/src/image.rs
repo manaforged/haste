@@ -7,40 +7,41 @@ mod stub;
 mod workers;
 
 pub use expand::{Job, run_macros};
-pub use lazy::{Jit, Driver, Ended, Program, entries, evaluator, run_on_demand, serve};
+pub use lazy::{Driver, Ended, Jit, Program, entries, evaluator, run_on_demand, serve};
 pub use script::Script;
 
-use std::cell::RefCell;
 use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rustc_hash::FxHashMap as HashMap;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Arena, Memory};
+use haste_codegen::{Arena, Code, Memory};
 
 use crate::lower::{self, Slots, Word};
 use crate::sema::Context;
-use crate::sema::reach::Reached;
+use crate::sema::reach::{Instance, Reached};
+use crate::sync::lock;
 
 const SHARED_BYTES: usize = 4 << 30;
 const STATE_BYTES: usize = 1 << 30;
 const CODE_BYTES: usize = 1 << 30;
 const TABLE_SLOTS: usize = 1 << 22;
 
-/// The call table, code memory and data of the running program, in memory that compile workers forked from this process share, and the cells the program writes, in memory each run holds its own copy of.
+/// The call table, code memory and data of the running program, in memory shared with children forked from this process, and the cells the program writes, in memory each run holds its own copy of.
 pub struct Image {
     table: usize,
     _low: Arena,
     capacity: usize,
     memory: Memory,
     stubs: Memory,
-    shared: RefCell<Arena>,
-    state: RefCell<Arena>,
-    tables: RefCell<HashMap<Vec<Word>, i64>>,
-    fixups: RefCell<Vec<(usize, usize)>>,
-    cells: RefCell<HashMap<usize, i64>>,
-    wanted: RefCell<Vec<crate::sema::reach::Instance>>,
+    shared: Mutex<Arena>,
+    state: Mutex<Arena>,
+    tables: Mutex<HashMap<Vec<Word>, i64>>,
+    fixups: Mutex<Vec<(usize, usize)>>,
+    cells: Mutex<HashMap<usize, i64>>,
+    wanted: Mutex<Vec<Instance>>,
     bodies: lower::Bodies,
 }
 
@@ -50,30 +51,31 @@ impl Slots for Image {
     }
 
     fn data(&self, bytes: &[u8]) -> i64 {
-        let address = self.shared.borrow_mut().alloc(bytes.len()).unwrap_or_else(|error| panic!("{error}"));
+        let address = lock(&self.shared).alloc(bytes.len()).unwrap_or_else(|error| panic!("{error}"));
         // SAFETY: alloc handed out `bytes.len()` writable bytes at address that nothing else uses, and they do not overlap `bytes`.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
         address as i64
     }
 
     fn table(&self, words: &[Word]) -> i64 {
-        if let Some(&address) = self.tables.borrow().get(words) {
+        let mut tables = lock(&self.tables);
+        if let Some(&address) = tables.get(words) {
             return address;
         }
         let bytes: Vec<u8> = words.iter().flat_map(|word| (if let Word::Int(value) = *word { value } else { 0 }).to_le_bytes()).collect();
         let address = self.data(&bytes);
         let codes = words.iter().enumerate().filter_map(|(at, word)| if let Word::Code(index) = *word { Some((address as usize + at * 8, index)) } else { None });
-        self.fixups.borrow_mut().extend(codes);
-        self.tables.borrow_mut().insert(words.to_vec(), address);
+        lock(&self.fixups).extend(codes);
+        tables.insert(words.to_vec(), address);
         address
     }
 
     fn zeroed(&self, len: usize) -> i64 {
-        self.state.borrow_mut().alloc(len).unwrap_or_else(|error| panic!("{error}")) as i64
+        lock(&self.state).alloc(len).unwrap_or_else(|error| panic!("{error}")) as i64
     }
 
-    fn want(&self, instance: crate::sema::reach::Instance) {
-        self.wanted.borrow_mut().push(instance);
+    fn want(&self, instance: Instance) {
+        lock(&self.wanted).push(instance);
     }
 
     fn bodies(&self) -> &lower::Bodies {
@@ -81,11 +83,12 @@ impl Slots for Image {
     }
 
     fn cell(&self, index: usize, size: u32) -> i64 {
-        if let Some(&address) = self.cells.borrow().get(&index) {
+        let mut cells = lock(&self.cells);
+        if let Some(&address) = cells.get(&index) {
             return address;
         }
         let address = self.zeroed(size as usize + 1);
-        self.cells.borrow_mut().insert(index, address);
+        cells.insert(index, address);
         address
     }
 }
@@ -110,7 +113,24 @@ impl Image {
         let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
         let memory = Memory::default();
         let state = Arena::private(STATE_BYTES)?;
-        Ok(Image { table, _low: low, capacity, memory, stubs: Memory::default(), shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), wanted: RefCell::default(), bodies: lower::Bodies::default() })
+        Ok(Image {
+            table,
+            _low: low,
+            capacity,
+            memory,
+            stubs: Memory::default(),
+            shared: Mutex::new(shared),
+            state: Mutex::new(state),
+            tables: Mutex::default(),
+            fixups: Mutex::default(),
+            cells: Mutex::default(),
+            wanted: Mutex::default(),
+            bodies: lower::Bodies::default(),
+        })
+    }
+
+    pub(super) fn take_wanted(&self) -> Vec<Instance> {
+        std::mem::take(&mut *lock(&self.wanted))
     }
 
     fn slot(&self, index: usize) -> &AtomicUsize {
@@ -164,25 +184,29 @@ impl Image {
                 (Ok(address), false) => address as i64,
                 (Err(_), false) => continue,
             };
-            self.cells.borrow_mut().insert(index, cell);
+            lock(&self.cells).insert(index, cell);
         }
     }
 
     fn link(&mut self) {
-        for &(address, index) in self.fixups.borrow().iter() {
+        for &(address, index) in lock(&self.fixups).iter() {
             let code = self.slot(index).load(Ordering::Acquire) as u64;
             // SAFETY: address is a word of a constant table that data handed out, which stays mapped for the life of the process.
             unsafe { (address as *mut u64).write_unaligned(code) };
         }
     }
 
-    fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
+    pub(super) fn encode_one(&self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<Code> {
         let lowered = self.bodies.body(index);
         let func = match lowered {
-            Some(body) => std::rc::Rc::unwrap_or_clone(body),
+            Some(body) => Arc::unwrap_or_clone(body),
             None => lower::lower(cx, reached, self, index)?,
         };
-        let code = haste_codegen::compile(func, haste_codegen::Target::host())?;
+        Ok(haste_codegen::compile(func, haste_codegen::Target::host())?)
+    }
+
+    fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
+        let code = self.encode_one(cx, reached, index)?;
         Ok(self.memory.write(code.bytes())?)
     }
 
@@ -231,7 +255,9 @@ impl Image {
     /// Runs the program the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling; returns its exit status.
     fn enter_main(&self, (start, main): (usize, usize), args: &[String]) -> i32 {
         let (start, main) = (self.slot(start).load(Ordering::Acquire), self.slot(main).load(Ordering::Acquire));
-        let Ok(owned) = args.iter().map(|arg| std::ffi::CString::new(arg.as_str())).collect::<Result<Vec<_>, _>>() else { return 101 };
+        let Ok(owned) = args.iter().map(|arg| std::ffi::CString::new(arg.as_str())).collect::<Result<Vec<_>, _>>() else {
+            return 101;
+        };
         let mut argv: Vec<*const u8> = owned.iter().map(|arg| arg.as_ptr().cast()).collect();
         argv.push(std::ptr::null());
         // SAFETY: start is code that the encoder wrote, or a stub that compiles it, for `lang_start::<T>(fn() -> T, isize, *const *const u8, u8) -> isize`, and main for the `fn() -> T` it takes.

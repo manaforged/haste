@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::body::sig::Predicate;
 use crate::body::{Body, PathId};
-use crate::names::{ItemRef, ModRef};
+use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 
@@ -26,7 +26,9 @@ impl Infer<'_, '_> {
         {
             return Ok(Some(ty));
         }
-        let Some(ty) = self.param_ty(param) else { return Ok(None) };
+        let Some(ty) = self.param_ty(param) else {
+            return Ok(None);
+        };
         if param == "Self"
             && let Some(of) = self.frame_item.and_then(|item| self.cx.owner_trait(item))
         {
@@ -36,7 +38,9 @@ impl Infer<'_, '_> {
                 return self.project(owner, ty, args, name).map(Some);
             }
         }
-        let Some(bound) = self.bound_trait((param, ty), name, Self::reaches_assoc_ty)? else { return Ok(None) };
+        let Some(bound) = self.bound_trait((param, ty), name, Self::reaches_assoc_ty)? else {
+            return Ok(None);
+        };
         match self.assoc_owner(bound, ty, name, 0)? {
             Some((of, args)) => self.project(of, ty, args, name).map(Some),
             None => Ok(None),
@@ -48,7 +52,9 @@ impl Infer<'_, '_> {
         if let Some(ty) = self.impl_alias(block, (name, &[]))? {
             return Ok(Some(ty));
         }
-        let (Some(of), Some(self_ty)) = (self.cx.impl_trait(block), self.self_ty) else { return Ok(None) };
+        let (Some(of), Some(self_ty)) = (self.cx.impl_trait(block), self.self_ty) else {
+            return Ok(None);
+        };
         let args = self.fresh_trait_args(of)?;
         match self.assoc_owner((of, args), self_ty, name, 0)? {
             Some((owner, args)) => self.project(owner, self_ty, args, name).map(Some),
@@ -60,7 +66,7 @@ impl Infer<'_, '_> {
     pub(super) fn param_ty(&self, param: &str) -> Option<Ty> {
         match param {
             "Self" => self.self_ty,
-            _ => self.generics.iter().find(|(generic, _)| *generic == param).map(|&(_, ty)| ty),
+            _ => self.generics.iter().find(|(generic, _)| super::scope::same_param(generic, param)).map(|&(_, ty)| ty),
         }
     }
 
@@ -126,7 +132,9 @@ impl Infer<'_, '_> {
         self.with_frame(frame, |infer| {
             let mut found = Vec::new();
             for &bound in def.0.list(def.1.supers) {
-                let Some((parent, path)) = infer.bound_trait_at(&def.0, bound, home) else { continue };
+                let Some((parent, path)) = infer.bound_trait_at(&def.0, bound, home) else {
+                    continue;
+                };
                 if let Ok(args) = infer.bound_args(parent, &def.0, path, substs[0]) {
                     let bindings = infer.path_bindings(&def.0, path)?;
                     found.push(((parent, std::iter::once(substs[0]).chain(args).collect()), bindings));
@@ -157,7 +165,9 @@ impl Infer<'_, '_> {
 
     /// The trait whose default method the frame types, with its `Self` and arguments, which the method may assume holds.
     fn own_trait(&mut self) -> Result<Option<(ItemRef, Vec<Ty>)>> {
-        let (Some(of), Some(self_ty), None) = (self.frame_item.and_then(|item| self.cx.owner_trait(item)), self.self_ty, self.block) else { return Ok(None) };
+        let (Some(of), Some(self_ty), None) = (self.frame_item.and_then(|item| self.cx.owner_trait(item)), self.self_ty, self.block) else {
+            return Ok(None);
+        };
         let def = self.cx.trait_generics(of)?;
         let src = &self.cx.file(of).source;
         let args: Option<Vec<Ty>> = type_params(&def.1.params).map(|param| self.generics.iter().find(|(name, _)| *name == src.text(param.name)).map(|&(_, ty)| ty)).collect();
@@ -169,17 +179,24 @@ impl Infer<'_, '_> {
         let def = self.cx.trait_generics(of)?;
         let params: Vec<_> = type_params(&def.1.params).copied().collect();
         let mut found = Vec::new();
-        for member in self.cx.children(of).filter(|&member| self.cx.item(member).1.kind == ItemKind::Type).collect::<Vec<_>>() {
+        for member in self.cx.children(of) {
+            if self.cx.item(member).1.kind != ItemKind::Type {
+                continue;
+            }
             let bounds = self.cx.trait_generics(member)?;
             if bounds.1.supers.len == 0 || substs.len() != params.len() + 1 {
                 continue;
             }
-            let Some(value) = self.picked_alias(of, substs[0], &substs[1..], (self.cx.name(member), &[]))? else { continue };
+            let Some(value) = self.picked_alias(of, substs[0], &substs[1..], (self.cx.name(member), &[]))? else {
+                continue;
+            };
             let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), None))?;
             let home = frame.home;
             self.with_frame(frame, |infer| {
                 for &bound in bounds.0.list(bounds.1.supers) {
-                    let Some((trait_of, path)) = infer.bound_trait_at(&bounds.0, bound, home) else { continue };
+                    let Some((trait_of, path)) = infer.bound_trait_at(&bounds.0, bound, home) else {
+                        continue;
+                    };
                     if let Ok(args) = infer.bound_args(trait_of, &bounds.0, path, value) {
                         found.push((trait_of, std::iter::once(value).chain(args).collect()));
                     }
@@ -196,7 +213,9 @@ impl Infer<'_, '_> {
             let (arena, generics, predicates) = header.parts();
             let done = self.in_source(src, |infer| {
                 for bound in named_bounds(arena, src, (generics, predicates), param) {
-                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else { continue };
+                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else {
+                        continue;
+                    };
                     if keep(infer, of)? {
                         found.push((of, infer.bound_args(of, arena, path, ty)?));
                         if first {
@@ -220,7 +239,9 @@ impl Infer<'_, '_> {
             let (arena, _, predicates) = header.parts();
             self.in_source(src, |infer| {
                 for (ty, bound) in infer.typed_predicates(arena, src, predicates) {
-                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else { continue };
+                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else {
+                        continue;
+                    };
                     found.push((of, std::iter::once(ty).chain(infer.bound_args(of, arena, path, ty)?).collect()));
                 }
                 Ok(())
@@ -233,8 +254,12 @@ impl Infer<'_, '_> {
     fn typed_predicates(&mut self, arena: &Body, src: &Source, predicates: &[Predicate]) -> Vec<(Ty, u32)> {
         let mut found = Vec::new();
         for predicate in predicates {
-            let Some(ty) = predicate.ty.filter(|&ty| one_name(arena, src, ty).is_none()) else { continue };
-            let Ok(ty) = self.lower_ty(arena, ty) else { continue };
+            let Some(ty) = predicate.ty.filter(|&ty| one_name(arena, src, ty).is_none()) else {
+                continue;
+            };
+            let Ok(ty) = self.lower_ty(arena, ty) else {
+                continue;
+            };
             found.extend(arena.list(predicate.bounds).iter().map(|&bound| (ty, bound)));
         }
         found
@@ -311,7 +336,9 @@ impl Infer<'_, '_> {
         if let Some(found) = self.builtin_alias(of, ty, name)? {
             return Ok(Some(found));
         }
-        let Some(selected) = self.select(of, ty, args)? else { return Ok(None) };
+        let Some(selected) = self.select(of, ty, args)? else {
+            return Ok(None);
+        };
         let (block, impl_args) = self.impl_member(of, (ty, args), selected.clone(), name)?.map_or(selected, |(_, picked)| picked);
         let frame = self.impl_frame_of(block, &impl_args, Some(ty))?;
         match self.with_frame(frame, |infer| infer.impl_alias(block, (name, own)))? {
@@ -321,6 +348,9 @@ impl Infer<'_, '_> {
     }
 
     fn builtin_alias(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
+        if self.cx.lang(of) == Some("pointee_trait") && name == "Metadata" {
+            return self.pointee_metadata(ty);
+        }
         let kind = self.cx.types.kind(self.resolve(ty)).clone();
         if let Kind::Dyn(principal, args, members, _) = &kind {
             let member = self.cx.trait_member(of, name);
@@ -334,10 +364,30 @@ impl Infer<'_, '_> {
         if self.cx.lang(of) == Some("fn_once") && name == "Output" {
             return Ok(self.callable_sig(ty)?.map(|(_, ret)| ret));
         }
-        if self.cx.lang(of) == Some("future_trait") && name == "Output" && let Some(output) = self.coroutine_output(ty) {
+        if self.cx.lang(of) == Some("future_trait")
+            && name == "Output"
+            && let Some(output) = self.coroutine_output(ty)
+        {
             return Ok(Some(output));
         }
-        Ok(None)
+        self.opaque_binding(of, self.resolve(ty), name)
+    }
+
+    /// The `<ty as Pointee>::Metadata` type once the unsized tail of `ty` is known, or none while it is an inference variable.
+    pub(super) fn pointee_metadata(&mut self, ty: Ty) -> Result<Option<Ty>> {
+        if matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
+            return Ok(None);
+        }
+        let tail = self.struct_tail(ty)?;
+        match self.cx.types.kind(tail).clone() {
+            Kind::Var(_) => Ok(None),
+            Kind::Slice(_) | Kind::Prim(Primitive::Str) => Ok(Some(self.cx.types.prim(Primitive::Usize))),
+            Kind::Dyn(..) => {
+                let Some(item) = self.cx.lang_item("dyn_metadata") else { bail!("core has no `DynMetadata`") };
+                Ok(Some(self.cx.types.intern(Kind::Adt(item, vec![tail]))))
+            }
+            _ => Ok(Some(self.cx.types.unit())),
+        }
     }
 
     fn discriminant_ty(&mut self, ty: Ty) -> Result<Option<Ty>> {
@@ -374,7 +424,9 @@ impl Infer<'_, '_> {
     }
 
     fn bind_bound(&mut self, arena: &Body, home: ModRef, (bound, ty): (u32, Ty)) -> Result<()> {
-        let Some((of, path)) = self.bound_trait_at(arena, bound, home) else { return Ok(()) };
+        let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
+            return Ok(());
+        };
         if self.is_callable_trait(of) {
             return self.bind_callable(arena, (of, path), ty);
         }
@@ -439,7 +491,9 @@ impl Infer<'_, '_> {
         let supers = self.with_frame(frame, |infer| {
             let mut found = Vec::new();
             for &bound in def.0.list(def.1.supers) {
-                let Some((of, path)) = infer.bound_trait_at(&def.0, bound, home) else { continue };
+                let Some((of, path)) = infer.bound_trait_at(&def.0, bound, home) else {
+                    continue;
+                };
                 found.push((of, infer.bound_args(of, &def.0, path, ty)?));
             }
             Ok(found)
@@ -480,9 +534,15 @@ fn angle_args(arena: &Body, path: PathId) -> Option<crate::body::List> {
 
 /// The associated type bounds that the last segment of the bound path `path` puts, as in `Iterator<Item: Try<Output = T>>`: each name and its bounds.
 fn path_constraints(arena: &Body, path: PathId) -> Vec<(u32, crate::body::List)> {
-    let Some(list) = angle_args(arena, path) else { return Vec::new() };
-    arena.list(list).iter().filter_map(|&at| match arena.args[at as usize] {
-        crate::body::GenericArg::Constraint { name, bounds } => Some((name, bounds)),
-        _ => None,
-    }).collect()
+    let Some(list) = angle_args(arena, path) else {
+        return Vec::new();
+    };
+    arena
+        .list(list)
+        .iter()
+        .filter_map(|&at| match arena.args[at as usize] {
+            crate::body::GenericArg::Constraint { name, bounds } => Some((name, bounds)),
+            _ => None,
+        })
+        .collect()
 }

@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
 use crate::graph::{self, Targets, cfg};
 use crate::names::{ItemRef, Names};
 use crate::serve::Request;
 use crate::{outline, sema};
+use anyhow::{Context, Result};
 
 fn print_graph(workspace: &graph::Workspace) {
     for line in workspace.unit_lines() {
@@ -166,7 +166,9 @@ fn parse_bodies(tree: &outline::tree::Crate) -> (usize, Vec<String>) {
     let mut errors = Vec::new();
     for file in &tree.files {
         for item in &file.items.items {
-            let Some(open) = item.body.filter(|_| item.kind == outline::item::ItemKind::Fn) else { continue };
+            let Some(open) = item.body.filter(|_| item.kind == outline::item::ItemKind::Fn) else {
+                continue;
+            };
             match crate::body::parse(&file.source, open, crate::body::Config::default()) {
                 Ok(_) => parsed += 1,
                 Err(error) => errors.push(format!("{error:#}")),
@@ -185,12 +187,12 @@ fn report_bodies(outline: &outline::Outline, threads: usize) {
             scope.spawn(|| {
                 while let Some(tree) = outline.crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                     let result = parse_bodies(tree);
-                    results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(result);
+                    crate::sync::lock(&results).push(result);
                 }
             });
         }
     });
-    let results = results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let results = crate::sync::into_inner(results);
     let parsed: usize = results.iter().map(|(parsed, _)| parsed).sum();
     let errors: Vec<&String> = results.iter().flat_map(|(_, errors)| errors).collect();
     for error in &errors {
@@ -219,7 +221,8 @@ fn report_names(outline: &outline::Outline, names: &Names, started: Instant) {
 /// Prints the root scope of each crate named `name`: every name with a flag per namespace, types, values and macros.
 fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     for (index, krate) in names.crates.iter().enumerate().filter(|(index, _)| outline.roots[*index].name == name) {
-        let mut keys: Vec<String> = krate.scopes[0].names.iter().map(|(name, entry)| format!("{}:{}{}{}", names.symbols.text(*name), u8::from(entry.types.is_some()), u8::from(entry.values.is_some()), u8::from(entry.macros.is_some()))).collect();
+        let mut keys: Vec<String> =
+            krate.scopes[0].names.iter().map(|(name, entry)| format!("{}:{}{}{}", names.symbols.text(*name), u8::from(entry.types.is_some()), u8::from(entry.values.is_some()), u8::from(entry.macros.is_some()))).collect();
         keys.sort();
         println!("scope {index} {}: {}", outline.roots[index].name, keys.join(" "));
     }

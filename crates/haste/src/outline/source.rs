@@ -45,9 +45,7 @@ impl Token {
 /// Whether `kind` is a doc comment, and whether it documents the enclosing item.
 pub fn doc(kind: TokenKind) -> Option<bool> {
     match kind {
-        TokenKind::LineComment { doc_style: Some(style) } | TokenKind::BlockComment { doc_style: Some(style), .. } => {
-            Some(style == rustc_lexer::DocStyle::Inner)
-        }
+        TokenKind::LineComment { doc_style: Some(style) } | TokenKind::BlockComment { doc_style: Some(style), .. } => Some(style == rustc_lexer::DocStyle::Inner),
         _ => None,
     }
 }
@@ -56,9 +54,16 @@ pub fn doc(kind: TokenKind) -> Option<bool> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mark {
     Crate(u32),
-    Home { krate: u32, file: u32, item: u32 },
+    Home {
+        krate: u32,
+        file: u32,
+        item: u32,
+    },
     /// A name from the body of a `macro_rules!` expansion, which binds local variables only within that expansion and also finds those of the scope where the macro was defined.
-    Scope { id: u32, parent: u32 },
+    Scope {
+        id: u32,
+        parent: u32,
+    },
 }
 
 /// A source file and its tokens, or tokens laid after those of a base file, numbered on from its last one.
@@ -76,22 +81,22 @@ pub struct Source {
     pub outputs: Outputs,
 }
 
-/// Macro outputs kept for as long as the source that holds their calls.
+/// Macro outputs kept for as long as the source that holds their calls, keyed by `(krate, module, open)`.
 #[derive(Debug, Default)]
-pub struct Outputs(Mutex<FxHashMap<u32, Box<Source>>>);
+pub struct Outputs(Mutex<FxHashMap<(u32, u32, u32), Box<Source>>>);
 
 impl Outputs {
-    /// The output kept for the call whose group opens at `open`.
-    pub fn get(&self, open: u32) -> Result<Option<&Source>> {
+    /// The output kept for the call `key`.
+    pub fn get(&self, key: (u32, u32, u32)) -> Result<Option<&Source>> {
         let kept = self.0.lock().map_err(|_| anyhow::anyhow!("macro outputs poisoned"))?;
         // SAFETY: entries are never removed or replaced while self lives, and a box keeps its heap address when the map grows.
-        Ok(kept.get(&open).map(|found| unsafe { &*std::ptr::from_ref::<Source>(found) }))
+        Ok(kept.get(&key).map(|found| unsafe { &*std::ptr::from_ref::<Source>(found) }))
     }
 
-    /// Keeps `output` for the call whose group opens at `open`, or the output another caller kept first.
-    pub fn keep(&self, open: u32, output: Source) -> Result<&Source> {
+    /// Keeps `output` for the call `key`, or the output another caller kept first.
+    pub fn keep(&self, key: (u32, u32, u32), output: Source) -> Result<&Source> {
         let mut kept = self.0.lock().map_err(|_| anyhow::anyhow!("macro outputs poisoned"))?;
-        let found = kept.entry(open).or_insert_with(|| Box::new(output));
+        let found = kept.entry(key).or_insert_with(|| Box::new(output));
         // SAFETY: entries are never removed or replaced while self lives, and a box keeps its heap address when the map grows.
         Ok(unsafe { &*std::ptr::from_ref::<Source>(found) })
     }
@@ -318,7 +323,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn push(&mut self, token: Token, joint: bool) {
-        if joint && !self.after_doc && let Some(last) = self.tokens.last_mut() {
+        if joint
+            && !self.after_doc
+            && let Some(last) = self.tokens.last_mut()
+        {
             last.set_joint(true);
         }
         self.after_doc = doc(token.kind).is_some();

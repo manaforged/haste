@@ -1,7 +1,10 @@
-//! Compile workers: forked copies of the compiler that each encode a share of the reached functions into the image's shared memory.
+//! Compile workers: scoped threads that pull batches of reached functions and encode them into thread-local code chunks merged into the image.
 
-use std::io::{Read, Write};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use anyhow::Result;
+use haste_codegen::Memory;
+use rustc_hash::FxHashSet;
 
 use crate::lower::{self, Slots};
 use crate::sema::Context;
@@ -9,20 +12,18 @@ use crate::sema::reach::Reached;
 
 use super::Image;
 
-const MIN_PARALLEL: usize = 256;
+const MIN_PARALLEL: usize = 64;
+const BATCH: usize = 16;
 
-/// One forked worker: its process, the read end of its report pipe, and its share of the work.
-struct Worker {
-    pid: libc::pid_t,
-    report: std::fs::File,
-    part: usize,
-}
+type WorkerOutput = (Memory, Vec<(usize, String)>, Vec<usize>);
 
 impl Image {
-    /// Gives every reached static its cell before workers fork, so that each of them writes the same address.
+    /// Gives every reached static its cell before workers run, warming static layouts on `cx`.
     pub(super) fn place_statics(&self, cx: &mut Context<'_>, reached: &Reached, work: &[usize]) {
         for &index in work {
-            let Ok(typed) = &reached.list[index].1 else { continue };
+            let Ok(typed) = &reached.list[index].1 else {
+                continue;
+            };
             if !lower::is_static(cx, reached.list[index].0.0) {
                 continue;
             }
@@ -32,90 +33,87 @@ impl Image {
         }
     }
 
-    /// Compiles every function of `work`, split across forked workers when there is enough of it, and returns the errors by index.
+    /// Compiles every function of `work`, split across scoped worker threads when there is enough of it, and returns the errors by index.
     pub(super) fn compile_all(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize]) -> Vec<(usize, String)> {
-        let jobs = crate::jobs();
-        if jobs == 1 || work.len() < MIN_PARALLEL {
-            return work.iter().filter_map(|&index| self.compile_into(cx, reached, index).err().map(|error| (index, error))).collect();
-        }
-        let fail_all = |error: String| -> Vec<(usize, String)> { work.iter().map(|&index| (index, error.clone())).collect() };
-        if let Err(error) = std::io::stdout().flush() {
-            return fail_all(format!("flushing stdout before compile workers fork: {error}"));
-        }
-        if let Err(error) = self.open_space() {
-            return fail_all(format!("mapping memory for compile workers: {error}"));
-        }
         work.iter().for_each(|&index| self.slot(index).store(0, Ordering::Release));
-        let mut workers = Vec::new();
-        for part in 0..jobs {
-            match self.fork_worker(cx, reached, work, (jobs, part)) {
-                Ok(worker) => workers.push(worker),
-                Err(error) => return fail_all(format!("compile worker {part}: {error}")),
+        let jobs = crate::jobs().min(work.len().div_ceil(BATCH));
+        if jobs <= 1 || work.len() < MIN_PARALLEL {
+            return work.iter().filter_map(|&index| self.compile_into(cx, reached, index).err()).collect();
+        }
+        let forks: Vec<Context<'_>> = (0..jobs).map(|_| cx.fork()).collect();
+        let next = AtomicUsize::new(0);
+        let outputs = self.run_workers(forks, reached, work, &next);
+        let (mut errors, mut deferred, mut panicked) = (Vec::new(), Vec::new(), false);
+        for output in outputs {
+            match output {
+                Some((local, failed, later)) => {
+                    self.memory.merge(local);
+                    errors.extend(failed);
+                    deferred.extend(later);
+                }
+                None => panicked = true,
             }
         }
-        let errors = workers.into_iter().flat_map(|worker| self.collect(worker, work, jobs)).collect();
-        self.memory.close();
-        self.shared.get_mut().close();
-        self.state.get_mut().close();
+        deferred.sort_unstable();
+        let was_parallel = std::mem::replace(&mut cx.in_parallel, false);
+        for index in deferred {
+            if let Err(failed) = self.compile_into(cx, reached, index) {
+                errors.push(failed);
+            }
+        }
+        cx.in_parallel = was_parallel;
+        if panicked {
+            self.record_panicked(cx, reached, work, &mut errors);
+        }
+        errors.sort_by_key(|&(index, _)| index);
         errors
     }
 
-    /// Maps fresh code, shared and state space for the workers about to fork, since what earlier workers split stays closed.
-    fn open_space(&mut self) -> Result<(), haste_codegen::Error> {
-        self.memory.reserve(super::CODE_BYTES)?;
-        self.shared.get_mut().renew()?;
-        self.state.get_mut().renew()
+    fn record_panicked(&self, cx: &Context<'_>, reached: &Reached, work: &[usize], errors: &mut Vec<(usize, String)>) {
+        let recorded: FxHashSet<usize> = errors.iter().map(|&(index, _)| index).collect();
+        let lost = work.iter().copied().filter(|&index| self.slot(index).load(Ordering::Acquire) == 0 && !recorded.contains(&index));
+        errors.extend(lost.map(|index| (index, format!("{}: compile worker panicked", cx.name(reached.list[index].0.0)))));
     }
 
-    fn compile_into(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<(), String> {
-        match self.compile_one(cx, reached, index) {
+    fn compile_into(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<(), (usize, String)> {
+        let result = self.compile_one(cx, reached, index);
+        self.store_compiled(cx, reached, index, result)
+    }
+
+    fn store_compiled(&self, cx: &Context<'_>, reached: &Reached, index: usize, result: Result<usize>) -> Result<(), (usize, String)> {
+        match result {
             Ok(address) => {
                 self.slot(index).store(address, Ordering::Release);
                 Ok(())
             }
-            Err(error) => Err(format!("{}: {error:#}", cx.name(reached.list[index].0.0))),
+            Err(error) => Err((index, format!("{}: {error:#}", cx.name(reached.list[index].0.0)))),
         }
     }
 
-    fn fork_worker(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize], (jobs, part): (usize, usize)) -> Result<Worker, String> {
-        let (pid, report) = super::fork_piped(|report| self.work_share(cx, reached, work, (jobs, part), report)).map_err(|error| format!("{error:#}"))?;
-        Ok(Worker { pid, report, part })
+    fn run_workers<'a>(&self, forks: Vec<Context<'a>>, reached: &Reached, work: &[usize], next: &AtomicUsize) -> Vec<Option<WorkerOutput>> {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = forks.into_iter().map(|fork| scope.spawn(move || self.worker_loop(fork, reached, work, next))).collect();
+            handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect()
+        })
     }
 
-    fn work_share(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize], (jobs, part): (usize, usize), mut report: std::fs::File) -> std::io::Result<()> {
-        self.memory.split(jobs, part);
-        self.shared.get_mut().split(jobs, part);
-        self.state.get_mut().split(jobs, part);
-        let inherited = self.fixups.get_mut().len();
-        let mut text = String::new();
-        for &index in work.iter().skip(part).step_by(jobs) {
-            if let Err(error) = self.compile_into(cx, reached, index) {
-                text.push_str(&format!("E {index} {}\n", error.replace('\n', " ")));
+    fn worker_loop(&self, mut cx: Context<'_>, reached: &Reached, work: &[usize], next: &AtomicUsize) -> WorkerOutput {
+        let (mut memory, mut errors, mut deferred) = (Memory::default(), Vec::new(), Vec::new());
+        let batches = std::iter::from_fn(|| {
+            let start = next.fetch_add(BATCH, Ordering::Relaxed);
+            (start < work.len()).then(|| &work[start..(start + BATCH).min(work.len())])
+        });
+        for &index in batches.flatten() {
+            let encoded = self.encode_one(&mut cx, reached, index);
+            if !cx.take_deferred_evals().is_empty() {
+                deferred.push(index);
+                continue;
+            }
+            let result = encoded.and_then(|code| Ok(memory.write(code.bytes())?));
+            if let Err(failed) = self.store_compiled(&cx, reached, index, result) {
+                errors.push(failed);
             }
         }
-        for (address, index) in self.fixups.get_mut().iter().skip(inherited) {
-            text.push_str(&format!("F {address} {index}\n"));
-        }
-        report.write_all(text.as_bytes())
-    }
-
-    fn collect(&mut self, mut worker: Worker, work: &[usize], jobs: usize) -> Vec<(usize, String)> {
-        let mut text = String::new();
-        let read = worker.report.read_to_string(&mut text);
-        let status = super::wait(worker.pid);
-        let mut errors = Vec::new();
-        for line in text.lines() {
-            let mut parts = line.splitn(3, ' ');
-            match (parts.next(), parts.next().and_then(|index| index.parse::<usize>().ok()), parts.next()) {
-                (Some("E"), Some(index), Some(error)) => errors.push((index, error.to_owned())),
-                (Some("F"), Some(address), Some(index)) => self.fixups.get_mut().extend(index.parse().ok().map(|index| (address, index))),
-                _ => {}
-            }
-        }
-        if status != 0 || read.is_err() {
-            let lost = work.iter().skip(worker.part).step_by(jobs).filter(|&&index| self.slot(index).load(Ordering::Acquire) == 0);
-            errors.extend(lost.map(|&index| (index, format!("compile worker {} stopped with status {status}", worker.part))));
-        }
-        errors
+        (memory, errors, deferred)
     }
 }

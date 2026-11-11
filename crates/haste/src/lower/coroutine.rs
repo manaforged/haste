@@ -39,7 +39,9 @@ impl Lower<'_, '_> {
 
     /// Hands the split of the coroutine's resume function to the code generator.
     pub(super) fn finish_resume(&mut self) -> Result<()> {
-        let Some(resume) = self.resume.take() else { return Ok(()) };
+        let Some(resume) = self.resume.take() else {
+            return Ok(());
+        };
         let (Some(alloc), Some(free)) = (crate::host::symbol("malloc"), crate::host::symbol("free")) else { bail!("no `malloc` or `free` for coroutine frames") };
         let object = usize::from(resume.sret.is_some());
         self.b.func.coroutine = Some(Coroutine { object, header: resume.header, resumes: resume.resumes, done: resume.done, alloc: alloc as i64, free: free as i64 });
@@ -130,7 +132,7 @@ impl Lower<'_, '_> {
         if let (Some(place), Some(future)) = (place, future) {
             self.write(place, future);
         }
-        self.own(Root::Temp(expr), awaited.future, place, true)?;
+        self.own(Root::Held(expr), awaited.future, place, true)?;
         let head = self.b.create_block();
         self.jump(head, &[]);
         self.enter(head);
@@ -142,7 +144,9 @@ impl Lower<'_, '_> {
         self.enter(pending);
         self.suspend(head)?;
         self.enter(done);
-        let Some(polled) = polled else { return Ok(None) };
+        let Some(polled) = polled else {
+            return Ok(None);
+        };
         let output = self.variant_field(polled, awaited.polled, (ready, 0))?;
         Ok(self.read(output))
     }

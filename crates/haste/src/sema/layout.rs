@@ -1,5 +1,4 @@
-use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow, bail};
 use rustc_abi::{AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, LayoutData, Primitive as Abi, ReprOptions, Scalar, Size, StructKind, TargetDataLayout, WrappingRange};
@@ -95,12 +94,15 @@ fn primitive(dl: &TargetDataLayout, primitive: Primitive) -> Result<Layout> {
 
 impl Context<'_> {
     /// The layout of `ty`, which must hold no inference variables or parameters.
-    pub fn layout(&mut self, ty: Ty) -> Result<Rc<Layout>> {
+    pub fn layout(&mut self, ty: Ty) -> Result<Arc<Layout>> {
         if let Some(found) = self.store.layouts.get(&ty) {
-            return Ok(found.clone());
+            return Ok(found);
         }
-        let computed = Rc::new(self.compute(ty)?);
-        self.store.layouts.insert(ty, computed.clone());
+        let before = self.quiet_mark();
+        let computed = Arc::new(self.compute(ty)?);
+        if self.quiet_mark() == before {
+            self.store.layouts.insert(ty, Arc::clone(&computed));
+        }
         Ok(computed)
     }
 
@@ -145,16 +147,21 @@ impl Context<'_> {
 
     /// The type at the end of `ty` whose metadata a pointer to `ty` carries: `ty` itself, or the tail of its last struct field.
     pub fn tail(&mut self, ty: Ty) -> Result<Ty> {
-        let Kind::Adt(item, args) = self.types.kind(ty).clone() else { return Ok(ty) };
+        let Kind::Adt(item, args) = self.types.kind(ty).clone() else {
+            return Ok(ty);
+        };
         if let Some(found) = self.store.tails.get(&ty) {
-            return Ok(*found);
+            return Ok(found);
         }
+        let before = self.quiet_mark();
         let last = if self.item(item).1.kind == ItemKind::Struct { super::infer::tail_field(self, item, &args)? } else { None };
         let found = match last {
             Some(last) => self.tail(last)?,
             None => ty,
         };
-        self.store.tails.insert(ty, found);
+        if !self.types.has_vars(ty) && !self.types.has_vars(found) && self.quiet_mark() == before {
+            self.store.tails.insert(ty, found);
+        }
         Ok(found)
     }
 

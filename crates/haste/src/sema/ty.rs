@@ -1,6 +1,7 @@
-use rustc_hash::FxHashMap as HashMap;
+use std::sync::Arc;
 
 use crate::names::{ItemRef, Primitive};
+use crate::sync::Interner;
 
 /// An interned type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,7 +55,7 @@ impl Kind {
     /// The types directly inside this shape.
     pub fn children(&self) -> impl Iterator<Item = Ty> + '_ {
         let (items, last): (&[Ty], Option<&Ty>) = match self {
-            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Dyn(_, items, ..) => (items, None),
+            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Closure(_, items, _) | Kind::Dyn(_, items, ..) => (items, None),
             Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => (std::slice::from_ref(inner), None),
             Kind::Array(inner, len) => (std::slice::from_ref(inner), Some(len)),
             Kind::FnPtr(params, ret) => (params, Some(ret)),
@@ -73,6 +74,7 @@ impl Kind {
             Kind::Slice(inner) => Kind::Slice(f(inner)),
             Kind::Adt(item, args) => Kind::Adt(item, args.into_iter().map(&mut f).collect()),
             Kind::FnDef(item, args) => Kind::FnDef(item, args.into_iter().map(&mut f).collect()),
+            Kind::Closure(item, args, id) => Kind::Closure(item, args.into_iter().map(&mut f).collect(), id),
             Kind::Dyn(of, args, members, autos) => Kind::Dyn(of, args.into_iter().map(&mut f).collect(), members, autos),
             Kind::FnPtr(params, ret) => {
                 let params = params.into_iter().map(&mut f).collect();
@@ -89,47 +91,119 @@ impl Kind {
     }
 }
 
+const TY_SHARDS: usize = 64;
+const TY_SLAB: usize = 65_536;
+const TY_SLABS: usize = 256;
+
+const ALL_PRIMITIVES: [Primitive; 19] = [
+    Primitive::Bool,
+    Primitive::Char,
+    Primitive::Str,
+    Primitive::I8,
+    Primitive::I16,
+    Primitive::I32,
+    Primitive::I64,
+    Primitive::I128,
+    Primitive::Isize,
+    Primitive::U8,
+    Primitive::U16,
+    Primitive::U32,
+    Primitive::U64,
+    Primitive::U128,
+    Primitive::Usize,
+    Primitive::F16,
+    Primitive::F32,
+    Primitive::F64,
+    Primitive::F128,
+];
+
+const UNIT_TY: Ty = Ty(19);
+const NEVER_TY: Ty = Ty(20);
+const VAR_BASE: u32 = 21;
+const FAST_VARS: u32 = 64;
+const INT_VAR_BASE: u32 = VAR_BASE + FAST_VARS;
+const FAST_INT_VARS: u32 = 32;
+const FLOAT_VAR_BASE: u32 = INT_VAR_BASE + FAST_INT_VARS;
+const FAST_FLOAT_VARS: u32 = 16;
+const VALUE_BASE: u32 = FLOAT_VAR_BASE + FAST_FLOAT_VARS;
+const FAST_VALUES: u32 = 16;
+
 /// The type interner.
-#[derive(Default)]
+#[derive(Clone)]
 pub struct Types {
-    kinds: Vec<Kind>,
-    map: HashMap<Kind, Ty>,
+    inner: Arc<Interner<Kind, TY_SHARDS, TY_SLAB, TY_SLABS>>,
+}
+
+impl Default for Types {
+    fn default() -> Self {
+        let types = Self { inner: Arc::new(Interner::default()) };
+        let fixed = ALL_PRIMITIVES
+            .into_iter()
+            .map(Kind::Prim)
+            .chain([Kind::Tuple(Vec::new()), Kind::Never])
+            .chain((0..FAST_VARS).map(Kind::Var))
+            .chain((0..FAST_INT_VARS).map(Kind::IntVar))
+            .chain((0..FAST_FLOAT_VARS).map(Kind::FloatVar))
+            .chain((0..FAST_VALUES).map(|bits| Kind::Value(u128::from(bits))));
+        for kind in fixed {
+            types.intern_slow(kind);
+        }
+        types
+    }
+}
+
+fn prim_index(primitive: Primitive) -> u32 {
+    primitive as u32
+}
+
+fn fast_ty(kind: &Kind) -> Option<Ty> {
+    match *kind {
+        Kind::Prim(primitive) => Some(Ty(prim_index(primitive))),
+        Kind::Tuple(ref items) if items.is_empty() => Some(UNIT_TY),
+        Kind::Never => Some(NEVER_TY),
+        Kind::Var(index) if index < FAST_VARS => Some(Ty(VAR_BASE + index)),
+        Kind::IntVar(index) if index < FAST_INT_VARS => Some(Ty(INT_VAR_BASE + index)),
+        Kind::FloatVar(index) if index < FAST_FLOAT_VARS => Some(Ty(FLOAT_VAR_BASE + index)),
+        Kind::Value(bits) if bits < u128::from(FAST_VALUES) => Some(Ty(VALUE_BASE + bits as u32)),
+        _ => None,
+    }
 }
 
 impl Types {
     /// The type of shape `kind`.
-    pub fn intern(&mut self, kind: Kind) -> Ty {
-        if let Some(&ty) = self.map.get(&kind) {
+    pub fn intern(&self, kind: Kind) -> Ty {
+        if let Some(ty) = fast_ty(&kind) {
             return ty;
         }
-        let ty = Ty(self.kinds.len() as u32);
-        self.kinds.push(kind.clone());
-        self.map.insert(kind, ty);
-        ty
+        self.intern_slow(kind)
+    }
+
+    fn intern_slow(&self, kind: Kind) -> Ty {
+        Ty(self.inner.intern(&kind, Kind::clone))
     }
 
     /// The shape of `ty`.
     pub fn kind(&self, ty: Ty) -> &Kind {
-        &self.kinds[ty.0 as usize]
+        self.inner.get(ty.0)
     }
 
     /// The primitive type `primitive`.
-    pub fn prim(&mut self, primitive: Primitive) -> Ty {
-        self.intern(Kind::Prim(primitive))
+    pub fn prim(&self, primitive: Primitive) -> Ty {
+        Ty(prim_index(primitive))
     }
 
     /// The unit type.
-    pub fn unit(&mut self) -> Ty {
-        self.intern(Kind::Tuple(Vec::new()))
+    pub fn unit(&self) -> Ty {
+        UNIT_TY
     }
 
     /// The type `bool`.
-    pub fn bool(&mut self) -> Ty {
-        self.prim(Primitive::Bool)
+    pub fn bool(&self) -> Ty {
+        Ty(0)
     }
 
     /// The array of `element` with the known length `len`.
-    pub fn array(&mut self, element: Ty, len: u64) -> Ty {
+    pub fn array(&self, element: Ty, len: u64) -> Ty {
         let len = self.intern(Kind::Value(u128::from(len)));
         self.intern(Kind::Array(element, len))
     }
@@ -139,6 +213,14 @@ impl Types {
         match *self.kind(len) {
             Kind::Value(bits) => u64::try_from(bits).ok(),
             _ => None,
+        }
+    }
+
+    /// Whether `ty` holds any unbound inference variable.
+    pub fn has_vars(&self, ty: Ty) -> bool {
+        match self.kind(ty) {
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => true,
+            other => other.children().any(|child| self.has_vars(child)),
         }
     }
 }

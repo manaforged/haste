@@ -10,10 +10,10 @@ use rustc_hash::FxHashSet as HashSet;
 use crate::macros::Compilation;
 use crate::names::ItemRef;
 use crate::names::path::Requests;
-use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
 use crate::outline::Outline;
 use crate::sema::evaluate::Evaluate;
-use crate::sema::{Answer, Context, Cache, Edited};
+use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
+use crate::sema::{Answer, Cache, Context, Edited};
 
 use super::{CODE_BYTES, Image, TABLE_SLOTS, host_symbol, stub, wait};
 
@@ -179,7 +179,9 @@ fn value_of(ended: Option<Ended>) -> Result<u128> {
     match ended {
         Some(Ended { failure: Some((error, _)), .. }) => bail!("{error}"),
         Some(Ended { status: 0, bytes, .. }) => Ok(u128::from_le_bytes(<[u8; 16]>::try_from(bytes).map_err(|_| anyhow!("it gave no value"))?)),
-        Some(Ended { status, .. }) if status == 128 + libc::SIGVTALRM => bail!("it ran for more than {EVALUATION_SECONDS} s of CPU time"),
+        Some(Ended { status, .. }) if status == 128 + libc::SIGVTALRM => {
+            bail!("it ran for more than {EVALUATION_SECONDS} s of CPU time")
+        }
         Some(Ended { status, .. }) => bail!("it stopped with status {status}"),
         None => bail!("it did not run"),
     }
@@ -343,7 +345,9 @@ impl Jit {
     }
 
     fn drain(&mut self, id: usize) {
-        let Some(child) = self.children[id].as_mut() else { return };
+        let Some(child) = self.children[id].as_mut() else {
+            return;
+        };
         let mut buffer = [0; 1 << 16];
         match child.out.as_mut().map(|out| out.read(&mut buffer)) {
             Some(Ok(read)) if read > 0 => child.bytes.extend_from_slice(&buffer[..read]),
@@ -364,7 +368,9 @@ impl Jit {
     }
 
     fn reply(&mut self, id: usize, code: usize) {
-        let Some(child) = self.children[id].as_mut() else { return };
+        let Some(child) = self.children[id].as_mut() else {
+            return;
+        };
         if child.answers.write_all(&(code as u64).to_le_bytes()).is_err() {
             child.asks = None;
         }
@@ -411,7 +417,9 @@ impl Jit {
                 self.drain(id);
                 continue;
             }
-            let Some(index) = self.read_ask(id) else { continue };
+            let Some(index) = self.read_ask(id) else {
+                continue;
+            };
             if !self.respond(cx, id, index) {
                 return Ok(Some((id, index)));
             }
@@ -464,7 +472,7 @@ impl Jit {
                     self.image.link();
                 }
                 Err(error) => {
-                    let wanted = self.image.wanted.take();
+                    let wanted = self.image.take_wanted();
                     if wanted.is_empty() {
                         return Err(Stop::Failed(self.failure(cx, index, &callees, &error), item));
                     }

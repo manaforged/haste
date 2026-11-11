@@ -51,7 +51,9 @@ fn cfg_of(src: &Source, open: u32) -> Result<cfg::Cfg> {
 
 fn cfg_attr(src: &Source, open: u32) -> Result<Attr> {
     let parts = split_commas(src, open + 1, src.pair(open));
-    let Some(&(first, last)) = parts.first() else { return Ok(Attr::Other(open)) };
+    let Some(&(first, last)) = parts.first() else {
+        return Ok(Attr::Other(open));
+    };
     let text = joined(src, first, last);
     let predicate = cfg::parse(&text).with_context(|| format!("{}: cfg_attr({text}, ..)", src.path.display()))?;
     let inner = parts[1..].iter().map(|&(from, to)| content(src, from, to)).collect::<Result<Vec<_>>>()?;
@@ -65,12 +67,24 @@ fn path_end(src: &Source, mut at: u32, to: u32) -> u32 {
     at
 }
 
-const FLAGS: [(&str, Attr); 4] = [
-    ("macro_use", Attr::MacroUse),
-    ("no_std", Attr::NoStd),
-    ("no_core", Attr::NoCore),
-    ("no_implicit_prelude", Attr::NoImplicitPrelude),
-];
+const FLAGS: [(&str, Attr); 4] = [("macro_use", Attr::MacroUse), ("no_std", Attr::NoStd), ("no_core", Attr::NoCore), ("no_implicit_prelude", Attr::NoImplicitPrelude)];
+
+/// Whether the attribute tokens `from..to` start with `derive(...)` or `derive_const(...)`, bare or under a standard prelude path.
+pub fn is_derive_at(src: &Source, from: u32, to: u32) -> bool {
+    let end = path_end(src, from, to);
+    if end >= to || src.kind(end) != TokenKind::OpenParen {
+        return false;
+    }
+    let mut at = from;
+    if end - at >= 2 && src.kind(at) == TokenKind::Colon && src.kind(at + 1) == TokenKind::Colon {
+        at += 2;
+    }
+    match end - at {
+        1 => matches!(src.text(at), "derive" | "derive_const"),
+        10 => matches!(src.text(at), "core" | "std") && src.text(at + 3) == "prelude" && matches!(src.text(at + 6), "v1" | "rust_2015" | "rust_2018" | "rust_2021" | "rust_2024") && matches!(src.text(at + 9), "derive" | "derive_const"),
+        _ => false,
+    }
+}
 
 /// Parses the tokens `from..to` inside `#[...]`.
 pub fn content(src: &Source, from: u32, to: u32) -> Result<Attr> {
@@ -79,13 +93,15 @@ pub fn content(src: &Source, from: u32, to: u32) -> Result<Attr> {
     }
     let after = path_end(src, from, to);
     let next = src.kind(after);
+    if is_derive_at(src, from, to) {
+        return Ok(Attr::Derive(after));
+    }
     let path = src.span(from, after.saturating_sub(1).max(from));
     Ok(match (path, next) {
         ("unsafe", TokenKind::OpenParen) => content(src, after + 1, src.pair(after))?,
         ("cfg", TokenKind::OpenParen) => Attr::Cfg(cfg_of(src, after)?),
         ("cfg_attr", TokenKind::OpenParen) => cfg_attr(src, after)?,
         ("path", TokenKind::Eq) if after + 1 < to => Attr::Path(unquote(src.text(after + 1))),
-        ("derive" | "derive_const", TokenKind::OpenParen) => Attr::Derive(after),
         ("macro_export", next) => Attr::MacroExport(next == TokenKind::OpenParen && joined(src, after + 1, src.pair(after)).contains("local_inner_macros")),
         _ => FLAGS.iter().find(|(name, _)| *name == path).map_or(Attr::Other(from), |(_, attr)| attr.clone()),
     })

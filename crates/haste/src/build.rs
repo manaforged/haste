@@ -3,14 +3,14 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Result, bail};
 use crate::graph::{self, Targets};
 use crate::image::{Image, Program};
 use crate::macros::Compilation;
 use crate::names::ItemRef;
 use crate::outline::{self, edit::Edit};
 use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
-use crate::sema::{self, Edited, Cache};
+use crate::sema::{self, Cache, Edited};
+use anyhow::{Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cli::{Failures, case_items, error_kind, print_failures};
@@ -91,16 +91,22 @@ impl Batch {
     /// Infers and compiles every root `pick` finds in `workspace` from nothing.
     fn new(workspace: &graph::Workspace, compilation: &mut Compilation, pick: Pick) -> Result<Batch> {
         let (cases, roots) = batch_roots(workspace, &compilation.outline, pick);
-        crate::macros::reach_resolved(compilation, |_| roots.clone(), |mut cx, reached| {
-            let (image, broken) = Image::build(&mut cx, &reached)?;
-            let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
-            let roots = roots.iter().map(|root| reached.index[root]).collect();
-            Ok(Batch { pick, store: Some(cx.release().0), labels, roots, reached, image, broken })
-        })
+        crate::macros::reach_resolved(
+            compilation,
+            |_| roots.clone(),
+            |mut cx, reached| {
+                let (image, broken) = Image::build(&mut cx, &reached)?;
+                let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
+                let roots = roots.iter().map(|root| reached.index[root]).collect();
+                Ok(Batch { pick, store: Some(cx.release().0), labels, roots, reached, image, broken })
+            },
+        )
     }
 
     fn again(&mut self, compilation: &Compilation, stale: &[(u32, u32)]) -> bool {
-        let Some(mut store) = self.store.take() else { return false };
+        let Some(mut store) = self.store.take() else {
+            return false;
+        };
         let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Files(stale));
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
         let fresh = reach_again(&mut cx, &mut self.reached, &touched);
@@ -113,7 +119,9 @@ impl Batch {
     }
 
     fn reload(&mut self, workspace: &graph::Workspace, compilation: &Compilation, crates: &[u32]) -> bool {
-        let Some(mut store) = self.store.take() else { return false };
+        let Some(mut store) = self.store.take() else {
+            return false;
+        };
         let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(crates));
         let (cases, roots) = batch_roots(workspace, &compilation.outline, self.pick);
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
@@ -238,7 +246,9 @@ impl Build {
             if crates.contains(&krate) {
                 continue;
             }
-            let Ok(reloaded) = self.compilation.outline.reload(krate as usize) else { return false };
+            let Ok(reloaded) = self.compilation.outline.reload(krate as usize) else {
+                return false;
+            };
             crates.extend(reloaded.into_iter().map(|at| at as u32));
         }
         crates.sort_unstable();

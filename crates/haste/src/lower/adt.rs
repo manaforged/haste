@@ -34,7 +34,9 @@ struct Tag {
 
 impl Lower<'_, '_> {
     fn tag(&mut self, layout: &Layout) -> Result<Option<Tag>> {
-        let Variants::Multiple { tag, tag_encoding, tag_field, .. } = &layout.variants else { return Ok(None) };
+        let Variants::Multiple { tag, tag_encoding, tag_field, .. } = &layout.variants else {
+            return Ok(None);
+        };
         let size = tag.size(target()?);
         let mask = crate::sema::ty::mask(size.bits() as u32);
         Ok(Some(Tag { offset: layout.fields.offset(tag_field.index()).bytes() as i32, ty: tag_type(size.bytes())?, mask, encoding: tag_encoding.clone() }))
@@ -44,7 +46,9 @@ impl Lower<'_, '_> {
     pub fn construct(&mut self, ty: Ty, variant: u32, fields: Vec<(u32, Option<Value>)>, base: Option<Value>) -> Result<Option<Value>> {
         let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
         let whole = repr(self.cx, ty)?;
-        let Some(slot) = self.slot(whole) else { return Ok(None) };
+        let Some(slot) = self.slot(whole) else {
+            return Ok(None);
+        };
         let place = Place::slot(slot, whole);
         if let Some(base) = base {
             self.write(place, base);
@@ -64,7 +68,9 @@ impl Lower<'_, '_> {
     }
 
     fn set_tag(&mut self, place: Place, item: ItemRef, layout: &Layout, variant: u32) -> Result<()> {
-        let Some(tag) = self.tag(layout)? else { return Ok(()) };
+        let Some(tag) = self.tag(layout)? else {
+            return Ok(());
+        };
         let value = match &tag.encoding {
             TagEncoding::Direct => self.cx.discriminants(item)?[variant as usize] as u128,
             TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
@@ -137,7 +143,9 @@ impl Lower<'_, '_> {
         let Some((&last, rest)) = values.split_last() else { bail!("discriminant_value of an enum with no variants") };
         let mut found = self.int_const(to, last as u128);
         for (variant, &value) in rest.iter().enumerate() {
-            let Some(test) = self.is_variant(Some(place), ty, variant as u32)? else { continue };
+            let Some(test) = self.is_variant(Some(place), ty, variant as u32)? else {
+                continue;
+            };
             let value = self.int_const(to, value as u128);
             found = self.ins().select(test, value, found);
         }

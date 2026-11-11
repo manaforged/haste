@@ -36,11 +36,13 @@ pub struct Index {
     pub holders: Vec<Box<[u32]>>,
 }
 
-/// A body read in full: its file with the expansions of its macro calls laid after it and the items it declares, and the braced block that each call's opening group became.
+/// A body read in full: its file with the expansions of its macro calls laid after it and the items it declares, the braced block that each call's opening group became, and the block-scope tree of its items.
 #[derive(Debug)]
 pub struct Expansion {
     pub file: File,
     pub calls: HashMap<u32, u32>,
+    pub scopes: Box<[Option<u32>]>,
+    pub item_scopes: Box<[u32]>,
 }
 
 impl File {
@@ -156,7 +158,14 @@ impl Module {
     }
 }
 
-/// One impl block: its file and item, the module around it, and the expansions of the macro calls among its items.
+/// Which associated-item block of a crate a macro call expands into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberBlock {
+    Impl(usize),
+    Trait(usize),
+}
+
+/// One impl or trait block: its file and item, the module around it, and the expansions of the macro calls among its items.
 #[derive(Clone, Debug)]
 pub struct Impl {
     pub file: usize,
@@ -178,9 +187,10 @@ pub struct Crate {
     pub defined: HashMap<(u32, u32), Arc<Macro>>,
     pub deferred: Vec<Waiting>,
     pub impls: Vec<Impl>,
+    pub traits: Vec<Impl>,
     /// The file and item of each module-level `const _` and of each module-level function whose body holds an `impl`, whose impls apply crate-wide.
     pub impl_bodies: Vec<(usize, u32)>,
-    pub members: Vec<Waiting>,
+    pub members: Vec<(MemberBlock, Waiting)>,
     pub fallback: Vec<usize>,
     pub foreign: Vec<Waiting>,
     pub derived: Vec<Held>,
@@ -328,7 +338,9 @@ impl Env {
 
     /// The `#[path]` value in `attrs`, including one that `cfg_attr` may enable.
     pub fn path<'a>(&self, attrs: &'a [Attr]) -> Option<&'a str> {
-        self.find_attr(attrs, Truth::Unknown, &|attr| if let Attr::Path(path) = attr { Some(path.as_str()) } else { None })
+        self.find_attr(attrs, Truth::Unknown, &|attr| {
+            if let Attr::Path(path) = attr { Some(path.as_str()) } else { None }
+        })
     }
 
     /// The first value that `pick` finds in `attrs`, including in those of each `cfg_attr` whose condition is `least` or `Yes`.
@@ -404,7 +416,9 @@ impl Files {
             for _ in 0..workers {
                 scope.spawn(|| {
                     while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if exists(path) && let Ok(slot) = slot(&self.slots, path) {
+                        if exists(path)
+                            && let Ok(slot) = slot(&self.slots, path)
+                        {
                             let _ = fill(&slot, path);
                         }
                     }
@@ -427,11 +441,8 @@ impl Files {
 }
 
 /// The files that haste supplies itself, read from these paths: its `proc_macro` crate, which stands in for the toolchain's.
-const EMBEDDED: [(&str, &str); 3] = [
-    ("/haste/proc_macro/lib.rs", include_str!("../../proc_macro/lib.rs")),
-    ("/haste/proc_macro/lex.rs", include_str!("../../proc_macro/lex.rs")),
-    ("/haste/proc_macro/literal.rs", include_str!("../../proc_macro/literal.rs")),
-];
+const EMBEDDED: [(&str, &str); 3] =
+    [("/haste/proc_macro/lib.rs", include_str!("../../proc_macro/lib.rs")), ("/haste/proc_macro/lex.rs", include_str!("../../proc_macro/lex.rs")), ("/haste/proc_macro/literal.rs", include_str!("../../proc_macro/literal.rs"))];
 
 /// The root file of the `proc_macro` crate that haste supplies.
 pub const PROC_MACRO_ROOT: &str = EMBEDDED[0].0;
