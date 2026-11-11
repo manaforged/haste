@@ -38,7 +38,7 @@ the number of cores the process may run on.
 
 ## Requirements
 
-- Linux on x86-64 with glibc.
+- Linux on x86-64 with glibc, or macOS on Apple Silicon.
 - A stable Rust toolchain from rustup with the `rust-src` component.
   haste reads the standard library from that source tree. Set
   `HASTE_LIBRARY` to point at another `library` directory.
@@ -66,13 +66,14 @@ The scripts run `cargo`, or the command in `$CARGO` or in
 
 ## Limits
 
-- Only the `x86_64-unknown-linux-gnu` target. There is no macOS, Windows
-  or ARM support.
-- Some Rust code does not compile yet. 400 of the 425 checks in
-  `tests/diff` agree with rustc; haste gives no result for the other 25.
-  128-bit division and float-to-`i128` casts are among the gaps.
+- It runs on `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` and
+  compiles for the host only. There is no Windows support.
+- Some Rust code does not compile yet. The checks above show what agrees
+  with rustc.
+- A panic prints its message and aborts. There is no unwinding.
 - `haste build` does not write a binary.
-- The first `serve` load of a large workspace takes about a minute.
+- The first `serve` load of a large workspace takes several seconds when
+  the cache is empty.
 
 ## Contributing
 
