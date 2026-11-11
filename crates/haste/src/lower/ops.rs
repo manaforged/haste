@@ -96,7 +96,11 @@ impl Lower<'_, '_> {
         Ok(self.ins().stack_load(ty, slot, 0))
     }
 
-    pub(super) fn unary(&mut self, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
+    pub(super) fn unary(&mut self, expr: ExprId, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
+        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
+            let Some(value) = self.expr(operand)? else { return Ok(None) };
+            return self.invoke(item, &substs, vec![value]);
+        }
         let num = self.num(self.ty_of(operand))?;
         if let (UnOp::Neg, Num::Int { ty, .. }, Some(at)) = (op, num, self.int_literal(operand)) {
             let value = parse_int(self.src.text(at))?.0;

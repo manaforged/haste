@@ -85,7 +85,7 @@ impl Lower<'_, '_> {
             Expr::Path(_) => self.path(expr),
             Expr::Paren(inner) => self.expr(inner),
             Expr::Unary(UnOp::Deref, operand) => self.deref_read(expr, operand),
-            Expr::Unary(op, operand) => self.unary(op, operand),
+            Expr::Unary(op, operand) => self.unary(expr, op, operand),
             Expr::Binary(op, lhs, rhs) => self.binary(expr, op, lhs, rhs),
             Expr::Assign(lhs, rhs) => self.assign(expr, (lhs, rhs), None),
             Expr::AssignOp(op, lhs, rhs) => self.assign(expr, (lhs, rhs), Some(op)),

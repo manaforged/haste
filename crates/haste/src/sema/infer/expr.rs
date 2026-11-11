@@ -176,10 +176,13 @@ impl Infer<'_, '_> {
             return self.deref(expr, found);
         }
         let ty = self.expr(operand, expected)?;
-        match op {
-            UnOp::Neg | UnOp::Not if self.is_int(ty) || self.is_float(ty) || self.resolve(ty) == self.cx.types.bool() => Ok(ty),
-            _ => bail!("unsupported unary {op:?} on {}", self.show(ty)),
+        if self.is_int(ty) || self.is_float(ty) || self.resolve(ty) == self.cx.types.bool() {
+            return Ok(ty);
         }
+        let name = if op == UnOp::Not { "not" } else { "neg" };
+        let Some((of, method)) = self.operator_impl((name, name), ty, &[])? else { bail!("unsupported unary {op:?} on {}", self.show(ty)) };
+        self.out.operators.insert(expr, Res::Fn(method, vec![ty]));
+        self.project(of, ty, Vec::new(), "Output")
     }
 
     fn binary(&mut self, expr: ExprId, op: BinOp, (lhs, rhs): (ExprId, ExprId), expected: Option<Ty>) -> Result<Ty> {
@@ -298,7 +301,7 @@ impl Infer<'_, '_> {
 
     fn overloaded(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
         let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
-        let Some((of, method)) = self.operator_impl((lang, name), (left, right))? else { bail!("unsupported operator {op:?} on {}", self.show(left)) };
+        let Some((of, method)) = self.operator_impl((lang, name), left, &[right])? else { bail!("unsupported operator {op:?} on {}", self.show(left)) };
         self.out.operators.insert(expr, Res::Fn(method, vec![left, right]));
         match is_compare(op) {
             true => Ok(self.cx.types.bool()),
@@ -306,11 +309,11 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// The trait with lang item `lang` and its method `name`, when an impl of that trait applies to `left` with `right`.
-    fn operator_impl(&mut self, (lang, name): (&str, &str), (left, right): (Ty, Ty)) -> Result<Option<(ItemRef, ItemRef)>> {
+    /// The trait with lang item `lang` and its method `name`, when an impl of that trait applies to `left` with the trait arguments `args`.
+    fn operator_impl(&mut self, (lang, name): (&str, &str), left: Ty, args: &[Ty]) -> Result<Option<(ItemRef, ItemRef)>> {
         let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
-        Ok(self.trial(|infer| infer.select(of, left, &[right]))?.map(|_| (of, method)))
+        Ok(self.trial(|infer| infer.select(of, left, args))?.map(|_| (of, method)))
     }
 
     fn logical(&mut self, lhs: ExprId, rhs: ExprId) -> Result<Ty> {
@@ -360,7 +363,7 @@ impl Infer<'_, '_> {
             Some(want) => self.coerce_expr(rhs, found, want).map(|()| want)?,
             None => found,
         };
-        let Some((of, method)) = self.operator_impl((&lang, &name), (place, value))? else {
+        let Some((of, method)) = self.operator_impl((&lang, &name), place, &[value])? else {
             bail!("unsupported compound assignment on {}", self.show(place))
         };
         if self.has_vars(value) {
