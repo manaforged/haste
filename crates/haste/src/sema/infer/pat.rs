@@ -223,7 +223,7 @@ impl Infer<'_, '_> {
         let Some((item, variant, args)) = self.ctor(body, path, true)? else { bail!("pattern path is not a tuple constructor") };
         let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
         self.unify(ty, adt)?;
-        let fields = self.adt_fields(item, &args)?.swap_remove(variant as usize);
+        let fields = self.adt_fields(item, &args)?[variant as usize].clone();
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         let (pats, rest) = rest_split(self.body, list)?;
         self.positional(&pats, rest, &fields, mode)
@@ -234,7 +234,7 @@ impl Infer<'_, '_> {
         let Some((item, variant, args)) = self.ctor(body, path, false)? else { bail!("struct pattern of something that is not a struct") };
         let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
         self.unify(ty, adt)?;
-        let fields = self.adt_fields(item, &args)?.swap_remove(variant as usize);
+        let fields = self.adt_fields(item, &args)?[variant as usize].clone();
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         for &at in body.list(list) {
             let field = body.field_pats[at as usize];

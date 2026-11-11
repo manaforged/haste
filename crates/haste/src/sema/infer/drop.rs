@@ -134,7 +134,7 @@ impl Infer<'_, '_> {
         Ok(match self.cx.types.kind(ty).clone() {
             _ if let Some(owned) = self.cx.boxed(ty) => vec![owned],
             Kind::Adt(item, _) if self.cx.lang(item) == Some("manually_drop") || self.cx.item(item).1.kind == ItemKind::Union => Vec::new(),
-            Kind::Adt(item, args) => self.adt_fields(item, &args)?.into_iter().flatten().collect(),
+            Kind::Adt(item, args) => self.adt_fields(item, &args)?.iter().flatten().copied().collect(),
             Kind::Tuple(items) => items,
             Kind::Closure(..) => match self.cx.closure_env(ty).map(|env| self.cx.types.kind(env).clone()) {
                 Some(Kind::Tuple(items)) if self.coroutine_output(ty).is_some() => match items.last().map(|env| self.cx.types.kind(*env).clone()) {

@@ -96,7 +96,7 @@ impl Infer<'_, '_> {
         };
         let Some(item) = self.cx.lang_item(lang) else { bail!("no `{lang}` lang item") };
         let args = self.adt_args(item, Vec::new(), true)?;
-        let fields = self.adt_fields(item, &args)?.swap_remove(0);
+        let fields = self.adt_fields(item, &args)?[0].clone();
         let mut filled = Vec::new();
         for (end, name) in [(from, "start"), (to, "end")] {
             let Some(end) = end else { continue };

@@ -22,6 +22,7 @@ mod select;
 mod stmt;
 mod zonk;
 
+pub use adt::Fields;
 pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, register};
 pub use drop::Glue;
@@ -624,6 +625,16 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
+    /// What a query can leave behind: the asks of the pass and the pending projections and obligations, which a cached answer must not have added to.
+    fn unsettled(&self) -> ([usize; 5], usize, usize) {
+        (self.cx.asks.mark(), self.projections.len(), self.obligations.len())
+    }
+
+    /// Whether no body state can reach a lowered type: no instance, block items, locals, const fn arguments, constants being evaluated or selection in progress, so an answer here holds for every body.
+    fn bodiless(&self) -> bool {
+        self.instance.is_none() && self.items.is_empty() && self.scopes.is_empty() && self.const_args.is_empty() && self.evaluating.is_empty() && self.selecting.is_empty()
+    }
+
     /// A short spelling of `ty` for messages.
     pub fn show(&self, ty: Ty) -> String {
         self.cx.type_text(ty, &|ty| self.resolve(ty))
@@ -631,7 +642,7 @@ impl Infer<'_, '_> {
 }
 
 /// The field types of each variant of the struct, enum or union `item` at `args`.
-pub fn field_types(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Vec<Vec<Ty>>> {
+pub fn field_types(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Fields> {
     detached(cx, item, |infer| infer.adt_fields(item, args))
 }
 

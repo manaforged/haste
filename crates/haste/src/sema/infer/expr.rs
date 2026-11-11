@@ -95,8 +95,8 @@ impl Infer<'_, '_> {
         match self.cx.types.kind(ty).clone() {
             Kind::Tuple(items) if (index as usize) < items.len() => Ok(items[index as usize]),
             Kind::Adt(item, args) if self.cx.item(item).1.kind == crate::outline::item::ItemKind::Struct => {
-                let fields = self.adt_fields(item, &args)?.swap_remove(0);
-                fields.get(index as usize).copied().ok_or_else(|| anyhow::anyhow!("no field {index} on {}", self.cx.name(item)))
+                let fields = self.adt_fields(item, &args)?;
+                fields[0].get(index as usize).copied().ok_or_else(|| anyhow::anyhow!("no field {index} on {}", self.cx.name(item)))
             }
             _ => bail!("no field {index} on {}", self.show(ty)),
         }

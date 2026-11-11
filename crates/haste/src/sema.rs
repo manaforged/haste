@@ -55,6 +55,7 @@ struct Lookups {
     discriminants: HashMap<ItemRef, Rc<[i128]>>,
     langs: Option<(Rc<HashMap<String, ItemRef>>, Rc<[u32]>)>,
     drops: HashMap<ty::Ty, bool>,
+    fields: HashMap<ty::Ty, infer::Fields>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
     futures: HashMap<ty::Ty, ty::Ty>,
     lang_of: std::cell::RefCell<HashMap<ItemRef, Option<u32>>>,
@@ -112,6 +113,7 @@ impl Cache {
         self.closures.retain(|ty, _| !naming.names(*ty));
         let kept = &mut self.lookups;
         kept.drops.retain(|ty, _| !naming.names(*ty));
+        kept.fields.retain(|ty, _| !naming.names(*ty));
         kept.reveals.retain(|instance, _| !naming.touches(instance));
         kept.futures.retain(|ty, _| !naming.names(*ty));
         kept.impl_traits.retain(|block, _| block_kept(block));
