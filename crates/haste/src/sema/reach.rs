@@ -4,10 +4,13 @@ use crate::names::ItemRef;
 
 use super::Context;
 use super::infer::{Typed, infer, register};
+use super::substs::Substs;
 use super::ty::{Kind, Ty};
 
 /// One function at concrete type arguments.
-pub type Instance = (ItemRef, Vec<Ty>);
+pub type Instance = (ItemRef, Substs);
+
+const _: () = assert!(std::mem::size_of::<Instance>() == 16);
 
 /// Every function reached from some roots, each with its inferred body or the reason it has none.
 #[derive(Default)]
@@ -66,7 +69,7 @@ impl Reached {
     }
 
     fn callees<'r>(&'r self, typed: &'r Typed) -> impl Iterator<Item = usize> + 'r {
-        typed.calls().filter_map(|(item, substs)| self.index.get(&(item, substs.to_vec())).copied())
+        typed.calls().filter_map(|callee| self.index.get(&callee).copied())
     }
 }
 
@@ -118,14 +121,14 @@ pub fn infer_declared(cx: &mut Context<'_>, reached: &mut Reached, index: usize)
 
 /// The functions that the inferred body `typed` calls, other than intrinsics.
 pub fn calls<'t>(cx: &'t Context<'_>, typed: &'t Result<std::rc::Rc<Typed>, String>) -> impl Iterator<Item = Instance> + 't {
-    typed.iter().flat_map(|typed| typed.calls()).filter(|(item, _)| cx.intrinsic(*item).is_none()).map(|(item, substs)| (item, substs.to_vec()))
+    typed.iter().flat_map(|typed| typed.calls()).filter(|(item, _)| cx.intrinsic(*item).is_none())
 }
 
 fn drain(cx: &mut Context<'_>, reached: &mut Reached, mut queue: Vec<Instance>) -> Vec<usize> {
     let mut added = Vec::new();
     let mut next = 0;
     while next < queue.len() {
-        let instance = queue[next].clone();
+        let instance = queue[next];
         next += 1;
         if reached.index.contains_key(&instance) {
             continue;
@@ -133,7 +136,7 @@ fn drain(cx: &mut Context<'_>, reached: &mut Reached, mut queue: Vec<Instance>) 
         let typed = typed_once(cx, &instance, &mut reached.unlaid);
         queue.extend(calls(cx, &typed));
         added.push(reached.list.len());
-        reached.index.insert(instance.clone(), reached.list.len());
+        reached.index.insert(instance, reached.list.len());
         reached.list.push((instance, typed));
     }
     added
@@ -142,21 +145,21 @@ fn drain(cx: &mut Context<'_>, reached: &mut Reached, mut queue: Vec<Instance>) 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
 fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<std::rc::Rc<Typed>, String> {
     if let Some(typed) = cx.store.finals.get(instance).cloned() {
-        register(cx, (instance.0, &instance.1), &typed);
+        register(cx, *instance, &typed);
         return Ok(typed);
     }
     let asked = cx.asks.count();
-    let typed = std::rc::Rc::new(infer(cx, instance.0, &instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?);
+    let typed = std::rc::Rc::new(infer(cx, instance.0, instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?);
     let laid = lay_out(cx, &typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
     if laid.is_ok() && cx.asks.count() == asked {
-        cx.store.finals.insert(instance.clone(), typed.clone());
+        cx.store.finals.insert(*instance, typed.clone());
     }
     Ok(typed)
 }
 
 /// Computes the layout of each ADT, tuple and array type that lowering `typed` reads, so the names those layouts need are asked for while inference can still retry.
 fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
-    let intrinsic_args: Vec<Ty> = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_some()).flat_map(|(_, substs)| substs.iter().copied()).collect();
+    let intrinsic_args: Vec<Ty> = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_some()).flat_map(|(_, substs)| cx.types.substs(substs).iter().copied()).collect();
     let locals = typed.locals.iter().map(|local| local.ty);
     for ty in typed.exprs.iter().copied().chain(locals).chain(intrinsic_args) {
         if ty != Ty::NONE && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
@@ -170,5 +173,5 @@ fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
 pub fn main_roots(cx: &mut Context<'_>, main: ItemRef) -> anyhow::Result<[Instance; 2]> {
     let start = cx.lang_item("start").ok_or_else(|| anyhow::anyhow!("no `start` lang item"))?;
     let ret = super::infer::return_type(cx, main)?;
-    Ok([(start, vec![ret]), (main, Vec::new())])
+    Ok([(start, cx.types.intern_substs(&[ret])), (main, Substs::EMPTY)])
 }

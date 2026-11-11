@@ -71,7 +71,7 @@ fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<Watch
 
 fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, pick: Pick) -> (Vec<ItemRef>, Vec<Instance>) {
     let cases = pick(workspace, outline);
-    let roots = cases.iter().map(|item| (*item, Vec::new())).collect();
+    let roots = cases.iter().map(|item| (*item, sema::substs::Substs::EMPTY)).collect();
     (cases, roots)
 }
 

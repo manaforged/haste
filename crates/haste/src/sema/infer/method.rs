@@ -346,7 +346,7 @@ impl<'a> Infer<'_, 'a> {
         }
         substs.extend(given);
         self.bind_bounds(item, &substs)?;
-        self.out.res.insert(expr, Res::Fn(item, substs.clone()));
+        self.out.res.insert(expr, Res::fn_of(&self.cx.types, item, &substs));
         self.out.adjusts.insert(expr, adjust);
         if let (Some(Mut::Mut), crate::body::Expr::Method { receiver, .. }) = (adjust.autoref, *self.body.expr(expr)) {
             self.note_mut(receiver)?;

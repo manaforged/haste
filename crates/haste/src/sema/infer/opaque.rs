@@ -3,9 +3,10 @@ use anyhow::{Result, anyhow};
 use crate::names::ItemRef;
 
 use super::super::Context;
+use super::super::substs::{PackedMap, Substs};
 use super::super::ty::{Kind, Ty};
 use super::closure::Closure;
-use super::{Infer, Local, Typed};
+use super::{BodyTables, Infer, Local, Typed};
 
 /// A return type that holds `impl Trait`, until its type arguments are known.
 #[derive(Clone)]
@@ -65,7 +66,8 @@ impl Infer<'_, '_> {
             self.opaques.swap_remove(at);
             let substs: Vec<Ty> = substs.into_iter().map(|ty| self.zonk(ty)).collect();
             self.share_closures(&substs);
-            let found = revealed(self.cx, item, &substs)?;
+            let interned = self.cx.types.intern_substs(&substs);
+            let found = revealed(self.cx, item, interned)?;
             if let Some(output) = output.filter(|_| self.cx.closure(found).is_none()) {
                 let output = self.zonk(output);
                 self.cx.store.lookups.futures.insert(found, output);
@@ -77,11 +79,11 @@ impl Infer<'_, '_> {
 
     /// Registers the closures of this body once their types are known, when `substs` hold one, so the body that reveals an `impl Trait` return can call them before this body finishes.
     fn share_closures(&mut self, substs: &[Ty]) {
-        let Some((item, args)) = self.instance.clone() else { return };
-        if !substs.iter().any(|&ty| holds_closure(self.cx, ty, (item, &args))) {
+        let Some((item, args)) = self.instance else { return };
+        if !substs.iter().any(|&ty| holds_closure(self.cx, ty, (item, args))) {
             return;
         }
-        let locals: Vec<Local> = self.out.locals.clone().into_iter().map(|local| Local { ty: self.substitute(local.ty), ..local }).collect();
+        let locals: Vec<Local> = self.out.locals.clone().into_iter().map(|local| Local { ty: self.substitute(local.ty) }).collect();
         let mut closures = self.out.closures.clone();
         closures.values_mut().for_each(|closure| closure.ret = self.substitute(closure.ret));
         let typed = |closure: &Closure| {
@@ -91,7 +93,8 @@ impl Infer<'_, '_> {
         if closures.values().flat_map(typed).any(|ty| self.has_vars(ty)) {
             return;
         }
-        super::closure::register(self.cx, (item, &args), &Typed { locals, closures, ..Typed::default() });
+        let tables = std::sync::Arc::new(BodyTables { closures: PackedMap::pack(closures), ..BodyTables::default() });
+        super::closure::register(self.cx, (item, args), &Typed { tables, locals, ..Typed::default() });
     }
 
     /// Holds the hidden type of each `impl Trait` in this function's return type to its bounds, tying the associated types they name, as `Output = T`, and their trait arguments, which rustc reads to infer the body.
@@ -127,14 +130,14 @@ impl Infer<'_, '_> {
 }
 
 /// The return type of `item` at `substs`, inferring its body once per pass, which also records the closures it defines.
-pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Ty> {
-    let key = (item, substs.to_vec());
+pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Ty> {
+    let key = (item, substs);
     match cx.store.lookups.reveals.get(&key) {
         Some(Some(ty)) => return Ok(*ty),
         Some(None) => return async_future(cx, item, substs)?.ok_or_else(|| anyhow!("the `impl Trait` return type of `{}` depends on itself", cx.name(item))),
         None => {}
     }
-    cx.store.lookups.reveals.insert(key.clone(), None);
+    cx.store.lookups.reveals.insert(key, None);
     let ret = super::infer(cx, item, substs).and_then(|typed| typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item))));
     match &ret {
         Ok(ty) => cx.store.lookups.reveals.insert(key, Some(*ty)),
@@ -144,12 +147,12 @@ pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Re
 }
 
 /// The future of the async fn `item` at `substs`, which names its body's coroutine without inferring it, as a call inside that body's own inference needs; none for other functions.
-fn async_future(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Option<Ty>> {
+fn async_future(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Option<Ty>> {
     if !cx.signature(item)?.is_async {
         return Ok(None);
     }
     let root = cx.body(item)?.root.ok_or_else(|| anyhow!("`{}` has no body", cx.name(item)))?;
-    Ok(Some(cx.types.intern(Kind::Closure(item, substs.to_vec(), root.0))))
+    Ok(Some(cx.types.intern(Kind::Closure(item, substs, root.0))))
 }
 
 /// The function that a `#[define_opaque]` attribute in the same file names as the definer of the type alias `alias`, whose body holds `impl Trait`.
@@ -161,7 +164,7 @@ pub(super) fn opaque_definer(cx: &Context<'_>, alias: ItemRef) -> Option<ItemRef
     definers.into_iter().find(|&candidate| cx.attr_at(candidate, "define_opaque").is_some_and(|at| src.text(at + 2) == name))
 }
 
-fn holds_closure(cx: &Context<'_>, ty: Ty, (item, args): (ItemRef, &[Ty])) -> bool {
+fn holds_closure(cx: &Context<'_>, ty: Ty, (item, args): (ItemRef, Substs)) -> bool {
     let kind = cx.types.kind(ty);
-    matches!(kind, Kind::Closure(parent, substs, _) if *parent == item && substs.as_slice() == args) || kind.children().any(|child| holds_closure(cx, child, (item, args)))
+    matches!(kind, Kind::Closure(parent, substs, _) if *parent == item && *substs == args) || kind.children(&cx.types).any(|child| holds_closure(cx, child, (item, args)))
 }

@@ -35,13 +35,21 @@ impl Infer<'_, '_> {
         let (found, expected) = (self.resolve(found), self.resolve(expected));
         match (self.cx.types.kind(found).clone(), self.cx.types.kind(expected).clone()) {
             (Kind::Ref(from, a) | Kind::Ptr(from, a), Kind::Ref(to, b) | Kind::Ptr(to, b)) => self.pointer_coercion((found, expected), (from, a), (to, b)),
-            (Kind::Adt(a, from), Kind::Adt(b, to)) if a == b && from != to && self.coerces(found, expected)? => self.unsize_args(&from, &to),
+            (Kind::Adt(a, from), Kind::Adt(b, to)) if a == b && from != to && self.coerces(found, expected)? => {
+                let (from, to) = (self.cx.types.substs(from).to_vec(), self.cx.types.substs(to).to_vec());
+                self.unsize_args(&from, &to)
+            }
             (Kind::FnDef(item, substs), Kind::FnPtr(params, ret)) => {
-                let have = self.fn_types(item, &substs)?;
-                self.unify_fn(have, (params, ret))?;
+                let args = self.cx.types.substs(substs).to_vec();
+                let wanted = self.cx.types.substs(params).to_vec();
+                let have = self.fn_types(item, &args)?;
+                self.unify_fn(have, (wanted, ret))?;
                 Ok(Some(Coercion::Reify(Res::Fn(item, substs))))
             }
-            (Kind::Closure(..), Kind::FnPtr(params, ret)) => self.reify_closure(found, (params, ret)),
+            (Kind::Closure(..), Kind::FnPtr(params, ret)) => {
+                let wanted = self.cx.types.substs(params).to_vec();
+                self.reify_closure(found, (wanted, ret))
+            }
             _ => Ok(None),
         }
     }
@@ -124,8 +132,8 @@ impl Infer<'_, '_> {
         }
         self.unify_fn((inputs.clone(), output), (params, ret))?;
         let Some(call_once) = self.cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
-        let tuple = self.cx.types.intern(Kind::Tuple(inputs));
-        Ok(Some(Coercion::Reify(Res::Fn(call_once, vec![found, tuple]))))
+        let tuple = self.cx.types.tuple(&inputs);
+        Ok(Some(Coercion::Reify(Res::fn_of(&self.cx.types, call_once, &[found, tuple]))))
     }
 
     fn unify_fn(&mut self, (params, ret): (Vec<Ty>, Ty), (wanted, out): (Vec<Ty>, Ty)) -> Result<()> {

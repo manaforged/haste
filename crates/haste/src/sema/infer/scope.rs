@@ -223,11 +223,12 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn instantiate(&mut self, ty: Ty, args: &[Ty]) -> Ty {
         match self.cx.types.kind(ty) {
             Kind::Var(index) => return args.get(*index as usize).copied().unwrap_or(ty),
-            kind if kind.children().next().is_none() => return ty,
+            kind if kind.children(&self.cx.types).next().is_none() => return ty,
             _ => {}
         }
-        let kind = self.cx.types.kind(ty).clone().map(|inner| self.instantiate(inner, args));
-        self.cx.types.intern(kind)
+        let kind = self.cx.types.kind(ty).clone();
+        let mapped = self.map_kind(&kind, |this, inner| this.instantiate(inner, args));
+        self.cx.types.intern(mapped)
     }
 
     /// The headers whose generic parameters and where clauses the frame's type parameters come from: the item's own, its impl's, and its trait's.

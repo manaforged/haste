@@ -5,6 +5,7 @@ use crate::body::{Expr, ExprId, UnOp};
 use crate::names::{ItemRef, Primitive};
 use crate::outline::item::ItemKind;
 use crate::sema::infer::Res;
+use crate::sema::substs::Substs;
 use crate::sema::ty::Ty;
 
 use super::place::{Base, Place};
@@ -51,7 +52,7 @@ impl Lower<'_, '_> {
     }
 
     /// The place of the static `item` at `substs`, of type `ty`: its cell, which the static's initializer fills on the first use that finds it empty.
-    pub fn static_place(&mut self, (item, substs): (ItemRef, &[Ty]), ty: Ty) -> Result<Place> {
+    pub fn static_place(&mut self, (item, substs): (ItemRef, Substs), ty: Ty) -> Result<Place> {
         let index = self.reached_index(item, substs)?;
         let (address, size) = self.static_cell(index, ty)?;
         if !self.cx.foreign(item) && index != self.index {
@@ -96,9 +97,9 @@ impl Lower<'_, '_> {
 
     /// Writes `value`, the value of the static that this function initializes, into the static's cell, and returns.
     pub fn fill_static(&mut self, value: Option<Value>) -> Result<()> {
-        let ((item, substs), ty) = (self.reached.list[self.index].0.clone(), self.typed.ret_ty());
+        let ((item, substs), ty) = (self.reached.list[self.index].0, self.typed.ret_ty());
         if self.open {
-            let place = self.static_place((item, &substs), ty)?;
+            let place = self.static_place((item, substs), ty)?;
             if let Some(value) = value {
                 self.write(place, value);
             }

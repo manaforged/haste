@@ -79,7 +79,7 @@ impl Infer<'_, '_> {
             return Ok(None);
         }
         let Some(method) = self.cx.trait_member(of, "index") else { bail!("`Index` has no `index`") };
-        self.out.operators.insert(expr, Res::Fn(method, vec![step, at]));
+        self.out.operators.insert(expr, Res::fn_of(&self.cx.types, method, &[step, at]));
         self.project(of, step, vec![at], "Output").map(Some)
     }
 }

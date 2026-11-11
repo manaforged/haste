@@ -30,7 +30,7 @@ impl Lower<'_, '_> {
     fn code_word(&self, res: Option<&Res>) -> Result<Word> {
         match res {
             None => Ok(Word::Int(0)),
-            Some(Res::Fn(item, substs)) => self.reached_index(*item, substs).map(Word::Code),
+            Some(&Res::Fn(item, substs)) => self.reached_index(item, substs).map(Word::Code),
             Some(_) => bail!("a vtable entry that is not a function"),
         }
     }

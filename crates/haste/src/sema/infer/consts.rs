@@ -206,7 +206,10 @@ impl<'a> Infer<'a, '_> {
             Ok((value & mask(int.0), int))
         });
         match (folded, width) {
-            (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => self.run_instance(&(item, substs.to_vec()), int, error),
+            (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => {
+                let interned = self.cx.types.intern_substs(substs);
+                self.run_instance(&(item, interned), int, error)
+            }
             (found, _) => found,
         }
     }
@@ -233,7 +236,7 @@ impl<'a> Infer<'a, '_> {
         let Some((owner, arena)) = self.holder(arena) else { return Err(error) };
         let mut args: Vec<Ty> = args.into_iter().map(|ty| self.zonk(ty)).collect();
         args.extend([arena.tag(), u128::from(expr.0)].map(|value| self.cx.types.intern(Kind::Value(value))));
-        let (instance, asked) = ((owner, args), self.cx.asks.count());
+        let (instance, asked) = ((owner, self.cx.types.intern_substs(&args)), self.cx.asks.count());
         let typed = match self.cx.store.finals.get(&instance).cloned() {
             Some(typed) => typed,
             None => self.infer_anon(Anon { arena, root: expr }, &instance).map_err(|reason| anyhow!("{error:#}; inferring it: {reason:#}"))?,
@@ -280,16 +283,16 @@ impl<'a> Infer<'a, '_> {
         let body = arena.body();
         let mut infer = Infer::start(self.cx, (body, &sig, src), home);
         infer.swap_frame(frame);
-        (infer.instance, infer.frames) = (Some(instance.clone()), frames);
-        infer.out.exprs = vec![Ty::NONE; body.exprs.len()];
+        (infer.instance, infer.frames) = (Some(*instance), frames);
+        infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
         let ty = infer.fresh(Kind::Var);
         infer.out.ret = Some(ty);
         let found = infer.expr(anon.root, Some(ty))?;
         infer.coerce_expr(anon.root, found, ty)?;
         let mut typed = infer.finish()?;
         typed.shape = Shape::Anon(anon);
-        let typed = Rc::new(super::settle(self.cx, (instance.0, &instance.1), typed)?);
-        self.cx.store.finals.insert(instance.clone(), typed.clone());
+        let typed = Rc::new(super::settle(self.cx, *instance, typed)?);
+        self.cx.store.finals.insert(*instance, typed.clone());
         Ok(typed)
     }
 
@@ -623,9 +626,9 @@ impl<'a> Infer<'a, '_> {
     fn const_target(&mut self, arena: &Body, path: PathId) -> Result<(ItemRef, Vec<Ty>)> {
         let (_, res) = self.path_value(arena, path)?;
         let Res::Fn(item, substs) = res else { bail!("a constant path that names no item") };
-        let substs = substs.into_iter().map(|ty| self.zonk(ty)).collect();
+        let substs = self.map_substs(substs, Self::zonk);
         match self.trait_call(item, substs)? {
-            Res::Fn(item, substs) => Ok((item, substs)),
+            Res::Fn(item, substs) => Ok((item, self.cx.types.substs(substs).to_vec())),
             _ => bail!("a constant path that names no item"),
         }
     }

@@ -179,8 +179,8 @@ impl Lower<'_, '_> {
     }
 
     fn test_const(&mut self, pat: PatId, place: Option<Place>, fail: Block) -> Result<()> {
-        let Some(Res::Fn(item, substs)) = self.typed.pat_res.get(&pat).cloned() else { return Ok(()) };
-        let Some(expected) = self.invoke(item, &substs, Vec::new())? else { bail!("constant pattern with no value") };
+        let Some(&Res::Fn(item, substs)) = self.typed.pat_res.get(&pat) else { return Ok(()) };
+        let Some(expected) = self.invoke(item, substs, Vec::new())? else { bail!("constant pattern with no value") };
         self.test_equal(pat, place, expected, fail)
     }
 
@@ -255,9 +255,12 @@ impl Lower<'_, '_> {
     }
 
     fn field_count(&mut self, ty: Ty, variant: u32) -> Result<usize> {
-        Ok(match self.cx.types.kind(ty).clone() {
-            Kind::Tuple(items) => items.len(),
-            Kind::Adt(item, args) => crate::sema::infer::field_types(self.cx, item, &args)?[variant as usize].len(),
+        Ok(match *self.cx.types.kind(ty) {
+            Kind::Tuple(items) => self.cx.types.substs(items).len(),
+            Kind::Adt(item, args) => {
+                let slice = self.cx.types.substs(args).to_vec();
+                crate::sema::infer::field_types(self.cx, item, &slice)?[variant as usize].len()
+            }
             _ => bail!("positional pattern on a type with no fields"),
         })
     }

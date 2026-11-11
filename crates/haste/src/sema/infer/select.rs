@@ -6,6 +6,7 @@ use crate::names::{Def, ItemRef, ModRef};
 use crate::outline::item::ItemKind;
 
 use super::super::impls::{ImplRef, head};
+use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty};
 use super::Infer;
 use super::scope::{Frame, named_args, type_params};
@@ -33,8 +34,8 @@ impl<'a> Infer<'_, 'a> {
     /// The one impl of trait `of` at trait arguments `args` for `self_ty`, or none when no impl or several apply.
     pub fn select(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<Option<Picked>> {
         let key = self.selection_key(of, self_ty, args);
-        if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
-            return Ok(found.clone());
+        if let Some(&found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
+            return Ok(found.map(|(block, impl_args)| (block, self.cx.types.substs(impl_args).to_vec())));
         }
         let before = (self.cx.asks.mark(), self.projections.len(), self.obligations.len());
         let picked = self.select_at(of, self_ty, args, 0)?;
@@ -44,7 +45,7 @@ impl<'a> Infer<'_, 'a> {
             None => Some(None),
             Some((block, impl_args)) => {
                 let filled: Vec<Ty> = impl_args.iter().map(|&ty| self.substitute(ty)).collect();
-                filled.iter().all(|&ty| self.closed(ty)).then_some(Some((*block, filled)))
+                filled.iter().all(|&ty| self.closed(ty)).then(|| Some((*block, self.cx.types.intern_substs(&filled))))
             }
         };
         if let Some(kept) = kept.filter(|_| settled) {
@@ -54,15 +55,18 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The key that caches selecting `of<args>` for `self_ty` across bodies: the query with its variables filled in, when it is made at the top level and every type in it is known and holds no closure.
-    fn selection_key(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Option<(ItemRef, Ty, Vec<Ty>)> {
-        let known = self.selecting.is_empty() && self.closed(self_ty) && args.iter().all(|&arg| self.closed(arg));
-        known.then(|| (of, self.substitute(self_ty), args.iter().map(|&arg| self.substitute(arg)).collect()))
+    fn selection_key(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Option<(ItemRef, Ty, Substs)> {
+        if !self.selecting.is_empty() || !self.closed(self_ty) || !args.iter().all(|&arg| self.closed(arg)) {
+            return None;
+        }
+        let substituted: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
+        Some((of, self.substitute(self_ty), self.cx.types.intern_substs(&substituted)))
     }
 
     /// Whether `ty` holds no inference variable and no closure, whose signature may still hold one, so selecting with it gives the same answer in every body.
     fn closed(&self, ty: Ty) -> bool {
         let kind = self.cx.types.kind(self.resolve(ty));
-        !matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Closure(..)) && kind.children().all(|item| self.closed(item))
+        !matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Closure(..)) && kind.children(&self.cx.types).all(|item| self.closed(item))
     }
 
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
@@ -251,7 +255,7 @@ impl<'a> Infer<'_, 'a> {
             {
                 crates.push(item.krate);
             }
-            stack.extend(kind.children());
+            stack.extend(kind.children(&self.cx.types));
         }
         crates
     }
@@ -390,7 +394,7 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn has_vars(&self, ty: Ty) -> bool {
         let ty = self.resolve(ty);
         let kind = self.cx.types.kind(ty);
-        matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || kind.children().any(|item| self.has_vars(item))
+        matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || kind.children(&self.cx.types).any(|item| self.has_vars(item))
     }
 
     /// Whether the obligation `ty: _<args>` holds an unbound inference variable.
@@ -442,7 +446,7 @@ impl<'a> Infer<'_, 'a> {
     /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.
     pub(super) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
         let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
-        let given = super::super::ty::object_parts(&parts, &members).0;
+        let given = super::super::ty::object_parts(self.cx.types.substs(parts), &members).0.to_vec();
         let same_args = object == of || (self.is_callable_trait(object) && self.is_callable_trait(of));
         if !same_args {
             return Some(args.is_empty() && self.implied_traits(vec![object]).is_ok_and(|traits| traits.contains(&of)));

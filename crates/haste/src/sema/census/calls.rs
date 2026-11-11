@@ -1,28 +1,24 @@
-use crate::body::ExprId;
 use crate::lower;
 use crate::names::ItemRef;
 use crate::sema::Context;
 use crate::sema::infer::{Coercion, Res, Shape, Typed, Vtable, field_types, needs_drop};
 use crate::sema::intrinsic::{Intrinsic, Simd};
 use crate::sema::reach::Reached;
+use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
 
 use super::digest::{Mix, TraitFacts, hash_num_tag, hash_signature};
 use super::footprint::{Edge, HashBins, hash_closure_env_offsets, hash_field_at, hash_type_use};
 
 pub(super) fn hash_control_and_coercions(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, bins: &mut HashBins, edges: &mut Vec<Edge>) {
-    let mut offsets: Vec<(u32, u64)> = typed.offsets.iter().map(|(&e, &off)| (e.0, off)).collect();
-    offsets.sort_unstable_by_key(|&(e, _)| e);
-    for (e, off) in offsets {
-        bins.k.u32(e);
+    for (&e, &off) in &typed.offsets {
+        bins.k.u32(e.0);
         bins.k.u64(off);
         bins.offset.u64(off);
     }
-    let mut ranges: Vec<(u32, &Vec<u32>)> = typed.ranges.iter().map(|(&e, v)| (e.0, v)).collect();
-    ranges.sort_unstable_by_key(|&(e, _)| e);
-    for (e, fields) in ranges {
-        if let Some(&ty) = typed.exprs.get(e as usize) && ty != Ty::NONE {
-            for &idx in fields {
+    for (&e, fields) in &typed.ranges {
+        if let Some(&ty) = typed.exprs.get(e.0 as usize) && ty != Ty::NONE {
+            for &idx in fields.iter() {
                 hash_field_at(cx, ty, 0, idx, bins);
             }
         }
@@ -32,45 +28,32 @@ pub(super) fn hash_control_and_coercions(cx: &mut Context<'_>, reached: &Reached
 }
 
 fn hash_loop_and_try_layouts(cx: &mut Context<'_>, typed: &Typed, bins: &mut HashBins) {
-    let mut fors: Vec<u32> = typed.fors.keys().map(|e| e.0).collect();
-    fors.sort_unstable();
-    for key in fors {
-        let each = &typed.fors[&ExprId(key)];
+    for (_, each) in &typed.fors {
         hash_type_use(cx, each.iter, bins);
         hash_type_use(cx, each.option, bins);
         hash_field_at(cx, each.option, each.some, 0, bins);
     }
-    let mut tries: Vec<u32> = typed.tries.keys().map(|e| e.0).collect();
-    tries.sort_unstable();
-    for key in tries {
-        let tried = &typed.tries[&ExprId(key)];
+    for (_, tried) in &typed.tries {
         hash_type_use(cx, tried.flow, bins);
         hash_field_at(cx, tried.flow, tried.stop, 0, bins);
         hash_field_at(cx, tried.flow, tried.proceed, 0, bins);
     }
-    let mut awaits: Vec<u32> = typed.awaits.keys().map(|e| e.0).collect();
-    awaits.sort_unstable();
-    for key in awaits {
-        let awaited = &typed.awaits[&ExprId(key)];
+    for (_, awaited) in &typed.awaits {
         hash_type_use(cx, awaited.future, bins);
         hash_type_use(cx, awaited.polled, bins);
         hash_field_at(cx, awaited.polled, 0, 0, bins);
     }
-    let mut closures: Vec<u32> = typed.closures.keys().map(|e| e.0).collect();
-    closures.sort_unstable();
-    for key in closures {
-        if let Some(&ty) = typed.exprs.get(key as usize) && ty != Ty::NONE {
+    for (&expr, _) in &typed.closures {
+        if let Some(&ty) = typed.exprs.get(expr.0 as usize) && ty != Ty::NONE {
             hash_closure_env_offsets(cx, ty, bins);
         }
     }
 }
 
 fn hash_coercion_table(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, bins: &mut HashBins, edges: &mut Vec<Edge>) {
-    let mut keys: Vec<u32> = typed.coercions.keys().map(|e| e.0).collect();
-    keys.sort_unstable();
-    for key in keys {
-        bins.k.u32(key);
-        hash_one_coercion(cx, reached, (key, &typed.coercions[&ExprId(key)]), bins, edges);
+    for (&expr, coercion) in &typed.coercions {
+        bins.k.u32(expr.0);
+        hash_one_coercion(cx, reached, (expr.0, coercion), bins, edges);
     }
 }
 
@@ -94,7 +77,7 @@ fn hash_one_coercion(cx: &mut Context<'_>, reached: &Reached, (key, coercion): (
             for (step_idx, (step_ty, step_res)) in steps.iter().enumerate() {
                 hash_type_use(cx, *step_ty, bins);
                 if let Some(Res::Fn(item, substs)) = step_res
-                    && let Some(&callee) = reached.index.get(&(*item, substs.clone()))
+                    && let Some(&callee) = reached.index.get(&(*item, *substs))
                 {
                     edges.push(Edge { tag: 9, key: (u64::from(key) << 16) | (step_idx as u64), callee, item: *item, foreign: cx.foreign(*item) });
                 }
@@ -106,7 +89,7 @@ fn hash_one_coercion(cx: &mut Context<'_>, reached: &Reached, (key, coercion): (
         }
         Coercion::Reify(Res::Fn(item, substs)) => {
             bins.k.byte(5);
-            if let Some(&callee) = reached.index.get(&(*item, substs.clone())) {
+            if let Some(&callee) = reached.index.get(&(*item, *substs)) {
                 bins.d.byte(5);
                 bins.d.u32(key);
                 bins.d.usize(callee);
@@ -137,7 +120,7 @@ fn hash_vtable_fn(reached: &Reached, res: Option<&Res>, mix: &mut Mix) {
     match res {
         Some(Res::Fn(item, substs)) => {
             mix.byte(1);
-            mix.usize(reached.index.get(&(*item, substs.clone())).copied().unwrap_or(usize::MAX));
+            mix.usize(reached.index.get(&(*item, *substs)).copied().unwrap_or(usize::MAX));
         }
         _ => mix.byte(0),
     }
@@ -208,17 +191,18 @@ fn record_res_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key, re
             bins.k.u64(key);
             bins.k.u32(*variant);
         }
-        Res::Fn(item, substs) => record_fn_site(cx, reached, (owner, tag, key), (*item, substs), (bins, edges, facts)),
+        Res::Fn(item, substs) => record_fn_site(cx, reached, (owner, tag, key), (*item, *substs), (bins, edges, facts)),
         Res::Local(_) => {}
     }
 }
 
-fn record_fn_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key): (ItemRef, u8, u64), (item, substs): (ItemRef, &[Ty]), (bins, edges, facts): (&mut HashBins, &mut Vec<Edge>, &mut TraitFacts)) {
+fn record_fn_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key): (ItemRef, u8, u64), (item, substs): (ItemRef, Substs), (bins, edges, facts): (&mut HashBins, &mut Vec<Edge>, &mut TraitFacts)) {
     if let Some(which) = cx.intrinsic(item) {
-        hash_intrinsic_site(cx, reached, (owner, tag, key), (which, substs), (bins, edges));
+        let slice = cx.types.substs(substs).to_vec();
+        hash_intrinsic_site(cx, reached, (owner, tag, key), (which, &slice), (bins, edges));
         return;
     }
-    let Some(&callee) = reached.index.get(&(item, substs.to_vec())) else { return };
+    let Some(&callee) = reached.index.get(&(item, substs)) else { return };
     if lower::is_static(cx, item) {
         bins.k.byte(tag);
         bins.k.u64(key);
@@ -321,7 +305,7 @@ fn hash_const_eval_select(cx: &mut Context<'_>, reached: &Reached, (tag, key): (
         hash_type_use(cx, tuple, bins);
     }
     if let Some(&runtime) = substs.get(2)
-        && let Kind::FnDef(fn_item, fn_substs) = cx.types.kind(runtime).clone()
+        && let Kind::FnDef(fn_item, fn_substs) = *cx.types.kind(runtime)
         && let Some(&callee) = reached.index.get(&(fn_item, fn_substs))
     {
         edges.push(Edge { tag, key, callee, item: fn_item, foreign: cx.foreign(fn_item) });
@@ -355,13 +339,15 @@ fn hash_simd_intrinsic(cx: &mut Context<'_>, op: Simd, substs: &[Ty], bins: &mut
 fn hash_simd_type(cx: &mut Context<'_>, ty: Ty, bins: &mut HashBins) {
     hash_type_use(cx, ty, bins);
     hash_num_tag(cx, ty, &mut bins.k);
-    if let Kind::Adt(item, args) = cx.types.kind(ty).clone()
-        && let Ok(fields) = field_types(cx, item, &args)
-        && let Some(&array) = fields.first().and_then(|v| v.first())
-    {
-        hash_type_use(cx, array, bins);
-        if let Kind::Array(elem, _) = *cx.types.kind(array) {
-            hash_num_tag(cx, elem, &mut bins.k);
+    if let Kind::Adt(item, args) = *cx.types.kind(ty) {
+        let slice = cx.types.substs(args).to_vec();
+        if let Ok(fields) = field_types(cx, item, &slice)
+            && let Some(&array) = fields.first().and_then(|v| v.first())
+        {
+            hash_type_use(cx, array, bins);
+            if let Kind::Array(elem, _) = *cx.types.kind(array) {
+                hash_num_tag(cx, elem, &mut bins.k);
+            }
         }
     }
 }

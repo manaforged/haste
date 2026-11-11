@@ -23,12 +23,17 @@ pub fn compiler_clone(cx: &Context<'_>, ty: Ty) -> bool {
 /// The typed form of the `Clone::clone` that the compiler writes for the tuple, closure, function item or function pointer `ty`: one `&ty` parameter, and the clone of each field.
 pub fn clone_typed(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<Typed> {
     let fields = match cloned_tuple(cx, ty).map(|tuple| cx.types.kind(tuple).clone()) {
-        Some(Kind::Tuple(fields)) => fields,
+        Some(Kind::Tuple(fields)) => cx.types.substs(fields).to_vec(),
         None if compiler_clone(cx, ty) => Vec::new(),
         _ => bail!("a compiler-made clone of a type that the compiler does not clone"),
     };
     let source = cx.types.intern(Kind::Ref(Mut::Not, ty));
-    let calls = detached(cx, item, |infer| fields.iter().map(|&field| infer.trait_call(item, vec![field])).collect::<Result<Vec<_>>>())?;
+    let calls = detached(cx, item, |infer| {
+        fields.iter().map(|&field| {
+            let substs = infer.cx.types.intern_substs(&[field]);
+            infer.trait_call(item, substs)
+        }).collect::<Result<Vec<_>>>()
+    })?;
     Ok(Typed { locals: vec![Local { ty: source }], params: vec![0], ret: Some(ty), shape: Shape::Clone(calls), ..Typed::default() })
 }
 

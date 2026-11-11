@@ -2,6 +2,8 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::names::{ItemRef, Primitive};
 
+use super::substs::{Substs, SubstsPool};
+
 /// An interned type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ty(pub u32);
@@ -23,19 +25,19 @@ pub enum Mut {
 pub enum Kind {
     Prim(Primitive),
     Never,
-    Tuple(Vec<Ty>),
+    Tuple(Substs),
     Ref(Mut, Ty),
     Ptr(Mut, Ty),
     /// An array of `0` whose length is the const value `1`.
     Array(Ty, Ty),
     Slice(Ty),
-    Adt(ItemRef, Vec<Ty>),
-    FnDef(ItemRef, Vec<Ty>),
-    FnPtr(Vec<Ty>, Ty),
+    Adt(ItemRef, Substs),
+    FnDef(ItemRef, Substs),
+    FnPtr(Substs, Ty),
     /// The closure expression `2` of the body of `0` at type arguments `1`.
-    Closure(ItemRef, Vec<Ty>, u32),
+    Closure(ItemRef, Substs, u32),
     /// A trait object of the trait `0`: its trait arguments, then the type bound to each associated type in `2`, with the sorted auto traits `3`.
-    Dyn(ItemRef, Vec<Ty>, Vec<ItemRef>, Vec<ItemRef>),
+    Dyn(ItemRef, Substs, Vec<ItemRef>, Vec<ItemRef>),
     Pat(Ty, u128, u128),
     /// The value of a const generic argument, as the bits of its type.
     Value(u128),
@@ -52,34 +54,34 @@ pub fn object_parts<'k>(args: &'k [Ty], members: &'k [ItemRef]) -> (&'k [Ty], im
 
 impl Kind {
     /// The types directly inside this shape.
-    pub fn children(&self) -> impl Iterator<Item = Ty> + '_ {
+    pub fn children<'a>(&'a self, types: &'a Types) -> impl Iterator<Item = Ty> + 'a {
         let (items, last): (&[Ty], Option<&Ty>) = match self {
-            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Dyn(_, items, ..) => (items, None),
+            Kind::Tuple(items) | Kind::Adt(_, items) | Kind::FnDef(_, items) | Kind::Dyn(_, items, ..) => (types.substs(*items), None),
             Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => (std::slice::from_ref(inner), None),
             Kind::Array(inner, len) => (std::slice::from_ref(inner), Some(len)),
-            Kind::FnPtr(params, ret) => (params, Some(ret)),
+            Kind::FnPtr(params, ret) => (types.substs(*params), Some(ret)),
             _ => (&[], None),
         };
         items.iter().chain(last).copied()
     }
 
-    /// This shape with each type directly inside it replaced by `f` of that type.
-    pub fn map(self, mut f: impl FnMut(Ty) -> Ty) -> Kind {
+    /// This shape with each type directly inside it replaced by `f` of that type, interning slices in `pool`.
+    pub fn map_pool(&self, pool: &SubstsPool, mut f: impl FnMut(Ty) -> Ty) -> Kind {
         match self {
-            Kind::Tuple(items) => Kind::Tuple(items.into_iter().map(&mut f).collect()),
-            Kind::Ref(mutable, inner) => Kind::Ref(mutable, f(inner)),
-            Kind::Ptr(mutable, inner) => Kind::Ptr(mutable, f(inner)),
-            Kind::Array(inner, len) => Kind::Array(f(inner), f(len)),
-            Kind::Slice(inner) => Kind::Slice(f(inner)),
-            Kind::Adt(item, args) => Kind::Adt(item, args.into_iter().map(&mut f).collect()),
-            Kind::FnDef(item, args) => Kind::FnDef(item, args.into_iter().map(&mut f).collect()),
-            Kind::Dyn(of, args, members, autos) => Kind::Dyn(of, args.into_iter().map(&mut f).collect(), members, autos),
+            Kind::Tuple(items) => Kind::Tuple(pool.map(*items, &mut f)),
+            Kind::Ref(mutable, inner) => Kind::Ref(*mutable, f(*inner)),
+            Kind::Ptr(mutable, inner) => Kind::Ptr(*mutable, f(*inner)),
+            Kind::Array(inner, len) => Kind::Array(f(*inner), f(*len)),
+            Kind::Slice(inner) => Kind::Slice(f(*inner)),
+            Kind::Adt(item, args) => Kind::Adt(*item, pool.map(*args, &mut f)),
+            Kind::FnDef(item, args) => Kind::FnDef(*item, pool.map(*args, &mut f)),
+            Kind::Dyn(of, args, members, autos) => Kind::Dyn(*of, pool.map(*args, &mut f), members.clone(), autos.clone()),
             Kind::FnPtr(params, ret) => {
-                let params = params.into_iter().map(&mut f).collect();
-                Kind::FnPtr(params, f(ret))
+                let params = pool.map(*params, &mut f);
+                Kind::FnPtr(params, f(*ret))
             }
-            Kind::Pat(base, start, end) => Kind::Pat(f(base), start, end),
-            other => other,
+            Kind::Pat(base, start, end) => Kind::Pat(f(*base), *start, *end),
+            other => other.clone(),
         }
     }
 
@@ -94,9 +96,25 @@ impl Kind {
 pub struct Types {
     kinds: Vec<Kind>,
     map: HashMap<Kind, Ty>,
+    substs: SubstsPool,
 }
 
 impl Types {
+    /// Clones the handle to the `[Ty]` slice interner.
+    pub fn pool(&self) -> SubstsPool {
+        self.substs.clone()
+    }
+
+    /// Interns `slice` into a `Substs` handle.
+    pub fn intern_substs(&self, slice: &[Ty]) -> Substs {
+        self.substs.intern(slice)
+    }
+
+    /// The slice of type arguments that `id` names.
+    pub fn substs(&self, id: Substs) -> &[Ty] {
+        self.substs.get(id)
+    }
+
     /// The type of shape `kind`.
     pub fn intern(&mut self, kind: Kind) -> Ty {
         if let Some(&ty) = self.map.get(&kind) {
@@ -120,7 +138,25 @@ impl Types {
 
     /// The unit type.
     pub fn unit(&mut self) -> Ty {
-        self.intern(Kind::Tuple(Vec::new()))
+        self.intern(Kind::Tuple(Substs::EMPTY))
+    }
+
+    /// The tuple type of `items`.
+    pub fn tuple(&mut self, items: &[Ty]) -> Ty {
+        let substs = self.intern_substs(items);
+        self.intern(Kind::Tuple(substs))
+    }
+
+    /// The ADT type `item` at `args`.
+    pub fn adt(&mut self, item: ItemRef, args: &[Ty]) -> Ty {
+        let substs = self.intern_substs(args);
+        self.intern(Kind::Adt(item, substs))
+    }
+
+    /// The function pointer type `(params) -> ret`.
+    pub fn fn_ptr(&mut self, params: &[Ty], ret: Ty) -> Ty {
+        let substs = self.intern_substs(params);
+        self.intern(Kind::FnPtr(substs, ret))
     }
 
     /// The type `bool`.

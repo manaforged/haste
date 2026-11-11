@@ -9,6 +9,7 @@ use crate::sema::Context;
 use crate::sema::impls::ImplRef;
 use crate::sema::infer::header_bound_traits;
 use crate::sema::reach::Reached;
+use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty, int_info};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -181,10 +182,11 @@ impl TraitFacts {
     }
 }
 
-pub(super) fn outer_shape_digest(cx: &mut Context<'_>, substs: &[Ty]) -> Digest {
+pub(super) fn outer_shape_digest(cx: &mut Context<'_>, substs: Substs) -> Digest {
+    let slice = cx.types.substs(substs).to_vec();
     let mut mix = Mix::new(99);
-    mix.usize(substs.len());
-    for &ty in substs {
+    mix.usize(slice.len());
+    for &ty in &slice {
         if let Kind::Value(bits) = *cx.types.kind(ty) {
             mix.byte(1);
             mix.u128(bits);

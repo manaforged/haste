@@ -172,7 +172,7 @@ fn analyze_base(cx: &mut Context<'_>, reached: &Reached, index: usize, inlined: 
         d.item(*item);
         return BaseRecord { valid: true, foreign: true, generic, k_base: k.finish(), d_base: d.finish(), ..empty_base() };
     }
-    let outer_shape = if generic { outer_shape_digest(cx, substs) } else { Digest::default() };
+    let outer_shape = if generic { outer_shape_digest(cx, *substs) } else { Digest::default() };
     let source = match &typed.shape {
         Shape::Closure(closure) => closure.parent,
         _ => *item,
@@ -396,18 +396,14 @@ fn hash_locals_and_pats(cx: &mut Context<'_>, typed: &Typed, bins: &mut HashBins
         hash_type_use(cx, local.ty, bins);
     }
     bins.k.usize(typed.drops.len());
-    let mut unpacks: Vec<(u32, u32)> = typed.unpacks.iter().map(|(&local, &pat)| (local, pat.0)).collect();
-    unpacks.sort_unstable();
-    bins.k.usize(unpacks.len());
-    for (local, pat) in unpacks {
+    bins.k.usize(typed.unpacks.len());
+    for (&local, &pat) in &typed.unpacks {
         bins.k.u32(local);
-        bins.k.u32(pat);
+        bins.k.u32(pat.0);
     }
-    let mut pats: Vec<(u32, Ty)> = typed.pats.iter().map(|(&pat, &ty)| (pat.0, ty)).collect();
-    pats.sort_unstable_by_key(|&(pat, _)| pat);
-    bins.k.usize(pats.len());
-    for (pat, ty) in pats {
-        bins.k.u32(pat);
+    bins.k.usize(typed.pats.len());
+    for (&pat, &ty) in &typed.pats {
+        bins.k.u32(pat.0);
         hash_type_use(cx, ty, bins);
     }
 }
@@ -522,7 +518,7 @@ fn autoderef_ty(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, expr: Ex
     let steps = typed.autoderefs.get(&expr).copied().unwrap_or(0);
     for step in 0..steps {
         if let Some(Res::Fn(item, substs)) = typed.derefs.get(&(expr, step)) {
-            let idx = *reached.index.get(&(*item, substs.clone()))?;
+            let idx = *reached.index.get(&(*item, *substs))?;
             let ret = reached.list[idx].1.as_ref().ok()?.ret?;
             let Kind::Ref(_, target_ty) = *cx.types.kind(ret) else { return None };
             ty = target_ty;
@@ -539,9 +535,12 @@ fn autoderef_ty(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, expr: Ex
 fn hash_tuple_pat_fields(cx: &mut Context<'_>, body: &Body, (ty, variant): (Ty, u32), items: crate::body::List, bins: &mut HashBins) {
     let subs = body.list(items);
     let rest_at = subs.iter().position(|&p| matches!(body.pat(PatId(p)), Pat::Rest));
-    let total = match cx.types.kind(ty).clone() {
-        Kind::Tuple(ts) => ts.len(),
-        Kind::Adt(item, args) => field_types(cx, item, &args).map_or(subs.len(), |v| v.get(variant as usize).map_or(subs.len(), Vec::len)),
+    let total = match *cx.types.kind(ty) {
+        Kind::Tuple(ts) => cx.types.substs(ts).len(),
+        Kind::Adt(item, args) => {
+            let slice = cx.types.substs(args).to_vec();
+            field_types(cx, item, &slice).map_or(subs.len(), |v| v.get(variant as usize).map_or(subs.len(), Vec::len))
+        }
         _ => subs.len(),
     };
     for (at, _) in subs.iter().enumerate() {

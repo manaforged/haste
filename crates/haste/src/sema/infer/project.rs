@@ -324,11 +324,13 @@ impl Infer<'_, '_> {
         let kind = self.cx.types.kind(self.resolve(ty)).clone();
         if let Kind::Dyn(principal, args, members, _) = &kind {
             let member = self.cx.trait_member(of, name);
-            let (trait_args, mut bound) = super::super::ty::object_parts(args, members);
-            if let Some((_, found)) = bound.find(|(bound, _)| Some(*bound) == member) {
-                return Ok(Some(found));
-            }
-            let trait_args = trait_args.to_vec();
+            let trait_args = {
+                let (trait_args, mut bound) = super::super::ty::object_parts(self.cx.types.substs(*args), members);
+                if let Some((_, found)) = bound.find(|(bound, _)| Some(*bound) == member) {
+                    return Ok(Some(found));
+                }
+                trait_args.to_vec()
+            };
             return self.object_super_alias(of, ty, (*principal, trait_args), name);
         }
         if self.cx.lang(of) == Some("fn_once") && name == "Output" {

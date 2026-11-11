@@ -49,11 +49,7 @@ impl Lower<'_, '_> {
         use Intrinsic::*;
         let ty = substs[0];
         match (which, args) {
-            (RawPointer, &[data, ..]) => match (repr(self.cx, ty)?, args.get(1)) {
-                (Repr::Mem { .. }, Some(&meta)) => Ok(Some(self.wide(data, meta))),
-                (Repr::Scalar(_), _) => Ok(Some(data)),
-                _ => bail!("aggregate_raw_ptr into a pointer with metadata that is not a slice length"),
-            },
+            (RawPointer, &[data, ..]) => self.raw_pointer(ty, data, args.get(1).copied()),
             (Offset(pointer), &[base, count]) => self.offset(ty, pointer, base, count).map(Some),
             (PtrMask, &[pointer, mask]) => Ok(Some(self.ins().band(pointer, mask))),
             (OffsetFrom(signed), &[to, from]) => self.offset_from(ty, signed, to, from).map(Some),
@@ -69,6 +65,14 @@ impl Lower<'_, '_> {
             (WriteBytes, &[to, byte, count]) => self.write_bytes(ty, to, byte, count).map(|()| None),
             (SliceElement, &[slice, index]) => self.slice_element(substs, slice, index).map(Some),
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
+        }
+    }
+
+    fn raw_pointer(&mut self, ty: Ty, data: Value, meta: Option<Value>) -> Result<Option<Value>> {
+        match (repr(self.cx, ty)?, meta) {
+            (Repr::Mem { .. }, Some(meta)) => Ok(Some(self.wide(data, meta))),
+            (Repr::Scalar(_), _) => Ok(Some(data)),
+            _ => bail!("aggregate_raw_ptr into a pointer with metadata that is not a slice length"),
         }
     }
 
@@ -120,7 +124,10 @@ impl Lower<'_, '_> {
                 let slot = if size { SIZE_SLOT } else { ALIGN_SLOT };
                 Ok(self.ins().load(Type::I64, vtable, slot as i32 * 8))
             }
-            Kind::Adt(item, args) if self.cx.is_unsized(ty)? => self.tail_layout(size, (ty, item, &args), pointer),
+            Kind::Adt(item, args) if self.cx.is_unsized(ty)? => {
+                let slice = self.cx.types.substs(args).to_vec();
+                self.tail_layout(size, (ty, item, &slice), pointer)
+            }
             _ => self.layout_const(which, ty),
         }
     }

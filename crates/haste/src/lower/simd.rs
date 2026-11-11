@@ -46,8 +46,9 @@ impl Lower<'_, '_> {
     }
 
     fn lanes(&mut self, ty: Ty) -> Result<Lanes> {
-        let Kind::Adt(item, args) = self.cx.types.kind(ty).clone() else { bail!("a SIMD intrinsic on a type that is not a vector") };
-        let fields = crate::sema::infer::field_types(self.cx, item, &args)?;
+        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { bail!("a SIMD intrinsic on a type that is not a vector") };
+        let slice = self.cx.types.substs(args).to_vec();
+        let fields = crate::sema::infer::field_types(self.cx, item, &slice)?;
         let Some(&array) = fields.first().and_then(|variant| variant.first()) else { bail!("a SIMD vector with no field") };
         let Kind::Array(elem, len) = *self.cx.types.kind(array) else { bail!("a SIMD vector whose field is not an array") };
         let Some(lane) = machine(self.cx, elem)? else { bail!("a SIMD lane with no machine type") };

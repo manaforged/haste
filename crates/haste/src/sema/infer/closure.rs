@@ -9,6 +9,7 @@ use crate::names::{ItemRef, ModRef};
 use crate::outline::item::ItemKind;
 
 use super::super::Context;
+use super::super::substs::Substs;
 use super::scope::Frame;
 use super::super::ty::{Kind, Mut, Ty};
 use super::{Infer, Local, Res, Shape, Typed};
@@ -69,7 +70,7 @@ pub(super) struct Captures {
 
 impl<'a> Infer<'_, 'a> {
     pub(super) fn closure_expr(&mut self, expr: ExprId, (params, ret, body, by_move): (List, Option<TyId>, ExprId, bool), expected: Option<Ty>) -> Result<Ty> {
-        let Some((parent, substs)) = self.instance.clone() else { bail!("a closure outside a function body") };
+        let Some((parent, substs)) = self.instance else { bail!("a closure outside a function body") };
         let hint = expected.and_then(|ty| self.expected_sig(ty)).filter(|(inputs, _)| inputs.len() == self.body.list(params).len());
         let depth = self.scopes.len();
         self.uses.push(Captures { first: self.out.locals.len() as u32, ..Captures::default() });
@@ -101,7 +102,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// Infers the `async` block or body `expr` as a coroutine whose output is `output` when known, capturing by value when `by_move` and always capturing `forced`.
     pub(super) fn coroutine_expr(&mut self, expr: ExprId, (output, by_move): (Option<Ty>, bool), forced: &[u32]) -> Result<Ty> {
-        let Some((parent, substs)) = self.instance.clone() else { bail!("an `async` block outside a function body") };
+        let Some((parent, substs)) = self.instance else { bail!("an `async` block outside a function body") };
         let Expr::Block { stmts, tail, .. } = *self.body.expr(expr) else { bail!("an `async` body that is not a block") };
         let depth = self.scopes.len();
         self.uses.push(Captures { first: self.out.locals.len() as u32, ..Captures::default() });
@@ -165,7 +166,8 @@ impl<'a> Infer<'_, 'a> {
         let Some(poll) = self.cx.lang_item("poll") else { bail!("core has no `Future::poll`") };
         let (item, substs) = self.future_poll(future_trait, poll, future)?;
         let polled = self.fn_types(item, &substs)?.1;
-        self.out.awaits.insert(expr, super::Awaited { into_future, future, poll: Res::Fn(item, substs), polled });
+        let poll = Res::fn_of(&self.cx.types, item, &substs);
+        self.out.awaits.insert(expr, super::Awaited { into_future, future, poll, polled });
         Ok(output)
     }
 
@@ -347,10 +349,10 @@ impl<'a> Infer<'_, 'a> {
 
     /// The parameter and result types of the closure type `ty`, from this body when it defines the closure, and whether it captures anything.
     pub(super) fn closure_sig(&mut self, ty: Ty) -> Result<(Vec<Ty>, Ty, bool)> {
-        let Kind::Closure(parent, substs, at) = self.cx.types.kind(ty).clone() else { bail!("not a closure") };
-        let local = self.instance.as_ref().is_some_and(|(item, args)| *item == parent && *args == substs);
+        let Kind::Closure(parent, substs, at) = *self.cx.types.kind(ty) else { bail!("not a closure") };
+        let local = self.instance == Some((parent, substs));
         if !local && self.cx.closure(ty).is_none() {
-            super::opaque::revealed(self.cx, parent, &substs)?;
+            super::opaque::revealed(self.cx, parent, substs)?;
         }
         let info = if local { None } else { self.cx.closure(ty) };
         let (closure, locals) = match &info {
@@ -372,8 +374,8 @@ impl<'a> Infer<'_, 'a> {
             self.call_arg(None, ExprId(arg), (param, None))?;
         }
         let Some(call_once) = self.cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
-        let tuple = self.cx.types.intern(Kind::Tuple(params));
-        self.out.res.insert(expr, Res::Fn(call_once, vec![ty, tuple]));
+        let tuple = self.cx.types.tuple(&params);
+        self.out.res.insert(expr, Res::fn_of(&self.cx.types, call_once, &[ty, tuple]));
         Ok(ret)
     }
 
@@ -382,12 +384,15 @@ impl<'a> Infer<'_, 'a> {
         let own_ret = self.out.ret.is_some_and(|ret| self.resolve(ret) == expected);
         let expected = self.ret_sig.filter(|_| own_ret).unwrap_or(expected);
         match self.cx.types.kind(expected).clone() {
-            Kind::FnPtr(inputs, output) => Some((inputs, output)),
+            Kind::FnPtr(inputs, output) => Some((self.cx.types.substs(inputs).to_vec(), output)),
             Kind::Dyn(of, parts, members, _) if self.is_callable_trait(of) => {
-                let (given, mut bound) = super::super::ty::object_parts(&parts, &members);
-                let Kind::Tuple(inputs) = self.cx.types.kind(self.resolve(*given.first()?)).clone() else { return None };
-                let output = bound.next().map_or_else(|| self.cx.types.unit(), |(_, ty)| ty);
-                Some((inputs, output))
+                let (first, output) = {
+                    let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), &members);
+                    (*given.first()?, bound.next().map(|(_, ty)| ty))
+                };
+                let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(first)) else { return None };
+                let inputs = self.cx.types.substs(inputs).to_vec();
+                Some((inputs, output.unwrap_or_else(|| self.cx.types.unit())))
             }
             _ => None,
         }
@@ -396,10 +401,14 @@ impl<'a> Infer<'_, 'a> {
     /// Infers the call `expr` of the `dyn Fn` or `dyn FnMut` value of type `ty`, recording it as a call of `call` or `call_mut` on the trait object.
     pub(super) fn object_call(&mut self, (expr, found): (ExprId, Ty), ty: Ty, args: List) -> Result<Ty> {
         let Kind::Dyn(of, parts, members, _) = self.cx.types.kind(ty).clone() else { bail!("an object call of a type that is not a trait object") };
-        let (given, mut bound) = super::super::ty::object_parts(&parts, &members);
-        let Some(&tuple) = given.first() else { bail!("a callable trait object with no argument tuple") };
-        let ret = bound.next().map_or_else(|| self.cx.types.unit(), |(_, ret)| ret);
-        let Kind::Tuple(params) = self.cx.types.kind(self.resolve(tuple)).clone() else { bail!("a callable trait object whose arguments are not a tuple") };
+        let (tuple, bound_ret) = {
+            let (given, mut bound) = super::super::ty::object_parts(self.cx.types.substs(parts), &members);
+            let Some(&tuple) = given.first() else { bail!("a callable trait object with no argument tuple") };
+            (tuple, bound.next().map(|(_, ret)| ret))
+        };
+        let ret = bound_ret.unwrap_or_else(|| self.cx.types.unit());
+        let Kind::Tuple(params) = *self.cx.types.kind(self.resolve(tuple)) else { bail!("a callable trait object whose arguments are not a tuple") };
+        let params = self.cx.types.substs(params).to_vec();
         let args = self.body.list(args).to_vec();
         if args.len() != params.len() {
             bail!("call takes {} arguments, {} given", params.len(), args.len());
@@ -416,7 +425,7 @@ impl<'a> Infer<'_, 'a> {
             }
         };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{}` has no `{name}`", self.cx.name(of)) };
-        self.out.res.insert(expr, Res::Fn(method, vec![ty, tuple]));
+        self.out.res.insert(expr, Res::fn_of(&self.cx.types, method, &[ty, tuple]));
         Ok(ret)
     }
 
@@ -424,7 +433,7 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn overloaded_call(&mut self, expr: ExprId, found: Ty, args: List) -> Result<Ty> {
         let args = self.body.list(args).to_vec();
         let params: Vec<Ty> = args.iter().map(|_| self.fresh(Kind::Var)).collect();
-        let tuple = self.cx.types.intern(Kind::Tuple(params.clone()));
+        let tuple = self.cx.types.tuple(&params);
         let (mut ty, mut steps) = (self.resolve(found), 0);
         loop {
             if let Some(method) = self.callable_impl(ty, tuple)? {
@@ -435,7 +444,7 @@ impl<'a> Infer<'_, 'a> {
                 for (&arg, &param) in args.iter().zip(&params) {
                     self.call_arg(None, ExprId(arg), (param, None))?;
                 }
-                self.out.res.insert(expr, Res::Fn(method, vec![ty, tuple]));
+                self.out.res.insert(expr, Res::fn_of(&self.cx.types, method, &[ty, tuple]));
                 self.out.overloaded.insert(expr);
                 let Some(once) = self.cx.lang_item("fn_once") else { bail!("core has no `FnOnce`") };
                 return self.project(once, ty, vec![tuple], "Output");
@@ -463,8 +472,8 @@ impl<'a> Infer<'_, 'a> {
         }
         let Some((block, args)) = self.drop_impl(found)? else { bail!("`Box` has no `Drop` impl") };
         let Some(member) = self.cx.member(block, "drop") else { bail!("the `Drop` impl of `Box` has no `drop`") };
-        let args = args.into_iter().map(|arg| self.zonk(arg)).collect();
-        self.out.box_frees.insert(expr, Res::Fn(member, args));
+        let args: Vec<Ty> = args.into_iter().map(|arg| self.zonk(arg)).collect();
+        self.out.box_frees.insert(expr, Res::fn_of(&self.cx.types, member, &args));
         Ok(())
     }
 
@@ -508,7 +517,8 @@ impl<'a> Infer<'_, 'a> {
 
     /// Unifies the signature of the callable `ty`, a closure, function item or function pointer, with `bound`, the function pointer type that an `Fn(A) -> B` bound on it spells.
     pub(super) fn tie_callable(&mut self, ty: Ty, bound: Ty) -> Result<()> {
-        let Kind::FnPtr(inputs, output) = self.cx.types.kind(bound).clone() else { return Ok(()) };
+        let Kind::FnPtr(inputs, output) = *self.cx.types.kind(bound) else { return Ok(()) };
+        let inputs = self.cx.types.substs(inputs).to_vec();
         let Some((params, ret)) = self.callable_sig(ty)? else { return self.tie_output(ty, inputs, output) };
         if params.len() != inputs.len() {
             bail!("a callable of {} arguments where its bound takes {}", params.len(), inputs.len());
@@ -521,7 +531,7 @@ impl<'a> Infer<'_, 'a> {
     fn tie_output(&mut self, ty: Ty, inputs: Vec<Ty>, output: Ty) -> Result<()> {
         let once = self.cx.lang_item("fn_once");
         let (Some(once), false) = (once, matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_))) else { return Ok(()) };
-        let tuple = self.cx.types.intern(Kind::Tuple(inputs));
+        let tuple = self.cx.types.tuple(&inputs);
         let found = self.project(once, ty, vec![tuple], "Output")?;
         self.unify(found, output)
     }
@@ -529,16 +539,19 @@ impl<'a> Infer<'_, 'a> {
     /// The parameters and return type of the closure, function item or function pointer `ty`, or the one a reference to it calls.
     pub(super) fn callable_sig(&mut self, ty: Ty) -> Result<Option<(Vec<Ty>, Ty)>> {
         let ty = self.resolve(ty);
-        Ok(Some(match self.cx.types.kind(ty).clone() {
+        Ok(Some(match *self.cx.types.kind(ty) {
             Kind::Ref(_, inner) => return self.callable_sig(inner),
             Kind::Closure(..) => {
                 let (params, ret, _) = self.closure_sig(ty)?;
                 (params, ret)
             }
-            Kind::FnDef(item, substs) => self.fn_types(item, &substs)?,
-            Kind::FnPtr(params, ret) => (params, ret),
+            Kind::FnDef(item, substs) => {
+                let args = self.cx.types.substs(substs).to_vec();
+                self.fn_types(item, &args)?
+            }
+            Kind::FnPtr(params, ret) => (self.cx.types.substs(params).to_vec(), ret),
             Kind::Var(_) => match self.opaque_sig(ty).map(|sig| self.cx.types.kind(sig).clone()) {
-                Some(Kind::FnPtr(params, ret)) => (params, ret),
+                Some(Kind::FnPtr(params, ret)) => (self.cx.types.substs(params).to_vec(), ret),
                 _ => return Ok(None),
             },
             _ => return Ok(None),
@@ -671,14 +684,15 @@ impl<'a> Infer<'_, 'a> {
             },
             _ => return Ok(None),
         };
-        Ok(Some(self.cx.types.intern(Kind::FnPtr(inputs, output))))
+        Ok(Some(self.cx.types.fn_ptr(&inputs, output)))
     }
 
     /// The inputs and output that the angle form `FnOnce<(A, B), Output = R>` of callable trait `of` names, once its argument tuple is known.
     fn angle_sig(&mut self, arena: &Body, (of, path): (ItemRef, PathId)) -> Result<Option<(Vec<Ty>, Ty)>> {
         let self_ty = self.fresh(Kind::Var);
         let Some(&tuple) = self.bound_args(of, arena, path, self_ty)?.first() else { return Ok(None) };
-        let Kind::Tuple(inputs) = self.cx.types.kind(self.resolve(tuple)).clone() else { return Ok(None) };
+        let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(tuple)) else { return Ok(None) };
+        let inputs = self.cx.types.substs(inputs).to_vec();
         let output = self.path_bindings(arena, path)?.into_iter().find(|(name, _)| name == "Output").map(|(_, ty)| ty);
         Ok(Some((inputs, output.unwrap_or_else(|| self.fresh(Kind::Var)))))
     }
@@ -694,17 +708,19 @@ pub fn by_reference(cx: &Context<'_>, item: ItemRef) -> Option<Mut> {
 }
 
 /// The typed form of a call trait method at a closure or function item and its argument tuple, which calls the closure's body or the function with the tuple's fields.
-pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<Typed> {
-    let (Some(&callee), Some(&tuple)) = (substs.first(), substs.get(1)) else { bail!("a call trait method with no callee and arguments") };
-    let (target, ret) = match cx.types.kind(callee).clone() {
+pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Typed> {
+    let slice = cx.types.substs(substs);
+    let (Some(&callee), Some(&tuple)) = (slice.first(), slice.get(1)) else { bail!("a call trait method with no callee and arguments") };
+    let (target, ret) = match *cx.types.kind(callee) {
         Kind::FnDef(target, args) => {
-            let ret = super::detached(cx, target, |infer| infer.fn_types(target, &args))?.1;
+            let arg_slice = cx.types.substs(args).to_vec();
+            let ret = super::detached(cx, target, |infer| infer.fn_types(target, &arg_slice))?.1;
             (Res::Fn(target, args), ret)
         }
         _ => {
             let Some(info) = cx.closure(callee) else { bail!("a closure whose defining body was not inferred") };
             let Some(call_once) = cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
-            (Res::Fn(call_once, vec![callee, tuple]), info.closure.ret)
+            (Res::fn_of(&cx.types, call_once, &[callee, tuple]), info.closure.ret)
         }
     };
     let receiver = by_reference(cx, item).map_or(callee, |by| cx.types.intern(Kind::Ref(by, callee)));
@@ -713,26 +729,25 @@ pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Resu
 }
 
 /// Records the closures of the finished body `typed` of `parent` at `substs` in `cx`, so other bodies can call them.
-pub fn register(cx: &mut Context<'_>, (parent, substs): (ItemRef, &[Ty]), typed: &Typed) {
+pub fn register(cx: &mut Context<'_>, (parent, substs): (ItemRef, Substs), typed: &Typed) {
     if typed.closures.is_empty() {
         return;
     }
     let shared = Rc::new(Typed { drops: Vec::new(), ..typed.clone() });
-    for (&at, closure) in &typed.closures {
-        let ty = cx.types.intern(Kind::Closure(parent, substs.to_vec(), at.0));
-        let parts = closure.captures.iter().map(|capture| {
+    for (at, closure) in &typed.closures {
+        let ty = cx.types.intern(Kind::Closure(parent, substs, at.0));
+        let parts: Vec<Ty> = closure.captures.iter().map(|capture| {
             let held = typed.locals[capture.local as usize].ty;
             match capture.by {
                 By::Ref => cx.types.intern(Kind::Ref(Mut::Not, held)),
                 By::Mut => cx.types.intern(Kind::Ref(Mut::Mut, held)),
                 By::Value => held,
             }
-        });
-        let env = Kind::Tuple(parts.collect());
-        let mut env = cx.types.intern(env);
+        }).collect();
+        let mut env = cx.types.tuple(&parts);
         if closure.coroutine {
             let word = cx.types.prim(crate::names::Primitive::Usize);
-            env = cx.types.intern(Kind::Tuple(vec![word, word, env]));
+            env = cx.types.tuple(&[word, word, env]);
         }
         cx.set_closure(ty, ClosureInfo { parent, typed: shared.clone(), closure: closure.clone(), env });
     }

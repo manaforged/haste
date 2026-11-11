@@ -108,7 +108,7 @@ pub(crate) type Failures = std::collections::BTreeMap<String, Vec<String>>;
 fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
     let mut failures = Failures::new();
     for &item in cases {
-        if let Err(error) = sema::infer::infer(cx, item, &[]) {
+        if let Err(error) = sema::infer::infer(cx, item, sema::substs::Substs::EMPTY) {
             let text = format!("{error:#}");
             let kind = text.split([' ', '(', '`']).take(3).collect::<Vec<_>>().join(" ");
             failures.entry(kind).or_default().push(cx.name(item).to_owned());

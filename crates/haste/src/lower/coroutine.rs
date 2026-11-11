@@ -28,8 +28,9 @@ impl Lower<'_, '_> {
             slot
         });
         let local = self.typed.params[0];
-        let Kind::Adt(_, args) = self.cx.types.kind(self.typed.locals[local as usize].ty).clone() else { bail!("a resume function with no pinned coroutine") };
-        let Some(&Kind::Ref(_, coroutine)) = args.first().map(|&pointer| self.cx.types.kind(pointer)) else { bail!("a resume function whose pin holds no reference") };
+        let Kind::Adt(_, args) = *self.cx.types.kind(self.typed.locals[local as usize].ty) else { bail!("a resume function with no pinned coroutine") };
+        let first = self.cx.types.substs(args).first().copied();
+        let Some(&Kind::Ref(_, coroutine)) = first.map(|pointer| self.cx.types.kind(pointer)) else { bail!("a resume function whose pin holds no reference") };
         let header = self.header_of(coroutine)?;
         self.resume = Some(Resume { sret, header, resumes: Vec::new(), done: Vec::new() });
         self.bind_captures()?;
@@ -123,8 +124,8 @@ impl Lower<'_, '_> {
             bail!("an `.await` outside an `async` body");
         }
         let value = self.expr(inner)?;
-        let Res::Fn(into, into_substs) = &awaited.into_future else { bail!("an `.await` with no `into_future`") };
-        let future = self.invoke(*into, into_substs, value.into_iter().collect())?;
+        let Res::Fn(into, into_substs) = awaited.into_future else { bail!("an `.await` with no `into_future`") };
+        let future = self.invoke(into, into_substs, value.into_iter().collect())?;
         let held = repr(self.cx, awaited.future)?;
         let place = self.slot(held).map(|slot| Place::slot(slot, held));
         if let (Some(place), Some(future)) = (place, future) {
@@ -148,14 +149,14 @@ impl Lower<'_, '_> {
     }
 
     fn poll_once(&mut self, awaited: &Awaited, future: Option<Place>) -> Result<Option<Place>> {
-        let Res::Fn(poll, substs) = &awaited.poll else { bail!("an `.await` with no `poll`") };
+        let Res::Fn(poll, substs) = awaited.poll else { bail!("an `.await` with no `poll`") };
         let address = match future {
             Some(place) => self.address(place),
             None => self.ins().iconst(Type::I64, 1),
         };
         let pin = self.pin_of(address)?;
         let Some(context) = self.locals[self.typed.params[1] as usize].and_then(|place| self.read(place)) else { bail!("a resume function with no task context") };
-        let polled = self.invoke(*poll, substs, vec![pin, context])?;
+        let polled = self.invoke(poll, substs, vec![pin, context])?;
         let shape = repr(self.cx, awaited.polled)?;
         Ok(match (shape, polled) {
             (Repr::Mem { .. }, Some(address)) => Some(Place { base: Base::Addr(address), offset: 0, repr: shape }),
@@ -239,7 +240,7 @@ impl Lower<'_, '_> {
         self.enter(suspended);
         let pin = self.pin_of(target)?;
         let none = self.ins().iconst(Type::I64, 0);
-        self.invoke(poll, &substs, vec![pin, none])?;
+        self.invoke(poll, substs, vec![pin, none])?;
         self.jump(out, &[]);
         self.enter(out);
         Ok(())
@@ -254,8 +255,8 @@ impl Lower<'_, '_> {
     /// The tuple of a coroutine's captures and its offset in the coroutine object, after the state word and the frame pointer.
     pub(super) fn captures_of(&mut self, ty: Ty) -> Result<(Ty, i32)> {
         let Some(env) = self.cx.closure_env(ty) else { bail!("a coroutine whose defining body was not inferred") };
-        let Kind::Tuple(items) = self.cx.types.kind(env).clone() else { bail!("a coroutine whose object is not a tuple") };
-        let Some(&inner) = items.get(2) else { bail!("a coroutine object with no captures") };
+        let Kind::Tuple(items) = *self.cx.types.kind(env) else { bail!("a coroutine whose object is not a tuple") };
+        let Some(&inner) = self.cx.types.substs(items).get(2) else { bail!("a coroutine object with no captures") };
         Ok((inner, self.field_offset(env, 2)?))
     }
 }

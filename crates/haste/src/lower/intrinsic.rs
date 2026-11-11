@@ -36,7 +36,7 @@ impl Lower<'_, '_> {
     /// A `&'static Location` of where the function being lowered starts, since callers do not pass down the location that `#[track_caller]` asks for yet.
     fn caller_location(&mut self) -> Result<Value> {
         let Some(location) = self.cx.lang_item("panic_location") else { bail!("no `Location` lang item") };
-        let ty = self.cx.types.intern(Kind::Adt(location, Vec::new()));
+        let ty = self.cx.types.adt(location, &[]);
         let layout = self.cx.layout(ty)?;
         let (src, entry) = self.cx.item(self.reached.list[self.index].0.0);
         let mut file = src.path.display().to_string().into_bytes();
@@ -103,7 +103,7 @@ impl Lower<'_, '_> {
     /// The address of a `(ty, bool)` pair in a new frame slot that holds `value` and `flag`.
     pub(super) fn flagged(&mut self, ty: Ty, value: Value, flag: Value) -> Result<Value> {
         let bool_ty = self.cx.types.prim(Primitive::Bool);
-        let tuple = self.cx.types.intern(Kind::Tuple(vec![ty, bool_ty]));
+        let tuple = self.cx.types.tuple(&[ty, bool_ty]);
         let tuple_repr = repr(self.cx, tuple)?;
         let Some(slot) = self.slot(tuple_repr) else { bail!("a flagged pair takes no bytes") };
         let (first, second) = (self.field_offset(tuple, 0)?, self.field_offset(tuple, 1)?);
@@ -117,6 +117,7 @@ impl Lower<'_, '_> {
         let (Kind::Tuple(fields), Kind::FnDef(item, fn_substs)) = (self.cx.types.kind(tuple).clone(), self.cx.types.kind(runtime).clone()) else {
             bail!("const_eval_select needs a tuple of arguments and a function item")
         };
+        let fields = self.cx.types.substs(fields).to_vec();
         let mut values = Vec::new();
         if let Some(&address) = args.first() {
             for (index, field) in fields.into_iter().enumerate() {
@@ -125,7 +126,7 @@ impl Lower<'_, '_> {
                 values.extend(self.read(place));
             }
         }
-        self.invoke(item, &fn_substs, values)
+        self.invoke(item, fn_substs, values)
     }
 
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {

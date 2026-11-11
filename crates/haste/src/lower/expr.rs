@@ -9,6 +9,7 @@ use crate::outline::item::ItemKind;
 use crate::sema::Context;
 use crate::sema::infer::{Coercion, Res, Shape};
 use crate::sema::reach::Reached;
+use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::Place;
@@ -87,8 +88,8 @@ impl Lower<'_, '_> {
             }
             (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(value, steps.clone()),
             (Some(&Coercion::Upcast(slot)), Some(value)) => Ok(Some(self.upcast(value, slot))),
-            (Some(Coercion::Reify(Res::Fn(item, substs))), _) => {
-                let index = self.reached_index(*item, substs)?;
+            (Some(&Coercion::Reify(Res::Fn(item, substs))), _) => {
+                let index = self.reached_index(item, substs)?;
                 Ok(Some(self.code_of(index)))
             }
             _ => Ok(value),
@@ -138,7 +139,7 @@ impl Lower<'_, '_> {
         };
         let owner = self.place_of(operand)?;
         let target = self.address_or_dangling(owner, boxed)?;
-        self.invoke(free, &substs, vec![target])?;
+        self.invoke(free, substs, vec![target])?;
         self.moved_out(root, &path)?;
         Ok(value)
     }
@@ -207,24 +208,18 @@ impl Lower<'_, '_> {
                 }
                 Ok(value)
             }
-            Some(Res::Fn(item, substs)) => {
-                let (item, substs) = (*item, substs.clone());
-                self.item_path(expr, item, &substs)
-            }
+            Some(&Res::Fn(item, substs)) => self.item_path(expr, item, substs),
             Some(&Res::Const(value)) => {
                 let (Kind::Value(bits), Repr::Scalar(machine)) = (self.cx.types.kind(value).clone(), self.repr_of(expr)?) else { bail!("a const parameter whose value is not known") };
                 Ok(Some(self.int_const(machine, bits)))
             }
             Some(Res::Ctor(..)) if self.typed.coercions.contains_key(&expr) => Ok(None),
-            Some(Res::Ctor(_, variant, _)) => {
-                let variant = *variant;
-                self.construct(self.ty_of(expr), variant, Vec::new(), None)
-            }
+            Some(&Res::Ctor(_, variant, _)) => self.construct(self.ty_of(expr), variant, Vec::new(), None),
             None => bail!("path has no resolution"),
         }
     }
 
-    fn item_path(&mut self, expr: ExprId, item: ItemRef, substs: &[Ty]) -> Result<Option<Value>> {
+    fn item_path(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         match self.cx.item(item).1.kind {
             ItemKind::Static => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
             ItemKind::Const => self.invoke(item, substs, Vec::new()),
@@ -250,32 +245,32 @@ impl Lower<'_, '_> {
     }
 
     fn call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
-        if let Some(Res::Fn(item, substs)) = self.typed.res.get(&expr).cloned() {
+        if let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) {
             return self.call_value((expr, callee), (item, substs), args);
         }
         let named = self.typed.res.get(&callee).filter(|_| self.body.names_callee(callee));
-        let (item, substs) = match named.cloned() {
+        let (item, substs) = match named.copied() {
             Some(Res::Fn(item, _)) if matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static) => return self.pointer_call(expr, callee, args),
             Some(Res::Fn(item, substs)) => (item, substs),
             Some(Res::Ctor(_, variant, _)) => return self.ctor_call(expr, variant, args),
             _ => return self.pointer_call(expr, callee, args),
         };
-        if self.tupled_closure_call(item, &substs) {
+        if self.tupled_closure_call(item, substs) {
             bail!("a `call_once` of a closure with a tupled argument is not lowered yet");
         }
         let values = self.args(args, Vec::new())?;
-        self.invoke(item, &substs, values)
+        self.invoke(item, substs, values)
     }
 
     fn method(&mut self, expr: ExprId, receiver: ExprId, params: List) -> Result<Option<Value>> {
-        let Some(Res::Fn(item, substs)) = self.typed.res.get(&expr).cloned() else { bail!("method call has no resolution") };
+        let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) else { bail!("method call has no resolution") };
         let Some(&adjust) = self.typed.adjusts.get(&expr) else { bail!("method call has no receiver adjustment") };
-        if self.tupled_closure_call(item, &substs) {
+        if self.tupled_closure_call(item, substs) {
             bail!("a closure method call with a tupled argument is not lowered yet");
         }
         let first = self.receiver((expr, receiver), adjust)?;
         let values = self.args(params, first.into_iter().collect())?;
-        self.invoke(item, &substs, values)
+        self.invoke(item, substs, values)
     }
 
     pub(super) fn args(&mut self, args: List, mut values: Vec<Value>) -> Result<Vec<Value>> {
@@ -287,12 +282,13 @@ impl Lower<'_, '_> {
         Ok(values)
     }
 
-    pub(super) fn invoke(&mut self, item: ItemRef, substs: &[Ty], values: Vec<Value>) -> Result<Option<Value>> {
+    pub(super) fn invoke(&mut self, item: ItemRef, substs: Substs, values: Vec<Value>) -> Result<Option<Value>> {
         if !self.open {
             return Ok(None);
         }
         if let Some(which) = self.cx.intrinsic(item) {
-            return self.intrinsic(which, substs, &values);
+            let slice = self.cx.types.substs(substs).to_vec();
+            return self.intrinsic(which, &slice, &values);
         }
         let index = self.reached_index(item, substs)?;
         let Ok(callee) = &self.reached.list[index].1 else { bail!("{} did not type-check", self.cx.name(item)) };
@@ -331,12 +327,13 @@ impl Lower<'_, '_> {
             },
             false => (self.expr(callee)?, self.ty_of(callee)),
         };
-        if let Kind::FnDef(item, substs) = self.cx.types.kind(ty).clone() {
+        if let Kind::FnDef(item, substs) = *self.cx.types.kind(ty) {
             let values = self.args(args, Vec::new())?;
-            return self.invoke(item, &substs, values);
+            return self.invoke(item, substs, values);
         }
-        let Kind::FnPtr(params, ret) = self.cx.types.kind(ty).clone() else { bail!("cannot lower calls through values yet") };
+        let Kind::FnPtr(params, ret) = *self.cx.types.kind(ty) else { bail!("cannot lower calls through values yet") };
         let Some(code) = code else { return Ok(None) };
+        let params = self.cx.types.substs(params).to_vec();
         let values = self.args(args, Vec::new())?;
         if !self.open {
             return Ok(None);
@@ -345,8 +342,8 @@ impl Lower<'_, '_> {
     }
 
     /// The index of the reached instance of `item` at `substs`.
-    pub(super) fn reached_index(&self, item: ItemRef, substs: &[Ty]) -> Result<usize> {
-        let instance = (item, substs.to_vec());
+    pub(super) fn reached_index(&self, item: ItemRef, substs: Substs) -> Result<usize> {
+        let instance = (item, substs);
         if let Some(&index) = self.reached.index.get(&instance) {
             return Ok(index);
         }

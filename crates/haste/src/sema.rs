@@ -12,6 +12,7 @@ pub mod infer;
 pub mod intrinsic;
 pub mod layout;
 pub mod reach;
+pub mod substs;
 pub mod traits;
 pub mod ty;
 
@@ -64,7 +65,7 @@ struct Lookups {
     scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
     type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
     impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
-    selections: HashMap<(ItemRef, ty::Ty, Vec<ty::Ty>), Option<(impls::ImplRef, Vec<ty::Ty>)>>,
+    selections: HashMap<(ItemRef, ty::Ty, substs::Substs), Option<(impls::ImplRef, substs::Substs)>>,
     loaded: Vec<[usize; 5]>,
 }
 
@@ -200,7 +201,7 @@ struct Naming<'t, F> {
 
 impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
     fn touches(&mut self, (item, substs): &reach::Instance) -> bool {
-        (self.mine)(*item) || substs.iter().any(|ty| self.names(*ty))
+        (self.mine)(*item) || self.types.substs(*substs).iter().any(|ty| self.names(*ty))
     }
 
     /// Whether `ty` names, at any depth, an item or a closure of an item for which `mine` holds.
@@ -214,10 +215,10 @@ impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
             _ => false,
         };
         let closure_args = match kind {
-            ty::Kind::Closure(_, args, _) => args.clone(),
-            _ => Vec::new(),
+            ty::Kind::Closure(_, args, _) => self.types.substs(*args),
+            _ => &[],
         };
-        let inner: Vec<ty::Ty> = kind.children().chain(closure_args).collect();
+        let inner: Vec<ty::Ty> = kind.children(self.types).chain(closure_args.iter().copied()).collect();
         let found = own || inner.into_iter().any(|inner| self.names(inner));
         self.memo.insert(ty, found);
         found
@@ -358,7 +359,7 @@ impl<'a> Context<'a> {
     /// The type that `ty` owns when it is a `Box`.
     pub fn boxed(&self, ty: ty::Ty) -> Option<ty::Ty> {
         match self.types.kind(ty) {
-            ty::Kind::Adt(item, args) if self.lang(*item) == Some("owned_box") => args.first().copied(),
+            ty::Kind::Adt(item, args) if self.lang(*item) == Some("owned_box") => self.types.substs(*args).first().copied(),
             _ => None,
         }
     }
@@ -374,10 +375,10 @@ impl<'a> Context<'a> {
         let list = |tys: &[ty::Ty]| tys.iter().map(|&ty| self.type_text(ty, resolve)).collect::<Vec<_>>().join(", ");
         match self.types.kind(resolve(ty)).clone() {
             Kind::Adt(item, args) if args.is_empty() => self.name(item).to_owned(),
-            Kind::Adt(item, args) => format!("{}<{}>", self.name(item), list(&args)),
+            Kind::Adt(item, args) => format!("{}<{}>", self.name(item), list(self.types.substs(args))),
             Kind::Ref(Mut::Not, inner) => format!("&{}", self.type_text(inner, resolve)),
             Kind::Ref(Mut::Mut, inner) => format!("&mut {}", self.type_text(inner, resolve)),
-            Kind::Tuple(items) => format!("({})", list(&items)),
+            Kind::Tuple(items) => format!("({})", list(self.types.substs(items))),
             Kind::Slice(element) => format!("[{}]", self.type_text(element, resolve)),
             Kind::Prim(primitive) => format!("{primitive:?}").to_lowercase(),
             other => format!("{other:?}"),

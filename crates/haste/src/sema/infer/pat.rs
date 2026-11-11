@@ -137,10 +137,10 @@ impl Infer<'_, '_> {
     fn tuple_pat(&mut self, list: List, ty: Ty, mode: Mode) -> Result<()> {
         let (pats, rest) = rest_split(self.body, list)?;
         let items = match (self.cx.types.kind(ty).clone(), rest) {
-            (Kind::Tuple(items), _) => items,
+            (Kind::Tuple(items), _) => self.cx.types.substs(items).to_vec(),
             (_, None) => {
                 let items: Vec<Ty> = (0..pats.len()).map(|_| self.fresh(Kind::Var)).collect();
-                let tuple = self.cx.types.intern(Kind::Tuple(items.clone()));
+                let tuple = self.cx.types.tuple(&items);
                 self.unify(ty, tuple)?;
                 items
             }
@@ -221,9 +221,10 @@ impl Infer<'_, '_> {
     fn variant_pat(&mut self, pat: PatId, path: PathId, ty: Ty, (list, mode): (List, Mode)) -> Result<()> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, true)? else { bail!("pattern path is not a tuple constructor") };
-        let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
+        let adt = self.cx.types.intern(Kind::Adt(item, args));
         self.unify(ty, adt)?;
-        let fields = self.adt_fields(item, &args)?[variant as usize].clone();
+        let slice = self.cx.types.substs(args).to_vec();
+        let fields = self.adt_fields(item, &slice)?[variant as usize].clone();
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         let (pats, rest) = rest_split(self.body, list)?;
         self.positional(&pats, rest, &fields, mode)
@@ -232,9 +233,10 @@ impl Infer<'_, '_> {
     fn struct_pat(&mut self, pat: PatId, path: PathId, ty: Ty, (list, mode): (List, Mode)) -> Result<()> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, false)? else { bail!("struct pattern of something that is not a struct") };
-        let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
+        let adt = self.cx.types.intern(Kind::Adt(item, args));
         self.unify(ty, adt)?;
-        let fields = self.adt_fields(item, &args)?[variant as usize].clone();
+        let slice = self.cx.types.substs(args).to_vec();
+        let fields = self.adt_fields(item, &slice)?[variant as usize].clone();
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         for &at in body.list(list) {
             let field = body.field_pats[at as usize];
@@ -293,7 +295,8 @@ impl Infer<'_, '_> {
             return Ok(None);
         }
         let args = self.adt_args(item, Vec::new(), true)?;
-        let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
-        Ok(Some((adt, Res::Ctor(item, variant, args))))
+        let interned = self.cx.types.intern_substs(&args);
+        let adt = self.cx.types.intern(Kind::Adt(item, interned));
+        Ok(Some((adt, Res::Ctor(item, variant, interned))))
     }
 }

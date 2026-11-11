@@ -119,7 +119,7 @@ impl Infer<'_, '_> {
         let Some((item, substs)) = self.trait_method(method, receiver)? else { return Ok(None) };
         let (_, ret) = self.fn_types(item, &substs)?;
         let Kind::Ref(_, target) = *self.cx.types.kind(self.resolve(ret)) else { bail!("`{}` returns a value that is not a reference", self.cx.name(item)) };
-        Ok(Some((Res::Fn(item, substs), target)))
+        Ok(Some((Res::fn_of(&self.cx.types, item, &substs), target)))
     }
 
     /// Makes every overloaded dereference in the place expression `expr` call `DerefMut::deref_mut`, as a write or a unique borrow of the place needs.
