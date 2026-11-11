@@ -133,7 +133,6 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize]) -> Result<Outc
     let left = scripts.iter().zip(entries).map(|(&(unit, _), entry)| (unit, entry.map(|pair| pair.map(|root| demand.declare(root))))).collect();
     let mut driver = Runs { workspace, targets, owners, left, running: Vec::new(), ran: known(workspace), outcome: Outcome::new() };
     image::serve(&mut compilation, &crate::macros::load, &mut demand, &mut driver)?;
-    std::mem::forget((compilation, demand));
     Ok(driver.outcome)
 }
 
