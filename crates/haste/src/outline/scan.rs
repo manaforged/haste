@@ -81,6 +81,10 @@ impl Scanner<'_> {
         if let Some(open) = head.body {
             self.inner_attrs(open, head.kind, &mut attrs)?;
         }
+        let bits = attr::marks(self.src, &attrs);
+        if bits != 0 {
+            self.out.marks.push((index, bits));
+        }
         self.out.items.push(Item { kind: head.kind, name: head.name, vis, attrs, lead, start, end: head.end, body: head.body, parent });
         self.children(index, &head)?;
         if let (ItemKind::MacroCall, Some(_), Some(open)) = (head.kind, parent, head.body)

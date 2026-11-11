@@ -306,11 +306,11 @@ impl<'a> Context<'a> {
         {
             return Rc::default();
         }
+        let mark = self.asks.mark();
         let blocks = match holder {
             Holder::Crate(krate) => self.crate_impls(krate),
             Holder::Body(root) => self.body_impls(root),
         };
-        let mark = self.asks.mark();
         let mut index = Index::default();
         for block in blocks {
             self.index_block(&mut index, block);

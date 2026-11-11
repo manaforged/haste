@@ -6,12 +6,22 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::body::Body;
 use crate::body::sig::{self, Generics};
 use crate::names::{ItemRef, ModRef};
-use crate::outline::item::ItemKind;
+use crate::outline::item::{ItemKind, mark};
 
 use super::Context;
 
 /// The generic parameters and where clause of a trait, in their own arena.
 pub type TraitGenerics = (Body, Generics);
+
+/// The lang items of the standard crates by name, built from the items whose attributes name `lang` or `panic_handler`.
+pub struct Langs {
+    /// Each lang item by its `#[lang]` value, and std's `#[panic_handler]` function by `PANIC_HANDLER`.
+    table: HashMap<String, ItemRef>,
+    /// The standard crates that were read only in part when the table was built, which each lookup asks to load.
+    partial: Vec<u32>,
+    /// The standard crates whose files the table was built from.
+    pub(super) crates: Vec<u32>,
+}
 
 /// The lang-table key of the function `#[panic_handler]` marks, which no `#[lang]` value can spell.
 const PANIC_HANDLER: &str = "#[panic_handler]";
@@ -114,31 +124,34 @@ impl<'a> Context<'a> {
 
     /// The item that `#[lang = "name"]` marks in the standard crates.
     pub fn lang_item(&mut self, name: &str) -> Option<ItemRef> {
-        if let Some((table, partial)) = &self.store.lookups.langs {
-            self.asks.crates.borrow_mut().extend(partial.iter().copied());
-            return table.get(name).copied();
+        if self.store.lookups.langs.is_none() {
+            self.store.lookups.langs = Some(self.lang_table());
         }
-        let (mut table, mut partial) = (HashMap::default(), Vec::new());
-        for krate in self.primitive_holders() {
+        let langs = self.store.lookups.langs.as_ref()?;
+        self.asks.crates.borrow_mut().extend(langs.partial.iter().copied());
+        langs.table.get(name).copied()
+    }
+
+    fn lang_table(&self) -> Langs {
+        let (mut table, mut partial, crates) = (HashMap::default(), Vec::new(), self.primitive_holders());
+        let wanted = mark("lang") | mark("panic_handler");
+        for &krate in &crates {
             let tree = &self.outline.crates[krate as usize];
             let std = self.outline.roots[krate as usize].name == "std";
             if tree.partial() {
                 partial.push(krate);
             }
-            for (file, items) in tree.files.iter().map(|file| &file.items.items).enumerate() {
-                for at in 0..items.len() {
-                    let item = ItemRef { krate, file: file as u32, item: at as u32 };
+            for (file, entry) in tree.files.iter().enumerate() {
+                for &(at, _) in entry.items.marks.iter().filter(|(_, bits)| bits & wanted != 0) {
+                    let item = ItemRef { krate, file: file as u32, item: at };
                     if let Some(lang) = self.lang(item) {
                         table.insert(lang.to_owned(), item);
-                    } else if std && items[at].kind == ItemKind::Fn && self.attr_at(item, "panic_handler").is_some() {
+                    } else if std && entry.items.items[at as usize].kind == ItemKind::Fn && self.attr_at(item, "panic_handler").is_some() {
                         table.insert(PANIC_HANDLER.to_owned(), item);
                     }
                 }
             }
         }
-        let found = table.get(name).copied();
-        self.asks.crates.borrow_mut().extend(partial.iter().copied());
-        self.store.lookups.langs = Some((Rc::new(table), partial.into()));
-        found
+        Langs { table, partial, crates }
     }
 }
