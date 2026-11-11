@@ -189,7 +189,7 @@ impl Loader<'_> {
         } else {
             let candidates = match path {
                 Some(path) if base.item.is_some() => vec![base.dir.join(path)],
-                Some(path) => vec![file.source.path.parent().unwrap_or(Path::new("")).join(path)],
+                Some(path) => vec![file.source.beside(path)],
                 None => vec![base.dir.join(format!("{name}.rs")), base.dir.join(&name).join("mod.rs")],
             };
             (Decl::File { candidates, by_attr: path.is_some() }, PathBuf::new())
@@ -367,7 +367,7 @@ impl Loader<'_> {
     fn include(&mut self, file: &Arc<File>, module: usize, open: u32) -> Result<()> {
         let src = &file.source;
         let path = path_text(src, (open + 1, src.pair(open)), &self.out.env).ok_or_else(|| anyhow::anyhow!("a path that is not a literal, `concat!` or `env!`"));
-        let source = path.and_then(|path| Source::read(&src.path.parent().unwrap_or(Path::new("")).join(path)));
+        let source = path.and_then(|path| Source::read(&src.beside(&path)));
         self.splice(module, source, "include")
     }
 
@@ -399,7 +399,7 @@ impl Loader<'_> {
 }
 
 /// The text of the tokens from `from` up to `to` when they are a string literal or a `concat!`, `env!` or `stringify!` of them, inside the parentheses that a macro puts around an expression fragment.
-fn path_text(src: &Source, (from, to): (u32, u32), env: &super::tree::Env) -> Option<String> {
+pub(crate) fn path_text(src: &Source, (from, to): (u32, u32), env: &super::tree::Env) -> Option<String> {
     if to == from + 1 {
         return src.literal_text(from).ok().flatten();
     }

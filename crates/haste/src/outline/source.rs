@@ -274,6 +274,11 @@ fn pair_up(tokens: &mut [Token], path: &Path) -> Result<()> {
 }
 
 impl Source {
+    /// The file that `path` names from this source, as `include!` and `include_str!` read it: relative to this source's directory.
+    pub fn beside(&self, path: &str) -> PathBuf {
+        self.path.parent().unwrap_or(Path::new("")).join(path)
+    }
+
     /// Reads and lexes the file at `path`.
     pub fn read(path: &Path) -> Result<Source> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;

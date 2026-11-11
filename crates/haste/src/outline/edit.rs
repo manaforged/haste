@@ -1,6 +1,6 @@
 //! Reading a source file again after an edit, in place when only function bodies or token places changed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -42,7 +42,30 @@ impl Outline {
         Ok(Edit::Bodies(slots))
     }
 
-    fn slots_of(&self, path: &Path) -> Vec<(u32, u32)> {
+    /// Reads the file at `path` again in place, dropping the macro expansions of its bodies, as an edit to a file it includes needs; returns each place that holds it.
+    pub fn reexpand(&mut self, path: &Path) -> Result<Vec<(u32, u32)>> {
+        let slots = self.slots_of(path);
+        let new = Arc::new(read(path)?);
+        for &(krate, file) in &slots {
+            self.crates[krate as usize].files[file as usize] = new.clone();
+        }
+        Ok(slots)
+    }
+
+    /// Each file that an `include_str!` or `include_bytes!` call with a literal path in crate `krate` reads, with the file that holds the call.
+    pub fn included(&self, krate: usize) -> Vec<(PathBuf, PathBuf)> {
+        let tree = &self.crates[krate];
+        let mut found = Vec::new();
+        for src in tree.files.iter().filter(|file| !file.expanded).map(|file| &file.source) {
+            let calls = (2..src.tokens.len() as u32).filter(|&open| src.text(open) == "(" && src.text(open - 1) == "!" && matches!(src.text(open - 2), "include_str" | "include_bytes"));
+            let paths = calls.filter_map(|open| super::build::path_text(src, *src.args(open).first()?, &tree.env));
+            found.extend(paths.map(|path| (src.beside(&path), src.path.clone())));
+        }
+        found
+    }
+
+    /// The crate and file index of each place that holds the file at `path`.
+    pub fn slots_of(&self, path: &Path) -> Vec<(u32, u32)> {
         let mut slots = Vec::new();
         for (krate, tree) in self.crates.iter().enumerate() {
             for (file, entry) in tree.files.iter().enumerate() {

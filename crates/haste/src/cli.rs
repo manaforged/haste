@@ -346,18 +346,25 @@ fn program_name(root: &std::path::Path) -> String {
     root.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
 
+/// Loads the workspace at `root` with the standard library merged in and the output of every build script settled.
+pub(crate) fn load_workspace(root: &std::path::Path, targets: &Targets) -> Result<graph::Workspace> {
+    let mut workspace = graph::load(root, targets)?;
+    workspace.merge(graph::load_sysroot(&graph::library()?, targets)?);
+    crate::scripts::settle(&mut workspace, targets)?;
+    Ok(workspace)
+}
+
 fn report(command: Command, root: &std::path::Path, argv: &[String]) -> Result<i32> {
     let targets = Targets { target: cfg::Target::host(), host: cfg::Target::host() };
     let started = Instant::now();
-    let mut workspace = graph::load(root, &targets)?;
-    if !matches!(command, Command::Debug(Query::Graph)) {
-        workspace.merge(graph::load_sysroot(&graph::library()?, &targets)?);
-        crate::scripts::settle(&mut workspace, &targets)?;
-    }
+    let mut workspace = match command {
+        Command::Debug(Query::Graph) => graph::load(root, &targets)?,
+        _ => load_workspace(root, &targets)?,
+    };
     let loaded = started.elapsed();
     let status = match command {
         Command::Request(request) => report_cases(&workspace, &targets, request, argv)?,
-        Command::Serve => crate::serve::serve(&workspace, &targets, root).map(|()| 0)?,
+        Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };
     eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);
