@@ -88,13 +88,8 @@ impl Infer<'_, '_> {
         let (mut ty, to) = (self.resolve(from), self.resolve(to));
         let mut steps = Vec::new();
         while steps.len() < RECURSION_LIMIT {
-            if self.same_head(ty, to) {
-                if steps.is_empty() {
-                    return Ok(None);
-                }
-                if self.trial_unify(ty, to) {
-                    return Ok(Some(Coercion::Deref(steps, to)));
-                }
+            if self.same_head(ty, to) && (ty == to || self.trial_unify(ty, to)) {
+                return Ok((!steps.is_empty()).then_some(Coercion::Deref(steps, to)));
             }
             let next = match self.cx.types.kind(ty).clone() {
                 Kind::Ref(_, inner) => Some((inner, None)),
