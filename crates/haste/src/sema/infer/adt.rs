@@ -74,8 +74,33 @@ impl<'a> Infer<'_, 'a> {
         self.item_frame(item, (params, args), (self_ty, Some(item)))
     }
 
-    /// The constructor that `path` names in the value namespace when `values` holds, else in the type namespace.
+    /// The constructor that `path` names in the value namespace when `values` holds, else in the type namespace, where a type that names a struct or union also does.
     pub fn ctor(&mut self, arena: &Body, path: PathId, values: bool) -> Result<Option<Ctor>> {
+        if values {
+            return self.named_ctor(arena, path, values);
+        }
+        if arena.path(path).qself.is_some() {
+            return self.type_ctor(arena, path);
+        }
+        match self.named_ctor(arena, path, values)? {
+            None => self.type_ctor(arena, path),
+            found => Ok(found),
+        }
+    }
+
+    /// The struct or union that `path` names as a type, through a type alias, `Self` or an associated type, at the type's arguments.
+    fn type_ctor(&mut self, arena: &Body, path: PathId) -> Result<Option<Ctor>> {
+        let entry = arena.path(path);
+        let ty = match (entry.qself, arena.list(entry.segments).last()) {
+            (Some((qself, Some(trait_path))), Some(&last)) => self.projection(arena, (qself, trait_path), last)?,
+            _ => self.named_ty(arena, path, entry.segments.len as usize, true)?,
+        };
+        let Kind::Adt(item, args) = self.cx.types.kind(self.resolve(ty)).clone() else { return Ok(None) };
+        Ok(matches!(self.cx.item(item).1.kind, ItemKind::Struct | ItemKind::Union).then_some((item, 0, args)))
+    }
+
+    /// The struct, union or variant that `path` names directly, or an enum variant through a type alias.
+    fn named_ctor(&mut self, arena: &Body, path: PathId, values: bool) -> Result<Option<Ctor>> {
         let (segments, absolute, dollar) = self.segments(arena, path);
         let texts: Vec<&str> = segments.iter().map(|sym| self.cx.names.symbols.text(*sym)).collect();
         if texts.first() == Some(&"Self") {
