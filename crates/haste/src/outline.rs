@@ -45,7 +45,7 @@ pub struct Outline {
     pub crates: Vec<Crate>,
     pub deps: Vec<Vec<(String, usize)>>,
     pub cache: Files,
-    /// The output text of each procedural macro called in a body, by macro function and input text, or why it failed.
+    /// The output text of each procedural macro called in a body, by macro function and input text, or why it failed; dropped for a macro whose crate reloads.
     pub procs: HashMap<(crate::names::ItemRef, String), Result<String, String>>,
     /// For each root whose sources cannot change, a key of its path and of the resolved graph, under which what its procedural macros print for one input is kept.
     pub pins: Vec<Option<u64>>,
@@ -234,6 +234,7 @@ impl Outline {
             let env = std::mem::take(&mut self.crates[at].env);
             self.crates[at] = Crate { env, modules: vec![root_module(&self.roots[at].path)], ..Crate::default() };
         }
+        self.procs.retain(|(run, _), _| !crates.contains(&(run.krate as usize)));
         crates.iter().try_for_each(|&at| self.load_crate(at))?;
         Ok(crates)
     }

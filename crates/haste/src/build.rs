@@ -46,7 +46,7 @@ fn stamp(path: &std::path::Path) -> Option<(SystemTime, u64)> {
 }
 
 fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<(PathBuf, Option<(SystemTime, u64)>)> {
-    member_files(workspace, outline).into_iter().map(|path| (path.clone(), stamp(&path))).collect()
+    local_files(workspace, outline).into_iter().map(|path| (path.clone(), stamp(&path))).collect()
 }
 
 fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, pick: Pick) -> (Vec<ItemRef>, Vec<Instance>) {
@@ -177,7 +177,7 @@ impl Build {
         Ok(())
     }
 
-    /// Brings the build up to date with the member files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and loads from nothing when that fails.
+    /// Brings the build up to date with the local files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and loads from nothing when that fails.
     pub fn refresh(&mut self, workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
         let (mut stale, mut crates) = (Vec::new(), Vec::new());
         for at in 0..self.stamps.len() {
@@ -188,6 +188,7 @@ impl Build {
             self.stamps[at].1 = now;
             match self.compilation.outline.reread(&self.stamps[at].0) {
                 Ok(Edit::Same) => {}
+                Ok(Edit::Bodies(slots)) if slots.iter().any(|&(krate, _)| expands(workspace, &self.compilation.outline, krate)) => crates.extend(slots.iter().map(|&(krate, _)| krate)),
                 Ok(Edit::Bodies(slots)) => stale.extend(slots),
                 Ok(Edit::Items(edited)) => crates.extend(edited),
                 Err(_) => return self.rebuild(workspace, targets),
@@ -284,9 +285,16 @@ pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> 
     status
 }
 
-fn member_files(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<PathBuf> {
-    let members = outline.roots.iter().zip(&outline.crates).filter(|(root, _)| is_member(workspace, root));
-    let mut paths: Vec<PathBuf> = members.flat_map(|(_, tree)| tree.files.iter().filter(|file| !file.expanded).map(|file| file.source.path.clone())).collect();
+/// Whether crate `krate` is a procedural macro crate, whose bodies decide the code of the crates that call its macros.
+fn expands(workspace: &graph::Workspace, outline: &outline::Outline, krate: u32) -> bool {
+    let unit = &workspace.graph.units[outline.roots[krate as usize].unit];
+    workspace.packages[unit.package].manifest.proc_macro
+}
+
+/// The source files of every crate whose package is local, which an edit can change.
+fn local_files(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<PathBuf> {
+    let local = outline.roots.iter().zip(&outline.crates).filter(|(root, _)| workspace.packages[workspace.graph.units[root.unit].package].local());
+    let mut paths: Vec<PathBuf> = local.flat_map(|(_, tree)| tree.files.iter().filter(|file| !file.expanded).map(|file| file.source.path.clone())).collect();
     paths.sort();
     paths.dedup();
     paths

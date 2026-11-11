@@ -44,6 +44,13 @@ pub struct Package {
     pub sysroot: bool,
 }
 
+impl Package {
+    /// Whether its sources can change while haste runs: a path package outside the standard library.
+    pub fn local(&self) -> bool {
+        self.locked.source.is_none() && !self.sysroot
+    }
+}
+
 /// A package built for one side with its resolved features and edges.
 pub struct Unit {
     pub package: usize,
