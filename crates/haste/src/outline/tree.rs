@@ -20,6 +20,20 @@ pub struct File {
     pub items: Items,
     pub expanded: bool,
     bodies: OnceLock<Box<[OnceLock<Option<Box<Expansion>>>]>>,
+    index: OnceLock<Index>,
+}
+
+/// The items and imports of a file by name, each list in declaration order.
+#[derive(Debug, Default)]
+pub struct Index {
+    /// The items that each item, or the top level for none, holds directly or in an extern block, by plain name.
+    pub items: HashMap<Option<u32>, HashMap<Box<str>, Vec<u32>>>,
+    /// The named imports by the name they bind.
+    pub imports: HashMap<Box<str>, Vec<u32>>,
+    /// The glob imports.
+    pub globs: Vec<u32>,
+    /// The functions whose tokens hold each import.
+    pub holders: Vec<Box<[u32]>>,
 }
 
 /// A body read in full: its file with the expansions of its macro calls laid after it and the items it declares, and the braced block that each call's opening group became.
@@ -32,7 +46,12 @@ pub struct Expansion {
 impl File {
     /// A file of `source` scanned to `items`, with no body expanded yet.
     pub fn new(source: Source, items: Items, expanded: bool) -> File {
-        File { source, items, expanded, bodies: OnceLock::new() }
+        File { source, items, expanded, bodies: OnceLock::new(), index: OnceLock::new() }
+    }
+
+    /// The name index of this file, made by `build` on first use and kept.
+    pub fn index(&self, build: impl FnOnce(&File) -> Index) -> &Index {
+        self.index.get_or_init(|| build(self))
     }
 
     /// The expansion of the body of item `item`, once a pass read it and found macro calls or items in it.
