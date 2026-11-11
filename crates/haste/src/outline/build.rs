@@ -6,7 +6,7 @@ use rustc_lexer::TokenKind;
 
 use super::item::{Attr, Item, ItemKind};
 use super::source::Source;
-use super::tree::{Files, Crate, Decl, File, Held, Impl, Macro, Module, State, Textual, Waiting, textual};
+use super::tree::{Files, Crate, Decl, File, Held, Impl, Macro, Module, State, Textual, View, Waiting, textual};
 use super::{derive, mbe, rules, scan};
 
 /// The item kinds that an attribute macro can stand on.
@@ -28,18 +28,62 @@ enum Found {
     Missing,
 }
 
+/// What a loader sees of the other crates: the crates as they are, or, by crate, the views that a parallel load fixed for one level.
+#[derive(Clone, Copy)]
+pub enum Others<'a> {
+    Crates(&'a [Crate]),
+    Views(&'a [Option<Arc<View>>]),
+}
+
 /// Loads modules of one crate, which it holds while the other crates stay readable.
 pub struct Loader<'a> {
     pub krate: usize,
     pub cache: &'a Files,
-    pub others: &'a [Crate],
+    pub others: Others<'a>,
     pub deps: &'a [(String, usize)],
     pub out: &'a mut Crate,
     pub depth: usize,
     pub scope: Option<Arc<Textual>>,
 }
 
+/// The prelude crate among `deps` that a crate gets as its first `#[macro_use]` crate: std, else core.
+fn prelude_crates(deps: &[(String, usize)]) -> Vec<usize> {
+    let named = |name: &str| deps.iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
+    ["std", "core"].iter().find_map(|name| named(name)).into_iter().collect()
+}
+
+impl<'a> Loader<'a> {
+    /// A loader of crate `krate` into `out` that sees the other crates through `others`; a crate with nothing read yet first gets its prelude crate among `deps`.
+    pub fn new(krate: usize, cache: &'a Files, others: Others<'a>, deps: &'a [(String, usize)], out: &'a mut Crate) -> Loader<'a> {
+        if out.modules.len() == 1 && out.files.is_empty() && out.macro_use.is_empty() {
+            out.macro_use = prelude_crates(deps);
+        }
+        Loader { krate, cache, others, deps, out, depth: 0, scope: None }
+    }
+}
+
 impl Loader<'_> {
+    /// Reads the declared module `module` as `load` does, and after the root module adds the `#[macro_use]` extern crates it names.
+    pub fn load_module(&mut self, module: usize) -> Result<()> {
+        self.load(module)?;
+        if module == 0 {
+            self.macro_use_externs();
+        }
+        Ok(())
+    }
+
+    fn macro_use_externs(&mut self) {
+        let Some(file) = self.out.modules.first().filter(|root| root.loaded()).map(|root| self.out.files[root.file].clone()) else { return };
+        let externs = file.items.items.iter().filter(|item| item.kind == ItemKind::ExternCrate && item.parent.is_none() && item.attrs.contains(&Attr::MacroUse));
+        for item in externs {
+            let name = file.source.text(item.start + 2);
+            let Some(&(_, at)) = self.deps.iter().find(|(dep, _)| dep == name) else { continue };
+            if !self.out.macro_use.contains(&at) {
+                self.out.macro_use.push(at);
+            }
+        }
+    }
+
     /// Reads the declared module `module` and expands its item macros, loading its `#[macro_use]` children with it.
     pub fn load(&mut self, module: usize) -> Result<()> {
         let State::Declared(decl) = self.out.modules[module].state.clone() else { return Ok(()) };
@@ -236,10 +280,17 @@ impl Loader<'_> {
     }
 
     fn exported(&self, krate: usize, name: &str) -> Found {
-        let holder = if krate == self.krate { &*self.out } else { &self.others[krate] };
-        match holder.exports.get(name) {
+        let (exports, unsettled) = match self.others {
+            _ if krate == self.krate => (&self.out.exports, self.out.unsettled()),
+            Others::Crates(crates) => (&crates[krate].exports, crates[krate].unsettled()),
+            Others::Views(views) => match views.get(krate).and_then(Option::as_ref) {
+                Some(view) => (&view.exports, view.partial),
+                None => return Found::NotYet(krate),
+            },
+        };
+        match exports.get(name) {
             Some(found) => Found::Macro(found.clone()),
-            None if holder.partial() || holder.modules.is_empty() => Found::NotYet(krate),
+            None if unsettled => Found::NotYet(krate),
             None => Found::Missing,
         }
     }

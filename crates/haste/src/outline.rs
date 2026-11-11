@@ -5,6 +5,7 @@ pub mod edit;
 pub mod fragment;
 pub mod item;
 pub mod mbe;
+mod parallel;
 pub mod rules;
 pub mod scan;
 pub mod source;
@@ -18,8 +19,8 @@ use anyhow::Result;
 
 use crate::graph::manifest::Kind;
 use crate::graph::{Targets, Workspace};
-use build::Loader;
-use item::{Attr, ItemKind, Vis};
+use build::{Loader, Others};
+use item::{ItemKind, Vis};
 use tree::{Files, Crate, Decl, Env, Macro, Module, State};
 
 /// What a crate is to its package.
@@ -213,16 +214,17 @@ impl Outline {
         modules.iter().try_for_each(|&(krate, module)| self.load_one(krate, module))
     }
 
-    /// Reads every module of every crate.
+    /// Reads every module of every crate, level by level of each module tree; with more than one job, crates load on several threads to the same result.
     pub fn load_all(&mut self) -> Result<()> {
-        loop {
-            let declared = |(krate, tree): (usize, &Crate)| (0..tree.modules.len()).filter(|at| matches!(tree.modules[*at].state, State::Declared(_))).map(move |at| (krate, at)).collect::<Vec<_>>();
-            let modules: Vec<(usize, usize)> = self.crates.iter().enumerate().flat_map(declared).collect();
-            self.load_many(&modules)?;
-            if !self.crates.iter().any(Crate::partial) {
-                return Ok(());
-            }
+        let workers = crate::jobs().min(self.crates.len());
+        if workers > 1 {
+            return parallel::load_all(self, workers);
         }
+        while self.crates.iter().any(Crate::partial) {
+            let modules: Vec<(usize, usize)> = self.crates.iter().enumerate().flat_map(|(krate, tree)| tree.declared().map(move |at| (krate, at))).collect();
+            self.load_many(&modules)?;
+        }
+        Ok(())
     }
 
     /// Reads crate `krate` and every crate that depends on it again from their roots after files of `krate` changed outside function bodies, and returns those crates.
@@ -330,49 +332,19 @@ impl Outline {
 
     fn with_loader<T>(&mut self, krate: usize, run: impl FnOnce(&mut Loader<'_>) -> Result<T>) -> Result<T> {
         let mut holder = std::mem::take(&mut self.crates[krate]);
-        if holder.modules.len() == 1 && holder.files.is_empty() && holder.macro_use.is_empty() {
-            holder.macro_use = self.prelude_crates(krate);
-        }
-        let mut loader = Loader { krate, cache: &self.cache, others: &self.crates, deps: &self.deps[krate], out: &mut holder, depth: 0, scope: None };
+        let mut loader = Loader::new(krate, &self.cache, Others::Crates(&self.crates), &self.deps[krate], &mut holder);
         let result = run(&mut loader);
         self.crates[krate] = holder;
         result
     }
 
-    fn prelude_crates(&self, krate: usize) -> Vec<usize> {
-        let named = |name: &str| self.deps[krate].iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
-        ["std", "core"].iter().find_map(|name| named(name)).into_iter().collect()
-    }
-
     fn read_ahead(&self, modules: &[(usize, usize)]) {
-        let files = modules.iter().filter_map(|&(krate, module)| match &self.crates[krate].modules[module].state {
-            State::Declared(Decl::File { candidates, .. }) => Some(candidates),
-            _ => None,
-        });
-        let paths: Vec<PathBuf> = files.flatten().cloned().collect();
+        let paths: Vec<PathBuf> = modules.iter().flat_map(|&(krate, module)| self.crates[krate].unread_files(module)).cloned().collect();
         self.cache.read_all(&paths);
     }
 
     fn load_one(&mut self, krate: usize, module: usize) -> Result<()> {
-        self.with_loader(krate, |loader| loader.load(module))?;
-        if module == 0 {
-            self.macro_use_externs(krate);
-        }
-        Ok(())
-    }
-
-    fn macro_use_externs(&mut self, krate: usize) {
-        let holder = &self.crates[krate];
-        let Some(file) = holder.modules.first().filter(|root| root.loaded()).map(|root| holder.files[root.file].clone()) else { return };
-        let externs = file.items.items.iter().filter(|item| item.kind == ItemKind::ExternCrate && item.parent.is_none() && item.attrs.contains(&Attr::MacroUse));
-        let names: Vec<&str> = externs.map(|item| file.source.text(item.start + 2)).collect();
-        let found: Vec<usize> = names.iter().filter_map(|name| self.deps[krate].iter().find(|(dep, _)| dep == name).map(|(_, at)| *at)).collect();
-        let list = &mut self.crates[krate].macro_use;
-        for at in found {
-            if !list.contains(&at) {
-                list.push(at);
-            }
-        }
+        self.with_loader(krate, |loader| loader.load_module(module))
     }
 
     /// Reads every declared module of `crates`, then retries the macro calls of every crate that still waits on one.
@@ -380,7 +352,7 @@ impl Outline {
         crates.sort_unstable();
         crates.dedup();
         let trees = &self.crates;
-        let declared: Vec<(usize, usize)> = crates.iter().flat_map(|&krate| (0..trees[krate].modules.len()).filter(move |at| matches!(trees[krate].modules[*at].state, State::Declared(_))).map(move |at| (krate, at))).collect();
+        let declared: Vec<(usize, usize)> = crates.iter().flat_map(|&krate| trees[krate].declared().map(move |at| (krate, at))).collect();
         self.load_many(&declared)?;
         self.retry_waiting()
     }
