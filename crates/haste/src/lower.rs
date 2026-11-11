@@ -21,7 +21,7 @@ mod promote;
 mod simd;
 mod slice_pat;
 
-pub use expr::may_inline;
+pub use expr::{inline_body, may_inline};
 
 use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, Function, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};

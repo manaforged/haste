@@ -3,6 +3,7 @@
 pub mod adt;
 mod body_scope;
 mod builtin;
+pub mod census;
 pub mod evaluate;
 mod expand;
 mod format;

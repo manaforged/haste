@@ -499,6 +499,36 @@ impl<'a> Infer<'_, 'a> {
             _ => None,
         }
     }
+
+    fn collect_header_traits(&mut self, item: ItemRef) -> Result<Vec<ItemRef>> {
+        self.frame_item = Some(item);
+        self.block = self.cx.owner_impl(item);
+        let mut direct = Vec::new();
+        if let Some(of) = self.cx.owner_trait(item) {
+            direct.push(of);
+        }
+        if let Some(block) = self.block
+            && let Some(of) = self.cx.impl_trait(block)
+        {
+            direct.push(of);
+        }
+        let home = self.home;
+        for (header, src) in self.headers()? {
+            let (arena, generics, predicates) = header.parts();
+            let bounds: Vec<u32> = type_params(generics).flat_map(|g| arena.list(g.bounds).iter().copied()).chain(predicates.iter().flat_map(|p| arena.list(p.bounds).iter().copied())).collect();
+            let found = self.in_source(src, |inner| Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>()))?;
+            direct.extend(found);
+        }
+        self.implied_traits(direct)
+    }
+}
+
+/// The traits declared in `item`'s header and any enclosing impl or trait header, with every supertrait they imply.
+pub fn header_bound_traits(cx: &mut super::super::Context<'_>, item: ItemRef) -> Vec<ItemRef> {
+    if !matches!(cx.item(item).1.kind, ItemKind::Fn | ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::Type) {
+        return Vec::new();
+    }
+    super::detached(cx, item, |infer| infer.collect_header_traits(item)).unwrap_or_default()
 }
 
 /// What ranks one applicable impl against another under specialization: whether it has `default` items, the traits its bounds name, and those with every supertrait.

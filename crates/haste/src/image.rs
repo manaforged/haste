@@ -42,6 +42,8 @@ pub struct Image {
     cells: RefCell<HashMap<usize, i64>>,
     wanted: RefCell<Vec<crate::sema::reach::Instance>>,
     bodies: lower::Bodies,
+    sizes: Vec<u32>,
+    times: Vec<u64>,
 }
 
 impl Slots for Image {
@@ -110,7 +112,18 @@ impl Image {
         let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
         let memory = Memory::default();
         let state = Arena::private(STATE_BYTES)?;
-        Ok(Image { table, _low: low, capacity, memory, stubs: Memory::default(), shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), wanted: RefCell::default(), bodies: lower::Bodies::default() })
+        let len = reached.list.len();
+        Ok(Image { table, _low: low, capacity, memory, stubs: Memory::default(), shared: RefCell::new(shared), state: RefCell::new(state), tables: RefCell::default(), fixups: RefCell::default(), cells: RefCell::default(), wanted: RefCell::default(), bodies: lower::Bodies::default(), sizes: vec![0; len], times: vec![0; len] })
+    }
+
+    /// The encoded machine-code byte length of each reached function, or zero when not compiled.
+    pub fn code_sizes(&self) -> &[u32] {
+        &self.sizes
+    }
+
+    /// The lowering and encoding wall time in nanoseconds of each reached function, or zero when not compiled.
+    pub fn compile_times(&self) -> &[u64] {
+        &self.times
     }
 
     fn slot(&self, index: usize) -> &AtomicUsize {
@@ -129,6 +142,10 @@ impl Image {
 
     /// Lowers and encodes the reached functions `indices` that type-checked, on every core when there are many, links them, and returns the errors of those that did not compile, by index.
     pub fn compile(&mut self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize]) -> Vec<(usize, String)> {
+        if self.sizes.len() < reached.list.len() {
+            self.sizes.resize(reached.list.len(), 0);
+            self.times.resize(reached.list.len(), 0);
+        }
         self.bind_foreign_statics(cx, reached, indices);
         let mut errors = Vec::new();
         let mut work = Vec::new();
@@ -177,13 +194,21 @@ impl Image {
     }
 
     fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
+        let started = std::time::Instant::now();
         let lowered = self.bodies.body(index);
         let func = match lowered {
             Some(body) => std::rc::Rc::unwrap_or_clone(body),
             None => lower::lower(cx, reached, self, index)?,
         };
         let code = haste_codegen::compile(func, haste_codegen::Target::host())?;
-        Ok(self.memory.write(code.bytes())?)
+        let bytes = code.bytes();
+        if index >= self.sizes.len() {
+            self.sizes.resize(index + 1, 0);
+            self.times.resize(index + 1, 0);
+        }
+        self.sizes[index] = bytes.len() as u32;
+        self.times[index] = started.elapsed().as_nanos() as u64;
+        Ok(self.memory.write(bytes)?)
     }
 
     /// Runs each case `(index, name)`, a reached `fn(i64) -> i64`, on each input and prints `name input value` lines, all in one forked child; a case that crashes gets its status and the cases after it run in a new child.

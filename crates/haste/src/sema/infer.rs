@@ -34,6 +34,7 @@ pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
 pub use scope::{Form, type_params};
+pub use select::header_bound_traits;
 
 use rustc_hash::FxHashMap as HashMap;
 

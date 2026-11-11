@@ -12,7 +12,7 @@ use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::Place;
-use super::{Loop, Lower, Parts, Repr, repr};
+use super::{Loop, Lower, Parts, Repr, Slots, repr};
 
 /// The most instructions a sysroot body may have, after slot promotion, for a call to copy it inline.
 const INLINE_LIMIT: usize = 30;
@@ -34,7 +34,23 @@ pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool
     inline_limit(cx, reached, index).is_some()
 }
 
-/// The most instructions a call may copy inline of reached function `index`: `ALWAYS_LIMIT` for an `#[inline(always)]` sysroot function, `INLINE_LIMIT` for one whose source body has at most `INLINE_EXPRS` expressions, or none.
+/// The lowered body of reached function `index` when a call may copy it inline: small, copyable, and not being lowered already.
+pub fn inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Option<Rc<Function>> {
+    if !slots.bodies().first_try(index) {
+        return slots.bodies().body(index);
+    }
+    let limit = inline_limit(cx, reached, index)?;
+    let mut body = super::lower(cx, reached, slots, index).ok().filter(Function::can_inline)?;
+    haste_codegen::simplify(&mut body);
+    if body.size() > limit {
+        return None;
+    }
+    let body = Rc::new(body);
+    slots.bodies().keep(index, body.clone());
+    Some(body)
+}
+
+/// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
 fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
     let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
     if !cx.outline.crates[item.krate as usize].env.release {
@@ -290,18 +306,7 @@ impl Lower<'_, '_> {
 
     /// The lowered body of reached sysroot function `index` when a call may copy it inline: small, copyable, and not being lowered already.
     fn inline_body(&mut self, index: usize) -> Option<Rc<Function>> {
-        if !self.slots.bodies().first_try(index) {
-            return self.slots.bodies().body(index);
-        }
-        let limit = inline_limit(self.cx, self.reached, index)?;
-        let mut body = super::lower(self.cx, self.reached, self.slots, index).ok().filter(Function::can_inline)?;
-        haste_codegen::simplify(&mut body);
-        if body.size() > limit {
-            return None;
-        }
-        let body = Rc::new(body);
-        self.slots.bodies().keep(index, body.clone());
-        Some(body)
+        inline_body(self.cx, self.reached, self.slots, index)
     }
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.

@@ -89,8 +89,9 @@ impl Image {
         let inherited = self.fixups.get_mut().len();
         let mut text = String::new();
         for &index in work.iter().skip(part).step_by(jobs) {
-            if let Err(error) = self.compile_into(cx, reached, index) {
-                text.push_str(&format!("E {index} {}\n", error.replace('\n', " ")));
+            match self.compile_into(cx, reached, index) {
+                Ok(()) => text.push_str(&format!("S {index} {} {}\n", self.sizes[index], self.times[index])),
+                Err(error) => text.push_str(&format!("E {index} {}\n", error.replace('\n', " "))),
             }
         }
         for (address, index) in self.fixups.get_mut().iter().skip(inherited) {
@@ -109,6 +110,13 @@ impl Image {
             match (parts.next(), parts.next().and_then(|index| index.parse::<usize>().ok()), parts.next()) {
                 (Some("E"), Some(index), Some(error)) => errors.push((index, error.to_owned())),
                 (Some("F"), Some(address), Some(index)) => self.fixups.get_mut().extend(index.parse().ok().map(|index| (address, index))),
+                (Some("S"), Some(index), Some(rest)) if index < self.sizes.len() => {
+                    let mut nums = rest.split_whitespace();
+                    if let (Some(size), Some(ns)) = (nums.next().and_then(|s| s.parse().ok()), nums.next().and_then(|s| s.parse().ok())) {
+                        self.sizes[index] = size;
+                        self.times[index] = ns;
+                    }
+                }
                 _ => {}
             }
         }
