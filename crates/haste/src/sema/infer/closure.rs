@@ -264,22 +264,29 @@ impl Infer<'_, '_> {
 
     /// What the closure type `ty` captures when this body defines it and its store entry is not written yet.
     fn own_captures(&self, ty: Ty) -> Option<Vec<(u32, By)>> {
-        let ty = self.resolve(ty);
-        let Kind::Closure(parent, substs, at) = self.cx.types.kind(ty) else { return None };
-        let here = self.instance.as_ref().is_some_and(|(item, args)| item == parent && args == substs);
-        let closure = here.then(|| self.out.closures.get(&ExprId(*at))).flatten().filter(|_| self.cx.closure(ty).is_none())?;
+        let closure = self.own_closure(ty)?;
         Some(closure.captures.iter().map(|capture| (capture.local, capture.by)).collect())
     }
 
+    /// The closure of type `ty` when this body defines it and its store entry is not written yet.
+    fn own_closure(&self, ty: Ty) -> Option<&Closure> {
+        let ty = self.resolve(ty);
+        let Kind::Closure(parent, substs, at) = self.cx.types.kind(ty) else { return None };
+        let here = self.instance.as_ref().is_some_and(|(item, args)| item == parent && args == substs);
+        here.then(|| self.out.closures.get(&ExprId(*at))).flatten().filter(|_| self.cx.closure(ty).is_none())
+    }
+
     /// The expressions of the body used as places rather than values, and the field or parenthesis expression that projects each projected expression.
-    fn place_uses(&self) -> (HashSet<ExprId>, HashMap<ExprId, ExprId>) {
+    fn place_uses(&mut self) -> (HashSet<ExprId>, HashMap<ExprId, ExprId>) {
         let (mut places, mut parents) = (HashSet::default(), HashMap::default());
+        let call_once = self.cx.call_once();
         for (at, expr) in self.body.exprs.iter().enumerate() {
             let at = ExprId(at as u32);
             match *expr {
                 Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Paren(base) => {
                     parents.insert(base, at);
                 }
+                Expr::Call(callee, _) if self.consumes_callee(at, callee, call_once) => {}
                 Expr::Ref { expr, .. } | Expr::Unary(UnOp::Deref, expr) | Expr::Index(expr, _) | Expr::Assign(expr, _) | Expr::AssignOp(_, expr, _) | Expr::Match(expr, _) | Expr::Let(_, expr) | Expr::Call(expr, _) => {
                     places.insert(expr);
                 }
@@ -294,6 +301,18 @@ impl Infer<'_, '_> {
             }
         }
         (places, parents)
+    }
+
+    /// Whether the call `call` of `callee` goes through `FnOnce::call_once` and so moves the callee: a closure that consumes itself, or a value such as a `Box<dyn FnOnce>`.
+    fn consumes_callee(&self, call: ExprId, callee: ExprId, call_once: Option<ItemRef>) -> bool {
+        if !matches!(self.out.res.get(&call), Some(Res::Fn(method, _)) if Some(*method) == call_once) {
+            return false;
+        }
+        let ty = self.resolve(self.out.exprs[callee.0 as usize]);
+        match self.cx.types.kind(ty) {
+            Kind::Closure(..) => self.own_closure(ty).map_or_else(|| self.cx.closure_consumes(ty), |closure| closure.consumes),
+            _ => true,
+        }
     }
 
     /// Notes that the body reads local `local`, which a closure being inferred captures when it lies outside it.
