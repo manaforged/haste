@@ -219,7 +219,7 @@ impl Jit {
         Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
     }
 
-    /// Drops the inference and code of the declared functions that `edited` touches and points their slots back at their stubs, so that the next call compiles them again.
+    /// Drops the inference and code of the declared functions that `edited` touches and points their slots and vtable entries back at their stubs, so that the next call compiles them again.
     fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
         let touched = self.store.touched(self.reached.list.iter().map(|(instance, _)| instance), edited);
         self.store.forget(outline, edited);
@@ -228,6 +228,7 @@ impl Jit {
             self.compiled.remove(&at);
             self.image.slot(at).store(self.stubs[at], Ordering::Release);
         }
+        self.image.link();
         self.expanded.clear();
     }
 
