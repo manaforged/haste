@@ -45,6 +45,9 @@ impl Infer<'_, '_> {
         let at = self.expr(index, None)?;
         let (mut step, mut steps) = (self.resolve(found), 0);
         loop {
+            if matches!(self.cx.types.kind(step), Kind::Proj(_)) {
+                self.poly_fallback();
+            }
             if let Some(ty) = self.index_step(expr, step, at)? {
                 if steps > 0 {
                     self.out.autoderefs.insert(expr, steps);
@@ -75,7 +78,7 @@ impl Infer<'_, '_> {
             return Ok(Some(element));
         }
         let Some(of) = self.cx.lang_item("index") else { bail!("core has no `Index` trait") };
-        if self.trial(|infer| infer.select(of, step, &[at]))?.is_none() {
+        if !self.select_or_prove(of, step, &[at])? {
             return Ok(None);
         }
         let Some(method) = self.cx.trait_member(of, "index") else { bail!("`Index` has no `index`") };

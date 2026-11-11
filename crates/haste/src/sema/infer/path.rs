@@ -609,19 +609,32 @@ impl<'a> Infer<'_, 'a> {
 
     /// The pointer metadata of `ty`: a length for slices and `str`, nothing for sized types, or a variable until `ty` is known.
     pub fn metadata_of(&mut self, ty: Ty) -> Result<Ty> {
-        match self.cx.types.kind(self.resolve(ty)) {
+        let tailed = self.tail_ty(ty)?;
+        let tail = self.resolve(tailed);
+        match self.cx.types.kind(tail).clone() {
             Kind::Slice(_) | Kind::Prim(Primitive::Str) => Ok(self.cx.types.prim(Primitive::Usize)),
             Kind::Dyn(..) => {
                 let Some(metadata) = self.cx.lang_item("dyn_metadata") else { bail!("core has no `DynMetadata`") };
-                Ok(self.cx.types.adt(metadata, &[ty]))
+                Ok(self.cx.types.adt(metadata, &[tail]))
             }
             Kind::Var(_) => {
                 let result = self.fresh(Kind::Var);
-                self.metadata.push((ty, result));
+                self.metadata.push((tail, result));
                 Ok(result)
             }
+            _ if self.has_params(tail) => self.param_metadata(tail),
             _ => Ok(self.cx.types.unit()),
         }
+    }
+
+    fn param_metadata(&mut self, tail: Ty) -> Result<Ty> {
+        if self.poly.is_none() {
+            bail!("metadata of open parameter requires concrete type");
+        }
+        if !self.poly_sized(tail) {
+            self.poly_fallback();
+        }
+        Ok(self.cx.types.unit())
     }
 
     pub(super) fn spell(&self, segments: &[Sym]) -> String {

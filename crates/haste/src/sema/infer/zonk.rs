@@ -96,7 +96,7 @@ pub(super) fn recycle_out(out: &mut InferOut) {
 }
 
 impl Infer<'_, '_> {
-    pub(super) fn zonk(&mut self, ty: Ty) -> Ty {
+    pub(in crate::sema) fn zonk(&mut self, ty: Ty) -> Ty {
         self.fill(ty, true)
     }
 
@@ -125,11 +125,11 @@ impl Infer<'_, '_> {
     }
 
     pub(super) fn map_kind(&mut self, kind: &Kind, mut f: impl FnMut(&mut Self, Ty) -> Ty) -> Kind {
-        let pool = self.cx.types.pool();
-        kind.map_pool(&pool, |ty| f(self, ty))
+        let pools = self.cx.types.pools();
+        kind.map_pool(&pools, |ty| f(self, ty))
     }
 
-    pub(super) fn finish(mut self) -> Result<Typed> {
+    fn settle_all(&mut self) -> Result<()> {
         self.settle_projections()?;
         self.settle_opaques(true)?;
         self.settle_awaits()?;
@@ -138,8 +138,34 @@ impl Infer<'_, '_> {
         self.fall_back_numbers()?;
         self.settle_operators(true)?;
         self.settle_projections()?;
-        self.settle_captures()?;
+        if self.poly.is_some() {
+            self.settle_obligations()?;
+        }
+        self.settle_captures()
+    }
+
+    pub(super) fn finish(mut self) -> Result<Typed> {
+        self.settle_all()?;
         self.pack_typed()
+    }
+
+    pub(super) fn finish_poly(mut self) -> Result<(Typed, Option<Box<super::poly::PolyState>>, bool)> {
+        self.settle_all()?;
+        let clean = self.shared_here(None) && self.backlog() == 0 && !self.has_unbound_out_vars();
+        let typed = self.pack_typed()?;
+        let mut poly = self.poly.take();
+        if let Some(state) = &mut poly {
+            super::poly::zonk_poly_state(&mut self, state);
+        }
+        Ok((typed, poly, clean))
+    }
+
+    fn has_unbound_out_vars(&self) -> bool {
+        let mut seen = HashSet::default();
+        let exprs = self.out.exprs.iter().copied().filter(|&ty| ty != Ty::NONE);
+        let locals = self.out.locals.iter().map(|local| local.ty);
+        let pats = self.out.pats.values().copied();
+        exprs.chain(locals).chain(pats).chain(self.out.ret).any(|ty| self.has_vars_seen(ty, &mut seen))
     }
 
     fn fall_back_numbers(&mut self) -> Result<()> {
@@ -197,7 +223,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn pack_typed(&mut self) -> Result<Typed> {
+    pub(super) fn pack_typed(&mut self) -> Result<Typed> {
         self.zonk_locals_and_closures();
         let syntax = self.pack_syntax();
         let mut raw_exprs = std::mem::take(&mut self.out.exprs);
@@ -221,8 +247,8 @@ impl Infer<'_, '_> {
         let overloaded = PackedSet::pack(self.out.overloaded.drain());
         let closures = PackedMap::pack(self.out.closures.drain());
         let ret = self.out.ret.take().map(|ret| self.zonk(ret));
-        let locals: Vec<Local> = self.out.locals.drain(..).collect();
-        let params: Vec<u32> = self.out.params.drain(..).collect();
+        let locals = std::mem::take(&mut self.out.locals);
+        let params = std::mem::take(&mut self.out.params);
         let tables = BodyTables {
             syntax,
             exprs,

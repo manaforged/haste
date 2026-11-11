@@ -176,7 +176,11 @@ impl Infer<'_, '_> {
             Kind::Array(element, len) => (element, len),
             _ => bail!("slice pattern on {}", self.show(ty)),
         };
-        match self.cx.types.len(self.resolve(len)) {
+        let resolved_len = self.resolve(len);
+        if matches!(self.cx.types.kind(resolved_len), Kind::Param(_) | Kind::Proj(_)) {
+            self.poly_fallback();
+        }
+        match self.cx.types.len(resolved_len) {
             Some(len) if given as u64 > len || (!rest && given as u64 != len) => bail!("pattern has {given} elements, the array has {len}"),
             Some(_) => Ok(element),
             None if !rest => {

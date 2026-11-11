@@ -103,6 +103,10 @@ impl Infer<'_, '_> {
                 Kind::Ref(_, inner) => Some((inner, None)),
                 Kind::Adt(..) if self.cx.boxed(ty).is_some() => self.cx.boxed(ty).map(|inner| (inner, None)),
                 Kind::Adt(..) => self.overloaded_deref(ty, mutability)?.map(|(res, target)| (target, Some(res))),
+                Kind::Param(_) | Kind::Proj(_) => {
+                    self.poly_fallback();
+                    self.overloaded_deref(ty, mutability)?.map(|(res, target)| (target, Some(res)))
+                }
                 _ => None,
             };
             let Some((inner, res)) = next else { return Ok(None) };

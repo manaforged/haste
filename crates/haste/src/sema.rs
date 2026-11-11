@@ -13,6 +13,7 @@ pub mod intrinsic;
 pub mod layout;
 pub mod reach;
 pub mod substs;
+pub mod summary;
 pub mod traits;
 pub mod ty;
 
@@ -46,6 +47,7 @@ pub struct Cache {
     finals: HashMap<reach::Instance, Rc<infer::Typed>>,
     closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
     lookups: Lookups,
+    pub summary_fallbacks: usize,
 }
 
 /// The lookups Sema caches about one outline, which hold while only function bodies change.
@@ -66,6 +68,7 @@ struct Lookups {
     type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
     impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
     selections: HashMap<(ItemRef, ty::Ty, substs::Substs), Option<(impls::ImplRef, substs::Substs)>>,
+    summaries: HashMap<ItemRef, summary::SummaryKind>,
     loaded: Vec<[usize; 5]>,
 }
 
@@ -146,6 +149,7 @@ impl Cache {
         kept.type_defs.get_mut().retain(|key, _| !edited.touches_crate(key.0.krate));
         kept.trait_defs.retain(|item, _| !mine(*item));
         kept.selections.clear();
+        kept.summaries.clear();
         kept.discriminants.retain(|item, _| !mine(*item));
         if kept.langs.as_ref().is_some_and(|langs| langs.crates.iter().any(|&krate| edited.touches_crate(krate))) {
             kept.langs = None;
@@ -212,6 +216,10 @@ impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
         let kind = self.types.kind(ty);
         let own = match kind {
             ty::Kind::Adt(item, _) | ty::Kind::FnDef(item, _) | ty::Kind::Closure(item, ..) | ty::Kind::Dyn(item, ..) => (self.mine)(*item),
+            ty::Kind::Proj(id) => {
+                let def = self.types.proj(*id);
+                (self.mine)(def.of) || (self.mine)(def.assoc)
+            }
             _ => false,
         };
         let closure_args = match kind {
@@ -381,6 +389,11 @@ impl<'a> Context<'a> {
             Kind::Tuple(items) => format!("({})", list(self.types.substs(items))),
             Kind::Slice(element) => format!("[{}]", self.type_text(element, resolve)),
             Kind::Prim(primitive) => format!("{primitive:?}").to_lowercase(),
+            Kind::Param(index) => format!("Param({index})"),
+            Kind::Proj(id) => {
+                let def = self.types.proj(id);
+                format!("<{} as {}>::{}", self.type_text(def.self_ty, resolve), self.name(def.of), self.name(def.assoc))
+            }
             other => format!("{other:?}"),
         }
     }

@@ -65,6 +65,10 @@ impl Infer<'_, '_> {
             }
             self.opaques.swap_remove(at);
             let substs: Vec<Ty> = substs.into_iter().map(|ty| self.zonk(ty)).collect();
+            if self.poly.is_some() && self.any_has_params(&substs) {
+                self.poly_fallback();
+                return Ok(());
+            }
             self.share_closures(&substs);
             let interned = self.cx.types.intern_substs(&substs);
             let found = revealed(self.cx, item, interned)?;
@@ -99,6 +103,9 @@ impl Infer<'_, '_> {
 
     /// Holds the hidden type of each `impl Trait` in this function's return type to its bounds, tying the associated types they name, as `Output = T`, and their trait arguments, which rustc reads to infer the body.
     pub(super) fn bind_hidden(&mut self) -> Result<()> {
+        if !self.hidden.is_empty() {
+            self.poly_fallback();
+        }
         let sig = self.sig;
         for (at, hidden) in std::mem::take(&mut self.hidden) {
             let bounds = sig.body.tys.iter().find_map(|ty| match *ty {

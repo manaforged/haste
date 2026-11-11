@@ -30,6 +30,10 @@ impl Infer<'_, '_> {
     /// Whether dropping a value of `ty` runs code: a `Drop` impl of its own or of a part.
     pub fn needs_drop(&mut self, ty: Ty) -> Result<bool> {
         let ty = self.resolve(ty);
+        if self.has_vars(ty) || self.has_params(ty) {
+            return self.parts_need_drop(ty);
+        }
+        let ty = self.substitute(ty);
         if let Some(&known) = self.cx.store.lookups.drops.get(&ty) {
             return Ok(known);
         }
@@ -49,17 +53,24 @@ impl Infer<'_, '_> {
                 self.all_copy(items.into_iter())?
             }
             Kind::Array(inner, _) => self.is_copy(inner)?,
-            Kind::Closure(..) if self.coroutine_output(ty).is_some() => false,
-            Kind::Closure(..) => match self.cx.closure_env(ty) {
-                Some(env) => self.is_copy(env)?,
-                None => true,
-            },
+            Kind::Closure(..) => self.closure_is_copy(ty)?,
             Kind::Adt(..) => {
                 let Some(copy) = self.cx.lang_item("copy") else { bail!("core has no `Copy` trait") };
                 self.select(copy, ty, &[])?.is_some()
             }
+            Kind::Param(_) | Kind::Proj(_) => self.poly_is_copy(ty)?,
             _ => true,
         })
+    }
+
+    fn closure_is_copy(&mut self, ty: Ty) -> Result<bool> {
+        if self.coroutine_output(ty).is_some() {
+            return Ok(false);
+        }
+        match self.cx.closure_env(ty) {
+            Some(env) => self.is_copy(env),
+            None => Ok(true),
+        }
     }
 
     fn all_copy(&mut self, mut tys: impl Iterator<Item = Ty>) -> Result<bool> {
@@ -78,6 +89,7 @@ impl Infer<'_, '_> {
             Kind::Adt(..) if self.drop_impl(ty)?.is_some() => return Ok(true),
             Kind::Dyn(..) => return Ok(true),
             Kind::Closure(..) if self.coroutine_output(ty).is_some() => return Ok(true),
+            Kind::Param(_) | Kind::Proj(_) => return Ok(!self.is_copy(ty)?),
             _ => {}
         }
         let parts = self.drop_parts(ty)?;
@@ -128,7 +140,7 @@ pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
 }
 
 impl Infer<'_, '_> {
-    pub(super) fn own_drop(&mut self, ty: Ty) -> Result<Option<Res>> {
+    pub(in crate::sema) fn own_drop(&mut self, ty: Ty) -> Result<Option<Res>> {
         let Some((block, args)) = self.drop_impl(ty)? else { return Ok(None) };
         let args: Vec<Ty> = args.into_iter().map(|arg| self.zonk(arg)).collect();
         let substs = self.cx.types.intern_substs(&args);

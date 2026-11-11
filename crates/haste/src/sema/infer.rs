@@ -15,6 +15,7 @@ mod opaque;
 mod pat;
 mod path;
 mod pattern;
+pub(super) mod poly;
 mod project;
 mod scope;
 mod drop;
@@ -22,7 +23,7 @@ mod select;
 mod stmt;
 mod zonk;
 
-pub use adt::Fields;
+pub use adt::{Fields, field_types, maybe_unsized};
 pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, register};
 pub use drop::{Glue, drop_fn, has_drop_impl, needs_drop};
@@ -253,7 +254,7 @@ pub(super) type Name<'a> = (&'a str, u32);
 
 /// The inference of one body.
 pub struct Infer<'c, 'a> {
-    cx: &'c mut Context<'a>,
+    pub(in crate::sema) cx: &'c mut Context<'a>,
     body: &'c Body,
     sig: &'c Signature,
     src: &'a Source,
@@ -286,6 +287,7 @@ pub struct Infer<'c, 'a> {
     frames: usize,
     evaluating: Vec<ItemRef>,
     imports: HashMap<(ItemRef, Option<crate::names::Sym>), Vec<crate::names::PerNs>>,
+    pub(super) poly: Option<Box<poly::PolyState>>,
 }
 
 impl Drop for Infer<'_, '_> {
@@ -354,7 +356,7 @@ pub struct Awaited {
     pub polled: Ty,
 }
 
-fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Option<Typed>> {
+pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Option<Typed>> {
     if matches!(cx.item(item).1.kind, crate::outline::item::ItemKind::Struct | crate::outline::item::ItemKind::Enum) {
         return adt::ctor_typed(cx, item, substs).map(Some);
     }
@@ -379,15 +381,15 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<
 }
 
 impl<'c, 'a> Infer<'c, 'a> {
-    fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
+    pub(super) fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
         let out = zonk::take_out();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out, scopes, items, loops, uses, unsure: Vec::new(), diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), frames: 0, evaluating: Vec::new(), imports: HashMap::default() }
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out, scopes, items, loops, uses, unsure: Vec::new(), diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), frames: 0, evaluating: Vec::new(), imports: HashMap::default(), poly: None }
     }
 }
 
 impl Infer<'_, '_> {
-    fn run(&mut self, foreign: bool) -> Result<()> {
+    pub(super) fn run(&mut self, foreign: bool) -> Result<()> {
         self.hidden.clear();
         let declared = match self.sig.ret {
             Some(ty) => self.lower_ty(&self.sig.body, ty)?,
@@ -607,7 +609,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn backlog(&self) -> usize {
+    pub(super) fn backlog(&self) -> usize {
         self.metadata.len() + self.projections.len() + self.opaques.len() + self.operands.len() + self.obligations.len()
     }
 
@@ -651,27 +653,29 @@ impl Infer<'_, '_> {
         expected.filter(|ty| !matches!(self.cx.types.kind(self.resolve(*ty)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)))
     }
 
-    fn settle_obligations(&mut self) -> Result<()> {
+    pub(super) fn settle_obligations(&mut self) -> Result<()> {
         let mut at = 0;
         while at < self.obligations.len() {
             let (of, substs) = self.obligations[at].clone();
-            let self_ty = self.resolve(substs[0]);
-            if matches!(self.cx.types.kind(self_ty), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
-                if self.opaque_holds(of, &substs)? == Some(true) {
-                    self.obligations.swap_remove(at);
-                } else {
-                    at += 1;
-                }
-                continue;
-            }
-            let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
-            if (!known && self.assume(of, &substs)?) || self.settled_by_impl(of, self_ty, &substs[1..])? || known {
+            if self.step_obligation(of, &substs)? {
                 self.obligations.swap_remove(at);
             } else {
                 at += 1;
             }
         }
         Ok(())
+    }
+
+    fn step_obligation(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
+        let self_ty = self.resolve(substs[0]);
+        if matches!(self.cx.types.kind(self_ty), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
+            return Ok(self.opaque_holds(of, substs)? == Some(true));
+        }
+        let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
+        if self.poly.is_some() && !self.has_vars(self_ty) && known && self.any_has_params(substs) {
+            return self.poly_settle_obligation(of, self_ty, &substs[1..]);
+        }
+        Ok((!known && self.assume(of, substs)?) || self.settled_by_impl(of, self_ty, &substs[1..])? || known)
     }
 
     fn settled_by_impl(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
@@ -723,49 +727,11 @@ impl Infer<'_, '_> {
     }
 }
 
-/// The field types of each variant of the struct, enum or union `item` at `args`.
-pub fn field_types(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Fields> {
-    detached(cx, item, |infer| infer.adt_fields(item, args))
-}
-
-/// The type of the last field of the struct `item` at `args`.
-pub fn tail_field(cx: &mut Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Option<Ty>> {
-    detached(cx, item, |infer| infer.adt_tail_field(item, args))
-}
-
 fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
     match kind {
         Kind::Dyn(_, _, members, autos) => (members, autos),
         _ => (&[], &[]),
     }
-}
-
-/// Whether the struct `item` may end in an unsized field, which its definition decides for every instantiation as rustc's layout does; with no `?Sized` parameter, a tail the stand-ins cannot lower, such as a projection on one, is sized.
-pub fn maybe_unsized(cx: &mut Context<'_>, item: ItemRef) -> Result<bool> {
-    if cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
-        return Ok(false);
-    }
-    let def = cx.adt_def(item)?;
-    let src = &cx.file(item).source;
-    let byte = cx.types.intern(Kind::Prim(Primitive::U8));
-    let stand_ins = [cx.types.intern(Kind::Value(1)), cx.types.intern(Kind::Slice(byte)), byte];
-    let args: Vec<Ty> = scope::type_params(&def.generics.params).map(|generic| match generic.kind {
-        crate::body::sig::GenericKind::Const(_) => stand_ins[0],
-        _ if relaxed(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
-        _ => stand_ins[2],
-    }).collect();
-    let any_relaxed = args.contains(&stand_ins[1]);
-    let ty = cx.types.adt(item, &args);
-    match cx.is_unsized(ty) {
-        Err(_) if !any_relaxed => Ok(false),
-        Err(_) => detached(cx, item, |infer| infer.open_tail_unsized(item, &args, stand_ins[2])),
-        found => found,
-    }
-}
-
-fn relaxed(arena: &Body, src: &Source, predicates: &[crate::body::sig::Predicate], generic: &crate::body::sig::Generic) -> bool {
-    let bounds = scope::generic_bounds(arena, src, predicates, generic);
-    bounds.iter().any(|&bound| matches!(arena.bounds[bound as usize], crate::body::Bound::Trait { maybe: true, .. }))
 }
 
 /// The discriminant of each variant of the enum `item`, whose tags are integers of type `primitive`.

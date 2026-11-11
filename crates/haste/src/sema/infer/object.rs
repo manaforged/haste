@@ -50,7 +50,7 @@ impl Infer<'_, '_> {
             }
             (Kind::Dyn(..), Kind::Dyn(..)) => self.object_to_object(from, to),
             (Kind::Dyn(..) | Kind::Var(_), _) => Ok(None),
-            (_, Kind::Dyn(..)) if self.cx.is_unsized(from)? => Ok(None),
+            (_, Kind::Dyn(..)) if self.is_unsized(from)? => Ok(None),
             (_, Kind::Dyn(of, args, members, _)) => {
                 let args = self.cx.types.substs(args).to_vec();
                 self.to_object(from, to, (of, &args, &members))
@@ -73,6 +73,9 @@ impl Infer<'_, '_> {
     }
 
     fn to_object(&mut self, from: Ty, to: Ty, (of, args, members): (ItemRef, &[Ty], &[ItemRef])) -> Result<Option<Coercion>> {
+        if self.poly.is_some() && (self.has_params(from) || self.any_has_params(args)) {
+            self.poly_fallback();
+        }
         let fallback = match self.cx.types.kind(from) {
             Kind::IntVar(_) => Some(crate::names::Primitive::I32),
             Kind::FloatVar(_) => Some(crate::names::Primitive::F64),
@@ -129,6 +132,10 @@ impl Infer<'_, '_> {
 
     pub(super) fn zonk_vtable(&mut self, vtable: Vtable) -> Result<Vtable> {
         let (ty, object) = (self.zonk(vtable.ty), self.zonk(vtable.object));
+        if self.poly.is_some() && (self.has_params(ty) || self.has_params(object)) {
+            self.poly_fallback();
+            return Ok(Vtable { ty, object, drop: None, methods: Vec::new(), supers: Vec::new() });
+        }
         let Kind::Dyn(of, args, members, _) = self.cx.types.kind(object).clone() else { bail!("a vtable for a type that is not a trait object") };
         let args = super::super::ty::object_parts(self.cx.types.substs(args), &members).0.to_vec();
         let mut methods = Vec::new();

@@ -3,9 +3,27 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use rustc_hash::{FxHashMap, FxHasher};
 
+use crate::names::ItemRef;
+
 use super::ty::Ty;
 
 const SHARDS: usize = 32;
+
+fn shard_index<K: Hash + ?Sized>(key: &K) -> usize {
+    let mut hasher = FxHasher::default();
+    key.hash(&mut hasher);
+    let hash = hasher.finish();
+    (((hash >> 58) ^ (hash >> 29) ^ hash) as usize) & (SHARDS - 1)
+}
+
+fn pack_handle(shard: usize, index: usize) -> u32 {
+    (((index as u32) << 5) | (shard as u32)) + 1
+}
+
+fn unpack_handle(raw: u32) -> Option<(usize, usize)> {
+    let raw = raw.checked_sub(1)?;
+    Some(((raw as usize) & (SHARDS - 1), (raw >> 5) as usize))
+}
 
 /// An interned slice of type arguments.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -54,20 +72,13 @@ impl Default for SubstsPool {
     }
 }
 
-fn shard_of(slice: &[Ty]) -> usize {
-    let mut hasher = FxHasher::default();
-    slice.hash(&mut hasher);
-    let hash = hasher.finish();
-    (((hash >> 58) ^ (hash >> 29) ^ hash) as usize) & (SHARDS - 1)
-}
-
 impl SubstsPool {
     /// Interns `slice` and returns its handle, returning `Substs::EMPTY` without locking when empty.
     pub fn intern(&self, slice: &[Ty]) -> Substs {
         if slice.is_empty() {
             return Substs::EMPTY;
         }
-        let shard_idx = shard_of(slice);
+        let shard_idx = shard_index(slice);
         let lock = &self.shards[shard_idx];
         let guard = lock.read().unwrap_or_else(PoisonError::into_inner);
         if let Some(&id) = guard.map.get(slice) {
@@ -78,8 +89,7 @@ impl SubstsPool {
         if let Some(&id) = guard.map.get(slice) {
             return id;
         }
-        let index = guard.entries.len() as u32;
-        let id = Substs(((index << 5) | (shard_idx as u32)) + 1);
+        let id = Substs(pack_handle(shard_idx, guard.entries.len()));
         let boxed: Box<[Ty]> = slice.into();
         let raw: *const [Ty] = Box::into_raw(boxed);
         // SAFETY: `raw` points to a heap allocation that stays immutable and alive until `Shard::drop`.
@@ -91,12 +101,7 @@ impl SubstsPool {
 
     /// The slice of type arguments that `id` names.
     pub fn get(&self, id: Substs) -> &[Ty] {
-        if id.0 == 0 {
-            return &[];
-        }
-        let raw = id.0 - 1;
-        let shard_idx = (raw as usize) & (SHARDS - 1);
-        let index = (raw >> 5) as usize;
+        let Some((shard_idx, index)) = unpack_handle(id.0) else { return &[] };
         let guard = self.shards[shard_idx].read().unwrap_or_else(PoisonError::into_inner);
         let Some(&ptr) = guard.entries.get(index) else { return &[] };
         // SAFETY: `ptr` belongs to `self.shards`, whose `Arc` outlives `&self`, and its `[Ty]` elements never mutate.
@@ -121,6 +126,73 @@ impl SubstsPool {
         }
         id
     }
+}
+
+/// An interned unnormalized associated type projection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProjId(pub u32);
+
+/// The trait, `Self` type, trait arguments, associated type item and GAT arguments of a projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProjDef {
+    pub of: ItemRef,
+    pub self_ty: Ty,
+    pub args: Substs,
+    pub assoc: ItemRef,
+    pub own: Substs,
+}
+
+#[derive(Default)]
+struct ProjShard {
+    map: FxHashMap<ProjDef, ProjId>,
+    entries: Vec<ProjDef>,
+}
+
+/// A sharded thread-safe interner of associated type projections.
+#[derive(Clone)]
+pub struct ProjPool {
+    shards: Arc<[RwLock<ProjShard>; SHARDS]>,
+}
+
+impl Default for ProjPool {
+    fn default() -> Self {
+        Self { shards: Arc::new(std::array::from_fn(|_| RwLock::new(ProjShard::default()))) }
+    }
+}
+
+impl ProjPool {
+    /// Interns `def` and returns its handle.
+    pub fn intern(&self, def: ProjDef) -> ProjId {
+        let shard_idx = shard_index(&def);
+        let lock = &self.shards[shard_idx];
+        let guard = lock.read().unwrap_or_else(PoisonError::into_inner);
+        if let Some(&id) = guard.map.get(&def) {
+            return id;
+        }
+        drop(guard);
+        let mut guard = lock.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(&id) = guard.map.get(&def) {
+            return id;
+        }
+        let id = ProjId(pack_handle(shard_idx, guard.entries.len()));
+        guard.entries.push(def);
+        guard.map.insert(def, id);
+        id
+    }
+
+    /// The projection definition that `id` names.
+    pub fn get(&self, id: ProjId) -> ProjDef {
+        let (shard_idx, index) = unpack_handle(id.0).unwrap_or((0, 0));
+        let guard = self.shards[shard_idx].read().unwrap_or_else(PoisonError::into_inner);
+        guard.entries[index]
+    }
+}
+
+/// Cloned handles to the slice and projection interners of `Types`.
+#[derive(Clone, Default)]
+pub struct Pools {
+    pub substs: SubstsPool,
+    pub projs: ProjPool,
 }
 
 /// A sorted immutable key-value table backed by a single boxed slice.
@@ -166,6 +238,20 @@ impl<K: Ord, V> PackedMap<K, V> {
     /// Whether `key` has an entry in this table.
     pub fn contains_key(&self, key: &K) -> bool {
         self.0.binary_search_by(|probe| probe.0.cmp(key)).is_ok()
+    }
+}
+
+impl<K: Copy, V> PackedMap<K, V> {
+    /// Maps values in sorted order without re-sorting keys.
+    pub fn try_map_values<U, E>(&self, mut f: impl FnMut(&V) -> Result<U, E>) -> Result<PackedMap<K, U>, E> {
+        if self.0.is_empty() {
+            return Ok(PackedMap::default());
+        }
+        let mut out = Vec::with_capacity(self.0.len());
+        for (key, val) in &self.0 {
+            out.push((*key, f(val)?));
+        }
+        Ok(PackedMap(out.into_boxed_slice()))
     }
 }
 
@@ -235,5 +321,12 @@ impl<K: Ord> PackedSet<K> {
     /// Whether `key` belongs to this set.
     pub fn contains(&self, key: &K) -> bool {
         self.0.binary_search(key).is_ok()
+    }
+}
+
+impl<K> PackedSet<K> {
+    /// Borrows the underlying sorted element slice.
+    pub fn as_slice(&self) -> &[K] {
+        &self.0
     }
 }

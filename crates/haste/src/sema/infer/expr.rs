@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::body::{BinOp, Expr, ExprId, List, Lit, TyId, UnOp};
+use crate::body::{BinOp, Body, Expr, ExprId, List, Lit, TyId, UnOp};
 use crate::names::{ItemRef, Primitive};
 
 use super::super::ty::{Kind, Mut, Ty, float_bits, int_info};
@@ -231,7 +231,11 @@ impl Infer<'_, '_> {
 
     /// The right operand type of the operator trait `of` when one impl of it applies to the ADT `left`.
     fn only_right(&mut self, of: ItemRef, left: Ty) -> Option<Ty> {
-        if !matches!(self.cx.types.kind(self.resolve(left)), Kind::Adt(..)) {
+        let left = self.resolve(left);
+        if matches!(self.cx.types.kind(left), Kind::Param(_) | Kind::Proj(_)) {
+            return self.poly_only_right(of, left);
+        }
+        if !matches!(self.cx.types.kind(left), Kind::Adt(..)) {
             return None;
         }
         self.probe(|infer| {
@@ -244,6 +248,30 @@ impl Infer<'_, '_> {
 
     fn builtin_left(&self, op: BinOp, left: Ty) -> bool {
         self.is_scalar(left) || is_compare(op) && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..))
+    }
+
+    pub(in crate::sema) fn is_builtin_operator(&mut self, body: &Body, expr: ExprId, exprs: &[Ty], index_step: Option<Ty>) -> bool {
+        match *body.expr(expr) {
+            Expr::Unary(op, operand) if op != UnOp::Deref => {
+                let ty = exprs[operand.0 as usize];
+                self.is_int(ty) || self.is_float(ty) || self.resolve(ty) == self.cx.types.bool()
+            }
+            Expr::Binary(op, lhs, rhs) => self.is_builtin_binary(op, exprs[lhs.0 as usize], exprs[rhs.0 as usize]),
+            Expr::AssignOp(op, lhs, rhs) => {
+                let (place, right) = (exprs[lhs.0 as usize], exprs[rhs.0 as usize]);
+                self.builtin_compound(op, place) && !matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..))
+            }
+            Expr::Index(_, idx) => {
+                index_step.is_some_and(|step| matches!(self.cx.types.kind(step), Kind::Array(..) | Kind::Slice(_)))
+                    && matches!(self.cx.types.kind(exprs[idx.0 as usize]), Kind::Prim(Primitive::Usize))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_builtin_binary(&self, op: BinOp, left: Ty, right: Ty) -> bool {
+        let ptr_cmp = is_compare(op) && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..));
+        ptr_cmp || (self.builtin_left(op, left) && !matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..)))
     }
 
     fn operator_type(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
@@ -297,7 +325,7 @@ impl Infer<'_, '_> {
         }
         let Some((lang, _)) = operator_trait(op) else { return Ok(false) };
         let Some(of) = self.cx.lang_item(lang) else { return Ok(false) };
-        Ok(self.probe(|infer| infer.select(of, left, &[right]))?.is_none())
+        Ok(!self.probe(|infer| infer.select_or_assume(of, left, &[right]).unwrap_or(false)))
     }
 
     fn overloaded(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
@@ -314,7 +342,7 @@ impl Infer<'_, '_> {
     fn operator_impl(&mut self, (lang, name): (&str, &str), left: Ty, args: &[Ty]) -> Result<Option<(ItemRef, ItemRef)>> {
         let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
-        Ok(self.trial(|infer| infer.select(of, left, args))?.map(|_| (of, method)))
+        Ok(self.select_or_prove(of, left, args)?.then_some((of, method)))
     }
 
     fn logical(&mut self, lhs: ExprId, rhs: ExprId) -> Result<Ty> {
@@ -395,11 +423,18 @@ impl Infer<'_, '_> {
             }
             Kind::FnPtr(params, ret) => (self.cx.types.substs(params).to_vec(), ret, None),
             Kind::Adt(..) => return self.overloaded_call(expr, found, args),
-            _ => bail!("calling {} is not supported yet", self.show(callee_ty)),
+            _ => return self.other_call(expr, found, callee_ty, args),
         };
         let args = self.passed_args(def.as_ref(), args, params.len())?;
         let def = def.or_else(|| self.ctor_callee(callee));
         self.call_args(args, (params, ret, def), expected)
+    }
+
+    fn other_call(&mut self, expr: ExprId, found: Ty, callee_ty: Ty, args: List) -> Result<Ty> {
+        if self.poly.is_some() && matches!(self.cx.types.kind(callee_ty), Kind::Param(_) | Kind::Proj(_)) {
+            return self.poly_call(expr, found, callee_ty, args);
+        }
+        bail!("calling {} is not supported yet", self.show(callee_ty))
     }
 
     /// The arguments `args` that pass values in a call of the function `def`, or all of them when the callee is not a function item.

@@ -44,6 +44,9 @@ struct Candidate {
 impl<'a> Infer<'_, 'a> {
     /// Infers the method call `expr`: picks the method by the receiver's type through references and borrows, as rustc probes.
     pub fn method_call(&mut self, expr: ExprId, receiver: ExprId, name: u32, params: (Option<List>, List), expected: Option<Ty>) -> Result<Ty> {
+        if !self.shared_here(None) {
+            self.poly_fallback();
+        }
         let found = self.expr(receiver, None)?;
         let at = name;
         let name = plain(self.src.text(name));
@@ -57,9 +60,37 @@ impl<'a> Infer<'_, 'a> {
         if let Some(pick) = self.opaque_pick(steps[0], name)? {
             return self.picked(expr, (pick, 0), params, expected);
         }
-        match self.probe_steps((expr, found), name, &steps)? {
-            Some((pick, derefs)) => self.picked(expr, (pick, derefs), params, expected),
-            None => Err(self.no_method(steps[steps.len() - 1], found, (name, at))),
+        let probed = self.probe_steps((expr, found), name, &steps)?;
+        self.finish_method_call((expr, found), (name, at), &steps, probed, params, expected)
+    }
+
+    fn finish_method_call(
+        &mut self,
+        (expr, found): (ExprId, Ty),
+        (name, at): (&str, u32),
+        steps: &[Ty],
+        probed: Option<(Pick, u32)>,
+        params: (Option<List>, List),
+        expected: Option<Ty>,
+    ) -> Result<Ty> {
+        match probed {
+            Some((pick, derefs)) => {
+                self.prune_method_steps(expr, steps, derefs);
+                self.picked(expr, (pick, derefs), params, expected)
+            }
+            None => {
+                if steps.iter().any(|&s| matches!(self.cx.types.kind(s), Kind::Proj(_))) {
+                    self.poly_fallback();
+                }
+                Err(self.no_method(steps[steps.len() - 1], found, (name, at)))
+            }
+        }
+    }
+
+    fn prune_method_steps(&mut self, expr: ExprId, steps: &[Ty], derefs: u32) {
+        self.out.derefs.retain(|&(e, s), _| e != expr || s < derefs);
+        if self.poly.is_some() && steps[..=derefs as usize].iter().any(|&s| matches!(self.cx.types.kind(s), Kind::Proj(_))) {
+            self.poly_fallback();
         }
     }
 
@@ -124,6 +155,9 @@ impl<'a> Infer<'_, 'a> {
             if let Some(pick) = self.probe_traits(&unbounded, (adjusted, autoref))? {
                 return Ok(Some(pick));
             }
+        }
+        if matches!(self.cx.types.kind(step), Kind::Proj(_)) {
+            self.poly_fallback();
         }
         Ok(None)
     }
@@ -257,6 +291,9 @@ impl<'a> Infer<'_, 'a> {
         if candidate.bound.is_some_and(|bound| self.substitute(bound) != self.substitute(self_ty)) {
             return Ok(None);
         }
+        if self.unsized_for_method(candidate.item, self_ty)? {
+            return Ok(None);
+        }
         let args = self.fresh_trait_args(candidate.of)?;
         if candidate.bound.is_some() || !args.is_empty() {
             self.assume(candidate.of, &std::iter::once(self_ty).chain(args.iter().copied()).collect::<Vec<_>>())?;
@@ -265,6 +302,23 @@ impl<'a> Infer<'_, 'a> {
             return Ok(Some((candidate.item, std::iter::once(self_ty).chain(args).collect())));
         }
         let Some(selected) = self.trial(|infer| infer.select(candidate.of, self_ty, &args))? else { return self.unselected_trait(candidate, self_ty, args) };
+        self.selected_trait_method(candidate, self_ty, args, selected)
+    }
+
+    fn unsized_for_method(&mut self, method: ItemRef, self_ty: Ty) -> Result<bool> {
+        if matches!(self.cx.types.kind(self.resolve(self_ty)), Kind::Ref(..) | Kind::Ptr(..)) {
+            return Ok(false);
+        }
+        let Some(sized) = self.cx.lang_item("sized") else { return Ok(false) };
+        Ok(self.needs_sized_self(method)? && !self.compiler_holds(sized, self_ty))
+    }
+
+    fn selected_trait_method(&mut self, candidate: TraitCandidate, self_ty: Ty, args: Vec<Ty>, selected: super::select::Picked) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        if self.poly.is_some() && (self.has_params(self_ty) || self.any_has_params(&args)) {
+            let substs: Vec<Ty> = std::iter::once(self_ty).chain(args).collect();
+            self.obligations.push((candidate.of, substs.clone()));
+            return Ok(Some((candidate.item, substs)));
+        }
         Ok(Some(match self.impl_member(candidate.of, (self_ty, &args), selected, self.cx.name(candidate.item))? {
             Some((item, (_, impl_args))) => (item, impl_args),
             None => (candidate.item, std::iter::once(self_ty).chain(args).collect()),

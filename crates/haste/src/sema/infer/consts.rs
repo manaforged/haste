@@ -195,6 +195,10 @@ impl<'a> Infer<'a, '_> {
 
     /// The value of the integer or bool constant item `item`, as the bits of its type: folded from its syntax, or else from running its body.
     pub(super) fn const_value(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(u128, Int)> {
+        if self.any_has_params(substs) {
+            self.poly_fallback();
+            bail!("constant {} depends on type parameters", self.cx.name(item));
+        }
         let sig = self.cx.signature(item)?;
         let Some(ret) = sig.ret else { bail!("constant {} has no type", self.cx.name(item)) };
         let mut width = None;
@@ -230,6 +234,10 @@ impl<'a> Infer<'a, '_> {
     /// The value of the anonymous constant `expr` of `arena`, which the folder failed on with `error`, from running it as its own function once per pass and frame arguments: when those arguments are known and an item holds `arena`.
     fn run_anon(&mut self, arena: &Body, expr: ExprId, error: anyhow::Error) -> Result<(u128, Int)> {
         let args: Vec<Ty> = self.generics.iter().map(|&(_, ty)| ty).chain(self.self_ty).collect();
+        if self.any_has_params(&args) {
+            self.poly_fallback();
+            return Err(error);
+        }
         if args.iter().any(|&ty| self.has_vars(ty)) {
             return Err(error);
         }
@@ -562,6 +570,10 @@ impl<'a> Infer<'a, '_> {
         let ty = declared.or(want);
         match *self.cx.types.kind(self.resolve(param)) {
             Kind::Value(bits) => Ok((ty.map_or(bits, |(w, _)| bits & mask(w)), ty)),
+            Kind::Param(_) | Kind::Proj(_) => {
+                self.poly_fallback();
+                bail!("a const parameter whose value is not known yet")
+            }
             _ => bail!("a const parameter whose value is not known yet"),
         }
     }
@@ -627,6 +639,10 @@ impl<'a> Infer<'a, '_> {
         let (_, res) = self.path_value(arena, path)?;
         let Res::Fn(item, substs) = res else { bail!("a constant path that names no item") };
         let substs = self.map_substs(substs, Self::zonk);
+        if self.substs_have_params(substs) {
+            self.poly_fallback();
+            bail!("constant target {} depends on type parameters", self.cx.name(item));
+        }
         match self.trait_call(item, substs)? {
             Res::Fn(item, substs) => Ok((item, self.cx.types.substs(substs).to_vec())),
             _ => bail!("a constant path that names no item"),

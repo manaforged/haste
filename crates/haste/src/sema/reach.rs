@@ -48,7 +48,7 @@ impl Reached {
             return (at, false);
         }
         let at = self.list.len();
-        self.index.insert(instance.clone(), at);
+        self.index.insert(instance, at);
         self.list.push((instance, Err(String::new())));
         self.untyped.insert(at);
         (at, true)
@@ -96,7 +96,7 @@ pub fn reach_again(cx: &mut Context<'_>, reached: &mut Reached, stale: &[usize])
     let mut queue = Vec::new();
     let stale: Vec<usize> = stale.iter().copied().filter(|index| reached.index.get(&reached.list[*index].0) == Some(index)).collect();
     for &index in &stale {
-        let instance = reached.list[index].0.clone();
+        let instance = reached.list[index].0;
         let typed = if cx.undeclared(&instance) { Err("no longer declared".to_owned()) } else { typed_once(cx, &instance, &mut reached.unlaid) };
         queue.extend(calls(cx, &typed));
         reached.list[index].1 = typed;
@@ -124,7 +124,7 @@ pub fn infer_declared(cx: &mut Context<'_>, reached: &mut Reached, index: usize)
     if !reached.untyped.remove(&index) {
         return false;
     }
-    let instance = reached.list[index].0.clone();
+    let instance = reached.list[index].0;
     reached.list[index].1 = typed_once(cx, &instance, &mut reached.unlaid);
     true
 }
@@ -158,6 +158,9 @@ fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String
         register(cx, *instance, &typed);
         return Ok(typed);
     }
+    if let Some(result) = super::summary::typed_once_poly(cx, instance, unlaid) {
+        return result;
+    }
     let asked = cx.asks.count();
     let typed = std::rc::Rc::new(infer(cx, instance.0, instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?);
     let laid = lay_out(cx, &typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
@@ -168,7 +171,7 @@ fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String
 }
 
 /// Computes the layout of each ADT, tuple and array type that lowering `typed` reads, so the names those layouts need are asked for while inference can still retry.
-fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
+pub(super) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
     let intrinsic_args: Vec<Ty> = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_some()).flat_map(|(_, substs)| cx.types.substs(substs).iter().copied()).collect();
     let locals = typed.locals.iter().map(|local| local.ty);
     for ty in typed.exprs.iter().copied().chain(locals).chain(intrinsic_args) {

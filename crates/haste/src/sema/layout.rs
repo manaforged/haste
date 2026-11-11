@@ -6,7 +6,6 @@ use rustc_abi::{AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, Lay
 use rustc_index::{Idx, IndexVec};
 
 use crate::names::Primitive;
-use crate::outline::item::ItemKind;
 
 use super::Context;
 use super::ty::{Kind, Ty};
@@ -148,18 +147,16 @@ impl Context<'_> {
 
     /// The type at the end of `ty` whose metadata a pointer to `ty` carries: `ty` itself, or the tail of its last struct field.
     pub fn tail(&mut self, ty: Ty) -> Result<Ty> {
-        let Kind::Adt(item, args) = *self.types.kind(ty) else { return Ok(ty) };
-        if let Some(found) = self.store.tails.get(&ty) {
-            return Ok(*found);
+        let Kind::Adt(item, _) = *self.types.kind(ty) else { return Ok(ty) };
+        if self.types.has_var_flag(ty) {
+            bail!("cannot compute tail of open inference variable outside Infer");
         }
-        let args = self.types.substs(args).to_vec();
-        let last = if self.item(item).1.kind == ItemKind::Struct { super::infer::tail_field(self, item, &args)? } else { None };
-        let found = match last {
-            Some(last) => self.tail(last)?,
-            None => ty,
-        };
-        self.store.tails.insert(ty, found);
-        Ok(found)
+        if !self.types.has_params(ty)
+            && let Some(&found) = self.store.tails.get(&ty)
+        {
+            return Ok(found);
+        }
+        super::infer::detached(self, item, |infer| infer.tail_ty(ty))
     }
 
     /// Whether a pointer to `ty` carries metadata after its address.

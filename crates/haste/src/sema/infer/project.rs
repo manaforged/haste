@@ -71,6 +71,11 @@ impl Infer<'_, '_> {
 
     /// The trait bounds that the frame's headers put on its type parameters, each as the trait and its types with `Self` first: what the body may assume holds.
     pub(super) fn assumptions(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        if let Some(poly) = &self.poly
+            && poly.env_ready
+        {
+            return Ok(poly.assumptions.clone());
+        }
         let mut found = self.param_bounds()?;
         found.extend(self.own_trait()?);
         found.extend(self.type_bounds()?);
@@ -115,7 +120,7 @@ impl Infer<'_, '_> {
     }
 
     /// The supertrait bounds that `substs[0]: of<substs[1..]>` implies, each with its arguments and the associated types its path binds, as `Iterator<Item = T>`.
-    fn super_bindings(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Vec<((ItemRef, Vec<Ty>), Vec<(String, Ty)>)>> {
+    pub(super) fn super_bindings(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Vec<((ItemRef, Vec<Ty>), Vec<(String, Ty)>)>> {
         let def = self.cx.trait_generics(of)?;
         let params: Vec<_> = type_params(&def.1.params).copied().collect();
         if def.1.supers.len == 0 || substs.len() != params.len() + 1 {
@@ -156,7 +161,7 @@ impl Infer<'_, '_> {
     }
 
     /// The trait whose default method the frame types, with its `Self` and arguments, which the method may assume holds.
-    fn own_trait(&mut self) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+    pub(super) fn own_trait(&mut self) -> Result<Option<(ItemRef, Vec<Ty>)>> {
         let (Some(of), Some(self_ty), None) = (self.frame_item.and_then(|item| self.cx.owner_trait(item)), self.self_ty, self.block) else { return Ok(None) };
         let def = self.cx.trait_generics(of)?;
         let src = &self.cx.file(of).source;
@@ -230,7 +235,7 @@ impl Infer<'_, '_> {
     }
 
     /// Each bound of the where-clauses in `predicates` whose bounded type is not one parameter, with that type lowered in the current frame.
-    fn typed_predicates(&mut self, arena: &Body, src: &Source, predicates: &[Predicate]) -> Vec<(Ty, u32)> {
+    pub(super) fn typed_predicates(&mut self, arena: &Body, src: &Source, predicates: &[Predicate]) -> Vec<(Ty, u32)> {
         let mut found = Vec::new();
         for predicate in predicates {
             let Some(ty) = predicate.ty.filter(|&ty| one_name(arena, src, ty).is_none()) else { continue };
@@ -304,7 +309,13 @@ impl Infer<'_, '_> {
         Ok(result)
     }
 
-    fn picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
+    pub(in crate::sema) fn picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
+        if self.has_params(ty) || self.any_has_params(args) || self.any_has_params(own) {
+            return match self.poly.is_some() {
+                true => self.poly_picked_alias(of, ty, args, (name, own)),
+                false => Ok(None),
+            };
+        }
         if self.cx.lang(of) == Some("discriminant_kind") {
             return self.discriminant_ty(ty);
         }
@@ -320,7 +331,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn builtin_alias(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
+    pub(super) fn builtin_alias(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
         let kind = self.cx.types.kind(self.resolve(ty)).clone();
         if let Kind::Dyn(principal, args, members, _) = &kind {
             let member = self.cx.trait_member(of, name);
@@ -342,10 +353,14 @@ impl Infer<'_, '_> {
         Ok(None)
     }
 
-    fn discriminant_ty(&mut self, ty: Ty) -> Result<Option<Ty>> {
+    pub(super) fn discriminant_ty(&mut self, ty: Ty) -> Result<Option<Ty>> {
         match *self.cx.types.kind(self.resolve(ty)) {
             Kind::Adt(item, _) if self.cx.item(item).1.kind == ItemKind::Enum => Ok(Some(self.cx.types.prim(self.cx.discriminant_primitive(item)))),
             Kind::Var(_) => Ok(None),
+            Kind::Param(_) | Kind::Proj(_) if self.poly.is_some() => {
+                self.poly_fallback();
+                Ok(None)
+            }
             _ => bail!("the discriminant type of {} is not supported yet", self.show(ty)),
         }
     }
@@ -455,7 +470,7 @@ impl Infer<'_, '_> {
     }
 
     /// Resolves each deferred associated type whose impl can now be picked.
-    pub(super) fn settle_projections(&mut self) -> Result<()> {
+    pub(in crate::sema) fn settle_projections(&mut self) -> Result<()> {
         let mut at = 0;
         while at < self.projections.len() {
             let (of, ty, args, name, result) = self.projections[at].clone();
@@ -472,7 +487,7 @@ impl Infer<'_, '_> {
 }
 
 /// The angle-bracketed arguments of the last segment of the bound path `path`, as in `FnOnce<A, Output = R>`.
-fn angle_args(arena: &Body, path: PathId) -> Option<crate::body::List> {
+pub(super) fn angle_args(arena: &Body, path: PathId) -> Option<crate::body::List> {
     let &last = arena.list(arena.path(path).segments).last()?;
     match arena.segments[last as usize].args {
         Some(crate::body::Args::Angle(list)) => Some(list),
@@ -481,7 +496,7 @@ fn angle_args(arena: &Body, path: PathId) -> Option<crate::body::List> {
 }
 
 /// The associated type bounds that the last segment of the bound path `path` puts, as in `Iterator<Item: Try<Output = T>>`: each name and its bounds.
-fn path_constraints(arena: &Body, path: PathId) -> Vec<(u32, crate::body::List)> {
+pub(super) fn path_constraints(arena: &Body, path: PathId) -> Vec<(u32, crate::body::List)> {
     let Some(list) = angle_args(arena, path) else { return Vec::new() };
     arena.list(list).iter().filter_map(|&at| match arena.args[at as usize] {
         crate::body::GenericArg::Constraint { name, bounds } => Some((name, bounds)),

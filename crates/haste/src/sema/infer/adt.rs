@@ -52,7 +52,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// The key that caches the field types of `item` at `args` across bodies, the ADT type with its variables filled in, and what it holds; no key when body state or an unbound inference variable could change the answer.
     fn cached_fields(&mut self, item: ItemRef, args: &[Ty]) -> (Option<Ty>, Option<Fields>) {
-        if !self.shared_here(item.declaring_body()) || args.iter().any(|&arg| self.has_vars(arg)) {
+        if !self.shared_here(item.declaring_body()) || args.iter().any(|&arg| self.has_vars(arg) || self.has_params(arg)) {
             return (None, None);
         }
         let args: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
@@ -74,15 +74,34 @@ impl<'a> Infer<'_, 'a> {
     /// Whether the struct `item` at `args` ends in an unsized field once each `sized` stand-in is an open variable, so a projection on it stays open and counts as sized.
     pub fn open_tail_unsized(&mut self, item: ItemRef, args: &[Ty], sized: Ty) -> Result<bool> {
         let open: Vec<Ty> = args.iter().map(|&arg| if arg == sized { self.fresh(Kind::Var) } else { arg }).collect();
-        let mut tail = self.cx.types.adt(item, &open);
-        while let Kind::Adt(at, args) = *self.cx.types.kind(self.resolve(tail))
-            && self.cx.item(at).1.kind == ItemKind::Struct
+        let tail = self.cx.types.adt(item, &open);
+        self.is_unsized(tail)
+    }
+
+    pub(in crate::sema) fn tail_ty(&mut self, ty: Ty) -> Result<Ty> {
+        let ty = self.substitute(ty);
+        let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { return Ok(ty) };
+        let cacheable = !self.cx.types.has_params(ty) && !self.cx.types.has_var_flag(ty);
+        if cacheable
+            && let Some(&found) = self.cx.store.tails.get(&ty)
         {
-            let slice = self.cx.types.substs(args).to_vec();
-            let Some(last) = self.adt_tail_field(at, &slice)? else { break };
-            tail = last;
+            return Ok(found);
         }
-        Ok(self.cx.types.kind(self.resolve(tail)).is_unsized())
+        let slice = self.cx.types.substs(args).to_vec();
+        let last = if self.cx.item(item).1.kind == ItemKind::Struct { self.adt_tail_field(item, &slice)? } else { None };
+        let found = match last {
+            Some(last) => self.tail_ty(last)?,
+            None => ty,
+        };
+        if cacheable && !self.cx.types.has_params(found) && !self.cx.types.has_var_flag(found) {
+            self.cx.store.tails.insert(ty, found);
+        }
+        Ok(found)
+    }
+
+    pub(in crate::sema) fn is_unsized(&mut self, ty: Ty) -> Result<bool> {
+        let tail = self.tail_ty(ty)?;
+        Ok(self.cx.types.kind(tail).is_unsized())
     }
 
     /// The frame of the struct, enum or union `item` with its type parameters `params` set to `args`, whose header supplies their bounds.
@@ -226,10 +245,12 @@ impl<'a> Infer<'_, 'a> {
         Ok(adt)
     }
 
-    /// Infers the field access `expr` on `base`, through references.
     /// Infers `offset_of!(ty, fields)`: a `usize` whose value, the byte offset of the field path in `ty`, lowering reads.
     pub fn offset_of(&mut self, expr: ExprId, ty: crate::body::TyId, fields: crate::body::List) -> Result<Ty> {
         let mut current = self.lower_ty(self.body, ty)?;
+        if self.poly.is_some() && self.has_params(current) {
+            return self.poly_offset_of(expr, current, fields);
+        }
         let mut offset = 0;
         for &at in self.body.list(fields) {
             for name in self.src.text(at).split('.').map(plain) {
@@ -242,7 +263,7 @@ impl<'a> Infer<'_, 'a> {
         Ok(self.cx.types.prim(crate::names::Primitive::Usize))
     }
 
-    fn field_at(&mut self, ty: Ty, name: &str) -> Result<(u32, Ty)> {
+    pub(super) fn field_at(&mut self, ty: Ty, name: &str) -> Result<(u32, Ty)> {
         match self.cx.types.kind(self.resolve(ty)).clone() {
             Kind::Tuple(items) => {
                 let index: u32 = name.parse()?;
@@ -291,4 +312,40 @@ pub fn ctor_typed(cx: &mut super::super::Context<'_>, item: ItemRef, substs: Sub
     let locals = fields.iter().map(|&ty| super::Local { ty }).collect();
     let ret = cx.types.adt(item, args);
     Ok(super::Typed { locals, params: (0..fields.len() as u32).collect(), ret: Some(ret), shape: super::Shape::Ctor(variant), ..super::Typed::default() })
+}
+
+/// The field types of each variant of the struct, enum or union `item` at `args`.
+pub fn field_types(cx: &mut super::super::Context<'_>, item: ItemRef, args: &[Ty]) -> Result<Fields> {
+    if args.iter().any(|&a| cx.types.has_var_flag(a)) {
+        bail!("cannot compute fields of open inference variable outside Infer");
+    }
+    super::detached(cx, item, |infer| infer.adt_fields(item, args))
+}
+
+/// Whether the struct `item` may end in an unsized field, which its definition decides for every instantiation as rustc's layout does; with no `?Sized` parameter, a tail the stand-ins cannot lower, such as a projection on one, is sized.
+pub fn maybe_unsized(cx: &mut super::super::Context<'_>, item: ItemRef) -> Result<bool> {
+    if cx.item(item).1.kind != ItemKind::Struct {
+        return Ok(false);
+    }
+    let def = cx.adt_def(item)?;
+    let src = &cx.file(item).source;
+    let byte = cx.types.intern(Kind::Prim(crate::names::Primitive::U8));
+    let stand_ins = [cx.types.intern(Kind::Value(1)), cx.types.intern(Kind::Slice(byte)), byte];
+    let args: Vec<Ty> = super::scope::type_params(&def.generics.params).map(|generic| match generic.kind {
+        crate::body::sig::GenericKind::Const(_) => stand_ins[0],
+        _ if relaxed(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
+        _ => stand_ins[2],
+    }).collect();
+    let any_relaxed = args.contains(&stand_ins[1]);
+    let ty = cx.types.adt(item, &args);
+    match cx.is_unsized(ty) {
+        Err(_) if !any_relaxed => Ok(false),
+        Err(_) => super::detached(cx, item, |infer| infer.open_tail_unsized(item, &args, stand_ins[2])),
+        found => found,
+    }
+}
+
+pub(super) fn relaxed(arena: &Body, src: &crate::outline::source::Source, predicates: &[crate::body::sig::Predicate], generic: &crate::body::sig::Generic) -> bool {
+    let bounds = super::scope::generic_bounds(arena, src, predicates, generic);
+    bounds.iter().any(|&bound| matches!(arena.bounds[bound as usize], crate::body::Bound::Trait { maybe: true, .. }))
 }

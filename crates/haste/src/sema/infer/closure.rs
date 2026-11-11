@@ -102,6 +102,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// Infers the `async` block or body `expr` as a coroutine whose output is `output` when known, capturing by value when `by_move` and always capturing `forced`.
     pub(super) fn coroutine_expr(&mut self, expr: ExprId, (output, by_move): (Option<Ty>, bool), forced: &[u32]) -> Result<Ty> {
+        self.poly_fallback();
         let Some((parent, substs)) = self.instance else { bail!("an `async` block outside a function body") };
         let Expr::Block { stmts, tail, .. } = *self.body.expr(expr) else { bail!("an `async` body that is not a block") };
         let depth = self.scopes.len();
@@ -137,6 +138,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// Infers `inner.await`: the future that `IntoFuture::into_future` makes of `inner`, polled until it gives its output.
     pub(super) fn await_expr(&mut self, expr: ExprId, inner: ExprId) -> Result<Ty> {
+        self.poly_fallback();
         let found = self.expr(inner, None)?;
         if matches!(self.cx.types.kind(self.resolve(found)), Kind::Var(_)) {
             self.settle_opaques(false)?;
@@ -455,7 +457,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once`, the first that an impl gives `ty` at the argument tuple `tuple`.
-    fn callable_impl(&mut self, ty: Ty, tuple: Ty) -> Result<Option<ItemRef>> {
+    pub(in crate::sema) fn callable_impl(&mut self, ty: Ty, tuple: Ty) -> Result<Option<ItemRef>> {
         for (lang, name) in [("fn", "call"), ("fn_mut", "call_mut"), ("fn_once", "call_once")] {
             let Some(of) = self.cx.lang_item(lang) else { continue };
             if self.trial(|infer| Ok(infer.select(of, ty, &[tuple])?.map(|_| ())))?.is_some() {
@@ -550,6 +552,10 @@ impl<'a> Infer<'_, 'a> {
                 self.fn_types(item, &args)?
             }
             Kind::FnPtr(params, ret) => (self.cx.types.substs(params).to_vec(), ret),
+            Kind::Param(_) | Kind::Proj(_) => match self.poly_fn_sig(ty) {
+                Some(sig) => sig,
+                None => return Ok(None),
+            },
             Kind::Var(_) => match self.opaque_sig(ty).map(|sig| self.cx.types.kind(sig).clone()) {
                 Some(Kind::FnPtr(params, ret)) => (self.cx.types.substs(params).to_vec(), ret),
                 _ => return Ok(None),
@@ -714,8 +720,8 @@ pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Res
     let (target, ret) = match *cx.types.kind(callee) {
         Kind::FnDef(target, args) => {
             let arg_slice = cx.types.substs(args).to_vec();
-            let ret = super::detached(cx, target, |infer| infer.fn_types(target, &arg_slice))?.1;
-            (Res::Fn(target, args), ret)
+            let (res, (_, ret)) = super::detached(cx, target, |infer| Ok((infer.trait_call(target, args)?, infer.fn_types(target, &arg_slice)?)))?;
+            (res, ret)
         }
         _ => {
             let Some(info) = cx.closure(callee) else { bail!("a closure whose defining body was not inferred") };
