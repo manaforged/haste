@@ -392,9 +392,9 @@ impl<'a> Context<'a> {
             Def::Primitive(primitive) => Some(Head::Prim(primitive)),
             Def::Item(item) if matches!(self.item(item).1.kind, ItemKind::Struct | ItemKind::Enum | ItemKind::Union) => Some(Head::Adt(item)),
             Def::Item(item) if self.item(item).1.kind == ItemKind::Type => {
-                let (_, arena, ty) = self.alias_parts(item).ok()?;
+                let alias = self.alias_def(item).ok()?;
                 let home = self.module_of(item).ok()?;
-                self.syntax_head(self.item(item).0, &arena, ty, (home, Some(item)))
+                self.syntax_head(self.item(item).0, &alias.arena, alias.ty, (home, Some(item)))
             }
             _ => None,
         }

@@ -205,6 +205,15 @@ pub struct Context<'a> {
     kids: std::cell::RefCell<HashMap<usize, Rc<Kids>>>,
     trait_members: std::cell::RefCell<HashMap<ItemRef, Rc<HashMap<&'a str, ItemRef>>>>,
     impl_members: std::cell::RefCell<HashMap<impls::ImplRef, Rc<HashMap<&'a str, ItemRef>>>>,
+    aliases: std::cell::RefCell<HashMap<ItemRef, Rc<Alias>>>,
+}
+
+/// A parsed type alias: its type parameters, its generics and where clause, and its target type.
+pub struct Alias {
+    pub params: Vec<sig::Generic>,
+    pub generics: Rc<traits::TraitGenerics>,
+    pub arena: Body,
+    pub ty: crate::body::TyId,
 }
 
 /// Where a type path is resolved and what it says: home module, body root, nested instance, segments, leading `::` and `$crate`.
@@ -217,8 +226,8 @@ impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, mut store: Cache) -> Context<'a> {
         let types = std::mem::take(&mut store.types);
-        let (kids, trait_members, impl_members, asks) = Default::default();
-        Context { outline, names, types, asks, store, kids, trait_members, impl_members }
+        let (kids, trait_members, impl_members, aliases, asks) = Default::default();
+        Context { outline, names, types, asks, store, kids, trait_members, impl_members, aliases }
     }
 
     /// Whether no lookup in this pass asked for anything to load or resolve, so another pass would find the same.
@@ -459,23 +468,22 @@ impl<'a> Context<'a> {
         Ok(parsed)
     }
 
-    /// The type parameters, arena and target type of the type alias `item`.
-    pub fn alias_parts(&self, item: ItemRef) -> Result<(Vec<sig::Generic>, Body, crate::body::TyId)> {
-        let (src, entry) = self.item(item);
-        let (_, eq) = self.alias_eq(item)?;
-        let params = self.alias_generics(item)?.1.params.into_iter().filter(|generic| generic.kind != sig::GenericKind::Lifetime).collect();
-        let (arena, ty) = crate::body::parse_ty(src, eq + 1, entry.end - 1)?;
-        Ok((params, arena, ty))
-    }
-
-    /// The generic parameters and where clause of the type alias `item`, with the bounds that its target may rely on.
-    pub fn alias_generics(&self, item: ItemRef) -> Result<traits::TraitGenerics> {
-        let (src, _) = self.item(item);
-        let (at, eq) = self.alias_eq(item)?;
-        match src.text(at + 1) {
-            "<" => sig::generics(src, at + 1, eq),
-            _ => Ok(Default::default()),
+    /// The type alias `item`, parsed once per pass.
+    pub fn alias_def(&self, item: ItemRef) -> Result<Rc<Alias>> {
+        if let Some(found) = self.aliases.borrow().get(&item) {
+            return Ok(found.clone());
         }
+        let (src, entry) = self.item(item);
+        let (at, eq) = self.alias_eq(item)?;
+        let generics: traits::TraitGenerics = match src.text(at + 1) {
+            "<" => sig::generics(src, at + 1, eq)?,
+            _ => Default::default(),
+        };
+        let params = generics.1.params.iter().filter(|generic| generic.kind != sig::GenericKind::Lifetime).cloned().collect();
+        let (arena, ty) = crate::body::parse_ty(src, eq + 1, entry.end - 1)?;
+        let alias = Rc::new(Alias { params, generics: Rc::new(generics), arena, ty });
+        self.aliases.borrow_mut().insert(item, alias.clone());
+        Ok(alias)
     }
 
     fn alias_eq(&self, item: ItemRef) -> Result<(u32, u32)> {

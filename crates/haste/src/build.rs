@@ -254,7 +254,13 @@ impl Build {
             let main = main_item(workspace, &self.compilation.outline);
             self.program = main.and_then(|main| Program::new(&mut self.compilation, store, main).ok());
         }
+        let seen: HashMap<PathBuf, Stamp> = self.stamps.iter().map(|watch| (watch.path.clone(), watch.stamp)).collect();
         self.stamps = stamps(workspace, &self.compilation.outline);
+        for watch in &mut self.stamps {
+            if let Some(&stamp) = seen.get(&watch.path) {
+                watch.stamp = stamp;
+            }
+        }
         let compilation = &self.compilation;
         [&mut self.cases, &mut self.binary].into_iter().flatten().all(|batch| batch.reload(workspace, compilation, &crates))
     }
