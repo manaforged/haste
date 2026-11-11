@@ -201,6 +201,8 @@ pub struct Infer<'c, 'a> {
     items: Vec<(&'a str, ItemRef)>,
     loops: Vec<Breaks>,
     uses: Vec<closure::Captures>,
+    /// The closures whose captures were decided while a read's type was unknown: each one's uses, whether it moves, and what it always captures.
+    unsure: Vec<(ExprId, closure::Captures, bool, Vec<u32>)>,
     diverges: bool,
     /// The `impl Trait` types that no frame parameter stands for: the token of each and the variable for its hidden type.
     hidden: Vec<(u32, Ty)>,
@@ -297,7 +299,7 @@ fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: &[Ty]) -> Result<O
 impl<'c, 'a> Infer<'c, 'a> {
     fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out: Typed::default(), scopes, items, loops, uses, diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new() }
+        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out: Typed::default(), scopes, items, loops, uses, unsure: Vec::new(), diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new() }
     }
 }
 
