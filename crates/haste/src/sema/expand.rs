@@ -227,6 +227,7 @@ impl Writer {
         match site.builtin {
             Builtin::Concat => return self.concat(cx, run, open, out),
             Builtin::Env | Builtin::OptionEnv => return self.env(cx, run, site, out),
+            Builtin::IncludeStr | Builtin::IncludeBytes => return self.include(cx, run, site, out),
             Builtin::FormatArgs | Builtin::FormatArgsNl => return self.format_args(cx, run, site, out),
             Builtin::PatternType => return Ok(false),
             Builtin::Line | Builtin::Column | Builtin::File | Builtin::Stringify => position(run, site, input, out),
@@ -290,6 +291,18 @@ impl Writer {
                 out.lexed(&format!("{value:?})"));
             }
             (_, None) => builtin::crate_path(out, site.krate, "::option::Option::None::<&'static str>"),
+        }
+        Ok(true)
+    }
+
+    fn include(&self, cx: &mut Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
+        let Some(&path) = run.src.args(site.open).first() else { bail!("include_str! and include_bytes! take a path") };
+        let Some(path) = self.literal(cx, run, path)? else { return Ok(false) };
+        let path = run.call_at(site.start).0.beside(&path);
+        let bytes = std::fs::read(&path).map_err(|error| anyhow!("cannot read {}: {error}", path.display()))?;
+        match site.builtin {
+            Builtin::IncludeStr => out.lexed(&format!("{:?}", String::from_utf8(bytes).map_err(|_| anyhow!("{} is not UTF-8", path.display()))?)),
+            _ => out.lexed(&builtin::byte_string(&bytes)),
         }
         Ok(true)
     }

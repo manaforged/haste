@@ -2,12 +2,41 @@
 
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Result, bail};
 use crate::graph::{self, Targets};
 
-use crate::build::Build;
+use crate::build::{Build, Stamp, stamp};
+
+/// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file and local manifests it was loaded from.
+struct Served<'a> {
+    root: &'a Path,
+    targets: &'a Targets,
+    workspace: &'a mut graph::Workspace,
+    manifests: Vec<(PathBuf, Stamp)>,
+}
+
+impl Served<'_> {
+    fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, Stamp)> {
+        let local = workspace.packages.iter().filter(|package| package.local()).map(|package| package.manifest.dir.join("Cargo.toml"));
+        std::iter::once(root.join("Cargo.lock")).chain(local).map(|path| {
+            let now = stamp(&path);
+            (path, now)
+        }).collect()
+    }
+
+    /// Loads the workspace again when the lock file or a local manifest changed since it loaded; returns whether it did.
+    fn reload(&mut self) -> Result<bool> {
+        if self.manifests.iter().all(|(path, kept)| stamp(path) == *kept) {
+            return Ok(false);
+        }
+        *self.workspace = crate::cli::load_workspace(self.root, self.targets)?;
+        self.manifests = Served::manifests(self.workspace, self.root);
+        Ok(true)
+    }
+}
 
 /// What a client asks the server to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,11 +121,13 @@ pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<
     Ok(Some(i32::from_le_bytes(status)))
 }
 
-/// Loads `workspace` once, then answers requests until the process is killed.
-pub fn serve(workspace: &graph::Workspace, targets: &Targets, root: &std::path::Path) -> Result<()> {
+/// Loads `workspace` once, then answers requests until the process is killed, loading it again when its lock file or a local manifest changes.
+pub fn serve(workspace: &mut graph::Workspace, targets: &Targets, root: &std::path::Path) -> Result<()> {
     let listener = listen(root)?;
     let started = Instant::now();
     let mut build = Some(Build::load(workspace, targets)?);
+    let manifests = Served::manifests(workspace, root);
+    let mut served = Served { root, targets, workspace, manifests };
     eprintln!("serving {} after {:.1} ms", root.display(), started.elapsed().as_secs_f64() * 1e3);
     loop {
         // SAFETY: listener is a listening socket; accept returns a new descriptor or -1.
@@ -108,7 +139,7 @@ pub fn serve(workspace: &graph::Workspace, targets: &Targets, root: &std::path::
         let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
         let status = match receive(fd) {
             Ok((byte, fds)) => match read_args(&mut conn) {
-                Ok(args) => answer(&mut build, (workspace, targets), Request::parse(byte).map(|request| (request, args)), &fds),
+                Ok(args) => answer(&mut build, &mut served, Request::parse(byte).map(|request| (request, args)), &fds),
                 Err(_) => 1,
             },
             Err(_) => 1,
@@ -157,7 +188,7 @@ fn read_args(conn: &mut std::fs::File) -> Result<Vec<String>> {
     Ok(args)
 }
 
-fn answer(build: &mut Option<Build>, (workspace, targets): (&graph::Workspace, &Targets), request: Option<(Request, Vec<String>)>, fds: &[RawFd]) -> i32 {
+fn answer(build: &mut Option<Build>, served: &mut Served<'_>, request: Option<(Request, Vec<String>)>, fds: &[RawFd]) -> i32 {
     let [out, err] = fds else {
         close_all(fds);
         return 1;
@@ -165,7 +196,11 @@ fn answer(build: &mut Option<Build>, (workspace, targets): (&graph::Workspace, &
     let saved = redirect(*out, *err);
     let started = Instant::now();
     let done = match request {
-        Some((request, args)) => current(build.take(), workspace, targets).and_then(|fresh| finish(build.insert(fresh), workspace, (request, &args), started)),
+        Some((request, args)) => served.reload().and_then(|reloaded| {
+            let kept = build.take().filter(|_| !reloaded);
+            let (workspace, targets) = (&*served.workspace, served.targets);
+            current(kept, workspace, targets).and_then(|fresh| finish(build.insert(fresh), workspace, (request, &args), started))
+        }),
         None => Err(anyhow::anyhow!("unknown request")),
     };
     if let Err(error) = &done {

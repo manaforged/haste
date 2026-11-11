@@ -25,9 +25,11 @@ pub enum Builtin {
     OptionEnv,
     Asm,
     ModulePath,
+    IncludeStr,
+    IncludeBytes,
 }
 
-const BUILTINS: [(&str, Builtin); 18] = [
+const BUILTINS: [(&str, Builtin); 20] = [
     ("concat", Builtin::Concat),
     ("stringify", Builtin::Stringify),
     ("line", Builtin::Line),
@@ -46,6 +48,8 @@ const BUILTINS: [(&str, Builtin); 18] = [
     ("option_env", Builtin::OptionEnv),
     ("asm", Builtin::Asm),
     ("module_path", Builtin::ModulePath),
+    ("include_str", Builtin::IncludeStr),
+    ("include_bytes", Builtin::IncludeBytes),
 ];
 
 impl Builtin {
@@ -62,6 +66,21 @@ impl Context<'_> {
         let marked = entry.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_builtin_macro"));
         Builtin::named(src.text(entry.name?)).filter(|_| marked)
     }
+}
+
+/// The byte string literal of `bytes`.
+pub fn byte_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 3);
+    out.push_str("b\"");
+    for &byte in bytes {
+        match byte {
+            b'"' | b'\\' => out.extend(['\\', byte as char]),
+            b' '..=b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Writes `$crate` of crate `krate` and then `rest`.
