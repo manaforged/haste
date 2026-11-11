@@ -143,10 +143,13 @@ impl<'a> Context<'a> {
                 }
                 _ => continue,
             };
+            let from = file.items.items[file.items.imports[import as usize].item as usize].parent;
+            let local = if absolute { None } else { self.body_import(root, from, head, leaf) };
             let entry = match head {
+                _ if let Some(local) = local => local,
                 [] => paths.first(leaf, home, &NamePath { segments: &[leaf], absolute, dollar }),
                 _ => match paths.resolve(&NamePath { segments: head, absolute, dollar }, home) {
-                    Some(def) => paths.member(def, leaf),
+                    Some(def) => self.path_member(home.krate, def, leaf),
                     None => continue,
                 },
             };
@@ -158,12 +161,49 @@ impl<'a> Context<'a> {
         out
     }
 
+    /// The bindings of `leaf` in the item that `head`, written at the body item `from` of `root`, names among the items the body declares: a variant of an enum or an item of a module.
+    fn body_import(&self, root: ItemRef, from: Option<u32>, head: &[Sym], leaf: Sym) -> Option<PerNs> {
+        if head.is_empty() {
+            return None;
+        }
+        let texts: Vec<&str> = head.iter().chain([&leaf]).map(|&segment| self.names.symbols.text(segment)).collect();
+        let found = |ns| self.body_binding(self.body_path(root, from, &texts, ns), texts[texts.len() - 1]);
+        let entry = PerNs { types: found(Ns::Types), values: found(Ns::Values), macros: None };
+        (entry.types.is_some() || entry.values.is_some()).then_some(entry)
+    }
+
+    /// The bindings of `name` inside `def`, an enum's variants or a module's items, for a path of crate `krate`, where a body may declare `def`.
+    pub(super) fn path_member(&self, krate: u32, def: Def, name: Sym) -> PerNs {
+        let Some((root, at)) = (match def { Def::Item(item) => item.outer(), _ => None }) else { return self.paths(krate).member(def, name) };
+        let text = self.names.symbols.text(name);
+        let found = |ns| self.body_binding(self.body_descend(root, at, &[text], ns), text);
+        PerNs { types: found(Ns::Types), values: found(Ns::Values), macros: None }
+    }
+
+    /// The binding of the body item or enum variant `name` that `path` reached.
+    fn body_binding(&self, path: Option<BodyPath>, name: &str) -> Option<Binding> {
+        let def = match path? {
+            BodyPath::Item(item) => Def::Item(item),
+            BodyPath::Variant(item) => self.body_variant(item, name)?,
+            BodyPath::Outside(_) => return None,
+        };
+        Some(Binding { def, vis: Vis::Pub, origin: Origin::Item })
+    }
+
+    /// The variant named `name` of the enum `item` that a body declares.
+    fn body_variant(&self, item: ItemRef, name: &str) -> Option<Def> {
+        let (root, at) = item.outer()?;
+        let found = self.expansion(root)?;
+        let open = found.file.items.items[at as usize].body?;
+        let index = crate::names::path::variant_names(&found.file.source, open).iter().position(|variant| *variant == name)?;
+        Some(Def::Variant(item, index as u32))
+    }
+
     /// Resolves `path` in the type namespace through the `use` declarations of the body `root` in module `home`, as code at token `here` sees them, when one binds its first segment.
     pub(super) fn body_use_path(&self, (root, home): (ItemRef, ModRef), path: &NamePath<'_>, here: Option<u32>) -> Option<Def> {
         let (first, rest) = path.segments.split_first().filter(|_| !path.absolute)?;
         let binding = self.body_imports((root, home), Some(*first), here).into_iter().find_map(|entry| entry.types)?;
-        let paths = self.paths(home.krate);
-        rest.iter().try_fold(binding.def, |def, segment| paths.member(def, *segment).types.map(|found| found.def))
+        rest.iter().try_fold(binding.def, |def, segment| self.path_member(home.krate, def, *segment).types.map(|found| found.def))
     }
 }
 

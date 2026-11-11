@@ -121,15 +121,7 @@ impl<'a> Paths<'a> {
     fn variants(&self, item: ItemRef) -> Vec<(&'a str, u32)> {
         let Some(file) = self.trees.get(item.krate as usize).and_then(|tree| tree.files.get(item.file as usize)) else { return Vec::new() };
         let Some(open) = file.items.items[item.item as usize].body else { return Vec::new() };
-        let src = &file.source;
-        let parts = split_commas(src, open + 1, src.pair(open));
-        let names = parts.into_iter().filter_map(|(mut at, to)| {
-            while at < to && src.kind(at) == TokenKind::Pound {
-                at = src.pair(at + 1) + 1;
-            }
-            (at < to && matches!(src.kind(at), TokenKind::Ident | TokenKind::RawIdent)).then(|| plain(src.text(at)))
-        });
-        names.enumerate().map(|(index, name)| (name, index as u32)).collect()
+        variant_names(&file.source, open).into_iter().enumerate().map(|(index, name)| (name, index as u32)).collect()
     }
 
     fn item_kind(&self, item: ItemRef) -> Option<ItemKind> {
@@ -292,4 +284,16 @@ impl<'a> Paths<'a> {
         }
         Some(def)
     }
+}
+
+/// The names of the variants of the enum whose body opens at token `open` of `src`, in order.
+pub fn variant_names(src: &crate::outline::source::Source, open: u32) -> Vec<&str> {
+    let parts = split_commas(src, open + 1, src.pair(open));
+    let names = parts.into_iter().filter_map(|(mut at, to)| {
+        while at < to && src.kind(at) == TokenKind::Pound {
+            at = src.pair(at + 1) + 1;
+        }
+        (at < to && matches!(src.kind(at), TokenKind::Ident | TokenKind::RawIdent)).then(|| plain(src.text(at)))
+    });
+    names.collect()
 }
