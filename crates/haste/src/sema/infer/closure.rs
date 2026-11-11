@@ -57,7 +57,7 @@ pub struct ClosureInfo {
 }
 
 /// The variables that one closure being inferred uses from outside it: locals below `first` belong to the bodies around it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Captures {
     first: u32,
     used: Vec<u32>,
@@ -91,7 +91,7 @@ impl Infer<'_, '_> {
         self.scopes.truncate(depth);
         let uses = self.uses.pop().expect("the closure pushed its uses");
         found?;
-        let moved = self.moved_reads(&uses.reads)?;
+        let moved = self.decide_later(expr, &uses, (by_move, &[]))?;
         let captures = self.captures(uses, (by_move, &moved), &[]);
         self.out.closures.insert(expr, Closure { params: locals, ret, body, captures, consumes: !moved.is_empty(), coroutine: false });
         Ok(self.cx.types.intern(Kind::Closure(parent, substs, expr.0)))
@@ -111,7 +111,7 @@ impl Infer<'_, '_> {
         self.scopes.truncate(depth);
         let uses = self.uses.pop().expect("the coroutine pushed its uses");
         found?;
-        let moved = self.moved_reads(&uses.reads)?;
+        let moved = self.decide_later(expr, &uses, (by_move, forced))?;
         let captures = self.captures(uses, (by_move, &moved), forced);
         self.out.closures.insert(expr, Closure { params: Vec::new(), ret, body: expr, captures, consumes: true, coroutine: true });
         Ok(self.cx.types.intern(Kind::Closure(parent, substs, expr.0)))
@@ -209,29 +209,66 @@ impl Infer<'_, '_> {
         }
     }
 
+    /// The captured locals that the closure `expr` moves out of, keeping its uses to decide again once the body settles when a read's type is not known yet.
+    fn decide_later(&mut self, expr: ExprId, uses: &Captures, (by_move, forced): (bool, &[u32])) -> Result<Vec<u32>> {
+        let (moved, known) = self.moved_reads(&uses.reads)?;
+        if !known {
+            self.unsure.push((expr, uses.clone(), by_move, forced.to_vec()));
+        }
+        Ok(moved)
+    }
+
+    /// Decides again what each closure whose reads had unknown types captures, now that the body's types are settled.
+    pub(super) fn settle_captures(&mut self) -> Result<()> {
+        for (expr, uses, by_move, forced) in std::mem::take(&mut self.unsure) {
+            let (moved, _) = self.moved_reads(&uses.reads)?;
+            let captures = self.captures(uses, (by_move, &moved), &forced);
+            let Some(closure) = self.out.closures.get_mut(&expr) else { continue };
+            closure.consumes = closure.coroutine || !moved.is_empty();
+            closure.captures = captures;
+        }
+        Ok(())
+    }
+
     /// The captured locals that the reads `reads` move out of: a read, or a field path from it, used as a value whose type needs dropping or is not `Copy`, where a `&mut` read reborrows.
-    fn moved_reads(&mut self, reads: &[(ExprId, u32)]) -> Result<Vec<u32>> {
+    fn moved_reads(&mut self, reads: &[(ExprId, u32)]) -> Result<(Vec<u32>, bool)> {
         if reads.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), true));
         }
         let (places, parents) = self.place_uses();
-        let mut moved = Vec::new();
+        let (mut moved, mut known) = (Vec::new(), true);
         for &(read, local) in reads {
             let mut at = read;
             while let Some(&parent) = parents.get(&at) {
                 at = parent;
             }
             let ty = self.resolve(self.out.exprs[at.0 as usize]);
-            if !places.contains(&at) && !moved.contains(&local) && self.moves(ty)? {
+            if places.contains(&at) || moved.contains(&local) {
+                continue;
+            }
+            known &= !matches!(self.cx.types.kind(ty), Kind::Var(_));
+            if self.moves(ty)? {
                 moved.push(local);
             }
         }
-        Ok(moved)
+        Ok((moved, known))
     }
 
     fn moves(&mut self, ty: Ty) -> Result<bool> {
+        if let Some(captures) = self.own_captures(ty) {
+            return captures.into_iter().try_fold(false, |moves, (local, by)| Ok(moves || by == By::Mut || (by == By::Value && self.moves(self.out.locals[local as usize].ty)?)));
+        }
         let reborrows = matches!(self.cx.types.kind(self.resolve(ty)), Kind::Ref(Mut::Mut, _));
         Ok(self.needs_drop(ty)? || (!reborrows && !self.is_copy(ty)?))
+    }
+
+    /// What the closure type `ty` captures when this body defines it and its store entry is not written yet.
+    fn own_captures(&self, ty: Ty) -> Option<Vec<(u32, By)>> {
+        let ty = self.resolve(ty);
+        let Kind::Closure(parent, substs, at) = self.cx.types.kind(ty) else { return None };
+        let here = self.instance.as_ref().is_some_and(|(item, args)| item == parent && args == substs);
+        let closure = here.then(|| self.out.closures.get(&ExprId(*at))).flatten().filter(|_| self.cx.closure(ty).is_none())?;
+        Some(closure.captures.iter().map(|capture| (capture.local, capture.by)).collect())
     }
 
     /// The expressions of the body used as places rather than values, and the field or parenthesis expression that projects each projected expression.
@@ -245,6 +282,10 @@ impl Infer<'_, '_> {
                 }
                 Expr::Ref { expr, .. } | Expr::Unary(UnOp::Deref, expr) | Expr::Index(expr, _) | Expr::Assign(expr, _) | Expr::AssignOp(_, expr, _) | Expr::Match(expr, _) | Expr::Let(_, expr) | Expr::Call(expr, _) => {
                     places.insert(expr);
+                }
+                Expr::Binary(op, lhs, rhs) if super::expr::is_compare(op) => {
+                    places.insert(lhs);
+                    places.insert(rhs);
                 }
                 Expr::Method { receiver, .. } if self.out.adjusts.get(&at).is_some_and(|adjust| adjust.autoref.is_some() || adjust.derefs > 0) => {
                     places.insert(receiver);
