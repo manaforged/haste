@@ -35,13 +35,21 @@ struct Writer {
     uses: Vec<(String, Source)>,
 }
 
-/// A token range being scanned for macro calls: its source, where it starts, how far its indices sit from those of the body, and how deep in expansions it is.
+/// A token range being scanned for macro calls: its source, where it starts, how far its indices sit from those of the body, how deep in expansions it is, and the source and first token of the outermost macro call it came from.
 #[derive(Clone, Copy)]
 struct Run<'s> {
     src: &'s Source,
     from: u32,
     shift: u32,
     depth: u32,
+    call: (&'s Source, u32),
+}
+
+impl<'s> Run<'s> {
+    /// The outermost macro call for the output of the call that starts at token `start` of this run.
+    fn call_at(self, start: u32) -> (&'s Source, u32) {
+        if self.depth == 0 { (self.src, start) } else { self.call }
+    }
 }
 
 /// The first token and the name token of the path of the macro call whose `!` is token `bang`.
@@ -143,7 +151,7 @@ impl Writer {
         (0..output.len()).for_each(|at| self.out.copy(&output, at));
         self.out.space();
         self.out.lexed("}");
-        self.scan(cx, Run { src: &output, from: 0, shift: block + 1, depth: run.depth + 1 }, output.len())
+        self.scan(cx, Run { src: &output, from: 0, shift: block + 1, depth: run.depth + 1, call: run.call_at(path.0) }, output.len())
     }
 
     fn note_use(&mut self, src: &Source, at: u32) -> Result<Option<u32>> {
@@ -221,8 +229,7 @@ impl Writer {
             Builtin::Env | Builtin::OptionEnv => return self.env(cx, run, site, out),
             Builtin::FormatArgs | Builtin::FormatArgsNl => return self.format_args(cx, run, site, out),
             Builtin::PatternType => return Ok(false),
-            Builtin::Line | Builtin::Column | Builtin::File if run.depth > 0 => return Ok(false),
-            Builtin::Line | Builtin::Column | Builtin::File | Builtin::Stringify => position(src, site, input, out),
+            Builtin::Line | Builtin::Column | Builtin::File | Builtin::Stringify => position(run, site, input, out),
             Builtin::Cfg => self.cfg(cx, src, input, out)?,
             Builtin::ModulePath => out.lexed(&format!("{:?}", cx.outline.module_path(self.home))),
             Builtin::CfgSelect => return self.cfg_select(cx, run, open, out),
@@ -318,8 +325,9 @@ impl Writer {
             return Ok(None);
         }
         let Some(path) = call_path(src, open - 1, from).filter(|path| path.0 == from) else { return Ok(None) };
-        let Some(output) = self.expand_one(cx, Run { depth: run.depth + 1, ..run }, path, open)? else { return Ok(None) };
-        self.literal(cx, Run { src: &output, from: 0, shift: 0, depth: run.depth + 1 }, (0, output.len()))
+        let call = run.call_at(path.0);
+        let Some(output) = self.expand_one(cx, Run { depth: run.depth + 1, call, ..run }, path, open)? else { return Ok(None) };
+        self.literal(cx, Run { src: &output, from: 0, shift: 0, depth: run.depth + 1, call }, (0, output.len()))
     }
 }
 
@@ -378,7 +386,7 @@ impl<'a> Context<'a> {
         let home = self.module_of(item)?;
         let before = self.asks.count();
         let mut writer = Writer { out: Tokens::default(), calls: HashMap::default(), offset: file.source.len(), home, locals: Vec::new(), uses: Vec::new() };
-        writer.scan(self, Run { src: &file.source, from, shift: 0, depth: 0 }, to)?;
+        writer.scan(self, Run { src: &file.source, from, shift: 0, depth: 0, call: (&file.source, from) }, to)?;
         if self.asks.count() > before {
             bail!("the macros that {} calls are not resolved yet", self.name(item));
         }
@@ -465,11 +473,12 @@ fn parse_in(src: &Source, config: syntax::Config<'_>, entry: &crate::outline::it
     }
 }
 
-fn position(src: &Source, site: Site, input: (u32, u32), out: &mut Tokens) {
+fn position(run: Run<'_>, site: Site, input: (u32, u32), out: &mut Tokens) {
+    let (src, at) = run.call_at(site.start);
     match site.builtin {
-        Builtin::Line => out.lexed(&format!("{}u32", src.line(site.start))),
-        Builtin::Column => out.lexed(&format!("{}u32", src.column(site.start))),
+        Builtin::Line => out.lexed(&format!("{}u32", src.line(at))),
+        Builtin::Column => out.lexed(&format!("{}u32", src.column(at))),
         Builtin::File => out.lexed(&format!("{:?}", src.path.display().to_string())),
-        _ => out.lexed(&format!("{:?}", src.spelled(input))),
+        _ => out.lexed(&format!("{:?}", run.src.spelled(input))),
     }
 }
