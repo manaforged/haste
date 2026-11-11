@@ -6,8 +6,10 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::body::sig::Signature;
 use crate::body::{Args, Body, BlockKind, Expr, ExprId, List, Param, PathId, TyId, UnOp};
 use crate::names::{ItemRef, ModRef};
+use crate::outline::item::ItemKind;
 
 use super::super::Context;
+use super::scope::Frame;
 use super::super::ty::{Kind, Mut, Ty};
 use super::{Infer, Local, Res, Shape, Typed};
 
@@ -65,7 +67,7 @@ pub(super) struct Captures {
     reads: Vec<(ExprId, u32)>,
 }
 
-impl Infer<'_, '_> {
+impl<'a> Infer<'_, 'a> {
     pub(super) fn closure_expr(&mut self, expr: ExprId, (params, ret, body, by_move): (List, Option<TyId>, ExprId, bool), expected: Option<Ty>) -> Result<Ty> {
         let Some((parent, substs)) = self.instance.clone() else { bail!("a closure outside a function body") };
         let hint = expected.and_then(|ty| self.expected_sig(ty)).filter(|(inputs, _)| inputs.len() == self.body.list(params).len());
@@ -573,6 +575,9 @@ impl Infer<'_, '_> {
         if !matches!(self.cx.types.kind(param), Kind::Var(_)) {
             return Ok(None);
         }
+        if matches!(self.cx.item(item).1.kind, ItemKind::Struct | ItemKind::Enum | ItemKind::Union) {
+            return self.field_hint((item, substs), param);
+        }
         let frame = self.frame(item, substs)?;
         let Some(at) = frame.generics.iter().position(|(_, ty)| self.resolve(*ty) == param) else { return Ok(None) };
         let sig = self.cx.signature(item)?;
@@ -581,9 +586,28 @@ impl Infer<'_, '_> {
         let (home, name) = (frame.home, frame.generics[at].0);
         let Some(index) = at.checked_sub(frame.generics.len() - own.len()) else { return self.with_frame(frame, |infer| infer.header_fn_bound(name, home)) };
         let bounds = super::scope::generic_bounds(&sig.body, src, &sig.predicates, own[index]);
+        self.first_fn_bound(frame, &sig.body, bounds)
+    }
+
+    /// The function pointer type that an `Fn` bound declared on the struct, enum or union `item` spells for its type parameter that `param` fills in `args`.
+    fn field_hint(&mut self, (item, args): (ItemRef, &[Ty]), param: Ty) -> Result<Option<Ty>> {
+        let def = self.cx.adt_def(item)?;
+        let Some(at) = args.iter().position(|&arg| self.resolve(arg) == param) else { return Ok(None) };
+        let Some(generic) = super::scope::type_params(&def.generics.params).nth(at) else { return Ok(None) };
+        let bounds = super::scope::generic_bounds(&def.body, &self.cx.file(item).source, &def.generics.predicates, generic);
+        if bounds.is_empty() {
+            return Ok(None);
+        }
+        let frame = self.adt_frame(item, &def.generics.params, args)?;
+        self.first_fn_bound(frame, &def.body, bounds)
+    }
+
+    /// The function pointer type that the first `Fn` bound among `bounds` in `arena` spells, read through `frame`.
+    fn first_fn_bound(&mut self, frame: Frame<'a>, arena: &Body, bounds: Vec<u32>) -> Result<Option<Ty>> {
+        let home = frame.home;
         self.with_frame(frame, |infer| {
             for bound in bounds {
-                if let Some(hint) = infer.fn_bound(&sig.body, home, bound)? {
+                if let Some(hint) = infer.fn_bound(arena, home, bound)? {
                     return Ok(Some(hint));
                 }
             }
