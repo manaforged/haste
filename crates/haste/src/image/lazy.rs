@@ -151,43 +151,62 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
     let mut store = std::mem::take(&mut demand.store);
     store.forget_lookups();
     let mut cx = Context::new(&compilation.outline, &compilation.names, store);
-    driver.start(demand)?;
-    while demand.children.iter().any(Option::is_some) {
-        for (id, asking) in demand.ready()? {
-            if !asking {
-                demand.drain(id);
-                continue;
-            }
-            let Some(index) = demand.read_ask(id) else { continue };
-            let reply = loop {
-                match demand.answer(&mut cx, index) {
-                    Ok(reply) => break reply,
-                    Err(Stop::Failed(error, item)) => {
-                        if let Some(child) = demand.children[id].as_mut() {
-                            child.failure = Some((error, item));
-                        }
-                        break 0;
-                    }
-                    Err(Stop::Asked) => {
-                        let (mut kept, asked) = cx.release();
-                        let answer = ask(compilation, asked)?;
-                        demand.strict = answer != Answer::Nothing;
-                        kept.forget_after(answer);
-                        cx = Context::new(&compilation.outline, &compilation.names, kept);
-                    }
-                }
+    let outcome = 'run: {
+        if let Err(error) = driver.start(demand) {
+            break 'run Err(error);
+        }
+        while demand.children.iter().any(Option::is_some) {
+            let ready = match demand.ready() {
+                Ok(ready) => ready,
+                Err(error) => break 'run Err(error),
             };
-            demand.strict = true;
-            demand.reply(id, reply);
+            for (id, asking) in ready {
+                if !asking {
+                    demand.drain(id);
+                    continue;
+                }
+                let Some(index) = demand.read_ask(id) else { continue };
+                let reply = loop {
+                    match demand.answer(&mut cx, index) {
+                        Ok(reply) => break reply,
+                        Err(Stop::Failed(error, item)) => {
+                            if let Some(child) = demand.children[id].as_mut() {
+                                child.failure = Some((error, item));
+                            }
+                            break 0;
+                        }
+                        Err(Stop::Asked) => {
+                            let (mut kept, asked) = cx.release();
+                            let answer = ask(compilation, asked);
+                            if let Ok(answer) = &answer {
+                                demand.strict = *answer != Answer::Nothing;
+                                kept.forget_after(*answer);
+                            }
+                            cx = Context::new(&compilation.outline, &compilation.names, kept);
+                            if let Err(error) = answer {
+                                break 'run Err(error);
+                            }
+                        }
+                    }
+                };
+                demand.strict = true;
+                demand.reply(id, reply);
+            }
+            for (id, ended) in demand.reap() {
+                if let Err(error) = driver.ended(id, ended) {
+                    break 'run Err(error);
+                }
+            }
+            if let Err(error) = driver.start(demand) {
+                break 'run Err(error);
+            }
         }
-        for (id, ended) in demand.reap() {
-            driver.ended(id, ended)?;
-        }
-        driver.start(demand)?;
-    }
-    demand.children.clear();
+        Ok(())
+    };
+    demand.strict = true;
+    demand.kill_children();
     demand.store = cx.release().0;
-    Ok(())
+    outcome
 }
 
 impl Jit {
@@ -254,6 +273,15 @@ impl Jit {
         };
         self.children.push(Some(child));
         Ok(self.children.len() - 1)
+    }
+
+    /// Kills and reaps every child still running, as a run that stopped on an error leaves them waiting for answers.
+    fn kill_children(&mut self) {
+        for child in self.children.drain(..).flatten() {
+            // SAFETY: pid is a child this process forked and has not reaped, so the signal reaches only that child.
+            unsafe { libc::kill(child.pid, libc::SIGKILL) };
+            wait(child.pid);
+        }
     }
 
     /// The children with something to read: `(id, true)` for an ask, `(id, false)` for output.

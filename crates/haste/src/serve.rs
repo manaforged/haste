@@ -195,16 +195,20 @@ fn answer(build: &mut Option<Build>, served: &mut Served<'_>, request: Option<(R
     };
     let saved = redirect(*out, *err);
     let started = Instant::now();
-    let done = match request {
+    let answered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
         Some((request, args)) => served.reload().and_then(|reloaded| {
             let kept = build.take().filter(|_| !reloaded);
             let (workspace, targets) = (&*served.workspace, served.targets);
             current(kept, workspace, targets).and_then(|fresh| finish(build.insert(fresh), workspace, (request, &args), started))
         }),
         None => Err(anyhow::anyhow!("unknown request")),
-    };
+    }));
+    let done = answered.unwrap_or_else(|_| {
+        *build = None;
+        Err(anyhow::anyhow!("the request panicked; the next request loads the workspace again"))
+    });
     if let Err(error) = &done {
-        eprintln!("error: {error:#}");
+        let _ = writeln!(std::io::stderr(), "error: {error:#}");
     }
     restore(saved, fds);
     done.unwrap_or(1)
