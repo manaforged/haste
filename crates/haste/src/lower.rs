@@ -157,7 +157,16 @@ pub fn unwrapped(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Type>> {
     })
 }
 
-/// The native signature of a reached function: memory values travel by address unless their layout is one scalar, and a memory result through a first `StructReturn` pointer.
+/// The scalars that a result of `ty` living in memory returns in, one register each, or none when it returns through a result pointer.
+pub fn returned(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
+    Ok(match repr(cx, ty)? {
+        Repr::Mem { parts: parts @ Parts::One(_), .. } => Some(parts),
+        Repr::Mem { parts: parts @ Parts::Pair(first, second, _), .. } if first != Type::I128 && second != Type::I128 => Some(parts),
+        _ => None,
+    })
+}
+
+/// The native signature of a reached function: memory values travel by address unless their layout is one scalar, and a memory result in the registers of `returned` or through a first `StructReturn` pointer.
 pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
     signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))
 }
@@ -168,8 +177,8 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
     if let Some(ret) = ret {
         match repr(cx, ret)? {
             Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
-            Repr::Mem { .. } => match unwrapped(cx, ret)? {
-                Some(machine) => signature.returns.push(AbiParam::new(machine)),
+            Repr::Mem { .. } => match returned(cx, ret)? {
+                Some(parts) => signature.returns.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
                 None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn)),
             },
             Repr::Zst => {}
@@ -183,6 +192,11 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
         }
     }
     Ok(signature)
+}
+
+/// Whether `signature` returns its result through a first `StructReturn` pointer.
+fn indirect(signature: &Signature) -> bool {
+    signature.params.first().is_some_and(|param| param.purpose == ArgumentPurpose::StructReturn)
 }
 
 #[derive(Clone, Copy)]
@@ -298,8 +312,7 @@ impl Lower<'_, '_> {
 
     fn declare_params(&mut self, entry: Block) -> Result<()> {
         let mut params = self.b.block_params(entry).to_vec().into_iter();
-        let sret = self.b.func.signature.params.first().is_some_and(|param| param.purpose == ArgumentPurpose::StructReturn);
-        self.sret = if sret { params.next() } else { None };
+        self.sret = if indirect(&self.b.func.signature) { params.next() } else { None };
         for &local in &self.typed.params {
             let value = match self.local_repr(local)? {
                 Repr::Zst => None,
@@ -353,26 +366,22 @@ impl Lower<'_, '_> {
             return self.resume_finish(value);
         }
         let ret = self.typed.ret_ty();
-        if let (Some(out), Some(value)) = (self.sret, value) {
-            let whole @ Repr::Mem { .. } = repr(self.cx, ret)? else { bail!("result pointer for a non-memory result") };
-            self.copy(out, value, whole);
-        }
+        let returns = !self.b.func.signature.returns.is_empty();
+        let values = match (self.sret, value) {
+            (Some(out), Some(value)) => {
+                let whole @ Repr::Mem { .. } = repr(self.cx, ret)? else { bail!("result pointer for a non-memory result") };
+                self.copy(out, value, whole);
+                Some(Vec::new())
+            }
+            (None, Some(value)) if returns => Some(self.returned_values(ret, value)?),
+            (None, _) if !returns => Some(Vec::new()),
+            _ => None,
+        };
         self.drop_to(0)?;
-        match (self.sret, value) {
-            (Some(_), Some(_)) => {
-                self.ins().return_(&[]);
-            }
-            (None, Some(value)) if !self.b.func.signature.returns.is_empty() => {
-                let value = self.passed(ret, value)?;
-                self.ins().return_(&[value]);
-            }
-            (_, _) if self.b.func.signature.returns.is_empty() && self.sret.is_none() => {
-                self.ins().return_(&[]);
-            }
-            _ => {
-                self.ins().trap();
-            }
-        }
+        match values {
+            Some(values) => self.ins().return_(&values),
+            None => self.ins().trap(),
+        };
         self.close();
         Ok(())
     }
@@ -447,6 +456,14 @@ impl Lower<'_, '_> {
         Ok(match unwrapped(self.cx, ty)? {
             Some(machine) => self.ins().load(machine, value, 0),
             None => value,
+        })
+    }
+
+    /// `value`, a result of `ty`, as the registers it returns in: the scalars loaded from its memory when `returned` names them.
+    pub(super) fn returned_values(&mut self, ty: Ty, value: Value) -> Result<Vec<Value>> {
+        Ok(match returned(self.cx, ty)? {
+            Some(parts) => parts.scalars().map(|(machine, offset)| self.ins().load(machine, value, offset)).collect(),
+            None => vec![value],
         })
     }
 

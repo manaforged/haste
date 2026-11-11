@@ -101,8 +101,8 @@ impl Lower<'_, '_> {
                 self.ins().return_(&[]);
             }
             (None, Some(value), Repr::Scalar(_) | Repr::Mem { .. }) => {
-                let value = self.passed(poll, value)?;
-                self.ins().return_(&[value]);
+                let values = self.returned_values(poll, value)?;
+                self.ins().return_(&values);
             }
             (_, None, Repr::Zst) => {
                 self.ins().return_(&[]);

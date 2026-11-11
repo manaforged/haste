@@ -55,10 +55,9 @@ impl Lower<'_, '_> {
             }
         }
         let signature = super::signature(self.cx, self.typed)?;
-        let returns = !signature.returns.is_empty();
         let sig = self.b.import_signature(signature);
         let call = self.ins().call_indirect(sig, code, &values);
-        let results: Vec<Value> = if returns { vec![self.b.inst_results(call)[0]] } else { Vec::new() };
+        let results = self.b.inst_results(call).to_vec();
         self.ins().return_(&results);
         self.close();
         Ok(())

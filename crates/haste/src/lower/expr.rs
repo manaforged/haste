@@ -365,30 +365,23 @@ impl Lower<'_, '_> {
         let signature = super::signature_of(self.cx, ret, params.iter().copied())?;
         let mut values = self.pass_all(&params, values)?;
         let result = ret.map(|ret| repr(self.cx, ret)).transpose()?.unwrap_or(Repr::Zst);
-        let unwrapped = ret.map(|ret| super::unwrapped(self.cx, ret)).transpose()?.flatten();
-        let out = match result {
-            Repr::Mem { .. } => self.slot(result),
-            _ => None,
-        };
-        if let Some(out) = out.filter(|_| unwrapped.is_none()) {
+        let out = if super::indirect(&signature) { self.slot(result) } else { None };
+        if let Some(out) = out {
             let address = self.ins().stack_addr(Type::I64, out, 0);
             values.insert(0, address);
         }
-        let returns = signature.returns.first().map(|param| param.value_type);
         let results = self.emit_call(callee, signature, &values);
-        if ret.is_some_and(|ret| matches!(self.cx.types.kind(ret), Kind::Never)) {
+        let Some(ret) = ret else { return Ok(None) };
+        if matches!(self.cx.types.kind(ret), Kind::Never) {
             self.ins().trap();
             self.close();
             return Ok(None);
         }
-        if let (Some(out), Some(machine)) = (out, unwrapped) {
-            let value = results[0];
-            self.write(Place::slot(out, result).at(0, Repr::Scalar(machine)), value);
-        }
         if let Some(out) = out {
             return Ok(Some(self.ins().stack_addr(Type::I64, out, 0)));
         }
-        Ok(returns.map(|_| results[0]))
+        let parts: Vec<(Type, i32)> = super::returned(self.cx, ret)?.into_iter().flat_map(Parts::scalars).collect();
+        self.received(ret, &parts, &results)
     }
 
     /// The argument `values` of a call that takes `params`, as they cross it: zero-sized parameters take no value, and a value whose type travels unwrapped crosses as its scalar.

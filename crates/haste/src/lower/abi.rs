@@ -99,12 +99,13 @@ impl Lower<'_, '_> {
                 self.close();
                 Ok(None)
             }
-            Some(ret) => self.native_result(ret, &returned, &results),
+            Some(ret) => self.received(ret, &returned, &results),
             None => Ok(None),
         }
     }
 
-    fn native_result(&mut self, ret: Ty, parts: &Passed, results: &[Value]) -> Result<Option<Value>> {
+    /// The value of a result of type `ret` that a call left in the registers `results`, one per part in `parts`: a frame slot holding them when the result lives in memory.
+    pub(super) fn received(&mut self, ret: Ty, parts: &[(Type, i32)], results: &[Value]) -> Result<Option<Value>> {
         let whole = repr(self.cx, ret)?;
         if !matches!(whole, Repr::Mem { .. }) {
             return Ok(results.first().copied());
