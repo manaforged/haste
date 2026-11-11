@@ -28,6 +28,19 @@ impl<'a> Infer<'_, 'a> {
         self.with_frame(frame, |infer| infer.lower_ty(&def.body, last.ty).map(|ty| infer.substitute(ty))).map(Some)
     }
 
+    /// Whether the struct `item` at `args` ends in an unsized field once each `sized` stand-in is an open variable, so a projection on it stays open and counts as sized.
+    pub fn open_tail_unsized(&mut self, item: ItemRef, args: &[Ty], sized: Ty) -> Result<bool> {
+        let open: Vec<Ty> = args.iter().map(|&arg| if arg == sized { self.fresh(Kind::Var) } else { arg }).collect();
+        let mut tail = self.cx.types.intern(Kind::Adt(item, open));
+        while let Kind::Adt(at, args) = self.cx.types.kind(self.resolve(tail)).clone()
+            && self.cx.item(at).1.kind == ItemKind::Struct
+            && let Some(last) = self.adt_tail_field(at, &args)?
+        {
+            tail = last;
+        }
+        Ok(self.cx.types.kind(self.resolve(tail)).is_unsized())
+    }
+
     fn adt_frame(&mut self, item: ItemRef, params: &[crate::body::sig::Generic], args: &[Ty]) -> Result<super::scope::Frame<'a>> {
         let self_ty = Some(self.cx.types.intern(Kind::Adt(item, args.to_vec())));
         self.item_frame(item, (params, args), (self_ty, Some(item)))

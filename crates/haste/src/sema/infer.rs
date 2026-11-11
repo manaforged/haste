@@ -656,9 +656,10 @@ pub fn maybe_unsized(cx: &mut Context<'_>, item: ItemRef) -> Result<bool> {
         _ => stand_ins[2],
     }).collect();
     let any_relaxed = args.contains(&stand_ins[1]);
-    let ty = cx.types.intern(Kind::Adt(item, args));
+    let ty = cx.types.intern(Kind::Adt(item, args.clone()));
     match cx.is_unsized(ty) {
         Err(_) if !any_relaxed => Ok(false),
+        Err(_) => detached(cx, item, |infer| infer.open_tail_unsized(item, &args, stand_ins[2])),
         found => found,
     }
 }
