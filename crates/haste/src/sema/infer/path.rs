@@ -69,7 +69,7 @@ impl<'a> Infer<'_, 'a> {
         } else {
             let path = NamePath { segments: prefix, absolute, dollar };
             let head = if inside { self.type_def(&path) } else { self.cx.paths(self.home.krate).resolve(&path, self.home) };
-            head.map(|def| self.cx.paths(self.home.krate).member(def, *last)).and_then(|entry| entry.values)
+            head.map(|def| self.cx.path_member(self.home.krate, def, *last)).and_then(|entry| entry.values)
         };
         match found {
             Some(binding) => Ok(binding.def),
@@ -136,7 +136,7 @@ impl<'a> Infer<'_, 'a> {
         let local = if path.absolute { None } else { self.body_use(*first).types };
         let paths = self.cx.paths(self.home.krate);
         let Some(binding) = local else { return paths.resolve(path, self.home) };
-        rest.iter().try_fold(binding.def, |def, segment| paths.member(def, *segment).types.map(|found| found.def))
+        rest.iter().try_fold(binding.def, |def, segment| self.cx.path_member(self.home.krate, def, *segment).types.map(|found| found.def))
     }
 
     /// The bindings that the `use` declarations inside the body give `word`, each namespace from the first one that binds it.

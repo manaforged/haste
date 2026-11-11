@@ -10,7 +10,7 @@ use super::{Infer, Res};
 impl Infer<'_, '_> {
     /// Infers the dereference `expr` of a value of type `found`: through a pointer, a `Box`, or `Deref::deref`.
     pub(super) fn deref(&mut self, expr: ExprId, found: Ty) -> Result<Ty> {
-        let ty = self.resolve(found);
+        let ty = self.known_ty(found)?;
         if let Some(inner) = self.builtin_deref(ty) {
             return Ok(inner);
         }
