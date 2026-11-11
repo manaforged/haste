@@ -395,11 +395,25 @@ impl Infer<'_, '_> {
             Kind::Adt(..) => return self.overloaded_call(expr, found, args),
             _ => bail!("calling {} is not supported yet", self.show(callee_ty)),
         };
-        let args = match &def {
-            Some((item, substs)) => self.legacy_const_args((*item, substs), args, params.len())?,
-            None => self.body.list(args).to_vec(),
-        };
+        let args = self.passed_args(def.as_ref(), args, params.len())?;
+        let def = def.or_else(|| self.ctor_callee(callee));
         self.call_args(args, (params, ret, def), expected)
+    }
+
+    /// The arguments `args` that pass values in a call of the function `def`, or all of them when the callee is not a function item.
+    fn passed_args(&mut self, def: Option<&(ItemRef, Vec<Ty>)>, args: List, params: usize) -> Result<Vec<u32>> {
+        match def {
+            Some((item, substs)) => self.legacy_const_args((*item, substs), args, params),
+            None => Ok(self.body.list(args).to_vec()),
+        }
+    }
+
+    /// The struct, enum or union and its type arguments when `callee` names a tuple constructor, whose declared bounds give closure arguments their signatures.
+    fn ctor_callee(&self, callee: ExprId) -> Option<(ItemRef, Vec<Ty>)> {
+        match self.out.res.get(&callee) {
+            Some(Res::Ctor(item, _, args)) => Some((*item, args.clone())),
+            _ => None,
+        }
     }
 
     /// The arguments `args` of a call of `item` at `substs`, which takes `params` values, that pass values, after the ones that `#[rustc_legacy_const_generics]` names are tied to its const generics.

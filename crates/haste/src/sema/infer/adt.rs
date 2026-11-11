@@ -69,7 +69,8 @@ impl<'a> Infer<'_, 'a> {
         Ok(self.cx.types.kind(self.resolve(tail)).is_unsized())
     }
 
-    fn adt_frame(&mut self, item: ItemRef, params: &[crate::body::sig::Generic], args: &[Ty]) -> Result<super::scope::Frame<'a>> {
+    /// The frame of the struct, enum or union `item` with its type parameters `params` set to `args`, whose header supplies their bounds.
+    pub(super) fn adt_frame(&mut self, item: ItemRef, params: &[crate::body::sig::Generic], args: &[Ty]) -> Result<super::scope::Frame<'a>> {
         let self_ty = Some(self.cx.types.intern(Kind::Adt(item, args.to_vec())));
         self.item_frame(item, (params, args), (self_ty, Some(item)))
     }
@@ -196,8 +197,7 @@ impl<'a> Infer<'_, 'a> {
             let Some(index) = self.field_index(item, variant, name)? else { bail!("no field `{name}` on {}", self.cx.name(item)) };
             let ty = tys[index as usize];
             self.out.inits.insert(field.value, index);
-            let found = self.expr(field.value, Some(ty))?;
-            self.coerce_expr(field.value, found, ty)?;
+            self.call_arg(Some((item, &args[..])), field.value, (ty, None))?;
         }
         let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
         if let Some(base) = base {
