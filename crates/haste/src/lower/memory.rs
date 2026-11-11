@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{IntCC, Type, Value};
 
 use crate::body::BinOp;
+use crate::names::Primitive;
 use crate::sema::infer::{ALIGN_SLOT, SIZE_SLOT};
 use crate::sema::intrinsic::Intrinsic;
 use crate::sema::ty::{Kind, Ty};
@@ -112,8 +113,8 @@ impl Lower<'_, '_> {
                 Ok(self.ins().imul_imm(len, bytes))
             }
             Kind::Slice(element) => self.layout_const(which, element),
-            Kind::Prim(crate::names::Primitive::Str) if size => Ok(self.ins().load(Type::I64, pointer, 8)),
-            Kind::Prim(crate::names::Primitive::Str) => Ok(self.ins().iconst(Type::I64, 1)),
+            Kind::Prim(Primitive::Str) if size => Ok(self.ins().load(Type::I64, pointer, 8)),
+            Kind::Prim(Primitive::Str) => Ok(self.ins().iconst(Type::I64, 1)),
             Kind::Dyn(..) => {
                 let vtable = self.ins().load(Type::I64, pointer, 8);
                 let slot = if size { SIZE_SLOT } else { ALIGN_SLOT };
@@ -203,45 +204,34 @@ impl Lower<'_, '_> {
         let size = self.size(ty)?;
         let bytes = self.ins().imul_imm(count, size);
         let byte = self.ins().uextend(Type::I64, byte);
-        self.call_libc(libc::memset as *const (), vec![to, byte, bytes])
+        self.call_libc(libc::memset as *const (), vec![to, byte, bytes], None)?;
+        Ok(())
     }
 
-    /// Calls the C library function `function` of this process with word arguments `args`, ignoring its result.
-    fn call_libc(&mut self, function: *const (), args: Vec<Value>) -> Result<()> {
-        let usize_ty = self.cx.types.prim(crate::names::Primitive::Usize);
+    /// Calls the C library function `function` of this process with word arguments `args`, and returns its result of type `ret`.
+    fn call_libc(&mut self, function: *const (), args: Vec<Value>, ret: Option<Ty>) -> Result<Option<Value>> {
+        let usize_ty = self.cx.types.prim(Primitive::Usize);
         let code = self.ins().iconst(Type::I64, function as i64);
-        self.call_code(code, (vec![usize_ty; args.len()], None), args)?;
-        Ok(())
+        self.call_code(code, (vec![usize_ty; args.len()], ret), args)
     }
 
     fn byte_compare(&mut self, which: Intrinsic, ty: Option<Ty>, args: &[Value]) -> Result<Value> {
         match (which, ty, args) {
-            (Intrinsic::CompareBytes, _, &[x, y, count]) => Ok(self.compare_bytes((x, y), count)),
+            (Intrinsic::CompareBytes, _, &[x, y, count]) => self.compare_bytes((x, y), count),
             (Intrinsic::RawEq, Some(ty), &[x, y]) => {
                 let size = self.layout_const(Intrinsic::SizeOf, ty)?;
-                let order = self.compare_bytes((x, y), size);
+                let order = self.compare_bytes((x, y), size)?;
                 Ok(self.ins().icmp_imm(IntCC::Equal, order, 0))
             }
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
         }
     }
 
-    fn compare_bytes(&mut self, (x, y): (Value, Value), count: Value) -> Value {
-        let order = self.b.create_stack_slot(4, 2);
-        let zero = self.ins().iconst(Type::I32, 0);
-        self.ins().stack_store(zero, order, 0);
-        self.each(count, |lower, index| {
-            let (left, right) = (lower.ins().iadd(x, index), lower.ins().iadd(y, index));
-            let (left, right) = (lower.ins().load(Type::I8, left, 0), lower.ins().load(Type::I8, right, 0));
-            let (left, right) = (lower.ins().uextend(Type::I32, left), lower.ins().uextend(Type::I32, right));
-            let difference = lower.ins().isub(left, right);
-            let so_far = lower.ins().stack_load(Type::I32, order, 0);
-            let zero = lower.ins().iconst(Type::I32, 0);
-            let undecided = lower.ins().icmp(IntCC::Equal, so_far, zero);
-            let next = lower.ins().select(undecided, difference, so_far);
-            lower.ins().stack_store(next, order, 0);
-        });
-        self.ins().stack_load(Type::I32, order, 0)
+    /// The C `int` that `memcmp` returns for the `count` bytes at `x` and `y`: negative, zero or positive.
+    fn compare_bytes(&mut self, (x, y): (Value, Value), count: Value) -> Result<Value> {
+        let int = self.cx.types.prim(Primitive::I32);
+        let Some(order) = self.call_libc(libc::memcmp as *const (), vec![x, y, count], Some(int))? else { bail!("memcmp returned no value") };
+        Ok(order)
     }
 
     pub(super) fn each(&mut self, count: Value, mut body: impl FnMut(&mut Self, Value)) {
