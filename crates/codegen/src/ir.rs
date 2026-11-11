@@ -33,6 +33,11 @@ impl Type {
     pub fn is_float(self) -> bool {
         matches!(self, Type::F32 | Type::F64)
     }
+
+    /// Whether the type holds an integer that fits in one general-purpose register.
+    pub fn is_small_int(self) -> bool {
+        matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+    }
 }
 
 macro_rules! ids {
@@ -409,6 +414,47 @@ impl Function {
     /// The type of `value`.
     pub fn ty(&self, value: Value) -> Type {
         self.types[value.index()]
+    }
+
+    /// A new value of type `ty`, for an instruction to define.
+    pub(crate) fn value(&mut self, ty: Type) -> Value {
+        self.types.push(ty);
+        Value(self.types.len() as u32 - 1)
+    }
+
+    /// The operation of the last instruction of `block`.
+    pub(crate) fn last(&self, block: Block) -> Option<&Op> {
+        self.blocks[block.index()].insts.last().map(|inst| &self.insts[inst.index()].op)
+    }
+
+    /// The blocks the last instruction of `block` can go to.
+    pub(crate) fn successors(&self, block: Block) -> impl Iterator<Item = Block> + use<> {
+        self.last(block).map(Op::targets).into_iter().flatten()
+    }
+
+    /// The block that a jump to `block` ends in, past every block that only jumps on and carries no values.
+    pub(crate) fn jump_target(&self, mut block: Block) -> Block {
+        for _ in 0..self.blocks.len() {
+            let data = &self.blocks[block.index()];
+            let [only] = data.insts[..] else { return block };
+            match &self.insts[only.index()].op {
+                Op::Jump(next, args) if data.params.is_empty() && args.is_empty() => block = *next,
+                _ => return block,
+            }
+        }
+        block
+    }
+
+    /// Whether control that enters at `entry` can reach each block.
+    pub(crate) fn reachable(&self, entry: Block) -> Vec<bool> {
+        let mut seen = vec![false; self.blocks.len()];
+        let mut stack = vec![entry];
+        while let Some(block) = stack.pop() {
+            if !std::mem::replace(&mut seen[block.index()], true) {
+                stack.extend(self.successors(block));
+            }
+        }
+        seen
     }
 
     /// The number of instructions in the body.

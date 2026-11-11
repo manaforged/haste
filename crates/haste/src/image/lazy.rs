@@ -229,15 +229,11 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
                 Ok(Some(asked)) => asked,
                 done => break 'run done.map(drop),
             };
-            let (mut kept, asks) = cx.release();
-            let answer = ask(compilation, asks);
-            if let Ok(answer) = &answer {
-                demand.strict = *answer != Answer::Nothing;
-                kept.forget_after(*answer);
-            }
+            let (kept, answer) = crate::macros::answer(compilation, ask, cx.release());
             cx = Context::new(&compilation.outline, &compilation.names, kept);
-            if let Err(error) = answer {
-                break 'run Err(error);
+            match answer {
+                Ok(answer) => demand.strict = answer != Answer::Nothing,
+                Err(error) => break 'run Err(error),
             }
             pending = Some(asked);
         }
@@ -260,8 +256,7 @@ impl Jit {
 
     /// Drops the inference and code of the declared functions that `edited` touches and points their slots and vtable entries back at their stubs, so that the next call compiles them again.
     fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
-        let touched = self.store.touched(self.reached.list.iter().map(|(instance, _)| instance), edited);
-        self.store.forget(outline, edited);
+        let touched = self.store.invalidate(outline, self.reached.list.iter().map(|(instance, _)| instance), edited);
         for at in touched {
             self.reached.forget(at);
             self.compiled.remove(&at);

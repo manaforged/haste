@@ -134,10 +134,6 @@ pub(crate) fn fits(op: Binary, signed: bool, ty: Type, (x, y): (i64, i64)) -> Op
     Some((low..=high).contains(&result))
 }
 
-fn small_int(ty: Type) -> bool {
-    matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
-}
-
 struct Fold {
     consts: Vec<Option<i64>>,
     subst: Vec<Value>,
@@ -147,11 +143,8 @@ struct Fold {
 }
 
 impl Fold {
-    fn find(&self, mut value: Value) -> Value {
-        while self.subst[value.index()] != value {
-            value = self.subst[value.index()];
-        }
-        value
+    fn find(&self, value: Value) -> Value {
+        crate::merge::find(&self.subst, value)
     }
 
     fn known(&self, value: Value) -> Option<i64> {
@@ -167,7 +160,7 @@ impl Fold {
             return if let Op::Const(imm) = *op { Some(imm) } else { None };
         };
         let ty = func.ty(x);
-        if !small_int(ty) {
+        if !ty.is_small_int() {
             return None;
         }
         match *op {
@@ -210,7 +203,7 @@ impl Fold {
     fn identity(&self, func: &Function, op: &Op) -> Option<Value> {
         match *op {
             Op::Select(condition, x, y) => self.known(condition).map(|known| if known != 0 { x } else { y }),
-            Op::Binary(kind, x, y) if small_int(func.ty(x)) => self.neutral(kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
+            Op::Binary(kind, x, y) if func.ty(x).is_small_int() => self.neutral(kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
             Op::Unary(kind @ (Unary::Ineg | Unary::Bnot), x) => match *self.def(func, x)? {
                 Op::Unary(inner, value) if inner == kind => Some(value),
                 _ => None,
@@ -255,7 +248,7 @@ impl Fold {
             let data = &func.insts[inst.index()];
             let Some(result) = data.result.filter(|result| self.subst[result.index()] == *result && self.consts[result.index()].is_none()) else { continue };
             let ty = func.ty(result);
-            if small_int(ty)
+            if ty.is_small_int()
                 && let Some(imm) = self.evaluate(func, &data.op)
             {
                 self.consts[result.index()] = Some(extend(imm, ty, true));
@@ -415,26 +408,12 @@ fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(Block, &'a 
     }
 }
 
-fn reachable(func: &Function, entry: Block) -> Vec<bool> {
-    let mut seen = vec![false; func.blocks.len()];
-    let mut stack = vec![entry];
-    while let Some(block) = stack.pop() {
-        if std::mem::replace(&mut seen[block.index()], true) {
-            continue;
-        }
-        if let Some(last) = func.blocks[block.index()].insts.last() {
-            stack.extend(func.insts[last.index()].op.targets());
-        }
-    }
-    seen
-}
-
 /// The entry and every block a call enters, whose parameters are not edge arguments.
 fn pinned(func: &Function, entry: Block) -> Vec<bool> {
     let mut pinned = vec![false; func.blocks.len()];
     pinned[entry.index()] = true;
-    for block in &func.blocks {
-        if let Some(Op::TryCall { normal, handler, .. }) = block.insts.last().map(|inst| &func.insts[inst.index()].op) {
+    for block in 0..func.blocks.len() as u32 {
+        if let Some(Op::TryCall { normal, handler, .. }) = func.last(Block(block)) {
             pinned[normal.index()] = true;
             pinned[handler.index()] = true;
         }
@@ -496,7 +475,7 @@ fn defs(func: &Function) -> Vec<Option<Inst>> {
 
 /// Empties the blocks no path from `entry` reaches and returns which blocks a path reaches.
 fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
-    let reachable = reachable(func, entry);
+    let reachable = func.reachable(entry);
     for (block, live) in func.blocks.iter_mut().zip(&reachable) {
         if !live && !block.insts.is_empty() {
             block.insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
@@ -596,7 +575,7 @@ fn invert(func: &mut Function) {
         }
         let Op::Brif(condition, then, then_args, otherwise, else_args) = op else { continue };
         let Some((cc, x, y)) = compares[condition.index()] else { continue };
-        if consts[y.index()] != Some(0) || !small_int(types[x.index()]) {
+        if consts[y.index()] != Some(0) || !types[x.index()].is_small_int() {
             continue;
         }
         match cc {

@@ -111,7 +111,7 @@ impl<'a> Context<'a> {
         let refs: Vec<Vec<&Layout>> = layouts.iter().map(|variant| variant.iter().map(|layout| &**layout).collect()).collect();
         let variants: IndexVec<Variant, IndexVec<Field, &&Layout>> = refs.iter().map(|variant| variant.iter().collect()).collect();
         let dl = super::layout::target()?;
-        let calc = LayoutCalculator::new(&dl);
+        let calc = LayoutCalculator::new(dl);
         let repr = self.repr(item);
         let kind = self.item(item).1.kind;
         let result = match kind {
@@ -120,7 +120,7 @@ impl<'a> Context<'a> {
                 let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { Rc::from([0]) };
                 let no_niche = matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned"));
                 let tagged = discriminants.iter().enumerate().map(|(at, &value)| (rustc_index::Idx::new(at), value));
-                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, no_niche, |min, max| discr_range(&dl, &repr, min, max), tagged, sized)
+                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, no_niche, |min, max| discr_range(dl, &repr, min, max), tagged, sized)
             }
         };
         result.map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))

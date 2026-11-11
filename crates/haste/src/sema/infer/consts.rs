@@ -178,7 +178,21 @@ fn fold_unsigned(op: BinOp, x: u128, y: u128) -> u128 {
     }
 }
 
-impl Infer<'_, '_> {
+impl<'a> Infer<'a, '_> {
+    fn const_typed(&mut self, arena: &Body, expr: ExprId, target: Int) -> Result<(u128, Int)> {
+        let (value, ty) = self.const_eval(arena, expr, Some(target))?;
+        let int = ty.unwrap_or(target);
+        Ok((value & mask(int.0), int))
+    }
+
+    fn const_defaulted(&mut self, arena: &Body, expr: ExprId, fallback: Int) -> Result<(u128, Int)> {
+        let (value, ty) = self.const_eval(arena, expr, None)?;
+        match ty {
+            Some(int) => Ok((value & mask(int.0), int)),
+            None => self.const_typed(arena, expr, fallback),
+        }
+    }
+
     /// The value of the integer or bool constant item `item`, as the bits of its type: folded from its syntax, or else from running its body.
     pub(super) fn const_value(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(u128, Int)> {
         let sig = self.cx.signature(item)?;
@@ -188,7 +202,7 @@ impl Infer<'_, '_> {
             let ty = infer.lower_ty(&sig.body, ret)?;
             let Some(int) = infer.int_of(ty) else { bail!("constant of a type that is not an integer") };
             width = Some(int);
-            let (value, _) = infer.const_eval(body, root, int)?;
+            let (value, _) = infer.const_typed(body, root, int)?;
             Ok((value & mask(int.0), int))
         });
         match (folded, width) {
@@ -301,15 +315,12 @@ impl Infer<'_, '_> {
         self.with_frame(frame, run)
     }
 
-    /// The integer type of each parameter of the const fn `item` at `substs`, or `want` for one that is not an integer.
-    fn const_params(&mut self, item: ItemRef, substs: &[Ty], want: Int) -> Result<Vec<Int>> {
+    /// The integer type of each parameter of the const fn `item` at `substs`.
+    fn const_params(&mut self, item: ItemRef, substs: &[Ty]) -> Result<Vec<Option<Int>>> {
         let sig = self.cx.signature(item)?;
         self.with_item_frame(item, substs, |infer| {
             let lowered: Result<Vec<Ty>> = sig.params.iter().map(|&(_, ty)| infer.lower_ty(&sig.body, ty)).collect();
-            Ok(lowered?.into_iter().map(|ty| match *infer.cx.types.kind(ty) {
-                Kind::Prim(primitive) => int_info(primitive).unwrap_or(want),
-                _ => want,
-            }).collect())
+            Ok(lowered?.into_iter().map(|ty| infer.int_of(ty)).collect())
         })
     }
 
@@ -331,7 +342,7 @@ impl Infer<'_, '_> {
         let mut values = Vec::with_capacity(def.variants.len());
         for variant in &def.variants {
             if let Some(expr) = variant.discriminant {
-                let (value, _) = self.const_eval(&def.body, expr, int)?;
+                let (value, _) = self.const_typed(&def.body, expr, int)?;
                 next = if int.1 { signed(value & mask(int.0), int.0) } else { (value & mask(int.0)) as i128 };
             }
             values.push(next);
@@ -345,7 +356,7 @@ impl Infer<'_, '_> {
         if let Some(param) = self.named_param(arena, expr) {
             return Ok(param);
         }
-        let (value, (bits, _)) = match self.const_eval(arena, expr, USIZE) {
+        let (value, (bits, _)) = match self.const_defaulted(arena, expr, USIZE) {
             Err(error) => self.run_anon(arena, expr, error)?,
             found => found?,
         };
@@ -362,23 +373,27 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn named_param(&self, arena: &Body, expr: ExprId) -> Option<Ty> {
+    fn param_name(&self, arena: &Body, expr: ExprId) -> Option<&'a str> {
         match *arena.expr(expr) {
-            Expr::Paren(inner) => self.named_param(arena, inner),
-            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.named_param(arena, tail),
+            Expr::Paren(inner) => self.param_name(arena, inner),
+            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.param_name(arena, tail),
             Expr::Path(path) => {
                 let entry = arena.path(path);
                 let [segment] = arena.list(entry.segments) else { return None };
-                let name = self.src.text(arena.segments[*segment as usize].name);
-                let named = entry.qself.is_none() && arena.segments[*segment as usize].args.is_none();
-                named.then(|| self.generics.iter().find(|(generic, _)| *generic == name).map(|&(_, ty)| ty)).flatten()
+                let named = entry.qself.is_none() && !entry.global && arena.segments[*segment as usize].args.is_none();
+                named.then(|| self.src.text(arena.segments[*segment as usize].name))
             }
             _ => None,
         }
     }
 
+    fn named_param(&self, arena: &Body, expr: ExprId) -> Option<Ty> {
+        let name = self.param_name(arena, expr)?;
+        self.generics.iter().find(|(generic, _)| *generic == name).map(|&(_, ty)| ty)
+    }
+
     /// The value of the integer constant expression `expr` of `arena`, read as `want` unless it says its own type.
-    pub(super) fn const_eval(&mut self, arena: &Body, expr: ExprId, want: Int) -> Result<(u128, Int)> {
+    pub(super) fn const_eval(&mut self, arena: &Body, expr: ExprId, want: Option<Int>) -> Result<(u128, Option<Int>)> {
         match *arena.expr(expr) {
             Expr::Lit(lit, at) => self.const_lit(lit, at, want),
             Expr::Paren(_) | Expr::Block { .. } | Expr::If(..) => self.const_flow(arena, expr, want),
@@ -393,35 +408,27 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// Whether `expr` is an integer literal with no suffix, perhaps negated or in parentheses, whose type the other operand decides.
-    fn plain_int(&self, arena: &Body, expr: ExprId) -> bool {
-        match *arena.expr(expr) {
-            Expr::Lit(Lit::Int, at) => parse_int(self.src.text(at)).is_ok_and(|(_, suffix)| suffix.is_none()),
-            Expr::Paren(inner) | Expr::Unary(UnOp::Neg, inner) => self.plain_int(arena, inner),
-            _ => false,
-        }
-    }
-
-    fn const_lit(&self, lit: Lit, at: u32, want: Int) -> Result<(u128, Int)> {
+    fn const_lit(&self, lit: Lit, at: u32, want: Option<Int>) -> Result<(u128, Option<Int>)> {
         let text = self.src.text(at);
         match lit {
             Lit::Int => {
                 let (value, suffix) = parse_int(text)?;
-                Ok((value, suffix.and_then(int_info).unwrap_or(want)))
+                let ty = suffix.and_then(int_info).or(want);
+                Ok((ty.map_or(value, |(bits, _)| value & mask(bits)), ty))
             }
-            Lit::Bool(value) => Ok((u128::from(value), BOOL)),
-            Lit::Byte => Ok((u128::from(crate::body::literal::byte_value(text)?), (8, false))),
-            Lit::Char => Ok((u128::from(crate::body::literal::char_value(text)?), (32, false))),
+            Lit::Bool(value) => Ok((u128::from(value), Some(BOOL))),
+            Lit::Byte => Ok((u128::from(crate::body::literal::byte_value(text)?), Some((8, false)))),
+            Lit::Char => Ok((u128::from(crate::body::literal::char_value(text)?), Some((32, false)))),
             other => bail!("constant {other:?} literals are not evaluated yet"),
         }
     }
 
-    fn const_flow(&mut self, arena: &Body, expr: ExprId, want: Int) -> Result<(u128, Int)> {
+    fn const_flow(&mut self, arena: &Body, expr: ExprId, want: Option<Int>) -> Result<(u128, Option<Int>)> {
         match *arena.expr(expr) {
             Expr::Paren(inner) => self.const_eval(arena, inner, want),
             Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.const_eval(arena, tail, want),
             Expr::If(cond, then, Some(otherwise)) => {
-                let (test, _) = self.const_eval(arena, cond, BOOL)?;
+                let (test, _) = self.const_typed(arena, cond, BOOL)?;
                 self.const_eval(arena, if test != 0 { then } else { otherwise }, want)
             }
             _ => bail!("constant blocks with statements and `if` with no `else` are not evaluated yet"),
@@ -429,7 +436,7 @@ impl Infer<'_, '_> {
     }
 
     /// The value of the macro call `path!` whose group opens at `open`, folded from the expression that the macro writes.
-    fn const_macro(&mut self, arena: &Body, (path, open): (PathId, u32), want: Int) -> Result<(u128, Int)> {
+    fn const_macro(&mut self, arena: &Body, (path, open): (PathId, u32), want: Option<Int>) -> Result<(u128, Option<Int>)> {
         let (segments, absolute, dollar) = self.segments(arena, path);
         let found = macro_path(&self.cx.paths(self.home.krate), &NamePath { segments: &segments, absolute, dollar }, self.home);
         let src = self.src;
@@ -440,63 +447,91 @@ impl Infer<'_, '_> {
         self.in_source(output, |infer| infer.const_eval(&inner, root, want))
     }
 
-    fn const_method(&mut self, arena: &Body, (receiver, name, params): (ExprId, u32, crate::body::List), want: Int) -> Result<(u128, Int)> {
+    fn const_method(&mut self, arena: &Body, (receiver, name, params): (ExprId, u32, crate::body::List), want: Option<Int>) -> Result<(u128, Option<Int>)> {
         let text = crate::names::plain(self.src.text(name));
         let Some(&(_, method)) = CONST_METHODS.iter().find(|(known, _)| *known == text) else { bail!("the method `{text}` is not evaluated in constants yet") };
         if method == ConstMethod::Len {
-            return Ok((self.const_len(arena, receiver)?, USIZE));
+            return Ok((self.const_len(arena, receiver)?, Some(USIZE)));
         }
-        let (x, int) = self.const_eval(arena, receiver, want)?;
+        let fallback = if method == ConstMethod::Pow { want.unwrap_or(I32) } else { I32 };
+        let (x, int) = self.const_defaulted(arena, receiver, fallback)?;
         let wanted = if method == ConstMethod::Pow { U32 } else { int };
         let mut args = Vec::new();
         for &arg in arena.list(params) {
-            args.push(self.const_eval(arena, ExprId(arg), wanted)?.0);
+            args.push(self.const_typed(arena, ExprId(arg), wanted)?.0);
         }
-        int_method(method, x, &args, int)
+        int_method(method, x, &args, int).map(|(value, ty)| (value, Some(ty)))
     }
 
-    fn const_unary(&mut self, arena: &Body, op: UnOp, inner: ExprId, want: Int) -> Result<(u128, Int)> {
-        let (value, int) = self.const_eval(arena, inner, want)?;
+    fn const_unary(&mut self, arena: &Body, op: UnOp, inner: ExprId, want: Option<Int>) -> Result<(u128, Option<Int>)> {
+        let (value, ty) = self.const_eval(arena, inner, want)?;
         let value = match op {
             UnOp::Neg => value.wrapping_neg(),
             UnOp::Not => !value,
             UnOp::Deref => bail!("a dereference in a constant"),
         };
-        Ok((value & mask(int.0), int))
+        let bits = ty.map_or(128, |(bits, _)| bits);
+        Ok((value & mask(bits), ty))
     }
 
-    fn const_cast(&mut self, arena: &Body, inner: ExprId, ty: TyId) -> Result<(u128, Int)> {
+    fn const_cast(&mut self, arena: &Body, inner: ExprId, ty: TyId) -> Result<(u128, Option<Int>)> {
         let target = self.lower_ty(arena, ty)?;
         let Kind::Prim(primitive) = *self.cx.types.kind(target) else { bail!("a cast to a type that is not an integer") };
         let Some(int) = int_info(primitive) else { bail!("a cast to a type that is not an integer") };
-        let (value, from) = self.const_eval(arena, inner, int)?;
-        Ok((convert(value, from, int), int))
+        let (value, from) = self.const_defaulted(arena, inner, I32)?;
+        Ok((convert(value, from, int), Some(int)))
     }
 
-    fn const_binary(&mut self, arena: &Body, op: BinOp, (lhs, rhs): (ExprId, ExprId), want: Int) -> Result<(u128, Int)> {
+    fn const_binary(&mut self, arena: &Body, op: BinOp, pair: (ExprId, ExprId), want: Option<Int>) -> Result<(u128, Option<Int>)> {
         if matches!(op, BinOp::And | BinOp::Or) {
-            let (x, _) = self.const_eval(arena, lhs, BOOL)?;
-            let decided = (x == 1) == (op == BinOp::Or);
-            return if decided { Ok((x, BOOL)) } else { Ok((self.const_eval(arena, rhs, BOOL)?.0, BOOL)) };
+            return self.const_logic(arena, op, pair);
         }
         if super::expr::is_compare(op) {
-            return self.const_compare(arena, op, (lhs, rhs));
+            return self.const_compare(arena, op, pair);
         }
-        let (mut x, mut int) = self.const_eval(arena, lhs, want)?;
-        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
-        let (y, other) = self.const_eval(arena, rhs, if shift { (32, false) } else { int })?;
-        if !shift && other != int && self.plain_int(arena, lhs) {
-            (x, int) = self.const_eval(arena, lhs, other)?;
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            return self.const_shift(arena, op, pair, want);
         }
-        Ok((fold(op, x, y, int)? & mask(int.0), int))
+        let (x, y, ty) = self.const_operands(arena, pair, want)?;
+        let int = ty.unwrap_or((128, false));
+        Ok((fold(op, x, y, int)? & mask(int.0), ty))
     }
 
-    fn const_compare(&mut self, arena: &Body, op: BinOp, (lhs, rhs): (ExprId, ExprId)) -> Result<(u128, Int)> {
-        let (mut x, mut int) = self.const_eval(arena, lhs, I32)?;
-        let (y, other) = self.const_eval(arena, rhs, int)?;
-        if other != int && self.plain_int(arena, lhs) {
-            (x, int) = self.const_eval(arena, lhs, other)?;
+    fn const_logic(&mut self, arena: &Body, op: BinOp, (lhs, rhs): (ExprId, ExprId)) -> Result<(u128, Option<Int>)> {
+        let (x, _) = self.const_typed(arena, lhs, BOOL)?;
+        if (x == 1) == (op == BinOp::Or) {
+            return Ok((x, Some(BOOL)));
         }
+        Ok((self.const_typed(arena, rhs, BOOL)?.0, Some(BOOL)))
+    }
+
+    fn const_shift(&mut self, arena: &Body, op: BinOp, (lhs, rhs): (ExprId, ExprId), want: Option<Int>) -> Result<(u128, Option<Int>)> {
+        let (x, lt) = self.const_eval(arena, lhs, want)?;
+        let (y, _) = self.const_defaulted(arena, rhs, I32)?;
+        let int = lt.unwrap_or((128, false));
+        Ok((fold(op, x, y, int)? & mask(int.0), lt))
+    }
+
+    fn const_operands(&mut self, arena: &Body, (lhs, rhs): (ExprId, ExprId), want: Option<Int>) -> Result<(u128, u128, Option<Int>)> {
+        let (mut x, lt) = self.const_eval(arena, lhs, None)?;
+        let (y, rt) = self.const_eval(arena, rhs, lt.or(want))?;
+        let ty = lt.or(rt).or(want);
+        if lt.is_none() && ty.is_some() {
+            (x, _) = self.const_eval(arena, lhs, ty)?;
+        }
+        Ok((x, y, ty))
+    }
+
+    fn const_compare(&mut self, arena: &Body, op: BinOp, (lhs, rhs): (ExprId, ExprId)) -> Result<(u128, Option<Int>)> {
+        let (mut x, mut y, ty) = self.const_operands(arena, (lhs, rhs), None)?;
+        let int = match ty {
+            Some(int) => int,
+            None => {
+                (x, _) = self.const_typed(arena, lhs, I32)?;
+                (y, _) = self.const_typed(arena, rhs, I32)?;
+                I32
+            }
+        };
         let order = if int.1 { signed(x, int.0).cmp(&signed(y, int.0)) } else { x.cmp(&y) };
         let holds = match op {
             BinOp::Eq => order.is_eq(),
@@ -506,16 +541,24 @@ impl Infer<'_, '_> {
             BinOp::Gt => order.is_gt(),
             _ => order.is_ge(),
         };
-        Ok((u128::from(holds), BOOL))
+        Ok((u128::from(holds), Some(BOOL)))
     }
 
-    fn const_name(&mut self, arena: &Body, (expr, path): (ExprId, PathId), want: Int) -> Result<(u128, Int)> {
-        if let Some(value) = self.const_arg_named(arena, path) {
-            return Ok(value);
+    fn const_name(&mut self, arena: &Body, (expr, path): (ExprId, PathId), want: Option<Int>) -> Result<(u128, Option<Int>)> {
+        if let Some((value, int)) = self.const_arg_named(arena, path) {
+            return Ok((value, Some(int)));
         }
-        let Some(param) = self.named_param(arena, expr) else { return self.const_path(arena, path) };
+        let Some(param) = self.named_param(arena, expr) else {
+            let (value, int) = self.const_path(arena, path)?;
+            return Ok((value, Some(int)));
+        };
+        let declared = match self.param_name(arena, expr) {
+            Some(name) => self.const_param(name)?.and_then(|(ty, _)| self.int_of(ty)),
+            None => None,
+        };
+        let ty = declared.or(want);
         match *self.cx.types.kind(self.resolve(param)) {
-            Kind::Value(bits) => Ok((bits, want)),
+            Kind::Value(bits) => Ok((ty.map_or(bits, |(w, _)| bits & mask(w)), ty)),
             _ => bail!("a const parameter whose value is not known yet"),
         }
     }
@@ -552,25 +595,26 @@ impl Infer<'_, '_> {
         unqualified.then(|| self.const_args.iter().rev().find(|(bound, _)| bound == name).map(|(_, value)| *value)).flatten()
     }
 
-    fn const_call(&mut self, arena: &Body, (callee, args): (ExprId, crate::body::List), want: Int) -> Result<(u128, Int)> {
+    fn const_call(&mut self, arena: &Body, (callee, args): (ExprId, crate::body::List), want: Option<Int>) -> Result<(u128, Option<Int>)> {
         let Expr::Path(path) = *arena.expr(callee) else { bail!("a constant call of something that is not a path") };
         let (item, substs) = self.const_target(arena, path)?;
         let params = match self.cx.intrinsic(item) {
             Some(_) => vec![want; arena.list(args).len()],
-            None => self.const_params(item, &substs, want)?,
+            None => self.const_params(item, &substs)?,
         };
         let mut values = Vec::new();
         for (&arg, &param) in arena.list(args).iter().zip(&params) {
-            let (value, from) = self.const_eval(arena, ExprId(arg), param)?;
-            values.push((convert(value, from, param), param));
+            let int = param.or(want).unwrap_or(I32);
+            let (value, from) = self.const_defaulted(arena, ExprId(arg), int)?;
+            values.push((convert(value, from, int), int));
         }
         let layout_of = |infer: &mut Self| match substs.first() {
             Some(&ty) => infer.cx.layout(ty),
             None => bail!("a layout intrinsic with no type"),
         };
         match self.cx.intrinsic(item) {
-            Some(Intrinsic::SizeOf) => Ok((u128::from(layout_of(self)?.size.bytes()), USIZE)),
-            Some(Intrinsic::AlignOf) => Ok((u128::from(layout_of(self)?.align.abi.bytes()), USIZE)),
+            Some(Intrinsic::SizeOf) => Ok((u128::from(layout_of(self)?.size.bytes()), Some(USIZE))),
+            Some(Intrinsic::AlignOf) => Ok((u128::from(layout_of(self)?.align.abi.bytes()), Some(USIZE))),
             Some(other) => bail!("the intrinsic {other:?} in a constant is not evaluated yet"),
             None => self.const_body(item, &substs, (&values, want)),
         }
@@ -587,20 +631,29 @@ impl Infer<'_, '_> {
     }
 
     /// The value of the const fn or constant `item` at `substs`, with its parameters bound to `values`.
-    fn const_body(&mut self, item: ItemRef, substs: &[Ty], (values, want): (&[(u128, Int)], Int)) -> Result<(u128, Int)> {
+    fn const_body(&mut self, item: ItemRef, substs: &[Ty], (values, want): (&[(u128, Int)], Option<Int>)) -> Result<(u128, Option<Int>)> {
         let sig = self.cx.signature(item)?;
         if sig.params.len() != values.len() {
             bail!("a constant call of {} with {} arguments", self.cx.name(item), values.len());
         }
         self.with_const_body(item, substs, |infer, body, root| {
+            let ret = match sig.ret {
+                Some(ty) => {
+                    let lowered = infer.lower_ty(&sig.body, ty)?;
+                    infer.int_of(lowered)
+                }
+                None => None,
+            };
             let mark = infer.const_args.len();
             for (&(pat, _), &value) in sig.params.iter().zip(values) {
                 let crate::body::Pat::Bind { name, sub: None, .. } = *sig.body.pat(pat) else { bail!("a const fn parameter that is not a plain name") };
                 infer.const_args.push((crate::names::plain(infer.src.text(name)).to_owned(), value));
             }
-            let result = infer.const_eval(body, root, want);
+            let result = infer.const_eval(body, root, ret.or(want));
             infer.const_args.truncate(mark);
-            result
+            let (value, ty) = result?;
+            let out = ret.or(ty);
+            Ok((out.map_or(value, |(bits, _)| value & mask(bits)), out))
         })
     }
 
@@ -608,8 +661,9 @@ impl Infer<'_, '_> {
         Ok(match *arena.expr(expr) {
             Expr::Lit(Lit::Str | Lit::ByteStr, at) => crate::body::literal::string_bytes(self.src.text(at))?.len() as u128,
             Expr::Array(items) => arena.list(items).len() as u128,
-            Expr::Repeat(_, count) => self.const_eval(arena, count, USIZE)?.0,
+            Expr::Repeat(_, count) => self.const_typed(arena, count, USIZE)?.0,
             Expr::Paren(inner) | Expr::Ref { expr: inner, .. } => self.const_len(arena, inner)?,
+            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.const_len(arena, tail)?,
             Expr::Path(path) => self.const_len_path(arena, path)?,
             ref other => bail!("the length of {other:?} in a constant"),
         })

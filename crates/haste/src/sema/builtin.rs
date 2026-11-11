@@ -93,7 +93,7 @@ pub fn crate_path(out: &mut Tokens, krate: u32, rest: &str) {
 pub fn assert(src: &Source, args: &[(u32, u32)], krate: u32, out: &mut Tokens) {
     let Some(&(from, to)) = args.first() else { return };
     out.lexed("if ! (");
-    (from..to).for_each(|at| out.copy(src, at));
+    out.copy_range(src, from, to);
     out.lexed(") {");
     match args.get(1) {
         None => {
@@ -103,7 +103,7 @@ pub fn assert(src: &Source, args: &[(u32, u32)], krate: u32, out: &mut Tokens) {
         Some(&(rest, _)) => {
             crate_path(out, krate, "::panic::panic_2021!");
             out.lexed("(");
-            (rest..args.last().map_or(rest, |last| last.1)).for_each(|at| out.copy(src, at));
+            out.copy_range(src, rest, args.last().map_or(rest, |last| last.1));
             out.lexed(")");
         }
     }

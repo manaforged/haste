@@ -150,6 +150,13 @@ impl Cache {
         }
     }
 
+    /// Drops what the store keeps about what `edited` holds and returns the indexes of the instances in `list` that it touched.
+    pub fn invalidate<'l>(&mut self, outline: &Outline, list: impl Iterator<Item = &'l reach::Instance>, edited: Edited<'_>) -> Vec<usize> {
+        let touched = self.touched(list, edited);
+        self.forget(outline, edited);
+        touched
+    }
+
     /// The indexes of the instances in `list` that are functions `edited` holds or take a type that names one of its items.
     pub fn touched<'l>(&self, list: impl Iterator<Item = &'l reach::Instance>, edited: Edited<'_>) -> Vec<usize> {
         let mine = |item: ItemRef| edited.holds(item.krate, item.file);

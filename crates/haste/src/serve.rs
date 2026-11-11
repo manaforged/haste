@@ -20,10 +20,15 @@ struct Served<'a> {
 
 impl Served<'_> {
     fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, Stamp)> {
+        let top = graph::workspace_root(root).unwrap_or_else(|_| root.to_owned());
+        let head = [top.join("Cargo.lock"), top.join("Cargo.toml"), root.join("Cargo.toml")];
         let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| {
             std::iter::once(package.manifest.dir.join("Cargo.toml")).chain(package.manifest.build.clone())
         });
-        std::iter::once(root.join("Cargo.lock")).chain(local).map(|path| {
+        let mut paths: Vec<PathBuf> = head.into_iter().chain(local).collect();
+        paths.sort();
+        paths.dedup();
+        paths.into_iter().map(|path| {
             let now = stamp(&path);
             (path, now)
         }).collect()
@@ -91,11 +96,44 @@ fn address(root: &std::path::Path) -> (libc::sockaddr_un, libc::socklen_t) {
 
 fn socket() -> Result<RawFd> {
     // SAFETY: socket takes plain integers and returns a new descriptor or -1.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
         bail!("socket: {}", std::io::Error::last_os_error());
     }
-    crate::image::close_on_exec(fd)
+    if raw >= 3 {
+        return crate::image::close_on_exec(raw);
+    }
+    // SAFETY: raw is a valid descriptor below 3; F_DUPFD_CLOEXEC duplicates it at >= 3 and close releases raw.
+    let moved = unsafe {
+        let duped = libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3);
+        libc::close(raw);
+        duped
+    };
+    if moved < 0 {
+        bail!("fcntl: {}", std::io::Error::last_os_error());
+    }
+    Ok(moved)
+}
+
+fn client_stdio() -> Result<([RawFd; 3], Vec<RawFd>)> {
+    let mut passed = STDIO;
+    let mut opened = Vec::new();
+    for (slot, &fd) in passed.iter_mut().zip(&STDIO) {
+        // SAFETY: fcntl with F_GETFD inspects whether fd is open in this process without side effects.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
+            continue;
+        }
+        let flags = (if fd == 0 { libc::O_RDONLY } else { libc::O_WRONLY }) | libc::O_CLOEXEC;
+        // SAFETY: c"/dev/null" is a static NUL-terminated path, and flags takes no mode argument.
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), flags) };
+        if null < 0 {
+            close_all(&opened);
+            bail!("open /dev/null: {}", std::io::Error::last_os_error());
+        }
+        *slot = null;
+        opened.push(null);
+    }
+    Ok((passed, opened))
 }
 
 /// A socket connected to the server of `root`, or none when no server answers.
@@ -116,7 +154,10 @@ pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<
     // SAFETY: fd is a connected socket that this File owns from here on.
     let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
     std::io::stdout().flush()?;
-    send(fd, request.byte(), &STDIO)?;
+    let (stdio, opened) = client_stdio()?;
+    let sent = send(fd, request.byte(), &stdio);
+    close_all(&opened);
+    sent?;
     write_args(&mut conn, args)?;
     let mut status = [0; 4];
     conn.read_exact(&mut status)?;
@@ -146,7 +187,7 @@ pub fn serve(workspace: &mut graph::Workspace, targets: &Targets, root: &std::pa
             },
             Err(_) => 1,
         };
-        let _ = conn.write_all(&status.to_le_bytes());
+        drop(conn.write_all(&status.to_le_bytes()));
     }
 }
 
@@ -213,7 +254,7 @@ fn answer(build: &mut Option<Build>, served: &mut Served<'_>, request: Option<(R
         Err(anyhow::anyhow!("the request panicked; the next request loads the workspace again"))
     });
     if let Err(error) = &done {
-        let _ = writeln!(std::io::stderr(), "error: {error:#}");
+        drop(writeln!(std::io::stderr(), "error: {error:#}"));
     }
     restore(saved, fds);
     done.unwrap_or(1)
@@ -238,25 +279,30 @@ pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, args): 
 }
 
 fn redirect(client: [RawFd; 3]) -> [RawFd; 3] {
-    // SAFETY: dup and dup2 take descriptors this process holds; 0, 1 and 2 stay open throughout.
+    // SAFETY: fcntl and dup2 take descriptors this process holds; 0, 1 and 2 stay open throughout.
     STDIO.map(|own| unsafe {
-        let saved = libc::dup(own);
+        let saved = libc::fcntl(own, libc::F_DUPFD_CLOEXEC, 3);
         libc::dup2(client[own as usize], own);
         saved
     })
 }
 
 fn restore(saved: [RawFd; 3], received: &[RawFd]) {
-    let _ = (std::io::stdout().flush(), std::io::stderr().flush());
+    drop(std::io::stdout().flush());
+    drop(std::io::stderr().flush());
     // SAFETY: saved holds the duplicates of this process's own standard descriptors.
-    STDIO.iter().zip(saved).for_each(|(&own, kept)| _ = unsafe { libc::dup2(kept, own) });
+    for (&own, kept) in STDIO.iter().zip(saved) {
+        unsafe { libc::dup2(kept, own); }
+    }
     close_all(&saved);
     close_all(received);
 }
 
 fn close_all(fds: &[RawFd]) {
     // SAFETY: fds are descriptors this process owns and nothing else uses after this call.
-    fds.iter().for_each(|&fd| _ = unsafe { libc::close(fd) });
+    for &fd in fds {
+        unsafe { libc::close(fd); }
+    }
 }
 
 /// Returns `build` brought up to date with the member files, or a build from nothing when there is none or the refresh fails, so a failed refresh never leaves a half-updated build behind.

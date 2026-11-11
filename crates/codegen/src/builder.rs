@@ -41,7 +41,7 @@ impl<'f> FunctionBuilder<'f> {
 
     /// Adds a parameter of type `ty` to `block`.
     pub fn append_block_param(&mut self, block: Block, ty: Type) -> Value {
-        let value = new_value(self.func, ty);
+        let value = self.func.value(ty);
         self.func.blocks[block.index()].params.push(value);
         value
     }
@@ -106,7 +106,7 @@ impl<'f> FunctionBuilder<'f> {
 
     /// Copies `callee` into the function as if the current block called it with `args`, then continues in a new block whose parameters are its results.
     pub fn inline(&mut self, callee: &Function, args: &[Value]) -> Vec<Value> {
-        let values: Vec<Value> = callee.types.iter().map(|ty| new_value(self.func, *ty)).collect();
+        let values: Vec<Value> = callee.types.iter().map(|ty| self.func.value(*ty)).collect();
         let blocks: Vec<Block> = callee.blocks.iter().map(|_| self.create_block()).collect();
         let after = self.create_block();
         let results: Vec<Value> = callee.signature.returns.iter().map(|ret| self.append_block_param(after, ret.value_type)).collect();
@@ -182,11 +182,6 @@ impl Remap {
     }
 }
 
-fn new_value(func: &mut Function, ty: Type) -> Value {
-    func.types.push(ty);
-    Value(func.types.len() as u32 - 1)
-}
-
 /// Appends one instruction to a block.
 pub struct Ins<'b> {
     func: &'b mut Function,
@@ -196,7 +191,7 @@ pub struct Ins<'b> {
 
 impl Ins<'_> {
     fn push(&mut self, op: Op, ty: Option<Type>) -> (Inst, Option<Value>) {
-        let result = ty.map(|ty| new_value(self.func, ty));
+        let result = ty.map(|ty| self.func.value(ty));
         self.func.insts.push(InstData { op, result });
         let inst = Inst(self.func.insts.len() as u32 - 1);
         self.func.blocks[self.block.index()].insts.push(inst);
@@ -621,7 +616,7 @@ impl Ins<'_> {
     /// Calls the code at `callee` with `args`.
     pub fn call_indirect(mut self, sig: SigRef, callee: Value, args: &[Value]) -> Inst {
         let returns: Vec<Type> = self.func.sigs[sig.index()].returns.iter().map(|param| param.value_type).collect();
-        let results = returns.into_iter().map(|ty| new_value(self.func, ty)).collect();
+        let results = returns.into_iter().map(|ty| self.func.value(ty)).collect();
         self.effect(Op::Call { sig, callee, args: args.to_vec(), results })
     }
 

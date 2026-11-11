@@ -13,7 +13,7 @@ use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
 use crate::sema::{self, Edited, Cache};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::cli::{Failures, case_items, error_kind, is_member, print_failures};
+use crate::cli::{Failures, case_items, error_kind, print_failures};
 
 const INPUTS: [i64; 5] = [-5, 0, 1, 3, 20];
 
@@ -74,7 +74,7 @@ fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, pick: P
 
 /// The `main` of the first member binary.
 fn main_item(workspace: &graph::Workspace, outline: &outline::Outline) -> Option<ItemRef> {
-    let krate = outline.roots.iter().position(|root| root.role == outline::Role::Bin && is_member(workspace, root))?;
+    let krate = outline.members(workspace).find(|&krate| outline.roots[krate].role == outline::Role::Bin)?;
     outline.main(krate)
 }
 
@@ -83,7 +83,7 @@ fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<I
 }
 
 fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reached): (&mut sema::Context<'_>, &Reached), fresh: &[usize]) {
-    fresh.iter().for_each(|at| _ = broken.remove(at));
+    fresh.iter().for_each(|at| drop(broken.remove(at)));
     broken.extend(image.compile(cx, reached, fresh));
 }
 
@@ -101,8 +101,7 @@ impl Batch {
 
     fn again(&mut self, compilation: &Compilation, stale: &[(u32, u32)]) -> bool {
         let Some(mut store) = self.store.take() else { return false };
-        let touched = store.touched(self.reached.list.iter().map(|(instance, _)| instance), Edited::Files(stale));
-        store.forget(&compilation.outline, Edited::Files(stale));
+        let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Files(stale));
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
         let fresh = reach_again(&mut cx, &mut self.reached, &touched);
         if !cx.resolved() {
@@ -115,8 +114,7 @@ impl Batch {
 
     fn reload(&mut self, workspace: &graph::Workspace, compilation: &Compilation, crates: &[u32]) -> bool {
         let Some(mut store) = self.store.take() else { return false };
-        let touched = store.touched(self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(crates));
-        store.forget(&compilation.outline, Edited::Crates(crates));
+        let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(crates));
         let (cases, roots) = batch_roots(workspace, &compilation.outline, self.pick);
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
         let fresh = reach_anew(&mut cx, &mut self.reached, &touched, &roots);
@@ -204,7 +202,7 @@ impl Build {
             }
             watch.stamp = now;
             let edit = match &watch.by {
-                Some(by) => self.compilation.outline.reexpand(by).map(Edit::Bodies),
+                Some(by) => self.compilation.outline.reexpand(by),
                 None => self.compilation.outline.reread(&watch.path),
             };
             match edit {

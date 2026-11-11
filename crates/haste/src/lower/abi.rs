@@ -1,5 +1,3 @@
-use std::sync::OnceLock;
-
 use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, CallConv, Signature, Type, Value};
 use rustc_abi::{BackendRepr, Float, Primitive, Scalar, TargetDataLayout};
@@ -14,16 +12,6 @@ use super::{Lower, Parts, Repr, repr};
 /// The machine values that a value of one type travels as in the platform convention, each with its byte offset inside the value.
 type Passed = Vec<(Type, i32)>;
 
-/// The host's data layout, parsed once.
-pub(super) fn host() -> Result<&'static TargetDataLayout> {
-    static HOST: OnceLock<TargetDataLayout> = OnceLock::new();
-    if let Some(dl) = HOST.get() {
-        return Ok(dl);
-    }
-    let dl = target()?;
-    Ok(HOST.get_or_init(|| dl))
-}
-
 pub(super) fn scalar_type(dl: &TargetDataLayout, scalar: &Scalar) -> Result<Type> {
     match scalar.primitive() {
         Primitive::Float(Float::F32) => Ok(Type::F32),
@@ -35,7 +23,7 @@ pub(super) fn scalar_type(dl: &TargetDataLayout, scalar: &Scalar) -> Result<Type
 
 /// The one or two scalars that `layout` names, each with its byte offset, or `Bytes` when it names none.
 pub(super) fn parts(layout: &Layout) -> Result<Parts> {
-    let dl = host()?;
+    let dl = target()?;
     Ok(match &layout.backend_repr {
         BackendRepr::Scalar(scalar) => Parts::One(scalar_type(dl, scalar)?),
         BackendRepr::ScalarPair(first, second) => {

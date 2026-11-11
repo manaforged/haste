@@ -229,14 +229,15 @@ impl Outline {
 
     /// Reads crate `krate` and every crate that depends on it again from their roots after files of `krate` changed outside function bodies, and returns those crates.
     pub fn reload(&mut self, krate: usize) -> Result<Vec<usize>> {
-        let crates = self.dependents(krate);
+        let mut seen = vec![false; self.deps.len()];
+        let crates = dependents_of(&self.users(), &mut seen, [krate]);
         let paths: Vec<PathBuf> = crates.iter().flat_map(|&at| self.crates[at].files.iter().map(|file| file.source.path.clone())).collect();
         self.cache.forget(&paths);
         for &at in &crates {
             let env = std::mem::take(&mut self.crates[at].env);
             self.crates[at] = Crate { env, modules: vec![root_module(&self.roots[at].path)], ..Crate::default() };
         }
-        self.procs.retain(|(run, _), _| !crates.contains(&(run.krate as usize)));
+        self.procs.retain(|(run, _), _| !seen[run.krate as usize]);
         crates.iter().try_for_each(|&at| self.load_crate(at))?;
         Ok(crates)
     }
@@ -293,6 +294,11 @@ impl Outline {
     pub fn dependents(&self, krate: usize) -> Vec<usize> {
         let mut seen = vec![false; self.deps.len()];
         dependents_of(&self.users(), &mut seen, [krate])
+    }
+
+    /// The crates whose package is a member of `workspace`.
+    pub fn members<'o>(&'o self, workspace: &'o Workspace) -> impl Iterator<Item = usize> + 'o {
+        (0..self.roots.len()).filter(|&krate| workspace.graph.members.contains(&workspace.graph.units[self.roots[krate].unit].package))
     }
 
     /// The package that crate `krate` belongs to.
