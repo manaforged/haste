@@ -2,7 +2,8 @@ use super::asm::{Alu, Cond, Count, Group3, Reg, Shift, Size};
 use super::{Emit, Ext};
 use crate::ir::{Binary, Convert, IntCC, Type, Unary, Value};
 
-const REVERSE_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
+/// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
+const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
 
 pub(super) fn cond(cc: IntCC) -> Cond {
     match cc {
@@ -60,7 +61,7 @@ impl Emit<'_> {
             }
             Unary::Clz => {
                 self.get(Reg::Rax, x, Ext::Zero);
-                self.asm.count(Count::Lzcnt, Reg::Rax, Reg::Rax);
+                self.count(Count::Lzcnt, Reg::Rax, Reg::Rax);
                 if bits < 64 {
                     self.asm.alu_imm(Alu::Sub, Reg::Rax, i32::from(64 - bits));
                 }
@@ -70,11 +71,11 @@ impl Emit<'_> {
                 if bits < 64 {
                     self.asm.bts(Reg::Rax, bits);
                 }
-                self.asm.count(Count::Tzcnt, Reg::Rax, Reg::Rax);
+                self.count(Count::Tzcnt, Reg::Rax, Reg::Rax);
             }
             Unary::Popcnt => {
                 self.get(Reg::Rax, x, Ext::Zero);
-                self.asm.count(Count::Popcnt, Reg::Rax, Reg::Rax);
+                self.count(Count::Popcnt, Reg::Rax, Reg::Rax);
             }
             other => return Err(format!("{other:?} of an integer")),
         }
@@ -91,9 +92,51 @@ impl Emit<'_> {
         }
     }
 
+    /// `op` of the 64 bits of `src` into `dst`, with 64 leading or trailing zeros for zero; without the host instruction it uses r11 and rsi, where no value lives.
+    pub(super) fn count(&mut self, op: Count, dst: Reg, src: Reg) {
+        let fast = match op {
+            Count::Lzcnt => self.features.lzcnt,
+            Count::Tzcnt => self.features.bmi1,
+            Count::Popcnt => self.features.popcnt,
+        };
+        if fast {
+            return self.asm.count(op, dst, src);
+        }
+        let reverse = match op {
+            Count::Popcnt => return self.popcount(dst, src),
+            Count::Lzcnt => true,
+            Count::Tzcnt => false,
+        };
+        self.asm.bit_scan(reverse, dst, src);
+        self.asm.mov_imm(Reg::R11, if reverse { 127 } else { 64 });
+        self.asm.cmov(Cond::E, dst, Reg::R11);
+        if reverse {
+            self.asm.alu_imm(Alu::Xor, dst, 63);
+        }
+    }
+
+    /// Counts the set bits of `src` into `dst` by summing ever wider fields, using r11 and rsi.
+    fn popcount(&mut self, dst: Reg, src: Reg) {
+        let (part, mask) = (Reg::R11, Reg::Rsi);
+        if dst != src {
+            self.asm.mov(dst, src);
+        }
+        for (bits, shift) in BIT_STEPS {
+            self.asm.mov_imm(mask, bits as i64);
+            self.asm.mov(part, dst);
+            self.asm.shift_imm(Size::Q, Shift::Shr, part, shift);
+            self.asm.alu(Alu::And, part, mask);
+            self.asm.alu(Alu::And, dst, mask);
+            self.asm.alu(Alu::Add, dst, part);
+        }
+        self.asm.mov_imm(mask, 0x0101_0101_0101_0101);
+        self.asm.imul(dst, mask);
+        self.asm.shift_imm(Size::Q, Shift::Shr, dst, 56);
+    }
+
     /// Reverses the 64 bits of rax in place, using rcx and rdx.
     pub(super) fn reverse_bits(&mut self) {
-        for (mask, shift) in REVERSE_STEPS {
+        for (mask, shift) in BIT_STEPS {
             self.asm.mov_imm(Reg::Rcx, mask as i64);
             self.asm.mov(Reg::Rdx, Reg::Rax);
             self.asm.shift_imm(Size::Q, Shift::Shr, Reg::Rdx, shift);

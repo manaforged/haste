@@ -7,6 +7,12 @@ const X1: Xmm = Xmm(1);
 const X2: Xmm = Xmm(2);
 const TWO_63: i64 = 0x43E0_0000_0000_0000;
 const TWO_64: i64 = 0x43F0_0000_0000_0000;
+/// The bits of 2^52, the least magnitude at which every f64 is whole.
+const F64_WHOLE: i64 = 0x4330_0000_0000_0000;
+/// The bits of 2^23, the least magnitude at which every f32 is whole.
+const F32_WHOLE: i64 = 0x4B00_0000;
+const F64_ONE: i64 = 0x3FF0_0000_0000_0000;
+const F32_ONE: i64 = 0x3F80_0000;
 
 /// The float registers planning hands out: past xmm0-xmm2, which conversions use as scratch and calls return in.
 pub(super) const POOL: [u8; 13] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
@@ -53,14 +59,50 @@ impl Emit<'_> {
         self.fget(dst, x);
         match mode {
             None => self.asm.sse(&[scalar(ty)], &[0x0F, 0x51], dst.0, dst),
-            Some(mode) => {
+            Some(mode) if self.features.sse41 => {
                 let opcode = if ty == Type::F64 { 0x0B } else { 0x0A };
                 self.asm.sse(&[0x66], &[0x0F, 0x3A, opcode], dst.0, dst);
                 self.asm.bytes(&[mode]);
             }
+            Some(_) => self.round_baseline(op, ty, dst),
         }
         self.fput(result, dst);
         Ok(())
+    }
+
+    /// Rounds the float in `dst` by `op` without SSE4.1: through a 64-bit integer below the magnitude where every float is whole, then the sign of the input, using rax, rcx, rdx, xmm1 and xmm2.
+    fn round_baseline(&mut self, op: Unary, ty: Type, dst: Xmm) {
+        let (size, whole, one) = if ty == Type::F64 { (Size::Q, F64_WHOLE, F64_ONE) } else { (Size::D, F32_WHOLE, F32_ONE) };
+        let done = self.asm.label();
+        self.asm.movq_out(Reg::Rax, dst);
+        self.asm.mov(Reg::Rcx, Reg::Rax);
+        self.asm.shift_imm(size, Shift::Shl, Reg::Rcx, 1);
+        self.asm.mov_imm(Reg::Rdx, whole << 1);
+        self.asm.alu_sized(size, Alu::Cmp, Reg::Rcx, Reg::Rdx);
+        self.asm.jcc(Cond::Ae, done);
+        self.asm.sse_wide(scalar(ty), 0x2C, Reg::Rcx as u8, dst);
+        self.asm.sse_wide(scalar(ty), 0x2A, X1.0, Reg::Rcx);
+        if op != Unary::Trunc {
+            self.step(op == Unary::Floor, ty, dst, one);
+        }
+        self.asm.movq_out(Reg::Rcx, X1);
+        self.asm.mov_imm(Reg::Rdx, sign(ty));
+        self.asm.alu_sized(size, Alu::And, Reg::Rax, Reg::Rdx);
+        self.asm.alu_sized(size, Alu::Or, Reg::Rcx, Reg::Rax);
+        self.asm.movq_in(dst, Reg::Rcx);
+        self.asm.bind(done);
+    }
+
+    /// Moves the truncated xmm1 one down for a floor, or up for a ceiling, when truncating `x` moved it the other way; `one` holds the bits of 1.0.
+    fn step(&mut self, down: bool, ty: Type, x: Xmm, one: i64) {
+        let skip = self.asm.label();
+        let (above, below, opcode) = if down { (X1, x, 0x5C) } else { (x, X1, 0x58) };
+        self.ucomi(ty, above, below);
+        self.asm.jcc(Cond::Be, skip);
+        self.asm.mov_imm(Reg::Rdx, one);
+        self.asm.movq_in(X2, Reg::Rdx);
+        self.asm.sse(&[scalar(ty)], &[0x0F, opcode], X1.0, X2);
+        self.asm.bind(skip);
     }
 
     pub(super) fn float_binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {

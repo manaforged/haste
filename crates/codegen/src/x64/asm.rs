@@ -390,6 +390,12 @@ impl Asm {
         self.encode(&[0xF3], true, &[0x0F, op as u8], dst as u8, src.into(), false);
     }
 
+    /// `bsr` when `reverse`, else `bsf`: the opcodes of lzcnt and tzcnt without the F3 prefix; a zero `src` sets ZF and leaves `dst` undefined.
+    pub fn bit_scan(&mut self, reverse: bool, dst: Reg, src: Reg) {
+        let op = if reverse { Count::Lzcnt } else { Count::Tzcnt };
+        self.encode(&[], true, &[0x0F, op as u8], dst as u8, src.into(), false);
+    }
+
     pub fn lea(&mut self, dst: Reg, src: Mem) {
         self.encode(&[], true, &[0x8D], dst as u8, src.into(), false);
     }
