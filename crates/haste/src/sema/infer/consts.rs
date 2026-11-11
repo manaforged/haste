@@ -1,9 +1,10 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::body::{BinOp, Body, Expr, ExprId, Lit, PathId, TyId, UnOp};
 use crate::names::{Def, ItemRef, Primitive, Sym};
 use crate::outline::item::ItemKind;
 
+use super::super::evaluate;
 use super::super::ty::{Kind, Ty, int_info, mask};
 use super::super::intrinsic::Intrinsic;
 use super::{Infer, Res};
@@ -132,17 +133,27 @@ fn fold_unsigned(op: BinOp, x: u128, y: u128) -> u128 {
 }
 
 impl Infer<'_, '_> {
-    /// The value of the integer or bool constant item `item`, as the bits of its type.
+    /// The value of the integer or bool constant item `item`, as the bits of its type: folded from its syntax, or else from running its body.
     pub(super) fn const_value(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(u128, Int)> {
         let sig = self.cx.signature(item)?;
         let Some(ret) = sig.ret else { bail!("constant {} has no type", self.cx.name(item)) };
-        self.with_const_body(item, substs, |infer, body, root| {
+        let mut width = None;
+        let folded = self.with_const_body(item, substs, |infer, body, root| {
             let ty = infer.lower_ty(&sig.body, ret)?;
             let Kind::Prim(primitive) = *infer.cx.types.kind(ty) else { bail!("constant of a type that is not an integer") };
             let Some(int) = int_info(primitive).or((primitive == Primitive::Bool).then_some(BOOL)) else { bail!("constant of a type that is not an integer") };
+            width = Some(int);
             let (value, _) = infer.const_eval(body, root, int)?;
             Ok((value & mask(int.0), int))
-        })
+        });
+        match (folded, width) {
+            (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => {
+                let ran = evaluate::run(self.cx, &(item, substs.to_vec()), int.0);
+                let value = ran.map_err(|reason| anyhow!("{error:#}; running {}: {reason:#}", self.cx.name(item)))?;
+                Ok((value & mask(int.0), int))
+            }
+            (found, _) => found,
+        }
     }
 
     /// Runs `run` on the body and value expression of the constant or const fn `item` at `substs`, with names read as that body reads them.
@@ -221,7 +232,7 @@ impl Infer<'_, '_> {
         let (Err(error), &crate::body::Ty::Path(path)) = (&lowered, arena.ty(ty)) else { return lowered };
         match self.const_path(arena, path) {
             Ok((value, (bits, _))) => Ok(self.cx.types.intern(Kind::Value(value & mask(bits)))),
-            Err(_) => bail!("{error:#}"),
+            Err(reason) => bail!("{error:#}; as a constant: {reason:#}"),
         }
     }
 

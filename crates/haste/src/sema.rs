@@ -3,6 +3,7 @@
 pub mod adt;
 mod body_scope;
 mod builtin;
+pub mod evaluate;
 mod expand;
 mod format;
 pub mod impls;
@@ -208,6 +209,7 @@ pub struct Context<'a> {
     trait_members: std::cell::RefCell<HashMap<ItemRef, Rc<HashMap<&'a str, ItemRef>>>>,
     impl_members: std::cell::RefCell<HashMap<impls::ImplRef, Rc<HashMap<&'a str, ItemRef>>>>,
     aliases: std::cell::RefCell<HashMap<ItemRef, Rc<Alias>>>,
+    evaluated: evaluate::Evaluated,
 }
 
 /// A parsed type alias: its type parameters, its generics and where clause, and its target type.
@@ -229,7 +231,7 @@ impl<'a> Context<'a> {
     pub fn new(outline: &'a Outline, names: &'a Names, mut store: Cache) -> Context<'a> {
         let types = std::mem::take(&mut store.types);
         let (kids, trait_members, impl_members, aliases, asks) = Default::default();
-        Context { outline, names, types, asks, store, kids, trait_members, impl_members, aliases }
+        Context { outline, names, types, asks, store, kids, trait_members, impl_members, aliases, evaluated: evaluate::Evaluated::default() }
     }
 
     /// Whether no lookup in this pass asked for anything to load or resolve, so another pass would find the same.

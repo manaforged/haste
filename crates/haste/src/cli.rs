@@ -303,6 +303,7 @@ fn tune_malloc() {
 /// Runs the haste command line.
 pub fn main() -> Result<()> {
     tune_malloc();
+    crate::sema::evaluate::install(crate::image::evaluator);
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     take_jobs(&mut args)?;
     let mut args = args.into_iter();

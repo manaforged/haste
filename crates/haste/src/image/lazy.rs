@@ -12,6 +12,7 @@ use crate::names::ItemRef;
 use crate::names::path::Requests;
 use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
 use crate::outline::Outline;
+use crate::sema::evaluate::Evaluate;
 use crate::sema::{Answer, Context, Cache, Edited};
 
 use super::{CODE_BYTES, Image, TABLE_SLOTS, host_symbol, stub, wait};
@@ -136,6 +137,73 @@ impl Driver for Run<'_> {
     }
 }
 
+/// The CPU time, in seconds, that running one constant item may take before its child is stopped.
+const EVALUATION_SECONDS: libc::time_t = 10;
+
+/// The one child that runs a constant item, and how it ended.
+struct Once(Option<Ended>);
+
+impl Driver for Once {
+    fn start(&mut self, _: &mut Jit) -> Result<()> {
+        Ok(())
+    }
+
+    fn ended(&mut self, _: usize, ended: Ended) -> Result<()> {
+        self.0 = Some(ended);
+        Ok(())
+    }
+}
+
+/// Makes the runner of constant items that the type checker installs: a demand of its own, whose functions compile on their first call.
+pub fn evaluator() -> Result<Box<dyn Evaluate>> {
+    Ok(Box::new(Jit::new(Cache::default())?))
+}
+
+impl Evaluate for Jit {
+    fn evaluate(&mut self, cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128> {
+        let (entry, wide) = (self.declare(instance.clone()), bits > 64);
+        let mut once = Once(None);
+        self.strict = false;
+        let ran = self.fork(true, |image, out| image.evaluate_in_child(entry, wide, out)).and_then(|_| self.pump(cx, &mut once, None));
+        self.strict = true;
+        self.kill_children();
+        if ran?.is_some() {
+            bail!("running it needs names that are not loaded yet");
+        }
+        value_of(once.0)
+    }
+}
+
+/// The value that the child running a constant wrote, or why it wrote none.
+fn value_of(ended: Option<Ended>) -> Result<u128> {
+    match ended {
+        Some(Ended { failure: Some((error, _)), .. }) => bail!("{error}"),
+        Some(Ended { status: 0, bytes, .. }) => Ok(u128::from_le_bytes(<[u8; 16]>::try_from(bytes).map_err(|_| anyhow!("it gave no value"))?)),
+        Some(Ended { status, .. }) if status == 128 + libc::SIGVTALRM => bail!("it ran for more than {EVALUATION_SECONDS} s of CPU time"),
+        Some(Ended { status, .. }) => bail!("it stopped with status {status}"),
+        None => bail!("it did not run"),
+    }
+}
+
+impl Image {
+    /// Runs the constant item at slot `entry` in this forked child under a CPU time limit and writes its value, 128 bits wide when `wide`, to `out`; returns the exit status.
+    fn evaluate_in_child(&self, entry: usize, wide: bool, out: Option<std::fs::File>) -> i32 {
+        let Some(mut out) = out else { return 1 };
+        let limit = libc::itimerval { it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 }, it_value: libc::timeval { tv_sec: EVALUATION_SECONDS, tv_usec: 0 } };
+        // SAFETY: setitimer arms only this child's virtual timer, from a live itimerval.
+        unsafe { libc::setitimer(libc::ITIMER_VIRTUAL, &limit, std::ptr::null_mut()) };
+        let address = self.slot(entry).load(Ordering::Acquire);
+        // SAFETY: address is the stub or code of a constant item of an integer type, whose native signature takes nothing and returns the value in registers, as an I128 when `wide`.
+        let value = unsafe {
+            match wide {
+                true => std::mem::transmute::<usize, extern "C" fn() -> u128>(address)(),
+                false => u128::from(std::mem::transmute::<usize, extern "C" fn() -> u64>(address)()),
+            }
+        };
+        i32::from(out.write_all(&value.to_le_bytes()).is_err())
+    }
+}
+
 /// For each program whose `main` is in `mains`, starting inference from `store`, its two roots, `lang_start` at the return type of `main` and `main`, or why it has none, once inference settles on them; with the store inference kept.
 pub fn entries(compilation: &mut Compilation, (store, mains): (Cache, &[Option<ItemRef>])) -> Result<(Vec<Result<[Instance; 2], String>>, Cache)> {
     crate::macros::resolve_sema(compilation, (store, crate::macros::load), |mut cx, last| {
@@ -155,53 +223,24 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
         if let Err(error) = driver.start(demand) {
             break 'run Err(error);
         }
-        while demand.children.iter().any(Option::is_some) {
-            let ready = match demand.ready() {
-                Ok(ready) => ready,
-                Err(error) => break 'run Err(error),
+        let mut pending = None;
+        loop {
+            let asked = match demand.pump(&mut cx, driver, pending.take()) {
+                Ok(Some(asked)) => asked,
+                done => break 'run done.map(drop),
             };
-            for (id, asking) in ready {
-                if !asking {
-                    demand.drain(id);
-                    continue;
-                }
-                let Some(index) = demand.read_ask(id) else { continue };
-                let reply = loop {
-                    match demand.answer(&mut cx, index) {
-                        Ok(reply) => break reply,
-                        Err(Stop::Failed(error, item)) => {
-                            if let Some(child) = demand.children[id].as_mut() {
-                                child.failure = Some((error, item));
-                            }
-                            break 0;
-                        }
-                        Err(Stop::Asked) => {
-                            let (mut kept, asked) = cx.release();
-                            let answer = ask(compilation, asked);
-                            if let Ok(answer) = &answer {
-                                demand.strict = *answer != Answer::Nothing;
-                                kept.forget_after(*answer);
-                            }
-                            cx = Context::new(&compilation.outline, &compilation.names, kept);
-                            if let Err(error) = answer {
-                                break 'run Err(error);
-                            }
-                        }
-                    }
-                };
-                demand.strict = true;
-                demand.reply(id, reply);
+            let (mut kept, asks) = cx.release();
+            let answer = ask(compilation, asks);
+            if let Ok(answer) = &answer {
+                demand.strict = *answer != Answer::Nothing;
+                kept.forget_after(*answer);
             }
-            for (id, ended) in demand.reap() {
-                if let Err(error) = driver.ended(id, ended) {
-                    break 'run Err(error);
-                }
-            }
-            if let Err(error) = driver.start(demand) {
+            cx = Context::new(&compilation.outline, &compilation.names, kept);
+            if let Err(error) = answer {
                 break 'run Err(error);
             }
+            pending = Some(asked);
         }
-        Ok(())
     };
     demand.strict = true;
     demand.kill_children();
@@ -346,6 +385,59 @@ impl Jit {
             }
         }
         ended
+    }
+
+    /// Answers with `cx` the asks of the children `driver` forked, the ask `pending` first, until no child is left or an answer needs what inference asked for: then returns that child and the function it asked for.
+    fn pump(&mut self, cx: &mut Context<'_>, driver: &mut dyn Driver, mut pending: Option<(usize, usize)>) -> Result<Option<(usize, usize)>> {
+        while self.children.iter().any(Option::is_some) {
+            let asked = match pending.take() {
+                Some((id, index)) if self.respond(cx, id, index) => {
+                    self.strict = true;
+                    None
+                }
+                Some(asked) => Some(asked),
+                None => self.round(cx)?,
+            };
+            if asked.is_some() {
+                return Ok(asked);
+            }
+            for (id, ended) in self.reap() {
+                driver.ended(id, ended)?;
+            }
+            driver.start(self)?;
+        }
+        Ok(None)
+    }
+
+    /// Reads what the children wrote and answers their asks once, stopping at an answer that needs what inference asked for, whose child and function it returns.
+    fn round(&mut self, cx: &mut Context<'_>) -> Result<Option<(usize, usize)>> {
+        for (id, asking) in self.ready()? {
+            if !asking {
+                self.drain(id);
+                continue;
+            }
+            let Some(index) = self.read_ask(id) else { continue };
+            if !self.respond(cx, id, index) {
+                return Ok(Some((id, index)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Replies to child `id`'s ask for function `index` with its code, or with zero and why it has none; false when the answer needs what inference asked for.
+    fn respond(&mut self, cx: &mut Context<'_>, id: usize, index: usize) -> bool {
+        let reply = match self.answer(cx, index) {
+            Ok(reply) => reply,
+            Err(Stop::Failed(error, item)) => {
+                if let Some(child) = self.children[id].as_mut() {
+                    child.failure = Some((error, item));
+                }
+                0
+            }
+            Err(Stop::Asked) => return false,
+        };
+        self.reply(id, reply);
+        true
     }
 
     /// The code of function `index`, or why it has none; what inference did is taken back when it asked for more.
