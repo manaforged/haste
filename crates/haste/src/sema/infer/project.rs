@@ -7,7 +7,7 @@ use crate::outline::item::ItemKind;
 use super::super::impls::ImplRef;
 use super::super::ty::{Kind, Ty};
 use super::Infer;
-use super::scope::{named_bounds, type_params};
+use super::scope::{named_bounds, one_name, type_params};
 
 /// An associated type whose `Self` is not known yet: trait, `Self`, trait arguments, name, and the variable that stands for it.
 pub(super) type Projection = (ItemRef, Ty, Vec<Ty>, String, Ty);
@@ -76,6 +76,7 @@ impl Infer<'_, '_> {
             }
         }
         found.extend(self.own_trait()?);
+        found.extend(self.type_bounds()?);
         let mut at = 0;
         while at < found.len() && found.len() < MAX_ASSUMPTIONS {
             let (of, substs) = found[at].clone();
@@ -191,6 +192,26 @@ impl Infer<'_, '_> {
             if done {
                 break;
             }
+        }
+        Ok(found)
+    }
+
+    /// The trait bounds that the where-clauses of the frame's headers put on types other than one parameter, such as `<I::Item as Edge>::Id: Into<Ix>`, each with `Self` first.
+    pub(super) fn type_bounds(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        let mut found = Vec::new();
+        for (header, src) in self.headers()? {
+            let (arena, _, predicates) = header.parts();
+            self.in_source(src, |infer| {
+                for predicate in predicates {
+                    let Some(ty) = predicate.ty.filter(|&ty| one_name(arena, src, ty).is_none()) else { continue };
+                    let Ok(ty) = infer.lower_ty(arena, ty) else { continue };
+                    for &bound in arena.list(predicate.bounds) {
+                        let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else { continue };
+                        found.push((of, std::iter::once(ty).chain(infer.bound_args(of, arena, path, ty)?).collect()));
+                    }
+                }
+                Ok(())
+            })?;
         }
         Ok(found)
     }
