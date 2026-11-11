@@ -270,6 +270,11 @@ fn long(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
     }
 }
 
+/// Whether a fragment of kind `frag` is found by looking at its first token or tree, without parsing.
+pub(super) fn is_short(frag: Frag) -> bool {
+    matches!(frag, Frag::Tt | Frag::Ident | Frag::Lifetime | Frag::Literal | Frag::Block | Frag::Vis)
+}
+
 /// The end of the fragment of kind `frag` that starts at `at`, or `None` when it cannot start there.
 pub fn extent(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
     if frag == Frag::Vis {
@@ -278,7 +283,6 @@ pub fn extent(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
     if at >= end {
         return None;
     }
-    let short_form = matches!(frag, Frag::Tt | Frag::Ident | Frag::Lifetime | Frag::Literal | Frag::Block);
-    let to = if short_form { short(src, frag, at)? } else { long(src, frag, at, end)? };
+    let to = if is_short(frag) { short(src, frag, at)? } else { long(src, frag, at, end)? };
     (to > at && to <= end).then_some(to)
 }

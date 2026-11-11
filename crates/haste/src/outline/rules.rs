@@ -12,7 +12,7 @@ pub enum Op {
 }
 
 /// A fragment specifier of a metavariable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Frag {
     Ident,
     Path,
@@ -48,33 +48,34 @@ const FRAGS: [(&str, Frag); 15] = [
     ("vis", Frag::Vis),
 ];
 
-/// A metavariable expression in a transcriber: `${ignore($x)}`, `${index()}`, `${len()}` or `${count($x)}`.
+/// A metavariable expression in a transcriber: `${ignore($x)}`, `${index()}`, `${len()}`, `${count($x)}` or `${concat(..)}`, naming metavariables by their slot in the rule, or `None` when the matcher binds no such name.
 #[derive(Clone, Debug)]
 pub enum Meta {
-    Ignore(u32),
+    Ignore(Option<u32>),
     Index(usize),
     Len(usize),
-    Count(u32),
-    Concat(Vec<(bool, u32)>),
+    Count(Option<u32>),
+    Concat(Vec<(Option<u32>, u32)>),
 }
 
-/// One element of a matcher or transcriber, as token positions in the definition's file.
+/// One element of a matcher or transcriber, as token positions in the definition's file; a metavariable also carries its slot in the rule, and a repetition the slots of every metavariable inside it.
 #[derive(Clone, Debug)]
 pub enum Piece {
     Token(u32),
     Group(u32, Vec<Piece>),
-    Var(u32, Option<Frag>),
+    Var(u32, Option<Frag>, Option<u32>),
     Crate,
     CratePath,
     Meta(Meta),
-    Repeat(Vec<Piece>, Option<(u32, u32)>, Op),
+    Repeat(Vec<Piece>, Option<(u32, u32)>, Op, Box<[u32]>),
 }
 
-/// One `matcher => transcriber` arm.
+/// One `matcher => transcriber` arm, whose matcher binds `slots` distinct metavariable names.
 #[derive(Clone, Debug)]
 pub struct Rule {
     pub matcher: Vec<Piece>,
     pub body: Vec<Piece>,
+    pub slots: usize,
 }
 
 fn is_name(kind: TokenKind) -> bool {
@@ -93,10 +94,35 @@ fn op_of(kind: TokenKind) -> Option<Op> {
 struct Parser<'a> {
     src: &'a Source,
     matcher: bool,
+    names: Vec<&'a str>,
 }
 
-impl Parser<'_> {
-    fn pieces(&self, mut at: u32, to: u32) -> Result<Vec<Piece>> {
+fn slots(pieces: &[Piece], into: &mut Vec<u32>) {
+    for piece in pieces {
+        match piece {
+            Piece::Var(_, _, slot) | Piece::Meta(Meta::Ignore(slot) | Meta::Count(slot)) => into.extend(*slot),
+            Piece::Group(_, inner) => slots(inner, into),
+            Piece::Repeat(.., names) => into.extend_from_slice(names),
+            Piece::Token(_) | Piece::Crate | Piece::CratePath | Piece::Meta(_) => {}
+        }
+    }
+}
+
+impl<'a> Parser<'a> {
+    fn slot(&mut self, name: u32) -> Option<u32> {
+        let src = self.src;
+        let text = src.text(name);
+        if let Some(found) = self.names.iter().position(|known| *known == text) {
+            return Some(found as u32);
+        }
+        if !self.matcher {
+            return None;
+        }
+        self.names.push(text);
+        Some(self.names.len() as u32 - 1)
+    }
+
+    fn pieces(&mut self, mut at: u32, to: u32) -> Result<Vec<Piece>> {
         let mut out = Vec::new();
         while at < to {
             let kind = self.src.kind(at);
@@ -114,13 +140,15 @@ impl Parser<'_> {
         Ok(out)
     }
 
-    fn dollar(&self, next: u32, out: &mut Vec<Piece>) -> Result<u32> {
+    fn dollar(&mut self, next: u32, out: &mut Vec<Piece>) -> Result<u32> {
         let kind = self.src.kind(next);
         if kind == TokenKind::OpenParen {
             let close = self.src.pair(next);
             let inner = self.pieces(next + 1, close)?;
             let (sep, op, after) = self.tail(close + 1)?;
-            out.push(Piece::Repeat(inner, sep, op));
+            let mut names = Vec::new();
+            slots(&inner, &mut names);
+            out.push(Piece::Repeat(inner, sep, op, names.into_boxed_slice()));
             return Ok(after);
         }
         if kind == TokenKind::OpenBrace && !self.matcher {
@@ -136,21 +164,23 @@ impl Parser<'_> {
             return Ok(next + 1);
         }
         if self.matcher && self.src.kind(next + 1) == TokenKind::Colon && is_name(self.src.kind(next + 2)) {
-            out.push(Piece::Var(next, Some(frag(self.src.text(next + 2))?)));
+            let frag = frag(self.src.text(next + 2))?;
+            out.push(Piece::Var(next, Some(frag), self.slot(next)));
             return Ok(next + 3);
         }
-        out.push(Piece::Var(next, None));
+        out.push(Piece::Var(next, None, self.slot(next)));
         Ok(next + 1)
     }
 
-    fn meta(&self, open: u32) -> Result<Meta> {
+    fn meta(&mut self, open: u32) -> Result<Meta> {
         let name = open + 1;
         let args = name + 1;
         let variable = (self.src.kind(args + 1) == TokenKind::Dollar).then_some(args + 2);
         let depth = (matches!(self.src.kind(args + 1), TokenKind::Literal { .. })).then(|| self.src.text(args + 1).parse().unwrap_or(0)).unwrap_or(0);
-        match (self.src.text(name), variable) {
-            ("ignore", Some(variable)) => Ok(Meta::Ignore(variable)),
-            ("count", Some(variable)) => Ok(Meta::Count(variable)),
+        let src = self.src;
+        match (src.text(name), variable) {
+            ("ignore", Some(variable)) => Ok(Meta::Ignore(self.slot(variable))),
+            ("count", Some(variable)) => Ok(Meta::Count(self.slot(variable))),
             ("index", _) => Ok(Meta::Index(depth)),
             ("len", _) => Ok(Meta::Len(depth)),
             ("concat", _) => Ok(Meta::Concat(self.concat_parts(args))),
@@ -158,14 +188,14 @@ impl Parser<'_> {
         }
     }
 
-    fn concat_parts(&self, open: u32) -> Vec<(bool, u32)> {
+    fn concat_parts(&mut self, open: u32) -> Vec<(Option<u32>, u32)> {
         let close = self.src.pair(open);
         let mut parts = Vec::new();
         let mut at = open + 1;
         while at < close {
             let variable = self.src.kind(at) == TokenKind::Dollar;
             let token = if variable { at + 1 } else { at };
-            parts.push((variable, token));
+            parts.push((if variable { self.slot(token) } else { None }, token));
             at = token + 1;
             if self.src.kind(at) == TokenKind::Comma {
                 at += 1;
@@ -196,10 +226,9 @@ fn frag(name: &str) -> Result<Frag> {
     }
 }
 
-/// Parses a `macro` definition whose body opens at `open`: one `(args) { body }` rule or a braced list of rules.
 /// The rules of a `#[macro_export(local_inner_macros)]` macro, whose transcribers call each macro named by one word as `$crate::name!`.
 pub fn local_inner(src: &Source, rules: Vec<Rule>) -> Vec<Rule> {
-    rules.into_iter().map(|rule| Rule { matcher: rule.matcher, body: qualified(src, rule.body) }).collect()
+    rules.into_iter().map(|rule| Rule { matcher: rule.matcher, body: qualified(src, rule.body), slots: rule.slots }).collect()
 }
 
 fn qualified(src: &Source, pieces: Vec<Piece>) -> Vec<Piece> {
@@ -217,26 +246,33 @@ fn qualified(src: &Source, pieces: Vec<Piece>) -> Vec<Piece> {
         }
         out.push(match piece.clone() {
             Piece::Group(open, inner) => Piece::Group(open, qualified(src, inner)),
-            Piece::Repeat(inner, sep, op) => Piece::Repeat(qualified(src, inner), sep, op),
+            Piece::Repeat(inner, sep, op, names) => Piece::Repeat(qualified(src, inner), sep, op, names),
             other => other,
         });
     }
     out
 }
 
+/// Parses a `macro` definition whose body opens at `open`: one `(args) { body }` rule or a braced list of rules.
 pub fn parse_macro(src: &Source, open: u32) -> Result<Vec<Rule>> {
     if src.kind(open) != TokenKind::OpenParen {
         return parse(src, open);
     }
-    let body = src.pair(open) + 1;
-    let matcher = Parser { src, matcher: true }.pieces(open + 1, src.pair(open))?;
-    Ok(vec![Rule { matcher, body: Parser { src, matcher: false }.pieces(body + 1, src.pair(body))? }])
+    Ok(vec![rule(src, open, src.pair(open) + 1)?])
+}
+
+/// The rule whose matcher opens at `matcher` and whose transcriber opens at `body`, with each metavariable name given its slot.
+fn rule(src: &Source, matcher: u32, body: u32) -> Result<Rule> {
+    let mut parser = Parser { src, matcher: true, names: Vec::new() };
+    let matcher = parser.pieces(matcher + 1, src.pair(matcher))?;
+    parser.matcher = false;
+    let body = parser.pieces(body + 1, src.pair(body))?;
+    Ok(Rule { matcher, body, slots: parser.names.len() })
 }
 
 /// Parses the rules of a `macro_rules!` body that opens at token `open`.
 pub fn parse(src: &Source, open: u32) -> Result<Vec<Rule>> {
     let close = src.pair(open);
-    let (matchers, bodies) = (Parser { src, matcher: true }, Parser { src, matcher: false });
     let mut rules = Vec::new();
     let mut at = open + 1;
     while at < close {
@@ -245,8 +281,7 @@ pub fn parse(src: &Source, open: u32) -> Result<Vec<Rule>> {
         if !opens(src.kind(at)) || src.kind(arrow) != TokenKind::Eq || !opens(src.kind(body)) {
             bail!("{}: malformed macro rule at byte {}", src.path.display(), src.byte(at));
         }
-        let matcher = matchers.pieces(at + 1, src.pair(at))?;
-        rules.push(Rule { matcher, body: bodies.pieces(body + 1, src.pair(body))? });
+        rules.push(rule(src, at, body)?);
         at = src.pair(body) + 1;
         if matches!(src.kind(at), TokenKind::Semi | TokenKind::Comma) {
             at += 1;
