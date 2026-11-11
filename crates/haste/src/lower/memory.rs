@@ -183,10 +183,10 @@ impl Lower<'_, '_> {
     fn read_at(&mut self, ty: Ty, from: Value) -> Result<Option<Value>> {
         let whole = repr(self.cx, ty)?;
         let at = Place { base: Base::Addr(from), offset: 0, repr: whole };
-        let Repr::Mem { size, .. } = whole else { return Ok(self.read(at)) };
+        let Repr::Mem { .. } = whole else { return Ok(self.read(at)) };
         let Some(slot) = self.slot(whole) else { return Ok(None) };
         let to = self.ins().stack_addr(Type::I64, slot, 0);
-        self.copy(to, from, size);
+        self.copy(to, from, whole);
         Ok(Some(to))
     }
 

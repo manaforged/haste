@@ -1,4 +1,4 @@
-use super::asm::{Alu, Cond, Group3, Mem, Reg, Size};
+use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
 use super::{Emit, Ext};
 use crate::ir::{AtomicRmwOp, Op, StackSlot, Type, Value};
 
@@ -112,6 +112,12 @@ impl Emit<'_> {
 
     fn read(&mut self, result: Value, from: Mem) {
         let ty = self.ty(result);
+        if ty.is_float() {
+            let dst = self.fdst(result);
+            self.xmm_load(ty, dst, from);
+            self.fput(result, dst);
+            return;
+        }
         if ty == Type::I128 {
             self.asm.load(Size::Q, Reg::Rax, from);
             self.put(result, Reg::Rax);
@@ -126,6 +132,11 @@ impl Emit<'_> {
 
     fn write(&mut self, value: Value, to: Mem) {
         let ty = self.ty(value);
+        if ty.is_float() {
+            let source = self.fin(value, Xmm(0));
+            self.xmm_store(ty, to, source);
+            return;
+        }
         let source = self.reg_of(value).unwrap_or(Reg::Rax);
         self.raw(source, value);
         if ty == Type::I128 {

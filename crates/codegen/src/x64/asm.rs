@@ -414,6 +414,21 @@ impl Asm {
         self.encode(&[prefix], true, &[0x0F, opcode], r, rm.into(), false);
     }
 
+    /// `movaps dst, src`: copies the whole register, with no dependency on the old contents of `dst`.
+    pub fn movaps(&mut self, dst: Xmm, src: Xmm) {
+        self.sse(&[], &[0x0F, 0x28], dst.0, src);
+    }
+
+    /// `movq xmm, reg`.
+    pub fn movq_in(&mut self, xmm: Xmm, reg: Reg) {
+        self.encode(&[0x66], true, &[0x0F, 0x6E], xmm.0, reg.into(), false);
+    }
+
+    /// `movq reg, xmm`.
+    pub fn movq_out(&mut self, reg: Reg, xmm: Xmm) {
+        self.encode(&[0x66], true, &[0x0F, 0x7E], xmm.0, reg.into(), false);
+    }
+
     pub fn push(&mut self, reg: Reg) {
         self.rex(false, 0, reg as u8, false);
         self.code.push(0x50 + (reg as u8 & 7));
