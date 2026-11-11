@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow, bail};
 
 use crate::body::{BinOp, Body, Expr, ExprId, Lit, PathId, TyId, UnOp};
+use crate::names::path::Path as NamePath;
+use crate::names::resolve::macro_path;
 use crate::names::{Def, ItemRef, Primitive, Sym};
 use crate::outline::item::ItemKind;
 
@@ -262,6 +264,7 @@ impl Infer<'_, '_> {
             Expr::Call(callee, args) => self.const_call(arena, (callee, args), want),
             Expr::Path(path) => self.const_name(arena, (expr, path), want),
             Expr::Method { receiver, name, args: None, params } => self.const_method(arena, (receiver, name, params), want),
+            Expr::Macro { path, open } => self.const_macro(arena, (path, open), want),
             other => bail!("constant expressions like {other:?} are not evaluated yet"),
         }
     }
@@ -299,6 +302,18 @@ impl Infer<'_, '_> {
             }
             _ => bail!("constant blocks with statements and `if` with no `else` are not evaluated yet"),
         }
+    }
+
+    /// The value of the macro call `path!` whose group opens at `open`, folded from the expression that the macro writes.
+    fn const_macro(&mut self, arena: &Body, (path, open): (PathId, u32), want: Int) -> Result<(u128, Int)> {
+        let (segments, absolute, dollar) = self.segments(arena, path);
+        let found = macro_path(&self.cx.paths(self.home.krate), &NamePath { segments: &segments, absolute, dollar }, self.home);
+        let src = self.src;
+        let Some(output) = found.map(|item| self.cx.macro_output(src, item, open)).transpose()?.flatten() else { bail!("constant macro `{}` is not supported", self.spell(&segments)) };
+        let config = crate::body::Config { calls: None, env: Some(&self.cx.outline.crates[self.home.krate as usize].env) };
+        let inner = crate::body::parse_expr(output, 0, output.len(), config)?;
+        let Some(root) = inner.root else { bail!("macro `{}` wrote no constant expression", self.spell(&segments)) };
+        self.in_source(output, |infer| infer.const_eval(&inner, root, want))
     }
 
     fn const_method(&mut self, arena: &Body, (receiver, name, params): (ExprId, u32, crate::body::List), want: Int) -> Result<(u128, Int)> {
