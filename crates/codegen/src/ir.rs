@@ -281,13 +281,14 @@ impl Op {
     }
 
     /// Every block this instruction can go to.
-    pub(crate) fn targets(&self) -> Vec<Block> {
-        match self {
-            Op::Jump(block, _) => vec![*block],
-            Op::Brif(_, then, _, otherwise, _) => vec![*then, *otherwise],
-            Op::TryCall { normal, handler, .. } => vec![*normal, *handler],
-            _ => Vec::new(),
-        }
+    pub(crate) fn targets(&self) -> impl Iterator<Item = Block> + use<> {
+        let (first, second) = match *self {
+            Op::Jump(block, _) => (Some(block), None),
+            Op::Brif(_, then, _, otherwise, _) => (Some(then), Some(otherwise)),
+            Op::TryCall { normal, handler, .. } => (Some(normal), Some(handler)),
+            _ => (None, None),
+        };
+        first.into_iter().chain(second)
     }
 
     /// Replaces every block this instruction can go to with `f` of it.
@@ -304,13 +305,6 @@ impl Op {
             }
             _ => {}
         }
-    }
-
-    /// Every value this instruction reads, once per read.
-    pub(crate) fn operands(&self) -> Vec<Value> {
-        let mut values = Vec::new();
-        self.for_operands(|value| values.push(value));
-        values
     }
 
     /// Calls `f` with every value this instruction reads, once per read.

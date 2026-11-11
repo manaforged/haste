@@ -62,10 +62,10 @@ struct Uses {
 
 impl Uses {
     fn visit(&mut self, data: &crate::ir::InstData, at: (usize, usize)) {
-        for value in data.op.operands() {
+        data.op.for_operands(|value| {
             self.uses[value.index()] += 1;
             self.last_use[value.index()] = Some(at);
-        }
+        });
         for result in results(data) {
             self.def[result.index()] = Some(at);
         }

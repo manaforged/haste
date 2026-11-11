@@ -43,8 +43,8 @@ impl Sets {
     }
 }
 
-fn successors(func: &Function, block: usize) -> Vec<Block> {
-    func.blocks[block].insts.last().map(|inst| func.insts[inst.index()].op.targets()).unwrap_or_default()
+fn successors(func: &Function, block: usize) -> impl Iterator<Item = Block> + '_ {
+    func.blocks[block].insts.last().into_iter().flat_map(move |inst| func.insts[inst.index()].op.targets())
 }
 
 /// The wanted values that some block other than their defining block reads, as a dense index per value and the values in index order.
@@ -60,12 +60,12 @@ fn crossing(func: &Function, wanted: &[bool]) -> (Vec<Option<usize>>, Vec<Value>
     let mut values = Vec::new();
     for (block, data) in func.blocks.iter().enumerate() {
         for inst in &data.insts {
-            for value in func.insts[inst.index()].op.operands() {
+            func.insts[inst.index()].op.for_operands(|value| {
                 if wanted[value.index()] && location[value.index()] != block && dense[value.index()].is_none() {
                     dense[value.index()] = Some(values.len());
                     values.push(value);
                 }
-            }
+            });
         }
     }
     (dense, values)
@@ -81,11 +81,13 @@ fn local_sets(func: &Function, dense: &[Option<usize>], count: usize) -> (Sets, 
         }
         for inst in &data.insts {
             let inst = &func.insts[inst.index()];
-            for value in inst.op.operands().into_iter().filter_map(|value| dense[value.index()]) {
-                if !defs.has(block, value) {
+            inst.op.for_operands(|value| {
+                if let Some(value) = dense[value.index()]
+                    && !defs.has(block, value)
+                {
                     uses.insert(block, value);
                 }
-            }
+            });
             for result in results(inst).filter_map(|result| dense[result.index()]) {
                 defs.insert(block, result);
             }
@@ -139,7 +141,13 @@ pub(crate) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
         for inst in &func.blocks[index].insts {
             at += 1;
             let data = &func.insts[inst.index()];
-            data.op.operands().into_iter().chain(results(data)).filter(|value| wanted[value.index()]).for_each(|value| widen(&mut span[value.index()], at));
+            let mut mark = |value: Value| {
+                if wanted[value.index()] {
+                    widen(&mut span[value.index()], at);
+                }
+            };
+            data.op.for_operands(&mut mark);
+            results(data).for_each(mark);
             if matches!(data.op, Op::TryCall { .. }) {
                 unwinds.push(at);
             }
