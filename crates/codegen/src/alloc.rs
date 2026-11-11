@@ -1,9 +1,9 @@
-//! Register planning shared by the encoders: static locations for constants and frame addresses, and registers for integer values over their live spans.
+//! Register planning shared by the encoders: static locations for constants and frame addresses, and registers for integer and float values over their live spans.
 
 use crate::frame::Loc;
 use crate::live::{Live, live, results};
 use crate::fold::{constant, holds};
-use crate::ir::{Binary, Block, Convert, Function, Op, StackSlot, Type, Value};
+use crate::ir::{Binary, Block, Convert, FloatCC, Function, Op, StackSlot, Type, Value};
 
 /// The registers of one encoder that planning hands out.
 pub(crate) struct Regs<R: 'static> {
@@ -13,6 +13,10 @@ pub(crate) struct Regs<R: 'static> {
     pub leaf: &'static [R],
     /// Leaf registers that 128-bit operations use as scratch, so a function with one keeps no value in them.
     pub wide_scratch: &'static [R],
+    /// Caller-saved float registers, by number, the emitter never uses as scratch, which float values that span no call live in.
+    pub float: &'static [u8],
+    /// The float compares whose result the next branch reads from the flags under one condition.
+    pub float_branches: &'static [FloatCC],
     /// Whether a call can read its callee from a constant address below 2 GiB in place.
     pub absolute_calls: bool,
 }
@@ -25,6 +29,7 @@ pub(crate) enum Location<R> {
     Slot,
     Imm(i64),
     Reg(R),
+    Float(u8),
     Frame(StackSlot, i32),
 }
 
@@ -40,6 +45,11 @@ pub(crate) struct Plan<R> {
 
 pub(crate) fn small_int(ty: Type) -> bool {
     matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+}
+
+/// Whether planning may give a value of type `ty` a register of `regs`.
+fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
+    small_int(ty) || (ty.is_float() && !regs.float.is_empty())
 }
 
 type Position = Option<(usize, usize)>;
@@ -129,14 +139,19 @@ fn statics<R: Copy>(func: &Function, locations: &mut [Location<R>]) {
     }
 }
 
-fn fuses(func: &Function, census: &Uses, value: usize) -> bool {
+fn fuses(func: &Function, census: &Uses, value: usize, float_branches: &[FloatCC]) -> bool {
     let (Some((block, at)), Some((_, last))) = (census.def[value], census.last_use[value]) else { return false };
     let insts = &func.blocks[block].insts;
     let op = &func.insts[insts[at].index()].op;
     let next = insts.get(at + 1).map(|inst| &func.insts[inst.index()].op);
+    let flags = match op {
+        Op::Icmp(..) | Op::Fits(..) => true,
+        Op::Fcmp(cc, ..) => float_branches.contains(cc),
+        _ => false,
+    };
     census.uses[value] == 1
         && last == at + 1
-        && matches!(op, Op::Icmp(..) | Op::Fits(..))
+        && flags
         && matches!(next, Some(Op::Brif(condition, ..) | Op::Trapz(condition)) if condition.index() == value)
 }
 
@@ -184,10 +199,43 @@ fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> Vec<
     through
 }
 
-fn eligible<R>(func: &Function, live: &Live, locations: &[Location<R>], value: usize) -> bool {
+fn eligible(live: &Live, wanted: &[bool], value: usize) -> bool {
     let Some((start, end)) = live.span[value] else { return false };
-    let unwinds = live.unwinds.iter().any(|at| start <= *at && *at < end);
-    matches!(locations[value], Location::Slot) && small_int(func.types[value]) && !unwinds
+    wanted[value] && !live.unwinds.iter().any(|at| start <= *at && *at < end)
+}
+
+/// One register class: the registers that keep values across calls, the caller-saved ones planning may use, and the registers of this class each parameter arrives in.
+struct Class<'a, F> {
+    saved: &'a [F],
+    leaf: Vec<F>,
+    arrivals: Vec<Vec<F>>,
+}
+
+/// The integer class; a function with a 128-bit value keeps none in the registers 128-bit operations use as scratch.
+fn int_class<'a, R: Copy + PartialEq>(func: &Function, regs: &'a Regs<R>, order: &[Block], params: &[Loc<R>]) -> Class<'a, R> {
+    let wide = order.iter().flat_map(|block| &func.blocks[block.index()].insts).any(|inst| func.insts[inst.index()].result.is_some_and(|result| func.ty(result) == Type::I128));
+    let leaf = regs.leaf.iter().filter(|reg| !(wide && regs.wide_scratch.contains(*reg))).copied().collect();
+    let arrivals = params
+        .iter()
+        .map(|loc| match *loc {
+            Loc::Int(reg) => vec![reg],
+            Loc::Pair(low, high) => vec![low, high],
+            _ => Vec::new(),
+        })
+        .collect();
+    Class { saved: regs.saved, leaf, arrivals }
+}
+
+/// The float class, which has no register that keeps a value across a call.
+fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>]) -> Class<'static, u8> {
+    let arrivals = params
+        .iter()
+        .map(|loc| match *loc {
+            Loc::Float(reg) => vec![reg],
+            _ => Vec::new(),
+        })
+        .collect();
+    Class { saved: &[], leaf: regs.float.to_vec(), arrivals }
 }
 
 /// The registers values may live in, the entry parameters that keep the register they arrive in, and the arrival registers no other value takes before the entry block.
@@ -203,32 +251,21 @@ fn crosses(calls: &[u32], (start, end): (u32, u32)) -> bool {
     calls.get(next).is_some_and(|at| *at <= end)
 }
 
-/// The saved pool and the free caller-saved registers; values that span no call may take the caller-saved ones, and so may entry parameters that arrive in one.
-fn pool<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, (order, params): (&[Block], &[Loc<R>]), live: &Live, pooled: &[bool]) -> Pool<R> {
-    let insts = || order.iter().flat_map(|block| &func.blocks[block.index()].insts).map(|inst| &func.insts[inst.index()]);
-    let wide = insts().any(|data| data.result.is_some_and(|result| func.ty(result) == Type::I128));
-    let usable = |reg: &R| regs.leaf.contains(reg) && !(wide && regs.wide_scratch.contains(reg));
+/// The saved pool and the free caller-saved registers of `class`; values that span no call may take the caller-saved ones, and so may entry parameters that arrive in one.
+fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, pooled: &[bool]) -> Pool<F> {
     let mut kept = vec![None; func.types.len()];
     let entry = func.entry.map_or(&[][..], |entry| &func.blocks[entry.index()].params[..]);
-    for (value, loc) in entry.iter().zip(params) {
-        if let Loc::Int(reg) = *loc
-            && usable(&reg)
+    for (value, arrival) in entry.iter().zip(&class.arrivals) {
+        if let [reg] = arrival[..]
+            && class.leaf.contains(&reg)
             && pooled[value.index()]
             && live.span[value.index()].is_some_and(|span| !crosses(&live.calls, span))
         {
             kept[value.index()] = Some(reg);
         }
     }
-    let arrival = params
-        .iter()
-        .flat_map(|loc| match *loc {
-            Loc::Int(reg) => vec![reg],
-            Loc::Pair(low, high) => vec![low, high],
-            _ => Vec::new(),
-        })
-        .filter(|reg| usable(reg) && !kept.contains(&Some(*reg)))
-        .collect();
-    let regs = regs.saved.iter().chain(regs.leaf.iter().filter(|reg| usable(reg))).copied().collect();
+    let arrival = class.arrivals.iter().flatten().copied().filter(|reg| class.leaf.contains(reg) && !kept.contains(&Some(*reg))).collect();
+    let regs = class.saved.iter().chain(&class.leaf).copied().collect();
     Pool { regs, kept, arrival }
 }
 
@@ -245,12 +282,13 @@ fn take<R: Copy + PartialEq>(free: &mut Vec<R>, (saved, pool): (bool, &[R]), use
 const ARRIVAL: usize = usize::MAX;
 
 /// Gives registers to values by linear scan over their spans, a saved one when the span holds a call, spilling the value that ends last when none is free; an entry parameter that keeps its arrival register takes it.
-fn assign<R: Copy + PartialEq>(live: &Live, pooled: &[bool], (locations, saved_regs): (&mut [Location<R>], &[R]), pool: Pool<R>) -> Vec<R> {
+fn assign<F: Copy + PartialEq>(live: &Live, pooled: &[bool], saved_regs: &[F], pool: Pool<F>) -> (Vec<Option<F>>, Vec<F>) {
+    let mut homes = vec![None; pooled.len()];
     let mut values: Vec<(u32, u32, usize)> = (0..pooled.len()).filter(|value| pooled[*value]).filter_map(|value| live.span[value].map(|(start, end)| (start, end, value))).collect();
     values.sort_unstable();
-    let kept: Vec<R> = pool.kept.iter().flatten().copied().collect();
-    let mut free: Vec<R> = pool.regs.iter().filter(|reg| !pool.arrival.contains(reg) && !kept.contains(reg)).copied().collect();
-    let mut active: Vec<(u32, usize, R)> = pool.arrival.iter().map(|reg| (0, ARRIVAL, *reg)).collect();
+    let kept: Vec<F> = pool.kept.iter().flatten().copied().collect();
+    let mut free: Vec<F> = pool.regs.iter().filter(|reg| !pool.arrival.contains(reg) && !kept.contains(reg)).copied().collect();
+    let mut active: Vec<(u32, usize, F)> = pool.arrival.iter().map(|reg| (0, ARRIVAL, *reg)).collect();
     let mut used = Vec::new();
     for (start, end, value) in values {
         active.retain(|&(until, _, reg)| {
@@ -265,36 +303,54 @@ fn assign<R: Copy + PartialEq>(live: &Live, pooled: &[bool], (locations, saved_r
             Some(reg) => reg,
             None => match active.iter().enumerate().filter(|(_, entry)| entry.1 != ARRIVAL && (!saved || saved_regs.contains(&entry.2))).max_by_key(|(_, entry)| entry.0) {
                 Some((at, &(until, other, reg))) if until > end => {
-                    locations[other] = Location::Slot;
+                    homes[other] = None;
                     active.swap_remove(at);
                     reg
                 }
                 _ => continue,
             },
         };
-        locations[value] = Location::Reg(reg);
+        homes[value] = Some(reg);
         active.push((end, value, reg));
         if saved_regs.contains(&reg) && !used.contains(&reg) {
             used.push(reg);
         }
     }
-    used
+    (homes, used)
 }
 
-/// Gives constants and frame addresses static locations, integers pool registers over their live spans, and finds the compares that feed the next branch.
+/// Registers of `class` for the `pooled` values, and the saved registers they use.
+fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class: &Class<F>, pooled: &[bool]) -> (Vec<Option<F>>, Vec<F>) {
+    assign(live, pooled, class.saved, pool(func, class, live, pooled))
+}
+
+/// Writes each register in `homes` into the location of its value as `wrap` of it.
+fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl Fn(F) -> Location<R>) {
+    for (location, home) in locations.iter_mut().zip(homes) {
+        if let Some(reg) = home {
+            *location = wrap(reg);
+        }
+    }
+}
+
+/// Gives constants and frame addresses static locations, integers and floats pool registers over their live spans, and finds the compares that feed the next branch.
 pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, order: &[Block], params: &[Loc<R>]) -> Plan<R> {
     let count = func.types.len();
     let mut locations = vec![Location::Slot; count];
     consts(func, &mut locations);
     statics(func, &mut locations);
     let census = census(func);
-    let wanted: Vec<bool> = (0..count).map(|value| matches!(locations[value], Location::Slot) && small_int(func.types[value])).collect();
+    let wanted: Vec<bool> = (0..count).map(|value| matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let live = live(func, order, &wanted);
-    let candidates: Vec<bool> = (0..count).map(|value| eligible(func, &live, &locations, value)).collect();
-    let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value)).collect();
+    let candidates: Vec<bool> = (0..count).map(|value| eligible(&live, &wanted, value)).collect();
+    let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches)).collect();
     let through = if regs.absolute_calls { through(func, &locations, &census) } else { vec![None; count] };
-    let pooled: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && through[value].is_none()).collect();
-    let used = assign(&live, &pooled, (&mut locations, regs.saved), pool(func, regs, (order, params), &live, &pooled));
+    let ints: Vec<bool> = (0..count).map(|value| candidates[value] && small_int(func.types[value]) && !fused[value] && through[value].is_none()).collect();
+    let floats: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_float() && live.span[value].is_some_and(|span| !crosses(&live.calls, span))).collect();
+    let (homes, used) = allocate(func, &live, &int_class(func, regs, order, params), &ints);
+    place(&mut locations, homes, Location::Reg);
+    let (homes, _) = allocate(func, &live, &float_class(regs, params), &floats);
+    place(&mut locations, homes, Location::Float);
     let (pairs, deferred) = pairs(func, &locations);
     Plan { locations, fused, used, pairs, deferred, through }
 }
@@ -322,6 +378,14 @@ impl<R: Copy> Plan<R> {
     pub(crate) fn reg_of(&self, value: Value) -> Option<R> {
         match self.location(value) {
             Location::Reg(reg) => Some(reg),
+            _ => None,
+        }
+    }
+
+    /// The float register that holds `value`, when its location is one.
+    pub(crate) fn float_of(&self, value: Value) -> Option<u8> {
+        match self.location(value) {
+            Location::Float(reg) => Some(reg),
             _ => None,
         }
     }

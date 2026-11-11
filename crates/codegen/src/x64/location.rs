@@ -1,4 +1,5 @@
-use super::asm::{Mem, Reg, Rm, Size};
+use super::asm::{Mem, Reg, Rm, Size, Xmm};
+use super::float::scalar;
 use super::{Emit, Ext};
 use crate::alloc::Location;
 use crate::ir::{Type, Value};
@@ -42,9 +43,19 @@ impl Emit<'_> {
         self.plan.reg_of(value)
     }
 
+    /// The float register that holds `value`, when its location is one.
+    pub(super) fn xmm_of(&self, value: Value) -> Option<Xmm> {
+        self.plan.float_of(value).map(Xmm)
+    }
+
     /// The register to compute `value` in: its location register, or rax.
     pub(super) fn dst(&self, value: Value) -> Reg {
         self.reg_of(value).unwrap_or(Reg::Rax)
+    }
+
+    /// The float register to compute `value` in: its location register, or xmm0.
+    pub(super) fn fdst(&self, value: Value) -> Xmm {
+        self.xmm_of(value).unwrap_or(Xmm(0))
     }
 
     /// The memory at `addr + offset`: relative to rbp for a frame address, to the location register of `addr`, or through rcx.
@@ -67,6 +78,10 @@ impl Emit<'_> {
         let source: Rm = match self.location(value) {
             Location::Imm(imm) => return self.asm.mov_imm(reg, extend(imm, ty, ext)),
             Location::Frame(..) => return self.raw(reg, value),
+            Location::Float(_) => {
+                self.raw(reg, value);
+                reg.into()
+            }
             Location::Reg(from) => from.into(),
             Location::Slot => self.at(value).into(),
         };
@@ -86,6 +101,7 @@ impl Emit<'_> {
             }
             Location::Reg(from) if from == reg => {}
             Location::Reg(from) => self.asm.mov(reg, from),
+            Location::Float(from) => self.asm.movq_out(reg, Xmm(from)),
             Location::Slot => {
                 let at = self.at(value);
                 self.asm.load(Size::Q, reg, at);
@@ -94,17 +110,66 @@ impl Emit<'_> {
     }
 
     pub(super) fn put(&mut self, value: Value, reg: Reg) {
-        if let Location::Reg(location) = self.location(value) {
-            if location != reg {
-                self.asm.mov(location, reg);
+        match self.location(value) {
+            Location::Reg(location) if location == reg => {}
+            Location::Reg(location) => self.asm.mov(location, reg),
+            Location::Float(location) => self.asm.movq_in(Xmm(location), reg),
+            _ => {
+                let at = self.at(value);
+                self.asm.store(Size::Q, at, reg);
             }
-            return;
         }
-        let at = self.at(value);
-        self.asm.store(Size::Q, at, reg);
     }
 
-    /// A register or memory operand that holds `value`, using r11 for a frame address.
+    /// Loads the float of type `ty` at `from` into `xmm`.
+    pub(super) fn xmm_load(&mut self, ty: Type, xmm: Xmm, from: Mem) {
+        self.asm.sse(&[scalar(ty)], &[0x0F, 0x10], xmm.0, from);
+    }
+
+    /// Stores the float of type `ty` in `xmm` to `to`.
+    pub(super) fn xmm_store(&mut self, ty: Type, to: Mem, xmm: Xmm) {
+        self.asm.sse(&[scalar(ty)], &[0x0F, 0x11], xmm.0, to);
+    }
+
+    /// Puts float `value` in `xmm`.
+    pub(super) fn fget(&mut self, xmm: Xmm, value: Value) {
+        match self.location(value) {
+            Location::Float(from) if Xmm(from) == xmm => {}
+            Location::Float(from) => self.asm.movaps(xmm, Xmm(from)),
+            Location::Slot => self.xmm_load(self.ty(value), xmm, self.at(value)),
+            _ => {
+                self.raw(Reg::Rax, value);
+                self.asm.movq_in(xmm, Reg::Rax);
+            }
+        }
+    }
+
+    /// Writes `xmm` into the location of float `value`.
+    pub(super) fn fput(&mut self, value: Value, xmm: Xmm) {
+        match self.location(value) {
+            Location::Float(to) if Xmm(to) == xmm => {}
+            Location::Float(to) => self.asm.movaps(Xmm(to), xmm),
+            _ => self.xmm_store(self.ty(value), self.at(value), xmm),
+        }
+    }
+
+    /// A float register that holds `value`: its location register, or `scratch` loaded with it.
+    pub(super) fn fin(&mut self, value: Value, scratch: Xmm) -> Xmm {
+        self.xmm_of(value).unwrap_or_else(|| {
+            self.fget(scratch, value);
+            scratch
+        })
+    }
+
+    /// A float register or memory operand that holds `value`.
+    pub(super) fn foperand(&self, value: Value) -> Rm {
+        match self.xmm_of(value) {
+            Some(xmm) => xmm.into(),
+            None => self.at(value).into(),
+        }
+    }
+
+    /// A register or memory operand that holds `value`, using r11 for a frame address or a float register.
     pub(super) fn operand(&mut self, value: Value) -> Rm {
         match self.location(value) {
             Location::Reg(reg) => reg.into(),
@@ -113,7 +178,7 @@ impl Emit<'_> {
                 self.move_to(at, value);
                 at.into()
             }
-            Location::Frame(..) => {
+            Location::Frame(..) | Location::Float(_) => {
                 self.raw(Reg::R11, value);
                 Reg::R11.into()
             }
@@ -121,7 +186,7 @@ impl Emit<'_> {
         }
     }
 
-    /// Writes the eight (or sixteen) bytes of `value` to `to`, using rax or r11 as scratch.
+    /// Writes the eight (or sixteen) bytes of `value` to `to`, using rax or r11 as scratch; a float in a register writes the bytes of its type.
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
         match self.location(value) {
             Location::Imm(imm) => match i32::try_from(imm) {
@@ -136,6 +201,7 @@ impl Emit<'_> {
                 self.asm.store(Size::Q, to, Reg::R11);
             }
             Location::Reg(reg) => self.asm.store(Size::Q, to, reg),
+            Location::Float(xmm) => self.xmm_store(self.ty(value), to, Xmm(xmm)),
             Location::Slot => self.copy_to(to, self.at(value), self.ty(value)),
         }
     }
