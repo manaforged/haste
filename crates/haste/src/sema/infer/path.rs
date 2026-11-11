@@ -114,7 +114,7 @@ impl<'a> Infer<'_, 'a> {
         let head = path.segments.first().filter(|_| !path.absolute).and_then(|first| self.block_item(self.cx.names.symbols.text(*first)));
         let found = match head {
             Some(item) => self.cx.local_descend(item, &path.segments[1..], ns)?,
-            None => self.cx.local_path(self.anchor(), path, ns)?,
+            None => self.cx.local_path(self.anchor().filter(|(_, from)| from.is_some()), path, ns)?,
         };
         Some(match found {
             BodyPath::Item(item) => Ok(Def::Item(item)),
