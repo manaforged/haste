@@ -37,6 +37,8 @@ pub enum Intrinsic {
     Cpuid,
     /// SSSE3 or AVX2 `pshufb` on a vector of this many bytes.
     BytePermute(u8),
+    /// NEON `umaxp` on two vectors of 16 bytes.
+    BytePairMax,
     CatchUnwind,
     SizeOf,
     AlignOf,
@@ -95,7 +97,7 @@ pub enum Atomic {
 }
 
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
-const LLVM: [(&str, Intrinsic); 2] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32))];
+const LLVM: [(&str, Intrinsic); 3] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32)), ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::BytePairMax)];
 
 const NAMES: [(&str, Intrinsic); 130] = {
     use Intrinsic::*;
