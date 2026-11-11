@@ -232,7 +232,7 @@ impl<'a> Context<'a> {
             _ => None,
         };
         for root in [local_self, of.and_then(ItemRef::declaring_body)].into_iter().flatten() {
-            let in_crate_index = crates.contains(&root.krate) && self.outline.crates[root.krate as usize].anonymous.iter().any(|&(file, item)| file as u32 == root.file && item == root.item);
+            let in_crate_index = crates.contains(&root.krate) && self.outline.crates[root.krate as usize].impl_bodies.iter().any(|&(file, item)| file as u32 == root.file && item == root.item);
             if !in_crate_index && !holders.contains(&Holder::Body(root)) {
                 holders.push(Holder::Body(root));
             }
@@ -321,11 +321,11 @@ impl<'a> Context<'a> {
         index
     }
 
-    /// The impls of crate `krate`: those of its modules, then those in the bodies of its module-level `const _` items.
+    /// The impls of crate `krate`: those of its modules, then those in the bodies of its module-level `const _` items and functions.
     fn crate_impls(&mut self, krate: u32) -> Vec<ImplRef> {
         let tree = &self.outline.crates[krate as usize];
         let mut blocks: Vec<ImplRef> = (0..tree.impls.len() as u32).map(|index| ImplRef::Module { krate, index }).collect();
-        for &(file, item) in &tree.anonymous {
+        for &(file, item) in &tree.impl_bodies {
             let root = ItemRef { krate, file: file as u32, item };
             if self.parse_body(root).is_ok() {
                 blocks.extend(self.body_impls(root));

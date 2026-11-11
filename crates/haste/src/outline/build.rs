@@ -104,7 +104,8 @@ impl Loader<'_> {
             ItemKind::MacroRules | ItemKind::Macro => self.define(file, (index as u32, at), item),
             ItemKind::MacroCall => self.call(file, module, at)?,
             ItemKind::Impl => self.impl_block(index, module, at, file)?,
-            ItemKind::Const if item.name.is_some_and(|name| file.source.text(name) == "_") => self.out.anonymous.push((index, at)),
+            ItemKind::Const if item.name.is_some_and(|name| file.source.text(name) == "_") => self.out.impl_bodies.push((index, at)),
+            ItemKind::Fn if item.body.is_some_and(|open| file.source.holds_word((open, file.source.pair(open)), "impl")) => self.out.impl_bodies.push((index, at)),
             ItemKind::Struct | ItemKind::Enum | ItemKind::Union => self.derive(file, module, (at, item))?,
             _ => {}
         }
