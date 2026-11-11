@@ -10,7 +10,7 @@ use crate::graph::{self, Targets};
 
 use crate::build::{Build, Stamp, stamp};
 
-/// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file and local manifests it was loaded from.
+/// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file, local manifests and local build scripts it was loaded from.
 struct Served<'a> {
     root: &'a Path,
     targets: &'a Targets,
@@ -20,14 +20,16 @@ struct Served<'a> {
 
 impl Served<'_> {
     fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, Stamp)> {
-        let local = workspace.packages.iter().filter(|package| package.local()).map(|package| package.manifest.dir.join("Cargo.toml"));
+        let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| {
+            std::iter::once(package.manifest.dir.join("Cargo.toml")).chain(package.manifest.build.clone())
+        });
         std::iter::once(root.join("Cargo.lock")).chain(local).map(|path| {
             let now = stamp(&path);
             (path, now)
         }).collect()
     }
 
-    /// Loads the workspace again when the lock file or a local manifest changed since it loaded; returns whether it did.
+    /// Loads the workspace again, running changed build scripts, when the lock file, a local manifest or a local build script changed since it loaded; returns whether it did.
     fn reload(&mut self) -> Result<bool> {
         if self.manifests.iter().all(|(path, kept)| stamp(path) == *kept) {
             return Ok(false);
