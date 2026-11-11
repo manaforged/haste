@@ -36,6 +36,7 @@ impl Infer<'_, '_> {
         self.fall_back_numbers()?;
         self.settle_operators(true)?;
         self.settle_projections()?;
+        self.settle_captures()?;
         self.zonk_types()?;
         self.zonk_calls()?;
         Ok(self.out)
