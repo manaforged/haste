@@ -73,7 +73,7 @@ struct Touch {
 
 #[derive(Default)]
 struct Scan {
-    addrs: HashMap<Value, (StackSlot, i64)>,
+    addrs: Vec<Option<(StackSlot, i64)>>,
     addr_insts: Vec<(Inst, StackSlot)>,
     escaped: Vec<bool>,
     vars: Vec<Var>,
@@ -85,7 +85,7 @@ struct Scan {
 impl Scan {
     fn new(func: &Function) -> Self {
         let slots = func.slots.len();
-        let mut scan = Scan { escaped: vec![false; slots], slot_vars: vec![Vec::new(); slots], ..Scan::default() };
+        let mut scan = Scan { addrs: vec![None; func.types.len()], escaped: vec![false; slots], slot_vars: vec![Vec::new(); slots], ..Scan::default() };
         scan.addresses(func);
         for (index, block) in func.blocks.iter().enumerate() {
             for inst in &block.insts {
@@ -96,19 +96,17 @@ impl Scan {
     }
 
     fn addresses(&mut self, func: &Function) {
-        let mut consts = HashMap::default();
+        let mut consts = vec![None; func.types.len()];
         let mut adds = Vec::new();
         for inst in func.blocks.iter().flat_map(|block| &block.insts) {
             let data = &func.insts[inst.index()];
             let Some(result) = data.result else { continue };
             match &data.op {
                 Op::StackAddr(slot, offset) => {
-                    self.addrs.insert(result, (*slot, i64::from(*offset)));
+                    self.addrs[result.index()] = Some((*slot, i64::from(*offset)));
                     self.addr_insts.push((*inst, *slot));
                 }
-                Op::Const(imm) => {
-                    consts.insert(result, *imm);
-                }
+                Op::Const(imm) => consts[result.index()] = Some(*imm),
                 Op::Binary(Binary::Iadd, x, c) => adds.push((*inst, result, *x, *c)),
                 _ => {}
             }
@@ -116,13 +114,13 @@ impl Scan {
         self.derive(&consts, adds);
     }
 
-    fn derive(&mut self, consts: &HashMap<Value, i64>, mut adds: Vec<(Inst, Value, Value, Value)>) {
+    fn derive(&mut self, consts: &[Option<i64>], mut adds: Vec<(Inst, Value, Value, Value)>) {
         loop {
             let before = adds.len();
             adds.retain(|&(inst, result, x, c)| {
-                let (Some(&(slot, base)), Some(&imm)) = (self.addrs.get(&x), consts.get(&c)) else { return true };
+                let (Some((slot, base)), Some(imm)) = (self.addrs[x.index()], consts[c.index()]) else { return true };
                 let Some(offset) = base.checked_add(imm) else { return true };
-                self.addrs.insert(result, (slot, offset));
+                self.addrs[result.index()] = Some((slot, offset));
                 self.addr_insts.push((inst, slot));
                 false
             });
@@ -134,23 +132,23 @@ impl Scan {
 
     fn classify(&mut self, func: &Function, block: Block, inst: Inst) {
         let data = &func.insts[inst.index()];
-        let mut uses = data.op.operands();
+        let mut skip = [None, None];
         if let Some(touch) = self.touch(data) {
-            if let Some(addr) = touch.addr {
-                take(&mut uses, addr);
-            }
+            skip[0] = touch.addr;
             self.access(func, (block, inst), (touch.slot, touch.offset), touch.kind);
         }
         if let Op::Binary(Binary::Iadd, x, _) = &data.op
-            && data.result.is_some_and(|result| self.addrs.contains_key(&result))
+            && data.result.is_some_and(|result| self.addrs[result.index()].is_some())
         {
-            take(&mut uses, *x);
+            skip[1] = Some(*x);
         }
-        for value in uses {
-            if let Some(&(slot, _)) = self.addrs.get(&value) {
+        data.op.for_operands(|value| {
+            if let Some(at) = skip.iter().position(|skipped| *skipped == Some(value)) {
+                skip[at] = None;
+            } else if let Some((slot, _)) = self.addrs[value.index()] {
                 self.escaped[slot.index()] = true;
             }
-        }
+        });
     }
 
     fn touch(&self, data: &InstData) -> Option<Touch> {
@@ -168,7 +166,7 @@ impl Scan {
     }
 
     fn through(&self, addr: Value, offset: i32, kind: Kind) -> Option<Touch> {
-        let &(slot, base) = self.addrs.get(&addr)?;
+        let (slot, base) = self.addrs[addr.index()]?;
         Some(Touch { addr: Some(addr), slot, offset: base.checked_add(i64::from(offset)), kind })
     }
 
@@ -205,12 +203,6 @@ impl Scan {
     }
 }
 
-fn take(uses: &mut Vec<Value>, value: Value) {
-    if let Some(position) = uses.iter().position(|used| *used == value) {
-        uses.swap_remove(position);
-    }
-}
-
 /// A load that promotion replaces, with the type it reads.
 #[derive(Clone, Copy)]
 struct Load {
@@ -220,7 +212,7 @@ struct Load {
 }
 
 struct Local {
-    defs: Vec<HashMap<Block, Value>>,
+    defs: HashMap<(usize, Block), Value>,
     exposed: Vec<Vec<(Block, Load)>>,
     forward: Vec<Vec<(Load, Value)>>,
 }
@@ -228,22 +220,21 @@ struct Local {
 impl Local {
     fn new(scan: &Scan) -> Self {
         let count = scan.vars.len();
-        let mut local =
-            Local { defs: vec![HashMap::default(); count], exposed: vec![Vec::new(); count], forward: vec![Vec::new(); count] };
+        let mut local = Local { defs: HashMap::default(), exposed: vec![Vec::new(); count], forward: vec![Vec::new(); count] };
         for access in &scan.accesses {
-            let defs = &mut local.defs[access.var];
+            let key = (access.var, access.block);
             match access.kind {
                 Kind::Store(value) => {
-                    defs.insert(access.block, value);
+                    local.defs.insert(key, value);
                 }
                 Kind::Load(result) => {
                     let load = Load { inst: access.inst, result, ty: access.ty };
-                    match defs.get(&access.block) {
+                    match local.defs.get(&key) {
                         Some(def) => local.forward[access.var].push((load, *def)),
                         None => {
                             local.exposed[access.var].push((access.block, load));
                             if access.ty == scan.vars[access.var].home() {
-                                defs.insert(access.block, result);
+                                local.defs.insert(key, result);
                             }
                         }
                     }
@@ -251,6 +242,11 @@ impl Local {
             }
         }
         local
+    }
+
+    /// The value `var` holds at the end of `block` when the block writes or reads it.
+    fn def(&self, var: usize, block: Block) -> Option<Value> {
+        self.defs.get(&(var, block)).copied()
     }
 }
 
@@ -343,6 +339,7 @@ struct Build {
     phis: Vec<Phi>,
     staged: HashMap<Value, Value>,
     converts: Vec<(Inst, Convert, Value)>,
+    path: Vec<Block>,
 }
 
 impl Build {
@@ -389,8 +386,8 @@ impl Pass {
             return Some(Step::Done(self.fresh.zero(ty)));
         }
         if let [pred] = preds[..] {
-            return Some(match self.local.defs[var].get(&pred) {
-                Some(def) => Step::Done(*def),
+            return Some(match self.local.def(var, pred) {
+                Some(def) => Step::Done(def),
                 None => Step::Up(pred),
             });
         }
@@ -400,30 +397,30 @@ impl Pass {
     }
 
     fn entry(&mut self, build: &mut Build, var: usize, start: Block) -> Option<Value> {
-        let mut path = Vec::new();
+        build.path.clear();
         let mut block = start;
         let value = loop {
             if let Some(value) = build.memo.get(&(var, block)) {
                 break *value;
             }
-            if path.len() > self.cfg.preds.len() {
+            if build.path.len() > self.cfg.preds.len() {
                 return None;
             }
-            path.push(block);
+            build.path.push(block);
             match self.step(build, var, block)? {
                 Step::Done(value) => break value,
                 Step::Up(pred) => block = pred,
             }
         };
-        for block in path {
+        for &block in &build.path {
             build.memo.insert((var, block), value);
         }
         Some(value)
     }
 
     fn exit(&mut self, build: &mut Build, var: usize, block: Block) -> Option<Value> {
-        match self.local.defs[var].get(&block) {
-            Some(def) => Some(*def),
+        match self.local.def(var, block) {
+            Some(def) => Some(def),
             None => self.entry(build, var, block),
         }
     }
@@ -432,8 +429,10 @@ impl Pass {
         let mut next = 0;
         while next < build.phis.len() {
             let (block, var) = (build.phis[next].block, build.phis[next].var);
-            let mut args = Vec::new();
-            for pred in self.cfg.preds[block.index()].clone() {
+            let count = self.cfg.preds[block.index()].len();
+            let mut args = Vec::with_capacity(count);
+            for at in 0..count {
+                let pred = self.cfg.preds[block.index()][at];
                 args.push(self.exit(build, var, pred)?);
             }
             build.phis[next].args = args;
@@ -480,9 +479,11 @@ impl Pass {
 
     fn build(&mut self, slot: usize) -> Option<Build> {
         let mut build = Build::default();
-        for var in self.scan.slot_vars[slot].clone() {
+        for at in 0..self.scan.slot_vars[slot].len() {
+            let var = self.scan.slot_vars[slot][at];
             let home = self.scan.vars[var].home();
-            for (block, load) in self.local.exposed[var].clone() {
+            for exposed in 0..self.local.exposed[var].len() {
+                let (block, load) = self.local.exposed[var][exposed];
                 let value = self.entry(&mut build, var, block)?;
                 build.bind(home, load, value);
             }
@@ -581,8 +582,11 @@ fn materialize(func: &mut Function, zeros: &[(Type, Value)]) -> Vec<Inst> {
 
 /// Promotes every stack slot whose address never escapes into SSA values carried in block parameters.
 pub(crate) fn run(func: &mut Function) {
-    let Some(entry) = func.entry else { return };
+    let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else { return };
     let scan = Scan::new(func);
+    if !(0..func.slots.len()).any(|slot| scan.promotable(slot)) {
+        return;
+    }
     let local = Local::new(&scan);
     let fresh = Fresh { base: func.types.len(), types: Vec::new(), zeros: Vec::new() };
     let promoted = vec![false; func.slots.len()];

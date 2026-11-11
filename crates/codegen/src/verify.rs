@@ -1,21 +1,34 @@
-use crate::ir::{Binary, Block, Function, Op, Type, Value};
+use crate::ir::{AbiParam, Binary, Block, Function, Op, Type, Value};
+
+fn value_types<'a>(func: &'a Function, values: &'a [Value]) -> impl Iterator<Item = Type> + 'a {
+    values.iter().map(|value| func.ty(*value))
+}
+
+fn abi_types(params: &[AbiParam]) -> impl Iterator<Item = Type> + '_ {
+    params.iter().map(|param| param.value_type)
+}
 
 fn types(func: &Function, values: &[Value]) -> Vec<Type> {
-    values.iter().map(|value| func.ty(*value)).collect()
+    value_types(func, values).collect()
+}
+
+/// Whether `values` have exactly the types of `params`.
+fn typed(func: &Function, values: &[Value], params: &[AbiParam]) -> bool {
+    value_types(func, values).eq(abi_types(params))
 }
 
 fn edge(func: &Function, block: Block, args: &[Value]) -> Result<(), String> {
-    let params = types(func, &func.blocks[block.index()].params);
-    if params != types(func, args) {
-        return Err(format!("block{} takes {params:?}, given {:?}", block.0, types(func, args)));
+    let params = &func.blocks[block.index()].params;
+    if !value_types(func, params).eq(value_types(func, args)) {
+        return Err(format!("block{} takes {:?}, given {:?}", block.0, types(func, params), types(func, args)));
     }
     Ok(())
 }
 
 fn call(func: &Function, sig: usize, args: &[Value]) -> Result<(), String> {
-    let wanted: Vec<Type> = func.sigs[sig].params.iter().map(|param| param.value_type).collect();
-    if wanted != types(func, args) {
-        return Err(format!("a call takes {wanted:?}, given {:?}", types(func, args)));
+    let params = &func.sigs[sig].params;
+    if !typed(func, args, params) {
+        return Err(format!("a call takes {:?}, given {:?}", abi_types(params).collect::<Vec<_>>(), types(func, args)));
     }
     Ok(())
 }
@@ -75,16 +88,16 @@ fn op(func: &Function, op: &Op) -> Result<(), String> {
 fn try_call(func: &Function, sig: usize, args: &[Value], normal: Block, handler: Block) -> Result<(), String> {
     call(func, sig, args)?;
     edge(func, normal, &[])?;
-    match types(func, &func.blocks[handler.index()].params)[..] {
-        [Type::I64] if func.sigs[sig].returns.is_empty() => Ok(()),
+    match func.blocks[handler.index()].params[..] {
+        [exception] if func.ty(exception) == Type::I64 && func.sigs[sig].returns.is_empty() => Ok(()),
         _ => Err("a try_call returns nothing and its handler takes only the exception".to_owned()),
     }
 }
 
 fn returned(func: &Function, values: &[Value]) -> Result<(), String> {
-    let wanted: Vec<Type> = func.signature.returns.iter().map(|param| param.value_type).collect();
-    if wanted != types(func, values) {
-        return Err(format!("return of {:?} from a function returning {wanted:?}", types(func, values)));
+    let returns = &func.signature.returns;
+    if !typed(func, values, returns) {
+        return Err(format!("return of {:?} from a function returning {:?}", types(func, values), abi_types(returns).collect::<Vec<_>>()));
     }
     Ok(())
 }
@@ -92,8 +105,7 @@ fn returned(func: &Function, values: &[Value]) -> Result<(), String> {
 /// Checks that every instruction agrees with the types of its operands, blocks and signatures, and every block ends with one terminator.
 pub(crate) fn verify(func: &Function) -> Result<(), String> {
     let entry = func.entry.ok_or("the function has no entry block")?;
-    let wanted: Vec<Type> = func.signature.params.iter().map(|param| param.value_type).collect();
-    if types(func, &func.blocks[entry.index()].params) != wanted {
+    if !typed(func, &func.blocks[entry.index()].params, &func.signature.params) {
         return Err("the entry block parameters do not match the signature".to_owned());
     }
     for inst in &func.insts {

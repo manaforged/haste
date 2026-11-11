@@ -314,7 +314,11 @@ impl Fold {
 
     /// Moves the edge to `target` with `args` along the blocks that only jump on, or only branch on a parameter the edge makes a constant, to the first block that does more, keeping `uses` counting the edge's new arguments.
     fn retarget(&self, func: &Function, (uses, pinned): (&mut [u32], &[bool]), target: &mut Block, args: &mut Vec<Value>) -> bool {
-        let (mut at, mut values, mut seen) = (*target, args.clone(), vec![*target]);
+        let Some((first, first_values)) = self.step(func, (uses, pinned), *target, args) else { return false };
+        if first == *target {
+            return false;
+        }
+        let (mut at, mut values, mut seen) = (first, first_values, vec![*target, first]);
         while let Some((next, next_values)) = self.step(func, (uses, pinned), at, &values) {
             if seen.contains(&next) {
                 return false;
@@ -322,7 +326,7 @@ impl Fold {
             seen.push(next);
             (at, values) = (next, next_values);
         }
-        if at == *target || !self.agrees(func, at, &values) {
+        if !self.agrees(func, at, &values) {
             return false;
         }
         args.iter().for_each(|value| uses[value.index()] -= 1);
@@ -353,9 +357,12 @@ impl Fold {
             },
             _ => return None,
         };
-        let mut reads = vec![0_u32; data.params.len()];
-        op.for_operands(|value| if let Some(at) = param(&value) { reads[at] += 1 });
-        if pinned[next.index()] || data.params.iter().zip(&reads).any(|(param, read)| uses[param.index()] != *read) {
+        let reads = |param: Value| {
+            let mut count = 0_u32;
+            op.for_operands(|value| count += u32::from(value == param));
+            count
+        };
+        if pinned[next.index()] || data.params.iter().any(|param| uses[param.index()] != reads(*param)) {
             return None;
         }
         Some((next, next_args.iter().map(|value| param(value).map_or(*value, |at| args[at])).collect()))
@@ -437,16 +444,18 @@ fn pinned(func: &Function, entry: Block) -> Vec<bool> {
 
 /// Drops the parameters `fold` replaced, and their arguments on every edge.
 fn drop_params(func: &mut Function, fold: &Fold) {
-    let gone: Vec<Vec<bool>> = func.blocks.iter().map(|block| block.params.iter().map(|param| fold.subst[param.index()] != *param).collect()).collect();
+    let gone = |param: &Value| fold.subst[param.index()] != *param;
+    let blocks = &func.blocks;
     let keep = |args: &mut Vec<Value>, target: Block| {
+        let params = &blocks[target.index()].params;
         let mut index = 0;
         args.retain(|_| {
             index += 1;
-            !gone[target.index()].get(index - 1).copied().unwrap_or(false)
+            !params.get(index - 1).is_some_and(gone)
         });
     };
-    for block in 0..func.blocks.len() {
-        let Some(&last) = func.blocks[block].insts.last() else { continue };
+    for block in blocks {
+        let Some(&last) = block.insts.last() else { continue };
         match &mut func.insts[last.index()].op {
             Op::Jump(target, args) => keep(args, *target),
             Op::Brif(_, then, then_args, otherwise, else_args) => {
@@ -456,12 +465,8 @@ fn drop_params(func: &mut Function, fold: &Fold) {
             _ => {}
         }
     }
-    for (block, gone) in func.blocks.iter_mut().zip(&gone) {
-        let mut index = 0;
-        block.params.retain(|_| {
-            index += 1;
-            !gone[index - 1]
-        });
+    for block in &mut func.blocks {
+        block.params.retain(|param| !gone(param));
     }
 }
 
@@ -503,8 +508,10 @@ fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
 /// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
 fn dead(func: &mut Function) {
     let mut uses = use_counts(func);
+    let mut keep = Vec::new();
     for block in func.blocks.iter_mut().rev() {
-        let mut keep = vec![true; block.insts.len()];
+        keep.clear();
+        keep.resize(block.insts.len(), true);
         for (at, inst) in block.insts.iter().enumerate().rev() {
             let data = &func.insts[inst.index()];
             if pure(&data.op) && data.result.is_some_and(|result| uses[result.index()] == 0) {
@@ -580,7 +587,7 @@ fn invert(func: &mut Function) {
             _ => {}
         }
     }
-    let types = func.types.clone();
+    let types = &func.types;
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         let op = &mut func.insts[inst.index()].op;
         if let Some((cc, a, b)) = negated(op, &consts).and_then(|value| compares[value.index()]) {

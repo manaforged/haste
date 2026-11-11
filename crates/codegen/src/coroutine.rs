@@ -86,9 +86,9 @@ fn crossing(func: &Function, defs: &[Option<Block>]) -> Vec<Value> {
     let mut found = vec![false; func.types.len()];
     for (index, block) in func.blocks.iter().enumerate() {
         for inst in &block.insts {
-            for value in func.insts[inst.index()].op.operands() {
+            func.insts[inst.index()].op.for_operands(|value| {
                 found[value.index()] |= defs[value.index()].is_some_and(|home| home.index() != index);
-            }
+            });
         }
     }
     found.iter().enumerate().filter(|(_, crosses)| **crosses).map(|(at, _)| Value(at as u32)).collect()
@@ -119,12 +119,12 @@ fn rewrite(func: &mut Function, block: Block, (frame, anchor): (&Frame, StackSlo
     for inst in old {
         let mut data = func.insts[inst.index()].clone();
         let mut loaded = HashMap::default();
-        for value in data.op.operands() {
+        data.op.for_operands(|value| {
             if let (Some(&at), false) = (frame.spills.get(&value), loaded.contains_key(&value)) {
                 let ty = func.types[value.index()];
                 loaded.insert(value, push(func, &mut insts, Op::Load(fp, at), Some(ty)).expect("a load has a result"));
             }
-        }
+        });
         data.op.map_operands(|value| loaded.get(&value).copied().unwrap_or(value));
         data.op = match data.op {
             Op::StackAddr(slot, offset) => {
