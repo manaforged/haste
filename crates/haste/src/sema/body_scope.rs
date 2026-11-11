@@ -1,9 +1,10 @@
 //! Names inside a function body: the items that its blocks and the modules it declares hold, found from the innermost scope out, as rustc resolves them.
 
 use crate::names::collect::{import_parts, namespaces};
-use crate::names::path::Path as NamePath;
-use crate::names::{Binding, Def, ItemRef, ModRef, Ns, Origin, PerNs, SELF, Sym, plain};
+use crate::names::path::{Path as NamePath, Paths};
+use crate::names::{Binding, Def, ItemRef, ModRef, Ns, Origin, PerNs, SELF, Sym, Symbols, plain};
 use crate::outline::item::{Item, ItemKind, Vis};
+use crate::outline::tree::{File, Index};
 
 use super::Context;
 
@@ -34,10 +35,14 @@ impl<'a> Context<'a> {
     /// The item named `name`, in namespace `ns` or any when none, that the body item `level` of `root`, or the body itself when none, holds directly or in an extern block.
     fn body_child(&self, root: ItemRef, level: Option<u32>, name: &str, ns: Option<Ns>) -> Option<ItemRef> {
         let found = self.expansion(root)?;
-        let (src, items) = (&found.file.source, &found.file.items.items[..]);
-        let held = |entry: &Item| entry.parent == level || entry.parent.is_some_and(|at| items[at as usize].kind == ItemKind::ExternBlock && items[at as usize].parent == level);
-        let named = |entry: &Item| entry.name.is_some_and(|at| plain(src.text(at)) == name) && ns.is_none_or(|ns| in_namespace(entry, ns));
-        items.iter().position(|entry| held(entry) && named(entry)).map(|at| root.inner(at as u32))
+        let items = &found.file.items.items;
+        let held = self.body_index(&found.file).items.get(&level)?.get(name)?;
+        held.iter().find(|&&at| ns.is_none_or(|ns| in_namespace(&items[at as usize], ns))).map(|&at| root.inner(at))
+    }
+
+    /// The name index of the body expansion `file`, made on first use and kept with it.
+    fn body_index(&self, file: &'a File) -> &'a Index {
+        file.index(|file| index_of(file, &self.names.symbols))
     }
 
     /// The item named `name` that code at the body item `from` of `root`, or in the body's own blocks when none, sees: in the blocks around it, then in its module, innermost first.
@@ -121,44 +126,47 @@ impl<'a> Context<'a> {
         if file.items.imports.is_empty() {
             return Vec::new();
         }
-        let paths = self.paths(home.krate);
+        let (paths, index) = (self.paths(home.krate), self.body_index(file));
+        let named = word.and_then(|word| index.imports.get(self.names.symbols.text(word))).map_or(&[][..], |list| &list[..]);
+        let globbed = if word.is_some() { &index.globs[..] } else { &[][..] };
+        let every = if word.is_none() { 0..file.items.imports.len() as u32 } else { 0..0 };
         let (mut out, mut globs) = (Vec::new(), Vec::new());
-        for import in 0..file.items.imports.len() as u32 {
-            if !import_visible(file, import, here) {
+        for import in named.iter().chain(globbed).copied().chain(every) {
+            if !import_visible(file, index, import, here) {
                 continue;
             }
-            let (segments, absolute, dollar, name) = import_parts(file, import, &self.names.symbols);
-            if name.zip(word).is_some_and(|(name, word)| name != word) {
-                continue;
-            }
-            let segments = segments.strip_suffix(&[SELF]).unwrap_or(&segments);
-            let absolute = paths.use_path(NamePath { segments, absolute, dollar }).absolute;
-            let (head, leaf) = match (name, segments.split_last(), word) {
-                (None, _, Some(word)) => (segments, word),
-                (Some(_), Some((&leaf, head)), _) => (head, leaf),
-                (None, Some(_), None) => {
-                    let glob = paths.resolve(&NamePath { segments, absolute, dollar }, home);
-                    globs.extend(glob.map(|def| PerNs { types: Some(Binding { def, vis: Vis::Pub, origin: Origin::Glob }), values: None, macros: None }));
-                    continue;
-                }
-                _ => continue,
-            };
-            let from = file.items.items[file.items.imports[import as usize].item as usize].parent;
-            let local = if absolute { None } else { self.body_import(root, from, head, leaf) };
-            let entry = match head {
-                _ if let Some(local) = local => local,
-                [] => paths.first(leaf, home, &NamePath { segments: &[leaf], absolute, dollar }),
-                _ => match paths.resolve(&NamePath { segments: head, absolute, dollar }, home) {
-                    Some(def) => self.path_member(home.krate, def, leaf),
-                    None => continue,
-                },
-            };
-            if entry.types.is_some() || entry.values.is_some() {
-                if name.is_some() { out.push(entry) } else { globs.push(entry) }
+            match self.import_entry((root, home), &paths, (file, import), word) {
+                Some((true, entry)) => out.push(entry),
+                Some((false, entry)) => globs.push(entry),
+                None => {}
             }
         }
         out.extend(globs);
         out
+    }
+
+    /// What the import `import` of the body expansion `file` gives `word`, or every name it imports when none, and whether it is a named import rather than a glob.
+    fn import_entry(&self, (root, home): (ItemRef, ModRef), paths: &Paths<'_>, (file, import): (&File, u32), word: Option<Sym>) -> Option<(bool, PerNs)> {
+        let (segments, absolute, dollar, name) = import_parts(file, import, &self.names.symbols);
+        let segments = segments.strip_suffix(&[SELF]).unwrap_or(&segments);
+        let absolute = paths.use_path(NamePath { segments, absolute, dollar }).absolute;
+        let (head, leaf) = match (name, segments.split_last(), word) {
+            (None, _, Some(word)) => (segments, word),
+            (Some(_), Some((&leaf, head)), _) => (head, leaf),
+            (None, Some(_), None) => {
+                let def = paths.resolve(&NamePath { segments, absolute, dollar }, home)?;
+                return Some((false, PerNs { types: Some(Binding { def, vis: Vis::Pub, origin: Origin::Glob }), values: None, macros: None }));
+            }
+            _ => return None,
+        };
+        let from = file.items.items[file.items.imports[import as usize].item as usize].parent;
+        let local = if absolute { None } else { self.body_import(root, from, head, leaf) };
+        let entry = match head {
+            _ if let Some(local) = local => local,
+            [] => paths.first(leaf, home, &NamePath { segments: &[leaf], absolute, dollar }),
+            _ => self.path_member(home.krate, paths.resolve(&NamePath { segments: head, absolute, dollar }, home)?, leaf),
+        };
+        (entry.types.is_some() || entry.values.is_some()).then_some((name.is_some(), entry))
     }
 
     /// The bindings of `leaf` in the item that `head`, written at the body item `from` of `root`, names among the items the body declares: a variant of an enum or an item of a module.
@@ -208,9 +216,34 @@ impl<'a> Context<'a> {
 }
 
 /// Whether the `use` declaration `import` of a body's expansion `file` is in scope at token `here`, or in the body itself when `here` is none: it is unless a function declared in the body holds it and not `here`.
-fn import_visible(file: &crate::outline::tree::File, import: u32, here: Option<u32>) -> bool {
-    let items = &file.items.items;
-    let at = items[file.items.imports[import as usize].item as usize].start;
-    let holds = |entry: &crate::outline::item::Item, token: u32| entry.start <= token && token < entry.end;
-    items.iter().all(|entry| entry.kind != ItemKind::Fn || !holds(entry, at) || here.is_some_and(|here| holds(entry, here)))
+fn import_visible(file: &File, index: &Index, import: u32, here: Option<u32>) -> bool {
+    index.holders[import as usize].iter().all(|&at| here.is_some_and(|here| holds(&file.items.items[at as usize], here)))
+}
+
+/// Whether the tokens of `entry` hold token `token`.
+fn holds(entry: &Item, token: u32) -> bool {
+    entry.start <= token && token < entry.end
+}
+
+/// The name index of a body's expansion `file`: its items by holder and plain name, its imports by the name `symbols` spells for them, and the functions around each import.
+fn index_of(file: &File, symbols: &Symbols) -> Index {
+    let (src, items) = (&file.source, &file.items.items);
+    let mut index = Index::default();
+    for (at, entry) in items.iter().enumerate() {
+        let Some(name) = entry.name else { continue };
+        let block = entry.parent.filter(|&parent| items[parent as usize].kind == ItemKind::ExternBlock);
+        for level in [Some(entry.parent), block.map(|parent| items[parent as usize].parent)].into_iter().flatten() {
+            index.items.entry(level).or_default().entry(plain(src.text(name)).into()).or_default().push(at as u32);
+        }
+    }
+    let fns: Vec<u32> = (0..items.len() as u32).filter(|&at| items[at as usize].kind == ItemKind::Fn).collect();
+    for import in 0..file.items.imports.len() as u32 {
+        match import_parts(file, import, symbols).3 {
+            Some(name) => index.imports.entry(symbols.text(name).into()).or_default().push(import),
+            None => index.globs.push(import),
+        }
+        let start = items[file.items.imports[import as usize].item as usize].start;
+        index.holders.push(fns.iter().copied().filter(|&at| holds(&items[at as usize], start)).collect());
+    }
+    index
 }
