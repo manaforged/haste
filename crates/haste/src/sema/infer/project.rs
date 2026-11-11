@@ -1,8 +1,10 @@
 use anyhow::{Result, bail};
 
+use crate::body::sig::Predicate;
 use crate::body::{Body, PathId};
 use crate::names::{ItemRef, ModRef};
 use crate::outline::item::ItemKind;
+use crate::outline::source::Source;
 
 use super::super::impls::ImplRef;
 use super::super::ty::{Kind, Ty};
@@ -202,18 +204,25 @@ impl Infer<'_, '_> {
         for (header, src) in self.headers()? {
             let (arena, _, predicates) = header.parts();
             self.in_source(src, |infer| {
-                for predicate in predicates {
-                    let Some(ty) = predicate.ty.filter(|&ty| one_name(arena, src, ty).is_none()) else { continue };
-                    let Ok(ty) = infer.lower_ty(arena, ty) else { continue };
-                    for &bound in arena.list(predicate.bounds) {
-                        let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else { continue };
-                        found.push((of, std::iter::once(ty).chain(infer.bound_args(of, arena, path, ty)?).collect()));
-                    }
+                for (ty, bound) in infer.typed_predicates(arena, src, predicates) {
+                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else { continue };
+                    found.push((of, std::iter::once(ty).chain(infer.bound_args(of, arena, path, ty)?).collect()));
                 }
                 Ok(())
             })?;
         }
         Ok(found)
+    }
+
+    /// Each bound of the where-clauses in `predicates` whose bounded type is not one parameter, with that type lowered in the current frame.
+    fn typed_predicates(&mut self, arena: &Body, src: &Source, predicates: &[Predicate]) -> Vec<(Ty, u32)> {
+        let mut found = Vec::new();
+        for predicate in predicates {
+            let Some(ty) = predicate.ty.filter(|&ty| one_name(arena, src, ty).is_none()) else { continue };
+            let Ok(ty) = self.lower_ty(arena, ty) else { continue };
+            found.extend(arena.list(predicate.bounds).iter().map(|&bound| (ty, bound)));
+        }
+        found
     }
 
     /// Whether trait `of` has a member `name`.
@@ -338,6 +347,12 @@ impl Infer<'_, '_> {
                 for bound in named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), name) {
                     infer.bind_bound(&sig.body, home, (bound, ty))?;
                 }
+            }
+            for (ty, bound) in infer.typed_predicates(&sig.body, src, &sig.predicates) {
+                if infer.bound_trait_at(&sig.body, bound, home).is_some_and(|(of, _)| infer.compiler_trait(of)) {
+                    continue;
+                }
+                infer.bind_bound(&sig.body, home, (bound, ty))?;
             }
             Ok(())
         })
