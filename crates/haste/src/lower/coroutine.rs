@@ -95,9 +95,9 @@ impl Lower<'_, '_> {
         let Some(poll) = self.typed.ret else { bail!("a resume function with no result") };
         let sret = self.resume.as_ref().and_then(|resume| resume.sret);
         match (sret, value, repr(self.cx, poll)?) {
-            (Some(slot), Some(value), Repr::Mem { size, .. }) => {
+            (Some(slot), Some(value), whole @ Repr::Mem { .. }) => {
                 let out = self.ins().stack_load(Type::I64, slot, 0);
-                self.copy(out, value, size);
+                self.copy(out, value, whole);
                 self.ins().return_(&[]);
             }
             (None, Some(value), Repr::Scalar(_) | Repr::Mem { .. }) => {

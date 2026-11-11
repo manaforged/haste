@@ -19,8 +19,7 @@ impl Lower<'_, '_> {
             return Ok(None);
         }
         let from = self.scrutinee_path(scrutinee);
-        let join = self.b.create_block();
-        let joined = Self::carrier(self.repr_of(expr)?).map(|ty| self.b.append_block_param(join, ty));
+        let (join, joined, slot) = self.join_block(expr)?;
         for at in self.body.list(arms).to_vec() {
             if !self.open {
                 break;
@@ -37,7 +36,7 @@ impl Lower<'_, '_> {
             self.commit_moves()?;
             let value = self.expr(arm.body)?;
             self.end_scope(mark)?;
-            self.branch_value(value, join);
+            self.branch_into(value, (join, slot));
             self.enter(next);
         }
         if self.open {
@@ -45,7 +44,7 @@ impl Lower<'_, '_> {
             self.close();
         }
         self.enter(join);
-        Ok(joined)
+        Ok(self.joined(joined, slot))
     }
 
     /// Lowers the condition `let pat = init` to whether it matched, binding its names on the way that did.

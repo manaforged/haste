@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Block, Function, Signature, StackSlot, Type, Value};
+use haste_codegen::{Block, Function, Signature, Type, Value};
 
 use crate::body::{Expr, ExprId, List, UnOp};
 use crate::names::ItemRef;
@@ -12,7 +12,7 @@ use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::Place;
-use super::{Loop, Lower, Repr, repr};
+use super::{Loop, Lower, Parts, Repr, repr};
 
 /// The most instructions a sysroot body may have, after slot promotion, for a call to copy it inline.
 const INLINE_LIMIT: usize = 30;
@@ -225,6 +225,14 @@ impl Lower<'_, '_> {
         }
     }
 
+    /// The frame slot that branches write a value of `repr` into for the block they join, when it is a small value made of scalars; other values cross the edge in their carrier.
+    pub(super) fn join_slot(&mut self, repr: Repr) -> Option<Place> {
+        match repr {
+            Repr::Mem { parts, .. } if parts != Parts::Bytes => self.slot(repr).map(|slot| Place::slot(slot, repr)),
+            _ => None,
+        }
+    }
+
     fn call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
         if let Some(Res::Fn(item, substs)) = self.typed.res.get(&expr).cloned() {
             return self.call_value((expr, callee), (item, substs), args);
@@ -407,32 +415,59 @@ impl Lower<'_, '_> {
         }
     }
 
+    /// The block that the branches of `expr` join, and where each leaves its value: the join's parameter, or the slot of `join_slot`.
+    pub(super) fn join_block(&mut self, expr: ExprId) -> Result<(Block, Option<Value>, Option<Place>)> {
+        let join = self.b.create_block();
+        let repr = self.repr_of(expr)?;
+        let slot = self.join_slot(repr);
+        let joined = Self::carrier(repr).filter(|_| slot.is_none()).map(|ty| self.b.append_block_param(join, ty));
+        Ok((join, joined, slot))
+    }
+
+    /// Goes to `join` with `value`, written into `slot` first when the join takes it there.
+    pub(super) fn branch_into(&mut self, value: Option<Value>, (join, slot): (Block, Option<Place>)) {
+        match (slot, value) {
+            (Some(place), Some(value)) if self.open => {
+                self.write(place, value);
+                self.branch_value(None, join);
+            }
+            _ => self.branch_value(value, join),
+        }
+    }
+
+    /// The value that the branches left at `join`, once the cursor is there.
+    pub(super) fn joined(&mut self, joined: Option<Value>, slot: Option<Place>) -> Option<Value> {
+        match slot {
+            Some(place) => self.read(place),
+            None => joined,
+        }
+    }
+
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
         let mark = self.owned.len();
         let Some(test) = self.expr(cond)? else { return Ok(None) };
-        let (then_block, else_block, join) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
-        let result = match otherwise {
-            Some(_) => Self::carrier(self.repr_of(expr)?),
-            None => None,
+        let (then_block, else_block) = (self.b.create_block(), self.b.create_block());
+        let (join, joined, slot) = match otherwise {
+            Some(_) => self.join_block(expr)?,
+            None => (self.b.create_block(), None, None),
         };
-        let joined = result.map(|ty| self.b.append_block_param(join, ty));
         self.brif(test, (then_block, &[]), (else_block, &[]));
         self.enter(then_block);
         let value = self.expr(then)?;
         if self.open {
             self.drop_to(mark)?;
         }
-        self.branch_value(value, join);
+        self.branch_into(value, (join, slot));
         self.enter(else_block);
         self.drop_to(mark)?;
         let value = match otherwise {
             Some(otherwise) => self.expr(otherwise)?,
             None => None,
         };
-        self.branch_value(value, join);
+        self.branch_into(value, (join, slot));
         self.owned.truncate(mark);
         self.enter(join);
-        Ok(joined)
+        Ok(self.joined(joined, slot))
     }
 
     fn while_expr(&mut self, cond: ExprId, body: ExprId, label: Option<u32>) -> Result<Option<Value>> {
@@ -458,19 +493,24 @@ impl Lower<'_, '_> {
         self.loops.push(Loop { head: exit, exit, value, depth: self.owned.len(), label: Some(label), block: true });
         let output = self.block(stmts, tail);
         self.loops.pop();
-        if let (Some(output), Some((slot, _))) = (output?, value)
+        if let (Some(output), Some(place)) = (output?, value)
             && self.open
         {
-            self.ins().stack_store(output, slot, 0);
+            self.write(place, output);
         }
         self.branch_value(None, exit);
         self.enter(exit);
-        Ok(value.map(|(slot, ty)| self.ins().stack_load(ty, slot, 0)))
+        Ok(value.and_then(|place| self.read(place)))
     }
 
-    /// A stack slot for the value of the loop or block `expr` that its `break`s leave with, when it has a scalar value.
-    pub(super) fn value_slot(&mut self, expr: ExprId) -> Result<Option<(StackSlot, Type)>> {
-        Ok(Self::carrier(self.repr_of(expr)?).map(|ty| (self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8), ty)))
+    /// The frame slot that the `break`s of the loop or block `expr` leave its value in: the value itself when `join_slot` holds it, else its carrier.
+    pub(super) fn value_slot(&mut self, expr: ExprId) -> Result<Option<Place>> {
+        let repr = self.repr_of(expr)?;
+        if let Some(place) = self.join_slot(repr) {
+            return Ok(Some(place));
+        }
+        let held = Self::carrier(repr).map_or(Repr::Zst, Repr::Scalar);
+        Ok(self.slot(held).map(|slot| Place::slot(slot, held)))
     }
 
     fn loop_expr(&mut self, expr: ExprId, body: ExprId, label: Option<u32>) -> Result<Option<Value>> {
@@ -485,7 +525,7 @@ impl Lower<'_, '_> {
         result?;
         self.branch_value(None, head);
         self.enter(exit);
-        Ok(value.map(|(slot, ty)| self.ins().stack_load(ty, slot, 0)))
+        Ok(value.and_then(|place| self.read(place)))
     }
 
     fn jump_target(&self, label: Option<u32>) -> Option<Loop> {
@@ -498,8 +538,8 @@ impl Lower<'_, '_> {
             None => None,
         };
         let Some(Loop { exit, value: slot, depth, .. }) = self.jump_target(label) else { bail!("`break` outside a loop") };
-        if let (Some(value), Some((slot, _))) = (value, slot) {
-            self.ins().stack_store(value, slot, 0);
+        if let (Some(value), Some(place)) = (value, slot) {
+            self.write(place, value);
         }
         self.drop_to(depth)?;
         self.branch_value(None, exit);
