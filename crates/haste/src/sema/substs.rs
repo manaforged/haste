@@ -1,20 +1,13 @@
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, RwLock};
 
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHashMap;
 
 use crate::names::ItemRef;
+use crate::sync::{read_lock, shard_index, write_lock};
 
 use super::ty::Ty;
 
 const SHARDS: usize = 32;
-
-fn shard_index<K: Hash + ?Sized>(key: &K) -> usize {
-    let mut hasher = FxHasher::default();
-    key.hash(&mut hasher);
-    let hash = hasher.finish();
-    (((hash >> 58) ^ (hash >> 29) ^ hash) as usize) & (SHARDS - 1)
-}
 
 fn pack_handle(shard: usize, index: usize) -> u32 {
     (((index as u32) << 5) | (shard as u32)) + 1
@@ -78,14 +71,14 @@ impl SubstsPool {
         if slice.is_empty() {
             return Substs::EMPTY;
         }
-        let shard_idx = shard_index(slice);
+        let shard_idx = shard_index::<_, SHARDS>(slice);
         let lock = &self.shards[shard_idx];
-        let guard = lock.read().unwrap_or_else(PoisonError::into_inner);
+        let guard = read_lock(lock);
         if let Some(&id) = guard.map.get(slice) {
             return id;
         }
         drop(guard);
-        let mut guard = lock.write().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = write_lock(lock);
         if let Some(&id) = guard.map.get(slice) {
             return id;
         }
@@ -102,7 +95,7 @@ impl SubstsPool {
     /// The slice of type arguments that `id` names.
     pub fn get(&self, id: Substs) -> &[Ty] {
         let Some((shard_idx, index)) = unpack_handle(id.0) else { return &[] };
-        let guard = self.shards[shard_idx].read().unwrap_or_else(PoisonError::into_inner);
+        let guard = read_lock(&self.shards[shard_idx]);
         let Some(&ptr) = guard.entries.get(index) else { return &[] };
         // SAFETY: `ptr` belongs to `self.shards`, whose `Arc` outlives `&self`, and its `[Ty]` elements never mutate.
         unsafe { &*ptr }
@@ -163,14 +156,14 @@ impl Default for ProjPool {
 impl ProjPool {
     /// Interns `def` and returns its handle.
     pub fn intern(&self, def: ProjDef) -> ProjId {
-        let shard_idx = shard_index(&def);
+        let shard_idx = shard_index::<_, SHARDS>(&def);
         let lock = &self.shards[shard_idx];
-        let guard = lock.read().unwrap_or_else(PoisonError::into_inner);
+        let guard = read_lock(lock);
         if let Some(&id) = guard.map.get(&def) {
             return id;
         }
         drop(guard);
-        let mut guard = lock.write().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = write_lock(lock);
         if let Some(&id) = guard.map.get(&def) {
             return id;
         }
@@ -183,7 +176,7 @@ impl ProjPool {
     /// The projection definition that `id` names.
     pub fn get(&self, id: ProjId) -> ProjDef {
         let (shard_idx, index) = unpack_handle(id.0).unwrap_or((0, 0));
-        let guard = self.shards[shard_idx].read().unwrap_or_else(PoisonError::into_inner);
+        let guard = read_lock(&self.shards[shard_idx]);
         guard.entries[index]
     }
 }

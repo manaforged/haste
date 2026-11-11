@@ -18,7 +18,9 @@ impl Lower<'_, '_> {
         let Some(env) = self.cx.closure_env(ty) else { bail!("a closure whose captures are not known") };
         let Some(closure) = self.typed.closures.get(&expr).cloned() else { bail!("a closure expression with no inferred closure") };
         let shape = repr(self.cx, env)?;
-        let Some(slot) = self.slot(shape) else { return Ok(None) };
+        let Some(slot) = self.slot(shape) else {
+            return Ok(None);
+        };
         let object = Place::slot(slot, shape);
         let (whole, env) = match closure.coroutine {
             true => self.coroutine_header(ty, object, env)?,
@@ -62,7 +64,9 @@ impl Lower<'_, '_> {
 
     /// Points each local that the closure being lowered captures at its place in the environment.
     pub(super) fn bind_captures(&mut self) -> Result<()> {
-        let Shape::Closure(ClosureBody { env: Some(local), closure, .. }) = self.typed.shape.clone() else { return Ok(()) };
+        let Shape::Closure(ClosureBody { env: Some(local), closure, .. }) = self.typed.shape.clone() else {
+            return Ok(());
+        };
         let (whole, env) = self.env_place(local, closure.coroutine)?;
         for (index, capture) in closure.captures.iter().enumerate() {
             let part = self.part_place(whole, env, (0, index as u32))?;
@@ -169,7 +173,9 @@ impl Lower<'_, '_> {
         if self.cx.call_once() == Some(item) {
             return self.boxed_once_call((expr, callee), (item, substs), args);
         }
-        let Some((place, _)) = self.autoderef_place(expr, callee)? else { return Ok(None) };
+        let Some((place, _)) = self.autoderef_place(expr, callee)? else {
+            return Ok(None);
+        };
         let receiver = self.address(place);
         let tuple = match self.typed.overloaded.contains(&expr) {
             true => self.args_tuple(args),
@@ -230,7 +236,9 @@ impl Lower<'_, '_> {
     }
 
     fn pointed_env(&mut self, expr: ExprId, callee: ExprId) -> Result<Vec<Value>> {
-        let Some((place, ty)) = self.autoderef_place(expr, callee)? else { return Ok(Vec::new()) };
+        let Some((place, ty)) = self.autoderef_place(expr, callee)? else {
+            return Ok(Vec::new());
+        };
         if self.cx.closure_consumes(ty) {
             bail!("calling a closure that consumes itself through a pointer is not supported yet");
         }

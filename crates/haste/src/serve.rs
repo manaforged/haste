@@ -5,8 +5,8 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Result, bail};
 use crate::graph::{self, Targets};
+use anyhow::{Result, bail};
 
 use crate::build::{Build, Stamp, stamp};
 
@@ -22,16 +22,17 @@ impl Served<'_> {
     fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, Stamp)> {
         let top = graph::workspace_root(root).unwrap_or_else(|_| root.to_owned());
         let head = [top.join("Cargo.lock"), top.join("Cargo.toml"), root.join("Cargo.toml")];
-        let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| {
-            std::iter::once(package.manifest.dir.join("Cargo.toml")).chain(package.manifest.build.clone())
-        });
+        let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| std::iter::once(package.manifest.dir.join("Cargo.toml")).chain(package.manifest.build.clone()));
         let mut paths: Vec<PathBuf> = head.into_iter().chain(local).collect();
         paths.sort();
         paths.dedup();
-        paths.into_iter().map(|path| {
-            let now = stamp(&path);
-            (path, now)
-        }).collect()
+        paths
+            .into_iter()
+            .map(|path| {
+                let now = stamp(&path);
+                (path, now)
+            })
+            .collect()
     }
 
     /// Loads the workspace again, running changed build scripts, when the lock file, a local manifest or a local build script changed since it loaded; returns whether it did.
@@ -150,7 +151,9 @@ fn connect(root: &std::path::Path) -> Result<Option<RawFd>> {
 
 /// Sends `request` and `args` with this process's stdout and stderr to the server of `root`, waits for it, and returns its status, or none when no server runs.
 pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<Option<i32>> {
-    let Some(fd) = connect(root)? else { return Ok(None) };
+    let Some(fd) = connect(root)? else {
+        return Ok(None);
+    };
     // SAFETY: fd is a connected socket that this File owns from here on.
     let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
     std::io::stdout().flush()?;
@@ -292,7 +295,9 @@ fn restore(saved: [RawFd; 3], received: &[RawFd]) {
     drop(std::io::stderr().flush());
     // SAFETY: saved holds the duplicates of this process's own standard descriptors.
     for (&own, kept) in STDIO.iter().zip(saved) {
-        unsafe { libc::dup2(kept, own); }
+        unsafe {
+            libc::dup2(kept, own);
+        }
     }
     close_all(&saved);
     close_all(received);
@@ -301,7 +306,9 @@ fn restore(saved: [RawFd; 3], received: &[RawFd]) {
 fn close_all(fds: &[RawFd]) {
     // SAFETY: fds are descriptors this process owns and nothing else uses after this call.
     for &fd in fds {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
 }
 

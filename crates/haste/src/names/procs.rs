@@ -5,7 +5,7 @@ use crate::outline::item::ProcKind;
 use crate::outline::source::Source;
 use crate::outline::tree::{Held, Waiting};
 
-use super::path::{Requests, Paths};
+use super::path::{Paths, Requests};
 use super::resolve::{macro_at, paths_of};
 use super::{ItemRef, ModRef, Names, collect};
 

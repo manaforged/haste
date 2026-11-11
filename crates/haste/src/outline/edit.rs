@@ -27,7 +27,9 @@ impl Outline {
         if crates.is_empty() {
             return Ok(Edit::Same);
         }
-        let Some(&(krate, file)) = slots.first() else { return Ok(Edit::Items(crates)) };
+        let Some(&(krate, file)) = slots.first() else {
+            return Ok(Edit::Items(crates));
+        };
         let old = self.crates[krate as usize].files[file as usize].clone();
         let new = read(path)?;
         if same_places(&old, &new) {
@@ -49,10 +51,10 @@ impl Outline {
         if crates.is_empty() {
             return Ok(Edit::Same);
         }
-        let Some(&(krate, file)) = slots.first() else { return Ok(Edit::Items(crates)) };
-        let expanded_include = self.crates.iter().any(|tree| {
-            tree.files.iter().any(|entry| entry.expanded && entry.source.path == path && !included_calls(&entry.source, &tree.env).is_empty())
-        });
+        let Some(&(krate, file)) = slots.first() else {
+            return Ok(Edit::Items(crates));
+        };
+        let expanded_include = self.crates.iter().any(|tree| tree.files.iter().any(|entry| entry.expanded && entry.source.path == path && !included_calls(&entry.source, &tree.env).is_empty()));
         let old = &self.crates[krate as usize].files[file as usize];
         let outside_include = outside_bodies(old).into_iter().any(|word| matches!(word, "include_str" | "include_bytes"));
         if expanded_include || !old.source.marks.is_empty() || outside_include {
@@ -68,10 +70,7 @@ impl Outline {
     /// Each file that an `include_str!` or `include_bytes!` call with a literal path in crate `krate` reads, with the file that holds the call.
     pub fn included(&self, krate: usize) -> Vec<(PathBuf, PathBuf)> {
         let tree = &self.crates[krate];
-        tree.files
-            .iter()
-            .flat_map(|file| included_calls(&file.source, &tree.env).into_iter().map(move |path| (file.source.beside(&path), file.source.path.clone())))
-            .collect()
+        tree.files.iter().flat_map(|file| included_calls(&file.source, &tree.env).into_iter().map(move |path| (file.source.beside(&path), file.source.path.clone()))).collect()
     }
 
     fn places_of(&self, path: &Path) -> (Vec<(u32, u32)>, Vec<u32>) {

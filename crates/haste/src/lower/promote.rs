@@ -21,7 +21,9 @@ impl Lower<'_, '_> {
             Expr::Closure { .. } => !self.cx.closure_takes_env(self.ty_of(expr)),
             Expr::Paren(inner) | Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Ref { mutable: false, raw: false, expr: inner } => self.promotable(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
-                Some(Res::Fn(item, _)) => matches!(self.cx.item(*item).1.kind, ItemKind::Const | ItemKind::Fn),
+                Some(Res::Fn(item, _)) => {
+                    matches!(self.cx.item(*item).1.kind, ItemKind::Const | ItemKind::Fn)
+                }
                 Some(Res::Ctor(..) | Res::Const(_)) => true,
                 _ => false,
             },

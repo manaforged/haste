@@ -39,12 +39,14 @@ pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool
 /// Whether reached function `index` lowers to a body small and copyable enough to inline.
 pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn super::Slots, index: usize) -> bool {
     let Some(limit) = inline_limit(cx, reached, index) else { return false };
-    resolve_inline(cx, reached, slots, index, limit).is_ok_and(|(callee, _)| callee.is_some())
+    resolve_inline(cx, (reached, slots), &mut super::Inline::default(), index, limit).is_ok_and(|(callee, _)| callee.is_some())
 }
 
 /// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
 fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
-    let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
+    let ((item, _), Ok(typed)) = &reached.list[index] else {
+        return None;
+    };
     if !cx.outline.crates[item.krate as usize].env.release {
         return None;
     }
@@ -295,7 +297,7 @@ impl Lower<'_, '_> {
         let Some(limit) = inline_limit(self.cx, self.reached, index) else {
             return Ok(None);
         };
-        let (callee, cycle) = resolve_inline(self.cx, self.reached, self.slots, index, limit)?;
+        let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, limit)?;
         self.cycle_root = self.cycle_root.min(cycle);
         Ok(callee)
     }
@@ -453,7 +455,9 @@ impl Lower<'_, '_> {
 
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
         let mark = self.owned.len();
-        let Some(test) = self.expr(cond)? else { return Ok(None) };
+        let Some(test) = self.expr(cond)? else {
+            return Ok(None);
+        };
         let (then_block, else_block) = (self.b.create_block(), self.b.create_block());
         let (join, joined, slot) = match otherwise {
             Some(_) => self.join_block(expr)?,

@@ -1,4 +1,3 @@
-use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -70,8 +69,8 @@ impl<'a> SubState<'a> {
     }
 }
 
-pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Option<Result<Rc<Typed>, String>> {
-    let asked0 = cx.asks.count();
+pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Option<Result<Arc<Typed>, String>> {
+    let before = cx.quiet_mark();
     let (item, substs) = *instance;
     if !eligible(cx, item, substs) {
         return None;
@@ -80,12 +79,10 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
     if cx.types.substs(substs).len() != expected || expected > u16::MAX as usize {
         return None;
     }
-    let summary_kind = match cx.store.lookups.summaries.get(&item).cloned() {
-        Some(found) => found,
-        None => build_and_cache(cx, item, expected as u16, asked0),
-    };
-    let SummaryKind::Poly(summary) = summary_kind else { return None };
-    instantiate_summary(cx, *instance, &summary, unlaid, asked0)
+    let summaries = cx.store.lookups.summaries.clone();
+    let built = summaries.run(cx, item, |cx| Ok(build_summary(cx, item, expected as u16)), |_| Ok(SummaryKind::MonomorphicFallback));
+    let Ok(SummaryKind::Poly(summary)) = built else { return None };
+    instantiate_summary(cx, *instance, &summary, unlaid, before)
 }
 
 fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
@@ -117,16 +114,10 @@ fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
     Some(own)
 }
 
-fn build_and_cache(cx: &mut Context<'_>, item: ItemRef, param_count: u16, asked0: usize) -> SummaryKind {
+fn build_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
     let built = super::infer::poly::build_poly_summary(cx, item, param_count);
     if let SummaryKind::Poly(summary) = &built {
-        let _ = prelayout_concrete(cx, summary);
-    }
-    if cx.asks.count() == asked0 {
-        if matches!(built, SummaryKind::MonomorphicFallback) {
-            cx.store.summary_fallbacks += 1;
-        }
-        cx.store.lookups.summaries.insert(item, built.clone());
+        drop(prelayout_concrete(cx, summary));
     }
     built
 }
@@ -141,13 +132,7 @@ fn prelayout_concrete(cx: &mut Context<'_>, summary: &PolySummary) -> Result<()>
     Ok(())
 }
 
-fn instantiate_summary(
-    cx: &mut Context<'_>,
-    instance: Instance,
-    summary: &PolySummary,
-    unlaid: &mut Vec<String>,
-    asked0: usize,
-) -> Option<Result<Rc<Typed>, String>> {
+fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &PolySummary, unlaid: &mut Vec<String>, before: (usize, usize)) -> Option<Result<Arc<Typed>, String>> {
     let concrete_args = cx.types.substs(instance.1).to_vec();
     if concrete_args.len() != usize::from(summary.param_count) {
         return None;
@@ -159,38 +144,19 @@ fn instantiate_summary(
         let offsets = eval_offset_holes(infer, &mut sub, &summary.const_holes)?;
         check_const_holes(infer, &mut sub, &summary.const_holes)?;
         let tables = instantiate_tables(infer, &mut sub, instance.0, &summary.template, (&calls, &offsets))?;
-        let locals = summary
-            .locals
-            .iter()
-            .map(|local| Ok(Local { ty: sub_ty(infer, &mut sub, local.ty)? }))
-            .collect::<Result<Vec<_>>>()?;
+        let locals = summary.locals.iter().map(|local| Ok(Local { ty: sub_ty(infer, &mut sub, local.ty)? })).collect::<Result<Vec<_>>>()?;
         let ret = summary.ret.map(|ty| sub_ty(infer, &mut sub, ty)).transpose()?;
-        let layouts = summary
-            .layout_tys
-            .iter()
-            .map(|&ty| sub_ty(infer, &mut sub, ty))
-            .collect::<Result<Vec<_>>>()?;
-        let typed = Typed {
-            tables: Arc::new(tables),
-            locals,
-            params: summary.params.to_vec(),
-            ret,
-            drops: Vec::new(),
-            shape: Shape::Body,
-        };
+        let layouts = summary.layout_tys.iter().map(|&ty| sub_ty(infer, &mut sub, ty)).collect::<Result<Vec<_>>>()?;
+        let typed = Typed { tables: Arc::new(tables), locals, params: summary.params.to_vec(), ret, drops: Vec::new(), shape: Shape::Body };
         Ok((typed, layouts))
     }) else {
-        cx.store.summary_fallbacks += 1;
         return None;
     };
-    let Ok(settled) = super::infer::settle(cx, instance, raw_typed) else {
-        cx.store.summary_fallbacks += 1;
-        return None;
-    };
-    let typed = Rc::new(settled);
+    let Ok(settled) = super::infer::settle(cx, instance, raw_typed) else { return None };
+    let typed = Arc::new(settled);
     let laid = lay_out_instantiated(cx, &concrete_layouts, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
-    if laid.is_ok() && cx.asks.count() == asked0 {
-        cx.store.finals.insert(instance, typed.clone());
+    if laid.is_ok() && cx.quiet_mark() == before {
+        cx.store.finals.insert(instance, Arc::clone(&typed));
     }
     Some(Ok(typed))
 }
@@ -223,9 +189,7 @@ fn eval_one_proj(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, proj_id: Pro
     let trait_args = sub_substs_vec(infer, sub, def.args)?;
     let own_args = sub_substs_vec(infer, sub, def.own)?;
     let name = infer.cx.name(def.assoc).to_string();
-    let Some(value) = infer.picked_alias(def.of, self_ty, &trait_args, (&name, &own_args))? else {
-        bail!("unnormalized projection `{name}` on {}", infer.show(self_ty))
-    };
+    let Some(value) = infer.picked_alias(def.of, self_ty, &trait_args, (&name, &own_args))? else { bail!("unnormalized projection `{name}` on {}", infer.show(self_ty)) };
     infer.settle_projections()?;
     let zonked = infer.zonk(value);
     if infer.cx.types.has_params(zonked) || infer.has_vars(zonked) || matches!(infer.cx.types.kind(zonked), Kind::Never) {
@@ -354,16 +318,8 @@ fn resolve_call_override(infer: &mut Infer<'_, '_>, expr: ExprId, found: Ty, tup
     }
 }
 
-fn resolve_dyn_call(
-    infer: &mut Infer<'_, '_>,
-    (expr, found, ty): (ExprId, Ty, Ty),
-    (of, parts, members): (ItemRef, Substs, &[ItemRef]),
-    autoderefs: Option<u32>,
-) -> Result<CallOverride> {
-    let dyn_tuple = *object_parts(infer.cx.types.substs(parts), members)
-        .0
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("callable trait object without tuple"))?;
+fn resolve_dyn_call(infer: &mut Infer<'_, '_>, (expr, found, ty): (ExprId, Ty, Ty), (of, parts, members): (ItemRef, Substs, &[ItemRef]), autoderefs: Option<u32>) -> Result<CallOverride> {
+    let dyn_tuple = *object_parts(infer.cx.types.substs(parts), members).0.first().ok_or_else(|| anyhow::anyhow!("callable trait object without tuple"))?;
     let (name, box_free) = match infer.cx.lang(of) {
         Some("fn") => ("call", None),
         Some("fn_mut") => ("call_mut", None),
@@ -430,13 +386,7 @@ fn check_const_holes(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, holes: &
     Ok(())
 }
 
-fn instantiate_tables(
-    infer: &mut Infer<'_, '_>,
-    sub: &mut SubState<'_>,
-    item: ItemRef,
-    tpl: &BodyTables,
-    (calls, offset_overrides): (&[CallOverride], &[(ExprId, u64)]),
-) -> Result<BodyTables> {
+fn instantiate_tables(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, item: ItemRef, tpl: &BodyTables, (calls, offset_overrides): (&[CallOverride], &[(ExprId, u64)])) -> Result<BodyTables> {
     let exprs = tpl.exprs.iter().map(|&ty| sub_ty(infer, sub, ty)).collect::<Result<Vec<_>>>()?.into_boxed_slice();
     let pats: PackedMap<PatId, Ty> = tpl.pats.try_map_values(|&ty| sub_ty(infer, sub, ty))?;
     let res = instantiate_res(infer, sub, &tpl.res, calls)?;
@@ -446,34 +396,10 @@ fn instantiate_tables(
     let (fors, tries, awaits, coercions, closures, try_blocks) = instantiate_flow_tables(infer, sub, tpl)?;
     let (autoderefs, overloaded, box_frees) = apply_call_tables(infer, sub, tpl, calls)?;
     let offsets = apply_offsets(&tpl.offsets, offset_overrides);
-    Ok(BodyTables {
-        syntax: Arc::clone(&tpl.syntax),
-        exprs,
-        res,
-        autoderefs,
-        derefs,
-        operators,
-        coercions,
-        offsets,
-        pat_res,
-        overloaded,
-        pats,
-        fors,
-        tries,
-        awaits,
-        closures,
-        try_blocks,
-        box_frees,
-    })
+    Ok(BodyTables { syntax: Arc::clone(&tpl.syntax), exprs, res, autoderefs, derefs, operators, coercions, offsets, pat_res, overloaded, pats, fors, tries, awaits, closures, try_blocks, box_frees })
 }
 
-fn instantiate_operators(
-    infer: &mut Infer<'_, '_>,
-    sub: &mut SubState<'_>,
-    item: ItemRef,
-    tpl_ops: &PackedMap<ExprId, Res>,
-    exprs: &[Ty],
-) -> Result<PackedMap<ExprId, Res>> {
+fn instantiate_operators(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, item: ItemRef, tpl_ops: &PackedMap<ExprId, Res>, exprs: &[Ty]) -> Result<PackedMap<ExprId, Res>> {
     if tpl_ops.is_empty() {
         return Ok(PackedMap::default());
     }
@@ -493,14 +419,7 @@ fn instantiate_operators(
     Ok(PackedMap::pack(pairs))
 }
 
-type FlowTables = (
-    PackedMap<ExprId, For>,
-    PackedMap<ExprId, Tried>,
-    PackedMap<ExprId, Awaited>,
-    PackedMap<ExprId, Coercion>,
-    PackedMap<ExprId, Closure>,
-    PackedMap<ExprId, Res>,
-);
+type FlowTables = (PackedMap<ExprId, For>, PackedMap<ExprId, Tried>, PackedMap<ExprId, Awaited>, PackedMap<ExprId, Coercion>, PackedMap<ExprId, Closure>, PackedMap<ExprId, Res>);
 
 fn instantiate_flow_tables(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, tpl: &BodyTables) -> Result<FlowTables> {
     let fors = tpl.fors.try_map_values(|f| sub_for(infer, sub, f))?;
@@ -512,12 +431,7 @@ fn instantiate_flow_tables(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, tp
     Ok((fors, tries, awaits, coercions, closures, try_blocks))
 }
 
-fn instantiate_res(
-    infer: &mut Infer<'_, '_>,
-    sub: &mut SubState<'_>,
-    tpl_res: &PackedMap<ExprId, Res>,
-    calls: &[CallOverride],
-) -> Result<PackedMap<ExprId, Res>> {
+fn instantiate_res(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, tpl_res: &PackedMap<ExprId, Res>, calls: &[CallOverride]) -> Result<PackedMap<ExprId, Res>> {
     if calls.is_empty() {
         return tpl_res.try_map_values(|r| sub_res(infer, sub, r));
     }
@@ -548,13 +462,7 @@ fn apply_call_tables(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, tpl: &Bo
     if calls.is_empty() {
         return Ok((tpl.autoderefs.clone(), tpl.overloaded.clone(), box_frees));
     }
-    let mut deref_pairs: Vec<(ExprId, u32)> = tpl
-        .autoderefs
-        .as_slice()
-        .iter()
-        .copied()
-        .filter(|(e, _)| !calls.iter().any(|c| c.expr == *e))
-        .collect();
+    let mut deref_pairs: Vec<(ExprId, u32)> = tpl.autoderefs.as_slice().iter().copied().filter(|(e, _)| !calls.iter().any(|c| c.expr == *e)).collect();
     let mut over_set: Vec<ExprId> = tpl.overloaded.as_slice().to_vec();
     let mut box_pairs: Vec<(ExprId, Res)> = box_frees.as_slice().to_vec();
     for ov in calls {
@@ -584,31 +492,15 @@ fn apply_offsets(tpl_offsets: &PackedMap<ExprId, u64>, overrides: &[(ExprId, u64
 }
 
 fn sub_for(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, f: &For) -> Result<For> {
-    Ok(For {
-        into_iter: sub_res(infer, sub, &f.into_iter)?,
-        next: sub_res(infer, sub, &f.next)?,
-        iter: sub_ty(infer, sub, f.iter)?,
-        option: sub_ty(infer, sub, f.option)?,
-        some: f.some,
-    })
+    Ok(For { into_iter: sub_res(infer, sub, &f.into_iter)?, next: sub_res(infer, sub, &f.next)?, iter: sub_ty(infer, sub, f.iter)?, option: sub_ty(infer, sub, f.option)?, some: f.some })
 }
 
 fn sub_tried(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, t: &Tried) -> Result<Tried> {
-    Ok(Tried {
-        branch: sub_res(infer, sub, &t.branch)?,
-        from_residual: sub_res(infer, sub, &t.from_residual)?,
-        flow: sub_ty(infer, sub, t.flow)?,
-        ..*t
-    })
+    Ok(Tried { branch: sub_res(infer, sub, &t.branch)?, from_residual: sub_res(infer, sub, &t.from_residual)?, flow: sub_ty(infer, sub, t.flow)?, ..*t })
 }
 
 fn sub_awaited(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, a: &Awaited) -> Result<Awaited> {
-    Ok(Awaited {
-        into_future: sub_res(infer, sub, &a.into_future)?,
-        future: sub_ty(infer, sub, a.future)?,
-        poll: sub_res(infer, sub, &a.poll)?,
-        polled: sub_ty(infer, sub, a.polled)?,
-    })
+    Ok(Awaited { into_future: sub_res(infer, sub, &a.into_future)?, future: sub_ty(infer, sub, a.future)?, poll: sub_res(infer, sub, &a.poll)?, polled: sub_ty(infer, sub, a.polled)? })
 }
 
 fn sub_coercion(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, coercion: &Coercion) -> Result<Coercion> {

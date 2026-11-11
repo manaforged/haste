@@ -220,7 +220,9 @@ fn walk(path: &Path, into: &mut Vec<(PathBuf, u64, i64, i64)>) {
         into.push((path.to_owned(), meta.len(), meta.mtime(), meta.mtime_nsec()));
         return;
     }
-    let Ok(entries) = std::fs::read_dir(path) else { return };
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
     let mut children: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
     children.sort();
     for child in children.iter().filter(|child| !matches!(child.file_name().and_then(|name| name.to_str()), Some("target" | ".git"))) {

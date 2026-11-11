@@ -4,21 +4,28 @@ pub mod procs;
 pub mod resolve;
 mod want;
 
-use std::cell::RefCell;
-
 use rustc_hash::FxHashMap;
 
 use crate::outline::item::Vis;
+use crate::sync::Interner;
 
 /// An interned name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Sym(pub u32);
 
+const SYM_SHARDS: usize = 32;
+const SYM_SLAB: usize = 16_384;
+const SYM_SLABS: usize = 256;
+
 /// The interned names of an outline. Each name text is stored once for the life of the process.
-#[derive(Debug)]
 pub struct Symbols {
-    map: RefCell<FxHashMap<&'static str, Sym>>,
-    names: RefCell<Vec<&'static str>>,
+    inner: Interner<&'static str, SYM_SHARDS, SYM_SLAB, SYM_SLABS>,
+}
+
+impl std::fmt::Debug for Symbols {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Symbols").field("len", &self.inner.len()).finish()
+    }
 }
 
 /// `crate`, interned first.
@@ -33,10 +40,10 @@ const FIXED: [&str; 4] = ["crate", "self", "super", "_"];
 
 impl Default for Symbols {
     fn default() -> Symbols {
-        let symbols = Symbols { map: RefCell::default(), names: RefCell::default() };
-        FIXED.iter().chain(PRIMITIVES.iter().map(|(name, _)| name)).for_each(|name| {
+        let symbols = Symbols { inner: Interner::default() };
+        for name in FIXED.iter().copied().chain(PRIMITIVES.iter().map(|(name, _)| *name)) {
             symbols.intern(name);
-        });
+        }
         symbols
     }
 }
@@ -50,19 +57,12 @@ impl Symbols {
 
     /// The symbol of `name`, adding it when it is new.
     pub fn intern(&self, name: &str) -> Sym {
-        if let Some(found) = self.map.borrow().get(name) {
-            return *found;
-        }
-        let text: &'static str = Box::leak(name.into());
-        let sym = Sym(self.names.borrow().len() as u32);
-        self.names.borrow_mut().push(text);
-        self.map.borrow_mut().insert(text, sym);
-        sym
+        Sym(self.inner.intern(name, |text| Box::leak(text.into())))
     }
 
     /// The text of `sym`.
     pub fn text(&self, sym: Sym) -> &'static str {
-        self.names.borrow()[sym.0 as usize]
+        *self.inner.get(sym.0)
     }
 }
 
@@ -309,18 +309,7 @@ impl Names {
     /// Path resolution in crate `krate` of `outline`, over the finished scopes.
     pub fn paths<'a>(&'a self, outline: &'a crate::outline::Outline, krate: u32) -> path::Paths<'a> {
         let entry = &self.crates[krate as usize];
-        path::Paths {
-            krate,
-            trees: &outline.crates,
-            done: &self.crates,
-            scopes: &entry.scopes,
-            deps: &entry.deps,
-            edition_2015: entry.edition_2015,
-            prelude: entry.prelude,
-            externs: &entry.externs,
-            symbols: &self.symbols,
-            demands: None,
-        }
+        path::Paths { krate, trees: &outline.crates, done: &self.crates, scopes: &entry.scopes, deps: &entry.deps, edition_2015: entry.edition_2015, prelude: entry.prelude, externs: &entry.externs, symbols: &self.symbols, demands: None }
     }
 }
 

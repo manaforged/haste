@@ -47,7 +47,9 @@ pub fn derives(src: &Source, attrs: &[Attr], holds: &dyn Fn(&Cfg) -> bool, into:
         match attr {
             Attr::Derive(open) => {
                 for (from, to) in split_commas(src, open + 1, src.pair(*open)) {
-                    let Some(last) = (from..to).rev().find(|at| matches!(src.kind(*at), TokenKind::Ident | TokenKind::RawIdent)) else { continue };
+                    let Some(last) = (from..to).rev().find(|at| matches!(src.kind(*at), TokenKind::Ident | TokenKind::RawIdent)) else {
+                        continue;
+                    };
                     match DERIVES.iter().find(|(name, ..)| *name == src.text(last)) {
                         Some(&(_, derive, _)) => into.0.push(derive),
                         None => into.1.push((from, last)),

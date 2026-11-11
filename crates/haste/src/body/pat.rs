@@ -3,8 +3,8 @@ use rustc_lexer::TokenKind;
 
 use super::cursor::Cursor;
 use super::path::Style;
-use crate::outline::source::opens;
 use super::{Expr, FieldPat, Lit, Pat, PatId, UnOp};
+use crate::outline::source::opens;
 
 impl Cursor<'_> {
     /// Parses a pattern, with `|` alternatives.
@@ -155,7 +155,7 @@ impl Cursor<'_> {
 
     fn path_continues(&self) -> bool {
         let next = self.at + 1;
-        self.punct_at(next, "::") || self.punct_at(next, "!") || matches!(self.kind_at(next), TokenKind::OpenParen | TokenKind::OpenBrace) || self.punct_at(next, "<")
+        self.punct_at(next, "::") || self.punct_at(next, "!") || self.punct_at(next, "..") || matches!(self.kind_at(next), TokenKind::OpenParen | TokenKind::OpenBrace) || self.punct_at(next, "<")
     }
 
     fn bind_pat(&mut self) -> Result<PatId> {

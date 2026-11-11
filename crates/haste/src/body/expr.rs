@@ -3,8 +3,8 @@ use rustc_lexer::TokenKind;
 
 use super::cursor::Cursor;
 use super::path::Style;
-use crate::outline::source::opens;
 use super::{Arm, BinOp, BlockKind, Expr, ExprId, FieldInit, Param, UnOp};
+use crate::outline::source::opens;
 
 const BINARY: [(&str, BinOp, u8); 18] = [
     ("||", BinOp::Or, 4),
@@ -27,18 +27,8 @@ const BINARY: [(&str, BinOp, u8); 18] = [
     ("%", BinOp::Rem, 12),
 ];
 
-const COMPOUND: [(&str, BinOp); 10] = [
-    ("<<=", BinOp::Shl),
-    (">>=", BinOp::Shr),
-    ("+=", BinOp::Add),
-    ("-=", BinOp::Sub),
-    ("*=", BinOp::Mul),
-    ("/=", BinOp::Div),
-    ("%=", BinOp::Rem),
-    ("^=", BinOp::BitXor),
-    ("&=", BinOp::BitAnd),
-    ("|=", BinOp::BitOr),
-];
+const COMPOUND: [(&str, BinOp); 10] =
+    [("<<=", BinOp::Shl), (">>=", BinOp::Shr), ("+=", BinOp::Add), ("-=", BinOp::Sub), ("*=", BinOp::Mul), ("/=", BinOp::Div), ("%=", BinOp::Rem), ("^=", BinOp::BitXor), ("&=", BinOp::BitAnd), ("|=", BinOp::BitOr)];
 
 const CAST: u8 = 13;
 const LET_SCRUTINEE: u8 = 6;
@@ -456,11 +446,7 @@ impl Cursor<'_> {
         self.at += 1;
         let cond = self.cond()?;
         let then = self.block_expr(None, BlockKind::Plain)?;
-        let otherwise = if self.eat_word("else") {
-            Some(if self.is_word("if") { self.if_expr()? } else { self.block_expr(None, BlockKind::Plain)? })
-        } else {
-            None
-        };
+        let otherwise = if self.eat_word("else") { Some(if self.is_word("if") { self.if_expr()? } else { self.block_expr(None, BlockKind::Plain)? }) } else { None };
         Ok(self.push_expr(Expr::If(cond, then, otherwise)))
     }
 

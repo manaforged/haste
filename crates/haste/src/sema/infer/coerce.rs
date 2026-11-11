@@ -1,9 +1,9 @@
 use anyhow::{Result, bail};
 
 use super::super::ty::{Kind, Mut, Ty};
-use crate::RECURSION_LIMIT;
 use super::object::Vtable;
 use super::{Infer, Res};
+use crate::RECURSION_LIMIT;
 
 /// How the value of an expression changes as it coerces to the type that it is used at.
 #[derive(Clone, Debug)]
@@ -55,12 +55,16 @@ impl Infer<'_, '_> {
     }
 
     fn coerces(&mut self, found: Ty, expected: Ty) -> Result<bool> {
-        let Some(of) = self.cx.lang_item("coerce_unsized") else { return Ok(false) };
+        let Some(of) = self.cx.lang_item("coerce_unsized") else {
+            return Ok(false);
+        };
         self.may_implement(of, found, &[expected])
     }
 
     fn unsize_args(&mut self, from: &[Ty], to: &[Ty]) -> Result<Option<Coercion>> {
-        let Some((at, unsize)) = self.unsized_arg(from, to)? else { return Ok(None) };
+        let Some((at, unsize)) = self.unsized_arg(from, to)? else {
+            return Ok(None);
+        };
         let rest = from.iter().zip(to).enumerate().filter(|(index, _)| *index != at);
         rest.map(|(_, pair)| pair).try_for_each(|(&a, &b)| self.unify(a, b))?;
         Ok(Some(unsize))
@@ -109,7 +113,9 @@ impl Infer<'_, '_> {
                 }
                 _ => None,
             };
-            let Some((inner, res)) = next else { return Ok(None) };
+            let Some((inner, res)) = next else {
+                return Ok(None);
+            };
             steps.push((ty, res));
             ty = self.resolve(inner);
         }

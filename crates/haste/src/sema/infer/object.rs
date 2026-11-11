@@ -60,7 +60,9 @@ impl Infer<'_, '_> {
     }
 
     fn object_to_object(&mut self, from: Ty, to: Ty) -> Result<Option<Coercion>> {
-        let (Kind::Dyn(of, args, members, autos), Kind::Dyn(other, wanted, bound, kept)) = (self.cx.types.kind(from).clone(), self.cx.types.kind(to).clone()) else { return Ok(None) };
+        let (Kind::Dyn(of, args, members, autos), Kind::Dyn(other, wanted, bound, kept)) = (self.cx.types.kind(from).clone(), self.cx.types.kind(to).clone()) else {
+            return Ok(None);
+        };
         if of != other {
             return Ok(if wanted.is_empty() { upcast_slot(self.cx, of, other)?.map(Coercion::Upcast) } else { None });
         }
@@ -115,15 +117,21 @@ impl Infer<'_, '_> {
         if !self.is_callable_trait(of) {
             return Ok(self.compiler_impl(of, from) || self.select(of, from, given)?.is_some());
         }
-        let (Some((params, _)), Some(&wanted)) = (self.callable_sig(from)?, given.first()) else { return Ok(false) };
-        let inputs = self.cx.types.tuple(&params);
-        Ok(self.unifies(inputs, wanted))
+        if let (Some((params, _)), Some(&wanted)) = (self.callable_sig(from)?, given.first()) {
+            let inputs = self.cx.types.tuple(&params);
+            return Ok(self.unifies(inputs, wanted));
+        }
+        Ok(self.select(of, from, given)?.is_some())
     }
 
     fn unsize_tail(&mut self, item: ItemRef, from: &[Ty], to: &[Ty]) -> Result<Option<Coercion>> {
         let (have, want) = (self.adt_fields(item, from)?, self.adt_fields(item, to)?);
-        let (Some(&a), Some(&b)) = (have.first().and_then(|fields| fields.last()), want.first().and_then(|fields| fields.last())) else { return Ok(None) };
-        let Some(unsize) = self.unsize_pointee(a, b)? else { return Ok(None) };
+        let (Some(&a), Some(&b)) = (have.first().and_then(|fields| fields.last()), want.first().and_then(|fields| fields.last())) else {
+            return Ok(None);
+        };
+        let Some(unsize) = self.unsize_pointee(a, b)? else {
+            return Ok(None);
+        };
         for (&found, &wanted) in from.iter().zip(to) {
             self.trial_unify(found, wanted);
         }
@@ -138,10 +146,11 @@ impl Infer<'_, '_> {
         }
         let Kind::Dyn(of, args, members, _) = self.cx.types.kind(object).clone() else { bail!("a vtable for a type that is not a trait object") };
         let args = super::super::ty::object_parts(self.cx.types.substs(args), &members).0.to_vec();
+        let bounds = self.expand_super_bounds(vec![(of, std::iter::once(ty).chain(args.iter().copied()).collect())])?;
         let mut methods = Vec::new();
         for method in self.cx.vtable_methods(of)? {
-            let own = method.is_some_and(|method| self.cx.owner_trait(method) == Some(of));
-            let slice: Vec<Ty> = std::iter::once(ty).chain(args.iter().copied().filter(|_| own)).collect();
+            let owner = method.and_then(|method| self.cx.owner_trait(method));
+            let slice = owner.and_then(|owner| bounds.iter().find(|(bound, _)| *bound == owner).map(|(_, substs)| substs.clone())).unwrap_or_else(|| vec![ty]);
             let substs = self.cx.types.intern_substs(&slice);
             let method = method.map(|method| self.closure_slot(method, ty).unwrap_or(method));
             methods.push(method.map(|method| self.trait_call(method, substs)).transpose()?);
@@ -177,16 +186,19 @@ fn set_drops(cx: &mut Context<'_>, vtable: &mut Vtable) -> Result<()> {
 
 /// The vtable slot of a trait object of `of` that holds the vtable of its value as a trait object of the supertrait `to`, or none when `to` is not one.
 pub fn upcast_slot(cx: &mut Context<'_>, of: ItemRef, to: ItemRef) -> Result<Option<u32>> {
-    let Some(at) = cx.vtable_supers(of)?.iter().position(|found| *found == to) else { return Ok(None) };
+    let Some(at) = cx.vtable_supers(of)?.iter().position(|found| *found == to) else {
+        return Ok(None);
+    };
     Ok(Some(FIRST_METHOD + (cx.vtable_methods(of)?.len() + at) as u32))
 }
 
 /// The vtable slot that a call of trait method `item` at `substs` reads its code from, when `Self` is a trait object of the method's trait.
 pub fn virtual_slot(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Option<u32>> {
-    if cx.owner_trait(item).is_none() {
+    let Some(owner) = cx.owner_trait(item) else { return Ok(None) };
+    let Some(&Kind::Dyn(object, ..)) = cx.types.substs(substs).first().map(|ty| cx.types.kind(*ty)) else { return Ok(None) };
+    if !super::detached(cx, object, |infer| infer.implied_traits(vec![object]))?.contains(&owner) {
         return Ok(None);
     }
-    let Some(&Kind::Dyn(object, ..)) = cx.types.substs(substs).first().map(|ty| cx.types.kind(*ty)) else { return Ok(None) };
     let Some(index) = cx.vtable_methods(object)?.iter().position(|method| *method == Some(item)) else { bail!("`{}` cannot be called through a trait object", cx.name(item)) };
     Ok(Some(FIRST_METHOD + index as u32))
 }

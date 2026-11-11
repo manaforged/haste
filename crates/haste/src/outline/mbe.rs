@@ -61,7 +61,7 @@ impl Matcher<'_> {
 
     fn sep(&self, sep: (u32, u32), at: u32, end: u32) -> Option<u32> {
         let len = sep.1 - sep.0 + 1;
-        let same = (0..len).all(|offset| at + offset < end && self.input.text(at + offset) == self.def.text(sep.0 + offset));
+        let same = (0..len).all(|offset| at + offset < end && same_token((self.input, at + offset, end), (self.def, sep.0 + offset)));
         same.then_some(at + len)
     }
 
@@ -78,7 +78,9 @@ impl Matcher<'_> {
             return None;
         }
         let (slot, from, reach, frag) = match piece {
-            Piece::Repeat(inner, sep, op, names) => return self.repeat((inner, names), (*sep, *op), (at, end), slots),
+            Piece::Repeat(inner, sep, op, names) => {
+                return self.repeat((inner, names), (*sep, *op), (at, end), slots);
+            }
             Piece::Var(_, Some(Frag::Tt), slot) => (slot, at, to, Frag::Tt),
             Piece::Var(_, Some(Frag::Vis), slot) if held != Frag::Vis => (slot, at, at, Frag::Vis),
             Piece::Var(_, Some(Frag::Literal), slot) if held == Frag::Expr && opaque_literal(self.input, at, to) => (slot, at, to, Frag::Literal),
@@ -97,7 +99,7 @@ impl Matcher<'_> {
             return self.opaque_piece(piece, (at, to, end), held, slots);
         }
         match piece {
-            Piece::Token(token) => (at < end && self.input.text(at) == self.def.text(*token)).then_some(at + 1),
+            Piece::Token(token) => (at < end && same_token((self.input, at, end), (self.def, *token))).then_some(at + 1),
             Piece::Group(open, inner) => {
                 if at >= end || self.input.kind(at) != self.def.kind(*open) {
                     return None;
@@ -225,9 +227,13 @@ impl Writer<'_> {
                 if !matches!(frag, Frag::Tt | Frag::Ident | Frag::Lifetime | Frag::Literal) {
                     self.out.opaque_from(start, frag);
                 }
-                self.out.space();
+                if frag != Frag::Tt {
+                    self.out.space();
+                }
             }
-            Some(Bind::Many(_)) => bail!("metavariable ${} is still repeating", self.def.text(name)),
+            Some(Bind::Many(_)) => {
+                bail!("metavariable ${} is still repeating", self.def.text(name))
+            }
             None => {
                 self.out.copy(self.def, name - 1);
                 self.out.copy(self.def, name);
@@ -303,7 +309,9 @@ pub fn expand(def: &Source, rules: &[Rule], input: &Source, (open, krate): (u32,
 
 /// The tokens of the first `cfg_select!` arm that `env` may enable, or `None` when no arm applies.
 pub fn select(src: &Source, open: u32, env: &super::tree::Env) -> Result<Option<Source>> {
-    let Some(arm) = select_arm(src, open, env)? else { return Ok(None) };
+    let Some(arm) = select_arm(src, open, env)? else {
+        return Ok(None);
+    };
     if !arm.braced {
         bail!("a cfg_select! arm of items needs braces at byte {} of {}", src.byte(arm.from), src.path.display());
     }
@@ -329,11 +337,7 @@ pub fn select_arm(src: &Source, open: u32, env: &super::tree::Env) -> Result<Opt
             bail!("malformed cfg_select! arm at byte {} of {}", src.byte(at), src.path.display());
         }
         let body = arrow + 2;
-        let arm = if src.kind(body) == TokenKind::OpenBrace {
-            Arm { from: body + 1, to: src.pair(body), braced: true }
-        } else {
-            Arm { from: body, to: skip_until(src, (body, close), |at| src.kind(at) == TokenKind::Comma), braced: false }
-        };
+        let arm = if src.kind(body) == TokenKind::OpenBrace { Arm { from: body + 1, to: src.pair(body), braced: true } } else { Arm { from: body, to: skip_until(src, (body, close), |at| src.kind(at) == TokenKind::Comma), braced: false } };
         let predicate = (at..arrow).map(|token| src.text(token)).collect::<Vec<_>>().join(" ");
         if predicate == "_" || env.allows(&crate::graph::cfg::parse(&predicate)?) {
             return Ok(Some(arm));
@@ -351,4 +355,12 @@ fn skip_until(src: &Source, (mut at, close): (u32, u32), stop: impl Fn(u32) -> b
         at = if opens(src.kind(at)) { src.pair(at) + 1 } else { at + 1 };
     }
     at
+}
+
+fn same_token((input, at, end): (&Source, u32, u32), (def, token): (&Source, u32)) -> bool {
+    input.text(at) == def.text(token) && (input.text(at) != ":" || part_of_colon2(input, at, end) == part_of_colon2(def, token, def.len()))
+}
+
+fn part_of_colon2(src: &Source, at: u32, end: u32) -> bool {
+    (src.joint(at) && at + 1 < end && src.text(at + 1) == ":") || (at > 0 && src.joint(at - 1) && src.text(at - 1) == ":")
 }

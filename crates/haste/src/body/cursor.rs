@@ -23,7 +23,8 @@ pub fn is_name(kind: TokenKind) -> bool {
 }
 
 pub const RESERVED: [&str; 38] = [
-    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await", "dyn",
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+    "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await", "dyn",
 ];
 
 impl<'a> Cursor<'a> {
@@ -33,7 +34,9 @@ impl<'a> Cursor<'a> {
 
     /// Whether the outer attributes at `attrs` hold a `#[cfg]` that the environment turns off.
     pub fn configured_out(&self, attrs: Option<(u32, u32)>) -> bool {
-        let (Some(env), Some((from, _))) = (self.config.env, attrs) else { return false };
+        let (Some(env), Some((from, _))) = (self.config.env, attrs) else {
+            return false;
+        };
         let mut parsed = Vec::new();
         crate::outline::attr::attrs(self.src, from, false, &mut parsed).is_ok() && !env.enabled(&parsed)
     }

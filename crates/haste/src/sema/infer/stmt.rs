@@ -21,10 +21,14 @@ impl Infer<'_, '_> {
     }
 
     fn declare_items(&mut self, stmts: List) {
-        let Some((root, found)) = self.root.and_then(|root| Some((root, self.cx.expansion(root)?))) else { return };
+        let Some((root, found)) = self.root.and_then(|root| Some((root, self.cx.expansion(root)?))) else {
+            return;
+        };
         let (src, items) = (&found.file.source, &found.file.items.items);
         for &stmt in self.body.list(stmts) {
-            let Stmt::Item(start, end) = self.body.stmts[stmt as usize] else { continue };
+            let Stmt::Item(start, end) = self.body.stmts[stmt as usize] else {
+                continue;
+            };
             for at in super::super::expand::stmt_items(items, (start, end)) {
                 if let Some(name) = items[at].name {
                     self.items.push((crate::names::plain(src.text(name)), root.inner(at as u32)));

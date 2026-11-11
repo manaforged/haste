@@ -8,7 +8,7 @@ use rustc_hash::FxHashSet as HashSet;
 use crate::graph::manifest::Kind;
 use crate::graph::script::{self, Output};
 use crate::graph::{Targets, Workspace, store};
-use crate::image::{self, Jit, Driver, Ended, Script};
+use crate::image::{self, Driver, Ended, Jit, Script};
 use crate::outline::Role;
 
 /// Gives every unit with a build script its output: the stored one while it is current, else from running the script. The scripts to run build into one image, then run in waves so a script that reads a `links` dependency's metadata runs after it; a script that does not build or fails stays without output, so its package's unknown cfgs stay open.
@@ -24,19 +24,25 @@ pub fn settle(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
         if pending.is_empty() {
             return Ok(());
         }
-        let outcome = run(workspace, targets, &pending)?;
-        let mut errors = Vec::new();
-        for (unit, result) in outcome {
-            match result {
-                Ok(output) => workspace.graph.units[unit].script = Some(output),
-                Err(failure) => errors.push((unit, failure)),
-            }
+        let ready: Vec<usize> = pending.iter().copied().filter(|&unit| !waits_build(workspace, unit, &pending)).collect();
+        let wave = if ready.is_empty() { &pending } else { &ready };
+        let outcome = run(workspace, targets, wave)?;
+        finish_wave(workspace, targets, wave, outcome, &mut failed);
+    }
+}
+
+fn finish_wave(workspace: &mut Workspace, targets: &Targets, wave: &[usize], outcome: Outcome, failed: &mut HashSet<usize>) {
+    let mut errors = Vec::new();
+    for (unit, result) in outcome {
+        match result {
+            Ok(output) => workspace.graph.units[unit].script = Some(output),
+            Err(failure) => errors.push((unit, failure)),
         }
-        for (unit, failure) in errors {
-            let ran = failure.broken.is_some_and(|at| pending.contains(&at) && workspace.graph.units[at].script.is_some());
-            if !ran {
-                give_up(workspace, targets, unit, &failure, &mut failed);
-            }
+    }
+    for (unit, failure) in errors {
+        let ran = failure.broken.is_some_and(|at| wave.binary_search(&at).is_ok() && workspace.graph.units[at].script.is_some());
+        if !ran {
+            give_up(workspace, targets, unit, &failure, failed);
         }
     }
 }
@@ -105,10 +111,19 @@ fn known(workspace: &Workspace) -> Ran {
     units.filter_map(|(unit, entry)| Some((unit, entry.script.clone()?))).collect()
 }
 
-/// Whether the script of `unit` needs the metadata of a dependency's script that has not run.
+/// Whether the script of `unit` needs a `links` dependency's metadata or a build dependency's cfgs from a script that has not run.
 fn waits(workspace: &Workspace, unit: usize, left: &[usize]) -> bool {
-    let deps = workspace.graph.units[unit].deps.iter().filter(|(_, _, kind)| *kind == Kind::Normal);
-    deps.map(|(_, dep, _)| *dep).any(|dep| dep != unit && left.contains(&dep) && workspace.packages[workspace.graph.units[dep].package].manifest.links.is_some())
+    let waiting: HashSet<usize> = left.iter().copied().filter(|&dep| dep != unit).collect();
+    if waiting.is_empty() {
+        return false;
+    }
+    let links = workspace.graph.units[unit].deps.iter().any(|&(_, dep, kind)| kind == Kind::Normal && waiting.contains(&dep) && workspace.packages[workspace.graph.units[dep].package].manifest.links.is_some());
+    links || waits_build(workspace, unit, left)
+}
+
+fn waits_build(workspace: &Workspace, unit: usize, left: &[usize]) -> bool {
+    let closure = crate::outline::build_closure(workspace, &[unit]);
+    left.iter().any(|&dep| dep != unit && closure.contains(&dep))
 }
 
 /// The `DEP_<links>_<key>` variables that the `links` dependencies of `unit` printed, from `ran` in this run.
@@ -160,7 +175,9 @@ impl Runs<'_> {
 impl Driver for Runs<'_> {
     fn start(&mut self, demand: &mut Jit) -> Result<()> {
         while self.running.len() < crate::jobs() {
-            let Some((unit, entry)) = self.next() else { return Ok(()) };
+            let Some((unit, entry)) = self.next() else {
+                return Ok(());
+            };
             let script = entry.map_err(Failure::from).and_then(|[start, main]| job(self.workspace, self.targets, unit, (start, main), &self.ran));
             match script {
                 Ok(script) => {
@@ -174,7 +191,9 @@ impl Driver for Runs<'_> {
     }
 
     fn ended(&mut self, id: usize, ended: Ended) -> Result<()> {
-        let Some(at) = self.running.iter().position(|(running, ..)| *running == id) else { return Ok(()) };
+        let Some(at) = self.running.iter().position(|(running, ..)| *running == id) else {
+            return Ok(());
+        };
         let (_, unit, script) = self.running.swap_remove(at);
         let result = match (ended.status, ended.failure) {
             (0, _) => String::from_utf8(ended.bytes).map(|text| finished(self.workspace, unit, &script, &text)).map_err(|_| Failure::from("printed output that is not UTF-8".to_owned())),

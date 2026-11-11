@@ -106,7 +106,9 @@ impl Resolver<'_> {
         let package = self.units[unit].package;
         let matches: Vec<Dep> = self.applicable(unit).filter(|dep| dep.key == key).cloned().collect();
         for dep in matches {
-            let Some(target) = self.packages[package].resolved.get(&dep.key).copied() else { continue };
+            let Some(target) = self.packages[package].resolved.get(&dep.key).copied() else {
+                continue;
+            };
             let host = side == Side::Host || dep.kind == Kind::Build || self.packages[target].manifest.proc_macro;
             let child = self.unit(target, if host { Side::Host } else { Side::Target });
             self.units[unit].deps.push((dep.key.clone(), child, dep.kind));
@@ -130,15 +132,7 @@ impl Resolver<'_> {
 
 /// Resolves the features of every unit reachable from `members`, with their default features, as Cargo's resolver 2 does for `normal` and `build` edges.
 pub fn resolve(packages: &[Package], targets: &super::Targets, members: &[usize], features: &[&str]) -> Graph {
-    let mut resolver = Resolver {
-        packages,
-        targets,
-        units: Vec::new(),
-        by_key: BTreeMap::new(),
-        enabled: Vec::new(),
-        want: Vec::new(),
-        queue: VecDeque::new(),
-    };
+    let mut resolver = Resolver { packages, targets, units: Vec::new(), by_key: BTreeMap::new(), enabled: Vec::new(), want: Vec::new(), queue: VecDeque::new() };
     for member in members {
         let unit = resolver.unit(*member, Side::Target);
         resolver.queue.push_back((unit, Step::Feature("default".to_owned())));

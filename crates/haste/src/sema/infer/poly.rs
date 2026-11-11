@@ -342,7 +342,7 @@ impl Infer<'_, '_> {
         if substs.len() != params.len() + 1 {
             return Ok(());
         }
-        let members: Vec<ItemRef> = self.cx.children(of).filter(|&m| self.cx.item(m).1.kind == ItemKind::Type).collect();
+        let members: Vec<ItemRef> = self.cx.children(of).into_iter().filter(|&m| self.cx.item(m).1.kind == ItemKind::Type).collect();
         for member in members {
             let bounds = self.cx.trait_generics(member)?;
             if bounds.1.supers.len == 0 {

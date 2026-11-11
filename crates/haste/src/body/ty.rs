@@ -3,13 +3,23 @@ use rustc_lexer::TokenKind;
 
 use super::cursor::Cursor;
 use super::path::Style;
-use crate::outline::source::opens;
 use super::{Ty, TyId};
+use crate::outline::source::opens;
 
 impl Cursor<'_> {
     /// Parses a type, with `+` bounds after a bare trait path.
     pub fn ty(&mut self) -> Result<TyId> {
-        self.ty_no_bounds()
+        let start = self.at;
+        let first = self.ty_no_bounds()?;
+        if self.punct("+")
+            && let Ty::Path(path) = self.body.tys[first.0 as usize]
+            && self.body.path(path).qself.is_none()
+        {
+            self.at = start;
+            let bounds = self.bounds()?;
+            return Ok(self.push_ty(Ty::DynTrait(bounds)));
+        }
+        Ok(first)
     }
 
     /// Parses a type that stops before `+`.

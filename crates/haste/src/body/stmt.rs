@@ -58,7 +58,9 @@ impl Cursor<'_> {
         if self.configured_out(attrs) {
             return self.last_as_tail(stmts);
         }
-        let Some((inner, inner_tail)) = self.spliced(tail) else { return (stmts, Some(tail)) };
+        let Some((inner, inner_tail)) = self.spliced(tail) else {
+            return (stmts, Some(tail));
+        };
         stmts.extend(inner);
         match inner_tail {
             Some(inner_tail) => (stmts, Some(inner_tail)),

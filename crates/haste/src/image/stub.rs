@@ -3,8 +3,8 @@
 use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
 
 pub(super) const STUB_BYTES: usize = 32;
 pub(super) const TIER_UP_BIT: u32 = 1 << 31;
@@ -168,7 +168,7 @@ extern "C" fn resolve(index: usize) -> usize {
     if !tier_up && let Some(code) = compiled(index) {
         return code;
     }
-    let _talk = TALK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _talk = crate::sync::lock(&TALK);
     if !tier_up && let Some(code) = compiled(index) {
         return code;
     }

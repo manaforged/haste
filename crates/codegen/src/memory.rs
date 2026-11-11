@@ -35,6 +35,10 @@ impl Bump {
     fn close(&mut self) {
         self.used = self.size;
     }
+
+    fn remaining(&self) -> usize {
+        self.size.saturating_sub(self.used.next_multiple_of(ALIGN))
+    }
 }
 
 /// One mapping of code: written through `write` and run through `exec`, two views of the same pages.
@@ -136,6 +140,17 @@ impl Memory {
         if let Some(chunk) = self.chunks.last_mut() {
             chunk.bump.split(parts, part);
             chunk.owner = this_process();
+        }
+    }
+
+    /// Moves the mapped chunks of `other` into `self`.
+    pub fn merge(&mut self, mut other: Memory) {
+        self.chunks.append(&mut other.chunks);
+        let owner = this_process();
+        let best = self.chunks.iter().enumerate().filter(|(_, chunk)| chunk.owner == owner).max_by_key(|(_, chunk)| chunk.bump.remaining()).map(|(index, _)| index);
+        if let Some(best) = best {
+            let last = self.chunks.len() - 1;
+            self.chunks.swap(best, last);
         }
     }
 }
@@ -309,7 +324,9 @@ fn file_views(fd: i32, size: usize) -> Result<(usize, usize), Error> {
 #[cfg(target_vendor = "apple")]
 fn views(size: usize) -> Result<(usize, usize), Error> {
     use mach::*;
-    let check = |what: &str, code: i32| if code == 0 { Ok(()) } else { Err(memory_error(format!("{what}: kernel error {code}"))) };
+    let check = |what: &str, code: i32| {
+        if code == 0 { Ok(()) } else { Err(memory_error(format!("{what}: kernel error {code}"))) }
+    };
     let (mut write, mut exec, mut current, mut max) = (0_u64, 0_u64, 0, 0);
     // SAFETY: each call takes this task's own port and the addresses it hands back; the remap aliases only the region just allocated.
     unsafe {

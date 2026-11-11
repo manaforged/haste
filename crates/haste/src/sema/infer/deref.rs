@@ -64,8 +64,22 @@ impl Infer<'_, '_> {
     }
 
     fn has_field(&mut self, ty: Ty, field: &str) -> Result<bool> {
-        let Kind::Adt(item, _) = *self.cx.types.kind(ty) else { return Ok(false) };
-        Ok(self.cx.item(item).1.kind == ItemKind::Struct && self.field_index(item, 0, field)?.is_some())
+        let Kind::Adt(item, _) = *self.cx.types.kind(ty) else {
+            return Ok(false);
+        };
+        if self.cx.item(item).1.kind != ItemKind::Struct || self.cx.foreign(item) {
+            return Ok(false);
+        }
+        let Some(index) = self.field_index(item, 0, field)? else {
+            return Ok(false);
+        };
+        let vis = self.cx.adt_def(item)?.variants.first().and_then(|v| v.fields.get(index as usize)).map(|f| f.vis);
+        match vis {
+            Some(crate::body::adt::FieldVis::Public) => Ok(true),
+            Some(crate::body::adt::FieldVis::Crate) => Ok(self.home.krate == item.krate),
+            Some(crate::body::adt::FieldVis::Private) => self.sees_private(item),
+            None => Ok(false),
+        }
     }
 
     /// The type that step `step` of the autoderef of `expr` reaches from `ty` through `Deref::deref`, recorded on `(expr, step)`; `None` when `ty` has no `Deref` impl.
@@ -111,7 +125,9 @@ impl Infer<'_, '_> {
     }
 
     fn index_mutably(&mut self, expr: ExprId) -> Result<()> {
-        let Some(Res::Fn(_, substs)) = self.out.operators.get(&expr).cloned() else { return Ok(()) };
+        let Some(Res::Fn(_, substs)) = self.out.operators.get(&expr).cloned() else {
+            return Ok(());
+        };
         let Some(method) = self.cx.lang_item("index_mut").and_then(|of| self.cx.trait_member(of, "index_mut")) else { bail!("core has no `IndexMut::index_mut`") };
         self.out.operators.insert(expr, Res::Fn(method, substs));
         Ok(())
@@ -119,7 +135,7 @@ impl Infer<'_, '_> {
 
     fn sees_private(&mut self, item: crate::names::ItemRef) -> Result<bool> {
         let module = self.cx.module_of(item)?;
-        Ok(self.cx.paths(self.home.krate).within(self.home, module))
+        Ok(self.home.krate == module.krate && self.cx.paths(self.home.krate).within(self.home, module))
     }
 
     pub(super) fn overloaded_deref(&mut self, ty: Ty, mutability: Mut) -> Result<Option<(Res, Ty)>> {
@@ -129,7 +145,9 @@ impl Infer<'_, '_> {
         };
         let Some(method) = self.cx.lang_item(lang).and_then(|of| self.cx.trait_member(of, name)) else { bail!("core has no `{lang}` trait") };
         let receiver = self.cx.types.intern(Kind::Ref(mutability, ty));
-        let Some((item, substs)) = self.trait_method(method, receiver)? else { return Ok(None) };
+        let Some((item, substs)) = self.trait_method(method, receiver)? else {
+            return Ok(None);
+        };
         let (_, ret) = self.fn_types(item, &substs)?;
         let Kind::Ref(_, target) = *self.cx.types.kind(self.resolve(ret)) else { bail!("`{}` returns a value that is not a reference", self.cx.name(item)) };
         Ok(Some((Res::fn_of(&self.cx.types, item, &substs), target)))

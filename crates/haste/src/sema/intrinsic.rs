@@ -28,6 +28,7 @@ pub enum Intrinsic {
     Trunc,
     Copysign,
     Round(u8),
+    FloatToInt,
     Transmute,
     PtrMetadata,
     WithOverflow(BinOp),
@@ -78,13 +79,20 @@ pub enum Simd {
     Lanewise(BinOp),
     /// Each lane converted as `as` converts it.
     Cast,
+    Select,
+    SelectBitmask,
     Shuffle,
     Extract,
     Insert,
     /// Whether every lane, or any lane, of a mask is set.
-    Reduce { all: bool },
+    Reduce {
+        all: bool,
+    },
     /// The largest, or smallest, lane of a vector.
-    Extreme { max: bool },
+    Extreme {
+        max: bool,
+    },
+    Sqrt,
 }
 
 /// An atomic access, which lowering makes sequentially consistent.
@@ -99,7 +107,7 @@ pub enum Atomic {
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
 const LLVM: [(&str, Intrinsic); 3] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32)), ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::BytePairMax)];
 
-const NAMES: [(&str, Intrinsic); 130] = {
+const NAMES: [(&str, Intrinsic); 134] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -136,6 +144,7 @@ const NAMES: [(&str, Intrinsic); 130] = {
         ("floor", Floor),
         ("roundf32", Round(32)),
         ("roundf64", Round(64)),
+        ("float_to_int_unchecked", FloatToInt),
         ("transmute", Transmute),
         ("transmute_unchecked", Transmute),
         ("atomic_fence", Fence),
@@ -208,6 +217,8 @@ const NAMES: [(&str, Intrinsic); 130] = {
         ("simd_shuffle", Simd(self::Simd::Shuffle)),
         ("simd_cast", Simd(self::Simd::Cast)),
         ("simd_as", Simd(self::Simd::Cast)),
+        ("simd_select", Simd(self::Simd::Select)),
+        ("simd_select_bitmask", Simd(self::Simd::SelectBitmask)),
         ("simd_extract", Simd(self::Simd::Extract)),
         ("simd_extract_dyn", Simd(self::Simd::Extract)),
         ("simd_insert", Simd(self::Simd::Insert)),
@@ -216,6 +227,7 @@ const NAMES: [(&str, Intrinsic); 130] = {
         ("simd_reduce_any", Simd(self::Simd::Reduce { all: false })),
         ("simd_reduce_max", Simd(self::Simd::Extreme { max: true })),
         ("simd_reduce_min", Simd(self::Simd::Extreme { max: false })),
+        ("simd_fsqrt", Simd(self::Simd::Sqrt)),
         ("simd_add", Simd(self::Simd::Lanewise(BinOp::Add))),
         ("simd_sub", Simd(self::Simd::Lanewise(BinOp::Sub))),
         ("simd_mul", Simd(self::Simd::Lanewise(BinOp::Mul))),

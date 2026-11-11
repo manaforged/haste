@@ -14,11 +14,7 @@ impl Lower<'_, '_> {
 
     fn vtable_id(&mut self, vtable: &Vtable) -> Result<VtableId> {
         let layout = self.cx.layout(vtable.ty)?;
-        let mut entries = vec![
-            VtableEntry::Word(self.code_word(vtable.drop.as_ref())?),
-            VtableEntry::Word(Word::Int(layout.size.bytes())),
-            VtableEntry::Word(Word::Int(layout.align.abi.bytes())),
-        ];
+        let mut entries = vec![VtableEntry::Word(self.code_word(vtable.drop.as_ref())?), VtableEntry::Word(Word::Int(layout.size.bytes())), VtableEntry::Word(Word::Int(layout.align.abi.bytes()))];
         for method in &vtable.methods {
             entries.push(VtableEntry::Word(self.code_word(method.as_ref())?));
         }

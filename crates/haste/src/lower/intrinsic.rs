@@ -2,8 +2,8 @@ use anyhow::{Result, bail};
 use haste_codegen::{FloatCC, IntCC, Type, Value};
 
 use crate::body::BinOp;
-use crate::sema::intrinsic::Intrinsic;
 use crate::names::Primitive;
+use crate::sema::intrinsic::Intrinsic;
 use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
@@ -16,6 +16,11 @@ impl Lower<'_, '_> {
     pub fn intrinsic(&mut self, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         match which {
             Intrinsic::Transmute => self.transmute(substs, args),
+            Intrinsic::FloatToInt => {
+                let (&[from, to], &[value]) = (substs, args) else { bail!("float_to_int_unchecked takes one float") };
+                let (from, to) = (self.num(from)?, self.num(to)?);
+                self.convert(value, from, to).map(Some)
+            }
             Intrinsic::PtrMetadata => self.metadata(substs, args),
             Intrinsic::ConstEvalSelect => self.const_eval_select(substs, args),
             Intrinsic::WithOverflow(op) => self.with_overflow(op, substs, args).map(Some),
@@ -115,9 +120,7 @@ impl Lower<'_, '_> {
 
     fn const_eval_select(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&tuple), Some(&runtime)) = (substs.first(), substs.get(2)) else { bail!("const_eval_select takes four type arguments") };
-        let (Kind::Tuple(fields), Kind::FnDef(item, fn_substs)) = (self.cx.types.kind(tuple).clone(), self.cx.types.kind(runtime).clone()) else {
-            bail!("const_eval_select needs a tuple of arguments and a function item")
-        };
+        let (Kind::Tuple(fields), Kind::FnDef(item, fn_substs)) = (self.cx.types.kind(tuple).clone(), self.cx.types.kind(runtime).clone()) else { bail!("const_eval_select needs a tuple of arguments and a function item") };
         let fields = self.cx.types.substs(fields).to_vec();
         let mut values = Vec::new();
         if let Some(&address) = args.first() {

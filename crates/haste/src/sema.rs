@@ -14,62 +14,92 @@ pub mod layout;
 pub mod reach;
 pub mod substs;
 pub mod summary;
+pub mod table;
 pub mod traits;
 pub mod ty;
 
-use rustc_hash::FxHashMap as HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use rustc_hash::FxHashMap as HashMap;
 
-use crate::body::sig::{self, Signature};
-use crate::body::adt::{AdtDef, adt as parse_adt};
 use crate::body::Body;
+use crate::body::adt::{AdtDef, adt as parse_adt};
+use crate::body::sig::{self, Signature};
 use crate::names::collect::items_of;
-use crate::names::path::{Requests, Paths};
+use crate::names::path::{Paths, Requests};
 use crate::names::{ItemRef, ModRef, Names};
 use crate::outline::Outline;
 use crate::outline::item::{Item, ItemKind};
 use crate::outline::source::Source;
 
+use table::Table;
 use ty::Types;
 
+type TypeScope = (ModRef, Option<ItemRef>, Option<ItemRef>, bool, Option<u32>);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SegKey {
+    inline: [u32; 4],
+    len: u8,
+    overflow: Option<Arc<[crate::names::Sym]>>,
+}
+
+impl SegKey {
+    fn from_slice(segments: &[crate::names::Sym]) -> Self {
+        let mut inline = [0; 4];
+        if segments.len() <= inline.len() {
+            for (slot, sym) in inline.iter_mut().zip(segments) {
+                *slot = sym.0;
+            }
+            return Self { inline, len: segments.len() as u8, overflow: None };
+        }
+        Self { inline, len: u8::MAX, overflow: Some(Arc::from(segments)) }
+    }
+}
+
+pub(super) use crate::sync::{read_lock, write_lock};
+
 /// What Sema keeps between passes over a growing outline: interned types and parsed headers and bodies.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Cache {
     types: Types,
-    signatures: HashMap<ItemRef, Rc<Signature>>,
-    bodies: HashMap<ItemRef, Rc<Body>>,
-    adts: HashMap<ItemRef, Rc<AdtDef>>,
-    layouts: HashMap<ty::Ty, Rc<layout::Layout>>,
-    tails: HashMap<ty::Ty, ty::Ty>,
-    headers: HashMap<impls::ImplRef, Rc<sig::ImplHeader>>,
-    finals: HashMap<reach::Instance, Rc<infer::Typed>>,
-    closures: HashMap<ty::Ty, Rc<infer::ClosureInfo>>,
+    signatures: Table<ItemRef, Arc<Signature>>,
+    bodies: Table<ItemRef, Arc<Body>>,
+    adts: Table<ItemRef, Arc<AdtDef>>,
+    layouts: Table<ty::Ty, Arc<layout::Layout>>,
+    tails: Table<ty::Ty, ty::Ty>,
+    headers: Table<impls::ImplRef, Arc<sig::ImplHeader>>,
+    finals: Table<reach::Instance, Arc<infer::Typed>>,
+    closures: Table<ty::Ty, Arc<infer::ClosureInfo>>,
     lookups: Lookups,
-    pub summary_fallbacks: usize,
+}
+
+#[derive(Default)]
+struct OutlineState {
+    langs: RwLock<Option<traits::Langs>>,
+    loaded: RwLock<Vec<[usize; 5]>>,
 }
 
 /// The lookups Sema caches about one outline, which hold while only function bodies change.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Lookups {
-    modules: HashMap<u32, Rc<HashMap<(u32, u32), u32>>>,
-    heads: HashMap<impls::Holder, Rc<impls::Index>>,
-    owners: HashMap<u32, Rc<HashMap<(u32, Option<u32>), u32>>>,
-    trait_defs: HashMap<ItemRef, Rc<traits::TraitGenerics>>,
-    discriminants: HashMap<ItemRef, Rc<[i128]>>,
-    langs: Option<traits::Langs>,
-    drops: HashMap<ty::Ty, bool>,
-    fields: HashMap<ty::Ty, infer::Fields>,
-    forms: HashMap<(infer::Form, usize), Option<infer::Fields>>,
-    reveals: HashMap<reach::Instance, Option<ty::Ty>>,
-    futures: HashMap<ty::Ty, ty::Ty>,
-    scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
-    type_defs: std::cell::RefCell<HashMap<TypeKey, crate::names::Def>>,
-    impl_traits: HashMap<impls::ImplRef, Option<ItemRef>>,
-    selections: HashMap<(ItemRef, ty::Ty, substs::Substs), Option<(impls::ImplRef, substs::Substs)>>,
-    summaries: HashMap<ItemRef, summary::SummaryKind>,
-    loaded: Vec<[usize; 5]>,
+    modules: Table<u32, Arc<HashMap<(u32, u32), u32>>>,
+    heads: Table<impls::Holder, Arc<impls::Index>>,
+    owners: Table<u32, Arc<HashMap<(u32, Option<u32>), u32>>>,
+    trait_defs: Table<ItemRef, Arc<traits::TraitGenerics>>,
+    discriminants: Table<ItemRef, Arc<[i128]>>,
+    state: Arc<OutlineState>,
+    drops: Table<ty::Ty, bool>,
+    fields: Table<ty::Ty, infer::Fields>,
+    forms: Table<(infer::Form, usize), Option<infer::Fields>>,
+    reveals: table::Flight<reach::Instance, ty::Ty>,
+    futures: Table<ty::Ty, ty::Ty>,
+    scope_traits: Table<ModRef, Arc<[ItemRef]>>,
+    type_defs: Table<(TypeScope, SegKey), crate::names::Def>,
+    impl_traits: Table<impls::ImplRef, Option<ItemRef>>,
+    selections: Table<(ItemRef, ty::Ty, substs::Substs), Option<(impls::ImplRef, substs::Substs)>>,
+    summaries: table::Flight<ItemRef, summary::SummaryKind>,
 }
 
 /// What answering the asks of a pass added: nothing new to infer with, the output of procedural macros that function bodies call, or loaded files, resolved names and expanded items.
@@ -83,18 +113,21 @@ pub enum Answer {
 impl Lookups {
     /// The lookups that depend only on loaded source and so hold while it does: the impl indexes of crates built without asking for anything, the lang items, and the outline extent they were built at.
     fn after_pass(&mut self) -> Lookups {
-        let complete = |(holder, index): &(impls::Holder, Rc<impls::Index>)| matches!(holder, impls::Holder::Crate(_)) && index.complete();
-        let heads = std::mem::take(&mut self.heads).into_iter().filter(complete).collect();
-        Lookups { heads, langs: self.langs.take(), loaded: std::mem::take(&mut self.loaded), ..Lookups::default() }
+        let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
+        let discriminants = self.discriminants.clone();
+        let state = Arc::clone(&self.state);
+        Lookups { heads, discriminants, state, ..Lookups::default() }
     }
 
     /// Drops the impl indexes and lang items when `outline` loaded, expanded or consumed anything since they were built, and records its extent now.
     fn check(&mut self, outline: &Outline) {
         let loaded: Vec<[usize; 5]> = outline.crates.iter().map(crate::outline::tree::Crate::extent).collect();
-        if loaded != self.loaded {
+        let mut guard = write_lock(&self.state.loaded);
+        if *guard != loaded {
             self.heads.clear();
-            self.langs = None;
-            self.loaded = loaded;
+            self.discriminants.clear();
+            *write_lock(&self.state.langs) = None;
+            *guard = loaded;
         }
     }
 }
@@ -114,7 +147,9 @@ impl Cache {
     pub fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
         let mine = |item: ItemRef| edited.holds(item.krate, item.file);
         let block_kept = |block: &impls::ImplRef| match *block {
-            impls::ImplRef::Module { krate, index } => outline.crates[krate as usize].impls.get(index as usize).is_some_and(|entry| !edited.holds(krate, entry.file as u32) && !entry.parts.iter().any(|&part| edited.holds(krate, part as u32))),
+            impls::ImplRef::Module { krate, index } => {
+                outline.crates[krate as usize].impls.get(index as usize).is_some_and(|entry| !edited.holds(krate, entry.file as u32) && !entry.parts.iter().any(|&part| edited.holds(krate, part as u32)))
+            }
             impls::ImplRef::Body(item) => !mine(item),
         };
         self.signatures.retain(|item, _| !mine(*item));
@@ -126,34 +161,7 @@ impl Cache {
         self.layouts.retain(|ty, _| !naming.names(*ty));
         self.tails.retain(|ty, _| !naming.names(*ty));
         self.closures.retain(|ty, _| !naming.names(*ty));
-        let kept = &mut self.lookups;
-        kept.drops.retain(|ty, _| !naming.names(*ty));
-        kept.fields.retain(|ty, _| !naming.names(*ty));
-        kept.forms.retain(|(form, _), found| {
-            let own = match *form {
-                infer::Form::Adt(item) | infer::Form::Fn(item) => !mine(item),
-                infer::Form::Impl(block) => block_kept(&block),
-            };
-            own && found.iter().flat_map(|types| types.iter().flatten()).all(|&ty| !naming.names(ty))
-        });
-        kept.reveals.retain(|instance, _| !naming.touches(instance));
-        kept.futures.retain(|ty, _| !naming.names(*ty));
-        kept.impl_traits.retain(|block, _| block_kept(block));
-        kept.heads.retain(|holder, _| match *holder {
-            impls::Holder::Crate(krate) => !edited.touches_crate(krate),
-            impls::Holder::Body(item) => !mine(item),
-        });
-        kept.modules.retain(|krate, _| !edited.touches_crate(*krate));
-        kept.owners.retain(|krate, _| !edited.touches_crate(*krate));
-        kept.scope_traits.get_mut().retain(|home, _| !edited.touches_crate(home.krate));
-        kept.type_defs.get_mut().retain(|key, _| !edited.touches_crate(key.0.krate));
-        kept.trait_defs.retain(|item, _| !mine(*item));
-        kept.selections.clear();
-        kept.summaries.clear();
-        kept.discriminants.retain(|item, _| !mine(*item));
-        if kept.langs.as_ref().is_some_and(|langs| langs.crates.iter().any(|&krate| edited.touches_crate(krate))) {
-            kept.langs = None;
-        }
+        self.lookups.forget_edited(edited, &mut naming, &mine, &block_kept);
     }
 
     /// Drops what the store keeps about what `edited` holds and returns the indexes of the instances in `list` that it touched.
@@ -168,6 +176,39 @@ impl Cache {
         let mine = |item: ItemRef| edited.holds(item.krate, item.file);
         let mut naming = Naming { types: &self.types, mine: &mine, memo: HashMap::default() };
         list.enumerate().filter(|(_, instance)| naming.touches(instance)).map(|(at, _)| at).collect()
+    }
+}
+
+impl Lookups {
+    fn forget_edited<F: Fn(ItemRef) -> bool>(&mut self, edited: Edited<'_>, naming: &mut Naming<'_, F>, mine: &F, block_kept: &dyn Fn(&impls::ImplRef) -> bool) {
+        self.drops.retain(|ty, _| !naming.names(*ty));
+        self.fields.retain(|ty, _| !naming.names(*ty));
+        self.forms.retain(|(form, _), found| {
+            let own = match *form {
+                infer::Form::Adt(item) | infer::Form::Fn(item) => !mine(item),
+                infer::Form::Impl(block) => block_kept(&block),
+            };
+            own && found.iter().flat_map(|types| types.iter().flatten()).all(|&ty| !naming.names(ty))
+        });
+        self.reveals.retain(|instance| !naming.touches(instance));
+        self.futures.retain(|ty, _| !naming.names(*ty));
+        self.impl_traits.retain(|block, _| block_kept(block));
+        self.heads.retain(|holder, _| match *holder {
+            impls::Holder::Crate(krate) => !edited.touches_crate(krate),
+            impls::Holder::Body(item) => !mine(item),
+        });
+        self.modules.retain(|krate, _| !edited.touches_crate(*krate));
+        self.owners.retain(|krate, _| !edited.touches_crate(*krate));
+        self.scope_traits.retain(|home, _| !edited.touches_crate(home.krate));
+        self.type_defs.retain(|key, _| !edited.touches_crate(key.0.0.krate));
+        self.trait_defs.retain(|item, _| !mine(*item));
+        self.selections.clear();
+        self.summaries = table::Flight::default();
+        self.discriminants.retain(|item, _| !mine(*item));
+        let mut langs = write_lock(&self.state.langs);
+        if langs.as_ref().is_some_and(|found| found.crates.iter().any(|&krate| edited.touches_crate(krate))) {
+            *langs = None;
+        }
     }
 }
 
@@ -222,11 +263,7 @@ impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
             }
             _ => false,
         };
-        let closure_args = match kind {
-            ty::Kind::Closure(_, args, _) => self.types.substs(*args),
-            _ => &[],
-        };
-        let inner: Vec<ty::Ty> = kind.children(self.types).chain(closure_args.iter().copied()).collect();
+        let inner: Vec<ty::Ty> = kind.children(self.types).collect();
         let found = own || inner.into_iter().any(|inner| self.names(inner));
         self.memo.insert(ty, found);
         found
@@ -239,35 +276,85 @@ pub struct Context<'a> {
     pub names: &'a Names,
     pub types: Types,
     pub asks: Requests,
+    pub(crate) in_parallel: bool,
+    pub(crate) deferred_evals: Vec<(reach::Instance, u32)>,
     store: Cache,
-    kids: std::cell::RefCell<HashMap<usize, Rc<Kids>>>,
-    trait_members: std::cell::RefCell<HashMap<ItemRef, Rc<HashMap<&'a str, ItemRef>>>>,
-    impl_members: std::cell::RefCell<HashMap<impls::ImplRef, Rc<HashMap<&'a str, ItemRef>>>>,
-    aliases: std::cell::RefCell<HashMap<ItemRef, Rc<Alias>>>,
+    kids: Table<usize, Arc<Kids>>,
+    trait_members: Table<ItemRef, Arc<HashMap<&'a str, ItemRef>>>,
+    impl_members: Table<impls::ImplRef, Arc<HashMap<&'a str, ItemRef>>>,
+    aliases: Table<ItemRef, Arc<Alias>>,
     evaluated: evaluate::Evaluated,
+    pub(super) eval_stack: Vec<reach::Instance>,
+    pub(super) drop_stack: Vec<ty::Ty>,
+    pub(super) form_stack: Vec<(infer::Form, usize)>,
 }
 
 /// A parsed type alias: its type parameters, its generics and where clause, and its target type.
+#[derive(Debug)]
 pub struct Alias {
     pub params: Vec<sig::Generic>,
-    pub generics: Rc<traits::TraitGenerics>,
+    pub generics: Arc<traits::TraitGenerics>,
     pub arena: Body,
     pub ty: crate::body::TyId,
 }
 
-/// Where a type path is resolved and what it says: home module, body root, nested instance, segments, leading `::` and `$crate`.
-pub type TypeKey = (ModRef, Option<ItemRef>, Option<ItemRef>, Vec<crate::names::Sym>, bool, Option<u32>);
-
 /// The items of one file or body grouped by the item they are declared inside, in order.
-type Kids = HashMap<Option<u32>, Rc<[u32]>>;
+type Kids = HashMap<Option<u32>, Arc<[u32]>>;
 
 impl<'a> Context<'a> {
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, mut store: Cache) -> Context<'a> {
-        let types = std::mem::take(&mut store.types);
+        let types = store.types.clone();
         store.lookups.check(outline);
         let (kids, trait_members, impl_members, aliases, asks) = Default::default();
-        Context { outline, names, types, asks, store, kids, trait_members, impl_members, aliases, evaluated: evaluate::Evaluated::default() }
+        Context {
+            outline,
+            names,
+            types,
+            asks,
+            in_parallel: false,
+            deferred_evals: Vec::new(),
+            store,
+            kids,
+            trait_members,
+            impl_members,
+            aliases,
+            evaluated: evaluate::Evaluated::default(),
+            eval_stack: Vec::new(),
+            drop_stack: Vec::new(),
+            form_stack: Vec::new(),
+        }
+    }
+
+    /// A sibling context over the same outline, names, types and caches, with its own empty request list so a worker thread can run without contending on asks.
+    pub fn fork(&self) -> Context<'a> {
+        Context {
+            outline: self.outline,
+            names: self.names,
+            types: self.types.clone(),
+            asks: Requests::default(),
+            in_parallel: true,
+            deferred_evals: Vec::new(),
+            store: self.store.clone(),
+            kids: self.kids.clone(),
+            trait_members: self.trait_members.clone(),
+            impl_members: self.impl_members.clone(),
+            aliases: self.aliases.clone(),
+            evaluated: self.evaluated.clone(),
+            eval_stack: Vec::new(),
+            drop_stack: Vec::new(),
+            form_stack: Vec::new(),
+        }
+    }
+
+    /// Takes the constant evaluations that a parallel pass deferred until worker threads joined.
+    pub fn take_deferred_evals(&mut self) -> Vec<(reach::Instance, u32)> {
+        std::mem::take(&mut self.deferred_evals)
+    }
+
+    /// The lengths of `asks` and `deferred_evals`, unchanged only when a lookup neither asked for unloaded names nor deferred a constant evaluation.
+    pub(crate) fn quiet_mark(&self) -> (usize, usize) {
+        (self.asks.count(), self.deferred_evals.len())
     }
 
     /// Whether no lookup in this pass asked for anything to load or resolve, so another pass would find the same.
@@ -281,9 +368,14 @@ impl<'a> Context<'a> {
         (self.store, self.asks)
     }
 
-    /// The type-namespace items that paths name, by home module, body root, nested instance, segments, `::` and `$crate`.
-    pub fn type_defs(&self) -> &std::cell::RefCell<HashMap<TypeKey, crate::names::Def>> {
-        &self.store.lookups.type_defs
+    /// The cached type-namespace definition for `segments` in `scope`.
+    pub fn type_def(&self, scope: (ModRef, Option<ItemRef>, Option<ItemRef>, bool, Option<u32>), segments: &[crate::names::Sym]) -> Option<crate::names::Def> {
+        self.store.lookups.type_defs.get(&(scope, SegKey::from_slice(segments)))
+    }
+
+    /// Caches `def` as the type-namespace definition for `segments` in `scope`.
+    pub fn set_type_def(&self, scope: (ModRef, Option<ItemRef>, Option<ItemRef>, bool, Option<u32>), segments: &[crate::names::Sym], def: crate::names::Def) {
+        self.store.lookups.type_defs.insert((scope, SegKey::from_slice(segments)), def);
     }
 
     /// The source file and outline entry of `item`.
@@ -295,44 +387,67 @@ impl<'a> Context<'a> {
 
     /// The item that `item` is declared directly inside, in the same file or body.
     pub fn parent_item(&self, item: ItemRef) -> Option<ItemRef> {
-        let parent = self.item(item).1.parent?;
-        Some(match item.declaring_body() {
-            Some(root) => root.inner(parent),
-            None => ItemRef { item: parent, ..item },
-        })
+        if let Some(parent) = self.item(item).1.parent {
+            return Some(match item.declaring_body() {
+                Some(root) => root.inner(parent),
+                None => ItemRef { item: parent, ..item },
+            });
+        }
+        if item.declaring_body().is_some() || !self.file(item).expanded {
+            return None;
+        }
+        let entry = self.outline.crates[item.krate as usize].traits.iter().find(|entry| entry.parts.contains(&(item.file as usize)))?;
+        Some(ItemRef { krate: item.krate, file: entry.file as u32, item: entry.at })
     }
 
-    /// The items declared directly inside `of`: the members of a trait or impl, in the file or body that holds it.
-    pub fn children(&self, of: ItemRef) -> impl Iterator<Item = ItemRef> + 'a {
+    /// The items declared directly inside `of`: the members of a trait or impl, in the file, expanded parts or body that holds it.
+    pub fn children(&self, of: ItemRef) -> Vec<ItemRef> {
+        if of.outer().is_none()
+            && self.item(of).1.kind == ItemKind::Trait
+            && let Some(entry) = self.outline.crates[of.krate as usize].traits.iter().find(|entry| entry.file == of.file as usize && entry.at == of.item)
+        {
+            return self.block_parts(of.krate, entry);
+        }
         let at = of.outer().map_or(of.item, |(_, at)| at);
-        let list = self.kids_of(&self.file(of).items.items, Some(at));
+        let file = self.file(of);
+        let env = &self.outline.crates[of.krate as usize].env;
+        let list = self.kids_of(&file.items.items, Some(at));
         let body = of.declaring_body();
-        (0..list.len()).map(move |index| match body {
-            Some(root) => root.inner(list[index]),
-            None => ItemRef { item: list[index], ..of },
-        })
+        list.iter().copied().filter(|&index| env.enabled(&file.items.items[index as usize].attrs)).map(|index| body.map_or(ItemRef { item: index, ..of }, |root| root.inner(index))).collect()
+    }
+
+    pub(super) fn block_parts(&self, krate: u32, entry: &crate::outline::tree::Impl) -> Vec<ItemRef> {
+        let tree = &self.outline.crates[krate as usize];
+        let parts = std::iter::once((entry.file, Some(entry.at))).chain(entry.parts.iter().map(|&part| (part, None)));
+        let mut found = Vec::new();
+        for (file, owner) in parts {
+            let items = &tree.files[file].items.items;
+            for &at in self.kids_of(items, owner).iter() {
+                if tree.env.enabled(&items[at as usize].attrs) {
+                    found.push(ItemRef { krate, file: file as u32, item: at });
+                }
+            }
+        }
+        found
     }
 
     /// The indices of the items in `items` declared directly inside item `parent`, or at the top level for none.
-    pub fn kids_of(&self, items: &[Item], parent: Option<u32>) -> Rc<[u32]> {
+    pub fn kids_of(&self, items: &[Item], parent: Option<u32>) -> Arc<[u32]> {
         let key = items.as_ptr() as usize;
-        let cached = self.kids.borrow().get(&key).cloned();
-        let kids = cached.unwrap_or_else(|| {
+        let kids = self.kids.get_or_insert_with(key, || {
             let mut grouped: HashMap<Option<u32>, Vec<u32>> = HashMap::default();
             for (at, item) in items.iter().enumerate() {
                 grouped.entry(item.parent).or_default().push(at as u32);
             }
-            let kids: Rc<Kids> = Rc::new(grouped.into_iter().map(|(parent, list)| (parent, list.into())).collect());
-            self.kids.borrow_mut().insert(key, kids.clone());
-            kids
+            Arc::new(grouped.into_iter().map(|(owner, list)| (owner, list.into())).collect())
         });
-        kids.get(&parent).cloned().unwrap_or_else(|| Rc::from([]))
+        kids.get(&parent).cloned().unwrap_or_else(|| Arc::from([]))
     }
 
-    /// Whether `item` is a function or static declared in an `extern` block, or a bodyless float intrinsic with a host function, which the host links by name.
+    /// Whether `item` is a function, static or type declared in an `extern` block, or a bodyless float intrinsic with a host function, which the host links by name.
     pub fn foreign(&self, item: ItemRef) -> bool {
         let (src, entry) = self.item(item);
-        if !matches!(entry.kind, ItemKind::Fn | ItemKind::Static) || entry.body.is_some() {
+        if !matches!(entry.kind, ItemKind::Fn | ItemKind::Static | ItemKind::Type) || entry.body.is_some() {
             return false;
         }
         let external = self.parent_item(item).is_some_and(|parent| self.item(parent).1.kind == ItemKind::ExternBlock);
@@ -340,18 +455,23 @@ impl<'a> Context<'a> {
     }
 
     /// What the body that defines the closure type `ty` inferred for it.
-    pub fn closure(&self, ty: ty::Ty) -> Option<Rc<infer::ClosureInfo>> {
-        self.store.closures.get(&ty).cloned()
+    pub fn closure(&self, ty: ty::Ty) -> Option<Arc<infer::ClosureInfo>> {
+        self.store.closures.get(&ty)
+    }
+
+    /// Whether the body that defines the closure type `ty` has recorded it.
+    pub fn has_closure(&self, ty: ty::Ty) -> bool {
+        self.store.closures.contains_key(&ty)
     }
 
     /// The output of the async fn future `ty` that a call named while its body was still being inferred, from the declared return type.
     pub fn future_output(&self, ty: ty::Ty) -> Option<ty::Ty> {
-        self.store.lookups.futures.get(&ty).copied()
+        self.store.lookups.futures.get(&ty)
     }
 
     /// Records what the body that defines the closure type `ty` inferred for it.
     pub fn set_closure(&mut self, ty: ty::Ty, info: infer::ClosureInfo) {
-        self.store.closures.insert(ty, Rc::new(info));
+        self.store.closures.insert(ty, Arc::new(info));
     }
 
     /// The tuple of the captures of the closure type `ty`, which is how the closure is laid out and dropped.
@@ -437,6 +557,9 @@ impl<'a> Context<'a> {
         if let Some(block) = self.owner_impl(item) {
             return self.impl_module(block);
         }
+        if let Some(of) = self.owner_trait(item) {
+            return self.module_of(of);
+        }
         let map = self.modules_of(item.krate);
         let (_, mut entry) = self.item(item);
         let mut top = item.item;
@@ -449,44 +572,36 @@ impl<'a> Context<'a> {
         Ok(ModRef { krate: item.krate, module })
     }
 
-    fn modules_of(&mut self, krate: u32) -> Rc<HashMap<(u32, u32), u32>> {
+    fn modules_of(&mut self, krate: u32) -> Arc<HashMap<(u32, u32), u32>> {
         let tree = &self.outline.crates[krate as usize];
-        self.store.lookups.modules
-            .entry(krate)
-            .or_insert_with(|| {
-                let pairs = (0..tree.modules.len()).flat_map(|module| items_of(tree, module).into_iter().map(move |pair| (pair, module as u32)));
-                Rc::new(pairs.collect())
-            })
-            .clone()
+        self.store.lookups.modules.get_or_insert_with(krate, || {
+            let pairs = (0..tree.modules.len()).flat_map(|module| items_of(tree, module).into_iter().map(move |pair| (pair, module as u32)));
+            Arc::new(pairs.collect())
+        })
     }
 
     /// The parsed header of the function `item`.
-    pub fn signature(&mut self, item: ItemRef) -> Result<Rc<Signature>> {
+    pub fn signature(&mut self, item: ItemRef) -> Result<Arc<Signature>> {
         if let Some(found) = self.store.signatures.get(&item) {
-            return Ok(found.clone());
+            return Ok(found);
         }
-        let (src, entry) = self.item(item);
-        let parsed = match (entry.kind, entry.name) {
-            (ItemKind::Const | ItemKind::Static, Some(name)) => sig::const_signature(src, name, entry.end)?,
-            _ => sig::signature(src, entry.start, entry.body.unwrap_or(entry.end), &self.outline.crates[item.krate as usize].env)?,
-        };
-        let parsed = Rc::new(parsed);
-        self.store.signatures.insert(item, parsed.clone());
+        let parsed = Arc::new(self.parse_signature(item)?);
+        self.store.signatures.insert(item, Arc::clone(&parsed));
         Ok(parsed)
     }
 
     /// The parsed body of the function `item`.
-    pub fn body(&mut self, item: ItemRef) -> Result<Rc<Body>> {
+    pub fn body(&mut self, item: ItemRef) -> Result<Arc<Body>> {
         if let Some(found) = self.store.bodies.get(&item) {
-            return Ok(found.clone());
+            return Ok(found);
         }
         let mut parsed = self.parse_body(item)?;
         let sig = self.signature(item)?;
         if sig.params.iter().any(|&(pat, _)| !sig.body.plain_param(pat)) {
             parsed = crate::body::parse_params(self.body_src(item), parsed, &sig.param_starts)?;
         }
-        let parsed = Rc::new(parsed);
-        self.store.bodies.insert(item, parsed.clone());
+        let parsed = Arc::new(parsed);
+        self.store.bodies.insert(item, Arc::clone(&parsed));
         Ok(parsed)
     }
 
@@ -499,24 +614,24 @@ impl<'a> Context<'a> {
     }
 
     /// The parsed definition of the struct, enum or union `item`.
-    pub fn adt_def(&mut self, item: ItemRef) -> Result<Rc<AdtDef>> {
+    pub fn adt_def(&mut self, item: ItemRef) -> Result<Arc<AdtDef>> {
         if let Some(found) = self.store.adts.get(&item) {
-            return Ok(found.clone());
+            return Ok(found);
         }
         let (src, entry) = self.item(item);
         let name = entry.name.ok_or_else(|| anyhow!("type item has no name"))?;
         let mut parsed = parse_adt(src, name, entry.end, entry.kind == ItemKind::Enum)?;
         let env = &self.outline.crates[item.krate as usize].env;
         parsed.configure(src, &|attrs| env.enabled(attrs));
-        let parsed = Rc::new(parsed);
-        self.store.adts.insert(item, parsed.clone());
+        let parsed = Arc::new(parsed);
+        self.store.adts.insert(item, Arc::clone(&parsed));
         Ok(parsed)
     }
 
     /// The type alias `item`, parsed once per pass.
-    pub fn alias_def(&self, item: ItemRef) -> Result<Rc<Alias>> {
-        if let Some(found) = self.aliases.borrow().get(&item) {
-            return Ok(found.clone());
+    pub fn alias_def(&self, item: ItemRef) -> Result<Arc<Alias>> {
+        if let Some(found) = self.aliases.get(&item) {
+            return Ok(found);
         }
         let (src, entry) = self.item(item);
         let (at, eq) = self.alias_eq(item)?;
@@ -526,8 +641,8 @@ impl<'a> Context<'a> {
         };
         let params = generics.1.params.iter().filter(|generic| generic.kind != sig::GenericKind::Lifetime).cloned().collect();
         let (arena, ty) = crate::body::parse_ty(src, eq + 1, entry.end - 1)?;
-        let alias = Rc::new(Alias { params, generics: Rc::new(generics), arena, ty });
-        self.aliases.borrow_mut().insert(item, alias.clone());
+        let alias = Arc::new(Alias { params, generics: Arc::new(generics), arena, ty });
+        self.aliases.insert(item, Arc::clone(&alias));
         Ok(alias)
     }
 

@@ -323,6 +323,9 @@ fn simd_op_code(op: Simd) -> (u8, u8) {
         Simd::Insert => (7, 0),
         Simd::Reduce { all } => (8 + u8::from(all), 0),
         Simd::Extreme { max } => (10 + u8::from(max), 0),
+        Simd::Select => (12, 0),
+        Simd::SelectBitmask => (13, 0),
+        Simd::Sqrt => (14, 0),
     }
 }
 

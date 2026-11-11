@@ -23,16 +23,16 @@ mod slice_pat;
 mod stencil;
 
 pub use expr::{can_inline_body, may_inline};
-pub use stencil::{
-    Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, SymbolSource, VtableEntry, VtableId, lower_dict,
-    lower_stencil, probe_footprint,
-};
+pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil, probe_footprint};
+
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
 
 use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
 use crate::names::{ItemRef, Primitive};
+use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 use crate::sema::Context;
 use crate::sema::infer::{Shape, Typed};
@@ -211,11 +211,19 @@ struct Loop {
     block: bool,
 }
 
+/// The inline state of one top-level lowering: the reached indexes being lowered, and the callees whose inline decision rests on an open cycle, each with the stack depth that cycle reaches.
+#[derive(Default)]
+pub(super) struct Inline {
+    pub stack: Vec<usize>,
+    pub local: rustc_hash::FxHashMap<usize, (Option<Arc<stencil::InlinedCallee>>, usize)>,
+}
+
 /// The lowering of one body.
 pub struct Lower<'l, 'a> {
     cx: &'l mut Context<'a>,
     reached: &'l Reached,
     slots: &'l dyn Slots,
+    inline: &'l mut Inline,
     body: &'l Body,
     src: &'a Source,
     typed: &'l Typed,
@@ -243,7 +251,7 @@ pub struct Lower<'l, 'a> {
 
 /// Whether `item` is a static, whose reached instance writes its value into the static's cell.
 pub fn is_static(cx: &Context<'_>, item: ItemRef) -> bool {
-    cx.item(item).1.kind == crate::outline::item::ItemKind::Static
+    cx.item(item).1.kind == ItemKind::Static
 }
 
 impl Lower<'_, '_> {
@@ -399,7 +407,6 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// Gives the initialized `local` its own frame slot, holding a copy of `value` when there is one, and owns what it holds.
     /// Declares parameter `local` with the value that crossed the call: a scalar is stored into the memory of a local whose type travels unwrapped.
     fn declare_passed(&mut self, local: u32, value: Option<Value>) -> Result<()> {
         self.declare(local, None)?;
@@ -434,6 +441,7 @@ impl Lower<'_, '_> {
         })
     }
 
+    /// Gives `local` a fresh frame slot, writes `value` into it when given, and marks `local` initialized.
     pub fn declare(&mut self, local: u32, value: Option<Value>) -> Result<()> {
         self.declare_as(local, value, true)
     }
@@ -528,7 +536,9 @@ impl Lower<'_, '_> {
     }
 
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<()> {
-        let Some(init) = init else { return self.declare_uninit(pat) };
+        let Some(init) = init else {
+            return self.declare_uninit(pat);
+        };
         self.extend(init);
         let unboxed = self.moves_whole_box(pat, init)?;
         let place = if unboxed { self.temp(init)? } else { self.place_or_temp(init)? };

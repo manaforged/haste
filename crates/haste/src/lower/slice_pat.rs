@@ -19,7 +19,9 @@ impl Lower<'_, '_> {
         };
         let (pats, rest) = rest_split(self.body, list)?;
         let count = pats.len();
-        let Some((data, len)) = self.data_len(place, ty)? else { return Ok(Vec::new()) };
+        let Some((data, len)) = self.data_len(place, ty)? else {
+            return Ok(Vec::new());
+        };
         if let (Some(fail), Kind::Slice(_)) = (fail, self.cx.types.kind(ty)) {
             let given = self.ins().iconst(Type::I64, (count - usize::from(rest.is_some())) as i64);
             let cc = if rest.is_some() { IntCC::UnsignedGreaterThanOrEqual } else { IntCC::Equal };

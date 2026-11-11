@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use anyhow::{Result, bail};
 
 use crate::body::adt::Shape;
@@ -17,7 +15,7 @@ use super::{Infer, Res};
 pub type Ctor = (ItemRef, u32, Substs);
 
 /// The field types of each variant of an ADT at some type arguments, shared with the cache that holds them.
-pub type Fields = Rc<[Vec<Ty>]>;
+pub type Fields = std::sync::Arc<[Vec<Ty>]>;
 
 impl<'a> Infer<'_, 'a> {
     /// The field types of each variant of the struct, enum or union `item` at `args`, lowered once per ADT type when no body state can change them.
@@ -45,6 +43,9 @@ impl<'a> Infer<'_, 'a> {
 
     /// The field types of each variant of `item` at `args`, lowered from its definition.
     fn lower_fields(&mut self, item: ItemRef, args: &[Ty]) -> Result<Fields> {
+        if self.cx.foreign(item) {
+            return Ok(vec![Vec::new()].into());
+        }
         let def = self.cx.adt_def(item)?;
         let frame = self.adt_frame(item, &def.generics.params, args)?;
         Ok(self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty).map(|ty| infer.substitute(ty))).collect()).collect::<Result<Vec<Vec<Ty>>>>())?.into())
@@ -57,16 +58,21 @@ impl<'a> Infer<'_, 'a> {
         }
         let args: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
         let key = self.cx.types.adt(item, &args);
-        (Some(key), self.cx.store.lookups.fields.get(&key).cloned())
+        (Some(key), self.cx.store.lookups.fields.get(&key))
     }
 
     /// The type of the last field of the first variant of `item` at `args`, the only field that can make a struct unsized, read from the cached field types when they are there.
     pub fn adt_tail_field(&mut self, item: ItemRef, args: &[Ty]) -> Result<Option<Ty>> {
+        if self.cx.foreign(item) {
+            return Ok(None);
+        }
         if let (_, Some(found)) = self.cached_fields(item, args) {
             return Ok(found.first().and_then(|variant| variant.last()).copied());
         }
         let def = self.cx.adt_def(item)?;
-        let Some(last) = def.variants.first().and_then(|variant| variant.fields.last()) else { return Ok(None) };
+        let Some(last) = def.variants.first().and_then(|variant| variant.fields.last()) else {
+            return Ok(None);
+        };
         let frame = self.adt_frame(item, &def.generics.params, args)?;
         self.with_frame(frame, |infer| infer.lower_ty(&def.body, last.ty).map(|ty| infer.substitute(ty))).map(Some)
     }
@@ -78,27 +84,28 @@ impl<'a> Infer<'_, 'a> {
         self.is_unsized(tail)
     }
 
+    /// The unsized tail of `ty`, walking struct tail fields in this inference context, cached in the store when `ty` and its tail hold no variable or parameter and no quieted error arose.
     pub(in crate::sema) fn tail_ty(&mut self, ty: Ty) -> Result<Ty> {
         let ty = self.substitute(ty);
         let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { return Ok(ty) };
         let cacheable = !self.cx.types.has_params(ty) && !self.cx.types.has_var_flag(ty);
-        if cacheable
-            && let Some(&found) = self.cx.store.tails.get(&ty)
-        {
+        if cacheable && let Some(found) = self.cx.store.tails.get(&ty) {
             return Ok(found);
         }
+        let before = self.cx.quiet_mark();
         let slice = self.cx.types.substs(args).to_vec();
         let last = if self.cx.item(item).1.kind == ItemKind::Struct { self.adt_tail_field(item, &slice)? } else { None };
         let found = match last {
             Some(last) => self.tail_ty(last)?,
             None => ty,
         };
-        if cacheable && !self.cx.types.has_params(found) && !self.cx.types.has_var_flag(found) {
+        if cacheable && !self.cx.types.has_params(found) && !self.cx.types.has_var_flag(found) && self.cx.quiet_mark() == before {
             self.cx.store.tails.insert(ty, found);
         }
         Ok(found)
     }
 
+    /// Whether a pointer to `ty` carries metadata after its address, decided in this inference context.
     pub(in crate::sema) fn is_unsized(&mut self, ty: Ty) -> Result<bool> {
         let tail = self.tail_ty(ty)?;
         Ok(self.cx.types.kind(tail).is_unsized())
@@ -131,7 +138,9 @@ impl<'a> Infer<'_, 'a> {
             (Some((qself, Some(trait_path))), Some(&last)) => self.projection(arena, (qself, trait_path), last)?,
             _ => self.named_ty(arena, path, entry.segments.len as usize, true)?,
         };
-        let Kind::Adt(item, args) = self.cx.types.kind(self.resolve(ty)).clone() else { return Ok(None) };
+        let Kind::Adt(item, args) = self.cx.types.kind(self.resolve(ty)).clone() else {
+            return Ok(None);
+        };
         Ok(matches!(self.cx.item(item).1.kind, ItemKind::Struct | ItemKind::Union).then_some((item, 0, args)))
     }
 
@@ -164,21 +173,29 @@ impl<'a> Infer<'_, 'a> {
 
     /// The variant that `Alias::Variant` names, when the type alias names an enum.
     fn alias_variant(&mut self, arena: &Body, path: PathId, segments: &[Sym]) -> Result<Option<Ctor>> {
-        let Some((name, prefix)) = segments.split_last().filter(|(_, prefix)| !prefix.is_empty()) else { return Ok(None) };
+        let Some((name, prefix)) = segments.split_last().filter(|(_, prefix)| !prefix.is_empty()) else {
+            return Ok(None);
+        };
         let (_, absolute, dollar) = self.segments(arena, path);
-        let Some(Def::Item(alias)) = self.type_def(&NamePath { segments: prefix, absolute, dollar }) else { return Ok(None) };
+        let Some(Def::Item(alias)) = self.type_def(&NamePath { segments: prefix, absolute, dollar }) else {
+            return Ok(None);
+        };
         if self.cx.item(alias).1.kind != ItemKind::Type {
             return Ok(None);
         }
         let given = self.segment_args(arena, path, prefix.len())?;
         let named = self.alias(alias, given, true)?;
-        let Kind::Adt(item, args) = self.cx.types.kind(named).clone() else { return Ok(None) };
+        let Kind::Adt(item, args) = self.cx.types.kind(named).clone() else {
+            return Ok(None);
+        };
         let name = self.cx.names.symbols.text(*name).to_string();
         Ok(self.variant_named(item, &name)?.map(|variant| (item, variant, args)))
     }
 
     fn self_ctor(&mut self, rest: &[&str]) -> Result<Option<Ctor>> {
-        let Some(Kind::Adt(item, args)) = self.self_ty.map(|ty| self.cx.types.kind(ty).clone()) else { return Ok(None) };
+        let Some(Kind::Adt(item, args)) = self.self_ty.map(|ty| self.cx.types.kind(ty).clone()) else {
+            return Ok(None);
+        };
         match rest {
             [] => Ok(Some((item, 0, args))),
             [name] => Ok(self.variant_named(item, name)?.map(|variant| (item, variant, args))),
@@ -279,6 +296,7 @@ impl<'a> Infer<'_, 'a> {
         }
     }
 
+    /// Infers the field access `expr` on `base`, through references.
     pub fn field_expr(&mut self, expr: ExprId, base: ExprId, name: &str) -> Result<Ty> {
         let found = self.expr(base, None)?;
         let ty = self.field_base(expr, found, name)?;
@@ -331,11 +349,13 @@ pub fn maybe_unsized(cx: &mut super::super::Context<'_>, item: ItemRef) -> Resul
     let src = &cx.file(item).source;
     let byte = cx.types.intern(Kind::Prim(crate::names::Primitive::U8));
     let stand_ins = [cx.types.intern(Kind::Value(1)), cx.types.intern(Kind::Slice(byte)), byte];
-    let args: Vec<Ty> = super::scope::type_params(&def.generics.params).map(|generic| match generic.kind {
-        crate::body::sig::GenericKind::Const(_) => stand_ins[0],
-        _ if relaxed(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
-        _ => stand_ins[2],
-    }).collect();
+    let args: Vec<Ty> = super::scope::type_params(&def.generics.params)
+        .map(|generic| match generic.kind {
+            crate::body::sig::GenericKind::Const(_) => stand_ins[0],
+            _ if relaxed(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
+            _ => stand_ins[2],
+        })
+        .collect();
     let any_relaxed = args.contains(&stand_ins[1]);
     let ty = cx.types.adt(item, &args);
     match cx.is_unsized(ty) {
@@ -345,7 +365,7 @@ pub fn maybe_unsized(cx: &mut super::super::Context<'_>, item: ItemRef) -> Resul
     }
 }
 
-pub(super) fn relaxed(arena: &Body, src: &crate::outline::source::Source, predicates: &[crate::body::sig::Predicate], generic: &crate::body::sig::Generic) -> bool {
+fn relaxed(arena: &Body, src: &crate::outline::source::Source, predicates: &[crate::body::sig::Predicate], generic: &crate::body::sig::Generic) -> bool {
     let bounds = super::scope::generic_bounds(arena, src, predicates, generic);
     bounds.iter().any(|&bound| matches!(arena.bounds[bound as usize], crate::body::Bound::Trait { maybe: true, .. }))
 }

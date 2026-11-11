@@ -26,6 +26,7 @@ impl Lower<'_, '_> {
             (Simd::Cast, Some(out)) => self.lane_cast((vector, out), first)?,
             (Simd::Reduce { all }, _) => self.reduce(vector, first, all)?,
             (Simd::Extreme { max }, _) => self.extreme(vector, first, max)?,
+            (Simd::Sqrt, _) => self.lane_sqrt(vector, first)?,
             _ => self.simd_lanes(op, substs, args)?,
         };
         Ok(Some(value))
@@ -35,6 +36,8 @@ impl Lower<'_, '_> {
         let vector = substs[0];
         Ok(match (op, args) {
             (Simd::Lanewise(bin), &[x, y]) => self.lanewise(bin, (vector, substs.get(1).copied().unwrap_or(vector)), (x, y))?,
+            (Simd::Select, &[mask, yes, no]) => self.lane_select((vector, substs.get(1).copied().unwrap_or(vector)), mask, (yes, no))?,
+            (Simd::SelectBitmask, &[mask, yes, no]) => self.bitmask_select((vector, substs.get(1).copied().unwrap_or(vector)), mask, (yes, no))?,
             (Simd::Shuffle, &[x, y, idx]) => self.shuffle(substs, (x, y), idx)?,
             (Simd::Extract, &[x, at]) => {
                 let (lanes, lane) = self.lane_address(vector, x, at)?;
@@ -66,6 +69,17 @@ impl Lower<'_, '_> {
         let (slot, address) = self.vector_slot(vector)?;
         for lane in 0..lanes.count {
             self.ins().stack_store(value, slot, lane * lanes.size);
+        }
+        Ok(address)
+    }
+
+    fn lane_sqrt(&mut self, vector: Ty, x: Value) -> Result<Value> {
+        let lanes = self.lanes(vector)?;
+        let (slot, address) = self.vector_slot(vector)?;
+        for lane in 0..lanes.count {
+            let value = self.ins().load(lanes.machine, x, lane * lanes.size);
+            let root = self.ins().sqrt(value);
+            self.ins().stack_store(root, slot, lane * lanes.size);
         }
         Ok(address)
     }
@@ -229,5 +243,38 @@ impl Lower<'_, '_> {
             mask = self.ins().bor(mask, bit);
         }
         Ok(self.resize(mask, (Type::I64, false), target))
+    }
+
+    fn lane_select(&mut self, (mask_ty, out_ty): (Ty, Ty), mask: Value, (yes, no): (Value, Value)) -> Result<Value> {
+        let (from, to) = (self.lanes(mask_ty)?, self.lanes(out_ty)?);
+        let (slot, address) = self.vector_slot(out_ty)?;
+        for lane in 0..to.count {
+            let cond = self.ins().load(from.machine, mask, lane * from.size);
+            let set = self.ins().icmp_imm(IntCC::NotEqual, cond, 0);
+            let a = self.ins().load(to.machine, yes, lane * to.size);
+            let b = self.ins().load(to.machine, no, lane * to.size);
+            let chosen = self.ins().select(set, a, b);
+            self.ins().stack_store(chosen, slot, lane * to.size);
+        }
+        Ok(address)
+    }
+
+    fn bitmask_select(&mut self, (mask_ty, out_ty): (Ty, Ty), mask: Value, (yes, no): (Value, Value)) -> Result<Value> {
+        let Some(from) = machine(self.cx, mask_ty)? else { bail!("a SIMD bitmask select from an array is not supported yet") };
+        let to = self.lanes(out_ty)?;
+        let (slot, address) = self.vector_slot(out_ty)?;
+        let bits = self.resize(mask, (from, false), Type::I64);
+        for lane in 0..to.count {
+            let shift = self.ins().iconst(Type::I64, i64::from(lane));
+            let shifted = self.ins().ushr(bits, shift);
+            let one = self.ins().iconst(Type::I64, 1);
+            let bit = self.ins().band(shifted, one);
+            let set = self.ins().icmp_imm(IntCC::NotEqual, bit, 0);
+            let a = self.ins().load(to.machine, yes, lane * to.size);
+            let b = self.ins().load(to.machine, no, lane * to.size);
+            let chosen = self.ins().select(set, a, b);
+            self.ins().stack_store(chosen, slot, lane * to.size);
+        }
+        Ok(address)
     }
 }

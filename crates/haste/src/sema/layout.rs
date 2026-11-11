@@ -1,5 +1,4 @@
-use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow, bail};
 use rustc_abi::{AddressSpace, BackendRepr, Float, Integer, LayoutCalculator, LayoutData, Primitive as Abi, ReprOptions, Scalar, Size, StructKind, TargetDataLayout, WrappingRange};
@@ -94,12 +93,15 @@ fn primitive(dl: &TargetDataLayout, primitive: Primitive) -> Result<Layout> {
 
 impl Context<'_> {
     /// The layout of `ty`, which must hold no inference variables or parameters.
-    pub fn layout(&mut self, ty: Ty) -> Result<Rc<Layout>> {
+    pub fn layout(&mut self, ty: Ty) -> Result<Arc<Layout>> {
         if let Some(found) = self.store.layouts.get(&ty) {
-            return Ok(found.clone());
+            return Ok(found);
         }
-        let computed = Rc::new(self.compute(ty)?);
-        self.store.layouts.insert(ty, computed.clone());
+        let before = self.quiet_mark();
+        let computed = Arc::new(self.compute(ty)?);
+        if self.quiet_mark() == before {
+            self.store.layouts.insert(ty, Arc::clone(&computed));
+        }
         Ok(computed)
     }
 
@@ -152,7 +154,7 @@ impl Context<'_> {
             bail!("cannot compute tail of open inference variable outside Infer");
         }
         if !self.types.has_params(ty)
-            && let Some(&found) = self.store.tails.get(&ty)
+            && let Some(found) = self.store.tails.get(&ty)
         {
             return Ok(found);
         }

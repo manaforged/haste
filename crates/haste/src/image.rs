@@ -8,11 +8,11 @@ mod stub;
 mod workers;
 
 pub use expand::{Job, run_macros};
-pub use lazy::{Jit, Driver, Ended, Program, entries, evaluator, run_on_demand, serve};
+pub use lazy::{Driver, Ended, Jit, Program, entries, evaluator, run_on_demand, serve};
 pub use script::Script;
 
-use std::cell::RefCell;
 use std::os::fd::FromRawFd;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap as HashMap;
@@ -22,36 +22,66 @@ use haste_codegen::{Arena, Memory};
 
 use crate::lower::{self, Slots, Word};
 use crate::sema::Context;
-use crate::sema::reach::Reached;
+use crate::sema::reach::{Instance, Reached};
+use crate::sync::lock;
 
 const SHARED_BYTES: usize = 4 << 30;
 const STATE_BYTES: usize = 1 << 30;
 const CODE_BYTES: usize = 1 << 30;
 const TABLE_SLOTS: usize = 1 << 22;
 
-/// The call table, code memory and data of the running program, in memory that compile workers forked from this process share, and the cells the program writes, in memory each run holds its own copy of.
+/// The call table, code memory and data of the running program, in memory shared with children forked from this process, and the cells the program writes, in memory each run holds its own copy of.
 pub struct Image {
     table: usize,
     _low: Arena,
     capacity: usize,
-    memory: Memory,
+    pass: Pass,
     stubs: Memory,
-    shared: RefCell<Arena>,
-    state: RefCell<Arena>,
-    tables: RefCell<HashMap<Vec<Word>, i64>>,
-    fixups: RefCell<Vec<(usize, usize)>>,
-    cells: RefCell<HashMap<usize, i64>>,
-    rodata_map: RefCell<HashMap<(Vec<u8>, Vec<lower::RodataReloc>), lower::RodataId>>,
-    rodata_addrs: RefCell<Vec<u64>>,
-    vtable_map: RefCell<HashMap<Vec<lower::VtableEntry>, lower::VtableId>>,
-    vtable_addrs: RefCell<Vec<u64>>,
-    promoted_cells: RefCell<HashMap<(usize, u32), u64>>,
-    wanted: RefCell<Vec<crate::sema::reach::Instance>>,
+    shared: Mutex<Arena>,
+    state: Mutex<Arena>,
+    tables: Mutex<HashMap<Vec<Word>, i64>>,
+    fixups: Mutex<Vec<(usize, usize)>>,
+    cells: Mutex<HashMap<usize, i64>>,
+    rodata_map: Mutex<HashMap<(Vec<u8>, Vec<lower::RodataReloc>), lower::RodataId>>,
+    rodata_addrs: Mutex<Vec<u64>>,
+    vtable_map: Mutex<HashMap<Vec<lower::VtableEntry>, lower::VtableId>>,
+    vtable_addrs: Mutex<Vec<u64>>,
+    promoted_cells: Mutex<HashMap<(usize, u32), u64>>,
+    wanted: Mutex<Vec<Instance>>,
     bodies: lower::Bodies,
-    stencils: stencil::StencilState,
     jit_mode: bool,
+}
+
+/// What one compile pass writes: its code memory, its stencil cache, and the code size and compile time of each reached function.
+#[derive(Default)]
+pub(super) struct Pass {
+    memory: Memory,
+    stencils: stencil::StencilState,
     sizes: Vec<u32>,
     times: Vec<u64>,
+}
+
+impl Pass {
+    fn new(len: usize) -> Pass {
+        Pass { sizes: vec![0; len], times: vec![0; len], ..Pass::default() }
+    }
+
+    /// Adds `size` code bytes and `ns` nanoseconds of compile time to reached function `index`.
+    pub(super) fn record_size(&mut self, index: usize, size: u32, ns: u64) {
+        if index >= self.sizes.len() {
+            self.sizes.resize(index + 1, 0);
+            self.times.resize(index + 1, 0);
+        }
+        self.sizes[index] = self.sizes[index].saturating_add(size);
+        self.times[index] = self.times[index].saturating_add(ns);
+    }
+
+    /// Moves the code chunks, sizes and times of a worker's pass into this one; the worker's stencil cache is dropped.
+    fn merge(&mut self, other: Pass) {
+        self.memory.merge(other.memory);
+        let recorded = other.sizes.iter().zip(&other.times).enumerate().filter(|(_, (size, ns))| **size > 0 || **ns > 0);
+        recorded.for_each(|(index, (&size, &ns))| self.record_size(index, size, ns));
+    }
 }
 
 impl Slots for Image {
@@ -60,36 +90,37 @@ impl Slots for Image {
     }
 
     fn data(&self, bytes: &[u8]) -> i64 {
-        let address = self.shared.borrow_mut().alloc(bytes.len()).unwrap_or_else(|error| panic!("{error}"));
+        let address = lock(&self.shared).alloc(bytes.len()).unwrap_or_else(|error| panic!("{error}"));
         // SAFETY: alloc handed out `bytes.len()` writable bytes at address that nothing else uses, and they do not overlap `bytes`.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
         address as i64
     }
 
     fn table(&self, words: &[Word]) -> i64 {
-        if let Some(&address) = self.tables.borrow().get(words) {
+        let mut tables = lock(&self.tables);
+        if let Some(&address) = tables.get(words) {
             return address;
         }
         let bytes: Vec<u8> = words.iter().flat_map(|word| (if let Word::Int(value) = *word { value } else { 0 }).to_le_bytes()).collect();
         let address = self.data(&bytes);
         let codes = words.iter().enumerate().filter_map(|(at, word)| if let Word::Code(index) = *word { Some((address as usize + at * 8, index)) } else { None });
-        self.fixups.borrow_mut().extend(codes);
-        self.tables.borrow_mut().insert(words.to_vec(), address);
+        lock(&self.fixups).extend(codes);
+        tables.insert(words.to_vec(), address);
         address
     }
 
     fn zeroed(&self, len: usize) -> i64 {
-        self.state.borrow_mut().alloc(len).unwrap_or_else(|error| panic!("{error}")) as i64
+        lock(&self.state).alloc(len).unwrap_or_else(|error| panic!("{error}")) as i64
     }
 
-    fn want(&self, instance: crate::sema::reach::Instance) {
+    fn want(&self, instance: Instance) {
         if self.jit_mode {
-            self.wanted.borrow_mut().push(instance);
+            lock(&self.wanted).push(instance);
         }
     }
 
     fn wanted_len(&self) -> usize {
-        self.wanted.borrow().len()
+        lock(&self.wanted).len()
     }
 
     fn bodies(&self) -> &lower::Bodies {
@@ -97,11 +128,12 @@ impl Slots for Image {
     }
 
     fn cell(&self, index: usize, size: u32) -> i64 {
-        if let Some(&address) = self.cells.borrow().get(&index) {
+        let mut cells = lock(&self.cells);
+        if let Some(&address) = cells.get(&index) {
             return address;
         }
         let address = self.zeroed(size as usize + 1);
-        self.cells.borrow_mut().insert(index, address);
+        cells.insert(index, address);
         address
     }
 
@@ -141,51 +173,49 @@ impl Image {
         let capacity = reached.list.len().max(TABLE_SLOTS);
         let mut low = Arena::low(capacity * size_of::<AtomicUsize>())?;
         let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
-        let memory = Memory::default();
         let state = Arena::private(STATE_BYTES)?;
-        let len = reached.list.len();
         Ok(Image {
             table,
             _low: low,
             capacity,
-            memory,
+            pass: Pass::new(reached.list.len()),
             stubs: Memory::default(),
-            shared: RefCell::new(shared),
-            state: RefCell::new(state),
-            tables: RefCell::default(),
-            fixups: RefCell::default(),
-            cells: RefCell::default(),
-            rodata_map: RefCell::default(),
-            rodata_addrs: RefCell::default(),
-            vtable_map: RefCell::default(),
-            vtable_addrs: RefCell::default(),
-            promoted_cells: RefCell::default(),
-            wanted: RefCell::default(),
+            shared: Mutex::new(shared),
+            state: Mutex::new(state),
+            tables: Mutex::default(),
+            fixups: Mutex::default(),
+            cells: Mutex::default(),
+            rodata_map: Mutex::default(),
+            rodata_addrs: Mutex::default(),
+            vtable_map: Mutex::default(),
+            vtable_addrs: Mutex::default(),
+            promoted_cells: Mutex::default(),
+            wanted: Mutex::default(),
             bodies: lower::Bodies::default(),
-            stencils: stencil::StencilState::default(),
             jit_mode: false,
-            sizes: vec![0; len],
-            times: vec![0; len],
         })
     }
 
     /// The encoded machine-code byte length of each reached function, or zero when not compiled.
     pub fn code_sizes(&self) -> &[u32] {
-        &self.sizes
+        &self.pass.sizes
     }
 
     /// The lowering and encoding wall time in nanoseconds of each reached function, or zero when not compiled.
     pub fn compile_times(&self) -> &[u64] {
-        &self.times
+        &self.pass.times
     }
 
-    pub(super) fn record_size(&mut self, index: usize, size: u32, ns: u64) {
-        if index >= self.sizes.len() {
-            self.sizes.resize(index + 1, 0);
-            self.times.resize(index + 1, 0);
-        }
-        self.sizes[index] = self.sizes[index].saturating_add(size);
-        self.times[index] = self.times[index].saturating_add(ns);
+    pub(super) fn take_wanted(&self) -> Vec<Instance> {
+        std::mem::take(&mut *lock(&self.wanted))
+    }
+
+    /// Runs `run` with this image's pass taken out, so that `run` lowers through the shared image while it writes into the pass.
+    pub(super) fn with_pass<R>(&mut self, run: impl FnOnce(&Image, &mut Pass) -> R) -> R {
+        let mut pass = std::mem::take(&mut self.pass);
+        let result = run(self, &mut pass);
+        self.pass = pass;
+        result
     }
 
     fn slot(&self, index: usize) -> &AtomicUsize {
@@ -204,9 +234,9 @@ impl Image {
 
     /// Lowers and encodes the reached functions `indices` that type-checked, on every core when there are many, links them, and returns the errors of those that did not compile, by index.
     pub fn compile(&mut self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize]) -> Vec<(usize, String)> {
-        if self.sizes.len() < reached.list.len() {
-            self.sizes.resize(reached.list.len(), 0);
-            self.times.resize(reached.list.len(), 0);
+        if self.pass.sizes.len() < reached.list.len() {
+            self.pass.sizes.resize(reached.list.len(), 0);
+            self.pass.times.resize(reached.list.len(), 0);
         }
         if !indices.is_empty() && indices.len() < reached.list.len() {
             self.reset_caches();
@@ -246,12 +276,12 @@ impl Image {
                 (Ok(address), false) => address as i64,
                 (Err(_), false) => continue,
             };
-            self.cells.borrow_mut().insert(index, cell);
+            lock(&self.cells).insert(index, cell);
         }
     }
 
     fn link(&mut self) {
-        for &(address, index) in self.fixups.borrow().iter() {
+        for &(address, index) in lock(&self.fixups).iter() {
             let code = self.slot(index).load(Ordering::Acquire) as u64;
             // SAFETY: address is a word of a constant table that data handed out, which stays mapped for the life of the process.
             unsafe { (address as *mut u64).write_unaligned(code) };
@@ -259,7 +289,7 @@ impl Image {
     }
 
     fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
-        self.compile_jit_one(cx, reached, index)
+        self.with_pass(|image, pass| image.compile_jit_one(cx, reached, index, pass))
     }
 
     /// Runs each case `(index, name)`, a reached `fn(i64) -> i64`, on each input and prints `name input value` lines, all in one forked child; a case that crashes gets its status and the cases after it run in a new child.
@@ -307,7 +337,9 @@ impl Image {
     /// Runs the program the way the native entry point does: std's `lang_start` with `main`, `args` as argv and the default SIGPIPE handling; returns its exit status.
     fn enter_main(&self, (start, main): (usize, usize), args: &[String]) -> i32 {
         let (start, main) = (self.slot(start).load(Ordering::Acquire), self.slot(main).load(Ordering::Acquire));
-        let Ok(owned) = args.iter().map(|arg| std::ffi::CString::new(arg.as_str())).collect::<Result<Vec<_>, _>>() else { return 101 };
+        let Ok(owned) = args.iter().map(|arg| std::ffi::CString::new(arg.as_str())).collect::<Result<Vec<_>, _>>() else {
+            return 101;
+        };
         let mut argv: Vec<*const u8> = owned.iter().map(|arg| arg.as_ptr().cast()).collect();
         argv.push(std::ptr::null());
         // SAFETY: start is code that the encoder wrote, or a stub that compiles it, for `lang_start::<T>(fn() -> T, isize, *const *const u8, u8) -> isize`, and main for the `fn() -> T` it takes.

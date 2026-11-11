@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use haste_codegen::{ArgumentPurpose, Signature};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -85,18 +85,19 @@ fn avalanche(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+const PROBE_DATA: i64 = 0x3000_0000;
+
 #[derive(Default)]
 struct ProbeSlots {
-    next: Cell<i64>,
+    next: AtomicI64,
     bodies: lower::Bodies,
 }
 
 impl ProbeSlots {
     fn alloc(&self, len: usize) -> i64 {
-        let cur = self.next.get().max(0x3000_0000);
         let step = ((len.max(1) as i64) + 15) & !15;
-        self.next.set(cur + step);
-        cur
+        let prev = self.next.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(cur.max(PROBE_DATA) + step)).unwrap_or_else(|cur| cur);
+        prev.max(PROBE_DATA)
     }
 }
 
@@ -152,7 +153,9 @@ impl TraitFacts {
             let impl_len = cx.outline.crates[krate].impls.len();
             for index in 0..impl_len {
                 let block = ImplRef::Module { krate: krate as u32, index: index as u32 };
-                if cx.specializable(block) && let Some(of) = cx.impl_trait(block) {
+                if cx.specializable(block)
+                    && let Some(of) = cx.impl_trait(block)
+                {
                     spec_trait_set.insert(of);
                 }
             }

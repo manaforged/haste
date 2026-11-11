@@ -8,24 +8,6 @@ use super::super::ty::{Kind, Mut, Ty};
 use super::select::Picked;
 use super::{Infer, Local, Res, Shape, Typed, detached};
 
-/// Whether dropping a value of `ty` runs code.
-pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
-    detached(cx, anchor, |infer| infer.needs_drop(ty))
-}
-
-/// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
-pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
-    detached(cx, anchor, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
-}
-
-/// The `Drop::drop` of `ty`'s own `Drop` impl, which for a `Box` frees the allocation without dropping what it owns.
-pub fn drop_fn(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
-    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
-    detached(cx, anchor, |infer| infer.own_drop(ty))
-}
-
 impl Infer<'_, '_> {
     /// Whether dropping a value of `ty` runs code: a `Drop` impl of its own or of a part.
     pub fn needs_drop(&mut self, ty: Ty) -> Result<bool> {
@@ -34,12 +16,20 @@ impl Infer<'_, '_> {
             return self.parts_need_drop(ty);
         }
         let ty = self.substitute(ty);
-        if let Some(&known) = self.cx.store.lookups.drops.get(&ty) {
+        if let Some(known) = self.cx.store.lookups.drops.get(&ty) {
             return Ok(known);
         }
-        self.cx.store.lookups.drops.insert(ty, false);
-        let needs = self.parts_need_drop(ty)?;
-        self.cx.store.lookups.drops.insert(ty, needs);
+        if self.cx.drop_stack.contains(&ty) {
+            return Ok(false);
+        }
+        let before = self.cx.quiet_mark();
+        self.cx.drop_stack.push(ty);
+        let result = self.parts_need_drop(ty);
+        self.cx.drop_stack.pop();
+        let needs = result?;
+        if self.cx.quiet_mark() == before && !self.has_vars(ty) {
+            self.cx.store.lookups.drops.insert(ty, needs);
+        }
         Ok(needs)
     }
 
@@ -140,6 +130,7 @@ pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
 }
 
 impl Infer<'_, '_> {
+    /// The `Drop::drop` of `ty`'s own `Drop` impl, without the drops of its parts.
     pub(in crate::sema) fn own_drop(&mut self, ty: Ty) -> Result<Option<Res>> {
         let Some((block, args)) = self.drop_impl(ty)? else { return Ok(None) };
         let args: Vec<Ty> = args.into_iter().map(|arg| self.zonk(arg)).collect();
@@ -191,4 +182,24 @@ impl Infer<'_, '_> {
         };
         Ok(self.cx.types.substs(captures).to_vec())
     }
+}
+
+fn with_drop<T>(cx: &mut Context<'_>, run: impl FnOnce(&mut Infer<'_, '_>) -> Result<T>) -> Result<T> {
+    let Some(anchor) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
+    detached(cx, anchor, run)
+}
+
+/// Whether dropping a value of `ty` runs code.
+pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    with_drop(cx, |infer| infer.needs_drop(ty))
+}
+
+/// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
+pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
+}
+
+/// The `Drop::drop` of `ty`'s own `Drop` impl, which for a `Box` frees the allocation without dropping what it owns.
+pub fn drop_fn(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
+    with_drop(cx, |infer| infer.own_drop(ty))
 }

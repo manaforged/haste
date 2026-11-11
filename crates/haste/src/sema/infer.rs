@@ -1,14 +1,16 @@
 mod adt;
-mod assoc;
-mod clone;
-mod consts;
 mod array;
+mod assoc;
+mod call;
+mod clone;
 mod closure;
 mod coerce;
+mod consts;
 mod deref;
+mod drop;
 mod expr;
-mod matching;
 mod looping;
+mod matching;
 mod method;
 mod object;
 mod opaque;
@@ -18,38 +20,37 @@ mod pattern;
 pub(super) mod poly;
 mod project;
 mod scope;
-mod drop;
 mod select;
 mod stmt;
+mod tables;
 mod zonk;
 
 pub use adt::{Fields, field_types, maybe_unsized};
 pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, register};
+pub use coerce::Coercion;
+pub use consts::{Anon, Arena};
 pub use drop::{Glue, drop_fn, has_drop_impl, needs_drop};
 pub use looping::{For, Tried};
 pub use method::Adjust;
-pub use coerce::Coercion;
-pub use consts::{Anon, Arena};
 pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
 pub use scope::{Form, type_params};
 pub use select::header_bound_traits;
-
-use std::sync::{Arc, OnceLock};
+pub use tables::{BodyTables, SyntaxTables, Typed};
 
 use rustc_hash::FxHashMap as HashMap;
 
 use anyhow::{Result, bail};
 
 use crate::body::sig::Signature;
-use crate::body::{Body, BlockKind, Expr, ExprId, PatId};
+use crate::body::{BlockKind, Body, Expr, ExprId, PatId};
 use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::source::Source;
 
 use super::Context;
-use super::substs::{PackedMap, PackedSet, Substs};
+use super::substs::Substs;
 use super::ty::{Kind, Mut, Ty, Types, int_info};
 
 /// What a path expression names.
@@ -88,168 +89,6 @@ pub enum Shape {
     Anon(Anon),
 }
 
-/// The instantiation-invariant syntax tables of an inferred body.
-#[derive(Clone, Debug, Default)]
-pub struct SyntaxTables {
-    pub binds: PackedMap<PatId, u32>,
-    pub adjusts: PackedMap<ExprId, Adjust>,
-    pub fields: PackedMap<ExprId, u32>,
-    pub inits: PackedMap<ExprId, u32>,
-    pub ranges: PackedMap<ExprId, Box<[u32]>>,
-    pub field_pats: PackedMap<PatId, u32>,
-    pub pat_derefs: PackedMap<PatId, u32>,
-    pub ref_binds: PackedMap<PatId, Mut>,
-    pub or_binds: PackedSet<PatId>,
-    pub const_args: PackedSet<ExprId>,
-    pub unpacks: PackedMap<u32, PatId>,
-}
-
-impl SyntaxTables {
-    /// A shared empty syntax table set for synthetic bodies.
-    pub fn empty() -> Arc<Self> {
-        static EMPTY: OnceLock<Arc<SyntaxTables>> = OnceLock::new();
-        Arc::clone(EMPTY.get_or_init(|| Arc::new(Self::default())))
-    }
-}
-
-/// The arena-packed expression, pattern, operator, coercion and closure tables of an inferred body.
-#[derive(Clone, Debug)]
-pub struct BodyTables {
-    pub syntax: Arc<SyntaxTables>,
-    pub exprs: Box<[Ty]>,
-    pub res: PackedMap<ExprId, Res>,
-    pub autoderefs: PackedMap<ExprId, u32>,
-    pub derefs: PackedMap<(ExprId, u32), Res>,
-    pub operators: PackedMap<ExprId, Res>,
-    pub coercions: PackedMap<ExprId, Coercion>,
-    pub offsets: PackedMap<ExprId, u64>,
-    pub pat_res: PackedMap<PatId, Res>,
-    pub overloaded: PackedSet<ExprId>,
-    pub pats: PackedMap<PatId, Ty>,
-    pub fors: PackedMap<ExprId, For>,
-    pub tries: PackedMap<ExprId, Tried>,
-    pub awaits: PackedMap<ExprId, Awaited>,
-    pub closures: PackedMap<ExprId, Closure>,
-    pub try_blocks: PackedMap<ExprId, Res>,
-    pub box_frees: PackedMap<ExprId, Res>,
-}
-
-impl Default for BodyTables {
-    fn default() -> Self {
-        Self {
-            syntax: SyntaxTables::empty(),
-            exprs: Box::default(),
-            res: PackedMap::default(),
-            autoderefs: PackedMap::default(),
-            derefs: PackedMap::default(),
-            operators: PackedMap::default(),
-            coercions: PackedMap::default(),
-            offsets: PackedMap::default(),
-            pat_res: PackedMap::default(),
-            overloaded: PackedSet::default(),
-            pats: PackedMap::default(),
-            fors: PackedMap::default(),
-            tries: PackedMap::default(),
-            awaits: PackedMap::default(),
-            closures: PackedMap::default(),
-            try_blocks: PackedMap::default(),
-            box_frees: PackedMap::default(),
-        }
-    }
-}
-
-impl BodyTables {
-    /// A shared empty body table set for compiler-generated bodies.
-    pub fn empty() -> Arc<Self> {
-        static EMPTY: OnceLock<Arc<BodyTables>> = OnceLock::new();
-        Arc::clone(EMPTY.get_or_init(|| Arc::new(Self::default())))
-    }
-}
-
-impl std::ops::Deref for BodyTables {
-    type Target = SyntaxTables;
-
-    fn deref(&self) -> &Self::Target {
-        &self.syntax
-    }
-}
-
-impl std::ops::DerefMut for BodyTables {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        Arc::make_mut(&mut self.syntax)
-    }
-}
-
-/// The inferred types and resolutions of one function body at one set of type arguments.
-#[derive(Clone, Debug)]
-pub struct Typed {
-    pub tables: Arc<BodyTables>,
-    pub locals: Vec<Local>,
-    pub params: Vec<u32>,
-    pub ret: Option<Ty>,
-    pub drops: Vec<Res>,
-    pub shape: Shape,
-}
-
-impl Default for Typed {
-    fn default() -> Self {
-        Self { tables: BodyTables::empty(), locals: Vec::new(), params: Vec::new(), ret: None, drops: Vec::new(), shape: Shape::default() }
-    }
-}
-
-impl std::ops::Deref for Typed {
-    type Target = BodyTables;
-
-    fn deref(&self) -> &Self::Target {
-        &self.tables
-    }
-}
-
-impl std::ops::DerefMut for Typed {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        Arc::make_mut(&mut self.tables)
-    }
-}
-
-fn coercion_calls(coercion: &Coercion) -> Box<dyn Iterator<Item = &Res> + '_> {
-    match coercion {
-        Coercion::Vtable(vtable) => Box::new(vtable.calls().into_iter()),
-        Coercion::Reify(res) => Box::new(std::iter::once(res)),
-        Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => Box::new(std::iter::empty()),
-        Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
-    }
-}
-
-fn shape_calls(shape: &Shape) -> Box<dyn Iterator<Item = &Res> + '_> {
-    match shape {
-        Shape::Glue(glue) => Box::new(glue.drop.iter().chain(&glue.parts).chain(&glue.resume)),
-        Shape::Untuple(res) => Box::new(std::iter::once(res)),
-        Shape::Clone(calls) => Box::new(calls.iter()),
-        _ => Box::new(std::iter::empty()),
-    }
-}
-
-impl Typed {
-    /// The return type, or `Ty::NONE` for a body that has none.
-    pub fn ret_ty(&self) -> Ty {
-        self.ret.unwrap_or(Ty::NONE)
-    }
-
-    /// Every function the body calls, with its interned type arguments.
-    pub fn calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
-        let loops = self.fors.values().flat_map(|each| [&each.into_iter, &each.next]);
-        let tries = self.tries.values().flat_map(|each| [&each.branch, &each.from_residual]);
-        let awaits = self.awaits.values().flat_map(|each| [&each.into_future, &each.poll]);
-        let coerced = self.coercions.values().flat_map(coercion_calls);
-        let shaped = shape_calls(&self.shape);
-        let direct = self.res.values().chain(self.pat_res.values()).chain(self.derefs.values()).chain(self.operators.values()).chain(self.try_blocks.values()).chain(self.box_frees.values());
-        direct.chain(loops).chain(tries).chain(awaits).chain(&self.drops).chain(shaped).chain(coerced).filter_map(|res| match res {
-            Res::Fn(item, substs) => Some((*item, *substs)),
-            _ => None,
-        })
-    }
-}
-
 pub(super) type Name<'a> = (&'a str, u32);
 
 /// The inference of one body.
@@ -283,7 +122,7 @@ pub struct Infer<'c, 'a> {
     diverges: bool,
     hidden: Vec<(u32, Ty)>,
     const_args: Vec<(String, (u128, (u32, bool)))>,
-    selecting: Vec<String>,
+    selecting: Vec<u64>,
     frames: usize,
     evaluating: Vec<ItemRef>,
     imports: HashMap<(ItemRef, Option<crate::names::Sym>), Vec<crate::names::PerNs>>,
@@ -319,7 +158,7 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Type
     let sig = cx.signature(item)?;
     let slot = object::virtual_slot(cx, item, substs)?;
     let foreign = cx.foreign(item) || slot.is_some();
-    let body = if foreign { std::rc::Rc::default() } else { cx.body(item)? };
+    let body = if foreign { std::sync::Arc::default() } else { cx.body(item)? };
     let src = cx.body_src(item);
     let home = cx.module_of(item)?;
     let root = Some(item.body_owner());
@@ -340,7 +179,7 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Type
 
 pub(super) fn settle(cx: &mut Context<'_>, instance: (ItemRef, Substs), mut typed: Typed) -> Result<Typed> {
     closure::register(cx, instance, &typed);
-    if object::fill_drops(cx, &mut typed)? {
+    if !typed.coercions.is_empty() && object::fill_drops(cx, &mut typed)? {
         closure::register(cx, instance, &typed);
     }
     typed.drops = drop::drop_calls(cx, &typed)?;
@@ -384,7 +223,42 @@ impl<'c, 'a> Infer<'c, 'a> {
     pub(super) fn start(cx: &'c mut Context<'a>, (body, sig, src): (&'c Body, &'c Signature, &'a Source), home: ModRef) -> Self {
         let (generics, vars, metadata, obligations, projections, opaques, operands, try_blocks, scopes, items, loops, uses) = Default::default();
         let out = zonk::take_out();
-        Infer { cx, body, sig, src, root: None, instance: None, home, generics, self_ty: None, block: None, frame_item: None, vars, metadata, obligations, projections, opaques, operands, try_blocks, awaits: Vec::new(), ret_sig: None, out, scopes, items, loops, uses, unsure: Vec::new(), diverges: false, hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), frames: 0, evaluating: Vec::new(), imports: HashMap::default(), poly: None }
+        Infer {
+            cx,
+            body,
+            sig,
+            src,
+            root: None,
+            instance: None,
+            home,
+            generics,
+            self_ty: None,
+            block: None,
+            frame_item: None,
+            vars,
+            metadata,
+            obligations,
+            projections,
+            opaques,
+            operands,
+            try_blocks,
+            awaits: Vec::new(),
+            ret_sig: None,
+            out,
+            scopes,
+            items,
+            loops,
+            uses,
+            unsure: Vec::new(),
+            diverges: false,
+            hidden: Vec::new(),
+            const_args: Vec::new(),
+            selecting: Vec::new(),
+            frames: 0,
+            evaluating: Vec::new(),
+            imports: HashMap::default(),
+            poly: None,
+        }
     }
 }
 
@@ -491,6 +365,9 @@ impl Infer<'_, '_> {
 
     fn bind(&mut self, var: Ty, to: Ty) -> Result<(), Clash> {
         let index = self.var_of(var).unwrap_or(u32::MAX) as usize;
+        if index >= self.vars.len() {
+            return Err(Clash { a: var, b: to, cycle: false });
+        }
         let accepts = match (self.cx.types.kind(var), self.cx.types.kind(to)) {
             (Kind::Var(_), _) => true,
             (Kind::IntVar(_), Kind::IntVar(_)) | (Kind::FloatVar(_), Kind::FloatVar(_)) => true,
@@ -622,6 +499,12 @@ impl Infer<'_, '_> {
 
     /// Coerces the value of `expr`, of type `found`, to `expected`, at each branch value it ends in, recording an array-to-slice unsizing.
     pub fn coerce_expr(&mut self, expr: ExprId, found: Ty, expected: Ty) -> Result<()> {
+        if self.known(Some(expected)).is_none() {
+            return self.coerce(found, expected);
+        }
+        if self.resolve(found) == self.resolve(expected) {
+            return self.settle_pending();
+        }
         if let Some(ends) = self.branch_ends(expr) {
             for end in ends {
                 let found = self.out.exprs[end.0 as usize];
@@ -693,7 +576,9 @@ impl Infer<'_, '_> {
                 matched.push(types);
             }
         }
-        let [types] = &matched[..] else { return Ok(false) };
+        let [types] = &matched[..] else {
+            return Ok(false);
+        };
         substs.iter().zip(types).try_for_each(|(&a, &b)| self.unify(a, b))?;
         Ok(true)
     }
@@ -713,8 +598,8 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    fn unsettled(&self) -> ([usize; 5], usize, usize) {
-        (self.cx.asks.mark(), self.projections.len(), self.obligations.len())
+    fn unsettled(&self) -> ((usize, usize), usize, usize) {
+        (self.cx.quiet_mark(), self.projections.len(), self.obligations.len())
     }
 
     fn bodiless(&self) -> bool {

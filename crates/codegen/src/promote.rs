@@ -114,8 +114,12 @@ impl Scan {
         loop {
             let before = adds.len();
             adds.retain(|&(inst, result, x, c)| {
-                let (Some((slot, base)), Some(imm)) = (self.addrs[x.index()], consts[c.index()]) else { return true };
-                let Some(offset) = base.checked_add(imm) else { return true };
+                let (Some((slot, base)), Some(imm)) = (self.addrs[x.index()], consts[c.index()]) else {
+                    return true;
+                };
+                let Some(offset) = base.checked_add(imm) else {
+                    return true;
+                };
                 self.addrs[result.index()] = Some((slot, offset));
                 self.addr_insts.push((inst, slot));
                 false
@@ -149,12 +153,8 @@ impl Scan {
 
     fn touch(&self, data: &InstData) -> Option<Touch> {
         match &data.op {
-            Op::StackLoad(slot, offset) => {
-                Some(Touch { addr: None, slot: *slot, offset: Some(i64::from(*offset)), kind: Kind::Load(data.result?) })
-            }
-            Op::StackStore(value, slot, offset) => {
-                Some(Touch { addr: None, slot: *slot, offset: Some(i64::from(*offset)), kind: Kind::Store(*value) })
-            }
+            Op::StackLoad(slot, offset) => Some(Touch { addr: None, slot: *slot, offset: Some(i64::from(*offset)), kind: Kind::Load(data.result?) }),
+            Op::StackStore(value, slot, offset) => Some(Touch { addr: None, slot: *slot, offset: Some(i64::from(*offset)), kind: Kind::Store(*value) }),
             Op::Load(addr, offset) => self.through(*addr, *offset, Kind::Load(data.result?)),
             Op::Store(value, addr, offset) => self.through(*addr, *offset, Kind::Store(*value)),
             _ => None,
@@ -256,8 +256,7 @@ struct Cfg {
 impl Cfg {
     fn new(func: &Function, entry: Block) -> Self {
         let count = func.blocks.len();
-        let mut cfg =
-            Cfg { entry, preds: vec![Vec::new(); count], reachable: vec![false; count], try_target: vec![false; count] };
+        let mut cfg = Cfg { entry, preds: vec![Vec::new(); count], reachable: vec![false; count], try_target: vec![false; count] };
         for index in 0..count {
             let block = Block(index as u32);
             let Some(op) = func.last(block) else { continue };
@@ -283,16 +282,18 @@ struct Fresh {
 }
 
 impl Fresh {
-    fn value(&mut self, ty: Type) -> Value {
+    fn value(&mut self, subst: &mut Vec<Value>, ty: Type) -> Value {
         self.types.push(ty);
-        Value((self.base + self.types.len() - 1) as u32)
+        let value = Value((self.base + self.types.len() - 1) as u32);
+        subst.push(value);
+        value
     }
 
-    fn zero(&mut self, ty: Type) -> Value {
+    fn zero(&mut self, subst: &mut Vec<Value>, ty: Type) -> Value {
         if let Some((_, value)) = self.zeros.iter().find(|(zero, _)| *zero == ty) {
             return *value;
         }
-        let value = self.value(ty);
+        let value = self.value(subst, ty);
         self.zeros.push((ty, value));
         value
     }
@@ -304,32 +305,23 @@ impl Fresh {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SlotVar {
+    local: usize,
+    index: usize,
+}
+
 struct Phi {
     value: Value,
     block: Block,
-    var: usize,
+    var: SlotVar,
     args: Vec<Value>,
-    live: bool,
 }
 
 #[derive(Default)]
 struct Build {
-    memo: HashMap<(usize, Block), Value>,
     phis: Vec<Phi>,
-    staged: HashMap<Value, Value>,
     converts: Vec<(Inst, Convert, Value)>,
-    path: Vec<Block>,
-}
-
-impl Build {
-    fn bind(&mut self, home: Type, load: Load, value: Value) {
-        match convert(home, load.ty) {
-            Some(op) => self.converts.push((load.inst, op, value)),
-            None => {
-                self.staged.insert(load.result, value);
-            }
-        }
-    }
 }
 
 enum Step {
@@ -342,63 +334,108 @@ struct Pass {
     scan: Scan,
     local: Local,
     fresh: Fresh,
-    subst: HashMap<Value, Value>,
+    subst: Vec<Value>,
+    undo: Vec<(u32, Value)>,
+    memo: Vec<(u32, Value)>,
+    stamp: u32,
+    path: Vec<Block>,
     promoted: Vec<bool>,
     kept: Vec<bool>,
 }
 
 impl Pass {
-    fn resolve(&self, build: &Build, mut value: Value) -> Value {
-        while let Some(next) = build.staged.get(&value).or_else(|| self.subst.get(&value)) {
-            value = *next;
+    fn resolve(&mut self, value: Value) -> Value {
+        let root = crate::merge::find(&self.subst, value);
+        let mut at = value;
+        while self.subst[at.index()] != root {
+            let next = std::mem::replace(&mut self.subst[at.index()], root);
+            self.undo.push((at.0, next));
+            at = next;
         }
-        value
+        root
     }
 
-    fn step(&mut self, build: &mut Build, var: usize, block: Block) -> Option<Step> {
-        let ty = self.scan.vars[var].home();
+    fn set(&mut self, from: Value, to: Value) {
+        let to = self.resolve(to);
+        if from != to {
+            self.undo.push((from.0, self.subst[from.index()]));
+            self.subst[from.index()] = to;
+        }
+    }
+
+    fn bind(&mut self, build: &mut Build, home: Type, load: Load, value: Value) {
+        match convert(home, load.ty) {
+            Some(op) => build.converts.push((load.inst, op, value)),
+            None => self.set(load.result, value),
+        }
+    }
+
+    fn prepare(&mut self, vars: usize) {
+        let need = vars * self.cfg.preds.len();
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.memo.fill((0, Value(0)));
+            self.stamp = 1;
+        }
+        if self.memo.len() < need {
+            self.memo.resize(need, (0, Value(0)));
+        }
+    }
+
+    fn rollback(&mut self, mark: usize) {
+        for (index, old) in self.undo.drain(..).rev() {
+            self.subst[index as usize] = old;
+        }
+        self.fresh.rollback(mark);
+        self.subst.truncate(self.fresh.base + mark);
+    }
+
+    fn step(&mut self, build: &mut Build, var: SlotVar, block: Block) -> Option<Step> {
+        let ty = self.scan.vars[var.index].home();
         let preds = &self.cfg.preds[block.index()];
         if block == self.cfg.entry && !preds.is_empty() {
             return None;
         }
         if !self.cfg.reachable[block.index()] || preds.is_empty() {
-            return Some(Step::Done(self.fresh.zero(ty)));
+            return Some(Step::Done(self.fresh.zero(&mut self.subst, ty)));
         }
         if let [pred] = preds[..] {
-            return Some(match self.local.def(var, pred) {
+            return Some(match self.local.def(var.index, pred) {
                 Some(def) => Step::Done(def),
                 None => Step::Up(pred),
             });
         }
-        let value = self.fresh.value(ty);
-        build.phis.push(Phi { value, block, var, args: Vec::new(), live: true });
+        let value = self.fresh.value(&mut self.subst, ty);
+        build.phis.push(Phi { value, block, var, args: Vec::new() });
         Some(Step::Done(value))
     }
 
-    fn entry(&mut self, build: &mut Build, var: usize, start: Block) -> Option<Value> {
-        build.path.clear();
+    fn entry(&mut self, build: &mut Build, var: SlotVar, start: Block) -> Option<Value> {
+        let blocks = self.cfg.preds.len();
+        self.path.clear();
         let mut block = start;
         let value = loop {
-            if let Some(value) = build.memo.get(&(var, block)) {
-                break *value;
+            let cached = self.memo[var.local * blocks + block.index()];
+            if cached.0 == self.stamp {
+                break cached.1;
             }
-            if build.path.len() > self.cfg.preds.len() {
+            if self.path.len() > blocks {
                 return None;
             }
-            build.path.push(block);
+            self.path.push(block);
             match self.step(build, var, block)? {
                 Step::Done(value) => break value,
                 Step::Up(pred) => block = pred,
             }
         };
-        for &block in &build.path {
-            build.memo.insert((var, block), value);
+        for &block in &self.path {
+            self.memo[var.local * blocks + block.index()] = (self.stamp, value);
         }
         Some(value)
     }
 
-    fn exit(&mut self, build: &mut Build, var: usize, block: Block) -> Option<Value> {
-        match self.local.def(var, block) {
+    fn exit(&mut self, build: &mut Build, var: SlotVar, block: Block) -> Option<Value> {
+        match self.local.def(var.index, block) {
             Some(def) => Some(def),
             None => self.entry(build, var, block),
         }
@@ -420,11 +457,10 @@ impl Pass {
         Some(())
     }
 
-    fn trivial(&mut self, build: &Build, index: usize) -> Option<Value> {
-        let phi = &build.phis[index];
+    fn trivial(&mut self, phi: &Phi) -> Option<Value> {
         let mut same = None;
         for arg in &phi.args {
-            let value = self.resolve(build, *arg);
+            let value = self.resolve(*arg);
             if value == phi.value || same == Some(value) {
                 continue;
             }
@@ -433,56 +469,57 @@ impl Pass {
             }
             same = Some(value);
         }
-        let ty = self.scan.vars[phi.var].home();
-        Some(same.unwrap_or_else(|| self.fresh.zero(ty)))
+        let ty = self.scan.vars[phi.var.index].home();
+        Some(same.unwrap_or_else(|| self.fresh.zero(&mut self.subst, ty)))
     }
 
-    fn minimize(&mut self, build: &mut Build) {
+    fn minimize(&mut self, phis: &mut Vec<Phi>) {
         loop {
-            let mut changed = false;
-            for index in 0..build.phis.len() {
-                if !build.phis[index].live {
-                    continue;
+            let before = phis.len();
+            phis.retain(|phi| match self.trivial(phi) {
+                Some(value) => {
+                    self.set(phi.value, value);
+                    false
                 }
-                if let Some(value) = self.trivial(build, index) {
-                    build.staged.insert(build.phis[index].value, value);
-                    build.phis[index].live = false;
-                    changed = true;
-                }
-            }
-            if !changed {
+                None => true,
+            });
+            if phis.len() == before {
                 return;
             }
         }
     }
 
     fn build(&mut self, slot: usize) -> Option<Build> {
+        let vars = self.scan.slot_vars[slot].len();
+        self.prepare(vars);
         let mut build = Build::default();
-        for at in 0..self.scan.slot_vars[slot].len() {
-            let var = self.scan.slot_vars[slot][at];
-            let home = self.scan.vars[var].home();
-            for exposed in 0..self.local.exposed[var].len() {
-                let (block, load) = self.local.exposed[var][exposed];
+        for local in 0..vars {
+            let index = self.scan.slot_vars[slot][local];
+            let var = SlotVar { local, index };
+            let home = self.scan.vars[index].home();
+            for exposed in 0..self.local.exposed[index].len() {
+                let (block, load) = self.local.exposed[index][exposed];
                 let value = self.entry(&mut build, var, block)?;
-                build.bind(home, load, value);
+                self.bind(&mut build, home, load, value);
             }
-            for &(load, def) in &self.local.forward[var] {
-                build.bind(home, load, def);
+            for forward in 0..self.local.forward[index].len() {
+                let (load, def) = self.local.forward[index][forward];
+                self.bind(&mut build, home, load, def);
             }
         }
         self.fill(&mut build)?;
-        self.minimize(&mut build);
-        let blocked = build.phis.iter().any(|phi| phi.live && self.cfg.try_target[phi.block.index()]);
+        self.minimize(&mut build.phis);
+        let blocked = build.phis.iter().any(|phi| self.cfg.try_target[phi.block.index()]);
         (!blocked).then_some(build)
     }
 
     fn apply(&mut self, func: &mut Function, slot: usize, build: Build) {
-        self.subst.extend(build.staged);
+        self.undo.clear();
         for (inst, op, value) in build.converts {
             func.insts[inst.index()].op = Op::Convert(op, value);
             self.kept[inst.index()] = true;
         }
-        for phi in build.phis.into_iter().filter(|phi| phi.live) {
+        for phi in build.phis {
             func.blocks[phi.block.index()].params.push(phi.value);
             for (pred, arg) in self.cfg.preds[phi.block.index()].iter().zip(&phi.args) {
                 push_edge_arg(func, *pred, phi.block, *arg);
@@ -506,7 +543,7 @@ impl Pass {
         dropped
     }
 
-    fn finish(self, func: &mut Function, entry: Block) {
+    fn finish(mut self, func: &mut Function, entry: Block) {
         func.types.extend(&self.fresh.types);
         let dropped = self.dropped(func.insts.len());
         for block in &mut func.blocks {
@@ -514,17 +551,18 @@ impl Pass {
         }
         let zeros = materialize(func, &self.fresh.zeros);
         func.blocks[entry.index()].insts.splice(0..0, zeros);
-        let empty = Build::default();
         for block in &func.blocks {
             for inst in &block.insts {
-                func.insts[inst.index()].op.map_operands(|value| self.resolve(&empty, value));
+                func.insts[inst.index()].op.map_operands(|value| crate::merge::find_compress(&mut self.subst, value));
             }
         }
     }
 }
 
 fn push_edge_arg(func: &mut Function, pred: Block, target: Block, arg: Value) {
-    let Some(&inst) = func.blocks[pred.index()].insts.last() else { return };
+    let Some(&inst) = func.blocks[pred.index()].insts.last() else {
+        return;
+    };
     match &mut func.insts[inst.index()].op {
         Op::Jump(block, args) if *block == target => args.push(arg),
         Op::Brif(_, then, then_args, otherwise, else_args) => {
@@ -560,16 +598,20 @@ fn materialize(func: &mut Function, zeros: &[(Type, Value)]) -> Vec<Inst> {
 
 /// Promotes every stack slot whose address never escapes into SSA values carried in block parameters.
 pub(crate) fn run(func: &mut Function) {
-    let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else { return };
+    let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
+        return;
+    };
     let scan = Scan::new(func);
     if !(0..func.slots.len()).any(|slot| scan.promotable(slot)) {
         return;
     }
     let local = Local::new(&scan);
-    let fresh = Fresh { base: func.types.len(), types: Vec::new(), zeros: Vec::new() };
+    let count = func.types.len();
+    let fresh = Fresh { base: count, types: Vec::new(), zeros: Vec::new() };
+    let subst = crate::merge::identity(count);
     let promoted = vec![false; func.slots.len()];
     let kept = vec![false; func.insts.len()];
-    let mut pass = Pass { cfg: Cfg::new(func, entry), scan, local, fresh, subst: HashMap::default(), promoted, kept };
+    let mut pass = Pass { cfg: Cfg::new(func, entry), scan, local, fresh, subst, undo: Vec::new(), memo: Vec::new(), stamp: 0, path: Vec::new(), promoted, kept };
     for slot in 0..func.slots.len() {
         if !pass.scan.promotable(slot) {
             continue;
@@ -577,7 +619,7 @@ pub(crate) fn run(func: &mut Function) {
         let mark = pass.fresh.types.len();
         match pass.build(slot) {
             Some(build) => pass.apply(func, slot, build),
-            None => pass.fresh.rollback(mark),
+            None => pass.rollback(mark),
         }
     }
     pass.finish(func, entry);

@@ -1,6 +1,4 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, Function, FunctionBuilder, Type, Value};
@@ -11,8 +9,10 @@ use crate::names::ItemRef;
 use crate::sema::Context;
 use crate::sema::infer::{Arena, Shape};
 use crate::sema::reach::Reached;
+use crate::sema::table::Table;
+use crate::sync::{read_lock, write_lock};
 
-use super::{Lower, Slots, Word, is_static, signature, signature_of};
+use super::{Inline, Lower, Slots, Word, is_static, signature, signature_of};
 
 /// The 128-bit structural footprint digest of a lowered function and its inlined callees.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -107,10 +107,9 @@ impl CycleState {
 /// Cached inlineable callee stencils and footprints across a compilation.
 #[derive(Default)]
 pub struct Bodies {
-    probed: RefCell<FxHashMap<usize, Option<Arc<InlinedCallee>>>>,
-    templates: RefCell<FxHashMap<TemplateKey, Option<(Arc<Function>, bool)>>>,
-    active: RefCell<Vec<usize>>,
-    cyclic: RefCell<FxHashMap<usize, CycleState>>,
+    probed: Table<usize, Option<Arc<InlinedCallee>>>,
+    templates: Table<TemplateKey, Option<(Arc<Function>, bool)>>,
+    cyclic: RwLock<FxHashMap<usize, CycleState>>,
 }
 
 #[derive(Clone, Copy)]
@@ -137,9 +136,11 @@ impl TarjanRun {
         (u, 0, edges)
     }
 
-    fn finish(&mut self, u: usize, parent: Option<usize>, cyclic: &mut FxHashMap<usize, CycleState>) -> Option<bool> {
+    fn finish(&mut self, u: usize, parent: Option<usize>, cyclic: &mut FxHashMap<usize, CycleState>) {
         let u_info = self.nodes[&u];
-        let ans = (u_info.low == u_info.index).then(|| self.pop_scc(u, cyclic));
+        if u_info.low == u_info.index {
+            self.pop_scc(u, cyclic);
+        }
         if let Some(p) = parent {
             let u_now = self.nodes[&u];
             if let Some(p_info) = self.nodes.get_mut(&p) {
@@ -147,10 +148,9 @@ impl TarjanRun {
                 p_info.complete &= u_now.complete;
             }
         }
-        ans
     }
 
-    fn pop_scc(&mut self, u: usize, cyclic: &mut FxHashMap<usize, CycleState>) -> bool {
+    fn pop_scc(&mut self, u: usize, cyclic: &mut FxHashMap<usize, CycleState>) {
         let mut scc = Vec::new();
         let mut self_loop = false;
         let mut complete = true;
@@ -180,7 +180,6 @@ impl TarjanRun {
                 info.complete = false;
             }
         }
-        is_cyc
     }
 }
 
@@ -188,129 +187,121 @@ impl Bodies {
     /// Drops all cached inlineable bodies and footprints.
     pub fn clear(&self) {
         self.clear_transient();
-        self.cyclic.borrow_mut().clear();
+        write_lock(&self.cyclic).clear();
     }
 
     /// Drops cached inline probes and templates while retaining any precomputed cycle entries.
     pub fn clear_transient(&self) {
-        self.probed.borrow_mut().clear();
-        self.templates.borrow_mut().clear();
-        self.active.borrow_mut().clear();
+        self.probed.clear();
+        self.templates.clear();
     }
 
     pub(super) fn is_cyclic(&self, cx: &mut Context<'_>, reached: &Reached, root: usize) -> bool {
-        if let Some(&st) = self.cyclic.borrow().get(&root) {
+        if let Some(&st) = read_lock(&self.cyclic).get(&root) {
             return st != CycleState::Acyclic;
         }
         if reached.is_untyped(root) {
             return false;
         }
-        if !super::may_inline(cx, reached, root) {
-            self.cyclic.borrow_mut().insert(root, CycleState::Acyclic);
-            return false;
+        let mut view = CycleView { shared: &self.cyclic, found: FxHashMap::default() };
+        if super::may_inline(cx, reached, root) {
+            tarjan_from(cx, reached, &mut view, root);
+        } else {
+            view.found.insert(root, CycleState::Acyclic);
         }
-        self.tarjan_from(cx, reached, root)
+        let mut shared = write_lock(&self.cyclic);
+        for (node, state) in view.found {
+            shared.entry(node).or_insert(state);
+        }
+        shared.get(&root).is_some_and(|&st| st != CycleState::Acyclic)
     }
+}
 
-    fn is_done_callee(&self, v: usize) -> bool {
-        self.cyclic.borrow().get(&v).is_some_and(|st| st.is_complete())
+struct CycleView<'b> {
+    shared: &'b RwLock<FxHashMap<usize, CycleState>>,
+    found: FxHashMap<usize, CycleState>,
+}
+
+impl CycleView<'_> {
+    fn is_done(&self, v: usize) -> bool {
+        let done = |st: &CycleState| st.is_complete();
+        self.found.get(&v).is_some_and(done) || read_lock(self.shared).get(&v).is_some_and(done)
     }
+}
 
-    fn tarjan_from(&self, cx: &mut Context<'_>, reached: &Reached, root: usize) -> bool {
-        let mut run = TarjanRun { nodes: FxHashMap::default(), stack: Vec::new(), clock: 0 };
-        let mut frames = vec![run.enter(root, self.node_edges(cx, reached, root))];
-        let mut root_ans = false;
-        while let Some(top) = frames.last_mut() {
-            let u = top.0;
-            if top.1 < top.2.len() {
-                let v = top.2[top.1];
-                top.1 += 1;
-                self.step_edge(cx, reached, &mut run, &mut frames, u, v);
-            } else if let Some((done, _, _)) = frames.pop() {
-                let popped = run.finish(done, frames.last().map(|f| f.0), &mut self.cyclic.borrow_mut());
-                if done == root && let Some(ans) = popped {
-                    root_ans = ans;
-                }
+fn tarjan_from(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, root: usize) {
+    let mut run = TarjanRun { nodes: FxHashMap::default(), stack: Vec::new(), clock: 0 };
+    let mut frames = vec![run.enter(root, node_edges(cx, reached, cyclic, root))];
+    while let Some(top) = frames.last_mut() {
+        let u = top.0;
+        if top.1 < top.2.len() {
+            let v = top.2[top.1];
+            top.1 += 1;
+            step_edge(cx, reached, cyclic, (&mut run, &mut frames), (u, v));
+        } else if let Some((done, _, _)) = frames.pop() {
+            run.finish(done, frames.last().map(|f| f.0), &mut cyclic.found);
+        }
+    }
+}
+
+type Frames = Vec<(usize, usize, Vec<usize>)>;
+
+fn step_edge(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, (run, frames): (&mut TarjanRun, &mut Frames), (u, v): (usize, usize)) {
+    if cyclic.is_done(v) {
+        return;
+    }
+    if let Some(&v_info) = run.nodes.get(&v) {
+        if let Some(u_info) = run.nodes.get_mut(&u) {
+            if v_info.on_stack {
+                u_info.low = u_info.low.min(v_info.index);
+            } else {
+                u_info.complete &= v_info.complete;
             }
         }
-        root_ans
+        return;
     }
+    frames.push(run.enter(v, node_edges(cx, reached, cyclic, v)));
+}
 
-    fn step_edge(&self, cx: &mut Context<'_>, reached: &Reached, run: &mut TarjanRun, frames: &mut Vec<(usize, usize, Vec<usize>)>, u: usize, v: usize) {
-        if self.is_done_callee(v) {
-            return;
+fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, u: usize) -> (Vec<usize>, bool, bool) {
+    let mut info = NodeInfo { index: 0, low: 0, on_stack: false, self_loop: false, complete: true };
+    let mut edges = Vec::new();
+    if let Some(slice) = reached.direct_calls(u) {
+        for &v in slice {
+            scan_callee(cx, reached, cyclic, (u, v), (&mut info, &mut edges));
         }
-        if let Some(&v_info) = run.nodes.get(&v) {
-            if let Some(u_info) = run.nodes.get_mut(&u) {
-                if v_info.on_stack {
-                    u_info.low = u_info.low.min(v_info.index);
-                } else {
-                    u_info.complete &= v_info.complete;
-                }
-            }
-            return;
-        }
-        frames.push(run.enter(v, self.node_edges(cx, reached, v)));
+        return (edges, info.self_loop, info.complete);
     }
+    let Ok(typed) = &reached.list[u].1 else { return (edges, false, true) };
+    for (item, substs) in typed.calls() {
+        if cx.intrinsic(item).is_some() {
+            continue;
+        }
+        match reached.index.get(&(item, substs)) {
+            Some(&v) => scan_callee(cx, reached, cyclic, (u, v), (&mut info, &mut edges)),
+            None => info.complete = false,
+        }
+    }
+    (edges, info.self_loop, info.complete)
+}
 
-    fn node_edges(&self, cx: &mut Context<'_>, reached: &Reached, u: usize) -> (Vec<usize>, bool, bool) {
-        let mut info = NodeInfo { index: 0, low: 0, on_stack: false, self_loop: false, complete: true };
-        let mut edges = Vec::new();
-        if let Some(slice) = reached.direct_calls(u) {
-            for &v in slice {
-                self.scan_callee(cx, reached, u, v, &mut info, &mut edges);
-            }
-            return (edges, info.self_loop, info.complete);
-        }
-        let Ok(typed) = &reached.list[u].1 else { return (edges, false, true) };
-        for (item, substs) in typed.calls() {
-            if cx.intrinsic(item).is_some() {
-                continue;
-            }
-            match reached.index.get(&(item, substs)) {
-                Some(&v) => self.scan_callee(cx, reached, u, v, &mut info, &mut edges),
-                None => info.complete = false,
-            }
-        }
-        (edges, info.self_loop, info.complete)
+fn scan_callee(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, (u, v): (usize, usize), (info, edges): (&mut NodeInfo, &mut Vec<usize>)) {
+    if v == u {
+        info.self_loop = true;
+        return;
     }
-
-    fn scan_callee(&self, cx: &mut Context<'_>, reached: &Reached, u: usize, v: usize, info: &mut NodeInfo, edges: &mut Vec<usize>) {
-        if v == u {
-            info.self_loop = true;
-            return;
-        }
-        if self.is_done_callee(v) {
-            return;
-        }
-        if reached.is_untyped(v) {
-            info.complete = false;
-            return;
-        }
-        if !super::may_inline(cx, reached, v) {
-            self.cyclic.borrow_mut().insert(v, CycleState::Acyclic);
-            return;
-        }
-        edges.push(v);
+    if cyclic.is_done(v) {
+        return;
     }
-
-    pub(super) fn lookup_probed(&self, index: usize) -> Option<Option<Arc<InlinedCallee>>> {
-        self.probed.borrow().get(&index).cloned()
+    if reached.is_untyped(v) {
+        info.complete = false;
+        return;
     }
-
-    pub(super) fn push_active(&self, index: usize) -> Result<usize, usize> {
-        let mut active = self.active.borrow_mut();
-        if let Some(pos) = active.iter().position(|&at| at == index) {
-            return Err(pos);
-        }
-        let depth = active.len();
-        active.push(index);
-        Ok(depth)
+    if !super::may_inline(cx, reached, v) {
+        cyclic.found.insert(v, CycleState::Acyclic);
+        return;
     }
-
-    pub(super) fn pop_active(&self) {
-        self.active.borrow_mut().pop();
-    }
+    edges.push(v);
 }
 
 pub(super) fn item_bits(item: ItemRef) -> u128 {
@@ -319,76 +310,100 @@ pub(super) fn item_bits(item: ItemRef) -> u128 {
 
 /// Computes the 128-bit footprint and symbolic relocations of reached function `index` without allocating IR instructions.
 pub fn probe_footprint(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<(FootprintId, RelocVec)> {
-    let (_, footprint, relocs, _) = run_with_cycle(cx, reached, slots, index, LowerMode::Probe)?;
+    let (_, footprint, relocs, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Probe)?;
     Ok((footprint, relocs))
 }
 
 /// Lowers reached function `index` into an SSA stencil with symbolic relocations.
 pub fn lower_stencil(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<StencilOutput> {
-    let (func, _, relocs, _) = run_with_cycle(cx, reached, slots, index, LowerMode::Stencil)?;
+    let (func, _, relocs, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Stencil)?;
     Ok(StencilOutput { func, relocs })
 }
 
 /// Lowers reached function `index` into a shared dictionary-parameterized SSA body and its relocation vector.
 pub fn lower_dict(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<(Function, RelocVec)> {
-    let (func, _, relocs, _) = run_with_cycle(cx, reached, slots, index, LowerMode::Dict)?;
+    let (func, _, relocs, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Dict)?;
     Ok((func, relocs))
 }
 
-pub(super) fn resolve_inline(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize, limit: usize) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
+pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
     let bodies = slots.bodies();
     if bodies.is_cyclic(cx, reached, index) {
         return Ok((None, usize::MAX));
     }
-    if let Some(cached) = bodies.lookup_probed(index) {
+    if let Some(cached) = bodies.probed.get(&index) {
         return Ok((cached, usize::MAX));
     }
-    let depth = match bodies.push_active(index) {
-        Ok(depth) => depth,
-        Err(pos) => return Ok((None, pos)),
-    };
-    let wanted0 = slots.wanted_len();
-    let outcome = build_inline(cx, reached, slots, index, limit, wanted0);
-    bodies.pop_active();
-    let (result, cycle) = outcome?;
-    if cycle > depth && slots.wanted_len() == wanted0 {
-        bodies.probed.borrow_mut().insert(index, result.clone());
+    if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
+        return Ok((None, pos));
     }
+    if let Some((cached, cycle)) = inline.local.get(&index) {
+        return Ok((cached.clone(), *cycle));
+    }
+    let depth = inline.stack.len();
+    inline.stack.push(index);
+    let quiet = Quiet::mark(cx, slots);
+    let outcome = build_inline(cx, (reached, slots), inline, index, (limit, &quiet));
+    inline.stack.pop();
+    let (result, cycle) = outcome?;
+    if cycle > depth && quiet.holds(cx, slots) {
+        return Ok((bodies.probed.get_or_insert_with(index, || result), cycle));
+    }
+    inline.local.insert(index, (result.clone(), if cycle < depth { cycle } else { usize::MAX }));
     Ok((result, cycle))
+}
+
+struct Quiet {
+    wanted: usize,
+    sema: (usize, usize),
+}
+
+impl Quiet {
+    fn mark(cx: &Context<'_>, slots: &dyn Slots) -> Self {
+        Self { wanted: slots.wanted_len(), sema: cx.quiet_mark() }
+    }
+
+    fn holds(&self, cx: &Context<'_>, slots: &dyn Slots) -> bool {
+        slots.wanted_len() == self.wanted && cx.quiet_mark() == self.sema
+    }
+
+    fn lowered<T>(&self, slots: &dyn Slots, result: Result<T>) -> Result<Option<T>> {
+        match result {
+            Ok(out) => Ok(Some(out)),
+            Err(err) if slots.wanted_len() > self.wanted => Err(err),
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 fn has_promoted_cell(relocs: &[SymbolSource]) -> bool {
     relocs.iter().any(|r| matches!(r, SymbolSource::PromotedCell { .. }))
 }
 
-fn build_inline(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize, limit: usize, wanted0: usize) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
+fn build_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
     let item = reached.list[index].0.0;
-    let (_, footprint, relocs, probe_cycle) = match run_with_cycle(cx, reached, slots, index, LowerMode::Probe) {
-        Ok(out) => out,
-        Err(err) if slots.wanted_len() > wanted0 => return Err(err),
-        Err(_) => return Ok((None, usize::MAX)),
-    };
+    let probed = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Probe);
+    let Some((_, footprint, relocs, probe_cycle)) = quiet.lowered(slots, probed)? else { return Ok((None, usize::MAX)) };
     if has_promoted_cell(&relocs) {
         return Ok((None, probe_cycle));
     }
     let key = TemplateKey { item, footprint, limit, low: slots.low_entries() };
-    if let Some(template) = slots.bodies().templates.borrow().get(&key).cloned() {
-        let built = template.map(|(body, returns)| Arc::new(InlinedCallee { item, footprint, relocs, body, returns }));
-        return Ok((built, probe_cycle));
+    if let Some(template) = slots.bodies().templates.get(&key) {
+        return Ok((callee(item, footprint, relocs, template), probe_cycle));
     }
-    let (func, _, _, ir_cycle) = match run_with_cycle(cx, reached, slots, index, LowerMode::Stencil) {
-        Ok(out) => out,
-        Err(err) if slots.wanted_len() > wanted0 => return Err(err),
-        Err(_) => return Ok((None, probe_cycle)),
-    };
+    let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
+    let Some((func, _, _, ir_cycle)) = quiet.lowered(slots, lowered)? else { return Ok((None, probe_cycle)) };
     let cycle = probe_cycle.min(ir_cycle);
-    let template = simplify_inline(func, limit);
-    let depth = slots.bodies().active.borrow().len().saturating_sub(1);
-    if cycle > depth && slots.wanted_len() == wanted0 {
-        slots.bodies().templates.borrow_mut().insert(key, template.clone());
+    let mut template = simplify_inline(func, limit);
+    let depth = inline.stack.len().saturating_sub(1);
+    if cycle > depth && quiet.holds(cx, slots) {
+        template = slots.bodies().templates.get_or_insert_with(key, || template);
     }
-    let built = template.map(|(body, returns)| Arc::new(InlinedCallee { item, footprint, relocs, body, returns }));
-    Ok((built, cycle))
+    Ok((callee(item, footprint, relocs, template), cycle))
+}
+
+fn callee(item: ItemRef, footprint: FootprintId, relocs: RelocVec, template: Option<(Arc<Function>, bool)>) -> Option<Arc<InlinedCallee>> {
+    template.map(|(body, returns)| Arc::new(InlinedCallee { item, footprint, relocs, body, returns }))
 }
 
 fn simplify_inline(mut func: Function, limit: usize) -> Option<(Arc<Function>, bool)> {
@@ -402,7 +417,7 @@ fn simplify_inline(mut func: Function, limit: usize) -> Option<(Arc<Function>, b
     })
 }
 
-fn run_with_cycle(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize, mode: LowerMode) -> Result<(Function, FootprintId, RelocVec, usize)> {
+fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode) -> Result<(Function, FootprintId, RelocVec, usize)> {
     let ((item, _), typed) = &reached.list[index];
     let Ok(typed) = typed else { bail!("{} did not type-check", cx.name(*item)) };
     let source = match &typed.shape {
@@ -412,7 +427,7 @@ fn run_with_cycle(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, in
     let arena = match &typed.shape {
         Shape::Body | Shape::Closure(_) => Arena::Body(cx.body(source)?),
         Shape::Anon(anon) => anon.arena.clone(),
-        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => Arena::Body(Rc::default()),
+        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => Arena::Body(Arc::default()),
     };
     let src = cx.body_src(source);
     let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
@@ -431,6 +446,7 @@ fn run_with_cycle(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, in
             cx,
             reached,
             slots,
+            inline,
             body: arena.body(),
             src,
             typed,

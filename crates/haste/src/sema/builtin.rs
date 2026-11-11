@@ -1,7 +1,7 @@
-use anyhow::{Result, bail};
 use crate::names::ItemRef;
 use crate::outline::item::Attr;
 use crate::outline::source::{Source, Tokens};
+use anyhow::{Result, bail};
 
 use super::Context;
 
@@ -91,7 +91,9 @@ pub fn crate_path(out: &mut Tokens, krate: u32, rest: &str) {
 
 /// The expansion of `assert!` with the arguments `args` of the call in `src`, for a macro of crate `krate`.
 pub fn assert(src: &Source, args: &[(u32, u32)], krate: u32, out: &mut Tokens) {
-    let Some(&(from, to)) = args.first() else { return };
+    let Some(&(from, to)) = args.first() else {
+        return;
+    };
     out.lexed("if ! (");
     out.copy_range(src, from, to);
     out.lexed(") {");
@@ -131,10 +133,21 @@ pub fn asm_barrier(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Resul
 fn strip_comments(template: &str) -> String {
     let mut rest = template;
     let mut kept = String::new();
-    while let Some(start) = rest.find(['/', '{']) {
+    while let Some(start) = rest.find(['/', '{', '#']) {
         kept.push_str(&rest[..start]);
-        let close = if rest[start..].starts_with("/*") { rest[start..].find("*/").map(|end| start + end + 2) } else if rest[start..].starts_with('{') { rest[start..].find('}').map(|end| start + end + 1) } else { None };
-        let Some(close) = close else { return kept + &rest[start..] };
+        let tail = &rest[start..];
+        let close = if tail.starts_with("/*") {
+            tail.find("*/").map(|end| start + end + 2)
+        } else if tail.starts_with("//") || tail.starts_with('#') {
+            Some(tail.find('\n').map_or(rest.len(), |end| start + end + 1))
+        } else if tail.starts_with('{') {
+            tail.find('}').map(|end| start + end + 1)
+        } else {
+            Some(start + 1)
+        };
+        let Some(close) = close else {
+            return kept + tail;
+        };
         rest = &rest[close..];
     }
     kept + rest

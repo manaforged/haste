@@ -149,7 +149,9 @@ impl Lower<'_, '_> {
     }
 
     fn test_variant(&mut self, pat: PatId, place: Option<Place>, fail: Block) -> Result<()> {
-        let Some(Res::Ctor(_, variant, _)) = self.typed.pat_res.get(&pat).cloned() else { return Ok(()) };
+        let Some(Res::Ctor(_, variant, _)) = self.typed.pat_res.get(&pat).cloned() else {
+            return Ok(());
+        };
         let ty = self.pat_ty(pat)?;
         if let Some(ok) = self.is_variant(place, ty, variant)? {
             self.pass(ok, fail);
@@ -319,7 +321,9 @@ impl Lower<'_, '_> {
                 path.push(step);
                 Ok(Some((root, path)))
             }
-            (Some(_), None) if crate::sema::infer::needs_drop(self.cx, self.pat_ty(sub)?)? => bail!("moving out of an array by a slice pattern is not supported yet"),
+            (Some(_), None) if crate::sema::infer::needs_drop(self.cx, self.pat_ty(sub)?)? => {
+                bail!("moving out of an array by a slice pattern is not supported yet")
+            }
             _ => Ok(None),
         }
     }
