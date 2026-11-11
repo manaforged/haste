@@ -103,7 +103,7 @@ impl Lower<'_, '_> {
         self.try_exits.pop();
         left?;
         self.enter(exit);
-        Ok(value.map(|(slot, ty)| self.ins().stack_load(ty, slot, 0)))
+        Ok(value.and_then(|place| self.read(place)))
     }
 
     fn leave_try(&mut self, block: ExprId, value: Option<Value>) -> Result<()> {
@@ -111,8 +111,8 @@ impl Lower<'_, '_> {
         if !self.open {
             return Ok(());
         }
-        if let (Some(value), Some((slot, _))) = (value, slot) {
-            self.ins().stack_store(value, slot, 0);
+        if let (Some(value), Some(place)) = (value, slot) {
+            self.write(place, value);
         }
         self.drop_to(depth)?;
         self.branch_value(None, exit);

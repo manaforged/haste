@@ -31,7 +31,7 @@ const INCOMING: i32 = 16;
 const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
 
 /// The registers planning hands out: the saved pool, and caller-saved registers that are neither scratch, return registers nor the indirect-result register.
-const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)], wide_scratch: &WIDE_SCRATCH, absolute_calls: false };
+const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)], wide_scratch: &WIDE_SCRATCH, float: &[], float_branches: &[], absolute_calls: false };
 
 /// Encodes `func` as A64 machine code for `target`.
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {

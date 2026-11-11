@@ -70,8 +70,8 @@ impl Emit<'_> {
             Unary::Ctz => (Count::Tzcnt, Reg::Rcx, Reg::Rdx),
             _ => (Count::Popcnt, Reg::Rcx, Reg::Rdx),
         };
-        self.asm.count(count, Reg::Rax, first);
-        self.asm.count(count, second, second);
+        self.count(count, Reg::Rax, first);
+        self.count(count, second, second);
         if op == Unary::Popcnt {
             self.asm.alu(Alu::Add, Reg::Rax, second);
             return;

@@ -390,6 +390,12 @@ impl Asm {
         self.encode(&[0xF3], true, &[0x0F, op as u8], dst as u8, src.into(), false);
     }
 
+    /// `bsr` when `reverse`, else `bsf`: the opcodes of lzcnt and tzcnt without the F3 prefix; a zero `src` sets ZF and leaves `dst` undefined.
+    pub fn bit_scan(&mut self, reverse: bool, dst: Reg, src: Reg) {
+        let op = if reverse { Count::Lzcnt } else { Count::Tzcnt };
+        self.encode(&[], true, &[0x0F, op as u8], dst as u8, src.into(), false);
+    }
+
     pub fn lea(&mut self, dst: Reg, src: Mem) {
         self.encode(&[], true, &[0x8D], dst as u8, src.into(), false);
     }
@@ -412,6 +418,21 @@ impl Asm {
 
     pub fn sse_wide(&mut self, prefix: u8, opcode: u8, r: u8, rm: impl Into<Rm>) {
         self.encode(&[prefix], true, &[0x0F, opcode], r, rm.into(), false);
+    }
+
+    /// `movaps dst, src`: copies the whole register, with no dependency on the old contents of `dst`.
+    pub fn movaps(&mut self, dst: Xmm, src: Xmm) {
+        self.sse(&[], &[0x0F, 0x28], dst.0, src);
+    }
+
+    /// `movq xmm, reg`.
+    pub fn movq_in(&mut self, xmm: Xmm, reg: Reg) {
+        self.encode(&[0x66], true, &[0x0F, 0x6E], xmm.0, reg.into(), false);
+    }
+
+    /// `movq reg, xmm`.
+    pub fn movq_out(&mut self, reg: Reg, xmm: Xmm) {
+        self.encode(&[0x66], true, &[0x0F, 0x7E], xmm.0, reg.into(), false);
     }
 
     pub fn push(&mut self, reg: Reg) {

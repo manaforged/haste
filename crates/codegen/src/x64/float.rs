@@ -1,4 +1,4 @@
-use super::asm::{Alu, Cond, Group3, Reg, Shift, Size, Xmm};
+use super::asm::{Alu, Cond, Group3, Reg, Rm, Shift, Size, Xmm};
 use super::{Emit, Ext};
 use crate::ir::{Binary, Convert, FloatCC, Type, Unary, Value};
 
@@ -7,8 +7,20 @@ const X1: Xmm = Xmm(1);
 const X2: Xmm = Xmm(2);
 const TWO_63: i64 = 0x43E0_0000_0000_0000;
 const TWO_64: i64 = 0x43F0_0000_0000_0000;
+/// The bits of 2^52, the least magnitude at which every f64 is whole.
+const F64_WHOLE: i64 = 0x4330_0000_0000_0000;
+/// The bits of 2^23, the least magnitude at which every f32 is whole.
+const F32_WHOLE: i64 = 0x4B00_0000;
+const F64_ONE: i64 = 0x3FF0_0000_0000_0000;
+const F32_ONE: i64 = 0x3F80_0000;
 
-fn scalar(ty: Type) -> u8 {
+/// The float registers planning hands out: past xmm0-xmm2, which conversions use as scratch and calls return in.
+pub(super) const POOL: [u8; 13] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// The float compares whose one condition a branch can read from the flags `ucomis` sets; equality needs two.
+pub(super) const BRANCHES: [FloatCC; 4] = [FloatCC::LessThan, FloatCC::LessThanOrEqual, FloatCC::GreaterThan, FloatCC::GreaterThanOrEqual];
+
+pub(super) fn scalar(ty: Type) -> u8 {
     if ty == Type::F64 { 0xF2 } else { 0xF3 }
 }
 
@@ -17,23 +29,7 @@ fn sign(ty: Type) -> i64 {
 }
 
 impl Emit<'_> {
-    fn fload(&mut self, xmm: Xmm, value: Value) {
-        let prefix = scalar(self.ty(value));
-        let at = self.at(value);
-        self.asm.sse(&[prefix], &[0x0F, 0x10], xmm.0, at);
-    }
-
-    fn fstore(&mut self, value: Value, xmm: Xmm) {
-        let prefix = scalar(self.ty(value));
-        let at = self.at(value);
-        self.asm.sse(&[prefix], &[0x0F, 0x11], xmm.0, at);
-    }
-
-    fn movq_in(&mut self, xmm: Xmm, reg: Reg) {
-        self.asm.encode(&[0x66], true, &[0x0F, 0x6E], xmm.0, reg.into(), false);
-    }
-
-    fn ucomi(&mut self, ty: Type, a: Xmm, b: Xmm) {
+    fn ucomi(&mut self, ty: Type, a: Xmm, b: impl Into<Rm>) {
         let prefix: &[u8] = if ty == Type::F64 { &[0x66] } else { &[] };
         self.asm.sse(prefix, &[0x0F, 0x2E], a.0, b);
     }
@@ -59,17 +55,54 @@ impl Emit<'_> {
             Unary::Trunc => Some(11),
             other => return Err(format!("{other:?} of a float")),
         };
-        self.fload(X0, x);
+        let dst = self.fdst(result);
+        self.fget(dst, x);
         match mode {
-            None => self.asm.sse(&[scalar(ty)], &[0x0F, 0x51], X0.0, X0),
-            Some(mode) => {
+            None => self.asm.sse(&[scalar(ty)], &[0x0F, 0x51], dst.0, dst),
+            Some(mode) if self.features.sse41 => {
                 let opcode = if ty == Type::F64 { 0x0B } else { 0x0A };
-                self.asm.sse(&[0x66], &[0x0F, 0x3A, opcode], X0.0, X0);
+                self.asm.sse(&[0x66], &[0x0F, 0x3A, opcode], dst.0, dst);
                 self.asm.bytes(&[mode]);
             }
+            Some(_) => self.round_baseline(op, ty, dst),
         }
-        self.fstore(result, X0);
+        self.fput(result, dst);
         Ok(())
+    }
+
+    /// Rounds the float in `dst` by `op` without SSE4.1: through a 64-bit integer below the magnitude where every float is whole, then the sign of the input, using rax, rcx, rdx, xmm1 and xmm2.
+    fn round_baseline(&mut self, op: Unary, ty: Type, dst: Xmm) {
+        let (size, whole, one) = if ty == Type::F64 { (Size::Q, F64_WHOLE, F64_ONE) } else { (Size::D, F32_WHOLE, F32_ONE) };
+        let done = self.asm.label();
+        self.asm.movq_out(Reg::Rax, dst);
+        self.asm.mov(Reg::Rcx, Reg::Rax);
+        self.asm.shift_imm(size, Shift::Shl, Reg::Rcx, 1);
+        self.asm.mov_imm(Reg::Rdx, whole << 1);
+        self.asm.alu_sized(size, Alu::Cmp, Reg::Rcx, Reg::Rdx);
+        self.asm.jcc(Cond::Ae, done);
+        self.asm.sse_wide(scalar(ty), 0x2C, Reg::Rcx as u8, dst);
+        self.asm.sse_wide(scalar(ty), 0x2A, X1.0, Reg::Rcx);
+        if op != Unary::Trunc {
+            self.step(op == Unary::Floor, ty, dst, one);
+        }
+        self.asm.movq_out(Reg::Rcx, X1);
+        self.asm.mov_imm(Reg::Rdx, sign(ty));
+        self.asm.alu_sized(size, Alu::And, Reg::Rax, Reg::Rdx);
+        self.asm.alu_sized(size, Alu::Or, Reg::Rcx, Reg::Rax);
+        self.asm.movq_in(dst, Reg::Rcx);
+        self.asm.bind(done);
+    }
+
+    /// Moves the truncated xmm1 one down for a floor, or up for a ceiling, when truncating `x` moved it the other way; `one` holds the bits of 1.0.
+    fn step(&mut self, down: bool, ty: Type, x: Xmm, one: i64) {
+        let skip = self.asm.label();
+        let (above, below, opcode) = if down { (X1, x, 0x5C) } else { (x, X1, 0x58) };
+        self.ucomi(ty, above, below);
+        self.asm.jcc(Cond::Be, skip);
+        self.asm.mov_imm(Reg::Rdx, one);
+        self.asm.movq_in(X2, Reg::Rdx);
+        self.asm.sse(&[scalar(ty)], &[0x0F, opcode], X1.0, X2);
+        self.asm.bind(skip);
     }
 
     pub(super) fn float_binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {
@@ -85,10 +118,11 @@ impl Emit<'_> {
             }
             other => return Err(format!("{other:?} of a float")),
         };
-        self.fload(X0, x);
-        let at = self.at(y);
-        self.asm.sse(&[scalar(ty)], &[0x0F, opcode], X0.0, at);
-        self.fstore(result, X0);
+        let dst = self.fdst(result);
+        self.fget(dst, x);
+        let source = self.foperand(y);
+        self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, source);
+        self.fput(result, dst);
         Ok(())
     }
 
@@ -103,26 +137,28 @@ impl Emit<'_> {
         self.put(result, Reg::Rax);
     }
 
+    /// Compares by `ucomis`, the less-than forms with swapped operands; a compare fused with the next branch leaves its one condition in the flags.
     pub(super) fn fcmp(&mut self, cc: FloatCC, x: Value, y: Value, result: Value) {
-        let ty = self.ty(x);
-        self.fload(X0, x);
-        self.fload(X1, y);
-        match cc {
-            FloatCC::Equal | FloatCC::NotEqual => {
-                self.ucomi(ty, X0, X1);
-                let equal = cc == FloatCC::Equal;
-                self.asm.setcc(if equal { Cond::E } else { Cond::Ne }, Reg::Rax);
-                self.asm.setcc(if equal { Cond::Np } else { Cond::P }, Reg::Rcx);
-                self.asm.alu32(if equal { Alu::And } else { Alu::Or }, Reg::Rax, Reg::Rcx);
-            }
-            FloatCC::LessThan | FloatCC::LessThanOrEqual => {
-                self.ucomi(ty, X1, X0);
-                self.asm.setcc(if cc == FloatCC::LessThan { Cond::A } else { Cond::Ae }, Reg::Rax);
-            }
-            FloatCC::GreaterThan | FloatCC::GreaterThanOrEqual => {
-                self.ucomi(ty, X0, X1);
-                self.asm.setcc(if cc == FloatCC::GreaterThan { Cond::A } else { Cond::Ae }, Reg::Rax);
-            }
+        let (a, b, cond) = match cc {
+            FloatCC::Equal => (x, y, Cond::E),
+            FloatCC::NotEqual => (x, y, Cond::Ne),
+            FloatCC::LessThan => (y, x, Cond::A),
+            FloatCC::LessThanOrEqual => (y, x, Cond::Ae),
+            FloatCC::GreaterThan => (x, y, Cond::A),
+            FloatCC::GreaterThanOrEqual => (x, y, Cond::Ae),
+        };
+        let left = self.fin(a, X0);
+        let right = self.foperand(b);
+        self.ucomi(self.ty(x), left, right);
+        if self.plan.fused[result.index()] {
+            self.flags = Some((result, cond));
+            return;
+        }
+        self.asm.setcc(cond, Reg::Rax);
+        if matches!(cc, FloatCC::Equal | FloatCC::NotEqual) {
+            let equal = cc == FloatCC::Equal;
+            self.asm.setcc(if equal { Cond::Np } else { Cond::P }, Reg::Rcx);
+            self.asm.alu32(if equal { Alu::And } else { Alu::Or }, Reg::Rax, Reg::Rcx);
         }
         self.asm.load(Size::B, Reg::Rax, Reg::Rax);
         self.put(result, Reg::Rax);
@@ -132,21 +168,23 @@ impl Emit<'_> {
         let to = self.ty(result);
         match op {
             Convert::Fpromote | Convert::Fdemote => {
-                let at = self.at(x);
-                self.asm.sse(&[scalar(self.ty(x))], &[0x0F, 0x5A], X0.0, at);
-                self.fstore(result, X0);
+                let (dst, source) = (self.fdst(result), self.foperand(x));
+                self.asm.sse(&[scalar(self.ty(x))], &[0x0F, 0x5A], dst.0, source);
+                self.fput(result, dst);
             }
             Convert::FromSint | Convert::FromUint if self.ty(x) == Type::I128 => {
                 return Err(format!("{op:?} from I128 to {to:?}"));
             }
             Convert::FromSint => {
                 self.get(Reg::Rax, x, Ext::Sign);
-                self.asm.sse_wide(scalar(to), 0x2A, X0.0, Reg::Rax);
-                self.fstore(result, X0);
+                let dst = self.fdst(result);
+                self.asm.sse_wide(scalar(to), 0x2A, dst.0, Reg::Rax);
+                self.fput(result, dst);
             }
             Convert::FromUint => {
-                self.from_unsigned(x, to);
-                self.fstore(result, X0);
+                let dst = self.fdst(result);
+                self.from_unsigned(x, to, dst);
+                self.fput(result, dst);
             }
             Convert::ToSintSat | Convert::ToUintSat if to != Type::I128 => {
                 self.widen_to_double(x);
@@ -160,34 +198,35 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn from_unsigned(&mut self, x: Value, to: Type) {
+    /// Converts unsigned `x` to a float of type `to` in `dst`.
+    fn from_unsigned(&mut self, x: Value, to: Type, dst: Xmm) {
         self.get(Reg::Rax, x, Ext::Zero);
         let prefix = scalar(to);
         if self.ty(x).bits() < 64 {
-            self.asm.sse_wide(prefix, 0x2A, X0.0, Reg::Rax);
+            self.asm.sse_wide(prefix, 0x2A, dst.0, Reg::Rax);
             return;
         }
         let (big, done) = (self.asm.label(), self.asm.label());
         self.asm.test(Reg::Rax, Reg::Rax);
         self.asm.jcc(Cond::S, big);
-        self.asm.sse_wide(prefix, 0x2A, X0.0, Reg::Rax);
+        self.asm.sse_wide(prefix, 0x2A, dst.0, Reg::Rax);
         self.asm.jmp(done);
         self.asm.bind(big);
         self.asm.mov(Reg::Rcx, Reg::Rax);
         self.asm.shift_imm(Size::Q, Shift::Shr, Reg::Rcx, 1);
         self.asm.alu_imm32(Alu::And, Reg::Rax, 1);
         self.asm.alu(Alu::Or, Reg::Rcx, Reg::Rax);
-        self.asm.sse_wide(prefix, 0x2A, X0.0, Reg::Rcx);
-        self.asm.sse(&[prefix], &[0x0F, 0x58], X0.0, X0);
+        self.asm.sse_wide(prefix, 0x2A, dst.0, Reg::Rcx);
+        self.asm.sse(&[prefix], &[0x0F, 0x58], dst.0, dst);
         self.asm.bind(done);
     }
 
     fn widen_to_double(&mut self, x: Value) {
         if self.ty(x) == Type::F32 {
-            let at = self.at(x);
-            self.asm.sse(&[0xF3], &[0x0F, 0x5A], X0.0, at);
+            let source = self.foperand(x);
+            self.asm.sse(&[0xF3], &[0x0F, 0x5A], X0.0, source);
         } else {
-            self.fload(X0, x);
+            self.fget(X0, x);
         }
     }
 
@@ -219,14 +258,14 @@ impl Emit<'_> {
         self.asm.jmp(done);
         self.asm.bind(positive);
         self.asm.mov_imm(Reg::Rcx, TWO_63);
-        self.movq_in(X1, Reg::Rcx);
+        self.asm.movq_in(X1, Reg::Rcx);
         self.ucomi(Type::F64, X0, X1);
         self.asm.jcc(Cond::Ae, big);
         self.asm.sse_wide(0xF2, 0x2C, Reg::Rax as u8, X0);
         self.asm.jmp(done);
         self.asm.bind(big);
         self.asm.mov_imm(Reg::Rcx, TWO_64);
-        self.movq_in(X2, Reg::Rcx);
+        self.asm.movq_in(X2, Reg::Rcx);
         self.ucomi(Type::F64, X0, X2);
         self.asm.jcc(Cond::Ae, max);
         self.asm.sse(&[0xF2], &[0x0F, 0x5C], X0.0, X1);

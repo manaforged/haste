@@ -1,4 +1,4 @@
-use crate::ir::{Binary, Block, Convert, Function, IntCC, Op, SigRef, Type, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, SigRef, Type, Unary, Value};
 
 /// `imm` of type `ty` extended to 64 bits, by its sign when `signed`.
 pub(crate) fn extend(imm: i64, ty: Type, signed: bool) -> i64 {
@@ -43,6 +43,82 @@ pub(crate) fn constant(op: Binary, a: i64, b: i64) -> Option<i64> {
     }
 }
 
+/// `a op b` on constants of type `ty`, with shift counts masked to the width as the encoders mask them, or `None` for a division that traps.
+pub(crate) fn binary(op: Binary, ty: Type, a: i64, b: i64) -> Option<i64> {
+    if let Some(value) = constant(op, a, b) {
+        return Some(value);
+    }
+    let bits = ty.bits();
+    let count = (b & i64::from(bits - 1)) as u32;
+    let (sa, sb) = (extend(a, ty, true), extend(b, ty, true));
+    let (ua, ub) = (extend(a, ty, false) as u64, extend(b, ty, false) as u64);
+    match op {
+        Binary::Ishl => Some(a << count),
+        Binary::Ushr => Some((ua >> count) as i64),
+        Binary::Sshr => Some(sa >> count),
+        Binary::Rotl => Some(rotate(ty, ua, count)),
+        Binary::Rotr => Some(rotate(ty, ua, bits - count)),
+        Binary::Smin => Some(sa.min(sb)),
+        Binary::Smax => Some(sa.max(sb)),
+        Binary::Umulhi => Some((u128::from(ua) * u128::from(ub) >> bits) as i64),
+        Binary::Smulhi => Some((i128::from(sa) * i128::from(sb) >> bits) as i64),
+        Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem => divide(op, ty, a, b),
+        _ => None,
+    }
+}
+
+/// The low bits of `value` of type `ty` rotated left by `left` modulo the width.
+fn rotate(ty: Type, value: u64, left: u32) -> i64 {
+    match ty {
+        Type::I8 => i64::from((value as u8).rotate_left(left)),
+        Type::I16 => i64::from((value as u16).rotate_left(left)),
+        Type::I32 => i64::from((value as u32).rotate_left(left)),
+        _ => value.rotate_left(left) as i64,
+    }
+}
+
+/// `a / b` or `a % b` on constants of type `ty`, or `None` when `b` is zero or the operation is the signed minimum by -1, where the machine traps.
+fn divide(op: Binary, ty: Type, a: i64, b: i64) -> Option<i64> {
+    let signed = matches!(op, Binary::Sdiv | Binary::Srem);
+    let (x, y) = (extend(a, ty, signed), extend(b, ty, signed));
+    if y == 0 || (signed && y == -1 && x == -1_i64 << (ty.bits() - 1)) {
+        return None;
+    }
+    Some(match op {
+        Binary::Sdiv => x / y,
+        Binary::Srem => x % y,
+        Binary::Udiv => (x as u64 / y as u64) as i64,
+        _ => (x as u64 % y as u64) as i64,
+    })
+}
+
+/// `op` of the constant `a` of type `ty`, counting bits at that width.
+fn unary(op: Unary, ty: Type, a: i64) -> Option<i64> {
+    let bits = ty.bits();
+    let unused = 64 - bits;
+    let value = extend(a, ty, false) as u64;
+    match op {
+        Unary::Ineg => Some(a.wrapping_neg()),
+        Unary::Bnot => Some(!a),
+        Unary::Bswap => Some((value.swap_bytes() >> unused) as i64),
+        Unary::Bitrev => Some((value.reverse_bits() >> unused) as i64),
+        Unary::Clz => Some(i64::from(value.leading_zeros() - unused)),
+        Unary::Ctz => Some(i64::from(value.trailing_zeros().min(bits))),
+        Unary::Popcnt => Some(i64::from(value.count_ones())),
+        _ => None,
+    }
+}
+
+/// The constant that leaves the left operand of `op` unchanged when it stands on the right.
+fn unit(op: Binary) -> Option<i64> {
+    match op {
+        Binary::Iadd | Binary::Isub | Binary::Bor | Binary::Bxor => Some(0),
+        Binary::Imul => Some(1),
+        Binary::Band => Some(-1),
+        _ => None,
+    }
+}
+
 /// Whether `x op y` on constants of type `ty` fits that type, read as signed when `signed`.
 pub(crate) fn fits(op: Binary, signed: bool, ty: Type, (x, y): (i64, i64)) -> Option<bool> {
     let widen = |value: i64| if signed { i128::from(extend(value, ty, true)) } else { i128::from(extend(value, ty, false) as u64) };
@@ -67,6 +143,7 @@ struct Fold {
     subst: Vec<Value>,
     incoming: Vec<Option<Value>>,
     mixed: Vec<bool>,
+    defs: Vec<Option<Inst>>,
 }
 
 impl Fold {
@@ -86,7 +163,7 @@ impl Fold {
     }
 
     fn evaluate(&self, func: &Function, op: &Op) -> Option<i64> {
-        let (Op::Binary(_, x, _) | Op::Icmp(_, x, _) | Op::Convert(_, x) | Op::Fits(_, _, x, _)) = *op else {
+        let (Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) | Op::Convert(_, x) | Op::Fits(_, _, x, _)) = *op else {
             return if let Op::Const(imm) = *op { Some(imm) } else { None };
         };
         let ty = func.ty(x);
@@ -94,7 +171,8 @@ impl Fold {
             return None;
         }
         match *op {
-            Op::Binary(op, x, y) => self.both(x, y).and_then(|(a, b)| constant(op, a, b)),
+            Op::Unary(op, x) => unary(op, ty, self.known(x)?),
+            Op::Binary(op, x, y) => self.both(x, y).and_then(|(a, b)| binary(op, ty, a, b)).or_else(|| self.absorbed(op, ty, x, y)),
             Op::Icmp(cc, x, y) => self.both(x, y).map(|(a, b)| i64::from(holds(cc, ty, a, b))),
             Op::Convert(Convert::Uextend | Convert::Ireduce, x) => Some(extend(self.known(x)?, ty, false)),
             Op::Convert(Convert::Sextend, x) => Some(extend(self.known(x)?, ty, true)),
@@ -103,27 +181,91 @@ impl Fold {
         }
     }
 
-    /// Finds, in one pass in block order, the small integers that are constants and the selects whose condition is one.
+    /// The constant `x op y` of type `ty` gives whatever one operand holds: a product, high product or mask with zero, or the difference or xor of a value with itself.
+    fn absorbed(&self, op: Binary, ty: Type, x: Value, y: Value) -> Option<i64> {
+        let zero = |value: Value| self.known(value).is_some_and(|imm| extend(imm, ty, false) == 0);
+        match op {
+            Binary::Imul | Binary::Umulhi | Binary::Smulhi | Binary::Band if zero(x) || zero(y) => Some(0),
+            Binary::Isub | Binary::Bxor if self.find(x) == self.find(y) => Some(0),
+            _ => None,
+        }
+    }
+
+    /// The operation of the instruction that defines `value`, when one in a block does.
+    fn def<'a>(&self, func: &'a Function, value: Value) -> Option<&'a Op> {
+        self.defs[self.find(value).index()].map(|inst| &func.insts[inst.index()].op)
+    }
+
+    /// Whether `value` is 0 or 1 in its low byte because a comparison or overflow check defines it.
+    fn boolean(&self, func: &Function, value: Value) -> bool {
+        matches!(self.def(func, value), Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..)))
+    }
+
+    /// Whether `x` and `y` of type `ty` hold the same bits at that width.
+    fn same(&self, ty: Type, x: Value, y: Value) -> bool {
+        self.find(x) == self.find(y) || matches!(self.both(x, y), Some((a, b)) if extend(a, ty, false) == extend(b, ty, false))
+    }
+
+    /// The existing value the result of `op` always equals, when there is one.
+    fn identity(&self, func: &Function, op: &Op) -> Option<Value> {
+        match *op {
+            Op::Select(condition, x, y) => self.known(condition).map(|known| if known != 0 { x } else { y }),
+            Op::Binary(kind, x, y) if small_int(func.ty(x)) => self.neutral(kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
+            Op::Unary(kind @ (Unary::Ineg | Unary::Bnot), x) => match *self.def(func, x)? {
+                Op::Unary(inner, value) if inner == kind => Some(value),
+                _ => None,
+            },
+            Op::Icmp(cc, x, y) if self.boolean(func, x) => {
+                let imm = extend(self.known(y)?, func.ty(x), false);
+                matches!((cc, imm), (IntCC::NotEqual, 0) | (IntCC::Equal, 1)).then_some(x)
+            }
+            _ => None,
+        }
+    }
+
+    /// `x` when `y` is the unit of `op` at type `ty` or a shift count that masks to zero, or `y` when `x` is the unit of a commuting `op`.
+    fn neutral(&self, op: Binary, ty: Type, x: Value, y: Value) -> Option<Value> {
+        let is = |value: Value, want: i64| self.known(value).is_some_and(|imm| extend(imm, ty, false) == extend(want, ty, false));
+        if let Some(unit) = unit(op) {
+            if is(y, unit) {
+                return Some(x);
+            }
+            return (op != Binary::Isub && is(x, unit)).then_some(y);
+        }
+        let shift = matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr);
+        (shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0)).then_some(x)
+    }
+
+    /// `a` when `x ^ y` is `(a ^ c) ^ c` in either order of either xor.
+    fn cancel(&self, func: &Function, op: Binary, x: Value, y: Value) -> Option<Value> {
+        if op != Binary::Bxor {
+            return None;
+        }
+        let ty = func.ty(x);
+        [(x, y), (y, x)].into_iter().find_map(|(inner, other)| match *self.def(func, inner)? {
+            Op::Binary(Binary::Bxor, a, b) if self.same(ty, b, other) => Some(a),
+            Op::Binary(Binary::Bxor, a, b) if self.same(ty, a, other) => Some(b),
+            _ => None,
+        })
+    }
+
+    /// Finds, in one pass in block order, the small integers that are constants, wrapped to their type, and the results that equal an existing value.
     fn constants(&mut self, func: &Function) {
         for inst in func.blocks.iter().flat_map(|block| &block.insts) {
             let data = &func.insts[inst.index()];
-            let Some(result) = data.result.filter(|result| self.subst[result.index()] == *result) else { continue };
-            if let Op::Select(condition, x, y) = data.op
-                && let Some(known) = self.known(condition)
-            {
-                self.subst[result.index()] = if known != 0 { x } else { y };
-                continue;
-            }
-            if self.consts[result.index()].is_none()
-                && small_int(func.ty(result))
+            let Some(result) = data.result.filter(|result| self.subst[result.index()] == *result && self.consts[result.index()].is_none()) else { continue };
+            let ty = func.ty(result);
+            if small_int(ty)
                 && let Some(imm) = self.evaluate(func, &data.op)
             {
-                self.consts[result.index()] = Some(imm);
+                self.consts[result.index()] = Some(extend(imm, ty, true));
+            } else if let Some(value) = self.identity(func, &data.op) {
+                self.subst[result.index()] = value;
             }
         }
     }
 
-    /// Turns branches on constants into jumps and drops traps that cannot fire.
+    /// Turns the branches `decide` settles into jumps and drops traps that cannot fire.
     fn branches(&self, func: &mut Function) -> bool {
         let mut changed = false;
         for block in 0..func.blocks.len() {
@@ -131,16 +273,23 @@ impl Fold {
             func.blocks[block].insts.retain(|inst| !matches!(func.insts[inst.index()].op, Op::Trapz(x) if self.known(x).is_some_and(|known| known != 0)));
             changed |= func.blocks[block].insts.len() != before;
             let Some(&last) = func.blocks[block].insts.last() else { continue };
-            let op = &mut func.insts[last.index()].op;
-            if let Op::Brif(condition, then, then_args, otherwise, else_args) = op
-                && let Some(known) = self.known(*condition)
-            {
-                let (target, args) = if known != 0 { (*then, std::mem::take(then_args)) } else { (*otherwise, std::mem::take(else_args)) };
-                *op = Op::Jump(target, args);
-                changed = true;
-            }
+            changed |= self.decide(&mut func.insts[last.index()].op);
         }
         changed
+    }
+
+    /// Turns `op` into a jump when it branches on a constant or sends both edges to the same block with the same arguments.
+    fn decide(&self, op: &mut Op) -> bool {
+        let Op::Brif(condition, then, then_args, otherwise, else_args) = op else { return false };
+        let same = then == otherwise && then_args.len() == else_args.len() && then_args.iter().zip(else_args.iter()).all(|(a, b)| self.find(*a) == self.find(*b));
+        let taken = match self.known(*condition) {
+            Some(known) => known != 0,
+            None if same => true,
+            None => return false,
+        };
+        let (target, args) = if taken { (*then, std::mem::take(then_args)) } else { (*otherwise, std::mem::take(else_args)) };
+        *op = Op::Jump(target, args);
+        true
     }
 
     /// Sends each edge that passes a constant to a block holding only a branch on that parameter straight to the target the branch takes.
@@ -320,7 +469,6 @@ fn pure(op: &Op) -> bool {
     matches!(op, Op::Const(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
 }
 
-/// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
 /// How many times the instructions in blocks read each value.
 fn use_counts(func: &Function) -> Vec<u32> {
     let mut uses = vec![0_u32; func.types.len()];
@@ -330,6 +478,29 @@ fn use_counts(func: &Function) -> Vec<u32> {
     uses
 }
 
+/// The instruction in a block that defines each value.
+fn defs(func: &Function) -> Vec<Option<Inst>> {
+    let mut defs = vec![None; func.types.len()];
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        if let Some(result) = func.insts[inst.index()].result {
+            defs[result.index()] = Some(inst);
+        }
+    }
+    defs
+}
+
+/// Empties the blocks no path from `entry` reaches and returns which blocks a path reaches.
+fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
+    let reachable = reachable(func, entry);
+    for (block, live) in func.blocks.iter_mut().zip(&reachable) {
+        if !live && !block.insts.is_empty() {
+            block.insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
+        }
+    }
+    reachable
+}
+
+/// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
 fn dead(func: &mut Function) {
     let mut uses = use_counts(func);
     for block in func.blocks.iter_mut().rev() {
@@ -349,23 +520,19 @@ fn dead(func: &mut Function) {
     }
 }
 
-/// Folds constants and branches on them, empties blocks no path reaches, replaces block parameters every edge agrees on, and drops dead pure instructions.
+/// Folds constants, identities and branches on them, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump.
 pub(crate) fn run(func: &mut Function) {
     let Some(entry) = func.entry else { return };
     let count = func.types.len();
-    let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: vec![None; count], mixed: vec![false; count] };
+    let defs = defs(func);
+    let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: vec![None; count], mixed: vec![false; count], defs };
     let pinned = pinned(func, entry);
     let mut reachable = Vec::new();
     loop {
         fold.constants(func);
         let branched = fold.branches(func) | fold.thread(func, &pinned);
         if branched || reachable.is_empty() {
-            reachable = self::reachable(func, entry);
-            for (block, live) in func.blocks.iter_mut().zip(&reachable) {
-                if !live && !block.insts.is_empty() {
-                    block.insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
-                }
-            }
+            reachable = prune(func, entry);
         }
         let replaced = fold.params(func, &reachable, &pinned);
         if !branched && !replaced {
@@ -384,9 +551,24 @@ pub(crate) fn run(func: &mut Function) {
     }
     invert(func);
     dead(func);
+    if fold.thread(func, &pinned) | fold.branches(func) {
+        prune(func, entry);
+        dead(func);
+    }
 }
 
-/// Rewrites `x ^ 1` of a compare `x` as the inverse compare, so a negated condition branches on the flags, and a branch on `x == 0` or `x != 0` as a branch on `x`.
+/// The value `op` negates when the constants make it `v ^ 1`, `1 ^ v`, `v == 0` or `v != 1`.
+fn negated(op: &Op, consts: &[Option<i64>]) -> Option<Value> {
+    let is = |value: Value, want: i64| consts[value.index()] == Some(want);
+    match *op {
+        Op::Binary(Binary::Bxor, x, y) | Op::Icmp(IntCC::NotEqual, x, y) if is(y, 1) => Some(x),
+        Op::Binary(Binary::Bxor, y, x) if is(y, 1) => Some(x),
+        Op::Icmp(IntCC::Equal, x, y) if is(y, 0) => Some(x),
+        _ => None,
+    }
+}
+
+/// Rewrites a negation of a compare, `x ^ 1`, `x == 0` or `x != 1`, as the inverse compare, so a negated condition branches on the flags, and a branch on `x == 0` or `x != 0` as a branch on `x`.
 fn invert(func: &mut Function) {
     let count = func.types.len();
     let (mut compares, mut consts) = (vec![None; count], vec![None; count]);
@@ -401,27 +583,21 @@ fn invert(func: &mut Function) {
     let types = func.types.clone();
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         let op = &mut func.insts[inst.index()].op;
-        match op {
-            Op::Binary(Binary::Bxor, x, y) => {
-                let compare = if consts[y.index()] == Some(1) { compares[x.index()] } else if consts[x.index()] == Some(1) { compares[y.index()] } else { None };
-                if let Some((cc, a, b)) = compare {
-                    *op = Op::Icmp(cc.inverse(), a, b);
-                }
-            }
-            Op::Brif(condition, then, then_args, otherwise, else_args) => {
-                let Some((cc, x, y)) = compares[condition.index()] else { continue };
-                if consts[y.index()] != Some(0) || !small_int(types[x.index()]) {
-                    continue;
-                }
-                match cc {
-                    IntCC::NotEqual => *condition = x,
-                    IntCC::Equal => {
-                        *condition = x;
-                        std::mem::swap(then, otherwise);
-                        std::mem::swap(then_args, else_args);
-                    }
-                    _ => {}
-                }
+        if let Some((cc, a, b)) = negated(op, &consts).and_then(|value| compares[value.index()]) {
+            *op = Op::Icmp(cc.inverse(), a, b);
+            continue;
+        }
+        let Op::Brif(condition, then, then_args, otherwise, else_args) = op else { continue };
+        let Some((cc, x, y)) = compares[condition.index()] else { continue };
+        if consts[y.index()] != Some(0) || !small_int(types[x.index()]) {
+            continue;
+        }
+        match cc {
+            IntCC::NotEqual => *condition = x,
+            IntCC::Equal => {
+                *condition = x;
+                std::mem::swap(then, otherwise);
+                std::mem::swap(then_args, else_args);
             }
             _ => {}
         }

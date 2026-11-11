@@ -1,5 +1,6 @@
 mod asm;
 mod atomic;
+mod features;
 mod float;
 mod frame;
 mod location;
@@ -7,6 +8,7 @@ mod int;
 mod wide;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
+use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{Location, Plan, Regs, plan};
 use crate::frame::{Frame, layout, saved};
@@ -16,10 +18,16 @@ use crate::{Code, Site};
 
 const PAGE: u32 = 4096;
 const INCOMING: i32 = 16;
-const MOVSD: (&[u8], &[u8], &[u8]) = (&[0xF2], &[0x0F, 0x10], &[0x0F, 0x11]);
 
-/// The registers planning hands out: the saved pool, and caller-saved registers the emitter never uses as scratch.
-const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg::Rdi, Reg::R9, Reg::R8, Reg::R10], wide_scratch: &wide::WIDE_SCRATCH, absolute_calls: true };
+/// The registers planning hands out: the saved pool, caller-saved registers the emitter never uses as scratch, and the float pool.
+const REGS: Regs<Reg> = Regs {
+    saved: &SAVED,
+    leaf: &[Reg::Rdi, Reg::R9, Reg::R8, Reg::R10],
+    wide_scratch: &wide::WIDE_SCRATCH,
+    float: &float::POOL,
+    float_branches: &float::BRANCHES,
+    absolute_calls: true,
+};
 
 /// Encodes `func` as x86-64 machine code.
 pub(crate) fn compile(func: &Function) -> Result<Code, String> {
@@ -29,7 +37,7 @@ pub(crate) fn compile(func: &Function) -> Result<Code, String> {
     let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, classify)?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), plan, flags: None, next: None }.run(order)
+    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), plan, flags: None, next: None, features: Features::host() }.run(order)
 }
 
 fn save_slot(index: usize) -> Mem {
@@ -52,6 +60,7 @@ pub(super) struct Emit<'a> {
     plan: Plan<Reg>,
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
+    features: Features,
 }
 
 impl Emit<'_> {
@@ -103,14 +112,6 @@ impl Emit<'_> {
         self.asm.bytes(&[0x0F, 0x0B]);
     }
 
-    fn movsd_load(&mut self, xmm: Xmm, from: Mem) {
-        self.asm.sse(MOVSD.0, MOVSD.1, xmm.0, from);
-    }
-
-    fn movsd_store(&mut self, to: Mem, xmm: Xmm) {
-        self.asm.sse(MOVSD.0, MOVSD.2, xmm.0, to);
-    }
-
     fn prologue(&mut self) {
         self.asm.push(Reg::Rbp);
         self.asm.mov(Reg::Rbp, Reg::Rsp);
@@ -145,22 +146,20 @@ impl Emit<'_> {
         self.asm.bytes(&[0xC9, 0xC3]);
     }
 
+    /// Moves the entry parameters to their locations, those in memory first, so each reads its arrival register before a register location overwrites it.
     fn intake(&mut self, entry: Block) -> Result<(), String> {
-        let params = self.func.blocks[entry.index()].params.clone();
-        for (value, loc) in params.into_iter().zip(self.abi.params.clone()) {
+        let func = self.func;
+        let params = func.blocks[entry.index()].params.iter().copied().zip(self.abi.params.clone());
+        let (registers, memory): (Vec<_>, Vec<_>) = params.partition(|(value, _)| self.reg_of(*value).is_some() || self.xmm_of(*value).is_some());
+        for (value, loc) in memory.into_iter().chain(registers) {
             let incoming = |offset: u32| Mem::new(Reg::Rbp, INCOMING + offset as i32);
             match loc {
-                Loc::Int(reg) => self.put(value, reg),
-                Loc::Pair(low, high) => {
-                    self.put(value, low);
-                    self.put_high(value, high);
-                }
-                Loc::Float(xmm) => self.movsd_store(self.at(value), Xmm(xmm)),
                 Loc::Stack(offset) => self.load_home(value, incoming(offset)),
                 Loc::Struct(offset, _) => {
                     self.asm.lea(Reg::Rax, incoming(offset));
                     self.put(value, Reg::Rax);
                 }
+                _ => self.store_loc(value, loc),
             }
         }
         Ok(())
@@ -249,13 +248,14 @@ impl Emit<'_> {
 
     /// Whether `a` and `b` live in the same place, so writing one overwrites the other.
     fn same_home(&self, a: Value, b: Value) -> bool {
-        a == b || matches!((self.plan.locations[a.index()], self.plan.locations[b.index()]), (Location::Reg(x), Location::Reg(y)) if x == y)
+        a == b || (self.reg_of(a).is_some() && self.reg_of(a) == self.reg_of(b)) || (self.xmm_of(a).is_some() && self.xmm_of(a) == self.xmm_of(b))
     }
 
     /// Writes `value` into the location of `param`.
     fn assign(&mut self, param: Value, value: Value) {
         match self.plan.locations[param.index()] {
             Location::Reg(reg) => self.raw(reg, value),
+            Location::Float(xmm) => self.fget(Xmm(xmm), value),
             _ => self.move_to(self.at(param), value),
         }
     }
@@ -264,6 +264,7 @@ impl Emit<'_> {
     fn load_home(&mut self, value: Value, from: Mem) {
         match self.plan.locations[value.index()] {
             Location::Reg(reg) => self.asm.load(Size::Q, reg, from),
+            Location::Float(xmm) => self.xmm_load(self.ty(value), Xmm(xmm), from),
             _ => self.copy_to(self.at(value), from, self.ty(value)),
         }
     }
@@ -374,7 +375,7 @@ impl Emit<'_> {
                 self.raw(low, value);
                 self.high(high, value);
             }
-            Loc::Float(xmm) => self.movsd_load(Xmm(xmm), self.at(value)),
+            Loc::Float(xmm) => self.fget(Xmm(xmm), value),
             Loc::Stack(_) | Loc::Struct(..) => {}
         }
     }
@@ -386,7 +387,7 @@ impl Emit<'_> {
                 self.put(value, low);
                 self.put_high(value, high);
             }
-            Loc::Float(xmm) => self.movsd_store(self.at(value), Xmm(xmm)),
+            Loc::Float(xmm) => self.fput(value, Xmm(xmm)),
             Loc::Stack(_) | Loc::Struct(..) => {}
         }
     }

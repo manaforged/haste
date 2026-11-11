@@ -5,7 +5,7 @@ use crate::body::{Expr, ExprId, List, UnOp};
 use crate::sema::infer::{Adjust, Coercion, Res};
 use crate::sema::ty::{Kind, Ty};
 
-use super::{Lower, Repr, repr};
+use super::{Lower, Parts, Repr, repr};
 
 /// Where a place's bytes start: a frame slot, or an address held in a value.
 #[derive(Clone, Copy, Debug)]
@@ -55,9 +55,9 @@ impl Lower<'_, '_> {
             (Repr::Scalar(_), Base::Addr(addr)) => {
                 self.ins().store(value, addr, place.offset);
             }
-            (Repr::Mem { size, .. }, _) => {
+            (Repr::Mem { .. }, _) => {
                 let to = self.address(place);
-                self.copy(to, value, size);
+                self.copy(to, value, place.repr);
             }
         }
     }
@@ -143,8 +143,20 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// Copies `size` bytes from address `from` to address `to`.
-    pub fn copy(&mut self, to: Value, from: Value, size: u32) {
+    /// Copies a value of `repr` from address `from` to address `to`: scalar by scalar at the widths and offsets its layout names, else every byte in the widest words.
+    pub fn copy(&mut self, to: Value, from: Value, repr: Repr) {
+        let (size, parts) = match repr {
+            Repr::Zst => return,
+            Repr::Scalar(ty) => (ty.bytes(), Parts::One(ty)),
+            Repr::Mem { size, parts, .. } => (size, parts),
+        };
+        if parts != Parts::Bytes {
+            for (ty, at) in parts.scalars() {
+                let part = self.ins().load(ty, from, at);
+                self.ins().store(part, to, at);
+            }
+            return;
+        }
         let mut at = 0;
         for (ty, step) in [(Type::I64, 8), (Type::I32, 4), (Type::I16, 2), (Type::I8, 1)] {
             while size - at >= step {

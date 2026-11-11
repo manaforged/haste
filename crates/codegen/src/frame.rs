@@ -84,7 +84,7 @@ pub(crate) fn layout<R>(func: &Function, saves: Vec<R>, locations: &[Location<R>
     let mut cursor = saves.len() as u32 * WORD;
     let mut values = Vec::with_capacity(func.types.len());
     for (value, ty) in func.types.iter().enumerate() {
-        if !present[value] || matches!(locations[value], Location::Reg(_)) {
+        if !present[value] || matches!(locations[value], Location::Reg(_) | Location::Float(_)) {
             values.push(0);
             continue;
         }
