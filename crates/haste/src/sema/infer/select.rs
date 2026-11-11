@@ -167,8 +167,53 @@ impl<'a> Infer<'_, 'a> {
             let implied = self.implied_traits(direct.clone())?;
             facts.push(Specialty { default: self.cx.specializable(*block), direct, implied });
         }
-        let kept = (0..found.len()).map(|at| !facts.iter().enumerate().any(|(by, other)| by != at && other.specializes(&facts[at])));
-        Ok(found.into_iter().zip(kept.collect::<Vec<_>>()).filter_map(|(entry, keep)| keep.then_some(entry)).collect())
+        let blocks: Vec<ImplRef> = found.iter().map(|((block, _), _)| *block).collect();
+        let mut kept = Vec::new();
+        for at in 0..found.len() {
+            kept.push(!self.specialized(&blocks, &facts, at)?);
+        }
+        Ok(found.into_iter().zip(kept).filter_map(|(entry, keep)| keep.then_some(entry)).collect())
+    }
+
+    /// Whether another impl in `blocks` specializes impl `at`: its specialty ranks above, and its header is an instance of the header of `at`.
+    fn specialized(&mut self, blocks: &[ImplRef], facts: &[Specialty], at: usize) -> Result<bool> {
+        for (by, (&block, fact)) in blocks.iter().zip(facts).enumerate() {
+            if by != at && fact.specializes(&facts[at]) && self.instance_of(block, blocks[at])? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the header of impl `special`, its self type and trait arguments, is an instance of the header of impl `general`: some arguments of `general` make it equal while every type parameter of `special` stays distinct and unbound, as rustc requires of an impl that specializes another.
+    fn instance_of(&mut self, special: ImplRef, general: ImplRef) -> Result<bool> {
+        let deferred = (self.projections.len(), self.obligations.len());
+        let found: Result<bool> = self.probe(|infer| {
+            let (params, own) = infer.fresh_header(special)?;
+            let (_, other) = infer.fresh_header(general)?;
+            let unified = own.len() == other.len() && own.iter().zip(&other).all(|(&a, &b)| infer.unifies(a, b));
+            let roots: Vec<Ty> = params.iter().map(|&param| infer.resolve(param)).collect();
+            let rigid = roots.iter().enumerate().all(|(at, root)| matches!(infer.cx.types.kind(*root), Kind::Var(_)) && !roots[..at].contains(root));
+            Ok(unified && rigid)
+        });
+        self.projections.truncate(deferred.0);
+        self.obligations.truncate(deferred.1);
+        found
+    }
+
+    /// Fresh type arguments for impl `block`, with its self type and then its trait arguments at them.
+    fn fresh_header(&mut self, block: ImplRef) -> Result<(Vec<Ty>, Vec<Ty>)> {
+        let (args, self_ty) = self.fresh_impl(block)?;
+        let header = std::iter::once(self_ty).chain(self.impl_trait_args(block, &args, self_ty)?).collect();
+        Ok((args, header))
+    }
+
+    /// Fresh type arguments for impl `block`, with its self type at them.
+    fn fresh_impl(&mut self, block: ImplRef) -> Result<(Vec<Ty>, Ty)> {
+        let count = self.impl_params(block)?;
+        let args: Vec<Ty> = (0..count).map(|_| self.fresh(Kind::Var)).collect();
+        let (_, self_ty) = self.impl_frame(block, &args)?;
+        Ok((args, self_ty))
     }
 
     fn impl_bound_traits(&mut self, block: ImplRef, impl_args: &[Ty]) -> Result<Vec<ItemRef>> {
@@ -192,9 +237,7 @@ impl<'a> Infer<'_, 'a> {
         Ok(found)
     }
     fn blanket(&mut self, block: ImplRef) -> Result<bool> {
-        let count = self.impl_params(block)?;
-        let args: Vec<Ty> = (0..count).map(|_| self.fresh(Kind::Var)).collect();
-        let (_, self_ty) = self.impl_frame(block, &args)?;
+        let (args, self_ty) = self.fresh_impl(block)?;
         Ok(args.contains(&self_ty))
     }
 
