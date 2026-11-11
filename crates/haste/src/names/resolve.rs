@@ -180,7 +180,7 @@ pub fn macro_at(paths: &Paths<'_>, src: &Source, (start, name): (u32, u32), at: 
 pub fn macro_path(paths: &Paths<'_>, path: &Path<'_>, at: ModRef) -> Option<ItemRef> {
     let (last, prefix) = path.segments.split_last()?;
     let binding = if prefix.is_empty() {
-        paths.first(*last, at, path).macros?
+        paths.first(*last, at, path).macros.or_else(|| paths.macro_use(*last))?
     } else {
         let owner = paths.resolve(&Path { segments: prefix, ..*path }, at)?;
         let found = paths.member(owner, *last).macros;
@@ -196,19 +196,7 @@ pub fn macro_path(paths: &Paths<'_>, path: &Path<'_>, at: ModRef) -> Option<Item
 }
 
 pub(super) fn paths_of<'a>(names: &'a Names, outline: &'a Outline, krate: usize, demands: &'a Requests) -> Paths<'a> {
-    let entry = &names.crates[krate];
-    Paths {
-        krate: krate as u32,
-        trees: &outline.crates,
-        done: &names.crates,
-        scopes: &entry.scopes,
-        deps: &entry.deps,
-        edition_2015: entry.edition_2015,
-        prelude: entry.prelude,
-        externs: &entry.externs,
-        symbols: &names.symbols,
-        demands: Some(demands),
-    }
+    Paths { demands: Some(demands), ..names.paths(outline, krate as u32) }
 }
 
 fn declared(outline: &Outline, krate: usize) -> impl Iterator<Item = ModRef> + '_ {
