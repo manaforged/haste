@@ -7,10 +7,10 @@ use super::fragment;
 use super::rules::{Frag, Meta, Op, Piece, Rule};
 use super::source::{Mark, Source, Tokens, opens};
 
-/// What a metavariable matched: a token range of the input, grouped when it is a compound expression, or one binding per repetition.
+/// What a metavariable matched: a token range of the input and its fragment kind, or one binding per repetition.
 #[derive(Clone, Debug)]
 pub enum Bind {
-    One(u32, u32, bool),
+    One(u32, u32, Frag),
     Many(Vec<Bind>),
 }
 
@@ -46,6 +46,16 @@ impl Matcher<'_> {
     }
 
     fn piece(&self, piece: &Piece, at: u32, end: u32, binds: &mut Binds) -> Option<u32> {
+        if let Some(to) = self.input.opaque_end(at).filter(|_| at < end) {
+            match piece {
+                Piece::Token(_) | Piece::Group(..) | Piece::Var(_, Some(Frag::Ident | Frag::Lifetime)) => return None,
+                Piece::Var(name, Some(Frag::Tt)) => {
+                    binds.insert(self.def.text(*name).to_owned(), Bind::One(at, to, Frag::Tt));
+                    return Some(to);
+                }
+                _ => {}
+            }
+        }
         match piece {
             Piece::Token(token) => (at < end && self.input.text(at) == self.def.text(*token)).then_some(at + 1),
             Piece::Group(open, inner) => {
@@ -57,8 +67,7 @@ impl Matcher<'_> {
             }
             Piece::Var(name, Some(frag)) => {
                 let to = fragment::extent(self.input, *frag, at, end)?;
-                let grouped = *frag == Frag::Expr && fragment::tree(self.input, at) != to;
-                binds.insert(self.def.text(*name).to_owned(), Bind::One(at, to, grouped));
+                binds.insert(self.def.text(*name).to_owned(), Bind::One(at, to, *frag));
                 Some(to)
             }
             Piece::Var(_, None) | Piece::Crate | Piece::CratePath | Piece::Meta(_) => None,
@@ -163,13 +172,18 @@ impl Writer<'_> {
 
     fn var(&mut self, name: u32, rounds: &[usize]) -> Result<()> {
         match lookup(&self.binds, self.def.text(name), rounds) {
-            Some(&Bind::One(from, to, grouped)) => {
+            Some(&Bind::One(from, to, frag)) => {
+                let grouped = frag == Frag::Expr && fragment::tree(self.input, from) != to;
+                let start = self.out.len();
                 if grouped {
                     self.out.lexed("(");
                 }
                 (from..to).for_each(|at| self.out.copy(self.input, at));
                 if grouped {
                     self.out.lexed(")");
+                }
+                if !matches!(frag, Frag::Tt | Frag::Ident | Frag::Lifetime | Frag::Literal | Frag::Vis) {
+                    self.out.opaque_from(start);
                 }
                 self.out.space();
             }

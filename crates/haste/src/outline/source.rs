@@ -43,6 +43,8 @@ pub struct Source {
     pub text: String,
     pub tokens: Vec<Token>,
     pub marks: Vec<(u32, Mark)>,
+    /// The token ranges, by index in this layer, that a macro wrote from an expression-like fragment, which later macros match only as a whole.
+    pub opaque: Vec<(u32, u32)>,
     pub base: Option<Arc<File>>,
     pub offset: u32,
     /// The tokens that each macro call in type position writes, by the token that opens its group.
@@ -76,6 +78,7 @@ pub struct Tokens {
     text: String,
     tokens: Vec<Token>,
     marks: Vec<(u32, Mark)>,
+    opaque: Vec<(u32, u32)>,
 }
 
 fn is_punct_kind(kind: TokenKind) -> bool {
@@ -151,7 +154,7 @@ impl Tokens {
     pub fn finish(self, path: PathBuf) -> Result<Source> {
         let mut tokens = self.tokens;
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text: self.text, tokens, marks: self.marks, base: None, offset: 0, outputs: Outputs::default() })
+        Ok(Source { path, text: self.text, tokens, marks: self.marks, opaque: self.opaque, base: None, offset: 0, outputs: Outputs::default() })
     }
 
     /// The written tokens laid after every token of `base`, so that the indices of `base` still name its tokens.
@@ -168,6 +171,13 @@ impl Tokens {
     /// The number of tokens written so far.
     pub fn len(&self) -> u32 {
         self.tokens.len() as u32
+    }
+
+    /// Marks the tokens written since `from` as one opaque fragment.
+    pub fn opaque_from(&mut self, from: u32) {
+        if from < self.len() {
+            self.opaque.push((from, self.len()));
+        }
     }
 }
 
@@ -290,7 +300,7 @@ impl Source {
         let mut text = text;
         let mut tokens = lex(&mut text);
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text, tokens, marks: Vec::new(), base: None, offset: 0, outputs: Outputs::default() })
+        Ok(Source { path, text, tokens, marks: Vec::new(), opaque: Vec::new(), base: None, offset: 0, outputs: Outputs::default() })
     }
 
     #[inline]
@@ -406,6 +416,13 @@ impl Source {
     pub fn mark(&self, at: u32) -> Option<Mark> {
         let (src, local) = self.layer(at);
         src.own_mark(local as u32)
+    }
+
+    /// The end of the opaque fragment that starts at token `at`, if one does.
+    pub fn opaque_end(&self, at: u32) -> Option<u32> {
+        let (src, local) = self.layer(at);
+        let found = src.opaque.binary_search_by_key(&(local as u32), |&(start, _)| start).ok()?;
+        Some(src.opaque[found].1 + (at - local as u32))
     }
 
     fn own_mark(&self, local: u32) -> Option<Mark> {
