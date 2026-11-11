@@ -91,6 +91,12 @@ fn signed(value: u128, bits: u32) -> i128 {
     ((value << shift) as i128) >> shift
 }
 
+/// `value` of type `from` read as type `to`, as an `as` cast does.
+fn convert(value: u128, from: Int, to: Int) -> u128 {
+    let value = if from.1 { signed(value, from.0) as u128 } else { value };
+    value & mask(to.0)
+}
+
 fn fold(op: BinOp, x: u128, y: u128, (bits, is_signed): Int) -> Result<u128> {
     if matches!(op, BinOp::Div | BinOp::Rem) && y == 0 {
         bail!("a division by zero in a constant");
@@ -143,9 +149,25 @@ impl Infer<'_, '_> {
     fn with_const_body<T>(&mut self, item: ItemRef, substs: &[Ty], run: impl FnOnce(&mut Self, &Body, ExprId) -> Result<T>) -> Result<T> {
         let body = self.cx.body(item)?;
         let Some(root) = body.root else { bail!("{} has no value to evaluate", self.cx.name(item)) };
+        self.with_item_frame(item, substs, |infer| run(infer, &body, root))
+    }
+
+    fn with_item_frame<T>(&mut self, item: ItemRef, substs: &[Ty], run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let mut frame = self.frame(item, substs)?;
         (frame.src, frame.root) = (self.cx.body_src(item), Some(item.body_owner()));
-        self.with_frame(frame, |infer| run(infer, &body, root))
+        self.with_frame(frame, run)
+    }
+
+    /// The integer type of each parameter of the const fn `item` at `substs`, or `want` for one that is not an integer.
+    fn const_params(&mut self, item: ItemRef, substs: &[Ty], want: Int) -> Result<Vec<Int>> {
+        let sig = self.cx.signature(item)?;
+        self.with_item_frame(item, substs, |infer| {
+            let lowered: Result<Vec<Ty>> = sig.params.iter().map(|&(_, ty)| infer.lower_ty(&sig.body, ty)).collect();
+            Ok(lowered?.into_iter().map(|ty| match *infer.cx.types.kind(ty) {
+                Kind::Prim(primitive) => int_info(primitive).unwrap_or(want),
+                _ => want,
+            }).collect())
+        })
     }
 
     fn variant_value(&mut self, item: ItemRef, index: u32) -> Result<(u128, Int)> {
@@ -224,6 +246,15 @@ impl Infer<'_, '_> {
         }
     }
 
+    /// Whether `expr` is an integer literal with no suffix, perhaps negated or in parentheses, whose type the other operand decides.
+    fn plain_int(&self, arena: &Body, expr: ExprId) -> bool {
+        match *arena.expr(expr) {
+            Expr::Lit(Lit::Int, at) => parse_int(self.src.text(at)).is_ok_and(|(_, suffix)| suffix.is_none()),
+            Expr::Paren(inner) | Expr::Unary(UnOp::Neg, inner) => self.plain_int(arena, inner),
+            _ => false,
+        }
+    }
+
     fn const_lit(&self, lit: Lit, at: u32, want: Int) -> Result<(u128, Int)> {
         let text = self.src.text(at);
         match lit {
@@ -280,8 +311,7 @@ impl Infer<'_, '_> {
         let Kind::Prim(primitive) = *self.cx.types.kind(target) else { bail!("a cast to a type that is not an integer") };
         let Some(int) = int_info(primitive) else { bail!("a cast to a type that is not an integer") };
         let (value, from) = self.const_eval(arena, inner, int)?;
-        let value = if from.1 { signed(value, from.0) as u128 } else { value };
-        Ok((value & mask(int.0), int))
+        Ok((convert(value, from, int), int))
     }
 
     fn const_binary(&mut self, arena: &Body, op: BinOp, (lhs, rhs): (ExprId, ExprId), want: Int) -> Result<(u128, Int)> {
@@ -293,15 +323,21 @@ impl Infer<'_, '_> {
         if super::expr::is_compare(op) {
             return self.const_compare(arena, op, (lhs, rhs));
         }
-        let (x, int) = self.const_eval(arena, lhs, want)?;
+        let (mut x, mut int) = self.const_eval(arena, lhs, want)?;
         let shift = matches!(op, BinOp::Shl | BinOp::Shr);
-        let (y, _) = self.const_eval(arena, rhs, if shift { (32, false) } else { int })?;
+        let (y, other) = self.const_eval(arena, rhs, if shift { (32, false) } else { int })?;
+        if !shift && other != int && self.plain_int(arena, lhs) {
+            (x, int) = self.const_eval(arena, lhs, other)?;
+        }
         Ok((fold(op, x, y, int)? & mask(int.0), int))
     }
 
     fn const_compare(&mut self, arena: &Body, op: BinOp, (lhs, rhs): (ExprId, ExprId)) -> Result<(u128, Int)> {
-        let (x, int) = self.const_eval(arena, lhs, I32)?;
-        let (y, _) = self.const_eval(arena, rhs, int)?;
+        let (mut x, mut int) = self.const_eval(arena, lhs, I32)?;
+        let (y, other) = self.const_eval(arena, rhs, int)?;
+        if other != int && self.plain_int(arena, lhs) {
+            (x, int) = self.const_eval(arena, lhs, other)?;
+        }
         let order = if int.1 { signed(x, int.0).cmp(&signed(y, int.0)) } else { x.cmp(&y) };
         let holds = match op {
             BinOp::Eq => order.is_eq(),
@@ -359,11 +395,16 @@ impl Infer<'_, '_> {
 
     fn const_call(&mut self, arena: &Body, (callee, args): (ExprId, crate::body::List), want: Int) -> Result<(u128, Int)> {
         let Expr::Path(path) = *arena.expr(callee) else { bail!("a constant call of something that is not a path") };
-        let mut values = Vec::new();
-        for &arg in arena.list(args) {
-            values.push(self.const_eval(arena, ExprId(arg), want)?);
-        }
         let (item, substs) = self.const_target(arena, path)?;
+        let params = match self.cx.intrinsic(item) {
+            Some(_) => vec![want; arena.list(args).len()],
+            None => self.const_params(item, &substs, want)?,
+        };
+        let mut values = Vec::new();
+        for (&arg, &param) in arena.list(args).iter().zip(&params) {
+            let (value, from) = self.const_eval(arena, ExprId(arg), param)?;
+            values.push((convert(value, from, param), param));
+        }
         let layout_of = |infer: &mut Self| match substs.first() {
             Some(&ty) => infer.cx.layout(ty),
             None => bail!("a layout intrinsic with no type"),
