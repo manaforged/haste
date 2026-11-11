@@ -149,7 +149,16 @@ impl Infer<'_, '_> {
     fn with_const_body<T>(&mut self, item: ItemRef, substs: &[Ty], run: impl FnOnce(&mut Self, &Body, ExprId) -> Result<T>) -> Result<T> {
         let body = self.cx.body(item)?;
         let Some(root) = body.root else { bail!("{} has no value to evaluate", self.cx.name(item)) };
-        self.with_item_frame(item, substs, |infer| run(infer, &body, root))
+        let constant = self.cx.item(item).1.kind != ItemKind::Fn;
+        if constant && self.evaluating.contains(&item) {
+            bail!("the constant {} depends on itself", self.cx.name(item));
+        }
+        self.evaluating.extend(constant.then_some(item));
+        let found = self.with_item_frame(item, substs, |infer| run(infer, &body, root));
+        if constant {
+            self.evaluating.pop();
+        }
+        found
     }
 
     fn with_item_frame<T>(&mut self, item: ItemRef, substs: &[Ty], run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {

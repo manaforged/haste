@@ -43,6 +43,9 @@ impl Infer<'_, '_> {
             };
             let Some(next) = next else { break };
             (ty, steps) = (self.resolve(next), steps + 1);
+            if steps as usize == super::RECURSION_LIMIT {
+                bail!("reached the recursion limit while dereferencing {}", self.show(found));
+            }
         }
         if steps > 0 {
             self.out.autoderefs.insert(expr, steps);
