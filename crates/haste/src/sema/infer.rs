@@ -29,6 +29,7 @@ pub use drop::Glue;
 pub use looping::{For, Tried};
 pub use method::Adjust;
 pub use coerce::Coercion;
+pub use consts::{Anon, Arena};
 pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
@@ -62,7 +63,7 @@ pub struct Local {
     pub ty: Ty,
 }
 
-/// What the code of an instance is: a body, drop glue, a closure's body, a call through the vtable slot of a trait object, or a constructor.
+/// What the code of an instance is: a body, drop glue, a closure's body, a call through the vtable slot of a trait object, a constructor, or an anonymous constant.
 #[derive(Clone, Debug, Default)]
 pub enum Shape {
     #[default]
@@ -76,6 +77,8 @@ pub enum Shape {
     Ctor(u32),
     /// The `Clone::clone` of a tuple that the compiler writes, with the clone call of each field.
     Clone(Vec<Res>),
+    /// An anonymous constant, such as an array length, whose value the folder could not compute, run as a function that takes nothing.
+    Anon(Anon),
 }
 
 /// The inferred types and resolutions of one function body at one set of type arguments.

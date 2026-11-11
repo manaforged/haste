@@ -30,7 +30,7 @@ use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
 use crate::names::{ItemRef, Primitive};
 use crate::outline::source::Source;
 use crate::sema::Context;
-use crate::sema::infer::{Shape, Typed};
+use crate::sema::infer::{Arena, Shape, Typed};
 use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty};
 
@@ -247,9 +247,10 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
         Shape::Closure(closure) => closure.parent,
         _ => *item,
     };
-    let body = match typed.shape {
-        Shape::Body | Shape::Closure(_) => cx.body(source)?,
-        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => std::rc::Rc::default(),
+    let arena = match &typed.shape {
+        Shape::Body | Shape::Closure(_) => Arena::Body(cx.body(source)?),
+        Shape::Anon(anon) => anon.arena.clone(),
+        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => Arena::Body(std::rc::Rc::default()),
     };
     let src = cx.body_src(source);
     let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
@@ -260,7 +261,7 @@ pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: 
         cx,
         reached,
         slots,
-        body: &body,
+        body: arena.body(),
         src,
         typed,
         b,
@@ -334,6 +335,7 @@ impl Lower<'_, '_> {
             Shape::Untuple(res) => self.untuple_call(res.clone()),
             &Shape::Ctor(variant) => self.ctor_body(variant),
             Shape::Clone(calls) => self.clone_body(calls.clone()),
+            Shape::Anon(anon) => self.expr(anon.root),
             Shape::Closure(closure) if closure.closure.coroutine => self.resume_root(closure.closure.body),
             Shape::Closure(closure) => {
                 let root = closure.closure.body;

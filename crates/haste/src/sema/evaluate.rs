@@ -1,4 +1,4 @@
-//! Constant items whose syntax the folder cannot evaluate, evaluated by running their bodies through the runner that the layer owning code memory installs.
+//! Constant items and anonymous constants whose syntax the folder cannot evaluate, evaluated by running their bodies through the runner that the layer owning code memory installs.
 
 use std::sync::OnceLock;
 

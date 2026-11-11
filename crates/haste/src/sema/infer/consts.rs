@@ -1,5 +1,9 @@
+use std::rc::Rc;
+
 use anyhow::{Result, anyhow, bail};
 
+use crate::body::adt::AdtDef;
+use crate::body::sig::{ImplHeader, Signature};
 use crate::body::{BinOp, Body, Expr, ExprId, Lit, PathId, TyId, UnOp};
 use crate::names::path::Path as NamePath;
 use crate::names::resolve::macro_path;
@@ -7,9 +11,12 @@ use crate::names::{Def, ItemRef, Primitive, Sym};
 use crate::outline::item::ItemKind;
 
 use super::super::evaluate;
+use super::super::impls::ImplRef;
+use super::super::reach::Instance;
 use super::super::ty::{Kind, Ty, int_info, mask};
 use super::super::intrinsic::Intrinsic;
-use super::{Infer, Res};
+use super::scope::Frame;
+use super::{Infer, Res, Shape, Typed};
 use super::path::parse_int;
 
 /// The width and signedness of an integer type.
@@ -35,6 +42,43 @@ enum ConstMethod {
     LeadingZeros,
     TrailingZeros,
     Len,
+}
+
+/// The parsed syntax that holds an anonymous constant: a function or constant body, a function or constant header, a type definition, or an impl header.
+#[derive(Clone, Debug)]
+pub enum Arena {
+    Body(Rc<Body>),
+    Signature(Rc<Signature>),
+    Adt(Rc<AdtDef>),
+    Header(Rc<ImplHeader>),
+}
+
+impl Arena {
+    /// The arena whose expressions the constant is made of.
+    pub fn body(&self) -> &Body {
+        match self {
+            Arena::Body(body) => body,
+            Arena::Signature(sig) => &sig.body,
+            Arena::Adt(def) => &def.body,
+            Arena::Header(header) => &header.body,
+        }
+    }
+
+    fn tag(&self) -> u128 {
+        match self {
+            Arena::Body(_) => 0,
+            Arena::Signature(_) => 1,
+            Arena::Adt(_) => 2,
+            Arena::Header(_) => 3,
+        }
+    }
+}
+
+/// An anonymous constant compiled as its own function that takes nothing: the arena that holds it and its value expression.
+#[derive(Clone, Debug)]
+pub struct Anon {
+    pub arena: Arena,
+    pub root: ExprId,
 }
 
 const CONST_METHODS: [(&str, ConstMethod); 9] = [
@@ -142,20 +186,97 @@ impl Infer<'_, '_> {
         let mut width = None;
         let folded = self.with_const_body(item, substs, |infer, body, root| {
             let ty = infer.lower_ty(&sig.body, ret)?;
-            let Kind::Prim(primitive) = *infer.cx.types.kind(ty) else { bail!("constant of a type that is not an integer") };
-            let Some(int) = int_info(primitive).or((primitive == Primitive::Bool).then_some(BOOL)) else { bail!("constant of a type that is not an integer") };
+            let Some(int) = infer.int_of(ty) else { bail!("constant of a type that is not an integer") };
             width = Some(int);
             let (value, _) = infer.const_eval(body, root, int)?;
             Ok((value & mask(int.0), int))
         });
         match (folded, width) {
-            (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => {
-                let ran = evaluate::run(self.cx, &(item, substs.to_vec()), int.0);
-                let value = ran.map_err(|reason| anyhow!("{error:#}; running {}: {reason:#}", self.cx.name(item)))?;
-                Ok((value & mask(int.0), int))
-            }
+            (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => self.run_instance(&(item, substs.to_vec()), int, error),
             (found, _) => found,
         }
+    }
+
+    /// The width and signedness of `ty` when it is an integer type or `bool`.
+    fn int_of(&self, ty: Ty) -> Option<Int> {
+        let Kind::Prim(primitive) = *self.cx.types.kind(ty) else { return None };
+        int_info(primitive).or((primitive == Primitive::Bool).then_some(BOOL))
+    }
+
+    /// The value, `int` wide, of the constant or anonymous constant `instance` from running it, once the folder failed with `error`.
+    fn run_instance(&mut self, instance: &Instance, int: Int, error: anyhow::Error) -> Result<(u128, Int)> {
+        let ran = evaluate::run(self.cx, instance, int.0);
+        let value = ran.map_err(|reason| anyhow!("{error:#}; running {}: {reason:#}", self.cx.name(instance.0)))?;
+        Ok((value & mask(int.0), int))
+    }
+
+    /// The value of the anonymous constant `expr` of `arena`, which the folder failed on with `error`, from running it as its own function once per pass and frame arguments: when those arguments are known and an item holds `arena`.
+    fn run_anon(&mut self, arena: &Body, expr: ExprId, error: anyhow::Error) -> Result<(u128, Int)> {
+        let args: Vec<Ty> = self.generics.iter().map(|&(_, ty)| ty).chain(self.self_ty).collect();
+        if args.iter().any(|&ty| self.has_vars(ty)) {
+            return Err(error);
+        }
+        let Some((owner, arena)) = self.holder(arena) else { return Err(error) };
+        let mut args: Vec<Ty> = args.into_iter().map(|ty| self.zonk(ty)).collect();
+        args.extend([arena.tag(), u128::from(expr.0)].map(|value| self.cx.types.intern(Kind::Value(value))));
+        let (instance, asked) = ((owner, args), self.cx.asks.count());
+        let typed = match self.cx.store.finals.get(&instance).cloned() {
+            Some(typed) => typed,
+            None => self.infer_anon(Anon { arena, root: expr }, &instance).map_err(|reason| anyhow!("{error:#}; inferring it: {reason:#}"))?,
+        };
+        let Some(int) = typed.ret.and_then(|ty| self.int_of(ty)) else { bail!("{error:#}; it is not an integer") };
+        let ran = self.run_instance(&instance, int, error);
+        if self.cx.asks.count() != asked {
+            self.cx.store.finals.remove(&instance);
+        }
+        ran
+    }
+
+    /// The item whose parsed syntax is `arena`, with that syntax: the body being inferred, or a header of the frame; none for a static, a foreign function, or syntax that no item holds, such as a macro's output.
+    fn holder(&self, arena: &Body) -> Option<(ItemRef, Arena)> {
+        let (store, held) = (&self.cx.store, |found: &Arena| std::ptr::eq(found.body(), arena));
+        let items = self.instance.iter().map(|(item, _)| *item).chain(self.frame_item);
+        for item in items {
+            let found = match self.cx.item(item).1.kind {
+                ItemKind::Struct | ItemKind::Enum | ItemKind::Union => [store.adts.get(&item).cloned().map(Arena::Adt), None],
+                ItemKind::Fn | ItemKind::Const if !self.cx.foreign(item) => [store.signatures.get(&item).cloned().map(Arena::Signature), store.bodies.get(&item).cloned().map(Arena::Body)],
+                _ => [None, None],
+            };
+            if let Some(found) = found.into_iter().flatten().find(held) {
+                return Some((item, found));
+            }
+        }
+        let block = self.block?;
+        let header = Arena::Header(store.headers.get(&block)?.clone());
+        let owner = match block {
+            ImplRef::Body(item) => item,
+            ImplRef::Module { krate, index } => {
+                let entry = &self.cx.outline.crates[krate as usize].impls[index as usize];
+                ItemRef { krate, file: entry.file as u32, item: entry.at }
+            }
+        };
+        held(&header).then_some((owner, header))
+    }
+
+    /// The typed form of the anonymous constant `anon` as the body of `instance`, inferred in the frame as it stands and kept in the store, where the runner finds it.
+    fn infer_anon(&mut self, anon: Anon, instance: &Instance) -> Result<Rc<Typed>> {
+        let (src, home, frames) = (self.src, self.home, self.frames);
+        let frame = Frame { src, home, generics: self.generics.clone(), self_ty: self.self_ty, block: self.block, item: self.frame_item, root: self.root };
+        let (arena, sig) = (anon.arena.clone(), Signature::default());
+        let body = arena.body();
+        let mut infer = Infer::start(self.cx, (body, &sig, src), home);
+        infer.swap_frame(frame);
+        (infer.instance, infer.frames) = (Some(instance.clone()), frames);
+        infer.out.exprs = vec![Ty::NONE; body.exprs.len()];
+        let ty = infer.fresh(Kind::Var);
+        infer.out.ret = Some(ty);
+        let found = infer.expr(anon.root, Some(ty))?;
+        infer.coerce_expr(anon.root, found, ty)?;
+        let mut typed = infer.finish()?;
+        typed.shape = Shape::Anon(anon);
+        let typed = Rc::new(super::settle(self.cx, (instance.0, &instance.1), typed)?);
+        self.cx.store.finals.insert(instance.clone(), typed.clone());
+        Ok(typed)
     }
 
     /// Runs `run` on the body and value expression of the constant or const fn `item` at `substs`, with names read as that body reads them.
@@ -219,12 +340,15 @@ impl Infer<'_, '_> {
         Ok(values)
     }
 
-    /// The const value that `expr` of `arena` gives as a generic argument or an array length: a const parameter of the frame as it stands, or the value it evaluates to.
+    /// The const value that `expr` of `arena` gives as a generic argument or an array length: a const parameter of the frame as it stands, or the value it folds to, or else the value from running it.
     pub(super) fn const_arg(&mut self, arena: &Body, expr: ExprId) -> Result<Ty> {
         if let Some(param) = self.named_param(arena, expr) {
             return Ok(param);
         }
-        let (value, (bits, _)) = self.const_eval(arena, expr, USIZE)?;
+        let (value, (bits, _)) = match self.const_eval(arena, expr, USIZE) {
+            Err(error) => self.run_anon(arena, expr, error)?,
+            found => found?,
+        };
         Ok(self.cx.types.intern(Kind::Value(value & mask(bits))))
     }
 
