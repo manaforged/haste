@@ -7,6 +7,8 @@ use rustc_index::IndexVec;
 use crate::names::{ItemRef, Primitive};
 use crate::outline::attr::split_commas;
 use crate::outline::item::{Attr, ItemKind};
+use crate::outline::source::Source;
+use crate::outline::tree::Truth;
 
 use super::Context;
 use super::infer::field_types;
@@ -37,26 +39,22 @@ impl<'a> Context<'a> {
         self.repr(item).int.map_or(Primitive::Isize, repr_primitive)
     }
 
-    /// The `#[repr]` options of `item`.
+    /// The `#[repr]` options of `item`, written directly or through a `cfg_attr` that holds.
     pub fn repr(&self, item: ItemRef) -> ReprOptions {
         let (src, entry) = self.item(item);
         let mut repr = ReprOptions::default();
-        for attr in &entry.attrs {
-            let Attr::Other(at) = *attr else { continue };
-            if src.text(at) != "repr" || src.kind(at + 1) != rustc_lexer::TokenKind::OpenParen {
-                continue;
-            }
-            for (from, _) in split_commas(src, at + 2, src.pair(at + 1)) {
-                match src.text(from) {
-                    "C" => repr.flags |= ReprFlags::IS_C,
-                    "transparent" => repr.flags |= ReprFlags::IS_TRANSPARENT,
-                    "packed" => repr.pack = Some(repr_align(src, from).unwrap_or(Align::ONE)),
-                    "align" => repr.align = repr_align(src, from).or(repr.align),
-                    word => repr.int = REPR_INTS.iter().find(|(name, _)| *name == word).map(|(_, int)| integer_type(*int)).or(repr.int),
-                }
+        self.read_repr(item, (src, &entry.attrs), &mut repr);
+        repr
+    }
+
+    fn read_repr(&self, item: ItemRef, (src, attrs): (&Source, &[Attr]), repr: &mut ReprOptions) {
+        for attr in attrs {
+            match attr {
+                Attr::CfgAttr(cfg, inner) if self.outline.crates[item.krate as usize].env.eval(cfg) == Truth::Yes => self.read_repr(item, (src, inner), repr),
+                &Attr::Other(at) if src.text(at) == "repr" && src.kind(at + 1) == rustc_lexer::TokenKind::OpenParen => read_repr_words(src, at, repr),
+                _ => {}
             }
         }
-        repr
     }
 
     /// The argument positions that `#[rustc_legacy_const_generics(..)]` on the function `item` gives its const generics, in order.
@@ -134,6 +132,19 @@ impl<'a> Context<'a> {
             }
         };
         result.map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))
+    }
+}
+
+/// Adds the words of the `#[repr(..)]` attribute at `at` to `repr`.
+fn read_repr_words(src: &Source, at: u32, repr: &mut ReprOptions) {
+    for (from, _) in split_commas(src, at + 2, src.pair(at + 1)) {
+        match src.text(from) {
+            "C" => repr.flags |= ReprFlags::IS_C,
+            "transparent" => repr.flags |= ReprFlags::IS_TRANSPARENT,
+            "packed" => repr.pack = Some(repr_align(src, from).unwrap_or(Align::ONE)),
+            "align" => repr.align = repr_align(src, from).or(repr.align),
+            word => repr.int = REPR_INTS.iter().find(|(name, _)| *name == word).map(|(_, int)| integer_type(*int)).or(repr.int),
+        }
     }
 }
 
