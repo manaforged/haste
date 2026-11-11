@@ -237,7 +237,7 @@ fn short(src: &Source, frag: Frag, at: u32) -> Option<u32> {
     let kind = src.kind(at);
     match frag {
         Frag::Tt => Some(tree(src, at)),
-        Frag::Ident => is_name(kind).then_some(at + 1),
+        Frag::Ident => (is_name(kind) && src.text(at) != "_").then_some(at + 1),
         Frag::Lifetime => matches!(kind, TokenKind::Lifetime { .. }).then_some(at + 1),
         Frag::Literal => literal(src, at),
         Frag::Block => (kind == TokenKind::OpenBrace).then(|| src.pair(at) + 1),
