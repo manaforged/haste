@@ -16,8 +16,6 @@ use crate::outline::tree::{Expansion, File, Truth};
 use super::Context;
 use super::builtin::{self, Builtin};
 
-const DEPTH: u32 = 64;
-
 /// A `macro_rules!` that a body defines, copied out so that its rules index its own tokens.
 struct Local {
     name: String,
@@ -193,8 +191,8 @@ impl Writer {
     }
 
     fn expand_one(&self, cx: &mut Context<'_>, run: Run<'_>, path: (u32, u32), open: u32) -> Result<Option<Source>> {
-        if run.depth >= DEPTH {
-            bail!("macro {} recursed past {DEPTH} levels", run.src.text(path.1));
+        if run.depth as usize >= crate::RECURSION_LIMIT {
+            bail!("macro {} recursed past {} levels", run.src.text(path.1), crate::RECURSION_LIMIT);
         }
         let name = plain(run.src.text(path.1));
         if let Some(local) = self.locals.iter().rev().find(|local| path.0 == path.1 && local.name == name) {

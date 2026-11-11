@@ -215,9 +215,6 @@ pub struct Infer<'c, 'a> {
     evaluating: Vec<ItemRef>,
 }
 
-/// rustc's default recursion limit, which bounds dereference steps and nested alias and constant expansion.
-pub(super) const RECURSION_LIMIT: usize = 128;
-
 /// What the `break`s of one loop or labeled block give: the type they coerce to once it is known, whether any `break` was seen, its label, and whether it is a block.
 #[derive(Clone, Copy)]
 struct Breaks {

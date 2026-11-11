@@ -48,7 +48,7 @@ impl<'a> Infer<'_, 'a> {
         let name = plain(self.src.text(name));
         let mut steps = vec![self.known_ty(found)?];
         while let Some(next) = self.next_step(expr, steps.len() as u32 - 1, steps[steps.len() - 1])? {
-            if steps.len() == super::RECURSION_LIMIT {
+            if steps.len() == crate::RECURSION_LIMIT {
                 bail!("reached the recursion limit while dereferencing {}", self.show(found));
             }
             steps.push(self.known_ty(next)?);
