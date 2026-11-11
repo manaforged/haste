@@ -83,7 +83,7 @@ fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<I
 }
 
 fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reached): (&mut sema::Context<'_>, &Reached), fresh: &[usize]) {
-    fresh.iter().for_each(|at| _ = broken.remove(at));
+    fresh.iter().for_each(|at| drop(broken.remove(at)));
     broken.extend(image.compile(cx, reached, fresh));
 }
 
@@ -204,7 +204,7 @@ impl Build {
             }
             watch.stamp = now;
             let edit = match &watch.by {
-                Some(by) => self.compilation.outline.reexpand(by).map(Edit::Bodies),
+                Some(by) => self.compilation.outline.reexpand(by),
                 None => self.compilation.outline.reread(&watch.path),
             };
             match edit {

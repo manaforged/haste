@@ -159,7 +159,7 @@ fn members(top: &Path, workspace: Option<&toml::Table>) -> Vec<PathBuf> {
         .collect()
 }
 
-fn workspace_root(root: &Path) -> Result<PathBuf> {
+pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
     let found = root.ancestors().find(|dir| dir.join("Cargo.lock").is_file());
     found.map(Path::to_owned).with_context(|| format!("no Cargo.lock at or above {}", root.display()))
 }

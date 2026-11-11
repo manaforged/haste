@@ -23,16 +23,17 @@ pub enum Edit {
 impl Outline {
     /// Reads the file at `path` again and swaps it in where the outline holds it when only function bodies changed.
     pub fn reread(&mut self, path: &Path) -> Result<Edit> {
-        let slots = self.slots_of(path);
-        let Some(&(krate, file)) = slots.first() else { return Ok(Edit::Same) };
+        let (slots, crates) = self.places_of(path);
+        if crates.is_empty() {
+            return Ok(Edit::Same);
+        }
+        let Some(&(krate, file)) = slots.first() else { return Ok(Edit::Items(crates)) };
         let old = self.crates[krate as usize].files[file as usize].clone();
         let new = read(path)?;
         if same_places(&old, &new) {
             return Ok(Edit::Same);
         }
-        if old.expanded || !old.source.marks.is_empty() || outside_bodies(&old) != outside_bodies(&new) {
-            let mut crates: Vec<u32> = slots.iter().map(|&(krate, _)| krate).collect();
-            crates.dedup();
+        if !old.source.marks.is_empty() || outside_bodies(&old) != outside_bodies(&new) {
             return Ok(Edit::Items(crates));
         }
         let new = Arc::new(new);
@@ -42,40 +43,56 @@ impl Outline {
         Ok(Edit::Bodies(slots))
     }
 
-    /// Reads the file at `path` again in place, dropping the macro expansions of its bodies, as an edit to a file it includes needs; returns each place that holds it.
-    pub fn reexpand(&mut self, path: &Path) -> Result<Vec<(u32, u32)>> {
-        let slots = self.slots_of(path);
+    /// Refreshes the file at `path` after a file its `include_str!` or `include_bytes!` calls read changed.
+    pub fn reexpand(&mut self, path: &Path) -> Result<Edit> {
+        let (slots, crates) = self.places_of(path);
+        if crates.is_empty() {
+            return Ok(Edit::Same);
+        }
+        let Some(&(krate, file)) = slots.first() else { return Ok(Edit::Items(crates)) };
+        let expanded_include = self.crates.iter().any(|tree| {
+            tree.files.iter().any(|entry| entry.expanded && entry.source.path == path && !included_calls(&entry.source, &tree.env).is_empty())
+        });
+        let old = &self.crates[krate as usize].files[file as usize];
+        let outside_include = outside_bodies(old).into_iter().any(|word| matches!(word, "include_str" | "include_bytes"));
+        if expanded_include || !old.source.marks.is_empty() || outside_include {
+            return Ok(Edit::Items(crates));
+        }
         let new = Arc::new(read(path)?);
         for &(krate, file) in &slots {
             self.crates[krate as usize].files[file as usize] = new.clone();
         }
-        Ok(slots)
+        Ok(Edit::Bodies(slots))
     }
 
     /// Each file that an `include_str!` or `include_bytes!` call with a literal path in crate `krate` reads, with the file that holds the call.
     pub fn included(&self, krate: usize) -> Vec<(PathBuf, PathBuf)> {
         let tree = &self.crates[krate];
-        let mut found = Vec::new();
-        for src in tree.files.iter().filter(|file| !file.expanded).map(|file| &file.source) {
-            let calls = (2..src.tokens.len() as u32).filter(|&open| src.text(open) == "(" && src.text(open - 1) == "!" && matches!(src.text(open - 2), "include_str" | "include_bytes"));
-            let paths = calls.filter_map(|open| super::build::path_text(src, *src.args(open).first()?, &tree.env));
-            found.extend(paths.map(|path| (src.beside(&path), src.path.clone())));
-        }
-        found
+        tree.files
+            .iter()
+            .flat_map(|file| included_calls(&file.source, &tree.env).into_iter().map(move |path| (file.source.beside(&path), file.source.path.clone())))
+            .collect()
     }
 
-    /// The crate and file index of each place that holds the file at `path`.
-    pub fn slots_of(&self, path: &Path) -> Vec<(u32, u32)> {
-        let mut slots = Vec::new();
+    fn places_of(&self, path: &Path) -> (Vec<(u32, u32)>, Vec<u32>) {
+        let (mut slots, mut crates) = (Vec::new(), Vec::new());
         for (krate, tree) in self.crates.iter().enumerate() {
-            for (file, entry) in tree.files.iter().enumerate() {
-                if entry.source.path == path {
+            for (file, entry) in tree.files.iter().enumerate().filter(|(_, entry)| entry.source.path == path) {
+                if !entry.expanded {
                     slots.push((krate as u32, file as u32));
+                }
+                if crates.last() != Some(&(krate as u32)) {
+                    crates.push(krate as u32);
                 }
             }
         }
-        slots
+        (slots, crates)
     }
+}
+
+fn included_calls(src: &super::source::Source, env: &super::tree::Env) -> Vec<String> {
+    let calls = (2..src.tokens.len() as u32).filter(|&open| super::source::opens(src.kind(open)) && src.text(open - 1) == "!" && matches!(src.text(open - 2), "include_str" | "include_bytes"));
+    calls.filter_map(|open| super::build::path_text(src, *src.args(open).first()?, env)).collect()
 }
 
 fn same_places(old: &File, new: &File) -> bool {

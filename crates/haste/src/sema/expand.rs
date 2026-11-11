@@ -299,7 +299,7 @@ impl Writer {
         let path = run.call_at(site.start).0.beside(&path);
         let bytes = std::fs::read(&path).map_err(|error| anyhow!("cannot read {}: {error}", path.display()))?;
         match site.builtin {
-            Builtin::IncludeStr => out.lexed(&format!("{:?}", String::from_utf8(bytes).map_err(|_| anyhow!("{} is not UTF-8", path.display()))?)),
+            Builtin::IncludeStr => out.lexed(&format!("{:?}", String::from_utf8(bytes).map_err(|error| anyhow!("{} is not UTF-8: {error}", path.display()))?)),
             _ => out.lexed(&builtin::byte_string(&bytes)),
         }
         Ok(true)

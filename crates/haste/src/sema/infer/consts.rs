@@ -663,6 +663,7 @@ impl<'a> Infer<'a, '_> {
             Expr::Array(items) => arena.list(items).len() as u128,
             Expr::Repeat(_, count) => self.const_typed(arena, count, USIZE)?.0,
             Expr::Paren(inner) | Expr::Ref { expr: inner, .. } => self.const_len(arena, inner)?,
+            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.const_len(arena, tail)?,
             Expr::Path(path) => self.const_len_path(arena, path)?,
             ref other => bail!("the length of {other:?} in a constant"),
         })
