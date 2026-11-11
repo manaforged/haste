@@ -172,6 +172,20 @@ fn root_module(path: &std::path::Path) -> Module {
 }
 
 impl Outline {
+    /// The path that `module_path!` spells for module `at`: the crate name, then each module name from the root down.
+    pub fn module_path(&self, at: crate::names::ModRef) -> String {
+        let modules = &self.crates[at.krate as usize].modules;
+        let mut names = Vec::new();
+        let mut current = Some(at.module as usize);
+        while let Some(module) = current.filter(|&module| module != 0) {
+            names.push(modules[module].name.as_str());
+            current = modules[module].parent;
+        }
+        names.push(&self.roots[at.krate as usize].name);
+        names.reverse();
+        names.join("::")
+    }
+
     /// The outline of the single crate whose root file is `path`, with no dependencies.
     pub fn file(path: &std::path::Path, target: crate::graph::cfg::Target) -> Outline {
         let root = Root { unit: 0, name: String::new(), path: path.to_owned(), role: Role::Lib };

@@ -24,9 +24,10 @@ pub enum Builtin {
     Env,
     OptionEnv,
     Asm,
+    ModulePath,
 }
 
-const BUILTINS: [(&str, Builtin); 17] = [
+const BUILTINS: [(&str, Builtin); 18] = [
     ("concat", Builtin::Concat),
     ("stringify", Builtin::Stringify),
     ("line", Builtin::Line),
@@ -44,6 +45,7 @@ const BUILTINS: [(&str, Builtin); 17] = [
     ("env", Builtin::Env),
     ("option_env", Builtin::OptionEnv),
     ("asm", Builtin::Asm),
+    ("module_path", Builtin::ModulePath),
 ];
 
 impl Builtin {
