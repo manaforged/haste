@@ -11,13 +11,11 @@ use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
 use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{Location, Plan, Regs, plan};
-use crate::frame::{Frame, layout, saved};
+use crate::frame::{Frame, INCOMING, PAGE, edge_moves, layout, saved};
 
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::{Code, Site};
 
-const PAGE: u32 = 4096;
-const INCOMING: i32 = 16;
 
 /// The registers planning hands out: the saved pool, caller-saved registers the emitter never uses as scratch, and the float pool.
 const REGS: Regs<Reg> = Regs {
@@ -270,22 +268,18 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
-        let params = &self.func.blocks[block.index()].params;
-        let pairs: Vec<(Value, Value)> = args.iter().copied().zip(params.iter().copied()).filter(|(a, p)| !self.same_home(*a, *p)).collect();
-        let clash = pairs.iter().any(|(arg, _)| pairs.iter().any(|(_, param)| self.same_home(*arg, *param)));
+        let (pairs, clash) = edge_moves(args, &self.func.blocks[block.index()].params, |a, b| self.same_home(a, b));
         if !clash {
             for (arg, param) in pairs {
                 self.assign(param, arg);
             }
             return Ok(());
         }
-        let base = self.frame.scratch;
-        let scratch = |index: usize| Mem::new(Reg::Rbp, base + 16 * index as i32);
         for (index, (arg, _)) in pairs.iter().enumerate() {
-            self.move_to(scratch(index), *arg);
+            self.move_to(Mem::new(Reg::Rbp, self.frame.edge_slot(index)), *arg);
         }
         for (index, (_, param)) in pairs.iter().enumerate() {
-            self.load_home(*param, scratch(index));
+            self.load_home(*param, Mem::new(Reg::Rbp, self.frame.edge_slot(index)));
         }
         Ok(())
     }
@@ -305,15 +299,15 @@ impl Emit<'_> {
             }
         };
         let (then_moves, else_moves) = (self.moves(then.0, then.1), self.moves(otherwise.0, otherwise.1));
-        let falls = self.next.is_some_and(|next| next == then.0 || next == self.target(then.0));
+        let falls = self.next.is_some_and(|next| next == then.0 || next == self.func.jump_target(then.0));
         if !else_moves && (then_moves || falls) {
-            self.asm.jcc(cond.invert(), self.blocks[self.target(otherwise.0).index()]);
+            self.asm.jcc(cond.invert(), self.blocks[self.func.jump_target(otherwise.0).index()]);
             self.edge(then.0, then.1)?;
             self.goto(then.0, true);
             return Ok(());
         }
         if !then_moves {
-            self.asm.jcc(cond, self.blocks[self.target(then.0).index()]);
+            self.asm.jcc(cond, self.blocks[self.func.jump_target(then.0).index()]);
             self.edge(otherwise.0, otherwise.1)?;
             self.goto(otherwise.0, true);
             return Ok(());
@@ -334,23 +328,11 @@ impl Emit<'_> {
     }
 
     fn goto(&mut self, block: Block, last: bool) {
-        let target = self.target(block);
+        let target = self.func.jump_target(block);
         if last && (self.next == Some(block) || self.next == Some(target)) {
             return;
         }
         self.asm.jmp(self.blocks[target.index()]);
-    }
-
-    fn target(&self, mut block: Block) -> Block {
-        for _ in 0..self.func.blocks.len() {
-            let data = &self.func.blocks[block.index()];
-            let [only] = data.insts[..] else { return block };
-            match &self.func.insts[only.index()].op {
-                Op::Jump(next, args) if data.params.is_empty() && args.is_empty() => block = *next,
-                _ => return block,
-            }
-        }
-        block
     }
 
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {

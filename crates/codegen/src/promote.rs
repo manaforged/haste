@@ -253,11 +253,6 @@ struct Cfg {
     try_target: Vec<bool>,
 }
 
-fn terminator(func: &Function, block: Block) -> Option<&Op> {
-    let inst = func.blocks[block.index()].insts.last()?;
-    Some(&func.insts[inst.index()].op).filter(|op| op.is_terminator())
-}
-
 impl Cfg {
     fn new(func: &Function, entry: Block) -> Self {
         let count = func.blocks.len();
@@ -265,7 +260,7 @@ impl Cfg {
             Cfg { entry, preds: vec![Vec::new(); count], reachable: vec![false; count], try_target: vec![false; count] };
         for index in 0..count {
             let block = Block(index as u32);
-            let Some(op) = terminator(func, block) else { continue };
+            let Some(op) = func.last(block) else { continue };
             for target in op.targets() {
                 let preds = &mut cfg.preds[target.index()];
                 if !preds.contains(&block) {
@@ -276,20 +271,8 @@ impl Cfg {
                 }
             }
         }
-        cfg.reach(func);
+        cfg.reachable = func.reachable(entry);
         cfg
-    }
-
-    fn reach(&mut self, func: &Function) {
-        let mut stack = vec![self.entry];
-        while let Some(block) = stack.pop() {
-            if std::mem::replace(&mut self.reachable[block.index()], true) {
-                continue;
-            }
-            if let Some(op) = terminator(func, block) {
-                stack.extend(op.targets());
-            }
-        }
     }
 }
 
@@ -568,8 +551,7 @@ fn materialize(func: &mut Function, zeros: &[(Type, Value)]) -> Vec<Inst> {
             insts.push(push_inst(func, Op::Const(0), value));
             continue;
         }
-        func.types.push(Type::I64);
-        let half = Value(func.types.len() as u32 - 1);
+        let half = func.value(Type::I64);
         insts.push(push_inst(func, Op::Const(0), half));
         insts.push(push_inst(func, Op::Binary(Binary::Iconcat, half, half), value));
     }

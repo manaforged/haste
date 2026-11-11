@@ -3,6 +3,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::builder::FunctionBuilder;
+use crate::live::results;
 use crate::ir::{AbiParam, Binary, Block, CallConv, Function, InstData, IntCC, Op, SlotData, StackSlot, Type, Value};
 
 /// The state word of a coroutine that has not started.
@@ -69,17 +70,10 @@ fn def_blocks(func: &Function) -> Vec<Option<Block>> {
         block.params.iter().for_each(|value| defs[value.index()] = here);
         for inst in &block.insts {
             let data = &func.insts[inst.index()];
-            data.result.iter().chain(call_results(&data.op)).for_each(|value| defs[value.index()] = here);
+            results(data).for_each(|value| defs[value.index()] = here);
         }
     }
     defs
-}
-
-fn call_results(op: &Op) -> &[Value] {
-    match op {
-        Op::Call { results, .. } => results,
-        _ => &[],
-    }
 }
 
 fn crossing(func: &Function, defs: &[Option<Block>]) -> Vec<Value> {
@@ -95,10 +89,7 @@ fn crossing(func: &Function, defs: &[Option<Block>]) -> Vec<Value> {
 }
 
 fn push(func: &mut Function, insts: &mut Vec<crate::ir::Inst>, op: Op, ty: Option<Type>) -> Option<Value> {
-    let result = ty.map(|ty| {
-        func.types.push(ty);
-        Value(func.types.len() as u32 - 1)
-    });
+    let result = ty.map(|ty| func.value(ty));
     func.insts.push(InstData { op, result });
     insts.push(crate::ir::Inst(func.insts.len() as u32 - 1));
     result
@@ -138,7 +129,7 @@ fn rewrite(func: &mut Function, block: Block, (frame, anchor): (&Frame, StackSlo
         if data.op.is_terminator() && let Some(free) = free {
             call(func, &mut insts, free, &[fp], false);
         }
-        let spilled: Vec<(Value, i32)> = data.result.iter().chain(call_results(&data.op)).filter_map(|value| frame.spills.get(value).map(|&at| (*value, at))).collect();
+        let spilled: Vec<(Value, i32)> = results(&data).filter_map(|value| frame.spills.get(&value).map(|&at| (value, at))).collect();
         func.insts[inst.index()] = data;
         insts.push(inst);
         for (value, at) in spilled {
@@ -157,12 +148,7 @@ fn call(func: &mut Function, insts: &mut Vec<crate::ir::Inst>, code: i64, args: 
     func.sigs.push(signature);
     let sig = crate::ir::SigRef(func.sigs.len() as u32 - 1);
     let callee = push(func, insts, Op::Const(code), Some(Type::I64)).expect("a constant has a result");
-    let results: Vec<Value> = (0..usize::from(returns))
-        .map(|_| {
-            func.types.push(Type::I64);
-            Value(func.types.len() as u32 - 1)
-        })
-        .collect();
+    let results: Vec<Value> = (0..usize::from(returns)).map(|_| func.value(Type::I64)).collect();
     let result = results.first().copied();
     push(func, insts, Op::Call { sig, callee, args: args.to_vec(), results }, None);
     result

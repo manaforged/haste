@@ -1,9 +1,10 @@
 use super::asm::Reg;
-use crate::frame::round;
+use crate::frame::{returns, round};
 use crate::ir::{ArgumentPurpose, Signature, Type};
 
 const INT_ARGS: [Reg; 8] = [Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7)];
 const FLOAT_ARGS: u8 = 8;
+const INT_RETURNS: [Reg; 2] = [INT_ARGS[0], INT_ARGS[1]];
 const FLOAT_RETURNS: u8 = 4;
 /// The register that carries the address of memory for a returned aggregate.
 const INDIRECT: Reg = Reg(8);
@@ -68,31 +69,11 @@ impl Counter {
             _ => self.stack(ty.bytes()),
         })
     }
-
-    fn ret(&mut self, ty: Type) -> Result<Loc, String> {
-        match ty {
-            Type::F32 | Type::F64 if self.float < FLOAT_RETURNS => {
-                self.float += 1;
-                Ok(Loc::Float(self.float - 1))
-            }
-            Type::I128 if self.int == 0 => {
-                self.int = 2;
-                Ok(Loc::Pair(INT_ARGS[0], INT_ARGS[1]))
-            }
-            Type::I8 | Type::I16 | Type::I32 | Type::I64 if self.int < 2 => {
-                self.int += 1;
-                Ok(Loc::Int(INT_ARGS[self.int - 1]))
-            }
-            _ => Err("too many return values".to_owned()),
-        }
-    }
 }
 
 /// Places the parameters and return values of `signature` by the AAPCS64 rules, with stack arguments packed by `packing`.
 pub(super) fn classify(signature: &Signature, packing: Packing) -> Result<Abi, String> {
     let mut params = Counter { int: 0, float: 0, stack: 0, packing };
     let placed = signature.params.iter().map(|param| params.param(param.purpose, param.value_type)).collect::<Result<_, _>>()?;
-    let mut returns = Counter { int: 0, float: 0, stack: 0, packing };
-    let rets = signature.returns.iter().map(|param| returns.ret(param.value_type)).collect::<Result<_, _>>()?;
-    Ok(Abi { params: placed, returns: rets, stack: round(params.stack, 16) })
+    Ok(Abi { params: placed, returns: returns(signature, INT_RETURNS, FLOAT_RETURNS)?, stack: round(params.stack, 16) })
 }

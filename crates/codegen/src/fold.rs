@@ -143,11 +143,8 @@ struct Fold {
 }
 
 impl Fold {
-    fn find(&self, mut value: Value) -> Value {
-        while self.subst[value.index()] != value {
-            value = self.subst[value.index()];
-        }
-        value
+    fn find(&self, value: Value) -> Value {
+        crate::merge::find(&self.subst, value)
     }
 
     fn known(&self, value: Value) -> Option<i64> {
@@ -411,26 +408,12 @@ fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(Block, &'a 
     }
 }
 
-fn reachable(func: &Function, entry: Block) -> Vec<bool> {
-    let mut seen = vec![false; func.blocks.len()];
-    let mut stack = vec![entry];
-    while let Some(block) = stack.pop() {
-        if std::mem::replace(&mut seen[block.index()], true) {
-            continue;
-        }
-        if let Some(last) = func.blocks[block.index()].insts.last() {
-            stack.extend(func.insts[last.index()].op.targets());
-        }
-    }
-    seen
-}
-
 /// The entry and every block a call enters, whose parameters are not edge arguments.
 fn pinned(func: &Function, entry: Block) -> Vec<bool> {
     let mut pinned = vec![false; func.blocks.len()];
     pinned[entry.index()] = true;
-    for block in &func.blocks {
-        if let Some(Op::TryCall { normal, handler, .. }) = block.insts.last().map(|inst| &func.insts[inst.index()].op) {
+    for block in 0..func.blocks.len() as u32 {
+        if let Some(Op::TryCall { normal, handler, .. }) = func.last(Block(block)) {
             pinned[normal.index()] = true;
             pinned[handler.index()] = true;
         }
@@ -492,7 +475,7 @@ fn defs(func: &Function) -> Vec<Option<Inst>> {
 
 /// Empties the blocks no path from `entry` reaches and returns which blocks a path reaches.
 fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
-    let reachable = reachable(func, entry);
+    let reachable = func.reachable(entry);
     for (block, live) in func.blocks.iter_mut().zip(&reachable) {
         if !live && !block.insts.is_empty() {
             block.insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);

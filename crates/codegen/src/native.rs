@@ -21,8 +21,7 @@ pub(crate) fn lower(func: &mut Function) {
             let inst = func.blocks[block].insts[at];
             if let Some(helper) = helper(func, &consts, &func.insts[inst.index()]) {
                 let sig = signature(func, &helper);
-                let callee = Value(func.types.len() as u32);
-                func.types.push(Type::I64);
+                let callee = func.value(Type::I64);
                 func.insts.push(InstData { op: Op::Const(helper.address as i64), result: Some(callee) });
                 func.blocks[block].insts.insert(at, Inst(func.insts.len() as u32 - 1));
                 let data = &mut func.insts[inst.index()];

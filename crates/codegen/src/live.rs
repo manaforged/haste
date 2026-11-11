@@ -43,10 +43,6 @@ impl Sets {
     }
 }
 
-fn successors(func: &Function, block: usize) -> impl Iterator<Item = Block> + '_ {
-    func.blocks[block].insts.last().into_iter().flat_map(move |inst| func.insts[inst.index()].op.targets())
-}
-
 /// The wanted values that some block other than their defining block reads, as a dense index per value and the values in index order.
 fn crossing(func: &Function, wanted: &[bool]) -> (Vec<Option<usize>>, Vec<Value>) {
     let mut location = vec![usize::MAX; func.types.len()];
@@ -107,7 +103,7 @@ fn live_in(func: &Function, order: &[Block], dense: &[Option<usize>], count: usi
         changed = false;
         for block in order.iter().rev().map(|block| block.index()) {
             out.iter_mut().for_each(|word| *word = 0);
-            for next in successors(func, block) {
+            for next in func.successors(Block(block as u32)) {
                 out.iter_mut().zip(live.row(next.index())).for_each(|(word, bits)| *word |= bits);
             }
             for word in 0..words {
@@ -155,7 +151,7 @@ pub(crate) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
                 calls.push(at);
             }
         }
-        for next in successors(func, index) {
+        for next in func.successors(Block(index as u32)) {
             live_in.members(next.index()).for_each(|member| widen(&mut span[crossing[member].index()], at));
         }
         at += 1;

@@ -1,10 +1,16 @@
 //! Frame layout shared by the encoders: where arguments travel, and frame offsets from the frame pointer for values, stack slots, edge scratch and outgoing arguments.
 
 use crate::alloc::Location;
-use crate::ir::{Function, Op, Signature, Type};
+use crate::ir::{Function, Op, Signature, Type, Value};
 
 const WORD: u32 = 8;
 const MAX_ALIGN_SHIFT: u8 = 4;
+/// The bytes of a page of stack, which a larger frame touches one at a time.
+pub(crate) const PAGE: u32 = 4096;
+/// The offset from the frame pointer of the first argument that arrived on the stack.
+pub(crate) const INCOMING: i32 = 16;
+/// The bytes of scratch that one move of a block edge takes.
+const EDGE_SLOT: u32 = 16;
 
 /// Where one argument or return value travels.
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +33,34 @@ pub(crate) fn round(value: u32, to: u32) -> u32 {
     value.div_ceil(to) * to
 }
 
+/// Places the return values of `signature`: integers in `ints`, an i128 in both of them, and floats in the first `floats` float registers.
+pub(crate) fn returns<R: Copy>(signature: &Signature, ints: [R; 2], floats: u8) -> Result<Vec<Loc<R>>, String> {
+    let (mut int, mut float) = (0, 0);
+    let place = |ty: Type| match ty {
+        Type::F32 | Type::F64 if float < floats => {
+            float += 1;
+            Ok(Loc::Float(float - 1))
+        }
+        Type::I128 if int == 0 => {
+            int = ints.len();
+            Ok(Loc::Pair(ints[0], ints[1]))
+        }
+        Type::I8 | Type::I16 | Type::I32 | Type::I64 if int < ints.len() => {
+            int += 1;
+            Ok(Loc::Int(ints[int - 1]))
+        }
+        _ => Err("too many return values".to_owned()),
+    };
+    signature.returns.iter().map(|param| param.value_type).map(place).collect()
+}
+
+/// The argument and parameter of each move an edge into a block with `params` makes, and whether one move writes the place another reads, when `same_home` tells that two values share a place.
+pub(crate) fn edge_moves(args: &[Value], params: &[Value], same_home: impl Fn(Value, Value) -> bool) -> (Vec<(Value, Value)>, bool) {
+    let pairs: Vec<(Value, Value)> = args.iter().copied().zip(params.iter().copied()).filter(|(arg, param)| !same_home(*arg, *param)).collect();
+    let clash = pairs.iter().any(|(arg, _)| pairs.iter().any(|(_, param)| same_home(*arg, *param)));
+    (pairs, clash)
+}
+
 /// Frame offsets from the frame pointer for every value, stack slot and the edge scratch area.
 pub(crate) struct Frame<R> {
     pub values: Vec<i32>,
@@ -34,6 +68,13 @@ pub(crate) struct Frame<R> {
     pub scratch: i32,
     pub size: u32,
     pub saves: Vec<R>,
+}
+
+impl<R> Frame<R> {
+    /// The offset from the frame pointer of the scratch that move `index` of a block edge uses.
+    pub(crate) fn edge_slot(&self, index: usize) -> i32 {
+        self.scratch + (EDGE_SLOT as usize * index) as i32
+    }
 }
 
 /// The operations of the instructions in blocks.
@@ -52,8 +93,8 @@ fn needs<R>(func: &Function, classify: impl Fn(&Signature) -> Result<Abi<R>, Str
     for op in live_ops(func) {
         match op {
             Op::Call { sig, .. } | Op::TryCall { sig, .. } => outgoing = outgoing.max(classify(&func.sigs[sig.index()])?.stack),
-            Op::Jump(_, args) => scratch = scratch.max(args.len() as u32 * 16),
-            Op::Brif(_, _, then, _, otherwise) => scratch = scratch.max(then.len().max(otherwise.len()) as u32 * 16),
+            Op::Jump(_, args) => scratch = scratch.max(args.len() as u32 * EDGE_SLOT),
+            Op::Brif(_, _, then, _, otherwise) => scratch = scratch.max(then.len().max(otherwise.len()) as u32 * EDGE_SLOT),
             _ => {}
         }
     }
