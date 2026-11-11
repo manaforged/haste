@@ -15,6 +15,26 @@ mod native;
 mod promote;
 mod target;
 mod verify;
+/// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
+macro_rules! value_op {
+    () => {
+        fn value_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
+            match op {
+                Op::Unary(op, x) => self.unary(*op, *x, result()?),
+                Op::Binary(op, x, y) => self.binary(*op, *x, *y, result()?),
+                Op::Convert(op, x) => self.convert(*op, *x, result()?),
+                Op::Icmp(cc, x, y) => self.icmp(*cc, *x, *y, result()?),
+                Op::Fits(op, signed, x, y) => self.fits(*op, *signed, (*x, *y), result()?),
+                Op::Fcmp(cc, x, y) => {
+                    self.fcmp(*cc, *x, *y, result()?);
+                    Ok(())
+                }
+                _ => self.memory_op(op, result),
+            }
+        }
+    };
+}
+
 mod arm64;
 mod x64;
 
