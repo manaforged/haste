@@ -200,6 +200,21 @@ impl Lower<'_, '_> {
         Ok(self.ins().stack_addr(Type::I64, slot, 0))
     }
 
+    /// The 16 bytes whose byte `i` is the larger of bytes `2i` and `2i + 1` of the first vector followed by the second, as NEON `umaxp` gives.
+    pub(super) fn byte_pair_max(&mut self, args: &[Value]) -> Result<Value> {
+        let &[first, second] = args else { bail!("`umaxp` takes two vectors") };
+        let slot = self.b.create_stack_slot(16, 4);
+        for lane in 0..16 {
+            let from = if lane < 8 { first } else { second };
+            let at = lane % 8 * 2;
+            let (x, y) = (self.ins().load(Type::I8, from, at), self.ins().load(Type::I8, from, at + 1));
+            let wins = self.ins().icmp(IntCC::UnsignedGreaterThan, x, y);
+            let value = self.ins().select(wins, x, y);
+            self.ins().stack_store(value, slot, lane);
+        }
+        Ok(self.ins().stack_addr(Type::I64, slot, 0))
+    }
+
     fn bitmask(&mut self, vector: Ty, x: Value, out: Ty) -> Result<Value> {
         let Some(target) = machine(self.cx, out)? else { bail!("a SIMD bitmask into an array is not supported yet") };
         let lanes = self.lanes(vector)?;

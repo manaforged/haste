@@ -28,6 +28,7 @@ impl Lower<'_, '_> {
             Intrinsic::CallerLocation => self.caller_location().map(Some),
             Intrinsic::Cpuid => Ok(Some(self.no_cpuid())),
             Intrinsic::BytePermute(bytes) => self.byte_permute(args, bytes).map(Some),
+            Intrinsic::BytePairMax => self.byte_pair_max(args).map(Some),
             _ => self.memory_intrinsic(which, substs, args),
         }
     }
