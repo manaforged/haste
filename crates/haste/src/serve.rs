@@ -116,7 +116,7 @@ pub fn ask(root: &std::path::Path, request: Request, args: &[String]) -> Result<
     // SAFETY: fd is a connected socket that this File owns from here on.
     let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
     std::io::stdout().flush()?;
-    send(fd, request.byte(), &[1, 2])?;
+    send(fd, request.byte(), &STDIO)?;
     write_args(&mut conn, args)?;
     let mut status = [0; 4];
     conn.read_exact(&mut status)?;
@@ -190,12 +190,15 @@ fn read_args(conn: &mut std::fs::File) -> Result<Vec<String>> {
     Ok(args)
 }
 
+/// The standard input, output and error that a client hands the server for the program it runs.
+const STDIO: [RawFd; 3] = [0, 1, 2];
+
 fn answer(build: &mut Option<Build>, served: &mut Served<'_>, request: Option<(Request, Vec<String>)>, fds: &[RawFd]) -> i32 {
-    let [out, err] = fds else {
+    let Ok(&client) = <&[RawFd; 3]>::try_from(fds) else {
         close_all(fds);
         return 1;
     };
-    let saved = redirect(*out, *err);
+    let saved = redirect(client);
     let started = Instant::now();
     let answered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
         Some((request, args)) => served.reload().and_then(|reloaded| {
@@ -234,23 +237,19 @@ pub fn finish(build: &mut Build, workspace: &graph::Workspace, (request, args): 
     }
 }
 
-fn redirect(out: RawFd, err: RawFd) -> [RawFd; 2] {
-    // SAFETY: dup and dup2 take descriptors this process holds; 1 and 2 stay open throughout.
-    unsafe {
-        let saved = [libc::dup(1), libc::dup(2)];
-        libc::dup2(out, 1);
-        libc::dup2(err, 2);
+fn redirect(client: [RawFd; 3]) -> [RawFd; 3] {
+    // SAFETY: dup and dup2 take descriptors this process holds; 0, 1 and 2 stay open throughout.
+    STDIO.map(|own| unsafe {
+        let saved = libc::dup(own);
+        libc::dup2(client[own as usize], own);
         saved
-    }
+    })
 }
 
-fn restore(saved: [RawFd; 2], received: &[RawFd]) {
+fn restore(saved: [RawFd; 3], received: &[RawFd]) {
     let _ = (std::io::stdout().flush(), std::io::stderr().flush());
-    // SAFETY: saved holds the duplicates of this process's own stdout and stderr.
-    unsafe {
-        libc::dup2(saved[0], 1);
-        libc::dup2(saved[1], 2);
-    }
+    // SAFETY: saved holds the duplicates of this process's own standard descriptors.
+    STDIO.iter().zip(saved).for_each(|(&own, kept)| _ = unsafe { libc::dup2(kept, own) });
     close_all(&saved);
     close_all(received);
 }
@@ -297,7 +296,7 @@ fn receive(fd: RawFd) -> Result<(u8, Vec<RawFd>)> {
     let mut data = [0_u8];
     let mut iov = libc::iovec { iov_base: data.as_mut_ptr().cast(), iov_len: 1 };
     // SAFETY: CMSG_SPACE only computes a size.
-    let mut control = vec![0_u8; unsafe { libc::CMSG_SPACE(2 * size_of::<RawFd>() as u32) } as usize];
+    let mut control = vec![0_u8; unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&STDIO) as u32) } as usize];
     // SAFETY: msghdr is plain data, and all zero bytes are a valid value.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     (msg.msg_iov, msg.msg_iovlen) = (&raw mut iov, 1);
