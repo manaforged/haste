@@ -1,5 +1,6 @@
 mod asm;
 mod atomic;
+mod features;
 mod float;
 mod frame;
 mod location;
@@ -7,6 +8,7 @@ mod int;
 mod wide;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
+use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{Location, Plan, Regs, plan};
 use crate::frame::{Frame, layout, saved};
@@ -35,7 +37,7 @@ pub(crate) fn compile(func: &Function) -> Result<Code, String> {
     let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, classify)?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), plan, flags: None, next: None }.run(order)
+    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), plan, flags: None, next: None, features: Features::host() }.run(order)
 }
 
 fn save_slot(index: usize) -> Mem {
@@ -58,6 +60,7 @@ pub(super) struct Emit<'a> {
     plan: Plan<Reg>,
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
+    features: Features,
 }
 
 impl Emit<'_> {
