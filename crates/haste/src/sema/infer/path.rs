@@ -431,22 +431,22 @@ impl<'a> Infer<'_, 'a> {
         if self.cx.item(member).1.kind != ItemKind::Type {
             return Ok(None);
         }
-        let (params, arena, ty) = self.cx.alias_parts(member)?;
+        let alias = self.cx.alias_def(member)?;
         let src = &self.cx.file(member).source;
         let outer = self.generics.len();
-        self.generics.extend(params.iter().map(|param| src.text(param.name)).zip(own.iter().copied()));
-        let found = self.in_source(src, |infer| infer.lower_ty(&arena, ty));
+        self.generics.extend(alias.params.iter().map(|param| src.text(param.name)).zip(own.iter().copied()));
+        let found = self.in_source(src, |infer| infer.lower_ty(&alias.arena, alias.ty));
         self.generics.truncate(outer);
         found.map(Some)
     }
 
     /// The type that the type alias `item` names at the type arguments `given`, then the defaults of the rest, or fresh ones in a value path that gives none.
     pub(super) fn alias(&mut self, item: ItemRef, given: Vec<Ty>, fresh: bool) -> Result<Ty> {
-        let (params, arena, ty) = self.cx.alias_parts(item)?;
-        if let Some(definer) = self.opaque_alias(item, &params, &arena) {
+        let alias = self.cx.alias_def(item)?;
+        let (params, arena, ty, declared) = (&alias.params, &alias.arena, alias.ty, &alias.generics);
+        if let Some(definer) = self.opaque_alias(item, params, arena) {
             return super::opaque::revealed(self.cx, definer, &[]);
         }
-        let declared = self.cx.alias_generics(item)?;
         let file = self.cx.file(item);
         let mut args = given;
         let infer_all = fresh && args.is_empty();
@@ -463,7 +463,7 @@ impl<'a> Infer<'_, 'a> {
         let names: Vec<&str> = params.iter().map(|generic| file.source.text(generic.name)).collect();
         let generics = names.into_iter().zip(args).collect();
         let frame = super::scope::Frame { src: &file.source, home: self.cx.module_of(item)?, generics, self_ty: None, block: None, item: Some(item), root: item.declaring_body() };
-        self.with_frame(frame, |infer| infer.lower_ty(&arena, ty))
+        self.with_frame(frame, |infer| infer.lower_ty(arena, ty))
     }
 
     /// The function that defines the hidden types of the alias `item` when its body holds `impl Trait`, it has no type parameters, and this body is not that function, which binds them itself.
