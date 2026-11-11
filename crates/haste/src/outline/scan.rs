@@ -180,11 +180,7 @@ impl Scanner<'_> {
     }
 
     fn is_arrow(&self, at: u32) -> bool {
-        let tokens = &self.src.tokens;
-        let (Some(before), Some(close)) = (at.checked_sub(1).and_then(|before| tokens.get(before as usize)), tokens.get(at as usize)) else {
-            return false;
-        };
-        matches!(before.kind, TokenKind::Minus | TokenKind::Eq) && before.start + 1 == close.start
+        at.checked_sub(1).is_some_and(|before| matches!(self.src.kind(before), TokenKind::Minus | TokenKind::Eq) && self.src.joint(before))
     }
 
     fn to_body(&self, mut at: u32) -> (Option<u32>, u32) {
@@ -268,8 +264,7 @@ impl Scanner<'_> {
         }
         let bang = at + 1;
         if !is_name(self.src.kind(at)) || self.src.kind(bang) != TokenKind::Bang {
-            let token = self.src.tokens.get(start as usize).map_or(0, |token| token.start);
-            bail!("{}: unexpected {:?} at byte {token} in item position", self.src.path.display(), self.src.text(start));
+            bail!("{}: unexpected {:?} at byte {} in item position", self.src.path.display(), self.src.text(start), self.src.byte(start));
         }
         let open = if is_name(self.src.kind(bang + 1)) { bang + 2 } else { bang + 1 };
         Ok(Head { kind: ItemKind::MacroCall, name: Some(at), body: Some(open), end: self.delimited_end(open) })

@@ -71,12 +71,7 @@ impl Infer<'_, '_> {
 
     /// The trait bounds that the frame's headers put on its type parameters, each as the trait and its types with `Self` first: what the body may assume holds.
     pub(super) fn assumptions(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
-        let mut found = Vec::new();
-        for (param, ty) in self.generics.clone() {
-            for (of, args) in self.header_bounds((param, ty), &mut |_, _| Ok(true), false)? {
-                found.push((of, std::iter::once(ty).chain(args).collect()));
-            }
-        }
+        let mut found = self.param_bounds()?;
         found.extend(self.own_trait()?);
         found.extend(self.type_bounds()?);
         let mut at = 0;
@@ -90,6 +85,26 @@ impl Infer<'_, '_> {
                 }
             }
             at += 1;
+        }
+        Ok(found)
+    }
+
+    /// The trait bounds that the frame's headers put on its type parameters, each with `Self` first.
+    fn param_bounds(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        let mut found = Vec::new();
+        for (param, ty) in self.generics.clone() {
+            for (of, args) in self.header_bounds((param, ty), &mut |_, _| Ok(true), false)? {
+                found.push((of, std::iter::once(ty).chain(args).collect()));
+            }
+        }
+        Ok(found)
+    }
+
+    /// The bounds that the associated types of the traits bounding the frame's type parameters declare, as `type S: Source` gives `<T as Logos>::S`.
+    pub(super) fn param_alias_bounds(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        let mut found = Vec::new();
+        for (of, substs) in self.param_bounds()? {
+            found.extend(self.alias_bounds(of, &substs)?);
         }
         Ok(found)
     }

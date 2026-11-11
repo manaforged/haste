@@ -8,7 +8,8 @@ use crate::names::procs::{Bound, Site};
 use crate::names::path::Requests;
 use crate::names::{ItemRef, Names};
 use crate::outline::Outline;
-use crate::outline::item::{ItemKind, ProcKind};
+use crate::outline::attr::{self, split_commas};
+use crate::outline::item::{Attr, ItemKind, ProcKind};
 use crate::outline::source::Source;
 use crate::outline::tree::PROC_MACRO_ROOT;
 use crate::graph::{Targets, Workspace, store};
@@ -118,7 +119,7 @@ fn expand_bound(compilation: &mut Compilation) -> Result<bool> {
             continue;
         }
         changed = true;
-        let inputs: Vec<Vec<String>> = bound.iter().map(inputs).collect();
+        let inputs: Vec<Vec<String>> = bound.iter().map(|call| inputs(&compilation.outline, call)).collect();
         let calls: Vec<Call> = bound.iter().map(|call| (call.run, call.kind, call.krate)).collect();
         let outputs = run(compilation, &calls, &inputs)?;
         apply(compilation, &bound, outputs)?;
@@ -190,7 +191,7 @@ fn macro_name(outline: &Outline, run: ItemRef) -> String {
 }
 
 /// The texts a call runs on: the tokens between a bang call's delimiters; the item under a derive without its `#[derive]` attributes; or an attribute's arguments and the item without that attribute.
-fn inputs(call: &Bound) -> Vec<String> {
+fn inputs(outline: &Outline, call: &Bound) -> Vec<String> {
     match &call.site {
         Site::Bang(waiting) => {
             let item = &waiting.file.items.items[waiting.at as usize];
@@ -198,13 +199,14 @@ fn inputs(call: &Bound) -> Vec<String> {
         }
         Site::Derive(held) => {
             let src = &held.file.source;
-            vec![item_text(src, &held.file.items.items[held.at as usize], &|path| src.text(path) != "derive")]
+            let env = &outline.crates[call.krate].env;
+            vec![item_text(src, &held.file.items.items[held.at as usize], &|path| src.text(path) != "derive", Some(&|attrs| env.enabled(attrs)))]
         }
         Site::Attribute(held) => {
             let src = &held.file.source;
             let after = held.path.1 + 1;
             let args = if matches!(src.text(after), "(" | "[" | "{") { inside(src, after) } else { String::new() };
-            vec![args, item_text(src, &held.file.items.items[held.at as usize], &|path| path != held.path.0)]
+            vec![args, item_text(src, &held.file.items.items[held.at as usize], &|path| path != held.path.0, None)]
         }
     }
 }
@@ -215,19 +217,33 @@ fn inside(src: &Source, open: u32) -> String {
     if close > open + 1 { src.span(open + 1, close - 1).to_owned() } else { String::new() }
 }
 
-/// The text of `item` with the outer attributes whose path starts at a token that `keep` rejects left out.
-fn item_text(src: &Source, item: &crate::outline::item::Item, keep: &dyn Fn(u32) -> bool) -> String {
+/// The text of `item` with the outer attributes whose path starts at a token that `keep` rejects left out, and, as a derive sees it, the fields or variants whose attributes `enabled` rejects.
+fn item_text(src: &Source, item: &crate::outline::item::Item, keep: &dyn Fn(u32) -> bool, enabled: Option<&dyn Fn(&[Attr]) -> bool>) -> String {
     let mut parts = Vec::new();
     let mut at = item.lead;
     while at < item.start && src.text(at) == "#" {
         let close = src.pair(at + 1);
         if keep(at + 2) {
-            parts.push(src.span(at, close));
+            parts.push(src.span(at, close).to_owned());
         }
         at = close + 1;
     }
-    parts.push(src.span(at, item.end - 1));
+    match item.body.zip(enabled).and_then(|(open, enabled)| Some((open, configured(src, open, enabled)?))) {
+        Some((open, members)) => parts.extend([src.span(at, open).to_owned(), members, src.span(src.pair(open), item.end - 1).to_owned()]),
+        None => parts.push(src.span(at, item.end - 1).to_owned()),
+    }
     parts.join(" ")
+}
+
+/// The members inside the delimiter that opens at `open` whose attributes `enabled` accepts, or none when it accepts them all.
+fn configured(src: &Source, open: u32, enabled: &dyn Fn(&[Attr]) -> bool) -> Option<String> {
+    let (mut kept, mut dropped) = (Vec::new(), false);
+    for (from, to) in split_commas(src, open + 1, src.pair(open)).into_iter().filter(|(from, to)| from < to) {
+        let mut attrs = Vec::new();
+        attr::attrs(src, from, false, &mut attrs).ok()?;
+        if enabled(&attrs) { kept.push(src.spelled((from, to))) } else { dropped = true }
+    }
+    dropped.then(|| kept.join(" , "))
 }
 
 /// The two entry functions of haste's `proc_macro` crate, reading its root first if it is only declared.
