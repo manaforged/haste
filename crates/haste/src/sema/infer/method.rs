@@ -45,6 +45,7 @@ impl<'a> Infer<'_, 'a> {
     /// Infers the method call `expr`: picks the method by the receiver's type through references and borrows, as rustc probes.
     pub fn method_call(&mut self, expr: ExprId, receiver: ExprId, name: u32, params: (Option<List>, List), expected: Option<Ty>) -> Result<Ty> {
         let found = self.expr(receiver, None)?;
+        let at = name;
         let name = plain(self.src.text(name));
         let mut steps = vec![self.known_ty(found)?];
         while let Some(next) = self.next_step(expr, steps.len() as u32 - 1, steps[steps.len() - 1])? {
@@ -58,7 +59,7 @@ impl<'a> Infer<'_, 'a> {
         }
         match self.probe_steps((expr, found), name, &steps)? {
             Some((pick, derefs)) => self.picked(expr, (pick, derefs), params, expected),
-            None => Err(self.no_method(steps[steps.len() - 1], found, name)),
+            None => Err(self.no_method(steps[steps.len() - 1], found, (name, at))),
         }
     }
 
@@ -80,9 +81,11 @@ impl<'a> Infer<'_, 'a> {
         Ok(None)
     }
 
-    fn no_method(&self, last: Ty, found: Ty, name: &str) -> anyhow::Error {
+    fn no_method(&self, last: Ty, found: Ty, (name, at): (&str, u32)) -> anyhow::Error {
         match self.cx.types.kind(last) {
-            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => anyhow::anyhow!("the type of a method receiver must be known here"),
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => {
+                anyhow::anyhow!("the type of the receiver of `{name}` must be known here ({}:{}:{})", self.src.path.display(), self.src.line(at), self.src.column(at))
+            }
             _ => anyhow::anyhow!("no method `{name}` on {}", self.show(found)),
         }
     }

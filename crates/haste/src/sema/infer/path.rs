@@ -497,12 +497,36 @@ impl<'a> Infer<'_, 'a> {
 
 
     fn path_ty(&mut self, arena: &Body, path: PathId) -> Result<Ty> {
-        if let Some((qself, Some(trait_path))) = arena.path(path).qself {
-            let Some(&last) = arena.list(arena.path(path).segments).last() else { bail!("a projection with no name") };
-            return self.projection(arena, (qself, trait_path), last);
+        match arena.path(path).qself {
+            Some((qself, Some(trait_path))) => {
+                let Some(&last) = arena.list(arena.path(path).segments).last() else { bail!("a projection with no name") };
+                self.projection(arena, (qself, trait_path), last)
+            }
+            Some((qself, None)) => self.qself_ty(arena, (qself, path)),
+            None => {
+                let count = arena.path(path).segments.len as usize;
+                self.named_ty(arena, path, count, false)
+            }
         }
-        let count = arena.path(path).segments.len as usize;
-        self.named_ty(arena, path, count, false)
+    }
+
+    /// The associated type that `<Q>::Name` names when `Q` is `Self` or a type parameter, found as `Q::Name` is.
+    fn qself_ty(&mut self, arena: &Body, (qself, path): (TyId, PathId)) -> Result<Ty> {
+        let mut inner = qself;
+        while let syntax::Ty::Paren(next) = *arena.ty(inner) {
+            inner = next;
+        }
+        let owner = match *arena.ty(inner) {
+            syntax::Ty::Path(named) if arena.path(named).qself.is_none() => self.segments(arena, named).0,
+            _ => Vec::new(),
+        };
+        let name = self.segments(arena, path).0;
+        if let ([owner], [name]) = (&owner[..], &name[..])
+            && let Some(ty) = self.scoped_ty(&[*owner, *name])?
+        {
+            return Ok(ty);
+        }
+        bail!("ambiguous associated type `<{}>::{}`", self.spell(&owner), self.spell(&name))
     }
 
     /// The type that the first `count` segments of `path` name, with fresh arguments for an ADT given none when `fresh` holds.
