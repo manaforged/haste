@@ -56,7 +56,13 @@ jobs:
               exit "$status"
             fi
           }
-          while IFS=$'\t' read -r -d '' meta _; do
+          banned_paths='(^|/)\.DS_Store$|\.bak([.-].*)?$|\.(orig|rej|swp|swo)$|~$|(^|/)\.env(\..+)?$'
+          allowed_env='(^|/)\.env\.(example|sample|template)$'
+          while IFS=$'\t' read -r -d '' meta path; do
+            if printf '%s\n' "$path" | grep -qiE "$banned_paths" && ! printf '%s\n' "$path" | grep -qiE "$allowed_env"; then
+              echo "::error::Tracked path $path is an ignored editor, backup, or environment file"
+              failed=1
+            fi
             read -r _ type object <<<"$meta"
             [ "$type" = blob ] || continue
             git cat-file blob "$object" | strings > "$RUNNER_TEMP/hygiene-content"
