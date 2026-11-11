@@ -91,6 +91,11 @@ impl<'a> Context<'a> {
         self.attr_at(item, "inline").is_some_and(|at| self.item(item).0.text(at + 2) == "always")
     }
 
+    /// Whether the const function `item` is `#[rustc_promotable]`, so a reference to its call on promotable arguments lives for the whole program.
+    pub fn rustc_promotable(&self, item: ItemRef) -> bool {
+        self.attr_at(item, "rustc_promotable").is_some()
+    }
+
     /// The token of the attribute `key` that `item` carries, through `cfg_attr` whose cfg holds.
     pub(super) fn attr_at(&self, item: ItemRef, key: &str) -> Option<u32> {
         let file = self.file(item);

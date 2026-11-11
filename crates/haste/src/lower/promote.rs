@@ -27,7 +27,14 @@ impl Lower<'_, '_> {
                 Some(Res::Ctor(..) | Res::Const(_)) => true,
                 _ => false,
             },
-            Expr::Call(callee, list) => matches!(self.typed.res.get(&callee), Some(Res::Ctor(..))) && self.body.list(list).iter().all(|&at| self.promotable(ExprId(at))),
+            Expr::Call(callee, list) => {
+                let constant = match self.typed.res.get(&callee) {
+                    Some(Res::Ctor(..)) => true,
+                    Some(Res::Fn(item, _)) => self.cx.rustc_promotable(*item),
+                    _ => false,
+                };
+                constant && self.body.list(list).iter().all(|&at| self.promotable(ExprId(at)))
+            }
             Expr::Array(list) | Expr::Tuple(list) => self.body.list(list).iter().all(|&at| self.promotable(ExprId(at))),
             Expr::Struct { fields, base: None, .. } => self.body.list(fields).iter().all(|&at| self.promotable(self.body.fields[at as usize].value)),
             _ => false,
