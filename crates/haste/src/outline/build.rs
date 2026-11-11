@@ -15,6 +15,10 @@ const ATTRIBUTED: [ItemKind; 9] = [ItemKind::Fn, ItemKind::Struct, ItemKind::Enu
 const INERT: &[&str] = &[
     "allow", "warn", "deny", "forbid", "expect", "inline", "cold", "must_use", "doc", "repr", "test", "ignore", "should_panic", "deprecated", "non_exhaustive", "track_caller", "automatically_derived", "no_mangle", "export_name", "link_section", "link_name", "used", "target_feature", "stable", "unstable", "const_stable", "feature", "lang", "diagnostic", "rustfmt", "clippy",
 ];
+/// Whether the attribute `name` is builtin, so it never names an attribute macro.
+pub(super) fn inert(name: &str) -> bool {
+    INERT.contains(&name) || name.starts_with("rustc_")
+}
 const BUILTIN: [&str; 6] = ["include", "global_asm", "compile_error", "concat", "env", "asm"];
 
 /// What a macro lookup in a crate's exports found.
@@ -119,7 +123,7 @@ impl Loader<'_> {
         for attr in &item.attrs {
             let Attr::Other(first) = *attr else { continue };
             let name = src.text(first);
-            if INERT.contains(&name) || name.starts_with("rustc_") {
+            if inert(name) {
                 continue;
             }
             let mut last = first;

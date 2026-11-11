@@ -12,9 +12,33 @@ use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
 pub struct Token {
     pub kind: TokenKind,
     pub start: u32,
-    pub len: u32,
-    pub pair: u32,
-    pub joint: bool,
+    len: u32,
+    pair: u32,
+}
+
+/// The bit of a token's length that marks it joint to the next token.
+const JOINT: u32 = 1 << 31;
+
+impl Token {
+    fn new(kind: TokenKind, start: u32, len: u32, joint: bool) -> Token {
+        let mut token = Token { kind, start, len, pair: u32::MAX };
+        token.set_joint(joint);
+        token
+    }
+
+    /// The byte offset just past the token.
+    fn end(self) -> u32 {
+        self.start + (self.len & !JOINT)
+    }
+
+    /// Whether the next token follows with no space between them.
+    fn joint(self) -> bool {
+        self.len & JOINT != 0
+    }
+
+    fn set_joint(&mut self, joint: bool) {
+        self.len = (self.len & !JOINT) | (u32::from(joint) * JOINT);
+    }
 }
 
 /// Whether `kind` is a doc comment, and whether it documents the enclosing item.
@@ -93,24 +117,27 @@ impl Tokens {
         if !joint {
             self.text.push(' ');
         }
-        self.tokens.push(Token { kind, start, len: text.len() as u32, pair: u32::MAX, joint });
+        self.tokens.push(Token::new(kind, start, text.len() as u32, joint));
     }
 
     /// Copies token `at` of `src`, with its spacing and its origin mark.
     pub fn copy(&mut self, src: &Source, at: u32) {
         let (layer, local) = src.layer(at);
-        let mark = layer.own_mark(local as u32);
-        self.copy_marked(src, at, mark);
+        self.copy_local(layer, local, layer.own_mark(local as u32));
     }
 
     /// Copies token `at` of `src` with its spacing, marked as coming from `mark`.
     pub fn copy_marked(&mut self, src: &Source, at: u32, mark: Option<Mark>) {
         let (layer, local) = src.layer(at);
+        self.copy_local(layer, local, mark);
+    }
+
+    fn copy_local(&mut self, layer: &Source, local: usize, mark: Option<Mark>) {
         let token = layer.tokens[local];
         if let Some(mark) = mark {
             self.marks.push((self.tokens.len() as u32, mark));
         }
-        self.append(token.kind, &layer.text[token.start as usize..(token.start + token.len) as usize], token.joint);
+        self.append(token.kind, &layer.text[token.start as usize..token.end() as usize], token.joint());
     }
 
     /// Writes the name `name`, marked as coming from `mark`.
@@ -144,8 +171,8 @@ impl Tokens {
 
     /// Ends the last token's spacing, so it never joins the next one.
     pub fn space(&mut self) {
-        if let Some(last) = self.tokens.last_mut().filter(|last| last.joint) {
-            last.joint = false;
+        if let Some(last) = self.tokens.last_mut().filter(|last| last.joint()) {
+            last.set_joint(false);
             self.text.push(' ');
         }
     }
@@ -194,23 +221,6 @@ fn closes(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::CloseParen | TokenKind::CloseBrace | TokenKind::CloseBracket)
 }
 
-fn tokens_of(text: &str, base: u32, into: &mut Vec<Token>) {
-    let mut start = base;
-    let mut joint = false;
-    for token in tokenize(text, FrontmatterAllowed::No) {
-        if is_trivia(token.kind) {
-            joint = false;
-        } else {
-            if joint && let Some(last) = into.last_mut() {
-                last.joint = true;
-            }
-            into.push(Token { kind: token.kind, start, len: token.len, pair: u32::MAX, joint: false });
-            joint = true;
-        }
-        start += token.len;
-    }
-}
-
 fn raw_hashes(body: &str) -> usize {
     let bytes = body.as_bytes();
     let runs = bytes.iter().enumerate().filter(|(_, byte)| **byte == b'"').map(|(at, _)| bytes[at + 1..].iter().take_while(|byte| **byte == b'#').count());
@@ -223,7 +233,7 @@ fn doc_tokens(comment: &str, inner: bool, (tail, base): (&mut String, u32), into
     let mut emit = |tail: &mut String, kind: TokenKind, pieces: &[&str]| {
         let start = base + tail.len() as u32;
         pieces.iter().for_each(|piece| tail.push_str(piece));
-        into.push(Token { kind, start, len: base + tail.len() as u32 - start, pair: u32::MAX, joint: true });
+        into.push(Token::new(kind, start, base + tail.len() as u32 - start, true));
     };
     emit(tail, TokenKind::Pound, &["#"]);
     if inner {
@@ -237,36 +247,233 @@ fn doc_tokens(comment: &str, inner: bool, (tail, base): (&mut String, u32), into
     emit(tail, literal, &["r", fence, "\"", body, "\"", fence]);
     emit(tail, TokenKind::CloseBracket, &["]"]);
     if let Some(last) = into.last_mut() {
-        last.joint = false;
+        last.set_joint(false);
     }
     tail.push('\n');
+}
+
+/// What the lexer knows of one open delimited group.
+#[derive(Clone, Copy, Default)]
+struct Group {
+    /// Every doc comment inside is kept: the group is macro input, or part of an item that a macro reads.
+    keep: bool,
+    /// The attributes read last at this level hand their item to a macro, so the groups of that item keep their doc comments.
+    shown: bool,
+    /// The last token at this level closed a brace group, so a name now starts another item.
+    after_brace: bool,
+}
+
+/// The doc comments and attributes in front of one item, still being read.
+#[derive(Clone, Copy)]
+struct Run {
+    from: usize,
+    depth: usize,
+    docs: bool,
+    shown: bool,
+    attr: usize,
+}
+
+/// The tokens of one file as they are lexed: doc comments become `#[doc = r"..."]` where a macro can read them, and are dropped where nothing reads them.
+struct Lexer<'a> {
+    text: &'a str,
+    tail: String,
+    tokens: Vec<Token>,
+    groups: Vec<Group>,
+    run: Option<Run>,
+    after_doc: bool,
+    spare: Vec<Token>,
+}
+
+impl<'a> Lexer<'a> {
+    fn new(text: &'a str) -> Self {
+        Lexer { text, tail: String::new(), tokens: Vec::with_capacity(text.len() / 5), groups: vec![Group::default()], run: None, after_doc: false, spare: Vec::new() }
+    }
+
+    fn group(&mut self) -> &mut Group {
+        let last = self.groups.len() - 1;
+        &mut self.groups[last]
+    }
+
+    /// The text of `token`, in the file or in the doc text written after it.
+    fn piece(&self, token: &Token) -> &str {
+        let (start, end, len) = (token.start as usize, token.end() as usize, self.text.len());
+        if start < len { &self.text[start..end] } else { &self.tail[start - len..end - len] }
+    }
+
+    fn push(&mut self, token: Token, joint: bool) {
+        if joint && !self.after_doc && let Some(last) = self.tokens.last_mut() {
+            last.set_joint(true);
+        }
+        self.after_doc = doc(token.kind).is_some();
+        if let Some(run) = self.run.filter(|run| !self.continues(run, token.kind)) {
+            self.run = None;
+            self.settle(run);
+        }
+        let keep = self.group().keep;
+        match doc(token.kind) {
+            Some(inner) if keep => self.expand(token, inner),
+            Some(_) => {
+                self.start_run().docs = true;
+                self.tokens.push(token);
+            }
+            None => {
+                if token.kind == TokenKind::Pound && !keep {
+                    self.start_run();
+                }
+                self.tokens.push(token);
+                self.track(token.kind);
+            }
+        }
+    }
+
+    fn start_run(&mut self) -> &mut Run {
+        let (from, depth) = (self.tokens.len(), self.groups.len());
+        self.run.get_or_insert(Run { from, depth, docs: false, shown: false, attr: 0 })
+    }
+
+    /// Whether a token of `kind` still belongs to the doc comments and attributes of `run`.
+    fn continues(&self, run: &Run, kind: TokenKind) -> bool {
+        if self.groups.len() > run.depth || doc(kind).is_some() {
+            return true;
+        }
+        let last = self.tokens.last().map(|token| token.kind);
+        match kind {
+            TokenKind::Pound => true,
+            TokenKind::Bang => last == Some(TokenKind::Pound),
+            TokenKind::OpenBracket => matches!(last, Some(TokenKind::Pound | TokenKind::Bang)),
+            _ => false,
+        }
+    }
+
+    /// Ends `run`: its doc comments become attributes when an attribute of the run hands the item to a macro, and are dropped otherwise.
+    fn settle(&mut self, run: Run) {
+        self.group().shown = run.shown;
+        if !run.docs {
+            return;
+        }
+        if run.shown {
+            let mut spare = std::mem::take(&mut self.spare);
+            spare.extend(self.tokens.drain(run.from..));
+            for token in spare.drain(..) {
+                match doc(token.kind) {
+                    Some(inner) => self.expand(token, inner),
+                    None => self.tokens.push(token),
+                }
+            }
+            self.spare = spare;
+        } else {
+            self.drop_docs(run.from);
+        }
+    }
+
+    fn drop_docs(&mut self, from: usize) {
+        let mut write = from;
+        for read in from..self.tokens.len() {
+            let token = self.tokens[read];
+            if doc(token.kind).is_none() {
+                self.tokens[write] = token;
+                write += 1;
+            } else if let Some(before) = write.checked_sub(1) {
+                self.tokens[before].set_joint(false);
+            }
+        }
+        self.tokens.truncate(write);
+    }
+
+    fn expand(&mut self, token: Token, inner: bool) {
+        if self.tail.is_empty() {
+            self.tail.push('\n');
+        }
+        let text = self.text;
+        doc_tokens(&text[token.start as usize..token.end() as usize], inner, (&mut self.tail, text.len() as u32), &mut self.tokens);
+    }
+
+    fn track(&mut self, kind: TokenKind) {
+        if opens(kind) {
+            self.open();
+        } else if closes(kind) {
+            self.close(kind);
+        } else {
+            let word = matches!(kind, TokenKind::Ident | TokenKind::RawIdent);
+            let named_macro = kind == TokenKind::Ident && self.tokens.last().is_some_and(|last| self.piece(last) == "macro");
+            let group = self.group();
+            if kind == TokenKind::Semi || (word && group.after_brace) {
+                group.shown = false;
+            }
+            group.after_brace = false;
+            group.shown |= named_macro;
+        }
+    }
+
+    fn open(&mut self) {
+        let before = |back: usize| self.tokens.len().checked_sub(back + 1).map(|at| self.tokens[at].kind);
+        let call = before(1) == Some(TokenKind::Bang) || (matches!(before(1), Some(TokenKind::Ident | TokenKind::RawIdent)) && before(2) == Some(TokenKind::Bang));
+        let depth = self.groups.len();
+        let at = self.tokens.len() - 1;
+        if let Some(run) = self.run.as_mut().filter(|run| run.depth == depth) {
+            run.attr = at;
+        }
+        let parent = self.group();
+        parent.after_brace = false;
+        let keep = parent.keep || parent.shown || call;
+        self.groups.push(Group { keep, ..Group::default() });
+    }
+
+    fn close(&mut self, kind: TokenKind) {
+        if self.groups.len() > 1 {
+            self.groups.pop();
+        }
+        self.group().after_brace = kind == TokenKind::CloseBrace;
+        let (depth, end) = (self.groups.len(), self.tokens.len() - 1);
+        if let Some(run) = self.run.filter(|run| run.depth == depth && run.attr < end) {
+            let shown = self.reaches_macro(&self.tokens[run.attr + 1..end]);
+            if let Some(run) = self.run.as_mut() {
+                run.shown |= shown;
+            }
+        }
+    }
+
+    /// Whether the attribute with `attr` inside its brackets hands the item it stands on to a macro: a derive, also under `cfg_attr`, or any path that is not a builtin attribute.
+    fn reaches_macro(&self, attr: &[Token]) -> bool {
+        let word = |token: &Token| (token.kind == TokenKind::Ident).then(|| self.piece(token));
+        let call = attr.get(1).is_some_and(|next| next.kind == TokenKind::OpenParen);
+        match attr.first().and_then(word) {
+            None => true,
+            Some(name @ ("cfg" | "cfg_attr")) if call => name == "cfg_attr" && attr.iter().filter_map(word).any(|path| matches!(path, "derive" | "derive_const")),
+            Some(name) => !super::build::inert(name),
+        }
+    }
+
+    fn finish(mut self) -> (Vec<Token>, String) {
+        if let Some(run) = self.run.take() {
+            self.settle(run);
+        }
+        (self.tokens, self.tail)
+    }
 }
 
 fn lex(text: &mut String) -> Vec<Token> {
     let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
     let skip = bom + rustc_lexer::strip_shebang(&text[bom..]).unwrap_or(0);
-    let mut raw = Vec::with_capacity(text.len() / 5);
-    tokens_of(&text[skip..], skip as u32, &mut raw);
-    let docs: Vec<usize> = raw.iter().filter(|token| doc(token.kind).is_some()).map(|token| token.len as usize).collect();
-    if docs.is_empty() {
-        return raw;
-    }
-    let base = text.len() as u32 + 1;
-    let mut tail = String::with_capacity(1 + docs.iter().map(|len| len + 16).sum::<usize>());
-    tail.push('\n');
-    let mut tokens = Vec::with_capacity(raw.len() + docs.len() * 7);
-    for token in raw {
-        match doc(token.kind) {
-            Some(inner) => doc_tokens(&text[token.start as usize..(token.start + token.len) as usize], inner, (&mut tail, base - 1), &mut tokens),
-            None => tokens.push(token),
+    let mut lexer = Lexer::new(text);
+    let (mut start, mut joint) = (skip as u32, false);
+    for token in tokenize(&text[skip..], FrontmatterAllowed::No) {
+        if is_trivia(token.kind) {
+            joint = false;
+        } else {
+            lexer.push(Token::new(token.kind, start, token.len, false), joint);
+            joint = true;
         }
+        start += token.len;
     }
+    let (tokens, tail) = lexer.finish();
+    text.reserve_exact(tail.len());
     text.push_str(&tail);
     tokens
 }
 
 fn pair_up(tokens: &mut [Token], path: &Path) -> Result<()> {
-    let mut open = Vec::new();
+    let mut open = Vec::with_capacity(64);
     for at in 0..tokens.len() {
         let kind = tokens[at].kind;
         if opens(kind) {
@@ -291,7 +498,14 @@ impl Source {
 
     /// Reads and lexes the file at `path`.
     pub fn read(path: &Path) -> Result<Source> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let read = || -> std::io::Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let len = file.metadata()?.len() as usize;
+            let mut text = String::with_capacity(len + len / 8);
+            std::io::Read::read_to_string(&mut file, &mut text)?;
+            Ok(text)
+        };
+        let text = read().with_context(|| format!("reading {}", path.display()))?;
         Source::parse(path.to_owned(), text)
     }
 
@@ -326,7 +540,7 @@ impl Source {
         }
         let ((first, start), (last, end)) = (self.layer(from), self.layer(to - 1));
         if std::ptr::eq(first, last) {
-            let span = &first.text[first.tokens[start].start as usize..(last.tokens[end].start + last.tokens[end].len) as usize];
+            let span = &first.text[first.tokens[start].start as usize..last.tokens[end].end() as usize];
             if !span.contains(word) {
                 return false;
             }
@@ -338,7 +552,7 @@ impl Source {
     pub fn text(&self, at: u32) -> &str {
         let (src, local) = self.layer(at);
         let token = src.tokens[local];
-        &src.text[token.start as usize..(token.start + token.len) as usize]
+        &src.text[token.start as usize..token.end() as usize]
     }
 
     /// The source text from the start of token `from` to the end of token `to`, inclusive, within the layer of `from`.
@@ -346,7 +560,7 @@ impl Source {
         let (src, first) = self.layer(from);
         let last = if src.offset == self.offset { (to - self.offset) as usize } else { (to.min(self.offset - 1)) as usize };
         let (first, last) = (src.tokens[first], src.tokens[last]);
-        &src.text[first.start as usize..(last.start + last.len) as usize]
+        &src.text[first.start as usize..last.end() as usize]
     }
 
     /// The kind of token `at`, or `Eof` past the end.
@@ -393,7 +607,7 @@ impl Source {
 
     pub fn joint(&self, at: u32) -> bool {
         let (src, local) = self.layer(at);
-        src.tokens[local].joint
+        src.tokens[local].joint()
     }
 
     /// The crate that the `$crate` starting at token `at` names, when a macro wrote it.
