@@ -80,11 +80,16 @@ fn predicate_bounds<'b>(arena: &'b Body, src: &'b Source, predicates: &'b [Predi
 }
 
 fn names_param(arena: &Body, src: &Source, ty: TyId, name: &str) -> bool {
-    let SyntaxTy::Path(path) = *arena.ty(ty) else { return false };
+    one_name(arena, src, ty) == Some(name)
+}
+
+/// The name that the type `ty` spells when it is a path of one segment with no qualified self, as a type parameter is.
+pub(super) fn one_name<'s>(arena: &Body, src: &'s Source, ty: TyId) -> Option<&'s str> {
+    let SyntaxTy::Path(path) = *arena.ty(ty) else { return None };
     let path = arena.path(path);
     match arena.list(path.segments) {
-        [segment] => path.qself.is_none() && src.text(arena.segments[*segment as usize].name) == name,
-        _ => false,
+        [segment] if path.qself.is_none() => Some(src.text(arena.segments[*segment as usize].name)),
+        _ => None,
     }
 }
 

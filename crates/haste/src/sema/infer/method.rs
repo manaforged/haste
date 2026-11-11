@@ -201,6 +201,12 @@ impl<'a> Infer<'_, 'a> {
                 found.extend(self.implied_traits(vec![of])?.into_iter().map(|of| (of, ty)));
             }
         }
+        for (of, substs) in self.type_bounds()? {
+            let ty = self.substitute(substs[0]);
+            if steps.contains(&ty) && self.reaches_member(of, name)? {
+                found.extend(self.implied_traits(vec![of])?.into_iter().map(|of| (of, ty)));
+            }
+        }
         let owner = self.instance.as_ref().and_then(|(item, _)| self.cx.owner_trait(*item)).filter(|_| self.block.is_none());
         if let (Some(of), Some(ty)) = (owner, self.self_ty.map(|ty| self.substitute(ty)))
             && steps.contains(&ty)
