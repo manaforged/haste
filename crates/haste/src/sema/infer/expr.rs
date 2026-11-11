@@ -487,7 +487,7 @@ impl Infer<'_, '_> {
         self.diverges = before || (then_diverges && self.diverges);
         let target = match self.known(expected) {
             Some(target) => target,
-            None => match self.slice_branch(then_ty, else_ty).map_or_else(|| self.fn_branch(then_ty, else_ty), |target| Ok(Some(target)))? {
+            None => match self.branch_target(then_ty, else_ty)? {
                 Some(target) => target,
                 None => return self.join(then_ty, else_ty),
             },
@@ -515,6 +515,18 @@ impl Infer<'_, '_> {
         }
         self.unify(a, b)?;
         Ok(a)
+    }
+
+    /// The type both branches of an `if` coerce to when they differ: an unsized slice, a function pointer, or the first branch's reference that the second derefs to.
+    fn branch_target(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
+        if let Some(target) = self.slice_branch(a, b) {
+            return Ok(Some(target));
+        }
+        if let Some(target) = self.fn_branch(a, b)? {
+            return Ok(Some(target));
+        }
+        let refs = [a, b].iter().all(|&ty| matches!(self.cx.types.kind(self.resolve(ty)), Kind::Ref(..)));
+        Ok(if refs { self.trial(|infer| Ok(infer.coercion(b, a).ok().flatten()))?.map(|_| a) } else { None })
     }
 
     /// The branch type that the other branch unsizes to, when one branch points to an array and the other to a slice, as rustc's common type of two branches does.
