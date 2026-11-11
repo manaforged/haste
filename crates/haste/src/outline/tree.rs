@@ -190,10 +190,40 @@ pub struct Crate {
     pub expansions: usize,
 }
 
+/// What a loader of another crate sees of one crate: its exported macros and whether it may still export more.
+#[derive(Debug, Default)]
+pub struct View {
+    pub exports: HashMap<String, Arc<Macro>>,
+    pub partial: bool,
+}
+
 impl Crate {
+    /// The modules declared but not read yet.
+    pub fn declared(&self) -> impl Iterator<Item = usize> + '_ {
+        self.modules.iter().enumerate().filter(|(_, module)| matches!(module.state, State::Declared(_))).map(|(at, _)| at)
+    }
+
     /// Whether some declared module is not read yet.
     pub fn partial(&self) -> bool {
-        self.modules.iter().any(|module| matches!(module.state, State::Declared(_)))
+        self.declared().next().is_some()
+    }
+
+    /// Whether the crate may still export more: a declared module is unread, or a loader holds the crate.
+    pub fn unsettled(&self) -> bool {
+        self.partial() || self.modules.is_empty()
+    }
+
+    /// What a loader of another crate sees of this crate now.
+    pub fn view(&self) -> View {
+        View { exports: self.exports.clone(), partial: self.unsettled() }
+    }
+
+    /// The files that may hold module `module` while a `mod` item without a body only declares it; empty otherwise.
+    pub fn unread_files(&self, module: usize) -> &[PathBuf] {
+        match &self.modules[module].state {
+            State::Declared(Decl::File { candidates, .. }) => candidates,
+            _ => &[],
+        }
     }
 
     /// How much of the crate is read: its files, impls, item-holding bodies and consumed items, and whether a declared module is still unread; loading, expanding or consuming changes it.
