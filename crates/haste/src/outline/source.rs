@@ -349,6 +349,18 @@ impl Source {
     }
 
     /// Whether token `at` is followed by the next token with no space between them.
+    /// The tokens from `from` up to `to` as `stringify!` spells them.
+    pub fn spelled(&self, (from, to): (u32, u32)) -> String {
+        let mut text = String::new();
+        for at in from..to {
+            text.push_str(self.text(at));
+            if at + 1 < to && !self.joint(at) {
+                text.push(' ');
+            }
+        }
+        text
+    }
+
     pub fn joint(&self, at: u32) -> bool {
         let (src, local) = self.layer(at);
         src.tokens[local].joint

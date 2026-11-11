@@ -64,18 +64,6 @@ impl Context<'_> {
     }
 }
 
-/// The tokens from `from` up to `to` as `stringify!` spells them.
-pub fn spelled(src: &Source, (from, to): (u32, u32)) -> String {
-    let mut text = String::new();
-    for at in from..to {
-        text.push_str(src.text(at));
-        if at + 1 < to && !src.joint(at) {
-            text.push(' ');
-        }
-    }
-    text
-}
-
 /// Writes `$crate` of crate `krate` and then `rest`.
 pub fn crate_path(out: &mut Tokens, krate: u32, rest: &str) {
     out.dollar_crate(krate);
@@ -91,7 +79,7 @@ pub fn assert(src: &Source, args: &[(u32, u32)], krate: u32, out: &mut Tokens) {
     match args.get(1) {
         None => {
             crate_path(out, krate, "::panicking::panic");
-            out.lexed(&format!("({:?})", format!("assertion failed: {}", spelled(src, (from, to)))));
+            out.lexed(&format!("({:?})", format!("assertion failed: {}", src.spelled((from, to)))));
         }
         Some(&(rest, _)) => {
             crate_path(out, krate, "::panic::panic_2021!");
@@ -114,7 +102,7 @@ pub fn asm_barrier(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Resul
             }
             _ if matches!(src.text(from), "in" | "inout") && !(from..to).any(|at| src.text(at) == "=>") => {}
             _ if src.text(from) == "options" => {}
-            _ => bail!("inline assembly operand `{}` is not supported", spelled(src, (from, to))),
+            _ => bail!("inline assembly operand `{}` is not supported", src.spelled((from, to))),
         }
     }
     out.lexed("()");

@@ -398,10 +398,13 @@ impl Loader<'_> {
     }
 }
 
-/// The text of the tokens from `from` up to `to` when they are a string literal or a `concat!` or `env!` of them.
+/// The text of the tokens from `from` up to `to` when they are a string literal or a `concat!`, `env!` or `stringify!` of them, inside the parentheses that a macro puts around an expression fragment.
 fn path_text(src: &Source, (from, to): (u32, u32), env: &super::tree::Env) -> Option<String> {
     if to == from + 1 {
         return src.literal_text(from).ok().flatten();
+    }
+    if src.text(from) == "(" && src.pair(from) == to - 1 {
+        return path_text(src, (from + 1, to - 1), env);
     }
     if to < from + 3 || src.text(from + 1) != "!" {
         return None;
@@ -410,6 +413,7 @@ fn path_text(src: &Source, (from, to): (u32, u32), env: &super::tree::Env) -> Op
     match src.text(from) {
         "concat" => parts.into_iter().map(|range| path_text(src, range, env)).collect(),
         "env" => env.var(&path_text(src, *parts.first()?, env)?),
+        "stringify" => Some(src.spelled((from + 3, src.pair(from + 2)))),
         _ => None,
     }
 }

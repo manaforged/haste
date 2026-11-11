@@ -470,6 +470,6 @@ fn position(src: &Source, site: Site, input: (u32, u32), out: &mut Tokens) {
         Builtin::Line => out.lexed(&format!("{}u32", src.line(site.start))),
         Builtin::Column => out.lexed(&format!("{}u32", src.column(site.start))),
         Builtin::File => out.lexed(&format!("{:?}", src.path.display().to_string())),
-        _ => out.lexed(&format!("{:?}", builtin::spelled(src, input))),
+        _ => out.lexed(&format!("{:?}", src.spelled(input))),
     }
 }
