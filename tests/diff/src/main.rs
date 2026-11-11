@@ -1,3 +1,5 @@
+mod stencils;
+
 #[derive(Clone, Copy)]
 struct Pair {
     a: i64,
@@ -1140,7 +1142,7 @@ fn main() {
         ("case_const_compound_types", case_const_compound_types),
         ("case_macro_opaque_forward", case_macro_opaque_forward),
     ];
-    for (name, case) in cases {
+    for (name, case) in cases.iter().chain(stencils::CASES) {
         for input in [-5_i64, 0, 1, 3, 20] {
             println!("{name} {input} {}", case(input));
         }

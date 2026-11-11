@@ -6,8 +6,8 @@ use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-/// The bytes one stub takes in stub memory, at most.
 pub(super) const STUB_BYTES: usize = 32;
+pub(super) const TIER_UP_BIT: u32 = 1 << 31;
 
 static TABLE: AtomicUsize = AtomicUsize::new(0);
 static STUBS_FROM: AtomicUsize = AtomicUsize::new(0);
@@ -112,6 +112,10 @@ unsafe extern "C" {
     fn haste_stub_entry();
 }
 
+pub(super) fn entry_addr() -> usize {
+    haste_stub_entry as *const () as usize
+}
+
 /// The machine code of the stub of call table slot `index`: it puts the index in r11 and jumps to the shared entry, which keeps every argument register.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn code(index: usize) -> Vec<u8> {
@@ -160,11 +164,12 @@ fn ask(index: usize) -> std::io::Result<usize> {
 }
 
 extern "C" fn resolve(index: usize) -> usize {
-    if let Some(code) = compiled(index) {
+    let tier_up = index & (TIER_UP_BIT as usize) != 0;
+    if !tier_up && let Some(code) = compiled(index) {
         return code;
     }
     let _talk = TALK.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(code) = compiled(index) {
+    if !tier_up && let Some(code) = compiled(index) {
         return code;
     }
     match ask(index) {

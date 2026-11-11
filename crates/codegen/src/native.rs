@@ -1,8 +1,9 @@
 use crate::ir::{AbiParam, Binary, CallConv, Convert, Function, Inst, InstData, Op, SigRef, Signature, Type, Value};
+use crate::reloc::RuntimeSymbol;
 
 /// A helper compiled into haste that one instruction becomes a call to.
 struct Helper {
-    address: usize,
+    symbol: RuntimeSymbol,
     args: Vec<Value>,
     result: Option<Value>,
 }
@@ -22,7 +23,7 @@ pub(crate) fn lower(func: &mut Function) {
             if let Some(helper) = helper(func, &consts, &func.insts[inst.index()]) {
                 let sig = signature(func, &helper);
                 let callee = func.value(Type::I64);
-                func.insts.push(InstData { op: Op::Const(helper.address as i64), result: Some(callee) });
+                func.insts.push(InstData { op: Op::Runtime(helper.symbol), result: Some(callee) });
                 func.blocks[block].insts.insert(at, Inst(func.insts.len() as u32 - 1));
                 let data = &mut func.insts[inst.index()];
                 data.op = Op::Call { sig, callee, args: helper.args, results: helper.result.into_iter().collect() };
@@ -35,15 +36,15 @@ pub(crate) fn lower(func: &mut Function) {
 }
 
 fn helper(func: &Function, consts: &[Option<i64>], data: &InstData) -> Option<Helper> {
-    let (address, args) = match data.op {
+    let (symbol, args) = match data.op {
         Op::Copy(to, from, bytes) if consts.get(bytes.index()).copied().flatten().and_then(crate::copy::chunks).is_none() => {
-            (libc::memmove as *const () as usize, vec![to, from, bytes])
+            (RuntimeSymbol::Memmove, vec![to, from, bytes])
         }
         Op::Binary(op, x, y) if func.ty(x) == Type::I128 => (wide_binary(op)?, vec![x, y]),
         Op::Convert(op, x) => (convert(op, func.ty(x), func.ty(data.result?))?, vec![x]),
         _ => return None,
     };
-    Some(Helper { address, args, result: data.result })
+    Some(Helper { symbol, args, result: data.result })
 }
 
 fn signature(func: &mut Function, helper: &Helper) -> SigRef {
@@ -55,76 +56,26 @@ fn signature(func: &mut Function, helper: &Helper) -> SigRef {
 }
 
 /// The helper for a 128-bit division or remainder. MIR asserts a nonzero divisor and no signed overflow first, so the helpers wrap instead of panicking.
-fn wide_binary(op: Binary) -> Option<usize> {
-    let address: extern "C" fn(i128, i128) -> i128 = match op {
-        Binary::Sdiv => sdiv,
-        Binary::Udiv => udiv,
-        Binary::Srem => srem,
-        Binary::Urem => urem,
-        _ => return None,
-    };
-    Some(address as usize)
+fn wide_binary(op: Binary) -> Option<RuntimeSymbol> {
+    match op {
+        Binary::Sdiv => Some(RuntimeSymbol::I128Sdiv),
+        Binary::Udiv => Some(RuntimeSymbol::I128Udiv),
+        Binary::Srem => Some(RuntimeSymbol::I128Srem),
+        Binary::Urem => Some(RuntimeSymbol::I128Urem),
+        _ => None,
+    }
 }
 
-fn convert(op: Convert, from: Type, to: Type) -> Option<usize> {
-    let address = match (op, from, to) {
-        (Convert::ToSintSat, Type::F32, Type::I128) => f32_to_i128 as extern "C" fn(f32) -> i128 as usize,
-        (Convert::ToSintSat, Type::F64, Type::I128) => f64_to_i128 as extern "C" fn(f64) -> i128 as usize,
-        (Convert::ToUintSat, Type::F32, Type::I128) => f32_to_u128 as extern "C" fn(f32) -> u128 as usize,
-        (Convert::ToUintSat, Type::F64, Type::I128) => f64_to_u128 as extern "C" fn(f64) -> u128 as usize,
-        (Convert::FromSint, Type::I128, Type::F32) => i128_to_f32 as extern "C" fn(i128) -> f32 as usize,
-        (Convert::FromSint, Type::I128, Type::F64) => i128_to_f64 as extern "C" fn(i128) -> f64 as usize,
-        (Convert::FromUint, Type::I128, Type::F32) => u128_to_f32 as extern "C" fn(u128) -> f32 as usize,
-        (Convert::FromUint, Type::I128, Type::F64) => u128_to_f64 as extern "C" fn(u128) -> f64 as usize,
-        _ => return None,
-    };
-    Some(address)
-}
-
-extern "C" fn sdiv(x: i128, y: i128) -> i128 {
-    x.wrapping_div(y)
-}
-
-extern "C" fn udiv(x: i128, y: i128) -> i128 {
-    ((x as u128) / (y as u128)) as i128
-}
-
-extern "C" fn srem(x: i128, y: i128) -> i128 {
-    x.wrapping_rem(y)
-}
-
-extern "C" fn urem(x: i128, y: i128) -> i128 {
-    ((x as u128) % (y as u128)) as i128
-}
-
-extern "C" fn f32_to_i128(x: f32) -> i128 {
-    x as i128
-}
-
-extern "C" fn f64_to_i128(x: f64) -> i128 {
-    x as i128
-}
-
-extern "C" fn f32_to_u128(x: f32) -> u128 {
-    x as u128
-}
-
-extern "C" fn f64_to_u128(x: f64) -> u128 {
-    x as u128
-}
-
-extern "C" fn i128_to_f32(x: i128) -> f32 {
-    x as f32
-}
-
-extern "C" fn i128_to_f64(x: i128) -> f64 {
-    x as f64
-}
-
-extern "C" fn u128_to_f32(x: u128) -> f32 {
-    x as f32
-}
-
-extern "C" fn u128_to_f64(x: u128) -> f64 {
-    x as f64
+fn convert(op: Convert, from: Type, to: Type) -> Option<RuntimeSymbol> {
+    match (op, from, to) {
+        (Convert::ToSintSat, Type::F32, Type::I128) => Some(RuntimeSymbol::F32ToI128),
+        (Convert::ToSintSat, Type::F64, Type::I128) => Some(RuntimeSymbol::F64ToI128),
+        (Convert::ToUintSat, Type::F32, Type::I128) => Some(RuntimeSymbol::F32ToU128),
+        (Convert::ToUintSat, Type::F64, Type::I128) => Some(RuntimeSymbol::F64ToU128),
+        (Convert::FromSint, Type::I128, Type::F32) => Some(RuntimeSymbol::I128ToF32),
+        (Convert::FromSint, Type::I128, Type::F64) => Some(RuntimeSymbol::I128ToF64),
+        (Convert::FromUint, Type::I128, Type::F32) => Some(RuntimeSymbol::U128ToF32),
+        (Convert::FromUint, Type::I128, Type::F64) => Some(RuntimeSymbol::U128ToF64),
+        _ => None,
+    }
 }

@@ -132,7 +132,7 @@ pub(super) fn inline_flags(cx: &mut Context<'_>, reached: &Reached) -> Vec<bool>
     for (index, flag) in flags.iter_mut().enumerate() {
         let ((item, _), typed) = &reached.list[index];
         if typed.is_ok() && !cx.foreign(*item) {
-            *flag = lower::inline_body(cx, reached, &slots, index).is_some();
+            *flag = lower::can_inline_body(cx, reached, &slots, index);
         }
     }
     flags

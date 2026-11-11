@@ -38,12 +38,10 @@ impl Lower<'_, '_> {
         self.block(stmts, tail)
     }
 
-    /// Hands the split of the coroutine's resume function to the code generator.
     pub(super) fn finish_resume(&mut self) -> Result<()> {
         let Some(resume) = self.resume.take() else { return Ok(()) };
-        let (Some(alloc), Some(free)) = (crate::host::symbol("malloc"), crate::host::symbol("free")) else { bail!("no `malloc` or `free` for coroutine frames") };
         let object = usize::from(resume.sret.is_some());
-        self.b.func.coroutine = Some(Coroutine { object, header: resume.header, resumes: resume.resumes, done: resume.done, alloc: alloc as i64, free: free as i64 });
+        self.b.func.coroutine = Some(Coroutine { object, header: resume.header, resumes: resume.resumes, done: resume.done });
         Ok(())
     }
 

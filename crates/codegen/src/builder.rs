@@ -2,26 +2,45 @@ use crate::ir::{
     AtomicRmwOp, Binary, Block, BlockData, Convert, FloatCC, Function, Inst, InstData, IntCC, Op, SigRef, Signature, SlotData,
     StackSlot, Type, Unary, Value,
 };
+use crate::probe::Probe;
+use crate::reloc::RuntimeSymbol;
 
 /// Appends blocks, values and instructions to a function.
 pub struct FunctionBuilder<'f> {
     pub func: &'f mut Function,
     current: Option<Block>,
     incoming: Vec<u32>,
+    probe: Option<Probe>,
 }
 
 impl<'f> FunctionBuilder<'f> {
     /// A builder that appends to `func`.
     pub fn new(func: &'f mut Function) -> Self {
         let incoming = vec![0; func.blocks.len()];
-        Self { func, current: None, incoming }
+        Self { func, current: None, incoming, probe: None }
+    }
+
+    /// A builder that hashes `func`'s footprint without allocating instructions.
+    pub fn new_probe(func: &'f mut Function) -> Self {
+        let probe = Probe::new(&func.signature);
+        let incoming = vec![0; func.blocks.len()];
+        Self { func, current: None, incoming, probe: Some(probe) }
+    }
+
+    /// Finishes probing and returns the 128-bit footprint digest.
+    pub fn finish_probe(mut self) -> u128 {
+        self.probe.take().map_or(0, |probe| probe.finish(self.func.coroutine.as_ref()))
     }
 
     /// Adds an empty block.
     pub fn create_block(&mut self) -> Block {
         self.func.blocks.push(BlockData::default());
         self.incoming.push(0);
-        Block(self.func.blocks.len() as u32 - 1)
+        let block = Block(self.func.blocks.len() as u32 - 1);
+        if let Some(probe) = &mut self.probe {
+            probe.block(block);
+        }
+        block
     }
 
     /// Whether an instruction built so far branches to `block`.
@@ -43,6 +62,9 @@ impl<'f> FunctionBuilder<'f> {
     pub fn append_block_param(&mut self, block: Block, ty: Type) -> Value {
         let value = self.func.value(ty);
         self.func.blocks[block.index()].params.push(value);
+        if let Some(probe) = &mut self.probe {
+            probe.block_param(block, ty, value);
+        }
         value
     }
 
@@ -53,22 +75,34 @@ impl<'f> FunctionBuilder<'f> {
             self.append_block_param(block, ty);
         }
         self.func.entry = Some(block);
+        if let Some(probe) = &mut self.probe {
+            probe.entry(block);
+        }
     }
 
     /// Adds a frame area of `size` bytes aligned to `1 << align_shift`.
     pub fn create_stack_slot(&mut self, size: u32, align_shift: u8) -> StackSlot {
+        if let Some(probe) = &mut self.probe {
+            return probe.slot(size, align_shift);
+        }
         self.func.slots.push(SlotData { size, align_shift });
         StackSlot(self.func.slots.len() as u32 - 1)
     }
 
     /// Makes `signature` available to calls.
     pub fn import_signature(&mut self, signature: Signature) -> SigRef {
+        if let Some(probe) = &mut self.probe {
+            return probe.sig(&signature);
+        }
         self.func.sigs.push(signature);
         SigRef(self.func.sigs.len() as u32 - 1)
     }
 
     /// The results of the call `inst`.
     pub fn inst_results(&self, inst: Inst) -> &[Value] {
+        if let Some(probe) = &self.probe {
+            return &probe.last_results;
+        }
         match &self.func.insts[inst.index()].op {
             Op::Call { results, .. } => results,
             _ => &[],
@@ -78,7 +112,7 @@ impl<'f> FunctionBuilder<'f> {
     /// The point that `rewind` returns the function to.
     pub fn mark(&self) -> Mark {
         let func = &self.func;
-        Mark { types: func.types.len(), blocks: func.blocks.len(), insts: func.insts.len(), slots: func.slots.len(), sigs: func.sigs.len(), current: self.current }
+        Mark { types: func.types.len(), blocks: func.blocks.len(), insts: func.insts.len(), slots: func.slots.len(), sigs: func.sigs.len(), current: self.current, probe: self.probe.clone() }
     }
 
     /// Removes everything appended since `mark`, in every block.
@@ -102,15 +136,55 @@ impl<'f> FunctionBuilder<'f> {
             block.params.retain(|value| value.index() < mark.types);
         }
         self.current = mark.current;
+        self.probe = mark.probe;
     }
 
     /// Copies `callee` into the function as if the current block called it with `args`, then continues in a new block whose parameters are its results.
     pub fn inline(&mut self, callee: &Function, args: &[Value]) -> Vec<Value> {
+        self.inline_remap(callee, args, 0, None)
+    }
+
+    /// Copies `callee` into the function while shifting its relocation indices by `sym_base`.
+    pub fn inline_shifted(&mut self, callee: &Function, args: &[Value], sym_base: u32) -> Vec<Value> {
+        self.inline_remap(callee, args, sym_base, None)
+    }
+
+    /// Copies `callee` into a dictionary-sharing function, loading its symbols from `dict` at `sym_base`.
+    pub fn inline_dict(&mut self, callee: &Function, args: &[Value], dict: Value, sym_base: u32) -> Vec<Value> {
+        self.inline_remap(callee, args, sym_base, Some(dict))
+    }
+
+    /// Records an inlined `callee` in probe mode, advancing value, block, slot and signature counters identically to `inline_shifted`.
+    pub fn inline_probe(&mut self, callee: &Function, args: &[Value], callee_item: u128, callee_footprint: u128, returns: bool) -> Vec<Value> {
+        let cur = self.current.expect("a block is selected");
+        self.func.types.extend_from_slice(&callee.types);
+        let base_block = self.func.blocks.len() as u32;
+        self.func.blocks.resize_with(self.func.blocks.len() + callee.blocks.len() + 1, BlockData::default);
+        self.incoming.resize(self.func.blocks.len(), 0);
+        let after = Block(base_block + callee.blocks.len() as u32);
+        let results: Vec<Value> = callee.signature.returns.iter().map(|ret| {
+            let v = self.func.value(ret.value_type);
+            self.func.blocks[after.index()].params.push(v);
+            v
+        }).collect();
+        let entry = callee.entry.map_or(after, |e| Block(base_block + e.0));
+        self.incoming[entry.index()] += 1;
+        if returns {
+            self.incoming[after.index()] += 1;
+        }
+        if let Some(probe) = &mut self.probe {
+            probe.inline(cur, callee_item, callee_footprint, args, callee.slots.len() as u32, callee.sigs.len());
+        }
+        self.switch_to_block(after);
+        results
+    }
+
+    fn inline_remap(&mut self, callee: &Function, args: &[Value], sym_base: u32, dict: Option<Value>) -> Vec<Value> {
         let values: Vec<Value> = callee.types.iter().map(|ty| self.func.value(*ty)).collect();
         let blocks: Vec<Block> = callee.blocks.iter().map(|_| self.create_block()).collect();
         let after = self.create_block();
         let results: Vec<Value> = callee.signature.returns.iter().map(|ret| self.append_block_param(after, ret.value_type)).collect();
-        let map = Remap { values, blocks, after, slots: self.func.slots.len() as u32, sigs: self.func.sigs.len() as u32 };
+        let map = Remap { values, blocks, after, slots: self.func.slots.len() as u32, sigs: self.func.sigs.len() as u32, sym_base, dict };
         self.func.slots.extend(callee.slots.iter().cloned());
         self.func.sigs.extend(callee.sigs.iter().cloned());
         for (index, block) in callee.blocks.iter().enumerate() {
@@ -139,12 +213,12 @@ impl<'f> FunctionBuilder<'f> {
     /// Appends one instruction to the current block.
     pub fn ins(&mut self) -> Ins<'_> {
         let block = self.current.expect("a block is selected");
-        Ins { func: self.func, block, incoming: &mut self.incoming }
+        Ins { func: self.func, block, incoming: &mut self.incoming, probe: self.probe.as_mut() }
     }
 }
 
 /// The sizes of a function's parts at one point of building.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Mark {
     types: usize,
     blocks: usize,
@@ -152,6 +226,7 @@ pub struct Mark {
     slots: usize,
     sigs: usize,
     current: Option<Block>,
+    probe: Option<Probe>,
 }
 
 /// Where an inlined callee's values, blocks, slots and signatures land in the caller.
@@ -161,6 +236,8 @@ struct Remap {
     after: Block,
     slots: u32,
     sigs: u32,
+    sym_base: u32,
+    dict: Option<Value>,
 }
 
 impl Remap {
@@ -169,6 +246,10 @@ impl Remap {
         op.map_operands(|value| self.values[value.index()]);
         op.map_targets(|block| self.blocks[block.index()]);
         match &mut op {
+            Op::SlotAddr(sym) | Op::Symbol(sym) => match self.dict {
+                Some(dict) => op = Op::Load(dict, ((*sym + self.sym_base) * 8) as i32),
+                None => *sym += self.sym_base,
+            },
             Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) => slot.0 += self.slots,
             Op::Call { sig, results, .. } => {
                 sig.0 += self.sigs;
@@ -187,11 +268,16 @@ pub struct Ins<'b> {
     func: &'b mut Function,
     block: Block,
     incoming: &'b mut Vec<u32>,
+    probe: Option<&'b mut Probe>,
 }
 
 impl Ins<'_> {
     fn push(&mut self, op: Op, ty: Option<Type>) -> (Inst, Option<Value>) {
         let result = ty.map(|ty| self.func.value(ty));
+        if let Some(probe) = self.probe.as_deref_mut() {
+            probe.op(self.block, &op, ty);
+            return (Inst(u32::MAX), result);
+        }
         self.func.insts.push(InstData { op, result });
         let inst = Inst(self.func.insts.len() as u32 - 1);
         self.func.blocks[self.block.index()].insts.push(inst);
@@ -249,6 +335,21 @@ impl Ins<'_> {
     /// An integer constant of type `ty`.
     pub fn iconst(mut self, ty: Type, imm: i64) -> Value {
         self.constant(ty, imm, true)
+    }
+
+    /// A relocated 31-bit call-table slot address at `index`.
+    pub fn slot_addr(mut self, index: u32) -> Value {
+        self.value(Op::SlotAddr(index), Type::I64)
+    }
+
+    /// A relocated 64-bit symbol word at `index`.
+    pub fn symbol(mut self, index: u32) -> Value {
+        self.value(Op::Symbol(index), Type::I64)
+    }
+
+    /// The address of runtime helper `symbol`.
+    pub fn runtime(mut self, symbol: RuntimeSymbol) -> Value {
+        self.value(Op::Runtime(symbol), Type::I64)
     }
 
     /// A 128-bit integer from two 64-bit halves.
@@ -615,6 +716,9 @@ impl Ins<'_> {
 
     /// Calls the code at `callee` with `args`.
     pub fn call_indirect(mut self, sig: SigRef, callee: Value, args: &[Value]) -> Inst {
+        if let Some(probe) = self.probe.as_deref_mut() {
+            return probe.call(self.func, self.block, sig, callee, args);
+        }
         let returns: Vec<Type> = self.func.sigs[sig.index()].returns.iter().map(|param| param.value_type).collect();
         let results = returns.into_iter().map(|ty| self.func.value(ty)).collect();
         self.effect(Op::Call { sig, callee, args: args.to_vec(), results })
@@ -622,21 +726,46 @@ impl Ins<'_> {
 
     /// Calls `callee`, then goes to `normal`, or to `handler` with the exception when the callee unwinds.
     pub fn try_call_indirect(mut self, sig: SigRef, callee: Value, args: &[Value], normal: Block, handler: Block) -> Inst {
+        if let Some(probe) = self.probe.as_deref_mut() {
+            for target in [normal, handler] {
+                if let Some(count) = self.incoming.get_mut(target.index()) {
+                    *count += 1;
+                }
+            }
+            return probe.try_call(self.block, sig, (callee, args), (normal, handler));
+        }
         self.effect(Op::TryCall { sig, callee, args: args.to_vec(), normal, handler })
     }
 
     /// Goes to `block` with `args`.
     pub fn jump(mut self, block: Block, args: &[Value]) -> Inst {
+        if let Some(probe) = self.probe.as_deref_mut() {
+            if let Some(count) = self.incoming.get_mut(block.index()) {
+                *count += 1;
+            }
+            return probe.jump(self.block, block, args);
+        }
         self.effect(Op::Jump(block, args.to_vec()))
     }
 
     /// Goes to `then` when `condition` is nonzero, else to `otherwise`.
     pub fn brif(mut self, condition: Value, then: Block, then_args: &[Value], otherwise: Block, else_args: &[Value]) -> Inst {
+        if let Some(probe) = self.probe.as_deref_mut() {
+            for target in [then, otherwise] {
+                if let Some(count) = self.incoming.get_mut(target.index()) {
+                    *count += 1;
+                }
+            }
+            return probe.brif(self.block, condition, (then, then_args), (otherwise, else_args));
+        }
         self.effect(Op::Brif(condition, then, then_args.to_vec(), otherwise, else_args.to_vec()))
     }
 
     /// Returns `values`.
     pub fn return_(mut self, values: &[Value]) -> Inst {
+        if let Some(probe) = self.probe.as_deref_mut() {
+            return probe.return_(self.block, values);
+        }
         self.effect(Op::Return(values.to_vec()))
     }
 

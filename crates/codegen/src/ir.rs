@@ -2,6 +2,7 @@ use std::fmt;
 
 /// The machine type of one value.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
 pub enum Type {
     I8,
     I16,
@@ -69,6 +70,7 @@ ids!(
 
 /// How a function takes arguments and which registers it keeps.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
 pub enum CallConv {
     /// Generated code calling generated code: the C argument registers, and the callee saves the pool registers it uses, or all of them when it has a handler.
     Internal,
@@ -84,6 +86,8 @@ pub enum ArgumentPurpose {
     StructReturn,
     /// A pointer to a struct of this many bytes that travels by value on the stack.
     StructArgument(u32),
+    /// The pointer to the static symbol dictionary of a shared generic body.
+    Dict,
 }
 
 /// One parameter or return value of a signature.
@@ -122,6 +126,7 @@ impl Signature {
 
 /// An integer comparison.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
 pub enum IntCC {
     Equal,
     NotEqual,
@@ -163,6 +168,7 @@ impl IntCC {
 
 /// A floating-point comparison; every one but `NotEqual` is false when an operand is NaN.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
 pub enum FloatCC {
     Equal,
     NotEqual,
@@ -174,6 +180,7 @@ pub enum FloatCC {
 
 /// The operation of an atomic read-modify-write.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
 pub enum AtomicRmwOp {
     Add,
     Sub,
@@ -189,6 +196,7 @@ pub enum AtomicRmwOp {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub(crate) enum Unary {
     Ineg,
     Bnot,
@@ -206,6 +214,7 @@ pub(crate) enum Unary {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub(crate) enum Binary {
     Iadd,
     Isub,
@@ -235,6 +244,7 @@ pub(crate) enum Binary {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub(crate) enum Convert {
     Uextend,
     Sextend,
@@ -250,6 +260,9 @@ pub(crate) enum Convert {
 #[derive(Clone, Debug)]
 pub(crate) enum Op {
     Const(i64),
+    SlotAddr(u32),
+    Symbol(u32),
+    Runtime(crate::reloc::RuntimeSymbol),
     Unary(Unary, Value),
     Binary(Binary, Value, Value),
     Convert(Convert, Value),
@@ -315,7 +328,7 @@ impl Op {
     /// Calls `f` with every value this instruction reads, once per read.
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
-            Op::Const(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
+            Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
             Op::Unary(_, x) | Op::Convert(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
             Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) => {
                 f(*x);
@@ -341,7 +354,7 @@ impl Op {
     /// Replaces every value this instruction reads with `f` of it.
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
-            Op::Const(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
+            Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
             Op::Unary(_, x) | Op::Convert(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
                 *x = f(*x);
             }
@@ -465,6 +478,11 @@ impl Function {
     /// Whether `FunctionBuilder::inline` can copy this function into a caller: it is no coroutine, catches no unwind and reads no frame pointer.
     pub fn can_inline(&self) -> bool {
         self.coroutine.is_none() && self.entry.is_some() && !self.insts.iter().any(|data| matches!(data.op, Op::TryCall { .. } | Op::FramePointer))
+    }
+
+    /// Whether any instruction in this body returns to its caller.
+    pub fn has_return(&self) -> bool {
+        self.insts.iter().any(|data| matches!(data.op, Op::Return(_)))
     }
 }
 

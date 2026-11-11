@@ -10,10 +10,11 @@ mod wide;
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
 use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
-use crate::alloc::{Location, Plan, Regs, plan};
+use crate::alloc::{CallTarget, Location, Plan, Regs, plan};
 use crate::frame::{Frame, INCOMING, PAGE, edge_moves, layout, saved};
 
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::{Code, Site};
 
 
@@ -22,6 +23,7 @@ const REGS: Regs<Reg> = Regs {
     saved: &SAVED,
     leaf: &[Reg::Rdi, Reg::R9, Reg::R8, Reg::R10],
     wide_scratch: &wide::WIDE_SCRATCH,
+    dict: Some(Reg::R10),
     float: &float::POOL,
     float_branches: &float::BRANCHES,
     absolute_calls: true,
@@ -35,7 +37,34 @@ pub(crate) fn compile(func: &Function) -> Result<Code, String> {
     let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, classify)?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), plan, flags: None, next: None, features: Features::host() }.run(order)
+    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, features: Features::host() }.run(order)
+}
+
+pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
+    let mut asm = Asm::default();
+    if let Some(tier) = tier_up {
+        let fast = asm.label();
+        asm.mov_abs64_val(Reg::R10, tier.counter_addr as u64);
+        asm.encode(&[], false, &[0x83], Alu::Add as u8, Mem::new(Reg::R10, 0).into(), false);
+        asm.bytes(&[1]);
+        asm.encode(&[], false, &[0x81], Alu::Cmp as u8, Mem::new(Reg::R10, 0).into(), false);
+        asm.bytes(&tier.threshold.to_le_bytes());
+        asm.jcc(Cond::Ne, fast);
+        asm.mov_imm(Reg::R11, i64::from(tier.encoded_index));
+        asm.mov_abs64_val(Reg::R10, tier.stub_entry as u64);
+        asm.jmp_reg(Reg::R10);
+        asm.bind(fast);
+    }
+    asm.mov_abs64_val(Reg::R10, dict_addr as u64);
+    let rel = body_exec as i64 - (stub_exec as i64 + i64::from(asm.pos()) + 5);
+    if let Ok(rel32) = i32::try_from(rel) {
+        asm.bytes(&[0xE9]);
+        asm.bytes(&rel32.to_le_bytes());
+    } else {
+        asm.mov_abs64_val(Reg::R11, body_exec as u64);
+        asm.jmp_reg(Reg::R11);
+    }
+    asm.finish()
 }
 
 fn save_slot(index: usize) -> Mem {
@@ -55,6 +84,7 @@ pub(super) struct Emit<'a> {
     asm: Asm,
     blocks: Vec<Label>,
     sites: Vec<Site>,
+    relocs: Vec<StencilReloc>,
     plan: Plan<Reg>,
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
@@ -70,7 +100,7 @@ impl Emit<'_> {
             self.next = order.get(index + 1).copied();
             self.block(*block)?;
         }
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites })
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs })
     }
 
     fn block(&mut self, block: Block) -> Result<(), String> {
@@ -385,9 +415,17 @@ impl Emit<'_> {
         for (arg, loc) in args.iter().zip(&abi.params) {
             self.load_loc(*arg, *loc);
         }
-        if let Some(at) = self.plan.through[callee.index()] {
-            self.asm.call_absolute(at);
-            return Ok(abi);
+        match self.plan.through[callee.index()] {
+            Some(CallTarget::Abs(at)) => {
+                self.asm.call_absolute(at);
+                return Ok(abi);
+            }
+            Some(CallTarget::Slot(sym)) => {
+                let at = self.asm.call_slot_reloc();
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
+                return Ok(abi);
+            }
+            None => {}
         }
         let target = self.reg_of(callee).unwrap_or(Reg::R11);
         self.raw(target, callee);

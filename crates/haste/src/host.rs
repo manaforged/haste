@@ -2,26 +2,95 @@
 
 mod math;
 
-pub use math::symbol as intrinsic;
+pub use math::{MathSymbol, symbol as intrinsic};
 
 use std::alloc::Layout;
 use std::ffi::CString;
 
-/// The address of the host function that the foreign function `name` links to, when the host has one.
-pub fn symbol(name: &str) -> Option<usize> {
-    let shim = match name {
-        "__rust_alloc" => alloc as *const () as usize,
-        "__rust_alloc_zeroed" => alloc_zeroed as *const () as usize,
-        "__rust_dealloc" => dealloc as *const () as usize,
-        "__rust_realloc" => realloc as *const () as usize,
-        "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" | "llvm.aarch64.hint" => nothing as *const () as usize,
-        "llvm.aarch64.isb" | "llvm.aarch64.dmb" | "llvm.aarch64.dsb" => barrier as *const () as usize,
-        "llvm.x86.xgetbv" => no_extended_state as *const () as usize,
-        "__dso_handle" => &DSO_HANDLE as *const u8 as usize,
-        "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => abort as *const () as usize,
-        _ => return math::symbol(name).or_else(|| dynamic(name)),
-    };
-    Some(shim)
+/// A typed host or runtime helper symbol referenced by lowered code or foreign declarations.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum HostSymbol {
+    Alloc,
+    AllocZeroed,
+    Dealloc,
+    Realloc,
+    Noop,
+    Barrier,
+    NoExtendedState,
+    DsoHandle,
+    Abort,
+    FillOnce,
+    ThreadCell,
+    Math(MathSymbol),
+    Dynamic(Box<str>),
+}
+
+const DIRECT: &[HostSymbol] = &[
+    HostSymbol::Alloc,
+    HostSymbol::AllocZeroed,
+    HostSymbol::Dealloc,
+    HostSymbol::Realloc,
+    HostSymbol::DsoHandle,
+];
+
+impl HostSymbol {
+    /// Classifies `name` into a typed host symbol when the host links to it.
+    pub fn resolve(name: &str) -> Option<Self> {
+        if let Some(found) = DIRECT.iter().find(|sym| sym.link_name() == name) {
+            return Some(found.clone());
+        }
+        let built_in = match name {
+            "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" | "llvm.aarch64.hint" => Self::Noop,
+            "llvm.aarch64.isb" | "llvm.aarch64.dmb" | "llvm.aarch64.dsb" => Self::Barrier,
+            "llvm.x86.xgetbv" => Self::NoExtendedState,
+            "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => Self::Abort,
+            _ => {
+                if let Some(math) = MathSymbol::from_name(name) {
+                    return Some(Self::Math(math));
+                }
+                return dynamic(name).map(|_| Self::Dynamic(name.into()));
+            }
+        };
+        Some(built_in)
+    }
+
+    /// The external linker symbol name for this host helper.
+    pub fn link_name(&self) -> &str {
+        match self {
+            Self::Alloc => "__rust_alloc",
+            Self::AllocZeroed => "__rust_alloc_zeroed",
+            Self::Dealloc => "__rust_dealloc",
+            Self::Realloc => "__rust_realloc",
+            Self::Noop => "__haste_noop",
+            Self::Barrier => "__haste_barrier",
+            Self::NoExtendedState => "__haste_no_extended_state",
+            Self::DsoHandle => "__dso_handle",
+            Self::Abort => "abort",
+            Self::FillOnce => "__haste_fill_once",
+            Self::ThreadCell => "__haste_thread_cell",
+            Self::Math(math) => math.link_name(),
+            Self::Dynamic(name) => name,
+        }
+    }
+
+    /// The address of this host symbol in the running process, when available.
+    pub fn host_addr(&self) -> Option<usize> {
+        Some(match self {
+            Self::Alloc => alloc as *const () as usize,
+            Self::AllocZeroed => alloc_zeroed as *const () as usize,
+            Self::Dealloc => dealloc as *const () as usize,
+            Self::Realloc => realloc as *const () as usize,
+            Self::Noop => nothing as *const () as usize,
+            Self::Barrier => barrier as *const () as usize,
+            Self::NoExtendedState => no_extended_state as *const () as usize,
+            Self::DsoHandle => &DSO_HANDLE as *const u8 as usize,
+            Self::Abort => abort as *const () as usize,
+            Self::FillOnce => crate::image::fill_once as *const () as usize,
+            Self::ThreadCell => crate::image::thread_cell as *const () as usize,
+            Self::Math(math) => math.host_addr(),
+            Self::Dynamic(_) => return dynamic(self.link_name()),
+        })
+    }
 }
 
 /// The object whose address stands for the host program where the linker's hidden `__dso_handle` would, which the C runtime reads as the main program.

@@ -68,6 +68,16 @@ impl Reached {
         }
     }
 
+    /// Whether declared function `index` has not been inferred yet.
+    pub fn is_untyped(&self, index: usize) -> bool {
+        !self.untyped.is_empty() && self.untyped.contains(&index)
+    }
+
+    /// The prelinked callee indices of reached function `index`, when `link` has populated them.
+    pub fn direct_calls(&self, index: usize) -> Option<&[usize]> {
+        self.calls.get(index).map(Vec::as_slice)
+    }
+
     fn callees<'r>(&'r self, typed: &'r Typed) -> impl Iterator<Item = usize> + 'r {
         typed.calls().filter_map(|callee| self.index.get(&callee).copied())
     }

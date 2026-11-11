@@ -8,6 +8,7 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
 use super::place::{Base, Place};
+use super::stencil::{RodataReloc, RodataTarget, SymbolSource};
 use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
@@ -33,7 +34,6 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// A `&'static Location` of where the function being lowered starts, since callers do not pass down the location that `#[track_caller]` asks for yet.
     fn caller_location(&mut self) -> Result<Value> {
         let Some(location) = self.cx.lang_item("panic_location") else { bail!("no `Location` lang item") };
         let ty = self.cx.types.adt(location, &[]);
@@ -42,17 +42,18 @@ impl Lower<'_, '_> {
         let mut file = src.path.display().to_string().into_bytes();
         let (len, line, column) = (file.len() as u64, src.line(entry.start) as u32, src.column(entry.start) as u32);
         file.push(0);
+        let file_id = self.slots.rodata(&file, &[]);
         let mut bytes = vec![0u8; layout.size.bytes() as usize];
         let mut put = |field: u32, at: i32, value: &[u8]| {
             let from = (crate::sema::layout::field_offset(&layout, 0, field) + at) as usize;
             bytes[from..from + value.len()].copy_from_slice(value);
         };
-        put(0, 0, &(self.slots.data(&file) as u64).to_le_bytes());
         put(0, 8, &len.to_le_bytes());
         put(1, 0, &line.to_le_bytes());
         put(2, 0, &column.to_le_bytes());
-        let address = self.slots.data(&bytes);
-        Ok(self.ins().iconst(Type::I64, address))
+        let ptr_offset = crate::sema::layout::field_offset(&layout, 0, 0) as u32;
+        let loc_id = self.slots.rodata(&bytes, &[RodataReloc { offset: ptr_offset, target: RodataTarget::Rodata(file_id) }]);
+        Ok(self.emit_symbol(SymbolSource::Rodata(loc_id)))
     }
 
     fn catch_unwind(&mut self, args: &[Value]) -> Result<Value> {

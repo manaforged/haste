@@ -12,7 +12,9 @@ mod frame;
 mod live;
 mod merge;
 mod native;
+mod probe;
 mod promote;
+mod reloc;
 mod target;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
@@ -43,6 +45,7 @@ pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, F
 pub use coroutine::{Coroutine, FIRST_SUSPEND, RETURNED, UNRESUMED};
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
+pub use reloc::{DictTierUp, FootprintHasher, RelocKind, RuntimeSymbol, StencilReloc};
 pub use target::{Arch, CallAbi, Format, Os, TARGETS, Target};
 
 /// A call site that has an exception handler, as offsets into its function.
@@ -53,11 +56,12 @@ pub struct Site {
     pub frame_offset: u32,
 }
 
-/// Machine code for one function and its exception call sites.
+/// Machine code for one function, its exception call sites, and its stencil relocations.
 #[derive(Clone, Debug)]
 pub struct Code {
     bytes: Vec<u8>,
     sites: Vec<Site>,
+    relocs: Vec<StencilReloc>,
 }
 
 impl Code {
@@ -70,6 +74,27 @@ impl Code {
     pub fn sites(&self) -> &[Site] {
         &self.sites
     }
+
+    /// The relocations inside `bytes`.
+    pub fn relocs(&self) -> &[StencilReloc] {
+        &self.relocs
+    }
+
+    /// Copies `bytes` into `out` and patches every relocation against `symbols`.
+    pub fn patch(&self, symbols: &[u64], out: &mut [u8]) {
+        out[..self.bytes.len()].copy_from_slice(&self.bytes);
+        reloc::patch_bytes(&self.relocs, symbols, &mut out[..self.bytes.len()]);
+    }
+}
+
+/// Encodes a call-table entry stub that loads `dict_addr` into the dictionary register and jumps to `body_exec`.
+pub fn dict_entry_stub(arch: Arch, stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, Error> {
+    let bytes = match arch {
+        Arch::X64 => x64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
+        Arch::Arm64 => arm64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
+        other => Err(format!("no encoder for {other:?} yet")),
+    };
+    bytes.map_err(|message| Error::new(ErrorKind::Unsupported, message))
 }
 
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks as `compile` does before encoding, and drops the dead entries of a body kept for copying.

@@ -291,6 +291,25 @@ impl Asm {
         }
     }
 
+    pub fn mov_symbol(&mut self, dst: Reg) -> u32 {
+        let at = self.pos();
+        let rd = u32::from(dst.0);
+        self.word(0xD280_0000 | rd);
+        self.word(0xF2A0_0000 | rd);
+        self.word(0xF2C0_0000 | rd);
+        self.word(0xF2E0_0000 | rd);
+        at
+    }
+
+    pub fn mov_fixed64(&mut self, dst: Reg, value: u64) {
+        let rd = u32::from(dst.0);
+        for half in 0..4 {
+            let bits = ((value >> (16 * half)) as u32) & 0xFFFF;
+            let base = if half == 0 { 0xD280_0000 } else { 0xF280_0000 | ((half as u32) << 21) };
+            self.word(base | (bits << 5) | rd);
+        }
+    }
+
     /// `ubfm`/`sbfm` with `immr` and `imms`: shifts and extensions by an immediate.
     pub fn bitfield(&mut self, signed: bool, dst: Reg, src: Reg, (immr, imms): (u8, u8)) {
         let base = if signed { 0x9340_0000 } else { 0xD340_0000 };
@@ -392,6 +411,10 @@ impl Asm {
 
     pub fn blr(&mut self, reg: Reg) {
         self.word(0xD63F_0000 | u32::from(reg.0) << 5);
+    }
+
+    pub fn br(&mut self, reg: Reg) {
+        self.word(0xD61F_0000 | u32::from(reg.0) << 5);
     }
 
     pub fn ret(&mut self) {

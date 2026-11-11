@@ -1,7 +1,7 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Block, Function, Signature, Type, Value};
+use haste_codegen::{Block, Signature, Type, Value};
 
 use crate::body::{Expr, ExprId, List, UnOp};
 use crate::names::ItemRef;
@@ -13,7 +13,8 @@ use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::Place;
-use super::{Loop, Lower, Parts, Repr, Slots, repr};
+use super::stencil::{InlinedCallee, LowerMode, SymbolSource, item_bits, resolve_inline};
+use super::{Loop, Lower, Parts, Repr, repr};
 
 /// The most instructions a sysroot body may have, after slot promotion, for a call to copy it inline.
 const INLINE_LIMIT: usize = 30;
@@ -35,20 +36,10 @@ pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool
     inline_limit(cx, reached, index).is_some()
 }
 
-/// The lowered body of reached function `index` when a call may copy it inline: small, copyable, and not being lowered already.
-pub fn inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Option<Rc<Function>> {
-    if !slots.bodies().first_try(index) {
-        return slots.bodies().body(index);
-    }
-    let limit = inline_limit(cx, reached, index)?;
-    let mut body = super::lower(cx, reached, slots, index).ok().filter(Function::can_inline)?;
-    haste_codegen::simplify(&mut body);
-    if body.size() > limit {
-        return None;
-    }
-    let body = Rc::new(body);
-    slots.bodies().keep(index, body.clone());
-    Some(body)
+/// Whether reached function `index` lowers to a body small and copyable enough to inline.
+pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn super::Slots, index: usize) -> bool {
+    let Some(limit) = inline_limit(cx, reached, index) else { return false };
+    resolve_inline(cx, reached, slots, index, limit).is_ok_and(|(callee, _)| callee.is_some())
 }
 
 /// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
@@ -84,7 +75,7 @@ impl Lower<'_, '_> {
             (Some(Coercion::Vtable(vtable)), Some(value)) => {
                 let data = self.sized_pointer(value, self.ty_of(expr));
                 let table = self.vtable(vtable)?;
-                Ok(Some(self.wide_pointer(data, table)))
+                Ok(Some(self.wide(data, table)))
             }
             (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(value, steps.clone()),
             (Some(&Coercion::Upcast(slot)), Some(value)) => Ok(Some(self.upcast(value, slot))),
@@ -300,23 +291,44 @@ impl Lower<'_, '_> {
         self.call_with(Callee::Reached(index), (params, callee.ret), values)
     }
 
-    /// The lowered body of reached sysroot function `index` when a call may copy it inline: small, copyable, and not being lowered already.
-    fn inline_body(&mut self, index: usize) -> Option<Rc<Function>> {
-        inline_body(self.cx, self.reached, self.slots, index)
+    fn inline_callee(&mut self, index: usize) -> Result<Option<Arc<InlinedCallee>>> {
+        let Some(limit) = inline_limit(self.cx, self.reached, index) else {
+            return Ok(None);
+        };
+        let (callee, cycle) = resolve_inline(self.cx, self.reached, self.slots, index, limit)?;
+        self.cycle_root = self.cycle_root.min(cycle);
+        Ok(callee)
+    }
+
+    fn emit_inlined(&mut self, inlined: &InlinedCallee, values: &[Value]) -> Vec<Value> {
+        if !self.open {
+            let dead = *self.dead.get_or_insert_with(|| self.b.create_block());
+            self.b.switch_to_block(dead);
+        }
+        let sym_base = self.relocs.len() as u32;
+        self.relocs.extend(inlined.relocs.iter().cloned());
+        match self.mode {
+            LowerMode::Probe => self.b.inline_probe(&inlined.body, values, item_bits(inlined.item), inlined.footprint.0, inlined.returns),
+            LowerMode::Stencil => self.b.inline_shifted(&inlined.body, values, sym_base),
+            LowerMode::Dict => {
+                let dict = self.dict_param.expect("dictionary parameter is set");
+                self.b.inline_dict(&inlined.body, values, dict, sym_base)
+            }
+        }
     }
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
-    fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Vec<Value> {
+    fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
         let code = match callee {
             Callee::Code(code) => code,
-            Callee::Reached(index) => match self.inline_body(index) {
-                Some(body) => return self.b.inline(&body, values),
+            Callee::Reached(index) => match self.inline_callee(index)? {
+                Some(inlined) => return Ok(self.emit_inlined(&inlined, values)),
                 None => self.code_of(index),
             },
         };
         let sig = self.b.import_signature(signature);
         let call = self.ins().call_indirect(sig, code, values);
-        self.b.inst_results(call).to_vec()
+        Ok(self.b.inst_results(call).to_vec())
     }
 
     fn pointer_call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
@@ -344,7 +356,9 @@ impl Lower<'_, '_> {
     /// The index of the reached instance of `item` at `substs`.
     pub(super) fn reached_index(&self, item: ItemRef, substs: Substs) -> Result<usize> {
         let instance = (item, substs);
-        if let Some(&index) = self.reached.index.get(&instance) {
+        if let Some(&index) = self.reached.index.get(&instance)
+            && !self.reached.is_untyped(index)
+        {
             return Ok(index);
         }
         self.slots.want(instance);
@@ -353,8 +367,7 @@ impl Lower<'_, '_> {
 
     /// The code address of reached function `index`, read from its call table entry.
     pub(super) fn code_of(&mut self, index: usize) -> Value {
-        let entry = self.slots.entry(index);
-        let table = self.ins().iconst(Type::I64, entry);
+        let table = self.emit_slot(SymbolSource::Slot(index));
         self.ins().load(Type::I64, table, 0)
     }
 
@@ -372,7 +385,7 @@ impl Lower<'_, '_> {
             let address = self.ins().stack_addr(Type::I64, out, 0);
             values.insert(0, address);
         }
-        let results = self.emit_call(callee, signature, &values);
+        let results = self.emit_call(callee, signature, &values)?;
         let Some(ret) = ret else { return Ok(None) };
         if matches!(self.cx.types.kind(ret), Kind::Never) {
             self.ins().trap();

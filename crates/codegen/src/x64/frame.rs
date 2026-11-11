@@ -29,6 +29,9 @@ impl Counter {
     }
 
     fn param(&mut self, purpose: ArgumentPurpose, ty: Type) -> Loc {
+        if purpose == ArgumentPurpose::Dict {
+            return Loc::Int(Reg::R10);
+        }
         if let ArgumentPurpose::StructArgument(size) = purpose {
             let at = self.stack;
             self.stack += round(size, WORD);
