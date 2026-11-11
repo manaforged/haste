@@ -60,11 +60,14 @@ fn same_places(old: &File, new: &File) -> bool {
     a.tokens.len() == b.tokens.len() && (0..a.tokens.len() as u32).all(|at| a.text(at) == b.text(at) && a.tokens[at as usize].start == b.tokens[at as usize].start)
 }
 
+/// The tokens of `file` outside the bodies that callers cannot see: those of functions that are not `const` or `async` and name no `impl Trait`, whose body decides a value or type that callers use.
 fn outside_bodies(file: &File) -> Vec<&str> {
     let src = &file.source;
     let mut skipped = vec![false; src.tokens.len()];
     for item in file.items.items.iter().filter(|item| item.kind == ItemKind::Fn) {
-        if let Some(open) = item.body {
+        if let Some(open) = item.body
+            && (item.start..open).all(|at| !matches!(src.text(at), "const" | "async" | "impl"))
+        {
             skipped[open as usize + 1..src.pair(open) as usize].fill(true);
         }
     }
