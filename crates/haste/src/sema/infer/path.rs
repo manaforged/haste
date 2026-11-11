@@ -165,9 +165,17 @@ impl<'a> Infer<'_, 'a> {
 
     fn body_imports(&mut self, word: Option<Sym>) -> Vec<PerNs> {
         let Some(root) = self.root.filter(|&root| self.cx.expansion(root).is_some_and(|found| !found.file.items.imports.is_empty())) else { return Vec::new() };
+        if let Some(found) = self.imports.get(&(root, word)) {
+            return found.clone();
+        }
         let Ok(home) = self.cx.module_of(root) else { return Vec::new() };
         let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()).map(|item| self.cx.item(item).1.start);
-        self.cx.body_imports((root, home), word, here)
+        let before = self.cx.asks.mark();
+        let found = self.cx.body_imports((root, home), word, here);
+        if self.cx.asks.mark() == before {
+            self.imports.insert((root, word), found.clone());
+        }
+        found
     }
 
     /// The item named `name` that a block around the use declares.

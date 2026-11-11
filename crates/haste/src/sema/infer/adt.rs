@@ -9,6 +9,7 @@ use crate::names::{Def, ItemRef, Sym, plain};
 use crate::outline::item::ItemKind;
 
 use super::super::ty::{Kind, Ty};
+use super::scope::Form;
 use super::{Infer, Res};
 
 /// A constructor that a path names: the ADT, the index of its variant, and its type arguments.
@@ -24,10 +25,16 @@ impl<'a> Infer<'_, 'a> {
         if let Some(found) = cached {
             return Ok(found);
         }
+        if let Some(form) = self.generic((Form::Adt(item), args.len()), |infer, params| infer.lower_fields(item, params)) {
+            let args: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
+            let fields: Fields = form.iter().map(|variant| variant.iter().map(|&ty| self.instantiate(ty, &args)).collect()).collect::<Vec<Vec<Ty>>>().into();
+            if let Some(key) = key {
+                self.cx.store.lookups.fields.insert(key, fields.clone());
+            }
+            return Ok(fields);
+        }
         let before = self.unsettled();
-        let def = self.cx.adt_def(item)?;
-        let frame = self.adt_frame(item, &def.generics.params, args)?;
-        let fields: Fields = self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty).map(|ty| infer.substitute(ty))).collect()).collect::<Result<Vec<Vec<Ty>>>>())?.into();
+        let fields = self.lower_fields(item, args)?;
         let closed = self.unsettled() == before && !fields.iter().flatten().any(|&ty| self.has_vars(ty));
         if let Some(key) = key.filter(|_| closed) {
             self.cx.store.lookups.fields.insert(key, fields.clone());
@@ -35,9 +42,16 @@ impl<'a> Infer<'_, 'a> {
         Ok(fields)
     }
 
+    /// The field types of each variant of `item` at `args`, lowered from its definition.
+    fn lower_fields(&mut self, item: ItemRef, args: &[Ty]) -> Result<Fields> {
+        let def = self.cx.adt_def(item)?;
+        let frame = self.adt_frame(item, &def.generics.params, args)?;
+        Ok(self.with_frame(frame, |infer| def.variants.iter().map(|variant| variant.fields.iter().map(|field| infer.lower_ty(&def.body, field.ty).map(|ty| infer.substitute(ty))).collect()).collect::<Result<Vec<Vec<Ty>>>>())?.into())
+    }
+
     /// The key that caches the field types of `item` at `args` across bodies, the ADT type with its variables filled in, and what it holds; no key when body state or an unbound inference variable could change the answer.
     fn cached_fields(&mut self, item: ItemRef, args: &[Ty]) -> (Option<Ty>, Option<Fields>) {
-        if !self.bodiless() || args.iter().any(|&arg| self.has_vars(arg)) {
+        if !self.shared_here(item.declaring_body()) || args.iter().any(|&arg| self.has_vars(arg)) {
             return (None, None);
         }
         let args = args.iter().map(|&arg| self.substitute(arg)).collect();

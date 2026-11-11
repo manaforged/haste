@@ -12,7 +12,7 @@ use crate::outline::source::Source;
 use super::super::impls::{ImplRef, head};
 use super::super::traits::TraitGenerics;
 use super::super::ty::{Kind, Mut, Ty};
-use super::Infer;
+use super::{Fields, Infer};
 
 /// Where inference reads names from: the file and module of an item, its type parameters and `Self`.
 pub struct Frame<'a> {
@@ -25,6 +25,24 @@ pub struct Frame<'a> {
     pub item: Option<ItemRef>,
     /// The function whose body declares the items that the frame's names may refer to.
     pub root: Option<ItemRef>,
+}
+
+/// A header whose types are lowered once in generic form: the fields of an ADT, the signature of a function, or the self type of an impl.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Form {
+    Adt(ItemRef),
+    Fn(ItemRef),
+    Impl(ImplRef),
+}
+
+impl Form {
+    /// The function whose body declares the header, when a body does.
+    fn root(self) -> Option<ItemRef> {
+        match self {
+            Form::Adt(item) | Form::Fn(item) => item.declaring_body(),
+            Form::Impl(block) => block.root(),
+        }
+    }
 }
 
 /// The names of the type parameters of `params` in `src`, each paired with its argument in `args`.
@@ -150,11 +168,66 @@ impl<'a> Infer<'_, 'a> {
     /// The type parameters of impl `block` set to `args`, and its self type at them.
     pub fn impl_frame(&mut self, block: ImplRef, args: &[Ty]) -> Result<(Vec<(&'a str, Ty)>, Ty)> {
         let header = self.cx.impl_header(block)?;
-        let file = self.cx.impl_file(block);
-        let generics: Vec<(&'a str, Ty)> = type_params(&header.generics).map(|generic| file.source.text(generic.name)).zip(args.iter().copied()).collect();
-        let frame = Frame { src: &file.source, home: self.cx.impl_module(block)?, generics: generics.clone(), self_ty: None, block: Some(block), item: None, root: block.root() };
-        let self_ty = self.with_frame(frame, |infer| infer.lower_ty(&header.body, header.self_ty))?;
+        let generics = named_args(&self.cx.impl_file(block).source, &header.generics, args);
+        let self_ty = match self.generic((Form::Impl(block), args.len()), |infer, params| Ok(Rc::from(vec![vec![infer.impl_self(block, params)?]]))) {
+            Some(form) => self.instantiate(form[0][0], args),
+            None => self.impl_self(block, args)?,
+        };
         Ok((generics, self_ty))
+    }
+
+    /// The self type of impl `block` with its type parameters set to `args`, lowered from its header.
+    fn impl_self(&mut self, block: ImplRef, args: &[Ty]) -> Result<Ty> {
+        let header = self.cx.impl_header(block)?;
+        let frame = self.impl_frame_of(block, args, None)?;
+        self.with_frame(frame, |infer| infer.lower_ty(&header.body, header.self_ty))
+    }
+
+    /// The types of `form` for `count` type arguments in generic form, lowered once by `lower` with placeholder variables as the arguments, or none when lowering it here could differ or needs the arguments themselves.
+    pub(super) fn generic(&mut self, (form, count): (Form, usize), lower: impl FnOnce(&mut Infer<'_, 'a>, &[Ty]) -> Result<Fields>) -> Option<Fields> {
+        if !self.shared_here(form.root()) {
+            return None;
+        }
+        if let Some(found) = self.cx.store.lookups.forms.get(&(form, count)) {
+            return found.clone();
+        }
+        self.cx.store.lookups.forms.insert((form, count), None);
+        let found = self.lower_generic(count, lower);
+        self.cx.store.lookups.forms.insert((form, count), found.clone());
+        found
+    }
+
+    /// What `lower` gives with `count` placeholder variables as the type arguments, run apart from any body, when it asked for nothing and left no pending query, hidden type, or new or bound variable.
+    fn lower_generic(&mut self, count: usize, lower: impl FnOnce(&mut Infer<'_, 'a>, &[Ty]) -> Result<Fields>) -> Option<Fields> {
+        let (body, sig) = (Body::default(), Signature::default());
+        let (src, home, frames) = (self.src, self.home, self.frames);
+        let mut infer = Infer::start(self.cx, (&body, &sig, src), home);
+        infer.frames = frames;
+        let before = infer.cx.asks.mark();
+        let params: Vec<Ty> = (0..count).map(|_| infer.fresh(Kind::Var)).collect();
+        let found = lower(&mut infer, &params).ok()?;
+        let clean = infer.cx.asks.mark() == before && infer.backlog() == 0 && infer.hidden.is_empty() && infer.vars.len() == count && infer.vars.iter().all(Option::is_none);
+        clean.then_some(found)
+    }
+
+    /// Whether lowering a header that the body of `root` declares, or no body when none, gives here what it gives apart from any body: no block items, const fn arguments, constants being evaluated or selection in progress can reach it, and this body defines no hidden type that it may name.
+    pub(super) fn shared_here(&self, root: Option<ItemRef>) -> bool {
+        if self.bodiless() {
+            return true;
+        }
+        let quiet = self.items.is_empty() && self.const_args.is_empty() && self.evaluating.is_empty() && self.selecting.is_empty();
+        quiet && root.is_none() && self.instance.as_ref().is_none_or(|(at, _)| self.cx.attr_at(*at, "define_opaque").is_none())
+    }
+
+    /// `ty` of a generic form with each placeholder variable `index` replaced by `args[index]`.
+    pub(super) fn instantiate(&mut self, ty: Ty, args: &[Ty]) -> Ty {
+        match self.cx.types.kind(ty) {
+            Kind::Var(index) => return args.get(*index as usize).copied().unwrap_or(ty),
+            kind if kind.children().next().is_none() => return ty,
+            _ => {}
+        }
+        let kind = self.cx.types.kind(ty).clone().map(|inner| self.instantiate(inner, args));
+        self.cx.types.intern(kind)
     }
 
     /// The headers whose generic parameters and where clauses the frame's type parameters come from: the item's own, its impl's, and its trait's.
@@ -222,6 +295,16 @@ impl<'a> Infer<'_, 'a> {
     /// The parameter and return types of the function `item` at `substs`, its receiver first.
     pub fn fn_types(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(Vec<Ty>, Ty)> {
         let sig = self.cx.signature(item)?;
+        if !sig.opaque
+            && let Some(form) = self.generic((Form::Fn(item), substs.len()), |infer, args| {
+                let frame = infer.frame(item, args)?;
+                let (params, ret) = infer.with_frame(frame, |infer| infer.sig_types(&sig))?;
+                Ok(Rc::from(vec![params, vec![ret]]))
+            })
+        {
+            let params = form[0].iter().map(|&ty| self.instantiate(ty, substs)).collect();
+            return Ok((params, self.instantiate(form[1][0], substs)));
+        }
         let frame = self.frame(item, substs)?;
         let foreign = sig.opaque && self.instance.as_ref().is_none_or(|(own, _)| *own != item);
         let (types, opaque) = self.with_frame(frame, |infer| {
