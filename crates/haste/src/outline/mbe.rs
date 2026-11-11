@@ -14,27 +14,25 @@ pub enum Bind {
     Many(Vec<Bind>),
 }
 
-type Binds = HashMap<String, Bind>;
+/// The bindings of one rule's metavariables, by the slot that the rule's parse gave each name.
+type Slots = Vec<Option<Bind>>;
+
+fn bind(slots: &mut Slots, slot: Option<u32>, found: Bind) {
+    if let Some(slot) = slot {
+        slots[slot as usize] = Some(found);
+    }
+}
 
 struct Matcher<'a> {
     def: &'a Source,
     input: &'a Source,
-}
-
-fn names(def: &Source, pieces: &[Piece], into: &mut Vec<String>) {
-    for piece in pieces {
-        match piece {
-            Piece::Var(name, _) | Piece::Meta(Meta::Ignore(name) | Meta::Count(name)) => into.push(def.text(*name).to_owned()),
-            Piece::Group(_, inner) | Piece::Repeat(inner, ..) => names(def, inner, into),
-            Piece::Token(_) | Piece::Crate | Piece::CratePath | Piece::Meta(_) => {}
-        }
-    }
+    parsed: Option<HashMap<(u32, u32, Frag), Option<u32>>>,
 }
 
 impl Matcher<'_> {
-    fn seq(&self, pieces: &[Piece], mut at: u32, end: u32, binds: &mut Binds) -> Option<u32> {
+    fn seq(&mut self, pieces: &[Piece], mut at: u32, end: u32, slots: &mut Slots) -> Option<u32> {
         for piece in pieces {
-            at = self.piece(piece, at, end, binds)?;
+            at = self.piece(piece, at, end, slots)?;
         }
         Some(at)
     }
@@ -45,12 +43,20 @@ impl Matcher<'_> {
         same.then_some(at + len)
     }
 
-    fn piece(&self, piece: &Piece, at: u32, end: u32, binds: &mut Binds) -> Option<u32> {
+    fn extent(&mut self, frag: Frag, at: u32, end: u32) -> Option<u32> {
+        let input = self.input;
+        match self.parsed.as_mut().filter(|_| !fragment::is_short(frag)) {
+            Some(parsed) => *parsed.entry((at, end, frag)).or_insert_with(|| fragment::extent(input, frag, at, end)),
+            None => fragment::extent(input, frag, at, end),
+        }
+    }
+
+    fn piece(&mut self, piece: &Piece, at: u32, end: u32, slots: &mut Slots) -> Option<u32> {
         if let Some(to) = self.input.opaque_end(at).filter(|_| at < end) {
             match piece {
-                Piece::Token(_) | Piece::Group(..) | Piece::Var(_, Some(Frag::Ident | Frag::Lifetime)) => return None,
-                Piece::Var(name, Some(Frag::Tt)) => {
-                    binds.insert(self.def.text(*name).to_owned(), Bind::One(at, to, Frag::Tt));
+                Piece::Token(_) | Piece::Group(..) | Piece::Var(_, Some(Frag::Ident | Frag::Lifetime), _) => return None,
+                Piece::Var(_, Some(Frag::Tt), slot) => {
+                    bind(slots, *slot, Bind::One(at, to, Frag::Tt));
                     return Some(to);
                 }
                 _ => {}
@@ -63,45 +69,45 @@ impl Matcher<'_> {
                     return None;
                 }
                 let close = self.input.pair(at);
-                (self.seq(inner, at + 1, close, binds)? == close).then_some(close + 1)
+                (self.seq(inner, at + 1, close, slots)? == close).then_some(close + 1)
             }
-            Piece::Var(name, Some(frag)) => {
-                let to = fragment::extent(self.input, *frag, at, end)?;
-                binds.insert(self.def.text(*name).to_owned(), Bind::One(at, to, *frag));
+            Piece::Var(_, Some(frag), slot) => {
+                let to = self.extent(*frag, at, end)?;
+                bind(slots, *slot, Bind::One(at, to, *frag));
                 Some(to)
             }
-            Piece::Var(_, None) | Piece::Crate | Piece::CratePath | Piece::Meta(_) => None,
-            Piece::Repeat(inner, sep, op) => self.repeat(inner, *sep, *op, (at, end), binds),
+            Piece::Var(_, None, _) | Piece::Crate | Piece::CratePath | Piece::Meta(_) => None,
+            Piece::Repeat(inner, sep, op, names) => self.repeat((inner, names), (*sep, *op), (at, end), slots),
         }
     }
 
-    fn repeat(&self, inner: &[Piece], sep: Option<(u32, u32)>, op: Op, (mut at, end): (u32, u32), binds: &mut Binds) -> Option<u32> {
-        let mut rounds: Vec<Binds> = Vec::new();
-        while !(op == Op::Maybe && rounds.len() == 1) {
+    fn repeat(&mut self, (inner, names): (&[Piece], &[u32]), (sep, op): (Option<(u32, u32)>, Op), (mut at, end): (u32, u32), slots: &mut Slots) -> Option<u32> {
+        let mut each: Vec<Vec<Bind>> = names.iter().map(|_| Vec::new()).collect();
+        let mut rounds = 0;
+        while !(op == Op::Maybe && rounds == 1) {
             let start = match sep {
-                Some(sep) if !rounds.is_empty() => match self.sep(sep, at, end) {
+                Some(sep) if rounds > 0 => match self.sep(sep, at, end) {
                     Some(next) => next,
                     None => break,
                 },
                 _ => at,
             };
-            let mut local = Binds::default();
-            match self.seq(inner, start, end, &mut local) {
+            match self.seq(inner, start, end, slots) {
                 Some(next) if next > start => {
-                    rounds.push(local);
+                    for (&slot, column) in names.iter().zip(&mut each) {
+                        column.push(slots[slot as usize].take().unwrap_or(Bind::Many(Vec::new())));
+                    }
+                    rounds += 1;
                     at = next;
                 }
                 _ => break,
             }
         }
-        if op == Op::Some && rounds.is_empty() {
+        if op == Op::Some && rounds == 0 {
             return None;
         }
-        let mut found = Vec::new();
-        names(self.def, inner, &mut found);
-        for name in found {
-            let each = rounds.iter_mut().map(|round| round.remove(&name).unwrap_or(Bind::Many(Vec::new()))).collect();
-            binds.insert(name, Bind::Many(each));
+        for (&slot, column) in names.iter().zip(each) {
+            slots[slot as usize] = Some(Bind::Many(column));
         }
         Some(at)
     }
@@ -110,7 +116,7 @@ impl Matcher<'_> {
 struct Writer<'a> {
     def: &'a Source,
     input: &'a Source,
-    binds: Binds,
+    slots: Slots,
     lens: Vec<usize>,
     krate: u32,
     home: Option<Mark>,
@@ -128,8 +134,8 @@ fn leaves(bind: &Bind) -> usize {
     }
 }
 
-fn lookup<'b>(binds: &'b Binds, name: &str, rounds: &[usize]) -> Option<&'b Bind> {
-    let mut bind = binds.get(name)?;
+fn lookup<'b>(slots: &'b Slots, slot: Option<u32>, rounds: &[usize]) -> Option<&'b Bind> {
+    let mut bind = slots.get(slot? as usize)?.as_ref()?;
     for &round in rounds {
         match bind {
             Bind::Many(each) => bind = each.get(round)?,
@@ -163,15 +169,15 @@ impl Writer<'_> {
                     self.out.lexed("::");
                 }
                 Piece::Meta(meta) => self.meta(meta, rounds),
-                Piece::Var(name, _) => self.var(*name, rounds)?,
-                Piece::Repeat(inner, sep, _) => self.repeat(inner, *sep, rounds)?,
+                Piece::Var(name, _, slot) => self.var(*name, *slot, rounds)?,
+                Piece::Repeat(inner, sep, _, names) => self.repeat((inner, names), *sep, rounds)?,
             }
         }
         Ok(())
     }
 
-    fn var(&mut self, name: u32, rounds: &[usize]) -> Result<()> {
-        match lookup(&self.binds, self.def.text(name), rounds) {
+    fn var(&mut self, name: u32, slot: Option<u32>, rounds: &[usize]) -> Result<()> {
+        match lookup(&self.slots, slot, rounds) {
             Some(&Bind::One(from, to, frag)) => {
                 let grouped = frag == Frag::Expr && fragment::tree(self.input, from) != to;
                 let start = self.out.len();
@@ -201,9 +207,9 @@ impl Writer<'_> {
             Meta::Ignore(_) => return,
             Meta::Index(depth) => rounds.len().checked_sub(depth + 1).map_or(0, |at| rounds[at]),
             Meta::Len(depth) => self.lens.len().checked_sub(depth + 1).map_or(0, |at| self.lens[at]),
-            Meta::Count(name) => lookup(&self.binds, self.def.text(*name), rounds).map_or(0, leaves),
+            Meta::Count(slot) => lookup(&self.slots, *slot, rounds).map_or(0, leaves),
             Meta::Concat(parts) => {
-                let text: String = parts.iter().map(|&(variable, token)| self.concat_part(variable, token, rounds)).collect();
+                let text: String = parts.iter().map(|&(slot, token)| self.concat_part(slot, token, rounds)).collect();
                 self.out.lexed(&text);
                 return;
             }
@@ -211,27 +217,23 @@ impl Writer<'_> {
         self.out.lexed(&value.to_string());
     }
 
-    fn concat_part(&self, variable: bool, token: u32, rounds: &[usize]) -> String {
-        let text = self.def.text(token);
-        let bound = if variable { lookup(&self.binds, text, rounds) } else { None };
-        let part = match bound {
+    fn concat_part(&self, slot: Option<u32>, token: u32, rounds: &[usize]) -> String {
+        let part = match lookup(&self.slots, slot, rounds) {
             Some(&Bind::One(from, ..)) => self.input.text(from),
-            _ => text,
+            _ => self.def.text(token),
         };
         part.trim_start_matches("r#").trim_matches('"').to_owned()
     }
 
-    fn count(&self, inner: &[Piece], rounds: &[usize]) -> Option<usize> {
-        let mut found = Vec::new();
-        names(self.def, inner, &mut found);
-        found.iter().find_map(|name| match lookup(&self.binds, name, rounds) {
+    fn count(&self, names: &[u32], rounds: &[usize]) -> Option<usize> {
+        names.iter().find_map(|&slot| match lookup(&self.slots, Some(slot), rounds) {
             Some(Bind::Many(each)) => Some(each.len()),
             _ => None,
         })
     }
 
-    fn repeat(&mut self, inner: &[Piece], sep: Option<(u32, u32)>, rounds: &mut Vec<usize>) -> Result<()> {
-        let Some(count) = self.count(inner, rounds) else { bail!("repetition in a transcriber uses no repeating metavariable") };
+    fn repeat(&mut self, (inner, names): (&[Piece], &[u32]), sep: Option<(u32, u32)>, rounds: &mut Vec<usize>) -> Result<()> {
+        let Some(count) = self.count(names, rounds) else { bail!("repetition in a transcriber uses no repeating metavariable") };
         for round in 0..count {
             if round > 0
                 && let Some((first, last)) = sep
@@ -250,12 +252,14 @@ impl Writer<'_> {
 
 /// Expands the call whose input is the group opening at `open` in `input` with the first rule that matches, written by a macro of crate `krate` whose own names carry the mark `home`.
 pub fn expand(def: &Source, rules: &[Rule], input: &Source, (open, krate): (u32, u32), home: Option<Mark>) -> Result<Source> {
-    let matcher = Matcher { def, input };
+    let mut matcher = Matcher { def, input, parsed: (rules.len() > 1).then(HashMap::default) };
     let close = input.pair(open);
+    let mut slots = Slots::new();
     for rule in rules {
-        let mut binds = Binds::default();
-        if matcher.seq(&rule.matcher, open + 1, close, &mut binds) == Some(close) {
-            let mut writer = Writer { def, input, binds, lens: Vec::new(), krate, home, scope: SCOPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed), out: Tokens::default() };
+        slots.clear();
+        slots.resize_with(rule.slots, || None);
+        if matcher.seq(&rule.matcher, open + 1, close, &mut slots) == Some(close) {
+            let mut writer = Writer { def, input, slots, lens: Vec::new(), krate, home, scope: SCOPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed), out: Tokens::default() };
             writer.emit(&rule.body, &mut Vec::new())?;
             return writer.out.finish(input.path.clone());
         }

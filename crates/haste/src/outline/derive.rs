@@ -84,7 +84,9 @@ pub fn expand(src: &Source, item: &Item, (wanted, holder): (&[Derive], u32), ena
     for &derive in wanted {
         writer.header(derive);
         let body = writer.method(derive, simple || union)?;
-        writer.text(&format!("{{ {body} }}"));
+        writer.text("{");
+        writer.text(&body);
+        writer.text("}");
     }
     writer.out.finish(src.path.clone())
 }
