@@ -25,10 +25,33 @@ impl Lower<'_, '_> {
                 Ok(None)
             }
             Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
+            Intrinsic::CallerLocation => self.caller_location().map(Some),
             Intrinsic::Cpuid => Ok(Some(self.no_cpuid())),
             Intrinsic::BytePermute(bytes) => self.byte_permute(args, bytes).map(Some),
             _ => self.memory_intrinsic(which, substs, args),
         }
+    }
+
+    /// A `&'static Location` of where the function being lowered starts, since callers do not pass down the location that `#[track_caller]` asks for yet.
+    fn caller_location(&mut self) -> Result<Value> {
+        let Some(location) = self.cx.lang_item("panic_location") else { bail!("no `Location` lang item") };
+        let ty = self.cx.types.intern(Kind::Adt(location, Vec::new()));
+        let layout = self.cx.layout(ty)?;
+        let (src, entry) = self.cx.item(self.reached.list[self.index].0.0);
+        let mut file = src.path.display().to_string().into_bytes();
+        let (len, line, column) = (file.len() as u64, src.line(entry.start) as u32, src.column(entry.start) as u32);
+        file.push(0);
+        let mut bytes = vec![0u8; layout.size.bytes() as usize];
+        let mut put = |field: u32, at: i32, value: &[u8]| {
+            let from = (crate::sema::layout::field_offset(&layout, 0, field) + at) as usize;
+            bytes[from..from + value.len()].copy_from_slice(value);
+        };
+        put(0, 0, &(self.slots.data(&file) as u64).to_le_bytes());
+        put(0, 8, &len.to_le_bytes());
+        put(1, 0, &line.to_le_bytes());
+        put(2, 0, &column.to_le_bytes());
+        let address = self.slots.data(&bytes);
+        Ok(self.ins().iconst(Type::I64, address))
     }
 
     fn catch_unwind(&mut self, args: &[Value]) -> Result<Value> {

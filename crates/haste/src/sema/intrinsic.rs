@@ -33,6 +33,7 @@ pub enum Intrinsic {
     WithOverflow(BinOp),
     ConstEvalSelect,
     Trap,
+    CallerLocation,
     Cpuid,
     /// SSSE3 or AVX2 `pshufb` on a vector of this many bytes.
     BytePermute(u8),
@@ -146,7 +147,7 @@ const NAMES: [(&str, Intrinsic); 130] = {
         ("abort", Trap),
         ("catch_unwind", CatchUnwind),
         ("unreachable", Trap),
-        ("caller_location", Trap),
+        ("caller_location", CallerLocation),
         ("size_of", SizeOf),
         ("align_of", AlignOf),
         ("min_align_of", AlignOf),

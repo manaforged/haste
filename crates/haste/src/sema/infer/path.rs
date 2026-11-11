@@ -26,8 +26,16 @@ impl<'a> Infer<'_, 'a> {
         segments(&self.cx.names.symbols, self.src, arena, path)
     }
 
-    /// The item a value path names, resolved from the body's module, then for a single name that a `macro` item wrote, from that macro's module.
+    /// The item a value path names, resolved from the body's module, then for a single name that a `macro` item wrote, from that macro's module, with a foreign declaration taken to the function the linker binds it to.
     pub fn value_item(&mut self, arena: &Body, path: PathId) -> Result<Def> {
+        let found = self.value_named(arena, path)?;
+        Ok(match found {
+            Def::Item(item) => Def::Item(self.cx.linked(item)),
+            other => other,
+        })
+    }
+
+    fn value_named(&mut self, arena: &Body, path: PathId) -> Result<Def> {
         let (segments, absolute, dollar) = self.segments(arena, path);
         let found = self.value_def(&segments, absolute, dollar);
         let [name] = segments[..] else { return found };
