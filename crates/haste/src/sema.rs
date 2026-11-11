@@ -57,6 +57,7 @@ struct Lookups {
     langs: Option<traits::Langs>,
     drops: HashMap<ty::Ty, bool>,
     fields: HashMap<ty::Ty, infer::Fields>,
+    forms: HashMap<(infer::Form, usize), Option<infer::Fields>>,
     reveals: HashMap<reach::Instance, Option<ty::Ty>>,
     futures: HashMap<ty::Ty, ty::Ty>,
     scope_traits: std::cell::RefCell<HashMap<ModRef, Rc<[ItemRef]>>>,
@@ -123,6 +124,13 @@ impl Cache {
         let kept = &mut self.lookups;
         kept.drops.retain(|ty, _| !naming.names(*ty));
         kept.fields.retain(|ty, _| !naming.names(*ty));
+        kept.forms.retain(|(form, _), found| {
+            let own = match *form {
+                infer::Form::Adt(item) | infer::Form::Fn(item) => !mine(item),
+                infer::Form::Impl(block) => block_kept(&block),
+            };
+            own && found.iter().flat_map(|types| types.iter().flatten()).all(|&ty| !naming.names(ty))
+        });
         kept.reveals.retain(|instance, _| !naming.touches(instance));
         kept.futures.retain(|ty, _| !naming.names(*ty));
         kept.impl_traits.retain(|block, _| block_kept(block));
