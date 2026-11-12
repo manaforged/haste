@@ -584,8 +584,7 @@ impl Image {
         };
         let exec = self.pass.memory.write_patched(&jt.stencil, &entry.symbols)?;
         self.pass.stencils.aliases.insert((entry.item, entry.footprint, entry.symbols), (exec, false));
-        self.slot(index).store(exec, Ordering::Release);
-        self.link();
+        self.publish(index, exec);
         Ok(exec)
     }
 

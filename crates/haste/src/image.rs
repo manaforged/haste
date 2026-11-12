@@ -41,7 +41,7 @@ pub struct Image {
     shared: Mutex<Arena>,
     state: Mutex<Arena>,
     tables: Mutex<HashMap<Vec<Word>, i64>>,
-    fixups: Mutex<Vec<(usize, usize)>>,
+    fixups: Mutex<HashMap<usize, Vec<usize>>>,
     cells: Mutex<HashMap<usize, i64>>,
     rodata_map: Mutex<HashMap<(Vec<u8>, Vec<lower::RodataReloc>), lower::RodataId>>,
     rodata_addrs: Mutex<Vec<u64>>,
@@ -102,10 +102,18 @@ impl Slots for Image {
         if let Some(&address) = tables.get(words) {
             return address;
         }
-        let bytes: Vec<u8> = words.iter().flat_map(|word| (if let Word::Int(value) = *word { value } else { 0 }).to_le_bytes()).collect();
+        let value = |word: &Word| match *word {
+            Word::Int(value) => value,
+            Word::Code(index) => self.slot(index).load(Ordering::Acquire) as u64,
+        };
+        let bytes: Vec<u8> = words.iter().flat_map(|word| value(word).to_le_bytes()).collect();
         let address = self.data(&bytes);
-        let codes = words.iter().enumerate().filter_map(|(at, word)| if let Word::Code(index) = *word { Some((address as usize + at * 8, index)) } else { None });
-        lock(&self.fixups).extend(codes);
+        let mut fixups = lock(&self.fixups);
+        for (at, word) in words.iter().enumerate() {
+            if let Word::Code(index) = *word {
+                fixups.entry(index).or_default().push(address as usize + at * 8);
+            }
+        }
         tables.insert(words.to_vec(), address);
         address
     }
@@ -280,11 +288,17 @@ impl Image {
         }
     }
 
-    fn link(&mut self) {
-        for &(address, index) in lock(&self.fixups).iter() {
-            let code = self.slot(index).load(Ordering::Acquire) as u64;
-            // SAFETY: address is a word of a constant table that data handed out, which stays mapped for the life of the process.
-            unsafe { (address as *mut u64).write_unaligned(code) };
+    fn link(&self) {
+        for (&index, addresses) in lock(&self.fixups).iter() {
+            patch(addresses, self.slot(index).load(Ordering::Acquire));
+        }
+    }
+
+    /// Points slot `index` at `code` and rewrites every constant table word that names it, so neither a call through the slot nor one through a table reaches its stub again.
+    fn publish(&self, index: usize, code: usize) {
+        self.slot(index).store(code, Ordering::Release);
+        if let Some(addresses) = lock(&self.fixups).get(&index) {
+            patch(addresses, code);
         }
     }
 
@@ -347,6 +361,14 @@ impl Image {
         let status = lang_start(main, owned.len() as isize, argv.as_ptr(), 0) as i32;
         crate::prep::finish();
         status
+    }
+}
+
+/// Writes `code` into each constant table word at `addresses`.
+fn patch(addresses: &[usize], code: usize) {
+    for &address in addresses {
+        // SAFETY: address is an 8-aligned word of a constant table that data handed out, which stays mapped for the life of the process; an aligned word store is single-copy atomic, so a thread that reads it sees the old entry or the new one, and both run the same function.
+        unsafe { (*(address as *const AtomicUsize)).store(code, Ordering::Release) };
     }
 }
 

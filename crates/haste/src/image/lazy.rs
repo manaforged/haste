@@ -277,7 +277,8 @@ impl Jit {
     pub fn declare(&mut self, instance: Instance) -> usize {
         let (at, new) = self.reached.declare(instance);
         if new {
-            let code = self.image.stubs.write(&stub::code(at)).unwrap_or_else(|error| panic!("{error}"));
+            let slot = self.image.slot(at).as_ptr() as usize;
+            let code = self.image.stubs.write(&stub::code(at, slot)).unwrap_or_else(|error| panic!("{error}"));
             self.image.slot(at).store(code, Ordering::Release);
             self.stubs.push(code);
         }
@@ -471,25 +472,19 @@ impl Jit {
         let item = self.reached.list[index].0.0;
         if cx.foreign(item) {
             let code = host_symbol(cx, item).map_err(|error| Stop::Failed(error, item))?;
-            self.image.slot(index).store(code, Ordering::Release);
-            self.compiled.insert(index);
-            return Ok(code);
+            return Ok(self.publish(index, code));
         }
         if let Some(code) = self.prepped(cx, index, journal) {
             let origin = if crate::prep::bind(cx, &self.reached, index) == Some(code) { super::perf::Origin::Rustc } else { super::perf::Origin::Adapter };
             super::perf::note(cx, &self.reached, (index, code), origin);
-            self.image.slot(index).store(code, Ordering::Release);
-            self.compiled.insert(index);
-            return Ok(code);
+            return Ok(self.publish(index, code));
         }
         let mut callees = self.infer(cx, index, journal)?;
         while !self.compiled.contains(&index) {
             match self.image.compile_one(cx, &self.reached, index) {
                 Ok(code) => {
                     super::perf::note(cx, &self.reached, (index, code), super::perf::Origin::Haste);
-                    self.image.slot(index).store(code, Ordering::Release);
-                    self.compiled.insert(index);
-                    self.image.link();
+                    self.publish(index, code);
                 }
                 Err(error) => {
                     let wanted = self.image.take_wanted();
@@ -501,6 +496,13 @@ impl Jit {
             }
         }
         Ok(self.image.slot(index).load(Ordering::Acquire))
+    }
+
+    /// Publishes `code` as function `index`'s code, in its slot and every table that names it, marks it compiled and returns it.
+    fn publish(&mut self, index: usize, code: usize) -> usize {
+        self.image.publish(index, code);
+        self.compiled.insert(index);
+        code
     }
 
     /// The address of the prepped code that runs function `index`, inferring it first, when the bound prepped library holds it: rustc's code, or an adapter to it written here.
