@@ -38,6 +38,13 @@ struct Libraries {
     search: Vec<PathBuf>,
 }
 
+impl Libraries {
+    /// The path of each archive and the name of each dynamic library.
+    fn names(&self) -> Vec<String> {
+        self.archives.iter().map(|archive| archive.display().to_string()).chain(self.dynamic.iter().map(|(_, name)| name.clone())).collect()
+    }
+}
+
 /// Loads the libraries that the build scripts of the crates in `outline` link and that this process has not loaded yet.
 pub fn load(outline: &Outline) -> Result<()> {
     let mut libraries = libraries(outline)?;
@@ -47,9 +54,9 @@ pub fn load(outline: &Outline) -> Result<()> {
     if libraries.archives.is_empty() && libraries.dynamic.is_empty() {
         return Ok(());
     }
-    let symbols = open_libraries(&libraries)?;
+    let symbols = open_libraries(&libraries).with_context(|| format!("loading the native libraries {}", libraries.names().join(", ")))?;
     loaded.symbols.get_or_insert_default().extend(symbols);
-    loaded.libraries.extend(libraries.archives.iter().map(|archive| archive.display().to_string()).chain(libraries.dynamic.into_iter().map(|(_, name)| name)));
+    loaded.libraries.extend(libraries.names());
     Ok(())
 }
 
@@ -72,8 +79,8 @@ fn libraries(outline: &Outline) -> Result<Libraries> {
             LinkKind::Dynamic | LinkKind::Framework => libraries.dynamic.push((kind, name)),
         }
     }
-    libraries.archives.sort_by(|a, b| a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b)));
-    libraries.archives.dedup_by(|a, b| a.file_name() == b.file_name());
+    libraries.archives.sort();
+    libraries.archives.dedup();
     libraries.dynamic.sort();
     libraries.dynamic.dedup();
     Ok(libraries)
@@ -113,13 +120,7 @@ fn link(libraries: &Libraries, path: &Path) -> Result<()> {
     let mut command = Command::new(tool("CC"));
     command.args(["-shared", "-fPIC", "-fno-builtin", "-w", "-o"]).arg(&fresh).arg(&source);
     command.args(libraries.search.iter().map(|dir| format!("-L{}", dir.display())));
-    command.args(whole(&libraries.archives));
-    for (kind, name) in &libraries.dynamic {
-        match kind {
-            LinkKind::Framework => command.arg("-framework").arg(name),
-            LinkKind::Static | LinkKind::Dynamic => command.arg(format!("-l{name}")),
-        };
-    }
+    command.args(whole(&libraries.archives)).args(needed(&libraries.dynamic));
     let ran = command.stdin(Stdio::null()).output().with_context(|| format!("running {command:?}"))?;
     if !ran.status.success() {
         bail!("linking native libraries failed: {}", String::from_utf8_lossy(&ran.stderr));
@@ -138,6 +139,23 @@ fn whole(archives: &[PathBuf]) -> Vec<String> {
     let mut args = vec!["-Wl,--whole-archive".to_owned()];
     args.extend(archives.iter().map(|archive| archive.display().to_string()));
     args.push("-Wl,--no-whole-archive".to_owned());
+    args
+}
+
+/// The linker arguments that name each of `dynamic`, on ELF kept as needed though the linked code references none of their symbols, so loading the result loads them.
+fn needed(dynamic: &[(LinkKind, String)]) -> Vec<String> {
+    let mut args = Vec::new();
+    for (kind, name) in dynamic {
+        match kind {
+            LinkKind::Framework => args.extend(["-framework".to_owned(), name.clone()]),
+            LinkKind::Static | LinkKind::Dynamic => args.push(format!("-l{name}")),
+        }
+    }
+    if cfg!(target_vendor = "apple") || args.is_empty() {
+        return args;
+    }
+    args.insert(0, "-Wl,--push-state,--no-as-needed".to_owned());
+    args.push("-Wl,--pop-state".to_owned());
     args
 }
 
