@@ -10,6 +10,7 @@ mod lower;
 mod macros;
 mod names;
 mod outline;
+mod prep;
 mod scripts;
 mod sema;
 mod serve;
@@ -32,4 +33,16 @@ fn jobs() -> usize {
 /// Sets the job count once, before any work reads it.
 fn set_jobs(count: usize) {
     _ = JOBS.set(count);
+}
+
+static PROFILE: OnceLock<outline::tree::Profile> = OnceLock::new();
+
+/// The build profile: the one `--release` set, else the debug profile.
+fn profile() -> outline::tree::Profile {
+    *PROFILE.get_or_init(outline::tree::Profile::default)
+}
+
+/// Sets the build profile once, before any work reads it.
+fn set_profile(profile: outline::tree::Profile) {
+    _ = PROFILE.set(profile);
 }

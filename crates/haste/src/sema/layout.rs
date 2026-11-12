@@ -130,7 +130,8 @@ impl Context<'_> {
         let layouts = fields.iter().map(|field| self.layout(*field)).collect::<Result<Vec<_>>>()?;
         let refs: Vec<&Layout> = layouts.iter().map(|layout| &**layout).collect();
         let refs: IndexVec<Field, &&Layout> = refs.iter().collect();
-        calc.univariant(&refs, &ReprOptions::default(), StructKind::AlwaysSized).map_err(|error| anyhow!("layout: {error:?}"))
+        let kind = if fields.is_empty() { StructKind::AlwaysSized } else { StructKind::MaybeUnsized };
+        calc.univariant(&refs, &ReprOptions::default(), kind).map_err(|error| anyhow!("layout: {error:?}"))
     }
 
     fn unsized_layout(&mut self, calc: &LayoutCalculator<&TargetDataLayout>, kind: Kind) -> Result<Layout> {

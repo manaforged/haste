@@ -231,7 +231,7 @@ fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     }
 }
 
-const USAGE: &str = "usage: haste [--jobs N] [--stats-json PATH] build|test|run|serve PATH [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand PATH [CRATE]";
+const USAGE: &str = "usage: haste [--jobs N] [--release] [--stats-json PATH] build|test|run|serve|prep PATH [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand PATH [CRATE]";
 
 /// What the command line asks for.
 #[derive(Clone, Copy)]
@@ -240,6 +240,8 @@ enum Command {
     Request(Request),
     /// Keep a build of the workspace in memory and answer requests.
     Serve,
+    /// Prepare the code the binary reaches for the prepped library.
+    Prep,
     /// Print what one stage found.
     Debug(Query),
 }
@@ -262,6 +264,7 @@ fn parse(args: &mut impl Iterator<Item = String>) -> Result<Command> {
     let word = args.next().context(USAGE)?;
     match word.as_str() {
         "serve" => Ok(Command::Serve),
+        "prep" => Ok(Command::Prep),
         "debug" => {
             let name = args.next().context(USAGE)?;
             QUERIES.into_iter().find(|(_, query)| *query == name).map(|(query, _)| Command::Debug(query)).context(USAGE)
@@ -277,6 +280,10 @@ fn consume_options<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>
                 args.next();
                 let count: usize = args.next().context(USAGE)?.parse().context("--jobs takes a positive number")?;
                 crate::set_jobs(count.max(1));
+            }
+            "--release" => {
+                args.next();
+                crate::set_profile(outline::tree::Profile::Release);
             }
             "--stats-json" => {
                 args.next();
@@ -339,6 +346,7 @@ pub fn main() -> Result<()> {
     let root = std::path::absolute(path)?;
     let argv: Vec<String> = std::iter::once(program_name(&root)).chain(rest).collect();
     if stats_json.is_none()
+        && crate::profile() == outline::tree::Profile::Debug
         && let Command::Request(request) = command
         && let Some(status) = crate::serve::ask(&root, request, &argv)?
     {
@@ -366,6 +374,13 @@ fn report_query(query: Query, (workspace, targets): (&graph::Workspace, &Targets
     }
 }
 
+fn report_prep(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let started = Instant::now();
+    let counts = crate::build::prep(workspace, targets)?;
+    println!("{counts} in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+    Ok(())
+}
+
 fn program_name(root: &std::path::Path) -> String {
     root.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned())
 }
@@ -391,6 +406,7 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
     let status = match command {
         Command::Request(request) => report_cases(&workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)))?,
         Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
+        Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };
     eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);

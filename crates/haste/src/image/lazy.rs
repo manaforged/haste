@@ -470,6 +470,11 @@ impl Jit {
             self.compiled.insert(index);
             return Ok(code);
         }
+        if let Some(code) = self.prepped(cx, index, journal) {
+            self.image.slot(index).store(code, Ordering::Release);
+            self.compiled.insert(index);
+            return Ok(code);
+        }
         let mut callees = self.infer(cx, index, journal)?;
         while !self.compiled.contains(&index) {
             match self.image.compile_one(cx, &self.reached, index) {
@@ -488,6 +493,14 @@ impl Jit {
             }
         }
         Ok(self.image.slot(index).load(Ordering::Acquire))
+    }
+
+    /// The address of the prepped wrapper that runs function `index`, inferring it first, when the bound prepped library holds one.
+    fn prepped(&mut self, cx: &mut Context<'_>, index: usize, journal: &mut Journal) -> Option<usize> {
+        if infer_declared(cx, &mut self.reached, index) {
+            journal.push(index);
+        }
+        crate::prep::bind(cx, &self.reached, index)
     }
 
     /// Infers function `index`, every function it calls, and every function that a callee calls copies inline, declaring those, and returns their indexes.

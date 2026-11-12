@@ -17,7 +17,7 @@ const OK_MARK: &str = "+";
 const FAILED_MARK: &str = "-";
 
 /// The directory of the store: `$HASTE_HOME`, else `$XDG_CACHE_HOME/haste`, else `$HOME/.cache/haste`.
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
     let home = var("HASTE_HOME").or_else(|| var("XDG_CACHE_HOME").map(|cache| cache.join("haste"))).or_else(|| var("HOME").map(|home| home.join(".cache/haste")));
     home.unwrap_or_else(|| std::env::temp_dir().join("haste"))
@@ -152,7 +152,7 @@ pub fn lock(workspace: &Workspace, unit: usize) -> io::Result<Lock> {
     Ok(Lock { _file: file })
 }
 
-fn write_new(path: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn write_new(path: &Path, text: &str) -> io::Result<()> {
     let fresh = path.with_extension(format!("{}", std::process::id()));
     std::fs::write(&fresh, text)?;
     std::fs::rename(&fresh, path)

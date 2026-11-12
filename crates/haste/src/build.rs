@@ -7,7 +7,7 @@ use crate::graph::{self, Targets};
 use crate::image::{Image, Program};
 use crate::macros::Compilation;
 use crate::names::ItemRef;
-use crate::outline::{self, edit::Edit};
+use crate::outline::{self, edit::Edit, tree::Profile};
 use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
 use crate::sema::{self, Cache, Edited};
 use anyhow::{Result, bail};
@@ -332,13 +332,44 @@ impl Build {
     }
 }
 
-/// Runs the binary's `main` with `args` as argv, compiling each function on its first call.
+/// Runs the binary's `main` with `args` as argv, compiling each function on its first call, and under the release profile calling prepped code where it can.
 pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> Result<i32> {
     let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
     let Some(main) = main_item(workspace, &compilation.outline) else { bail!("no member binary has a `main`") };
+    if crate::profile() == Profile::Release {
+        bind_prepped(workspace, &mut compilation);
+    }
     let status = crate::image::run_on_demand(&mut compilation, (sema::Cache::default(), main), args);
     std::mem::forget(compilation);
     status
+}
+
+/// Prepares the code that the binary's `main` reaches for the prepped library, and returns what that did.
+pub fn prep(workspace: &graph::Workspace, targets: &Targets) -> Result<crate::prep::Counts> {
+    let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
+    let plan = prep_main(workspace, &mut compilation)?;
+    std::mem::forget(compilation);
+    Ok(plan.counts)
+}
+
+fn prep_main(workspace: &graph::Workspace, compilation: &mut Compilation) -> Result<crate::prep::Plan> {
+    let (_, roots) = batch_roots(workspace, &compilation.outline, main_items);
+    crate::macros::reach_resolved(compilation, |_| roots.clone(), |mut cx, reached| crate::prep::prep(&mut cx, workspace, &reached))
+}
+
+/// Binds this process to the prepped library of the build, preparing it from what `main` reaches when the store holds none; a build that cannot bind it compiles everything.
+fn bind_prepped(workspace: &graph::Workspace, compilation: &mut Compilation) {
+    let manifest = match crate::prep::load(&compilation.outline, &compilation.names, workspace) {
+        Ok(Some(manifest)) => Ok(manifest),
+        Ok(None) => prep_main(workspace, compilation).map(|plan| {
+            eprintln!("{}", plan.counts);
+            plan.manifest
+        }),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = manifest.and_then(crate::prep::install) {
+        eprintln!("haste: running without prepped code: {error:#}");
+    }
 }
 
 /// Whether crate `krate` is a procedural macro crate, whose bodies decide the code of the crates that call its macros.

@@ -24,7 +24,7 @@ pub struct Langs {
 }
 
 /// The lang-table key of the function `#[panic_handler]` marks, which no `#[lang]` value can spell.
-const PANIC_HANDLER: &str = "#[panic_handler]";
+pub(crate) const PANIC_HANDLER: &str = "#[panic_handler]";
 
 impl<'a> Context<'a> {
     /// The generic parameters and where clause of trait `item`.

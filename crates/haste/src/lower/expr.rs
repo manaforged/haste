@@ -50,7 +50,7 @@ fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option
     if typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
         return None;
     }
-    if !cx.outline.crates[item.krate as usize].env.release {
+    if !cx.outline.crates[item.krate as usize].env.release || crate::prep::bind(cx, reached, index).is_some() {
         return None;
     }
     let source = match &typed.shape {

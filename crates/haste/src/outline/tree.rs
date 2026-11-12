@@ -267,7 +267,15 @@ pub struct Env {
     pub release: bool,
 }
 
-const PROFILE: [&str; 3] = ["debug_assertions", "overflow_checks", "ub_checks"];
+/// The build profile every crate compiles under: Cargo's dev profile, or its release profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Profile {
+    #[default]
+    Debug,
+    Release,
+}
+
+pub(crate) const PROFILE: [&str; 3] = ["debug_assertions", "overflow_checks", "ub_checks"];
 const RELEASE: [&str; 1] = ["ub_checks"];
 const OFF: [&str; 10] = ["test", "doc", "doctest", "miri", "rustfmt", "clippy", "windows", "wasm", "bootstrap", "docsrs"];
 
@@ -298,15 +306,19 @@ impl Env {
         self.profile().contains(&"overflow_checks")
     }
 
-    /// The profile cfgs that hold: the debug profile, or for a sysroot crate the release build rustc ships, whose UB checks follow the user crate.
+    /// The profile cfgs that hold: none under the release profile, else the debug profile, or for a sysroot crate the release build rustc ships, whose UB checks follow the user crate.
     fn profile(&self) -> &'static [&'static str] {
-        if self.release { &RELEASE } else { &PROFILE }
+        match crate::profile() {
+            Profile::Release => &[],
+            Profile::Debug if self.release => &RELEASE,
+            Profile::Debug => &PROFILE,
+        }
     }
 
     fn name(&self, name: &str) -> Truth {
         if self.target.has_name(name) || self.profile().contains(&name) || self.script.as_ref().is_some_and(|set| set.names.contains(name)) {
             Truth::Yes
-        } else if self.known || OFF.contains(&name) {
+        } else if self.known || OFF.contains(&name) || (crate::profile() == Profile::Release && PROFILE.contains(&name)) {
             Truth::No
         } else {
             Truth::Unknown
