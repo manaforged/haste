@@ -134,6 +134,27 @@ pub(crate) fn fits(op: Binary, signed: bool, ty: Type, (x, y): (i64, i64)) -> Op
     Some((low..=high).contains(&result))
 }
 
+/// `op` on small integers when `known` gives the constants it reads.
+fn evaluate(func: &Function, op: &Op, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
+    let (Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) | Op::Convert(_, x) | Op::Fits(_, _, x, _)) = *op else {
+        return if let Op::Const(imm) = *op { Some(imm) } else { None };
+    };
+    let ty = func.ty(x);
+    if !ty.is_small_int() {
+        return None;
+    }
+    let both = |x: Value, y: Value| Some((known(x)?, known(y)?));
+    match *op {
+        Op::Unary(op, x) => unary(op, ty, known(x)?),
+        Op::Binary(op, x, y) => both(x, y).and_then(|(a, b)| binary(op, ty, a, b)),
+        Op::Icmp(cc, x, y) => both(x, y).map(|(a, b)| i64::from(holds(cc, ty, a, b))),
+        Op::Convert(Convert::Uextend | Convert::Ireduce, x) => Some(extend(known(x)?, ty, false)),
+        Op::Convert(Convert::Sextend, x) => Some(extend(known(x)?, ty, true)),
+        Op::Fits(op, signed, x, y) => both(x, y).and_then(|pair| fits(op, signed, ty, pair)).map(i64::from),
+        _ => None,
+    }
+}
+
 struct Fold {
     consts: Vec<Option<i64>>,
     subst: Vec<Value>,
@@ -156,22 +177,10 @@ impl Fold {
     }
 
     fn evaluate(&self, func: &Function, op: &Op) -> Option<i64> {
-        let (Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) | Op::Convert(_, x) | Op::Fits(_, _, x, _)) = *op else {
-            return if let Op::Const(imm) = *op { Some(imm) } else { None };
-        };
-        let ty = func.ty(x);
-        if !ty.is_small_int() {
-            return None;
-        }
-        match *op {
-            Op::Unary(op, x) => unary(op, ty, self.known(x)?),
-            Op::Binary(op, x, y) => self.both(x, y).and_then(|(a, b)| binary(op, ty, a, b)).or_else(|| self.absorbed(op, ty, x, y)),
-            Op::Icmp(cc, x, y) => self.both(x, y).map(|(a, b)| i64::from(holds(cc, ty, a, b))),
-            Op::Convert(Convert::Uextend | Convert::Ireduce, x) => Some(extend(self.known(x)?, ty, false)),
-            Op::Convert(Convert::Sextend, x) => Some(extend(self.known(x)?, ty, true)),
-            Op::Fits(op, signed, x, y) => self.both(x, y).and_then(|pair| fits(op, signed, ty, pair)).map(i64::from),
+        evaluate(func, op, &|value| self.known(value)).or_else(|| match *op {
+            Op::Binary(op, x, y) if func.ty(x).is_small_int() => self.absorbed(op, func.ty(x), x, y),
             _ => None,
-        }
+        })
     }
 
     /// The constant `x op y` of type `ty` gives whatever one operand holds: a product, high product or mask with zero, or the difference or xor of a value with itself.
@@ -522,8 +531,8 @@ fn dead(func: &mut Function) {
     }
 }
 
-/// Folds constants, identities and branches on them, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump.
-pub(crate) fn run(func: &mut Function) {
+/// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump.
+pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
     let Some(entry) = func.entry else { return };
     let count = func.types.len();
     let defs = defs(func);
@@ -532,7 +541,8 @@ pub(crate) fn run(func: &mut Function) {
     let mut reachable = Vec::new();
     loop {
         fold.constants(func);
-        let branched = fold.branches(func) | fold.thread(func, &pinned);
+        let settled = effort == crate::Effort::Full && reachable.is_empty() && crate::facts::settle(func, &fold.defs, &mut fold.consts);
+        let branched = settled | fold.branches(func) | fold.thread(func, &pinned);
         if branched || reachable.is_empty() {
             reachable = prune(func, entry);
         }

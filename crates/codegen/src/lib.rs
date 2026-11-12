@@ -11,6 +11,7 @@ mod error;
 mod ir;
 mod memory;
 mod fold;
+mod facts;
 mod fill;
 mod frame;
 mod licm;
@@ -113,9 +114,9 @@ pub fn simplify(func: &mut Function, effort: Effort) {
 
 fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
     fill::run(func);
-    fold::run(func);
+    fold::run(func, effort);
     promote::run(func, if effort == Effort::Full { moves } else { promote::Moves::Words });
-    fold::run(func);
+    fold::run(func, effort);
     merge::run(func);
     cse::run(func);
     if effort == Effort::Full {
