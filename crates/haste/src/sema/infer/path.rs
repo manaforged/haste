@@ -72,7 +72,7 @@ impl<'a> Infer<'_, 'a> {
         } else {
             let path = NamePath { segments: prefix, absolute, dollar };
             let head = if inside { self.type_def(&path) } else { self.cx.paths(self.home.krate).resolve(&path, self.home) };
-            head.map(|def| self.cx.path_member(self.home.krate, def, *last)).and_then(|entry| entry.values)
+            head.map(|def| self.cx.path_member(self.home, def, *last)).and_then(|entry| entry.values)
         };
         match found {
             Some(binding) => Ok(binding.def),
@@ -116,8 +116,8 @@ impl<'a> Infer<'_, 'a> {
     fn local_def(&mut self, path: &NamePath<'_>, ns: Ns) -> Option<Result<Def, usize>> {
         let head = path.segments.first().filter(|_| !path.absolute).and_then(|first| self.block_item(self.cx.names.symbols.text(*first)));
         let found = match head {
-            Some(item) => self.cx.local_descend(item, &path.segments[1..], ns)?,
-            None => self.cx.local_path(self.anchor().filter(|(_, from)| from.is_some()), path, ns)?,
+            Some(item) => self.cx.local_descend(self.home, item, &path.segments[1..], ns)?,
+            None => self.cx.local_path(self.home, self.anchor().filter(|(_, from)| from.is_some()), path, ns)?,
         };
         Some(match found {
             BodyPath::Def(def) => Ok(def),
@@ -141,7 +141,7 @@ impl<'a> Infer<'_, 'a> {
         let Some(binding) = local else {
             return paths.resolve(path, self.home);
         };
-        rest.iter().try_fold(binding.def, |def, segment| self.cx.path_member(self.home.krate, def, *segment).types.map(|found| found.def))
+        rest.iter().try_fold(binding.def, |def, segment| self.cx.path_member(self.home, def, *segment).types.map(|found| found.def))
     }
 
     /// The bindings that the `use` declarations inside the body give `word`, each namespace from the first one that binds it.

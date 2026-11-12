@@ -183,7 +183,7 @@ impl<'a> Infer<'_, 'a> {
             let Ok((_, ret)) = infer.fn_types(pick.item, &substs) else {
                 return true;
             };
-            infer.unifies(ret, wanted) || infer.coerces_to(ret, wanted)
+            infer.is_never(ret) || infer.unifies(ret, wanted) || infer.coerces_to(ret, wanted)
         })
     }
 

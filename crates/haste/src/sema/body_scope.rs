@@ -78,22 +78,22 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Where `path`, written at `at`, leads among the items that the body of `at.0` declares, where `at.1` is the body item it is written in, or none when it does not start among them.
-    pub(super) fn local_path(&self, at: Option<(ItemRef, Option<u32>)>, path: &NamePath<'_>, ns: Ns) -> Option<BodyPath> {
+    /// Where `path`, written at `at` in a body of module `home`, leads among the items that the body of `at.0` declares, where `at.1` is the body item it is written in, or none when it does not start among them.
+    pub(super) fn local_path(&self, home: ModRef, at: Option<(ItemRef, Option<u32>)>, path: &NamePath<'_>, ns: Ns) -> Option<BodyPath> {
         let (root, from) = at.filter(|_| !path.absolute)?;
         let texts: Vec<&str> = path.segments.iter().map(|&segment| self.names.symbols.text(segment)).collect();
-        self.body_path(root, from, &texts, ns)
+        self.body_path((root, home), from, &texts, ns)
     }
 
-    /// Where `rest` leads from the body item `item`, which a block around the path declares.
-    pub(super) fn local_descend(&self, item: ItemRef, rest: &[crate::names::Sym], ns: Ns) -> Option<BodyPath> {
+    /// Where `rest` leads from the body item `item` of a body in module `home`, which a block around the path declares.
+    pub(super) fn local_descend(&self, home: ModRef, item: ItemRef, rest: &[crate::names::Sym], ns: Ns) -> Option<BodyPath> {
         let (root, at) = item.outer()?;
         let texts: Vec<&str> = rest.iter().map(|&segment| self.names.symbols.text(segment)).collect();
-        self.body_descend(root, at, &texts, ns)
+        self.body_descend((root, home), at, &texts, ns)
     }
 
     /// Where `segments`, written at the body item `from` of `root`, lead through the items and modules that the body declares, or none when the path does not start among them.
-    fn body_path(&self, root: ItemRef, from: Option<u32>, segments: &[&str], ns: Ns) -> Option<BodyPath> {
+    fn body_path(&self, (root, home): (ItemRef, ModRef), from: Option<u32>, segments: &[&str], ns: Ns) -> Option<BodyPath> {
         let items = self.body_entries(root);
         let enclosing = |mut at: Option<u32>| {
             while let Some(index) = at.filter(|&index| items[index as usize].kind != ItemKind::Mod) {
@@ -120,22 +120,25 @@ impl<'a> Context<'a> {
                 (module, &segments[supers..])
             }
         };
-        self.body_descend(root, start, rest, ns)
+        self.body_descend((root, home), start, rest, ns)
     }
 
-    fn body_descend(&self, root: ItemRef, mut at: u32, rest: &[&str], ns: Ns) -> Option<BodyPath> {
+    fn body_descend(&self, (root, home): (ItemRef, ModRef), mut at: u32, rest: &[&str], ns: Ns) -> Option<BodyPath> {
         let items = self.body_entries(root);
         if items[at as usize].kind == ItemKind::ExternCrate {
-            return self.extern_descend(root, at, rest, ns);
+            return self.extern_descend((root, home), at, rest, ns);
         }
         for (index, name) in rest.iter().enumerate() {
             let last = index + 1 == rest.len();
             match items[at as usize].kind {
                 ItemKind::Enum if last => return Some(BodyPath::Variant(root.inner(at))),
                 ItemKind::Mod => {
-                    let next = self.body_child(root, Some(at), None, name, Some(if last { ns } else { Ns::Types }))?.outer()?.1;
+                    let Some(next) = self.body_child(root, Some(at), None, name, Some(if last { ns } else { Ns::Types })) else {
+                        return self.module_import((root, home), at, &rest[index..], ns);
+                    };
+                    let next = next.outer()?.1;
                     if items[next as usize].kind == ItemKind::ExternCrate {
-                        return self.extern_descend(root, next, &rest[index + 1..], ns);
+                        return self.extern_descend((root, home), next, &rest[index + 1..], ns);
                     }
                     at = next;
                 }
@@ -145,16 +148,34 @@ impl<'a> Context<'a> {
         Some(BodyPath::Def(Def::Item(root.inner(at))))
     }
 
-    fn extern_descend(&self, root: ItemRef, at: u32, rest: &[&str], ns: Ns) -> Option<BodyPath> {
+    fn extern_descend(&self, (root, home): (ItemRef, ModRef), at: u32, rest: &[&str], ns: Ns) -> Option<BodyPath> {
         let found = self.expansion(root)?;
         let item = &found.file.items.items[at as usize];
         let deps = &self.outline.deps[root.krate as usize];
-        let mut def = Def::Module(extern_crate_target(&found.file.source, item, root.krate, deps)?);
+        let def = Def::Module(extern_crate_target(&found.file.source, item, root.krate, deps)?);
         if rest.is_empty() {
             return (ns == Ns::Types).then_some(BodyPath::Def(def));
         }
+        self.def_descend(home, def, rest, ns)
+    }
+
+    /// Where `rest` leads through the `use` declaration of the body module `at` that binds its first segment.
+    fn module_import(&self, (root, home): (ItemRef, ModRef), at: u32, rest: &[&str], ns: Ns) -> Option<BodyPath> {
+        let file = &self.expansion(root)?.file;
+        let (first, more) = rest.split_first()?;
+        let word = self.names.symbols.intern(first);
+        let paths = self.paths(home.krate);
+        let held = |import: &&u32| file.items.items[file.items.imports[**import as usize].item as usize].parent == Some(at);
+        let imports = self.body_index(file).imports.get(*first)?;
+        let (_, entry) = imports.iter().filter(held).find_map(|&import| self.import_entry((root, home), &paths, (file, import), Some(word)))?;
+        let binding = if more.is_empty() { entry.get(ns) } else { entry.types };
+        self.def_descend(home, binding?.def, more, ns)
+    }
+
+    /// Where `rest` leads from `def` through the members of each definition it names.
+    fn def_descend(&self, home: ModRef, mut def: Def, rest: &[&str], ns: Ns) -> Option<BodyPath> {
         for (index, name) in rest.iter().enumerate() {
-            let entry = self.path_member(root.krate, def, self.names.symbols.intern(name));
+            let entry = self.path_member(home, def, self.names.symbols.intern(name));
             let binding = if index + 1 == rest.len() { entry.get(ns) } else { entry.types };
             def = binding?.def;
         }
@@ -200,41 +221,41 @@ impl<'a> Context<'a> {
             (Some(_), Some((&leaf, head)), _) => (head, leaf),
             (None, Some(_), None) => {
                 let path = NamePath { segments, absolute, dollar };
-                let def = self.local_path(Some((root, from)), &path, Ns::Types).and_then(|found| self.body_binding(Some(found), "").map(|binding| binding.def)).or_else(|| paths.resolve(&path, home))?;
+                let def = self.local_path(home, Some((root, from)), &path, Ns::Types).and_then(|found| self.body_binding(Some(found), "").map(|binding| binding.def)).or_else(|| paths.resolve(&path, home))?;
                 return Some((false, PerNs { types: Some(Binding { def, vis: Vis::Pub, origin: Origin::Glob }), values: None, macros: None }));
             }
             _ => return None,
         };
-        let local = if absolute { None } else { self.body_import(root, from, head, leaf) };
+        let local = if absolute { None } else { self.body_import((root, home), from, head, leaf) };
         let entry = match head {
             _ if let Some(local) = local => local,
             [] => paths.first(leaf, home, &NamePath { segments: &[leaf], absolute, dollar }),
-            _ => self.path_member(home.krate, paths.resolve(&NamePath { segments: head, absolute, dollar }, home)?, leaf),
+            _ => self.path_member(home, paths.resolve(&NamePath { segments: head, absolute, dollar }, home)?, leaf),
         };
         (entry.types.is_some() || entry.values.is_some()).then_some((name.is_some(), entry))
     }
 
     /// The bindings of `leaf` in the item that `head`, written at the body item `from` of `root`, names among the items the body declares: a variant of an enum or an item of a module.
-    fn body_import(&self, root: ItemRef, from: Option<u32>, head: &[Sym], leaf: Sym) -> Option<PerNs> {
+    fn body_import(&self, (root, home): (ItemRef, ModRef), from: Option<u32>, head: &[Sym], leaf: Sym) -> Option<PerNs> {
         if head.is_empty() {
             return None;
         }
         let texts: Vec<&str> = head.iter().chain([&leaf]).map(|&segment| self.names.symbols.text(segment)).collect();
-        let found = |ns| self.body_binding(self.body_path(root, from, &texts, ns), texts[texts.len() - 1]);
+        let found = |ns| self.body_binding(self.body_path((root, home), from, &texts, ns), texts[texts.len() - 1]);
         let entry = PerNs { types: found(Ns::Types), values: found(Ns::Values), macros: None };
         (entry.types.is_some() || entry.values.is_some()).then_some(entry)
     }
 
-    /// The bindings of `name` inside `def`, an enum's variants or a module's items, for a path of crate `krate`, where a body may declare `def`.
-    pub(super) fn path_member(&self, krate: u32, def: Def, name: Sym) -> PerNs {
+    /// The bindings of `name` inside `def`, an enum's variants or a module's items, for a path written in module `home`, where a body may declare `def`.
+    pub(super) fn path_member(&self, home: ModRef, def: Def, name: Sym) -> PerNs {
         let Some((root, at)) = (match def {
             Def::Item(item) => item.outer(),
             _ => None,
         }) else {
-            return self.paths(krate).member(def, name);
+            return self.paths(home.krate).member(def, name);
         };
         let text = self.names.symbols.text(name);
-        let found = |ns| self.body_binding(self.body_descend(root, at, &[text], ns), text);
+        let found = |ns| self.body_binding(self.body_descend((root, home), at, &[text], ns), text);
         PerNs { types: found(Ns::Types), values: found(Ns::Values), macros: None }
     }
 
@@ -261,7 +282,7 @@ impl<'a> Context<'a> {
     pub(super) fn body_use_path(&self, (root, home): (ItemRef, ModRef), path: &NamePath<'_>, here: Option<u32>) -> Option<Def> {
         let (first, rest) = path.segments.split_first().filter(|_| !path.absolute)?;
         let binding = self.body_imports((root, home), Some(*first), here).into_iter().find_map(|entry| entry.types)?;
-        rest.iter().try_fold(binding.def, |def, segment| self.path_member(home.krate, def, *segment).types.map(|found| found.def))
+        rest.iter().try_fold(binding.def, |def, segment| self.path_member(home, def, *segment).types.map(|found| found.def))
     }
 }
 

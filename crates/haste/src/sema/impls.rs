@@ -288,7 +288,7 @@ impl<'a> Context<'a> {
     fn resolve_in(&self, at: Option<ItemRef>, path: &NamePath<'_>, home: ModRef) -> Option<Def> {
         let anchor = at.and_then(ItemRef::outer).map(|(root, from)| (root, Some(from)));
         let paths = self.paths(home.krate);
-        match self.local_path(anchor, path, Ns::Types) {
+        match self.local_path(home, anchor, path, Ns::Types) {
             Some(BodyPath::Def(def)) => Some(def),
             Some(BodyPath::Variant(_)) => None,
             Some(BodyPath::Outside(skip)) => paths.resolve(&outside(path, skip), home),

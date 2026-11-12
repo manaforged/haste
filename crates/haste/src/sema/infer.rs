@@ -551,8 +551,10 @@ impl Infer<'_, '_> {
 
     fn step_obligation(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
         let self_ty = self.resolve(substs[0]);
-        if matches!(self.cx.types.kind(self_ty), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
-            return Ok(self.opaque_holds(of, substs)? == Some(true));
+        match self.cx.types.kind(self_ty) {
+            Kind::Var(_) => return Ok(self.opaque_holds(of, substs)? == Some(true)),
+            Kind::IntVar(_) | Kind::FloatVar(_) => return Ok(self.opaque_holds(of, substs)? == Some(true) || self.settled_by_impl(of, self_ty, &substs[1..])?),
+            _ => {}
         }
         let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
         if self.poly.is_some() && !self.has_vars(self_ty) && known && self.any_has_params(substs) {

@@ -569,7 +569,12 @@ impl<'a> Infer<'_, 'a> {
             return Ok(true);
         }
         let args = self.bound_args(of, arena, path, ty)?;
-        Ok(self.opaque_holds(of, &std::iter::once(ty).chain(args).collect::<Vec<_>>())? != Some(false))
+        let substs: Vec<Ty> = std::iter::once(ty).chain(args).collect();
+        let held = self.opaque_holds(of, &substs)?;
+        if held.is_none() {
+            self.obligations.push((of, substs));
+        }
+        Ok(held != Some(false))
     }
 
     /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.

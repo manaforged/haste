@@ -136,6 +136,7 @@ impl Infer<'_, '_> {
         self.settle_operators(false)?;
         self.settle_obligations()?;
         self.fall_back_numbers()?;
+        self.fall_back_residuals()?;
         self.settle_obligations()?;
         self.settle_operators(true)?;
         self.settle_projections()?;
@@ -188,6 +189,24 @@ impl Infer<'_, '_> {
             };
             let prim = self.cx.types.prim(fallback);
             self.unify(ty, prim)?;
+        }
+        Ok(())
+    }
+
+    /// Gives each `?` whose residual is still unknown the residual of the function's own `Try` type, the one `From` impl a generic body could use.
+    fn fall_back_residuals(&mut self) -> Result<()> {
+        let Some(of) = self.cx.lang_item("Try") else { return Ok(()) };
+        let calls: Vec<Res> = self.out.tries.values().map(|each| each.from_residual).collect();
+        for call in calls {
+            let Res::Fn(_, substs) = call else { continue };
+            let &[ret, residual] = self.cx.types.substs(substs) else { continue };
+            if self.has_vars(ret) || !self.has_vars(residual) {
+                continue;
+            }
+            let own = self.project(of, ret, Vec::new(), "Residual")?;
+            if self.probe(|infer| infer.unifies(own, residual)) {
+                self.unify(own, residual)?;
+            }
         }
         Ok(())
     }
