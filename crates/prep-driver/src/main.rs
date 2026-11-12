@@ -18,6 +18,7 @@ mod args;
 mod elf;
 mod error;
 mod export;
+mod layout;
 mod link;
 mod record;
 mod uses;

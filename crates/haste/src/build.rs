@@ -337,7 +337,7 @@ pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> 
     let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
     let Some(main) = main_item(workspace, &compilation.outline) else { bail!("no member binary has a `main`") };
     if crate::profile() == Profile::Release {
-        bind_prepped(workspace, &mut compilation);
+        bind_prepped(workspace, &mut compilation, args);
     }
     let status = crate::image::run_on_demand(&mut compilation, (sema::Cache::default(), main), args);
     std::mem::forget(compilation);
@@ -358,7 +358,7 @@ fn prep_main(workspace: &graph::Workspace, compilation: &mut Compilation) -> Res
 }
 
 /// Binds this process to the prepped library of the build, preparing it from what `main` reaches when the store holds none; a build that cannot bind it compiles everything.
-fn bind_prepped(workspace: &graph::Workspace, compilation: &mut Compilation) {
+fn bind_prepped(workspace: &graph::Workspace, compilation: &mut Compilation, args: &[String]) {
     let manifest = match crate::prep::load(&compilation.outline, &compilation.names, workspace) {
         Ok(Some(manifest)) => Ok(manifest),
         Ok(None) => prep_main(workspace, compilation).map(|plan| {
@@ -367,7 +367,7 @@ fn bind_prepped(workspace: &graph::Workspace, compilation: &mut Compilation) {
         }),
         Err(error) => Err(error),
     };
-    if let Err(error) = manifest.and_then(crate::prep::install) {
+    if let Err(error) = manifest.and_then(|manifest| crate::prep::install(manifest, args)) {
         eprintln!("haste: running without prepped code: {error:#}");
     }
 }

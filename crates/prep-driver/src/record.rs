@@ -5,7 +5,8 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mono::{MonoItem, MonoItemData};
 use rustc_middle::ty::print::{with_resolve_crate_name, with_no_trimmed_paths};
-use rustc_middle::ty::{GenericArgKind, Instance, InstanceKind, TyCtxt};
+use rustc_middle::middle::exported_symbols::ExportedSymbol;
+use rustc_middle::ty::{self, GenericArgKind, Instance, InstanceKind, TyCtxt};
 use rustc_session::config::CrateType;
 use rustc_span::Symbol;
 use serde_json::{Value, json};
@@ -16,6 +17,20 @@ use crate::{abi, uses};
 
 /// The file in each unit directory that holds the unit's manifest, one JSON record per line.
 pub const MANIFEST: &str = "manifest.jsonl";
+
+/// The key of the table that describes the whole library: the symbols of the shared standard library's argument initializer, of its `stdout` and of `flush` on what that returns.
+pub const LIBRARY: &str = "library";
+
+/// The key of the array of instance records in the merged manifest.
+pub const RECORD: &str = "record";
+
+/// The diagnostic items of `std::io::stdout`, of the `Write` trait, and the name of its flush method.
+const STDOUT_ITEM: &str = "io_stdout";
+const WRITE_ITEM: &str = "IoWrite";
+const FLUSH: &str = "flush";
+
+/// The definition path of the function that the shared standard library's loader calls with the process arguments.
+const ARGS_INIT: &str = "std::sys::args::unix::imp::ARGV_INIT_ARRAY::init_wrapper";
 
 /// The file in a linking unit's directory that names the sysroot libraries and native libraries its prep library links.
 pub const LINK: &str = "link.txt";
@@ -54,25 +69,48 @@ fn header(tcx: TyCtxt<'_>, unit: &Unit) -> Value {
         "opt_level": format!("{:?}", sess.opts.optimize),
         "codegen_units": sess.codegen_units().as_usize(),
         "panic": sess.panic_strategy().desc(),
+        LIBRARY: { "args_init": args_init(tcx), "stdout": stdout(tcx).map(|(stdout, _)| stdout), "stdout_flush": stdout(tcx).map(|(_, flush)| flush) },
+    })
+}
+
+/// The symbols of `std::io::stdout` and of `Write::flush` on the `Stdout` it returns.
+fn stdout(tcx: TyCtxt<'_>) -> Option<(String, String)> {
+    let stdout = tcx.get_diagnostic_item(Symbol::intern(STDOUT_ITEM))?;
+    let write = tcx.get_diagnostic_item(Symbol::intern(WRITE_ITEM))?;
+    let flush = tcx.associated_items(write).filter_by_name_unhygienic(Symbol::intern(FLUSH)).next()?.def_id;
+    let ty = tcx.fn_sig(stdout).instantiate_identity().skip_normalization().output().skip_binder();
+    let instance = Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), flush, tcx.mk_args(&[ty.into()])).ok()??;
+    Some((tcx.symbol_name(Instance::mono(tcx, stdout)).name.to_string(), tcx.symbol_name(instance).name.to_string()))
+}
+
+fn args_init(tcx: TyCtxt<'_>) -> Option<String> {
+    let std = tcx.crates(()).iter().copied().find(|&cnum| tcx.crate_name(cnum).as_str() == "std" && crate::link::sysroot(tcx, cnum))?;
+    tcx.exported_non_generic_symbols(std).iter().find_map(|(symbol, _)| match symbol {
+        ExportedSymbol::NonGeneric(def_id) if path(tcx, *def_id) == ARGS_INIT => Some(tcx.symbol_name(Instance::mono(tcx, *def_id)).name.to_string()),
+        _ => None,
     })
 }
 
 fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData, cgu: Symbol) -> Result<Value> {
     let def_id = instance.def_id();
+    let used = uses::used(tcx, instance);
+    let (abi, crossing) = abi::of(tcx, instance)?;
     Ok(json!({
         "symbol": tcx.symbol_name(instance).name,
         "crate": tcx.crate_name(def_id.krate).as_str(),
         "crate_id": crate_id(tcx, def_id),
         "kind": kind(instance.def),
         "path": path(tcx, def_id),
-        "closure": closure(tcx, def_id),
+        "closure": closure(tcx, instance),
         "span": span(tcx, def_id),
         "args": args(tcx, instance),
         "local_copy": data.inlined,
         "cgu": cgu.as_str(),
-        "abi": abi::of(tcx, instance)?,
+        "abi": abi,
+        "layouts": crate::layout::reached(tcx, &crossing),
         "inlined": uses::inlined(tcx, instance),
-        "uses": uses::used(tcx, instance),
+        "uses": used.symbols,
+        "state": used.state,
     }))
 }
 
@@ -94,14 +132,37 @@ fn kind(def: InstanceKind<'_>) -> String {
     }
 }
 
-fn closure(tcx: TyCtxt<'_>, def_id: DefId) -> Value {
+fn closure<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Value {
+    let def_id = instance.def_id();
     if !tcx.is_closure_like(def_id) {
         return Value::Null;
     }
     let parent = tcx.parent(def_id);
     let root = tcx.typeck_root_def_id(def_id);
     let index = tcx.def_key(def_id).disambiguated_data.disambiguator;
-    json!({ "parent": path(tcx, parent), "root": path(tcx, root), "index": index })
+    let kind = match tcx.type_of(def_id).instantiate_identity().skip_normalization().kind() {
+        ty::Closure(..) => Some(format!("{:?}", instance.args.as_closure().kind())),
+        _ => None,
+    };
+    let (order, count) = order(tcx, def_id).unzip();
+    json!({ "parent": path(tcx, parent), "root": path(tcx, root), "index": index, "kind": kind, "order": order, "count": count })
+}
+
+/// The place of local closure `def_id` among the closures of its typeck root in the order their expressions end, inner before outer, and how many there are; none when the root holds a coroutine, an inline constant or a closure a macro wrote.
+fn order(tcx: TyCtxt<'_>, def_id: DefId) -> Option<(usize, usize)> {
+    let local = def_id.as_local()?;
+    let root = tcx.typeck_root_def_id(def_id).as_local()?;
+    let mut ends = Vec::new();
+    for nested in tcx.nested_bodies_within(root) {
+        let span = tcx.hir_span_with_body(tcx.local_def_id_to_hir_id(nested));
+        let plain = matches!(tcx.type_of(nested).instantiate_identity().skip_normalization().kind(), ty::Closure(..));
+        if !plain || span.from_expansion() {
+            return None;
+        }
+        ends.push((span.hi(), std::cmp::Reverse(span.lo()), nested));
+    }
+    ends.sort_by_key(|(hi, lo, _)| (*hi, *lo));
+    Some((ends.iter().position(|(_, _, nested)| *nested == local)?, ends.len()))
 }
 
 fn span(tcx: TyCtxt<'_>, def_id: DefId) -> Value {

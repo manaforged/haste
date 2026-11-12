@@ -13,6 +13,7 @@ const CARGO_BIN: &str = "bin/cargo";
 const RUSTC_BIN: &str = "bin/rustc";
 const VERSION_FLAG: &str = "-vV";
 const CONFIG_FLAG: &str = "--config";
+const OFFLINE_FLAG: &str = "--offline";
 const ROUNDS: usize = 4;
 const CLEARED: [&str; 4] = ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "CARGO_BUILD_TARGET"];
 const ERROR: &str = "error";
@@ -42,7 +43,7 @@ impl Toolchain {
 }
 
 /// The standard output of `command`, or its standard error when it fails.
-fn output(command: &mut Command) -> Result<String> {
+pub(super) fn output(command: &mut Command) -> Result<String> {
     let ran = command.stdin(Stdio::null()).output().with_context(|| format!("running {command:?}"))?;
     if !ran.status.success() {
         bail!("{command:?} failed: {}", String::from_utf8_lossy(&ran.stderr));
@@ -83,20 +84,33 @@ pub(super) fn build(toolchain: &Toolchain, dirs: &Dirs<'_>, shim: &mut Shim) -> 
 }
 
 fn cargo(toolchain: &Toolchain, dirs: &Dirs<'_>) -> Command {
-    let mut command = Command::new(&toolchain.cargo);
-    command.args(["build", "--release", "--offline", "--message-format=short", "--manifest-path"]).arg(dirs.shim.join(CARGO_MANIFEST));
-    for setting in SETTINGS {
-        command.args([CONFIG_FLAG, setting]);
-    }
+    let mut command = release(toolchain, &dirs.shim.join(CARGO_MANIFEST), dirs.target);
+    command.arg(OFFLINE_FLAG);
+    settled(&mut command);
     let config = dirs.workspace.join(CONFIG);
     if config.is_file() {
         command.arg(CONFIG_FLAG).arg(config);
     }
+    command.current_dir(dirs.shim);
+    command
+}
+
+/// A release build of the package at `manifest` with `toolchain` into `target`, with short messages, no input, and none of the variables that would change how cargo calls rustc.
+pub(super) fn release(toolchain: &Toolchain, manifest: &Path, target: &Path) -> Command {
+    let mut command = Command::new(&toolchain.cargo);
+    command.args(["build", "--release", "--message-format=short", "--manifest-path"]).arg(manifest);
     for name in CLEARED {
         command.env_remove(name);
     }
-    command.env("CARGO_TARGET_DIR", dirs.target).env("RUSTC", &toolchain.rustc).current_dir(dirs.shim).stdin(Stdio::null());
+    command.env("CARGO_TARGET_DIR", target).env("RUSTC", &toolchain.rustc).stdin(Stdio::null());
     command
+}
+
+/// Gives `command` the settings that every prepped build uses.
+pub(super) fn settled(command: &mut Command) {
+    for setting in SETTINGS {
+        command.args([CONFIG_FLAG, setting]);
+    }
 }
 
 /// The wrappers that the errors in `stderr` point into, by the lines of `src/lib.rs` that `owners` maps to them.

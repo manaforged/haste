@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use rustc_attr_parsing::eval_config_entry;
+use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_middle::ty::TyCtxt;
 use rustc_attr_ir::NativeLibKind;
 use serde_json::Value;
 
 use crate::elf;
 use crate::error::{Error, Result};
-use crate::record::{LINK, MANIFEST};
+use crate::record::{self, LINK, MANIFEST};
 use crate::wrap::RELEASE;
 
 /// Links every unit under a prep directory into one shared library and writes its manifest beside it.
@@ -25,16 +26,22 @@ pub fn main(args: &[String]) -> ExitCode {
     }
 }
 
+/// Whether crate `cnum` comes from the toolchain's sysroot, as the standard crates do.
+pub fn sysroot(tcx: TyCtxt<'_>, cnum: CrateNum) -> bool {
+    if cnum == LOCAL_CRATE {
+        return false;
+    }
+    let source = tcx.used_crate_source(cnum);
+    [&source.rlib, &source.dylib].into_iter().flatten().any(|path| path.starts_with(tcx.sess.opts.sysroot.path()))
+}
+
 /// Writes the sysroot libraries and native libraries that the crate being compiled links, one per line.
 pub fn write_libraries(tcx: TyCtxt<'_>, path: &Path) -> Result<()> {
-    let sysroot = tcx.sess.opts.sysroot.path();
     let mut out = BufWriter::new(File::create(path)?);
     for &cnum in tcx.crates(()) {
         let source = tcx.used_crate_source(cnum);
         for (kind, path) in [("rlib", &source.rlib), ("dylib", &source.dylib)] {
-            if let Some(path) = path
-                && path.starts_with(sysroot)
-            {
+            if let Some(path) = path.as_ref().filter(|_| sysroot(tcx, cnum)) {
                 writeln!(out, "{kind} {}", path.display())?;
             }
         }
@@ -50,6 +57,9 @@ pub fn write_libraries(tcx: TyCtxt<'_>, path: &Path) -> Result<()> {
 }
 
 const ALLOCATOR_SUFFIX: &str = "___rust_alloc";
+
+/// The extension of the merged manifest that `link` writes beside the library, in TOML.
+pub const MANIFEST_EXTENSION: &str = "toml";
 
 #[derive(Default)]
 struct Inputs {
@@ -88,7 +98,7 @@ fn run(args: &[String]) -> Result<()> {
     }
     link(&inputs, Path::new(out), std)?;
     let defined = dynamic(Path::new(out))?;
-    let (kept, missing) = merge(&inputs.manifests, (&defined, &released), &PathBuf::from(format!("{out}.manifest.jsonl")))?;
+    let (kept, missing) = merge(&inputs.manifests, (&defined, &released), &PathBuf::from(format!("{out}.{MANIFEST_EXTENSION}")))?;
     let size = fs::metadata(out)?.len();
     let counts = format!("units {} objects {} released {}", inputs.manifests.len(), inputs.objects.len() + inputs.released.len(), released.len());
     println!("{counts} rebound {rebound} records {kept} missing {missing} bytes {size}");
@@ -216,23 +226,37 @@ fn nm(path: &Path, flags: &[&str]) -> Result<HashSet<String>> {
 }
 
 fn merge(manifests: &[PathBuf], (defined, released): (&HashSet<String>, &HashSet<String>), out: &Path) -> Result<(usize, usize)> {
-    let mut writer = BufWriter::new(File::create(out)?);
-    let (mut kept, mut missing) = (0, 0);
+    let (mut records, mut library) = (Vec::new(), serde_json::Map::new());
+    let mut missing = 0;
     for manifest in manifests {
         for line in BufReader::new(File::open(manifest)?).lines() {
             let mut record: Value = serde_json::from_str(&line?)?;
-            let symbol = record.get("symbol").and_then(Value::as_str).map(str::to_string);
-            if let Some(symbol) = symbol {
-                if !defined.contains(&symbol) {
-                    missing += 1;
-                    continue;
-                }
-                kept += 1;
-                record["release_copy"] = Value::Bool(released.contains(&symbol));
+            let Some(symbol) = record.get("symbol").and_then(Value::as_str).map(str::to_string) else {
+                library.extend(record.get(record::LIBRARY).and_then(Value::as_object).cloned().unwrap_or_default());
+                continue;
+            };
+            if !defined.contains(&symbol) {
+                missing += 1;
+                continue;
             }
-            writeln!(writer, "{record}")?;
+            record["release_copy"] = Value::Bool(released.contains(&symbol));
+            records.push(record);
         }
     }
-    writer.flush()?;
+    let kept = records.len();
+    let mut document = serde_json::Map::new();
+    document.insert(record::LIBRARY.to_string(), Value::Object(library));
+    document.insert(record::RECORD.to_string(), Value::Array(records));
+    let document = Value::Object(document);
+    let text = toml::to_string(&without_nulls(document)).map_err(|error| Error(error.to_string()))?;
+    fs::write(out, text)?;
     Ok((kept, missing))
+}
+
+fn without_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(map.into_iter().filter(|(_, value)| !value.is_null()).map(|(key, value)| (key, without_nulls(value))).collect()),
+        Value::Array(items) => Value::Array(items.into_iter().map(without_nulls).collect()),
+        other => other,
+    }
 }

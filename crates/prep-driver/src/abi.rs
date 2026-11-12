@@ -6,19 +6,21 @@ use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 
-/// The calling convention rustc lowered `instance` to: its convention, each argument and the return with their type, size, alignment and passing mode, and whether the return goes through a hidden pointer.
-pub fn of<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Result<Value> {
+/// The calling convention rustc lowered `instance` to: its convention, each argument and the return with their type, size, alignment and passing mode, and whether the return goes through a hidden pointer; and the types of the arguments and the return.
+pub fn of<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Result<(Value, Vec<Ty<'tcx>>)> {
     let input = TypingEnv::fully_monomorphized().as_query_input((instance, ty::List::empty()));
     let abi = tcx.fn_abi_of_instance(input).map_err(|error| Error(format!("{error:?}")))?;
     let dl = &tcx.data_layout;
-    Ok(json!({
+    let types = abi.args.iter().chain([&abi.ret]).map(|one| one.layout.ty).collect();
+    let value = json!({
         "conv": format!("{:?}", abi.conv),
         "variadic": abi.c_variadic,
         "unwind": abi.can_unwind,
         "sret": matches!(abi.ret.mode, PassMode::Indirect { .. }),
         "ret": arg(dl, &abi.ret),
         "args": abi.args.iter().map(|one| arg(dl, one)).collect::<Vec<_>>(),
-    }))
+    });
+    Ok((value, types))
 }
 
 fn arg<'tcx>(dl: &TargetDataLayout, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> Value {

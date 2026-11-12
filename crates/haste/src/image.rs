@@ -344,7 +344,9 @@ impl Image {
         argv.push(std::ptr::null());
         // SAFETY: start is code that the encoder wrote, or a stub that compiles it, for `lang_start::<T>(fn() -> T, isize, *const *const u8, u8) -> isize`, and main for the `fn() -> T` it takes.
         let lang_start: extern "C" fn(usize, isize, *const *const u8, u8) -> isize = unsafe { std::mem::transmute::<usize, _>(start) };
-        lang_start(main, owned.len() as isize, argv.as_ptr(), 0) as i32
+        let status = lang_start(main, owned.len() as isize, argv.as_ptr(), 0) as i32;
+        crate::prep::finish();
+        status
     }
 }
 

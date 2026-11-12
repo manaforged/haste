@@ -168,10 +168,19 @@ pub(super) fn wrappable(cx: &Context<'_>, reached: &Reached, at: usize) -> bool 
     matches!(&reached.list[at].1, Ok(typed) if matches!(typed.shape, Shape::Body)) && cx.item(item).1.kind == ItemKind::Fn
 }
 
-/// The hash of the layouts of `types` and of every type their values hold or point to, or none when one of them cannot cross between rustc's code and Haste's, or when they mix a niche-encoded enum with a type from outside the standard crates, whose niche Haste may place apart from rustc.
+/// The hash of the layouts of `types` and of every type their values hold or point to, or none when `reached` finds none.
 pub(super) fn walk(cx: &mut Context<'_>, crates: &Crates, types: &[Ty], purpose: Purpose) -> Option<u64> {
+    let mut hashes = Vec::new();
+    for ty in reached(cx, crates, types, purpose)? {
+        hashes.push(rustc_hash::FxBuildHasher.hash_one(&*cx.layout(ty).ok()?));
+    }
+    Some(rustc_hash::FxBuildHasher.hash_one(&hashes))
+}
+
+/// `types` and every type their values hold or point to, or none when one of them cannot cross between rustc's code and Haste's, or when they mix a niche-encoded enum with a type from outside the standard crates, whose niche Haste may place apart from rustc.
+pub(super) fn reached(cx: &mut Context<'_>, crates: &Crates, types: &[Ty], purpose: Purpose) -> Option<Vec<Ty>> {
     let mut seen = HashSet::default();
-    let (mut stack, mut hashes, mut niche, mut outer) = (types.to_vec(), Vec::new(), false, false);
+    let (mut stack, mut found, mut niche, mut outer) = (types.to_vec(), Vec::new(), false, false);
     while let Some(ty) = stack.pop() {
         if !seen.insert(ty) {
             continue;
@@ -183,9 +192,9 @@ pub(super) fn walk(cx: &mut Context<'_>, crates: &Crates, types: &[Ty], purpose:
         let Ok(layout) = cx.layout(ty) else { return None };
         niche |= matches!(layout.variants, Variants::Multiple { tag_encoding: TagEncoding::Niche { .. }, .. });
         outer |= matches!(*cx.types.kind(ty), Kind::Adt(item, _) if !crates.sysroot[item.krate as usize]);
-        hashes.push(rustc_hash::FxBuildHasher.hash_one(&*layout));
+        found.push(ty);
     }
-    (!(niche && outer)).then(|| rustc_hash::FxBuildHasher.hash_one(&hashes))
+    (!(niche && outer)).then_some(found)
 }
 
 fn inner(cx: &mut Context<'_>, crates: &Crates, ty: Ty, purpose: Purpose) -> Result<Option<Vec<Ty>>> {

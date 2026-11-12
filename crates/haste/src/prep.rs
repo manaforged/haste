@@ -1,8 +1,14 @@
 //! Prepped code: standard library and dependency functions that rustc optimizes once into a cached library, which Haste calls through wrappers instead of compiling.
 
+mod bind;
 mod cargo;
 mod choose;
+mod conv;
+mod driver;
+mod edit;
+mod ident;
 mod name;
+mod record;
 mod select;
 mod shim;
 
@@ -25,7 +31,9 @@ use crate::sema::infer::Typed;
 use crate::sema::reach::{Instance, Reached};
 use crate::sema::ty::Ty;
 
+use bind::{Bindings, Decision};
 use cargo::{Dirs, Toolchain};
+use edit::Snapshot;
 use name::{Paths, Printer};
 use select::{Crates, Purpose};
 use shim::{Shim, Wrapper};
@@ -40,12 +48,14 @@ const LIBRARY: &str = "library";
 const ENTRY: &str = "entry";
 const DROPPED: &str = "dropped";
 const FIELD: char = '\t';
+const RUSTC: &str = "rustc";
 
 /// The prepped library of one build, the wrapper of each function it holds, and what binding a reached function to one needs.
 pub struct Manifest {
     stored: Stored,
     paths: Paths,
     crates: Crates,
+    rustc: Option<Bindings>,
 }
 
 /// What `haste prep` keeps on disk for one key: the library, each wrapper by its function's text, the texts rustc rejected, and the names of the functions it wraps, which a lookup checks before it prints a callee.
@@ -76,13 +86,18 @@ pub struct Counts {
     pub built: usize,
     pub reused: usize,
     pub dropped: usize,
+    pub rustc: Option<bind::Tally>,
 }
 
 static BOUND: OnceLock<Manifest> = OnceLock::new();
 
 impl std::fmt::Display for Counts {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(out, "prep {} selected, {} built, {} dropped, {} reused", self.selected, self.built, self.dropped, self.reused)
+        write!(out, "prep {} selected, {} built, {} dropped, {} reused", self.selected, self.built, self.dropped, self.reused)?;
+        match &self.rustc {
+            Some(tally) => write!(out, "; {tally}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -102,8 +117,13 @@ pub fn prep(cx: &mut Context<'_>, workspace: &Workspace, reached: &Reached) -> R
         Some(kept) if kept.covers(&chosen) => (kept, false),
         _ => (make(cx, workspace, (&toolchain, key, &dir), (wrappers, &krates))?, true),
     };
-    let counts = stored.counts(&chosen, made);
-    let manifest = Manifest { stored, paths, crates };
+    let mut counts = stored.counts(&chosen, made);
+    let rustc = rustc(cx.outline, workspace, (&toolchain, key))?;
+    if let Some(rustc) = &rustc {
+        rustc.open()?;
+        counts.rustc = Some(rustc.tally(cx, reached));
+    }
+    let manifest = Manifest { stored, paths, crates, rustc };
     manifest.open()?;
     let bound: HashMap<usize, usize> = chosen.iter().filter_map(|(at, key, _)| Some((*at, manifest.symbol(key)?))).collect();
     let (compiled, stopped) = select::visit(reached, &entries, |at| bound.contains_key(&at));
@@ -111,13 +131,29 @@ pub fn prep(cx: &mut Context<'_>, workspace: &Workspace, reached: &Reached) -> R
     Ok(Plan { manifest, prepped, compiled, counts })
 }
 
-/// Opens `manifest` and makes it the one every later binding of this process reads.
-pub fn install(manifest: Manifest) -> Result<()> {
+/// Opens `manifest`, gives the shared standard library of its rustc library the program arguments `args`, and makes it the one every later binding of this process reads.
+pub fn install(manifest: Manifest, args: &[String]) -> Result<()> {
     manifest.open()?;
+    if let Some(rustc) = &manifest.rustc {
+        rustc.open()?;
+        rustc.start(args)?;
+    }
     if BOUND.set(manifest).is_err() {
         bail!("a prepped library is already bound");
     }
     Ok(())
+}
+
+/// The address at which a library loaded into this process exports symbol `name`.
+fn exported(name: &str) -> Option<usize> {
+    HostSymbol::Dynamic(name.into()).host_addr()
+}
+
+/// Flushes what rustc's code of the bound library wrote to standard output, once the program's `main` has returned.
+pub fn finish() {
+    if let Some(rustc) = BOUND.get().and_then(|manifest| manifest.rustc.as_ref()) {
+        rustc.finish();
+    }
 }
 
 /// The address of the prepped wrapper that runs reached function `at`, when a manifest is installed and holds it.
@@ -133,8 +169,40 @@ pub fn load(outline: &Outline, names: &Names, workspace: &Workspace) -> Result<O
         return Ok(None);
     }
     let toolchain = Toolchain::find()?;
-    let Some(stored) = Stored::read(&dir(key(outline, workspace, &toolchain)?))? else { return Ok(None) };
-    Ok(Some(Manifest { stored, paths: Paths::new(outline, names, workspace), crates: Crates::new(outline, workspace) }))
+    let key = key(outline, workspace, &toolchain)?;
+    let Some(stored) = Stored::read(&dir(key))? else { return Ok(None) };
+    let Some(rustc) = Bindings::read(&dir(key).join(RUSTC), &Snapshot::take(outline, workspace), facts(outline, workspace))? else { return Ok(None) };
+    Ok(Some(Manifest { stored, paths: Paths::new(outline, names, workspace), crates: Crates::new(outline, workspace), rustc: Some(rustc) }))
+}
+
+/// Builds the workspace's member package with the prep driver into the store under `key`, beside a snapshot of its sources, and reads what binding to it allows now.
+fn rustc(outline: &Outline, workspace: &Workspace, (toolchain, key): (&Toolchain, u64)) -> Result<Option<Bindings>> {
+    let out = dir(key).join(RUSTC);
+    let before = Snapshot::take(outline, workspace);
+    driver::run(toolchain, &store(), &root(workspace)?, &out)?;
+    before.write(&out.join(bind::SNAPSHOT))?;
+    Bindings::read(&out, &before, facts(outline, workspace))
+}
+
+/// Which crates of `outline` are standard crates, and the facts selection reads about them.
+fn facts(outline: &Outline, workspace: &Workspace) -> (Vec<bool>, Crates) {
+    let sysroot = (0..outline.roots.len()).map(|krate| outline.package(workspace, krate).sysroot).collect();
+    (sysroot, Crates::new(outline, workspace))
+}
+
+/// Loads the library at `path` into this process with its symbols global, so the dynamic linker finds every symbol it exports.
+fn open(path: &Path) -> Result<()> {
+    let text = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: text is a NUL-terminated string that lives across the call; the library holds only rustc output whose initializers are the standard library's.
+    let handle = unsafe { libc::dlopen(text.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if !handle.is_null() {
+        return Ok(());
+    }
+    // SAFETY: dlerror takes no arguments and returns null or a message that stays valid until the next dynamic linker call on this thread.
+    let reason = unsafe { libc::dlerror() };
+    // SAFETY: reason is a live NUL-terminated string when it is not null, and it is copied before any other dynamic linker call.
+    let reason = if reason.is_null() { String::new() } else { unsafe { CStr::from_ptr(reason) }.to_string_lossy().into_owned() };
+    bail!("loading {}: {reason}", path.display())
 }
 
 /// The reached functions that no reached function calls, where a build's calls start.
@@ -213,7 +281,7 @@ impl Stored {
     fn counts(&self, chosen: &[(usize, String, u64)], made: bool) -> Counts {
         let dropped = chosen.iter().filter(|(_, key, _)| self.dropped.contains(key)).count();
         let held = chosen.len() - dropped;
-        Counts { selected: chosen.len(), built: if made { held } else { 0 }, reused: if made { 0 } else { held }, dropped }
+        Counts { selected: chosen.len(), built: if made { held } else { 0 }, reused: if made { 0 } else { held }, dropped, rustc: None }
     }
 
     fn covers(&self, chosen: &[(usize, String, u64)]) -> bool {
@@ -269,27 +337,20 @@ impl Manifest {
         &self.stored.library
     }
 
-    /// Loads the library into this process with its symbols global, so the dynamic linker finds every wrapper.
+    /// Loads the wrapper library into this process with its symbols global, so the dynamic linker finds every wrapper.
     pub fn open(&self) -> Result<()> {
-        let path = CString::new(self.stored.library.as_os_str().as_bytes())?;
-        // SAFETY: path is a NUL-terminated string that lives across the call; the library holds only rustc output whose initializers are the standard library's.
-        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
-        if !handle.is_null() {
-            return Ok(());
-        }
-        // SAFETY: dlerror takes no arguments and returns null or a message that stays valid until the next dynamic linker call on this thread.
-        let reason = unsafe { libc::dlerror() };
-        // SAFETY: reason is a live NUL-terminated string when it is not null, and it is copied before any other dynamic linker call.
-        let reason = if reason.is_null() { String::new() } else { unsafe { CStr::from_ptr(reason) }.to_string_lossy().into_owned() };
-        bail!("loading {}: {reason}", self.stored.library.display())
+        open(&self.stored.library)
     }
 
     fn symbol(&self, key: &str) -> Option<usize> {
-        HostSymbol::Dynamic(self.stored.entries.get(key)?.symbol.as_str().into()).host_addr()
+        exported(&self.stored.entries.get(key)?.symbol)
     }
 
-    /// The address of the wrapper of `instance` with body `typed`, when this manifest holds it at the layouts Haste computes now and the open library exports it.
+    /// The address of rustc's code for `instance` with body `typed`: its own copy in the driver's library when one may bind, else the wrapper this manifest holds at the layouts Haste computes now.
     pub fn address(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Option<usize> {
+        if let Some(Decision::Bound(address)) = self.rustc.as_ref().map(|rustc| rustc.decide(cx, instance, typed)) {
+            return Some(address);
+        }
         if !self.stored.names.contains(cx.name(instance.0)) {
             return None;
         }

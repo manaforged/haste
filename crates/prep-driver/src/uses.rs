@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 
+use rustc_hir::def_id::DefId;
+use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{Body, CastKind, ConstOperand, Location, Rvalue, Terminator, TerminatorKind};
+use rustc_middle::mir::{Body, CastKind, Const, ConstOperand, ConstValue, Location, Rvalue, Terminator, TerminatorKind};
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::print::{with_resolve_crate_name, with_no_trimmed_paths};
+use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths, with_resolve_crate_name};
 use rustc_middle::ty::{self, EarlyBinder, Instance, InstanceKind, Ty, TyCtxt, TypeFoldable, TypingEnv, VtblEntry};
 
 /// The definition paths of the functions whose MIR rustc's inliner copied into the body of `instance`.
@@ -14,12 +16,30 @@ pub fn inlined<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<String>
     paths.into_iter().collect()
 }
 
-/// The symbols of the instances that the optimized body of `instance` calls, drops, reifies or puts in a vtable.
-pub fn used<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<String> {
+/// What the optimized body of `instance` reaches outside itself: the symbols of the instances it calls, drops, reifies or puts in a vtable, and whether it reads or writes a static outside the sysroot that is mutable, thread-local or holds interior mutability, or reaches standard library code whose state each copy of std keeps apart.
+pub struct Used {
+    pub symbols: Vec<String>,
+    pub state: bool,
+}
+
+/// What the optimized body of `instance` reaches outside itself.
+pub fn used<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Used {
     let body = tcx.instance_mir(instance.def);
-    let mut uses = Uses { tcx, instance, body, found: BTreeSet::new() };
+    let mut uses = Uses { tcx, instance, body, found: BTreeSet::new(), state: false };
     uses.visit_body(body);
-    uses.found.into_iter().collect()
+    Used { symbols: uses.found.into_iter().collect(), state: uses.state }
+}
+
+/// The standard library code whose state each copy of std keeps for itself: the standard streams, and the exit that flushes them.
+const HELD_APART: [&str; 2] = ["std::io::stdio::", "std::process::exit"];
+
+/// Whether `def_id` is standard library code that reads or writes state the shared standard library keeps apart from the std Haste compiles.
+fn held_apart(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if !crate::link::sysroot(tcx, def_id.krate) {
+        return false;
+    }
+    let path = with_no_visible_paths!(with_no_trimmed_paths!(tcx.def_path_str(def_id)));
+    HELD_APART.iter().any(|held| path.contains(held))
 }
 
 struct Uses<'a, 'tcx> {
@@ -27,6 +47,7 @@ struct Uses<'a, 'tcx> {
     instance: Instance<'tcx>,
     body: &'a Body<'tcx>,
     found: BTreeSet<String>,
+    state: bool,
 }
 
 impl<'tcx> Uses<'_, 'tcx> {
@@ -38,7 +59,25 @@ impl<'tcx> Uses<'_, 'tcx> {
         if matches!(instance.def, InstanceKind::Intrinsic(_) | InstanceKind::Virtual(..)) {
             return;
         }
+        self.state |= held_apart(self.tcx, instance.def_id());
         self.found.insert(self.tcx.symbol_name(instance).name.to_string());
+    }
+
+    fn touch(&mut self, def_id: DefId) {
+        let env = TypingEnv::fully_monomorphized();
+        let mutable = self.tcx.static_mutability(def_id) == Some(rustc_hir::Mutability::Mut);
+        let cell = !self.tcx.type_of(def_id).instantiate_identity().skip_normalization().is_freeze(self.tcx, env);
+        let shared = mutable || cell || self.tcx.is_thread_local_static(def_id);
+        self.state |= shared && !crate::link::sysroot(self.tcx, def_id.krate);
+    }
+
+    fn constant(&mut self, constant: &ConstOperand<'tcx>) {
+        let Const::Val(ConstValue::Scalar(Scalar::Ptr(pointer, _)), _) = constant.const_ else {
+            return;
+        };
+        if let Some(GlobalAlloc::Static(def_id)) = self.tcx.try_get_global_alloc(pointer.provenance.alloc_id()) {
+            self.touch(def_id);
+        }
     }
 
     fn function(&mut self, ty: Ty<'tcx>) {
@@ -80,6 +119,7 @@ impl<'tcx> Visitor<'tcx> for Uses<'_, 'tcx> {
     fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, location: Location) {
         let ty = self.mono(constant.ty());
         self.function(ty);
+        self.constant(constant);
         self.super_const_operand(constant, location);
     }
 
@@ -92,6 +132,9 @@ impl<'tcx> Visitor<'tcx> for Uses<'_, 'tcx> {
     }
 
     fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
+        if let Rvalue::ThreadLocalRef(def_id) = rvalue {
+            self.touch(*def_id);
+        }
         if let Rvalue::Cast(CastKind::PointerCoercion(coercion, _), operand, target) = rvalue {
             let source = self.mono(operand.ty(self.body, self.tcx));
             match coercion {

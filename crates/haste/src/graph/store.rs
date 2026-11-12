@@ -71,7 +71,7 @@ impl Expansion {
 }
 
 /// The size and modification time of this program, whose changes make what the store kept stale.
-fn program() -> Option<(u64, i64, i64)> {
+pub(crate) fn program() -> Option<(u64, i64, i64)> {
     static PROGRAM: std::sync::OnceLock<Option<(u64, i64, i64)>> = std::sync::OnceLock::new();
     *PROGRAM.get_or_init(|| std::env::current_exe().and_then(std::fs::metadata).map(|meta| (meta.len(), meta.mtime(), meta.mtime_nsec())).ok())
 }
@@ -153,9 +153,14 @@ pub fn lock(workspace: &Workspace, unit: usize) -> io::Result<Lock> {
 }
 
 pub(crate) fn write_new(path: &Path, text: &str) -> io::Result<()> {
-    let fresh = path.with_extension(format!("{}", std::process::id()));
+    let fresh = fresh(path);
     std::fs::write(&fresh, text)?;
     std::fs::rename(&fresh, path)
+}
+
+/// The path this process writes `path` at before it renames the file into place, so no reader sees it half written.
+pub(crate) fn fresh(path: &Path) -> PathBuf {
+    path.with_extension(format!("{}", std::process::id()))
 }
 
 /// The hash of the variables a script ran with and of this program, whose compile of the script decides what it prints.
@@ -211,7 +216,7 @@ impl Watched {
 }
 
 /// Adds the path, size and modification time of `path`, or of every file under it when it is a directory other than a build output or VCS directory.
-fn walk(path: &Path, into: &mut Vec<(PathBuf, u64, i64, i64)>) {
+pub(crate) fn walk(path: &Path, into: &mut Vec<(PathBuf, u64, i64, i64)>) {
     let Ok(meta) = std::fs::metadata(path) else {
         into.push((path.to_owned(), 0, 0, -1));
         return;
