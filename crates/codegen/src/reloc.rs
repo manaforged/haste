@@ -179,47 +179,6 @@ fn patch_arm64_movw64(out: &mut [u8], value: u64) {
     }
 }
 
-/// Streams a function's IR structure into a 128-bit footprint digest.
-#[derive(Clone, Copy, Debug)]
-pub struct FootprintHasher {
-    lo: u64,
-    hi: u64,
-}
-
-impl Default for FootprintHasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FootprintHasher {
-    /// Starts a fresh 128-bit footprint digest.
-    pub fn new() -> Self {
-        Self { lo: 0x243F_6A88_85A3_08D3, hi: 0x1319_8A2E_0370_7344 }
-    }
-
-    /// Mixes one 64-bit word into both lanes.
-    pub fn word(&mut self, x: u64) {
-        let mut a = (self.lo ^ x).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        a = (a ^ (a >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        let mut b = (self.hi ^ x.rotate_left(31)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        b = (b ^ (b >> 27)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        self.lo = a ^ (b >> 32);
-        self.hi = b ^ (a >> 29);
-    }
-
-    /// Mixes a 128-bit value into the digest.
-    pub fn u128(&mut self, x: u128) {
-        self.word(x as u64);
-        self.word((x >> 64) as u64);
-    }
-
-    /// Returns the 128-bit digest.
-    pub fn finish(self) -> u128 {
-        u128::from(self.lo) | (u128::from(self.hi) << 64)
-    }
-}
-
 /// Parameters for tiering up a hot dictionary stub in JIT mode.
 #[derive(Clone, Copy, Debug)]
 pub struct DictTierUp {

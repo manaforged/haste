@@ -124,6 +124,13 @@ impl Target {
     }
 
     /// This target with the code generator spending `effort` on each function.
+    #[must_use]
+    pub const fn effort(mut self, effort: Effort) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// This target with the code generator spending `effort` on each function.
     pub fn with(&self, effort: Effort) -> Target {
         Target { effort, ..*self }
     }

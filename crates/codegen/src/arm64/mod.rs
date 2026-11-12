@@ -164,6 +164,10 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => self.brif(*condition, (*then, then_args), (*otherwise, else_args)),
+            Op::BrTable(index, default, targets) => {
+                self.br_table(*index, *default, targets);
+                Ok(())
+            }
             Op::Return(values) => self.ret(values),
             Op::Trap => {
                 self.asm.brk();
@@ -307,6 +311,26 @@ impl Emit<'_> {
             return;
         }
         self.asm.b(self.blocks[target.index()]);
+    }
+
+    fn br_table(&mut self, index: Value, default: Block, targets: &[Block]) {
+        if targets.is_empty() {
+            self.goto(default, true);
+            return;
+        }
+        let idx = self.src(index, A, Ext::Zero);
+        self.asm.mov_imm(C, targets.len() as i64);
+        self.asm.alu(Alu::Subs, Size::X, ZR, idx, C);
+        self.asm.bcond(Cond::Hs, self.blocks[self.func.jump_target(default).index()]);
+        let table = self.asm.label();
+        self.asm.adr(C, table);
+        self.asm.ldrsw_scaled(IP, C, idx);
+        self.asm.alu(Alu::Add, Size::X, C, C, IP);
+        self.asm.br(C);
+        self.asm.bind(table);
+        for &target in targets {
+            self.asm.table_entry(table, self.blocks[self.func.jump_target(target).index()]);
+        }
     }
 
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {

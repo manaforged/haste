@@ -167,6 +167,8 @@ enum Fixup {
     Branch,
     /// A 19-bit word offset at bit 5: `b.cond`, `cbz`, `cbnz`.
     Cond,
+    /// A 21-bit byte offset: `adr`.
+    Adr,
 }
 
 #[derive(Default)]
@@ -174,6 +176,7 @@ pub(crate) struct Asm {
     code: Vec<u8>,
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, usize, Fixup)>,
+    table_fixups: Vec<(u32, usize, usize)>,
 }
 
 fn sized(base: u32, size: Size) -> u32 {
@@ -217,18 +220,43 @@ impl Asm {
         self.jump(sized(base, size) | u32::from(reg.0), label, Fixup::Cond);
     }
 
+    pub fn adr(&mut self, dst: Reg, label: Label) {
+        self.jump(0x1000_0000 | u32::from(dst.0), label, Fixup::Adr);
+    }
+
+    pub fn ldrsw_scaled(&mut self, dst: Reg, base: Reg, index: Reg) {
+        self.word(0xB8A0_7800 | u32::from(index.0) << 16 | u32::from(base.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn table_entry(&mut self, base: Label, target: Label) {
+        self.table_fixups.push((self.pos(), base.0, target.0));
+        self.word(0);
+    }
+
     pub fn finish(mut self) -> Result<Vec<u8>, String> {
         for (at, label, kind) in std::mem::take(&mut self.fixups) {
             let target = self.labels[label].ok_or("a jump to a label that was never bound")?;
-            let delta = (i64::from(target) - i64::from(at)) / 4;
+            let bytes = i64::from(target) - i64::from(at);
+            let delta = bytes / 4;
             let at = at as usize;
             let mut word = u32::from_le_bytes(self.code[at..at + 4].try_into().expect("four bytes"));
             word |= match kind {
                 Fixup::Branch if (-(1 << 25)..1 << 25).contains(&delta) => (delta as u32) & 0x03FF_FFFF,
                 Fixup::Cond if (-(1 << 18)..1 << 18).contains(&delta) => ((delta as u32) & 0x7_FFFF) << 5,
+                Fixup::Adr if (-(1 << 20)..1 << 20).contains(&bytes) => {
+                    let imm = bytes as u32;
+                    ((imm & 3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5)
+                }
                 _ => return Err("a branch out of range".to_owned()),
             };
             self.code[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        for (at, base, target) in std::mem::take(&mut self.table_fixups) {
+            let base = self.labels[base].ok_or("a jump table without a base label")?;
+            let target = self.labels[target].ok_or("a jump to a label that was never bound")?;
+            let delta = i64::from(target) - i64::from(base);
+            let at = at as usize;
+            self.code[at..at + 4].copy_from_slice(&(delta as i32).to_le_bytes());
         }
         Ok(self.code)
     }

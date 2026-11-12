@@ -20,11 +20,11 @@ mod loads;
 mod merge;
 mod native;
 mod park;
-mod probe;
 mod promote;
 mod reloc;
 mod returns;
 mod split;
+mod switch;
 mod target;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
@@ -55,7 +55,7 @@ pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, ByteCC, CallConv, Fl
 pub use coroutine::{Coroutine, FIRST_SUSPEND, RETURNED, UNRESUMED};
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
-pub use reloc::{DictTierUp, FootprintHasher, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
+pub use reloc::{DictTierUp, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
 pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
 
 /// A call site that has an exception handler, as offsets into its function.
@@ -67,6 +67,7 @@ pub struct Site {
 }
 
 /// Machine code for one function, its exception call sites, and its stencil relocations.
+#[must_use]
 #[derive(Clone, Debug)]
 pub struct Code {
     bytes: Vec<u8>,
@@ -131,6 +132,7 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
     cse::run(func);
     if effort == Effort::Full {
         loads::run(func);
+        switch::run(func);
         licm::run(func);
     }
     returns::run(func);

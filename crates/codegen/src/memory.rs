@@ -4,7 +4,7 @@ const CHUNK: usize = 64 << 20;
 const ALIGN: usize = 16;
 
 /// A bump pointer over `size` bytes: what is handed out ends at `used`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Bump {
     used: usize,
     size: usize,
@@ -42,6 +42,7 @@ impl Bump {
 }
 
 /// One mapping of code: written through `write` and run through `exec`, two views of the same pages.
+#[derive(Debug)]
 struct Chunk {
     write: usize,
     exec: usize,
@@ -51,7 +52,7 @@ struct Chunk {
 }
 
 /// Memory that holds generated code, packed densely: written through one mapping and run through a second, executable mapping of the same pages.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Memory {
     chunks: Vec<Chunk>,
     sealed: bool,
@@ -165,13 +166,14 @@ impl Drop for Memory {
 }
 
 /// How the pages of an `Arena` are mapped.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Sharing {
     Shared,
     Private,
 }
 
 /// Read-write memory at the same addresses in the processes forked after it is made, handed out by a bump pointer; shared memory holds what workers write for the parent, and private memory what each run of a program writes for itself.
+#[derive(Debug)]
 pub struct Arena {
     base: usize,
     bump: Bump,

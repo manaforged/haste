@@ -180,6 +180,7 @@ pub(crate) struct Asm {
     pub code: Vec<u8>,
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, Label)>,
+    table_fixups: Vec<(u32, Label, Label)>,
 }
 
 impl Asm {
@@ -582,10 +583,29 @@ impl Asm {
         self.fixup(label);
     }
 
+    pub fn lea_rip(&mut self, dst: Reg, label: Label) {
+        let reg = dst as u8;
+        self.rex(true, reg, 0, 0, false);
+        self.code.extend([0x8D, 0x05 | ((reg & 7) << 3)]);
+        self.fixup(label);
+    }
+
+    pub fn table_entry(&mut self, base: Label, target: Label) {
+        self.table_fixups.push((self.pos(), base, target));
+        self.code.extend([0; 4]);
+    }
+
     pub fn finish(mut self) -> Result<Vec<u8>, String> {
         for (at, label) in std::mem::take(&mut self.fixups) {
             let target = self.labels[label.0 as usize].ok_or("a jump to a label that was never placed")?;
             let relative = target as i64 - (at as i64 + 4);
+            let at = at as usize;
+            self.code[at..at + 4].copy_from_slice(&(relative as i32).to_le_bytes());
+        }
+        for (at, base, target) in std::mem::take(&mut self.table_fixups) {
+            let base = self.labels[base.0 as usize].ok_or("a jump table without a base label")?;
+            let target = self.labels[target.0 as usize].ok_or("a jump to a label that was never placed")?;
+            let relative = target as i64 - base as i64;
             let at = at as usize;
             self.code[at..at + 4].copy_from_slice(&(relative as i32).to_le_bytes());
         }

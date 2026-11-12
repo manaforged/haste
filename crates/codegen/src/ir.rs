@@ -343,6 +343,7 @@ pub(crate) enum Op {
     TryCall { sig: SigRef, callee: Value, args: Vec<Value>, normal: Block, handler: Block },
     Jump(Block, Vec<Value>),
     Brif(Value, Block, Vec<Value>, Block, Vec<Value>),
+    BrTable(Value, Block, Vec<Block>),
     Return(Vec<Value>),
     Trap,
     Trapz(Value),
@@ -350,18 +351,19 @@ pub(crate) enum Op {
 
 impl Op {
     pub(crate) fn is_terminator(&self) -> bool {
-        matches!(self, Op::TryCall { .. } | Op::Jump(..) | Op::Brif(..) | Op::Return(_) | Op::Trap)
+        matches!(self, Op::TryCall { .. } | Op::Jump(..) | Op::Brif(..) | Op::BrTable(..) | Op::Return(_) | Op::Trap)
     }
 
     /// Every block this instruction can go to.
-    pub(crate) fn targets(&self) -> impl Iterator<Item = Block> + use<> {
-        let (first, second) = match *self {
-            Op::Jump(block, _) => (Some(block), None),
-            Op::Brif(_, then, _, otherwise, _) => (Some(then), Some(otherwise)),
-            Op::TryCall { normal, handler, .. } => (Some(normal), Some(handler)),
-            _ => (None, None),
+    pub(crate) fn targets(&self) -> impl Iterator<Item = Block> + '_ {
+        let (first, second, slice) = match self {
+            Op::Jump(block, _) => (Some(*block), None, &[][..]),
+            Op::Brif(_, then, _, otherwise, _) => (Some(*then), Some(*otherwise), &[][..]),
+            Op::BrTable(_, default, targets) => (Some(*default), None, &targets[..]),
+            Op::TryCall { normal, handler, .. } => (Some(*normal), Some(*handler), &[][..]),
+            _ => (None, None, &[][..]),
         };
-        first.into_iter().chain(second)
+        first.into_iter().chain(second).chain(slice.iter().copied())
     }
 
     /// Replaces every block this instruction can go to with `f` of it.
@@ -371,6 +373,10 @@ impl Op {
             Op::Brif(_, then, _, otherwise, _) => {
                 *then = f(*then);
                 *otherwise = f(*otherwise);
+            }
+            Op::BrTable(_, default, targets) => {
+                *default = f(*default);
+                targets.iter_mut().for_each(|target| *target = f(*target));
             }
             Op::TryCall { normal, handler, .. } => {
                 *normal = f(*normal);
@@ -403,6 +409,7 @@ impl Op {
                 f(*c);
                 then.iter().chain(otherwise).for_each(|arg| f(*arg));
             }
+            Op::BrTable(index, ..) => f(*index),
         }
     }
 
@@ -440,30 +447,31 @@ impl Op {
                 *c = f(*c);
                 then.iter_mut().chain(otherwise.iter_mut()).for_each(|arg| *arg = f(*arg));
             }
+            Op::BrTable(index, ..) => *index = f(*index),
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct InstData {
     pub op: Op,
     pub result: Option<Value>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct BlockData {
     pub params: Vec<Value>,
     pub insts: Vec<Inst>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct SlotData {
     pub size: u32,
     pub align_shift: u8,
 }
 
 /// One function body: blocks of instructions over typed values.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Function {
     pub signature: Signature,
     pub(crate) types: Vec<Type>,
@@ -505,7 +513,7 @@ impl Function {
     }
 
     /// The blocks the last instruction of `block` can go to.
-    pub(crate) fn successors(&self, block: Block) -> impl Iterator<Item = Block> + use<> {
+    pub(crate) fn successors(&self, block: Block) -> impl Iterator<Item = Block> + '_ {
         self.last(block).map(Op::targets).into_iter().flatten()
     }
 

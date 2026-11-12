@@ -304,7 +304,7 @@ impl Cfg {
                 if !preds.contains(&block) {
                     preds.push(block);
                 }
-                if matches!(op, Op::TryCall { .. }) {
+                if matches!(op, Op::TryCall { .. } | Op::BrTable(..)) {
                     cfg.try_target[target.index()] = true;
                 }
             }
