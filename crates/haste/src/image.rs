@@ -202,15 +202,15 @@ fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {
 impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Result<Image> {
-        Self::create(reached, false)
+        Self::create(reached, false, (SHARED_BYTES, STATE_BYTES, TABLE_SLOTS))
     }
 
-    fn create(reached: &Reached, record_aot: bool) -> Result<Image> {
-        let shared = Arena::shared(SHARED_BYTES)?;
-        let capacity = reached.list.len().max(TABLE_SLOTS);
+    fn create(reached: &Reached, record_aot: bool, (shared_bytes, state_bytes, table_slots): (usize, usize, usize)) -> Result<Image> {
+        let shared = Arena::shared(shared_bytes)?;
+        let capacity = reached.list.len().max(table_slots);
         let mut low = Arena::low(capacity * size_of::<AtomicUsize>())?;
         let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
-        let state = Arena::private(STATE_BYTES)?;
+        let state = Arena::private(state_bytes)?;
         Ok(Image {
             table,
             _low: low,
@@ -286,7 +286,7 @@ impl Image {
 
     /// An image of every function in `reached`, compiled, optionally recording AOT relocations, with why each one that did not compile failed.
     pub(crate) fn build(cx: &mut Context<'_>, reached: &Reached, record_aot: bool) -> Result<(Image, HashMap<usize, String>)> {
-        let mut image = Self::create(reached, record_aot)?;
+        let mut image = Self::create(reached, record_aot, (SHARED_BYTES, STATE_BYTES, TABLE_SLOTS))?;
         let all: Vec<usize> = (0..reached.list.len()).collect();
         let broken = image.compile(cx, reached, &all).into_iter().collect();
         Ok((image, broken))

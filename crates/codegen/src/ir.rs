@@ -99,6 +99,8 @@ pub enum ArgumentPurpose {
     StructArgument(u32),
     /// The pointer to the static symbol dictionary of a shared generic body.
     Dict,
+    /// An unnamed argument after `...` in a C variadic call.
+    Variadic,
 }
 
 /// One parameter or return value of a signature.
@@ -117,6 +119,11 @@ impl AbiParam {
     /// A value of `ty` with a special purpose.
     pub fn special(ty: Type, purpose: ArgumentPurpose) -> Self {
         Self { value_type: ty, purpose }
+    }
+
+    /// A C variadic argument of `ty`.
+    pub fn variadic(ty: Type) -> Self {
+        Self { value_type: ty, purpose: ArgumentPurpose::Variadic }
     }
 }
 

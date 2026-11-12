@@ -128,7 +128,14 @@ fn import(paths: &Paths<'_>, pending: &Pending) -> Outcome {
             out.push((name, ns, Binding { def: binding.def, vis: pending.vis, origin: Origin::Import }));
         }
     }
-    if out.is_empty() { Outcome::Missing } else { Outcome::Bound(out, stamp) }
+    if out.is_empty() {
+        if let Some(Def::Module(root)) = target {
+            paths.demand_macro_in(root, found);
+        }
+        Outcome::Missing
+    } else {
+        Outcome::Bound(out, stamp)
+    }
 }
 
 fn apply(scopes: &mut [Scope], module: u32, found: Found) -> bool {
@@ -190,14 +197,21 @@ pub fn macro_at(paths: &Paths<'_>, src: &Source, (start, name): (u32, u32), at: 
 pub fn macro_path(paths: &Paths<'_>, path: &Path<'_>, at: ModRef) -> Option<ItemRef> {
     let (last, prefix) = path.segments.split_last()?;
     let binding = if prefix.is_empty() {
-        paths.first(*last, at, path).macros.or_else(|| paths.macro_use(*last))?
-    } else {
-        let owner = paths.resolve(&Path { segments: prefix, ..*path }, at)?;
-        let found = paths.member(owner, *last).macros;
-        if let (None, Def::Module(root)) = (found, owner) {
-            paths.ask_crate(root);
+        let first = paths.first(*last, at, path);
+        let found = first.macros.or_else(|| paths.macro_use(*last));
+        if found.is_none()
+            && let Some(Binding { def: Def::Module(submod), origin: Origin::Import | Origin::Glob, .. }) = first.types
+        {
+            paths.demand_macro_module(submod);
         }
         found?
+    } else {
+        let owner = paths.resolve(&Path { segments: prefix, ..*path }, at)?;
+        let found = paths.member(owner, *last);
+        if let (None, Def::Module(root)) = (found.macros, owner) {
+            paths.demand_macro_in(root, found);
+        }
+        found.macros?
     };
     match binding.def {
         Def::Item(item) => Some(item),

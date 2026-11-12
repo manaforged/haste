@@ -192,6 +192,9 @@ fn with_drop<T>(cx: &mut Context<'_>, run: impl FnOnce(&mut Infer<'_, '_>) -> Re
 
 /// Whether dropping a value of `ty` runs code.
 pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    if ty == Ty::NONE {
+        return Ok(false);
+    }
     match cx.types.kind(ty) {
         Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => return Ok(false),
         Kind::Dyn(..) => return Ok(true),
@@ -208,6 +211,9 @@ pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
 
 /// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
 pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    if ty == Ty::NONE {
+        return Ok(false);
+    }
     if !matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)) {
         return Ok(false);
     }

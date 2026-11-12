@@ -468,6 +468,9 @@ impl Emit<'_> {
                 self.high(high, arg);
             }
         }
+        if self.abi_kind == CallAbi::SysV && self.func.sigs[sig.index()].params.iter().any(|param| param.purpose == ArgumentPurpose::Variadic) {
+            self.asm.mov_imm(Reg::Rax, float_targets.len() as i64);
+        }
         match direct {
             Some(CallTarget::Abs(at)) => self.asm.call_absolute(at),
             Some(CallTarget::Slot(sym)) => {

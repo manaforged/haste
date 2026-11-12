@@ -146,7 +146,7 @@ impl<'a> Infer<'_, 'a> {
             bail!("{error:#}; inferring it needs names that are not loaded yet");
         }
         let ran = self.run_instance(&instance, int, error);
-        if self.cx.asks.count() != asked {
+        if ran.is_err() && self.cx.asks.count() != asked {
             self.cx.store.finals.remove(&instance);
         }
         ran

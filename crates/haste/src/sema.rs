@@ -60,6 +60,26 @@ impl SegKey {
 
 pub(super) use crate::sync::{read_lock, write_lock};
 
+#[derive(Default)]
+pub(super) struct RunnerSlot(std::sync::Mutex<Option<Box<dyn evaluate::Evaluate>>>);
+
+impl RunnerSlot {
+    pub(super) fn take(&self) -> Option<Box<dyn evaluate::Evaluate>> {
+        crate::sync::lock(&self.0).take()
+    }
+
+    pub(super) fn put(&self, runner: Box<dyn evaluate::Evaluate>) {
+        let mut guard = crate::sync::lock(&self.0);
+        if guard.is_none() {
+            *guard = Some(runner);
+        }
+    }
+
+    pub(super) fn clear(&self) {
+        *crate::sync::lock(&self.0) = None;
+    }
+}
+
 /// What Sema keeps between passes over a growing outline: interned types and parsed headers and bodies.
 #[derive(Clone, Default)]
 pub struct Cache {
@@ -72,6 +92,8 @@ pub struct Cache {
     headers: Table<impls::ImplRef, Arc<sig::ImplHeader>>,
     finals: Table<reach::Instance, Arc<infer::Typed>>,
     closures: Table<ty::Ty, Arc<infer::ClosureInfo>>,
+    pub(super) evaluated: Table<reach::Instance, u128>,
+    pub(super) runner: Arc<RunnerSlot>,
     lookups: Lookups,
 }
 
@@ -230,6 +252,8 @@ impl Cache {
         self.layouts.retain(|ty, _| !naming.names(*ty));
         self.tails.retain(|ty, _| !naming.names(*ty));
         self.closures.retain(|ty, _| !naming.names(*ty));
+        self.evaluated.retain(|instance, _| !naming.touches(instance));
+        self.runner.clear();
         self.lookups.forget_edited(edited, &mut naming, &mine, &block_kept);
     }
 
@@ -352,7 +376,7 @@ pub struct Context<'a> {
     trait_members: Table<ItemRef, Arc<HashMap<&'a str, ItemRef>>>,
     impl_members: Table<impls::ImplRef, Arc<HashMap<&'a str, ItemRef>>>,
     aliases: Table<ItemRef, Arc<Alias>>,
-    evaluated: evaluate::Evaluated,
+    pub(super) eval_errors: Table<reach::Instance, String>,
     pub(super) eval_stack: Vec<reach::Instance>,
     pub(super) drop_stack: Vec<ty::Ty>,
     pub(super) form_stack: Vec<(infer::Form, usize)>,
@@ -393,7 +417,7 @@ impl<'a> Context<'a> {
             trait_members,
             impl_members,
             aliases,
-            evaluated: evaluate::Evaluated::default(),
+            eval_errors: Table::default(),
             eval_stack: Vec::new(),
             drop_stack: Vec::new(),
             form_stack: Vec::new(),
@@ -414,7 +438,7 @@ impl<'a> Context<'a> {
             trait_members: self.trait_members.clone(),
             impl_members: self.impl_members.clone(),
             aliases: self.aliases.clone(),
-            evaluated: self.evaluated.clone(),
+            eval_errors: self.eval_errors.clone(),
             eval_stack: Vec::new(),
             drop_stack: Vec::new(),
             form_stack: Vec::new(),
@@ -560,6 +584,9 @@ impl<'a> Context<'a> {
 
     /// The type that `ty` owns when it is a `Box`.
     pub fn boxed(&self, ty: ty::Ty) -> Option<ty::Ty> {
+        if ty == ty::Ty::NONE {
+            return None;
+        }
         match self.types.kind(ty) {
             ty::Kind::Adt(item, args) if self.lang(*item) == Some("owned_box") => self.types.substs(*args).first().copied(),
             _ => None,

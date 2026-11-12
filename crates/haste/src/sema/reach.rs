@@ -268,17 +268,47 @@ fn parallel_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], wo
     }
     items.sort_by_key(|item| item.pos);
     if !deferred.is_empty() || items.iter().any(|item| item.deferred) {
-        run_deferred(cx, (reached, wave, check_undeclared, force_commit), deferred, &mut items);
+        run_deferred(cx, (reached, wave, workers, check_undeclared, force_commit), deferred, &mut items);
     }
     commit_wave(cx, reached, wave, items, force_commit)
 }
 
-fn run_deferred(cx: &mut Context<'_>, (reached, wave, check_undeclared, force_commit): (&Reached, &[usize], bool, bool), deferred: Vec<(Instance, u32)>, items: &mut [WaveItem]) {
+fn eval_deferred_list(cx: &mut Context<'_>, deferred: Vec<(Instance, u32)>) {
     let mut seen = rustc_hash::FxHashSet::default();
     for (inst, bits) in deferred {
         if seen.insert((inst, bits)) {
-            drop(super::evaluate::run(cx, &inst, bits));
+            super::evaluate::prime(cx, &inst, bits);
         }
+    }
+}
+
+fn run_deferred(cx: &mut Context<'_>, (reached, wave, workers, check_undeclared, force_commit): (&Reached, &[usize], usize, bool, bool), deferred: Vec<(Instance, u32)>, items: &mut [WaveItem]) {
+    eval_deferred_list(cx, deferred);
+    for _ in 0..4 {
+        let pending: Vec<usize> = items.iter().enumerate().filter(|(_, item)| item.deferred).map(|(i, _)| i).collect();
+        if pending.len() < MIN_PARALLEL_WAVE || workers <= 1 {
+            break;
+        }
+        let sub_wave: Vec<usize> = pending.iter().map(|&i| wave[items[i].pos]).collect();
+        let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
+        let next = AtomicUsize::new(0);
+        cx.in_parallel = true;
+        let (mut sub_items, joined) = run_scoped(cx, forks, reached, (&sub_wave, &next, check_undeclared, force_commit));
+        cx.in_parallel = false;
+        let mut next_deferred = cx.take_deferred_evals();
+        for (asks, worker_deferred, worker_items) in joined.into_iter().flatten() {
+            cx.asks.repeat(&asks);
+            next_deferred.extend(worker_deferred);
+            sub_items.extend(worker_items);
+        }
+        for sub_item in sub_items {
+            let slot = &mut items[pending[sub_item.pos]];
+            *slot = WaveItem { pos: slot.pos, asked: slot.asked | sub_item.asked, ..sub_item };
+        }
+        if next_deferred.is_empty() {
+            break;
+        }
+        eval_deferred_list(cx, next_deferred);
     }
     for item in items.iter_mut().filter(|item| item.deferred) {
         let asks0 = cx.asks.count();

@@ -25,6 +25,7 @@ mod slice_pat;
 mod stencil;
 
 pub use expr::{can_inline_body, may_inline};
+pub(crate) use abi::purpose_tag;
 pub use plan::eval_footprint;
 pub use reloc::{RelocPlan, eval_relocs};
 pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil};
@@ -465,8 +466,11 @@ impl Lower<'_, '_> {
                 self.write(place::Place::slot(slot, repr), value);
             }
         }
-        let place = slot.map(|slot| place::Place::slot(slot, repr));
-        self.own(moves::Root::Local(local), self.typed.locals[local as usize].ty, place, init)
+        if matches!(self.typed.shape, Shape::Body | Shape::Closure(_) | Shape::Anon(_)) {
+            let place = slot.map(|slot| place::Place::slot(slot, repr));
+            self.own(moves::Root::Local(local), self.typed.locals[local as usize].ty, place, init)?;
+        }
+        Ok(())
     }
 
     /// A fresh frame slot for a value of `repr`, or none for a zero-sized one.

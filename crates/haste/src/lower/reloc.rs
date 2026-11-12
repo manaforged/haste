@@ -234,26 +234,33 @@ pub(super) fn eval_expr_ty(cx: &Context<'_>, typed: &Typed, expr: ExprId) -> Ty 
     }
 }
 
+pub(super) fn eval_deref_step(cx: &Context<'_>, reached: &Reached, typed: &Typed, expr: ExprId, step: u32, ty: Ty) -> Result<Ty> {
+    if let Some((item, substs)) = eval_table_site(typed, SiteKey::Deref(expr, step)) {
+        let Some(&idx) = reached.index.get(&(item, substs)) else { bail!("unreached deref callee") };
+        let Ok(callee) = &reached.list[idx].1 else { bail!("broken deref callee") };
+        let Some(ret) = callee.ret else { bail!("deref callee without return") };
+        let Kind::Ref(_, inner) = *cx.types.kind(ret) else { bail!("deref callee did not return ref") };
+        Ok(inner)
+    } else if let Some(inner) = cx.boxed(ty) {
+        Ok(inner)
+    } else if let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *cx.types.kind(ty) {
+        Ok(inner)
+    } else {
+        bail!("cannot autoderef {:?}", cx.types.kind(ty));
+    }
+}
+
 pub(super) fn eval_autoderef_ty(cx: &Context<'_>, reached: &Reached, typed: &Typed, expr: ExprId, base: ExprId) -> Result<Ty> {
     let mut ty = eval_expr_ty(cx, typed, base);
+    if ty == Ty::NONE {
+        return Ok(Ty::NONE);
+    }
     let steps = match &typed.tables {
         LazyTables::Poly(poly) => poly.autoderefs_at(expr),
         LazyTables::Eager(tables) => tables.autoderefs.get(&expr).copied().unwrap_or(0),
     };
     for step in 0..steps {
-        if let Some((item, substs)) = eval_table_site(typed, SiteKey::Deref(expr, step)) {
-            let Some(&idx) = reached.index.get(&(item, substs)) else { bail!("unreached deref callee") };
-            let Ok(callee) = &reached.list[idx].1 else { bail!("broken deref callee") };
-            let Some(ret) = callee.ret else { bail!("deref callee without return") };
-            let Kind::Ref(_, inner) = *cx.types.kind(ret) else { bail!("deref callee did not return ref") };
-            ty = inner;
-        } else if let Some(inner) = cx.boxed(ty) {
-            ty = inner;
-        } else if let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *cx.types.kind(ty) {
-            ty = inner;
-        } else {
-            bail!("cannot autoderef {:?}", cx.types.kind(ty));
-        }
+        ty = eval_deref_step(cx, reached, typed, expr, step, ty)?;
     }
     Ok(ty)
 }

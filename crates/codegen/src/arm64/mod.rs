@@ -10,7 +10,7 @@ use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
 use crate::alloc::{Location, Plan, Regs};
 use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, Step, arg_steps, drive, edge_steps, emit_body, prepare, save_offset};
-use crate::ir::{Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, StencilReloc};
 use crate::target::{Os, Target};
@@ -365,22 +365,24 @@ impl Emit<'_> {
         }
     }
 
-    fn stack_argument(&mut self, offset: u32, value: Value) {
+    fn stack_argument(&mut self, offset: u32, purpose: ArgumentPurpose, value: Value) {
         let to = Mem::new(SP, offset as i32);
         let bytes = self.ty(value).bytes();
-        if self.packing == Packing::Natural && bytes < 8 {
+        if bytes < 8 && !self.ty(value).is_float() {
             let reg = self.src(value, A, Ext::Zero);
-            self.asm.store(Size::of(bytes), to, reg);
+            let width = if self.packing == Packing::Natural && purpose != ArgumentPurpose::Variadic { Size::of(bytes) } else { Size::X };
+            self.asm.store(width, to, reg);
             return;
         }
         self.move_to(to, value);
     }
 
     fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> {
-        let abi = classify(&self.func.sigs[sig.index()], self.packing)?;
-        for (arg, loc) in args.iter().zip(&abi.params) {
+        let sig_data = &self.func.sigs[sig.index()];
+        let abi = classify(sig_data, self.packing)?;
+        for ((arg, loc), param) in args.iter().zip(&abi.params).zip(&sig_data.params) {
             if let Loc::Stack(offset) = *loc {
-                self.stack_argument(offset, *arg);
+                self.stack_argument(offset, param.purpose, *arg);
             }
         }
         let target = match self.plan.reg_of(callee).filter(|reg| SAVED.contains(reg)) {

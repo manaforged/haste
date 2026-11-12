@@ -1,41 +1,38 @@
 use crate::body::{Body, Expr, ExprId, Pat, PatId, Stmt};
-use crate::sema::infer::SyntaxTables;
 
 use super::{BodyFootprintPlan, FieldSite, PatSite, PatSiteKind};
 
-pub(super) fn build_plan(body: &Body, closure_root: Option<ExprId>, syntax: &SyntaxTables) -> BodyFootprintPlan {
+pub(super) fn build_plan(body: &Body, closure_root: Option<ExprId>) -> BodyFootprintPlan {
     let (expr_ids, pat_ids) = collect_subtree(body, closure_root);
     let mut field_sites = Vec::new();
     let mut num_sites = Vec::new();
     let mut repeat_sites = Vec::new();
-    let mut promotable_refs = Vec::new();
     let mut closure_exprs = Vec::new();
-    let mut has_partial_moves = !syntax.unpacks.is_empty();
+    let mut has_partial_moves = false;
     for &id in &expr_ids {
         match *body.expr(id) {
             Expr::TupleField(base, index) => {
                 has_partial_moves = true;
-                field_sites.push(FieldSite::Access { expr: id, base, index });
+                field_sites.push(FieldSite::TupleAccess { expr: id, base, index });
             }
             Expr::Field(base, _) => {
                 has_partial_moves = true;
-                if let Some(&index) = syntax.fields.get(&id) {
-                    field_sites.push(FieldSite::Access { expr: id, base, index });
-                }
+                field_sites.push(FieldSite::NamedAccess { expr: id, base });
             }
             Expr::Struct { fields, .. } => {
-                let indices = body.list(fields).iter().filter_map(|&f| syntax.inits.get(&body.fields[f as usize].value).copied()).collect();
-                field_sites.push(FieldSite::StructInit { expr: id, indices });
+                let values = body.list(fields).iter().map(|&f| body.fields[f as usize].value).collect();
+                field_sites.push(FieldSite::StructInit { expr: id, values });
             }
-            Expr::Range { .. } => {
-                if let Some(indices) = syntax.ranges.get(&id) {
-                    field_sites.push(FieldSite::RangeInit { expr: id, indices: indices.clone() });
-                }
-            }
+            Expr::Range { .. } => field_sites.push(FieldSite::RangeInit { expr: id }),
             Expr::Call(callee, args) => {
                 let arg_ids = body.list(args).iter().map(|&a| ExprId(a)).collect();
                 field_sites.push(FieldSite::CallSite { expr: id, callee, args: arg_ids });
             }
+            Expr::Method { receiver, params, .. } => {
+                let args = body.list(params).iter().map(|&a| ExprId(a)).collect();
+                field_sites.push(FieldSite::MethodSite { expr: id, receiver, args });
+            }
+            Expr::Index(base, _) => field_sites.push(FieldSite::IndexSite { expr: id, base }),
             Expr::Unary(_, opnd) => {
                 num_sites.push(id);
                 num_sites.push(opnd);
@@ -47,7 +44,9 @@ pub(super) fn build_plan(body: &Body, closure_root: Option<ExprId>, syntax: &Syn
                 num_sites.extend([id, opnd]);
             }
             Expr::Repeat(val, _) => repeat_sites.push((id, val)),
-            Expr::Ref { mutable: false, raw: false, expr: inner } => promotable_refs.push(inner),
+            Expr::Ref { mutable, raw, expr: inner } => {
+                field_sites.push(FieldSite::RefSite { inner, shared: !mutable && !raw });
+            }
             Expr::Closure { .. } => closure_exprs.push(id),
             Expr::Match(..) | Expr::Let(..) => has_partial_moves = true,
             _ => {}
@@ -55,7 +54,6 @@ pub(super) fn build_plan(body: &Body, closure_root: Option<ExprId>, syntax: &Syn
     }
     let mut pat_sites = Vec::with_capacity(pat_ids.len());
     for pat in pat_ids {
-        let derefs = syntax.pat_derefs.get(&pat).copied().unwrap_or(0);
         let kind = match *body.pat(pat) {
             Pat::Range { .. } => PatSiteKind::Range,
             Pat::Tuple(list) | Pat::TupleStruct(_, list) => {
@@ -68,8 +66,8 @@ pub(super) fn build_plan(body: &Body, closure_root: Option<ExprId>, syntax: &Syn
             }
             Pat::Struct { fields, .. } => {
                 has_partial_moves = true;
-                let indices = body.list(fields).iter().filter_map(|&f| syntax.field_pats.get(&body.field_pats[f as usize].pat).copied()).collect();
-                PatSiteKind::Struct(indices)
+                let sub_pats = body.list(fields).iter().map(|&f| body.field_pats[f as usize].pat).collect();
+                PatSiteKind::Struct(sub_pats)
             }
             Pat::Box(_) => {
                 has_partial_moves = true;
@@ -77,7 +75,7 @@ pub(super) fn build_plan(body: &Body, closure_root: Option<ExprId>, syntax: &Syn
             }
             _ => PatSiteKind::Plain,
         };
-        pat_sites.push(PatSite { pat, derefs, kind });
+        pat_sites.push(PatSite { pat, kind });
     }
     BodyFootprintPlan {
         expr_ids: expr_ids.into_boxed_slice(),
@@ -85,7 +83,6 @@ pub(super) fn build_plan(body: &Body, closure_root: Option<ExprId>, syntax: &Syn
         field_sites: field_sites.into_boxed_slice(),
         num_sites: num_sites.into_boxed_slice(),
         repeat_sites: repeat_sites.into_boxed_slice(),
-        promotable_refs: promotable_refs.into_boxed_slice(),
         closure_exprs: closure_exprs.into_boxed_slice(),
         has_partial_moves,
     }
@@ -99,8 +96,8 @@ fn collect_subtree(body: &Body, closure_root: Option<ExprId>) -> (Vec<ExprId>, V
     };
     let mut exprs = Vec::new();
     let mut pats = Vec::new();
-    for &p in &body.fn_params {
-        walk_pat(body, p, &mut exprs, &mut pats);
+    for param in &body.params {
+        walk_pat(body, param.pat, &mut exprs, &mut pats);
     }
     walk_expr(body, root, &mut exprs, &mut pats);
     (exprs, pats)

@@ -1,4 +1,5 @@
 mod build;
+mod sites;
 mod ty;
 
 use std::sync::Arc;
@@ -9,25 +10,30 @@ use crate::body::{ExprId, PatId};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
-use crate::sema::infer::{ClosureBody, Coercion, Fields, Glue, LazyTables, Res, Shape, SiteKey, SyntaxTables, Typed, cloned_tuple, field_types, needs_drop};
+use crate::sema::infer::{ClosureBody, Coercion, Fields, Glue, LazyTables, Res, Shape, SiteKey, Typed, cloned_tuple, field_types, needs_drop};
 use crate::sema::layout::field_offset;
 use crate::sema::reach::Reached;
 use crate::sema::summary::{ConstHole, PolyInst};
 use crate::sema::ty::{Kind, Mut, Ty};
 
-use super::reloc::{eval_autoderef_ty, eval_expr_ty, eval_table_site};
+use super::reloc::eval_expr_ty;
 use super::stencil::{FootprintId, item_bits};
 use super::{Inline, Slots, passed_parts, signature, signature_of};
 
 use build::build_plan;
+use sites::hash_plan_sites;
 use ty::{HashMix, hash_call_edge, hash_drop_tree, hash_dyn_facts, hash_num_tag, hash_parts, hash_repr, hash_sig, hash_tuple_offsets, hash_ty_facts};
 
 #[derive(Clone, Debug)]
 enum FieldSite {
-    Access { expr: ExprId, base: ExprId, index: u32 },
-    StructInit { expr: ExprId, indices: Box<[u32]> },
-    RangeInit { expr: ExprId, indices: Box<[u32]> },
+    TupleAccess { expr: ExprId, base: ExprId, index: u32 },
+    NamedAccess { expr: ExprId, base: ExprId },
+    StructInit { expr: ExprId, values: Box<[ExprId]> },
+    RangeInit { expr: ExprId },
     CallSite { expr: ExprId, callee: ExprId, args: Box<[ExprId]> },
+    MethodSite { expr: ExprId, receiver: ExprId, args: Box<[ExprId]> },
+    IndexSite { expr: ExprId, base: ExprId },
+    RefSite { inner: ExprId, shared: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -36,13 +42,12 @@ enum PatSiteKind {
     Range,
     Tuple(u32),
     Slice,
-    Struct(Box<[u32]>),
+    Struct(Box<[PatId]>),
 }
 
 #[derive(Clone, Debug)]
 struct PatSite {
     pat: PatId,
-    derefs: u32,
     kind: PatSiteKind,
 }
 
@@ -54,7 +59,6 @@ pub(super) struct BodyFootprintPlan {
     field_sites: Box<[FieldSite]>,
     num_sites: Box<[ExprId]>,
     repeat_sites: Box<[(ExprId, ExprId)]>,
-    promotable_refs: Box<[ExprId]>,
     closure_exprs: Box<[ExprId]>,
     has_partial_moves: bool,
 }
@@ -368,7 +372,7 @@ fn hash_closure_header(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, c
 }
 
 fn eval_body_footprint(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, index: usize, (source_item, closure_root): (ItemRef, Option<ExprId>), typed: &Typed, cycle_root: &mut usize) -> Result<()> {
-    let plan = get_or_build_plan(cx, slots, source_item, closure_root, typed.syntax())?;
+    let plan = get_or_build_plan(cx, slots, source_item, closure_root)?;
     match &typed.tables {
         LazyTables::Poly(poly) => eval_poly_body(cx, (reached, slots), inline, mix, index, &plan, typed, poly, cycle_root),
         LazyTables::Eager(tables) => eval_eager_body(cx, (reached, slots), inline, mix, index, &plan, typed, tables, cycle_root),
@@ -382,7 +386,8 @@ fn eval_poly_body(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         hash_ty_facts(cx, mix, concrete)?;
         hash_num_tag(cx, mix, concrete);
     }
-    if plan.has_partial_moves {
+    let has_partial_moves = plan.has_partial_moves || !typed.syntax().unpacks.is_empty();
+    if has_partial_moves {
         for local in &typed.locals {
             hash_drop_tree(cx, (reached, slots), inline, mix, index, local.ty, 0, cycle_root)?;
         }
@@ -433,16 +438,17 @@ fn eval_poly_body(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
 
 fn eval_eager_body(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, index: usize, plan: &BodyFootprintPlan, typed: &Typed, tables: &crate::sema::infer::BodyTables, cycle_root: &mut usize) -> Result<()> {
     mix.byte(0xa2);
+    let has_partial_moves = plan.has_partial_moves || !typed.syntax().unpacks.is_empty();
     for local in &typed.locals {
         hash_ty_facts(cx, mix, local.ty)?;
-        if plan.has_partial_moves {
+        if has_partial_moves {
             hash_drop_tree(cx, (reached, slots), inline, mix, index, local.ty, 0, cycle_root)?;
         }
     }
     for &expr in &plan.expr_ids {
         let ty = tables.exprs[expr.0 as usize];
         hash_ty_facts(cx, mix, ty)?;
-        if plan.has_partial_moves {
+        if has_partial_moves {
             hash_drop_tree(cx, (reached, slots), inline, mix, index, ty, 0, cycle_root)?;
         }
     }
@@ -529,7 +535,9 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
             mix.byte(3);
             mix.u32(*slot);
             let expr_ty = eval_expr_ty(cx, typed, id);
-            if let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *cx.types.kind(expr_ty)
+            if expr_ty == Ty::NONE {
+                mix.byte(0xff);
+            } else if let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *cx.types.kind(expr_ty)
                 && let Kind::Dyn(of, ..) = *cx.types.kind(inner)
             {
                 hash_dyn_facts(cx, mix, inner, of)?;
@@ -556,140 +564,6 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
     Ok(())
 }
 
-fn hash_plan_sites(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, plan: &BodyFootprintPlan, typed: &Typed) -> Result<()> {
-    for site in &plan.field_sites {
-        hash_field_site(cx, reached, mix, typed, site)?;
-    }
-    for ps in &plan.pat_sites {
-        hash_pat_site(cx, mix, typed, ps)?;
-    }
-    for &(_, val_expr) in &plan.repeat_sites {
-        let is_uninit = eval_table_site(typed, SiteKey::ExprRes(val_expr)).is_some_and(|(i, _)| {
-            let ret_adt = match *cx.types.kind(eval_expr_ty(cx, typed, val_expr)) {
-                Kind::Adt(adt, _) => cx.lang(adt) == Some("maybe_uninit"),
-                _ => false,
-            };
-            (cx.name(i) == "uninit" && ret_adt) || cx.lang(i) == Some("maybe_uninit_uninit")
-        });
-        mix.bool(is_uninit);
-    }
-    for &inner in &plan.promotable_refs {
-        let mono_const = eval_table_site(typed, SiteKey::ExprRes(inner)).is_some_and(|(i, s)| s.is_empty() && matches!(cx.item(i).1.kind, ItemKind::Const));
-        mix.bool(mono_const);
-    }
-    for &clos_expr in &plan.closure_exprs {
-        let clos_ty = eval_expr_ty(cx, typed, clos_expr);
-        if let Some(env_ty) = cx.closure_env(clos_ty) {
-            hash_ty_facts(cx, mix, env_ty)?;
-            hash_tuple_offsets(cx, mix, env_ty)?;
-        }
-    }
-    Ok(())
-}
-
-fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, typed: &Typed, site: &FieldSite) -> Result<()> {
-    match site {
-        FieldSite::Access { expr, base, index: idx } => {
-            let owner = eval_autoderef_ty(cx, reached, typed, *expr, *base)?;
-            if cx.is_unsized(owner)? {
-                mix.byte(1);
-            } else {
-                mix.byte(0);
-                let l = cx.layout(owner)?;
-                mix.i32(field_offset(&l, 0, *idx));
-            }
-            let out_ty = eval_expr_ty(cx, typed, *expr);
-            if !cx.is_unsized(out_ty)? {
-                hash_repr(cx, mix, out_ty)?;
-            }
-        }
-        FieldSite::StructInit { expr, indices } => {
-            let ty = eval_expr_ty(cx, typed, *expr);
-            let variant = match site_res_any(cx, typed, SiteKey::ExprRes(*expr)) {
-                Some(Res::Ctor(_, v, _)) => v,
-                _ => 0,
-            };
-            mix.u32(variant);
-            let l = cx.layout(ty)?;
-            for &idx in indices {
-                mix.i32(field_offset(&l, variant, idx));
-            }
-        }
-        FieldSite::RangeInit { expr, indices } => {
-            let l = cx.layout(eval_expr_ty(cx, typed, *expr))?;
-            for &idx in indices {
-                mix.i32(field_offset(&l, 0, idx));
-            }
-        }
-        FieldSite::CallSite { expr, callee, args } => {
-            if let Some(Res::Ctor(_, variant, _)) = site_res_any(cx, typed, SiteKey::ExprRes(*callee)) {
-                mix.byte(1);
-                mix.u32(variant);
-                let l = cx.layout(eval_expr_ty(cx, typed, *expr))?;
-                for idx in 0..args.len() as u32 {
-                    mix.i32(field_offset(&l, variant, idx));
-                }
-            } else {
-                mix.byte(0);
-                let overloaded = match &typed.tables {
-                    LazyTables::Poly(p) => p.is_overloaded_call(*expr),
-                    LazyTables::Eager(t) => t.overloaded.contains(expr),
-                };
-                if overloaded {
-                    let arg_tys: Vec<Ty> = args.iter().map(|&a| eval_expr_ty(cx, typed, a)).collect();
-                    let tup = cx.types.tuple(&arg_tys);
-                    hash_tuple_offsets(cx, mix, tup)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn hash_pat_site(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, ps: &PatSite) -> Result<()> {
-    let Some(mut ty) = pat_ty_any(cx, typed, ps.pat) else { return Ok(()) };
-    hash_ty_facts(cx, mix, ty)?;
-    for _ in 0..ps.derefs {
-        if let Some(inner) = cx.boxed(ty) {
-            ty = inner;
-        } else if let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *cx.types.kind(ty) {
-            ty = inner;
-        }
-        hash_ty_facts(cx, mix, ty)?;
-    }
-    let variant = match site_res_any(cx, typed, SiteKey::PatRes(ps.pat)) {
-        Some(Res::Ctor(_, v, _)) => v,
-        _ => 0,
-    };
-    mix.u32(variant);
-    match &ps.kind {
-        PatSiteKind::Plain => {}
-        PatSiteKind::Range => hash_num_tag(cx, mix, ty),
-        PatSiteKind::Tuple(count) => {
-            if !cx.is_unsized(ty)? {
-                let l = cx.layout(ty)?;
-                for idx in 0..*count {
-                    mix.i32(field_offset(&l, variant, idx));
-                }
-            }
-        }
-        PatSiteKind::Slice => {
-            if let Kind::Array(elem, _) | Kind::Slice(elem) = *cx.types.kind(ty) {
-                mix.u64(cx.layout(elem)?.size.bytes());
-            }
-        }
-        PatSiteKind::Struct(fields) => {
-            if !cx.is_unsized(ty)? {
-                let l = cx.layout(ty)?;
-                for &idx in fields {
-                    mix.i32(field_offset(&l, variant, idx));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn site_res_any(cx: &Context<'_>, typed: &Typed, key: SiteKey) -> Option<Res> {
     match &typed.tables {
         LazyTables::Poly(p) => p.site_res(&cx.types, key),
@@ -704,13 +578,13 @@ fn pat_ty_any(cx: &Context<'_>, typed: &Typed, pat: PatId) -> Option<Ty> {
     }
 }
 
-fn get_or_build_plan(cx: &mut Context<'_>, slots: &dyn Slots, source_item: ItemRef, closure_root: Option<ExprId>, syntax: &SyntaxTables) -> Result<Arc<BodyFootprintPlan>> {
+fn get_or_build_plan(cx: &mut Context<'_>, slots: &dyn Slots, source_item: ItemRef, closure_root: Option<ExprId>) -> Result<Arc<BodyFootprintPlan>> {
     let key = (source_item, closure_root);
     if let Some(found) = slots.bodies().plans.get(&key) {
         return Ok(found);
     }
     let body = cx.body(source_item)?;
-    let built = Arc::new(build_plan(&body, closure_root, syntax));
+    let built = Arc::new(build_plan(&body, closure_root));
     slots.bodies().plans.insert(key, Arc::clone(&built));
     Ok(built)
 }

@@ -47,7 +47,16 @@ impl Counter {
             ArgumentPurpose::StructReturn => return Ok(Loc::Int(INDIRECT)),
             ArgumentPurpose::Dict => return Ok(Loc::Int(Reg(9))),
             ArgumentPurpose::StructArgument(_) => return Err("a struct passed by value on the stack has no arm64 lowering yet".to_owned()),
-            ArgumentPurpose::Normal => {}
+            ArgumentPurpose::Variadic if self.packing == Packing::Natural => {
+                self.int = INT_ARGS.len();
+                self.float = FLOAT_ARGS;
+                let size = ty.bytes().max(8);
+                self.stack = round(self.stack, size);
+                let at = self.stack;
+                self.stack += size;
+                return Ok(Loc::Stack(at));
+            }
+            ArgumentPurpose::Normal | ArgumentPurpose::Variadic => {}
         }
         Ok(match ty {
             Type::I128 => {

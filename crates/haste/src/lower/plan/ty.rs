@@ -130,14 +130,10 @@ pub(super) fn hash_repr(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty) -> Resu
 }
 
 fn hash_purpose(mix: &mut HashMix, purpose: ArgumentPurpose) {
-    match purpose {
-        ArgumentPurpose::Normal => mix.byte(0),
-        ArgumentPurpose::StructReturn => mix.byte(1),
-        ArgumentPurpose::StructArgument(n) => {
-            mix.byte(2);
-            mix.u32(n);
-        }
-        ArgumentPurpose::Dict => mix.byte(3),
+    let (tag, extra) = crate::lower::purpose_tag(purpose);
+    mix.byte(tag);
+    if let Some(n) = extra {
+        mix.u32(n);
     }
 }
 
@@ -275,6 +271,12 @@ fn hash_ty_facts_depth(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, depth: u
             mix.u32(at);
             mix.bool(cx.closure_takes_env(ty));
             mix.bool(cx.closure_consumes(ty));
+            if depth < 3
+                && let Some(env_ty) = cx.closure_env(ty)
+            {
+                hash_ty_facts_depth(cx, mix, env_ty, depth + 1)?;
+                hash_tuple_offsets(cx, mix, env_ty)?;
+            }
         }
         Kind::Dyn(of, ..) => {
             mix.byte(0x1b);
@@ -519,6 +521,10 @@ fn hash_intrinsic_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn S
 }
 
 pub(super) fn hash_tuple_offsets(cx: &mut Context<'_>, mix: &mut HashMix, tuple: Ty) -> Result<()> {
+    if tuple == Ty::NONE {
+        mix.byte(0);
+        return Ok(());
+    }
     if let Kind::Tuple(items) = *cx.types.kind(tuple) {
         let slice = cx.types.substs(items).to_vec();
         let layout = cx.layout(tuple)?;
