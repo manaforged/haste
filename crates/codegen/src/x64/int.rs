@@ -364,14 +364,9 @@ impl Emit<'_> {
 
     /// `dst op= y` on the low `size` bytes, with an immediate when `y` is a constant that fits one at that width.
     pub(super) fn alu_at(&mut self, size: Size, alu: Alu, dst: Reg, y: Value) {
-        match (size, self.imm_of(y)) {
-            (Size::Q, Some(imm)) => self.asm.alu_imm(alu, dst, imm),
-            (Size::D, Some(imm)) => self.asm.alu_imm32(alu, dst, imm),
-            (_, Some(_)) => {
-                self.raw(Reg::Rcx, y);
-                self.asm.alu_sized(size, alu, dst, Reg::Rcx);
-            }
-            (_, None) => {
+        match self.imm_of(y) {
+            Some(imm) => self.asm.alu_imm_sized(size, alu, dst, imm),
+            None => {
                 let source = self.operand(y);
                 self.asm.alu_sized(size, alu, dst, source);
             }

@@ -351,6 +351,28 @@ impl Asm {
         self.alu_imm_width(false, op, dst, imm);
     }
 
+    /// `dst op= imm` on the low `size` bytes of `dst`, with `imm` cut to that width.
+    pub fn alu_imm_sized(&mut self, size: Size, op: Alu, dst: Reg, imm: i32) {
+        match size {
+            Size::B => {
+                self.encode(&[], false, &[0x80], op as u8, dst.into(), true);
+                self.code.push(imm as u8);
+            }
+            Size::W => match i8::try_from(imm as i16) {
+                Ok(small) => {
+                    self.encode(&[0x66], false, &[0x83], op as u8, dst.into(), false);
+                    self.code.push(small as u8);
+                }
+                Err(_) => {
+                    self.encode(&[0x66], false, &[0x81], op as u8, dst.into(), false);
+                    self.code.extend((imm as u16).to_le_bytes());
+                }
+            },
+            Size::D => self.alu_imm32(op, dst, imm),
+            Size::Q => self.alu_imm(op, dst, imm),
+        }
+    }
+
     pub fn test(&mut self, a: Reg, b: Reg) {
         self.encode(&[], true, &[0x85], b as u8, a.into(), false);
     }

@@ -333,18 +333,22 @@ impl Fold {
         func.blocks[block.index()].params.iter().zip(args).all(|(param, arg)| self.subst[param.index()] == *param || self.find(*arg) == self.find(*param))
     }
 
-    /// Where an edge into `block` with `args` goes next when `block` holds only a jump, or a branch on a parameter `args` makes a constant, and reads its parameters nowhere else.
+    /// Where an edge into `block` with `args` goes next when `block` holds only a jump, or a branch on a parameter `args` makes a constant or on a comparison of such a parameter with a constant, and reads its parameters nowhere else.
     fn step(&self, func: &Function, (uses, pinned): (&[u32], &[bool]), block: Block, args: &[Value]) -> Option<(Block, Vec<Value>)> {
         let data = &func.blocks[block.index()];
-        let [only] = data.insts[..] else { return None };
+        let (compare, last) = match data.insts[..] {
+            [only] => (None, only),
+            [compare, last] => (Some(compare), last),
+            _ => return None,
+        };
         if !self.agrees(func, block, args) {
             return None;
         }
-        let op = &func.insts[only.index()].op;
+        let op = &func.insts[last.index()].op;
         let param = |value: &Value| data.params.iter().position(|param| param == value);
         let (next, next_args) = match op {
-            Op::Jump(next, next_args) => (*next, next_args),
-            Op::Brif(condition, then, then_args, otherwise, else_args) => match self.known(args[param(condition)?])? {
+            Op::Jump(next, next_args) if compare.is_none() => (*next, next_args),
+            Op::Brif(condition, then, then_args, otherwise, else_args) => match self.edge_condition(func, (compare, uses), *condition, &|value| param(&value).map(|at| args[at]))? {
                 0 => (*otherwise, else_args),
                 _ => (*then, then_args),
             },
@@ -352,13 +356,25 @@ impl Fold {
         };
         let reads = |param: Value| {
             let mut count = 0_u32;
-            op.for_operands(|value| count += u32::from(value == param));
+            compare.iter().map(|inst| &func.insts[inst.index()].op).chain([op]).for_each(|op| op.for_operands(|value| count += u32::from(value == param)));
             count
         };
         if pinned[next.index()] || data.params.iter().any(|param| uses[param.index()] != reads(*param)) {
             return None;
         }
         Some((next, next_args.iter().map(|value| param(value).map_or(*value, |at| args[at])).collect()))
+    }
+
+    /// The constant a branch on `condition` sees when the block's parameters hold what `arg` gives them: `condition` itself is such a parameter, or `compare` alone uses it and compares parameters or constants.
+    fn edge_condition(&self, func: &Function, (compare, uses): (Option<Inst>, &[u32]), condition: Value, arg: &dyn Fn(Value) -> Option<Value>) -> Option<i64> {
+        let Some(compare) = compare else { return self.known(arg(condition)?) };
+        let data = &func.insts[compare.index()];
+        let (Op::Icmp(cc, x, y), Some(result)) = (&data.op, data.result) else { return None };
+        if result != condition || uses[result.index()] != 1 || !func.ty(*x).is_small_int() {
+            return None;
+        }
+        let value = |operand: Value| arg(operand).map_or_else(|| self.known(operand), |given| self.known(given));
+        Some(i64::from(holds(*cc, func.ty(*x), value(*x)?, value(*y)?)))
     }
 
     /// Replaces each block parameter that every reachable edge gives one value, other than itself.
