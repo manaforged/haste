@@ -1,13 +1,14 @@
-use std::collections::BTreeSet;
-
 use haste_codegen::Type;
 use rustc_abi::{BackendRepr, FieldsShape, Primitive, Scalar, TagEncoding, Variants};
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::lower::{Parts, Repr, repr, returned, unwrapped};
 use crate::sema::Context;
+use crate::sema::infer::field_types;
 use crate::sema::layout::Layout;
 use crate::sema::ty::{Kind, Ty};
 
+use super::key::Miss;
 use super::record::{Abi, Arg, Class, Conv, Pass, Reg};
 
 /// How Haste passes one argument or return: in no register, in one, in two at an offset, or by address.
@@ -85,14 +86,36 @@ impl Class {
     }
 }
 
-/// The layouts of `types` and of every type they hold or point to, printed as the driver prints rustc's, or none when one has no layout or cannot cross.
-pub(super) fn layouts(cx: &mut Context<'_>, crates: &super::select::Crates, types: &[Ty]) -> Option<Vec<String>> {
-    let reached = super::select::reached(cx, crates, types, super::select::Purpose::Crossing)?;
-    let mut printed = BTreeSet::new();
-    for ty in reached {
-        printed.insert(print(&*cx.layout(ty).ok()?));
+/// The layouts of `types` and of every type their values hold or point to, in the order a depth-first walk first meets them, printed as the driver prints rustc's.
+pub(super) fn layouts(cx: &mut Context<'_>, types: &[Ty]) -> Result<Vec<String>, Miss> {
+    let (mut seen, mut stack, mut printed) = (HashSet::default(), types.to_vec(), Vec::new());
+    while let Some(ty) = stack.pop() {
+        if !seen.insert(ty) {
+            continue;
+        }
+        printed.push(print(&*cx.layout(ty).map_err(|_| Miss::Unnamed)?));
+        stack.extend(inner(cx, ty)?);
     }
-    Some(printed.into_iter().collect())
+    Ok(printed)
+}
+
+/// The types directly inside a value of `ty` in the order the driver walks rustc's: a pointee or element, the items of a tuple, every field of every variant, or a closure's captures.
+fn inner(cx: &mut Context<'_>, ty: Ty) -> Result<Vec<Ty>, Miss> {
+    Ok(match cx.types.kind(ty).clone() {
+        Kind::Prim(_) | Kind::Never | Kind::FnDef(..) => Vec::new(),
+        Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) | Kind::Array(inner, _) => vec![inner],
+        Kind::Tuple(items) => cx.types.substs(items).to_vec(),
+        Kind::Adt(item, args) => {
+            let args = cx.types.substs(args).to_vec();
+            field_types(cx, item, &args).map_err(|_| Miss::Unnamed)?.iter().flatten().copied().collect()
+        }
+        Kind::Closure(..) => match cx.closure_env(ty).map(|env| cx.types.kind(env).clone()) {
+            Some(Kind::Tuple(items)) => cx.types.substs(items).to_vec(),
+            _ => return Err(Miss::Unnamed),
+        },
+        Kind::FnPtr(..) | Kind::Dyn(..) => return Err(Miss::Indirect),
+        _ => return Err(Miss::Unnamed),
+    })
 }
 
 fn print(layout: &Layout) -> String {

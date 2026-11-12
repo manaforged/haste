@@ -89,6 +89,9 @@ impl Program {
         compilation.settle();
         served?;
         eprintln!("compiled {} of {} functions declared", self.jit.compiled.len(), self.jit.reached.list.len());
+        if let Some(counts) = crate::prep::decided() {
+            eprintln!("prep {counts}");
+        }
         run.status.ok_or_else(|| anyhow!("the program did not start"))
     }
 

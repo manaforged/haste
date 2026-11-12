@@ -4,6 +4,7 @@
 extern crate rustc_abi;
 extern crate rustc_attr_ir;
 extern crate rustc_attr_parsing;
+extern crate rustc_crate_store;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_hir;
@@ -18,6 +19,7 @@ mod args;
 mod elf;
 mod error;
 mod export;
+mod key;
 mod layout;
 mod link;
 mod record;

@@ -1,15 +1,14 @@
 use rustc_abi::{BackendRepr, FieldIdx, FieldsShape, LayoutData, Primitive, Scalar, TagEncoding, VariantIdx, Variants};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypingEnv};
-use std::collections::BTreeSet;
 
 /// The most types one instance's arguments and return may reach before the driver stops listing their layouts.
 const REACHED_TYPES: usize = 256;
 
-/// The layout of every type that the values of `roots` hold or point to, each printed in the form Haste prints its own layouts in, or none when one cannot be printed or there are too many.
+/// The layout of every type that the values of `roots` hold or point to, in the order a depth-first walk first meets them, each printed in the form Haste prints its own layouts in, or none when one cannot be printed or there are too many.
 pub fn reached<'tcx>(tcx: TyCtxt<'tcx>, roots: &[Ty<'tcx>]) -> Option<Vec<String>> {
     let env = TypingEnv::fully_monomorphized();
-    let (mut seen, mut stack, mut printed) = (FxHashSet::default(), roots.to_vec(), BTreeSet::new());
+    let (mut seen, mut stack, mut printed) = (FxHashSet::default(), roots.to_vec(), Vec::new());
     while let Some(ty) = stack.pop() {
         if !seen.insert(ty) {
             continue;
@@ -18,15 +17,16 @@ pub fn reached<'tcx>(tcx: TyCtxt<'tcx>, roots: &[Ty<'tcx>]) -> Option<Vec<String
             return None;
         }
         let layout = tcx.layout_of(env.as_query_input(ty)).ok()?;
-        printed.insert(print(&layout.layout.0.0));
+        printed.push(print(&layout.layout.0.0));
         stack.extend(inner(tcx, env, ty)?);
     }
-    Some(printed.into_iter().collect())
+    Some(printed)
 }
 
 fn inner<'tcx>(tcx: TyCtxt<'tcx>, env: TypingEnv<'tcx>, ty: Ty<'tcx>) -> Option<Vec<Ty<'tcx>>> {
     Some(match *ty.kind() {
-        ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Never => Vec::new(),
+        ty::Bool | ty::Char | ty::Str | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Never | ty::FnDef(..) => Vec::new(),
+        ty::Closure(_, args) => args.as_closure().upvar_tys().to_vec(),
         ty::Ref(_, inner, _) | ty::RawPtr(inner, _) | ty::Slice(inner) | ty::Array(inner, _) | ty::Pat(inner, _) => vec![inner],
         ty::Tuple(items) => items.to_vec(),
         ty::Adt(def, args) => def.all_fields().map(|field| tcx.normalize_erasing_regions(env, field.ty(tcx, args))).collect(),

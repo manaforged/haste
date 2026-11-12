@@ -5,18 +5,21 @@ use std::sync::Mutex;
 use anyhow::{Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::graph::Workspace;
+use crate::outline::Outline;
 use crate::sema::Context;
 use crate::sema::infer::Typed;
-use crate::sema::reach::{Instance, Reached};
+use crate::sema::reach::Instance;
 
-use super::edit::Snapshot;
-use super::ident::{self, Ident};
-use super::record::{Facts, InstanceKind, Library, Record};
-use super::select::Crates;
+use super::edit::{Changed, Snapshot};
+use super::ident;
+use super::key::{Keys, Miss};
+use super::record::{At, Facts, InstanceKind, Library, Record};
 use super::{conv, driver};
 
 const MAIN: &str = "main";
 const START: &str = "std::rt::lang_start";
+const PATH_SEPARATOR: &str = "::";
 
 /// The file beside a driver library that holds the snapshot of the sources it was built from.
 pub(super) const SNAPSHOT: &str = "snapshot";
@@ -28,19 +31,23 @@ pub enum Decision {
     Bound(usize),
     /// No record names the function.
     Unmatched,
+    /// More than one record names the function.
+    Ambiguous,
     /// An edit since prep changed the function, code rustc inlined into it, or code it calls.
     Stale,
-    /// It or code it calls touches a mutable static outside the standard crates, which Haste's code holds apart.
+    /// It or code it calls touches state that Haste's code holds apart.
     State,
-    /// rustc passes an argument or the return otherwise than Haste does.
+    /// rustc passes an argument or the return otherwise than Haste does, or its signature names other types.
     Convention,
     /// rustc lays out a type it crosses with otherwise than Haste does, or the type cannot cross.
     Layout,
+    /// It names or crosses with a function pointer or trait object.
+    Indirect,
     /// The open library does not export the record's symbol.
     Missing,
 }
 
-/// The driver's library of one build and what binding to it needs: its records by the path that names them, which records an edit or shared state rules out, and the facts of the build's crates.
+/// The driver's library of one build and what binding to it needs: its records by the key that names them, which records an edit or shared state rules out, and how keys name the build's definitions.
 pub(super) struct Bindings {
     library: PathBuf,
     facts: Facts,
@@ -48,24 +55,27 @@ pub(super) struct Bindings {
     index: HashMap<String, Vec<usize>>,
     stale: Vec<bool>,
     state: Vec<bool>,
-    sysroot: Vec<bool>,
-    crates: Crates,
-    decided: Mutex<HashMap<Instance, Decision>>,
+    keys: Keys,
+    current: bool,
+    decided: Mutex<HashMap<Instance, (Decision, Option<usize>)>>,
 }
 
 impl Bindings {
     /// The driver library in `dir` with its records ruled out by the edits from its snapshot to `now`; none when `dir` holds no library or an edit outside functions makes every record stale.
-    pub(super) fn read(dir: &Path, now: &Snapshot, (sysroot, crates): (Vec<bool>, Crates)) -> Result<Option<Bindings>> {
+    pub(super) fn read(dir: &Path, now: &Snapshot, (outline, workspace): (&Outline, &Workspace)) -> Result<Option<Bindings>> {
+        let Ok(dir) = dir.canonicalize() else { return Ok(None) };
         let (manifest, snapshot) = (dir.join(driver::MANIFEST), dir.join(SNAPSHOT));
         if !manifest.is_file() || !snapshot.is_file() {
             return Ok(None);
         }
-        let Some(changed) = now.changed(&Snapshot::read(&snapshot)?) else { return Ok(None) };
+        let then = Snapshot::read(&snapshot)?;
+        let Some(changed) = now.changed(&then) else { return Ok(None) };
         let Library { library, record: records } = Library::read(&manifest)?;
         let mut index: HashMap<String, Vec<usize>> = HashMap::default();
         for (at, record) in records.iter().enumerate() {
-            let key = record.closure.as_ref().map_or(&record.path, |closure| &closure.root);
-            index.entry(key.clone()).or_default().push(at);
+            if let Some(key) = &record.key {
+                index.entry(key.clone()).or_default().push(at);
+            }
         }
         let callers = callers(&records);
         let stale = spread(&callers, records.iter().map(|record| touched(record, &changed)).collect());
@@ -73,7 +83,14 @@ impl Bindings {
         for at in (0..records.len()).filter(|&at| entry(&records, &callers, at)) {
             state[at] = false;
         }
-        Ok(Some(Bindings { library: dir.join(driver::LIBRARY), facts: library, records, index, stale, state, sysroot, crates, decided: Mutex::default() }))
+        let keys = Keys::new(outline, workspace, then);
+        let current = changed.ranges.is_empty() && changed.crates.is_empty();
+        Ok(Some(Bindings { library: dir.join(driver::LIBRARY), facts: library, records, index, stale, state, keys, current, decided: Mutex::default() }))
+    }
+
+    /// Whether the library was built from the local sources as they are now.
+    pub(super) fn current(&self) -> bool {
+        self.current
     }
 
     /// Loads the library into this process.
@@ -106,26 +123,46 @@ impl Bindings {
         flush(&mut handle);
     }
 
-    /// The record that names `instance` with body `typed`, when one does.
-    pub(super) fn record(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Option<usize> {
-        let ident = ident::ident(cx, instance, typed, &self.sysroot)?;
-        self.index.get(ident.key())?.iter().copied().find(|&at| Ident::names(&ident, &self.records[at]))
+    /// The record that names `instance` with body `typed`: none when no record does, or the reason no single record does.
+    fn record(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Result<usize, Decision> {
+        let (key, once) = self.keys.instance(cx, instance, typed).map_err(refusal)?;
+        let fits = |at: &usize| {
+            let record = &self.records[*at];
+            match (once, &record.closure) {
+                (Some(once), Some(closure)) => ident::called(once, record.kind, closure.kind),
+                (None, None) => record.kind == InstanceKind::Item,
+                _ => false,
+            }
+        };
+        let found: Vec<usize> = self.index.get(&key).into_iter().flatten().copied().filter(fits).collect();
+        match found.as_slice() {
+            [] => Err(Decision::Unmatched),
+            [one] => Ok(*one),
+            _ => Err(Decision::Ambiguous),
+        }
     }
 
     /// What binding `instance` with body `typed` to rustc's code decides, worked out once per instance.
     pub(super) fn decide(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Decision {
-        if let Some(found) = self.decided.lock().ok().and_then(|decided| decided.get(&instance).copied()) {
+        if let Some((found, _)) = self.decided.lock().ok().and_then(|decided| decided.get(&instance).copied()) {
             return found;
         }
-        let found = self.work_out(cx, instance, typed);
+        let (found, at) = self.work_out(cx, instance, typed);
         if let Ok(mut decided) = self.decided.lock() {
-            decided.insert(instance, found);
+            decided.insert(instance, (found, at));
         }
         found
     }
 
-    fn work_out(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Decision {
-        let Some(at) = self.record(cx, instance, typed) else { return Decision::Unmatched };
+    fn work_out(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> (Decision, Option<usize>) {
+        match self.record(cx, instance, typed) {
+            Ok(at) => (self.check(cx, typed, at), Some(at)),
+            Err(decision) => (decision, None),
+        }
+    }
+
+    /// What binding a function with body `typed` to record `at`, which names it, decides.
+    fn check(&self, cx: &mut Context<'_>, typed: &Typed, at: usize) -> Decision {
         let record = &self.records[at];
         if self.stale[at] {
             return Decision::Stale;
@@ -134,98 +171,140 @@ impl Bindings {
             return Decision::State;
         }
         let (params, ret) = super::signature(typed);
-        if !conv::agrees(cx, (&params, ret), &record.abi) {
+        let mut types = params.clone();
+        types.push(ret.unwrap_or_else(|| cx.types.tuple(&[])));
+        if !self.same_signature(cx, &types, record) || !conv::agrees(cx, (&params, ret), &record.abi) {
             return Decision::Convention;
         }
-        let mut types = params;
-        types.push(ret.unwrap_or_else(|| cx.types.tuple(&[])));
-        if conv::layouts(cx, &self.crates, &types).is_none_or(|found| record.layouts.as_ref() != Some(&found)) {
-            return Decision::Layout;
+        match conv::layouts(cx, &types) {
+            Err(Miss::Indirect) => Decision::Indirect,
+            Ok(found) if record.layouts.as_ref() == Some(&found) => super::exported(&record.symbol).map_or(Decision::Missing, Decision::Bound),
+            _ => Decision::Layout,
         }
-        super::exported(&record.symbol).map_or(Decision::Missing, Decision::Bound)
     }
 
-    /// What binding each function of `reached` decides, and which records no reached function names.
-    pub(super) fn tally(&self, cx: &mut Context<'_>, reached: &Reached) -> Tally {
+    /// Whether the argument and return types `types` have the keys of the types `record` passes.
+    fn same_signature(&self, cx: &mut Context<'_>, types: &[crate::sema::ty::Ty], record: &Record) -> bool {
+        let theirs: Vec<Option<&str>> = record.abi.args.iter().chain([&record.abi.ret]).map(|arg| arg.key.as_deref()).collect();
+        theirs.len() == types.len() && types.iter().zip(theirs).all(|(&ty, theirs)| theirs.is_some_and(|theirs| self.keys.ty(cx, ty).is_ok_and(|ours| ours == theirs)))
+    }
+
+    /// What binding decided for each function this process asked about, and how many records of each kind those functions name.
+    pub(super) fn decided(&self) -> Tally {
         let mut tally = Tally { records: self.records.len(), ..Tally::default() };
         let mut matched = vec![false; self.records.len()];
-        for (instance, typed) in &reached.list {
-            let Ok(typed) = typed else { continue };
-            let found = self.record(cx, *instance, typed);
-            let decision = self.decide(cx, *instance, typed);
-            if let Some(at) = found {
+        for (decision, at) in self.decided.lock().map(|decided| decided.values().copied().collect::<Vec<_>>()).unwrap_or_default() {
+            tally.count(decision);
+            if let Some(at) = at {
                 matched[at] = true;
                 tally.release += usize::from(matches!(decision, Decision::Bound(_)) && self.records[at].release_copy);
             }
-            tally.count(decision);
+        }
+        for (record, found) in self.records.iter().zip(&matched) {
+            let kind = &mut tally.kinds[Category::of(record) as usize];
+            kind.1 += 1;
+            kind.0 += usize::from(*found);
         }
         tally.matched = matched.iter().filter(|&&found| found).count();
-        for (record, _) in self.records.iter().zip(&matched).filter(|(_, found)| !**found) {
-            tally.unmatched(record);
-        }
         tally
+    }
+
+    /// How many records the library holds.
+    pub(super) fn len(&self) -> usize {
+        self.records.len()
     }
 }
 
-/// What binding the reached functions of one build to the driver's library decided, and the kinds of the records no reached function names.
+/// The kinds of records a tally counts apart: generic instances, closures, other functions, and shims.
+#[derive(Clone, Copy)]
+enum Category {
+    Generic,
+    Closure,
+    Item,
+    Shim,
+}
+
+/// The names a tally prints its record kinds by, in `Category` order.
+const CATEGORIES: [&str; 4] = ["generic", "closures", "items", "shims"];
+
+impl Category {
+    fn of(record: &Record) -> Category {
+        match (record.kind, &record.closure) {
+            (InstanceKind::Item | InstanceKind::ClosureOnce, Some(_)) => Category::Closure,
+            (InstanceKind::Item, None) if !record.args.is_empty() => Category::Generic,
+            (InstanceKind::Item, None) => Category::Item,
+            _ => Category::Shim,
+        }
+    }
+}
+
+/// What binding the reached functions of one build to the driver's library decided: per record kind how many records a reached function names of how many, and per decision how many functions it took.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Tally {
     pub records: usize,
     pub matched: usize,
+    pub kinds: [(usize, usize); 4],
     pub bound: usize,
     pub release: usize,
     pub stale: usize,
     pub state: usize,
     pub convention: usize,
     pub layout: usize,
+    pub indirect: usize,
+    pub ambiguous: usize,
     pub missing: usize,
-    pub generic: usize,
-    pub shims: usize,
-    pub closures: usize,
-    pub items: usize,
+    pub unmatched: usize,
 }
 
 impl Tally {
     fn count(&mut self, decision: Decision) {
-        match decision {
-            Decision::Bound(_) => self.bound += 1,
-            Decision::Stale => self.stale += 1,
-            Decision::State => self.state += 1,
-            Decision::Convention => self.convention += 1,
-            Decision::Layout => self.layout += 1,
-            Decision::Missing => self.missing += 1,
-            Decision::Unmatched => {}
-        }
-    }
-
-    fn unmatched(&mut self, record: &Record) {
-        match (record.kind, &record.closure) {
-            (InstanceKind::Other, _) => self.shims += 1,
-            (_, Some(_)) => self.closures += 1,
-            _ if !record.args.is_empty() => self.generic += 1,
-            _ => self.items += 1,
-        }
+        let counter = match decision {
+            Decision::Bound(_) => &mut self.bound,
+            Decision::Stale => &mut self.stale,
+            Decision::State => &mut self.state,
+            Decision::Convention => &mut self.convention,
+            Decision::Layout => &mut self.layout,
+            Decision::Indirect => &mut self.indirect,
+            Decision::Ambiguous => &mut self.ambiguous,
+            Decision::Missing => &mut self.missing,
+            Decision::Unmatched => &mut self.unmatched,
+        };
+        *counter += 1;
     }
 }
 
 impl std::fmt::Display for Tally {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(out, "rustc {} records, {} matched, {} bound ({} release copies), refused {} stale {} state {} convention {} layout {} missing; unmatched {} generic {} shims {} closures {} items", self.records, self.matched, self.bound, self.release, self.stale, self.state, self.convention, self.layout, self.missing, self.generic, self.shims, self.closures, self.items)
+        let kinds: Vec<String> = CATEGORIES.iter().zip(self.kinds).map(|(name, (found, all))| format!("{name} {found}/{all}")).collect();
+        write!(out, "rustc {} records, {} matched ({}), {} bound ({} release copies), refused {} stale {} state {} convention {} layout {} indirect {} ambiguous {} missing, {} unmatched", self.records, self.matched, kinds.join(" "), self.bound, self.release, self.stale, self.state, self.convention, self.layout, self.indirect, self.ambiguous, self.missing, self.unmatched)
     }
 }
 
-/// Whether an edit to the functions at `changed` makes `record` stale: it is one of them or inside one, or rustc inlined one into it.
-fn touched(record: &Record, changed: &[String]) -> bool {
-    let root = record.closure.as_ref().map(|closure| closure.root.as_str());
-    let mut paths = std::iter::once(record.path.as_str()).chain(root).chain(record.inlined.iter().map(String::as_str));
-    paths.any(|path| changed.iter().any(|changed| ident::within(path, changed)))
+/// Whether the edits `changed` make `record` stale: it, or code rustc inlined into it, lies in a changed function, or has no place in a crate with one.
+fn touched(record: &Record, changed: &Changed) -> bool {
+    std::iter::once(&record.at).chain(&record.inlined).any(|at| within(at, changed))
+}
+
+fn within(at: &At, changed: &Changed) -> bool {
+    match (&at.file, at.lo) {
+        (Some(file), Some(lo)) => changed.ranges.iter().any(|(changed, start, end)| changed == file && (*start..*end).contains(&lo)),
+        _ => changed.crates.contains(&at.krate),
+    }
 }
 
 /// Whether record `at` is a program's `main`, which only the runtime's start calls: when it runs rustc's code, every function the program runs does, so state that each std keeps apart never crosses.
 fn entry(records: &[Record], callers: &[Vec<usize>], at: usize) -> bool {
     let record = &records[at];
-    let main = record.closure.is_none() && record.args.is_empty() && record.path.rsplit(ident::SEPARATOR).next() == Some(MAIN);
+    let main = record.closure.is_none() && record.args.is_empty() && record.path.rsplit(PATH_SEPARATOR).next() == Some(MAIN);
     main && callers[at].iter().all(|&caller| records[caller].path.starts_with(START))
+}
+
+/// The reason no record binds when an instance has no key.
+fn refusal(miss: Miss) -> Decision {
+    match miss {
+        Miss::Indirect => Decision::Indirect,
+        Miss::Unnamed => Decision::Unmatched,
+    }
 }
 
 /// For each record, the records that call it by symbol.

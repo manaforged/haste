@@ -344,30 +344,24 @@ pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> 
     status
 }
 
-/// Prepares the code that the binary's `main` reaches for the prepped library, and returns what that did.
+/// Builds the prepped library of the build of `workspace`, and returns what it holds.
 pub fn prep(workspace: &graph::Workspace, targets: &Targets) -> Result<crate::prep::Counts> {
-    let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
-    let plan = prep_main(workspace, &mut compilation)?;
+    let compilation = crate::macros::load_eager(workspace, targets, &[])?;
+    let counts = crate::prep::prep(&compilation.outline, workspace);
     std::mem::forget(compilation);
-    Ok(plan.counts)
+    counts
 }
 
-fn prep_main(workspace: &graph::Workspace, compilation: &mut Compilation) -> Result<crate::prep::Plan> {
-    let (_, roots) = batch_roots(workspace, &compilation.outline, main_items);
-    crate::macros::reach_resolved(compilation, |_| roots.clone(), |mut cx, reached| crate::prep::prep(&mut cx, workspace, &reached))
-}
-
-/// Binds this process to the prepped library of the build, preparing it from what `main` reaches when the store holds none; a build that cannot bind it compiles everything.
+/// Binds this process to what of the prepped library of the build still matches the sources, and starts a prep in the background when the library is missing or older than the sources; a build that cannot bind it compiles everything.
 fn bind_prepped(workspace: &graph::Workspace, compilation: &mut Compilation, args: &[String]) {
-    let manifest = match crate::prep::load(&compilation.outline, &compilation.names, workspace) {
-        Ok(Some(manifest)) => Ok(manifest),
-        Ok(None) => prep_main(workspace, compilation).map(|plan| {
-            eprintln!("{}", plan.counts);
-            plan.manifest
-        }),
-        Err(error) => Err(error),
+    let (manifest, current) = match crate::prep::load(&compilation.outline, workspace) {
+        Ok(loaded) => loaded,
+        Err(error) => (Err(error), true),
     };
-    if let Err(error) = manifest.and_then(|manifest| crate::prep::install(manifest, args)) {
+    if !current && let Err(error) = crate::prep::refresh(&compilation.outline, workspace) {
+        eprintln!("haste: not preparing in the background: {error:#}");
+    }
+    if let Err(error) = manifest.and_then(|manifest| manifest.map_or(Ok(()), |manifest| crate::prep::install(manifest, args))) {
         eprintln!("haste: running without prepped code: {error:#}");
     }
 }

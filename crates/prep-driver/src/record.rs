@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::error::Result;
 use crate::wrap::Unit;
-use crate::{abi, uses};
+use crate::{abi, key, uses};
 
 /// The file in each unit directory that holds the unit's manifest, one JSON record per line.
 pub const MANIFEST: &str = "manifest.jsonl";
@@ -97,6 +97,8 @@ fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData
     let (abi, crossing) = abi::of(tcx, instance)?;
     Ok(json!({
         "symbol": tcx.symbol_name(instance).name,
+        "key": key::instance(tcx, instance),
+        "at": key::at(tcx, def_id),
         "crate": tcx.crate_name(def_id.krate).as_str(),
         "crate_id": crate_id(tcx, def_id),
         "kind": kind(instance.def),
@@ -122,7 +124,7 @@ fn path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     with_no_trimmed_paths!(with_resolve_crate_name!(tcx.def_path_str(def_id)))
 }
 
-fn kind(def: InstanceKind<'_>) -> String {
+pub fn kind(def: InstanceKind<'_>) -> String {
     let text = format!("{def:?}");
     let mut words = text.split(['(', ' ', ',', ')']).filter(|word| !word.is_empty());
     match (words.next(), words.next()) {
@@ -149,7 +151,7 @@ fn closure<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Value {
 }
 
 /// The place of local closure `def_id` among the closures of its typeck root in the order their expressions end, inner before outer, and how many there are; none when the root holds a coroutine, an inline constant or a closure a macro wrote.
-fn order(tcx: TyCtxt<'_>, def_id: DefId) -> Option<(usize, usize)> {
+pub fn order(tcx: TyCtxt<'_>, def_id: DefId) -> Option<(usize, usize)> {
     let local = def_id.as_local()?;
     let root = tcx.typeck_root_def_id(def_id).as_local()?;
     let mut ends = Vec::new();

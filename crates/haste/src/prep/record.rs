@@ -20,39 +20,49 @@ pub(super) struct Facts {
     pub stdout_flush: Option<String>,
 }
 
-/// One function instance in the library: its symbol, definition path, closure identity, type arguments, calling convention, the layouts it crosses with, what rustc inlined into it, what it calls, whether it touches mutable state outside the standard crates, and whether rustc's release build kept this copy.
+/// One function instance in the library: its symbol, the key that names it, where it and the functions rustc inlined into it are defined, its definition path, closure identity, type arguments, calling convention, the layouts it crosses with, what it calls, whether it touches mutable state outside the standard crates, and whether rustc's release build kept this copy.
 #[derive(Deserialize)]
 pub(super) struct Record {
     pub symbol: String,
+    pub key: Option<String>,
+    pub at: At,
     pub kind: InstanceKind,
     pub path: String,
     pub closure: Option<ClosureId>,
     pub args: Vec<String>,
     pub abi: Abi,
     pub layouts: Option<Vec<String>>,
-    pub inlined: Vec<String>,
+    pub inlined: Vec<At>,
     pub uses: Vec<String>,
     pub state: bool,
     pub release_copy: bool,
 }
 
-/// What rustc generated an instance's code from: a function's own body, a closure's by-value call shim, or another shim.
+/// Where a definition is: its crate, and its file and the byte offset of its name unless a macro expansion wrote it.
+#[derive(Deserialize)]
+pub(super) struct At {
+    #[serde(rename = "crate")]
+    pub krate: String,
+    pub file: Option<String>,
+    pub lo: Option<u32>,
+}
+
+/// What rustc generated an instance's code from: a function's own body, a closure's by-value call shim, a drop glue, or another shim.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum InstanceKind {
     Item,
     #[serde(rename = "Shim::ClosureOnce")]
     ClosureOnce,
+    #[serde(rename = "Shim::DropGlue")]
+    DropGlue,
     #[serde(other)]
     Other,
 }
 
-/// Where a closure is: its typeck root, its call trait, and its place among the root's closures in the order their expressions end, with their count.
+/// What a closure record says of its closure: the call trait it implements at most.
 #[derive(Deserialize)]
 pub(super) struct ClosureId {
-    pub root: String,
     pub kind: Option<ClosureKind>,
-    pub order: Option<usize>,
-    pub count: Option<usize>,
 }
 
 /// The call trait a closure implements at most.
@@ -80,9 +90,10 @@ pub(super) enum Conv {
     Other,
 }
 
-/// One argument or the return: its size, alignment and passing mode.
+/// One argument or the return: the key of its type, its size, alignment and passing mode.
 #[derive(Deserialize)]
 pub(super) struct Arg {
+    pub key: Option<String>,
     pub size: u64,
     pub align: u64,
     pub pass: Pass,

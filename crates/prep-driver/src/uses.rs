@@ -1,19 +1,21 @@
 use std::collections::BTreeSet;
 
+use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{Body, CastKind, Const, ConstOperand, ConstValue, Location, Rvalue, Terminator, TerminatorKind};
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths, with_resolve_crate_name};
+use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 use rustc_middle::ty::{self, EarlyBinder, Instance, InstanceKind, Ty, TyCtxt, TypeFoldable, TypingEnv, VtblEntry};
+use serde_json::Value;
 
-/// The definition paths of the functions whose MIR rustc's inliner copied into the body of `instance`.
-pub fn inlined<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<String> {
+/// Where the functions are whose MIR rustc's inliner copied into the body of `instance`.
+pub fn inlined<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<Value> {
     let body = tcx.instance_mir(instance.def);
+    let mut seen = FxHashSet::default();
     let callees = body.source_scopes.iter().filter_map(|scope| scope.inlined).map(|(callee, _)| callee.def_id());
-    let paths: BTreeSet<String> = callees.map(|def_id| with_no_trimmed_paths!(with_resolve_crate_name!(tcx.def_path_str(def_id)))).collect();
-    paths.into_iter().collect()
+    callees.filter(|def_id| seen.insert(*def_id)).map(|def_id| crate::key::at(tcx, def_id)).collect()
 }
 
 /// What the optimized body of `instance` reaches outside itself: the symbols of the instances it calls, drops, reifies or puts in a vtable, and whether it reads or writes a static outside the sysroot that is mutable, thread-local or holds interior mutability, or reaches standard library code whose state each copy of std keeps apart.

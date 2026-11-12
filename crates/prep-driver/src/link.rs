@@ -8,6 +8,7 @@ use rustc_attr_parsing::eval_config_entry;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_middle::ty::TyCtxt;
 use rustc_attr_ir::NativeLibKind;
+use rustc_crate_store::LinkagePreference;
 use serde_json::Value;
 
 use crate::elf;
@@ -35,26 +36,52 @@ pub fn sysroot(tcx: TyCtxt<'_>, cnum: CrateNum) -> bool {
     [&source.rlib, &source.dylib].into_iter().flatten().any(|path| path.starts_with(tcx.sess.opts.sysroot.path()))
 }
 
-/// Writes the sysroot libraries and native libraries that the crate being compiled links, one per line.
+/// Writes the units, sysroot libraries and native libraries that the crate being compiled links, one per line, marking each sysroot rlib whose crate no sysroot dylib holds.
 pub fn write_libraries(tcx: TyCtxt<'_>, path: &Path) -> Result<()> {
     let mut out = BufWriter::new(File::create(path)?);
+    let held = in_dylibs(tcx);
     for &cnum in tcx.crates(()) {
         let source = tcx.used_crate_source(cnum);
-        for (kind, path) in [("rlib", &source.rlib), ("dylib", &source.dylib)] {
+        let unit = source.rlib.as_ref().filter(|_| !sysroot(tcx, cnum)).and_then(|rlib| rlib.file_stem()?.to_str()?.strip_prefix(RLIB_PREFIX));
+        if let Some(unit) = unit {
+            writeln!(out, "{UNIT} {unit}")?;
+        }
+        for (kind, path) in [(RLIB, &source.rlib), (DYLIB, &source.dylib)] {
             if let Some(path) = path.as_ref().filter(|_| sysroot(tcx, cnum)) {
                 writeln!(out, "{kind} {}", path.display())?;
             }
         }
+        if let Some(path) = source.rlib.as_ref().filter(|_| sysroot(tcx, cnum) && !held.contains(&cnum)) {
+            writeln!(out, "{ALONE} {}", path.display())?;
+        }
         for lib in tcx.native_libraries(cnum) {
             let relevant = lib.cfg.as_ref().is_none_or(|cfg| eval_config_entry(tcx.sess, cfg).as_bool());
             if relevant && matches!(lib.kind, NativeLibKind::Dylib { .. } | NativeLibKind::Unspecified) {
-                writeln!(out, "lib {}", lib.name)?;
+                writeln!(out, "{NATIVE} {}", lib.name)?;
             }
         }
     }
     out.flush()?;
     Ok(())
 }
+
+/// The sysroot crates whose code a sysroot dylib holds: each such dylib's crate and the crates it links statically.
+fn in_dylibs(tcx: TyCtxt<'_>) -> HashSet<CrateNum> {
+    let mut held = HashSet::new();
+    for &cnum in tcx.crates(()).iter().filter(|&&cnum| sysroot(tcx, cnum) && tcx.used_crate_source(cnum).dylib.is_some()) {
+        held.insert(cnum);
+        let linked = tcx.dylib_dependency_formats(cnum).iter().filter(|(_, preference)| *preference == LinkagePreference::RequireStatic);
+        held.extend(linked.map(|&(dependency, _)| dependency));
+    }
+    held
+}
+
+const RLIB: &str = "rlib";
+const DYLIB: &str = "dylib";
+const ALONE: &str = "alone";
+const NATIVE: &str = "lib";
+const UNIT: &str = "unit";
+const RLIB_PREFIX: &str = "lib";
 
 const ALLOCATOR_SUFFIX: &str = "___rust_alloc";
 
@@ -67,6 +94,7 @@ struct Inputs {
     released: Vec<PathBuf>,
     rlibs: BTreeSet<String>,
     dylibs: BTreeSet<String>,
+    alone: BTreeSet<String>,
     libs: Vec<String>,
     manifests: Vec<PathBuf>,
 }
@@ -105,11 +133,18 @@ fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The inputs of the units under `root` that a linked crate of the package links, or of every unit when no crate of it links.
 fn gather(root: &Path) -> Result<Inputs> {
     let mut inputs = Inputs::default();
     let mut dirs: Vec<PathBuf> = fs::read_dir(root)?.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
     dirs.sort();
-    for dir in dirs.iter().filter(|dir| dir.join(MANIFEST).exists()) {
+    let mut linked = HashSet::new();
+    for dir in dirs.iter().filter(|dir| dir.join(LINK).exists()) {
+        let text = fs::read_to_string(dir.join(LINK))?;
+        linked.extend(text.lines().filter_map(|line| line.strip_prefix(UNIT)?.strip_prefix(' ')).map(str::to_string));
+    }
+    let wanted = |dir: &PathBuf| linked.is_empty() || dir.join(LINK).exists() || dir.file_name().and_then(|name| name.to_str()).is_some_and(|name| linked.contains(name));
+    for dir in dirs.iter().filter(|dir| dir.join(MANIFEST).exists() && wanted(dir)) {
         inputs.manifests.push(dir.join(MANIFEST));
         inputs.objects.extend(objects(dir)?);
         inputs.released.extend(objects(&dir.join(RELEASE))?);
@@ -135,13 +170,10 @@ fn objects(dir: &Path) -> Result<Vec<PathBuf>> {
 fn libraries(path: &Path, inputs: &mut Inputs) -> Result<()> {
     for line in fs::read_to_string(path)?.lines() {
         match line.split_once(' ') {
-            Some(("rlib", rlib)) => {
-                inputs.rlibs.insert(rlib.to_string());
-            }
-            Some(("dylib", dylib)) => {
-                inputs.dylibs.insert(dylib.to_string());
-            }
-            Some(("lib", lib)) if !inputs.libs.iter().any(|known| known == lib) => inputs.libs.push(lib.to_string()),
+            Some((RLIB, rlib)) => _ = inputs.rlibs.insert(rlib.to_string()),
+            Some((DYLIB, dylib)) => _ = inputs.dylibs.insert(dylib.to_string()),
+            Some((ALONE, rlib)) => _ = inputs.alone.insert(rlib.to_string()),
+            Some((NATIVE, lib)) if !inputs.libs.iter().any(|known| known == lib) => inputs.libs.push(lib.to_string()),
             _ => {}
         }
     }
@@ -164,6 +196,7 @@ fn link(inputs: &Inputs, out: &Path, std: Std) -> Result<()> {
         command.args(&inputs.dylibs);
         let dirs: BTreeSet<_> = inputs.dylibs.iter().filter_map(|dylib| Path::new(dylib).parent()).collect();
         command.args(dirs.iter().map(|dir| format!("-Wl,-rpath,{}", dir.display())));
+        command.arg("-Wl,--start-group").args(&inputs.alone).arg("-Wl,--end-group");
     } else {
         command.arg("-Wl,--start-group").args(&inputs.rlibs).arg("-Wl,--end-group");
     }
@@ -232,7 +265,8 @@ fn merge(manifests: &[PathBuf], (defined, released): (&HashSet<String>, &HashSet
         for line in BufReader::new(File::open(manifest)?).lines() {
             let mut record: Value = serde_json::from_str(&line?)?;
             let Some(symbol) = record.get("symbol").and_then(Value::as_str).map(str::to_string) else {
-                library.extend(record.get(record::LIBRARY).and_then(Value::as_object).cloned().unwrap_or_default());
+                let facts = record.get(record::LIBRARY).and_then(Value::as_object).cloned().unwrap_or_default();
+                library.extend(facts.into_iter().filter(|(_, value)| !value.is_null()));
                 continue;
             };
             if !defined.contains(&symbol) {

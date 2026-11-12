@@ -1,143 +1,78 @@
-//! Prepped code: standard library and dependency functions that rustc optimizes once into a cached library, which Haste calls through wrappers instead of compiling.
+//! Prepped code: rustc optimizes every function instance of a build once into a cached library, and Haste binds each function it reaches to that code when the instance, its convention and its layouts agree.
 
 mod bind;
 mod cargo;
-mod choose;
 mod conv;
 mod driver;
 mod edit;
 mod ident;
-mod name;
+mod key;
 mod record;
-mod select;
-mod shim;
 
-use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::hash::BuildHasher as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::OnceLock;
 
 use anyhow::{Context as _, Result, bail};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::graph::Workspace;
 use crate::host::HostSymbol;
-use crate::names::Names;
 use crate::outline::Outline;
 use crate::sema::Context;
 use crate::sema::infer::Typed;
-use crate::sema::reach::{Instance, Reached};
+use crate::sema::reach::Reached;
 use crate::sema::ty::Ty;
 
 use bind::{Bindings, Decision};
-use cargo::{Dirs, Toolchain};
+use cargo::Toolchain;
 use edit::Snapshot;
-use name::{Paths, Printer};
-use select::{Crates, Purpose};
-use shim::{Shim, Wrapper};
 
-const ABI_VERSION: u32 = 1;
+pub use bind::Tally;
+
+/// What a prep made: the records of the library it built.
+#[derive(Clone, Copy, Debug)]
+pub struct Counts {
+    pub records: usize,
+}
+
+impl std::fmt::Display for Counts {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "prep rustc {} records", self.records)
+    }
+}
+
+const ABI_VERSION: u32 = 2;
 const SUPPORTED: bool = cfg!(all(target_arch = "x86_64", target_os = "linux"));
 const STORE: &str = "prep";
-const TARGET: &str = "target";
-const MANIFEST: &str = "manifest";
-const HEADER: &str = "haste-prep";
-const LIBRARY: &str = "library";
-const ENTRY: &str = "entry";
-const DROPPED: &str = "dropped";
-const FIELD: char = '\t';
 const RUSTC: &str = "rustc";
+const LOCK: &str = "rustc.lock";
+const PREP_ARGS: [&str; 2] = ["--release", "prep"];
 
-/// The prepped library of one build, the wrapper of each function it holds, and what binding a reached function to one needs.
+/// The driver's library of one build and what binding a reached function to it needs.
 pub struct Manifest {
-    stored: Stored,
-    paths: Paths,
-    crates: Crates,
-    rustc: Option<Bindings>,
-}
-
-/// What `haste prep` keeps on disk for one key: the library, each wrapper by its function's text, the texts rustc rejected, and the names of the functions it wraps, which a lookup checks before it prints a callee.
-struct Stored {
-    library: PathBuf,
-    entries: HashMap<String, Entry>,
-    dropped: BTreeSet<String>,
-    names: HashSet<String>,
-}
-
-struct Entry {
-    symbol: String,
-    layout: u64,
-}
-
-/// What a build runs: the reached functions bound to the address of a prepped wrapper, those Haste still compiles, and what preparing them did.
-pub struct Plan {
-    pub manifest: Manifest,
-    pub prepped: Vec<(usize, usize)>,
-    pub compiled: Vec<usize>,
-    pub counts: Counts,
-}
-
-/// What `prep` did: the functions it selected, the wrappers it built and those it found stored, and the selected functions rustc rejected.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Counts {
-    pub selected: usize,
-    pub built: usize,
-    pub reused: usize,
-    pub dropped: usize,
-    pub rustc: Option<bind::Tally>,
+    rustc: Bindings,
 }
 
 static BOUND: OnceLock<Manifest> = OnceLock::new();
 
-impl std::fmt::Display for Counts {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(out, "prep {} selected, {} built, {} dropped, {} reused", self.selected, self.built, self.dropped, self.reused)?;
-        match &self.rustc {
-            Some(tally) => write!(out, "; {tally}"),
-            None => Ok(()),
-        }
-    }
-}
-
-/// Selects the reached functions whose whole call tree rustc may compile, builds their wrappers unless the store holds them for the same key and layouts, opens the library, and plans which functions Haste still compiles.
-pub fn prep(cx: &mut Context<'_>, workspace: &Workspace, reached: &Reached) -> Result<Plan> {
+/// Builds the workspace's member package with the prep driver into the store, beside a snapshot of the sources of `outline`, and says what the library holds.
+pub fn prep(outline: &Outline, workspace: &Workspace) -> Result<Counts> {
     if !SUPPORTED {
         bail!("prep supports x86-64 Linux only");
     }
     let toolchain = Toolchain::find()?;
-    let key = key(cx.outline, workspace, &toolchain)?;
-    let (crates, paths) = (Crates::new(cx.outline, workspace), Paths::new(cx.outline, cx.names, workspace));
-    let entries = entries(reached);
-    let (wrappers, krates) = choose::choose(cx, (&crates, &paths), reached, &entries)?;
-    let chosen: Vec<(usize, String, u64)> = wrappers.iter().map(|wrapper| (wrapper.index, wrapper.key.clone(), wrapper.layout)).collect();
-    let dir = dir(key);
-    let (stored, made) = match Stored::read(&dir)? {
-        Some(kept) if kept.covers(&chosen) => (kept, false),
-        _ => (make(cx, workspace, (&toolchain, key, &dir), (wrappers, &krates))?, true),
-    };
-    let mut counts = stored.counts(&chosen, made);
-    let rustc = rustc(cx.outline, workspace, (&toolchain, key))?;
-    if let Some(rustc) = &rustc {
-        rustc.open()?;
-        counts.rustc = Some(rustc.tally(cx, reached));
-    }
-    let manifest = Manifest { stored, paths, crates, rustc };
-    manifest.open()?;
-    let bound: HashMap<usize, usize> = chosen.iter().filter_map(|(at, key, _)| Some((*at, manifest.symbol(key)?))).collect();
-    let (compiled, stopped) = select::visit(reached, &entries, |at| bound.contains_key(&at));
-    let prepped = stopped.into_iter().filter_map(|at| Some((at, *bound.get(&at)?))).collect();
-    Ok(Plan { manifest, prepped, compiled, counts })
+    let key = key(outline, workspace, &toolchain)?;
+    let rustc = rustc(outline, workspace, (&toolchain, key))?.context("the prep driver's library does not match the sources")?;
+    Ok(Counts { records: rustc.len() })
 }
 
-/// Opens `manifest`, gives the shared standard library of its rustc library the program arguments `args`, and makes it the one every later binding of this process reads.
+/// Opens `manifest`, gives the shared standard library of its library the program arguments `args`, and makes it the one every later binding of this process reads.
 pub fn install(manifest: Manifest, args: &[String]) -> Result<()> {
-    manifest.open()?;
-    if let Some(rustc) = &manifest.rustc {
-        rustc.open()?;
-        rustc.start(args)?;
-    }
+    manifest.rustc.open()?;
+    manifest.rustc.start(args)?;
     if BOUND.set(manifest).is_err() {
         bail!("a prepped library is already bound");
     }
@@ -151,43 +86,75 @@ fn exported(name: &str) -> Option<usize> {
 
 /// Flushes what rustc's code of the bound library wrote to standard output, once the program's `main` has returned.
 pub fn finish() {
-    if let Some(rustc) = BOUND.get().and_then(|manifest| manifest.rustc.as_ref()) {
-        rustc.finish();
+    if let Some(manifest) = BOUND.get() {
+        manifest.rustc.finish();
     }
 }
 
-/// The address of the prepped wrapper that runs reached function `at`, when a manifest is installed and holds it.
+/// What binding decided for each function this process compiled or bound, when a manifest is installed.
+pub fn decided() -> Option<Tally> {
+    BOUND.get().map(|manifest| manifest.rustc.decided())
+}
+
+/// The address of rustc's code for reached function `at`, when a manifest is installed and may bind it.
 pub fn bind(cx: &mut Context<'_>, reached: &Reached, at: usize) -> Option<usize> {
     let manifest = BOUND.get()?;
     let (instance, Ok(typed)) = &reached.list[at] else { return None };
-    manifest.address(cx, *instance, typed)
+    match manifest.rustc.decide(cx, *instance, typed) {
+        Decision::Bound(address) => Some(address),
+        _ => None,
+    }
 }
 
-/// The manifest that `prep` stored for the build of `workspace` with the resolved `names`, when one matches its key.
-pub fn load(outline: &Outline, names: &Names, workspace: &Workspace) -> Result<Option<Manifest>> {
+/// The manifest that `prep` stored for the build of `workspace` when one matches its key and the sources outside functions, or why it cannot be read, and whether it was built from the sources as they are now.
+pub fn load(outline: &Outline, workspace: &Workspace) -> Result<(Result<Option<Manifest>>, bool)> {
     if !SUPPORTED {
-        return Ok(None);
+        return Ok((Ok(None), true));
     }
     let toolchain = Toolchain::find()?;
     let key = key(outline, workspace, &toolchain)?;
-    let Some(stored) = Stored::read(&dir(key))? else { return Ok(None) };
-    let Some(rustc) = Bindings::read(&dir(key).join(RUSTC), &Snapshot::take(outline, workspace), facts(outline, workspace))? else { return Ok(None) };
-    Ok(Some(Manifest { stored, paths: Paths::new(outline, names, workspace), crates: Crates::new(outline, workspace), rustc: Some(rustc) }))
+    let rustc = Bindings::read(&dir(key).join(RUSTC), &Snapshot::take(outline, workspace), (outline, workspace));
+    let current = rustc.as_ref().is_ok_and(|rustc| rustc.as_ref().is_some_and(Bindings::current));
+    Ok((rustc.map(|rustc| rustc.map(|rustc| Manifest { rustc })), current))
 }
 
-/// Builds the workspace's member package with the prep driver into the store under `key`, beside a snapshot of its sources, and reads what binding to it allows now.
+/// Builds the workspace's member package with the prep driver into the store under `key`, beside a snapshot of its sources, while no other prep of the key runs, and reads what binding to it allows now; a library built while a local source changed is dropped.
 fn rustc(outline: &Outline, workspace: &Workspace, (toolchain, key): (&Toolchain, u64)) -> Result<Option<Bindings>> {
+    std::fs::create_dir_all(dir(key))?;
+    let _lock = lock(&dir(key), true)?;
     let out = dir(key).join(RUSTC);
     let before = Snapshot::take(outline, workspace);
-    driver::run(toolchain, &store(), &root(workspace)?, &out)?;
-    before.write(&out.join(bind::SNAPSHOT))?;
-    Bindings::read(&out, &before, facts(outline, workspace))
+    let fresh = driver::run(toolchain, &store(), &root(workspace)?, &out)?;
+    if !edit::settled(outline, workspace)? {
+        std::fs::remove_dir_all(&fresh)?;
+        bail!("a local source changed while the prep driver ran");
+    }
+    before.write(&fresh.join(bind::SNAPSHOT))?;
+    driver::publish(&fresh, &out)?;
+    Bindings::read(&out, &before, (outline, workspace))
 }
 
-/// Which crates of `outline` are standard crates, and the facts selection reads about them.
-fn facts(outline: &Outline, workspace: &Workspace) -> (Vec<bool>, Crates) {
-    let sysroot = (0..outline.roots.len()).map(|krate| outline.package(workspace, krate).sysroot).collect();
-    (sysroot, Crates::new(outline, workspace))
+/// Starts `haste --release prep` on the build's member package in the background, unless a prep of the build runs now; it never waits for it.
+pub fn refresh(outline: &Outline, workspace: &Workspace) -> Result<()> {
+    let dir = dir(key(outline, workspace, &Toolchain::find()?)?);
+    std::fs::create_dir_all(&dir)?;
+    if lock(&dir, false)?.is_none() {
+        return Ok(());
+    }
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.args(PREP_ARGS).arg(root(workspace)?).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command.spawn().context("starting a background prep")?;
+    Ok(())
+}
+
+/// The lock that one prep of the build in `dir` holds while it runs, waiting for it when `wait` is set, or none when another process holds it and `wait` is not set.
+fn lock(dir: &Path, wait: bool) -> Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(LOCK))?;
+    let mode = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
+    // SAFETY: the descriptor belongs to `file`, which lives across the call; flock only changes the lock the open file holds.
+    let held = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), mode) } == 0;
+    Ok(held.then_some(file))
 }
 
 /// Loads the library at `path` into this process with its symbols global, so the dynamic linker finds every symbol it exports.
@@ -205,45 +172,15 @@ fn open(path: &Path) -> Result<()> {
     bail!("loading {}: {reason}", path.display())
 }
 
-/// The reached functions that no reached function calls, where a build's calls start.
-fn entries(reached: &Reached) -> Vec<usize> {
-    let callers = select::callers(reached);
-    (0..reached.list.len()).filter(|&at| callers[at].is_empty()).collect()
-}
-
-fn candidate(cx: &mut Context<'_>, (printer, crates): (&mut Printer<'_>, &Crates), reached: &Reached, at: usize) -> Result<Option<Wrapper>> {
-    let Ok(typed) = &reached.list[at].1 else { return Ok(None) };
-    let (params, ret) = signature(typed);
-    let Some(callee) = printer.callee(cx, reached.list[at].0) else { return Ok(None) };
-    let Some(layout) = crossing(cx, crates, &params, ret) else { return Ok(None) };
-    Wrapper::new(cx, printer, (at, callee, layout), (&params, ret))
-}
-
 fn signature(typed: &Typed) -> (Vec<Ty>, Option<Ty>) {
     (typed.params.iter().map(|&local| typed.locals[local as usize].ty).collect(), typed.ret)
 }
 
-fn crossing(cx: &mut Context<'_>, crates: &Crates, params: &[Ty], ret: Option<Ty>) -> Option<u64> {
-    let mut types = params.to_vec();
-    types.extend(ret);
-    select::walk(cx, crates, &types, Purpose::Crossing)
-}
-
-fn make(cx: &Context<'_>, workspace: &Workspace, (toolchain, key, dir): (&Toolchain, u64, &Path), (wrappers, krates): (Vec<Wrapper>, &BTreeSet<u32>)) -> Result<Stored> {
-    let mut shim = Shim::new(cx, workspace, key, wrappers, krates);
-    let top = crate::graph::workspace_root(&root(workspace)?)?;
-    let target = store().join(TARGET);
-    let library = cargo::build(toolchain, &Dirs { shim: dir, target: &target, workspace: &top }, &mut shim)?;
-    let stored = Stored::built(library, &shim);
-    stored.write(dir)?;
-    Ok(stored)
-}
-
-/// The key of everything prepped code depends on besides the functions it holds: the wrapper format, the toolchain, the target, the dependency graph and the workspace.
+/// The key of everything prepped code depends on besides the local sources: the manifest format, the driver, the toolchain, the target, the dependency graph and the workspace.
 fn key(outline: &Outline, workspace: &Workspace, toolchain: &Toolchain) -> Result<u64> {
     let root = root(workspace)?;
     let triple = crate::graph::cfg::Target::host().triple;
-    let format = (ABI_VERSION, shim::PRELUDE, cargo::SETTINGS, crate::profile());
+    let format = (ABI_VERSION, driver::sources(), cargo::SETTINGS, crate::profile());
     Ok(rustc_hash::FxBuildHasher.hash_one((format, &toolchain.version, &toolchain.library, triple, &outline.pins, root)))
 }
 
@@ -258,106 +195,4 @@ fn store() -> PathBuf {
 
 fn dir(key: u64) -> PathBuf {
     store().join(format!("{key:016x}"))
-}
-
-impl Stored {
-    fn built(library: PathBuf, shim: &Shim) -> Stored {
-        let mut stored = Stored { library, entries: HashMap::default(), dropped: BTreeSet::new(), names: HashSet::default() };
-        for (at, wrapper) in shim.wrappers.iter().enumerate() {
-            if shim.dropped[at] {
-                stored.dropped.insert(wrapper.key.clone());
-            } else {
-                stored.hold(wrapper.key.clone(), Entry { symbol: shim.symbol(at), layout: wrapper.layout });
-            }
-        }
-        stored
-    }
-
-    fn hold(&mut self, key: String, entry: Entry) {
-        self.names.insert(name::function(&key).to_owned());
-        self.entries.insert(key, entry);
-    }
-
-    fn counts(&self, chosen: &[(usize, String, u64)], made: bool) -> Counts {
-        let dropped = chosen.iter().filter(|(_, key, _)| self.dropped.contains(key)).count();
-        let held = chosen.len() - dropped;
-        Counts { selected: chosen.len(), built: if made { held } else { 0 }, reused: if made { 0 } else { held }, dropped, rustc: None }
-    }
-
-    fn covers(&self, chosen: &[(usize, String, u64)]) -> bool {
-        chosen.iter().all(|(_, key, layout)| self.dropped.contains(key) || self.entries.get(key).is_some_and(|entry| entry.layout == *layout))
-    }
-
-    fn write(&self, dir: &Path) -> Result<()> {
-        let mut text = format!("{HEADER} {ABI_VERSION}\n{LIBRARY} {}\n", self.library.display());
-        let mut entries: Vec<(&String, &Entry)> = self.entries.iter().collect();
-        entries.sort_by(|left, right| left.0.cmp(right.0));
-        for (key, entry) in entries {
-            text.push_str(&format!("{ENTRY} {}{FIELD}{:016x}{FIELD}{key}\n", entry.symbol, entry.layout));
-        }
-        for key in &self.dropped {
-            text.push_str(&format!("{DROPPED} {key}\n"));
-        }
-        crate::graph::store::write_new(&dir.join(MANIFEST), &text).with_context(|| format!("writing the prep manifest in {}", dir.display()))
-    }
-
-    fn read(dir: &Path) -> Result<Option<Stored>> {
-        let text = match std::fs::read_to_string(dir.join(MANIFEST)) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).with_context(|| format!("reading the prep manifest in {}", dir.display())),
-        };
-        Ok(Stored::parse(&text))
-    }
-
-    fn parse(text: &str) -> Option<Stored> {
-        let mut lines = text.lines();
-        (lines.next()? == format!("{HEADER} {ABI_VERSION}")).then_some(())?;
-        let library = PathBuf::from(lines.next()?.strip_prefix(LIBRARY)?.trim_start());
-        let mut stored = Stored { library, entries: HashMap::default(), dropped: BTreeSet::new(), names: HashSet::default() };
-        for line in lines {
-            let (word, rest) = line.split_once(' ')?;
-            match word {
-                ENTRY => {
-                    let mut fields = rest.splitn(3, FIELD);
-                    let (symbol, layout, key) = (fields.next()?, fields.next()?, fields.next()?);
-                    stored.hold(key.to_owned(), Entry { symbol: symbol.to_owned(), layout: u64::from_str_radix(layout, 16).ok()? });
-                }
-                DROPPED => _ = stored.dropped.insert(rest.to_owned()),
-                _ => return None,
-            }
-        }
-        Some(stored)
-    }
-}
-
-impl Manifest {
-    /// The prepped library this manifest names.
-    pub fn library(&self) -> &Path {
-        &self.stored.library
-    }
-
-    /// Loads the wrapper library into this process with its symbols global, so the dynamic linker finds every wrapper.
-    pub fn open(&self) -> Result<()> {
-        open(&self.stored.library)
-    }
-
-    fn symbol(&self, key: &str) -> Option<usize> {
-        exported(&self.stored.entries.get(key)?.symbol)
-    }
-
-    /// The address of rustc's code for `instance` with body `typed`: its own copy in the driver's library when one may bind, else the wrapper this manifest holds at the layouts Haste computes now.
-    pub fn address(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Option<usize> {
-        if let Some(Decision::Bound(address)) = self.rustc.as_ref().map(|rustc| rustc.decide(cx, instance, typed)) {
-            return Some(address);
-        }
-        if !self.stored.names.contains(cx.name(instance.0)) {
-            return None;
-        }
-        let callee = Printer::new(&self.paths).callee(cx, instance)?;
-        let entry = self.stored.entries.get(&callee.key)?;
-        let (params, ret) = signature(typed);
-        (crossing(cx, &self.crates, &params, ret)? == entry.layout).then_some(())?;
-        self.symbol(&callee.key)
-    }
 }
