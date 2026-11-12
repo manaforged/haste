@@ -61,8 +61,24 @@ impl<'a> Infer<'_, 'a> {
             return self.picked(expr, (pick, 0), params, expected);
         }
         let count = self.body.list(params.1).len();
-        let probed = self.probe_steps((expr, found), (name, count), &steps, expected)?;
+        let origin = self.receiver_origin(receiver);
+        let outer = std::mem::replace(&mut self.receiver_param, origin);
+        let probed = self.probe_steps((expr, found), (name, count), &steps, expected);
+        self.receiver_param = outer;
+        let probed = probed?;
         self.finish_method_call((expr, found), (name, at), &steps, probed, params, expected)
+    }
+
+    /// The type parameter that the receiver `receiver` was declared as when it names a parameter of the function, as `key` in `fn header<K>(key: K)`.
+    fn receiver_origin(&self, receiver: ExprId) -> Option<&'a str> {
+        match *self.body.expr(receiver) {
+            crate::body::Expr::Paren(inner) => self.receiver_origin(inner),
+            crate::body::Expr::Path(_) => match self.out.res.get(&receiver) {
+                Some(super::Res::Local(local)) => self.param_origins.iter().find(|(at, _)| at == local).map(|&(_, name)| name),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn finish_method_call(&mut self, (expr, found): (ExprId, Ty), (name, at): (&str, u32), steps: &[Ty], probed: Option<(Pick, u32)>, params: (Option<List>, List), expected: Option<Ty>) -> Result<Ty> {

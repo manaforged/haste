@@ -43,14 +43,11 @@ pub(super) fn identity(outline: &Outline, item: ItemRef) -> Option<String> {
     if let Some(parent) = holder {
         (file.items.items.get(parent as usize)?.kind == ItemKind::Mod).then_some(())?;
     }
-    let mut at = krate.modules.iter().position(|module| module.file == item.file as usize && module.item == holder)?;
-    while let Some(parent) = krate.modules[at].parent {
-        segments.push(krate.modules[at].name.clone());
-        at = parent;
-    }
-    segments.push(outline.roots[item.krate as usize].name.replace('-', "_"));
-    segments.reverse();
-    Some(segments.join(SEPARATOR))
+    let at = krate.modules.iter().position(|module| module.file == item.file as usize && module.item == holder)?;
+    let mut path = vec![outline.roots[item.krate as usize].name.replace('-', "_")];
+    path.extend(super::key::module_path(krate, at));
+    path.extend(segments.into_iter().rev());
+    Some(path.join(SEPARATOR))
 }
 
 /// The closure that closure type `ty` is, when its root holds no coroutine or inline constant.

@@ -43,6 +43,7 @@ impl Infer<'_, '_> {
         match self.cx.lang(of) {
             Some("clone") => compiler_clone(self.cx, self.resolve(ty)),
             Some("future_trait") => self.coroutine_output(ty).is_some(),
+            Some("fn_ptr_trait") => matches!(self.cx.types.kind(self.resolve(ty)), Kind::FnPtr(..)),
             _ => false,
         }
     }

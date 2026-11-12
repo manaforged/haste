@@ -193,7 +193,7 @@ impl Statics {
 }
 
 /// Each function, static and type definition of crate `krate` that a key names, by its key.
-fn crate_defs(cx: &Context<'_>, keys: &Keys, krate: usize) -> HashMap<String, ItemRef> {
+fn crate_defs(cx: &mut Context<'_>, keys: &Keys, krate: usize) -> HashMap<String, ItemRef> {
     let mut defs = HashMap::default();
     for (file, tree) in cx.outline.crates[krate].files.iter().enumerate() {
         for (at, entry) in tree.items.items.iter().enumerate() {

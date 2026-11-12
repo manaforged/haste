@@ -212,11 +212,22 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// Writes the outer attributes that open the expression fragment `from..to` of the input, so that they stay outside the parentheses grouping it, and gives where the expression starts.
+    fn outer_attrs(&mut self, mut from: u32, to: u32) -> u32 {
+        let start = from;
+        while from + 1 < to && self.input.kind(from) == TokenKind::Pound && self.input.kind(from + 1) == TokenKind::OpenBracket {
+            from = self.input.pair(from + 1) + 1;
+        }
+        self.out.copy_range(self.input, start, from);
+        from
+    }
+
     fn var(&mut self, name: u32, slot: Option<u32>, rounds: &[usize]) -> Result<()> {
         match lookup(&self.slots, slot, rounds) {
             Some(&Bind::One(from, to, frag)) => {
-                let grouped = frag == Frag::Expr && fragment::tree(self.input, from) != to;
                 let start = self.out.len();
+                let from = if frag == Frag::Expr { self.outer_attrs(from, to) } else { from };
+                let grouped = frag == Frag::Expr && fragment::tree(self.input, from) != to;
                 if grouped {
                     self.out.lexed("(");
                 }

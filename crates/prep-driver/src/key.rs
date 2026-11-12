@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{self, GenericArgKind, GenericArgsRef, Instance, InstanceKind, Ty, TyCtxt};
 use rustc_span::Span;
@@ -127,11 +128,57 @@ fn closure<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, closure_args: GenericArgsRef<
     Some(form::closure(&def(tcx, root)?, order, &args(tcx, &parent)?))
 }
 
-/// The key of definition `def_id`: its crate, file, the byte offset of its name and the name, for a named definition outside any macro expansion.
+/// The key of definition `def_id`: its crate, file, the byte offset of its name and the name, for a named definition outside any macro expansion; else, when a macro wrote its name, `written`'s.
 pub fn def(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
-    let (file, lo) = place(tcx, tcx.def_ident_span(def_id)?)?;
+    let ident = tcx.def_ident_span(def_id)?;
     let krate = crate::source::crate_key(tcx.crate_name(def_id.krate).as_str(), crate::link::sysroot(tcx, def_id.krate));
-    Some(format!("{krate}:{file}:{lo}:{}", tcx.item_name(def_id)))
+    match place(tcx, ident) {
+        Some((file, lo)) => Some(format!("{krate}:{file}:{lo}:{}", tcx.item_name(def_id))),
+        None if ident.from_expansion() => written(tcx, def_id, &krate),
+        None => None,
+    }
+}
+
+/// The key of definition `def_id` of crate `krate` whose name a macro wrote, when name resolution does not keep that name apart by hygiene: by the module path for one a module holds, or by the trait and self type of the impl that holds it.
+fn written(tcx: TyCtxt<'_>, def_id: DefId, krate: &str) -> Option<String> {
+    plain_name(tcx, def_id).then_some(())?;
+    let parent = tcx.opt_parent(def_id)?;
+    let name = tcx.item_name(def_id);
+    match tcx.def_kind(parent) {
+        DefKind::Mod => Some(form::in_module(krate, &modules(tcx, parent)?, name.as_str())),
+        DefKind::Impl { .. } => member(tcx, parent, krate, name.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether the name of `def_id` resolves as a plain name, which no macro hygiene keeps apart from others of its module.
+fn plain_name(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    tcx.def_ident_span(def_id).is_some_and(|span| span.ctxt().normalize_to_macros_2_0().is_root())
+}
+
+/// The names of module `module` and its parents below the crate root, outermost first, when every one of them is a module with a plain name.
+fn modules(tcx: TyCtxt<'_>, mut module: DefId) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    while let Some(parent) = tcx.opt_parent(module) {
+        (tcx.def_kind(parent) == DefKind::Mod && plain_name(tcx, module)).then_some(())?;
+        names.push(tcx.item_name(module).to_string());
+        module = parent;
+    }
+    names.reverse();
+    Some(names)
+}
+
+/// The key of member `name` of impl `block` of crate `krate`, by the key of the trait it implements with that trait's arguments and the key of its self type.
+fn member(tcx: TyCtxt<'_>, block: DefId, krate: &str, name: &str) -> Option<String> {
+    let self_ty = ty(tcx, tcx.type_of(block).instantiate_identity().skip_normalization())?;
+    let of = match tcx.impl_opt_trait_ref(block) {
+        Some(trait_ref) => {
+            let trait_ref = trait_ref.instantiate_identity().skip_normalization();
+            Some(form::named(&def(tcx, trait_ref.def_id)?, &args(tcx, trait_ref.args.get(1..)?)?))
+        }
+        None => None,
+    };
+    form::member(krate, of.as_deref(), &self_ty, name)
 }
 
 fn place(tcx: TyCtxt<'_>, span: Span) -> Option<(String, u32)> {

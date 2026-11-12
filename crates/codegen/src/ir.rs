@@ -181,6 +181,30 @@ pub enum ByteCC {
     SignedGreaterThan,
 }
 
+/// An x64 instruction on two 128-bit vectors that computes in place into the first.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum VectorOp {
+    ByteShuffle,
+    AddBytes,
+    AddWords,
+    AddDwords,
+    AddQwords,
+    SubBytes,
+    SubWords,
+    SubDwords,
+    SubQwords,
+    Sha1NextE,
+    Sha1Msg1,
+    Sha1Msg2,
+    Sha256Msg1,
+    Sha256Msg2,
+    AesEnc,
+    AesEncLast,
+    AesDec,
+    AesDecLast,
+}
+
 /// A floating-point comparison; every one but `NotEqual` is false when an operand is NaN.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
@@ -291,6 +315,10 @@ pub(crate) enum Op {
     Splat(Value),
     /// The 32-bit integer whose bit `i` is the top bit of byte `i` of the vector, for `i` below 16, and whose other bits are zero.
     Movemask(Value),
+    /// The x64 vector instruction on two vectors.
+    Vector(VectorOp, Value, Value),
+    /// Two SHA-256 rounds (`sha256rnds2`) on the state vectors in the first two values with the message and constants in the third.
+    Sha256Rounds(Value, Value, Value),
     Select(Value, Value, Value),
     Load(Value, i32),
     Store(Value, Value, i32),
@@ -353,11 +381,11 @@ impl Op {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
             Op::Unary(_, x) | Op::Convert(_, x) | Op::Splat(x) | Op::Movemask(x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
-            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::ByteCmp(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
+            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::ByteCmp(_, x, y) | Op::Vector(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
                 f(*x);
                 f(*y);
             }
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::Sha256Rounds(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
                 f(*c);
                 f(*x);
                 f(*y);
@@ -386,6 +414,7 @@ impl Op {
             | Op::Fits(_, _, x, y)
             | Op::Fcmp(_, x, y)
             | Op::ByteCmp(_, x, y)
+            | Op::Vector(_, x, y)
             | Op::Store(x, y, _)
             | Op::AtomicStore(x, y)
             | Op::AtomicRmw(_, x, y)
@@ -393,7 +422,7 @@ impl Op {
                 *x = f(*x);
                 *y = f(*y);
             }
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::Sha256Rounds(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
                 *c = f(*c);
                 *x = f(*x);
                 *y = f(*y);

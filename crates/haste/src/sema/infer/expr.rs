@@ -41,6 +41,7 @@ impl Infer<'_, '_> {
         let target = self.lower_ty(self.body, ty)?;
         let hint = matches!(self.cx.types.kind(self.resolve(target)), Kind::FnPtr(..)).then_some(target);
         let found = self.expr(inner, hint)?;
+        self.note_cast_pointee(found, target);
         let address = matches!(self.cx.types.kind(self.resolve(target)), Kind::Ptr(..) | Kind::Prim(Primitive::Usize | Primitive::Isize));
         let coercion = match self.cx.types.kind(self.resolve(found)).clone() {
             Kind::FnDef(item, substs) if address => Some(super::coerce::Coercion::Reify(Res::Fn(item, substs))),
@@ -50,6 +51,26 @@ impl Infer<'_, '_> {
             self.out.coercions.insert(inner, coercion);
         }
         Ok(target)
+    }
+
+    /// Notes a cast to `*const _` or `*mut _` from the reference or pointer `found`, whose open pointee takes the pointee of `found` when nothing else fixes it, as the coercion to a raw pointer gives it.
+    fn note_cast_pointee(&mut self, found: Ty, target: Ty) {
+        let Kind::Ptr(_, open) = *self.cx.types.kind(self.resolve(target)) else { return };
+        if let Kind::Var(_) = self.cx.types.kind(self.resolve(open))
+            && let Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) = *self.cx.types.kind(self.resolve(found))
+        {
+            self.casts.push((open, pointee));
+        }
+    }
+
+    /// Gives each cast pointee that is still open the pointee of the value cast.
+    pub(super) fn settle_casts(&mut self) -> Result<()> {
+        for (open, pointee) in std::mem::take(&mut self.casts) {
+            if matches!(self.cx.types.kind(self.resolve(open)), Kind::Var(_)) {
+                self.unify(open, pointee)?;
+            }
+        }
+        Ok(())
     }
 
     fn tuple(&mut self, list: List, expected: Option<Ty>) -> Result<Ty> {
@@ -173,7 +194,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn is_float(&self, ty: Ty) -> bool {
+    pub(super) fn is_float(&self, ty: Ty) -> bool {
         match self.cx.types.kind(self.resolve(ty)) {
             Kind::FloatVar(_) => true,
             Kind::Prim(primitive) => float_bits(*primitive).is_some(),
@@ -240,7 +261,7 @@ impl Infer<'_, '_> {
     }
 
     /// The right operand type of the operator trait `of` when one impl of it applies to the ADT `left`.
-    fn only_right(&mut self, of: ItemRef, left: Ty) -> Option<Ty> {
+    pub(super) fn only_right(&mut self, of: ItemRef, left: Ty) -> Option<Ty> {
         let left = self.resolve(left);
         if matches!(self.cx.types.kind(left), Kind::Param(_) | Kind::Proj(_)) {
             return self.poly_only_right(of, left);
@@ -300,12 +321,16 @@ impl Infer<'_, '_> {
             let mut at = 0;
             while at < self.operands.len() {
                 let (expr, op, operands, out) = self.operands[at];
-                if self.pending(op, operands)? {
+                let compound = matches!(self.body.expr(expr), Expr::AssignOp(..));
+                if if compound { self.unknown_left(operands.0) } else { self.pending(op, operands)? } {
                     at += 1;
                     continue;
                 }
                 self.operands.swap_remove(at);
-                let found = self.operator_type(expr, op, operands)?;
+                let found = match *self.body.expr(expr) {
+                    Expr::AssignOp(_, _, rhs) => self.compound(expr, op, (operands.0, rhs, operands.1)).map(|()| out)?,
+                    _ => self.operator_type(expr, op, operands)?,
+                };
                 self.unify(found, out)?;
             }
             if self.operands.is_empty() || self.operands.len() == before {
@@ -322,12 +347,7 @@ impl Infer<'_, '_> {
 
     /// Whether operator `op` on `left` and `right` must wait to pick its impl: the left operand is a variable or a reference to one, or several impls fit only because the right operand is an untyped number.
     fn pending(&mut self, op: BinOp, (left, right): (Ty, Ty)) -> Result<bool> {
-        let unknown_left = match self.cx.types.kind(self.resolve(left)) {
-            Kind::Var(_) => true,
-            Kind::Ref(_, inner) => matches!(self.cx.types.kind(self.resolve(*inner)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)),
-            _ => false,
-        };
-        if unknown_left {
+        if self.unknown_left(left) {
             return Ok(true);
         }
         if self.builtin_left(op, left) || !matches!(self.cx.types.kind(self.resolve(right)), Kind::IntVar(_) | Kind::FloatVar(_)) {
@@ -336,6 +356,15 @@ impl Infer<'_, '_> {
         let Some((lang, _)) = operator_trait(op) else { return Ok(false) };
         let Some(of) = self.cx.lang_item(lang) else { return Ok(false) };
         Ok(!self.probe(|infer| infer.select_or_assume(of, left, &[right]).unwrap_or(false)))
+    }
+
+    /// Whether the left operand `left` is a variable or a reference to one, so no operator impl can be picked for it yet.
+    fn unknown_left(&self, left: Ty) -> bool {
+        match self.cx.types.kind(self.resolve(left)) {
+            Kind::Var(_) => true,
+            Kind::Ref(_, inner) => matches!(self.cx.types.kind(self.resolve(*inner)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)),
+            _ => false,
+        }
     }
 
     fn overloaded(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
@@ -349,7 +378,7 @@ impl Infer<'_, '_> {
     }
 
     /// The trait with lang item `lang` and its method `name`, when an impl of that trait applies to `left` with the trait arguments `args`.
-    fn operator_impl(&mut self, (lang, name): (&str, &str), left: Ty, args: &[Ty]) -> Result<Option<(ItemRef, ItemRef)>> {
+    pub(super) fn operator_impl(&mut self, (lang, name): (&str, &str), left: Ty, args: &[Ty]) -> Result<Option<(ItemRef, ItemRef)>> {
         let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
         Ok(self.select_or_prove(of, left, args)?.then_some((of, method)))
@@ -376,55 +405,6 @@ impl Infer<'_, '_> {
     fn is_scalar(&self, ty: Ty) -> bool {
         let scalar = matches!(self.cx.types.kind(self.resolve(ty)), Kind::Prim(Primitive::Bool | Primitive::Char));
         scalar || self.is_int(ty) || self.is_float(ty)
-    }
-
-    fn assign(&mut self, expr: ExprId, (lhs, rhs): (ExprId, ExprId), op: Option<BinOp>) -> Result<Ty> {
-        let place = self.expr(lhs, None)?;
-        self.note_mut(lhs)?;
-        match op {
-            Some(bin) if !self.builtin_compound(bin, place) => self.overloaded_assign(expr, bin, (place, rhs))?,
-            Some(BinOp::Shl | BinOp::Shr) => drop(self.expr(rhs, None)?),
-            Some(bin) => {
-                let value = self.expr(rhs, Some(place))?;
-                match self.cx.types.kind(self.resolve(value)) {
-                    Kind::Ref(..) | Kind::Adt(..) => self.assign_impl(expr, bin, (place, value))?,
-                    _ => self.coerce_expr(rhs, value, place)?,
-                }
-            }
-            None => {
-                let value = self.expr(rhs, Some(place))?;
-                self.coerce_expr(rhs, value, place)?;
-            }
-        }
-        Ok(self.cx.types.unit())
-    }
-
-    /// Types `place op= rhs` through the operator's assign trait, coercing `rhs` to the right operand type when one impl fixes it, as rustc does.
-    fn overloaded_assign(&mut self, expr: ExprId, op: BinOp, (place, rhs): (Ty, ExprId)) -> Result<()> {
-        let (lang, _) = assign_trait(op)?;
-        let right = self.cx.lang_item(&lang).and_then(|of| self.only_right(of, place));
-        let found = self.expr(rhs, right)?;
-        let value = match right {
-            Some(want) => self.coerce_expr(rhs, found, want).map(|()| want)?,
-            None => found,
-        };
-        self.assign_impl(expr, op, (place, value))
-    }
-
-    /// Types `place op= value` through the impl of the operator's assign trait for `place` and `value`.
-    fn assign_impl(&mut self, expr: ExprId, op: BinOp, (place, value): (Ty, Ty)) -> Result<()> {
-        let (lang, name) = assign_trait(op)?;
-        let Some((of, method)) = self.operator_impl((&lang, &name), place, &[value])? else { bail!("unsupported compound assignment on {}", self.show(place)) };
-        if self.has_vars(value) {
-            self.obligations.push((of, vec![place, value]));
-        }
-        self.out.operators.insert(expr, Res::fn_of(&self.cx.types, method, &[place, value]));
-        Ok(())
-    }
-
-    fn builtin_compound(&mut self, op: BinOp, place: Ty) -> bool {
-        let logical = matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor);
-        self.is_int(place) || self.is_float(place) || logical && self.resolve(place) == self.cx.types.bool()
     }
 
     fn call(&mut self, expr: ExprId, (callee, args): (ExprId, List), expected: Option<Ty>) -> Result<Ty> {
@@ -456,6 +436,11 @@ impl Infer<'_, '_> {
     fn other_call(&mut self, expr: ExprId, found: Ty, callee_ty: Ty, args: List) -> Result<Ty> {
         if self.poly.is_some() && matches!(self.cx.types.kind(callee_ty), Kind::Param(_) | Kind::Proj(_)) {
             return self.poly_call(expr, found, callee_ty, args);
+        }
+        if matches!(self.cx.types.kind(callee_ty), Kind::Var(_))
+            && let Some((params, ret)) = self.callable_sig(callee_ty)?
+        {
+            return self.call_once_of(expr, callee_ty, (params, ret), args);
         }
         bail!("calling {} is not supported yet", self.show(callee_ty))
     }
@@ -770,12 +755,6 @@ const OPERATORS: [(BinOp, &str, &str); 16] = [
 ];
 
 /// The lang item of the trait that overloads `op`, and its method.
-fn operator_trait(op: BinOp) -> Option<(&'static str, &'static str)> {
+pub(super) fn operator_trait(op: BinOp) -> Option<(&'static str, &'static str)> {
     OPERATORS.iter().find(|(each, ..)| *each == op).map(|&(_, lang, name)| (lang, name))
-}
-
-/// The lang item of the trait that overloads `op=`, and its method.
-fn assign_trait(op: BinOp) -> Result<(String, String)> {
-    let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
-    Ok((format!("{lang}_assign"), format!("{name}_assign")))
 }

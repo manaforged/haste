@@ -9,7 +9,7 @@ const FILL_INLINE: i64 = 64;
 const DEPTH: u32 = 4;
 
 /// A 64-bit integer whose eight bytes are each one.
-const BYTES: i64 = 0x0101_0101_0101_0101;
+pub(crate) const BYTES: i64 = 0x0101_0101_0101_0101;
 
 /// The constant `value` holds when constants, extensions and arithmetic on constants compute it.
 fn known(func: &Function, defs: &[Option<Inst>], value: Value, depth: u32) -> Option<i64> {

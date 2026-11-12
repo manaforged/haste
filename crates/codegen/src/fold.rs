@@ -450,7 +450,7 @@ fn drop_params(func: &mut Function, fold: &Fold) {
 }
 
 fn pure(op: &Op) -> bool {
-    matches!(op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
+    matches!(op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Sha256Rounds(..) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
 }
 
 /// How many times the instructions in blocks read each value.

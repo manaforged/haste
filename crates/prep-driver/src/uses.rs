@@ -18,22 +18,23 @@ pub fn inlined<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<Value> 
     callees.filter(|def_id| seen.insert(*def_id)).map(|def_id| crate::key::at(tcx, def_id)).collect()
 }
 
-/// What the optimized body of `instance` reaches outside itself: the trait object and function pointer types whose code pointers it makes, calls or hands to the shared standard library, the symbols of the instances it calls, drops, reifies or puts in a vtable, the symbols of the statics outside the sysroot it reads or writes that are mutable, thread-local or hold interior mutability, the keys of the function pointer types it calls through (none when one has no key), and whether it reaches standard library code whose state each copy of std keeps apart.
+/// What the optimized body of `instance` reaches outside itself: the trait object and function pointer types whose code pointers it makes, calls or hands to the shared standard library, the functions of the shared standard library that take no type arguments it calls or reifies, the symbols of the instances it calls, drops, reifies or puts in a vtable, the symbols of the statics outside the sysroot it reads or writes that are mutable, thread-local or hold interior mutability, the keys of the function pointer types it calls through (none when one has no key), and whether it reaches standard library code whose state each copy of std keeps apart.
 pub struct Used<'tcx> {
     pub symbols: Vec<String>,
     pub statics: Vec<String>,
     pub calls: Option<Vec<String>>,
     pub held: bool,
     pub indirect: FxHashSet<Ty<'tcx>>,
+    pub upstream: FxHashSet<Instance<'tcx>>,
 }
 
 /// What the optimized body of `instance` reaches outside itself.
 pub fn used<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Used<'tcx> {
     let body = tcx.instance_mir(instance.def);
-    let mut uses = Uses { tcx, instance, body, found: BTreeSet::new(), statics: BTreeSet::new(), calls: Some(BTreeSet::new()), held: false, indirect: FxHashSet::default(), seen: FxHashSet::default() };
+    let mut uses = Uses { tcx, instance, body, found: BTreeSet::new(), statics: BTreeSet::new(), calls: Some(BTreeSet::new()), held: false, indirect: FxHashSet::default(), upstream: FxHashSet::default(), seen: FxHashSet::default() };
     uses.visit_body(body);
     let calls = uses.calls.map(|calls| calls.into_iter().collect());
-    Used { symbols: uses.found.into_iter().collect(), statics: uses.statics.into_iter().collect(), calls, held: uses.held, indirect: uses.indirect }
+    Used { symbols: uses.found.into_iter().collect(), statics: uses.statics.into_iter().collect(), calls, held: uses.held, indirect: uses.indirect, upstream: uses.upstream }
 }
 
 /// Whether static `def_id` holds state that two copies would split: it is outside the sysroot and mutable, thread-local or of a type with interior mutability.
@@ -51,7 +52,7 @@ const ALLOCATION_DEPTH: usize = 4;
 const HELD_APART: [&str; 2] = ["std::io::stdio::", "std::process::exit"];
 
 /// Whether `def_id` is standard library code that reads or writes state the shared standard library keeps apart from the std Haste compiles.
-fn held_apart(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+pub fn held_apart(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     if !crate::link::sysroot(tcx, def_id.krate) {
         return false;
     }
@@ -68,6 +69,7 @@ struct Uses<'a, 'tcx> {
     calls: Option<BTreeSet<String>>,
     held: bool,
     indirect: FxHashSet<Ty<'tcx>>,
+    upstream: FxHashSet<Instance<'tcx>>,
     seen: FxHashSet<AllocId>,
 }
 
@@ -85,6 +87,9 @@ impl<'tcx> Uses<'_, 'tcx> {
         }
         if crate::link::sysroot(self.tcx, instance.def_id().krate) && !instance.args.iter().any(|arg| arg.as_type().is_some()) {
             self.handed(instance);
+            if let InstanceKind::Item(_) = instance.def {
+                self.upstream.insert(instance);
+            }
         }
         self.held |= held_apart(self.tcx, instance.def_id());
         self.found.insert(self.tcx.symbol_name(instance).name.to_string());

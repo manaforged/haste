@@ -79,6 +79,17 @@ pub struct Source {
     pub offset: u32,
     /// The tokens that each macro call in type position writes, by the token that opens its group.
     pub outputs: Outputs,
+    /// Where the tokens of this layer lie in the file at `path` as read from disk.
+    pub origins: Origins,
+}
+
+/// Where the tokens of a source lie in the file at its path as read from disk: every token where it is, or the listed tokens, by index, at the byte offsets of the tokens a macro copied them from.
+#[derive(Debug)]
+pub enum Origins {
+    /// Every token lies where the source has it.
+    Read,
+    /// The listed tokens, by index, lie at the byte offsets of the tokens a macro copied them from; the rest lie nowhere on disk.
+    Copied(Vec<(u32, u32)>),
 }
 
 /// Macro outputs kept for as long as the source that holds their calls, keyed by `(krate, module, open)`.
@@ -109,6 +120,7 @@ pub struct Tokens {
     tokens: Vec<Token>,
     marks: Vec<(u32, Mark)>,
     opaque: Vec<(u32, u32, Frag)>,
+    origins: Vec<(u32, u32)>,
 }
 
 fn is_punct_kind(kind: TokenKind) -> bool {
@@ -187,7 +199,7 @@ impl Tokens {
     pub fn finish(self, path: PathBuf) -> Result<Source> {
         let mut tokens = self.tokens;
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text: self.text, tokens, marks: self.marks, opaque: self.opaque, base: None, offset: 0, outputs: Outputs::default() })
+        Ok(Source { path, text: self.text, tokens, marks: self.marks, opaque: self.opaque, base: None, offset: 0, outputs: Outputs::default(), origins: Origins::Copied(self.origins) })
     }
 
     /// The written tokens laid after every token of `base`, so that the indices of `base` still name its tokens.
@@ -206,10 +218,15 @@ impl Tokens {
         self.tokens.len() as u32
     }
 
-    /// Copies tokens `from..to` of `src`, keeping their spacing, origin marks and opaque sub-ranges.
+    /// Copies tokens `from..to` of `src`, keeping their spacing, origin marks, places on disk and opaque sub-ranges.
     pub fn copy_range(&mut self, src: &Source, from: u32, to: u32) {
         let base = self.len();
-        (from..to).for_each(|at| self.copy(src, at));
+        for at in from..to {
+            if let Some(origin) = src.origin(at) {
+                self.origins.push((self.len(), origin));
+            }
+            self.copy(src, at);
+        }
         for (op_from, op_to, frag) in src.opaques_in(from, to) {
             self.opaque.push((base + (op_from - from), base + (op_to - from), frag));
         }
@@ -543,7 +560,9 @@ impl Source {
             Ok(text)
         };
         let text = read().with_context(|| format!("reading {}", path.display()))?;
-        Source::parse(path.to_owned(), text)
+        let mut source = Source::parse(path.to_owned(), text)?;
+        source.origins = Origins::Read;
+        Ok(source)
     }
 
     /// Lexes `text` as the contents of `path`.
@@ -551,7 +570,7 @@ impl Source {
         let mut text = text;
         let mut tokens = lex(&mut text);
         pair_up(&mut tokens, &path)?;
-        Ok(Source { path, text, tokens, marks: Vec::new(), opaque: Vec::new(), base: None, offset: 0, outputs: Outputs::default() })
+        Ok(Source { path, text, tokens, marks: Vec::new(), opaque: Vec::new(), base: None, offset: 0, outputs: Outputs::default(), origins: Origins::Copied(Vec::new()) })
     }
 
     #[inline]
@@ -696,6 +715,15 @@ impl Source {
 
     fn own_mark(&self, local: u32) -> Option<Mark> {
         self.marks.binary_search_by_key(&local, |(token, _)| *token).ok().map(|found| self.marks[found].1)
+    }
+
+    /// The byte offset in the file at `path`, as read from disk, of token `at` or of the token a macro copied it from.
+    pub fn origin(&self, at: u32) -> Option<u32> {
+        let (src, local) = self.layer(at);
+        match &src.origins {
+            Origins::Read => src.tokens.get(local).map(|token| token.start),
+            Origins::Copied(copied) => copied.binary_search_by_key(&(local as u32), |&(token, _)| token).ok().map(|found| copied[found].1),
+        }
     }
 
     /// The byte offset of token `at` in the text of its layer.

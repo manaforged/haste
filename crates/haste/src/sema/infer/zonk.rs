@@ -135,6 +135,7 @@ impl Infer<'_, '_> {
         self.settle_awaits()?;
         self.settle_operators(false)?;
         self.settle_obligations()?;
+        self.settle_casts()?;
         self.fall_back_numbers()?;
         self.fall_back_residuals()?;
         self.settle_obligations()?;

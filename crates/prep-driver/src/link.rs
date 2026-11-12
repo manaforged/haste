@@ -115,7 +115,11 @@ fn run(args: &[String]) -> Result<()> {
     }
     link(&inputs, Path::new(out))?;
     let defined = elf::defined(Path::new(out), Table::Dynamic, Scope::All)?;
-    let (kept, missing) = merge(&inputs.manifests, (&defined, &released), &PathBuf::from(format!("{out}.{MANIFEST_EXTENSION}")))?;
+    let mut shared = HashSet::new();
+    for dylib in &inputs.dylibs {
+        shared.extend(elf::defined(Path::new(dylib), Table::Dynamic, Scope::All)?);
+    }
+    let (kept, missing) = merge(&inputs.manifests, (&defined, &shared, &released), &PathBuf::from(format!("{out}.{MANIFEST_EXTENSION}")))?;
     let size = fs::metadata(out)?.len();
     let counts = format!("units {} objects {} released {}", inputs.manifests.len(), inputs.objects.len() + inputs.released.len(), released.len());
     println!("{counts} rebound {rebound} records {kept} missing {missing} bytes {size}");
@@ -216,7 +220,8 @@ fn released(objects: &[PathBuf], symbols: &HashSet<String>) -> Result<HashSet<St
     Ok(found)
 }
 
-fn merge(manifests: &[PathBuf], (defined, released): (&HashSet<String>, &HashSet<String>), out: &Path) -> Result<(usize, usize)> {
+/// Writes the merged manifest of `manifests` to `out`: each record whose symbol the library defines, or the shared standard library for a record of its code, and each distinct line describing a type or a static.
+fn merge(manifests: &[PathBuf], (defined, shared, released): (&HashSet<String>, &HashSet<String>, &HashSet<String>), out: &Path) -> Result<(usize, usize)> {
     let (mut records, mut library) = (Vec::new(), serde_json::Map::new());
     let mut indirect: [BTreeMap<String, Value>; 3] = Default::default();
     let mut missing = 0;
@@ -232,7 +237,8 @@ fn merge(manifests: &[PathBuf], (defined, released): (&HashSet<String>, &HashSet
                 library.extend(facts.into_iter().filter(|(_, value)| !value.is_null()));
                 continue;
             };
-            if !defined.contains(&symbol) {
+            let upstream = record.get(record::UPSTREAM).and_then(Value::as_bool) == Some(true);
+            if !defined.contains(&symbol) && !(upstream && shared.contains(&symbol)) {
                 missing += 1;
                 continue;
             }

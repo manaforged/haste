@@ -1,13 +1,40 @@
 use super::asm::{Reg, Xmm};
 use super::{Emit, Ext};
-use super::float::X1;
-use crate::ir::{Binary, ByteCC, Op, Value};
+use super::float::{X0, X1, X2};
+use crate::fill::BYTES;
+use crate::ir::{Binary, ByteCC, Op, Value, VectorOp};
 
 /// The operand-size prefix every packed integer SSE2 instruction takes.
 const PACKED: [u8; 1] = [0x66];
 
-/// The bytes of a 32-bit integer whose four bytes are each one.
-const BYTES: i64 = 0x0101_0101;
+/// The prefix and opcode bytes of the vector instruction `op`.
+fn encoding(op: VectorOp) -> (&'static [u8], [u8; 3]) {
+    match op {
+        VectorOp::ByteShuffle => (&PACKED, [0x0F, 0x38, 0x00]),
+        VectorOp::AddBytes => (&PACKED, [0x0F, 0xFC, 0]),
+        VectorOp::AddWords => (&PACKED, [0x0F, 0xFD, 0]),
+        VectorOp::AddDwords => (&PACKED, [0x0F, 0xFE, 0]),
+        VectorOp::AddQwords => (&PACKED, [0x0F, 0xD4, 0]),
+        VectorOp::SubBytes => (&PACKED, [0x0F, 0xF8, 0]),
+        VectorOp::SubWords => (&PACKED, [0x0F, 0xF9, 0]),
+        VectorOp::SubDwords => (&PACKED, [0x0F, 0xFA, 0]),
+        VectorOp::SubQwords => (&PACKED, [0x0F, 0xFB, 0]),
+        VectorOp::Sha1NextE => (&[], [0x0F, 0x38, 0xC8]),
+        VectorOp::Sha1Msg1 => (&[], [0x0F, 0x38, 0xC9]),
+        VectorOp::Sha1Msg2 => (&[], [0x0F, 0x38, 0xCA]),
+        VectorOp::Sha256Msg1 => (&[], [0x0F, 0x38, 0xCC]),
+        VectorOp::Sha256Msg2 => (&[], [0x0F, 0x38, 0xCD]),
+        VectorOp::AesEnc => (&PACKED, [0x0F, 0x38, 0xDC]),
+        VectorOp::AesEncLast => (&PACKED, [0x0F, 0x38, 0xDD]),
+        VectorOp::AesDec => (&PACKED, [0x0F, 0x38, 0xDE]),
+        VectorOp::AesDecLast => (&PACKED, [0x0F, 0x38, 0xDF]),
+    }
+}
+
+/// The opcode bytes of `encoding`: two for a 0F map instruction, three for a 0F 38 one.
+fn opcode(bytes: &[u8; 3]) -> &[u8] {
+    if bytes[1] == 0x38 { bytes } else { &bytes[..2] }
+}
 
 /// The opcode of the packed integer bitwise `op`.
 fn bitwise(op: Binary) -> Option<u8> {
@@ -27,8 +54,13 @@ impl Emit<'_> {
                     ByteCC::Equal => 0x74,
                     ByteCC::SignedGreaterThan => 0x64,
                 };
-                self.packed(opcode, (x, y), result);
+                self.packed((&PACKED, &[0x0F, opcode]), (x, y), result);
             }
+            Op::Vector(kind, x, y) => {
+                let (prefix, bytes) = encoding(kind);
+                self.packed((prefix, opcode(&bytes)), (x, y), result);
+            }
+            Op::Sha256Rounds(x, y, k) => self.sha256_rounds((x, y, k), result),
             Op::Splat(x) => self.splat(x, result),
             Op::Movemask(x) => {
                 let source = self.fin(x, Xmm(0));
@@ -44,16 +76,26 @@ impl Emit<'_> {
     /// Computes the packed bitwise `op` of vectors `x` and `y` into `result`.
     pub(super) fn vector_binary(&mut self, op: Binary, (x, y): (Value, Value), result: Value) -> Result<(), String> {
         let opcode = bitwise(op).ok_or_else(|| format!("{op:?} of a vector"))?;
-        self.packed(opcode, (x, y), result);
+        self.packed((&PACKED, &[0x0F, opcode]), (x, y), result);
         Ok(())
     }
 
-    /// `dst = x op y` for the two-operand packed SSE2 instruction `opcode`, reading `y` from a register so no operand needs alignment.
-    fn packed(&mut self, opcode: u8, (x, y): (Value, Value), result: Value) {
+    /// `dst = x op y` for the two-operand SSE instruction with `prefix` and `opcode`, reading `y` from a register so no operand needs alignment.
+    fn packed(&mut self, (prefix, opcode): (&[u8], &[u8]), (x, y): (Value, Value), result: Value) {
         let dst = self.fdst(result);
         let source = self.fin(y, X1);
         self.fget(dst, x);
-        self.asm.sse(&PACKED, &[0x0F, opcode], dst.0, source);
+        self.asm.sse(prefix, opcode, dst.0, source);
+        self.fput(result, dst);
+    }
+
+    /// `sha256rnds2 dst, y` with `dst` holding `x` and xmm0, which the instruction reads, holding `k`.
+    fn sha256_rounds(&mut self, (x, y, k): (Value, Value, Value), result: Value) {
+        let dst = self.xmm_of(result).unwrap_or(X2);
+        let source = self.fin(y, X1);
+        self.fget(X0, k);
+        self.fget(dst, x);
+        self.asm.sse(&[], &[0x0F, 0x38, 0xCB], dst.0, source);
         self.fput(result, dst);
     }
 
@@ -63,7 +105,7 @@ impl Emit<'_> {
         match self.const_of(x) {
             Some(0) => self.asm.sse(&PACKED, &[0x0F, 0xEF], dst.0, dst),
             Some(byte) => {
-                self.asm.mov_imm(Reg::Rax, (byte & 0xFF) * BYTES);
+                self.asm.mov_imm(Reg::Rax, (byte & 0xFF).wrapping_mul(BYTES));
                 self.word_splat(dst);
             }
             None => {

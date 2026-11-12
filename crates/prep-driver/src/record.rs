@@ -21,6 +21,9 @@ pub const MANIFEST: &str = "manifest.jsonl";
 /// The key of the table that describes the whole library: the symbols of the shared standard library's argument initializer, of its `stdout` and of `flush` on what that returns.
 pub const LIBRARY: &str = "library";
 
+/// The field that marks a record of a function the shared standard library defines.
+pub const UPSTREAM: &str = "upstream";
+
 /// The key of the array of instance records in the merged manifest.
 pub const RECORD: &str = "record";
 
@@ -35,19 +38,32 @@ const ARGS_INIT: &str = "std::sys::args::unix::imp::ARGV_INIT_ARRAY::init_wrappe
 /// The file in a linking unit's directory that names the sysroot libraries and native libraries its prep library links.
 pub const LINK: &str = "link.txt";
 
-/// Writes the manifest of every function instance the crate generates code for, of every static it defines that holds state, and of every trait object and function pointer type their code touches, and, for a crate that links, the libraries it links.
+/// What writing a unit's manifest gathers across its records: the instances already recorded, the trait object and function pointer types their code touches, and the functions of the shared standard library that take no type arguments they call.
+#[derive(Default)]
+struct Found<'tcx> {
+    seen: FxHashSet<Instance<'tcx>>,
+    indirect: FxHashSet<ty::Ty<'tcx>>,
+    upstream: FxHashSet<Instance<'tcx>>,
+}
+
+/// Writes the manifest of every function instance the crate generates code for and of every function of the shared standard library taking no type arguments that their code calls, of every static it defines that holds state, and of every trait object and function pointer type their code touches, and, for a crate that links, the libraries it links.
 pub fn write(tcx: TyCtxt<'_>, unit: &Unit) -> Result<()> {
     let mut out = BufWriter::new(File::create(unit.dir.join(MANIFEST))?);
     writeln!(out, "{}", header(tcx, unit))?;
-    let (mut seen, mut indirect) = (FxHashSet::default(), FxHashSet::default());
+    let mut found = Found::default();
     for cgu in tcx.collect_and_partition_mono_items(()).codegen_units {
         for (item, data) in cgu.items() {
-            if let Some(line) = line(tcx, (*item, data), (cgu.name(), &mut seen, &mut indirect))? {
+            if let Some(line) = line(tcx, (*item, data), (cgu.name(), &mut found))? {
                 writeln!(out, "{line}")?;
             }
         }
     }
-    for ty in indirect {
+    for instance in std::mem::take(&mut found.upstream) {
+        if found.seen.insert(instance) {
+            writeln!(out, "{}", upstream(tcx, instance)?)?;
+        }
+    }
+    for ty in found.indirect {
         writeln!(out, "{}", crate::object::facts(tcx, ty)?)?;
     }
     out.flush()?;
@@ -58,9 +74,9 @@ pub fn write(tcx: TyCtxt<'_>, unit: &Unit) -> Result<()> {
 }
 
 /// The manifest line of mono item `item` of unit `cgu`: a record for a function instance not yet seen, the facts of a static that holds state.
-fn line<'tcx>(tcx: TyCtxt<'tcx>, (item, data): (MonoItem<'tcx>, &MonoItemData), (cgu, seen, indirect): (Symbol, &mut FxHashSet<Instance<'tcx>>, &mut FxHashSet<ty::Ty<'tcx>>)) -> Result<Option<Value>> {
+fn line<'tcx>(tcx: TyCtxt<'tcx>, (item, data): (MonoItem<'tcx>, &MonoItemData), (cgu, found): (Symbol, &mut Found<'tcx>)) -> Result<Option<Value>> {
     match item {
-        MonoItem::Fn(instance) if seen.insert(instance) => record(tcx, instance, data, (cgu, indirect)).map(Some),
+        MonoItem::Fn(instance) if found.seen.insert(instance) => record(tcx, instance, data, (cgu, found)).map(Some),
         MonoItem::Static(def_id) => Ok(crate::statics::facts(tcx, def_id)),
         MonoItem::Fn(_) | MonoItem::GlobalAsm(_) => Ok(None),
     }
@@ -68,6 +84,7 @@ fn line<'tcx>(tcx: TyCtxt<'tcx>, (item, data): (MonoItem<'tcx>, &MonoItemData), 
 
 fn header(tcx: TyCtxt<'_>, unit: &Unit) -> Value {
     let sess = tcx.sess;
+    let stdout = stdout(tcx);
     json!({
         "unit": tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str(),
         "version": unit.version,
@@ -78,7 +95,7 @@ fn header(tcx: TyCtxt<'_>, unit: &Unit) -> Value {
         "opt_level": format!("{:?}", sess.opts.optimize),
         "codegen_units": sess.codegen_units().as_usize(),
         "panic": sess.panic_strategy().desc(),
-        LIBRARY: { "args_init": args_init(tcx), "stdout": stdout(tcx).map(|(stdout, _)| stdout), "stdout_flush": stdout(tcx).map(|(_, flush)| flush) },
+        LIBRARY: { "args_init": args_init(tcx), "stdout": stdout.as_ref().map(|(stdout, _)| stdout), "stdout_flush": stdout.as_ref().map(|(_, flush)| flush) },
     })
 }
 
@@ -100,10 +117,47 @@ fn args_init(tcx: TyCtxt<'_>) -> Option<String> {
     })
 }
 
-fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData, (cgu, indirect): (Symbol, &mut FxHashSet<ty::Ty<'tcx>>)) -> Result<Value> {
-    let def_id = instance.def_id();
+fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData, (cgu, found): (Symbol, &mut Found<'tcx>)) -> Result<Value> {
     let used = uses::used(tcx, instance);
-    indirect.extend(used.indirect);
+    found.indirect.extend(used.indirect);
+    found.upstream.extend(used.upstream);
+    let local = json!({
+        "local_copy": data.inlined,
+        "cgu": cgu.as_str(),
+        "inlined": uses::inlined(tcx, instance),
+        "uses": used.symbols,
+        "statics": used.statics,
+        "calls": used.calls,
+        "held": used.held,
+    });
+    Ok(joined(described(tcx, instance)?, local))
+}
+
+/// The record of `instance`, a function of the shared standard library that takes no type arguments, which the library links rather than defines: nothing rustc inlined into it is local, and of what it reaches only whether it is standard library code that holds state apart.
+fn upstream<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Result<Value> {
+    let shared = json!({
+        UPSTREAM: true,
+        "local_copy": false,
+        "inlined": [],
+        "uses": [],
+        "statics": [],
+        "calls": Value::Null,
+        "held": uses::held_apart(tcx, instance.def_id()),
+    });
+    Ok(joined(described(tcx, instance)?, shared))
+}
+
+/// `record` with the fields of `more` added.
+fn joined(mut record: Value, more: Value) -> Value {
+    if let (Some(fields), Value::Object(more)) = (record.as_object_mut(), more) {
+        fields.extend(more);
+    }
+    record
+}
+
+/// What a record says of `instance` whatever code defines it: its symbol, key, place, crate, kind, path, closure identity, span, type arguments, convention and the layouts it crosses.
+fn described<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Result<Value> {
+    let def_id = instance.def_id();
     let (abi, crossing) = abi::of(tcx, instance)?;
     Ok(json!({
         "symbol": tcx.symbol_name(instance).name,
@@ -116,15 +170,8 @@ fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData
         "closure": closure(tcx, instance),
         "span": span(tcx, def_id),
         "args": args(tcx, instance),
-        "local_copy": data.inlined,
-        "cgu": cgu.as_str(),
         "abi": abi,
         "layouts": crate::layout::reached(tcx, &crossing),
-        "inlined": uses::inlined(tcx, instance),
-        "uses": used.symbols,
-        "statics": used.statics,
-        "calls": used.calls,
-        "held": used.held,
     }))
 }
 

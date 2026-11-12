@@ -26,11 +26,12 @@ pub enum Builtin {
     OptionEnv,
     Asm,
     ModulePath,
+    Include,
     IncludeStr,
     IncludeBytes,
 }
 
-const BUILTINS: [(&str, Builtin); 20] = [
+const BUILTINS: [(&str, Builtin); 21] = [
     ("concat", Builtin::Concat),
     ("stringify", Builtin::Stringify),
     ("line", Builtin::Line),
@@ -49,6 +50,7 @@ const BUILTINS: [(&str, Builtin); 20] = [
     ("option_env", Builtin::OptionEnv),
     ("asm", Builtin::Asm),
     ("module_path", Builtin::ModulePath),
+    ("include", Builtin::Include),
     ("include_str", Builtin::IncludeStr),
     ("include_bytes", Builtin::IncludeBytes),
 ];

@@ -36,6 +36,8 @@ pub enum Intrinsic {
     Trap,
     CallerLocation,
     Cpuid,
+    /// `FnPtr::addr`, the address of a function pointer.
+    FnAddr,
     /// SSSE3 or AVX2 `pshufb` on a vector of this many bytes.
     BytePermute(u8),
     /// NEON `umaxp` on two vectors of 16 bytes.
@@ -97,6 +99,40 @@ pub enum Simd {
     /// Every lane of a vector combined by one bitwise operator.
     Fold(BinOp),
     Sqrt,
+    /// Each lane through one operation on that lane alone.
+    Unary(LaneUnary),
+    /// Each pair of lanes through one operation that has no operator.
+    Pair(LanePair),
+    /// Each lane of the first vector times the second plus the third, rounded once.
+    Fma,
+    /// The sum, or product, of every lane in order, after the start value when one is given.
+    Sum {
+        mul: bool,
+    },
+    /// Each lane read from the pointer where the mask lane is set, and taken from the fallback where not.
+    MaskedLoad,
+    /// Each lane written through the pointer where the mask lane is set.
+    MaskedStore,
+}
+
+/// An operation on one SIMD lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneUnary {
+    Neg,
+    Ctpop,
+    Ctlz,
+    Fabs,
+    Floor,
+    Ceil,
+}
+
+/// An operation on two SIMD lanes that no binary operator spells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanePair {
+    Min,
+    Max,
+    SaturatingAdd,
+    SaturatingSub,
 }
 
 /// An atomic access, which lowering makes sequentially consistent.
@@ -111,7 +147,7 @@ pub enum Atomic {
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
 const LLVM: [(&str, Intrinsic); 3] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32)), ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::BytePairMax)];
 
-const NAMES: [(&str, Intrinsic); 137] = {
+const NAMES: [(&str, Intrinsic); 159] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -235,6 +271,28 @@ const NAMES: [(&str, Intrinsic); 137] = {
         ("simd_reduce_or", Simd(self::Simd::Fold(BinOp::BitOr))),
         ("simd_reduce_xor", Simd(self::Simd::Fold(BinOp::BitXor))),
         ("simd_fsqrt", Simd(self::Simd::Sqrt)),
+        ("simd_neg", Simd(self::Simd::Unary(LaneUnary::Neg))),
+        ("simd_ctpop", Simd(self::Simd::Unary(LaneUnary::Ctpop))),
+        ("simd_ctlz", Simd(self::Simd::Unary(LaneUnary::Ctlz))),
+        ("simd_fabs", Simd(self::Simd::Unary(LaneUnary::Fabs))),
+        ("simd_floor", Simd(self::Simd::Unary(LaneUnary::Floor))),
+        ("simd_ceil", Simd(self::Simd::Unary(LaneUnary::Ceil))),
+        ("simd_imin", Simd(self::Simd::Pair(LanePair::Min))),
+        ("simd_imax", Simd(self::Simd::Pair(LanePair::Max))),
+        ("simd_fmin", Simd(self::Simd::Pair(LanePair::Min))),
+        ("simd_fmax", Simd(self::Simd::Pair(LanePair::Max))),
+        ("simd_minimum_number_nsz", Simd(self::Simd::Pair(LanePair::Min))),
+        ("simd_maximum_number_nsz", Simd(self::Simd::Pair(LanePair::Max))),
+        ("simd_saturating_add", Simd(self::Simd::Pair(LanePair::SaturatingAdd))),
+        ("simd_saturating_sub", Simd(self::Simd::Pair(LanePair::SaturatingSub))),
+        ("simd_fma", Simd(self::Simd::Fma)),
+        ("simd_relaxed_fma", Simd(self::Simd::Fma)),
+        ("simd_reduce_add_ordered", Simd(self::Simd::Sum { mul: false })),
+        ("simd_reduce_add_unordered", Simd(self::Simd::Sum { mul: false })),
+        ("simd_reduce_mul_ordered", Simd(self::Simd::Sum { mul: true })),
+        ("simd_reduce_mul_unordered", Simd(self::Simd::Sum { mul: true })),
+        ("simd_masked_load", Simd(self::Simd::MaskedLoad)),
+        ("simd_masked_store", Simd(self::Simd::MaskedStore)),
         ("simd_add", Simd(self::Simd::Lanewise(BinOp::Add))),
         ("simd_sub", Simd(self::Simd::Lanewise(BinOp::Sub))),
         ("simd_mul", Simd(self::Simd::Lanewise(BinOp::Mul))),
@@ -258,8 +316,10 @@ impl Context<'_> {
     /// The intrinsic that the function `item` is, when it carries `#[rustc_intrinsic]` and lowering knows it, or when it is the panic handler. `Trap` stands for the panic runtime, which is not lowered yet, and for code that must never run.
     pub fn intrinsic(&self, item: ItemRef) -> Option<Intrinsic> {
         let (src, entry) = self.item(item);
-        if self.lang(item) == Some("panic_impl") {
-            return Some(Intrinsic::Trap);
+        match self.lang(item) {
+            Some("panic_impl") => return Some(Intrinsic::Trap),
+            Some("fn_ptr_addr") => return Some(Intrinsic::FnAddr),
+            _ => {}
         }
         let marked = self.rustc_intrinsic(item);
         let name = src.text(entry.name?);

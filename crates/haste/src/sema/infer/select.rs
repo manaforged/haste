@@ -607,6 +607,14 @@ impl<'a> Infer<'_, 'a> {
         Ok(held != Some(false))
     }
 
+    /// Whether the one impl of `of<args>` that the function pointer of the `Fn` bound on the pending `impl Fn` value `ty` selects applies, tying `args` to that signature as an impl over any `F: Fn` does for the value it reveals.
+    pub(super) fn callable_opaque_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Result<bool> {
+        let Some(sig) = self.opaque_sig(self.resolve(ty)) else { return Ok(false) };
+        let Ok([(_, vars)]) = <[_; 1]>::try_from(self.applicable(of, sig, args, 0)?) else { return Ok(false) };
+        self.adopt(vars);
+        Ok(true)
+    }
+
     /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.
     pub(in crate::sema) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
         let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
@@ -649,8 +657,19 @@ impl<'a> Infer<'_, 'a> {
             Kind::Ref(Mut::Mut, _) => !matches!(lang, "copy" | "clone"),
             Kind::Adt(..) | Kind::Tuple(..) | Kind::Param(_) | Kind::Proj(_) if SIZED_ONLY.contains(&lang) && self.poly.is_some() && self.has_params(ty) => self.poly_sized(ty),
             Kind::Adt(item, _) if SIZED_ONLY.contains(&lang) => !self.cx.foreign(*item) && !self.is_unsized(ty).unwrap_or(false),
+            Kind::Tuple(_) | Kind::Array(..) if matches!(lang, "copy" | "clone") => self.parts_hold(of, ty),
             _ => true,
         }
+    }
+
+    /// Whether `Copy` or `Clone`, as `of`, holds for every element of the tuple or array `ty`, as rustc's built-in impls require.
+    fn parts_hold(&mut self, of: ItemRef, ty: Ty) -> bool {
+        let parts = match *self.cx.types.kind(ty) {
+            Kind::Tuple(items) => self.cx.types.substs(items).to_vec(),
+            Kind::Array(inner, _) => vec![inner],
+            _ => return true,
+        };
+        parts.into_iter().all(|part| if self.compiler_decides(of, part) { self.compiler_holds(of, part) } else { self.select(of, part, &[]).is_ok_and(|picked| picked.is_some()) })
     }
 
     /// Whether trait `of` is `Fn`, `FnMut` or `FnOnce`, which callables implement with no impl to select.

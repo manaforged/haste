@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, ByteCC, IntCC, StackSlot, Target, Type, Value};
+use haste_codegen::{Arch, ByteCC, IntCC, StackSlot, Target, Type, Value, VectorOp};
 
 use crate::body::BinOp;
 use crate::host::{HostSymbol, X86Symbol};
@@ -8,6 +8,8 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::ops::{Num, compare};
 use super::{Lower, machine, repr};
+
+mod lanes;
 
 struct Lanes {
     num: Num,
@@ -49,6 +51,7 @@ impl Lower<'_, '_> {
             (Simd::Extreme { max }, _) => self.extreme(vector, first, max)?,
             (Simd::Fold(op), _) => self.fold(vector, first, op)?,
             (Simd::Sqrt, _) => self.lane_sqrt(vector, first)?,
+            (Simd::Unary(_) | Simd::Pair(_) | Simd::Fma | Simd::Sum { .. } | Simd::MaskedLoad | Simd::MaskedStore, _) => return self.lane_intrinsic(op, substs, args),
             _ => self.simd_lanes(op, substs, args)?,
         };
         Ok(Some(value))
@@ -63,6 +66,10 @@ impl Lower<'_, '_> {
         let signed = matches!(lanes.num, Num::Int { signed: true, .. });
         let vector = match (op, args) {
             (Simd::Splat, &[x]) if lanes.is_bytes() => self.ins().splat(x),
+            (Simd::Lanewise(bin @ (BinOp::Add | BinOp::Sub)), &[x, y]) if input == output && lanes.size <= 8 => {
+                let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+                self.ins().vector(lane_arithmetic(bin, lanes.size), a, b)
+            }
             (Simd::Bitmask, &[x]) if lanes.is_bytes() => {
                 let Some(target) = machine(self.cx, output)? else { return Ok(None) };
                 let loaded = self.ins().load(Type::V128, x, 0);
@@ -266,8 +273,11 @@ impl Lower<'_, '_> {
         Ok(best)
     }
 
-    /// Calls the host function of the x86 intrinsic `x86` with `args`, each vector by address, and returns the address of the frame slot it writes the result to.
+    /// Calls the host function of the x86 intrinsic `x86` with `args`, each vector by address, and returns the address of the frame slot it writes a vector result to, or the integer it returns.
     pub(super) fn host_vector(&mut self, x86: X86Symbol, args: &[Value]) -> Result<Value> {
+        if let Some(value) = self.inline_vector(x86, args) {
+            return Ok(value);
+        }
         if x86.host_addr().is_none() {
             bail!("{} has no host function on this machine", x86.link_name());
         }
@@ -275,12 +285,19 @@ impl Lower<'_, '_> {
         let out = self.ins().stack_addr(Type::I64, slot, 0);
         let values: Vec<Value> = std::iter::once(out).chain(args.iter().copied()).collect();
         self.call_host(HostSymbol::X86(x86), &values, None);
-        Ok(out)
+        Ok(match x86.scalar_bytes() {
+            Some(8) => self.ins().load(Type::I64, out, 0),
+            Some(_) => self.ins().load(Type::I32, out, 0),
+            None => out,
+        })
     }
 
     /// The `bytes` bytes whose byte `i` is byte `index[i] & 15` of the 16-byte lane of `table` that holds byte `i`, or zero when bit 7 of `index[i]` is set, as `pshufb` gives.
     pub(super) fn byte_permute(&mut self, args: &[Value], bytes: u8) -> Result<Value> {
         let &[table, index] = args else { bail!("`pshufb` takes two vectors") };
+        if i32::from(bytes) == PACKED_BYTES && Target::host().arch == Arch::X64 {
+            return Ok(self.vector_result(VectorOp::ByteShuffle, (table, index)));
+        }
         let slot = self.b.create_stack_slot(u32::from(bytes), 5);
         let (low, zero) = (self.ins().iconst(Type::I8, 15), self.ins().iconst(Type::I8, 0));
         for lane in 0..i32::from(bytes) {
@@ -358,5 +375,64 @@ impl Lower<'_, '_> {
             self.ins().stack_store(chosen, slot, lane * to.size);
         }
         Ok(address)
+    }
+
+    /// The address of a frame slot holding the x64 vector instruction `op` on the vectors at `x` and `y`.
+    fn vector_result(&mut self, op: VectorOp, (x, y): (Value, Value)) -> Value {
+        let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+        let vector = self.ins().vector(op, a, b);
+        self.store_vector(vector)
+    }
+
+    fn store_vector(&mut self, vector: Value) -> Value {
+        let slot = self.b.create_stack_slot(PACKED_BYTES as u32, 4);
+        self.ins().stack_store(vector, slot, 0);
+        self.ins().stack_addr(Type::I64, slot, 0)
+    }
+
+    /// The x86 intrinsic `x86` on the vectors at `args` as one instruction in the code, on an x64 host, when it is one the code generator encodes.
+    fn inline_vector(&mut self, x86: X86Symbol, args: &[Value]) -> Option<Value> {
+        if Target::host().arch != Arch::X64 {
+            return None;
+        }
+        match (x86, args) {
+            (X86Symbol::Sha256rnds2, &[x, y, k]) => {
+                let (a, b, c) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0), self.ins().load(Type::V128, k, 0));
+                let vector = self.ins().sha256_rounds(a, b, c);
+                Some(self.store_vector(vector))
+            }
+            (_, &[x, y]) => Some(self.vector_result(instruction(x86)?, (x, y))),
+            _ => None,
+        }
+    }
+}
+
+/// The vector instruction that computes the two-operand x86 intrinsic `x86`, when there is one.
+fn instruction(x86: X86Symbol) -> Option<VectorOp> {
+    Some(match x86 {
+        X86Symbol::Sha1nexte => VectorOp::Sha1NextE,
+        X86Symbol::Sha1msg1 => VectorOp::Sha1Msg1,
+        X86Symbol::Sha1msg2 => VectorOp::Sha1Msg2,
+        X86Symbol::Sha256msg1 => VectorOp::Sha256Msg1,
+        X86Symbol::Sha256msg2 => VectorOp::Sha256Msg2,
+        X86Symbol::Aesenc => VectorOp::AesEnc,
+        X86Symbol::Aesenclast => VectorOp::AesEncLast,
+        X86Symbol::Aesdec => VectorOp::AesDec,
+        X86Symbol::Aesdeclast => VectorOp::AesDecLast,
+        _ => return None,
+    })
+}
+
+/// The packed add or subtract of `op` on lanes of `size` bytes.
+fn lane_arithmetic(op: BinOp, size: i32) -> VectorOp {
+    match (op == BinOp::Add, size) {
+        (true, 1) => VectorOp::AddBytes,
+        (true, 2) => VectorOp::AddWords,
+        (true, 4) => VectorOp::AddDwords,
+        (true, _) => VectorOp::AddQwords,
+        (false, 1) => VectorOp::SubBytes,
+        (false, 2) => VectorOp::SubWords,
+        (false, 4) => VectorOp::SubDwords,
+        (false, _) => VectorOp::SubQwords,
     }
 }

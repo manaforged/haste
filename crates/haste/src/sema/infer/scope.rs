@@ -252,6 +252,7 @@ impl<'a> Infer<'_, 'a> {
             let header = match self.cx.item(item).1.kind {
                 ItemKind::Struct | ItemKind::Enum | ItemKind::Union => Header::Adt(self.cx.adt_def(item)?),
                 ItemKind::Type => Header::Generics(self.cx.alias_def(item)?.generics.clone()),
+                ItemKind::Trait => Header::Generics(self.cx.trait_generics(item)?),
                 _ => Header::Fn(self.cx.signature(item)?),
             };
             headers.push((header, &self.cx.file(item).source));

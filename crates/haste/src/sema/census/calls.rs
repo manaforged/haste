@@ -327,6 +327,12 @@ fn simd_op_code(op: Simd) -> (u8, u8) {
         Simd::SelectBitmask => (13, 0),
         Simd::Sqrt => (14, 0),
         Simd::Fold(bin) => (15, bin as u8),
+        Simd::Unary(op) => (16, op as u8),
+        Simd::Pair(op) => (17, op as u8),
+        Simd::Fma => (18, 0),
+        Simd::Sum { mul } => (19, u8::from(mul)),
+        Simd::MaskedLoad => (20, 0),
+        Simd::MaskedStore => (21, 0),
     }
 }
 

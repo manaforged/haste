@@ -7,6 +7,14 @@ pub const SHARED_REF: &str = "&";
 pub const MUT_REF: &str = "&mut ";
 pub const CONST_PTR: &str = "*const ";
 pub const MUT_PTR: &str = "*mut ";
+/// What starts the key of a trait object type.
+pub const OBJECT: &str = "dyn ";
+/// What starts the module path in the key of a definition whose name a macro wrote, and what joins the modules in it.
+pub const MODULE: &str = "mod ";
+pub const MODULE_SEPARATOR: &str = "/";
+/// What starts the key of a member of an impl whose name a macro wrote, and what joins the trait it implements to its self type.
+pub const IMPL: &str = "impl ";
+pub const FOR: &str = " for ";
 /// What opens a function pointer type's parameters and what closes them before its return type.
 pub const FN_PTR: &str = "fn(";
 pub const RETURNS: &str = ")->";
@@ -55,12 +63,26 @@ pub fn fn_ptr(params: &[String], ret: &str) -> String {
 pub fn object(def: &str, args: &[String], fixed: &[(String, String)]) -> String {
     let mut bound: Vec<String> = fixed.iter().map(|(name, ty)| format!("+{name}={ty}")).collect();
     bound.sort();
-    format!("dyn {}{}", named(def, args), bound.concat())
+    format!("{OBJECT}{}{}", named(def, args), bound.concat())
 }
 
 /// Closure number `order` of `count` in the body of `root`, with the root's arguments `args`.
 pub fn closure(root: &str, (order, count): (usize, usize), args: &[String]) -> String {
     format!("closure {root}#{order}/{count}<{}>", args.join(","))
+}
+
+/// The key of definition `name` of crate `krate` that the module at path `modules` below the crate root holds.
+pub fn in_module(krate: &str, modules: &[String], name: &str) -> String {
+    format!("{krate}:{MODULE}{}:{name}", modules.join(MODULE_SEPARATOR))
+}
+
+/// The key of member `name` of an impl of crate `krate` for type `self_ty`, of trait `of` when it implements one; none when either names a trait object or function pointer type, whose keys do not tell apart types that differ only in auto traits or binders.
+pub fn member(krate: &str, of: Option<&str>, self_ty: &str, name: &str) -> Option<String> {
+    let head = match of {
+        Some(of) => format!("{of}{FOR}{self_ty}"),
+        None => self_ty.to_owned(),
+    };
+    (!head.contains(OBJECT) && !head.contains(FN_PTR)).then(|| format!("{krate}:{IMPL}{head}:{name}"))
 }
 
 fn terminated(items: &[String]) -> String {

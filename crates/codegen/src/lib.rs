@@ -48,7 +48,7 @@ mod arm64;
 mod x64;
 
 pub use builder::{FunctionBuilder, Ins, Mark};
-pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, ByteCC, CallConv, FloatCC, Function, Inst, IntCC, SigRef, Signature, StackSlot, Type, Value};
+pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, ByteCC, CallConv, FloatCC, Function, Inst, IntCC, SigRef, Signature, StackSlot, Type, Value, VectorOp};
 pub use coroutine::{Coroutine, FIRST_SUSPEND, RETURNED, UNRESUMED};
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};

@@ -51,7 +51,7 @@ impl Emit<'_> {
                 self.put(result, dst);
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
-            Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) => self.vector_op(op, result()?)?,
+            Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Sha256Rounds(..) => self.vector_op(op, result()?)?,
             _ => return self.access(op, result),
         }
         Ok(())

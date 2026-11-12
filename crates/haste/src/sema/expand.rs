@@ -393,6 +393,16 @@ impl Writer {
         if let Some((_, source)) = self.uses.iter().rev().find(|(alias, _)| path.0 == path.1 && *alias == name) {
             return Ok(self.resolve_macro(cx, source, (0, source.len() - 1)));
         }
+        let first = plain(run.src.text(path.0));
+        if path.0 < path.1
+            && let Some((_, source)) = self.uses.iter().rev().find(|(alias, _)| *alias == first)
+        {
+            let mut full = Tokens::default();
+            full.copy_range(source, 0, source.len());
+            (path.0 + 1..=path.1).for_each(|token| full.copy(run.src, token));
+            let joined = full.finish(run.src.path.clone())?;
+            return Ok(self.resolve_macro(cx, &joined, (0, joined.len() - 1)));
+        }
         match self.resolve_macro(cx, run.src, path).or_else(|| def_site_macro(cx, run.src, path)) {
             Some(found) => Ok(Some(found)),
             None => self.resolve_glob(cx, run.src, path),
@@ -405,7 +415,7 @@ impl Writer {
         match site.builtin {
             Builtin::Concat => return self.concat(cx, run, open, out),
             Builtin::Env | Builtin::OptionEnv => return self.env(cx, run, site, out),
-            Builtin::IncludeStr | Builtin::IncludeBytes => return self.include(cx, run, site, out),
+            Builtin::Include | Builtin::IncludeStr | Builtin::IncludeBytes => return self.include(cx, run, site, out),
             Builtin::FormatArgs | Builtin::FormatArgsNl => {
                 return self.format_args(cx, run, site, out);
             }
@@ -492,14 +502,16 @@ impl Writer {
     }
 
     fn include(&self, cx: &mut Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
-        let Some(&path) = run.src.args(site.open).first() else { bail!("include_str! and include_bytes! take a path") };
+        let Some(&path) = run.src.args(site.open).first() else { bail!("include!, include_str! and include_bytes! take a path") };
         let Some(path) = self.literal(cx, run, path)? else {
             return Ok(false);
         };
         let path = run.call_at(site.start).0.beside(&path);
         let bytes = std::fs::read(&path).map_err(|error| anyhow!("cannot read {}: {error}", path.display()))?;
+        let text = |bytes: Vec<u8>| String::from_utf8(bytes).map_err(|error| anyhow!("{} is not UTF-8: {error}", path.display()));
         match site.builtin {
-            Builtin::IncludeStr => out.lexed(&format!("{:?}", String::from_utf8(bytes).map_err(|error| anyhow!("{} is not UTF-8: {error}", path.display()))?)),
+            Builtin::Include => out.lexed(&text(bytes)?),
+            Builtin::IncludeStr => out.lexed(&format!("{:?}", text(bytes)?)),
             _ => out.lexed(&builtin::byte_string(&bytes)),
         }
         Ok(true)

@@ -82,6 +82,13 @@ impl Infer<'_, '_> {
         {
             return Ok(poly.assumptions.clone());
         }
+        let pending = self.obligations.len();
+        let found = self.assumed_bounds();
+        self.obligations.truncate(pending);
+        found
+    }
+
+    fn assumed_bounds(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let mut found = self.param_bounds()?;
         found.extend(self.own_trait()?);
         found.extend(self.type_bounds()?);
@@ -132,7 +139,7 @@ impl Infer<'_, '_> {
         if def.1.supers.len == 0 || substs.len() != params.len() + 1 {
             return Ok(Vec::new());
         }
-        let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), None))?;
+        let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), Some(of)))?;
         let home = frame.home;
         self.with_frame(frame, |infer| {
             let mut found = Vec::new();
@@ -210,7 +217,7 @@ impl Infer<'_, '_> {
         Ok(found)
     }
 
-    fn header_bounds(&mut self, (param, ty): (&str, Ty), keep: &mut dyn FnMut(&mut Self, ItemRef) -> Result<bool>, first: bool) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+    pub(super) fn header_bounds(&mut self, (param, ty): (&str, Ty), keep: &mut dyn FnMut(&mut Self, ItemRef) -> Result<bool>, first: bool) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let mut found = Vec::new();
         for (header, src) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
@@ -423,7 +430,7 @@ impl Infer<'_, '_> {
         }
         let frame = self.frame(item, substs)?;
         let (src, home) = (frame.src, frame.home);
-        let params = frame.generics.clone();
+        let params: Vec<(&str, Ty)> = frame.generics.iter().copied().chain(frame.self_ty.map(|ty| ("Self", ty))).collect();
         self.with_frame(frame, |infer| {
             for (name, ty) in params {
                 for bound in named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), name) {

@@ -391,6 +391,11 @@ impl<'a> Infer<'_, 'a> {
     /// Infers the call `expr` of the closure value of type `ty`, recording it as a call of `FnOnce::call_once` at the closure and its argument tuple.
     pub(super) fn closure_call(&mut self, expr: ExprId, ty: Ty, args: List) -> Result<Ty> {
         let (params, ret, _) = self.closure_sig(ty)?;
+        self.call_once_of(expr, ty, (params, ret), args)
+    }
+
+    /// Infers the call `expr` of the closure or pending `impl Fn` value `ty` with signature `(params, ret)` as `FnOnce::call_once` of it.
+    pub(super) fn call_once_of(&mut self, expr: ExprId, ty: Ty, (params, ret): (Vec<Ty>, Ty), args: List) -> Result<Ty> {
         self.infer_call_args(args, &params, None)?;
         let Some(call_once) = self.cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
         let tuple = self.cx.types.tuple(&params);

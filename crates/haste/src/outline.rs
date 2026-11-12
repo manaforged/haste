@@ -224,13 +224,17 @@ impl Outline {
         Outline { roots: vec![root], crates: vec![krate], deps: vec![Vec::new()], cache: Files::default(), procs: HashMap::default(), pins: vec![None] }
     }
 
-    /// The top-level `fn main` that the cfgs of crate `krate` keep in its root file.
+    /// The top-level `fn main` that the cfgs of crate `krate` keep in its root file, or that an attribute macro on it wrote in its place.
     pub fn main(&self, krate: usize) -> Option<crate::names::ItemRef> {
         let tree = &self.crates[krate];
-        let (file_at, file) = tree.files.iter().enumerate().find(|(_, file)| !file.expanded && file.source.path == self.roots[krate].path)?;
-        let is_main = |item: &item::Item| item.kind == ItemKind::Fn && item.parent.is_none() && item.name.is_some_and(|name| file.source.text(name) == "main") && tree.env.enabled(&item.attrs);
-        let at = file.items.items.iter().position(is_main)?;
-        Some(crate::names::ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 })
+        let root = tree.files.iter().position(|file| !file.expanded && file.source.path == self.roots[krate].path)?;
+        let parts = tree.modules.iter().find(|module| module.file == root && module.item.is_none()).map_or(&[][..], |module| &module.parts[..]);
+        std::iter::once(root).chain(parts.iter().copied()).find_map(|file_at| {
+            let file = &tree.files[file_at];
+            let is_main = |item: &item::Item| item.kind == ItemKind::Fn && item.parent.is_none() && item.name.is_some_and(|name| file.source.text(name) == "main") && tree.env.enabled(&item.attrs);
+            let at = (0..file.items.items.len()).find(|&at| is_main(&file.items.items[at]) && !tree.consumed.contains(&(file_at as u32, at as u32)))?;
+            Some(crate::names::ItemRef { krate: krate as u32, file: file_at as u32, item: at as u32 })
+        })
     }
 
     /// Reads module `module` of crate `krate` if it is only declared, then expands what that made resolvable.
