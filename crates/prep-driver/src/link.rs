@@ -12,13 +12,14 @@ use rustc_crate_store::LinkagePreference;
 use serde_json::Value;
 
 use crate::elf::{self, Scope, Table};
+use crate::files;
 use crate::object;
 use crate::statics;
 use crate::error::{Error, Result};
 use crate::record::{self, LINK, MANIFEST};
 use crate::wrap::RELEASE;
 
-/// Links every unit under a prep directory into one shared library and writes its manifest beside it.
+/// Links every unit under a prep directory into one shared library and writes its manifest beside it, or, given an earlier library, only the units rebuilt since into a second library that resolves against it.
 pub fn main(args: &[String]) -> ExitCode {
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -46,7 +47,7 @@ pub fn write_libraries(tcx: TyCtxt<'_>, path: &Path) -> Result<()> {
         let source = tcx.used_crate_source(cnum);
         let unit = source.rlib.as_ref().filter(|_| !sysroot(tcx, cnum)).and_then(|rlib| rlib.file_stem()?.to_str()?.strip_prefix(RLIB_PREFIX));
         if let Some(unit) = unit {
-            writeln!(out, "{UNIT} {unit}")?;
+            writeln!(out, "{} {unit}", record::UNIT)?;
         }
         if let Some(path) = source.dylib.as_ref().filter(|_| sysroot(tcx, cnum)) {
             writeln!(out, "{DYLIB} {}", path.display())?;
@@ -79,71 +80,94 @@ fn in_dylibs(tcx: TyCtxt<'_>) -> HashSet<CrateNum> {
 const DYLIB: &str = "dylib";
 const ALONE: &str = "alone";
 const NATIVE: &str = "lib";
-const UNIT: &str = "unit";
 const RLIB_PREFIX: &str = "lib";
 
 const ALLOCATOR_SUFFIX: &str = "___rust_alloc";
 
+const USAGE: &str = "usage: prep-driver link <prep directory> <library directory> [<directory of an earlier library>]";
+
+/// The name of the lld driver in the toolchain's linker directory.
+const LLD: &str = "ld.lld";
+
+/// What a second library adds to its link so it finds the first one beside it at run time and leaves no symbol unresolved.
+const AGAINST_BASE: [&str; 2] = ["-Wl,-rpath,$ORIGIN", "-Wl,--no-undefined"];
+
 /// The kinds of lines that describe a trait object or function pointer type or a static, in the order the merged manifest lists them.
 const INDIRECT: [&str; 3] = [object::OBJECT, object::POINTER, statics::STATIC];
 
-/// The extension of the merged manifest that `link` writes beside the library, in TOML.
-pub const MANIFEST_EXTENSION: &str = "toml";
-
+/// What a link of some units takes: their objects without allocator shims, their release objects, what the linking units link, their manifests, the instances whose release copy keeps its convention, and how many symbols rebinding changed.
 #[derive(Default)]
-struct Inputs {
+pub struct Inputs {
     objects: Vec<PathBuf>,
     released: Vec<PathBuf>,
     dylibs: BTreeSet<String>,
     alone: BTreeSet<String>,
     libs: Vec<String>,
     manifests: Vec<PathBuf>,
+    copies: HashSet<String>,
+    rebound: usize,
+}
+
+/// Where a link finds what its units do not define: the shared standard library and the sysroot rlibs no dylib holds, or also the library in a directory, which already links those rlibs.
+#[derive(Clone, Copy)]
+pub enum Against<'a> {
+    Sysroot,
+    Base(&'a Path),
 }
 
 fn run(args: &[String]) -> Result<()> {
-    let [root, out] = args else {
-        return Err(Error("usage: prep-driver link <prep directory> <library>".to_string()));
-    };
-    let mut inputs = gather(Path::new(root))?;
-    inputs.objects = without_allocator(&inputs.objects)?;
-    inputs.released = without_allocator(&inputs.released)?;
-    let symbols = symbols(&inputs.manifests)?;
-    let released = released(&inputs.released, &symbols)?;
-    let mut rebound = 0;
-    for object in inputs.released.iter().chain(&inputs.objects) {
-        rebound += elf::rebind(object, &symbols)?;
+    match args {
+        [root, dir] => whole(Path::new(root), Path::new(dir)),
+        [root, dir, base] => crate::delta::link(Path::new(root), Path::new(dir), Path::new(base)).or_else(|error| {
+            eprintln!("prep link: linking every unit again: {error}");
+            crate::delta::clear(Path::new(dir))?;
+            whole(Path::new(root), Path::new(dir))
+        }),
+        _ => Err(Error(USAGE.to_string())),
     }
-    link(&inputs, Path::new(out))?;
-    let defined = elf::defined(Path::new(out), Table::Dynamic, Scope::All)?;
-    let mut shared = HashSet::new();
-    for dylib in &inputs.dylibs {
-        shared.extend(elf::defined(Path::new(dylib), Table::Dynamic, Scope::All)?);
-    }
-    let (kept, missing) = merge(&inputs.manifests, (&defined, &shared, &released), &PathBuf::from(format!("{out}.{MANIFEST_EXTENSION}")))?;
-    let size = fs::metadata(out)?.len();
-    let counts = format!("units {} objects {} released {}", inputs.manifests.len(), inputs.objects.len() + inputs.released.len(), released.len());
-    println!("{counts} rebound {rebound} records {kept} missing {missing} bytes {size}");
-    Ok(())
 }
 
-/// The inputs of the units under `root` that a linked crate of the package links, or of every unit when no crate of it links.
-fn gather(root: &Path) -> Result<Inputs> {
-    let mut inputs = Inputs::default();
+/// Links every unit under `root` into the library in `dir`, and writes its manifest and the list of its units beside it.
+fn whole(root: &Path, dir: &Path) -> Result<()> {
+    let units = units(root)?;
+    let inputs = inputs(&units, &units)?;
+    let out = dir.join(files::LIBRARY);
+    link(&inputs, &out, Against::Sysroot)?;
+    let counts = merge(&inputs, &out, (&dir.join(files::manifest(files::LIBRARY)), &[]))?;
+    crate::delta::write_units(&units, &dir.join(files::UNITS))?;
+    report(&inputs, &out, counts)
+}
+
+/// The directories of the units under `root` that a linked crate of the package links, or of every unit when no crate of it links.
+pub fn units(root: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs: Vec<PathBuf> = fs::read_dir(root)?.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
     dirs.sort();
     let mut linked = HashSet::new();
     for dir in dirs.iter().filter(|dir| dir.join(LINK).exists()) {
         let text = fs::read_to_string(dir.join(LINK))?;
-        linked.extend(text.lines().filter_map(|line| line.strip_prefix(UNIT)?.strip_prefix(' ')).map(str::to_string));
+        linked.extend(text.lines().filter_map(|line| line.strip_prefix(record::UNIT)?.strip_prefix(' ')).map(str::to_string));
     }
     let wanted = |dir: &PathBuf| linked.is_empty() || dir.join(LINK).exists() || dir.file_name().and_then(|name| name.to_str()).is_some_and(|name| linked.contains(name));
-    for dir in dirs.iter().filter(|dir| dir.join(MANIFEST).exists() && wanted(dir)) {
+    Ok(dirs.iter().filter(|dir| dir.join(MANIFEST).exists() && wanted(dir)).cloned().collect())
+}
+
+/// The inputs of a link of the units in `dirs`, with what the linking units of `all` link, each object rebound so the library exports every recorded instance and keeps its release copy.
+pub fn inputs(dirs: &[PathBuf], all: &[PathBuf]) -> Result<Inputs> {
+    let mut inputs = Inputs::default();
+    for dir in dirs {
         inputs.manifests.push(dir.join(MANIFEST));
         inputs.objects.extend(objects(dir)?);
         inputs.released.extend(objects(&dir.join(RELEASE))?);
-        if dir.join(LINK).exists() {
-            libraries(&dir.join(LINK), &mut inputs)?;
-        }
+    }
+    for dir in all.iter().filter(|dir| dir.join(LINK).exists()) {
+        libraries(&dir.join(LINK), &mut inputs)?;
+    }
+    inputs.objects = without_allocator(&inputs.objects)?;
+    inputs.released = without_allocator(&inputs.released)?;
+    let symbols = symbols(&inputs.manifests)?;
+    inputs.copies = released(&inputs.released, &symbols)?;
+    for object in inputs.released.iter().chain(&inputs.objects) {
+        inputs.rebound += elf::rebind(object, &symbols)?;
     }
     Ok(inputs)
 }
@@ -172,8 +196,8 @@ fn libraries(path: &Path, inputs: &mut Inputs) -> Result<()> {
     Ok(())
 }
 
-/// Links the inputs into the shared library `out` against the toolchain's shared libstd, so the process holds one std.
-fn link(inputs: &Inputs, out: &Path) -> Result<()> {
+/// Links `inputs` into the shared library `out` against the toolchain's shared libstd, so the process holds one std, and against what `against` names.
+pub fn link(inputs: &Inputs, out: &Path, against: Against<'_>) -> Result<()> {
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let mut command = Command::new(cc);
     command.args(["-shared", "-Wl,-Bsymbolic", "-o"]).arg(out);
@@ -181,12 +205,38 @@ fn link(inputs: &Inputs, out: &Path) -> Result<()> {
     command.args(&inputs.dylibs);
     let dirs: BTreeSet<_> = inputs.dylibs.iter().filter_map(|dylib| Path::new(dylib).parent()).collect();
     command.args(dirs.iter().map(|dir| format!("-Wl,-rpath,{}", dir.display())));
-    command.arg("-Wl,--start-group").args(&inputs.alone).arg("-Wl,--end-group");
+    match against {
+        Against::Sysroot => {
+            command.arg("-Wl,--start-group").args(&inputs.alone).arg("-Wl,--end-group");
+        }
+        Against::Base(dir) => {
+            command.arg(format!("-L{}", dir.display())).arg(format!("-l:{}", files::LIBRARY)).args(AGAINST_BASE);
+            command.args(lld());
+        }
+    }
     command.args(inputs.libs.iter().map(|lib| format!("-l{lib}")));
     let status = command.status()?;
     if !status.success() {
         return Err(Error(format!("the linker failed: {status}")));
     }
+    Ok(())
+}
+
+/// The options that make the C compiler link with the toolchain's own lld, which links a small library against a large one several times faster than the system linker; none when the toolchain has none.
+fn lld() -> Vec<String> {
+    let (Some(sysroot), Some(target)) = (option_env!("PREP_SYSROOT"), option_env!("PREP_TARGET")) else { return Vec::new() };
+    let dir = Path::new(sysroot).join(format!("lib/rustlib/{target}/bin/gcc-ld"));
+    if !dir.join(LLD).is_file() {
+        return Vec::new();
+    }
+    vec![format!("-B{}", dir.display()), "-fuse-ld=lld".to_string()]
+}
+
+/// Prints what the link of `inputs` into `out` took and kept.
+pub fn report(inputs: &Inputs, out: &Path, (kept, missing): (usize, usize)) -> Result<()> {
+    let size = fs::metadata(out)?.len();
+    let counts = format!("units {} objects {} released {}", inputs.manifests.len(), inputs.objects.len() + inputs.released.len(), inputs.copies.len());
+    println!("{counts} rebound {} records {kept} missing {missing} bytes {size}", inputs.rebound);
     Ok(())
 }
 
@@ -220,43 +270,76 @@ fn released(objects: &[PathBuf], symbols: &HashSet<String>) -> Result<HashSet<St
     Ok(found)
 }
 
-/// Writes the merged manifest of `manifests` to `out`: each record whose symbol the library defines, or the shared standard library for a record of its code, and each distinct line describing a type or a static.
-fn merge(manifests: &[PathBuf], (defined, shared, released): (&HashSet<String>, &HashSet<String>, &HashSet<String>), out: &Path) -> Result<(usize, usize)> {
-    let (mut records, mut library) = (Vec::new(), serde_json::Map::new());
-    let mut indirect: [BTreeMap<String, Value>; 3] = Default::default();
-    let mut missing = 0;
-    for manifest in manifests {
+/// Writes to `out` the manifest of `library`, linked from `inputs`, with the units whose records of an earlier library's manifest it replaces, and returns how many records it kept and dropped.
+pub fn merge(inputs: &Inputs, library: &Path, (out, replaces): (&Path, &[String])) -> Result<(usize, usize)> {
+    let defined = elf::defined(library, Table::Dynamic, Scope::All)?;
+    let mut shared = HashSet::new();
+    for dylib in &inputs.dylibs {
+        shared.extend(elf::defined(Path::new(dylib), Table::Dynamic, Scope::All)?);
+    }
+    let mut merged = Merged::default();
+    for manifest in &inputs.manifests {
+        let unit = manifest.parent().and_then(|dir| dir.file_name()).map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
         for line in BufReader::new(File::open(manifest)?).lines() {
-            let mut record: Value = serde_json::from_str(&line?)?;
-            if let Some((kind, name)) = INDIRECT.iter().enumerate().find_map(|(at, kind)| Some((at, record.get(*kind)?.as_str()?.to_string()))) {
-                indirect[kind].entry(name).or_insert(record);
-                continue;
-            }
-            let Some(symbol) = record.get("symbol").and_then(Value::as_str).map(str::to_string) else {
-                let facts = record.get(record::LIBRARY).and_then(Value::as_object).cloned().unwrap_or_default();
-                library.extend(facts.into_iter().filter(|(_, value)| !value.is_null()));
-                continue;
-            };
-            let upstream = record.get(record::UPSTREAM).and_then(Value::as_bool) == Some(true);
-            if !defined.contains(&symbol) && !(upstream && shared.contains(&symbol)) {
-                missing += 1;
-                continue;
-            }
-            record["release_copy"] = Value::Bool(released.contains(&symbol));
-            records.push(record);
+            merged.add(serde_json::from_str(&line?)?, &unit, (&defined, &shared, &inputs.copies));
         }
     }
-    let kept = records.len();
-    let mut document = serde_json::Map::new();
-    document.insert(record::LIBRARY.to_string(), Value::Object(library));
-    document.insert(record::RECORD.to_string(), Value::Array(records));
-    for (kind, lines) in INDIRECT.iter().zip(indirect) {
-        document.insert(kind.to_string(), Value::Array(lines.into_values().collect()));
+    merged.write(out, replaces)
+}
+
+/// A merged manifest being built: the records kept, the library facts, each distinct line describing a type or a static, and how many records name a symbol the library lacks.
+#[derive(Default)]
+struct Merged {
+    records: Vec<Value>,
+    library: serde_json::Map<String, Value>,
+    indirect: [BTreeMap<String, Value>; 3],
+    missing: usize,
+}
+
+impl Merged {
+    /// Adds a line of the manifest of `unit`: a record when the library defines its symbol, or the shared standard library for a record of its code, a type or static line once with every unit that has it, library facts otherwise.
+    fn add(&mut self, mut record: Value, unit: &str, (defined, shared, copies): (&HashSet<String>, &HashSet<String>, &HashSet<String>)) {
+        if let Some((kind, name)) = INDIRECT.iter().enumerate().find_map(|(at, kind)| Some((at, record.get(*kind)?.as_str()?.to_string()))) {
+            let line = self.indirect[kind].entry(name).or_insert_with(|| {
+                record[record::USED_BY] = Value::Array(Vec::new());
+                record
+            });
+            if let Some(units) = line[record::USED_BY].as_array_mut() {
+                units.push(Value::String(unit.to_string()));
+            }
+            return;
+        }
+        let Some(symbol) = record.get("symbol").and_then(Value::as_str).map(str::to_string) else {
+            let facts = record.get(record::LIBRARY).and_then(Value::as_object).cloned().unwrap_or_default();
+            self.library.extend(facts.into_iter().filter(|(_, value)| !value.is_null()));
+            return;
+        };
+        let upstream = record.get(record::UPSTREAM).and_then(Value::as_bool) == Some(true);
+        if !defined.contains(&symbol) && !(upstream && shared.contains(&symbol)) {
+            self.missing += 1;
+            return;
+        }
+        record["release_copy"] = Value::Bool(copies.contains(&symbol));
+        record[record::UNIT] = Value::String(unit.to_string());
+        self.records.push(record);
     }
-    let document = Value::Object(document);
-    let text = toml::to_string(&without_nulls(document)).map_err(|error| Error(error.to_string()))?;
-    fs::write(out, text)?;
-    Ok((kept, missing))
+
+    /// Writes the merged manifest to `out` in TOML, naming the units in `replaces` when there are any, and returns how many records it kept and dropped.
+    fn write(self, out: &Path, replaces: &[String]) -> Result<(usize, usize)> {
+        let kept = self.records.len();
+        let mut document = serde_json::Map::new();
+        document.insert(record::LIBRARY.to_string(), Value::Object(self.library));
+        document.insert(record::RECORD.to_string(), Value::Array(self.records));
+        for (kind, lines) in INDIRECT.iter().zip(self.indirect) {
+            document.insert(kind.to_string(), Value::Array(lines.into_values().collect()));
+        }
+        if !replaces.is_empty() {
+            document.insert(record::REPLACES.to_string(), Value::Array(replaces.iter().cloned().map(Value::String).collect()));
+        }
+        let text = toml::to_string(&without_nulls(Value::Object(document))).map_err(|error| Error(error.to_string()))?;
+        fs::write(out, text)?;
+        Ok((kept, self.missing))
+    }
 }
 
 fn without_nulls(value: Value) -> Value {

@@ -18,9 +18,11 @@ extern crate rustc_trait_selection;
 
 mod abi;
 mod args;
+mod delta;
 mod elf;
 mod error;
 mod export;
+mod files;
 mod form;
 mod key;
 mod layout;

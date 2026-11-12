@@ -9,8 +9,12 @@ mod edit;
 mod ident;
 mod indirect;
 mod key;
+mod race;
 mod record;
+mod sources;
 mod statics;
+#[path = "../../prep-driver/src/files.rs"]
+mod files;
 #[path = "../../prep-driver/src/form.rs"]
 mod form;
 #[path = "../../prep-driver/src/print.rs"]
@@ -22,13 +26,13 @@ use std::ffi::{CStr, CString};
 use std::hash::BuildHasher as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 use anyhow::{Context as _, Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::graph::Workspace;
+use crate::graph::{Targets, Workspace};
 use crate::host::HostSymbol;
 use crate::lower::Slots;
 use crate::outline::Outline;
@@ -40,10 +44,12 @@ use crate::sema::ty::Ty;
 use bind::{Bindings, Decision};
 use cargo::Toolchain;
 use edit::Snapshot;
+use sources::Sources;
 
 pub use bind::Tally;
 pub use bridge::Carry;
 pub use indirect::{Method, Vtable};
+pub use race::{Ahead, ahead, set_wait};
 
 /// What a prep made: the records of the library it built.
 #[derive(Clone, Copy, Debug)]
@@ -57,12 +63,11 @@ impl std::fmt::Display for Counts {
     }
 }
 
-const ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 4;
 const SUPPORTED: bool = cfg!(all(target_arch = "x86_64", target_os = "linux"));
 const STORE: &str = "prep";
 const RUSTC: &str = "rustc";
 const LOCK: &str = "rustc.lock";
-const PREP_ARGS: [&str; 2] = ["--release", "prep"];
 
 /// The driver's library of one build and what binding a reached function to it needs.
 pub struct Manifest {
@@ -81,15 +86,109 @@ const ENTRY_BYTES: usize = 1 << 20;
 
 static BOUND: OnceLock<Manifest> = OnceLock::new();
 
-/// Builds the workspace's member package with the prep driver into the store, beside a snapshot of the sources of `outline`, and says what the library holds.
-pub fn prep(outline: &Outline, workspace: &Workspace) -> Result<Counts> {
+static TOOLCHAIN: OnceLock<Toolchain> = OnceLock::new();
+
+/// A prep of a build started before Haste loads the build's sources: where its library goes, the lock it holds while it runs, the files as they read when it started, and what it does.
+pub struct Started {
+    out: PathBuf,
+    lock: std::fs::File,
+    sources: Sources,
+    work: Work,
+}
+
+/// What a started prep does: nothing, since the library was built from the files as they read; the driver build it started on those files; or a build once the sources load, since no library names the files to read.
+enum Work {
+    Current,
+    Early(JoinHandle<Result<PathBuf>>),
+    Late,
+}
+
+/// Starts the prep of the build of `workspace` before its sources load: waits until no other prep of the build runs, then starts the driver on the files the library was built from as they read now, unless they did not change; a first prep starts once the sources load.
+pub fn begin(workspace: &Workspace, targets: &Targets) -> Result<Started> {
     if !SUPPORTED {
         bail!("prep supports x86-64 Linux only");
     }
-    let toolchain = Toolchain::find()?;
-    let key = key(outline, workspace, &toolchain)?;
-    let rustc = rustc(outline, workspace, (&toolchain, key))?.context("the prep driver's library does not match the sources")?;
-    Ok(Counts { records: rustc.len() })
+    let toolchain = toolchain()?;
+    let dir = dir(key(&pins(workspace, targets), workspace, toolchain)?);
+    std::fs::create_dir_all(&dir)?;
+    let lock = match handed(&dir)? {
+        Some(lock) => lock,
+        None => lock(&dir, true)?.context("taking the prep lock")?,
+    };
+    let out = dir.join(RUSTC);
+    let then = Snapshot::read(&out.join(bind::SNAPSHOT)).ok();
+    let sources = Sources::read(then.as_ref().map(|then| then.sources.paths()).unwrap_or_default());
+    if let Some(mut then) = then.filter(|then| then.sources.same(&sources)) {
+        then.sources = sources.clone();
+        then.write(&out.join(bind::SNAPSHOT))?;
+        return Ok(Started { out, lock, sources, work: Work::Current });
+    }
+    if sources.paths().is_empty() {
+        return Ok(Started { out, lock, sources, work: Work::Late });
+    }
+    let (store, root, at) = (store(), root(workspace)?, out.clone());
+    let build = std::thread::spawn(move || driver::run(toolchain, &store, &root, &at));
+    Ok(Started { out, lock, sources, work: Work::Early(build) })
+}
+
+impl Started {
+    /// Finishes this prep once Haste loaded the build's sources into `outline`: keeps the library the driver built when it read those sources, else builds again from them, publishes it with a snapshot of them, and says what the library holds.
+    pub fn end(self, outline: &Outline, workspace: &Workspace) -> Result<Counts> {
+        let Started { out, lock, sources, work } = self;
+        match work {
+            Work::Current => {}
+            Work::Early(build) => settle(&out, (sources, Some(joined(build))), (outline, workspace))?,
+            Work::Late => settle(&out, (sources, None), (outline, workspace))?,
+        }
+        drop(lock);
+        let rustc = Bindings::read(&out, &Snapshot::take(outline, workspace), (outline, workspace), None)?.context("the prep driver's library does not match the sources")?;
+        Ok(Counts { records: rustc.len() })
+    }
+
+    /// Stops this prep when Haste cannot load the sources: waits for the driver build and drops what it made.
+    pub fn cancel(self) {
+        let Work::Early(build) = self.work else { return };
+        if let Ok(fresh) = joined(build)
+            && let Err(error) = std::fs::remove_dir_all(&fresh)
+        {
+            eprintln!("haste: keeping {}: {error}", fresh.display());
+        }
+    }
+}
+
+/// The directory the driver build `build` made, once it ends.
+fn joined(build: JoinHandle<Result<PathBuf>>) -> Result<PathBuf> {
+    build.join().map_err(|_| anyhow::anyhow!("the prep build panicked")).and_then(|built| built)
+}
+
+/// Publishes at `out` the library of the build in `built` when rustc read the sources that `outline` holds as `sources` says, else builds it again from the sources as they read now and publishes that unless one changed while the driver ran; each beside a snapshot of the sources.
+fn settle(out: &Path, (sources, built): (Sources, Option<Result<PathBuf>>), (outline, workspace): (&Outline, &Workspace)) -> Result<()> {
+    let settled = sources.settled(outline, workspace)?;
+    let (fresh, sources) = match built {
+        Some(Ok(fresh)) if settled => (fresh, sources),
+        Some(Err(error)) if settled => return Err(error),
+        early => {
+            if let Some(Ok(fresh)) = early {
+                std::fs::remove_dir_all(fresh)?;
+            }
+            rebuild(out, (outline, workspace))?
+        }
+    };
+    let mut snapshot = Snapshot::take(outline, workspace);
+    snapshot.sources = sources;
+    snapshot.write(&fresh.join(bind::SNAPSHOT))?;
+    driver::publish(&fresh, out)
+}
+
+/// Builds the library for `out` from the sources as they read now, with what it read; fails when a source changed while the driver ran.
+fn rebuild(out: &Path, (outline, workspace): (&Outline, &Workspace)) -> Result<(PathBuf, Sources)> {
+    let sources = Sources::read(Sources::of(outline, workspace));
+    let fresh = driver::run(toolchain()?, &store(), &root(workspace)?, out)?;
+    if !sources.settled(outline, workspace)? {
+        std::fs::remove_dir_all(&fresh)?;
+        bail!("a local source changed while the prep driver ran");
+    }
+    Ok((fresh, sources))
 }
 
 /// Opens `manifest`, gives the shared standard library of its library the program arguments `args`, and makes it the one every later binding of this process reads.
@@ -194,45 +293,24 @@ pub fn call_native(cx: &mut Context<'_>, b: &mut haste_codegen::FunctionBuilder<
     Ok(bridge::call_native(b, &shapes, code, values))
 }
 
-/// The manifest that `prep` stored for the build of `workspace` when one matches its key and the sources outside functions, or why it cannot be read, and whether it was built from the sources as they are now.
-pub fn load(outline: &Outline, workspace: &Workspace) -> Result<(Result<Option<Manifest>>, bool)> {
+/// The manifest that `prep` stored for the build of `workspace` when one matches its key and the sources outside functions, read with what `ahead` read of it, or why it cannot be read, and whether it was built from the sources as they are now.
+pub fn load(outline: &Outline, workspace: &Workspace, ahead: Option<&mut Ahead>) -> Result<(Result<Option<Manifest>>, bool)> {
     if !SUPPORTED {
         return Ok((Ok(None), true));
     }
-    let toolchain = Toolchain::find()?;
-    let key = key(outline, workspace, &toolchain)?;
-    let rustc = Bindings::read(&dir(key).join(RUSTC), &Snapshot::take(outline, workspace), (outline, workspace));
+    let key = key(&outline.pins, workspace, toolchain()?)?;
+    let rustc = Bindings::read(&dir(key).join(RUSTC), &Snapshot::take(outline, workspace), (outline, workspace), ahead.and_then(Ahead::manifest));
     let current = rustc.as_ref().is_ok_and(|rustc| rustc.as_ref().is_some_and(Bindings::current));
     Ok((rustc.map(|rustc| rustc.map(|rustc| Manifest { rustc, entries: Mutex::new(Entries { memory: haste_codegen::Memory::default(), placed: HashMap::default() }) })), current))
 }
 
-/// Builds the workspace's member package with the prep driver into the store under `key`, beside a snapshot of its sources, while no other prep of the key runs, and reads what binding to it allows now; a library built while a local source changed is dropped.
-fn rustc(outline: &Outline, workspace: &Workspace, (toolchain, key): (&Toolchain, u64)) -> Result<Option<Bindings>> {
-    std::fs::create_dir_all(dir(key))?;
-    let _lock = lock(&dir(key), true)?;
-    let out = dir(key).join(RUSTC);
-    let before = Snapshot::take(outline, workspace);
-    let fresh = driver::run(toolchain, &store(), &root(workspace)?, &out)?;
-    if !edit::settled(outline, workspace)? {
-        std::fs::remove_dir_all(&fresh)?;
-        bail!("a local source changed while the prep driver ran");
-    }
-    before.write(&fresh.join(bind::SNAPSHOT))?;
-    driver::publish(&fresh, &out)?;
-    Bindings::read(&out, &before, (outline, workspace))
-}
-
 /// Starts `haste --release prep` on the build's member package in the background, unless a prep of the build runs now; it never waits for it.
 pub fn refresh(outline: &Outline, workspace: &Workspace) -> Result<()> {
-    let dir = dir(key(outline, workspace, &Toolchain::find()?)?);
+    let dir = dir(key(&outline.pins, workspace, toolchain()?)?);
     std::fs::create_dir_all(&dir)?;
-    if lock(&dir, false)?.is_none() {
-        return Ok(());
+    if let Some(child) = race::spawn(&dir, workspace)? {
+        race::reap(child);
     }
-    let mut command = std::process::Command::new(std::env::current_exe()?);
-    command.args(PREP_ARGS).arg(root(workspace)?).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    command.spawn().context("starting a background prep")?;
     Ok(())
 }
 
@@ -243,6 +321,15 @@ fn lock(dir: &Path, wait: bool) -> Result<Option<std::fs::File>> {
     // SAFETY: the descriptor belongs to `file`, which lives across the call; flock only changes the lock the open file holds.
     let held = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), mode) } == 0;
     Ok(held.then_some(file))
+}
+
+/// The prep lock of the build in `dir` when the run that started this process holds it and handed it over on standard input.
+fn handed(dir: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let input = std::fs::File::from(std::os::fd::AsFd::as_fd(&std::io::stdin()).try_clone_to_owned()?);
+    let (held, at) = (input.metadata(), std::fs::metadata(dir.join(LOCK)));
+    let same = matches!((held, at), (Ok(held), Ok(at)) if held.is_file() && (held.dev(), held.ino()) == (at.dev(), at.ino()));
+    Ok(same.then_some(input))
 }
 
 /// Loads the library at `path` into this process with its symbols global, so the dynamic linker finds every symbol it exports.
@@ -264,12 +351,26 @@ fn signature(typed: &Typed) -> (Vec<Ty>, Option<Ty>) {
     (typed.params.iter().map(|&local| typed.locals[local as usize].ty).collect(), typed.ret)
 }
 
-/// The key of everything prepped code depends on besides the local sources: the manifest format, the driver, the toolchain, the target, the dependency graph and the workspace.
-fn key(outline: &Outline, workspace: &Workspace, toolchain: &Toolchain) -> Result<u64> {
+/// The key of everything prepped code depends on besides the local sources: the manifest format, the driver, the toolchain, the target, the dependency graph by the pins of its crates, and the workspace.
+fn key(pins: &[Option<u64>], workspace: &Workspace, toolchain: &Toolchain) -> Result<u64> {
     let root = root(workspace)?;
     let triple = crate::graph::cfg::Target::host().triple;
     let format = (ABI_VERSION, driver::sources(), cargo::SETTINGS, crate::profile());
-    Ok(rustc_hash::FxBuildHasher.hash_one((format, &toolchain.version, &toolchain.library, triple, &outline.pins, root)))
+    Ok(rustc_hash::FxBuildHasher.hash_one((format, &toolchain.version, &toolchain.library, triple, pins, root)))
+}
+
+/// The pins of the crates of the build of `workspace`, which its outline holds before any source loads.
+fn pins(workspace: &Workspace, targets: &Targets) -> Vec<Option<u64>> {
+    crate::outline::new(workspace, targets, &[]).pins
+}
+
+/// The toolchain whose library sources Haste lowers, found once per process.
+fn toolchain() -> Result<&'static Toolchain> {
+    if let Some(found) = TOOLCHAIN.get() {
+        return Ok(found);
+    }
+    let found = Toolchain::find()?;
+    Ok(TOOLCHAIN.get_or_init(|| found))
 }
 
 fn root(workspace: &Workspace) -> Result<PathBuf> {

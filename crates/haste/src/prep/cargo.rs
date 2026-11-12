@@ -3,8 +3,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 
-/// The settings every prep build uses, which no user or workspace configuration can change: release optimization, no checks, abort on panic, no extra compiler flags.
-pub(super) const SETTINGS: [&str; 6] = ["build.rustflags=[]", "profile.release.opt-level=3", "profile.release.debug-assertions=false", "profile.release.overflow-checks=false", "profile.release.panic=\"abort\"", "profile.release.lto=false"];
+/// The settings every prep build uses, which no user or workspace configuration can change: release optimization, no checks, abort on panic, no extra compiler flags, and incremental builds of local crates, so a rebuild after an edit redoes only what it changed.
+pub(super) const SETTINGS: [&str; 7] = ["build.rustflags=[]", "profile.release.opt-level=3", "profile.release.debug-assertions=false", "profile.release.overflow-checks=false", "profile.release.panic=\"abort\"", "profile.release.lto=false", "profile.release.incremental=true"];
 
 const TOOLCHAIN_DEPTH: usize = 5;
 const CARGO_BIN: &str = "bin/cargo";

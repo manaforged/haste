@@ -9,23 +9,24 @@ use crate::graph::Workspace;
 use crate::names::ItemRef;
 use crate::outline::Outline;
 use crate::outline::item::ItemKind;
-use crate::outline::source::Source;
 use crate::outline::tree::File;
 
 use super::ident::identity;
 use super::key::{Place, on_disk};
+use super::files::FIELD;
+use super::sources::{FILE, Sources};
 
 const FUNCTION: &str = "fn";
 const ITEM: &str = "item";
 const REST: &str = "rest";
-const FIELD: char = '\t';
 
-/// The source of a build's local crates as prep saw it: each function by its identity with the hash of its text, where its name was and the byte range it spanned; where each other named item was; and a hash of all other text, which no edit may change for any prepped code to stay valid.
+/// The source of a build's local crates as prep saw it: each function by its identity with the hash of its text, where its name was and the byte range it spanned; where each other named item was; a hash of all other text, which no edit may change for any prepped code to stay valid; and the files rustc read.
 #[derive(PartialEq, Eq, Debug, Default)]
 pub(super) struct Snapshot {
     functions: BTreeMap<String, Function>,
     items: BTreeMap<String, Place>,
     rest: u64,
+    pub sources: Sources,
 }
 
 /// One function of a snapshot: the hash of its text, where its name is, and the byte range of its text in its file.
@@ -113,6 +114,7 @@ impl Snapshot {
         for (name, place) in &self.items {
             text.push_str(&format!("{ITEM}{FIELD}{}{FIELD}{}{FIELD}{name}\n", place.file, place.lo));
         }
+        text.push_str(&self.sources.lines());
         crate::graph::store::write_new(path, &text).with_context(|| format!("writing {}", path.display()))
     }
 
@@ -139,24 +141,11 @@ impl Snapshot {
                 self.functions.insert((*name).to_owned(), function);
             }
             [ITEM, file, _, name] => _ = self.items.insert((*name).to_owned(), Place { file: (*file).to_owned(), lo: number(2)? }),
+            [FILE, rest @ ..] => self.sources.line(rest)?,
             _ => return None,
         }
         Some(())
     }
-}
-
-/// Whether every local source file of `outline` still reads on disk as it did when `outline` was loaded.
-pub(super) fn settled(outline: &Outline, workspace: &Workspace) -> Result<bool> {
-    for krate in (0..outline.crates.len()).filter(|&krate| outline.package(workspace, krate).local()) {
-        for file in outline.crates[krate].files.iter().filter(|file| !file.expanded) {
-            let path = &file.source.path;
-            let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-            if Source::parse(path.clone(), text)?.text != file.source.text {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
 }
 
 fn crate_of(identity: &str) -> &str {

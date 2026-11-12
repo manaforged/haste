@@ -6,6 +6,7 @@ use anyhow::{Context as _, Result};
 use rustc_hash::FxBuildHasher;
 
 use super::cargo::{self, Toolchain};
+use super::files;
 
 macro_rules! sources {
     ($($path:literal),* $(,)?) => {
@@ -14,16 +15,18 @@ macro_rules! sources {
 }
 
 /// The source of the prep driver, which Haste builds once per toolchain into its store.
-const SOURCES: [(&str, &str); 20] = sources!(
+const SOURCES: [(&str, &str); 22] = sources!(
     "Cargo.toml",
     "Cargo.lock",
     "build.rs",
     "src/main.rs",
     "src/abi.rs",
     "src/args.rs",
+    "src/delta.rs",
     "src/elf.rs",
     "src/error.rs",
     "src/export.rs",
+    "src/files.rs",
     "src/form.rs",
     "src/key.rs",
     "src/layout.rs",
@@ -45,12 +48,6 @@ const CARGO_MANIFEST: &str = "Cargo.toml";
 const LINK: &str = "link";
 const BOOTSTRAP: (&str, &str) = ("RUSTC_BOOTSTRAP", "1");
 const WRAPPER: &str = "RUSTC_WRAPPER";
-const PREP_DIR: &str = "PREP_DIR";
-
-/// The library file a driver run leaves in its directory, and the manifest beside it.
-pub(super) const LIBRARY: &str = "library.so";
-/// The manifest the driver's link step writes beside `LIBRARY`.
-pub(super) const MANIFEST: &str = "library.so.toml";
 
 /// The hash of the driver's source, which every unit and library a driver build makes depends on.
 pub(super) fn sources() -> u64 {
@@ -75,7 +72,7 @@ fn binary(toolchain: &Toolchain, store: &Path) -> Result<PathBuf> {
     Ok(binary)
 }
 
-/// Builds the package at `package` in release with the driver as rustc's wrapper, links every function instance of its crate graph into one library, and leaves the library and its manifest in a new directory beside `out`, which it returns; the build and the driver's units stay beside `out`, so the next run rebuilds only what changed.
+/// Builds the package at `package` in release with the driver as rustc's wrapper, links every function instance of its crate graph into one library, or only the units rebuilt since the library `out` names into a second one beside a link to it, and leaves the libraries and their manifests in a new directory beside `out`, which it returns; the build and the driver's units stay beside `out`, so the next run rebuilds only what changed.
 pub(super) fn run(toolchain: &Toolchain, store: &Path, package: &Path, out: &Path) -> Result<PathBuf> {
     let driver = binary(toolchain, store)?;
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
@@ -85,9 +82,10 @@ pub(super) fn run(toolchain: &Toolchain, store: &Path, package: &Path, out: &Pat
     std::fs::create_dir_all(&fresh)?;
     let mut build = cargo::release(toolchain, &package.join(CARGO_MANIFEST), &target);
     cargo::settled(&mut build);
-    build.env(WRAPPER, &driver).env(PREP_DIR, &units).current_dir(package);
+    build.env(WRAPPER, &driver).env(files::PREP_DIR, &units).current_dir(package);
     cargo::output(&mut build).with_context(|| format!("building {} with the prep driver", package.display()))?;
-    cargo::output(Command::new(&driver).arg(LINK).arg(&units).arg(fresh.join(LIBRARY))).context("linking the prep library")?;
+    let base = out.canonicalize().ok().filter(|base| base.join(files::UNITS).is_file());
+    cargo::output(Command::new(&driver).arg(LINK).arg(&units).arg(&fresh).args(base)).context("linking the prep library")?;
     Ok(fresh)
 }
 

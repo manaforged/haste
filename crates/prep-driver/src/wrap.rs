@@ -11,7 +11,6 @@ use crate::{export, record};
 const BUG_URL: &str = "https://github.com/rust-lang/rust/issues/new";
 
 /// The environment variable that names the directory prep builds write to; without it the driver only compiles.
-pub const PREP_DIR: &str = "PREP_DIR";
 
 /// The subdirectory of a unit that holds the objects of the build that keeps rustc's own linkage, so its code matches a release build.
 pub const RELEASE: &str = "release";
@@ -131,11 +130,11 @@ fn compile(args: &[String], opts: &[Opt], unit: Unit, phase: Phase) -> ExitCode 
     let program = args.first().map(String::as_str).unwrap_or("rustc");
     match phase {
         Phase::Release => {
-            let released = args::prep(program, opts, &unit.dir.join(RELEASE));
+            let released = args::prep(program, opts, &unit.dir.join(RELEASE), phase.name());
             rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&released, &mut Released))
         }
         Phase::Exported => {
-            let exported = args::prep(program, opts, &unit.dir);
+            let exported = args::prep(program, opts, &unit.dir, phase.name());
             let mut prep = Prep { unit };
             rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&exported, &mut prep))
         }
@@ -151,7 +150,7 @@ fn compiler_args(mut args: Vec<String>) -> Vec<String> {
 }
 
 fn plan(args: &[String]) -> Option<(Vec<Opt>, Unit)> {
-    let root = std::env::var_os(PREP_DIR)?;
+    let root = std::env::var_os(crate::files::PREP_DIR)?;
     let opts = args::parse(args.get(1..)?);
     let name = args::last(&opts, "--crate-name")?;
     if !prepped(&opts, name) {

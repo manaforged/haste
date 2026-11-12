@@ -27,6 +27,15 @@ pub const UPSTREAM: &str = "upstream";
 /// The key of the array of instance records in the merged manifest.
 pub const RECORD: &str = "record";
 
+/// The key of a record of the merged manifest that names the unit it came from, and the word that starts a line of a link list naming a linked unit.
+pub const UNIT: &str = "unit";
+
+/// The key of a trait object, function pointer or static line of the merged manifest that names the units whose code uses it.
+pub const USED_BY: &str = "used_by";
+
+/// The key of the merged manifest of a second library that names the units whose records of the first library's manifest it replaces.
+pub const REPLACES: &str = "replaces";
+
 /// The diagnostic items of `std::io::stdout`, of the `Write` trait, and the name of its flush method.
 const STDOUT_ITEM: &str = "io_stdout";
 const WRITE_ITEM: &str = "IoWrite";

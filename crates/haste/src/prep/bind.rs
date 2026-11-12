@@ -18,9 +18,9 @@ use super::edit::{Changed, Snapshot};
 use super::ident;
 use super::indirect::{Indirect, Mode};
 use super::key::{Keys, Miss};
-use super::record::{At, Facts, InstanceKind, Library, Record};
+use super::record::{At, Facts, InstanceKind, Library, Parsed, Record};
 use super::statics::{Shared, Statics};
-use super::{conv, driver};
+use super::{conv, files};
 
 const MAIN: &str = "main";
 const START: &str = "std::rt::lang_start";
@@ -85,16 +85,16 @@ struct Decided {
 }
 
 impl Bindings {
-    /// The driver library in `dir` with its records ruled out by the edits from its snapshot to `now`; none when `dir` holds no library or an edit outside functions makes every record stale.
-    pub(super) fn read(dir: &Path, now: &Snapshot, (outline, workspace): (&Outline, &Workspace)) -> Result<Option<Bindings>> {
+    /// The driver library in `dir` with its records ruled out by the edits from its snapshot to `now`, its manifest taken from `ahead` when that read the same file; none when `dir` holds no library or an edit outside functions makes every record stale.
+    pub(super) fn read(dir: &Path, now: &Snapshot, (outline, workspace): (&Outline, &Workspace), ahead: Option<Parsed>) -> Result<Option<Bindings>> {
         let Ok(dir) = dir.canonicalize() else { return Ok(None) };
-        let (manifest, snapshot) = (dir.join(driver::MANIFEST), dir.join(SNAPSHOT));
+        let (manifest, snapshot) = (dir.join(files::manifest(files::LIBRARY)), dir.join(SNAPSHOT));
         if !manifest.is_file() || !snapshot.is_file() {
             return Ok(None);
         }
         let then = Snapshot::read(&snapshot)?;
         let Some(changed) = now.changed(&then) else { return Ok(None) };
-        let Library { library, record: records, object, pointer, statics } = Library::read(&manifest)?;
+        let Library { library, record: records, object, pointer, statics, .. } = Library::load(&dir, ahead)?;
         let indirect = Indirect::new(object, pointer, library.unkeyed);
         let mut index: HashMap<String, Vec<usize>> = HashMap::default();
         for (at, record) in records.iter().enumerate() {
@@ -107,7 +107,8 @@ impl Bindings {
         let keys = Keys::new(outline, workspace, then);
         let current = changed.ranges.is_empty() && changed.crates.is_empty();
         let statics = Statics::new(statics);
-        Ok(Some(Bindings { library: dir.join(driver::LIBRARY), facts: library, records, index, callers, stale, statics, settled: OnceLock::new(), keys, indirect, current, decided: Mutex::default() }))
+        let opened = [files::DELTA, files::LIBRARY].into_iter().map(|name| dir.join(name)).find(|path| path.is_file()).unwrap_or_else(|| dir.join(files::LIBRARY));
+        Ok(Some(Bindings { library: opened, facts: library, records, index, callers, stale, statics, settled: OnceLock::new(), keys, indirect, current, decided: Mutex::default() }))
     }
 
     /// The statics Haste's code shares and the records touching state it holds apart, worked out on first use: a record that reaches std state each std keeps apart or a static Haste does not share, or calls one that does; none when it is the program's `main`, whose code then runs every function; and the runtime's start always.
@@ -138,7 +139,7 @@ impl Bindings {
         self.current
     }
 
-    /// Loads the library into this process.
+    /// Loads the library into this process: the second library when there is one, which loads the first as it needs it and comes before it in every lookup.
     pub(super) fn open(&self) -> Result<()> {
         super::open(&self.library)
     }
