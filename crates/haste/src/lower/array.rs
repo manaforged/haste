@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{IntCC, Type, Value};
 
-use crate::body::{ExprId, List};
+use crate::body::{BlockKind, Expr, ExprId, List};
 use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Ty};
 
@@ -31,7 +31,7 @@ impl Lower<'_, '_> {
         let whole = repr(self.cx, ty)?;
         let Kind::Array(element, count) = *self.cx.types.kind(ty) else { bail!("repeat of a type that is not an array") };
         let (stride, part) = (self.cx.layout(element)?.size.bytes() as i32, repr(self.cx, element)?);
-        let value = self.expr(value)?;
+        let value = if self.uninit_call(value) { None } else { self.expr(value)? };
         let Some(slot) = self.slot(whole) else {
             return Ok(None);
         };
@@ -41,6 +41,18 @@ impl Lower<'_, '_> {
             }
         }
         Ok(self.read(Place::slot(slot, whole)))
+    }
+
+    /// Whether `expr` is `MaybeUninit::uninit()`, whose bytes are undefined, so a repeat of it need not store them.
+    fn uninit_call(&self, expr: ExprId) -> bool {
+        let expr = match *self.body.expr(expr) {
+            Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Const, .. } if self.body.list(stmts).is_empty() => tail,
+            _ => expr,
+        };
+        let Expr::Call(callee, args) = *self.body.expr(expr) else { return false };
+        let Some(&Res::Fn(item, _)) = self.typed.res.get(&expr).or_else(|| self.typed.res.get(&callee)) else { return false };
+        let Kind::Adt(adt, _) = *self.cx.types.kind(self.ty_of(expr)) else { return false };
+        self.body.list(args).is_empty() && self.cx.name(item) == "uninit" && self.cx.lang(adt) == Some("maybe_uninit")
     }
 
     /// The place that `base[index]` names after the autoderef steps of `base`: an element of an array or slice after a bounds check, or the target of `Index::index`.

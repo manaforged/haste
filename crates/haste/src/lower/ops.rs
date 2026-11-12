@@ -87,15 +87,12 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn float_const(&mut self, ty: Type, value: f64) -> Result<Value> {
-        let (bits, int) = match ty {
-            Type::F32 => (i64::from((value as f32).to_bits()), Type::I32),
-            Type::F64 => (value.to_bits() as i64, Type::I64),
+        let bits = match ty {
+            Type::F32 => i64::from((value as f32).to_bits()),
+            Type::F64 => value.to_bits() as i64,
             other => bail!("no float constant of {other:?}"),
         };
-        let slot = self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8);
-        let bits = self.ins().iconst(int, bits);
-        self.ins().stack_store(bits, slot, 0);
-        Ok(self.ins().stack_load(ty, slot, 0))
+        Ok(self.ins().iconst(ty, bits))
     }
 
     pub(super) fn unary(&mut self, expr: ExprId, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
