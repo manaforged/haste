@@ -356,9 +356,9 @@ impl Build {
     }
 }
 
-/// Runs the binary's `main` with `args` as argv, compiling each function on its first call, and under the release profile calling prepped code where it can, racing a prep of what changed since the library was built.
+/// Runs the binary's `main` with `args` as argv, compiling each function on its first call, and, when prepared code is switched on, under the release profile calling prepped code where it can, racing a prep of what changed since the library was built.
 pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> Result<i32> {
-    let mut ahead = if crate::profile() == Profile::Release { crate::prep::ahead(workspace, targets) } else { None };
+    let mut ahead = if crate::profile() == Profile::Release && crate::prep::prepared() { crate::prep::ahead(workspace, targets) } else { None };
     let status = run_loaded(workspace, targets, args, ahead.as_mut());
     if !matches!(status, Ok(0))
         && let Some(said) = ahead.as_mut().and_then(crate::prep::Ahead::rejected)
@@ -371,7 +371,7 @@ pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> 
 fn run_loaded(workspace: &graph::Workspace, targets: &Targets, args: &[String], ahead: Option<&mut crate::prep::Ahead>) -> Result<i32> {
     let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
     let Some(main) = main_item(workspace, &compilation.outline) else { bail!("no member binary has a `main`") };
-    if crate::profile() == Profile::Release {
+    if crate::profile() == Profile::Release && crate::prep::prepared() {
         bind_prepped(workspace, &mut compilation, args, ahead);
     }
     let status = crate::image::run_on_demand(&mut compilation, (sema::Cache::default(), main), args);

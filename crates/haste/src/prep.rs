@@ -49,7 +49,7 @@ use sources::Sources;
 pub use bind::Tally;
 pub use bridge::Carry;
 pub use indirect::{Method, Vtable};
-pub use race::{Ahead, ahead, set_wait};
+pub use race::{Ahead, ahead, prepared, set_prepared, set_wait};
 
 /// What a prep made: the records of the library it built.
 #[derive(Clone, Copy, Debug)]

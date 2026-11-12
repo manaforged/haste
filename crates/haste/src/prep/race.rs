@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,18 @@ static BUDGET: OnceLock<Duration> = OnceLock::new();
 /// Sets how long a run waits for a prep it raced, before any run reads it; zero turns racing off, so a run binds what the store holds and leaves the prep to the next run.
 pub fn set_wait(budget: Duration) {
     BUDGET.get_or_init(|| budget);
+}
+
+static PREPARED: AtomicBool = AtomicBool::new(false);
+
+/// Lets runs under the release profile call code rustc prepared; without it every function runs code this compiler made.
+pub fn set_prepared() {
+    PREPARED.store(true, Ordering::Relaxed);
+}
+
+/// Whether runs may call code rustc prepared.
+pub fn prepared() -> bool {
+    PREPARED.load(Ordering::Relaxed)
 }
 
 fn budget() -> Duration {
