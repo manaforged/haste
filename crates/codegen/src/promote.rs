@@ -637,6 +637,8 @@ pub(crate) enum Moves {
     Split,
     /// Those of them that an access of either end gives a layout for; a body kept for copying leaves the others whole for the caller, which may know how their bytes are read.
     Guided,
+    /// Every move that touches a slot only moves let escape, into words, without reading layouts.
+    Words,
 }
 
 /// Promotes every stack slot whose address never escapes into SSA values carried in block parameters, first splitting into pieces each move that `moves` splits and that touches a slot only moves let escape.
@@ -647,9 +649,9 @@ pub(crate) fn run(func: &mut Function, moves: Moves) {
     let mut scan = Scan::new(func);
     let mut splits = Vec::new();
     if func.insts.iter().any(|data| matches!(data.op, Op::Move(to, from, _) if scan.open(to) || scan.open(from))) {
-        let layouts = scan.layouts(func);
-        let pieces = |to: Value, from: Value, bytes: u32| match layouts.pieces(scan.end(to), scan.end(from), bytes) {
-            None if moves == Moves::Split => Some(crate::copy::words(bytes)),
+        let layouts = (moves != Moves::Words).then(|| scan.layouts(func));
+        let pieces = |to: Value, from: Value, bytes: u32| match layouts.as_ref().and_then(|layouts| layouts.pieces(scan.end(to), scan.end(from), bytes)) {
+            None if moves != Moves::Guided => Some(crate::copy::words(bytes)),
             guided => guided,
         };
         splits = crate::copy::expand(func, |to, from, bytes| if scan.open(to) || scan.open(from) { pieces(to, from, bytes) } else { None });

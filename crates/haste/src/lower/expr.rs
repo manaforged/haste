@@ -40,6 +40,11 @@ fn budget() -> &'static Budget {
     }
 }
 
+/// Whether calls may copy bodies of the crate with `env` inline: the standard library's, and under the release profile those of every crate whose sources cannot change while haste runs.
+fn inlinable(env: &crate::outline::tree::Env) -> bool {
+    env.release || (crate::profile() == crate::outline::tree::Profile::Release && env.fixed)
+}
+
 /// What an item's attributes ask of inlining.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hint {
@@ -84,7 +89,7 @@ fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option
     if typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
         return None;
     }
-    if !cx.outline.crates[item.krate as usize].env.release || crate::prep::bind(cx, reached, index).is_some() {
+    if !inlinable(&cx.outline.crates[item.krate as usize].env) || crate::prep::bind(cx, reached, index).is_some() {
         return None;
     }
     let budget = budget();

@@ -51,7 +51,7 @@ pub use coroutine::{Coroutine, FIRST_SUSPEND, RETURNED, UNRESUMED};
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
 pub use reloc::{DictTierUp, FootprintHasher, RelocKind, RuntimeSymbol, StencilReloc};
-pub use target::{Arch, CallAbi, Format, Os, TARGETS, Target};
+pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
 
 /// A call site that has an exception handler, as offsets into its function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,15 +103,15 @@ pub fn dict_entry_stub(arch: Arch, stub_exec: usize, body_exec: usize, dict_addr
 }
 
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
-pub fn simplify(func: &mut Function) {
-    optimize(func, promote::Moves::Guided);
+pub fn simplify(func: &mut Function, effort: Effort) {
+    optimize(func, promote::Moves::Guided, effort);
     fold::compact(func);
 }
 
-fn optimize(func: &mut Function, moves: promote::Moves) {
+fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
     fill::run(func);
     fold::run(func);
-    promote::run(func, moves);
+    promote::run(func, if effort == Effort::Full { moves } else { promote::Moves::Words });
     fold::run(func);
     merge::run(func);
     cse::run(func);
@@ -122,7 +122,7 @@ fn optimize(func: &mut Function, moves: promote::Moves) {
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, message))?;
-    optimize(&mut func, promote::Moves::Split);
+    optimize(&mut func, promote::Moves::Split, target.effort);
     if target.arch != Arch::X64 {
         copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
     }

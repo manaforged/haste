@@ -265,6 +265,8 @@ pub struct Env {
     pub known: bool,
     pub vars: Vec<(String, String)>,
     pub release: bool,
+    /// Whether the crate's sources cannot change while haste runs: the standard library, or a registry or git package.
+    pub fixed: bool,
 }
 
 /// The build profile every crate compiles under: Cargo's dev profile, or its release profile.

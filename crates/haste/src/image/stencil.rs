@@ -2,11 +2,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Code, DictTierUp, Site, Target};
+use haste_codegen::{Code, DictTierUp, Effort, Site, Target};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::lower::{self, FootprintId, RodataId, RodataReloc, RodataTarget, Slots, SymbolSource, VtableEntry, VtableId, Word};
 use crate::names::ItemRef;
+use crate::outline::tree::Profile;
 use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sync::lock;
@@ -39,6 +40,20 @@ impl DictConfig {
         let tier_up = env_usize("HASTE_JIT_TIER_UP").map_or(DEFAULT_TIER_UP, |v| v as u32);
         let verify = std::env::var_os("HASTE_VERIFY_STENCIL").is_some_and(|v| v == "1");
         Self { min_bytes, min_fanout, tier_up, verify }
+    }
+}
+
+/// The host target with the code generator's effort set by the build profile.
+fn target() -> Target {
+    Target::host().with(crate::profile().into())
+}
+
+impl From<Profile> for Effort {
+    fn from(profile: Profile) -> Effort {
+        match profile {
+            Profile::Debug => Effort::Quick,
+            Profile::Release => Effort::Full,
+        }
     }
 }
 
@@ -264,7 +279,7 @@ impl Image {
         let item = reached.list[index].0.0;
         let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
         let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-        let code = haste_codegen::compile(out.func, Target::host()).map_err(|e| item_err(cx, item, e))?;
+        let code = haste_codegen::compile(out.func, &target()).map_err(|e| item_err(cx, item, e))?;
         let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
         self.slot(index).store(exec, Ordering::Release);
         pass.record_size(index, code.bytes().len() as u32, started.elapsed().as_nanos() as u64);
@@ -350,7 +365,7 @@ impl Image {
         }
         let started = std::time::Instant::now();
         let out = lower::lower_stencil(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?;
-        let code = Arc::new(haste_codegen::compile(out.func, Target::host()).map_err(|e| item_err(cx, group.item, e))?);
+        let code = Arc::new(haste_codegen::compile(out.func, &target()).map_err(|e| item_err(cx, group.item, e))?);
         if code.bytes().len() > cfg.min_bytes && group.distinct.len() >= cfg.min_fanout {
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);
@@ -387,7 +402,7 @@ impl Image {
         let rep = group.representative();
         let started = std::time::Instant::now();
         let (func, _) = lower::lower_dict(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?;
-        let code = Arc::new(haste_codegen::compile(func, Target::host()).map_err(|e| item_err(cx, group.item, e))?);
+        let code = Arc::new(haste_codegen::compile(func, &target()).map_err(|e| item_err(cx, group.item, e))?);
         let body_exec = self.write_dict_body(&code, pass).map_err(|e| item_err(cx, group.item, e))?;
         let mut records = Vec::new();
         for inst in &group.distinct {
@@ -427,7 +442,7 @@ impl Image {
 
     fn emit_dict_stub(&self, body_exec: usize, symbols: &[u64], tier_up: Option<DictTierUp>, pass: &mut Pass) -> Result<(usize, Vec<u8>)> {
         let dict_addr = self.alloc_dict(symbols);
-        let arch = Target::host().arch;
+        let arch = target().arch;
         let space = if tier_up.is_some() { TIER_STUB_SPACE } else { DICT_STUB_SPACE };
         let mut written = Vec::new();
         let exec = pass.memory.write_with(space, |stub_exec| {
@@ -459,7 +474,7 @@ impl Image {
                     bail!("unreached inline callee");
                 }
                 let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-                let code = Arc::new(haste_codegen::compile(out.func, Target::host())?);
+                let code = Arc::new(haste_codegen::compile(out.func, &target())?);
                 let exec = pass.memory.write_patched(&code, &symbols)?;
                 pass.stencils.first_jit.insert(item, Some((index, code, symbols, exec)));
                 Ok(Some(exec))
@@ -517,7 +532,7 @@ impl Image {
             return Ok(entry.stencil.clone());
         }
         let out = lower::lower_stencil(cx, reached, self, index)?;
-        let stencil = Arc::new(haste_codegen::compile(out.func, Target::host())?);
+        let stencil = Arc::new(haste_codegen::compile(out.func, &target())?);
         pass.stencils.jit_templates.insert(key, JitTemplate { stencil: stencil.clone(), dict: None, fanout: 1 });
         Ok(stencil)
     }
@@ -527,7 +542,7 @@ impl Image {
             Some(pair) => pair,
             None => {
                 let (func, _) = lower::lower_dict(cx, reached, self, index)?;
-                let code = Arc::new(haste_codegen::compile(func, Target::host())?);
+                let code = Arc::new(haste_codegen::compile(func, &target())?);
                 let exec = self.write_dict_body(&code, pass)?;
                 if let Some(jt) = pass.stencils.jit_templates.get_mut(&key) {
                     jt.dict = Some((exec, code.clone()));
@@ -610,7 +625,7 @@ impl Image {
         let out = lower::lower_stencil(cx, reached, fresh, index)?;
         let slots: &dyn Slots = fresh;
         let symbols: Vec<u64> = out.relocs.iter().map(|sym| slots.resolve_symbol(sym)).collect();
-        let fresh_code = haste_codegen::compile(out.func, Target::host())?;
+        let fresh_code = haste_codegen::compile(out.func, &target())?;
         let mut expected = vec![0u8; fresh_code.bytes().len()];
         fresh_code.patch(&symbols, &mut expected);
         // SAFETY: exec..exec + len is mapped readable executable code in this image.
@@ -626,7 +641,7 @@ impl Image {
 
     fn verify_dict(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, (body_exec, stub_exec): (usize, usize), stub_bytes: &[u8], code: &Code) -> Result<()> {
         let (func, _) = lower::lower_dict(cx, reached, fresh, index)?;
-        let fresh_code = haste_codegen::compile(func, Target::host())?;
+        let fresh_code = haste_codegen::compile(func, &target())?;
         if !fresh_code.relocs().iter().all(|reloc| reloc.as_runtime().is_some()) {
             bail!("dict body verification found non-runtime relocations");
         }

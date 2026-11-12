@@ -179,7 +179,7 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root) -> Crate {
     let known = script || unit.script.is_some() || workspace.packages[unit.package].manifest.build.is_none();
     let side = if script { crate::graph::Side::Host } else { unit.side };
     let vars = if script { crate::graph::script::package_vars(workspace, root.unit) } else { crate::graph::script::crate_vars(workspace, root.unit) };
-    let env = Env { target: targets.of(side).clone(), features: unit.features.clone(), script: unit.script.clone().filter(|_| !script), known, vars, release: workspace.packages[unit.package].sysroot };
+    let env = Env { target: targets.of(side).clone(), features: unit.features.clone(), script: unit.script.clone().filter(|_| !script), known, vars, release: workspace.packages[unit.package].sysroot, fixed: !workspace.packages[unit.package].local() };
     Crate { env, modules: vec![root_module(&root.path)], ..Crate::default() }
 }
 
