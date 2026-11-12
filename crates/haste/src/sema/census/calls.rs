@@ -251,7 +251,7 @@ fn hash_intrinsic_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key
         Intrinsic::TypeName => {
             bins.k.byte(2);
             if let Some(&ty) = substs.first() {
-                let text = cx.type_text(ty, &|t| t);
+                let text = crate::sema::infer::type_name(cx, ty);
                 bins.d.byte(21);
                 bins.d.u64(key);
                 bins.d.bytes(text.as_bytes());

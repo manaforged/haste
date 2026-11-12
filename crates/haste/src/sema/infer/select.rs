@@ -25,9 +25,12 @@ struct Vars {
 }
 
 /// The traits that closures, function items and function pointers implement by the compiler, with no impl to select.
-const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
+pub(super) const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
 
 const BUILTIN: [&str; 12] = ["sized", "meta_sized", "pointee_sized", "copy", "clone", "destruct", "tuple_trait", "freeze", "pointee_trait", "unsize", "sync", "unpin"];
+
+/// The sizedness traits weaker than `Sized`, whose bound on a parameter drops its implicit `Sized` bound.
+const WEAKER_THAN_SIZED: [&str; 2] = ["meta_sized", "pointee_sized"];
 
 /// The compiler traits that no unsized type implements.
 const SIZED_ONLY: [&str; 3] = ["sized", "copy", "clone"];
@@ -356,6 +359,9 @@ impl<'a> Infer<'_, 'a> {
             wanted.extend(header.body.list(generic.bounds).iter().map(|&bound| (arg, bound)));
         }
         self.with_frame(frame, |infer| {
+            if infer.sets_unsized_param(block, &header, (impl_args, home))? {
+                return Ok(false);
+            }
             infer.self_ty = Some(infer.lower_ty(&header.body, header.self_ty)?);
             for (ty, bound) in wanted {
                 if !infer.bound_holds(&header.body, home, (ty, bound), depth)? {
@@ -375,6 +381,26 @@ impl<'a> Infer<'_, 'a> {
         })
     }
 
+    /// Whether impl `block` at `impl_args` sets a type parameter to a slice, `str` or trait object while the parameter keeps its implicit `Sized` bound, which rules the impl out.
+    fn sets_unsized_param(&mut self, block: ImplRef, header: &crate::body::sig::ImplHeader, (impl_args, home): (&[Ty], ModRef)) -> Result<bool> {
+        let src = &self.cx.impl_file(block).source;
+        for (generic, &arg) in type_params(&header.generics).zip(impl_args) {
+            if generic.kind != crate::body::sig::GenericKind::Type || !self.cx.types.kind(self.resolve(arg)).is_unsized() {
+                continue;
+            }
+            let bounds = super::scope::generic_bounds(&header.body, src, &header.predicates, generic);
+            if !bounds.into_iter().any(|bound| self.relaxes_sized(&header.body, bound, home)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `bound` drops the implicit `Sized` bound of the parameter it is on: `?Sized`, or a bound on a sizedness trait weaker than `Sized`.
+    fn relaxes_sized(&mut self, arena: &Body, bound: u32, home: ModRef) -> bool {
+        matches!(arena.bounds[bound as usize], Bound::Trait { maybe: true, .. }) || self.bound_trait_at(arena, bound, home).and_then(|(of, _)| self.cx.lang(of)).is_some_and(|lang| WEAKER_THAN_SIZED.contains(&lang))
+    }
+
     fn bound_holds(&mut self, arena: &Body, home: ModRef, (ty, bound): (Ty, u32), depth: u32) -> Result<bool> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
             return Ok(true);
@@ -384,7 +410,7 @@ impl<'a> Infer<'_, 'a> {
         }
         let kind = self.cx.types.kind(self.resolve(ty));
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
-            return self.var_holds(arena, (of, path), ty);
+            return self.var_holds(arena, (of, path), ty, depth);
         }
         if self.compiler_impl(of, ty) {
             let args = self.bound_args(of, arena, path, ty)?;
@@ -567,12 +593,12 @@ impl<'a> Infer<'_, 'a> {
         Ok(true)
     }
 
-    /// Whether the bound `of` at `path` can hold for the unknown type `ty`: false only when `ty` is a pending `impl Trait` value whose own bound of that trait does not unify.
-    fn var_holds(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty) -> Result<bool> {
-        if !matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
-            return Ok(true);
-        }
+    /// Whether the bound `of` at `path` can hold for the unknown type `ty`: for an integer or float variable, whether an impl for some number type applies, as rustc selects with one; else false only when `ty` is a pending `impl Trait` value whose own bound of that trait does not unify.
+    fn var_holds(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty, depth: u32) -> Result<bool> {
         let args = self.bound_args(of, arena, path, ty)?;
+        if !matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
+            return Ok(!self.applicable(of, ty, &args, depth + 1)?.is_empty() || self.poly_may_implement(of, ty, &args)?);
+        }
         let substs: Vec<Ty> = std::iter::once(ty).chain(args).collect();
         let held = self.opaque_holds(of, &substs)?;
         if held.is_none() {

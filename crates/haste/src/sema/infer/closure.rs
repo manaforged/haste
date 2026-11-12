@@ -418,7 +418,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Infers and coerces the argument `arg` of a call of `callee` to its parameter type `param`, giving a closure argument the signature of the parameter's `Fn` bound.
-    pub(super) fn call_arg(&mut self, callee: Option<(ItemRef, &[Ty])>, arg: ExprId, (param, expectation): (Ty, Option<Ty>)) -> Result<()> {
+    pub(super) fn call_arg(&mut self, callee: Option<(ItemRef, &[Ty])>, arg: ExprId, (param, expectation): (Ty, Option<Ty>), held: &mut Option<(ItemRef, Vec<Ty>)>) -> Result<()> {
         let callable = match *self.cx.types.kind(self.resolve(param)) {
             Kind::Ref(_, pointee) => pointee,
             _ => param,
@@ -431,6 +431,7 @@ impl<'a> Infer<'_, 'a> {
         let propagate = closure || self.holds_closure(arg) || matches!(self.body.expr(self.wrapped(arg)), Expr::Array(_));
         let usable = expectation.filter(|&wanted| propagate || self.sized_expectation(wanted));
         let found = self.expr(arg, Some(hint.or(usable).unwrap_or(param)))?;
+        self.release_if_fits(held, found, param)?;
         self.coerce_arg((arg, found, closure), param, expectation)?;
         match bound {
             Some(bound) => self.tie_callable(callable, bound),
@@ -521,7 +522,7 @@ impl<'a> Infer<'_, 'a> {
         }))
     }
 
-    fn is_closure(&self, arg: ExprId) -> bool {
+    pub(super) fn is_closure(&self, arg: ExprId) -> bool {
         matches!(*self.body.expr(self.wrapped(arg)), Expr::Closure { .. })
     }
 

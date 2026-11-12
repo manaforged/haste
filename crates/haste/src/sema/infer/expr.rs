@@ -448,8 +448,9 @@ impl Infer<'_, '_> {
             _ => return self.other_call(expr, found, callee_ty, args),
         };
         let args = self.passed_args(def.as_ref(), args, params.len())?;
+        let held = self.hold_open_obligation(def.as_ref())?;
         let def = def.or_else(|| self.ctor_callee(callee));
-        self.call_args(args, (params, ret, def), expected)
+        self.call_args(args, (params, ret, def), (expected, held))
     }
 
     fn other_call(&mut self, expr: ExprId, found: Ty, callee_ty: Ty, args: List) -> Result<Ty> {
@@ -497,15 +498,19 @@ impl Infer<'_, '_> {
     }
 
     /// Infers the arguments `args` of a call of a function with `params` that returns `ret`, the function item `def` when it is one, and returns `ret`.
-    fn call_args(&mut self, args: Vec<u32>, (params, ret, def): (Vec<Ty>, Ty, Option<(ItemRef, Vec<Ty>)>), expected: Option<Ty>) -> Result<Ty> {
+    fn call_args(&mut self, args: Vec<u32>, (params, ret, def): (Vec<Ty>, Ty, Option<(ItemRef, Vec<Ty>)>), (expected, mut held): (Option<Ty>, Option<(ItemRef, Vec<Ty>)>)) -> Result<Ty> {
         let extra = self.variadic_extra(def.as_ref().map(|(item, _)| *item), args.len(), params.len())?;
         let hints = self.expected_inputs(&params, ret, expected);
         for ((&arg, param), hint) in args.iter().zip(params).zip(hints) {
-            self.call_arg(def.as_ref().map(|(item, substs)| (*item, &substs[..])), ExprId(arg), (param, hint))?;
+            if self.is_closure(ExprId(arg)) {
+                self.release_obligation(&mut held)?;
+            }
+            self.call_arg(def.as_ref().map(|(item, substs)| (*item, &substs[..])), ExprId(arg), (param, hint), &mut held)?;
         }
         for &arg in &args[args.len() - extra..] {
             self.expr(ExprId(arg), None)?;
         }
+        self.release_obligation(&mut held)?;
         Ok(ret)
     }
 

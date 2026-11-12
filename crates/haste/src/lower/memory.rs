@@ -22,7 +22,7 @@ impl Lower<'_, '_> {
             (SizeOfVal | AlignOfVal, Some(ty), &[pointer]) => self.value_layout(which == SizeOfVal, ty, pointer).map(Some),
             (NeedsDrop | TypeId, Some(ty), _) => self.type_fact(which, ty).map(Some),
             (TypeName, Some(ty), _) => {
-                let name = self.cx.type_text(ty, &|ty| ty);
+                let name = crate::sema::infer::type_name(self.cx, ty);
                 let id = self.slots.rodata(name.as_bytes(), &[]);
                 let data = self.emit_symbol(SymbolSource::Rodata(id));
                 let len = self.emit_symbol(SymbolSource::Word(name.len() as u64));

@@ -12,6 +12,7 @@ mod expr;
 mod looping;
 mod matching;
 mod method;
+mod name;
 mod object;
 mod opaque;
 mod pat;
@@ -33,6 +34,7 @@ pub use consts::{Anon, Arena};
 pub use drop::{Glue, drop_fn, has_drop_impl, needs_drop};
 pub use looping::{For, Tried};
 pub use method::Adjust;
+pub use name::type_name;
 pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
@@ -330,19 +332,30 @@ impl Infer<'_, '_> {
     }
 
     fn trial<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<Option<T>>) -> Result<Option<T>> {
-        let saved = self.vars.clone();
+        let saved = self.snapshot();
         let out = f(self);
         if !matches!(out, Ok(Some(_))) {
-            self.vars = saved;
+            self.roll_back(saved);
         }
         out
     }
 
     fn probe<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-        let saved = self.vars.clone();
+        let saved = self.snapshot();
         let out = f(self);
-        self.vars = saved;
+        self.roll_back(saved);
         out
+    }
+
+    /// The variable bindings and the deferred projections and obligations, which name those variables and so roll back with them.
+    fn snapshot(&self) -> Snapshot {
+        (self.vars.clone(), self.projections.clone(), self.obligations.clone())
+    }
+
+    fn roll_back(&mut self, (vars, projections, obligations): Snapshot) {
+        self.vars = vars;
+        self.projections = projections;
+        self.obligations = obligations;
     }
 
     fn fresh(&mut self, kind: fn(u32) -> Kind) -> Ty {
@@ -615,6 +628,9 @@ impl Infer<'_, '_> {
         self.cx.type_text(ty, &|ty| self.resolve(ty))
     }
 }
+
+/// What `Infer::snapshot` saves: the variable bindings, then the deferred projections and obligations.
+type Snapshot = (Vec<Option<Ty>>, Vec<project::Projection>, Vec<(ItemRef, Vec<Ty>)>);
 
 fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
     match kind {
