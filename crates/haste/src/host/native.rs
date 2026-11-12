@@ -65,30 +65,54 @@ pub fn symbol(name: &str) -> Option<usize> {
     LOADED.read().ok()?.symbols.as_ref()?.get(name).copied()
 }
 
-/// What the build scripts that ran for the crates of `outline` link, each archive found in their search directories.
+/// What the build scripts that ran for the crates of `outline` link, each archive found first in the search directories of the script that asked for it.
 fn libraries(outline: &Outline) -> Result<Libraries> {
     let mut wanted = Vec::new();
     let mut libraries = Libraries::default();
     for script in outline.crates.iter().filter_map(|krate| krate.env.script.as_ref()) {
-        libraries.search.extend(script.search_dirs().map(PathBuf::from));
-        wanted.extend(script.link_libs().map(|(kind, name)| (kind, name.to_owned())));
-    }
-    for (kind, name) in wanted {
-        match kind {
-            LinkKind::Static => libraries.archives.push(archive(&libraries.search, &name)?),
-            LinkKind::Dynamic | LinkKind::Framework => libraries.dynamic.push((kind, name)),
+        let own: Vec<PathBuf> = script.search_dirs().map(PathBuf::from).collect();
+        for (kind, name) in script.link_libs() {
+            match kind {
+                LinkKind::Static => wanted.push((own.clone(), name.to_owned())),
+                LinkKind::Dynamic | LinkKind::Framework => libraries.dynamic.push((kind, name.to_owned())),
+            }
         }
+        libraries.search.extend(own);
+    }
+    for (own, name) in wanted {
+        libraries.archives.push(archive(&own, &libraries.search, &name)?);
     }
     libraries.archives.sort();
     libraries.archives.dedup();
+    libraries.archives = distinct(std::mem::take(&mut libraries.archives))?;
     libraries.dynamic.sort();
     libraries.dynamic.dedup();
     Ok(libraries)
 }
 
-fn archive(search: &[PathBuf], name: &str) -> Result<PathBuf> {
+/// The first of each set of byte-identical `archives`, since linking two copies whole defines each of their symbols twice.
+fn distinct(archives: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut kept: Vec<(PathBuf, u64)> = Vec::new();
+    for archive in archives {
+        let size = std::fs::metadata(&archive)?.len();
+        let mut copy = false;
+        for (seen, _) in kept.iter().filter(|(_, seen_size)| *seen_size == size) {
+            copy = std::fs::read(seen)? == std::fs::read(&archive)?;
+            if copy {
+                break;
+            }
+        }
+        if !copy {
+            kept.push((archive, size));
+        }
+    }
+    Ok(kept.into_iter().map(|(archive, _)| archive).collect())
+}
+
+/// The archive `lib{name}.a` in the search directories of the script that asked for it, `own`, or else in those of every script.
+fn archive(own: &[PathBuf], search: &[PathBuf], name: &str) -> Result<PathBuf> {
     let file = format!("lib{name}.a");
-    search.iter().map(|dir| dir.join(&file)).find(|path| path.is_file()).with_context(|| format!("no {file} in the build scripts' search directories"))
+    own.iter().chain(search).map(|dir| dir.join(&file)).find(|path| path.is_file()).with_context(|| format!("no {file} in the build scripts' search directories"))
 }
 
 /// Links `libraries` into the store unless it holds them, opens the result, and reads its table of static symbols.
