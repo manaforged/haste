@@ -206,7 +206,7 @@ pub(super) fn outer_shape_digest(cx: &mut Context<'_>, substs: Substs) -> Digest
         }
         if let Ok(layout) = cx.layout(ty) {
             mix.u64(layout.size.bytes());
-            mix.u64(layout.align.abi.bytes());
+            mix.u64(layout.align.bytes());
         }
     }
     mix.finish()
@@ -218,7 +218,7 @@ pub(super) fn hash_unsized_kind(cx: &mut Context<'_>, ty: Ty, mix: &mut Mix) {
         Kind::Slice(elem) => {
             mix.byte(1);
             let size = cx.layout(elem).map_or(0, |l| l.size.bytes());
-            let align = cx.layout(elem).map_or(1, |l| l.align.abi.bytes());
+            let align = cx.layout(elem).map_or(1, |l| l.align.bytes());
             mix.u64(size);
             mix.u64(align);
         }

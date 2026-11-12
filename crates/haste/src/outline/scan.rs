@@ -92,6 +92,11 @@ impl Scanner<'_> {
         {
             self.items(block + 1, self.src.pair(block), parent)?;
         }
+        if let (ItemKind::Mod, None) = (head.kind, head.body)
+            && let Some(&block) = self.calls.and_then(|calls| calls.get(&(head.end - 1)))
+        {
+            self.items(block + 1, self.src.pair(block), Some(index))?;
+        }
         Ok(head.end)
     }
 

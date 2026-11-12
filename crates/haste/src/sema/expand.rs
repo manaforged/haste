@@ -7,11 +7,11 @@ use crate::body::{self as syntax, Body, sig};
 use crate::names::collect::{extern_crate_root, proc_kind};
 use crate::names::resolve::macro_at;
 use crate::names::{ItemRef, ModRef, plain};
-use crate::outline::item::{ItemKind, Items, ProcKind};
+use crate::outline::item::{Attr, ItemKind, Items, ProcKind};
 use crate::outline::rules::{self, Rule};
 use crate::outline::source::{Mark, Source, Tokens, opens};
 use crate::outline::tree::{Expansion, File, Truth};
-use crate::outline::{derive, mbe, scan};
+use crate::outline::{attr, derive, mbe, scan};
 
 use super::Context;
 use super::builtin::{self, Builtin};
@@ -87,10 +87,9 @@ fn defined_expand(cx: &Context<'_>, found: ItemRef, src: &Source, open: u32) -> 
     Some(mbe::expand(&definition.file.source, &definition.rules, src, (open, definition.krate as u32), home))
 }
 
-/// The output of the procedural macro `run` called with the delimiter at `open`, once the macro expander ran it; until then the call asks for it.
-fn proc_bang(cx: &mut Context<'_>, src: &Source, run: ItemRef, open: u32) -> Result<Option<Source>> {
-    let close = src.pair(open);
-    let input = if close > open + 1 { src.span(open + 1, close - 1).to_owned() } else { String::new() };
+/// The output of the procedural macro `run` called from crate `krate` with the delimiter at `open`, once the macro expander ran it; until then the call asks for it.
+fn proc_bang(cx: &mut Context<'_>, krate: u32, src: &Source, run: ItemRef, open: u32) -> Result<Option<Source>> {
+    let input = crate::macros::bang_input(&cx.outline.deps[krate as usize], krate as usize, src, open);
     let key = (run, input);
     match cx.outline.procs.get(&key) {
         Some(Ok(text)) => Source::parse(src.path.clone(), text.clone()).map(Some),
@@ -121,6 +120,11 @@ impl Writer {
 
     fn step(&mut self, cx: &mut Context<'_>, run: Run<'_>, at: u32) -> Result<u32> {
         let src = run.src;
+        if src.kind(at) == TokenKind::Pound
+            && let Some(next) = self.module_file(cx, run, at)?
+        {
+            return Ok(next);
+        }
         if src.kind(at) != TokenKind::Bang {
             return self.non_bang(cx, src, at);
         }
@@ -169,6 +173,32 @@ impl Writer {
         self.out.space();
         self.out.lexed("}");
         self.scan(cx, Run { src: &output, from: 0, shift: block + 1, depth: run.depth + 1, call: run.call_at(path.0) }, output.len())
+    }
+
+    /// Writes the file that a `#[path = ".."] mod name;` starting at `at` names as the module's block, keyed by its `;`, and returns the token after it.
+    fn module_file(&mut self, cx: &mut Context<'_>, run: Run<'_>, at: u32) -> Result<Option<u32>> {
+        let src = run.src;
+        let mut attrs = Vec::new();
+        let mut word = attr::attrs(src, at, false, &mut attrs)?;
+        let Some(path) = attrs.iter().find_map(|found| if let Attr::Path(path) = found { Some(path.clone()) } else { None }) else { return Ok(None) };
+        if src.text(word) == "pub" {
+            word += 1;
+            if src.kind(word) == TokenKind::OpenParen {
+                word = src.pair(word) + 1;
+            }
+        }
+        if src.text(word) != "mod" || !is_name(src.kind(word + 1)) || src.kind(word + 2) != TokenKind::Semi {
+            return Ok(None);
+        }
+        let output = Source::read(&run.call_at(at).0.beside(&path))?;
+        let block = self.offset + self.out.len();
+        self.calls.insert(run.shift + word + 2, block);
+        self.out.lexed("{");
+        self.out.copy_range(&output, 0, output.len());
+        self.out.space();
+        self.out.lexed("}");
+        self.scan(cx, Run { src: &output, from: 0, shift: block + 1, depth: run.depth, call: (&output, 0) }, output.len())?;
+        Ok(Some(word + 3))
     }
 
     fn note_use(&mut self, src: &Source, at: u32) -> Result<Option<u32>> {
@@ -271,7 +301,7 @@ impl Writer {
             return output.map(Some);
         }
         if let Some((_, ProcKind::Bang)) = found.outer().is_none().then(|| cx.item(found)).and_then(|(src, item)| proc_kind(src, item)) {
-            return proc_bang(cx, run.src, found, open);
+            return proc_bang(cx, self.home.krate, run.src, found, open);
         }
         let Some(builtin) = cx.builtin(found) else {
             return Ok(None);

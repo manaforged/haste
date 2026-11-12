@@ -103,7 +103,7 @@ fn hash_one_coercion(cx: &mut Context<'_>, reached: &Reached, (key, coercion): (
 fn hash_vtable(cx: &mut Context<'_>, reached: &Reached, vtable: &Vtable, mix: &mut Mix) {
     if let Ok(layout) = cx.layout(vtable.ty) {
         mix.u64(layout.size.bytes());
-        mix.u64(layout.align.abi.bytes());
+        mix.u64(layout.align.bytes());
     }
     hash_vtable_fn(reached, vtable.drop.as_ref(), mix);
     mix.usize(vtable.methods.len());
@@ -289,7 +289,7 @@ fn hash_layout_intrinsic(cx: &mut Context<'_>, which: Intrinsic, ty: Option<Ty>,
         }
         (Intrinsic::AlignOf, Some(ty)) => {
             bins.k.byte(5);
-            bins.k.u64(cx.layout(ty).map_or(1, |l| l.align.abi.bytes()));
+            bins.k.u64(cx.layout(ty).map_or(1, |l| l.align.bytes()));
         }
         (Intrinsic::NeedsDrop, Some(ty)) => {
             bins.k.byte(6);

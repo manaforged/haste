@@ -335,7 +335,7 @@ impl Lower<'_, '_> {
             Some(place) => Ok(self.address(place)),
             None => {
                 let layout = self.cx.layout(ty)?;
-                Ok(self.ins().iconst(Type::I64, layout.align.abi.bytes() as i64))
+                Ok(self.ins().iconst(Type::I64, layout.align.bytes() as i64))
             }
         }
     }

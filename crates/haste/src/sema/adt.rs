@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use rustc_abi::{Align, Integer, IntegerType, LayoutCalculator, ReprFlags, ReprOptions, TargetDataLayout};
+use rustc_abi::{Align, Integer, IntegerType, LayoutCalculator, NicheOptimizations, ReprFlags, ReprOptions, TargetDataLayout};
 use rustc_index::IndexVec;
 
 use crate::names::{ItemRef, Primitive};
@@ -126,9 +126,10 @@ impl<'a> Context<'a> {
             ItemKind::Union => calc.layout_of_union(&repr, &variants),
             _ => {
                 let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { Arc::from([0]) };
-                let no_niche = matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned"));
-                let tagged = discriminants.iter().enumerate().map(|(at, &value)| (rustc_index::Idx::new(at), value));
-                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, no_niche, |min, max| discr_range(dl, &repr, min, max), tagged, sized)
+                let niches = if matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned")) { NicheOptimizations::Disabled } else { NicheOptimizations::Enabled };
+                let bits = Integer::from_attr(dl, repr.discr_type()).size();
+                let tagged = discriminants.iter().enumerate().map(|(at, &value)| (rustc_index::Idx::new(at), bits.truncate(value as u128)));
+                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, niches, |min, max| discr_range(dl, &repr, min.start, max.last), tagged, sized)
             }
         };
         result.map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))
@@ -170,14 +171,14 @@ fn integer_type(primitive: Primitive) -> IntegerType {
     }
 }
 
-fn discr_range(dl: &TargetDataLayout, repr: &ReprOptions, min: i128, max: i128) -> (Integer, bool) {
+fn discr_range(dl: &TargetDataLayout, repr: &ReprOptions, min: i128, max: u128) -> (Integer, bool) {
     match repr.int {
         Some(IntegerType::Fixed(integer, signed)) => return (integer, signed),
         Some(IntegerType::Pointer(signed)) => return (dl.ptr_sized_integer(), signed),
         None => {}
     }
-    let unsigned = Integer::fit_unsigned(std::cmp::max(min as u128, max as u128));
-    let signed = std::cmp::max(Integer::fit_signed(min), Integer::fit_signed(max));
+    let unsigned = Integer::fit_unsigned(max);
+    let signed = std::cmp::max(Integer::fit_signed(min), Integer::fit_signed(i128::try_from(max).unwrap_or(i128::MAX)));
     let at_least = if repr.c() { Integer::I32 } else { Integer::I8 };
     if min >= 0 { (std::cmp::max(unsigned, at_least), false) } else { (std::cmp::max(signed, at_least), true) }
 }

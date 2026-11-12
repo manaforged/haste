@@ -78,7 +78,7 @@ impl Lower<'_, '_> {
                 if untagged_variant.index() == variant as usize {
                     return Ok(());
                 }
-                ((variant as u128).wrapping_sub(niche_variants.start().index() as u128)).wrapping_add(*niche_start)
+                ((variant as u128).wrapping_sub(niche_variants.start.index() as u128)).wrapping_add(*niche_start)
             }
         };
         let value = self.int_const(tag.ty, value & tag.mask);
@@ -106,8 +106,8 @@ impl Lower<'_, '_> {
             TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                 let start = self.int_const(tag.ty, *niche_start & tag.mask);
                 let relative = self.ins().isub(value, start);
-                let first = niche_variants.start().index() as u128;
-                let span = self.int_const(tag.ty, niche_variants.end().index() as u128 - first);
+                let first = niche_variants.start.index() as u128;
+                let span = self.int_const(tag.ty, niche_variants.last.index() as u128 - first);
                 if untagged_variant.index() == variant as usize {
                     self.ins().icmp(IntCC::UnsignedGreaterThan, relative, span)
                 } else {
