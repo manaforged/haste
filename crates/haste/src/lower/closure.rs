@@ -130,7 +130,7 @@ impl Lower<'_, '_> {
         self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)
     }
 
-    fn callee_env(&mut self, callee: ExprId) -> Result<Vec<Value>> {
+    pub(super) fn callee_env(&mut self, callee: ExprId) -> Result<Vec<Value>> {
         let callee_ty = self.ty_of(callee);
         if !self.cx.closure_takes_env(callee_ty) {
             self.expr(callee)?;
@@ -286,9 +286,24 @@ impl Lower<'_, '_> {
         Ok(vec![self.address(place)])
     }
 
-    /// Whether a call of `item` at `substs` is a trait call of a closure, whose tupled arguments are not lowered yet.
     pub(super) fn tupled_closure_call(&mut self, item: ItemRef, substs: Substs) -> bool {
         let first = self.cx.types.substs(substs).first().copied();
         first.is_some_and(|ty| matches!(self.cx.types.kind(ty), Kind::Closure(..))) && self.cx.call_once() == Some(item)
+    }
+
+    pub(super) fn untuple_arg(&mut self, tuple_expr: ExprId, values: &mut Vec<Value>) -> Result<()> {
+        let tuple_ty = self.ty_of(tuple_expr);
+        let Kind::Tuple(items) = *self.cx.types.kind(tuple_ty) else { bail!("closure arguments that are not a tuple") };
+        let count = self.cx.types.substs(items).len() as u32;
+        if let Some(place) = self.place_or_temp(tuple_expr)? {
+            for index in 0..count {
+                let part = self.part_place(place, tuple_ty, (0, index))?;
+                values.extend(self.read(part));
+            }
+        }
+        if let Some((root, path)) = self.scrutinee_path(tuple_expr) {
+            self.moved_out(root, &path)?;
+        }
+        Ok(())
     }
 }

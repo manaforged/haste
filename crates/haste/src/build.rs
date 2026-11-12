@@ -86,8 +86,27 @@ fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<I
 }
 
 fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reached): (&mut sema::Context<'_>, &Reached), fresh: &[usize]) {
-    fresh.iter().for_each(|at| drop(broken.remove(at)));
-    broken.extend(image.compile(cx, reached, fresh));
+    let mut expanded = fresh.to_vec();
+    if crate::profile() == outline::tree::Profile::Release && !fresh.is_empty() && fresh.len() < reached.list.len() {
+        let mut dirty = vec![false; reached.list.len()];
+        for &at in fresh {
+            dirty[at] = true;
+        }
+        for _ in 0..3 {
+            let added: Vec<usize> = (0..reached.list.len())
+                .filter(|&u| !dirty[u] && reached.direct_calls(u).is_some_and(|callees| callees.iter().any(|&c| dirty[c])))
+                .collect();
+            if added.is_empty() {
+                break;
+            }
+            for u in added {
+                dirty[u] = true;
+                expanded.push(u);
+            }
+        }
+    }
+    expanded.iter().for_each(|at| drop(broken.remove(at)));
+    broken.extend(image.compile(cx, reached, &expanded));
 }
 
 impl Batch {

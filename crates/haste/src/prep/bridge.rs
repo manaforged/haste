@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, CallConv, Function, FunctionBuilder, Signature, Type, Value};
 
-use crate::lower::{Repr, repr, signature_of};
+use crate::lower::{Parts, Repr, passed_parts, repr, signature_of};
 use crate::sema::Context;
 use crate::sema::ty::Ty;
 
@@ -16,7 +16,7 @@ pub enum Carry {
 pub(crate) struct Shapes {
     pub haste: Signature,
     pub native: Signature,
-    pub kept: Vec<Carry>,
+    pub kept: Vec<(Carry, u8)>,
     pub sret: bool,
 }
 
@@ -36,12 +36,27 @@ pub(crate) fn shapes(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), c
         if matches!(repr(cx, param)?, Repr::Zst) {
             continue;
         }
-        let Some(&haste_param) = passed.next() else { bail!("a call with fewer parameters than its function") };
+        let arity = match passed_parts(cx, param)? {
+            Some(Parts::Pair(..)) => 2,
+            _ => 1,
+        };
         match carry {
-            Carry::Same => native.params.push(haste_param),
-            Carry::Split(first, second, _) => native.params.extend([AbiParam::new(first), AbiParam::new(second)]),
+            Carry::Same => {
+                for _ in 0..arity {
+                    let Some(&haste_param) = passed.next() else { bail!("a call with fewer parameters than its function") };
+                    native.params.push(haste_param);
+                }
+            }
+            Carry::Split(first, second, _) => {
+                for _ in 0..arity {
+                    if passed.next().is_none() {
+                        bail!("a call with fewer parameters than its function");
+                    }
+                }
+                native.params.extend([AbiParam::new(first), AbiParam::new(second)]);
+            }
         }
-        kept.push(carry);
+        kept.push((carry, arity));
     }
     Ok(Shapes { haste, native, kept, sret: sret.is_some() })
 }
@@ -50,10 +65,11 @@ pub(crate) fn shapes(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), c
 pub(crate) fn call_native(b: &mut FunctionBuilder<'_>, shapes: &Shapes, code: Value, values: &[Value]) -> Vec<Value> {
     let mut values = values.iter().copied();
     let mut args: Vec<Value> = values.by_ref().take(usize::from(shapes.sret)).collect();
-    for (&carry, value) in shapes.kept.iter().zip(values) {
+    for &(carry, arity) in &shapes.kept {
         match carry {
-            Carry::Same => args.push(value),
+            Carry::Same => args.extend(values.by_ref().take(usize::from(arity))),
             Carry::Split(first, second, offset) => {
+                let Some(value) = values.next() else { break };
                 let low = b.ins().load(first, value, 0);
                 let high = b.ins().load(second, value, offset);
                 args.extend([low, high]);
@@ -90,11 +106,11 @@ pub(super) fn entry(cx: &mut Context<'_>, types: (&[Ty], Option<Ty>), carries: &
     b.switch_to_block(block);
     let mut values = b.block_params(block).to_vec().into_iter();
     let mut args: Vec<Value> = values.by_ref().take(usize::from(shapes.sret)).collect();
-    for &carry in &shapes.kept {
-        let Some(value) = values.next() else { bail!("an entry with fewer arguments than its function") };
+    for &(carry, arity) in &shapes.kept {
         match carry {
-            Carry::Same => args.push(value),
+            Carry::Same => args.extend(values.by_ref().take(usize::from(arity))),
             Carry::Split(first, second, offset) => {
+                let Some(value) = values.next() else { bail!("an entry with fewer arguments than its function") };
                 let Some(high) = values.next() else { bail!("an entry with a split argument missing its second half") };
                 let size = offset as u32 + second.bytes();
                 let slot = b.create_stack_slot(size, first.bytes().max(second.bytes()).trailing_zeros() as u8);

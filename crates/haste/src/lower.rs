@@ -156,16 +156,8 @@ pub fn repr(cx: &mut Context<'_>, ty: Ty) -> Result<Repr> {
     Ok(if size == 0 { Repr::Zst } else { Repr::Mem { size, align: layout.align.bytes().trailing_zeros() as u8, parts: abi::copied_parts(&layout) } })
 }
 
-/// The register that a value of `ty` crosses a call in when it lives in memory but its layout is one scalar, as rustc passes such a value.
-pub fn unwrapped(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Type>> {
-    Ok(match repr(cx, ty)? {
-        Repr::Mem { parts: Parts::One(machine), .. } => Some(machine),
-        _ => None,
-    })
-}
-
-/// The scalars that a result of `ty` living in memory returns in, one register each, or none when it returns through a result pointer.
-pub fn returned(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
+/// The scalars that a memory value of `ty` crosses an internal call in, one register each, or none when it travels by address.
+pub fn passed_parts(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
     Ok(match repr(cx, ty)? {
         Repr::Mem { parts: parts @ Parts::One(_), .. } => Some(parts),
         Repr::Mem { parts: parts @ Parts::Pair(first, second, _), .. } if first != Type::I128 && second != Type::I128 => Some(parts),
@@ -173,7 +165,7 @@ pub fn returned(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
     })
 }
 
-/// The native signature of a reached function: memory values travel by address unless their layout is one scalar, and a memory result in the registers of `returned` or through a first `StructReturn` pointer.
+/// The native signature of a reached function: memory values travel by address unless `passed_parts` splits them into one or two scalar registers, and a memory result returns in those registers or through a first `StructReturn` pointer.
 pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
     signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))
 }
@@ -184,7 +176,7 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
     if let Some(ret) = ret {
         match repr(cx, ret)? {
             Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
-            Repr::Mem { .. } => match returned(cx, ret)? {
+            Repr::Mem { .. } => match passed_parts(cx, ret)? {
                 Some(parts) => signature.returns.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
                 None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn)),
             },
@@ -194,7 +186,10 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
     for param in params {
         match repr(cx, param)? {
             Repr::Scalar(ty) => signature.params.push(AbiParam::new(ty)),
-            Repr::Mem { .. } => signature.params.push(AbiParam::new(unwrapped(cx, param)?.unwrap_or(Type::I64))),
+            Repr::Mem { .. } => match passed_parts(cx, param)? {
+                Some(parts) => signature.params.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
+                None => signature.params.push(AbiParam::new(Type::I64)),
+            },
             Repr::Zst => {}
         }
     }
@@ -294,11 +289,7 @@ impl Lower<'_, '_> {
         let mut params = self.b.block_params(entry).to_vec().into_iter();
         self.sret = if indirect(&self.b.func.signature) { params.next() } else { None };
         for &local in &self.typed.params {
-            let value = match self.local_repr(local)? {
-                Repr::Zst => None,
-                _ => params.next(),
-            };
-            self.declare_passed(local, value)?;
+            self.declare_passed(local, &mut params)?;
             if let Some(&pat) = self.typed.unpacks.get(&local) {
                 self.bind_matched(pat, self.locals[local as usize], Some((moves::Root::Local(local), Vec::new())))?;
                 self.commit_moves()?;
@@ -413,38 +404,51 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// Declares parameter `local` with the value that crossed the call: a scalar is stored into the memory of a local whose type travels unwrapped.
-    fn declare_passed(&mut self, local: u32, value: Option<Value>) -> Result<()> {
+    fn declare_passed(&mut self, local: u32, params: &mut impl Iterator<Item = Value>) -> Result<()> {
         self.declare(local, None)?;
-        if let (Some(place), Some(value)) = (self.locals[local as usize], value) {
-            self.store_passed(local, place, value)?;
+        if let Some(place) = self.locals[local as usize] {
+            self.store_passed(local, place, params)?;
         }
         Ok(())
     }
 
-    /// Stores into `place` the value that parameter `local` received.
-    pub(super) fn store_passed(&mut self, local: u32, place: place::Place, value: Value) -> Result<()> {
-        match unwrapped(self.cx, self.typed.locals[local as usize].ty)? {
-            Some(machine) => self.write(place.at(0, Repr::Scalar(machine)), value),
-            None => self.write(place, value),
+    /// Stores into `place` the scalars or address that parameter `local` received from `params`, returning the last consumed `Value`.
+    pub(super) fn store_passed(&mut self, local: u32, place: place::Place, params: &mut impl Iterator<Item = Value>) -> Result<Option<Value>> {
+        let ty = self.typed.locals[local as usize].ty;
+        let mut last = None;
+        match passed_parts(self.cx, ty)? {
+            Some(parts) => {
+                for (machine, offset) in parts.scalars() {
+                    if let Some(value) = params.next() {
+                        self.write(place.at(offset, Repr::Scalar(machine)), value);
+                        last = Some(value);
+                    }
+                }
+            }
+            None => {
+                if let Some(value) = params.next() {
+                    self.write(place, value);
+                    last = Some(value);
+                }
+            }
+        }
+        Ok(last)
+    }
+
+    /// Appends `value`, a value of `ty`, as it crosses a call: scalars loaded from memory when `passed_parts` names them.
+    pub(super) fn push_passed(&mut self, ty: Ty, value: Value, out: &mut Vec<Value>) -> Result<()> {
+        match passed_parts(self.cx, ty)? {
+            Some(parts) => out.extend(parts.scalars().map(|(machine, offset)| self.ins().load(machine, value, offset))),
+            None => out.push(value),
         }
         Ok(())
     }
 
-    /// `value`, a value of `ty`, as it crosses a call: the scalar loaded from its memory when `ty` travels unwrapped.
-    pub(super) fn passed(&mut self, ty: Ty, value: Value) -> Result<Value> {
-        Ok(match unwrapped(self.cx, ty)? {
-            Some(machine) => self.ins().load(machine, value, 0),
-            None => value,
-        })
-    }
-
-    /// `value`, a result of `ty`, as the registers it returns in: the scalars loaded from its memory when `returned` names them.
+    /// `value`, a result of `ty`, as the registers it returns in: the scalars loaded from its memory when `passed_parts` names them.
     pub(super) fn returned_values(&mut self, ty: Ty, value: Value) -> Result<Vec<Value>> {
-        Ok(match returned(self.cx, ty)? {
-            Some(parts) => parts.scalars().map(|(machine, offset)| self.ins().load(machine, value, offset)).collect(),
-            None => vec![value],
-        })
+        let mut out = Vec::new();
+        self.push_passed(ty, value, &mut out)?;
+        Ok(out)
     }
 
     /// Gives `local` a fresh frame slot, writes `value` into it when given, and marks `local` initialized.

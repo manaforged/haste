@@ -41,9 +41,9 @@ fn budget() -> &'static Budget {
     }
 }
 
-/// Whether calls may copy bodies of the crate with `env` inline: the standard library's, and under the release profile those of every crate whose sources cannot change while haste runs.
+/// Whether calls may copy bodies of the crate with `env` inline: the standard library's, and every crate under the release profile.
 fn inlinable(env: &crate::outline::tree::Env) -> bool {
-    env.release || (crate::profile() == crate::outline::tree::Profile::Release && env.fixed)
+    env.release || crate::profile() == crate::outline::tree::Profile::Release
 }
 
 /// What an item's attributes ask of inlining.
@@ -294,7 +294,11 @@ impl Lower<'_, '_> {
             _ => return self.pointer_call(expr, callee, args),
         };
         if self.tupled_closure_call(item, substs) {
-            bail!("a `call_once` of a closure with a tupled argument is not lowered yet");
+            let arg_list = self.body.list(args).to_vec();
+            let [f_expr, tuple_expr] = arg_list.as_slice() else { bail!("tupled closure call expects 2 arguments") };
+            let mut values = self.callee_env(ExprId(*f_expr))?;
+            self.untuple_arg(ExprId(*tuple_expr), &mut values)?;
+            return self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values);
         }
         let values = self.args(args, Vec::new())?;
         self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values)
@@ -303,10 +307,15 @@ impl Lower<'_, '_> {
     fn method(&mut self, expr: ExprId, receiver: ExprId, params: List) -> Result<Option<Value>> {
         let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) else { bail!("method call has no resolution") };
         let Some(&adjust) = self.typed.adjusts.get(&expr) else { bail!("method call has no receiver adjustment") };
-        if self.tupled_closure_call(item, substs) {
-            bail!("a closure method call with a tupled argument is not lowered yet");
-        }
         let first = self.receiver((expr, receiver), adjust)?;
+        if self.tupled_closure_call(item, substs) {
+            let param_list = self.body.list(params).to_vec();
+            let [tuple_expr] = param_list.as_slice() else { bail!("tupled closure method expects 1 argument") };
+            let closure_ty = self.cx.types.substs(substs)[0];
+            let mut values = if self.cx.closure_takes_env(closure_ty) { first.into_iter().collect() } else { Vec::new() };
+            self.untuple_arg(ExprId(*tuple_expr), &mut values)?;
+            return self.invoke(SiteOrigin::Table(SiteKey::ExprRes(expr)), item, substs, values);
+        }
         let values = self.args(params, first.into_iter().collect())?;
         self.invoke(SiteOrigin::Table(SiteKey::ExprRes(expr)), item, substs, values)
     }
@@ -442,11 +451,11 @@ impl Lower<'_, '_> {
         if let Some(out) = out {
             return Ok(Some(self.ins().stack_addr(Type::I64, out, 0)));
         }
-        let parts: Vec<(Type, i32)> = super::returned(self.cx, ret)?.into_iter().flat_map(Parts::scalars).collect();
+        let parts: Vec<(Type, i32)> = super::passed_parts(self.cx, ret)?.into_iter().flat_map(Parts::scalars).collect();
         self.received(ret, &parts, &results)
     }
 
-    /// The argument `values` of a call that takes `params`, as they cross it: zero-sized parameters take no value, and a value whose type travels unwrapped crosses as its scalar.
+    /// The argument `values` of a call that takes `params`, as they cross it: zero-sized parameters take no value, and memory values in `passed_parts` expand into their scalar registers.
     pub(super) fn pass_all(&mut self, params: &[Ty], values: Vec<Value>) -> Result<Vec<Value>> {
         let mut values = values.into_iter();
         let mut passed = Vec::new();
@@ -455,7 +464,7 @@ impl Lower<'_, '_> {
                 continue;
             }
             let Some(value) = values.next() else { break };
-            passed.push(self.passed(param, value)?);
+            self.push_passed(param, value, &mut passed)?;
         }
         passed.extend(values);
         Ok(passed)

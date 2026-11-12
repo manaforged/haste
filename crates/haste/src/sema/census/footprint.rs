@@ -318,12 +318,16 @@ fn hash_header(cx: &mut Context<'_>, item: ItemRef, typed: &Typed, bins: &mut Ha
     for &param in &typed.params {
         let ty = typed.locals[param as usize].ty;
         hash_type_use(cx, ty, bins);
-        bins.k.byte(lower::unwrapped(cx, ty).ok().flatten().map_or(255, |m| m as u8));
+        bins.k.byte(lower::passed_parts(cx, ty).ok().flatten().map_or(0, |parts| match parts {
+            lower::Parts::One(_) => 1,
+            lower::Parts::Pair(..) => 2,
+            lower::Parts::Bytes => 3,
+        }));
     }
     if let Some(ret) = typed.ret {
         hash_type_use(cx, ret, bins);
         bins.k.flag(matches!(cx.types.kind(ret), Kind::Never));
-        bins.k.flag(lower::returned(cx, ret).ok().flatten().is_some());
+        bins.k.flag(lower::passed_parts(cx, ret).ok().flatten().is_some());
     }
     hash_shape_kind(cx, typed, bins);
 }

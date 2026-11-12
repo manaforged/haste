@@ -115,7 +115,7 @@ impl Lower<'_, '_> {
         for &local in &self.typed.params[1..] {
             if let Some(value) = self.locals[local as usize].and_then(|place| self.read(place)) {
                 let ty = self.typed.locals[local as usize].ty;
-                values.push(self.passed(ty, value)?);
+                self.push_passed(ty, value, &mut values)?;
             }
         }
         let (item, substs) = self.reached.list[self.index].0;
@@ -129,7 +129,9 @@ impl Lower<'_, '_> {
             }
             None => {
                 let code = self.ins().load(Type::I64, vtable, slot as i32 * 8);
-                let signature = super::signature(self.cx, self.typed)?;
+                let thin = self.cx.types.prim(crate::names::Primitive::Usize);
+                let rest: Vec<Ty> = self.typed.params[1..].iter().map(|&local| self.typed.locals[local as usize].ty).collect();
+                let signature = super::signature_of(self.cx, self.typed.ret, std::iter::once(thin).chain(rest))?;
                 let sig = self.b.import_signature(signature);
                 let call = self.ins().call_indirect(sig, code, &values);
                 self.b.inst_results(call).to_vec()

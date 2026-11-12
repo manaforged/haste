@@ -214,9 +214,8 @@ impl Lower<'_, '_> {
         let mut last = None;
         for at in 0..2 {
             let local = self.typed.params[at];
-            let (Some(place), Some(value)) = (self.locals[local as usize], params.next()) else { bail!("a resume block with missing arguments") };
-            self.store_passed(local, place, value)?;
-            last = Some(value);
+            let Some(place) = self.locals[local as usize] else { bail!("a resume block with missing arguments") };
+            last = self.store_passed(local, place, &mut params)?;
         }
         last.ok_or_else(|| anyhow::anyhow!("a resume block with no task context"))
     }

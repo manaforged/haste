@@ -18,7 +18,7 @@ use super::super::adt::tag_bits;
 use super::super::expr::inline_limit;
 use super::super::reloc::reached_index_of;
 use super::super::stencil::{FootprintId, item_bits, resolve_inline_meta};
-use super::super::{Inline, Parts, Repr, Slots, is_static, repr, returned, signature, signature_of, unwrapped};
+use super::super::{Inline, Parts, Repr, Slots, is_static, passed_parts, repr, signature, signature_of};
 
 #[derive(Clone, Copy)]
 pub(super) struct HashMix {
@@ -205,13 +205,12 @@ fn hash_ty_facts_depth(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, depth: u
     hash_repr(cx, mix, ty)?;
     let layout = cx.layout(ty)?;
     hash_parts(mix, copied_parts(&layout));
-    if let Some(r) = returned(cx, ty)? {
+    if let Some(p) = passed_parts(cx, ty)? {
         mix.byte(1);
-        hash_parts(mix, r);
+        hash_parts(mix, p);
     } else {
         mix.byte(0);
     }
-    mix.byte(unwrapped(cx, ty)?.map_or(0, type_code));
     mix.bool(needs_drop(cx, ty)?);
     mix.bool(has_drop_impl(cx, ty)?);
     if let Some(inner) = cx.boxed(ty) {

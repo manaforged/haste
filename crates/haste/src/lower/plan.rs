@@ -17,10 +17,10 @@ use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::reloc::{eval_autoderef_ty, eval_expr_ty, eval_table_site};
 use super::stencil::{FootprintId, item_bits};
-use super::{Inline, Slots, signature, signature_of, unwrapped};
+use super::{Inline, Slots, passed_parts, signature, signature_of};
 
 use build::build_plan;
-use ty::{HashMix, hash_call_edge, hash_drop_tree, hash_dyn_facts, hash_num_tag, hash_repr, hash_sig, hash_tuple_offsets, hash_ty_facts, type_code};
+use ty::{HashMix, hash_call_edge, hash_drop_tree, hash_dyn_facts, hash_num_tag, hash_parts, hash_repr, hash_sig, hash_tuple_offsets, hash_ty_facts};
 
 #[derive(Clone, Debug)]
 enum FieldSite {
@@ -151,7 +151,12 @@ fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, low: bool, item
     for &p in &typed.params {
         let pty = typed.locals[p as usize].ty;
         hash_repr(cx, mix, pty)?;
-        mix.byte(unwrapped(cx, pty)?.map_or(0, type_code));
+        if let Some(parts) = passed_parts(cx, pty)? {
+            mix.byte(1);
+            hash_parts(mix, parts);
+        } else {
+            mix.byte(0);
+        }
     }
     match typed.ret {
         Some(ret) => {

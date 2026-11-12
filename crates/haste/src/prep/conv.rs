@@ -2,7 +2,7 @@ use haste_codegen::Type;
 use rustc_abi::{FieldsShape, Variants};
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::lower::{Parts, Repr, repr, returned, unwrapped};
+use crate::lower::{Parts, Repr, passed_parts, repr};
 use crate::sema::Context;
 use crate::sema::infer::field_types;
 use crate::sema::layout::Layout;
@@ -37,7 +37,7 @@ fn carries_after(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), abi: 
     }
     let returns = match ret {
         Some(ty) if matches!(cx.types.kind(ty), Kind::Never) => return None,
-        Some(ty) => sized(cx, ty, &abi.ret) && result(cx, ty).is_some_and(|haste| same(haste, &abi.ret.pass)),
+        Some(ty) => sized(cx, ty, &abi.ret) && haste_pass(cx, ty).is_some_and(|haste| same(haste, &abi.ret.pass)),
         None => abi.ret.pass == Pass::Ignore,
     };
     returns.then_some(())?;
@@ -93,7 +93,7 @@ fn spread(cx: &mut Context<'_>, params: &[Ty]) -> Option<Vec<Ty>> {
 fn same_value(cx: &mut Context<'_>, tuple: Ty, item: Ty) -> bool {
     let (Ok(outer), Ok(inner)) = (cx.layout(tuple), cx.layout(item)) else { return false };
     let at_zero = crate::sema::layout::field_offset(&outer, 0, 0) == 0;
-    at_zero && outer.size == inner.size && outer.align.bytes() == inner.align.bytes() && argument(cx, tuple).is_some_and(|haste| argument(cx, item) == Some(haste))
+    at_zero && outer.size == inner.size && outer.align.bytes() == inner.align.bytes() && haste_pass(cx, tuple).is_some_and(|haste| haste_pass(cx, item) == Some(haste))
 }
 
 /// How an argument of `ty` reaches rustc's code that takes it as `arg`: as Haste passes it, or split from its address into the two registers of a scalar pair whose parts no signed narrow integer is, since a load widens with zeros.
@@ -101,7 +101,7 @@ fn carry(cx: &mut Context<'_>, ty: Ty, arg: &Arg) -> Option<Carry> {
     if !sized(cx, ty, arg) {
         return None;
     }
-    let haste = argument(cx, ty)?;
+    let haste = haste_pass(cx, ty)?;
     if same(haste, &arg.pass) {
         return Some(Carry::Same);
     }
@@ -116,19 +116,11 @@ fn sized(cx: &mut Context<'_>, ty: Ty, arg: &Arg) -> bool {
     cx.layout(ty).is_ok_and(|layout| layout.size.bytes() == arg.size && layout.align.bytes() == arg.align)
 }
 
-fn argument(cx: &mut Context<'_>, ty: Ty) -> Option<Haste> {
+fn haste_pass(cx: &mut Context<'_>, ty: Ty) -> Option<Haste> {
     Some(match repr(cx, ty).ok()? {
         Repr::Zst => Haste::Nothing,
         Repr::Scalar(machine) => Haste::One(machine),
-        Repr::Mem { .. } => unwrapped(cx, ty).ok()?.map_or(Haste::Address, Haste::One),
-    })
-}
-
-fn result(cx: &mut Context<'_>, ty: Ty) -> Option<Haste> {
-    Some(match repr(cx, ty).ok()? {
-        Repr::Zst => Haste::Nothing,
-        Repr::Scalar(machine) => Haste::One(machine),
-        Repr::Mem { .. } => match returned(cx, ty).ok()? {
+        Repr::Mem { .. } => match passed_parts(cx, ty).ok()? {
             Some(Parts::One(machine)) => Haste::One(machine),
             Some(Parts::Pair(first, second, offset)) => Haste::Two(first, second, offset),
             Some(Parts::Bytes) | None => Haste::Address,
@@ -140,7 +132,7 @@ fn same(haste: Haste, pass: &Pass) -> bool {
     match (haste, pass) {
         (Haste::Nothing, Pass::Ignore) => true,
         (Haste::One(machine), Pass::Direct { regs }) => matches!(regs.as_slice(), [Reg { class, offset: 0 }] if class.machine() == Some(machine)),
-        (Haste::Two(first, second, at), Pass::Pair { regs }) => match regs.as_slice() {
+        (Haste::Two(first, second, at), Pass::Pair { regs }) if !regs.iter().any(|reg| matches!(reg.class, Class::I8 | Class::I16)) => match regs.as_slice() {
             [one, two] => one.offset == 0 && one.class.machine() == Some(first) && two.class.machine() == Some(second) && i32::try_from(two.offset) == Ok(at),
             _ => false,
         },
