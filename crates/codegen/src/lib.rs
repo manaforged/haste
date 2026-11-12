@@ -143,7 +143,7 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, message))?;
     optimize(&mut func, promote::Moves::Split, target.effort);
-    if target.arch != Arch::X64 {
+    if !matches!(target.arch, Arch::X64 | Arch::Arm64) {
         copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
     }
     native::lower(&mut func);

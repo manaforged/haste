@@ -108,6 +108,8 @@ pub struct Infer<'c, 'a> {
     block: Option<super::impls::ImplRef>,
     frame_item: Option<ItemRef>,
     vars: Vec<Option<Ty>>,
+    var_trail: Vec<(u32, Option<Ty>)>,
+    trail_depth: u32,
     metadata: Vec<(Ty, Ty)>,
     obligations: Vec<(ItemRef, Vec<Ty>)>,
     projections: Vec<project::Projection>,
@@ -130,6 +132,7 @@ pub struct Infer<'c, 'a> {
     hidden: Vec<(u32, Ty)>,
     const_args: Vec<(String, (u128, (u32, bool)))>,
     selecting: Vec<u64>,
+    cycle_hits: u32,
     frames: usize,
     evaluating: Vec<ItemRef>,
     imports: HashMap<(ItemRef, Option<crate::names::Sym>, Vec<u32>), Vec<crate::names::PerNs>>,
@@ -243,6 +246,8 @@ impl<'c, 'a> Infer<'c, 'a> {
             block: None,
             frame_item: None,
             vars,
+            var_trail: Vec::new(),
+            trail_depth: 0,
             metadata,
             obligations,
             projections,
@@ -265,6 +270,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             hidden: Vec::new(),
             const_args: Vec::new(),
             selecting: Vec::new(),
+            cycle_hits: 0,
             frames: 0,
             evaluating: Vec::new(),
             imports: HashMap::default(),
@@ -355,30 +361,55 @@ impl Infer<'_, '_> {
     }
 
     fn trial<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<Option<T>>) -> Result<Option<T>> {
-        let saved = self.snapshot();
+        let mark = (self.mark_vars(), self.projections.len(), self.obligations.len());
         let out = f(self);
-        if !matches!(out, Ok(Some(_))) {
-            self.roll_back(saved);
+        if matches!(out, Ok(Some(_))) {
+            self.commit_vars(mark.0);
+        } else {
+            self.rollback_vars(mark.0);
+            self.projections.truncate(mark.1);
+            self.obligations.truncate(mark.2);
         }
         out
     }
 
     fn probe<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-        let saved = self.snapshot();
+        let mark = (self.mark_vars(), self.projections.len(), self.obligations.len());
         let out = f(self);
-        self.roll_back(saved);
+        self.rollback_vars(mark.0);
+        self.projections.truncate(mark.1);
+        self.obligations.truncate(mark.2);
         out
     }
 
-    /// The variable bindings and the deferred projections and obligations, which name those variables and so roll back with them.
-    fn snapshot(&self) -> Snapshot {
-        (self.vars.clone(), self.projections.clone(), self.obligations.clone())
+    pub(super) fn mark_vars(&mut self) -> (usize, usize) {
+        self.trail_depth += 1;
+        (self.vars.len(), self.var_trail.len())
     }
 
-    fn roll_back(&mut self, (vars, projections, obligations): Snapshot) {
-        self.vars = vars;
-        self.projections = projections;
-        self.obligations = obligations;
+    pub(super) fn set_var(&mut self, index: usize, value: Option<Ty>) {
+        if self.trail_depth > 0 {
+            self.var_trail.push((index as u32, self.vars[index]));
+        }
+        self.vars[index] = value;
+    }
+
+    pub(super) fn rollback_vars(&mut self, (vars_len, trail_len): (usize, usize)) {
+        while self.var_trail.len() > trail_len {
+            let Some((index, prev)) = self.var_trail.pop() else { break };
+            if (index as usize) < vars_len {
+                self.vars[index as usize] = prev;
+            }
+        }
+        self.vars.truncate(vars_len);
+        self.trail_depth -= 1;
+    }
+
+    pub(super) fn commit_vars(&mut self, (_, trail_len): (usize, usize)) {
+        self.trail_depth -= 1;
+        if self.trail_depth == 0 {
+            self.var_trail.truncate(trail_len);
+        }
     }
 
     fn fresh(&mut self, kind: fn(u32) -> Kind) -> Ty {
@@ -419,7 +450,7 @@ impl Infer<'_, '_> {
         if self.occurs(index as u32, to) {
             return Err(Clash { a: var, b: to, cycle: true });
         }
-        self.vars[index] = Some(to);
+        self.set_var(index, Some(to));
         Ok(())
     }
 
@@ -657,6 +688,10 @@ impl Infer<'_, '_> {
         (self.cx.quiet_mark(), self.projections.len(), self.obligations.len())
     }
 
+    pub(super) fn cache_state(&self) -> (((usize, usize), usize, usize), u32) {
+        (self.unsettled(), self.cycle_hits)
+    }
+
     fn bodiless(&self) -> bool {
         self.instance.is_none() && self.items.is_empty() && self.scopes.is_empty() && self.const_args.is_empty() && self.evaluating.is_empty() && self.selecting.is_empty()
     }
@@ -666,9 +701,6 @@ impl Infer<'_, '_> {
         self.cx.type_text(ty, &|ty| self.resolve(ty))
     }
 }
-
-/// What `Infer::snapshot` saves: the variable bindings, then the deferred projections and obligations.
-type Snapshot = (Vec<Option<Ty>>, Vec<project::Projection>, Vec<(ItemRef, Vec<Ty>)>);
 
 fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
     match kind {

@@ -272,6 +272,11 @@ impl Asm {
         self.word(base | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
     }
 
+    /// `dst = base + (index << shift)`.
+    pub fn add_shifted(&mut self, dst: Reg, base: Reg, index: Reg, shift: u8) {
+        self.word(0x8B00_0000 | u32::from(shift) << 10 | u32::from(index.0) << 16 | u32::from(base.0) << 5 | u32::from(dst.0));
+    }
+
     /// `dst = a +/- imm` for `imm < 4096` or a multiple of 4096 below 2^24, where `a` or `dst` may be the stack pointer; sets the flags when `flags`.
     pub fn add_imm(&mut self, sub: bool, flags: bool, size: Size, dst: Reg, a: Reg, imm: u32) {
         let (imm, shifted) = if imm >= 4096 { (imm >> 12, 1) } else { (imm, 0) };
@@ -377,9 +382,8 @@ impl Asm {
         self.word(op as u32 | u32::from(src.0) << 5 | u32::from(dst.0));
     }
 
-    /// Loads `size` bytes at `mem` into `dst`, sign-extending to 64 bits when `signed`, else zero-extending.
-    pub fn load(&mut self, size: Size, signed: bool, dst: Reg, mem: Mem) {
-        let base = match (size, signed) {
+    fn load_base(size: Size, signed: bool) -> u32 {
+        match (size, signed) {
             (Size::X, _) => 0xF840_0000,
             (Size::W, false) => 0xB840_0000,
             (Size::H, false) => 0x7840_0000,
@@ -387,13 +391,20 @@ impl Asm {
             (Size::W, true) => 0xB880_0000,
             (Size::H, true) => 0x7880_0000,
             (Size::B, true) => 0x3880_0000,
-        };
-        self.access(base, size.log2(), u32::from(dst.0), mem);
+        }
+    }
+
+    fn store_base(size: Size) -> u32 {
+        [0x3800_0000, 0x7800_0000, 0xB800_0000, 0xF800_0000][size as usize]
+    }
+
+    /// Loads `size` bytes at `mem` into `dst`, sign-extending to 64 bits when `signed`, else zero-extending.
+    pub fn load(&mut self, size: Size, signed: bool, dst: Reg, mem: Mem) {
+        self.access(Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
     }
 
     pub fn store(&mut self, size: Size, mem: Mem, src: Reg) {
-        let base = [0x3800_0000, 0x7800_0000, 0xB800_0000, 0xF800_0000][size as usize];
-        self.access(base, size.log2(), u32::from(src.0), mem);
+        self.access(Self::store_base(size), size.log2(), u32::from(src.0), mem);
     }
 
     /// Loads a float or vector register of `bytes` 4, 8 or 16.
@@ -407,12 +418,36 @@ impl Asm {
         self.access(base, scale, u32::from(src.0), mem);
     }
 
+    /// Loads `size` bytes at `base + (index << shift)` into `dst`.
+    pub fn load_indexed(&mut self, size: Size, signed: bool, dst: Reg, base: Reg, index: Reg, shift: u8) {
+        self.access_indexed(Self::load_base(size, signed), u32::from(dst.0), base, index, shift);
+    }
+
+    /// Stores `size` bytes from `src` to `base + (index << shift)`.
+    pub fn store_indexed(&mut self, size: Size, base: Reg, index: Reg, shift: u8, src: Reg) {
+        self.access_indexed(Self::store_base(size), u32::from(src.0), base, index, shift);
+    }
+
+    /// Loads a float register of `bytes` 4 or 8 at `base + (index << shift)`.
+    pub fn vload_indexed(&mut self, bytes: u32, dst: Vreg, base: Reg, index: Reg, shift: u8) {
+        self.access_indexed(Self::vbase(bytes).0 | 0x40_0000, u32::from(dst.0), base, index, shift);
+    }
+
+    /// Stores a float register of `bytes` 4 or 8 to `base + (index << shift)`.
+    pub fn vstore_indexed(&mut self, bytes: u32, base: Reg, index: Reg, shift: u8, src: Vreg) {
+        self.access_indexed(Self::vbase(bytes).0, u32::from(src.0), base, index, shift);
+    }
+
     fn vbase(bytes: u32) -> (u32, u32) {
         match bytes {
             4 => (0xBC00_0000, 2),
             8 => (0xFC00_0000, 3),
             _ => (0x3C80_0000, 4),
         }
+    }
+
+    fn access_indexed(&mut self, base: u32, rt: u32, rn: Reg, rm: Reg, shift: u8) {
+        self.word(base | 1 << 21 | u32::from(rm.0) << 16 | 0b011 << 13 | u32::from(shift > 0) << 12 | 0b10 << 10 | u32::from(rn.0) << 5 | rt);
     }
 
     /// One load or store from its unscaled-offset encoding `base`: the scaled form when the offset fits it, the unscaled form for small offsets, else through x17.
@@ -425,7 +460,7 @@ impl Asm {
             self.word(base | ((disp as u32) & 0x1FF) << 12 | rn << 5 | rt);
         } else {
             self.mov_imm(Reg(17), i64::from(disp));
-            self.word(base | 1 << 21 | 17 << 16 | 0b011 << 13 | 0b10 << 10 | rn << 5 | rt);
+            self.access_indexed(base, rt, mem.base, Reg(17), 0);
         }
     }
 

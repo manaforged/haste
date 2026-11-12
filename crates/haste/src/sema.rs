@@ -64,20 +64,12 @@ pub(super) use crate::sync::{read_lock, write_lock};
 pub(super) struct RunnerSlot(std::sync::Mutex<Option<Box<dyn evaluate::Evaluate>>>);
 
 impl RunnerSlot {
-    pub(super) fn take(&self) -> Option<Box<dyn evaluate::Evaluate>> {
-        crate::sync::lock(&self.0).take()
-    }
-
+    pub(super) fn take(&self) -> Option<Box<dyn evaluate::Evaluate>> { crate::sync::lock(&self.0).take() }
     pub(super) fn put(&self, runner: Box<dyn evaluate::Evaluate>) {
         let mut guard = crate::sync::lock(&self.0);
-        if guard.is_none() {
-            *guard = Some(runner);
-        }
+        if guard.is_none() { *guard = Some(runner); }
     }
-
-    pub(super) fn clear(&self) {
-        *crate::sync::lock(&self.0) = None;
-    }
+    pub(super) fn clear(&self) { *crate::sync::lock(&self.0) = None; }
 }
 
 /// What Sema keeps between passes over a growing outline: interned types and parsed headers and bodies.
@@ -121,6 +113,7 @@ struct Lookups {
     type_defs: Table<(TypeScope, SegKey), crate::names::Def>,
     impl_traits: Table<impls::ImplRef, Option<ItemRef>>,
     selections: Table<(ItemRef, ty::Ty, substs::Substs), Option<(impls::ImplRef, substs::Substs)>>,
+    projections: Table<(ItemRef, ty::Ty, substs::Substs, crate::names::Sym, substs::Substs), Option<ty::Ty>>,
     summaries: table::Flight<ItemRef, summary::SummaryKind>,
     substrate: Option<Arc<crate::substrate::Substrate>>,
     sysroot_index: Arc<std::sync::OnceLock<Arc<summary::codec::SysrootIndex>>>,
@@ -141,6 +134,8 @@ impl Lookups {
             return std::mem::take(self);
         }
         let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
+        let selections = self.selections.retained(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
+        let projections = self.projections.retained(|_, found| found.is_some());
         Lookups {
             heads,
             trait_defs: std::mem::take(&mut self.trait_defs),
@@ -148,8 +143,11 @@ impl Lookups {
             state: Arc::clone(&self.state),
             drops: std::mem::take(&mut self.drops),
             fields: std::mem::take(&mut self.fields),
+            forms: self.forms.retained(|_, found| found.is_some()),
             futures: std::mem::take(&mut self.futures),
             impl_traits: std::mem::take(&mut self.impl_traits),
+            selections,
+            projections,
             summaries: std::mem::take(&mut self.summaries),
             substrate: self.substrate.clone(),
             sysroot_index: Arc::clone(&self.sysroot_index),
@@ -296,6 +294,7 @@ impl Lookups {
         self.type_defs.retain(|key, _| !edited.touches_crate(key.0.0.krate));
         self.trait_defs.retain(|item, _| !mine(*item));
         self.selections.clear();
+        self.projections.clear();
         self.summaries = table::Flight::default();
         self.discriminants.retain(|item, _| !mine(*item));
         let mut langs = write_lock(&self.state.langs);

@@ -537,7 +537,8 @@ fn simplify_inline(mut func: Function, limit: usize) -> Option<(Arc<Function>, b
 fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode) -> Result<(Function, RelocVec, Arc<RelocPlan>, usize)> {
     let ((item, _), typed) = &reached.list[index];
     let Ok(typed) = typed else { bail!("{} did not type-check", cx.name(*item)) };
-    typed.ensure_tables(&cx.types);
+    let typed = typed.scoped(&cx.types);
+    let typed: &Typed = &typed;
     let source = match &typed.shape {
         Shape::Closure(closure) => closure.parent,
         _ => *item,

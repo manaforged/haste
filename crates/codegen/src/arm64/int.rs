@@ -129,19 +129,27 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn small_imm(&self, value: Value) -> Option<u32> {
-        self.plan.const_of(value).and_then(|imm| u32::try_from(imm).ok()).filter(|imm| *imm < 4096)
+    fn add_imm_args(&self, sub: bool, value: Value, ty: Type) -> Option<(bool, u32)> {
+        let imm = crate::fold::extend(self.plan.const_of(value)?, ty, true);
+        if (0..4096).contains(&imm) {
+            Some((sub, imm as u32))
+        } else if (-4095..0).contains(&imm) {
+            Some((!sub, (-imm) as u32))
+        } else {
+            None
+        }
     }
 
     fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<(), String> {
         if let Some(alu) = alu_of(op) {
             let left = self.bits(x, A);
-            match self.small_imm(y).filter(|_| matches!(alu, Alu::Add | Alu::Sub)) {
-                Some(imm) => self.asm.add_imm(alu == Alu::Sub, false, Size::X, dst, left, imm),
-                None => {
-                    let right = self.bits(y, C);
-                    self.asm.alu(alu, Size::X, dst, left, right);
-                }
+            if matches!(alu, Alu::Add | Alu::Sub)
+                && let Some((sub, imm)) = self.add_imm_args(alu == Alu::Sub, y, ty)
+            {
+                self.asm.add_imm(sub, false, Size::X, dst, left, imm);
+            } else {
+                let right = self.bits(y, C);
+                self.asm.alu(alu, Size::X, dst, left, right);
             }
             return Ok(());
         }

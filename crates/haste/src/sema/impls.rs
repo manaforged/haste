@@ -319,11 +319,6 @@ impl<'a> Context<'a> {
     }
 
     fn index_of(&mut self, holder: Holder) -> Arc<Index> {
-        if let Holder::Crate(krate) = holder
-            && self.outline.crates[krate as usize].partial()
-        {
-            self.asks.crates.borrow_mut().push(krate);
-        }
         if let Some(found) = self.store.lookups.heads.get(&holder) {
             found.asked.replay(&self.asks);
             return found;
@@ -334,6 +329,11 @@ impl<'a> Context<'a> {
             return Arc::default();
         }
         let mark = self.asks.mark();
+        if let Holder::Crate(krate) = holder
+            && self.outline.crates[krate as usize].unsettled()
+        {
+            self.asks.crates.borrow_mut().push(krate);
+        }
         let blocks = match holder {
             Holder::Crate(krate) => self.crate_impls(krate),
             Holder::Body(root) => self.body_impls(root),

@@ -7,6 +7,7 @@ use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 
 use super::super::impls::ImplRef;
+use super::super::substs::Substs;
 use super::super::ty::{Kind, Ty};
 use super::Infer;
 use super::scope::{named_bounds, one_name, type_params};
@@ -339,6 +340,16 @@ impl Infer<'_, '_> {
         Ok(result)
     }
 
+    fn closed_projection_key(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Option<(ItemRef, Ty, Substs, crate::names::Sym, Substs)> {
+        if !self.closed(ty) {
+            return None;
+        }
+        let args = self.closed_substs(args)?;
+        let own = self.closed_substs(own)?;
+        let sym = self.cx.names.symbols.intern(name);
+        Some((of, self.substitute(ty), args, sym, own))
+    }
+
     pub(in crate::sema) fn picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
         if self.has_params(ty) || self.any_has_params(args) || self.any_has_params(own) {
             return match self.poly.is_some() {
@@ -346,6 +357,23 @@ impl Infer<'_, '_> {
                 false => Ok(None),
             };
         }
+        let key = self.closed_projection_key(of, ty, args, (name, own));
+        if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.projections.get(key)) {
+            return Ok(found);
+        }
+        let state = self.cache_state();
+        let res = self.picked_alias_uncached(of, ty, args, (name, own))?;
+        if let Some(key) = key
+            && self.cache_state() == state
+            && res.is_none_or(|t| self.closed(t))
+        {
+            let cached = res.map(|t| self.substitute(t));
+            self.cx.store.lookups.projections.insert(key, cached);
+        }
+        Ok(res)
+    }
+
+    fn picked_alias_uncached(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
         if self.cx.lang(of) == Some("discriminant_kind") {
             return self.discriminant_ty(ty);
         }
@@ -523,6 +551,32 @@ impl Infer<'_, '_> {
     }
 
     /// Whether each associated type that the bound path `path` binds, as in `Iterator<Item = X>`, is its type for `ty` under trait `of` at `args`; unifies the two.
+    pub(super) fn assoc_bounds_hold(&mut self, (arena, home, path): (&Body, crate::names::ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
+        if !self.bindings_hold(arena, path, (of, ty, args))? {
+            return Ok(false);
+        }
+        let Some(&last) = arena.list(arena.path(path).segments).last() else {
+            return Ok(true);
+        };
+        let Some(crate::body::Args::Angle(list)) = arena.segments[last as usize].args else {
+            return Ok(true);
+        };
+        for &at in arena.list(list) {
+            let crate::body::GenericArg::Constraint { name, bounds } = arena.args[at as usize] else {
+                continue;
+            };
+            let name = self.src.text(name);
+            let Some((owner, owner_args)) = self.assoc_owner((of, args.to_vec()), ty, name, 0)? else { bail!("`{}` has no associated type `{name}`", self.cx.name(of)) };
+            let assoc = self.project(owner, ty, owner_args, name)?;
+            for &bound in arena.list(bounds) {
+                if !self.bound_holds(arena, home, (assoc, bound), depth + 1)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn bindings_hold(&mut self, arena: &Body, path: PathId, (of, ty, args): (ItemRef, Ty, &[Ty])) -> Result<bool> {
         for (name, bound_ty) in self.path_bindings(arena, path)? {
             if !self.binding_holds((of, args), ty, (&name, bound_ty))? {
@@ -605,4 +659,9 @@ pub(super) fn path_constraints(arena: &Body, path: PathId) -> Vec<(u32, crate::b
             _ => None,
         })
         .collect()
+}
+
+pub(super) fn has_assoc_bounds(arena: &Body, path: PathId) -> bool {
+    let Some(list) = angle_args(arena, path) else { return false };
+    arena.list(list).iter().any(|&at| matches!(arena.args[at as usize], crate::body::GenericArg::Binding { .. } | crate::body::GenericArg::Constraint { .. }))
 }

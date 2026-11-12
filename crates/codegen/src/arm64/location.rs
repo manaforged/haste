@@ -3,6 +3,7 @@ use super::{A, C, D, Emit, IP, V0};
 use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{StackSlot, Type, Value};
+use crate::live::SibBase;
 
 impl Emit<'_> {
     pub(super) fn at(&self, value: Value) -> Mem {
@@ -41,6 +42,36 @@ impl Emit<'_> {
     }
 
     pub(super) fn address(&mut self, addr: Value, offset: i32) -> Mem {
+        self.address_in(addr, offset, C)
+    }
+
+    pub(super) fn sib_indexed(&mut self, addr: Value, offset: i32, bytes: u32) -> Option<(Reg, Reg, u8)> {
+        let mode = self.plan.sib[addr.index()]?;
+        let total_disp = match mode.base {
+            SibBase::Frame(slot) => i64::from(self.frame.slots[slot.index()]) + i64::from(mode.disp) + i64::from(offset),
+            SibBase::Value(_) => i64::from(mode.disp) + i64::from(offset),
+        };
+        if total_disp != 0 || (mode.shift != 0 && (1u32 << mode.shift) != bytes) {
+            return None;
+        }
+        let base_reg = match mode.base {
+            SibBase::Frame(_) => FP,
+            SibBase::Value(base) => self.bits(base, C),
+        };
+        let idx_reg = self.bits(mode.index, IP);
+        Some((base_reg, idx_reg, mode.shift))
+    }
+
+    pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg) -> Mem {
+        if let Some(mode) = self.plan.sib[addr.index()] {
+            let (base_reg, disp) = match mode.base {
+                SibBase::Frame(slot) => (FP, self.frame.slots[slot.index()] + mode.disp + offset),
+                SibBase::Value(base) => (self.bits(base, scratch), mode.disp + offset),
+            };
+            let idx_reg = self.bits(mode.index, IP);
+            self.asm.add_shifted(scratch, base_reg, idx_reg, mode.shift);
+            return Mem::new(scratch, disp);
+        }
         if let Some(reg) = self.plan.reg_of(addr) {
             return Mem::new(reg, offset);
         }
@@ -49,8 +80,8 @@ impl Emit<'_> {
         {
             return Mem::new(FP, disp);
         }
-        self.raw(C, addr);
-        Mem::new(C, offset)
+        self.raw(scratch, addr);
+        Mem::new(scratch, offset)
     }
 
     pub(super) fn raw(&mut self, reg: Reg, value: Value) {

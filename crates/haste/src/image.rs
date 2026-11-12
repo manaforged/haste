@@ -286,9 +286,10 @@ impl Image {
 
     /// An image of every function in `reached`, compiled, optionally recording AOT relocations, with why each one that did not compile failed.
     pub(crate) fn build(cx: &mut Context<'_>, reached: &Reached, record_aot: bool) -> Result<(Image, HashMap<usize, String>)> {
-        let mut image = Self::create(reached, record_aot, (SHARED_BYTES, STATE_BYTES, TABLE_SLOTS))?;
+        let mut image = Self::create(reached, record_aot, (SHARED_BYTES, STATE_BYTES, reached.list.len().max(1)))?;
         let all: Vec<usize> = (0..reached.list.len()).collect();
         let broken = image.compile(cx, reached, &all).into_iter().collect();
+        image.bodies = lower::Bodies::default();
         Ok((image, broken))
     }
 

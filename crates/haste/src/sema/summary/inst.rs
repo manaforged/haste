@@ -35,6 +35,11 @@ impl PolyInst {
         self.materialized.get_or_init(|| Arc::new(self.materialize(types)))
     }
 
+    /// Materializes concrete body tables without pinning them in `OnceLock` unless already cached.
+    pub fn ephemeral_tables(&self, types: &Types) -> Option<Arc<BodyTables>> {
+        self.materialized.get().is_none().then(|| Arc::new(self.materialize(types)))
+    }
+
     /// Iterates every concrete and resolved call edge without materializing `BodyTables`.
     pub fn calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
         self.summary.fixed_calls.iter().copied().chain(self.resolved_calls.iter().map(|&(_, i, s)| (i, s)))

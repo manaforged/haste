@@ -39,14 +39,8 @@ impl Emit<'_> {
 
     fn access(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
-            Op::Load(addr, offset) => {
-                let from = self.address(*addr, *offset);
-                self.read(result()?, from);
-            }
-            Op::Store(value, addr, offset) => {
-                let to = self.address(*addr, *offset);
-                self.write(*value, to);
-            }
+            Op::Load(addr, offset) => self.load_at(result()?, *addr, *offset),
+            Op::Store(value, addr, offset) => self.store_at(*value, *addr, *offset),
             Op::StackAddr(slot, offset) => {
                 let result = result()?;
                 if !self.plan.is_static(result) {
@@ -60,9 +54,63 @@ impl Emit<'_> {
             Op::Fence => self.asm.dmb(),
             Op::FramePointer => self.put(result()?, FP),
             Op::Copy(to, from, bytes) => self.copy(*to, *from, *bytes)?,
+            Op::Move(to, from, bytes) => self.move_bytes(*to, *from, *bytes),
             _ => return self.atomic(op, result),
         }
         Ok(())
+    }
+
+    fn load_at(&mut self, result: Value, addr: Value, offset: i32) {
+        let ty = self.ty(result);
+        if ty != Type::I128
+            && let Some((base, index, shift)) = self.sib_indexed(addr, offset, ty.bytes())
+        {
+            if ty.is_float() {
+                let dst = self.fdst(result);
+                self.asm.vload_indexed(ty.bytes(), dst, base, index, shift);
+                self.fput(result, dst);
+            } else {
+                let dst = self.dst(result);
+                self.asm.load_indexed(Size::of(ty.bytes()), false, dst, base, index, shift);
+                self.put(result, dst);
+            }
+            return;
+        }
+        let from = self.address(addr, offset);
+        self.read(result, from);
+    }
+
+    fn store_at(&mut self, value: Value, addr: Value, offset: i32) {
+        let ty = self.ty(value);
+        if ty != Type::I128
+            && let Some((base, index, shift)) = self.sib_indexed(addr, offset, ty.bytes())
+        {
+            if ty.is_float() {
+                let source = self.fin(value, super::V0);
+                self.asm.vstore_indexed(ty.bytes(), base, index, shift, source);
+            } else {
+                let source = self.store_src(value);
+                self.asm.store_indexed(Size::of(ty.bytes()), base, index, shift, source);
+            }
+            return;
+        }
+        let to = self.address(addr, offset);
+        self.write(value, to);
+    }
+
+    fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
+        let source = self.address_in(from, 0, S);
+        let target = self.address_in(to, 0, C);
+        let whole = bytes / 16 * 16;
+        for at in (0..whole).step_by(16) {
+            self.asm.vload(16, super::V1, source.offset(at as i32));
+            self.asm.vstore(16, target.offset(at as i32), super::V1);
+        }
+        for (ty, at) in crate::copy::words(bytes - whole) {
+            let at = (whole + at) as i32;
+            self.asm.load(Size::of(ty.bytes()), false, A, source.offset(at));
+            self.asm.store(Size::of(ty.bytes()), target.offset(at), A);
+        }
     }
 
     fn copy(&mut self, to: Value, from: Value, bytes: Value) -> Result<(), String> {
@@ -112,11 +160,15 @@ impl Emit<'_> {
             self.asm.store(Size::X, to.offset(8), A);
             return;
         }
-        let source = match self.plan.const_of(value) {
+        let source = self.store_src(value);
+        self.asm.store(Size::of(ty.bytes()), to, source);
+    }
+
+    fn store_src(&mut self, value: Value) -> Reg {
+        match self.plan.const_of(value) {
             Some(0) => ZR,
             _ => self.bits(value, A),
-        };
-        self.asm.store(Size::of(ty.bytes()), to, source);
+        }
     }
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {

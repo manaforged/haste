@@ -41,7 +41,7 @@ const REGS: Regs<Reg> = Regs {
     absolute_calls: false,
     two_address: false,
     park: true,
-    fold_sib: false,
+    fold_sib: true,
 };
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {

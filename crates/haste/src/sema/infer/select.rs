@@ -42,34 +42,45 @@ impl<'a> Infer<'_, 'a> {
         if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
             return Ok(found.map(|(block, impl_args)| (block, self.cx.types.substs(impl_args).to_vec())));
         }
-        let before = self.unsettled();
+        let state = self.cache_state();
         let picked = self.select_at(of, self_ty, args, 0)?;
-        let Some(key) = key else { return Ok(picked) };
-        let settled = self.unsettled() == before;
-        let kept = match &picked {
-            None => Some(None),
-            Some((block, impl_args)) => {
-                let filled: Vec<Ty> = impl_args.iter().map(|&ty| self.substitute(ty)).collect();
-                filled.iter().all(|&ty| self.closed(ty)).then(|| Some((*block, self.cx.types.intern_substs(&filled))))
-            }
-        };
-        if let Some(kept) = kept.filter(|_| settled) {
-            self.cx.store.lookups.selections.insert(key, kept);
+        if let Some(key) = key {
+            self.cache_selection(key, picked.as_ref(), state);
         }
         Ok(picked)
     }
 
-    /// The key that caches selecting `of<args>` for `self_ty` across bodies: the query with its variables filled in, when it is made at the top level and every type in it is known and holds no closure.
-    fn selection_key(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Option<(ItemRef, Ty, Substs)> {
-        if !self.selecting.is_empty() || !self.closed(self_ty) || !args.iter().all(|&arg| self.closed(arg)) {
+    fn cache_selection(&mut self, key: (ItemRef, Ty, Substs), picked: Option<&Picked>, state: (((usize, usize), usize, usize), u32)) {
+        if self.cache_state() != state {
+            return;
+        }
+        let kept = match picked {
+            None => Some(None),
+            Some((block, impl_args)) => self.closed_substs(impl_args).map(|args| Some((*block, args))),
+        };
+        if let Some(kept) = kept {
+            self.cx.store.lookups.selections.insert(key, kept);
+        }
+    }
+
+    pub(super) fn closed_substs(&mut self, tys: &[Ty]) -> Option<Substs> {
+        if !tys.iter().all(|&ty| self.closed(ty)) {
             return None;
         }
-        let substituted: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
-        Some((of, self.substitute(self_ty), self.cx.types.intern_substs(&substituted)))
+        let substituted: Vec<Ty> = tys.iter().map(|&ty| self.substitute(ty)).collect();
+        Some(self.cx.types.intern_substs(&substituted))
+    }
+
+    /// The key that caches selecting `of<args>` for `self_ty` across bodies: the query with its variables filled in, when every type in it is known and holds no closure.
+    fn selection_key(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Option<(ItemRef, Ty, Substs)> {
+        if !self.closed(self_ty) {
+            return None;
+        }
+        Some((of, self.substitute(self_ty), self.closed_substs(args)?))
     }
 
     /// Whether `ty` holds no inference variable and no closure, whose signature may still hold one, so selecting with it gives the same answer in every body.
-    fn closed(&self, ty: Ty) -> bool {
+    pub(super) fn closed(&self, ty: Ty) -> bool {
         let ty = self.resolve(ty);
         if self.has_params(ty) {
             return false;
@@ -121,13 +132,21 @@ impl<'a> Infer<'_, 'a> {
         let mut found = Vec::new();
         let blocks: Vec<ImplRef> = blocks.into_iter().filter(|&block| !self.cx.reserved(block)).collect();
         for block in blocks {
-            let (saved, deferred) = (self.vars.clone(), (self.projections.len(), self.obligations.len()));
+            let mark = (self.mark_vars(), self.projections.len(), self.obligations.len());
             let applies = self.impl_applies(block, self_ty, args, depth);
-            let bound = std::mem::replace(&mut self.vars, saved);
-            let projections = self.projections.split_off(deferred.0.min(self.projections.len()));
-            let obligations = self.obligations.split_off(deferred.1.min(self.obligations.len()));
-            if let Some(impl_args) = applies? {
-                found.push(((block, impl_args), Vars { bound, projections, obligations }));
+            let projections = self.projections.split_off(mark.1.min(self.projections.len()));
+            let obligations = self.obligations.split_off(mark.2.min(self.obligations.len()));
+            match applies {
+                Ok(Some(impl_args)) => {
+                    let bound = self.vars.clone();
+                    self.rollback_vars(mark.0);
+                    found.push(((block, impl_args), Vars { bound, projections, obligations }));
+                }
+                Ok(None) => self.rollback_vars(mark.0),
+                Err(err) => {
+                    self.rollback_vars(mark.0);
+                    return Err(err);
+                }
             }
         }
         Ok(found)
@@ -135,6 +154,14 @@ impl<'a> Infer<'_, 'a> {
 
     /// Takes on the bindings and deferred work of the impl trial `vars`.
     fn adopt(&mut self, vars: Vars) {
+        if self.trail_depth > 0 {
+            let shared = self.vars.len().min(vars.bound.len());
+            for i in 0..shared {
+                if self.vars[i] != vars.bound[i] {
+                    self.var_trail.push((i as u32, self.vars[i]));
+                }
+            }
+        }
         self.vars = vars.bound;
         self.projections.extend(vars.projections);
         self.obligations.extend(vars.obligations);
@@ -401,7 +428,7 @@ impl<'a> Infer<'_, 'a> {
         matches!(arena.bounds[bound as usize], Bound::Trait { maybe: true, .. }) || self.bound_trait_at(arena, bound, home).and_then(|(of, _)| self.cx.lang(of)).is_some_and(|lang| WEAKER_THAN_SIZED.contains(&lang))
     }
 
-    fn bound_holds(&mut self, arena: &Body, home: ModRef, (ty, bound): (Ty, u32), depth: u32) -> Result<bool> {
+    pub(super) fn bound_holds(&mut self, arena: &Body, home: ModRef, (ty, bound): (Ty, u32), depth: u32) -> Result<bool> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
             return Ok(true);
         };
@@ -444,17 +471,33 @@ impl<'a> Infer<'_, 'a> {
     fn impl_holds(&mut self, (arena, home, path): (&Body, ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
         let query = self.query(of, ty, args);
         if self.selecting.contains(&query) {
+            self.cycle_hits += 1;
             return Ok(self.obligation_open(ty, args));
         }
+        let key = (!super::project::has_assoc_bounds(arena, path)).then(|| self.selection_key(of, ty, args)).flatten();
+        if let Some(found) = key.as_ref().and_then(|key| self.cx.store.lookups.selections.get(key)) {
+            return Ok(found.is_some());
+        }
+        let state = self.cache_state();
         self.selecting.push(query);
         let found = self.applicable(of, ty, args, depth + 1);
         self.selecting.pop();
         match <[_; 1]>::try_from(found?) {
-            Ok([(_, vars)]) => {
+            Ok([(picked, vars)]) => {
                 self.adopt(vars);
-                self.assoc_bounds_hold((arena, home, path), (of, ty, args), depth)
+                let holds = self.assoc_bounds_hold((arena, home, path), (of, ty, args), depth)?;
+                if holds && let Some(key) = key {
+                    self.cache_selection(key, Some(&picked), state);
+                }
+                Ok(holds)
             }
-            Err(found) => Ok(!found.is_empty()),
+            Err(found) => {
+                let held = !found.is_empty();
+                if !held && let Some(key) = key {
+                    self.cache_selection(key, None, state);
+                }
+                Ok(held)
+            }
         }
     }
 
@@ -567,32 +610,6 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Whether the associated types of `of` for `ty` meet the bound path's bindings, as `Item = T`, and its constraints, as `Item: Trait`.
-    pub(super) fn assoc_bounds_hold(&mut self, (arena, home, path): (&Body, ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
-        if !self.bindings_hold(arena, path, (of, ty, args))? {
-            return Ok(false);
-        }
-        let Some(&last) = arena.list(arena.path(path).segments).last() else {
-            return Ok(true);
-        };
-        let Some(crate::body::Args::Angle(list)) = arena.segments[last as usize].args else {
-            return Ok(true);
-        };
-        for &at in arena.list(list) {
-            let crate::body::GenericArg::Constraint { name, bounds } = arena.args[at as usize] else {
-                continue;
-            };
-            let name = self.src.text(name);
-            let Some((owner, owner_args)) = self.assoc_owner((of, args.to_vec()), ty, name, 0)? else { bail!("`{}` has no associated type `{name}`", self.cx.name(of)) };
-            let assoc = self.project(owner, ty, owner_args, name)?;
-            for &bound in arena.list(bounds) {
-                if !self.bound_holds(arena, home, (assoc, bound), depth + 1)? {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
-    }
-
     /// Whether the bound `of` at `path` can hold for the unknown type `ty`: for an integer or float variable, whether an impl for some number type applies, kept as an obligation that picks the type when one impl alone applies, as rustc selects with one; else false only when `ty` is a pending `impl Trait` value whose own bound of that trait does not unify.
     fn var_holds(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty, depth: u32) -> Result<bool> {
         let args = self.bound_args(of, arena, path, ty)?;
@@ -636,11 +653,12 @@ impl<'a> Infer<'_, 'a> {
             return Some(false);
         }
         if matching.len() == 1 {
-            let saved = self.vars.clone();
+            let mark = self.mark_vars();
             if matching[0][1..].iter().zip(args).all(|(&found, &wanted)| self.unifies(found, wanted)) {
+                self.commit_vars(mark);
                 return Some(true);
             }
-            self.vars = saved;
+            self.rollback_vars(mark);
             return Some(false);
         }
         let held = matching.iter().any(|substs| matches!(self.trial(|infer| Ok(substs[1..].iter().zip(args).all(|(&found, &wanted)| infer.unifies(found, wanted)).then_some(()))), Ok(Some(()))));
@@ -776,12 +794,6 @@ struct Specialty {
 }
 
 impl Specialty {
-    /// Whether this impl specializes `other`: `other` has `default` items, and this one has none or its bounds imply the bounds of `other` and not the reverse.
-    fn specializes(&self, other: &Specialty) -> bool {
-        other.default && (!self.default || (self.covers(other) && !other.covers(self)))
-    }
-
-    fn covers(&self, other: &Specialty) -> bool {
-        other.direct.iter().all(|of| self.implied.contains(of))
-    }
+    fn specializes(&self, other: &Specialty) -> bool { other.default && (!self.default || (self.covers(other) && !other.covers(self))) }
+    fn covers(&self, other: &Specialty) -> bool { other.direct.iter().all(|of| self.implied.contains(of)) }
 }
