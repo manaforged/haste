@@ -1,7 +1,7 @@
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
 use super::float::X1;
 use super::{Emit, Ext};
-use crate::ir::{AtomicRmwOp, Op, StackSlot, Type, Value};
+use crate::ir::{AtomicRmwOp, Binary, Function, Op, StackSlot, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
@@ -14,6 +14,15 @@ const VECTOR: u32 = 16;
 
 /// The opcodes of `movups` from memory into an xmm register, and from an xmm register into memory.
 const MOVUPS: ([u8; 2], [u8; 2]) = ([0x0F, 0x10], [0x0F, 0x11]);
+
+/// Whether `op` of `func` uses rsi as scratch: a copy of a constant size, a compare-exchange or read-modify-write, a population count, or a 128-bit shift or rotate.
+pub(super) fn uses_rsi(func: &Function, op: &Op) -> bool {
+    match op {
+        Op::Copy(..) | Op::AtomicCas(..) | Op::AtomicRmw(..) | Op::Unary(Unary::Popcnt, _) => true,
+        Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, x, _) => func.ty(*x) == Type::I128,
+        _ => false,
+    }
+}
 
 impl Emit<'_> {
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
@@ -105,9 +114,9 @@ impl Emit<'_> {
         Ok(())
     }
 
-    /// Copies `bytes` bytes between two ranges that are the same or disjoint: 16 at a time through xmm1, then word by word through rax.
+    /// Copies `bytes` bytes between two ranges that are the same or disjoint: 16 at a time through xmm1, then word by word through rax; r11 and rcx hold addresses.
     fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
-        let source = self.address_in(from, 0, Reg::Rsi);
+        let source = self.address_in(from, 0, Reg::R11);
         let target = self.address_in(to, 0, Reg::Rcx);
         let whole = bytes / VECTOR * VECTOR;
         for at in (0..whole).step_by(VECTOR as usize) {

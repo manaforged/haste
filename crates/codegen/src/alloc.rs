@@ -13,6 +13,10 @@ pub(crate) struct Regs<R: 'static> {
     pub leaf: &'static [R],
     /// Leaf registers that 128-bit operations use as scratch, so a function with one keeps no value in them.
     pub wide_scratch: &'static [R],
+    /// Leaf registers that the operations `uses_scratch` picks use as scratch, so a function with one keeps no value in them.
+    pub op_scratch: &'static [R],
+    /// Whether an operation of a function uses `op_scratch`.
+    pub uses_scratch: fn(&Function, &Op) -> bool,
     /// Leaf register that carries the dictionary parameter on entry, when it is in `leaf`.
     pub dict: Option<R>,
     /// Caller-saved float registers, by number, the emitter never uses as scratch, which float values that span no call live in.
@@ -26,6 +30,11 @@ pub(crate) struct Regs<R: 'static> {
 }
 
 const FOLD_LIMIT: i64 = 1 << 24;
+
+/// The `uses_scratch` of an encoder whose operations use no leaf register as scratch.
+pub(crate) fn no_scratch(_: &Function, _: &Op) -> bool {
+    false
+}
 
 /// Where a value lives.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +61,7 @@ pub(crate) struct Plan<R> {
     pub pairs: Vec<Option<Value>>,
     pub deferred: Vec<bool>,
     pub through: Vec<Option<CallTarget>>,
+    pub shared: Vec<Option<u32>>,
 }
 
 /// Whether planning may give a value of type `ty` a register of `regs`.
@@ -241,9 +251,14 @@ fn passed<R: Copy>(func: &Function, classify: impl Fn(&Signature) -> Result<Abi<
 
 /// The integer class; a function with a 128-bit value keeps none in the registers 128-bit operations use as scratch.
 fn int_class<'a, R: Copy + PartialEq>(func: &Function, regs: &'a Regs<R>, order: &[Block], params: &[Loc<R>], passed: Vec<Option<R>>) -> Class<'a, R> {
-    let wide = order.iter().flat_map(|block| &func.blocks[block.index()].insts).any(|inst| func.insts[inst.index()].result.is_some_and(|result| func.ty(result) == Type::I128));
+    let (mut wide, mut scratch) = (false, false);
+    for data in order.iter().flat_map(|block| &func.blocks[block.index()].insts).map(|inst| &func.insts[inst.index()]) {
+        wide |= data.result.is_some_and(|result| func.ty(result) == Type::I128);
+        scratch |= (regs.uses_scratch)(func, &data.op);
+    }
     let dict = func.signature.params.iter().any(|param| param.purpose == ArgumentPurpose::Dict);
-    let leaf = regs.leaf.iter().filter(|reg| !(wide && regs.wide_scratch.contains(*reg)) && !(dict && regs.dict == Some(**reg))).copied().collect();
+    let kept = |reg: &R| !(wide && regs.wide_scratch.contains(reg)) && !(scratch && regs.op_scratch.contains(reg)) && !(dict && regs.dict == Some(*reg));
+    let leaf = regs.leaf.iter().filter(|reg| kept(reg)).copied().collect();
     let arrivals = params
         .iter()
         .map(|loc| match *loc {
@@ -289,6 +304,7 @@ fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, poo
         if let [reg] = arrival[..]
             && class.leaf.contains(&reg)
             && pooled[value.index()]
+            && !live.trapped[value.index()]
             && live.span[value.index()].is_some_and(|span| !crosses(&live.calls, span))
         {
             kept[value.index()] = Some(reg);
@@ -440,7 +456,7 @@ fn assign<F: Copy + PartialEq>(live: &Live, pooled: &[bool], saved_regs: &[F], p
             }
             !ended
         });
-        let saved = crosses(&live.calls, (start, end));
+        let saved = live.trapped[value] || crosses(&live.calls, (start, end));
         let partner = |free: &mut Vec<F>, homes: &[Option<F>]| hints.partners.and_then(|partners| joined(free, homes, &partners[value], (saved, saved_regs, &used)));
         let fresh = |free: &mut Vec<F>| passed_in(free, live, &pool.passed, (start, end, value)).or_else(|| take(free, (saved, saved_regs), &used));
         let reg = match pool.kept[value].or_else(|| reused(&mut active, hints.reuse[value], saved, saved_regs)).or_else(|| partner(&mut free, &homes)).or_else(|| fresh(&mut free)) {
@@ -485,12 +501,13 @@ pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, (order,
     statics(func, &mut locations);
     let census = census(func);
     let wanted: Vec<bool> = (0..count).map(|value| matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
-    let live = live(func, order, &wanted);
+    let tracked: Vec<bool> = (0..count).map(|value| wanted[value] || (weighed && matches!(locations[value], Location::Slot))).collect();
+    let live = live(func, order, &tracked);
     let candidates: Vec<bool> = (0..count).map(|value| eligible(&live, &wanted, value)).collect();
     let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches)).collect();
     let through = if regs.absolute_calls { through(func, &locations, &census) } else { vec![None; count] };
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
-    let floats: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].in_float_register() && live.span[value].is_some_and(|span| !crosses(&live.calls, span))).collect();
+    let floats: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].in_float_register() && !live.trapped[value] && live.span[value].is_some_and(|span| !crosses(&live.calls, span))).collect();
     let reuse = if regs.two_address { reusable(func, &live) } else { vec![None; count] };
     let weights = weighed.then(|| weights(func));
     let partners = weighed.then(|| partners(func));
@@ -500,7 +517,8 @@ pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, (order,
     let (homes, _) = allocate(func, &live, &float_class(regs, params), &floats, &hints);
     place(&mut locations, homes, Location::Float);
     let (pairs, deferred) = pairs(func, &locations);
-    Plan { locations, fused, used, pairs, deferred, through }
+    let shared = if weighed { crate::color::share(func, &live, &locations, &deferred) } else { Vec::new() };
+    Plan { locations, fused, used, pairs, deferred, through, shared }
 }
 
 impl<R: Copy> Plan<R> {

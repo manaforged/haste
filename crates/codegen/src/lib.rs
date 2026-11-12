@@ -2,6 +2,7 @@
 
 mod alloc;
 mod builder;
+mod color;
 mod coroutine;
 mod copy;
 mod cse;

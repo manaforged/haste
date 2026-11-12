@@ -30,7 +30,7 @@ const V1: Vreg = Vreg(1);
 const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
 
 /// The registers planning hands out: the saved pool, and caller-saved registers that are neither scratch, return registers nor the indirect-result register.
-const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)], wide_scratch: &WIDE_SCRATCH, dict: None, float: &[], float_branches: &[], absolute_calls: false, two_address: false };
+const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)], wide_scratch: &WIDE_SCRATCH, op_scratch: &[], uses_scratch: crate::alloc::no_scratch, dict: None, float: &[], float_branches: &[], absolute_calls: false, two_address: false };
 
 /// Encodes `func` as A64 machine code for `target`.
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
@@ -38,7 +38,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let order = crate::live::order(func);
     let abi = classify(&func.signature, packing)?;
     let plan = plan(func, &REGS, (&order, target.effort == crate::Effort::Full), &abi.params, |sig| classify(sig, packing));
-    let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, |sig| classify(sig, packing))?;
+    let frame = layout(func, saved(func, &plan.used, &SAVED), (&plan.locations, &plan.shared), |sig| classify(sig, packing))?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let copied = crate::live::copied_tests(func, &order);
@@ -251,7 +251,7 @@ impl Emit<'_> {
 
     /// Whether `a` and `b` live in the same place, so writing one overwrites the other.
     fn same_home(&self, a: Value, b: Value) -> bool {
-        a == b || matches!((self.plan.location(a), self.plan.location(b)), (Location::Reg(x), Location::Reg(y)) if x == y)
+        a == b || matches!((self.plan.location(a), self.plan.location(b)), (Location::Reg(x), Location::Reg(y)) if x == y) || self.frame.shares(&self.plan, a, b)
     }
 
     /// Writes `value` into the location of `param`.

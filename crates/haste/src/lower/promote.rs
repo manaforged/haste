@@ -8,7 +8,8 @@ use crate::names::{ItemRef, Primitive};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 use crate::sema::Context;
-use crate::sema::infer::{Res, Shape, parse_int};
+use crate::sema::infer::{Res, Shape, Typed, field_types, parse_int};
+use crate::sema::layout::field_offset;
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty, int_info, mask};
 
@@ -162,62 +163,161 @@ fn literal_scalar((body, src): (&Body, &Source), expr: ExprId, primitive: Primit
     Some(int.map_or(value, |(bits, _)| value & mask(bits)))
 }
 
-/// Appends to `out` the bytes of `expr` of `body`, a value of `ty`, when it is made of literals only: arrays and repeats of integer, `bool` and `char` literals.
-fn literal_bytes(cx: &Context<'_>, arena: (&Body, &Source), (expr, ty): (ExprId, Ty), out: &mut Vec<u8>) -> Option<()> {
-    let (body, _) = arena;
-    match (*body.expr(expr), cx.types.kind(ty)) {
-        (Expr::Paren(inner), _) => literal_bytes(cx, arena, (inner, ty), out),
-        (Expr::Array(list), &Kind::Array(elem, _)) => body.list(list).iter().try_for_each(|&at| literal_bytes(cx, arena, (ExprId(at), elem), out)),
-        (Expr::Repeat(item, _), &Kind::Array(elem, count)) => {
-            let mut one = Vec::new();
-            literal_bytes(cx, arena, (item, elem), &mut one)?;
-            let count = usize::try_from(cx.types.len(count)?).ok()?;
-            (one.len().checked_mul(count)? + out.len() <= LITERAL_BYTES).then(|| out.extend(one.repeat(count)))
+/// A constant's body, source and inference, from which `write` lays out the bytes of a value made of literals.
+struct Literal<'b> {
+    body: &'b Body,
+    src: &'b Source,
+    typed: &'b Typed,
+}
+
+impl Literal<'_> {
+    /// Writes into `out` at `at` the bytes of `expr`, a value of `ty`, when it is made of integer, `bool` and `char` literals, arrays, repeats, tuples and constructors of them.
+    fn write(&self, cx: &mut Context<'_>, (expr, ty): (ExprId, Ty), at: usize, out: &mut [u8]) -> Option<()> {
+        match (*self.body.expr(expr), cx.types.kind(ty).clone()) {
+            (Expr::Paren(inner), _) => self.write(cx, (inner, ty), at, out),
+            (Expr::Array(list), Kind::Array(elem, _)) => {
+                let stride = cx.layout(elem).ok()?.size.bytes() as usize;
+                self.body.list(list).iter().enumerate().try_for_each(|(index, &item)| self.write(cx, (ExprId(item), elem), at + index * stride, out))
+            }
+            (Expr::Repeat(item, _), Kind::Array(elem, count)) => {
+                let stride = cx.layout(elem).ok()?.size.bytes() as usize;
+                let count = usize::try_from(cx.types.len(count)?).ok()?;
+                if count > 0 {
+                    self.write(cx, (item, elem), at, out)?;
+                }
+                (1..count).for_each(|index| out.copy_within(at..at + stride, at + index * stride));
+                Some(())
+            }
+            (Expr::Tuple(list), Kind::Tuple(items)) => {
+                let layout = cx.layout(ty).ok()?;
+                let items = cx.types.substs(items).to_vec();
+                let fields: Vec<(u32, ExprId)> = self.body.list(list).iter().enumerate().map(|(index, &item)| (index as u32, ExprId(item))).collect();
+                fields.into_iter().try_for_each(|(index, item)| self.write(cx, (item, *items.get(index as usize)?), at + field_offset(&layout, 0, index) as usize, out))
+            }
+            (_, Kind::Adt(item, args)) => self.construct(cx, (expr, ty), (item, args), at, out),
+            (_, Kind::Prim(primitive)) => {
+                let size = match primitive {
+                    Primitive::Bool => 1,
+                    Primitive::Char => 4,
+                    _ => int_info(primitive)?.0 as usize / 8,
+                };
+                let bits = literal_scalar((self.body, self.src), expr, primitive)?;
+                out.get_mut(at..at + size)?.copy_from_slice(&bits.to_le_bytes()[..size]);
+                Some(())
+            }
+            _ => None,
         }
-        (_, &Kind::Prim(primitive)) => {
-            let size = match primitive {
-                Primitive::Bool => 1,
-                Primitive::Char => 4,
-                _ => int_info(primitive)?.0 as usize / 8,
-            };
-            let bits = literal_scalar(arena, expr, primitive)?;
-            (out.len() + size <= LITERAL_BYTES).then(|| out.extend_from_slice(&bits.to_le_bytes()[..size]))
-        }
-        _ => None,
     }
+
+    /// The variant `expr` constructs, with each field it gives by index, when it is a unit, tuple or struct constructor with no base.
+    fn constructor(&self, expr: ExprId) -> Option<(u32, Vec<(u32, ExprId)>)> {
+        let variant = |at: ExprId| match self.typed.res.get(&at) {
+            Some(&Res::Ctor(_, variant, _)) => Some(variant),
+            _ => None,
+        };
+        match *self.body.expr(expr) {
+            Expr::Path(_) if !self.typed.coercions.contains_key(&expr) => Some((variant(expr)?, Vec::new())),
+            Expr::Call(callee, args) => Some((variant(callee)?, self.body.list(args).iter().enumerate().map(|(index, &at)| (index as u32, ExprId(at))).collect())),
+            Expr::Struct { fields, base: None, .. } => {
+                let fields = self.body.list(fields).iter().map(|&at| self.body.fields[at as usize].value).map(|value| Some((*self.typed.inits.get(&value)?, value))).collect::<Option<Vec<_>>>()?;
+                Some((variant(expr)?, fields))
+            }
+            _ => None,
+        }
+    }
+
+    /// Writes the fields and the tag of the constructor `expr` of the ADT `item` at `args`, a value of `ty`.
+    fn construct(&self, cx: &mut Context<'_>, (expr, ty): (ExprId, Ty), (item, args): (ItemRef, Substs), at: usize, out: &mut [u8]) -> Option<()> {
+        let (variant, fields) = self.constructor(expr)?;
+        let layout = cx.layout(ty).ok()?;
+        let args = cx.types.substs(args).to_vec();
+        let types = field_types(cx, item, &args).ok()?.get(variant as usize)?.clone();
+        for (index, value) in fields {
+            self.write(cx, (value, *types.get(index as usize)?), at + field_offset(&layout, variant, index) as usize, out)?;
+        }
+        if let Some((offset, tag, bits)) = super::adt::tag_bits(cx, item, &layout, variant).ok()? {
+            let size = tag.bytes() as usize;
+            let start = at + offset as usize;
+            out.get_mut(start..start + size)?.copy_from_slice(&bits.to_le_bytes()[..size]);
+        }
+        Some(())
+    }
+}
+
+/// The bytes of `expr`, a value of `ty` made of literals, when they fit `LITERAL_BYTES`.
+fn literal_bytes(cx: &mut Context<'_>, literal: &Literal<'_>, (expr, ty): (ExprId, Ty)) -> Option<Vec<u8>> {
+    let size = usize::try_from(cx.layout(ty).ok()?.size.bytes()).ok().filter(|size| *size <= LITERAL_BYTES)?;
+    let mut out = vec![0; size];
+    literal.write(cx, (expr, ty), 0, &mut out)?;
+    Some(out)
 }
 
 impl Lower<'_, '_> {
     /// The value of the constant `item` at `substs` that `expr` reads: an immediate, or bytes laid out once, when its body is literals of a crate that cannot change while haste runs; else a call of its body.
     pub(super) fn constant(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
-        match self.literal_constant(expr, item, substs)? {
+        if let Some(value) = self.literal_constant(expr, item, substs)? {
+            return Ok(Some(value));
+        }
+        match self.literal_reference(item, substs)? {
             Some(value) => Ok(Some(value)),
             None => self.invoke(item, substs, Vec::new()),
         }
     }
 
-    fn literal_constant(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
+    /// The definition and inference of the constant `item` at `substs` when lowering may read its value from its body: a body that takes no type arguments, of a crate whose sources cannot change while haste runs.
+    fn literal_source(&mut self, item: ItemRef, substs: Substs) -> Result<Option<(ItemRef, std::sync::Arc<Typed>)>> {
         let index = self.reached_index(item, substs)?;
         let ((source, _), Ok(typed)) = &self.reached.list[index] else { return Ok(None) };
         let env = &self.cx.outline.crates[source.krate as usize].env;
-        if !matches!(typed.shape, Shape::Body) || !(env.release || env.fixed) {
-            return Ok(None);
-        }
-        let (source, ty) = (*source, typed.ret_ty());
+        let readable = matches!(typed.shape, Shape::Body) && (env.release || env.fixed) && self.cx.types.substs(substs).is_empty();
+        Ok(readable.then(|| (*source, typed.clone())))
+    }
+
+    fn literal_constant(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
+        let Some((source, typed)) = self.literal_source(item, substs)? else { return Ok(None) };
+        let ty = typed.ret_ty();
         let body = self.cx.body(source)?;
         let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
-        match (repr(self.cx, ty)?, self.cx.types.kind(ty)) {
-            (Repr::Scalar(machine), &Kind::Prim(primitive)) => Ok(literal_scalar((&body, src), root, primitive).map(|bits| self.int_const(machine, bits))),
-            (Repr::Mem { .. }, Kind::Array(..)) if !self.lent_mutably(expr) => {
-                let mut bytes = Vec::new();
-                if literal_bytes(self.cx, (&body, src), (root, ty), &mut bytes).is_none() {
-                    return Ok(None);
-                }
+        let literal = Literal { body: &body, src, typed: &typed };
+        match repr(self.cx, ty)? {
+            Repr::Scalar(machine) => {
+                let Some(bytes) = literal_bytes(self.cx, &literal, (root, ty)) else { return Ok(None) };
+                let mut word = [0; 16];
+                word[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
+                Ok(Some(self.int_const(machine, u128::from_le_bytes(word))))
+            }
+            Repr::Mem { .. } if !self.lent_mutably(expr) => {
+                let Some(bytes) = literal_bytes(self.cx, &literal, (root, ty)) else { return Ok(None) };
                 let id = self.slots.rodata(&bytes, &[]);
                 Ok(Some(self.emit_symbol(SymbolSource::Rodata(id))))
             }
             _ => Ok(None),
         }
+    }
+
+    /// The value of the constant `item` at `substs`, a shared reference whose body is `&` of a value made of literals: the address of those bytes laid out once, with the length of the array it points to when the reference is to a slice.
+    fn literal_reference(&mut self, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
+        let Some((source, typed)) = self.literal_source(item, substs)? else { return Ok(None) };
+        let ty = typed.ret_ty();
+        let Kind::Ref(Mut::Not, pointee) = *self.cx.types.kind(ty) else { return Ok(None) };
+        let body = self.cx.body(source)?;
+        let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
+        let mut root = root;
+        while let Expr::Paren(inner) = *body.expr(root) {
+            root = inner;
+        }
+        let Expr::Ref { mutable: false, raw: false, expr: inner } = *body.expr(root) else { return Ok(None) };
+        let inner_ty = typed.exprs[inner.0 as usize];
+        let literal = Literal { body: &body, src, typed: &typed };
+        let Some(bytes) = literal_bytes(self.cx, &literal, (inner, inner_ty)) else { return Ok(None) };
+        let id = self.slots.rodata(&bytes, &[]);
+        let data = self.emit_symbol(SymbolSource::Rodata(id));
+        Ok(match (self.cx.types.kind(pointee).clone(), self.cx.types.kind(inner_ty).clone()) {
+            (Kind::Slice(_), Kind::Array(_, len)) => self.cx.types.len(len).map(|len| self.wide_pointer(data, len as i64)),
+            (Kind::Slice(_), _) => None,
+            _ if pointee == inner_ty => Some(data),
+            _ => None,
+        })
     }
 
     /// The address of the bytes the compiler laid out for `expr` when it names a constant made of literals that lives in memory.

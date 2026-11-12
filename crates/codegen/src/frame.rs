@@ -1,9 +1,10 @@
 //! Frame layout shared by the encoders: where arguments travel, and frame offsets from the frame pointer for values, stack slots, edge scratch and outgoing arguments.
 
-use crate::alloc::Location;
+use crate::alloc::{Location, Plan};
 use crate::ir::{Function, Op, Signature, Type, Value};
 
-const WORD: u32 = 8;
+/// The bytes of a machine word.
+pub(crate) const WORD: u32 = 8;
 const MAX_ALIGN_SHIFT: u8 = 4;
 /// The bytes of a page of stack, which a larger frame touches one at a time.
 pub(crate) const PAGE: u32 = 4096;
@@ -108,6 +109,15 @@ impl<R> Frame<R> {
     pub(crate) fn edge_slot(&self, index: usize) -> i32 {
         self.scratch + (EDGE_SLOT as usize * index) as i32
     }
+
+    /// Whether `a` and `b` both live in memory at one shared home, so the bytes of one are the bytes of the other.
+    pub(crate) fn shares(&self, plan: &Plan<R>, a: Value, b: Value) -> bool
+    where
+        R: Copy,
+    {
+        let memory = |value: Value| matches!(plan.location(value), Location::Slot);
+        memory(a) && memory(b) && self.values[a.index()] == self.values[b.index()]
+    }
 }
 
 /// The operations of the instructions in blocks.
@@ -156,19 +166,31 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
     (values, slots)
 }
 
-/// Lays out the frame below the frame pointer: saved registers, the values that live in memory, the stack slots in use, edge scratch, then outgoing arguments at the stack pointer.
-pub(crate) fn layout<R>(func: &Function, saves: Vec<R>, locations: &[Location<R>], classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<Frame<R>, String> {
+/// Lays out the frame below the frame pointer: saved registers, the values that live in memory (one place per shared home), the stack slots in use, edge scratch, then outgoing arguments at the stack pointer.
+pub(crate) fn layout<R>(func: &Function, saves: Vec<R>, (locations, shared): (&[Location<R>], &[Option<u32>]), classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<Frame<R>, String> {
     let (outgoing, scratch) = needs(func, classify)?;
     let (present, addressed) = present(func);
     let mut cursor = saves.len() as u32 * WORD;
     let mut values = Vec::with_capacity(func.types.len());
+    let mut homes: Vec<i32> = Vec::new();
     for (value, ty) in func.types.iter().enumerate() {
         if !present[value] || matches!(locations[value], Location::Reg(_) | Location::Float(_)) {
             values.push(0);
             continue;
         }
-        cursor += round(ty.bytes(), WORD);
-        values.push(-(cursor as i32));
+        let Some(home) = shared.get(value).copied().flatten().map(|home| home as usize) else {
+            cursor += round(ty.bytes(), WORD);
+            values.push(-(cursor as i32));
+            continue;
+        };
+        if homes.len() <= home {
+            homes.resize(home + 1, 0);
+        }
+        if homes[home] == 0 {
+            cursor += round(ty.bytes(), WORD);
+            homes[home] = -(cursor as i32);
+        }
+        values.push(homes[home]);
     }
     let mut slots = Vec::with_capacity(func.slots.len());
     for (slot, data) in func.slots.iter().enumerate() {

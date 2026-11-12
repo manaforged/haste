@@ -22,8 +22,10 @@ use crate::{Code, Site};
 /// The registers planning hands out: the saved pool, caller-saved registers the emitter never uses as scratch, and the float pool.
 const REGS: Regs<Reg> = Regs {
     saved: &SAVED,
-    leaf: &[Reg::Rdi, Reg::R9, Reg::R8, Reg::R10],
+    leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10],
     wide_scratch: &wide::WIDE_SCRATCH,
+    op_scratch: &[Reg::Rsi],
+    uses_scratch: atomic::uses_rsi,
     dict: Some(Reg::R10),
     float: &float::POOL,
     float_branches: &float::BRANCHES,
@@ -36,7 +38,7 @@ pub(crate) fn compile(func: &Function, effort: crate::Effort) -> Result<Code, St
     let order = crate::live::order(func);
     let abi = classify(&func.signature)?;
     let plan = plan(func, &REGS, (&order, effort == crate::Effort::Full), &abi.params, classify);
-    let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, classify)?;
+    let frame = layout(func, saved(func, &plan.used, &SAVED), (&plan.locations, &plan.shared), classify)?;
     let framed = crate::frame::framed(func, &frame, abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..))));
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -280,7 +282,7 @@ impl Emit<'_> {
 
     /// Whether `a` and `b` live in the same place, so writing one overwrites the other.
     fn same_home(&self, a: Value, b: Value) -> bool {
-        a == b || (self.reg_of(a).is_some() && self.reg_of(a) == self.reg_of(b)) || (self.xmm_of(a).is_some() && self.xmm_of(a) == self.xmm_of(b))
+        a == b || (self.reg_of(a).is_some() && self.reg_of(a) == self.reg_of(b)) || (self.xmm_of(a).is_some() && self.xmm_of(a) == self.xmm_of(b)) || self.frame.shares(&self.plan, a, b)
     }
 
     /// Writes `value` into the location of `param`.
