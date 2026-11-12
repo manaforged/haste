@@ -1,4 +1,4 @@
-use crate::ir::{AbiParam, Binary, CallConv, Convert, Function, Inst, InstData, Op, SigRef, Signature, Type, Value};
+use crate::ir::{AbiParam, Binary, CallConv, Convert, Function, InstData, Op, SigRef, Signature, Type, Value};
 use crate::reloc::RuntimeSymbol;
 
 /// A helper compiled into haste that one instruction becomes a call to.
@@ -8,7 +8,7 @@ struct Helper {
     result: Option<Value>,
 }
 
-/// Turns each instruction the encoder has no inline form for into a call to a native helper: copies of a size `copy::chunks` does not cover, and 128-bit division and float conversions.
+/// Turns each instruction the encoder has no inline form for into a call to a native helper: copies of a size `copy::chunks` does not cover, moves above `copy::MOVE_INLINE` bytes, and 128-bit division and float conversions.
 pub(crate) fn lower(func: &mut Function) {
     let mut consts = vec![None; func.types.len()];
     for data in &func.insts {
@@ -20,11 +20,20 @@ pub(crate) fn lower(func: &mut Function) {
         let mut at = 0;
         while at < func.blocks[block].insts.len() {
             let inst = func.blocks[block].insts[at];
+            if let Op::Move(to, from, bytes) = func.insts[inst.index()].op
+                && bytes > crate::copy::MOVE_INLINE
+            {
+                let size = func.value(Type::I64);
+                let constant = func.add(Op::Const(i64::from(bytes)), Some(size));
+                func.blocks[block].insts.insert(at, constant);
+                func.insts[inst.index()].op = Op::Copy(to, from, size);
+                at += 1;
+            }
             if let Some(helper) = helper(func, &consts, &func.insts[inst.index()]) {
                 let sig = signature(func, &helper);
                 let callee = func.value(Type::I64);
-                func.insts.push(InstData { op: Op::Runtime(helper.symbol), result: Some(callee) });
-                func.blocks[block].insts.insert(at, Inst(func.insts.len() as u32 - 1));
+                let runtime = func.add(Op::Runtime(helper.symbol), Some(callee));
+                func.blocks[block].insts.insert(at, runtime);
                 let data = &mut func.insts[inst.index()];
                 data.op = Op::Call { sig, callee, args: helper.args, results: helper.result.into_iter().collect() };
                 data.result = None;

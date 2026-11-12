@@ -132,6 +132,9 @@ impl Scan {
 
     fn classify(&mut self, func: &Function, block: Block, inst: Inst) {
         let data = &func.insts[inst.index()];
+        if matches!(data.op, Op::Move(..)) {
+            return;
+        }
         let mut skip = [None, None];
         if let Some(touch) = self.touch(data) {
             skip[0] = touch.addr;
@@ -187,6 +190,11 @@ impl Scan {
         };
         self.vars[var].add(ty, matches!(kind, Kind::Store(_)));
         self.accesses.push(Access { block: at.0, inst: at.1, var, kind, ty });
+    }
+
+    /// Whether `addr` is the address of a slot that nothing but moves lets escape.
+    fn open(&self, addr: Value) -> bool {
+        self.addrs[addr.index()].is_some_and(|(slot, _)| !self.escaped[slot.index()])
     }
 
     fn promotable(&self, slot: usize) -> bool {
@@ -577,34 +585,39 @@ fn push_edge_arg(func: &mut Function, pred: Block, target: Block, arg: Value) {
     }
 }
 
-fn push_inst(func: &mut Function, op: Op, result: Value) -> Inst {
-    func.insts.push(InstData { op, result: Some(result) });
-    Inst(func.insts.len() as u32 - 1)
-}
-
 fn materialize(func: &mut Function, zeros: &[(Type, Value)]) -> Vec<Inst> {
     let mut insts = Vec::new();
     for &(ty, value) in zeros {
         if ty != Type::I128 {
-            insts.push(push_inst(func, Op::Const(0), value));
+            insts.push(func.add(Op::Const(0), Some(value)));
             continue;
         }
         let half = func.value(Type::I64);
-        insts.push(push_inst(func, Op::Const(0), half));
-        insts.push(push_inst(func, Op::Binary(Binary::Iconcat, half, half), value));
+        insts.push(func.add(Op::Const(0), Some(half)));
+        insts.push(func.add(Op::Binary(Binary::Iconcat, half, half), Some(value)));
     }
     insts
 }
 
-/// Promotes every stack slot whose address never escapes into SSA values carried in block parameters.
+/// Promotes every stack slot whose address never escapes into SSA values carried in block parameters, first splitting into pieces each move that touches a slot only moves let escape.
 pub(crate) fn run(func: &mut Function) {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
         return;
     };
-    let scan = Scan::new(func);
-    if !(0..func.slots.len()).any(|slot| scan.promotable(slot)) {
-        return;
+    let mut scan = Scan::new(func);
+    let mut splits = Vec::new();
+    if func.insts.iter().any(|data| matches!(data.op, Op::Move(to, from, _) if scan.open(to) || scan.open(from))) {
+        splits = crate::copy::expand(func, |to, from, bytes| (scan.open(to) || scan.open(from)).then(|| crate::copy::words(bytes)));
+        scan = Scan::new(func);
     }
+    if (0..func.slots.len()).any(|slot| scan.promotable(slot)) {
+        promote(func, entry, scan);
+    }
+    crate::copy::rejoin(func, &splits);
+}
+
+/// Promotes every promotable slot `scan` found.
+fn promote(func: &mut Function, entry: Block, scan: Scan) {
     let local = Local::new(&scan);
     let count = func.types.len();
     let fresh = Fresh { base: count, types: Vec::new(), zeros: Vec::new() };

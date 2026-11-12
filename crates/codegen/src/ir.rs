@@ -284,6 +284,8 @@ pub(crate) enum Op {
     FramePointer,
     /// Copies the number of bytes in the third value from the address in the second to the address in the first; the two may overlap.
     Copy(Value, Value, Value),
+    /// Copies a value of this many bytes from the address in the second value to the address in the first; the two ranges are the same or disjoint.
+    Move(Value, Value, u32),
     Call { sig: SigRef, callee: Value, args: Vec<Value>, results: Vec<Value> },
     TryCall { sig: SigRef, callee: Value, args: Vec<Value>, normal: Block, handler: Block },
     Jump(Block, Vec<Value>),
@@ -330,7 +332,7 @@ impl Op {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
             Op::Unary(_, x) | Op::Convert(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
-            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) => {
+            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
                 f(*x);
                 f(*y);
             }
@@ -364,7 +366,8 @@ impl Op {
             | Op::Fcmp(_, x, y)
             | Op::Store(x, y, _)
             | Op::AtomicStore(x, y)
-            | Op::AtomicRmw(_, x, y) => {
+            | Op::AtomicRmw(_, x, y)
+            | Op::Move(x, y, _) => {
                 *x = f(*x);
                 *y = f(*y);
             }
@@ -433,6 +436,12 @@ impl Function {
     pub(crate) fn value(&mut self, ty: Type) -> Value {
         self.types.push(ty);
         Value(self.types.len() as u32 - 1)
+    }
+
+    /// A new instruction outside every block that runs `op` and defines `result`.
+    pub(crate) fn add(&mut self, op: Op, result: Option<Value>) -> Inst {
+        self.insts.push(InstData { op, result });
+        Inst(self.insts.len() as u32 - 1)
     }
 
     /// The operation of the last instruction of `block`.

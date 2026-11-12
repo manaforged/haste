@@ -61,6 +61,11 @@ impl Emit<'_> {
 
     /// The memory at `addr + offset`: relative to rbp for a frame address, to the location register of `addr`, or through rcx.
     pub(super) fn address(&mut self, addr: Value, offset: i32) -> Mem {
+        self.address_in(addr, offset, Reg::Rcx)
+    }
+
+    /// The memory operand at `addr + offset`, loading `addr` into `scratch` when it is neither in a register nor a frame address.
+    pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg) -> Mem {
         if let Some(reg) = self.reg_of(addr) {
             return Mem::new(reg, offset);
         }
@@ -69,8 +74,8 @@ impl Emit<'_> {
         {
             return Mem::new(Reg::Rbp, disp);
         }
-        self.raw(Reg::Rcx, addr);
-        Mem::new(Reg::Rcx, offset)
+        self.raw(scratch, addr);
+        Mem::new(scratch, offset)
     }
 
     pub(super) fn get(&mut self, reg: Reg, value: Value, ext: Ext) {

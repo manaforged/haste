@@ -3,7 +3,7 @@ use super::{Emit, Ext};
 use crate::ir::{Binary, Convert, FloatCC, Type, Unary, Value};
 
 const X0: Xmm = Xmm(0);
-const X1: Xmm = Xmm(1);
+pub(super) const X1: Xmm = Xmm(1);
 const X2: Xmm = Xmm(2);
 const TWO_63: i64 = 0x43E0_0000_0000_0000;
 const TWO_64: i64 = 0x43F0_0000_0000_0000;

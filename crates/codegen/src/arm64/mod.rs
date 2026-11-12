@@ -9,7 +9,7 @@ mod wide;
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, classify};
 use crate::alloc::{Location, Plan, Regs, plan};
-use crate::frame::{Frame, INCOMING, PAGE, edge_moves, layout, saved};
+use crate::frame::{Frame, INCOMING, PAGE, edge_steps, Step, layout, saved};
 use crate::ir::{Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::reloc::{DictTierUp, StencilReloc};
 use crate::target::{Os, Target};
@@ -263,18 +263,12 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) {
-        let (pairs, clash) = edge_moves(args, &self.func.blocks[block.index()].params, |a, b| self.same_home(a, b));
-        if !clash {
-            for (arg, param) in pairs {
-                self.assign(param, arg);
+        for step in edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.same_home(a, b)) {
+            match step {
+                Step::Move(arg, param) => self.assign(param, arg),
+                Step::Save(arg, index) => self.move_to(Mem::new(FP, self.frame.edge_slot(index)), arg),
+                Step::Restore(index, param) => self.load_home(param, Mem::new(FP, self.frame.edge_slot(index))),
             }
-            return;
-        }
-        for (index, (arg, _)) in pairs.iter().enumerate() {
-            self.move_to(Mem::new(FP, self.frame.edge_slot(index)), *arg);
-        }
-        for (index, (_, param)) in pairs.iter().enumerate() {
-            self.load_home(*param, Mem::new(FP, self.frame.edge_slot(index)));
         }
     }
 

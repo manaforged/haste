@@ -54,11 +54,44 @@ pub(crate) fn returns<R: Copy>(signature: &Signature, ints: [R; 2], floats: u8) 
     signature.returns.iter().map(|param| param.value_type).map(place).collect()
 }
 
-/// The argument and parameter of each move an edge into a block with `params` makes, and whether one move writes the place another reads, when `same_home` tells that two values share a place.
-pub(crate) fn edge_moves(args: &[Value], params: &[Value], same_home: impl Fn(Value, Value) -> bool) -> (Vec<(Value, Value)>, bool) {
-    let pairs: Vec<(Value, Value)> = args.iter().copied().zip(params.iter().copied()).filter(|(arg, param)| !same_home(*arg, *param)).collect();
-    let clash = pairs.iter().any(|(arg, _)| pairs.iter().any(|(_, param)| same_home(*arg, *param)));
-    (pairs, clash)
+/// One step of the moves an edge into a block makes, in an order that reads every place before any step writes it.
+#[derive(Clone, Copy)]
+pub(crate) enum Step {
+    /// Writes the argument into the place of the parameter.
+    Move(Value, Value),
+    /// Saves the argument into edge scratch `index`, which breaks a cycle of moves.
+    Save(Value, usize),
+    /// Loads the parameter from edge scratch `index`.
+    Restore(usize, Value),
+}
+
+/// Where a pending edge move reads from: an argument's place, or edge scratch.
+#[derive(Clone, Copy)]
+enum Source {
+    Value(Value),
+    Scratch(usize),
+}
+
+/// The steps of the moves an edge into a block with `params` makes, when `same_home` tells that two values share a place: each move runs once no other pending move still reads its target, and a cycle goes through edge scratch.
+pub(crate) fn edge_steps(args: &[Value], params: &[Value], same_home: impl Fn(Value, Value) -> bool) -> Vec<Step> {
+    let mut pending: Vec<(Source, Value)> = args.iter().zip(params).filter(|(arg, param)| !same_home(**arg, **param)).map(|(arg, param)| (Source::Value(*arg), *param)).collect();
+    let mut steps = Vec::with_capacity(pending.len());
+    let mut saved = 0;
+    while !pending.is_empty() {
+        let read = |at: usize| pending.iter().enumerate().any(|(other, (source, _))| other != at && matches!(source, Source::Value(arg) if same_home(*arg, pending[at].1)));
+        if let Some(at) = (0..pending.len()).find(|at| !read(*at)) {
+            steps.push(match pending.remove(at) {
+                (Source::Value(arg), param) => Step::Move(arg, param),
+                (Source::Scratch(index), param) => Step::Restore(index, param),
+            });
+            continue;
+        }
+        let Some((at, arg)) = pending.iter().enumerate().find_map(|(at, (source, _))| if let Source::Value(arg) = source { Some((at, *arg)) } else { None }) else { break };
+        steps.push(Step::Save(arg, saved));
+        pending[at].0 = Source::Scratch(saved);
+        saved += 1;
+    }
+    steps
 }
 
 /// Frame offsets from the frame pointer for every value, stack slot and the edge scratch area.

@@ -159,6 +159,10 @@ impl Probe {
                 self.hasher.word((129 << 32) | u64::from(to.0));
                 self.hasher.word((u64::from(from.0) << 32) | u64::from(bytes.0));
             }
+            Op::Move(to, from, bytes) => {
+                self.hasher.word((134 << 32) | u64::from(to.0));
+                self.hasher.word((u64::from(from.0) << 32) | u64::from(bytes));
+            }
             Op::Fence => self.hasher.word(130),
             Op::FramePointer => self.hasher.word(131),
             Op::Trap => self.hasher.word(132),

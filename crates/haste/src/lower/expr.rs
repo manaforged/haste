@@ -16,14 +16,48 @@ use super::place::Place;
 use super::stencil::{InlinedCallee, LowerMode, SymbolSource, item_bits, resolve_inline};
 use super::{Loop, Lower, Parts, Repr, repr};
 
-/// The most instructions a sysroot body may have, after slot promotion, for a call to copy it inline.
-const INLINE_LIMIT: usize = 30;
+/// How large a sysroot body a call may copy inline under one build profile.
+struct Budget {
+    /// The most instructions a body may have, after slot promotion, for a call to copy it inline.
+    insts: usize,
+    /// The most instructions an `#[inline(always)]` body may have for a call to copy it inline.
+    always: usize,
+    /// The most source expressions a function body may have for lowering it to try `insts`.
+    exprs: usize,
+}
 
-/// The most instructions an `#[inline(always)]` sysroot body may have for a call to copy it inline.
-const ALWAYS_LIMIT: usize = 100;
+/// The budget of the dev profile.
+const DEBUG_BUDGET: Budget = Budget { insts: 30, always: 100, exprs: 20 };
 
-/// The most source expressions a sysroot body may have for lowering it to try `INLINE_LIMIT`.
-const INLINE_EXPRS: usize = 20;
+/// The budget of the release profile.
+const RELEASE_BUDGET: Budget = Budget { insts: 400, always: 1000, exprs: 400 };
+
+/// The budget of the build profile.
+fn budget() -> &'static Budget {
+    match crate::profile() {
+        crate::outline::tree::Profile::Debug => &DEBUG_BUDGET,
+        crate::outline::tree::Profile::Release => &RELEASE_BUDGET,
+    }
+}
+
+/// What an item's attributes ask of inlining.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hint {
+    Default,
+    Always,
+    Never,
+}
+
+/// The inlining hint of `item`: `#[inline(always)]`, or `#[inline(never)]` and `#[cold]`, which calls never copy.
+fn hint(cx: &Context<'_>, item: ItemRef) -> Hint {
+    if cx.inline_always(item) {
+        Hint::Always
+    } else if cx.attr_value(item, "cold").is_some() || cx.attr_value(item, "inline") == Some("never") {
+        Hint::Never
+    } else {
+        Hint::Default
+    }
+}
 
 /// What a call runs: code at an address, or reached function `index`, which may be copied inline.
 enum Callee {
@@ -53,13 +87,15 @@ fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option
     if !cx.outline.crates[item.krate as usize].env.release || crate::prep::bind(cx, reached, index).is_some() {
         return None;
     }
-    let source = match &typed.shape {
-        Shape::Body if cx.inline_always(*item) => return Some(ALWAYS_LIMIT),
-        Shape::Body => *item,
-        Shape::Closure(closure) => closure.parent,
-        _ => return Some(INLINE_LIMIT),
-    };
-    cx.body(source).is_ok_and(|body| body.exprs.len() <= INLINE_EXPRS).then_some(INLINE_LIMIT)
+    let budget = budget();
+    if !matches!(typed.shape, Shape::Body) {
+        return Some(budget.insts);
+    }
+    match hint(cx, *item) {
+        Hint::Never => None,
+        Hint::Always => Some(budget.always),
+        Hint::Default => cx.body(*item).is_ok_and(|body| body.exprs.len() <= budget.exprs).then_some(budget.insts),
+    }
 }
 
 impl Lower<'_, '_> {

@@ -143,7 +143,7 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// Copies a value of `repr` from address `from` to address `to`: scalar by scalar at the widths and offsets its layout names, else every byte in the widest words.
+    /// Copies a value of `repr` from address `from` to address `to`: scalar by scalar at the widths and offsets its layout names, else as one move of its bytes.
     pub fn copy(&mut self, to: Value, from: Value, repr: Repr) {
         let (size, parts) = match repr {
             Repr::Zst => return,
@@ -157,14 +157,7 @@ impl Lower<'_, '_> {
             }
             return;
         }
-        let mut at = 0;
-        for (ty, step) in [(Type::I64, 8), (Type::I32, 4), (Type::I16, 2), (Type::I8, 1)] {
-            while size - at >= step {
-                let word = self.ins().load(ty, from, at as i32);
-                self.ins().store(word, to, at as i32);
-                at += step;
-            }
-        }
+        self.ins().move_value(to, from, size);
     }
 
     /// The place that the place expression `expr` names, or none when `expr` is a value.

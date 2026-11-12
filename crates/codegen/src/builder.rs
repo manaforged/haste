@@ -663,6 +663,11 @@ impl Ins<'_> {
         self.effect(Op::Copy(to, from, bytes))
     }
 
+    /// Copies a value of `bytes` bytes from `from` to `to`, two ranges that are the same or disjoint.
+    pub fn move_value(mut self, to: Value, from: Value, bytes: u32) -> Inst {
+        self.effect(Op::Move(to, from, bytes))
+    }
+
     /// Writes `value` at `addr + offset`.
     pub fn store(mut self, value: Value, addr: Value, offset: i32) -> Inst {
         self.effect(Op::Store(value, addr, offset))

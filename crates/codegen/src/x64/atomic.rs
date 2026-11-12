@@ -1,4 +1,5 @@
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
+use super::float::X1;
 use super::{Emit, Ext};
 use crate::ir::{AtomicRmwOp, Op, StackSlot, Type, Value};
 use crate::reloc::{RelocKind, StencilReloc};
@@ -7,6 +8,12 @@ const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
 
 /// Scratch registers an inline copy holds its chunks in; none of them forms an address.
 const COPY_SCRATCH: [Reg; 4] = [Reg::Rax, Reg::Rdx, Reg::R11, Reg::Rsi];
+
+/// The bytes a move copies through one xmm register at a time.
+const VECTOR: u32 = 16;
+
+/// The opcodes of `movups` from memory into an xmm register, and from an xmm register into memory.
+const MOVUPS: ([u8; 2], [u8; 2]) = ([0x0F, 0x10], [0x0F, 0x11]);
 
 impl Emit<'_> {
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
@@ -68,6 +75,7 @@ impl Emit<'_> {
             Op::Fence => self.asm.bytes(&MFENCE),
             Op::FramePointer => self.put(result()?, Reg::Rbp),
             Op::Copy(to, from, bytes) => self.copy(*to, *from, *bytes)?,
+            Op::Move(to, from, bytes) => self.move_bytes(*to, *from, *bytes),
             _ => return self.atomic(op, result),
         }
         Ok(())
@@ -93,6 +101,22 @@ impl Emit<'_> {
             self.asm.store(Size::of(width), target.offset(offset as i32), reg);
         }
         Ok(())
+    }
+
+    /// Copies `bytes` bytes between two ranges that are the same or disjoint: 16 at a time through xmm1, then word by word through rax.
+    fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
+        let source = self.address_in(from, 0, Reg::Rsi);
+        let target = self.address_in(to, 0, Reg::Rcx);
+        let whole = bytes / VECTOR * VECTOR;
+        for at in (0..whole).step_by(VECTOR as usize) {
+            self.asm.sse(&[], &MOVUPS.0, X1.0, source.offset(at as i32));
+            self.asm.sse(&[], &MOVUPS.1, X1.0, target.offset(at as i32));
+        }
+        for (ty, at) in crate::copy::words(bytes - whole) {
+            let at = (whole + at) as i32;
+            self.asm.load(Size::of(ty.bytes()), Reg::Rax, source.offset(at));
+            self.asm.store(Size::of(ty.bytes()), target.offset(at), Reg::Rax);
+        }
     }
 
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
