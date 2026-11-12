@@ -18,6 +18,21 @@ pub fn inlined<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<Value> 
     callees.filter(|def_id| seen.insert(*def_id)).map(|def_id| crate::key::at(tcx, def_id)).collect()
 }
 
+/// The most statements a leaf's body holds.
+const LEAF_STATEMENTS: usize = 16;
+
+/// Whether the optimized body of `instance` is a small leaf: at most `LEAF_STATEMENTS` statements, and no call, drop, assembly or tail call besides calls of intrinsics.
+pub fn leaf<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+    let body = tcx.instance_mir(instance.def);
+    let statements: usize = body.basic_blocks.iter().map(|block| block.statements.len()).sum();
+    let plain = |terminator: &Terminator<'tcx>| match &terminator.kind {
+        TerminatorKind::Call { func, .. } => matches!(*func.ty(body, tcx).kind(), ty::FnDef(def_id, _) if tcx.intrinsic(def_id).is_some()),
+        TerminatorKind::Drop { .. } | TerminatorKind::InlineAsm { .. } | TerminatorKind::TailCall { .. } => false,
+        _ => true,
+    };
+    statements <= LEAF_STATEMENTS && body.basic_blocks.iter().all(|block| plain(block.terminator()))
+}
+
 /// What the optimized body of `instance` reaches outside itself: the trait object and function pointer types whose code pointers it makes, calls or hands to the shared standard library, the functions of the shared standard library that take no type arguments it calls or reifies, the symbols of the instances it calls, drops, reifies or puts in a vtable, the symbols of the statics outside the sysroot it reads or writes that are mutable, thread-local or hold interior mutability, the keys of the function pointer types it calls through (none when one has no key), and whether it reaches standard library code whose state each copy of std keeps apart.
 pub struct Used<'tcx> {
     pub symbols: Vec<String>,

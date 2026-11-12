@@ -9,7 +9,7 @@ use crate::sema::layout::Layout;
 use crate::sema::ty::{Kind, Ty};
 
 use super::bridge::Carry;
-use super::key::Miss;
+use super::key::{Keys, Miss};
 use super::print;
 use super::record::{Abi, Arg, Class, Conv, Pass, Reg};
 
@@ -49,18 +49,51 @@ fn thin_pointer(arg: &Arg) -> bool {
     arg.size == 8 && same(Haste::One(Type::I64), &arg.pass)
 }
 
-/// How each argument of a call through a vtable slot (`thin` is one, for its receiver) or a function pointer (`thin` is zero) that Haste's code makes with `params` and `ret` reaches rustc's convention `abi`, with the parameter types as rustc counts them: a last tuple of no items, which rustc's call methods take apart, dropped.
-pub(super) fn spread_carries(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), abi: &Abi, thin: usize) -> Option<(Vec<Ty>, Vec<Carry>)> {
-    let mut spread = params.to_vec();
-    if spread.len() != abi.args.len()
-        && let Some(&last) = spread.last()
-        && let Kind::Tuple(items) = cx.types.kind(last).clone()
-        && cx.types.substs(items).is_empty()
-    {
-        spread.pop();
-    }
+/// How each argument of a call through a vtable slot (`thin` is one, for its receiver) or a function pointer (`thin` is zero) that Haste's code makes with `params` and `ret` reaches rustc's convention `abi`, with the parameter types as rustc counts them: a last tuple taken apart as rustc's call methods take it when it has no items and `abi` counts one argument fewer, or when its keys are the ones `abi` passes.
+pub(super) fn spread_carries(cx: &mut Context<'_>, keys: &Keys, (params, ret): (&[Ty], Option<Ty>), abi: &Abi, thin: usize) -> Option<(Vec<Ty>, Vec<Carry>)> {
+    let spread = match spread(cx, params) {
+        Some(spread) if (spread.len() < params.len() && params.len() != abi.args.len()) || keyed(cx, keys, (&spread, ret), abi, thin) => spread,
+        _ => params.to_vec(),
+    };
     let carries = carries_after(cx, (&spread, ret), abi, thin)?;
     Some((spread, carries))
+}
+
+/// The parameters `params` of a function returning `ret` as convention `abi` counts them, as they are or with a last tuple taken apart as rustc's call methods take it, when the keys of the parameters after the first `thin` and of the return are those of the types `abi` passes there.
+pub(super) fn counted(cx: &mut Context<'_>, keys: &Keys, (params, ret): (&[Ty], Option<Ty>), abi: &Abi, thin: usize) -> Option<Vec<Ty>> {
+    if keyed(cx, keys, (params, ret), abi, thin) {
+        return Some(params.to_vec());
+    }
+    let spread = spread(cx, params)?;
+    keyed(cx, keys, (&spread, ret), abi, thin).then_some(spread)
+}
+
+/// Whether the parameters `params` after the first `thin` and the return `ret`, `()` when none, have the keys of the types convention `abi` passes there.
+fn keyed(cx: &mut Context<'_>, keys: &Keys, (params, ret): (&[Ty], Option<Ty>), abi: &Abi, thin: usize) -> bool {
+    let ret = ret.unwrap_or_else(|| cx.types.tuple(&[]));
+    let theirs: Vec<Option<&str>> = abi.args.iter().chain([&abi.ret]).skip(thin).map(|arg| arg.key.as_deref()).collect();
+    let ours: Vec<Ty> = params.iter().skip(thin).copied().chain([ret]).collect();
+    theirs.len() == ours.len() && ours.into_iter().zip(theirs).all(|(ty, theirs)| theirs.is_some_and(|theirs| keys.ty(cx, ty).is_ok_and(|key| key == theirs)))
+}
+
+/// `params` with a last tuple taken apart as rustc's call methods take it: a tuple of no items dropped, and a tuple of one item, which Haste lays out and passes as that item, replaced by it; none when the last parameter is no such tuple.
+fn spread(cx: &mut Context<'_>, params: &[Ty]) -> Option<Vec<Ty>> {
+    let (&last, rest) = params.split_last()?;
+    let Kind::Tuple(items) = cx.types.kind(last).clone() else { return None };
+    let mut spread = rest.to_vec();
+    match *cx.types.substs(items).to_vec() {
+        [] => {}
+        [item] if same_value(cx, last, item) => spread.push(item),
+        _ => return None,
+    }
+    Some(spread)
+}
+
+/// Whether Haste lays out and passes a tuple `tuple` of the one item `item` exactly as `item`: the same size and alignment, the item at offset zero, and one way of passing.
+fn same_value(cx: &mut Context<'_>, tuple: Ty, item: Ty) -> bool {
+    let (Ok(outer), Ok(inner)) = (cx.layout(tuple), cx.layout(item)) else { return false };
+    let at_zero = crate::sema::layout::field_offset(&outer, 0, 0) == 0;
+    at_zero && outer.size == inner.size && outer.align.bytes() == inner.align.bytes() && argument(cx, tuple).is_some_and(|haste| argument(cx, item) == Some(haste))
 }
 
 /// How an argument of `ty` reaches rustc's code that takes it as `arg`: as Haste passes it, or split from its address into the two registers of a scalar pair whose parts no signed narrow integer is, since a load widens with zeros.

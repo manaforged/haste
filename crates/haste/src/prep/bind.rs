@@ -50,6 +50,8 @@ pub enum Decision {
     Indirect,
     /// The open library does not export the record's symbol.
     Missing,
+    /// rustc's code of it is a small leaf that rustc copies into its callers, so Haste's code copies its own.
+    Leaf,
 }
 
 /// The driver's library of one build and what binding to it needs: its records by the key that names them, which records an edit or shared state rules out, and how keys name the build's definitions.
@@ -229,12 +231,12 @@ impl Bindings {
         if self.settled(cx).state[at] {
             return Err(Decision::State);
         }
-        let (params, ret) = super::signature(typed);
-        let mut types = params.clone();
-        types.push(ret.unwrap_or_else(|| cx.types.tuple(&[])));
-        if !self.same_signature(cx, &types, record) {
-            return Err(Decision::Convention);
+        if record.leaf {
+            return Err(Decision::Leaf);
         }
+        let (params, ret) = super::signature(typed);
+        let params = conv::counted(cx, &self.keys, (&params, ret), &record.abi, 0).ok_or(Decision::Convention)?;
+        let types: Vec<Ty> = params.iter().copied().chain([ret.unwrap_or_else(|| cx.types.tuple(&[]))]).collect();
         let carries = conv::carries(cx, (&params, ret), &record.abi).ok_or(Decision::Convention)?;
         match conv::layouts(cx, &types) {
             Ok((found, _)) if record.layouts.as_ref() != Some(&found) => Err(Decision::Layout),
@@ -242,12 +244,6 @@ impl Bindings {
             Ok(_) => super::exported(&record.symbol).map(|address| (Decision::Bound(address), carries)).ok_or(Decision::Missing),
             Err(_) => Err(Decision::Layout),
         }
-    }
-
-    /// Whether the argument and return types `types` have the keys of the types `record` passes.
-    fn same_signature(&self, cx: &mut Context<'_>, types: &[Ty], record: &Record) -> bool {
-        let theirs: Vec<Option<&str>> = record.abi.args.iter().chain([&record.abi.ret]).map(|arg| arg.key.as_deref()).collect();
-        theirs.len() == types.len() && types.iter().zip(theirs).all(|(&ty, theirs)| theirs.is_some_and(|theirs| self.keys.ty(cx, ty).is_ok_and(|ours| ours == theirs)))
     }
 
     /// What binding decided for each function this process asked about, and how many records of each kind those functions name.
@@ -322,6 +318,7 @@ pub struct Tally {
     pub indirect: usize,
     pub ambiguous: usize,
     pub missing: usize,
+    pub leaf: usize,
     pub unmatched: usize,
 }
 
@@ -336,6 +333,7 @@ impl Tally {
             Decision::Indirect => &mut self.indirect,
             Decision::Ambiguous => &mut self.ambiguous,
             Decision::Missing => &mut self.missing,
+            Decision::Leaf => &mut self.leaf,
             Decision::Unmatched => &mut self.unmatched,
         };
         *counter += 1;
@@ -345,7 +343,7 @@ impl Tally {
 impl std::fmt::Display for Tally {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kinds: Vec<String> = CATEGORIES.iter().zip(self.kinds).map(|(name, (found, all))| format!("{name} {found}/{all}")).collect();
-        write!(out, "rustc {} records, {} matched ({}), {} bound ({} through adapters, {} release copies), refused {} stale {} state {} convention {} layout {} indirect {} ambiguous {} missing, {} unmatched", self.records, self.matched, kinds.join(" "), self.bound, self.adapted, self.release, self.stale, self.state, self.convention, self.layout, self.indirect, self.ambiguous, self.missing, self.unmatched)
+        write!(out, "rustc {} records, {} matched ({}), {} bound ({} through adapters, {} release copies), refused {} stale {} state {} convention {} layout {} indirect {} ambiguous {} missing {} leaf, {} unmatched", self.records, self.matched, kinds.join(" "), self.bound, self.adapted, self.release, self.stale, self.state, self.convention, self.layout, self.indirect, self.ambiguous, self.missing, self.leaf, self.unmatched)
     }
 }
 

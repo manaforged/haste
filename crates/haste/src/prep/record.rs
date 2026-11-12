@@ -93,6 +93,8 @@ pub(super) struct Record {
     pub calls: Option<Vec<String>>,
     pub held: bool,
     pub release_copy: bool,
+    #[serde(default)]
+    pub leaf: bool,
 }
 
 /// Where a definition is: its crate, and its file and the byte offset of its name unless a macro expansion wrote it.

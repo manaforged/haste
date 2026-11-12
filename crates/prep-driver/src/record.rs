@@ -129,6 +129,7 @@ fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData
         "statics": used.statics,
         "calls": used.calls,
         "held": used.held,
+        "leaf": uses::leaf(tcx, instance),
     });
     Ok(joined(described(tcx, instance)?, local))
 }

@@ -13,12 +13,6 @@ pub enum Family {
     Avx512,
     /// VAES and VPCLMULQDQ on YMM and ZMM registers.
     VectorCrypto,
-    /// SSSE3, with SSE4.1.
-    Ssse3,
-    /// SSE4.1, with SSE4.2.
-    Sse41,
-    /// SSE4.2.
-    Sse42,
 }
 
 /// The families without native encodings in the code generator, which compiled code sees as absent so that run-time dispatch picks paths this backend runs well.
@@ -80,9 +74,6 @@ impl Family {
                 ..NONE
             },
             Self::VectorCrypto => Bits { leaf7_ecx: 1 << 9 | 1 << 10, ..NONE },
-            Self::Ssse3 => Bits { leaf1_ecx: 1 << 9, ..NONE }.with(Self::Sse41.bits()),
-            Self::Sse41 => Bits { leaf1_ecx: 1 << 19, ..NONE }.with(Self::Sse42.bits()),
-            Self::Sse42 => Bits { leaf1_ecx: 1 << 20, ..NONE },
         }
     }
 }

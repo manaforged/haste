@@ -126,7 +126,7 @@ impl Indirect {
 
     /// How each argument of a call through a code pointer that takes `params`, the first `thin` of them receivers, and returns `ret` reaches rustc's convention `abi`, when the layouts it crosses besides its receivers are `layouts` and every trait object and function pointer type among them may cross.
     fn method(&self, cx: &mut Context<'_>, keys: &Keys, (params, ret, thin): (&[Ty], Option<Ty>, usize), (abi, layouts): (&Abi, &Option<Vec<String>>), visiting: &mut Vec<Ty>) -> Option<(Vec<Ty>, Vec<Carry>)> {
-        let (spread, carries) = conv::spread_carries(cx, (params, ret), abi, thin)?;
+        let (spread, carries) = conv::spread_carries(cx, keys, (params, ret), abi, thin)?;
         let mut types = spread.get(thin..)?.to_vec();
         types.push(ret.unwrap_or_else(|| cx.types.tuple(&[])));
         let (printed, found) = conv::layouts(cx, &types).ok()?;
