@@ -47,6 +47,9 @@ fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option
     let ((item, _), Ok(typed)) = &reached.list[index] else {
         return None;
     };
+    if typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
+        return None;
+    }
     if !cx.outline.crates[item.krate as usize].env.release {
         return None;
     }
