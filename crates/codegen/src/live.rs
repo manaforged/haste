@@ -317,6 +317,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
                     }
                     at += 1;
                     for_effective_operands(h_data, sib, elided, |v| use_val(v, at, &mut open, &mut touched));
+                    at += 1;
                     results(h_data).for_each(|r| def_val(r, at, false, &mut defs, &mut open, &mut touched, &mut per_val));
                 }
                 copied_head = Some(*head);
@@ -341,6 +342,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
             }
             at += 1;
             for_effective_operands(data, sib, elided, |v| use_val(v, at, &mut open, &mut touched));
+            at += 1;
             results(data).for_each(|r| def_val(r, at, true, &mut defs, &mut open, &mut touched, &mut per_val));
         }
         at += 1;

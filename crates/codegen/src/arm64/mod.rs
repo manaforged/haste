@@ -8,11 +8,11 @@ mod wide;
 
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
-use crate::alloc::{Location, Plan, Regs};
+use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, Step, arg_steps, drive, edge_steps, emit_body, prepare, save_offset};
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
-use crate::reloc::{DictTierUp, StencilReloc};
+use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{Os, Target};
 use crate::{Code, Site};
 
@@ -38,7 +38,7 @@ const REGS: Regs<Reg> = Regs {
     float: &float::POOL,
     float_branches: &float::BRANCHES,
     vectors: false,
-    absolute_calls: false,
+    absolute_calls: true,
     two_address: false,
     park: true,
     fold_sib: true,
@@ -49,7 +49,22 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let Prepared { order, copied, abi, plan, frame, framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    let emit = Emit { func, frame, framed, abi, packing, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, copied };
+    let emit = Emit {
+        func,
+        frame,
+        framed,
+        abi,
+        packing,
+        asm,
+        blocks,
+        sites: Vec::new(),
+        relocs: Vec::new(),
+        plan,
+        flags: None,
+        next: None,
+        copied,
+        direct_calls: target.direct_calls,
+    };
     drive(emit, &order)
 }
 
@@ -95,6 +110,7 @@ pub(super) struct Emit<'a> {
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
     copied: Vec<bool>,
+    direct_calls: bool,
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
@@ -385,12 +401,17 @@ impl Emit<'_> {
                 self.stack_argument(offset, param.purpose, *arg);
             }
         }
-        let target = match self.plan.reg_of(callee).filter(|reg| SAVED.contains(reg)) {
-            Some(reg) => reg,
-            None => {
-                self.raw(T, callee);
-                T
+        let direct = self.plan.through[callee.index()];
+        let target = if direct.is_none() {
+            match self.plan.reg_of(callee).filter(|reg| SAVED.contains(reg)) {
+                Some(reg) => reg,
+                None => {
+                    self.raw(T, callee);
+                    T
+                }
             }
+        } else {
+            T
         };
         let float_targets: Vec<(Value, u8)> = args.iter().zip(&abi.params).filter_map(|(&arg, &loc)| if let Loc::Float(v) = loc { Some((arg, v)) } else { None }).collect();
         for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
@@ -416,7 +437,23 @@ impl Emit<'_> {
                 self.high(high, arg);
             }
         }
-        self.asm.blr(target);
+        match direct {
+            Some(CallTarget::Slot(sym)) if self.direct_calls => {
+                let at = self.asm.bl_reloc();
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Arm64Call26));
+            }
+            Some(CallTarget::Slot(sym)) => {
+                let at = self.asm.mov_symbol(T);
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Arm64Movw64));
+                self.asm.load(Size::X, false, T, Mem::new(T, 0));
+                self.asm.blr(T);
+            }
+            Some(CallTarget::Abs(at)) => {
+                self.asm.mov_imm(T, i64::from(at));
+                self.asm.blr(T);
+            }
+            None => self.asm.blr(target),
+        }
         Ok(abi)
     }
 

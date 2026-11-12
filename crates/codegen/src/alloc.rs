@@ -56,6 +56,7 @@ pub(crate) struct Plan<R> {
     pub homed: Vec<bool>,
     pub sib: Vec<Option<Sib>>,
     pub elided: Vec<bool>,
+    pub zero_ext: Vec<bool>,
 }
 
 fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
@@ -470,7 +471,18 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
     let (pairs, deferred) = pairs(func, &locations, &elided);
     let shared = if weighed { crate::color::share(func, &live, &locations, &deferred) } else { Vec::new() };
-    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided }
+    let zero_ext = func.insts.iter().fold(vec![false; count], |mut out, data| {
+        if let Some(res) = data.result
+            && matches!(
+                data.op,
+                Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(_) | Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(Convert::Uextend, _)
+            )
+        {
+            out[res.index()] = true;
+        }
+        out
+    });
+    Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext }
 }
 
 impl<R: Copy> Plan<R> {

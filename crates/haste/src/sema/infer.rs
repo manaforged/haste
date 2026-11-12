@@ -218,7 +218,7 @@ pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs)
     if cx.lang(item) == Some("clone_fn") && clone::compiler_clone(cx, ty) {
         return clone::clone_typed(cx, item, ty).map(Some);
     }
-    if cx.lang(item) == Some("poll") && cx.closure(ty).is_some_and(|info| info.closure.coroutine) {
+    if cx.lang(item) == Some("poll") && cx.ensure_closure(ty).is_some_and(|info| info.closure.coroutine) {
         return closure::coroutine_typed(cx, item, ty).map(Some);
     }
     let (once, by_ref) = (cx.call_once() == Some(item), closure::by_reference(cx, item).is_some());

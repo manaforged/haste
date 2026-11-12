@@ -1,22 +1,40 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Block, Type, Value};
+use haste_codegen::{Block, IntCC, Type, Value};
 use rustc_abi::Variants;
 use rustc_index::Idx;
 
 use crate::body::{ExprId, List, PatId};
-use crate::names::ItemRef;
+use crate::names::{ItemRef, Primitive};
 use crate::sema::infer::{Res, SiteKey, Tried};
 use crate::sema::substs::Substs;
+use crate::sema::ty::{Kind, Ty};
 
 use super::place::Place;
 use super::reloc::SiteOrigin;
-use super::{Loop, Lower, repr};
+use super::{Loop, Lower, Repr, repr};
+
+fn range_signed(prim: Primitive) -> Option<bool> {
+    match prim {
+        Primitive::I8 | Primitive::I16 | Primitive::I32 | Primitive::I64 | Primitive::Isize => Some(true),
+        Primitive::U8 | Primitive::U16 | Primitive::U32 | Primitive::U64 | Primitive::Usize | Primitive::Char => Some(false),
+        _ => None,
+    }
+}
 
 impl Lower<'_, '_> {
     /// Lowers `for pat in iter { body }`: `into_iter` once, then `next` until it returns `None`.
     pub fn for_expr(&mut self, expr: ExprId, pat: PatId, iter: ExprId, (label, body): (Option<u32>, ExprId)) -> Result<Option<Value>> {
         let Some(each) = self.typed.fors.get(&expr).cloned() else { bail!("`for` loop has no iterator calls") };
         let (Res::Fn(into, into_substs), Res::Fn(next, next_substs)) = (each.into_iter, each.next) else { bail!("`for` loop calls are not functions") };
+        if let Kind::Adt(adt, args) = *self.cx.types.kind(each.iter)
+            && self.cx.lang(adt) == Some("Range")
+            && let [elem_ty] = *self.cx.types.substs(args)
+            && let Kind::Prim(prim) = *self.cx.types.kind(elem_ty)
+            && let Some(signed) = range_signed(prim)
+            && let Repr::Scalar(ir_ty) = repr(self.cx, elem_ty)?
+        {
+            return self.for_range(pat, iter, (each.iter, elem_ty), (signed, ir_ty), (label, body));
+        }
         let value = self.expr(iter)?;
         let iterator = self.invoke(SiteOrigin::Table(SiteKey::ForInto(expr)), into, into_substs, value.into_iter().collect())?;
         let place = self.spill(iterator, each.iter)?;
@@ -35,6 +53,34 @@ impl Lower<'_, '_> {
         self.enter(inner);
         let item = self.variant_field(option, each.option, (each.some, 0))?;
         self.bind_matched(pat, Some(item), None)?;
+        self.loop_body((head, exit, depth), label, body)
+    }
+
+    fn for_range(&mut self, pat: PatId, iter: ExprId, (range_ty, elem_ty): (Ty, Ty), (signed, ir_ty): (bool, Type), (label, body): (Option<u32>, ExprId)) -> Result<Option<Value>> {
+        let value = self.expr(iter)?;
+        let Some(place) = self.spill(value, range_ty)? else { bail!("range has no place") };
+        let start_place = self.part_place(place, range_ty, (0, 0))?;
+        let end_place = self.part_place(place, range_ty, (0, 1))?;
+        let Some(start) = self.read(start_place) else { bail!("range start has no value") };
+        let Some(end) = self.read(end_place) else { bail!("range end has no value") };
+        let cur_repr = repr(self.cx, elem_ty)?;
+        let Some(cur_slot) = self.slot(cur_repr) else { bail!("range element has no slot") };
+        let cur_place = Place::slot(cur_slot, cur_repr);
+        self.write(cur_place, start);
+        let depth = self.owned.len();
+        let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.jump(head, &[]);
+        self.enter(head);
+        let Some(cur) = self.read(cur_place) else { bail!("range cursor has no value") };
+        let cc = if signed { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan };
+        let cond = self.ins().icmp(cc, cur, end);
+        self.brif(cond, (inner, &[]), (exit, &[]));
+        self.enter(inner);
+        let one = self.ins().iconst(ir_ty, 1);
+        let next = self.ins().iadd(cur, one);
+        self.write(cur_place, next);
+        let item = self.spill(Some(cur), elem_ty)?;
+        self.bind_matched(pat, item, None)?;
         self.loop_body((head, exit, depth), label, body)
     }
 

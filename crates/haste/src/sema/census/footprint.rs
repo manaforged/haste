@@ -393,7 +393,8 @@ pub(super) fn hash_closure_env_offsets(cx: &mut Context<'_>, raw_ty: Ty, bins: &
     while let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *cx.types.kind(ty) {
         ty = inner;
     }
-    hash_all_field_offsets(cx, cx.closure_env(ty).unwrap_or(ty), bins);
+    let env = cx.ensure_closure(ty).map_or(ty, |info| info.env);
+    hash_all_field_offsets(cx, env, bins);
 }
 
 fn hash_locals_and_pats(cx: &mut Context<'_>, typed: &Typed, bins: &mut HashBins) {

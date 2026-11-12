@@ -197,7 +197,7 @@ impl Context<'_> {
     }
 
     fn closure_layout(&mut self, ty: Ty) -> Result<Layout> {
-        let Some(env) = self.closure_env(ty) else { bail!("layout of a closure whose defining body was not inferred") };
+        let Some(env) = self.ensure_closure(ty).map(|info| info.env) else { bail!("layout of a closure whose defining body was not inferred") };
         Ok((*self.layout(env)?).clone())
     }
 

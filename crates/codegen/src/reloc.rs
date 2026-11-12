@@ -6,6 +6,8 @@ pub enum RelocKind {
     Abs32,
     Abs64,
     Arm64Movw64,
+    PcRel32,
+    Arm64Call26,
 }
 
 /// A runtime helper linked into generated code.
@@ -165,6 +167,9 @@ pub fn patch_reloc(kind: RelocKind, value: u64, out: &mut [u8]) -> Result<(), cr
         }
         RelocKind::Abs64 => out[..8].copy_from_slice(&value.to_le_bytes()),
         RelocKind::Arm64Movw64 => patch_arm64_movw64(&mut out[..16], value),
+        RelocKind::PcRel32 | RelocKind::Arm64Call26 => {
+            return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("{kind:?} requires AOT PC-relative patching")));
+        }
     }
     Ok(())
 }

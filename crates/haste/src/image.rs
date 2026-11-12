@@ -168,7 +168,7 @@ impl Slots for Image {
     }
 
     fn low_entries(&self) -> bool {
-        self._low.is_low()
+        cfg!(target_arch = "aarch64") || self._low.is_low()
     }
 
     fn rodata(&self, bytes: &[u8], relocs: &[lower::RodataReloc]) -> lower::RodataId {

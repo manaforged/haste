@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use haste_codegen::{Code, Target, dict_entry_stub, dict_stub_relocs};
+use haste_codegen::{Code, RelocKind, Target, dict_entry_stub, dict_stub_relocs};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::aot::{Executable, Symbol};
@@ -95,21 +95,26 @@ fn emit_dict_bodies(state: &AotState, exe: &mut Executable) -> Result<HashMap<us
     Ok(dict_bodies)
 }
 
+fn slot_target(fn_offs: &[Option<u32>], foreign_fns: &HashMap<usize, HostSymbol>, idx: usize) -> Symbol {
+    if let Some(off) = fn_offs.get(idx).copied().flatten() {
+        Symbol::Text(off)
+    } else if let Some(host) = foreign_fns.get(&idx) {
+        Symbol::Host(host.clone())
+    } else {
+        Symbol::Host(HostSymbol::Abort)
+    }
+}
+
 fn emit_functions(state: &AotState, target: &Target, syms: &SymTable<'_>, dict_bodies: &HashMap<usize, u32>, exe: &mut Executable) -> Result<Vec<Option<u32>>> {
     let mut fn_offs = vec![None; state.functions.len()];
     let mut aliases = Vec::new();
+    let mut pending = Vec::new();
     for (idx, item) in state.functions.iter().enumerate() {
         match item {
             Some(AotFn::Direct { code, relocs }) => {
                 let off = exe.text(code.bytes());
                 fn_offs[idx] = Some(off);
-                for reloc in code.relocs() {
-                    let target_sym = match reloc.as_runtime() {
-                        Some(rt) => Symbol::Runtime(rt),
-                        None => syms.translate(&relocs[reloc.symbol as usize])?,
-                    };
-                    exe.patch(off + reloc.offset, reloc.kind, target_sym);
-                }
+                pending.push((off, code, relocs));
             }
             Some(AotFn::Dict { body, relocs }) => {
                 let dict_off = exe.rodata(&vec![0u8; relocs.len() * 8], 8);
@@ -130,6 +135,19 @@ fn emit_functions(state: &AotState, target: &Target, syms: &SymTable<'_>, dict_b
     }
     for (idx, leader) in aliases {
         fn_offs[idx] = fn_offs[leader];
+    }
+    for (off, code, relocs) in pending {
+        for reloc in code.relocs() {
+            let target_sym = match reloc.as_runtime() {
+                Some(rt) => Symbol::Runtime(rt),
+                None if matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32) => match relocs[reloc.symbol as usize] {
+                    SymbolSource::Slot(callee_idx) => slot_target(&fn_offs, &state.foreign_fns, callee_idx),
+                    ref other => syms.translate(other)?,
+                },
+                None => syms.translate(&relocs[reloc.symbol as usize])?,
+            };
+            exe.patch(off + reloc.offset, reloc.kind, target_sym);
+        }
     }
     Ok(fn_offs)
 }
@@ -195,28 +213,18 @@ impl Image {
         let dict_bodies = emit_dict_bodies(&state, &mut exe)?;
         let fn_offs = emit_functions(&state, target, &syms, &dict_bodies, &mut exe)?;
 
-        let slot_target = |idx: usize| -> Symbol {
-            if let Some(off) = fn_offs.get(idx).copied().flatten() {
-                Symbol::Text(off)
-            } else if let Some(host) = state.foreign_fns.get(&idx) {
-                Symbol::Host(host.clone())
-            } else {
-                Symbol::Host(HostSymbol::Abort)
-            }
-        };
-
         for (id, entries) in state.vtables.iter().enumerate() {
             for (i, entry) in entries.iter().enumerate() {
                 let target_sym = match *entry {
                     VtableEntry::Word(Word::Int(val)) => Symbol::Word(val),
-                    VtableEntry::Word(Word::Code(fn_idx)) => slot_target(fn_idx),
+                    VtableEntry::Word(Word::Code(fn_idx)) => slot_target(&fn_offs, &state.foreign_fns, fn_idx),
                     VtableEntry::Super(super_id) => Symbol::Rodata(vtable_offs[super_id.0 as usize]),
                 };
                 exe.pointer(true, vtable_offs[id] + (i * 8) as u32, target_sym);
             }
         }
         for (idx, &slot_off) in slot_offs.iter().enumerate() {
-            exe.pointer(true, slot_off, slot_target(idx));
+            exe.pointer(true, slot_off, slot_target(&fn_offs, &state.foreign_fns, idx));
         }
 
         let Some(start_off) = fn_offs.get(lang_start).copied().flatten() else {

@@ -195,12 +195,18 @@ impl Emit<'_> {
                     return Ok(dst);
                 }
             }
-            self.raw(dst, x);
-            match self.imm_of(y) {
-                Some(imm) => self.asm.alu_imm(alu, dst, imm),
-                None => {
-                    let source = self.operand(y);
-                    self.asm.alu(alu, dst, source);
+            if self.imm_of(y).is_none() && self.reg_of(y) == Some(dst) && x != y {
+                self.asm.mov(Reg::Rax, dst);
+                self.raw(dst, x);
+                self.asm.alu(alu, dst, Reg::Rax);
+            } else {
+                self.raw(dst, x);
+                match self.imm_of(y) {
+                    Some(imm) => self.asm.alu_imm(alu, dst, imm),
+                    None => {
+                        let source = self.operand(y);
+                        self.asm.alu(alu, dst, source);
+                    }
                 }
             }
             return Ok(dst);
@@ -231,9 +237,15 @@ impl Emit<'_> {
             (_, Some(imm)) => (x, imm),
             (Some(imm), None) => (y, imm),
             (None, None) => {
-                self.raw(dst, x);
-                let source = self.operand(y);
-                self.asm.imul(dst, source);
+                if self.reg_of(y) == Some(dst) && x != y {
+                    self.asm.mov(Reg::Rax, dst);
+                    self.raw(dst, x);
+                    self.asm.imul(dst, Reg::Rax);
+                } else {
+                    self.raw(dst, x);
+                    let source = self.operand(y);
+                    self.asm.imul(dst, source);
+                }
                 return;
             }
         };

@@ -277,6 +277,7 @@ impl Lower<'_, '_> {
 
     fn literal_constant(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         let Some((source, typed)) = self.literal_source(item, substs)? else { return Ok(None) };
+        let typed = typed.scoped(&self.cx.types);
         let ty = typed.ret_ty();
         let body = self.cx.body(source)?;
         let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
@@ -300,6 +301,7 @@ impl Lower<'_, '_> {
     /// The value of the constant `item` at `substs`, a shared reference whose body is `&` of a value made of literals: the address of those bytes laid out once, with the length of the array it points to when the reference is to a slice.
     fn literal_reference(&mut self, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         let Some((source, typed)) = self.literal_source(item, substs)? else { return Ok(None) };
+        let typed = typed.scoped(&self.cx.types);
         let ty = typed.ret_ty();
         let Kind::Ref(Mut::Not, pointee) = *self.cx.types.kind(ty) else { return Ok(None) };
         let body = self.cx.body(source)?;

@@ -276,10 +276,16 @@ impl Image {
         let started = std::time::Instant::now();
         let item = reached.list[index].0.0;
         let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
-        let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-        let code = haste_codegen::compile(out.func, &target()).map_err(|e| item_err(cx, item, e))?;
-        let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
-        self.publish(index, exec);
+        let code = haste_codegen::compile(out.func, &target().direct_calls(self.aot.is_some())).map_err(|e| item_err(cx, item, e))?;
+        if self.aot.is_none() {
+            let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+            let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
+            self.publish(index, exec);
+        } else {
+            for sym in &out.relocs {
+                self.symbol_value(sym);
+            }
+        }
         let code_len = code.bytes().len() as u32;
         self.record_aot(index, AotFn::Direct { code: Arc::new(code), relocs: out.relocs }, &[]);
         pass.record_size(index, code_len, started.elapsed().as_nanos() as u64);
@@ -391,8 +397,7 @@ impl Image {
         let template = pass.stencils.templates.get(&(item, footprint)).cloned()?;
         match template {
             CachedTemplate::Stencil { code, .. } => {
-                let exec = pass.memory.write_patched(&code, symbols).ok()?;
-                self.publish(index, exec);
+                let exec = if aot_relocs.is_some() { 0 } else { let e = pass.memory.write_patched(&code, symbols).ok()?; self.publish(index, e); e };
                 if let Some(relocs) = aot_relocs {
                     self.record_aot(index, AotFn::Direct { code: Arc::clone(&code), relocs: relocs.clone() }, &[]);
                 }
@@ -401,8 +406,7 @@ impl Image {
                 Some(VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() })
             }
             CachedTemplate::Dict { body_exec, code, .. } => {
-                let (stub_exec, stub_bytes) = self.emit_dict_stub(body_exec, symbols, None, pass).ok()?;
-                self.publish(index, stub_exec);
+                let (stub_exec, stub_bytes) = if aot_relocs.is_some() { (0, Vec::new()) } else { let (e, b) = self.emit_dict_stub(body_exec, symbols, None, pass).ok()?; self.publish(index, e); (e, b) };
                 if let Some(relocs) = aot_relocs {
                     self.record_aot(index, AotFn::Dict { body: Arc::clone(&code), relocs: relocs.clone() }, &[]);
                 }
@@ -460,9 +464,10 @@ impl Image {
             None => lower::lower_stencil(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?,
         };
         let reloc_plan = out.reloc_plan;
-        let code = Arc::new(haste_codegen::compile(out.func, &target()).map_err(|e| item_err(cx, group.item, e))?);
+        let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.aot.is_some())).map_err(|e| item_err(cx, group.item, e))?);
         let tree = &cx.outline.crates[group.item.krate as usize];
-        if tree.env.release
+        if self.aot.is_none()
+            && tree.env.release
             && tree.env.fixed
             && code.relocs().iter().all(|r| r.symbol_index().is_some())
             && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, group.item)
@@ -475,8 +480,7 @@ impl Image {
         }
         let mut records = Vec::new();
         for inst in &group.distinct {
-            let exec = pass.memory.write_patched(&code, &inst.symbols).map_err(|e| item_err(cx, group.item, e))?;
-            self.store_instance(inst, exec);
+            let exec = if self.aot.is_some() { 0 } else { let e = pass.memory.write_patched(&code, &inst.symbols).map_err(|e| item_err(cx, group.item, e))?; self.store_instance(inst, e); e };
             if let Some(relocs) = &inst.relocs {
                 self.record_aot(inst.leader, AotFn::Direct { code: Arc::clone(&code), relocs: relocs.clone() }, &inst.followers);
             }
@@ -509,11 +513,10 @@ impl Image {
         let started = std::time::Instant::now();
         let (func, _, reloc_plan) = lower::lower_dict(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?;
         let code = Arc::new(haste_codegen::compile(func, &target()).map_err(|e| item_err(cx, group.item, e))?);
-        let body_exec = self.write_dict_body(&code, pass).map_err(|e| item_err(cx, group.item, e))?;
+        let body_exec = if self.aot.is_some() { 0 } else { self.write_dict_body(&code, pass).map_err(|e| item_err(cx, group.item, e))? };
         let mut records = Vec::new();
         for inst in &group.distinct {
-            let (stub_exec, stub_bytes) = self.emit_dict_stub(body_exec, &inst.symbols, None, pass).map_err(|e| item_err(cx, group.item, e))?;
-            self.store_instance(inst, stub_exec);
+            let (stub_exec, stub_bytes) = if self.aot.is_some() { (0, Vec::new()) } else { let (e, b) = self.emit_dict_stub(body_exec, &inst.symbols, None, pass).map_err(|e| item_err(cx, group.item, e))?; self.store_instance(inst, e); (e, b) };
             if let Some(relocs) = &inst.relocs {
                 self.record_aot(inst.leader, AotFn::Dict { body: Arc::clone(&code), relocs: relocs.clone() }, &inst.followers);
             }

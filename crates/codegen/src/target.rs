@@ -64,6 +64,7 @@ pub struct Target {
     pub cfg: &'static str,
     /// How much work the code generator spends on each function.
     pub effort: Effort,
+    pub direct_calls: bool,
 }
 
 macro_rules! target {
@@ -79,6 +80,7 @@ macro_rules! target {
             symbol_prefix: $prefix,
             cfg: include_str!(concat!("targets/", $triple, ".cfg")),
             effort: Effort::Quick,
+            direct_calls: false,
         }
     };
 }
@@ -127,6 +129,13 @@ impl Target {
     #[must_use]
     pub const fn effort(mut self, effort: Effort) -> Self {
         self.effort = effort;
+        self
+    }
+
+    /// This target with direct PC-relative calls enabled when `direct_calls` is true.
+    #[must_use]
+    pub const fn direct_calls(mut self, direct_calls: bool) -> Self {
+        self.direct_calls = direct_calls;
         self
     }
 }

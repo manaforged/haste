@@ -47,7 +47,23 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let Prepared { order, copied, abi, plan, frame, framed } = prepare(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    let emit = Emit { func, frame, framed, abi, abi_kind, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, features: Features::host(), copied };
+    let emit = Emit {
+        func,
+        frame,
+        framed,
+        abi,
+        abi_kind,
+        asm,
+        blocks,
+        sites: Vec::new(),
+        relocs: Vec::new(),
+        plan,
+        flags: None,
+        next: None,
+        features: Features::host(),
+        copied,
+        direct_calls: target.direct_calls,
+    };
     drive(emit, &order)
 }
 
@@ -93,6 +109,7 @@ pub(super) struct Emit<'a> {
     next: Option<Block>,
     features: Features,
     copied: Vec<bool>,
+    direct_calls: bool,
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
@@ -473,6 +490,10 @@ impl Emit<'_> {
         }
         match direct {
             Some(CallTarget::Abs(at)) => self.asm.call_absolute(at),
+            Some(CallTarget::Slot(sym)) if self.direct_calls => {
+                let at = self.asm.call_pcrel32();
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::PcRel32));
+            }
             Some(CallTarget::Slot(sym)) => {
                 let at = self.asm.call_slot_reloc();
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));

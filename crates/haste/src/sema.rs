@@ -93,6 +93,7 @@ pub struct Cache {
 struct OutlineState {
     langs: RwLock<Option<traits::Langs>>,
     loaded: RwLock<Vec<[usize; 5]>>,
+    primitives: RwLock<Option<Arc<[u32]>>>,
 }
 
 /// The lookups Sema caches about one outline, which hold while only function bodies change.
@@ -105,6 +106,7 @@ struct Lookups {
     discriminants: Table<ItemRef, Arc<[i128]>>,
     state: Arc<OutlineState>,
     drops: Table<ty::Ty, bool>,
+    glues: Table<ty::Ty, Option<infer::Res>>,
     fields: Table<ty::Ty, infer::Fields>,
     forms: Table<(infer::Form, usize), Option<infer::Fields>>,
     reveals: table::Flight<reach::Instance, ty::Ty>,
@@ -142,6 +144,7 @@ impl Lookups {
             discriminants: std::mem::take(&mut self.discriminants),
             state: Arc::clone(&self.state),
             drops: std::mem::take(&mut self.drops),
+            glues: self.glues.retained(|_, found| found.is_some()),
             fields: std::mem::take(&mut self.fields),
             forms: self.forms.retained(|_, found| found.is_some()),
             futures: std::mem::take(&mut self.futures),
@@ -175,6 +178,7 @@ impl Lookups {
                 self.summaries = table::Flight::default();
             }
             *write_lock(&self.state.langs) = None;
+            *write_lock(&self.state.primitives) = None;
             self.sysroot_index = Arc::new(std::sync::OnceLock::new());
             *guard = loaded;
         }
@@ -273,6 +277,7 @@ impl Cache {
 impl Lookups {
     fn forget_edited<F: Fn(ItemRef) -> bool>(&mut self, edited: Edited<'_>, naming: &mut Naming<'_, F>, mine: &F, block_kept: &dyn Fn(&impls::ImplRef) -> bool) {
         self.drops.retain(|ty, _| !naming.names(*ty));
+        self.glues.retain(|ty, _| !naming.names(*ty));
         self.fields.retain(|ty, _| !naming.names(*ty));
         self.forms.retain(|(form, _), found| {
             let own = match *form {
@@ -767,16 +772,12 @@ impl<'a> Context<'a> {
     fn alias_eq(&self, item: ItemRef) -> Result<(u32, u32)> {
         let (src, entry) = self.item(item);
         let Some(at) = entry.name else { bail!("type alias with no name") };
-        let mut depth = 0i32;
-        let mut found = None;
+        let (mut depth, mut found) = (0i32, None);
         for token in at + 1..entry.end {
             match src.kind(token) {
                 rustc_lexer::TokenKind::Lt => depth += 1,
                 rustc_lexer::TokenKind::Gt if src.kind(token - 1) != rustc_lexer::TokenKind::Minus => depth -= 1,
-                rustc_lexer::TokenKind::Eq if depth == 0 => {
-                    found = Some(token);
-                    break;
-                }
+                rustc_lexer::TokenKind::Eq if depth == 0 => { found = Some(token); break; }
                 _ => {}
             }
         }

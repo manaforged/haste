@@ -305,6 +305,7 @@ fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_
 
 /// The functions a closure's own body calls; its typed data is its parent's, whose calls hold those of every closure in the parent's body, so each table is read at the closure's own expressions.
 fn closure_calls(cx: &mut Context<'_>, typed: &Typed) -> Option<Vec<(ItemRef, Substs)>> {
+    let typed = typed.scoped(&cx.types);
     let Shape::Closure(closure) = &typed.shape else { return None };
     let body = cx.body(closure.parent).ok()?;
     let own = own_exprs(&body, closure.closure.body);

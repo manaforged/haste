@@ -11,8 +11,8 @@ use super::infer::{Typed, infer, register};
 use super::substs::Substs;
 use super::ty::{Kind, Ty};
 
-const MIN_PARALLEL_WAVE: usize = 16;
-const WAVE_BATCH: usize = 4;
+const MIN_PARALLEL_WAVE: usize = 4;
+const WAVE_BATCH: usize = 2;
 
 /// One function at concrete type arguments.
 pub type Instance = (ItemRef, Substs);
@@ -400,7 +400,7 @@ fn infer_entry(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<Strin
 }
 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
-fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
+pub(super) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
     if let Some(typed) = cx.store.finals.get(instance) {
         register(cx, *instance, &typed);
         return Ok(typed);
@@ -419,7 +419,8 @@ fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String
 
 /// Computes the layout of each ADT, tuple and array type that lowering `typed` reads, so the names those layouts need are asked for while inference can still retry.
 pub(super) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
-    let tables = typed.ensure_tables(&cx.types);
+    let scoped = typed.scoped(&cx.types);
+    let tables = scoped.ensure_tables(&cx.types);
     let intrinsic_args: Vec<Ty> = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_some()).flat_map(|(_, substs)| cx.types.substs(substs).iter().copied()).collect();
     let locals = typed.locals.iter().map(|local| local.ty);
     let pats = tables.pats.values().copied();

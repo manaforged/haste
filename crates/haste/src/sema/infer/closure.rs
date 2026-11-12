@@ -364,7 +364,7 @@ impl<'a> Infer<'_, 'a> {
         let Kind::Closure(parent, substs, at) = *self.cx.types.kind(ty) else { return Ok(None) };
         let local = self.instance == Some((parent, substs));
         if !local && !self.cx.has_closure(ty) {
-            super::opaque::revealed(self.cx, parent, substs)?;
+            self.cx.ensure_closure(ty);
         }
         Ok(Some((at, (!local).then(|| self.cx.closure(ty)).flatten())))
     }
@@ -616,7 +616,7 @@ pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Res
             (res, ret)
         }
         _ => {
-            let Some(info) = cx.closure(callee) else { bail!("a closure whose defining body was not inferred") };
+            let Some(info) = cx.ensure_closure(callee) else { bail!("a closure whose defining body was not inferred") };
             let Some(call_once) = cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
             (Res::fn_of(&cx.types, call_once, &[callee, tuple]), info.closure.ret)
         }
@@ -632,8 +632,9 @@ pub fn register(cx: &mut Context<'_>, (parent, substs): (ItemRef, Substs), typed
     if !typed.has_closures() {
         return;
     }
+    let typed = typed.scoped(&cx.types);
     typed.ensure_tables(&cx.types);
-    let shared = Arc::new(Typed { drops: Vec::new(), ..typed.clone() });
+    let shared = Arc::new(Typed { drops: Vec::new(), ..(*typed).clone() });
     for (at, closure) in &typed.closures {
         let ty = cx.types.intern(Kind::Closure(parent, substs, at.0));
         let parts: Vec<Ty> = closure
@@ -666,7 +667,7 @@ fn finish_closure(cx: &mut Context<'_>, mut typed: Typed, info: &ClosureInfo, en
 
 /// The typed form of `Future::poll` at the coroutine type `ty`: its defining body, resumed with the pinned coroutine and the task context, returning `Poll` of its output.
 pub fn coroutine_typed(cx: &mut Context<'_>, poll: ItemRef, ty: Ty) -> Result<Typed> {
-    let Some(info) = cx.closure(ty) else { bail!("a coroutine whose defining body was not inferred") };
+    let Some(info) = cx.ensure_closure(ty) else { bail!("a coroutine whose defining body was not inferred") };
     let (params, ret) = super::detached(cx, poll, |infer| infer.fn_types(poll, &[ty]))?;
     let mut typed = (*info.typed).clone();
     let first = typed.locals.len() as u32;
@@ -677,7 +678,7 @@ pub fn coroutine_typed(cx: &mut Context<'_>, poll: ItemRef, ty: Ty) -> Result<Ty
 
 /// The typed form of the function that the closure type `ty` runs: its defining body, with an environment parameter and the closure's own parameters.
 pub fn closure_typed(cx: &mut Context<'_>, ty: Ty) -> Result<Typed> {
-    let Some(info) = cx.closure(ty) else { bail!("a closure whose defining body was not inferred") };
+    let Some(info) = cx.ensure_closure(ty) else { bail!("a closure whose defining body was not inferred") };
     let mut typed = (*info.typed).clone();
     let env = cx.closure_takes_env(ty).then(|| {
         typed.locals.push(Local { ty: cx.types.intern(Kind::Ref(Mut::Mut, info.env)) });
@@ -685,4 +686,28 @@ pub fn closure_typed(cx: &mut Context<'_>, ty: Ty) -> Result<Typed> {
     });
     typed.params = env.into_iter().chain(info.closure.params.iter().copied()).collect();
     finish_closure(cx, typed, &info, env, info.closure.ret)
+}
+
+impl<'a> Context<'a> {
+    /// Returns the recorded closure info for `ty`, lazily inferring its defining body once when needed.
+    pub fn ensure_closure(&mut self, ty: Ty) -> Option<Arc<ClosureInfo>> {
+        if let Some(info) = self.store.closures.get(&ty) {
+            return Some(info);
+        }
+        let Kind::Closure(parent, substs, _) = *self.types.kind(ty) else { return None };
+        let reveals = self.store.lookups.reveals.clone();
+        reveals
+            .run(
+                self,
+                (parent, substs),
+                |cx| {
+                    let mut unlaid = Vec::new();
+                    let typed = crate::sema::reach::typed_once(cx, &(parent, substs), &mut unlaid).map_err(|msg| anyhow::anyhow!("{msg}"))?;
+                    Ok(typed.ret.unwrap_or(Ty::NONE))
+                },
+                |_| Ok(Ty::NONE),
+            )
+            .ok()?;
+        self.store.closures.get(&ty)
+    }
 }

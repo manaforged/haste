@@ -476,6 +476,12 @@ impl Asm {
         self.word(0xD63F_0000 | u32::from(reg.0) << 5);
     }
 
+    pub fn bl_reloc(&mut self) -> u32 {
+        let at = self.pos();
+        self.word(0x9400_0000);
+        at
+    }
+
     pub fn br(&mut self, reg: Reg) {
         self.word(0xD61F_0000 | u32::from(reg.0) << 5);
     }

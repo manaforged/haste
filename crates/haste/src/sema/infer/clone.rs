@@ -22,6 +22,7 @@ pub fn compiler_clone(cx: &Context<'_>, ty: Ty) -> bool {
 
 /// The typed form of the `Clone::clone` that the compiler writes for the tuple, closure, function item or function pointer `ty`: one `&ty` parameter, and the clone of each field.
 pub fn clone_typed(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<Typed> {
+    cx.ensure_closure(ty);
     let fields = match cloned_tuple(cx, ty).map(|tuple| cx.types.kind(tuple).clone()) {
         Some(Kind::Tuple(fields)) => cx.types.substs(fields).to_vec(),
         None if compiler_clone(cx, ty) => Vec::new(),

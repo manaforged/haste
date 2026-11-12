@@ -627,6 +627,8 @@ fn encode_reloc_kind(kind: RelocKind) -> u8 {
         RelocKind::Abs32 => 0,
         RelocKind::Abs64 => 1,
         RelocKind::Arm64Movw64 => 2,
+        RelocKind::PcRel32 => 3,
+        RelocKind::Arm64Call26 => 4,
     }
 }
 
@@ -635,6 +637,8 @@ fn decode_reloc_kind(raw: u8) -> Result<RelocKind> {
         0 => Ok(RelocKind::Abs32),
         1 => Ok(RelocKind::Abs64),
         2 => Ok(RelocKind::Arm64Movw64),
+        3 => Ok(RelocKind::PcRel32),
+        4 => Ok(RelocKind::Arm64Call26),
         _ => bail!("unknown relocation kind"),
     }
 }

@@ -297,11 +297,22 @@ impl<'a> Infer<'_, 'a> {
 
 /// The return type of `item` at `substs`, inferring its body once per pass, which also records the closures it defines.
 pub(super) fn revealed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Ty> {
+    if let Some(future) = async_future(cx, item, substs)? {
+        return Ok(future);
+    }
+    if let Some(typed) = cx.store.finals.get(&(item, substs)) {
+        super::closure::register(cx, (item, substs), &typed);
+        return typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)));
+    }
     let reveals = cx.store.lookups.reveals.clone();
     reveals.run(
         cx,
         (item, substs),
-        |cx| super::infer(cx, item, substs).and_then(|typed| typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)))),
+        |cx| {
+            let mut unlaid = Vec::new();
+            let typed = crate::sema::reach::typed_once(cx, &(item, substs), &mut unlaid).map_err(|msg| anyhow!("{msg}"))?;
+            typed.ret.ok_or_else(|| anyhow!("`{}` has no return type", cx.name(item)))
+        },
         |cx| async_future(cx, item, substs)?.ok_or_else(|| anyhow!("the `impl Trait` return type of `{}` depends on itself", cx.name(item))),
     )
 }

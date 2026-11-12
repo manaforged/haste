@@ -19,10 +19,12 @@ impl Emit<'_> {
             }
             Op::SlotAddr(sym) | Op::Symbol(sym) => {
                 let result = result()?;
-                let dst = self.dst(result);
-                let at = self.asm.mov_symbol(dst);
-                self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Arm64Movw64));
-                self.put(result, dst);
+                if !self.plan.is_static(result) {
+                    let dst = self.dst(result);
+                    let at = self.asm.mov_symbol(dst);
+                    self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Arm64Movw64));
+                    self.put(result, dst);
+                }
             }
             Op::Runtime(rt) => {
                 let result = result()?;

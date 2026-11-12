@@ -4,6 +4,7 @@ use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{StackSlot, Type, Value};
 use crate::live::SibBase;
+use crate::reloc::{RelocKind, StencilReloc};
 
 impl Emit<'_> {
     pub(super) fn at(&self, value: Value) -> Mem {
@@ -87,10 +88,14 @@ impl Emit<'_> {
     pub(super) fn raw(&mut self, reg: Reg, value: Value) {
         match self.plan.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, imm),
+            Location::SlotAddr(sym) => {
+                let at = self.asm.mov_symbol(reg);
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Arm64Movw64));
+            }
             Location::Frame(slot, offset) => self.slot_address(reg, slot, offset),
             Location::Reg(from) => self.asm.mov(reg, from),
             Location::Float(from) => self.asm.fmov_out(self.ty(value) == Type::F64, reg, Vreg(from)),
-            Location::Slot | Location::SlotAddr(_) => {
+            Location::Slot => {
                 let at = self.at(value);
                 self.asm.load(Size::X, false, reg, at);
             }
@@ -103,13 +108,13 @@ impl Emit<'_> {
         let signed = matches!(ext, Ext::Sign);
         match self.plan.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed)),
-            Location::Frame(..) => self.raw(reg, value),
+            Location::Frame(..) | Location::SlotAddr(_) => self.raw(reg, value),
             Location::Reg(from) => self.asm.extend(signed, bytes, reg, from),
             Location::Float(from) => {
                 self.asm.fmov_out(ty == Type::F64, reg, Vreg(from));
                 self.asm.extend(signed, bytes, reg, reg);
             }
-            Location::Slot | Location::SlotAddr(_) => {
+            Location::Slot => {
                 let at = self.at(value);
                 self.asm.load(Size::of(bytes), signed && bytes < 8, reg, at);
             }
@@ -118,7 +123,7 @@ impl Emit<'_> {
 
     pub(super) fn src(&mut self, value: Value, scratch: Reg, ext: Ext) -> Reg {
         match self.plan.reg_of(value) {
-            Some(reg) if self.ty(value).bytes() >= 8 => reg,
+            Some(reg) if self.ty(value).bytes() >= 8 || (matches!(ext, Ext::Zero) && self.plan.zero_ext[value.index()]) => reg,
             _ => {
                 self.get(scratch, value, ext);
                 scratch
@@ -204,13 +209,13 @@ impl Emit<'_> {
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
         match self.plan.location(value) {
             Location::Imm(0) => self.asm.store(Size::X, to, super::ZR),
-            Location::Imm(_) | Location::Frame(..) => {
+            Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) => {
                 self.raw(IP, value);
                 self.asm.store(Size::X, to, IP);
             }
             Location::Reg(reg) => self.asm.store(Size::X, to, reg),
             Location::Float(v) => self.asm.vstore(self.ty(value).bytes(), to, Vreg(v)),
-            Location::Slot | Location::SlotAddr(_) => self.copy_to(to, self.at(value), self.ty(value)),
+            Location::Slot => self.copy_to(to, self.at(value), self.ty(value)),
         }
     }
 }

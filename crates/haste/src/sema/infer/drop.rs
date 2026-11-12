@@ -57,7 +57,7 @@ impl Infer<'_, '_> {
         if self.coroutine_output(ty).is_some() {
             return Ok(false);
         }
-        match self.cx.closure_env(ty) {
+        match self.cx.ensure_closure(ty).map(|info| info.env) {
             Some(env) => self.is_copy(env),
             None => Ok(true),
         }
@@ -110,16 +110,26 @@ pub fn glue_typed(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<Typed> 
 
 /// The call of the drop glue of `ty`, when dropping a value of `ty` runs code.
 pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
-    if !needs_drop(cx, ty)? {
-        return Ok(None);
+    if let Some(cached) = cx.store.lookups.glues.get(&ty) {
+        return Ok(cached);
     }
-    let Some(glue) = cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
-    Ok(Some(Res::fn_of(&cx.types, glue, &[ty])))
+    let before = cx.quiet_mark();
+    let call = if needs_drop(cx, ty)? {
+        let Some(glue) = cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
+        Some(Res::fn_of(&cx.types, glue, &[ty]))
+    } else {
+        None
+    };
+    if cx.quiet_mark() == before && !cx.types.has_params(ty) {
+        cx.store.lookups.glues.insert(ty, call);
+    }
+    Ok(call)
 }
 
 /// The drop glue calls for every type that a local or an expression of `typed` holds and that needs drop.
 pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
-    let tables = typed.ensure_tables(&cx.types);
+    let scoped = typed.scoped(&cx.types);
+    let tables = scoped.ensure_tables(&cx.types);
     let mut seen = rustc_hash::FxHashSet::default();
     let mut calls = Vec::new();
     for ty in typed.locals.iter().map(|local| local.ty).chain(tables.exprs.iter().copied()) {
@@ -171,8 +181,8 @@ impl Infer<'_, '_> {
         })
     }
 
-    fn closure_drop_parts(&self, ty: Ty) -> Result<Vec<Ty>> {
-        let Some(&Kind::Tuple(items)) = self.cx.closure_env(ty).map(|env| self.cx.types.kind(env)) else {
+    fn closure_drop_parts(&mut self, ty: Ty) -> Result<Vec<Ty>> {
+        let Some(&Kind::Tuple(items)) = self.cx.ensure_closure(ty).map(|info| self.cx.types.kind(info.env)) else {
             bail!("drop of a closure whose defining body was not inferred");
         };
         if self.coroutine_output(ty).is_none() {

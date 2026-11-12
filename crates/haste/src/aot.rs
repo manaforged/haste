@@ -375,7 +375,23 @@ pub(super) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8
             continue;
         }
         let value = resolve_sym(&reloc.symbol, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan, ctx.stub_va)?;
-        patch_reloc(reloc.kind, value, &mut out[at..])?;
+        match reloc.kind {
+            RelocKind::Arm64Call26 => {
+                let pc_va = ctx.text_va + u64::from(reloc.offset);
+                let delta = value as i64 - pc_va as i64;
+                if delta & 3 != 0 || !(-0x800_0000..0x800_0000).contains(&delta) {
+                    bail!("Arm64Call26 target {value:#x} out of range from {pc_va:#x}");
+                }
+                let word = 0x9400_0000 | (((delta >> 2) as u32) & 0x03FF_FFFF);
+                out[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            RelocKind::PcRel32 => {
+                let next_ip = ctx.text_va + u64::from(reloc.offset) + 4;
+                let delta = i32::try_from(value as i64 - next_ip as i64).context("PcRel32 target out of range")?;
+                out[at..at + 4].copy_from_slice(&delta.to_le_bytes());
+            }
+            kind => patch_reloc(kind, value, &mut out[at..])?,
+        }
     }
     Ok(())
 }

@@ -547,6 +547,13 @@ impl Asm {
         at
     }
 
+    pub fn call_pcrel32(&mut self) -> u32 {
+        self.code.push(0xE8);
+        let at = self.pos();
+        self.code.extend(0_u32.to_le_bytes());
+        at
+    }
+
     pub fn call(&mut self, reg: Reg) {
         self.encode(&[], false, &[0xFF], 2, reg.into(), false);
     }
