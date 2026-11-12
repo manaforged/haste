@@ -498,12 +498,18 @@ impl Jit {
         Ok(self.image.slot(index).load(Ordering::Acquire))
     }
 
-    /// The address of the prepped wrapper that runs function `index`, inferring it first, when the bound prepped library holds one.
+    /// The address of the prepped code that runs function `index`, inferring it first, when the bound prepped library holds it: rustc's code, or an adapter to it written here.
     fn prepped(&mut self, cx: &mut Context<'_>, index: usize, journal: &mut Journal) -> Option<usize> {
         if infer_declared(cx, &mut self.reached, index) {
             journal.push(index);
         }
-        crate::prep::bind(cx, &self.reached, index)
+        match crate::prep::prepped(cx, &self.reached, index)? {
+            crate::prep::Prepped::Direct(address) => Some(address),
+            crate::prep::Prepped::Adapter(func) => {
+                let code = haste_codegen::compile(func, haste_codegen::Target::host()).ok()?;
+                self.image.with_pass(|_, pass| pass.memory.write_patched(&code, &[])).ok()
+            }
+        }
     }
 
     /// Infers function `index`, every function it calls, and every function that a callee calls copies inline, declaring those, and returns their indexes.

@@ -23,6 +23,7 @@ mod key;
 mod layout;
 mod link;
 mod record;
+mod source;
 mod uses;
 mod wrap;
 

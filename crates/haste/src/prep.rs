@@ -1,6 +1,7 @@
 //! Prepped code: rustc optimizes every function instance of a build once into a cached library, and Haste binds each function it reaches to that code when the instance, its convention and its layouts agree.
 
 mod bind;
+mod bridge;
 mod cargo;
 mod conv;
 mod driver;
@@ -8,6 +9,8 @@ mod edit;
 mod ident;
 mod key;
 mod record;
+#[path = "../../prep-driver/src/source.rs"]
+mod source;
 
 use std::ffi::{CStr, CString};
 use std::hash::BuildHasher as _;
@@ -96,12 +99,32 @@ pub fn decided() -> Option<Tally> {
     BOUND.get().map(|manifest| manifest.rustc.decided())
 }
 
+/// rustc's code for a reached function: its address, or a function in Haste's convention that calls it there.
+pub enum Prepped {
+    Direct(usize),
+    Adapter(haste_codegen::Function),
+}
+
 /// The address of rustc's code for reached function `at`, when a manifest is installed and may bind it.
 pub fn bind(cx: &mut Context<'_>, reached: &Reached, at: usize) -> Option<usize> {
+    bound(cx, reached, at).map(|(address, _)| address)
+}
+
+/// The code that runs reached function `at` in rustc's code, when a manifest is installed and may bind it: rustc's own when its convention is Haste's, else an adapter to it.
+pub fn prepped(cx: &mut Context<'_>, reached: &Reached, at: usize) -> Option<Prepped> {
+    let (address, carries) = bound(cx, reached, at)?;
+    let Some(carries) = carries else { return Some(Prepped::Direct(address)) };
+    let Ok(typed) = &reached.list[at].1 else { return None };
+    let (params, ret) = signature(typed);
+    bridge::adapter(cx, (&params, ret), &carries, address).ok().map(Prepped::Adapter)
+}
+
+/// The address of rustc's code for reached function `at` and how its arguments reach it when any does not travel as Haste passes it, when a manifest is installed and may bind it.
+fn bound(cx: &mut Context<'_>, reached: &Reached, at: usize) -> Option<(usize, Option<Vec<bridge::Carry>>)> {
     let manifest = BOUND.get()?;
     let (instance, Ok(typed)) = &reached.list[at] else { return None };
     match manifest.rustc.decide(cx, *instance, typed) {
-        Decision::Bound(address) => Some(address),
+        (Decision::Bound(address), carries) => Some((address, carries)),
         _ => None,
     }
 }

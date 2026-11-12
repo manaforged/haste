@@ -13,7 +13,8 @@ use crate::outline::source::Source;
 use crate::outline::tree::File;
 
 use super::ident::identity;
-use super::key::{Place, clean, normalize};
+use super::key::{Place, clean};
+use super::source::normalize;
 
 const FUNCTION: &str = "fn";
 const ITEM: &str = "item";

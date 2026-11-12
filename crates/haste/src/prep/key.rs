@@ -1,4 +1,3 @@
-use std::path::{Component, Path};
 use std::sync::Mutex;
 
 use rustc_hash::FxHashMap as HashMap;
@@ -15,9 +14,8 @@ use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::edit::Snapshot;
 use super::ident;
+use super::source::{crate_key, normalize};
 
-/// The directory whose parent starts a source path in a key, as the driver prints it.
-const SOURCE_DIR: &str = "src";
 const BYTE_ORDER_MARK: char = '\u{feff}';
 
 /// Where a definition is: its file from the parent of its last `src` directory on, and the byte offset of its name there.
@@ -43,19 +41,11 @@ pub(super) struct Keys {
     files: Mutex<HashMap<(u32, u32), Option<String>>>,
 }
 
-/// The components of `path` from the parent of its last `src` directory on, joined by slashes.
-pub(super) fn normalize(path: &Path) -> Option<String> {
-    let parts: Vec<Component<'_>> = path.components().collect();
-    let at = parts.iter().rposition(|part| part.as_os_str() == SOURCE_DIR)?;
-    let kept = parts.get(at.checked_sub(1)?..)?.iter().map(|part| part.as_os_str().to_string_lossy());
-    Some(kept.collect::<Vec<_>>().join("/"))
-}
-
 impl Keys {
     /// The keys of the crates of `outline`, naming local definitions as the snapshot `then` placed them.
     pub(super) fn new(outline: &Outline, workspace: &Workspace, then: Snapshot) -> Keys {
-        let names: Vec<String> = outline.roots.iter().map(|root| root.name.replace('-', "_")).collect();
         let package = |krate: usize| workspace.graph.units[outline.roots[krate].unit].package;
+        let names: Vec<String> = (0..outline.roots.len()).map(|krate| crate_key(&outline.roots[krate].name.replace('-', "_"), outline.package(workspace, krate).sysroot)).collect();
         let doubled = (0..names.len()).map(|krate| (0..names.len()).any(|other| names[other] == names[krate] && package(other) != package(krate))).collect();
         let local = (0..names.len()).map(|krate| outline.package(workspace, krate).local()).collect();
         Keys { names, local, doubled, then, files: Mutex::default() }

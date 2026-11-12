@@ -20,11 +20,12 @@ pub(super) struct Facts {
     pub stdout_flush: Option<String>,
 }
 
-/// One function instance in the library: its symbol, the key that names it, where it and the functions rustc inlined into it are defined, its definition path, closure identity, type arguments, calling convention, the layouts it crosses with, what it calls, whether it touches mutable state outside the standard crates, and whether rustc's release build kept this copy.
+/// One function instance in the library: its symbol, the key that names it, the stable id of the crate that defines it, where it and the functions rustc inlined into it are defined, its definition path, closure identity, type arguments, calling convention, the layouts it crosses with, what it calls, whether it touches mutable state outside the standard crates, and whether rustc's release build kept this copy.
 #[derive(Deserialize)]
 pub(super) struct Record {
     pub symbol: String,
     pub key: Option<String>,
+    pub crate_id: String,
     pub at: At,
     pub kind: InstanceKind,
     pub path: String,
@@ -74,7 +75,7 @@ pub(super) enum ClosureKind {
 }
 
 /// The calling convention rustc lowered an instance to.
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 pub(super) struct Abi {
     pub conv: Conv,
     pub variadic: bool,
@@ -91,7 +92,7 @@ pub(super) enum Conv {
 }
 
 /// One argument or the return: the key of its type, its size, alignment and passing mode.
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 pub(super) struct Arg {
     pub key: Option<String>,
     pub size: u64,

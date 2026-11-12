@@ -33,7 +33,7 @@ pub fn sysroot(tcx: TyCtxt<'_>, cnum: CrateNum) -> bool {
         return false;
     }
     let source = tcx.used_crate_source(cnum);
-    [&source.rlib, &source.dylib].into_iter().flatten().any(|path| path.starts_with(tcx.sess.opts.sysroot.path()))
+    [&source.rlib, &source.rmeta, &source.dylib].into_iter().flatten().any(|path| path.starts_with(tcx.sess.opts.sysroot.path()))
 }
 
 /// Writes the units, sysroot libraries and native libraries that the crate being compiled links, one per line, marking each sysroot rlib whose crate no sysroot dylib holds.
@@ -113,15 +113,8 @@ fn run(args: &[String]) -> Result<()> {
     }
     let symbols = symbols(&inputs.manifests)?;
     let released = released(&inputs.released, &symbols)?;
-    let list = Path::new(root).join("released.txt");
-    fs::write(&list, released.iter().map(|name| format!("{name}\n")).collect::<String>())?;
-    let globalize = format!("--globalize-symbols={}", list.display());
     let mut rebound = 0;
-    for object in &inputs.released {
-        objcopy(object, &[&globalize])?;
-        rebound += elf::rebind(object, &symbols)?;
-    }
-    for object in &inputs.objects {
+    for object in inputs.released.iter().chain(&inputs.objects) {
         rebound += elf::rebind(object, &symbols)?;
     }
     link(&inputs, Path::new(out), std)?;
@@ -229,18 +222,11 @@ fn without_allocator(objects: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(kept)
 }
 
-fn objcopy(object: &Path, flags: &[&str]) -> Result<()> {
-    let status = Command::new("objcopy").args(flags).arg(object).status()?;
-    if !status.success() {
-        return Err(Error(format!("objcopy {} failed: {status}", object.display())));
-    }
-    Ok(())
-}
-
+/// The instances whose release copy keeps the convention its record states: those a release object defines as global, since LLVM may rewrite the arguments of a local function whose every caller it sees.
 fn released(objects: &[PathBuf], symbols: &HashSet<String>) -> Result<HashSet<String>> {
     let mut found = HashSet::new();
     for object in objects {
-        found.extend(nm(object, &["--defined-only"])?.into_iter().filter(|name| symbols.contains(name)));
+        found.extend(nm(object, &["--defined-only", "--extern-only"])?.into_iter().filter(|name| symbols.contains(name)));
     }
     Ok(found)
 }

@@ -11,6 +11,7 @@ use crate::sema::Context;
 use crate::sema::infer::Typed;
 use crate::sema::reach::Instance;
 
+use super::bridge::Carry;
 use super::edit::{Changed, Snapshot};
 use super::ident;
 use super::key::{Keys, Miss};
@@ -57,7 +58,15 @@ pub(super) struct Bindings {
     state: Vec<bool>,
     keys: Keys,
     current: bool,
-    decided: Mutex<HashMap<Instance, (Decision, Option<usize>)>>,
+    decided: Mutex<HashMap<Instance, Decided>>,
+}
+
+/// What binding one instance decided, the record that names it, and how its arguments reach rustc's code when any does not travel as Haste passes it.
+#[derive(Clone)]
+struct Decided {
+    decision: Decision,
+    record: Option<usize>,
+    carries: Option<Vec<Carry>>,
 }
 
 impl Bindings {
@@ -123,8 +132,8 @@ impl Bindings {
         flush(&mut handle);
     }
 
-    /// The record that names `instance` with body `typed`: none when no record does, or the reason no single record does.
-    fn record(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Result<usize, Decision> {
+    /// The records that name `instance` with body `typed`, which are copies of one instance that crates instantiated apart when there are several: they name one definition of one crate and cross the same layouts with one convention; or why no record binds.
+    fn records(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Result<Vec<usize>, Decision> {
         let (key, once) = self.keys.instance(cx, instance, typed).map_err(refusal)?;
         let fits = |at: &usize| {
             let record = &self.records[*at];
@@ -135,51 +144,63 @@ impl Bindings {
             }
         };
         let found: Vec<usize> = self.index.get(&key).into_iter().flatten().copied().filter(fits).collect();
-        match found.as_slice() {
-            [] => Err(Decision::Unmatched),
-            [one] => Ok(*one),
-            _ => Err(Decision::Ambiguous),
-        }
+        let first = &self.records[*found.first().ok_or(Decision::Unmatched)?];
+        let copy = |at: &usize| {
+            let record = &self.records[*at];
+            record.crate_id == first.crate_id && record.layouts == first.layouts && record.abi == first.abi
+        };
+        if found.iter().all(copy) { Ok(found) } else { Err(Decision::Ambiguous) }
     }
 
-    /// What binding `instance` with body `typed` to rustc's code decides, worked out once per instance.
-    pub(super) fn decide(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Decision {
-        if let Some((found, _)) = self.decided.lock().ok().and_then(|decided| decided.get(&instance).copied()) {
-            return found;
+    /// What binding `instance` with body `typed` to rustc's code decides, worked out once per instance, and how its arguments reach that code when any does not travel as Haste passes it.
+    pub(super) fn decide(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> (Decision, Option<Vec<Carry>>) {
+        if let Some(found) = self.decided.lock().ok().and_then(|decided| decided.get(&instance).cloned()) {
+            return (found.decision, found.carries);
         }
-        let (found, at) = self.work_out(cx, instance, typed);
+        let found = self.work_out(cx, instance, typed);
         if let Ok(mut decided) = self.decided.lock() {
-            decided.insert(instance, (found, at));
+            decided.insert(instance, found.clone());
         }
-        found
+        (found.decision, found.carries)
     }
 
-    fn work_out(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> (Decision, Option<usize>) {
-        match self.record(cx, instance, typed) {
-            Ok(at) => (self.check(cx, typed, at), Some(at)),
-            Err(decision) => (decision, None),
+    /// What binding decides for `instance`: the first copy that binds, else why the first copy does not.
+    fn work_out(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Decided {
+        let copies = match self.records(cx, instance, typed) {
+            Ok(copies) => copies,
+            Err(decision) => return Decided { decision, record: None, carries: None },
+        };
+        let mut refused = None;
+        for at in copies {
+            match self.check(cx, typed, at) {
+                Ok((decision, carries)) => return Decided { decision, record: Some(at), carries: carries.iter().any(|&carry| carry != Carry::Same).then_some(carries) },
+                Err(decision) if refused.is_none() => refused = Some(Decided { decision, record: Some(at), carries: None }),
+                Err(_) => {}
+            }
         }
+        refused.unwrap_or(Decided { decision: Decision::Unmatched, record: None, carries: None })
     }
 
-    /// What binding a function with body `typed` to record `at`, which names it, decides.
-    fn check(&self, cx: &mut Context<'_>, typed: &Typed, at: usize) -> Decision {
+    /// What binding a function with body `typed` to record `at`, which names it, decides, with how each argument reaches rustc's code.
+    fn check(&self, cx: &mut Context<'_>, typed: &Typed, at: usize) -> Result<(Decision, Vec<Carry>), Decision> {
         let record = &self.records[at];
         if self.stale[at] {
-            return Decision::Stale;
+            return Err(Decision::Stale);
         }
         if self.state[at] {
-            return Decision::State;
+            return Err(Decision::State);
         }
         let (params, ret) = super::signature(typed);
         let mut types = params.clone();
         types.push(ret.unwrap_or_else(|| cx.types.tuple(&[])));
-        if !self.same_signature(cx, &types, record) || !conv::agrees(cx, (&params, ret), &record.abi) {
-            return Decision::Convention;
+        if !self.same_signature(cx, &types, record) {
+            return Err(Decision::Convention);
         }
+        let carries = conv::carries(cx, (&params, ret), &record.abi).ok_or(Decision::Convention)?;
         match conv::layouts(cx, &types) {
-            Err(Miss::Indirect) => Decision::Indirect,
-            Ok(found) if record.layouts.as_ref() == Some(&found) => super::exported(&record.symbol).map_or(Decision::Missing, Decision::Bound),
-            _ => Decision::Layout,
+            Err(Miss::Indirect) => Err(Decision::Indirect),
+            Ok(found) if record.layouts.as_ref() == Some(&found) => super::exported(&record.symbol).map(|address| (Decision::Bound(address), carries)).ok_or(Decision::Missing),
+            _ => Err(Decision::Layout),
         }
     }
 
@@ -193,11 +214,13 @@ impl Bindings {
     pub(super) fn decided(&self) -> Tally {
         let mut tally = Tally { records: self.records.len(), ..Tally::default() };
         let mut matched = vec![false; self.records.len()];
-        for (decision, at) in self.decided.lock().map(|decided| decided.values().copied().collect::<Vec<_>>()).unwrap_or_default() {
+        for Decided { decision, record, carries } in self.decided.lock().map(|decided| decided.values().cloned().collect::<Vec<_>>()).unwrap_or_default() {
             tally.count(decision);
-            if let Some(at) = at {
+            let bound = matches!(decision, Decision::Bound(_));
+            tally.adapted += usize::from(bound && carries.is_some());
+            if let Some(at) = record {
                 matched[at] = true;
-                tally.release += usize::from(matches!(decision, Decision::Bound(_)) && self.records[at].release_copy);
+                tally.release += usize::from(bound && self.records[at].release_copy);
             }
         }
         for (record, found) in self.records.iter().zip(&matched) {
@@ -245,6 +268,7 @@ pub struct Tally {
     pub matched: usize,
     pub kinds: [(usize, usize); 4],
     pub bound: usize,
+    pub adapted: usize,
     pub release: usize,
     pub stale: usize,
     pub state: usize,
@@ -276,7 +300,7 @@ impl Tally {
 impl std::fmt::Display for Tally {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kinds: Vec<String> = CATEGORIES.iter().zip(self.kinds).map(|(name, (found, all))| format!("{name} {found}/{all}")).collect();
-        write!(out, "rustc {} records, {} matched ({}), {} bound ({} release copies), refused {} stale {} state {} convention {} layout {} indirect {} ambiguous {} missing, {} unmatched", self.records, self.matched, kinds.join(" "), self.bound, self.release, self.stale, self.state, self.convention, self.layout, self.indirect, self.ambiguous, self.missing, self.unmatched)
+        write!(out, "rustc {} records, {} matched ({}), {} bound ({} through adapters, {} release copies), refused {} stale {} state {} convention {} layout {} indirect {} ambiguous {} missing, {} unmatched", self.records, self.matched, kinds.join(" "), self.bound, self.adapted, self.release, self.stale, self.state, self.convention, self.layout, self.indirect, self.ambiguous, self.missing, self.unmatched)
     }
 }
 

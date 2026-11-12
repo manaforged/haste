@@ -8,8 +8,12 @@ use crate::sema::infer::field_types;
 use crate::sema::layout::Layout;
 use crate::sema::ty::{Kind, Ty};
 
+use super::bridge::Carry;
 use super::key::Miss;
 use super::record::{Abi, Arg, Class, Conv, Pass, Reg};
+
+/// How the driver prints the fields of a struct or pattern type whose one value lies at offset zero.
+const NEWTYPE_FIELDS: &str = "O0";
 
 /// How Haste passes one argument or return: in no register, in one, in two at an offset, or by address.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20,17 +24,34 @@ enum Haste {
     Address,
 }
 
-/// Whether rustc passes each argument and the return of `abi` as Haste passes `params` and `ret`, each at the size and alignment of Haste's layout.
-pub(super) fn agrees(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), abi: &Abi) -> bool {
+/// How each argument reaches rustc's code for `abi` when Haste passes `params` and `ret`, each at the size and alignment of Haste's layout: none when rustc passes an argument or the return otherwise than Haste can carry it.
+pub(super) fn carries(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), abi: &Abi) -> Option<Vec<Carry>> {
     if abi.conv != Conv::Rust || abi.variadic || params.len() != abi.args.len() {
-        return false;
+        return None;
     }
     let returns = match ret {
-        Some(ty) if matches!(cx.types.kind(ty), Kind::Never) => return false,
+        Some(ty) if matches!(cx.types.kind(ty), Kind::Never) => return None,
         Some(ty) => sized(cx, ty, &abi.ret) && result(cx, ty).is_some_and(|haste| same(haste, &abi.ret.pass)),
         None => abi.ret.pass == Pass::Ignore,
     };
-    returns && params.iter().zip(&abi.args).all(|(&ty, arg)| sized(cx, ty, arg) && argument(cx, ty).is_some_and(|haste| same(haste, &arg.pass)))
+    returns.then_some(())?;
+    params.iter().zip(&abi.args).map(|(&ty, arg)| carry(cx, ty, arg)).collect()
+}
+
+/// How an argument of `ty` reaches rustc's code that takes it as `arg`: as Haste passes it, or split from its address into the two registers of a scalar pair whose parts no signed narrow integer is, since a load widens with zeros.
+fn carry(cx: &mut Context<'_>, ty: Ty, arg: &Arg) -> Option<Carry> {
+    if !sized(cx, ty, arg) {
+        return None;
+    }
+    let haste = argument(cx, ty)?;
+    if same(haste, &arg.pass) {
+        return Some(Carry::Same);
+    }
+    let Pass::Pair { regs } = &arg.pass else { return None };
+    match (haste, repr(cx, ty).ok()?) {
+        (Haste::Address, Repr::Mem { parts: Parts::Pair(first, second, at), .. }) if same(Haste::Two(first, second, at), &arg.pass) && !regs.iter().any(|reg| matches!(reg.class, Class::I8 | Class::I16)) => Some(Carry::Split(first, second, at)),
+        _ => None,
+    }
 }
 
 fn sized(cx: &mut Context<'_>, ty: Ty, arg: &Arg) -> bool {
@@ -93,8 +114,15 @@ pub(super) fn layouts(cx: &mut Context<'_>, types: &[Ty]) -> Result<Vec<String>,
         if !seen.insert(ty) {
             continue;
         }
-        printed.push(print(&*cx.layout(ty).map_err(|_| Miss::Unnamed)?));
-        stack.extend(inner(cx, ty)?);
+        let layout = cx.layout(ty).map_err(|_| Miss::Unnamed)?;
+        let fields = inner(cx, ty)?;
+        let newtype = match cx.types.kind(ty) {
+            Kind::Adt(..) => fields.len() == 1,
+            Kind::Pat(..) => true,
+            _ => false,
+        };
+        printed.push(print(&layout, newtype));
+        stack.extend(fields);
     }
     Ok(printed)
 }
@@ -118,8 +146,15 @@ fn inner(cx: &mut Context<'_>, ty: Ty) -> Result<Vec<Ty>, Miss> {
     })
 }
 
-fn print(layout: &Layout) -> String {
-    format!("{}:{}:{}:{}:{}", layout.size.bytes(), layout.align.bytes(), backend(&layout.backend_repr), fields(&layout.fields), variants(&layout.variants))
+/// One layout as the driver prints rustc's; a struct of one field or a pattern type, whose one value lies at offset zero and which Haste may lay out as the scalar it holds, prints its fields as rustc places them.
+fn print(layout: &Layout, newtype: bool) -> String {
+    let at_zero = match &layout.fields {
+        FieldsShape::Primitive => true,
+        FieldsShape::Arbitrary { offsets, .. } => offsets.iter().next().is_some_and(|offset| offset.bytes() == 0),
+        _ => false,
+    };
+    let fields = if newtype && at_zero && matches!(layout.variants, Variants::Single { .. }) { NEWTYPE_FIELDS.to_owned() } else { fields(&layout.fields) };
+    format!("{}:{}:{}:{fields}:{}", layout.size.bytes(), layout.align.bytes(), backend(&layout.backend_repr), variants(&layout.variants))
 }
 
 fn backend(repr: &BackendRepr) -> String {

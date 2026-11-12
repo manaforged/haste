@@ -1,12 +1,9 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{self, GenericArgKind, GenericArgsRef, Instance, InstanceKind, Ty, TyCtxt};
 use rustc_span::Span;
 use serde_json::{Value, json};
-
-/// The directory whose parent starts a source path in a key, so one crate's file prints alike wherever its package lies.
-const SOURCE_DIR: &str = "src";
 
 /// The kinds `record::kind` gives a closure's by-value call shim and a drop glue.
 const CLOSURE_ONCE: &str = "Shim::ClosureOnce";
@@ -85,7 +82,8 @@ fn closure<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, closure_args: GenericArgsRef<
 /// The key of definition `def_id`: its crate, file, the byte offset of its name and the name, for a named definition outside any macro expansion.
 fn def(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
     let (file, lo) = place(tcx, tcx.def_ident_span(def_id)?)?;
-    Some(format!("{}:{file}:{lo}:{}", tcx.crate_name(def_id.krate), tcx.item_name(def_id)))
+    let krate = crate::source::crate_key(tcx.crate_name(def_id.krate).as_str(), crate::link::sysroot(tcx, def_id.krate));
+    Some(format!("{krate}:{file}:{lo}:{}", tcx.item_name(def_id)))
 }
 
 fn place(tcx: TyCtxt<'_>, span: Span) -> Option<(String, u32)> {
@@ -96,7 +94,7 @@ fn place(tcx: TyCtxt<'_>, span: Span) -> Option<(String, u32)> {
     let found = map.lookup_byte_offset(span.lo());
     let shown = map.span_to_diagnostic_string(span);
     let name = shown.rsplitn(2, ": ").last()?.rsplitn(3, ':').last()?;
-    Some((normalize(&absolute(Path::new(name)))?, found.pos.0))
+    Some((crate::source::normalize(&absolute(Path::new(name)))?, found.pos.0))
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -104,12 +102,4 @@ fn absolute(path: &Path) -> PathBuf {
         return path.to_path_buf();
     }
     std::env::current_dir().map_or_else(|_| path.to_path_buf(), |dir| dir.join(path))
-}
-
-/// The components of `path` from the parent of its last `src` directory on, joined by slashes.
-fn normalize(path: &Path) -> Option<String> {
-    let parts: Vec<Component<'_>> = path.components().collect();
-    let at = parts.iter().rposition(|part| part.as_os_str() == SOURCE_DIR)?;
-    let kept = parts.get(at.checked_sub(1)?..)?.iter().map(|part| part.as_os_str().to_string_lossy());
-    Some(kept.collect::<Vec<_>>().join("/"))
 }
