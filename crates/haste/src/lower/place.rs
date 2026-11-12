@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{StackSlot, Type, Value};
 
-use crate::body::{Expr, ExprId, List, UnOp};
+use crate::body::{BlockKind, Expr, ExprId, List, UnOp};
 use crate::sema::infer::{Adjust, Coercion, Res};
 use crate::sema::ty::{Kind, Ty};
 
@@ -169,8 +169,10 @@ impl Lower<'_, '_> {
 
     /// The place that the place expression `expr` names, or none when `expr` is a value.
     pub fn place_of(&mut self, expr: ExprId) -> Result<Option<Place>> {
+        if let Some(inner) = self.transparent(expr) {
+            return self.place_of(inner);
+        }
         match *self.body.expr(expr) {
-            Expr::Paren(inner) => self.place_of(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Local(local)) => Ok(self.locals[*local as usize]),
                 Some(&Res::Fn(item, substs)) if super::is_static(self.cx, item) => self.static_place((item, substs), self.ty_of(expr)).map(Some),
@@ -184,6 +186,15 @@ impl Lower<'_, '_> {
             },
             Expr::Index(base, index) => self.index_place(expr, base, index),
             _ => Ok(None),
+        }
+    }
+
+    /// The expression that `expr` only wraps: the inside of parentheses, or the tail of a macro expansion with no statements.
+    pub(super) fn transparent(&self, expr: ExprId) -> Option<ExprId> {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) => Some(inner),
+            Expr::Block { stmts, tail, label: None, kind: BlockKind::Expansion } if self.body.list(stmts).is_empty() => tail,
+            _ => None,
         }
     }
 
@@ -262,9 +273,13 @@ impl Lower<'_, '_> {
         Ok((self.pointee_place(pointer, inner)?, inner))
     }
 
-    /// The place of field `index` of variant `variant` of the tuple or ADT `ty` at `place`.
+    /// The place of field `index` of variant `variant` of the tuple or ADT `ty`, or of element `index` of the array `ty`, at `place`.
     pub(super) fn part_place(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
         match *self.cx.types.kind(ty) {
+            Kind::Array(element, _) => {
+                let stride = self.cx.layout(element)?.size.bytes() as i32;
+                Ok(place.at(stride * index as i32, repr(self.cx, element)?))
+            }
             Kind::Tuple(items) => {
                 let item_ty = self.cx.types.substs(items)[index as usize];
                 let offset = self.field_offset(ty, index)?;

@@ -440,6 +440,44 @@ impl Infer<'_, '_> {
         })
     }
 
+    /// Binds the bounds on the parameters of the inherent impl that owns `item` at its arguments in `substs` while one is unknown, as `C: Deref<Target = T>` names `T`.
+    pub(super) fn bind_impl_bounds(&mut self, item: ItemRef, substs: &[Ty]) -> Result<()> {
+        let Some(block) = self.cx.owner_impl(item) else { return Ok(()) };
+        let count = self.impl_params(block)?;
+        let Some(args) = substs.get(..count) else { return Ok(()) };
+        if self.cx.impl_trait(block).is_some() || !args.iter().any(|&arg| matches!(self.cx.types.kind(self.resolve(arg)), Kind::Var(_))) {
+            return Ok(());
+        }
+        for (of, ty, args, bindings) in self.impl_param_bounds(block, args)? {
+            if self.obligation_open(ty, &args) {
+                self.obligations.push((of, std::iter::once(ty).chain(args.iter().copied()).collect()));
+            }
+            for (name, bound) in bindings {
+                self.binding_holds((of, &args), ty, (&name, bound))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Each trait bound on a parameter of impl `block` at `args`, lowered in the impl's frame: the trait, the bounded type, the trait's arguments and the associated types it binds.
+    fn impl_param_bounds(&mut self, block: ImplRef, args: &[Ty]) -> Result<Vec<(ItemRef, Ty, Vec<Ty>, Vec<(String, Ty)>)>> {
+        let header = self.cx.impl_header(block)?;
+        let (_, self_ty) = self.impl_frame(block, args)?;
+        let frame = self.impl_frame_of(block, args, Some(self_ty))?;
+        let (src, home, arena) = (frame.src, frame.home, &header.body);
+        let params = frame.generics.clone();
+        self.with_frame(frame, |infer| {
+            let mut found = Vec::new();
+            for (name, ty) in params {
+                for bound in named_bounds(arena, src, (&header.generics, &header.predicates), name) {
+                    let Some((of, path)) = infer.bound_trait_at(arena, bound, home).filter(|&(of, _)| !infer.compiler_trait(of) && !infer.is_callable_trait(of)) else { continue };
+                    found.push((of, ty, infer.bound_args(of, arena, path, ty)?, infer.path_bindings(arena, path)?));
+                }
+            }
+            Ok(found)
+        })
+    }
+
     fn bind_bound(&mut self, arena: &Body, home: ModRef, (bound, ty): (u32, Ty)) -> Result<()> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
             return Ok(());

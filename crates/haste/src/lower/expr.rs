@@ -122,10 +122,11 @@ impl Lower<'_, '_> {
     }
 
     fn move_out_of_box(&mut self, expr: ExprId, operand: ExprId) -> Result<Option<Value>> {
-        let Some((root, path)) = self.move_path(operand) else { bail!("moving out of a `Box` that no local owns is not supported yet") };
+        let Some((root, path)) = self.scrutinee_path(operand) else { bail!("moving out of a `Box` behind a reference") };
         let boxed = self.ty_of(operand);
         let Some(Res::Fn(free, substs)) = crate::sema::infer::drop_fn(self.cx, boxed)? else { bail!("`Box` has no `Drop` impl") };
-        let contents = self.place_of(expr)?;
+        let owner = self.place_or_temp(operand)?;
+        let contents = self.deref_step((expr, 0), owner, boxed)?.map(|(place, _)| place);
         let value = match contents {
             Some(place) if matches!(place.repr, Repr::Mem { .. }) => {
                 let read = self.read(place);
@@ -133,7 +134,6 @@ impl Lower<'_, '_> {
             }
             place => place.and_then(|place| self.read(place)),
         };
-        let owner = self.place_of(operand)?;
         let target = self.address_or_dangling(owner, boxed)?;
         self.invoke(free, substs, vec![target])?;
         self.moved_out(root, &path)?;

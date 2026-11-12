@@ -231,7 +231,7 @@ fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     }
 }
 
-const USAGE: &str = "usage: haste [--jobs N] [--release] [--stats-json PATH] build|test|run|serve|prep PATH [--] [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand PATH [CRATE]";
+const USAGE: &str = "usage: haste [--jobs N] [--release] [--stats-json PATH] build|test|run|serve|prep PATH [--] [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]\n       haste [--release] debug code PATH DIR";
 
 /// What the command line asks for.
 #[derive(Clone, Copy)]
@@ -256,9 +256,12 @@ enum Query {
     Scope,
     Items,
     Expand,
+    Failures,
+    /// Write the machine code of every function `main` reaches, with the rustc symbol each binds to.
+    Code,
 }
 
-const QUERIES: [(Query, &str); 7] = [(Query::Graph, "graph"), (Query::Outline, "outline"), (Query::Lazy, "lazy"), (Query::Typeck, "typeck"), (Query::Scope, "scope"), (Query::Items, "items"), (Query::Expand, "expand")];
+const QUERIES: [(Query, &str); 9] = [(Query::Graph, "graph"), (Query::Outline, "outline"), (Query::Lazy, "lazy"), (Query::Typeck, "typeck"), (Query::Scope, "scope"), (Query::Items, "items"), (Query::Expand, "expand"), (Query::Failures, "failures"), (Query::Code, "code")];
 
 fn parse(args: &mut impl Iterator<Item = String>) -> Result<Command> {
     let word = args.next().context(USAGE)?;
@@ -374,8 +377,27 @@ fn report_query(query: Query, (workspace, targets): (&graph::Workspace, &Targets
             print_scope(&compilation.outline, &compilation.names, name);
             Ok(())
         }
+        Query::Failures => report_failures(workspace, targets),
+        Query::Code => crate::dump::write(workspace, targets, std::path::Path::new(argv.get(1).context(USAGE)?)),
         Query::Items | Query::Expand => Ok(()),
     }
+}
+
+/// Builds the binary and prints every function its `main` reaches that did not type-check or compile, grouped by the kind of error, largest group first.
+fn report_failures(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let mut build = crate::build::Build::load(workspace, targets)?;
+    build.compile_binary(workspace)?;
+    let mut groups: Vec<(String, Vec<String>)> = build.failures()?.into_iter().collect();
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    for (kind, errors) in &groups {
+        println!("{} {kind}", errors.len());
+        for error in errors {
+            println!("    {error}");
+        }
+    }
+    eprintln!("{} functions failed in {} groups", groups.iter().map(|(_, errors)| errors.len()).sum::<usize>(), groups.len());
+    std::mem::forget(build);
+    Ok(())
 }
 
 fn report_prep(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {

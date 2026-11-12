@@ -20,7 +20,7 @@ impl Infer<'_, '_> {
 
     fn expr_kind(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
         match *self.body.expr(expr) {
-            Expr::Lit(lit, at) => self.lit(lit, at),
+            Expr::Lit(lit, at) => self.lit(lit, at, expected),
             Expr::Path(path) => self.path_expr(expr, path),
             Expr::Paren(inner) => self.expr(inner, expected),
             Expr::Unary(op, operand) => self.unary(expr, (op, operand), expected),
@@ -123,19 +123,28 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn lit(&mut self, lit: Lit, at: u32) -> Result<Ty> {
+    /// The type of the literal `lit` at token `at`: its suffix's, else the integer or float type `expected` names, as rustc types an unsuffixed literal, else a fresh numeric variable.
+    fn lit(&mut self, lit: Lit, at: u32, expected: Option<Ty>) -> Result<Ty> {
         let text = self.src.text(at);
+        let wanted = self.known(expected).map(|ty| self.resolve(ty));
+        let numeric = |float: bool| {
+            wanted.filter(|&ty| match *self.cx.types.kind(ty) {
+                Kind::Prim(prim) if float => float_bits(prim).is_some(),
+                Kind::Prim(prim) => int_info(prim).is_some(),
+                _ => false,
+            })
+        };
         Ok(match lit {
             Lit::Bool(_) => self.cx.types.bool(),
             Lit::Char => self.cx.types.prim(Primitive::Char),
             Lit::Byte => self.cx.types.prim(Primitive::U8),
             Lit::Int => match parse_int(text)?.1 {
                 Some(primitive) => self.cx.types.prim(primitive),
-                None => self.fresh(Kind::IntVar),
+                None => numeric(false).unwrap_or_else(|| self.fresh(Kind::IntVar)),
             },
             Lit::Float => match ["f16", "f32", "f64", "f128"].iter().find(|suffix| text.ends_with(*suffix)) {
                 Some(suffix) => self.cx.types.prim(Primitive::named(suffix).unwrap_or(Primitive::F64)),
-                None => self.fresh(Kind::FloatVar),
+                None => numeric(true).unwrap_or_else(|| self.fresh(Kind::FloatVar)),
             },
             Lit::Str => {
                 let str_ty = self.cx.types.prim(Primitive::Str);

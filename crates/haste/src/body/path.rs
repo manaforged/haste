@@ -3,6 +3,7 @@ use rustc_lexer::TokenKind;
 
 use super::cursor::{Cursor, is_name};
 use super::{Args, Bound, GenericArg, Path, PathId, Segment, Ty};
+use crate::outline::rules::Frag;
 use crate::outline::source::opens;
 
 /// Where a path is written, which decides how generic arguments open.
@@ -10,6 +11,8 @@ use crate::outline::source::opens;
 pub enum Style {
     Expr,
     Type,
+    /// An expression path that a macro wrote from a `path` fragment ending before this token, where `<` opens generic arguments as in a type.
+    Fragment(u32),
 }
 
 impl Cursor<'_> {
@@ -18,6 +21,10 @@ impl Cursor<'_> {
         if self.punct("$") && self.word_at(self.at + 1) == "crate" {
             self.at += 1;
         }
+        let style = match (style, self.src.opaque_at(self.at)) {
+            (Style::Expr, Some((end, Frag::Path))) => Style::Fragment(end),
+            _ => style,
+        };
         let qself = if self.punct("<") { Some(self.qself()?) } else { None };
         let global = qself.is_none() && self.eat("::");
         let mut segments = Vec::new();
@@ -55,7 +62,13 @@ impl Cursor<'_> {
             self.at += 2;
             return Ok(Some(self.angle()?));
         }
-        if style == Style::Expr {
+        if let Style::Fragment(end) = style
+            && self.at < end
+            && self.punct("<")
+        {
+            return Ok(Some(self.angle()?));
+        }
+        if style != Style::Type {
             return Ok(None);
         }
         if self.punct("<") && !self.punct("<-") && !self.punct("<=") {

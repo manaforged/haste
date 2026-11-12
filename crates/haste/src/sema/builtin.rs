@@ -122,7 +122,7 @@ const SYSCALL_CLOBBERS: [&str; 2] = ["rcx", "r11"];
 /// The expansion of an `asm!`: an optimization barrier when its templates hold no instruction, and a call of the host's system call entry when they hold one `syscall`.
 pub fn asm(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
     let mut instructions = String::new();
-    for &(from, to) in args.iter().filter(|(from, to)| *to == from + 1) {
+    for &(from, _) in args.iter().filter(|(from, to)| *to == from + 1) {
         if let Some(template) = src.literal_text(from)? {
             instructions.push_str(&strip_comments(&template));
             instructions.push('\n');

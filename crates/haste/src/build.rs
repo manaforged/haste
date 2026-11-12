@@ -76,7 +76,7 @@ fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, pick: P
 }
 
 /// The `main` of the first member binary.
-fn main_item(workspace: &graph::Workspace, outline: &outline::Outline) -> Option<ItemRef> {
+pub(crate) fn main_item(workspace: &graph::Workspace, outline: &outline::Outline) -> Option<ItemRef> {
     let krate = outline.members(workspace).find(|&krate| outline.roots[krate].role == outline::Role::Bin)?;
     outline.main(krate)
 }
@@ -156,6 +156,20 @@ impl Batch {
             }
         }
         (failures, runnable)
+    }
+
+    /// Why each function the roots reach did not type-check or compile, at the file and line of its item and with its type arguments, keyed by the kind of error.
+    fn failures(&self, cx: &sema::Context<'_>) -> Failures {
+        let mut failures = Failures::new();
+        for at in self.reached.closure(&self.roots) {
+            if let Some(error) = self.reached.list[at].1.as_ref().err().or_else(|| self.broken.get(&at)) {
+                let (item, substs) = self.reached.list[at].0;
+                let (src, entry) = cx.item(item);
+                let substs: Vec<String> = cx.types.substs(substs).iter().map(|&ty| cx.type_text(ty, &|ty| ty)).collect();
+                failures.entry(error_kind(error)).or_default().push(format!("{}:{} {error} [{}]", src.path.display(), src.line(entry.start), substs.join(", ")));
+            }
+        }
+        failures
     }
 
     /// Prints what failed to build and how long building took, and returns 1 when anything failed.
@@ -304,6 +318,16 @@ impl Build {
     pub fn check(&self, built: Duration) -> Result<i32> {
         let Some(binary) = &self.binary else { bail!("the binary is not compiled") };
         Ok(binary.check(built))
+    }
+
+    /// Why each function the binary's `main` reaches did not type-check or compile, at the file and line of its item, keyed by the kind of error.
+    pub fn failures(&mut self) -> Result<Failures> {
+        let Some(binary) = &mut self.binary else { bail!("the binary is not compiled") };
+        let Some(store) = binary.store.take() else { bail!("the binary has no inference store") };
+        let cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
+        let failures = binary.failures(&cx);
+        binary.store = Some(cx.release().0);
+        Ok(failures)
     }
 
     /// Writes the equivalence-class, hazard, origin, and code-size census of the compiled binary to `path`.

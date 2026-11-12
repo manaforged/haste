@@ -68,15 +68,30 @@ impl Infer<'_, '_> {
     pub fn for_expr(&mut self, expr: ExprId, pat: PatId, iter: ExprId, (label, body): (Option<u32>, ExprId)) -> Result<Ty> {
         let found = self.expr(iter, None)?;
         let (into_iter, iter_ty) = self.lang_call("into_iter", found)?;
+        let pending = self.opaque_item(found)?;
+        if pending.is_some() {
+            self.unify(iter_ty, found)?;
+        }
         let by_mut = self.cx.types.intern(Kind::Ref(Mut::Mut, iter_ty));
         let (next, option) = self.lang_call("next", by_mut)?;
         let Kind::Adt(item, args) = *self.cx.types.kind(self.resolve(option)) else { bail!("`next` does not return an `Option`") };
         let elem = self.cx.types.substs(args)[0];
+        if let Some(bound) = pending {
+            self.unify(elem, bound)?;
+        }
+        let elem = self.known_ty(elem)?;
         let Some(some) = self.variant_named(item, "Some")? else { bail!("`Option` has no `Some`") };
         self.out.fors.insert(expr, For { into_iter, next, iter: iter_ty, option, some });
         let depth = self.scopes.len();
         self.bind_pat(pat, elem)?;
         self.unit_loop_body(body, label, depth)
+    }
+
+    /// The `Item` that a bound of the pending `impl Iterator` value `found` fixes, which a `for` loop over it yields through the blanket `IntoIterator` impl before its hidden type is known.
+    fn opaque_item(&mut self, found: Ty) -> Result<Option<Ty>> {
+        let Some(iterator) = self.cx.lang_item("next").and_then(|next| self.cx.owner_trait(next)) else { return Ok(None) };
+        let found = self.resolve(found);
+        self.opaque_binding(iterator, found, "Item")
     }
 
     pub(super) fn lang_call(&mut self, lang: &str, receiver: Ty) -> Result<(Res, Ty)> {

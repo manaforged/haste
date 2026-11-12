@@ -671,4 +671,9 @@ impl<'a> Context<'a> {
         let (src, entry) = self.item(item);
         entry.name.map_or("<anonymous>", |name| src.text(name))
     }
+
+    /// The name of `item` as a path or method call names it, without an `r#` prefix.
+    pub fn plain_name(&self, item: ItemRef) -> &'a str {
+        crate::names::plain(self.name(item))
+    }
 }

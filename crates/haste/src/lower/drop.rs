@@ -275,6 +275,7 @@ impl Lower<'_, '_> {
         let Some(place) = place else { bail!("a partly moved value with no bytes") };
         let variants: Fields = match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => vec![self.cx.types.substs(items).to_vec()].into(),
+            Kind::Array(element, len) => vec![vec![element; self.len(len)? as usize]].into(),
             Kind::Adt(item, args) => {
                 let slice = self.cx.types.substs(args).to_vec();
                 field_types(self.cx, item, &slice)?

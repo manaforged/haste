@@ -214,7 +214,7 @@ pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs)
     let (once, by_ref) = (cx.call_once() == Some(item), closure::by_reference(cx, item).is_some());
     match cx.types.kind(ty) {
         Kind::Closure(..) if once => closure::closure_typed(cx, ty).map(Some),
-        Kind::Closure(..) | Kind::FnDef(..) if once || by_ref => closure::untuple_typed(cx, item, substs).map(Some),
+        Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) if once || by_ref => closure::untuple_typed(cx, item, substs).map(Some),
         _ => Ok(None),
     }
 }

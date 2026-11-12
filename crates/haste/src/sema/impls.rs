@@ -181,7 +181,7 @@ impl<'a> Context<'a> {
         let members = self.impl_members.get_or_insert_with(block, || {
             let mut map = HashMap::default();
             for member in self.members(block) {
-                map.entry(self.name(member)).or_insert(member);
+                map.entry(self.plain_name(member)).or_insert(member);
             }
             Arc::new(map)
         });

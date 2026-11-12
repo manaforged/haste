@@ -3,6 +3,7 @@
 mod body;
 mod build;
 mod cli;
+mod dump;
 mod graph;
 mod host;
 mod image;

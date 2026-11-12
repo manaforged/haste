@@ -49,7 +49,7 @@ impl<'a> Context<'a> {
         let members = self.trait_members.get_or_insert_with(of, || {
             let mut map = HashMap::default();
             for member in self.children(of) {
-                map.entry(self.name(member)).or_insert(member);
+                map.entry(self.plain_name(member)).or_insert(member);
             }
             Arc::new(map)
         });

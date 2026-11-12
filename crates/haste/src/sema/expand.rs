@@ -210,6 +210,9 @@ impl Writer {
                 self.globs.push(copy.finish(src.path.clone())?);
                 return Ok(Some(end + 2));
             }
+            if src.kind(end) == TokenKind::OpenBrace && end >= at + 3 && src.kind(end - 1) == TokenKind::Colon {
+                return self.note_use_group(src, (at + 1, end));
+            }
             if !is_name(src.kind(end)) && src.kind(end) != TokenKind::Colon {
                 return Ok(None);
             }
@@ -223,6 +226,30 @@ impl Writer {
         (at + 1..=last).for_each(|token| copy.copy(src, token));
         self.uses.push((plain(src.text(alias)).to_owned(), copy.finish(src.path.clone())?));
         Ok(Some(end + 1))
+    }
+
+    /// Notes each `name` or `name as alias` of the one-level group at `open` of a `use prefix::{..};` whose prefix starts at `from`, and returns the token after the `;`.
+    fn note_use_group(&mut self, src: &Source, (from, open): (u32, u32)) -> Result<Option<u32>> {
+        let close = src.pair(open);
+        if src.kind(close + 1) != TokenKind::Semi {
+            return Ok(None);
+        }
+        let mut found = Vec::new();
+        for entry in (open + 1..close).collect::<Vec<_>>().split(|&at| src.kind(at) == TokenKind::Comma) {
+            match *entry {
+                [] => {}
+                [name] if is_name(src.kind(name)) => found.push((name, name)),
+                [name, word, alias] if is_name(src.kind(name)) && src.text(word) == "as" && is_name(src.kind(alias)) => found.push((name, alias)),
+                _ => return Ok(None),
+            }
+        }
+        for (name, alias) in found {
+            let mut copy = Tokens::default();
+            (from..open).for_each(|token| copy.copy(src, token));
+            copy.copy(src, name);
+            self.uses.push((plain(src.text(alias)).to_owned(), copy.finish(src.path.clone())?));
+        }
+        Ok(Some(close + 2))
     }
 
     fn define(&mut self, src: &Source, name: u32) -> Result<()> {

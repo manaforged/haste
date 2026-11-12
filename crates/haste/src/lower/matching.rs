@@ -223,7 +223,9 @@ impl Lower<'_, '_> {
     /// The sub-patterns of a tuple, tuple-struct, struct or slice pattern `pat`, each with its place and the field it matches; a slice tests its length against `fail` first.
     fn subpatterns(&mut self, pat: PatId, place: Option<Place>, fail: Option<Block>) -> Result<Vec<(PatId, Option<Place>, Option<(u32, u32)>)>> {
         if let Pat::Slice(list) = *self.body.pat(pat) {
-            return Ok(self.slice_parts((pat, list), place, fail)?.into_iter().map(|(sub, at)| (sub, at, None)).collect());
+            let steps = self.part_indices(pat)?;
+            let step = |sub: PatId| steps.iter().find(|(part, _)| *part == sub).map(|&(_, step)| step);
+            return Ok(self.slice_parts((pat, list), place, fail)?.into_iter().map(|(sub, at)| (sub, at, step(sub))).collect());
         }
         let ty = self.pat_ty(pat)?;
         let mut found = Vec::new();
@@ -237,7 +239,7 @@ impl Lower<'_, '_> {
         Ok(found)
     }
 
-    /// The sub-patterns of a tuple, tuple-struct or struct pattern `pat`, each with the variant and field it matches.
+    /// The sub-patterns of a tuple, tuple-struct, struct or array pattern `pat`, each with the variant and field or element it matches.
     pub(super) fn part_indices(&mut self, pat: PatId) -> Result<Vec<(PatId, (u32, u32))>> {
         let ty = self.pat_ty(pat)?;
         let variant = match self.typed.pat_res.get(&pat) {
@@ -246,7 +248,7 @@ impl Lower<'_, '_> {
         };
         let subs: Vec<(PatId, u32)> = match *self.body.pat(pat) {
             Pat::Struct { fields, .. } => self.body.list(fields).iter().map(|&at| self.body.field_pats[at as usize].pat).map(|sub| (sub, self.typed.field_pats.get(&sub).copied().unwrap_or(u32::MAX))).collect(),
-            Pat::Tuple(list) | Pat::TupleStruct(_, list) => {
+            Pat::Tuple(list) | Pat::TupleStruct(_, list) | Pat::Slice(list) if !matches!(self.cx.types.kind(ty), Kind::Slice(_)) => {
                 let count = self.field_count(ty, variant)?;
                 let (pats, rest) = rest_split(self.body, list)?;
                 pats.iter().enumerate().filter_map(|(at, sub)| position(at, pats.len(), rest, count).map(|index| (*sub, index as u32))).collect()
@@ -259,6 +261,7 @@ impl Lower<'_, '_> {
     fn field_count(&mut self, ty: Ty, variant: u32) -> Result<usize> {
         Ok(match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => self.cx.types.substs(items).len(),
+            Kind::Array(_, len) => self.len(len)? as usize,
             Kind::Adt(item, args) => {
                 let slice = self.cx.types.substs(args).to_vec();
                 crate::sema::infer::field_types(self.cx, item, &slice)?[variant as usize].len()

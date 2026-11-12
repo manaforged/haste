@@ -24,8 +24,10 @@ pub const BOX_STEP: (u32, u32) = (u32::MAX, 0);
 impl Lower<'_, '_> {
     /// The root and path of the place expression `expr`, or none when it reads through a pointer or names no local.
     pub fn move_path(&self, expr: ExprId) -> Option<(Root, MovePath)> {
+        if let Some(inner) = self.transparent(expr) {
+            return self.move_path(inner);
+        }
         let (base, index) = match *self.body.expr(expr) {
-            Expr::Paren(inner) => return self.move_path(inner),
             Expr::Path(_) => {
                 return match self.typed.res.get(&expr) {
                     Some(Res::Local(local)) => Some((Root::Local(*local), Vec::new())),
@@ -67,8 +69,10 @@ impl Lower<'_, '_> {
     }
 
     fn is_place(&self, expr: ExprId) -> bool {
+        if let Some(inner) = self.transparent(expr) {
+            return self.is_place(inner);
+        }
         match *self.body.expr(expr) {
-            Expr::Paren(inner) => self.is_place(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Local(_)) => true,
                 Some(Res::Fn(item, _)) => super::is_static(self.cx, *item),
@@ -138,7 +142,7 @@ impl Lower<'_, '_> {
             }
             Pat::Paren(inner) => self.pattern_paths(inner, Some(at), found),
             Pat::Or(list) => self.body.list(list).to_vec().into_iter().try_for_each(|alt| self.pattern_paths(PatId(alt), Some(at.clone()), found)),
-            Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } => {
+            Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } | Pat::Slice(_) => {
                 for (sub, step) in self.part_indices(pat)? {
                     let mut path = at.1.clone();
                     path.push(step);

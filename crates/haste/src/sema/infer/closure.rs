@@ -598,11 +598,12 @@ pub fn by_reference(cx: &Context<'_>, item: ItemRef) -> Option<Mut> {
     }
 }
 
-/// The typed form of a call trait method at a closure or function item and its argument tuple, which calls the closure's body or the function with the tuple's fields.
+/// The typed form of a call trait method at a closure, function item or function pointer and its argument tuple, which calls the closure's body, the function or the pointer that the receiver `Res::Local(0)` points at, as a vtable passes it, with the tuple's fields.
 pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Typed> {
     let slice = cx.types.substs(substs);
     let (Some(&callee), Some(&tuple)) = (slice.first(), slice.get(1)) else { bail!("a call trait method with no callee and arguments") };
     let (target, ret) = match *cx.types.kind(callee) {
+        Kind::FnPtr(_, ret) => (Res::Local(0), ret),
         Kind::FnDef(target, args) => {
             let arg_slice = cx.types.substs(args).to_vec();
             let (res, (_, ret)) = super::detached(cx, target, |infer| Ok((infer.trait_call(target, args)?, infer.fn_types(target, &arg_slice)?)))?;
@@ -614,7 +615,8 @@ pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Res
             (Res::fn_of(&cx.types, call_once, &[callee, tuple]), info.closure.ret)
         }
     };
-    let receiver = by_reference(cx, item).map_or(callee, |by| cx.types.intern(Kind::Ref(by, callee)));
+    let pointer = matches!(cx.types.kind(callee), Kind::FnPtr(..)).then_some(Mut::Not);
+    let receiver = by_reference(cx, item).or(pointer).map_or(callee, |by| cx.types.intern(Kind::Ref(by, callee)));
     let locals = vec![Local { ty: receiver }, Local { ty: tuple }];
     Ok(Typed { locals, params: vec![0, 1], ret: Some(ret), shape: Shape::Untuple(target), ..Typed::default() })
 }

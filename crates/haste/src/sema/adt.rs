@@ -5,10 +5,9 @@ use rustc_abi::{Align, Integer, IntegerType, LayoutCalculator, NicheOptimization
 use rustc_index::IndexVec;
 
 use crate::names::{ItemRef, Primitive};
-use crate::outline::attr::split_commas;
+use crate::outline::attr::{repr_words, split_commas};
 use crate::outline::item::{Attr, ItemKind};
 use crate::outline::source::Source;
-use crate::outline::tree::Truth;
 
 use super::Context;
 use super::infer::field_types;
@@ -43,19 +42,10 @@ impl<'a> Context<'a> {
     pub fn repr(&self, item: ItemRef) -> ReprOptions {
         let (src, entry) = self.item(item);
         let mut repr = ReprOptions::default();
-        self.read_repr(item, (src, &entry.attrs), &mut repr);
+        read_repr_words(src, repr_words(src, &entry.attrs, &self.outline.crates[item.krate as usize].env), &mut repr);
         repr
     }
 
-    fn read_repr(&self, item: ItemRef, (src, attrs): (&Source, &[Attr]), repr: &mut ReprOptions) {
-        for attr in attrs {
-            match attr {
-                Attr::CfgAttr(cfg, inner) if self.outline.crates[item.krate as usize].env.eval(cfg) == Truth::Yes => self.read_repr(item, (src, inner), repr),
-                &Attr::Other(at) if src.text(at) == "repr" && src.kind(at + 1) == rustc_lexer::TokenKind::OpenParen => read_repr_words(src, at, repr),
-                _ => {}
-            }
-        }
-    }
 
     /// The argument positions that `#[rustc_legacy_const_generics(..)]` on the function `item` gives its const generics, in order.
     pub fn legacy_const_args(&self, item: ItemRef) -> Vec<usize> {
@@ -144,9 +134,9 @@ impl<'a> Context<'a> {
     }
 }
 
-/// Adds the words of the `#[repr(..)]` attribute at `at` to `repr`.
-fn read_repr_words(src: &Source, at: u32, repr: &mut ReprOptions) {
-    for (from, _) in split_commas(src, at + 2, src.pair(at + 1)) {
+/// Adds the `#[repr]` words that start at the tokens `words` to `repr`.
+fn read_repr_words(src: &Source, words: Vec<u32>, repr: &mut ReprOptions) {
+    for from in words {
         match src.text(from) {
             "C" => repr.flags |= ReprFlags::IS_C,
             "transparent" => repr.flags |= ReprFlags::IS_TRANSPARENT,
