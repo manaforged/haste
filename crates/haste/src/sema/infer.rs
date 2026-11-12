@@ -116,6 +116,7 @@ pub struct Infer<'c, 'a> {
     out: zonk::InferOut,
     scopes: Vec<(Name<'a>, u32)>,
     items: Vec<(&'a str, ItemRef)>,
+    block_uses: Vec<u32>,
     loops: Vec<Breaks>,
     uses: Vec<closure::Captures>,
     unsure: Vec<(ExprId, closure::Captures, bool, Vec<u32>)>,
@@ -125,7 +126,7 @@ pub struct Infer<'c, 'a> {
     selecting: Vec<u64>,
     frames: usize,
     evaluating: Vec<ItemRef>,
-    imports: HashMap<(ItemRef, Option<crate::names::Sym>), Vec<crate::names::PerNs>>,
+    imports: HashMap<(ItemRef, Option<crate::names::Sym>, Vec<u32>), Vec<crate::names::PerNs>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
 }
 
@@ -247,6 +248,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             out,
             scopes,
             items,
+            block_uses: Vec::new(),
             loops,
             uses,
             unsure: Vec::new(),

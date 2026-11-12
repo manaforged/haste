@@ -183,7 +183,7 @@ impl<'a> Context<'a> {
     }
 
     /// The bindings that the `use` declarations of the body `root` in module `home` give `word`, or every name they import when none, as code at token `here` sees them: named imports first, then globs.
-    pub(super) fn body_imports(&self, (root, home): (ItemRef, ModRef), word: Option<Sym>, here: Option<u32>) -> Vec<PerNs> {
+    pub(super) fn body_imports(&self, (root, home): (ItemRef, ModRef), word: Option<Sym>, (here, hidden): (Option<u32>, &[u32])) -> Vec<PerNs> {
         let Some(found) = self.expansion(root) else {
             return Vec::new();
         };
@@ -197,7 +197,7 @@ impl<'a> Context<'a> {
         let every = if word.is_none() { 0..file.items.imports.len() as u32 } else { 0..0 };
         let (mut out, mut globs) = (Vec::new(), Vec::new());
         for import in named.iter().chain(globbed).copied().chain(every) {
-            if !import_visible(file, index, import, here) {
+            if !import_visible(file, index, import, here) || hidden.contains(&file.items.imports[import as usize].item) {
                 continue;
             }
             match self.import_entry((root, home), &paths, (file, import), word) {
@@ -285,7 +285,7 @@ impl<'a> Context<'a> {
     /// Resolves `path` in the type namespace through the `use` declarations of the body `root` in module `home`, as code at token `here` sees them, when one binds its first segment.
     pub(super) fn body_use_path(&self, (root, home): (ItemRef, ModRef), path: &NamePath<'_>, here: Option<u32>) -> Option<Def> {
         let (first, rest) = path.segments.split_first().filter(|_| !path.absolute)?;
-        let binding = self.body_imports((root, home), Some(*first), here).into_iter().find_map(|entry| entry.types)?;
+        let binding = self.body_imports((root, home), Some(*first), (here, &[])).into_iter().find_map(|entry| entry.types)?;
         rest.iter().try_fold(binding.def, |def, segment| self.path_member(home, def, *segment).types.map(|found| found.def))
     }
 }

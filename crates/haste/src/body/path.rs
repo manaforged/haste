@@ -71,7 +71,7 @@ impl Cursor<'_> {
         if style != Style::Type {
             return Ok(None);
         }
-        if self.punct("<") && !self.punct("<-") && !self.punct("<=") {
+        if self.punct("<") && !self.punct("<=") {
             return Ok(Some(self.angle()?));
         }
         if self.punct("::") && self.kind_at(self.at + 2) == TokenKind::OpenParen {

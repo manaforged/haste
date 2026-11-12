@@ -119,33 +119,116 @@ const SYSCALL_REGISTERS: [&str; 7] = ["rax", "rdi", "rsi", "rdx", "r10", "r8", "
 /// The registers that the `syscall` instruction overwrites.
 const SYSCALL_CLOBBERS: [&str; 2] = ["rcx", "r11"];
 
-/// The expansion of an `asm!`: an optimization barrier when its templates hold no instruction, and a call of the host's system call entry when they hold one `syscall`.
-pub fn asm(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
-    let mut instructions = String::new();
-    for &(from, _) in args.iter().filter(|(from, to)| *to == from + 1) {
-        if let Some(template) = src.literal_text(from)? {
-            instructions.push_str(&strip_comments(&template));
-            instructions.push('\n');
-        }
+/// One instruction an `asm!` template holds, which its expansion writes as Rust.
+#[derive(Clone, Copy)]
+enum Instruction {
+    Barrier,
+    Syscall,
+    LockNot(u32),
+    Divide(u32),
+}
+
+/// The expansion of an `asm!` whose `templates` the call spells before its `operands`: an optimization barrier when they hold no instruction, a call of the host's system call entry for one `syscall`, an atomic invert for one `lock not` of memory, and a wide division for one `div`.
+pub fn asm(src: &Source, templates: &[String], operands: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
+    let text = templates.iter().map(|template| strip_comments(template)).collect::<Vec<_>>().join("\n");
+    match instruction(&text) {
+        Some(Instruction::Barrier) => asm_barrier(src, operands, out),
+        Some(Instruction::Syscall) => asm_syscall(src, operands, out),
+        Some(Instruction::LockNot(bits)) => asm_lock_not(src, operands, bits, out),
+        Some(Instruction::Divide(bits)) => asm_divide(src, operands, bits, out),
+        None => bail!("inline assembly `{}` is not supported", text.trim()),
     }
-    match instructions.trim() {
-        "" => asm_barrier(src, args, out),
-        "syscall" => asm_syscall(src, args, out),
-        _ => bail!("inline assembly with instructions other than one `syscall` is not supported"),
+}
+
+/// The instruction that the comment-free template `text` holds.
+fn instruction(text: &str) -> Option<Instruction> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let placeholder = |word: &str| word.starts_with('{') && word.ends_with('}');
+    match words.as_slice() {
+        all if all.iter().all(|word| placeholder(word)) => Some(Instruction::Barrier),
+        ["syscall"] => Some(Instruction::Syscall),
+        ["lock", "not", width, "ptr", "[{0}]"] => Some(Instruction::LockNot(memory_bits(width)?)),
+        ["div", "{0:r}"] => Some(Instruction::Divide(64)),
+        ["div", "{0:e}"] => Some(Instruction::Divide(32)),
+        _ => None,
+    }
+}
+
+/// The bits of the memory operand size `width`.
+fn memory_bits(width: &str) -> Option<u32> {
+    match width {
+        "qword" => Some(64),
+        "dword" => Some(32),
+        _ => None,
     }
 }
 
 /// The expansion of an `asm!` whose templates hold only comments and placeholders and whose operands only read or keep their places: an optimization barrier with no effect.
 fn asm_barrier(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
     for &(from, to) in args {
-        match src.literal_text(from)? {
-            Some(_) if to == from + 1 => {}
-            _ if matches!(src.text(from), "in" | "inout") && !(from..to).any(|at| punct_in(src, (at, to), "=>")) => {}
-            _ if src.text(from) == "options" => {}
-            _ => bail!("inline assembly operand `{}` is not supported", src.spelled((from, to))),
+        let reads = matches!(src.text(from), "in" | "inout") && !(from..to).any(|at| punct_in(src, (at, to), "=>"));
+        if !reads && src.text(from) != "options" {
+            bail!("inline assembly operand `{}` is not supported", src.spelled((from, to)));
         }
     }
     out.lexed("()");
+    Ok(())
+}
+
+/// The general register `name` names without its size prefix, as `ax` for `rax` and `eax`.
+fn base_register(name: &str) -> &str {
+    name.strip_prefix(['r', 'e']).filter(|rest| GENERAL_REGISTERS.contains(rest)).unwrap_or(name)
+}
+
+/// The x86 general registers that a size prefix widens.
+const GENERAL_REGISTERS: [&str; 8] = ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"];
+
+/// The expansion of an `asm!` that inverts the `bits`-wide memory its one `in(reg)` operand points at, under a `lock` prefix: a sequentially consistent atomic exclusive or with all ones.
+fn asm_lock_not(src: &Source, args: &[(u32, u32)], bits: u32, out: &mut Tokens) -> Result<()> {
+    let mut address = None;
+    for &(from, to) in args.iter().filter(|(from, _)| src.text(*from) != "options") {
+        let operand = operand(src, (from, to))?;
+        match (operand.input, operand.output, address) {
+            (Some(input), None, None) => address = Some(input),
+            _ => bail!("a `lock not` takes one address operand, not `{}`", src.spelled((from, to))),
+        }
+    }
+    let Some((from, to)) = address else { bail!("a `lock not` names no address") };
+    out.lexed("{ let __haste_cell = (");
+    out.copy_range(src, from, to);
+    out.lexed(&format!(") as *const ::core::sync::atomic::AtomicU{bits}; (*__haste_cell).fetch_xor(!0, ::core::sync::atomic::Ordering::SeqCst); }}"));
+    Ok(())
+}
+
+/// The expansion of an `asm!` that runs one `bits`-wide `div`: the dividend `dx:ax` over the register operand, the quotient to `ax` and the remainder to `dx`.
+fn asm_divide(src: &Source, args: &[(u32, u32)], bits: u32, out: &mut Tokens) -> Result<()> {
+    let (mut divisor, mut high, mut low) = (None, None, None);
+    for &(from, to) in args.iter().filter(|(from, _)| src.text(*from) != "options") {
+        let operand = operand(src, (from, to))?;
+        let slot = match base_register(&operand.register) {
+            "reg" => &mut divisor,
+            "dx" => &mut high,
+            "ax" => &mut low,
+            other => bail!("a `div` uses no `{other}`"),
+        };
+        *slot = Some(operand);
+    }
+    let (Some(divisor), Some(high), Some(low)) = (divisor, high, low) else { bail!("a `div` needs a divisor and `dx` and `ax` operands") };
+    out.lexed("{");
+    for (name, operand) in [("__haste_high", &high), ("__haste_low", &low), ("__haste_by", &divisor)] {
+        let Some((from, to)) = operand.input else { bail!("a `div` reads its `{}` operand", operand.register) };
+        out.lexed(&format!("let {name} = ("));
+        out.copy_range(src, from, to);
+        out.lexed(&format!(") as u{};", bits * 2));
+    }
+    out.lexed(&format!("let __haste_wide = (__haste_high << {bits}) | __haste_low;"));
+    for (operand, op) in [(&low, "/"), (&high, "%")] {
+        if let Some((from, to)) = operand.output {
+            out.copy_range(src, from, to);
+            out.lexed(&format!(" = (__haste_wide {op} __haste_by) as u{bits};"));
+        }
+    }
+    out.lexed("}");
     Ok(())
 }
 
@@ -159,7 +242,8 @@ struct Operand {
 /// The operand `in`, `out`, `lateout`, `inout` or `inlateout` that spans `from` to `to`, a `_` place writing nowhere.
 fn operand(src: &Source, (from, to): (u32, u32)) -> Result<Operand> {
     let open = from + 1;
-    let register = src.literal_text(open + 1)?.filter(|_| src.text(open) == "(").ok_or_else(|| anyhow::anyhow!("inline assembly operand `{}` names no register", src.spelled((from, to))))?;
+    let named = src.literal_text(open + 1)?.unwrap_or_else(|| src.text(open + 1).to_owned());
+    let register = Some(named).filter(|_| src.text(open) == "(").ok_or_else(|| anyhow::anyhow!("inline assembly operand `{}` names no register", src.spelled((from, to))))?;
     let rest = (src.pair(open) + 1, to);
     let mut arrow = None;
     let mut at = rest.0;
@@ -182,7 +266,7 @@ fn operand(src: &Source, (from, to): (u32, u32)) -> Result<Operand> {
 fn asm_syscall(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
     let mut inputs: [Option<(u32, u32)>; 7] = [None; 7];
     let (mut output, mut diverges) = (None, false);
-    for &(from, to) in args.iter().filter(|(from, to)| *to != from + 1) {
+    for &(from, to) in args {
         if src.text(from) == "options" {
             diverges = (from..to).any(|at| src.text(at) == "noreturn");
             continue;
@@ -224,15 +308,13 @@ fn asm_syscall(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()
 fn strip_comments(template: &str) -> String {
     let mut rest = template;
     let mut kept = String::new();
-    while let Some(start) = rest.find(['/', '{', '#']) {
+    while let Some(start) = rest.find(['/', '#']) {
         kept.push_str(&rest[..start]);
         let tail = &rest[start..];
         let close = if tail.starts_with("/*") {
             tail.find("*/").map(|end| start + end + 2)
         } else if tail.starts_with("//") || tail.starts_with('#') {
             Some(tail.find('\n').map_or(rest.len(), |end| start + end + 1))
-        } else if tail.starts_with('{') {
-            tail.find('}').map(|end| start + end + 1)
         } else {
             Some(start + 1)
         };

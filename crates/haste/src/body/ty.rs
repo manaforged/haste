@@ -19,6 +19,10 @@ impl Cursor<'_> {
             let bounds = self.bounds()?;
             return Ok(self.push_ty(Ty::DynTrait(bounds)));
         }
+        if self.punct("+") && matches!(self.body.tys[first.0 as usize], Ty::Paren(_)) {
+            self.at += 1;
+            self.bounds()?;
+        }
         Ok(first)
     }
 
@@ -116,12 +120,7 @@ impl Cursor<'_> {
             Ok((types, trailing))
         })?;
         if types.len() == 1 && !trailing {
-            let inner = TyId(types[0]);
-            if self.punct("+") {
-                self.at += 1;
-                self.bounds()?;
-            }
-            return Ok(self.push_ty(Ty::Paren(inner)));
+            return Ok(self.push_ty(Ty::Paren(TyId(types[0]))));
         }
         let list = self.list(&types);
         Ok(self.push_ty(Ty::Tuple(list)))

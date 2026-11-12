@@ -6,7 +6,7 @@ use super::source::{Source, opens};
 use super::tree::{Env, Truth};
 use crate::graph::cfg;
 
-/// The top-level comma-separated ranges of tokens in `from..to`, where the generic arguments of a `::<...>` turbofish nest like a group.
+/// The top-level comma-separated ranges of tokens in `from..to`, where the generic arguments of a `::<...>` turbofish and a qualified path `<...>` that starts a part nest like a group.
 pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
     let mut parts = Vec::new();
     let (mut start, mut at, mut angles) = (from, from, 0u32);
@@ -16,7 +16,7 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
                 parts.push((start, at));
                 start = at + 1;
             }
-            TokenKind::Lt if angles > 0 || turbofish(src, at) => angles += 1,
+            TokenKind::Lt if angles > 0 || at == start || turbofish(src, at) => angles += 1,
             TokenKind::Gt if angles > 0 && !(src.kind(at - 1) == TokenKind::Minus && src.joint(at - 1)) => angles -= 1,
             kind if opens(kind) => at = src.pair(at),
             _ => {}

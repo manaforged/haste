@@ -8,12 +8,13 @@ use super::Infer;
 impl Infer<'_, '_> {
     /// Infers a block's statements and tail in a new scope.
     pub fn block(&mut self, stmts: List, tail: Option<ExprId>, expected: Option<Ty>) -> Result<Ty> {
-        let (depth, items) = (self.scopes.len(), self.items.len());
+        let (depth, items, uses) = (self.scopes.len(), self.items.len(), self.block_uses.len());
         let diverges = std::mem::replace(&mut self.diverges, false);
         self.declare_items(stmts);
         let result = self.block_inner(stmts, tail, expected);
         self.scopes.truncate(depth);
         self.items.truncate(items);
+        self.block_uses.truncate(uses);
         let ty = result?;
         let ty = if tail.is_none() && self.diverges { self.cx.types.intern(Kind::Never) } else { ty };
         self.diverges |= diverges;
@@ -30,6 +31,9 @@ impl Infer<'_, '_> {
                 continue;
             };
             for at in super::super::expand::stmt_items(items, (start, end)) {
+                if items[at].kind == crate::outline::item::ItemKind::Use {
+                    self.block_uses.push(at as u32);
+                }
                 if let Some(name) = items[at].name {
                     self.items.push((crate::names::plain(src.text(name)), root.inner(at as u32)));
                 }

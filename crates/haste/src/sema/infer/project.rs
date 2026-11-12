@@ -377,7 +377,7 @@ impl Infer<'_, '_> {
         }
         if self.cx.lang(of) == Some("future_trait")
             && name == "Output"
-            && let Some(output) = self.coroutine_output(ty)
+            && let Some(output) = self.coroutine_output(ty).or_else(|| self.opaque_output(self.resolve(ty)))
         {
             return Ok(Some(output));
         }

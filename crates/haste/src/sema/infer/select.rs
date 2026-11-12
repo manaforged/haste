@@ -257,15 +257,19 @@ impl<'a> Infer<'_, 'a> {
         Ok(args.contains(&self_ty))
     }
 
+    /// The crates whose impls of `of` may apply to `self_ty` at `args`: the trait's, each named type's, and the body's own while a type is still unknown, since an impl there may name the type it becomes.
     fn holders(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Vec<u32> {
         let mut crates = vec![of.krate];
         let mut stack: Vec<Ty> = std::iter::once(self_ty).chain(args.iter().copied()).collect();
         while let Some(ty) = stack.pop() {
             let kind = self.cx.types.kind(self.resolve(ty));
-            if let Kind::Adt(item, _) | Kind::Dyn(item, ..) = kind
-                && !crates.contains(&item.krate)
-            {
-                crates.push(item.krate);
+            let named = match kind {
+                Kind::Adt(item, _) | Kind::Dyn(item, ..) => Some(item.krate),
+                Kind::Var(_) => Some(self.home.krate),
+                _ => None,
+            };
+            if let Some(krate) = named.filter(|krate| !crates.contains(krate)) {
+                crates.push(krate);
             }
             stack.extend(kind.children(&self.cx.types));
         }

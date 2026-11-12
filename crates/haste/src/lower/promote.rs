@@ -1,7 +1,7 @@
 use anyhow::Result;
 use haste_codegen::{IntCC, Type, Value};
 
-use crate::body::{Expr, ExprId, UnOp};
+use crate::body::{BlockKind, Expr, ExprId, UnOp};
 use crate::host::HostSymbol;
 use crate::names::{ItemRef, Primitive};
 use crate::outline::item::ItemKind;
@@ -14,12 +14,21 @@ use super::stencil::SymbolSource;
 use super::{Lower, repr};
 
 impl Lower<'_, '_> {
-    /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a function, a closure that captures nothing, a constructor, a shared reference to one, an aggregate or constructor call of them, or a field of one.
+    /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a function, a closure that captures nothing, a constructor, a shared reference to one, an aggregate or constructor call of them, or a field of one; in a constant or static initializer, which the compiler evaluates once, also a call, operator or block of them.
     pub fn promotable(&self, expr: ExprId) -> bool {
+        let item = self.reached.list[self.index].0.0;
+        self.promotable_in(expr, matches!(self.cx.item(item).1.kind, ItemKind::Const | ItemKind::Static))
+    }
+
+    fn promotable_in(&self, expr: ExprId, constant: bool) -> bool {
+        if let Some(inner) = self.transparent(expr) {
+            return self.promotable_in(inner, constant);
+        }
+        let all = |list: crate::body::List| self.body.list(list).iter().all(|&at| self.promotable_in(ExprId(at), constant));
         match *self.body.expr(expr) {
             Expr::Lit(..) => true,
             Expr::Closure { .. } => !self.cx.closure_takes_env(self.ty_of(expr)),
-            Expr::Paren(inner) | Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Ref { mutable: false, raw: false, expr: inner } => self.promotable(inner),
+            Expr::Unary(UnOp::Neg, inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) | Expr::Ref { mutable: false, raw: false, expr: inner } => self.promotable_in(inner, constant),
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Fn(item, _)) => {
                     matches!(self.cx.item(*item).1.kind, ItemKind::Const | ItemKind::Fn)
@@ -28,15 +37,19 @@ impl Lower<'_, '_> {
                 _ => false,
             },
             Expr::Call(callee, list) => {
-                let constant = match self.typed.res.get(&callee) {
+                let callable = match self.typed.res.get(&callee) {
                     Some(Res::Ctor(..)) => true,
-                    Some(Res::Fn(item, _)) => self.cx.rustc_promotable(*item),
+                    Some(Res::Fn(item, _)) => constant || self.cx.rustc_promotable(*item),
                     _ => false,
                 };
-                constant && self.body.list(list).iter().all(|&at| self.promotable(ExprId(at)))
+                callable && all(list)
             }
-            Expr::Array(list) | Expr::Tuple(list) => self.body.list(list).iter().all(|&at| self.promotable(ExprId(at))),
-            Expr::Struct { fields, base: None, .. } => self.body.list(fields).iter().all(|&at| self.promotable(self.body.fields[at as usize].value)),
+            Expr::Method { receiver, params, .. } => constant && self.promotable_in(receiver, constant) && all(params),
+            Expr::Unary(_, inner) | Expr::Cast(inner, _) => constant && self.promotable_in(inner, constant),
+            Expr::Binary(_, left, right) => constant && self.promotable_in(left, constant) && self.promotable_in(right, constant),
+            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } => constant && self.body.list(stmts).is_empty() && self.promotable_in(tail, constant),
+            Expr::Array(list) | Expr::Tuple(list) => all(list),
+            Expr::Struct { fields, base: None, .. } => self.body.list(fields).iter().all(|&at| self.promotable_in(self.body.fields[at as usize].value, constant)),
             _ => false,
         }
     }

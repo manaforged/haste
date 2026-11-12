@@ -101,6 +101,38 @@ fn proc_bang(cx: &mut Context<'_>, krate: u32, src: &Source, run: ItemRef, open:
     }
 }
 
+/// Adds the tokens of each `path` that the use tree entries in `from..to` name under `prefix`, with the token of its name or alias, to `found`, descending into nested groups; false when an entry is not a plain path.
+fn use_entries(src: &Source, prefix: &[u32], (from, to): (u32, u32), found: &mut Vec<(Vec<u32>, u32)>) -> bool {
+    let mut at = from;
+    while at < to {
+        let mut end = at;
+        while end < to && src.kind(end) != TokenKind::Comma {
+            end = if src.kind(end) == TokenKind::OpenBrace { src.pair(end) + 1 } else { end + 1 };
+        }
+        if end > at && !use_entry(src, prefix, (at, end), found) {
+            return false;
+        }
+        at = end + 1;
+    }
+    true
+}
+
+/// Adds the path that the one use tree entry `from..to` names under `prefix` to `found`, as `use_entries` does.
+fn use_entry(src: &Source, prefix: &[u32], (from, to): (u32, u32), found: &mut Vec<(Vec<u32>, u32)>) -> bool {
+    let pathlike = |range: std::ops::Range<u32>| range.clone().all(|at| is_name(src.kind(at)) || src.kind(at) == TokenKind::Colon);
+    let joined = |end: u32| prefix.iter().copied().chain(from..end).collect::<Vec<u32>>();
+    if src.kind(to - 1) == TokenKind::CloseBrace {
+        let open = src.pair(to - 1);
+        return pathlike(from..open) && use_entries(src, &joined(open), (open + 1, to - 1), found);
+    }
+    let (end, alias) = if to >= from + 3 && src.text(to - 2) == "as" { (to - 2, to - 1) } else { (to, to - 1) };
+    if !pathlike(from..end) || !is_name(src.kind(end - 1)) || !is_name(src.kind(alias)) {
+        return false;
+    }
+    found.push((joined(end), alias));
+    true
+}
+
 fn body_range(file: &File, item: u32) -> Option<(u32, u32)> {
     let entry = &file.items.items[item as usize];
     match (entry.kind, entry.name) {
@@ -125,6 +157,11 @@ impl Writer {
         {
             return Ok(next);
         }
+        if src.kind(at) == TokenKind::Pound
+            && let Some(next) = self.configured_out(cx, src, at)
+        {
+            return Ok(next);
+        }
         if src.kind(at) != TokenKind::Bang {
             return self.non_bang(cx, src, at);
         }
@@ -141,6 +178,23 @@ impl Writer {
         };
         self.call(cx, run, path, next)?;
         Ok(src.pair(next) + 1)
+    }
+
+    /// The token after the macro call or block that attributes starting at `at` turn off with a `#[cfg]`, which is left unexpanded.
+    fn configured_out(&self, cx: &Context<'_>, src: &Source, at: u32) -> Option<u32> {
+        let mut attrs = Vec::new();
+        let Ok(word) = attr::attrs(src, at, false, &mut attrs) else { return None };
+        if word == at || cx.outline.crates[self.home.krate as usize].env.enabled(&attrs) {
+            return None;
+        }
+        if src.kind(word) == TokenKind::OpenBrace {
+            return Some(src.pair(word) + 1);
+        }
+        let mut end = word;
+        while is_name(src.kind(end)) || src.kind(end) == TokenKind::Colon {
+            end += 1;
+        }
+        (end > word && src.kind(end) == TokenKind::Bang && opens(src.kind(end + 1))).then(|| src.pair(end + 1) + 1)
     }
 
     fn non_bang(&mut self, cx: &Context<'_>, src: &Source, at: u32) -> Result<u32> {
@@ -228,25 +282,19 @@ impl Writer {
         Ok(Some(end + 1))
     }
 
-    /// Notes each `name` or `name as alias` of the one-level group at `open` of a `use prefix::{..};` whose prefix starts at `from`, and returns the token after the `;`.
+    /// Notes each `path` or `path as alias` of the group at `open` of a `use prefix::{..};` whose prefix starts at `from`, with nested groups, and returns the token after the `;`.
     fn note_use_group(&mut self, src: &Source, (from, open): (u32, u32)) -> Result<Option<u32>> {
         let close = src.pair(open);
         if src.kind(close + 1) != TokenKind::Semi {
             return Ok(None);
         }
         let mut found = Vec::new();
-        for entry in (open + 1..close).collect::<Vec<_>>().split(|&at| src.kind(at) == TokenKind::Comma) {
-            match *entry {
-                [] => {}
-                [name] if is_name(src.kind(name)) => found.push((name, name)),
-                [name, word, alias] if is_name(src.kind(name)) && src.text(word) == "as" && is_name(src.kind(alias)) => found.push((name, alias)),
-                _ => return Ok(None),
-            }
+        if !use_entries(src, &(from..open).collect::<Vec<_>>(), (open + 1, close), &mut found) {
+            return Ok(None);
         }
-        for (name, alias) in found {
+        for (path, alias) in found {
             let mut copy = Tokens::default();
-            (from..open).for_each(|token| copy.copy(src, token));
-            copy.copy(src, name);
+            path.into_iter().for_each(|token| copy.copy(src, token));
             self.uses.push((plain(src.text(alias)).to_owned(), copy.finish(src.path.clone())?));
         }
         Ok(Some(close + 2))
@@ -367,7 +415,7 @@ impl Writer {
             Builtin::ModulePath => out.lexed(&format!("{:?}", cx.outline.module_path(self.home))),
             Builtin::CfgSelect => return self.cfg_select(cx, run, open, out),
             Builtin::Assert => builtin::assert(src, &src.args(open), site.krate, out),
-            Builtin::Asm => builtin::asm(src, &src.args(open), out)?,
+            Builtin::Asm => self.asm(cx, run, open, out)?,
             Builtin::Panic | Builtin::Unreachable => self.panic(cx, run, site, out),
         }
         Ok(true)
@@ -400,6 +448,16 @@ impl Writer {
         out.lexed("(");
         out.copy_range(run.src, site.open + 1, run.src.pair(site.open));
         out.lexed(")");
+    }
+
+    fn asm(&self, cx: &mut Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<()> {
+        let args = run.src.args(open);
+        let mut templates = Vec::new();
+        for &range in &args {
+            let Some(template) = self.literal(cx, run, range)? else { break };
+            templates.push(template);
+        }
+        builtin::asm(run.src, &templates, &args[templates.len()..], out)
     }
 
     fn concat(&self, cx: &mut Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<bool> {
