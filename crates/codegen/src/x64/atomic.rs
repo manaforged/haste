@@ -18,6 +18,7 @@ const MOVUPS: ([u8; 2], [u8; 2]) = ([0x0F, 0x10], [0x0F, 0x11]);
 impl Emit<'_> {
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
+            Op::Const(_) if result().is_ok_and(|result| self.ty(result) == Type::V128) => self.vector_zero(result()?),
             Op::Const(imm) => {
                 let result = result()?;
                 if !self.is_static(result) {
@@ -50,6 +51,7 @@ impl Emit<'_> {
                 self.put(result, dst);
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
+            Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) => self.vector_op(op, result()?)?,
             _ => return self.access(op, result),
         }
         Ok(())
@@ -160,7 +162,7 @@ impl Emit<'_> {
 
     fn read(&mut self, result: Value, from: Mem) {
         let ty = self.ty(result);
-        if ty.is_float() {
+        if ty.in_float_register() {
             let dst = self.fdst(result);
             self.xmm_load(ty, dst, from);
             self.fput(result, dst);
@@ -180,7 +182,7 @@ impl Emit<'_> {
 
     fn write(&mut self, value: Value, to: Mem) {
         let ty = self.ty(value);
-        if ty.is_float() {
+        if ty.in_float_register() {
             let source = self.fin(value, Xmm(0));
             self.xmm_store(ty, to, source);
             return;

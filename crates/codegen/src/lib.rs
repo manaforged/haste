@@ -10,6 +10,7 @@ mod error;
 mod ir;
 mod memory;
 mod fold;
+mod fill;
 mod frame;
 mod live;
 mod merge;
@@ -18,6 +19,7 @@ mod probe;
 mod promote;
 mod reloc;
 mod returns;
+mod split;
 mod target;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
@@ -44,7 +46,7 @@ mod arm64;
 mod x64;
 
 pub use builder::{FunctionBuilder, Ins, Mark};
-pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst, IntCC, SigRef, Signature, StackSlot, Type, Value};
+pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, ByteCC, CallConv, FloatCC, Function, Inst, IntCC, SigRef, Signature, StackSlot, Type, Value};
 pub use coroutine::{Coroutine, FIRST_SUSPEND, RETURNED, UNRESUMED};
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
@@ -102,12 +104,14 @@ pub fn dict_entry_stub(arch: Arch, stub_exec: usize, body_exec: usize, dict_addr
 
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
 pub fn simplify(func: &mut Function) {
-    optimize(func);
+    optimize(func, promote::Moves::Guided);
     fold::compact(func);
 }
 
-fn optimize(func: &mut Function) {
-    promote::run(func);
+fn optimize(func: &mut Function, moves: promote::Moves) {
+    fill::run(func);
+    fold::run(func);
+    promote::run(func, moves);
     fold::run(func);
     merge::run(func);
     cse::run(func);
@@ -118,7 +122,7 @@ fn optimize(func: &mut Function) {
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, message))?;
-    optimize(&mut func);
+    optimize(&mut func, promote::Moves::Split);
     if target.arch != Arch::X64 {
         copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
     }

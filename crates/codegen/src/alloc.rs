@@ -56,7 +56,7 @@ pub(crate) struct Plan<R> {
 
 /// Whether planning may give a value of type `ty` a register of `regs`.
 fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
-    ty.is_small_int() || (ty.is_float() && !regs.float.is_empty())
+    ty.is_small_int() || (ty.in_float_register() && !regs.float.is_empty())
 }
 
 type Position = Option<(usize, usize)>;
@@ -420,7 +420,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, order: 
     let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches)).collect();
     let through = if regs.absolute_calls { through(func, &locations, &census) } else { vec![None; count] };
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
-    let floats: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_float() && live.span[value].is_some_and(|span| !crosses(&live.calls, span))).collect();
+    let floats: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].in_float_register() && live.span[value].is_some_and(|span| !crosses(&live.calls, span))).collect();
     let reuse = if regs.two_address { reusable(func, &live) } else { vec![None; count] };
     let (homes, used) = allocate(func, &live, &int_class(func, regs, order, params, passed(func, classify)), &ints, &reuse);
     place(&mut locations, homes, Location::Reg);

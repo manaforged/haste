@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, Op, StackSlot, Type, Value};
+use crate::split::{End, Layouts};
 
 /// One promoted place: the bytes at `offset` in `slot`, read and written at one or more integer widths.
 struct Var {
@@ -190,6 +191,36 @@ impl Scan {
         };
         self.vars[var].add(ty, matches!(kind, Kind::Store(_)));
         self.accesses.push(Access { block: at.0, inst: at.1, var, kind, ty });
+    }
+
+    /// The slot and offset `addr` points into, when it is a slot address.
+    fn end(&self, addr: Value) -> End {
+        self.addrs[addr.index()].map(|(slot, offset)| (slot.index(), offset))
+    }
+
+    /// The layouts the accesses give each slot, spread through the moves of `func`.
+    fn layouts(&self, func: &Function) -> Layouts {
+        let accesses = self.accesses.iter().map(|access| (self.vars[access.var].slot.index(), self.vars[access.var].offset, access.ty));
+        let mut layouts = Layouts::new(func.slots.len(), accesses);
+        let moves: Vec<(End, End, u32)> = func.blocks.iter().flat_map(|block| &block.insts).filter_map(|inst| match func.insts[inst.index()].op {
+            Op::Move(to, from, bytes) => Some((self.end(to), self.end(from), bytes)),
+            _ => None,
+        }).collect();
+        layouts.spread(&moves);
+        layouts
+    }
+
+    /// Marks as escaped every slot a move that stayed whole reads or writes, since promotion would drop the stores it reads and miss the bytes it writes.
+    fn pin_moves(&mut self, func: &Function) {
+        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+            if let Op::Move(to, from, _) = func.insts[inst.index()].op {
+                for addr in [to, from] {
+                    if let Some((slot, _)) = self.addrs[addr.index()] {
+                        self.escaped[slot.index()] = true;
+                    }
+                }
+            }
+        }
     }
 
     /// Whether `addr` is the address of a slot that nothing but moves lets escape.
@@ -599,16 +630,31 @@ fn materialize(func: &mut Function, zeros: &[(Type, Value)]) -> Vec<Inst> {
     insts
 }
 
-/// Promotes every stack slot whose address never escapes into SSA values carried in block parameters, first splitting into pieces each move that touches a slot only moves let escape.
-pub(crate) fn run(func: &mut Function) {
+/// Which moves promotion splits into pieces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moves {
+    /// Every move that touches a slot only moves let escape.
+    Split,
+    /// Those of them that an access of either end gives a layout for; a body kept for copying leaves the others whole for the caller, which may know how their bytes are read.
+    Guided,
+}
+
+/// Promotes every stack slot whose address never escapes into SSA values carried in block parameters, first splitting into pieces each move that `moves` splits and that touches a slot only moves let escape.
+pub(crate) fn run(func: &mut Function, moves: Moves) {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
         return;
     };
     let mut scan = Scan::new(func);
     let mut splits = Vec::new();
     if func.insts.iter().any(|data| matches!(data.op, Op::Move(to, from, _) if scan.open(to) || scan.open(from))) {
-        splits = crate::copy::expand(func, |to, from, bytes| (scan.open(to) || scan.open(from)).then(|| crate::copy::words(bytes)));
+        let layouts = scan.layouts(func);
+        let pieces = |to: Value, from: Value, bytes: u32| match layouts.pieces(scan.end(to), scan.end(from), bytes) {
+            None if moves == Moves::Split => Some(crate::copy::words(bytes)),
+            guided => guided,
+        };
+        splits = crate::copy::expand(func, |to, from, bytes| if scan.open(to) || scan.open(from) { pieces(to, from, bytes) } else { None });
         scan = Scan::new(func);
+        scan.pin_moves(func);
     }
     if (0..func.slots.len()).any(|slot| scan.promotable(slot)) {
         promote(func, entry, scan);

@@ -11,6 +11,8 @@ pub enum Type {
     I128,
     F32,
     F64,
+    /// Sixteen bytes held in one vector register.
+    V128,
 }
 
 impl Type {
@@ -21,7 +23,7 @@ impl Type {
             Type::I16 => 2,
             Type::I32 | Type::F32 => 4,
             Type::I64 | Type::F64 => 8,
-            Type::I128 => 16,
+            Type::I128 | Type::V128 => 16,
         }
     }
 
@@ -33,6 +35,11 @@ impl Type {
     /// Whether the type holds a floating-point number.
     pub fn is_float(self) -> bool {
         matches!(self, Type::F32 | Type::F64)
+    }
+
+    /// Whether a value of the type lives in a float register when it has one.
+    pub fn in_float_register(self) -> bool {
+        self.is_float() || self == Type::V128
     }
 
     /// Whether the type holds an integer that fits in one general-purpose register.
@@ -166,6 +173,14 @@ impl IntCC {
     }
 }
 
+/// A comparison of the sixteen bytes of two vectors, giving a byte of all ones where it holds and of zeros where it does not.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum ByteCC {
+    Equal,
+    SignedGreaterThan,
+}
+
 /// A floating-point comparison; every one but `NotEqual` is false when an operand is NaN.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
@@ -270,6 +285,12 @@ pub(crate) enum Op {
     /// 1 when `x op y` (add, sub or mul, signed when the flag is set) fits the type of `x`, else 0.
     Fits(Binary, bool, Value, Value),
     Fcmp(FloatCC, Value, Value),
+    /// The sixteen byte comparisons of two vectors.
+    ByteCmp(ByteCC, Value, Value),
+    /// The vector whose sixteen bytes are all the byte in the value.
+    Splat(Value),
+    /// The 32-bit integer whose bit `i` is the top bit of byte `i` of the vector, for `i` below 16, and whose other bits are zero.
+    Movemask(Value),
     Select(Value, Value, Value),
     Load(Value, i32),
     Store(Value, Value, i32),
@@ -331,8 +352,8 @@ impl Op {
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
-            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Splat(x) | Op::Movemask(x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
+            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::ByteCmp(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
                 f(*x);
                 f(*y);
             }
@@ -357,13 +378,14 @@ impl Op {
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Splat(x) | Op::Movemask(x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
                 *x = f(*x);
             }
             Op::Binary(_, x, y)
             | Op::Icmp(_, x, y)
             | Op::Fits(_, _, x, y)
             | Op::Fcmp(_, x, y)
+            | Op::ByteCmp(_, x, y)
             | Op::Store(x, y, _)
             | Op::AtomicStore(x, y)
             | Op::AtomicRmw(_, x, y)

@@ -450,7 +450,7 @@ fn drop_params(func: &mut Function, fold: &Fold) {
 }
 
 fn pure(op: &Op) -> bool {
-    matches!(op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
+    matches!(op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
 }
 
 /// How many times the instructions in blocks read each value.
@@ -463,7 +463,7 @@ fn use_counts(func: &Function) -> Vec<u32> {
 }
 
 /// The instruction in a block that defines each value.
-fn defs(func: &Function) -> Vec<Option<Inst>> {
+pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
     let mut defs = vec![None; func.types.len()];
     for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
         if let Some(result) = func.insts[inst.index()].result {

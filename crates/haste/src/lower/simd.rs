@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{IntCC, StackSlot, Type, Value};
+use haste_codegen::{Arch, ByteCC, IntCC, StackSlot, Target, Type, Value};
 
 use crate::body::BinOp;
 use crate::host::{HostSymbol, X86Symbol};
@@ -16,11 +16,31 @@ struct Lanes {
     count: i32,
 }
 
+/// The bytes of a vector the code generator holds in one register.
+const PACKED_BYTES: i32 = 16;
+
+impl Lanes {
+    /// Whether the vector is sixteen integer bytes.
+    fn is_bytes(&self) -> bool {
+        self.size == 1 && self.count == PACKED_BYTES && matches!(self.num, Num::Int { .. })
+    }
+
+    /// Whether the vector is integer lanes that fill one 128-bit register.
+    fn is_packed(&self) -> bool {
+        self.size * self.count == PACKED_BYTES && matches!(self.num, Num::Int { .. })
+    }
+}
+
 impl Lower<'_, '_> {
     /// Emits the SIMD intrinsic `op` one lane at a time on vectors held in memory, as a scalar backend does.
     pub(super) fn simd(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&vector), Some(&first)) = (substs.first(), args.first()) else { bail!("a SIMD intrinsic with no vector") };
         let out = substs.get(1).copied();
+        if Target::host().arch == Arch::X64
+            && let Some(value) = self.packed(op, (vector, out.unwrap_or(vector)), args)?
+        {
+            return Ok(Some(value));
+        }
         let value = match (op, out) {
             (Simd::Splat, _) => self.splat(vector, first)?,
             (Simd::Bitmask, Some(out)) => self.bitmask(vector, first, out)?,
@@ -32,6 +52,44 @@ impl Lower<'_, '_> {
             _ => self.simd_lanes(op, substs, args)?,
         };
         Ok(Some(value))
+    }
+
+    /// Emits `op` as one 128-bit vector operation when it is one the code generator has: a bitwise operation on a register of integer lanes, or a splat, equality, signed order or bitmask on sixteen bytes.
+    fn packed(&mut self, op: Simd, (input, output): (Ty, Ty), args: &[Value]) -> Result<Option<Value>> {
+        let lanes = self.lanes(input)?;
+        if !lanes.is_packed() {
+            return Ok(None);
+        }
+        let signed = matches!(lanes.num, Num::Int { signed: true, .. });
+        let vector = match (op, args) {
+            (Simd::Splat, &[x]) if lanes.is_bytes() => self.ins().splat(x),
+            (Simd::Bitmask, &[x]) if lanes.is_bytes() => {
+                let Some(target) = machine(self.cx, output)? else { return Ok(None) };
+                let loaded = self.ins().load(Type::V128, x, 0);
+                let mask = self.ins().movemask(loaded);
+                return Ok(Some(self.resize(mask, (Type::I32, false), target)));
+            }
+            (Simd::Lanewise(bin @ (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)), &[x, y]) if input == output => {
+                let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+                match bin {
+                    BinOp::BitAnd => self.ins().band(a, b),
+                    BinOp::BitOr => self.ins().bor(a, b),
+                    _ => self.ins().bxor(a, b),
+                }
+            }
+            (Simd::Lanewise(cmp @ (BinOp::Eq | BinOp::Gt | BinOp::Lt)), &[x, y]) if lanes.is_bytes() && (cmp == BinOp::Eq || signed) && self.lanes(output)?.is_bytes() => {
+                let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+                match cmp {
+                    BinOp::Eq => self.ins().byte_cmp(ByteCC::Equal, a, b),
+                    BinOp::Gt => self.ins().byte_cmp(ByteCC::SignedGreaterThan, a, b),
+                    _ => self.ins().byte_cmp(ByteCC::SignedGreaterThan, b, a),
+                }
+            }
+            _ => return Ok(None),
+        };
+        let (slot, address) = self.vector_slot(if matches!(op, Simd::Splat) { input } else { output })?;
+        self.ins().stack_store(vector, slot, 0);
+        Ok(Some(address))
     }
 
     fn simd_lanes(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Value> {

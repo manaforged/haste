@@ -127,6 +127,12 @@ impl Probe {
                 self.hasher.word((110 << 32) | u64::from(c.0));
                 self.hasher.word((u64::from(x.0) << 32) | u64::from(y.0));
             }
+            Op::ByteCmp(cc, x, y) => {
+                self.hasher.word((111 << 48) | u64::from(cc as u8));
+                self.hasher.word((u64::from(x.0) << 32) | u64::from(y.0));
+            }
+            Op::Splat(x) => self.hasher.word((112 << 32) | u64::from(x.0)),
+            Op::Movemask(x) => self.hasher.word((113 << 32) | u64::from(x.0)),
             _ => return false,
         }
         true

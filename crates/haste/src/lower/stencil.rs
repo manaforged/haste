@@ -287,7 +287,7 @@ fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_
 
 fn scan_callee(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, (u, v): (usize, usize), (info, edges): (&mut NodeInfo, &mut Vec<usize>)) {
     if v == u {
-        info.self_loop = true;
+        info.self_loop |= !matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
         return;
     }
     if cyclic.is_done(v) {

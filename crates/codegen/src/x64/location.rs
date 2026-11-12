@@ -131,14 +131,16 @@ impl Emit<'_> {
         }
     }
 
-    /// Loads the float of type `ty` at `from` into `xmm`.
+    /// Loads the float or vector of type `ty` at `from` into `xmm`; a vector by `movdqu`, which needs no alignment.
     pub(super) fn xmm_load(&mut self, ty: Type, xmm: Xmm, from: Mem) {
-        self.asm.sse(&[scalar(ty)], &[0x0F, 0x10], xmm.0, from);
+        let opcode = if ty == Type::V128 { 0x6F } else { 0x10 };
+        self.asm.sse(&[scalar(ty)], &[0x0F, opcode], xmm.0, from);
     }
 
-    /// Stores the float of type `ty` in `xmm` to `to`.
+    /// Stores the float or vector of type `ty` in `xmm` to `to`.
     pub(super) fn xmm_store(&mut self, ty: Type, to: Mem, xmm: Xmm) {
-        self.asm.sse(&[scalar(ty)], &[0x0F, 0x11], xmm.0, to);
+        let opcode = if ty == Type::V128 { 0x7F } else { 0x11 };
+        self.asm.sse(&[scalar(ty)], &[0x0F, opcode], xmm.0, to);
     }
 
     /// Puts float `value` in `xmm`.

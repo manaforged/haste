@@ -5,6 +5,8 @@ use crate::ir::{
 use crate::probe::Probe;
 use crate::reloc::RuntimeSymbol;
 
+mod vector;
+
 /// Appends blocks, values and instructions to a function.
 pub struct FunctionBuilder<'f> {
     pub func: &'f mut Function,

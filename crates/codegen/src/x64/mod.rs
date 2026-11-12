@@ -5,6 +5,7 @@ mod float;
 mod frame;
 mod location;
 mod int;
+mod vector;
 mod wide;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
@@ -204,7 +205,7 @@ impl Emit<'_> {
     fn copy_to(&mut self, to: Mem, from: Mem, ty: Type) {
         self.asm.load(Size::Q, Reg::Rax, from);
         self.asm.store(Size::Q, to, Reg::Rax);
-        if ty == Type::I128 {
+        if ty.bytes() == 16 {
             self.asm.load(Size::Q, Reg::Rax, from.offset(8));
             self.asm.store(Size::Q, to.offset(8), Reg::Rax);
         }

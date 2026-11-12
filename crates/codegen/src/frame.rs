@@ -162,7 +162,7 @@ pub(crate) fn layout<R>(func: &Function, saves: Vec<R>, locations: &[Location<R>
             values.push(0);
             continue;
         }
-        cursor += if *ty == Type::I128 { 16 } else { WORD };
+        cursor += round(ty.bytes(), WORD);
         values.push(-(cursor as i32));
     }
     let mut slots = Vec::with_capacity(func.slots.len());

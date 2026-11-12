@@ -160,6 +160,9 @@ impl Emit<'_> {
             self.put_high(result, Reg::Rax);
             return Ok(());
         }
+        if ty == Type::V128 {
+            return self.vector_binary(op, (x, y), result);
+        }
         if ty.is_float() {
             return self.float_binary(op, x, y, result);
         }
