@@ -114,7 +114,7 @@ impl Lower<'_, '_> {
         if !self.cx.foreign(item) && self.cx.thread_local(item) {
             let usize_ty = self.cx.types.prim(Primitive::Usize);
             let code = self.emit_symbol(SymbolSource::Host(HostSymbol::ThreadCell));
-            let idx_val = self.emit_symbol(SymbolSource::Word(index as u64));
+            let idx_val = self.emit_symbol(SymbolSource::ThreadSlot(index));
             let args = vec![idx_val, self.ins().iconst(Type::I64, i64::from(size) + 1)];
             let cell = self.call_code(code, (vec![usize_ty, usize_ty], Some(usize_ty)), args)?;
             return Ok((cell.ok_or_else(|| anyhow::anyhow!("no thread cell"))?, size as i32));

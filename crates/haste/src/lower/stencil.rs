@@ -58,6 +58,7 @@ pub enum SymbolSource {
     PromotedCell { owner: usize, seq: u32, size: u32 },
     Host(HostSymbol),
     Word(u64),
+    ThreadSlot(usize),
 }
 
 /// The ordered symbolic relocation vector (`D`) of one lowered function instance.

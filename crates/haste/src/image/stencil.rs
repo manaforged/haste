@@ -252,6 +252,7 @@ impl Image {
             SymbolSource::PromotedCell { owner, seq, size } => self.promoted_cell(owner, seq, size),
             SymbolSource::Host(ref host) => host.host_addr().unwrap_or(0) as u64,
             SymbolSource::Word(word) => word,
+            SymbolSource::ThreadSlot(index) => self.thread_slot(index),
         }
     }
 

@@ -48,6 +48,7 @@ pub struct Image {
     vtable_map: Mutex<HashMap<Vec<lower::VtableEntry>, lower::VtableId>>,
     vtable_addrs: Mutex<Vec<u64>>,
     promoted_cells: Mutex<HashMap<(usize, u32), u64>>,
+    thread_slots: Mutex<HashMap<usize, u64>>,
     wanted: Mutex<Vec<Instance>>,
     bodies: lower::Bodies,
     jit_mode: bool,
@@ -198,6 +199,7 @@ impl Image {
             vtable_map: Mutex::default(),
             vtable_addrs: Mutex::default(),
             promoted_cells: Mutex::default(),
+            thread_slots: Mutex::default(),
             wanted: Mutex::default(),
             bodies: lower::Bodies::default(),
             jit_mode: false,
@@ -224,6 +226,13 @@ impl Image {
         let result = run(self, &mut pass);
         self.pass = pass;
         result
+    }
+
+    /// The dense number of the per-thread cell of the `#[thread_local]` static that reached function `index` initializes, given out in order of first use and kept for the life of the image.
+    fn thread_slot(&self, index: usize) -> u64 {
+        let mut slots = lock(&self.thread_slots);
+        let next = slots.len() as u64;
+        *slots.entry(index).or_insert(next)
     }
 
     fn slot(&self, index: usize) -> &AtomicUsize {
@@ -390,10 +399,10 @@ pub(crate) const FILLED: u8 = 1;
 const EMPTY: u8 = 0;
 const FILLING: u8 = 2;
 
-/// What the host keeps for each thread of the program: its cells of `#[thread_local]` statics by initializer, and the statics it is filling.
+/// What the host keeps for each thread of the program: its cells of `#[thread_local]` statics by thread slot, zero for one not made yet, and the statics it is filling.
 #[derive(Default)]
 struct ThreadState {
-    cells: rustc_hash::FxHashMap<usize, usize>,
+    cells: Vec<usize>,
     filling: Vec<usize>,
 }
 
@@ -434,17 +443,29 @@ pub(crate) extern "C" fn fill_once(flag: usize, code: usize) {
     }
 }
 
-/// The calling thread's cell of `size` zeroed bytes for the `#[thread_local]` static whose initializer is reached function `index`; cells are never freed, since the program's thread exit code may still read them.
-pub(crate) extern "C" fn thread_cell(index: usize, size: usize) -> usize {
-    *thread_state().cells.entry(index).or_insert_with(|| {
-        let layout = std::alloc::Layout::from_size_align(size.max(1), 64).unwrap_or_else(|_| std::alloc::Layout::new::<u8>());
-        // SAFETY: layout has a nonzero size.
-        let cell = unsafe { std::alloc::alloc_zeroed(layout) };
-        if cell.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        cell as usize
-    })
+/// The calling thread's cell of `size` zeroed bytes for the `#[thread_local]` static with thread slot `slot`; cells are never freed, since the program's thread exit code may still read them.
+pub(crate) extern "C" fn thread_cell(slot: usize, size: usize) -> usize {
+    let state = thread_state();
+    match state.cells.get(slot) {
+        Some(&cell) if cell != 0 => cell,
+        _ => new_cell(state, slot, size),
+    }
+}
+
+/// Makes the calling thread's cell of `size` zeroed bytes for thread slot `slot`.
+#[cold]
+fn new_cell(state: &mut ThreadState, slot: usize, size: usize) -> usize {
+    let layout = std::alloc::Layout::from_size_align(size.max(1), 64).unwrap_or_else(|_| std::alloc::Layout::new::<u8>());
+    // SAFETY: layout has a nonzero size.
+    let cell = unsafe { std::alloc::alloc_zeroed(layout) };
+    if cell.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    if state.cells.len() <= slot {
+        state.cells.resize(slot + 1, 0);
+    }
+    state.cells[slot] = cell as usize;
+    cell as usize
 }
 
 /// Forks a child that dumps no core when a signal ends it, runs `child` and exits with the status it returns; returns the child's pid.

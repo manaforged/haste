@@ -80,6 +80,7 @@ pub trait Slots {
             SymbolSource::PromotedCell { size, .. } => self.zeroed(size as usize) as u64,
             SymbolSource::Host(ref host) => host.host_addr().unwrap_or(0) as u64,
             SymbolSource::Word(word) => word,
+            SymbolSource::ThreadSlot(index) => index as u64,
             SymbolSource::Vtable(_) | SymbolSource::Rodata(_) => 0,
         }
     }
