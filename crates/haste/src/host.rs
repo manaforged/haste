@@ -1,6 +1,8 @@
 //! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hints as no-ops, the AArch64 barriers as one full barrier, `xgetbv` as no extended state enabled, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
 
 mod math;
+pub mod native;
+mod syscall;
 
 pub use math::{MathSymbol, symbol as intrinsic};
 
@@ -21,6 +23,7 @@ pub enum HostSymbol {
     Abort,
     FillOnce,
     ThreadCell,
+    Syscall,
     Math(MathSymbol),
     Dynamic(Box<str>),
 }
@@ -31,6 +34,7 @@ const DIRECT: &[HostSymbol] = &[
     HostSymbol::Dealloc,
     HostSymbol::Realloc,
     HostSymbol::DsoHandle,
+    HostSymbol::Syscall,
 ];
 
 impl HostSymbol {
@@ -68,6 +72,7 @@ impl HostSymbol {
             Self::Abort => "abort",
             Self::FillOnce => "__haste_fill_once",
             Self::ThreadCell => "__haste_thread_cell",
+            Self::Syscall => "__haste_syscall",
             Self::Math(math) => math.link_name(),
             Self::Dynamic(name) => name,
         }
@@ -87,6 +92,7 @@ impl HostSymbol {
             Self::Abort => abort as *const () as usize,
             Self::FillOnce => crate::image::fill_once as *const () as usize,
             Self::ThreadCell => crate::image::thread_cell as *const () as usize,
+            Self::Syscall => syscall::run as *const () as usize,
             Self::Math(math) => math.host_addr(),
             Self::Dynamic(_) => return dynamic(self.link_name()),
         })
@@ -97,6 +103,9 @@ impl HostSymbol {
 static DSO_HANDLE: u8 = 0;
 
 fn dynamic(name: &str) -> Option<usize> {
+    if let Some(address) = native::symbol(name) {
+        return Some(address);
+    }
     let name = CString::new(name).ok()?;
     // SAFETY: name is a NUL-terminated string that lives across the call.
     let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };

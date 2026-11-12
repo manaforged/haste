@@ -215,6 +215,16 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// Whether code in module `from` may name the inherent member `item`, as the member's visibility allows.
+    pub fn member_visible(&mut self, item: ItemRef, from: ModRef) -> Result<bool> {
+        let vis = self.item(item).1.vis;
+        if vis == crate::outline::item::Vis::Pub {
+            return Ok(true);
+        }
+        let home = self.module_of(item)?;
+        Ok(crate::names::resolve::visible(&self.paths(from.krate), vis, home, from))
+    }
+
     /// The inherent impls of types with head `head`, asking for every module of the crates that may hold one.
     pub fn inherent(&mut self, head: Head) -> Vec<ImplRef> {
         let standard = self.primitive_holders();

@@ -1,3 +1,4 @@
+use crate::body::cursor::punct_in;
 use crate::names::ItemRef;
 use crate::outline::item::Attr;
 use crate::outline::source::{Source, Tokens};
@@ -112,21 +113,111 @@ pub fn assert(src: &Source, args: &[(u32, u32)], krate: u32, out: &mut Tokens) {
     out.lexed("}");
 }
 
+/// The registers that carry a Linux system call's number and its six arguments on x86-64, in the order the host's system call entry takes them.
+const SYSCALL_REGISTERS: [&str; 7] = ["rax", "rdi", "rsi", "rdx", "r10", "r8", "r9"];
+
+/// The registers that the `syscall` instruction overwrites.
+const SYSCALL_CLOBBERS: [&str; 2] = ["rcx", "r11"];
+
+/// The expansion of an `asm!`: an optimization barrier when its templates hold no instruction, and a call of the host's system call entry when they hold one `syscall`.
+pub fn asm(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
+    let mut instructions = String::new();
+    for &(from, to) in args.iter().filter(|(from, to)| *to == from + 1) {
+        if let Some(template) = src.literal_text(from)? {
+            instructions.push_str(&strip_comments(&template));
+            instructions.push('\n');
+        }
+    }
+    match instructions.trim() {
+        "" => asm_barrier(src, args, out),
+        "syscall" => asm_syscall(src, args, out),
+        _ => bail!("inline assembly with instructions other than one `syscall` is not supported"),
+    }
+}
+
 /// The expansion of an `asm!` whose templates hold only comments and placeholders and whose operands only read or keep their places: an optimization barrier with no effect.
-pub fn asm_barrier(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
+fn asm_barrier(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
     for &(from, to) in args {
         match src.literal_text(from)? {
-            Some(template) if to == from + 1 => {
-                if !strip_comments(&template).chars().all(|c| c.is_whitespace()) {
-                    bail!("inline assembly with instructions is not supported");
-                }
-            }
-            _ if matches!(src.text(from), "in" | "inout") && !(from..to).any(|at| src.text(at) == "=>") => {}
+            Some(_) if to == from + 1 => {}
+            _ if matches!(src.text(from), "in" | "inout") && !(from..to).any(|at| punct_in(src, (at, to), "=>")) => {}
             _ if src.text(from) == "options" => {}
             _ => bail!("inline assembly operand `{}` is not supported", src.spelled((from, to))),
         }
     }
     out.lexed("()");
+    Ok(())
+}
+
+/// One register operand of an `asm!`: its register, the expression it reads and the place it writes.
+struct Operand {
+    register: String,
+    input: Option<(u32, u32)>,
+    output: Option<(u32, u32)>,
+}
+
+/// The operand `in`, `out`, `lateout`, `inout` or `inlateout` that spans `from` to `to`, a `_` place writing nowhere.
+fn operand(src: &Source, (from, to): (u32, u32)) -> Result<Operand> {
+    let open = from + 1;
+    let register = src.literal_text(open + 1)?.filter(|_| src.text(open) == "(").ok_or_else(|| anyhow::anyhow!("inline assembly operand `{}` names no register", src.spelled((from, to))))?;
+    let rest = (src.pair(open) + 1, to);
+    let mut arrow = None;
+    let mut at = rest.0;
+    while at < rest.1 && arrow.is_none() {
+        arrow = punct_in(src, (at, rest.1), "=>").then_some(at);
+        at = if matches!(src.text(at), "(" | "[" | "{") { src.pair(at) + 1 } else { at + 1 };
+    }
+    let place = |(from, to): (u32, u32)| (src.text(from) != "_" || to != from + 1).then_some((from, to));
+    let (input, output) = match (src.text(from), arrow) {
+        ("in", None) => (Some(rest), None),
+        ("out" | "lateout", None) => (None, place(rest)),
+        ("inout" | "inlateout", None) => (Some(rest), Some(rest)),
+        ("inout" | "inlateout", Some(arrow)) => (Some((rest.0, arrow)), place((arrow + 2, rest.1))),
+        _ => bail!("inline assembly operand `{}` is not supported", src.spelled((from, to))),
+    };
+    Ok(Operand { register, input, output })
+}
+
+/// The expansion of an `asm!` that runs one `syscall` with its operands in the x86-64 Linux system call registers: a call of the host's system call entry, whose result the `rax` output takes.
+fn asm_syscall(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
+    let mut inputs: [Option<(u32, u32)>; 7] = [None; 7];
+    let (mut output, mut diverges) = (None, false);
+    for &(from, to) in args.iter().filter(|(from, to)| *to != from + 1) {
+        if src.text(from) == "options" {
+            diverges = (from..to).any(|at| src.text(at) == "noreturn");
+            continue;
+        }
+        let operand = operand(src, (from, to))?;
+        let slot = SYSCALL_REGISTERS.iter().position(|register| *register == operand.register);
+        match (slot, operand.output) {
+            (Some(0), written) => output = written,
+            (_, Some(_)) => bail!("a `syscall` writes only `rax`, not `{}`", operand.register),
+            (None, None) if SYSCALL_CLOBBERS.contains(&operand.register.as_str()) && operand.input.is_none() => {}
+            (None, None) => bail!("a `syscall` reads no `{}`", operand.register),
+            (Some(_), None) => {}
+        }
+        if let Some(slot) = slot {
+            inputs[slot] = operand.input;
+        }
+    }
+    let entry = crate::host::HostSymbol::Syscall.link_name();
+    out.lexed(&format!("{{ extern \"C\" {{ fn {entry}(words: &[usize; 7]) -> usize; }} let __haste_words: [usize; 7] = ["));
+    for input in inputs {
+        match input {
+            Some((from, to)) => {
+                out.lexed("::core::mem::transmute::<_, usize>(");
+                out.copy_range(src, from, to);
+                out.lexed("),");
+            }
+            None => out.lexed("0,"),
+        }
+    }
+    out.lexed(&format!("]; let __haste_ret = {entry}(&__haste_words);"));
+    if let Some((from, to)) = output {
+        out.copy_range(src, from, to);
+        out.lexed(" = ::core::mem::transmute(__haste_ret);");
+    }
+    out.lexed(if diverges { "::core::hint::unreachable_unchecked() }" } else { "}" });
     Ok(())
 }
 

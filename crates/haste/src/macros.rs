@@ -48,6 +48,7 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
     if !errors.is_empty() {
         anyhow::bail!("{}", errors.join("\n"));
     }
+    load_native(&compilation.outline);
     Ok(compilation)
 }
 
@@ -61,7 +62,15 @@ pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<Compilation
     let mut compilation = Compilation::new(workspace, outline);
     members.iter().for_each(|krate| compilation.names.crates[*krate].eager = true);
     resolve(&mut compilation)?;
+    load_native(&compilation.outline);
     Ok(compilation)
+}
+
+/// Loads the native libraries that the crates' build scripts link, so the foreign functions they declare resolve; a library that does not load leaves those functions unresolved.
+fn load_native(outline: &crate::outline::Outline) {
+    if let Err(error) = crate::host::native::load(outline) {
+        eprintln!("haste: cannot load the native libraries that build scripts link: {error:#}");
+    }
 }
 
 /// Reaches from the instances `roots` gives, answering what each pass asks for until a pass settles or nothing new can load, then hands that pass's context and what it reached to `finish`.

@@ -231,7 +231,7 @@ fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     }
 }
 
-const USAGE: &str = "usage: haste [--jobs N] [--release] [--stats-json PATH] build|test|run|serve|prep PATH [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand PATH [CRATE]";
+const USAGE: &str = "usage: haste [--jobs N] [--release] [--stats-json PATH] build|test|run|serve|prep PATH [--] [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand PATH [CRATE]";
 
 /// What the command line asks for.
 #[derive(Clone, Copy)]
@@ -330,6 +330,10 @@ fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>)
     }
     let path = PathBuf::from(args.next().context(USAGE)?);
     let rest: Vec<String> = args.collect();
+    let rest = match rest.split_first() {
+        Some((first, tail)) if first == "--" => tail.to_vec(),
+        _ => rest,
+    };
     Ok((command, path, rest, stats_json))
 }
 

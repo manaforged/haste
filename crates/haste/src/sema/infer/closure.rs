@@ -72,19 +72,11 @@ impl<'a> Infer<'_, 'a> {
         let hint = expected.and_then(|ty| self.expected_sig(ty)).filter(|(inputs, _)| inputs.len() == self.body.list(params).len());
         let depth = self.scopes.len();
         self.uses.push(Captures { first: self.out.locals.len() as u32, ..Captures::default() });
-        let ret = match (ret, &hint) {
-            (Some(ty), _) => self.lower_ty(self.body, ty)?,
-            (None, Some((_, output))) => *output,
-            (None, None) => self.fresh(Kind::Var),
-        };
+        let ret = self.closure_part(ret, hint.as_ref().map(|(_, output)| *output))?;
         let mut locals = Vec::new();
         for (index, &at) in self.body.list(params).iter().enumerate() {
             let Param { pat, ty } = self.body.params[at as usize];
-            let ty = match (ty, &hint) {
-                (Some(ty), _) => self.lower_ty(self.body, ty)?,
-                (None, Some((inputs, _))) => inputs[index],
-                (None, None) => self.fresh(Kind::Var),
-            };
+            let ty = self.closure_part(ty, hint.as_ref().map(|(inputs, _)| inputs[index]))?;
             let arena = self.body;
             locals.push(self.param_pat(arena, pat, ty, Some(pat))?);
         }
@@ -110,6 +102,16 @@ impl<'a> Infer<'_, 'a> {
         found?;
         self.record_closure(expr, uses, (Vec::new(), ret, expr, true), (by_move, forced))?;
         Ok(self.cx.types.intern(Kind::Closure(parent, substs, expr.0)))
+    }
+
+    /// The type of a closure parameter or return: its annotation, made the same as the expected `hinted` where the two agree, else `hinted`, else a fresh variable.
+    fn closure_part(&mut self, annotated: Option<TyId>, hinted: Option<Ty>) -> Result<Ty> {
+        let Some(annotated) = annotated else { return Ok(hinted.unwrap_or_else(|| self.fresh(Kind::Var))) };
+        let ty = self.lower_ty(self.body, annotated)?;
+        if let Some(hinted) = hinted {
+            self.unifies(ty, hinted);
+        }
+        Ok(ty)
     }
 
     fn record_closure(&mut self, expr: ExprId, uses: Captures, (params, ret, body, coroutine): (Vec<u32>, Ty, ExprId, bool), (by_move, forced): (bool, &[u32])) -> Result<()> {

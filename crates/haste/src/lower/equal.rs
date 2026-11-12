@@ -12,8 +12,10 @@ impl Lower<'_, '_> {
     /// Whether the values `x` and `y` of `ty` are equal part by part, the way a literal or constant pattern compares them, as an 8-bit flag.
     pub(super) fn equal(&mut self, ty: Ty, x: Value, y: Value) -> Result<Value> {
         let kind = self.cx.types.kind(ty).clone();
-        if let Kind::Ref(_, inner) = kind {
-            return self.equal_pointee(inner, x, y);
+        match kind {
+            Kind::Ref(_, inner) => return self.equal_pointee(inner, x, y),
+            Kind::Pat(base, ..) => return self.equal(base, x, y),
+            _ => {}
         }
         match repr(self.cx, ty)? {
             Repr::Zst => Ok(self.ins().iconst(Type::I8, 1)),
@@ -35,9 +37,10 @@ impl Lower<'_, '_> {
                 let slice = self.cx.types.substs(args).to_vec();
                 match &field_types(self.cx, item, &slice)?[..] {
                     [fields] => fields.clone(),
-                    _ => bail!("a pattern constant of an enum is not compared yet"),
+                    variants => return self.equal_enum(ty, variants, (x, y)),
                 }
             }
+            Kind::Ptr(..) => return self.equal_words(ty, x, y),
             other => bail!("a pattern value of {other:?} is not compared yet"),
         };
         let whole = repr(self.cx, ty)?;
@@ -49,6 +52,46 @@ impl Lower<'_, '_> {
                 continue;
             };
             let same = self.equal(field, left, right)?;
+            all = self.ins().band(all, same);
+        }
+        Ok(all)
+    }
+
+    /// Whether the enum values at `x` and `y` of `ty`, whose variants hold the fields `variants`, hold the same variant with equal fields.
+    fn equal_enum(&mut self, ty: Ty, variants: &[Vec<Ty>], (x, y): (Value, Value)) -> Result<Value> {
+        let whole = repr(self.cx, ty)?;
+        let at = |base| Place { base: Base::Addr(base), offset: 0, repr: whole };
+        let (left, right) = (self.discriminant_value(at(x), ty)?, self.discriminant_value(at(y), ty)?);
+        let same = self.ins().icmp(IntCC::Equal, left, right);
+        let all = self.b.create_stack_slot(1, 0);
+        self.ins().stack_store(same, all, 0);
+        for (variant, fields) in variants.iter().enumerate().filter(|(_, fields)| !fields.is_empty()) {
+            let Some(holds) = self.is_variant(Some(at(x)), ty, variant as u32)? else { continue };
+            let (compare, next) = (self.b.create_block(), self.b.create_block());
+            let both = self.ins().band(holds, same);
+            self.brif(both, (compare, &[]), (next, &[]));
+            self.enter(compare);
+            let mut equal = self.ins().iconst(Type::I8, 1);
+            for (index, &field) in fields.iter().enumerate() {
+                let (left, right) = (self.variant_field(at(x), ty, (variant as u32, index as u32))?, self.variant_field(at(y), ty, (variant as u32, index as u32))?);
+                let (Some(left), Some(right)) = (self.read(left), self.read(right)) else { continue };
+                let same_field = self.equal(field, left, right)?;
+                equal = self.ins().band(equal, same_field);
+            }
+            self.ins().stack_store(equal, all, 0);
+            self.jump(next, &[]);
+            self.enter(next);
+        }
+        Ok(self.ins().stack_load(Type::I8, all, 0))
+    }
+
+    /// Whether the values at `x` and `y` of `ty`, a wide raw pointer, hold the same address and metadata.
+    fn equal_words(&mut self, ty: Ty, x: Value, y: Value) -> Result<Value> {
+        let size = self.cx.layout(ty)?.size.bytes() as i32;
+        let mut all = self.ins().iconst(Type::I8, 1);
+        for offset in (0..size).step_by(8) {
+            let (left, right) = (self.ins().load(Type::I64, x, offset), self.ins().load(Type::I64, y, offset));
+            let same = self.ins().icmp(IntCC::Equal, left, right);
             all = self.ins().band(all, same);
         }
         Ok(all)

@@ -340,7 +340,7 @@ impl Writer {
             Builtin::ModulePath => out.lexed(&format!("{:?}", cx.outline.module_path(self.home))),
             Builtin::CfgSelect => return self.cfg_select(cx, run, open, out),
             Builtin::Assert => builtin::assert(src, &src.args(open), site.krate, out),
-            Builtin::Asm => builtin::asm_barrier(src, &src.args(open), out)?,
+            Builtin::Asm => builtin::asm(src, &src.args(open), out)?,
             Builtin::Panic | Builtin::Unreachable => self.panic(cx, run, site, out),
         }
         Ok(true)

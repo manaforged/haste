@@ -73,6 +73,14 @@ impl<'a> Context<'a> {
         self.attr_value(item, "lang")
     }
 
+    /// The symbol that the foreign `item` links to: its `#[link_name]` with escapes read and without the leading `\u{1}` that asks for the name verbatim, else its own name.
+    pub fn symbol_name(&self, item: ItemRef) -> Option<String> {
+        let (src, entry) = self.item(item);
+        let Some(at) = self.attr_at(item, "link_name") else { return entry.name.map(|at| src.text(at).to_owned()) };
+        let text = src.literal_text(at + 2).ok().flatten()?;
+        Some(text.strip_prefix('\u{1}').map(str::to_owned).unwrap_or(text))
+    }
+
     /// The value of the name-value attribute `#[key = "..."]` on `item`, written directly or through a `cfg_attr` that holds.
     pub fn attr_value(&self, item: ItemRef, key: &str) -> Option<&'a str> {
         let at = self.attr_at(item, key)?;

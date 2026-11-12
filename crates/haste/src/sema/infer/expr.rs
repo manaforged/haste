@@ -375,7 +375,14 @@ impl Infer<'_, '_> {
         match op {
             Some(bin) if !self.builtin_compound(bin, place) => self.overloaded_assign(expr, bin, (place, rhs))?,
             Some(BinOp::Shl | BinOp::Shr) => drop(self.expr(rhs, None)?),
-            _ => {
+            Some(bin) => {
+                let value = self.expr(rhs, Some(place))?;
+                match self.cx.types.kind(self.resolve(value)) {
+                    Kind::Ref(..) | Kind::Adt(..) => self.assign_impl(expr, bin, (place, value))?,
+                    _ => self.coerce_expr(rhs, value, place)?,
+                }
+            }
+            None => {
                 let value = self.expr(rhs, Some(place))?;
                 self.coerce_expr(rhs, value, place)?;
             }
@@ -385,14 +392,19 @@ impl Infer<'_, '_> {
 
     /// Types `place op= rhs` through the operator's assign trait, coercing `rhs` to the right operand type when one impl fixes it, as rustc does.
     fn overloaded_assign(&mut self, expr: ExprId, op: BinOp, (place, rhs): (Ty, ExprId)) -> Result<()> {
-        let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
-        let (lang, name) = (format!("{lang}_assign"), format!("{name}_assign"));
+        let (lang, _) = assign_trait(op)?;
         let right = self.cx.lang_item(&lang).and_then(|of| self.only_right(of, place));
         let found = self.expr(rhs, right)?;
         let value = match right {
             Some(want) => self.coerce_expr(rhs, found, want).map(|()| want)?,
             None => found,
         };
+        self.assign_impl(expr, op, (place, value))
+    }
+
+    /// Types `place op= value` through the impl of the operator's assign trait for `place` and `value`.
+    fn assign_impl(&mut self, expr: ExprId, op: BinOp, (place, value): (Ty, Ty)) -> Result<()> {
+        let (lang, name) = assign_trait(op)?;
         let Some((of, method)) = self.operator_impl((&lang, &name), place, &[value])? else { bail!("unsupported compound assignment on {}", self.show(place)) };
         if self.has_vars(value) {
             self.obligations.push((of, vec![place, value]));
@@ -531,7 +543,7 @@ impl Infer<'_, '_> {
         let then_ty = self.expr(then, expected)?;
         self.scopes.truncate(depth);
         let then_diverges = std::mem::replace(&mut self.diverges, false);
-        let hint = Some(then_ty).filter(|&ty| !self.is_never(ty));
+        let hint = Some(then_ty).filter(|&ty| !self.is_never(ty) && !matches!(self.cx.types.kind(self.resolve(ty)), Kind::FnDef(..)));
         let else_ty = self.expr(otherwise, expected.or(hint))?;
         self.diverges = before || (then_diverges && self.diverges);
         let target = match self.known(expected) {
@@ -605,17 +617,17 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// The function pointer type both branches reify to, when they are two different function items, as rustc's common type of two branches does.
+    /// The function pointer type both branches reify to, when they are two different function items or a function item and a function pointer, as rustc's common type of two branches does.
     fn fn_branch(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
-        let (a, b) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
-        let (Kind::FnDef(item, substs), Kind::FnDef(..)) = (&a, &b) else {
-            return Ok(None);
+        let (a_kind, b_kind) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
+        let (item, substs) = match (&a_kind, &b_kind) {
+            (Kind::FnDef(..), Kind::FnPtr(..)) => return Ok(Some(b)),
+            (Kind::FnPtr(..), Kind::FnDef(..)) => return Ok(Some(a)),
+            (Kind::FnDef(item, substs), Kind::FnDef(..)) if a_kind != b_kind => (*item, *substs),
+            _ => return Ok(None),
         };
-        if a == b {
-            return Ok(None);
-        }
-        let slice = self.cx.types.substs(*substs).to_vec();
-        let (params, ret) = self.fn_types(*item, &slice)?;
+        let slice = self.cx.types.substs(substs).to_vec();
+        let (params, ret) = self.fn_types(item, &slice)?;
         Ok(Some(self.cx.types.fn_ptr(&params, ret)))
     }
 
@@ -746,4 +758,10 @@ const OPERATORS: [(BinOp, &str, &str); 16] = [
 /// The lang item of the trait that overloads `op`, and its method.
 fn operator_trait(op: BinOp) -> Option<(&'static str, &'static str)> {
     OPERATORS.iter().find(|(each, ..)| *each == op).map(|&(_, lang, name)| (lang, name))
+}
+
+/// The lang item of the trait that overloads `op=`, and its method.
+fn assign_trait(op: BinOp) -> Result<(String, String)> {
+    let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
+    Ok((format!("{lang}_assign"), format!("{name}_assign")))
 }

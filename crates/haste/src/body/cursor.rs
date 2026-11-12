@@ -80,8 +80,7 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn punct_at(&self, at: u32, text: &str) -> bool {
-        let last = at + text.len() as u32 - 1;
-        last < self.end && text.bytes().zip(at..).all(|(byte, here)| Some(self.src.kind(here)) == punct_kind(byte) && (here == last || self.src.joint(here)))
+        punct_in(self.src, (at, self.end), text)
     }
 
     pub fn punct(&self, text: &str) -> bool {
@@ -271,6 +270,12 @@ const PUNCT_KINDS: [Option<TokenKind>; 128] = {
     }
     table
 };
+
+/// Whether the joined punctuation tokens of `src` from `at` spell `text` and end before `end`.
+pub(crate) fn punct_in(src: &Source, (at, end): (u32, u32), text: &str) -> bool {
+    let last = at + text.len() as u32 - 1;
+    last < end && text.bytes().zip(at..).all(|(byte, here)| Some(src.kind(here)) == punct_kind(byte) && (here == last || src.joint(here)))
+}
 
 fn punct_kind(byte: u8) -> Option<TokenKind> {
     PUNCT_KINDS.get(byte as usize).copied().flatten()

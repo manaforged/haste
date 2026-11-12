@@ -31,6 +31,18 @@ enum Directive {
     Other,
 }
 
+/// How a build script asks for a library to be linked: whole from its static archive, through the dynamic linker, or as an Apple framework.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LinkKind {
+    Static,
+    Dynamic,
+    Framework,
+}
+
+const LINK_KINDS: [(&str, LinkKind); 3] = [("static", LinkKind::Static), ("dylib", LinkKind::Dynamic), ("framework", LinkKind::Framework)];
+
+const SEARCH_KINDS: [&str; 5] = ["native", "all", "crate", "dependency", "framework"];
+
 const DIRECTIVES: [(&str, Directive); 19] = [
     ("rustc-cfg", Directive::Cfg),
     ("rustc-env", Directive::Env),
@@ -93,6 +105,25 @@ impl Output {
             Directive::Other => {}
         }
     }
+
+    /// Each `rustc-link-lib` library as its kind and name, without modifiers or a new name; a library without a kind links dynamically.
+    pub fn link_libs(&self) -> impl Iterator<Item = (LinkKind, &str)> {
+        self.libs.iter().map(|spec| {
+            let (kind, name) = spec.split_once('=').map_or((LinkKind::Dynamic, spec.as_str()), |(kind, name)| {
+                let kind = kind.split_once(':').map_or(kind, |(kind, _)| kind);
+                (LINK_KINDS.iter().find(|(known, _)| *known == kind).map_or(LinkKind::Dynamic, |(_, kind)| *kind), name)
+            });
+            (kind, name.split_once(':').map_or(name, |(name, _)| name))
+        })
+    }
+
+    /// The directory of each `rustc-link-search` line, without its kind.
+    pub fn search_dirs(&self) -> impl Iterator<Item = &str> {
+        self.search.iter().map(|spec| match spec.split_once('=') {
+            Some((kind, dir)) if SEARCH_KINDS.contains(&kind) => dir,
+            _ => spec.as_str(),
+        })
+    }
 }
 
 fn out_dir(workspace: &Workspace, unit: usize) -> String {
@@ -132,7 +163,6 @@ pub fn script_vars(workspace: &Workspace, targets: &Targets, unit: usize, metada
     let entry = &workspace.graph.units[unit];
     let manifest = &workspace.packages[entry.package].manifest;
     let target = targets.of(entry.side);
-    let tool = |name: &str| std::env::var(name).unwrap_or_else(|_| name.to_lowercase());
     let mut vars = package_vars(workspace, unit);
     vars.extend(entry.features.iter().map(|feature| (format!("CARGO_FEATURE_{}", upper(feature)), "1".to_owned())));
     vars.extend(cfg_vars(target));
@@ -158,6 +188,11 @@ pub fn script_vars(workspace: &Workspace, targets: &Targets, unit: usize, metada
 /// `DEP_<LINKS>_<KEY>` for each metadata pair that the script of a dependency with `links` printed.
 pub fn dep_vars(links: &str, output: &Output) -> Vec<(String, String)> {
     output.metadata.iter().map(|(key, value)| (format!("DEP_{}_{}", upper(links), upper(key)), value.clone())).collect()
+}
+
+/// The program that the variable `name` names, else the program named as the variable in lower case, as Cargo finds `CC` or `RUSTC`.
+pub fn tool(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| name.to_lowercase())
 }
 
 fn upper(name: &str) -> String {

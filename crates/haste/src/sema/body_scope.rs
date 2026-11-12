@@ -221,7 +221,11 @@ impl<'a> Context<'a> {
             (Some(_), Some((&leaf, head)), _) => (head, leaf),
             (None, Some(_), None) => {
                 let path = NamePath { segments, absolute, dollar };
-                let def = self.local_path(home, Some((root, from)), &path, Ns::Types).and_then(|found| self.body_binding(Some(found), "").map(|binding| binding.def)).or_else(|| paths.resolve(&path, home))?;
+                let def = match self.local_path(home, Some((root, from)), &path, Ns::Types) {
+                    Some(BodyPath::Outside(skip)) if skip == segments.len() => Some(Def::Module(home)),
+                    Some(BodyPath::Outside(skip)) => paths.resolve(&outside(&path, skip), home),
+                    found => self.body_binding(found, "").map(|binding| binding.def).or_else(|| paths.resolve(&path, home)),
+                }?;
                 return Some((false, PerNs { types: Some(Binding { def, vis: Vis::Pub, origin: Origin::Glob }), values: None, macros: None }));
             }
             _ => return None,
@@ -286,7 +290,7 @@ impl<'a> Context<'a> {
     }
 }
 
-/// Whether the `use` declaration `import` of a body's expansion `file` is in scope at token `here`, or in the body itself when `here` is none: it is unless a function declared in the body holds it and not `here`.
+/// Whether the `use` declaration `import` of a body's expansion `file` is in scope at token `here`, or in the body itself when `here` is none: it is unless a function or module declared in the body holds it and not `here`.
 fn import_visible(file: &File, index: &Index, import: u32, here: Option<u32>) -> bool {
     index.holders[import as usize].iter().all(|&at| here.is_some_and(|here| holds(&file.items.items[at as usize], here)))
 }
@@ -307,14 +311,14 @@ fn index_of(file: &File, symbols: &Symbols) -> Index {
             index.items.entry(level).or_default().entry(plain(src.text(name)).into()).or_default().push(at as u32);
         }
     }
-    let fns: Vec<u32> = (0..items.len() as u32).filter(|&at| items[at as usize].kind == ItemKind::Fn).collect();
+    let scopes: Vec<u32> = (0..items.len() as u32).filter(|&at| matches!(items[at as usize].kind, ItemKind::Fn | ItemKind::Mod)).collect();
     for import in 0..file.items.imports.len() as u32 {
         match import_parts(file, import, symbols).3 {
             Some(name) => index.imports.entry(symbols.text(name).into()).or_default().push(import),
             None => index.globs.push(import),
         }
         let start = items[file.items.imports[import as usize].item as usize].start;
-        index.holders.push(fns.iter().copied().filter(|&at| holds(&items[at as usize], start)).collect());
+        index.holders.push(scopes.iter().copied().filter(|&at| holds(&items[at as usize], start)).collect());
     }
     index
 }

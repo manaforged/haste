@@ -210,6 +210,9 @@ impl<'a> Infer<'_, 'a> {
             let Some(item) = self.cx.member(block, name) else {
                 continue;
             };
+            if !self.cx.member_visible(item, self.home)? {
+                continue;
+            }
             if let Some((kind, _)) = self.cx.signature(item)?.receiver {
                 found.push(Candidate { block, item, kind });
             }

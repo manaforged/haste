@@ -394,6 +394,9 @@ impl<'a> Infer<'_, 'a> {
             let Some(member) = self.cx.member(block, name) else {
                 continue;
             };
+            if !self.cx.member_visible(member, self.home)? {
+                continue;
+            }
             if let Some(args) = self.trial(|infer| Ok(infer.match_impl(block, ty)))? {
                 return Ok(Some((member, args)));
             }
