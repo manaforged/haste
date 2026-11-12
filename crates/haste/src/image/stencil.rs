@@ -282,7 +282,7 @@ impl Image {
         let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
         let code = haste_codegen::compile(out.func, &target()).map_err(|e| item_err(cx, item, e))?;
         let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
-        self.slot(index).store(exec, Ordering::Release);
+        self.publish(index, exec);
         pass.record_size(index, code.bytes().len() as u32, started.elapsed().as_nanos() as u64);
         Ok(())
     }
@@ -329,21 +329,21 @@ impl Image {
     fn reuse_cached(&self, (item, footprint): (ItemRef, FootprintId), index: usize, symbols: &[u64], pass: &mut Pass) -> Option<VerifyRecord> {
         let alias_key = (item, footprint, symbols.to_vec());
         if let Some(&(addr, is_dict)) = pass.stencils.aliases.get(&alias_key) {
-            self.slot(index).store(addr, Ordering::Release);
+            self.publish(index, addr);
             return self.cached_verify_record((item, footprint), addr, is_dict, pass);
         }
         let template = pass.stencils.templates.get(&(item, footprint)).cloned()?;
         match template {
             CachedTemplate::Stencil(code) => {
                 let exec = pass.memory.write_patched(&code, symbols).ok()?;
-                self.slot(index).store(exec, Ordering::Release);
+                self.publish(index, exec);
                 pass.record_size(index, code.bytes().len() as u32, 0);
                 pass.stencils.aliases.insert(alias_key, (exec, false));
                 Some(VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() })
             }
             CachedTemplate::Dict { body_exec, code } => {
                 let (stub_exec, stub_bytes) = self.emit_dict_stub(body_exec, symbols, None, pass).ok()?;
-                self.slot(index).store(stub_exec, Ordering::Release);
+                self.publish(index, stub_exec);
                 pass.record_size(index, stub_bytes.len() as u32, 0);
                 pass.stencils.aliases.insert(alias_key, (stub_exec, true));
                 Some(VerifyRecord::Dict { body_exec, stub_exec, stub_bytes, code })
@@ -427,9 +427,9 @@ impl Image {
     }
 
     fn store_instance(&self, inst: &DistinctInst, addr: usize) {
-        self.slot(inst.leader).store(addr, Ordering::Release);
+        self.publish(inst.leader, addr);
         for &follower in &inst.followers {
-            self.slot(follower).store(addr, Ordering::Release);
+            self.publish(follower, addr);
         }
     }
 

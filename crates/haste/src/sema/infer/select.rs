@@ -7,7 +7,7 @@ use crate::names::path::Path as NamePath;
 use crate::names::{Def, ItemRef, ModRef};
 use crate::outline::item::ItemKind;
 
-use super::super::impls::{ImplRef, head};
+use super::super::impls::{Head, ImplRef, head};
 use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty};
 use super::Infer;
@@ -652,7 +652,7 @@ impl<'a> Infer<'_, 'a> {
         self.cx.lang(of).is_some_and(|lang| BUILTIN.contains(&lang)) || self.cx.is_auto_trait(of)
     }
 
-    /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one, such as a struct that ends in a slice, is neither `Sized`, `Copy` nor `Clone`, and `&mut T` is neither `Copy` nor `Clone`.
+    /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one, such as a struct that ends in a slice, is neither `Sized`, `Copy` nor `Clone`, `&mut T` is neither `Copy` nor `Clone`, and `Unpin` follows the parts of the type.
     pub(in crate::sema) fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
         let Some(lang) = self.cx.lang(of) else { return true };
         let ty = self.resolve(ty);
@@ -662,18 +662,51 @@ impl<'a> Infer<'_, 'a> {
             Kind::Adt(..) | Kind::Tuple(..) | Kind::Param(_) | Kind::Proj(_) if SIZED_ONLY.contains(&lang) && self.poly.is_some() && self.has_params(ty) => self.poly_sized(ty),
             Kind::Adt(item, _) if SIZED_ONLY.contains(&lang) => !self.cx.foreign(*item) && !self.is_unsized(ty).unwrap_or(false),
             Kind::Tuple(_) | Kind::Array(..) if matches!(lang, "copy" | "clone") => self.parts_hold(of, ty),
+            _ if lang == "unpin" => self.unpin_holds(of, ty, &mut Vec::new()),
             _ => true,
         }
     }
 
     /// Whether `Copy` or `Clone`, as `of`, holds for every element of the tuple or array `ty`, as rustc's built-in impls require.
     fn parts_hold(&mut self, of: ItemRef, ty: Ty) -> bool {
-        let parts = match *self.cx.types.kind(ty) {
+        self.parts(ty).into_iter().all(|part| if self.compiler_decides(of, part) { self.compiler_holds(of, part) } else { self.select(of, part, &[]).is_ok_and(|picked| picked.is_some()) })
+    }
+
+    /// The types a value of the tuple, array, struct, enum or union `ty` holds inline: its elements or the fields of every variant.
+    fn parts(&mut self, ty: Ty) -> Vec<Ty> {
+        match self.cx.types.kind(ty).clone() {
             Kind::Tuple(items) => self.cx.types.substs(items).to_vec(),
             Kind::Array(inner, _) => vec![inner],
+            Kind::Adt(item, args) => {
+                let args = self.cx.types.substs(args).to_vec();
+                self.adt_fields(item, &args).map(|fields| fields.iter().flatten().copied().collect()).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether `Unpin`, as `of`, holds for `ty` as rustc's auto trait decides: never for a coroutine or a type with a negative impl, always for one with an impl, else when every part holds it; a type already in `seen` holds it, as auto trait cycles do.
+    fn unpin_holds(&mut self, of: ItemRef, ty: Ty, seen: &mut Vec<Ty>) -> bool {
+        let ty = self.resolve(ty);
+        if seen.contains(&ty) {
+            return true;
+        }
+        match *self.cx.types.kind(ty) {
+            Kind::Closure(..) => return self.coroutine_output(ty).is_none(),
+            Kind::Adt(item, _) => {
+                let holders = self.holders(of, ty, &[]);
+                if self.cx.negative_impl(of, Head::Adt(item), &holders) {
+                    return false;
+                }
+                if self.select(of, ty, &[]).is_ok_and(|picked| picked.is_some()) {
+                    return true;
+                }
+            }
+            Kind::Tuple(_) | Kind::Array(..) => {}
             _ => return true,
-        };
-        parts.into_iter().all(|part| if self.compiler_decides(of, part) { self.compiler_holds(of, part) } else { self.select(of, part, &[]).is_ok_and(|picked| picked.is_some()) })
+        }
+        seen.push(ty);
+        self.parts(ty).into_iter().all(|part| self.unpin_holds(of, part, seen))
     }
 
     /// Whether trait `of` is `Fn`, `FnMut` or `FnOnce`, which callables implement with no impl to select.

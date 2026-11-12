@@ -110,6 +110,7 @@ impl Asked {
 pub struct Index {
     inherent: HashMap<Head, Vec<ImplRef>>,
     traits: HashMap<ItemRef, Vec<(ImplRef, Option<Head>)>>,
+    negative: HashMap<ItemRef, Vec<Head>>,
     asked: Asked,
 }
 
@@ -267,6 +268,11 @@ impl<'a> Context<'a> {
         found
     }
 
+    /// Whether crates `holders` write a negative impl of trait `of` for a self type with head `head`.
+    pub fn negative_impl(&mut self, of: ItemRef, head: Head, holders: &[u32]) -> bool {
+        self.holders_with_body(holders, (Some(head), Some(of))).into_iter().any(|holder| self.index_of(holder).negative.get(&of).is_some_and(|heads| heads.contains(&head)))
+    }
+
     /// The trait that impl `block` implements, or none for an inherent impl.
     pub fn impl_trait(&mut self, block: ImplRef) -> Option<ItemRef> {
         if let Some(known) = self.store.lookups.impl_traits.get(&block) {
@@ -368,14 +374,17 @@ impl<'a> Context<'a> {
         let Ok(header) = self.impl_header(block) else {
             return;
         };
-        if header.negative {
-            return;
-        }
         let src = &self.impl_file(block).source;
         let Ok(home) = self.impl_module(block) else {
             return;
         };
         let head = if generic_self(src, &header) { None } else { self.syntax_head(src, &header.body, header.self_ty, (home, block.item())) };
+        if header.negative {
+            if let (Some(head), Some(of)) = (head, self.impl_trait(block)) {
+                index.negative.entry(of).or_default().push(head);
+            }
+            return;
+        }
         match (header.trait_ref.is_some(), head) {
             (false, Some(head)) => index.inherent.entry(head).or_default().push(block),
             (false, None) => {}

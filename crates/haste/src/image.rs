@@ -42,6 +42,7 @@ pub struct Image {
     state: Mutex<Arena>,
     tables: Mutex<HashMap<Vec<Word>, i64>>,
     fixups: Mutex<HashMap<usize, Vec<usize>>>,
+    registered: AtomicUsize,
     cells: Mutex<HashMap<usize, i64>>,
     rodata_map: Mutex<HashMap<(Vec<u8>, Vec<lower::RodataReloc>), lower::RodataId>>,
     rodata_addrs: Mutex<Vec<u64>>,
@@ -112,7 +113,10 @@ impl Slots for Image {
         let mut fixups = lock(&self.fixups);
         for (at, word) in words.iter().enumerate() {
             if let Word::Code(index) = *word {
-                fixups.entry(index).or_default().push(address as usize + at * 8);
+                let at = address as usize + at * 8;
+                fixups.entry(index).or_default().push(at);
+                self.registered.fetch_add(1, Ordering::SeqCst);
+                patch(&[at], self.slot(index).load(Ordering::SeqCst));
             }
         }
         tables.insert(words.to_vec(), address);
@@ -193,6 +197,7 @@ impl Image {
             state: Mutex::new(state),
             tables: Mutex::default(),
             fixups: Mutex::default(),
+            registered: AtomicUsize::new(0),
             cells: Mutex::default(),
             rodata_map: Mutex::default(),
             rodata_addrs: Mutex::default(),
@@ -305,7 +310,10 @@ impl Image {
 
     /// Points slot `index` at `code` and rewrites every constant table word that names it, so neither a call through the slot nor one through a table reaches its stub again.
     fn publish(&self, index: usize, code: usize) {
-        self.slot(index).store(code, Ordering::Release);
+        self.slot(index).store(code, Ordering::SeqCst);
+        if self.registered.load(Ordering::SeqCst) == 0 {
+            return;
+        }
         if let Some(addresses) = lock(&self.fixups).get(&index) {
             patch(addresses, code);
         }
