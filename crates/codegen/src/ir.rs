@@ -195,7 +195,7 @@ pub enum AtomicRmwOp {
     Smax,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub(crate) enum Unary {
     Ineg,
@@ -213,7 +213,7 @@ pub(crate) enum Unary {
     Trunc,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub(crate) enum Binary {
     Iadd,
@@ -243,7 +243,7 @@ pub(crate) enum Binary {
     Fcopysign,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub(crate) enum Convert {
     Uextend,

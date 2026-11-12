@@ -161,6 +161,11 @@ impl Emit<'_> {
             self.xmm_store(ty, to, source);
             return;
         }
+        let size = Size::of(ty.bytes());
+        if let Some(imm) = self.const_of(value).and_then(|imm| if ty.bytes() < 8 { Some(imm as i32) } else { i32::try_from(imm).ok() }) {
+            self.asm.store_imm_sized(size, to, imm);
+            return;
+        }
         let source = self.reg_of(value).unwrap_or(Reg::Rax);
         self.raw(source, value);
         if ty == Type::I128 {
@@ -169,7 +174,7 @@ impl Emit<'_> {
             self.asm.store(Size::Q, to.offset(8), Reg::Rax);
             return;
         }
-        self.asm.store(Size::of(ty.bytes()), to, source);
+        self.asm.store(size, to, source);
     }
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {

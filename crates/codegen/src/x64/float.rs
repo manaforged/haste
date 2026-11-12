@@ -119,9 +119,17 @@ impl Emit<'_> {
             other => return Err(format!("{other:?} of a float")),
         };
         let dst = self.fdst(result);
-        self.fget(dst, x);
-        let source = self.foperand(y);
-        self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, source);
+        match self.xmm_of(x).filter(|_| self.features.avx) {
+            Some(src) => {
+                let source = self.foperand(y);
+                self.asm.vex_scalar(scalar(ty), opcode, (dst, src), source);
+            }
+            None => {
+                self.fget(dst, x);
+                let source = self.foperand(y);
+                self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, source);
+            }
+        }
         self.fput(result, dst);
         Ok(())
     }

@@ -48,7 +48,8 @@ fn absorb(func: &mut Function, block: usize, next: usize, subst: &mut [Value]) {
     func.blocks[block].insts.extend(moved.insts);
 }
 
-fn rename(func: &mut Function, subst: &[Value]) {
+/// Replaces every operand by the value it stands for in `subst`.
+pub(crate) fn rename(func: &mut Function, subst: &[Value]) {
     for data in &mut func.insts {
         data.op.map_operands(|value| find(subst, value));
     }

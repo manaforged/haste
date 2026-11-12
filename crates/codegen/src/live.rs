@@ -1,15 +1,37 @@
 use crate::ir::{Block, Function, InstData, Op, Value};
 
-/// The blocks in the order the emitter lays them out: the entry, then every other block that has instructions.
+/// The blocks in the order the emitter lays them out: those reachable from the entry in reverse postorder, then every other block that has instructions.
 pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
-    let rest = (0..func.blocks.len() as u32).map(Block).filter(|block| *block != entry && !func.blocks[block.index()].insts.is_empty());
-    std::iter::once(entry).chain(rest).collect()
+    let mut order = crate::dom::reverse_postorder(func, entry);
+    let mut placed = vec![false; func.blocks.len()];
+    order.iter().for_each(|block| placed[block.index()] = true);
+    order.retain(|block| *block == entry || !func.blocks[block.index()].insts.is_empty());
+    order.extend((0..func.blocks.len() as u32).map(Block).filter(|block| !placed[block.index()] && !func.blocks[block.index()].insts.is_empty()));
+    order
 }
 
-/// The positions, in layout order, over which each wanted value is live, the positions of calls that can unwind into a handler, and the positions of every call.
+/// The most instructions a loop test may hold for a jump back to it to run a copy of it in place.
+const TEST_LIMIT: usize = 4;
+
+/// For each instruction, whether it is a jump back to an earlier short test that ends in a branch and calls nothing, which the emitter runs a copy of in place of the jump.
+pub(crate) fn copied_tests(func: &Function, order: &[Block]) -> Vec<bool> {
+    let rank = crate::dom::ranks(order, func.blocks.len());
+    let mut copied = vec![false; func.insts.len()];
+    for (at, &latch) in order.iter().enumerate() {
+        let Some(&last) = func.blocks[latch.index()].insts.last() else { continue };
+        let Op::Jump(head, _) = func.insts[last.index()].op else { continue };
+        let insts = &func.blocks[head.index()].insts;
+        let calls = insts.iter().any(|inst| matches!(func.insts[inst.index()].op, Op::Call { .. }));
+        copied[last.index()] = rank[head.index()] < at && insts.len() <= TEST_LIMIT && !calls && matches!(func.last(head), Some(Op::Brif(..)));
+    }
+    copied
+}
+
+/// The positions, in layout order, over which each wanted value is live and where it is defined, the positions of calls that can unwind into a handler, and the positions of every call.
 pub(crate) struct Live {
     pub span: Vec<Option<(u32, u32)>>,
+    pub defs: Vec<u32>,
     pub unwinds: Vec<u32>,
     pub calls: Vec<u32>,
 }
@@ -128,6 +150,7 @@ pub(crate) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
     let (dense, crossing) = crossing(func, wanted);
     let live_in = live_in(func, order, &dense, crossing.len());
     let mut span = vec![None; func.types.len()];
+    let mut defs = vec![0; func.types.len()];
     let (mut unwinds, mut calls) = (Vec::new(), Vec::new());
     let mut at = 0_u32;
     for &block in order {
@@ -143,7 +166,10 @@ pub(crate) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
                 }
             };
             data.op.for_operands(&mut mark);
-            results(data).for_each(mark);
+            results(data).for_each(|result| {
+                defs[result.index()] = at;
+                mark(result);
+            });
             if matches!(data.op, Op::TryCall { .. }) {
                 unwinds.push(at);
             }
@@ -156,7 +182,7 @@ pub(crate) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
         }
         at += 1;
     }
-    Live { span, unwinds, calls }
+    Live { span, defs, unwinds, calls }
 }
 
 /// The values an instruction defines: its result, or a call's results.

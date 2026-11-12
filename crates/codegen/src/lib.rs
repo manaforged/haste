@@ -4,6 +4,8 @@ mod alloc;
 mod builder;
 mod coroutine;
 mod copy;
+mod cse;
+mod dom;
 mod error;
 mod ir;
 mod memory;
@@ -15,6 +17,7 @@ mod native;
 mod probe;
 mod promote;
 mod reloc;
+mod returns;
 mod target;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
@@ -97,7 +100,7 @@ pub fn dict_entry_stub(arch: Arch, stub_exec: usize, body_exec: usize, dict_addr
     bytes.map_err(|message| Error::new(ErrorKind::Unsupported, message))
 }
 
-/// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks as `compile` does before encoding, and drops the dead entries of a body kept for copying.
+/// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
 pub fn simplify(func: &mut Function) {
     optimize(func);
     fold::compact(func);
@@ -107,6 +110,8 @@ fn optimize(func: &mut Function) {
     promote::run(func);
     fold::run(func);
     merge::run(func);
+    cse::run(func);
+    returns::run(func);
 }
 
 /// Encodes `func` for `target`.

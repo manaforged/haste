@@ -27,17 +27,19 @@ const REGS: Regs<Reg> = Regs {
     float: &float::POOL,
     float_branches: &float::BRANCHES,
     absolute_calls: true,
+    two_address: true,
 };
 
 /// Encodes `func` as x86-64 machine code.
 pub(crate) fn compile(func: &Function) -> Result<Code, String> {
     let order = crate::live::order(func);
     let abi = classify(&func.signature)?;
-    let plan = plan(func, &REGS, &order, &abi.params);
+    let plan = plan(func, &REGS, &order, &abi.params, classify);
     let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, classify)?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, features: Features::host() }.run(order)
+    let copied = crate::live::copied_tests(func, &order);
+    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, features: Features::host(), copied }.run(order)
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -89,6 +91,7 @@ pub(super) struct Emit<'a> {
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
     features: Features,
+    copied: Vec<bool>,
 }
 
 impl Emit<'_> {
@@ -105,6 +108,11 @@ impl Emit<'_> {
 
     fn block(&mut self, block: Block) -> Result<(), String> {
         self.asm.bind(self.blocks[block.index()]);
+        self.body(block)
+    }
+
+    /// Emits the instructions of `block`, at its label or as a copy in place of a jump to it.
+    fn body(&mut self, block: Block) -> Result<(), String> {
         self.flags = None;
         let func = self.func;
         let insts = &func.blocks[block.index()].insts;
@@ -212,6 +220,9 @@ impl Emit<'_> {
             Op::TryCall { sig, callee, args, normal, handler } => self.try_call(*sig, *callee, args, *normal, *handler),
             Op::Jump(block, args) => {
                 self.edge(*block, args)?;
+                if self.copied[inst.index()] {
+                    return self.body(*block);
+                }
                 self.goto(*block, true);
                 Ok(())
             }
