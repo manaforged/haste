@@ -119,9 +119,10 @@ pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
 
 /// The drop glue calls for every type that a local or an expression of `typed` holds and that needs drop.
 pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
+    let tables = typed.ensure_tables(&cx.types);
     let mut seen = rustc_hash::FxHashSet::default();
     let mut calls = Vec::new();
-    for ty in typed.locals.iter().map(|local| local.ty).chain(typed.exprs.iter().copied()) {
+    for ty in typed.locals.iter().map(|local| local.ty).chain(tables.exprs.iter().copied()) {
         if ty != Ty::NONE && seen.insert(ty) {
             calls.extend(glue_call(cx, ty)?);
         }
@@ -191,11 +192,25 @@ fn with_drop<T>(cx: &mut Context<'_>, run: impl FnOnce(&mut Infer<'_, '_>) -> Re
 
 /// Whether dropping a value of `ty` runs code.
 pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    match cx.types.kind(ty) {
+        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => return Ok(false),
+        Kind::Dyn(..) => return Ok(true),
+        _ => {}
+    }
+    if !cx.types.has_var_flag(ty)
+        && !cx.types.has_params(ty)
+        && let Some(known) = cx.store.lookups.drops.get(&ty)
+    {
+        return Ok(known);
+    }
     with_drop(cx, |infer| infer.needs_drop(ty))
 }
 
 /// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
 pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    if !matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)) {
+        return Ok(false);
+    }
     with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
 }
 

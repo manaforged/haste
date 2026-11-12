@@ -182,7 +182,7 @@ impl Lower<'_, '_> {
 
     fn test_const(&mut self, pat: PatId, place: Option<Place>, fail: Block) -> Result<()> {
         let Some(&Res::Fn(item, substs)) = self.typed.pat_res.get(&pat) else { return Ok(()) };
-        let Some(expected) = self.invoke(item, substs, Vec::new())? else { bail!("constant pattern with no value") };
+        let Some(expected) = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::PatRes(pat)), item, substs, Vec::new())? else { bail!("constant pattern with no value") };
         self.test_equal(pat, place, expected, fail)
     }
 

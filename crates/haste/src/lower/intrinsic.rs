@@ -9,12 +9,13 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
 use super::place::{Base, Place};
+use super::reloc::SiteOrigin;
 use super::stencil::{RodataReloc, RodataTarget, SymbolSource};
 use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
     /// Emits intrinsic `which` at type arguments `substs` on `args` inline.
-    pub fn intrinsic(&mut self, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    pub(super) fn intrinsic(&mut self, origin: &SiteOrigin, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         match which {
             Intrinsic::Transmute => self.transmute(substs, args),
             Intrinsic::FloatToInt => {
@@ -23,7 +24,7 @@ impl Lower<'_, '_> {
                 self.convert(value, from, to).map(Some)
             }
             Intrinsic::PtrMetadata => self.metadata(substs, args),
-            Intrinsic::ConstEvalSelect => self.const_eval_select(substs, args),
+            Intrinsic::ConstEvalSelect => self.const_eval_select(origin, substs, args),
             Intrinsic::WithOverflow(op) => self.with_overflow(op, substs, args).map(Some),
             Intrinsic::Simd(op) => self.simd(op, substs, args),
             Intrinsic::Trap => {
@@ -38,7 +39,7 @@ impl Lower<'_, '_> {
             Intrinsic::BytePermute(bytes) => self.byte_permute(args, bytes).map(Some),
             Intrinsic::BytePairMax => self.byte_pair_max(args).map(Some),
             Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
-            _ => self.memory_intrinsic(which, substs, args),
+            _ => self.memory_intrinsic(origin, which, substs, args),
         }
     }
 
@@ -131,7 +132,7 @@ impl Lower<'_, '_> {
         Ok(self.ins().stack_addr(Type::I64, slot, 0))
     }
 
-    fn const_eval_select(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    fn const_eval_select(&mut self, origin: &SiteOrigin, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&tuple), Some(&runtime)) = (substs.first(), substs.get(2)) else { bail!("const_eval_select takes four type arguments") };
         let (Kind::Tuple(fields), Kind::FnDef(item, fn_substs)) = (self.cx.types.kind(tuple).clone(), self.cx.types.kind(runtime).clone()) else { bail!("const_eval_select needs a tuple of arguments and a function item") };
         let fields = self.cx.types.substs(fields).to_vec();
@@ -143,7 +144,7 @@ impl Lower<'_, '_> {
                 values.extend(self.read(place));
             }
         }
-        self.invoke(item, fn_substs, values)
+        self.invoke(SiteOrigin::ConstEvalSelect(Box::new(origin.clone())), item, fn_substs, values)
     }
 
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {

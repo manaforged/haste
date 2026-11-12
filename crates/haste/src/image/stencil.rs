@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{Code, DictTierUp, Effort, Site, Target};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::lower::{self, FootprintId, RodataId, RodataReloc, RodataTarget, Slots, SymbolSource, VtableEntry, VtableId, Word};
+use crate::lower::{self, FootprintId, RelocPlan, RodataId, RodataReloc, RodataTarget, Slots, SymbolSource, VtableEntry, VtableId, Word};
 use crate::names::ItemRef;
 use crate::outline::tree::Profile;
 use crate::sema::Context;
@@ -63,14 +63,23 @@ fn env_usize(key: &str) -> Option<usize> {
 
 #[derive(Clone)]
 pub(super) enum CachedTemplate {
-    Stencil(Arc<Code>),
-    Dict { body_exec: usize, code: Arc<Code> },
+    Stencil { code: Arc<Code>, reloc_plan: Arc<RelocPlan> },
+    Dict { body_exec: usize, code: Arc<Code>, reloc_plan: Arc<RelocPlan> },
+}
+
+impl CachedTemplate {
+    fn reloc_plan(&self) -> &Arc<RelocPlan> {
+        match self {
+            Self::Stencil { reloc_plan, .. } | Self::Dict { reloc_plan, .. } => reloc_plan,
+        }
+    }
 }
 
 pub(super) struct JitTemplate {
     pub stencil: Arc<Code>,
     pub dict: Option<(usize, Arc<Code>)>,
     pub fanout: usize,
+    pub reloc_plan: Arc<RelocPlan>,
 }
 
 pub(super) struct TierUpEntry {
@@ -79,7 +88,7 @@ pub(super) struct TierUpEntry {
     pub symbols: Vec<u64>,
 }
 
-type FirstJit = (usize, Arc<Code>, Vec<u64>, usize);
+type FirstJit = (usize, Arc<Code>, Vec<u64>, usize, Arc<RelocPlan>);
 
 pub(super) struct StencilState {
     pub cfg: DictConfig,
@@ -117,6 +126,7 @@ pub(super) struct GroupWork {
     pub item: ItemRef,
     pub footprint: FootprintId,
     pub distinct: Vec<DistinctInst>,
+    pub leader_out: Option<lower::StencilOutput>,
 }
 
 impl GroupWork {
@@ -267,8 +277,8 @@ impl Image {
             return self.compile_singleton(cx, reached, index, pass).err().map(|err| (index, err)).into_iter().collect();
         }
         let (groups, mut errors) = self.partition_work(cx, reached, indices, cfg, pass);
-        for group in &groups {
-            if let Err(err) = self.compile_group(cx, reached, group, cfg, record_cache, pass) {
+        for mut group in groups {
+            if let Err(err) = self.compile_group(cx, reached, &mut group, cfg, record_cache, pass) {
                 errors.extend(group.all_indices().map(|idx| (idx, err.clone())));
             }
         }
@@ -290,39 +300,78 @@ impl Image {
     pub(super) fn partition_work(&self, cx: &mut Context<'_>, reached: &Reached, work: &[usize], cfg: DictConfig, pass: &mut Pass) -> (Vec<GroupWork>, Vec<(usize, String)>) {
         let mut errors = Vec::new();
         let mut order: Vec<(ItemRef, FootprintId)> = Vec::new();
-        let mut by_fp: HashMap<(ItemRef, FootprintId), (HashMap<Vec<u64>, usize>, Vec<DistinctInst>)> = HashMap::default();
-        let mut verify_hits = Vec::new();
+        let mut by_fp: HashMap<(ItemRef, FootprintId), Vec<usize>> = HashMap::default();
         for &index in work {
             let item = reached.list[index].0.0;
-            let (footprint, relocs) = match lower::probe_footprint(cx, reached, self, index) {
-                Ok(pair) => pair,
+            let footprint = match lower::eval_footprint(cx, reached, self, index) {
+                Ok(fp) => fp,
                 Err(err) => {
-                    errors.push((index, format!("{}: {err:#}", cx.name(item))));
+                    errors.push((index, item_err(cx, item, &err)));
                     continue;
                 }
             };
-            let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-            if let Some(hit) = self.reuse_cached((item, footprint), index, &symbols, pass) {
-                if cfg.verify {
-                    verify_hits.push((index, hit));
+            by_fp.entry((item, footprint)).or_insert_with(|| {
+                order.push((item, footprint));
+                Vec::new()
+            }).push(index);
+        }
+        let mut verify_hits = Vec::new();
+        let mut groups = Vec::new();
+        for (item, footprint) in order {
+            let Some(indices) = by_fp.remove(&(item, footprint)) else { continue };
+            if let Some(reloc_plan) = pass.stencils.templates.get(&(item, footprint)).map(|t| Arc::clone(t.reloc_plan())) {
+                for index in indices {
+                    let relocs = match lower::eval_relocs(cx, reached, self, &reloc_plan, index) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            errors.push((index, item_err(cx, item, &err)));
+                            continue;
+                        }
+                    };
+                    let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+                    if let Some(hit) = self.reuse_cached((item, footprint), index, &symbols, pass)
+                        && cfg.verify
+                    {
+                        verify_hits.push((index, hit));
+                    }
                 }
                 continue;
             }
-            let entry = by_fp.entry((item, footprint)).or_insert_with(|| {
-                order.push((item, footprint));
-                (HashMap::default(), Vec::new())
-            });
-            if let Some(&pos) = entry.0.get(&symbols) {
-                entry.1[pos].followers.push(index);
-            } else {
-                entry.0.insert(symbols.clone(), entry.1.len());
-                entry.1.push(DistinctInst { leader: index, followers: Vec::new(), symbols });
+            let Some((&rep, rest)) = indices.split_first() else { continue };
+            let out = match lower::lower_stencil(cx, reached, self, rep) {
+                Ok(out) => out,
+                Err(err) => {
+                    let msg = item_err(cx, item, &err);
+                    errors.extend(indices.into_iter().map(|idx| (idx, msg.clone())));
+                    continue;
+                }
+            };
+            let mut sym_pos: HashMap<Vec<u64>, usize> = HashMap::default();
+            let mut distinct: Vec<DistinctInst> = Vec::new();
+            let rep_syms: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+            sym_pos.insert(rep_syms.clone(), 0);
+            distinct.push(DistinctInst { leader: rep, followers: Vec::new(), symbols: rep_syms });
+            for &index in rest {
+                let relocs = match lower::eval_relocs(cx, reached, self, &out.reloc_plan, index) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        errors.push((index, item_err(cx, item, &err)));
+                        continue;
+                    }
+                };
+                let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+                if let Some(&pos) = sym_pos.get(&symbols) {
+                    distinct[pos].followers.push(index);
+                } else {
+                    sym_pos.insert(symbols.clone(), distinct.len());
+                    distinct.push(DistinctInst { leader: index, followers: Vec::new(), symbols });
+                }
             }
+            groups.push(GroupWork { item, footprint, distinct, leader_out: Some(out) });
         }
         if cfg.verify {
             errors.extend(self.verify_records(cx, reached, &verify_hits));
         }
-        let groups = order.into_iter().filter_map(|key| by_fp.remove(&key).map(|(_, distinct)| GroupWork { item: key.0, footprint: key.1, distinct })).collect();
         (groups, errors)
     }
 
@@ -334,14 +383,14 @@ impl Image {
         }
         let template = pass.stencils.templates.get(&(item, footprint)).cloned()?;
         match template {
-            CachedTemplate::Stencil(code) => {
+            CachedTemplate::Stencil { code, .. } => {
                 let exec = pass.memory.write_patched(&code, symbols).ok()?;
                 self.publish(index, exec);
                 pass.record_size(index, code.bytes().len() as u32, 0);
                 pass.stencils.aliases.insert(alias_key, (exec, false));
                 Some(VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() })
             }
-            CachedTemplate::Dict { body_exec, code } => {
+            CachedTemplate::Dict { body_exec, code, .. } => {
                 let (stub_exec, stub_bytes) = self.emit_dict_stub(body_exec, symbols, None, pass).ok()?;
                 self.publish(index, stub_exec);
                 pass.record_size(index, stub_bytes.len() as u32, 0);
@@ -353,19 +402,23 @@ impl Image {
 
     fn cached_verify_record(&self, key: (ItemRef, FootprintId), addr: usize, is_dict: bool, pass: &Pass) -> Option<VerifyRecord> {
         match (is_dict, pass.stencils.templates.get(&key)?) {
-            (false, CachedTemplate::Stencil(code)) => Some(VerifyRecord::Patched { exec: addr, len: code.bytes().len(), sites: code.sites().to_vec() }),
-            (true, CachedTemplate::Dict { body_exec, code }) => Some(VerifyRecord::Dict { body_exec: *body_exec, stub_exec: addr, stub_bytes: Vec::new(), code: code.clone() }),
+            (false, CachedTemplate::Stencil { code, .. }) => Some(VerifyRecord::Patched { exec: addr, len: code.bytes().len(), sites: code.sites().to_vec() }),
+            (true, CachedTemplate::Dict { body_exec, code, .. }) => Some(VerifyRecord::Dict { body_exec: *body_exec, stub_exec: addr, stub_bytes: Vec::new(), code: code.clone() }),
             _ => None,
         }
     }
 
-    pub(super) fn compile_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &GroupWork, cfg: DictConfig, record_cache: bool, pass: &mut Pass) -> Result<(), String> {
+    pub(super) fn compile_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &mut GroupWork, cfg: DictConfig, record_cache: bool, pass: &mut Pass) -> Result<(), String> {
         let rep = group.representative();
         if cfg.min_bytes == 0 && group.distinct.len() >= cfg.min_fanout {
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);
         }
         let started = std::time::Instant::now();
-        let out = lower::lower_stencil(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?;
+        let out = match group.leader_out.take() {
+            Some(out) => out,
+            None => lower::lower_stencil(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?,
+        };
+        let reloc_plan = out.reloc_plan;
         let code = Arc::new(haste_codegen::compile(out.func, &target()).map_err(|e| item_err(cx, group.item, e))?);
         if code.bytes().len() > cfg.min_bytes && group.distinct.len() >= cfg.min_fanout {
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
@@ -387,7 +440,7 @@ impl Image {
         }
         pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
         if record_cache {
-            pass.stencils.templates.insert((group.item, group.footprint), CachedTemplate::Stencil(code));
+            pass.stencils.templates.insert((group.item, group.footprint), CachedTemplate::Stencil { code, reloc_plan });
         }
         self.finish_verify(cx, reached, &records)
     }
@@ -402,7 +455,7 @@ impl Image {
     fn compile_dict_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &GroupWork, cfg: DictConfig, record_cache: bool, pass: &mut Pass) -> Result<(), String> {
         let rep = group.representative();
         let started = std::time::Instant::now();
-        let (func, _) = lower::lower_dict(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?;
+        let (func, _, reloc_plan) = lower::lower_dict(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?;
         let code = Arc::new(haste_codegen::compile(func, &target()).map_err(|e| item_err(cx, group.item, e))?);
         let body_exec = self.write_dict_body(&code, pass).map_err(|e| item_err(cx, group.item, e))?;
         let mut records = Vec::new();
@@ -421,7 +474,7 @@ impl Image {
         }
         pass.record_size(rep, code.bytes().len() as u32, started.elapsed().as_nanos() as u64);
         if record_cache {
-            pass.stencils.templates.insert((group.item, group.footprint), CachedTemplate::Dict { body_exec, code });
+            pass.stencils.templates.insert((group.item, group.footprint), CachedTemplate::Dict { body_exec, code, reloc_plan });
         }
         self.finish_verify(cx, reached, &records)
     }
@@ -477,15 +530,15 @@ impl Image {
                 let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
                 let code = Arc::new(haste_codegen::compile(out.func, &target())?);
                 let exec = pass.memory.write_patched(&code, &symbols)?;
-                pass.stencils.first_jit.insert(item, Some((index, code, symbols, exec)));
+                pass.stencils.first_jit.insert(item, Some((index, code, symbols, exec, out.reloc_plan)));
                 Ok(Some(exec))
             }
-            Some(Some((idx1, code1, syms1, exec1))) => {
-                let (fp1, _) = lower::probe_footprint(cx, reached, self, idx1)?;
+            Some(Some((idx1, code1, syms1, exec1, plan1))) => {
+                let fp1 = lower::eval_footprint(cx, reached, self, idx1)?;
                 if self.wanted_len() > wanted0 {
                     bail!("unreached inline callee");
                 }
-                pass.stencils.jit_templates.insert((item, fp1), JitTemplate { stencil: code1, dict: None, fanout: 1 });
+                pass.stencils.jit_templates.insert((item, fp1), JitTemplate { stencil: code1, dict: None, fanout: 1, reloc_plan: plan1 });
                 pass.stencils.aliases.insert((item, fp1, syms1), (exec1, false));
                 pass.stencils.first_jit.insert(item, None);
                 Ok(None)
@@ -495,11 +548,28 @@ impl Image {
     }
 
     fn compile_jit_cached(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, cfg: DictConfig, pass: &mut Pass) -> Result<usize> {
-        let (footprint, relocs) = lower::probe_footprint(cx, reached, self, index)?;
+        let footprint = lower::eval_footprint(cx, reached, self, index)?;
         if self.wanted_len() > wanted0 {
             bail!("unreached inline callee");
         }
-        let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+        let existing_plan = pass.stencils.jit_templates.get(&(item, footprint)).map(|jt| Arc::clone(&jt.reloc_plan));
+        let (symbols, prelowered) = match existing_plan {
+            Some(plan) => {
+                let relocs = lower::eval_relocs(cx, reached, self, &plan, index)?;
+                if self.wanted_len() > wanted0 {
+                    bail!("unreached inline callee");
+                }
+                (relocs.iter().map(|sym| self.symbol_value(sym)).collect::<Vec<u64>>(), None)
+            }
+            None => {
+                let out = lower::lower_stencil(cx, reached, self, index)?;
+                if self.wanted_len() > wanted0 {
+                    bail!("unreached inline callee");
+                }
+                let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+                (symbols, Some(out))
+            }
+        };
         let alias_key = (item, footprint, symbols.clone());
         if let Some(&(addr, is_dict)) = pass.stencils.aliases.get(&alias_key) {
             if cfg.verify
@@ -513,7 +583,7 @@ impl Image {
             }
             return Ok(addr);
         }
-        let stencil = self.ensure_jit_stencil(cx, reached, index, (item, footprint), pass)?;
+        let stencil = self.ensure_jit_stencil(cx, reached, index, (item, footprint), prelowered, pass)?;
         let fanout = pass.stencils.jit_templates.get(&(item, footprint)).map_or(1, |jt| jt.fanout);
         if stencil.bytes().len() > cfg.min_bytes && fanout >= cfg.min_fanout {
             return self.instantiate_jit_dict(cx, reached, index, (item, footprint), symbols, cfg, pass);
@@ -527,14 +597,17 @@ impl Image {
         Ok(exec)
     }
 
-    fn ensure_jit_stencil(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, key: (ItemRef, FootprintId), pass: &mut Pass) -> Result<Arc<Code>> {
+    fn ensure_jit_stencil(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, key: (ItemRef, FootprintId), prelowered: Option<lower::StencilOutput>, pass: &mut Pass) -> Result<Arc<Code>> {
         if let Some(entry) = pass.stencils.jit_templates.get_mut(&key) {
             entry.fanout += 1;
             return Ok(entry.stencil.clone());
         }
-        let out = lower::lower_stencil(cx, reached, self, index)?;
+        let out = match prelowered {
+            Some(out) => out,
+            None => lower::lower_stencil(cx, reached, self, index)?,
+        };
         let stencil = Arc::new(haste_codegen::compile(out.func, &target())?);
-        pass.stencils.jit_templates.insert(key, JitTemplate { stencil: stencil.clone(), dict: None, fanout: 1 });
+        pass.stencils.jit_templates.insert(key, JitTemplate { stencil: stencil.clone(), dict: None, fanout: 1, reloc_plan: out.reloc_plan });
         Ok(stencil)
     }
 
@@ -542,7 +615,7 @@ impl Image {
         let (body_exec, dict_code) = match pass.stencils.jit_templates.get(&key).and_then(|jt| jt.dict.clone()) {
             Some(pair) => pair,
             None => {
-                let (func, _) = lower::lower_dict(cx, reached, self, index)?;
+                let (func, _, _) = lower::lower_dict(cx, reached, self, index)?;
                 let code = Arc::new(haste_codegen::compile(func, &target())?);
                 let exec = self.write_dict_body(&code, pass)?;
                 if let Some(jt) = pass.stencils.jit_templates.get_mut(&key) {
@@ -640,7 +713,7 @@ impl Image {
     }
 
     fn verify_dict(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, (body_exec, stub_exec): (usize, usize), stub_bytes: &[u8], code: &Code) -> Result<()> {
-        let (func, _) = lower::lower_dict(cx, reached, fresh, index)?;
+        let (func, _, _) = lower::lower_dict(cx, reached, fresh, index)?;
         let fresh_code = haste_codegen::compile(func, &target())?;
         if !fresh_code.relocs().iter().all(|reloc| reloc.as_runtime().is_some()) {
             bail!("dict body verification found non-runtime relocations");

@@ -164,6 +164,7 @@ fn empty_base() -> BaseRecord {
 fn analyze_base(cx: &mut Context<'_>, reached: &Reached, index: usize, inlined: bool, facts: &mut TraitFacts) -> BaseRecord {
     let ((item, substs), result) = &reached.list[index];
     let Ok(typed) = result else { return empty_base() };
+    typed.ensure_tables(&cx.types);
     let generic = !substs.is_empty();
     if cx.foreign(*item) {
         let (mut k, mut d) = (Mix::new(1), Mix::new(2));

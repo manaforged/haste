@@ -17,13 +17,17 @@ mod moves;
 mod object;
 mod ops;
 mod place;
+mod plan;
 mod promote;
+mod reloc;
 mod simd;
 mod slice_pat;
 mod stencil;
 
 pub use expr::{can_inline_body, may_inline};
-pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil, probe_footprint};
+pub use plan::eval_footprint;
+pub use reloc::{RelocPlan, eval_relocs};
+pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil};
 
 use std::sync::Arc;
 
@@ -238,6 +242,7 @@ pub struct Lower<'l, 'a> {
     dict_param: Option<Value>,
     mode: stencil::LowerMode,
     relocs: &'l mut RelocVec,
+    reloc_plan: &'l mut Vec<reloc::RelocStep>,
     promoted_seq: u32,
     cycle_root: usize,
     owned: Vec<drop::Owned>,
@@ -532,7 +537,7 @@ impl Lower<'_, '_> {
         let place = value.map(|value| place::Place { base: place::Base::Addr(value), offset: 0, repr });
         match (repr, place) {
             (Repr::Scalar(_), _) => Ok(()),
-            (_, place) => self.glue(ty, place),
+            (_, place) => self.glue(ty, place, reloc::TyOrigin::Expr(expr)),
         }
     }
 

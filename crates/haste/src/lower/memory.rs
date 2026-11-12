@@ -9,23 +9,33 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
 use super::place::{Base, Place};
+use super::reloc::{RelocStep, SiteOrigin, TyOrigin};
 use super::stencil::SymbolSource;
 use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
     /// Emits the memory and layout intrinsic `which` inline, and hands every other intrinsic to the value intrinsics.
-    pub(super) fn memory_intrinsic(&mut self, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    pub(super) fn memory_intrinsic(&mut self, origin: &SiteOrigin, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         use Intrinsic::*;
         let ty = substs.first().copied();
         match (which, ty, args) {
             (SizeOf | AlignOf, Some(ty), _) => self.layout_const(which, ty).map(Some),
             (SizeOfVal | AlignOfVal, Some(ty), &[pointer]) => self.value_layout(which == SizeOfVal, ty, pointer).map(Some),
-            (NeedsDrop | TypeId, Some(ty), _) => self.type_fact(which, ty).map(Some),
+            (NeedsDrop | TypeId, Some(ty), _) => self.type_fact(origin, which, ty).map(Some),
             (TypeName, Some(ty), _) => {
                 let name = crate::sema::infer::type_name(self.cx, ty);
                 let id = self.slots.rodata(name.as_bytes(), &[]);
-                let data = self.emit_symbol(SymbolSource::Rodata(id));
-                let len = self.emit_symbol(SymbolSource::Word(name.len() as u64));
+                let step = RelocStep::TypeName(TyOrigin::SiteSubst(Box::new(origin.clone()), 0));
+                let data = self.emit_symbol_with(SymbolSource::Rodata(id), step);
+                let idx = self.relocs.len() as u32;
+                self.relocs.push(SymbolSource::Word(name.len() as u64));
+                let len = match self.mode {
+                    super::stencil::LowerMode::Dict => {
+                        let dict = self.dict_param.expect("dictionary parameter is set");
+                        self.ins().load(Type::I64, dict, (idx * 8) as i32)
+                    }
+                    super::stencil::LowerMode::Stencil => self.ins().symbol(idx),
+                };
                 Ok(Some(self.wide(data, len)))
             }
             (NoOp, _, _) => Ok(None),
@@ -100,17 +110,18 @@ impl Lower<'_, '_> {
         Ok(boxed)
     }
 
-    fn type_fact(&mut self, which: Intrinsic, ty: Ty) -> Result<Value> {
+    fn type_fact(&mut self, origin: &SiteOrigin, which: Intrinsic, ty: Ty) -> Result<Value> {
         if which == Intrinsic::TypeId {
-            return Ok(self.type_id(ty));
+            return Ok(self.type_id(origin, ty));
         }
         let needs = crate::sema::infer::needs_drop(self.cx, ty)?;
         Ok(self.ins().iconst(Type::I8, i64::from(needs)))
     }
 
-    fn type_id(&mut self, ty: Ty) -> Value {
+    fn type_id(&mut self, origin: &SiteOrigin, ty: Ty) -> Value {
         let slot = self.b.create_stack_slot(16, 3);
-        let id = self.emit_symbol(SymbolSource::Word(u64::from(ty.0)));
+        let step = RelocStep::TypeId(TyOrigin::SiteSubst(Box::new(origin.clone()), 0));
+        let id = self.emit_symbol_with(SymbolSource::Word(u64::from(ty.0)), step);
         let zero = self.emit_symbol(SymbolSource::Word(0));
         self.ins().stack_store(id, slot, 0);
         self.ins().stack_store(zero, slot, 8);

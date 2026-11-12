@@ -64,7 +64,7 @@ impl Lower<'_, '_> {
                 None => self.address_or_dangling(None, self.ty_of(base))?,
             };
             let values = self.expr(index)?.into_iter();
-            let Some(pointer) = self.invoke(item, substs, std::iter::once(receiver).chain(values).collect())? else { return Ok(None) };
+            let Some(pointer) = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::Operator(expr)), item, substs, std::iter::once(receiver).chain(values).collect())? else { return Ok(None) };
             return self.pointee_place(pointer, self.ty_of(expr)).map(Some);
         }
         let Some((place, ty)) = found else { return self.empty_index(expr, base, index) };

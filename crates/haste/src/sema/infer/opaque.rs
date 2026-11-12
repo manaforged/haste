@@ -107,7 +107,7 @@ impl<'a> Infer<'_, 'a> {
         if closures.values().flat_map(typed).any(|ty| self.has_vars(ty)) {
             return;
         }
-        let tables = std::sync::Arc::new(BodyTables { closures: PackedMap::pack(closures), ..BodyTables::default() });
+        let tables = super::LazyTables::Eager(std::sync::Arc::new(BodyTables { closures: PackedMap::pack(closures), ..BodyTables::default() }));
         super::closure::register(self.cx, (item, args), &Typed { tables, locals, ..Typed::default() });
     }
 

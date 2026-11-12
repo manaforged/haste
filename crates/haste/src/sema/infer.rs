@@ -32,7 +32,7 @@ pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, register};
 pub use coerce::Coercion;
 pub use consts::{Anon, Arena};
-pub use drop::{Glue, drop_fn, has_drop_impl, needs_drop};
+pub use drop::{Glue, drop_fn, glue_call, has_drop_impl, needs_drop};
 pub use looping::{For, Tried};
 pub use method::Adjust;
 pub use name::type_name;
@@ -41,7 +41,7 @@ pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
 pub use scope::{Form, type_params};
 pub use select::header_bound_traits;
-pub use tables::{BodyTables, SyntaxTables, Typed};
+pub use tables::{BodyTables, LazyTables, SiteKey, SyntaxTables, Typed};
 
 use rustc_hash::FxHashMap as HashMap;
 

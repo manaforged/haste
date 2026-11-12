@@ -67,7 +67,8 @@ impl Lower<'_, '_> {
         let size = self.cx.layout(ty)?.size.bytes() as usize;
         let seq = self.promoted_seq;
         self.promoted_seq += 1;
-        let address = self.emit_symbol(SymbolSource::PromotedCell { owner: self.index, seq, size: (size + 1) as u32 });
+        let cell_size = (size + 1) as u32;
+        let address = self.emit_symbol_with(SymbolSource::PromotedCell { owner: self.index, seq, size: cell_size }, super::reloc::RelocStep::Promoted { seq, size: cell_size });
         let filled = self.ins().load(Type::I8, address, size as i32);
         let (fill, done) = (self.b.create_block(), self.b.create_block());
         self.brif(filled, (done, &[]), (fill, &[]));
@@ -99,7 +100,8 @@ impl Lower<'_, '_> {
             self.enter(fill);
             let usize_ty = self.cx.types.prim(Primitive::Usize);
             let flag = self.ins().iadd_imm(address, i64::from(size));
-            let code = self.code_of(index);
+            let table = self.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index)));
+            let code = self.ins().load(Type::I64, table, 0);
             let once = self.emit_symbol(SymbolSource::Host(HostSymbol::FillOnce));
             self.call_code(once, (vec![usize_ty, usize_ty], None), vec![flag, code])?;
             self.jump(done, &[]);
@@ -260,7 +262,7 @@ impl Lower<'_, '_> {
         }
         match self.literal_reference(item, substs)? {
             Some(value) => Ok(Some(value)),
-            None => self.invoke(item, substs, Vec::new()),
+            None => self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, Vec::new()),
         }
     }
 

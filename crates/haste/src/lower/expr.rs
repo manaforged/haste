@@ -7,13 +7,14 @@ use crate::body::{Expr, ExprId, List, UnOp};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
-use crate::sema::infer::{Coercion, Res, Shape};
+use crate::sema::infer::{Coercion, Res, Shape, SiteKey};
 use crate::sema::reach::Reached;
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::Place;
-use super::stencil::{InlinedCallee, LowerMode, SymbolSource, item_bits, resolve_inline};
+use super::reloc::{RelocStep, SiteOrigin, TyOrigin};
+use super::stencil::{InlinedCallee, LowerMode, SymbolSource, resolve_inline};
 use super::{Loop, Lower, Parts, Repr, repr};
 
 /// How large a sysroot body a call may copy inline under one build profile.
@@ -67,7 +68,7 @@ fn hint(cx: &Context<'_>, item: ItemRef) -> Hint {
 /// What a call runs: code at an address, or reached function `index`, which may be copied inline.
 enum Callee {
     Code(Value),
-    Reached(usize),
+    Reached(usize, SiteOrigin),
 }
 
 /// Whether a call may try to copy reached function `index` inline.
@@ -82,7 +83,7 @@ pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn supe
 }
 
 /// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
-fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
+pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
     let ((item, _), Ok(typed)) = &reached.list[index] else {
         return None;
     };
@@ -120,14 +121,14 @@ impl Lower<'_, '_> {
             }
             (Some(Coercion::Vtable(vtable)), Some(value)) => {
                 let data = self.sized_pointer(value, self.ty_of(expr));
-                let table = self.vtable(vtable)?;
+                let table = self.vtable(expr, vtable)?;
                 Ok(Some(self.wide(data, table)))
             }
-            (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(value, steps.clone()),
+            (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(expr, value, steps.clone()),
             (Some(&Coercion::Upcast(slot)), Some(value)) => Ok(Some(self.upcast(value, slot, self.ty_of(expr))?)),
             (Some(&Coercion::Reify(Res::Fn(item, substs))), _) => {
                 let index = self.reached_index(item, substs)?;
-                Ok(Some(self.code_of(index)))
+                Ok(Some(self.code_of(index, SiteOrigin::Table(SiteKey::CoercionReify(expr)))))
             }
             _ => Ok(value),
         }
@@ -176,7 +177,7 @@ impl Lower<'_, '_> {
             place => place.and_then(|place| self.read(place)),
         };
         let target = self.address_or_dangling(owner, boxed)?;
-        self.invoke(free, substs, vec![target])?;
+        self.invoke(SiteOrigin::DropFn(TyOrigin::Expr(operand)), free, substs, vec![target])?;
         self.moved_out(root, &path)?;
         Ok(value)
     }
@@ -296,7 +297,7 @@ impl Lower<'_, '_> {
             bail!("a `call_once` of a closure with a tupled argument is not lowered yet");
         }
         let values = self.args(args, Vec::new())?;
-        self.invoke(item, substs, values)
+        self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values)
     }
 
     fn method(&mut self, expr: ExprId, receiver: ExprId, params: List) -> Result<Option<Value>> {
@@ -307,7 +308,7 @@ impl Lower<'_, '_> {
         }
         let first = self.receiver((expr, receiver), adjust)?;
         let values = self.args(params, first.into_iter().collect())?;
-        self.invoke(item, substs, values)
+        self.invoke(SiteOrigin::Table(SiteKey::ExprRes(expr)), item, substs, values)
     }
 
     pub(super) fn args(&mut self, args: List, mut values: Vec<Value>) -> Result<Vec<Value>> {
@@ -319,22 +320,22 @@ impl Lower<'_, '_> {
         Ok(values)
     }
 
-    pub(super) fn invoke(&mut self, item: ItemRef, substs: Substs, values: Vec<Value>) -> Result<Option<Value>> {
+    pub(super) fn invoke(&mut self, origin: SiteOrigin, item: ItemRef, substs: Substs, values: Vec<Value>) -> Result<Option<Value>> {
         if !self.open {
             return Ok(None);
         }
         if let Some(which) = self.cx.intrinsic(item) {
             let slice = self.cx.types.substs(substs).to_vec();
-            return self.intrinsic(which, &slice, &values);
+            return self.intrinsic(&origin, which, &slice, &values);
         }
         let index = self.reached_index(item, substs)?;
         let Ok(callee) = &self.reached.list[index].1 else { bail!("{} did not type-check", self.cx.name(item)) };
         let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
         if self.cx.foreign(item) {
-            let code = self.code_of(index);
+            let code = self.code_of(index, origin);
             return self.native_call(code, (params, callee.ret), values);
         }
-        self.call_with(Callee::Reached(index), (params, callee.ret), values)
+        self.call_with(Callee::Reached(index, origin), (params, callee.ret), values)
     }
 
     fn inline_callee(&mut self, index: usize) -> Result<Option<Arc<InlinedCallee>>> {
@@ -346,15 +347,15 @@ impl Lower<'_, '_> {
         Ok(callee)
     }
 
-    fn emit_inlined(&mut self, inlined: &InlinedCallee, values: &[Value]) -> Vec<Value> {
+    fn emit_inlined(&mut self, inlined: &InlinedCallee, origin: SiteOrigin, values: &[Value]) -> Vec<Value> {
         if !self.open {
             let dead = *self.dead.get_or_insert_with(|| self.b.create_block());
             self.b.switch_to_block(dead);
         }
         let sym_base = self.relocs.len() as u32;
         self.relocs.extend(inlined.relocs.iter().cloned());
+        self.reloc_plan.push(RelocStep::SiteInline { origin, plan: Arc::clone(&inlined.reloc_plan) });
         match self.mode {
-            LowerMode::Probe => self.b.inline_probe(&inlined.body, values, item_bits(inlined.item), inlined.footprint.0, inlined.returns),
             LowerMode::Stencil => self.b.inline_shifted(&inlined.body, values, sym_base),
             LowerMode::Dict => {
                 let dict = self.dict_param.expect("dictionary parameter is set");
@@ -367,9 +368,9 @@ impl Lower<'_, '_> {
     fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
         let code = match callee {
             Callee::Code(code) => code,
-            Callee::Reached(index) => match self.inline_callee(index)? {
-                Some(inlined) => return Ok(self.emit_inlined(&inlined, values)),
-                None => self.code_of(index),
+            Callee::Reached(index, origin) => match self.inline_callee(index)? {
+                Some(inlined) => return Ok(self.emit_inlined(&inlined, origin, values)),
+                None => self.code_of(index, origin),
             },
         };
         let sig = self.b.import_signature(signature);
@@ -387,7 +388,7 @@ impl Lower<'_, '_> {
         };
         if let Kind::FnDef(item, substs) = *self.cx.types.kind(ty) {
             let values = self.args(args, Vec::new())?;
-            return self.invoke(item, substs, values);
+            return self.invoke(SiteOrigin::PointerFnDef { expr, callee }, item, substs, values);
         }
         let Kind::FnPtr(params, ret) = *self.cx.types.kind(ty) else { bail!("cannot lower calls through values yet") };
         let Some(code) = code else { return Ok(None) };
@@ -412,8 +413,8 @@ impl Lower<'_, '_> {
     }
 
     /// The code address of reached function `index`, read from its call table entry.
-    pub(super) fn code_of(&mut self, index: usize) -> Value {
-        let table = self.emit_slot(SymbolSource::Slot(index));
+    pub(super) fn code_of(&mut self, index: usize, origin: SiteOrigin) -> Value {
+        let table = self.emit_slot(SymbolSource::Slot(index), origin);
         self.ins().load(Type::I64, table, 0)
     }
 

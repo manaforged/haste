@@ -133,19 +133,17 @@ impl Image {
 
     /// Compiles each bucket of `shard` into a pass of this worker's own; a bucket whose lowering deferred a constant evaluation is handed back to compile after the workers join.
     fn worker_loop(&self, mut cx: Context<'_>, reached: &Reached, shard: &[Vec<usize>], (cfg, allow_singleton): Plan) -> WorkerOutput {
-        let mut pass = Pass::new(reached.list.len());
+        let mut pass = Pass::default();
         pass.stencils.cfg = cfg;
         let (mut errors, mut deferred) = (Vec::new(), Vec::new());
         for bucket in shard {
+            let mark = pass.records.len();
             let failed = self.compile_bucket(&mut cx, reached, bucket, cfg, (false, allow_singleton), &mut pass);
             if cx.take_deferred_evals().is_empty() {
                 errors.extend(failed);
                 continue;
             }
-            for &index in bucket {
-                pass.sizes[index] = 0;
-                pass.times[index] = 0;
-            }
+            pass.records.truncate(mark);
             deferred.extend_from_slice(bucket);
         }
         (pass, errors, deferred)

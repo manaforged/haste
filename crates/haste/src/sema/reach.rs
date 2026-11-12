@@ -359,10 +359,11 @@ fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String
 
 /// Computes the layout of each ADT, tuple and array type that lowering `typed` reads, so the names those layouts need are asked for while inference can still retry.
 pub(super) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
+    let tables = typed.ensure_tables(&cx.types);
     let intrinsic_args: Vec<Ty> = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_some()).flat_map(|(_, substs)| cx.types.substs(substs).iter().copied()).collect();
     let locals = typed.locals.iter().map(|local| local.ty);
-    let pats = typed.pats.values().copied();
-    for ty in typed.exprs.iter().copied().chain(locals).chain(pats).chain(intrinsic_args) {
+    let pats = tables.pats.values().copied();
+    for ty in tables.exprs.iter().copied().chain(locals).chain(pats).chain(intrinsic_args) {
         if ty == Ty::NONE {
             continue;
         }

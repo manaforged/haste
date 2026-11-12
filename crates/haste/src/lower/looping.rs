@@ -5,10 +5,11 @@ use rustc_index::Idx;
 
 use crate::body::{ExprId, List, PatId};
 use crate::names::ItemRef;
-use crate::sema::infer::{Res, Tried};
+use crate::sema::infer::{Res, SiteKey, Tried};
 use crate::sema::substs::Substs;
 
 use super::place::Place;
+use super::reloc::SiteOrigin;
 use super::{Loop, Lower, repr};
 
 impl Lower<'_, '_> {
@@ -17,15 +18,15 @@ impl Lower<'_, '_> {
         let Some(each) = self.typed.fors.get(&expr).cloned() else { bail!("`for` loop has no iterator calls") };
         let (Res::Fn(into, into_substs), Res::Fn(next, next_substs)) = (each.into_iter, each.next) else { bail!("`for` loop calls are not functions") };
         let value = self.expr(iter)?;
-        let iterator = self.invoke(into, into_substs, value.into_iter().collect())?;
+        let iterator = self.invoke(SiteOrigin::Table(SiteKey::ForInto(expr)), into, into_substs, value.into_iter().collect())?;
         let place = self.spill(iterator, each.iter)?;
-        self.own(super::moves::Root::Held(iter), each.iter, place, true)?;
+        self.own(super::moves::Root::Held(expr), each.iter, place, true)?;
         let depth = self.owned.len();
         let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.jump(head, &[]);
         self.enter(head);
         let address = self.address_or_dangling(place, each.iter)?;
-        let option = self.invoke(next, next_substs, vec![address])?;
+        let option = self.invoke(SiteOrigin::Table(SiteKey::ForNext(expr)), next, next_substs, vec![address])?;
         let Some(option) = self.spill(option, each.option)? else { bail!("`next` returned no value") };
         match self.is_variant(Some(option), each.option, each.some)? {
             Some(some) => self.brif(some, (inner, &[]), (exit, &[])),
@@ -54,36 +55,36 @@ impl Lower<'_, '_> {
         let Some(tried) = self.typed.tries.get(&expr).cloned() else { bail!("`?` has no `Try` calls") };
         let (Res::Fn(branch, branch_substs), Res::Fn(from, from_substs)) = (tried.branch, tried.from_residual) else { bail!("`?` calls are not functions") };
         let value = self.expr(inner)?;
-        let flow = self.invoke(branch, branch_substs, value.into_iter().collect())?;
-        let Some(flow) = self.spill(flow, tried.flow)? else { return self.zero_sized_try(&tried, (from, from_substs)) };
-        let Some(stopped) = self.is_variant(Some(flow), tried.flow, tried.stop)? else { return self.always_stop(Some(flow), &tried, (from, from_substs)) };
+        let flow = self.invoke(SiteOrigin::Table(SiteKey::TryBranch(expr)), branch, branch_substs, value.into_iter().collect())?;
+        let Some(flow) = self.spill(flow, tried.flow)? else { return self.zero_sized_try(expr, &tried, (from, from_substs)) };
+        let Some(stopped) = self.is_variant(Some(flow), tried.flow, tried.stop)? else { return self.always_stop(expr, Some(flow), &tried, (from, from_substs)) };
         let (stop, proceed) = (self.b.create_block(), self.b.create_block());
         self.brif(stopped, (stop, &[]), (proceed, &[]));
         self.enter(stop);
-        self.stop_with(Some(flow), &tried, (from, from_substs))?;
+        self.stop_with(expr, Some(flow), &tried, (from, from_substs))?;
         self.enter(proceed);
         let output = self.variant_field(flow, tried.flow, (tried.proceed, 0))?;
         Ok(self.read(output))
     }
 
     /// Lowers `?` on a zero-sized `ControlFlow`, whose one inhabited variant says at compile time whether it proceeds or stops.
-    fn zero_sized_try(&mut self, tried: &Tried, from: (ItemRef, Substs)) -> Result<Option<Value>> {
+    fn zero_sized_try(&mut self, expr: ExprId, tried: &Tried, from: (ItemRef, Substs)) -> Result<Option<Value>> {
         if matches!(self.cx.layout(tried.flow)?.variants, Variants::Single { index } if index.index() == tried.proceed as usize) {
             return Ok(None);
         }
-        self.always_stop(None, tried, from)
+        self.always_stop(expr, None, tried, from)
     }
 
     /// Lowers `?` on a `ControlFlow` at `flow` whose one inhabited variant is `Break`: a return of its residual, after which nothing runs.
-    fn always_stop(&mut self, flow: Option<Place>, tried: &Tried, from: (ItemRef, Substs)) -> Result<Option<Value>> {
-        self.stop_with(flow, tried, from)?;
+    fn always_stop(&mut self, expr: ExprId, flow: Option<Place>, tried: &Tried, from: (ItemRef, Substs)) -> Result<Option<Value>> {
+        self.stop_with(expr, flow, tried, from)?;
         let unreachable = self.b.create_block();
         self.enter(unreachable);
         Ok(None)
     }
 
     /// Leaves with `FromResidual::from_residual` on the `Break` value of the `ControlFlow` at `flow`.
-    fn stop_with(&mut self, flow: Option<Place>, tried: &Tried, from: (ItemRef, Substs)) -> Result<()> {
+    fn stop_with(&mut self, expr: ExprId, flow: Option<Place>, tried: &Tried, from: (ItemRef, Substs)) -> Result<()> {
         let residual = match flow {
             Some(flow) => {
                 let field = self.variant_field(flow, tried.flow, (tried.stop, 0))?;
@@ -91,12 +92,12 @@ impl Lower<'_, '_> {
             }
             None => None,
         };
-        self.leave_residual(tried, from, residual.into_iter().collect())
+        self.leave_residual(expr, tried, from, residual.into_iter().collect())
     }
 
     /// Returns `FromResidual::from_residual` on the `Break` value `residual` from the function, or leaves the `try` block with it.
-    fn leave_residual(&mut self, tried: &Tried, (from, from_substs): (ItemRef, Substs), residual: Vec<Value>) -> Result<()> {
-        let result = self.invoke(from, from_substs, residual)?;
+    fn leave_residual(&mut self, expr: ExprId, tried: &Tried, (from, from_substs): (ItemRef, Substs), residual: Vec<Value>) -> Result<()> {
+        let result = self.invoke(SiteOrigin::Table(SiteKey::TryFrom(expr)), from, from_substs, residual)?;
         match tried.target {
             Some(block) => self.leave_try(block, result),
             None => self.finish(result),
@@ -111,7 +112,7 @@ impl Lower<'_, '_> {
         self.try_exits.push((expr, Loop { head: exit, exit, value, depth: self.owned.len(), label: None, block: true }));
         let output = self.block(stmts, tail);
         let wrapped = match output {
-            Ok(output) if self.open => self.invoke(from_output, substs, output.into_iter().collect()),
+            Ok(output) if self.open => self.invoke(SiteOrigin::Table(SiteKey::TryBlock(expr)), from_output, substs, output.into_iter().collect()),
             other => other,
         };
         let left = wrapped.and_then(|wrapped| self.leave_try(expr, wrapped));

@@ -145,7 +145,7 @@ impl Lower<'_, '_> {
             None => false,
         };
         if !replaced {
-            self.glue(ty, Some(place))?;
+            self.glue(ty, Some(place), super::reloc::TyOrigin::Expr(lhs))?;
         }
         self.write(place, value);
         if let Some((root, path)) = tracked {
@@ -249,10 +249,11 @@ impl Lower<'_, '_> {
         let inside: MovePath = path.iter().copied().chain([BOX_STEP]).collect();
         let into_box = parts.iter().any(|(part, _)| part.starts_with(&inside));
         let opened = below && !has_drop_impl(self.cx, ty)?;
+        let origin = super::reloc::TyOrigin::from_root(self.owned[at].root, self.typed).stepped(path);
         let run = |lower: &mut Self| match (into_box, opened) {
-            (true, _) => lower.open_box(at, &inside, ty, place),
+            (true, _) => lower.open_box(at, &inside, ty, place, origin.clone()),
             (false, true) => lower.open_drop(at, path, ty, place),
-            (false, false) => lower.glue(ty, place),
+            (false, false) => lower.glue(ty, place, origin.clone()),
         };
         match flag {
             Some(flag) => self.guarded(flag, run),
@@ -261,14 +262,14 @@ impl Lower<'_, '_> {
     }
 
     /// Drops what is left of the value the `Box` of type `ty` at `place` owns, part by part, then frees the box with its own `Drop::drop`.
-    fn open_box(&mut self, at: usize, inside: &[(u32, u32)], ty: Ty, place: Option<Place>) -> Result<()> {
+    fn open_box(&mut self, at: usize, inside: &[(u32, u32)], ty: Ty, place: Option<Place>, origin: super::reloc::TyOrigin) -> Result<()> {
         let (Some(place), Some(owned)) = (place, self.cx.boxed(ty)) else { bail!("a partly moved box with no bytes") };
         let target = self.address(place);
         let contents = self.ins().load(Type::I64, target, 0);
         let part = Place { base: Base::Addr(contents), offset: 0, repr: repr(self.cx, owned)? };
         self.drop_path(at, inside, owned, Some(part))?;
         let Some(Res::Fn(item, substs)) = drop_fn(self.cx, ty)? else { bail!("`Box` has no `Drop::drop`") };
-        self.invoke(item, substs, vec![target]).map(drop)
+        self.invoke(super::reloc::SiteOrigin::DropFn(origin), item, substs, vec![target]).map(drop)
     }
 
     fn open_drop(&mut self, at: usize, path: &[(u32, u32)], ty: Ty, place: Option<Place>) -> Result<()> {
@@ -316,14 +317,14 @@ impl Lower<'_, '_> {
     }
 
     /// Runs the drop glue of `ty` on the value at `place`.
-    pub fn glue(&mut self, ty: Ty, place: Option<Place>) -> Result<()> {
+    pub(super) fn glue(&mut self, ty: Ty, place: Option<Place>, origin: super::reloc::TyOrigin) -> Result<()> {
         if !needs_drop(self.cx, ty)? {
             return Ok(());
         }
         let Some(glue) = self.cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
         let target = self.address_or_dangling(place, ty)?;
         let substs = self.cx.types.intern_substs(&[ty]);
-        self.invoke(glue, substs, vec![target]).map(drop)
+        self.invoke(super::reloc::SiteOrigin::DropGlue(origin), glue, substs, vec![target]).map(drop)
     }
 
     /// Lowers the body of the drop glue for `ty` whose target is `target`: `Drop::drop`, then the parts.
@@ -340,20 +341,21 @@ impl Lower<'_, '_> {
             Some(Res::Fn(item, substs)) => Some((item, substs)),
             _ => None,
         };
+        let origin = super::reloc::TyOrigin::Subst(0);
         if let Some(owned) = self.cx.boxed(ty) {
-            self.box_contents(owned, target)?;
+            self.box_contents(owned, target, origin.step(BOX_STEP.0, 0))?;
             if let Some((item, substs)) = drop_fn {
-                self.invoke(item, substs, vec![target])?;
+                self.invoke(super::reloc::SiteOrigin::ShapeGlueDrop, item, substs, vec![target])?;
             }
             return Ok(());
         }
         if let Some((item, substs)) = drop_fn {
-            self.invoke(item, substs, vec![target])?;
+            self.invoke(super::reloc::SiteOrigin::ShapeGlueDrop, item, substs, vec![target])?;
         }
-        self.drop_parts(ty, target)
+        self.drop_parts(ty, target, origin)
     }
 
-    fn box_contents(&mut self, inner: Ty, target: Value) -> Result<()> {
+    fn box_contents(&mut self, inner: Ty, target: Value, origin: super::reloc::TyOrigin) -> Result<()> {
         let reference = self.cx.types.intern(Kind::Ref(crate::sema::ty::Mut::Mut, inner));
         let contents = match repr(self.cx, reference)? {
             Repr::Scalar(_) => self.ins().load(Type::I64, target, 0),
@@ -361,38 +363,38 @@ impl Lower<'_, '_> {
         };
         let place = Place { base: Base::Addr(contents), offset: 0, repr: repr(self.cx, inner).unwrap_or(Repr::Zst) };
         match self.cx.types.kind(inner) {
-            Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str) | Kind::Dyn(..) => self.glue_wide(inner, contents),
-            _ => self.glue(inner, Some(place)),
+            Kind::Slice(_) | Kind::Prim(crate::names::Primitive::Str) | Kind::Dyn(..) => self.glue_wide(inner, contents, origin),
+            _ => self.glue(inner, Some(place), origin),
         }
     }
 
-    fn glue_wide(&mut self, ty: Ty, wide: Value) -> Result<()> {
+    fn glue_wide(&mut self, ty: Ty, wide: Value, origin: super::reloc::TyOrigin) -> Result<()> {
         if !needs_drop(self.cx, ty)? {
             return Ok(());
         }
         let Some(glue) = self.cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
         let substs = self.cx.types.intern_substs(&[ty]);
-        self.invoke(glue, substs, vec![wide]).map(drop)
+        self.invoke(super::reloc::SiteOrigin::DropGlue(origin), glue, substs, vec![wide]).map(drop)
     }
 
-    fn drop_parts(&mut self, ty: Ty, target: Value) -> Result<()> {
+    fn drop_parts(&mut self, ty: Ty, target: Value, origin: super::reloc::TyOrigin) -> Result<()> {
         match self.cx.types.kind(ty).clone() {
             Kind::Array(inner, count) => {
                 let count = self.len(count)?;
                 let count = self.ins().iconst(Type::I64, count);
-                self.drop_elements(inner, target, count)
+                self.drop_elements(inner, target, count, origin.step(0, 0))
             }
             Kind::Slice(inner) => {
                 let (data, len) = (self.ins().load(Type::I64, target, 0), self.ins().load(Type::I64, target, 8));
-                self.drop_elements(inner, data, len)
+                self.drop_elements(inner, data, len, origin.step(0, 0))
             }
             Kind::Tuple(_) | Kind::Adt(..) => {
                 let repr = if self.cx.is_unsized(ty)? { super::ops::WIDE } else { repr(self.cx, ty)? };
                 let place = Place { base: Base::Addr(target), offset: 0, repr };
-                self.drop_fields(ty, place)
+                self.drop_fields(ty, place, origin)
             }
             Kind::Closure(..) => match self.cx.closure_env(ty) {
-                Some(env) => self.drop_parts(env, target),
+                Some(env) => self.drop_parts(env, target, origin.step(super::reloc::CLOSURE_ENV_STEP, 0)),
                 None => bail!("drop of a closure whose defining body was not inferred"),
             },
             Kind::Dyn(..) => self.drop_object(target),
@@ -409,7 +411,7 @@ impl Lower<'_, '_> {
         self.when(code, |lower| lower.call_code(code, (vec![pointer], None), vec![data]).map(drop))
     }
 
-    pub(super) fn drop_fields(&mut self, ty: Ty, place: Place) -> Result<()> {
+    pub(super) fn drop_fields(&mut self, ty: Ty, place: Place, origin: super::reloc::TyOrigin) -> Result<()> {
         let variants: Fields = match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => vec![self.cx.types.substs(items).to_vec()].into(),
             Kind::Adt(item, _) if self.cx.lang(item) == Some("manually_drop") || self.cx.item(item).1.kind == crate::outline::item::ItemKind::Union => return Ok(()),
@@ -419,10 +421,10 @@ impl Lower<'_, '_> {
             }
             _ => return Ok(()),
         };
-        self.each_field((ty, place), &variants, &mut |lower, _, field_ty, part| lower.glue(field_ty, Some(part)))
+        self.each_field((ty, place), &variants, &mut |lower, (variant, field), field_ty, part| lower.glue(field_ty, Some(part), origin.clone().step(variant, field)))
     }
 
-    fn drop_elements(&mut self, inner: Ty, data: Value, count: Value) -> Result<()> {
+    fn drop_elements(&mut self, inner: Ty, data: Value, count: Value, origin: super::reloc::TyOrigin) -> Result<()> {
         if !needs_drop(self.cx, inner)? {
             return Ok(());
         }
@@ -432,7 +434,7 @@ impl Lower<'_, '_> {
         self.each(count, |lower, index| {
             let offset = lower.ins().imul_imm(index, size);
             let at = lower.ins().iadd(data, offset);
-            if let Err(error) = lower.glue(inner, Some(Place { base: Base::Addr(at), offset: 0, repr: element })) {
+            if let Err(error) = lower.glue(inner, Some(Place { base: Base::Addr(at), offset: 0, repr: element }), origin.clone()) {
                 failed = Some(error);
             }
         });

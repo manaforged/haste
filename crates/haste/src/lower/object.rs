@@ -1,53 +1,68 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Type, Value};
 
+use crate::body::ExprId;
 use crate::prep::Vtable as Laid;
+use crate::sema::Context;
 use crate::sema::infer::{ALIGN_SLOT, Res, Vtable};
+use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty};
 
+use super::reloc::{RelocStep, reached_index_of};
 use super::stencil::{SymbolSource, VtableEntry, VtableId};
-use super::{Lower, Word};
+use super::{Lower, Slots, Word};
+
+pub(super) fn build_vtable_id(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, vtable: &Vtable) -> Result<VtableId> {
+    let layout = cx.layout(vtable.ty)?;
+    let mut entries = vec![
+        VtableEntry::Word(code_word(cx, reached, slots, vtable.drop.as_ref())?),
+        VtableEntry::Word(Word::Int(layout.size.bytes())),
+        VtableEntry::Word(Word::Int(layout.align.bytes())),
+    ];
+    if let Some(laid) = crate::prep::vtable(cx, vtable.object) {
+        laid_entries(cx, reached, slots, vtable, &laid, &mut entries)?;
+        return Ok(slots.vtable_id(&entries));
+    }
+    for method in &vtable.methods {
+        entries.push(VtableEntry::Word(code_word(cx, reached, slots, method.as_ref())?));
+    }
+    for inner in &vtable.supers {
+        entries.push(VtableEntry::Super(build_vtable_id(cx, reached, slots, inner)?));
+    }
+    Ok(slots.vtable_id(&entries))
+}
+
+fn laid_entries(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, vtable: &Vtable, laid: &Laid, entries: &mut Vec<VtableEntry>) -> Result<()> {
+    let Kind::Dyn(of, ..) = *cx.types.kind(vtable.object) else { bail!("a vtable for a type that is not a trait object") };
+    let (methods, supers) = (cx.vtable_methods(of)?, cx.vtable_supers(of)?);
+    let ends = laid.slots.iter().map(|slot| slot.at + 1).chain(laid.supers.iter().filter_map(|(_, at)| at.map(|at| at + 1)));
+    entries.resize(ends.max().unwrap_or(entries.len()).max(entries.len()), VtableEntry::Word(Word::Int(0)));
+    for slot in &laid.slots {
+        let found = methods.iter().position(|method| *method == Some(slot.method)).and_then(|at| vtable.methods.get(at)).and_then(Option::as_ref);
+        let Some(&Res::Fn(item, substs)) = found else { bail!("a vtable with no function for a method rustc's vtable holds") };
+        let index = reached_index_of(cx, reached, slots, (item, substs))?;
+        entries[slot.at] = VtableEntry::Word(Word::Int(crate::prep::entry(cx, slots, index, slot)?));
+    }
+    for &(inner, at) in &laid.supers {
+        let Some(at) = at else { continue };
+        let Some(found) = supers.iter().position(|&of| of == inner).and_then(|place| vtable.supers.get(place)) else { bail!("a vtable with no supertrait vtable rustc's vtable holds") };
+        entries[at] = VtableEntry::Super(build_vtable_id(cx, reached, slots, found)?);
+    }
+    Ok(())
+}
+
+fn code_word(cx: &Context<'_>, reached: &Reached, slots: &dyn Slots, res: Option<&Res>) -> Result<Word> {
+    match res {
+        None => Ok(Word::Int(0)),
+        Some(&Res::Fn(item, substs)) => reached_index_of(cx, reached, slots, (item, substs)).map(Word::Code),
+        Some(_) => bail!("a vtable entry that is not a function"),
+    }
+}
 
 impl Lower<'_, '_> {
-    pub(super) fn vtable(&mut self, vtable: &Vtable) -> Result<Value> {
-        let id = self.vtable_id(vtable)?;
-        Ok(self.emit_symbol(SymbolSource::Vtable(id)))
-    }
-
-    fn vtable_id(&mut self, vtable: &Vtable) -> Result<VtableId> {
-        let layout = self.cx.layout(vtable.ty)?;
-        let mut entries = vec![VtableEntry::Word(self.code_word(vtable.drop.as_ref())?), VtableEntry::Word(Word::Int(layout.size.bytes())), VtableEntry::Word(Word::Int(layout.align.bytes()))];
-        if let Some(laid) = crate::prep::vtable(self.cx, vtable.object) {
-            self.laid_entries(vtable, &laid, &mut entries)?;
-            return Ok(self.slots.vtable_id(&entries));
-        }
-        for method in &vtable.methods {
-            entries.push(VtableEntry::Word(self.code_word(method.as_ref())?));
-        }
-        for inner in &vtable.supers {
-            entries.push(VtableEntry::Super(self.vtable_id(inner)?));
-        }
-        Ok(self.slots.vtable_id(&entries))
-    }
-
-    /// Fills `entries` after the drop glue, size and alignment as rustc lays out a vtable of `vtable`'s trait object type: each method slot a function in rustc's convention that runs Haste's code, and each supertrait slot that supertrait's vtable.
-    fn laid_entries(&mut self, vtable: &Vtable, laid: &Laid, entries: &mut Vec<VtableEntry>) -> Result<()> {
-        let Kind::Dyn(of, ..) = *self.cx.types.kind(vtable.object) else { bail!("a vtable for a type that is not a trait object") };
-        let (methods, supers) = (self.cx.vtable_methods(of)?, self.cx.vtable_supers(of)?);
-        let ends = laid.slots.iter().map(|slot| slot.at + 1).chain(laid.supers.iter().filter_map(|(_, at)| at.map(|at| at + 1)));
-        entries.resize(ends.max().unwrap_or(entries.len()).max(entries.len()), VtableEntry::Word(Word::Int(0)));
-        for slot in &laid.slots {
-            let found = methods.iter().position(|method| *method == Some(slot.method)).and_then(|at| vtable.methods.get(at)).and_then(Option::as_ref);
-            let Some(&Res::Fn(item, substs)) = found else { bail!("a vtable with no function for a method rustc's vtable holds") };
-            let index = self.reached_index(item, substs)?;
-            entries[slot.at] = VtableEntry::Word(Word::Int(crate::prep::entry(self.cx, self.slots, index, slot)?));
-        }
-        for &(inner, at) in &laid.supers {
-            let Some(at) = at else { continue };
-            let Some(found) = supers.iter().position(|&of| of == inner).and_then(|place| vtable.supers.get(place)) else { bail!("a vtable with no supertrait vtable rustc's vtable holds") };
-            entries[at] = VtableEntry::Super(self.vtable_id(found)?);
-        }
-        Ok(())
+    pub(super) fn vtable(&mut self, expr: ExprId, vtable: &Vtable) -> Result<Value> {
+        let id = build_vtable_id(self.cx, self.reached, self.slots, vtable)?;
+        Ok(self.emit_symbol_with(SymbolSource::Vtable(id), RelocStep::VtableAt(expr)))
     }
 
     /// The wide pointer `wide` to a trait object of type `object` as a pointer to the supertrait object whose vtable slot `slot` of Haste's vtable holds: in rustc's layout, the same vtable when it starts with the supertrait's, else the one its slot holds.
@@ -83,14 +98,6 @@ impl Lower<'_, '_> {
         let kind = self.cx.types.kind(ty).clone();
         let children: Vec<Ty> = kind.children(&self.cx.types).collect();
         children.into_iter().find_map(|child| depth.checked_sub(1).and_then(|depth| self.object_in(child, depth)))
-    }
-
-    fn code_word(&self, res: Option<&Res>) -> Result<Word> {
-        match res {
-            None => Ok(Word::Int(0)),
-            Some(&Res::Fn(item, substs)) => self.reached_index(item, substs).map(Word::Code),
-            Some(_) => bail!("a vtable entry that is not a function"),
-        }
     }
 
     /// Lowers a trait object method: calls slot `slot` of the receiver's vtable with the receiver's data pointer and the other arguments, in rustc's convention and slot when every vtable of the object is laid out as rustc lays it out.

@@ -99,7 +99,7 @@ impl Lower<'_, '_> {
     pub(super) fn unary(&mut self, expr: ExprId, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
         if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
             let Some(value) = self.expr(operand)? else { return Ok(None) };
-            return self.invoke(item, substs, vec![value]);
+            return self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::Operator(expr)), item, substs, vec![value]);
         }
         let num = self.num(self.ty_of(operand))?;
         if let (UnOp::Neg, Num::Int { ty, .. }, Some(at)) = (op, num, self.int_literal(operand)) {
@@ -199,7 +199,7 @@ impl Lower<'_, '_> {
             let Some(value) = value else { return Ok(None) };
             values.push(value);
         }
-        self.invoke(item, substs, values)
+        self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::Operator(expr)), item, substs, values)
     }
 
     fn overloaded_assign(&mut self, (expr, lhs, rhs): (ExprId, ExprId, ExprId), (item, substs): (ItemRef, Substs)) -> Result<Option<Value>> {
@@ -209,7 +209,7 @@ impl Lower<'_, '_> {
         };
         let mut values = vec![place];
         values.extend(self.expr(rhs)?);
-        self.invoke(item, substs, values).map(|_| None)
+        self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::Operator(expr)), item, substs, values).map(|_| None)
     }
 
     pub(super) fn apply(&mut self, op: BinOp, num: Num, (x, y): (Value, Value), rhs: Num) -> Result<Value> {

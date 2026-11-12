@@ -73,7 +73,7 @@ impl Lower<'_, '_> {
         match self.typed.derefs.get(&(expr, step)).copied() {
             Some(Res::Fn(item, substs)) => {
                 let receiver = self.address_or_dangling(place, ty)?;
-                let Some(pointer) = self.invoke(item, substs, vec![receiver])? else { return Ok(None) };
+                let Some(pointer) = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::Deref(expr, step)), item, substs, vec![receiver])? else { return Ok(None) };
                 let index = self.reached_index(item, substs)?;
                 let ret = self.reached.list[index].1.as_ref().ok().and_then(|callee| callee.ret);
                 let Some(Kind::Ref(_, target)) = ret.map(|ret| self.cx.types.kind(ret).clone()) else { bail!("`{}` returns no reference", self.cx.name(item)) };
@@ -97,10 +97,10 @@ impl Lower<'_, '_> {
     }
 
     /// The reference that the deref coercion `steps` reaches from the reference `pointer`, one builtin dereference or `Deref::deref` call per step.
-    pub(super) fn deref_coerced(&mut self, mut pointer: Value, steps: Vec<(Ty, Option<Res>)>) -> Result<Option<Value>> {
-        for (ty, res) in steps {
+    pub(super) fn deref_coerced(&mut self, expr: ExprId, mut pointer: Value, steps: Vec<(Ty, Option<Res>)>) -> Result<Option<Value>> {
+        for (idx, (ty, res)) in steps.into_iter().enumerate() {
             pointer = match res {
-                Some(Res::Fn(item, substs)) => match self.invoke(item, substs, vec![pointer])? {
+                Some(Res::Fn(item, substs)) => match self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::CoercionDeref(expr, idx as u16)), item, substs, vec![pointer])? {
                     Some(next) => next,
                     None => return Ok(None),
                 },
@@ -305,7 +305,7 @@ impl Lower<'_, '_> {
             let Res::Fn(item, substs) = call else { bail!("a field clone that is not a call") };
             let offset = self.field_offset(ty, index as u32)?;
             let field = self.ins().iadd_imm(source, i64::from(offset));
-            values.push(self.invoke(item, substs, vec![field])?);
+            values.push(self.invoke(super::reloc::SiteOrigin::ShapeClone(index as u16), item, substs, vec![field])?);
         }
         match crate::sema::infer::cloned_tuple(self.cx, ty) {
             Some(tuple) => self.tuple_from(tuple, values),

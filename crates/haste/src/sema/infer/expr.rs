@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::body::{BinOp, Body, Expr, ExprId, List, Lit, TyId, UnOp};
+use crate::body::{BinOp, Expr, ExprId, List, Lit, TyId, UnOp};
 use crate::names::{ItemRef, Primitive};
 
 use super::super::ty::{Kind, Mut, Ty, float_bits, int_info};
@@ -282,19 +282,14 @@ impl Infer<'_, '_> {
         self.is_scalar(left) || is_compare(op) && matches!(kind, Kind::Ptr(..)) || matches!(op, BinOp::Eq | BinOp::Ne) && matches!(kind, Kind::FnPtr(..))
     }
 
-    pub(in crate::sema) fn is_builtin_operator(&mut self, body: &Body, expr: ExprId, exprs: &[Ty], index_step: Option<Ty>) -> bool {
-        match *body.expr(expr) {
-            Expr::Unary(op, operand) if op != UnOp::Deref => {
-                let ty = exprs[operand.0 as usize];
-                self.is_int(ty) || self.is_float(ty) || self.resolve(ty) == self.cx.types.bool()
-            }
-            Expr::Binary(op, lhs, rhs) => self.is_builtin_binary(op, exprs[lhs.0 as usize], exprs[rhs.0 as usize]),
-            Expr::AssignOp(op, lhs, rhs) => {
-                let (place, right) = (exprs[lhs.0 as usize], exprs[rhs.0 as usize]);
-                self.builtin_compound(op, place) && !matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..))
-            }
-            Expr::Index(_, idx) => index_step.is_some_and(|step| matches!(self.cx.types.kind(step), Kind::Array(..) | Kind::Slice(_))) && matches!(self.cx.types.kind(exprs[idx.0 as usize]), Kind::Prim(Primitive::Usize)),
-            _ => false,
+    pub(in crate::sema) fn is_builtin_op(&mut self, check: super::super::summary::OpCheck) -> bool {
+        use super::super::summary::OpCheck;
+        match check {
+            OpCheck::Unary(ty) => self.is_int(ty) || self.is_float(ty) || self.resolve(ty) == self.cx.types.bool(),
+            OpCheck::Binary(op, left, right) => self.is_builtin_binary(op, left, right),
+            OpCheck::AssignOp(op, place, right) => self.builtin_compound(op, place) && !matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..)),
+            OpCheck::Index(step, idx) => step.is_some_and(|s| matches!(self.cx.types.kind(s), Kind::Array(..) | Kind::Slice(_))) && matches!(self.cx.types.kind(idx), Kind::Prim(Primitive::Usize)),
+            OpCheck::Never => false,
         }
     }
 

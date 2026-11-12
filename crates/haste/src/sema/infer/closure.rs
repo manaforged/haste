@@ -629,9 +629,10 @@ pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Res
 
 /// Records the closures of the finished body `typed` of `parent` at `substs` in `cx`, so other bodies can call them.
 pub fn register(cx: &mut Context<'_>, (parent, substs): (ItemRef, Substs), typed: &Typed) {
-    if typed.closures.is_empty() {
+    if !typed.has_closures() {
         return;
     }
+    typed.ensure_tables(&cx.types);
     let shared = Arc::new(Typed { drops: Vec::new(), ..typed.clone() });
     for (at, closure) in &typed.closures {
         let ty = cx.types.intern(Kind::Closure(parent, substs, at.0));
