@@ -115,8 +115,26 @@ impl Batch {
         let reach_clock = sema::census::Clock::now();
         let main = if record_aot { Some(main_item(workspace, &compilation.outline).context("no member binary has a `main`")?) } else { None };
         let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, pick) };
-        crate::macros::reach_resolved(
+        let mut cache = Cache::default();
+        let substrate_key = crate::substrate::enabled().then(|| {
+            let target = crate::host_target();
+            (crate::substrate::toolchain_key(workspace, &target), crate::substrate::target_hash(&target))
+        });
+        let existing_sub = if let Some((key, target_key)) = substrate_key {
+            match crate::substrate::Substrate::open_toolchain(key) {
+                Ok(sub) if sub.toolchain_hash() == key && sub.target_hash() == target_key => {
+                    let sub = std::sync::Arc::new(sub);
+                    cache.set_substrate(Some(std::sync::Arc::clone(&sub)));
+                    Some(sub)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        crate::macros::reach_resolved_with_cache(
             compilation,
+            cache,
             |cx| match main {
                 Some(main) => sema::reach::main_roots(cx, main).map_or_else(|_| vec![(main, sema::substs::Substs::EMPTY)], Into::into),
                 None => root_insts.clone(),
@@ -126,6 +144,26 @@ impl Batch {
                 let codegen_clock = sema::census::Clock::now();
                 let (image, broken) = Image::build(&mut cx, &reached, record_aot)?;
                 let codegen_span = codegen_clock.elapsed();
+                if let Some((key, target_key)) = substrate_key
+                    && image.has_new_frozen_stencils()
+                {
+                    let mut builder = crate::substrate::Substrate::builder().toolchain_hash(key).target_hash(target_key);
+                    let save_res = (|| -> Result<()> {
+                        if let Some(ex) = &existing_sub {
+                            builder.merge_from(ex)?;
+                        }
+                        cx.store().export_sysroot_summaries(cx.outline, &mut builder)?;
+                        image.export_sysroot_stencils(&mut builder)?;
+                        let sub = builder.build()?;
+                        if sub.summary_count() > 0 || sub.stencil_count() > 0 {
+                            sub.save_toolchain()?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = save_res {
+                        eprintln!("haste: cannot save toolchain substrate: {error:#}");
+                    }
+                }
                 let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
                 let roots = match main {
                     Some(main) => sema::reach::main_roots(&mut cx, main)?.into_iter().map(|inst| reached.index[&inst]).collect(),
@@ -224,7 +262,7 @@ impl Build {
     /// Loads every crate of `workspace`, resolves its names and expands its macros, inferring and compiling nothing yet.
     pub fn load(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
         let outline_clock = sema::census::Clock::now();
-        let compilation = crate::macros::load_eager(workspace, targets, &[])?;
+        let compilation = crate::macros::load_lazy(workspace, targets)?;
         let stamps = stamps(workspace, &compilation.outline);
         let outline_span = outline_clock.elapsed();
         Ok(Build { compilation, cases: None, binary: None, program: None, stamps, outline_span })
@@ -233,6 +271,21 @@ impl Build {
     /// Infers and compiles the `case_` functions unless that is done.
     pub fn compile_cases(&mut self, workspace: &graph::Workspace) -> Result<()> {
         if self.cases.is_none() {
+            let members: Vec<usize> = self.compilation.outline.members(workspace).collect();
+            let mut loaded_more = false;
+            for member in members {
+                if self.compilation.outline.crates[member].partial() {
+                    self.compilation.outline.load_crate(member)?;
+                    loaded_more = true;
+                }
+            }
+            if loaded_more {
+                crate::macros::resolve(&mut self.compilation)?;
+                let errors = self.compilation.outline.local_errors(workspace);
+                if !errors.is_empty() {
+                    anyhow::bail!("{}", errors.join("\n"));
+                }
+            }
             self.cases = Some(Batch::new(workspace, &mut self.compilation, case_items, false)?);
         }
         Ok(())
@@ -350,7 +403,7 @@ impl Build {
         if !bin.broken.is_empty() {
             eprintln!("warning: {} functions did not compile (replaced by abort stubs)", bin.broken.len());
         }
-        let target = haste_codegen::Target::host().with(crate::profile().into());
+        let target = crate::host_target();
         bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]))?.write(path)?;
         eprintln!("built {} ({} functions reached, {:.1} ms)", path.display(), bin.reached.list.len(), started.elapsed().as_secs_f64() * 1e3);
         Ok(0)

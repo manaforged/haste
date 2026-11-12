@@ -129,9 +129,4 @@ impl Target {
         self.effort = effort;
         self
     }
-
-    /// This target with the code generator spending `effort` on each function.
-    pub fn with(&self, effort: Effort) -> Target {
-        Target { effort, ..*self }
-    }
 }

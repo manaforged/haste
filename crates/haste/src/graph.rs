@@ -149,8 +149,8 @@ fn patches_in(file: &Path, base: &Path) -> Result<Vec<PathBuf>> {
     Ok(entries.filter_map(|entry| entry.get("path")?.as_str()).map(|path| base.join(path)).collect())
 }
 
-fn members(top: &Path, workspace: Option<&toml::Table>) -> Vec<PathBuf> {
-    let listed = workspace.and_then(|ws| ws.get("members")).and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str);
+fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<PathBuf> {
+    let listed = workspace.and_then(|ws| ws.get(key)).and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str);
     listed
         .flat_map(|member| match member.strip_suffix("/*") {
             Some(parent) => subdirs(&top.join(parent)).unwrap_or_default().into_iter().filter(|dir| dir.join("Cargo.toml").is_file()).collect(),
@@ -168,8 +168,11 @@ fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Resu
     let mut paths = BTreeMap::new();
     let mut stack = vec![root.to_owned()];
     stack.extend(patch_paths(top)?);
-    stack.extend(members(top, workspace));
+    stack.extend(member_dirs(top, workspace, "members"));
     while let Some(dir) = stack.pop() {
+        if manifest_name(&dir).is_none() {
+            continue;
+        }
         let manifest = manifest::read(&dir, owning_workspace(&dir)?.as_ref())?;
         if paths.insert(manifest.name.clone(), dir.clone()).is_some() {
             continue;
@@ -213,19 +216,44 @@ pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Wo
     registries.insert(0, top.join("vendor"));
     let paths = local_paths(root, &top, workspace.as_ref())?;
     let mut packages = Vec::with_capacity(locked.len());
+    let mut missing: Vec<Option<anyhow::Error>> = Vec::with_capacity(locked.len());
     for entry in locked {
-        let dir = source_dir(&entry, &registries, &paths)?;
-        let owner = if entry.is_registry() { None } else { owning_workspace(&dir)? };
-        let manifest = manifest::read(&dir, owner.as_ref())?;
-        packages.push(Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false });
+        match source_dir(&entry, &registries, &paths) {
+            Ok(dir) => {
+                let owner = if entry.is_registry() { None } else { owning_workspace(&dir)? };
+                let manifest = manifest::read(&dir, owner.as_ref())?;
+                packages.push(Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false });
+                missing.push(None);
+            }
+            Err(err) => {
+                let manifest = manifest::Manifest { name: entry.name.clone(), ..manifest::Manifest::default() };
+                packages.push(Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false });
+                missing.push(Some(err));
+            }
+        }
     }
     resolve_deps(&mut packages);
-    let root_name = manifest::read(root, owning_workspace(root)?.as_ref())?.name;
-    let members: Vec<usize> = packages.iter().enumerate().filter(|(_, package)| !package.locked.is_registry() && package.locked.name == root_name).map(|(at, _)| at).collect();
+    let root_names: Vec<String> = if manifest_name(root).is_some() {
+        vec![manifest::read(root, owning_workspace(root)?.as_ref())?.name]
+    } else if root == top && workspace.is_some() {
+        let mut dirs = member_dirs(&top, workspace.as_ref(), "default-members");
+        if dirs.is_empty() {
+            dirs = member_dirs(&top, workspace.as_ref(), "members");
+        }
+        dirs.into_iter().filter_map(|dir| manifest_name(&dir)).collect()
+    } else {
+        vec![manifest::read(root, owning_workspace(root)?.as_ref())?.name]
+    };
+    let members: Vec<usize> = packages.iter().enumerate().filter(|(_, package)| !package.locked.is_registry() && root_names.contains(&package.locked.name)).map(|(at, _)| at).collect();
     if members.is_empty() {
-        bail!("{root_name} is not in Cargo.lock");
+        bail!("{} is not in Cargo.lock", root.display());
     }
     let graph = features::resolve(&packages, targets, &members, features);
+    for unit in &graph.units {
+        if let Some(err) = missing[unit.package].take() {
+            return Err(err);
+        }
+    }
     Ok(Workspace { packages, graph })
 }
 

@@ -277,7 +277,7 @@ pub fn entry(cx: &mut Context<'_>, slots: &dyn Slots, index: usize, method: &Met
         return Ok(address);
     }
     let func = bridge::entry(cx, (&method.params, method.ret), &method.carries, slots.entry(index))?;
-    let compiled = haste_codegen::compile(func, haste_codegen::Target::host()).map_err(|error| anyhow::anyhow!("compiling a vtable entry: {error:?}"))?;
+    let compiled = haste_codegen::compile(func, &crate::host_target()).map_err(|error| anyhow::anyhow!("compiling a vtable entry: {error:?}"))?;
     if !compiled.relocs().is_empty() || !compiled.sites().is_empty() {
         bail!("a vtable entry whose code names addresses it is placed at");
     }

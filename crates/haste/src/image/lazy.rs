@@ -513,7 +513,7 @@ impl Jit {
         match crate::prep::prepped(cx, &self.reached, index)? {
             crate::prep::Prepped::Direct(address) => Some(address),
             crate::prep::Prepped::Adapter(func) => {
-                let code = haste_codegen::compile(func, haste_codegen::Target::host()).ok()?;
+                let code = haste_codegen::compile(func, &crate::host_target()).ok()?;
                 self.image.with_pass(|_, pass| pass.memory.write_patched(&code, &[])).ok()
             }
         }

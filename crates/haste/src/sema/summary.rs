@@ -1,3 +1,4 @@
+pub mod codec;
 mod inst;
 
 pub use inst::PolyInst;
@@ -102,9 +103,32 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
         return None;
     }
     let summaries = cx.store.lookups.summaries.clone();
-    let built = summaries.run(cx, item, |cx| Ok(build_summary(cx, item, expected as u16)), |_| Ok(SummaryKind::MonomorphicFallback));
+    let built = summaries.run(
+        cx,
+        item,
+        |cx| {
+            if let Some(poly) = frozen_summary(cx, item) {
+                return Ok(SummaryKind::Poly(poly));
+            }
+            Ok(build_summary(cx, item, expected as u16))
+        },
+        |_| Ok(SummaryKind::MonomorphicFallback),
+    );
     let Ok(SummaryKind::Poly(summary)) = built else { return None };
     instantiate_summary(cx, *instance, &summary, unlaid, before)
+}
+
+fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
+    let tree = cx.outline.crates.get(item.krate as usize)?;
+    if !tree.env.release || !tree.env.fixed {
+        return None;
+    }
+    let substrate = cx.store.lookups.substrate.clone()?;
+    let key = crate::substrate::sysroot_item_key(cx.outline, item)?;
+    let bytes = substrate.summary(key)?;
+    cx.body(item).ok()?;
+    let index = cx.store.lookups.sysroot_index.get_or_init(|| Arc::new(codec::SysrootIndex::build(cx.outline, crate::substrate::sysroot_item_key)));
+    codec::decode_summary(index, &cx.types, bytes).ok().flatten().map(Arc::new)
 }
 
 fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {

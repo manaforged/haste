@@ -33,9 +33,9 @@ type Task = (usize, Crate, Vec<Option<Arc<View>>>);
 /// The lock over the board, and the signal that a task finished.
 type Lock = (Mutex<Board>, Condvar);
 
-/// Loads every module of every crate of `outline` on `workers` threads to the outline that loading level by level on one thread gives.
-pub(super) fn load_all(outline: &mut Outline, workers: usize) -> Result<()> {
-    let board = Board::new(std::mem::take(&mut outline.crates));
+/// Loads every module of each crate where `selected[krate]` is true on `workers` threads.
+pub(super) fn load_selected(outline: &mut Outline, workers: usize, selected: &[bool]) -> Result<()> {
+    let board = Board::new(std::mem::take(&mut outline.crates), selected);
     let shared = Shared { cache: &outline.cache, deps: &outline.deps, reads: reads(&outline.deps) };
     let lock: Lock = (Mutex::new(board), Condvar::new());
     std::thread::scope(|scope| {
@@ -57,9 +57,9 @@ fn reads(deps: &[Vec<(String, usize)>]) -> Vec<Vec<usize>> {
 }
 
 impl Board {
-    fn new(crates: Vec<Crate>) -> Board {
+    fn new(crates: Vec<Crate>, selected: &[bool]) -> Board {
         let views = crates.iter().map(|tree| vec![Arc::new(tree.view())]).collect();
-        let done = crates.iter().map(|tree| !tree.partial()).collect();
+        let done = crates.iter().enumerate().map(|(at, tree)| !selected.get(at).copied().unwrap_or(false) || !tree.partial()).collect();
         Board { crates: crates.into_iter().map(Some).collect(), views, done, running: 0, failed: None }
     }
 

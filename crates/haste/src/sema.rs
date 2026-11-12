@@ -100,6 +100,8 @@ struct Lookups {
     impl_traits: Table<impls::ImplRef, Option<ItemRef>>,
     selections: Table<(ItemRef, ty::Ty, substs::Substs), Option<(impls::ImplRef, substs::Substs)>>,
     summaries: table::Flight<ItemRef, summary::SummaryKind>,
+    substrate: Option<Arc<crate::substrate::Substrate>>,
+    sysroot_index: Arc<std::sync::OnceLock<Arc<summary::codec::SysrootIndex>>>,
 }
 
 /// What answering the asks of a pass added: nothing new to infer with, the output of procedural macros that function bodies call, or loaded files, resolved names and expanded items.
@@ -111,36 +113,103 @@ pub enum Answer {
 }
 
 impl Lookups {
-    /// The lookups that depend only on loaded source and so hold while it does: the impl indexes of crates built without asking for anything, the lang items, and the outline extent they were built at.
-    fn after_pass(&mut self) -> Lookups {
+    /// The lookups that hold across a wave answer: everything on `Nothing`/`Bodies`, and settled summaries, complete crate impl indexes, and item metadata on `Names`.
+    fn after_pass(&mut self, answer: Answer) -> Lookups {
+        if !matches!(answer, Answer::Names) {
+            return std::mem::take(self);
+        }
         let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
-        let discriminants = self.discriminants.clone();
-        let state = Arc::clone(&self.state);
-        Lookups { heads, discriminants, state, ..Lookups::default() }
+        Lookups {
+            heads,
+            trait_defs: std::mem::take(&mut self.trait_defs),
+            discriminants: std::mem::take(&mut self.discriminants),
+            state: Arc::clone(&self.state),
+            drops: std::mem::take(&mut self.drops),
+            fields: std::mem::take(&mut self.fields),
+            futures: std::mem::take(&mut self.futures),
+            impl_traits: std::mem::take(&mut self.impl_traits),
+            summaries: std::mem::take(&mut self.summaries),
+            substrate: self.substrate.clone(),
+            sysroot_index: Arc::clone(&self.sysroot_index),
+            ..Lookups::default()
+        }
     }
 
-    /// Drops the impl indexes and lang items when `outline` loaded, expanded or consumed anything since they were built, and records its extent now.
+    /// Drops only the crate impl indexes (and summaries/discriminants if items were consumed) for crates whose extent changed since they were built.
     fn check(&mut self, outline: &Outline) {
         let loaded: Vec<[usize; 5]> = outline.crates.iter().map(crate::outline::tree::Crate::extent).collect();
         let mut guard = write_lock(&self.state.loaded);
         if *guard != loaded {
-            self.heads.clear();
-            self.discriminants.clear();
+            if guard.len() == loaded.len() {
+                self.heads.retain(|holder, _| match *holder {
+                    impls::Holder::Crate(k) => guard.get(k as usize) == loaded.get(k as usize),
+                    impls::Holder::Body(item) => guard.get(item.krate as usize) == loaded.get(item.krate as usize),
+                });
+                if guard.iter().zip(&loaded).any(|(a, b)| a[3] != b[3]) {
+                    self.summaries = table::Flight::default();
+                    self.discriminants.clear();
+                }
+            } else {
+                self.heads.clear();
+                self.discriminants.clear();
+                self.summaries = table::Flight::default();
+            }
             *write_lock(&self.state.langs) = None;
+            self.sysroot_index = Arc::new(std::sync::OnceLock::new());
             *guard = loaded;
         }
     }
 }
 
 impl Cache {
-    /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.
-    pub fn forget_lookups(&mut self) {
-        self.lookups = Lookups::default();
+    /// Attaches a frozen sysroot substrate to serve pre-computed `PolySummary` entries.
+    pub fn set_substrate(&mut self, substrate: Option<Arc<crate::substrate::Substrate>>) {
+        self.lookups.substrate = substrate;
+        self.lookups.sysroot_index = Arc::new(std::sync::OnceLock::new());
     }
 
-    /// Drops the cached lookups that an answer may make stale, keeping those that depend only on loaded source, which the next `Context::new` drops if the answer changed that source.
-    pub fn forget_after(&mut self, _: Answer) {
-        self.lookups = self.lookups.after_pass();
+    /// Returns the attached frozen sysroot substrate, if any.
+    pub fn substrate(&self) -> Option<&Arc<crate::substrate::Substrate>> {
+        self.lookups.substrate.as_ref()
+    }
+
+    /// Encodes all settled sysroot `PolySummary` entries into `builder`.
+    pub fn export_sysroot_summaries(&self, outline: &Outline, builder: &mut crate::substrate::SubstrateBuilder) -> Result<()> {
+        let mut err = None;
+        self.lookups.summaries.for_each_ready(|&item, kind| {
+            if err.is_some() {
+                return;
+            }
+            let tree = &outline.crates[item.krate as usize];
+            if !tree.env.release || !tree.env.fixed {
+                return;
+            }
+            if let summary::SummaryKind::Poly(summary) = kind
+                && let Some(key) = crate::substrate::sysroot_item_key(outline, item)
+                && let Ok(Some(bytes)) = summary::codec::encode_summary(outline, &self.types, summary, crate::substrate::sysroot_item_key)
+                && let Err(e) = builder.add_summary(key, &bytes)
+            {
+                err = Some(e);
+            }
+        });
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.
+    pub fn forget_lookups(&mut self) {
+        self.lookups = Lookups {
+            substrate: self.lookups.substrate.clone(),
+            sysroot_index: Arc::clone(&self.lookups.sysroot_index),
+            ..Lookups::default()
+        };
+    }
+
+    /// Drops the cached lookups that `answer` may make stale, keeping settled summaries and unchanged crate indexes.
+    pub fn forget_after(&mut self, answer: Answer) {
+        self.lookups = self.lookups.after_pass(answer);
     }
 
     /// Drops what the store keeps about the items that `edited` holds, and about the instances, types and lookups that name one of them.
@@ -302,6 +371,11 @@ pub struct Alias {
 type Kids = HashMap<Option<u32>, Arc<[u32]>>;
 
 impl<'a> Context<'a> {
+    /// Returns the shared inference cache attached to this context.
+    pub(crate) fn store(&self) -> &Cache {
+        &self.store
+    }
+
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, mut store: Cache) -> Context<'a> {
         let types = store.types.clone();

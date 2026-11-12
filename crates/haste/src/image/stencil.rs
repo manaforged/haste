@@ -46,7 +46,7 @@ impl DictConfig {
 
 /// The host target with the code generator's effort set by the build profile.
 fn target() -> Target {
-    Target::host().with(crate::profile().into())
+    crate::host_target()
 }
 
 impl From<Profile> for Effort {
@@ -149,53 +149,18 @@ enum VerifyRecord {
 struct FreshSlots<'a>(&'a Image, lower::Bodies);
 
 impl Slots for FreshSlots<'_> {
-    fn entry(&self, index: usize) -> i64 {
-        self.0.entry(index)
-    }
-
-    fn data(&self, bytes: &[u8]) -> i64 {
-        self.0.data(bytes)
-    }
-
-    fn zeroed(&self, len: usize) -> i64 {
-        self.0.zeroed(len)
-    }
-
-    fn table(&self, words: &[Word]) -> i64 {
-        self.0.table(words)
-    }
-
-    fn cell(&self, index: usize, size: u32) -> i64 {
-        self.0.cell(index, size)
-    }
-
-    fn want(&self, instance: crate::sema::reach::Instance) {
-        self.0.want(instance);
-    }
-
-    fn wanted_len(&self) -> usize {
-        self.0.wanted_len()
-    }
-
-    fn bodies(&self) -> &lower::Bodies {
-        &self.1
-    }
-
-    fn low_entries(&self) -> bool {
-        self.0.low_entries()
-    }
-
-    fn rodata(&self, bytes: &[u8], relocs: &[RodataReloc]) -> RodataId {
-        self.0.rodata(bytes, relocs)
-    }
-
-    fn vtable_id(&self, entries: &[VtableEntry]) -> VtableId {
-        self.0.vtable_id(entries)
-    }
-
-    fn resolve_symbol(&self, sym: &SymbolSource) -> u64 {
-        self.0.resolve_symbol(sym)
-    }
+    fn entry(&self, index: usize) -> i64 { self.0.entry(index) }
+    fn data(&self, bytes: &[u8]) -> i64 { self.0.data(bytes) }
+    fn zeroed(&self, len: usize) -> i64 { self.0.zeroed(len) }
+    fn table(&self, words: &[Word]) -> i64 { self.0.table(words) }
+    fn cell(&self, index: usize, size: u32) -> i64 { self.0.cell(index, size) }
+    fn want(&self, instance: crate::sema::reach::Instance) { self.0.want(instance); }
+    fn wanted_len(&self) -> usize { self.0.wanted_len() }
+    fn bodies(&self) -> &lower::Bodies { &self.1 }
+    fn low_entries(&self) -> bool { self.0.low_entries() }
+    fn rodata(&self, bytes: &[u8], relocs: &[RodataReloc]) -> RodataId { self.0.rodata(bytes, relocs) }
+    fn vtable_id(&self, entries: &[VtableEntry]) -> VtableId { self.0.vtable_id(entries) }
+    fn resolve_symbol(&self, sym: &SymbolSource) -> u64 { self.0.resolve_symbol(sym) }
 }
 
 fn item_err(cx: &Context<'_>, item: ItemRef, err: impl std::fmt::Display) -> String {
@@ -456,10 +421,38 @@ impl Image {
         }
     }
 
+    fn try_frozen_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &GroupWork, cfg: DictConfig, pass: &mut Pass) -> Option<Result<(), String>> {
+        let tree = &cx.outline.crates[group.item.krate as usize];
+        if !tree.env.release || !tree.env.fixed { return None; }
+        let substrate = cx.store().substrate()?;
+        let item_key = crate::substrate::sysroot_item_key(cx.outline, group.item)?;
+        let slice = substrate.stencil(item_key, group.footprint.0)?;
+        let sites = cfg.verify.then(|| slice.decode_sites()).transpose().ok()?;
+        let mut records = Vec::new();
+        for inst in &group.distinct {
+            let patched = crate::substrate::patch_stencil(&slice, &inst.symbols).ok()?;
+            let exec = match pass.memory.write(&patched) { Ok(exec) => exec, Err(e) => return Some(Err(item_err(cx, group.item, e))) };
+            self.store_instance(inst, exec);
+            pass.record_size(inst.leader, patched.len() as u32, 0);
+            if let Some(sites) = &sites {
+                for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {
+                    records.push((idx, VerifyRecord::Patched { exec, len: slice.code().len(), sites: sites.clone() }));
+                }
+            }
+        }
+        Some(self.finish_verify(cx, reached, &records))
+    }
+
     pub(super) fn compile_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &mut GroupWork, cfg: DictConfig, record_cache: bool, pass: &mut Pass) -> Result<(), String> {
         let rep = group.representative();
         if cfg.min_bytes == 0 && group.distinct.len() >= cfg.min_fanout {
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);
+        }
+        if !self.jit_mode
+            && self.aot.is_none()
+            && let Some(exec_ok) = self.try_frozen_group(cx, reached, group, cfg, pass)
+        {
+            return exec_ok;
         }
         let started = std::time::Instant::now();
         let out = match group.leader_out.take() {
@@ -468,6 +461,14 @@ impl Image {
         };
         let reloc_plan = out.reloc_plan;
         let code = Arc::new(haste_codegen::compile(out.func, &target()).map_err(|e| item_err(cx, group.item, e))?);
+        let tree = &cx.outline.crates[group.item.krate as usize];
+        if tree.env.release
+            && tree.env.fixed
+            && code.relocs().iter().all(|r| r.symbol_index().is_some())
+            && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, group.item)
+        {
+            pass.frozen_stencils.push((item_key, group.footprint.0, Arc::clone(&code)));
+        }
         if code.bytes().len() > cfg.min_bytes && group.distinct.len() >= cfg.min_fanout {
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);

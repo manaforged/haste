@@ -66,6 +66,7 @@ pub(super) struct Pass {
     memory: Memory,
     stencils: stencil::StencilState,
     records: Vec<(usize, u32, u64)>,
+    frozen_stencils: Vec<(u64, u128, std::sync::Arc<haste_codegen::Code>)>,
 }
 
 impl Pass {
@@ -80,6 +81,22 @@ impl Pass {
     fn merge(&mut self, other: Pass) {
         self.memory.merge(other.memory);
         self.records.extend(other.records);
+        self.frozen_stencils.extend(other.frozen_stencils);
+    }
+}
+
+impl Image {
+    /// Returns whether this image compiled any new sysroot stencils not yet in a substrate.
+    pub(crate) fn has_new_frozen_stencils(&self) -> bool {
+        !self.pass.frozen_stencils.is_empty()
+    }
+
+    /// Appends all newly compiled sysroot `Effort::Full` stencils from this image into `builder`.
+    pub(crate) fn export_sysroot_stencils(&self, builder: &mut crate::substrate::SubstrateBuilder) -> Result<()> {
+        for (item_key, fp, code) in &self.pass.frozen_stencils {
+            builder.add_code_stencil(*item_key, *fp, code)?;
+        }
+        Ok(())
     }
 }
 

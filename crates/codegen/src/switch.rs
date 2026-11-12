@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::fold::extend;
 use crate::ir::{Binary, Block, BlockData, Convert, Function, InstData, IntCC, Op, Type, Value};
@@ -125,7 +125,7 @@ pub(crate) fn run(func: &mut Function) {
             cur = next.index();
         }
         let ty = func.ty(v);
-        let mut seen: HashMap<u64, (i64, Block, Vec<Value>)> = HashMap::new();
+        let mut seen: HashMap<u64, (i64, Block, Vec<Value>)> = HashMap::default();
         for (imm, hit, hit_args) in arms {
             let u = extend(imm, ty, false) as u64;
             seen.entry(u).or_insert((imm, hit, hit_args));

@@ -250,12 +250,24 @@ impl Outline {
 
     /// Reads every module of every crate, level by level of each module tree; with more than one job, crates load on several threads to the same result.
     pub fn load_all(&mut self) -> Result<()> {
-        let workers = crate::jobs().min(self.crates.len());
+        self.load_selected(&vec![true; self.crates.len()])
+    }
+
+    /// Reads every module of each crate where `selected[krate]` is true, level by level; with more than one job, crates load on several threads.
+    pub fn load_selected(&mut self, selected: &[bool]) -> Result<()> {
+        let count = selected.iter().filter(|&&on| on).count();
+        let workers = crate::jobs().min(count);
         if workers > 1 {
-            return parallel::load_all(self, workers);
+            return parallel::load_selected(self, workers, selected);
         }
-        while self.crates.iter().any(Crate::partial) {
-            let modules: Vec<(usize, usize)> = self.crates.iter().enumerate().flat_map(|(krate, tree)| tree.declared().map(move |at| (krate, at))).collect();
+        while self.crates.iter().enumerate().any(|(at, tree)| selected.get(at).copied().unwrap_or(false) && tree.partial()) {
+            let modules: Vec<(usize, usize)> = self
+                .crates
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| selected.get(*at).copied().unwrap_or(false))
+                .flat_map(|(krate, tree)| tree.declared().map(move |at| (krate, at)))
+                .collect();
             self.load_many(&modules)?;
         }
         Ok(())

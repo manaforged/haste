@@ -16,6 +16,7 @@ mod prep;
 mod scripts;
 mod sema;
 mod serve;
+mod substrate;
 mod sync;
 
 use std::sync::OnceLock;
@@ -42,6 +43,11 @@ static PROFILE: OnceLock<outline::tree::Profile> = OnceLock::new();
 /// The build profile: the one `--release` set, else the debug profile.
 fn profile() -> outline::tree::Profile {
     *PROFILE.get_or_init(outline::tree::Profile::default)
+}
+
+/// The host target with the code generator's effort set by the build profile.
+pub(crate) fn host_target() -> haste_codegen::Target {
+    haste_codegen::Target::host().effort(profile().into())
 }
 
 /// Sets the build profile once, before any work reads it.
