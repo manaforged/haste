@@ -32,15 +32,16 @@ const REGS: Regs<Reg> = Regs {
 };
 
 /// Encodes `func` as x86-64 machine code.
-pub(crate) fn compile(func: &Function) -> Result<Code, String> {
+pub(crate) fn compile(func: &Function, effort: crate::Effort) -> Result<Code, String> {
     let order = crate::live::order(func);
     let abi = classify(&func.signature)?;
-    let plan = plan(func, &REGS, &order, &abi.params, classify);
+    let plan = plan(func, &REGS, (&order, effort == crate::Effort::Full), &abi.params, classify);
     let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, classify)?;
+    let framed = crate::frame::framed(func, &frame, abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..))));
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let copied = crate::live::copied_tests(func, &order);
-    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, features: Features::host(), copied }.run(order)
+    Emit { func, frame, framed, abi, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, features: Features::host(), copied }.run(order)
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -83,6 +84,7 @@ pub(super) enum Ext {
 pub(super) struct Emit<'a> {
     func: &'a Function,
     frame: Frame<Reg>,
+    framed: bool,
     abi: Abi,
     asm: Asm,
     blocks: Vec<Label>,
@@ -150,6 +152,9 @@ impl Emit<'_> {
     }
 
     fn prologue(&mut self) {
+        if !self.framed {
+            return;
+        }
         self.asm.push(Reg::Rbp);
         self.asm.mov(Reg::Rbp, Reg::Rsp);
         let size = self.frame.size;
@@ -180,7 +185,7 @@ impl Emit<'_> {
         for (index, reg) in self.frame.saves.iter().enumerate() {
             self.asm.load(Size::Q, *reg, save_slot(index));
         }
-        self.asm.bytes(&[0xC9, 0xC3]);
+        self.asm.bytes(if self.framed { &[0xC9, 0xC3] } else { &[0xC3] });
     }
 
     /// Moves the entry parameters to their locations, those in memory first, so each reads its arrival register before a register location overwrites it.

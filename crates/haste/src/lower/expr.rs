@@ -259,7 +259,7 @@ impl Lower<'_, '_> {
     fn item_path(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         match self.cx.item(item).1.kind {
             ItemKind::Static => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
-            ItemKind::Const => self.invoke(item, substs, Vec::new()),
+            ItemKind::Const => self.constant(expr, item, substs),
             _ => Ok(None),
         }
     }

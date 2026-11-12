@@ -37,7 +37,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
     let order = crate::live::order(func);
     let abi = classify(&func.signature, packing)?;
-    let plan = plan(func, &REGS, &order, &abi.params, |sig| classify(sig, packing));
+    let plan = plan(func, &REGS, (&order, target.effort == crate::Effort::Full), &abi.params, |sig| classify(sig, packing));
     let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, |sig| classify(sig, packing))?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();

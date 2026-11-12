@@ -12,7 +12,9 @@ mod memory;
 mod fold;
 mod fill;
 mod frame;
+mod licm;
 mod live;
+mod loads;
 mod merge;
 mod native;
 mod probe;
@@ -115,6 +117,10 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
     fold::run(func);
     merge::run(func);
     cse::run(func);
+    if effort == Effort::Full {
+        loads::run(func);
+        licm::run(func);
+    }
     returns::run(func);
 }
 
@@ -129,7 +135,7 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     native::lower(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
     let code = match target.arch {
-        Arch::X64 => x64::compile(&func),
+        Arch::X64 => x64::compile(&func, target.effort),
         Arch::Arm64 => arm64::compile(&func, target),
         other => Err(format!("no encoder for {other:?} yet")),
     };

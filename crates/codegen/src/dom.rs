@@ -67,14 +67,20 @@ fn immediate(order: &[Block], preds: &[Vec<Block>], blocks: usize) -> Vec<Option
     idom
 }
 
-/// The blocks each block reachable from `entry` immediately dominates.
-pub(crate) fn dominated(func: &Function, entry: Block) -> Vec<Vec<Block>> {
+/// The reachable blocks of `func` in reverse postorder, the reachable predecessors of each block, and the immediate dominator of each reachable block.
+pub(crate) fn dominators(func: &Function, entry: Block) -> (Vec<Block>, Vec<Vec<Block>>, Vec<Option<Block>>) {
     let order = reverse_postorder(func, entry);
     let mut preds = vec![Vec::new(); func.blocks.len()];
     for &block in &order {
         func.successors(block).for_each(|target| preds[target.index()].push(block));
     }
     let idom = immediate(&order, &preds, func.blocks.len());
+    (order, preds, idom)
+}
+
+/// The blocks each block reachable from `entry` immediately dominates.
+pub(crate) fn dominated(func: &Function, entry: Block) -> Vec<Vec<Block>> {
+    let (order, _, idom) = dominators(func, entry);
     let mut children = vec![Vec::new(); func.blocks.len()];
     for &block in &order[1..] {
         if let Some(parent) = idom[block.index()] {

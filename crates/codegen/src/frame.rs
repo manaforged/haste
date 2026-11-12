@@ -121,6 +121,11 @@ pub(crate) fn saved<R: Copy>(func: &Function, used: &[R], all: &[R]) -> Vec<R> {
     if handles { all.to_vec() } else { used.to_vec() }
 }
 
+/// Whether a function needs a frame of its own: one that saves registers, keeps anything in memory, calls, reads its frame pointer or takes arguments on the stack.
+pub(crate) fn framed<R>(func: &Function, frame: &Frame<R>, stack_params: bool) -> bool {
+    stack_params || frame.size > 0 || !frame.saves.is_empty() || live_ops(func).any(|op| matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::FramePointer))
+}
+
 fn needs<R>(func: &Function, classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<(u32, u32), String> {
     let (mut outgoing, mut scratch) = (0, 0);
     for op in live_ops(func) {

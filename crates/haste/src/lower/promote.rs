@@ -1,17 +1,20 @@
 use anyhow::Result;
 use haste_codegen::{IntCC, Type, Value};
 
-use crate::body::{BlockKind, Expr, ExprId, UnOp};
+use crate::body::literal::{byte_value, char_value};
+use crate::body::{BlockKind, Body, Expr, ExprId, Lit, UnOp};
 use crate::host::HostSymbol;
 use crate::names::{ItemRef, Primitive};
 use crate::outline::item::ItemKind;
-use crate::sema::infer::Res;
+use crate::outline::source::Source;
+use crate::sema::Context;
+use crate::sema::infer::{Res, Shape, parse_int};
 use crate::sema::substs::Substs;
-use crate::sema::ty::Ty;
+use crate::sema::ty::{Kind, Mut, Ty, int_info, mask};
 
 use super::place::{Base, Place};
 use super::stencil::SymbolSource;
-use super::{Lower, repr};
+use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
     /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a function, a closure that captures nothing, a constructor, a shared reference to one, an aggregate or constructor call of them, or a field of one; in a constant or static initializer, which the compiler evaluates once, also a call, operator or block of them.
@@ -56,6 +59,9 @@ impl Lower<'_, '_> {
 
     /// The address of a program-lifetime cell that holds `expr`, which the first use fills.
     pub fn promoted(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        if let Some(address) = self.literal_place(expr)? {
+            return Ok(Some(address));
+        }
         let ty = self.ty_of(expr);
         let size = self.cx.layout(ty)?.size.bytes() as usize;
         let seq = self.promoted_seq;
@@ -135,5 +141,110 @@ impl Lower<'_, '_> {
             self.mark_static()?;
         }
         self.finish(None)
+    }
+}
+
+/// The most bytes of a constant that lowering lays out from its literals.
+const LITERAL_BYTES: usize = 1 << 16;
+
+/// The bits of the scalar literal `expr` of `body` as a value of `primitive`, when it is one the compiler reads without running anything.
+fn literal_scalar((body, src): (&Body, &Source), expr: ExprId, primitive: Primitive) -> Option<u128> {
+    let int = int_info(primitive);
+    let value = match *body.expr(expr) {
+        Expr::Paren(inner) => literal_scalar((body, src), inner, primitive)?,
+        Expr::Lit(Lit::Bool(value), _) if primitive == Primitive::Bool => u128::from(value),
+        Expr::Lit(Lit::Int, at) if int.is_some() => parse_int(src.text(at)).ok()?.0,
+        Expr::Lit(Lit::Byte, at) if primitive == Primitive::U8 => u128::from(byte_value(src.text(at)).ok()?),
+        Expr::Lit(Lit::Char, at) if primitive == Primitive::Char => u128::from(u32::from(char_value(src.text(at)).ok()?)),
+        Expr::Unary(UnOp::Neg, inner) if int.is_some_and(|(_, signed)| signed) => literal_scalar((body, src), inner, primitive)?.wrapping_neg(),
+        _ => return None,
+    };
+    Some(int.map_or(value, |(bits, _)| value & mask(bits)))
+}
+
+/// Appends to `out` the bytes of `expr` of `body`, a value of `ty`, when it is made of literals only: arrays and repeats of integer, `bool` and `char` literals.
+fn literal_bytes(cx: &Context<'_>, arena: (&Body, &Source), (expr, ty): (ExprId, Ty), out: &mut Vec<u8>) -> Option<()> {
+    let (body, _) = arena;
+    match (*body.expr(expr), cx.types.kind(ty)) {
+        (Expr::Paren(inner), _) => literal_bytes(cx, arena, (inner, ty), out),
+        (Expr::Array(list), &Kind::Array(elem, _)) => body.list(list).iter().try_for_each(|&at| literal_bytes(cx, arena, (ExprId(at), elem), out)),
+        (Expr::Repeat(item, _), &Kind::Array(elem, count)) => {
+            let mut one = Vec::new();
+            literal_bytes(cx, arena, (item, elem), &mut one)?;
+            let count = usize::try_from(cx.types.len(count)?).ok()?;
+            (one.len().checked_mul(count)? + out.len() <= LITERAL_BYTES).then(|| out.extend(one.repeat(count)))
+        }
+        (_, &Kind::Prim(primitive)) => {
+            let size = match primitive {
+                Primitive::Bool => 1,
+                Primitive::Char => 4,
+                _ => int_info(primitive)?.0 as usize / 8,
+            };
+            let bits = literal_scalar(arena, expr, primitive)?;
+            (out.len() + size <= LITERAL_BYTES).then(|| out.extend_from_slice(&bits.to_le_bytes()[..size]))
+        }
+        _ => None,
+    }
+}
+
+impl Lower<'_, '_> {
+    /// The value of the constant `item` at `substs` that `expr` reads: an immediate, or bytes laid out once, when its body is literals of a crate that cannot change while haste runs; else a call of its body.
+    pub(super) fn constant(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
+        match self.literal_constant(expr, item, substs)? {
+            Some(value) => Ok(Some(value)),
+            None => self.invoke(item, substs, Vec::new()),
+        }
+    }
+
+    fn literal_constant(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
+        let index = self.reached_index(item, substs)?;
+        let ((source, _), Ok(typed)) = &self.reached.list[index] else { return Ok(None) };
+        let env = &self.cx.outline.crates[source.krate as usize].env;
+        if !matches!(typed.shape, Shape::Body) || !(env.release || env.fixed) {
+            return Ok(None);
+        }
+        let (source, ty) = (*source, typed.ret_ty());
+        let body = self.cx.body(source)?;
+        let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
+        match (repr(self.cx, ty)?, self.cx.types.kind(ty)) {
+            (Repr::Scalar(machine), &Kind::Prim(primitive)) => Ok(literal_scalar((&body, src), root, primitive).map(|bits| self.int_const(machine, bits))),
+            (Repr::Mem { .. }, Kind::Array(..)) if !self.lent_mutably(expr) => {
+                let mut bytes = Vec::new();
+                if literal_bytes(self.cx, (&body, src), (root, ty), &mut bytes).is_none() {
+                    return Ok(None);
+                }
+                let id = self.slots.rodata(&bytes, &[]);
+                Ok(Some(self.emit_symbol(SymbolSource::Rodata(id))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The address of the bytes the compiler laid out for `expr` when it names a constant made of literals that lives in memory.
+    fn literal_place(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        let inner = self.transparent(expr).unwrap_or(expr);
+        let Some(&Res::Fn(item, substs)) = self.typed.res.get(&inner).filter(|_| matches!(self.body.expr(inner), Expr::Path(_))) else { return Ok(None) };
+        if self.cx.item(item).1.kind != ItemKind::Const || !matches!(repr(self.cx, self.ty_of(inner))?, Repr::Mem { .. }) {
+            return Ok(None);
+        }
+        self.literal_constant(inner, item, substs)
+    }
+
+    /// Whether the body writes through or lends mutably a place whose root is the value `expr`.
+    fn lent_mutably(&self, expr: ExprId) -> bool {
+        let mutable = |at: ExprId| match *self.body.expr(at) {
+            Expr::Assign(lhs, _) | Expr::AssignOp(_, lhs, _) | Expr::Ref { mutable: true, expr: lhs, .. } => self.place_root(lhs) == expr,
+            Expr::Method { receiver, .. } => self.typed.adjusts.get(&at).is_some_and(|adjust| adjust.autoref == Some(Mut::Mut)) && self.place_root(receiver) == expr,
+            _ => false,
+        };
+        self.typed.ref_binds.values().any(|binding| *binding == Mut::Mut) || (0..self.body.exprs.len() as u32).map(ExprId).any(mutable)
+    }
+
+    /// The expression a place expression `expr` projects from through fields, indexes and parentheses.
+    fn place_root(&self, expr: ExprId) -> ExprId {
+        match *self.body.expr(expr) {
+            Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _) => self.place_root(base),
+            _ => self.transparent(expr).map_or(expr, |inner| self.place_root(inner)),
+        }
     }
 }

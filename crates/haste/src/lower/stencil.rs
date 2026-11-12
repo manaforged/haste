@@ -289,20 +289,22 @@ fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_
     (edges, info.self_loop, info.complete)
 }
 
-/// The functions a closure's own body calls; its typed data is its parent's, whose calls hold those of every closure in the parent's body.
+/// The functions a closure's own body calls; its typed data is its parent's, whose calls hold those of every closure in the parent's body, so each table is read at the closure's own expressions.
 fn closure_calls(cx: &mut Context<'_>, typed: &Typed) -> Option<Vec<(ItemRef, Substs)>> {
     let Shape::Closure(closure) = &typed.shape else { return None };
     let body = cx.body(closure.parent).ok()?;
     let own = own_exprs(&body, closure.closure.body);
-    let mine = |expr: &ExprId| own.get(expr.0 as usize).copied().unwrap_or(false);
-    let direct = [&typed.res, &typed.operators, &typed.try_blocks, &typed.box_frees].into_iter().flat_map(|map| map.iter().filter(|(expr, _)| mine(expr)).map(|(_, res)| res));
-    let derefs = typed.derefs.iter().filter(|((expr, _), _)| mine(expr)).map(|(_, res)| res);
-    let loops = typed.fors.iter().filter(|(expr, _)| mine(expr)).flat_map(|(_, each)| [&each.into_iter, &each.next]);
-    let tries = typed.tries.iter().filter(|(expr, _)| mine(expr)).flat_map(|(_, each)| [&each.branch, &each.from_residual]);
-    let awaits = typed.awaits.iter().filter(|(expr, _)| mine(expr)).flat_map(|(_, each)| [&each.into_future, &each.poll]);
-    let coerced = typed.coercions.iter().filter(|(expr, _)| mine(expr)).flat_map(|(_, coercion)| coercion_calls(coercion));
+    let mut calls: Vec<&Res> = Vec::new();
+    for expr in &own {
+        calls.extend([&typed.res, &typed.operators, &typed.try_blocks, &typed.box_frees].into_iter().filter_map(|map| map.get(expr)));
+        calls.extend(typed.fors.get(expr).into_iter().flat_map(|each| [&each.into_iter, &each.next]));
+        calls.extend(typed.tries.get(expr).into_iter().flat_map(|each| [&each.branch, &each.from_residual]));
+        calls.extend(typed.awaits.get(expr).into_iter().flat_map(|each| [&each.into_future, &each.poll]));
+        calls.extend(typed.coercions.get(expr).into_iter().flat_map(coercion_calls));
+    }
+    let derefs = typed.derefs.iter().filter(|((expr, _), _)| own.binary_search(expr).is_ok()).map(|(_, res)| res);
     let shared = typed.pat_res.values().chain(&typed.drops);
-    let all = direct.chain(derefs).chain(loops).chain(tries).chain(awaits).chain(coerced).chain(shared);
+    let all = calls.into_iter().chain(derefs).chain(shared);
     Some(all.filter_map(|res| if let Res::Fn(item, substs) = res { Some((*item, *substs)) } else { None }).collect())
 }
 
@@ -316,17 +318,16 @@ fn coercion_calls(coercion: &Coercion) -> Vec<&Res> {
     }
 }
 
-/// For each expression of `body`, whether it lies in the tree under `root` outside any closure nested there.
-fn own_exprs(body: &Body, root: ExprId) -> Vec<bool> {
-    let mut own = vec![false; body.exprs.len()];
+/// The expressions of `body` in the tree under `root` outside any closure nested there, in increasing order.
+fn own_exprs(body: &Body, root: ExprId) -> Vec<ExprId> {
+    let mut own = Vec::new();
     let mut todo = vec![root];
     while let Some(expr) = todo.pop() {
-        if own.get(expr.0 as usize).is_none_or(|seen| *seen) {
-            continue;
-        }
-        own[expr.0 as usize] = true;
+        own.push(expr);
         children(body, expr, &mut todo);
     }
+    own.sort_unstable();
+    own.dedup();
     own
 }
 

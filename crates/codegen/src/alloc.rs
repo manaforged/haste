@@ -312,6 +312,75 @@ fn take<R: Copy + PartialEq>(free: &mut Vec<R>, (saved, pool): (bool, &[R]), use
 
 const ARRIVAL: usize = usize::MAX;
 
+/// How much more one use inside a loop costs a spilled value than one outside it, per level of nesting.
+const LOOP_WEIGHT: u64 = 8;
+
+/// The deepest nesting that still raises a use's weight.
+const MAX_DEPTH: u32 = 4;
+
+/// For each value, the cost of keeping it in memory: one per definition and use, times `LOOP_WEIGHT` for each loop around it.
+fn weights(func: &Function) -> Vec<u64> {
+    let depths = crate::licm::depths(func);
+    let mut weight = vec![0_u64; func.types.len()];
+    for (block, data) in func.blocks.iter().enumerate() {
+        let each = LOOP_WEIGHT.pow(depths[block].min(MAX_DEPTH));
+        for inst in &data.insts {
+            let data = &func.insts[inst.index()];
+            data.op.for_operands(|value| weight[value.index()] += each);
+            results(data).for_each(|value| weight[value.index()] += each);
+        }
+    }
+    weight
+}
+
+/// What guides the choice of a register beyond the spans: the operand each result may compute in place over, and when planning weighs values, the spill cost of each and the values each block edge moves it to or from.
+struct Hints<'a> {
+    reuse: &'a [Option<Value>],
+    weights: Option<&'a [u64]>,
+    partners: Option<&'a [Vec<Value>]>,
+}
+
+/// For each value a block edge passes, the parameters it becomes, and for each block parameter, the values its edges pass it.
+fn partners(func: &Function) -> Vec<Vec<Value>> {
+    let mut partners = vec![Vec::new(); func.types.len()];
+    let mut pair = |params: &[Value], args: &[Value]| {
+        for (param, arg) in params.iter().zip(args) {
+            partners[param.index()].push(*arg);
+            partners[arg.index()].push(*param);
+        }
+    };
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        match &func.insts[inst.index()].op {
+            Op::Jump(block, args) => pair(&func.blocks[block.index()].params, args),
+            Op::Brif(_, then, then_args, otherwise, else_args) => {
+                pair(&func.blocks[then.index()].params, then_args);
+                pair(&func.blocks[otherwise.index()].params, else_args);
+            }
+            _ => {}
+        }
+    }
+    partners
+}
+
+/// Takes from `free` the register of a value an edge moves `value` to or from, so the edge moves nothing there: a saved one when `value` spans a call, else one the frame already saves or a caller-saved one.
+fn joined<F: Copy + PartialEq>(free: &mut Vec<F>, homes: &[Option<F>], partners: &[Value], (saved, saved_regs, used): (bool, &[F], &[F])) -> Option<F> {
+    let suits = |reg: &F| if saved { saved_regs.contains(reg) } else { !saved_regs.contains(reg) || used.contains(reg) };
+    let at = partners.iter().filter_map(|partner| homes[partner.index()]).find_map(|reg| free.iter().position(|free| *free == reg && suits(free)))?;
+    Some(free.swap_remove(at))
+}
+
+/// The active entry whose register `value`, live until `end`, takes when none is free: without weights the one that ends last, when it outlives `value`; with weights the one with the least spill cost per instruction of its span, when that is less than `value`'s.
+fn victim<F: Copy + PartialEq>(active: &[(u32, usize, F)], (end, value): (u32, usize), saved: Option<&[F]>, weights: Option<&[u64]>, spans: &[Option<(u32, u32)>]) -> Option<usize> {
+    let candidates = active.iter().enumerate().filter(|(_, entry)| entry.1 != ARRIVAL && saved.is_none_or(|regs| regs.contains(&entry.2)));
+    let Some(cost) = weights else {
+        return candidates.max_by_key(|(_, entry)| entry.0).filter(|(_, entry)| entry.0 > end).map(|(at, _)| at);
+    };
+    let density = |value: usize| (cost[value], spans[value].map_or(1, |(start, end)| u64::from(end - start) + 1));
+    let below = |(a, la): (u64, u64), (b, lb): (u64, u64)| u128::from(a) * u128::from(lb) < u128::from(b) * u128::from(la);
+    let chosen = candidates.reduce(|best, next| if below(density(next.1.1), density(best.1.1)) { next } else { best });
+    chosen.filter(|(_, entry)| below(density(entry.1), density(value))).map(|(at, _)| at)
+}
+
 /// Whether an encoder that computes in place reads the first operand of `op` once, into the result's register, before it reads the second.
 fn in_place(op: Binary) -> bool {
     matches!(op, Binary::Iadd | Binary::Isub | Binary::Imul | Binary::Band | Binary::Bor | Binary::Bxor | Binary::Fadd | Binary::Fsub | Binary::Fmul | Binary::Fdiv)
@@ -355,7 +424,7 @@ fn passed_in<R: Copy + PartialEq>(free: &mut Vec<R>, live: &Live, passed: &[Opti
 }
 
 /// Gives registers to values by linear scan over their spans, a saved one when the span holds a call, spilling the value that ends last when none is free; an entry parameter that keeps its arrival register takes it; a value takes the register of an operand that dies where it is computed in place, or of the call that reads it last, when it can.
-fn assign<F: Copy + PartialEq>(live: &Live, pooled: &[bool], saved_regs: &[F], pool: Pool<F>, reuse: &[Option<Value>]) -> (Vec<Option<F>>, Vec<F>) {
+fn assign<F: Copy + PartialEq>(live: &Live, pooled: &[bool], saved_regs: &[F], pool: Pool<F>, hints: &Hints) -> (Vec<Option<F>>, Vec<F>) {
     let mut homes = vec![None; pooled.len()];
     let mut values: Vec<(u32, u32, usize)> = (0..pooled.len()).filter(|value| pooled[*value]).filter_map(|value| live.span[value].map(|(start, end)| (start, end, value))).collect();
     values.sort_unstable();
@@ -372,16 +441,17 @@ fn assign<F: Copy + PartialEq>(live: &Live, pooled: &[bool], saved_regs: &[F], p
             !ended
         });
         let saved = crosses(&live.calls, (start, end));
+        let partner = |free: &mut Vec<F>, homes: &[Option<F>]| hints.partners.and_then(|partners| joined(free, homes, &partners[value], (saved, saved_regs, &used)));
         let fresh = |free: &mut Vec<F>| passed_in(free, live, &pool.passed, (start, end, value)).or_else(|| take(free, (saved, saved_regs), &used));
-        let reg = match pool.kept[value].or_else(|| reused(&mut active, reuse[value], saved, saved_regs)).or_else(|| fresh(&mut free)) {
+        let reg = match pool.kept[value].or_else(|| reused(&mut active, hints.reuse[value], saved, saved_regs)).or_else(|| partner(&mut free, &homes)).or_else(|| fresh(&mut free)) {
             Some(reg) => reg,
-            None => match active.iter().enumerate().filter(|(_, entry)| entry.1 != ARRIVAL && (!saved || saved_regs.contains(&entry.2))).max_by_key(|(_, entry)| entry.0) {
-                Some((at, &(until, other, reg))) if until > end => {
+            None => match victim(&active, (end, value), saved.then_some(saved_regs), hints.weights, &live.span) {
+                Some(at) => {
+                    let (_, other, reg) = active.swap_remove(at);
                     homes[other] = None;
-                    active.swap_remove(at);
                     reg
                 }
-                _ => continue,
+                None => continue,
             },
         };
         homes[value] = Some(reg);
@@ -394,8 +464,8 @@ fn assign<F: Copy + PartialEq>(live: &Live, pooled: &[bool], saved_regs: &[F], p
 }
 
 /// Registers of `class` for the `pooled` values, and the saved registers they use.
-fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class: &Class<F>, pooled: &[bool], reuse: &[Option<Value>]) -> (Vec<Option<F>>, Vec<F>) {
-    assign(live, pooled, class.saved, pool(func, class, live, pooled), reuse)
+fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class: &Class<F>, pooled: &[bool], hints: &Hints) -> (Vec<Option<F>>, Vec<F>) {
+    assign(live, pooled, class.saved, pool(func, class, live, pooled), hints)
 }
 
 /// Writes each register in `homes` into the location of its value as `wrap` of it.
@@ -408,7 +478,7 @@ fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl 
 }
 
 /// Gives constants and frame addresses static locations, integers and floats pool registers over their live spans, and finds the compares that feed the next branch.
-pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, order: &[Block], params: &[Loc<R>], classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Plan<R> {
+pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, (order, weighed): (&[Block], bool), params: &[Loc<R>], classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Plan<R> {
     let count = func.types.len();
     let mut locations = vec![Location::Slot; count];
     consts(func, regs.absolute_calls, &mut locations);
@@ -422,9 +492,12 @@ pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, order: 
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].in_float_register() && live.span[value].is_some_and(|span| !crosses(&live.calls, span))).collect();
     let reuse = if regs.two_address { reusable(func, &live) } else { vec![None; count] };
-    let (homes, used) = allocate(func, &live, &int_class(func, regs, order, params, passed(func, classify)), &ints, &reuse);
+    let weights = weighed.then(|| weights(func));
+    let partners = weighed.then(|| partners(func));
+    let hints = Hints { reuse: &reuse, weights: weights.as_deref(), partners: partners.as_deref() };
+    let (homes, used) = allocate(func, &live, &int_class(func, regs, order, params, passed(func, classify)), &ints, &hints);
     place(&mut locations, homes, Location::Reg);
-    let (homes, _) = allocate(func, &live, &float_class(regs, params), &floats, &reuse);
+    let (homes, _) = allocate(func, &live, &float_class(regs, params), &floats, &hints);
     place(&mut locations, homes, Location::Float);
     let (pairs, deferred) = pairs(func, &locations);
     Plan { locations, fused, used, pairs, deferred, through }
