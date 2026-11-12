@@ -7,8 +7,11 @@ mod conv;
 mod driver;
 mod edit;
 mod ident;
+mod indirect;
 mod key;
 mod record;
+#[path = "../../prep-driver/src/print.rs"]
+mod print;
 #[path = "../../prep-driver/src/source.rs"]
 mod source;
 
@@ -17,12 +20,14 @@ use std::hash::BuildHasher as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::graph::Workspace;
 use crate::host::HostSymbol;
+use crate::lower::Slots;
 use crate::outline::Outline;
 use crate::sema::Context;
 use crate::sema::infer::Typed;
@@ -34,6 +39,8 @@ use cargo::Toolchain;
 use edit::Snapshot;
 
 pub use bind::Tally;
+pub use bridge::Carry;
+pub use indirect::{Method, Vtable};
 
 /// What a prep made: the records of the library it built.
 #[derive(Clone, Copy, Debug)]
@@ -57,7 +64,17 @@ const PREP_ARGS: [&str; 2] = ["--release", "prep"];
 /// The driver's library of one build and what binding a reached function to it needs.
 pub struct Manifest {
     rustc: Bindings,
+    entries: Mutex<Entries>,
 }
+
+/// The vtable entries made so far, by reached function and argument carries, and the code memory they live in, mapped before the program's process forks so that it runs them.
+struct Entries {
+    memory: haste_codegen::Memory,
+    placed: HashMap<(usize, Vec<Carry>), u64>,
+}
+
+/// The bytes of code memory that vtable entries may fill.
+const ENTRY_BYTES: usize = 1 << 20;
 
 static BOUND: OnceLock<Manifest> = OnceLock::new();
 
@@ -73,9 +90,12 @@ pub fn prep(outline: &Outline, workspace: &Workspace) -> Result<Counts> {
 }
 
 /// Opens `manifest`, gives the shared standard library of its library the program arguments `args`, and makes it the one every later binding of this process reads.
-pub fn install(manifest: Manifest, args: &[String]) -> Result<()> {
+pub fn install(mut manifest: Manifest, args: &[String]) -> Result<()> {
     manifest.rustc.open()?;
     manifest.rustc.start(args)?;
+    let entries = manifest.entries.get_mut().map_err(|_| anyhow::anyhow!("vtable entries poisoned"))?;
+    entries.memory.reserve(ENTRY_BYTES).map_err(|error| anyhow::anyhow!("reserving vtable entry memory: {error:?}"))?;
+    entries.memory.split(1, 0);
     if BOUND.set(manifest).is_err() {
         bail!("a prepped library is already bound");
     }
@@ -129,6 +149,38 @@ fn bound(cx: &mut Context<'_>, reached: &Reached, at: usize) -> Option<(usize, O
     }
 }
 
+/// rustc's layout of every vtable of trait object type `ty`, which Haste's code then builds and calls in rustc's layout and convention, when a bound library touches the type and Haste can follow it.
+pub fn vtable(cx: &mut Context<'_>, ty: Ty) -> Option<Arc<Vtable>> {
+    match BOUND.get()?.rustc.mode(cx, ty) {
+        indirect::Mode::Rustc(vtable) => Some(vtable),
+        indirect::Mode::Free | indirect::Mode::Opaque => None,
+    }
+}
+
+/// The address of a function in rustc's convention for vtable slot `method` that runs reached function `index` in Haste's convention through its call table entry, which `slots` places; made once per function and slot shape.
+pub fn entry(cx: &mut Context<'_>, slots: &dyn Slots, index: usize, method: &Method) -> Result<u64> {
+    let Some(manifest) = BOUND.get() else { bail!("a vtable entry with no bound library") };
+    let key = (index, method.carries.clone());
+    if let Some(address) = manifest.entries.lock().ok().and_then(|entries| entries.placed.get(&key).copied()) {
+        return Ok(address);
+    }
+    let func = bridge::entry(cx, (&method.params, method.ret), &method.carries, slots.entry(index))?;
+    let compiled = haste_codegen::compile(func, haste_codegen::Target::host()).map_err(|error| anyhow::anyhow!("compiling a vtable entry: {error:?}"))?;
+    if !compiled.relocs().is_empty() || !compiled.sites().is_empty() {
+        bail!("a vtable entry whose code names addresses it is placed at");
+    }
+    let mut entries = manifest.entries.lock().map_err(|_| anyhow::anyhow!("vtable entries poisoned"))?;
+    let address = entries.memory.write(compiled.bytes()).map_err(|error| anyhow::anyhow!("placing a vtable entry: {error:?}"))? as u64;
+    entries.placed.insert(key, address);
+    Ok(address)
+}
+
+/// Calls rustc's code at `code` through a vtable slot or function pointer from Haste's code, with the Haste-convention argument values `values` of a call taking `params` and returning `ret`, each reaching rustc's convention as `carries` says, and returns the call's results.
+pub fn call_native(cx: &mut Context<'_>, b: &mut haste_codegen::FunctionBuilder<'_>, ((params, ret), carries): ((&[Ty], Option<Ty>), &[Carry]), (code, values): (haste_codegen::Value, &[haste_codegen::Value])) -> Result<Vec<haste_codegen::Value>> {
+    let shapes = bridge::shapes(cx, (params, ret), carries)?;
+    Ok(bridge::call_native(b, &shapes, code, values))
+}
+
 /// The manifest that `prep` stored for the build of `workspace` when one matches its key and the sources outside functions, or why it cannot be read, and whether it was built from the sources as they are now.
 pub fn load(outline: &Outline, workspace: &Workspace) -> Result<(Result<Option<Manifest>>, bool)> {
     if !SUPPORTED {
@@ -138,7 +190,7 @@ pub fn load(outline: &Outline, workspace: &Workspace) -> Result<(Result<Option<M
     let key = key(outline, workspace, &toolchain)?;
     let rustc = Bindings::read(&dir(key).join(RUSTC), &Snapshot::take(outline, workspace), (outline, workspace));
     let current = rustc.as_ref().is_ok_and(|rustc| rustc.as_ref().is_some_and(Bindings::current));
-    Ok((rustc.map(|rustc| rustc.map(|rustc| Manifest { rustc })), current))
+    Ok((rustc.map(|rustc| rustc.map(|rustc| Manifest { rustc, entries: Mutex::new(Entries { memory: haste_codegen::Memory::default(), placed: HashMap::default() }) })), current))
 }
 
 /// Builds the workspace's member package with the prep driver into the store under `key`, beside a snapshot of its sources, while no other prep of the key runs, and reads what binding to it allows now; a library built while a local source changed is dropped.

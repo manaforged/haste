@@ -1,7 +1,7 @@
 use rustc_abi::{BackendRepr, Primitive, Reg, RegKind, Scalar, TargetDataLayout};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypingEnv};
-use rustc_target::callconv::{ArgAbi, ArgAttributes, CastTarget, PassMode};
+use rustc_target::callconv::{ArgAbi, ArgAttributes, CastTarget, FnAbi, PassMode};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
@@ -9,7 +9,17 @@ use crate::error::{Error, Result};
 /// The calling convention rustc lowered `instance` to: its convention, each argument and the return with their type, size, alignment and passing mode, and whether the return goes through a hidden pointer; and the types of the arguments and the return.
 pub fn of<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Result<(Value, Vec<Ty<'tcx>>)> {
     let input = TypingEnv::fully_monomorphized().as_query_input((instance, ty::List::empty()));
-    let abi = tcx.fn_abi_of_instance(input).map_err(|error| Error(format!("{error:?}")))?;
+    tcx.fn_abi_of_instance(input).map(|abi| describe(tcx, abi)).map_err(|error| Error(format!("{error:?}")))
+}
+
+/// The calling convention of a call through a function pointer of type `pointer`, as `of` describes one.
+pub fn of_pointer<'tcx>(tcx: TyCtxt<'tcx>, pointer: Ty<'tcx>) -> Result<(Value, Vec<Ty<'tcx>>)> {
+    let sig = pointer.fn_sig(tcx);
+    let input = TypingEnv::fully_monomorphized().as_query_input((sig, ty::List::empty()));
+    tcx.fn_abi_of_fn_ptr(input).map(|abi| describe(tcx, abi)).map_err(|error| Error(format!("{error:?}")))
+}
+
+fn describe<'tcx>(tcx: TyCtxt<'tcx>, abi: &FnAbi<'tcx, Ty<'tcx>>) -> (Value, Vec<Ty<'tcx>>) {
     let types = abi.args.iter().chain([&abi.ret]).map(|one| one.layout.ty).collect();
     let value = json!({
         "conv": format!("{:?}", abi.conv),
@@ -19,7 +29,7 @@ pub fn of<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Result<(Value, V
         "ret": arg(tcx, &abi.ret),
         "args": abi.args.iter().map(|one| arg(tcx, one)).collect::<Vec<_>>(),
     });
-    Ok((value, types))
+    (value, types)
 }
 
 fn arg<'tcx>(tcx: TyCtxt<'tcx>, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> Value {

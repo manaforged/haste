@@ -1,5 +1,5 @@
 use haste_codegen::Type;
-use rustc_abi::{BackendRepr, FieldsShape, Primitive, Scalar, TagEncoding, Variants};
+use rustc_abi::{FieldsShape, Variants};
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::lower::{Parts, Repr, repr, returned, unwrapped};
@@ -10,6 +10,7 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::bridge::Carry;
 use super::key::Miss;
+use super::print;
 use super::record::{Abi, Arg, Class, Conv, Pass, Reg};
 
 /// How the driver prints the fields of a struct or pattern type whose one value lies at offset zero.
@@ -26,7 +27,12 @@ enum Haste {
 
 /// How each argument reaches rustc's code for `abi` when Haste passes `params` and `ret`, each at the size and alignment of Haste's layout: none when rustc passes an argument or the return otherwise than Haste can carry it.
 pub(super) fn carries(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), abi: &Abi) -> Option<Vec<Carry>> {
-    if abi.conv != Conv::Rust || abi.variadic || params.len() != abi.args.len() {
+    carries_after(cx, (params, ret), abi, 0)
+}
+
+/// `carries` for a call whose first `thin` arguments are receivers that both sides pass as one thin pointer.
+fn carries_after(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), abi: &Abi, thin: usize) -> Option<Vec<Carry>> {
+    if abi.conv != Conv::Rust || abi.variadic || params.len() != abi.args.len() || abi.args.iter().take(thin).any(|arg| !thin_pointer(arg)) {
         return None;
     }
     let returns = match ret {
@@ -35,7 +41,26 @@ pub(super) fn carries(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), 
         None => abi.ret.pass == Pass::Ignore,
     };
     returns.then_some(())?;
-    params.iter().zip(&abi.args).map(|(&ty, arg)| carry(cx, ty, arg)).collect()
+    let rest = params.iter().zip(&abi.args).skip(thin).map(|(&ty, arg)| carry(cx, ty, arg));
+    std::iter::repeat_n(Some(Carry::Same), thin.min(params.len())).chain(rest).collect()
+}
+
+fn thin_pointer(arg: &Arg) -> bool {
+    arg.size == 8 && same(Haste::One(Type::I64), &arg.pass)
+}
+
+/// How each argument of a call through a vtable slot (`thin` is one, for its receiver) or a function pointer (`thin` is zero) that Haste's code makes with `params` and `ret` reaches rustc's convention `abi`, with the parameter types as rustc counts them: a last tuple of no items, which rustc's call methods take apart, dropped.
+pub(super) fn spread_carries(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), abi: &Abi, thin: usize) -> Option<(Vec<Ty>, Vec<Carry>)> {
+    let mut spread = params.to_vec();
+    if spread.len() != abi.args.len()
+        && let Some(&last) = spread.last()
+        && let Kind::Tuple(items) = cx.types.kind(last).clone()
+        && cx.types.substs(items).is_empty()
+    {
+        spread.pop();
+    }
+    let carries = carries_after(cx, (&spread, ret), abi, thin)?;
+    Some((spread, carries))
 }
 
 /// How an argument of `ty` reaches rustc's code that takes it as `arg`: as Haste passes it, or split from its address into the two registers of a scalar pair whose parts no signed narrow integer is, since a load widens with zeros.
@@ -107,11 +132,16 @@ impl Class {
     }
 }
 
-/// The layouts of `types` and of every type their values hold or point to, in the order a depth-first walk first meets them, printed as the driver prints rustc's.
-pub(super) fn layouts(cx: &mut Context<'_>, types: &[Ty]) -> Result<Vec<String>, Miss> {
-    let (mut seen, mut stack, mut printed) = (HashSet::default(), types.to_vec(), Vec::new());
+/// The layouts of `types` and of every type their values hold or point to, in the order a depth-first walk first meets them, printed as the driver prints rustc's, with the trait object and function pointer types among them.
+pub(super) fn layouts(cx: &mut Context<'_>, types: &[Ty]) -> Result<(Vec<String>, Vec<Ty>), Miss> {
+    let (mut seen, mut stack, mut printed, mut indirect) = (HashSet::default(), types.to_vec(), Vec::new(), Vec::new());
     while let Some(ty) = stack.pop() {
         if !seen.insert(ty) {
+            continue;
+        }
+        if matches!(cx.types.kind(ty), Kind::FnPtr(..) | Kind::Dyn(..)) {
+            printed.push(print::INDIRECT.to_owned());
+            indirect.push(ty);
             continue;
         }
         let layout = cx.layout(ty).map_err(|_| Miss::Unnamed)?;
@@ -121,10 +151,10 @@ pub(super) fn layouts(cx: &mut Context<'_>, types: &[Ty]) -> Result<Vec<String>,
             Kind::Pat(..) => true,
             _ => false,
         };
-        printed.push(print(&layout, newtype));
+        printed.push(layout_text(&layout, newtype));
         stack.extend(fields);
     }
-    Ok(printed)
+    Ok((printed, indirect))
 }
 
 /// The types directly inside a value of `ty` in the order the driver walks rustc's: a pointee or element, the items of a tuple, every field of every variant, or a closure's captures.
@@ -141,75 +171,17 @@ fn inner(cx: &mut Context<'_>, ty: Ty) -> Result<Vec<Ty>, Miss> {
             Some(Kind::Tuple(items)) => cx.types.substs(items).to_vec(),
             _ => return Err(Miss::Unnamed),
         },
-        Kind::FnPtr(..) | Kind::Dyn(..) => return Err(Miss::Indirect),
         _ => return Err(Miss::Unnamed),
     })
 }
 
 /// One layout as the driver prints rustc's; a struct of one field or a pattern type, whose one value lies at offset zero and which Haste may lay out as the scalar it holds, prints its fields as rustc places them.
-fn print(layout: &Layout, newtype: bool) -> String {
+fn layout_text(layout: &Layout, newtype: bool) -> String {
     let at_zero = match &layout.fields {
         FieldsShape::Primitive => true,
         FieldsShape::Arbitrary { offsets, .. } => offsets.iter().next().is_some_and(|offset| offset.bytes() == 0),
         _ => false,
     };
-    let fields = if newtype && at_zero && matches!(layout.variants, Variants::Single { .. }) { NEWTYPE_FIELDS.to_owned() } else { fields(&layout.fields) };
-    format!("{}:{}:{}:{fields}:{}", layout.size.bytes(), layout.align.bytes(), backend(&layout.backend_repr), variants(&layout.variants))
-}
-
-fn backend(repr: &BackendRepr) -> String {
-    match repr {
-        BackendRepr::Scalar(one) => format!("s{}", scalar(one)),
-        BackendRepr::ScalarPair { a, b, .. } => format!("p{},{}", scalar(a), scalar(b)),
-        BackendRepr::SimdVector { .. } | BackendRepr::SimdScalableVector { .. } => "v".to_owned(),
-        BackendRepr::Memory { sized } => format!("m{}", u8::from(*sized)),
-    }
-}
-
-fn scalar(scalar: &Scalar) -> String {
-    match scalar {
-        Scalar::Initialized { value, valid_range } => format!("{}[{}..{}]", primitive(value), valid_range.start, valid_range.end),
-        Scalar::Union { value } => format!("{}u", primitive(value)),
-    }
-}
-
-fn primitive(value: &Primitive) -> String {
-    match value {
-        Primitive::Int(int, signed) => format!("{}{}", if *signed { "i" } else { "u" }, int.size().bits()),
-        Primitive::Float(float) => format!("f{}", float.size().bits()),
-        Primitive::Pointer(_) => "p".to_owned(),
-    }
-}
-
-fn joined<'a>(offsets: impl Iterator<Item = &'a rustc_abi::Size>) -> String {
-    offsets.map(|offset| offset.bytes().to_string()).collect::<Vec<_>>().join(",")
-}
-
-fn fields<F: rustc_index::Idx>(shape: &FieldsShape<F>) -> String {
-    match shape {
-        FieldsShape::Primitive => "P".to_owned(),
-        FieldsShape::Union(count) => format!("U{count}"),
-        FieldsShape::Array { stride, count } => format!("A{}x{count}", stride.bytes()),
-        FieldsShape::Arbitrary { offsets, .. } => format!("O{}", joined(offsets.iter())),
-    }
-}
-
-fn variants<F: rustc_index::Idx, V: rustc_index::Idx>(variants: &Variants<F, V>) -> String {
-    match variants {
-        Variants::Empty => "E".to_owned(),
-        Variants::Single { index } => format!("S{}", index.index()),
-        Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
-            let each: Vec<String> = variants.iter().map(|variant| joined(variant.field_offsets.iter())).collect();
-            format!("M{}@{}{}|{}", scalar(tag), tag_field.index(), encoding(tag_encoding), each.join("|"))
-        }
-    }
-}
-
-fn encoding<V: rustc_index::Idx>(encoding: &TagEncoding<V>) -> String {
-    match encoding {
-        TagEncoding::Direct => "d".to_owned(),
-        TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
-            format!("n{}/{}-{}/{niche_start}", untagged_variant.index(), niche_variants.start.index(), niche_variants.last.index())
-        }
-    }
+    let fields = if newtype && at_zero && matches!(layout.variants, Variants::Single { .. }) { NEWTYPE_FIELDS.to_owned() } else { print::fields(&layout.fields) };
+    print::layout((layout.size.bytes(), layout.align.bytes()), &layout.backend_repr, &fields, &layout.variants)
 }

@@ -52,8 +52,29 @@ pub fn ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<String> {
         ty::Adt(adt, args) => format!("{}<{}>", def(tcx, adt.did())?, self::args(tcx, args)?),
         ty::FnDef(def_id, args) => format!("fn {}<{}>", def(tcx, def_id)?, self::args(tcx, args.skip_binder())?),
         ty::Closure(def_id, args) => closure(tcx, def_id, args)?,
+        ty::FnPtr(..) => pointer(tcx, ty)?,
+        ty::Dynamic(predicates, _) => object(tcx, predicates)?,
         _ => return None,
     })
+}
+
+/// The key of a function pointer type: its parameter and return types.
+fn pointer<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<String> {
+    let sig = tcx.instantiate_bound_regions_with_erased(ty.fn_sig(tcx));
+    let params = sig.inputs().iter().map(|&param| self::ty(tcx, param).map(|key| key + ",")).collect::<Option<String>>()?;
+    Some(format!("fn({params})->{}", self::ty(tcx, sig.output())?))
+}
+
+/// The key of a trait object type: its principal trait with the trait's arguments, and each associated type it fixes by name in name order.
+fn object<'tcx>(tcx: TyCtxt<'tcx>, predicates: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>) -> Option<String> {
+    let principal = predicates.principal()?.skip_binder();
+    let mut bound = Vec::new();
+    for projection in predicates.projection_bounds() {
+        let projection = projection.skip_binder();
+        bound.push(format!("+{}={}", tcx.item_name(projection.def_id), self::ty(tcx, projection.term.as_type()?)?));
+    }
+    bound.sort();
+    Some(format!("dyn {}<{}>{}", def(tcx, principal.def_id)?, args(tcx, principal.args)?, bound.concat()))
 }
 
 fn args<'tcx>(tcx: TyCtxt<'tcx>, args: &[ty::GenericArg<'tcx>]) -> Option<String> {
@@ -80,7 +101,7 @@ fn closure<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, closure_args: GenericArgsRef<
 }
 
 /// The key of definition `def_id`: its crate, file, the byte offset of its name and the name, for a named definition outside any macro expansion.
-fn def(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
+pub fn def(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
     let (file, lo) = place(tcx, tcx.def_ident_span(def_id)?)?;
     let krate = crate::source::crate_key(tcx.crate_name(def_id.krate).as_str(), crate::link::sysroot(tcx, def_id.krate));
     Some(format!("{krate}:{file}:{lo}:{}", tcx.item_name(def_id)))

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,8 @@ use rustc_attr_ir::NativeLibKind;
 use rustc_crate_store::LinkagePreference;
 use serde_json::Value;
 
-use crate::elf;
+use crate::elf::{self, Scope, Table};
+use crate::object;
 use crate::error::{Error, Result};
 use crate::record::{self, LINK, MANIFEST};
 use crate::wrap::RELEASE;
@@ -36,7 +37,7 @@ pub fn sysroot(tcx: TyCtxt<'_>, cnum: CrateNum) -> bool {
     [&source.rlib, &source.rmeta, &source.dylib].into_iter().flatten().any(|path| path.starts_with(tcx.sess.opts.sysroot.path()))
 }
 
-/// Writes the units, sysroot libraries and native libraries that the crate being compiled links, one per line, marking each sysroot rlib whose crate no sysroot dylib holds.
+/// Writes the units, sysroot dylibs and native libraries that the crate being compiled links, one per line, marking each sysroot rlib whose crate no sysroot dylib holds.
 pub fn write_libraries(tcx: TyCtxt<'_>, path: &Path) -> Result<()> {
     let mut out = BufWriter::new(File::create(path)?);
     let held = in_dylibs(tcx);
@@ -46,10 +47,8 @@ pub fn write_libraries(tcx: TyCtxt<'_>, path: &Path) -> Result<()> {
         if let Some(unit) = unit {
             writeln!(out, "{UNIT} {unit}")?;
         }
-        for (kind, path) in [(RLIB, &source.rlib), (DYLIB, &source.dylib)] {
-            if let Some(path) = path.as_ref().filter(|_| sysroot(tcx, cnum)) {
-                writeln!(out, "{kind} {}", path.display())?;
-            }
+        if let Some(path) = source.dylib.as_ref().filter(|_| sysroot(tcx, cnum)) {
+            writeln!(out, "{DYLIB} {}", path.display())?;
         }
         if let Some(path) = source.rlib.as_ref().filter(|_| sysroot(tcx, cnum) && !held.contains(&cnum)) {
             writeln!(out, "{ALONE} {}", path.display())?;
@@ -76,7 +75,6 @@ fn in_dylibs(tcx: TyCtxt<'_>) -> HashSet<CrateNum> {
     held
 }
 
-const RLIB: &str = "rlib";
 const DYLIB: &str = "dylib";
 const ALONE: &str = "alone";
 const NATIVE: &str = "lib";
@@ -85,6 +83,9 @@ const RLIB_PREFIX: &str = "lib";
 
 const ALLOCATOR_SUFFIX: &str = "___rust_alloc";
 
+/// The kinds of lines that describe a trait object or function pointer type, in the order the merged manifest lists them.
+const INDIRECT: [&str; 2] = [object::OBJECT, object::POINTER];
+
 /// The extension of the merged manifest that `link` writes beside the library, in TOML.
 pub const MANIFEST_EXTENSION: &str = "toml";
 
@@ -92,7 +93,6 @@ pub const MANIFEST_EXTENSION: &str = "toml";
 struct Inputs {
     objects: Vec<PathBuf>,
     released: Vec<PathBuf>,
-    rlibs: BTreeSet<String>,
     dylibs: BTreeSet<String>,
     alone: BTreeSet<String>,
     libs: Vec<String>,
@@ -100,25 +100,20 @@ struct Inputs {
 }
 
 fn run(args: &[String]) -> Result<()> {
-    let (root, out, std) = match args {
-        [root, out] => (root, out, Std::Shared),
-        [root, out, flag, kind] if flag == "--std" && kind == "static" => (root, out, Std::Static),
-        [root, out, flag, kind] if flag == "--std" && kind == "shared" => (root, out, Std::Shared),
-        _ => return Err(Error("usage: prep-driver link <prep directory> <library> [--std shared|static]".to_string())),
+    let [root, out] = args else {
+        return Err(Error("usage: prep-driver link <prep directory> <library>".to_string()));
     };
     let mut inputs = gather(Path::new(root))?;
-    if std == Std::Shared {
-        inputs.objects = without_allocator(&inputs.objects)?;
-        inputs.released = without_allocator(&inputs.released)?;
-    }
+    inputs.objects = without_allocator(&inputs.objects)?;
+    inputs.released = without_allocator(&inputs.released)?;
     let symbols = symbols(&inputs.manifests)?;
     let released = released(&inputs.released, &symbols)?;
     let mut rebound = 0;
     for object in inputs.released.iter().chain(&inputs.objects) {
         rebound += elf::rebind(object, &symbols)?;
     }
-    link(&inputs, Path::new(out), std)?;
-    let defined = dynamic(Path::new(out))?;
+    link(&inputs, Path::new(out))?;
+    let defined = elf::defined(Path::new(out), Table::Dynamic, Scope::All)?;
     let (kept, missing) = merge(&inputs.manifests, (&defined, &released), &PathBuf::from(format!("{out}.{MANIFEST_EXTENSION}")))?;
     let size = fs::metadata(out)?.len();
     let counts = format!("units {} objects {} released {}", inputs.manifests.len(), inputs.objects.len() + inputs.released.len(), released.len());
@@ -163,7 +158,6 @@ fn objects(dir: &Path) -> Result<Vec<PathBuf>> {
 fn libraries(path: &Path, inputs: &mut Inputs) -> Result<()> {
     for line in fs::read_to_string(path)?.lines() {
         match line.split_once(' ') {
-            Some((RLIB, rlib)) => _ = inputs.rlibs.insert(rlib.to_string()),
             Some((DYLIB, dylib)) => _ = inputs.dylibs.insert(dylib.to_string()),
             Some((ALONE, rlib)) => _ = inputs.alone.insert(rlib.to_string()),
             Some((NATIVE, lib)) if !inputs.libs.iter().any(|known| known == lib) => inputs.libs.push(lib.to_string()),
@@ -173,26 +167,16 @@ fn libraries(path: &Path, inputs: &mut Inputs) -> Result<()> {
     Ok(())
 }
 
-/// Which copy of std the prep library links: the toolchain's shared libstd, so the process holds one std, or the static rlibs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Std {
-    Shared,
-    Static,
-}
-
-fn link(inputs: &Inputs, out: &Path, std: Std) -> Result<()> {
+/// Links the inputs into the shared library `out` against the toolchain's shared libstd, so the process holds one std.
+fn link(inputs: &Inputs, out: &Path) -> Result<()> {
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let mut command = Command::new(cc);
     command.args(["-shared", "-Wl,-Bsymbolic", "-o"]).arg(out);
     command.args(&inputs.released).args(&inputs.objects);
-    if std == Std::Shared {
-        command.args(&inputs.dylibs);
-        let dirs: BTreeSet<_> = inputs.dylibs.iter().filter_map(|dylib| Path::new(dylib).parent()).collect();
-        command.args(dirs.iter().map(|dir| format!("-Wl,-rpath,{}", dir.display())));
-        command.arg("-Wl,--start-group").args(&inputs.alone).arg("-Wl,--end-group");
-    } else {
-        command.arg("-Wl,--start-group").args(&inputs.rlibs).arg("-Wl,--end-group");
-    }
+    command.args(&inputs.dylibs);
+    let dirs: BTreeSet<_> = inputs.dylibs.iter().filter_map(|dylib| Path::new(dylib).parent()).collect();
+    command.args(dirs.iter().map(|dir| format!("-Wl,-rpath,{}", dir.display())));
+    command.arg("-Wl,--start-group").args(&inputs.alone).arg("-Wl,--end-group");
     command.args(inputs.libs.iter().map(|lib| format!("-l{lib}")));
     let status = command.status()?;
     if !status.success() {
@@ -215,7 +199,7 @@ fn symbols(manifests: &[PathBuf]) -> Result<HashSet<String>> {
 fn without_allocator(objects: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut kept = Vec::new();
     for object in objects {
-        if !nm(object, &["--defined-only"])?.iter().any(|name| name.ends_with(ALLOCATOR_SUFFIX)) {
+        if !elf::defined(object, Table::Static, Scope::All)?.iter().any(|name| name.ends_with(ALLOCATOR_SUFFIX)) {
             kept.push(object.clone());
         }
     }
@@ -226,30 +210,22 @@ fn without_allocator(objects: &[PathBuf]) -> Result<Vec<PathBuf>> {
 fn released(objects: &[PathBuf], symbols: &HashSet<String>) -> Result<HashSet<String>> {
     let mut found = HashSet::new();
     for object in objects {
-        found.extend(nm(object, &["--defined-only", "--extern-only"])?.into_iter().filter(|name| symbols.contains(name)));
+        found.extend(elf::defined(object, Table::Static, Scope::Extern)?.into_iter().filter(|name| symbols.contains(name)));
     }
     Ok(found)
 }
 
-fn dynamic(library: &Path) -> Result<HashSet<String>> {
-    nm(library, &["-D", "--defined-only"])
-}
-
-fn nm(path: &Path, flags: &[&str]) -> Result<HashSet<String>> {
-    let output = Command::new("nm").args(flags).arg(path).output()?;
-    if !output.status.success() {
-        return Err(Error(format!("nm {} failed: {}", path.display(), output.status)));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text.lines().filter_map(|line| line.split_whitespace().nth(2)).map(str::to_string).collect())
-}
-
 fn merge(manifests: &[PathBuf], (defined, released): (&HashSet<String>, &HashSet<String>), out: &Path) -> Result<(usize, usize)> {
     let (mut records, mut library) = (Vec::new(), serde_json::Map::new());
+    let mut indirect: [BTreeMap<String, Value>; 2] = Default::default();
     let mut missing = 0;
     for manifest in manifests {
         for line in BufReader::new(File::open(manifest)?).lines() {
             let mut record: Value = serde_json::from_str(&line?)?;
+            if let Some((kind, name)) = INDIRECT.iter().enumerate().find_map(|(at, kind)| Some((at, record.get(*kind)?.as_str()?.to_string()))) {
+                indirect[kind].entry(name).or_insert(record);
+                continue;
+            }
             let Some(symbol) = record.get("symbol").and_then(Value::as_str).map(str::to_string) else {
                 let facts = record.get(record::LIBRARY).and_then(Value::as_object).cloned().unwrap_or_default();
                 library.extend(facts.into_iter().filter(|(_, value)| !value.is_null()));
@@ -267,6 +243,9 @@ fn merge(manifests: &[PathBuf], (defined, released): (&HashSet<String>, &HashSet
     let mut document = serde_json::Map::new();
     document.insert(record::LIBRARY.to_string(), Value::Object(library));
     document.insert(record::RECORD.to_string(), Value::Array(records));
+    let [objects, pointers] = indirect;
+    document.insert(object::OBJECT.to_string(), Value::Array(objects.into_values().collect()));
+    document.insert(object::POINTER.to_string(), Value::Array(pointers.into_values().collect()));
     let document = Value::Object(document);
     let text = toml::to_string(&without_nulls(document)).map_err(|error| Error(error.to_string()))?;
     fs::write(out, text)?;

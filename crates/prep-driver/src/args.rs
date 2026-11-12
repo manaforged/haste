@@ -40,7 +40,7 @@ const DROPPED_CODEGEN: &[&str] = &["incremental", "panic"];
 
 const DEFAULT_CODEGEN_UNITS: &str = "codegen-units=16";
 
-const LIBRARY_TYPES: &[&str] = &["lib", "rlib", "proc-macro"];
+const EMIT: &str = "--emit=obj";
 
 /// One command-line option of rustc: its flag and value, or a lone positional argument with no flag.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,27 +82,20 @@ pub fn codegen<'o>(opts: &'o [Opt], key: &str) -> Option<&'o str> {
         .map(|(_, value)| value)
 }
 
-/// The command line of the prep build of the crate that `opts` builds: objects into `dir`, aborting on panic, without lints or cargo's artifact messages, with rustc's non-incremental codegen-unit count stated so that emitting objects does not force one unit, and for a crate that links, the linked output with temporaries kept so the allocator shim object survives.
+/// The command line of the prep build of the crate that `opts` builds: objects into `dir`, aborting on panic, without lints or cargo's artifact messages, with rustc's non-incremental codegen-unit count stated so that emitting objects does not force one unit.
 pub fn prep(program: &str, opts: &[Opt], dir: &Path) -> Vec<String> {
     let mut line = vec![program.to_string()];
     for opt in opts.iter().filter(|opt| !dropped(opt)) {
         line.push(opt.flag.clone());
         line.extend(opt.value.clone());
     }
-    let emit = if links(opts) { ["--emit=obj,link", "-C", "save-temps"].as_slice() } else { ["--emit=obj"].as_slice() };
-    line.extend(emit.iter().map(|arg| arg.to_string()));
+    line.push(EMIT.to_string());
     line.extend(["--out-dir".to_string(), dir.display().to_string()]);
     line.extend(["-C", "panic=abort", "--cap-lints", "allow"].map(String::from));
     if codegen(opts, "codegen-units").is_none() {
         line.extend(["-C", DEFAULT_CODEGEN_UNITS].map(String::from));
     }
     line
-}
-
-/// Whether the crate that `opts` builds links an executable or a library that carries an allocator shim.
-pub fn links(opts: &[Opt]) -> bool {
-    let mut kinds = opts.iter().filter(|opt| opt.flag == "--crate-type").filter_map(|opt| opt.value.as_deref()).peekable();
-    kinds.peek().is_none() || kinds.any(|kind| kind.split(',').any(|kind| !LIBRARY_TYPES.contains(&kind)))
 }
 
 fn dropped(opt: &Opt) -> bool {

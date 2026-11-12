@@ -119,7 +119,7 @@ impl Lower<'_, '_> {
                 Ok(Some(self.wide(data, table)))
             }
             (Some(Coercion::Deref(steps, _)), Some(value)) => self.deref_coerced(value, steps.clone()),
-            (Some(&Coercion::Upcast(slot)), Some(value)) => Ok(Some(self.upcast(value, slot))),
+            (Some(&Coercion::Upcast(slot)), Some(value)) => Ok(Some(self.upcast(value, slot, self.ty_of(expr))?)),
             (Some(&Coercion::Reify(Res::Fn(item, substs))), _) => {
                 let index = self.reached_index(item, substs)?;
                 Ok(Some(self.code_of(index)))

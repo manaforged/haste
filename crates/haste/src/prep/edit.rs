@@ -149,7 +149,7 @@ impl Snapshot {
 /// Whether every local source file of `outline` still reads on disk as it did when `outline` was loaded.
 pub(super) fn settled(outline: &Outline, workspace: &Workspace) -> Result<bool> {
     for krate in (0..outline.crates.len()).filter(|&krate| outline.package(workspace, krate).local()) {
-        for file in &outline.crates[krate].files {
+        for file in outline.crates[krate].files.iter().filter(|file| !file.expanded) {
             let path = &file.source.path;
             let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
             if Source::parse(path.clone(), text)?.text != file.source.text {

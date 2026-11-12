@@ -14,7 +14,7 @@ macro_rules! sources {
 }
 
 /// The source of the prep driver, which Haste builds once per toolchain into its store.
-const SOURCES: [(&str, &str); 16] = sources!(
+const SOURCES: [(&str, &str); 18] = sources!(
     "Cargo.toml",
     "Cargo.lock",
     "build.rs",
@@ -27,6 +27,8 @@ const SOURCES: [(&str, &str); 16] = sources!(
     "src/key.rs",
     "src/layout.rs",
     "src/link.rs",
+    "src/object.rs",
+    "src/print.rs",
     "src/record.rs",
     "src/source.rs",
     "src/uses.rs",

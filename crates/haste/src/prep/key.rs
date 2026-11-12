@@ -25,11 +25,10 @@ pub(super) struct Place {
     pub lo: u32,
 }
 
-/// Why an instance or a type has no key: a part of it has none, or it holds a function pointer or trait object, whose code no key names.
+/// Why an instance or a type has no key: a part of it has none.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Miss {
     Unnamed,
-    Indirect,
 }
 
 /// What naming the definitions of a build needs: each crate's name, whether it is local, and whether another package's crate shares its name; the snapshot prep took, by which a local definition is named where it was then; and each file's name once worked out.
@@ -82,9 +81,25 @@ impl Keys {
             Kind::Adt(item, args) => format!("{}<{}>", self.def(cx, item)?, self.list(cx, &cx.types.substs(args).to_vec())?),
             Kind::FnDef(item, args) => format!("fn {}<{}>", self.def(cx, item)?, self.list(cx, &cx.types.substs(args).to_vec())?),
             Kind::Closure(..) => self.closure(cx, ty)?,
-            Kind::FnPtr(..) | Kind::Dyn(..) => return Err(Miss::Indirect),
+            Kind::FnPtr(params, ret) => {
+                let params = cx.types.substs(params).to_vec();
+                format!("fn({})->{}", params.iter().map(|&param| self.ty(cx, param).map(|key| key + ",")).collect::<Result<String, Miss>>()?, self.ty(cx, ret)?)
+            }
+            Kind::Dyn(of, args, members, _) => self.object(cx, of, (&cx.types.substs(args).to_vec(), &members))?,
             _ => return Err(Miss::Unnamed),
         })
+    }
+
+    /// The key of a trait object type of trait `of` with arguments `args`, the last of which give the associated types `members` fixes, as the driver prints one: those in name order.
+    fn object(&self, cx: &mut Context<'_>, of: ItemRef, (args, members): (&[Ty], &[ItemRef])) -> Result<String, Miss> {
+        let (given, bound) = crate::sema::ty::object_parts(args, members);
+        let (given, bound): (Vec<Ty>, Vec<(ItemRef, Ty)>) = (given.to_vec(), bound.collect());
+        let mut fixed = Vec::new();
+        for (member, ty) in bound {
+            fixed.push(format!("+{}={}", cx.name(member), self.ty(cx, ty)?));
+        }
+        fixed.sort();
+        Ok(format!("dyn {}<{}>{}", self.def(cx, of)?, self.list(cx, &given)?, fixed.concat()))
     }
 
     fn closure(&self, cx: &mut Context<'_>, ty: Ty) -> Result<String, Miss> {
@@ -105,7 +120,7 @@ impl Keys {
     }
 
     /// The key of definition `item`: its crate, file, the byte offset of its name and the name, where prep saw it for a local definition.
-    fn def(&self, cx: &Context<'_>, item: ItemRef) -> Result<String, Miss> {
+    pub(super) fn def(&self, cx: &Context<'_>, item: ItemRef) -> Result<String, Miss> {
         let krate = item.krate as usize;
         if self.doubled[krate] {
             return Err(Miss::Unnamed);

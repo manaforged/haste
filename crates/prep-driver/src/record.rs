@@ -35,20 +35,23 @@ const ARGS_INIT: &str = "std::sys::args::unix::imp::ARGV_INIT_ARRAY::init_wrappe
 /// The file in a linking unit's directory that names the sysroot libraries and native libraries its prep library links.
 pub const LINK: &str = "link.txt";
 
-/// Writes the manifest of every function instance the crate generates code for, and, for a crate that links, the libraries it links.
+/// Writes the manifest of every function instance the crate generates code for and of every trait object and function pointer type their code touches, and, for a crate that links, the libraries it links.
 pub fn write(tcx: TyCtxt<'_>, unit: &Unit) -> Result<()> {
     let mut out = BufWriter::new(File::create(unit.dir.join(MANIFEST))?);
     writeln!(out, "{}", header(tcx, unit))?;
-    let mut seen = FxHashSet::default();
+    let (mut seen, mut indirect) = (FxHashSet::default(), FxHashSet::default());
     for cgu in tcx.collect_and_partition_mono_items(()).codegen_units {
         for (item, data) in cgu.items() {
             let MonoItem::Fn(instance) = *item else {
                 continue;
             };
             if seen.insert(instance) {
-                writeln!(out, "{}", record(tcx, instance, data, cgu.name())?)?;
+                writeln!(out, "{}", record(tcx, instance, data, (cgu.name(), &mut indirect))?)?;
             }
         }
+    }
+    for ty in indirect {
+        writeln!(out, "{}", crate::object::facts(tcx, ty)?)?;
     }
     out.flush()?;
     if tcx.crate_types().iter().any(|kind| *kind != CrateType::Rlib) {
@@ -91,9 +94,10 @@ fn args_init(tcx: TyCtxt<'_>) -> Option<String> {
     })
 }
 
-fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData, cgu: Symbol) -> Result<Value> {
+fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData, (cgu, indirect): (Symbol, &mut FxHashSet<ty::Ty<'tcx>>)) -> Result<Value> {
     let def_id = instance.def_id();
     let used = uses::used(tcx, instance);
+    indirect.extend(used.indirect);
     let (abi, crossing) = abi::of(tcx, instance)?;
     Ok(json!({
         "symbol": tcx.symbol_name(instance).name,

@@ -43,22 +43,46 @@ impl Callbacks for Prep {
     }
 }
 
-/// Compiles as rustc would with the arguments cargo passed, then, when a prep directory is set and the crate is prepped, compiles it twice more: once as released into the `release` subdirectory and once with every function instance exported.
-pub fn main(args: Vec<String>) -> ExitCode {
-    rustc_driver::install_ice_hook(BUG_URL, |_| ());
-    let args = compiler_args(args);
-    let code = rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&args, &mut Plain));
-    if code != ExitCode::SUCCESS {
-        return code;
-    }
-    match plan(&args) {
-        Some((opts, unit)) => prep(&args, &opts, unit),
-        None => code,
+/// The name of the prep compile that exports every function instance.
+const EXPORTED: &str = "exported";
+
+/// The environment variable that tells a driver process to run one prep compile of its crate and nothing else.
+const PHASE: &str = "PREP_PHASE";
+
+/// One prep compile of a crate: as released, into the `release` subdirectory, or with every function instance exported.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Release,
+    Exported,
+}
+
+impl Phase {
+    const ALL: [Phase; 2] = [Phase::Release, Phase::Exported];
+
+    fn name(self) -> &'static str {
+        match self {
+            Phase::Release => RELEASE,
+            Phase::Exported => EXPORTED,
+        }
     }
 }
 
-fn prep(args: &[String], opts: &[Opt], unit: Unit) -> ExitCode {
-    let program = args.first().map(String::as_str).unwrap_or("rustc");
+/// Compiles as rustc would with the arguments cargo passed, and, when a prep directory is set and the crate is prepped, compiles it twice more in child processes at the same time: once as released into the `release` subdirectory and once with every function instance exported.
+pub fn main(args: Vec<String>) -> ExitCode {
+    rustc_driver::install_ice_hook(BUG_URL, |_| ());
+    let args = compiler_args(args);
+    let Some((opts, unit)) = plan(&args) else {
+        return rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&args, &mut Plain));
+    };
+    let phase = std::env::var(PHASE).ok().and_then(|name| Phase::ALL.into_iter().find(|phase| phase.name() == name));
+    match phase {
+        Some(phase) => compile(&args, &opts, unit, phase),
+        None => prep(&args, unit),
+    }
+}
+
+/// Compiles the crate as cargo asked while both prep compiles run beside it, then keeps only the prep outputs.
+fn prep(args: &[String], unit: Unit) -> ExitCode {
     let release = unit.dir.join(RELEASE);
     for dir in [&unit.dir, &release] {
         if let Err(error) = fresh(dir) {
@@ -66,21 +90,47 @@ fn prep(args: &[String], opts: &[Opt], unit: Unit) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let released = args::prep(program, opts, &release);
-    let code = rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&released, &mut Plain));
-    if code != ExitCode::SUCCESS {
-        return code;
+    let children: Vec<_> = Phase::ALL.iter().map(|phase| spawn(args, *phase)).collect();
+    let code = rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(args, &mut Plain));
+    let mut failed = false;
+    for child in children {
+        let status = child.and_then(|mut child| child.wait());
+        failed |= !status.as_ref().is_ok_and(std::process::ExitStatus::success);
+        if let Err(error) = status {
+            eprintln!("prep: {error}");
+        }
     }
-    let exported = args::prep(program, opts, &unit.dir);
-    let mut prep = Prep { unit };
-    let code = rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&exported, &mut prep));
-    for dir in [&prep.unit.dir, &release] {
+    if code != ExitCode::SUCCESS || failed {
+        return ExitCode::FAILURE;
+    }
+    for dir in [&unit.dir, &release] {
         if let Err(error) = keep_outputs(dir) {
             eprintln!("prep: {}: {error}", dir.display());
             return ExitCode::FAILURE;
         }
     }
     code
+}
+
+/// Starts this driver again on `args` to run the prep compile `phase` alone.
+fn spawn(args: &[String], phase: Phase) -> std::io::Result<std::process::Child> {
+    std::process::Command::new(std::env::current_exe()?).args(args).env(PHASE, phase.name()).stdin(std::process::Stdio::null()).spawn()
+}
+
+/// Runs the prep compile `phase` of the crate that `opts` builds.
+fn compile(args: &[String], opts: &[Opt], unit: Unit, phase: Phase) -> ExitCode {
+    let program = args.first().map(String::as_str).unwrap_or("rustc");
+    match phase {
+        Phase::Release => {
+            let released = args::prep(program, opts, &unit.dir.join(RELEASE));
+            rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&released, &mut Plain))
+        }
+        Phase::Exported => {
+            let exported = args::prep(program, opts, &unit.dir);
+            let mut prep = Prep { unit };
+            rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&exported, &mut prep))
+        }
+    }
 }
 
 fn compiler_args(mut args: Vec<String>) -> Vec<String> {

@@ -10,10 +10,12 @@ use crate::outline::Outline;
 use crate::sema::Context;
 use crate::sema::infer::Typed;
 use crate::sema::reach::Instance;
+use crate::sema::ty::Ty;
 
 use super::bridge::Carry;
 use super::edit::{Changed, Snapshot};
 use super::ident;
+use super::indirect::{Indirect, Mode};
 use super::key::{Keys, Miss};
 use super::record::{At, Facts, InstanceKind, Library, Record};
 use super::{conv, driver};
@@ -57,6 +59,7 @@ pub(super) struct Bindings {
     stale: Vec<bool>,
     state: Vec<bool>,
     keys: Keys,
+    indirect: Indirect,
     current: bool,
     decided: Mutex<HashMap<Instance, Decided>>,
 }
@@ -79,7 +82,8 @@ impl Bindings {
         }
         let then = Snapshot::read(&snapshot)?;
         let Some(changed) = now.changed(&then) else { return Ok(None) };
-        let Library { library, record: records } = Library::read(&manifest)?;
+        let Library { library, record: records, object, pointer } = Library::read(&manifest)?;
+        let indirect = Indirect::new(object, pointer, library.unkeyed);
         let mut index: HashMap<String, Vec<usize>> = HashMap::default();
         for (at, record) in records.iter().enumerate() {
             if let Some(key) = &record.key {
@@ -92,9 +96,12 @@ impl Bindings {
         for at in (0..records.len()).filter(|&at| entry(&records, &callers, at)) {
             state[at] = false;
         }
+        for (at, _) in records.iter().enumerate().filter(|(_, record)| record.path.starts_with(START)) {
+            state[at] = true;
+        }
         let keys = Keys::new(outline, workspace, then);
         let current = changed.ranges.is_empty() && changed.crates.is_empty();
-        Ok(Some(Bindings { library: dir.join(driver::LIBRARY), facts: library, records, index, stale, state, keys, current, decided: Mutex::default() }))
+        Ok(Some(Bindings { library: dir.join(driver::LIBRARY), facts: library, records, index, stale, state, keys, indirect, current, decided: Mutex::default() }))
     }
 
     /// Whether the library was built from the local sources as they are now.
@@ -134,7 +141,7 @@ impl Bindings {
 
     /// The records that name `instance` with body `typed`, which are copies of one instance that crates instantiated apart when there are several: they name one definition of one crate and cross the same layouts with one convention; or why no record binds.
     fn records(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Result<Vec<usize>, Decision> {
-        let (key, once) = self.keys.instance(cx, instance, typed).map_err(refusal)?;
+        let (key, once) = self.keys.instance(cx, instance, typed).map_err(|Miss::Unnamed| Decision::Unmatched)?;
         let fits = |at: &usize| {
             let record = &self.records[*at];
             match (once, &record.closure) {
@@ -198,14 +205,15 @@ impl Bindings {
         }
         let carries = conv::carries(cx, (&params, ret), &record.abi).ok_or(Decision::Convention)?;
         match conv::layouts(cx, &types) {
-            Err(Miss::Indirect) => Err(Decision::Indirect),
-            Ok(found) if record.layouts.as_ref() == Some(&found) => super::exported(&record.symbol).map(|address| (Decision::Bound(address), carries)).ok_or(Decision::Missing),
-            _ => Err(Decision::Layout),
+            Ok((found, _)) if record.layouts.as_ref() != Some(&found) => Err(Decision::Layout),
+            Ok((_, indirect)) if !self.indirect.cross(cx, &self.keys, &indirect) => Err(Decision::Indirect),
+            Ok(_) => super::exported(&record.symbol).map(|address| (Decision::Bound(address), carries)).ok_or(Decision::Missing),
+            Err(_) => Err(Decision::Layout),
         }
     }
 
     /// Whether the argument and return types `types` have the keys of the types `record` passes.
-    fn same_signature(&self, cx: &mut Context<'_>, types: &[crate::sema::ty::Ty], record: &Record) -> bool {
+    fn same_signature(&self, cx: &mut Context<'_>, types: &[Ty], record: &Record) -> bool {
         let theirs: Vec<Option<&str>> = record.abi.args.iter().chain([&record.abi.ret]).map(|arg| arg.key.as_deref()).collect();
         theirs.len() == types.len() && types.iter().zip(theirs).all(|(&ty, theirs)| theirs.is_some_and(|theirs| self.keys.ty(cx, ty).is_ok_and(|ours| ours == theirs)))
     }
@@ -230,6 +238,11 @@ impl Bindings {
         }
         tally.matched = matched.iter().filter(|&&found| found).count();
         tally
+    }
+
+    /// How code pointers of trait object or function pointer type `ty` travel between Haste's code and the library's.
+    pub(super) fn mode(&self, cx: &mut Context<'_>, ty: Ty) -> Mode {
+        self.indirect.mode(cx, &self.keys, ty)
     }
 
     /// How many records the library holds.
@@ -316,19 +329,11 @@ fn within(at: &At, changed: &Changed) -> bool {
     }
 }
 
-/// Whether record `at` is a program's `main`, which only the runtime's start calls: when it runs rustc's code, every function the program runs does, so state that each std keeps apart never crosses.
+/// Whether record `at` is a program's `main`, which only the runtime's start calls: when it runs rustc's code, every function the program runs does, so state that each std keeps apart never crosses; the start itself always runs Haste's code, which sets up the state of Haste's std.
 fn entry(records: &[Record], callers: &[Vec<usize>], at: usize) -> bool {
     let record = &records[at];
     let main = record.closure.is_none() && record.args.is_empty() && record.path.rsplit(PATH_SEPARATOR).next() == Some(MAIN);
     main && callers[at].iter().all(|&caller| records[caller].path.starts_with(START))
-}
-
-/// The reason no record binds when an instance has no key.
-fn refusal(miss: Miss) -> Decision {
-    match miss {
-        Miss::Indirect => Decision::Indirect,
-        Miss::Unnamed => Decision::Unmatched,
-    }
 }
 
 /// For each record, the records that call it by symbol.
