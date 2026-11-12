@@ -1,4 +1,4 @@
-use crate::ir::{Block, Function, InstData, Op, Value};
+use crate::ir::{Block, Function, Inst, InstData, Op, Value};
 
 /// The blocks in the order the emitter lays them out: those reachable from the entry in reverse postorder, then every other block that has instructions.
 pub(crate) fn order(func: &Function) -> Vec<Block> {
@@ -28,12 +28,13 @@ pub(crate) fn copied_tests(func: &Function, order: &[Block]) -> Vec<bool> {
     copied
 }
 
-/// The positions, in layout order, over which each wanted value is live and where it is defined, the positions of calls that can unwind into a handler, the positions of every call that control can return from, and the operands of the calls a trap follows, which clobber nothing read again but read their operands from where the emitter places arguments.
+/// The positions, in layout order, over which each wanted value is live and where it is defined, the positions of calls that can unwind into a handler, the positions of every call that control can return from with the instruction and block of each, and the operands of the calls a trap follows, which clobber nothing read again but read their operands from where the emitter places arguments.
 pub(crate) struct Live {
     pub span: Vec<Option<(u32, u32)>>,
     pub defs: Vec<u32>,
     pub unwinds: Vec<u32>,
     pub calls: Vec<u32>,
+    pub sites: Vec<(Inst, Block)>,
     pub trapped: Vec<bool>,
 }
 
@@ -152,7 +153,7 @@ pub(crate) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
     let live_in = live_in(func, order, &dense, crossing.len());
     let mut span = vec![None; func.types.len()];
     let mut defs = vec![0; func.types.len()];
-    let (mut unwinds, mut calls) = (Vec::new(), Vec::new());
+    let (mut unwinds, mut calls, mut sites) = (Vec::new(), Vec::new(), Vec::new());
     let mut trapped = vec![false; func.types.len()];
     let mut at = 0_u32;
     for &block in order {
@@ -181,6 +182,7 @@ pub(crate) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
                 data.op.for_operands(|value| trapped[value.index()] = true);
             } else if matches!(data.op, Op::Call { .. } | Op::TryCall { .. }) {
                 calls.push(at);
+                sites.push((*inst, block));
             }
         }
         for next in func.successors(Block(index as u32)) {
@@ -188,7 +190,7 @@ pub(crate) fn live(func: &Function, order: &[Block], wanted: &[bool]) -> Live {
         }
         at += 1;
     }
-    Live { span, defs, unwinds, calls, trapped }
+    Live { span, defs, unwinds, calls, sites, trapped }
 }
 
 /// The values an instruction defines: its result, or a call's results.

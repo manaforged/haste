@@ -3,7 +3,7 @@
 use crate::frame::{Abi, Loc};
 use crate::live::{Live, live, results};
 use crate::fold::{constant, holds};
-use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Op, Signature, StackSlot, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, Op, Signature, StackSlot, Type, Value};
 
 /// The registers of one encoder that planning hands out.
 pub(crate) struct Regs<R: 'static> {
@@ -27,6 +27,8 @@ pub(crate) struct Regs<R: 'static> {
     pub absolute_calls: bool,
     /// Whether the encoder computes an add, subtract, multiply or bitwise operation in the register of its first operand, so the result may take that register where the operand dies.
     pub two_address: bool,
+    /// Whether a value that spans calls may live in a caller-saved register that the emitter stores before and reloads after each call it spans.
+    pub park: bool,
 }
 
 const FOLD_LIMIT: i64 = 1 << 24;
@@ -62,6 +64,8 @@ pub(crate) struct Plan<R> {
     pub deferred: Vec<bool>,
     pub through: Vec<Option<CallTarget>>,
     pub shared: Vec<Option<u32>>,
+    pub parked: Vec<(Inst, Vec<(Value, R, bool)>)>,
+    pub homed: Vec<bool>,
 }
 
 /// Whether planning may give a value of type `ty` a register of `regs`.
@@ -233,7 +237,7 @@ struct Class<'a, F> {
 }
 
 /// For each value some call passes in an integer register, that register.
-fn passed<R: Copy>(func: &Function, classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Vec<Option<R>> {
+fn passed<R: Copy>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> Vec<Option<R>> {
     let mut passed = vec![None; func.types.len()];
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         if let Op::Call { sig, args, .. } | Op::TryCall { sig, args, .. } = &func.insts[inst.index()].op
@@ -334,12 +338,16 @@ const LOOP_WEIGHT: u64 = 8;
 /// The deepest nesting that still raises a use's weight.
 const MAX_DEPTH: u32 = 4;
 
-/// For each value, the cost of keeping it in memory: one per definition and use, times `LOOP_WEIGHT` for each loop around it.
-fn weights(func: &Function) -> Vec<u64> {
-    let depths = crate::licm::depths(func);
+/// For each block, the weight of one instruction in it: `LOOP_WEIGHT` for each loop around it.
+fn block_weights(func: &Function) -> Vec<u64> {
+    crate::licm::depths(func).into_iter().map(|depth| LOOP_WEIGHT.pow(depth.min(MAX_DEPTH))).collect()
+}
+
+/// For each value, the cost of keeping it in memory: the weight of its block for each definition and use.
+fn weights(func: &Function, blocks: &[u64]) -> Vec<u64> {
     let mut weight = vec![0_u64; func.types.len()];
     for (block, data) in func.blocks.iter().enumerate() {
-        let each = LOOP_WEIGHT.pow(depths[block].min(MAX_DEPTH));
+        let each = blocks[block];
         for inst in &data.insts {
             let data = &func.insts[inst.index()];
             data.op.for_operands(|value| weight[value.index()] += each);
@@ -349,11 +357,25 @@ fn weights(func: &Function) -> Vec<u64> {
     weight
 }
 
-/// What guides the choice of a register beyond the spans: the operand each result may compute in place over, and when planning weighs values, the spill cost of each and the values each block edge moves it to or from.
+/// What guides the choice of a register beyond the spans: the operand each result may compute in place over, and when planning weighs values, the spill cost of each, the values each block edge moves it to or from, and the weight of each call when values that span calls may park around them.
 struct Hints<'a> {
     reuse: &'a [Option<Value>],
     weights: Option<&'a [u64]>,
     partners: Option<&'a [Vec<Value>]>,
+    park: Option<&'a [u64]>,
+}
+
+/// What keeping a value in a caller-saved register over `start..=end` costs: a store and a reload around each call inside the span, and a store before a call that ends it.
+fn park_cost(calls: &[u32], weights: &[u64], (start, end): (u32, u32)) -> u64 {
+    let (first, last) = (calls.partition_point(|at| *at <= start), calls.partition_point(|at| *at <= end));
+    (first..last).map(|at| weights[at] * if calls[at] < end { 2 } else { 1 }).sum()
+}
+
+/// Whether `value` may park in a caller-saved register around the calls its span holds, because none of them can unwind and that costs less than keeping it in memory.
+fn parks(live: &Live, hints: &Hints, (start, end, value): (u32, u32, usize)) -> bool {
+    let Some((calls, weights)) = hints.park.zip(hints.weights) else { return false };
+    let unwinds = live.unwinds.partition_point(|at| *at <= start) < live.unwinds.partition_point(|at| *at <= end);
+    !live.trapped[value] && !unwinds && park_cost(&live.calls, calls, (start, end)) < weights[value]
 }
 
 /// For each value a block edge passes, the parameters it becomes, and for each block parameter, the values its edges pass it.
@@ -458,7 +480,11 @@ fn assign<F: Copy + PartialEq>(live: &Live, pooled: &[bool], saved_regs: &[F], p
         });
         let saved = live.trapped[value] || crosses(&live.calls, (start, end));
         let partner = |free: &mut Vec<F>, homes: &[Option<F>]| hints.partners.and_then(|partners| joined(free, homes, &partners[value], (saved, saved_regs, &used)));
-        let fresh = |free: &mut Vec<F>| passed_in(free, live, &pool.passed, (start, end, value)).or_else(|| take(free, (saved, saved_regs), &used));
+        let parked = saved && parks(live, hints, (start, end, value));
+        let fresh = |free: &mut Vec<F>| {
+            let any = passed_in(free, live, &pool.passed, (start, end, value)).or_else(|| take(free, (saved, saved_regs), &used));
+            any.or_else(|| if parked { take(free, (false, saved_regs), &used) } else { None })
+        };
         let reg = match pool.kept[value].or_else(|| reused(&mut active, hints.reuse[value], saved, saved_regs)).or_else(|| partner(&mut free, &homes)).or_else(|| fresh(&mut free)) {
             Some(reg) => reg,
             None => match victim(&active, (end, value), saved.then_some(saved_regs), hints.weights, &live.span) {
@@ -493,6 +519,34 @@ fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl 
     }
 }
 
+/// Whether the call `inst` takes `value` as an argument in `reg`, where it already lives.
+fn passed_own<R: Copy + PartialEq>(func: &Function, inst: Inst, (value, reg): (Value, R), classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> bool {
+    let Op::Call { sig, args, .. } = &func.insts[inst.index()].op else { return false };
+    let Ok(abi) = classify(&func.sigs[sig.index()]) else { return false };
+    args.iter().zip(&abi.params).any(|(arg, loc)| *arg == value && matches!(*loc, Loc::Int(at) if at == reg))
+}
+
+/// For each call that a value in a caller-saved register spans, that value, its register and whether it lives on after the call, ordered by instruction; a value the call reads last from the register it takes it in stays.
+fn parked<R: Copy + PartialEq>(func: &Function, live: &Live, (locations, saved): (&[Location<R>], &[R]), classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> Vec<(Inst, Vec<(Value, R, bool)>)> {
+    let mut at_call: Vec<Vec<(Value, R, bool)>> = vec![Vec::new(); live.calls.len()];
+    for (index, location) in locations.iter().enumerate() {
+        let (Location::Reg(reg), Some((start, end))) = (*location, live.span[index]) else { continue };
+        if saved.contains(&reg) {
+            continue;
+        }
+        let value = Value(index as u32);
+        for call in live.calls.partition_point(|at| *at <= start)..live.calls.partition_point(|at| *at <= end) {
+            let at = live.calls[call];
+            if at < end || !passed_own(func, live.sites[call].0, (value, reg), classify) {
+                at_call[call].push((value, reg, at < end));
+            }
+        }
+    }
+    let mut parked: Vec<(Inst, Vec<(Value, R, bool)>)> = live.sites.iter().map(|site| site.0).zip(at_call).filter(|(_, values)| !values.is_empty()).collect();
+    parked.sort_unstable_by_key(|(inst, _)| inst.index());
+    parked
+}
+
 /// Gives constants and frame addresses static locations, integers and floats pool registers over their live spans, and finds the compares that feed the next branch.
 pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, (order, weighed): (&[Block], bool), params: &[Loc<R>], classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Plan<R> {
     let count = func.types.len();
@@ -509,16 +563,21 @@ pub(crate) fn plan<R: Copy + PartialEq>(func: &Function, regs: &Regs<R>, (order,
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].in_float_register() && !live.trapped[value] && live.span[value].is_some_and(|span| !crosses(&live.calls, span))).collect();
     let reuse = if regs.two_address { reusable(func, &live) } else { vec![None; count] };
-    let weights = weighed.then(|| weights(func));
+    let blocks = weighed.then(|| block_weights(func));
+    let weights = blocks.as_deref().map(|blocks| weights(func, blocks));
     let partners = weighed.then(|| partners(func));
-    let hints = Hints { reuse: &reuse, weights: weights.as_deref(), partners: partners.as_deref() };
-    let (homes, used) = allocate(func, &live, &int_class(func, regs, order, params, passed(func, classify)), &ints, &hints);
+    let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
+    let hints = Hints { reuse: &reuse, weights: weights.as_deref(), partners: partners.as_deref(), park: park.as_deref() };
+    let (homes, used) = allocate(func, &live, &int_class(func, regs, order, params, passed(func, &classify)), &ints, &hints);
     place(&mut locations, homes, Location::Reg);
+    let parked = if park.is_some() { parked(func, &live, (&locations, regs.saved), &classify) } else { Vec::new() };
+    let mut homed = vec![false; if parked.is_empty() { 0 } else { count }];
+    parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
     let (homes, _) = allocate(func, &live, &float_class(regs, params), &floats, &hints);
     place(&mut locations, homes, Location::Float);
     let (pairs, deferred) = pairs(func, &locations);
     let shared = if weighed { crate::color::share(func, &live, &locations, &deferred) } else { Vec::new() };
-    Plan { locations, fused, used, pairs, deferred, through, shared }
+    Plan { locations, fused, used, pairs, deferred, through, shared, parked, homed }
 }
 
 impl<R: Copy> Plan<R> {
@@ -546,6 +605,11 @@ impl<R: Copy> Plan<R> {
             Location::Reg(reg) => Some(reg),
             _ => None,
         }
+    }
+
+    /// The values in caller-saved registers that the call `inst` spans, each with its register and whether it lives on after the call.
+    pub(crate) fn parked_at(&self, inst: Inst) -> &[(Value, R, bool)] {
+        self.parked.binary_search_by_key(&inst.index(), |(at, _)| at.index()).map_or(&[], |at| &self.parked[at].1)
     }
 
     /// The float register that holds `value`, when its location is one.

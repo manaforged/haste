@@ -31,6 +31,7 @@ const REGS: Regs<Reg> = Regs {
     float_branches: &float::BRANCHES,
     absolute_calls: true,
     two_address: true,
+    park: true,
 };
 
 /// Encodes `func` as x86-64 machine code.
@@ -38,7 +39,7 @@ pub(crate) fn compile(func: &Function, effort: crate::Effort) -> Result<Code, St
     let order = crate::live::order(func);
     let abi = classify(&func.signature)?;
     let plan = plan(func, &REGS, (&order, effort == crate::Effort::Full), &abi.params, classify);
-    let frame = layout(func, saved(func, &plan.used, &SAVED), (&plan.locations, &plan.shared), classify)?;
+    let frame = layout(func, saved(func, &plan.used, &SAVED), (&plan.locations, &plan.shared, &plan.homed), classify)?;
     let framed = crate::frame::framed(func, &frame, abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..))));
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -224,7 +225,7 @@ impl Emit<'_> {
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
         match &data.op {
-            Op::Call { sig, callee, args, results } => self.call(*sig, *callee, args, results),
+            Op::Call { sig, callee, args, results } => self.call(inst, (*sig, *callee), args, results),
             Op::TryCall { sig, callee, args, normal, handler } => self.try_call(*sig, *callee, args, *normal, *handler),
             Op::Jump(block, args) => {
                 self.edge(*block, args)?;
@@ -446,10 +447,24 @@ impl Emit<'_> {
         Ok(abi)
     }
 
-    fn call(&mut self, sig: SigRef, callee: Value, args: &[Value], results: &[Value]) -> Result<(), String> {
+    /// Emits a call; each value parked in a caller-saved register around it is stored to its home first, read from there by the call, and reloaded after it when it lives on.
+    fn call(&mut self, inst: Inst, (sig, callee): (SigRef, Value), args: &[Value], results: &[Value]) -> Result<(), String> {
+        let parked = self.plan.parked_at(inst).to_vec();
+        for &(value, reg, _) in &parked {
+            let home = self.at(value);
+            self.asm.store(Size::Q, home, reg);
+            self.plan.locations[value.index()] = Location::Slot;
+        }
         let abi = self.arguments(sig, callee, args)?;
         for (value, loc) in results.iter().zip(abi.returns) {
             self.store_loc(*value, loc);
+        }
+        for (value, reg, lives) in parked {
+            if lives {
+                let home = self.at(value);
+                self.asm.load(Size::Q, reg, home);
+            }
+            self.plan.locations[value.index()] = Location::Reg(reg);
         }
         Ok(())
     }

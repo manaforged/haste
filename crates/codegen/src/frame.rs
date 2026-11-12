@@ -166,15 +166,15 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
     (values, slots)
 }
 
-/// Lays out the frame below the frame pointer: saved registers, the values that live in memory (one place per shared home), the stack slots in use, edge scratch, then outgoing arguments at the stack pointer.
-pub(crate) fn layout<R>(func: &Function, saves: Vec<R>, (locations, shared): (&[Location<R>], &[Option<u32>]), classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<Frame<R>, String> {
+/// Lays out the frame below the frame pointer: saved registers, the values that live in memory (one place per shared home) or are `homed` there around calls, the stack slots in use, edge scratch, then outgoing arguments at the stack pointer.
+pub(crate) fn layout<R>(func: &Function, saves: Vec<R>, (locations, shared, homed): (&[Location<R>], &[Option<u32>], &[bool]), classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<Frame<R>, String> {
     let (outgoing, scratch) = needs(func, classify)?;
     let (present, addressed) = present(func);
     let mut cursor = saves.len() as u32 * WORD;
     let mut values = Vec::with_capacity(func.types.len());
     let mut homes: Vec<i32> = Vec::new();
     for (value, ty) in func.types.iter().enumerate() {
-        if !present[value] || matches!(locations[value], Location::Reg(_) | Location::Float(_)) {
+        if !present[value] || (matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true)) {
             values.push(0);
             continue;
         }
