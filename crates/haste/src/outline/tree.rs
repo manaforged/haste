@@ -19,8 +19,38 @@ pub struct File {
     pub source: Source,
     pub items: Items,
     pub expanded: bool,
-    bodies: OnceLock<Box<[OnceLock<Option<Box<Expansion>>>]>>,
+    bodies: OnceLock<Box<Bodies>>,
     index: OnceLock<Index>,
+}
+
+/// The body expansions that one crate read from a file, then those of the next crate that includes the same file, since a body expands to different paths in a host and a target build of one package.
+#[derive(Debug)]
+struct Bodies {
+    krate: u32,
+    slots: Box<[OnceLock<Option<Box<Expansion>>>]>,
+    next: OnceLock<Box<Bodies>>,
+}
+
+impl Bodies {
+    fn new(krate: u32, items: usize) -> Box<Bodies> {
+        Box::new(Bodies { krate, slots: (0..items).map(|_| OnceLock::new()).collect(), next: OnceLock::new() })
+    }
+
+    fn of(&self, krate: u32) -> Option<&Bodies> {
+        let mut at = self;
+        while at.krate != krate {
+            at = at.next.get()?;
+        }
+        Some(at)
+    }
+
+    fn claim(&self, krate: u32, items: usize) -> &Bodies {
+        let mut at = self;
+        while at.krate != krate {
+            at = at.next.get_or_init(|| Bodies::new(krate, items));
+        }
+        at
+    }
 }
 
 /// The items and imports of a file by name, each list in declaration order.
@@ -56,21 +86,26 @@ impl File {
         self.index.get_or_init(|| build(self))
     }
 
-    /// The expansion of the body of item `item`, once a pass read it and found macro calls or items in it.
-    pub fn expansion(&self, item: u32) -> Option<&Expansion> {
-        self.bodies.get()?.get(item as usize)?.get()?.as_deref()
+    fn body_slot(&self, krate: u32, item: u32) -> Option<&OnceLock<Option<Box<Expansion>>>> {
+        self.bodies.get()?.of(krate)?.slots.get(item as usize)
     }
 
-    /// Whether a pass already read the body of item `item`.
-    pub fn body_read(&self, item: u32) -> bool {
-        self.bodies.get().and_then(|slots| slots.get(item as usize)).is_some_and(|slot| slot.get().is_some())
+    /// The expansion of the body of item `item` in crate `krate`, once a pass read it and found macro calls or items in it.
+    pub fn expansion(&self, krate: u32, item: u32) -> Option<&Expansion> {
+        self.body_slot(krate, item)?.get()?.as_deref()
     }
 
-    /// Records what reading the body of item `item` found, unless a pass already did.
-    pub fn set_expansion(&self, item: u32, found: Option<Box<Expansion>>) {
-        let slots = self.bodies.get_or_init(|| (0..self.items.items.len()).map(|_| OnceLock::new()).collect());
-        if let Some(slot) = slots.get(item as usize) {
-            let _ = slot.set(found);
+    /// Whether a pass already read the body of item `item` in crate `krate`.
+    pub fn body_read(&self, krate: u32, item: u32) -> bool {
+        self.body_slot(krate, item).is_some_and(|slot| slot.get().is_some())
+    }
+
+    /// Records what reading the body of item `item` in crate `krate` found, unless a pass already did.
+    pub fn set_expansion(&self, krate: u32, item: u32, found: Option<Box<Expansion>>) {
+        let items = self.items.items.len();
+        let bodies = self.bodies.get_or_init(|| Bodies::new(krate, items)).claim(krate, items);
+        if let Some(slot) = bodies.slots.get(item as usize) {
+            drop(slot.set(found));
         }
     }
 }

@@ -29,7 +29,13 @@ pub(super) fn outside<'p>(path: &NamePath<'p>, skip: usize) -> NamePath<'p> {
     NamePath { segments: &path.segments[skip..], absolute: false, dollar: path.dollar }
 }
 
-fn in_namespace(entry: &Item, ns: Ns) -> bool {
+/// The namespace that the first of `len` path segments is looked up in, for a path that names something in `ns`.
+pub(super) fn head_ns(len: usize, ns: Ns) -> Ns {
+    if len == 1 { ns } else { Ns::Types }
+}
+
+/// Whether the item `entry` binds a name in namespace `ns`.
+pub(super) fn in_namespace(entry: &Item, ns: Ns) -> bool {
     if matches!(entry.kind, ItemKind::Mod | ItemKind::ExternCrate) { ns == Ns::Types } else { namespaces(entry).contains(&ns) }
 }
 
@@ -106,8 +112,7 @@ impl<'a> Context<'a> {
             (0, None) => return None,
             (0, Some(&"self")) => (enclosing(from)?, &segments[1..]),
             (0, Some(first)) => {
-                let wanted = if segments.len() == 1 { ns } else { Ns::Types };
-                (self.scope_item(root, from, first, Some(wanted))?.outer()?.1, &segments[1..])
+                (self.scope_item(root, from, first, Some(head_ns(segments.len(), ns)))?.outer()?.1, &segments[1..])
             }
             _ => {
                 let mut module = enclosing(from)?;

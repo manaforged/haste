@@ -7,7 +7,7 @@ use crate::names::{Def, ItemRef, Ns, PerNs, Primitive, Sym, Symbols, plain};
 use crate::outline::item::ItemKind;
 use crate::outline::source::{Mark, Source};
 
-use super::super::body_scope::{BodyPath, outside};
+use super::super::body_scope::{BodyPath, head_ns, in_namespace, outside};
 use super::super::impls::ImplRef;
 use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty};
@@ -114,7 +114,8 @@ impl<'a> Infer<'_, 'a> {
 
     /// Where `path` leads among the items that the body declares: the item or variant it names, or `Err` with the count of segments that led out through `super`.
     fn local_def(&mut self, path: &NamePath<'_>, ns: Ns) -> Option<Result<Def, usize>> {
-        let head = path.segments.first().filter(|_| !path.absolute).and_then(|first| self.block_item(self.cx.names.symbols.text(*first)));
+        let wanted = head_ns(path.segments.len(), ns);
+        let head = path.segments.first().filter(|_| !path.absolute).and_then(|first| self.block_item(self.cx.names.symbols.text(*first), wanted));
         let found = match head {
             Some(item) => self.cx.local_descend(self.home, item, &path.segments[1..], ns)?,
             None => self.cx.local_path(self.home, self.anchor().filter(|(_, from)| from.is_some()), path, ns)?,
@@ -197,9 +198,9 @@ impl<'a> Infer<'_, 'a> {
         declared.flatten().map(|at| at as u32).filter(|at| items[*at as usize].kind == crate::outline::item::ItemKind::Use && !self.block_uses.contains(at)).collect()
     }
 
-    /// The item named `name` that a block around the use declares.
-    fn block_item(&self, name: &str) -> Option<ItemRef> {
-        self.items.iter().rev().find(|(bound, _)| *bound == name).map(|(_, item)| *item)
+    /// The item named `name` in namespace `ns` that a block around the use declares.
+    fn block_item(&self, name: &str, ns: Ns) -> Option<ItemRef> {
+        self.items.iter().rev().find(|(bound, item)| *bound == name && in_namespace(self.cx.item(*item).1, ns)).map(|(_, item)| *item)
     }
 
     /// Resolves the value path expression `expr` to a local or an item, and returns its type.

@@ -257,6 +257,9 @@ fn parsed(frag: Frag) -> Option<Fragment> {
 }
 
 fn long(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
+    if frag == Frag::Expr && !can_begin_expr(src.kind(at)) {
+        return None;
+    }
     if let Some(found) = parsed(frag).and_then(|fragment| fragment_end(src, fragment, at, end)) {
         return Some(found);
     }
@@ -273,6 +276,12 @@ fn long(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
         Frag::Pat => Some(until(src, at, end, Stop::Pat)),
         _ => Some(until(src, at, end, Stop::PatParam)),
     }
+}
+
+/// Whether a token of kind `kind` can start an expression, as rustc checks before it parses an `expr` fragment.
+fn can_begin_expr(kind: TokenKind) -> bool {
+    use TokenKind::*;
+    opens(kind) || matches!(kind, Ident | RawIdent | Literal { .. } | Lifetime { .. } | Bang | Minus | Star | And | Or | Lt | Colon | Dot | Pound | Dollar)
 }
 
 /// Whether a fragment of kind `frag` is found by looking at its first token or tree, without parsing.

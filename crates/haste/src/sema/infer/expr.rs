@@ -586,7 +586,7 @@ impl Infer<'_, '_> {
         Ok(a)
     }
 
-    /// The type both branches coerce to when they differ: an unsized slice, a function pointer, or one branch's reference that the other coerces to.
+    /// The type both branches coerce to when they differ: an unsized slice, a function pointer, or one branch's reference or pointer of the same type, such as a `Box`, that the other coerces to.
     pub(super) fn branch_target(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
         if let Some(target) = self.slice_branch(a, b) {
             return Ok(Some(target));
@@ -594,7 +594,13 @@ impl Infer<'_, '_> {
         if let Some(target) = self.fn_branch(a, b)? {
             return Ok(Some(target));
         }
-        if ![a, b].iter().all(|&ty| matches!(self.cx.types.kind(self.resolve(ty)), Kind::Ref(..))) {
+        let (ka, kb) = (self.cx.types.kind(self.resolve(a)), self.cx.types.kind(self.resolve(b)));
+        let pointers = match (ka, kb) {
+            (Kind::Ref(..), Kind::Ref(..)) => true,
+            (Kind::Adt(x, _), Kind::Adt(y, _)) => x == y,
+            _ => false,
+        };
+        if !pointers {
             return Ok(None);
         }
         if self.trial(|infer| Ok(infer.coercion(b, a).ok().flatten()))?.is_some() {

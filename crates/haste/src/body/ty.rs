@@ -4,6 +4,7 @@ use rustc_lexer::TokenKind;
 use super::cursor::Cursor;
 use super::path::Style;
 use super::{Ty, TyId};
+use crate::outline::rules::Frag;
 use crate::outline::source::opens;
 
 impl Cursor<'_> {
@@ -26,8 +27,20 @@ impl Cursor<'_> {
         Ok(first)
     }
 
-    /// Parses a type that stops before `+`.
+    /// Parses a type that stops before `+`, and at the end of a `ty` fragment that a macro passed in.
     pub fn ty_no_bounds(&mut self) -> Result<TyId> {
+        if let Some((end, Frag::Ty)) = self.src.opaque_at(self.at)
+            && end < self.end
+        {
+            let outer = std::mem::replace(&mut self.end, end);
+            let ty = self.ty_unbounded();
+            self.end = outer;
+            return ty;
+        }
+        self.ty_unbounded()
+    }
+
+    fn ty_unbounded(&mut self) -> Result<TyId> {
         match self.kind() {
             TokenKind::OpenParen => return self.paren_ty(),
             TokenKind::OpenBracket => return self.bracket_ty(),

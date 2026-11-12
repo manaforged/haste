@@ -27,6 +27,9 @@ pub const RESERVED: [&str; 38] = [
     "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await", "dyn",
 ];
 
+/// The keywords that can lead a path.
+pub const PATH_KEYWORDS: [&str; 4] = ["crate", "self", "Self", "super"];
+
 impl<'a> Cursor<'a> {
     pub fn new(src: &'a Source, at: u32, end: u32) -> Cursor<'a> {
         Cursor { src, at, end: end.min(src.len()), body: Body::default(), no_struct: false, config: super::Config::default(), expansion: None }

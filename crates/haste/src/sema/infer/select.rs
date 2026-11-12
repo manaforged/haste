@@ -593,13 +593,17 @@ impl<'a> Infer<'_, 'a> {
         Ok(true)
     }
 
-    /// Whether the bound `of` at `path` can hold for the unknown type `ty`: for an integer or float variable, whether an impl for some number type applies, as rustc selects with one; else false only when `ty` is a pending `impl Trait` value whose own bound of that trait does not unify.
+    /// Whether the bound `of` at `path` can hold for the unknown type `ty`: for an integer or float variable, whether an impl for some number type applies, kept as an obligation that picks the type when one impl alone applies, as rustc selects with one; else false only when `ty` is a pending `impl Trait` value whose own bound of that trait does not unify.
     fn var_holds(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty, depth: u32) -> Result<bool> {
         let args = self.bound_args(of, arena, path, ty)?;
+        let substs: Vec<Ty> = std::iter::once(ty).chain(args.iter().copied()).collect();
         if !matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
-            return Ok(!self.applicable(of, ty, &args, depth + 1)?.is_empty() || self.poly_may_implement(of, ty, &args)?);
+            let held = !self.applicable(of, ty, &args, depth + 1)?.is_empty() || self.poly_may_implement(of, ty, &args)?;
+            if held {
+                self.obligations.push((of, substs));
+            }
+            return Ok(held);
         }
-        let substs: Vec<Ty> = std::iter::once(ty).chain(args).collect();
         let held = self.opaque_holds(of, &substs)?;
         if held.is_none() {
             self.obligations.push((of, substs));

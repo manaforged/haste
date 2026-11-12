@@ -236,7 +236,28 @@ pub fn generics(src: &Source, at: u32, to: u32) -> Result<(Body, Generics)> {
     let params = cursor.generic_params()?;
     let supers = if cursor.eat(":") { cursor.bounds()? } else { List::default() };
     let predicates = cursor.where_clause()?;
+    let supers = cursor.with_self_bounds(supers, &predicates);
     Ok((cursor.body, Generics { params, predicates, supers }))
+}
+
+impl Cursor<'_> {
+    /// `supers` with the bounds of each `Self: ...` predicate in `predicates`, which rustc reads as supertraits.
+    fn with_self_bounds(&mut self, supers: List, predicates: &[Predicate]) -> List {
+        let mut bounds = self.body.list(supers).to_vec();
+        let before = bounds.len();
+        for predicate in predicates.iter().filter(|predicate| predicate.ty.is_some_and(|ty| self.is_self_ty(ty))) {
+            bounds.extend_from_slice(self.body.list(predicate.bounds));
+        }
+        if bounds.len() == before { supers } else { self.list(&bounds) }
+    }
+
+    fn is_self_ty(&self, ty: TyId) -> bool {
+        let super::Ty::Path(path) = *self.body.ty(ty) else { return false };
+        let path = self.body.path(path);
+        let [only] = self.body.list(path.segments) else { return false };
+        let segment = &self.body.segments[*only as usize];
+        path.qself.is_none() && !path.global && segment.args.is_none() && self.src.text(segment.name) == "Self"
+    }
 }
 
 /// An impl header: generics, the trait it implements if any, the self type and the where clause, in its own arena.

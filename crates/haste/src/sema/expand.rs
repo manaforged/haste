@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_lexer::TokenKind;
 
-use crate::body::cursor::{RESERVED, is_name};
+use crate::body::cursor::{PATH_KEYWORDS, RESERVED, is_name};
 use crate::body::{self as syntax, Body, sig};
 use crate::names::collect::{extern_crate_root, proc_kind};
 use crate::names::resolve::macro_at;
@@ -60,7 +60,7 @@ fn call_path(src: &Source, bang: u32, from: u32) -> Option<(u32, u32)> {
         return None;
     }
     let mut start = name;
-    while start >= from + 3 && src.kind(start - 1) == TokenKind::Colon && src.kind(start - 2) == TokenKind::Colon && is_name(src.kind(start - 3)) {
+    while start >= from + 3 && src.kind(start - 1) == TokenKind::Colon && src.kind(start - 2) == TokenKind::Colon && path_word(src, start - 3) {
         start -= 3;
     }
     if start >= from + 2 && src.kind(start - 1) == TokenKind::Colon && src.kind(start - 2) == TokenKind::Colon {
@@ -69,6 +69,12 @@ fn call_path(src: &Source, bang: u32, from: u32) -> Option<(u32, u32)> {
         start -= 1;
     }
     Some((start, name))
+}
+
+/// Whether token `at` can lead a path segment: a name that is not a keyword, or one of the keywords a path starts from.
+fn path_word(src: &Source, at: u32) -> bool {
+    let kind = src.kind(at);
+    is_name(kind) && (kind != TokenKind::Ident || !RESERVED.contains(&src.text(at)) || PATH_KEYWORDS.contains(&src.text(at)))
 }
 
 /// The macro that the single name at `path` calls, resolved from the module of the `macro` item that wrote the name.
@@ -346,19 +352,20 @@ impl Writer {
     }
 
     fn resolve_glob(&self, cx: &Context<'_>, src: &Source, path: (u32, u32)) -> Result<Option<ItemRef>> {
-        if path.0 != path.1 {
-            return Ok(None);
-        }
         for prefix in self.globs.iter().rev() {
-            let mut full = Tokens::default();
-            full.copy_range(prefix, 0, prefix.len());
-            full.copy(src, path.1);
-            let joined = full.finish(src.path.clone())?;
-            if let Some(found) = self.resolve_macro(cx, &joined, (0, prefix.len())) {
+            if let Some(found) = self.resolve_joined(cx, prefix, src, path)? {
                 return Ok(Some(found));
             }
         }
         Ok(None)
+    }
+
+    fn resolve_joined(&self, cx: &Context<'_>, prefix: &Source, src: &Source, (from, to): (u32, u32)) -> Result<Option<ItemRef>> {
+        let mut full = Tokens::default();
+        full.copy_range(prefix, 0, prefix.len());
+        (from..=to).for_each(|token| full.copy(src, token));
+        let joined = full.finish(src.path.clone())?;
+        Ok(self.resolve_macro(cx, &joined, (0, joined.len() - 1)))
     }
 
     fn expand_one(&self, cx: &mut Context<'_>, run: Run<'_>, path: (u32, u32), open: u32) -> Result<Option<Source>> {
@@ -396,12 +403,9 @@ impl Writer {
         let first = plain(run.src.text(path.0));
         if path.0 < path.1
             && let Some((_, source)) = self.uses.iter().rev().find(|(alias, _)| *alias == first)
+            && let Some(found) = self.resolve_joined(cx, source, run.src, (path.0 + 1, path.1))?
         {
-            let mut full = Tokens::default();
-            full.copy_range(source, 0, source.len());
-            (path.0 + 1..=path.1).for_each(|token| full.copy(run.src, token));
-            let joined = full.finish(run.src.path.clone())?;
-            return Ok(self.resolve_macro(cx, &joined, (0, joined.len() - 1)));
+            return Ok(Some(found));
         }
         match self.resolve_macro(cx, run.src, path).or_else(|| def_site_macro(cx, run.src, path)) {
             Some(found) => Ok(Some(found)),
@@ -608,7 +612,7 @@ impl<'a> Context<'a> {
     /// The expansion of the body of `item`, or of the body that declares it, once a pass read that body and found macro calls or items in it.
     pub fn expansion(&self, item: ItemRef) -> Option<&'a Expansion> {
         let item = item.body_owner();
-        self.outline.crates[item.krate as usize].files[item.file as usize].expansion(item.item)
+        self.outline.crates[item.krate as usize].files[item.file as usize].expansion(item.krate, item.item)
     }
 
     /// The source that the body of `item` is parsed from: its file, with the expansions of its macro calls when it has some.
@@ -632,7 +636,7 @@ impl<'a> Context<'a> {
     /// Parses the body of `item`, expanding its macro calls and scanning the items it declares when no pass did yet.
     pub(super) fn parse_body(&mut self, item: ItemRef) -> Result<Body> {
         let file = self.file(item);
-        if item.outer().is_some() || file.body_read(item.item) {
+        if item.outer().is_some() || file.body_read(item.krate, item.item) {
             let found = self.expansion(item);
             return super::body_scope::parse_in(self.body_src(item), self.body_config(item, found.map(|found| &found.calls)), self.item(item).1);
         }
@@ -653,7 +657,7 @@ impl<'a> Context<'a> {
         let (source, items, item_scopes) = self.body_derives(item, before, &mut writer, (source, items, &mut scopes, item_scopes))?;
         let calls = writer.calls;
         let found = (!calls.is_empty() || !items.items.is_empty()).then(|| Box::new(Expansion { file: File::new(source, items, true), calls, scopes: scopes.into(), item_scopes: item_scopes.into() }));
-        self.file(item).set_expansion(item.item, found);
+        self.file(item).set_expansion(item.krate, item.item, found);
         Ok(body)
     }
 }
