@@ -1,6 +1,6 @@
 //! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hints and `vzeroupper` as no-ops, the AArch64 barriers as one full barrier, `cpuid` and `xgetbv` as the host CPU's own answers less the extensions the code generator cannot encode, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
 
-mod cpu;
+pub(crate) mod cpu;
 mod math;
 pub mod native;
 mod syscall;

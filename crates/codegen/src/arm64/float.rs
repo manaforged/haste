@@ -1,22 +1,12 @@
-use super::asm::{Alu, Cond, Fconv, Fop, Funary, Size, Vreg, ZR};
-use super::{A, C, D, Emit, Ext, V0, V1};
+use super::asm::{Alu, Cond, Fconv, Fop, Funary, Size, ZR};
+use super::{A, C, D, Emit, V0, V1};
+use crate::frame::Ext;
 use crate::ir::{Binary, Convert, FloatCC, Type, Unary, Value};
 
-fn sign(ty: Type) -> i64 {
-    if ty == Type::F64 { i64::MIN } else { 0x8000_0000 }
-}
+pub(super) const POOL: [u8; 20] = [4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
+pub(super) const BRANCHES: [FloatCC; 6] = [FloatCC::Equal, FloatCC::NotEqual, FloatCC::LessThan, FloatCC::LessThanOrEqual, FloatCC::GreaterThan, FloatCC::GreaterThanOrEqual];
 
 impl Emit<'_> {
-    fn fload(&mut self, reg: Vreg, value: Value) {
-        let at = self.at(value);
-        self.asm.vload(self.ty(value).bytes(), reg, at);
-    }
-
-    fn fstore(&mut self, value: Value, reg: Vreg) {
-        let at = self.at(value);
-        self.asm.vstore(self.ty(value).bytes(), at, reg);
-    }
-
     pub(super) fn float_unary(&mut self, op: Unary, x: Value, result: Value) -> Result<(), String> {
         let double = self.ty(x) == Type::F64;
         let funary = match op {
@@ -28,9 +18,10 @@ impl Emit<'_> {
             Unary::Trunc => Funary::Trunc,
             other => return Err(format!("{other:?} of a float")),
         };
-        self.fload(V0, x);
-        self.asm.funary(funary, double, V0, V0);
-        self.fstore(result, V0);
+        let dst = self.fdst(result);
+        let src = self.fin(x, V0);
+        self.asm.funary(funary, double, dst, src);
+        self.fput(result, dst);
         Ok(())
     }
 
@@ -47,17 +38,18 @@ impl Emit<'_> {
             }
             other => return Err(format!("{other:?} of a float")),
         };
-        self.fload(V0, x);
-        self.fload(V1, y);
-        self.asm.fop(fop, ty == Type::F64, V0, V0, V1);
-        self.fstore(result, V0);
+        let dst = self.fdst(result);
+        let left = self.fin(x, V0);
+        let right = self.fin(y, V1);
+        self.asm.fop(fop, ty == Type::F64, dst, left, right);
+        self.fput(result, dst);
         Ok(())
     }
 
     fn copysign(&mut self, ty: Type, x: Value, y: Value, result: Value) {
         self.raw(A, x);
         self.raw(C, y);
-        self.asm.mov_imm(D, sign(ty));
+        self.asm.mov_imm(D, ty.sign_bit());
         self.asm.alu(Alu::And, Size::X, C, C, D);
         self.asm.alu(Alu::Bic, Size::X, A, A, D);
         self.asm.alu(Alu::Orr, Size::X, A, A, C);
@@ -65,9 +57,9 @@ impl Emit<'_> {
     }
 
     pub(super) fn fcmp(&mut self, cc: FloatCC, x: Value, y: Value, result: Value) {
-        self.fload(V0, x);
-        self.fload(V1, y);
-        self.asm.fcmp(self.ty(x) == Type::F64, V0, V1);
+        let left = self.fin(x, V0);
+        let right = self.fin(y, V1);
+        self.asm.fcmp(self.ty(x) == Type::F64, left, right);
         let cond = match cc {
             FloatCC::Equal => Cond::Eq,
             FloatCC::NotEqual => Cond::Ne,
@@ -76,9 +68,7 @@ impl Emit<'_> {
             FloatCC::GreaterThan => Cond::Gt,
             FloatCC::GreaterThanOrEqual => Cond::Ge,
         };
-        let dst = self.dst(result);
-        self.asm.cset(cond, dst);
-        self.put(result, dst);
+        self.set_flag(result, cond);
     }
 
     pub(super) fn float_convert(&mut self, op: Convert, x: Value, result: Value) -> Result<(), String> {
@@ -88,22 +78,24 @@ impl Emit<'_> {
         }
         match op {
             Convert::Fpromote | Convert::Fdemote => {
-                self.fload(V0, x);
-                self.asm.fcvt(op == Convert::Fdemote, V0, V0);
-                self.fstore(result, V0);
+                let dst = self.fdst(result);
+                let src = self.fin(x, V0);
+                self.asm.fcvt(op == Convert::Fdemote, dst, src);
+                self.fput(result, dst);
             }
             Convert::FromSint | Convert::FromUint => {
                 let signed = op == Convert::FromSint;
-                self.get(A, x, if signed { Ext::Sign } else { Ext::Zero });
-                self.asm.fconv(if signed { Fconv::Scvtf } else { Fconv::Ucvtf }, to == Type::F64, true, A, V0);
-                self.fstore(result, V0);
+                let src = self.src(x, A, Ext::of(signed));
+                let dst = self.fdst(result);
+                self.asm.fconv(if signed { Fconv::Scvtf } else { Fconv::Ucvtf }, to == Type::F64, true, src, dst);
+                self.fput(result, dst);
             }
             Convert::ToSintSat | Convert::ToUintSat => {
                 let signed = op == Convert::ToSintSat;
-                self.fload(V0, x);
+                let src = self.fin(x, V0);
                 let dst = self.dst(result);
                 let conv = if signed { Fconv::Fcvtzs } else { Fconv::Fcvtzu };
-                self.asm.fconv(conv, from == Type::F64, to.bits() > 32, dst, V0);
+                self.asm.fconv(conv, from == Type::F64, to.bits() > 32, dst, src);
                 self.clamp(to.bits(), signed, dst);
                 self.put(result, dst);
             }
@@ -112,7 +104,6 @@ impl Emit<'_> {
         Ok(())
     }
 
-    /// Clamps the 32-bit conversion in `dst` to an 8- or 16-bit range.
     fn clamp(&mut self, bits: u32, signed: bool, dst: super::asm::Reg) {
         if bits >= 32 {
             return;

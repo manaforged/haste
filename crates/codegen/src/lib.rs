@@ -19,6 +19,7 @@ mod live;
 mod loads;
 mod merge;
 mod native;
+mod park;
 mod probe;
 mod promote;
 mod reloc;
@@ -54,7 +55,7 @@ pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, ByteCC, CallConv, Fl
 pub use coroutine::{Coroutine, FIRST_SUSPEND, RETURNED, UNRESUMED};
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
-pub use reloc::{DictTierUp, FootprintHasher, RelocKind, RuntimeSymbol, StencilReloc};
+pub use reloc::{DictTierUp, FootprintHasher, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
 pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
 
 /// A call site that has an exception handler, as offsets into its function.
@@ -106,6 +107,15 @@ pub fn dict_entry_stub(arch: Arch, stub_exec: usize, body_exec: usize, dict_addr
     bytes.map_err(|message| Error::new(ErrorKind::Unsupported, message))
 }
 
+/// Returns the `(dict_offset, body_offset, kind)` relocation offsets inside an unlinked `dict_entry_stub(arch, 0, 1 << 40, 0, None)`.
+pub fn dict_stub_relocs(arch: Arch) -> Result<[(u32, RelocKind); 2], Error> {
+    match arch {
+        Arch::X64 => Ok([(2, RelocKind::Abs64), (12, RelocKind::Abs64)]),
+        Arch::Arm64 => Ok([(0, RelocKind::Arm64Movw64), (16, RelocKind::Arm64Movw64)]),
+        other => Err(Error::new(ErrorKind::Unsupported, format!("no encoder for {other:?} yet"))),
+    }
+}
+
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
 pub fn simplify(func: &mut Function, effort: Effort) {
     optimize(func, promote::Moves::Guided, effort);
@@ -137,7 +147,7 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     native::lower(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
     let code = match target.arch {
-        Arch::X64 => x64::compile(&func, target.effort),
+        Arch::X64 => x64::compile(&func, target),
         Arch::Arm64 => arm64::compile(&func, target),
         other => Err(format!("no encoder for {other:?} yet")),
     };

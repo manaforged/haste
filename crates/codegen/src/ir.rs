@@ -46,6 +46,10 @@ impl Type {
     pub fn is_small_int(self) -> bool {
         matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
     }
+
+    pub(crate) const fn sign_bit(self) -> i64 {
+        if matches!(self, Type::F64) { i64::MIN } else { 0x8000_0000 }
+    }
 }
 
 macro_rules! ids {

@@ -10,7 +10,7 @@ use crate::names::ItemRef;
 use crate::outline::{self, edit::Edit, tree::Profile};
 use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
 use crate::sema::{self, Cache, Edited};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cli::{Failures, case_items, error_kind, print_failures};
@@ -92,19 +92,26 @@ fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reache
 
 impl Batch {
     /// Infers and compiles every root `pick` finds in `workspace` from nothing.
-    fn new(workspace: &graph::Workspace, compilation: &mut Compilation, pick: Pick) -> Result<Batch> {
+    fn new(workspace: &graph::Workspace, compilation: &mut Compilation, pick: Pick, record_aot: bool) -> Result<Batch> {
         let reach_clock = sema::census::Clock::now();
-        let (cases, roots) = batch_roots(workspace, &compilation.outline, pick);
+        let main = if record_aot { Some(main_item(workspace, &compilation.outline).context("no member binary has a `main`")?) } else { None };
+        let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, pick) };
         crate::macros::reach_resolved(
             compilation,
-            |_| roots.clone(),
+            |cx| match main {
+                Some(main) => sema::reach::main_roots(cx, main).map_or_else(|_| vec![(main, sema::substs::Substs::EMPTY)], Into::into),
+                None => root_insts.clone(),
+            },
             |mut cx, reached| {
                 let reach_span = reach_clock.elapsed();
                 let codegen_clock = sema::census::Clock::now();
-                let (image, broken) = Image::build(&mut cx, &reached)?;
+                let (image, broken) = Image::build(&mut cx, &reached, record_aot)?;
                 let codegen_span = codegen_clock.elapsed();
                 let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
-                let roots = roots.iter().map(|root| reached.index[root]).collect();
+                let roots = match main {
+                    Some(main) => sema::reach::main_roots(&mut cx, main)?.into_iter().map(|inst| reached.index[&inst]).collect(),
+                    None => root_insts.iter().map(|root| reached.index[root]).collect(),
+                };
                 Ok(Batch { pick, store: Some(cx.release().0), labels, roots, reached, image, broken, reach_span, codegen_span })
             },
         )
@@ -207,7 +214,7 @@ impl Build {
     /// Infers and compiles the `case_` functions unless that is done.
     pub fn compile_cases(&mut self, workspace: &graph::Workspace) -> Result<()> {
         if self.cases.is_none() {
-            self.cases = Some(Batch::new(workspace, &mut self.compilation, case_items)?);
+            self.cases = Some(Batch::new(workspace, &mut self.compilation, case_items, false)?);
         }
         Ok(())
     }
@@ -218,7 +225,7 @@ impl Build {
             bail!("no member binary has a `main`");
         }
         if self.binary.is_none() {
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items)?);
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, false)?);
         }
         Ok(())
     }
@@ -306,6 +313,28 @@ impl Build {
             self.compile_binary(workspace)?;
         }
         Ok(())
+    }
+
+    /// Compiles `main` and `std::rt::lang_start` into an AOT `Image` and writes a standalone executable to `path`.
+    pub(crate) fn emit_executable(&mut self, workspace: &graph::Workspace, path: &std::path::Path) -> Result<i32> {
+        let started = Instant::now();
+        if self.binary.is_none() {
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, true)?);
+        }
+        let bin = self.binary.as_ref().context("the binary is not compiled")?;
+        if bin.broken.contains_key(&bin.roots[0]) || bin.broken.contains_key(&bin.roots[1]) {
+            for (idx, err) in &bin.broken {
+                eprintln!("broken [{idx}]: {err}");
+            }
+            bail!("entry point failed to compile");
+        }
+        if !bin.broken.is_empty() {
+            eprintln!("warning: {} functions did not compile (replaced by abort stubs)", bin.broken.len());
+        }
+        let target = haste_codegen::Target::host().with(crate::profile().into());
+        bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]))?.write(path)?;
+        eprintln!("built {} ({} functions reached, {:.1} ms)", path.display(), bin.reached.list.len(), started.elapsed().as_secs_f64() * 1e3);
+        Ok(0)
     }
 
     /// Runs every case whose functions all compiled and prints what failed and how long building took.

@@ -148,16 +148,25 @@ pub(crate) fn patch_bytes(relocs: &[StencilReloc], symbols: &[u64], out: &mut [u
             Some(rt) => rt.host_addr() as u64,
             None => symbols[reloc.symbol as usize],
         };
-        let at = reloc.offset as usize;
-        match reloc.kind {
-            RelocKind::Abs32 => {
-                assert!(value < (1 << 31), "Abs32 target {value:#x} exceeds low 2 GiB");
-                out[at..at + 4].copy_from_slice(&(value as u32).to_le_bytes());
-            }
-            RelocKind::Abs64 => out[at..at + 8].copy_from_slice(&value.to_le_bytes()),
-            RelocKind::Arm64Movw64 => patch_arm64_movw64(&mut out[at..at + 16], value),
+        if let Err(err) = patch_reloc(reloc.kind, value, &mut out[reloc.offset as usize..]) {
+            panic!("{err}");
         }
     }
+}
+
+/// Patches one relocation of `kind` targeting `value` at the start of `out`.
+pub fn patch_reloc(kind: RelocKind, value: u64, out: &mut [u8]) -> Result<(), crate::Error> {
+    match kind {
+        RelocKind::Abs32 => {
+            if value >= (1 << 31) {
+                return Err(crate::Error::new(crate::ErrorKind::Unsupported, format!("Abs32 target {value:#x} exceeds low 2 GiB")));
+            }
+            out[..4].copy_from_slice(&(value as u32).to_le_bytes());
+        }
+        RelocKind::Abs64 => out[..8].copy_from_slice(&value.to_le_bytes()),
+        RelocKind::Arm64Movw64 => patch_arm64_movw64(&mut out[..16], value),
+    }
+    Ok(())
 }
 
 fn patch_arm64_movw64(out: &mut [u8], value: u64) {

@@ -12,6 +12,7 @@ use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sync::lock;
 
+use super::aot::AotFn;
 use super::{Image, Pass, stub};
 
 /// Minimum template code size in bytes before sharing a dictionary body.
@@ -120,6 +121,7 @@ pub(super) struct DistinctInst {
     pub leader: usize,
     pub followers: Vec<usize>,
     pub symbols: Vec<u64>,
+    pub relocs: Option<Vec<SymbolSource>>,
 }
 
 pub(super) struct GroupWork {
@@ -214,6 +216,9 @@ impl Image {
         let mut addrs = lock(&self.rodata_addrs);
         let id = RodataId(addrs.len() as u32);
         addrs.push(address);
+        if let Some(aot) = &self.aot {
+            lock(aot).rodata.push((bytes.to_vec(), relocs.to_vec()));
+        }
         map.insert(key, id);
         id
     }
@@ -245,12 +250,29 @@ impl Image {
         let mut addrs = lock(&self.vtable_addrs);
         let id = VtableId(addrs.len() as u32);
         addrs.push(address);
+        if let Some(aot) = &self.aot {
+            lock(aot).vtables.push(entries.to_vec());
+        }
         map.insert(entries.to_vec(), id);
         id
     }
 
     pub(super) fn promoted_cell(&self, owner: usize, seq: u32, size: u32) -> u64 {
-        *lock(&self.promoted_cells).entry((owner, seq)).or_insert_with(|| self.zeroed(size as usize) as usize as u64)
+        let mut cells = lock(&self.promoted_cells);
+        if let Some(&addr) = cells.get(&(owner, seq)) {
+            return addr;
+        }
+        let addr = self.zeroed(size as usize) as usize as u64;
+        cells.insert((owner, seq), addr);
+        if let Some(aot) = &self.aot {
+            let mut state = lock(aot);
+            if !state.promoted_seen.contains_key(&(owner, seq)) {
+                let at = state.promoted.len();
+                state.promoted_seen.insert((owner, seq), at);
+                state.promoted.push(((owner, seq), size));
+            }
+        }
+        addr
     }
 
     pub(super) fn symbol_value(&self, sym: &SymbolSource) -> u64 {
@@ -293,7 +315,9 @@ impl Image {
         let code = haste_codegen::compile(out.func, &target()).map_err(|e| item_err(cx, item, e))?;
         let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
         self.publish(index, exec);
-        pass.record_size(index, code.bytes().len() as u32, started.elapsed().as_nanos() as u64);
+        let code_len = code.bytes().len() as u32;
+        self.record_aot(index, AotFn::Direct { code: Arc::new(code), relocs: out.relocs }, &[]);
+        pass.record_size(index, code_len, started.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -329,7 +353,7 @@ impl Image {
                         }
                     };
                     let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-                    if let Some(hit) = self.reuse_cached((item, footprint), index, &symbols, pass)
+                    if let Some(hit) = self.reuse_cached((item, footprint), index, &symbols, self.aot.is_some().then_some(&relocs), pass)
                         && cfg.verify
                     {
                         verify_hits.push((index, hit));
@@ -350,7 +374,12 @@ impl Image {
             let mut distinct: Vec<DistinctInst> = Vec::new();
             let rep_syms: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
             sym_pos.insert(rep_syms.clone(), 0);
-            distinct.push(DistinctInst { leader: rep, followers: Vec::new(), symbols: rep_syms });
+            distinct.push(DistinctInst {
+                leader: rep,
+                followers: Vec::new(),
+                symbols: rep_syms,
+                relocs: self.aot.is_some().then(|| out.relocs.to_vec()),
+            });
             for &index in rest {
                 let relocs = match lower::eval_relocs(cx, reached, self, &out.reloc_plan, index) {
                     Ok(r) => r,
@@ -364,7 +393,12 @@ impl Image {
                     distinct[pos].followers.push(index);
                 } else {
                     sym_pos.insert(symbols.clone(), distinct.len());
-                    distinct.push(DistinctInst { leader: index, followers: Vec::new(), symbols });
+                    distinct.push(DistinctInst {
+                        leader: index,
+                        followers: Vec::new(),
+                        symbols,
+                        relocs: self.aot.is_some().then(|| relocs.to_vec()),
+                    });
                 }
             }
             groups.push(GroupWork { item, footprint, distinct, leader_out: Some(out) });
@@ -375,10 +409,18 @@ impl Image {
         (groups, errors)
     }
 
-    fn reuse_cached(&self, (item, footprint): (ItemRef, FootprintId), index: usize, symbols: &[u64], pass: &mut Pass) -> Option<VerifyRecord> {
+    fn reuse_cached(&self, (item, footprint): (ItemRef, FootprintId), index: usize, symbols: &[u64], aot_relocs: Option<&Vec<SymbolSource>>, pass: &mut Pass) -> Option<VerifyRecord> {
         let alias_key = (item, footprint, symbols.to_vec());
         if let Some(&(addr, is_dict)) = pass.stencils.aliases.get(&alias_key) {
             self.publish(index, addr);
+            if let Some(relocs) = aot_relocs
+                && let Some(template) = pass.stencils.templates.get(&(item, footprint))
+            {
+                match template {
+                    CachedTemplate::Stencil { code, .. } => self.record_aot(index, AotFn::Direct { code: Arc::clone(code), relocs: relocs.clone() }, &[]),
+                    CachedTemplate::Dict { code, .. } => self.record_aot(index, AotFn::Dict { body: Arc::clone(code), relocs: relocs.clone() }, &[]),
+                }
+            }
             return self.cached_verify_record((item, footprint), addr, is_dict, pass);
         }
         let template = pass.stencils.templates.get(&(item, footprint)).cloned()?;
@@ -386,6 +428,9 @@ impl Image {
             CachedTemplate::Stencil { code, .. } => {
                 let exec = pass.memory.write_patched(&code, symbols).ok()?;
                 self.publish(index, exec);
+                if let Some(relocs) = aot_relocs {
+                    self.record_aot(index, AotFn::Direct { code: Arc::clone(&code), relocs: relocs.clone() }, &[]);
+                }
                 pass.record_size(index, code.bytes().len() as u32, 0);
                 pass.stencils.aliases.insert(alias_key, (exec, false));
                 Some(VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() })
@@ -393,6 +438,9 @@ impl Image {
             CachedTemplate::Dict { body_exec, code, .. } => {
                 let (stub_exec, stub_bytes) = self.emit_dict_stub(body_exec, symbols, None, pass).ok()?;
                 self.publish(index, stub_exec);
+                if let Some(relocs) = aot_relocs {
+                    self.record_aot(index, AotFn::Dict { body: Arc::clone(&code), relocs: relocs.clone() }, &[]);
+                }
                 pass.record_size(index, stub_bytes.len() as u32, 0);
                 pass.stencils.aliases.insert(alias_key, (stub_exec, true));
                 Some(VerifyRecord::Dict { body_exec, stub_exec, stub_bytes, code })
@@ -428,6 +476,9 @@ impl Image {
         for inst in &group.distinct {
             let exec = pass.memory.write_patched(&code, &inst.symbols).map_err(|e| item_err(cx, group.item, e))?;
             self.store_instance(inst, exec);
+            if let Some(relocs) = &inst.relocs {
+                self.record_aot(inst.leader, AotFn::Direct { code: Arc::clone(&code), relocs: relocs.clone() }, &inst.followers);
+            }
             pass.record_size(inst.leader, code.bytes().len() as u32, 0);
             if record_cache {
                 pass.stencils.aliases.insert((group.item, group.footprint, inst.symbols.clone()), (exec, false));
@@ -462,6 +513,9 @@ impl Image {
         for inst in &group.distinct {
             let (stub_exec, stub_bytes) = self.emit_dict_stub(body_exec, &inst.symbols, None, pass).map_err(|e| item_err(cx, group.item, e))?;
             self.store_instance(inst, stub_exec);
+            if let Some(relocs) = &inst.relocs {
+                self.record_aot(inst.leader, AotFn::Dict { body: Arc::clone(&code), relocs: relocs.clone() }, &inst.followers);
+            }
             pass.record_size(inst.leader, stub_bytes.len() as u32, 0);
             if record_cache {
                 pass.stencils.aliases.insert((group.item, group.footprint, inst.symbols.clone()), (stub_exec, true));

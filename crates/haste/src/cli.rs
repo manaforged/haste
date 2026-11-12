@@ -138,13 +138,16 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
     Ok(())
 }
 
-fn report_cases(workspace: &graph::Workspace, targets: &Targets, (request, args): (Request, &[String]), stats: Option<(&std::path::Path, sema::census::Span)>) -> Result<i32> {
+fn report_cases(workspace: &graph::Workspace, targets: &Targets, (request, args): (Request, &[String]), stats: Option<(&std::path::Path, sema::census::Span)>, out: Option<&std::path::Path>) -> Result<i32> {
     if request == Request::Run {
         return crate::build::run(workspace, targets, args);
     }
     let started = Instant::now();
     let mut build = crate::build::Build::load(workspace, targets)?;
-    let result = crate::serve::finish(&mut build, workspace, (request, args), started);
+    let result = match (request, out) {
+        (Request::Build, Some(path)) => build.emit_executable(workspace, path),
+        _ => crate::serve::finish(&mut build, workspace, (request, args), started),
+    };
     if let Some((path, graph_span)) = stats {
         build.write_stats(workspace, graph_span, path)?;
     }
@@ -231,7 +234,7 @@ fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     }
 }
 
-const USAGE: &str = "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] build|test|run|serve|prep PATH [--] [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]\n       haste [--release] debug code PATH DIR";
+const USAGE: &str = "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] [-o PATH] build|test|run|serve|prep PATH [--] [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]\n       haste [--release] debug code PATH DIR";
 
 /// What the command line asks for.
 #[derive(Clone, Copy)]
@@ -276,7 +279,7 @@ fn parse(args: &mut impl Iterator<Item = String>) -> Result<Command> {
     }
 }
 
-fn consume_options<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>, stats: &mut Option<PathBuf>) -> Result<()> {
+fn consume_options<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>, stats: &mut Option<PathBuf>, out: &mut Option<PathBuf>) -> Result<()> {
     while let Some(flag) = args.peek() {
         match flag.as_str() {
             "--jobs" => {
@@ -306,6 +309,11 @@ fn consume_options<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>
                 let value = args.next().context("--stats-json takes a file path")?;
                 *stats = Some(PathBuf::from(value));
             }
+            "-o" | "--output" => {
+                args.next();
+                let value = args.next().context("-o takes a file path")?;
+                *out = Some(PathBuf::from(value));
+            }
             _ => break,
         }
     }
@@ -334,15 +342,16 @@ fn tune_malloc() {
     }
 }
 
-fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>)> {
+fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>, Option<PathBuf>)> {
     let mut args = std::env::args().skip(1).peekable();
     let mut stats_json = None;
-    consume_options(&mut args, &mut stats_json)?;
+    let mut out = None;
+    consume_options(&mut args, &mut stats_json, &mut out)?;
     let command = parse(&mut args)?;
     if matches!(command, Command::Request(Request::Build)) {
-        consume_options(&mut args, &mut stats_json)?;
-    } else if stats_json.is_some() {
-        anyhow::bail!("--stats-json is only supported with `haste build`");
+        consume_options(&mut args, &mut stats_json, &mut out)?;
+    } else if stats_json.is_some() || out.is_some() {
+        anyhow::bail!("--stats-json and -o are only supported with `haste build`");
     }
     let path = PathBuf::from(args.next().context(USAGE)?);
     let rest: Vec<String> = args.collect();
@@ -350,14 +359,14 @@ fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>)
         Some((first, tail)) if first == "--" => tail.to_vec(),
         _ => rest,
     };
-    Ok((command, path, rest, stats_json))
+    Ok((command, path, rest, stats_json, out))
 }
 
 /// Runs the haste command line.
 pub fn main() -> Result<()> {
     tune_malloc();
     crate::sema::evaluate::install(crate::image::evaluator);
-    let (command, path, rest, stats_json) = parse_invocation()?;
+    let (command, path, rest, stats_json, out) = parse_invocation()?;
     match command {
         Command::Debug(Query::Items) => return print_items(&path),
         Command::Debug(Query::Expand) => return print_expanded(&path),
@@ -366,13 +375,14 @@ pub fn main() -> Result<()> {
     let root = std::path::absolute(path)?;
     let argv: Vec<String> = std::iter::once(program_name(&root)).chain(rest).collect();
     if stats_json.is_none()
+        && out.is_none()
         && crate::profile() == outline::tree::Profile::Debug
         && let Command::Request(request) = command
         && let Some(status) = crate::serve::ask(&root, request, &argv)?
     {
         std::process::exit(status);
     }
-    match report(command, &root, &argv, stats_json.as_deref())? {
+    match report(command, &root, &argv, stats_json.as_deref(), out.as_deref())? {
         0 => Ok(()),
         status => std::process::exit(status),
     }
@@ -432,7 +442,7 @@ pub(crate) fn load_workspace(root: &std::path::Path, targets: &Targets) -> Resul
     Ok(workspace)
 }
 
-fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json: Option<&std::path::Path>) -> Result<i32> {
+fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json: Option<&std::path::Path>, out: Option<&std::path::Path>) -> Result<i32> {
     let targets = Targets { target: cfg::Target::host(), host: cfg::Target::host() };
     let started = Instant::now();
     let graph_clock = sema::census::Clock::now();
@@ -443,7 +453,7 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
     let graph_span = graph_clock.elapsed();
     let loaded = started.elapsed();
     let status = match command {
-        Command::Request(request) => report_cases(&workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)))?,
+        Command::Request(request) => report_cases(&workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)), out)?,
         Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
         Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,

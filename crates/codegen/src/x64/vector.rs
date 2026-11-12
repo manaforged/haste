@@ -1,7 +1,8 @@
 use super::asm::{Reg, Xmm};
-use super::{Emit, Ext};
+use super::Emit;
 use super::float::{X0, X1, X2};
 use crate::fill::BYTES;
+use crate::frame::Ext;
 use crate::ir::{Binary, ByteCC, Op, Value, VectorOp};
 
 /// The operand-size prefix every packed integer SSE2 instruction takes.
@@ -80,19 +81,25 @@ impl Emit<'_> {
         Ok(())
     }
 
-    /// `dst = x op y` for the two-operand SSE instruction with `prefix` and `opcode`, reading `y` from a register so no operand needs alignment.
     fn packed(&mut self, (prefix, opcode): (&[u8], &[u8]), (x, y): (Value, Value), result: Value) {
         let dst = self.fdst(result);
-        let source = self.fin(y, X1);
+        let mut source = self.fin(y, X1);
+        if source == dst && x != y {
+            self.asm.movaps(X1, source);
+            source = X1;
+        }
         self.fget(dst, x);
         self.asm.sse(prefix, opcode, dst.0, source);
         self.fput(result, dst);
     }
 
-    /// `sha256rnds2 dst, y` with `dst` holding `x` and xmm0, which the instruction reads, holding `k`.
     fn sha256_rounds(&mut self, (x, y, k): (Value, Value, Value), result: Value) {
         let dst = self.xmm_of(result).unwrap_or(X2);
-        let source = self.fin(y, X1);
+        let mut source = self.fin(y, X1);
+        if source == dst && x != y {
+            self.asm.movaps(X1, source);
+            source = X1;
+        }
         self.fget(X0, k);
         self.fget(dst, x);
         self.asm.sse(&[], &[0x0F, 0x38, 0xCB], dst.0, source);

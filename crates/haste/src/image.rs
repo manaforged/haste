@@ -1,5 +1,6 @@
 //! One process image: a call table with one entry per reached function, the code it points at, and constant data.
 
+mod aot;
 mod expand;
 mod lazy;
 pub mod perf;
@@ -21,6 +22,7 @@ use rustc_hash::FxHashMap as HashMap;
 use anyhow::{Result, bail};
 use haste_codegen::{Arena, Memory};
 
+use crate::host::HostSymbol;
 use crate::lower::{self, Slots, Word};
 use crate::sema::Context;
 use crate::sema::reach::{Instance, Reached};
@@ -55,6 +57,7 @@ pub struct Image {
     wanted: Mutex<Vec<Instance>>,
     bodies: lower::Bodies,
     jit_mode: bool,
+    aot: Option<Mutex<aot::AotState>>,
 }
 
 /// What one compile pass writes: its code memory, its stencil cache, and sparse `(index, size, ns)` records.
@@ -141,6 +144,9 @@ impl Slots for Image {
         }
         let address = self.zeroed(size as usize + 1);
         cells.insert(index, address);
+        if let Some(aot) = &self.aot {
+            lock(aot).statics.entry(index).or_insert(aot::AotStatic::Local(size));
+        }
         address
     }
 
@@ -161,10 +167,14 @@ impl Slots for Image {
     }
 }
 
-fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, String> {
+fn resolve_host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<(HostSymbol, usize), String> {
     let name = cx.symbol_name(item);
-    let resolved = name.as_deref().and_then(crate::host::HostSymbol::resolve).and_then(|sym| sym.host_addr());
+    let resolved = name.as_deref().and_then(HostSymbol::resolve).and_then(|sym| sym.host_addr().map(|addr| (sym, addr)));
     resolved.ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
+}
+
+fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, String> {
+    resolve_host_symbol(cx, item).map(|(_, addr)| addr)
 }
 
 /// Whether the foreign item `item` links weakly, so a missing symbol reads as null.
@@ -175,6 +185,10 @@ fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {
 impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Result<Image> {
+        Self::create(reached, false)
+    }
+
+    fn create(reached: &Reached, record_aot: bool) -> Result<Image> {
         let shared = Arena::shared(SHARED_BYTES)?;
         let capacity = reached.list.len().max(TABLE_SLOTS);
         let mut low = Arena::low(capacity * size_of::<AtomicUsize>())?;
@@ -203,6 +217,7 @@ impl Image {
             wanted: Mutex::default(),
             bodies: lower::Bodies::default(),
             jit_mode: false,
+            aot: record_aot.then(|| aot::AotState::new(reached.list.len())),
         })
     }
 
@@ -252,9 +267,9 @@ impl Image {
         unsafe { &*(self.table as *const AtomicUsize).add(index) }
     }
 
-    /// An image of every function in `reached`, compiled, with why each one that did not compile failed.
-    pub fn build(cx: &mut Context<'_>, reached: &Reached) -> Result<(Image, HashMap<usize, String>)> {
-        let mut image = Image::new(reached)?;
+    /// An image of every function in `reached`, compiled, optionally recording AOT relocations, with why each one that did not compile failed.
+    pub(crate) fn build(cx: &mut Context<'_>, reached: &Reached, record_aot: bool) -> Result<(Image, HashMap<usize, String>)> {
+        let mut image = Self::create(reached, record_aot)?;
         let all: Vec<usize> = (0..reached.list.len()).collect();
         let broken = image.compile(cx, reached, &all).into_iter().collect();
         Ok((image, broken))
@@ -265,6 +280,9 @@ impl Image {
         if self.sizes.len() < reached.list.len() {
             self.sizes.resize(reached.list.len(), 0);
             self.times.resize(reached.list.len(), 0);
+        }
+        if let Some(aot) = &self.aot {
+            lock(aot).ensure_len(reached.list.len());
         }
         if !indices.is_empty() && indices.len() < reached.list.len() {
             self.reset_caches();
@@ -281,8 +299,13 @@ impl Image {
                 work.push(index);
                 continue;
             }
-            match host_symbol(cx, item) {
-                Ok(address) if !lower::is_static(cx, item) => self.slot(index).store(address, Ordering::Release),
+            match resolve_host_symbol(cx, item) {
+                Ok((sym, address)) if !lower::is_static(cx, item) => {
+                    self.slot(index).store(address, Ordering::Release);
+                    if let Some(aot) = &self.aot {
+                        lock(aot).foreign_fns.insert(index, sym);
+                    }
+                }
                 Ok(_) => {}
                 Err(_) if lower::is_static(cx, item) && weak(cx, item) => {}
                 Err(error) => errors.push((index, error)),
@@ -300,12 +323,18 @@ impl Image {
             if typed.is_err() || !cx.foreign(*item) || !lower::is_static(cx, *item) {
                 continue;
             }
-            let cell = match (host_symbol(cx, *item), weak(cx, *item)) {
-                (found, true) => self.data(&found.unwrap_or(0).to_le_bytes()),
-                (Ok(address), false) => address as i64,
+            let resolved = resolve_host_symbol(cx, *item);
+            let is_weak = weak(cx, *item);
+            let (cell, host) = match (resolved, is_weak) {
+                (Ok((host, address)), true) => (self.data(&address.to_le_bytes()), Some(host)),
+                (Err(_), true) => (self.data(&0_usize.to_le_bytes()), None),
+                (Ok((host, address)), false) => (address as i64, Some(host)),
                 (Err(_), false) => continue,
             };
             lock(&self.cells).insert(index, cell);
+            if let Some(aot) = &self.aot {
+                lock(aot).statics.insert(index, aot::AotStatic::Foreign { weak: is_weak, host });
+            }
         }
     }
 

@@ -1,6 +1,7 @@
-use super::asm::{FP, Mem, Reg, Size};
-use super::{A, C, Emit, Ext, IP};
+use super::asm::{FP, Mem, Reg, Size, Vreg};
+use super::{A, C, D, Emit, IP, V0};
 use crate::alloc::Location;
+use crate::frame::Ext;
 use crate::ir::{StackSlot, Type, Value};
 
 impl Emit<'_> {
@@ -12,18 +13,23 @@ impl Emit<'_> {
         Mem::new(FP, self.frame.slots[slot.index()] + offset)
     }
 
-    /// The register to compute `value` in: its location register, or A.
+    pub(super) fn vreg_of(&self, value: Value) -> Option<Vreg> {
+        self.plan.float_of(value).map(Vreg)
+    }
+
     pub(super) fn dst(&self, value: Value) -> Reg {
         self.plan.reg_of(value).unwrap_or(A)
     }
 
-    /// Puts the address `slot + offset` in `reg`.
+    pub(super) fn fdst(&self, value: Value) -> Vreg {
+        self.vreg_of(value).unwrap_or(V0)
+    }
+
     pub(super) fn slot_address(&mut self, reg: Reg, slot: StackSlot, offset: i32) {
         let disp = self.frame.slots[slot.index()] + offset;
         self.add_const(reg, FP, i64::from(disp));
     }
 
-    /// `dst = base + imm`, with an immediate form when it fits one.
     pub(super) fn add_const(&mut self, dst: Reg, base: Reg, imm: i64) {
         match u32::try_from(imm.unsigned_abs()) {
             Ok(small) if small < 4096 => self.asm.add_imm(imm < 0, false, Size::X, dst, base, small),
@@ -34,7 +40,6 @@ impl Emit<'_> {
         }
     }
 
-    /// The memory at `addr + offset`: relative to the frame pointer for a frame address, to the location register of `addr`, or through C.
     pub(super) fn address(&mut self, addr: Value, offset: i32) -> Mem {
         if let Some(reg) = self.plan.reg_of(addr) {
             return Mem::new(reg, offset);
@@ -48,20 +53,19 @@ impl Emit<'_> {
         Mem::new(C, offset)
     }
 
-    /// Puts the 64 bits of `value` in `reg`; bits above its type's width are unspecified.
     pub(super) fn raw(&mut self, reg: Reg, value: Value) {
         match self.plan.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, imm),
             Location::Frame(slot, offset) => self.slot_address(reg, slot, offset),
             Location::Reg(from) => self.asm.mov(reg, from),
-            Location::Slot | Location::SlotAddr(_) | Location::Float(_) => {
+            Location::Float(from) => self.asm.fmov_out(self.ty(value) == Type::F64, reg, Vreg(from)),
+            Location::Slot | Location::SlotAddr(_) => {
                 let at = self.at(value);
                 self.asm.load(Size::X, false, reg, at);
             }
         }
     }
 
-    /// Puts `value` in `reg`, extended from its type's width to 64 bits by `ext`.
     pub(super) fn get(&mut self, reg: Reg, value: Value, ext: Ext) {
         let ty = self.ty(value);
         let bytes = ty.bytes();
@@ -70,14 +74,17 @@ impl Emit<'_> {
             Location::Imm(imm) => self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed)),
             Location::Frame(..) => self.raw(reg, value),
             Location::Reg(from) => self.asm.extend(signed, bytes, reg, from),
-            Location::Slot | Location::SlotAddr(_) | Location::Float(_) => {
+            Location::Float(from) => {
+                self.asm.fmov_out(ty == Type::F64, reg, Vreg(from));
+                self.asm.extend(signed, bytes, reg, reg);
+            }
+            Location::Slot | Location::SlotAddr(_) => {
                 let at = self.at(value);
                 self.asm.load(Size::of(bytes), signed && bytes < 8, reg, at);
             }
         }
     }
 
-    /// A register that holds `value` extended by `ext`: its location register when no extension is needed, else `scratch` loaded with it.
     pub(super) fn src(&mut self, value: Value, scratch: Reg, ext: Ext) -> Reg {
         match self.plan.reg_of(value) {
             Some(reg) if self.ty(value).bytes() >= 8 => reg,
@@ -88,7 +95,6 @@ impl Emit<'_> {
         }
     }
 
-    /// A register that holds the 64 bits of `value`, which may be unspecified above its type's width.
     pub(super) fn bits(&mut self, value: Value, scratch: Reg) -> Reg {
         match self.plan.reg_of(value) {
             Some(reg) => reg,
@@ -100,12 +106,41 @@ impl Emit<'_> {
     }
 
     pub(super) fn put(&mut self, value: Value, reg: Reg) {
-        if let Location::Reg(location) = self.plan.location(value) {
-            self.asm.mov(location, reg);
-            return;
+        match self.plan.location(value) {
+            Location::Reg(location) => self.asm.mov(location, reg),
+            Location::Float(location) => self.asm.fmov_in(self.ty(value) == Type::F64, Vreg(location), reg),
+            _ => {
+                let at = self.at(value);
+                self.asm.store(Size::X, at, reg);
+            }
         }
-        let at = self.at(value);
-        self.asm.store(Size::X, at, reg);
+    }
+
+    pub(super) fn fget(&mut self, reg: Vreg, value: Value) {
+        let ty = self.ty(value);
+        match self.plan.location(value) {
+            Location::Float(from) => self.asm.fmov_reg(ty == Type::F64, reg, Vreg(from)),
+            Location::Slot => self.asm.vload(ty.bytes(), reg, self.at(value)),
+            _ => {
+                self.raw(D, value);
+                self.asm.fmov_in(ty == Type::F64, reg, D);
+            }
+        }
+    }
+
+    pub(super) fn fput(&mut self, value: Value, reg: Vreg) {
+        let ty = self.ty(value);
+        match self.plan.location(value) {
+            Location::Float(to) => self.asm.fmov_reg(ty == Type::F64, Vreg(to), reg),
+            _ => self.asm.vstore(ty.bytes(), self.at(value), reg),
+        }
+    }
+
+    pub(super) fn fin(&mut self, value: Value, scratch: Vreg) -> Vreg {
+        self.vreg_of(value).unwrap_or_else(|| {
+            self.fget(scratch, value);
+            scratch
+        })
     }
 
     pub(super) fn high(&mut self, reg: Reg, value: Value) {
@@ -118,10 +153,10 @@ impl Emit<'_> {
         self.asm.store(Size::X, at, reg);
     }
 
-    /// Loads the location of `value` from the bytes at `from`.
     pub(super) fn load_home(&mut self, value: Value, from: Mem) {
         match self.plan.location(value) {
             Location::Reg(reg) => self.asm.load(Size::X, false, reg, from),
+            Location::Float(v) => self.asm.vload(self.ty(value).bytes(), Vreg(v), from),
             _ => self.copy_to(self.at(value), from, self.ty(value)),
         }
     }
@@ -129,13 +164,12 @@ impl Emit<'_> {
     pub(super) fn copy_to(&mut self, to: Mem, from: Mem, ty: Type) {
         self.asm.load(Size::X, false, IP, from);
         self.asm.store(Size::X, to, IP);
-        if ty == Type::I128 {
+        if ty.bytes() == 16 {
             self.asm.load(Size::X, false, IP, from.offset(8));
             self.asm.store(Size::X, to.offset(8), IP);
         }
     }
 
-    /// Writes the eight (or sixteen) bytes of `value` to `to`, using IP as scratch.
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
         match self.plan.location(value) {
             Location::Imm(0) => self.asm.store(Size::X, to, super::ZR),
@@ -144,7 +178,8 @@ impl Emit<'_> {
                 self.asm.store(Size::X, to, IP);
             }
             Location::Reg(reg) => self.asm.store(Size::X, to, reg),
-            Location::Slot | Location::SlotAddr(_) | Location::Float(_) => self.copy_to(to, self.at(value), self.ty(value)),
+            Location::Float(v) => self.asm.vstore(self.ty(value).bytes(), to, Vreg(v)),
+            Location::Slot | Location::SlotAddr(_) => self.copy_to(to, self.at(value), self.ty(value)),
         }
     }
 }

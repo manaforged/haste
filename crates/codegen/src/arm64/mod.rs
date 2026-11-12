@@ -7,42 +7,50 @@ mod location;
 mod wide;
 
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
-use frame::{Abi, Loc, Packing, SAVED, classify};
-use crate::alloc::{Location, Plan, Regs, plan};
-use crate::frame::{Frame, INCOMING, PAGE, edge_steps, Step, layout, saved};
+use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
+use crate::alloc::{Location, Plan, Regs};
+use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, Step, arg_steps, drive, edge_steps, emit_body, prepare, save_offset};
 use crate::ir::{Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, StencilReloc};
 use crate::target::{Os, Target};
 use crate::{Code, Site};
 
-/// The scratch registers the emitter computes in; planning never hands them out.
 const A: Reg = Reg(9);
 const C: Reg = Reg(10);
 const D: Reg = Reg(11);
 const S: Reg = Reg(12);
 const T: Reg = Reg(13);
-/// Holds immediates and callees; the encoder itself uses x17 for large memory offsets.
 const IP: Reg = Reg(16);
 const V0: Vreg = Vreg(0);
 const V1: Vreg = Vreg(1);
 
-/// The registers 128-bit operations use as scratch besides the emitter's own.
 const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
 
-/// The registers planning hands out: the saved pool, and caller-saved registers that are neither scratch, return registers nor the indirect-result register.
-const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)], wide_scratch: &WIDE_SCRATCH, op_scratch: &[], uses_scratch: crate::alloc::no_scratch, dict: None, float: &[], float_branches: &[], absolute_calls: false, two_address: false, park: false };
+const REGS: Regs<Reg> = Regs {
+    saved: &SAVED,
+    saved_float: &SAVED_FLOAT,
+    leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)],
+    wide_scratch: &WIDE_SCRATCH,
+    op_scratch: &[],
+    uses_scratch: crate::alloc::no_scratch,
+    dict: None,
+    float: &float::POOL,
+    float_branches: &float::BRANCHES,
+    vectors: false,
+    absolute_calls: false,
+    two_address: false,
+    park: true,
+    fold_sib: false,
+};
 
-/// Encodes `func` as A64 machine code for `target`.
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
-    let order = crate::live::order(func);
-    let abi = classify(&func.signature, packing)?;
-    let plan = plan(func, &REGS, (&order, target.effort == crate::Effort::Full), &abi.params, |sig| classify(sig, packing));
-    let frame = layout(func, saved(func, &plan.used, &SAVED), (&plan.locations, &plan.shared, &plan.homed), |sig| classify(sig, packing))?;
+    let Prepared { order, copied, abi, plan, frame, framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    let copied = crate::live::copied_tests(func, &order);
-    Emit { func, frame, abi, packing, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, copied }.run(order)
+    let emit = Emit { func, frame, framed, abi, packing, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, copied };
+    drive(emit, &order)
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -73,15 +81,10 @@ pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, ti
     asm.finish()
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum Ext {
-    Zero,
-    Sign,
-}
-
 pub(super) struct Emit<'a> {
     func: &'a Function,
     frame: Frame<Reg>,
+    framed: bool,
     abi: Abi,
     packing: Packing,
     asm: Asm,
@@ -94,47 +97,15 @@ pub(super) struct Emit<'a> {
     copied: Vec<bool>,
 }
 
-impl Emit<'_> {
-    fn run(mut self, order: Vec<Block>) -> Result<Code, String> {
-        let entry = self.func.entry.ok_or("the function has no entry block")?;
-        self.prologue();
-        self.intake(entry);
-        for (index, block) in order.iter().enumerate() {
-            self.next = order.get(index + 1).copied();
-            self.block(*block)?;
-        }
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs })
-    }
-
-    fn block(&mut self, block: Block) -> Result<(), String> {
-        self.asm.bind(self.blocks[block.index()]);
-        self.body(block)
-    }
-
-    /// Emits the instructions of `block`, at its label or as a copy in place of a jump to it.
-    fn body(&mut self, block: Block) -> Result<(), String> {
-        self.flags = None;
-        let func = self.func;
-        let insts = &func.blocks[block.index()].insts;
-        for inst in insts {
-            self.inst(*inst)?;
-        }
-        let ended = insts.last().is_some_and(|inst| func.insts[inst.index()].op.is_terminator());
-        if !ended {
-            self.asm.brk();
-        }
-        Ok(())
-    }
-
-    fn ty(&self, value: Value) -> Type {
-        self.func.ty(value)
-    }
-
-    fn save_slot(index: usize) -> Mem {
-        Mem::new(FP, -8 * (index as i32 + 1))
+impl<'a> Emitter<'a> for Emit<'a> {
+    fn func(&self) -> &'a Function {
+        self.func
     }
 
     fn prologue(&mut self) {
+        if !self.framed {
+            return;
+        }
         self.asm.stp_pre(FP, LR, SP, -16);
         self.asm.mov_sp(FP, SP);
         let size = self.frame.size;
@@ -143,12 +114,83 @@ impl Emit<'_> {
         } else if size > 0 {
             self.asm.add_imm(true, false, Size::X, SP, SP, size);
         }
-        for (index, reg) in self.frame.saves.clone().into_iter().enumerate() {
-            self.asm.store(Size::X, Self::save_slot(index), reg);
+        for (index, &reg) in self.frame.saves.iter().enumerate() {
+            self.asm.store(Size::X, Mem::new(FP, save_offset(index)), reg);
+        }
+        let base = self.frame.saves.len();
+        for (index, &v) in self.frame.float_saves.iter().enumerate() {
+            self.asm.vstore(8, Mem::new(FP, save_offset(base + index)), Vreg(v));
         }
     }
 
-    /// Moves the stack pointer down by `size` one page at a time, touching each page, so the guard page faults before anything past it is written.
+    fn intake(&mut self, entry: Block) -> Result<(), String> {
+        let params = self.func.blocks[entry.index()].params.iter().copied().zip(self.abi.params.clone());
+        let (registers, memory): (Vec<_>, Vec<_>) = params.partition(|(value, _)| self.plan.reg_of(*value).is_some() || self.vreg_of(*value).is_some());
+        for (value, loc) in memory.into_iter().chain(registers) {
+            match loc {
+                Loc::Stack(offset) => self.load_home(value, Mem::new(FP, INCOMING + offset as i32)),
+                _ => self.store_loc(value, loc),
+            }
+        }
+        Ok(())
+    }
+
+    fn set_next(&mut self, next: Option<Block>) {
+        self.next = next;
+    }
+
+    fn bind_block(&mut self, block: Block) {
+        self.asm.bind(self.blocks[block.index()]);
+    }
+
+    fn clear_flags(&mut self) {
+        self.flags = None;
+    }
+
+    fn inst(&mut self, inst: Inst) -> Result<(), String> {
+        let func = self.func;
+        let data = &func.insts[inst.index()];
+        let result = data.result;
+        let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
+        match &data.op {
+            Op::Call { sig, callee, args, results } => self.call(inst, (*sig, *callee), args, results),
+            Op::TryCall { sig, callee, args, normal, handler } => self.try_call(*sig, *callee, args, *normal, *handler),
+            Op::Jump(block, args) => {
+                self.edge(*block, args)?;
+                if self.copied[inst.index()] {
+                    return emit_body(self, *block);
+                }
+                self.goto(*block, true);
+                Ok(())
+            }
+            Op::Brif(condition, then, then_args, otherwise, else_args) => self.brif(*condition, (*then, then_args), (*otherwise, else_args)),
+            Op::Return(values) => self.ret(values),
+            Op::Trap => {
+                self.asm.brk();
+                Ok(())
+            }
+            Op::Trapz(condition) => {
+                self.trapz(*condition);
+                Ok(())
+            }
+            op => self.value_op(op, value),
+        }
+    }
+
+    fn trap(&mut self) {
+        self.asm.brk();
+    }
+
+    fn finish(self) -> Result<Code, String> {
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs })
+    }
+}
+
+impl Emit<'_> {
+    fn ty(&self, value: Value) -> Type {
+        self.func.ty(value)
+    }
+
     fn probe(&mut self, size: u32) {
         self.asm.mov_imm(IP, i64::from(size / PAGE));
         let again = self.asm.label();
@@ -163,66 +205,22 @@ impl Emit<'_> {
     }
 
     fn epilogue(&mut self) {
-        for (index, reg) in self.frame.saves.clone().into_iter().enumerate() {
-            self.asm.load(Size::X, false, reg, Self::save_slot(index));
+        if self.framed {
+            for (index, &reg) in self.frame.saves.iter().enumerate() {
+                self.asm.load(Size::X, false, reg, Mem::new(FP, save_offset(index)));
+            }
+            let base = self.frame.saves.len();
+            for (index, &v) in self.frame.float_saves.iter().enumerate() {
+                self.asm.vload(8, Vreg(v), Mem::new(FP, save_offset(base + index)));
+            }
+            self.asm.mov_sp(SP, FP);
+            self.asm.ldp_post(FP, LR, SP, 16);
         }
-        self.asm.mov_sp(SP, FP);
-        self.asm.ldp_post(FP, LR, SP, 16);
         self.asm.ret();
-    }
-
-    fn intake(&mut self, entry: Block) {
-        let params = self.func.blocks[entry.index()].params.clone();
-        for (value, loc) in params.into_iter().zip(self.abi.params.clone()) {
-            match loc {
-                Loc::Stack(offset) => {
-                    let from = Mem::new(FP, INCOMING + offset as i32);
-                    self.load_home(value, from);
-                }
-                loc => self.store_loc(value, loc),
-            }
-        }
-    }
-
-    fn inst(&mut self, inst: Inst) -> Result<(), String> {
-        let func = self.func;
-        let data = &func.insts[inst.index()];
-        let result = data.result;
-        let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
-        match &data.op {
-            Op::Call { sig, callee, args, results } => self.call(*sig, *callee, args, results),
-            Op::TryCall { sig, callee, args, normal, handler } => self.try_call(*sig, *callee, args, *normal, *handler),
-            Op::Jump(block, args) => {
-                self.edge(*block, args);
-                if self.copied[inst.index()] {
-                    return self.body(*block);
-                }
-                self.goto(*block, true);
-                Ok(())
-            }
-            Op::Brif(condition, then, then_args, otherwise, else_args) => {
-                self.brif(*condition, (*then, then_args), (*otherwise, else_args));
-                Ok(())
-            }
-            Op::Return(values) => {
-                self.ret(values);
-                Ok(())
-            }
-            Op::Trap => {
-                self.asm.brk();
-                Ok(())
-            }
-            Op::Trapz(condition) => {
-                self.trapz(*condition);
-                Ok(())
-            }
-            op => self.value_op(op, value),
-        }
     }
 
     value_op!();
 
-    /// The condition under which `condition` is nonzero: the fused flags of its compare, or a test of its value.
     fn truth(&mut self, condition: Value) -> Cond {
         match self.flags.take() {
             Some((value, cond)) if value == condition => cond,
@@ -249,63 +247,58 @@ impl Emit<'_> {
         self.asm.bind(skip);
     }
 
-    /// Whether `a` and `b` live in the same place, so writing one overwrites the other.
-    fn same_home(&self, a: Value, b: Value) -> bool {
-        a == b || matches!((self.plan.location(a), self.plan.location(b)), (Location::Reg(x), Location::Reg(y)) if x == y) || self.frame.shares(&self.plan, a, b)
-    }
-
-    /// Writes `value` into the location of `param`.
     fn assign(&mut self, param: Value, value: Value) {
         match self.plan.location(param) {
             Location::Reg(reg) => self.raw(reg, value),
+            Location::Float(v) => self.fget(Vreg(v), value),
             _ => self.move_to(self.at(param), value),
         }
     }
 
-    fn edge(&mut self, block: Block, args: &[Value]) {
-        for step in edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.same_home(a, b)) {
+    fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
+        for step in edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.plan.same_home(&self.frame, a, b)) {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
                 Step::Save(arg, index) => self.move_to(Mem::new(FP, self.frame.edge_slot(index)), arg),
                 Step::Restore(index, param) => self.load_home(param, Mem::new(FP, self.frame.edge_slot(index))),
             }
         }
+        Ok(())
     }
 
-    fn brif(&mut self, condition: Value, then: (Block, &[Value]), otherwise: (Block, &[Value])) {
+    fn brif(&mut self, condition: Value, then: (Block, &[Value]), otherwise: (Block, &[Value])) -> Result<(), String> {
         if let Some(known) = self.plan.const_of(condition) {
             let (block, args) = if crate::fold::extend(known, self.ty(condition), false) != 0 { then } else { otherwise };
-            self.edge(block, args);
+            self.edge(block, args)?;
             self.goto(block, true);
-            return;
+            return Ok(());
         }
         let cond = self.truth(condition);
-        let (then_moves, else_moves) = (self.moves(then.0, then.1), self.moves(otherwise.0, otherwise.1));
+        let (then_moves, else_moves) = (
+            self.plan.moves(self.func, &self.frame, then.0, then.1),
+            self.plan.moves(self.func, &self.frame, otherwise.0, otherwise.1),
+        );
         let falls = self.next.is_some_and(|next| next == then.0 || next == self.func.jump_target(then.0));
         if !else_moves && (then_moves || falls) {
             self.asm.bcond(cond.invert(), self.blocks[self.func.jump_target(otherwise.0).index()]);
-            self.edge(then.0, then.1);
+            self.edge(then.0, then.1)?;
             self.goto(then.0, true);
-            return;
+            return Ok(());
         }
         if !then_moves {
             self.asm.bcond(cond, self.blocks[self.func.jump_target(then.0).index()]);
-            self.edge(otherwise.0, otherwise.1);
+            self.edge(otherwise.0, otherwise.1)?;
             self.goto(otherwise.0, true);
-            return;
+            return Ok(());
         }
         let other = self.asm.label();
         self.asm.bcond(cond.invert(), other);
-        self.edge(then.0, then.1);
+        self.edge(then.0, then.1)?;
         self.goto(then.0, false);
         self.asm.bind(other);
-        self.edge(otherwise.0, otherwise.1);
+        self.edge(otherwise.0, otherwise.1)?;
         self.goto(otherwise.0, true);
-    }
-
-    /// Whether entering `block` with `args` moves any value.
-    fn moves(&self, block: Block, args: &[Value]) -> bool {
-        args.iter().zip(&self.func.blocks[block.index()].params).any(|(arg, param)| !self.same_home(*arg, *param))
+        Ok(())
     }
 
     fn goto(&mut self, block: Block, last: bool) {
@@ -316,14 +309,14 @@ impl Emit<'_> {
         self.asm.b(self.blocks[target.index()]);
     }
 
-    fn ret(&mut self, values: &[Value]) {
+    fn ret(&mut self, values: &[Value]) -> Result<(), String> {
         for (value, loc) in values.iter().zip(self.abi.returns.clone()) {
             self.load_loc(*value, loc);
         }
         self.epilogue();
+        Ok(())
     }
 
-    /// Puts `value` where `loc` carries it into a call or out of a return.
     fn load_loc(&mut self, value: Value, loc: Loc) {
         match loc {
             Loc::Int(reg) => self.raw(reg, value),
@@ -331,12 +324,11 @@ impl Emit<'_> {
                 self.raw(low, value);
                 self.high(high, value);
             }
-            Loc::Float(index) => self.asm.vload(self.ty(value).bytes(), Vreg(index), self.at(value)),
+            Loc::Float(index) => self.fget(Vreg(index), value),
             Loc::Stack(_) | Loc::Struct(..) => {}
         }
     }
 
-    /// Takes `value` from where `loc` carries it out of a call or into the entry.
     fn store_loc(&mut self, value: Value, loc: Loc) {
         match loc {
             Loc::Int(reg) => self.put(value, reg),
@@ -344,12 +336,11 @@ impl Emit<'_> {
                 self.put(value, low);
                 self.put_high(value, high);
             }
-            Loc::Float(index) => self.asm.vstore(self.ty(value).bytes(), self.at(value), Vreg(index)),
+            Loc::Float(index) => self.fput(value, Vreg(index)),
             Loc::Stack(_) | Loc::Struct(..) => {}
         }
     }
 
-    /// Writes a stack argument at `offset` above the stack pointer, in its own size when Apple's packing gives it no full slot.
     fn stack_argument(&mut self, offset: u32, value: Value) {
         let to = Mem::new(SP, offset as i32);
         let bytes = self.ty(value).bytes();
@@ -368,19 +359,67 @@ impl Emit<'_> {
                 self.stack_argument(offset, *arg);
             }
         }
-        for (arg, loc) in args.iter().zip(&abi.params) {
-            self.load_loc(*arg, *loc);
+        let target = match self.plan.reg_of(callee).filter(|reg| SAVED.contains(reg)) {
+            Some(reg) => reg,
+            None => {
+                self.raw(T, callee);
+                T
+            }
+        };
+        let float_targets: Vec<(Value, u8)> = args.iter().zip(&abi.params).filter_map(|(&arg, &loc)| if let Loc::Float(v) = loc { Some((arg, v)) } else { None }).collect();
+        for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
+            match step {
+                ArgStep::Move(src, dst) => self.asm.fmov_reg(true, Vreg(dst), Vreg(src)),
+                ArgStep::Save(src) => self.asm.fmov_out(true, A, Vreg(src)),
+                ArgStep::Restore(dst) => self.asm.fmov_in(true, Vreg(dst), A),
+                ArgStep::Load(val, dst) => self.fget(Vreg(dst), val),
+            }
         }
-        let target = self.plan.reg_of(callee).unwrap_or(IP);
-        self.raw(target, callee);
+        let int_targets: Vec<(Value, Reg)> = args.iter().zip(&abi.params).filter_map(|(&arg, &loc)| if let Loc::Int(reg) = loc { Some((arg, reg)) } else { None }).collect();
+        for step in arg_steps(&int_targets, |v| self.plan.reg_of(v)) {
+            match step {
+                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
+                ArgStep::Save(src) => self.asm.mov(A, src),
+                ArgStep::Restore(dst) => self.asm.mov(dst, A),
+                ArgStep::Load(val, dst) => self.raw(dst, val),
+            }
+        }
+        for (&arg, &loc) in args.iter().zip(&abi.params) {
+            if let Loc::Pair(low, high) = loc {
+                self.raw(low, arg);
+                self.high(high, arg);
+            }
+        }
         self.asm.blr(target);
         Ok(abi)
     }
 
-    fn call(&mut self, sig: SigRef, callee: Value, args: &[Value], results: &[Value]) -> Result<(), String> {
+    fn call(&mut self, inst: Inst, (sig, callee): (SigRef, Value), args: &[Value], results: &[Value]) -> Result<(), String> {
+        let parked = self.plan.parked_at(inst).to_vec();
+        for &(value, reg, _) in &parked {
+            let home = self.at(value);
+            match reg {
+                ParkReg::Int(r) => self.asm.store(Size::X, home, r),
+                ParkReg::Float(v) => self.asm.vstore(self.ty(value).bytes(), home, Vreg(v)),
+            }
+            self.plan.locations[value.index()] = Location::Slot;
+        }
         let abi = self.arguments(sig, callee, args)?;
         for (value, loc) in results.iter().zip(abi.returns) {
             self.store_loc(*value, loc);
+        }
+        for (value, reg, lives) in parked {
+            if lives {
+                let home = self.at(value);
+                match reg {
+                    ParkReg::Int(r) => self.asm.load(Size::X, false, r, home),
+                    ParkReg::Float(v) => self.asm.vload(self.ty(value).bytes(), Vreg(v), home),
+                }
+            }
+            self.plan.locations[value.index()] = match reg {
+                ParkReg::Int(r) => Location::Reg(r),
+                ParkReg::Float(v) => Location::Float(v),
+            };
         }
         Ok(())
     }

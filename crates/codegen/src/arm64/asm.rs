@@ -480,13 +480,32 @@ impl Asm {
         self.word(base | src << 5 | dst);
     }
 
-    /// Moves the 64 bits of `src` into `dst`.
+    pub fn fmov_reg(&mut self, double: bool, dst: Vreg, src: Vreg) {
+        if dst != src {
+            self.word(Self::precision(0x1E20_4000, double) | u32::from(src.0) << 5 | u32::from(dst.0));
+        }
+    }
+
+    pub fn fcsel(&mut self, cond: Cond, double: bool, dst: Vreg, a: Vreg, b: Vreg) {
+        self.word(Self::precision(0x1E20_0C00, double) | u32::from(b.0) << 16 | (cond as u32) << 12 | u32::from(a.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn fmov_in(&mut self, double: bool, dst: Vreg, src: Reg) {
+        let base = Self::precision(0x1E27_0000, double) | u32::from(double) << 31;
+        self.word(base | u32::from(src.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn fmov_out(&mut self, double: bool, dst: Reg, src: Vreg) {
+        let base = Self::precision(0x1E26_0000, double) | u32::from(double) << 31;
+        self.word(base | u32::from(src.0) << 5 | u32::from(dst.0));
+    }
+
     pub fn fmov_to_float(&mut self, dst: Vreg, src: Reg) {
-        self.word(0x9E67_0000 | u32::from(src.0) << 5 | u32::from(dst.0));
+        self.fmov_in(true, dst, src);
     }
 
     pub fn fmov_to_int(&mut self, dst: Reg, src: Vreg) {
-        self.word(0x9E66_0000 | u32::from(src.0) << 5 | u32::from(dst.0));
+        self.fmov_out(true, dst, src);
     }
 
     /// Counts the set bits of each byte of `src` and adds them into the low byte of `dst`.

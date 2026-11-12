@@ -1,19 +1,28 @@
-//! Frame layout shared by the encoders: where arguments travel, and frame offsets from the frame pointer for values, stack slots, edge scratch and outgoing arguments.
+use crate::alloc::{Location, Plan, Regs};
+use crate::ir::{Block, Function, Inst, Op, Signature, Type, Value};
 
-use crate::alloc::{Location, Plan};
-use crate::ir::{Function, Op, Signature, Type, Value};
-
-/// The bytes of a machine word.
 pub(crate) const WORD: u32 = 8;
 const MAX_ALIGN_SHIFT: u8 = 4;
-/// The bytes of a page of stack, which a larger frame touches one at a time.
 pub(crate) const PAGE: u32 = 4096;
-/// The offset from the frame pointer of the first argument that arrived on the stack.
 pub(crate) const INCOMING: i32 = 16;
-/// The bytes of scratch that one move of a block edge takes.
 const EDGE_SLOT: u32 = 16;
 
-/// Where one argument or return value travels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ext {
+    Zero,
+    Sign,
+}
+
+impl Ext {
+    pub(crate) const fn of(signed: bool) -> Self {
+        if signed { Self::Sign } else { Self::Zero }
+    }
+}
+
+pub(crate) const fn save_offset(index: usize) -> i32 {
+    -((WORD as i32) * (index as i32 + 1))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Loc<R> {
     Int(R),
@@ -23,7 +32,6 @@ pub(crate) enum Loc<R> {
     Struct(u32, u32),
 }
 
-/// Where the arguments and return values of one signature travel, and the bytes of stack its arguments take.
 pub(crate) struct Abi<R> {
     pub params: Vec<Loc<R>>,
     pub returns: Vec<Loc<R>>,
@@ -34,7 +42,6 @@ pub(crate) fn round(value: u32, to: u32) -> u32 {
     value.div_ceil(to) * to
 }
 
-/// Places the return values of `signature`: integers in `ints`, an i128 in both of them, and floats in the first `floats` float registers.
 pub(crate) fn returns<R: Copy>(signature: &Signature, ints: [R; 2], floats: u8) -> Result<Vec<Loc<R>>, String> {
     let (mut int, mut float) = (0, 0);
     let place = |ty: Type| match ty {
@@ -55,25 +62,19 @@ pub(crate) fn returns<R: Copy>(signature: &Signature, ints: [R; 2], floats: u8) 
     signature.returns.iter().map(|param| param.value_type).map(place).collect()
 }
 
-/// One step of the moves an edge into a block makes, in an order that reads every place before any step writes it.
 #[derive(Clone, Copy)]
 pub(crate) enum Step {
-    /// Writes the argument into the place of the parameter.
     Move(Value, Value),
-    /// Saves the argument into edge scratch `index`, which breaks a cycle of moves.
     Save(Value, usize),
-    /// Loads the parameter from edge scratch `index`.
     Restore(usize, Value),
 }
 
-/// Where a pending edge move reads from: an argument's place, or edge scratch.
 #[derive(Clone, Copy)]
 enum Source {
     Value(Value),
     Scratch(usize),
 }
 
-/// The steps of the moves an edge into a block with `params` makes, when `same_home` tells that two values share a place: each move runs once no other pending move still reads its target, and a cycle goes through edge scratch.
 pub(crate) fn edge_steps(args: &[Value], params: &[Value], same_home: impl Fn(Value, Value) -> bool) -> Vec<Step> {
     let mut pending: Vec<(Source, Value)> = args.iter().zip(params).filter(|(arg, param)| !same_home(**arg, **param)).map(|(arg, param)| (Source::Value(*arg), *param)).collect();
     let mut steps = Vec::with_capacity(pending.len());
@@ -95,22 +96,62 @@ pub(crate) fn edge_steps(args: &[Value], params: &[Value], same_home: impl Fn(Va
     steps
 }
 
-/// Frame offsets from the frame pointer for every value, stack slot and the edge scratch area.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ArgStep<T> {
+    Move(T, T),
+    Save(T),
+    Restore(T),
+    Load(Value, T),
+}
+
+#[derive(Clone, Copy)]
+enum RegSrc<T> {
+    Reg(T),
+    Saved,
+}
+
+pub(crate) fn arg_steps<T: Copy + PartialEq>(targets: &[(Value, T)], current: impl Fn(Value) -> Option<T>) -> Vec<ArgStep<T>> {
+    let mut reg_moves: Vec<(RegSrc<T>, T)> = Vec::new();
+    let mut loads: Vec<(Value, T)> = Vec::new();
+    for &(val, dst) in targets {
+        match current(val) {
+            Some(src) if src == dst => {}
+            Some(src) => reg_moves.push((RegSrc::Reg(src), dst)),
+            None => loads.push((val, dst)),
+        }
+    }
+    let mut steps = Vec::with_capacity(reg_moves.len() + loads.len());
+    while !reg_moves.is_empty() {
+        let blocked = |at: usize| reg_moves.iter().enumerate().any(|(other, &(s, _))| other != at && matches!(s, RegSrc::Reg(r) if r == reg_moves[at].1));
+        if let Some(at) = (0..reg_moves.len()).find(|&at| !blocked(at)) {
+            steps.push(match reg_moves.remove(at) {
+                (RegSrc::Reg(src), dst) => ArgStep::Move(src, dst),
+                (RegSrc::Saved, dst) => ArgStep::Restore(dst),
+            });
+            continue;
+        }
+        let Some((at, src)) = reg_moves.iter().enumerate().find_map(|(at, &(s, _))| if let RegSrc::Reg(r) = s { Some((at, r)) } else { None }) else { break };
+        steps.push(ArgStep::Save(src));
+        reg_moves[at].0 = RegSrc::Saved;
+    }
+    steps.extend(loads.into_iter().map(|(val, dst)| ArgStep::Load(val, dst)));
+    steps
+}
+
 pub(crate) struct Frame<R> {
     pub values: Vec<i32>,
     pub slots: Vec<i32>,
     pub scratch: i32,
     pub size: u32,
     pub saves: Vec<R>,
+    pub float_saves: Vec<u8>,
 }
 
 impl<R> Frame<R> {
-    /// The offset from the frame pointer of the scratch that move `index` of a block edge uses.
     pub(crate) fn edge_slot(&self, index: usize) -> i32 {
         self.scratch + (EDGE_SLOT as usize * index) as i32
     }
 
-    /// Whether `a` and `b` both live in memory at one shared home, so the bytes of one are the bytes of the other.
     pub(crate) fn shares(&self, plan: &Plan<R>, a: Value, b: Value) -> bool
     where
         R: Copy,
@@ -120,23 +161,20 @@ impl<R> Frame<R> {
     }
 }
 
-/// The operations of the instructions in blocks.
 fn live_ops(func: &Function) -> impl Iterator<Item = &Op> {
     func.blocks.iter().flat_map(|block| &block.insts).map(|inst| &func.insts[inst.index()].op)
 }
 
-/// The registers a frame saves: all of `all` for a function with a handler, which restores what the frames it unwinds clobbered, else the pool registers it uses.
 pub(crate) fn saved<R: Copy>(func: &Function, used: &[R], all: &[R]) -> Vec<R> {
     let handles = live_ops(func).any(|op| matches!(op, Op::TryCall { .. }));
     if handles { all.to_vec() } else { used.to_vec() }
 }
 
-/// Whether a function needs a frame of its own: one that saves registers, keeps anything in memory, calls, reads its frame pointer or takes arguments on the stack.
 pub(crate) fn framed<R>(func: &Function, frame: &Frame<R>, stack_params: bool) -> bool {
-    stack_params || frame.size > 0 || !frame.saves.is_empty() || live_ops(func).any(|op| matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::FramePointer))
+    stack_params || frame.size > 0 || !frame.saves.is_empty() || !frame.float_saves.is_empty() || live_ops(func).any(|op| matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::FramePointer))
 }
 
-fn needs<R>(func: &Function, classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<(u32, u32), String> {
+fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<(u32, u32), String> {
     let (mut outgoing, mut scratch) = (0, 0);
     for op in live_ops(func) {
         match op {
@@ -149,7 +187,6 @@ fn needs<R>(func: &Function, classify: impl Fn(&Signature) -> Result<Abi<R>, Str
     Ok((outgoing, scratch))
 }
 
-/// The values the blocks define or read, and the stack slots they address.
 fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
     let (mut values, mut slots) = (vec![false; func.types.len()], vec![false; func.slots.len()]);
     for block in &func.blocks {
@@ -166,15 +203,19 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
     (values, slots)
 }
 
-/// Lays out the frame below the frame pointer: saved registers, the values that live in memory (one place per shared home) or are `homed` there around calls, the stack slots in use, edge scratch, then outgoing arguments at the stack pointer.
-pub(crate) fn layout<R>(func: &Function, saves: Vec<R>, (locations, shared, homed): (&[Location<R>], &[Option<u32>], &[bool]), classify: impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<Frame<R>, String> {
+pub(crate) fn layout<R>(
+    func: &Function,
+    (saves, float_saves): (Vec<R>, Vec<u8>),
+    (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
+    classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
+) -> Result<Frame<R>, String> {
     let (outgoing, scratch) = needs(func, classify)?;
     let (present, addressed) = present(func);
-    let mut cursor = saves.len() as u32 * WORD;
+    let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
     let mut values = Vec::with_capacity(func.types.len());
     let mut homes: Vec<i32> = Vec::new();
     for (value, ty) in func.types.iter().enumerate() {
-        if !present[value] || (matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true)) {
+        if !present[value] || elided.get(value) == Some(&true) || (matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true)) {
             values.push(0);
             continue;
         }
@@ -205,5 +246,69 @@ pub(crate) fn layout<R>(func: &Function, saves: Vec<R>, (locations, shared, home
     cursor = round(cursor + scratch, 16);
     let scratch = -(cursor as i32);
     let size = round(cursor + outgoing, 16);
-    Ok(Frame { values, slots, scratch, size, saves })
+    Ok(Frame { values, slots, scratch, size, saves, float_saves })
+}
+
+pub(crate) struct Prepared<R> {
+    pub order: Vec<Block>,
+    pub copied: Vec<bool>,
+    pub abi: Abi<R>,
+    pub plan: Plan<R>,
+    pub frame: Frame<R>,
+    pub framed: bool,
+}
+
+pub(crate) fn prepare<R: Copy + PartialEq>(
+    func: &Function,
+    regs: &Regs<R>,
+    weighed: bool,
+    classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
+) -> Result<Prepared<R>, String> {
+    let order = crate::live::order(func);
+    let copied = crate::live::copied_tests(func, &order);
+    let abi = classify(&func.signature)?;
+    let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed), &abi.params, &classify);
+    let saves = saved(func, &plan.used, regs.saved);
+    let float_saves = saved(func, &plan.used_floats, regs.saved_float);
+    let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided), &classify)?;
+    let stack_params = abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)));
+    let framed = framed(func, &frame, stack_params);
+    Ok(Prepared { order, copied, abi, plan, frame, framed })
+}
+
+pub(crate) trait Emitter<'a>: Sized {
+    fn func(&self) -> &'a Function;
+    fn prologue(&mut self);
+    fn intake(&mut self, entry: Block) -> Result<(), String>;
+    fn set_next(&mut self, next: Option<Block>);
+    fn bind_block(&mut self, block: Block);
+    fn clear_flags(&mut self);
+    fn inst(&mut self, inst: Inst) -> Result<(), String>;
+    fn trap(&mut self);
+    fn finish(self) -> Result<crate::Code, String>;
+}
+
+pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Result<(), String> {
+    emit.clear_flags();
+    let func = emit.func();
+    let insts = &func.blocks[block.index()].insts;
+    for &inst in insts {
+        emit.inst(inst)?;
+    }
+    if !insts.last().is_some_and(|inst| func.insts[inst.index()].op.is_terminator()) {
+        emit.trap();
+    }
+    Ok(())
+}
+
+pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<crate::Code, String> {
+    let entry = emit.func().entry.ok_or("the function has no entry block")?;
+    emit.prologue();
+    emit.intake(entry)?;
+    for (index, &block) in order.iter().enumerate() {
+        emit.set_next(order.get(index + 1).copied());
+        emit.bind_block(block);
+        emit_body(&mut emit, block)?;
+    }
+    emit.finish()
 }

@@ -1,36 +1,39 @@
-//! Frame homes shared between values that live in memory over disjoint spans.
-
 use crate::alloc::Location;
 use crate::frame::{WORD, round};
 use crate::ir::Function;
-use crate::live::Live;
+use crate::live::{Live, overlaps};
 
-/// For each value that lives in memory, has a span in `live` and is not `alone`, a home it shares with values whose spans it does not overlap, by linear scan; the values of one home have the same size in words.
 pub(crate) fn share<R>(func: &Function, live: &Live, locations: &[Location<R>], alone: &[bool]) -> Vec<Option<u32>> {
     let memory = |value: usize| !alone[value] && matches!(locations[value], Location::Slot);
-    let mut spans: Vec<(u32, u32, usize)> = (0..locations.len()).filter(|value| memory(*value)).filter_map(|value| live.span[value].map(|(start, end)| (start, end, value))).collect();
-    spans.sort_unstable();
+    let mut values: Vec<(u32, u32, usize)> = (0..locations.len()).filter(|value| memory(*value)).filter_map(|value| live.bounds(value).map(|(start, end)| (start, end, value))).collect();
+    values.sort_unstable();
     let mut homes = vec![None; locations.len()];
     let mut sizes: Vec<u32> = Vec::new();
-    let (mut active, mut free): (Vec<(u32, u32)>, Vec<u32>) = (Vec::new(), Vec::new());
-    for (start, end, value) in spans {
-        active.retain(|&(until, home)| {
-            let ended = until < start;
-            if ended {
-                free.push(home);
-            }
-            !ended
-        });
+    let mut holders: Vec<Vec<usize>> = Vec::new();
+    for (start, _, value) in values {
+        let ranges = live.ranges_of(value);
         let size = round(func.types[value].bytes(), WORD);
-        let home = match free.iter().position(|home| sizes[*home as usize] == size) {
-            Some(at) => free.swap_remove(at),
+        let mut chosen = None;
+        for (home, list) in holders.iter_mut().enumerate() {
+            if sizes[home] != size {
+                continue;
+            }
+            list.retain(|&other| live.last_end(other).is_some_and(|end| end >= start));
+            if list.iter().all(|&other| !overlaps(live.ranges_of(other), ranges)) {
+                chosen = Some(home as u32);
+                break;
+            }
+        }
+        let home = match chosen {
+            Some(home) => home,
             None => {
                 sizes.push(size);
+                holders.push(Vec::new());
                 sizes.len() as u32 - 1
             }
         };
+        holders[home as usize].push(value);
         homes[value] = Some(home);
-        active.push((end, home));
     }
     homes
 }

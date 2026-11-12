@@ -20,15 +20,15 @@ pub const UNENCODED: &[Family] = &[Family::Avx];
 
 /// The `cpuid` and `xgetbv` bits that a set of families occupies.
 #[derive(Clone, Copy)]
-struct Bits {
-    leaf1_ecx: u32,
-    leaf7_ebx: u32,
-    leaf7_ecx: u32,
-    leaf7_edx: u32,
-    leaf7_1_eax: u32,
-    leaf7_1_edx: u32,
-    extended_ecx: u32,
-    xcr0: u64,
+pub(crate) struct Bits {
+    pub(crate) leaf1_ecx: u32,
+    pub(crate) leaf7_ebx: u32,
+    pub(crate) leaf7_ecx: u32,
+    pub(crate) leaf7_edx: u32,
+    pub(crate) leaf7_1_eax: u32,
+    pub(crate) leaf7_1_edx: u32,
+    pub(crate) extended_ecx: u32,
+    pub(crate) xcr0: u64,
 }
 
 const NONE: Bits = Bits { leaf1_ecx: 0, leaf7_ebx: 0, leaf7_ecx: 0, leaf7_edx: 0, leaf7_1_eax: 0, leaf7_1_edx: 0, extended_ecx: 0, xcr0: 0 };
@@ -88,7 +88,7 @@ const fn hidden() -> Bits {
     bits
 }
 
-const HIDDEN: Bits = hidden();
+pub(crate) const HIDDEN: Bits = hidden();
 
 /// The registers `[eax, ebx, ecx, edx]` that `cpuid` leaf `leaf`, subleaf `sub_leaf` gives compiled code.
 pub(super) fn registers(leaf: u32, sub_leaf: u32) -> [u32; 4] {

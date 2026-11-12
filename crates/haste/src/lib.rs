@@ -1,5 +1,6 @@
 //! Haste: the build graph, name resolution, type inference, lowering, and the JIT that runs the program.
 
+mod aot;
 mod body;
 mod build;
 mod cli;

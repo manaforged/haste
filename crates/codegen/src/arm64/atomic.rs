@@ -1,9 +1,9 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
-use super::{A, C, D, Emit, Ext, S, T};
+use super::{A, C, D, Emit, S, T};
+use crate::frame::Ext;
 use crate::ir::{AtomicRmwOp, Op, Type, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
-/// Scratch registers an inline copy holds its chunks in; none of them forms an address.
 const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
 
 impl Emit<'_> {
@@ -65,7 +65,6 @@ impl Emit<'_> {
         Ok(())
     }
 
-    /// Copies a constant number of bytes inline: every chunk into its own scratch register first, so overlapping ranges copy correctly.
     fn copy(&mut self, to: Value, from: Value, bytes: Value) -> Result<(), String> {
         let chunks = self.plan.const_of(bytes).and_then(crate::copy::chunks).ok_or("a copy of a size that is not a small constant")?;
         let source = self.address(from, 0);
@@ -81,6 +80,12 @@ impl Emit<'_> {
 
     fn read(&mut self, result: Value, from: Mem) {
         let ty = self.ty(result);
+        if ty.is_float() {
+            let dst = self.fdst(result);
+            self.asm.vload(ty.bytes(), dst, from);
+            self.fput(result, dst);
+            return;
+        }
         if ty == Type::I128 {
             self.asm.load(Size::X, false, A, from);
             self.put(result, A);
@@ -95,6 +100,11 @@ impl Emit<'_> {
 
     fn write(&mut self, value: Value, to: Mem) {
         let ty = self.ty(value);
+        if ty.is_float() {
+            let source = self.fin(value, super::V0);
+            self.asm.vstore(ty.bytes(), to, source);
+            return;
+        }
         if ty == Type::I128 {
             self.raw(A, value);
             self.asm.store(Size::X, to, A);
@@ -112,7 +122,15 @@ impl Emit<'_> {
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
         let flag = self.src(condition, C, Ext::Zero);
         self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
-        if self.ty(x) == Type::I128 {
+        let ty = self.ty(x);
+        if ty.is_float() {
+            let (left, right) = (self.fin(x, super::V0), self.fin(y, super::V1));
+            let dst = self.fdst(result);
+            self.asm.fcsel(Cond::Ne, ty == Type::F64, dst, left, right);
+            self.fput(result, dst);
+            return;
+        }
+        if ty == Type::I128 {
             self.raw(A, x);
             self.raw(D, y);
             self.asm.csel(Cond::Ne, A, A, D);
@@ -163,12 +181,11 @@ impl Emit<'_> {
         Ok(())
     }
 
-    /// Loops on an exclusive load and store until `op` applies; leaves the old contents in A.
     fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
-        self.get(D, value, if signed { Ext::Sign } else { Ext::Zero });
+        self.get(D, value, Ext::of(signed));
         let again = self.asm.label();
         self.asm.bind(again);
         self.asm.load_acquire(true, size, A, S);
@@ -205,7 +222,6 @@ impl Emit<'_> {
         self.asm.cbz(true, Size::W, T, again);
     }
 
-    /// Compares and swaps with an exclusive load and store; leaves the old contents in A.
     fn cas(&mut self, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);

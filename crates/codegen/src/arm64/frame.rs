@@ -11,6 +11,7 @@ const INDIRECT: Reg = Reg(8);
 
 /// The registers every function keeps for its caller besides the frame pointer and the link register.
 pub(super) const SAVED: [Reg; 10] = [Reg(19), Reg(20), Reg(21), Reg(22), Reg(23), Reg(24), Reg(25), Reg(26), Reg(27), Reg(28)];
+pub(super) const SAVED_FLOAT: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 
 pub(super) type Loc = crate::frame::Loc<Reg>;
 pub(super) type Abi = crate::frame::Abi<Reg>;
