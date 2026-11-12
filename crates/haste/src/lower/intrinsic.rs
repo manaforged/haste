@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
-use haste_codegen::{FloatCC, IntCC, Type, Value};
+use haste_codegen::{AbiParam, CallConv, FloatCC, IntCC, Signature, Type, Value};
 
 use crate::body::BinOp;
+use crate::host::HostSymbol;
 use crate::names::Primitive;
 use crate::sema::intrinsic::Intrinsic;
 use crate::sema::ty::{Kind, Ty};
@@ -35,8 +36,20 @@ impl Lower<'_, '_> {
             Intrinsic::Cpuid => Ok(Some(self.no_cpuid())),
             Intrinsic::BytePermute(bytes) => self.byte_permute(args, bytes).map(Some),
             Intrinsic::BytePairMax => self.byte_pair_max(args).map(Some),
+            Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
             _ => self.memory_intrinsic(which, substs, args),
         }
+    }
+
+    /// Calls the host function `host` in the platform convention with `args`, and returns its result of machine type `ret`.
+    pub(super) fn call_host(&mut self, host: HostSymbol, args: &[Value], ret: Option<Type>) -> Option<Value> {
+        let code = self.emit_symbol(SymbolSource::Host(host));
+        let mut signature = Signature::new(CallConv::Native);
+        signature.params.extend(args.iter().map(|&arg| AbiParam::new(self.b.func.ty(arg))));
+        signature.returns.extend(ret.map(AbiParam::new));
+        let sig = self.b.import_signature(signature);
+        let call = self.ins().call_indirect(sig, code, args);
+        self.b.inst_results(call).first().copied()
     }
 
     fn caller_location(&mut self) -> Result<Value> {

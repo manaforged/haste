@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{IntCC, StackSlot, Type, Value};
 
 use crate::body::BinOp;
+use crate::host::{HostSymbol, X86Symbol};
 use crate::sema::intrinsic::Simd;
 use crate::sema::ty::{Kind, Ty};
 
@@ -26,6 +27,7 @@ impl Lower<'_, '_> {
             (Simd::Cast, Some(out)) => self.lane_cast((vector, out), first)?,
             (Simd::Reduce { all }, _) => self.reduce(vector, first, all)?,
             (Simd::Extreme { max }, _) => self.extreme(vector, first, max)?,
+            (Simd::Fold(op), _) => self.fold(vector, first, op)?,
             (Simd::Sqrt, _) => self.lane_sqrt(vector, first)?,
             _ => self.simd_lanes(op, substs, args)?,
         };
@@ -184,6 +186,16 @@ impl Lower<'_, '_> {
         Ok(found)
     }
 
+    fn fold(&mut self, vector: Ty, x: Value, op: BinOp) -> Result<Value> {
+        let lanes = self.lanes(vector)?;
+        let mut folded = self.ins().load(lanes.machine, x, 0);
+        for lane in 1..lanes.count {
+            let value = self.ins().load(lanes.machine, x, lane * lanes.size);
+            folded = self.apply(op, lanes.num, (folded, value), lanes.num)?;
+        }
+        Ok(folded)
+    }
+
     fn extreme(&mut self, vector: Ty, x: Value, max: bool) -> Result<Value> {
         let lanes = self.lanes(vector)?;
         let better = if max { BinOp::Gt } else { BinOp::Lt };
@@ -194,6 +206,18 @@ impl Lower<'_, '_> {
             best = self.ins().select(wins, value, best);
         }
         Ok(best)
+    }
+
+    /// Calls the host function of the x86 intrinsic `x86` with `args`, each vector by address, and returns the address of the frame slot it writes the result to.
+    pub(super) fn host_vector(&mut self, x86: X86Symbol, args: &[Value]) -> Result<Value> {
+        if x86.host_addr().is_none() {
+            bail!("{} has no host function on this machine", x86.link_name());
+        }
+        let slot = self.b.create_stack_slot(x86.out_bytes(), 5);
+        let out = self.ins().stack_addr(Type::I64, slot, 0);
+        let values: Vec<Value> = std::iter::once(out).chain(args.iter().copied()).collect();
+        self.call_host(HostSymbol::X86(x86), &values, None);
+        Ok(out)
     }
 
     /// The `bytes` bytes whose byte `i` is byte `index[i] & 15` of the 16-byte lane of `table` that holds byte `i`, or zero when bit 7 of `index[i]` is set, as `pshufb` gives.

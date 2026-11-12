@@ -1,10 +1,12 @@
-//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hints as no-ops, the AArch64 barriers as one full barrier, `xgetbv` as no extended state enabled, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
+//! The host functions that foreign declarations link to: the allocator shims through the host's allocator, the spin-loop hints and `vzeroupper` as no-ops, the AArch64 barriers as one full barrier, `xgetbv` as no extended state enabled, the DSO handle of the host program, the allocation error handler and the panic runtime as an abort, and every other name through the dynamic linker.
 
 mod math;
 pub mod native;
 mod syscall;
+mod x86;
 
 pub use math::{MathSymbol, symbol as intrinsic};
+pub use x86::X86Symbol;
 
 use std::alloc::Layout;
 use std::ffi::CString;
@@ -25,6 +27,7 @@ pub enum HostSymbol {
     ThreadCell,
     Syscall,
     Math(MathSymbol),
+    X86(X86Symbol),
     Dynamic(Box<str>),
 }
 
@@ -44,7 +47,7 @@ impl HostSymbol {
             return Some(found.clone());
         }
         let built_in = match name {
-            "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" | "llvm.aarch64.hint" => Self::Noop,
+            "__rust_no_alloc_shim_is_unstable_v2" | "llvm.x86.sse2.pause" | "llvm.x86.avx.vzeroupper" | "llvm.aarch64.hint" => Self::Noop,
             "llvm.aarch64.isb" | "llvm.aarch64.dmb" | "llvm.aarch64.dsb" => Self::Barrier,
             "llvm.x86.xgetbv" => Self::NoExtendedState,
             "__rust_alloc_error_handler" | "__rust_panic_cleanup" | "__rust_start_panic" => Self::Abort,
@@ -74,6 +77,7 @@ impl HostSymbol {
             Self::ThreadCell => "__haste_thread_cell",
             Self::Syscall => "__haste_syscall",
             Self::Math(math) => math.link_name(),
+            Self::X86(x86) => x86.link_name(),
             Self::Dynamic(name) => name,
         }
     }
@@ -94,6 +98,7 @@ impl HostSymbol {
             Self::ThreadCell => crate::image::thread_cell as *const () as usize,
             Self::Syscall => syscall::run as *const () as usize,
             Self::Math(math) => math.host_addr(),
+            Self::X86(x86) => return x86.host_addr(),
             Self::Dynamic(_) => return dynamic(self.link_name()),
         })
     }

@@ -3,6 +3,7 @@ use haste_codegen::{FloatCC, IntCC, Type, Value};
 
 use crate::body::literal::{byte_value, char_value, string_bytes};
 use crate::body::{BinOp, Expr, ExprId, Lit, UnOp};
+use crate::host::{HostSymbol, MathSymbol};
 use crate::names::{ItemRef, Primitive};
 use crate::sema::infer::parse_int;
 use crate::sema::infer::{Adjust, Res};
@@ -241,6 +242,12 @@ impl Lower<'_, '_> {
             BinOp::Sub => self.ins().fsub(x, y),
             BinOp::Mul => self.ins().fmul(x, y),
             BinOp::Div => self.ins().fdiv(x, y),
+            BinOp::Rem => {
+                let ty = self.b.func.ty(x);
+                let fmod = if ty == Type::F32 { MathSymbol::Fmodf32 } else { MathSymbol::Fmodf64 };
+                let Some(value) = self.call_host(HostSymbol::Math(fmod), &[x, y], Some(ty)) else { bail!("float remainder returned no value") };
+                value
+            }
             other => bail!("cannot lower float {other:?} yet"),
         })
     }

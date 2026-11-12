@@ -93,7 +93,7 @@ fn open_libraries(libraries: &Libraries) -> Result<HashMap<Box<str>, usize>> {
     if !path.is_file() {
         link(libraries, &path)?;
     }
-    let handle = open(&path)?;
+    let handle = open(&path, libc::RTLD_LAZY)?;
     table(handle)
 }
 
@@ -174,11 +174,11 @@ fn index(path: &Path) -> Result<Vec<String>> {
     Ok(strings.split(|byte| *byte == 0).filter(|name| !name.is_empty()).take(count).map(|name| String::from_utf8_lossy(name).into_owned()).collect())
 }
 
-/// Opens the library at `path` with its symbols global, so the libraries it needs serve every foreign symbol they export, and returns its handle.
-fn open(path: &Path) -> Result<*mut c_void> {
+/// Opens the library at `path` with its symbols global and its references bound by `mode`, `RTLD_LAZY` or `RTLD_NOW`, so it serves every foreign symbol it exports, and returns its handle.
+pub fn open(path: &Path, mode: libc::c_int) -> Result<*mut c_void> {
     let text = CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: text is a NUL-terminated string that lives across the call; the library runs the initializers of the archives a cargo build would link.
-    let handle = unsafe { libc::dlopen(text.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL) };
+    // SAFETY: text is a NUL-terminated string that lives across the call; haste opens only libraries it built, whose initializers are those a cargo build of the same code would run.
+    let handle = unsafe { libc::dlopen(text.as_ptr(), mode | libc::RTLD_GLOBAL) };
     if !handle.is_null() {
         return Ok(handle);
     }

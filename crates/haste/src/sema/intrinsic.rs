@@ -40,6 +40,8 @@ pub enum Intrinsic {
     BytePermute(u8),
     /// NEON `umaxp` on two vectors of 16 bytes.
     BytePairMax,
+    /// An LLVM x86 intrinsic that a host function computes.
+    X86(crate::host::X86Symbol),
     CatchUnwind,
     SizeOf,
     AlignOf,
@@ -92,6 +94,8 @@ pub enum Simd {
     Extreme {
         max: bool,
     },
+    /// Every lane of a vector combined by one bitwise operator.
+    Fold(BinOp),
     Sqrt,
 }
 
@@ -107,7 +111,7 @@ pub enum Atomic {
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
 const LLVM: [(&str, Intrinsic); 3] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32)), ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::BytePairMax)];
 
-const NAMES: [(&str, Intrinsic); 134] = {
+const NAMES: [(&str, Intrinsic); 137] = {
     use Intrinsic::*;
     [
         ("wrapping_add", WrappingAdd),
@@ -227,6 +231,9 @@ const NAMES: [(&str, Intrinsic); 134] = {
         ("simd_reduce_any", Simd(self::Simd::Reduce { all: false })),
         ("simd_reduce_max", Simd(self::Simd::Extreme { max: true })),
         ("simd_reduce_min", Simd(self::Simd::Extreme { max: false })),
+        ("simd_reduce_and", Simd(self::Simd::Fold(BinOp::BitAnd))),
+        ("simd_reduce_or", Simd(self::Simd::Fold(BinOp::BitOr))),
+        ("simd_reduce_xor", Simd(self::Simd::Fold(BinOp::BitXor))),
         ("simd_fsqrt", Simd(self::Simd::Sqrt)),
         ("simd_add", Simd(self::Simd::Lanewise(BinOp::Add))),
         ("simd_sub", Simd(self::Simd::Lanewise(BinOp::Sub))),
@@ -260,6 +267,11 @@ impl Context<'_> {
             && let Some(&(_, which)) = LLVM.iter().find(|(known, _)| *known == link)
         {
             return Some(which);
+        }
+        if let Some(link) = self.attr_value(item, "link_name")
+            && let Some(x86) = crate::host::X86Symbol::from_link(link)
+        {
+            return Some(Intrinsic::X86(x86));
         }
         if entry.kind == ItemKind::Fn && name == "__cpuid_count" && self.outline.roots[item.krate as usize].name == "core" {
             return Some(Intrinsic::Cpuid);

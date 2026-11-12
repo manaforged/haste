@@ -326,6 +326,7 @@ fn simd_op_code(op: Simd) -> (u8, u8) {
         Simd::Select => (12, 0),
         Simd::SelectBitmask => (13, 0),
         Simd::Sqrt => (14, 0),
+        Simd::Fold(bin) => (15, bin as u8),
     }
 }
 
