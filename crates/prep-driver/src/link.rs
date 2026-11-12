@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::elf::{self, Scope, Table};
 use crate::object;
+use crate::statics;
 use crate::error::{Error, Result};
 use crate::record::{self, LINK, MANIFEST};
 use crate::wrap::RELEASE;
@@ -83,8 +84,8 @@ const RLIB_PREFIX: &str = "lib";
 
 const ALLOCATOR_SUFFIX: &str = "___rust_alloc";
 
-/// The kinds of lines that describe a trait object or function pointer type, in the order the merged manifest lists them.
-const INDIRECT: [&str; 2] = [object::OBJECT, object::POINTER];
+/// The kinds of lines that describe a trait object or function pointer type or a static, in the order the merged manifest lists them.
+const INDIRECT: [&str; 3] = [object::OBJECT, object::POINTER, statics::STATIC];
 
 /// The extension of the merged manifest that `link` writes beside the library, in TOML.
 pub const MANIFEST_EXTENSION: &str = "toml";
@@ -217,7 +218,7 @@ fn released(objects: &[PathBuf], symbols: &HashSet<String>) -> Result<HashSet<St
 
 fn merge(manifests: &[PathBuf], (defined, released): (&HashSet<String>, &HashSet<String>), out: &Path) -> Result<(usize, usize)> {
     let (mut records, mut library) = (Vec::new(), serde_json::Map::new());
-    let mut indirect: [BTreeMap<String, Value>; 2] = Default::default();
+    let mut indirect: [BTreeMap<String, Value>; 3] = Default::default();
     let mut missing = 0;
     for manifest in manifests {
         for line in BufReader::new(File::open(manifest)?).lines() {
@@ -243,9 +244,9 @@ fn merge(manifests: &[PathBuf], (defined, released): (&HashSet<String>, &HashSet
     let mut document = serde_json::Map::new();
     document.insert(record::LIBRARY.to_string(), Value::Object(library));
     document.insert(record::RECORD.to_string(), Value::Array(records));
-    let [objects, pointers] = indirect;
-    document.insert(object::OBJECT.to_string(), Value::Array(objects.into_values().collect()));
-    document.insert(object::POINTER.to_string(), Value::Array(pointers.into_values().collect()));
+    for (kind, lines) in INDIRECT.iter().zip(indirect) {
+        document.insert(kind.to_string(), Value::Array(lines.into_values().collect()));
+    }
     let document = Value::Object(document);
     let text = toml::to_string(&without_nulls(document)).map_err(|error| Error(error.to_string()))?;
     fs::write(out, text)?;

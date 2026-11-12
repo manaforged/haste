@@ -76,8 +76,12 @@ impl Lower<'_, '_> {
         Ok(Some(address))
     }
 
-    /// The place of the static `item` at `substs`, of type `ty`: its cell, which the static's initializer fills on the first use that finds it empty.
+    /// The place of the static `item` at `substs`, of type `ty`: the prepped library's copy when Haste shares it, whose value the library's loading set, else its cell, which the static's initializer fills on the first use that finds it empty.
     pub fn static_place(&mut self, (item, substs): (ItemRef, Substs), ty: Ty) -> Result<Place> {
+        if let Some(address) = crate::prep::static_address(self.cx, item) {
+            let base = self.emit_symbol(SymbolSource::Word(address as u64));
+            return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
+        }
         let index = self.reached_index(item, substs)?;
         let (address, size) = self.static_cell(index, ty)?;
         if !self.cx.foreign(item) && index != self.index {
@@ -123,7 +127,7 @@ impl Lower<'_, '_> {
     /// Writes `value`, the value of the static that this function initializes, into the static's cell, and returns.
     pub fn fill_static(&mut self, value: Option<Value>) -> Result<()> {
         let ((item, substs), ty) = (self.reached.list[self.index].0, self.typed.ret_ty());
-        if self.open {
+        if self.open && crate::prep::static_address(self.cx, item).is_none() {
             let place = self.static_place((item, substs), ty)?;
             if let Some(value) = value {
                 self.write(place, value);

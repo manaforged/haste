@@ -1,11 +1,12 @@
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::graph::Workspace;
+use crate::names::ItemRef;
 use crate::outline::Outline;
 use crate::sema::Context;
 use crate::sema::infer::Typed;
@@ -18,6 +19,7 @@ use super::ident;
 use super::indirect::{Indirect, Mode};
 use super::key::{Keys, Miss};
 use super::record::{At, Facts, InstanceKind, Library, Record};
+use super::statics::{Shared, Statics};
 use super::{conv, driver};
 
 const MAIN: &str = "main";
@@ -56,12 +58,20 @@ pub(super) struct Bindings {
     facts: Facts,
     records: Vec<Record>,
     index: HashMap<String, Vec<usize>>,
+    callers: Vec<Vec<usize>>,
     stale: Vec<bool>,
-    state: Vec<bool>,
+    statics: Statics,
+    settled: OnceLock<Settled>,
     keys: Keys,
     indirect: Indirect,
     current: bool,
     decided: Mutex<HashMap<Instance, Decided>>,
+}
+
+/// What binding needs Haste's sema to work out once: the statics Haste's code shares with the library, and the records that touch state Haste's code holds apart.
+struct Settled {
+    shared: Shared,
+    state: Vec<bool>,
 }
 
 /// What binding one instance decided, the record that names it, and how its arguments reach rustc's code when any does not travel as Haste passes it.
@@ -82,7 +92,7 @@ impl Bindings {
         }
         let then = Snapshot::read(&snapshot)?;
         let Some(changed) = now.changed(&then) else { return Ok(None) };
-        let Library { library, record: records, object, pointer } = Library::read(&manifest)?;
+        let Library { library, record: records, object, pointer, statics } = Library::read(&manifest)?;
         let indirect = Indirect::new(object, pointer, library.unkeyed);
         let mut index: HashMap<String, Vec<usize>> = HashMap::default();
         for (at, record) in records.iter().enumerate() {
@@ -92,16 +102,33 @@ impl Bindings {
         }
         let callers = callers(&records);
         let stale = spread(&callers, records.iter().map(|record| touched(record, &changed)).collect());
-        let mut state = spread(&callers, records.iter().map(|record| record.state).collect());
-        for at in (0..records.len()).filter(|&at| entry(&records, &callers, at)) {
-            state[at] = false;
-        }
-        for (at, _) in records.iter().enumerate().filter(|(_, record)| record.path.starts_with(START)) {
-            state[at] = true;
-        }
         let keys = Keys::new(outline, workspace, then);
         let current = changed.ranges.is_empty() && changed.crates.is_empty();
-        Ok(Some(Bindings { library: dir.join(driver::LIBRARY), facts: library, records, index, stale, state, keys, indirect, current, decided: Mutex::default() }))
+        let statics = Statics::new(statics);
+        Ok(Some(Bindings { library: dir.join(driver::LIBRARY), facts: library, records, index, callers, stale, statics, settled: OnceLock::new(), keys, indirect, current, decided: Mutex::default() }))
+    }
+
+    /// The statics Haste's code shares and the records touching state it holds apart, worked out on first use: a record that reaches std state each std keeps apart or a static Haste does not share, or calls one that does; none when it is the program's `main`, whose code then runs every function; and the runtime's start always.
+    fn settled(&self, cx: &mut Context<'_>) -> &Settled {
+        if let Some(settled) = self.settled.get() {
+            return settled;
+        }
+        let shared = self.statics.share(cx, (&self.keys, &self.indirect), &self.records);
+        let marked = self.records.iter().map(|record| record.held || record.statics.iter().any(|symbol| !shared.holds(&self.statics, symbol))).collect();
+        let mut state = spread(&self.callers, marked);
+        for at in (0..self.records.len()).filter(|&at| entry(&self.records, &self.callers, at)) {
+            state[at] = false;
+        }
+        for (at, _) in self.records.iter().enumerate().filter(|(_, record)| record.path.starts_with(START)) {
+            state[at] = true;
+        }
+        self.settled.get_or_init(|| Settled { shared, state })
+    }
+
+    /// The address of the library's copy of static `item`, when Haste's code shares it.
+    pub(super) fn static_address(&self, cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
+        let settled = self.settled(cx);
+        self.statics.address(cx, &self.keys, &settled.shared, item)
     }
 
     /// Whether the library was built from the local sources as they are now.
@@ -171,6 +198,11 @@ impl Bindings {
         (found.decision, found.carries)
     }
 
+    /// What binding decided for `instance`, when it was asked.
+    pub(super) fn decision(&self, instance: Instance) -> Option<Decision> {
+        self.decided.lock().ok()?.get(&instance).map(|found| found.decision)
+    }
+
     /// What binding decides for `instance`: the first copy that binds, else why the first copy does not.
     fn work_out(&self, cx: &mut Context<'_>, instance: Instance, typed: &Typed) -> Decided {
         let copies = match self.records(cx, instance, typed) {
@@ -194,7 +226,7 @@ impl Bindings {
         if self.stale[at] {
             return Err(Decision::Stale);
         }
-        if self.state[at] {
+        if self.settled(cx).state[at] {
             return Err(Decision::State);
         }
         let (params, ret) = super::signature(typed);

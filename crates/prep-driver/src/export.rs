@@ -12,11 +12,17 @@ use rustc_session::Session;
 
 static BASE: OnceLock<Providers> = OnceLock::new();
 
-/// Replaces the crate's partitioning and its exported generic symbols so that every function instance keeps an exported definition through LLVM and local ThinLTO.
+/// Replaces the crate's partitioning and its exported generic symbols so that every function instance and static keeps an exported definition through LLVM and local ThinLTO.
 pub fn override_queries(_: &Session, providers: &mut Providers) {
     BASE.get_or_init(|| *providers);
     providers.queries.collect_and_partition_mono_items = partition;
     providers.queries.exported_generic_symbols = exported;
+}
+
+/// Replaces the crate's partitioning so that every static keeps an exported definition, which the library's two builds of the crate then share, and functions keep rustc's linkage.
+pub fn override_statics(_: &Session, providers: &mut Providers) {
+    BASE.get_or_init(|| *providers);
+    providers.queries.collect_and_partition_mono_items = partition_statics;
 }
 
 fn base() -> &'static Providers {
@@ -26,32 +32,48 @@ fn base() -> &'static Providers {
     }
 }
 
+/// Which items a partitioning exports: statics only, or functions too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exported {
+    Statics,
+    All,
+}
+
 fn partition(tcx: TyCtxt<'_>, key: ()) -> MonoItemPartitions<'_> {
+    repartition(tcx, key, Exported::All)
+}
+
+fn partition_statics(tcx: TyCtxt<'_>, key: ()) -> MonoItemPartitions<'_> {
+    repartition(tcx, key, Exported::Statics)
+}
+
+fn repartition(tcx: TyCtxt<'_>, key: (), exported: Exported) -> MonoItemPartitions<'_> {
     let base = (base().queries.collect_and_partition_mono_items)(tcx, key);
-    let units: Vec<CodegenUnit<'_>> = base.codegen_units.iter().map(exported_unit).collect();
+    let units: Vec<CodegenUnit<'_>> = base.codegen_units.iter().map(|unit| exported_unit(unit, exported)).collect();
     MonoItemPartitions { codegen_units: tcx.arena.alloc_from_iter(units), all_mono_items: base.all_mono_items }
 }
 
-fn exported_unit<'tcx>(unit: &CodegenUnit<'tcx>) -> CodegenUnit<'tcx> {
+fn exported_unit<'tcx>(unit: &CodegenUnit<'tcx>, exported: Exported) -> CodegenUnit<'tcx> {
     let mut copy = CodegenUnit::new(unit.name());
     copy.set_symbol_name(unit.symbol_name());
     if unit.is_primary() {
         copy.make_primary();
     }
     for (item, data) in unit.items() {
-        copy.items_mut().insert(*item, exported_item(item, *data));
+        copy.items_mut().insert(*item, exported_item(item, *data, exported));
     }
     copy.compute_size_estimate();
     copy
 }
 
-fn exported_item(item: &MonoItem<'_>, data: MonoItemData) -> MonoItemData {
-    let MonoItem::Fn(_) = item else {
-        return data;
-    };
-    let linkage = match data.linkage {
-        Linkage::Internal => Linkage::WeakODR,
-        other => other,
+/// How the library defines `item`: a function, when all are exported, as a weak definition every copy may hold; a static as one exported definition, which the library's two builds share once linking keeps the first.
+fn exported_item(item: &MonoItem<'_>, data: MonoItemData, exported: Exported) -> MonoItemData {
+    let linkage = match (item, data.linkage) {
+        (MonoItem::Fn(_), Linkage::Internal) if exported == Exported::All => Linkage::WeakODR,
+        (MonoItem::Fn(_), _) if exported == Exported::All => data.linkage,
+        (MonoItem::Static(_), Linkage::Internal) => Linkage::External,
+        (MonoItem::Static(_), _) => data.linkage,
+        _ => return data,
     };
     MonoItemData { linkage, visibility: Visibility::Default, ..data }
 }

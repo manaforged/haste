@@ -12,8 +12,8 @@ const SEPARATOR: &str = "::";
 const CALL_ONCE: &str = "call_once";
 const CALLS_BY_REFERENCE: [&str; 2] = ["call", "call_mut"];
 
-/// The item kinds whose definitions a key names: functions, and the types and traits a key's types name.
-const NAMED: [ItemKind; 5] = [ItemKind::Fn, ItemKind::Struct, ItemKind::Enum, ItemKind::Union, ItemKind::Trait];
+/// The item kinds whose definitions a key names: functions, statics, and the types and traits a key's types name.
+const NAMED: [ItemKind; 6] = [ItemKind::Fn, ItemKind::Static, ItemKind::Struct, ItemKind::Enum, ItemKind::Union, ItemKind::Trait];
 
 /// A closure type by its typeck root, the root's type arguments, and its place among the root's closures in the order their expressions end, with their count.
 pub(super) struct ClosureAt {

@@ -108,8 +108,11 @@ impl Indirect {
         let mut supers = Vec::new();
         for inner in cx.vtable_supers(of).ok()? {
             let ours = keys.def(cx, inner).ok()?;
-            let found = object.supers.iter().find(|theirs| theirs.of.as_deref() == Some(ours.as_str()))?;
-            supers.push((inner, found.vptr));
+            match object.supers.iter().find(|theirs| theirs.of.as_deref() == Some(ours.as_str())) {
+                Some(found) => supers.push((inner, found.vptr)),
+                None if cx.vtable_methods(inner).ok()?.is_empty() => {}
+                None => return None,
+            }
         }
         Some(Vtable { slots, supers })
     }

@@ -231,7 +231,7 @@ fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     }
 }
 
-const USAGE: &str = "usage: haste [--jobs N] [--release] [--stats-json PATH] build|test|run|serve|prep PATH [--] [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]\n       haste [--release] debug code PATH DIR";
+const USAGE: &str = "usage: haste [--jobs N] [--release] [--perf-map] [--stats-json PATH] build|test|run|serve|prep PATH [--] [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]\n       haste [--release] debug code PATH DIR";
 
 /// What the command line asks for.
 #[derive(Clone, Copy)]
@@ -287,6 +287,10 @@ fn consume_options<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>
             "--release" => {
                 args.next();
                 crate::set_profile(outline::tree::Profile::Release);
+            }
+            "--perf-map" => {
+                args.next();
+                crate::image::perf::enable();
             }
             "--stats-json" => {
                 args.next();

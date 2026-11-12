@@ -21,6 +21,7 @@ mod args;
 mod elf;
 mod error;
 mod export;
+mod form;
 mod key;
 mod layout;
 mod link;
@@ -28,6 +29,7 @@ mod object;
 mod print;
 mod record;
 mod source;
+mod statics;
 mod uses;
 mod wrap;
 

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
-use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
+use rustc_middle::mir::interpret::{AllocId, GlobalAlloc, Scalar};
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{Body, CastKind, Const, ConstOperand, ConstValue, Location, Rvalue, Terminator, TerminatorKind};
 use rustc_middle::ty::adjustment::PointerCoercion;
@@ -18,20 +18,34 @@ pub fn inlined<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<Value> 
     callees.filter(|def_id| seen.insert(*def_id)).map(|def_id| crate::key::at(tcx, def_id)).collect()
 }
 
-/// What the optimized body of `instance` reaches outside itself: the trait object and function pointer types whose code pointers it makes, calls or hands to the shared standard library, the symbols of the instances it calls, drops, reifies or puts in a vtable, and whether it reads or writes a static outside the sysroot that is mutable, thread-local or holds interior mutability, or reaches standard library code whose state each copy of std keeps apart.
+/// What the optimized body of `instance` reaches outside itself: the trait object and function pointer types whose code pointers it makes, calls or hands to the shared standard library, the symbols of the instances it calls, drops, reifies or puts in a vtable, the symbols of the statics outside the sysroot it reads or writes that are mutable, thread-local or hold interior mutability, the keys of the function pointer types it calls through (none when one has no key), and whether it reaches standard library code whose state each copy of std keeps apart.
 pub struct Used<'tcx> {
     pub symbols: Vec<String>,
-    pub state: bool,
+    pub statics: Vec<String>,
+    pub calls: Option<Vec<String>>,
+    pub held: bool,
     pub indirect: FxHashSet<Ty<'tcx>>,
 }
 
 /// What the optimized body of `instance` reaches outside itself.
 pub fn used<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Used<'tcx> {
     let body = tcx.instance_mir(instance.def);
-    let mut uses = Uses { tcx, instance, body, found: BTreeSet::new(), state: false, indirect: FxHashSet::default() };
+    let mut uses = Uses { tcx, instance, body, found: BTreeSet::new(), statics: BTreeSet::new(), calls: Some(BTreeSet::new()), held: false, indirect: FxHashSet::default(), seen: FxHashSet::default() };
     uses.visit_body(body);
-    Used { symbols: uses.found.into_iter().collect(), state: uses.state, indirect: uses.indirect }
+    let calls = uses.calls.map(|calls| calls.into_iter().collect());
+    Used { symbols: uses.found.into_iter().collect(), statics: uses.statics.into_iter().collect(), calls, held: uses.held, indirect: uses.indirect }
 }
+
+/// Whether static `def_id` holds state that two copies would split: it is outside the sysroot and mutable, thread-local or of a type with interior mutability.
+pub fn stateful(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    let env = TypingEnv::fully_monomorphized();
+    let mutable = tcx.static_mutability(def_id) == Some(rustc_hir::Mutability::Mut);
+    let cell = !tcx.type_of(def_id).instantiate_identity().skip_normalization().is_freeze(tcx, env);
+    (mutable || cell || tcx.is_thread_local_static(def_id)) && !crate::link::sysroot(tcx, def_id.krate)
+}
+
+/// How many allocations deep a body's constant pointers are followed to the functions and statics they reach.
+const ALLOCATION_DEPTH: usize = 4;
 
 /// The standard library code whose state each copy of std keeps for itself: the standard streams, and the exit that flushes them.
 const HELD_APART: [&str; 2] = ["std::io::stdio::", "std::process::exit"];
@@ -50,8 +64,11 @@ struct Uses<'a, 'tcx> {
     instance: Instance<'tcx>,
     body: &'a Body<'tcx>,
     found: BTreeSet<String>,
-    state: bool,
+    statics: BTreeSet<String>,
+    calls: Option<BTreeSet<String>>,
+    held: bool,
     indirect: FxHashSet<Ty<'tcx>>,
+    seen: FxHashSet<AllocId>,
 }
 
 impl<'tcx> Uses<'_, 'tcx> {
@@ -69,24 +86,58 @@ impl<'tcx> Uses<'_, 'tcx> {
         if crate::link::sysroot(self.tcx, instance.def_id().krate) && !instance.args.iter().any(|arg| arg.as_type().is_some()) {
             self.handed(instance);
         }
-        self.state |= held_apart(self.tcx, instance.def_id());
+        self.held |= held_apart(self.tcx, instance.def_id());
         self.found.insert(self.tcx.symbol_name(instance).name.to_string());
     }
 
     fn touch(&mut self, def_id: DefId) {
-        let env = TypingEnv::fully_monomorphized();
-        let mutable = self.tcx.static_mutability(def_id) == Some(rustc_hir::Mutability::Mut);
-        let cell = !self.tcx.type_of(def_id).instantiate_identity().skip_normalization().is_freeze(self.tcx, env);
-        let shared = mutable || cell || self.tcx.is_thread_local_static(def_id);
-        self.state |= shared && !crate::link::sysroot(self.tcx, def_id.krate);
+        if stateful(self.tcx, def_id) {
+            self.statics.insert(self.tcx.symbol_name(Instance::mono(self.tcx, def_id)).name.to_string());
+        }
     }
 
+    fn call_through(&mut self, pointer: Ty<'tcx>) {
+        let key = crate::key::ty(self.tcx, pointer);
+        self.calls = self.calls.take().zip(key).map(|(mut calls, key)| {
+            calls.insert(key);
+            calls
+        });
+    }
+
+    /// Notes what constant `constant` points to, evaluated at this instance's type arguments.
     fn constant(&mut self, constant: &ConstOperand<'tcx>) {
-        let Const::Val(ConstValue::Scalar(Scalar::Ptr(pointer, _)), _) = constant.const_ else {
+        let value = match self.mono(constant.const_) {
+            Const::Val(value, _) => Some(value),
+            unevaluated => unevaluated.eval(self.tcx, TypingEnv::fully_monomorphized(), constant.span).ok(),
+        };
+        let id = match value {
+            Some(ConstValue::Scalar(Scalar::Ptr(pointer, _))) => pointer.provenance.alloc_id(),
+            Some(ConstValue::Indirect { alloc_id, .. }) => alloc_id,
+            _ => return,
+        };
+        self.points_to(id, ALLOCATION_DEPTH);
+    }
+
+    /// Notes what a pointer to allocation `id` reaches: a static it touches, a function it may call, and, `depth` allocations deep, what the static's value or the memory points to, so that a function a static holds a pointer to, such as a thread-local's accessor, counts as one the body calls.
+    fn points_to(&mut self, id: AllocId, depth: usize) {
+        let allocation = match self.tcx.try_get_global_alloc(id) {
+            Some(GlobalAlloc::Static(def_id)) => {
+                self.touch(def_id);
+                self.tcx.eval_static_initializer(def_id).ok()
+            }
+            Some(GlobalAlloc::Function { instance }) => {
+                self.add(instance);
+                None
+            }
+            Some(GlobalAlloc::Memory(allocation)) => Some(allocation),
+            _ => None,
+        };
+        let Some(allocation) = allocation.filter(|_| depth > 0 && self.seen.insert(id)) else {
             return;
         };
-        if let Some(GlobalAlloc::Static(def_id)) = self.tcx.try_get_global_alloc(pointer.provenance.alloc_id()) {
-            self.touch(def_id);
+        let inner: Vec<AllocId> = allocation.inner().provenance().ptrs().values().map(|pointer| pointer.alloc_id()).collect();
+        for inner in inner {
+            self.points_to(inner, depth - 1);
         }
     }
 
@@ -151,6 +202,7 @@ impl<'tcx> Visitor<'tcx> for Uses<'_, 'tcx> {
             && let ty::FnPtr(..) = callee.kind()
         {
             self.indirect.insert(callee);
+            self.call_through(callee);
         }
         if let TerminatorKind::Drop { place, .. } = &terminator.kind {
             let ty = self.mono(place.ty(self.body, self.tcx).ty);

@@ -26,6 +26,15 @@ struct Plain;
 
 impl Callbacks for Plain {}
 
+/// The release prep compile: rustc's own partitioning, with each static exported so both builds of the crate share one.
+struct Released;
+
+impl Callbacks for Released {
+    fn config(&mut self, config: &mut interface::Config) {
+        config.override_queries = Some(export::override_statics);
+    }
+}
+
 struct Prep {
     unit: Unit,
 }
@@ -123,7 +132,7 @@ fn compile(args: &[String], opts: &[Opt], unit: Unit, phase: Phase) -> ExitCode 
     match phase {
         Phase::Release => {
             let released = args::prep(program, opts, &unit.dir.join(RELEASE));
-            rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&released, &mut Plain))
+            rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&released, &mut Released))
         }
         Phase::Exported => {
             let exported = args::prep(program, opts, &unit.dir);

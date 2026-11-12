@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
-/// The manifest that the prep driver writes beside its library: the library's own facts, one record per function instance it exports, and each trait object and function pointer type that rustc's code makes, calls or hands to the shared standard library.
+/// The manifest that the prep driver writes beside its library: the library's own facts, one record per function instance it exports, each trait object and function pointer type that rustc's code makes, calls or hands to the shared standard library, and each static that holds state.
 #[derive(Deserialize)]
 pub(super) struct Library {
     #[serde(default)]
@@ -14,6 +14,18 @@ pub(super) struct Library {
     pub object: Vec<Object>,
     #[serde(default)]
     pub pointer: Vec<Pointer>,
+    #[serde(default, rename = "static")]
+    pub statics: Vec<Static>,
+}
+
+/// A static that holds state, which the library defines once: its key, symbol, the layouts its value holds or points to, and whether each thread has its own.
+#[derive(Deserialize)]
+pub(super) struct Static {
+    #[serde(rename = "static")]
+    pub key: String,
+    pub symbol: String,
+    pub layouts: Option<Vec<String>>,
+    pub thread_local: bool,
 }
 
 /// What the driver found about the library as a whole: the symbols of the shared standard library's argument initializer, of its `stdout`, and of `flush` on the `Stdout` that returns, and whether rustc's code touches a trait object or function pointer type that has no key.
@@ -61,7 +73,7 @@ pub(super) struct Pointer {
     pub layouts: Option<Vec<String>>,
 }
 
-/// One function instance in the library: its symbol, the key that names it, the stable id of the crate that defines it, where it and the functions rustc inlined into it are defined, its definition path, closure identity, type arguments, calling convention, the layouts it crosses with, what it calls, whether it touches mutable state outside the standard crates, and whether rustc's release build kept this copy.
+/// One function instance in the library: its symbol, the key that names it, the stable id of the crate that defines it, where it and the functions rustc inlined into it are defined, its definition path, closure identity, type arguments, calling convention, the layouts it crosses with, what it calls, the statics holding state it touches, the keys of the function pointer types it calls through (none when one has no key), whether it reaches standard library state each std keeps apart, and whether rustc's release build kept this copy.
 #[derive(Deserialize)]
 pub(super) struct Record {
     pub symbol: String,
@@ -76,7 +88,10 @@ pub(super) struct Record {
     pub layouts: Option<Vec<String>>,
     pub inlined: Vec<At>,
     pub uses: Vec<String>,
-    pub state: bool,
+    #[serde(default)]
+    pub statics: Vec<String>,
+    pub calls: Option<Vec<String>>,
+    pub held: bool,
     pub release_copy: bool,
 }
 

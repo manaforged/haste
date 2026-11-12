@@ -5,6 +5,8 @@ use rustc_middle::ty::{self, GenericArgKind, GenericArgsRef, Instance, InstanceK
 use rustc_span::Span;
 use serde_json::{Value, json};
 
+use crate::form;
+
 /// The kinds `record::kind` gives a closure's by-value call shim and a drop glue.
 const CLOSURE_ONCE: &str = "Shim::ClosureOnce";
 const DROP_GLUE: &str = "Shim::DropGlue";
@@ -15,7 +17,7 @@ pub fn instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Option<Str
         if tcx.is_closure_like(def_id) {
             return closure(tcx, def_id, instance.args);
         }
-        return Some(format!("{}<{}>", def(tcx, def_id)?, args(tcx, instance.args)?));
+        return Some(form::named(&def(tcx, def_id)?, &args(tcx, instance.args)?));
     }
     let first = instance.args.types().next()?;
     match crate::record::kind(instance.def).as_str() {
@@ -36,21 +38,44 @@ pub fn at(tcx: TyCtxt<'_>, def_id: DefId) -> Value {
 
 /// `ty` as a key, or none when it holds a type with no key.
 pub fn ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<String> {
+    match *ty.kind() {
+        ty::Bool | ty::Char | ty::Str | ty::Never | ty::Int(_) | ty::Uint(_) | ty::Float(_) => scalar(ty),
+        ty::Ref(..) | ty::RawPtr(..) | ty::Array(..) | ty::Slice(_) | ty::Tuple(_) => built(tcx, ty),
+        _ => named(tcx, ty),
+    }
+}
+
+/// The key of a primitive type.
+fn scalar(ty: Ty<'_>) -> Option<String> {
     Some(match *ty.kind() {
-        ty::Bool => "bool".to_string(),
-        ty::Char => "char".to_string(),
-        ty::Str => "str".to_string(),
-        ty::Never => "!".to_string(),
-        ty::Int(int) => int.name_str().to_string(),
-        ty::Uint(uint) => uint.name_str().to_string(),
-        ty::Float(float) => float.name_str().to_string(),
-        ty::Ref(_, inner, mutability) => format!("&{}{}", mutability.prefix_str(), self::ty(tcx, inner)?),
-        ty::RawPtr(inner, mutability) => format!("*{} {}", mutability.ptr_str(), self::ty(tcx, inner)?),
-        ty::Array(inner, len) => format!("[{};{}]", self::ty(tcx, inner)?, value(len)?),
-        ty::Slice(inner) => format!("[{}]", self::ty(tcx, inner)?),
-        ty::Tuple(items) => format!("({})", items.iter().map(|item| self::ty(tcx, item).map(|key| key + ",")).collect::<Option<String>>()?),
-        ty::Adt(adt, args) => format!("{}<{}>", def(tcx, adt.did())?, self::args(tcx, args)?),
-        ty::FnDef(def_id, args) => format!("fn {}<{}>", def(tcx, def_id)?, self::args(tcx, args.skip_binder())?),
+        ty::Bool => "bool".to_owned(),
+        ty::Char => "char".to_owned(),
+        ty::Str => "str".to_owned(),
+        ty::Never => form::NEVER.to_owned(),
+        ty::Int(int) => int.name_str().to_owned(),
+        ty::Uint(uint) => uint.name_str().to_owned(),
+        ty::Float(float) => float.name_str().to_owned(),
+        _ => return None,
+    })
+}
+
+/// The key of a reference, raw pointer, array, slice or tuple type, built from the keys of its parts.
+fn built<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<String> {
+    Some(match *ty.kind() {
+        ty::Ref(_, inner, mutability) => form::reference(mutability.is_mut(), &self::ty(tcx, inner)?),
+        ty::RawPtr(inner, mutability) => form::raw(mutability.is_mut(), &self::ty(tcx, inner)?),
+        ty::Array(inner, len) => form::array(&self::ty(tcx, inner)?, &value(len)?),
+        ty::Slice(inner) => form::slice(&self::ty(tcx, inner)?),
+        ty::Tuple(items) => form::tuple(&types(tcx, items.iter())?),
+        _ => return None,
+    })
+}
+
+/// The key of a type a definition names: a struct, enum or union, a function item, a closure, a function pointer or a trait object.
+fn named<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<String> {
+    Some(match *ty.kind() {
+        ty::Adt(adt, args) => form::named(&def(tcx, adt.did())?, &self::args(tcx, args)?),
+        ty::FnDef(def_id, args) => form::fn_def(&def(tcx, def_id)?, &self::args(tcx, args.skip_binder())?),
         ty::Closure(def_id, args) => closure(tcx, def_id, args)?,
         ty::FnPtr(..) => pointer(tcx, ty)?,
         ty::Dynamic(predicates, _) => object(tcx, predicates)?,
@@ -58,26 +83,28 @@ pub fn ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<String> {
     })
 }
 
+fn types<'tcx>(tcx: TyCtxt<'tcx>, items: impl Iterator<Item = Ty<'tcx>>) -> Option<Vec<String>> {
+    items.map(|item| self::ty(tcx, item)).collect()
+}
+
 /// The key of a function pointer type: its parameter and return types.
 fn pointer<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<String> {
     let sig = tcx.instantiate_bound_regions_with_erased(ty.fn_sig(tcx));
-    let params = sig.inputs().iter().map(|&param| self::ty(tcx, param).map(|key| key + ",")).collect::<Option<String>>()?;
-    Some(format!("fn({params})->{}", self::ty(tcx, sig.output())?))
+    Some(form::fn_ptr(&types(tcx, sig.inputs().iter().copied())?, &self::ty(tcx, sig.output())?))
 }
 
-/// The key of a trait object type: its principal trait with the trait's arguments, and each associated type it fixes by name in name order.
+/// The key of a trait object type: its principal trait with the trait's arguments, and each associated type it fixes by name.
 fn object<'tcx>(tcx: TyCtxt<'tcx>, predicates: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>) -> Option<String> {
     let principal = predicates.principal()?.skip_binder();
-    let mut bound = Vec::new();
+    let mut fixed = Vec::new();
     for projection in predicates.projection_bounds() {
         let projection = projection.skip_binder();
-        bound.push(format!("+{}={}", tcx.item_name(projection.def_id), self::ty(tcx, projection.term.as_type()?)?));
+        fixed.push((tcx.item_name(projection.def_id).to_string(), self::ty(tcx, projection.term.as_type()?)?));
     }
-    bound.sort();
-    Some(format!("dyn {}<{}>{}", def(tcx, principal.def_id)?, args(tcx, principal.args)?, bound.concat()))
+    Some(form::object(&def(tcx, principal.def_id)?, &args(tcx, principal.args)?, &fixed))
 }
 
-fn args<'tcx>(tcx: TyCtxt<'tcx>, args: &[ty::GenericArg<'tcx>]) -> Option<String> {
+fn args<'tcx>(tcx: TyCtxt<'tcx>, args: &[ty::GenericArg<'tcx>]) -> Option<Vec<String>> {
     let mut keys = Vec::new();
     for arg in args {
         match arg.kind() {
@@ -86,7 +113,7 @@ fn args<'tcx>(tcx: TyCtxt<'tcx>, args: &[ty::GenericArg<'tcx>]) -> Option<String
             GenericArgKind::Const(one) => keys.push(value(one)?),
         }
     }
-    Some(keys.join(","))
+    Some(keys)
 }
 
 fn value(constant: ty::Const<'_>) -> Option<String> {
@@ -95,9 +122,9 @@ fn value(constant: ty::Const<'_>) -> Option<String> {
 
 fn closure<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, closure_args: GenericArgsRef<'tcx>) -> Option<String> {
     let root = tcx.typeck_root_def_id(def_id);
-    let (order, count) = crate::record::order(tcx, def_id)?;
+    let order = crate::record::order(tcx, def_id)?;
     let parent = closure_args.iter().take(tcx.generics_of(def_id).parent_count).collect::<Vec<_>>();
-    Some(format!("closure {}#{order}/{count}<{}>", def(tcx, root)?, args(tcx, &parent)?))
+    Some(form::closure(&def(tcx, root)?, order, &args(tcx, &parent)?))
 }
 
 /// The key of definition `def_id`: its crate, file, the byte offset of its name and the name, for a named definition outside any macro expansion.

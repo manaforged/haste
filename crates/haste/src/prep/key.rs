@@ -13,6 +13,7 @@ use crate::sema::reach::Instance;
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::edit::Snapshot;
+use super::form;
 use super::ident;
 use super::source::{crate_key, normalize};
 
@@ -37,7 +38,7 @@ pub(super) struct Keys {
     local: Vec<bool>,
     doubled: Vec<bool>,
     then: Snapshot,
-    files: Mutex<HashMap<(u32, u32), Option<String>>>,
+    files: Mutex<HashMap<(u32, u32), Option<(String, usize)>>>,
 }
 
 impl Keys {
@@ -58,53 +59,65 @@ impl Keys {
                 let once = ident::once(cx, item).ok_or(Miss::Unnamed)?;
                 Ok((self.ty(cx, *substs.first().ok_or(Miss::Unnamed)?)?, Some(once)))
             }
-            Shape::Body if cx.item(item).1.kind == ItemKind::Fn => Ok((format!("{}<{}>", self.def(cx, item)?, self.list(cx, &substs)?), None)),
+            Shape::Body if cx.item(item).1.kind == ItemKind::Fn => Ok((form::named(&self.def(cx, item)?, &self.list(cx, &substs)?), None)),
             _ => Err(Miss::Unnamed),
         }
     }
 
+    /// The crates whose key names them `name`.
+    pub(super) fn crates_named<'n>(&'n self, name: &'n str) -> impl Iterator<Item = usize> + 'n {
+        (0..self.names.len()).filter(move |&at| self.names[at] == name)
+    }
+
     /// `ty` as a key.
     pub(super) fn ty(&self, cx: &mut Context<'_>, ty: Ty) -> Result<String, Miss> {
-        Ok(match cx.types.kind(ty).clone() {
-            Kind::Prim(primitive) => format!("{primitive:?}").to_lowercase(),
-            Kind::Never => "!".to_owned(),
-            Kind::Tuple(items) => {
-                let items = cx.types.substs(items).to_vec();
-                format!("({})", items.iter().map(|&item| self.ty(cx, item).map(|key| key + ",")).collect::<Result<String, Miss>>()?)
-            }
-            Kind::Ref(Mut::Not, inner) => format!("&{}", self.ty(cx, inner)?),
-            Kind::Ref(Mut::Mut, inner) => format!("&mut {}", self.ty(cx, inner)?),
-            Kind::Ptr(Mut::Not, inner) => format!("*const {}", self.ty(cx, inner)?),
-            Kind::Ptr(Mut::Mut, inner) => format!("*mut {}", self.ty(cx, inner)?),
-            Kind::Array(inner, len) => format!("[{};{}]", self.ty(cx, inner)?, self.arg(cx, len)?),
-            Kind::Slice(inner) => format!("[{}]", self.ty(cx, inner)?),
-            Kind::Adt(item, args) => format!("{}<{}>", self.def(cx, item)?, self.list(cx, &cx.types.substs(args).to_vec())?),
-            Kind::FnDef(item, args) => format!("fn {}<{}>", self.def(cx, item)?, self.list(cx, &cx.types.substs(args).to_vec())?),
+        let kind = cx.types.kind(ty).clone();
+        match kind {
+            Kind::Prim(primitive) => Ok(format!("{primitive:?}").to_lowercase()),
+            Kind::Never => Ok(form::NEVER.to_owned()),
+            Kind::Tuple(..) | Kind::Ref(..) | Kind::Ptr(..) | Kind::Array(..) | Kind::Slice(_) => self.built(cx, kind),
+            _ => self.named(cx, ty, kind),
+        }
+    }
+
+    /// The key of a tuple, reference, raw pointer, array or slice type of kind `kind`, built from the keys of its parts.
+    fn built(&self, cx: &mut Context<'_>, kind: Kind) -> Result<String, Miss> {
+        Ok(match kind {
+            Kind::Tuple(items) => form::tuple(&self.types(cx, &cx.types.substs(items).to_vec())?),
+            Kind::Ref(mutable, inner) => form::reference(mutable == Mut::Mut, &self.ty(cx, inner)?),
+            Kind::Ptr(mutable, inner) => form::raw(mutable == Mut::Mut, &self.ty(cx, inner)?),
+            Kind::Array(inner, len) => form::array(&self.ty(cx, inner)?, &self.arg(cx, len)?),
+            Kind::Slice(inner) => form::slice(&self.ty(cx, inner)?),
+            _ => return Err(Miss::Unnamed),
+        })
+    }
+
+    /// The key of type `ty` of kind `kind` that a definition names: a struct, enum or union, a function item, a closure, a function pointer or a trait object.
+    fn named(&self, cx: &mut Context<'_>, ty: Ty, kind: Kind) -> Result<String, Miss> {
+        Ok(match kind {
+            Kind::Adt(item, args) => form::named(&self.def(cx, item)?, &self.list(cx, &cx.types.substs(args).to_vec())?),
+            Kind::FnDef(item, args) => form::fn_def(&self.def(cx, item)?, &self.list(cx, &cx.types.substs(args).to_vec())?),
             Kind::Closure(..) => self.closure(cx, ty)?,
-            Kind::FnPtr(params, ret) => {
-                let params = cx.types.substs(params).to_vec();
-                format!("fn({})->{}", params.iter().map(|&param| self.ty(cx, param).map(|key| key + ",")).collect::<Result<String, Miss>>()?, self.ty(cx, ret)?)
-            }
+            Kind::FnPtr(params, ret) => form::fn_ptr(&self.types(cx, &cx.types.substs(params).to_vec())?, &self.ty(cx, ret)?),
             Kind::Dyn(of, args, members, _) => self.object(cx, of, (&cx.types.substs(args).to_vec(), &members))?,
             _ => return Err(Miss::Unnamed),
         })
     }
 
-    /// The key of a trait object type of trait `of` with arguments `args`, the last of which give the associated types `members` fixes, as the driver prints one: those in name order.
+    /// The key of a trait object type of trait `of` with arguments `args`, the last of which give the associated types `members` fixes.
     fn object(&self, cx: &mut Context<'_>, of: ItemRef, (args, members): (&[Ty], &[ItemRef])) -> Result<String, Miss> {
         let (given, bound) = crate::sema::ty::object_parts(args, members);
         let (given, bound): (Vec<Ty>, Vec<(ItemRef, Ty)>) = (given.to_vec(), bound.collect());
         let mut fixed = Vec::new();
         for (member, ty) in bound {
-            fixed.push(format!("+{}={}", cx.name(member), self.ty(cx, ty)?));
+            fixed.push((cx.name(member).to_owned(), self.ty(cx, ty)?));
         }
-        fixed.sort();
-        Ok(format!("dyn {}<{}>{}", self.def(cx, of)?, self.list(cx, &given)?, fixed.concat()))
+        Ok(form::object(&self.def(cx, of)?, &self.list(cx, &given)?, &fixed))
     }
 
     fn closure(&self, cx: &mut Context<'_>, ty: Ty) -> Result<String, Miss> {
         let at = ident::closure(cx, ty).ok_or(Miss::Unnamed)?;
-        Ok(format!("closure {}#{}/{}<{}>", self.def(cx, at.root)?, at.order, at.count, self.list(cx, &at.outer)?))
+        Ok(form::closure(&self.def(cx, at.root)?, (at.order, at.count), &self.list(cx, &at.outer)?))
     }
 
     fn arg(&self, cx: &mut Context<'_>, ty: Ty) -> Result<String, Miss> {
@@ -114,9 +127,12 @@ impl Keys {
         }
     }
 
-    fn list(&self, cx: &mut Context<'_>, items: &[Ty]) -> Result<String, Miss> {
-        let keys: Result<Vec<String>, Miss> = items.iter().map(|&item| self.arg(cx, item)).collect();
-        Ok(keys?.join(","))
+    fn types(&self, cx: &mut Context<'_>, items: &[Ty]) -> Result<Vec<String>, Miss> {
+        items.iter().map(|&item| self.ty(cx, item)).collect()
+    }
+
+    fn list(&self, cx: &mut Context<'_>, items: &[Ty]) -> Result<Vec<String>, Miss> {
+        items.iter().map(|&item| self.arg(cx, item)).collect()
     }
 
     /// The key of definition `item`: its crate, file, the byte offset of its name and the name, where prep saw it for a local definition.
@@ -134,7 +150,7 @@ impl Keys {
         Ok(format!("{}:{}:{}:{}", self.names[krate], place.file, place.lo, cx.name(item)))
     }
 
-    /// Where definition `item` of a crate no edit changes is, when its name is in its file's own text.
+    /// Where definition `item` of a crate no edit changes is, when its name is in the text of the file on disk, not in text a macro wrote.
     fn place(&self, cx: &Context<'_>, item: ItemRef) -> Option<Place> {
         if item.outer().is_some() {
             return None;
@@ -143,14 +159,21 @@ impl Keys {
         let name = cx.item(item).1.name?;
         let (text, span) = (file.source.text.as_str(), file.source.span(name, name));
         let lo = (span.as_ptr() as usize).checked_sub(text.as_ptr() as usize)?;
-        (file.source.base.is_none() && lo + span.len() <= text.len()).then_some(())?;
+        file.source.base.is_none().then_some(())?;
         let mut files = self.files.lock().ok()?;
-        let named = files.entry((item.krate, item.file)).or_insert_with(|| clean(text).then(|| normalize(&file.source.path)).flatten());
-        Some(Place { file: named.clone()?, lo: lo as u32 })
+        let (named, read) = files.entry((item.krate, item.file)).or_insert_with(|| on_disk(&file.source.path, text)).clone()?;
+        (lo + span.len() <= read).then_some(Place { file: named, lo: lo as u32 })
     }
 }
 
+/// The name a key gives file `path` and the length of its text on disk, when `text` begins with that text and rustc counts byte offsets in it as Haste does.
+pub(super) fn on_disk(path: &std::path::Path, text: &str) -> Option<(String, usize)> {
+    let read = std::fs::read(path).ok()?;
+    (clean(text) && text.as_bytes().starts_with(&read)).then_some(())?;
+    Some((normalize(path)?, read.len()))
+}
+
 /// Whether byte offsets in `text` are those rustc counts, which it counts after dropping a byte order mark and carriage returns.
-pub(super) fn clean(text: &str) -> bool {
+fn clean(text: &str) -> bool {
     !text.starts_with(BYTE_ORDER_MARK) && !text.contains('\r')
 }

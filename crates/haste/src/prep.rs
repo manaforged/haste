@@ -10,6 +10,9 @@ mod ident;
 mod indirect;
 mod key;
 mod record;
+mod statics;
+#[path = "../../prep-driver/src/form.rs"]
+mod form;
 #[path = "../../prep-driver/src/print.rs"]
 mod print;
 #[path = "../../prep-driver/src/source.rs"]
@@ -119,6 +122,11 @@ pub fn decided() -> Option<Tally> {
     BOUND.get().map(|manifest| manifest.rustc.decided())
 }
 
+/// What binding decided for reached function `at`, when a manifest is installed and binding asked about it.
+pub fn why(reached: &Reached, at: usize) -> Option<String> {
+    BOUND.get()?.rustc.decision(reached.list[at].0).map(|decision| format!("{decision:?}"))
+}
+
 /// rustc's code for a reached function: its address, or a function in Haste's convention that calls it there.
 pub enum Prepped {
     Direct(usize),
@@ -147,6 +155,11 @@ fn bound(cx: &mut Context<'_>, reached: &Reached, at: usize) -> Option<(usize, O
         (Decision::Bound(address), carries) => Some((address, carries)),
         _ => None,
     }
+}
+
+/// The address of the prepped library's copy of static `item`, which Haste's code then reads and writes in place of its own, when a manifest is installed and Haste shares that static.
+pub fn static_address(cx: &mut Context<'_>, item: crate::names::ItemRef) -> Option<usize> {
+    BOUND.get()?.rustc.static_address(cx, item)
 }
 
 /// rustc's layout of every vtable of trait object type `ty`, which Haste's code then builds and calls in rustc's layout and convention, when a bound library touches the type and Haste can follow it.

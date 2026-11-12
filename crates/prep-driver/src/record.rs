@@ -35,18 +35,15 @@ const ARGS_INIT: &str = "std::sys::args::unix::imp::ARGV_INIT_ARRAY::init_wrappe
 /// The file in a linking unit's directory that names the sysroot libraries and native libraries its prep library links.
 pub const LINK: &str = "link.txt";
 
-/// Writes the manifest of every function instance the crate generates code for and of every trait object and function pointer type their code touches, and, for a crate that links, the libraries it links.
+/// Writes the manifest of every function instance the crate generates code for, of every static it defines that holds state, and of every trait object and function pointer type their code touches, and, for a crate that links, the libraries it links.
 pub fn write(tcx: TyCtxt<'_>, unit: &Unit) -> Result<()> {
     let mut out = BufWriter::new(File::create(unit.dir.join(MANIFEST))?);
     writeln!(out, "{}", header(tcx, unit))?;
     let (mut seen, mut indirect) = (FxHashSet::default(), FxHashSet::default());
     for cgu in tcx.collect_and_partition_mono_items(()).codegen_units {
         for (item, data) in cgu.items() {
-            let MonoItem::Fn(instance) = *item else {
-                continue;
-            };
-            if seen.insert(instance) {
-                writeln!(out, "{}", record(tcx, instance, data, (cgu.name(), &mut indirect))?)?;
+            if let Some(line) = line(tcx, (*item, data), (cgu.name(), &mut seen, &mut indirect))? {
+                writeln!(out, "{line}")?;
             }
         }
     }
@@ -58,6 +55,15 @@ pub fn write(tcx: TyCtxt<'_>, unit: &Unit) -> Result<()> {
         crate::link::write_libraries(tcx, &unit.dir.join(LINK))?;
     }
     Ok(())
+}
+
+/// The manifest line of mono item `item` of unit `cgu`: a record for a function instance not yet seen, the facts of a static that holds state.
+fn line<'tcx>(tcx: TyCtxt<'tcx>, (item, data): (MonoItem<'tcx>, &MonoItemData), (cgu, seen, indirect): (Symbol, &mut FxHashSet<Instance<'tcx>>, &mut FxHashSet<ty::Ty<'tcx>>)) -> Result<Option<Value>> {
+    match item {
+        MonoItem::Fn(instance) if seen.insert(instance) => record(tcx, instance, data, (cgu, indirect)).map(Some),
+        MonoItem::Static(def_id) => Ok(crate::statics::facts(tcx, def_id)),
+        MonoItem::Fn(_) | MonoItem::GlobalAsm(_) => Ok(None),
+    }
 }
 
 fn header(tcx: TyCtxt<'_>, unit: &Unit) -> Value {
@@ -116,7 +122,9 @@ fn record<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, data: &MonoItemData
         "layouts": crate::layout::reached(tcx, &crossing),
         "inlined": uses::inlined(tcx, instance),
         "uses": used.symbols,
-        "state": used.state,
+        "statics": used.statics,
+        "calls": used.calls,
+        "held": used.held,
     }))
 }
 

@@ -18,3 +18,16 @@ pub fn normalize(path: &Path) -> Option<String> {
 pub fn crate_key(name: &str, sysroot: bool) -> String {
     if sysroot { format!("{name}{SYSROOT_MARK}") } else { name.to_string() }
 }
+
+/// What joins the key of a function to the name of a static its body declares.
+const NESTED: &str = "::";
+
+/// The key of a static named `name` that the body of the function keyed `parent` declares.
+pub fn nested(parent: &str, name: &str) -> String {
+    format!("{parent}{NESTED}{name}")
+}
+
+/// The key of the function and the name of the static its body declares that `key` names, when it names one.
+pub fn parent_of(key: &str) -> Option<(&str, &str)> {
+    key.rsplit_once(NESTED)
+}

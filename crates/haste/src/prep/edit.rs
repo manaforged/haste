@@ -13,8 +13,7 @@ use crate::outline::source::Source;
 use crate::outline::tree::File;
 
 use super::ident::identity;
-use super::key::{Place, clean};
-use super::source::normalize;
+use super::key::{Place, on_disk};
 
 const FUNCTION: &str = "fn";
 const ITEM: &str = "item";
@@ -63,10 +62,10 @@ impl Snapshot {
     /// Adds the named items of `file` and returns the text of functions whose identity is not unique, which joins the rest, with the byte ranges of the functions it holds apart.
     fn file(&mut self, outline: &Outline, (krate, index): (usize, usize), file: &File) -> (Vec<String>, Vec<std::ops::Range<usize>>) {
         let (text, mut doubled, mut cut) = (file.source.text.as_str(), Vec::new(), Vec::new());
-        let Some(name) = normalize(&file.source.path).filter(|_| clean(text)) else { return (vec![text.to_owned()], cut) };
+        let Some((name, read)) = on_disk(&file.source.path, text) else { return (vec![text.to_owned()], cut) };
         for at in 0..file.items.items.len() {
             let item = ItemRef { krate: krate as u32, file: index as u32, item: at as u32 };
-            let Some((path, lo)) = identity(outline, item).zip(name_offset(file, at)) else { continue };
+            let Some((path, lo)) = identity(outline, item).zip(name_offset(file, at).filter(|&lo| (lo as usize) < read)) else { continue };
             let place = Place { file: name.clone(), lo };
             if file.items.items[at].kind != ItemKind::Fn {
                 self.items.insert(path, place);

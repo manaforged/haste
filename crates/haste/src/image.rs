@@ -2,6 +2,7 @@
 
 mod expand;
 mod lazy;
+pub mod perf;
 mod script;
 mod stencil;
 mod stub;

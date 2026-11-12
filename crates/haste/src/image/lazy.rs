@@ -452,7 +452,9 @@ impl Jit {
         if index & (stub::TIER_UP_BIT as usize) != 0 {
             let real = index & !(stub::TIER_UP_BIT as usize);
             let item = self.reached.list[real].0.0;
-            return self.image.tier_up(real).map_err(|err| Stop::Failed(format!("{}: {err:#}", cx.name(item)), item));
+            let code = self.image.tier_up(real).map_err(|err| Stop::Failed(format!("{}: {err:#}", cx.name(item)), item))?;
+            super::perf::note(cx, &self.reached, (real, code), super::perf::Origin::Haste);
+            return Ok(code);
         }
         let mut journal = Journal::new();
         let answer = self.code(cx, index, &mut journal);
@@ -474,6 +476,8 @@ impl Jit {
             return Ok(code);
         }
         if let Some(code) = self.prepped(cx, index, journal) {
+            let origin = if crate::prep::bind(cx, &self.reached, index) == Some(code) { super::perf::Origin::Rustc } else { super::perf::Origin::Adapter };
+            super::perf::note(cx, &self.reached, (index, code), origin);
             self.image.slot(index).store(code, Ordering::Release);
             self.compiled.insert(index);
             return Ok(code);
@@ -482,6 +486,7 @@ impl Jit {
         while !self.compiled.contains(&index) {
             match self.image.compile_one(cx, &self.reached, index) {
                 Ok(code) => {
+                    super::perf::note(cx, &self.reached, (index, code), super::perf::Origin::Haste);
                     self.image.slot(index).store(code, Ordering::Release);
                     self.compiled.insert(index);
                     self.image.link();
