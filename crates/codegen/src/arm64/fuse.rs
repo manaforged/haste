@@ -19,12 +19,15 @@ pub(super) fn shift_parts(op: &Op, plan: &Plan<Reg>) -> Option<(Binary, Value, i
     }
 }
 
-fn preserved(func: &Function, plan: &Plan<Reg>, block_idx: usize, start: usize, end: usize, val: Value) -> bool {
+fn preserved(func: &Function, plan: &Plan<Reg>, block_idx: usize, start: usize, end: usize, skip_pos: Option<usize>, val: Value) -> bool {
     if start + 1 >= end || matches!(plan.location(val), Location::Imm(_) | Location::Slot | Location::SlotAddr(_) | Location::Frame(..)) {
         return true;
     }
     let Some(reg) = plan.reg_of(val) else { return false };
     for pos in start + 1..end {
+        if skip_pos == Some(pos) {
+            continue;
+        }
         let data = &func.insts[func.blocks[block_idx].insts[pos].index()];
         if data.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
             continue;
@@ -81,10 +84,8 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                             match func.insts[finst.index()].op {
                                 Op::Icmp(_, a, b)
                                     if func.ty(a) != Type::I128
-                                        && a != res
-                                        && b != res
-                                        && preserved(func, plan, b_idx, fpos, pos, a)
-                                        && preserved(func, plan, b_idx, fpos, pos, b) =>
+                                        && preserved(func, plan, b_idx, fpos, pos, None, a)
+                                        && preserved(func, plan, b_idx, fpos, pos, None, b) =>
                                 {
                                     plan.elided[flag_val.index()] = true;
                                     done = true;
@@ -100,10 +101,8 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                                             func.insts[iinst.index()].op,
                                             Op::Icmp(_, a, b)
                                                 if func.ty(a) != Type::I128
-                                                    && a != res
-                                                    && b != res
-                                                    && preserved(func, plan, b_idx, ipos, pos, a)
-                                                    && preserved(func, plan, b_idx, ipos, pos, b)
+                                                    && preserved(func, plan, b_idx, ipos, pos, Some(fpos), a)
+                                                    && preserved(func, plan, b_idx, ipos, pos, Some(fpos), b)
                                         ) =>
                                 {
                                     plan.elided[flag_val.index()] = true;
@@ -147,8 +146,8 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                                 }
                             }
                             if seen_uses == uses[res.index()]
-                                && preserved(func, plan, b_idx, pos, last_pos, base)
-                                && preserved(func, plan, b_idx, spos, last_pos, idx)
+                                && preserved(func, plan, b_idx, pos, last_pos, None, base)
+                                && preserved(func, plan, b_idx, spos, last_pos, None, idx)
                             {
                                 plan.sib[res.index()] = Some(Sib { base: SibBase::Value(base), index: idx, shift: shift as u8, disp: 0 });
                                 plan.elided[res.index()] = true;
@@ -173,7 +172,7 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                             && b != res
                             && (matches!(sop, Binary::Ishl | Binary::Ushr | Binary::Sshr)
                                 || (matches!(alu_op, Binary::Band | Binary::Bor | Binary::Bxor) && matches!(sop, Binary::Rotl | Binary::Rotr)))
-                            && preserved(func, plan, b_idx, spos, pos, b)
+                            && preserved(func, plan, b_idx, spos, pos, None, b)
                         {
                             plan.elided[shift_val.index()] = true;
                             break;

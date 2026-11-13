@@ -92,7 +92,16 @@ impl Image {
     }
 
     fn compile_buckets(&mut self, cx: &mut Context<'_>, reached: &Reached, buckets: &[Vec<usize>], (cfg, allow_singleton): Plan) -> Vec<(usize, String)> {
-        self.with_pass(|image, pass| buckets.iter().flat_map(|bucket| image.compile_bucket(cx, reached, bucket, cfg, (true, allow_singleton), pass)).collect())
+        self.with_pass(|image, pass| {
+            buckets
+                .iter()
+                .flat_map(|bucket| {
+                    let out = image.compile_bucket(cx, reached, bucket, cfg, (true, allow_singleton), pass);
+                    image.bodies.trim_transient();
+                    out
+                })
+                .collect()
+        })
     }
 
     fn compile_parallel(&mut self, cx: &mut Context<'_>, reached: &Reached, shards: &[Vec<Vec<usize>>], plan: Plan) -> Vec<(usize, String)> {
@@ -146,11 +155,13 @@ impl Image {
             let failed = self.compile_bucket(&mut cx, reached, bucket, cfg, (false, allow_singleton), &mut pass);
             if cx.take_deferred_evals().is_empty() {
                 errors.extend(failed);
+                self.bodies.trim_transient();
                 continue;
             }
             pass.records.truncate(mark);
             pass.frozen_stencils.truncate(frozen_mark);
             deferred.extend_from_slice(bucket);
+            self.bodies.trim_transient();
         }
         (pass, errors, deferred)
     }

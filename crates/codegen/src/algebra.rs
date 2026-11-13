@@ -325,14 +325,84 @@ fn fold_rodata_load(func: &Function, defs: &[Option<Inst>], ty: Type, addr: Valu
     Some(Op::Const(imm))
 }
 
+fn reassociate_add_sub(
+    func: &mut Function,
+    defs: &mut Vec<Option<Inst>>,
+    consts: &mut Vec<Option<i64>>,
+    out: &mut Vec<Inst>,
+    fits_used: &[bool],
+    is_sub: bool,
+    a: Value,
+    b: Value,
+) -> Option<Op> {
+    let ty = func.ty(a);
+    if !ty.is_small_int() {
+        return None;
+    }
+    if !is_sub {
+        for (lhs, c2_v) in [(a, b), (b, a)] {
+            let Some(c2) = consts.get(c2_v.index()).copied().flatten() else { continue };
+            if fits_used.get(lhs.index()).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(inner_inst) = defs.get(lhs.index()).copied().flatten() else { continue };
+            match func.insts[inner_inst.index()].op {
+                Op::Binary(Binary::Iadd, x, y) => {
+                    for (base, c1_v) in [(x, y), (y, x)] {
+                        if let Some(c1) = consts.get(c1_v.index()).copied().flatten() {
+                            let c = emit_op(func, defs, consts, out, ty, Op::Const(extend(c1.wrapping_add(c2), ty, true)));
+                            return Some(Op::Binary(Binary::Iadd, base, c));
+                        }
+                    }
+                }
+                Op::Binary(Binary::Isub, x, y) => {
+                    if let Some(c1) = consts.get(y.index()).copied().flatten() {
+                        let c = emit_op(func, defs, consts, out, ty, Op::Const(extend(c2.wrapping_sub(c1), ty, true)));
+                        return Some(Op::Binary(Binary::Iadd, x, c));
+                    }
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+    let c2 = consts.get(b.index()).copied().flatten()?;
+    if fits_used.get(a.index()).copied().unwrap_or(false) {
+        return None;
+    }
+    let inner_inst = defs.get(a.index()).copied().flatten()?;
+    match func.insts[inner_inst.index()].op {
+        Op::Binary(Binary::Iadd, x, y) => {
+            for (base, c1_v) in [(x, y), (y, x)] {
+                if let Some(c1) = consts.get(c1_v.index()).copied().flatten() {
+                    let c = emit_op(func, defs, consts, out, ty, Op::Const(extend(c1.wrapping_sub(c2), ty, true)));
+                    return Some(Op::Binary(Binary::Iadd, base, c));
+                }
+            }
+            None
+        }
+        Op::Binary(Binary::Isub, x, y) => {
+            let c1 = consts.get(y.index()).copied().flatten()?;
+            let c = emit_op(func, defs, consts, out, ty, Op::Const(extend(c1.wrapping_add(c2), ty, true)));
+            Some(Op::Binary(Binary::Isub, x, c))
+        }
+        _ => None,
+    }
+}
+
 /// Rewrites constant unsigned divisions/remainders, unsigned zero compares, negated shift-adds, and bitwise/SWAR masks.
 pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
     let mut defs = initial_defs.to_vec();
     let mut consts = vec![None; func.types.len()];
+    let mut fits_used = vec![false; func.types.len()];
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         let data = &func.insts[inst.index()];
         if let (Op::Const(imm), Some(res)) = (&data.op, data.result) {
             consts[res.index()] = Some(*imm);
+        }
+        if let Op::Fits(_, _, x, y) = data.op {
+            fits_used[x.index()] = true;
+            fits_used[y.index()] = true;
         }
     }
     for b in 0..func.blocks.len() {
@@ -354,12 +424,15 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
                     }).flatten();
                     swar_cmp.or_else(|| zero_compare(func, &mut defs, &mut consts, &mut out, cc, x, y))
                 }
-                Op::Binary(Binary::Iadd, a, b) => negated_shift_add(func, &defs, &consts, func.ty(a), a, b).map(|(base, idx, shift)| {
-                    let ty = func.ty(base);
-                    let k = emit_op(func, &mut defs, &mut consts, &mut out, ty, Op::Const(shift));
-                    let shl = emit_op(func, &mut defs, &mut consts, &mut out, ty, Op::Binary(Binary::Ishl, idx, k));
-                    Op::Binary(Binary::Isub, base, shl)
-                }),
+                Op::Binary(Binary::Iadd, a, b) => negated_shift_add(func, &defs, &consts, func.ty(a), a, b)
+                    .map(|(base, idx, shift)| {
+                        let ty = func.ty(base);
+                        let k = emit_op(func, &mut defs, &mut consts, &mut out, ty, Op::Const(shift));
+                        let shl = emit_op(func, &mut defs, &mut consts, &mut out, ty, Op::Binary(Binary::Ishl, idx, k));
+                        Op::Binary(Binary::Isub, base, shl)
+                    })
+                    .or_else(|| reassociate_add_sub(func, &mut defs, &mut consts, &mut out, &fits_used, false, a, b)),
+                Op::Binary(Binary::Isub, a, b) => reassociate_add_sub(func, &mut defs, &mut consts, &mut out, &fits_used, true, a, b),
                 Op::Binary(Binary::Band, a, b) => simplify_band(func, &mut defs, &mut consts, &mut out, a, b),
                 Op::Binary(Binary::Bxor, a, b) => simplify_bxor(func, &mut defs, &mut consts, &mut out, a, b),
                 Op::Binary(Binary::Ushr, ctz_val, sh) if func.ty(ctz_val) == Type::I64 && consts.get(sh.index()).copied().flatten() == Some(3) => {

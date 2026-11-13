@@ -122,6 +122,7 @@ fn hoist(
     home: &mut [Option<Block>],
 ) {
     let mut writes = false;
+    let mut unknown_mem_writes = false;
     let mut calls = false;
     let mut written_slots = vec![false; func.slots.len()];
     for inst in (0..each.body.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts) {
@@ -134,14 +135,20 @@ fn hoist(
         }
         match op {
             Op::StackStore(_, slot, _) => written_slots[slot.index()] = true,
-            Op::Store(_, addr, _) | Op::Move(addr, _, _) => {
+            Op::Store(_, addr, _) | Op::Move(addr, _, _) | Op::Copy(addr, _, _) => {
                 if let Some((slot, _)) = slot_addrs.get(addr.index()).copied().flatten() {
                     written_slots[slot.index()] = true;
+                } else {
+                    unknown_mem_writes = true;
                 }
             }
+            _ if clobbers(op) => unknown_mem_writes = true,
             _ => {}
         }
     }
+    let slot_ok = |slot: StackSlot, head: bool| {
+        (slot_ro.get(slot.index()).copied().unwrap_or(false) || (!calls && !unknown_mem_writes && head)) && !written_slots[slot.index()]
+    };
     let mut moved: Vec<Inst> = Vec::new();
     for block in (0..each.body.len()).filter(|block| each.body[*block]) {
         let head = block == each.head.index();
@@ -158,16 +165,14 @@ fn hoist(
             let load_ok = match (&data.op, data.result) {
                 (&Op::StackLoad(slot, offset), Some(res)) => {
                     let width = u64::from(func.ty(res).bytes());
-                    slot_ro.get(slot.index()).copied().unwrap_or(false)
-                        && !written_slots[slot.index()]
+                    slot_ok(slot, head)
                         && offset >= 0
                         && (offset as u64).checked_add(width).is_some_and(|end| end <= u64::from(func.slots[slot.index()].size))
                 }
                 (&Op::Load(addr, offset), Some(res)) => {
                     let width = func.ty(res).bytes();
                     let slot_load_ok = slot_addrs.get(addr.index()).copied().flatten().is_some_and(|(slot, base_off)| {
-                        slot_ro.get(slot.index()).copied().unwrap_or(false)
-                            && !written_slots[slot.index()]
+                        slot_ok(slot, head)
                             && i64::from(base_off).checked_add(i64::from(offset)).is_some_and(|total| {
                                 total >= 0
                                     && (total as u64)

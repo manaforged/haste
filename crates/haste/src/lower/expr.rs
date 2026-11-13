@@ -121,7 +121,7 @@ fn inline_limit_at(cx: &mut Context<'_>, reached: &Reached, index: usize, devirt
         Hint::Never => None,
         Hint::Always => Some(budget.always),
         Hint::Inline => {
-            let max_exprs = if release || env.release { 2500 } else { 200 };
+            let max_exprs = if release || env.release { 800 } else { 200 };
             cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(insts)
         }
         Hint::Default => {

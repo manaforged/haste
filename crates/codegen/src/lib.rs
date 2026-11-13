@@ -30,6 +30,7 @@ mod switch;
 mod tailrec;
 mod target;
 mod thread;
+mod unroll;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
 macro_rules! value_op {
@@ -142,6 +143,10 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
         fold::run(func, effort);
         merge::run(func);
     }
+    if effort == Effort::Full && unroll::run(func) {
+        fold::run(func, effort);
+        merge::run(func);
+    }
     cse::run(func);
     if effort == Effort::Full {
         thread::run(func);
@@ -152,6 +157,10 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
         thread::run(func);
         fold::run(func, effort);
         merge::run(func);
+        if unroll::run(func) {
+            fold::run(func, effort);
+            merge::run(func);
+        }
         for _ in 0..2 {
             if !promote::step(func, kind) {
                 break;
