@@ -89,3 +89,16 @@ pub(crate) fn dominated(func: &Function, entry: Block) -> Vec<Vec<Block>> {
     }
     children
 }
+
+/// Whether `ancestor` dominates `block`, walking up `idom`.
+pub(crate) fn dominates(idom: &[Option<Block>], ancestor: Block, mut block: Block) -> bool {
+    loop {
+        if block == ancestor {
+            return true;
+        }
+        match idom[block.index()] {
+            Some(parent) if parent != block => block = parent,
+            _ => return false,
+        }
+    }
+}

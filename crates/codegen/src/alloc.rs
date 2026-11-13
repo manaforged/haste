@@ -627,6 +627,14 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     }
     let (float_homes, used_floats) = allocate(func, &live, &float_class(regs, params, passed_floats), &floats, &hints);
     place(&mut locations, float_homes, Location::Float);
+    for data in &func.insts {
+        if let (Op::Const(0), Some(res)) = (&data.op, data.result)
+            && func.ty(res) == Type::V128
+            && matches!(locations[res.index()], Location::Slot)
+        {
+            locations[res.index()] = Location::Imm(0);
+        }
+    }
     let parked = if park.is_some() { parked(func, &live, &locations, (regs.saved, regs.saved_float), classify) } else { Vec::new() };
     let mut homed = vec![false; if parked.is_empty() { 0 } else { count }];
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);

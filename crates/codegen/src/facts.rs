@@ -1,3 +1,4 @@
+use crate::dom::dominates;
 use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
@@ -633,21 +634,6 @@ pub(crate) fn single_preds(func: &Function) -> Vec<Option<Block>> {
         single[entry.index()] = Some(None);
     }
     single.into_iter().map(Option::flatten).collect()
-}
-
-fn dominates(idom: &[Option<Block>], dom: Block, mut node: Block) -> bool {
-    loop {
-        if node == dom {
-            return true;
-        }
-        let Some(parent) = idom[node.index()] else {
-            return false;
-        };
-        if parent == node {
-            return false;
-        }
-        node = parent;
-    }
 }
 
 /// Settles the compares, traps and branches that the facts on entry to each block and its earlier instructions decide: a settled compare's result becomes a constant in `consts`, a trap that cannot fire goes, and a settled branch becomes a jump. A block's facts on entry are its only predecessor's facts on exit plus that edge's branch. Returns whether anything changed.

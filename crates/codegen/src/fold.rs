@@ -309,11 +309,22 @@ impl Fold {
             return Some(x);
         }
         if op == Binary::Band {
-            if self.boolean(func, x) && self.known(y).is_some_and(|imm| imm & 1 == 1) {
-                return Some(x);
-            }
-            if self.boolean(func, y) && self.known(x).is_some_and(|imm| imm & 1 == 1) {
-                return Some(y);
+            for (val, other) in [(x, y), (y, x)] {
+                if self.boolean(func, val) && self.known(other).is_some_and(|imm| imm & 1 == 1) {
+                    return Some(val);
+                }
+                if let (Some(&Op::Binary(Binary::Ushr, _, s)), Some(mask)) = (self.def(func, val), self.known(other))
+                    && let Some(shift) = self.known(s)
+                {
+                    let bits = ty.bits();
+                    let count = (shift as u32) & (bits - 1);
+                    if count > 0 {
+                        let max_bits = ((1_u128 << (bits - count)) - 1) as u64;
+                        if (extend(mask, ty, false) as u64) & max_bits == max_bits {
+                            return Some(val);
+                        }
+                    }
+                }
             }
         }
         None
@@ -710,6 +721,7 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
             let replacement = match func.insts[inst.index()].op {
                 Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
                 Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
+                Op::Splat(x) if fold.known(x).is_some_and(|imm| (imm as u8) == 0) => Some(Op::Const(0)),
                 _ => func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const),
             };
             if let Some(op) = replacement {

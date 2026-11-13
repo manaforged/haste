@@ -217,9 +217,17 @@ impl Emit<'_> {
             self.put_high(result, A);
             return;
         }
-        let (left, right) = (self.bits(x, A), self.bits(y, D));
         let dst = self.dst(result);
-        self.asm.csel(cond, dst, left, right);
+        let const_val = |v: Value| self.plan.const_of(v).map(|imm| crate::fold::extend(imm, ty, false));
+        match (const_val(x), const_val(y)) {
+            (Some(1), Some(0)) => self.asm.cset(cond, dst),
+            (Some(0), Some(1)) => self.asm.cset(cond.invert(), dst),
+            (kx, ky) => {
+                let left = if kx == Some(0) { ZR } else { self.bits(x, A) };
+                let right = if ky == Some(0) { ZR } else { self.bits(y, D) };
+                self.asm.csel(cond, dst, left, right);
+            }
+        }
         self.put(result, dst);
     }
 

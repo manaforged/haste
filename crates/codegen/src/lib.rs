@@ -135,12 +135,7 @@ pub fn simplify(func: &mut Function, effort: Effort) {
     fold::compact(func);
 }
 
-fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
-    fill::run(func);
-    fold::run(func, effort);
-    merge::run(func);
-    let kind = if effort == Effort::Full { moves } else { promote::Moves::Words };
-    let rounds = if effort == Effort::Full { 4 } else { 2 };
+fn promote_rounds(func: &mut Function, kind: promote::Moves, effort: Effort, rounds: usize) {
     for _ in 0..rounds {
         if !promote::step(func, kind) {
             break;
@@ -148,6 +143,14 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
         fold::run(func, effort);
         merge::run(func);
     }
+}
+
+fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
+    fill::run(func);
+    fold::run(func, effort);
+    merge::run(func);
+    let kind = if effort == Effort::Full { moves } else { promote::Moves::Words };
+    promote_rounds(func, kind, effort, if effort == Effort::Full { 4 } else { 2 });
     if effort == Effort::Full && unroll::run(func) {
         fold::run(func, effort);
         merge::run(func);
@@ -166,13 +169,7 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
             fold::run(func, effort);
             merge::run(func);
         }
-        for _ in 0..2 {
-            if !promote::step(func, kind) {
-                break;
-            }
-            fold::run(func, effort);
-            merge::run(func);
-        }
+        promote_rounds(func, kind, effort, 2);
         cse::run(func);
         licm::run(func);
         loads::run(func);
@@ -182,13 +179,7 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
             fold::run(func, effort);
             merge::run(func);
             loads::run(func);
-            for _ in 0..2 {
-                if !promote::step(func, kind) {
-                    break;
-                }
-                fold::run(func, effort);
-                merge::run(func);
-            }
+            promote_rounds(func, kind, effort, 2);
         }
         cse::run(func);
         switch::run(func);

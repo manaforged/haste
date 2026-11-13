@@ -31,7 +31,7 @@ impl Emit<'_> {
         self.asm.sse(prefix, &[0x0F, 0x2E], a.0, b);
     }
 
-    fn zero_xmm(&mut self, xmm: Xmm) {
+    pub(super) fn zero_xmm(&mut self, xmm: Xmm) {
         self.asm.sse(&[0x66], &[0x0F, 0x57], xmm.0, xmm);
     }
 

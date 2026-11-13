@@ -381,6 +381,28 @@ impl Op {
         matches!(self, Op::TryCall { .. } | Op::Jump(..) | Op::Brif(..) | Op::BrTable(..) | Op::Return(_) | Op::Trap)
     }
 
+    /// Whether this instruction computes its result from its operands alone, cannot trap, and may run speculatively.
+    pub(crate) fn is_speculable(&self) -> bool {
+        match self {
+            Op::Binary(bin, ..) => !matches!(bin, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem),
+            Op::Const(_)
+            | Op::SlotAddr(_)
+            | Op::Symbol(_)
+            | Op::StackAddr(..)
+            | Op::Unary(..)
+            | Op::Convert(..)
+            | Op::Icmp(..)
+            | Op::Fits(..)
+            | Op::Fcmp(..)
+            | Op::ByteCmp(..)
+            | Op::Splat(_)
+            | Op::Movemask(_)
+            | Op::Vector(..)
+            | Op::Select(..) => true,
+            _ => false,
+        }
+    }
+
     /// Every block this instruction can go to.
     pub(crate) fn targets(&self) -> impl Iterator<Item = Block> + '_ {
         let (first, second, slice) = match self {

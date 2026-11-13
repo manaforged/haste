@@ -1,28 +1,7 @@
-use crate::ir::{Binary, Block, Function, Inst, InstData, Op, Type, Value};
-use crate::merge::pred_counts;
+use crate::ir::{Block, Function, Inst, InstData, Op, Type, Value};
 
 fn scalar_select(ty: Type) -> bool {
     matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64)
-}
-
-fn speculable(op: &Op) -> bool {
-    match op {
-        Op::Binary(bin, ..) => !matches!(bin, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem),
-        Op::Const(_)
-        | Op::SlotAddr(_)
-        | Op::Symbol(_)
-        | Op::StackAddr(..)
-        | Op::Unary(..)
-        | Op::Convert(..)
-        | Op::Icmp(..)
-        | Op::Fits(..)
-        | Op::Fcmp(..)
-        | Op::Select(..)
-        | Op::ByteCmp(..)
-        | Op::Splat(_)
-        | Op::Movemask(_) => true,
-        _ => false,
-    }
 }
 
 fn pure_arm(func: &Function, block: Block, join: Block) -> Option<Vec<Value>> {
@@ -34,7 +13,7 @@ fn pure_arm(func: &Function, block: Block, join: Block) -> Option<Vec<Value>> {
     let Op::Jump(target, args) = &func.insts[last.index()].op else {
         return None;
     };
-    if *target != join || !body.iter().all(|inst| speculable(&func.insts[inst.index()].op)) {
+    if *target != join || !body.iter().all(|inst| func.insts[inst.index()].op.is_speculable()) {
         return None;
     }
     Some(args.clone())
@@ -130,7 +109,7 @@ pub(crate) fn run(func: &mut Function) {
     if func.entry.is_none() || func.coroutine.is_some() {
         return;
     }
-    let mut preds = pred_counts(func);
+    let mut preds = func.pred_counts();
     loop {
         let mut changed = false;
         for index in 0..func.blocks.len() {

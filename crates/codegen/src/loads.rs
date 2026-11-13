@@ -1,7 +1,7 @@
 //! Reuses what memory holds along straight-line code: a load of the bytes an earlier load or store on the same path read or wrote, with no write of unknown reach between them, takes that value.
 
 use crate::ir::{Binary, Block, Function, Inst, Op, StackSlot, Type, Value};
-use crate::merge::{find, identity, pred_counts, rename};
+use crate::merge::{find, identity, rename};
 
 /// The most cells one path remembers, so a long block costs linear time.
 const CELLS: usize = 256;
@@ -633,7 +633,7 @@ pub(crate) fn run(func: &mut Function) {
         return;
     }
     eliminate_affine_block_params(func);
-    let preds = pred_counts(func);
+    let preds = func.pred_counts();
     let slots = slot_addresses(func);
     let affine = affine_table(func);
     fold_affine_mem(func, &slots, &affine);

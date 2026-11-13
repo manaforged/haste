@@ -1,7 +1,7 @@
 //! Moves out of each loop what every trip computes alike: pure instructions that cannot trap and whose operands the loop does not change, and loads at the head of a loop that writes no memory.
 
-use crate::dom::dominators;
-use crate::ir::{Binary, Block, BlockData, Function, Inst, Op, StackSlot, Value};
+use crate::dom::{dominates, dominators};
+use crate::ir::{Block, BlockData, Function, Inst, Op, StackSlot, Value};
 use crate::loads::{classify_slots, clobbers, slot_addresses};
 
 /// One natural loop: its head, the blocks of its body including the head, and the one block outside it that enters the head by a jump, when there is one.
@@ -10,28 +10,6 @@ struct Loop {
     body: Vec<bool>,
     size: usize,
     entry: Option<Block>,
-}
-
-/// Whether `op` computes its result from its operands alone, cannot trap, and may run on a path that did not run it.
-fn speculable(op: &Op) -> bool {
-    match op {
-        Op::Binary(op, ..) => !matches!(op, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem),
-        Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Unary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Select(..) | Op::StackAddr(..) => true,
-        _ => false,
-    }
-}
-
-/// Whether `ancestor` dominates `block`, by walking up `idom`.
-fn dominates(idom: &[Option<Block>], ancestor: Block, mut block: Block) -> bool {
-    loop {
-        if block == ancestor {
-            return true;
-        }
-        match idom[block.index()] {
-            Some(parent) if parent != block => block = parent,
-            _ => return false,
-        }
-    }
 }
 
 /// The natural loop that the back edges from `latches` into `head` close.
@@ -210,7 +188,7 @@ fn hoist(
                 }
                 _ => false,
             };
-            let movable = (speculable(&data.op) && !(calls && static_loc)) || load_ok;
+            let movable = (data.op.is_speculable() && !(calls && static_loc)) || load_ok;
             let invariant = |value: Value| home.get(value.index()).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false));
             let mut operands_invariant = true;
             data.op.for_operands(|value| operands_invariant &= invariant(value));

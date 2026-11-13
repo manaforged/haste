@@ -169,6 +169,7 @@ impl Emit<'_> {
         match self.plan.location(value) {
             Location::Float(from) if ty == Type::V128 => self.asm.vmov(reg, Vreg(from)),
             Location::Float(from) => self.asm.fmov_reg(ty == Type::F64, reg, Vreg(from)),
+            Location::Imm(0) if ty == Type::V128 => self.asm.veor_zero(reg),
             Location::Slot => self.asm.vload(ty.bytes(), reg, self.at(value)),
             _ => {
                 self.raw(D, value);
@@ -222,6 +223,10 @@ impl Emit<'_> {
 
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
         match self.plan.location(value) {
+            Location::Imm(0) if self.ty(value) == Type::V128 => {
+                self.asm.store(Size::X, to, super::ZR);
+                self.asm.store(Size::X, to.offset(8), super::ZR);
+            }
             Location::Imm(0) => self.asm.store(Size::X, to, super::ZR),
             Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) => {
                 self.raw(IP, value);
