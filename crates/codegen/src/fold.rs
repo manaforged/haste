@@ -200,7 +200,11 @@ impl Fold {
 
     /// Whether `value` is 0 or 1 in its low byte because a comparison or overflow check defines it.
     fn boolean(&self, func: &Function, value: Value) -> bool {
-        matches!(self.def(func, value), Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..)))
+        match self.def(func, value) {
+            Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..)) => true,
+            Some(Op::Convert(Convert::Uextend, inner)) => matches!(self.def(func, *inner), Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..))),
+            _ => false,
+        }
     }
 
     /// Whether `x` and `y` of type `ty` hold the same bits at that width.
@@ -212,7 +216,7 @@ impl Fold {
     fn identity(&self, func: &Function, op: &Op) -> Option<Value> {
         match *op {
             Op::Select(condition, x, y) => self.known(condition).map(|known| if known != 0 { x } else { y }),
-            Op::Binary(kind, x, y) if func.ty(x).is_small_int() => self.neutral(kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
+            Op::Binary(kind, x, y) if func.ty(x).is_small_int() => self.neutral(func, kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
             Op::Unary(kind @ (Unary::Ineg | Unary::Bnot), x) => match *self.def(func, x)? {
                 Op::Unary(inner, value) if inner == kind => Some(value),
                 _ => None,
@@ -226,7 +230,7 @@ impl Fold {
     }
 
     /// `x` when `y` is the unit of `op` at type `ty` or a shift count that masks to zero, or `y` when `x` is the unit of a commuting `op`.
-    fn neutral(&self, op: Binary, ty: Type, x: Value, y: Value) -> Option<Value> {
+    fn neutral(&self, func: &Function, op: Binary, ty: Type, x: Value, y: Value) -> Option<Value> {
         let is = |value: Value, want: i64| self.known(value).is_some_and(|imm| extend(imm, ty, false) == extend(want, ty, false));
         if let Some(unit) = unit(op) {
             if is(y, unit) {
@@ -235,7 +239,18 @@ impl Fold {
             return (op != Binary::Isub && is(x, unit)).then_some(y);
         }
         let shift = matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr);
-        (shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0)).then_some(x)
+        if shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0) {
+            return Some(x);
+        }
+        if op == Binary::Band {
+            if self.boolean(func, x) && self.known(y).is_some_and(|imm| imm & 1 == 1) {
+                return Some(x);
+            }
+            if self.boolean(func, y) && self.known(x).is_some_and(|imm| imm & 1 == 1) {
+                return Some(y);
+            }
+        }
+        None
     }
 
     /// `a` when `x ^ y` is `(a ^ c) ^ c` in either order of either xor.
@@ -594,6 +609,39 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
         prune(func, entry);
         dead(func);
     }
+    if devirt_vtables(func, &fold.defs) {
+        dead(func);
+    }
+}
+
+fn devirt_vtables(func: &mut Function, defs: &[Option<Inst>]) -> bool {
+    if func.vtable_slots.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for b in 0..func.blocks.len() {
+        let mut i = 0;
+        while i < func.blocks[b].insts.len() {
+            let inst = func.blocks[b].insts[i];
+            if let (Op::Load(addr, off), Some(res)) = (func.insts[inst.index()].op.clone(), func.insts[inst.index()].result)
+                && func.ty(res) == Type::I64
+                && let Some(def_inst) = defs.get(addr.index()).copied().flatten()
+                && let Op::Symbol(vt_sym) = func.insts[def_inst.index()].op
+                && let Some(&(_, _, slot_sym, low)) = func.vtable_slots.iter().find(|&&(v, o, _, _)| v == vt_sym && o == off)
+            {
+                let slot_val = func.value(Type::I64);
+                let slot_op = if low { Op::SlotAddr(slot_sym) } else { Op::Symbol(slot_sym) };
+                let slot_inst = func.add(slot_op, Some(slot_val));
+                func.blocks[b].insts.insert(i, slot_inst);
+                func.insts[inst.index()].op = Op::Load(slot_val, 0);
+                changed = true;
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    changed
 }
 
 fn is_float_two(func: &Function, defs: &[Option<Inst>], value: Value) -> bool {
@@ -620,12 +668,22 @@ fn negated(op: &Op, consts: &[Option<i64>]) -> Option<Value> {
 /// Rewrites a negation of a compare, `x ^ 1`, `x == 0` or `x != 1`, as the inverse compare, so a negated condition branches on the flags, and a branch on `x == 0` or `x != 0` as a branch on `x`.
 fn invert(func: &mut Function) {
     let count = func.types.len();
-    let (mut compares, mut consts) = (vec![None; count], vec![None; count]);
+    let (mut compares, mut consts, mut xors, mut bools) = (vec![None; count], vec![None; count], vec![None; count], vec![false; count]);
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         let data = &func.insts[inst.index()];
         match (&data.op, data.result) {
-            (&Op::Icmp(cc, x, y), Some(result)) => compares[result.index()] = Some((cc, x, y)),
+            (&Op::Icmp(cc, x, y), Some(result)) => {
+                compares[result.index()] = Some((cc, x, y));
+                bools[result.index()] = true;
+            }
+            (&Op::Fcmp(..) | &Op::Fits(..), Some(result)) => bools[result.index()] = true,
             (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
+            (&Op::Binary(Binary::Bxor, x, y), Some(result)) => xors[result.index()] = Some((x, y)),
+            (&Op::Binary(Binary::Band, x, y), Some(result)) => {
+                if consts[x.index()] == Some(1) || consts[y.index()] == Some(1) {
+                    bools[result.index()] = true;
+                }
+            }
             _ => {}
         }
     }
@@ -637,6 +695,21 @@ fn invert(func: &mut Function) {
             continue;
         }
         let Op::Brif(condition, then, then_args, otherwise, else_args) = op else { continue };
+        if let Some((x, y)) = xors[condition.index()] {
+            let inner = if consts[y.index()] == Some(1) {
+                Some(x)
+            } else if consts[x.index()] == Some(1) {
+                Some(y)
+            } else {
+                None
+            };
+            if let Some(inner) = inner.filter(|v| bools[v.index()]) {
+                *condition = inner;
+                std::mem::swap(then, otherwise);
+                std::mem::swap(then_args, else_args);
+                continue;
+            }
+        }
         let Some((cc, x, y)) = compares[condition.index()] else { continue };
         if consts[y.index()] != Some(0) || !types[x.index()].is_small_int() {
             continue;

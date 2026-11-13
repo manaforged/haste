@@ -11,7 +11,8 @@ use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset};
-use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, Op, SigRef, Type, Value};
+use crate::live::{Sib, SibBase};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{Os, Target};
@@ -47,7 +48,9 @@ const REGS: Regs<Reg> = Regs {
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
-    let Prepared { order, copied, abi, plan, frame, framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
+    let Prepared { order, copied, abi, mut plan, frame, framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
+    let defs = crate::fold::defs(func);
+    fuse(func, &mut plan);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let emit = Emit {
@@ -61,6 +64,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         sites: Vec::new(),
         relocs: Vec::new(),
         plan,
+        defs,
         flags: None,
         next: None,
         copied,
@@ -68,6 +72,158 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         sp_bias: 0,
     };
     drive(emit, &order)
+}
+
+fn preserved(func: &Function, plan: &Plan<Reg>, block_idx: usize, start: usize, end: usize, val: Value) -> bool {
+    if start + 1 == end || matches!(plan.location(val), Location::Imm(_) | Location::SlotAddr(_) | Location::Frame(..)) {
+        return true;
+    }
+    let Some(reg) = plan.reg_of(val) else { return false };
+    for pos in start + 1..end {
+        let data = &func.insts[func.blocks[block_idx].insts[pos].index()];
+        if data.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
+            continue;
+        }
+        let pair_clobber = data.result.and_then(|r| plan.pairs[r.index()]).is_some_and(|sum| plan.reg_of(sum) == Some(reg));
+        if matches!(data.op, Op::Call { .. } | Op::TryCall { .. }) || pair_clobber || data.result.is_some_and(|r| plan.reg_of(r) == Some(reg)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn fuse(func: &Function, plan: &mut Plan<Reg>) {
+    let mut uses = vec![0_u32; func.types.len()];
+    let mut pos_of = vec![None; func.types.len()];
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            data.op.for_operands(|v| uses[v.index()] += 1);
+            if let Some(res) = data.result {
+                pos_of[res.index()] = Some((b_idx, pos, inst));
+            }
+        }
+    }
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            if plan.elided[res.index()] {
+                continue;
+            }
+            if let Op::Icmp(_, a, _) = data.op
+                && func.ty(a) != Type::I128
+                && (1..=2).contains(&uses[res.index()])
+                && (1..=uses[res.index()] as usize).all(|k| {
+                    block.insts.get(pos + k).is_some_and(|&ni| matches!(func.insts[ni.index()].op, Op::Select(c, x, y) if c == res && x != res && y != res))
+                })
+            {
+                plan.elided[res.index()] = true;
+                continue;
+            }
+            if let Op::Binary(alu_op @ (Binary::Band | Binary::Bor | Binary::Bxor | Binary::Iadd | Binary::Isub), x, y) = data.op
+                && matches!(func.ty(res), Type::I32 | Type::I64)
+            {
+                let mut done = false;
+                if alu_op == Binary::Iadd {
+                    for flag_val in [y, x] {
+                        if uses[flag_val.index()] == 1
+                            && !plan.elided[flag_val.index()]
+                            && let Some((fb, fpos, finst)) = pos_of[flag_val.index()]
+                            && fb == b_idx
+                            && fpos + 1 == pos
+                        {
+                            match func.insts[finst.index()].op {
+                                Op::Icmp(_, a, _) if func.ty(a) != Type::I128 => {
+                                    plan.elided[flag_val.index()] = true;
+                                    done = true;
+                                    break;
+                                }
+                                Op::Convert(Convert::Uextend, inner)
+                                    if uses[inner.index()] == 1
+                                        && !plan.elided[inner.index()]
+                                        && let Some((ib, ipos, iinst)) = pos_of[inner.index()]
+                                        && ib == b_idx
+                                        && ipos + 1 == fpos
+                                        && matches!(func.insts[iinst.index()].op, Op::Icmp(_, a, _) if func.ty(a) != Type::I128) =>
+                                {
+                                    plan.elided[flag_val.index()] = true;
+                                    plan.elided[inner.index()] = true;
+                                    done = true;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if !done {
+                    let candidates = if alu_op == Binary::Isub { [Some(y), None] } else { [Some(y), Some(x)] };
+                    for shift_val in candidates.into_iter().flatten() {
+                        if uses[shift_val.index()] == 1
+                            && !plan.elided[shift_val.index()]
+                            && let Some((sb, spos, sinst)) = pos_of[shift_val.index()]
+                            && sb == b_idx
+                            && spos < pos
+                            && let Op::Binary(sop, b, c) = func.insts[sinst.index()].op
+                            && plan.const_of(c).is_some()
+                            && (matches!(sop, Binary::Ishl | Binary::Ushr | Binary::Sshr)
+                                || (matches!(alu_op, Binary::Band | Binary::Bor | Binary::Bxor) && matches!(sop, Binary::Rotl | Binary::Rotr)))
+                            && preserved(func, plan, b_idx, spos, pos, b)
+                        {
+                            plan.elided[shift_val.index()] = true;
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+                if !done && alu_op == Binary::Iadd && plan.sib[res.index()].is_none() && uses[res.index()] >= 2 {
+                    for (base, shl) in [(x, y), (y, x)] {
+                        if uses[shl.index()] == 1
+                            && !plan.elided[shl.index()]
+                            && let Some((sb, spos, sinst)) = pos_of[shl.index()]
+                            && sb == b_idx
+                            && spos < pos
+                            && let Op::Binary(Binary::Ishl, idx, c) = func.insts[sinst.index()].op
+                            && let Some(shift) = plan.const_of(c).filter(|&s| (1..=3).contains(&s))
+                            && plan.reg_of(base).is_some()
+                            && plan.reg_of(idx).is_some()
+                        {
+                            let mut seen_uses = 0_u32;
+                            let mut last_pos = pos;
+                            for (u_pos, &u_inst) in block.insts.iter().enumerate().skip(pos + 1) {
+                                let u_data = &func.insts[u_inst.index()];
+                                let ok = match (&u_data.op, u_data.result) {
+                                    (&Op::Load(addr, 0), Some(r)) if addr == res => {
+                                        let ty = func.ty(r);
+                                        ty != Type::I128 && ty.bytes() == (1 << shift)
+                                    }
+                                    (&Op::Store(val, addr, 0), _) if addr == res && val != res => {
+                                        let ty = func.ty(val);
+                                        ty != Type::I128 && ty.bytes() == (1 << shift)
+                                    }
+                                    _ => false,
+                                };
+                                if ok {
+                                    seen_uses += 1;
+                                    last_pos = u_pos;
+                                }
+                            }
+                            if seen_uses == uses[res.index()]
+                                && preserved(func, plan, b_idx, pos, last_pos, base)
+                                && preserved(func, plan, b_idx, spos, last_pos, idx)
+                            {
+                                plan.sib[res.index()] = Some(Sib { base: SibBase::Value(base), index: idx, shift: shift as u8, disp: 0 });
+                                plan.elided[res.index()] = true;
+                                plan.elided[shl.index()] = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -109,6 +265,7 @@ pub(super) struct Emit<'a> {
     sites: Vec<Site>,
     relocs: Vec<StencilReloc>,
     plan: Plan<Reg>,
+    defs: Vec<Option<Inst>>,
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
     copied: Vec<bool>,
@@ -173,6 +330,9 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn inst(&mut self, inst: Inst) -> Result<(), String> {
         let func = self.func;
         let data = &func.insts[inst.index()];
+        if !matches!(data.op, Op::Brif(..) | Op::Trapz(..) | Op::Select(..)) {
+            self.flags = None;
+        }
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
         match &data.op {
@@ -298,6 +458,19 @@ impl Emit<'_> {
         Ok(())
     }
 
+    fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {
+        if let Some((value, cond)) = self.flags.take()
+            && value == condition
+        {
+            self.asm.bcond(if invert { cond.invert() } else { cond }, label);
+            return;
+        }
+        let bytes = self.ty(condition).bytes();
+        let reg = if bytes >= 4 { self.bits(condition, A) } else { self.src(condition, A, Ext::Zero) };
+        let size = if bytes >= 8 { Size::X } else { Size::W };
+        self.asm.cbz(!invert, size, reg, label);
+    }
+
     fn brif(&mut self, condition: Value, then: (Block, &[Value]), otherwise: (Block, &[Value])) -> Result<(), String> {
         if let Some(known) = self.plan.const_of(condition) {
             let (block, args) = if crate::fold::extend(known, self.ty(condition), false) != 0 { then } else { otherwise };
@@ -305,26 +478,25 @@ impl Emit<'_> {
             self.goto(block, true);
             return Ok(());
         }
-        let cond = self.truth(condition);
         let (then_moves, else_moves) = (
             self.plan.moves(self.func, &self.frame, then.0, then.1),
             self.plan.moves(self.func, &self.frame, otherwise.0, otherwise.1),
         );
         let falls = self.next.is_some_and(|next| next == then.0 || next == self.func.jump_target(then.0));
         if !else_moves && (then_moves || falls) {
-            self.asm.bcond(cond.invert(), self.blocks[self.func.jump_target(otherwise.0).index()]);
+            self.branch_cond(condition, true, self.blocks[self.func.jump_target(otherwise.0).index()]);
             self.edge(then.0, then.1)?;
             self.goto(then.0, true);
             return Ok(());
         }
         if !then_moves {
-            self.asm.bcond(cond, self.blocks[self.func.jump_target(then.0).index()]);
+            self.branch_cond(condition, false, self.blocks[self.func.jump_target(then.0).index()]);
             self.edge(otherwise.0, otherwise.1)?;
             self.goto(otherwise.0, true);
             return Ok(());
         }
         let other = self.asm.label();
-        self.asm.bcond(cond.invert(), other);
+        self.branch_cond(condition, true, other);
         self.edge(then.0, then.1)?;
         self.goto(then.0, false);
         self.asm.bind(other);

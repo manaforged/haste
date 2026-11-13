@@ -14,6 +14,7 @@ mod fold;
 mod facts;
 mod fill;
 mod frame;
+mod ifconv;
 mod licm;
 mod live;
 mod loads;
@@ -139,6 +140,8 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
     }
     cse::run(func);
     if effort == Effort::Full {
+        ifconv::run(func);
+        merge::run(func);
         loads::run(func);
         fold::run(func, effort);
         merge::run(func);

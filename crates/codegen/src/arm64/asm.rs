@@ -30,6 +30,59 @@ impl Mem {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Shift {
+    Lsl = 0,
+    Lsr = 1,
+    Asr = 2,
+    Ror = 3,
+}
+
+pub(super) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32)> {
+    let w = if is_64 {
+        val
+    } else {
+        let low = (val as u32) as u64;
+        low | (low << 32)
+    };
+    if w == 0 || w == u64::MAX {
+        return None;
+    }
+    let mut esize = 64u32;
+    while esize > 2 && w == w.rotate_right(esize / 2) {
+        esize /= 2;
+    }
+    let mask = if esize == 64 { u64::MAX } else { (1u64 << esize) - 1 };
+    let elem = w & mask;
+    let ones = elem.count_ones();
+    if ones == 0 || ones == esize {
+        return None;
+    }
+    let tz = elem.trailing_zeros();
+    let immr = if tz > 0 {
+        (esize - tz) & (esize - 1)
+    } else {
+        let trailing_ones = (!elem & mask).trailing_zeros();
+        ones - trailing_ones
+    };
+    let n = u32::from(esize == 64);
+    let imms = ((!(esize - 1) << 1) | (ones - 1)) & 0x3F;
+    let pat = (1u64 << ones) - 1;
+    let rotated = if esize == 64 {
+        pat.rotate_right(immr)
+    } else {
+        ((pat >> immr) | (pat << (esize - immr))) & mask
+    };
+    let mut decoded = rotated;
+    let mut shift = esize;
+    while shift < 64 {
+        decoded |= decoded << shift;
+        shift *= 2;
+    }
+    (decoded == w).then_some((n, immr, imms))
+}
+
 /// The width of a memory access or of an integer operation: 1, 2, 4 or 8 bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Size {
@@ -266,6 +319,26 @@ impl Asm {
         self.word(sized(op as u32, size) | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
     }
 
+    pub fn alu_shifted(&mut self, op: Alu, size: Size, shift: Shift, imm: u8, dst: Reg, a: Reg, b: Reg) {
+        self.word(sized(op as u32, size) | (shift as u32) << 22 | u32::from(b.0) << 16 | u32::from(imm) << 10 | u32::from(a.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn alu_bitmask(&mut self, op: Alu, size: Size, (n, immr, imms): (u32, u32, u32), dst: Reg, a: Reg) {
+        let base = match op {
+            Alu::And => 0x9200_0000,
+            Alu::Orr => 0xB200_0000,
+            Alu::Eor => 0xD200_0000,
+            _ => return,
+        };
+        self.word(sized(base, size) | n << 22 | immr << 16 | imms << 10 | u32::from(a.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn ror_imm(&mut self, size: Size, dst: Reg, src: Reg, imm: u8) {
+        let base = if size == Size::X { 0x93C0_0000 } else { 0x1380_0000 };
+        let s = u32::from(src.0);
+        self.word(base | s << 16 | u32::from(imm) << 10 | s << 5 | u32::from(dst.0));
+    }
+
     /// `dst = a + b` where `a` or `dst` may be the stack pointer.
     pub fn add_extended(&mut self, sub: bool, dst: Reg, a: Reg, b: Reg) {
         let base = if sub { 0xCB20_6000 } else { 0x8B20_6000 };
@@ -306,6 +379,10 @@ impl Asm {
         let halves = |word: u64| (0..4).map(move |half| (word >> (16 * half)) as u16);
         let ones = halves(value).filter(|half| *half == 0xFFFF).count();
         let zeros = halves(value).filter(|half| *half == 0).count();
+        if zeros < 3 && ones < 3 && dst != ZR && let Some(bitmask) = encode_bitmask_imm(value, true) {
+            self.alu_bitmask(Alu::Orr, Size::X, bitmask, dst, ZR);
+            return;
+        }
         let inverted = ones > zeros;
         let skip = if inverted { 0xFFFF } else { 0 };
         let mut first = true;
@@ -372,6 +449,10 @@ impl Asm {
 
     pub fn csel(&mut self, cond: Cond, dst: Reg, a: Reg, b: Reg) {
         self.word(0x9A80_0000 | u32::from(b.0) << 16 | (cond as u32) << 12 | u32::from(a.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn csinc(&mut self, cond: Cond, dst: Reg, a: Reg, b: Reg) {
+        self.word(0x9A80_0400 | u32::from(b.0) << 16 | (cond as u32) << 12 | u32::from(a.0) << 5 | u32::from(dst.0));
     }
 
     pub fn cset(&mut self, cond: Cond, dst: Reg) {
@@ -549,10 +630,8 @@ impl Asm {
         self.word(base | src << 5 | dst);
     }
 
-    pub fn fmov_reg(&mut self, double: bool, dst: Vreg, src: Vreg) {
-        if dst != src {
-            self.word(Self::precision(0x1E20_4000, double) | u32::from(src.0) << 5 | u32::from(dst.0));
-        }
+    pub fn fmov_reg(&mut self, _double: bool, dst: Vreg, src: Vreg) {
+        self.vmov(dst, src);
     }
 
     pub fn fcsel(&mut self, cond: Cond, double: bool, dst: Vreg, a: Vreg, b: Vreg) {

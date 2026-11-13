@@ -71,6 +71,7 @@ pub(super) enum RelocStep {
     Const(SymbolSource),
     Promoted { seq: u32, size: u32 },
     VtableAt(ExprId),
+    VtableSlot { expr: ExprId, slot: u16 },
     SiteSlot(SiteOrigin),
     SiteInline { origin: SiteOrigin, plan: Arc<RelocPlan> },
     TypeId(TyOrigin),
@@ -118,6 +119,14 @@ fn eval_into(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, plan: &
             RelocStep::VtableAt(expr) => {
                 let id = eval_vtable_at(cx, reached, slots, typed, *expr)?;
                 out.push(SymbolSource::Vtable(id));
+            }
+            RelocStep::VtableSlot { expr, slot } => {
+                let id = eval_vtable_at(cx, reached, slots, typed, *expr)?;
+                let entries = slots.vtable_entries(id).ok_or_else(|| anyhow::anyhow!("missing vtable entries for {:?}", id))?;
+                match entries.get(*slot as usize) {
+                    Some(super::stencil::VtableEntry::Word(super::Word::Code(callee_idx))) => out.push(SymbolSource::Slot(*callee_idx)),
+                    other => bail!("vtable slot {} is not code: {:?}", slot, other),
+                }
             }
             RelocStep::SiteSlot(origin) => {
                 let (callee_item, callee_substs) = eval_site(cx, reached, typed, substs, origin)?;

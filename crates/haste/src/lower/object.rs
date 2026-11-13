@@ -62,7 +62,23 @@ fn code_word(cx: &Context<'_>, reached: &Reached, slots: &dyn Slots, res: Option
 impl Lower<'_, '_> {
     pub(super) fn vtable(&mut self, expr: ExprId, vtable: &Vtable) -> Result<Value> {
         let id = build_vtable_id(self.cx, self.reached, self.slots, vtable)?;
-        Ok(self.emit_symbol_with(SymbolSource::Vtable(id), RelocStep::VtableAt(expr)))
+        let vt_sym = self.relocs.len() as u32;
+        let vt_val = self.emit_symbol_with(SymbolSource::Vtable(id), RelocStep::VtableAt(expr));
+        if self.mode == super::stencil::LowerMode::Stencil
+            && let Some(entries) = self.slots.vtable_entries(id)
+            && entries.len() <= 12
+        {
+            let low = self.slots.low_entries();
+            for (slot, entry) in entries.iter().enumerate() {
+                if (slot == 0 || slot >= 3)
+                    && let VtableEntry::Word(Word::Code(callee_idx)) = *entry
+                {
+                    let slot_sym = self.push_reloc(SymbolSource::Slot(callee_idx), RelocStep::VtableSlot { expr, slot: slot as u16 });
+                    self.b.func.add_vtable_slot(vt_sym, (slot * 8) as i32, slot_sym, low);
+                }
+            }
+        }
+        Ok(vt_val)
     }
 
     /// The wide pointer `wide` to a trait object of type `object` as a pointer to the supertrait object whose vtable slot `slot` of Haste's vtable holds: in rustc's layout, the same vtable when it starts with the supertrait's, else the one its slot holds.

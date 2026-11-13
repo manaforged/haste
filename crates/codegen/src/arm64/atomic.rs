@@ -174,30 +174,45 @@ impl Emit<'_> {
     }
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
-        let flag = self.src(condition, C, Ext::Zero);
-        self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+        let cond = if let Some((val, c)) = self.flags
+            && val == condition
+        {
+            c
+        } else if self.plan.elided[condition.index()]
+            && let Some(inst) = self.defs[condition.index()]
+            && let Op::Icmp(cc, a, b) = self.func.insts[inst.index()].op
+        {
+            let c = self.compare(cc, a, b);
+            self.flags = Some((condition, c));
+            c
+        } else {
+            self.flags = None;
+            let flag = self.src(condition, C, Ext::Zero);
+            self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+            Cond::Ne
+        };
         let ty = self.ty(x);
         if ty.is_float() {
             let (left, right) = (self.fin(x, super::V0), self.fin(y, super::V1));
             let dst = self.fdst(result);
-            self.asm.fcsel(Cond::Ne, ty == Type::F64, dst, left, right);
+            self.asm.fcsel(cond, ty == Type::F64, dst, left, right);
             self.fput(result, dst);
             return;
         }
         if ty == Type::I128 {
             self.raw(A, x);
             self.raw(D, y);
-            self.asm.csel(Cond::Ne, A, A, D);
+            self.asm.csel(cond, A, A, D);
             self.put(result, A);
             self.high(A, x);
             self.high(D, y);
-            self.asm.csel(Cond::Ne, A, A, D);
+            self.asm.csel(cond, A, A, D);
             self.put_high(result, A);
             return;
         }
         let (left, right) = (self.bits(x, A), self.bits(y, D));
         let dst = self.dst(result);
-        self.asm.csel(Cond::Ne, dst, left, right);
+        self.asm.csel(cond, dst, left, right);
         self.put(result, dst);
     }
 

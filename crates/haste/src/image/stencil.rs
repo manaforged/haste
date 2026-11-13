@@ -158,6 +158,7 @@ impl Slots for FreshSlots<'_> {
     fn low_entries(&self) -> bool { self.0.low_entries() }
     fn rodata(&self, bytes: &[u8], relocs: &[RodataReloc]) -> RodataId { self.0.rodata(bytes, relocs) }
     fn vtable_id(&self, entries: &[VtableEntry]) -> VtableId { self.0.vtable_id(entries) }
+    fn vtable_entries(&self, id: VtableId) -> Option<Vec<VtableEntry>> { self.0.vtable_entries(id) }
     fn resolve_symbol(&self, sym: &SymbolSource) -> u64 { self.0.resolve_symbol(sym) }
 }
 
@@ -213,6 +214,7 @@ impl Image {
         let mut addrs = lock(&self.vtable_addrs);
         let id = VtableId(addrs.len() as u32);
         addrs.push(address);
+        lock(&self.vtable_entries).push(entries.to_vec());
         if let Some(aot) = &self.aot {
             lock(aot).vtables.push(entries.to_vec());
         }

@@ -81,6 +81,10 @@ pub trait Slots {
     fn vtable_id(&self, _entries: &[VtableEntry]) -> VtableId {
         VtableId(0)
     }
+    /// Returns the entries of an interned vtable `id`, if available.
+    fn vtable_entries(&self, _id: VtableId) -> Option<Vec<VtableEntry>> {
+        None
+    }
     /// Resolves a symbolic relocation entry to its concrete 64-bit value in this image.
     fn resolve_symbol(&self, sym: &SymbolSource) -> u64 {
         match *sym {

@@ -120,6 +120,7 @@ impl Emit<'_> {
         match self.plan.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed)),
             Location::Frame(..) | Location::SlotAddr(_) => self.raw(reg, value),
+            Location::Reg(from) if !signed && self.plan.zero_ext[value.index()] => self.asm.mov(reg, from),
             Location::Reg(from) => self.asm.extend(signed, bytes, reg, from),
             Location::Float(from) => {
                 self.asm.fmov_out(ty == Type::F64, reg, Vreg(from));

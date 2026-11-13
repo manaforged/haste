@@ -131,6 +131,11 @@ impl<'f> FunctionBuilder<'f> {
         let map = Remap { values, blocks, after, slots: self.func.slots.len() as u32, sigs: self.func.sigs.len() as u32, sym_base, dict };
         self.func.slots.extend(callee.slots.iter().cloned());
         self.func.sigs.extend(callee.sigs.iter().cloned());
+        if dict.is_none() {
+            for &(vt_sym, off, slot_sym, low) in &callee.vtable_slots {
+                self.func.vtable_slots.push((vt_sym + sym_base, off, slot_sym + sym_base, low));
+            }
+        }
         for (index, block) in callee.blocks.iter().enumerate() {
             let target = map.blocks[index];
             self.func.blocks[target.index()].params = block.params.iter().map(|param| map.values[param.index()]).collect();
@@ -158,6 +163,11 @@ impl<'f> FunctionBuilder<'f> {
     pub fn ins(&mut self) -> Ins<'_> {
         let block = self.current.expect("a block is selected");
         Ins { func: self.func, block, incoming: &mut self.incoming }
+    }
+
+    /// Whether `value` was defined as an immediate constant in the current function.
+    pub fn is_const(&self, value: Value) -> bool {
+        self.func.insts.iter().rev().take(32).any(|d| d.result == Some(value) && matches!(d.op, Op::Const(_)))
     }
 }
 

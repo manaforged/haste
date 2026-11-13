@@ -61,6 +61,7 @@ pub struct Image {
     rodata_addrs: Mutex<Vec<u64>>,
     vtable_map: Mutex<HashMap<Vec<lower::VtableEntry>, lower::VtableId>>,
     vtable_addrs: Mutex<Vec<u64>>,
+    vtable_entries: Mutex<Vec<Vec<lower::VtableEntry>>>,
     promoted_cells: Mutex<HashMap<(usize, u32), u64>>,
     thread_slots: Mutex<HashMap<usize, u64>>,
     wanted: Mutex<Vec<Instance>>,
@@ -199,6 +200,10 @@ impl Slots for Image {
         self.intern_vtable(entries)
     }
 
+    fn vtable_entries(&self, id: lower::VtableId) -> Option<Vec<lower::VtableEntry>> {
+        lock(&self.vtable_entries).get(id.0 as usize).cloned()
+    }
+
     fn resolve_symbol(&self, sym: &lower::SymbolSource) -> u64 {
         self.symbol_value(sym)
     }
@@ -253,6 +258,7 @@ impl Image {
             rodata_addrs: Mutex::default(),
             vtable_map: Mutex::default(),
             vtable_addrs: Mutex::default(),
+            vtable_entries: Mutex::default(),
             promoted_cells: Mutex::default(),
             thread_slots: Mutex::default(),
             wanted: Mutex::default(),

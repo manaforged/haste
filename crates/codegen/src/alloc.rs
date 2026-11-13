@@ -439,6 +439,84 @@ fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl 
     }
 }
 
+fn promote_loop_consts<R>(func: &Function, census: &Uses, elided: &[bool], locations: &mut [Location<R>]) -> Vec<(usize, i64)> {
+    let depths = crate::licm::depths(func);
+    if !depths.iter().any(|&d| d > 0) {
+        return Vec::new();
+    }
+    let count = func.types.len();
+    let mut must_stay_imm = vec![false; count];
+    let mut loop_mat = vec![0_u32; count];
+    for (b, block) in func.blocks.iter().enumerate() {
+        let depth = depths[b];
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            if data.result.is_some_and(|r| elided[r.index()]) {
+                continue;
+            }
+            match data.op {
+                Op::Copy(_, _, bytes) => must_stay_imm[bytes.index()] = true,
+                Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, _, rhs) => must_stay_imm[rhs.index()] = true,
+                Op::Binary(Binary::Imul | Binary::Udiv | Binary::Urem, x, y) => {
+                    for v in [x, y] {
+                        if let Location::Imm(imm) = locations[v.index()] {
+                            if imm > 0 && imm.count_ones() == 1 {
+                                must_stay_imm[v.index()] = true;
+                            } else if depth > 0 && census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth) {
+                                loop_mat[v.index()] += 1;
+                            }
+                        }
+                    }
+                }
+                Op::Binary(Binary::Sdiv | Binary::Srem, x, y) if depth > 0 => {
+                    for v in [x, y] {
+                        if matches!(locations[v.index()], Location::Imm(_)) && census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth) {
+                            loop_mat[v.index()] += 1;
+                        }
+                    }
+                }
+                Op::Binary(Binary::Iadd | Binary::Isub, x, y) | Op::Icmp(_, x, y) if depth > 0 => {
+                    if let Location::Imm(imm) = locations[y.index()] {
+                        if (-4095..4096).contains(&imm) {
+                            must_stay_imm[y.index()] = true;
+                        } else if census.def[y.index()].is_some_and(|(db, _)| depths[db] < depth) {
+                            loop_mat[y.index()] += 1;
+                        }
+                    }
+                    if let Location::Imm(imm) = locations[x.index()]
+                        && !(-4095..4096).contains(&imm)
+                        && census.def[x.index()].is_some_and(|(db, _)| depths[db] < depth)
+                    {
+                        loop_mat[x.index()] += 1;
+                    }
+                }
+                Op::Store(val, ..) | Op::StackStore(val, ..) if depth > 0 => {
+                    if let Location::Imm(imm) = locations[val.index()]
+                        && imm != 0
+                        && census.def[val.index()].is_some_and(|(db, _)| depths[db] < depth)
+                    {
+                        loop_mat[val.index()] += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut promoted = Vec::new();
+    for v in 0..count {
+        if let Location::Imm(imm) = locations[v]
+            && imm != 0
+            && !elided[v]
+            && !must_stay_imm[v]
+            && loop_mat[v] > 0
+        {
+            locations[v] = Location::Slot;
+            promoted.push((v, imm));
+        }
+    }
+    promoted
+}
+
 pub(crate) fn plan<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
@@ -453,6 +531,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let census = census(func);
     let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census) } else { (vec![None; count], vec![false; count]) };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
+    let promoted_consts = if weighed { promote_loop_consts(func, &census, &elided, &mut locations) } else { Vec::new() };
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
     let live = live(func, order, copied, &tracked, &sib, &elided);
@@ -469,6 +548,11 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let (passed_ints, passed_floats) = passed(func, classify);
     let (homes, used) = allocate(func, &live, &int_class(func, regs, order, params, passed_ints), &ints, &hints);
     place(&mut locations, homes, Location::Reg);
+    for (v, imm) in promoted_consts {
+        if !matches!(locations[v], Location::Reg(_)) {
+            locations[v] = Location::Imm(imm);
+        }
+    }
     let (float_homes, used_floats) = allocate(func, &live, &float_class(regs, params, passed_floats), &floats, &hints);
     place(&mut locations, float_homes, Location::Float);
     let parked = if park.is_some() { parked(func, &live, &locations, (regs.saved, regs.saved_float), classify) } else { Vec::new() };
