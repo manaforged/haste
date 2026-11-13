@@ -1,6 +1,6 @@
 use crate::fold::{constant, holds};
 use crate::frame::{Abi, Loc};
-use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, Op, Signature, StackSlot, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, Op, Signature, StackSlot, Type, Unary, Value};
 use crate::live::{Live, Sib, SibBase, for_effective_operands, live, results};
 use crate::park::{Class, Hints, ParkReg, allocate, parked};
 
@@ -559,7 +559,7 @@ fn zero_ext<R>(func: &Function, order: &[Block], locations: &[Location<R>], cens
             let data = &func.insts[inst.index()];
             let Some(res) = data.result else { continue };
             let z = match data.op {
-                Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(_) | Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(Convert::Uextend, _) => true,
+                Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(_) | Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(Convert::Uextend, _) | Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => true,
                 Op::Binary(Binary::Band, a, b) => match func.types[res.index()] {
                     Type::I8 => out[a.index()] || out[b.index()] || fits_mask(a, 0xff) || fits_mask(b, 0xff),
                     Type::I16 => out[a.index()] || out[b.index()] || fits_mask(a, 0xffff) || fits_mask(b, 0xffff),
@@ -570,6 +570,7 @@ fn zero_ext<R>(func: &Function, order: &[Block], locations: &[Location<R>], cens
                     let dst_bits = func.types[res.index()].bits();
                     matches!(src_ty, Type::I64 | Type::I32)
                         && census.def_inst[shifted.index()].is_some_and(|def| match func.insts[def.index()].op {
+                            Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => dst_bits >= 8,
                             Op::Binary(Binary::Ushr, _, c) => {
                                 matches!(locations[c.index()], Location::Imm(shift) if (0..i64::from(src_ty.bits())).contains(&shift) && src_ty.bits() - (shift as u32) <= dst_bits)
                             }

@@ -118,7 +118,7 @@ fn unroll_self(func: &mut Function, b: usize, cond: Value, back_on_true: bool, b
         }
     }
     let Some(back_steps) = proven else {
-        return unroll_self_dynamic(func, b, cond, back_on_true, &back_args, exit_blk);
+        return unroll_self_dynamic(func, b, cond, back_on_true, &back_args, exit_blk, global_consts);
     };
     let last = *func.blocks[b].insts.last().unwrap_or(&Inst(0));
     if back_steps == 0 {
@@ -145,10 +145,31 @@ fn unroll_self(func: &mut Function, b: usize, cond: Value, back_on_true: bool, b
     true
 }
 
-fn unroll_self_dynamic(func: &mut Function, b: usize, cond: Value, back_on_true: bool, back_args: &[Value], exit_blk: Block) -> bool {
+fn match_iv_step(func: &Function, b: usize, body_insts: &[Inst], back_args: &[Value], iv_next: Value) -> Option<(usize, Value)> {
+    let iv_inst = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(iv_next))?;
+    let Op::Binary(Binary::Iadd, p, q) = func.insts[iv_inst.index()].op else { return None };
+    for (cand_iv, cand_stride) in [(p, q), (q, p)] {
+        if let Some(idx) = func.blocks[b].params.iter().position(|&param| param == cand_iv)
+            && back_args[idx] == iv_next
+        {
+            return Some((idx, cand_stride));
+        }
+    }
+    None
+}
+
+fn unroll_self_dynamic(
+    func: &mut Function,
+    b: usize,
+    cond: Value,
+    back_on_true: bool,
+    back_args: &[Value],
+    exit_blk: Block,
+    global_consts: &[Option<i64>],
+) -> bool {
     let head = Block(b as u32);
     let inst_count = func.blocks[b].insts.len();
-    if inst_count > 8
+    if inst_count > 28
         || func.blocks[b].params.len() > 3
         || back_args.len() != func.blocks[b].params.len()
         || func.successors(exit_blk).any(|t| t == exit_blk)
@@ -184,29 +205,35 @@ fn unroll_self_dynamic(func: &mut Function, b: usize, cond: Value, back_on_true:
     let Some(cond_inst) = cond_inst else { return false };
     let Op::Icmp(cc, lhs, rhs) = func.insts[cond_inst.index()].op else { return false };
     let eff_cc = if back_on_true { cc } else { cc.inverse() };
-    let (cmp_cc, iv_next, limit) = match eff_cc {
+    let (cmp_cc, iv_cmp, limit) = match eff_cc {
         IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => (eff_cc, lhs, rhs),
         IntCC::UnsignedGreaterThan => (IntCC::UnsignedLessThan, rhs, lhs),
         IntCC::UnsignedGreaterThanOrEqual => (IntCC::UnsignedLessThanOrEqual, rhs, lhs),
         _ => return false,
     };
-    if func.ty(iv_next) != Type::I64 || head_defs[limit.index()] {
+    if func.ty(iv_cmp) != Type::I64 || head_defs[limit.index()] {
         return false;
     }
-    let iv_inst = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(iv_next));
-    let Some(iv_inst) = iv_inst else { return false };
-    let Op::Binary(Binary::Iadd, p, q) = func.insts[iv_inst.index()].op else { return false };
-    let mut matched = None;
-    for (cand_iv, cand_stride) in [(p, q), (q, p)] {
-        if let Some(idx) = func.blocks[b].params.iter().position(|&param| param == cand_iv)
-            && !head_defs[cand_stride.index()]
-            && back_args[idx] == iv_next
-        {
-            matched = Some((idx, cand_stride));
-            break;
+    let mut matched = match_iv_step(func, b, &body_insts, back_args, iv_cmp)
+        .filter(|&(_, stride)| !head_defs[stride.index()])
+        .map(|(idx, stride)| (idx, stride, 0_i64));
+    if matched.is_none()
+        && let Some(cmp_add) = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(iv_cmp))
+        && let Op::Binary(Binary::Iadd, p, q) = func.insts[cmp_add.index()].op
+    {
+        for (cand_next, cand_bias) in [(p, q), (q, p)] {
+            if let Some(bias) = global_consts[cand_bias.index()]
+                && (0..(1_i64 << 30)).contains(&bias)
+                && let Some((idx, stride)) = match_iv_step(func, b, &body_insts, back_args, cand_next)
+                && !head_defs[stride.index()]
+            {
+                matched = Some((idx, stride, bias));
+                break;
+            }
         }
     }
-    let Some((iv_idx, stride)) = matched else { return false };
+    let Some((iv_idx, stride, bias)) = matched else { return false };
+    let factor = if inst_count <= 8 { 4_i64 } else { 2_i64 };
     let outside: Vec<usize> = (0..func.blocks.len())
         .filter(|&p| p != b && func.successors(Block(p as u32)).any(|t| t == head))
         .collect();
@@ -233,14 +260,20 @@ fn unroll_self_dynamic(func: &mut Function, b: usize, cond: Value, back_on_true:
     };
     let zero = emit_guard(Op::Const(0), Type::I64);
     let sh61 = emit_guard(Op::Const(61), Type::I64);
-    let c4 = emit_guard(Op::Const(4), Type::I64);
+    let cf = emit_guard(Op::Const(factor), Type::I64);
     let stride_pos = emit_guard(Op::Icmp(IntCC::UnsignedGreaterThan, stride, zero), Type::I8);
     let or_lim = emit_guard(Op::Binary(Binary::Bor, limit, stride), Type::I64);
     let hi_bits = emit_guard(Op::Binary(Binary::Ushr, or_lim, sh61), Type::I64);
     let no_wrap = emit_guard(Op::Icmp(IntCC::Equal, hi_bits, zero), Type::I8);
-    let s4 = emit_guard(Op::Binary(Binary::Imul, stride, c4), Type::I64);
-    let lim_ok = emit_guard(Op::Icmp(IntCC::UnsignedLessThanOrEqual, s4, limit), Type::I8);
-    let safe_limit = emit_guard(Op::Binary(Binary::Isub, limit, s4), Type::I64);
+    let sf = emit_guard(Op::Binary(Binary::Imul, stride, cf), Type::I64);
+    let s_need = if bias > 0 {
+        let b_val = emit_guard(Op::Const(bias), Type::I64);
+        emit_guard(Op::Binary(Binary::Iadd, sf, b_val), Type::I64)
+    } else {
+        sf
+    };
+    let lim_ok = emit_guard(Op::Icmp(IntCC::UnsignedLessThanOrEqual, s_need, limit), Type::I8);
+    let safe_limit = emit_guard(Op::Binary(Binary::Isub, limit, s_need), Type::I64);
     let init_ok = emit_guard(Op::Icmp(cmp_cc, guard_params[iv_idx], safe_limit), Type::I8);
     let g1 = emit_guard(Op::Binary(Binary::Band, stride_pos, no_wrap), Type::I8);
     let g2 = emit_guard(Op::Binary(Binary::Band, lim_ok, init_ok), Type::I8);
@@ -249,7 +282,7 @@ fn unroll_self_dynamic(func: &mut Function, b: usize, cond: Value, back_on_true:
     func.blocks[guard.index()].insts.push(guard_br);
 
     let mut cur_args = unrolled_params;
-    for _ in 0..4 {
+    for _ in 0..factor {
         let mut map: Vec<(Value, Value)> = func.blocks[b].params.iter().copied().zip(cur_args.iter().copied()).collect();
         clone_body(func, &body_insts, unrolled, &mut map);
         cur_args = back_args.iter().map(|&v| remap_val(&map, v)).collect();
