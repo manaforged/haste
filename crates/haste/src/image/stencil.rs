@@ -280,7 +280,7 @@ impl Image {
         let mut seen: HashSet<(ItemRef, FootprintId)> = HashSet::default();
         for &index in indices {
             let (item, substs) = reached.list[index].0;
-            if cx.outline.is_sysroot(item.krate) {
+            if cx.outline.is_fixed(item.krate) {
                 pass.record_size(index, 0, 0);
                 continue;
             }

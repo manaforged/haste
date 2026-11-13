@@ -653,6 +653,47 @@ fn dead(func: &mut Function) {
     }
 }
 
+fn unwrap_uextend(func: &Function, defs: &[Option<Inst>], mut v: Value) -> Value {
+    while let Some(inst) = defs.get(v.index()).copied().flatten() {
+        if let Op::Convert(Convert::Uextend, inner) = func.insts[inst.index()].op {
+            v = inner;
+        } else {
+            break;
+        }
+    }
+    v
+}
+
+fn fold_bxor_branches(func: &mut Function) -> bool {
+    let defs = defs(func);
+    let mut consts = vec![None; func.types.len()];
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[inst.index()];
+        if let (Op::Const(imm), Some(res)) = (&data.op, data.result) {
+            consts[res.index()] = Some(*imm);
+        }
+    }
+    let mut changed = false;
+    for b in 0..func.blocks.len() {
+        let Some(&last) = func.blocks[b].insts.last() else { continue };
+        let Op::Brif(cond, ..) = func.insts[last.index()].op else { continue };
+        let inner = unwrap_uextend(func, &defs, cond);
+        let Some(bxor_inst) = defs.get(inner.index()).copied().flatten() else { continue };
+        let Op::Binary(Binary::Bxor, x, y) = func.insts[bxor_inst.index()].op else { continue };
+        let matched = [(x, y), (y, x)].into_iter().find(|&(_, c)| consts.get(c.index()).copied().flatten().is_some());
+        let Some((lhs, c_val)) = matched else { continue };
+        let cmp_val = func.value(Type::I8);
+        let cmp_inst = func.add(Op::Icmp(IntCC::NotEqual, lhs, c_val), Some(cmp_val));
+        let pos = func.blocks[b].insts.len() - 1;
+        func.blocks[b].insts.insert(pos, cmp_inst);
+        if let Op::Brif(cond, ..) = &mut func.insts[last.index()].op {
+            *cond = cmp_val;
+        }
+        changed = true;
+    }
+    changed
+}
+
 fn fold_bitcast_loads(func: &mut Function) {
     let uses = func.use_counts();
     let defs = defs(func);
@@ -726,6 +767,9 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
         dead(func);
     }
     if crate::algebra::devirt_vtables(func, &fold.defs) {
+        dead(func);
+    }
+    if fold_bxor_branches(func) {
         dead(func);
     }
 }

@@ -10,6 +10,9 @@ use crate::names::path::Requests;
 use super::Context;
 use super::infer::{Typed, infer, register};
 use super::substs::Substs;
+mod filter;
+
+use filter::{ReachFilter, collect_filtered_callees};
 use super::ty::{Kind, Ty};
 
 const MIN_PARALLEL_WAVE: usize = 4;
@@ -185,145 +188,6 @@ pub fn infer_declared(cx: &mut Context<'_>, reached: &mut Reached, index: usize)
 /// The functions that the inferred body `typed` calls, other than intrinsics.
 pub fn calls<'t>(cx: &'t Context<'_>, typed: &'t Result<Arc<Typed>, String>) -> impl Iterator<Item = Instance> + 't {
     typed.iter().flat_map(|typed| typed.calls()).filter(|(item, _)| cx.intrinsic(*item).is_none())
-}
-
-#[derive(Default)]
-struct ReachFilter {
-    seen_fixed_poly: rustc_hash::FxHashSet<ItemRef>,
-    seen_sealed_sysroot: rustc_hash::FxHashSet<ItemRef>,
-    sealed_cache: HashMap<ItemRef, bool>,
-}
-
-impl ReachFilter {
-    fn check_sealed(&mut self, cx: &Context<'_>, item: ItemRef, visiting: &mut rustc_hash::FxHashSet<ItemRef>) -> Option<bool> {
-        if let Some(&cached) = self.sealed_cache.get(&item) {
-            return Some(cached);
-        }
-        if !cx.outline.is_sysroot(item.krate) {
-            self.sealed_cache.insert(item, false);
-            return Some(false);
-        }
-        if !visiting.insert(item) {
-            return Some(false);
-        }
-        let Some(kind) = cx.store.lookups.summaries.get_ready(&item) else {
-            visiting.remove(&item);
-            return None;
-        };
-        let super::summary::SummaryKind::Poly(summary) = kind else {
-            visiting.remove(&item);
-            self.sealed_cache.insert(item, false);
-            return Some(false);
-        };
-        let local_ok = summary.projections.is_empty()
-            && summary.obligations.is_empty()
-            && summary.call_holes.is_empty()
-            && summary.op_holes.is_empty()
-            && summary.const_holes.is_empty()
-            && summary.drop_tys.is_empty()
-            && summary.template.closures.is_empty()
-            && summary.layout_tys.iter().all(|&ty| matches!(
-                *cx.types.kind(ty),
-                Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..)
-            ));
-        if !local_ok {
-            visiting.remove(&item);
-            self.sealed_cache.insert(item, false);
-            return Some(false);
-        }
-        let mut all_ready = true;
-        for &(_, callee, _) in &summary.direct_calls {
-            match self.check_sealed(cx, callee, visiting) {
-                Some(true) => {}
-                Some(false) => {
-                    visiting.remove(&item);
-                    self.sealed_cache.insert(item, false);
-                    return Some(false);
-                }
-                None => all_ready = false,
-            }
-        }
-        visiting.remove(&item);
-        if all_ready {
-            self.sealed_cache.insert(item, true);
-            Some(true)
-        } else {
-            None
-        }
-    }
-}
-
-fn collect_filtered_callees(
-    cx: &Context<'_>,
-    filter: &mut ReachFilter,
-    caller: Instance,
-    typed: &Result<Arc<Typed>, String>,
-    out: &mut Vec<Instance>,
-) {
-    let Ok(typed) = typed else { return };
-    let check_only_sysroot = cx.store.lookups.skip_warm_sysroot_bodies && cx.outline.is_sysroot(caller.0.krate);
-    let mut visiting = rustc_hash::FxHashSet::default();
-    let mut push_callee = |filter: &mut ReachFilter, item: ItemRef, substs: Substs| {
-        if cx.intrinsic(item).is_some() {
-            return;
-        }
-        if check_only_sysroot
-            && cx.outline.is_sysroot(item.krate)
-            && filter.seen_sealed_sysroot.contains(&item)
-            && filter.check_sealed(cx, item, &mut visiting) == Some(true)
-        {
-            return;
-        }
-        out.push((item, substs));
-    };
-    match &typed.tables {
-        super::infer::LazyTables::Poly(poly) => {
-            if filter.seen_fixed_poly.insert(caller.0) {
-                for (item, substs) in poly.calls() {
-                    push_callee(filter, item, substs);
-                }
-            } else {
-                for (item, substs) in poly.dynamic_calls() {
-                    push_callee(filter, item, substs);
-                }
-            }
-            if cx.outline.is_sysroot(caller.0.krate) {
-                filter.seen_sealed_sysroot.insert(caller.0);
-            }
-            for r in &typed.drops {
-                if let super::infer::Res::Fn(item, substs) = *r {
-                    push_callee(filter, item, substs);
-                }
-            }
-            match &typed.shape {
-                super::infer::Shape::Glue(g) => {
-                    for r in g.drop.iter().chain(&g.parts).chain(&g.resume) {
-                        if let super::infer::Res::Fn(item, substs) = *r {
-                            push_callee(filter, item, substs);
-                        }
-                    }
-                }
-                super::infer::Shape::Untuple(r) => {
-                    if let super::infer::Res::Fn(item, substs) = *r {
-                        push_callee(filter, item, substs);
-                    }
-                }
-                super::infer::Shape::Clone(calls) => {
-                    for r in calls {
-                        if let super::infer::Res::Fn(item, substs) = *r {
-                            push_callee(filter, item, substs);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        super::infer::LazyTables::Eager(_) => {
-            for (item, substs) in typed.calls() {
-                push_callee(filter, item, substs);
-            }
-        }
-    }
 }
 
 struct WaveItem {
@@ -689,7 +553,7 @@ fn worker_loop(cx: &mut Context<'_>, reached: &Reached, wave: &[usize], next: &A
     }
 }
 
-fn commit_wave(cx: &Context<'_>, reached: &mut Reached, wave: &[usize], items: Vec<WaveItem>, force_commit: bool) -> (Vec<usize>, Vec<Instance>) {
+fn commit_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], items: Vec<WaveItem>, force_commit: bool) -> (Vec<usize>, Vec<Instance>) {
     let mut slots: Vec<Option<WaveItem>> = (0..wave.len()).map(|_| None).collect();
     for item in items {
         let pos = item.pos;

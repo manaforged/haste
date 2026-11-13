@@ -208,6 +208,11 @@ impl Outline {
         self.crates.get(krate as usize).is_some_and(tree::Crate::is_sysroot)
     }
 
+    /// Whether crate `krate` is an immutable sysroot or pinned registry/git crate.
+    pub fn is_fixed(&self, krate: u32) -> bool {
+        self.crates.get(krate as usize).is_some_and(tree::Crate::is_fixed)
+    }
+
     /// The path that `module_path!` spells for module `at`: the crate name, then each module name from the root down.
     pub fn module_path(&self, at: crate::names::ModRef) -> String {
         let modules = &self.crates[at.krate as usize].modules;

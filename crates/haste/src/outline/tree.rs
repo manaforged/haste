@@ -254,6 +254,11 @@ impl Crate {
         self.env.release && self.env.fixed
     }
 
+    /// Whether this crate is an immutable sysroot or pinned registry/git crate.
+    pub const fn is_fixed(&self) -> bool {
+        self.env.fixed
+    }
+
     /// The modules declared but not read yet.
     pub fn declared(&self) -> impl Iterator<Item = usize> + '_ {
         self.modules.iter().enumerate().filter(|(_, module)| matches!(module.state, State::Declared(_))).map(|(at, _)| at)

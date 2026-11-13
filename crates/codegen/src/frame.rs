@@ -305,7 +305,7 @@ pub(crate) struct ShrinkWrap {
 }
 
 fn pure_value<R: Copy + PartialEq>(value: Value, plan: &Plan<R>, frame: &Frame<R>, clobbers: &[R]) -> bool {
-    if plan.elided[value.index()] {
+    if plan.elided[value.index()] || plan.fused[value.index()] {
         return true;
     }
     match plan.location(value) {

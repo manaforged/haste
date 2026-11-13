@@ -34,7 +34,7 @@ fn analyze(func: &Function) -> Info {
 }
 
 fn match_eq(func: &Function, info: &Info, cond: Value, expected_val: Option<Value>, expected_block: Option<usize>) -> Option<(Value, i64)> {
-    if info.uses[cond.index()] != 1 {
+    if info.uses.get(cond.index()).copied() != Some(1) {
         return None;
     }
     if expected_block.is_some() && info.def_block[cond.index()] != expected_block {
@@ -221,5 +221,6 @@ pub(crate) fn run(func: &mut Function) {
             func.blocks[b].insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
             cleared[b] = true;
         }
+        cleared[b0] = true;
     }
 }

@@ -170,8 +170,8 @@ fn hoist(
     let slot_written = |slot: StackSlot, lo: i64, hi: i64| {
         slot_clobbered[slot.index()] || slot_write_ranges[slot.index()].iter().any(|&(wlo, whi)| lo < whi && wlo < hi)
     };
-    let slot_ok = |slot: StackSlot, head: bool, lo: i64, hi: i64| {
-        (slot_ro.get(slot.index()).copied().unwrap_or(false) || (!calls && !unknown_mem_writes && head)) && !slot_written(slot, lo, hi)
+    let slot_ok = |slot: StackSlot, lo: i64, hi: i64| {
+        (slot_ro.get(slot.index()).copied().unwrap_or(false) || (!calls && !unknown_mem_writes)) && !slot_written(slot, lo, hi)
     };
     let mut moved: Vec<Inst> = Vec::new();
     for block in (0..each.body.len()).filter(|block| each.body[*block]) {
@@ -203,7 +203,7 @@ fn hoist(
                                 && (total as u64)
                                     .checked_add(u64::from(width))
                                     .is_some_and(|end| end <= u64::from(func.slots[slot.index()].size))
-                                && slot_ok(slot, head, total, total + i64::from(width))
+                                && slot_ok(slot, total, total + i64::from(width))
                         })
                     });
                     let deref_ok = offset >= 0 && (offset as u64) + u64::from(width) <= u64::from(ro_bytes.get(addr.index()).copied().unwrap_or(0));
