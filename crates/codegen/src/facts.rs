@@ -7,6 +7,27 @@ const MAX_FACTS: usize = 16;
 /// The most constants one fact records a value as differing from.
 const MAX_NOT: usize = 32;
 
+/// The most symbolic relations a path keeps; past it the oldest goes.
+const MAX_RELS: usize = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelKind {
+    Eq,
+    Ne,
+    Ult,
+    Ule,
+    Slt,
+    Sle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Rel {
+    kind: RelKind,
+    lhs: Value,
+    rhs: Value,
+    ty: Type,
+}
+
 /// What is known about an integer value: its unsigned range at its type's width, and constants it differs from.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Fact {
@@ -249,6 +270,22 @@ impl<'a> Ranges<'a> {
 #[derive(Clone, Default)]
 pub(crate) struct Path {
     facts: Vec<(Value, Fact)>,
+    rels: Vec<Rel>,
+}
+
+fn rel_of(cc: IntCC, x: Value, y: Value) -> (RelKind, Value, Value) {
+    match cc {
+        IntCC::Equal => (RelKind::Eq, x, y),
+        IntCC::NotEqual => (RelKind::Ne, x, y),
+        IntCC::UnsignedLessThan => (RelKind::Ult, x, y),
+        IntCC::UnsignedGreaterThan => (RelKind::Ult, y, x),
+        IntCC::UnsignedLessThanOrEqual => (RelKind::Ule, x, y),
+        IntCC::UnsignedGreaterThanOrEqual => (RelKind::Ule, y, x),
+        IntCC::SignedLessThan => (RelKind::Slt, x, y),
+        IntCC::SignedGreaterThan => (RelKind::Slt, y, x),
+        IntCC::SignedLessThanOrEqual => (RelKind::Sle, x, y),
+        IntCC::SignedGreaterThanOrEqual => (RelKind::Sle, y, x),
+    }
 }
 
 impl Path {
@@ -308,17 +345,122 @@ impl Path {
                 let (left, right) = (self.fact(ranges, x), self.fact(ranges, y));
                 let order = match cc.is_signed() {
                     true if left.non_negative(operand_ty) && right.non_negative(operand_ty) => as_unsigned(cc),
-                    true => return,
-                    false => cc,
+                    _ => cc,
                 };
-                if let Some(fact) = right.exact().and_then(|k| compared(order, operand_ty, k, taken)) {
-                    self.add(ranges, x, fact);
+                if !order.is_signed() {
+                    if let Some(fact) = right.exact().and_then(|k| compared(order, operand_ty, k, taken)) {
+                        self.add(ranges, x, fact);
+                    }
+                    if let Some(fact) = left.exact().and_then(|k| compared(swapped(order), operand_ty, k, taken)) {
+                        self.add(ranges, y, fact);
+                    }
                 }
-                if let Some(fact) = left.exact().and_then(|k| compared(swapped(order), operand_ty, k, taken)) {
-                    self.add(ranges, y, fact);
+                if x != y {
+                    let eff = if taken { order } else { order.inverse() };
+                    let (kind, lhs, rhs) = rel_of(eff, x, y);
+                    let rel = Rel { kind, lhs, rhs, ty: operand_ty };
+                    if !self.rels.contains(&rel) {
+                        if self.rels.len() >= MAX_RELS {
+                            self.rels.remove(0);
+                        }
+                        self.rels.push(rel);
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn reaches(&self, ty: Type, start: Value, target: Value, (strict_k, weak_k): (RelKind, RelKind), require_strict: bool) -> bool {
+        if start == target {
+            return !require_strict;
+        }
+        let mut seen: Vec<(Value, bool)> = vec![(start, false)];
+        let mut idx = 0;
+        while idx < seen.len() {
+            let (cur, cur_strict) = seen[idx];
+            idx += 1;
+            for &r in &self.rels {
+                if r.ty != ty {
+                    continue;
+                }
+                let (next, step_strict) = if r.kind == RelKind::Eq && r.lhs == cur {
+                    (r.rhs, false)
+                } else if r.kind == RelKind::Eq && r.rhs == cur {
+                    (r.lhs, false)
+                } else if r.lhs == cur && r.kind == strict_k {
+                    (r.rhs, true)
+                } else if r.lhs == cur && r.kind == weak_k {
+                    (r.rhs, false)
+                } else {
+                    continue;
+                };
+                let next_strict = cur_strict || step_strict;
+                if next == target && (!require_strict || next_strict) {
+                    return true;
+                }
+                if let Some(entry) = seen.iter_mut().find(|(v, _)| *v == next) {
+                    if next_strict && !entry.1 {
+                        entry.1 = true;
+                        seen.push((next, true));
+                    }
+                } else {
+                    seen.push((next, next_strict));
+                }
+            }
+        }
+        false
+    }
+
+    fn proves(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> bool {
+        if x == y {
+            return holds(cc, ty, 0, 0);
+        }
+        let (kind, a, b) = rel_of(cc, x, y);
+        match kind {
+            RelKind::Eq => self.reaches(ty, a, b, (RelKind::Eq, RelKind::Eq), false),
+            RelKind::Ult => {
+                if self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), true) {
+                    return true;
+                }
+                if let Some(&Op::Binary(Binary::Iadd, p, q)) = ranges.op(func, b) {
+                    for (base, c) in [(p, q), (q, p)] {
+                        if let Some(k) = ranges.constant(c)
+                            && k >= 1
+                            && ranges.of(base).hi.checked_add(k).is_some_and(|hi| hi <= top(ty))
+                            && self.reaches(ty, a, base, (RelKind::Ult, RelKind::Ule), false)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            RelKind::Ule => self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), false),
+            RelKind::Slt => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true),
+            RelKind::Sle => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), false),
+            RelKind::Ne => {
+                self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), true)
+                    || self.reaches(ty, b, a, (RelKind::Ult, RelKind::Ule), true)
+                    || self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true)
+                    || self.reaches(ty, b, a, (RelKind::Slt, RelKind::Sle), true)
+                    || self.rels.iter().any(|r| {
+                        r.kind == RelKind::Ne
+                            && r.ty == ty
+                            && ((self.reaches(ty, a, r.lhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.rhs, (RelKind::Eq, RelKind::Eq), false))
+                                || (self.reaches(ty, a, r.rhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.lhs, (RelKind::Eq, RelKind::Eq), false)))
+                    })
+            }
+        }
+    }
+
+    fn decide_rel(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> Option<bool> {
+        if self.proves(func, ranges, cc, ty, x, y) {
+            Some(true)
+        } else if self.proves(func, ranges, cc.inverse(), ty, x, y) {
+            Some(false)
+        } else {
+            None
         }
     }
 
@@ -385,7 +527,7 @@ fn settle_one(func: &Function, (ranges, path): (&Ranges, &mut Path), inst: Inst,
     let data = &func.insts[inst.index()];
     match (&data.op, data.result) {
         (&Op::Icmp(cc, x, y), Some(result)) if ranges.constant(result).is_none() && func.ty(x).is_small_int() => {
-            if let Some(known) = decide(cc, func.ty(x), &path.fact(ranges, x), &path.fact(ranges, y)) {
+            if let Some(known) = decide(cc, func.ty(x), &path.fact(ranges, x), &path.fact(ranges, y)).or_else(|| path.decide_rel(func, ranges, cc, func.ty(x), x, y)) {
                 compares.push((result, known));
             }
         }

@@ -428,6 +428,9 @@ impl Substrate {
     pub fn save_toolchain(&self) -> Result<PathBuf> {
         let path = toolchain_path(self.header.toolchain_hash);
         self.save(&path)?;
+        if let Some(dir) = path.parent() {
+            prune_stale_substrates(dir, &path);
+        }
         Ok(path)
     }
 
@@ -745,5 +748,28 @@ fn decode_reloc_kind(raw: u8) -> Result<RelocKind> {
         3 => Ok(RelocKind::PcRel32),
         4 => Ok(RelocKind::Arm64Call26),
         _ => bail!("unknown relocation kind"),
+    }
+}
+
+fn prune_stale_substrates(dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path == keep || path.extension().and_then(|e| e.to_str()) != Some("substrate") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+    others.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in others.into_iter().skip(1) {
+        drop(std::fs::remove_file(path));
     }
 }

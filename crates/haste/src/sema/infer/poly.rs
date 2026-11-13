@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::{Body, Bound, ExprId, List, PathId, Stmt};
+use crate::body::{Body, Bound, ExprId, List, PathId};
 use crate::names::{ItemRef, ModRef, Primitive, plain};
 use crate::outline::item::ItemKind;
 
@@ -41,7 +41,7 @@ pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, p
     let (Ok(sig), Ok(body), Ok(home)) = (cx.signature(item), cx.body(item), cx.module_of(item)) else {
         return SummaryKind::MonomorphicFallback;
     };
-    if sig.is_async || body.stmts.iter().any(|stmt| matches!(stmt, Stmt::Item(..))) {
+    if sig.is_async {
         return SummaryKind::MonomorphicFallback;
     }
     let args: Vec<Ty> = (0..param_count).map(|idx| cx.types.intern(Kind::Param(idx))).collect();
@@ -76,7 +76,7 @@ pub(super) fn zonk_poly_state(infer: &mut Infer<'_, '_>, poly: &mut PolyState) {
 
 fn finalize_summary(cx: &Context<'_>, typed: Typed, poly: Option<Box<PolyState>>, clean: bool, param_count: u16) -> SummaryKind {
     let Some(mut poly) = poly else { return SummaryKind::MonomorphicFallback };
-    if poly.fallback || !clean || has_param_closure(cx, &typed, &poly.obligations) {
+    if poly.fallback || !clean || has_param_closure(cx, &typed) {
         return SummaryKind::MonomorphicFallback;
     }
     collect_remaining_projs(&cx.types, &mut poly, &typed);
@@ -104,17 +104,12 @@ fn finalize_summary(cx: &Context<'_>, typed: Typed, poly: Option<Box<PolyState>>
     }))
 }
 
-fn has_param_closure(cx: &Context<'_>, typed: &Typed, obligations: &[PolyObligation]) -> bool {
-    if typed.closures.is_empty() {
-        return false;
-    }
-    let has_call = obligations.iter().any(|o| matches!(o, PolyObligation::Call { .. }));
-    has_call
-        || typed
-            .closures
-            .as_slice()
-            .iter()
-            .any(|(_, c)| c.captures.iter().any(|cap| cx.types.has_params(typed.locals[cap.local as usize].ty)))
+fn has_param_closure(cx: &Context<'_>, typed: &Typed) -> bool {
+    typed
+        .closures
+        .as_slice()
+        .iter()
+        .any(|(_, c)| c.captures.iter().any(|cap| cx.types.has_params(typed.locals[cap.local as usize].ty)))
 }
 
 fn zonk_obligations(infer: &mut Infer<'_, '_>, raw: &mut Vec<PolyObligation>) -> Vec<PolyObligation> {
