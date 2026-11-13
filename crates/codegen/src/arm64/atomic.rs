@@ -9,6 +9,12 @@ const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
 impl Emit<'_> {
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
+            Op::Const(0) => {
+                let result = result()?;
+                if !self.plan.is_static(result) {
+                    self.put(result, ZR);
+                }
+            }
             Op::Const(imm) => {
                 let result = result()?;
                 if !self.plan.is_static(result) {

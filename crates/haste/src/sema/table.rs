@@ -190,6 +190,18 @@ impl<K, V> Flight<K, V> {
         self.inner.slots.retain(|key, _| keep(key));
     }
 
+    pub(super) fn get_ready(&self, key: &K) -> Option<V>
+    where
+        K: Eq + Hash,
+        V: Clone,
+    {
+        let slot = self.inner.slots.get(key)?;
+        match &*lock(&slot.state) {
+            SlotState::Ready(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     pub(super) fn for_each_ready(&self, mut f: impl FnMut(&K, &V)) {
         self.inner.slots.retain(|key, slot| {
             if let SlotState::Ready(value) = &*lock(&slot.state) {

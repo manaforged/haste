@@ -70,6 +70,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP]);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
+    let slow_thunk = asm.label();
     let emit = Emit {
         func,
         frame,
@@ -89,6 +90,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         direct_calls: target.direct_calls,
         sp_bias: 0,
         shrink,
+        slow_thunk,
         in_shrink_entry: false,
         in_fast_ret: false,
     };
@@ -142,6 +144,7 @@ pub(super) struct Emit<'a> {
     direct_calls: bool,
     sp_bias: i32,
     shrink: Option<ShrinkWrap>,
+    slow_thunk: Label,
     in_shrink_entry: bool,
     in_fast_ret: bool,
 }
@@ -201,20 +204,29 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.shrink.is_some()
     }
 
+    fn blocks_fallthrough_to(&self, block: Block) -> bool {
+        self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block)
+    }
+
+    fn before_block_bind(&mut self, block: Block) -> Result<(), String> {
+        if let Some(shrink) = self.shrink
+            && shrink.use_slow_thunk
+            && block == shrink.slow_entry
+        {
+            self.asm.bind(self.slow_thunk);
+            self.emit_slow_prologue_and_edge(shrink.slow_entry)?;
+        }
+        Ok(())
+    }
+
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
         self.in_shrink_entry = self.shrink.is_some() && self.func.entry == Some(block);
         self.in_fast_ret = self.shrink.is_some_and(|s| s.fast_ret == block);
         if let Some(shrink) = self.shrink
+            && !shrink.use_slow_thunk
             && block == shrink.slow_entry
         {
-            self.prologue();
-            if let Some(entry) = self.func.entry
-                && let Some(term) = self.func.blocks[entry.index()].insts.last()
-                && let Op::Brif(_, then_b, then_args, else_b, else_args) = &self.func.insts[term.index()].op
-            {
-                let args = if *then_b == shrink.slow_entry { then_args.as_slice() } else if *else_b == shrink.slow_entry { else_args.as_slice() } else { &[] };
-                self.edge(shrink.slow_entry, args)?;
-            }
+            self.emit_slow_prologue_and_edge(shrink.slow_entry)?;
         }
         Ok(())
     }
@@ -429,6 +441,34 @@ impl Emit<'_> {
         self.asm.cbz(!invert, size, reg, label);
     }
 
+    fn emit_slow_prologue_and_edge(&mut self, slow_entry: Block) -> Result<(), String> {
+        self.prologue();
+        if let Some(entry) = self.func.entry
+            && let Some(term) = self.func.blocks[entry.index()].insts.last()
+            && let Op::Brif(_, then_b, then_args, else_b, else_args) = &self.func.insts[term.index()].op
+        {
+            let args = if *then_b == slow_entry { then_args.as_slice() } else if *else_b == slow_entry { else_args.as_slice() } else { &[] };
+            self.edge(slow_entry, args)?;
+        }
+        Ok(())
+    }
+
+    fn target_label(&self, block: Block) -> Label {
+        if self.in_shrink_entry && self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
+            self.slow_thunk
+        } else {
+            self.blocks[self.func.jump_target(block).index()]
+        }
+    }
+
+    fn goto_branch(&mut self, block: Block, last: bool) {
+        if self.in_shrink_entry && self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
+            self.asm.b(self.slow_thunk);
+        } else {
+            self.goto(block, last);
+        }
+    }
+
     fn brif(&mut self, condition: Value, then: (Block, &[Value]), otherwise: (Block, &[Value])) -> Result<(), String> {
         let (then, otherwise) = if self.in_shrink_entry {
             let slow = self.shrink.map(|s| s.slow_entry);
@@ -442,7 +482,7 @@ impl Emit<'_> {
         if let Some(known) = self.plan.const_of(condition) {
             let (block, args) = if crate::fold::extend(known, self.ty(condition), false) != 0 { then } else { otherwise };
             self.edge(block, args)?;
-            self.goto(block, true);
+            self.goto_branch(block, true);
             return Ok(());
         }
         let (then_moves, else_moves) = (
@@ -451,24 +491,26 @@ impl Emit<'_> {
         );
         let falls = self.next.is_some_and(|next| next == then.0 || next == self.func.jump_target(then.0));
         if !else_moves && (then_moves || falls) {
-            self.branch_cond(condition, true, self.blocks[self.func.jump_target(otherwise.0).index()]);
+            let target = self.target_label(otherwise.0);
+            self.branch_cond(condition, true, target);
             self.edge(then.0, then.1)?;
-            self.goto(then.0, true);
+            self.goto_branch(then.0, true);
             return Ok(());
         }
         if !then_moves {
-            self.branch_cond(condition, false, self.blocks[self.func.jump_target(then.0).index()]);
+            let target = self.target_label(then.0);
+            self.branch_cond(condition, false, target);
             self.edge(otherwise.0, otherwise.1)?;
-            self.goto(otherwise.0, true);
+            self.goto_branch(otherwise.0, true);
             return Ok(());
         }
         let other = self.asm.label();
         self.branch_cond(condition, true, other);
         self.edge(then.0, then.1)?;
-        self.goto(then.0, false);
+        self.goto_branch(then.0, false);
         self.asm.bind(other);
         self.edge(otherwise.0, otherwise.1)?;
-        self.goto(otherwise.0, true);
+        self.goto_branch(otherwise.0, true);
         Ok(())
     }
 

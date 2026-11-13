@@ -15,7 +15,7 @@ use haste_codegen::{Code, RelocKind, Site, StencilReloc, Target};
 use rustc_hash::FxHasher;
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 48;

@@ -166,6 +166,9 @@ pub(super) fn try_cached_instantiate(
     for &ty in &summary.parametric_tys {
         resolve_proj_ty(cx, &args, &mut projs, ty, 0)?;
     }
+    for &(_, _, substs) in summary.direct_calls.iter().chain(&summary.call_holes) {
+        resolve_proj_substs(cx, &args, &mut projs, substs, 0)?;
+    }
     let mut inst = PolyInst {
         args: instance.1,
         summary: Arc::clone(summary),
@@ -184,7 +187,10 @@ pub(super) fn try_cached_instantiate(
             return None;
         };
     }
-    let mut resolved = Vec::with_capacity(summary.call_holes.len());
+    let mut resolved = Vec::with_capacity(summary.direct_calls.len() + summary.call_holes.len());
+    for &(key, item, substs) in &summary.direct_calls {
+        resolved.push((key, item, inst.sub_substs(&cx.types, substs)));
+    }
     for &(key, item, substs) in &summary.call_holes {
         let mapped = inst.sub_substs(&cx.types, substs);
         let cached = cx.store.lookups.trait_calls.get(&(item, mapped))?;

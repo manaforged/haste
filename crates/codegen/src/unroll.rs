@@ -1,6 +1,6 @@
 use crate::dom::dominators;
 use crate::fold::{evaluate, extend};
-use crate::ir::{Block, Function, Inst, Op, Value};
+use crate::ir::{Binary, Block, BlockData, Function, Inst, IntCC, Op, Type, Value};
 
 fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
     map.iter().rev().find(|&&(old, _)| old == v).map_or(v, |&(_, new)| new)
@@ -117,7 +117,9 @@ fn unroll_self(func: &mut Function, b: usize, cond: Value, back_on_true: bool, b
             break;
         }
     }
-    let Some(back_steps) = proven else { return false };
+    let Some(back_steps) = proven else {
+        return unroll_self_dynamic(func, b, cond, back_on_true, &back_args, exit_blk);
+    };
     let last = *func.blocks[b].insts.last().unwrap_or(&Inst(0));
     if back_steps == 0 {
         func.insts[last.index()].op = Op::Jump(exit_blk, exit_args);
@@ -140,6 +142,138 @@ fn unroll_self(func: &mut Function, b: usize, cond: Value, back_on_true: bool, b
     let jump = func.add(Op::Jump(exit_blk, final_exit_args), None);
     func.blocks[b].insts.push(jump);
     remap_other_blocks(func, b, None, &last_map);
+    true
+}
+
+fn unroll_self_dynamic(func: &mut Function, b: usize, cond: Value, back_on_true: bool, back_args: &[Value], exit_blk: Block) -> bool {
+    let head = Block(b as u32);
+    let inst_count = func.blocks[b].insts.len();
+    if inst_count > 8
+        || func.blocks[b].params.len() > 3
+        || back_args.len() != func.blocks[b].params.len()
+        || func.successors(exit_blk).any(|t| t == exit_blk)
+    {
+        return false;
+    }
+    let body_insts = func.blocks[b].insts[..inst_count - 1].to_vec();
+    if body_insts.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Trap | Op::Trapz(..) | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence)) {
+        return false;
+    }
+    let mut head_defs = vec![false; func.types.len()];
+    for &p in &func.blocks[b].params {
+        head_defs[p.index()] = true;
+    }
+    for &i in &body_insts {
+        if let Some(r) = func.insts[i.index()].result {
+            head_defs[r.index()] = true;
+        }
+    }
+    for ob in 0..func.blocks.len() {
+        if ob == b {
+            continue;
+        }
+        for &inst in &func.blocks[ob].insts {
+            let mut escapes = false;
+            func.insts[inst.index()].op.for_operands(|v| escapes |= head_defs[v.index()]);
+            if escapes {
+                return false;
+            }
+        }
+    }
+    let cond_inst = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(cond));
+    let Some(cond_inst) = cond_inst else { return false };
+    let Op::Icmp(cc, lhs, rhs) = func.insts[cond_inst.index()].op else { return false };
+    let eff_cc = if back_on_true { cc } else { cc.inverse() };
+    let (cmp_cc, iv_next, limit) = match eff_cc {
+        IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => (eff_cc, lhs, rhs),
+        IntCC::UnsignedGreaterThan => (IntCC::UnsignedLessThan, rhs, lhs),
+        IntCC::UnsignedGreaterThanOrEqual => (IntCC::UnsignedLessThanOrEqual, rhs, lhs),
+        _ => return false,
+    };
+    if func.ty(iv_next) != Type::I64 || head_defs[limit.index()] {
+        return false;
+    }
+    let iv_inst = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(iv_next));
+    let Some(iv_inst) = iv_inst else { return false };
+    let Op::Binary(Binary::Iadd, p, q) = func.insts[iv_inst.index()].op else { return false };
+    let mut matched = None;
+    for (cand_iv, cand_stride) in [(p, q), (q, p)] {
+        if let Some(idx) = func.blocks[b].params.iter().position(|&param| param == cand_iv)
+            && !head_defs[cand_stride.index()]
+            && back_args[idx] == iv_next
+        {
+            matched = Some((idx, cand_stride));
+            break;
+        }
+    }
+    let Some((iv_idx, stride)) = matched else { return false };
+    let outside: Vec<usize> = (0..func.blocks.len())
+        .filter(|&p| p != b && func.successors(Block(p as u32)).any(|t| t == head))
+        .collect();
+    if outside.len() != 1 {
+        return false;
+    }
+    let out_blk = outside[0];
+    if !func.blocks[out_blk].insts.last().is_some_and(|&last| matches!(func.insts[last.index()].op, Op::Jump(..) | Op::Brif(..))) {
+        return false;
+    }
+    let param_tys: Vec<Type> = func.blocks[b].params.iter().map(|&p| func.ty(p)).collect();
+    let guard_params: Vec<Value> = param_tys.iter().map(|&ty| func.value(ty)).collect();
+    let guard = Block(func.blocks.len() as u32);
+    let unrolled = Block((func.blocks.len() + 1) as u32);
+    let unrolled_params: Vec<Value> = param_tys.iter().map(|&ty| func.value(ty)).collect();
+    func.blocks.push(BlockData { params: guard_params.clone(), insts: Vec::new() });
+    func.blocks.push(BlockData { params: unrolled_params.clone(), insts: Vec::new() });
+
+    let mut emit_guard = |op: Op, ty: Type| -> Value {
+        let v = func.value(ty);
+        let i = func.add(op, Some(v));
+        func.blocks[guard.index()].insts.push(i);
+        v
+    };
+    let zero = emit_guard(Op::Const(0), Type::I64);
+    let sh61 = emit_guard(Op::Const(61), Type::I64);
+    let c4 = emit_guard(Op::Const(4), Type::I64);
+    let stride_pos = emit_guard(Op::Icmp(IntCC::UnsignedGreaterThan, stride, zero), Type::I8);
+    let or_lim = emit_guard(Op::Binary(Binary::Bor, limit, stride), Type::I64);
+    let hi_bits = emit_guard(Op::Binary(Binary::Ushr, or_lim, sh61), Type::I64);
+    let no_wrap = emit_guard(Op::Icmp(IntCC::Equal, hi_bits, zero), Type::I8);
+    let s4 = emit_guard(Op::Binary(Binary::Imul, stride, c4), Type::I64);
+    let lim_ok = emit_guard(Op::Icmp(IntCC::UnsignedLessThanOrEqual, s4, limit), Type::I8);
+    let safe_limit = emit_guard(Op::Binary(Binary::Isub, limit, s4), Type::I64);
+    let init_ok = emit_guard(Op::Icmp(cmp_cc, guard_params[iv_idx], safe_limit), Type::I8);
+    let g1 = emit_guard(Op::Binary(Binary::Band, stride_pos, no_wrap), Type::I8);
+    let g2 = emit_guard(Op::Binary(Binary::Band, lim_ok, init_ok), Type::I8);
+    let guard_cond = emit_guard(Op::Binary(Binary::Band, g1, g2), Type::I8);
+    let guard_br = func.add(Op::Brif(guard_cond, unrolled, guard_params.clone(), head, guard_params), None);
+    func.blocks[guard.index()].insts.push(guard_br);
+
+    let mut cur_args = unrolled_params;
+    for _ in 0..4 {
+        let mut map: Vec<(Value, Value)> = func.blocks[b].params.iter().copied().zip(cur_args.iter().copied()).collect();
+        clone_body(func, &body_insts, unrolled, &mut map);
+        cur_args = back_args.iter().map(|&v| remap_val(&map, v)).collect();
+    }
+    let loop_cond = func.value(Type::I8);
+    let loop_icmp = func.add(Op::Icmp(cmp_cc, cur_args[iv_idx], safe_limit), Some(loop_cond));
+    let loop_br = func.add(Op::Brif(loop_cond, unrolled, cur_args.clone(), head, cur_args), None);
+    func.blocks[unrolled.index()].insts.push(loop_icmp);
+    func.blocks[unrolled.index()].insts.push(loop_br);
+
+    if let Some(&last) = func.blocks[out_blk].insts.last() {
+        match &mut func.insts[last.index()].op {
+            Op::Jump(target, _) if *target == head => *target = guard,
+            Op::Brif(_, then, _, otherwise, _) => {
+                if *then == head {
+                    *then = guard;
+                }
+                if *otherwise == head {
+                    *otherwise = guard;
+                }
+            }
+            _ => {}
+        }
+    }
     true
 }
 
@@ -250,8 +384,9 @@ pub(crate) fn run(func: &mut Function) -> bool {
             }
         }
     }
+    let initial_blocks = func.blocks.len();
     let mut changed = false;
-    for b in 0..func.blocks.len() {
+    for b in 0..initial_blocks {
         let head = Block(b as u32);
         if head == entry || preds[b] != 2 || func.blocks[b].insts.is_empty() || has_bad_non_term(func, b) {
             continue;

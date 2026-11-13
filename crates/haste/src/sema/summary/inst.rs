@@ -45,6 +45,11 @@ impl PolyInst {
         self.summary.fixed_calls.iter().copied().chain(self.resolved_calls.iter().map(|&(_, i, s)| (i, s)))
     }
 
+    /// Iterates only the instance-dependent call edges, excluding `summary.fixed_calls`.
+    pub fn dynamic_calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+        self.resolved_calls.iter().map(|&(_, i, s)| (i, s))
+    }
+
     /// Substitutes this instance's concrete arguments and normalized projections into `ty`.
     pub fn sub_ty(&self, types: &Types, ty: Ty) -> Ty {
         if ty == Ty::NONE || !types.has_params(ty) {

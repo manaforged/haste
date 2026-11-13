@@ -41,6 +41,12 @@ impl Cell {
 #[derive(Clone, Default)]
 struct Known(Vec<(Cell, Value)>);
 
+enum Assembled {
+    Int(i64),
+    FloatBits(i64),
+    V128Splat(u8),
+}
+
 impl Known {
     fn get(&self, cell: &Cell) -> Option<Value> {
         self.0.iter().find(|(known, _)| known == cell).map(|(_, value)| *value)
@@ -52,24 +58,35 @@ impl Known {
         }
     }
 
-    fn assemble_const(&self, cell: &Cell, consts: &[Option<i64>]) -> Option<i64> {
+    fn assemble_const(&self, cell: &Cell, consts: &[Option<i64>]) -> Option<Assembled> {
         let Base::Slot(slot) = cell.base else { return None };
-        let width = i64::from(cell.ty.bytes());
-        if !cell.ty.is_small_int() || !matches!(width, 2 | 4 | 8) {
-            return None;
-        }
-        let mut assembled = 0_u64;
-        for byte in 0..width {
+        let byte_at = |byte: i64| -> Option<u8> {
             let at = cell.offset + byte;
             let (kcell, kval) = self.0.iter().find(|(c, _)| {
                 c.base == Base::Slot(slot) && c.ty.is_small_int() && c.offset <= at && at < c.offset + i64::from(c.ty.bytes())
             })?;
             let imm = consts[kval.index()]?;
             let shift = 8 * (at - kcell.offset);
-            let piece = ((imm as u64) >> shift) & 0xFF;
-            assembled |= piece << (8 * byte);
+            Some((((imm as u64) >> shift) & 0xFF) as u8)
+        };
+        if cell.ty == Type::V128 {
+            let first = byte_at(0)?;
+            for byte in 1..16 {
+                if byte_at(byte)? != first {
+                    return None;
+                }
+            }
+            return Some(Assembled::V128Splat(first));
         }
-        Some(assembled as i64)
+        let width = i64::from(cell.ty.bytes());
+        if !((cell.ty.is_small_int() && matches!(width, 2 | 4 | 8)) || matches!(cell.ty, Type::F32 | Type::F64)) {
+            return None;
+        }
+        let mut assembled = 0_u64;
+        for byte in 0..width {
+            assembled |= u64::from(byte_at(byte)?) << (8 * byte);
+        }
+        Some(if cell.ty.is_small_int() { Assembled::Int(assembled as i64) } else { Assembled::FloatBits(assembled as i64) })
     }
 
     fn write(&mut self, cell: Cell, value: Value, unescaped: &[bool]) {
@@ -108,8 +125,8 @@ struct State<'a> {
     unescaped: &'a [bool],
     call_readonly: &'a [bool],
     selects: &'a [Option<(Value, Value, Value)>],
-    consts: &'a mut [Option<i64>],
-    subst: &'a mut [Value],
+    consts: &'a mut Vec<Option<i64>>,
+    subst: &'a mut Vec<Value>,
 }
 
 fn addr_cell(slots: &[Option<(StackSlot, i32)>], affine: &[(Value, i64)], subst: &[Value], addr: Value, offset: i32, ty: Type) -> Cell {
@@ -172,9 +189,26 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                     continue;
                 }
                 None => {
-                    if let Some(imm) = known.assemble_const(&cell, state.consts) {
-                        func.insts[inst.index()].op = Op::Const(imm);
-                        state.consts[result.index()] = Some(imm);
+                    if let Some(assembled) = known.assemble_const(&cell, state.consts) {
+                        match assembled {
+                            Assembled::Int(imm) => {
+                                func.insts[inst.index()].op = Op::Const(imm);
+                                state.consts[result.index()] = Some(imm);
+                            }
+                            Assembled::FloatBits(imm) => {
+                                func.insts[inst.index()].op = Op::Const(imm);
+                            }
+                            Assembled::V128Splat(0) => {
+                                func.insts[inst.index()].op = Op::Const(0);
+                            }
+                            Assembled::V128Splat(b) => {
+                                let b_val = func.value(Type::I8);
+                                state.subst.push(b_val);
+                                state.consts.push(Some(i64::from(b)));
+                                kept.push(Some(func.add(Op::Const(i64::from(b)), Some(b_val))));
+                                func.insts[inst.index()].op = Op::Splat(b_val);
+                            }
+                        }
                         known.remember(cell, result);
                     } else if let Op::Load(addr, offset) = func.insts[inst.index()].op
                         && let Some((c, ptr_a, ptr_b)) = state.selects[find(state.subst, addr).index()]

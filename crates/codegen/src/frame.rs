@@ -301,6 +301,7 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
 pub(crate) struct ShrinkWrap {
     pub fast_ret: Block,
     pub slow_entry: Block,
+    pub use_slow_thunk: bool,
 }
 
 fn pure_value<R: Copy + PartialEq>(value: Value, plan: &Plan<R>, frame: &Frame<R>, clobbers: &[R]) -> bool {
@@ -378,11 +379,12 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, pl
     }
     let term = *func.blocks[entry.index()].insts.last()?;
     let Op::Brif(cond, then_b, then_args, else_b, else_args) = &func.insts[term.index()].op else { return None };
-    if *then_b == *else_b || preds[then_b.index()] != 1 || preds[else_b.index()] != 1 || !pure_value(*cond, plan, frame, clobbers) {
+    if *then_b == *else_b || !pure_value(*cond, plan, frame, clobbers) {
         return None;
     }
     let fast_ret_ok = |block: Block, edge_args: &[Value]| {
-        func.jump_target(block) == block
+        preds[block.index()] == 1
+            && func.jump_target(block) == block
             && edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
             && func.blocks[block.index()].params.iter().all(|&p| pure_value(p, plan, frame, clobbers))
             && !edge_steps(edge_args, &func.blocks[block.index()].params, |a, b| plan.same_home(frame, a, b))
@@ -394,10 +396,18 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, pl
                 _ => false,
             })
     };
-    if fast_ret_ok(*then_b, then_args) && func.jump_target(*else_b) == *else_b {
-        Some(ShrinkWrap { fast_ret: *then_b, slow_entry: *else_b })
-    } else if fast_ret_ok(*else_b, else_args) && func.jump_target(*then_b) == *then_b {
-        Some(ShrinkWrap { fast_ret: *else_b, slow_entry: *then_b })
+    let slow_ok = |block: Block, edge_args: &[Value]| {
+        edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
+            .then(|| preds[block.index()] != 1 || func.jump_target(block) != block)
+    };
+    if fast_ret_ok(*then_b, then_args)
+        && let Some(use_slow_thunk) = slow_ok(*else_b, else_args)
+    {
+        Some(ShrinkWrap { fast_ret: *then_b, slow_entry: *else_b, use_slow_thunk })
+    } else if fast_ret_ok(*else_b, else_args)
+        && let Some(use_slow_thunk) = slow_ok(*then_b, then_args)
+    {
+        Some(ShrinkWrap { fast_ret: *else_b, slow_entry: *then_b, use_slow_thunk })
     } else {
         None
     }
@@ -417,6 +427,14 @@ pub(crate) trait Emitter<'a>: Sized {
 
     fn deferred_prologue(&self) -> bool {
         false
+    }
+
+    fn blocks_fallthrough_to(&self, _block: Block) -> bool {
+        false
+    }
+
+    fn before_block_bind(&mut self, _block: Block) -> Result<(), String> {
+        Ok(())
     }
 
     fn on_block_bound(&mut self, _block: Block) -> Result<(), String> {
@@ -448,7 +466,9 @@ pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<
     }
     emit.intake(entry)?;
     for (index, &block) in order.iter().enumerate() {
-        emit.set_next(order.get(index + 1).copied());
+        let next_blk = order.get(index + 1).copied().filter(|&nb| !emit.blocks_fallthrough_to(nb));
+        emit.set_next(next_blk);
+        emit.before_block_bind(block)?;
         emit.bind_block(block);
         emit.on_block_bound(block)?;
         emit_body(&mut emit, block)?;

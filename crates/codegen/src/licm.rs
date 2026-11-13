@@ -124,20 +124,41 @@ fn hoist(
     let mut writes = false;
     let mut unknown_mem_writes = false;
     let mut calls = false;
-    let mut written_slots = vec![false; func.slots.len()];
+    let mut slot_clobbered = vec![false; func.slots.len()];
+    let mut slot_write_ranges: Vec<Vec<(i64, i64)>> = vec![Vec::new(); func.slots.len()];
     for inst in (0..each.body.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts) {
-        let op = &func.insts[inst.index()].op;
+        let data = &func.insts[inst.index()];
+        let op = &data.op;
         if clobbers(op) || matches!(op, Op::Store(..) | Op::StackStore(..)) {
             writes = true;
         }
         if matches!(op, Op::Call { .. } | Op::TryCall { .. }) {
             calls = true;
         }
-        match op {
-            Op::StackStore(_, slot, _) => written_slots[slot.index()] = true,
-            Op::Store(_, addr, _) | Op::Move(addr, _, _) | Op::Copy(addr, _, _) => {
+        match *op {
+            Op::StackStore(val, slot, off) => {
+                if off < 0 {
+                    slot_clobbered[slot.index()] = true;
+                } else {
+                    let lo = i64::from(off);
+                    slot_write_ranges[slot.index()].push((lo, lo + i64::from(func.ty(val).bytes())));
+                }
+            }
+            Op::Store(val, addr, off) => {
+                if let Some((slot, base_off)) = slot_addrs.get(addr.index()).copied().flatten() {
+                    let lo = i64::from(base_off) + i64::from(off);
+                    if lo < 0 {
+                        slot_clobbered[slot.index()] = true;
+                    } else {
+                        slot_write_ranges[slot.index()].push((lo, lo + i64::from(func.ty(val).bytes())));
+                    }
+                } else {
+                    unknown_mem_writes = true;
+                }
+            }
+            Op::Move(addr, _, _) | Op::Copy(addr, _, _) => {
                 if let Some((slot, _)) = slot_addrs.get(addr.index()).copied().flatten() {
-                    written_slots[slot.index()] = true;
+                    slot_clobbered[slot.index()] = true;
                 } else {
                     unknown_mem_writes = true;
                 }
@@ -146,8 +167,11 @@ fn hoist(
             _ => {}
         }
     }
-    let slot_ok = |slot: StackSlot, head: bool| {
-        (slot_ro.get(slot.index()).copied().unwrap_or(false) || (!calls && !unknown_mem_writes && head)) && !written_slots[slot.index()]
+    let slot_written = |slot: StackSlot, lo: i64, hi: i64| {
+        slot_clobbered[slot.index()] || slot_write_ranges[slot.index()].iter().any(|&(wlo, whi)| lo < whi && wlo < hi)
+    };
+    let slot_ok = |slot: StackSlot, head: bool, lo: i64, hi: i64| {
+        (slot_ro.get(slot.index()).copied().unwrap_or(false) || (!calls && !unknown_mem_writes && head)) && !slot_written(slot, lo, hi)
     };
     let mut moved: Vec<Inst> = Vec::new();
     for block in (0..each.body.len()).filter(|block| each.body[*block]) {
@@ -165,7 +189,8 @@ fn hoist(
             let load_ok = match (&data.op, data.result) {
                 (&Op::StackLoad(slot, offset), Some(res)) => {
                     let width = u64::from(func.ty(res).bytes());
-                    !written_slots[slot.index()]
+                    let lo = i64::from(offset);
+                    !slot_written(slot, lo, lo + width as i64)
                         && (!has_stack_addr[slot.index()] || (!calls && !unknown_mem_writes))
                         && offset >= 0
                         && (offset as u64).checked_add(width).is_some_and(|end| end <= u64::from(func.slots[slot.index()].size))
@@ -173,13 +198,13 @@ fn hoist(
                 (&Op::Load(addr, offset), Some(res)) => {
                     let width = func.ty(res).bytes();
                     let slot_load_ok = slot_addrs.get(addr.index()).copied().flatten().is_some_and(|(slot, base_off)| {
-                        slot_ok(slot, head)
-                            && i64::from(base_off).checked_add(i64::from(offset)).is_some_and(|total| {
-                                total >= 0
-                                    && (total as u64)
-                                        .checked_add(u64::from(width))
-                                        .is_some_and(|end| end <= u64::from(func.slots[slot.index()].size))
-                            })
+                        i64::from(base_off).checked_add(i64::from(offset)).is_some_and(|total| {
+                            total >= 0
+                                && (total as u64)
+                                    .checked_add(u64::from(width))
+                                    .is_some_and(|end| end <= u64::from(func.slots[slot.index()].size))
+                                && slot_ok(slot, head, total, total + i64::from(width))
+                        })
                     });
                     let deref_ok = offset >= 0 && (offset as u64) + u64::from(width) <= u64::from(ro_bytes.get(addr.index()).copied().unwrap_or(0));
                     slot_load_ok || (!calls && ((head && !writes) || (head_prefix && readonly.get(addr.index()).copied().unwrap_or(false)) || deref_ok))

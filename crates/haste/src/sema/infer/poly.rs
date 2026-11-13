@@ -97,6 +97,7 @@ fn finalize_summary(cx: &Context<'_>, typed: Typed, poly: Option<Box<PolyState>>
         layout_tys: layout_tys.into_boxed_slice(),
         const_holes: const_holes.into_boxed_slice(),
         fixed_calls: Box::default(),
+        direct_calls: Box::default(),
         call_holes: Box::default(),
         op_holes: Box::default(),
         fixed_drops: Box::default(),

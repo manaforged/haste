@@ -314,6 +314,8 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
         }
         write_u32(out, s.fixed_calls.len() as u32);
         for &(item, substs) in &s.fixed_calls { write_u32(out, self.item_id(item)?); self.write_substs(out, substs)?; }
+        write_u32(out, s.direct_calls.len() as u32);
+        for &(site, item, substs) in &s.direct_calls { write_site_key(out, site); write_u32(out, self.item_id(item)?); self.write_substs(out, substs)?; }
         write_u32(out, s.call_holes.len() as u32);
         for &(site, item, substs) in &s.call_holes { write_site_key(out, site); write_u32(out, self.item_id(item)?); self.write_substs(out, substs)?; }
         write_u32(out, s.op_holes.len() as u32);
@@ -506,12 +508,13 @@ impl Decoder<'_> {
             _ => bail!("invalid const hole tag"),
         }).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let fixed_calls = (0..cur.u32()?).map(|_| Ok((self.item(cur.u32()?)?, self.substs(cur)?))).collect::<Result<Vec<_>>>()?.into_boxed_slice();
+        let direct_calls = (0..cur.u32()?).map(|_| Ok((read_site_key(cur)?, self.item(cur.u32()?)?, self.substs(cur)?))).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let call_holes = (0..cur.u32()?).map(|_| Ok((read_site_key(cur)?, self.item(cur.u32()?)?, self.substs(cur)?))).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let op_holes = (0..cur.u32()?).map(|_| Ok((ExprId(cur.u32()?), self.read_op_check(cur)?, self.res(cur)?))).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let fixed_drops = (0..cur.u32()?).map(|_| self.res(cur)).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let drop_tys = (0..cur.u32()?).map(|_| self.ty(cur.u32()?)).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let parametric_tys = (0..cur.u32()?).map(|_| self.ty(cur.u32()?)).collect::<Result<Vec<_>>>()?.into_boxed_slice();
-        Ok(PolySummary { param_count, template, locals, params, ret, obligations, projections, layout_tys, const_holes, fixed_calls, call_holes, op_holes, fixed_drops, drop_tys, parametric_tys })
+        Ok(PolySummary { param_count, template, locals, params, ret, obligations, projections, layout_tys, const_holes, fixed_calls, direct_calls, call_holes, op_holes, fixed_drops, drop_tys, parametric_tys })
     }
 
     fn read_instance(&self, cur: &mut Cursor<'_>, expected_substs: Substs) -> Result<Option<FrozenInst>> {

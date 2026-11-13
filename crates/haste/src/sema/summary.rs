@@ -59,6 +59,7 @@ pub struct PolySummary {
     pub layout_tys: Box<[Ty]>,
     pub const_holes: Box<[ConstHole]>,
     pub fixed_calls: Box<[(ItemRef, Substs)]>,
+    pub direct_calls: Box<[(SiteKey, ItemRef, Substs)]>,
     pub call_holes: Box<[(SiteKey, ItemRef, Substs)]>,
     pub op_holes: Box<[(ExprId, OpCheck, Res)]>,
     pub fixed_drops: Box<[Res]>,
@@ -205,7 +206,7 @@ fn prepare_summary(cx: &mut Context<'_>, item: ItemRef, summary: &mut PolySummar
             bail!("parametric vtable coercion");
         }
     }
-    extract_call_holes(&cx.types, summary);
+    extract_call_holes(cx, summary);
     if !summary.template.operators.is_empty() {
         let body = cx.body(item)?;
         summary.op_holes = extract_op_holes(&cx.types, &body, &summary.template);
@@ -213,17 +214,25 @@ fn prepare_summary(cx: &mut Context<'_>, item: ItemRef, summary: &mut PolySummar
     extract_drops_and_tys(cx, summary)
 }
 
-fn extract_call_holes(types: &Types, summary: &mut PolySummary) {
+fn extract_call_holes(cx: &Context<'_>, summary: &mut PolySummary) {
+    let types = &cx.types;
     let tpl = &summary.template;
     let call_obs: HashSet<ExprId> = summary.obligations.iter().filter_map(|o| match *o {
         PolyObligation::Call { expr, .. } => Some(expr),
         _ => None,
     }).collect();
     let mut fixed = Vec::new();
+    let mut direct = Vec::new();
     let mut holes = Vec::new();
     let mut push = |key: SiteKey, r: Res| {
         if let Res::Fn(i, s) = r {
-            if types.substs_have_params(s) { holes.push((key, i, s)) } else { fixed.push((i, s)) }
+            if !types.substs_have_params(s) {
+                fixed.push((i, s));
+            } else if cx.owner_trait(i).is_none() {
+                direct.push((key, i, s));
+            } else {
+                holes.push((key, i, s));
+            }
         }
     };
     for &(id, r) in tpl.res.as_slice() {
@@ -272,6 +281,7 @@ fn extract_call_holes(types: &Types, summary: &mut PolySummary) {
         }
     }
     summary.fixed_calls = fixed.into_boxed_slice();
+    summary.direct_calls = direct.into_boxed_slice();
     summary.call_holes = holes.into_boxed_slice();
 }
 
@@ -335,6 +345,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
     if summary.param_count == 0
         && summary.projections.is_empty()
         && summary.obligations.is_empty()
+        && summary.direct_calls.is_empty()
         && summary.call_holes.is_empty()
         && summary.op_holes.is_empty()
         && summary.const_holes.is_empty()
@@ -375,7 +386,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
         && summary.const_holes.is_empty()
         && summary.template.closures.is_empty();
     let (poly_inst, locals, ret, concrete_layouts, concrete_drop_tys) = if pure {
-        let inst = PolyInst {
+        let mut inst = PolyInst {
             args: instance.1,
             summary: Arc::clone(summary),
             projs: Box::new([]),
@@ -385,6 +396,15 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
             offset_overrides: Box::new([]),
             materialized: OnceLock::new(),
         };
+        if !summary.direct_calls.is_empty() {
+            let mut resolved: Vec<(SiteKey, ItemRef, Substs)> = summary
+                .direct_calls
+                .iter()
+                .map(|&(key, item, substs)| (key, item, inst.sub_substs(&cx.types, substs)))
+                .collect();
+            resolved.sort_unstable_by_key(|&(key, ..)| key);
+            inst.resolved_calls = resolved.into_boxed_slice();
+        }
         let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
         let ret = summary.ret.map(|ty| inst.sub_ty(&cx.types, ty));
         let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
@@ -455,7 +475,11 @@ fn instantiate_drops(cx: &mut Context<'_>, fixed: &[Res], concrete_tys: &[Ty]) -
 type ResolvedSites = (Box<[(SiteKey, ItemRef, Substs)]>, Box<[ExprId]>);
 
 fn resolve_instance_calls(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, summary: &PolySummary, calls: &[CallOverride]) -> Result<ResolvedSites> {
-    let mut resolved = Vec::with_capacity(summary.call_holes.len() + summary.op_holes.len() + calls.len());
+    let mut resolved = Vec::with_capacity(summary.direct_calls.len() + summary.call_holes.len() + summary.op_holes.len() + calls.len());
+    for &(key, item, substs) in &summary.direct_calls {
+        let mapped = sub_substs(infer, sub, substs)?;
+        resolved.push((key, item, mapped));
+    }
     for &(key, item, substs) in &summary.call_holes {
         let mapped = sub_substs(infer, sub, substs)?;
         if let Res::Fn(ri, rs) = infer.trait_call(item, mapped)? {

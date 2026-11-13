@@ -241,14 +241,32 @@ impl Fold {
                 {
                     return Some(condition);
                 }
-                if let Some(&Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), lhs, rhs)) = self.def(func, condition) {
-                    for (var, imm_val) in [(lhs, rhs), (rhs, lhs)] {
+                if func.ty(condition) == func.ty(x)
+                    && self.find(condition) == self.find(x)
+                    && self.known(y).is_some_and(|imm| extend(imm, func.ty(x), false) == 0)
+                {
+                    return Some(x);
+                }
+                if let Some(&Op::Icmp(cc, lhs, rhs)) = self.def(func, condition) {
+                    for (idx, (var, imm_val)) in [(lhs, rhs), (rhs, lhs)].into_iter().enumerate() {
                         if let Some(c) = self.known(imm_val) {
                             let ty = func.ty(var);
-                            let is_c = |v: Value| self.known(v).is_some_and(|imm| extend(imm, ty, false) == extend(c, ty, false));
-                            let is_var = |v: Value| self.find(v) == self.find(var);
-                            if (cc == IntCC::Equal && is_c(x) && is_var(y)) || (cc == IntCC::NotEqual && is_var(x) && is_c(y)) {
-                                return Some(var);
+                            let imm = extend(c, ty, false);
+                            let norm = match (cc, idx == 1) {
+                                (IntCC::Equal, _) => Some((IntCC::Equal, imm)),
+                                (IntCC::NotEqual, _) => Some((IntCC::NotEqual, imm)),
+                                (IntCC::UnsignedGreaterThan, false) | (IntCC::UnsignedLessThan, true) if imm == 0 => Some((IntCC::NotEqual, 0)),
+                                (IntCC::UnsignedGreaterThanOrEqual, false) | (IntCC::UnsignedLessThanOrEqual, true) if imm == 1 => Some((IntCC::NotEqual, 0)),
+                                (IntCC::UnsignedLessThan, false) | (IntCC::UnsignedGreaterThan, true) if imm == 1 => Some((IntCC::Equal, 0)),
+                                (IntCC::UnsignedLessThanOrEqual, false) | (IntCC::UnsignedGreaterThanOrEqual, true) if imm == 0 => Some((IntCC::Equal, 0)),
+                                _ => None,
+                            };
+                            if let Some((eq_cc, eq_c)) = norm {
+                                let is_c = |v: Value| self.known(v).is_some_and(|v_imm| extend(v_imm, ty, false) == eq_c);
+                                let is_var = |v: Value| self.find(v) == self.find(var);
+                                if (eq_cc == IntCC::Equal && is_c(x) && is_var(y)) || (eq_cc == IntCC::NotEqual && is_var(x) && is_c(y)) {
+                                    return Some(var);
+                                }
                             }
                         }
                     }
@@ -337,7 +355,7 @@ impl Fold {
         }
     }
 
-    /// Turns the branches `decide` settles into jumps and drops traps that cannot fire.
+    /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, and drops traps that cannot fire.
     fn branches(&self, func: &mut Function) -> bool {
         let mut changed = false;
         for block in 0..func.blocks.len() {
@@ -345,6 +363,26 @@ impl Fold {
             func.blocks[block].insts.retain(|inst| !matches!(func.insts[inst.index()].op, Op::Trapz(x) if self.known(x).is_some_and(|known| known != 0)));
             changed |= func.blocks[block].insts.len() != before;
             let Some(&last) = func.blocks[block].insts.last() else { continue };
+            let invert = match func.insts[last.index()].op {
+                Op::Brif(cond, ..) if self.known(cond).is_none() => match self.def(func, cond) {
+                    Some(&Op::Binary(Binary::Bxor, a, b)) => [(a, b), (b, a)].into_iter().find_map(|(inner, one)| {
+                        (func.ty(inner) == Type::I8
+                            && self.boolean(func, inner)
+                            && self.known(one).is_some_and(|imm| extend(imm, Type::I8, false) == 1))
+                        .then_some(inner)
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(inner) = invert
+                && let Op::Brif(cond, then, then_args, otherwise, else_args) = &mut func.insts[last.index()].op
+            {
+                *cond = inner;
+                std::mem::swap(then, otherwise);
+                std::mem::swap(then_args, else_args);
+                changed = true;
+            }
             changed |= self.decide(&func.types, &mut func.insts[last.index()].op);
         }
         changed
