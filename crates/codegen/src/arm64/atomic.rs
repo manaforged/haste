@@ -187,6 +187,7 @@ impl Emit<'_> {
             c
         } else {
             self.flags = None;
+            self.last_cmp = None;
             let flag = self.src(condition, C, Ext::Zero);
             self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
             Cond::Ne

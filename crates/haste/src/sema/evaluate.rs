@@ -114,7 +114,7 @@ pub fn run(cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128>
     }
 }
 
-pub(super) fn prime(cx: &mut Context<'_>, instance: &Instance, bits: u32) {
+pub(crate) fn prime(cx: &mut Context<'_>, instance: &Instance, bits: u32) {
     match run(cx, instance, bits) {
         Ok(_) | Err(_) => {}
     }

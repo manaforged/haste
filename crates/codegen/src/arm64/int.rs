@@ -397,8 +397,8 @@ impl Emit<'_> {
     }
 
     pub(super) fn set_flag(&mut self, result: Value, flags: Cond) {
+        self.flags = Some((result, flags));
         if self.plan.fused[result.index()] {
-            self.flags = Some((result, flags));
             return;
         }
         let dst = self.dst(result);

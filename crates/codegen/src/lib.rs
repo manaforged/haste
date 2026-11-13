@@ -172,6 +172,19 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
         licm::run(func);
         loads::run(func);
         fold::run(func, effort);
+        merge::run(func);
+        if unroll::run(func) {
+            fold::run(func, effort);
+            merge::run(func);
+            loads::run(func);
+            for _ in 0..2 {
+                if !promote::step(func, kind) {
+                    break;
+                }
+                fold::run(func, effort);
+                merge::run(func);
+            }
+        }
         cse::run(func);
         switch::run(func);
     }

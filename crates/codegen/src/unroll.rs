@@ -65,7 +65,7 @@ pub(crate) fn run(func: &mut Function) -> bool {
     let mut changed = false;
     for b in 0..func.blocks.len() {
         let head = Block(b as u32);
-        if head == entry || preds[b] != 2 || func.blocks[b].insts.is_empty() || func.blocks[b].insts.len() > 32 {
+        if head == entry || preds[b] != 2 || func.blocks[b].insts.is_empty() || func.blocks[b].insts.len() > 48 {
             continue;
         }
         let Some(&last) = func.blocks[b].insts.last() else { continue };
@@ -109,7 +109,7 @@ pub(crate) fn run(func: &mut Function) -> bool {
             continue;
         }
         let inst_count = func.blocks[b].insts.len();
-        if (back_steps + 1) * inst_count > 64 {
+        if (back_steps + 1) * inst_count > 96 {
             continue;
         }
         let body_insts = func.blocks[b].insts[..inst_count - 1].to_vec();

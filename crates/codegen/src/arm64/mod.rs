@@ -181,13 +181,23 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn inst(&mut self, inst: Inst) -> Result<(), String> {
         let func = self.func;
         let data = &func.insts[inst.index()];
-        if !matches!(data.op, Op::Brif(..) | Op::Trapz(..) | Op::Select(..)) {
+        let keep_flags = matches!(
+            data.op,
+            Op::Brif(..)
+                | Op::Trapz(..)
+                | Op::Load(..)
+                | Op::Store(..)
+                | Op::StackAddr(..)
+                | Op::StackLoad(..)
+                | Op::StackStore(..)
+                | Op::Const(_)
+                | Op::FramePointer
+        ) || matches!(data.op, Op::Select(cond, ..) if self.flags.is_some_and(|(v, _)| v == cond));
+        if !keep_flags {
             self.flags = None;
-        }
-        match data.op {
-            Op::Brif(..) | Op::Trapz(..) | Op::Icmp(..) => {}
-            Op::Select(cond, ..) if self.flags.is_some_and(|(v, _)| v == cond) => {}
-            _ => self.last_cmp = None,
+            if !matches!(data.op, Op::Icmp(..)) {
+                self.last_cmp = None;
+            }
         }
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
