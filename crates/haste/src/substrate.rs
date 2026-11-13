@@ -14,7 +14,7 @@ use haste_codegen::{Code, RelocKind, Site, StencilReloc, Target};
 use rustc_hash::FxHasher;
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 11;
+const VERSION: u32 = 12;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 48;
@@ -229,20 +229,52 @@ fn sysroot_library_roots(workspace: &crate::graph::Workspace, units: &[usize]) -
     roots
 }
 
-fn hash_sysroot_rs(dir: &Path, hasher: &mut FxHasher) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut children: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect();
-    children.sort();
-    for child in children {
-        if matches!(child.file_name().and_then(|n| n.to_str()), Some("target" | ".git")) {
-            continue;
+type Stamp = (u64, i128);
+
+fn scan_sysroot_dir(dir: &Path) -> Vec<(PathBuf, Option<Stamp>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<_> = entries.filter_map(Result::ok).filter_map(|entry| {
+        let path = entry.path();
+        if matches!(path.file_name().and_then(|n| n.to_str()), Some("target" | ".git")) { return None; }
+        let ft = entry.file_type().ok();
+        if ft.is_some_and(|ft| ft.is_dir()) { return Some((path, None)); }
+        let is_rs = path.extension().and_then(|e| e.to_str()) == Some("rs");
+        let meta = if ft.is_some_and(|ft| ft.is_file()) { is_rs.then(|| entry.metadata().ok()).flatten()? } else { std::fs::metadata(&path).ok()? };
+        if meta.is_dir() { Some((path, None)) } else if is_rs { Some((path, Some(crate::graph::store::meta_stamp(&meta)))) } else { None }
+    }).collect();
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn walk_sysroot_dir(dir: &Path, out: &mut Vec<(PathBuf, Stamp)>) {
+    for (path, stamp) in scan_sysroot_dir(dir) {
+        match stamp { Some(s) => out.push((path, s)), None => walk_sysroot_dir(&path, out) }
+    }
+}
+
+fn hash_sysroot_roots(roots: Vec<PathBuf>, hasher: &mut FxHasher) {
+    let mut work = Vec::new();
+    for root in roots {
+        for (p, s) in scan_sysroot_dir(&root) {
+            if s.is_some() { work.push((p, s)); } else { work.extend(scan_sysroot_dir(&p)); }
         }
-        let Ok(meta) = std::fs::metadata(&child) else { continue };
-        if meta.is_dir() {
-            hash_sysroot_rs(&child, hasher);
-        } else if child.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-            (child, crate::graph::store::meta_stamp(&meta)).hash(hasher);
+    }
+    let dirs: Vec<_> = work.iter().enumerate().filter(|(_, (_, s))| s.is_none()).map(|(i, (p, _))| (i, p.as_path())).collect();
+    let (workers, next) = (crate::jobs().min(dirs.len()), std::sync::atomic::AtomicUsize::new(0));
+    let mut chunks = vec![Vec::new(); work.len()];
+    let drain = || {
+        let mut local = Vec::new();
+        while let Some(&(slot, dir)) = dirs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+            let mut items = Vec::new();
+            walk_sysroot_dir(dir, &mut items);
+            local.push((slot, items));
         }
+        local
+    };
+    let done = if workers > 1 { std::thread::scope(|s| (0..workers).map(|_| s.spawn(drain)).collect::<Vec<_>>().into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()) } else { drain() };
+    for (slot, items) in done { chunks[slot] = items; }
+    for (i, (path, stamp)) in work.into_iter().enumerate() {
+        match stamp { Some(s) => (path, s).hash(hasher), None => chunks[i].iter().for_each(|e| e.hash(hasher)) }
     }
 }
 
@@ -283,9 +315,7 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
             feat.hash(&mut hasher);
         }
     }
-    for root in sysroot_library_roots(workspace, &unit_indices) {
-        hash_sysroot_rs(&root, &mut hasher);
-    }
+    hash_sysroot_roots(sysroot_library_roots(workspace, &unit_indices), &mut hasher);
     hasher.finish()
 }
 
@@ -732,46 +762,25 @@ fn read_u64(data: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+const RELOC_KINDS: [RelocKind; 7] = [RelocKind::Abs32, RelocKind::Abs64, RelocKind::Arm64Movw64, RelocKind::PcRel32, RelocKind::Arm64Call26, RelocKind::Arm64AdrpAdd, RelocKind::X64RipRel32];
+
 fn encode_reloc_kind(kind: RelocKind) -> u8 {
-    match kind {
-        RelocKind::Abs32 => 0,
-        RelocKind::Abs64 => 1,
-        RelocKind::Arm64Movw64 => 2,
-        RelocKind::PcRel32 => 3,
-        RelocKind::Arm64Call26 => 4,
-    }
+    match kind { RelocKind::Abs32 => 0, RelocKind::Abs64 => 1, RelocKind::Arm64Movw64 => 2, RelocKind::PcRel32 => 3, RelocKind::Arm64Call26 => 4, RelocKind::Arm64AdrpAdd => 5, RelocKind::X64RipRel32 => 6 }
 }
 
 fn decode_reloc_kind(raw: u8) -> Result<RelocKind> {
-    match raw {
-        0 => Ok(RelocKind::Abs32),
-        1 => Ok(RelocKind::Abs64),
-        2 => Ok(RelocKind::Arm64Movw64),
-        3 => Ok(RelocKind::PcRel32),
-        4 => Ok(RelocKind::Arm64Call26),
-        _ => bail!("unknown relocation kind"),
-    }
+    RELOC_KINDS.get(raw as usize).copied().ok_or_else(|| anyhow!("unknown relocation kind"))
 }
 
 fn prune_stale_substrates(dir: &Path, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path == keep || path.extension().and_then(|e| e.to_str()) != Some("substrate") {
-                return None;
-            }
-            let meta = entry.metadata().ok()?;
-            if !meta.is_file() {
-                return None;
-            }
-            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            Some((modified, path))
-        })
-        .collect();
+    let mut others: Vec<_> = entries.filter_map(|entry| {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path == keep || path.extension().and_then(|e| e.to_str()) != Some("substrate") { return None; }
+        let meta = entry.metadata().ok()?;
+        meta.is_file().then(|| (meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), path))
+    }).collect();
     others.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, path) in others.into_iter().skip(7) {
-        drop(std::fs::remove_file(path));
-    }
+    others.into_iter().skip(7).for_each(|(_, p)| drop(std::fs::remove_file(p)));
 }

@@ -41,8 +41,13 @@ impl Emit<'_> {
                 let result = result()?;
                 if !self.is_static(result) {
                     let dst = self.dst(result);
-                    let at = self.asm.mov_slot_reloc(dst);
-                    self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs32));
+                    if self.direct_calls {
+                        let at = self.asm.lea_rip_reloc(dst);
+                        self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::X64RipRel32));
+                    } else {
+                        let at = self.asm.mov_slot_reloc(dst);
+                        self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs32));
+                    }
                     self.put(result, dst);
                 }
             }

@@ -120,8 +120,8 @@ impl CycleState {
     }
 }
 
-const TRANSIENT_CAP: usize = 32_768;
-const TRIM_SHARDS: usize = 4;
+const TRANSIENT_CAP: usize = 2_048;
+const TRIM_SHARDS: usize = 8;
 const MAX_INLINE_HEIGHT: u8 = 10;
 
 pub(super) type InlineMeta = (ItemRef, FootprintId, bool, u8, u16);
@@ -225,12 +225,20 @@ impl Bodies {
         self.templates.clear();
     }
 
-    /// Evicts a small round-robin slice of shards once transient entries reach the trim watermark.
+    /// Evicts cached inline templates and a rolling slice of footprint plans once transient entries reach the trim watermark.
     pub(crate) fn trim_transient(&self) {
-        if self.transient_entries.load(Ordering::Relaxed) < TRANSIENT_CAP / 8 {
+        let count = self.transient_entries.load(Ordering::Relaxed);
+        if count < TRANSIENT_CAP / 8 {
             return;
         }
         let start = self.evict_cursor.fetch_add(TRIM_SHARDS, Ordering::Relaxed);
+        if count >= TRANSIENT_CAP {
+            self.clear_transient();
+            for offset in 0..TRIM_SHARDS {
+                self.plans.clear_shard((start + offset) % crate::sema::table::SHARDS);
+            }
+            return;
+        }
         let mut removed = 0usize;
         for offset in 0..TRIM_SHARDS {
             let shard = (start + offset) % crate::sema::table::SHARDS;
@@ -238,6 +246,7 @@ impl Bodies {
             removed += self.inline_meta.clear_shard(shard);
             removed += self.templates.clear_shard(shard);
         }
+        self.plans.clear_shard((start / TRIM_SHARDS) % crate::sema::table::SHARDS);
         if removed > 0 {
             let mut cur = self.transient_entries.load(Ordering::Relaxed);
             while cur > 0 {

@@ -101,6 +101,10 @@ impl Emit<'_> {
     pub(super) fn raw(&mut self, reg: Reg, value: Value) {
         match self.plan.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, imm),
+            Location::SlotAddr(sym) if self.direct_calls => {
+                let at = self.asm.adrp_add_reloc(reg);
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Arm64AdrpAdd));
+            }
             Location::SlotAddr(sym) => {
                 let at = self.asm.mov_symbol(reg);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Arm64Movw64));

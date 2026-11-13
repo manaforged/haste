@@ -633,11 +633,22 @@ impl Asm {
         self.fixup(label);
     }
 
-    pub fn lea_rip(&mut self, dst: Reg, label: Label) {
+    fn lea_rip_head(&mut self, dst: Reg) -> u32 {
         let reg = dst as u8;
         self.rex(true, reg, 0, 0, false);
         self.code.extend([0x8D, 0x05 | ((reg & 7) << 3)]);
+        self.pos()
+    }
+
+    pub fn lea_rip(&mut self, dst: Reg, label: Label) {
+        self.lea_rip_head(dst);
         self.fixup(label);
+    }
+
+    pub fn lea_rip_reloc(&mut self, dst: Reg) -> u32 {
+        let at = self.lea_rip_head(dst);
+        self.code.extend(0_u32.to_le_bytes());
+        at
     }
 
     pub fn table_entry(&mut self, base: Label, target: Label) {

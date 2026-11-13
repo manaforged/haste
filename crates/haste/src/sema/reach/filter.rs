@@ -15,7 +15,7 @@ use super::super::ty::{Kind, Ty};
 use super::Instance;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct SealInfo {
+pub(super) struct SealInfo {
     sealed: bool,
     params: u16,
 }
@@ -49,16 +49,30 @@ impl ReachFilter {
         fresh
     }
 
-    pub(super) fn sync_from(&mut self, global: &Self, synced: &mut (usize, usize)) {
-        if global.sealed_log.len() > synced.0 {
-            for &(k, v) in &global.sealed_log[synced.0..] {
-                self.sealed_cache.entry(k).or_insert(v);
-            }
-            synced.0 = global.sealed_log.len();
+    pub(super) fn take_delta(&self, synced: &mut (usize, usize)) -> (Vec<(ItemRef, SealInfo)>, Vec<ItemRef>) {
+        let sealed = if self.sealed_log.len() > synced.0 {
+            let slice = self.sealed_log[synced.0..].to_vec();
+            synced.0 = self.sealed_log.len();
+            slice
+        } else {
+            Vec::new()
+        };
+        let seen = if self.seen_sealed_log.len() > synced.1 {
+            let slice = self.seen_sealed_log[synced.1..].to_vec();
+            synced.1 = self.seen_sealed_log.len();
+            slice
+        } else {
+            Vec::new()
+        };
+        (sealed, seen)
+    }
+
+    pub(super) fn apply_delta(&mut self, sealed: &[(ItemRef, SealInfo)], seen: &[ItemRef]) {
+        for &(k, v) in sealed {
+            self.sealed_cache.entry(k).or_insert(v);
         }
-        if global.seen_sealed_log.len() > synced.1 {
-            self.seen_sealed_sysroot.extend(global.seen_sealed_log[synced.1..].iter().copied());
-            synced.1 = global.seen_sealed_log.len();
+        if !seen.is_empty() {
+            self.seen_sealed_sysroot.extend(seen.iter().copied());
         }
     }
 

@@ -2,7 +2,7 @@ use anyhow::Result;
 use haste_codegen::{Arch, Os};
 
 use super::shims::{emit_main_trampoline, emit_shims, emit_stub, plan_shims};
-use super::{Buf, Executable, MACH_BASE, MACH_PAGE, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, resolve_sym};
+use super::{Buf, Executable, MACH_BASE, MACH_PAGE, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, resolve_sym};
 
 struct MachMeta<'a> {
     rebase_off: usize,
@@ -101,8 +101,11 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let sizeofcmds = 72 + (72 + nsects_text * 80) + (72 + nsects_data * 80) + 72 + 48 + 24 + 80 + 32 + 24 + 24 + dylib_cmds;
     let tramp_off = (32 + sizeofcmds + 64).next_multiple_of(16);
     let shims_off = (tramp_off + tramp_size).next_multiple_of(16);
-    let (shim_offs, text_off) = plan_shims(arch, Os::Darwin, &plan, MACH_BASE, shims_off)?;
-    let stubs_off = (text_off + exe.text.len()).next_multiple_of(16);
+    let (shim_offs, head_off) = plan_shims(arch, Os::Darwin, &plan, MACH_BASE, shims_off)?;
+    let post_rel = exe.text.len().next_multiple_of(16);
+    let veneers = plan_veneers(exe, &plan, MACH_BASE, head_off, &shim_offs, |pre, post| (head_off + pre + post_rel + post).next_multiple_of(16))?;
+    let text_off = head_off + veneers.pre_len;
+    let stubs_off = (text_off + post_rel + veneers.post_len).next_multiple_of(16);
     let text_seg_size = (stubs_off + plan.imports.len() * stub_size).next_multiple_of(MACH_PAGE as usize);
 
     let (data_seg_off, data_seg_va) = (text_seg_size, MACH_BASE + text_seg_size as u64);
@@ -162,12 +165,14 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     out.align(16);
     emit_shims(arch, Os::Darwin, &plan, MACH_BASE, 0, addrs, &stub_va, None, &mut out)?;
     out.align(16);
+    veneers.emit_pre(&resolve, &mut out)?;
     out.bytes(&exe.text);
     let resolve_got = |name: &str| Ok(got_va(plan.import_idx(name)?));
-    let ctx = PatchCtx { text_base: text_off, text_va: addrs.text, pie_arm64: arch == Arch::Arm64, addrs, base_va: MACH_BASE, shim_offs: &shim_offs, plan: &plan, stub_va: &stub_va, got_va: &resolve_got };
+    let ctx = PatchCtx { text_base: text_off, text_va: addrs.text, pie_arm64: arch == Arch::Arm64, addrs, base_va: MACH_BASE, shim_offs: &shim_offs, plan: &plan, stub_va: &stub_va, got_va: &resolve_got, veneers: &veneers };
     patch_code(&exe.relocs, &ctx, &mut out.0)?;
 
     out.align(16);
+    veneers.emit_post(&resolve, &mut out)?;
     (0..plan.imports.len()).for_each(|i| emit_stub(arch, MACH_BASE + (stubs_off + i * stub_size) as u64, got_va(i), &mut out));
     out.0.resize(data_off, 0);
     out.bytes(&exe.data);

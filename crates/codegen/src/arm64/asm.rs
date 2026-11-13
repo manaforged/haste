@@ -464,6 +464,14 @@ impl Asm {
         at
     }
 
+    pub fn adrp_add_reloc(&mut self, dst: Reg) -> u32 {
+        let at = self.pos();
+        let rd = u32::from(dst.0);
+        self.word(0x9000_0000 | rd);
+        self.word(0x9100_0000 | (rd << 5) | rd);
+        at
+    }
+
     pub fn mov_fixed64(&mut self, dst: Reg, value: u64) {
         let rd = u32::from(dst.0);
         for half in 0..4 {
@@ -517,15 +525,8 @@ impl Asm {
     }
 
     fn load_base(size: Size, signed: bool) -> u32 {
-        match (size, signed) {
-            (Size::X, _) => 0xF840_0000,
-            (Size::W, false) => 0xB840_0000,
-            (Size::H, false) => 0x7840_0000,
-            (Size::B, false) => 0x3840_0000,
-            (Size::W, true) => 0xB880_0000,
-            (Size::H, true) => 0x7880_0000,
-            (Size::B, true) => 0x3880_0000,
-        }
+        if size == Size::X { return 0xF840_0000; }
+        [0x3840_0000, 0x7840_0000, 0xB840_0000][size as usize] | (u32::from(signed) << 22)
     }
 
     fn store_base(size: Size) -> u32 {

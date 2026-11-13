@@ -249,22 +249,26 @@ impl Typed {
         }
     }
 
+    fn with_tables(&self, tables: Arc<BodyTables>) -> Self {
+        Self {
+            tables: LazyTables::Eager(tables),
+            locals: self.locals.clone(),
+            params: self.params.clone(),
+            ret: self.ret,
+            drops: self.drops.clone(),
+            shape: self.shape.clone(),
+        }
+    }
+
     /// Returns a borrowed or transiently materialized view of this instance without pinning `OnceLock` tables.
     pub fn scoped(&self, types: &Types) -> std::borrow::Cow<'_, Self> {
         match &self.tables {
             LazyTables::Eager(_) => std::borrow::Cow::Borrowed(self),
             LazyTables::Poly(poly) => match poly.ephemeral_tables(types) {
-                Some(tables) => std::borrow::Cow::Owned(Self {
-                    tables: LazyTables::Eager(tables),
-                    locals: self.locals.clone(),
-                    params: self.params.clone(),
-                    ret: self.ret,
-                    drops: self.drops.clone(),
-                    shape: self.shape.clone(),
-                }),
+                Some(tables) => std::borrow::Cow::Owned(self.with_tables(tables)),
                 None => std::borrow::Cow::Borrowed(self),
             },
-            LazyTables::CheckOnly(_) => panic!("check-only Typed cannot materialize scoped BodyTables"),
+            LazyTables::CheckOnly(_) => std::borrow::Cow::Owned(self.with_tables(BodyTables::empty())),
         }
     }
 

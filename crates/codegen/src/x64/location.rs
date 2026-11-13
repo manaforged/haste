@@ -206,6 +206,10 @@ impl Emit<'_> {
     pub(super) fn raw(&mut self, reg: Reg, value: Value) {
         match self.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, imm),
+            Location::SlotAddr(sym) if self.direct_calls => {
+                let at = self.asm.lea_rip_reloc(reg);
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::X64RipRel32));
+            }
             Location::SlotAddr(sym) => {
                 let at = self.asm.mov_slot_reloc(reg);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
@@ -362,11 +366,11 @@ impl Emit<'_> {
                     self.asm.store(Size::Q, to, Reg::R11);
                 }
             },
-            Location::SlotAddr(sym) => {
+            Location::SlotAddr(sym) if !self.direct_calls => {
                 let at = self.asm.store_slot_reloc(to);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
             }
-            Location::Frame(..) => {
+            Location::Frame(..) | Location::SlotAddr(_) => {
                 self.raw(Reg::R11, value);
                 self.asm.store(Size::Q, to, Reg::R11);
             }

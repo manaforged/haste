@@ -94,17 +94,32 @@ impl ImageBackend {
     }
 }
 
+struct OptArena(Option<Arena>);
+
+impl OptArena {
+    fn alloc(&mut self, len: usize) -> std::result::Result<usize, haste_codegen::Error> {
+        match &mut self.0 {
+            Some(arena) => arena.alloc(len),
+            None => Ok(0),
+        }
+    }
+
+    fn is_low(&self) -> bool {
+        self.0.as_ref().is_some_and(Arena::is_low)
+    }
+}
+
 /// The call table, code memory and data of the running program, in memory shared with children forked from this process, and the cells the program writes, in memory each run holds its own copy of.
 pub struct Image {
     table: usize,
-    _low: Arena,
+    _low: OptArena,
     capacity: usize,
     pass: Pass,
     sizes: Vec<u32>,
     times: Vec<u64>,
     stubs: Memory,
-    shared: Mutex<Arena>,
-    state: Mutex<Arena>,
+    shared: Mutex<OptArena>,
+    state: Mutex<OptArena>,
     tables: Mutex<HashMap<Vec<Word>, i64>>,
     fixups: Mutex<HashMap<usize, Vec<usize>>>,
     registered: AtomicUsize,
@@ -171,12 +186,15 @@ impl Image {
 impl Slots for Image {
     fn entry(&self, index: usize) -> i64 {
         if !self.backend.is_jit() {
-            return (self.table + index * size_of::<AtomicUsize>()) as i64;
+            return index as i64;
         }
         self.slot(index) as *const AtomicUsize as i64
     }
 
     fn data(&self, bytes: &[u8]) -> i64 {
+        if !self.backend.is_jit() {
+            return 0;
+        }
         let address = lock(&self.shared).alloc(bytes.len()).unwrap_or_else(|error| panic!("{error}"));
         // SAFETY: alloc handed out `bytes.len()` writable bytes at address that nothing else uses, and they do not overlap `bytes`.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
@@ -184,26 +202,26 @@ impl Slots for Image {
     }
 
     fn table(&self, words: &[Word]) -> i64 {
+        if !self.backend.is_jit() {
+            return 0;
+        }
         let mut tables = lock(&self.tables);
         if let Some(&address) = tables.get(words) {
             return address;
         }
         let value = |word: &Word| match *word {
             Word::Int(value) => value,
-            Word::Code(index) if self.backend.is_jit() => self.slot(index).load(Ordering::Acquire) as u64,
-            Word::Code(_) => 0,
+            Word::Code(index) => self.slot(index).load(Ordering::Acquire) as u64,
         };
         let bytes: Vec<u8> = words.iter().flat_map(|word| value(word).to_le_bytes()).collect();
         let address = self.data(&bytes);
-        if self.backend.is_jit() {
-            let mut fixups = lock(&self.fixups);
-            for (at, word) in words.iter().enumerate() {
-                if let Word::Code(index) = *word {
-                    let at = address as usize + at * 8;
-                    fixups.entry(index).or_default().push(at);
-                    self.registered.fetch_add(1, Ordering::SeqCst);
-                    patch(&[at], self.slot(index).load(Ordering::SeqCst));
-                }
+        let mut fixups = lock(&self.fixups);
+        for (at, word) in words.iter().enumerate() {
+            if let Word::Code(index) = *word {
+                let at = address as usize + at * 8;
+                fixups.entry(index).or_default().push(at);
+                self.registered.fetch_add(1, Ordering::SeqCst);
+                patch(&[at], self.slot(index).load(Ordering::SeqCst));
             }
         }
         tables.insert(words.to_vec(), address);
@@ -211,6 +229,9 @@ impl Slots for Image {
     }
 
     fn zeroed(&self, len: usize) -> i64 {
+        if !self.backend.is_jit() {
+            return 0;
+        }
         lock(&self.state).alloc(len).unwrap_or_else(|error| panic!("{error}")) as i64
     }
 
@@ -238,20 +259,24 @@ impl Slots for Image {
     }
 
     fn cell(&self, index: usize, size: u32) -> i64 {
+        if let Some(aot) = self.aot() {
+            lock(aot).statics.entry(index).or_insert(aot::AotStatic::Local(size));
+            return 0;
+        }
+        if self.backend.is_check() {
+            return 0;
+        }
         let mut cells = lock(&self.cells);
         if let Some(&address) = cells.get(&index) {
             return address;
         }
         let address = self.zeroed(size as usize + 1);
         cells.insert(index, address);
-        if let Some(aot) = self.aot() {
-            lock(aot).statics.entry(index).or_insert(aot::AotStatic::Local(size));
-        }
         address
     }
 
     fn low_entries(&self) -> bool {
-        cfg!(target_arch = "aarch64") || self._low.is_low()
+        self.backend.is_aot() || cfg!(target_arch = "aarch64") || self._low.is_low()
     }
 
     fn rodata(&self, bytes: &[u8], relocs: &[lower::RodataReloc]) -> lower::RodataId {
@@ -267,6 +292,9 @@ impl Slots for Image {
     }
 
     fn vtable_entries(&self, id: lower::VtableId) -> Option<Vec<lower::VtableEntry>> {
+        if let Some(aot) = self.aot() {
+            return lock(aot).vtables.get(id.0 as usize).cloned();
+        }
         lock(&self.vtable_entries).get(id.0 as usize).cloned()
     }
 
@@ -275,7 +303,7 @@ impl Slots for Image {
     }
 }
 
-fn resolve_host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<(HostSymbol, usize), String> {
+pub(super) fn resolve_host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<(HostSymbol, usize), String> {
     let name = cx.symbol_name(item);
     let resolved = name.as_deref().and_then(HostSymbol::resolve).and_then(|sym| sym.host_addr().map(|addr| (sym, addr)));
     resolved.ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
@@ -286,7 +314,7 @@ fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, S
 }
 
 /// Whether the foreign item `item` links weakly, so a missing symbol reads as null.
-fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {
+pub(super) fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {
     cx.attr_value(item, "linkage") == Some("extern_weak")
 }
 
@@ -296,16 +324,15 @@ impl Image {
         Self::create(reached, ImageMode::Jit, (SHARED_BYTES, STATE_BYTES, TABLE_SLOTS))
     }
 
-    fn create(reached: &Reached, mode: ImageMode, (shared_bytes, state_bytes, table_slots): (usize, usize, usize)) -> Result<Image> {
-        let (shared_bytes, state_bytes, capacity) = if mode == ImageMode::Jit {
-            (shared_bytes, state_bytes, reached.list.len().max(table_slots))
+    pub(super) fn create(reached: &Reached, mode: ImageMode, (shared_bytes, state_bytes, table_slots): (usize, usize, usize)) -> Result<Image> {
+        let (shared, low, table, state, capacity) = if mode == ImageMode::Jit {
+            let capacity = reached.list.len().max(table_slots);
+            let mut low = Arena::low(capacity * size_of::<AtomicUsize>())?;
+            let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
+            (OptArena(Some(Arena::shared(shared_bytes)?)), OptArena(Some(low)), table, OptArena(Some(Arena::private(state_bytes)?)), capacity)
         } else {
-            (64 << 20, 64 << 20, 1)
+            (OptArena(None), OptArena(None), 0, OptArena(None), 0)
         };
-        let shared = Arena::shared(shared_bytes)?;
-        let mut low = Arena::low(capacity * size_of::<AtomicUsize>())?;
-        let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
-        let state = Arena::private(state_bytes)?;
         Ok(Image {
             table,
             _low: low,
@@ -357,7 +384,7 @@ impl Image {
         &self.times
     }
 
-    fn apply_records(&mut self) {
+    pub(super) fn apply_records(&mut self) {
         for (index, size, ns) in self.pass.records.drain(..) {
             if index >= self.sizes.len() {
                 self.sizes.resize(index + 1, 0);
@@ -406,32 +433,7 @@ impl Image {
     }
 
     pub(crate) fn build_aot(cx: &mut Context<'_>, reached: &Reached, roots: [usize; 2]) -> Result<(Image, HashMap<usize, String>)> {
-        let mut image = Self::create(reached, ImageMode::Aot, (SHARED_BYTES, STATE_BYTES, reached.list.len().max(1)))?;
-        let mut compiled = vec![false; reached.list.len()];
-        let mut reach = aot::AotReach::new(reached.list.len(), roots);
-        let mut broken = HashMap::default();
-        let mut wave = Vec::new();
-        loop {
-            if let Some(aot) = image.aot() {
-                let state = lock(aot);
-                reach.drain(&state, Some((&compiled, &mut wave)));
-            }
-            if wave.is_empty() {
-                break;
-            }
-            wave.sort_unstable();
-            for &idx in &wave {
-                if let Some(slot) = compiled.get_mut(idx) {
-                    *slot = true;
-                }
-            }
-            for (idx, err) in image.compile_inner(cx, reached, &wave, false) {
-                broken.insert(idx, err);
-            }
-            wave.clear();
-        }
-        image.bodies = lower::Bodies::default();
-        Ok((image, broken))
+        Self::build_aot_streaming(cx, reached, roots)
     }
 
     /// Lowers and encodes the reached functions `indices` that type-checked, on every core when there are many, links them, and returns the errors of those that did not compile, by index.
@@ -451,82 +453,12 @@ impl Image {
         if reset {
             self.reset_caches();
         }
-        self.bind_foreign_statics(cx, reached, indices);
         let mut errors = Vec::new();
-        let mut work = Vec::new();
-        let mut foreign_fns = Vec::new();
-        for &index in indices {
-            if reached.list[index].1.is_err() {
-                continue;
-            }
-            let item = reached.list[index].0.0;
-            if !cx.foreign(item) {
-                work.push(index);
-                continue;
-            }
-            match resolve_host_symbol(cx, item) {
-                Ok((sym, address)) if !lower::is_static(cx, item) => {
-                    if self.backend.is_jit() {
-                        self.slot(index).store(address, Ordering::Release);
-                    }
-                    if self.aot().is_some() {
-                        foreign_fns.push((index, sym));
-                    }
-                }
-                Ok(_) => {}
-                Err(_) if lower::is_static(cx, item) && weak(cx, item) => {}
-                Err(error) => errors.push((index, error)),
-            }
-        }
-        if !foreign_fns.is_empty()
-            && let Some(aot) = self.aot()
-        {
-            let mut state = lock(aot);
-            for (index, sym) in foreign_fns {
-                state.foreign_fns.insert(index, sym);
-            }
-        }
-        self.place_statics(cx, reached, &work);
+        let work = self.prepare_work(cx, reached, indices, &mut errors);
         errors.extend(self.compile_all(cx, reached, &work));
         self.apply_records();
         self.link();
         errors
-    }
-
-    fn bind_foreign_statics(&self, cx: &Context<'_>, reached: &Reached, indices: &[usize]) {
-        let mut cells_batch = Vec::new();
-        let mut aot_batch = Vec::new();
-        for (index, ((item, _), typed)) in indices.iter().map(|&index| (index, &reached.list[index])) {
-            if typed.is_err() || !cx.foreign(*item) || !lower::is_static(cx, *item) {
-                continue;
-            }
-            let resolved = resolve_host_symbol(cx, *item);
-            let is_weak = weak(cx, *item);
-            let (cell, host) = match (resolved, is_weak) {
-                (Ok((host, address)), true) => (self.data(&address.to_le_bytes()), Some(host)),
-                (Err(_), true) => (self.data(&0_usize.to_le_bytes()), None),
-                (Ok((host, address)), false) => (address as i64, Some(host)),
-                (Err(_), false) => continue,
-            };
-            cells_batch.push((index, cell));
-            if self.aot().is_some() {
-                aot_batch.push((index, aot::AotStatic::Foreign { weak: is_weak, host }));
-            }
-        }
-        if !cells_batch.is_empty() {
-            let mut cells = lock(&self.cells);
-            for (index, cell) in cells_batch {
-                cells.insert(index, cell);
-            }
-        }
-        if !aot_batch.is_empty()
-            && let Some(aot) = self.aot()
-        {
-            let mut state = lock(aot);
-            for (index, entry) in aot_batch {
-                state.statics.insert(index, entry);
-            }
-        }
     }
 
     fn link(&self) {

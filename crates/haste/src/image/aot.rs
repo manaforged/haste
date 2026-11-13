@@ -1,20 +1,43 @@
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, bail};
-use haste_codegen::{Code, RelocKind, Target};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use haste_codegen::{Code, RelocKind, StencilReloc, Target};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 
 use crate::aot::{Executable, Symbol};
 use crate::host::HostSymbol;
-use crate::lower::{RodataReloc, RodataTarget, SymbolSource, VtableEntry, Word};
+use crate::lower::{RodataId, RodataReloc, RodataTarget, SymbolSource, VtableEntry, VtableId, Word};
 use crate::sync::lock;
 
 use super::Image;
 
 #[derive(Clone)]
+pub(super) struct AotCode {
+    bytes: Vec<u8>,
+    relocs: Vec<StencilReloc>,
+}
+
+impl AotCode {
+    pub(super) fn from_code(code: &Code) -> Arc<Self> {
+        Arc::new(Self { bytes: code.bytes().to_vec(), relocs: code.relocs().to_vec() })
+    }
+
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn relocs(&self) -> &[StencilReloc] {
+        &self.relocs
+    }
+}
+
+#[derive(Clone)]
 pub(super) enum AotFn {
-    Direct { code: Arc<Code>, relocs: Vec<SymbolSource> },
-    Dict { body: Arc<Code>, relocs: Vec<SymbolSource> },
+    Direct { code: Arc<AotCode>, relocs: Vec<SymbolSource> },
+    Dict { body: Arc<AotCode>, relocs: Vec<SymbolSource> },
     Alias(usize),
 }
 
@@ -23,26 +46,132 @@ pub(super) enum AotStatic {
     Foreign { weak: bool, host: Option<HostSymbol> },
 }
 
+struct QueueState {
+    buckets: VecDeque<Vec<usize>>,
+    loose: Vec<usize>,
+    active: usize,
+}
+
+pub(super) struct AotQueue {
+    claimed: Vec<AtomicBool>,
+    state: Mutex<QueueState>,
+    wake: Condvar,
+}
+
+pub(super) struct TaskGuard<'a>(&'a AotQueue);
+
+impl Drop for TaskGuard<'_> {
+    fn drop(&mut self) {
+        self.0.finish_task();
+    }
+}
+
+impl AotQueue {
+    pub(super) fn new(claimed: Vec<AtomicBool>, initial_buckets: Vec<Vec<usize>>) -> Arc<Self> {
+        Arc::new(Self {
+            claimed,
+            state: Mutex::new(QueueState { buckets: initial_buckets.into(), loose: Vec::new(), active: 0 }),
+            wake: Condvar::new(),
+        })
+    }
+
+    pub(super) fn claim(&self, idx: usize) -> bool {
+        idx < self.claimed.len() && !self.claimed[idx].swap(true, Ordering::AcqRel)
+    }
+
+    pub(super) fn push_loose(&self, items: Vec<usize>) {
+        if items.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.loose.extend(items);
+        self.wake.notify_all();
+    }
+
+    pub(super) fn reseed_buckets(&self, buckets: Vec<Vec<usize>>) {
+        if buckets.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.buckets.extend(buckets);
+        self.wake.notify_all();
+    }
+
+    pub(super) fn pop(&self, jobs: usize) -> Option<(Vec<usize>, TaskGuard<'_>)> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(bucket) = state.buckets.pop_front() {
+                state.active += 1;
+                return Some((bucket, TaskGuard(self)));
+            }
+            if !state.loose.is_empty() {
+                let take = state.loose.len().div_ceil(jobs.max(1)).clamp(1, 16);
+                let start = state.loose.len().saturating_sub(take);
+                let batch = state.loose.split_off(start);
+                state.active += 1;
+                return Some((batch, TaskGuard(self)));
+            }
+            if state.active == 0 {
+                self.wake.notify_all();
+                return None;
+            }
+            state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    pub(super) fn take_all_pending(&self) -> Vec<usize> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        while let Some(bucket) = state.buckets.pop_front() {
+            out.extend(bucket);
+        }
+        out.append(&mut state.loose);
+        out
+    }
+
+    fn finish_task(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 && state.buckets.is_empty() && state.loose.is_empty() {
+            self.wake.notify_all();
+        }
+    }
+}
+
+fn hash_key<T: Hash + ?Sized>(val: &T) -> u64 {
+    let mut h = FxHasher::default();
+    val.hash(&mut h);
+    h.finish()
+}
+
 pub(crate) struct AotState {
     pub(super) rodata: Vec<(Vec<u8>, Vec<RodataReloc>)>,
+    rodata_buckets: HashMap<u64, Vec<RodataId>>,
     pub(super) vtables: Vec<Vec<VtableEntry>>,
+    vtable_buckets: HashMap<u64, Vec<VtableId>>,
     pub(super) statics: HashMap<usize, AotStatic>,
     pub(super) promoted: Vec<((usize, u32), u32)>,
     pub(super) promoted_seen: HashMap<(usize, u32), usize>,
     pub(super) foreign_fns: HashMap<usize, HostSymbol>,
     pub(super) functions: Vec<Option<AotFn>>,
+    pub(super) frontier: Option<Arc<AotQueue>>,
+    frontier_vtables: Vec<bool>,
 }
 
 impl AotState {
     pub(super) fn new(len: usize) -> Mutex<Self> {
         Mutex::new(Self {
             rodata: Vec::new(),
+            rodata_buckets: HashMap::default(),
             vtables: Vec::new(),
+            vtable_buckets: HashMap::default(),
             statics: HashMap::default(),
             promoted: Vec::new(),
             promoted_seen: HashMap::default(),
             foreign_fns: HashMap::default(),
             functions: vec![None; len],
+            frontier: None,
+            frontier_vtables: Vec::new(),
         })
     }
 
@@ -50,6 +179,115 @@ impl AotState {
         if self.functions.len() < len {
             self.functions.resize(len, None);
         }
+    }
+
+    pub(super) fn alloc_rodata(&mut self, bytes: &[u8], relocs: &[RodataReloc]) -> RodataId {
+        let id = RodataId(self.rodata.len() as u32);
+        self.rodata.push((bytes.to_vec(), relocs.to_vec()));
+        id
+    }
+
+    pub(super) fn intern_rodata(&mut self, bytes: &[u8], relocs: &[RodataReloc]) -> RodataId {
+        let hash = hash_key(&(bytes, relocs));
+        if let Some(bucket) = self.rodata_buckets.get(&hash) {
+            for &id in bucket {
+                if let Some((b, r)) = self.rodata.get(id.0 as usize)
+                    && b.as_slice() == bytes
+                    && r.as_slice() == relocs
+                {
+                    return id;
+                }
+            }
+        }
+        let id = self.alloc_rodata(bytes, relocs);
+        self.rodata_buckets.entry(hash).or_default().push(id);
+        id
+    }
+
+    pub(super) fn intern_vtable(&mut self, entries: &[VtableEntry]) -> VtableId {
+        let hash = hash_key(entries);
+        if let Some(bucket) = self.vtable_buckets.get(&hash) {
+            for &id in bucket {
+                if self.vtables.get(id.0 as usize).is_some_and(|e| e.as_slice() == entries) {
+                    return id;
+                }
+            }
+        }
+        let id = VtableId(self.vtables.len() as u32);
+        self.vtables.push(entries.to_vec());
+        self.vtable_buckets.entry(hash).or_default().push(id);
+        id
+    }
+
+    fn collect_new_targets(&mut self, entry: &AotFn, queue: &AotQueue) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut vstack = Vec::new();
+        for_each_fn_edge(entry, |edge| match edge {
+            FnEdge::Sym(SymbolSource::Slot(idx) | SymbolSource::StaticCell { index: idx, .. }, _) => {
+                if queue.claim(*idx) {
+                    out.push(*idx);
+                }
+            }
+            FnEdge::Sym(SymbolSource::Vtable(id), _) => vstack.push(id.0 as usize),
+            FnEdge::Sym(_, _) => {}
+            FnEdge::Alias(leader) => {
+                if queue.claim(leader) {
+                    out.push(leader);
+                }
+            }
+        });
+        while let Some(id) = vstack.pop() {
+            if id >= self.frontier_vtables.len() {
+                self.frontier_vtables.resize(id + 1, false);
+            }
+            if self.frontier_vtables[id] {
+                continue;
+            }
+            self.frontier_vtables[id] = true;
+            if let Some(entries) = self.vtables.get(id) {
+                for entry in entries {
+                    match *entry {
+                        VtableEntry::Word(Word::Code(fn_idx)) => {
+                            if queue.claim(fn_idx) {
+                                out.push(fn_idx);
+                            }
+                        }
+                        VtableEntry::Super(super_id) => vstack.push(super_id.0 as usize),
+                        VtableEntry::Word(Word::Int(_)) => {}
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+enum FnEdge<'a> {
+    Sym(&'a SymbolSource, bool),
+    Alias(usize),
+}
+
+fn for_each_fn_edge(entry: &AotFn, mut on_edge: impl FnMut(FnEdge<'_>)) {
+    match entry {
+        AotFn::Direct { code, relocs } => {
+            for reloc in code.relocs() {
+                if reloc.as_runtime().is_some() {
+                    continue;
+                }
+                if let Some(sym) = relocs.get(reloc.symbol as usize) {
+                    on_edge(FnEdge::Sym(
+                        sym,
+                        matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32),
+                    ));
+                }
+            }
+        }
+        AotFn::Dict { relocs, .. } => {
+            for sym in relocs {
+                on_edge(FnEdge::Sym(sym, false));
+            }
+        }
+        AotFn::Alias(leader) => on_edge(FnEdge::Alias(*leader)),
     }
 }
 
@@ -152,29 +390,17 @@ impl AotReach {
                     next_wave.push(idx);
                     continue;
                 }
-                match state.functions.get(idx).and_then(Option::as_ref) {
-                    Some(AotFn::Direct { code, relocs }) => {
-                        for reloc in code.relocs() {
-                            if reloc.as_runtime().is_some() {
-                                continue;
-                            }
-                            let Some(sym) = relocs.get(reloc.symbol as usize) else { continue };
-                            if matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32)
-                                && let SymbolSource::Slot(callee) = *sym
-                            {
+                if let Some(entry) = state.functions.get(idx).and_then(Option::as_ref) {
+                    for_each_fn_edge(entry, |edge| match edge {
+                        FnEdge::Sym(sym, direct) => {
+                            if direct && let SymbolSource::Slot(callee) = *sym {
                                 self.mark_fn(callee);
                             } else {
                                 self.mark_sym(sym);
                             }
                         }
-                    }
-                    Some(AotFn::Dict { relocs, .. }) => {
-                        for sym in relocs {
-                            self.mark_sym(sym);
-                        }
-                    }
-                    Some(AotFn::Alias(leader)) => self.mark_fn(*leader),
-                    None => {}
+                        FnEdge::Alias(leader) => self.mark_fn(leader),
+                    });
                 }
             }
             while let Some(id) = self.work_rodata.pop() {
@@ -285,7 +511,7 @@ fn foreign_sym(foreign_fns: &HashMap<usize, HostSymbol>, idx: usize) -> Symbol {
     foreign_fns.get(&idx).map_or(Symbol::Host(HostSymbol::Abort), |host| Symbol::Host(host.clone()))
 }
 
-fn icf_key<'a>(self_idx: usize, code: &'a Code, relocs: &[SymbolSource], state: &AotState, syms: &SymTable<'_>, roots: &[usize], canon: &[usize]) -> Result<IcfKey<'a>> {
+fn icf_key<'a>(self_idx: usize, code: &'a AotCode, relocs: &[SymbolSource], state: &AotState, syms: &SymTable<'_>, roots: &[usize], canon: &[usize]) -> Result<IcfKey<'a>> {
     let mut sig = Vec::with_capacity(code.relocs().len());
     for reloc in code.relocs() {
         let target = match reloc.as_runtime() {
@@ -394,10 +620,18 @@ impl Image {
         if let Some(aot) = self.aot() {
             let mut state = lock(aot);
             state.ensure_len(index + 1);
+            let frontier = state.frontier.clone();
+            let discovered = frontier.as_ref().map(|q| state.collect_new_targets(&entry, q));
             state.functions[index] = Some(entry);
             for &follower in followers {
                 state.ensure_len(follower + 1);
                 state.functions[follower] = Some(AotFn::Alias(index));
+            }
+            drop(state);
+            if let (Some(q), Some(items)) = (frontier, discovered)
+                && !items.is_empty()
+            {
+                q.push_loose(items);
             }
         }
     }
@@ -442,11 +676,11 @@ impl Image {
             };
             static_syms.insert(index, sym);
         }
+        let mut promoted_keys: Vec<_> = state.promoted.iter().copied().filter(|&(key, _)| live.promoted.contains(&key)).collect();
+        promoted_keys.sort_unstable_by_key(|&(key, _)| key);
         let mut promoted_syms = HashMap::default();
-        for &((owner, seq), size) in &state.promoted {
-            if live.promoted.contains(&(owner, seq)) {
-                promoted_syms.insert((owner, seq), Symbol::Bss(exe.bss(size, 16)));
-            }
+        for ((owner, seq), size) in promoted_keys {
+            promoted_syms.insert((owner, seq), Symbol::Bss(exe.bss(size, 16)));
         }
 
         let syms = SymTable {

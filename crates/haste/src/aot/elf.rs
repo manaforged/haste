@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use haste_codegen::{Arch, Os};
 
 use super::shims::{emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
-use super::{Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, resolve_sym};
+use super::{Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, resolve_sym};
 
 struct ElfTables {
     dynstr: Vec<u8>,
@@ -75,8 +75,10 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let start_off = (stubs_off + plan.imports.len() * stub_size).next_multiple_of(16);
     let tramp_off = (start_off + start_size).next_multiple_of(16);
     let shims_off = (tramp_off + tramp_size).next_multiple_of(16);
-    let (shim_offs, text_off) = plan_shims(arch, Os::Linux, &plan, ELF_BASE, shims_off)?;
-    let rx_end = (text_off + exe.text.len()).next_multiple_of(16);
+    let (shim_offs, head_off) = plan_shims(arch, Os::Linux, &plan, ELF_BASE, shims_off)?;
+    let veneers = plan_veneers(exe, &plan, ELF_BASE, head_off, &shim_offs, |_, _| stubs_off)?;
+    let text_off = head_off + veneers.pre_len;
+    let rx_end = (text_off + exe.text.len().next_multiple_of(16) + veneers.post_len).next_multiple_of(16);
 
     let rw_off = rx_end;
     let rw_va = ELF_BASE + (rx_end + page) as u64;
@@ -142,10 +144,12 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     out.align(16);
     emit_shims(arch, Os::Linux, &plan, ELF_BASE, 0, addrs, &stub_va, None, &mut out)?;
     out.align(16);
+    veneers.emit_pre(&resolve, &mut out)?;
     out.bytes(&exe.text);
     out.align(16);
+    veneers.emit_post(&resolve, &mut out)?;
     let resolve_got = |name: &str| Ok(got_va(plan.import_idx(name)?));
-    let ctx = PatchCtx { text_base: text_off, text_va: addrs.text, pie_arm64: false, addrs, base_va: ELF_BASE, shim_offs: &shim_offs, plan: &plan, stub_va: &stub_va, got_va: &resolve_got };
+    let ctx = PatchCtx { text_base: text_off, text_va: addrs.text, pie_arm64: false, addrs, base_va: ELF_BASE, shim_offs: &shim_offs, plan: &plan, stub_va: &stub_va, got_va: &resolve_got, veneers: &veneers };
     patch_code(&exe.relocs, &ctx, &mut out.0)?;
 
     out.bytes(&exe.data);
