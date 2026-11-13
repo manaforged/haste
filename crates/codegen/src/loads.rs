@@ -1,6 +1,6 @@
 //! Reuses what memory holds along straight-line code: a load of the bytes an earlier load or store on the same path read or wrote, with no write of unknown reach between them, takes that value.
 
-use crate::ir::{Block, Function, Inst, Op, StackSlot, Type, Value};
+use crate::ir::{Binary, Block, Function, Inst, Op, StackSlot, Type, Value};
 use crate::merge::{find, identity, pred_counts, rename};
 
 /// The most cells one path remembers, so a long block costs linear time.
@@ -105,6 +105,7 @@ pub(crate) fn clobbers(op: &Op) -> bool {
 struct State<'a> {
     slots: &'a [Option<(StackSlot, i32)>],
     unescaped: &'a [bool],
+    call_readonly: &'a [bool],
     selects: &'a [Option<(Value, Value, Value)>],
     consts: &'a mut [Option<i64>],
     subst: &'a mut [Value],
@@ -205,7 +206,10 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                 }
             }
             Effect::ClobberSlot { slot, offset, bytes } => known.clobber_slot(slot, offset, bytes, state.unescaped),
-            Effect::Unknown => known.0.retain(|(c, _)| matches!(c.base, Base::Slot(s) if state.unescaped[s.index()])),
+            Effect::Unknown => {
+                let is_call = matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. });
+                known.0.retain(|(c, _)| matches!(c.base, Base::Slot(s) if state.unescaped[s.index()] || (is_call && state.call_readonly[s.index()])));
+            }
             Effect::None => {}
         }
         kept.push(Some(inst));
@@ -215,43 +219,93 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
 }
 
 /// The frame slot and offset each value holds the address of, when an instruction computes it as one.
-fn slot_addresses(func: &Function) -> Vec<Option<(StackSlot, i32)>> {
+pub(crate) fn slot_addresses(func: &Function) -> Vec<Option<(StackSlot, i32)>> {
+    let mut consts = vec![None; func.types.len()];
     let mut slots = vec![None; func.types.len()];
-    for data in &func.insts {
-        if let (Op::StackAddr(slot, offset), Some(result)) = (&data.op, data.result) {
-            slots[result.index()] = Some((*slot, *offset));
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let data = &func.insts[inst.index()];
+        match (&data.op, data.result) {
+            (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
+            (&Op::StackAddr(slot, offset), Some(result)) => slots[result.index()] = Some((slot, offset)),
+            _ => {}
+        }
+    }
+    loop {
+        let mut changed = false;
+        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+            let data = &func.insts[inst.index()];
+            let Some(result) = data.result else { continue };
+            if slots[result.index()].is_some() {
+                continue;
+            }
+            if let Op::Binary(Binary::Iadd, a, b) = data.op {
+                let derived = [(a, b), (b, a)].into_iter().find_map(|(ptr, off)| {
+                    let (slot, base) = slots[ptr.index()]?;
+                    let c = i32::try_from(consts[off.index()]?).ok()?;
+                    Some((slot, base.checked_add(c)?))
+                });
+                if let Some(val) = derived {
+                    slots[result.index()] = Some(val);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
     slots
 }
 
-/// Whether each stack slot's address never escapes outside direct loads, stores (as address), and moves.
-fn unescaped_slots(func: &Function) -> Vec<bool> {
-    let mut total_uses = vec![0_u32; func.types.len()];
-    let mut safe_uses = vec![0_u32; func.types.len()];
+fn slot_use_counts(func: &Function, slots: &[Option<(StackSlot, i32)>]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let count = func.types.len();
+    let (mut total, mut safe, mut readonly_calls) = (vec![0_u32; count], vec![0_u32; count], vec![0_u32; count]);
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        let op = &func.insts[inst.index()].op;
-        op.for_operands(|value| total_uses[value.index()] += 1);
-        match *op {
-            Op::Load(addr, _) => safe_uses[addr.index()] += 1,
-            Op::Store(val, addr, _) if val != addr => safe_uses[addr.index()] += 1,
+        let data = &func.insts[inst.index()];
+        data.op.for_operands(|value| total[value.index()] += 1);
+        match &data.op {
+            Op::Load(addr, _) => safe[addr.index()] += 1,
+            Op::Store(val, addr, _) if val != addr => safe[addr.index()] += 1,
             Op::Move(to, from, _) => {
-                safe_uses[to.index()] += 1;
-                safe_uses[from.index()] += 1;
+                safe[to.index()] += 1;
+                safe[from.index()] += 1;
+            }
+            Op::Binary(Binary::Iadd, a, b) if data.result.is_some_and(|r| slots[r.index()].is_some()) => {
+                if slots[a.index()].is_some() {
+                    safe[a.index()] += 1;
+                } else if slots[b.index()].is_some() {
+                    safe[b.index()] += 1;
+                }
+            }
+            Op::Call { sig, args, .. } | Op::TryCall { sig, args, .. } => {
+                let mask = func.sigs[sig.index()].readonly_params;
+                for (i, arg) in args.iter().enumerate() {
+                    if i < 64 && ((mask >> i) & 1) != 0 {
+                        readonly_calls[arg.index()] += 1;
+                    }
+                }
             }
             _ => {}
         }
     }
+    (total, safe, readonly_calls)
+}
+
+/// For each stack slot, `(unescaped, call_readonly)`: never escaped at all, or passed outside direct memory ops only to `readonly_params` calls.
+pub(crate) fn classify_slots(func: &Function, slots: &[Option<(StackSlot, i32)>]) -> (Vec<bool>, Vec<bool>) {
+    let (total, safe, readonly_calls) = slot_use_counts(func, slots);
     let mut unescaped = vec![true; func.slots.len()];
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        let data = &func.insts[inst.index()];
-        if let (Op::StackAddr(slot, _), Some(result)) = (&data.op, data.result)
-            && safe_uses[result.index()] != total_uses[result.index()]
-        {
-            unescaped[slot.index()] = false;
+    let mut call_readonly = vec![true; func.slots.len()];
+    for (v, slot) in slots.iter().enumerate() {
+        let Some((s, _)) = *slot else { continue };
+        if safe[v] != total[v] {
+            unescaped[s.index()] = false;
+        }
+        if safe[v] + readonly_calls[v] != total[v] {
+            call_readonly[s.index()] = false;
         }
     }
-    unescaped
+    (unescaped, call_readonly)
 }
 
 /// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between: through each block and on into a successor that only it enters.
@@ -262,7 +316,7 @@ pub(crate) fn run(func: &mut Function) {
     }
     let preds = pred_counts(func);
     let slots = slot_addresses(func);
-    let unescaped = unescaped_slots(func);
+    let (unescaped, call_readonly) = classify_slots(func, &slots);
     let mut consts = vec![None; func.types.len()];
     let mut selects = vec![None; func.types.len()];
     for data in &func.insts {
@@ -273,7 +327,7 @@ pub(crate) fn run(func: &mut Function) {
         }
     }
     let mut subst = identity(func.types.len());
-    let mut state = State { slots: &slots, unescaped: &unescaped, selects: &selects, consts: &mut consts, subst: &mut subst };
+    let mut state = State { slots: &slots, unescaped: &unescaped, call_readonly: &call_readonly, selects: &selects, consts: &mut consts, subst: &mut subst };
     let mut dropped = false;
     let mut seen = vec![false; func.blocks.len()];
     let mut stack = vec![(entry, Known::default())];

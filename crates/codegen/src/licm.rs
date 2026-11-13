@@ -1,9 +1,9 @@
 //! Moves out of each loop what every trip computes alike: pure instructions that cannot trap and whose operands the loop does not change, and loads at the head of a loop that writes no memory.
 
 use crate::dom::dominators;
-use crate::ir::{Binary, Block, BlockData, Function, Inst, Op, Value};
-use crate::loads::clobbers;
+use crate::ir::{Binary, Block, BlockData, Function, Inst, Op, StackSlot, Value};
 use crate::live::results;
+use crate::loads::{classify_slots, clobbers, slot_addresses};
 
 /// One natural loop: its head, the blocks of its body including the head, and the one block outside it that enters the head by a jump, when there is one.
 struct Loop {
@@ -126,12 +126,35 @@ fn preheader(func: &mut Function, each: &Loop, home: &mut Vec<Option<Block>>) ->
 }
 
 /// Moves into the loop's entry block, before its jump, each instruction of the loop that may move, in order, and records their new home.
-fn hoist(func: &mut Function, each: &Loop, entry: Block, (readonly, ro_bytes): (&[bool], &[u32]), home: &mut [Option<Block>]) {
-    let writes = (0..each.body.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts).any(|inst| {
+fn hoist(
+    func: &mut Function,
+    each: &Loop,
+    entry: Block,
+    (readonly, ro_bytes): (&[bool], &[u32]),
+    (slot_ro, slot_addrs): (&[bool], &[Option<(StackSlot, i32)>]),
+    home: &mut [Option<Block>],
+) {
+    let mut writes = false;
+    let mut calls = false;
+    let mut written_slots = vec![false; func.slots.len()];
+    for inst in (0..each.body.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts) {
         let op = &func.insts[inst.index()].op;
-        clobbers(op) || matches!(op, Op::Store(..) | Op::StackStore(..))
-    });
-    let calls = (0..each.body.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts).any(|inst| matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. }));
+        if clobbers(op) || matches!(op, Op::Store(..) | Op::StackStore(..)) {
+            writes = true;
+        }
+        if matches!(op, Op::Call { .. } | Op::TryCall { .. }) {
+            calls = true;
+        }
+        match op {
+            Op::StackStore(_, slot, _) => written_slots[slot.index()] = true,
+            Op::Store(_, addr, _) | Op::Move(addr, _, _) => {
+                if let Some((slot, _)) = slot_addrs.get(addr.index()).copied().flatten() {
+                    written_slots[slot.index()] = true;
+                }
+            }
+            _ => {}
+        }
+    }
     let mut moved: Vec<Inst> = Vec::new();
     for block in (0..each.body.len()).filter(|block| each.body[*block]) {
         let head = block == each.head.index();
@@ -146,10 +169,27 @@ fn hoist(func: &mut Function, each: &Loop, entry: Block, (readonly, ro_bytes): (
             let static_loc = matches!(data.op, Op::StackAddr(..) | Op::SlotAddr(_))
                 || (matches!(data.op, Op::Const(_)) && data.result.is_none_or(|result| !func.ty(result).is_float()));
             let load_ok = match (&data.op, data.result) {
-                (&Op::Load(addr, offset), Some(res)) if !calls => {
+                (&Op::StackLoad(slot, offset), Some(res)) => {
+                    let width = u64::from(func.ty(res).bytes());
+                    slot_ro.get(slot.index()).copied().unwrap_or(false)
+                        && !written_slots[slot.index()]
+                        && offset >= 0
+                        && (offset as u64).checked_add(width).is_some_and(|end| end <= u64::from(func.slots[slot.index()].size))
+                }
+                (&Op::Load(addr, offset), Some(res)) => {
                     let width = func.ty(res).bytes();
+                    let slot_load_ok = slot_addrs.get(addr.index()).copied().flatten().is_some_and(|(slot, base_off)| {
+                        slot_ro.get(slot.index()).copied().unwrap_or(false)
+                            && !written_slots[slot.index()]
+                            && i64::from(base_off).checked_add(i64::from(offset)).is_some_and(|total| {
+                                total >= 0
+                                    && (total as u64)
+                                        .checked_add(u64::from(width))
+                                        .is_some_and(|end| end <= u64::from(func.slots[slot.index()].size))
+                            })
+                    });
                     let deref_ok = offset >= 0 && (offset as u64) + u64::from(width) <= u64::from(ro_bytes.get(addr.index()).copied().unwrap_or(0));
-                    (head && !writes) || (head_prefix && readonly.get(addr.index()).copied().unwrap_or(false)) || deref_ok
+                    slot_load_ok || (!calls && ((head && !writes) || (head_prefix && readonly.get(addr.index()).copied().unwrap_or(false)) || deref_ok))
                 }
                 _ => false,
             };
@@ -191,6 +231,8 @@ pub(crate) fn run(func: &mut Function) {
             ro_bytes[param.index()] = func.signature.readonly_bytes[i];
         }
     }
+    let slot_addrs = slot_addresses(func);
+    let (_, slot_ro) = classify_slots(func, &slot_addrs);
     let mut home = homes(func);
     for idx in 0..found.len() {
         let pre = found[idx].entry.or_else(|| {
@@ -204,7 +246,7 @@ pub(crate) fn run(func: &mut Function) {
             Some(created)
         });
         if let Some(entry) = pre {
-            hoist(func, &found[idx], entry, (&readonly, &ro_bytes), &mut home);
+            hoist(func, &found[idx], entry, (&readonly, &ro_bytes), (&slot_ro, &slot_addrs), &mut home);
         }
     }
 }

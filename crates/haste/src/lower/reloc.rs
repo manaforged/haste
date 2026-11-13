@@ -65,6 +65,7 @@ pub(super) enum SiteOrigin {
     ShapeUntuple,
     ShapeClone(u16),
     VtableMethod { expr: ExprId, slot: u16 },
+    Known(ItemRef, Substs),
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +257,7 @@ fn eval_site(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Sub
             _ => bail!("expected clone shape"),
         },
         SiteOrigin::VtableMethod { slot, .. } => bail!("unexpected eval_site for vtable method slot {slot}"),
+        SiteOrigin::Known(item, call_substs) => Ok((*item, *call_substs)),
     }
 }
 

@@ -149,9 +149,19 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
         thread::run(func);
         fold::run(func, effort);
         merge::run(func);
+        for _ in 0..2 {
+            if !promote::step(func, kind) {
+                break;
+            }
+            fold::run(func, effort);
+            merge::run(func);
+        }
+        cse::run(func);
+        licm::run(func);
+        loads::run(func);
+        fold::run(func, effort);
         cse::run(func);
         switch::run(func);
-        licm::run(func);
     }
     returns::run(func);
     if effort == Effort::Full && tailrec::run(func) {

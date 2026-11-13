@@ -198,11 +198,23 @@ impl Fold {
         self.defs[self.find(value).index()].map(|inst| &func.insts[inst.index()].op)
     }
 
-    /// Whether `value` is 0 or 1 in its low byte because a comparison or overflow check defines it.
+    /// Whether `value` is 0 or 1 in its low byte because a comparison, overflow check, or boolean op defines it.
     fn boolean(&self, func: &Function, value: Value) -> bool {
+        self.boolean_at(func, value, 0)
+    }
+
+    fn boolean_at(&self, func: &Function, value: Value, depth: u8) -> bool {
+        if depth >= 8 {
+            return false;
+        }
+        let is_01 = |v: Value| matches!(self.known(v), Some(0 | 1)) || self.boolean_at(func, v, depth + 1);
         match self.def(func, value) {
             Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..)) => true,
-            Some(Op::Convert(Convert::Uextend, inner)) => matches!(self.def(func, *inner), Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..))),
+            Some(Op::Convert(Convert::Uextend, inner)) => self.boolean_at(func, *inner, depth + 1),
+            Some(Op::Binary(Binary::Band, a, b)) => {
+                matches!(self.known(*a), Some(0 | 1)) || matches!(self.known(*b), Some(0 | 1)) || (is_01(*a) && is_01(*b))
+            }
+            Some(Op::Binary(Binary::Bor | Binary::Bxor, a, b) | Op::Select(_, a, b)) => is_01(*a) && is_01(*b),
             _ => false,
         }
     }
@@ -215,16 +227,28 @@ impl Fold {
     /// The existing value the result of `op` always equals, when there is one.
     fn identity(&self, func: &Function, op: &Op) -> Option<Value> {
         match *op {
-            Op::Select(condition, x, y) => self.known(condition).map(|known| if known != 0 { x } else { y }),
+            Op::Select(condition, x, y) => {
+                if self.find(x) == self.find(y) {
+                    return Some(x);
+                }
+                if let Some(known) = self.known(condition) {
+                    return Some(if known != 0 { x } else { y });
+                }
+                (func.ty(condition) == func.ty(x)
+                    && self.boolean(func, condition)
+                    && self.known(x) == Some(1)
+                    && self.known(y) == Some(0))
+                .then_some(condition)
+            }
             Op::Binary(kind, x, y) if func.ty(x).is_small_int() => self.neutral(func, kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
             Op::Unary(kind @ (Unary::Ineg | Unary::Bnot), x) => match *self.def(func, x)? {
                 Op::Unary(inner, value) if inner == kind => Some(value),
                 _ => None,
             },
-            Op::Icmp(cc, x, y) if self.boolean(func, x) => {
-                let imm = extend(self.known(y)?, func.ty(x), false);
-                matches!((cc, imm), (IntCC::NotEqual, 0) | (IntCC::Equal, 1)).then_some(x)
-            }
+            Op::Icmp(cc, x, y) => [(x, y), (y, x)].into_iter().find_map(|(b, c)| {
+                let imm = extend(self.known(c)?, func.ty(b), false);
+                (func.ty(b) == Type::I8 && self.boolean(func, b) && matches!((cc, imm), (IntCC::NotEqual, 0) | (IntCC::Equal, 1))).then_some(b)
+            }),
             _ => None,
         }
     }
@@ -661,18 +685,20 @@ fn is_float_two(func: &Function, defs: &[Option<Inst>], value: Value) -> bool {
     }
 }
 
-/// The value `op` negates when the constants make it `v ^ 1`, `1 ^ v`, `v == 0` or `v != 1`.
-fn negated(op: &Op, consts: &[Option<i64>]) -> Option<Value> {
+/// The boolean value `op` negates (`v ^ 1`, `v == 0`, `v != 1`, or `select(v, 0, 1)`), plus any existing `1` constant.
+fn negated(op: &Op, consts: &[Option<i64>], bools: &[bool]) -> Option<(Value, Option<Value>)> {
     let is = |value: Value, want: i64| consts[value.index()] == Some(want);
     match *op {
-        Op::Binary(Binary::Bxor, x, y) | Op::Icmp(IntCC::NotEqual, x, y) if is(y, 1) => Some(x),
-        Op::Binary(Binary::Bxor, y, x) if is(y, 1) => Some(x),
-        Op::Icmp(IntCC::Equal, x, y) if is(y, 0) => Some(x),
+        Op::Binary(Binary::Bxor, x, y) | Op::Icmp(IntCC::NotEqual, x, y) if is(y, 1) => Some((x, Some(y))),
+        Op::Binary(Binary::Bxor, y, x) | Op::Icmp(IntCC::NotEqual, y, x) if is(y, 1) => Some((x, Some(y))),
+        Op::Icmp(IntCC::Equal, x, y) if is(y, 0) => Some((x, None)),
+        Op::Icmp(IntCC::Equal, y, x) if is(y, 0) => Some((x, None)),
+        Op::Select(c, x, y) if is(x, 0) && is(y, 1) && bools[c.index()] => Some((c, Some(y))),
         _ => None,
     }
 }
 
-/// Rewrites a negation of a compare, `x ^ 1`, `x == 0` or `x != 1`, as the inverse compare, so a negated condition branches on the flags, and a branch on `x == 0` or `x != 0` as a branch on `x`.
+/// Rewrites a negation of a compare, `x ^ 1`, `x == 0`, `x != 1`, or `select(x, 0, 1)`, as the inverse compare or `x ^ 1`, and simplifies branches on `x == 0` / `x != 0`.
 fn invert(func: &mut Function) {
     let count = func.types.len();
     let (mut compares, mut consts, mut xors, mut bools) = (vec![None; count], vec![None; count], vec![None; count], vec![false; count]);
@@ -686,20 +712,43 @@ fn invert(func: &mut Function) {
             (&Op::Fcmp(..) | &Op::Fits(..), Some(result)) => bools[result.index()] = true,
             (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
             (&Op::Binary(Binary::Bxor, x, y), Some(result)) => xors[result.index()] = Some((x, y)),
-            (&Op::Binary(Binary::Band, x, y), Some(result)) => {
-                if consts[x.index()] == Some(1) || consts[y.index()] == Some(1) {
-                    bools[result.index()] = true;
-                }
-            }
             _ => {}
+        }
+    }
+    let is_01 = |v: Value, bools: &[bool]| bools[v.index()] || matches!(consts[v.index()], Some(0 | 1));
+    for _ in 0..2 {
+        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+            let data = &func.insts[inst.index()];
+            let Some(result) = data.result else { continue };
+            bools[result.index()] |= match data.op {
+                Op::Binary(Binary::Band, x, y) => matches!(consts[x.index()], Some(0 | 1)) || matches!(consts[y.index()], Some(0 | 1)) || (is_01(x, &bools) && is_01(y, &bools)),
+                Op::Binary(Binary::Bor | Binary::Bxor, x, y) | Op::Select(_, x, y) => is_01(x, &bools) && is_01(y, &bools),
+                Op::Convert(Convert::Uextend, inner) => bools[inner.index()],
+                _ => false,
+            };
         }
     }
     let types = &func.types;
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let res = func.insts[inst.index()].result;
         let op = &mut func.insts[inst.index()].op;
-        if let Some((cc, a, b)) = negated(op, &consts).and_then(|value| compares[value.index()]) {
-            *op = Op::Icmp(cc.inverse(), a, b);
-            continue;
+        if let (Some(res), Some((inner, opt_one))) = (res, negated(op, &consts, &bools)) {
+            let res_ty = types[res.index()];
+            if res_ty == Type::I8
+                && let Some((cc, a, b)) = compares[inner.index()]
+            {
+                *op = Op::Icmp(cc.inverse(), a, b);
+                continue;
+            }
+            if bools[inner.index()]
+                && let Some(one) = opt_one
+                && types[inner.index()] == res_ty
+                && types[one.index()] == res_ty
+                && !matches!(*op, Op::Binary(Binary::Bxor, ..))
+            {
+                *op = Op::Binary(Binary::Bxor, inner, one);
+                continue;
+            }
         }
         let Op::Brif(condition, then, then_args, otherwise, else_args) = op else { continue };
         if let Some((x, y)) = xors[condition.index()] {

@@ -82,7 +82,7 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
     }
     let mut mix = HashMix::new(item_bits(item));
     let mut cycle_root = usize::MAX;
-    hash_instance_header(cx, &mut mix, slots.low_entries(), item, typed)?;
+    hash_instance_header(cx, &mut mix, (slots.low_entries(), slots.allow_inline()), item, typed)?;
     match &typed.shape {
         Shape::Glue(glue) => hash_glue_shape(cx, (reached, slots), inline, &mut mix, index, substs, glue, &mut cycle_root)?,
         Shape::Untuple(target) => hash_untuple_shape(cx, (reached, slots), inline, &mut mix, index, typed, *target, &mut cycle_root)?,
@@ -135,8 +135,9 @@ fn try_unique_footprint(cx: &Context<'_>, item: ItemRef, substs: crate::sema::su
     None
 }
 
-fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, low: bool, item: ItemRef, typed: &Typed) -> Result<()> {
+fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, (low, allow_inline): (bool, bool), item: ItemRef, typed: &Typed) -> Result<()> {
     mix.bool(low);
+    mix.bool(allow_inline);
     mix.bool(cx.outline.crates[item.krate as usize].env.overflow_checks());
     let shape_tag = match &typed.shape {
         Shape::Body => 0,

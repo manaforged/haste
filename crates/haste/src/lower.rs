@@ -9,6 +9,7 @@ mod coroutine;
 mod drop;
 mod equal;
 mod expr;
+mod format;
 mod intrinsic;
 mod looping;
 mod matching;

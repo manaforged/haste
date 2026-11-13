@@ -308,6 +308,7 @@ impl Image {
         let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
         let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, item, e))?);
         if let Some(fp) = footprint
+            && cx.deferred_evals.is_empty()
             && code.relocs().iter().all(|r| r.symbol_index().is_some())
             && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
         {
@@ -529,6 +530,8 @@ impl Image {
         let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, group.item, e))?);
         let tree = &cx.outline.crates[group.item.krate as usize];
         if self.mode != ImageMode::Aot
+            && !self.jit_mode
+            && cx.deferred_evals.is_empty()
             && tree.env.release
             && tree.env.fixed
             && code.relocs().iter().all(|r| r.symbol_index().is_some())

@@ -335,6 +335,12 @@ impl Lower<'_, '_> {
         let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) else { bail!("method call has no resolution") };
         let Some(&adjust) = self.typed.adjusts.get(&expr) else { bail!("method call has no receiver adjustment") };
         let first = self.receiver((expr, receiver), adjust)?;
+        if let Some(result) = self.try_write_fmt(expr, item, substs, first, params)? {
+            return Ok(Some(result));
+        }
+        if !self.open {
+            return Ok(None);
+        }
         if self.tupled_closure_call(item, substs) {
             let param_list = self.body.list(params).to_vec();
             let [tuple_expr] = param_list.as_slice() else { bail!("tupled closure method expects 1 argument") };
@@ -535,8 +541,31 @@ impl Lower<'_, '_> {
         }
     }
 
+    pub(super) fn unwrap_expr(&self, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner) => expr = inner,
+                Expr::Block { stmts, tail: Some(inner), label: None, kind }
+                    if self.body.list(stmts).is_empty()
+                        && (matches!(kind, crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion)
+                            || (allow_unsafe && kind == crate::body::BlockKind::Unsafe)) =>
+                {
+                    expr = inner;
+                }
+                _ => return expr,
+            }
+        }
+    }
+
+    fn const_bool(&self, expr: ExprId) -> Option<bool> {
+        match *self.body.expr(self.unwrap_expr(expr, false)) {
+            Expr::Lit(crate::body::Lit::Bool(taken), _) => Some(taken),
+            _ => None,
+        }
+    }
+
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
-        if let Expr::Lit(crate::body::Lit::Bool(taken), _) = *self.body.expr(cond) {
+        if let Some(taken) = self.const_bool(cond) {
             return if taken {
                 self.expr(then)
             } else {

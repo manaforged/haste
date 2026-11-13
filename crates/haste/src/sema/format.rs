@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::outline::source::{Mark, Source, Tokens};
 
-use super::builtin::crate_path;
+use super::builtin::{byte_string, crate_path};
 
 /// The `fmt::rt::Argument` constructor that each formatting trait spelling uses, with the debug-hex flag it adds.
 const TRAITS: [(&str, &str, u32); 11] = [
@@ -19,7 +19,7 @@ const TRAITS: [(&str, &str, u32); 11] = [
     ("p", "new_pointer", 0),
 ];
 
-const DEFAULT_FLAGS: u32 = 3 << 29 | ' ' as u32;
+pub(crate) const DEFAULT_FLAGS: u32 = 3 << 29 | ' ' as u32;
 const WIDTH_SET: u32 = 1 << 27;
 const PRECISION_SET: u32 = 1 << 28;
 
@@ -159,18 +159,6 @@ fn write_call(out: &mut Tokens, krate: u32, (bytes, sources, call): (&[u8], &[Or
     }
     out.lexed("]) } }");
     Ok(())
-}
-
-fn byte_string(bytes: &[u8]) -> String {
-    let mut text = String::from("b\"");
-    for &byte in bytes {
-        match byte {
-            b' '..=b'~' if byte != b'"' && byte != b'\\' => text.push(byte as char),
-            _ => text.push_str(&format!("\\x{byte:02x}")),
-        }
-    }
-    text.push('"');
-    text
 }
 
 fn encode(pieces: &[Piece], holes: usize) -> Vec<u8> {

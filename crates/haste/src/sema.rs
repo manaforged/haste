@@ -6,7 +6,7 @@ mod builtin;
 pub mod census;
 pub mod evaluate;
 mod expand;
-mod format;
+pub(crate) mod format;
 pub mod impls;
 pub mod infer;
 pub mod intrinsic;

@@ -142,12 +142,14 @@ impl Image {
         let (mut errors, mut deferred) = (Vec::new(), Vec::new());
         for bucket in shard {
             let mark = pass.records.len();
+            let frozen_mark = pass.frozen_stencils.len();
             let failed = self.compile_bucket(&mut cx, reached, bucket, cfg, (false, allow_singleton), &mut pass);
             if cx.take_deferred_evals().is_empty() {
                 errors.extend(failed);
                 continue;
             }
             pass.records.truncate(mark);
+            pass.frozen_stencils.truncate(frozen_mark);
             deferred.extend_from_slice(bucket);
         }
         (pass, errors, deferred)

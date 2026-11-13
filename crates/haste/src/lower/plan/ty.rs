@@ -478,7 +478,7 @@ pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         }
         return Ok(());
     }
-    if let Some(limit) = inline_limit(cx, reached, callee_idx) {
+    if slots.allow_inline() && let Some(limit) = inline_limit(cx, reached, callee_idx) {
         let (meta, cyc) = resolve_inline_meta(cx, (reached, slots), inline, callee_idx, limit)?;
         *cycle_root = (*cycle_root).min(cyc);
         match meta {
