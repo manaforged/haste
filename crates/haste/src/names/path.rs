@@ -119,8 +119,12 @@ impl<'a> Paths<'a> {
     }
 
     fn variants(&self, item: ItemRef) -> Vec<(&'a str, u32)> {
-        let Some(file) = self.trees.get(item.krate as usize).and_then(|tree| tree.files.get(item.file as usize)) else { return Vec::new() };
-        let Some(open) = file.items.items[item.item as usize].body else { return Vec::new() };
+        let Some(file) = self.trees.get(item.krate as usize).and_then(|tree| tree.files.get(item.file as usize)) else {
+            return Vec::new();
+        };
+        let Some(open) = file.items.items[item.item as usize].body else {
+            return Vec::new();
+        };
         variant_names(&file.source, open).into_iter().enumerate().map(|(index, name)| (name, index as u32)).collect()
     }
 
@@ -132,7 +136,9 @@ impl<'a> Paths<'a> {
     pub fn member(&self, def: Def, name: Sym) -> PerNs {
         match def {
             Def::Module(at) => {
-                if let Some(asks) = self.demands && !self.done.get(at.krate as usize).is_some_and(|krate| krate.wants(at.module, name)) {
+                if let Some(asks) = self.demands
+                    && !self.done.get(at.krate as usize).is_some_and(|krate| krate.wants(at.module, name))
+                {
                     asks.names.borrow_mut().push((at, name));
                 }
                 let found = self.scope(at).and_then(|scope| scope.names.get(&name).copied());
@@ -200,8 +206,12 @@ impl<'a> Paths<'a> {
 
     /// Adds to `found` the traits that module `module` declares or imports.
     pub fn traits_of(&self, module: ModRef, found: &mut Vec<ItemRef>) {
-        let Some(entry) = self.done.get(module.krate as usize) else { return };
-        if !entry.resolves_all(module.module) && let Some(demands) = self.demands {
+        let Some(entry) = self.done.get(module.krate as usize) else {
+            return;
+        };
+        if !entry.resolves_all(module.module)
+            && let Some(demands) = self.demands
+        {
             demands.scopes.borrow_mut().push(module);
         }
         let named = self.scope(module).into_iter().flat_map(|scope| scope.names.values()).filter_map(|names| names.types.map(|binding| binding.def));
@@ -209,7 +219,10 @@ impl<'a> Paths<'a> {
         let mut defs: Vec<Def> = named.chain(hidden).collect();
         self.glob_hidden(module, (module, &mut vec![module]), &mut defs);
         for def in defs {
-            if let Def::Item(item) = def && self.trees[item.krate as usize].files[item.file as usize].items.items[item.item as usize].kind == ItemKind::Trait && !found.contains(&item) {
+            if let Def::Item(item) = def
+                && self.trees[item.krate as usize].files[item.file as usize].items.items[item.item as usize].kind == ItemKind::Trait
+                && !found.contains(&item)
+            {
                 found.push(item);
             }
         }
@@ -217,19 +230,27 @@ impl<'a> Paths<'a> {
 
     /// Adds to `found` what the `use … as _` imports of the modules that `module` glob-imports bind, through further globs, when visible to `importer`.
     fn glob_hidden(&self, module: ModRef, (importer, seen): (ModRef, &mut Vec<ModRef>), found: &mut Vec<Def>) {
-        let Some(entry) = self.done.get(module.krate as usize) else { return };
+        let Some(entry) = self.done.get(module.krate as usize) else {
+            return;
+        };
         let globs = entry.globs.get(&module.module).into_iter().flatten();
-        let targets: Vec<ModRef> = globs.filter_map(|&index| match entry.pending[index].stamp {
-            Some((Def::Module(target), _)) => Some(target),
-            _ => None,
-        }).collect();
+        let targets: Vec<ModRef> = globs
+            .filter_map(|&index| match entry.pending[index].stamp {
+                Some((Def::Module(target), _)) => Some(target),
+                _ => None,
+            })
+            .collect();
         for target in targets {
             if seen.contains(&target) {
                 continue;
             }
             seen.push(target);
-            let Some(other) = self.done.get(target.krate as usize) else { continue };
-            if !other.resolves_all(target.module) && let Some(demands) = self.demands {
+            let Some(other) = self.done.get(target.krate as usize) else {
+                continue;
+            };
+            if !other.resolves_all(target.module)
+                && let Some(demands) = self.demands
+            {
                 demands.scopes.borrow_mut().push(target);
             }
             let hidden = other.pending.iter().filter(|pending| pending.module == target.module && pending.name == Some(UNDERSCORE) && super::resolve::visible(self, pending.vis, target, importer));

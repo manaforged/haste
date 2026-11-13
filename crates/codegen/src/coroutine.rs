@@ -5,6 +5,7 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::builder::FunctionBuilder;
 use crate::live::results;
 use crate::ir::{AbiParam, Binary, Block, CallConv, Function, InstData, IntCC, Op, SlotData, StackSlot, Type, Value};
+use crate::reloc::RuntimeSymbol;
 
 /// The state word of a coroutine that has not started.
 pub const UNRESUMED: i64 = 0;
@@ -24,9 +25,6 @@ pub struct Coroutine {
     pub done: Vec<Block>,
     /// The offsets of the state word and of the heap frame pointer in the coroutine object.
     pub header: (i32, i32),
-    /// The code addresses of `malloc` and `free`.
-    pub alloc: i64,
-    pub free: i64,
 }
 
 struct Frame {
@@ -58,7 +56,7 @@ pub(crate) fn split(func: &mut Function) {
     func.slots = vec![SlotData { size: 8, align_shift: 3 }];
     let anchor = StackSlot(0);
     for block in 0..func.blocks.len() {
-        rewrite(func, Block(block as u32), (&frame, anchor), spec.done.contains(&Block(block as u32)).then_some(spec.free));
+        rewrite(func, Block(block as u32), (&frame, anchor), spec.done.contains(&Block(block as u32)));
     }
     entry(func, &spec, (old_entry, anchor), frame.size);
 }
@@ -95,7 +93,7 @@ fn push(func: &mut Function, insts: &mut Vec<crate::ir::Inst>, op: Op, ty: Optio
     result
 }
 
-fn rewrite(func: &mut Function, block: Block, (frame, anchor): (&Frame, StackSlot), free: Option<i64>) {
+fn rewrite(func: &mut Function, block: Block, (frame, anchor): (&Frame, StackSlot), free: bool) {
     let old = std::mem::take(&mut func.blocks[block.index()].insts);
     if old.is_empty() {
         return;
@@ -126,8 +124,8 @@ fn rewrite(func: &mut Function, block: Block, (frame, anchor): (&Frame, StackSlo
             Op::StackStore(value, slot, offset) => Op::Store(value, fp, frame.slots[slot.index()] as i32 + offset),
             op => op,
         };
-        if data.op.is_terminator() && let Some(free) = free {
-            call(func, &mut insts, free, &[fp], false);
+        if data.op.is_terminator() && free {
+            call(func, &mut insts, RuntimeSymbol::Free, &[fp], false);
         }
         let spilled: Vec<(Value, i32)> = results(&data).filter_map(|value| frame.spills.get(&value).map(|&at| (value, at))).collect();
         func.insts[inst.index()] = data;
@@ -139,7 +137,7 @@ fn rewrite(func: &mut Function, block: Block, (frame, anchor): (&Frame, StackSlo
     func.blocks[block.index()].insts = insts;
 }
 
-fn call(func: &mut Function, insts: &mut Vec<crate::ir::Inst>, code: i64, args: &[Value], returns: bool) -> Option<Value> {
+fn call(func: &mut Function, insts: &mut Vec<crate::ir::Inst>, symbol: RuntimeSymbol, args: &[Value], returns: bool) -> Option<Value> {
     let mut signature = crate::ir::Signature::new(CallConv::Native);
     signature.params = args.iter().map(|_| AbiParam::new(Type::I64)).collect();
     if returns {
@@ -147,7 +145,7 @@ fn call(func: &mut Function, insts: &mut Vec<crate::ir::Inst>, code: i64, args: 
     }
     func.sigs.push(signature);
     let sig = crate::ir::SigRef(func.sigs.len() as u32 - 1);
-    let callee = push(func, insts, Op::Const(code), Some(Type::I64)).expect("a constant has a result");
+    let callee = push(func, insts, Op::Runtime(symbol), Some(Type::I64)).expect("a runtime symbol has a result");
     let results: Vec<Value> = (0..usize::from(returns)).map(|_| func.value(Type::I64)).collect();
     let result = results.first().copied();
     push(func, insts, Op::Call { sig, callee, args: args.to_vec(), results }, None);
@@ -167,7 +165,7 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     b.switch_to_block(init);
     let mut insts = std::mem::take(&mut b.func.blocks[init.index()].insts);
     let bytes = push(b.func, &mut insts, Op::Const(i64::from(size.max(8))), Some(Type::I64)).expect("a constant has a result");
-    let fp = call(b.func, &mut insts, spec.alloc, &[bytes], true).expect("malloc returns");
+    let fp = call(b.func, &mut insts, RuntimeSymbol::Malloc, &[bytes], true).expect("malloc returns");
     b.func.blocks[init.index()].insts = insts;
     b.ins().store(fp, object, spec.header.1);
     b.ins().stack_store(fp, anchor, 0);

@@ -11,6 +11,7 @@ use frame::{Abi, Loc, Packing, SAVED, classify};
 use crate::alloc::{Location, Plan, Regs, plan};
 use crate::frame::{Frame, INCOMING, PAGE, edge_moves, layout, saved};
 use crate::ir::{Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::reloc::{DictTierUp, StencilReloc};
 use crate::target::{Os, Target};
 use crate::{Code, Site};
 
@@ -29,7 +30,7 @@ const V1: Vreg = Vreg(1);
 const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
 
 /// The registers planning hands out: the saved pool, and caller-saved registers that are neither scratch, return registers nor the indirect-result register.
-const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)], wide_scratch: &WIDE_SCRATCH, float: &[], float_branches: &[], absolute_calls: false };
+const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)], wide_scratch: &WIDE_SCRATCH, dict: None, float: &[], float_branches: &[], absolute_calls: false };
 
 /// Encodes `func` as A64 machine code for `target`.
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
@@ -40,7 +41,35 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, |sig| classify(sig, packing))?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    Emit { func, frame, abi, packing, asm, blocks, sites: Vec::new(), plan, flags: None, next: None }.run(order)
+    Emit { func, frame, abi, packing, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None }.run(order)
+}
+
+pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
+    let mut asm = Asm::default();
+    if let Some(tier) = tier_up {
+        let fast = asm.label();
+        asm.mov_fixed64(IP, tier.counter_addr as u64);
+        asm.load(Size::W, false, Reg(17), Mem::new(IP, 0));
+        asm.add_imm(false, false, Size::W, Reg(17), Reg(17), 1);
+        asm.store(Size::W, Mem::new(IP, 0), Reg(17));
+        asm.mov_imm(A, i64::from(tier.threshold));
+        asm.alu(Alu::Subs, Size::W, ZR, Reg(17), A);
+        asm.bcond(Cond::Ne, fast);
+        asm.mov_imm(IP, i64::from(tier.encoded_index));
+        asm.mov_fixed64(Reg(17), tier.stub_entry as u64);
+        asm.br(Reg(17));
+        asm.bind(fast);
+    }
+    asm.mov_fixed64(A, dict_addr as u64);
+    let at = stub_exec as i64 + i64::from(asm.pos());
+    let delta = (body_exec as i64 - at) / 4;
+    if (body_exec as i64 - at) % 4 == 0 && (-(1 << 25)..(1 << 25)).contains(&delta) {
+        asm.word(0x1400_0000 | ((delta as u32) & 0x03FF_FFFF));
+    } else {
+        asm.mov_fixed64(IP, body_exec as u64);
+        asm.br(IP);
+    }
+    asm.finish()
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +86,7 @@ pub(super) struct Emit<'a> {
     asm: Asm,
     blocks: Vec<Label>,
     sites: Vec<Site>,
+    relocs: Vec<StencilReloc>,
     plan: Plan<Reg>,
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
@@ -71,7 +101,7 @@ impl Emit<'_> {
             self.next = order.get(index + 1).copied();
             self.block(*block)?;
         }
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites })
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs })
     }
 
     fn block(&mut self, block: Block) -> Result<(), String> {

@@ -54,7 +54,7 @@ impl Emit<'_> {
             Location::Imm(imm) => self.asm.mov_imm(reg, imm),
             Location::Frame(slot, offset) => self.slot_address(reg, slot, offset),
             Location::Reg(from) => self.asm.mov(reg, from),
-            Location::Slot | Location::Float(_) => {
+            Location::Slot | Location::SlotAddr(_) | Location::Float(_) => {
                 let at = self.at(value);
                 self.asm.load(Size::X, false, reg, at);
             }
@@ -70,7 +70,7 @@ impl Emit<'_> {
             Location::Imm(imm) => self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed)),
             Location::Frame(..) => self.raw(reg, value),
             Location::Reg(from) => self.asm.extend(signed, bytes, reg, from),
-            Location::Slot | Location::Float(_) => {
+            Location::Slot | Location::SlotAddr(_) | Location::Float(_) => {
                 let at = self.at(value);
                 self.asm.load(Size::of(bytes), signed && bytes < 8, reg, at);
             }
@@ -144,7 +144,7 @@ impl Emit<'_> {
                 self.asm.store(Size::X, to, IP);
             }
             Location::Reg(reg) => self.asm.store(Size::X, to, reg),
-            Location::Slot | Location::Float(_) => self.copy_to(to, self.at(value), self.ty(value)),
+            Location::Slot | Location::SlotAddr(_) | Location::Float(_) => self.copy_to(to, self.at(value), self.ty(value)),
         }
     }
 }

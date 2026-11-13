@@ -20,17 +20,22 @@ mod place;
 mod promote;
 mod simd;
 mod slice_pat;
+mod stencil;
 
-pub use expr::may_inline;
+pub use expr::{can_inline_body, may_inline};
+pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil, probe_footprint};
+
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, Function, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
+use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
 
 use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
 use crate::names::{ItemRef, Primitive};
+use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 use crate::sema::Context;
-use crate::sema::infer::{Arena, Shape, Typed};
+use crate::sema::infer::{Shape, Typed};
 use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Ty};
 
@@ -48,38 +53,35 @@ pub trait Slots {
     fn cell(&self, index: usize, size: u32) -> i64;
     /// Notes that lowering used `instance`, which was not reached, so a caller that reaches functions on demand can reach it and lower again.
     fn want(&self, _instance: crate::sema::reach::Instance) {}
+    /// The count of unreached function instances recorded so far.
+    fn wanted_len(&self) -> usize {
+        0
+    }
     /// The bodies that calls copy inline.
     fn bodies(&self) -> &Bodies;
-}
-
-/// What calls learned about copying reached functions inline: which reached indexes they tried, and the bodies they may copy.
-#[derive(Default)]
-pub struct Bodies {
-    tried: std::cell::RefCell<Vec<u64>>,
-    kept: std::cell::RefCell<rustc_hash::FxHashMap<usize, std::rc::Rc<Function>>>,
-}
-
-impl Bodies {
-    /// Marks `index` tried, and whether it was not before.
-    pub fn first_try(&self, index: usize) -> bool {
-        let mut tried = self.tried.borrow_mut();
-        if tried.len() <= index / 64 {
-            tried.resize(index / 64 + 1, 0);
+    /// Whether call table entries live in the low 2 GiB address range.
+    fn low_entries(&self) -> bool {
+        false
+    }
+    /// Interns a read-only blob with optional intra-rodata relocations and returns its symbol id.
+    fn rodata(&self, bytes: &[u8], _relocs: &[RodataReloc]) -> RodataId {
+        let _ = self.data(bytes);
+        RodataId(0)
+    }
+    /// Interns a vtable layout and returns its symbol id.
+    fn vtable_id(&self, _entries: &[VtableEntry]) -> VtableId {
+        VtableId(0)
+    }
+    /// Resolves a symbolic relocation entry to its concrete 64-bit value in this image.
+    fn resolve_symbol(&self, sym: &SymbolSource) -> u64 {
+        match *sym {
+            SymbolSource::Slot(index) => self.entry(index) as u64,
+            SymbolSource::StaticCell { index, size } => self.cell(index, size) as u64,
+            SymbolSource::PromotedCell { size, .. } => self.zeroed(size as usize) as u64,
+            SymbolSource::Host(ref host) => host.host_addr().unwrap_or(0) as u64,
+            SymbolSource::Word(word) => word,
+            SymbolSource::Vtable(_) | SymbolSource::Rodata(_) => 0,
         }
-        let (word, bit) = (&mut tried[index / 64], 1 << (index % 64));
-        let first = *word & bit == 0;
-        *word |= bit;
-        first
-    }
-
-    /// The body of reached function `index` that calls may copy inline.
-    pub fn body(&self, index: usize) -> Option<std::rc::Rc<Function>> {
-        self.kept.borrow().get(&index).cloned()
-    }
-
-    /// Keeps `body` as the one calls copy for reached function `index`.
-    pub fn keep(&self, index: usize, body: std::rc::Rc<Function>) {
-        self.kept.borrow_mut().insert(index, body);
     }
 }
 
@@ -209,11 +211,19 @@ struct Loop {
     block: bool,
 }
 
+/// The inline state of one top-level lowering: the reached indexes being lowered, and the callees whose inline decision rests on an open cycle, each with the stack depth that cycle reaches.
+#[derive(Default)]
+pub(super) struct Inline {
+    pub stack: Vec<usize>,
+    pub local: rustc_hash::FxHashMap<usize, (Option<Arc<stencil::InlinedCallee>>, usize)>,
+}
+
 /// The lowering of one body.
 pub struct Lower<'l, 'a> {
     cx: &'l mut Context<'a>,
     reached: &'l Reached,
     slots: &'l dyn Slots,
+    inline: &'l mut Inline,
     body: &'l Body,
     src: &'a Source,
     typed: &'l Typed,
@@ -224,6 +234,11 @@ pub struct Lower<'l, 'a> {
     open: bool,
     dead: Option<Block>,
     sret: Option<Value>,
+    dict_param: Option<Value>,
+    mode: stencil::LowerMode,
+    relocs: &'l mut RelocVec,
+    promoted_seq: u32,
+    cycle_root: usize,
     owned: Vec<drop::Owned>,
     flags: Vec<StackSlot>,
     moved: rustc_hash::FxHashMap<moves::Root, Vec<moves::MovePath>>,
@@ -236,58 +251,16 @@ pub struct Lower<'l, 'a> {
 
 /// Whether `item` is a static, whose reached instance writes its value into the static's cell.
 pub fn is_static(cx: &Context<'_>, item: ItemRef) -> bool {
-    cx.item(item).1.kind == crate::outline::item::ItemKind::Static
-}
-
-/// Lowers reached function `index` to SSA, with calls through `slots`.
-pub fn lower(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<Function> {
-    let ((item, _), typed) = &reached.list[index];
-    let Ok(typed) = typed else { bail!("{} did not type-check", cx.name(*item)) };
-    let source = match &typed.shape {
-        Shape::Closure(closure) => closure.parent,
-        _ => *item,
-    };
-    let arena = match &typed.shape {
-        Shape::Body | Shape::Closure(_) => Arena::Body(cx.body(source)?),
-        Shape::Anon(anon) => anon.arena.clone(),
-        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => Arena::Body(std::rc::Rc::default()),
-    };
-    let src = cx.body_src(source);
-    let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
-    let signature = if is_static(cx, *item) { signature_of(cx, None, [])? } else { signature(cx, typed)? };
-    let mut func = Function::new(signature);
-    let b = FunctionBuilder::new(&mut func);
-    let mut lower = Lower {
-        cx,
-        reached,
-        slots,
-        body: arena.body(),
-        src,
-        typed,
-        b,
-        locals: vec![None; typed.locals.len()],
-        loops: Vec::new(),
-        try_exits: Vec::new(),
-        open: true,
-        dead: None,
-        sret: None,
-        owned: Vec::new(),
-        flags: Vec::new(),
-        moved: Default::default(),
-        extended: Default::default(),
-        pending: Vec::new(),
-        index,
-        resume: None,
-        overflow_checks,
-    };
-    lower.run()?;
-    Ok(func)
+    cx.item(item).1.kind == ItemKind::Static
 }
 
 impl Lower<'_, '_> {
     fn run(&mut self) -> Result<()> {
         let entry = self.b.create_block();
         self.b.append_block_params_for_function_params(entry);
+        if self.mode == stencil::LowerMode::Dict {
+            self.dict_param = self.b.block_params(entry).last().copied();
+        }
         self.b.switch_to_block(entry);
         let (prologue, start) = (self.b.create_block(), self.b.create_block());
         self.jump(prologue, &[]);
@@ -434,7 +407,6 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// Gives the initialized `local` its own frame slot, holding a copy of `value` when there is one, and owns what it holds.
     /// Declares parameter `local` with the value that crossed the call: a scalar is stored into the memory of a local whose type travels unwrapped.
     fn declare_passed(&mut self, local: u32, value: Option<Value>) -> Result<()> {
         self.declare(local, None)?;
@@ -469,6 +441,7 @@ impl Lower<'_, '_> {
         })
     }
 
+    /// Gives `local` a fresh frame slot, writes `value` into it when given, and marks `local` initialized.
     pub fn declare(&mut self, local: u32, value: Option<Value>) -> Result<()> {
         self.declare_as(local, value, true)
     }
@@ -563,7 +536,9 @@ impl Lower<'_, '_> {
     }
 
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<()> {
-        let Some(init) = init else { return self.declare_uninit(pat) };
+        let Some(init) = init else {
+            return self.declare_uninit(pat);
+        };
         self.extend(init);
         let unboxed = self.moves_whole_box(pat, init)?;
         let place = if unboxed { self.temp(init)? } else { self.place_or_temp(init)? };

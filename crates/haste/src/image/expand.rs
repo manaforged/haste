@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{Result, bail};
 
 use super::Image;
-use super::lazy::{Answerer, Jit, Driver, Ended, serve};
+use super::lazy::{Answerer, Driver, Ended, Jit, serve};
 use crate::macros::Compilation;
 
 /// One macro call: the declared `proc_macro` entry function, the declared macro function it runs, the one or two input texts, and its group: the calls of one macro crate from one crate, which run in order in one child so the macro's statics carry from call to call as in one compiler process.
@@ -69,7 +69,9 @@ impl Driver for Shares<'_, '_> {
     }
 
     fn ended(&mut self, id: usize, ended: Ended) -> Result<()> {
-        let Some(at) = self.running.iter().position(|&(running, _)| running == id) else { return Ok(()) };
+        let Some(at) = self.running.iter().position(|&(running, _)| running == id) else {
+            return Ok(());
+        };
         let (_, part) = self.running.swap_remove(at);
         let left: Vec<usize> = self.left(part).collect();
         let outputs = frames(&ended.bytes);

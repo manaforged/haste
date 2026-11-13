@@ -6,14 +6,44 @@ use rustc_lexer::TokenKind;
 
 use super::item::{Attr, Item, ItemKind};
 use super::source::Source;
-use super::tree::{Files, Crate, Decl, File, Held, Impl, Macro, Module, State, Textual, View, Waiting, textual};
+use super::tree::{Crate, Decl, File, Files, Held, Impl, Macro, Module, State, Textual, View, Waiting, textual};
 use super::{derive, mbe, rules, scan};
 
 /// The item kinds that an attribute macro can stand on.
 const ATTRIBUTED: [ItemKind; 9] = [ItemKind::Fn, ItemKind::Struct, ItemKind::Enum, ItemKind::Union, ItemKind::Impl, ItemKind::Trait, ItemKind::Const, ItemKind::Static, ItemKind::Type];
 /// Builtin attributes, which never name a macro; any other attribute is looked up as one.
 const INERT: &[&str] = &[
-    "allow", "warn", "deny", "forbid", "expect", "inline", "cold", "must_use", "doc", "repr", "test", "ignore", "should_panic", "deprecated", "non_exhaustive", "track_caller", "automatically_derived", "no_mangle", "export_name", "link_section", "link_name", "used", "target_feature", "stable", "unstable", "const_stable", "feature", "lang", "diagnostic", "rustfmt", "clippy",
+    "allow",
+    "warn",
+    "deny",
+    "forbid",
+    "expect",
+    "inline",
+    "cold",
+    "must_use",
+    "doc",
+    "repr",
+    "test",
+    "ignore",
+    "should_panic",
+    "deprecated",
+    "non_exhaustive",
+    "track_caller",
+    "automatically_derived",
+    "no_mangle",
+    "export_name",
+    "link_section",
+    "link_name",
+    "used",
+    "target_feature",
+    "stable",
+    "unstable",
+    "const_stable",
+    "feature",
+    "lang",
+    "diagnostic",
+    "rustfmt",
+    "clippy",
 ];
 /// Whether the attribute `name` is builtin, so it never names an attribute macro.
 pub(super) fn inert(name: &str) -> bool {
@@ -52,6 +82,14 @@ fn prelude_crates(deps: &[(String, usize)]) -> Vec<usize> {
     ["std", "core"].iter().find_map(|name| named(name)).into_iter().collect()
 }
 
+fn has_impl_body(src: &Source, item: &Item) -> bool {
+    match item.kind {
+        ItemKind::Const => item.name.is_some_and(|name| src.text(name) == "_"),
+        ItemKind::Fn => item.body.is_some_and(|open| src.holds_word((open, src.pair(open)), "impl")),
+        _ => false,
+    }
+}
+
 impl<'a> Loader<'a> {
     /// A loader of crate `krate` into `out` that sees the other crates through `others`; a crate with nothing read yet first gets its prelude crate among `deps`.
     pub fn new(krate: usize, cache: &'a Files, others: Others<'a>, deps: &'a [(String, usize)], out: &'a mut Crate) -> Loader<'a> {
@@ -73,11 +111,15 @@ impl Loader<'_> {
     }
 
     fn macro_use_externs(&mut self) {
-        let Some(file) = self.out.modules.first().filter(|root| root.loaded()).map(|root| self.out.files[root.file].clone()) else { return };
+        let Some(file) = self.out.modules.first().filter(|root| root.loaded()).map(|root| self.out.files[root.file].clone()) else {
+            return;
+        };
         let externs = file.items.items.iter().filter(|item| item.kind == ItemKind::ExternCrate && item.parent.is_none() && item.attrs.contains(&Attr::MacroUse));
         for item in externs {
             let name = file.source.text(item.start + 2);
-            let Some(&(_, at)) = self.deps.iter().find(|(dep, _)| dep == name) else { continue };
+            let Some(&(_, at)) = self.deps.iter().find(|(dep, _)| dep == name) else {
+                continue;
+            };
             if !self.out.macro_use.contains(&at) {
                 self.out.macro_use.push(at);
             }
@@ -86,7 +128,9 @@ impl Loader<'_> {
 
     /// Reads the declared module `module` and expands its item macros, loading its `#[macro_use]` children with it.
     pub fn load(&mut self, module: usize) -> Result<()> {
-        let State::Declared(decl) = self.out.modules[module].state.clone() else { return Ok(()) };
+        let State::Declared(decl) = self.out.modules[module].state.clone() else {
+            return Ok(());
+        };
         let (index, owner) = match decl {
             Decl::Inline { file, at } => (file, Some(at)),
             Decl::File { candidates, by_attr } => match self.open(module, &candidates, by_attr) {
@@ -151,9 +195,9 @@ impl Loader<'_> {
             ItemKind::MacroRules | ItemKind::Macro => self.define(file, (index as u32, at), item),
             ItemKind::MacroCall => self.call(file, module, at)?,
             ItemKind::Impl => self.impl_block(index, module, at, file)?,
-            ItemKind::Const if item.name.is_some_and(|name| file.source.text(name) == "_") => self.out.impl_bodies.push((index, at)),
-            ItemKind::Fn if item.body.is_some_and(|open| file.source.holds_word((open, file.source.pair(open)), "impl")) => self.out.impl_bodies.push((index, at)),
+            ItemKind::Trait => self.trait_block(index, module, at, file)?,
             ItemKind::Struct | ItemKind::Enum | ItemKind::Union => self.derive(file, module, (at, item))?,
+            _ if has_impl_body(&file.source, item) => self.out.impl_bodies.push((index, at)),
             _ => {}
         }
         Ok(())
@@ -189,41 +233,59 @@ impl Loader<'_> {
 
     fn impl_block(&mut self, index: usize, module: usize, at: u32, file: &Arc<File>) -> Result<()> {
         self.out.impls.push(Impl { file: index, at, module, parts: Vec::new() });
-        self.members(file, self.out.impls.len() - 1, Some(at))
+        self.members(file, super::tree::MemberBlock::Impl(self.out.impls.len() - 1), module, Some(at))
     }
 
-    fn members(&mut self, file: &Arc<File>, block: usize, owner: Option<u32>) -> Result<()> {
+    fn trait_block(&mut self, index: usize, module: usize, at: u32, file: &Arc<File>) -> Result<()> {
+        if !file.items.items.iter().any(|item| item.parent == Some(at) && item.kind == ItemKind::MacroCall) {
+            return Ok(());
+        }
+        self.out.traits.push(Impl { file: index, at, module, parts: Vec::new() });
+        self.members(file, super::tree::MemberBlock::Trait(self.out.traits.len() - 1), module, Some(at))
+    }
+
+    fn members(&mut self, file: &Arc<File>, block: super::tree::MemberBlock, module: usize, owner: Option<u32>) -> Result<()> {
         for (at, item) in file.items.items.iter().enumerate() {
             if item.parent == owner && item.kind == ItemKind::MacroCall && self.out.env.enabled(&item.attrs) {
-                self.member_call(file, block, at as u32)?;
+                self.member_call(file, block, module, at as u32)?;
             }
         }
         Ok(())
     }
 
-    fn member_call(&mut self, file: &Arc<File>, block: usize, at: u32) -> Result<()> {
+    fn member_call(&mut self, file: &Arc<File>, block: super::tree::MemberBlock, module: usize, at: u32) -> Result<()> {
         let item = &file.items.items[at as usize];
-        let (Some(name), Some(_)) = (item.name, item.body) else { return Ok(()) };
-        let name = crate::names::plain(file.source.text(name));
-        let Some(definition) = self.lookup(file, item, name) else {
-            self.out.members.push(self.waiting(file, block, at));
+        let (Some(name), Some(_)) = (item.name, item.body) else {
             return Ok(());
         };
-        self.member_at(file, block, at, &definition)
+        let name = crate::names::plain(file.source.text(name));
+        let Some(definition) = self.lookup(file, item, name) else {
+            self.out.members.push((block, self.waiting(file, module, at)));
+            return Ok(());
+        };
+        self.member_at(file, block, module, at, &definition)
     }
 
-    /// Expands the waiting macro call `call` in an impl body with `definition`, in the textual scope it was written in.
-    pub fn expand_member(&mut self, call: Waiting, definition: &Macro) -> Result<()> {
+    /// Expands the waiting macro call `call` in an impl or trait body with `definition`, in the textual scope it was written in.
+    pub fn expand_member(&mut self, block: super::tree::MemberBlock, call: Waiting, definition: &Macro) -> Result<()> {
         self.scope = call.scope;
-        self.member_at(&call.file, call.owner, call.at, definition)
+        self.member_at(&call.file, block, call.owner, call.at, definition)
     }
 
-    fn member_at(&mut self, file: &Arc<File>, block: usize, at: u32, definition: &Macro) -> Result<()> {
-        let Some((name, expanded)) = self.expand_call(file, at, definition) else { return Ok(()) };
-        let Some(expanded) = self.scanned(expanded, name) else { return Ok(()) };
-        self.out.impls[block].parts.push(self.out.files.len() - 1);
+    fn member_at(&mut self, file: &Arc<File>, block: super::tree::MemberBlock, module: usize, at: u32, definition: &Macro) -> Result<()> {
+        let Some((name, expanded)) = self.expand_call(file, at, definition) else {
+            return Ok(());
+        };
+        let Some(expanded) = self.scanned(expanded, name) else {
+            return Ok(());
+        };
+        let parts = match block {
+            super::tree::MemberBlock::Impl(index) => &mut self.out.impls[index].parts,
+            super::tree::MemberBlock::Trait(index) => &mut self.out.traits[index].parts,
+        };
+        parts.push(self.out.files.len() - 1);
         self.depth += 1;
-        let result = self.members(&expanded, block, None);
+        let result = self.members(&expanded, block, module, None);
         self.depth -= 1;
         result
     }
@@ -255,7 +317,9 @@ impl Loader<'_> {
     }
 
     fn define(&mut self, file: &Arc<File>, place: (u32, u32), item: &Item) {
-        let (Some(name), Some(open)) = (item.name, item.body) else { return };
+        let (Some(name), Some(open)) = (item.name, item.body) else {
+            return;
+        };
         let builtin = item.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if file.source.text(*at) == "rustc_builtin_macro"));
         if builtin {
             return;
@@ -344,9 +408,9 @@ impl Loader<'_> {
             self.scope = call.scope;
             self.call(&call.file, call.owner, call.at)?;
         }
-        for call in std::mem::take(&mut self.out.members) {
+        for (block, call) in std::mem::take(&mut self.out.members) {
             self.scope = call.scope;
-            self.member_call(&call.file, call.owner, call.at)?;
+            self.member_call(&call.file, block, call.owner, call.at)?;
         }
         self.scope = None;
         Ok(())
@@ -358,7 +422,9 @@ impl Loader<'_> {
 
     fn call(&mut self, file: &Arc<File>, module: usize, at: u32) -> Result<()> {
         let item = &file.items.items[at as usize];
-        let (Some(name), Some(open)) = (item.name, item.body) else { return Ok(()) };
+        let (Some(name), Some(open)) = (item.name, item.body) else {
+            return Ok(());
+        };
         let name = crate::names::plain(file.source.text(name));
         if name == "include" {
             return self.include(file, module, open);
@@ -393,7 +459,9 @@ impl Loader<'_> {
     /// The name and expansion by `definition` of the macro call item `at` of `file`, or none when it has no body or recursed too deep.
     fn expand_call<'f>(&mut self, file: &'f Arc<File>, at: u32, definition: &Macro) -> Option<(&'f str, Result<Source>)> {
         let item = &file.items.items[at as usize];
-        let (Some(name), Some(open)) = (item.name, item.body) else { return None };
+        let (Some(name), Some(open)) = (item.name, item.body) else {
+            return None;
+        };
         let name = crate::names::plain(file.source.text(name));
         if self.depth >= crate::RECURSION_LIMIT {
             self.out.errors.push(format!("{}: macro {name} recursed past {} levels", file.source.path.display(), crate::RECURSION_LIMIT));
@@ -403,7 +471,9 @@ impl Loader<'_> {
     }
 
     fn expand_at(&mut self, file: &Arc<File>, module: usize, at: u32, definition: &Macro) -> Result<()> {
-        let Some((name, expanded)) = self.expand_call(file, at, definition) else { return Ok(()) };
+        let Some((name, expanded)) = self.expand_call(file, at, definition) else {
+            return Ok(());
+        };
         self.splice(module, expanded, name)
     }
 
@@ -442,7 +512,9 @@ impl Loader<'_> {
     }
 
     fn splice(&mut self, module: usize, source: Result<Source>, name: &str) -> Result<()> {
-        let Some(expanded) = self.scanned(source, name) else { return Ok(()) };
+        let Some(expanded) = self.scanned(source, name) else {
+            return Ok(());
+        };
         let index = self.out.files.len() - 1;
         self.out.modules[module].parts.push(index);
         self.out.expansions += 1;

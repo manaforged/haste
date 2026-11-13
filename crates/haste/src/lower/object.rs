@@ -3,20 +3,25 @@ use haste_codegen::{Type, Value};
 
 use crate::sema::infer::{Res, Vtable};
 
+use super::stencil::{SymbolSource, VtableEntry, VtableId};
 use super::{Lower, Word};
 
 impl Lower<'_, '_> {
-    /// The address of the vtable `vtable`: the drop glue, the size, the alignment, each method's code, then the address of each supertrait vtable.
-    pub(super) fn vtable(&mut self, vtable: &Vtable) -> Result<i64> {
+    pub(super) fn vtable(&mut self, vtable: &Vtable) -> Result<Value> {
+        let id = self.vtable_id(vtable)?;
+        Ok(self.emit_symbol(SymbolSource::Vtable(id)))
+    }
+
+    fn vtable_id(&mut self, vtable: &Vtable) -> Result<VtableId> {
         let layout = self.cx.layout(vtable.ty)?;
-        let mut words = vec![self.code_word(vtable.drop.as_ref())?, Word::Int(layout.size.bytes()), Word::Int(layout.align.abi.bytes())];
+        let mut entries = vec![VtableEntry::Word(self.code_word(vtable.drop.as_ref())?), VtableEntry::Word(Word::Int(layout.size.bytes())), VtableEntry::Word(Word::Int(layout.align.abi.bytes()))];
         for method in &vtable.methods {
-            words.push(self.code_word(method.as_ref())?);
+            entries.push(VtableEntry::Word(self.code_word(method.as_ref())?));
         }
         for inner in &vtable.supers {
-            words.push(Word::Int(self.vtable(inner)? as u64));
+            entries.push(VtableEntry::Super(self.vtable_id(inner)?));
         }
-        Ok(self.slots.table(&words))
+        Ok(self.slots.vtable_id(&entries))
     }
 
     /// The wide pointer `wide` to a trait object as a pointer to the supertrait object whose vtable slot `slot` of its vtable holds.
@@ -30,7 +35,7 @@ impl Lower<'_, '_> {
     fn code_word(&self, res: Option<&Res>) -> Result<Word> {
         match res {
             None => Ok(Word::Int(0)),
-            Some(Res::Fn(item, substs)) => self.reached_index(*item, substs).map(Word::Code),
+            Some(&Res::Fn(item, substs)) => self.reached_index(item, substs).map(Word::Code),
             Some(_) => bail!("a vtable entry that is not a function"),
         }
     }

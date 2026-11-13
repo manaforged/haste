@@ -10,10 +10,10 @@ use rustc_hash::FxHashSet as HashSet;
 use crate::macros::Compilation;
 use crate::names::ItemRef;
 use crate::names::path::Requests;
-use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
 use crate::outline::Outline;
 use crate::sema::evaluate::Evaluate;
-use crate::sema::{Answer, Context, Cache, Edited};
+use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
+use crate::sema::{Answer, Cache, Context, Edited};
 
 use super::{CODE_BYTES, Image, TABLE_SLOTS, host_symbol, stub, wait};
 
@@ -179,7 +179,9 @@ fn value_of(ended: Option<Ended>) -> Result<u128> {
     match ended {
         Some(Ended { failure: Some((error, _)), .. }) => bail!("{error}"),
         Some(Ended { status: 0, bytes, .. }) => Ok(u128::from_le_bytes(<[u8; 16]>::try_from(bytes).map_err(|_| anyhow!("it gave no value"))?)),
-        Some(Ended { status, .. }) if status == 128 + libc::SIGVTALRM => bail!("it ran for more than {EVALUATION_SECONDS} s of CPU time"),
+        Some(Ended { status, .. }) if status == 128 + libc::SIGVTALRM => {
+            bail!("it ran for more than {EVALUATION_SECONDS} s of CPU time")
+        }
         Some(Ended { status, .. }) => bail!("it stopped with status {status}"),
         None => bail!("it did not run"),
     }
@@ -245,18 +247,20 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
 }
 
 impl Jit {
-    /// A demand with no function declared that infers on from `store`, its stub and code memory mapped so that every child forked later shares them.
     pub fn new(store: Cache) -> Result<Jit> {
         let reached = Reached::default();
         let mut image = Image::new(&reached)?;
+        image.jit_mode = true;
         image.stubs.reserve(TABLE_SLOTS * stub::STUB_BYTES)?;
-        image.memory.reserve(CODE_BYTES)?;
+        image.pass.memory.reserve(CODE_BYTES)?;
         Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
     }
 
-    /// Drops the inference and code of the declared functions that `edited` touches and points their slots and vtable entries back at their stubs, so that the next call compiles them again.
     fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
         let touched = self.store.invalidate(outline, self.reached.list.iter().map(|(instance, _)| instance), edited);
+        if !touched.is_empty() {
+            self.image.reset_caches();
+        }
         for at in touched {
             self.reached.forget(at);
             self.compiled.remove(&at);
@@ -343,7 +347,9 @@ impl Jit {
     }
 
     fn drain(&mut self, id: usize) {
-        let Some(child) = self.children[id].as_mut() else { return };
+        let Some(child) = self.children[id].as_mut() else {
+            return;
+        };
         let mut buffer = [0; 1 << 16];
         match child.out.as_mut().map(|out| out.read(&mut buffer)) {
             Some(Ok(read)) if read > 0 => child.bytes.extend_from_slice(&buffer[..read]),
@@ -364,7 +370,9 @@ impl Jit {
     }
 
     fn reply(&mut self, id: usize, code: usize) {
-        let Some(child) = self.children[id].as_mut() else { return };
+        let Some(child) = self.children[id].as_mut() else {
+            return;
+        };
         if child.answers.write_all(&(code as u64).to_le_bytes()).is_err() {
             child.asks = None;
         }
@@ -411,7 +419,9 @@ impl Jit {
                 self.drain(id);
                 continue;
             }
-            let Some(index) = self.read_ask(id) else { continue };
+            let Some(index) = self.read_ask(id) else {
+                continue;
+            };
             if !self.respond(cx, id, index) {
                 return Ok(Some((id, index)));
             }
@@ -435,13 +445,18 @@ impl Jit {
         true
     }
 
-    /// The code of function `index`, or why it has none; what inference did is taken back when it asked for more.
     fn answer(&mut self, cx: &mut Context<'_>, index: usize) -> Result<usize, Stop> {
+        if index & (stub::TIER_UP_BIT as usize) != 0 {
+            let real = index & !(stub::TIER_UP_BIT as usize);
+            let item = self.reached.list[real].0.0;
+            return self.image.tier_up(real).map_err(|err| Stop::Failed(format!("{}: {err:#}", cx.name(item)), item));
+        }
         let mut journal = Journal::new();
         let answer = self.code(cx, index, &mut journal);
         if matches!(answer, Err(Stop::Asked)) {
             journal.iter().for_each(|&at| self.reached.forget(at));
             self.expanded.clear();
+            self.image.bodies.clear();
         }
         answer
     }
@@ -464,7 +479,7 @@ impl Jit {
                     self.image.link();
                 }
                 Err(error) => {
-                    let wanted = self.image.wanted.take();
+                    let wanted = self.image.take_wanted();
                     if wanted.is_empty() {
                         return Err(Stop::Failed(self.failure(cx, index, &callees, &error), item));
                     }

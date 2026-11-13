@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
 use crate::graph::{self, Targets, cfg};
 use crate::names::{ItemRef, Names};
 use crate::serve::Request;
 use crate::{outline, sema};
+use anyhow::{Context, Result};
 
 fn print_graph(workspace: &graph::Workspace) {
     for line in workspace.unit_lines() {
@@ -108,7 +108,7 @@ pub(crate) type Failures = std::collections::BTreeMap<String, Vec<String>>;
 fn typeck_pass(cx: &mut sema::Context<'_>, cases: &[ItemRef]) -> Failures {
     let mut failures = Failures::new();
     for &item in cases {
-        if let Err(error) = sema::infer::infer(cx, item, &[]) {
+        if let Err(error) = sema::infer::infer(cx, item, sema::substs::Substs::EMPTY) {
             let text = format!("{error:#}");
             let kind = text.split([' ', '(', '`']).take(3).collect::<Vec<_>>().join(" ");
             failures.entry(kind).or_default().push(cx.name(item).to_owned());
@@ -138,13 +138,16 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
     Ok(())
 }
 
-fn report_cases(workspace: &graph::Workspace, targets: &Targets, request: Request, args: &[String]) -> Result<i32> {
+fn report_cases(workspace: &graph::Workspace, targets: &Targets, (request, args): (Request, &[String]), stats: Option<(&std::path::Path, sema::census::Span)>) -> Result<i32> {
     if request == Request::Run {
         return crate::build::run(workspace, targets, args);
     }
     let started = Instant::now();
     let mut build = crate::build::Build::load(workspace, targets)?;
     let result = crate::serve::finish(&mut build, workspace, (request, args), started);
+    if let Some((path, graph_span)) = stats {
+        build.write_stats(workspace, graph_span, path)?;
+    }
     std::mem::forget(build);
     result
 }
@@ -166,7 +169,9 @@ fn parse_bodies(tree: &outline::tree::Crate) -> (usize, Vec<String>) {
     let mut errors = Vec::new();
     for file in &tree.files {
         for item in &file.items.items {
-            let Some(open) = item.body.filter(|_| item.kind == outline::item::ItemKind::Fn) else { continue };
+            let Some(open) = item.body.filter(|_| item.kind == outline::item::ItemKind::Fn) else {
+                continue;
+            };
             match crate::body::parse(&file.source, open, crate::body::Config::default()) {
                 Ok(_) => parsed += 1,
                 Err(error) => errors.push(format!("{error:#}")),
@@ -185,12 +190,12 @@ fn report_bodies(outline: &outline::Outline, threads: usize) {
             scope.spawn(|| {
                 while let Some(tree) = outline.crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                     let result = parse_bodies(tree);
-                    results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(result);
+                    crate::sync::lock(&results).push(result);
                 }
             });
         }
     });
-    let results = results.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let results = crate::sync::into_inner(results);
     let parsed: usize = results.iter().map(|(parsed, _)| parsed).sum();
     let errors: Vec<&String> = results.iter().flat_map(|(_, errors)| errors).collect();
     for error in &errors {
@@ -219,13 +224,14 @@ fn report_names(outline: &outline::Outline, names: &Names, started: Instant) {
 /// Prints the root scope of each crate named `name`: every name with a flag per namespace, types, values and macros.
 fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     for (index, krate) in names.crates.iter().enumerate().filter(|(index, _)| outline.roots[*index].name == name) {
-        let mut keys: Vec<String> = krate.scopes[0].names.iter().map(|(name, entry)| format!("{}:{}{}{}", names.symbols.text(*name), u8::from(entry.types.is_some()), u8::from(entry.values.is_some()), u8::from(entry.macros.is_some()))).collect();
+        let mut keys: Vec<String> =
+            krate.scopes[0].names.iter().map(|(name, entry)| format!("{}:{}{}{}", names.symbols.text(*name), u8::from(entry.types.is_some()), u8::from(entry.values.is_some()), u8::from(entry.macros.is_some()))).collect();
         keys.sort();
         println!("scope {index} {}: {}", outline.roots[index].name, keys.join(" "));
     }
 }
 
-const USAGE: &str = "usage: haste [--jobs N] build|test|run|serve PATH [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand PATH [CRATE]";
+const USAGE: &str = "usage: haste [--jobs N] [--stats-json PATH] build|test|run|serve PATH [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand PATH [CRATE]";
 
 /// What the command line asks for.
 #[derive(Clone, Copy)]
@@ -264,14 +270,22 @@ fn parse(args: &mut impl Iterator<Item = String>) -> Result<Command> {
     }
 }
 
-/// Takes a leading `--jobs N` off `args` and sets the job count from it.
-fn take_jobs(args: &mut Vec<String>) -> Result<()> {
-    if args.first().map(String::as_str) != Some("--jobs") {
-        return Ok(());
+fn consume_options<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>, stats: &mut Option<PathBuf>) -> Result<()> {
+    while let Some(flag) = args.peek() {
+        match flag.as_str() {
+            "--jobs" => {
+                args.next();
+                let count: usize = args.next().context(USAGE)?.parse().context("--jobs takes a positive number")?;
+                crate::set_jobs(count.max(1));
+            }
+            "--stats-json" => {
+                args.next();
+                let value = args.next().context("--stats-json takes a file path")?;
+                *stats = Some(PathBuf::from(value));
+            }
+            _ => break,
+        }
     }
-    let count: usize = args.get(1).context(USAGE)?.parse().context("--jobs takes a positive number")?;
-    crate::set_jobs(count.max(1));
-    args.drain(..2);
     Ok(())
 }
 
@@ -297,28 +311,40 @@ fn tune_malloc() {
     }
 }
 
+fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>)> {
+    let mut args = std::env::args().skip(1).peekable();
+    let mut stats_json = None;
+    consume_options(&mut args, &mut stats_json)?;
+    let command = parse(&mut args)?;
+    if matches!(command, Command::Request(Request::Build)) {
+        consume_options(&mut args, &mut stats_json)?;
+    } else if stats_json.is_some() {
+        anyhow::bail!("--stats-json is only supported with `haste build`");
+    }
+    let path = PathBuf::from(args.next().context(USAGE)?);
+    let rest: Vec<String> = args.collect();
+    Ok((command, path, rest, stats_json))
+}
+
 /// Runs the haste command line.
 pub fn main() -> Result<()> {
     tune_malloc();
     crate::sema::evaluate::install(crate::image::evaluator);
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    take_jobs(&mut args)?;
-    let mut args = args.into_iter();
-    let command = parse(&mut args)?;
-    let path = PathBuf::from(args.next().context(USAGE)?);
+    let (command, path, rest, stats_json) = parse_invocation()?;
     match command {
         Command::Debug(Query::Items) => return print_items(&path),
         Command::Debug(Query::Expand) => return print_expanded(&path),
         _ => {}
     }
     let root = std::path::absolute(path)?;
-    let argv: Vec<String> = std::iter::once(program_name(&root)).chain(args).collect();
-    if let Command::Request(request) = command
+    let argv: Vec<String> = std::iter::once(program_name(&root)).chain(rest).collect();
+    if stats_json.is_none()
+        && let Command::Request(request) = command
         && let Some(status) = crate::serve::ask(&root, request, &argv)?
     {
         std::process::exit(status);
     }
-    match report(command, &root, &argv)? {
+    match report(command, &root, &argv, stats_json.as_deref())? {
         0 => Ok(()),
         status => std::process::exit(status),
     }
@@ -352,16 +378,18 @@ pub(crate) fn load_workspace(root: &std::path::Path, targets: &Targets) -> Resul
     Ok(workspace)
 }
 
-fn report(command: Command, root: &std::path::Path, argv: &[String]) -> Result<i32> {
+fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json: Option<&std::path::Path>) -> Result<i32> {
     let targets = Targets { target: cfg::Target::host(), host: cfg::Target::host() };
     let started = Instant::now();
+    let graph_clock = sema::census::Clock::now();
     let mut workspace = match command {
         Command::Debug(Query::Graph) => graph::load(root, &targets)?,
         _ => load_workspace(root, &targets)?,
     };
+    let graph_span = graph_clock.elapsed();
     let loaded = started.elapsed();
     let status = match command {
-        Command::Request(request) => report_cases(&workspace, &targets, request, argv)?,
+        Command::Request(request) => report_cases(&workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)))?,
         Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };

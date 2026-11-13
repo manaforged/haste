@@ -2,9 +2,9 @@ use anyhow::{Result, bail};
 use rustc_lexer::TokenKind;
 
 use crate::body::{self as syntax, Body, PathId};
-use crate::names::Primitive;
 use crate::names::path::Path as NamePath;
 use crate::names::resolve::macro_path;
+use crate::names::{ItemRef, Primitive, Sym};
 
 use super::super::builtin::Builtin;
 use super::super::ty::{Kind, Ty, int_info};
@@ -29,11 +29,21 @@ impl Bits {
     }
 }
 
-impl Infer<'_, '_> {
-    /// The type that the type macro call `path!` with its group opening at `open` names: a pattern type of `pattern_type!`.
-    pub(super) fn macro_ty(&mut self, arena: &Body, path: PathId, open: u32) -> Result<Ty> {
+impl<'a> Infer<'_, 'a> {
+    pub(super) fn resolve_macro(&mut self, arena: &Body, path: PathId) -> (Vec<Sym>, Option<ItemRef>) {
         let (segments, absolute, dollar) = self.segments(arena, path);
         let found = macro_path(&self.cx.paths(self.home.krate), &NamePath { segments: &segments, absolute, dollar }, self.home);
+        (segments, found)
+    }
+
+    pub(super) fn expand_macro_call(&mut self, found: Option<ItemRef>, open: u32) -> Result<Option<&'a crate::outline::source::Source>> {
+        let (home, src) = (self.home, self.src);
+        Ok(found.map(|item| self.cx.macro_output(home, src, item, open)).transpose()?.flatten())
+    }
+
+    /// The type that the type macro call `path!` with its group opening at `open` names: a pattern type of `pattern_type!`.
+    pub(super) fn macro_ty(&mut self, arena: &Body, path: PathId, open: u32) -> Result<Ty> {
+        let (segments, found) = self.resolve_macro(arena, path);
         let (src, close) = (self.src, self.src.pair(open));
         match found.and_then(|item| self.cx.builtin(item)) {
             Some(Builtin::PatternType) => {}
@@ -44,7 +54,7 @@ impl Infer<'_, '_> {
                 return self.lower_ty(&inner, ty);
             }
             _ => {
-                let Some(output) = found.map(|item| self.cx.macro_output(src, item, open)).transpose()?.flatten() else { bail!("type macro `{}` is not supported", self.spell(&segments)) };
+                let Some(output) = self.expand_macro_call(found, open)? else { bail!("type macro `{}` is not supported", self.spell(&segments)) };
                 let (inner, ty) = syntax::parse_ty(output, 0, output.len())?;
                 return self.in_source(output, |infer| infer.lower_ty(&inner, ty));
             }

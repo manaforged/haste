@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use rustc_abi::{Align, Integer, IntegerType, LayoutCalculator, ReprFlags, ReprOptions, TargetDataLayout};
@@ -19,13 +19,16 @@ const REPR_INTS: [(&str, Primitive); 12] = {
 
 impl<'a> Context<'a> {
     /// The discriminant of each variant of the enum `item`: its written value, or one more than the previous.
-    pub fn discriminants(&mut self, item: ItemRef) -> Result<Rc<[i128]>> {
+    pub fn discriminants(&mut self, item: ItemRef) -> Result<Arc<[i128]>> {
         if let Some(found) = self.store.lookups.discriminants.get(&item) {
-            return Ok(found.clone());
+            return Ok(found);
         }
+        let before = self.quiet_mark();
         let primitive = self.discriminant_primitive(item);
-        let found: Rc<[i128]> = super::infer::discriminants(self, item, primitive)?.into();
-        self.store.lookups.discriminants.insert(item, found.clone());
+        let found: Arc<[i128]> = super::infer::discriminants(self, item, primitive)?.into();
+        if self.quiet_mark() == before {
+            self.store.lookups.discriminants.insert(item, Arc::clone(&found));
+        }
         Ok(found)
     }
 
@@ -96,7 +99,9 @@ impl<'a> Context<'a> {
             return None;
         }
         let (src, entry) = (&file.source, &file.items.items[index as usize]);
-        let pick = |attr: &Attr| if let Attr::Other(at) = attr { (src.text(*at) == key).then_some(*at) } else { None };
+        let pick = |attr: &Attr| {
+            if let Attr::Other(at) = attr { (src.text(*at) == key).then_some(*at) } else { None }
+        };
         self.outline.crates[item.krate as usize].env.find_attr(&entry.attrs, crate::outline::tree::Truth::Yes, &pick)
     }
 
@@ -117,7 +122,7 @@ impl<'a> Context<'a> {
         let result = match kind {
             ItemKind::Union => calc.layout_of_union(&repr, &variants),
             _ => {
-                let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { Rc::from([0]) };
+                let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { Arc::from([0]) };
                 let no_niche = matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned"));
                 let tagged = discriminants.iter().enumerate().map(|(at, &value)| (rustc_index::Idx::new(at), value));
                 calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, no_niche, |min, max| discr_range(dl, &repr, min, max), tagged, sized)
@@ -160,4 +165,3 @@ fn discr_range(dl: &TargetDataLayout, repr: &ReprOptions, min: i128, max: i128) 
     let at_least = if repr.c() { Integer::I32 } else { Integer::I8 };
     if min >= 0 { (std::cmp::max(unsigned, at_least), false) } else { (std::cmp::max(signed, at_least), true) }
 }
-

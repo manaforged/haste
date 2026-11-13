@@ -14,6 +14,9 @@ impl Infer<'_, '_> {
         if let Some(inner) = self.builtin_deref(ty) {
             return Ok(inner);
         }
+        if matches!(self.cx.types.kind(ty), Kind::Proj(_)) {
+            self.poly_fallback();
+        }
         match self.overloaded_deref(ty, Mut::Not)? {
             Some((res, target)) => {
                 self.out.derefs.insert((expr, 0), res);
@@ -24,7 +27,7 @@ impl Infer<'_, '_> {
     }
 
     /// The type that the compiler's own dereference of `ty` reaches: the pointee of a reference or pointer, or what a `Box` owns.
-    pub(super) fn builtin_deref(&self, ty: Ty) -> Option<Ty> {
+    pub(in crate::sema) fn builtin_deref(&self, ty: Ty) -> Option<Ty> {
         match self.cx.types.kind(ty) {
             Kind::Ref(_, inner) | Kind::Ptr(_, inner) => Some(*inner),
             _ => self.cx.boxed(ty),
@@ -35,13 +38,7 @@ impl Infer<'_, '_> {
     pub(super) fn field_base(&mut self, expr: ExprId, found: Ty, field: &str) -> Result<Ty> {
         let (mut ty, mut steps) = (self.known_ty(found)?, 0);
         loop {
-            let next = match self.cx.types.kind(ty).clone() {
-                Kind::Ref(_, inner) => Some(self.known_ty(inner)?),
-                Kind::Adt(item, _) if self.cx.boxed(ty).is_some() && !self.sees_private(item)? => self.cx.boxed(ty),
-                Kind::Adt(..) if !self.has_field(ty, field)? => self.deref_step(expr, steps, ty)?,
-                _ => None,
-            };
-            let Some(next) = next else { break };
+            let Some(next) = self.next_field_step(expr, steps, ty, field)? else { break };
             (ty, steps) = (self.resolve(next), steps + 1);
             if steps as usize == crate::RECURSION_LIMIT {
                 bail!("reached the recursion limit while dereferencing {}", self.show(found));
@@ -53,13 +50,43 @@ impl Infer<'_, '_> {
         Ok(ty)
     }
 
+    fn next_field_step(&mut self, expr: ExprId, steps: u32, ty: Ty, field: &str) -> Result<Option<Ty>> {
+        match self.cx.types.kind(ty).clone() {
+            Kind::Ref(_, inner) => self.known_ty(inner).map(Some),
+            Kind::Adt(item, _) if self.cx.boxed(ty).is_some() && !self.sees_private(item)? => Ok(self.cx.boxed(ty)),
+            Kind::Adt(..) if !self.has_field(ty, field)? => self.deref_step(expr, steps, ty),
+            Kind::Param(_) | Kind::Proj(_) => {
+                self.poly_fallback();
+                self.deref_step(expr, steps, ty)
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn has_field(&mut self, ty: Ty, field: &str) -> Result<bool> {
-        let Kind::Adt(item, _) = *self.cx.types.kind(ty) else { return Ok(false) };
-        Ok(self.cx.item(item).1.kind == ItemKind::Struct && self.field_index(item, 0, field)?.is_some())
+        let Kind::Adt(item, _) = *self.cx.types.kind(ty) else {
+            return Ok(false);
+        };
+        if self.cx.item(item).1.kind != ItemKind::Struct || self.cx.foreign(item) {
+            return Ok(false);
+        }
+        let Some(index) = self.field_index(item, 0, field)? else {
+            return Ok(false);
+        };
+        let vis = self.cx.adt_def(item)?.variants.first().and_then(|v| v.fields.get(index as usize)).map(|f| f.vis);
+        match vis {
+            Some(crate::body::adt::FieldVis::Public) => Ok(true),
+            Some(crate::body::adt::FieldVis::Crate) => Ok(self.home.krate == item.krate),
+            Some(crate::body::adt::FieldVis::Private) => self.sees_private(item),
+            None => Ok(false),
+        }
     }
 
     /// The type that step `step` of the autoderef of `expr` reaches from `ty` through `Deref::deref`, recorded on `(expr, step)`; `None` when `ty` has no `Deref` impl.
     pub(super) fn deref_step(&mut self, expr: ExprId, step: u32, ty: Ty) -> Result<Option<Ty>> {
+        if matches!(self.cx.types.kind(ty), Kind::Proj(_)) {
+            self.poly_fallback();
+        }
         let Some((res, target)) = self.overloaded_deref(ty, Mut::Not)? else { return Ok(None) };
         self.out.derefs.insert((expr, step), res);
         Ok(Some(target))
@@ -98,7 +125,9 @@ impl Infer<'_, '_> {
     }
 
     fn index_mutably(&mut self, expr: ExprId) -> Result<()> {
-        let Some(Res::Fn(_, substs)) = self.out.operators.get(&expr).cloned() else { return Ok(()) };
+        let Some(Res::Fn(_, substs)) = self.out.operators.get(&expr).cloned() else {
+            return Ok(());
+        };
         let Some(method) = self.cx.lang_item("index_mut").and_then(|of| self.cx.trait_member(of, "index_mut")) else { bail!("core has no `IndexMut::index_mut`") };
         self.out.operators.insert(expr, Res::Fn(method, substs));
         Ok(())
@@ -106,7 +135,7 @@ impl Infer<'_, '_> {
 
     fn sees_private(&mut self, item: crate::names::ItemRef) -> Result<bool> {
         let module = self.cx.module_of(item)?;
-        Ok(self.cx.paths(self.home.krate).within(self.home, module))
+        Ok(self.home.krate == module.krate && self.cx.paths(self.home.krate).within(self.home, module))
     }
 
     pub(super) fn overloaded_deref(&mut self, ty: Ty, mutability: Mut) -> Result<Option<(Res, Ty)>> {
@@ -116,10 +145,12 @@ impl Infer<'_, '_> {
         };
         let Some(method) = self.cx.lang_item(lang).and_then(|of| self.cx.trait_member(of, name)) else { bail!("core has no `{lang}` trait") };
         let receiver = self.cx.types.intern(Kind::Ref(mutability, ty));
-        let Some((item, substs)) = self.trait_method(method, receiver)? else { return Ok(None) };
+        let Some((item, substs)) = self.trait_method(method, receiver)? else {
+            return Ok(None);
+        };
         let (_, ret) = self.fn_types(item, &substs)?;
         let Kind::Ref(_, target) = *self.cx.types.kind(self.resolve(ret)) else { bail!("`{}` returns a value that is not a reference", self.cx.name(item)) };
-        Ok(Some((Res::Fn(item, substs), target)))
+        Ok(Some((Res::fn_of(&self.cx.types, item, &substs), target)))
     }
 
     /// Makes every overloaded dereference in the place expression `expr` call `DerefMut::deref_mut`, as a write or a unique borrow of the place needs.

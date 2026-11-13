@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::body::sig::Predicate;
 use crate::body::{Body, PathId};
-use crate::names::{ItemRef, ModRef};
+use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
 
@@ -26,7 +26,9 @@ impl Infer<'_, '_> {
         {
             return Ok(Some(ty));
         }
-        let Some(ty) = self.param_ty(param) else { return Ok(None) };
+        let Some(ty) = self.param_ty(param) else {
+            return Ok(None);
+        };
         if param == "Self"
             && let Some(of) = self.frame_item.and_then(|item| self.cx.owner_trait(item))
         {
@@ -36,7 +38,9 @@ impl Infer<'_, '_> {
                 return self.project(owner, ty, args, name).map(Some);
             }
         }
-        let Some(bound) = self.bound_trait((param, ty), name, Self::reaches_assoc_ty)? else { return Ok(None) };
+        let Some(bound) = self.bound_trait((param, ty), name, Self::reaches_assoc_ty)? else {
+            return Ok(None);
+        };
         match self.assoc_owner(bound, ty, name, 0)? {
             Some((of, args)) => self.project(of, ty, args, name).map(Some),
             None => Ok(None),
@@ -48,7 +52,9 @@ impl Infer<'_, '_> {
         if let Some(ty) = self.impl_alias(block, (name, &[]))? {
             return Ok(Some(ty));
         }
-        let (Some(of), Some(self_ty)) = (self.cx.impl_trait(block), self.self_ty) else { return Ok(None) };
+        let (Some(of), Some(self_ty)) = (self.cx.impl_trait(block), self.self_ty) else {
+            return Ok(None);
+        };
         let args = self.fresh_trait_args(of)?;
         match self.assoc_owner((of, args), self_ty, name, 0)? {
             Some((owner, args)) => self.project(owner, self_ty, args, name).map(Some),
@@ -60,7 +66,7 @@ impl Infer<'_, '_> {
     pub(super) fn param_ty(&self, param: &str) -> Option<Ty> {
         match param {
             "Self" => self.self_ty,
-            _ => self.generics.iter().find(|(generic, _)| *generic == param).map(|&(_, ty)| ty),
+            _ => self.generics.iter().find(|(generic, _)| super::scope::same_param(generic, param)).map(|&(_, ty)| ty),
         }
     }
 
@@ -71,6 +77,11 @@ impl Infer<'_, '_> {
 
     /// The trait bounds that the frame's headers put on its type parameters, each as the trait and its types with `Self` first: what the body may assume holds.
     pub(super) fn assumptions(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+        if let Some(poly) = &self.poly
+            && poly.env_ready
+        {
+            return Ok(poly.assumptions.clone());
+        }
         let mut found = self.param_bounds()?;
         found.extend(self.own_trait()?);
         found.extend(self.type_bounds()?);
@@ -115,7 +126,7 @@ impl Infer<'_, '_> {
     }
 
     /// The supertrait bounds that `substs[0]: of<substs[1..]>` implies, each with its arguments and the associated types its path binds, as `Iterator<Item = T>`.
-    fn super_bindings(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Vec<((ItemRef, Vec<Ty>), Vec<(String, Ty)>)>> {
+    pub(super) fn super_bindings(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Vec<((ItemRef, Vec<Ty>), Vec<(String, Ty)>)>> {
         let def = self.cx.trait_generics(of)?;
         let params: Vec<_> = type_params(&def.1.params).copied().collect();
         if def.1.supers.len == 0 || substs.len() != params.len() + 1 {
@@ -126,7 +137,9 @@ impl Infer<'_, '_> {
         self.with_frame(frame, |infer| {
             let mut found = Vec::new();
             for &bound in def.0.list(def.1.supers) {
-                let Some((parent, path)) = infer.bound_trait_at(&def.0, bound, home) else { continue };
+                let Some((parent, path)) = infer.bound_trait_at(&def.0, bound, home) else {
+                    continue;
+                };
                 if let Ok(args) = infer.bound_args(parent, &def.0, path, substs[0]) {
                     let bindings = infer.path_bindings(&def.0, path)?;
                     found.push(((parent, std::iter::once(substs[0]).chain(args).collect()), bindings));
@@ -156,7 +169,7 @@ impl Infer<'_, '_> {
     }
 
     /// The trait whose default method the frame types, with its `Self` and arguments, which the method may assume holds.
-    fn own_trait(&mut self) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+    pub(super) fn own_trait(&mut self) -> Result<Option<(ItemRef, Vec<Ty>)>> {
         let (Some(of), Some(self_ty), None) = (self.frame_item.and_then(|item| self.cx.owner_trait(item)), self.self_ty, self.block) else { return Ok(None) };
         let def = self.cx.trait_generics(of)?;
         let src = &self.cx.file(of).source;
@@ -169,17 +182,24 @@ impl Infer<'_, '_> {
         let def = self.cx.trait_generics(of)?;
         let params: Vec<_> = type_params(&def.1.params).copied().collect();
         let mut found = Vec::new();
-        for member in self.cx.children(of).filter(|&member| self.cx.item(member).1.kind == ItemKind::Type).collect::<Vec<_>>() {
+        for member in self.cx.children(of) {
+            if self.cx.item(member).1.kind != ItemKind::Type {
+                continue;
+            }
             let bounds = self.cx.trait_generics(member)?;
             if bounds.1.supers.len == 0 || substs.len() != params.len() + 1 {
                 continue;
             }
-            let Some(value) = self.picked_alias(of, substs[0], &substs[1..], (self.cx.name(member), &[]))? else { continue };
+            let Some(value) = self.picked_alias(of, substs[0], &substs[1..], (self.cx.name(member), &[]))? else {
+                continue;
+            };
             let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), None))?;
             let home = frame.home;
             self.with_frame(frame, |infer| {
                 for &bound in bounds.0.list(bounds.1.supers) {
-                    let Some((trait_of, path)) = infer.bound_trait_at(&bounds.0, bound, home) else { continue };
+                    let Some((trait_of, path)) = infer.bound_trait_at(&bounds.0, bound, home) else {
+                        continue;
+                    };
                     if let Ok(args) = infer.bound_args(trait_of, &bounds.0, path, value) {
                         found.push((trait_of, std::iter::once(value).chain(args).collect()));
                     }
@@ -196,7 +216,9 @@ impl Infer<'_, '_> {
             let (arena, generics, predicates) = header.parts();
             let done = self.in_source(src, |infer| {
                 for bound in named_bounds(arena, src, (generics, predicates), param) {
-                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else { continue };
+                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else {
+                        continue;
+                    };
                     if keep(infer, of)? {
                         found.push((of, infer.bound_args(of, arena, path, ty)?));
                         if first {
@@ -220,7 +242,9 @@ impl Infer<'_, '_> {
             let (arena, _, predicates) = header.parts();
             self.in_source(src, |infer| {
                 for (ty, bound) in infer.typed_predicates(arena, src, predicates) {
-                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else { continue };
+                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else {
+                        continue;
+                    };
                     found.push((of, std::iter::once(ty).chain(infer.bound_args(of, arena, path, ty)?).collect()));
                 }
                 Ok(())
@@ -230,11 +254,15 @@ impl Infer<'_, '_> {
     }
 
     /// Each bound of the where-clauses in `predicates` whose bounded type is not one parameter, with that type lowered in the current frame.
-    fn typed_predicates(&mut self, arena: &Body, src: &Source, predicates: &[Predicate]) -> Vec<(Ty, u32)> {
+    pub(super) fn typed_predicates(&mut self, arena: &Body, src: &Source, predicates: &[Predicate]) -> Vec<(Ty, u32)> {
         let mut found = Vec::new();
         for predicate in predicates {
-            let Some(ty) = predicate.ty.filter(|&ty| one_name(arena, src, ty).is_none()) else { continue };
-            let Ok(ty) = self.lower_ty(arena, ty) else { continue };
+            let Some(ty) = predicate.ty.filter(|&ty| one_name(arena, src, ty).is_none()) else {
+                continue;
+            };
+            let Ok(ty) = self.lower_ty(arena, ty) else {
+                continue;
+            };
             found.extend(arena.list(predicate.bounds).iter().map(|&bound| (ty, bound)));
         }
         found
@@ -304,14 +332,22 @@ impl Infer<'_, '_> {
         Ok(result)
     }
 
-    fn picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
+    pub(in crate::sema) fn picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
+        if self.has_params(ty) || self.any_has_params(args) || self.any_has_params(own) {
+            return match self.poly.is_some() {
+                true => self.poly_picked_alias(of, ty, args, (name, own)),
+                false => Ok(None),
+            };
+        }
         if self.cx.lang(of) == Some("discriminant_kind") {
             return self.discriminant_ty(ty);
         }
         if let Some(found) = self.builtin_alias(of, ty, name)? {
             return Ok(Some(found));
         }
-        let Some(selected) = self.select(of, ty, args)? else { return Ok(None) };
+        let Some(selected) = self.select(of, ty, args)? else {
+            return Ok(None);
+        };
         let (block, impl_args) = self.impl_member(of, (ty, args), selected.clone(), name)?.map_or(selected, |(_, picked)| picked);
         let frame = self.impl_frame_of(block, &impl_args, Some(ty))?;
         match self.with_frame(frame, |infer| infer.impl_alias(block, (name, own)))? {
@@ -320,30 +356,61 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn builtin_alias(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
+    pub(super) fn builtin_alias(&mut self, of: ItemRef, ty: Ty, name: &str) -> Result<Option<Ty>> {
+        if self.cx.lang(of) == Some("pointee_trait") && name == "Metadata" {
+            return self.pointee_metadata(ty);
+        }
         let kind = self.cx.types.kind(self.resolve(ty)).clone();
         if let Kind::Dyn(principal, args, members, _) = &kind {
             let member = self.cx.trait_member(of, name);
-            let (trait_args, mut bound) = super::super::ty::object_parts(args, members);
-            if let Some((_, found)) = bound.find(|(bound, _)| Some(*bound) == member) {
-                return Ok(Some(found));
-            }
-            let trait_args = trait_args.to_vec();
+            let trait_args = {
+                let (trait_args, mut bound) = super::super::ty::object_parts(self.cx.types.substs(*args), members);
+                if let Some((_, found)) = bound.find(|(bound, _)| Some(*bound) == member) {
+                    return Ok(Some(found));
+                }
+                trait_args.to_vec()
+            };
             return self.object_super_alias(of, ty, (*principal, trait_args), name);
         }
         if self.cx.lang(of) == Some("fn_once") && name == "Output" {
             return Ok(self.callable_sig(ty)?.map(|(_, ret)| ret));
         }
-        if self.cx.lang(of) == Some("future_trait") && name == "Output" && let Some(output) = self.coroutine_output(ty) {
+        if self.cx.lang(of) == Some("future_trait")
+            && name == "Output"
+            && let Some(output) = self.coroutine_output(ty)
+        {
             return Ok(Some(output));
         }
-        Ok(None)
+        self.opaque_binding(of, self.resolve(ty), name)
     }
 
-    fn discriminant_ty(&mut self, ty: Ty) -> Result<Option<Ty>> {
+    /// The `<ty as Pointee>::Metadata` type once the unsized tail of `ty` is known, or none while it is an inference variable.
+    pub(super) fn pointee_metadata(&mut self, ty: Ty) -> Result<Option<Ty>> {
+        if matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
+            return Ok(None);
+        }
+        let tailed = self.tail_ty(ty)?;
+        let tail = self.resolve(tailed);
+        match self.cx.types.kind(tail).clone() {
+            Kind::Var(_) => Ok(None),
+            Kind::Slice(_) | Kind::Prim(Primitive::Str) => Ok(Some(self.cx.types.prim(Primitive::Usize))),
+            Kind::Dyn(..) => {
+                let Some(item) = self.cx.lang_item("dyn_metadata") else { bail!("core has no `DynMetadata`") };
+                Ok(Some(self.cx.types.adt(item, &[tail])))
+            }
+            _ if self.has_params(tail) => self.param_metadata(tail).map(Some),
+            _ => Ok(Some(self.cx.types.unit())),
+        }
+    }
+
+    pub(super) fn discriminant_ty(&mut self, ty: Ty) -> Result<Option<Ty>> {
         match *self.cx.types.kind(self.resolve(ty)) {
             Kind::Adt(item, _) if self.cx.item(item).1.kind == ItemKind::Enum => Ok(Some(self.cx.types.prim(self.cx.discriminant_primitive(item)))),
             Kind::Var(_) => Ok(None),
+            Kind::Param(_) | Kind::Proj(_) if self.poly.is_some() => {
+                self.poly_fallback();
+                Ok(None)
+            }
             _ => bail!("the discriminant type of {} is not supported yet", self.show(ty)),
         }
     }
@@ -374,7 +441,9 @@ impl Infer<'_, '_> {
     }
 
     fn bind_bound(&mut self, arena: &Body, home: ModRef, (bound, ty): (u32, Ty)) -> Result<()> {
-        let Some((of, path)) = self.bound_trait_at(arena, bound, home) else { return Ok(()) };
+        let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
+            return Ok(());
+        };
         if self.is_callable_trait(of) {
             return self.bind_callable(arena, (of, path), ty);
         }
@@ -439,7 +508,9 @@ impl Infer<'_, '_> {
         let supers = self.with_frame(frame, |infer| {
             let mut found = Vec::new();
             for &bound in def.0.list(def.1.supers) {
-                let Some((of, path)) = infer.bound_trait_at(&def.0, bound, home) else { continue };
+                let Some((of, path)) = infer.bound_trait_at(&def.0, bound, home) else {
+                    continue;
+                };
                 found.push((of, infer.bound_args(of, &def.0, path, ty)?));
             }
             Ok(found)
@@ -453,7 +524,7 @@ impl Infer<'_, '_> {
     }
 
     /// Resolves each deferred associated type whose impl can now be picked.
-    pub(super) fn settle_projections(&mut self) -> Result<()> {
+    pub(in crate::sema) fn settle_projections(&mut self) -> Result<()> {
         let mut at = 0;
         while at < self.projections.len() {
             let (of, ty, args, name, result) = self.projections[at].clone();
@@ -470,7 +541,7 @@ impl Infer<'_, '_> {
 }
 
 /// The angle-bracketed arguments of the last segment of the bound path `path`, as in `FnOnce<A, Output = R>`.
-fn angle_args(arena: &Body, path: PathId) -> Option<crate::body::List> {
+pub(super) fn angle_args(arena: &Body, path: PathId) -> Option<crate::body::List> {
     let &last = arena.list(arena.path(path).segments).last()?;
     match arena.segments[last as usize].args {
         Some(crate::body::Args::Angle(list)) => Some(list),
@@ -479,10 +550,14 @@ fn angle_args(arena: &Body, path: PathId) -> Option<crate::body::List> {
 }
 
 /// The associated type bounds that the last segment of the bound path `path` puts, as in `Iterator<Item: Try<Output = T>>`: each name and its bounds.
-fn path_constraints(arena: &Body, path: PathId) -> Vec<(u32, crate::body::List)> {
+pub(super) fn path_constraints(arena: &Body, path: PathId) -> Vec<(u32, crate::body::List)> {
     let Some(list) = angle_args(arena, path) else { return Vec::new() };
-    arena.list(list).iter().filter_map(|&at| match arena.args[at as usize] {
-        crate::body::GenericArg::Constraint { name, bounds } => Some((name, bounds)),
-        _ => None,
-    }).collect()
+    arena
+        .list(list)
+        .iter()
+        .filter_map(|&at| match arena.args[at as usize] {
+            crate::body::GenericArg::Constraint { name, bounds } => Some((name, bounds)),
+            _ => None,
+        })
+        .collect()
 }

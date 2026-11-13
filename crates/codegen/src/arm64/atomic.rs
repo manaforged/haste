@@ -1,6 +1,7 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
 use super::{A, C, D, Emit, Ext, S, T};
 use crate::ir::{AtomicRmwOp, Op, Type, Value};
+use crate::reloc::{RelocKind, StencilReloc};
 
 /// Scratch registers an inline copy holds its chunks in; none of them forms an address.
 const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
@@ -15,6 +16,20 @@ impl Emit<'_> {
                     self.asm.mov_imm(dst, *imm);
                     self.put(result, dst);
                 }
+            }
+            Op::SlotAddr(sym) | Op::Symbol(sym) => {
+                let result = result()?;
+                let dst = self.dst(result);
+                let at = self.asm.mov_symbol(dst);
+                self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Arm64Movw64));
+                self.put(result, dst);
+            }
+            Op::Runtime(rt) => {
+                let result = result()?;
+                let dst = self.dst(result);
+                let at = self.asm.mov_symbol(dst);
+                self.relocs.push(StencilReloc::runtime(at, *rt, RelocKind::Arm64Movw64));
+                self.put(result, dst);
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
             _ => return self.access(op, result),

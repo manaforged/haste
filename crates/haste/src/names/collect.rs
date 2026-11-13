@@ -39,15 +39,24 @@ pub fn namespaces(item: &Item) -> &'static [Ns] {
     }
 }
 
+/// The root module that `extern crate <named>` in crate `krate` names among `deps`.
+pub fn extern_crate_root(named: &str, krate: u32, deps: &[(String, usize)]) -> Option<ModRef> {
+    if named == "self" {
+        return Some(ModRef { krate, module: 0 });
+    }
+    let (_, dep) = deps.iter().find(|(dep, _)| dep == named)?;
+    Some(ModRef { krate: *dep as u32, module: 0 })
+}
+
+/// The root module that the `extern crate` item `item` of `source` in crate `krate` names among `deps`.
+pub fn extern_crate_target(source: &crate::outline::source::Source, item: &Item, krate: u32, deps: &[(String, usize)]) -> Option<ModRef> {
+    extern_crate_root(plain(source.text(item.start + 2)), krate, deps)
+}
+
 fn extern_crate(tree: &Tree, (file, at): (u32, u32), krate: u32, deps: &[(String, usize)]) -> Option<Def> {
     let source = &tree.files[file as usize].source;
     let item = &tree.files[file as usize].items.items[at as usize];
-    let named = plain(source.text(item.start + 2));
-    if named == "self" {
-        return Some(Def::Module(ModRef { krate, module: 0 }));
-    }
-    let (_, dep) = deps.iter().find(|(dep, _)| dep == named)?;
-    Some(Def::Module(ModRef { krate: *dep as u32, module: 0 }))
+    extern_crate_target(source, item, krate, deps).map(Def::Module)
 }
 
 /// What a crate's collection needs besides its tree: its index, its cfg values and its dependencies.
@@ -141,7 +150,9 @@ fn bind_item(tree: &Tree, (file, at): (u32, u32), index: usize, context: &Contex
         return;
     }
     let public = Binding { def, vis: Vis::Pub, origin: Origin::Item };
-    if item.kind == ItemKind::Fn && let Some(exported) = proc_macro_name(&source.source, item, text) {
+    if item.kind == ItemKind::Fn
+        && let Some(exported) = proc_macro_name(&source.source, item, text)
+    {
         scopes[0].bind(context.symbols.intern(exported), Ns::Macros, public);
     }
     if item.attrs.iter().any(|attr| matches!(attr, Attr::MacroExport(_))) {
@@ -155,7 +166,9 @@ fn bind_item(tree: &Tree, (file, at): (u32, u32), index: usize, context: &Contex
 /// Copies the macros of `#[macro_use]` modules up into their parents, children first.
 pub fn lift_macro_use(tree: &Tree, scopes: &mut [Scope]) {
     for (index, module) in tree.modules.iter().enumerate().rev() {
-        let Some(parent) = module.parent.filter(|_| module.macro_use && module.loaded()) else { continue };
+        let Some(parent) = module.parent.filter(|_| module.macro_use && module.loaded()) else {
+            continue;
+        };
         let lifted: Vec<(Sym, Binding)> = scopes[index].names.iter().filter_map(|(name, entry)| Some((*name, entry.macros.filter(|binding| binding.origin == Origin::Item)?))).collect();
         for (name, binding) in lifted {
             scopes[parent].bind(name, Ns::Macros, binding);

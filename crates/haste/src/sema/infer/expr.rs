@@ -1,11 +1,11 @@
 use anyhow::{Result, bail};
 
-use crate::body::{BinOp, Expr, ExprId, List, Lit, TyId, UnOp};
+use crate::body::{BinOp, Body, Expr, ExprId, List, Lit, TyId, UnOp};
 use crate::names::{ItemRef, Primitive};
 
 use super::super::ty::{Kind, Mut, Ty, float_bits, int_info};
-use super::{Breaks, Infer, Res};
 use super::path::parse_int;
+use super::{Breaks, Infer, Res};
 
 impl Infer<'_, '_> {
     /// Infers `expr`, with the type the context expects when it knows one.
@@ -38,8 +38,9 @@ impl Infer<'_, '_> {
     }
 
     fn cast(&mut self, inner: ExprId, ty: TyId) -> Result<Ty> {
-        let found = self.expr(inner, None)?;
         let target = self.lower_ty(self.body, ty)?;
+        let hint = matches!(self.cx.types.kind(self.resolve(target)), Kind::FnPtr(..)).then_some(target);
+        let found = self.expr(inner, hint)?;
         let address = matches!(self.cx.types.kind(self.resolve(target)), Kind::Ptr(..) | Kind::Prim(Primitive::Usize | Primitive::Isize));
         let coercion = match self.cx.types.kind(self.resolve(found)).clone() {
             Kind::FnDef(item, substs) if address => Some(super::coerce::Coercion::Reify(Res::Fn(item, substs))),
@@ -53,7 +54,7 @@ impl Infer<'_, '_> {
 
     fn tuple(&mut self, list: List, expected: Option<Ty>) -> Result<Ty> {
         let wanted = match expected.map(|ty| self.cx.types.kind(self.resolve(ty)).clone()) {
-            Some(Kind::Tuple(wanted)) if wanted.len() == list.len as usize => wanted,
+            Some(Kind::Tuple(wanted)) if self.cx.types.substs(wanted).len() == list.len as usize => self.cx.types.substs(wanted).to_vec(),
             _ => Vec::new(),
         };
         let mut items = Vec::new();
@@ -68,7 +69,7 @@ impl Infer<'_, '_> {
                 _ => found,
             });
         }
-        Ok(self.cx.types.intern(Kind::Tuple(items)))
+        Ok(self.cx.types.tuple(&items))
     }
 
     fn reference(&mut self, inner: ExprId, (mutable, raw): (bool, bool), expected: Option<Ty>) -> Result<Ty> {
@@ -93,9 +94,10 @@ impl Infer<'_, '_> {
         let found = self.expr(base, None)?;
         let ty = self.field_base(expr, found, &index.to_string())?;
         match self.cx.types.kind(ty).clone() {
-            Kind::Tuple(items) if (index as usize) < items.len() => Ok(items[index as usize]),
+            Kind::Tuple(items) if (index as usize) < self.cx.types.substs(items).len() => Ok(self.cx.types.substs(items)[index as usize]),
             Kind::Adt(item, args) if self.cx.item(item).1.kind == crate::outline::item::ItemKind::Struct => {
-                let fields = self.adt_fields(item, &args)?;
+                let slice = self.cx.types.substs(args).to_vec();
+                let fields = self.adt_fields(item, &slice)?;
                 fields[0].get(index as usize).copied().ok_or_else(|| anyhow::anyhow!("no field {index} on {}", self.cx.name(item)))
             }
             _ => bail!("no field {index} on {}", self.show(ty)),
@@ -147,7 +149,7 @@ impl Infer<'_, '_> {
             }
             Lit::CStr => {
                 let Some(cstr) = self.cx.lang_item("CStr") else { bail!("core has no `CStr`") };
-                let cstr = self.cx.types.intern(Kind::Adt(cstr, Vec::new()));
+                let cstr = self.cx.types.adt(cstr, &[]);
                 self.cx.types.intern(Kind::Ref(Mut::Not, cstr))
             }
         })
@@ -181,7 +183,7 @@ impl Infer<'_, '_> {
         }
         let name = if op == UnOp::Not { "not" } else { "neg" };
         let Some((of, method)) = self.operator_impl((name, name), ty, &[])? else { bail!("unsupported unary {op:?} on {}", self.show(ty)) };
-        self.out.operators.insert(expr, Res::Fn(method, vec![ty]));
+        self.out.operators.insert(expr, Res::fn_of(&self.cx.types, method, &[ty]));
         self.project(of, ty, Vec::new(), "Output")
     }
 
@@ -230,7 +232,11 @@ impl Infer<'_, '_> {
 
     /// The right operand type of the operator trait `of` when one impl of it applies to the ADT `left`.
     fn only_right(&mut self, of: ItemRef, left: Ty) -> Option<Ty> {
-        if !matches!(self.cx.types.kind(self.resolve(left)), Kind::Adt(..)) {
+        let left = self.resolve(left);
+        if matches!(self.cx.types.kind(left), Kind::Param(_) | Kind::Proj(_)) {
+            return self.poly_only_right(of, left);
+        }
+        if !matches!(self.cx.types.kind(left), Kind::Adt(..)) {
             return None;
         }
         self.probe(|infer| {
@@ -242,7 +248,29 @@ impl Infer<'_, '_> {
     }
 
     fn builtin_left(&self, op: BinOp, left: Ty) -> bool {
-        self.is_scalar(left) || is_compare(op) && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..))
+        let kind = self.cx.types.kind(self.resolve(left));
+        self.is_scalar(left) || is_compare(op) && matches!(kind, Kind::Ptr(..)) || matches!(op, BinOp::Eq | BinOp::Ne) && matches!(kind, Kind::FnPtr(..))
+    }
+
+    pub(in crate::sema) fn is_builtin_operator(&mut self, body: &Body, expr: ExprId, exprs: &[Ty], index_step: Option<Ty>) -> bool {
+        match *body.expr(expr) {
+            Expr::Unary(op, operand) if op != UnOp::Deref => {
+                let ty = exprs[operand.0 as usize];
+                self.is_int(ty) || self.is_float(ty) || self.resolve(ty) == self.cx.types.bool()
+            }
+            Expr::Binary(op, lhs, rhs) => self.is_builtin_binary(op, exprs[lhs.0 as usize], exprs[rhs.0 as usize]),
+            Expr::AssignOp(op, lhs, rhs) => {
+                let (place, right) = (exprs[lhs.0 as usize], exprs[rhs.0 as usize]);
+                self.builtin_compound(op, place) && !matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..))
+            }
+            Expr::Index(_, idx) => index_step.is_some_and(|step| matches!(self.cx.types.kind(step), Kind::Array(..) | Kind::Slice(_))) && matches!(self.cx.types.kind(exprs[idx.0 as usize]), Kind::Prim(Primitive::Usize)),
+            _ => false,
+        }
+    }
+
+    fn is_builtin_binary(&self, op: BinOp, left: Ty, right: Ty) -> bool {
+        let ptr_cmp = is_compare(op) && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..));
+        ptr_cmp || (self.builtin_left(op, left) && !matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..)))
     }
 
     fn operator_type(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
@@ -276,7 +304,9 @@ impl Infer<'_, '_> {
             }
         }
         match self.operands.first() {
-            Some((_, op, ..)) if force => bail!("the type of the left operand of {op:?} is not known"),
+            Some((_, op, ..)) if force => {
+                bail!("the type of the left operand of {op:?} is not known")
+            }
             _ => Ok(()),
         }
     }
@@ -296,13 +326,13 @@ impl Infer<'_, '_> {
         }
         let Some((lang, _)) = operator_trait(op) else { return Ok(false) };
         let Some(of) = self.cx.lang_item(lang) else { return Ok(false) };
-        Ok(self.probe(|infer| infer.select(of, left, &[right]))?.is_none())
+        Ok(!self.probe(|infer| infer.select_or_assume(of, left, &[right]).unwrap_or(false)))
     }
 
     fn overloaded(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
         let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
         let Some((of, method)) = self.operator_impl((lang, name), left, &[right])? else { bail!("unsupported operator {op:?} on {}", self.show(left)) };
-        self.out.operators.insert(expr, Res::Fn(method, vec![left, right]));
+        self.out.operators.insert(expr, Res::fn_of(&self.cx.types, method, &[left, right]));
         match is_compare(op) {
             true => Ok(self.cx.types.bool()),
             false => self.project(of, left, vec![right], "Output"),
@@ -313,7 +343,7 @@ impl Infer<'_, '_> {
     fn operator_impl(&mut self, (lang, name): (&str, &str), left: Ty, args: &[Ty]) -> Result<Option<(ItemRef, ItemRef)>> {
         let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
-        Ok(self.trial(|infer| infer.select(of, left, args))?.map(|_| (of, method)))
+        Ok(self.select_or_prove(of, left, args)?.then_some((of, method)))
     }
 
     fn logical(&mut self, lhs: ExprId, rhs: ExprId) -> Result<Ty> {
@@ -363,13 +393,11 @@ impl Infer<'_, '_> {
             Some(want) => self.coerce_expr(rhs, found, want).map(|()| want)?,
             None => found,
         };
-        let Some((of, method)) = self.operator_impl((&lang, &name), place, &[value])? else {
-            bail!("unsupported compound assignment on {}", self.show(place))
-        };
+        let Some((of, method)) = self.operator_impl((&lang, &name), place, &[value])? else { bail!("unsupported compound assignment on {}", self.show(place)) };
         if self.has_vars(value) {
             self.obligations.push((of, vec![place, value]));
         }
-        self.out.operators.insert(expr, Res::Fn(method, vec![place, value]));
+        self.out.operators.insert(expr, Res::fn_of(&self.cx.types, method, &[place, value]));
         Ok(())
     }
 
@@ -383,21 +411,31 @@ impl Infer<'_, '_> {
         let callee_ty = self.callee_base(expr, found);
         let (params, ret, def) = match self.cx.types.kind(callee_ty).clone() {
             Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
-            Kind::Dyn(of, ..) if self.is_callable_trait(of) => return self.object_call((expr, found), callee_ty, args),
+            Kind::Dyn(of, ..) if self.is_callable_trait(of) => {
+                return self.object_call((expr, found), callee_ty, args);
+            }
             Kind::FnDef(item, substs) => {
                 if !self.body.names_callee(callee) || !matches!(self.out.res.get(&callee), Some(Res::Fn(..))) {
-                    self.out.res.insert(expr, Res::Fn(item, substs.clone()));
+                    self.out.res.insert(expr, Res::Fn(item, substs));
                 }
-                let (params, ret) = self.fn_types(item, &substs)?;
-                (params, ret, Some((item, substs)))
+                let slice = self.cx.types.substs(substs).to_vec();
+                let (params, ret) = self.fn_types(item, &slice)?;
+                (params, ret, Some((item, slice)))
             }
-            Kind::FnPtr(params, ret) => (params, ret, None),
+            Kind::FnPtr(params, ret) => (self.cx.types.substs(params).to_vec(), ret, None),
             Kind::Adt(..) => return self.overloaded_call(expr, found, args),
-            _ => bail!("calling {} is not supported yet", self.show(callee_ty)),
+            _ => return self.other_call(expr, found, callee_ty, args),
         };
         let args = self.passed_args(def.as_ref(), args, params.len())?;
         let def = def.or_else(|| self.ctor_callee(callee));
         self.call_args(args, (params, ret, def), expected)
+    }
+
+    fn other_call(&mut self, expr: ExprId, found: Ty, callee_ty: Ty, args: List) -> Result<Ty> {
+        if self.poly.is_some() && matches!(self.cx.types.kind(callee_ty), Kind::Param(_) | Kind::Proj(_)) {
+            return self.poly_call(expr, found, callee_ty, args);
+        }
+        bail!("calling {} is not supported yet", self.show(callee_ty))
     }
 
     /// The arguments `args` that pass values in a call of the function `def`, or all of them when the callee is not a function item.
@@ -411,7 +449,7 @@ impl Infer<'_, '_> {
     /// The struct, enum or union and its type arguments when `callee` names a tuple constructor, whose declared bounds give closure arguments their signatures.
     fn ctor_callee(&self, callee: ExprId) -> Option<(ItemRef, Vec<Ty>)> {
         match self.out.res.get(&callee) {
-            Some(Res::Ctor(item, _, args)) => Some((*item, args.clone())),
+            Some(&Res::Ctor(item, _, args)) => Some((item, self.cx.types.substs(args).to_vec())),
             _ => None,
         }
     }
@@ -472,10 +510,12 @@ impl Infer<'_, '_> {
     }
 
     pub(super) fn expected_inputs(&mut self, params: &[Ty], ret: Ty, expected: Option<Ty>) -> Vec<Option<Ty>> {
-        let Some(expected) = expected else { return vec![None; params.len()] };
-        self.probe(|infer| match infer.unify(ret, expected) {
-            Ok(()) => params.iter().map(|&param| Some(infer.zonk(param))).collect(),
-            Err(_) => vec![None; params.len()],
+        let Some(expected) = expected else {
+            return vec![None; params.len()];
+        };
+        self.probe(|infer| match infer.unifies(ret, expected) {
+            true => params.iter().map(|&param| Some(infer.substitute(param))).collect(),
+            false => vec![None; params.len()],
         })
     }
 
@@ -486,12 +526,7 @@ impl Infer<'_, '_> {
         self.coerce(found, bool_ty)?;
         let before = std::mem::replace(&mut self.diverges, false);
         let Some(otherwise) = otherwise else {
-            let then_ty = self.expr(then, None);
-            self.scopes.truncate(depth);
-            self.diverges = before;
-            let unit = self.cx.types.unit();
-            self.coerce(then_ty?, unit)?;
-            return Ok(unit);
+            return self.if_without_else(then, depth, before);
         };
         let then_ty = self.expr(then, expected)?;
         self.scopes.truncate(depth);
@@ -509,6 +544,15 @@ impl Infer<'_, '_> {
         self.coerce_expr(then, then_ty, target)?;
         self.coerce_expr(otherwise, else_ty, target)?;
         Ok(target)
+    }
+
+    fn if_without_else(&mut self, then: ExprId, depth: usize, before: bool) -> Result<Ty> {
+        let then_ty = self.expr(then, None);
+        self.scopes.truncate(depth);
+        self.diverges = before;
+        let unit = self.cx.types.unit();
+        self.coerce(then_ty?, unit)?;
+        Ok(unit)
     }
 
     /// Whether `ty` is the never type `!`.
@@ -531,16 +575,21 @@ impl Infer<'_, '_> {
         Ok(a)
     }
 
-    /// The type both branches of an `if` coerce to when they differ: an unsized slice, a function pointer, or the first branch's reference that the second derefs to.
-    fn branch_target(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
+    /// The type both branches coerce to when they differ: an unsized slice, a function pointer, or one branch's reference that the other coerces to.
+    pub(super) fn branch_target(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
         if let Some(target) = self.slice_branch(a, b) {
             return Ok(Some(target));
         }
         if let Some(target) = self.fn_branch(a, b)? {
             return Ok(Some(target));
         }
-        let refs = [a, b].iter().all(|&ty| matches!(self.cx.types.kind(self.resolve(ty)), Kind::Ref(..)));
-        Ok(if refs { self.trial(|infer| Ok(infer.coercion(b, a).ok().flatten()))?.map(|_| a) } else { None })
+        if ![a, b].iter().all(|&ty| matches!(self.cx.types.kind(self.resolve(ty)), Kind::Ref(..))) {
+            return Ok(None);
+        }
+        if self.trial(|infer| Ok(infer.coercion(b, a).ok().flatten()))?.is_some() {
+            return Ok(Some(a));
+        }
+        Ok(self.trial(|infer| Ok(infer.coercion(a, b).ok().flatten()))?.map(|_| b))
     }
 
     /// The branch type that the other branch unsizes to, when one branch points to an array and the other to a slice, as rustc's common type of two branches does.
@@ -559,12 +608,15 @@ impl Infer<'_, '_> {
     /// The function pointer type both branches reify to, when they are two different function items, as rustc's common type of two branches does.
     fn fn_branch(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
         let (a, b) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
-        let (Kind::FnDef(item, substs), Kind::FnDef(..)) = (&a, &b) else { return Ok(None) };
+        let (Kind::FnDef(item, substs), Kind::FnDef(..)) = (&a, &b) else {
+            return Ok(None);
+        };
         if a == b {
             return Ok(None);
         }
-        let (params, ret) = self.fn_types(*item, substs)?;
-        Ok(Some(self.cx.types.intern(Kind::FnPtr(params, ret))))
+        let slice = self.cx.types.substs(*substs).to_vec();
+        let (params, ret) = self.fn_types(*item, &slice)?;
+        Ok(Some(self.cx.types.fn_ptr(&params, ret)))
     }
 
     fn shared_pointer(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {

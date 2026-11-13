@@ -10,9 +10,7 @@ fn is_name(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Ident | TokenKind::RawIdent)
 }
 
-const OPERATORS: [&str; 24] = [
-    "<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", "..",
-];
+const OPERATORS: [&str; 24] = ["<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", ".."];
 
 fn glued(src: &Source, at: u32, operator: &str) -> bool {
     operator.char_indices().all(|(index, ch)| {
@@ -81,7 +79,9 @@ fn stops(src: &Source, at: u32, stop: Stop, first: bool) -> bool {
 }
 
 fn ends_type(src: &Source, at: u32) -> bool {
-    let Some(before) = at.checked_sub(1) else { return false };
+    let Some(before) = at.checked_sub(1) else {
+        return false;
+    };
     match src.kind(before) {
         TokenKind::Ident | TokenKind::RawIdent => !matches!(src.text(before), "mut" | "dyn" | "impl" | "const"),
         TokenKind::Gt | TokenKind::CloseParen | TokenKind::CloseBracket => true,
@@ -113,7 +113,9 @@ fn until(src: &Source, mut at: u32, end: u32, stop: Stop) -> u32 {
             break;
         }
         if stop == Stop::Ty {
-            let Some(next) = angle(src, at, angles) else { break };
+            let Some(next) = angle(src, at, angles) else {
+                break;
+            };
             angles = next;
         }
         at = tree(src, at);
@@ -127,9 +129,7 @@ fn literal(src: &Source, at: u32) -> Option<u32> {
     (matches!(src.kind(at), TokenKind::Literal { .. }) || word).then_some(at + 1)
 }
 
-const PREFIX_WORDS: [&str; 20] = [
-    "if", "match", "while", "for", "loop", "let", "move", "async", "unsafe", "return", "break", "mut", "const", "dyn", "ref", "box", "yield", "static", "impl", "where",
-];
+const PREFIX_WORDS: [&str; 20] = ["if", "match", "while", "for", "loop", "let", "move", "async", "unsafe", "return", "break", "mut", "const", "dyn", "ref", "box", "yield", "static", "impl", "where"];
 
 fn closure_params(src: &Source, at: u32, end: u32) -> u32 {
     if src.kind(at + 1) == TokenKind::Or && src.joint(at) {
@@ -258,6 +258,11 @@ fn parsed(frag: Frag) -> Option<Fragment> {
 
 fn long(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
     if let Some(found) = parsed(frag).and_then(|fragment| fragment_end(src, fragment, at, end)) {
+        return Some(found);
+    }
+    if frag == Frag::Pat
+        && let Some(found) = fragment_end(src, Fragment::PatParam, at, end)
+    {
         return Some(found);
     }
     match frag {

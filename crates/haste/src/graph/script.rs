@@ -65,7 +65,9 @@ impl Output {
                     None => continue,
                 },
             };
-            let Some((key, value)) = body.split_once('=') else { continue };
+            let Some((key, value)) = body.split_once('=') else {
+                continue;
+            };
             let directive = DIRECTIVES.iter().find(|(known, _)| *known == key).map(|(_, directive)| *directive);
             match directive {
                 Some(directive) => output.apply(directive, value),

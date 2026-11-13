@@ -66,7 +66,11 @@ impl Infer<'_, '_> {
     }
 
     fn bind_name(&mut self, pat: PatId, (name, mutable, by_ref): (u32, bool, bool), sub: Option<PatId>, (ty, mode): (Ty, Mode)) -> Result<()> {
-        if !mutable && !by_ref && sub.is_none() && let Some((found, res)) = self.named_pat(name)? {
+        if !mutable
+            && !by_ref
+            && sub.is_none()
+            && let Some((found, res)) = self.named_pat(name)?
+        {
             return self.named_value(pat, (found, res), ty, mode);
         }
         let explicit = if mutable { Mut::Mut } else { Mut::Not };
@@ -137,10 +141,10 @@ impl Infer<'_, '_> {
     fn tuple_pat(&mut self, list: List, ty: Ty, mode: Mode) -> Result<()> {
         let (pats, rest) = rest_split(self.body, list)?;
         let items = match (self.cx.types.kind(ty).clone(), rest) {
-            (Kind::Tuple(items), _) => items,
+            (Kind::Tuple(items), _) => self.cx.types.substs(items).to_vec(),
             (_, None) => {
                 let items: Vec<Ty> = (0..pats.len()).map(|_| self.fresh(Kind::Var)).collect();
-                let tuple = self.cx.types.intern(Kind::Tuple(items.clone()));
+                let tuple = self.cx.types.tuple(&items);
                 self.unify(ty, tuple)?;
                 items
             }
@@ -176,7 +180,11 @@ impl Infer<'_, '_> {
             Kind::Array(element, len) => (element, len),
             _ => bail!("slice pattern on {}", self.show(ty)),
         };
-        match self.cx.types.len(self.resolve(len)) {
+        let resolved_len = self.resolve(len);
+        if matches!(self.cx.types.kind(resolved_len), Kind::Param(_) | Kind::Proj(_)) {
+            self.poly_fallback();
+        }
+        match self.cx.types.len(resolved_len) {
             Some(len) if given as u64 > len || (!rest && given as u64 != len) => bail!("pattern has {given} elements, the array has {len}"),
             Some(_) => Ok(element),
             None if !rest => {
@@ -193,7 +201,9 @@ impl Infer<'_, '_> {
             bail!("pattern has {given} fields, the type has {}", items.len());
         }
         for (at, &pat) in pats.iter().enumerate() {
-            let Some(index) = position(at, pats.len(), rest, items.len()) else { continue };
+            let Some(index) = position(at, pats.len(), rest, items.len()) else {
+                continue;
+            };
             self.pat(pat, items[index], mode)?;
         }
         Ok(())
@@ -221,9 +231,10 @@ impl Infer<'_, '_> {
     fn variant_pat(&mut self, pat: PatId, path: PathId, ty: Ty, (list, mode): (List, Mode)) -> Result<()> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, true)? else { bail!("pattern path is not a tuple constructor") };
-        let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
+        let adt = self.cx.types.intern(Kind::Adt(item, args));
         self.unify(ty, adt)?;
-        let fields = self.adt_fields(item, &args)?[variant as usize].clone();
+        let slice = self.cx.types.substs(args).to_vec();
+        let fields = self.adt_fields(item, &slice)?[variant as usize].clone();
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         let (pats, rest) = rest_split(self.body, list)?;
         self.positional(&pats, rest, &fields, mode)
@@ -232,9 +243,10 @@ impl Infer<'_, '_> {
     fn struct_pat(&mut self, pat: PatId, path: PathId, ty: Ty, (list, mode): (List, Mode)) -> Result<()> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, false)? else { bail!("struct pattern of something that is not a struct") };
-        let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
+        let adt = self.cx.types.intern(Kind::Adt(item, args));
         self.unify(ty, adt)?;
-        let fields = self.adt_fields(item, &args)?[variant as usize].clone();
+        let slice = self.cx.types.substs(args).to_vec();
+        let fields = self.adt_fields(item, &slice)?[variant as usize].clone();
         self.out.pat_res.insert(pat, Res::Ctor(item, variant, args));
         for &at in body.list(list) {
             let field = body.field_pats[at as usize];
@@ -282,18 +294,23 @@ impl Infer<'_, '_> {
         let found = self.value_def(&[sym], false, None).ok();
         let (item, variant) = match found {
             Some(crate::names::Def::Variant(item, index)) => {
-                let Some(at) = self.cx.adt_def(item)?.position(index) else { return Ok(None) };
+                let Some(at) = self.cx.adt_def(item)?.position(index) else {
+                    return Ok(None);
+                };
                 (item, at as u32)
             }
             Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Struct => (item, 0),
-            Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => return self.const_item(item, Vec::new()).map(Some),
+            Some(crate::names::Def::Item(item)) if self.cx.item(item).1.kind == ItemKind::Const => {
+                return self.const_item(item, Vec::new()).map(Some);
+            }
             _ => return Ok(None),
         };
         if self.cx.adt_def(item)?.variants[variant as usize].shape != crate::body::adt::Shape::Unit {
             return Ok(None);
         }
         let args = self.adt_args(item, Vec::new(), true)?;
-        let adt = self.cx.types.intern(Kind::Adt(item, args.clone()));
-        Ok(Some((adt, Res::Ctor(item, variant, args))))
+        let interned = self.cx.types.intern_substs(&args);
+        let adt = self.cx.types.intern(Kind::Adt(item, interned));
+        Ok(Some((adt, Res::Ctor(item, variant, interned))))
     }
 }

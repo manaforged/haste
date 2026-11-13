@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Result;
 use rustc_hash::FxHashMap as HashMap;
@@ -78,12 +78,39 @@ pub fn head(kind: &Kind) -> Option<Head> {
     })
 }
 
+#[derive(Default)]
+struct Asked {
+    modules: Vec<ModRef>,
+    names: Vec<(ModRef, crate::names::Sym)>,
+    crates: Vec<u32>,
+    scopes: Vec<ModRef>,
+    procs: Vec<(ItemRef, String)>,
+}
+
+impl Asked {
+    fn from_requests(requests: crate::names::path::Requests) -> Self {
+        Self { modules: requests.modules.into_inner(), names: requests.names.into_inner(), crates: requests.crates.into_inner(), scopes: requests.scopes.into_inner(), procs: requests.procs.into_inner() }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.modules.is_empty() && self.names.is_empty() && self.crates.is_empty() && self.scopes.is_empty() && self.procs.is_empty()
+    }
+
+    fn replay(&self, into: &crate::names::path::Requests) {
+        into.modules.borrow_mut().extend(self.modules.iter().copied());
+        into.names.borrow_mut().extend(self.names.iter().copied());
+        into.crates.borrow_mut().extend(self.crates.iter().copied());
+        into.scopes.borrow_mut().extend(self.scopes.iter().copied());
+        into.procs.borrow_mut().extend(self.procs.iter().cloned());
+    }
+}
+
 /// The impls of one crate: inherent ones by the head of their self type, trait ones by their trait.
 #[derive(Default)]
 pub struct Index {
     inherent: HashMap<Head, Vec<ImplRef>>,
     traits: HashMap<ItemRef, Vec<(ImplRef, Option<Head>)>>,
-    asked: crate::names::path::Requests,
+    asked: Asked,
 }
 
 const PRIMITIVE_HOLDERS: [&str; 3] = ["core", "alloc", "std"];
@@ -91,19 +118,19 @@ const PRIMITIVE_HOLDERS: [&str; 3] = ["core", "alloc", "std"];
 impl Index {
     /// Whether building the index asked for nothing, so it holds every impl its holder has.
     pub fn complete(&self) -> bool {
-        self.asked.count() == 0
+        self.asked.is_empty()
     }
 }
 
 impl<'a> Context<'a> {
     /// The parsed header of impl `block`.
-    pub fn impl_header(&mut self, block: ImplRef) -> Result<Rc<ImplHeader>> {
+    pub fn impl_header(&mut self, block: ImplRef) -> Result<Arc<ImplHeader>> {
         if let Some(found) = self.store.headers.get(&block) {
-            return Ok(found.clone());
+            return Ok(found);
         }
         let (file, item) = (self.impl_file(block), self.impl_entry(block));
-        let parsed = Rc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
-        self.store.headers.insert(block, parsed.clone());
+        let parsed = Arc::new(sig::impl_header(&file.source, item.start, item.body.unwrap_or(item.end))?);
+        self.store.headers.insert(block, Arc::clone(&parsed));
         Ok(parsed)
     }
 
@@ -142,41 +169,21 @@ impl<'a> Context<'a> {
 
     /// The functions, constants and types of impl `block`, its own and those its macro calls expand to.
     pub fn members(&self, block: ImplRef) -> Vec<ItemRef> {
-        let (krate, index) = match block {
-            ImplRef::Module { krate, index } => (krate, index),
-            ImplRef::Body(item) => return self.body_members(item),
+        let items = match block {
+            ImplRef::Module { krate, index } => self.block_parts(krate, &self.outline.crates[krate as usize].impls[index as usize]),
+            ImplRef::Body(item) => self.children(item),
         };
-        let tree = &self.outline.crates[krate as usize];
-        let entry = &tree.impls[index as usize];
-        let parts = std::iter::once((entry.file, Some(entry.at))).chain(entry.parts.iter().map(|&part| (part, None)));
-        let mut found = Vec::new();
-        for (file, owner) in parts {
-            let items = &tree.files[file].items.items;
-            for &at in self.kids_of(items, owner).iter() {
-                let item = &items[at as usize];
-                if matches!(item.kind, ItemKind::Fn | ItemKind::Const | ItemKind::Type) && tree.env.enabled(&item.attrs) {
-                    found.push(ItemRef { krate, file: file as u32, item: at });
-                }
-            }
-        }
-        found
-    }
-
-    fn body_members(&self, block: ItemRef) -> Vec<ItemRef> {
-        self.children(block).filter(|member| matches!(self.item(*member).1.kind, ItemKind::Fn | ItemKind::Const | ItemKind::Type)).collect()
+        items.into_iter().filter(|&member| matches!(self.item(member).1.kind, ItemKind::Fn | ItemKind::Const | ItemKind::Type)).collect()
     }
 
     /// The member of impl `block` named `name`.
     pub fn member(&self, block: ImplRef, name: &str) -> Option<ItemRef> {
-        let known = self.impl_members.borrow().get(&block).cloned();
-        let members = known.unwrap_or_else(|| {
-            let mut members = HashMap::default();
+        let members = self.impl_members.get_or_insert_with(block, || {
+            let mut map = HashMap::default();
             for member in self.members(block) {
-                members.entry(self.name(member)).or_insert(member);
+                map.entry(self.name(member)).or_insert(member);
             }
-            let members = Rc::new(members);
-            self.impl_members.borrow_mut().insert(block, members.clone());
-            members
+            Arc::new(map)
         });
         members.get(name).copied()
     }
@@ -196,26 +203,25 @@ impl<'a> Context<'a> {
         owners.get(&key).map(|&index| ImplRef::Module { krate: item.krate, index })
     }
 
-    fn owners_of(&mut self, krate: u32) -> Rc<HashMap<(u32, Option<u32>), u32>> {
+    fn owners_of(&mut self, krate: u32) -> Arc<HashMap<(u32, Option<u32>), u32>> {
         let tree = &self.outline.crates[krate as usize];
-        self.store.lookups.owners
-            .entry(krate)
-            .or_insert_with(|| {
-                let mut map = HashMap::default();
-                for (index, entry) in tree.impls.iter().enumerate() {
-                    map.insert((entry.file as u32, Some(entry.at)), index as u32);
-                    map.extend(entry.parts.iter().map(|&part| ((part as u32, None), index as u32)));
-                }
-                Rc::new(map)
-            })
-            .clone()
+        self.store.lookups.owners.get_or_insert_with(krate, || {
+            let mut map = HashMap::default();
+            for (index, entry) in tree.impls.iter().enumerate() {
+                map.insert((entry.file as u32, Some(entry.at)), index as u32);
+                map.extend(entry.parts.iter().map(|&part| ((part as u32, None), index as u32)));
+            }
+            Arc::new(map)
+        })
     }
 
     /// The inherent impls of types with head `head`, asking for every module of the crates that may hold one.
     pub fn inherent(&mut self, head: Head) -> Vec<ImplRef> {
         let standard = self.primitive_holders();
         let holders = match head {
-            Head::Adt(item) | Head::Dyn(item) if !standard.contains(&item.krate) => vec![item.krate],
+            Head::Adt(item) | Head::Dyn(item) if !standard.contains(&item.krate) => {
+                vec![item.krate]
+            }
             _ => standard,
         };
         let mut found = Vec::new();
@@ -253,17 +259,22 @@ impl<'a> Context<'a> {
 
     /// The trait that impl `block` implements, or none for an inherent impl.
     pub fn impl_trait(&mut self, block: ImplRef) -> Option<ItemRef> {
-        if let Some(&known) = self.store.lookups.impl_traits.get(&block) {
+        if let Some(known) = self.store.lookups.impl_traits.get(&block) {
             return known;
         }
+        let before = self.quiet_mark();
         let found = self.impl_trait_here(block);
-        self.store.lookups.impl_traits.insert(block, found);
+        if self.quiet_mark() == before {
+            self.store.lookups.impl_traits.insert(block, found);
+        }
         found
     }
 
     fn impl_trait_here(&mut self, block: ImplRef) -> Option<ItemRef> {
         let header = self.impl_header(block).ok()?;
-        let syntax::Ty::Path(path) = *header.body.ty(header.trait_ref?) else { return None };
+        let syntax::Ty::Path(path) = *header.body.ty(header.trait_ref?) else {
+            return None;
+        };
         let src = &self.impl_file(block).source;
         let home = self.impl_module(block).ok()?;
         let (segments, absolute, dollar) = segments(&self.names.symbols, src, &header.body, path);
@@ -278,7 +289,7 @@ impl<'a> Context<'a> {
         let anchor = at.and_then(ItemRef::outer).map(|(root, from)| (root, Some(from)));
         let paths = self.paths(home.krate);
         match self.local_path(anchor, path, Ns::Types) {
-            Some(BodyPath::Item(item)) => Some(Def::Item(item)),
+            Some(BodyPath::Def(def)) => Some(def),
             Some(BodyPath::Variant(_)) => None,
             Some(BodyPath::Outside(skip)) => paths.resolve(&outside(path, skip), home),
             None => anchor.and_then(|(root, _)| self.body_use_path((root, home), path, at.map(|at| self.item(at).1.start))).or_else(|| paths.resolve(path, home)),
@@ -291,20 +302,20 @@ impl<'a> Context<'a> {
         roots.filter(|(_, root)| root.role == crate::outline::Role::Lib && PRIMITIVE_HOLDERS.contains(&root.name.as_str())).map(|(krate, _)| krate as u32).collect()
     }
 
-    fn index_of(&mut self, holder: Holder) -> Rc<Index> {
+    fn index_of(&mut self, holder: Holder) -> Arc<Index> {
         if let Holder::Crate(krate) = holder
             && self.outline.crates[krate as usize].partial()
         {
             self.asks.crates.borrow_mut().push(krate);
         }
         if let Some(found) = self.store.lookups.heads.get(&holder) {
-            self.asks.repeat(&found.asked);
-            return found.clone();
+            found.asked.replay(&self.asks);
+            return found;
         }
         if let Holder::Body(root) = holder
             && self.expansion(root).is_none()
         {
-            return Rc::default();
+            return Arc::default();
         }
         let mark = self.asks.mark();
         let blocks = match holder {
@@ -315,9 +326,9 @@ impl<'a> Context<'a> {
         for block in blocks {
             self.index_block(&mut index, block);
         }
-        index.asked = self.asks.since(mark);
-        let index = Rc::new(index);
-        self.store.lookups.heads.insert(holder, index.clone());
+        index.asked = Asked::from_requests(self.asks.since(mark));
+        let index = Arc::new(index);
+        self.store.lookups.heads.insert(holder, Arc::clone(&index));
         index
     }
 
@@ -335,19 +346,25 @@ impl<'a> Context<'a> {
     }
 
     fn body_impls(&self, root: ItemRef) -> Vec<ImplRef> {
-        let Some(found) = self.expansion(root) else { return Vec::new() };
+        let Some(found) = self.expansion(root) else {
+            return Vec::new();
+        };
         let items = &found.file.items.items;
         let blocks = items.iter().enumerate().filter(|(_, item)| item.kind == ItemKind::Impl);
         blocks.map(|(at, _)| ImplRef::Body(root.inner(at as u32))).collect()
     }
 
     fn index_block(&mut self, index: &mut Index, block: ImplRef) {
-        let Ok(header) = self.impl_header(block) else { return };
+        let Ok(header) = self.impl_header(block) else {
+            return;
+        };
         if header.negative {
             return;
         }
         let src = &self.impl_file(block).source;
-        let Ok(home) = self.impl_module(block) else { return };
+        let Ok(home) = self.impl_module(block) else {
+            return;
+        };
         let head = if generic_self(src, &header) { None } else { self.syntax_head(src, &header.body, header.self_ty, (home, block.item())) };
         match (header.trait_ref.is_some(), head) {
             (false, Some(head)) => index.inherent.entry(head).or_default().push(block),
@@ -377,7 +394,9 @@ impl<'a> Context<'a> {
 
     fn dyn_head(&mut self, src: &Source, arena: &Body, bounds: crate::body::List, (home, root): (ModRef, Option<ItemRef>)) -> Option<Head> {
         arena.list(bounds).iter().find_map(|&at| {
-            let crate::body::Bound::Trait { path, .. } = arena.bounds[at as usize] else { return None };
+            let crate::body::Bound::Trait { path, .. } = arena.bounds[at as usize] else {
+                return None;
+            };
             let (segments, absolute, dollar) = segments(&self.names.symbols, src, arena, path);
             match self.resolve_in(root, &NamePath { segments: &segments, absolute, dollar }, home)? {
                 Def::Item(item) if self.item(item).1.kind == ItemKind::Trait && !self.is_auto_trait(item) => Some(Head::Dyn(item)),
@@ -390,7 +409,7 @@ impl<'a> Context<'a> {
         let (segments, absolute, dollar) = segments(&self.names.symbols, src, arena, path);
         match self.resolve_in(root, &NamePath { segments: &segments, absolute, dollar }, home)? {
             Def::Primitive(primitive) => Some(Head::Prim(primitive)),
-            Def::Item(item) if matches!(self.item(item).1.kind, ItemKind::Struct | ItemKind::Enum | ItemKind::Union) => Some(Head::Adt(item)),
+            Def::Item(item) if matches!(self.item(item).1.kind, ItemKind::Struct | ItemKind::Enum | ItemKind::Union) || self.foreign(item) => Some(Head::Adt(item)),
             Def::Item(item) if self.item(item).1.kind == ItemKind::Type => {
                 let alias = self.alias_def(item).ok()?;
                 let home = self.module_of(item).ok()?;
@@ -402,7 +421,9 @@ impl<'a> Context<'a> {
 }
 
 fn generic_self(src: &Source, header: &ImplHeader) -> bool {
-    let syntax::Ty::Path(path) = *header.body.ty(header.self_ty) else { return false };
+    let syntax::Ty::Path(path) = *header.body.ty(header.self_ty) else {
+        return false;
+    };
     let segments = header.body.list(header.body.path(path).segments);
     let [only] = segments else { return false };
     let name = src.text(header.body.segments[*only as usize].name);

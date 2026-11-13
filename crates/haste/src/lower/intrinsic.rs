@@ -2,12 +2,13 @@ use anyhow::{Result, bail};
 use haste_codegen::{FloatCC, IntCC, Type, Value};
 
 use crate::body::BinOp;
-use crate::sema::intrinsic::Intrinsic;
 use crate::names::Primitive;
+use crate::sema::intrinsic::Intrinsic;
 use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
 use super::place::{Base, Place};
+use super::stencil::{RodataReloc, RodataTarget, SymbolSource};
 use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
@@ -15,6 +16,11 @@ impl Lower<'_, '_> {
     pub fn intrinsic(&mut self, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         match which {
             Intrinsic::Transmute => self.transmute(substs, args),
+            Intrinsic::FloatToInt => {
+                let (&[from, to], &[value]) = (substs, args) else { bail!("float_to_int_unchecked takes one float") };
+                let (from, to) = (self.num(from)?, self.num(to)?);
+                self.convert(value, from, to).map(Some)
+            }
             Intrinsic::PtrMetadata => self.metadata(substs, args),
             Intrinsic::ConstEvalSelect => self.const_eval_select(substs, args),
             Intrinsic::WithOverflow(op) => self.with_overflow(op, substs, args).map(Some),
@@ -33,26 +39,26 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// A `&'static Location` of where the function being lowered starts, since callers do not pass down the location that `#[track_caller]` asks for yet.
     fn caller_location(&mut self) -> Result<Value> {
         let Some(location) = self.cx.lang_item("panic_location") else { bail!("no `Location` lang item") };
-        let ty = self.cx.types.intern(Kind::Adt(location, Vec::new()));
+        let ty = self.cx.types.adt(location, &[]);
         let layout = self.cx.layout(ty)?;
         let (src, entry) = self.cx.item(self.reached.list[self.index].0.0);
         let mut file = src.path.display().to_string().into_bytes();
         let (len, line, column) = (file.len() as u64, src.line(entry.start) as u32, src.column(entry.start) as u32);
         file.push(0);
+        let file_id = self.slots.rodata(&file, &[]);
         let mut bytes = vec![0u8; layout.size.bytes() as usize];
         let mut put = |field: u32, at: i32, value: &[u8]| {
             let from = (crate::sema::layout::field_offset(&layout, 0, field) + at) as usize;
             bytes[from..from + value.len()].copy_from_slice(value);
         };
-        put(0, 0, &(self.slots.data(&file) as u64).to_le_bytes());
         put(0, 8, &len.to_le_bytes());
         put(1, 0, &line.to_le_bytes());
         put(2, 0, &column.to_le_bytes());
-        let address = self.slots.data(&bytes);
-        Ok(self.ins().iconst(Type::I64, address))
+        let ptr_offset = crate::sema::layout::field_offset(&layout, 0, 0) as u32;
+        let loc_id = self.slots.rodata(&bytes, &[RodataReloc { offset: ptr_offset, target: RodataTarget::Rodata(file_id) }]);
+        Ok(self.emit_symbol(SymbolSource::Rodata(loc_id)))
     }
 
     fn catch_unwind(&mut self, args: &[Value]) -> Result<Value> {
@@ -103,7 +109,7 @@ impl Lower<'_, '_> {
     /// The address of a `(ty, bool)` pair in a new frame slot that holds `value` and `flag`.
     pub(super) fn flagged(&mut self, ty: Ty, value: Value, flag: Value) -> Result<Value> {
         let bool_ty = self.cx.types.prim(Primitive::Bool);
-        let tuple = self.cx.types.intern(Kind::Tuple(vec![ty, bool_ty]));
+        let tuple = self.cx.types.tuple(&[ty, bool_ty]);
         let tuple_repr = repr(self.cx, tuple)?;
         let Some(slot) = self.slot(tuple_repr) else { bail!("a flagged pair takes no bytes") };
         let (first, second) = (self.field_offset(tuple, 0)?, self.field_offset(tuple, 1)?);
@@ -114,9 +120,8 @@ impl Lower<'_, '_> {
 
     fn const_eval_select(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&tuple), Some(&runtime)) = (substs.first(), substs.get(2)) else { bail!("const_eval_select takes four type arguments") };
-        let (Kind::Tuple(fields), Kind::FnDef(item, fn_substs)) = (self.cx.types.kind(tuple).clone(), self.cx.types.kind(runtime).clone()) else {
-            bail!("const_eval_select needs a tuple of arguments and a function item")
-        };
+        let (Kind::Tuple(fields), Kind::FnDef(item, fn_substs)) = (self.cx.types.kind(tuple).clone(), self.cx.types.kind(runtime).clone()) else { bail!("const_eval_select needs a tuple of arguments and a function item") };
+        let fields = self.cx.types.substs(fields).to_vec();
         let mut values = Vec::new();
         if let Some(&address) = args.first() {
             for (index, field) in fields.into_iter().enumerate() {
@@ -125,7 +130,7 @@ impl Lower<'_, '_> {
                 values.extend(self.read(place));
             }
         }
-        self.invoke(item, &fn_substs, values)
+        self.invoke(item, fn_substs, values)
     }
 
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {

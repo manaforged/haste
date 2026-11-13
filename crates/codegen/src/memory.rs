@@ -1,4 +1,4 @@
-use crate::{Error, ErrorKind};
+use crate::{Code, Error, ErrorKind};
 
 const CHUNK: usize = 64 << 20;
 const ALIGN: usize = 16;
@@ -35,6 +35,10 @@ impl Bump {
     fn close(&mut self) {
         self.used = self.size;
     }
+
+    fn remaining(&self) -> usize {
+        self.size.saturating_sub(self.used.next_multiple_of(ALIGN))
+    }
 }
 
 /// One mapping of code: written through `write` and run through `exec`, two views of the same pages.
@@ -68,22 +72,48 @@ fn memory_error(message: String) -> Error {
 }
 
 impl Memory {
+    fn reserve_at(&mut self, len: usize) -> Result<(usize, usize), Error> {
+        let owner = this_process();
+        let taken = self.chunks.last_mut().filter(|chunk| chunk.owner == owner).and_then(|chunk| Some((chunk.bump.take(len)?, chunk.write, chunk.exec)));
+        match taken {
+            Some((at, write, exec)) => Ok((write + at, exec + at)),
+            None if self.sealed => Err(memory_error("the code window of this worker is full".to_owned())),
+            None => {
+                self.chunks.push(map(len.max(CHUNK).next_multiple_of(page()), owner)?);
+                self.reserve_at(len)
+            }
+        }
+    }
+
     /// Copies `code` into code memory and returns the address it runs at.
     pub fn write(&mut self, code: &[u8]) -> Result<usize, Error> {
-        let owner = this_process();
-        let taken = self.chunks.last_mut().filter(|chunk| chunk.owner == owner).and_then(|chunk| Some((chunk.bump.take(code.len())?, chunk.write, chunk.exec)));
-        let (at, write, exec) = match taken {
-            Some(found) => found,
-            None if self.sealed => return Err(memory_error("the code window of this worker is full".to_owned())),
-            None => {
-                self.chunks.push(map(code.len().max(CHUNK).next_multiple_of(page()), owner)?);
-                return self.write(code);
-            }
-        };
-        // SAFETY: at + len is inside this chunk's writable mapping, past every byte written before, and code does not overlap it.
-        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), (write + at) as *mut u8, code.len()) };
-        flush(exec + at, code.len());
-        Ok(exec + at)
+        let (write, exec) = self.reserve_at(code.len())?;
+        // SAFETY: write..write + len is inside this chunk's writable mapping, past every byte written before, and code does not overlap it.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), write as *mut u8, code.len()) };
+        flush(exec, code.len());
+        Ok(exec)
+    }
+
+    /// Copies `code` into code memory, patches its relocations with `symbols`, and returns its executable address.
+    pub fn write_patched(&mut self, code: &Code, symbols: &[u64]) -> Result<usize, Error> {
+        let len = code.bytes().len();
+        let (write, exec) = self.reserve_at(len)?;
+        // SAFETY: write..write + len is a fresh unaliased slice of this chunk's writable mapping.
+        let out = unsafe { std::slice::from_raw_parts_mut(write as *mut u8, len) };
+        code.patch(symbols, out);
+        flush(exec, len);
+        Ok(exec)
+    }
+
+    /// Reserves up to `max_len` bytes, builds bytes knowing the executable address, and writes them.
+    pub fn write_with(&mut self, max_len: usize, build: impl FnOnce(usize) -> Result<Vec<u8>, Error>) -> Result<usize, Error> {
+        let (write, exec) = self.reserve_at(max_len)?;
+        let bytes = build(exec)?;
+        let len = bytes.len().min(max_len);
+        // SAFETY: write..write + max_len is inside this chunk's writable mapping and bytes does not overlap it.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), write as *mut u8, len) };
+        flush(exec, len);
+        Ok(exec)
     }
 
     /// Maps a chunk of `size` bytes now, so that processes forked after this call write into the same pages.
@@ -110,6 +140,17 @@ impl Memory {
         if let Some(chunk) = self.chunks.last_mut() {
             chunk.bump.split(parts, part);
             chunk.owner = this_process();
+        }
+    }
+
+    /// Moves the mapped chunks of `other` into `self`.
+    pub fn merge(&mut self, mut other: Memory) {
+        self.chunks.append(&mut other.chunks);
+        let owner = this_process();
+        let best = self.chunks.iter().enumerate().filter(|(_, chunk)| chunk.owner == owner).max_by_key(|(_, chunk)| chunk.bump.remaining()).map(|(index, _)| index);
+        if let Some(best) = best {
+            let last = self.chunks.len() - 1;
+            self.chunks.swap(best, last);
         }
     }
 }
@@ -154,6 +195,11 @@ impl Arena {
     pub fn low(size: usize) -> Result<Arena, Error> {
         let base = LOW_HINTS.into_iter().find_map(|hint| map_low(size, hint));
         Ok(Arena::over(base.map_or_else(|| map_data(size, Sharing::Shared), Ok)?, size, Sharing::Shared))
+    }
+
+    /// Whether the entire initial mapping of this arena lies below 2 GiB.
+    pub fn is_low(&self) -> bool {
+        self.base > 0 && self.base.saturating_add(self.bump.size) <= (1 << 31)
     }
 
     fn over(base: usize, size: usize, sharing: Sharing) -> Arena {
@@ -278,7 +324,9 @@ fn file_views(fd: i32, size: usize) -> Result<(usize, usize), Error> {
 #[cfg(target_vendor = "apple")]
 fn views(size: usize) -> Result<(usize, usize), Error> {
     use mach::*;
-    let check = |what: &str, code: i32| if code == 0 { Ok(()) } else { Err(memory_error(format!("{what}: kernel error {code}"))) };
+    let check = |what: &str, code: i32| {
+        if code == 0 { Ok(()) } else { Err(memory_error(format!("{what}: kernel error {code}"))) }
+    };
     let (mut write, mut exec, mut current, mut max) = (0_u64, 0_u64, 0, 0);
     // SAFETY: each call takes this task's own port and the addresses it hands back; the remap aliases only the region just allocated.
     unsafe {

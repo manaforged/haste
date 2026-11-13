@@ -31,7 +31,9 @@ impl Names {
     pub fn want(&mut self, mut asked: Vec<(ModRef, Sym)>) -> bool {
         let mut new = false;
         while let Some((at, name)) = asked.pop() {
-            let Some(entry) = self.crates.get_mut(at.krate as usize) else { continue };
+            let Some(entry) = self.crates.get_mut(at.krate as usize) else {
+                continue;
+            };
             if !entry.wanted.entry(at.module).or_default().insert(name) {
                 continue;
             }
@@ -54,16 +56,20 @@ impl Names {
     pub fn want_whole(&mut self, mut modules: Vec<ModRef>) -> bool {
         let mut new = false;
         while let Some(at) = modules.pop() {
-            let Some(entry) = self.crates.get_mut(at.krate as usize) else { continue };
+            let Some(entry) = self.crates.get_mut(at.krate as usize) else {
+                continue;
+            };
             if entry.whole.insert(at.module) {
                 new = true;
                 entry.pending.iter_mut().filter(|pending| pending.module == at.module).for_each(|pending| pending.active = true);
             }
             let globs = entry.globs.get(&at.module).into_iter().flatten();
-            let targets: Vec<ModRef> = globs.filter_map(|index| match entry.pending[*index].stamp {
-                Some((Def::Module(target), _)) => Some(target),
-                _ => None,
-            }).collect();
+            let targets: Vec<ModRef> = globs
+                .filter_map(|index| match entry.pending[*index].stamp {
+                    Some((Def::Module(target), _)) => Some(target),
+                    _ => None,
+                })
+                .collect();
             modules.extend(targets.into_iter().filter(|target| self.crates.get(target.krate as usize).is_some_and(|other| !other.whole.contains(&target.module))));
         }
         new

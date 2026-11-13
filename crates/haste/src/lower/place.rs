@@ -70,11 +70,11 @@ impl Lower<'_, '_> {
 
     /// The place and type that dereference step `step` of `expr` reaches from `place` of type `ty`: through the `Deref` call inference picked, or the builtin dereference.
     pub(super) fn deref_step(&mut self, (expr, step): (ExprId, u32), place: Option<Place>, ty: Ty) -> Result<Option<(Place, Ty)>> {
-        match self.typed.derefs.get(&(expr, step)).cloned() {
+        match self.typed.derefs.get(&(expr, step)).copied() {
             Some(Res::Fn(item, substs)) => {
                 let receiver = self.address_or_dangling(place, ty)?;
-                let Some(pointer) = self.invoke(item, &substs, vec![receiver])? else { return Ok(None) };
-                let index = self.reached_index(item, &substs)?;
+                let Some(pointer) = self.invoke(item, substs, vec![receiver])? else { return Ok(None) };
+                let index = self.reached_index(item, substs)?;
                 let ret = self.reached.list[index].1.as_ref().ok().and_then(|callee| callee.ret);
                 let Some(Kind::Ref(_, target)) = ret.map(|ret| self.cx.types.kind(ret).clone()) else { bail!("`{}` returns no reference", self.cx.name(item)) };
                 Ok(Some((self.pointee_place(pointer, target)?, target)))
@@ -100,7 +100,7 @@ impl Lower<'_, '_> {
     pub(super) fn deref_coerced(&mut self, mut pointer: Value, steps: Vec<(Ty, Option<Res>)>) -> Result<Option<Value>> {
         for (ty, res) in steps {
             pointer = match res {
-                Some(Res::Fn(item, substs)) => match self.invoke(item, &substs, vec![pointer])? {
+                Some(Res::Fn(item, substs)) => match self.invoke(item, substs, vec![pointer])? {
                     Some(next) => next,
                     None => return Ok(None),
                 },
@@ -173,10 +173,7 @@ impl Lower<'_, '_> {
             Expr::Paren(inner) => self.place_of(inner),
             Expr::Path(_) => match self.typed.res.get(&expr) {
                 Some(Res::Local(local)) => Ok(self.locals[*local as usize]),
-                Some(Res::Fn(item, substs)) if super::is_static(self.cx, *item) => {
-                    let (item, substs) = (*item, substs.clone());
-                    self.static_place((item, &substs), self.ty_of(expr)).map(Some)
-                }
+                Some(&Res::Fn(item, substs)) if super::is_static(self.cx, item) => self.static_place((item, substs), self.ty_of(expr)).map(Some),
                 _ => Ok(None),
             },
             Expr::Unary(UnOp::Deref, operand) => self.deref_place(expr, operand),
@@ -202,7 +199,9 @@ impl Lower<'_, '_> {
     /// The place of `expr`, holding its value in a new frame slot when it is not a place already.
     pub fn place_or_temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
         let coerced = self.typed.coercions.get(&expr);
-        if coerced.is_none() && let Some(place) = self.place_of(expr)? {
+        if coerced.is_none()
+            && let Some(place) = self.place_of(expr)?
+        {
             return Ok(Some(place));
         }
         self.temp(expr)
@@ -235,16 +234,22 @@ impl Lower<'_, '_> {
     }
 
     fn field_place(&mut self, expr: ExprId, base: ExprId, index: u32) -> Result<Option<Place>> {
-        let Some((place, ty)) = self.autoderef_place(expr, base)? else { return Ok(None) };
+        let Some((place, ty)) = self.autoderef_place(expr, base)? else {
+            return Ok(None);
+        };
         self.part_place(place, ty, (0, index)).map(Some)
     }
 
     /// The place of `base` and its type, after the dereferences that inference recorded on `expr`.
     pub(super) fn autoderef_place(&mut self, expr: ExprId, base: ExprId) -> Result<Option<(Place, Ty)>> {
-        let Some(mut place) = self.place_or_temp(base)? else { return Ok(None) };
+        let Some(mut place) = self.place_or_temp(base)? else {
+            return Ok(None);
+        };
         let mut ty = self.ty_of(base);
         for step in 0..self.typed.autoderefs.get(&expr).copied().unwrap_or(0) {
-            let Some(next) = self.deref_step((expr, step), Some(place), ty)? else { return Ok(None) };
+            let Some(next) = self.deref_step((expr, step), Some(place), ty)? else {
+                return Ok(None);
+            };
             (place, ty) = next;
         }
         Ok(Some((place, ty)))
@@ -259,10 +264,11 @@ impl Lower<'_, '_> {
 
     /// The place of field `index` of variant `variant` of the tuple or ADT `ty` at `place`.
     pub(super) fn part_place(&mut self, place: Place, ty: Ty, (variant, index): (u32, u32)) -> Result<Place> {
-        match self.cx.types.kind(ty).clone() {
+        match *self.cx.types.kind(ty) {
             Kind::Tuple(items) => {
+                let item_ty = self.cx.types.substs(items)[index as usize];
                 let offset = self.field_offset(ty, index)?;
-                Ok(place.at(offset, repr(self.cx, items[index as usize])?))
+                Ok(place.at(offset, repr(self.cx, item_ty)?))
             }
             _ => self.variant_field(place, ty, (variant, index)),
         }
@@ -291,7 +297,7 @@ impl Lower<'_, '_> {
             let Res::Fn(item, substs) = call else { bail!("a field clone that is not a call") };
             let offset = self.field_offset(ty, index as u32)?;
             let field = self.ins().iadd_imm(source, i64::from(offset));
-            values.push(self.invoke(item, &substs, vec![field])?);
+            values.push(self.invoke(item, substs, vec![field])?);
         }
         match crate::sema::infer::cloned_tuple(self.cx, ty) {
             Some(tuple) => self.tuple_from(tuple, values),
@@ -304,7 +310,8 @@ impl Lower<'_, '_> {
 
     fn tuple_from(&mut self, ty: Ty, values: Vec<Option<Value>>) -> Result<Option<Value>> {
         let whole = repr(self.cx, ty)?;
-        let Kind::Tuple(items) = self.cx.types.kind(ty).clone() else { bail!("a tuple of a type that is not a tuple") };
+        let Kind::Tuple(items) = *self.cx.types.kind(ty) else { bail!("a tuple of a type that is not a tuple") };
+        let items = self.cx.types.substs(items).to_vec();
         let slot = self.slot(whole);
         for (index, value) in values.into_iter().enumerate() {
             let field = repr(self.cx, items[index])?;
@@ -347,7 +354,9 @@ impl Lower<'_, '_> {
                 let len = self.len(len)?;
                 return Ok(Some(self.wide_pointer(data, len)));
             }
-            let Some((inner_place, inner)) = self.deref_step((expr, step), place, ty)? else { return Ok(None) };
+            let Some((inner_place, inner)) = self.deref_step((expr, step), place, ty)? else {
+                return Ok(None);
+            };
             (place, ty) = (Some(inner_place), inner);
         }
         match adjust.autoref {

@@ -32,7 +32,9 @@ impl Lower<'_, '_> {
         let Kind::Array(element, count) = *self.cx.types.kind(ty) else { bail!("repeat of a type that is not an array") };
         let (stride, part) = (self.cx.layout(element)?.size.bytes() as i32, repr(self.cx, element)?);
         let value = self.expr(value)?;
-        let Some(slot) = self.slot(whole) else { return Ok(None) };
+        let Some(slot) = self.slot(whole) else {
+            return Ok(None);
+        };
         if let Some(value) = value {
             for at in 0..self.len(count)? as i32 {
                 self.write(Place::slot(slot, whole).at(at * stride, part), value);
@@ -44,14 +46,18 @@ impl Lower<'_, '_> {
     /// The place that `base[index]` names after the autoderef steps of `base`: an element of an array or slice after a bounds check, or the target of `Index::index`.
     pub fn index_place(&mut self, expr: ExprId, base: ExprId, index: ExprId) -> Result<Option<Place>> {
         let Some((place, ty)) = self.autoderef_place(expr, base)? else { return self.empty_index(expr, base, index) };
-        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
+        if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
             let receiver = self.address(place);
             let values = self.expr(index)?.into_iter();
-            let Some(pointer) = self.invoke(item, &substs, std::iter::once(receiver).chain(values).collect())? else { return Ok(None) };
+            let Some(pointer) = self.invoke(item, substs, std::iter::once(receiver).chain(values).collect())? else { return Ok(None) };
             return self.pointee_place(pointer, self.ty_of(expr)).map(Some);
         }
-        let Some((data, len)) = self.data_len(Some(place), ty)? else { return Ok(None) };
-        let Some(at) = self.expr(index)? else { return Ok(None) };
+        let Some((data, len)) = self.data_len(Some(place), ty)? else {
+            return Ok(None);
+        };
+        let Some(at) = self.expr(index)? else {
+            return Ok(None);
+        };
         self.check_bounds(at, len);
         self.element_place(data, at, self.ty_of(expr)).map(Some)
     }
@@ -59,8 +65,12 @@ impl Lower<'_, '_> {
     /// The place of element `index` of the array `base` that has no bytes: a dangling one past a bounds check, which rustc also keeps.
     fn empty_index(&mut self, expr: ExprId, base: ExprId, index: ExprId) -> Result<Option<Place>> {
         let ty = self.ty_of(base);
-        let Kind::Array(_, count) = *self.cx.types.kind(ty) else { return Ok(None) };
-        let Some(at) = self.expr(index)? else { return Ok(None) };
+        let Kind::Array(_, count) = *self.cx.types.kind(ty) else {
+            return Ok(None);
+        };
+        let Some(at) = self.expr(index)? else {
+            return Ok(None);
+        };
         let count = self.len(count)?;
         let len = self.ins().iconst(Type::I64, count);
         self.check_bounds(at, len);

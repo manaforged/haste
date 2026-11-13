@@ -4,10 +4,12 @@ use haste_codegen::{FloatCC, IntCC, Type, Value};
 use crate::body::literal::{byte_value, char_value, string_bytes};
 use crate::body::{BinOp, Expr, ExprId, Lit, UnOp};
 use crate::names::{ItemRef, Primitive};
-use crate::sema::infer::{Adjust, Res};
 use crate::sema::infer::parse_int;
+use crate::sema::infer::{Adjust, Res};
+use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty, int_info};
 
+use super::stencil::SymbolSource;
 use super::{Lower, Parts, Repr};
 
 /// What arithmetic means for one operand type.
@@ -56,8 +58,8 @@ impl Lower<'_, '_> {
             bytes.push(0);
         }
         let wide = lit != Lit::ByteStr;
-        let address = self.slots.data(&bytes);
-        let data = self.ins().iconst(Type::I64, address);
+        let id = self.slots.rodata(&bytes, &[]);
+        let data = self.emit_symbol(SymbolSource::Rodata(id));
         Ok(if wide { self.wide_pointer(data, bytes.len() as i64) } else { data })
     }
 
@@ -97,16 +99,18 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn unary(&mut self, expr: ExprId, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
-        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
+        if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
             let Some(value) = self.expr(operand)? else { return Ok(None) };
-            return self.invoke(item, &substs, vec![value]);
+            return self.invoke(item, substs, vec![value]);
         }
         let num = self.num(self.ty_of(operand))?;
         if let (UnOp::Neg, Num::Int { ty, .. }, Some(at)) = (op, num, self.int_literal(operand)) {
             let value = parse_int(self.src.text(at))?.0;
             return Ok(Some(self.int_const(ty, value.wrapping_neg())));
         }
-        let Some(value) = self.expr(operand)? else { return Ok(None) };
+        let Some(value) = self.expr(operand)? else {
+            return Ok(None);
+        };
         Ok(Some(match (op, num) {
             (UnOp::Not, Num::Bool) => self.ins().bxor_imm(value, 1),
             (UnOp::Not, Num::Int { .. }) => self.ins().bnot(value),
@@ -150,16 +154,20 @@ impl Lower<'_, '_> {
         if matches!(op, BinOp::And | BinOp::Or) {
             return self.logical(expr, op, lhs, rhs);
         }
-        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
-            return self.overloaded(expr, op, (lhs, rhs), (item, &substs));
+        if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
+            return self.overloaded(expr, op, (lhs, rhs), (item, substs));
         }
         if self.is_wide(self.ty_of(lhs))? {
-            let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else { return Ok(None) };
+            let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else {
+                return Ok(None);
+            };
             return self.wide_compare(op, (x, y)).map(Some);
         }
         let num = self.num(self.ty_of(lhs))?;
         let shift = self.num(self.ty_of(rhs))?;
-        let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else { return Ok(None) };
+        let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else {
+            return Ok(None);
+        };
         self.apply(op, num, (x, y), shift).map(Some)
     }
 
@@ -185,7 +193,7 @@ impl Lower<'_, '_> {
         })
     }
 
-    fn overloaded(&mut self, expr: ExprId, op: BinOp, operands: (ExprId, ExprId), (item, substs): (ItemRef, &[Ty])) -> Result<Option<Value>> {
+    fn overloaded(&mut self, expr: ExprId, op: BinOp, operands: (ExprId, ExprId), (item, substs): (ItemRef, Substs)) -> Result<Option<Value>> {
         let by_ref = Adjust { derefs: 0, autoref: Some(Mut::Not) };
         let mut values = Vec::with_capacity(2);
         for operand in [operands.0, operands.1] {
@@ -196,9 +204,11 @@ impl Lower<'_, '_> {
         self.invoke(item, substs, values)
     }
 
-    fn overloaded_assign(&mut self, (expr, lhs, rhs): (ExprId, ExprId, ExprId), (item, substs): (ItemRef, &[Ty])) -> Result<Option<Value>> {
+    fn overloaded_assign(&mut self, (expr, lhs, rhs): (ExprId, ExprId, ExprId), (item, substs): (ItemRef, Substs)) -> Result<Option<Value>> {
         let by_mut = Adjust { derefs: 0, autoref: Some(Mut::Mut) };
-        let Some(place) = self.receiver((expr, lhs), by_mut)? else { return Ok(None) };
+        let Some(place) = self.receiver((expr, lhs), by_mut)? else {
+            return Ok(None);
+        };
         let mut values = vec![place];
         values.extend(self.expr(rhs)?);
         self.invoke(item, substs, values).map(|_| None)
@@ -378,7 +388,9 @@ impl Lower<'_, '_> {
     }
 
     fn logical(&mut self, expr: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<Option<Value>> {
-        let Some(left) = self.expr(lhs)? else { return Ok(None) };
+        let Some(left) = self.expr(lhs)? else {
+            return Ok(None);
+        };
         let (right_block, join) = (self.b.create_block(), self.b.create_block());
         let machine = super::machine(self.cx, self.ty_of(expr))?.unwrap_or(Type::I8);
         let result = self.b.append_block_param(join, machine);
@@ -406,7 +418,9 @@ impl Lower<'_, '_> {
             let value = self.expr(rhs)?;
             return self.assign_parts(lhs, value).map(|_| None);
         }
-        let Some(value) = self.expr(rhs)? else { return Ok(None) };
+        let Some(value) = self.expr(rhs)? else {
+            return Ok(None);
+        };
         let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
         if !self.replace(lhs, place, value)? {
             self.write(place, value);
@@ -415,13 +429,17 @@ impl Lower<'_, '_> {
     }
 
     fn compound(&mut self, expr: ExprId, (lhs, rhs): (ExprId, ExprId), op: BinOp) -> Result<Option<Value>> {
-        if let Some(Res::Fn(item, substs)) = self.typed.operators.get(&expr).cloned() {
-            return self.overloaded_assign((expr, lhs, rhs), (item, &substs));
+        if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
+            return self.overloaded_assign((expr, lhs, rhs), (item, substs));
         }
         let rhs_num = self.num(self.ty_of(rhs)).ok();
-        let Some(value) = self.expr(rhs)? else { return Ok(None) };
+        let Some(value) = self.expr(rhs)? else {
+            return Ok(None);
+        };
         let Some(place) = self.place_of(lhs)? else { bail!("cannot lower assignment to this expression yet") };
-        let Some(current) = self.read(place) else { return Ok(None) };
+        let Some(current) = self.read(place) else {
+            return Ok(None);
+        };
         let num = self.num(self.ty_of(lhs))?;
         let value = self.apply(op, num, (current, value), rhs_num.unwrap_or(num))?;
         self.write(place, value);
@@ -460,7 +478,9 @@ impl Lower<'_, '_> {
             return self.expr(inner);
         }
         let to = self.num(self.ty_of(expr))?;
-        let Some((value, from)) = self.cast_source(inner)? else { return Ok(None) };
+        let Some((value, from)) = self.cast_source(inner)? else {
+            return Ok(None);
+        };
         self.convert(value, from, to).map(Some)
     }
 
@@ -488,7 +508,9 @@ impl Lower<'_, '_> {
             return self.discriminant(place, source).map(Some);
         }
         if self.is_wide(source)? {
-            let Some(pair) = self.expr(inner)? else { return Ok(None) };
+            let Some(pair) = self.expr(inner)? else {
+                return Ok(None);
+            };
             return Ok(Some((self.ins().load(Type::I64, pair, 0), Num::Int { ty: Type::I64, signed: false })));
         }
         let from = self.num(source)?;
@@ -568,4 +590,3 @@ fn parse_float(text: &str) -> Result<f64> {
     let digits = ["f16", "f32", "f64", "f128"].iter().find_map(|suffix| digits.strip_suffix(suffix)).unwrap_or(&digits);
     Ok(digits.parse()?)
 }
-

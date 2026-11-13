@@ -21,7 +21,7 @@ use crate::graph::manifest::Kind;
 use crate::graph::{Targets, Workspace};
 use build::{Loader, Others};
 use item::{ItemKind, Vis};
-use tree::{Files, Crate, Decl, Env, Macro, Module, State};
+use tree::{Crate, Decl, Env, Files, Macro, Module, State};
 
 /// What a crate is to its package.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,12 +75,23 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
     roots
 }
 
+/// The units that the build dependencies of `scripts` reach through normal dependencies.
+pub(crate) fn build_closure(workspace: &Workspace, scripts: &[usize]) -> rustc_hash::FxHashSet<usize> {
+    let units = &workspace.graph.units;
+    let builds = scripts.iter().flat_map(|&unit| units[unit].deps.iter().filter(|(_, _, kind)| *kind == Kind::Build).map(|(_, dep, _)| *dep));
+    normal_closure(units, builds)
+}
+
 /// The units whose libraries the build scripts of `scripts` build from: the sysroot and every library their build dependencies reach.
-fn script_closure(workspace: &Workspace, scripts: &[usize]) -> rustc_hash::FxHashSet<usize> {
+pub(crate) fn script_closure(workspace: &Workspace, scripts: &[usize]) -> rustc_hash::FxHashSet<usize> {
     let units = &workspace.graph.units;
     let sysroot = (0..units.len()).filter(|&unit| workspace.packages[units[unit].package].sysroot);
     let builds = scripts.iter().flat_map(|&unit| units[unit].deps.iter().filter(|(_, _, kind)| *kind == Kind::Build).map(|(_, dep, _)| *dep));
-    let mut left: Vec<usize> = sysroot.chain(builds).collect();
+    normal_closure(units, sysroot.chain(builds))
+}
+
+fn normal_closure(units: &[crate::graph::Unit], roots: impl IntoIterator<Item = usize>) -> rustc_hash::FxHashSet<usize> {
+    let mut left: Vec<usize> = roots.into_iter().collect();
     let mut needed = rustc_hash::FxHashSet::default();
     while let Some(unit) = left.pop() {
         if needed.insert(unit) {
@@ -115,7 +126,9 @@ fn dependencies(workspace: &Workspace, roots: &[Root]) -> Vec<Vec<(String, usize
                 if renamed { key.replace('-', "_") } else { roots[lib].name.clone() }
             };
             let mut deps: Vec<(String, usize)> = normal.filter_map(|(key, dep, _)| libs.get(dep).map(|&lib| (extern_name(key, *dep, lib), lib))).collect();
-            if root.role == Role::Bin && let Some(&lib) = libs.get(&root.unit) {
+            if root.role == Role::Bin
+                && let Some(&lib) = libs.get(&root.unit)
+            {
                 deps.push((root.name.replace('-', "_"), lib));
             }
             if !package.sysroot || root.role == Role::Script {
@@ -135,12 +148,29 @@ pub fn new(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Outli
     Outline { roots, crates, deps, cache: Files::default(), procs: HashMap::default(), pins }
 }
 
-/// The key of each root from a registry or git source: its path, and every unit's package, version, source, features and side.
+/// The key of each root from a registry or git source: its path, and the transitive library dependencies and script outputs of its unit.
 fn pins(workspace: &Workspace, roots: &[Root]) -> Vec<Option<u64>> {
     use std::hash::BuildHasher as _;
-    let units: Vec<_> = workspace.graph.units.iter().map(|unit| (&workspace.packages[unit.package].locked, &unit.features, unit.side == crate::graph::Side::Host)).map(|(locked, features, host)| (&locked.name, locked.version.to_string(), &locked.source, features, host)).collect();
-    let graph = rustc_hash::FxBuildHasher.hash_one(&units);
-    roots.iter().map(|root| workspace.packages[workspace.graph.units[root.unit].package].locked.source.is_some().then(|| rustc_hash::FxBuildHasher.hash_one((graph, &root.path)))).collect()
+    let units = &workspace.graph.units;
+    let mut memo = vec![None; units.len()];
+    let sysroot: Vec<u64> = (0..units.len()).filter(|&u| workspace.packages[units[u].package].sysroot).map(|u| unit_pin(workspace, u, &[], &mut memo)).collect();
+    let base = [rustc_hash::FxBuildHasher.hash_one(&sysroot)];
+    roots.iter().map(|root| workspace.packages[units[root.unit].package].locked.source.is_some().then(|| rustc_hash::FxBuildHasher.hash_one((unit_pin(workspace, root.unit, &base, &mut memo), &root.path)))).collect()
+}
+
+fn unit_pin(workspace: &Workspace, unit: usize, extra: &[u64], memo: &mut [Option<u64>]) -> u64 {
+    use std::hash::BuildHasher as _;
+    if let Some(found) = memo[unit] {
+        return found;
+    }
+    memo[unit] = Some(0);
+    let entry = &workspace.graph.units[unit];
+    let deps: Vec<(&str, u64)> = entry.deps.iter().filter(|(_, _, kind)| *kind == Kind::Normal).map(|(key, dep, _)| (key.as_str(), unit_pin(workspace, *dep, extra, memo))).collect();
+    let locked = &workspace.packages[entry.package].locked;
+    let cfgs = entry.script.as_ref().map(|out| (&out.names, &out.pairs, &out.vars));
+    let hash = rustc_hash::FxBuildHasher.hash_one((&locked.name, locked.version.to_string(), &locked.source, &entry.features, entry.side == crate::graph::Side::Host, cfgs, extra, deps));
+    memo[unit] = Some(hash);
+    hash
 }
 
 fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root) -> Crate {
@@ -154,7 +184,7 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root) -> Crate {
 }
 
 /// Takes out of `waiting` the calls at the indexes of `found`, each with its definition, and keeps the rest waiting.
-fn take_found(waiting: &mut Vec<tree::Waiting>, found: Vec<(usize, Arc<Macro>)>) -> Vec<(tree::Waiting, Arc<Macro>)> {
+fn take_found<T>(waiting: &mut Vec<T>, found: Vec<(usize, Arc<Macro>)>) -> Vec<(T, Arc<Macro>)> {
     let mut found = found.into_iter().peekable();
     let mut calls = Vec::new();
     for (index, call) in std::mem::take(waiting).into_iter().enumerate() {
@@ -256,10 +286,10 @@ impl Outline {
         self.with_loader(krate, |loader| calls.into_iter().try_for_each(|(call, definition)| loader.expand(call, &definition)))
     }
 
-    /// Expands the waiting macro calls in impl bodies of crate `krate` at the given indexes with the definitions that name resolution found for them.
+    /// Expands the waiting macro calls in impl or trait bodies of crate `krate` at the given indexes with the definitions that name resolution found for them.
     pub fn expand_members(&mut self, krate: usize, found: Vec<(usize, Arc<Macro>)>) -> Result<()> {
         let calls = take_found(&mut self.crates[krate].members, found);
-        self.with_loader(krate, |loader| calls.into_iter().try_for_each(|(call, definition)| loader.expand_member(call, &definition)))
+        self.with_loader(krate, |loader| calls.into_iter().try_for_each(|((block, call), definition)| loader.expand_member(block, call, &definition)))
     }
 
     /// Reads every module of the crates whose exports may define a still-deferred macro call, once name resolution can bind nothing more; returns whether it read any.
@@ -285,9 +315,12 @@ impl Outline {
     /// Takes item `at` of `file` in crate `krate` out of the crate, as an attribute macro does with the item it replaces.
     pub fn consume(&mut self, krate: usize, file: &Arc<tree::File>, at: u32) {
         let holder = &mut self.crates[krate];
-        let Some(index) = holder.files.iter().position(|entry| Arc::ptr_eq(entry, file)) else { return };
+        let Some(index) = holder.files.iter().position(|entry| Arc::ptr_eq(entry, file)) else {
+            return;
+        };
         holder.consumed.insert((index as u32, at));
         holder.impls.retain(|block| (block.file, block.at) != (index, at));
+        holder.traits.retain(|block| (block.file, block.at) != (index, at));
     }
 
     /// The crates that depend on crate `krate`, directly or through others, with `krate` itself.
@@ -309,10 +342,12 @@ impl Outline {
     /// The outline errors and missing module files of every crate whose package is local, where rustc would stop the build.
     pub fn local_errors(&self, workspace: &Workspace) -> Vec<String> {
         let local = self.crates.iter().enumerate().filter(|(krate, _)| self.package(workspace, *krate).local());
-        let mut found: Vec<String> = local.flat_map(|(_, tree)| {
-            let missing = tree.missing.chunks(2).map(|tried| format!("file not found for module: tried {}", tried.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(" and ")));
-            tree.errors.iter().cloned().chain(missing)
-        }).collect();
+        let mut found: Vec<String> = local
+            .flat_map(|(_, tree)| {
+                let missing = tree.missing.chunks(2).map(|tried| format!("file not found for module: tried {}", tried.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(" and ")));
+                tree.errors.iter().cloned().chain(missing)
+            })
+            .collect();
         found.sort();
         found.dedup();
         found

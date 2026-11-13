@@ -304,7 +304,9 @@ impl Scanner<'_> {
                     path.push(at);
                     at += 3;
                 }
-                TokenKind::Ident | TokenKind::RawIdent => return Ok(self.leaf(at, path, absolute, item)),
+                TokenKind::Ident | TokenKind::RawIdent => {
+                    return Ok(self.leaf(at, path, absolute, item));
+                }
                 _ => bail!("{}: bad use tree at byte {}", self.src.path.display(), self.src.byte(at)),
             }
         }

@@ -1,0 +1,511 @@
+use std::sync::{Arc, RwLock};
+
+use anyhow::{Result, bail};
+use haste_codegen::{AbiParam, ArgumentPurpose, Function, FunctionBuilder, Type, Value};
+use rustc_hash::FxHashMap;
+
+use crate::host::HostSymbol;
+use crate::names::ItemRef;
+use crate::sema::Context;
+use crate::sema::infer::{Arena, Shape};
+use crate::sema::reach::Reached;
+use crate::sema::table::Table;
+use crate::sync::{read_lock, write_lock};
+
+use super::{Inline, Lower, Slots, Word, is_static, signature, signature_of};
+
+/// The 128-bit structural footprint digest of a lowered function and its inlined callees.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct FootprintId(pub u128);
+
+/// An interned read-only data blob identifier.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RodataId(pub u32);
+
+/// An interned vtable layout identifier.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct VtableId(pub u32);
+
+/// The target of an 8-byte pointer relocation inside a read-only data blob.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RodataTarget {
+    Rodata(RodataId),
+}
+
+/// One 8-byte pointer relocation inside a read-only data blob.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RodataReloc {
+    pub offset: u32,
+    pub target: RodataTarget,
+}
+
+/// One word inside a symbolic vtable definition.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum VtableEntry {
+    Word(Word),
+    Super(VtableId),
+}
+
+/// A symbolic relocation entry referenced by a function stencil or dictionary.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum SymbolSource {
+    Slot(usize),
+    Vtable(VtableId),
+    Rodata(RodataId),
+    StaticCell { index: usize, size: u32 },
+    PromotedCell { owner: usize, seq: u32, size: u32 },
+    Host(HostSymbol),
+    Word(u64),
+}
+
+/// The ordered symbolic relocation vector (`D`) of one lowered function instance.
+pub type RelocVec = Vec<SymbolSource>;
+
+/// The output of lowering one function into a reusable SSA stencil.
+pub struct StencilOutput {
+    pub func: Function,
+    pub relocs: RelocVec,
+}
+
+/// A cached, simplified callee body ready to splice inline into callers.
+pub struct InlinedCallee {
+    pub item: ItemRef,
+    pub footprint: FootprintId,
+    pub relocs: RelocVec,
+    pub body: Arc<Function>,
+    pub returns: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum LowerMode {
+    Probe,
+    Stencil,
+    Dict,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TemplateKey {
+    item: ItemRef,
+    footprint: FootprintId,
+    limit: usize,
+    low: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CycleState {
+    Acyclic,
+    CyclicIncomplete,
+    CyclicComplete,
+}
+
+impl CycleState {
+    fn is_complete(self) -> bool {
+        self != Self::CyclicIncomplete
+    }
+}
+
+/// Cached inlineable callee stencils and footprints across a compilation.
+#[derive(Default)]
+pub struct Bodies {
+    probed: Table<usize, Option<Arc<InlinedCallee>>>,
+    templates: Table<TemplateKey, Option<(Arc<Function>, bool)>>,
+    cyclic: RwLock<FxHashMap<usize, CycleState>>,
+}
+
+#[derive(Clone, Copy)]
+struct NodeInfo {
+    index: u32,
+    low: u32,
+    on_stack: bool,
+    self_loop: bool,
+    complete: bool,
+}
+
+struct TarjanRun {
+    nodes: FxHashMap<usize, NodeInfo>,
+    stack: Vec<usize>,
+    clock: u32,
+}
+
+impl TarjanRun {
+    fn enter(&mut self, u: usize, (edges, self_loop, complete): (Vec<usize>, bool, bool)) -> (usize, usize, Vec<usize>) {
+        self.clock += 1;
+        let info = NodeInfo { index: self.clock, low: self.clock, on_stack: true, self_loop, complete };
+        self.nodes.insert(u, info);
+        self.stack.push(u);
+        (u, 0, edges)
+    }
+
+    fn finish(&mut self, u: usize, parent: Option<usize>, cyclic: &mut FxHashMap<usize, CycleState>) {
+        let u_info = self.nodes[&u];
+        if u_info.low == u_info.index {
+            self.pop_scc(u, cyclic);
+        }
+        if let Some(p) = parent {
+            let u_now = self.nodes[&u];
+            if let Some(p_info) = self.nodes.get_mut(&p) {
+                p_info.low = p_info.low.min(u_now.low);
+                p_info.complete &= u_now.complete;
+            }
+        }
+    }
+
+    fn pop_scc(&mut self, u: usize, cyclic: &mut FxHashMap<usize, CycleState>) {
+        let mut scc = Vec::new();
+        let mut self_loop = false;
+        let mut complete = true;
+        while let Some(w) = self.stack.pop() {
+            if let Some(info) = self.nodes.get_mut(&w) {
+                info.on_stack = false;
+                self_loop |= info.self_loop;
+                complete &= info.complete;
+            }
+            scc.push(w);
+            if w == u {
+                break;
+            }
+        }
+        let is_cyc = scc.len() > 1 || self_loop;
+        let state = match (is_cyc, complete) {
+            (true, true) => Some(CycleState::CyclicComplete),
+            (true, false) => Some(CycleState::CyclicIncomplete),
+            (false, true) => Some(CycleState::Acyclic),
+            (false, false) => None,
+        };
+        for &w in &scc {
+            if let Some(st) = state {
+                cyclic.insert(w, st);
+            }
+            if !complete && let Some(info) = self.nodes.get_mut(&w) {
+                info.complete = false;
+            }
+        }
+    }
+}
+
+impl Bodies {
+    /// Drops all cached inlineable bodies and footprints.
+    pub fn clear(&self) {
+        self.clear_transient();
+        write_lock(&self.cyclic).clear();
+    }
+
+    /// Drops cached inline probes and templates while retaining any precomputed cycle entries.
+    pub fn clear_transient(&self) {
+        self.probed.clear();
+        self.templates.clear();
+    }
+
+    pub(super) fn is_cyclic(&self, cx: &mut Context<'_>, reached: &Reached, root: usize) -> bool {
+        if let Some(&st) = read_lock(&self.cyclic).get(&root) {
+            return st != CycleState::Acyclic;
+        }
+        if reached.is_untyped(root) {
+            return false;
+        }
+        let mut view = CycleView { shared: &self.cyclic, found: FxHashMap::default() };
+        if super::may_inline(cx, reached, root) {
+            tarjan_from(cx, reached, &mut view, root);
+        } else {
+            view.found.insert(root, CycleState::Acyclic);
+        }
+        let mut shared = write_lock(&self.cyclic);
+        for (node, state) in view.found {
+            shared.entry(node).or_insert(state);
+        }
+        shared.get(&root).is_some_and(|&st| st != CycleState::Acyclic)
+    }
+}
+
+struct CycleView<'b> {
+    shared: &'b RwLock<FxHashMap<usize, CycleState>>,
+    found: FxHashMap<usize, CycleState>,
+}
+
+impl CycleView<'_> {
+    fn is_done(&self, v: usize) -> bool {
+        let done = |st: &CycleState| st.is_complete();
+        self.found.get(&v).is_some_and(done) || read_lock(self.shared).get(&v).is_some_and(done)
+    }
+}
+
+fn tarjan_from(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, root: usize) {
+    let mut run = TarjanRun { nodes: FxHashMap::default(), stack: Vec::new(), clock: 0 };
+    let mut frames = vec![run.enter(root, node_edges(cx, reached, cyclic, root))];
+    while let Some(top) = frames.last_mut() {
+        let u = top.0;
+        if top.1 < top.2.len() {
+            let v = top.2[top.1];
+            top.1 += 1;
+            step_edge(cx, reached, cyclic, (&mut run, &mut frames), (u, v));
+        } else if let Some((done, _, _)) = frames.pop() {
+            run.finish(done, frames.last().map(|f| f.0), &mut cyclic.found);
+        }
+    }
+}
+
+type Frames = Vec<(usize, usize, Vec<usize>)>;
+
+fn step_edge(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, (run, frames): (&mut TarjanRun, &mut Frames), (u, v): (usize, usize)) {
+    if cyclic.is_done(v) {
+        return;
+    }
+    if let Some(&v_info) = run.nodes.get(&v) {
+        if let Some(u_info) = run.nodes.get_mut(&u) {
+            if v_info.on_stack {
+                u_info.low = u_info.low.min(v_info.index);
+            } else {
+                u_info.complete &= v_info.complete;
+            }
+        }
+        return;
+    }
+    frames.push(run.enter(v, node_edges(cx, reached, cyclic, v)));
+}
+
+fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, u: usize) -> (Vec<usize>, bool, bool) {
+    let mut info = NodeInfo { index: 0, low: 0, on_stack: false, self_loop: false, complete: true };
+    let mut edges = Vec::new();
+    if let Some(slice) = reached.direct_calls(u) {
+        for &v in slice {
+            scan_callee(cx, reached, cyclic, (u, v), (&mut info, &mut edges));
+        }
+        return (edges, info.self_loop, info.complete);
+    }
+    let Ok(typed) = &reached.list[u].1 else { return (edges, false, true) };
+    for (item, substs) in typed.calls() {
+        if cx.intrinsic(item).is_some() {
+            continue;
+        }
+        match reached.index.get(&(item, substs)) {
+            Some(&v) => scan_callee(cx, reached, cyclic, (u, v), (&mut info, &mut edges)),
+            None => info.complete = false,
+        }
+    }
+    (edges, info.self_loop, info.complete)
+}
+
+fn scan_callee(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, (u, v): (usize, usize), (info, edges): (&mut NodeInfo, &mut Vec<usize>)) {
+    if v == u {
+        info.self_loop = true;
+        return;
+    }
+    if cyclic.is_done(v) {
+        return;
+    }
+    if reached.is_untyped(v) {
+        info.complete = false;
+        return;
+    }
+    if !super::may_inline(cx, reached, v) {
+        cyclic.found.insert(v, CycleState::Acyclic);
+        return;
+    }
+    edges.push(v);
+}
+
+pub(super) fn item_bits(item: ItemRef) -> u128 {
+    (u128::from(item.krate) << 64) | (u128::from(item.file) << 32) | u128::from(item.item)
+}
+
+/// Computes the 128-bit footprint and symbolic relocations of reached function `index` without allocating IR instructions.
+pub fn probe_footprint(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<(FootprintId, RelocVec)> {
+    let (_, footprint, relocs, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Probe)?;
+    Ok((footprint, relocs))
+}
+
+/// Lowers reached function `index` into an SSA stencil with symbolic relocations.
+pub fn lower_stencil(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<StencilOutput> {
+    let (func, _, relocs, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Stencil)?;
+    Ok(StencilOutput { func, relocs })
+}
+
+/// Lowers reached function `index` into a shared dictionary-parameterized SSA body and its relocation vector.
+pub fn lower_dict(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<(Function, RelocVec)> {
+    let (func, _, relocs, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Dict)?;
+    Ok((func, relocs))
+}
+
+pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
+    let bodies = slots.bodies();
+    if bodies.is_cyclic(cx, reached, index) {
+        return Ok((None, usize::MAX));
+    }
+    if let Some(cached) = bodies.probed.get(&index) {
+        return Ok((cached, usize::MAX));
+    }
+    if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
+        return Ok((None, pos));
+    }
+    if let Some((cached, cycle)) = inline.local.get(&index) {
+        return Ok((cached.clone(), *cycle));
+    }
+    let depth = inline.stack.len();
+    inline.stack.push(index);
+    let quiet = Quiet::mark(cx, slots);
+    let outcome = build_inline(cx, (reached, slots), inline, index, (limit, &quiet));
+    inline.stack.pop();
+    let (result, cycle) = outcome?;
+    if cycle > depth && quiet.holds(cx, slots) {
+        return Ok((bodies.probed.get_or_insert_with(index, || result), cycle));
+    }
+    inline.local.insert(index, (result.clone(), if cycle < depth { cycle } else { usize::MAX }));
+    Ok((result, cycle))
+}
+
+struct Quiet {
+    wanted: usize,
+    sema: (usize, usize),
+}
+
+impl Quiet {
+    fn mark(cx: &Context<'_>, slots: &dyn Slots) -> Self {
+        Self { wanted: slots.wanted_len(), sema: cx.quiet_mark() }
+    }
+
+    fn holds(&self, cx: &Context<'_>, slots: &dyn Slots) -> bool {
+        slots.wanted_len() == self.wanted && cx.quiet_mark() == self.sema
+    }
+
+    fn lowered<T>(&self, slots: &dyn Slots, result: Result<T>) -> Result<Option<T>> {
+        match result {
+            Ok(out) => Ok(Some(out)),
+            Err(err) if slots.wanted_len() > self.wanted => Err(err),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+fn has_promoted_cell(relocs: &[SymbolSource]) -> bool {
+    relocs.iter().any(|r| matches!(r, SymbolSource::PromotedCell { .. }))
+}
+
+fn build_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
+    let item = reached.list[index].0.0;
+    let probed = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Probe);
+    let Some((_, footprint, relocs, probe_cycle)) = quiet.lowered(slots, probed)? else { return Ok((None, usize::MAX)) };
+    if has_promoted_cell(&relocs) {
+        return Ok((None, probe_cycle));
+    }
+    let key = TemplateKey { item, footprint, limit, low: slots.low_entries() };
+    if let Some(template) = slots.bodies().templates.get(&key) {
+        return Ok((callee(item, footprint, relocs, template), probe_cycle));
+    }
+    let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
+    let Some((func, _, _, ir_cycle)) = quiet.lowered(slots, lowered)? else { return Ok((None, probe_cycle)) };
+    let cycle = probe_cycle.min(ir_cycle);
+    let mut template = simplify_inline(func, limit);
+    let depth = inline.stack.len().saturating_sub(1);
+    if cycle > depth && quiet.holds(cx, slots) {
+        template = slots.bodies().templates.get_or_insert_with(key, || template);
+    }
+    Ok((callee(item, footprint, relocs, template), cycle))
+}
+
+fn callee(item: ItemRef, footprint: FootprintId, relocs: RelocVec, template: Option<(Arc<Function>, bool)>) -> Option<Arc<InlinedCallee>> {
+    template.map(|(body, returns)| Arc::new(InlinedCallee { item, footprint, relocs, body, returns }))
+}
+
+fn simplify_inline(mut func: Function, limit: usize) -> Option<(Arc<Function>, bool)> {
+    if !func.can_inline() {
+        return None;
+    }
+    haste_codegen::simplify(&mut func);
+    (func.size() <= limit).then(|| {
+        let returns = func.has_return();
+        (Arc::new(func), returns)
+    })
+}
+
+fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode) -> Result<(Function, FootprintId, RelocVec, usize)> {
+    let ((item, _), typed) = &reached.list[index];
+    let Ok(typed) = typed else { bail!("{} did not type-check", cx.name(*item)) };
+    let source = match &typed.shape {
+        Shape::Closure(closure) => closure.parent,
+        _ => *item,
+    };
+    let arena = match &typed.shape {
+        Shape::Body | Shape::Closure(_) => Arena::Body(cx.body(source)?),
+        Shape::Anon(anon) => anon.arena.clone(),
+        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => Arena::Body(Arc::default()),
+    };
+    let src = cx.body_src(source);
+    let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
+    let mut sig = if is_static(cx, *item) { signature_of(cx, None, [])? } else { signature(cx, typed)? };
+    if mode == LowerMode::Dict {
+        sig.params.push(AbiParam::special(Type::I64, ArgumentPurpose::Dict));
+    }
+    let mut func = Function::new(sig);
+    let b = match mode {
+        LowerMode::Probe => FunctionBuilder::new_probe(&mut func),
+        LowerMode::Stencil | LowerMode::Dict => FunctionBuilder::new(&mut func),
+    };
+    let mut relocs = Vec::new();
+    let (digest, cycle) = {
+        let mut lower = Lower {
+            cx,
+            reached,
+            slots,
+            inline,
+            body: arena.body(),
+            src,
+            typed,
+            b,
+            locals: vec![None; typed.locals.len()],
+            loops: Vec::new(),
+            try_exits: Vec::new(),
+            open: true,
+            dead: None,
+            sret: None,
+            dict_param: None,
+            mode,
+            relocs: &mut relocs,
+            promoted_seq: 0,
+            cycle_root: usize::MAX,
+            owned: Vec::new(),
+            flags: Vec::new(),
+            moved: Default::default(),
+            extended: Default::default(),
+            pending: Vec::new(),
+            index,
+            resume: None,
+            overflow_checks,
+        };
+        lower.run()?;
+        let digest = if mode == LowerMode::Probe { FootprintId(lower.b.finish_probe()) } else { FootprintId(0) };
+        (digest, lower.cycle_root)
+    };
+    Ok((func, digest, relocs, cycle))
+}
+
+impl Lower<'_, '_> {
+    pub(super) fn push_reloc(&mut self, src: SymbolSource) -> u32 {
+        let idx = self.relocs.len() as u32;
+        self.relocs.push(src);
+        idx
+    }
+
+    pub(super) fn emit_slot(&mut self, src: SymbolSource) -> Value {
+        let low = self.slots.low_entries();
+        let idx = self.push_reloc(src);
+        match self.mode {
+            LowerMode::Dict => {
+                let dict = self.dict_param.expect("dictionary parameter is set");
+                self.ins().load(Type::I64, dict, (idx * 8) as i32)
+            }
+            LowerMode::Probe | LowerMode::Stencil if low => self.ins().slot_addr(idx),
+            LowerMode::Probe | LowerMode::Stencil => self.ins().symbol(idx),
+        }
+    }
+
+    pub(super) fn emit_symbol(&mut self, src: SymbolSource) -> Value {
+        let idx = self.push_reloc(src);
+        match self.mode {
+            LowerMode::Dict => {
+                let dict = self.dict_param.expect("dictionary parameter is set");
+                self.ins().load(Type::I64, dict, (idx * 8) as i32)
+            }
+            LowerMode::Probe | LowerMode::Stencil => self.ins().symbol(idx),
+        }
+    }
+}

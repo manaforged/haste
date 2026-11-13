@@ -1,9 +1,7 @@
-
 use std::sync::Arc;
 
 use anyhow::Result;
 use rustc_lexer::TokenKind;
-
 
 use crate::graph::Workspace;
 use crate::outline::Outline;
@@ -12,8 +10,8 @@ use crate::outline::source::Source;
 use crate::outline::tree::{Crate as Tree, File, Macro};
 
 use super::collect::{self, Context, Pending};
-use super::path::{Requests, Path, Paths};
-use super::{Binding, Crate, Def, ModRef, Names, Ns, ItemRef, Origin, PerNs, SELF, Scope, Sym, Symbols, UNDERSCORE, Unresolved, plain};
+use super::path::{Path, Paths, Requests};
+use super::{Binding, Crate, Def, ItemRef, ModRef, Names, Ns, Origin, PerNs, SELF, Scope, Sym, Symbols, UNDERSCORE, Unresolved, plain};
 
 type Found = Vec<(Sym, Ns, Binding)>;
 
@@ -48,12 +46,16 @@ fn glob(paths: &Paths<'_>, target: Def, (at, vis): (ModRef, Vis), since: u32) ->
     let mut found = Found::new();
     match target {
         Def::Module(home) => {
-            let Some(scope) = paths.scope(home) else { return found };
+            let Some(scope) = paths.scope(home) else {
+                return found;
+            };
             let names: Box<dyn Iterator<Item = &Sym>> = if since == 0 { Box::new(scope.names.keys()) } else { Box::new(scope.log[since as usize..].iter()) };
             for name in names {
                 let entry = &scope.names[name];
                 for ns in NAMESPACES {
-                    let Some(binding) = entry.get(ns) else { continue };
+                    let Some(binding) = entry.get(ns) else {
+                        continue;
+                    };
                     if visible(paths, binding.vis, home, at) {
                         found.push((*name, ns, Binding { def: binding.def, vis, origin: Origin::Glob }));
                     }
@@ -93,7 +95,9 @@ fn import(paths: &Paths<'_>, pending: &Pending) -> Outcome {
     let path = paths.use_path(Path { segments: &pending.segments, absolute: pending.absolute, dollar: pending.dollar });
     let at = ModRef { krate: paths.krate, module: pending.module };
     let Some(name) = pending.name else {
-        let Some(target) = paths.resolve(&path, at) else { return Outcome::Missing };
+        let Some(target) = paths.resolve(&path, at) else {
+            return Outcome::Missing;
+        };
         let stamp = stamp(paths, target);
         if stamp.is_some() && stamp == pending.stamp {
             return Outcome::Unchanged;
@@ -101,9 +105,13 @@ fn import(paths: &Paths<'_>, pending: &Pending) -> Outcome {
         let since = pending.stamp.filter(|(seen, _)| *seen == target).map_or(0, |(_, version)| version);
         return Outcome::Bound(glob(paths, target, (at, pending.vis), since), stamp);
     };
-    let Some((found, home, target)) = named(paths, &path, at) else { return Outcome::Missing };
+    let Some((found, home, target)) = named(paths, &path, at) else {
+        return Outcome::Missing;
+    };
     if name == UNDERSCORE {
-        let Some(binding) = found.types else { return Outcome::Missing };
+        let Some(binding) = found.types else {
+            return Outcome::Missing;
+        };
         let stamp = Some((binding.def, 0));
         return if stamp == pending.stamp { Outcome::Unchanged } else { Outcome::Bound(Found::new(), stamp) };
     }
@@ -113,7 +121,9 @@ fn import(paths: &Paths<'_>, pending: &Pending) -> Outcome {
     }
     let mut out = Found::new();
     for ns in NAMESPACES {
-        let Some(binding) = found.get(ns) else { continue };
+        let Some(binding) = found.get(ns) else {
+            continue;
+        };
         if home.is_none_or(|home| visible(paths, binding.vis, home, at)) {
             out.push((name, ns, Binding { def: binding.def, vis: pending.vis, origin: Origin::Import }));
         }
@@ -359,19 +369,22 @@ impl Names {
         Ok(expanded)
     }
 
-    /// The waiting macro calls of crate `krate` that name resolution binds, in modules or, when `members`, in impl bodies: those with a definition, and the indexes of the others.
+    /// The waiting macro calls of crate `krate` that name resolution binds, in modules or, when `members`, in impl or trait bodies: those with a definition, and the indexes of the others.
     fn imported_macros(&self, outline: &Outline, krate: usize, demands: &Requests, members: bool) -> (Vec<(usize, Arc<Macro>)>, Vec<usize>) {
         let paths = paths_of(self, outline, krate, demands);
         let tree = &outline.crates[krate];
-        let (calls, module): (&[crate::outline::tree::Waiting], &dyn Fn(usize) -> usize) = match members {
-            true => (&tree.members, &|block| tree.impls[block].module),
-            false => (&tree.deferred, &|module| module),
-        };
         let (mut found, mut foreign) = (Vec::new(), Vec::new());
-        for (index, call) in calls.iter().enumerate() {
-            let Some(item) = resolve_macro(&paths, &call.file, (call.at, ModRef { krate: krate as u32, module: module(call.owner) as u32 })) else { continue };
-            match outline.crates[item.krate as usize].defined.get(&(item.file, item.item)) {
-                Some(definition) => found.push((index, definition.clone())),
+        let check = |(index, call): (usize, &crate::outline::tree::Waiting)| {
+            let item = resolve_macro(&paths, &call.file, (call.at, ModRef { krate: krate as u32, module: call.owner as u32 }))?;
+            Some((index, outline.crates[item.krate as usize].defined.get(&(item.file, item.item)).cloned()))
+        };
+        let resolved: Vec<_> = match members {
+            true => tree.members.iter().map(|(_, call)| call).enumerate().filter_map(check).collect(),
+            false => tree.deferred.iter().enumerate().filter_map(check).collect(),
+        };
+        for (index, definition) in resolved {
+            match definition {
+                Some(definition) => found.push((index, definition)),
                 None => foreign.push(index),
             }
         }

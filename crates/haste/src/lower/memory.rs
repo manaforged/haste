@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{IntCC, Type, Value};
+use haste_codegen::{IntCC, RuntimeSymbol, Type, Value};
 
 use crate::body::BinOp;
 use crate::names::Primitive;
@@ -9,6 +9,7 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
 use super::place::{Base, Place};
+use super::stencil::SymbolSource;
 use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
@@ -22,9 +23,10 @@ impl Lower<'_, '_> {
             (NeedsDrop | TypeId, Some(ty), _) => self.type_fact(which, ty).map(Some),
             (TypeName, Some(ty), _) => {
                 let name = self.cx.type_text(ty, &|ty| ty);
-                let data = self.slots.data(name.as_bytes());
-                let data = self.ins().iconst(Type::I64, data);
-                Ok(Some(self.wide_pointer(data, name.len() as i64)))
+                let id = self.slots.rodata(name.as_bytes(), &[]);
+                let data = self.emit_symbol(SymbolSource::Rodata(id));
+                let len = self.emit_symbol(SymbolSource::Word(name.len() as u64));
+                Ok(Some(self.wide(data, len)))
             }
             (NoOp, _, _) => Ok(None),
             (Fence, _, _) => {
@@ -49,11 +51,7 @@ impl Lower<'_, '_> {
         use Intrinsic::*;
         let ty = substs[0];
         match (which, args) {
-            (RawPointer, &[data, ..]) => match (repr(self.cx, ty)?, args.get(1)) {
-                (Repr::Mem { .. }, Some(&meta)) => Ok(Some(self.wide(data, meta))),
-                (Repr::Scalar(_), _) => Ok(Some(data)),
-                _ => bail!("aggregate_raw_ptr into a pointer with metadata that is not a slice length"),
-            },
+            (RawPointer, &[data, ..]) => self.raw_pointer(substs, data, args.get(1).copied()),
             (Offset(pointer), &[base, count]) => self.offset(ty, pointer, base, count).map(Some),
             (PtrMask, &[pointer, mask]) => Ok(Some(self.ins().band(pointer, mask))),
             (OffsetFrom(signed), &[to, from]) => self.offset_from(ty, signed, to, from).map(Some),
@@ -70,6 +68,27 @@ impl Lower<'_, '_> {
             (SliceElement, &[slice, index]) => self.slice_element(substs, slice, index).map(Some),
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
         }
+    }
+
+    fn raw_pointer(&mut self, substs: &[Ty], data: Value, meta: Option<Value>) -> Result<Option<Value>> {
+        let ty = substs[0];
+        let data = match substs.get(1).copied().map(|from| repr(self.cx, from)).transpose()? {
+            Some(Repr::Mem { .. }) => self.ins().load(Type::I64, data, 0),
+            _ => data,
+        };
+        if matches!(repr(self.cx, ty)?, Repr::Scalar(_)) {
+            return Ok(Some(data));
+        }
+        let (Kind::Ptr(_, pointee) | Kind::Ref(_, pointee)) = *self.cx.types.kind(ty) else {
+            bail!("aggregate_raw_ptr into a type that is not a pointer");
+        };
+        let Some(meta) = meta else { bail!("aggregate_raw_ptr into a wide pointer with no metadata") };
+        let tail = self.cx.tail(pointee)?;
+        let meta = match self.cx.types.kind(tail) {
+            Kind::Dyn(..) => self.ins().load(Type::I64, meta, 0),
+            _ => meta,
+        };
+        Ok(Some(self.wide(data, meta)))
     }
 
     fn write_box(&mut self, ty: Ty, boxed: Value, value: Option<Value>) -> Result<Value> {
@@ -91,8 +110,8 @@ impl Lower<'_, '_> {
 
     fn type_id(&mut self, ty: Ty) -> Value {
         let slot = self.b.create_stack_slot(16, 3);
-        let id = self.ins().iconst(Type::I64, i64::from(ty.0));
-        let zero = self.ins().iconst(Type::I64, 0);
+        let id = self.emit_symbol(SymbolSource::Word(u64::from(ty.0)));
+        let zero = self.emit_symbol(SymbolSource::Word(0));
         self.ins().stack_store(id, slot, 0);
         self.ins().stack_store(zero, slot, 8);
         self.ins().stack_addr(Type::I64, slot, 0)
@@ -120,7 +139,10 @@ impl Lower<'_, '_> {
                 let slot = if size { SIZE_SLOT } else { ALIGN_SLOT };
                 Ok(self.ins().load(Type::I64, vtable, slot as i32 * 8))
             }
-            Kind::Adt(item, args) if self.cx.is_unsized(ty)? => self.tail_layout(size, (ty, item, &args), pointer),
+            Kind::Adt(item, args) if self.cx.is_unsized(ty)? => {
+                let slice = self.cx.types.substs(args).to_vec();
+                self.tail_layout(size, (ty, item, &slice), pointer)
+            }
             _ => self.layout_const(which, ty),
         }
     }
@@ -183,8 +205,12 @@ impl Lower<'_, '_> {
     fn read_at(&mut self, ty: Ty, from: Value) -> Result<Option<Value>> {
         let whole = repr(self.cx, ty)?;
         let at = Place { base: Base::Addr(from), offset: 0, repr: whole };
-        let Repr::Mem { .. } = whole else { return Ok(self.read(at)) };
-        let Some(slot) = self.slot(whole) else { return Ok(None) };
+        let Repr::Mem { .. } = whole else {
+            return Ok(self.read(at));
+        };
+        let Some(slot) = self.slot(whole) else {
+            return Ok(None);
+        };
         let to = self.ins().stack_addr(Type::I64, slot, 0);
         self.copy(to, from, whole);
         Ok(Some(to))
@@ -204,14 +230,13 @@ impl Lower<'_, '_> {
         let size = self.size(ty)?;
         let bytes = self.ins().imul_imm(count, size);
         let byte = self.ins().uextend(Type::I64, byte);
-        self.call_libc(libc::memset as *const (), vec![to, byte, bytes], None)?;
+        self.call_libc(RuntimeSymbol::Memset, vec![to, byte, bytes], None)?;
         Ok(())
     }
 
-    /// Calls the C library function `function` of this process with word arguments `args`, and returns its result of type `ret`.
-    fn call_libc(&mut self, function: *const (), args: Vec<Value>, ret: Option<Ty>) -> Result<Option<Value>> {
+    fn call_libc(&mut self, symbol: RuntimeSymbol, args: Vec<Value>, ret: Option<Ty>) -> Result<Option<Value>> {
         let usize_ty = self.cx.types.prim(Primitive::Usize);
-        let code = self.ins().iconst(Type::I64, function as i64);
+        let code = self.ins().runtime(symbol);
         self.call_code(code, (vec![usize_ty; args.len()], ret), args)
     }
 
@@ -227,10 +252,9 @@ impl Lower<'_, '_> {
         }
     }
 
-    /// The C `int` that `memcmp` returns for the `count` bytes at `x` and `y`: negative, zero or positive.
     fn compare_bytes(&mut self, (x, y): (Value, Value), count: Value) -> Result<Value> {
         let int = self.cx.types.prim(Primitive::I32);
-        let Some(order) = self.call_libc(libc::memcmp as *const (), vec![x, y, count], Some(int))? else { bail!("memcmp returned no value") };
+        let Some(order) = self.call_libc(RuntimeSymbol::Memcmp, vec![x, y, count], Some(int))? else { bail!("memcmp returned no value") };
         Ok(order)
     }
 

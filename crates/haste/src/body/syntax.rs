@@ -1,11 +1,11 @@
 #![expect(dead_code, reason = "the syntax tree records every part of the syntax it parses; sema reads the parts it supports and prints the rest in errors")]
 
 /// An expression in a body's arena.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExprId(pub u32);
 
 /// A pattern in a body's arena.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PatId(pub u32);
 
 /// A type in a body's arena.

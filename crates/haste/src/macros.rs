@@ -3,18 +3,18 @@
 use anyhow::{Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::graph::{Targets, Workspace, store};
 use crate::image::{Jit, Job, run_macros};
-use crate::names::procs::{Bound, Site};
 use crate::names::path::Requests;
+use crate::names::procs::{Bound, Site};
 use crate::names::{ItemRef, Names};
 use crate::outline::Outline;
 use crate::outline::attr::{self, split_commas};
 use crate::outline::item::{Attr, ItemKind, ProcKind};
 use crate::outline::source::Source;
 use crate::outline::tree::PROC_MACRO_ROOT;
-use crate::graph::{Targets, Workspace, store};
 use crate::sema::reach::{Instance, Reached, reach};
-use crate::sema::{Answer, Context, Cache};
+use crate::sema::{Answer, Cache, Context};
 
 const ENTRIES: [&str; 2] = ["__haste_expand1", "__haste_expand2"];
 
@@ -146,7 +146,14 @@ pub fn load(compilation: &mut Compilation, asks: Requests) -> Result<Answer> {
     procs.dedup();
     procs.retain(|key| !compilation.outline.procs.contains_key(key));
     if !procs.is_empty() {
-        let calls: Vec<Call> = procs.iter().map(|(run, _)| (*run, ProcKind::Bang, usize::MAX)).collect();
+        let calls: Vec<Call> = procs
+            .iter()
+            .map(|(run, _)| {
+                let file = &compilation.outline.crates[run.krate as usize].files[run.file as usize];
+                let kind = crate::names::collect::proc_kind(&file.source, &file.items.items[run.item as usize]).map_or(ProcKind::Bang, |(_, kind)| kind);
+                (*run, kind, usize::MAX)
+            })
+            .collect();
         let inputs: Vec<Vec<String>> = procs.iter().map(|(_, text)| vec![text.clone()]).collect();
         let outputs = run(compilation, &calls, &inputs)?;
         compilation.outline.procs.extend(procs.iter().cloned().zip(outputs));
@@ -209,11 +216,7 @@ fn inputs(outline: &Outline, call: &Bound) -> Vec<String> {
             let item = &waiting.file.items.items[waiting.at as usize];
             vec![item.body.map_or_else(String::new, |open| inside(&waiting.file.source, open))]
         }
-        Site::Derive(held) => {
-            let src = &held.file.source;
-            let env = &outline.crates[call.krate].env;
-            vec![item_text(src, &held.file.items.items[held.at as usize], &|path| src.text(path) != "derive", Some(&|attrs| env.enabled(attrs)))]
-        }
+        Site::Derive(held) => vec![derive_input(&held.file.source, &held.file.items.items[held.at as usize], &outline.crates[call.krate].env)],
         Site::Attribute(held) => {
             let src = &held.file.source;
             let after = held.path.1 + 1;
@@ -221,6 +224,11 @@ fn inputs(outline: &Outline, call: &Bound) -> Vec<String> {
             vec![args, item_text(src, &held.file.items.items[held.at as usize], &|path| path != held.path.0, None)]
         }
     }
+}
+
+/// The text of `item` as a procedural derive macro receives it: without its `#[derive]` attributes or cfg-disabled fields and variants.
+pub(crate) fn derive_input(src: &Source, item: &crate::outline::item::Item, env: &crate::outline::tree::Env) -> String {
+    item_text(src, item, &|path| !crate::outline::attr::is_derive_at(src, path, src.pair(path - 1)), Some(&|attrs| env.enabled(attrs)))
 }
 
 /// The tokens between the delimiter that opens at `open` and its pair.
@@ -301,8 +309,17 @@ fn expand(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>])
         Some(kept) => kept,
         None => Jit::new(Cache::default())?,
     };
-    let entry = pair.map(|item| demand.declare((item, Vec::new())));
-    let jobs: Vec<Job<'_>> = bound.iter().zip(inputs).map(|(&(call, kind, caller), texts)| Job { entry: entry[usize::from(kind == ProcKind::Attribute)], run: demand.declare((call, Vec::new())), texts: texts.iter().map(|text| text.as_bytes()).collect(), group: (caller, call.krate) }).collect();
+    let entry = pair.map(|item| demand.declare((item, crate::sema::substs::Substs::EMPTY)));
+    let jobs: Vec<Job<'_>> = bound
+        .iter()
+        .zip(inputs)
+        .map(|(&(call, kind, caller), texts)| Job {
+            entry: entry[usize::from(kind == ProcKind::Attribute)],
+            run: demand.declare((call, crate::sema::substs::Substs::EMPTY)),
+            texts: texts.iter().map(|text| text.as_bytes()).collect(),
+            group: (caller, call.krate),
+        })
+        .collect();
     let ask = |compilation: &mut Compilation, asks: Requests| Ok(if compilation.names.load(&mut compilation.outline, asks)? { Answer::Names } else { Answer::Nothing });
     let ran = run_macros(compilation, &mut demand, &jobs, &ask);
     drop(jobs);

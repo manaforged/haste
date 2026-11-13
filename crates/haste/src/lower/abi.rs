@@ -51,7 +51,9 @@ impl Lower<'_, '_> {
         };
         let layout = self.cx.layout(ty)?;
         match parts(&layout)? {
-            Parts::Bytes => bail!("a {size}-byte aggregate across a native call is not supported yet"),
+            Parts::Bytes => {
+                bail!("a {size}-byte aggregate across a native call is not supported yet")
+            }
             found => Ok(found.scalars().collect()),
         }
     }
@@ -98,7 +100,9 @@ impl Lower<'_, '_> {
         if !matches!(whole, Repr::Mem { .. }) {
             return Ok(results.first().copied());
         }
-        let Some(slot) = self.slot(whole) else { return Ok(None) };
+        let Some(slot) = self.slot(whole) else {
+            return Ok(None);
+        };
         let place = Place::slot(slot, whole);
         for (&(ty, offset), &value) in parts.iter().zip(results) {
             self.write(place.at(offset, Repr::Scalar(ty)), value);

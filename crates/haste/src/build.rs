@@ -3,14 +3,14 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Result, bail};
 use crate::graph::{self, Targets};
 use crate::image::{Image, Program};
 use crate::macros::Compilation;
 use crate::names::ItemRef;
 use crate::outline::{self, edit::Edit};
 use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
-use crate::sema::{self, Edited, Cache};
+use crate::sema::{self, Cache, Edited};
+use anyhow::{Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cli::{Failures, case_items, error_kind, print_failures};
@@ -24,6 +24,7 @@ pub struct Build {
     binary: Option<Batch>,
     program: Option<Program>,
     stamps: Vec<Watch>,
+    outline_span: sema::census::Span,
 }
 
 /// A file that a kept build watches: its path, its last time and size, and for a file that a macro includes, the file that holds the call.
@@ -45,6 +46,8 @@ struct Batch {
     reached: Reached,
     image: Image,
     broken: HashMap<usize, String>,
+    reach_span: sema::census::Span,
+    codegen_span: sema::census::Span,
 }
 
 /// The last-modified time and size of the file at `path`, which change when it is written.
@@ -68,7 +71,7 @@ fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<Watch
 
 fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, pick: Pick) -> (Vec<ItemRef>, Vec<Instance>) {
     let cases = pick(workspace, outline);
-    let roots = cases.iter().map(|item| (*item, Vec::new())).collect();
+    let roots = cases.iter().map(|item| (*item, sema::substs::Substs::EMPTY)).collect();
     (cases, roots)
 }
 
@@ -90,17 +93,27 @@ fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reache
 impl Batch {
     /// Infers and compiles every root `pick` finds in `workspace` from nothing.
     fn new(workspace: &graph::Workspace, compilation: &mut Compilation, pick: Pick) -> Result<Batch> {
+        let reach_clock = sema::census::Clock::now();
         let (cases, roots) = batch_roots(workspace, &compilation.outline, pick);
-        crate::macros::reach_resolved(compilation, |_| roots.clone(), |mut cx, reached| {
-            let (image, broken) = Image::build(&mut cx, &reached)?;
-            let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
-            let roots = roots.iter().map(|root| reached.index[root]).collect();
-            Ok(Batch { pick, store: Some(cx.release().0), labels, roots, reached, image, broken })
-        })
+        crate::macros::reach_resolved(
+            compilation,
+            |_| roots.clone(),
+            |mut cx, reached| {
+                let reach_span = reach_clock.elapsed();
+                let codegen_clock = sema::census::Clock::now();
+                let (image, broken) = Image::build(&mut cx, &reached)?;
+                let codegen_span = codegen_clock.elapsed();
+                let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
+                let roots = roots.iter().map(|root| reached.index[root]).collect();
+                Ok(Batch { pick, store: Some(cx.release().0), labels, roots, reached, image, broken, reach_span, codegen_span })
+            },
+        )
     }
 
     fn again(&mut self, compilation: &Compilation, stale: &[(u32, u32)]) -> bool {
-        let Some(mut store) = self.store.take() else { return false };
+        let Some(mut store) = self.store.take() else {
+            return false;
+        };
         let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Files(stale));
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
         let fresh = reach_again(&mut cx, &mut self.reached, &touched);
@@ -113,7 +126,9 @@ impl Batch {
     }
 
     fn reload(&mut self, workspace: &graph::Workspace, compilation: &Compilation, crates: &[u32]) -> bool {
-        let Some(mut store) = self.store.take() else { return false };
+        let Some(mut store) = self.store.take() else {
+            return false;
+        };
         let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(crates));
         let (cases, roots) = batch_roots(workspace, &compilation.outline, self.pick);
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
@@ -168,9 +183,11 @@ impl Batch {
 impl Build {
     /// Loads every crate of `workspace`, resolves its names and expands its macros, inferring and compiling nothing yet.
     pub fn load(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
+        let outline_clock = sema::census::Clock::now();
         let compilation = crate::macros::load_eager(workspace, targets, &[])?;
         let stamps = stamps(workspace, &compilation.outline);
-        Ok(Build { compilation, cases: None, binary: None, program: None, stamps })
+        let outline_span = outline_clock.elapsed();
+        Ok(Build { compilation, cases: None, binary: None, program: None, stamps, outline_span })
     }
 
     /// Infers and compiles the `case_` functions unless that is done.
@@ -238,7 +255,9 @@ impl Build {
             if crates.contains(&krate) {
                 continue;
             }
-            let Ok(reloaded) = self.compilation.outline.reload(krate as usize) else { return false };
+            let Ok(reloaded) = self.compilation.outline.reload(krate as usize) else {
+                return false;
+            };
             crates.extend(reloaded.into_iter().map(|at| at as u32));
         }
         crates.sort_unstable();
@@ -285,6 +304,18 @@ impl Build {
     pub fn check(&self, built: Duration) -> Result<i32> {
         let Some(binary) = &self.binary else { bail!("the binary is not compiled") };
         Ok(binary.check(built))
+    }
+
+    /// Writes the equivalence-class, hazard, origin, and code-size census of the compiled binary to `path`.
+    pub fn write_stats(&mut self, workspace: &graph::Workspace, graph: sema::census::Span, path: &std::path::Path) -> Result<()> {
+        let Some(binary) = &mut self.binary else { bail!("the binary is not compiled") };
+        let Some(store) = binary.store.take() else { bail!("the binary has no inference store") };
+        let timings = sema::census::Timings { graph, outline: self.outline_span, reach: binary.reach_span, codegen: binary.codegen_span };
+        let input = sema::census::CensusInput { workspace, reached: &binary.reached, code_sizes: binary.image.code_sizes(), compile_times: binary.image.compile_times(), timings };
+        let mut cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
+        let result = sema::census::write_stats(&mut cx, input, path);
+        binary.store = Some(cx.release().0);
+        result
     }
 
     /// Runs the binary's `main` with `args` as argv in a forked child, compiling each function on its first call and keeping that code for the next run.

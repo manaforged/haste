@@ -3,6 +3,7 @@ use super::float::scalar;
 use super::{Emit, Ext};
 use crate::alloc::Location;
 use crate::ir::{Type, Value};
+use crate::reloc::{RelocKind, StencilReloc};
 
 fn extend(imm: i64, ty: Type, ext: Ext) -> i64 {
     crate::fold::extend(imm, ty, matches!(ext, Ext::Sign))
@@ -77,7 +78,7 @@ impl Emit<'_> {
         let bytes = ty.bytes();
         let source: Rm = match self.location(value) {
             Location::Imm(imm) => return self.asm.mov_imm(reg, extend(imm, ty, ext)),
-            Location::Frame(..) => return self.raw(reg, value),
+            Location::SlotAddr(_) | Location::Frame(..) => return self.raw(reg, value),
             Location::Float(_) => {
                 self.raw(reg, value);
                 reg.into()
@@ -95,6 +96,10 @@ impl Emit<'_> {
     pub(super) fn raw(&mut self, reg: Reg, value: Value) {
         match self.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, imm),
+            Location::SlotAddr(sym) => {
+                let at = self.asm.mov_slot_reloc(reg);
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
+            }
             Location::Frame(slot, offset) => {
                 let at = self.slot(slot, offset);
                 self.asm.lea(reg, at);
@@ -173,7 +178,7 @@ impl Emit<'_> {
     pub(super) fn operand(&mut self, value: Value) -> Rm {
         match self.location(value) {
             Location::Reg(reg) => reg.into(),
-            Location::Imm(_) => {
+            Location::Imm(_) | Location::SlotAddr(_) => {
                 let at = self.at(value);
                 self.move_to(at, value);
                 at.into()
@@ -196,6 +201,10 @@ impl Emit<'_> {
                     self.asm.store(Size::Q, to, Reg::R11);
                 }
             },
+            Location::SlotAddr(sym) => {
+                let at = self.asm.store_slot_reloc(to);
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
+            }
             Location::Frame(..) => {
                 self.raw(Reg::R11, value);
                 self.asm.store(Size::Q, to, Reg::R11);

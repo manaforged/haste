@@ -1,6 +1,7 @@
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
 use super::{Emit, Ext};
 use crate::ir::{AtomicRmwOp, Op, StackSlot, Type, Value};
+use crate::reloc::{RelocKind, StencilReloc};
 
 const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
 
@@ -17,6 +18,29 @@ impl Emit<'_> {
                     self.asm.mov_imm(dst, *imm);
                     self.put(result, dst);
                 }
+            }
+            Op::SlotAddr(sym) => {
+                let result = result()?;
+                if !self.is_static(result) {
+                    let dst = self.dst(result);
+                    let at = self.asm.mov_slot_reloc(dst);
+                    self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs32));
+                    self.put(result, dst);
+                }
+            }
+            Op::Symbol(sym) => {
+                let result = result()?;
+                let dst = self.dst(result);
+                let at = self.asm.mov_abs64(dst);
+                self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs64));
+                self.put(result, dst);
+            }
+            Op::Runtime(rt) => {
+                let result = result()?;
+                let dst = self.dst(result);
+                let at = self.asm.mov_abs64(dst);
+                self.relocs.push(StencilReloc::runtime(at, *rt, RelocKind::Abs64));
+                self.put(result, dst);
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
             _ => return self.access(op, result),

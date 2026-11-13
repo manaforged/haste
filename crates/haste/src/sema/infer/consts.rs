@@ -1,26 +1,21 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 
 use crate::body::adt::AdtDef;
 use crate::body::sig::{ImplHeader, Signature};
 use crate::body::{BinOp, Body, Expr, ExprId, Lit, PathId, TyId, UnOp};
-use crate::names::path::Path as NamePath;
-use crate::names::resolve::macro_path;
 use crate::names::{Def, ItemRef, Primitive, Sym};
 use crate::outline::item::ItemKind;
 
-use super::super::evaluate;
+use super::super::evaluate::{self, CONST_METHODS, ConstMethod, Int, OVERFLOW_OPS, OverflowOp, convert, fold, int_method, overflowing_op, signed};
 use super::super::impls::ImplRef;
+use super::super::intrinsic::Intrinsic;
 use super::super::reach::Instance;
 use super::super::ty::{Kind, Ty, int_info, mask};
-use super::super::intrinsic::Intrinsic;
+use super::path::parse_int;
 use super::scope::Frame;
 use super::{Infer, Res, Shape, Typed};
-use super::path::parse_int;
-
-/// The width and signedness of an integer type.
-type Int = (u32, bool);
 
 const U32: Int = (32, false);
 
@@ -30,27 +25,14 @@ const BOOL: Int = (1, false);
 
 const I32: Int = (32, true);
 
-/// A method that constant expressions call: a pure method of the integer types, or the length of a string, byte string or array.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConstMethod {
-    Ilog,
-    Ilog2,
-    Ilog10,
-    Pow,
-    CountOnes,
-    CountZeros,
-    LeadingZeros,
-    TrailingZeros,
-    Len,
-}
-
-/// The parsed syntax that holds an anonymous constant: a function or constant body, a function or constant header, a type definition, or an impl header.
+/// The parsed syntax that holds an anonymous constant: a function or constant body, a function or constant header, a type definition, an impl header, or a type alias.
 #[derive(Clone, Debug)]
 pub enum Arena {
-    Body(Rc<Body>),
-    Signature(Rc<Signature>),
-    Adt(Rc<AdtDef>),
-    Header(Rc<ImplHeader>),
+    Body(Arc<Body>),
+    Signature(Arc<Signature>),
+    Adt(Arc<AdtDef>),
+    Header(Arc<ImplHeader>),
+    Alias(Arc<super::super::Alias>),
 }
 
 impl Arena {
@@ -61,6 +43,7 @@ impl Arena {
             Arena::Signature(sig) => &sig.body,
             Arena::Adt(def) => &def.body,
             Arena::Header(header) => &header.body,
+            Arena::Alias(alias) => &alias.arena,
         }
     }
 
@@ -70,6 +53,7 @@ impl Arena {
             Arena::Signature(_) => 1,
             Arena::Adt(_) => 2,
             Arena::Header(_) => 3,
+            Arena::Alias(_) => 4,
         }
     }
 }
@@ -81,104 +65,7 @@ pub struct Anon {
     pub root: ExprId,
 }
 
-const CONST_METHODS: [(&str, ConstMethod); 9] = [
-    ("ilog", ConstMethod::Ilog),
-    ("ilog2", ConstMethod::Ilog2),
-    ("ilog10", ConstMethod::Ilog10),
-    ("pow", ConstMethod::Pow),
-    ("count_ones", ConstMethod::CountOnes),
-    ("count_zeros", ConstMethod::CountZeros),
-    ("leading_zeros", ConstMethod::LeadingZeros),
-    ("trailing_zeros", ConstMethod::TrailingZeros),
-    ("len", ConstMethod::Len),
-];
-
-fn ilog(value: u128, base: u128) -> u128 {
-    let (mut value, mut log) = (value, 0);
-    while value >= base {
-        value /= base;
-        log += 1;
-    }
-    log
-}
-
-fn int_method(method: ConstMethod, x: u128, args: &[u128], int: Int) -> Result<(u128, Int)> {
-    let arg = args.first().copied();
-    match (method, arg) {
-        (ConstMethod::Ilog | ConstMethod::Ilog2 | ConstMethod::Ilog10, _) => int_log(method, x, arg, int).map(|log| (log, U32)),
-        (ConstMethod::Pow, Some(exp)) => Ok((x.wrapping_pow(exp as u32) & mask(int.0), int)),
-        (ConstMethod::Pow, None) => bail!("`pow` in a constant has no exponent"),
-        _ => Ok((int_bits(method, x & mask(int.0), int.0), U32)),
-    }
-}
-
-fn int_log(method: ConstMethod, x: u128, base: Option<u128>, (bits, is_signed): Int) -> Result<u128> {
-    if x == 0 || (is_signed && signed(x, bits) < 0) {
-        bail!("the logarithm of a value that is not positive in a constant");
-    }
-    Ok(match (method, base) {
-        (ConstMethod::Ilog2, _) => u128::from(127 - x.leading_zeros()),
-        (ConstMethod::Ilog, Some(base)) if !(is_signed && signed(base, bits) < 2) && base >= 2 => ilog(x, base),
-        (ConstMethod::Ilog, _) => bail!("a logarithm of base below 2 in a constant"),
-        _ => ilog(x, 10),
-    })
-}
-
-fn int_bits(method: ConstMethod, x: u128, bits: u32) -> u128 {
-    u128::from(match method {
-        ConstMethod::CountOnes => x.count_ones(),
-        ConstMethod::CountZeros => bits - x.count_ones(),
-        ConstMethod::LeadingZeros => x.leading_zeros() - (128 - bits),
-        _ => x.trailing_zeros().min(bits),
-    })
-}
-
-fn signed(value: u128, bits: u32) -> i128 {
-    let shift = 128 - bits;
-    ((value << shift) as i128) >> shift
-}
-
-/// `value` of type `from` read as type `to`, as an `as` cast does.
-fn convert(value: u128, from: Int, to: Int) -> u128 {
-    let value = if from.1 { signed(value, from.0) as u128 } else { value };
-    value & mask(to.0)
-}
-
-fn fold(op: BinOp, x: u128, y: u128, (bits, is_signed): Int) -> Result<u128> {
-    if matches!(op, BinOp::Div | BinOp::Rem) && y == 0 {
-        bail!("a division by zero in a constant");
-    }
-    Ok(match op {
-        BinOp::Div | BinOp::Rem | BinOp::Shr if is_signed => fold_signed(op, signed(x, bits), y, bits),
-        BinOp::Div | BinOp::Rem | BinOp::Shr => fold_unsigned(op, x, y),
-        BinOp::Add => x.wrapping_add(y),
-        BinOp::Sub => x.wrapping_sub(y),
-        BinOp::Mul => x.wrapping_mul(y),
-        BinOp::Shl => x.checked_shl(y as u32).unwrap_or(0),
-        BinOp::BitAnd => x & y,
-        BinOp::BitOr => x | y,
-        BinOp::BitXor => x ^ y,
-        other => bail!("the operator {other:?} in a constant is not evaluated yet"),
-    })
-}
-
-fn fold_signed(op: BinOp, x: i128, y: u128, bits: u32) -> u128 {
-    match op {
-        BinOp::Div => x.wrapping_div(signed(y, bits)) as u128,
-        BinOp::Rem => x.wrapping_rem(signed(y, bits)) as u128,
-        _ => (x >> (y as u32).min(127)) as u128,
-    }
-}
-
-fn fold_unsigned(op: BinOp, x: u128, y: u128) -> u128 {
-    match op {
-        BinOp::Div => x / y,
-        BinOp::Rem => x % y,
-        _ => x.checked_shr(y as u32).unwrap_or(0),
-    }
-}
-
-impl<'a> Infer<'a, '_> {
+impl<'a> Infer<'_, 'a> {
     fn const_typed(&mut self, arena: &Body, expr: ExprId, target: Int) -> Result<(u128, Int)> {
         let (value, ty) = self.const_eval(arena, expr, Some(target))?;
         let int = ty.unwrap_or(target);
@@ -195,6 +82,10 @@ impl<'a> Infer<'a, '_> {
 
     /// The value of the integer or bool constant item `item`, as the bits of its type: folded from its syntax, or else from running its body.
     pub(super) fn const_value(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(u128, Int)> {
+        if self.any_has_params(substs) {
+            self.poly_fallback();
+            bail!("constant {} depends on type parameters", self.cx.name(item));
+        }
         let sig = self.cx.signature(item)?;
         let Some(ret) = sig.ret else { bail!("constant {} has no type", self.cx.name(item)) };
         let mut width = None;
@@ -206,14 +97,19 @@ impl<'a> Infer<'a, '_> {
             Ok((value & mask(int.0), int))
         });
         match (folded, width) {
-            (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => self.run_instance(&(item, substs.to_vec()), int, error),
+            (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => {
+                let interned = self.cx.types.intern_substs(substs);
+                self.run_instance(&(item, interned), int, error)
+            }
             (found, _) => found,
         }
     }
 
     /// The width and signedness of `ty` when it is an integer type or `bool`.
     fn int_of(&self, ty: Ty) -> Option<Int> {
-        let Kind::Prim(primitive) = *self.cx.types.kind(ty) else { return None };
+        let Kind::Prim(primitive) = *self.cx.types.kind(ty) else {
+            return None;
+        };
         int_info(primitive).or((primitive == Primitive::Bool).then_some(BOOL))
     }
 
@@ -227,18 +123,28 @@ impl<'a> Infer<'a, '_> {
     /// The value of the anonymous constant `expr` of `arena`, which the folder failed on with `error`, from running it as its own function once per pass and frame arguments: when those arguments are known and an item holds `arena`.
     fn run_anon(&mut self, arena: &Body, expr: ExprId, error: anyhow::Error) -> Result<(u128, Int)> {
         let args: Vec<Ty> = self.generics.iter().map(|&(_, ty)| ty).chain(self.self_ty).collect();
+        if self.any_has_params(&args) {
+            self.poly_fallback();
+            return Err(error);
+        }
         if args.iter().any(|&ty| self.has_vars(ty)) {
             return Err(error);
         }
-        let Some((owner, arena)) = self.holder(arena) else { return Err(error) };
+        let Some((owner, arena)) = self.holder(arena) else {
+            return Err(error);
+        };
         let mut args: Vec<Ty> = args.into_iter().map(|ty| self.zonk(ty)).collect();
         args.extend([arena.tag(), u128::from(expr.0)].map(|value| self.cx.types.intern(Kind::Value(value))));
-        let (instance, asked) = ((owner, args), self.cx.asks.count());
-        let typed = match self.cx.store.finals.get(&instance).cloned() {
+        let (instance, asked) = ((owner, self.cx.types.intern_substs(&args)), self.cx.asks.count());
+        let typed = match self.cx.store.finals.get(&instance) {
             Some(typed) => typed,
             None => self.infer_anon(Anon { arena, root: expr }, &instance).map_err(|reason| anyhow!("{error:#}; inferring it: {reason:#}"))?,
         };
         let Some(int) = typed.ret.and_then(|ty| self.int_of(ty)) else { bail!("{error:#}; it is not an integer") };
+        if self.cx.asks.count() != asked {
+            self.cx.store.finals.remove(&instance);
+            bail!("{error:#}; inferring it needs names that are not loaded yet");
+        }
         let ran = self.run_instance(&instance, int, error);
         if self.cx.asks.count() != asked {
             self.cx.store.finals.remove(&instance);
@@ -252,8 +158,9 @@ impl<'a> Infer<'a, '_> {
         let items = self.instance.iter().map(|(item, _)| *item).chain(self.frame_item);
         for item in items {
             let found = match self.cx.item(item).1.kind {
-                ItemKind::Struct | ItemKind::Enum | ItemKind::Union => [store.adts.get(&item).cloned().map(Arena::Adt), None],
-                ItemKind::Fn | ItemKind::Const if !self.cx.foreign(item) => [store.signatures.get(&item).cloned().map(Arena::Signature), store.bodies.get(&item).cloned().map(Arena::Body)],
+                ItemKind::Struct | ItemKind::Enum | ItemKind::Union => [store.adts.get(&item).map(Arena::Adt), None],
+                ItemKind::Type => [self.cx.aliases.get(&item).map(Arena::Alias), None],
+                ItemKind::Fn | ItemKind::Const | ItemKind::Static if !self.cx.foreign(item) => [store.signatures.get(&item).map(Arena::Signature), store.bodies.get(&item).map(Arena::Body)],
                 _ => [None, None],
             };
             if let Some(found) = found.into_iter().flatten().find(held) {
@@ -261,7 +168,7 @@ impl<'a> Infer<'a, '_> {
             }
         }
         let block = self.block?;
-        let header = Arena::Header(store.headers.get(&block)?.clone());
+        let header = Arena::Header(store.headers.get(&block)?);
         let owner = match block {
             ImplRef::Body(item) => item,
             ImplRef::Module { krate, index } => {
@@ -273,23 +180,27 @@ impl<'a> Infer<'a, '_> {
     }
 
     /// The typed form of the anonymous constant `anon` as the body of `instance`, inferred in the frame as it stands and kept in the store, where the runner finds it.
-    fn infer_anon(&mut self, anon: Anon, instance: &Instance) -> Result<Rc<Typed>> {
+    fn infer_anon(&mut self, anon: Anon, instance: &Instance) -> Result<Arc<Typed>> {
+        let before = self.cx.quiet_mark();
         let (src, home, frames) = (self.src, self.home, self.frames);
         let frame = Frame { src, home, generics: self.generics.clone(), self_ty: self.self_ty, block: self.block, item: self.frame_item, root: self.root };
         let (arena, sig) = (anon.arena.clone(), Signature::default());
         let body = arena.body();
         let mut infer = Infer::start(self.cx, (body, &sig, src), home);
         infer.swap_frame(frame);
-        (infer.instance, infer.frames) = (Some(instance.clone()), frames);
-        infer.out.exprs = vec![Ty::NONE; body.exprs.len()];
+        (infer.instance, infer.frames) = (Some(*instance), frames);
+        infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
         let ty = infer.fresh(Kind::Var);
         infer.out.ret = Some(ty);
         let found = infer.expr(anon.root, Some(ty))?;
         infer.coerce_expr(anon.root, found, ty)?;
         let mut typed = infer.finish()?;
         typed.shape = Shape::Anon(anon);
-        let typed = Rc::new(super::settle(self.cx, (instance.0, &instance.1), typed)?);
-        self.cx.store.finals.insert(instance.clone(), typed.clone());
+        let typed = Arc::new(super::settle(self.cx, *instance, typed)?);
+        if self.cx.quiet_mark() != before {
+            bail!("inferring it deferred constant evaluation or asked for unloaded names");
+        }
+        self.cx.store.finals.insert(*instance, typed.clone());
         Ok(typed)
     }
 
@@ -366,7 +277,9 @@ impl<'a> Infer<'a, '_> {
     /// The generic argument `ty`: a type, or, when a plain path names no type, the constant it names, as rustc reads an argument that could be either.
     pub(super) fn ty_or_const_arg(&mut self, arena: &Body, ty: TyId) -> Result<Ty> {
         let lowered = self.lower_ty(arena, ty);
-        let (Err(error), &crate::body::Ty::Path(path)) = (&lowered, arena.ty(ty)) else { return lowered };
+        let (Err(error), &crate::body::Ty::Path(path)) = (&lowered, arena.ty(ty)) else {
+            return lowered;
+        };
         match self.const_path(arena, path) {
             Ok((value, (bits, _))) => Ok(self.cx.types.intern(Kind::Value(value & mask(bits)))),
             Err(reason) => bail!("{error:#}; as a constant: {reason:#}"),
@@ -379,7 +292,9 @@ impl<'a> Infer<'a, '_> {
             Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.param_name(arena, tail),
             Expr::Path(path) => {
                 let entry = arena.path(path);
-                let [segment] = arena.list(entry.segments) else { return None };
+                let [segment] = arena.list(entry.segments) else {
+                    return None;
+                };
                 let named = entry.qself.is_none() && !entry.global && arena.segments[*segment as usize].args.is_none();
                 named.then(|| self.src.text(arena.segments[*segment as usize].name))
             }
@@ -402,10 +317,59 @@ impl<'a> Infer<'a, '_> {
             Expr::Cast(inner, ty) => self.const_cast(arena, inner, ty),
             Expr::Call(callee, args) => self.const_call(arena, (callee, args), want),
             Expr::Path(path) => self.const_name(arena, (expr, path), want),
+            Expr::TupleField(base, index) => self.const_tuple_field(arena, base, index, want),
             Expr::Method { receiver, name, args: None, params } => self.const_method(arena, (receiver, name, params), want),
             Expr::Macro { path, open } => self.const_macro(arena, (path, open), want),
             other => bail!("constant expressions like {other:?} are not evaluated yet"),
         }
+    }
+
+    fn const_tuple_field(&mut self, arena: &Body, base: ExprId, index: u32, want: Option<Int>) -> Result<(u128, Option<Int>)> {
+        match *arena.expr(base) {
+            Expr::Paren(inner) => self.const_tuple_field(arena, inner, index, want),
+            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.const_tuple_field(arena, tail, index, want),
+            Expr::Tuple(items) => {
+                let &item = arena.list(items).get(index as usize).ok_or_else(|| anyhow::anyhow!("no field {index} on tuple constant"))?;
+                self.const_eval(arena, ExprId(item), want)
+            }
+            Expr::Method { receiver, name, args: None, params } => self.const_overflowing(arena, (receiver, name, params), index, want),
+            Expr::Path(path) => self.const_path_field(arena, path, index, want),
+            other => bail!("constant tuple field on {other:?} is not evaluated yet"),
+        }
+    }
+
+    fn const_overflowing(&mut self, arena: &Body, (receiver, name, params): (ExprId, u32, crate::body::List), index: u32, want: Option<Int>) -> Result<(u128, Option<Int>)> {
+        let text = crate::names::plain(self.src.text(name));
+        let Some(&(_, op)) = OVERFLOW_OPS.iter().find(|(known, _)| *known == text) else { bail!("the method `{text}` is not evaluated in constants yet") };
+        let &[rhs] = arena.list(params) else { bail!("`{text}` takes one operand") };
+        let hint = (index == 0).then_some(want).flatten();
+        let (x, lt) = self.const_eval(arena, receiver, hint)?;
+        let int = lt.or(hint).unwrap_or(I32);
+        let y = match op {
+            OverflowOp::Shl | OverflowOp::Shr => self.const_defaulted(arena, ExprId(rhs), I32)?.0,
+            _ => convert(self.const_defaulted(arena, ExprId(rhs), int)?.0, int, int),
+        };
+        let (val, over) = overflowing_op(op, x, y, int);
+        match index {
+            0 => Ok((val & mask(int.0), Some(int))),
+            1 => Ok((u128::from(over), Some(BOOL))),
+            _ => bail!("no field {index} on `{text}` result"),
+        }
+    }
+
+    fn const_path_field(&mut self, arena: &Body, path: PathId, index: u32, want: Option<Int>) -> Result<(u128, Option<Int>)> {
+        let (item, substs) = self.const_target(arena, path)?;
+        let body = self.cx.body(item)?;
+        let frame = self.frame(item, &substs)?;
+        self.with_frame(frame, |infer| {
+            let root = body.root.ok_or_else(|| anyhow::anyhow!("constant has no body"))?;
+            let items = match *body.expr(root) {
+                Expr::Tuple(items) | Expr::Call(_, items) => items,
+                _ => bail!("constant tuple field on non-tuple constant"),
+            };
+            let &elem = body.list(items).get(index as usize).ok_or_else(|| anyhow::anyhow!("no field {index} on constant"))?;
+            infer.const_eval(&body, ExprId(elem), want)
+        })
     }
 
     fn const_lit(&self, lit: Lit, at: u32, want: Option<Int>) -> Result<(u128, Option<Int>)> {
@@ -435,16 +399,19 @@ impl<'a> Infer<'a, '_> {
         }
     }
 
-    /// The value of the macro call `path!` whose group opens at `open`, folded from the expression that the macro writes.
-    fn const_macro(&mut self, arena: &Body, (path, open): (PathId, u32), want: Option<Int>) -> Result<(u128, Option<Int>)> {
-        let (segments, absolute, dollar) = self.segments(arena, path);
-        let found = macro_path(&self.cx.paths(self.home.krate), &NamePath { segments: &segments, absolute, dollar }, self.home);
-        let src = self.src;
-        let Some(output) = found.map(|item| self.cx.macro_output(src, item, open)).transpose()?.flatten() else { bail!("constant macro `{}` is not supported", self.spell(&segments)) };
+    /// The value of the macro call `call`, folded from the expression that the macro writes.
+    fn const_macro(&mut self, arena: &Body, call: (PathId, u32), want: Option<Int>) -> Result<(u128, Option<Int>)> {
+        let (output, inner, root) = self.macro_expr(arena, call)?;
+        self.in_source(output, |infer| infer.const_eval(&inner, root, want))
+    }
+
+    fn macro_expr(&mut self, arena: &Body, (path, open): (PathId, u32)) -> Result<(&'a crate::outline::source::Source, Body, ExprId)> {
+        let (segments, found) = self.resolve_macro(arena, path);
+        let Some(output) = self.expand_macro_call(found, open)? else { bail!("constant macro `{}` is not supported", self.spell(&segments)) };
         let config = crate::body::Config { calls: None, env: Some(&self.cx.outline.crates[self.home.krate as usize].env) };
         let inner = crate::body::parse_expr(output, 0, output.len(), config)?;
         let Some(root) = inner.root else { bail!("macro `{}` wrote no constant expression", self.spell(&segments)) };
-        self.in_source(output, |infer| infer.const_eval(&inner, root, want))
+        Ok((output, inner, root))
     }
 
     fn const_method(&mut self, arena: &Body, (receiver, name, params): (ExprId, u32, crate::body::List), want: Option<Int>) -> Result<(u128, Option<Int>)> {
@@ -559,6 +526,10 @@ impl<'a> Infer<'a, '_> {
         let ty = declared.or(want);
         match *self.cx.types.kind(self.resolve(param)) {
             Kind::Value(bits) => Ok((ty.map_or(bits, |(w, _)| bits & mask(w)), ty)),
+            Kind::Param(_) | Kind::Proj(_) => {
+                self.poly_fallback();
+                bail!("a const parameter whose value is not known yet")
+            }
             _ => bail!("a const parameter whose value is not known yet"),
         }
     }
@@ -589,7 +560,9 @@ impl<'a> Infer<'a, '_> {
     /// The value of the parameter that the one-segment `path` names in the const fn being evaluated.
     fn const_arg_named(&self, arena: &Body, path: PathId) -> Option<(u128, Int)> {
         let entry = arena.path(path);
-        let [segment] = arena.list(entry.segments) else { return None };
+        let [segment] = arena.list(entry.segments) else {
+            return None;
+        };
         let name = crate::names::plain(self.src.text(arena.segments[*segment as usize].name));
         let unqualified = entry.qself.is_none() && !entry.global;
         unqualified.then(|| self.const_args.iter().rev().find(|(bound, _)| bound == name).map(|(_, value)| *value)).flatten()
@@ -623,9 +596,13 @@ impl<'a> Infer<'a, '_> {
     fn const_target(&mut self, arena: &Body, path: PathId) -> Result<(ItemRef, Vec<Ty>)> {
         let (_, res) = self.path_value(arena, path)?;
         let Res::Fn(item, substs) = res else { bail!("a constant path that names no item") };
-        let substs = substs.into_iter().map(|ty| self.zonk(ty)).collect();
+        let substs = self.map_substs(substs, Self::zonk);
+        if self.substs_have_params(substs) {
+            self.poly_fallback();
+            bail!("constant target {} depends on type parameters", self.cx.name(item));
+        }
         match self.trait_call(item, substs)? {
-            Res::Fn(item, substs) => Ok((item, substs)),
+            Res::Fn(item, substs) => Ok((item, self.cx.types.substs(substs).to_vec())),
             _ => bail!("a constant path that names no item"),
         }
     }
@@ -658,15 +635,21 @@ impl<'a> Infer<'a, '_> {
     }
 
     fn const_len(&mut self, arena: &Body, expr: ExprId) -> Result<u128> {
-        Ok(match *arena.expr(expr) {
-            Expr::Lit(Lit::Str | Lit::ByteStr, at) => crate::body::literal::string_bytes(self.src.text(at))?.len() as u128,
-            Expr::Array(items) => arena.list(items).len() as u128,
-            Expr::Repeat(_, count) => self.const_typed(arena, count, USIZE)?.0,
-            Expr::Paren(inner) | Expr::Ref { expr: inner, .. } => self.const_len(arena, inner)?,
-            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.const_len(arena, tail)?,
-            Expr::Path(path) => self.const_len_path(arena, path)?,
+        match *arena.expr(expr) {
+            Expr::Lit(Lit::Str | Lit::ByteStr, at) => crate::body::literal::string_bytes(self.src.text(at)).map(|bytes| bytes.len() as u128),
+            Expr::Array(items) => Ok(arena.list(items).len() as u128),
+            Expr::Repeat(_, count) => self.const_typed(arena, count, USIZE).map(|(len, _)| len),
+            Expr::Paren(inner) | Expr::Ref { expr: inner, .. } => self.const_len(arena, inner),
+            Expr::Block { stmts, tail: Some(tail), .. } if arena.list(stmts).is_empty() => self.const_len(arena, tail),
+            Expr::Path(path) => self.const_len_path(arena, path),
+            Expr::Macro { path, open } => self.const_len_macro(arena, (path, open)),
             ref other => bail!("the length of {other:?} in a constant"),
-        })
+        }
+    }
+
+    fn const_len_macro(&mut self, arena: &Body, call: (PathId, u32)) -> Result<u128> {
+        let (output, inner, root) = self.macro_expr(arena, call)?;
+        self.in_source(output, |infer| infer.const_len(&inner, root))
     }
 
     /// The length of the constant array or string that `path` names: a constant item, or an associated constant such as `Kind::ALL`.

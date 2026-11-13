@@ -263,8 +263,40 @@ impl Asm {
         self.code.extend(imm.to_le_bytes());
     }
 
+    pub fn store_slot_reloc(&mut self, dst: Mem) -> u32 {
+        self.encode(&[], true, &[0xC7], 0, dst.into(), false);
+        let at = self.pos();
+        self.code.extend(0_u32.to_le_bytes());
+        at
+    }
+
     pub fn mov(&mut self, dst: Reg, src: Reg) {
         self.encode(&[], true, &[0x8B], dst as u8, src.into(), false);
+    }
+
+    pub fn mov_slot_reloc(&mut self, dst: Reg) -> u32 {
+        let reg = dst as u8;
+        self.rex(false, 0, reg, false);
+        self.code.push(0xB8 + (reg & 7));
+        let at = self.pos();
+        self.code.extend(0_u32.to_le_bytes());
+        at
+    }
+
+    pub fn mov_abs64(&mut self, dst: Reg) -> u32 {
+        let reg = dst as u8;
+        self.rex(true, 0, reg, false);
+        self.code.push(0xB8 + (reg & 7));
+        let at = self.pos();
+        self.code.extend(0_u64.to_le_bytes());
+        at
+    }
+
+    pub fn mov_abs64_val(&mut self, dst: Reg, val: u64) {
+        let reg = dst as u8;
+        self.rex(true, 0, reg, false);
+        self.code.push(0xB8 + (reg & 7));
+        self.code.extend(val.to_le_bytes());
     }
 
     pub fn mov_imm(&mut self, dst: Reg, imm: i64) {
@@ -446,8 +478,19 @@ impl Asm {
         self.code.extend(at.to_le_bytes());
     }
 
+    pub fn call_slot_reloc(&mut self) -> u32 {
+        self.code.extend([0xFF, 0x14, 0x25]);
+        let at = self.pos();
+        self.code.extend(0_u32.to_le_bytes());
+        at
+    }
+
     pub fn call(&mut self, reg: Reg) {
         self.encode(&[], false, &[0xFF], 2, reg.into(), false);
+    }
+
+    pub fn jmp_reg(&mut self, reg: Reg) {
+        self.encode(&[], false, &[0xFF], 4, reg.into(), false);
     }
 
     pub fn bytes(&mut self, bytes: &[u8]) {
