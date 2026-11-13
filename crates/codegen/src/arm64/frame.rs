@@ -1,6 +1,6 @@
 use super::asm::Reg;
 use crate::frame::{returns, round};
-use crate::ir::{ArgumentPurpose, Signature, Type};
+use crate::ir::{ArgumentPurpose, CallConv, Signature, Type};
 
 const INT_ARGS: [Reg; 8] = [Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7)];
 const FLOAT_ARGS: u8 = 8;
@@ -69,11 +69,11 @@ impl Counter {
                     self.stack(16)
                 }
             }
-            Type::F32 | Type::F64 if self.float < FLOAT_ARGS => {
+            Type::F32 | Type::F64 | Type::V128 if self.float < FLOAT_ARGS => {
                 self.float += 1;
                 Loc::Float(self.float - 1)
             }
-            _ if !ty.is_float() && self.int < INT_ARGS.len() => {
+            _ if !ty.is_float() && ty != Type::V128 && self.int < INT_ARGS.len() => {
                 self.int += 1;
                 Loc::Int(INT_ARGS[self.int - 1])
             }
@@ -86,5 +86,6 @@ impl Counter {
 pub(super) fn classify(signature: &Signature, packing: Packing) -> Result<Abi, String> {
     let mut params = Counter { int: 0, float: 0, stack: 0, packing };
     let placed = signature.params.iter().map(|param| params.param(param.purpose, param.value_type)).collect::<Result<_, _>>()?;
-    Ok(Abi { params: placed, returns: returns(signature, INT_RETURNS, FLOAT_RETURNS)?, stack: round(params.stack, 16) })
+    let ints: &[Reg] = if signature.call_conv == CallConv::Internal { &INT_ARGS[..4] } else { &INT_RETURNS };
+    Ok(Abi { params: placed, returns: returns(signature, ints, FLOAT_RETURNS)?, stack: round(params.stack, 16) })
 }

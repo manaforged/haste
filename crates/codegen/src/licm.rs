@@ -95,9 +95,6 @@ fn hoist(func: &mut Function, each: &Loop, entry: Block, home: &mut [Option<Bloc
         clobbers(op) || matches!(op, Op::Store(..) | Op::StackStore(..))
     });
     let calls = (0..func.blocks.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts).any(|inst| matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. }));
-    if calls {
-        return;
-    }
     let mut moved: Vec<Inst> = Vec::new();
     for block in (0..func.blocks.len()).filter(|block| each.body[*block]) {
         let head = block == each.head.index();
@@ -105,7 +102,9 @@ fn hoist(func: &mut Function, each: &Loop, entry: Block, home: &mut [Option<Bloc
         let mut kept = Vec::with_capacity(insts.len());
         for inst in insts {
             let data = &func.insts[inst.index()];
-            let movable = speculable(&data.op) || (head && !writes && matches!(data.op, Op::Load(..)));
+            let static_loc = matches!(data.op, Op::StackAddr(..) | Op::SlotAddr(_))
+                || (matches!(data.op, Op::Const(_)) && data.result.is_none_or(|result| !func.ty(result).is_float()));
+            let movable = (speculable(&data.op) && !(calls && static_loc)) || (head && !writes && !calls && matches!(data.op, Op::Load(..)));
             let invariant = |value: Value| home[value.index()].is_none_or(|at| !each.body[at.index()]);
             let mut operands_invariant = true;
             data.op.for_operands(|value| operands_invariant &= invariant(value));

@@ -10,7 +10,7 @@ mod wide;
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
-use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, Step, arg_steps, drive, edge_steps, emit_body, prepare, save_offset};
+use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset};
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
@@ -356,22 +356,76 @@ impl Emit<'_> {
     }
 
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {
-        for (value, loc) in values.iter().zip(self.abi.returns.clone()) {
-            self.load_loc(*value, loc);
-        }
+        let returns = self.abi.returns.clone();
+        self.move_locs(values, &returns);
         self.epilogue();
         Ok(())
     }
 
-    fn load_loc(&mut self, value: Value, loc: Loc) {
-        match loc {
-            Loc::Int(reg) => self.raw(reg, value),
-            Loc::Pair(low, high) => {
-                self.raw(low, value);
-                self.high(high, value);
+    fn move_locs(&mut self, values: &[Value], locs: &[Loc]) {
+        let float_targets: Vec<(Value, u8)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Float(v) = loc { Some((val, v)) } else { None }).collect();
+        for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
+            match step {
+                ArgStep::Move(src, dst) => self.asm.vmov(Vreg(dst), Vreg(src)),
+                ArgStep::Save(src) => {
+                    self.asm.add_imm(true, false, Size::X, SP, SP, 16);
+                    self.asm.vstore(16, Mem::new(SP, 0), Vreg(src));
+                }
+                ArgStep::Restore(dst) => {
+                    self.asm.vload(16, Vreg(dst), Mem::new(SP, 0));
+                    self.asm.add_imm(false, false, Size::X, SP, SP, 16);
+                }
+                ArgStep::Load(val, dst) => self.fget(Vreg(dst), val),
             }
-            Loc::Float(index) => self.fget(Vreg(index), value),
-            Loc::Stack(_) | Loc::Struct(..) => {}
+        }
+        let int_targets: Vec<(Value, Reg)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Int(reg) = loc { Some((val, reg)) } else { None }).collect();
+        for step in arg_steps(&int_targets, |v| self.plan.reg_of(v)) {
+            match step {
+                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
+                ArgStep::Save(src) => self.asm.mov(A, src),
+                ArgStep::Restore(dst) => self.asm.mov(dst, A),
+                ArgStep::Load(val, dst) => self.raw(dst, val),
+            }
+        }
+        for (&val, &loc) in values.iter().zip(locs) {
+            if let Loc::Pair(low, high) = loc {
+                self.raw(low, val);
+                self.high(high, val);
+            }
+        }
+    }
+
+    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
+        let mut float_pairs = Vec::new();
+        let mut int_pairs = Vec::new();
+        for (&value, &loc) in values.iter().zip(locs) {
+            match (loc, self.plan.location(value)) {
+                (Loc::Float(src), Location::Float(dst)) => float_pairs.push((src, dst)),
+                (Loc::Int(src), Location::Reg(dst)) => int_pairs.push((src, dst)),
+                _ => self.store_loc(value, loc),
+            }
+        }
+        for step in reg_steps(float_pairs) {
+            match step {
+                ArgStep::Move(src, dst) => self.asm.vmov(Vreg(dst), Vreg(src)),
+                ArgStep::Save(src) => {
+                    self.asm.add_imm(true, false, Size::X, SP, SP, 16);
+                    self.asm.vstore(16, Mem::new(SP, 0), Vreg(src));
+                }
+                ArgStep::Restore(dst) => {
+                    self.asm.vload(16, Vreg(dst), Mem::new(SP, 0));
+                    self.asm.add_imm(false, false, Size::X, SP, SP, 16);
+                }
+                ArgStep::Load(..) => {}
+            }
+        }
+        for step in reg_steps(int_pairs) {
+            match step {
+                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
+                ArgStep::Save(src) => self.asm.mov(A, src),
+                ArgStep::Restore(dst) => self.asm.mov(dst, A),
+                ArgStep::Load(..) => {}
+            }
         }
     }
 
@@ -419,30 +473,7 @@ impl Emit<'_> {
         } else {
             T
         };
-        let float_targets: Vec<(Value, u8)> = args.iter().zip(&abi.params).filter_map(|(&arg, &loc)| if let Loc::Float(v) = loc { Some((arg, v)) } else { None }).collect();
-        for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
-            match step {
-                ArgStep::Move(src, dst) => self.asm.fmov_reg(true, Vreg(dst), Vreg(src)),
-                ArgStep::Save(src) => self.asm.fmov_out(true, A, Vreg(src)),
-                ArgStep::Restore(dst) => self.asm.fmov_in(true, Vreg(dst), A),
-                ArgStep::Load(val, dst) => self.fget(Vreg(dst), val),
-            }
-        }
-        let int_targets: Vec<(Value, Reg)> = args.iter().zip(&abi.params).filter_map(|(&arg, &loc)| if let Loc::Int(reg) = loc { Some((arg, reg)) } else { None }).collect();
-        for step in arg_steps(&int_targets, |v| self.plan.reg_of(v)) {
-            match step {
-                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
-                ArgStep::Save(src) => self.asm.mov(A, src),
-                ArgStep::Restore(dst) => self.asm.mov(dst, A),
-                ArgStep::Load(val, dst) => self.raw(dst, val),
-            }
-        }
-        for (&arg, &loc) in args.iter().zip(&abi.params) {
-            if let Loc::Pair(low, high) = loc {
-                self.raw(low, arg);
-                self.high(high, arg);
-            }
-        }
+        self.move_locs(args, &abi.params);
         match direct {
             Some(CallTarget::Slot(sym)) if self.direct_calls => {
                 let at = self.asm.bl_reloc();
@@ -474,9 +505,7 @@ impl Emit<'_> {
             self.plan.locations[value.index()] = Location::Slot;
         }
         let abi = self.arguments(sig, callee, args)?;
-        for (value, loc) in results.iter().zip(abi.returns) {
-            self.store_loc(*value, loc);
-        }
+        self.store_locs(results, &abi.returns);
         for (value, reg, lives) in parked {
             if lives {
                 let home = self.at(value);

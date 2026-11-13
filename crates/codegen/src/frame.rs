@@ -42,15 +42,15 @@ pub(crate) fn round(value: u32, to: u32) -> u32 {
     value.div_ceil(to) * to
 }
 
-pub(crate) fn returns<R: Copy>(signature: &Signature, ints: [R; 2], floats: u8) -> Result<Vec<Loc<R>>, String> {
+pub(crate) fn returns<R: Copy>(signature: &Signature, ints: &[R], floats: u8) -> Result<Vec<Loc<R>>, String> {
     let (mut int, mut float) = (0, 0);
     let place = |ty: Type| match ty {
-        Type::F32 | Type::F64 if float < floats => {
+        Type::F32 | Type::F64 | Type::V128 if float < floats => {
             float += 1;
             Ok(Loc::Float(float - 1))
         }
         Type::I128 if int == 0 => {
-            int = ints.len();
+            int = 2;
             Ok(Loc::Pair(ints[0], ints[1]))
         }
         Type::I8 | Type::I16 | Type::I32 | Type::I64 if int < ints.len() => {
@@ -110,17 +110,9 @@ enum RegSrc<T> {
     Saved,
 }
 
-pub(crate) fn arg_steps<T: Copy + PartialEq>(targets: &[(Value, T)], current: impl Fn(Value) -> Option<T>) -> Vec<ArgStep<T>> {
-    let mut reg_moves: Vec<(RegSrc<T>, T)> = Vec::new();
-    let mut loads: Vec<(Value, T)> = Vec::new();
-    for &(val, dst) in targets {
-        match current(val) {
-            Some(src) if src == dst => {}
-            Some(src) => reg_moves.push((RegSrc::Reg(src), dst)),
-            None => loads.push((val, dst)),
-        }
-    }
-    let mut steps = Vec::with_capacity(reg_moves.len() + loads.len());
+pub(crate) fn reg_steps<T: Copy + PartialEq>(pairs: impl IntoIterator<Item = (T, T)>) -> Vec<ArgStep<T>> {
+    let mut reg_moves: Vec<(RegSrc<T>, T)> = pairs.into_iter().filter(|(src, dst)| src != dst).map(|(src, dst)| (RegSrc::Reg(src), dst)).collect();
+    let mut steps = Vec::with_capacity(reg_moves.len() + 1);
     while !reg_moves.is_empty() {
         let blocked = |at: usize| reg_moves.iter().enumerate().any(|(other, &(s, _))| other != at && matches!(s, RegSrc::Reg(r) if r == reg_moves[at].1));
         if let Some(at) = (0..reg_moves.len()).find(|&at| !blocked(at)) {
@@ -134,6 +126,19 @@ pub(crate) fn arg_steps<T: Copy + PartialEq>(targets: &[(Value, T)], current: im
         steps.push(ArgStep::Save(src));
         reg_moves[at].0 = RegSrc::Saved;
     }
+    steps
+}
+
+pub(crate) fn arg_steps<T: Copy + PartialEq>(targets: &[(Value, T)], current: impl Fn(Value) -> Option<T>) -> Vec<ArgStep<T>> {
+    let mut pairs = Vec::new();
+    let mut loads = Vec::new();
+    for &(val, dst) in targets {
+        match current(val) {
+            Some(src) => pairs.push((src, dst)),
+            None => loads.push((val, dst)),
+        }
+    }
+    let mut steps = reg_steps(pairs);
     steps.extend(loads.into_iter().map(|(val, dst)| ArgStep::Load(val, dst)));
     steps
 }

@@ -38,6 +38,7 @@ pub(crate) fn shapes(cx: &mut Context<'_>, (params, ret): (&[Ty], Option<Ty>), c
         }
         let arity = match passed_parts(cx, param)? {
             Some(Parts::Pair(..)) => 2,
+            Some(Parts::Words(_, len)) => len,
             _ => 1,
         };
         match carry {

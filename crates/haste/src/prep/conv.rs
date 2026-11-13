@@ -123,6 +123,7 @@ fn haste_pass(cx: &mut Context<'_>, ty: Ty) -> Option<Haste> {
         Repr::Mem { .. } => match passed_parts(cx, ty).ok()? {
             Some(Parts::One(machine)) => Haste::One(machine),
             Some(Parts::Pair(first, second, offset)) => Haste::Two(first, second, offset),
+            Some(Parts::Words(..)) => return None,
             Some(Parts::Bytes) | None => Haste::Address,
         },
     })

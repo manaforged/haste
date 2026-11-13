@@ -577,10 +577,14 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
     drop_params(func, &fold);
     for block in &func.blocks {
         for inst in &block.insts {
-            let data = &mut func.insts[inst.index()];
-            data.op.map_operands(|value| fold.find(value));
-            if let Some(imm) = data.result.and_then(|result| fold.consts[result.index()]) {
-                data.op = Op::Const(imm);
+            func.insts[inst.index()].op.map_operands(|value| fold.find(value));
+            let replacement = match func.insts[inst.index()].op {
+                Op::Binary(Binary::Fmul, x, y) if is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
+                Op::Binary(Binary::Fmul, x, y) if is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
+                _ => func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const),
+            };
+            if let Some(op) = replacement {
+                func.insts[inst.index()].op = op;
             }
         }
     }
@@ -589,6 +593,16 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
     if fold.thread(func, &pinned) | fold.branches(func) {
         prune(func, entry);
         dead(func);
+    }
+}
+
+fn is_float_two(func: &Function, defs: &[Option<Inst>], value: Value) -> bool {
+    let Some(inst) = defs[value.index()] else { return false };
+    let Op::Const(imm) = func.insts[inst.index()].op else { return false };
+    match func.ty(value) {
+        Type::F64 => imm as u64 == 0x4000_0000_0000_0000,
+        Type::F32 => imm as u32 == 0x4000_0000,
+        _ => false,
     }
 }
 

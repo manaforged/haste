@@ -93,6 +93,8 @@ pub(super) struct Lookups {
     pub(super) impl_traits: Table<impls::ImplRef, Option<ItemRef>>,
     pub(super) selections: Table<(ItemRef, ty::Ty, super::substs::Substs), Option<(impls::ImplRef, super::substs::Substs)>>,
     pub(super) projections: Table<(ItemRef, ty::Ty, super::substs::Substs, crate::names::Sym, super::substs::Substs), Option<ty::Ty>>,
+    pub(super) trait_calls: Table<(ItemRef, super::substs::Substs), infer::Res>,
+    pub(super) assoc_types: Table<(ItemRef, ty::Ty, super::substs::Substs, ItemRef, super::substs::Substs), ty::Ty>,
     pub(super) summaries: table::Flight<ItemRef, summary::SummaryKind>,
     pub(super) has_new_sysroot_summaries: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
@@ -178,6 +180,8 @@ impl Lookups {
                 *write_lock(&self.state.primitives) = None;
                 self.sysroot_index = Arc::new(std::sync::OnceLock::new());
             }
+            self.trait_calls.clear();
+            self.assoc_types.clear();
             *guard = loaded;
         }
     }
@@ -303,6 +307,8 @@ impl Lookups {
         self.trait_defs.retain(|item, _| !mine(*item));
         self.selections.clear();
         self.projections.clear();
+        self.trait_calls.clear();
+        self.assoc_types.clear();
         self.summaries = table::Flight::default();
         self.discriminants.retain(|item, _| !mine(*item));
         let mut langs = write_lock(&self.state.langs);

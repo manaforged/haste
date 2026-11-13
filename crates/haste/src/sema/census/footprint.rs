@@ -323,6 +323,7 @@ fn hash_header(cx: &mut Context<'_>, item: ItemRef, typed: &Typed, bins: &mut Ha
             lower::Parts::One(_) => 1,
             lower::Parts::Pair(..) => 2,
             lower::Parts::Bytes => 3,
+            lower::Parts::Words(_, len) => 3 + len,
         }));
     }
     if let Some(ret) = typed.ret {

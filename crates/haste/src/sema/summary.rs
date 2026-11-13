@@ -381,8 +381,10 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
         let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
         let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
         (inst, locals, ret, layouts, drop_tys)
+    } else if let Some(cached) = try_cached_instantiate(cx, instance, summary) {
+        cached
     } else {
-        let Ok(built) = super::infer::detached(cx, instance.0, |infer| {
+        let Ok(built) = super::infer::detached_summary(cx, instance.0, |infer| {
             let mut sub = SubState::new(&concrete_args);
             eval_projections(infer, &mut sub, &summary.projections)?;
             let call_overrides = check_obligations(infer, &mut sub, &summary.obligations)?;
@@ -492,6 +494,50 @@ fn lay_out_instantiated(cx: &mut Context<'_>, layouts: &[Ty], typed: &Typed) -> 
     Ok(())
 }
 
+fn try_cached_instantiate(cx: &Context<'_>, instance: Instance, summary: &Arc<PolySummary>) -> Option<(PolyInst, Vec<Local>, Option<Ty>, Vec<Ty>, Vec<Ty>)> {
+    if !summary.projections.is_empty()
+        || !summary.op_holes.is_empty()
+        || !summary.const_holes.is_empty()
+        || !summary.template.closures.is_empty()
+        || summary.obligations.iter().any(|ob| matches!(ob, PolyObligation::Call { .. }))
+    {
+        return None;
+    }
+    let mut inst = PolyInst {
+        args: instance.1,
+        summary: Arc::clone(summary),
+        projs: Box::new([]),
+        resolved_calls: Box::new([]),
+        builtin_ops: Box::new([]),
+        call_overrides: Box::new([]),
+        offset_overrides: Box::new([]),
+        materialized: OnceLock::new(),
+    };
+    for ob in &summary.obligations {
+        let PolyObligation::Prove { of, self_ty, args } = *ob else { return None };
+        let concrete_self = inst.sub_ty(&cx.types, self_ty);
+        let concrete_args = inst.sub_substs(&cx.types, args);
+        let Some(Some(_)) = cx.store.lookups.selections.get(&(of, concrete_self, concrete_args)) else {
+            return None;
+        };
+    }
+    let mut resolved = Vec::with_capacity(summary.call_holes.len());
+    for &(key, item, substs) in &summary.call_holes {
+        let mapped = inst.sub_substs(&cx.types, substs);
+        let cached = cx.store.lookups.trait_calls.get(&(item, mapped))?;
+        if let Res::Fn(ri, rs) = cached {
+            resolved.push((key, ri, rs));
+        }
+    }
+    resolved.sort_unstable_by_key(|&(key, ..)| key);
+    inst.resolved_calls = resolved.into_boxed_slice();
+    let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
+    let ret = summary.ret.map(|ty| inst.sub_ty(&cx.types, ty));
+    let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
+    let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
+    Some((inst, locals, ret, layouts, drop_tys))
+}
+
 fn eval_projections(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, projections: &[ProjId]) -> Result<()> {
     for &proj_id in projections {
         eval_one_proj(infer, sub, proj_id)?;
@@ -507,12 +553,29 @@ fn eval_one_proj(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, proj_id: Pro
     let self_ty = sub_ty(infer, sub, def.self_ty)?;
     let trait_args = sub_substs_vec(infer, sub, def.args)?;
     let own_args = sub_substs_vec(infer, sub, def.own)?;
+    let trait_substs = infer.cx.types.intern_substs(&trait_args);
+    let own_substs = infer.cx.types.intern_substs(&own_args);
+    let cacheable = !infer.has_vars(self_ty)
+        && !infer.cx.types.has_params(self_ty)
+        && !infer.cx.types.substs_have_params(trait_substs)
+        && !infer.cx.types.substs(trait_substs).iter().any(|&ty| infer.has_vars(ty))
+        && !infer.cx.types.substs_have_params(own_substs)
+        && !infer.cx.types.substs(own_substs).iter().any(|&ty| infer.has_vars(ty));
+    let key = (def.of, self_ty, trait_substs, def.assoc, own_substs);
+    if cacheable && let Some(cached) = infer.cx.store.lookups.assoc_types.get(&key) {
+        sub.projs.insert(proj_id, cached);
+        return Ok(cached);
+    }
+    let before = infer.cx.quiet_mark();
     let name = infer.cx.name(def.assoc).to_string();
     let Some(value) = infer.picked_alias(def.of, self_ty, &trait_args, (&name, &own_args))? else { bail!("unnormalized projection `{name}` on {}", infer.show(self_ty)) };
     infer.settle_projections()?;
     let zonked = infer.zonk(value);
     if infer.cx.types.has_params(zonked) || infer.has_vars(zonked) || matches!(infer.cx.types.kind(zonked), Kind::Never) {
         bail!("projection `{name}` did not resolve to a concrete type");
+    }
+    if cacheable && infer.cx.quiet_mark() == before {
+        infer.cx.store.lookups.assoc_types.insert(key, zonked);
     }
     sub.projs.insert(proj_id, zonked);
     Ok(zonked)

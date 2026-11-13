@@ -170,6 +170,19 @@ impl Infer<'_, '_> {
 
     /// The impl member that a call of trait item `item` at `substs` runs, once `Self` is known, or the trait item itself when `Self` is a trait object that dispatches it.
     pub(in crate::sema) fn trait_call(&mut self, item: ItemRef, substs: Substs) -> Result<Res> {
+        let cacheable = !self.cx.types.substs_have_params(substs) && !self.cx.types.substs(substs).iter().any(|&ty| self.has_vars(ty));
+        if cacheable && let Some(cached) = self.cx.store.lookups.trait_calls.get(&(item, substs)) {
+            return Ok(cached);
+        }
+        let before = self.cx.quiet_mark();
+        let res = self.compute_trait_call(item, substs)?;
+        if cacheable && self.cx.quiet_mark() == before {
+            self.cx.store.lookups.trait_calls.insert((item, substs), res.clone());
+        }
+        Ok(res)
+    }
+
+    fn compute_trait_call(&mut self, item: ItemRef, substs: Substs) -> Result<Res> {
         let Some(of) = self.cx.owner_trait(item) else { return Ok(Res::Fn(item, substs)) };
         let slice = self.cx.types.substs(substs).to_vec();
         let count = 1 + type_params(&self.cx.trait_generics(of)?.1.params).count();

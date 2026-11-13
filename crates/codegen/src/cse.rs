@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::dom::dominated;
-use crate::ir::{Binary, Block, Convert, Function, Inst, Op, StackSlot, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, FloatCC, Function, Inst, IntCC, Op, StackSlot, Type, Unary, Value};
 use crate::merge::{find, identity, rename};
 
 /// What a pure instruction computes, by its operation and the values it reads.
@@ -11,6 +11,9 @@ enum Key {
     Unary(Unary, Value),
     Binary(Binary, Value, Value),
     Convert(Convert, Type, Value),
+    Icmp(IntCC, Type, Value, Value),
+    Fcmp(FloatCC, Type, Value, Value),
+    Splat(Type, Value),
     Select(Value, Value, Value),
     StackAddr(StackSlot, i32),
     SlotAddr(u32),
@@ -18,13 +21,22 @@ enum Key {
 }
 
 /// The key of `op` with result type `ty` and its operands replaced by `subst`, when it reads no memory and has no effect.
-fn key(op: &Op, ty: Type, subst: &[Value]) -> Option<Key> {
+fn key(op: &Op, types: &[Type], ty: Type, subst: &[Value]) -> Option<Key> {
     let f = |value: Value| find(subst, value);
     Some(match *op {
         Op::Const(imm) => Key::Const(ty, imm),
         Op::Unary(op, x) => Key::Unary(op, f(x)),
         Op::Binary(op, x, y) => Key::Binary(op, f(x), f(y)),
         Op::Convert(op, x) => Key::Convert(op, ty, f(x)),
+        Op::Icmp(cc, x, y) => {
+            let (x, y) = (f(x), f(y));
+            Key::Icmp(cc, types[x.index()], x, y)
+        }
+        Op::Fcmp(cc, x, y) => {
+            let (x, y) = (f(x), f(y));
+            Key::Fcmp(cc, types[x.index()], x, y)
+        }
+        Op::Splat(x) => Key::Splat(ty, f(x)),
         Op::Select(c, x, y) => Key::Select(f(c), f(x), f(y)),
         Op::StackAddr(slot, offset) => Key::StackAddr(slot, offset),
         Op::SlotAddr(sym) => Key::SlotAddr(sym),
@@ -50,7 +62,7 @@ impl Table {
             .filter(|inst| {
                 let data = &func.insts[inst.index()];
                 let Some(result) = data.result else { return true };
-                let Some(key) = key(&data.op, func.ty(result), subst) else { return true };
+                let Some(key) = key(&data.op, &func.types, func.ty(result), subst) else { return true };
                 match self.known.get(&key) {
                     Some(&earlier) => {
                         subst[result.index()] = earlier;

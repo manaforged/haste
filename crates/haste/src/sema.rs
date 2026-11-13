@@ -79,12 +79,14 @@ impl<'a> Context<'a> {
         &self.store
     }
 
-    /// Drops cached `finals`, `summaries`, `selections`, and `projections` to cut RSS before one-shot codegen.
+    /// Drops cached `finals`, `summaries`, `selections`, `projections`, `trait_calls`, and `assoc_types` to cut RSS before one-shot codegen.
     pub(crate) fn compact_for_oneshot_codegen(&mut self) {
         self.store.finals.clear();
         self.store.lookups.summaries = table::Flight::default();
         self.store.lookups.selections.clear();
         self.store.lookups.projections.clear();
+        self.store.lookups.trait_calls.clear();
+        self.store.lookups.assoc_types.clear();
     }
 
     /// A pass over an outline and its resolved names that reuses `store`.

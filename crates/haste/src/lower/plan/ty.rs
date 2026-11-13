@@ -104,6 +104,14 @@ pub(super) fn hash_parts(mix: &mut HashMix, p: Parts) {
             mix.byte(type_code(b));
             mix.i32(off);
         }
+        Parts::Words(words, len) => {
+            mix.byte(4);
+            mix.byte(len);
+            for &(ty, off) in &words[..usize::from(len)] {
+                mix.byte(type_code(ty));
+                mix.i32(off);
+            }
+        }
         Parts::Bytes => mix.byte(3),
     }
 }

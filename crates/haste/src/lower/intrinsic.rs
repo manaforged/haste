@@ -169,14 +169,14 @@ impl Lower<'_, '_> {
                     self.ins().stack_store(sel, slot, at);
                 };
                 match parts {
-                    super::Parts::One(m) => pick(m, 0),
-                    super::Parts::Pair(m0, m1, off1) => {
-                        pick(m0, 0);
-                        pick(m1, off1);
-                    }
                     super::Parts::Bytes => {
                         let chosen = self.ins().select(cond, yes, no);
                         self.copy(out, chosen, whole);
+                    }
+                    other => {
+                        for (m, at) in other.scalars() {
+                            pick(m, at);
+                        }
                     }
                 }
                 Ok(Some(out))

@@ -116,15 +116,23 @@ pub enum Parts {
     Bytes,
     One(Type),
     Pair(Type, Type, i32),
+    Words([(Type, i32); 4], u8),
 }
 
 impl Parts {
     /// Each scalar's machine type and byte offset.
     pub fn scalars(self) -> impl Iterator<Item = (Type, i32)> {
         let list = match self {
-            Parts::Bytes => [None, None],
-            Parts::One(ty) => [Some((ty, 0)), None],
-            Parts::Pair(first, second, offset) => [Some((first, 0)), Some((second, offset))],
+            Parts::Bytes => [None; 4],
+            Parts::One(ty) => [Some((ty, 0)), None, None, None],
+            Parts::Pair(first, second, offset) => [Some((first, 0)), Some((second, offset)), None, None],
+            Parts::Words(words, len) => {
+                let mut out = [None; 4];
+                for (slot, &word) in out.iter_mut().zip(&words[..usize::from(len)]) {
+                    *slot = Some(word);
+                }
+                out
+            }
         };
         list.into_iter().flatten()
     }
@@ -161,11 +169,16 @@ pub fn repr(cx: &mut Context<'_>, ty: Ty) -> Result<Repr> {
     Ok(if size == 0 { Repr::Zst } else { Repr::Mem { size, align: layout.align.bytes().trailing_zeros() as u8, parts: abi::copied_parts(&layout) } })
 }
 
+fn is_repr_c(cx: &Context<'_>, ty: Ty) -> bool {
+    matches!(cx.types.kind(ty), Kind::Adt(def, _) if cx.repr(*def).flags.contains(rustc_abi::ReprFlags::IS_C))
+}
+
 /// The scalars that a memory value of `ty` crosses an internal call in, one register each, or none when it travels by address.
 pub fn passed_parts(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
     Ok(match repr(cx, ty)? {
         Repr::Mem { parts: parts @ Parts::One(_), .. } => Some(parts),
         Repr::Mem { parts: parts @ Parts::Pair(first, second, _), .. } if first != Type::I128 && second != Type::I128 => Some(parts),
+        Repr::Mem { parts: parts @ Parts::Words(..), .. } if !is_repr_c(cx, ty) => Some(parts),
         _ => None,
     })
 }
@@ -177,7 +190,7 @@ pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
 
 /// The native signature of a function that returns `ret` and takes `params`.
 pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIterator<Item = Ty>) -> Result<Signature> {
-    let mut signature = Signature::new(CallConv::Native);
+    let mut signature = Signature::new(CallConv::Internal);
     if let Some(ret) = ret {
         match repr(cx, ret)? {
             Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),

@@ -726,3 +726,25 @@ pub(crate) fn detached<T>(cx: &mut Context<'_>, item: ItemRef, run: impl FnOnce(
     let mut infer = Infer::start(cx, (&body, &sig, src), home);
     run(&mut infer)
 }
+
+pub(super) fn detached_summary<T>(cx: &mut Context<'_>, item: ItemRef, run: impl FnOnce(&mut Infer<'_, '_>) -> Result<T>) -> Result<T> {
+    static EMPTY_BODY: std::sync::OnceLock<Body> = std::sync::OnceLock::new();
+    static EMPTY_SIG: std::sync::OnceLock<Signature> = std::sync::OnceLock::new();
+    static EMPTY_SRC: std::sync::OnceLock<crate::outline::source::Source> = std::sync::OnceLock::new();
+    let body = EMPTY_BODY.get_or_init(Body::default);
+    let sig = EMPTY_SIG.get_or_init(Signature::default);
+    let src = EMPTY_SRC.get_or_init(|| crate::outline::source::Source {
+        path: std::path::PathBuf::new(),
+        text: String::new(),
+        tokens: Vec::new(),
+        marks: Vec::new(),
+        opaque: Vec::new(),
+        base: None,
+        offset: 0,
+        outputs: Default::default(),
+        origins: crate::outline::source::Origins::Read,
+    });
+    let home = ModRef { krate: item.krate, module: 0 };
+    let mut infer = Infer::start(cx, (body, sig, src), home);
+    run(&mut infer)
+}

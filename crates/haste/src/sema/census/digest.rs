@@ -251,6 +251,14 @@ pub(super) fn hash_repr(repr: &Repr, mix: &mut Mix) {
                     mix.byte(b as u8);
                     mix.i32(off);
                 }
+                Parts::Words(words, len) => {
+                    mix.byte(3);
+                    mix.byte(len);
+                    for &(ty, off) in &words[..usize::from(len)] {
+                        mix.byte(ty as u8);
+                        mix.i32(off);
+                    }
+                }
             }
         }
     }

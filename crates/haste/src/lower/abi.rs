@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{AbiParam, ArgumentPurpose, CallConv, Signature, Type, Value};
+use haste_codegen::{AbiParam, Arch, ArgumentPurpose, CallConv, Signature, Target, Type, Value};
 use rustc_abi::{BackendRepr, Float, Primitive, Scalar, TargetDataLayout};
 
 use crate::sema::layout::{Layout, target};
@@ -42,16 +42,44 @@ pub(super) fn parts(layout: &Layout) -> Result<Parts> {
     })
 }
 
-/// The parts that a typed copy of a value of `layout` moves: its scalars, or every byte when both scalars are a union's, whose bytes between them may hold data.
+fn word_parts(size: u64) -> Parts {
+    if !(1..=32).contains(&size) {
+        return Parts::Bytes;
+    }
+    let mut words = [(Type::I8, 0); 4];
+    let mut len = 0usize;
+    let mut offset = 0u64;
+    for (ty, width) in [(Type::I64, 8), (Type::I32, 4), (Type::I16, 2), (Type::I8, 1)] {
+        while offset + width <= size {
+            if len == 4 {
+                return Parts::Bytes;
+            }
+            words[len] = (ty, offset as i32);
+            len += 1;
+            offset += width;
+        }
+    }
+    match len {
+        1 => Parts::One(words[0].0),
+        2 => Parts::Pair(words[0].0, words[1].0, words[1].1),
+        _ => Parts::Words(words, len as u8),
+    }
+}
+
+/// The parts that a typed copy of a value of `layout` moves: its scalars, or contiguous word chunks up to 32 bytes when both scalars are a union's or the layout names none.
 pub(super) fn copied_parts(layout: &Layout) -> Parts {
     match &layout.backend_repr {
-        BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => Parts::Bytes,
+        BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => word_parts(layout.size.bytes()),
         BackendRepr::SimdVector { .. } => match layout.size.bytes() {
             8 => Parts::One(Type::I64),
+            16 if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Parts::One(Type::V128),
             16 => Parts::Pair(Type::I64, Type::I64, 8),
             _ => Parts::Bytes,
         },
-        _ => parts(layout).unwrap_or(Parts::Bytes),
+        _ => match parts(layout).unwrap_or(Parts::Bytes) {
+            Parts::Bytes => word_parts(layout.size.bytes()),
+            found => found,
+        },
     }
 }
 
