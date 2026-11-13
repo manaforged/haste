@@ -33,6 +33,7 @@ pub enum Intrinsic {
     PtrMetadata,
     WithOverflow(BinOp),
     ConstEvalSelect,
+    SelectUnpredictable,
     Trap,
     CallerLocation,
     Cpuid,
@@ -147,7 +148,7 @@ pub enum Atomic {
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
 const LLVM: [(&str, Intrinsic); 3] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32)), ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::BytePairMax)];
 
-const NAMES: [(&str, Intrinsic); 160] = {
+const NAMES: [(&str, Intrinsic); 161] = {
     use Intrinsic::*;
     [
         ("cold_path", NoOp),
@@ -196,6 +197,7 @@ const NAMES: [(&str, Intrinsic); 160] = {
         ("sub_with_overflow", WithOverflow(BinOp::Sub)),
         ("mul_with_overflow", WithOverflow(BinOp::Mul)),
         ("const_eval_select", ConstEvalSelect),
+        ("select_unpredictable", SelectUnpredictable),
         ("abort", Trap),
         ("catch_unwind", CatchUnwind),
         ("unreachable", Trap),

@@ -4,6 +4,7 @@ mod float;
 mod frame;
 mod int;
 mod location;
+mod vector;
 mod wide;
 
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
@@ -37,7 +38,7 @@ const REGS: Regs<Reg> = Regs {
     dict: None,
     float: &float::POOL,
     float_branches: &float::BRANCHES,
-    vectors: false,
+    vectors: true,
     absolute_calls: true,
     two_address: false,
     park: true,
@@ -193,7 +194,12 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 self.trapz(*condition);
                 Ok(())
             }
-            op => self.value_op(op, value),
+            op => {
+                if self.vector_inst(op, value)? {
+                    return Ok(());
+                }
+                self.value_op(op, value)
+            }
         }
     }
 

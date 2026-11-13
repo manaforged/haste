@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -93,6 +94,7 @@ pub(super) struct Lookups {
     pub(super) selections: Table<(ItemRef, ty::Ty, super::substs::Substs), Option<(impls::ImplRef, super::substs::Substs)>>,
     pub(super) projections: Table<(ItemRef, ty::Ty, super::substs::Substs, crate::names::Sym, super::substs::Substs), Option<ty::Ty>>,
     pub(super) summaries: table::Flight<ItemRef, summary::SummaryKind>,
+    pub(super) has_new_sysroot_summaries: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
     pub(super) sysroot_index: Arc<std::sync::OnceLock<Arc<summary::codec::SysrootIndex>>>,
 }
@@ -131,6 +133,7 @@ impl Lookups {
             selections,
             projections,
             summaries: std::mem::take(&mut self.summaries),
+            has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
             substrate: self.substrate.clone(),
             sysroot_index: Arc::clone(&self.sysroot_index),
             ..Lookups::default()
@@ -156,8 +159,8 @@ impl Lookups {
                     impls::Holder::Crate(k) => guard.get(k as usize) == loaded.get(k as usize),
                     impls::Holder::Body(item) => guard.get(item.krate as usize) == loaded.get(item.krate as usize),
                 });
+                self.summaries.retain_keys(|item| guard.get(item.krate as usize) == loaded.get(item.krate as usize));
                 if guard.iter().zip(&loaded).any(|(a, b)| a[3] != b[3]) {
-                    self.summaries.retain_keys(|item| guard.get(item.krate as usize) == loaded.get(item.krate as usize));
                     self.discriminants.retain(|item, _| guard.get(item.krate as usize) == loaded.get(item.krate as usize));
                     self.glues.clear();
                 }
@@ -185,6 +188,11 @@ impl Cache {
     pub fn set_substrate(&mut self, substrate: Option<Arc<crate::substrate::Substrate>>) {
         self.lookups.substrate = substrate;
         self.lookups.sysroot_index = Arc::new(std::sync::OnceLock::new());
+    }
+
+    /// Returns whether any new sysroot `PolySummary` was built in this session.
+    pub fn has_new_sysroot_summaries(&self) -> bool {
+        self.lookups.has_new_sysroot_summaries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the attached frozen sysroot substrate, if any.

@@ -79,9 +79,12 @@ impl<'a> Context<'a> {
         &self.store
     }
 
-    /// Drops all cached final `Typed` bodies from the store to free memory before codegen.
-    pub(crate) fn clear_finals(&mut self) {
+    /// Drops cached `finals`, `summaries`, `selections`, and `projections` to cut RSS before one-shot codegen.
+    pub(crate) fn compact_for_oneshot_codegen(&mut self) {
         self.store.finals.clear();
+        self.store.lookups.summaries = table::Flight::default();
+        self.store.lookups.selections.clear();
+        self.store.lookups.projections.clear();
     }
 
     /// A pass over an outline and its resolved names that reuses `store`.
@@ -253,6 +256,9 @@ impl<'a> Context<'a> {
 
     /// Records what the body that defines the closure type `ty` inferred for it.
     pub fn set_closure(&mut self, ty: ty::Ty, info: infer::ClosureInfo) {
+        if info.typed.exprs.is_empty() && self.store.closures.get(&ty).is_some_and(|cur| !cur.typed.exprs.is_empty()) {
+            return;
+        }
         self.store.closures.insert(ty, Arc::new(info));
     }
 

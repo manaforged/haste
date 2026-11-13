@@ -93,6 +93,9 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
     let ((item, _), Ok(typed)) = &reached.list[index] else {
         return None;
     };
+    if cx.foreign(*item) {
+        return None;
+    }
     let hint = hint(cx, *item);
     if hint != Hint::Always && typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
         return None;

@@ -273,8 +273,44 @@ impl Image {
     fn compile_singleton(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<(), String> {
         let started = std::time::Instant::now();
         let item = reached.list[index].0.0;
+        let tree = &cx.outline.crates[item.krate as usize];
+        let sysroot_frozen = self.mode != ImageMode::Aot && !self.jit_mode && tree.env.release && tree.env.fixed;
+        let footprint = if sysroot_frozen {
+            Some(lower::eval_footprint(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?)
+        } else {
+            None
+        };
+        let substrate = cx.store().substrate().cloned();
+        if let Some(fp) = footprint
+            && let Some(substrate) = substrate.as_ref()
+            && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
+            && let Some(slice) = substrate.stencil(item_key, fp.0)
+        {
+            if self.mode == ImageMode::Check {
+                pass.record_size(index, slice.code().len() as u32, 0);
+                return Ok(());
+            }
+            let symbols: Vec<u64> = if slice.decode_relocs().is_ok_and(|r| r.is_empty()) {
+                Vec::new()
+            } else {
+                let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
+                out.relocs.iter().map(|sym| self.symbol_value(sym)).collect()
+            };
+            if let Ok(patched) = crate::substrate::patch_stencil(&slice, &symbols) {
+                let exec = pass.memory.write(&patched).map_err(|e| item_err(cx, item, e))?;
+                self.publish(index, exec);
+                pass.record_size(index, patched.len() as u32, 0);
+                return Ok(());
+            }
+        }
         let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
-        let code = haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, item, e))?;
+        let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, item, e))?);
+        if let Some(fp) = footprint
+            && code.relocs().iter().all(|r| r.symbol_index().is_some())
+            && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
+        {
+            pass.frozen_stencils.push((item_key, fp.0, Arc::clone(&code)));
+        }
         if self.mode == ImageMode::Jit {
             let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
             let exec = pass.memory.write_patched(&code, &symbols).map_err(|e| item_err(cx, item, e))?;
@@ -285,7 +321,7 @@ impl Image {
             }
         }
         let code_len = code.bytes().len() as u32;
-        self.record_aot(index, AotFn::Direct { code: Arc::new(code), relocs: out.relocs }, &[]);
+        self.record_aot(index, AotFn::Direct { code, relocs: out.relocs }, &[]);
         pass.record_size(index, code_len, started.elapsed().as_nanos() as u64);
         Ok(())
     }
@@ -331,6 +367,22 @@ impl Image {
                 continue;
             }
             let Some((&rep, rest)) = indices.split_first() else { continue };
+            let tree = &cx.outline.crates[item.krate as usize];
+            if self.mode == ImageMode::Check
+                && !cfg.verify
+                && !self.jit_mode
+                && tree.env.release
+                && tree.env.fixed
+                && let Some(substrate) = cx.store().substrate()
+                && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
+                && let Some(slice) = substrate.stencil(item_key, footprint.0)
+            {
+                let len = slice.code().len() as u32;
+                for idx in indices {
+                    pass.record_size(idx, len, 0);
+                }
+                continue;
+            }
             let out = match lower::lower_stencil(cx, reached, self, rep) {
                 Ok(out) => out,
                 Err(err) => {

@@ -155,6 +155,7 @@ impl Emit<'_> {
     pub(super) fn fget(&mut self, reg: Vreg, value: Value) {
         let ty = self.ty(value);
         match self.plan.location(value) {
+            Location::Float(from) if ty == Type::V128 => self.asm.vmov(reg, Vreg(from)),
             Location::Float(from) => self.asm.fmov_reg(ty == Type::F64, reg, Vreg(from)),
             Location::Slot => self.asm.vload(ty.bytes(), reg, self.at(value)),
             _ => {
@@ -167,6 +168,7 @@ impl Emit<'_> {
     pub(super) fn fput(&mut self, value: Value, reg: Vreg) {
         let ty = self.ty(value);
         match self.plan.location(value) {
+            Location::Float(to) if ty == Type::V128 => self.asm.vmov(Vreg(to), reg),
             Location::Float(to) => self.asm.fmov_reg(ty == Type::F64, Vreg(to), reg),
             _ => self.asm.vstore(ty.bytes(), self.at(value), reg),
         }

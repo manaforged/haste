@@ -25,6 +25,7 @@ impl Lower<'_, '_> {
             }
             Intrinsic::PtrMetadata => self.metadata(substs, args),
             Intrinsic::ConstEvalSelect => self.const_eval_select(origin, substs, args),
+            Intrinsic::SelectUnpredictable => self.select_unpredictable(substs, args),
             Intrinsic::WithOverflow(op) => self.with_overflow(op, substs, args).map(Some),
             Intrinsic::Simd(op) => self.simd(op, substs, args),
             Intrinsic::Trap => {
@@ -145,6 +146,42 @@ impl Lower<'_, '_> {
             }
         }
         self.invoke(SiteOrigin::ConstEvalSelect(Box::new(origin.clone())), item, fn_substs, values)
+    }
+
+    fn select_unpredictable(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+        let Some(&ty) = substs.first() else { bail!("select_unpredictable takes one type argument") };
+        let whole = repr(self.cx, ty)?;
+        if whole == Repr::Zst {
+            return Ok(None);
+        }
+        let &[cond, yes, no] = args else { bail!("select_unpredictable takes three arguments") };
+        match whole {
+            Repr::Zst => Ok(None),
+            Repr::Scalar(_) => Ok(Some(self.ins().select(cond, yes, no))),
+            Repr::Mem { .. } => {
+                let parts = super::abi::copied_parts(&*self.cx.layout(ty)?);
+                let Some(slot) = self.slot(whole) else { return Ok(None) };
+                let out = self.ins().stack_addr(Type::I64, slot, 0);
+                let mut pick = |m: Type, at: i32| {
+                    let a = self.ins().load(m, yes, at);
+                    let b = self.ins().load(m, no, at);
+                    let sel = self.ins().select(cond, a, b);
+                    self.ins().stack_store(sel, slot, at);
+                };
+                match parts {
+                    super::Parts::One(m) => pick(m, 0),
+                    super::Parts::Pair(m0, m1, off1) => {
+                        pick(m0, 0);
+                        pick(m1, off1);
+                    }
+                    super::Parts::Bytes => {
+                        let chosen = self.ins().select(cond, yes, no);
+                        self.copy(out, chosen, whole);
+                    }
+                }
+                Ok(Some(out))
+            }
+        }
     }
 
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {

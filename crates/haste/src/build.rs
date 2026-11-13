@@ -142,20 +142,33 @@ impl Batch {
             |mut cx, reached| {
                 let reach_span = reach_clock.elapsed();
                 let codegen_clock = sema::census::Clock::now();
+                let mut pre_builder = if drop_finals && cx.store().has_new_sysroot_summaries() {
+                    substrate_key.map(|(key, target_key)| crate::substrate::Substrate::builder().toolchain_hash(key).target_hash(target_key))
+                } else {
+                    None
+                };
+                if let Some(builder) = &mut pre_builder
+                    && let Err(error) = cx.store().export_sysroot_summaries(cx.outline, builder)
+                {
+                    eprintln!("haste: cannot export sysroot summaries: {error:#}");
+                    pre_builder = None;
+                }
                 if drop_finals {
-                    cx.clear_finals();
+                    cx.compact_for_oneshot_codegen();
                 }
                 let (image, broken) = Image::build(&mut cx, &reached, mode)?;
                 let codegen_span = codegen_clock.elapsed();
                 if let Some((key, target_key)) = substrate_key
-                    && image.has_new_frozen_stencils()
+                    && (image.has_new_frozen_stencils() || pre_builder.is_some())
                 {
-                    let mut builder = crate::substrate::Substrate::builder().toolchain_hash(key).target_hash(target_key);
+                    let mut builder = pre_builder.unwrap_or_else(|| crate::substrate::Substrate::builder().toolchain_hash(key).target_hash(target_key));
                     let save_res = (|| -> Result<()> {
                         if let Some(ex) = &existing_sub {
                             builder.merge_from(ex)?;
                         }
-                        cx.store().export_sysroot_summaries(cx.outline, &mut builder)?;
+                        if !drop_finals {
+                            cx.store().export_sysroot_summaries(cx.outline, &mut builder)?;
+                        }
                         image.export_sysroot_stencils(&mut builder)?;
                         let sub = builder.build()?;
                         if sub.summary_count() > 0 || sub.stencil_count() > 0 {

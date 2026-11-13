@@ -34,6 +34,7 @@ pub(in crate::sema) struct PolyState {
 }
 
 pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
+    let before = cx.quiet_mark();
     if item.declaring_body().is_some() || cx.attr_at(item, "define_opaque").is_some() {
         return SummaryKind::MonomorphicFallback;
     }
@@ -61,7 +62,7 @@ pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, p
         return SummaryKind::MonomorphicFallback;
     }
     let Ok((mut typed, poly, clean)) = infer.finish_poly() else { return SummaryKind::MonomorphicFallback };
-    if !typed.coercions.is_empty() && super::object::fill_drops(cx, &mut typed).is_err() {
+    if cx.quiet_mark() != before || (!typed.coercions.is_empty() && super::object::fill_drops(cx, &mut typed).is_err()) {
         return SummaryKind::MonomorphicFallback;
     }
     finalize_summary(cx, typed, poly, clean, param_count)

@@ -667,7 +667,7 @@ fn finish_closure(cx: &mut Context<'_>, mut typed: Typed, info: &ClosureInfo, en
 
 /// The typed form of `Future::poll` at the coroutine type `ty`: its defining body, resumed with the pinned coroutine and the task context, returning `Poll` of its output.
 pub fn coroutine_typed(cx: &mut Context<'_>, poll: ItemRef, ty: Ty) -> Result<Typed> {
-    let Some(info) = cx.ensure_closure(ty) else { bail!("a coroutine whose defining body was not inferred") };
+    let Some(info) = cx.ensure_full_closure(ty) else { bail!("a coroutine whose defining body was not inferred") };
     let (params, ret) = super::detached(cx, poll, |infer| infer.fn_types(poll, &[ty]))?;
     let mut typed = (*info.typed).clone();
     let first = typed.locals.len() as u32;
@@ -678,7 +678,7 @@ pub fn coroutine_typed(cx: &mut Context<'_>, poll: ItemRef, ty: Ty) -> Result<Ty
 
 /// The typed form of the function that the closure type `ty` runs: its defining body, with an environment parameter and the closure's own parameters.
 pub fn closure_typed(cx: &mut Context<'_>, ty: Ty) -> Result<Typed> {
-    let Some(info) = cx.ensure_closure(ty) else { bail!("a closure whose defining body was not inferred") };
+    let Some(info) = cx.ensure_full_closure(ty) else { bail!("a closure whose defining body was not inferred") };
     let mut typed = (*info.typed).clone();
     let env = cx.closure_takes_env(ty).then(|| {
         typed.locals.push(Local { ty: cx.types.intern(Kind::Ref(Mut::Mut, info.env)) });
@@ -694,6 +694,20 @@ impl<'a> Context<'a> {
         if let Some(info) = self.store.closures.get(&ty) {
             return Some(info);
         }
+        self.infer_closure_owner(ty)?;
+        self.store.closures.get(&ty)
+    }
+
+    /// Returns the finished closure info for `ty` with complete body tables, inferring its defining body if only a signature stub is present.
+    pub fn ensure_full_closure(&mut self, ty: Ty) -> Option<Arc<ClosureInfo>> {
+        if let Some(info) = self.store.closures.get(&ty).filter(|info| !info.typed.exprs.is_empty()) {
+            return Some(info);
+        }
+        self.infer_closure_owner(ty)?;
+        self.store.closures.get(&ty).filter(|info| !info.typed.exprs.is_empty())
+    }
+
+    fn infer_closure_owner(&mut self, ty: Ty) -> Option<()> {
         let Kind::Closure(parent, substs, _) = *self.types.kind(ty) else { return None };
         let reveals = self.store.lookups.reveals.clone();
         reveals
@@ -707,7 +721,7 @@ impl<'a> Context<'a> {
                 },
                 |_| Ok(Ty::NONE),
             )
-            .ok()?;
-        self.store.closures.get(&ty)
+            .ok()
+            .map(|_| ())
     }
 }
