@@ -1,4 +1,4 @@
-use crate::dom::dominators;
+use crate::dom::{dominates, dominators};
 use crate::fold::{evaluate, extend};
 use crate::ir::{Binary, Block, BlockData, Function, Inst, IntCC, Op, Type, Value};
 
@@ -189,16 +189,28 @@ fn unroll_self_dynamic(
             head_defs[r.index()] = true;
         }
     }
+    let outside: Vec<usize> = (0..func.blocks.len())
+        .filter(|&p| p != b && func.successors(Block(p as u32)).any(|t| t == head))
+        .collect();
+    if outside.len() != 1 {
+        return false;
+    }
+    let out_blk = outside[0];
+    if !func.blocks[out_blk].insts.last().is_some_and(|&last| matches!(func.insts[last.index()].op, Op::Jump(..) | Op::Brif(..))) {
+        return false;
+    }
+    let Some(entry) = func.entry else { return false };
+    let (_, _, idom) = dominators(func, entry);
     for ob in 0..func.blocks.len() {
         if ob == b {
             continue;
         }
+        let mut escapes = false;
         for &inst in &func.blocks[ob].insts {
-            let mut escapes = false;
             func.insts[inst.index()].op.for_operands(|v| escapes |= head_defs[v.index()]);
-            if escapes {
-                return false;
-            }
+        }
+        if escapes && (ob == out_blk || !dominates(&idom, head, Block(ob as u32))) {
+            return false;
         }
     }
     let cond_inst = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(cond));
@@ -234,16 +246,6 @@ fn unroll_self_dynamic(
     }
     let Some((iv_idx, stride, bias)) = matched else { return false };
     let factor = if inst_count <= 8 { 4_i64 } else { 2_i64 };
-    let outside: Vec<usize> = (0..func.blocks.len())
-        .filter(|&p| p != b && func.successors(Block(p as u32)).any(|t| t == head))
-        .collect();
-    if outside.len() != 1 {
-        return false;
-    }
-    let out_blk = outside[0];
-    if !func.blocks[out_blk].insts.last().is_some_and(|&last| matches!(func.insts[last.index()].op, Op::Jump(..) | Op::Brif(..))) {
-        return false;
-    }
     let param_tys: Vec<Type> = func.blocks[b].params.iter().map(|&p| func.ty(p)).collect();
     let guard_params: Vec<Value> = param_tys.iter().map(|&ty| func.value(ty)).collect();
     let guard = Block(func.blocks.len() as u32);

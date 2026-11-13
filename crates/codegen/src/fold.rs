@@ -295,6 +295,36 @@ impl Fold {
         }
     }
 
+    fn known_active_bits(&self, func: &Function, val: Value, depth: u32) -> Option<u32> {
+        if depth == 0 {
+            return None;
+        }
+        if self.boolean(func, val) {
+            return Some(1);
+        }
+        match *self.def(func, val)? {
+            Op::Binary(Binary::Ushr, src, s) => {
+                let bits = func.ty(src).bits();
+                let count = (self.known(s)? as u32) & (bits - 1);
+                (count > 0).then_some(bits - count)
+            }
+            Op::Binary(Binary::Band, a, b) => match (self.known_active_bits(func, a, depth - 1), self.known(b)) {
+                (_, Some(mask)) => Some(64 - (extend(mask, func.ty(a), false) as u64).leading_zeros()),
+                (Some(ab), _) => Some(ab),
+                _ => self.known(a).map(|mask| 64 - (extend(mask, func.ty(a), false) as u64).leading_zeros()),
+            },
+            Op::Convert(Convert::Ireduce, src) => {
+                let dst_bits = func.ty(val).bits();
+                Some(self.known_active_bits(func, src, depth - 1).map_or(dst_bits, |b| b.min(dst_bits)))
+            }
+            Op::Convert(Convert::Uextend, src) => {
+                let src_bits = func.ty(src).bits();
+                Some(self.known_active_bits(func, src, depth - 1).map_or(src_bits, |b| b.min(src_bits)))
+            }
+            _ => None,
+        }
+    }
+
     /// `x` when `y` is the unit of `op` at type `ty` or a shift count that masks to zero, or `y` when `x` is the unit of a commuting `op`.
     fn neutral(&self, func: &Function, op: Binary, ty: Type, x: Value, y: Value) -> Option<Value> {
         let is = |value: Value, want: i64| self.known(value).is_some_and(|imm| extend(imm, ty, false) == extend(want, ty, false));
@@ -310,19 +340,12 @@ impl Fold {
         }
         if op == Binary::Band {
             for (val, other) in [(x, y), (y, x)] {
-                if self.boolean(func, val) && self.known(other).is_some_and(|imm| imm & 1 == 1) {
-                    return Some(val);
-                }
-                if let (Some(&Op::Binary(Binary::Ushr, _, s)), Some(mask)) = (self.def(func, val), self.known(other))
-                    && let Some(shift) = self.known(s)
+                if let (Some(active), Some(mask)) = (self.known_active_bits(func, val, 4), self.known(other))
+                    && active < 64
                 {
-                    let bits = ty.bits();
-                    let count = (shift as u32) & (bits - 1);
-                    if count > 0 {
-                        let max_bits = ((1_u128 << (bits - count)) - 1) as u64;
-                        if (extend(mask, ty, false) as u64) & max_bits == max_bits {
-                            return Some(val);
-                        }
+                    let max_bits = if active == 0 { 0 } else { (1_u64 << active) - 1 };
+                    if (extend(mask, ty, false) as u64) & max_bits == max_bits {
+                        return Some(val);
                     }
                 }
             }
@@ -721,7 +744,9 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
             let replacement = match func.insts[inst.index()].op {
                 Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
                 Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
+                Op::Binary(Binary::Isub, x, y) if func.ty(x).is_small_int() && fold.known(x).is_some_and(|imm| extend(imm, func.ty(x), false) == 0) => Some(Op::Unary(Unary::Ineg, y)),
                 Op::Splat(x) if fold.known(x).is_some_and(|imm| (imm as u8) == 0) => Some(Op::Const(0)),
+                Op::Convert(Convert::WidenVec64, x) if is_zero_bits(func, &fold, x) => Some(Op::Const(0)),
                 _ => func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const),
             };
             if let Some(op) = replacement {
@@ -743,6 +768,13 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
     if crate::algebra::fold_bxor_conds(func) {
         dead(func);
     }
+}
+
+fn is_zero_bits(func: &Function, fold: &Fold, val: Value) -> bool {
+    let val = fold.find(val);
+    fold.known(val) == Some(0)
+        || matches!(fold.def(func, val), Some(&Op::Const(0)))
+        || matches!(fold.def(func, val), Some(&Op::Convert(Convert::Bitcast, z)) if fold.known(z) == Some(0) || matches!(fold.def(func, fold.find(z)), Some(&Op::Const(0))))
 }
 
 pub(crate) use crate::thread::compact;
