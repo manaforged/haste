@@ -225,6 +225,7 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         }
         let suits_direct = |s: usize| if needs_saved { pool.is_saved[s] && !wide_val } else { !wide_val || !pool.is_saved[s] };
         let suits_any = |s: usize| suits_direct(s) || (can_park && !pool.is_saved[s]);
+        let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start));
         reserved.clear();
         for &(param, arg) in &back_args {
             if arg != value
@@ -240,7 +241,8 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
             let op_idx = op.index();
             let reg = homes[op_idx]?;
             let s = pool.regs.iter().position(|r| *r == reg)?;
-            if !suits_any(s) || (start == 0 && pool.arrival_lock[s]) || reserved.contains(&reg) {
+            let suits_reuse = if has_free_saved { suits_direct(s) } else { suits_any(s) };
+            if !suits_reuse || (start == 0 && pool.arrival_lock[s]) || reserved.contains(&reg) {
                 return None;
             }
             if !holders[s].iter().all(|&h| h == op_idx || !overlaps(live.ranges_of(h), ranges)) {
@@ -254,7 +256,7 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         {
             chosen = partners[value].iter().filter_map(|p| homes[p.index()]).find_map(|reg| {
                 let s = pool.regs.iter().position(|r| *r == reg)?;
-                let ok = if needs_saved { (pool.is_saved[s] || can_park) && !wide_val } else { !pool.is_saved[s] || (!wide_val && used.contains(&reg)) };
+                let ok = if needs_saved { (pool.is_saved[s] || (can_park && !has_free_saved)) && !wide_val } else { !pool.is_saved[s] || (!wide_val && used.contains(&reg)) };
                 (ok && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start)).then_some(s)
             });
         }

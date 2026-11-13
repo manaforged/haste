@@ -556,6 +556,26 @@ impl Asm {
         }
     }
 
+    fn pair_offset(&mut self, base: u32, a: u8, b: u8, addr: Reg, offset: i32) {
+        self.word(base | (((offset / 8) as u32) & 0x7F) << 15 | u32::from(b) << 10 | u32::from(addr.0) << 5 | u32::from(a));
+    }
+
+    pub fn stp_offset(&mut self, a: Reg, b: Reg, base: Reg, offset: i32) {
+        self.pair_offset(0xA900_0000, a.0, b.0, base, offset);
+    }
+
+    pub fn ldp_offset(&mut self, a: Reg, b: Reg, base: Reg, offset: i32) {
+        self.pair_offset(0xA940_0000, a.0, b.0, base, offset);
+    }
+
+    pub fn fstp_offset(&mut self, a: Vreg, b: Vreg, base: Reg, offset: i32) {
+        self.pair_offset(0x6D00_0000, a.0, b.0, base, offset);
+    }
+
+    pub fn fldp_offset(&mut self, a: Vreg, b: Vreg, base: Reg, offset: i32) {
+        self.pair_offset(0x6D40_0000, a.0, b.0, base, offset);
+    }
+
     pub fn stp_pre(&mut self, a: Reg, b: Reg, base: Reg, offset: i32) {
         self.word(0xA980_0000 | (((offset / 8) as u32) & 0x7F) << 15 | u32::from(b.0) << 10 | u32::from(base.0) << 5 | u32::from(a.0));
     }

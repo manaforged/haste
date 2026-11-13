@@ -46,6 +46,22 @@ const REGS: Regs<Reg> = Regs {
     fold_sib: true,
 };
 
+fn emit_save_pairs<T: Copy>(asm: &mut Asm, regs: &[T], base: usize, mut step: impl FnMut(&mut Asm, i32, T, Option<T>)) {
+    let mut i = 0;
+    while i < regs.len() {
+        if i + 1 < regs.len() {
+            let disp = save_offset(base + i + 1);
+            if (-512..=504).contains(&disp) && disp % 8 == 0 {
+                step(asm, disp, regs[i + 1], Some(regs[i]));
+                i += 2;
+                continue;
+            }
+        }
+        step(asm, save_offset(base + i), regs[i], None);
+        i += 1;
+    }
+}
+
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
     let Prepared { order, copied, abi, mut plan, frame, framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
@@ -144,13 +160,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
         } else if size > 0 {
             self.asm.add_imm(true, false, Size::X, SP, SP, size);
         }
-        for (index, &reg) in self.frame.saves.iter().enumerate() {
-            self.asm.store(Size::X, Mem::new(FP, save_offset(index)), reg);
-        }
-        let base = self.frame.saves.len();
-        for (index, &v) in self.frame.float_saves.iter().enumerate() {
-            self.asm.vstore(8, Mem::new(FP, save_offset(base + index)), Vreg(v));
-        }
+        emit_save_pairs(&mut self.asm, &self.frame.saves, 0, |asm, disp, a, b| match b {
+            Some(r0) => asm.stp_offset(a, r0, FP, disp),
+            None => asm.store(Size::X, Mem::new(FP, disp), a),
+        });
+        emit_save_pairs(&mut self.asm, &self.frame.float_saves, self.frame.saves.len(), |asm, disp, a, b| match b {
+            Some(v0) => asm.fstp_offset(Vreg(a), Vreg(v0), FP, disp),
+            None => asm.vstore(8, Mem::new(FP, disp), Vreg(a)),
+        });
     }
 
     fn intake(&mut self, entry: Block) -> Result<(), String> {
@@ -264,13 +281,14 @@ impl Emit<'_> {
 
     fn epilogue(&mut self) {
         if self.framed {
-            for (index, &reg) in self.frame.saves.iter().enumerate() {
-                self.asm.load(Size::X, false, reg, Mem::new(FP, save_offset(index)));
-            }
-            let base = self.frame.saves.len();
-            for (index, &v) in self.frame.float_saves.iter().enumerate() {
-                self.asm.vload(8, Vreg(v), Mem::new(FP, save_offset(base + index)));
-            }
+            emit_save_pairs(&mut self.asm, &self.frame.saves, 0, |asm, disp, a, b| match b {
+                Some(r0) => asm.ldp_offset(a, r0, FP, disp),
+                None => asm.load(Size::X, false, a, Mem::new(FP, disp)),
+            });
+            emit_save_pairs(&mut self.asm, &self.frame.float_saves, self.frame.saves.len(), |asm, disp, a, b| match b {
+                Some(v0) => asm.fldp_offset(Vreg(a), Vreg(v0), FP, disp),
+                None => asm.vload(8, Vreg(a), Mem::new(FP, disp)),
+            });
             self.asm.mov_sp(SP, FP);
             self.asm.ldp_post(FP, LR, SP, 16);
         }

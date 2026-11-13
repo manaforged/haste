@@ -276,7 +276,7 @@ impl Image {
         let started = std::time::Instant::now();
         let item = reached.list[index].0.0;
         let tree = &cx.outline.crates[item.krate as usize];
-        let sysroot_frozen = self.mode != ImageMode::Aot && !self.jit_mode && tree.env.release && tree.env.fixed;
+        let sysroot_frozen = !self.jit_mode && tree.env.release && tree.env.fixed;
         let footprint = if sysroot_frozen {
             Some(lower::eval_footprint(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?)
         } else {
@@ -286,11 +286,30 @@ impl Image {
         if let Some(fp) = footprint
             && let Some(substrate) = substrate.as_ref()
             && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
-            && let Some(slice) = substrate.stencil(item_key, fp.0)
+            && let Some(slice) = substrate.stencil(mode_stencil_key(self.mode, item_key), fp.0)
         {
             if self.mode == ImageMode::Check {
                 pass.record_size(index, slice.code().len() as u32, 0);
                 return Ok(());
+            }
+            if self.mode == ImageMode::Aot
+                && let Ok(code) = slice.to_code().map(Arc::new)
+            {
+                let relocs = if code.relocs().iter().any(|r| r.symbol_index().is_some()) {
+                    let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
+                    for sym in &out.relocs {
+                        self.symbol_value(sym);
+                    }
+                    out.relocs
+                } else {
+                    Vec::new()
+                };
+                if aot_relocs_valid(&code, relocs.len()) {
+                    let code_len = code.bytes().len() as u32;
+                    self.record_aot(index, AotFn::Direct { code, relocs }, &[]);
+                    pass.record_size(index, code_len, 0);
+                    return Ok(());
+                }
             }
             let symbols: Vec<u64> = if slice.decode_relocs().is_ok_and(|r| r.is_empty()) {
                 Vec::new()
@@ -308,11 +327,10 @@ impl Image {
         let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
         let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, item, e))?);
         if let Some(fp) = footprint
-            && cx.deferred_evals.is_empty()
-            && code.relocs().iter().all(|r| r.symbol_index().is_some())
-            && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
+            && lower::eval_footprint(cx, reached, self, index).ok() == Some(fp)
+            && aot_relocs_valid(&code, out.relocs.len())
         {
-            pass.frozen_stencils.push((item_key, fp.0, Arc::clone(&code)));
+            self.maybe_freeze_stencil(cx, item, fp.0, &code, pass);
         }
         if self.mode == ImageMode::Jit {
             let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
@@ -489,7 +507,21 @@ impl Image {
         if !tree.env.release || !tree.env.fixed { return None; }
         let substrate = cx.store().substrate()?;
         let item_key = crate::substrate::sysroot_item_key(cx.outline, group.item)?;
-        let slice = substrate.stencil(item_key, group.footprint.0)?;
+        let slice = substrate.stencil(mode_stencil_key(self.mode, item_key), group.footprint.0)?;
+        if self.mode == ImageMode::Aot {
+            let code = Arc::new(slice.to_code().ok()?);
+            if !group.distinct.iter().all(|inst| inst.relocs.as_ref().is_some_and(|r| aot_relocs_valid(&code, r.len()))) {
+                return None;
+            }
+            let code_len = code.bytes().len() as u32;
+            for inst in &group.distinct {
+                if let Some(relocs) = &inst.relocs {
+                    self.record_aot(inst.leader, AotFn::Direct { code: Arc::clone(&code), relocs: relocs.clone() }, &inst.followers);
+                }
+                pass.record_size(inst.leader, code_len, 0);
+            }
+            return Some(Ok(()));
+        }
         let sites = cfg.verify.then(|| slice.decode_sites()).transpose().ok()?;
         let mut records = Vec::new();
         for inst in &group.distinct {
@@ -516,7 +548,6 @@ impl Image {
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);
         }
         if !self.jit_mode
-            && self.mode != ImageMode::Aot
             && let Some(exec_ok) = self.try_frozen_group(cx, reached, group, cfg, pass)
         {
             return exec_ok;
@@ -528,16 +559,10 @@ impl Image {
         };
         let reloc_plan = out.reloc_plan;
         let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, group.item, e))?);
-        let tree = &cx.outline.crates[group.item.krate as usize];
-        if self.mode != ImageMode::Aot
-            && !self.jit_mode
-            && cx.deferred_evals.is_empty()
-            && tree.env.release
-            && tree.env.fixed
-            && code.relocs().iter().all(|r| r.symbol_index().is_some())
-            && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, group.item)
+        if lower::eval_footprint(cx, reached, self, rep).ok() == Some(group.footprint)
+            && group.distinct.first().is_some_and(|inst| aot_relocs_valid(&code, inst.symbols.len()))
         {
-            pass.frozen_stencils.push((item_key, group.footprint.0, Arc::clone(&code)));
+            self.maybe_freeze_stencil(cx, group.item, group.footprint.0, &code, pass);
         }
         if code.bytes().len() > cfg.min_bytes && group.distinct.len() >= cfg.min_fanout {
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
@@ -617,6 +642,19 @@ impl Image {
         self.data(&bytes) as usize
     }
 
+    fn maybe_freeze_stencil(&self, cx: &Context<'_>, item: ItemRef, footprint: u128, code: &Arc<Code>, pass: &mut Pass) {
+        let tree = &cx.outline.crates[item.krate as usize];
+        if !self.jit_mode
+            && cx.deferred_evals.is_empty()
+            && tree.env.release
+            && tree.env.fixed
+            && code.relocs().iter().all(|r| r.symbol_index().is_some() || (self.mode == ImageMode::Aot && r.as_runtime().is_some()))
+            && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
+        {
+            pass.frozen_stencils.push((mode_stencil_key(self.mode, item_key), footprint, Arc::clone(code)));
+        }
+    }
+
     fn emit_dict_stub(&self, body_exec: usize, symbols: &[u64], pass: &mut Pass) -> Result<(usize, Vec<u8>)> {
         self.emit_dict_stub_with_tier(body_exec, symbols, None, pass)
     }
@@ -633,4 +671,12 @@ impl Image {
         })?;
         Ok((exec, written))
     }
+}
+
+fn aot_relocs_valid(code: &Code, relocs_len: usize) -> bool {
+    code.relocs().iter().filter_map(|r| r.symbol_index()).all(|idx| idx < relocs_len)
+}
+
+fn mode_stencil_key(mode: ImageMode, item_key: u64) -> u64 {
+    if mode == ImageMode::Aot { item_key ^ 0xA070_A070_A070_A070 } else { item_key }
 }

@@ -275,8 +275,15 @@ impl Path {
         self.facts.push((value, merged));
     }
 
-    /// Records that the branch on `condition` went the `taken` way: the condition is nonzero or zero, and the integer compare that defines it held or failed.
+    /// Records that the branch on `condition` went the `taken` way: the condition is nonzero or zero, and the integer compare or boolean op that defines it held or failed.
     pub(crate) fn assume(&mut self, func: &Function, ranges: &Ranges, condition: Value, taken: bool) {
+        self.assume_depth(func, ranges, condition, taken, 0);
+    }
+
+    fn assume_depth(&mut self, func: &Function, ranges: &Ranges, condition: Value, taken: bool, depth: u8) {
+        if depth > 4 {
+            return;
+        }
         let ty = func.ty(condition);
         if !ty.is_small_int() {
             return;
@@ -284,22 +291,34 @@ impl Path {
         if let Some(truth) = compared(IntCC::NotEqual, ty, 0, taken) {
             self.add(ranges, condition, truth);
         }
-        let Some(&Op::Icmp(cc, x, y)) = ranges.op(func, condition) else { return };
-        let operand_ty = func.ty(x);
-        if !operand_ty.is_small_int() {
-            return;
-        }
-        let (left, right) = (self.fact(ranges, x), self.fact(ranges, y));
-        let order = match cc.is_signed() {
-            true if left.non_negative(operand_ty) && right.non_negative(operand_ty) => as_unsigned(cc),
-            true => return,
-            false => cc,
-        };
-        if let Some(fact) = right.exact().and_then(|k| compared(order, operand_ty, k, taken)) {
-            self.add(ranges, x, fact);
-        }
-        if let Some(fact) = left.exact().and_then(|k| compared(swapped(order), operand_ty, k, taken)) {
-            self.add(ranges, y, fact);
+        match ranges.op(func, condition) {
+            Some(&Op::Binary(Binary::Band, a, b)) if taken => {
+                self.assume_depth(func, ranges, a, true, depth + 1);
+                self.assume_depth(func, ranges, b, true, depth + 1);
+            }
+            Some(&Op::Binary(Binary::Bor, a, b)) if !taken => {
+                self.assume_depth(func, ranges, a, false, depth + 1);
+                self.assume_depth(func, ranges, b, false, depth + 1);
+            }
+            Some(&Op::Icmp(cc, x, y)) => {
+                let operand_ty = func.ty(x);
+                if !operand_ty.is_small_int() {
+                    return;
+                }
+                let (left, right) = (self.fact(ranges, x), self.fact(ranges, y));
+                let order = match cc.is_signed() {
+                    true if left.non_negative(operand_ty) && right.non_negative(operand_ty) => as_unsigned(cc),
+                    true => return,
+                    false => cc,
+                };
+                if let Some(fact) = right.exact().and_then(|k| compared(order, operand_ty, k, taken)) {
+                    self.add(ranges, x, fact);
+                }
+                if let Some(fact) = left.exact().and_then(|k| compared(swapped(order), operand_ty, k, taken)) {
+                    self.add(ranges, y, fact);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -334,7 +353,7 @@ pub(crate) fn single_preds(func: &Function) -> Vec<Option<Block>> {
 /// Settles the compares, traps and branches that the facts on entry to each block and its earlier instructions decide: a settled compare's result becomes a constant in `consts`, a trap that cannot fire goes, and a settled branch becomes a jump. A block's facts on entry are its only predecessor's facts on exit plus that edge's branch. Returns whether anything changed.
 pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [Option<i64>]) -> bool {
     let Some(entry) = func.entry else { return false };
-    let (single, order) = (single_preds(func), crate::dom::reverse_postorder(func, entry));
+    let (single, (order, _, idom)) = (single_preds(func), crate::dom::dominators(func, entry));
     let (mut decided, mut compares) = (Vec::new(), Vec::new());
     {
         let ranges = Ranges::new(func, (defs, consts), &order);
@@ -345,6 +364,7 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
                     path.follow(func, &ranges, pred, block);
                     path
                 }
+                None if block != entry => idom[block.index()].and_then(|d| exits[d.index()].clone()).unwrap_or_default(),
                 None => Path::default(),
             };
             for &inst in &func.blocks[block.index()].insts {

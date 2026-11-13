@@ -81,6 +81,11 @@ pub struct Code {
 }
 
 impl Code {
+    /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, and relocations.
+    pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>) -> Self {
+        Self { bytes, sites, relocs }
+    }
+
     /// The machine code.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
