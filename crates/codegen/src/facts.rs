@@ -546,12 +546,25 @@ impl Path {
                         }
                     }
                 }
-                if let Some(&Op::Binary(Binary::Isub, base, c)) = ranges.op(func, a)
-                    && let Some(k) = ranges.constant(c)
-                    && self.fact(ranges, base).lo >= k
-                    && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), k == 0)
-                {
-                    return true;
+                if let Some(&Op::Binary(Binary::Isub, base, c)) = ranges.op(func, a) {
+                    if let Some(k) = ranges.constant(c)
+                        && self.fact(ranges, base).lo >= k
+                        && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), k == 0)
+                    {
+                        return true;
+                    }
+                    if self.reaches(ty, c, base, (RelKind::Ult, RelKind::Ule), false)
+                        && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), self.fact(ranges, c).lo == 0)
+                    {
+                        return true;
+                    }
+                    if let Some(&Op::Binary(Binary::Isub, outer, k_val)) = ranges.op(func, base)
+                        && ranges.constant(k_val) == Some(1)
+                        && self.reaches(ty, c, outer, (RelKind::Ult, RelKind::Ule), true)
+                        && self.reaches(ty, outer, b, (RelKind::Ult, RelKind::Ule), false)
+                    {
+                        return true;
+                    }
                 }
                 false
             }
@@ -562,10 +575,11 @@ impl Path {
             RelKind::Slt => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true),
             RelKind::Sle => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), false),
             RelKind::Ne => {
-                self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), true)
-                    || self.reaches(ty, b, a, (RelKind::Ult, RelKind::Ule), true)
-                    || self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true)
-                    || self.reaches(ty, b, a, (RelKind::Slt, RelKind::Sle), true)
+                self.strictly_ordered(ty, a, b)
+                    || [(a, b), (b, a)].into_iter().any(|(sub, zero)| {
+                        self.fact(ranges, zero).exact() == Some(0)
+                            && matches!(ranges.op(func, sub), Some(&Op::Binary(Binary::Isub, lhs, rhs)) if self.strictly_ordered(ty, lhs, rhs))
+                    })
                     || self.rels.iter().any(|r| {
                         r.kind == RelKind::Ne
                             && r.ty == ty
@@ -574,6 +588,13 @@ impl Path {
                     })
             }
         }
+    }
+
+    fn strictly_ordered(&self, ty: Type, a: Value, b: Value) -> bool {
+        self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), true)
+            || self.reaches(ty, b, a, (RelKind::Ult, RelKind::Ule), true)
+            || self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true)
+            || self.reaches(ty, b, a, (RelKind::Slt, RelKind::Sle), true)
     }
 
     fn decide_rel(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> Option<bool> {

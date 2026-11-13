@@ -163,6 +163,26 @@ fn layout_ty_infallible(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> bool {
     }
 }
 
+fn ty_has_non_fixed(cx: &Context<'_>, ty: Ty) -> bool {
+    if ty == Ty::NONE {
+        return true;
+    }
+    match cx.types.kind(ty) {
+        Kind::Prim(_) | Kind::Never | Kind::Value(_) => false,
+        Kind::Ref(_, inner) | Kind::Ptr(_, inner) | Kind::Slice(inner) | Kind::Pat(inner, ..) => ty_has_non_fixed(cx, *inner),
+        Kind::Array(elem, count) => ty_has_non_fixed(cx, *elem) || ty_has_non_fixed(cx, *count),
+        Kind::Tuple(args) => substs_has_non_fixed(cx, *args),
+        Kind::FnPtr(args, ret) => substs_has_non_fixed(cx, *args) || ty_has_non_fixed(cx, *ret),
+        Kind::Adt(def, args) | Kind::FnDef(def, args) | Kind::Closure(def, args, _) => !cx.outline.is_fixed(def.krate) || substs_has_non_fixed(cx, *args),
+        Kind::Dyn(tr, args, assoc, auto) => !cx.outline.is_fixed(tr.krate) || assoc.iter().chain(auto).any(|d| !cx.outline.is_fixed(d.krate)) || substs_has_non_fixed(cx, *args),
+        Kind::Proj(_) | Kind::Param(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => true,
+    }
+}
+
+fn substs_has_non_fixed(cx: &Context<'_>, substs: Substs) -> bool {
+    !substs.is_empty() && cx.types.substs(substs).iter().any(|&ty| ty_has_non_fixed(cx, ty))
+}
+
 pub(super) fn collect_filtered_callees(
     cx: &mut Context<'_>,
     filter: &mut ReachFilter,
@@ -177,8 +197,13 @@ pub(super) fn collect_filtered_callees(
         if cx.intrinsic(item).is_some() {
             return;
         }
-        if check_only && cx.outline.is_fixed(item.krate) && filter.check_sealed(cx, item, &mut visiting) == Some(true) && !filter.seen_sealed_sysroot.insert(item) {
-            return;
+        if check_only && cx.outline.is_fixed(item.krate) {
+            if !substs_has_non_fixed(cx, substs) {
+                return;
+            }
+            if filter.check_sealed(cx, item, &mut visiting) == Some(true) && !filter.seen_sealed_sysroot.insert(item) {
+                return;
+            }
         }
         out.push((item, substs));
     };

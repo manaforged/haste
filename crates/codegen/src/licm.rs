@@ -184,8 +184,7 @@ fn hoist(
             if matches!(data.op, Op::Call { .. } | Op::TryCall { .. } | Op::Trap | Op::Trapz(_) | Op::Brif(..)) {
                 head_prefix = false;
             }
-            let static_loc = matches!(data.op, Op::StackAddr(..) | Op::SlotAddr(_))
-                || (matches!(data.op, Op::Const(_)) && data.result.is_none_or(|result| !func.ty(result).is_float()));
+            let static_loc = matches!(data.op, Op::StackAddr(..) | Op::SlotAddr(_));
             let load_ok = match (&data.op, data.result) {
                 (&Op::StackLoad(slot, offset), Some(res)) => {
                     let width = u64::from(func.ty(res).bytes());
