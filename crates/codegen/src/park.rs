@@ -94,14 +94,44 @@ fn pick_slot<F: Copy + PartialEq>(
     ranges: &[Range],
     start: u32,
     used: &[F],
+    reserved: &[F],
     pred: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    let valid = |slot: usize| pred(slot) && slot_free(&holders[slot], live, ranges, pool.arrival_lock[slot], start);
-    (0..pool.regs.len())
-        .find(|&s| valid(s) && holders[s].is_empty() && (!pool.is_saved[s] || used.contains(&pool.regs[s])))
-        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && (!pool.is_saved[s] || used.contains(&pool.regs[s]))))
-        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && holders[s].is_empty()))
-        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s)))
+    let pick = |allow_reserved: bool| {
+        let valid = |slot: usize| pred(slot) && (allow_reserved || !reserved.contains(&pool.regs[slot])) && slot_free(&holders[slot], live, ranges, pool.arrival_lock[slot], start);
+        (0..pool.regs.len())
+            .find(|&s| valid(s) && holders[s].is_empty() && (!pool.is_saved[s] || used.contains(&pool.regs[s])))
+            .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && (!pool.is_saved[s] || used.contains(&pool.regs[s]))))
+            .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && holders[s].is_empty()))
+            .or_else(|| (0..pool.regs.len()).find(|&s| valid(s)))
+    };
+    pick(false).or_else(|| pick(true))
+}
+
+fn loop_back_args(func: &Function) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        let mut edge = |target: crate::ir::Block, args: &[crate::ir::Value]| {
+            if target.index() <= b_idx {
+                for (param, arg) in func.blocks[target.index()].params.iter().zip(args) {
+                    if param != arg {
+                        pairs.push((param.index(), arg.index()));
+                    }
+                }
+            }
+        };
+        for &inst in &block.insts {
+            match &func.insts[inst.index()].op {
+                crate::ir::Op::Jump(target, args) => edge(*target, args),
+                crate::ir::Op::Brif(_, then, then_args, otherwise, else_args) => {
+                    edge(*then, then_args);
+                    edge(*otherwise, else_args);
+                }
+                _ => {}
+            }
+        }
+    }
+    pairs
 }
 
 fn try_demote<F: Copy + PartialEq>(
@@ -181,7 +211,9 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         .filter_map(|v| live.bounds(v).map(|(start, end)| (start, end, v)))
         .collect();
     values.sort_unstable();
+    let back_args = loop_back_args(func);
     let mut used: Vec<F> = Vec::new();
+    let mut reserved: Vec<F> = Vec::new();
     for (start, end, value) in values {
         for list in &mut holders {
             list.retain(|&other| live.last_end(other).is_some_and(|u| u >= start));
@@ -230,12 +262,22 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
             }
         }
         if chosen.is_none() {
+            reserved.clear();
+            for &(param, arg) in &back_args {
+                if let Some(reg) = homes[param]
+                    && homes[arg].is_none()
+                    && live.bounds(arg).is_some_and(|(arg_start, _)| arg_start >= start)
+                    && !reserved.contains(&reg)
+                {
+                    reserved.push(reg);
+                }
+            }
             chosen = if needs_saved {
-                pick_slot(&pool, &holders, live, ranges, start, &used, |s| pool.is_saved[s] && !wide_val)
-                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, |s| !pool.is_saved[s])).flatten())
+                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, |s| pool.is_saved[s] && !wide_val)
+                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, |s| !pool.is_saved[s])).flatten())
             } else {
-                pick_slot(&pool, &holders, live, ranges, start, &used, |s| !pool.is_saved[s])
-                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, |s| pool.is_saved[s])).flatten())
+                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, |s| !pool.is_saved[s])
+                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, |s| pool.is_saved[s])).flatten())
             };
         }
         if chosen.is_none() && needs_saved && !wide_val {

@@ -244,6 +244,9 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
     target.triple.hash(&mut hasher);
     target.effort.hash(&mut hasher);
     crate::graph::store::program().hash(&mut hasher);
+    if let Ok(exe) = std::env::current_exe() {
+        hash_file_meta(&exe, &mut hasher);
+    }
     MAGIC.hash(&mut hasher);
     VERSION.hash(&mut hasher);
     for (_, _, idx) in sysroot_units {

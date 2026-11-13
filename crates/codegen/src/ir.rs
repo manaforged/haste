@@ -508,12 +508,18 @@ pub struct Function {
     pub coroutine: Option<crate::coroutine::Coroutine>,
     pub(crate) self_slots: Vec<u32>,
     pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
+    pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
 }
 
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new() }
+    }
+
+    /// Associates symbol index `sym` with known read-only constant bytes for load folding.
+    pub fn add_rodata_bytes(&mut self, sym: u32, bytes: Vec<u8>) {
+        self.rodata_bytes.push((sym, bytes));
     }
 
     /// Marks relocation slot `sym` as a direct self-recursive target of this function.

@@ -675,6 +675,16 @@ impl Lower<'_, '_> {
         self.emit_symbol_with(src, step)
     }
 
+    pub(super) fn emit_const_rodata(&mut self, bytes: &[u8]) -> Value {
+        let id = self.slots.rodata(bytes, &[]);
+        let idx = self.relocs.len() as u32;
+        let val = self.emit_symbol(SymbolSource::Rodata(id));
+        if matches!(self.mode, LowerMode::Stencil) && bytes.len() <= 64 {
+            self.b.func.add_rodata_bytes(idx, bytes.to_vec());
+        }
+        val
+    }
+
     pub(super) fn emit_symbol_with(&mut self, src: SymbolSource, step: RelocStep) -> Value {
         self.emit_reloc(src, step, false, false)
     }

@@ -390,14 +390,23 @@ fn partners(func: &Function) -> Vec<Vec<Value>> {
             out[arg.index()].push(*param);
         }
     };
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        match &func.insts[inst.index()].op {
-            Op::Jump(block, args) => pair(&func.blocks[block.index()].params, args),
-            Op::Brif(_, then, then_args, otherwise, else_args) => {
-                pair(&func.blocks[then.index()].params, then_args);
-                pair(&func.blocks[otherwise.index()].params, else_args);
+    for want_back in [true, false] {
+        for (b_idx, block) in func.blocks.iter().enumerate() {
+            let mut edge = |target: Block, args: &[Value]| {
+                if (target.index() <= b_idx) == want_back {
+                    pair(&func.blocks[target.index()].params, args);
+                }
+            };
+            for inst in &block.insts {
+                match &func.insts[inst.index()].op {
+                    Op::Jump(target, args) => edge(*target, args),
+                    Op::Brif(_, then, then_args, otherwise, else_args) => {
+                        edge(*then, then_args);
+                        edge(*otherwise, else_args);
+                    }
+                    _ => {}
+                }
             }
-            _ => {}
         }
     }
     out

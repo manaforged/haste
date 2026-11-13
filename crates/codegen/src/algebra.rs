@@ -279,18 +279,50 @@ fn simplify_bxor(func: &mut Function, defs: &mut Vec<Option<Inst>>, consts: &mut
     if !ty.is_small_int() {
         return None;
     }
+    let all_ones = width_mask(ty);
     for (inner, c2_val) in [(a, b), (b, a)] {
         let Some(c2) = consts.get(c2_val.index()).copied().flatten() else { continue };
+        if (extend(c2, ty, false) as u64) == all_ones {
+            return Some(Op::Unary(Unary::Bnot, inner));
+        }
         let Some(inner_inst) = defs.get(inner.index()).copied().flatten() else { continue };
         let Op::Binary(Binary::Bxor, x, y) = func.insts[inner_inst.index()].op else { continue };
         for (src, c1_val) in [(x, y), (y, x)] {
             if let Some(c1) = consts.get(c1_val.index()).copied().flatten() {
-                let combined = emit_op(func, defs, consts, out, ty, Op::Const(extend(c1 ^ c2, ty, true)));
+                let xor_imm = extend(c1 ^ c2, ty, true);
+                if (xor_imm as u64 & all_ones) == all_ones {
+                    return Some(Op::Unary(Unary::Bnot, src));
+                }
+                let combined = emit_op(func, defs, consts, out, ty, Op::Const(xor_imm));
                 return Some(Op::Binary(Binary::Bxor, src, combined));
             }
         }
     }
     None
+}
+
+fn fold_rodata_load(func: &Function, defs: &[Option<Inst>], ty: Type, addr: Value, off: i32) -> Option<Op> {
+    if off < 0 {
+        return None;
+    }
+    let size = match ty {
+        Type::I8 => 1,
+        Type::I16 => 2,
+        Type::I32 | Type::F32 => 4,
+        Type::I64 | Type::F64 => 8,
+        _ => return None,
+    };
+    let def_inst = defs.get(addr.index()).copied().flatten()?;
+    let Op::Symbol(sym) = func.insts[def_inst.index()].op else { return None };
+    let start = off as usize;
+    let end = start.checked_add(size)?;
+    let (_, bytes) = func.rodata_bytes.iter().find(|&&(s, _)| s == sym)?;
+    let slice = bytes.get(start..end)?;
+    let mut raw = [0_u8; 8];
+    raw[..size].copy_from_slice(slice);
+    let u = u64::from_le_bytes(raw);
+    let imm = if ty.is_small_int() { extend(u as i64, ty, true) } else { u as i64 };
+    Some(Op::Const(imm))
 }
 
 /// Rewrites constant unsigned divisions/remainders, unsigned zero compares, negated shift-adds, and bitwise/SWAR masks.
@@ -372,6 +404,12 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
                     } else {
                         None
                     }
+                }
+                Op::Brif(cond, then_b, t_args, else_b, e_args) => {
+                    match_swar_msb_broadcast(func, &defs, &consts, cond).map(|x| Op::Brif(x, then_b, t_args, else_b, e_args))
+                }
+                Op::Load(addr, off) if !func.rodata_bytes.is_empty() && off >= 0 => {
+                    res.and_then(|r| fold_rodata_load(func, &defs, func.ty(r), addr, off))
                 }
                 _ => None,
             };

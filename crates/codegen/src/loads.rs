@@ -482,6 +482,49 @@ fn eliminate_affine_block_params(func: &mut Function) {
     }
 }
 
+fn fits_mem_imm(ty: Type, off: i64) -> bool {
+    let fits_one = |align: i64, o: i64| (-256..=255).contains(&o) || (o >= 0 && o % align == 0 && o <= align * 4095);
+    if ty == Type::I128 {
+        return off.checked_add(8).is_some_and(|hi| fits_one(8, off) && fits_one(8, hi));
+    }
+    let align = i64::from(ty.bytes().max(1));
+    fits_one(align, off)
+}
+
+fn fold_affine_mem(func: &mut Function, slots: &[Option<(StackSlot, i32)>], affine: &[(Value, i64)]) {
+    let mut is_stack_addr = vec![false; func.types.len()];
+    for data in &func.insts {
+        if let (Op::StackAddr(..), Some(res)) = (&data.op, data.result) {
+            is_stack_addr[res.index()] = true;
+        }
+    }
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let res_ty = func.insts[inst.index()].result.map(|r| func.ty(r));
+            let val_ty = match func.insts[inst.index()].op {
+                Op::Load(..) => res_ty,
+                Op::Store(val, ..) => Some(func.ty(val)),
+                _ => None,
+            };
+            let Some(ty) = val_ty else { continue };
+            let (Op::Load(addr, off) | Op::Store(_, addr, off)) = &mut func.insts[inst.index()].op else { continue };
+            if slots[addr.index()].is_some() {
+                continue;
+            }
+            let (root, base_off) = affine[addr.index()];
+            if root != *addr
+                && func.types[root.index()] == Type::I64
+                && !is_stack_addr[root.index()]
+                && let Some(new_off) = i64::from(*off).checked_add(base_off)
+                && fits_mem_imm(ty, new_off)
+            {
+                *addr = root;
+                *off = new_off as i32;
+            }
+        }
+    }
+}
+
 /// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between: through each block and on into a successor that only it enters.
 pub(crate) fn run(func: &mut Function) {
     let Some(entry) = func.entry else { return };
@@ -492,6 +535,7 @@ pub(crate) fn run(func: &mut Function) {
     let preds = pred_counts(func);
     let slots = slot_addresses(func);
     let affine = affine_table(func);
+    fold_affine_mem(func, &slots, &affine);
     let (unescaped, call_readonly) = classify_slots(func, &slots);
     let mut consts = vec![None; func.types.len()];
     let mut selects = vec![None; func.types.len()];

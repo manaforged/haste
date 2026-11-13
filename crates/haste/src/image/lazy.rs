@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{Result, anyhow, bail};
 use rustc_hash::FxHashSet as HashSet;
 
+use crate::lower::Slots;
 use crate::macros::Compilation;
 use crate::names::ItemRef;
 use crate::names::path::Requests;
@@ -471,7 +472,7 @@ impl Jit {
         if matches!(answer, Err(Stop::Asked)) {
             journal.iter().for_each(|&at| self.reached.forget(at));
             self.expanded.clear();
-            self.image.bodies.clear();
+            self.image.bodies.clear_transient();
         }
         answer
     }
@@ -538,18 +539,25 @@ impl Jit {
         }
         let wanted: Vec<Instance> = calls(cx, &self.reached.list[index].1).collect();
         let mut callees = self.reach(cx, wanted, journal)?;
-        let mut seen: rustc_hash::FxHashSet<usize> = callees.iter().copied().collect();
-        let mut next = 0;
-        while let Some(&at) = callees.get(next) {
-            next += 1;
-            if !self.expanded.insert(at) || !crate::lower::may_inline(cx, &self.reached, at) {
-                continue;
+        if self.image.allow_inline() {
+            let mut seen: rustc_hash::FxHashSet<usize> = callees.iter().copied().collect();
+            let mut next = 0;
+            while let Some(&at) = callees.get(next) {
+                next += 1;
+                if !self.expanded.insert(at) || !crate::lower::may_inline(cx, &self.reached, at) {
+                    continue;
+                }
+                let inner: Vec<Instance> = calls(cx, &self.reached.list[at].1).collect();
+                let reached = self.reach(cx, inner, journal)?;
+                callees.extend(reached.into_iter().filter(|callee| seen.insert(*callee)));
             }
-            let inner: Vec<Instance> = calls(cx, &self.reached.list[at].1).collect();
-            let reached = self.reach(cx, inner, journal)?;
-            callees.extend(reached.into_iter().filter(|callee| seen.insert(*callee)));
         }
         Ok(callees)
+    }
+
+    /// Configures whether this on-demand image compiles for one-shot host execution without cross-crate inlining.
+    pub(crate) fn set_fast(&mut self, fast: bool) {
+        self.image.fast_jit = fast;
     }
 
     /// Declares and infers the functions `wanted`, and returns their indexes.

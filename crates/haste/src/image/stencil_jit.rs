@@ -10,7 +10,7 @@ use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sync::lock;
 
-use super::stencil::{DictConfig, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord, target};
+use super::stencil::{DictConfig, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord};
 use super::{Image, Pass, stub};
 
 impl Image {
@@ -35,7 +35,7 @@ impl Image {
                     bail!("unreached inline callee");
                 }
                 let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
-                let code = Arc::new(haste_codegen::compile(out.func, &target())?);
+                let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target())?);
                 let exec = pass.memory.write_patched(&code, &symbols)?;
                 pass.stencils.first_jit.insert(item, Some((index, code, symbols, exec, out.reloc_plan)));
                 Ok(Some(exec))
@@ -113,7 +113,7 @@ impl Image {
             Some(out) => out,
             None => lower::lower_stencil(cx, reached, self, index)?,
         };
-        let stencil = Arc::new(haste_codegen::compile(out.func, &target())?);
+        let stencil = Arc::new(haste_codegen::compile(out.func, &self.compile_target())?);
         pass.stencils.jit_templates.insert(key, JitTemplate { stencil: stencil.clone(), dict: None, fanout: 1, reloc_plan: out.reloc_plan });
         Ok(stencil)
     }
@@ -123,7 +123,7 @@ impl Image {
             Some(pair) => pair,
             None => {
                 let (func, _, _) = lower::lower_dict(cx, reached, self, index)?;
-                let code = Arc::new(haste_codegen::compile(func, &target())?);
+                let code = Arc::new(haste_codegen::compile(func, &self.compile_target())?);
                 let exec = self.write_dict_body(&code, pass)?;
                 if let Some(jt) = pass.stencils.jit_templates.get_mut(&key) {
                     jt.dict = Some((exec, code.clone()));
@@ -205,7 +205,7 @@ impl Image {
         let out = lower::lower_stencil(cx, reached, fresh, index)?;
         let slots: &dyn Slots = fresh;
         let symbols: Vec<u64> = out.relocs.iter().map(|sym| slots.resolve_symbol(sym)).collect();
-        let fresh_code = haste_codegen::compile(out.func, &target())?;
+        let fresh_code = haste_codegen::compile(out.func, &fresh.0.compile_target())?;
         let mut expected = vec![0u8; fresh_code.bytes().len()];
         fresh_code.patch(&symbols, &mut expected);
         // SAFETY: exec..exec + len is mapped readable executable code in this image.
@@ -221,7 +221,7 @@ impl Image {
 
     fn verify_dict(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, (body_exec, stub_exec): (usize, usize), stub_bytes: &[u8], code: &Code) -> Result<()> {
         let (func, _, _) = lower::lower_dict(cx, reached, fresh, index)?;
-        let fresh_code = haste_codegen::compile(func, &target())?;
+        let fresh_code = haste_codegen::compile(func, &fresh.0.compile_target())?;
         if !fresh_code.relocs().iter().all(|reloc| reloc.as_runtime().is_some()) {
             bail!("dict body verification found non-runtime relocations");
         }

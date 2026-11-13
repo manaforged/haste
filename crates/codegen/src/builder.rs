@@ -136,6 +136,9 @@ impl<'f> FunctionBuilder<'f> {
                 self.func.vtable_slots.push((vt_sym + sym_base, off, slot_sym + sym_base, low));
             }
         }
+        for (sym, bytes) in &callee.rodata_bytes {
+            self.func.rodata_bytes.push((sym + sym_base, bytes.clone()));
+        }
         for (index, block) in callee.blocks.iter().enumerate() {
             let target = map.blocks[index];
             self.func.blocks[target.index()].params = block.params.iter().map(|param| map.values[param.index()]).collect();
@@ -192,6 +195,9 @@ impl Function {
         self.sigs.extend(callee.sigs.iter().cloned());
         for &(vt_sym, off, slot_sym, low) in &callee.vtable_slots {
             self.vtable_slots.push((vt_sym + sym_base, off, slot_sym + sym_base, low));
+        }
+        for (sym, bytes) in &callee.rodata_bytes {
+            self.rodata_bytes.push((sym + sym_base, bytes.clone()));
         }
         for (index, c_block) in callee.blocks.iter().enumerate() {
             let target = map.blocks[index];

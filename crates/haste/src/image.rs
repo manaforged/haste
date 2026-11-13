@@ -68,6 +68,7 @@ pub struct Image {
     bodies: lower::Bodies,
     mode: ImageMode,
     jit_mode: bool,
+    fast_jit: bool,
     aot: Option<Mutex<aot::AotState>>,
 }
 
@@ -172,7 +173,7 @@ impl Slots for Image {
     }
 
     fn allow_inline(&self) -> bool {
-        !self.jit_mode || crate::profile() == crate::outline::tree::Profile::Release
+        !self.fast_jit && (!self.jit_mode || crate::profile() == crate::outline::tree::Profile::Release)
     }
 
     fn cell(&self, index: usize, size: u32) -> i64 {
@@ -265,8 +266,17 @@ impl Image {
             bodies: lower::Bodies::default(),
             mode,
             jit_mode: false,
+            fast_jit: false,
             aot: (mode == ImageMode::Aot).then(|| aot::AotState::new(reached.list.len())),
         })
+    }
+
+    pub(super) fn compile_target(&self) -> haste_codegen::Target {
+        if self.fast_jit {
+            haste_codegen::Target::host().effort(haste_codegen::Effort::Quick)
+        } else {
+            crate::host_target()
+        }
     }
 
     /// The encoded machine-code byte length of each reached function, or zero when not compiled.
