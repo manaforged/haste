@@ -109,7 +109,7 @@ pub fn resolve_sema<R>(compilation: &mut Compilation, asking: (Cache, impl Fn(&m
 pub fn answer(compilation: &mut Compilation, ask: impl Fn(&mut Compilation, Requests) -> Result<Answer>, (mut kept, asks): (Cache, Requests)) -> (Cache, Result<Answer>) {
     let answer = ask(compilation, asks);
     if let Ok(answer) = &answer {
-        kept.forget_after(*answer);
+        kept.forget_after(&compilation.outline, *answer);
     }
     (kept, answer)
 }

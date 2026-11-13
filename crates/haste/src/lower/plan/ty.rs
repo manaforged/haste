@@ -449,6 +449,7 @@ pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, 
     let sig = signature(cx, callee)?;
     hash_sig(mix, &sig);
     mix.bool(callee.ret.is_some_and(|r| matches!(cx.types.kind(r), Kind::Never)));
+    mix.bool(callee_idx == caller);
     if foreign {
         for &p in &callee.params {
             let pty = callee.locals[p as usize].ty;

@@ -126,7 +126,6 @@ fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary
     let substrate = cx.store.lookups.substrate.clone()?;
     let key = crate::substrate::sysroot_item_key(cx.outline, item)?;
     let bytes = substrate.summary(key)?;
-    cx.body(item).ok()?;
     let index = cx.store.lookups.sysroot_index.get_or_init(|| Arc::new(codec::SysrootIndex::build(cx.outline, crate::substrate::sysroot_item_key)));
     codec::decode_summary(index, &cx.types, bytes).ok().flatten().map(Arc::new)
 }

@@ -146,6 +146,7 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets, (request, args)
     let mut build = crate::build::Build::load(workspace, targets)?;
     let result = match (request, out) {
         (Request::Build, Some(path)) => build.emit_executable(workspace, path),
+        (Request::Build, None) => build.compile_binary_oneshot(workspace).and_then(|()| build.check(started.elapsed())),
         _ => crate::serve::finish(&mut build, workspace, (request, args), started),
     };
     if let Some((path, graph_span)) = stats {

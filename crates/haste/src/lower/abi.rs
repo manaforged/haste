@@ -46,6 +46,11 @@ pub(super) fn parts(layout: &Layout) -> Result<Parts> {
 pub(super) fn copied_parts(layout: &Layout) -> Parts {
     match &layout.backend_repr {
         BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => Parts::Bytes,
+        BackendRepr::SimdVector { .. } => match layout.size.bytes() {
+            8 => Parts::One(Type::I64),
+            16 => Parts::Pair(Type::I64, Type::I64, 8),
+            _ => Parts::Bytes,
+        },
         _ => parts(layout).unwrap_or(Parts::Bytes),
     }
 }

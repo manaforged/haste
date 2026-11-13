@@ -50,16 +50,19 @@ fn inlinable(env: &crate::outline::tree::Env) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hint {
     Default,
+    Inline,
     Always,
     Never,
 }
 
-/// The inlining hint of `item`: `#[inline(always)]`, or `#[inline(never)]` and `#[cold]`, which calls never copy.
+/// The inlining hint of `item`: `#[inline(always)]`, `#[inline(never)]`/`#[cold]`, or `#[inline]`.
 fn hint(cx: &Context<'_>, item: ItemRef) -> Hint {
     if cx.inline_always(item) {
         Hint::Always
     } else if cx.attr_value(item, "cold").is_some() || cx.attr_value(item, "inline") == Some("never") {
         Hint::Never
+    } else if cx.attr_value(item, "inline").is_some() {
+        Hint::Inline
     } else {
         Hint::Default
     }
@@ -78,6 +81,9 @@ pub fn may_inline(cx: &mut Context<'_>, reached: &Reached, index: usize) -> bool
 
 /// Whether reached function `index` lowers to a body small and copyable enough to inline.
 pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn super::Slots, index: usize) -> bool {
+    if !slots.allow_inline() {
+        return false;
+    }
     let Some(limit) = inline_limit(cx, reached, index) else { return false };
     resolve_inline(cx, (reached, slots), &mut super::Inline::default(), index, limit).is_ok_and(|(callee, _)| callee.is_some())
 }
@@ -87,19 +93,25 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
     let ((item, _), Ok(typed)) = &reached.list[index] else {
         return None;
     };
-    if typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
+    let hint = hint(cx, *item);
+    if hint != Hint::Always && typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
         return None;
     }
-    if !inlinable(&cx.outline.crates[item.krate as usize].env) || crate::prep::bind(cx, reached, index).is_some() {
+    let env = &cx.outline.crates[item.krate as usize].env;
+    if !inlinable(env) || crate::prep::bind(cx, reached, index).is_some() {
         return None;
     }
     let budget = budget();
     if !matches!(typed.shape, Shape::Body) {
         return Some(budget.insts);
     }
-    match hint(cx, *item) {
+    match hint {
         Hint::Never => None,
         Hint::Always => Some(budget.always),
+        Hint::Inline => {
+            let max_exprs = if crate::profile() == crate::outline::tree::Profile::Release || env.release { 2500 } else { 200 };
+            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(budget.insts)
+        }
         Hint::Default => cx.body(*item).is_ok_and(|body| body.exprs.len() <= budget.exprs).then_some(budget.insts),
     }
 }
@@ -377,7 +389,7 @@ impl Lower<'_, '_> {
     fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
         let code = match callee {
             Callee::Code(code) => code,
-            Callee::Reached(index, origin) => match self.inline_callee(index)? {
+            Callee::Reached(index, origin) => match if self.slots.allow_inline() { self.inline_callee(index)? } else { None } {
                 Some(inlined) => return Ok(self.emit_inlined(&inlined, origin, values)),
                 None => self.code_of(index, origin),
             },
@@ -508,6 +520,16 @@ impl Lower<'_, '_> {
     }
 
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
+        if let Expr::Lit(crate::body::Lit::Bool(taken), _) = *self.body.expr(cond) {
+            return if taken {
+                self.expr(then)
+            } else {
+                match otherwise {
+                    Some(otherwise) => self.expr(otherwise),
+                    None => Ok(None),
+                }
+            };
+        }
         let mark = self.owned.len();
         let Some(test) = self.expr(cond)? else {
             return Ok(None);

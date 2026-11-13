@@ -70,8 +70,12 @@ pub trait Slots {
     }
     /// Interns a read-only blob with optional intra-rodata relocations and returns its symbol id.
     fn rodata(&self, bytes: &[u8], _relocs: &[RodataReloc]) -> RodataId {
-        let _ = self.data(bytes);
+        self.data(bytes);
         RodataId(0)
+    }
+    /// Whether calls may inline bodies through this image.
+    fn allow_inline(&self) -> bool {
+        true
     }
     /// Interns a vtable layout and returns its symbol id.
     fn vtable_id(&self, _entries: &[VtableEntry]) -> VtableId {

@@ -27,13 +27,17 @@ impl Lower<'_, '_> {
         let Some(each) = self.typed.fors.get(&expr).cloned() else { bail!("`for` loop has no iterator calls") };
         let (Res::Fn(into, into_substs), Res::Fn(next, next_substs)) = (each.into_iter, each.next) else { bail!("`for` loop calls are not functions") };
         if let Kind::Adt(adt, args) = *self.cx.types.kind(each.iter)
-            && self.cx.lang(adt) == Some("Range")
+            && let Some(inclusive) = match self.cx.lang(adt) {
+                Some("Range") => Some(false),
+                Some("RangeInclusive") => Some(true),
+                _ => None,
+            }
             && let [elem_ty] = *self.cx.types.substs(args)
             && let Kind::Prim(prim) = *self.cx.types.kind(elem_ty)
             && let Some(signed) = range_signed(prim)
             && let Repr::Scalar(ir_ty) = repr(self.cx, elem_ty)?
         {
-            return self.for_range(pat, iter, (each.iter, elem_ty), (signed, ir_ty), (label, body));
+            return self.for_range(pat, iter, (each.iter, elem_ty), (signed, inclusive, ir_ty), (label, body));
         }
         let value = self.expr(iter)?;
         let iterator = self.invoke(SiteOrigin::Table(SiteKey::ForInto(expr)), into, into_substs, value.into_iter().collect())?;
@@ -56,7 +60,14 @@ impl Lower<'_, '_> {
         self.loop_body((head, exit, depth), label, body)
     }
 
-    fn for_range(&mut self, pat: PatId, iter: ExprId, (range_ty, elem_ty): (Ty, Ty), (signed, ir_ty): (bool, Type), (label, body): (Option<u32>, ExprId)) -> Result<Option<Value>> {
+    fn for_range(
+        &mut self,
+        pat: PatId,
+        iter: ExprId,
+        (range_ty, elem_ty): (Ty, Ty),
+        (signed, inclusive, ir_ty): (bool, bool, Type),
+        (label, body): (Option<u32>, ExprId),
+    ) -> Result<Option<Value>> {
         let value = self.expr(iter)?;
         let Some(place) = self.spill(value, range_ty)? else { bail!("range has no place") };
         let start_place = self.part_place(place, range_ty, (0, 0))?;
@@ -67,15 +78,43 @@ impl Lower<'_, '_> {
         let Some(cur_slot) = self.slot(cur_repr) else { bail!("range element has no slot") };
         let cur_place = Place::slot(cur_slot, cur_repr);
         self.write(cur_place, start);
+        let done_place = if inclusive {
+            let ex_place = self.part_place(place, range_ty, (0, 2))?;
+            let Some(exhausted) = self.read(ex_place) else { bail!("range exhausted has no value") };
+            let done_repr = Repr::Scalar(Type::I8);
+            let Some(done_slot) = self.slot(done_repr) else { bail!("range done has no slot") };
+            let done_place = Place::slot(done_slot, done_repr);
+            self.write(done_place, exhausted);
+            Some(done_place)
+        } else {
+            None
+        };
         let depth = self.owned.len();
         let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.jump(head, &[]);
         self.enter(head);
         let Some(cur) = self.read(cur_place) else { bail!("range cursor has no value") };
-        let cc = if signed { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan };
-        let cond = self.ins().icmp(cc, cur, end);
+        let cc = match (signed, inclusive) {
+            (true, false) => IntCC::SignedLessThan,
+            (false, false) => IntCC::UnsignedLessThan,
+            (true, true) => IntCC::SignedLessThanOrEqual,
+            (false, true) => IntCC::UnsignedLessThanOrEqual,
+        };
+        let in_bounds = self.ins().icmp(cc, cur, end);
+        let cond = if let Some(done_place) = done_place {
+            let Some(done) = self.read(done_place) else { bail!("range done has no value") };
+            let zero = self.ins().iconst(Type::I8, 0);
+            let not_done = self.ins().icmp(IntCC::Equal, done, zero);
+            self.ins().band(not_done, in_bounds)
+        } else {
+            in_bounds
+        };
         self.brif(cond, (inner, &[]), (exit, &[]));
         self.enter(inner);
+        if let Some(done_place) = done_place {
+            let at_end = self.ins().icmp(IntCC::Equal, cur, end);
+            self.write(done_place, at_end);
+        }
         let one = self.ins().iconst(ir_ty, 1);
         let next = self.ins().iadd(cur, one);
         self.write(cur_place, next);

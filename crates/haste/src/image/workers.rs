@@ -72,7 +72,9 @@ impl Image {
         if work.is_empty() {
             return Vec::new();
         }
-        work.iter().for_each(|&index| self.slot(index).store(0, Ordering::Release));
+        if self.mode == super::ImageMode::Jit {
+            work.iter().for_each(|&index| self.slot(index).store(0, Ordering::Release));
+        }
         let cfg = DictConfig::from_env();
         self.pass.stencils.cfg = cfg;
         let had_templates = !self.pass.stencils.templates.is_empty();
@@ -118,7 +120,9 @@ impl Image {
     /// Clears the slots of a worker that panicked, whose code chunks unmapped as it unwound, and gives each of its functions an error.
     fn lost(&self, cx: &Context<'_>, reached: &Reached, shard: &[Vec<usize>]) -> Vec<(usize, String)> {
         let lost = shard.iter().flatten().map(|&index| {
-            self.slot(index).store(0, Ordering::Release);
+            if self.mode == super::ImageMode::Jit {
+                self.slot(index).store(0, Ordering::Release);
+            }
             (index, format!("{}: compile worker panicked", cx.name(reached.list[index].0.0)))
         });
         lost.collect()

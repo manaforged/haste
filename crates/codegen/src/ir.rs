@@ -489,12 +489,20 @@ pub struct Function {
     pub(crate) entry: Option<Block>,
     /// The split that turns this function into a coroutine's resume function, when it is one.
     pub coroutine: Option<crate::coroutine::Coroutine>,
+    pub(crate) self_slots: Vec<u32>,
 }
 
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new() }
+    }
+
+    /// Marks relocation slot `sym` as a direct self-recursive target of this function.
+    pub fn add_self_slot(&mut self, sym: u32) {
+        if !self.self_slots.contains(&sym) {
+            self.self_slots.push(sym);
+        }
     }
 
     /// The type of `value`.

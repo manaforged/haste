@@ -219,6 +219,13 @@ impl<K, V> Flight<K, V> {
         *lock(&slot.state) = SlotState::Failed;
         slot.ready.notify_all();
     }
+
+    pub fn retain_keys(&self, mut keep: impl FnMut(&K) -> bool)
+    where
+        K: Eq + Hash,
+    {
+        self.inner.slots.retain(|k, _| keep(k));
+    }
 }
 
 impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {

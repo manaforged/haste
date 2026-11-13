@@ -111,9 +111,9 @@ fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reache
 
 impl Batch {
     /// Infers and compiles every root `pick` finds in `workspace` from nothing.
-    fn new(workspace: &graph::Workspace, compilation: &mut Compilation, pick: Pick, record_aot: bool) -> Result<Batch> {
+    fn new(workspace: &graph::Workspace, compilation: &mut Compilation, pick: Pick, mode: crate::image::ImageMode, drop_finals: bool) -> Result<Batch> {
         let reach_clock = sema::census::Clock::now();
-        let main = if record_aot { Some(main_item(workspace, &compilation.outline).context("no member binary has a `main`")?) } else { None };
+        let main = if mode == crate::image::ImageMode::Aot { Some(main_item(workspace, &compilation.outline).context("no member binary has a `main`")?) } else { None };
         let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, pick) };
         let mut cache = Cache::default();
         let substrate_key = crate::substrate::enabled().then(|| {
@@ -142,7 +142,10 @@ impl Batch {
             |mut cx, reached| {
                 let reach_span = reach_clock.elapsed();
                 let codegen_clock = sema::census::Clock::now();
-                let (image, broken) = Image::build(&mut cx, &reached, record_aot)?;
+                if drop_finals {
+                    cx.clear_finals();
+                }
+                let (image, broken) = Image::build(&mut cx, &reached, mode)?;
                 let codegen_span = codegen_clock.elapsed();
                 if let Some((key, target_key)) = substrate_key
                     && image.has_new_frozen_stencils()
@@ -286,18 +289,27 @@ impl Build {
                     anyhow::bail!("{}", errors.join("\n"));
                 }
             }
-            self.cases = Some(Batch::new(workspace, &mut self.compilation, case_items, false)?);
+            self.cases = Some(Batch::new(workspace, &mut self.compilation, case_items, crate::image::ImageMode::Jit, false)?);
         }
         Ok(())
     }
 
     /// Infers and compiles every function the binary's `main` reaches unless that is done.
     pub fn compile_binary(&mut self, workspace: &graph::Workspace) -> Result<()> {
+        self.compile_binary_with(workspace, false)
+    }
+
+    /// Infers and check-compiles `main` for one-shot `haste build`, dropping `Store.finals` before codegen.
+    pub fn compile_binary_oneshot(&mut self, workspace: &graph::Workspace) -> Result<()> {
+        self.compile_binary_with(workspace, true)
+    }
+
+    fn compile_binary_with(&mut self, workspace: &graph::Workspace, drop_finals: bool) -> Result<()> {
         if main_item(workspace, &self.compilation.outline).is_none() {
             bail!("no member binary has a `main`");
         }
         if self.binary.is_none() {
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, false)?);
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, crate::image::ImageMode::Check, drop_finals)?);
         }
         Ok(())
     }
@@ -391,7 +403,7 @@ impl Build {
     pub(crate) fn emit_executable(&mut self, workspace: &graph::Workspace, path: &std::path::Path) -> Result<i32> {
         let started = Instant::now();
         if self.binary.is_none() {
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, true)?);
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, crate::image::ImageMode::Aot, false)?);
         }
         let bin = self.binary.as_ref().context("the binary is not compiled")?;
         if bin.broken.contains_key(&bin.roots[0]) || bin.broken.contains_key(&bin.roots[1]) {

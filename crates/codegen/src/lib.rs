@@ -25,6 +25,7 @@ mod reloc;
 mod returns;
 mod split;
 mod switch;
+mod tailrec;
 mod target;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
@@ -136,6 +137,9 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
         licm::run(func);
     }
     returns::run(func);
+    if effort == Effort::Full && tailrec::run(func) {
+        fold::compact(func);
+    }
 }
 
 /// Encodes `func` for `target`.

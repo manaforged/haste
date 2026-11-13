@@ -147,9 +147,10 @@ pub enum Atomic {
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
 const LLVM: [(&str, Intrinsic); 3] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32)), ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::BytePairMax)];
 
-const NAMES: [(&str, Intrinsic); 159] = {
+const NAMES: [(&str, Intrinsic); 160] = {
     use Intrinsic::*;
     [
+        ("cold_path", NoOp),
         ("wrapping_add", WrappingAdd),
         ("wrapping_sub", WrappingSub),
         ("wrapping_mul", WrappingMul),

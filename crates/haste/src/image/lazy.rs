@@ -261,7 +261,7 @@ impl Jit {
 
     fn create(store: Cache, (shared_bytes, state_bytes, code_bytes, table_slots): (usize, usize, usize, usize)) -> Result<Jit> {
         let reached = Reached::default();
-        let mut image = Image::create(&reached, false, (shared_bytes, state_bytes, table_slots))?;
+        let mut image = Image::create(&reached, super::ImageMode::Jit, (shared_bytes, state_bytes, table_slots))?;
         image.jit_mode = true;
         image.stubs.reserve(table_slots * stub::STUB_BYTES)?;
         image.pass.memory.reserve(code_bytes)?;

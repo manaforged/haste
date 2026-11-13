@@ -15,7 +15,7 @@ use haste_codegen::{Code, RelocKind, Site, StencilReloc, Target};
 use rustc_hash::FxHasher;
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 48;
@@ -224,9 +224,8 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
     target.triple.hash(&mut hasher);
     target.effort.hash(&mut hasher);
     crate::graph::store::program().hash(&mut hasher);
-    if let Ok(exe) = std::env::current_exe() {
-        hash_file_meta(&exe, &mut hasher);
-    }
+    MAGIC.hash(&mut hasher);
+    VERSION.hash(&mut hasher);
     for (_, _, idx) in sysroot_units {
         let unit = &workspace.graph.units[idx];
         let pkg = &workspace.packages[unit.package];

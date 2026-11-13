@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use rustc_hash::FxHashMap as HashMap;
 
@@ -204,11 +205,183 @@ fn drain(cx: &mut Context<'_>, reached: &mut Reached, queue: Vec<Instance>) -> V
 fn drain_wave(cx: &mut Context<'_>, reached: &mut Reached, mut wave: Vec<usize>, force_commit: bool) -> Vec<usize> {
     let mut added = Vec::new();
     while !wave.is_empty() {
-        let (settled, next) = run_wave(cx, reached, &wave, false, force_commit);
+        if crate::jobs() > 1 && wave.len() >= MIN_PARALLEL_WAVE {
+            added.extend(parallel_drain(cx, reached, wave, force_commit));
+            break;
+        }
+        let (settled, next) = serial_wave(cx, reached, &wave, false, force_commit);
         added.extend_from_slice(&settled);
         wave = enqueue(reached, next);
     }
     added
+}
+
+struct WaveQueue {
+    seen: HashMap<Instance, usize>,
+    instances: Vec<Instance>,
+    queue: VecDeque<(usize, Instance)>,
+    settled: Vec<(usize, Result<Arc<Typed>, String>, Vec<String>, bool)>,
+    deferred_items: Vec<(usize, Instance)>,
+    active: usize,
+}
+
+struct ActiveGuard<'a>(&'a Mutex<WaveQueue>, &'a Condvar, usize);
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        if self.2 > 0 {
+            let mut q = crate::sync::lock(self.0);
+            q.active = q.active.saturating_sub(self.2);
+            self.1.notify_all();
+        }
+    }
+}
+
+fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: Vec<usize>, force_commit: bool) -> Vec<usize> {
+    let workers = crate::jobs();
+    let seen = std::mem::take(&mut reached.index);
+    let instances: Vec<Instance> = reached.list.iter().map(|&(inst, _)| inst).collect();
+    let queue: VecDeque<(usize, Instance)> = wave.iter().map(|&at| (at, instances[at])).collect();
+    let shared = (Mutex::new(WaveQueue { seen, instances, queue, settled: Vec::new(), deferred_items: Vec::new(), active: 0 }), Condvar::new());
+    loop {
+        let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
+        let shared_ref = &shared;
+        cx.in_parallel = true;
+        let joined = std::thread::scope(|scope| {
+            let handles: Vec<_> = forks
+                .into_iter()
+                .map(|mut fork| {
+                    scope.spawn(move || {
+                        wavefront_worker(&mut fork, shared_ref, force_commit);
+                        let deferred = fork.take_deferred_evals();
+                        let (_, asks) = fork.release();
+                        (asks, deferred)
+                    })
+                })
+                .collect();
+            wavefront_worker(cx, shared_ref, force_commit);
+            handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect::<Vec<_>>()
+        });
+        cx.in_parallel = false;
+        let mut deferred = cx.take_deferred_evals();
+        for (asks, worker_deferred) in joined.into_iter().flatten() {
+            cx.asks.repeat(&asks);
+            deferred.extend(worker_deferred);
+        }
+        if !deferred.is_empty() {
+            eval_deferred_list(cx, deferred);
+        }
+        let deferred_items = {
+            let mut q = crate::sync::lock(&shared.0);
+            std::mem::take(&mut q.deferred_items)
+        };
+        if deferred_items.is_empty() {
+            break;
+        }
+        if deferred_items.len() < MIN_PARALLEL_WAVE {
+            let mut extra = Vec::new();
+            for (at, instance) in deferred_items {
+                let asks0 = cx.asks.count();
+                let mut unlaid = Vec::new();
+                let typed = infer_entry(cx, &instance, &mut unlaid, false);
+                let asked = cx.asks.count() > asks0;
+                let callees: Vec<Instance> = if !force_commit && asked { Vec::new() } else { calls(cx, &typed).collect() };
+                extra.push((at, typed, unlaid, !force_commit && asked, callees));
+            }
+            let mut q = crate::sync::lock(&shared.0);
+            for (at, typed, unlaid, blocked, callees) in extra {
+                q.settled.push((at, typed, unlaid, blocked));
+                for callee in callees {
+                    if !q.seen.contains_key(&callee) {
+                        let next_at = q.instances.len();
+                        q.seen.insert(callee, next_at);
+                        q.instances.push(callee);
+                        q.queue.push_back((next_at, callee));
+                    }
+                }
+            }
+            if q.queue.is_empty() {
+                break;
+            }
+        } else {
+            let mut q = crate::sync::lock(&shared.0);
+            q.queue.extend(deferred_items);
+        }
+    }
+    let q = shared.0.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    reached.index = q.seen;
+    for inst in q.instances.into_iter().skip(reached.list.len()) {
+        reached.list.push((inst, Err(String::new())));
+    }
+    let mut added = Vec::with_capacity(q.settled.len());
+    for (at, typed, unlaid, blocked) in q.settled {
+        reached.list[at].1 = typed;
+        if blocked {
+            reached.blocked.push(at);
+        } else {
+            reached.unlaid.extend(unlaid);
+            added.push(at);
+        }
+    }
+    added
+}
+
+fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Condvar), force_commit: bool) {
+    let mut batch = Vec::with_capacity(4);
+    let mut results = Vec::with_capacity(4);
+    loop {
+        batch.clear();
+        {
+            let mut q = crate::sync::lock(mutex);
+            while q.queue.is_empty() {
+                if q.active == 0 {
+                    cvar.notify_all();
+                    return;
+                }
+                q = cvar.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            for _ in 0..4 {
+                let Some(item) = q.queue.pop_front() else { break };
+                batch.push(item);
+            }
+            q.active += batch.len();
+        }
+        let mut active = ActiveGuard(mutex, cvar, batch.len());
+        results.clear();
+        for &(at, instance) in &batch {
+            let asks0 = cx.asks.count();
+            let mut unlaid = Vec::new();
+            let before = cx.deferred_evals.len();
+            let typed = infer_entry(cx, &instance, &mut unlaid, false);
+            let deferred = cx.deferred_evals.len() > before;
+            let asked = cx.asks.count() > asks0;
+            let callees: Vec<Instance> = if !deferred && (force_commit || !asked) { calls(cx, &typed).collect() } else { Vec::new() };
+            results.push((at, instance, typed, unlaid, asked, deferred, callees));
+        }
+        {
+            let mut q = crate::sync::lock(mutex);
+            q.active = q.active.saturating_sub(active.2);
+            active.2 = 0;
+            for (at, instance, typed, unlaid, asked, deferred, callees) in results.drain(..) {
+                if deferred {
+                    q.deferred_items.push((at, instance));
+                } else if !force_commit && asked {
+                    q.settled.push((at, typed, unlaid, true));
+                } else {
+                    q.settled.push((at, typed, unlaid, false));
+                    for callee in callees {
+                        if !q.seen.contains_key(&callee) {
+                            let next_at = q.instances.len();
+                            q.seen.insert(callee, next_at);
+                            q.instances.push(callee);
+                            q.queue.push_back((next_at, callee));
+                        }
+                    }
+                }
+            }
+            cvar.notify_all();
+        }
+    }
 }
 
 fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {

@@ -11,6 +11,7 @@ pub mod impls;
 pub mod infer;
 pub mod intrinsic;
 pub mod layout;
+mod lookups;
 pub mod reach;
 pub mod substs;
 pub mod summary;
@@ -18,7 +19,10 @@ pub mod table;
 pub mod traits;
 pub mod ty;
 
-use std::sync::{Arc, RwLock};
+pub use lookups::{Answer, Cache, Edited};
+use lookups::{Naming, SegKey, TypeScope};
+
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use rustc_hash::FxHashMap as HashMap;
@@ -36,336 +40,7 @@ use crate::outline::source::Source;
 use table::Table;
 use ty::Types;
 
-type TypeScope = (ModRef, Option<ItemRef>, Option<ItemRef>, bool, Option<u32>);
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct SegKey {
-    inline: [u32; 4],
-    len: u8,
-    overflow: Option<Arc<[crate::names::Sym]>>,
-}
-
-impl SegKey {
-    fn from_slice(segments: &[crate::names::Sym]) -> Self {
-        let mut inline = [0; 4];
-        if segments.len() <= inline.len() {
-            for (slot, sym) in inline.iter_mut().zip(segments) {
-                *slot = sym.0;
-            }
-            return Self { inline, len: segments.len() as u8, overflow: None };
-        }
-        Self { inline, len: u8::MAX, overflow: Some(Arc::from(segments)) }
-    }
-}
-
 pub(super) use crate::sync::{read_lock, write_lock};
-
-#[derive(Default)]
-pub(super) struct RunnerSlot(std::sync::Mutex<Option<Box<dyn evaluate::Evaluate>>>);
-
-impl RunnerSlot {
-    pub(super) fn take(&self) -> Option<Box<dyn evaluate::Evaluate>> { crate::sync::lock(&self.0).take() }
-    pub(super) fn put(&self, runner: Box<dyn evaluate::Evaluate>) {
-        let mut guard = crate::sync::lock(&self.0);
-        if guard.is_none() { *guard = Some(runner); }
-    }
-    pub(super) fn clear(&self) { *crate::sync::lock(&self.0) = None; }
-}
-
-/// What Sema keeps between passes over a growing outline: interned types and parsed headers and bodies.
-#[derive(Clone, Default)]
-pub struct Cache {
-    types: Types,
-    signatures: Table<ItemRef, Arc<Signature>>,
-    bodies: Table<ItemRef, Arc<Body>>,
-    adts: Table<ItemRef, Arc<AdtDef>>,
-    layouts: Table<ty::Ty, Arc<layout::Layout>>,
-    tails: Table<ty::Ty, ty::Ty>,
-    headers: Table<impls::ImplRef, Arc<sig::ImplHeader>>,
-    finals: Table<reach::Instance, Arc<infer::Typed>>,
-    closures: Table<ty::Ty, Arc<infer::ClosureInfo>>,
-    pub(super) evaluated: Table<reach::Instance, u128>,
-    pub(super) runner: Arc<RunnerSlot>,
-    lookups: Lookups,
-}
-
-#[derive(Default)]
-struct OutlineState {
-    langs: RwLock<Option<traits::Langs>>,
-    loaded: RwLock<Vec<[usize; 5]>>,
-    primitives: RwLock<Option<Arc<[u32]>>>,
-}
-
-/// The lookups Sema caches about one outline, which hold while only function bodies change.
-#[derive(Clone, Default)]
-struct Lookups {
-    modules: Table<u32, Arc<HashMap<(u32, u32), u32>>>,
-    heads: Table<impls::Holder, Arc<impls::Index>>,
-    owners: Table<u32, Arc<HashMap<(u32, Option<u32>), u32>>>,
-    trait_defs: Table<ItemRef, Arc<traits::TraitGenerics>>,
-    discriminants: Table<ItemRef, Arc<[i128]>>,
-    state: Arc<OutlineState>,
-    drops: Table<ty::Ty, bool>,
-    glues: Table<ty::Ty, Option<infer::Res>>,
-    fields: Table<ty::Ty, infer::Fields>,
-    forms: Table<(infer::Form, usize), Option<infer::Fields>>,
-    reveals: table::Flight<reach::Instance, ty::Ty>,
-    futures: Table<ty::Ty, ty::Ty>,
-    scope_traits: Table<ModRef, Arc<[ItemRef]>>,
-    type_defs: Table<(TypeScope, SegKey), crate::names::Def>,
-    impl_traits: Table<impls::ImplRef, Option<ItemRef>>,
-    selections: Table<(ItemRef, ty::Ty, substs::Substs), Option<(impls::ImplRef, substs::Substs)>>,
-    projections: Table<(ItemRef, ty::Ty, substs::Substs, crate::names::Sym, substs::Substs), Option<ty::Ty>>,
-    summaries: table::Flight<ItemRef, summary::SummaryKind>,
-    substrate: Option<Arc<crate::substrate::Substrate>>,
-    sysroot_index: Arc<std::sync::OnceLock<Arc<summary::codec::SysrootIndex>>>,
-}
-
-/// What answering the asks of a pass added: nothing new to infer with, the output of procedural macros that function bodies call, or loaded files, resolved names and expanded items.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Answer {
-    Nothing,
-    Bodies,
-    Names,
-}
-
-impl Lookups {
-    /// The lookups that hold across a wave answer: everything on `Nothing`/`Bodies`, and settled summaries, complete crate impl indexes, and item metadata on `Names`.
-    fn after_pass(&mut self, answer: Answer) -> Lookups {
-        if !matches!(answer, Answer::Names) {
-            return std::mem::take(self);
-        }
-        let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
-        let selections = self.selections.retained(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
-        let projections = self.projections.retained(|_, found| found.is_some());
-        Lookups {
-            heads,
-            trait_defs: std::mem::take(&mut self.trait_defs),
-            discriminants: std::mem::take(&mut self.discriminants),
-            state: Arc::clone(&self.state),
-            drops: std::mem::take(&mut self.drops),
-            glues: self.glues.retained(|_, found| found.is_some()),
-            fields: std::mem::take(&mut self.fields),
-            forms: self.forms.retained(|_, found| found.is_some()),
-            futures: std::mem::take(&mut self.futures),
-            impl_traits: std::mem::take(&mut self.impl_traits),
-            selections,
-            projections,
-            summaries: std::mem::take(&mut self.summaries),
-            substrate: self.substrate.clone(),
-            sysroot_index: Arc::clone(&self.sysroot_index),
-            ..Lookups::default()
-        }
-    }
-
-    /// Drops only the crate impl indexes (and summaries/discriminants if items were consumed) for crates whose extent changed since they were built.
-    fn check(&mut self, outline: &Outline) {
-        let loaded: Vec<[usize; 5]> = outline.crates.iter().map(crate::outline::tree::Crate::extent).collect();
-        let mut guard = write_lock(&self.state.loaded);
-        if *guard != loaded {
-            if guard.len() == loaded.len() {
-                self.heads.retain(|holder, _| match *holder {
-                    impls::Holder::Crate(k) => guard.get(k as usize) == loaded.get(k as usize),
-                    impls::Holder::Body(item) => guard.get(item.krate as usize) == loaded.get(item.krate as usize),
-                });
-                if guard.iter().zip(&loaded).any(|(a, b)| a[3] != b[3]) {
-                    self.summaries = table::Flight::default();
-                    self.discriminants.clear();
-                }
-            } else {
-                self.heads.clear();
-                self.discriminants.clear();
-                self.summaries = table::Flight::default();
-            }
-            *write_lock(&self.state.langs) = None;
-            *write_lock(&self.state.primitives) = None;
-            self.sysroot_index = Arc::new(std::sync::OnceLock::new());
-            *guard = loaded;
-        }
-    }
-}
-
-impl Cache {
-    /// Attaches a frozen sysroot substrate to serve pre-computed `PolySummary` entries.
-    pub fn set_substrate(&mut self, substrate: Option<Arc<crate::substrate::Substrate>>) {
-        self.lookups.substrate = substrate;
-        self.lookups.sysroot_index = Arc::new(std::sync::OnceLock::new());
-    }
-
-    /// Returns the attached frozen sysroot substrate, if any.
-    pub fn substrate(&self) -> Option<&Arc<crate::substrate::Substrate>> {
-        self.lookups.substrate.as_ref()
-    }
-
-    /// Encodes all settled sysroot `PolySummary` entries into `builder`.
-    pub fn export_sysroot_summaries(&self, outline: &Outline, builder: &mut crate::substrate::SubstrateBuilder) -> Result<()> {
-        let mut err = None;
-        self.lookups.summaries.for_each_ready(|&item, kind| {
-            if err.is_some() {
-                return;
-            }
-            let tree = &outline.crates[item.krate as usize];
-            if !tree.env.release || !tree.env.fixed {
-                return;
-            }
-            if let summary::SummaryKind::Poly(summary) = kind
-                && let Some(key) = crate::substrate::sysroot_item_key(outline, item)
-                && let Ok(Some(bytes)) = summary::codec::encode_summary(outline, &self.types, summary, crate::substrate::sysroot_item_key)
-                && let Err(e) = builder.add_summary(key, &bytes)
-            {
-                err = Some(e);
-            }
-        });
-        match err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
-    /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.
-    pub fn forget_lookups(&mut self) {
-        self.lookups = Lookups {
-            substrate: self.lookups.substrate.clone(),
-            sysroot_index: Arc::clone(&self.lookups.sysroot_index),
-            ..Lookups::default()
-        };
-    }
-
-    /// Drops the cached lookups that `answer` may make stale, keeping settled summaries and unchanged crate indexes.
-    pub fn forget_after(&mut self, answer: Answer) {
-        self.lookups = self.lookups.after_pass(answer);
-    }
-
-    /// Drops what the store keeps about the items that `edited` holds, and about the instances, types and lookups that name one of them.
-    pub fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
-        let mine = |item: ItemRef| edited.holds(item.krate, item.file);
-        let block_kept = |block: &impls::ImplRef| match *block {
-            impls::ImplRef::Module { krate, index } => {
-                outline.crates[krate as usize].impls.get(index as usize).is_some_and(|entry| !edited.holds(krate, entry.file as u32) && !entry.parts.iter().any(|&part| edited.holds(krate, part as u32)))
-            }
-            impls::ImplRef::Body(item) => !mine(item),
-        };
-        self.signatures.retain(|item, _| !mine(*item));
-        self.bodies.retain(|item, _| !mine(*item));
-        self.adts.retain(|item, _| !mine(*item));
-        self.headers.retain(|block, _| block_kept(block));
-        let mut naming = Naming { types: &self.types, mine: &mine, memo: HashMap::default() };
-        self.finals.retain(|instance, _| !naming.touches(instance));
-        self.layouts.retain(|ty, _| !naming.names(*ty));
-        self.tails.retain(|ty, _| !naming.names(*ty));
-        self.closures.retain(|ty, _| !naming.names(*ty));
-        self.evaluated.retain(|instance, _| !naming.touches(instance));
-        self.runner.clear();
-        self.lookups.forget_edited(edited, &mut naming, &mine, &block_kept);
-    }
-
-    /// Drops what the store keeps about what `edited` holds and returns the indexes of the instances in `list` that it touched.
-    pub fn invalidate<'l>(&mut self, outline: &Outline, list: impl Iterator<Item = &'l reach::Instance>, edited: Edited<'_>) -> Vec<usize> {
-        let touched = self.touched(list, edited);
-        self.forget(outline, edited);
-        touched
-    }
-
-    /// The indexes of the instances in `list` that are functions `edited` holds or take a type that names one of its items.
-    pub fn touched<'l>(&self, list: impl Iterator<Item = &'l reach::Instance>, edited: Edited<'_>) -> Vec<usize> {
-        let mine = |item: ItemRef| edited.holds(item.krate, item.file);
-        let mut naming = Naming { types: &self.types, mine: &mine, memo: HashMap::default() };
-        list.enumerate().filter(|(_, instance)| naming.touches(instance)).map(|(at, _)| at).collect()
-    }
-}
-
-impl Lookups {
-    fn forget_edited<F: Fn(ItemRef) -> bool>(&mut self, edited: Edited<'_>, naming: &mut Naming<'_, F>, mine: &F, block_kept: &dyn Fn(&impls::ImplRef) -> bool) {
-        self.drops.retain(|ty, _| !naming.names(*ty));
-        self.glues.retain(|ty, _| !naming.names(*ty));
-        self.fields.retain(|ty, _| !naming.names(*ty));
-        self.forms.retain(|(form, _), found| {
-            let own = match *form {
-                infer::Form::Adt(item) | infer::Form::Fn(item) => !mine(item),
-                infer::Form::Impl(block) => block_kept(&block),
-            };
-            own && found.iter().flat_map(|types| types.iter().flatten()).all(|&ty| !naming.names(ty))
-        });
-        self.reveals.retain(|instance| !naming.touches(instance));
-        self.futures.retain(|ty, _| !naming.names(*ty));
-        self.impl_traits.retain(|block, _| block_kept(block));
-        self.heads.retain(|holder, _| match *holder {
-            impls::Holder::Crate(krate) => !edited.touches_crate(krate),
-            impls::Holder::Body(item) => !mine(item),
-        });
-        self.modules.retain(|krate, _| !edited.touches_crate(*krate));
-        self.owners.retain(|krate, _| !edited.touches_crate(*krate));
-        self.scope_traits.retain(|home, _| !edited.touches_crate(home.krate));
-        self.type_defs.retain(|key, _| !edited.touches_crate(key.0.0.krate));
-        self.trait_defs.retain(|item, _| !mine(*item));
-        self.selections.clear();
-        self.projections.clear();
-        self.summaries = table::Flight::default();
-        self.discriminants.retain(|item, _| !mine(*item));
-        let mut langs = write_lock(&self.state.langs);
-        if langs.as_ref().is_some_and(|found| found.crates.iter().any(|&krate| edited.touches_crate(krate))) {
-            *langs = None;
-        }
-    }
-}
-
-/// What an edit changed: function bodies in some `(crate, file)` slots, or whole crates read again.
-#[derive(Clone, Copy, Debug)]
-pub enum Edited<'e> {
-    /// Function bodies in these `(crate, file)` slots.
-    Files(&'e [(u32, u32)]),
-    /// Every file of these crates.
-    Crates(&'e [u32]),
-}
-
-impl Edited<'_> {
-    fn holds(self, krate: u32, file: u32) -> bool {
-        match self {
-            Edited::Files(files) => files.contains(&(krate, file)),
-            Edited::Crates(crates) => crates.contains(&krate),
-        }
-    }
-
-    fn touches_crate(self, krate: u32) -> bool {
-        match self {
-            Edited::Files(files) => files.iter().any(|&(owner, _)| owner == krate),
-            Edited::Crates(crates) => crates.contains(&krate),
-        }
-    }
-}
-
-/// Which types name an item for which `mine` holds, remembered per type.
-struct Naming<'t, F> {
-    types: &'t Types,
-    mine: &'t F,
-    memo: HashMap<ty::Ty, bool>,
-}
-
-impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
-    fn touches(&mut self, (item, substs): &reach::Instance) -> bool {
-        (self.mine)(*item) || self.types.substs(*substs).iter().any(|ty| self.names(*ty))
-    }
-
-    /// Whether `ty` names, at any depth, an item or a closure of an item for which `mine` holds.
-    fn names(&mut self, ty: ty::Ty) -> bool {
-        if let Some(&known) = self.memo.get(&ty) {
-            return known;
-        }
-        let kind = self.types.kind(ty);
-        let own = match kind {
-            ty::Kind::Adt(item, _) | ty::Kind::FnDef(item, _) | ty::Kind::Closure(item, ..) | ty::Kind::Dyn(item, ..) => (self.mine)(*item),
-            ty::Kind::Proj(id) => {
-                let def = self.types.proj(*id);
-                (self.mine)(def.of) || (self.mine)(def.assoc)
-            }
-            _ => false,
-        };
-        let inner: Vec<ty::Ty> = kind.children(self.types).collect();
-        let found = own || inner.into_iter().any(|inner| self.names(inner));
-        self.memo.insert(ty, found);
-        found
-    }
-}
 
 /// Everything Sema reads in one pass, with its caches and the lookups that found nothing loaded yet.
 pub struct Context<'a> {
@@ -402,6 +77,11 @@ impl<'a> Context<'a> {
     /// Returns the shared inference cache attached to this context.
     pub(crate) fn store(&self) -> &Cache {
         &self.store
+    }
+
+    /// Drops all cached final `Typed` bodies from the store to free memory before codegen.
+    pub(crate) fn clear_finals(&mut self) {
+        self.store.finals.clear();
     }
 
     /// A pass over an outline and its resolved names that reuses `store`.
@@ -471,12 +151,12 @@ impl<'a> Context<'a> {
     }
 
     /// The cached type-namespace definition for `segments` in `scope`.
-    pub fn type_def(&self, scope: (ModRef, Option<ItemRef>, Option<ItemRef>, bool, Option<u32>), segments: &[crate::names::Sym]) -> Option<crate::names::Def> {
+    pub fn type_def(&self, scope: TypeScope, segments: &[crate::names::Sym]) -> Option<crate::names::Def> {
         self.store.lookups.type_defs.get(&(scope, SegKey::from_slice(segments)))
     }
 
     /// Caches `def` as the type-namespace definition for `segments` in `scope`.
-    pub fn set_type_def(&self, scope: (ModRef, Option<ItemRef>, Option<ItemRef>, bool, Option<u32>), segments: &[crate::names::Sym], def: crate::names::Def) {
+    pub fn set_type_def(&self, scope: TypeScope, segments: &[crate::names::Sym], def: crate::names::Def) {
         self.store.lookups.type_defs.insert((scope, SegKey::from_slice(segments)), def);
     }
 
