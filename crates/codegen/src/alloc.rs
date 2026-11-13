@@ -569,9 +569,15 @@ fn zero_ext<R>(func: &Function, order: &[Block], locations: &[Location<R>], cens
                     let src_ty = func.types[shifted.index()];
                     let dst_bits = func.types[res.index()].bits();
                     matches!(src_ty, Type::I64 | Type::I32)
-                        && census.def_inst[shifted.index()].is_some_and(|def| {
-                            matches!(func.insts[def.index()].op, Op::Binary(Binary::Ushr, _, c)
-                                if matches!(locations[c.index()], Location::Imm(shift) if (0..i64::from(src_ty.bits())).contains(&shift) && src_ty.bits() - (shift as u32) <= dst_bits))
+                        && census.def_inst[shifted.index()].is_some_and(|def| match func.insts[def.index()].op {
+                            Op::Binary(Binary::Ushr, _, c) => {
+                                matches!(locations[c.index()], Location::Imm(shift) if (0..i64::from(src_ty.bits())).contains(&shift) && src_ty.bits() - (shift as u32) <= dst_bits)
+                            }
+                            Op::Binary(Binary::Band, a, b) if dst_bits <= 32 => {
+                                let mask = (1_i64 << dst_bits) - 1;
+                                fits_mask(a, mask) || fits_mask(b, mask)
+                            }
+                            _ => false,
                         })
                 }
                 _ => false,

@@ -7,9 +7,10 @@ use crate::names::{ItemRef, Primitive};
 
 use super::super::Context;
 use super::super::infer::{LazyTables, Res, Shape, Typed, body_relaxes_sized, maybe_unsized, param_relaxes_sized};
+use super::super::impls::head;
 use super::super::intrinsic::Intrinsic;
 use super::super::substs::Substs;
-use super::super::summary::{ConstHole, PolyObligation, SummaryKind};
+use super::super::summary::{ConstHole, PolyObligation, poly_summary};
 use super::super::ty::{Kind, Ty};
 use super::Instance;
 
@@ -37,24 +38,13 @@ impl ReachFilter {
         if !visiting.insert(item) {
             return Some(false);
         }
-        let summary = match cx.store.lookups.summaries.get_ready(&item) {
-            Some(SummaryKind::Poly(summary)) => summary,
-            Some(SummaryKind::MonomorphicFallback) => {
-                visiting.remove(&item);
-                self.sealed_cache.insert(item, false);
-                return Some(false);
-            }
-            None => match super::super::summary::frozen::frozen_summary(cx, item) {
-                Some(summary) => summary,
-                None => {
-                    visiting.remove(&item);
-                    return None;
-                }
-            },
+        let Some(summary) = poly_summary(cx, item) else {
+            visiting.remove(&item);
+            self.sealed_cache.insert(item, false);
+            return Some(false);
         };
         let local_ok = summary.projections.is_empty()
             && summary.obligations.iter().all(|o| matches!(o, PolyObligation::Prove { .. }))
-            && summary.call_holes.is_empty()
             && summary.op_holes.is_empty()
             && summary.const_holes.iter().all(|h| matches!(h, ConstHole::Intrinsic { .. }))
             && summary.template.closures.is_empty()
@@ -77,6 +67,17 @@ impl ReachFilter {
                 None => all_ready = false,
             }
         }
+        for &(_, hole_item, hole_substs) in &summary.call_holes {
+            match self.call_hole_sealed(cx, hole_item, hole_substs, visiting) {
+                Some(true) => {}
+                Some(false) => {
+                    visiting.remove(&item);
+                    self.sealed_cache.insert(item, false);
+                    return Some(false);
+                }
+                None => all_ready = false,
+            }
+        }
         visiting.remove(&item);
         if all_ready {
             self.sealed_cache.insert(item, true);
@@ -84,6 +85,58 @@ impl ReachFilter {
         } else {
             None
         }
+    }
+
+    fn call_hole_sealed(&mut self, cx: &mut Context<'_>, item: ItemRef, substs: Substs, visiting: &mut HashSet<ItemRef>) -> Option<bool> {
+        let Some(tr) = cx.owner_trait(item) else { return Some(false) };
+        if !cx.outline.is_fixed(tr.krate) {
+            return Some(false);
+        }
+        let Ok(tg) = cx.trait_generics(tr) else { return Some(false) };
+        let count = 1 + tg.1.params.iter().filter(|g| g.kind != GenericKind::Lifetime).count();
+        let slice = cx.types.substs(substs).to_vec();
+        if slice.len() < count || slice[1..count].iter().any(|&ty| ty_has_non_fixed(cx, ty)) {
+            return Some(false);
+        }
+        let ok_head = match *cx.types.kind(slice[0]) {
+            Kind::Prim(_) | Kind::Never | Kind::Ptr(..) | Kind::Slice(..) | Kind::Array(..) | Kind::FnPtr(..) => true,
+            Kind::Adt(adt, _) => cx.outline.is_fixed(adt.krate) && cx.lang(adt) != Some("owned_box") && cx.attr_at(adt, "fundamental").is_none(),
+            _ => false,
+        };
+        if !ok_head {
+            return Some(false);
+        }
+        let mut holders = vec![tr.krate];
+        let mut stack: Vec<Ty> = slice[..count].to_vec();
+        while let Some(ty) = stack.pop() {
+            let kind = cx.types.kind(ty).clone();
+            if let Kind::Adt(def, _) | Kind::Dyn(def, ..) = kind
+                && cx.outline.is_fixed(def.krate)
+                && !holders.contains(&def.krate)
+            {
+                holders.push(def.krate);
+            }
+            stack.extend(kind.children(&cx.types));
+        }
+        let Some(head_key) = head(cx.types.kind(slice[0])) else { return Some(false) };
+        let blocks = cx.trait_impls(tr, Some(head_key), &holders);
+        if blocks.is_empty() {
+            return Some(false);
+        }
+        let name = cx.name(item);
+        let mut all_ready = true;
+        for block in blocks {
+            if cx.reserved(block) {
+                continue;
+            }
+            let member = cx.member(block, name).unwrap_or(item);
+            match self.check_sealed(cx, member, visiting) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None => all_ready = false,
+            }
+        }
+        all_ready.then_some(true)
     }
 }
 

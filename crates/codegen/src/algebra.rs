@@ -554,6 +554,22 @@ fn negated(op: &Op, consts: &[Option<i64>], bools: &[bool]) -> Option<(Value, Op
     }
 }
 
+fn propagate_bools(func: &Function, consts: &[Option<i64>], bools: &mut [bool]) {
+    let is_01 = |v: Value, bools: &[bool]| bools[v.index()] || matches!(consts[v.index()], Some(0 | 1));
+    for _ in 0..2 {
+        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+            let data = &func.insts[inst.index()];
+            let Some(result) = data.result else { continue };
+            bools[result.index()] |= match data.op {
+                Op::Binary(Binary::Band, x, y) => matches!(consts[x.index()], Some(0 | 1)) || matches!(consts[y.index()], Some(0 | 1)) || (is_01(x, bools) && is_01(y, bools)),
+                Op::Binary(Binary::Bor | Binary::Bxor, x, y) | Op::Select(_, x, y) => is_01(x, bools) && is_01(y, bools),
+                Op::Convert(Convert::Uextend, inner) => bools[inner.index()],
+                _ => false,
+            };
+        }
+    }
+}
+
 /// Rewrites a negation of a compare, `x ^ 1`, `x == 0`, `x != 1`, or `select(x, 0, 1)`, as the inverse compare or `x ^ 1`, and simplifies branches on `x == 0` / `x != 0`.
 pub(crate) fn invert(func: &mut Function) {
     let count = func.types.len();
@@ -571,19 +587,7 @@ pub(crate) fn invert(func: &mut Function) {
             _ => {}
         }
     }
-    let is_01 = |v: Value, bools: &[bool]| bools[v.index()] || matches!(consts[v.index()], Some(0 | 1));
-    for _ in 0..2 {
-        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-            let data = &func.insts[inst.index()];
-            let Some(result) = data.result else { continue };
-            bools[result.index()] |= match data.op {
-                Op::Binary(Binary::Band, x, y) => matches!(consts[x.index()], Some(0 | 1)) || matches!(consts[y.index()], Some(0 | 1)) || (is_01(x, &bools) && is_01(y, &bools)),
-                Op::Binary(Binary::Bor | Binary::Bxor, x, y) | Op::Select(_, x, y) => is_01(x, &bools) && is_01(y, &bools),
-                Op::Convert(Convert::Uextend, inner) => bools[inner.index()],
-                _ => false,
-            };
-        }
-    }
+    propagate_bools(func, &consts, &mut bools);
     let types = &func.types;
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         let res = func.insts[inst.index()].result;
@@ -638,6 +642,111 @@ pub(crate) fn invert(func: &mut Function) {
                 std::mem::swap(then_args, else_args);
             }
             _ => {}
+        }
+    }
+    sink_brif_cmp(func);
+}
+
+pub(crate) fn fold_bxor_conds(func: &mut Function) -> bool {
+    let count = func.types.len();
+    let (mut consts, mut xors, mut uextends, mut bools) = (vec![None; count], vec![None; count], vec![None; count], vec![false; count]);
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let data = &func.insts[inst.index()];
+        match (&data.op, data.result) {
+            (&Op::Icmp(..) | &Op::Fcmp(..) | &Op::Fits(..), Some(res)) => bools[res.index()] = true,
+            (&Op::Const(imm), Some(res)) => consts[res.index()] = Some(imm),
+            (&Op::Binary(Binary::Bxor, x, y), Some(res)) => xors[res.index()] = Some((x, y)),
+            (&Op::Convert(Convert::Uextend, inner), Some(res)) => uextends[res.index()] = Some(inner),
+            _ => {}
+        }
+    }
+    propagate_bools(func, &consts, &mut bools);
+    let unwrap = |mut v: Value| {
+        while let Some(inner) = uextends.get(v.index()).copied().flatten() {
+            v = inner;
+        }
+        v
+    };
+    let mut changed = false;
+    for b_idx in 0..func.blocks.len() {
+        let mut out = Vec::with_capacity(func.blocks[b_idx].insts.len());
+        let insts = std::mem::take(&mut func.blocks[b_idx].insts);
+        for inst in insts {
+            match func.insts[inst.index()].op {
+                Op::Select(cond, t_val, f_val) => {
+                    let inner = unwrap(cond);
+                    if let Some((x, y)) = xors.get(inner.index()).copied().flatten() {
+                        if let Some((lhs, _)) = [(x, y), (y, x)].into_iter().find(|&(_, c)| consts.get(c.index()).copied().flatten() == Some(1))
+                            && let bool_src = unwrap(lhs)
+                            && bools.get(bool_src.index()).copied().unwrap_or(false)
+                        {
+                            func.insts[inst.index()].op = Op::Select(bool_src, f_val, t_val);
+                            changed = true;
+                        } else if bools.get(x.index()).copied().unwrap_or(false) && bools.get(y.index()).copied().unwrap_or(false) {
+                            let (a, b) = (unwrap(x), unwrap(y));
+                            if func.ty(a) == func.ty(b) && func.ty(a) != Type::I128 {
+                                let cmp_val = func.value(Type::I8);
+                                out.push(func.add(Op::Icmp(IntCC::NotEqual, a, b), Some(cmp_val)));
+                                func.insts[inst.index()].op = Op::Select(cmp_val, t_val, f_val);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                Op::Brif(cond, ..) => {
+                    let inner = unwrap(cond);
+                    if let Some((x, y)) = xors.get(inner.index()).copied().flatten() {
+                        let pair = if let Some((lhs, c_val)) = [(x, y), (y, x)].into_iter().find(|&(_, c)| consts.get(c.index()).copied().flatten().is_some()) {
+                            Some((lhs, c_val))
+                        } else if bools.get(x.index()).copied().unwrap_or(false) && bools.get(y.index()).copied().unwrap_or(false) {
+                            let (a, b) = (unwrap(x), unwrap(y));
+                            (func.ty(a) == func.ty(b) && func.ty(a) != Type::I128).then_some((a, b))
+                        } else {
+                            None
+                        };
+                        if let Some((a, b)) = pair && func.ty(a) == func.ty(b) && func.ty(a) != Type::I128 {
+                            let cmp_val = func.value(Type::I8);
+                            out.push(func.add(Op::Icmp(IntCC::NotEqual, a, b), Some(cmp_val)));
+                            if let Op::Brif(c_mut, ..) = &mut func.insts[inst.index()].op {
+                                *c_mut = cmp_val;
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            out.push(inst);
+        }
+        func.blocks[b_idx].insts = out;
+    }
+    if changed {
+        sink_brif_cmp(func);
+    }
+    changed
+}
+
+fn sink_brif_cmp(func: &mut Function) {
+    let mut uses = vec![0_u32; func.types.len()];
+    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        func.insts[inst.index()].op.for_operands(|v| uses[v.index()] += 1);
+    }
+    for block in &mut func.blocks {
+        let len = block.insts.len();
+        if len < 2 {
+            continue;
+        }
+        let Op::Brif(cond, ..) = func.insts[block.insts[len - 1].index()].op else { continue };
+        if uses[cond.index()] != 1 {
+            continue;
+        }
+        if let Some(cpos) = block.insts[..len - 1].iter().rposition(|&inst| {
+            let data = &func.insts[inst.index()];
+            data.result == Some(cond) && matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))
+        }) && cpos + 1 < len - 1
+        {
+            let cinst = block.insts.remove(cpos);
+            block.insts.insert(len - 2, cinst);
         }
     }
 }

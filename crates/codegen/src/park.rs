@@ -171,14 +171,16 @@ fn victim_slot<F: Copy + PartialEq>(
     weights: Option<&[u64]>,
     suits: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    let candidates = (0..pool.regs.len()).filter(|&s| suits(s) && !(start == 0 && pool.arrival_lock[s]) && holders[s].len() == 1);
+    let candidates = (0..pool.regs.len()).filter(|&s| suits(s) && !(start == 0 && pool.arrival_lock[s]));
     let Some(cost) = weights else {
         return candidates
+            .filter(|&s| holders[s].len() == 1 && pool.kept[holders[s][0]].is_none())
             .filter_map(|s| live.last_end(holders[s][0]).map(|u| (u, s)))
             .max_by_key(|&(u, _)| u)
             .filter(|&(u, _)| u > end)
             .map(|(_, s)| s);
     };
+    let ranges = live.ranges_of(value);
     let below = |v: usize, u: usize| {
         if cost[v] <= 2 && cost[u] <= 2 {
             u128::from(cost[v]) * u128::from(live.total_len(u)) < u128::from(cost[u]) * u128::from(live.total_len(v))
@@ -186,8 +188,40 @@ fn victim_slot<F: Copy + PartialEq>(
             cost[v] < cost[u] || (cost[v] == cost[u] && live.total_len(v) > live.total_len(u))
         }
     };
-    let best = candidates.reduce(|a, b| if below(holders[b][0], holders[a][0]) { b } else { a })?;
-    below(holders[best][0], value).then_some(best)
+    let mut best: Option<(u64, u64, usize)> = None;
+    for s in candidates {
+        let mut evict_cost = 0_u64;
+        let mut max_len = 0_u64;
+        let mut count = 0_usize;
+        let mut single = 0_usize;
+        let mut outer_only = pool.is_saved[s];
+        let mut ok = true;
+        for &h in &holders[s] {
+            if overlaps(live.ranges_of(h), ranges) {
+                if pool.kept[h].is_some() {
+                    ok = false;
+                    break;
+                }
+                outer_only &= cost[h] < 10;
+                evict_cost = evict_cost.saturating_add(cost[h]);
+                max_len = max_len.max(live.total_len(h));
+                single = h;
+                count += 1;
+            }
+        }
+        if !ok || count == 0 {
+            continue;
+        }
+        let cheaper = if holders[s].len() == 1 {
+            below(single, value)
+        } else {
+            outer_only && evict_cost.saturating_mul(4) < cost[value]
+        };
+        if cheaper && best.is_none_or(|(bc, bl, _)| evict_cost < bc || (evict_cost == bc && max_len > bl)) {
+            best = Some((evict_cost, max_len, s));
+        }
+    }
+    best.map(|(_, _, s)| s)
 }
 
 pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class: &Class<F>, pooled: &[bool], hints: &Hints) -> (Vec<Option<F>>, Vec<F>) {
@@ -291,10 +325,16 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         }
         if chosen.is_none()
             && let Some(s) = victim_slot(&pool, &holders, live, (start, end, value), hints.weights, suits_any)
-            && let Some(other) = holders[s].pop()
         {
-            assigned[s].retain(|&h| h != other);
-            homes[other] = None;
+            holders[s].retain(|&other| {
+                if overlaps(live.ranges_of(other), ranges) {
+                    assigned[s].retain(|&h| h != other);
+                    homes[other] = None;
+                    false
+                } else {
+                    true
+                }
+            });
             chosen = Some(s);
         }
         let Some(slot) = chosen else { continue };

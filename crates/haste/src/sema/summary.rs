@@ -154,6 +154,37 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
     instantiate_summary(cx, *instance, &summary, unlaid, before)
 }
 
+pub(super) fn poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
+    if let Some(kind) = cx.store.lookups.summaries.get_ready(&item) {
+        return match kind {
+            SummaryKind::Poly(summary) => Some(summary),
+            SummaryKind::MonomorphicFallback => None,
+        };
+    }
+    if let Some(poly) = frozen::frozen_summary(cx, item) {
+        return Some(poly);
+    }
+    let (_, entry) = cx.item(item);
+    if entry.kind != ItemKind::Fn || entry.body.is_none() || cx.foreign(item) {
+        return None;
+    }
+    let expected = expected_param_count(cx, item)?;
+    if (expected == 0 && !cx.outline.is_sysroot(item.krate)) || expected > u16::MAX as usize {
+        return None;
+    }
+    let summaries = cx.store.lookups.summaries.clone();
+    let built = summaries.run(
+        cx,
+        item,
+        |cx| Ok(frozen::frozen_summary(cx, item).map_or_else(|| build_summary(cx, item, expected as u16), SummaryKind::Poly)),
+        |_| Ok(SummaryKind::MonomorphicFallback),
+    );
+    match built {
+        Ok(SummaryKind::Poly(summary)) => Some(summary),
+        _ => None,
+    }
+}
+
 fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
     let slice = cx.types.substs(substs);
     let is_sysroot = cx.outline.is_sysroot(item.krate);
