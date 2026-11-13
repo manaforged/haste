@@ -65,6 +65,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         next: None,
         copied,
         direct_calls: target.direct_calls,
+        sp_bias: 0,
     };
     drive(emit, &order)
 }
@@ -112,11 +113,16 @@ pub(super) struct Emit<'a> {
     next: Option<Block>,
     copied: Vec<bool>,
     direct_calls: bool,
+    sp_bias: i32,
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
     fn func(&self) -> &'a Function {
         self.func
+    }
+
+    fn is_elided(&self, value: Value) -> bool {
+        self.plan.elided[value.index()]
     }
 
     fn prologue(&mut self) {
@@ -285,8 +291,8 @@ impl Emit<'_> {
         for step in edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.plan.same_home(&self.frame, a, b)) {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
-                Step::Save(arg, index) => self.move_to(Mem::new(FP, self.frame.edge_slot(index)), arg),
-                Step::Restore(index, param) => self.load_home(param, Mem::new(FP, self.frame.edge_slot(index))),
+                Step::Save(arg, index) => self.move_to(self.frame_mem(self.frame.edge_slot(index)), arg),
+                Step::Restore(index, param) => self.load_home(param, self.frame_mem(self.frame.edge_slot(index))),
             }
         }
         Ok(())
@@ -369,11 +375,13 @@ impl Emit<'_> {
                 ArgStep::Move(src, dst) => self.asm.vmov(Vreg(dst), Vreg(src)),
                 ArgStep::Save(src) => {
                     self.asm.add_imm(true, false, Size::X, SP, SP, 16);
+                    self.sp_bias += 16;
                     self.asm.vstore(16, Mem::new(SP, 0), Vreg(src));
                 }
                 ArgStep::Restore(dst) => {
                     self.asm.vload(16, Vreg(dst), Mem::new(SP, 0));
                     self.asm.add_imm(false, false, Size::X, SP, SP, 16);
+                    self.sp_bias -= 16;
                 }
                 ArgStep::Load(val, dst) => self.fget(Vreg(dst), val),
             }
@@ -410,11 +418,13 @@ impl Emit<'_> {
                 ArgStep::Move(src, dst) => self.asm.vmov(Vreg(dst), Vreg(src)),
                 ArgStep::Save(src) => {
                     self.asm.add_imm(true, false, Size::X, SP, SP, 16);
+                    self.sp_bias += 16;
                     self.asm.vstore(16, Mem::new(SP, 0), Vreg(src));
                 }
                 ArgStep::Restore(dst) => {
                     self.asm.vload(16, Vreg(dst), Mem::new(SP, 0));
                     self.asm.add_imm(false, false, Size::X, SP, SP, 16);
+                    self.sp_bias -= 16;
                 }
                 ArgStep::Load(..) => {}
             }

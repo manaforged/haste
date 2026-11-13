@@ -226,7 +226,7 @@ impl Loader<'_> {
         let (expanded, foreign) = derive::derived(&file.source, item, &self.out.env, (self.krate, self.deps));
         self.out.derived.extend(foreign.into_iter().map(|path| Held { file: file.clone(), owner: module, at, path }));
         match expanded {
-            Some(expanded) => self.splice(module, expanded, "derive"),
+            Some(expanded) => self.splice(module, expanded, "derive", child_origin(file, 1, at)),
             None => Ok(()),
         }
     }
@@ -276,7 +276,7 @@ impl Loader<'_> {
         let Some((name, expanded)) = self.expand_call(file, at, definition) else {
             return Ok(());
         };
-        let Some(expanded) = self.scanned(expanded, name) else {
+        let Some(expanded) = self.scanned(expanded, name, child_origin(file, 2, at)) else {
             return Ok(());
         };
         let parts = match block {
@@ -451,7 +451,7 @@ impl Loader<'_> {
     /// Adds `source`, the output of procedural macro `name`, to module `module` in the module's textual scope.
     pub fn insert(&mut self, module: usize, source: Source, name: &str) -> Result<()> {
         self.scope = self.out.modules[module].textual.clone();
-        let result = self.splice(module, Ok(source), name);
+        let result = self.splice(module, Ok(source), name, 0);
         self.scope = None;
         result
     }
@@ -474,7 +474,7 @@ impl Loader<'_> {
         let Some((name, expanded)) = self.expand_call(file, at, definition) else {
             return Ok(());
         };
-        self.splice(module, expanded, name)
+        self.splice(module, expanded, name, child_origin(file, 3, at))
     }
 
     fn cfg_select(&mut self, file: &Arc<File>, module: usize, open: u32) -> Result<()> {
@@ -486,18 +486,18 @@ impl Loader<'_> {
                 return Ok(());
             }
         };
-        self.splice(module, Ok(selected), "cfg_select")
+        self.splice(module, Ok(selected), "cfg_select", child_origin(file, 4, open))
     }
 
     fn include(&mut self, file: &Arc<File>, module: usize, open: u32) -> Result<()> {
         let src = &file.source;
         let path = path_text(src, (open + 1, src.pair(open)), &self.out.env).ok_or_else(|| anyhow::anyhow!("a path that is not a literal, `concat!` or `env!`"));
         let source = path.and_then(|path| Source::read(&src.beside(&path)));
-        self.splice(module, source, "include")
+        self.splice(module, source, "include", child_origin(file, 5, open))
     }
 
-    fn scanned(&mut self, source: Result<Source>, name: &str) -> Option<Arc<File>> {
-        let expanded = source.and_then(|source| scan::scan(&source).map(|items| File::new(source, items, true)));
+    fn scanned(&mut self, source: Result<Source>, name: &str, origin: u64) -> Option<Arc<File>> {
+        let expanded = source.and_then(|source| scan::scan(&source).map(|items| File::new_expanded(source, items, origin)));
         match expanded {
             Ok(expanded) => {
                 let expanded = Arc::new(expanded);
@@ -511,8 +511,8 @@ impl Loader<'_> {
         }
     }
 
-    fn splice(&mut self, module: usize, source: Result<Source>, name: &str) -> Result<()> {
-        let Some(expanded) = self.scanned(source, name) else {
+    fn splice(&mut self, module: usize, source: Result<Source>, name: &str, origin: u64) -> Result<()> {
+        let Some(expanded) = self.scanned(source, name, origin) else {
             return Ok(());
         };
         let index = self.out.files.len() - 1;
@@ -549,4 +549,13 @@ fn child_dir(found: &Path, by_attr: bool, name: &str) -> PathBuf {
     let parent = found.parent().unwrap_or(Path::new("")).to_owned();
     let mod_rs = found.file_name().is_some_and(|file| file == "mod.rs");
     if by_attr || mod_rs { parent } else { parent.join(name) }
+}
+
+fn child_origin(parent: &File, kind: u8, at: u32) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = rustc_hash::FxHasher::default();
+    parent.expand_origin.hash(&mut hasher);
+    kind.hash(&mut hasher);
+    at.hash(&mut hasher);
+    hasher.finish().max(1)
 }

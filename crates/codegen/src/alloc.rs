@@ -281,7 +281,7 @@ fn pairs<R>(func: &Function, locations: &[Location<R>], elided: &[bool]) -> (Vec
     (pairs, deferred)
 }
 
-fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> Vec<Option<CallTarget>> {
+fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided: &mut [bool]) -> Vec<Option<CallTarget>> {
     let mut through = vec![None; func.types.len()];
     let mut loads = vec![None; func.types.len()];
     for data in &func.insts {
@@ -297,8 +297,10 @@ fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> Vec<
         if let Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } = &func.insts[inst.index()].op
             && census.uses[callee.index()] == 1
             && !args.contains(callee)
+            && let Some(target) = loads[callee.index()]
         {
-            through[callee.index()] = loads[callee.index()];
+            through[callee.index()] = Some(target);
+            elided[callee.index()] = true;
         }
     }
     through
@@ -417,7 +419,10 @@ fn reusable(func: &Function, live: &Live, elided: &[bool]) -> Vec<Option<Value>>
             let next = block.insts.get(at + 1).map(|next| &func.insts[next.index()].op);
             let checked = matches!(next, Some(Op::Fits(check, _, a, b)) if check == op && (a, b) == (x, y));
             let def = live.defs[result.index()];
-            let dies = live.last_end(x.index()) == Some(def + u32::from(checked));
+            let end_at = if checked { def + 1 } else { def.saturating_sub(1) };
+            let dies = def > 0
+                && live.ranges_of(x.index()).iter().any(|r| r.end == end_at)
+                && !crate::live::overlaps(live.ranges_of(x.index()), live.ranges_of(result.index()));
             if in_place(*op) && dies && live.ranges_of(result.index()).first().is_some_and(|r| r.start == def) {
                 reuse[result.index()] = Some(*x);
             }
@@ -446,13 +451,13 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     consts(func, regs.absolute_calls, &mut locations);
     statics(func, &mut locations);
     let census = census(func);
-    let (sib, elided) = if regs.fold_sib { sib_addrs(func, &locations, &census) } else { (vec![None; count], vec![false; count]) };
+    let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census) } else { (vec![None; count], vec![false; count]) };
+    let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
     let live = live(func, order, copied, &tracked, &sib, &elided);
     let candidates: Vec<bool> = (0..count).map(|value| eligible(&live, &wanted, value)).collect();
     let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches)).collect();
-    let through = if regs.absolute_calls { through(func, &locations, &census) } else { vec![None; count] };
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value] == Type::V128))).collect();
     let reuse = if regs.two_address { reusable(func, &live, &elided) } else { vec![None; count] };

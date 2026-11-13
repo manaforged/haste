@@ -97,6 +97,7 @@ pub(super) struct Lookups {
     pub(super) assoc_types: Table<(ItemRef, ty::Ty, super::substs::Substs, ItemRef, super::substs::Substs), ty::Ty>,
     pub(super) summaries: table::Flight<ItemRef, summary::SummaryKind>,
     pub(super) has_new_sysroot_summaries: Arc<AtomicBool>,
+    pub(super) has_new_sysroot_instances: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
     pub(super) sysroot_index: Arc<std::sync::OnceLock<Arc<summary::codec::SysrootIndex>>>,
 }
@@ -136,6 +137,7 @@ impl Lookups {
             projections,
             summaries: std::mem::take(&mut self.summaries),
             has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
+            has_new_sysroot_instances: Arc::clone(&self.has_new_sysroot_instances),
             substrate: self.substrate.clone(),
             sysroot_index: Arc::clone(&self.sysroot_index),
             ..Lookups::default()
@@ -194,9 +196,10 @@ impl Cache {
         self.lookups.sysroot_index = Arc::new(std::sync::OnceLock::new());
     }
 
-    /// Returns whether any new sysroot `PolySummary` was built in this session.
+    /// Returns whether any new sysroot `PolySummary` or concrete sysroot instance was built in this session.
     pub fn has_new_sysroot_summaries(&self) -> bool {
         self.lookups.has_new_sysroot_summaries.load(std::sync::atomic::Ordering::Relaxed)
+            || self.lookups.has_new_sysroot_instances.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the attached frozen sysroot substrate, if any.
@@ -204,7 +207,7 @@ impl Cache {
         self.lookups.substrate.as_ref()
     }
 
-    /// Encodes all settled sysroot `PolySummary` entries into `builder`.
+    /// Encodes all settled sysroot `PolySummary` and concrete sysroot instance entries into `builder`.
     pub fn export_sysroot_summaries(&self, outline: &Outline, builder: &mut crate::substrate::SubstrateBuilder) -> Result<()> {
         let mut err = None;
         self.lookups.summaries.for_each_ready(|&item, kind| {
@@ -223,10 +226,10 @@ impl Cache {
                 err = Some(e);
             }
         });
-        match err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(e) = err {
+            return Err(e);
         }
+        summary::frozen::export_sysroot_instances(outline, &self.types, &self.finals, builder)
     }
 
     /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.

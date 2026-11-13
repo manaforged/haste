@@ -79,14 +79,25 @@ impl<'a> Context<'a> {
         &self.store
     }
 
-    /// Drops cached `finals`, `summaries`, `selections`, `projections`, `trait_calls`, and `assoc_types` to cut RSS before one-shot codegen.
+    /// Drops cached reach-only tables and sysroot bodies to cut RSS before one-shot codegen.
     pub(crate) fn compact_for_oneshot_codegen(&mut self) {
         self.store.finals.clear();
+        self.store.bodies.retain(|item, _| !self.outline.crates.get(item.krate as usize).is_some_and(|t| t.env.release && t.env.fixed));
         self.store.lookups.summaries = table::Flight::default();
         self.store.lookups.selections.clear();
         self.store.lookups.projections.clear();
         self.store.lookups.trait_calls.clear();
         self.store.lookups.assoc_types.clear();
+        self.store.lookups.type_defs.clear();
+        self.store.lookups.scope_traits.clear();
+        self.store.lookups.reveals = table::Flight::default();
+        self.store.lookups.futures.clear();
+        self.store.lookups.forms.clear();
+        self.store.lookups.sysroot_index = Arc::new(std::sync::OnceLock::new());
+        self.kids.clear();
+        self.trait_members.clear();
+        self.impl_members.clear();
+        self.aliases.clear();
     }
 
     /// A pass over an outline and its resolved names that reuses `store`.

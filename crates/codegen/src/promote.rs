@@ -115,8 +115,12 @@ impl Scan {
         loop {
             let before = adds.len();
             adds.retain(|&(inst, result, x, c)| {
-                let (Some((slot, base)), Some(imm)) = (self.addrs[x.index()], consts[c.index()]) else {
-                    return true;
+                let ((slot, base), imm) = match (self.addrs[x.index()], consts[c.index()]) {
+                    (Some(addr), Some(imm)) => (addr, imm),
+                    _ => match (self.addrs[c.index()], consts[x.index()]) {
+                        (Some(addr), Some(imm)) => (addr, imm),
+                        _ => return true,
+                    },
                 };
                 let Some(offset) = base.checked_add(imm) else {
                     return true;
@@ -141,10 +145,16 @@ impl Scan {
             skip[0] = touch.addr;
             self.access(func, (block, inst), (touch.slot, touch.offset), touch.kind);
         }
-        if let Op::Binary(Binary::Iadd, x, _) = &data.op
+        if let Op::Binary(Binary::Iadd, x, y) = &data.op
             && data.result.is_some_and(|result| self.addrs[result.index()].is_some())
         {
-            skip[1] = Some(*x);
+            skip[1] = if self.addrs[x.index()].is_some() {
+                Some(*x)
+            } else if self.addrs[y.index()].is_some() {
+                Some(*y)
+            } else {
+                None
+            };
         }
         data.op.for_operands(|value| {
             if let Some(at) = skip.iter().position(|skipped| *skipped == Some(value)) {
@@ -641,10 +651,9 @@ pub(crate) enum Moves {
     Words,
 }
 
-/// Promotes every stack slot whose address never escapes into SSA values carried in block parameters, first splitting into pieces each move that `moves` splits and that touches a slot only moves let escape.
-pub(crate) fn run(func: &mut Function, moves: Moves) {
+pub(crate) fn step(func: &mut Function, moves: Moves) -> bool {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
-        return;
+        return false;
     };
     let mut scan = Scan::new(func);
     let mut splits = Vec::new();
@@ -658,14 +667,13 @@ pub(crate) fn run(func: &mut Function, moves: Moves) {
         scan = Scan::new(func);
         scan.pin_moves(func);
     }
-    if (0..func.slots.len()).any(|slot| scan.promotable(slot)) {
-        promote(func, entry, scan);
-    }
+    let changed = (0..func.slots.len()).any(|slot| scan.promotable(slot)) && promote(func, entry, scan);
     crate::copy::rejoin(func, &splits);
+    changed
 }
 
 /// Promotes every promotable slot `scan` found.
-fn promote(func: &mut Function, entry: Block, scan: Scan) {
+fn promote(func: &mut Function, entry: Block, scan: Scan) -> bool {
     let local = Local::new(&scan);
     let count = func.types.len();
     let fresh = Fresh { base: count, types: Vec::new(), zeros: Vec::new() };
@@ -683,5 +691,7 @@ fn promote(func: &mut Function, entry: Block, scan: Scan) {
             None => pass.rollback(mark),
         }
     }
+    let changed = pass.promoted.iter().any(|&p| p);
     pass.finish(func, entry);
+    changed
 }

@@ -117,6 +117,10 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.func
     }
 
+    fn is_elided(&self, value: Value) -> bool {
+        self.plan.elided[value.index()]
+    }
+
     fn prologue(&mut self) {
         if !self.framed {
             return;

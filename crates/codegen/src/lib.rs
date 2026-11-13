@@ -127,12 +127,22 @@ pub fn simplify(func: &mut Function, effort: Effort) {
 fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
     fill::run(func);
     fold::run(func, effort);
-    promote::run(func, if effort == Effort::Full { moves } else { promote::Moves::Words });
-    fold::run(func, effort);
     merge::run(func);
+    let kind = if effort == Effort::Full { moves } else { promote::Moves::Words };
+    let rounds = if effort == Effort::Full { 4 } else { 2 };
+    for _ in 0..rounds {
+        if !promote::step(func, kind) {
+            break;
+        }
+        fold::run(func, effort);
+        merge::run(func);
+    }
     cse::run(func);
     if effort == Effort::Full {
         loads::run(func);
+        fold::run(func, effort);
+        merge::run(func);
+        cse::run(func);
         switch::run(func);
         licm::run(func);
     }

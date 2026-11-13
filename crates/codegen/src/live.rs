@@ -2,7 +2,28 @@ use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, Value};
 
 pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
-    let mut order = crate::dom::reverse_postorder(func, entry);
+    let depths = crate::licm::depths(func);
+    let is_cold = |block: Block| matches!(func.last(block), Some(Op::Trap));
+    let mut visited = vec![false; func.blocks.len()];
+    let mut post = Vec::with_capacity(func.blocks.len());
+    let mut stack = vec![(entry, false)];
+    while let Some((block, done)) = stack.pop() {
+        if done {
+            post.push(block);
+            continue;
+        }
+        if std::mem::replace(&mut visited[block.index()], true) {
+            continue;
+        }
+        stack.push((block, true));
+        let mut succs: Vec<Block> = func.successors(block).filter(|succ| !visited[succ.index()]).collect();
+        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), depths[succ.index()])));
+        for succ in succs {
+            stack.push((succ, false));
+        }
+    }
+    post.reverse();
+    let mut order = post;
     let mut placed = vec![false; func.blocks.len()];
     order.iter().for_each(|block| placed[block.index()] = true);
     order.retain(|block| *block == entry || !func.blocks[block.index()].insts.is_empty());
@@ -307,6 +328,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
                 for &arg in args {
                     use_val(arg, at, &mut open, &mut touched);
                 }
+                at += 1;
                 for &param in &func.blocks[head.index()].params {
                     def_val(param, at, false, &mut defs, &mut open, &mut touched, &mut per_val);
                 }

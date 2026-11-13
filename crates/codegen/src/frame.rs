@@ -238,15 +238,14 @@ pub(crate) fn layout<R>(
         }
         values.push(homes[home]);
     }
-    let mut slots = Vec::with_capacity(func.slots.len());
-    for (slot, data) in func.slots.iter().enumerate() {
-        if !addressed[slot] {
-            slots.push(0);
-            continue;
-        }
+    let mut slots = vec![0; func.slots.len()];
+    let mut order: Vec<usize> = (0..func.slots.len()).filter(|&slot| addressed[slot]).collect();
+    order.sort_by_key(|&slot| (func.slots[slot].size, slot));
+    for slot in order {
+        let data = &func.slots[slot];
         let align = 1 << data.align_shift.min(MAX_ALIGN_SHIFT);
         cursor = round(cursor + data.size, align);
-        slots.push(-(cursor as i32));
+        slots[slot] = -(cursor as i32);
     }
     cursor = round(cursor + scratch, 16);
     let scratch = -(cursor as i32);
@@ -288,6 +287,7 @@ pub(crate) trait Emitter<'a>: Sized {
     fn set_next(&mut self, next: Option<Block>);
     fn bind_block(&mut self, block: Block);
     fn clear_flags(&mut self);
+    fn is_elided(&self, value: Value) -> bool;
     fn inst(&mut self, inst: Inst) -> Result<(), String>;
     fn trap(&mut self);
     fn finish(self) -> Result<crate::Code, String>;
@@ -298,6 +298,10 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
     let func = emit.func();
     let insts = &func.blocks[block.index()].insts;
     for &inst in insts {
+        let data = &func.insts[inst.index()];
+        if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res)) {
+            continue;
+        }
         emit.inst(inst)?;
     }
     if !insts.last().is_some_and(|inst| func.insts[inst.index()].op.is_terminator()) {

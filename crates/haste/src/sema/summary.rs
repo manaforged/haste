@@ -1,4 +1,5 @@
 pub mod codec;
+pub(super) mod frozen;
 mod inst;
 
 pub use inst::PolyInst;
@@ -106,7 +107,7 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
             cx,
             item,
             |cx| {
-                if let Some(poly) = frozen_summary(cx, item) {
+                if let Some(poly) = frozen::frozen_summary(cx, item) {
                     return Ok(SummaryKind::Poly(poly));
                 }
                 if !eligible(cx, item, substs) || expected_param_count(cx, item) != Some(0) {
@@ -128,7 +129,7 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
             cx,
             item,
             |cx| {
-                if let Some(poly) = frozen_summary(cx, item) {
+                if let Some(poly) = frozen::frozen_summary(cx, item) {
                     return Ok(SummaryKind::Poly(poly));
                 }
                 Ok(build_summary(cx, item, expected as u16))
@@ -138,18 +139,6 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
     };
     let Ok(SummaryKind::Poly(summary)) = built else { return None };
     instantiate_summary(cx, *instance, &summary, unlaid, before)
-}
-
-fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
-    let tree = cx.outline.crates.get(item.krate as usize)?;
-    if !tree.env.release || !tree.env.fixed {
-        return None;
-    }
-    let substrate = cx.store.lookups.substrate.clone()?;
-    let key = crate::substrate::sysroot_item_key(cx.outline, item)?;
-    let bytes = substrate.summary(key)?;
-    let index = cx.store.lookups.sysroot_index.get_or_init(|| Arc::new(codec::SysrootIndex::build(cx.outline, crate::substrate::sysroot_item_key)));
-    codec::decode_summary(index, &cx.types, bytes).ok().flatten().map(Arc::new)
 }
 
 fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
@@ -359,6 +348,14 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
     if concrete_args.len() != usize::from(summary.param_count) {
         return None;
     }
+    if let Some((poly_inst, locals, ret, concrete_layouts, drops)) = frozen::frozen_instance(cx, instance, summary) {
+        let typed = Arc::new(Typed { tables: LazyTables::Poly(Box::new(poly_inst)), locals, params: summary.params.to_vec(), ret, drops, shape: Shape::Body });
+        let laid = lay_out_instantiated(cx, &concrete_layouts, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
+        if laid.is_ok() && cx.quiet_mark() == before {
+            cx.store.finals.insert(instance, Arc::clone(&typed));
+        }
+        return Some(Ok(typed));
+    }
     let pure = summary.projections.is_empty()
         && summary.obligations.is_empty()
         && summary.call_holes.is_empty()
@@ -381,7 +378,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
         let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
         let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
         (inst, locals, ret, layouts, drop_tys)
-    } else if let Some(cached) = try_cached_instantiate(cx, instance, summary) {
+    } else if let Some(cached) = frozen::try_cached_instantiate(cx, instance, summary) {
         cached
     } else {
         let Ok(built) = super::infer::detached_summary(cx, instance.0, |infer| {
@@ -424,6 +421,11 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
     };
     let laid = lay_out_instantiated(cx, &concrete_layouts, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
     if laid.is_ok() && cx.quiet_mark() == before {
+        if summary.template.closures.is_empty()
+            && cx.outline.crates.get(instance.0.krate as usize).is_some_and(|tree| tree.env.release && tree.env.fixed)
+        {
+            cx.store.lookups.has_new_sysroot_instances.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         cx.store.finals.insert(instance, Arc::clone(&typed));
     }
     Some(Ok(typed))
@@ -492,50 +494,6 @@ fn lay_out_instantiated(cx: &mut Context<'_>, layouts: &[Ty], typed: &Typed) -> 
         super::reach::lay_out(cx, typed)?;
     }
     Ok(())
-}
-
-fn try_cached_instantiate(cx: &Context<'_>, instance: Instance, summary: &Arc<PolySummary>) -> Option<(PolyInst, Vec<Local>, Option<Ty>, Vec<Ty>, Vec<Ty>)> {
-    if !summary.projections.is_empty()
-        || !summary.op_holes.is_empty()
-        || !summary.const_holes.is_empty()
-        || !summary.template.closures.is_empty()
-        || summary.obligations.iter().any(|ob| matches!(ob, PolyObligation::Call { .. }))
-    {
-        return None;
-    }
-    let mut inst = PolyInst {
-        args: instance.1,
-        summary: Arc::clone(summary),
-        projs: Box::new([]),
-        resolved_calls: Box::new([]),
-        builtin_ops: Box::new([]),
-        call_overrides: Box::new([]),
-        offset_overrides: Box::new([]),
-        materialized: OnceLock::new(),
-    };
-    for ob in &summary.obligations {
-        let PolyObligation::Prove { of, self_ty, args } = *ob else { return None };
-        let concrete_self = inst.sub_ty(&cx.types, self_ty);
-        let concrete_args = inst.sub_substs(&cx.types, args);
-        let Some(Some(_)) = cx.store.lookups.selections.get(&(of, concrete_self, concrete_args)) else {
-            return None;
-        };
-    }
-    let mut resolved = Vec::with_capacity(summary.call_holes.len());
-    for &(key, item, substs) in &summary.call_holes {
-        let mapped = inst.sub_substs(&cx.types, substs);
-        let cached = cx.store.lookups.trait_calls.get(&(item, mapped))?;
-        if let Res::Fn(ri, rs) = cached {
-            resolved.push((key, ri, rs));
-        }
-    }
-    resolved.sort_unstable_by_key(|&(key, ..)| key);
-    inst.resolved_calls = resolved.into_boxed_slice();
-    let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
-    let ret = summary.ret.map(|ty| inst.sub_ty(&cx.types, ty));
-    let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
-    let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
-    Some((inst, locals, ret, layouts, drop_tys))
 }
 
 fn eval_projections(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, projections: &[ProjId]) -> Result<()> {
