@@ -1,6 +1,6 @@
 use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};
-use crate::ir::{Binary, Block, BlockData, Function, Inst, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, IntCC, Op, Type, Value};
 
 fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
     map.iter().rev().find(|&&(old, _)| old == v).map_or(v, |&(_, new)| new)
@@ -416,11 +416,7 @@ fn unroll_two_block(
     true
 }
 
-/// Unrolls 1-block and 2-block natural loops with a statically provable constant trip count (`0..=16` / `0..=8`) or dynamic counted loops.
-pub(crate) fn run(func: &mut Function) -> bool {
-    let Some(entry) = func.entry else { return false };
-    let mut cfg = Cfg::new(func);
-    let loops = cfg.loops(func);
+fn collect_global_consts(func: &Function, cfg: &Cfg) -> Vec<Option<i64>> {
     let mut global_consts = vec![None; func.types.len()];
     for &blk in &cfg.rpo {
         for &inst in &func.blocks[blk.index()].insts {
@@ -431,6 +427,15 @@ pub(crate) fn run(func: &mut Function) -> bool {
             }
         }
     }
+    global_consts
+}
+
+/// Unrolls 1-block and 2-block natural loops with a statically provable constant trip count (`0..=16` / `0..=8`) or dynamic counted loops.
+pub(crate) fn run(func: &mut Function) -> Domain {
+    let Some(entry) = func.entry else { return Domain::NONE };
+    let mut cfg = func.cfg();
+    let loops = cfg.loops();
+    let mut global_consts = collect_global_consts(func, &cfg);
     let mut changed = false;
     let mut dirty = false;
     for each in &loops.list {
@@ -440,7 +445,8 @@ pub(crate) fn run(func: &mut Function) -> bool {
             continue;
         }
         if dirty {
-            cfg = Cfg::new(func);
+            func.bump_cfg();
+            cfg = func.cfg();
             dirty = false;
         }
         if cfg.pred_count(head) != 2 {
@@ -469,5 +475,10 @@ pub(crate) fn run(func: &mut Function) -> bool {
         changed |= did;
         dirty |= did;
     }
-    changed
+    if changed {
+        func.bump_cfg();
+        Domain::CFG | Domain::VALUES | Domain::MEM
+    } else {
+        Domain::NONE
+    }
 }

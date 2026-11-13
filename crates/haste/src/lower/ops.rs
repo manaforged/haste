@@ -14,7 +14,7 @@ use super::stencil::SymbolSource;
 use super::{Lower, Parts, Repr};
 
 /// What arithmetic means for one operand type.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Num {
     Int { ty: Type, signed: bool },
     Float(Type),

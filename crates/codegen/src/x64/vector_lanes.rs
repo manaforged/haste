@@ -32,15 +32,6 @@ const X64_TARGET_OPS: &[TargetOpSpec] = &[
     TargetOpSpec { id: TargetOpId::X64AesDec, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDE] },
     TargetOpSpec { id: TargetOpId::X64AesDecLast, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDF] },
     TargetOpSpec { id: TargetOpId::X64AesImc, form: TargetOpForm::Unary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0xDB] },
-    TargetOpSpec { id: TargetOpId::X64Pmaddwd, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0xF5] },
-    TargetOpSpec { id: TargetOpId::X64Pmaddubsw, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0x04] },
-    TargetOpSpec { id: TargetOpId::X64Psadbw, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0xF6] },
-    TargetOpSpec { id: TargetOpId::X64Pavgb, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0xE0] },
-    TargetOpSpec { id: TargetOpId::X64Pavgw, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0xE3] },
-    TargetOpSpec { id: TargetOpId::X64Packsswb, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x63] },
-    TargetOpSpec { id: TargetOpId::X64Packssdw, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x6B] },
-    TargetOpSpec { id: TargetOpId::X64Packuswb, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x67] },
-    TargetOpSpec { id: TargetOpId::X64Packusdw, form: TargetOpForm::Binary, prefix: &[0x66], opcode: &[0x0F, 0x38, 0x2B] },
 ];
 
 impl Emit<'_> {
@@ -557,12 +548,33 @@ impl Emit<'_> {
                     };
                     self.asm.shift(size, shift, Reg::Rax);
                 }
+                Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat => self.emit_sat_op(op, size, Reg::Rax, Reg::Rcx),
                 _ => {}
             }
             self.asm.store(size, sx, Reg::Rax);
         }
         self.xmm_load(ty, dst, Mem::new(Reg::Rsp, 0));
         self.asm.alu_imm(Alu::Add, Reg::Rsp, 32);
+    }
+
+    pub(super) fn scalarize_int_clz(&mut self, lane: Lane, count: u8, x: Value, dst: Xmm) {
+        let ty = Type::Vec { lane, count };
+        let stride = lane.bytes() as i32;
+        let size = Size::of(lane.bytes());
+        self.fget(X0, x);
+        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
+        self.xmm_store(ty, Mem::new(Reg::Rsp, 0), X0);
+        for i in 0..i32::from(count) {
+            let slot = Mem::new(Reg::Rsp, i * stride);
+            self.asm.load(size, Reg::Rax, slot);
+            self.count(super::asm::Count::Lzcnt, Reg::Rax, Reg::Rax);
+            if lane.bits() < 64 {
+                self.asm.alu_imm(Alu::Sub, Reg::Rax, (64 - lane.bits()) as i32);
+            }
+            self.asm.store(size, slot, Reg::Rax);
+        }
+        self.xmm_load(ty, dst, Mem::new(Reg::Rsp, 0));
+        self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
     }
 
     pub(super) fn scalarize_int_icmp(&mut self, cc: IntCC, lane: Lane, count: u8, x: Value, y: Value, dst: Xmm) {

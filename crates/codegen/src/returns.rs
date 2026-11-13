@@ -1,11 +1,8 @@
-use crate::ir::{Block, Function, Op, Value};
+use crate::ir::{Block, Domain, Function, Op, Value};
 
 /// Turns every jump into a block that only returns into that return, so the edge moves no values and takes no branch.
-pub(crate) fn run(func: &mut Function) -> bool {
-    let mut entered = vec![0_u32; func.blocks.len()];
-    for block in 0..func.blocks.len() {
-        func.successors(Block(block as u32)).for_each(|target| entered[target.index()] += 1);
-    }
+pub(crate) fn run(func: &mut Function) -> Domain {
+    let cfg = func.cfg();
     let mut threaded = vec![0_u32; func.blocks.len()];
     let mut changed = false;
     for block in 0..func.blocks.len() {
@@ -17,12 +14,18 @@ pub(crate) fn run(func: &mut Function) -> bool {
         changed = true;
     }
     for (block, count) in threaded.iter().enumerate() {
-        if *count > 0 && *count == entered[block] && func.entry != Some(Block(block as u32)) {
+        let b = Block(block as u32);
+        if *count > 0 && *count == cfg.pred_count(b) && func.entry != Some(b) {
             func.blocks[block].insts.clear();
             changed = true;
         }
     }
-    changed
+    if changed {
+        func.bump_cfg();
+        Domain::CFG | Domain::VALUES
+    } else {
+        Domain::NONE
+    }
 }
 
 /// The values a jump into `target` with `args` returns, when `target` holds only a return.

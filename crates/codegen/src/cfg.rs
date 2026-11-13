@@ -19,6 +19,7 @@ impl Loops {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Cfg {
     pub entry: Option<Block>,
     pub reachable: Vec<bool>,
@@ -183,7 +184,7 @@ impl Cfg {
         children
     }
 
-    pub(crate) fn loops(&self, _func: &Function) -> Loops {
+    pub(crate) fn loops(&self) -> Loops {
         let mut list: Vec<Loop> = self
             .rpo
             .iter()
@@ -247,5 +248,6 @@ pub(crate) fn preheader(func: &mut Function, cfg: &Cfg, each: &Loop) -> Option<B
             _ => {}
         }
     }
+    func.bump_cfg();
     Some(pre)
 }

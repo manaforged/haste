@@ -1,5 +1,5 @@
 use crate::cfg::Cfg;
-use crate::ir::{Block, Function, Inst, InstData, Op, Type, Value};
+use crate::ir::{Block, Domain, Function, Inst, InstData, Op, Type, Value};
 
 fn scalar_select(ty: Type) -> bool {
     matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64)
@@ -116,13 +116,13 @@ fn try_head(func: &mut Function, cfg: &Cfg, head: Block, cleared: &mut [bool]) -
 }
 
 /// Converts pure diamond and triangle conditional branches into branchless `Op::Select`.
-pub(crate) fn run(func: &mut Function) -> bool {
+pub(crate) fn run(func: &mut Function) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
-        return false;
+        return Domain::NONE;
     }
     let mut any = false;
     loop {
-        let cfg = Cfg::new(func);
+        let cfg = func.cfg();
         let mut cleared = vec![false; func.blocks.len()];
         let mut changed = false;
         for &block in cfg.rpo.iter().rev() {
@@ -131,9 +131,10 @@ pub(crate) fn run(func: &mut Function) -> bool {
             }
         }
         if !changed {
-            return any;
+            return if any { Domain::CFG | Domain::VALUES } else { Domain::NONE };
         }
         any = true;
+        func.bump_cfg();
         crate::merge::run(func);
     }
 }

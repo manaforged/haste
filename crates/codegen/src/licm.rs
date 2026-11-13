@@ -1,5 +1,5 @@
 use crate::cfg::{self, Cfg, Loop};
-use crate::ir::{Block, BlockData, Function, Inst, Op, Value};
+use crate::ir::{Block, BlockData, Domain, Function, Inst, Op, Value};
 use crate::mem::{LoopMem, MemLoc, PromoteBase, PromoteCand, Provenance};
 use crate::merge::{find, identity, rename};
 
@@ -384,23 +384,25 @@ fn hoist(
 }
 
 /// Moves loop-invariant work of every natural loop that one jump enters out to the block that enters it.
-pub(crate) fn run(func: &mut Function) -> bool {
+pub(crate) fn run(func: &mut Function) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
-        return false;
+        return Domain::NONE;
     }
-    let mut cfg = Cfg::new(func);
-    let mut found = cfg.loops(func);
+    let cfg_arc = func.cfg();
+    let mut found = cfg_arc.loops();
     if found.list.is_empty() {
-        return false;
+        return Domain::NONE;
     }
+    let mut cfg = (*cfg_arc).clone();
+    drop(cfg_arc);
     let prov = Provenance::new(func, &cfg);
     let mut home = func.def_blocks();
-    let mut changed = false;
+    let mut dirty = Domain::NONE;
     for idx in 0..found.list.len() {
         let before = func.blocks.len();
         let Some(pre) = cfg::preheader(func, &cfg, &found.list[idx]) else { continue };
         if func.blocks.len() > before {
-            changed = true;
+            dirty |= Domain::CFG;
             home.resize(func.types.len(), Some(pre));
             let head_idx = found.list[idx].head.index();
             let mut pre_preds = Vec::new();
@@ -426,8 +428,19 @@ pub(crate) fn run(func: &mut Function) -> bool {
         let (left, later) = found.list.split_at_mut(idx + 1);
         let each = &left[idx];
         let mut state = PromoteState { func, cfg: &mut cfg, each, later, home: &mut home };
-        changed |= promote_mem(&mut state, &prov, pre);
-        changed |= hoist(func, &found.list[idx], pre, &prov, &mut home);
+        let blocks_before = state.func.blocks.len();
+        if promote_mem(&mut state, &prov, pre) {
+            dirty |= Domain::VALUES | Domain::MEM;
+            if state.func.blocks.len() > blocks_before {
+                dirty |= Domain::CFG;
+            }
+        }
+        if hoist(func, &found.list[idx], pre, &prov, &mut home) {
+            dirty |= Domain::VALUES;
+        }
     }
-    changed
+    if dirty.contains(Domain::CFG) {
+        func.bump_cfg();
+    }
+    dirty
 }

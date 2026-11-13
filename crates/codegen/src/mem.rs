@@ -66,12 +66,27 @@ impl TrackRoot {
 pub(crate) struct Provenance {
     pub slot_offsets: Vec<Option<(StackSlot, i32)>>,
     pub unescaped_slots: Vec<bool>,
+    pub open_slots: Vec<bool>,
     pub call_readonly_slots: Vec<bool>,
     pub noalias_escaped: Vec<bool>,
     pub param_roots: Vec<MemRoot>,
     pub symbol_defs: Vec<Option<u32>>,
     pub ro_bytes: Vec<u32>,
     pub affine: Vec<(Value, i64)>,
+}
+
+struct UseCounts {
+    total: Vec<u32>,
+    safe: Vec<u32>,
+    moves: Vec<u32>,
+    ro_calls: Vec<u32>,
+}
+
+struct SlotEscapes {
+    unescaped: Vec<bool>,
+    open: Vec<bool>,
+    call_readonly: Vec<bool>,
+    noalias: Vec<bool>,
 }
 
 fn slot_addresses(func: &Function) -> Vec<Option<(StackSlot, i32)>> {
@@ -86,72 +101,86 @@ fn finish_slot_escape(
     func: &Function,
     slots: &[Option<(StackSlot, i32)>],
     tracked: &[TrackRoot],
-    (total, safe, ro_calls): (&[u32], &[u32], &[u32]),
-) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
-    let mut unescaped_slots = vec![true; func.slots.len()];
-    let mut call_readonly_slots = vec![true; func.slots.len()];
-    let mut noalias_escaped = vec![false; func.signature.params.len()];
+    counts: &UseCounts,
+    is_spill: Option<&[bool]>,
+) -> SlotEscapes {
+    let mut unescaped = vec![true; func.slots.len()];
+    let mut open = vec![true; func.slots.len()];
+    let mut call_readonly = vec![true; func.slots.len()];
+    let mut noalias = vec![false; func.signature.params.len()];
     for (v, slot) in slots.iter().enumerate() {
         let resolved = slot.map(|(s, _)| s).or(match tracked[v] {
             TrackRoot::Set(MemRoot::Slot(s)) => Some(s),
             _ => None,
         });
         if let Some(s) = resolved {
-            if safe[v] != total[v] {
-                unescaped_slots[s.index()] = false;
+            let spilled = is_spill.is_some_and(|sp| sp.get(v).copied().unwrap_or(false));
+            if spilled || counts.safe[v] != counts.total[v] {
+                unescaped[s.index()] = false;
             }
-            if safe[v] + ro_calls[v] != total[v] {
-                call_readonly_slots[s.index()] = false;
+            if spilled || counts.safe[v] + counts.moves[v] != counts.total[v] {
+                open[s.index()] = false;
+            }
+            if spilled || counts.safe[v] + counts.ro_calls[v] != counts.total[v] {
+                call_readonly[s.index()] = false;
             }
         }
         if let TrackRoot::Set(MemRoot::NoAliasParam(p)) = tracked[v]
-            && safe[v] != total[v]
+            && counts.safe[v] != counts.total[v]
         {
-            noalias_escaped[usize::from(p)] = true;
+            noalias[usize::from(p)] = true;
         }
     }
-    (unescaped_slots, call_readonly_slots, noalias_escaped)
+    SlotEscapes { unescaped, open, call_readonly, noalias }
 }
 
 fn classify_uses(
     func: &Function,
     slots: &[Option<(StackSlot, i32)>],
     tracked: &[TrackRoot],
-) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+    is_spill: Option<&[bool]>,
+) -> SlotEscapes {
     let n = func.types.len();
-    let (mut total, mut safe, mut ro_calls) = (vec![0_u32; n], vec![0_u32; n], vec![0_u32; n]);
+    let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], moves: vec![0_u32; n], ro_calls: vec![0_u32; n] };
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         let data = &func.insts[inst.index()];
-        data.op.for_operands(|v| total[v.index()] += 1);
+        data.op.for_operands(|v| counts.total[v.index()] += 1);
         match &data.op {
-            Op::Load(addr, _) => safe[addr.index()] += 1,
-            Op::Store(val, addr, _) if val != addr => safe[addr.index()] += 1,
+            Op::Load(addr, _) => {
+                if slots[addr.index()].is_some() || !matches!(tracked[addr.index()], TrackRoot::Set(MemRoot::Slot(_))) {
+                    counts.safe[addr.index()] += 1;
+                }
+            }
+            Op::Store(val, addr, _) if val != addr => {
+                if slots[addr.index()].is_some() || !matches!(tracked[addr.index()], TrackRoot::Set(MemRoot::Slot(_))) {
+                    counts.safe[addr.index()] += 1;
+                }
+            }
             Op::Move(to, from, _) => {
-                safe[to.index()] += 1;
-                safe[from.index()] += 1;
+                counts.moves[to.index()] += 1;
+                counts.moves[from.index()] += 1;
             }
             Op::Binary(Binary::Iadd | Binary::Isub, a, b) => {
-                let res_tracked = data.result.is_some_and(|r| slots[r.index()].is_some() || matches!(tracked[r.index()], TrackRoot::Set(_)));
-                if res_tracked {
-                    if slots[a.index()].is_some() || matches!(tracked[a.index()], TrackRoot::Set(_)) {
-                        safe[a.index()] += 1;
-                    } else {
-                        safe[b.index()] += 1;
-                    }
+                if data.result.is_some_and(|r| slots[r.index()].is_some()) {
+                    let target = if slots[a.index()].is_some() { a } else { b };
+                    counts.safe[target.index()] += 1;
+                } else if data.result.is_some_and(|r| matches!(tracked[r.index()], TrackRoot::Set(root) if !matches!(root, MemRoot::Slot(_)))) {
+                    let target = if matches!(tracked[a.index()], TrackRoot::Set(_)) { a } else { b };
+                    counts.safe[target.index()] += 1;
                 }
             }
             Op::Call { sig, args, .. } | Op::TryCall { sig, args, .. } => {
                 let params = &func.sigs[sig.index()].params;
                 for (i, arg) in args.iter().enumerate() {
                     if params.get(i).is_some_and(|p| p.readonly) {
-                        ro_calls[arg.index()] += 1;
+                        counts.ro_calls[arg.index()] += 1;
                     }
                 }
             }
             _ => {}
         }
     }
-    finish_slot_escape(func, slots, tracked, (&total, &safe, &ro_calls))
+    finish_slot_escape(func, slots, tracked, &counts, is_spill)
 }
 
 fn step_track(op: &Op, ty: Type, tracked: &[TrackRoot]) -> TrackRoot {
@@ -299,10 +328,10 @@ pub(crate) fn compute_affine(func: &Function) -> Vec<(Value, i64)> {
 }
 
 impl Provenance {
-    pub(crate) fn new(func: &Function, cfg: &Cfg) -> Self {
+    fn build(func: &Function, cfg: &Cfg, is_spill: Option<&[bool]>) -> Self {
         let slot_offsets = slot_addresses(func);
         let tracked = compute_tracked_roots(func, cfg);
-        let (unescaped_slots, call_readonly_slots, noalias_escaped) = classify_uses(func, &slot_offsets, &tracked);
+        let esc = classify_uses(func, &slot_offsets, &tracked, is_spill);
         let mut param_roots = vec![MemRoot::Unknown; func.types.len()];
         for (i, t) in tracked.iter().enumerate() {
             if let TrackRoot::Set(root) = *t {
@@ -323,7 +352,31 @@ impl Provenance {
             }
         }
         let affine = compute_affine(func);
-        Self { slot_offsets, unescaped_slots, call_readonly_slots, noalias_escaped, param_roots, symbol_defs, ro_bytes, affine }
+        Self {
+            slot_offsets,
+            unescaped_slots: esc.unescaped,
+            open_slots: esc.open,
+            call_readonly_slots: esc.call_readonly,
+            noalias_escaped: esc.noalias,
+            param_roots,
+            symbol_defs,
+            ro_bytes,
+            affine,
+        }
+    }
+
+    pub(crate) fn new(func: &Function, cfg: &Cfg) -> Self {
+        Self::build(func, cfg, None)
+    }
+
+    pub(crate) fn compute(func: &Function) -> Self {
+        let cfg = func.cfg();
+        Self::build(func, &cfg, None)
+    }
+
+    pub(crate) fn compute_with_spills(func: &Function, is_spill: Option<&[bool]>) -> Self {
+        let cfg = func.cfg();
+        Self::build(func, &cfg, is_spill)
     }
 
     pub(crate) fn loc(&self, addr: Value, offset: i64, size: u32) -> MemLoc {
@@ -347,6 +400,14 @@ impl Provenance {
 
     pub(crate) fn slot_unescaped(&self, slot: StackSlot) -> bool {
         self.unescaped_slots.get(slot.index()).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn slot_open(&self, slot: StackSlot) -> bool {
+        self.open_slots.get(slot.index()).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn escaped_slots(&self) -> Vec<bool> {
+        self.unescaped_slots.iter().map(|&u| !u).collect()
     }
 
     pub(crate) fn slot_call_readonly(&self, slot: StackSlot) -> bool {

@@ -1,5 +1,5 @@
 use crate::fold::{evaluate_wrapped, extend};
-use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, IntCC, Op, SigRef, Type, Value};
+use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, InstData, IntCC, Op, SigRef, Type, Value};
 
 const MAX_DISP_INSTS: usize = 10;
 const MAX_CHAIN: usize = 8;
@@ -277,12 +277,12 @@ fn thread_brif(func: &mut Function, pred: Block, disp: Block, consts: &mut Vec<O
 }
 
 /// Threads correlated constant-condition jump chains through small pure dispatcher blocks.
-pub(crate) fn run(func: &mut Function) -> bool {
+pub(crate) fn run(func: &mut Function) -> Domain {
     let Some(entry) = func.entry else {
-        return false;
+        return Domain::NONE;
     };
     if func.coroutine.is_some() {
-        return false;
+        return Domain::NONE;
     }
     let mut pinned = vec![false; func.blocks.len()];
     pinned[entry.index()] = true;
@@ -339,9 +339,12 @@ pub(crate) fn run(func: &mut Function) -> bool {
         any = true;
     }
     if any {
+        func.bump_cfg();
         crate::fold::prune(func, entry);
+        Domain::CFG | Domain::VALUES
+    } else {
+        Domain::NONE
     }
-    any
 }
 
 /// Renumbers the instructions and values the blocks hold and drops the rest, so a body kept or copied whole carries no dead entries.
@@ -398,6 +401,7 @@ fn compact_blocks(func: &mut Function) {
     func.insts.iter_mut().for_each(|data| data.op.map_targets(renumber));
     func.entry = func.entry.map(renumber);
     func.blocks = blocks;
+    func.bump_cfg();
 }
 
 fn compact_sigs(func: &mut Function) {

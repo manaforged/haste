@@ -32,6 +32,7 @@ impl<'f> FunctionBuilder<'f> {
     pub fn create_block(&mut self) -> Block {
         self.func.blocks.push(BlockData::default());
         self.incoming.push(0);
+        self.func.bump_cfg();
         Block(self.func.blocks.len() as u32 - 1)
     }
 
@@ -64,6 +65,7 @@ impl<'f> FunctionBuilder<'f> {
             self.append_block_param(block, ty);
         }
         self.func.entry = Some(block);
+        self.func.bump_cfg();
     }
 
     /// Adds a frame area of `size` bytes aligned to `1 << align_shift`.
@@ -112,6 +114,7 @@ impl<'f> FunctionBuilder<'f> {
             block.insts.retain(|inst| inst.index() < mark.insts);
             block.params.retain(|value| value.index() < mark.types);
         }
+        func.bump_cfg();
         self.current = mark.current;
     }
 
@@ -161,6 +164,9 @@ impl<'f> FunctionBuilder<'f> {
     }
 
     fn append(&mut self, block: Block, data: InstData) {
+        if data.op.is_terminator() {
+            self.func.bump_cfg();
+        }
         for target in data.op.targets() {
             self.incoming[target.index()] += 1;
         }
@@ -188,6 +194,7 @@ impl Function {
         let Op::Call { args, results, .. } = std::mem::replace(&mut self.insts[old_inst.index()].op, Op::Trap) else {
             return;
         };
+        self.bump_cfg();
         self.insts[old_inst.index()].result = None;
         let values: Vec<Value> = callee.types.iter().map(|ty| self.value(*ty)).collect();
         let base_block = self.blocks.len() as u32;
@@ -289,6 +296,9 @@ impl Ins<'_> {
     }
 
     fn effect(&mut self, op: Op) -> Inst {
+        if op.is_terminator() {
+            self.func.bump_cfg();
+        }
         for target in op.targets() {
             if let Some(count) = self.incoming.get_mut(target.index()) {
                 *count += 1;

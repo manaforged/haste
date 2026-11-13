@@ -1,70 +1,108 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, IntCC, Lane, Target, TargetOpId, Type, Value};
+use haste_codegen::{Arch, IntCC, Lane, ReduceOp, StackSlot, Target, TargetOpId, Type, Value};
 
 use crate::host::{HostSymbol, X86Symbol};
 
-use super::Lower;
+use super::super::Lower;
 
 impl Lower<'_, '_> {
     pub(in crate::lower) fn shuffle_dyn(&mut self, args: &[Value], tbl: bool) -> Result<Value> {
         let &[table, index] = args else { bail!("byte shuffle takes two vectors") };
+        let res = self.shuffle_dyn_16(table, index, tbl, 0);
+        Ok(self.store_vec(res, 16))
+    }
+
+    fn shuffle_dyn_16(&mut self, table: Value, index: Value, tbl: bool, off: i32) -> Value {
+        let ty = Type::Vec { lane: Lane::I8, count: 16 };
+        let (t, idx) = (self.ins().load(ty, table, off), self.ins().load(ty, index, off));
         let arch = Target::host().arch;
         if (tbl && arch == Arch::Arm64) || (!tbl && arch == Arch::X64) {
-            let ty = Type::Vec { lane: Lane::I8, count: 16 };
-            let (t, idx) = (self.ins().load(ty, table, 0), self.ins().load(ty, index, 0));
-            let res = self.ins().shuffle_dyn(t, t, idx);
-            return Ok(self.store_vec(res, 16));
+            return self.ins().shuffle_dyn(t, t, idx);
         }
-        let slot = self.b.create_stack_slot(16, 4);
-        let (mask, zero) = (self.ins().iconst(Type::I8, 15), self.ins().iconst(Type::I8, 0));
-        for lane in 0..16 {
-            let at = self.ins().load(Type::I8, index, lane);
-            let keep = if tbl {
-                self.ins().icmp_imm(IntCC::UnsignedLessThan, at, 16)
-            } else {
-                self.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, at, 0)
-            };
-            let masked = self.ins().band(at, mask);
-            let pick = self.ins().uextend(Type::I64, masked);
-            let source = self.ins().iadd(table, pick);
-            let byte = self.ins().load(Type::I8, source, 0);
-            let value = self.ins().select(keep, byte, zero);
-            self.ins().stack_store(value, slot, lane);
-        }
-        Ok(self.ins().stack_addr(Type::I64, slot, 0))
+        let adj = if tbl {
+            let sixteen_s = self.ins().iconst(Type::I8, 16);
+            let sixteen = self.ins().splat(ty, sixteen_s);
+            let oob = self.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, sixteen);
+            self.ins().bor(idx, oob)
+        } else {
+            let zero = self.ins().iconst(ty, 0);
+            let neg = self.ins().icmp(IntCC::SignedLessThan, idx, zero);
+            let fifteen_s = self.ins().iconst(Type::I8, 15);
+            let fifteen = self.ins().splat(ty, fifteen_s);
+            let masked = self.ins().band(idx, fifteen);
+            self.ins().bor(masked, neg)
+        };
+        self.ins().shuffle_dyn(t, t, adj)
     }
 
     pub(in crate::lower) fn byte_permute_32(&mut self, args: &[Value]) -> Result<Value> {
         let &[table, index] = args else { bail!("`pshufb` takes two vectors") };
         let slot = self.b.create_stack_slot(32, 5);
-        let (low, zero) = (self.ins().iconst(Type::I8, 15), self.ins().iconst(Type::I8, 0));
-        for lane in 0..32 {
-            let at = self.ins().load(Type::I8, index, lane);
-            let pick = self.ins().band(at, low);
-            let pick = self.ins().uextend(Type::I64, pick);
-            let base = self.ins().iadd_imm(table, i64::from(lane & !15));
-            let source = self.ins().iadd(base, pick);
-            let byte = self.ins().load(Type::I8, source, 0);
-            let cleared = self.ins().icmp_imm(IntCC::SignedLessThan, at, 0);
-            let value = self.ins().select(cleared, zero, byte);
-            self.ins().stack_store(value, slot, lane);
-        }
+        let lo = self.shuffle_dyn_16(table, index, false, 0);
+        let hi = self.shuffle_dyn_16(table, index, false, 16);
+        self.ins().stack_store(lo, slot, 0);
+        self.ins().stack_store(hi, slot, 16);
         Ok(self.ins().stack_addr(Type::I64, slot, 0))
+    }
+
+    pub(in crate::lower) fn avg_round_vec(&mut self, ty: Type, args: &[Value]) -> Result<Value> {
+        let &[x, y] = args else { bail!("`avg_round` takes two vectors") };
+        let (va, vb) = (self.ins().load(ty, x, 0), self.ins().load(ty, y, 0));
+        let out = self.ins().avg_round(va, vb);
+        Ok(self.store_vec(out, ty.bytes()))
+    }
+
+    pub(in crate::lower) fn umaxp_vec(&mut self, args: &[Value]) -> Result<Value> {
+        let &[x, y] = args else { bail!("`umaxp` takes two vectors") };
+        let ty = Type::Vec { lane: Lane::I8, count: 16 };
+        let (va, vb) = (self.ins().load(ty, x, 0), self.ins().load(ty, y, 0));
+        let even = self.ins().shuffle(va, vb, [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]);
+        let odd = self.ins().shuffle(va, vb, [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31]);
+        let out = self.ins().umax(even, odd);
+        Ok(self.store_vec(out, 16))
+    }
+
+    pub(in crate::lower) fn sqdmulh_vec(&mut self, ty: Type, args: &[Value]) -> Result<Value> {
+        let &[x, y] = args else { bail!("`sqdmulh` takes two vectors") };
+        let i32x2 = Type::Vec { lane: Lane::I32, count: 2 };
+        let i64x2 = Type::Vec { lane: Lane::I64, count: 2 };
+        let i16x4 = Type::Vec { lane: Lane::I16, count: 4 };
+        let i32x4 = Type::Vec { lane: Lane::I32, count: 4 };
+        let i16x8 = Type::Vec { lane: Lane::I16, count: 8 };
+        if ty == i32x2 {
+            let out = self.sqdmulh_half(i32x2, i64x2, 31, (x, y), 0);
+            return Ok(self.store_vec(out, 8));
+        }
+        let (half_ty, wide_ty, shift) = match ty {
+            _ if ty == i32x4 => (i32x2, i64x2, 31),
+            _ if ty == i16x8 => (i16x4, i32x4, 15),
+            _ => bail!("unsupported `sqdmulh` type {ty:?}"),
+        };
+        let lo = self.sqdmulh_half(half_ty, wide_ty, shift, (x, y), 0);
+        let hi = self.sqdmulh_half(half_ty, wide_ty, shift, (x, y), 8);
+        let slot = self.b.create_stack_slot(16, 4);
+        self.ins().stack_store(lo, slot, 0);
+        self.ins().stack_store(hi, slot, 8);
+        Ok(self.ins().stack_addr(Type::I64, slot, 0))
+    }
+
+    fn sqdmulh_half(&mut self, half_ty: Type, wide_ty: Type, shift_bits: i64, (x, y): (Value, Value), off: i32) -> Value {
+        let (va, vb) = (self.ins().load(half_ty, x, off), self.ins().load(half_ty, y, off));
+        let (wa, wb) = (self.ins().sextend(wide_ty, va), self.ins().sextend(wide_ty, vb));
+        let prod = self.ins().imul(wa, wb);
+        let wide_lane = wide_ty.lane().map_or(Type::I64, Lane::to_type);
+        let sh_s = self.ins().iconst(wide_lane, shift_bits);
+        let sh = self.ins().splat(wide_ty, sh_s);
+        let shifted = self.ins().sshr(prod, sh);
+        self.ins().narrow_sat(half_ty, true, shifted)
     }
 
     pub(in crate::lower) fn target_vector(&mut self, id: TargetOpId, ty: Type, args: &[Value]) -> Result<Value> {
         let arch = Target::host().arch;
         if is_arm64_target_op(id) && arch != Arch::Arm64 {
-            return match (id, args) {
-                (TargetOpId::Arm64Umaxp, &[x, y]) => Ok(self.byte_pair_max_fallback(x, y)),
-                (TargetOpId::Arm64Sqdmulh, &[x, y]) => {
-                    let Some((lane, count)) = ty.vec_shape() else { bail!("bad sqdmulh type") };
-                    Ok(self.sqdmulh_scalar(i32::from(count), lane.to_type(), (x, y)))
-                }
-                _ => bail!("ARM64 vector intrinsic {id:?} is only supported on Arm64"),
-            };
+            bail!("ARM64 vector intrinsic {id:?} is only supported on Arm64");
         }
-        if is_x64_target_op(id) && arch != Arch::X64 {
+        if !is_arm64_target_op(id) && arch != Arch::X64 {
             bail!("x86 vector intrinsic {id:?} is only supported on X64");
         }
         if !(1..=3).contains(&args.len()) {
@@ -76,6 +114,9 @@ impl Lower<'_, '_> {
     }
 
     pub(in crate::lower) fn host_vector(&mut self, x86: X86Symbol, args: &[Value]) -> Result<Value> {
+        if let Some(value) = self.x86_inline(x86, args)? {
+            return Ok(value);
+        }
         if Target::host().arch == Arch::X64
             && let Some((id, ty)) = x86_target_op(x86)
             && (1..=3).contains(&args.len())
@@ -98,52 +139,245 @@ impl Lower<'_, '_> {
         })
     }
 
-    fn byte_pair_max_fallback(&mut self, first: Value, second: Value) -> Value {
-        let slot = self.b.create_stack_slot(16, 4);
-        for lane in 0..16 {
-            let from = if lane < 8 { first } else { second };
-            let at = lane % 8 * 2;
-            let (x, y) = (self.ins().load(Type::I8, from, at), self.ins().load(Type::I8, from, at + 1));
-            let wins = self.ins().icmp(IntCC::UnsignedGreaterThan, x, y);
-            let value = self.ins().select(wins, x, y);
-            self.ins().stack_store(value, slot, lane);
+    fn x86_inline(&mut self, x86: X86Symbol, args: &[Value]) -> Result<Option<Value>> {
+        let i8x16 = Type::Vec { lane: Lane::I8, count: 16 };
+        let i8x8 = Type::Vec { lane: Lane::I8, count: 8 };
+        let i16x8 = Type::Vec { lane: Lane::I16, count: 8 };
+        let i16x4 = Type::Vec { lane: Lane::I16, count: 4 };
+        let i32x4 = Type::Vec { lane: Lane::I32, count: 4 };
+        let f32x4 = Type::Vec { lane: Lane::F32, count: 4 };
+        let f64x2 = Type::Vec { lane: Lane::F64, count: 2 };
+        match (x86, args) {
+            (X86Symbol::Lddqu, &[at]) => {
+                let v = self.ins().load(i8x16, at, 0);
+                Ok(Some(self.store_vec(v, 16)))
+            }
+            (X86Symbol::Vlddqu, &[at]) => {
+                let v = self.emit_256(|lower, off| lower.ins().load(i8x16, at, off));
+                Ok(Some(v))
+            }
+            (X86Symbol::Packsswb | X86Symbol::Packuswb, &[a, b]) => {
+                let slot = self.b.create_stack_slot(16, 4);
+                self.pack_sat_half(i16x8, i8x8, x86 == X86Symbol::Packsswb, (a, b), (slot, 0));
+                Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
+            }
+            (X86Symbol::Packsswb256 | X86Symbol::Packuswb256, &[a, b]) => {
+                let signed = x86 == X86Symbol::Packsswb256;
+                let slot = self.b.create_stack_slot(32, 5);
+                self.pack_sat_half(i16x8, i8x8, signed, (a, b), (slot, 0));
+                self.pack_sat_half(i16x8, i8x8, signed, (a, b), (slot, 16));
+                Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
+            }
+            (X86Symbol::Packssdw | X86Symbol::Packusdw, &[a, b]) => {
+                let slot = self.b.create_stack_slot(16, 4);
+                self.pack_sat_half(i32x4, i16x4, x86 == X86Symbol::Packssdw, (a, b), (slot, 0));
+                Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
+            }
+            (X86Symbol::Packssdw256 | X86Symbol::Packusdw256, &[a, b]) => {
+                let signed = x86 == X86Symbol::Packssdw256;
+                let slot = self.b.create_stack_slot(32, 5);
+                self.pack_sat_half(i32x4, i16x4, signed, (a, b), (slot, 0));
+                self.pack_sat_half(i32x4, i16x4, signed, (a, b), (slot, 16));
+                Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
+            }
+            (X86Symbol::Pmaddwd, &[a, b]) => {
+                let v = self.pmaddwd_128(a, b, 0);
+                Ok(Some(self.store_vec(v, 16)))
+            }
+            (X86Symbol::Pmaddwd256, &[a, b]) => Ok(Some(self.emit_256(|lower, off| lower.pmaddwd_128(a, b, off)))),
+            (X86Symbol::Pmaddubsw128, &[a, b]) => {
+                let v = self.pmaddubsw_128(a, b, 0);
+                Ok(Some(self.store_vec(v, 16)))
+            }
+            (X86Symbol::Pmaddubsw256, &[a, b]) => Ok(Some(self.emit_256(|lower, off| lower.pmaddubsw_128(a, b, off)))),
+            (X86Symbol::Psadbw, &[a, b]) => {
+                let slot = self.b.create_stack_slot(16, 4);
+                self.psadbw_128((a, b), (slot, 0));
+                Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
+            }
+            (X86Symbol::Psadbw256, &[a, b]) => {
+                let slot = self.b.create_stack_slot(32, 5);
+                self.psadbw_128((a, b), (slot, 0));
+                self.psadbw_128((a, b), (slot, 16));
+                Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
+            }
+            (X86Symbol::Minps | X86Symbol::Maxps, &[a, b]) => {
+                let v = self.fminmax_128(f32x4, x86 == X86Symbol::Maxps, a, b, 0);
+                Ok(Some(self.store_vec(v, 16)))
+            }
+            (X86Symbol::Minpd | X86Symbol::Maxpd, &[a, b]) => {
+                let v = self.fminmax_128(f64x2, x86 == X86Symbol::Maxpd, a, b, 0);
+                Ok(Some(self.store_vec(v, 16)))
+            }
+            (X86Symbol::Minps256 | X86Symbol::Maxps256, &[a, b]) => Ok(Some(self.emit_256(|lower, off| lower.fminmax_128(f32x4, x86 == X86Symbol::Maxps256, a, b, off)))),
+            (X86Symbol::Minpd256 | X86Symbol::Maxpd256, &[a, b]) => Ok(Some(self.emit_256(|lower, off| lower.fminmax_128(f64x2, x86 == X86Symbol::Maxpd256, a, b, off)))),
+            (
+                X86Symbol::Psllw
+                | X86Symbol::Pslld
+                | X86Symbol::Psllq
+                | X86Symbol::Psrlw
+                | X86Symbol::Psrld
+                | X86Symbol::Psrlq
+                | X86Symbol::Psraw
+                | X86Symbol::Psrad
+                | X86Symbol::Psllw256
+                | X86Symbol::Pslld256
+                | X86Symbol::Psllq256
+                | X86Symbol::Psrlw256
+                | X86Symbol::Psrld256
+                | X86Symbol::Psrlq256
+                | X86Symbol::Psraw256
+                | X86Symbol::Psrad256,
+                &[a, count],
+            ) => {
+                let (lane, n, left, signed, wide) = match x86 {
+                    X86Symbol::Psllw => (Lane::I16, 8, true, false, false),
+                    X86Symbol::Pslld => (Lane::I32, 4, true, false, false),
+                    X86Symbol::Psllq => (Lane::I64, 2, true, false, false),
+                    X86Symbol::Psrlw => (Lane::I16, 8, false, false, false),
+                    X86Symbol::Psrld => (Lane::I32, 4, false, false, false),
+                    X86Symbol::Psrlq => (Lane::I64, 2, false, false, false),
+                    X86Symbol::Psraw => (Lane::I16, 8, false, true, false),
+                    X86Symbol::Psrad => (Lane::I32, 4, false, true, false),
+                    X86Symbol::Psllw256 => (Lane::I16, 8, true, false, true),
+                    X86Symbol::Pslld256 => (Lane::I32, 4, true, false, true),
+                    X86Symbol::Psllq256 => (Lane::I64, 2, true, false, true),
+                    X86Symbol::Psrlw256 => (Lane::I16, 8, false, false, true),
+                    X86Symbol::Psrld256 => (Lane::I32, 4, false, false, true),
+                    X86Symbol::Psrlq256 => (Lane::I64, 2, false, false, true),
+                    X86Symbol::Psraw256 => (Lane::I16, 8, false, true, true),
+                    _ => (Lane::I32, 4, false, true, true),
+                };
+                Ok(Some(self.vec_shift_sat(lane, n, left, signed, wide, a, count)))
+            }
+            _ => Ok(None),
         }
+    }
+
+    fn emit_256(&mut self, mut half: impl FnMut(&mut Self, i32) -> Value) -> Value {
+        let slot = self.b.create_stack_slot(32, 5);
+        let lo = half(self, 0);
+        let hi = half(self, 16);
+        self.ins().stack_store(lo, slot, 0);
+        self.ins().stack_store(hi, slot, 16);
         self.ins().stack_addr(Type::I64, slot, 0)
     }
 
-    fn sqdmulh_scalar(&mut self, lanes: i32, lane_ty: Type, (x, y): (Value, Value)) -> Value {
-        let bytes = lanes * lane_ty.bytes() as i32;
-        let slot = self.b.create_stack_slot(bytes as u32, if bytes == 8 { 3 } else { 4 });
-        let (wide_ty, shift, min_val, max_val) = if lane_ty == Type::I32 {
-            (Type::I64, 32i64, i64::from(i32::MIN), i64::from(i32::MAX))
+    fn low_8(&mut self, half_ty: Type, vec16: Value) -> Value {
+        let slot = self.b.create_stack_slot(16, 4);
+        self.ins().stack_store(vec16, slot, 0);
+        self.ins().stack_load(half_ty, slot, 0)
+    }
+
+    fn pack_sat_half(&mut self, in_ty: Type, out_half: Type, signed: bool, (a, b): (Value, Value), (slot, off): (StackSlot, i32)) {
+        let (va, vb) = (self.ins().load(in_ty, a, off), self.ins().load(in_ty, b, off));
+        let lo = self.ins().narrow_sat(out_half, signed, va);
+        let hi = self.ins().narrow_sat(out_half, signed, vb);
+        self.ins().stack_store(lo, slot, off);
+        self.ins().stack_store(hi, slot, off + 8);
+    }
+
+    fn pmaddwd_128(&mut self, a: Value, b: Value, off: i32) -> Value {
+        let i16x8 = Type::Vec { lane: Lane::I16, count: 8 };
+        let i16x4 = Type::Vec { lane: Lane::I16, count: 4 };
+        let i32x4 = Type::Vec { lane: Lane::I32, count: 4 };
+        let even = [0, 2, 4, 6, 0, 2, 4, 6, 0, 0, 0, 0, 0, 0, 0, 0];
+        let odd = [1, 3, 5, 7, 1, 3, 5, 7, 0, 0, 0, 0, 0, 0, 0, 0];
+        let (va, vb) = (self.ins().load(i16x8, a, off), self.ins().load(i16x8, b, off));
+        let (se_a, se_b) = (self.ins().shuffle(va, va, even), self.ins().shuffle(vb, vb, even));
+        let (so_a, so_b) = (self.ins().shuffle(va, va, odd), self.ins().shuffle(vb, vb, odd));
+        let (la, lb) = (self.low_8(i16x4, se_a), self.low_8(i16x4, se_b));
+        let (ra, rb) = (self.low_8(i16x4, so_a), self.low_8(i16x4, so_b));
+        let (ea, eb) = (self.ins().sextend(i32x4, la), self.ins().sextend(i32x4, lb));
+        let (oa, ob) = (self.ins().sextend(i32x4, ra), self.ins().sextend(i32x4, rb));
+        let pe = self.ins().imul(ea, eb);
+        let po = self.ins().imul(oa, ob);
+        self.ins().iadd(pe, po)
+    }
+
+    fn pmaddubsw_128(&mut self, a: Value, b: Value, off: i32) -> Value {
+        let i8x16 = Type::Vec { lane: Lane::I8, count: 16 };
+        let i8x8 = Type::Vec { lane: Lane::I8, count: 8 };
+        let i16x8 = Type::Vec { lane: Lane::I16, count: 8 };
+        let even = [0, 2, 4, 6, 8, 10, 12, 14, 0, 2, 4, 6, 8, 10, 12, 14];
+        let odd = [1, 3, 5, 7, 9, 11, 13, 15, 1, 3, 5, 7, 9, 11, 13, 15];
+        let (va, vb) = (self.ins().load(i8x16, a, off), self.ins().load(i8x16, b, off));
+        let (se_a, so_a) = (self.ins().shuffle(va, va, even), self.ins().shuffle(va, va, odd));
+        let (se_b, so_b) = (self.ins().shuffle(vb, vb, even), self.ins().shuffle(vb, vb, odd));
+        let (lea, loa) = (self.low_8(i8x8, se_a), self.low_8(i8x8, so_a));
+        let (leb, lob) = (self.low_8(i8x8, se_b), self.low_8(i8x8, so_b));
+        let (ea, oa) = (self.ins().uextend(i16x8, lea), self.ins().uextend(i16x8, loa));
+        let (eb, ob) = (self.ins().sextend(i16x8, leb), self.ins().sextend(i16x8, lob));
+        let pe = self.ins().imul(ea, eb);
+        let po = self.ins().imul(oa, ob);
+        self.ins().sadd_sat(pe, po)
+    }
+
+    fn psadbw_128(&mut self, (a, b): (Value, Value), (slot, off): (StackSlot, i32)) {
+        let u8x16 = Type::Vec { lane: Lane::I8, count: 16 };
+        let u8x8 = Type::Vec { lane: Lane::I8, count: 8 };
+        let i16x8 = Type::Vec { lane: Lane::I16, count: 8 };
+        let (va, vb) = (self.ins().load(u8x16, a, off), self.ins().load(u8x16, b, off));
+        let d1 = self.ins().usub_sat(va, vb);
+        let d2 = self.ins().usub_sat(vb, va);
+        let diff = self.ins().bor(d1, d2);
+        let tmp = self.b.create_stack_slot(16, 4);
+        self.ins().stack_store(diff, tmp, 0);
+        let (lo8, hi8) = (self.ins().stack_load(u8x8, tmp, 0), self.ins().stack_load(u8x8, tmp, 8));
+        let (lo16, hi16) = (self.ins().uextend(i16x8, lo8), self.ins().uextend(i16x8, hi8));
+        let (red_lo, red_hi) = (self.ins().reduce(ReduceOp::Add, lo16), self.ins().reduce(ReduceOp::Add, hi16));
+        let (sum_lo, sum_hi) = (self.ins().uextend(Type::I64, red_lo), self.ins().uextend(Type::I64, red_hi));
+        self.ins().stack_store(sum_lo, slot, off);
+        self.ins().stack_store(sum_hi, slot, off + 8);
+    }
+
+    fn fminmax_128(&mut self, ty: Type, max: bool, a: Value, b: Value, off: i32) -> Value {
+        let (va, vb) = (self.ins().load(ty, a, off), self.ins().load(ty, b, off));
+        if max { self.ins().fmax(va, vb) } else { self.ins().fmin(va, vb) }
+    }
+
+    fn vec_shift_sat(&mut self, lane: Lane, count_lanes: u8, left: bool, signed: bool, wide: bool, a: Value, count: Value) -> Value {
+        let vec_ty = Type::Vec { lane, count: count_lanes };
+        let cnt = self.ins().load(Type::I64, count, 0);
+        let lane_bits = lane.bits();
+        let lane_ty = lane.to_type();
+        let oob = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, cnt, i64::from(lane_bits));
+        let sh_scalar = self.resize(cnt, (Type::I64, false), lane_ty);
+        let sh_vec = self.ins().splat(vec_ty, sh_scalar);
+        let sat = if signed {
+            let c = self.ins().iconst(lane_ty, i64::from(lane_bits - 1));
+            Some(self.ins().splat(vec_ty, c))
         } else {
-            (Type::I32, 16i64, i64::from(i16::MIN), i64::from(i16::MAX))
+            None
         };
-        let (one, sh, max_c) = (self.ins().iconst(wide_ty, 1), self.ins().iconst(wide_ty, shift), self.ins().iconst(lane_ty, max_val));
-        for lane in 0..lanes {
-            let off = lane * lane_ty.bytes() as i32;
-            let (a, b) = (self.ins().load(lane_ty, x, off), self.ins().load(lane_ty, y, off));
-            let (wa, wb) = (self.ins().sextend(wide_ty, a), self.ins().sextend(wide_ty, b));
-            let prod = self.ins().imul(wa, wb);
-            let doubled = self.ins().ishl(prod, one);
-            let shifted = self.ins().sshr(doubled, sh);
-            let narrow = self.ins().ireduce(lane_ty, shifted);
-            let eq_a = self.ins().icmp_imm(IntCC::Equal, a, min_val);
-            let eq_b = self.ins().icmp_imm(IntCC::Equal, b, min_val);
-            let both_min = self.ins().band(eq_a, eq_b);
-            let val = self.ins().select(both_min, max_c, narrow);
-            self.ins().stack_store(val, slot, off);
+        let zero = (!signed).then(|| self.ins().iconst(vec_ty, 0));
+        let emit_half = |lower: &mut Self, off: i32| {
+            let va = lower.ins().load(vec_ty, a, off);
+            let shifted = match (left, signed) {
+                (true, _) => lower.ins().ishl(va, sh_vec),
+                (false, true) => lower.ins().sshr(va, sh_vec),
+                (false, false) => lower.ins().ushr(va, sh_vec),
+            };
+            let saturated = match (sat, zero) {
+                (Some(sat_sh), _) => lower.ins().sshr(va, sat_sh),
+                (_, Some(z)) => z,
+                _ => shifted,
+            };
+            lower.ins().select(oob, saturated, shifted)
+        };
+        if wide {
+            self.emit_256(|lower, off| emit_half(lower, off))
+        } else {
+            let res = emit_half(self, 0);
+            self.store_vec(res, 16)
         }
-        self.ins().stack_addr(Type::I64, slot, 0)
     }
 }
 
 fn is_arm64_target_op(id: TargetOpId) -> bool {
     matches!(
         id,
-        TargetOpId::Arm64Umaxp
-            | TargetOpId::Arm64Sqdmulh
-            | TargetOpId::Arm64Sha256H
+        TargetOpId::Arm64Sha256H
             | TargetOpId::Arm64Sha256H2
             | TargetOpId::Arm64Sha256Su0
             | TargetOpId::Arm64Sha256Su1
@@ -154,15 +388,9 @@ fn is_arm64_target_op(id: TargetOpId) -> bool {
     )
 }
 
-fn is_x64_target_op(id: TargetOpId) -> bool {
-    !is_arm64_target_op(id)
-}
-
 fn x86_target_op(x86: X86Symbol) -> Option<(TargetOpId, Type)> {
     let i8x16 = Type::Vec { lane: Lane::I8, count: 16 };
-    let i16x8 = Type::Vec { lane: Lane::I16, count: 8 };
     let i32x4 = Type::Vec { lane: Lane::I32, count: 4 };
-    let i64x2 = Type::Vec { lane: Lane::I64, count: 2 };
     Some(match x86 {
         X86Symbol::Sha1nexte => (TargetOpId::X64Sha1NextE, i32x4),
         X86Symbol::Sha1msg1 => (TargetOpId::X64Sha1Msg1, i32x4),
@@ -175,13 +403,6 @@ fn x86_target_op(x86: X86Symbol) -> Option<(TargetOpId, Type)> {
         X86Symbol::Aesdec => (TargetOpId::X64AesDec, i8x16),
         X86Symbol::Aesdeclast => (TargetOpId::X64AesDecLast, i8x16),
         X86Symbol::Aesimc => (TargetOpId::X64AesImc, i8x16),
-        X86Symbol::Pmaddwd => (TargetOpId::X64Pmaddwd, i32x4),
-        X86Symbol::Pmaddubsw128 => (TargetOpId::X64Pmaddubsw, i16x8),
-        X86Symbol::Psadbw => (TargetOpId::X64Psadbw, i64x2),
-        X86Symbol::Packsswb => (TargetOpId::X64Packsswb, i8x16),
-        X86Symbol::Packssdw => (TargetOpId::X64Packssdw, i16x8),
-        X86Symbol::Packuswb => (TargetOpId::X64Packuswb, i8x16),
-        X86Symbol::Packusdw => (TargetOpId::X64Packusdw, i16x8),
         _ => return None,
     })
 }

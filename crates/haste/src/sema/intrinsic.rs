@@ -29,6 +29,7 @@ pub enum Intrinsic {
     Copysign,
     Fmin,
     Fmax,
+    Fma,
     Round(u8),
     FloatToInt,
     Transmute,
@@ -47,6 +48,12 @@ pub enum Intrinsic {
     },
     /// AVX2 32-byte `pshufb`.
     BytePermute32,
+    /// Unsigned integer rounded average `(a + b + 1) >> 1` on `Type::Vec`.
+    AvgRound(Type),
+    /// Unsigned byte pairwise maximum across two 16-byte vectors.
+    Umaxp,
+    /// Signed saturating doubling multiply returning high half on `Type::Vec`.
+    Sqdmulh(Type),
     /// A target-specific SIMD instruction emitted via `TargetOpId`.
     TargetOp {
         id: TargetOpId,
@@ -158,13 +165,13 @@ pub enum Atomic {
 const LLVM: &[(&str, Intrinsic)] = &[
     ("llvm.x86.ssse3.pshuf.b.128", Intrinsic::ShuffleDyn { tbl: false }),
     ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute32),
-    ("llvm.x86.sse2.pavg.b", Intrinsic::TargetOp { id: TargetOpId::X64Pavgb, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
-    ("llvm.x86.sse2.pavg.w", Intrinsic::TargetOp { id: TargetOpId::X64Pavgw, ty: Type::Vec { lane: Lane::I16, count: 8 } }),
-    ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::TargetOp { id: TargetOpId::Arm64Umaxp, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
+    ("llvm.x86.sse2.pavg.b", Intrinsic::AvgRound(Type::Vec { lane: Lane::I8, count: 16 })),
+    ("llvm.x86.sse2.pavg.w", Intrinsic::AvgRound(Type::Vec { lane: Lane::I16, count: 8 })),
+    ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::Umaxp),
     ("llvm.aarch64.neon.tbl1.v16i8", Intrinsic::ShuffleDyn { tbl: true }),
-    ("llvm.aarch64.neon.sqdmulh.v2i32", Intrinsic::TargetOp { id: TargetOpId::Arm64Sqdmulh, ty: Type::Vec { lane: Lane::I32, count: 2 } }),
-    ("llvm.aarch64.neon.sqdmulh.v4i32", Intrinsic::TargetOp { id: TargetOpId::Arm64Sqdmulh, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
-    ("llvm.aarch64.neon.sqdmulh.v8i16", Intrinsic::TargetOp { id: TargetOpId::Arm64Sqdmulh, ty: Type::Vec { lane: Lane::I16, count: 8 } }),
+    ("llvm.aarch64.neon.sqdmulh.v2i32", Intrinsic::Sqdmulh(Type::Vec { lane: Lane::I32, count: 2 })),
+    ("llvm.aarch64.neon.sqdmulh.v4i32", Intrinsic::Sqdmulh(Type::Vec { lane: Lane::I32, count: 4 })),
+    ("llvm.aarch64.neon.sqdmulh.v8i16", Intrinsic::Sqdmulh(Type::Vec { lane: Lane::I16, count: 8 })),
     ("llvm.aarch64.crypto.sha256h", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256H, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
     ("llvm.aarch64.crypto.sha256h2", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256H2, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
     ("llvm.aarch64.crypto.sha256su0", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256Su0, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
@@ -217,6 +224,10 @@ const NAMES: &[(&str, Intrinsic)] = {
         ("floor", Floor),
         ("roundf32", Round(32)),
         ("roundf64", Round(64)),
+        ("fmaf32", Fma),
+        ("fmaf64", Fma),
+        ("fmuladdf32", Fma),
+        ("fmuladdf64", Fma),
         ("float_to_int_unchecked", FloatToInt),
         ("transmute", Transmute),
         ("transmute_unchecked", Transmute),

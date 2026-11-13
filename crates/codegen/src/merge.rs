@@ -1,9 +1,9 @@
 use crate::cfg::Cfg;
-use crate::ir::{Block, Function, Op, Value};
+use crate::ir::{Block, Domain, Function, Op, Value};
 
 /// Folds every block that only one jump enters into the block that jumps, so its values stay block-local.
-pub(crate) fn run(func: &mut Function) -> bool {
-    let cfg = Cfg::new(func);
+pub(crate) fn run(func: &mut Function) -> Domain {
+    let cfg = func.cfg();
     let mut subst = identity(func.types.len());
     let mut merged = false;
     for block in 0..func.blocks.len() {
@@ -15,7 +15,13 @@ pub(crate) fn run(func: &mut Function) -> bool {
     if merged {
         rename(func, &subst);
     }
-    merged | merge_traps(func)
+    let traps = merge_traps(func);
+    if merged || traps {
+        func.bump_cfg();
+        Domain::CFG | Domain::VALUES
+    } else {
+        Domain::NONE
+    }
 }
 
 fn is_trap_block(func: &Function, block: usize) -> bool {

@@ -97,8 +97,6 @@ pub enum ReduceOp {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum TargetOpId {
-    Arm64Umaxp,
-    Arm64Sqdmulh,
     Arm64Sha256H,
     Arm64Sha256H2,
     Arm64Sha256Su0,
@@ -118,15 +116,6 @@ pub enum TargetOpId {
     X64AesDec,
     X64AesDecLast,
     X64AesImc,
-    X64Pmaddwd,
-    X64Pmaddubsw,
-    X64Psadbw,
-    X64Pavgb,
-    X64Pavgw,
-    X64Packsswb,
-    X64Packssdw,
-    X64Packuswb,
-    X64Packusdw,
 }
 
 /// Inline 1-to-3 operand list for `Op::TargetOp` (unused slots canonicalized to `Value(0)`).
@@ -156,4 +145,57 @@ impl TinyArgs {
     pub fn as_slice(&self) -> &[Value] { &self.args[..usize::from(self.len)] }
     /// Returns mutable access to the active operands.
     pub fn as_mut_slice(&mut self) -> &mut [Value] { &mut self.args[..usize::from(self.len)] }
+}
+
+/// Bitset of IR facets invalidated or changed by a pass.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Domain(pub(crate) u8);
+
+impl Domain {
+    pub(crate) const NONE: Self = Self(0);
+    pub(crate) const VALUES: Self = Self(1);
+    pub(crate) const CFG: Self = Self(2);
+    pub(crate) const MEM: Self = Self(4);
+
+    /// Whether no facet bit is set.
+    pub(crate) const fn is_empty(self) -> bool { self.0 == 0 }
+    /// Whether any bit in `other` is set in `self`.
+    pub(crate) const fn contains(self, other: Self) -> bool { (self.0 & other.0) != 0 }
+    /// Union of two domain bitsets.
+    pub(crate) const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
+}
+
+impl std::ops::BitOr for Domain {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+}
+
+impl std::ops::BitOrAssign for Domain {
+    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+}
+
+impl std::ops::BitAnd for Domain {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) }
+}
+
+/// Thread-safe cached CFG tied to a function's `cfg_rev`.
+pub(crate) struct CfgCache(pub(super) std::sync::Mutex<Option<(u32, std::sync::Arc<crate::cfg::Cfg>)>>);
+
+impl Default for CfgCache {
+    fn default() -> Self { Self(std::sync::Mutex::new(None)) }
+}
+
+impl Clone for CfgCache {
+    fn clone(&self) -> Self { Self::default() }
+}
+
+impl PartialEq for CfgCache {
+    fn eq(&self, _other: &Self) -> bool { true }
+}
+
+impl Eq for CfgCache {}
+
+impl std::fmt::Debug for CfgCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("CfgCache") }
 }

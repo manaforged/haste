@@ -404,7 +404,7 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, pl
     if func.blocks[entry.index()].params.iter().any(|&p| !pure_value(p, plan, frame, clobbers)) {
         return None;
     }
-    let cfg = crate::cfg::Cfg::new(func);
+    let cfg = func.cfg();
     if cfg.pred_count(entry) != 0 || !pure_block(func, entry, plan, frame, clobbers) {
         return None;
     }

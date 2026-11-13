@@ -361,7 +361,50 @@ impl Emit<'_> {
                 };
                 self.asm.vbit(base | (spec.q << 30) | (spec.fsz() << 22), dst, a, b);
             }
+            Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat => {
+                let base = match (spec.is_1d(), op) {
+                    (true, Binary::SaddSat) => 0x5EE0_0C00,
+                    (true, Binary::UaddSat) => 0x7EE0_0C00,
+                    (true, Binary::SsubSat) => 0x5EE0_2C00,
+                    (true, Binary::UsubSat) => 0x7EE0_2C00,
+                    (false, Binary::SaddSat) => 0x0E20_0C00 | (spec.q << 30) | (spec.size << 22),
+                    (false, Binary::UaddSat) => 0x2E20_0C00 | (spec.q << 30) | (spec.size << 22),
+                    (false, Binary::SsubSat) => 0x0E20_2C00 | (spec.q << 30) | (spec.size << 22),
+                    (false, Binary::UsubSat) => 0x2E20_2C00 | (spec.q << 30) | (spec.size << 22),
+                    _ => unreachable!(),
+                };
+                self.asm.vbit(base, dst, a, b);
+            }
+            Binary::AvgRound if spec.lane != Lane::I64 => {
+                self.asm.vbit(0x2E20_1400 | (spec.q << 30) | (spec.size << 22), dst, a, b);
+            }
+            Binary::AvgRound => {
+                self.asm.vbit(0x0EA0_1C00 | (spec.q << 30), V2, a, b);
+                self.asm.vbit(0x2E20_1C00 | (spec.q << 30), V3, a, b);
+                self.vec_shift_imm(spec, Binary::Ushr, 1, V3, V3);
+                let sub = if spec.is_1d() { 0x7EE0_8400 } else { 0x2E20_8400 | (spec.q << 30) | (spec.size << 22) };
+                self.asm.vbit(sub, dst, V2, V3);
+            }
             other => return Err(format!("{other:?} of a vector")),
+        }
+        self.fput(result, dst);
+        Ok(())
+    }
+
+    pub(super) fn vec_fma(&mut self, a: Value, b: Value, c: Value, result: Value) -> Result<(), String> {
+        let spec = VecSpec::of(self.ty(a))?;
+        let va = self.fin(a, V0);
+        let vb = self.fin(b, V1);
+        let vc = self.fin(c, V2);
+        let dst = self.fdst(result);
+        if spec.is_1d() {
+            let word = 0x1F40_0000 | u32::from(vb.0) << 16 | u32::from(vc.0) << 10 | u32::from(va.0) << 5 | u32::from(dst.0);
+            self.asm.word(word);
+        } else {
+            let acc = if dst == va || dst == vb { V3 } else { dst };
+            self.asm.vmov(acc, vc);
+            self.asm.vbit(0x0E20_CC00 | (spec.q << 30) | (spec.fsz() << 22), acc, va, vb);
+            self.asm.vmov(dst, acc);
         }
         self.fput(result, dst);
         Ok(())
@@ -489,6 +532,10 @@ impl Emit<'_> {
                 self.v_two(0x0F00_A400 | (u << 29) | ((1 << fspec.size) << 19), dst, src);
             }
             Convert::Ireduce => self.v_two(0x0E21_2800 | (tspec.size << 22), dst, src),
+            Convert::NarrowSat { signed } => {
+                let base = if signed { 0x0E21_4800 } else { 0x2E21_2800 };
+                self.v_two(base | (tspec.size << 22), dst, src);
+            }
             Convert::FromSint | Convert::FromUint => {
                 let u = u32::from(op == Convert::FromUint);
                 if fspec.size == tspec.size {

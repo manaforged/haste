@@ -2,10 +2,10 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::cfg::Cfg;
 use crate::fold::extend;
-use crate::ir::{Binary, Block, BlockData, Convert, Function, Inst, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Block, BlockData, Convert, Domain, Function, Inst, IntCC, Op, Type, Value};
 
 struct Info {
-    cfg: Cfg,
+    cfg: std::sync::Arc<Cfg>,
     uses: Vec<u32>,
     consts: Vec<Option<i64>>,
     def_block: Vec<Option<usize>>,
@@ -73,7 +73,7 @@ struct Chain {
 }
 
 fn analyze(func: &Function) -> Info {
-    let cfg = Cfg::new(func);
+    let cfg = func.cfg();
     let uses = func.use_counts();
     let mut consts = vec![None; func.types.len()];
     let mut def_block = vec![None; func.types.len()];
@@ -772,7 +772,7 @@ fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), m
     true
 }
 
-pub(crate) fn run(func: &mut Function) -> bool {
+pub(crate) fn run(func: &mut Function) -> Domain {
     let info = analyze(func);
     let initial_blocks = func.blocks.len();
     let mut cleared = vec![false; initial_blocks];
@@ -785,5 +785,10 @@ pub(crate) fn run(func: &mut Function) -> bool {
         let Some(ch) = collect_chain(func, &info, b0, &cleared) else { continue };
         changed |= rewrite_chain(func, &info, (b0, last0), ch, &mut cleared);
     }
-    changed
+    if changed {
+        func.bump_cfg();
+        Domain::CFG | Domain::VALUES
+    } else {
+        Domain::NONE
+    }
 }

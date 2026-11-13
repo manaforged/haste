@@ -1,5 +1,5 @@
 use crate::fold::{constant, defs, extend};
-use crate::ir::{Convert, Function, Inst, Op, StackSlot, Type, Value};
+use crate::ir::{Convert, Domain, Function, Inst, Op, StackSlot, Type, Value};
 use crate::reloc::RuntimeSymbol;
 
 /// The most bytes a `memset` of a constant size is stored inline with.
@@ -95,9 +95,9 @@ fn expand_copy(func: &mut Function, defs: &[Option<Inst>], slots: &[Option<(Stac
 }
 
 /// Replaces each `memset` of a constant byte and small constant size by stores, and scalarizes small constant-length `Copy` operations, so promotion sees the bytes they access.
-pub(crate) fn run(func: &mut Function) -> bool {
+pub(crate) fn run(func: &mut Function) -> Domain {
     if !func.insts.iter().any(|data| matches!(data.op, Op::Runtime(RuntimeSymbol::Memset) | Op::Copy(..))) {
-        return false;
+        return Domain::NONE;
     }
     let defs = defs(func);
     let (slots, _) = func.slot_offsets(|v| known(func, &defs, v, DEPTH));
@@ -117,5 +117,5 @@ pub(crate) fn run(func: &mut Function) -> bool {
         }
         func.blocks[block].insts = out;
     }
-    changed
+    if changed { Domain::CFG | Domain::VALUES } else { Domain::NONE }
 }

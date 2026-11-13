@@ -45,6 +45,7 @@ macro_rules! value_op {
                 Op::Convert(op, x) => self.convert(*op, *x, result()?),
                 Op::Icmp(cc, x, y) => self.icmp(*cc, *x, *y, result()?),
                 Op::Fits(op, signed, x, y) => self.fits(*op, *signed, (*x, *y), result()?),
+                Op::Fma(a, b, c) => self.fma(*a, *b, *c, result()?),
                 Op::Fcmp(cc, x, y) => {
                     self.fcmp(*cc, *x, *y, result()?);
                     Ok(())

@@ -39,6 +39,9 @@ impl Lower<'_, '_> {
             Intrinsic::FnAddr => Ok(args.first().copied()),
             Intrinsic::ShuffleDyn { tbl } => self.shuffle_dyn(args, tbl).map(Some),
             Intrinsic::BytePermute32 => self.byte_permute_32(args).map(Some),
+            Intrinsic::AvgRound(ty) => self.avg_round_vec(ty, args).map(Some),
+            Intrinsic::Umaxp => self.umaxp_vec(args).map(Some),
+            Intrinsic::Sqdmulh(ty) => self.sqdmulh_vec(ty, args).map(Some),
             Intrinsic::TargetOp { id, ty } => self.target_vector(id, ty, args).map(Some),
             Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
             _ => self.memory_intrinsic(origin, which, substs, args),
@@ -207,6 +210,7 @@ impl Lower<'_, '_> {
             (Copysign, &[x, y]) => Ok(self.ins().fcopysign(x, y)),
             (Fmin, &[x, y]) => Ok(self.ins().fmin(x, y)),
             (Fmax, &[x, y]) => Ok(self.ins().fmax(x, y)),
+            (Fma, &[a, b, c]) => Ok(self.ins().fma(a, b, c)),
             (Round(bits), &[x]) => self.round(if bits == 32 { Type::F32 } else { Type::F64 }, x),
             _ => {
                 let Some(&ty) = substs.first() else { bail!("intrinsic {which:?} has no type argument") };

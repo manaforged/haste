@@ -2,13 +2,16 @@
 
 use std::fs::File;
 use std::hash::BuildHasher as _;
-use std::io;
+use std::io::{self, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::script::Output;
 use super::{Side, Workspace};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 const STAMP: &str = "stamp";
 const OUTPUT: &str = "output";
@@ -167,15 +170,48 @@ pub fn lock(workspace: &Workspace, unit: usize) -> io::Result<Lock> {
     Ok(Lock { _file: file })
 }
 
-pub(crate) fn write_new(path: &Path, text: &str) -> io::Result<()> {
-    let fresh = fresh(path);
-    std::fs::write(&fresh, text)?;
-    std::fs::rename(&fresh, path)
+fn replace_with(path: &Path, stage: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = fresh(path);
+    if let Err(err) = stage(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| drop(std::fs::remove_file(&tmp)))
+}
+
+fn write_bytes(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
+    replace_with(path, |tmp| {
+        let mut file = File::create(tmp)?;
+        file.write_all(bytes)?;
+        if durable {
+            file.sync_all()?;
+        }
+        Ok(())
+    })
+}
+
+/// Atomically writes `bytes` to `path` via a unique sibling temporary file and rename.
+pub(crate) fn write_new(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
+    write_bytes(path, bytes.as_ref(), false)
+}
+
+/// Atomically writes `bytes` to `path`, calling `sync_all` on the temporary file before renaming.
+pub(crate) fn write_new_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_bytes(path, bytes, true)
+}
+
+/// Atomically replaces symlink `path` with a link pointing to `target`.
+pub(crate) fn replace_symlink(target: &std::ffi::OsStr, path: &Path) -> io::Result<()> {
+    replace_with(path, |tmp| std::os::unix::fs::symlink(target, tmp))
 }
 
 /// The path this process writes `path` at before it renames the file into place, so no reader sees it half written.
 pub(crate) fn fresh(path: &Path) -> PathBuf {
-    path.with_extension(format!("{}", std::process::id()))
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{seq}", std::process::id()))
 }
 
 /// The hash of the variables a script ran with and of this program, whose compile of the script decides what it prints.

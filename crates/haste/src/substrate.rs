@@ -4,11 +4,10 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::fs::File;
 use std::hash::{Hash as _, Hasher as _};
-use std::io::{self, Write as _};
+use std::io;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use haste_codegen::{Code, RelocKind, Site, StencilReloc, Target};
@@ -22,8 +21,6 @@ const STENCIL_REC_LEN: usize = 48;
 const INSTANCE_REC_LEN: usize = 24;
 const SITE_WIRE_LEN: usize = 12;
 const RELOC_WIRE_LEN: usize = 12;
-
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Zero-copy view of a pre-compiled `Effort::Full` stencil in a substrate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,22 +423,7 @@ impl Substrate {
 
     /// Atomically writes the substrate to `path` via a sibling temporary file and rename.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-        }
-        let seq = TMP_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
-        let tmp = path.with_extension(format!("substrate.tmp.{}.{seq}", std::process::id()));
-        let write_res = (|| -> io::Result<()> {
-            let mut file = File::create(&tmp)?;
-            file.write_all(self.backing.as_slice())?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        if let Err(err) = write_res {
-            drop(std::fs::remove_file(&tmp));
-            return Err(err).with_context(|| format!("write {}", tmp.display()));
-        }
-        std::fs::rename(&tmp, path).inspect_err(|_| drop(std::fs::remove_file(&tmp))).with_context(|| format!("rename {}", path.display()))
+        crate::graph::store::write_new_durable(path, self.backing.as_slice()).with_context(|| format!("writing {}", path.display()))
     }
 
     /// Atomically saves the substrate into the toolchain cache directory.

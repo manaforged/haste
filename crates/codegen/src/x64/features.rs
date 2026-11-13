@@ -12,6 +12,7 @@ pub(super) struct Features {
     pub ssse3: bool,
     pub sse41: bool,
     pub avx: bool,
+    pub fma: bool,
 }
 
 impl Features {
@@ -32,6 +33,7 @@ fn detect() -> Features {
         ssse3: std::arch::is_x86_feature_detected!("ssse3"),
         sse41: std::arch::is_x86_feature_detected!("sse4.1"),
         avx: std::arch::is_x86_feature_detected!("avx"),
+        fma: std::arch::is_x86_feature_detected!("fma"),
     }
 }
 

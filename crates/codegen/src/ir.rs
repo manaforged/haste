@@ -3,6 +3,7 @@ use std::fmt;
 mod vector;
 
 pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
+pub(crate) use vector::{CfgCache, Domain};
 
 /// The machine type of one value.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -313,10 +314,14 @@ pub(crate) enum Binary {
     Fmin,
     Fmax,
     Fcopysign,
+    SaddSat,
+    UaddSat,
+    SsubSat,
+    UsubSat,
+    AvgRound,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
 pub(crate) enum Convert {
     Uextend,
     Sextend,
@@ -328,6 +333,7 @@ pub(crate) enum Convert {
     ToSintSat,
     ToUintSat,
     Bitcast,
+    NarrowSat { signed: bool },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -338,6 +344,7 @@ pub(crate) enum Op {
     Runtime(crate::reloc::RuntimeSymbol),
     Unary(Unary, Value),
     Binary(Binary, Value, Value),
+    Fma(Value, Value, Value),
     Convert(Convert, Value),
     Icmp(IntCC, Value, Value),
     /// 1 when `x op y` (add, sub or mul, signed when the flag is set) fits the type of `x`, else 0.
@@ -402,7 +409,8 @@ impl Op {
             | Op::Insert(..)
             | Op::Reduce(..)
             | Op::TargetOp(..)
-            | Op::Select(..) => true,
+            | Op::Select(..)
+            | Op::Fma(..) => true,
             _ => false,
         }
     }
@@ -461,7 +469,7 @@ impl Op {
                 }
             }
             Op::TargetOp(_, args) => args.as_slice().iter().for_each(|arg| f(*arg)),
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
                 f(*c);
                 f(*x);
                 f(*y);
@@ -506,7 +514,7 @@ impl Op {
                 }
             }
             Op::TargetOp(_, args) => args.as_mut_slice().iter_mut().for_each(|arg| *arg = f(*arg)),
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
                 *c = f(*c);
                 *x = f(*x);
                 *y = f(*y);
@@ -558,12 +566,28 @@ pub struct Function {
     pub(crate) self_slots: Vec<u32>,
     pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
     pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
+    pub(crate) cfg_rev: u32,
+    pub(crate) cfg_cache: CfgCache,
 }
 
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), cfg_rev: 0, cfg_cache: CfgCache::default() }
+    }
+
+    pub(crate) fn bump_cfg(&mut self) {
+        self.cfg_rev = self.cfg_rev.wrapping_add(1);
+    }
+
+    pub(crate) fn cfg(&self) -> std::sync::Arc<crate::cfg::Cfg> {
+        let mut guard = self.cfg_cache.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((rev, cfg)) = &*guard && *rev == self.cfg_rev {
+            return std::sync::Arc::clone(cfg);
+        }
+        let cfg = std::sync::Arc::new(crate::cfg::Cfg::new(self));
+        *guard = Some((self.cfg_rev, std::sync::Arc::clone(&cfg)));
+        cfg
     }
 
     /// Associates symbol index `sym` with known read-only constant bytes for load folding.

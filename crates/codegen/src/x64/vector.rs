@@ -135,10 +135,57 @@ impl Emit<'_> {
                     self.scalarize_float_unary(op, lane, count, x, dst);
                 }
             }
+            Unary::Popcnt if lane.is_int() => self.vector_popcnt(lane, x, dst),
+            Unary::Clz if lane.is_int() => self.scalarize_int_clz(lane, count, x, dst),
             _ => return Err(format!("{op:?} of a vector")),
         }
         self.fput(result, dst);
         Ok(())
+    }
+
+    fn vector_popcnt(&mut self, lane: Lane, x: Value, dst: Xmm) {
+        self.fget(dst, x);
+        self.asm.movaps(X0, dst);
+        self.asm.pshift_imm(2, 2, X0, 1);
+        self.splat_imm(Lane::I8, X1, 0x55);
+        self.asm.sse(&[0x66], &[0x0F, 0xDB], X0.0, X1);
+        self.asm.sse(&[0x66], &[0x0F, 0xF8], dst.0, X0);
+        self.asm.movaps(X0, dst);
+        self.asm.pshift_imm(2, 2, X0, 2);
+        self.splat_imm(Lane::I8, X1, 0x33);
+        self.asm.sse(&[0x66], &[0x0F, 0xDB], dst.0, X1);
+        self.asm.sse(&[0x66], &[0x0F, 0xDB], X0.0, X1);
+        self.asm.sse(&[0x66], &[0x0F, 0xFC], dst.0, X0);
+        self.asm.movaps(X0, dst);
+        self.asm.pshift_imm(2, 2, X0, 4);
+        self.asm.sse(&[0x66], &[0x0F, 0xFC], dst.0, X0);
+        self.splat_imm(Lane::I8, X1, 0x0F);
+        self.asm.sse(&[0x66], &[0x0F, 0xDB], dst.0, X1);
+        match lane {
+            Lane::I8 => {}
+            Lane::I16 => {
+                self.asm.movaps(X0, dst);
+                self.asm.pshift_imm(2, 2, X0, 8);
+                self.asm.sse(&[0x66], &[0x0F, 0xFD], dst.0, X0);
+                self.asm.pshift_imm(6, 2, dst, 8);
+                self.asm.pshift_imm(2, 2, dst, 8);
+            }
+            Lane::I32 => {
+                self.asm.movaps(X0, dst);
+                self.asm.pshift_imm(2, 2, X0, 8);
+                self.asm.sse(&[0x66], &[0x0F, 0xFD], dst.0, X0);
+                self.asm.movaps(X0, dst);
+                self.asm.pshift_imm(2, 4, X0, 16);
+                self.asm.sse(&[0x66], &[0x0F, 0xFE], dst.0, X0);
+                self.asm.pshift_imm(6, 4, dst, 24);
+                self.asm.pshift_imm(2, 4, dst, 24);
+            }
+            Lane::I64 => {
+                self.zero_xmm(X0);
+                self.asm.sse(&[0x66], &[0x0F, 0xF6], dst.0, X0);
+            }
+            _ => {}
+        }
     }
 
     fn scalarize_float_unary(&mut self, op: Unary, lane: Lane, count: u8, x: Value, dst: Xmm) {
@@ -189,9 +236,57 @@ impl Emit<'_> {
             }
             Binary::Imul if lane.is_int() => self.vector_imul(lane, count, x, y, result),
             Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax if lane.is_int() => self.vector_iminmax(op, lane, count, x, y, result),
+            Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat | Binary::AvgRound if lane.is_int() => self.vector_sat_avg(op, lane, count, x, y, result),
             Binary::Ishl | Binary::Ushr | Binary::Sshr if lane.is_int() => self.vector_shift(op, lane, count, x, y, result),
             _ => Err(format!("{op:?} of vector {lane:?}")),
         }
+    }
+
+    fn vector_sat_avg(&mut self, op: Binary, lane: Lane, count: u8, x: Value, y: Value, result: Value) -> Result<(), String> {
+        let sse_opc = match (op, lane) {
+            (Binary::SaddSat, Lane::I8) => Some(0xEC),
+            (Binary::SaddSat, Lane::I16) => Some(0xED),
+            (Binary::UaddSat, Lane::I8) => Some(0xDC),
+            (Binary::UaddSat, Lane::I16) => Some(0xDD),
+            (Binary::SsubSat, Lane::I8) => Some(0xE8),
+            (Binary::SsubSat, Lane::I16) => Some(0xE9),
+            (Binary::UsubSat, Lane::I8) => Some(0xD8),
+            (Binary::UsubSat, Lane::I16) => Some(0xD9),
+            (Binary::AvgRound, Lane::I8) => Some(0xE0),
+            (Binary::AvgRound, Lane::I16) => Some(0xE3),
+            _ => None,
+        };
+        if let Some(opc) = sse_opc {
+            self.packed_op(&[0x66], &[0x0F, opc], (x, y), result);
+            return Ok(());
+        }
+        let dst = self.xmm_of(result).unwrap_or(X2);
+        if op == Binary::AvgRound {
+            self.fget(X1, y);
+            self.fget(dst, x);
+            self.asm.movaps(X0, dst);
+            self.asm.sse(&[0x66], &[0x0F, 0xEB], dst.0, X1);
+            self.asm.sse(&[0x66], &[0x0F, 0xEF], X0.0, X1);
+            self.asm.pshift_imm(2, lane.bytes(), X0, 1);
+            let sub = vec_alu_opcode(Binary::Isub, lane).ok_or_else(|| format!("AvgRound of {lane:?}"))?;
+            self.asm.sse(&[0x66], &[0x0F, sub], dst.0, X0);
+        } else if lane == Lane::I32 && self.features.sse41 && matches!(op, Binary::UaddSat | Binary::UsubSat) {
+            self.fget(X1, y);
+            self.fget(dst, x);
+            if op == Binary::UaddSat {
+                self.asm.sse(&[0x66], &[0x0F, 0x76], X0.0, X0);
+                self.asm.sse(&[0x66], &[0x0F, 0xEF], X0.0, X1);
+                self.asm.sse(&[0x66], &[0x0F, 0x38, 0x3B], dst.0, X0);
+                self.asm.sse(&[0x66], &[0x0F, 0xFE], dst.0, X1);
+            } else {
+                self.asm.sse(&[0x66], &[0x0F, 0x38, 0x3F], dst.0, X1);
+                self.asm.sse(&[0x66], &[0x0F, 0xFA], dst.0, X1);
+            }
+        } else {
+            self.scalarize_int_binary(op, lane, count, x, y, dst);
+        }
+        self.fput(result, dst);
+        Ok(())
     }
 
     fn vector_fminmax(&mut self, op: Binary, lane: Lane, x: Value, y: Value, result: Value) -> Result<(), String> {
@@ -522,6 +617,30 @@ impl Emit<'_> {
                 let src = self.fin(x, dst);
                 self.asm.sse(&[0x66], &[0x0F, 0x38, base + code], dst.0, src);
             }
+            (Convert::NarrowSat { signed }, Lane::I16, Lane::I8) => {
+                self.fget(dst, x);
+                self.asm.sse(&[0x66], &[0x0F, if signed { 0x63 } else { 0x67 }], dst.0, dst);
+            }
+            (Convert::NarrowSat { signed: true }, Lane::I32, Lane::I16) => {
+                self.fget(dst, x);
+                self.asm.sse(&[0x66], &[0x0F, 0x6B], dst.0, dst);
+            }
+            (Convert::NarrowSat { signed: false }, Lane::I32, Lane::I16) if self.features.sse41 => {
+                self.fget(dst, x);
+                self.asm.sse(&[0x66], &[0x0F, 0x38, 0x2B], dst.0, dst);
+            }
+            (Convert::NarrowSat { signed: false }, Lane::I32, Lane::I16) => {
+                self.fget(dst, x);
+                self.asm.movaps(X2, dst);
+                self.zero_xmm(X1);
+                self.asm.sse(&[0x66], &[0x0F, 0x66], X2.0, X1);
+                self.asm.sse(&[0x66], &[0x0F, 0xDB], dst.0, X2);
+                self.splat_imm(Lane::I32, X1, 0x8000);
+                self.asm.sse(&[0x66], &[0x0F, 0xFA], dst.0, X1);
+                self.asm.sse(&[0x66], &[0x0F, 0x6B], dst.0, dst);
+                self.splat_imm(Lane::I16, X1, 0x8000);
+                self.asm.sse(&[0x66], &[0x0F, 0xEF], dst.0, X1);
+            }
             _ => self.scalarize_convert(op, (fl, tl, fc), (from_ty, to_ty), x, dst)?,
         }
         self.fput(result, dst);
@@ -579,6 +698,11 @@ impl Emit<'_> {
                     let signed = op == Convert::ToSintSat;
                     if signed { self.to_signed() } else { self.to_unsigned() }
                     self.clamp(tl.to_type(), signed);
+                    self.asm.store(Size::of(tl.bytes()), dst_slot, Reg::Rax);
+                }
+                Convert::NarrowSat { signed } => {
+                    self.asm.load_signed(Size::of(fl.bytes()), Reg::Rax, src_slot);
+                    self.clamp_signed(Reg::Rax, tl.to_type(), signed);
                     self.asm.store(Size::of(tl.bytes()), dst_slot, Reg::Rax);
                 }
                 _ => {

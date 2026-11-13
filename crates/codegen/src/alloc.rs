@@ -637,7 +637,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let census = census(func);
     let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census) } else { (vec![None; count], vec![false; count]) };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
-    let loop_depths = weighed.then(|| crate::cfg::Cfg::new(func).loops(func).depths);
+    let loop_depths = weighed.then(|| func.cfg().loops().depths);
     let promoted_consts = loop_depths.as_deref().map(|depths| promote_loop_consts(func, &census, depths, &elided, regs.two_address, &mut locations)).unwrap_or_default();
     let mut promoted_syms = Vec::new();
     if regs.absolute_calls {

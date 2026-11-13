@@ -5,7 +5,7 @@ mod coalesce;
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 
 use crate::cfg::Cfg;
-use crate::ir::{Binary, Block, Convert, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
+use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, compute_affine, may_alias};
 use crate::merge::{find, identity, rename};
 
@@ -660,14 +660,13 @@ fn entry_known(func: &Function, bw: &BlockWrites<'_>, known_out: &[KnownLoads], 
     known
 }
 
-/// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between; returns whether `func` was mutated.
-pub(crate) fn run(func: &mut Function) -> bool {
-    let Some(entry) = func.entry else { return false };
-    if func.coroutine.is_some() {
-        return false;
+/// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between; returns the effect domains modified.
+pub(crate) fn run(func: &mut Function) -> Domain {
+    if func.entry.is_none() || func.coroutine.is_some() {
+        return Domain::NONE;
     }
     let mut changed = eliminate_affine_block_params(func);
-    let cfg = Cfg::from_entry(func, entry);
+    let cfg = func.cfg();
     let prov = Provenance::new(func, &cfg);
     changed |= fold_affine_mem(func, &prov.slot_offsets, &prov.affine);
     changed |= sink_terminator_defs(func);
@@ -696,5 +695,5 @@ pub(crate) fn run(func: &mut Function) -> bool {
     if renamed {
         rename(func, state.subst);
     }
-    changed
+    if changed { Domain::MEM | Domain::VALUES } else { Domain::NONE }
 }

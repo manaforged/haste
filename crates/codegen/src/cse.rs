@@ -1,8 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::cfg::Cfg;
 use crate::fold::extend;
-use crate::ir::{Binary, Block, Convert, FloatCC, Function, Inst, IntCC, Op, ReduceOp, ShuffleMask, StackSlot, TargetOpId, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Domain, FloatCC, Function, Inst, IntCC, Op, ReduceOp, ShuffleMask, StackSlot, TargetOpId, Type, Unary, Value};
 use crate::merge::{find, identity, rename};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,6 +25,9 @@ fn is_commutative_binary(op: Binary) -> bool {
             | Binary::Smax
             | Binary::Umin
             | Binary::Umax
+            | Binary::SaddSat
+            | Binary::UaddSat
+            | Binary::AvgRound
             | Binary::Fmin
             | Binary::Fmax
             | Binary::Band
@@ -79,6 +81,7 @@ enum Key {
     Reduce(ReduceOp, Operand),
     TargetOp(TargetOpId, [Option<Operand>; 3]),
     Select(Operand, Operand, Operand),
+    Fma(Operand, Operand, Operand),
     StackAddr(StackSlot, i32),
     SlotAddr(u32),
     Symbol(u32),
@@ -137,6 +140,7 @@ fn key(op: &Op, consts: &[Option<i64>], types: &[Type], ty: Type, subst: &[Value
             Key::TargetOp(id, [s.first().map(|v| opnd(*v)), s.get(1).map(|v| opnd(*v)), s.get(2).map(|v| opnd(*v))])
         }
         Op::Select(c, x, y) => Key::Select(opnd(c), opnd(x), opnd(y)),
+        Op::Fma(a, b, c) => Key::Fma(opnd(a), opnd(b), opnd(c)),
         Op::StackAddr(slot, offset) => Key::StackAddr(slot, offset),
         Op::SlotAddr(sym) => Key::SlotAddr(sym),
         Op::Symbol(sym) => Key::Symbol(sym),
@@ -210,13 +214,13 @@ enum Visit {
     Leave(usize),
 }
 
-/// Replaces every pure instruction that a dominating instruction already computed with that instruction's result, returning whether any instruction was dropped.
-pub(crate) fn run(func: &mut Function) -> bool {
-    let Some(entry) = func.entry else { return false };
+/// Replaces every pure instruction that a dominating instruction already computed with that instruction's result, returning the invalidated IR domain.
+pub(crate) fn run(func: &mut Function) -> Domain {
+    let Some(entry) = func.entry else { return Domain::NONE };
     if func.coroutine.is_some() {
-        return false;
+        return Domain::NONE;
     }
-    let children = Cfg::from_entry(func, entry).children();
+    let children = func.cfg().children();
     let mut subst = identity(func.types.len());
     let mut consts = vec![None; func.types.len()];
     for data in &func.insts {
@@ -242,6 +246,8 @@ pub(crate) fn run(func: &mut Function) -> bool {
     }
     if dropped {
         rename(func, &subst);
+        Domain::VALUES
+    } else {
+        Domain::NONE
     }
-    dropped
 }

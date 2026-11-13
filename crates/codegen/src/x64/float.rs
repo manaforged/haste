@@ -1,7 +1,8 @@
 use super::asm::{Alu, Cond, Group3, Reg, Rm, Shift, Size, Xmm};
+use super::vector::vec_prefix;
 use super::Emit;
 use crate::frame::Ext;
-use crate::ir::{Binary, Convert, FloatCC, Type, Unary, Value};
+use crate::ir::{Binary, Convert, FloatCC, Lane, Type, Unary, Value};
 
 pub(super) const X0: Xmm = Xmm(0);
 pub(super) const X1: Xmm = Xmm(1);
@@ -149,6 +150,50 @@ impl Emit<'_> {
             }
         }
         self.fput(result, dst);
+        Ok(())
+    }
+
+    pub(super) fn fma(&mut self, a: Value, b: Value, c: Value, result: Value) -> Result<(), String> {
+        let ty = self.ty(a);
+        let (is_vec, is_f64, lane) = match ty {
+            Type::F32 => (false, false, Lane::F32),
+            Type::F64 => (false, true, Lane::F64),
+            Type::Vec { lane: Lane::F32, count: 2 | 4 } => (true, false, Lane::F32),
+            Type::Vec { lane: Lane::F64, count: 2 } => (true, true, Lane::F64),
+            other => return Err(format!("Fma of {other:?}")),
+        };
+        if self.features.fma && self.features.avx {
+            let dst = self.fdst(result);
+            let src_b = match self.xmm_of(b) {
+                Some(r) if r != dst => r,
+                _ => {
+                    self.fget(X1, b);
+                    X1
+                }
+            };
+            let src_c: Rm = if !is_vec && self.xmm_of(c) != Some(dst) {
+                self.foperand(c, X2)
+            } else {
+                match self.xmm_of(c) {
+                    Some(r) if r != dst => r.into(),
+                    _ => {
+                        self.fget(X2, c);
+                        X2.into()
+                    }
+                }
+            };
+            self.fget(dst, a);
+            self.asm.vex_fma(is_vec, is_f64, (dst, src_b), src_c);
+            self.fput(result, dst);
+            return Ok(());
+        }
+        let prefix: &[u8] = if is_vec { vec_prefix(lane) } else { &[scalar(ty)] };
+        self.fget(X0, a);
+        let mul_src: Rm = if is_vec { self.fin(b, X1).into() } else { self.foperand(b, X1) };
+        self.asm.sse(prefix, &[0x0F, 0x59], X0.0, mul_src);
+        let add_src: Rm = if is_vec { self.fin(c, X1).into() } else { self.foperand(c, X1) };
+        self.asm.sse(prefix, &[0x0F, 0x58], X0.0, add_src);
+        self.fput(result, X0);
         Ok(())
     }
 

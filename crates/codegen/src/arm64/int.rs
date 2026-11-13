@@ -269,11 +269,71 @@ impl Emit<'_> {
                 };
                 self.asm.csel(cond, dst, left, right);
             }
+            Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat => self.sat_add_sub(op, (x, y), bits, dst),
+            Binary::AvgRound => {
+                let left = self.src(x, A, Ext::Zero);
+                let right = self.src(y, C, Ext::Zero);
+                self.asm.alu(Alu::Orr, Size::X, D, left, right);
+                self.asm.alu(Alu::Eor, Size::X, A, left, right);
+                self.asm.alu_shifted(Alu::Sub, Size::X, Shift::Lsr, 1, dst, D, A);
+            }
             Binary::Ishl | Binary::Ushr | Binary::Sshr => self.shift_by(op, (x, y), bits, dst),
             Binary::Rotl | Binary::Rotr => self.rotate(op == Binary::Rotl, (x, y), bits, dst),
             other => return Err(format!("{other:?} of an integer")),
         }
         Ok(())
+    }
+
+    fn clamp_range(&mut self, val: Reg, dst: Reg, lo: i64, hi: i64) {
+        if lo == 0 {
+            self.asm.alu(Alu::Subs, Size::X, ZR, val, ZR);
+            self.asm.csel(Cond::Lt, D, ZR, val);
+        } else {
+            self.asm.mov_imm(C, lo);
+            self.asm.alu(Alu::Subs, Size::X, ZR, val, C);
+            self.asm.csel(Cond::Lt, D, C, val);
+        }
+        self.asm.mov_imm(C, hi);
+        self.asm.alu(Alu::Subs, Size::X, ZR, D, C);
+        self.asm.csel(Cond::Gt, dst, C, D);
+    }
+
+    fn sat_add_sub(&mut self, op: Binary, (x, y): (Value, Value), bits: u8, dst: Reg) {
+        let signed = matches!(op, Binary::SaddSat | Binary::SsubSat);
+        let sub = matches!(op, Binary::SsubSat | Binary::UsubSat);
+        if sub && !signed {
+            let left = self.src(x, A, Ext::Zero);
+            let right = self.src(y, C, Ext::Zero);
+            self.asm.alu(Alu::Subs, Size::X, D, left, right);
+            self.asm.csel(Cond::Hs, dst, D, ZR);
+            return;
+        }
+        if bits < 64 {
+            let left = self.src(x, A, Ext::of(signed));
+            let right = self.src(y, C, Ext::of(signed));
+            self.asm.alu(if sub { Alu::Sub } else { Alu::Add }, Size::X, D, left, right);
+            if signed {
+                let smin = -(1i64 << (bits - 1));
+                let smax = (1i64 << (bits - 1)) - 1;
+                self.clamp_range(D, dst, smin, smax);
+            } else {
+                self.asm.mov_imm(C, (1i64 << bits) - 1);
+                self.asm.alu(Alu::Subs, Size::X, ZR, D, C);
+                self.asm.csel(Cond::Lo, dst, D, C);
+            }
+            return;
+        }
+        let left = self.bits(x, A);
+        let right = self.bits(y, C);
+        self.asm.alu(if sub { Alu::Subs } else { Alu::Adds }, Size::X, D, left, right);
+        if signed {
+            self.asm.mov_imm(A, i64::MIN);
+            self.asm.alu_shifted(Alu::Eor, Size::X, Shift::Asr, 63, C, A, D);
+            self.asm.csel(Cond::Vs, dst, C, D);
+        } else {
+            self.asm.mov_imm(A, -1);
+            self.asm.csel(Cond::Hs, dst, A, D);
+        }
     }
 
     fn multiply(&mut self, dst: Reg, x: Value, y: Value) {
@@ -526,6 +586,19 @@ impl Emit<'_> {
                 } else {
                     self.raw(dst, x);
                 }
+                self.put(result, dst);
+                Ok(())
+            }
+            Convert::NarrowSat { signed } => {
+                let src = self.src(x, A, Ext::Sign);
+                let dst = self.dst(result);
+                let to_bits = self.ty(result).bits();
+                let (lo, hi) = if signed {
+                    (-(1i64 << (to_bits - 1)), (1i64 << (to_bits - 1)) - 1)
+                } else {
+                    (0, (1i64 << to_bits) - 1)
+                };
+                self.clamp_range(src, dst, lo, hi);
                 self.put(result, dst);
                 Ok(())
             }

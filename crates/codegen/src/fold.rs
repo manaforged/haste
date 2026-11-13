@@ -1,4 +1,4 @@
-use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, IntCC, Op, Type, Unary, Value};
 
 mod vector;
 
@@ -58,40 +58,16 @@ pub(crate) fn binary(op: Binary, ty: Type, a: i64, b: i64) -> Option<i64> {
         Binary::Ishl => Some(a << count),
         Binary::Ushr => Some((ua >> count) as i64),
         Binary::Sshr => Some(sa >> count),
-        Binary::Rotl => Some(rotate(ty, ua, count)),
-        Binary::Rotr => Some(rotate(ty, ua, bits - count)),
+        Binary::Rotl => Some(vector::rotate(ty, ua, count)),
+        Binary::Rotr => Some(vector::rotate(ty, ua, bits - count)),
         Binary::Smin => Some(sa.min(sb)),
         Binary::Smax => Some(sa.max(sb)),
         Binary::Umulhi => Some((u128::from(ua) * u128::from(ub) >> bits) as i64),
         Binary::Smulhi => Some((i128::from(sa) * i128::from(sb) >> bits) as i64),
-        Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem => divide(op, ty, a, b),
+        Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem => vector::divide(op, ty, a, b),
+        Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat | Binary::AvgRound => vector::sat_binary(op, ty, sa, sb, ua, ub),
         _ => None,
     }
-}
-
-/// The low bits of `value` of type `ty` rotated left by `left` modulo the width.
-fn rotate(ty: Type, value: u64, left: u32) -> i64 {
-    match ty {
-        Type::I8 => i64::from((value as u8).rotate_left(left)),
-        Type::I16 => i64::from((value as u16).rotate_left(left)),
-        Type::I32 => i64::from((value as u32).rotate_left(left)),
-        _ => value.rotate_left(left) as i64,
-    }
-}
-
-/// `a / b` or `a % b` on constants of type `ty`, or `None` when `b` is zero or the operation is the signed minimum by -1, where the machine traps.
-fn divide(op: Binary, ty: Type, a: i64, b: i64) -> Option<i64> {
-    let signed = matches!(op, Binary::Sdiv | Binary::Srem);
-    let (x, y) = (extend(a, ty, signed), extend(b, ty, signed));
-    if y == 0 || (signed && y == -1 && x == -1_i64 << (ty.bits() - 1)) {
-        return None;
-    }
-    Some(match op {
-        Binary::Sdiv => x / y,
-        Binary::Srem => x % y,
-        Binary::Udiv => (x as u64 / y as u64) as i64,
-        _ => (x as u64 % y as u64) as i64,
-    })
 }
 
 /// `op` of the constant `a` of type `ty`, counting bits at that width.
@@ -161,6 +137,9 @@ pub(crate) fn evaluate(func: &Function, op: &Op, known: &dyn Fn(Value) -> Option
 pub(crate) fn evaluate_wrapped(func: &Function, op: &Op, ty: Type, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
     if !ty.is_small_int() {
         return None;
+    }
+    if let Op::Convert(Convert::NarrowSat { signed }, x) = *op {
+        return vector::narrow_sat(func, ty, signed, x, known);
     }
     evaluate(func, op, known).map(|v| extend(v, ty, true))
 }
@@ -675,13 +654,20 @@ pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
 }
 
 fn prune_changed(func: &mut Function, entry: Block) -> (Vec<bool>, bool) {
-    let reachable = crate::cfg::Cfg::from_entry(func, entry).reachable;
+    let reachable = if Some(entry) == func.entry {
+        func.cfg().reachable.clone()
+    } else {
+        crate::cfg::Cfg::from_entry(func, entry).reachable
+    };
     let mut changed = false;
     for (block, live) in func.blocks.iter_mut().zip(&reachable) {
         if !live && !block.insts.is_empty() {
             block.insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
             changed = true;
         }
+    }
+    if changed {
+        func.bump_cfg();
     }
     (reachable, changed)
 }
@@ -713,52 +699,29 @@ fn dead(func: &mut Function) -> bool {
     dropped
 }
 
-fn fold_bitcast_loads(func: &mut Function) -> bool {
-    let uses = func.use_counts();
-    let defs = defs(func);
-    let mut remap: Vec<Option<Value>> = vec![None; func.types.len()];
-    let mut dropped = vec![false; func.insts.len()];
-    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        let data = &func.insts[inst.index()];
-        if let (Op::Convert(Convert::Bitcast, src), Some(res)) = (&data.op, data.result)
-            && uses[src.index()] == 1
-            && func.ty(*src).bytes() == func.ty(res).bytes()
-            && func.ty(*src) != func.ty(res)
-            && let Some(src_inst) = defs[src.index()]
-            && matches!(func.insts[src_inst.index()].op, Op::Load(..))
-        {
-            func.types[src.index()] = func.ty(res);
-            remap[res.index()] = Some(*src);
-            dropped[inst.index()] = true;
-        }
-    }
-    if remap.iter().all(Option::is_none) {
-        return false;
-    }
-    for block in &mut func.blocks {
-        block.insts.retain(|inst| !dropped[inst.index()]);
-        for &inst in &block.insts {
-            func.insts[inst.index()].op.map_operands(|v| remap[v.index()].unwrap_or(v));
-        }
-    }
-    true
-}
-
-/// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump; returns whether `func` was mutated.
-pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> bool {
-    let Some(entry) = func.entry else { return false };
+/// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump; returns the invalidated IR domain.
+pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
+    let Some(entry) = func.entry else { return Domain::NONE };
     let count = func.types.len();
     let defs = defs(func);
     let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: vec![None; count], mixed: vec![false; count], defs };
     let pinned = pinned(func, entry);
-    let (mut reachable, mut changed) = (Vec::new(), false);
+    let (mut reachable, mut changed, mut cfg_changed) = (Vec::new(), false, false);
     loop {
         fold.constants(func);
         let settled = effort == crate::Effort::Full && reachable.is_empty() && crate::facts::settle(func, &fold.defs, &mut fold.consts);
         let branched = settled | fold.branches(func) | fold.thread(func, &pinned);
+        if branched {
+            func.bump_cfg();
+        }
         if branched || reachable.is_empty() {
             let (r, pruned) = prune_changed(func, entry);
-            reachable = r; changed |= pruned;
+            if pruned {
+                func.bump_cfg();
+            }
+            reachable = r;
+            cfg_changed |= branched | pruned;
+            changed |= pruned;
         }
         let replaced = fold.params(func, &reachable, &pinned);
         changed |= branched | replaced;
@@ -789,11 +752,23 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> bool {
     if let Some((b0, o0)) = snap {
         changed = o0.len() != func.insts.len() || b0.iter().zip(&func.blocks).any(|(a, b)| *a != b.insts) || o0.iter().zip(&func.insts).any(|(a, b)| *a != b.op);
     }
-    changed |= fold_bitcast_loads(func) | dead(func);
-    if fold.thread(func, &pinned) | fold.branches(func) { prune(func, entry); dead(func); changed = true; }
+    changed |= vector::fold_bitcast_loads(func) | dead(func);
+    if fold.thread(func, &pinned) | fold.branches(func) {
+        func.bump_cfg();
+        prune(func, entry);
+        dead(func);
+        changed = true;
+        cfg_changed = true;
+    }
     if crate::algebra::devirt_vtables(func, &fold.defs) { dead(func); changed = true; }
     if crate::algebra::fold_bxor_conds(func) { dead(func); changed = true; }
-    changed
+    if !changed {
+        Domain::NONE
+    } else if cfg_changed {
+        Domain::VALUES | Domain::CFG
+    } else {
+        Domain::VALUES
+    }
 }
 
 pub(crate) use crate::thread::compact;

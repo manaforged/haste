@@ -7,7 +7,6 @@ use crate::ir::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs, Value};
 enum TargetKind {
     TwoInPlace,
     ThreeInPlace,
-    ThreeReg,
     OneReg,
 }
 
@@ -15,20 +14,17 @@ struct TargetDesc {
     id: TargetOpId,
     base: u32,
     kind: TargetKind,
-    sized: bool,
 }
 
 const ARM64_TARGET_OPS: &[TargetDesc] = &[
-    TargetDesc { id: TargetOpId::Arm64Umaxp, base: 0x2E20_A400, kind: TargetKind::ThreeReg, sized: true },
-    TargetDesc { id: TargetOpId::Arm64Sqdmulh, base: 0x0E20_B400, kind: TargetKind::ThreeReg, sized: true },
-    TargetDesc { id: TargetOpId::Arm64Sha256H, base: 0x5E00_4000, kind: TargetKind::ThreeInPlace, sized: false },
-    TargetDesc { id: TargetOpId::Arm64Sha256H2, base: 0x5E00_5000, kind: TargetKind::ThreeInPlace, sized: false },
-    TargetDesc { id: TargetOpId::Arm64Sha256Su1, base: 0x5E00_6000, kind: TargetKind::ThreeInPlace, sized: false },
-    TargetDesc { id: TargetOpId::Arm64Sha256Su0, base: 0x5E28_2800, kind: TargetKind::TwoInPlace, sized: false },
-    TargetDesc { id: TargetOpId::Arm64AesE, base: 0x4E28_4800, kind: TargetKind::TwoInPlace, sized: false },
-    TargetDesc { id: TargetOpId::Arm64AesD, base: 0x4E28_5800, kind: TargetKind::TwoInPlace, sized: false },
-    TargetDesc { id: TargetOpId::Arm64AesMc, base: 0x4E28_6800, kind: TargetKind::OneReg, sized: false },
-    TargetDesc { id: TargetOpId::Arm64AesImc, base: 0x4E28_7800, kind: TargetKind::OneReg, sized: false },
+    TargetDesc { id: TargetOpId::Arm64Sha256H, base: 0x5E00_4000, kind: TargetKind::ThreeInPlace },
+    TargetDesc { id: TargetOpId::Arm64Sha256H2, base: 0x5E00_5000, kind: TargetKind::ThreeInPlace },
+    TargetDesc { id: TargetOpId::Arm64Sha256Su1, base: 0x5E00_6000, kind: TargetKind::ThreeInPlace },
+    TargetDesc { id: TargetOpId::Arm64Sha256Su0, base: 0x5E28_2800, kind: TargetKind::TwoInPlace },
+    TargetDesc { id: TargetOpId::Arm64AesE, base: 0x4E28_4800, kind: TargetKind::TwoInPlace },
+    TargetDesc { id: TargetOpId::Arm64AesD, base: 0x4E28_5800, kind: TargetKind::TwoInPlace },
+    TargetDesc { id: TargetOpId::Arm64AesMc, base: 0x4E28_6800, kind: TargetKind::OneReg },
+    TargetDesc { id: TargetOpId::Arm64AesImc, base: 0x4E28_7800, kind: TargetKind::OneReg },
 ];
 
 impl Emit<'_> {
@@ -322,18 +318,12 @@ impl Emit<'_> {
             return Err(format!("unsupported ARM64 target op {id:?}"));
         };
         let args = args.as_slice();
-        let spec = VecSpec::of(self.ty(result))?;
-        let base = if desc.sized { desc.base | (spec.q << 30) | (spec.size << 22) } else { desc.base };
+        let base = desc.base;
         let dst = self.fdst(result);
         match desc.kind {
             TargetKind::OneReg => {
                 let a = self.fin(args[0], V0);
                 self.v_two(base, dst, a);
-            }
-            TargetKind::ThreeReg => {
-                let a = self.fin(args[0], V0);
-                let b = self.fin(args[1], V1);
-                self.asm.vbit(base, dst, a, b);
             }
             TargetKind::TwoInPlace => {
                 let a = self.fin(args[0], V0);

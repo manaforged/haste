@@ -3,8 +3,8 @@ use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, Value};
 
 pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
-    let cfg = Cfg::new(func);
-    let loops = cfg.loops(func);
+    let cfg = func.cfg();
+    let loops = cfg.loops();
     let mut can_exit = vec![false; func.blocks.len()];
     let mut work = Vec::new();
     for b in 0..func.blocks.len() {

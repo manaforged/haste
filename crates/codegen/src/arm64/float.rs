@@ -1,4 +1,5 @@
 use super::asm::{Alu, Cond, Fconv, Fop, Funary, Size, ZR};
+use super::vector::V2;
 use super::{A, C, D, Emit, V0, V1};
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, FloatCC, Type, Unary, Value};
@@ -63,6 +64,24 @@ impl Emit<'_> {
         self.asm.alu(Alu::Bic, Size::X, A, A, D);
         self.asm.alu(Alu::Orr, Size::X, A, A, C);
         self.put(result, A);
+    }
+
+    pub(super) fn fma(&mut self, a: Value, b: Value, c: Value, result: Value) -> Result<(), String> {
+        if self.plan.is_static(result) || self.plan.deferred[result.index()] {
+            return Ok(());
+        }
+        let ty = self.ty(a);
+        if ty.is_vector() {
+            return self.vec_fma(a, b, c, result);
+        }
+        let va = self.fin(a, V0);
+        let vb = self.fin(b, V1);
+        let vc = self.fin(c, V2);
+        let dst = self.fdst(result);
+        let word = 0x1F00_0000 | u32::from(ty == Type::F64) << 22 | u32::from(vb.0) << 16 | u32::from(vc.0) << 10 | u32::from(va.0) << 5 | u32::from(dst.0);
+        self.asm.word(word);
+        self.fput(result, dst);
+        Ok(())
     }
 
     pub(super) fn fcmp(&mut self, cc: FloatCC, x: Value, y: Value, result: Value) {

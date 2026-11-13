@@ -63,9 +63,7 @@ fn binary(toolchain: &Toolchain, store: &Path) -> Result<PathBuf> {
         return Ok(binary);
     }
     for (path, text) in SOURCES {
-        let file = dir.join(path);
-        std::fs::create_dir_all(file.parent().context("a driver source with no directory")?)?;
-        std::fs::write(&file, text)?;
+        crate::graph::store::write_new(&dir.join(path), text)?;
     }
     let mut build = cargo::release(toolchain, &dir.join(CARGO_MANIFEST), &dir.join(TARGET));
     cargo::output(build.env(BOOTSTRAP.0, BOOTSTRAP.1)).context("building the prep driver")?;
@@ -95,12 +93,7 @@ pub(super) fn publish(fresh: &Path, out: &Path) -> Result<()> {
     if out.is_dir() && before.is_none() {
         std::fs::remove_dir_all(out)?;
     }
-    let link = out.with_extension(format!("{LINK}{}", std::process::id()));
-    if link.symlink_metadata().is_ok() {
-        std::fs::remove_file(&link)?;
-    }
-    std::os::unix::fs::symlink(fresh.file_name().context("a prep directory with no name")?, &link)?;
-    std::fs::rename(&link, out)?;
+    crate::graph::store::replace_symlink(fresh.file_name().context("a prep directory with no name")?, out)?;
     let (Some(parent), Some(stem)) = (out.parent(), out.file_name()) else { return Ok(()) };
     let kept = [Some(fresh.to_path_buf()), before.map(|before| parent.join(before))];
     for entry in std::fs::read_dir(parent)? {

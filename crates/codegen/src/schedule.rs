@@ -1,4 +1,4 @@
-use crate::ir::Function;
+use crate::ir::{Domain, Function};
 use crate::{Effort, cse, fill, fold, ifconv, licm, loads, merge, promote, returns, switch, tailrec, thread, unroll};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -19,55 +19,61 @@ pub(crate) enum Pass {
     TailRec = 12,
 }
 
-const PASS_COUNT: usize = 13;
-const MAX_ROUNDS: usize = 6;
+impl Pass {
+    const ALL: &[Self] = &[
+        Self::Fill,
+        Self::Fold,
+        Self::Merge,
+        Self::Promote,
+        Self::Cse,
+        Self::Loads,
+        Self::Thread,
+        Self::IfConv,
+        Self::Unroll,
+        Self::Licm,
+        Self::Switch,
+        Self::Returns,
+        Self::TailRec,
+    ];
+}
 
 struct Rule {
     pass: Pass,
-    max_runs: u8,
-    enables: &'static [Pass],
+    reads: Domain,
 }
 
 struct Plan {
     moves: promote::Moves,
     effort: Effort,
-    init: &'static [Pass],
-    seed: &'static [Pass],
     rules: &'static [Rule],
-    max_rounds: usize,
+    budget: usize,
     finish: &'static [Pass],
 }
 
-static QUICK_INIT: &[Pass] = &[Pass::Fill, Pass::Fold, Pass::Merge];
-static QUICK_SEED: &[Pass] = &[Pass::Promote];
+static INIT: &[Pass] = &[Pass::Fill, Pass::Fold, Pass::Merge];
+
 static QUICK_RULES: &[Rule] = &[
-    Rule { pass: Pass::Promote, max_runs: 2, enables: &[Pass::Promote, Pass::Fold, Pass::Merge] },
-    Rule { pass: Pass::Fold, max_runs: 2, enables: &[] },
-    Rule { pass: Pass::Merge, max_runs: 2, enables: &[] },
+    Rule { pass: Pass::Promote, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
+    Rule { pass: Pass::Fold, reads: Domain::VALUES.union(Domain::CFG) },
+    Rule { pass: Pass::Merge, reads: Domain::CFG.union(Domain::VALUES) },
 ];
 static QUICK_FINISH: &[Pass] = &[Pass::Cse, Pass::Returns];
 
-static FULL_INIT: &[Pass] = &[Pass::Fill, Pass::Fold, Pass::Merge];
-static FULL_SEED: &[Pass] = &[Pass::Promote, Pass::Loads, Pass::Cse, Pass::Thread, Pass::IfConv, Pass::Unroll, Pass::Licm];
 static FULL_RULES: &[Rule] = &[
-    Rule {
-        pass: Pass::Promote,
-        max_runs: 6,
-        enables: &[Pass::Promote, Pass::Fold, Pass::Merge, Pass::Loads, Pass::Cse, Pass::Unroll, Pass::Licm],
-    },
-    Rule { pass: Pass::Fold, max_runs: 8, enables: &[Pass::Merge, Pass::Promote, Pass::Cse, Pass::Thread, Pass::IfConv, Pass::Unroll] },
-    Rule { pass: Pass::Merge, max_runs: 8, enables: &[Pass::Fold, Pass::Promote, Pass::IfConv, Pass::Unroll] },
-    Rule { pass: Pass::Loads, max_runs: 4, enables: &[Pass::Fold, Pass::Promote, Pass::Cse, Pass::Licm] },
-    Rule { pass: Pass::Cse, max_runs: 4, enables: &[Pass::Fold, Pass::Loads] },
-    Rule { pass: Pass::Thread, max_runs: 3, enables: &[Pass::Merge, Pass::Fold, Pass::Cse, Pass::Loads] },
-    Rule { pass: Pass::IfConv, max_runs: 3, enables: &[Pass::Merge, Pass::Fold, Pass::Cse, Pass::Loads] },
-    Rule { pass: Pass::Unroll, max_runs: 3, enables: &[Pass::Fold, Pass::Merge, Pass::Loads, Pass::Promote, Pass::Cse] },
-    Rule { pass: Pass::Licm, max_runs: 3, enables: &[Pass::Loads, Pass::Fold, Pass::Cse] },
+    Rule { pass: Pass::Promote, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
+    Rule { pass: Pass::Fold, reads: Domain::VALUES.union(Domain::CFG) },
+    Rule { pass: Pass::Merge, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::Loads, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
+    Rule { pass: Pass::Cse, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::Thread, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::IfConv, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::Unroll, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
+    Rule { pass: Pass::Licm, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
 ];
 static FULL_FINISH: &[Pass] = &[Pass::Switch, Pass::Returns, Pass::TailRec];
 
-fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort) -> bool {
-    match pass {
+fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort) -> Domain {
+    let changed = match pass {
         Pass::Fill => fill::run(func),
         Pass::Fold => fold::run(func, effort),
         Pass::Merge => merge::run(func),
@@ -82,37 +88,50 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Returns => returns::run(func),
         Pass::TailRec => {
             let did = tailrec::run(func);
-            if did {
+            if !did.is_empty() {
                 fold::compact(func);
             }
             did
         }
+    };
+    if changed.contains(Domain::CFG) {
+        func.bump_cfg();
     }
+    changed
 }
 
 fn run_fixpoint(func: &mut Function, plan: &Plan) {
-    let mut active = [false; PASS_COUNT];
-    let mut runs = [0_u8; PASS_COUNT];
-    for &pass in plan.seed {
-        active[pass as usize] = true;
+    let mut dirty = [Domain::NONE; Pass::ALL.len()];
+    for rule in plan.rules {
+        dirty[rule.pass as usize] = rule.reads;
     }
-    for _ in 0..plan.max_rounds {
-        let mut any = false;
+    let mut remaining = plan.budget;
+    while remaining > 0 {
+        let mut ran = false;
         for rule in plan.rules {
+            if remaining == 0 {
+                break;
+            }
             let idx = rule.pass as usize;
-            if !active[idx] || runs[idx] >= rule.max_runs {
+            if (dirty[idx] & rule.reads).is_empty() {
                 continue;
             }
-            active[idx] = false;
-            runs[idx] += 1;
-            if run_pass(func, rule.pass, plan.moves, plan.effort) {
-                any = true;
-                for &next in rule.enables {
-                    active[next as usize] = true;
+            dirty[idx] = Domain::NONE;
+            remaining -= 1;
+            ran = true;
+            let changed = run_pass(func, rule.pass, plan.moves, plan.effort);
+            if !changed.is_empty() {
+                for other in plan.rules {
+                    if other.pass != rule.pass {
+                        dirty[other.pass as usize] |= changed;
+                    }
+                }
+                if rule.pass == Pass::Promote {
+                    dirty[idx] |= changed;
                 }
             }
         }
-        if !any {
+        if !ran {
             break;
         }
     }
@@ -123,23 +142,19 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, effort: Effort) {
         Effort::Quick => Plan {
             moves: promote::Moves::Words,
             effort,
-            init: QUICK_INIT,
-            seed: QUICK_SEED,
             rules: QUICK_RULES,
-            max_rounds: 2,
+            budget: 6,
             finish: QUICK_FINISH,
         },
         Effort::Full => Plan {
             moves,
             effort,
-            init: FULL_INIT,
-            seed: FULL_SEED,
             rules: FULL_RULES,
-            max_rounds: MAX_ROUNDS,
+            budget: 32,
             finish: FULL_FINISH,
         },
     };
-    for &pass in plan.init {
+    for &pass in INIT {
         run_pass(func, pass, plan.moves, plan.effort);
     }
     run_fixpoint(func, &plan);

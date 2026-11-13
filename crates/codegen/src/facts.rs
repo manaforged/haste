@@ -1,4 +1,4 @@
-use crate::cfg::{Cfg, dominates};
+use crate::cfg::dominates;
 use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
@@ -616,7 +616,7 @@ impl Path {
 /// Settles the compares, traps and branches that the facts on entry to each block and its earlier instructions decide: a settled compare's result becomes a constant in `consts`, a trap that cannot fire goes, and a settled branch becomes a jump. A block's facts on entry are its only predecessor's facts on exit plus that edge's branch. Returns whether anything changed.
 pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [Option<i64>]) -> bool {
     let Some(entry) = func.entry else { return false };
-    let cfg = Cfg::new(func);
+    let cfg = func.cfg();
     let single: Vec<Option<Block>> = (0..func.blocks.len()).map(|b| cfg.single_pred(Block(b as u32))).collect();
     let (mut decided, mut compares) = (Vec::new(), Vec::new());
     {
