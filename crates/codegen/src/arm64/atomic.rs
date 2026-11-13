@@ -73,7 +73,7 @@ impl Emit<'_> {
         if ty != Type::I128
             && let Some((base, index, shift)) = self.sib_indexed(addr, offset, ty.bytes())
         {
-            if ty.is_float() {
+            if ty.in_float_register() {
                 let dst = self.fdst(result);
                 self.asm.vload_indexed(ty.bytes(), dst, base, index, shift);
                 self.fput(result, dst);
@@ -93,7 +93,7 @@ impl Emit<'_> {
         if ty != Type::I128
             && let Some((base, index, shift)) = self.sib_indexed(addr, offset, ty.bytes())
         {
-            if ty.is_float() {
+            if ty.in_float_register() {
                 let source = self.fin(value, super::V0);
                 self.asm.vstore_indexed(ty.bytes(), base, index, shift, source);
             } else {
@@ -136,7 +136,7 @@ impl Emit<'_> {
 
     fn read(&mut self, result: Value, from: Mem) {
         let ty = self.ty(result);
-        if ty.is_float() {
+        if ty.in_float_register() {
             let dst = self.fdst(result);
             self.asm.vload(ty.bytes(), dst, from);
             self.fput(result, dst);
@@ -156,7 +156,7 @@ impl Emit<'_> {
 
     fn write(&mut self, value: Value, to: Mem) {
         let ty = self.ty(value);
-        if ty.is_float() {
+        if ty.in_float_register() {
             let source = self.fin(value, super::V0);
             self.asm.vstore(ty.bytes(), to, source);
             return;
@@ -180,6 +180,10 @@ impl Emit<'_> {
     }
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
+        if self.ty(condition).is_vector() {
+            self.vec_select_mask(condition, x, y, result);
+            return;
+        }
         let cond = if let Some((val, c)) = self.flags
             && val == condition
         {
@@ -199,6 +203,10 @@ impl Emit<'_> {
             Cond::Ne
         };
         let ty = self.ty(x);
+        if ty.is_vector() {
+            self.vec_select_cond(cond, x, y, result);
+            return;
+        }
         if ty.is_float() {
             let (left, right) = (self.fin(x, super::V0), self.fin(y, super::V1));
             let dst = self.fdst(result);

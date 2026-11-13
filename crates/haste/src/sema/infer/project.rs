@@ -85,7 +85,7 @@ impl Infer<'_, '_> {
     /// The trait bounds that the frame's headers put on its type parameters, each as the trait and its types with `Self` first: what the body may assume holds.
     pub(super) fn assumptions(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         if let Some(poly) = &self.poly
-            && poly.env_ready
+            && poly.phase != super::poly::PolyPhase::HeaderInit
         {
             return Ok(poly.assumptions.clone());
         }

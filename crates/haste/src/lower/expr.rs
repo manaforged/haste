@@ -88,6 +88,10 @@ pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn supe
     resolve_inline(cx, (reached, slots), &mut super::Inline::default(), index, limit).is_ok_and(|(callee, _)| callee.is_some())
 }
 
+fn is_leaf_body(body: &crate::body::Body) -> bool {
+    !body.exprs.iter().any(|expr| matches!(expr, Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } | Expr::Await(..) | Expr::Yield(..)))
+}
+
 /// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
 pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
     let ((item, _), Ok(typed)) = &reached.list[index] else {
@@ -116,7 +120,13 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
             let max_exprs = if release || env.release { 2500 } else { 200 };
             cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(budget.insts)
         }
-        Hint::Default => cx.body(*item).is_ok_and(|body| body.exprs.len() <= budget.exprs).then_some(budget.insts),
+        Hint::Default => cx
+            .body(*item)
+            .is_ok_and(|body| {
+                let max_exprs = if release && is_leaf_body(&body) { budget.exprs * 2 } else { budget.exprs };
+                body.exprs.len() <= max_exprs
+            })
+            .then_some(budget.insts),
     }
 }
 

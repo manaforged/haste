@@ -744,29 +744,7 @@ impl Asm {
         self.word(base | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
     }
 
-    pub fn vdup_byte(&mut self, dst: Vreg, src: Reg) {
-        self.word(0x4E01_0C00 | u32::from(src.0) << 5 | u32::from(dst.0));
-    }
-
-    pub fn vcmp_byte(&mut self, eq: bool, dst: Vreg, a: Vreg, b: Vreg) {
-        let base = if eq { 0x6E20_8C00 } else { 0x4E20_3400 };
-        self.word(base | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
-    }
-
-    pub fn varith(&mut self, sub: bool, size: u32, dst: Vreg, a: Vreg, b: Vreg) {
-        let base = if sub { 0x6E20_8400 } else { 0x4E20_8400 };
-        self.word(base | size << 22 | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
-    }
-
-    pub fn vtbl(&mut self, dst: Vreg, table: Vreg, idx: Vreg) {
-        self.word(0x4E00_0000 | u32::from(idx.0) << 16 | u32::from(table.0) << 5 | u32::from(dst.0));
-    }
-
     pub fn umov_d1(&mut self, dst: Reg, src: Vreg) {
         self.word(0x4E18_3C00 | u32::from(src.0) << 5 | u32::from(dst.0));
-    }
-
-    pub fn vsha256su0(&mut self, dst: Vreg, src: Vreg) {
-        self.word(0x5E28_2800 | u32::from(src.0) << 5 | u32::from(dst.0));
     }
 }

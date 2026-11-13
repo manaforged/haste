@@ -60,7 +60,7 @@ pub(crate) struct Plan<R> {
 }
 
 fn registered<R>(regs: &Regs<R>, ty: Type) -> bool {
-    ty.is_small_int() || ((ty.is_float() || (regs.vectors && ty == Type::V128)) && !regs.float.is_empty())
+    ty.is_small_int() || ((ty.is_float() || (regs.vectors && ty.is_vector())) && !regs.float.is_empty())
 }
 
 type Position = Option<(usize, usize)>;
@@ -250,8 +250,8 @@ fn fuses(func: &Function, census: &Uses, value: usize, float_branches: &[FloatCC
     let op = &func.insts[insts[at].index()].op;
     let next = insts.get(at + 1).map(|inst| &func.insts[inst.index()].op);
     let flags = match op {
-        Op::Icmp(..) | Op::Fits(..) => true,
-        Op::Fcmp(cc, ..) => float_branches.contains(cc),
+        Op::Icmp(_, a, _) | Op::Fits(_, _, a, _) => !func.ty(*a).is_vector(),
+        Op::Fcmp(cc, a, _) => !func.ty(*a).is_vector() && float_branches.contains(cc),
         _ => false,
     };
     census.uses[value] == 1
@@ -362,8 +362,8 @@ fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<u8>>) ->
 const LOOP_WEIGHT: u64 = 16;
 const MAX_DEPTH: u32 = 4;
 
-fn block_weights(func: &Function) -> Vec<u64> {
-    crate::licm::depths(func).into_iter().map(|depth| LOOP_WEIGHT.pow(depth.min(MAX_DEPTH))).collect()
+fn block_weights(depths: &[u32]) -> Vec<u64> {
+    depths.iter().map(|&depth| LOOP_WEIGHT.pow(depth.min(MAX_DEPTH))).collect()
 }
 
 fn weights(func: &Function, blocks: &[u64], sib: &[Option<Sib>], elided: &[bool]) -> Vec<u64> {
@@ -399,15 +399,6 @@ fn partners(func: &Function) -> Vec<Vec<Value>> {
             };
             for inst in &block.insts {
                 crate::frame::terminator_edges(&func.insts[inst.index()].op, &mut edge);
-            }
-        }
-    }
-    for block in &func.blocks {
-        for inst in &block.insts {
-            if let Op::Convert(Convert::WidenVec64 | Convert::NarrowVec64, x) = &func.insts[inst.index()].op
-                && let Some(result) = func.insts[inst.index()].result
-            {
-                pair(&[result], &[*x]);
             }
         }
     }
@@ -462,11 +453,25 @@ fn expensive_i64_const(imm: i64) -> bool {
     non_zero >= 3 && non_ones >= 3
 }
 
-fn promote_loop_consts<R>(func: &Function, census: &Uses, elided: &[bool], locations: &mut [Location<R>]) -> Vec<(usize, i64)> {
-    let depths = crate::licm::depths(func);
+fn x64_alu_imm(ty: Type, imm: i64) -> bool {
+    ty == Type::I32 || i32::try_from(imm).is_ok()
+}
+
+fn x64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64) -> bool {
+    match op {
+        Op::Icmp(..) => ty != Type::I64 || i32::try_from(imm).is_ok(),
+        Op::Binary(Binary::Iadd | Binary::Bor | Binary::Bxor, ..) => x64_alu_imm(ty, imm),
+        Op::Binary(Binary::Band, ..) => x64_alu_imm(ty, imm) || (rhs && imm == 0xFFFF_FFFF),
+        Op::Binary(Binary::Isub, ..) => rhs && x64_alu_imm(ty, imm),
+        _ => false,
+    }
+}
+
+fn promote_loop_consts<R>(func: &Function, census: &Uses, depths: &[u32], elided: &[bool], two_address: bool, locations: &mut [Location<R>]) -> Vec<(usize, i64)> {
     let count = func.types.len();
     let mut must_stay_imm = vec![false; count];
     let mut loop_mat = vec![0_u32; count];
+    let outer = |v: Value, depth: u32| census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth);
     for (b, block) in func.blocks.iter().enumerate() {
         let depth = depths[b];
         for &inst in &block.insts {
@@ -478,11 +483,12 @@ fn promote_loop_consts<R>(func: &Function, census: &Uses, elided: &[bool], locat
                 Op::Copy(_, _, bytes) => must_stay_imm[bytes.index()] = true,
                 Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, _, rhs) => must_stay_imm[rhs.index()] = true,
                 Op::Binary(Binary::Imul | Binary::Udiv | Binary::Urem, x, y) => {
+                    let mul_imm = matches!(data.op, Op::Binary(Binary::Imul, ..)) && two_address;
                     for v in [x, y] {
                         if let Location::Imm(imm) = locations[v.index()] {
-                            if imm > 0 && imm.count_ones() == 1 {
+                            if (imm > 0 && imm.count_ones() == 1) || (mul_imm && i32::try_from(imm).is_ok()) {
                                 must_stay_imm[v.index()] = true;
-                            } else if depth > 0 && census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth) {
+                            } else if depth > 0 && outer(v, depth) {
                                 loop_mat[v.index()] += 1;
                             }
                         }
@@ -490,32 +496,36 @@ fn promote_loop_consts<R>(func: &Function, census: &Uses, elided: &[bool], locat
                 }
                 Op::Binary(Binary::Sdiv | Binary::Srem, x, y) if depth > 0 => {
                     for v in [x, y] {
-                        if matches!(locations[v.index()], Location::Imm(_)) && census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth) {
+                        if matches!(locations[v.index()], Location::Imm(_)) && outer(v, depth) {
                             loop_mat[v.index()] += 1;
                         }
                     }
                 }
-                Op::Binary(Binary::Iadd | Binary::Isub, x, y) | Op::Icmp(_, x, y) if depth > 0 => {
-                    if let Location::Imm(imm) = locations[y.index()] {
-                        if (-4095..4096).contains(&imm) {
-                            must_stay_imm[y.index()] = true;
-                        } else if census.def[y.index()].is_some_and(|(db, _)| depths[db] < depth) {
-                            loop_mat[y.index()] += 1;
+                Op::Binary(Binary::Iadd | Binary::Isub | Binary::Band | Binary::Bor | Binary::Bxor, x, y) | Op::Icmp(_, x, y) if depth > 0 => {
+                    let ty = func.ty(x);
+                    for (rhs, v) in [(false, x), (true, y)] {
+                        let Location::Imm(imm) = locations[v.index()] else { continue };
+                        let inline = if two_address {
+                            x64_inline_imm(&data.op, ty, rhs, imm)
+                        } else {
+                            matches!(data.op, Op::Binary(Binary::Iadd | Binary::Isub, ..) | Op::Icmp(..)) && (-4095..4096).contains(&imm)
+                        };
+                        if inline {
+                            if two_address || rhs {
+                                must_stay_imm[v.index()] = true;
+                            }
+                        } else if (two_address || matches!(data.op, Op::Binary(Binary::Iadd | Binary::Isub, ..) | Op::Icmp(..))) && outer(v, depth) {
+                            loop_mat[v.index()] += 1;
                         }
-                    }
-                    if let Location::Imm(imm) = locations[x.index()]
-                        && !(-4095..4096).contains(&imm)
-                        && census.def[x.index()].is_some_and(|(db, _)| depths[db] < depth)
-                    {
-                        loop_mat[x.index()] += 1;
                     }
                 }
                 Op::Store(val, ..) | Op::StackStore(val, ..) if depth > 0 => {
-                    if let Location::Imm(imm) = locations[val.index()]
-                        && imm != 0
-                        && census.def[val.index()].is_some_and(|(db, _)| depths[db] < depth)
-                    {
-                        loop_mat[val.index()] += 1;
+                    if let Location::Imm(imm) = locations[val.index()] {
+                        if two_address && (func.ty(val).bytes() < 8 || i32::try_from(imm).is_ok()) {
+                            must_stay_imm[val.index()] = true;
+                        } else if imm != 0 && outer(val, depth) {
+                            loop_mat[val.index()] += 1;
+                        }
                     }
                 }
                 _ => {}
@@ -524,7 +534,7 @@ fn promote_loop_consts<R>(func: &Function, census: &Uses, elided: &[bool], locat
                 if let Location::Imm(imm) = locations[v.index()]
                     && func.ty(v) == Type::I64
                     && expensive_i64_const(imm)
-                    && ((depth > 0 && census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth)) || census.uses[v.index()] >= 4)
+                    && ((depth > 0 && outer(v, depth)) || census.uses[v.index()] >= 4)
                 {
                     loop_mat[v.index()] += 1;
                 }
@@ -598,16 +608,17 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let census = census(func);
     let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census) } else { (vec![None; count], vec![false; count]) };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
-    let promoted_consts = if weighed { promote_loop_consts(func, &census, &elided, &mut locations) } else { Vec::new() };
+    let loop_depths = weighed.then(|| crate::cfg::Cfg::new(func).loops(func).depths);
+    let promoted_consts = loop_depths.as_deref().map(|depths| promote_loop_consts(func, &census, depths, &elided, regs.two_address, &mut locations)).unwrap_or_default();
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
     let live = live(func, order, copied, &tracked, &sib, &elided);
     let candidates: Vec<bool> = (0..count).map(|value| eligible(&live, &wanted, value)).collect();
     let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches)).collect();
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
-    let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value] == Type::V128))).collect();
+    let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
     let reuse = if regs.two_address { reusable(func, &live, &elided) } else { vec![None; count] };
-    let blocks = weighed.then(|| block_weights(func));
+    let blocks = loop_depths.as_deref().map(block_weights);
     let weights = blocks.as_deref().map(|blocks| weights(func, blocks, &sib, &elided));
     let partners = weighed.then(|| partners(func));
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
@@ -624,7 +635,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     place(&mut locations, float_homes, Location::Float);
     for data in &func.insts {
         if let (Op::Const(0), Some(res)) = (&data.op, data.result)
-            && func.ty(res) == Type::V128
+            && func.ty(res).is_vector()
             && matches!(locations[res.index()], Location::Slot)
         {
             locations[res.index()] = Location::Imm(0);

@@ -6,6 +6,7 @@ mod frame;
 mod int;
 mod location;
 mod vector;
+mod vector_lanes;
 mod wide;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
@@ -14,7 +15,7 @@ use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_try_call, intake_params};
 use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
-use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::ir::{ArgumentPurpose, Block, Function, Inst, Lane, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{CallAbi, Target};
@@ -50,6 +51,12 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let slow_thunk = asm.label();
+    let mut defs = vec![None; func.types.len()];
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        if let Some(res) = func.insts[inst.index()].result {
+            defs[res.index()] = Some(inst);
+        }
+    }
     let emit = Emit {
         func,
         frame,
@@ -61,7 +68,10 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         sites: Vec::new(),
         relocs: Vec::new(),
         plan,
+        defs,
         flags: None,
+        last_spill: None,
+        last_fspill: None,
         next: None,
         features: Features::host(),
         copied,
@@ -112,7 +122,10 @@ pub(super) struct Emit<'a> {
     sites: Vec<Site>,
     relocs: Vec<StencilReloc>,
     plan: Plan<Reg>,
+    defs: Vec<Option<Inst>>,
     flags: Option<(Value, Cond)>,
+    last_spill: Option<(i32, Reg, (usize, u32))>,
+    last_fspill: Option<(i32, Xmm, Type, (usize, u32))>,
     next: Option<Block>,
     features: Features,
     copied: Vec<bool>,
@@ -158,6 +171,8 @@ impl<'a> Emitter<'a> for Emit<'a> {
     }
 
     fn bind_block(&mut self, block: Block) {
+        self.last_spill = None;
+        self.last_fspill = None;
         self.asm.bind(self.blocks[block.index()]);
     }
 
@@ -292,6 +307,8 @@ impl Emit<'_> {
         if ty.bytes() == 16 {
             self.asm.load(Size::Q, Reg::Rax, from.offset(8));
             self.asm.store(Size::Q, to.offset(8), Reg::Rax);
+        } else if to.base == Reg::Rbp && to.index.is_none() {
+            self.last_spill = Some((to.disp, Reg::Rax, self.asm.stamp()));
         }
     }
 
@@ -317,7 +334,7 @@ impl Emit<'_> {
     }
 
     fn test_value(&mut self, value: Value) {
-        let reg = self.reg_of(value).unwrap_or_else(|| {
+        let reg = self.reg_of(value).or_else(|| self.cached_spill(value)).unwrap_or_else(|| {
             self.get(Reg::Rax, value, Ext::Zero);
             Reg::Rax
         });
@@ -399,10 +416,10 @@ impl Emit<'_> {
                 ArgStep::Move(src, dst) => self.asm.movaps(Xmm(dst), Xmm(src)),
                 ArgStep::Save(src) => {
                     self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
-                    self.xmm_store(Type::V128, Mem::new(Reg::Rsp, 0), Xmm(src));
+                    self.xmm_store(Type::Vec { lane: Lane::I64, count: 2 }, Mem::new(Reg::Rsp, 0), Xmm(src));
                 }
                 ArgStep::Restore(dst) => {
-                    self.xmm_load(Type::V128, Xmm(dst), Mem::new(Reg::Rsp, 0));
+                    self.xmm_load(Type::Vec { lane: Lane::I64, count: 2 }, Xmm(dst), Mem::new(Reg::Rsp, 0));
                     self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
                 }
                 ArgStep::Load(val, dst) => self.fget(Xmm(dst), val),
@@ -441,10 +458,10 @@ impl Emit<'_> {
                 ArgStep::Move(src, dst) => self.asm.movaps(Xmm(dst), Xmm(src)),
                 ArgStep::Save(src) => {
                     self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
-                    self.xmm_store(Type::V128, Mem::new(Reg::Rsp, 0), Xmm(src));
+                    self.xmm_store(Type::Vec { lane: Lane::I64, count: 2 }, Mem::new(Reg::Rsp, 0), Xmm(src));
                 }
                 ArgStep::Restore(dst) => {
-                    self.xmm_load(Type::V128, Xmm(dst), Mem::new(Reg::Rsp, 0));
+                    self.xmm_load(Type::Vec { lane: Lane::I64, count: 2 }, Xmm(dst), Mem::new(Reg::Rsp, 0));
                     self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
                 }
                 ArgStep::Load(..) => {}

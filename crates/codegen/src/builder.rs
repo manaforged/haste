@@ -6,6 +6,13 @@ use crate::reloc::RuntimeSymbol;
 
 mod vector;
 
+fn cmp_result_ty(ty: Type) -> Type {
+    match ty {
+        Type::Vec { lane, count } => Type::Vec { lane: lane.int_mask(), count },
+        _ => Type::I8,
+    }
+}
+
 /// Appends blocks, values and instructions to a function.
 #[derive(Debug)]
 pub struct FunctionBuilder<'f> {
@@ -415,6 +422,16 @@ impl Ins<'_> {
         self.binary(Binary::Smax, x, y)
     }
 
+    /// The unsigned minimum.
+    pub fn umin(self, x: Value, y: Value) -> Value {
+        self.binary(Binary::Umin, x, y)
+    }
+
+    /// The unsigned maximum.
+    pub fn umax(self, x: Value, y: Value) -> Value {
+        self.binary(Binary::Umax, x, y)
+    }
+
     /// Bitwise and.
     pub fn band(self, x: Value, y: Value) -> Value {
         self.binary(Binary::Band, x, y)
@@ -500,9 +517,10 @@ impl Ins<'_> {
         self.unary(Unary::Popcnt, x)
     }
 
-    /// Integer comparison producing 1 or 0 as an `I8`.
+    /// Integer comparison producing 1 or 0 as `I8`, or a vector mask for vector operands.
     pub fn icmp(mut self, cc: IntCC, x: Value, y: Value) -> Value {
-        self.value(Op::Icmp(cc, x, y), Type::I8)
+        let ty = cmp_result_ty(self.func.ty(x));
+        self.value(Op::Icmp(cc, x, y), ty)
     }
 
     /// 1 as an `I8` when `x + y` fits the type of `x`, read as signed when `signed`, else 0.
@@ -535,9 +553,10 @@ impl Ins<'_> {
         self.compare_imm(cc, x, imm, false)
     }
 
-    /// Float comparison producing 1 or 0 as an `I8`.
+    /// Float comparison producing 1 or 0 as `I8`, or a vector mask for vector operands.
     pub fn fcmp(mut self, cc: FloatCC, x: Value, y: Value) -> Value {
-        self.value(Op::Fcmp(cc, x, y), Type::I8)
+        let ty = cmp_result_ty(self.func.ty(x));
+        self.value(Op::Fcmp(cc, x, y), ty)
     }
 
     /// `x` when `condition` is nonzero, else `y`.
@@ -609,6 +628,16 @@ impl Ins<'_> {
     /// Float division.
     pub fn fdiv(self, x: Value, y: Value) -> Value {
         self.binary(Binary::Fdiv, x, y)
+    }
+
+    /// IEEE-754 `minNum` of `x` and `y`.
+    pub fn fmin(self, x: Value, y: Value) -> Value {
+        self.binary(Binary::Fmin, x, y)
+    }
+
+    /// IEEE-754 `maxNum` of `x` and `y`.
+    pub fn fmax(self, x: Value, y: Value) -> Value {
+        self.binary(Binary::Fmax, x, y)
     }
 
     /// `x` with the sign of `y`.

@@ -248,6 +248,16 @@ pub struct View {
     pub partial: bool,
 }
 
+/// Positional-free snapshot of how much of a crate is read, consumed, or still partial.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CrateExtent {
+    pub files: usize,
+    pub impls: usize,
+    pub impl_bodies: usize,
+    pub consumed: usize,
+    pub partial: usize,
+}
+
 impl Crate {
     /// Whether this crate is an immutable release sysroot crate.
     pub const fn is_sysroot(&self) -> bool {
@@ -288,8 +298,14 @@ impl Crate {
     }
 
     /// How much of the crate is read: its files, impls, item-holding bodies and consumed items, and whether a declared module is still unread; loading, expanding or consuming changes it.
-    pub fn extent(&self) -> [usize; 5] {
-        [self.files.len(), self.impls.len(), self.impl_bodies.len(), self.consumed.len(), usize::from(self.partial())]
+    pub fn extent(&self) -> CrateExtent {
+        CrateExtent {
+            files: self.files.len(),
+            impls: self.impls.len(),
+            impl_bodies: self.impl_bodies.len(),
+            consumed: self.consumed.len(),
+            partial: usize::from(self.partial()),
+        }
     }
 
     /// The names of the item macro calls that no definition matched.

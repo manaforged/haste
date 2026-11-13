@@ -1,40 +1,82 @@
 use rustc_hash::FxHashMap as HashMap;
 
+#[path = "promote_subword.rs"]
+mod subword;
+
 use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, Op, StackSlot, Type, Value};
 use crate::split::{End, Layouts};
 
-/// One promoted place: the bytes at `offset` in `slot`, read and written at one or more integer widths.
+#[derive(Clone, Copy)]
+enum VarMode {
+    Uniform { ty: Type, stored: bool },
+    NarrowInt { home: Type, has_store: bool },
+    Bitcast { home: Type },
+    Invalid,
+}
+
+fn same_bitcast_family(a: Type, b: Type) -> bool {
+    a.bytes() == b.bytes()
+        && (matches!((a, b), (Type::F64 | Type::I64, Type::F64 | Type::I64) | (Type::F32 | Type::I32, Type::F32 | Type::I32))
+            || (a.is_vector() && b.is_vector()))
+}
+
+/// One promoted place: the bytes at `offset` in `slot`, read and written under one mode.
 struct Var {
     slot: StackSlot,
     offset: i64,
     end: i64,
-    first: Type,
-    store: Option<Type>,
-    uniform: bool,
-    narrow: bool,
-    bitcast: bool,
-    clash: bool,
+    mode: VarMode,
 }
 
 impl Var {
+    fn new(slot: StackSlot, offset: i64, ty: Type) -> Self {
+        Var { slot, offset, end: offset + i64::from(ty.bytes()), mode: VarMode::Uniform { ty, stored: false } }
+    }
+
     fn home(&self) -> Type {
-        self.store.unwrap_or(self.first)
+        match self.mode {
+            VarMode::Uniform { ty, .. } | VarMode::NarrowInt { home: ty, .. } | VarMode::Bitcast { home: ty } => ty,
+            VarMode::Invalid => Type::I8,
+        }
     }
 
     fn sound(&self) -> bool {
-        !self.clash && (self.uniform || self.narrow || self.bitcast)
+        !matches!(self.mode, VarMode::Invalid)
     }
 
-    fn add(&mut self, ty: Type, store: bool) {
+    fn add(&mut self, ty: Type, is_store: bool) {
         self.end = self.end.max(self.offset + i64::from(ty.bytes()));
-        self.uniform &= ty == self.first;
-        self.narrow &= ty.is_small_int();
-        self.bitcast &= ty.bytes() == self.first.bytes()
-            && matches!((self.first, ty), (Type::F64 | Type::I64, Type::F64 | Type::I64) | (Type::F32 | Type::I32, Type::F32 | Type::I32));
-        if store {
-            self.clash |= self.store.is_some_and(|home| home != ty);
-            self.store = Some(ty);
-        }
+        self.mode = match self.mode {
+            VarMode::Uniform { ty: u, stored } if ty == u => VarMode::Uniform { ty: u, stored: stored || is_store },
+            VarMode::Uniform { ty: u, stored } if same_bitcast_family(u, ty) => {
+                let home = if stored || !is_store { u } else { ty };
+                VarMode::Bitcast { home }
+            }
+            VarMode::Uniform { ty: u, stored } if u.is_small_int() && ty.is_small_int() => match (stored, is_store) {
+                (true, true) => VarMode::Invalid,
+                (true, false) if ty.bytes() > u.bytes() => VarMode::Invalid,
+                (true, false) => VarMode::NarrowInt { home: u, has_store: true },
+                (false, true) if u.bytes() > ty.bytes() => VarMode::Invalid,
+                (false, true) => VarMode::NarrowInt { home: ty, has_store: true },
+                (false, false) => VarMode::NarrowInt { home: if ty.bytes() > u.bytes() { ty } else { u }, has_store: false },
+            },
+            VarMode::NarrowInt { home, has_store } if ty.is_small_int() => {
+                if is_store {
+                    if (has_store && ty != home) || (!has_store && home.bytes() > ty.bytes()) {
+                        VarMode::Invalid
+                    } else {
+                        VarMode::NarrowInt { home: ty, has_store: true }
+                    }
+                } else if has_store && ty.bytes() > home.bytes() {
+                    VarMode::Invalid
+                } else {
+                    let next = if !has_store && ty.bytes() > home.bytes() { ty } else { home };
+                    VarMode::NarrowInt { home: next, has_store }
+                }
+            }
+            VarMode::Bitcast { home } if same_bitcast_family(home, ty) => VarMode::Bitcast { home },
+            _ => VarMode::Invalid,
+        };
     }
 }
 
@@ -42,7 +84,8 @@ fn convert(from: Type, to: Type) -> Option<Convert> {
     if from == to {
         return None;
     }
-    if from.is_float() || to.is_float() {
+    if from.is_float() || to.is_float() || from.is_vector() || to.is_vector() {
+        assert_eq!(from.bytes(), to.bytes());
         return Some(Convert::Bitcast);
     }
     Some(if to.bytes() < from.bytes() { Convert::Ireduce } else { Convert::Uextend })
@@ -162,8 +205,7 @@ impl Scan {
             Some(var) => *var,
             None => {
                 let var = self.vars.len();
-                let end = offset + i64::from(ty.bytes());
-                self.vars.push(Var { slot, offset, end, first: ty, store: None, uniform: true, narrow: true, bitcast: true, clash: false });
+                self.vars.push(Var::new(slot, offset, ty));
                 self.ids.insert((slot, offset), var);
                 self.slot_vars[slot.index()].push(var);
                 var
@@ -230,17 +272,31 @@ struct Local {
     defs: HashMap<(usize, Block), Value>,
     exposed: Vec<Vec<(Block, Load)>>,
     forward: Vec<Vec<(Load, Value)>>,
+    store_casts: Vec<Vec<(Inst, Value)>>,
 }
 
 impl Local {
-    fn new(scan: &Scan) -> Self {
+    fn new(scan: &Scan, fresh: &mut Fresh, subst: &mut Vec<Value>) -> Self {
         let count = scan.vars.len();
-        let mut local = Local { defs: HashMap::default(), exposed: vec![Vec::new(); count], forward: vec![Vec::new(); count] };
+        let mut local = Local {
+            defs: HashMap::default(),
+            exposed: vec![Vec::new(); count],
+            forward: vec![Vec::new(); count],
+            store_casts: vec![Vec::new(); count],
+        };
         for access in &scan.accesses {
             let key = (access.var, access.block);
             match access.kind {
                 Kind::Store(value) => {
-                    local.defs.insert(key, value);
+                    let home = scan.vars[access.var].home();
+                    let def = if access.ty != home && access.ty.bytes() == home.bytes() {
+                        let cast = fresh.value(subst, home);
+                        local.store_casts[access.var].push((access.inst, cast));
+                        cast
+                    } else {
+                        value
+                    };
+                    local.defs.insert(key, def);
                 }
                 Kind::Load(result) => {
                     let load = Load { inst: access.inst, result, ty: access.ty };
@@ -265,33 +321,15 @@ impl Local {
     }
 }
 
-struct Cfg {
-    entry: Block,
-    preds: Vec<Vec<Block>>,
-    reachable: Vec<bool>,
-    try_target: Vec<bool>,
-}
-
-impl Cfg {
-    fn new(func: &Function, entry: Block) -> Self {
-        let count = func.blocks.len();
-        let mut cfg = Cfg { entry, preds: vec![Vec::new(); count], reachable: vec![false; count], try_target: vec![false; count] };
-        for index in 0..count {
-            let block = Block(index as u32);
-            let Some(op) = func.last(block) else { continue };
-            for target in op.targets() {
-                let preds = &mut cfg.preds[target.index()];
-                if !preds.contains(&block) {
-                    preds.push(block);
-                }
-                if matches!(op, Op::TryCall { .. } | Op::BrTable(..)) {
-                    cfg.try_target[target.index()] = true;
-                }
-            }
+fn try_targets(func: &Function) -> Vec<bool> {
+    let mut try_target = vec![false; func.blocks.len()];
+    for index in 0..func.blocks.len() {
+        let Some(op) = func.last(Block(index as u32)) else { continue };
+        if matches!(op, Op::TryCall { .. } | Op::BrTable(..)) {
+            op.targets().for_each(|target| try_target[target.index()] = true);
         }
-        cfg.reachable = func.reachable(entry);
-        cfg
     }
+    try_target
 }
 
 struct Fresh {
@@ -349,7 +387,8 @@ enum Step {
 }
 
 struct Pass {
-    cfg: Cfg,
+    cfg: crate::cfg::Cfg,
+    try_target: Vec<bool>,
     scan: Scan,
     local: Local,
     fresh: Fresh,
@@ -412,7 +451,7 @@ impl Pass {
     fn step(&mut self, build: &mut Build, var: SlotVar, block: Block) -> Option<Step> {
         let ty = self.scan.vars[var.index].home();
         let preds = &self.cfg.preds[block.index()];
-        if block == self.cfg.entry && !preds.is_empty() {
+        if self.cfg.entry == Some(block) && !preds.is_empty() {
             return None;
         }
         if !self.cfg.reachable[block.index()] || preds.is_empty() {
@@ -528,20 +567,34 @@ impl Pass {
         }
         self.fill(&mut build)?;
         self.minimize(&mut build.phis);
-        let blocked = build.phis.iter().any(|phi| self.cfg.try_target[phi.block.index()]);
+        let blocked = build.phis.iter().any(|phi| self.try_target[phi.block.index()]);
         (!blocked).then_some(build)
     }
 
     fn apply(&mut self, func: &mut Function, slot: usize, build: Build) {
         self.undo.clear();
+        for &var in &self.scan.slot_vars[slot] {
+            for &(inst, cast) in &self.local.store_casts[var] {
+                let val = match func.insts[inst.index()].op {
+                    Op::StackStore(v, ..) | Op::Store(v, ..) => v,
+                    _ => continue,
+                };
+                func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, val);
+                func.insts[inst.index()].result = Some(cast);
+                self.kept[inst.index()] = true;
+            }
+        }
         for (inst, op, value) in build.converts {
             func.insts[inst.index()].op = Op::Convert(op, value);
             self.kept[inst.index()] = true;
         }
         for phi in build.phis {
             func.blocks[phi.block.index()].params.push(phi.value);
-            for (pred, arg) in self.cfg.preds[phi.block.index()].iter().zip(&phi.args) {
-                push_edge_arg(func, *pred, phi.block, *arg);
+            let preds = &self.cfg.preds[phi.block.index()];
+            for (i, (pred, arg)) in preds.iter().zip(&phi.args).enumerate() {
+                if !preds[..i].contains(pred) {
+                    push_edge_arg(func, *pred, phi.block, *arg);
+                }
             }
         }
         self.promoted[slot] = true;
@@ -637,20 +690,25 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> bool {
         scan = Scan::new(func);
         scan.pin_moves(func);
     }
-    let changed = (0..func.slots.len()).any(|slot| scan.promotable(slot)) && promote(func, entry, scan);
+    let split_changed = moves == Moves::Split && subword::split(func, &scan);
+    if split_changed {
+        scan = Scan::new(func);
+        scan.pin_moves(func);
+    }
+    let changed = ((0..func.slots.len()).any(|slot| scan.promotable(slot)) && promote(func, entry, scan)) || split_changed;
     crate::copy::rejoin(func, &splits);
     changed
 }
 
 /// Promotes every promotable slot `scan` found.
 fn promote(func: &mut Function, entry: Block, scan: Scan) -> bool {
-    let local = Local::new(&scan);
     let count = func.types.len();
-    let fresh = Fresh { base: count, types: Vec::new(), zeros: Vec::new() };
-    let subst = crate::merge::identity(count);
+    let mut fresh = Fresh { base: count, types: Vec::new(), zeros: Vec::new() };
+    let mut subst = crate::merge::identity(count);
+    let local = Local::new(&scan, &mut fresh, &mut subst);
     let promoted = vec![false; func.slots.len()];
     let kept = vec![false; func.insts.len()];
-    let mut pass = Pass { cfg: Cfg::new(func, entry), scan, local, fresh, subst, undo: Vec::new(), memo: Vec::new(), stamp: 0, path: Vec::new(), promoted, kept };
+    let mut pass = Pass { cfg: crate::cfg::Cfg::from_entry(func, entry), try_target: try_targets(func), scan, local, fresh, subst, undo: Vec::new(), memo: Vec::new(), stamp: 0, path: Vec::new(), promoted, kept };
     for slot in 0..func.slots.len() {
         if !pass.scan.promotable(slot) {
             continue;

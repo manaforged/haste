@@ -23,7 +23,7 @@ pub(super) enum AotStatic {
     Foreign { weak: bool, host: Option<HostSymbol> },
 }
 
-pub(super) struct AotState {
+pub(crate) struct AotState {
     pub(super) rodata: Vec<(Vec<u8>, Vec<RodataReloc>)>,
     pub(super) vtables: Vec<Vec<VtableEntry>>,
     pub(super) statics: HashMap<usize, AotStatic>,
@@ -310,7 +310,7 @@ fn emit_functions(state: &AotState, live_fns: &[bool], target: &Target, syms: &S
 
 impl Image {
     pub(super) fn record_aot(&self, index: usize, entry: AotFn, followers: &[usize]) {
-        if let Some(aot) = &self.aot {
+        if let Some(aot) = self.aot() {
             let mut state = lock(aot);
             state.ensure_len(index + 1);
             state.functions[index] = Some(entry);
@@ -323,7 +323,7 @@ impl Image {
 
     /// Freezes a compiled AOT image into a standalone executable starting at `(lang_start, user_main)`.
     pub(crate) fn to_aot(&self, target: &Target, (lang_start, user_main): (usize, usize)) -> Result<Executable> {
-        let state = lock(self.aot.as_ref().context("image has no AOT recording")?);
+        let state = lock(self.aot().context("image has no AOT recording")?);
         let thread_slots = lock(&self.thread_slots);
         let live = AotReach::collect(&state, [lang_start, user_main]);
         let mut exe = Executable::new(target);

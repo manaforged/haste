@@ -43,8 +43,10 @@ impl Counter {
             self.int += 1;
             return match ty {
                 Type::F32 | Type::F64 if slot < WIN64_INT_ARGS.len() => Loc::Float(slot as u8),
+                Type::Vec { .. } if ty.bytes() == 8 && slot < WIN64_INT_ARGS.len() => Loc::Float(slot as u8),
                 Type::F32 | Type::F64 => self.stack(WORD, WORD),
-                Type::I128 | Type::V128 => self.stack(16, 16),
+                Type::Vec { .. } if ty.bytes() == 8 => self.stack(WORD, WORD),
+                Type::I128 | Type::Vec { .. } => self.stack(16, 16),
                 _ if slot < WIN64_INT_ARGS.len() => Loc::Int(WIN64_INT_ARGS[slot]),
                 _ => self.stack(WORD, WORD),
             };
@@ -55,11 +57,14 @@ impl Counter {
                 Loc::Pair(INT_ARGS[self.int - 2], INT_ARGS[self.int - 1])
             }
             Type::I128 => self.stack(16, 16),
-            Type::F32 | Type::F64 | Type::V128 if self.float < FLOAT_ARGS => {
+            Type::F32 | Type::F64 | Type::Vec { .. } if self.float < FLOAT_ARGS => {
                 self.float += 1;
                 Loc::Float(self.float - 1)
             }
-            Type::V128 => self.stack(16, 16),
+            Type::Vec { .. } => {
+                let bytes = ty.bytes();
+                self.stack(bytes, bytes)
+            }
             Type::F32 | Type::F64 => self.stack(WORD, WORD),
             _ if self.int < INT_ARGS.len() => {
                 self.int += 1;

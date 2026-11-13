@@ -45,7 +45,7 @@ pub(crate) fn round(value: u32, to: u32) -> u32 {
 pub(crate) fn returns<R: Copy>(signature: &Signature, ints: &[R], floats: u8) -> Result<Vec<Loc<R>>, String> {
     let (mut int, mut float) = (0, 0);
     let place = |ty: Type| match ty {
-        Type::F32 | Type::F64 | Type::V128 if float < floats => {
+        Type::F32 | Type::F64 | Type::Vec { .. } if float < floats => {
             float += 1;
             Ok(Loc::Float(float - 1))
         }
@@ -284,6 +284,33 @@ pub(crate) struct Prepared<R> {
     pub framed: bool,
 }
 
+fn build_frame<R: Copy + PartialEq>(
+    func: &Function,
+    (saves, float_saves): (Vec<R>, Vec<u8>),
+    plan: &Plan<R>,
+    abi: &Abi<R>,
+    classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
+) -> Result<(Frame<R>, bool), String> {
+    let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided), classify)?;
+    let stack_params = abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)));
+    let framed = framed(func, &frame, stack_params);
+    Ok((frame, framed))
+}
+
+pub(crate) fn repack_after_elide<R: Copy + PartialEq>(
+    func: &Function,
+    plan: &Plan<R>,
+    abi: &Abi<R>,
+    frame: &mut Frame<R>,
+    framed: &mut bool,
+    classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
+) -> Result<(), String> {
+    let saves = std::mem::take(&mut frame.saves);
+    let float_saves = std::mem::take(&mut frame.float_saves);
+    (*frame, *framed) = build_frame(func, (saves, float_saves), plan, abi, &classify)?;
+    Ok(())
+}
+
 pub(crate) fn prepare<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
@@ -296,9 +323,7 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
     let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed), &abi.params, &classify);
     let saves = saved(func, &plan.used, regs.saved);
     let float_saves = saved(func, &plan.used_floats, regs.saved_float);
-    let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided), &classify)?;
-    let stack_params = abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)));
-    let framed = framed(func, &frame, stack_params);
+    let (frame, framed) = build_frame(func, (saves, float_saves), &plan, &abi, &classify)?;
     Ok(Prepared { order, copied, abi, plan, frame, framed })
 }
 
@@ -373,13 +398,8 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, pl
     if func.blocks[entry.index()].params.iter().any(|&p| !pure_value(p, plan, frame, clobbers)) {
         return None;
     }
-    let mut preds = vec![0_u32; func.blocks.len()];
-    for block in &func.blocks {
-        if let Some(&term) = block.insts.last() {
-            func.insts[term.index()].op.targets().for_each(|t| preds[t.index()] += 1);
-        }
-    }
-    if preds[entry.index()] != 0 || !pure_block(func, entry, plan, frame, clobbers) {
+    let cfg = crate::cfg::Cfg::new(func);
+    if cfg.pred_count(entry) != 0 || !pure_block(func, entry, plan, frame, clobbers) {
         return None;
     }
     let term = *func.blocks[entry.index()].insts.last()?;
@@ -388,7 +408,7 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, pl
         return None;
     }
     let fast_ret_ok = |block: Block, edge_args: &[Value]| {
-        preds[block.index()] == 1
+        cfg.pred_count(block) == 1
             && func.jump_target(block) == block
             && edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
             && func.blocks[block.index()].params.iter().all(|&p| pure_value(p, plan, frame, clobbers))
@@ -403,7 +423,7 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, pl
     };
     let slow_ok = |block: Block, edge_args: &[Value]| {
         edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
-            .then(|| preds[block.index()] != 1 || func.jump_target(block) != block)
+            .then(|| cfg.pred_count(block) != 1 || func.jump_target(block) != block)
     };
     if fast_ret_ok(*then_b, then_args)
         && let Some(use_slow_thunk) = slow_ok(*else_b, else_args)

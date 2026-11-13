@@ -5,10 +5,29 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::body::{ExprId, PatId};
 use crate::names::ItemRef;
 
-use super::super::infer::{Awaited, BodyTables, Closure, Coercion, For, Res, SiteKey, Tried};
+use super::super::infer::{Awaited, BodyTables, Closure, Coercion, For, Local, Res, SiteKey, Tried};
 use super::super::substs::{PackedMap, PackedSet, ProjId, Substs};
 use super::super::ty::{Kind, Ty, Types};
 use super::{CallOverride, PolySummary};
+
+/// Stripped polymorphic check-only summary holding only resolved call edges.
+#[derive(Clone, Debug)]
+pub struct PolyCheck {
+    pub summary: Arc<PolySummary>,
+    pub resolved_calls: Box<[(SiteKey, ItemRef, Substs)]>,
+}
+
+impl PolyCheck {
+    /// Iterates every concrete and resolved call edge without materializing `BodyTables`.
+    pub fn calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+        self.summary.fixed_calls.iter().copied().chain(self.resolved_calls.iter().map(|&(_, i, s)| (i, s)))
+    }
+
+    /// Iterates only the instance-dependent call edges, excluding `summary.fixed_calls`.
+    pub fn dynamic_calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+        self.resolved_calls.iter().map(|&(_, i, s)| (i, s))
+    }
+}
 
 /// Compact per-instance instantiation state that materializes full `BodyTables` only on demand.
 #[derive(Clone, Debug)]
@@ -20,8 +39,42 @@ pub struct PolyInst {
     pub builtin_ops: Box<[ExprId]>,
     pub call_overrides: Box<[CallOverride]>,
     pub offset_overrides: Box<[(ExprId, u64)]>,
-    pub(crate) check_only: bool,
     pub(super) materialized: OnceLock<Arc<BodyTables>>,
+}
+
+/// Typed instantiation outcome distinguishing lowered full instances from stripped check-only ones.
+pub(super) enum InstOutcome {
+    Full(PolyInst, Vec<Local>, Option<Ty>, Vec<Ty>, Vec<Ty>),
+    CheckOnly(PolyCheck, Option<Ty>, Vec<Ty>, Vec<Ty>),
+}
+
+pub(super) fn instantiate_pure(types: &Types, args: Substs, summary: &Arc<PolySummary>, check_only: bool) -> InstOutcome {
+    let mut inst = PolyInst {
+        args,
+        summary: Arc::clone(summary),
+        projs: Box::new([]),
+        resolved_calls: Box::new([]),
+        builtin_ops: Box::new([]),
+        call_overrides: Box::new([]),
+        offset_overrides: Box::new([]),
+        materialized: OnceLock::new(),
+    };
+    if !summary.direct_calls.is_empty() {
+        let mut resolved: Vec<_> = summary.direct_calls.iter().map(|&(key, item, substs)| (key, item, inst.sub_substs(types, substs))).collect();
+        if !check_only {
+            resolved.sort_unstable_by_key(|&(key, ..)| key);
+        }
+        inst.resolved_calls = resolved.into_boxed_slice();
+    }
+    let ret = summary.ret.map(|ty| inst.sub_ty(types, ty));
+    let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(types, ty)).collect();
+    let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(types, ty)).collect();
+    if check_only {
+        InstOutcome::CheckOnly(PolyCheck { summary: inst.summary, resolved_calls: inst.resolved_calls }, ret, layouts, drop_tys)
+    } else {
+        let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(types, local.ty) }).collect();
+        InstOutcome::Full(inst, locals, ret, layouts, drop_tys)
+    }
 }
 
 /// Generic parameter and projection substitution policy for [`fold_ty`] and [`fold_substs`].

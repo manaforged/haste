@@ -23,6 +23,15 @@ pub type Instance = (ItemRef, Substs);
 
 const _: () = assert!(std::mem::size_of::<Instance>() == 16);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReachedEntry {
+    Declared,
+    Enqueued,
+    Blocked,
+    Settled,
+    Replaced,
+}
+
 /// Every function reached from some roots, each with its inferred body or the reason it has none.
 #[derive(Default)]
 pub struct Reached {
@@ -31,8 +40,8 @@ pub struct Reached {
     /// The bodies whose types have no layout yet, which lowering would fail on.
     pub unlaid: Vec<String>,
     calls: Vec<Vec<usize>>,
-    untyped: rustc_hash::FxHashSet<usize>,
-    blocked: Vec<usize>,
+    states: Vec<ReachedEntry>,
+    untyped_count: usize,
     filter: ReachFilter,
 }
 
@@ -55,27 +64,60 @@ impl Reached {
         found
     }
 
+    fn push_entry(&mut self, instance: Instance, state: ReachedEntry) -> usize {
+        let at = self.list.len();
+        self.index.insert(instance, at);
+        self.list.push((instance, Err(String::new())));
+        self.states.push(state);
+        if state == ReachedEntry::Declared {
+            self.untyped_count += 1;
+        }
+        at
+    }
+
+    fn set_entry(&mut self, index: usize, next: ReachedEntry, result: Result<Arc<Typed>, String>) {
+        if self.states[index] == ReachedEntry::Declared {
+            self.untyped_count -= 1;
+        }
+        if next == ReachedEntry::Declared {
+            self.untyped_count += 1;
+        }
+        self.states[index] = next;
+        self.list[index].1 = result;
+    }
+
+    fn take_blocked(&mut self) -> Vec<usize> {
+        self.states
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(at, state)| {
+                if *state == ReachedEntry::Blocked {
+                    *state = ReachedEntry::Enqueued;
+                    Some(at)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// The index of `instance`, and whether it is new: a new one is listed without its body until `infer_declared` infers it.
     pub fn declare(&mut self, instance: Instance) -> (usize, bool) {
         if let Some(&at) = self.index.get(&instance) {
             return (at, false);
         }
-        let at = self.list.len();
-        self.index.insert(instance, at);
-        self.list.push((instance, Err(String::new())));
-        self.untyped.insert(at);
+        let at = self.push_entry(instance, ReachedEntry::Declared);
         (at, true)
     }
 
     /// Takes back the body of declared function `index`, so the next `infer_declared` infers it again.
     pub fn forget(&mut self, index: usize) {
-        self.list[index].1 = Err(String::new());
-        self.untyped.insert(index);
+        self.set_entry(index, ReachedEntry::Declared, Err(String::new()));
     }
 
     /// Whether declared function `index` has not been inferred yet.
     pub fn is_untyped(&self, index: usize) -> bool {
-        !self.untyped.is_empty() && self.untyped.contains(&index)
+        self.untyped_count > 0 && self.states.get(index) == Some(&ReachedEntry::Declared)
     }
 
     /// The prelinked callee indices of reached function `index`, when `link` has populated them.
@@ -98,7 +140,7 @@ impl Reached {
 
 /// Advances `reached` monotonically from `roots` and any previously blocked instances, parking instances that emit new asks unless `force_commit` is set.
 pub fn reach_wave(cx: &mut Context<'_>, reached: &mut Reached, roots: &[Instance], force_commit: bool) {
-    let mut initial = std::mem::take(&mut reached.blocked);
+    let mut initial = reached.take_blocked();
     initial.extend(enqueue(reached, roots.to_vec()));
     let settled = drain_wave(cx, reached, initial, force_commit);
     reached.link(&settled);
@@ -167,7 +209,7 @@ fn closure_owners(types: &super::ty::Types, ty: Ty, out: &mut Vec<Instance>) {
 pub fn reach_anew(cx: &mut Context<'_>, reached: &mut Reached, dead: &[usize], roots: &[Instance]) -> Vec<usize> {
     for &index in dead {
         reached.index.remove(&reached.list[index].0);
-        reached.list[index].1 = Err("replaced by an edit".to_owned());
+        reached.set_entry(index, ReachedEntry::Replaced, Err("replaced by an edit".to_owned()));
     }
     reached.link(dead);
     let found = drain(cx, reached, roots.to_vec());
@@ -177,11 +219,12 @@ pub fn reach_anew(cx: &mut Context<'_>, reached: &mut Reached, dead: &[usize], r
 
 /// Infers declared function `index` when it has no body yet, and returns whether it did.
 pub fn infer_declared(cx: &mut Context<'_>, reached: &mut Reached, index: usize) -> bool {
-    if !reached.untyped.remove(&index) {
+    if reached.states.get(index) != Some(&ReachedEntry::Declared) {
         return false;
     }
     let instance = reached.list[index].0;
-    reached.list[index].1 = typed_once(cx, &instance, &mut reached.unlaid);
+    let typed = typed_once(cx, &instance, &mut reached.unlaid);
+    reached.set_entry(index, ReachedEntry::Settled, typed);
     true
 }
 
@@ -322,13 +365,14 @@ fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: Vec<usize>,
     reached.filter = q.filter;
     for inst in q.instances.into_iter().skip(reached.list.len()) {
         reached.list.push((inst, Err(String::new())));
+        reached.states.push(ReachedEntry::Enqueued);
     }
     let mut added = Vec::with_capacity(q.settled.len());
     for (at, typed, unlaid, blocked) in q.settled {
-        reached.list[at].1 = typed;
         if blocked {
-            reached.blocked.push(at);
+            reached.set_entry(at, ReachedEntry::Blocked, typed);
         } else {
+            reached.set_entry(at, ReachedEntry::Settled, typed);
             reached.unlaid.extend(unlaid);
             added.push(at);
         }
@@ -340,7 +384,7 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
     let mut batch = Vec::with_capacity(MAX_WORKER_BATCH);
     let mut results = Vec::with_capacity(MAX_WORKER_BATCH);
     let mut local_filter = ReachFilter::default();
-    let mut synced_len = 0usize;
+    let mut synced_len = (0usize, 0usize);
     loop {
         batch.clear();
         {
@@ -372,7 +416,11 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             let asked = cx.asks.count() > asks0;
             let mut callees = Vec::new();
             if !deferred && (force_commit || !asked) {
-                pre_collect_callees(cx, &mut local_filter, (instance, &typed, include_fixed), &mut callees);
+                let first_fixed = include_fixed && !local_filter.seen_fixed_poly.contains(&instance.0);
+                pre_collect_callees(cx, &mut local_filter, (instance, &typed, first_fixed), &mut callees);
+                if let Ok(t) = &typed && matches!(t.tables, super::infer::LazyTables::Poly(_) | super::infer::LazyTables::CheckOnly(_)) {
+                    local_filter.seen_fixed_poly.insert(instance.0);
+                }
             }
             results.push((at, instance, typed, unlaid, asked, deferred, callees));
         }
@@ -381,7 +429,6 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             q.active = q.active.saturating_sub(active.2);
             active.2 = 0;
             local_filter.drain_to(&mut q.filter);
-            synced_len = q.filter.sealed_log.len();
             let mut pushed = false;
             for (at, instance, typed, unlaid, asked, deferred, callees) in results.drain(..) {
                 if deferred {
@@ -392,7 +439,7 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
                     commit_filter_caller(cx, &mut q.filter, instance, &typed);
                     q.settled.push((at, typed, unlaid, false));
                     for (callee, sealed) in callees {
-                        if sealed && !q.filter.seen_sealed_sysroot.insert(callee.0) {
+                        if sealed && !q.filter.mark_seen_sealed(callee.0) {
                             continue;
                         }
                         if !q.seen.contains_key(&callee) {
@@ -418,10 +465,7 @@ fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {
         if reached.index.contains_key(&instance) {
             continue;
         }
-        let at = reached.list.len();
-        reached.index.insert(instance, at);
-        reached.list.push((instance, Err(String::new())));
-        wave.push(at);
+        wave.push(reached.push_entry(instance, ReachedEntry::Enqueued));
     }
     wave
 }
@@ -445,13 +489,12 @@ fn serial_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], chec
         let mut unlaid = Vec::new();
         let typed = infer_entry(cx, &instance, &mut unlaid, check_undeclared);
         if !force_commit && cx.asks.count() > asks0 {
-            reached.blocked.push(at);
-            reached.list[at].1 = typed;
+            reached.set_entry(at, ReachedEntry::Blocked, typed);
             continue;
         }
         reached.unlaid.extend(unlaid);
         collect_filtered_callees(cx, &mut reached.filter, instance, &typed, &mut next);
-        reached.list[at].1 = typed;
+        reached.set_entry(at, ReachedEntry::Settled, typed);
         settled.push(at);
     }
     (settled, next)
@@ -576,18 +619,18 @@ fn commit_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], item
         let at = wave[pos];
         match slot {
             Some(item) if !force_commit && item.asked => {
-                reached.blocked.push(at);
-                reached.list[at].1 = item.typed;
+                reached.set_entry(at, ReachedEntry::Blocked, item.typed);
             }
             Some(item) => {
                 let caller = reached.list[at].0;
                 collect_filtered_callees(cx, &mut reached.filter, caller, &item.typed, &mut next);
-                reached.list[at].1 = item.typed;
+                reached.set_entry(at, ReachedEntry::Settled, item.typed);
                 reached.unlaid.extend(item.unlaid);
                 settled.push(at);
             }
             None => {
-                reached.list[at].1 = Err(format!("{}: sema worker panicked", cx.name(reached.list[at].0.0)));
+                let name = cx.name(reached.list[at].0.0);
+                reached.set_entry(at, ReachedEntry::Settled, Err(format!("{name}: sema worker panicked")));
                 settled.push(at);
             }
         }
@@ -604,7 +647,7 @@ fn infer_entry(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<Strin
 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
 pub(super) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
-    if let Some(typed) = cx.store.finals.get(instance).filter(|t| cx.store.lookups.skip_warm_sysroot_bodies || !matches!(&t.tables, super::infer::LazyTables::Poly(p) if p.check_only)) {
+    if let Some(typed) = cx.store.finals.get(instance).filter(|t| cx.store.lookups.skip_warm_sysroot_bodies || !matches!(&t.tables, super::infer::LazyTables::CheckOnly(_))) {
         register(cx, *instance, &typed);
         return Ok(typed);
     }

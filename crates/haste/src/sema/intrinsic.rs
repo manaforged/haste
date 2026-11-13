@@ -1,4 +1,4 @@
-use haste_codegen::AtomicRmwOp;
+use haste_codegen::{AtomicRmwOp, Lane, TargetOpId, Type};
 
 use crate::body::BinOp;
 use crate::names::ItemRef;
@@ -27,6 +27,8 @@ pub enum Intrinsic {
     Ceil,
     Trunc,
     Copysign,
+    Fmin,
+    Fmax,
     Round(u8),
     FloatToInt,
     Transmute,
@@ -39,12 +41,17 @@ pub enum Intrinsic {
     Cpuid,
     /// `FnPtr::addr`, the address of a function pointer.
     FnAddr,
-    /// SSSE3 or AVX2 `pshufb` on a vector of this many bytes.
-    BytePermute(u8),
-    /// NEON `umaxp` on two vectors of 16 bytes.
-    BytePairMax,
-    /// An ARM64 NEON or SHA-256 intrinsic emitted inline.
-    Arm64(Arm64Intrinsic),
+    /// Dynamic 16-byte shuffle (`pshufb` when `tbl` is false, NEON `tbl1` when `tbl` is true).
+    ShuffleDyn {
+        tbl: bool,
+    },
+    /// AVX2 32-byte `pshufb`.
+    BytePermute32,
+    /// A target-specific SIMD instruction emitted via `TargetOpId`.
+    TargetOp {
+        id: TargetOpId,
+        ty: Type,
+    },
     /// An LLVM x86 intrinsic that a host function computes.
     X86(crate::host::X86Symbol),
     CatchUnwind,
@@ -147,37 +154,30 @@ pub enum Atomic {
     Exchange,
 }
 
-/// An ARM64 NEON or crypto intrinsic emitted inline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arm64Intrinsic {
-    Tbl1,
-    Sqdmulh2S,
-    Sqdmulh4S,
-    Sqdmulh8H,
-    Sha256H,
-    Sha256H2,
-    Sha256Su0,
-    Sha256Su1,
-}
-
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
-const LLVM: [(&str, Intrinsic); 11] = [
-    ("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)),
-    ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32)),
-    ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::BytePairMax),
-    ("llvm.aarch64.neon.tbl1.v16i8", Intrinsic::Arm64(Arm64Intrinsic::Tbl1)),
-    ("llvm.aarch64.neon.sqdmulh.v2i32", Intrinsic::Arm64(Arm64Intrinsic::Sqdmulh2S)),
-    ("llvm.aarch64.neon.sqdmulh.v4i32", Intrinsic::Arm64(Arm64Intrinsic::Sqdmulh4S)),
-    ("llvm.aarch64.neon.sqdmulh.v8i16", Intrinsic::Arm64(Arm64Intrinsic::Sqdmulh8H)),
-    ("llvm.aarch64.crypto.sha256h", Intrinsic::Arm64(Arm64Intrinsic::Sha256H)),
-    ("llvm.aarch64.crypto.sha256h2", Intrinsic::Arm64(Arm64Intrinsic::Sha256H2)),
-    ("llvm.aarch64.crypto.sha256su0", Intrinsic::Arm64(Arm64Intrinsic::Sha256Su0)),
-    ("llvm.aarch64.crypto.sha256su1", Intrinsic::Arm64(Arm64Intrinsic::Sha256Su1)),
+const LLVM: &[(&str, Intrinsic)] = &[
+    ("llvm.x86.ssse3.pshuf.b.128", Intrinsic::ShuffleDyn { tbl: false }),
+    ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute32),
+    ("llvm.x86.sse2.pavg.b", Intrinsic::TargetOp { id: TargetOpId::X64Pavgb, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
+    ("llvm.x86.sse2.pavg.w", Intrinsic::TargetOp { id: TargetOpId::X64Pavgw, ty: Type::Vec { lane: Lane::I16, count: 8 } }),
+    ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::TargetOp { id: TargetOpId::Arm64Umaxp, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
+    ("llvm.aarch64.neon.tbl1.v16i8", Intrinsic::ShuffleDyn { tbl: true }),
+    ("llvm.aarch64.neon.sqdmulh.v2i32", Intrinsic::TargetOp { id: TargetOpId::Arm64Sqdmulh, ty: Type::Vec { lane: Lane::I32, count: 2 } }),
+    ("llvm.aarch64.neon.sqdmulh.v4i32", Intrinsic::TargetOp { id: TargetOpId::Arm64Sqdmulh, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
+    ("llvm.aarch64.neon.sqdmulh.v8i16", Intrinsic::TargetOp { id: TargetOpId::Arm64Sqdmulh, ty: Type::Vec { lane: Lane::I16, count: 8 } }),
+    ("llvm.aarch64.crypto.sha256h", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256H, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
+    ("llvm.aarch64.crypto.sha256h2", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256H2, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
+    ("llvm.aarch64.crypto.sha256su0", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256Su0, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
+    ("llvm.aarch64.crypto.sha256su1", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256Su1, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
+    ("llvm.aarch64.crypto.aese", Intrinsic::TargetOp { id: TargetOpId::Arm64AesE, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
+    ("llvm.aarch64.crypto.aesd", Intrinsic::TargetOp { id: TargetOpId::Arm64AesD, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
+    ("llvm.aarch64.crypto.aesmc", Intrinsic::TargetOp { id: TargetOpId::Arm64AesMc, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
+    ("llvm.aarch64.crypto.aesimc", Intrinsic::TargetOp { id: TargetOpId::Arm64AesImc, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
 ];
 
-const NAMES: [(&str, Intrinsic); 161] = {
+const NAMES: &[(&str, Intrinsic)] = {
     use Intrinsic::*;
-    [
+    &[
         ("cold_path", NoOp),
         ("wrapping_add", WrappingAdd),
         ("wrapping_sub", WrappingSub),
@@ -208,6 +208,10 @@ const NAMES: [(&str, Intrinsic); 161] = {
         ("truncf64", Trunc),
         ("copysignf32", Copysign),
         ("copysignf64", Copysign),
+        ("minnumf32", Fmin),
+        ("minnumf64", Fmin),
+        ("maxnumf32", Fmax),
+        ("maxnumf64", Fmax),
         ("fabs", Fabs),
         ("sqrt", Sqrt),
         ("floor", Floor),

@@ -62,11 +62,15 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
+    fn retire(&mut self) -> Result<()> {
+        self.drop_to(0)?;
+        self.set_state(Coroutine::RETURNED)
+    }
+
     /// Ends the coroutine with `value`: returns `Poll::Ready(value)` after dropping what the body owns, and frees the frame.
     pub(super) fn resume_finish(&mut self, value: Option<Value>) -> Result<()> {
         let ready = self.poll_value("Ready", value)?;
-        self.drop_to(0)?;
-        self.set_state(Coroutine::RETURNED)?;
+        self.retire()?;
         self.return_poll(ready, true)
     }
 
@@ -179,7 +183,7 @@ impl Lower<'_, '_> {
     /// Suspends: records the resume point, returns `Poll::Pending`, and on resume takes the new call's arguments, then drops everything and ends when the call drops the coroutine, or polls again at `head`.
     fn suspend(&mut self, head: Block) -> Result<()> {
         let Some(count) = self.resume.as_ref().map(|resume| resume.resumes.len()) else { bail!("a suspension outside a resume function") };
-        self.set_state(Coroutine::FIRST_SUSPEND + count as i64)?;
+        self.set_state(Coroutine::suspend_state(count))?;
         let pending = self.poll_value("Pending", None)?;
         self.return_poll(pending, false)?;
         let block = self.b.create_block();
@@ -195,8 +199,7 @@ impl Lower<'_, '_> {
         let (dropping, again) = (self.b.create_block(), self.b.create_block());
         self.brif(dropped, (dropping, &[]), (again, &[]));
         self.enter(dropping);
-        self.drop_to(0)?;
-        self.set_state(Coroutine::RETURNED)?;
+        self.retire()?;
         let pending = self.poll_value("Pending", None)?;
         self.return_poll(pending, true)?;
         self.enter(again);

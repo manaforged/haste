@@ -98,16 +98,20 @@ impl HashMix {
     }
 }
 
-pub(super) fn type_code(ty: Type) -> u8 {
+pub(super) fn hash_type(mix: &mut HashMix, ty: Type) {
     match ty {
-        Type::I8 => 1,
-        Type::I16 => 2,
-        Type::I32 => 3,
-        Type::I64 => 4,
-        Type::I128 => 5,
-        Type::F32 => 6,
-        Type::F64 => 7,
-        Type::V128 => 8,
+        Type::I8 => mix.byte(1),
+        Type::I16 => mix.byte(2),
+        Type::I32 => mix.byte(3),
+        Type::I64 => mix.byte(4),
+        Type::I128 => mix.byte(5),
+        Type::F32 => mix.byte(6),
+        Type::F64 => mix.byte(7),
+        Type::Vec { lane, count } => {
+            mix.byte(8);
+            mix.byte(lane as u8);
+            mix.byte(count);
+        }
     }
 }
 
@@ -115,19 +119,19 @@ pub(super) fn hash_parts(mix: &mut HashMix, p: Parts) {
     match p {
         Parts::One(t) => {
             mix.byte(1);
-            mix.byte(type_code(t));
+            hash_type(mix, t);
         }
         Parts::Pair(a, b, off) => {
             mix.byte(2);
-            mix.byte(type_code(a));
-            mix.byte(type_code(b));
+            hash_type(mix, a);
+            hash_type(mix, b);
             mix.i32(off);
         }
         Parts::Words(words, len) => {
             mix.byte(4);
             mix.byte(len);
             for &(ty, off) in &words[..usize::from(len)] {
-                mix.byte(type_code(ty));
+                hash_type(mix, ty);
                 mix.i32(off);
             }
         }
@@ -144,7 +148,7 @@ pub(super) fn hash_repr(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty) -> Resu
         Repr::Zst => mix.byte(1),
         Repr::Scalar(t) => {
             mix.byte(2);
-            mix.byte(type_code(t));
+            hash_type(mix, t);
         }
         Repr::Mem { size, align, parts: p } => {
             mix.byte(3);
@@ -166,18 +170,17 @@ fn hash_purpose(mix: &mut HashMix, purpose: ArgumentPurpose) {
 
 pub(super) fn hash_sig(mix: &mut HashMix, sig: &Signature) {
     mix.byte(sig.call_conv as u8);
-    mix.u64(sig.readonly_params);
-    for &b in &sig.readonly_bytes {
-        mix.u32(b);
-    }
     mix.usize(sig.params.len());
     for p in &sig.params {
-        mix.byte(type_code(p.value_type));
+        hash_type(mix, p.value_type);
         hash_purpose(mix, p.purpose);
+        mix.bool(p.readonly);
+        mix.bool(p.noalias);
+        mix.u32(p.deref_bytes);
     }
     mix.usize(sig.returns.len());
     for r in &sig.returns {
-        mix.byte(type_code(r.value_type));
+        hash_type(mix, r.value_type);
         hash_purpose(mix, r.purpose);
     }
 }
@@ -420,7 +423,7 @@ fn hash_enum_encoding(cx: &mut Context<'_>, mix: &mut HashMix, item: ItemRef, la
                 if let Some((offset, ty, bits)) = tag_bits(cx, item, layout, v)? {
                     mix.byte(1);
                     mix.i32(offset);
-                    mix.byte(type_code(ty));
+                    hash_type(mix, ty);
                     mix.u128(bits);
                 } else {
                     mix.byte(0);

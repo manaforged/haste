@@ -1,5 +1,7 @@
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
+mod vector;
+
 /// `imm` of type `ty` extended to 64 bits, by its sign when `signed`.
 pub(crate) fn extend(imm: i64, ty: Type, signed: bool) -> i64 {
     let bits = ty.bits();
@@ -208,7 +210,7 @@ pub(crate) fn known_bits(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>
     }
 }
 
-struct Fold {
+pub(super) struct Fold {
     consts: Vec<Option<i64>>,
     subst: Vec<Value>,
     incoming: Vec<Option<Value>>,
@@ -217,11 +219,11 @@ struct Fold {
 }
 
 impl Fold {
-    fn find(&self, value: Value) -> Value {
+    pub(super) fn find(&self, value: Value) -> Value {
         crate::merge::find(&self.subst, value)
     }
 
-    fn known(&self, value: Value) -> Option<i64> {
+    pub(super) fn known(&self, value: Value) -> Option<i64> {
         self.consts[self.find(value).index()]
     }
 
@@ -247,7 +249,7 @@ impl Fold {
     }
 
     /// The operation of the instruction that defines `value`, when one in a block does.
-    fn def<'a>(&self, func: &'a Function, value: Value) -> Option<&'a Op> {
+    pub(super) fn def<'a>(&self, func: &'a Function, value: Value) -> Option<&'a Op> {
         self.defs[self.find(value).index()].map(|inst| &func.insts[inst.index()].op)
     }
 
@@ -257,7 +259,7 @@ impl Fold {
     }
 
     fn boolean_at(&self, func: &Function, value: Value, depth: u8) -> bool {
-        if depth >= 8 {
+        if depth >= 8 || func.ty(value).is_vector() {
             return false;
         }
         let is_01 = |v: Value| matches!(self.known(v), Some(0 | 1)) || self.boolean_at(func, v, depth + 1);
@@ -326,15 +328,12 @@ impl Fold {
                 }
                 None
             }
-            Op::Convert(kind @ (Convert::Bitcast | Convert::NarrowVec64), x) => match *self.def(func, x)? {
-                Op::Convert(inner, value)
-                    if (kind == Convert::Bitcast && inner == Convert::Bitcast && func.ty(value) != func.ty(x))
-                        || (kind == Convert::NarrowVec64 && inner == Convert::WidenVec64) =>
-                {
-                    Some(value)
-                }
+            Op::Convert(Convert::Bitcast, x) => match *self.def(func, x)? {
+                Op::Convert(Convert::Bitcast, value) if func.ty(value) != func.ty(x) => Some(value),
                 _ => None,
             },
+            Op::Extract(..) | Op::Shuffle(..) => vector::vec_identity(self, func, op),
+            Op::Binary(Binary::Fmin | Binary::Fmax, x, y) if self.find(x) == self.find(y) => Some(x),
             Op::Binary(kind, x, y) if func.ty(x).is_small_int() => self.neutral(func, kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
             Op::Unary(kind @ (Unary::Ineg | Unary::Bnot), x) => match *self.def(func, x)? {
                 Op::Unary(inner, value) if inner == kind => Some(value),
@@ -670,21 +669,28 @@ pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
     defs
 }
 
-/// Empties the blocks no path from `entry` reaches and returns which blocks a path reaches.
-pub(crate) fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
-    let reachable = func.reachable(entry);
+fn prune_changed(func: &mut Function, entry: Block) -> (Vec<bool>, bool) {
+    let reachable = crate::cfg::Cfg::from_entry(func, entry).reachable;
+    let mut changed = false;
     for (block, live) in func.blocks.iter_mut().zip(&reachable) {
         if !live && !block.insts.is_empty() {
             block.insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
+            changed = true;
         }
     }
-    reachable
+    (reachable, changed)
+}
+
+/// Empties the blocks no path from `entry` reaches and returns which blocks a path reaches.
+pub(crate) fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
+    prune_changed(func, entry).0
 }
 
 /// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
-fn dead(func: &mut Function) {
+fn dead(func: &mut Function) -> bool {
     let mut uses = func.use_counts();
     let mut keep = Vec::new();
+    let mut dropped = false;
     for block in func.blocks.iter_mut().rev() {
         keep.clear();
         keep.resize(block.insts.len(), true);
@@ -692,18 +698,17 @@ fn dead(func: &mut Function) {
             let data = &func.insts[inst.index()];
             if data.op.is_removable() && data.result.is_some_and(|result| uses[result.index()] == 0) {
                 keep[at] = false;
+                dropped = true;
                 data.op.for_operands(|value| uses[value.index()] -= 1);
             }
         }
         let mut at = 0;
-        block.insts.retain(|_| {
-            at += 1;
-            keep[at - 1]
-        });
+        block.insts.retain(|_| { at += 1; keep[at - 1] });
     }
+    dropped
 }
 
-fn fold_bitcast_loads(func: &mut Function) {
+fn fold_bitcast_loads(func: &mut Function) -> bool {
     let uses = func.use_counts();
     let defs = defs(func);
     let mut remap: Vec<Option<Value>> = vec![None; func.types.len()];
@@ -723,7 +728,7 @@ fn fold_bitcast_loads(func: &mut Function) {
         }
     }
     if remap.iter().all(Option::is_none) {
-        return;
+        return false;
     }
     for block in &mut func.blocks {
         block.insts.retain(|inst| !dropped[inst.index()]);
@@ -731,24 +736,27 @@ fn fold_bitcast_loads(func: &mut Function) {
             func.insts[inst.index()].op.map_operands(|v| remap[v.index()].unwrap_or(v));
         }
     }
+    true
 }
 
-/// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump.
-pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
-    let Some(entry) = func.entry else { return };
+/// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump; returns whether `func` was mutated.
+pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> bool {
+    let Some(entry) = func.entry else { return false };
     let count = func.types.len();
     let defs = defs(func);
     let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: vec![None; count], mixed: vec![false; count], defs };
     let pinned = pinned(func, entry);
-    let mut reachable = Vec::new();
+    let (mut reachable, mut changed) = (Vec::new(), false);
     loop {
         fold.constants(func);
         let settled = effort == crate::Effort::Full && reachable.is_empty() && crate::facts::settle(func, &fold.defs, &mut fold.consts);
         let branched = settled | fold.branches(func) | fold.thread(func, &pinned);
         if branched || reachable.is_empty() {
-            reachable = prune(func, entry);
+            let (r, pruned) = prune_changed(func, entry);
+            reachable = r; changed |= pruned;
         }
         let replaced = fold.params(func, &reachable, &pinned);
+        changed |= branched | replaced;
         if !branched && !replaced {
             break;
         }
@@ -756,41 +764,31 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
     drop_params(func, &fold);
     for block in &func.blocks {
         for inst in &block.insts {
-            func.insts[inst.index()].op.map_operands(|value| fold.find(value));
+            func.insts[inst.index()].op.map_operands(|v| { let n = fold.find(v); changed |= n != v; n });
             let replacement = match func.insts[inst.index()].op {
                 Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
                 Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
                 Op::Binary(Binary::Isub, x, y) if func.ty(x).is_small_int() && fold.known(x).is_some_and(|imm| extend(imm, func.ty(x), false) == 0) => Some(Op::Unary(Unary::Ineg, y)),
-                Op::Splat(x) if fold.known(x).is_some_and(|imm| (imm as u8) == 0) => Some(Op::Const(0)),
-                Op::Convert(Convert::WidenVec64, x) if is_zero_bits(func, &fold, x) => Some(Op::Const(0)),
-                _ => func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const),
+                _ => vector::vec_zero_fold(func, &fold, &func.insts[inst.index()].op)
+                    .or_else(|| func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const)),
             };
-            if let Some(op) = replacement {
+            if let Some(op) = replacement && func.insts[inst.index()].op != op {
                 func.insts[inst.index()].op = op;
+                changed = true;
             }
         }
     }
+    let snap = (!changed).then(|| (func.blocks.iter().map(|b| b.insts.clone()).collect::<Vec<_>>(), func.insts.iter().map(|d| d.op.clone()).collect::<Vec<_>>()));
     crate::algebra::rewrite(func, &fold.defs);
     crate::algebra::invert(func);
-    fold_bitcast_loads(func);
-    dead(func);
-    if fold.thread(func, &pinned) | fold.branches(func) {
-        prune(func, entry);
-        dead(func);
+    if let Some((b0, o0)) = snap {
+        changed = o0.len() != func.insts.len() || b0.iter().zip(&func.blocks).any(|(a, b)| *a != b.insts) || o0.iter().zip(&func.insts).any(|(a, b)| *a != b.op);
     }
-    if crate::algebra::devirt_vtables(func, &fold.defs) {
-        dead(func);
-    }
-    if crate::algebra::fold_bxor_conds(func) {
-        dead(func);
-    }
-}
-
-fn is_zero_bits(func: &Function, fold: &Fold, val: Value) -> bool {
-    let val = fold.find(val);
-    fold.known(val) == Some(0)
-        || matches!(fold.def(func, val), Some(&Op::Const(0)))
-        || matches!(fold.def(func, val), Some(&Op::Convert(Convert::Bitcast, z)) if fold.known(z) == Some(0) || matches!(fold.def(func, fold.find(z)), Some(&Op::Const(0))))
+    changed |= fold_bitcast_loads(func) | dead(func);
+    if fold.thread(func, &pinned) | fold.branches(func) { prune(func, entry); dead(func); changed = true; }
+    if crate::algebra::devirt_vtables(func, &fold.defs) { dead(func); changed = true; }
+    if crate::algebra::fold_bxor_conds(func) { dead(func); changed = true; }
+    changed
 }
 
 pub(crate) use crate::thread::compact;

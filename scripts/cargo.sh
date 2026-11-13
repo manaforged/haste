@@ -32,8 +32,10 @@ build_haste() {
         [ -n "$prev" ] && rm -f "$prev"
         return 1
     fi
-    [ -z "$prev" ] && return 0
-    if cmp -s "$bin" "$prev"; then mv -f "$prev" "$bin"; else rm -f "$prev"; fi
+    if [ -n "$prev" ]; then
+        if cmp -s "$bin" "$prev"; then mv -f "$prev" "$bin"; else rm -f "$prev"; fi
+    fi
+    if [ -x "$bin" ]; then export HASTE_BIN="$bin"; fi
 }
 run_haste() {
     if [ -n "${HASTE_BIN:-}" ]; then

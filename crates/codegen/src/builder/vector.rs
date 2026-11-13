@@ -1,58 +1,50 @@
 use super::Ins;
-use crate::ir::{ByteCC, Convert, Op, Sha256Op, Type, Value, VectorOp};
+use crate::ir::{Op, ReduceOp, ShuffleMask, TargetOpId, TinyArgs, Type, Value};
 
 impl Ins<'_> {
-    /// Zero-extending 64-bit float-register value `x` (`F64`) to a 128-bit vector (`V128`).
-    pub fn widen_vec64(self, x: Value) -> Value {
-        self.convert(Convert::WidenVec64, Type::V128, x)
+    /// Vector whose lanes all equal `scalar`.
+    pub fn splat(mut self, vec_ty: Type, scalar: Value) -> Value {
+        let zero = self.value(Op::Const(0), vec_ty);
+        let first = self.value(Op::Insert(zero, scalar, 0), vec_ty);
+        self.value(Op::Shuffle(first, first, ShuffleMask::Const([0; 16])), vec_ty)
     }
 
-    /// Low 64 bits of a 128-bit vector `x` (`V128`) as `F64`.
-    pub fn narrow_vec64(self, x: Value) -> Value {
-        self.convert(Convert::NarrowVec64, Type::F64, x)
+    /// Static lane permute across `a` (`0..count`) and `b` (`count..2*count`).
+    pub fn shuffle(mut self, a: Value, b: Value, mask: [u8; 16]) -> Value {
+        let ty = self.func.ty(a);
+        self.value(Op::Shuffle(a, b, ShuffleMask::Const(mask)), ty)
     }
 
-    /// The sixteen byte comparisons `cc` of vectors `x` and `y`.
-    pub fn byte_cmp(mut self, cc: ByteCC, x: Value, y: Value) -> Value {
-        self.value(Op::ByteCmp(cc, x, y), Type::V128)
+    /// Dynamic byte permute across `a` and `b` indexed by byte-vector `index`.
+    pub fn shuffle_dyn(mut self, a: Value, b: Value, index: Value) -> Value {
+        let ty = self.func.ty(a);
+        self.value(Op::Shuffle(a, b, ShuffleMask::Dyn(index)), ty)
     }
 
-    /// The vector whose sixteen bytes are all the byte `x`.
-    pub fn splat(mut self, x: Value) -> Value {
-        self.value(Op::Splat(x), Type::V128)
+    /// Extracts scalar lane `lane` from `vec`.
+    pub fn extract(mut self, vec: Value, lane: u8) -> Value {
+        let ty = self.func.ty(vec).lane().expect("extract requires a vector").to_type();
+        self.value(Op::Extract(vec, lane), ty)
     }
 
-    /// The 32-bit integer whose low sixteen bits are the top bits of the bytes of vector `x`.
-    pub fn movemask(mut self, x: Value) -> Value {
-        self.value(Op::Movemask(x), Type::I32)
+    /// Inserts `scalar` at lane `lane` of `vec`.
+    pub fn insert(mut self, vec: Value, scalar: Value, lane: u8) -> Value {
+        let ty = self.func.ty(vec);
+        self.value(Op::Insert(vec, scalar, lane), ty)
     }
 
-    /// The x64 vector instruction `op` on vectors `x` and `y`.
-    pub fn vector(mut self, op: VectorOp, x: Value, y: Value) -> Value {
-        self.value(Op::Vector(op, x, y), Type::V128)
+    /// Reduces `vec` horizontally according to `op`.
+    pub fn reduce(mut self, op: ReduceOp, vec: Value) -> Value {
+        let ty = match op {
+            ReduceOp::Movemask => Type::I32,
+            _ => self.func.ty(vec).lane().expect("reduce requires a vector").to_type(),
+        };
+        self.value(Op::Reduce(op, vec), ty)
     }
 
-    /// Two SHA-256 rounds on state vectors `x` and `y` with the message and constants in `k`, as `sha256rnds2` gives.
-    pub fn sha256_rounds(self, x: Value, y: Value, k: Value) -> Value {
-        self.sha256(Sha256Op::X86Rnds2, x, y, k)
-    }
-
-    /// One ARM64 `sha256h` hash update round over `(x, y, z)`.
-    pub fn arm64_sha256h(self, x: Value, y: Value, z: Value) -> Value {
-        self.sha256(Sha256Op::Arm64H, x, y, z)
-    }
-
-    /// One ARM64 `sha256h2` hash update round over `(x, y, z)`.
-    pub fn arm64_sha256h2(self, x: Value, y: Value, z: Value) -> Value {
-        self.sha256(Sha256Op::Arm64H2, x, y, z)
-    }
-
-    /// One ARM64 `sha256su1` message schedule update over `(x, y, z)`.
-    pub fn arm64_sha256su1(self, x: Value, y: Value, z: Value) -> Value {
-        self.sha256(Sha256Op::Arm64Su1, x, y, z)
-    }
-
-    fn sha256(mut self, op: Sha256Op, x: Value, y: Value, z: Value) -> Value {
-        self.value(Op::Sha256Rounds(op, x, y, z), Type::V128)
+    /// Emits a target-specific vector operation with 1 to 3 operands.
+    pub fn target_op(mut self, op: TargetOpId, ty: Type, args: &[Value]) -> Value {
+        let tiny = TinyArgs::from_slice(args).expect("target_op requires 1 to 3 arguments");
+        self.value(Op::TargetOp(op, tiny), ty)
     }
 }

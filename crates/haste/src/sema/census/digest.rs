@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use haste_codegen::{ArgumentPurpose, Signature};
+use haste_codegen::{ArgumentPurpose, Signature, Type};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::lower::{self, Parts, Repr, Slots, Word};
@@ -228,12 +228,29 @@ pub(super) fn hash_unsized_kind(cx: &mut Context<'_>, ty: Ty, mix: &mut Mix) {
     }
 }
 
+pub(super) fn hash_type(ty: Type, mix: &mut Mix) {
+    match ty {
+        Type::I8 => mix.byte(1),
+        Type::I16 => mix.byte(2),
+        Type::I32 => mix.byte(3),
+        Type::I64 => mix.byte(4),
+        Type::I128 => mix.byte(5),
+        Type::F32 => mix.byte(6),
+        Type::F64 => mix.byte(7),
+        Type::Vec { lane, count } => {
+            mix.byte(8);
+            mix.byte(lane as u8);
+            mix.byte(count);
+        }
+    }
+}
+
 pub(super) fn hash_repr(repr: &Repr, mix: &mut Mix) {
     match *repr {
         Repr::Zst => mix.byte(0),
         Repr::Scalar(ty) => {
             mix.byte(1);
-            mix.byte(ty as u8);
+            hash_type(ty, mix);
         }
         Repr::Mem { size, align, parts } => {
             mix.byte(2);
@@ -243,19 +260,19 @@ pub(super) fn hash_repr(repr: &Repr, mix: &mut Mix) {
                 Parts::Bytes => mix.byte(0),
                 Parts::One(ty) => {
                     mix.byte(1);
-                    mix.byte(ty as u8);
+                    hash_type(ty, mix);
                 }
                 Parts::Pair(a, b, off) => {
                     mix.byte(2);
-                    mix.byte(a as u8);
-                    mix.byte(b as u8);
+                    hash_type(a, mix);
+                    hash_type(b, mix);
                     mix.i32(off);
                 }
                 Parts::Words(words, len) => {
                     mix.byte(3);
                     mix.byte(len);
                     for &(ty, off) in &words[..usize::from(len)] {
-                        mix.byte(ty as u8);
+                        hash_type(ty, mix);
                         mix.i32(off);
                     }
                 }
@@ -275,12 +292,15 @@ fn hash_purpose(purpose: ArgumentPurpose, mix: &mut Mix) {
 pub(super) fn hash_signature(sig: &Signature, mix: &mut Mix) {
     mix.usize(sig.params.len());
     for param in &sig.params {
-        mix.byte(param.value_type as u8);
+        hash_type(param.value_type, mix);
         hash_purpose(param.purpose, mix);
+        mix.flag(param.readonly);
+        mix.flag(param.noalias);
+        mix.u32(param.deref_bytes);
     }
     mix.usize(sig.returns.len());
     for ret in &sig.returns {
-        mix.byte(ret.value_type as u8);
+        hash_type(ret.value_type, mix);
         hash_purpose(ret.purpose, mix);
     }
 }
@@ -295,16 +315,16 @@ pub(super) fn hash_num_tag(cx: &mut Context<'_>, ty: Ty, mix: &mut Mix) {
         (Kind::Prim(Primitive::Bool), _) => mix.byte(1),
         (Kind::Prim(Primitive::F32 | Primitive::F64), Some(m)) => {
             mix.byte(2);
-            mix.byte(m as u8);
+            hash_type(m, mix);
         }
         (Kind::Prim(prim), Some(m)) if int_info(*prim).is_some() => {
             mix.byte(3);
-            mix.byte(m as u8);
+            hash_type(m, mix);
             mix.flag(int_info(*prim).is_some_and(|(_, signed)| signed));
         }
         (_, Some(m)) => {
             mix.byte(4);
-            mix.byte(m as u8);
+            hash_type(m, mix);
         }
         _ => mix.byte(5),
     }

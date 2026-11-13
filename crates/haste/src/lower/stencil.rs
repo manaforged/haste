@@ -111,13 +111,12 @@ struct InlineTemplate {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CycleState {
     Acyclic,
-    CyclicIncomplete,
-    CyclicComplete,
+    Cyclic { complete: bool },
 }
 
 impl CycleState {
     fn is_complete(self) -> bool {
-        self != Self::CyclicIncomplete
+        matches!(self, Self::Acyclic | Self::Cyclic { complete: true })
     }
 }
 
@@ -194,8 +193,7 @@ impl TarjanRun {
         }
         let is_cyc = scc.len() > 1 || self_loop;
         let state = match (is_cyc, complete) {
-            (true, true) => Some(CycleState::CyclicComplete),
-            (true, false) => Some(CycleState::CyclicIncomplete),
+            (true, complete) => Some(CycleState::Cyclic { complete }),
             (false, true) => Some(CycleState::Acyclic),
             (false, false) => None,
         };
@@ -270,7 +268,12 @@ impl Bodies {
         }
         let mut shared = write_lock(&self.cyclic);
         for (node, state) in view.found {
-            shared.entry(node).or_insert(state);
+            match shared.get(&node).copied() {
+                Some(CycleState::Acyclic) | Some(CycleState::Cyclic { complete: true }) => {}
+                _ => {
+                    shared.insert(node, state);
+                }
+            }
         }
         shared.get(&root).is_some_and(|&st| st != CycleState::Acyclic)
     }
@@ -530,10 +533,11 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     let cycle = fp_cycle.min(ir_cycle);
     let base_h = fp_h.max(ir_h);
     let base_size = fp_sz.max(ir_sz) as usize;
+    let leaf = !plan_has_calls(&reloc_plan);
     let mut template = if reloc_plan.has_promoted() {
         None
     } else {
-        simplify_inline(func, limit).and_then(|(body, returns)| {
+        simplify_inline(func, limit, leaf).and_then(|(body, returns)| {
             let body_size = body.size();
             let grew = (base_size == 0 && body_size > 32) || (base_size > 0 && body_size.saturating_sub(base_size) > 16);
             let height = if grew { base_h.saturating_add(1) } else { base_h };
@@ -549,12 +553,24 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     Ok((template.map(|t| (footprint, t, Some(relocs))), cycle))
 }
 
-fn simplify_inline(mut func: Function, limit: usize) -> Option<(Arc<Function>, bool)> {
+fn plan_has_calls(plan: &RelocPlan) -> bool {
+    plan.steps.iter().any(|step| match step {
+        RelocStep::SiteSlot(_)
+        | RelocStep::VtableSlot { .. }
+        | RelocStep::Const(SymbolSource::Slot(_) | SymbolSource::Host(_)) => true,
+        RelocStep::SiteInline { plan, .. } => plan_has_calls(plan),
+        _ => false,
+    })
+}
+
+fn simplify_inline(mut func: Function, limit: usize, leaf: bool) -> Option<(Arc<Function>, bool)> {
     if func.is_coroutine() {
         return None;
     }
     haste_codegen::simplify(&mut func, crate::profile().into());
-    (func.can_inline() && func.size() <= limit).then(|| {
+    let release = crate::profile() == crate::outline::tree::Profile::Release;
+    let effective_limit = if release && leaf { limit.saturating_add(limit / 2).min(600).max(limit) } else { limit };
+    (func.can_inline() && func.size() <= effective_limit).then(|| {
         let returns = func.has_return();
         (Arc::new(func), returns)
     })
@@ -696,9 +712,18 @@ impl Lower<'_, '_> {
 
     pub(super) fn emit_const_rodata(&mut self, bytes: &[u8]) -> Value {
         let id = self.slots.rodata(bytes, &[]);
+        self.emit_rodata_id(id, bytes)
+    }
+
+    pub(super) fn emit_static_rodata(&mut self, index: usize, bytes: &[u8]) -> Value {
+        let id = self.slots.static_rodata(index, bytes);
+        self.emit_rodata_id(id, bytes)
+    }
+
+    fn emit_rodata_id(&mut self, id: RodataId, bytes: &[u8]) -> Value {
         let idx = self.relocs.len() as u32;
         let val = self.emit_symbol(SymbolSource::Rodata(id));
-        if matches!(self.mode, LowerMode::Stencil) && bytes.len() <= 64 {
+        if matches!(self.mode, LowerMode::Stencil) && bytes.len() <= 1024 {
             self.b.func.add_rodata_bytes(idx, bytes.to_vec());
         }
         val

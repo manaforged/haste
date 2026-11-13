@@ -1,4 +1,4 @@
-use crate::dom::dominates;
+use crate::cfg::{Cfg, dominates};
 use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
@@ -613,39 +613,22 @@ impl Path {
     }
 }
 
-/// The only block that branches to each block, for blocks with exactly one incoming edge.
-pub(crate) fn single_preds(func: &Function) -> Vec<Option<Block>> {
-    let mut single: Vec<Option<Option<Block>>> = vec![None; func.blocks.len()];
-    for block in 0..func.blocks.len() as u32 {
-        for target in func.successors(Block(block)) {
-            let slot = &mut single[target.index()];
-            *slot = match slot {
-                None => Some(Some(Block(block))),
-                Some(_) => Some(None),
-            };
-        }
-    }
-    if let Some(entry) = func.entry {
-        single[entry.index()] = Some(None);
-    }
-    single.into_iter().map(Option::flatten).collect()
-}
-
 /// Settles the compares, traps and branches that the facts on entry to each block and its earlier instructions decide: a settled compare's result becomes a constant in `consts`, a trap that cannot fire goes, and a settled branch becomes a jump. A block's facts on entry are its only predecessor's facts on exit plus that edge's branch. Returns whether anything changed.
 pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [Option<i64>]) -> bool {
     let Some(entry) = func.entry else { return false };
-    let (single, (order, _, idom)) = (single_preds(func), crate::dom::dominators(func, entry));
+    let cfg = Cfg::new(func);
+    let single: Vec<Option<Block>> = (0..func.blocks.len()).map(|b| cfg.single_pred(Block(b as u32))).collect();
     let (mut decided, mut compares) = (Vec::new(), Vec::new());
     {
-        let ranges = Ranges::new(func, (defs, consts), (&order, &single, &idom));
+        let ranges = Ranges::new(func, (defs, consts), (&cfg.rpo, &single, &cfg.idom));
         let mut exits: Vec<Option<Path>> = vec![None; func.blocks.len()];
-        for &block in &order {
+        for &block in &cfg.rpo {
             let mut path = match single[block.index()].and_then(|pred| exits[pred.index()].as_ref().map(|exit| (pred, exit.clone()))) {
                 Some((pred, mut path)) => {
                     path.follow(func, &ranges, pred, block);
                     path
                 }
-                None if block != entry => idom[block.index()].and_then(|d| exits[d.index()].clone()).unwrap_or_default(),
+                None if block != entry => cfg.idom[block.index()].and_then(|d| exits[d.index()].clone()).unwrap_or_default(),
                 None => Path::default(),
             };
             for &inst in &func.blocks[block.index()].insts {

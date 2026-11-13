@@ -211,7 +211,6 @@ fn classify_math(math: MathSymbol) -> Result<&'static str> {
         (Logf32, "logf"), (Logf64, "log"), (Log2f32, "log2f"), (Log2f64, "log2"),
         (Log10f32, "log10f"), (Log10f64, "log10"), (Powf32, "powf"), (Powf64, "pow"),
         (Fmaf32, "fmaf"), (Fmuladdf32, "fmaf"), (Fmaf64, "fma"), (Fmuladdf64, "fma"),
-        (Maxnumf32, "fmaxf"), (Maxnumf64, "fmax"), (Minnumf32, "fminf"), (Minnumf64, "fmin"),
         (RoundTiesEvenF32, "rintf"), (RoundTiesEvenF64, "rint"), (Fmodf32, "fmodf"), (Fmodf64, "fmod"),
     ];
     TABLE.iter().find(|&&(k, _)| k == math).map(|&(_, n)| n).with_context(|| format!("{} requires a self-contained powi shim", math.link_name()))

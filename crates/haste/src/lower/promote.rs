@@ -84,22 +84,50 @@ impl Lower<'_, '_> {
         Ok(Some(address))
     }
 
-    /// The place of the static `item` at `substs`, of type `ty`: the prepped library's copy when Haste shares it, whose value the library's loading set, else its cell, which the static's initializer fills on the first use that finds it empty.
+    fn is_mutable_static(&self, item: ItemRef) -> bool {
+        let (src, entry) = self.cx.item(item);
+        entry.name.is_none_or(|name| name == 0 || src.text(name - 1) == "mut")
+    }
+
+    fn static_rodata_bytes(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<Vec<u8>>> {
+        if self.cx.foreign(item) || self.cx.thread_local(item) || self.is_mutable_static(item) || !super::is_freeze_ty(self.cx, ty, 0) {
+            return Ok(None);
+        }
+        if self.cx.layout(ty)?.align.bytes() > 16 {
+            return Ok(None);
+        }
+        let Some((source, typed)) = self.literal_source(item, substs)? else { return Ok(None) };
+        let typed = typed.scoped(&self.cx.types);
+        let static_ty = typed.ret_ty();
+        if static_ty != ty {
+            return Ok(None);
+        }
+        let body = self.cx.body(source)?;
+        let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
+        let literal = Literal { body: &body, src, typed: &typed };
+        Ok(literal_bytes(self.cx, &literal, (root, static_ty)))
+    }
+
+    /// The place of the static `item` at `substs`, of type `ty`: the prepped library's copy when Haste shares it, immutable literal bytes in read-only data when eligible, else its cell, which the static's initializer fills on the first use that finds it empty.
     pub fn static_place(&mut self, (item, substs): (ItemRef, Substs), ty: Ty) -> Result<Place> {
         if let Some(address) = crate::prep::static_address(self.cx, item) {
             let base = self.emit_symbol(SymbolSource::Word(address as u64));
             return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
         }
         let index = self.reached_index(item, substs)?;
+        if let Some(bytes) = self.static_rodata_bytes(item, substs, ty)? {
+            let base = self.emit_static_rodata(index, &bytes);
+            return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
+        }
         let (address, size) = self.static_cell(index, ty)?;
         if !self.cx.foreign(item) && index != self.index {
-            let state = self.ins().load(Type::I8, address, size);
-            let filled = self.ins().icmp_imm(IntCC::Equal, state, crate::image::FILLED as i64);
+            let flag = self.ins().iadd_imm(address, i64::from(size));
+            let state = self.ins().atomic_load(Type::I8, flag);
+            let filled = self.ins().icmp_imm(IntCC::Equal, state, i64::from(crate::image::StaticInit::Filled as u8));
             let (fill, done) = (self.b.create_block(), self.b.create_block());
             self.brif(filled, (done, &[]), (fill, &[]));
             self.enter(fill);
             let usize_ty = self.cx.types.prim(Primitive::Usize);
-            let flag = self.ins().iadd_imm(address, i64::from(size));
             let table = self.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index)));
             let code = self.ins().load(Type::I64, table, 0);
             let once = self.emit_symbol(SymbolSource::Host(HostSymbol::FillOnce));
@@ -125,23 +153,14 @@ impl Lower<'_, '_> {
         Ok((address, size as i32))
     }
 
-    /// Marks the static that this function initializes as filled once its value is written, so that later uses read it without running this again.
-    fn mark_static(&mut self) -> Result<()> {
-        let (address, size) = self.static_cell(self.index, self.typed.ret_ty())?;
-        let one = self.ins().iconst(Type::I8, i64::from(crate::image::FILLED));
-        self.ins().store(one, address, size);
-        Ok(())
-    }
-
     /// Writes `value`, the value of the static that this function initializes, into the static's cell, and returns.
     pub fn fill_static(&mut self, value: Option<Value>) -> Result<()> {
         let ((item, substs), ty) = (self.reached.list[self.index].0, self.typed.ret_ty());
-        if self.open && crate::prep::static_address(self.cx, item).is_none() {
+        if self.open && crate::prep::static_address(self.cx, item).is_none() && self.static_rodata_bytes(item, substs, ty)?.is_none() {
             let place = self.static_place((item, substs), ty)?;
             if let Some(value) = value {
                 self.write(place, value);
             }
-            self.mark_static()?;
         }
         self.finish(None)
     }

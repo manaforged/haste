@@ -73,16 +73,16 @@ impl Image {
         if work.is_empty() {
             return Vec::new();
         }
-        if self.mode == super::ImageMode::Jit {
+        if self.backend.is_jit() {
             work.iter().for_each(|&index| self.slot(index).store(0, Ordering::Release));
         }
         let cfg = DictConfig::from_env();
         self.pass.stencils.cfg = cfg;
-        let block_parallel = !self.pass.stencils.templates.is_empty() && self.mode != super::ImageMode::Aot;
+        let block_parallel = !self.pass.stencils.templates.is_empty() && !self.backend.is_aot();
         let plan = (cfg, !block_parallel && !cfg.verify && cfg.min_fanout > 1);
         let buckets = bucket_work(reached, work);
         let jobs = crate::jobs();
-        let min_parallel = if self.mode == super::ImageMode::Aot { 4 } else { MIN_PARALLEL };
+        let min_parallel = if self.backend.is_aot() { 4 } else { MIN_PARALLEL };
         if jobs <= 1 || cfg.verify || work.len() < min_parallel || block_parallel {
             return self.compile_buckets(cx, reached, &buckets, plan);
         }
@@ -157,7 +157,7 @@ impl Image {
     /// Clears the slots of a worker that panicked, whose code chunks unmapped as it unwound, and gives each of its functions an error.
     fn lost(&self, cx: &Context<'_>, reached: &Reached, shard: &[Vec<usize>]) -> Vec<(usize, String)> {
         let lost = shard.iter().flatten().map(|&index| {
-            if self.mode == super::ImageMode::Jit {
+            if self.backend.is_jit() {
                 self.slot(index).store(0, Ordering::Release);
             }
             (index, format!("{}: compile worker panicked", cx.name(reached.list[index].0.0)))

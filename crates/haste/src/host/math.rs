@@ -64,10 +64,6 @@ math! {
     Fmaf64 = fmaf64(x: f64, y: f64, z: f64) -> f64 = x.mul_add(y, z);
     Fmuladdf32 = fmuladdf32(x: f32, y: f32, z: f32) -> f32 = x.mul_add(y, z);
     Fmuladdf64 = fmuladdf64(x: f64, y: f64, z: f64) -> f64 = x.mul_add(y, z);
-    Maxnumf32 = maxnumf32(x: f32, y: f32) -> f32 = x.max(y);
-    Maxnumf64 = maxnumf64(x: f64, y: f64) -> f64 = x.max(y);
-    Minnumf32 = minnumf32(x: f32, y: f32) -> f32 = x.min(y);
-    Minnumf64 = minnumf64(x: f64, y: f64) -> f64 = x.min(y);
     RoundTiesEvenF32 = round_ties_even_f32(x: f32) -> f32 = x.round_ties_even();
     RoundTiesEvenF64 = round_ties_even_f64(x: f64) -> f64 = x.round_ties_even();
     Fmodf32 = fmodf32(x: f32, y: f32) -> f32 = x % y;

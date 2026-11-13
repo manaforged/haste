@@ -6,6 +6,7 @@ mod fuse;
 mod int;
 mod location;
 mod vector;
+mod vector_ops;
 mod wide;
 
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
@@ -65,9 +66,13 @@ fn emit_save_pairs<T: Copy>(asm: &mut Asm, regs: &[T], base: usize, mut step: im
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
-    let Prepared { order, copied, abi, mut plan, frame, framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
+    let Prepared { order, copied, abi, mut plan, mut frame, mut framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
     let defs = crate::fold::defs(func);
+    let elided_before = plan.elided.iter().filter(|&&e| e).count();
     fuse::fuse(func, &mut plan);
+    if plan.elided.iter().filter(|&&e| e).count() != elided_before {
+        crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, packing))?;
+    }
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP]);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -556,7 +561,7 @@ impl Emit<'_> {
     fn stack_argument(&mut self, offset: u32, purpose: ArgumentPurpose, value: Value) {
         let to = Mem::new(SP, offset as i32);
         let bytes = self.ty(value).bytes();
-        if bytes < 8 && !self.ty(value).is_float() {
+        if bytes < 8 && !self.ty(value).in_float_register() {
             let reg = self.src(value, A, Ext::Zero);
             let width = if self.packing == Packing::Natural && purpose != ArgumentPurpose::Variadic { Size::of(bytes) } else { Size::X };
             self.asm.store(width, to, reg);

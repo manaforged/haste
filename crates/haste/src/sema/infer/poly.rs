@@ -19,10 +19,17 @@ use super::{Infer, Res, Typed};
 const MAX_ENV: usize = 256;
 const MAX_CONSTRAINT_DEPTH: u32 = 6;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::sema) enum PolyPhase {
+    #[default]
+    HeaderInit,
+    Active,
+    Fallback,
+}
+
 #[derive(Default)]
 pub(in crate::sema) struct PolyState {
-    pub env_ready: bool,
-    pub fallback: bool,
+    pub phase: PolyPhase,
     pub unsized_params: HashSet<u16>,
     pub assumptions: Vec<(ItemRef, Vec<Ty>)>,
     pub assoc_eqs: Vec<(ItemRef, Ty, Substs, String, Ty)>,
@@ -76,7 +83,7 @@ pub(super) fn zonk_poly_state(infer: &mut Infer<'_, '_>, poly: &mut PolyState) {
 
 fn finalize_summary(cx: &Context<'_>, typed: Typed, poly: Option<Box<PolyState>>, clean: bool, param_count: u16) -> SummaryKind {
     let Some(mut poly) = poly else { return SummaryKind::MonomorphicFallback };
-    if poly.fallback || !clean || has_param_closure(cx, &typed) {
+    if poly.phase == PolyPhase::Fallback || !clean || has_param_closure(cx, &typed) {
         return SummaryKind::MonomorphicFallback;
     }
     collect_remaining_projs(&cx.types, &mut poly, &typed);
@@ -254,7 +261,7 @@ fn collect_remaining_projs(types: &Types, state: &mut PolyState, typed: &Typed) 
 impl Infer<'_, '_> {
     pub(super) fn poly_fallback(&mut self) {
         if let Some(poly) = &mut self.poly {
-            poly.fallback = true;
+            poly.phase = PolyPhase::Fallback;
         }
     }
 
@@ -268,8 +275,10 @@ impl Infer<'_, '_> {
             self.push_assumption(own);
         }
         self.collect_header_env()?;
-        if let Some(poly) = &mut self.poly {
-            poly.env_ready = true;
+        if let Some(poly) = &mut self.poly
+            && poly.phase == PolyPhase::HeaderInit
+        {
+            poly.phase = PolyPhase::Active;
         }
         self.close_poly_env()?;
         self.prune_sized_params();

@@ -95,22 +95,27 @@ fn expand_copy(func: &mut Function, defs: &[Option<Inst>], slots: &[Option<(Stac
 }
 
 /// Replaces each `memset` of a constant byte and small constant size by stores, and scalarizes small constant-length `Copy` operations, so promotion sees the bytes they access.
-pub(crate) fn run(func: &mut Function) {
+pub(crate) fn run(func: &mut Function) -> bool {
     if !func.insts.iter().any(|data| matches!(data.op, Op::Runtime(RuntimeSymbol::Memset) | Op::Copy(..))) {
-        return;
+        return false;
     }
     let defs = defs(func);
     let (slots, _) = func.slot_offsets(|v| known(func, &defs, v, DEPTH));
+    let mut changed = false;
     for block in 0..func.blocks.len() {
         let insts = std::mem::take(&mut func.blocks[block].insts);
         let mut out = Vec::with_capacity(insts.len());
         for inst in insts {
             if let Some(found) = fill(func, &defs, inst) {
                 stores(func, &slots, found, &mut out);
-            } else if !expand_copy(func, &defs, &slots, inst, &mut out) {
+                changed = true;
+            } else if expand_copy(func, &defs, &slots, inst, &mut out) {
+                changed = true;
+            } else {
                 out.push(inst);
             }
         }
         func.blocks[block].insts = out;
     }
+    changed
 }

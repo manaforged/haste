@@ -1,4 +1,4 @@
-use crate::dom::{dominates, dominators};
+use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};
 use crate::ir::{Binary, Block, BlockData, Function, Inst, IntCC, Op, Type, Value};
 
@@ -97,7 +97,17 @@ fn single_outside_pred(func: &Function, head: Block, back_pred: Block) -> Option
     found
 }
 
-fn unroll_self(func: &mut Function, b: usize, cond: Value, back_on_true: bool, back_args: Vec<Value>, exit_blk: Block, exit_args: Vec<Value>, global_consts: &[Option<i64>]) -> bool {
+fn unroll_self(
+    func: &mut Function,
+    cfg: &Cfg,
+    b: usize,
+    cond: Value,
+    back_on_true: bool,
+    back_args: Vec<Value>,
+    exit_blk: Block,
+    exit_args: Vec<Value>,
+    global_consts: &[Option<i64>],
+) -> bool {
     let head = Block(b as u32);
     let inst_count = func.blocks[b].insts.len();
     if inst_count > 48 {
@@ -109,7 +119,7 @@ fn unroll_self(func: &mut Function, b: usize, cond: Value, back_on_true: bool, b
     }
     let mut cur_params: Vec<Option<i64>> = init_args.iter().map(|v| global_consts[v.index()]).collect();
     let mut proven = None;
-    for step in 0..4_usize {
+    for step in 0..=16_usize {
         let mut env = global_consts.to_vec();
         eval_block(func, b, &cur_params, &mut env);
         let Some(cond_val) = env[cond.index()] else { break };
@@ -121,14 +131,14 @@ fn unroll_self(func: &mut Function, b: usize, cond: Value, back_on_true: bool, b
         }
     }
     let Some(back_steps) = proven else {
-        return unroll_self_dynamic(func, b, cond, back_on_true, &back_args, exit_blk, global_consts);
+        return unroll_self_dynamic(func, cfg, b, cond, back_on_true, &back_args, exit_blk, global_consts);
     };
     let last = *func.blocks[b].insts.last().unwrap_or(&Inst(0));
     if back_steps == 0 {
         func.insts[last.index()].op = Op::Jump(exit_blk, exit_args);
         return true;
     }
-    if (back_steps + 1) * inst_count > 96 {
+    if (back_steps + 1) * inst_count > 192 {
         return false;
     }
     let body_insts = func.blocks[b].insts[..inst_count - 1].to_vec();
@@ -163,6 +173,7 @@ fn match_iv_step(func: &Function, b: usize, body_insts: &[Inst], back_args: &[Va
 
 fn unroll_self_dynamic(
     func: &mut Function,
+    cfg: &Cfg,
     b: usize,
     cond: Value,
     back_on_true: bool,
@@ -172,8 +183,8 @@ fn unroll_self_dynamic(
 ) -> bool {
     let head = Block(b as u32);
     let inst_count = func.blocks[b].insts.len();
-    if inst_count > 28
-        || func.blocks[b].params.len() > 3
+    if inst_count > 36
+        || func.blocks[b].params.len() > 8
         || back_args.len() != func.blocks[b].params.len()
         || func.successors(exit_blk).any(|t| t == exit_blk)
     {
@@ -202,8 +213,6 @@ fn unroll_self_dynamic(
     if !func.blocks[out_blk].insts.last().is_some_and(|&last| matches!(func.insts[last.index()].op, Op::Jump(..) | Op::Brif(..))) {
         return false;
     }
-    let Some(entry) = func.entry else { return false };
-    let (_, _, idom) = dominators(func, entry);
     for ob in 0..func.blocks.len() {
         if ob == b {
             continue;
@@ -212,7 +221,7 @@ fn unroll_self_dynamic(
         for &inst in &func.blocks[ob].insts {
             func.insts[inst.index()].op.for_operands(|v| escapes |= head_defs[v.index()]);
         }
-        if escapes && (ob == out_blk || !dominates(&idom, head, Block(ob as u32))) {
+        if escapes && (ob == out_blk || !cfg.dominates(head, Block(ob as u32))) {
             return false;
         }
     }
@@ -315,47 +324,47 @@ fn unroll_self_dynamic(
     true
 }
 
-fn match_two_block(func: &Function, entry: Block, preds: &[u32], head: Block, body_blk: Block, body_args: &[Value], exit_blk: Block) -> Option<Vec<Value>> {
-    if body_blk == head || body_blk == entry || exit_blk == head || exit_blk == body_blk {
-        return None;
-    }
-    if preds[body_blk.index()] != 1 || func.blocks[body_blk.index()].insts.is_empty() {
-        return None;
-    }
-    if func.blocks[head.index()].insts.len() + func.blocks[body_blk.index()].insts.len() > 48 {
-        return None;
-    }
-    if body_args.len() != func.blocks[body_blk.index()].params.len() || has_bad_non_term(func, body_blk.index()) {
-        return None;
-    }
-    let last = *func.blocks[body_blk.index()].insts.last()?;
-    let Op::Jump(back_target, back_args) = &func.insts[last.index()].op else { return None };
-    (*back_target == head && back_args.len() == func.blocks[head.index()].params.len()).then(|| back_args.clone())
-}
-
 fn unroll_two_block(
     func: &mut Function,
-    entry: Block,
-    preds: &[u32],
-    b: usize,
+    cfg: &Cfg,
+    each: &Loop,
     cond: Value,
     (t_blk, t_args, f_blk, f_args): (Block, Vec<Value>, Block, Vec<Value>),
     global_consts: &[Option<i64>],
 ) -> bool {
-    let head = Block(b as u32);
-    let candidates = [(true, t_blk, t_args.clone(), f_blk, f_args.clone()), (false, f_blk, f_args, t_blk, t_args)];
-    let Some((body_on_true, body_blk, body_args, exit_blk, exit_args, back_args)) = candidates.into_iter().find_map(|(bot, bb, ba, eb, ea)| {
-        match_two_block(func, entry, preds, head, bb, &ba, eb).map(|back| (bot, bb, ba, eb, ea, back))
-    }) else {
+    let head = each.head;
+    let b = head.index();
+    let body_blk = each.latches[0];
+    let (body_on_true, body_args, exit_blk, exit_args) = if t_blk == body_blk {
+        (true, t_args, f_blk, f_args)
+    } else if f_blk == body_blk {
+        (false, f_args, t_blk, t_args)
+    } else {
         return false;
     };
+    if func.entry == Some(body_blk)
+        || each.body.get(exit_blk.index()).copied().unwrap_or(false)
+        || cfg.pred_count(body_blk) != 1
+        || func.blocks[body_blk.index()].insts.is_empty()
+        || func.blocks[b].insts.len() + func.blocks[body_blk.index()].insts.len() > 48
+        || body_args.len() != func.blocks[body_blk.index()].params.len()
+        || has_bad_non_term(func, body_blk.index())
+    {
+        return false;
+    }
+    let Some(&body_last) = func.blocks[body_blk.index()].insts.last() else { return false };
+    let Op::Jump(back_target, back_args) = &func.insts[body_last.index()].op else { return false };
+    if *back_target != head || back_args.len() != func.blocks[b].params.len() {
+        return false;
+    }
+    let back_args = back_args.clone();
     let Some(init_args) = single_outside_pred(func, head, body_blk) else { return false };
     if init_args.len() != func.blocks[b].params.len() {
         return false;
     }
     let mut cur_head_params: Vec<Option<i64>> = init_args.iter().map(|v| global_consts[v.index()]).collect();
     let mut proven = None;
-    for step in 0..=4_usize {
+    for step in 0..=8_usize {
         let mut env = global_consts.to_vec();
         eval_block(func, b, &cur_head_params, &mut env);
         let Some(cond_val) = env[cond.index()] else { break };
@@ -363,7 +372,7 @@ fn unroll_two_block(
             proven = Some(step);
             break;
         }
-        if step == 4 {
+        if step == 8 {
             break;
         }
         let body_params: Vec<Option<i64>> = body_args.iter().map(|v| env[v.index()]).collect();
@@ -379,7 +388,7 @@ fn unroll_two_block(
         retire_block(func, body_blk.index());
         return true;
     }
-    if head_len + trips * (head_len + body_len) > 96 {
+    if head_len + trips * (head_len + body_len) > 192 {
         return false;
     }
     let head_non_term = func.blocks[b].insts[..head_len - 1].to_vec();
@@ -407,13 +416,13 @@ fn unroll_two_block(
     true
 }
 
-/// Unrolls 1-block and 2-block natural loops with a statically provable constant trip count in `0..=4`.
+/// Unrolls 1-block and 2-block natural loops with a statically provable constant trip count (`0..=16` / `0..=8`) or dynamic counted loops.
 pub(crate) fn run(func: &mut Function) -> bool {
     let Some(entry) = func.entry else { return false };
-    let preds = func.pred_counts();
-    let (order, _, _) = dominators(func, entry);
+    let mut cfg = Cfg::new(func);
+    let loops = cfg.loops(func);
     let mut global_consts = vec![None; func.types.len()];
-    for &blk in &order {
+    for &blk in &cfg.rpo {
         for &inst in &func.blocks[blk.index()].insts {
             let data = &func.insts[inst.index()];
             let Some(res) = data.result else { continue };
@@ -422,11 +431,19 @@ pub(crate) fn run(func: &mut Function) -> bool {
             }
         }
     }
-    let initial_blocks = func.blocks.len();
     let mut changed = false;
-    for b in 0..initial_blocks {
-        let head = Block(b as u32);
-        if head == entry || preds[b] != 2 || func.blocks[b].insts.is_empty() || has_bad_non_term(func, b) {
+    let mut dirty = false;
+    for each in &loops.list {
+        let head = each.head;
+        let b = head.index();
+        if head == entry || each.size > 2 || each.latches.len() != 1 || func.blocks[b].insts.is_empty() || has_bad_non_term(func, b) {
+            continue;
+        }
+        if dirty {
+            cfg = Cfg::new(func);
+            dirty = false;
+        }
+        if cfg.pred_count(head) != 2 {
             continue;
         }
         let Some(&last) = func.blocks[b].insts.last() else { continue };
@@ -436,13 +453,21 @@ pub(crate) fn run(func: &mut Function) -> bool {
         }
         let (cond, t_blk, t_args, f_blk, f_args) = (*cond, *t_blk, t_args.clone(), *f_blk, f_args.clone());
         global_consts.resize(func.types.len(), None);
-        if t_blk == head {
-            changed |= unroll_self(func, b, cond, true, t_args, f_blk, f_args, &global_consts);
-        } else if f_blk == head {
-            changed |= unroll_self(func, b, cond, false, f_args, t_blk, t_args, &global_consts);
+        let did = if each.size == 1 && each.latches[0] == head {
+            if t_blk == head {
+                unroll_self(func, &cfg, b, cond, true, t_args, f_blk, f_args, &global_consts)
+            } else if f_blk == head {
+                unroll_self(func, &cfg, b, cond, false, f_args, t_blk, t_args, &global_consts)
+            } else {
+                false
+            }
+        } else if each.size == 2 && each.latches[0] != head {
+            unroll_two_block(func, &cfg, each, cond, (t_blk, t_args, f_blk, f_args), &global_consts)
         } else {
-            changed |= unroll_two_block(func, entry, &preds, b, cond, (t_blk, t_args, f_blk, f_args), &global_consts);
-        }
+            false
+        };
+        changed |= did;
+        dirty |= did;
     }
     changed
 }

@@ -74,6 +74,10 @@ pub trait Slots {
         self.data(bytes);
         RodataId(0)
     }
+    /// Interns read-only bytes for immutable static `index` without deduplicating across distinct statics.
+    fn static_rodata(&self, _index: usize, bytes: &[u8]) -> RodataId {
+        self.rodata(bytes, &[])
+    }
     /// Whether calls may inline bodies through this image.
     fn allow_inline(&self) -> bool {
         true
@@ -193,6 +197,27 @@ pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
     signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))
 }
 
+fn ref_abi_param(cx: &mut Context<'_>, abi: AbiParam, param: Ty, thin: bool) -> AbiParam {
+    let Kind::Ref(mutability, inner) = *cx.types.kind(param) else {
+        return abi;
+    };
+    if mutability == crate::sema::ty::Mut::Mut {
+        return abi.with_noalias();
+    }
+    if thin {
+        if let Some(bytes) = freeze_pointee_bytes(cx, inner) {
+            return abi.with_deref_bytes(bytes);
+        }
+        return abi;
+    }
+    let immutable = match *cx.types.kind(inner) {
+        Kind::Slice(elem) => is_freeze_ty(cx, elem, 0),
+        Kind::Prim(Primitive::Str) => true,
+        _ => false,
+    };
+    if immutable { abi.with_readonly() } else { abi }
+}
+
 /// The native signature of a function that returns `ret` and takes `params`.
 pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIterator<Item = Ty>) -> Result<Signature> {
     let mut signature = Signature::new(CallConv::Internal);
@@ -201,26 +226,32 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
             Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
             Repr::Mem { .. } => match passed_parts(cx, ret)? {
                 Some(parts) => signature.returns.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
-                None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn)),
+                None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn).with_noalias()),
             },
             Repr::Zst => {}
         }
     }
     for param in params {
-        let sig_idx = signature.params.len();
         match repr(cx, param)? {
             Repr::Scalar(ty) => {
-                if ty == Type::I64
-                    && let Kind::Ref(crate::sema::ty::Mut::Not, inner) = *cx.types.kind(param)
-                    && let Some(bytes) = freeze_pointee_bytes(cx, inner)
-                {
-                    signature.mark_readonly(sig_idx);
-                    signature.mark_readonly_bytes(sig_idx, bytes);
+                let mut abi = AbiParam::new(ty);
+                if ty == Type::I64 {
+                    abi = ref_abi_param(cx, abi, param, true);
                 }
-                signature.params.push(AbiParam::new(ty));
+                signature.params.push(abi);
             }
             Repr::Mem { .. } => match passed_parts(cx, param)? {
-                Some(parts) => signature.params.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
+                Some(parts) => {
+                    let mut first = true;
+                    for (machine, _) in parts.scalars() {
+                        let mut abi = AbiParam::new(machine);
+                        if first {
+                            abi = ref_abi_param(cx, abi, param, false);
+                            first = false;
+                        }
+                        signature.params.push(abi);
+                    }
+                }
                 None => signature.params.push(AbiParam::new(Type::I64)),
             },
             Repr::Zst => {}

@@ -396,6 +396,7 @@ fn eval_body_footprint(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn S
     match &typed.tables {
         LazyTables::Poly(poly) => eval_poly_body(cx, (reached, slots), inline, mix, index, &plan, typed, poly, cycle_root),
         LazyTables::Eager(tables) => eval_eager_body(cx, (reached, slots), inline, mix, index, &plan, typed, tables, cycle_root),
+        LazyTables::CheckOnly(_) => bail!("cannot lower check-only sysroot instance"),
     }
 }
 

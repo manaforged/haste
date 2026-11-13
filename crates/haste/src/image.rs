@@ -42,6 +42,58 @@ pub enum ImageMode {
     Check,
 }
 
+pub(super) enum ImageBackend {
+    Check,
+    EagerJit { fast: bool },
+    LazyJit { fast: bool },
+    Aot(Mutex<aot::AotState>),
+}
+
+impl ImageBackend {
+    fn from_mode(mode: ImageMode, reached_len: usize) -> Self {
+        match mode {
+            ImageMode::Check => Self::Check,
+            ImageMode::Jit => Self::EagerJit { fast: false },
+            ImageMode::Aot => Self::Aot(aot::AotState::new(reached_len)),
+        }
+    }
+
+    pub(super) fn mode(&self) -> ImageMode {
+        match self {
+            Self::Check => ImageMode::Check,
+            Self::EagerJit { .. } | Self::LazyJit { .. } => ImageMode::Jit,
+            Self::Aot(_) => ImageMode::Aot,
+        }
+    }
+
+    pub(super) fn is_jit(&self) -> bool {
+        matches!(self, Self::EagerJit { .. } | Self::LazyJit { .. })
+    }
+
+    pub(super) fn is_lazy_jit(&self) -> bool {
+        matches!(self, Self::LazyJit { .. })
+    }
+
+    pub(super) fn is_fast_jit(&self) -> bool {
+        matches!(self, Self::EagerJit { fast: true } | Self::LazyJit { fast: true })
+    }
+
+    pub(super) fn is_aot(&self) -> bool {
+        matches!(self, Self::Aot(_))
+    }
+
+    pub(super) fn is_check(&self) -> bool {
+        matches!(self, Self::Check)
+    }
+
+    pub(super) fn aot(&self) -> Option<&Mutex<aot::AotState>> {
+        match self {
+            Self::Aot(state) => Some(state),
+            _ => None,
+        }
+    }
+}
+
 /// The call table, code memory and data of the running program, in memory shared with children forked from this process, and the cells the program writes, in memory each run holds its own copy of.
 pub struct Image {
     table: usize,
@@ -58,6 +110,7 @@ pub struct Image {
     registered: AtomicUsize,
     cells: Mutex<HashMap<usize, i64>>,
     rodata_map: Mutex<HashMap<(Vec<u8>, Vec<lower::RodataReloc>), lower::RodataId>>,
+    static_rodata: Mutex<HashMap<usize, lower::RodataId>>,
     rodata_addrs: Mutex<Vec<u64>>,
     vtable_map: Mutex<HashMap<Vec<lower::VtableEntry>, lower::VtableId>>,
     vtable_addrs: Mutex<Vec<u64>>,
@@ -66,10 +119,7 @@ pub struct Image {
     thread_slots: Mutex<HashMap<usize, u64>>,
     wanted: Mutex<Vec<Instance>>,
     bodies: lower::Bodies,
-    mode: ImageMode,
-    jit_mode: bool,
-    fast_jit: bool,
-    aot: Option<Mutex<aot::AotState>>,
+    backend: ImageBackend,
 }
 
 /// What one compile pass writes: its code memory, its stencil cache, and sparse `(index, size, ns)` records.
@@ -120,7 +170,7 @@ impl Image {
 
 impl Slots for Image {
     fn entry(&self, index: usize) -> i64 {
-        if self.mode != ImageMode::Jit {
+        if !self.backend.is_jit() {
             return (self.table + index * size_of::<AtomicUsize>()) as i64;
         }
         self.slot(index) as *const AtomicUsize as i64
@@ -140,12 +190,12 @@ impl Slots for Image {
         }
         let value = |word: &Word| match *word {
             Word::Int(value) => value,
-            Word::Code(index) if self.mode == ImageMode::Jit => self.slot(index).load(Ordering::Acquire) as u64,
+            Word::Code(index) if self.backend.is_jit() => self.slot(index).load(Ordering::Acquire) as u64,
             Word::Code(_) => 0,
         };
         let bytes: Vec<u8> = words.iter().flat_map(|word| value(word).to_le_bytes()).collect();
         let address = self.data(&bytes);
-        if self.mode == ImageMode::Jit {
+        if self.backend.is_jit() {
             let mut fixups = lock(&self.fixups);
             for (at, word) in words.iter().enumerate() {
                 if let Word::Code(index) = *word {
@@ -165,7 +215,7 @@ impl Slots for Image {
     }
 
     fn want(&self, instance: Instance) {
-        if self.jit_mode {
+        if self.backend.is_lazy_jit() {
             lock(&self.wanted).push(instance);
         }
     }
@@ -179,7 +229,12 @@ impl Slots for Image {
     }
 
     fn allow_inline(&self) -> bool {
-        self.mode != ImageMode::Check && !self.fast_jit && (!self.jit_mode || crate::profile() == crate::outline::tree::Profile::Release)
+        match &self.backend {
+            ImageBackend::Check => false,
+            ImageBackend::EagerJit { fast } => !fast,
+            ImageBackend::LazyJit { fast } => !fast && crate::profile() == crate::outline::tree::Profile::Release,
+            ImageBackend::Aot(_) => true,
+        }
     }
 
     fn cell(&self, index: usize, size: u32) -> i64 {
@@ -189,7 +244,7 @@ impl Slots for Image {
         }
         let address = self.zeroed(size as usize + 1);
         cells.insert(index, address);
-        if let Some(aot) = &self.aot {
+        if let Some(aot) = self.aot() {
             lock(aot).statics.entry(index).or_insert(aot::AotStatic::Local(size));
         }
         address
@@ -201,6 +256,10 @@ impl Slots for Image {
 
     fn rodata(&self, bytes: &[u8], relocs: &[lower::RodataReloc]) -> lower::RodataId {
         self.intern_rodata(bytes, relocs)
+    }
+
+    fn static_rodata(&self, index: usize, bytes: &[u8]) -> lower::RodataId {
+        self.intern_static_rodata(index, bytes)
     }
 
     fn vtable_id(&self, entries: &[lower::VtableEntry]) -> lower::VtableId {
@@ -262,6 +321,7 @@ impl Image {
             registered: AtomicUsize::new(0),
             cells: Mutex::default(),
             rodata_map: Mutex::default(),
+            static_rodata: Mutex::default(),
             rodata_addrs: Mutex::default(),
             vtable_map: Mutex::default(),
             vtable_addrs: Mutex::default(),
@@ -270,20 +330,21 @@ impl Image {
             thread_slots: Mutex::default(),
             wanted: Mutex::default(),
             bodies: lower::Bodies::default(),
-            mode,
-            jit_mode: false,
-            fast_jit: false,
-            aot: (mode == ImageMode::Aot).then(|| aot::AotState::new(reached.list.len())),
+            backend: ImageBackend::from_mode(mode, reached.list.len()),
         })
     }
 
+    pub(super) fn aot(&self) -> Option<&Mutex<aot::AotState>> {
+        self.backend.aot()
+    }
+
     pub(super) fn compile_target(&self) -> haste_codegen::Target {
-        let base = if self.fast_jit {
+        let base = if self.backend.is_fast_jit() {
             haste_codegen::Target::host().effort(haste_codegen::Effort::Quick)
         } else {
             crate::host_target()
         };
-        base.direct_calls(self.mode == ImageMode::Aot)
+        base.direct_calls(self.backend.is_aot())
     }
 
     /// The encoded machine-code byte length of each reached function, or zero when not compiled.
@@ -351,7 +412,7 @@ impl Image {
         let mut broken = HashMap::default();
         let mut wave = Vec::new();
         loop {
-            if let Some(aot) = &image.aot {
+            if let Some(aot) = image.aot() {
                 let state = lock(aot);
                 reach.drain(&state, Some((&compiled, &mut wave)));
             }
@@ -384,7 +445,7 @@ impl Image {
             self.sizes.resize(reached.list.len(), 0);
             self.times.resize(reached.list.len(), 0);
         }
-        if let Some(aot) = &self.aot {
+        if let Some(aot) = self.aot() {
             lock(aot).ensure_len(reached.list.len());
         }
         if reset {
@@ -404,10 +465,10 @@ impl Image {
             }
             match resolve_host_symbol(cx, item) {
                 Ok((sym, address)) if !lower::is_static(cx, item) => {
-                    if self.mode == ImageMode::Jit {
+                    if self.backend.is_jit() {
                         self.slot(index).store(address, Ordering::Release);
                     }
-                    if let Some(aot) = &self.aot {
+                    if let Some(aot) = self.aot() {
                         lock(aot).foreign_fns.insert(index, sym);
                     }
                 }
@@ -437,14 +498,14 @@ impl Image {
                 (Err(_), false) => continue,
             };
             lock(&self.cells).insert(index, cell);
-            if let Some(aot) = &self.aot {
+            if let Some(aot) = self.aot() {
                 lock(aot).statics.insert(index, aot::AotStatic::Foreign { weak: is_weak, host });
             }
         }
     }
 
     fn link(&self) {
-        if self.mode != ImageMode::Jit {
+        if !self.backend.is_jit() {
             return;
         }
         for (&index, addresses) in lock(&self.fixups).iter() {
@@ -454,7 +515,7 @@ impl Image {
 
     /// Points slot `index` at `code` and rewrites every constant table word that names it, so neither a call through the slot nor one through a table reaches its stub again.
     fn publish(&self, index: usize, code: usize) {
-        if self.mode != ImageMode::Jit {
+        if !self.backend.is_jit() {
             return;
         }
         self.slot(index).store(code, Ordering::SeqCst);
@@ -549,10 +610,29 @@ pub(crate) fn interrupted(status: i32) -> bool {
     [libc::SIGHUP, libc::SIGINT, libc::SIGKILL, libc::SIGTERM].iter().any(|&signal| status == 128 + signal)
 }
 
-/// The state byte of a static whose initializer has written its value.
-pub(crate) const FILLED: u8 = 1;
-const EMPTY: u8 = 0;
-const FILLING: u8 = 2;
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaticInit {
+    Empty = 0,
+    Filled = 1,
+    Filling = 2,
+    Poisoned = 3,
+}
+
+struct FillGuard<'a> {
+    state: &'a std::sync::atomic::AtomicU8,
+    flag: usize,
+    done: bool,
+}
+
+impl Drop for FillGuard<'_> {
+    fn drop(&mut self) {
+        thread_state().filling.retain(|&at| at != self.flag);
+        if !self.done {
+            self.state.store(StaticInit::Poisoned as u8, Ordering::Release);
+        }
+    }
+}
 
 /// What the host keeps for each thread of the program: its cells of `#[thread_local]` statics by thread slot, zero for one not made yet, and the statics it is filling.
 #[derive(Default)]
@@ -581,17 +661,19 @@ pub(crate) extern "C" fn fill_once(flag: usize, code: usize) {
     // SAFETY: flag is the state byte after a static's value in a cell that lives as long as the program.
     let state = unsafe { &*(flag as *const std::sync::atomic::AtomicU8) };
     loop {
-        match state.compare_exchange(EMPTY, FILLING, Ordering::AcqRel, Ordering::Acquire) {
+        match state.compare_exchange(StaticInit::Empty as u8, StaticInit::Filling as u8, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
                 thread_state().filling.push(flag);
+                let mut guard = FillGuard { state, flag, done: false };
                 // SAFETY: code is the generated initializer of this static, a function that takes and returns nothing.
                 let fill: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(code) };
                 fill();
-                thread_state().filling.retain(|&at| at != flag);
-                state.store(FILLED, Ordering::Release);
+                guard.done = true;
+                state.store(StaticInit::Filled as u8, Ordering::Release);
                 return;
             }
-            Err(FILLED) => return,
+            Err(v) if v == StaticInit::Filled as u8 => return,
+            Err(v) if v == StaticInit::Poisoned as u8 => panic!("static initializer panicked"),
             Err(_) if thread_state().filling.contains(&flag) => return,
             Err(_) => std::thread::yield_now(),
         }

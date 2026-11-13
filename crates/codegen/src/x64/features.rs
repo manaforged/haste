@@ -9,6 +9,7 @@ pub(super) struct Features {
     pub lzcnt: bool,
     pub bmi1: bool,
     pub popcnt: bool,
+    pub ssse3: bool,
     pub sse41: bool,
     pub avx: bool,
 }
@@ -28,6 +29,7 @@ fn detect() -> Features {
         lzcnt: std::arch::is_x86_feature_detected!("lzcnt"),
         bmi1: std::arch::is_x86_feature_detected!("bmi1"),
         popcnt: std::arch::is_x86_feature_detected!("popcnt"),
+        ssse3: std::arch::is_x86_feature_detected!("ssse3"),
         sse41: std::arch::is_x86_feature_detected!("sse4.1"),
         avx: std::arch::is_x86_feature_detected!("avx"),
     }

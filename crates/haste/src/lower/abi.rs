@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
-use haste_codegen::{AbiParam, Arch, ArgumentPurpose, CallConv, Signature, Target, Type, Value};
-use rustc_abi::{BackendRepr, FieldsShape, Float, Primitive, Scalar, TargetDataLayout, Variants};
+use haste_codegen::{AbiParam, Arch, ArgumentPurpose, CallConv, Lane, Signature, Target, Type, Value};
+use rustc_abi::{BackendLaneCount, BackendRepr, FieldsShape, Float, Primitive, Scalar, TargetDataLayout, Variants};
 use rustc_index::Idx;
 
 use crate::sema::Context;
@@ -75,15 +75,26 @@ fn word_parts(size: u64) -> Parts {
     }
 }
 
+fn simd_vec_type(element: &Scalar, count: BackendLaneCount) -> Option<Type> {
+    let dl = target().ok()?;
+    let scalar = scalar_type(dl, element).ok()?;
+    let lane = Lane::from_type(scalar)?;
+    let count = u8::try_from(count.as_u64()).ok()?;
+    let ty = Type::Vec { lane, count };
+    ty.is_valid_vec().then_some(ty)
+}
+
 /// The parts that a typed copy of a value of `layout` moves: its scalars, or contiguous word chunks up to 32 bytes when both scalars are a union's or the layout names none.
 pub(super) fn copied_parts(layout: &Layout) -> Parts {
     match &layout.backend_repr {
         BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => word_parts(layout.size.bytes()),
-        BackendRepr::SimdVector { .. } => match layout.size.bytes() {
-            8 => Parts::One(Type::I64),
-            16 if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Parts::One(Type::V128),
-            16 => Parts::Pair(Type::I64, Type::I64, 8),
-            _ => Parts::Bytes,
+        BackendRepr::SimdVector { element, count } => match simd_vec_type(element, *count) {
+            Some(ty) if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Parts::One(ty),
+            _ => match layout.size.bytes() {
+                8 => Parts::One(Type::I64),
+                16 => Parts::Pair(Type::I64, Type::I64, 8),
+                _ => Parts::Bytes,
+            },
         },
         _ => match parts(layout).unwrap_or(Parts::Bytes) {
             Parts::Bytes => word_parts(layout.size.bytes()),
@@ -190,9 +201,14 @@ fn x64_eightbytes(leaves: Option<&[(Type, i32)]>, size: u32) -> Passed {
     }
 }
 
-fn simd_native_type(size: u32, arch: Arch) -> Result<Type> {
+fn simd_native_type(element: &Scalar, count: BackendLaneCount, size: u32, arch: Arch) -> Result<Type> {
+    if matches!(arch, Arch::X64 | Arch::Arm64)
+        && let Some(vec_ty) = simd_vec_type(element, count)
+    {
+        return Ok(vec_ty);
+    }
     match size {
-        16 => Ok(Type::V128),
+        16 => Ok(Type::Vec { lane: Lane::I64, count: 2 }),
         8 if arch == Arch::Arm64 => Ok(Type::F64),
         8 => Ok(Type::I64),
         _ => bail!("a {size}-byte SIMD vector across a native call is not supported yet"),
@@ -218,8 +234,8 @@ impl Lower<'_, '_> {
         };
         let layout = self.cx.layout(ty)?;
         let arch = Target::host().arch;
-        if matches!(layout.backend_repr, BackendRepr::SimdVector { .. }) {
-            return Ok(NativePass::Direct(vec![(simd_native_type(size, arch)?, 0)]));
+        if let BackendRepr::SimdVector { element, count } = &layout.backend_repr {
+            return Ok(NativePass::Direct(vec![(simd_native_type(element, *count, size, arch)?, 0)]));
         }
         let mut leaves = Vec::new();
         let flat = collect_leaves(self.cx, ty, 0, &mut leaves)?;

@@ -10,7 +10,7 @@ use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sync::lock;
 
-use super::stencil::{DictConfig, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord};
+use super::stencil::{DictConfig, FirstJit, FirstJitState, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord};
 use super::{Image, Pass, stub};
 
 impl Image {
@@ -37,20 +37,20 @@ impl Image {
                 let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
                 let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target())?);
                 let exec = pass.memory.write_patched(&code, &symbols)?;
-                pass.stencils.first_jit.insert(item, Some((index, code, symbols, exec, out.reloc_plan)));
+                pass.stencils.first_jit.insert(item, FirstJitState::First(FirstJit { index, code, symbols, exec, reloc_plan: out.reloc_plan }));
                 Ok(Some(exec))
             }
-            Some(Some((idx1, code1, syms1, exec1, plan1))) => {
-                let fp1 = lower::eval_footprint(cx, reached, self, idx1)?;
+            Some(FirstJitState::First(first)) => {
+                let fp1 = lower::eval_footprint(cx, reached, self, first.index)?;
                 if self.wanted_len() > wanted0 {
                     bail!("unreached inline callee");
                 }
-                pass.stencils.jit_templates.insert((item, fp1), JitTemplate { stencil: code1, dict: None, fanout: 1, reloc_plan: plan1 });
-                pass.stencils.aliases.insert((item, fp1, syms1), (exec1, false));
-                pass.stencils.first_jit.insert(item, None);
+                pass.stencils.jit_templates.insert((item, fp1), JitTemplate { stencil: first.code, dict: None, fanout: 1, reloc_plan: first.reloc_plan });
+                pass.stencils.aliases.insert((item, fp1, first.symbols), (first.exec, false));
+                pass.stencils.first_jit.insert(item, FirstJitState::Promoted);
                 Ok(None)
             }
-            Some(None) => Ok(None),
+            Some(FirstJitState::Promoted) => Ok(None),
         }
     }
 
@@ -144,7 +144,7 @@ impl Image {
     }
 
     fn make_tier_up(&self, index: usize, key: (ItemRef, FootprintId), symbols: &[u64], threshold: u32, pass: &mut Pass) -> Result<Option<DictTierUp>> {
-        if !self.jit_mode || threshold == 0 || index >= (stub::TIER_UP_BIT as usize) {
+        if !self.backend.is_lazy_jit() || threshold == 0 || index >= (stub::TIER_UP_BIT as usize) {
             return Ok(None);
         }
         let counter_addr = lock(&self.shared).alloc(8)?;
