@@ -90,8 +90,11 @@ impl<'a> Infer<'_, 'a> {
         if let Some(found) = self.cx.type_def(scope, path.segments) {
             return Some(found);
         }
+        let before = self.cx.quiet_mark();
         let found = self.type_def_here(path)?;
-        self.cx.set_type_def(scope, path.segments, found);
+        if self.cx.quiet_mark() == before {
+            self.cx.set_type_def(scope, path.segments, found);
+        }
         Some(found)
     }
 

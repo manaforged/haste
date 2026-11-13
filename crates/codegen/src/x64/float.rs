@@ -204,6 +204,26 @@ impl Emit<'_> {
                 self.clamp(to, signed);
                 self.put(result, Reg::Rax);
             }
+            Convert::WidenVec64 | Convert::NarrowVec64 => {
+                let dst = self.fdst(result);
+                let src = self.fin(x, dst);
+                if dst != src {
+                    self.asm.movaps(dst, src);
+                }
+                self.fput(result, dst);
+            }
+            Convert::Bitcast if to.is_float() => {
+                let dst = self.fdst(result);
+                self.get(Reg::Rax, x, Ext::Zero);
+                self.asm.movq_in(dst, Reg::Rax);
+                self.fput(result, dst);
+            }
+            Convert::Bitcast => {
+                let src = self.fin(x, X0);
+                let dst = self.dst(result);
+                self.asm.movq_out(dst, src);
+                self.put(result, dst);
+            }
             other => return Err(format!("{other:?} from {:?} to {to:?}", self.ty(x))),
         }
         Ok(())

@@ -185,6 +185,7 @@ impl Lookups {
             }
             self.trait_calls.clear();
             self.assoc_types.clear();
+            self.type_defs.clear();
             *guard = loaded;
         }
     }

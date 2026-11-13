@@ -322,6 +322,9 @@ pub(crate) enum Convert {
     FromUint,
     ToSintSat,
     ToUintSat,
+    WidenVec64,
+    NarrowVec64,
+    Bitcast,
 }
 
 #[derive(Clone, Debug)]

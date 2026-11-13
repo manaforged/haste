@@ -409,6 +409,15 @@ fn partners(func: &Function) -> Vec<Vec<Value>> {
             }
         }
     }
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let Op::Convert(Convert::WidenVec64 | Convert::NarrowVec64, x) = &func.insts[inst.index()].op
+                && let Some(result) = func.insts[inst.index()].result
+            {
+                pair(&[result], &[*x]);
+            }
+        }
+    }
     out
 }
 
@@ -448,11 +457,18 @@ fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl 
     }
 }
 
+fn expensive_i64_const(imm: i64) -> bool {
+    let u = imm as u64;
+    if (u >> 32) == (u & 0xffff_ffff) {
+        return false;
+    }
+    let non_zero = (0..4).filter(|&s| ((u >> (s * 16)) & 0xffff) != 0).count();
+    let non_ones = (0..4).filter(|&s| ((u >> (s * 16)) & 0xffff) != 0xffff).count();
+    non_zero >= 3 && non_ones >= 3
+}
+
 fn promote_loop_consts<R>(func: &Function, census: &Uses, elided: &[bool], locations: &mut [Location<R>]) -> Vec<(usize, i64)> {
     let depths = crate::licm::depths(func);
-    if !depths.iter().any(|&d| d > 0) {
-        return Vec::new();
-    }
     let count = func.types.len();
     let mut must_stay_imm = vec![false; count];
     let mut loop_mat = vec![0_u32; count];
@@ -509,6 +525,15 @@ fn promote_loop_consts<R>(func: &Function, census: &Uses, elided: &[bool], locat
                 }
                 _ => {}
             }
+            data.op.for_operands(|v| {
+                if let Location::Imm(imm) = locations[v.index()]
+                    && func.ty(v) == Type::I64
+                    && expensive_i64_const(imm)
+                    && ((depth > 0 && census.def[v.index()].is_some_and(|(db, _)| depths[db] < depth)) || census.uses[v.index()] >= 4)
+                {
+                    loop_mat[v.index()] += 1;
+                }
+            });
         }
     }
     let mut promoted = Vec::new();

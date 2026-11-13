@@ -325,6 +325,10 @@ impl Image {
             }
         }
         let out = lower::lower_stencil(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?;
+        if self.mode == ImageMode::Check && !pass.stencils.cfg.verify {
+            pass.record_size(index, 0, started.elapsed().as_nanos() as u64);
+            return Ok(());
+        }
         let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, item, e))?);
         if let Some(fp) = footprint
             && cx.outline.is_sysroot(item.krate)
@@ -556,7 +560,7 @@ impl Image {
 
     pub(super) fn compile_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &mut GroupWork, cfg: DictConfig, record_cache: bool, pass: &mut Pass) -> Result<(), String> {
         let rep = group.representative();
-        if cfg.min_bytes == 0 && group.distinct.len() >= cfg.min_fanout {
+        if self.mode != ImageMode::Check && cfg.min_bytes == 0 && group.distinct.len() >= cfg.min_fanout {
             return self.compile_dict_group(cx, reached, group, cfg, record_cache, pass);
         }
         if !self.jit_mode
@@ -569,6 +573,13 @@ impl Image {
             Some(out) => out,
             None => lower::lower_stencil(cx, reached, self, rep).map_err(|e| item_err(cx, group.item, e))?,
         };
+        if self.mode == ImageMode::Check && !cfg.verify {
+            for inst in &group.distinct {
+                pass.record_size(inst.leader, 0, 0);
+            }
+            pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
+            return Ok(());
+        }
         let reloc_plan = out.reloc_plan;
         let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, group.item, e))?);
         if cx.outline.is_sysroot(group.item.krate)

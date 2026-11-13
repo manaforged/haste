@@ -99,6 +99,26 @@ impl Emit<'_> {
                 self.clamp(to.bits(), signed, dst);
                 self.put(result, dst);
             }
+            Convert::WidenVec64 | Convert::NarrowVec64 => {
+                let dst = self.fdst(result);
+                let src = self.fin(x, dst);
+                if dst != src {
+                    self.asm.fmov_reg(true, dst, src);
+                }
+                self.fput(result, dst);
+            }
+            Convert::Bitcast if to.is_float() => {
+                let src = self.src(x, A, Ext::Zero);
+                let dst = self.fdst(result);
+                self.asm.fmov_in(to == Type::F64, dst, src);
+                self.fput(result, dst);
+            }
+            Convert::Bitcast => {
+                let src = self.fin(x, V0);
+                let dst = self.dst(result);
+                self.asm.fmov_out(from == Type::F64, dst, src);
+                self.put(result, dst);
+            }
             other => return Err(format!("{other:?} from {from:?} to {to:?}")),
         }
         Ok(())

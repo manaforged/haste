@@ -12,6 +12,7 @@ struct Var {
     store: Option<Type>,
     uniform: bool,
     narrow: bool,
+    bitcast: bool,
     clash: bool,
 }
 
@@ -21,13 +22,15 @@ impl Var {
     }
 
     fn sound(&self) -> bool {
-        !self.clash && (self.uniform || self.narrow)
+        !self.clash && (self.uniform || self.narrow || self.bitcast)
     }
 
     fn add(&mut self, ty: Type, store: bool) {
         self.end = self.end.max(self.offset + i64::from(ty.bytes()));
         self.uniform &= ty == self.first;
         self.narrow &= ty.is_small_int();
+        self.bitcast &= ty.bytes() == self.first.bytes()
+            && matches!((self.first, ty), (Type::F64 | Type::I64, Type::F64 | Type::I64) | (Type::F32 | Type::I32, Type::F32 | Type::I32));
         if store {
             self.clash |= self.store.is_some_and(|home| home != ty);
             self.store = Some(ty);
@@ -36,7 +39,13 @@ impl Var {
 }
 
 fn convert(from: Type, to: Type) -> Option<Convert> {
-    (from != to).then(|| if to.bytes() < from.bytes() { Convert::Ireduce } else { Convert::Uextend })
+    if from == to {
+        return None;
+    }
+    if from.is_float() || to.is_float() {
+        return Some(Convert::Bitcast);
+    }
+    Some(if to.bytes() < from.bytes() { Convert::Ireduce } else { Convert::Uextend })
 }
 
 #[derive(Clone, Copy)]
@@ -193,7 +202,7 @@ impl Scan {
             None => {
                 let var = self.vars.len();
                 let end = offset + i64::from(ty.bytes());
-                self.vars.push(Var { slot, offset, end, first: ty, store: None, uniform: true, narrow: true, clash: false });
+                self.vars.push(Var { slot, offset, end, first: ty, store: None, uniform: true, narrow: true, bitcast: true, clash: false });
                 self.ids.insert((slot, offset), var);
                 self.slot_vars[slot.index()].push(var);
                 var

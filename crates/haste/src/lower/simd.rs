@@ -22,11 +22,6 @@ struct Lanes {
 const PACKED_BYTES: i32 = 16;
 
 impl Lanes {
-    /// Whether the vector is sixteen integer bytes.
-    fn is_bytes(&self) -> bool {
-        self.size == 1 && self.count == PACKED_BYTES && matches!(self.num, Num::Int { .. })
-    }
-
     /// Whether the vector is integer lanes that fill one 128-bit register.
     fn is_packed(&self) -> bool {
         self.size * self.count == PACKED_BYTES && matches!(self.num, Num::Int { .. })
@@ -38,12 +33,12 @@ impl Lower<'_, '_> {
     pub(super) fn simd(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&vector), Some(&first)) = (substs.first(), args.first()) else { bail!("a SIMD intrinsic with no vector") };
         let out = substs.get(1).copied();
-        if let Some(value) = self.packed_swar64(op, (vector, out.unwrap_or(vector)), args)? {
-            return Ok(Some(value));
-        }
         if matches!(Target::host().arch, Arch::X64 | Arch::Arm64)
             && let Some(value) = self.packed(op, (vector, out.unwrap_or(vector)), args)?
         {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.packed_swar64(op, (vector, out.unwrap_or(vector)), args)? {
             return Ok(Some(value));
         }
         let value = match (op, out) {
@@ -60,27 +55,38 @@ impl Lower<'_, '_> {
         Ok(Some(value))
     }
 
-    /// Emits `op` as one 128-bit vector operation when it is one the code generator has: a bitwise operation on a register of integer lanes, or a splat, equality, signed order or bitmask on sixteen bytes.
+    /// Emits `op` as one 128-bit vector operation when it is one the code generator has: a bitwise operation on a register of 8 or 16 integer bytes, or a splat, equality, signed order or bitmask.
     fn packed(&mut self, op: Simd, (input, output): (Ty, Ty), args: &[Value]) -> Result<Option<Value>> {
         let lanes = self.lanes(input)?;
-        if !lanes.is_packed() {
+        let is_16 = lanes.is_packed();
+        let is_8 = lanes.size * lanes.count == 8 && matches!(lanes.num, Num::Int { .. });
+        if !is_16 && !is_8 {
             return Ok(None);
         }
+        let is_bytes = lanes.size == 1 && (lanes.count == PACKED_BYTES || lanes.count == 8);
         let signed = matches!(lanes.num, Num::Int { signed: true, .. });
+        let load_vec = |lower: &mut Self, addr: Value| {
+            if is_8 {
+                let f = lower.ins().load(Type::F64, addr, 0);
+                lower.ins().widen_vec64(f)
+            } else {
+                lower.ins().load(Type::V128, addr, 0)
+            }
+        };
         let vector = match (op, args) {
-            (Simd::Splat, &[x]) if lanes.is_bytes() => self.ins().splat(x),
-            (Simd::Lanewise(bin @ (BinOp::Add | BinOp::Sub)), &[x, y]) if input == output && lanes.size <= 8 => {
-                let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+            (Simd::Splat, &[x]) if is_bytes => self.ins().splat(x),
+            (Simd::Lanewise(bin @ (BinOp::Add | BinOp::Sub)), &[x, y]) if is_16 && input == output && lanes.size <= 8 => {
+                let (a, b) = (load_vec(self, x), load_vec(self, y));
                 self.ins().vector(lane_arithmetic(bin, lanes.size), a, b)
             }
-            (Simd::Bitmask, &[x]) if lanes.is_bytes() => {
+            (Simd::Bitmask, &[x]) if is_16 && is_bytes => {
                 let Some(target) = machine(self.cx, output)? else { return Ok(None) };
-                let loaded = self.ins().load(Type::V128, x, 0);
+                let loaded = load_vec(self, x);
                 let mask = self.ins().movemask(loaded);
                 return Ok(Some(self.resize(mask, (Type::I32, false), target)));
             }
             (Simd::Lanewise(bin @ (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)), &[x, y]) if input == output => {
-                let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+                let (a, b) = (load_vec(self, x), load_vec(self, y));
                 match bin {
                     BinOp::BitAnd => self.ins().band(a, b),
                     BinOp::BitOr => self.ins().bor(a, b),
@@ -88,9 +94,14 @@ impl Lower<'_, '_> {
                 }
             }
             (Simd::Lanewise(cmp @ (BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le)), &[x, y])
-                if lanes.is_bytes() && (matches!(cmp, BinOp::Eq | BinOp::Ne) || signed) && self.lanes(output)?.is_bytes() =>
+                if is_bytes
+                    && (matches!(cmp, BinOp::Eq | BinOp::Ne) || signed)
+                    && {
+                        let out = self.lanes(output)?;
+                        out.size == 1 && out.count == lanes.count && matches!(out.num, Num::Int { .. })
+                    } =>
             {
-                let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+                let (a, b) = (load_vec(self, x), load_vec(self, y));
                 let invert = |v: Value, lower: &mut Self| {
                     let ones = lower.ins().byte_cmp(ByteCC::Equal, a, a);
                     lower.ins().bxor(v, ones)
@@ -115,8 +126,9 @@ impl Lower<'_, '_> {
             }
             _ => return Ok(None),
         };
+        let stored = if is_8 { self.ins().narrow_vec64(vector) } else { vector };
         let (slot, address) = self.vector_slot(if matches!(op, Simd::Splat) { input } else { output })?;
-        self.ins().stack_store(vector, slot, 0);
+        self.ins().stack_store(stored, slot, 0);
         Ok(Some(address))
     }
 
