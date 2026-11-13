@@ -24,11 +24,12 @@ use super::super::{Inline, Parts, Repr, Slots, is_static, passed_parts, repr, si
 pub(super) struct HashMix {
     a: u64,
     b: u64,
+    local: bool,
 }
 
 impl HashMix {
     pub(super) fn new(seed: u128) -> Self {
-        Self { a: 0x9e37_79b9_7f4a_7c15 ^ (seed as u64), b: 0xbf58_476d_1ce4_e5b9 ^ ((seed >> 64) as u64) }
+        Self { a: 0x9e37_79b9_7f4a_7c15 ^ (seed as u64), b: 0xbf58_476d_1ce4_e5b9 ^ ((seed >> 64) as u64), local: false }
     }
 
     pub(super) fn u64(&mut self, v: u64) {
@@ -57,13 +58,30 @@ impl HashMix {
         self.u64(v as u64);
     }
 
+    pub(super) fn local_index(&mut self, v: usize) {
+        self.local = true;
+        self.usize(v);
+    }
+
     pub(super) fn u128(&mut self, v: u128) {
         self.u64(v as u64);
         self.u64((v >> 64) as u64);
     }
 
-    pub(super) fn item(&mut self, item: ItemRef) {
-        self.u128(item_bits(item));
+    pub(super) fn footprint(&mut self, fp: FootprintId) {
+        if !fp.is_portable() {
+            self.local = true;
+        }
+        self.u128(fp.0);
+    }
+
+    pub(super) fn item(&mut self, outline: &crate::outline::Outline, item: ItemRef) {
+        if let Some(key) = crate::substrate::sysroot_item_key(outline, item) {
+            self.u128((1u128 << 96) | u128::from(key));
+        } else {
+            self.local = true;
+            self.u128(item_bits(item));
+        }
     }
 
     pub(super) fn finish(self) -> FootprintId {
@@ -75,7 +93,8 @@ impl HashMix {
         hi = (hi ^ (hi >> 30)).wrapping_mul(0x94d0_49bb_1331_11eb);
         hi = (hi ^ (hi >> 27)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         hi ^= hi >> 31;
-        FootprintId(((hi as u128) << 64) | (lo as u128))
+        let raw = ((hi as u128) << 64) | (lo as u128);
+        FootprintId(if self.local { (raw & !1) | 1 } else { raw & !1 })
     }
 }
 
@@ -279,7 +298,7 @@ fn hash_ty_facts_depth(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, depth: u
         }
         Kind::Closure(parent, _, at) => {
             mix.byte(0x1a);
-            mix.item(parent);
+            mix.item(cx.outline, parent);
             mix.u32(at);
             mix.bool(cx.closure_takes_env(ty));
             mix.bool(cx.closure_consumes(ty));
@@ -350,18 +369,18 @@ fn hash_unsized_facts(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, depth: u8
 }
 
 pub(super) fn hash_dyn_facts(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, of: ItemRef) -> Result<()> {
-    mix.item(of);
+    mix.item(cx.outline, of);
     match crate::prep::vtable(cx, ty) {
         Some(laid) => {
             mix.byte(1);
             mix.usize(laid.slots.len());
             for s in &laid.slots {
-                mix.item(s.method);
+                mix.item(cx.outline, s.method);
                 mix.usize(s.at);
                 mix.usize(s.carries.len());
             }
             for &(sup, at) in &laid.supers {
-                mix.item(sup);
+                mix.item(cx.outline, sup);
                 mix.usize(at.unwrap_or(usize::MAX));
             }
         }
@@ -455,7 +474,7 @@ pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         return Ok(());
     }
     if is_const && substs.is_empty() {
-        mix.item(item);
+        mix.item(cx.outline, item);
     }
     let Ok(callee) = &reached.list[callee_idx].1 else { bail!("{} did not type-check", cx.name(item)) };
     let sig = signature(cx, callee)?;
@@ -484,8 +503,8 @@ pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         match meta {
             Some((inl_item, inl_fp, returns)) => {
                 mix.byte(1);
-                mix.item(inl_item);
-                mix.u128(inl_fp.0);
+                mix.item(cx.outline, inl_item);
+                mix.footprint(inl_fp);
                 mix.bool(returns);
             }
             None => mix.byte(0),
@@ -498,7 +517,7 @@ pub(super) fn hash_call_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, 
 
 fn hash_intrinsic_edge(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, caller: usize, item: ItemRef, which: Intrinsic, substs: Substs, cycle_root: &mut usize) -> Result<()> {
     mix.byte(0xe0);
-    mix.item(item);
+    mix.item(cx.outline, item);
     let args = cx.types.substs(substs).to_vec();
     mix.usize(args.len());
     for &arg in &args {

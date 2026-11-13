@@ -15,7 +15,7 @@ use haste_codegen::{Code, RelocKind, Site, StencilReloc, Target};
 use rustc_hash::FxHasher;
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 4;
+const VERSION: u32 = 7;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 48;
@@ -194,15 +194,8 @@ pub fn target_hash(target: &Target) -> u64 {
     let mut hasher = FxHasher::default();
     target.triple.hash(&mut hasher);
     target.effort.hash(&mut hasher);
-    if let Ok(exe) = std::env::current_exe()
-        && let Ok(meta) = std::fs::metadata(exe)
-    {
-        meta.len().hash(&mut hasher);
-        if let Ok(modified) = meta.modified()
-            && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH)
-        {
-            dur.as_nanos().hash(&mut hasher);
-        }
+    if let Ok(exe) = std::env::current_exe() {
+        hash_file_meta(&exe, &mut hasher);
     }
     hasher.finish()
 }
@@ -223,13 +216,35 @@ pub fn patch_stencil(slice: &StencilSlice<'_>, symbols: &[u64]) -> Result<Vec<u8
 }
 
 fn hash_file_meta(path: &Path, hasher: &mut FxHasher) {
-    path.hash(hasher);
-    if let Ok(meta) = std::fs::metadata(path) {
-        meta.len().hash(hasher);
-        if let Ok(modified) = meta.modified()
-            && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH)
-        {
-            dur.as_nanos().hash(hasher);
+    (path, crate::graph::store::file_stamp(path)).hash(hasher);
+}
+
+fn sysroot_library_roots(workspace: &crate::graph::Workspace, units: &[usize]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = units
+        .iter()
+        .map(|&idx| {
+            let dir = &workspace.packages[workspace.graph.units[idx].package].manifest.dir;
+            dir.ancestors().find(|a| a.file_name().is_some_and(|n| n == "library")).unwrap_or(dir.as_path()).to_owned()
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn hash_sysroot_rs(dir: &Path, hasher: &mut FxHasher) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut children: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect();
+    children.sort();
+    for child in children {
+        if matches!(child.file_name().and_then(|n| n.to_str()), Some("target" | ".git")) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&child) else { continue };
+        if meta.is_dir() {
+            hash_sysroot_rs(&child, hasher);
+        } else if child.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            (child, crate::graph::store::meta_stamp(&meta)).hash(hasher);
         }
     }
 }
@@ -254,7 +269,9 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
     }
     MAGIC.hash(&mut hasher);
     VERSION.hash(&mut hasher);
+    let mut unit_indices = Vec::with_capacity(sysroot_units.len());
     for (_, _, idx) in sysroot_units {
+        unit_indices.push(idx);
         let unit = &workspace.graph.units[idx];
         let pkg = &workspace.packages[unit.package];
         let locked = &pkg.locked;
@@ -268,6 +285,9 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
         for feat in &unit.features {
             feat.hash(&mut hasher);
         }
+    }
+    for root in sysroot_library_roots(workspace, &unit_indices) {
+        hash_sysroot_rs(&root, &mut hasher);
     }
     hasher.finish()
 }

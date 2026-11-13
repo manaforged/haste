@@ -117,8 +117,8 @@ impl Emit<'_> {
 
     /// Copies `bytes` bytes between two ranges that are the same or disjoint: 16 at a time through xmm1, then word by word through rax; r11 and rcx hold addresses.
     fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
-        let source = self.address_in(from, 0, Reg::R11);
-        let target = self.address_in(to, 0, Reg::Rcx);
+        let source = self.address_in(from, 0, Reg::R11, Reg::Rax);
+        let target = self.address_in(to, 0, Reg::Rcx, Reg::Rax);
         let whole = bytes / VECTOR * VECTOR;
         for at in (0..whole).step_by(VECTOR as usize) {
             self.asm.sse(&[], &MOVUPS.0, X1.0, source.offset(at as i32));

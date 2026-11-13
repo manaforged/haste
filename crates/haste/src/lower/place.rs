@@ -287,11 +287,60 @@ impl Lower<'_, '_> {
         self.tuple_of(self.ty_of(expr), list)
     }
 
+    /// Copies `addr` into a fresh frame slot when `repr` lives in memory, returning the snapshot address.
+    pub(super) fn snapshot_repr(&mut self, repr: Repr, addr: Value) -> Value {
+        let Some(slot) = self.slot(repr) else {
+            return addr;
+        };
+        let dst = self.address(Place::slot(slot, repr));
+        self.copy(dst, addr, repr);
+        dst
+    }
+
+    /// Snapshots a memory result of `expr` before drops in `self.owned[mark..]` run.
+    pub(super) fn snapshot_before_drops(&mut self, mark: usize, expr: ExprId, value: Option<Value>) -> Result<Option<Value>> {
+        let Some(addr) = value else {
+            return Ok(None);
+        };
+        if !self.open || self.owned.len() <= mark {
+            return Ok(Some(addr));
+        }
+        let repr = self.coerced_repr(expr, self.typed.coercions.get(&expr))?;
+        Ok(Some(if matches!(repr, Repr::Mem { .. }) { self.snapshot_repr(repr, addr) } else { addr }))
+    }
+
+    /// Records a move out of `expr`'s place when its type needs drop.
+    pub(super) fn move_from_expr(&mut self, expr: ExprId) -> Result<()> {
+        if !self.open || !crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))? {
+            return Ok(());
+        }
+        if let Some((root, path)) = self.move_path(expr) {
+            self.moved_out(root, &path)?;
+        }
+        Ok(())
+    }
+
+    /// Evaluates `expr` by value, records its move, and snapshots a `Repr::Mem` place expression into a fresh frame slot.
+    pub(super) fn eval_operand(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        let value = self.expr(expr)?;
+        self.move_from_expr(expr)?;
+        let Some(addr) = value else {
+            return Ok(None);
+        };
+        let coerced = self.typed.coercions.get(&expr);
+        let fresh_coercion = matches!(coerced, Some(Coercion::Len(_) | Coercion::Vtable(_) | Coercion::Upcast(_) | Coercion::Reify(_)));
+        if !self.open || !self.may_alias_place(expr) || fresh_coercion {
+            return Ok(Some(addr));
+        }
+        let repr = self.coerced_repr(expr, coerced)?;
+        Ok(Some(if matches!(repr, Repr::Mem { .. }) { self.snapshot_repr(repr, addr) } else { addr }))
+    }
+
     /// Lowers the expressions `list` into a new frame slot as a tuple of type `ty`, and returns its value.
     pub(super) fn tuple_of(&mut self, ty: Ty, list: List) -> Result<Option<Value>> {
         let mut values = Vec::new();
         for &item in self.body.list(list).to_vec().iter() {
-            values.push(self.expr(ExprId(item))?);
+            values.push(self.eval_operand(ExprId(item))?);
         }
         self.tuple_from(ty, values)
     }
@@ -351,7 +400,7 @@ impl Lower<'_, '_> {
     /// The receiver of a method call after `adjust`: read through its references, then borrowed or read.
     pub fn receiver(&mut self, (expr, receiver): (ExprId, ExprId), adjust: Adjust) -> Result<Option<Value>> {
         if adjust == (Adjust { derefs: 0, autoref: None }) {
-            return self.expr(receiver);
+            return self.eval_operand(receiver);
         }
         let mut place = self.place_or_temp(receiver)?;
         let mut ty = self.ty_of(receiver);
@@ -369,7 +418,9 @@ impl Lower<'_, '_> {
         }
         match adjust.autoref {
             Some(_) => self.address_or_dangling(place, ty).map(Some),
-            None => Ok(place.and_then(|place| self.read(place))),
+            None => Ok(place.and_then(|place| {
+                self.read(place).map(|val| if matches!(place.repr, Repr::Mem { .. }) { self.snapshot_repr(place.repr, val) } else { val })
+            })),
         }
     }
 }

@@ -43,6 +43,8 @@ pub enum Intrinsic {
     BytePermute(u8),
     /// NEON `umaxp` on two vectors of 16 bytes.
     BytePairMax,
+    /// An ARM64 NEON or SHA-256 intrinsic emitted inline.
+    Arm64(Arm64Intrinsic),
     /// An LLVM x86 intrinsic that a host function computes.
     X86(crate::host::X86Symbol),
     CatchUnwind,
@@ -145,8 +147,33 @@ pub enum Atomic {
     Exchange,
 }
 
+/// An ARM64 NEON or crypto intrinsic emitted inline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arm64Intrinsic {
+    Tbl1,
+    Sqdmulh2S,
+    Sqdmulh4S,
+    Sqdmulh8H,
+    Sha256H,
+    Sha256H2,
+    Sha256Su0,
+    Sha256Su1,
+}
+
 /// The LLVM intrinsics that foreign declarations link to and lowering emits inline.
-const LLVM: [(&str, Intrinsic); 3] = [("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)), ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32)), ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::BytePairMax)];
+const LLVM: [(&str, Intrinsic); 11] = [
+    ("llvm.x86.ssse3.pshuf.b.128", Intrinsic::BytePermute(16)),
+    ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute(32)),
+    ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::BytePairMax),
+    ("llvm.aarch64.neon.tbl1.v16i8", Intrinsic::Arm64(Arm64Intrinsic::Tbl1)),
+    ("llvm.aarch64.neon.sqdmulh.v2i32", Intrinsic::Arm64(Arm64Intrinsic::Sqdmulh2S)),
+    ("llvm.aarch64.neon.sqdmulh.v4i32", Intrinsic::Arm64(Arm64Intrinsic::Sqdmulh4S)),
+    ("llvm.aarch64.neon.sqdmulh.v8i16", Intrinsic::Arm64(Arm64Intrinsic::Sqdmulh8H)),
+    ("llvm.aarch64.crypto.sha256h", Intrinsic::Arm64(Arm64Intrinsic::Sha256H)),
+    ("llvm.aarch64.crypto.sha256h2", Intrinsic::Arm64(Arm64Intrinsic::Sha256H2)),
+    ("llvm.aarch64.crypto.sha256su0", Intrinsic::Arm64(Arm64Intrinsic::Sha256Su0)),
+    ("llvm.aarch64.crypto.sha256su1", Intrinsic::Arm64(Arm64Intrinsic::Sha256Su1)),
+];
 
 const NAMES: [(&str, Intrinsic); 161] = {
     use Intrinsic::*;

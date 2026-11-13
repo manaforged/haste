@@ -94,7 +94,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let (stub_size, tramp_size) = if arch == Arch::X64 { (6, 20) } else { (12, 24) };
 
     let mut libs = vec!["/usr/lib/libSystem.B.dylib".to_owned()];
-    plan.libs.iter().filter(|&&l| !l.ends_with(".so.6")).for_each(|l| libs.push(format!("@rpath/lib{l}.dylib")));
+    plan.libs.iter().filter(|&&l| !l.contains(".so")).for_each(|l| libs.push(format!("@rpath/lib{l}.dylib")));
 
     let (nsects_text, nsects_data) = if plan.imports.is_empty() { (1, 3) } else { (2, 4) };
     let dylib_cmds: usize = libs.iter().map(|l| (24 + l.len() + 1).next_multiple_of(8)).sum();

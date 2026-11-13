@@ -3,14 +3,14 @@ use super::Emit;
 use super::float::{X0, X1, X2};
 use crate::fill::BYTES;
 use crate::frame::Ext;
-use crate::ir::{Binary, ByteCC, Op, Value, VectorOp};
+use crate::ir::{Binary, ByteCC, Op, Sha256Op, Value, VectorOp};
 
 /// The operand-size prefix every packed integer SSE2 instruction takes.
 const PACKED: [u8; 1] = [0x66];
 
 /// The prefix and opcode bytes of the vector instruction `op`.
-fn encoding(op: VectorOp) -> (&'static [u8], [u8; 3]) {
-    match op {
+fn encoding(op: VectorOp) -> Result<(&'static [u8], [u8; 3]), String> {
+    Ok(match op {
         VectorOp::ByteShuffle => (&PACKED, [0x0F, 0x38, 0x00]),
         VectorOp::AddBytes => (&PACKED, [0x0F, 0xFC, 0]),
         VectorOp::AddWords => (&PACKED, [0x0F, 0xFD, 0]),
@@ -29,7 +29,8 @@ fn encoding(op: VectorOp) -> (&'static [u8], [u8; 3]) {
         VectorOp::AesEncLast => (&PACKED, [0x0F, 0x38, 0xDD]),
         VectorOp::AesDec => (&PACKED, [0x0F, 0x38, 0xDE]),
         VectorOp::AesDecLast => (&PACKED, [0x0F, 0x38, 0xDF]),
-    }
+        other => return Err(format!("unsupported x64 vector op {other:?}")),
+    })
 }
 
 /// The opcode bytes of `encoding`: two for a 0F map instruction, three for a 0F 38 one.
@@ -58,10 +59,11 @@ impl Emit<'_> {
                 self.packed((&PACKED, &[0x0F, opcode]), (x, y), result);
             }
             Op::Vector(kind, x, y) => {
-                let (prefix, bytes) = encoding(kind);
+                let (prefix, bytes) = encoding(kind)?;
                 self.packed((prefix, opcode(&bytes)), (x, y), result);
             }
-            Op::Sha256Rounds(x, y, k) => self.sha256_rounds((x, y, k), result),
+            Op::Sha256Rounds(Sha256Op::X86Rnds2, x, y, k) => self.sha256_rounds((x, y, k), result),
+            Op::Sha256Rounds(other, ..) => return Err(format!("unsupported x64 sha256 op {other:?}")),
             Op::Splat(x) => self.splat(x, result),
             Op::Movemask(x) => {
                 let source = self.fin(x, Xmm(0));

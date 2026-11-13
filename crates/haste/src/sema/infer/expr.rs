@@ -221,11 +221,11 @@ impl Infer<'_, '_> {
         if matches!(op, BinOp::And | BinOp::Or) {
             return self.logical(lhs, rhs);
         }
-        let left = self.expr(lhs, if is_compare(op) { None } else { expected })?;
-        self.right_operand(expr, op, (left, rhs))
+        let left = self.expr(lhs, None)?;
+        self.right_operand(expr, op, (left, rhs), expected)
     }
 
-    fn right_operand(&mut self, expr: ExprId, op: BinOp, (left, rhs): (Ty, ExprId)) -> Result<Ty> {
+    fn right_operand(&mut self, expr: ExprId, op: BinOp, (left, rhs): (Ty, ExprId), expected: Option<Ty>) -> Result<Ty> {
         let right = self.right_value(op, left, rhs)?;
         if is_compare(op) && matches!(self.cx.types.kind(self.resolve(left)), Kind::Ptr(..)) {
             self.coerce_expr(rhs, right, left)?;
@@ -236,7 +236,7 @@ impl Infer<'_, '_> {
             self.operands.push((expr, op, (left, right), out));
             return Ok(out);
         }
-        self.operator_type(expr, op, (left, right))
+        self.operator_type(expr, op, (left, right), expected)
     }
 
     /// The type of the right operand `rhs` of `op`, coerced to the one type an overloaded operator on `left` takes there.
@@ -298,15 +298,34 @@ impl Infer<'_, '_> {
         ptr_cmp || (self.builtin_left(op, left) && !matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..)))
     }
 
-    fn operator_type(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
+    fn operator_type(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty), expected: Option<Ty>) -> Result<Ty> {
         if !self.builtin_left(op, left) || matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..)) {
             return self.overloaded(expr, op, (left, right));
         }
         if matches!(op, BinOp::Shl | BinOp::Shr) {
+            self.hint_scalar_var(left, expected)?;
             return self.shift(left, right);
         }
         self.unify(left, right)?;
+        if !is_compare(op) {
+            self.hint_scalar_var(left, expected)?;
+        }
         Ok(if is_compare(op) { self.cx.types.bool() } else { left })
+    }
+
+    fn hint_scalar_var(&mut self, left: Ty, expected: Option<Ty>) -> Result<()> {
+        let Some(exp) = self.known(expected).map(|ty| self.resolve(ty)) else {
+            return Ok(());
+        };
+        let unify_scalar = match self.cx.types.kind(self.resolve(left)) {
+            Kind::IntVar(_) => self.is_int(exp),
+            Kind::FloatVar(_) => self.is_float(exp),
+            _ => false,
+        };
+        if unify_scalar {
+            self.unify(left, exp)?;
+        }
+        Ok(())
     }
 
     /// Types each operator whose left operand was not known when it was read, once it is.
@@ -324,7 +343,7 @@ impl Infer<'_, '_> {
                 self.operands.swap_remove(at);
                 let found = match *self.body.expr(expr) {
                     Expr::AssignOp(_, _, rhs) => self.compound(expr, op, (operands.0, rhs, operands.1)).map(|()| out)?,
-                    _ => self.operator_type(expr, op, operands)?,
+                    _ => self.operator_type(expr, op, operands, Some(out))?,
                 };
                 self.unify(found, out)?;
             }
@@ -340,12 +359,15 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// Whether operator `op` on `left` and `right` must wait to pick its impl: the left operand is a variable or a reference to one, or several impls fit only because the right operand is an untyped number.
+    /// Whether operator `op` on `left` and `right` must wait to pick its impl: the left operand is a variable or a reference to one, or several impls fit only because an operand is an untyped number.
     fn pending(&mut self, op: BinOp, (left, right): (Ty, Ty)) -> Result<bool> {
         if self.unknown_left(left) {
             return Ok(true);
         }
-        if self.builtin_left(op, left) || !matches!(self.cx.types.kind(self.resolve(right)), Kind::IntVar(_) | Kind::FloatVar(_)) {
+        let left_num_var = matches!(self.cx.types.kind(self.resolve(left)), Kind::IntVar(_) | Kind::FloatVar(_));
+        let right_adt_or_ref = matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..));
+        let right_num_var = matches!(self.cx.types.kind(self.resolve(right)), Kind::IntVar(_) | Kind::FloatVar(_));
+        if (self.builtin_left(op, left) && !right_adt_or_ref) || (!left_num_var && !right_num_var) {
             return Ok(false);
         }
         let Some((lang, _)) = operator_trait(op) else { return Ok(false) };

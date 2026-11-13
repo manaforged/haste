@@ -204,6 +204,17 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
     (values, slots)
 }
 
+pub(crate) fn terminator_edges<'a>(op: &'a Op, mut f: impl FnMut(Block, &'a [Value])) {
+    match op {
+        Op::Jump(target, args) => f(*target, args),
+        Op::Brif(_, then, then_args, otherwise, else_args) => {
+            f(*then, then_args);
+            f(*otherwise, else_args);
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn layout<R: Copy + PartialEq>(
     func: &Function,
     (saves, float_saves): (Vec<R>, Vec<u8>),
@@ -245,14 +256,7 @@ pub(crate) fn layout<R: Copy + PartialEq>(
         }
     };
     for op in live_ops(func) {
-        match op {
-            Op::Jump(block, args) => check_edge(*block, args),
-            Op::Brif(_, then, then_args, otherwise, else_args) => {
-                check_edge(*then, then_args);
-                check_edge(*otherwise, else_args);
-            }
-            _ => {}
-        }
+        terminator_edges(op, &mut check_edge);
     }
     let scratch = max_saved as u32 * EDGE_SLOT;
     let mut slots = vec![0; func.slots.len()];
@@ -260,7 +264,8 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     order.sort_by_key(|&slot| (func.slots[slot].size, slot));
     for slot in order {
         let data = &func.slots[slot];
-        let align = 1 << data.align_shift.min(MAX_ALIGN_SHIFT);
+        let min_align = if data.size >= 8 { 8 } else if data.size >= 4 { 4 } else if data.size >= 2 { 2 } else { 1 };
+        let align = (1 << data.align_shift.min(MAX_ALIGN_SHIFT)).max(min_align);
         cursor = round(cursor + data.size, align);
         slots[slot] = -(cursor as i32);
     }

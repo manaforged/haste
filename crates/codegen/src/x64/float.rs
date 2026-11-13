@@ -119,7 +119,7 @@ impl Emit<'_> {
         let dst = self.fdst(result);
         match self.xmm_of(x).filter(|_| self.features.avx) {
             Some(src) => {
-                let source = self.foperand(y);
+                let source = self.foperand(y, X1);
                 self.asm.vex_scalar(scalar(ty), opcode, (dst, src), source);
             }
             None => {
@@ -127,7 +127,7 @@ impl Emit<'_> {
                     self.asm.movaps(X1, dst);
                     X1.into()
                 } else {
-                    self.foperand(y)
+                    self.foperand(y, X1)
                 };
                 self.fget(dst, x);
                 self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, source);
@@ -159,7 +159,7 @@ impl Emit<'_> {
             FloatCC::GreaterThanOrEqual => (x, y, Cond::Ae),
         };
         let left = self.fin(a, X0);
-        let right = self.foperand(b);
+        let right = self.foperand(b, X1);
         self.ucomi(self.ty(x), left, right);
         if self.plan.fused[result.index()] {
             self.flags = Some((result, cond));
@@ -179,7 +179,7 @@ impl Emit<'_> {
         let to = self.ty(result);
         match op {
             Convert::Fpromote | Convert::Fdemote => {
-                let (dst, source) = (self.fdst(result), self.foperand(x));
+                let (dst, source) = (self.fdst(result), self.foperand(x, X1));
                 self.asm.sse(&[scalar(self.ty(x))], &[0x0F, 0x5A], dst.0, source);
                 self.fput(result, dst);
             }
@@ -254,7 +254,7 @@ impl Emit<'_> {
 
     fn widen_to_double(&mut self, x: Value) {
         if self.ty(x) == Type::F32 {
-            let source = self.foperand(x);
+            let source = self.foperand(x, X1);
             self.asm.sse(&[0xF3], &[0x0F, 0x5A], X0.0, source);
         } else {
             self.fget(X0, x);

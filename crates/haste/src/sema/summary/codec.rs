@@ -130,7 +130,6 @@ fn hash_ty(outline: &Outline, types: &Types, ty: Ty, key_of: &mut impl FnMut(&Ou
         Kind::Adt(i, s) => { 8u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
         Kind::FnDef(i, s) => { 9u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
         Kind::FnPtr(p, r) => { 10u8.hash(hasher); hash_substs(outline, types, p, key_of, hasher)?; hash_ty(outline, types, r, key_of, hasher)?; }
-        Kind::Closure(i, s, a) => { 11u8.hash(hasher); key_of(outline, i)?.hash(hasher); a.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
         Kind::Dyn(o, s, m, a) => {
             12u8.hash(hasher);
             key_of(outline, o)?.hash(hasher);
@@ -142,7 +141,7 @@ fn hash_ty(outline: &Outline, types: &Types, ty: Ty, key_of: &mut impl FnMut(&Ou
         }
         Kind::Pat(b, lo, hi) => { 13u8.hash(hasher); lo.hash(hasher); hi.hash(hasher); hash_ty(outline, types, b, key_of, hasher)?; }
         Kind::Value(v) => { 14u8.hash(hasher); v.hash(hasher); }
-        Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return None,
+        Kind::Closure(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return None,
     }
     Some(())
 }
@@ -229,7 +228,7 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
             Kind::Adt(i, s) => { rec.push(7); write_u32(&mut rec, self.item_id(i)?); write_u32s(&mut rec, &self.substs_ids(s)?); }
             Kind::FnDef(i, s) => { rec.push(8); write_u32(&mut rec, self.item_id(i)?); write_u32s(&mut rec, &self.substs_ids(s)?); }
             Kind::FnPtr(p, r) => { rec.push(9); write_u32s(&mut rec, &self.substs_ids(p)?); write_u32(&mut rec, self.ty_id(r)?); }
-            Kind::Closure(i, s, a) => { rec.push(10); write_u32(&mut rec, self.item_id(i)?); write_u32s(&mut rec, &self.substs_ids(s)?); write_u32(&mut rec, a); }
+            Kind::Closure(..) => return None,
             Kind::Dyn(o, s, m, a) => {
                 rec.push(11); write_u32(&mut rec, self.item_id(o)?); write_u32s(&mut rec, &self.substs_ids(s)?);
                 let ms = m.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
@@ -275,6 +274,9 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
     }
 
     fn write_summary(&mut self, out: &mut Vec<u8>, s: &PolySummary) -> Option<()> {
+        if !s.template.closures.is_empty() {
+            return None;
+        }
         write_u16(out, s.param_count);
         write_opt(out, s.ret.as_ref(), |out, t| { write_u32(out, self.ty_id(*t)?); Some(()) })?;
         write_u32(out, s.locals.len() as u32);

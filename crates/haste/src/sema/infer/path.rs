@@ -82,7 +82,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// The type-namespace item that `path` names, a single segment first among the items that the body declares.
     pub(super) fn type_def(&mut self, path: &NamePath<'_>) -> Option<Def> {
-        if !self.items.is_empty() {
+        if !self.items.is_empty() || !self.block_uses.is_empty() {
             return self.type_def_here(path);
         }
         let here = self.anchor().and_then(|(root, from)| from.map(|at| root.inner(at)));

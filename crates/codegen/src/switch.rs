@@ -66,6 +66,9 @@ fn block_only(func: &Function, info: &Info, block: usize, v: Value) -> Option<(V
             return None;
         }
         if let Some(res) = data.result {
+            if !matches!(data.op, Op::Const(_)) && hit_args.contains(&res) {
+                return None;
+            }
             let mut local = 0_u32;
             for &other in insts {
                 func.insts[other.index()].op.for_operands(|op| local += u32::from(op == res));
@@ -143,6 +146,29 @@ fn emit_btree(
     push_node(func, at, insts)
 }
 
+fn hoist_chain_consts(
+    func: &mut Function,
+    info: &Info,
+    b0: usize,
+    chain: &[usize],
+    seen: &mut HashMap<u64, (i64, Block, Vec<Value>)>,
+) {
+    let mut hoisted: Vec<(Value, Value)> = Vec::new();
+    for (_, _, hit_args) in seen.values_mut() {
+        for arg in hit_args.iter_mut() {
+            if let Some(&(_, nv)) = hoisted.iter().find(|&&(ov, _)| ov == *arg) {
+                *arg = nv;
+            } else if info.def_block.get(arg.index()).copied().flatten().is_some_and(|b| chain.contains(&b))
+                && let Some(imm) = info.consts.get(arg.index()).copied().flatten()
+            {
+                let nv = push_before_last(func, b0, Op::Const(imm), func.ty(*arg));
+                hoisted.push((*arg, nv));
+                *arg = nv;
+            }
+        }
+    }
+}
+
 pub(crate) fn run(func: &mut Function) {
     let info = analyze(func);
     let initial_blocks = func.blocks.len();
@@ -176,6 +202,7 @@ pub(crate) fn run(func: &mut Function) {
         if distinct < 4 {
             continue;
         }
+        hoist_chain_consts(func, &info, b0, &chain, &mut seen);
         let (mut u_min, mut u_max) = (u64::MAX, 0_u64);
         let (mut s_min, mut s_max) = (i64::MAX, i64::MIN);
         for &u in seen.keys() {

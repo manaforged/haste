@@ -1,4 +1,4 @@
-use super::asm::{Alu, Bits, Cond, Reg, Shift, Size, ZR, encode_bitmask_imm};
+use super::asm::{Alu, Bits, Cond, Reg, Shift, Size, ZR};
 use super::{A, C, D, Emit, T, V0};
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
@@ -496,4 +496,48 @@ impl Emit<'_> {
             _ => self.float_convert(op, x, result),
         }
     }
+}
+
+pub(super) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32)> {
+    let w = if is_64 {
+        val
+    } else {
+        let low = (val as u32) as u64;
+        low | (low << 32)
+    };
+    if w == 0 || w == u64::MAX {
+        return None;
+    }
+    let mut esize = 64u32;
+    while esize > 2 && w == w.rotate_right(esize / 2) {
+        esize /= 2;
+    }
+    let mask = if esize == 64 { u64::MAX } else { (1u64 << esize) - 1 };
+    let elem = w & mask;
+    let ones = elem.count_ones();
+    if ones == 0 || ones == esize {
+        return None;
+    }
+    let tz = elem.trailing_zeros();
+    let immr = if tz > 0 {
+        (esize - tz) & (esize - 1)
+    } else {
+        let trailing_ones = (!elem & mask).trailing_zeros();
+        ones - trailing_ones
+    };
+    let n = u32::from(esize == 64);
+    let imms = ((!(esize - 1) << 1) | (ones - 1)) & 0x3F;
+    let pat = (1u64 << ones) - 1;
+    let rotated = if esize == 64 {
+        pat.rotate_right(immr)
+    } else {
+        ((pat >> immr) | (pat << (esize - immr))) & mask
+    };
+    let mut decoded = rotated;
+    let mut shift = esize;
+    while shift < 64 {
+        decoded |= decoded << shift;
+        shift *= 2;
+    }
+    (decoded == w).then_some((n, immr, imms))
 }

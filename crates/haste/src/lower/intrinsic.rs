@@ -39,6 +39,7 @@ impl Lower<'_, '_> {
             Intrinsic::FnAddr => Ok(args.first().copied()),
             Intrinsic::BytePermute(bytes) => self.byte_permute(args, bytes).map(Some),
             Intrinsic::BytePairMax => self.byte_pair_max(args).map(Some),
+            Intrinsic::Arm64(op) => self.arm64_vector(op, args).map(Some),
             Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
             _ => self.memory_intrinsic(origin, which, substs, args),
         }
@@ -159,7 +160,8 @@ impl Lower<'_, '_> {
             Repr::Zst => Ok(None),
             Repr::Scalar(_) => Ok(Some(self.ins().select(cond, yes, no))),
             Repr::Mem { .. } => {
-                let parts = super::abi::copied_parts(&*self.cx.layout(ty)?);
+                let layout = self.cx.layout(ty)?;
+                let parts = super::abi::copied_parts(&layout);
                 let Some(slot) = self.slot(whole) else { return Ok(None) };
                 let out = self.ins().stack_addr(Type::I64, slot, 0);
                 let mut pick = |m: Type, at: i32| {

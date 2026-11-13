@@ -8,6 +8,7 @@ mod coroutine;
 mod copy;
 mod cse;
 mod dom;
+mod emit;
 mod error;
 mod ir;
 mod memory;

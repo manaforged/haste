@@ -56,7 +56,13 @@ impl Infer<'_, '_> {
         let (Some(of), Some(self_ty)) = (self.cx.impl_trait(block), self.self_ty) else {
             return Ok(None);
         };
-        let args = self.fresh_trait_args(of)?;
+        let count = self.impl_params(block)?;
+        let args = if self.generics.len() >= count {
+            let impl_args: Vec<Ty> = self.generics[..count].iter().map(|&(_, ty)| ty).collect();
+            self.impl_trait_args(block, &impl_args, self_ty)?
+        } else {
+            self.fresh_trait_args(of)?
+        };
         match self.assoc_owner((of, args), self_ty, name, 0)? {
             Some((owner, args)) => self.project(owner, self_ty, args, name).map(Some),
             None => Ok(None),
@@ -453,30 +459,30 @@ impl Infer<'_, '_> {
     /// Holds the call of function `item` at `substs` to the bounds its header puts on any type parameter of its frame, its impl's included: each trait bound whose types are not known yet becomes an obligation, and each associated type a bound binds, as in `I: Iterator<Item = A>`, is tied to the bound type.
     pub(super) fn bind_bounds(&mut self, item: ItemRef, substs: &[Ty]) -> Result<()> {
         let sig = self.cx.signature(item)?;
-        if sig.generics.iter().all(|generic| generic.bounds.len == 0) && sig.predicates.is_empty() {
-            return Ok(());
-        }
-        let frame = self.frame(item, substs)?;
-        let (src, home) = (frame.src, frame.home);
-        let params: Vec<(&str, Ty)> = frame.generics.iter().copied().chain(frame.self_ty.map(|ty| ("Self", ty))).collect();
-        self.with_frame(frame, |infer| {
-            for (name, ty) in params {
-                for bound in named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), name) {
+        if sig.generics.iter().any(|generic| generic.bounds.len > 0) || !sig.predicates.is_empty() {
+            let frame = self.frame(item, substs)?;
+            let (src, home) = (frame.src, frame.home);
+            let params: Vec<(&str, Ty)> = frame.generics.iter().copied().chain(frame.self_ty.map(|ty| ("Self", ty))).collect();
+            self.with_frame(frame, |infer| {
+                for (name, ty) in params {
+                    for bound in named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), name) {
+                        infer.bind_bound(&sig.body, home, (bound, ty))?;
+                    }
+                }
+                for (ty, bound) in infer.typed_predicates(&sig.body, src, &sig.predicates) {
+                    if infer.bound_trait_at(&sig.body, bound, home).is_some_and(|(of, _)| infer.compiler_trait(of)) {
+                        continue;
+                    }
                     infer.bind_bound(&sig.body, home, (bound, ty))?;
                 }
-            }
-            for (ty, bound) in infer.typed_predicates(&sig.body, src, &sig.predicates) {
-                if infer.bound_trait_at(&sig.body, bound, home).is_some_and(|(of, _)| infer.compiler_trait(of)) {
-                    continue;
-                }
-                infer.bind_bound(&sig.body, home, (bound, ty))?;
-            }
-            Ok(())
-        })
+                Ok(())
+            })?;
+        }
+        self.bind_impl_bounds(item, substs)
     }
 
     /// Binds the bounds on the parameters of the inherent impl that owns `item` at its arguments in `substs` while one is unknown, as `C: Deref<Target = T>` names `T`.
-    pub(super) fn bind_impl_bounds(&mut self, item: ItemRef, substs: &[Ty]) -> Result<()> {
+    fn bind_impl_bounds(&mut self, item: ItemRef, substs: &[Ty]) -> Result<()> {
         let Some(block) = self.cx.owner_impl(item) else { return Ok(()) };
         let count = self.impl_params(block)?;
         let Some(args) = substs.get(..count) else { return Ok(()) };

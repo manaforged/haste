@@ -46,7 +46,7 @@ impl Lower<'_, '_> {
         match lit {
             Lit::Bool(value) => Ok(self.ins().iconst(Type::I8, i64::from(value))),
             Lit::Int => Ok(self.int_const(ty, parse_int(text)?.0)),
-            Lit::Float => self.float_const(ty, parse_float(text)?),
+            Lit::Float => Ok(self.ins().iconst(ty, parse_float(ty, text)?)),
             Lit::Char => Ok(self.ins().iconst(Type::I32, i64::from(u32::from(char_value(text)?)))),
             Lit::Byte => Ok(self.ins().iconst(Type::I8, i64::from(byte_value(text)?))),
             Lit::Str | Lit::ByteStr | Lit::CStr => self.string_lit(lit, text),
@@ -98,8 +98,11 @@ impl Lower<'_, '_> {
 
     pub(super) fn unary(&mut self, expr: ExprId, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
         if let Some(&Res::Fn(item, substs)) = self.typed.operators.get(&expr) {
-            let Some(value) = self.expr(operand)? else { return Ok(None) };
-            return self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::Operator(expr)), item, substs, vec![value]);
+            let values: Vec<Value> = self.expr(operand)?.into_iter().collect();
+            if !self.open {
+                return Ok(None);
+            }
+            return self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::Operator(expr)), item, substs, values);
         }
         let num = self.num(self.ty_of(operand))?;
         if let (UnOp::Neg, Num::Int { ty, .. }, Some(at)) = (op, num, self.int_literal(operand)) {
@@ -156,7 +159,7 @@ impl Lower<'_, '_> {
             return self.overloaded(expr, op, (lhs, rhs), (item, substs));
         }
         if self.is_wide(self.ty_of(lhs))? {
-            let (Some(x), Some(y)) = (self.expr(lhs)?, self.expr(rhs)?) else {
+            let (Some(x), Some(y)) = (self.eval_operand(lhs)?, self.eval_operand(rhs)?) else {
                 return Ok(None);
             };
             return self.wide_compare(op, (x, y)).map(Some);
@@ -195,9 +198,11 @@ impl Lower<'_, '_> {
         let by_ref = Adjust { derefs: 0, autoref: Some(Mut::Not) };
         let mut values = Vec::with_capacity(2);
         for operand in [operands.0, operands.1] {
-            let value = if compare(op).is_some() { self.receiver((expr, operand), by_ref)? } else { self.expr(operand)? };
-            let Some(value) = value else { return Ok(None) };
-            values.push(value);
+            let value = if compare(op).is_some() { self.receiver((expr, operand), by_ref)? } else { self.eval_operand(operand)? };
+            if !self.open {
+                return Ok(None);
+            }
+            values.extend(value);
         }
         self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::Operator(expr)), item, substs, values)
     }
@@ -492,6 +497,7 @@ impl Lower<'_, '_> {
         Ok(match (from, to) {
             (Num::Int { ty: a, signed }, Num::Int { ty: b, .. }) => self.resize(value, (a, signed), b),
             (Num::Bool, Num::Int { ty: b, .. }) => self.resize(value, (Type::I8, false), b),
+            (Num::Int { signed, ty: Type::I128 }, Num::Float(b)) => self.int128_to_float(value, signed, b)?,
             (Num::Int { signed, ty: a }, Num::Float(b)) => {
                 let wide = self.resize(value, (a, signed), Type::I64);
                 if signed { self.ins().fcvt_from_sint(b, wide) } else { self.ins().fcvt_from_uint(b, wide) }
@@ -502,6 +508,65 @@ impl Lower<'_, '_> {
             (Num::Float(Type::F32), Num::Float(b)) => self.ins().fpromote(b, value),
             (Num::Float(_), Num::Float(b)) => self.ins().fdemote(b, value),
             _ => bail!("cannot lower this cast yet"),
+        })
+    }
+
+    fn pow2_float(&mut self, dst: Type, shift: Value) -> Result<Value> {
+        let (int_ty, bias, mant_bits, size, align) = match dst {
+            Type::F32 => (Type::I32, 127i64, 23i64, 4u32, 2u8),
+            Type::F64 => (Type::I64, 1023i64, 52i64, 8u32, 3u8),
+            other => bail!("no float power of {other:?}"),
+        };
+        let shift = if int_ty == Type::I32 { self.ins().ireduce(Type::I32, shift) } else { shift };
+        let exp = self.ins().iadd_imm(shift, bias);
+        let mant = self.ins().iconst(int_ty, mant_bits);
+        let bits = self.ins().ishl(exp, mant);
+        let slot = self.b.create_stack_slot(size, align);
+        self.ins().stack_store(bits, slot, 0);
+        Ok(self.ins().stack_load(dst, slot, 0))
+    }
+
+    fn int128_to_float(&mut self, value: Value, signed: bool, dst: Type) -> Result<Value> {
+        let (neg, abs) = if signed {
+            let zero = self.ins().iconst(Type::I128, 0);
+            let neg = self.ins().icmp(IntCC::SignedLessThan, value, zero);
+            let flipped = self.ins().ineg(value);
+            (Some(neg), self.ins().select(neg, flipped, value))
+        } else {
+            (None, value)
+        };
+        let lo = self.ins().ireduce(Type::I64, abs);
+        let shift64 = self.ins().iconst(Type::I128, 64);
+        let hi_wide = self.ins().ushr(abs, shift64);
+        let hi = self.ins().ireduce(Type::I64, hi_wide);
+        let hi_zero = self.ins().icmp_imm(IntCC::Equal, hi, 0);
+        let lz = self.ins().clz(hi);
+        let lz_zero = self.ins().icmp_imm(IntCC::Equal, lz, 0);
+        let c64 = self.ins().iconst(Type::I64, 64);
+        let shift = self.ins().isub(c64, lz);
+        let zero64 = self.ins().iconst(Type::I64, 0);
+        let top = self.ins().ishl(hi, lz);
+        let mask63 = self.ins().iconst(Type::I64, 63);
+        let safe_shift = self.ins().band(shift, mask63);
+        let shifted_lo = self.ins().ushr(lo, safe_shift);
+        let low_part = self.ins().select(lz_zero, zero64, shifted_lo);
+        let rem_shifted = self.ins().ishl(lo, lz);
+        let rem = self.ins().select(lz_zero, lo, rem_shifted);
+        let rem_nz = self.ins().icmp_imm(IntCC::NotEqual, rem, 0);
+        let sticky = self.ins().uextend(Type::I64, rem_nz);
+        let top_low = self.ins().bor(top, low_part);
+        let mag = self.ins().bor(top_low, sticky);
+        let u64_val = self.ins().select(hi_zero, lo, mag);
+        let float_val = self.ins().fcvt_from_uint(dst, u64_val);
+        let scale = self.pow2_float(dst, shift)?;
+        let scaled = self.ins().fmul(float_val, scale);
+        let unsigned = self.ins().select(hi_zero, float_val, scaled);
+        Ok(match neg {
+            Some(neg) => {
+                let negated = self.ins().fneg(unsigned);
+                self.ins().select(neg, negated, unsigned)
+            }
+            None => unsigned,
         })
     }
 
@@ -589,8 +654,12 @@ fn float_cc(cmp: Cmp) -> FloatCC {
     }
 }
 
-fn parse_float(text: &str) -> Result<f64> {
+fn parse_float(ty: Type, text: &str) -> Result<i64> {
     let digits: String = text.chars().filter(|ch| *ch != '_').collect();
     let digits = ["f16", "f32", "f64", "f128"].iter().find_map(|suffix| digits.strip_suffix(suffix)).unwrap_or(&digits);
-    Ok(digits.parse()?)
+    match ty {
+        Type::F32 => Ok(i64::from(digits.parse::<f32>()?.to_bits())),
+        Type::F64 => Ok(digits.parse::<f64>()?.to_bits() as i64),
+        other => bail!("no float constant of {other:?}"),
+    }
 }

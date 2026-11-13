@@ -8,18 +8,20 @@ use std::time::Instant;
 use crate::graph::{self, Targets};
 use anyhow::{Result, bail};
 
-use crate::build::{Build, Stamp, stamp};
+use crate::build::Build;
+use crate::graph::store::{FileStamp, file_stamp, watched_stamps};
 
-/// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file, local manifests and local build scripts it was loaded from.
+/// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file, local manifests, build scripts and watched inputs it was loaded from.
 struct Served<'a> {
     root: &'a Path,
     targets: &'a Targets,
     workspace: &'a mut graph::Workspace,
-    manifests: Vec<(PathBuf, Stamp)>,
+    manifests: Vec<(PathBuf, FileStamp)>,
+    watched: (Vec<(PathBuf, u64, i128)>, Vec<(String, Option<std::ffi::OsString>)>),
 }
 
 impl Served<'_> {
-    fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, Stamp)> {
+    fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, FileStamp)> {
         let top = graph::workspace_root(root).unwrap_or_else(|_| root.to_owned());
         let head = [top.join("Cargo.lock"), top.join("Cargo.toml"), root.join("Cargo.toml")];
         let local = workspace.packages.iter().filter(|package| package.local()).flat_map(|package| std::iter::once(package.manifest.dir.join("Cargo.toml")).chain(package.manifest.build.clone()));
@@ -29,19 +31,21 @@ impl Served<'_> {
         paths
             .into_iter()
             .map(|path| {
-                let now = stamp(&path);
+                let now = file_stamp(&path);
                 (path, now)
             })
             .collect()
     }
 
-    /// Loads the workspace again, running changed build scripts, when the lock file, a local manifest or a local build script changed since it loaded; returns whether it did.
+    /// Loads the workspace again, running changed build scripts, when the lock file, a local manifest, a local build script or a watched input changed since it loaded; returns whether it did.
     fn reload(&mut self) -> Result<bool> {
-        if self.manifests.iter().all(|(path, kept)| stamp(path) == *kept) {
+        let manifests_ok = self.manifests.iter().all(|(path, kept)| file_stamp(path) == *kept);
+        if manifests_ok && watched_stamps(self.workspace) == self.watched {
             return Ok(false);
         }
         *self.workspace = crate::cli::load_workspace(self.root, self.targets)?;
         self.manifests = Served::manifests(self.workspace, self.root);
+        self.watched = watched_stamps(self.workspace);
         Ok(true)
     }
 }
@@ -57,7 +61,8 @@ pub enum Request {
     Run,
 }
 
-const MODES: [(Request, &str); 3] = [(Request::Build, "build"), (Request::Test, "test"), (Request::Run, "run")];
+/// The command-line names of server-handled requests.
+pub const MODES: [(Request, &str); 3] = [(Request::Build, "build"), (Request::Test, "test"), (Request::Run, "run")];
 
 impl Request {
     fn byte(self) -> u8 {
@@ -173,7 +178,8 @@ pub fn serve(workspace: &mut graph::Workspace, targets: &Targets, root: &std::pa
     let started = Instant::now();
     let mut build = Some(Build::load(workspace, targets)?);
     let manifests = Served::manifests(workspace, root);
-    let mut served = Served { root, targets, workspace, manifests };
+    let watched = watched_stamps(workspace);
+    let mut served = Served { root, targets, workspace, manifests, watched };
     eprintln!("serving {} after {:.1} ms", root.display(), started.elapsed().as_secs_f64() * 1e3);
     loop {
         // SAFETY: listener is a listening socket; accept returns a new descriptor or -1.
@@ -183,6 +189,9 @@ pub fn serve(workspace: &mut graph::Workspace, targets: &Targets, root: &std::pa
         }
         // SAFETY: fd is the accepted connection, which this File owns from here on.
         let mut conn = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !same_user(fd) {
+            continue;
+        }
         let status = match receive(fd) {
             Ok((byte, fds)) => match read_args(&mut conn) {
                 Ok(args) => answer(&mut build, &mut served, Request::parse(byte).map(|request| (request, args)), &fds),
@@ -192,6 +201,22 @@ pub fn serve(workspace: &mut graph::Workspace, targets: &Targets, root: &std::pa
         };
         drop(conn.write_all(&status.to_le_bytes()));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn same_user(fd: RawFd) -> bool {
+    // SAFETY: ucred is plain data, and all zero bytes are a valid value.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: fd is an accepted AF_UNIX socket, and cred/len point to live storage of size len.
+    let rc = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &raw mut len) };
+    // SAFETY: geteuid takes no pointers and reads the process's effective user id.
+    rc == 0 && len as usize == std::mem::size_of::<libc::ucred>() && cred.uid == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn same_user(_fd: RawFd) -> bool {
+    true
 }
 
 fn listen(root: &std::path::Path) -> Result<RawFd> {

@@ -1,7 +1,7 @@
 use super::asm::{Alu, Reg, Size, Vreg, ZR};
 use super::{A, C, D, Emit, IP, V0, V1};
 use crate::frame::Ext;
-use crate::ir::{Binary, ByteCC, Op, Type, Value, VectorOp};
+use crate::ir::{Binary, ByteCC, Op, Sha256Op, Type, Value, VectorOp};
 
 impl Emit<'_> {
     pub(super) fn vector_inst(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<bool, String> {
@@ -59,6 +59,7 @@ impl Emit<'_> {
                 self.fput(res, dst);
             }
             Op::Vector(kind, x, y) => self.vector_op(kind, (x, y), result()?)?,
+            Op::Sha256Rounds(kind, x, y, z) => self.sha256_rounds(kind, (x, y, z), result()?)?,
             Op::Splat(x) => {
                 let res = result()?;
                 let dst = self.fdst(res);
@@ -96,9 +97,21 @@ impl Emit<'_> {
     fn vector_op(&mut self, kind: VectorOp, (x, y): (Value, Value), result: Value) -> Result<(), String> {
         let dst = self.fdst(result);
         let a = self.fin(x, V0);
-        let b = self.fin(y, V1);
+        let mut b = self.fin(y, V1);
         match kind {
             VectorOp::ByteShuffle => self.asm.vtbl(dst, a, b),
+            VectorOp::UmaxPairBytes => self.asm.vbit(0x6E20_A400, dst, a, b),
+            VectorOp::Sqdmulh2S => self.asm.vbit(0x0EA0_B400, dst, a, b),
+            VectorOp::Sqdmulh4S => self.asm.vbit(0x4EA0_B400, dst, a, b),
+            VectorOp::Sqdmulh8H => self.asm.vbit(0x4E60_B400, dst, a, b),
+            VectorOp::Sha256Su0 => {
+                if b == dst && a != dst {
+                    self.asm.vmov(V1, b);
+                    b = V1;
+                }
+                self.asm.vmov(dst, a);
+                self.asm.vsha256su0(dst, b);
+            }
             VectorOp::AddBytes => self.asm.varith(false, 0, dst, a, b),
             VectorOp::AddWords => self.asm.varith(false, 1, dst, a, b),
             VectorOp::AddDwords => self.asm.varith(false, 2, dst, a, b),
@@ -109,6 +122,33 @@ impl Emit<'_> {
             VectorOp::SubQwords => self.asm.varith(true, 3, dst, a, b),
             other => return Err(format!("unsupported ARM64 vector op {other:?}")),
         }
+        self.fput(result, dst);
+        Ok(())
+    }
+
+    fn sha256_rounds(&mut self, kind: Sha256Op, (x, y, z): (Value, Value, Value), result: Value) -> Result<(), String> {
+        let base = match kind {
+            Sha256Op::Arm64H => 0x5E00_4000,
+            Sha256Op::Arm64H2 => 0x5E00_5000,
+            Sha256Op::Arm64Su1 => 0x5E00_6000,
+            Sha256Op::X86Rnds2 => return Err(format!("unsupported ARM64 sha256 op {kind:?}")),
+        };
+        let dst = self.fdst(result);
+        let a = self.fin(x, V0);
+        let mut b = self.fin(y, V1);
+        let mut c = self.fin(z, Vreg(2));
+        if dst != a {
+            if b == dst {
+                self.asm.vmov(V1, b);
+                b = V1;
+            }
+            if c == dst {
+                self.asm.vmov(Vreg(2), c);
+                c = Vreg(2);
+            }
+            self.asm.vmov(dst, a);
+        }
+        self.asm.vbit(base, dst, b, c);
         self.fput(result, dst);
         Ok(())
     }

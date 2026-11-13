@@ -235,7 +235,17 @@ fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     }
 }
 
-const USAGE: &str = "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] [-o PATH] build|test|run|serve|prep PATH [--] [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]\n       haste [--release] debug code PATH DIR";
+const TOP_COMMANDS: [(Command, &str); 2] = [(Command::Serve, "serve"), (Command::Prep, "prep")];
+
+fn usage() -> String {
+    let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().map(|(_, name)| name)).collect();
+    let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
+    format!(
+        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] [-o PATH] {} PATH [--] [ARGS...]\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR",
+        modes.join("|"),
+        queries.join("|"),
+    )
+}
 
 /// What the command line asks for.
 #[derive(Clone, Copy)]
@@ -267,25 +277,29 @@ enum Query {
 
 const QUERIES: [(Query, &str); 9] = [(Query::Graph, "graph"), (Query::Outline, "outline"), (Query::Lazy, "lazy"), (Query::Typeck, "typeck"), (Query::Scope, "scope"), (Query::Items, "items"), (Query::Expand, "expand"), (Query::Failures, "failures"), (Query::Code, "code")];
 
-fn parse(args: &mut impl Iterator<Item = String>) -> Result<Command> {
-    let word = args.next().context(USAGE)?;
-    match word.as_str() {
-        "serve" => Ok(Command::Serve),
-        "prep" => Ok(Command::Prep),
-        "debug" => {
-            let name = args.next().context(USAGE)?;
-            QUERIES.into_iter().find(|(_, query)| *query == name).map(|(query, _)| Command::Debug(query)).context(USAGE)
-        }
-        _ => Request::parse_mode(&word).map(Command::Request).context(USAGE),
-    }
+fn next_str(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<String> {
+    let raw = args.next().with_context(usage)?;
+    raw.into_string().map_err(|bad| anyhow::anyhow!("non-UTF-8 argument: {}", bad.to_string_lossy()))
 }
 
-fn consume_options<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>, stats: &mut Option<PathBuf>, out: &mut Option<PathBuf>) -> Result<()> {
-    while let Some(flag) = args.peek() {
-        match flag.as_str() {
+fn parse(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<Command> {
+    let word = next_str(args)?;
+    if let Some((cmd, _)) = TOP_COMMANDS.into_iter().find(|(_, name)| *name == word) {
+        return Ok(cmd);
+    }
+    if word == "debug" {
+        let name = next_str(args)?;
+        return QUERIES.into_iter().find(|(_, query)| *query == name).map(|(query, _)| Command::Debug(query)).with_context(usage);
+    }
+    Request::parse_mode(&word).map(Command::Request).with_context(usage)
+}
+
+fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter::Peekable<I>, stats: &mut Option<PathBuf>, out: &mut Option<PathBuf>) -> Result<()> {
+    while let Some(flag) = args.peek().and_then(|raw| raw.to_str()) {
+        match flag {
             "--jobs" => {
                 args.next();
-                let count: usize = args.next().context(USAGE)?.parse().context("--jobs takes a positive number")?;
+                let count: usize = next_str(args)?.parse().context("--jobs takes a positive number")?;
                 crate::set_jobs(count.max(1));
             }
             "--release" => {
@@ -298,7 +312,7 @@ fn consume_options<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>
             }
             "--prep-wait" => {
                 args.next();
-                let millis: u64 = args.next().context(USAGE)?.parse().context("--prep-wait takes a number of milliseconds")?;
+                let millis: u64 = next_str(args)?.parse().context("--prep-wait takes a number of milliseconds")?;
                 crate::prep::set_wait(std::time::Duration::from_millis(millis));
             }
             "--perf-map" => {
@@ -344,7 +358,7 @@ fn tune_malloc() {
 }
 
 fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>, Option<PathBuf>)> {
-    let mut args = std::env::args().skip(1).peekable();
+    let mut args = std::env::args_os().skip(1).peekable();
     let mut stats_json = None;
     let mut out = None;
     consume_options(&mut args, &mut stats_json, &mut out)?;
@@ -354,8 +368,10 @@ fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>,
     } else if stats_json.is_some() || out.is_some() {
         anyhow::bail!("--stats-json and -o are only supported with `haste build`");
     }
-    let path = PathBuf::from(args.next().context(USAGE)?);
-    let rest: Vec<String> = args.collect();
+    let path = PathBuf::from(args.next().with_context(usage)?);
+    let rest = args
+        .map(|raw| raw.into_string().map_err(|bad| anyhow::anyhow!("non-UTF-8 argument: {}", bad.to_string_lossy())))
+        .collect::<Result<Vec<String>>>()?;
     let rest = match rest.split_first() {
         Some((first, tail)) if first == "--" => tail.to_vec(),
         _ => rest,
@@ -396,13 +412,13 @@ fn report_query(query: Query, (workspace, targets): (&graph::Workspace, &Targets
         Query::Lazy => report_lazy(workspace, targets),
         Query::Typeck => report_typeck(workspace, targets),
         Query::Scope => {
-            let name = argv.get(1).context(USAGE)?;
+            let name = argv.get(1).with_context(usage)?;
             let compilation = crate::macros::load_eager(workspace, targets, &[])?;
             print_scope(&compilation.outline, &compilation.names, name);
             Ok(())
         }
         Query::Failures => report_failures(workspace, targets),
-        Query::Code => crate::dump::write(workspace, targets, std::path::Path::new(argv.get(1).context(USAGE)?)),
+        Query::Code => crate::dump::write(workspace, targets, std::path::Path::new(argv.get(1).with_context(usage)?)),
         Query::Items | Query::Expand => Ok(()),
     }
 }

@@ -1,15 +1,81 @@
 use anyhow::Result;
+use rustc_hash::FxHashSet;
 
+use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
-use crate::sema::infer::{Res, SiteKey, Typed};
+use crate::sema::infer::{BodyTables, ClosureBody, Coercion, Res, Shape, SiteKey, Typed, glue_call};
 use crate::sema::layout::field_offset;
 use crate::sema::reach::Reached;
+use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::reloc::{eval_autoderef_ty, eval_deref_step};
+use super::build::build_plan;
 use super::ty::{HashMix, hash_num_tag, hash_repr, hash_tuple_offsets, hash_ty_facts};
 use super::{BodyFootprintPlan, FieldSite, PatSite, PatSiteKind};
+
+pub(super) fn closure_locals(plan: &BodyFootprintPlan, typed: &Typed, tables: &BodyTables, cb: &ClosureBody) -> Vec<u32> {
+    let mut out: Vec<u32> = typed.params.iter().copied().chain(cb.closure.captures.iter().map(|c| c.local)).collect();
+    out.extend(plan.pat_sites.iter().filter_map(|ps| tables.syntax.binds.get(&ps.pat).copied()));
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+pub(super) fn closure_own_calls(cx: &mut Context<'_>, plan: &BodyFootprintPlan, typed: &Typed, tables: &BodyTables, cb: &ClosureBody) -> Result<Vec<(ItemRef, Substs)>> {
+    let mut calls: Vec<Res> = Vec::new();
+    for &expr in &plan.expr_ids {
+        calls.extend([&tables.res, &tables.operators, &tables.try_blocks, &tables.box_frees].into_iter().filter_map(|m| m.get(&expr).copied()));
+        calls.extend(tables.fors.get(&expr).into_iter().flat_map(|f| [f.into_iter, f.next]));
+        calls.extend(tables.tries.get(&expr).into_iter().flat_map(|t| [t.branch, t.from_residual]));
+        calls.extend(tables.awaits.get(&expr).into_iter().flat_map(|a| [a.into_future, a.poll]));
+        if let Some(c) = tables.coercions.get(&expr) {
+            push_coercion_calls(c, &mut calls);
+        }
+    }
+    for &((expr, _), res) in tables.derefs.as_slice() {
+        if plan.contains_expr(expr) {
+            calls.push(res);
+        }
+    }
+    for ps in &plan.pat_sites {
+        if let Some(&res) = tables.pat_res.get(&ps.pat) {
+            calls.push(res);
+        }
+    }
+    let mut out: Vec<(ItemRef, Substs)> = calls.into_iter().filter_map(|r| match r { Res::Fn(i, s) => Some((i, s)), _ => None }).collect();
+    if !typed.drops.is_empty() {
+        let mut seen = FxHashSet::default();
+        let tys = closure_locals(plan, typed, tables, cb).into_iter().map(|l| typed.locals[l as usize].ty).chain(plan.expr_ids.iter().map(|&e| tables.exprs[e.0 as usize]));
+        for ty in tys {
+            if ty != Ty::NONE && seen.insert(ty) && let Some(res @ Res::Fn(di, ds)) = glue_call(cx, ty)? && typed.drops.contains(&res) {
+                out.push((di, ds));
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub(in crate::lower) fn closure_calls_uncached(cx: &mut Context<'_>, typed: &Typed) -> Option<Vec<(ItemRef, Substs)>> {
+    let Shape::Closure(cb) = &typed.shape else { return None };
+    let body = cx.body(cb.parent).ok()?;
+    let plan = build_plan(&body, Some(cb.closure.body));
+    let tables = match &typed.tables {
+        crate::sema::infer::LazyTables::Eager(t) => t.as_ref(),
+        crate::sema::infer::LazyTables::Poly(p) => p.ensure_tables(&cx.types),
+    };
+    closure_own_calls(cx, &plan, typed, tables, cb).ok()
+}
+
+fn push_coercion_calls(coercion: &Coercion, out: &mut Vec<Res>) {
+    match coercion {
+        Coercion::Vtable(vt) => out.extend(vt.calls().into_iter().copied()),
+        Coercion::Reify(res) => out.push(*res),
+        Coercion::Deref(steps, _) => out.extend(steps.iter().filter_map(|(_, r)| *r)),
+        Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => {}
+    }
+}
 
 pub(super) fn hash_plan_sites(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, plan: &BodyFootprintPlan, typed: &Typed) -> Result<()> {
     for site in &plan.field_sites {

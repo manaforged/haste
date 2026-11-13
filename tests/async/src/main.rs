@@ -188,6 +188,8 @@ fn case_async_done_drop(n: i64) -> i64 {
     log.get() * 100 + got
 }
 
+include!("../../case_inputs.rs");
+
 fn main() {
     let cases: [(&str, fn(i64) -> i64); 18] = [
         ("case_mod_fn", case_mod_fn),
@@ -210,7 +212,7 @@ fn main() {
         ("case_async_done_drop", case_async_done_drop),
     ];
     for (name, case) in cases {
-        for n in [-5, 0, 1, 3, 20] {
+        for n in CASE_INPUTS {
             println!("{name} {n} {}", case(n));
         }
     }

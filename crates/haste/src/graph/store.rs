@@ -70,10 +70,25 @@ impl Expansion {
     }
 }
 
+/// The byte size and nanosecond modification timestamp of a file, or none when unreadable.
+pub(crate) type FileStamp = Option<(u64, i128)>;
+
+/// Extracts the byte size and nanosecond modification timestamp from file metadata `meta`.
+pub(crate) fn meta_stamp(meta: &std::fs::Metadata) -> (u64, i128) {
+    let nanos = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
+    (meta.len(), nanos)
+}
+
+/// The byte size and modification timestamp of `path`, or none when unreadable.
+pub(crate) fn file_stamp(path: &Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(meta_stamp(&meta))
+}
+
 /// The size and modification time of this program, whose changes make what the store kept stale.
-pub(crate) fn program() -> Option<(u64, i64, i64)> {
-    static PROGRAM: std::sync::OnceLock<Option<(u64, i64, i64)>> = std::sync::OnceLock::new();
-    *PROGRAM.get_or_init(|| std::env::current_exe().and_then(std::fs::metadata).map(|meta| (meta.len(), meta.mtime(), meta.mtime_nsec())).ok())
+pub(crate) fn program() -> FileStamp {
+    static PROGRAM: std::sync::OnceLock<FileStamp> = std::sync::OnceLock::new();
+    *PROGRAM.get_or_init(|| std::env::current_exe().ok().as_deref().and_then(file_stamp))
 }
 
 /// The directory that holds the build script output of `unit`: the script's `OUT_DIR`, its standard error, what it printed and the stamp that says when it is current.
@@ -177,7 +192,7 @@ struct Watched {
 }
 
 impl Watched {
-    /// What Cargo watches for `unit`: the `rerun-if` lines the script printed, else every file of a package that is not an unpacked registry or git source; a local script's own source always.
+    /// What Cargo watches for `unit`: the `rerun-if` lines the script printed, else every file of a package that is not an unpacked registry or git source; a local script's own sources always.
     fn of(workspace: &Workspace, unit: usize, output: &Output) -> Watched {
         let package = &workspace.packages[workspace.graph.units[unit].package];
         let manifest = &package.manifest;
@@ -186,8 +201,8 @@ impl Watched {
         if output.watched.is_empty() && output.watched_vars.is_empty() && local {
             files.push(manifest.dir.clone());
         }
-        if local {
-            files.extend(manifest.build.iter().cloned());
+        if local && let Some(build) = &manifest.build {
+            build_script_inputs(&manifest.dir, build, &mut files);
         }
         Watched { files, vars: output.watched_vars.clone() }
     }
@@ -215,14 +230,67 @@ impl Watched {
     }
 }
 
+fn build_script_inputs(manifest_dir: &Path, build_path: &Path, into: &mut Vec<PathBuf>) {
+    into.push(build_path.to_owned());
+    let mod_dir = build_path.with_extension("");
+    if mod_dir.is_dir() {
+        into.push(mod_dir);
+    }
+    if let Some(parent) = build_path.parent()
+        && parent != manifest_dir
+    {
+        into.push(parent.to_owned());
+    }
+    let Ok(entries) = std::fs::read_dir(manifest_dir) else {
+        return;
+    };
+    let mut extras: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs") && path.is_file())
+        .collect();
+    extras.sort();
+    into.extend(extras);
+}
+
+/// Stamps of all build-script sources, `cargo:rerun-if-changed` paths, and `cargo:rerun-if-env-changed` values for local packages in `workspace`.
+pub(crate) fn watched_stamps(workspace: &Workspace) -> (Vec<(PathBuf, u64, i128)>, Vec<(String, Option<std::ffi::OsString>)>) {
+    let mut files = Vec::new();
+    let mut vars = Vec::new();
+    for (unit, entry) in workspace.graph.units.iter().enumerate() {
+        let package = &workspace.packages[entry.package];
+        let Some(build) = &package.manifest.build else { continue };
+        if !package.local() {
+            continue;
+        }
+        build_script_inputs(&package.manifest.dir, build, &mut files);
+        let watched = std::fs::read_to_string(dir(workspace, unit).join(STAMP))
+            .ok()
+            .map(|text| Watched::read(text.lines().skip(2)))
+            .unwrap_or_else(|| Watched::of(workspace, unit, &Output::default()));
+        files.extend(watched.files);
+        vars.extend(watched.vars);
+    }
+    files.sort();
+    files.dedup();
+    vars.sort();
+    vars.dedup();
+    let mut stamps = Vec::new();
+    for path in &files {
+        walk(path, &mut stamps);
+    }
+    let env_vals = vars.into_iter().map(|name| (name.clone(), std::env::var_os(&name))).collect();
+    (stamps, env_vals)
+}
+
 /// Adds the path, size and modification time of `path`, or of every file under it when it is a directory other than a build output or VCS directory.
-pub(crate) fn walk(path: &Path, into: &mut Vec<(PathBuf, u64, i64, i64)>) {
+pub(crate) fn walk(path: &Path, into: &mut Vec<(PathBuf, u64, i128)>) {
     let Ok(meta) = std::fs::metadata(path) else {
-        into.push((path.to_owned(), 0, 0, -1));
+        into.push((path.to_owned(), 0, -1));
         return;
     };
     if !meta.is_dir() {
-        into.push((path.to_owned(), meta.len(), meta.mtime(), meta.mtime_nsec()));
+        let (len, nanos) = meta_stamp(&meta);
+        into.push((path.to_owned(), len, nanos));
         return;
     }
     let Ok(entries) = std::fs::read_dir(path) else {

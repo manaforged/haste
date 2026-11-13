@@ -140,6 +140,7 @@ impl GroupWork {
 
 pub(super) enum VerifyRecord {
     Patched { exec: usize, len: usize, sites: Vec<Site> },
+    Compiled { code: Arc<Code>, symbols: Vec<u64> },
     Dict { body_exec: usize, stub_exec: usize, stub_bytes: Vec<u8>, code: Arc<Code> },
 }
 
@@ -310,18 +311,17 @@ impl Image {
     fn compile_singleton(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<(), String> {
         let started = std::time::Instant::now();
         let item = reached.list[index].0.0;
-        let tree = &cx.outline.crates[item.krate as usize];
-        let sysroot_frozen = !self.jit_mode && tree.is_sysroot();
-        let footprint = if sysroot_frozen {
+        let footprint = if !self.jit_mode && cx.outline.is_sysroot(item.krate) {
             Some(lower::eval_footprint(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?)
         } else {
             None
         };
         let substrate = cx.store().substrate().cloned();
-        if let Some(fp) = footprint
+        if !pass.stencils.cfg.verify
+            && let Some(fp) = footprint
+            && let Some((stencil_key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp)
             && let Some(substrate) = substrate.as_ref()
-            && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
-            && let Some(slice) = substrate.stencil(mode_stencil_key(self.mode, item_key), fp.0)
+            && let Some(slice) = substrate.stencil(stencil_key, fp_bits)
         {
             if self.mode == ImageMode::Check {
                 pass.record_size(index, slice.code().len() as u32, 0);
@@ -364,13 +364,12 @@ impl Image {
             pass.record_size(index, 0, started.elapsed().as_nanos() as u64);
             return Ok(());
         }
-        let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, item, e))?);
+        let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target()).map_err(|e| item_err(cx, item, e))?);
         if let Some(fp) = footprint
-            && cx.outline.is_sysroot(item.krate)
             && aot_relocs_valid(&code, out.relocs.len())
             && lower::eval_footprint(cx, reached, self, index).ok() == Some(fp)
         {
-            self.maybe_freeze_stencil(cx, item, fp.0, &code, pass);
+            self.maybe_freeze_stencil(cx, reached, index, fp, &code, pass);
         }
         if self.mode == ImageMode::Jit {
             let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
@@ -428,13 +427,10 @@ impl Image {
                 continue;
             }
             let Some((&rep, rest)) = indices.split_first() else { continue };
-            let tree = &cx.outline.crates[item.krate as usize];
             if !cfg.verify
-                && !self.jit_mode
-                && tree.is_sysroot()
+                && let Some((stencil_key, fp_bits)) = self.frozen_stencil_key(cx, reached, rep, footprint)
                 && let Some(substrate) = cx.store().substrate()
-                && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
-                && let Some(slice) = substrate.stencil(mode_stencil_key(self.mode, item_key), footprint.0)
+                && let Some(slice) = substrate.stencil(stencil_key, fp_bits)
             {
                 if self.mode == ImageMode::Check {
                     let len = slice.code().len() as u32;
@@ -516,7 +512,7 @@ impl Image {
                     CachedTemplate::Dict { code, .. } => self.record_aot(index, AotFn::Dict { body: Arc::clone(code), relocs: relocs.clone() }, &[]),
                 }
             }
-            return self.cached_verify_record((item, footprint), addr, is_dict, pass);
+            return self.cached_verify_record((item, footprint), addr, is_dict, symbols, pass);
         }
         let template = pass.stencils.templates.get(&(item, footprint)).cloned()?;
         match template {
@@ -529,7 +525,11 @@ impl Image {
                 if self.mode != ImageMode::Check {
                     pass.stencils.aliases.insert(alias_key, (exec, false));
                 }
-                Some(VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() })
+                if self.mode == ImageMode::Jit {
+                    Some(VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() })
+                } else {
+                    Some(VerifyRecord::Compiled { code, symbols: symbols.to_vec() })
+                }
             }
             CachedTemplate::Dict { body_exec, code, .. } => {
                 let (stub_exec, stub_bytes) = if self.mode != ImageMode::Jit { (0, Vec::new()) } else { let (e, b) = self.emit_dict_stub(body_exec, symbols, pass).ok()?; self.publish(index, e); (e, b) };
@@ -545,20 +545,23 @@ impl Image {
         }
     }
 
-    fn cached_verify_record(&self, key: (ItemRef, FootprintId), addr: usize, is_dict: bool, pass: &Pass) -> Option<VerifyRecord> {
+    fn cached_verify_record(&self, key: (ItemRef, FootprintId), addr: usize, is_dict: bool, symbols: &[u64], pass: &Pass) -> Option<VerifyRecord> {
         match (is_dict, pass.stencils.templates.get(&key)?) {
-            (false, CachedTemplate::Stencil { code, .. }) => Some(VerifyRecord::Patched { exec: addr, len: code.bytes().len(), sites: code.sites().to_vec() }),
+            (false, CachedTemplate::Stencil { code, .. }) if self.mode == ImageMode::Jit => Some(VerifyRecord::Patched { exec: addr, len: code.bytes().len(), sites: code.sites().to_vec() }),
+            (false, CachedTemplate::Stencil { code, .. }) => Some(VerifyRecord::Compiled { code: code.clone(), symbols: symbols.to_vec() }),
             (true, CachedTemplate::Dict { body_exec, code, .. }) => Some(VerifyRecord::Dict { body_exec: *body_exec, stub_exec: addr, stub_bytes: Vec::new(), code: code.clone() }),
             _ => None,
         }
     }
 
     fn try_frozen_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &GroupWork, cfg: DictConfig, pass: &mut Pass) -> Option<Result<(), String>> {
-        let tree = &cx.outline.crates[group.item.krate as usize];
-        if !tree.is_sysroot() { return None; }
+        if cfg.verify {
+            return None;
+        }
+        let rep = group.representative();
+        let (stencil_key, fp_bits) = self.frozen_stencil_key(cx, reached, rep, group.footprint)?;
         let substrate = cx.store().substrate()?;
-        let item_key = crate::substrate::sysroot_item_key(cx.outline, group.item)?;
-        let slice = substrate.stencil(mode_stencil_key(self.mode, item_key), group.footprint.0)?;
+        let slice = substrate.stencil(stencil_key, fp_bits)?;
         if self.mode == ImageMode::Aot {
             let code = Arc::new(slice.to_code().ok()?);
             if !group.distinct.iter().all(|inst| inst.relocs.as_ref().is_some_and(|r| aot_relocs_valid(&code, r.len()))) {
@@ -616,12 +619,11 @@ impl Image {
             return Ok(());
         }
         let reloc_plan = out.reloc_plan;
-        let code = Arc::new(haste_codegen::compile(out.func, &target().direct_calls(self.mode == ImageMode::Aot)).map_err(|e| item_err(cx, group.item, e))?);
-        if cx.outline.is_sysroot(group.item.krate)
-            && group.distinct.first().is_some_and(|inst| aot_relocs_valid(&code, inst.symbols.len()))
+        let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target()).map_err(|e| item_err(cx, group.item, e))?);
+        if group.distinct.first().is_some_and(|inst| aot_relocs_valid(&code, inst.symbols.len()))
             && lower::eval_footprint(cx, reached, self, rep).ok() == Some(group.footprint)
         {
-            self.maybe_freeze_stencil(cx, group.item, group.footprint.0, &code, pass);
+            self.maybe_freeze_stencil(cx, reached, rep, group.footprint, &code, pass);
         }
         if code.bytes().len() > cfg.min_bytes && group.distinct.len() >= cfg.min_fanout {
             pass.record_size(rep, 0, started.elapsed().as_nanos() as u64);
@@ -639,7 +641,12 @@ impl Image {
             }
             if cfg.verify {
                 for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {
-                    records.push((idx, VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() }));
+                    let rec = if self.mode == ImageMode::Jit {
+                        VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() }
+                    } else {
+                        VerifyRecord::Compiled { code: Arc::clone(&code), symbols: inst.symbols.clone() }
+                    };
+                    records.push((idx, rec));
                 }
             }
         }
@@ -701,15 +708,24 @@ impl Image {
         self.data(&bytes) as usize
     }
 
-    fn maybe_freeze_stencil(&self, cx: &Context<'_>, item: ItemRef, footprint: u128, code: &Arc<Code>, pass: &mut Pass) {
-        let tree = &cx.outline.crates[item.krate as usize];
-        if !self.jit_mode
-            && cx.deferred_evals.is_empty()
-            && tree.is_sysroot()
+    fn frozen_stencil_key(&self, cx: &Context<'_>, reached: &Reached, index: usize, fp: FootprintId) -> Option<(u64, u128)> {
+        if self.jit_mode || !fp.is_portable() {
+            return None;
+        }
+        let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
+        if !matches!(typed.shape, crate::sema::infer::Shape::Body) || typed.has_awaits() || !cx.outline.is_sysroot(item.krate) {
+            return None;
+        }
+        let item_key = crate::substrate::sysroot_item_key(cx.outline, *item)?;
+        Some((mode_stencil_key(self.mode, item_key), fp.0))
+    }
+
+    fn maybe_freeze_stencil(&self, cx: &Context<'_>, reached: &Reached, index: usize, fp: FootprintId, code: &Arc<Code>, pass: &mut Pass) {
+        if cx.deferred_evals.is_empty()
             && code.relocs().iter().all(|r| r.symbol_index().is_some() || (self.mode == ImageMode::Aot && r.as_runtime().is_some()))
-            && let Some(item_key) = crate::substrate::sysroot_item_key(cx.outline, item)
+            && let Some((stencil_key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp)
         {
-            pass.frozen_stencils.push((mode_stencil_key(self.mode, item_key), footprint, Arc::clone(code)));
+            pass.frozen_stencils.push((stencil_key, fp_bits, Arc::clone(code)));
         }
     }
 

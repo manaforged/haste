@@ -35,7 +35,7 @@ pub(in crate::sema) struct PolyState {
 
 pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
     let before = cx.quiet_mark();
-    if item.declaring_body().is_some() || cx.attr_at(item, "define_opaque").is_some() {
+    if cx.attr_at(item, "define_opaque").is_some() {
         return SummaryKind::MonomorphicFallback;
     }
     let (Ok(sig), Ok(body), Ok(home)) = (cx.signature(item), cx.body(item), cx.module_of(item)) else {
@@ -700,7 +700,7 @@ impl Infer<'_, '_> {
         }
         if has_params {
             let full: Vec<Ty> = std::iter::once(self_ty).chain(args.iter().copied()).collect();
-            let _ = self.assume(of, &full)?;
+            self.assume(of, &full)?;
             if self.poly_holds_in_env(of, self_ty, args)? {
                 self.poly_prove(of, self_ty, args);
                 return Ok(true);

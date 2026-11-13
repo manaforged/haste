@@ -197,8 +197,26 @@ impl Image {
     fn verify_with_fresh(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, record: &VerifyRecord) -> Result<()> {
         match record {
             VerifyRecord::Patched { exec, len, sites } => Self::verify_patched(cx, reached, fresh, index, (*exec, *len), sites),
+            VerifyRecord::Compiled { code, symbols } => Self::verify_compiled(cx, reached, fresh, index, code, symbols),
             VerifyRecord::Dict { body_exec, stub_exec, stub_bytes, code } => Self::verify_dict(cx, reached, fresh, index, (*body_exec, *stub_exec), stub_bytes, code),
         }
+    }
+
+    fn verify_compiled(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, code: &Code, symbols: &[u64]) -> Result<()> {
+        let out = lower::lower_stencil(cx, reached, fresh, index)?;
+        let slots: &dyn Slots = fresh;
+        let fresh_syms: Vec<u64> = out.relocs.iter().map(|sym| slots.resolve_symbol(sym)).collect();
+        let fresh_code = haste_codegen::compile(out.func, &fresh.0.compile_target())?;
+        if code.bytes() != fresh_code.bytes() {
+            bail!("stencil verification byte mismatch ({} vs {} bytes)", code.bytes().len(), fresh_code.bytes().len());
+        }
+        if code.sites() != fresh_code.sites() {
+            bail!("stencil verification Site table mismatch");
+        }
+        if code.relocs() != fresh_code.relocs() || symbols != fresh_syms.as_slice() {
+            bail!("stencil verification relocation mismatch");
+        }
+        Ok(())
     }
 
     fn verify_patched(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, (exec, len): (usize, usize), sites: &[Site]) -> Result<()> {
@@ -221,21 +239,27 @@ impl Image {
 
     fn verify_dict(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, (body_exec, stub_exec): (usize, usize), stub_bytes: &[u8], code: &Code) -> Result<()> {
         let (func, _, _) = lower::lower_dict(cx, reached, fresh, index)?;
-        let fresh_code = haste_codegen::compile(func, &fresh.0.compile_target())?;
+        let fresh_code = haste_codegen::compile(func, &super::stencil::target())?;
         if !fresh_code.relocs().iter().all(|reloc| reloc.as_runtime().is_some()) {
             bail!("dict body verification found non-runtime relocations");
         }
-        let mut expected = vec![0u8; fresh_code.bytes().len()];
-        fresh_code.patch(&[], &mut expected);
-        // SAFETY: body_exec..body_exec + code.bytes().len() is mapped readable executable code in this image.
-        let actual_body = unsafe { std::slice::from_raw_parts(body_exec as *const u8, code.bytes().len()) };
-        if actual_body != expected.as_slice() {
-            bail!("dict body verification byte mismatch ({} vs {} bytes)", actual_body.len(), expected.len());
+        if body_exec == 0 {
+            if code.bytes() != fresh_code.bytes() || code.relocs() != fresh_code.relocs() {
+                bail!("dict body verification mismatch ({} vs {} bytes)", code.bytes().len(), fresh_code.bytes().len());
+            }
+        } else {
+            let mut expected = vec![0u8; fresh_code.bytes().len()];
+            fresh_code.patch(&[], &mut expected);
+            // SAFETY: body_exec..body_exec + code.bytes().len() is mapped readable executable code in this image.
+            let actual_body = unsafe { std::slice::from_raw_parts(body_exec as *const u8, code.bytes().len()) };
+            if actual_body != expected.as_slice() {
+                bail!("dict body verification byte mismatch ({} vs {} bytes)", actual_body.len(), expected.len());
+            }
         }
         if code.sites() != fresh_code.sites() {
             bail!("dict body verification Site table mismatch");
         }
-        if !stub_bytes.is_empty() {
+        if stub_exec != 0 && !stub_bytes.is_empty() {
             // SAFETY: stub_exec..stub_exec + stub_bytes.len() is mapped readable executable code in this image.
             let actual_stub = unsafe { std::slice::from_raw_parts(stub_exec as *const u8, stub_bytes.len()) };
             if actual_stub != stub_bytes {

@@ -10,8 +10,10 @@ use crate::host::{HostSymbol, MathSymbol};
 mod elf;
 mod macho;
 mod shims;
+mod wide;
 
 use shims::Shim;
+use wide::WideShim;
 
 pub(super) const ELF_BASE: u64 = 0x0040_0000;
 pub(super) const MACH_BASE: u64 = 0x1_0000_0000;
@@ -215,6 +217,18 @@ fn classify_math(math: MathSymbol) -> Result<&'static str> {
     TABLE.iter().find(|&&(k, _)| k == math).map(|&(_, n)| n).with_context(|| format!("{} requires a self-contained powi shim", math.link_name()))
 }
 
+fn dynamic_lib(name: &str) -> Option<&'static str> {
+    if name.starts_with("_Unwind_") {
+        return Some("libgcc_s.so.1");
+    }
+    const LIBM: &[&str] = &[
+        "acos", "acosf", "acosh", "acoshf", "asin", "asinf", "asinh", "asinhf", "atan", "atanf", "atan2", "atan2f", "atanh", "atanhf",
+        "cbrt", "cbrtf", "cosh", "coshf", "erf", "erff", "erfc", "erfcf", "expm1", "expm1f", "fdim", "fdimf", "hypot", "hypotf",
+        "ldexp", "ldexpf", "lgamma_r", "lgammaf_r", "log1p", "log1pf", "nextafter", "nextafterf", "sinh", "sinhf", "tan", "tanf", "tanh", "tanhf", "tgamma", "tgammaf",
+    ];
+    LIBM.contains(&name).then_some("libm.so.6")
+}
+
 fn classify_host(host: &HostSymbol) -> Result<Binding<'_>> {
     use HostSymbol::*;
     Ok(match host {
@@ -231,8 +245,10 @@ fn classify_host(host: &HostSymbol) -> Result<Binding<'_>> {
         ThreadCell => Binding::Shim(Shim::ThreadCell),
         DsoHandle => Binding::DsoHandle,
         Abort => Binding::Import("abort", None),
+        Math(MathSymbol::Powif32) => Binding::Shim(Shim::Wide(WideShim::Powi { f64: false })),
+        Math(MathSymbol::Powif64) => Binding::Shim(Shim::Wide(WideShim::Powi { f64: true })),
         Math(math) => Binding::Import(classify_math(*math)?, Some("libm.so.6")),
-        Dynamic(name) => Binding::Import(name, None),
+        Dynamic(name) => Binding::Import(name, dynamic_lib(name)),
         X86(sym) => bail!("AOT emission requires a compiled shim for {}", sym.link_name()),
     })
 }
@@ -246,7 +262,7 @@ fn classify_runtime(rt: RuntimeSymbol) -> Result<Binding<'static>> {
         Memcmp => Binding::Import("memcmp", None),
         Malloc => Binding::Import("malloc", None),
         Free => Binding::Import("free", None),
-        _ => bail!("AOT emission requires a compiled 128-bit runtime shim for {}", rt.link_name()),
+        other => Binding::Shim(Shim::Wide(WideShim::Runtime(other))),
     })
 }
 

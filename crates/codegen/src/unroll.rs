@@ -1,5 +1,5 @@
 use crate::dom::{dominates, dominators};
-use crate::fold::{evaluate, extend};
+use crate::fold::{evaluate_wrapped, extend};
 use crate::ir::{Binary, Block, BlockData, Function, Inst, IntCC, Op, Type, Value};
 
 fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
@@ -21,11 +21,14 @@ fn eval_block(func: &Function, block_idx: usize, params: &[Option<i64>], env: &m
     for &inst in &block.insts[..block.insts.len() - 1] {
         let data = &func.insts[inst.index()];
         let Some(res) = data.result else { continue };
-        let val = match data.op {
-            Op::Select(c, x, y) => env[c.index()].and_then(|cv| if cv != 0 { env[x.index()] } else { env[y.index()] }),
-            _ => evaluate(func, &data.op, &|v| env[v.index()]),
+        let ty = func.ty(res);
+        env[res.index()] = match data.op {
+            Op::Select(c, x, y) if ty.is_small_int() => env[c.index()].and_then(|cv| {
+                let chosen = if cv != 0 { x } else { y };
+                env[chosen.index()].map(|imm| extend(imm, ty, true))
+            }),
+            _ => evaluate_wrapped(func, &data.op, ty, &|v| env[v.index()]),
         };
-        env[res.index()] = val.map(|imm| extend(imm, func.ty(res), true));
     }
 }
 
@@ -414,8 +417,8 @@ pub(crate) fn run(func: &mut Function) -> bool {
         for &inst in &func.blocks[blk.index()].insts {
             let data = &func.insts[inst.index()];
             let Some(res) = data.result else { continue };
-            if let Some(imm) = evaluate(func, &data.op, &|v| global_consts[v.index()]) {
-                global_consts[res.index()] = Some(extend(imm, func.ty(res), true));
+            if let Some(imm) = evaluate_wrapped(func, &data.op, func.ty(res), &|v| global_consts[v.index()]) {
+                global_consts[res.index()] = Some(imm);
             }
         }
     }

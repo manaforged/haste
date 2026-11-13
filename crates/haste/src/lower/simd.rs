@@ -3,7 +3,7 @@ use haste_codegen::{Arch, ByteCC, IntCC, StackSlot, Target, Type, Value, VectorO
 
 use crate::body::BinOp;
 use crate::host::{HostSymbol, X86Symbol};
-use crate::sema::intrinsic::Simd;
+use crate::sema::intrinsic::{Arm64Intrinsic, Simd};
 use crate::sema::ty::{Kind, Ty};
 
 use super::ops::{Num, compare};
@@ -432,6 +432,9 @@ impl Lower<'_, '_> {
     /// The 16 bytes whose byte `i` is the larger of bytes `2i` and `2i + 1` of the first vector followed by the second, as NEON `umaxp` gives.
     pub(super) fn byte_pair_max(&mut self, args: &[Value]) -> Result<Value> {
         let &[first, second] = args else { bail!("`umaxp` takes two vectors") };
+        if Target::host().arch == Arch::Arm64 {
+            return Ok(self.vector_result(VectorOp::UmaxPairBytes, (first, second)));
+        }
         let slot = self.b.create_stack_slot(16, 4);
         for lane in 0..16 {
             let from = if lane < 8 { first } else { second };
@@ -442,6 +445,99 @@ impl Lower<'_, '_> {
             self.ins().stack_store(value, slot, lane);
         }
         Ok(self.ins().stack_addr(Type::I64, slot, 0))
+    }
+
+    pub(super) fn arm64_vector(&mut self, op: Arm64Intrinsic, args: &[Value]) -> Result<Value> {
+        let arm64 = Target::host().arch == Arch::Arm64;
+        match op {
+            Arm64Intrinsic::Tbl1 => {
+                let &[table, index] = args else { bail!("`tbl1` takes two vectors") };
+                if arm64 {
+                    return Ok(self.vector_result(VectorOp::ByteShuffle, (table, index)));
+                }
+                let slot = self.b.create_stack_slot(16, 4);
+                let (mask, zero) = (self.ins().iconst(Type::I8, 15), self.ins().iconst(Type::I8, 0));
+                for lane in 0..16 {
+                    let at = self.ins().load(Type::I8, index, lane);
+                    let in_bounds = self.ins().icmp_imm(IntCC::UnsignedLessThan, at, 16);
+                    let masked = self.ins().band(at, mask);
+                    let pick = self.ins().uextend(Type::I64, masked);
+                    let source = self.ins().iadd(table, pick);
+                    let byte = self.ins().load(Type::I8, source, 0);
+                    let value = self.ins().select(in_bounds, byte, zero);
+                    self.ins().stack_store(value, slot, lane);
+                }
+                Ok(self.ins().stack_addr(Type::I64, slot, 0))
+            }
+            Arm64Intrinsic::Sqdmulh2S => {
+                let &[x, y] = args else { bail!("`sqdmulh.v2i32` takes two vectors") };
+                if arm64 {
+                    let (a, b) = (self.ins().load(Type::F64, x, 0), self.ins().load(Type::F64, y, 0));
+                    let (wa, wb) = (self.ins().widen_vec64(a), self.ins().widen_vec64(b));
+                    let vec = self.ins().vector(VectorOp::Sqdmulh2S, wa, wb);
+                    let narrow = self.ins().narrow_vec64(vec);
+                    let slot = self.b.create_stack_slot(8, 3);
+                    self.ins().stack_store(narrow, slot, 0);
+                    return Ok(self.ins().stack_addr(Type::I64, slot, 0));
+                }
+                Ok(self.sqdmulh_scalar(2, Type::I32, (x, y)))
+            }
+            Arm64Intrinsic::Sqdmulh4S => {
+                let &[x, y] = args else { bail!("`sqdmulh.v4i32` takes two vectors") };
+                Ok(if arm64 { self.vector_result(VectorOp::Sqdmulh4S, (x, y)) } else { self.sqdmulh_scalar(4, Type::I32, (x, y)) })
+            }
+            Arm64Intrinsic::Sqdmulh8H => {
+                let &[x, y] = args else { bail!("`sqdmulh.v8i16` takes two vectors") };
+                Ok(if arm64 { self.vector_result(VectorOp::Sqdmulh8H, (x, y)) } else { self.sqdmulh_scalar(8, Type::I16, (x, y)) })
+            }
+            Arm64Intrinsic::Sha256Su0 => {
+                if !arm64 {
+                    bail!("`sha256su0` is only supported on Arm64");
+                }
+                let &[x, y] = args else { bail!("`sha256su0` takes two vectors") };
+                Ok(self.vector_result(VectorOp::Sha256Su0, (x, y)))
+            }
+            Arm64Intrinsic::Sha256H | Arm64Intrinsic::Sha256H2 | Arm64Intrinsic::Sha256Su1 => {
+                if !arm64 {
+                    bail!("ARM64 SHA-256 intrinsics are only supported on Arm64");
+                }
+                let &[x, y, z] = args else { bail!("ARM64 SHA-256 intrinsic takes three vectors") };
+                let (a, b, c) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0), self.ins().load(Type::V128, z, 0));
+                let vec = match op {
+                    Arm64Intrinsic::Sha256H => self.ins().arm64_sha256h(a, b, c),
+                    Arm64Intrinsic::Sha256H2 => self.ins().arm64_sha256h2(a, b, c),
+                    Arm64Intrinsic::Sha256Su1 => self.ins().arm64_sha256su1(a, b, c),
+                    _ => unreachable!(),
+                };
+                Ok(self.store_vector(vec))
+            }
+        }
+    }
+
+    fn sqdmulh_scalar(&mut self, lanes: i32, lane_ty: Type, (x, y): (Value, Value)) -> Value {
+        let bytes = lanes * lane_ty.bytes() as i32;
+        let slot = self.b.create_stack_slot(bytes as u32, if bytes == 8 { 3 } else { 4 });
+        let (wide_ty, shift, min_val, max_val) = if lane_ty == Type::I32 {
+            (Type::I64, 32i64, i64::from(i32::MIN), i64::from(i32::MAX))
+        } else {
+            (Type::I32, 16i64, i64::from(i16::MIN), i64::from(i16::MAX))
+        };
+        let (one, sh, max_c) = (self.ins().iconst(wide_ty, 1), self.ins().iconst(wide_ty, shift), self.ins().iconst(lane_ty, max_val));
+        for lane in 0..lanes {
+            let off = lane * lane_ty.bytes() as i32;
+            let (a, b) = (self.ins().load(lane_ty, x, off), self.ins().load(lane_ty, y, off));
+            let (wa, wb) = (self.ins().sextend(wide_ty, a), self.ins().sextend(wide_ty, b));
+            let prod = self.ins().imul(wa, wb);
+            let doubled = self.ins().ishl(prod, one);
+            let shifted = self.ins().sshr(doubled, sh);
+            let narrow = self.ins().ireduce(lane_ty, shifted);
+            let eq_a = self.ins().icmp_imm(IntCC::Equal, a, min_val);
+            let eq_b = self.ins().icmp_imm(IntCC::Equal, b, min_val);
+            let both_min = self.ins().band(eq_a, eq_b);
+            let val = self.ins().select(both_min, max_c, narrow);
+            self.ins().stack_store(val, slot, off);
+        }
+        self.ins().stack_addr(Type::I64, slot, 0)
     }
 
     fn bitmask(&mut self, vector: Ty, x: Value, out: Ty) -> Result<Value> {

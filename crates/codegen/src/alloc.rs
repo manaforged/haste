@@ -398,14 +398,7 @@ fn partners(func: &Function) -> Vec<Vec<Value>> {
                 }
             };
             for inst in &block.insts {
-                match &func.insts[inst.index()].op {
-                    Op::Jump(target, args) => edge(*target, args),
-                    Op::Brif(_, then, then_args, otherwise, else_args) => {
-                        edge(*then, then_args);
-                        edge(*otherwise, else_args);
-                    }
-                    _ => {}
-                }
+                crate::frame::terminator_edges(&func.insts[inst.index()].op, &mut edge);
             }
         }
     }
@@ -435,11 +428,13 @@ fn reusable(func: &Function, live: &Live, elided: &[bool]) -> Vec<Option<Value>>
                 continue;
             }
             let next = block.insts.get(at + 1).map(|next| &func.insts[next.index()].op);
-            let checked = matches!(next, Some(Op::Fits(check, _, a, b)) if check == op && (a, b) == (x, y));
+            if matches!(next, Some(Op::Fits(check, _, a, b)) if check == op && (a, b) == (x, y)) {
+                continue;
+            }
             let def = live.defs[result.index()];
-            let end_at = if checked { def + 1 } else { def.saturating_sub(1) };
+            let end_at = def.saturating_sub(1);
             let dies = def > 0
-                && live.ranges_of(x.index()).iter().any(|r| r.end == end_at)
+                && live.last_end(x.index()) == Some(end_at)
                 && !crate::live::overlaps(live.ranges_of(x.index()), live.ranges_of(result.index()));
             if in_place(*op) && dies && live.ranges_of(result.index()).first().is_some_and(|r| r.start == def) {
                 reuse[result.index()] = Some(*x);

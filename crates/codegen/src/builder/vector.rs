@@ -1,5 +1,5 @@
 use super::Ins;
-use crate::ir::{ByteCC, Convert, Op, Type, Value, VectorOp};
+use crate::ir::{ByteCC, Convert, Op, Sha256Op, Type, Value, VectorOp};
 
 impl Ins<'_> {
     /// Zero-extending 64-bit float-register value `x` (`F64`) to a 128-bit vector (`V128`).
@@ -33,7 +33,26 @@ impl Ins<'_> {
     }
 
     /// Two SHA-256 rounds on state vectors `x` and `y` with the message and constants in `k`, as `sha256rnds2` gives.
-    pub fn sha256_rounds(mut self, x: Value, y: Value, k: Value) -> Value {
-        self.value(Op::Sha256Rounds(x, y, k), Type::V128)
+    pub fn sha256_rounds(self, x: Value, y: Value, k: Value) -> Value {
+        self.sha256(Sha256Op::X86Rnds2, x, y, k)
+    }
+
+    /// One ARM64 `sha256h` hash update round over `(x, y, z)`.
+    pub fn arm64_sha256h(self, x: Value, y: Value, z: Value) -> Value {
+        self.sha256(Sha256Op::Arm64H, x, y, z)
+    }
+
+    /// One ARM64 `sha256h2` hash update round over `(x, y, z)`.
+    pub fn arm64_sha256h2(self, x: Value, y: Value, z: Value) -> Value {
+        self.sha256(Sha256Op::Arm64H2, x, y, z)
+    }
+
+    /// One ARM64 `sha256su1` message schedule update over `(x, y, z)`.
+    pub fn arm64_sha256su1(self, x: Value, y: Value, z: Value) -> Value {
+        self.sha256(Sha256Op::Arm64Su1, x, y, z)
+    }
+
+    fn sha256(mut self, op: Sha256Op, x: Value, y: Value, z: Value) -> Value {
+        self.value(Op::Sha256Rounds(op, x, y, z), Type::V128)
     }
 }

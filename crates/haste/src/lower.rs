@@ -577,7 +577,10 @@ impl Lower<'_, '_> {
             self.stmt(self.body.stmts[stmt as usize])?;
         }
         let value = match tail {
-            Some(tail) => self.expr(tail)?,
+            Some(tail) => {
+                let value = self.expr(tail)?;
+                self.snapshot_before_drops(mark, tail, value)?
+            }
             None => None,
         };
         self.end_scope(mark)?;

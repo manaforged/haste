@@ -16,11 +16,12 @@ use crate::sema::reach::Reached;
 use crate::sema::summary::{ConstHole, PolyInst};
 use crate::sema::ty::{Kind, Mut, Ty};
 
-use super::stencil::{FootprintId, item_bits};
+use super::stencil::FootprintId;
 use super::{Inline, Slots, passed_parts, signature, signature_of};
 
 use build::build_plan;
-use sites::hash_plan_sites;
+pub(super) use sites::closure_calls_uncached;
+use sites::{closure_locals, closure_own_calls, hash_plan_sites};
 use ty::{HashMix, hash_call_edge, hash_drop_tree, hash_dyn_facts, hash_num_tag, hash_parts, hash_repr, hash_sig, hash_tuple_offsets, hash_ty_facts};
 
 #[derive(Clone, Debug)]
@@ -62,6 +63,16 @@ pub(super) struct BodyFootprintPlan {
     has_partial_moves: bool,
 }
 
+impl BodyFootprintPlan {
+    pub(super) fn contains_expr(&self, expr: ExprId) -> bool {
+        self.expr_ids.binary_search(&expr).is_ok()
+    }
+
+    pub(super) fn contains_pat(&self, pat: PatId) -> bool {
+        self.pat_sites.binary_search_by_key(&pat, |ps| ps.pat).is_ok()
+    }
+}
+
 /// Evaluates the exact stencil `FootprintId` of reached instance `index` without running AST lowering.
 pub fn eval_footprint(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<FootprintId> {
     let mut inline = Inline::default();
@@ -76,10 +87,11 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
         Err(err) => bail!("{}: {err}", cx.name(*item)),
     };
     let (item, substs) = (*item, *substs);
-    if let Some(unique) = try_unique_footprint(cx, item, substs, typed, index) {
+    if let Some(unique) = try_unique_footprint(cx, slots, item, substs, typed, index) {
         return Ok((unique, usize::MAX));
     }
-    let mut mix = HashMix::new(item_bits(item));
+    let mut mix = HashMix::new(0x51a7_0000);
+    mix.item(cx.outline, item);
     let mut cycle_root = usize::MAX;
     hash_instance_header(cx, &mut mix, (slots.low_entries(), slots.allow_inline()), item, typed)?;
     match &typed.shape {
@@ -93,33 +105,41 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
             hash_closure_header(cx, &mut mix, typed, cb)?;
             eval_body_footprint(cx, (reached, slots), inline, &mut mix, index, (cb.parent, Some(cb.closure.body)), typed, &mut cycle_root)?;
         }
-        Shape::Anon(_) => mix.usize(index),
+        Shape::Anon(_) => mix.local_index(index),
     }
     Ok((mix.finish(), cycle_root))
 }
 
-fn try_unique_footprint(cx: &Context<'_>, item: ItemRef, substs: crate::sema::substs::Substs, typed: &Typed, index: usize) -> Option<FootprintId> {
+fn try_unique_footprint(cx: &Context<'_>, slots: &dyn Slots, item: ItemRef, substs: crate::sema::substs::Substs, typed: &Typed, index: usize) -> Option<FootprintId> {
     if cx.foreign(item) {
         let mut mix = HashMix::new(0xff);
-        mix.item(item);
-        return Some(mix.finish());
-    }
-    if substs.is_empty() && !matches!(typed.shape, Shape::Closure(_)) {
-        let mut mix = HashMix::new(0x51a7_1c01);
-        mix.item(item);
-        mix.usize(index);
+        mix.item(cx.outline, item);
         return Some(mix.finish());
     }
     if matches!(typed.shape, Shape::Anon(_)) || typed.has_awaits() {
         let mut mix = HashMix::new(0x51a7_1c02);
-        mix.item(item);
-        mix.usize(index);
+        mix.item(cx.outline, item);
+        mix.local_index(index);
+        return Some(mix.finish());
+    }
+    if substs.is_empty() && matches!(typed.shape, Shape::Body) {
+        let mut mix = HashMix::new(0x51a7_1c01);
+        mix.item(cx.outline, item);
+        mix.bool(slots.low_entries());
+        mix.bool(slots.allow_inline());
+        mix.bool(cx.outline.crates[item.krate as usize].env.overflow_checks());
+        return Some(mix.finish());
+    }
+    if substs.is_empty() && !matches!(typed.shape, Shape::Closure(_)) {
+        let mut mix = HashMix::new(0x51a7_1c01);
+        mix.item(cx.outline, item);
+        mix.local_index(index);
         return Some(mix.finish());
     }
     if let Shape::Closure(cb) = &typed.shape {
         if cb.closure.coroutine {
             let mut mix = HashMix::new(0x51a7_1c03);
-            mix.usize(index);
+            mix.local_index(index);
             return Some(mix.finish());
         }
         if let Some(&first) = cx.types.substs(substs).first()
@@ -127,7 +147,7 @@ fn try_unique_footprint(cx: &Context<'_>, item: ItemRef, substs: crate::sema::su
             && p_substs.is_empty()
         {
             let mut mix = HashMix::new(0x51a7_1c04);
-            mix.usize(index);
+            mix.local_index(index);
             return Some(mix.finish());
         }
     }
@@ -174,7 +194,7 @@ fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, (low, allow_inl
 
 fn hash_glue_shape(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, index: usize, substs: crate::sema::substs::Substs, glue: &Glue, cycle_root: &mut usize) -> Result<()> {
     if glue.resume.is_some() {
-        mix.usize(index);
+        mix.local_index(index);
         return Ok(());
     }
     let Some(&target_ty) = cx.types.substs(substs).first() else { bail!("glue missing target type") };
@@ -348,7 +368,7 @@ fn hash_virtual_shape(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, sl
 }
 
 fn hash_closure_header(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, cb: &ClosureBody) -> Result<()> {
-    mix.item(cb.parent);
+    mix.item(cx.outline, cb.parent);
     mix.u32(cb.closure.body.0);
     mix.bool(cb.closure.consumes);
     mix.bool(cb.env.is_some());
@@ -410,14 +430,21 @@ fn eval_poly_body(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         mix.u32(ov.expr.0);
         mix.u32(ov.autoderefs.unwrap_or(u32::MAX));
         mix.bool(ov.overloaded);
-        mix.bool(ov.res.is_some());
-        mix.bool(ov.box_free.is_some());
+        hash_override_res(cx, (reached, slots), inline, mix, index, ov.res, cycle_root)?;
+        hash_override_res(cx, (reached, slots), inline, mix, index, ov.box_free, cycle_root)?;
     }
     for hole in &poly.summary.const_holes {
-        if let ConstHole::Value(vty) = *hole
-            && let Kind::Value(bits) = *cx.types.kind(poly.sub_ty(&cx.types, vty))
-        {
-            mix.u128(bits);
+        match *hole {
+            ConstHole::Value(vty) => {
+                if let Kind::Value(bits) = *cx.types.kind(poly.sub_ty(&cx.types, vty)) {
+                    mix.u128(bits);
+                }
+            }
+            ConstHole::Intrinsic { item, substs } => {
+                let concrete = poly.sub_substs(&cx.types, substs);
+                hash_call_edge(cx, (reached, slots), inline, mix, index, item, concrete, cycle_root)?;
+            }
+            ConstHole::OffsetOf { .. } => {}
         }
     }
     hash_plan_sites(cx, reached, mix, plan, typed)?;
@@ -436,13 +463,49 @@ fn eval_poly_body(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
     Ok(())
 }
 
+fn hash_override_res(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, index: usize, res: Option<Res>, cycle_root: &mut usize) -> Result<()> {
+    match res {
+        None => mix.byte(0),
+        Some(Res::Fn(ci, cs)) => {
+            mix.byte(1);
+            hash_call_edge(cx, (reached, slots), inline, mix, index, ci, cs, cycle_root)?;
+        }
+        Some(Res::Ctor(_, v, _)) => {
+            mix.byte(2);
+            mix.u32(v);
+        }
+        Some(Res::Local(l)) => {
+            mix.byte(3);
+            mix.u32(l);
+        }
+        Some(Res::Const(vty)) => {
+            mix.byte(4);
+            if let Kind::Value(bits) = *cx.types.kind(vty) {
+                mix.u128(bits);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn eval_eager_body(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, mix: &mut HashMix, index: usize, plan: &BodyFootprintPlan, typed: &Typed, tables: &crate::sema::infer::BodyTables, cycle_root: &mut usize) -> Result<()> {
     mix.byte(0xa2);
-    let has_partial_moves = plan.has_partial_moves || !typed.syntax().unpacks.is_empty();
-    for local in &typed.locals {
-        hash_ty_facts(cx, mix, local.ty)?;
+    let closure = match &typed.shape {
+        Shape::Closure(cb) => Some(cb),
+        _ => None,
+    };
+    let is_closure = closure.is_some();
+    let has_partial_moves = plan.has_partial_moves
+        || if is_closure { typed.params.iter().any(|l| typed.syntax().unpacks.contains_key(l)) } else { !typed.syntax().unpacks.is_empty() };
+    let own_locals: Vec<u32> = match closure {
+        Some(cb) => closure_locals(plan, typed, tables, cb),
+        None => (0..typed.locals.len() as u32).collect(),
+    };
+    for l in own_locals {
+        let ty = typed.locals[l as usize].ty;
+        hash_ty_facts(cx, mix, ty)?;
         if has_partial_moves {
-            hash_drop_tree(cx, (reached, slots), inline, mix, index, local.ty, 0, cycle_root)?;
+            hash_drop_tree(cx, (reached, slots), inline, mix, index, ty, 0, cycle_root)?;
         }
     }
     for &expr in &plan.expr_ids {
@@ -456,30 +519,56 @@ fn eval_eager_body(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots
         hash_num_tag(cx, mix, tables.exprs[expr.0 as usize]);
     }
     for &(e, s) in tables.autoderefs.as_slice() {
-        mix.u32(e.0);
-        mix.u32(s);
+        if !is_closure || plan.contains_expr(e) {
+            mix.u32(e.0);
+            mix.u32(s);
+        }
     }
     for &e in tables.overloaded.as_slice() {
-        mix.u32(e.0);
+        if !is_closure || plan.contains_expr(e) {
+            mix.u32(e.0);
+        }
     }
     for &(e, _) in tables.operators.as_slice() {
-        mix.u32(e.0);
+        if !is_closure || plan.contains_expr(e) {
+            mix.u32(e.0);
+        }
     }
     for &(e, off) in tables.offsets.as_slice() {
-        mix.u32(e.0);
-        mix.u64(off);
+        if !is_closure || plan.contains_expr(e) {
+            mix.u32(e.0);
+            mix.u64(off);
+        }
     }
-    for r in tables.res.values().chain(tables.pat_res.values()) {
-        if let Res::Const(vty) = *r
+    for &(e, ref r) in tables.res.as_slice() {
+        if (!is_closure || plan.contains_expr(e))
+            && let Res::Const(vty) = *r
+            && let Kind::Value(bits) = *cx.types.kind(vty)
+        {
+            mix.u128(bits);
+        }
+    }
+    for &(p, ref r) in tables.pat_res.as_slice() {
+        if (!is_closure || plan.contains_pat(p))
+            && let Res::Const(vty) = *r
             && let Kind::Value(bits) = *cx.types.kind(vty)
         {
             mix.u128(bits);
         }
     }
     hash_plan_sites(cx, reached, mix, plan, typed)?;
-    hash_eager_flow_and_coercions(cx, mix, typed, tables)?;
-    for (ci, cs) in typed.calls() {
-        hash_call_edge(cx, (reached, slots), inline, mix, index, ci, cs, cycle_root)?;
+    hash_eager_flow_and_coercions(cx, mix, plan, typed, tables, is_closure)?;
+    match closure {
+        Some(cb) => {
+            for (ci, cs) in closure_own_calls(cx, plan, typed, tables, cb)? {
+                hash_call_edge(cx, (reached, slots), inline, mix, index, ci, cs, cycle_root)?;
+            }
+        }
+        None => {
+            for (ci, cs) in typed.calls() {
+                hash_call_edge(cx, (reached, slots), inline, mix, index, ci, cs, cycle_root)?;
+            }
+        }
     }
     Ok(())
 }
@@ -505,20 +594,26 @@ fn hash_poly_flow_and_coercions(cx: &mut Context<'_>, mix: &mut HashMix, typed: 
     Ok(())
 }
 
-fn hash_eager_flow_and_coercions(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, tables: &crate::sema::infer::BodyTables) -> Result<()> {
-    for (_, f) in &tables.fors {
-        hash_ty_facts(cx, mix, f.iter)?;
-        hash_ty_facts(cx, mix, f.option)?;
-        mix.i32(field_offset(&*cx.layout(f.option)?, f.some, 0));
+fn hash_eager_flow_and_coercions(cx: &mut Context<'_>, mix: &mut HashMix, plan: &BodyFootprintPlan, typed: &Typed, tables: &crate::sema::infer::BodyTables, is_closure: bool) -> Result<()> {
+    for (&id, f) in &tables.fors {
+        if !is_closure || plan.contains_expr(id) {
+            hash_ty_facts(cx, mix, f.iter)?;
+            hash_ty_facts(cx, mix, f.option)?;
+            mix.i32(field_offset(&*cx.layout(f.option)?, f.some, 0));
+        }
     }
-    for (_, t) in &tables.tries {
-        hash_ty_facts(cx, mix, t.flow)?;
-        let fl = cx.layout(t.flow)?;
-        mix.i32(field_offset(&fl, t.stop, 0));
-        mix.i32(field_offset(&fl, t.proceed, 0));
+    for (&id, t) in &tables.tries {
+        if !is_closure || plan.contains_expr(id) {
+            hash_ty_facts(cx, mix, t.flow)?;
+            let fl = cx.layout(t.flow)?;
+            mix.i32(field_offset(&fl, t.stop, 0));
+            mix.i32(field_offset(&fl, t.proceed, 0));
+        }
     }
     for (&id, c) in &tables.coercions {
-        hash_one_coercion(cx, mix, typed, id, c, None)?;
+        if !is_closure || plan.contains_expr(id) {
+            hash_one_coercion(cx, mix, typed, id, c, None)?;
+        }
     }
     Ok(())
 }

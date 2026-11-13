@@ -260,7 +260,7 @@ impl Scanner<'_> {
         if self.src.kind(last) == TokenKind::OpenParen && self.src.kind(self.src.pair(last) + 1) == TokenKind::OpenBrace {
             last = self.src.pair(last) + 1;
         }
-        Ok(Head { kind: ItemKind::Macro, name: Some(at + 1), body: Some(at + 2), end: self.src.pair(last) + 1 })
+        Ok(Head { kind: ItemKind::Macro, name: Some(at + 1), body: Some(at + 2), end: self.delimited_end(last)? })
     }
 
     fn macro_call(&self, start: u32) -> Result<Head> {

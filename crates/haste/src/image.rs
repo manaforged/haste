@@ -278,11 +278,12 @@ impl Image {
     }
 
     pub(super) fn compile_target(&self) -> haste_codegen::Target {
-        if self.fast_jit {
+        let base = if self.fast_jit {
             haste_codegen::Target::host().effort(haste_codegen::Effort::Quick)
         } else {
             crate::host_target()
-        }
+        };
+        base.direct_calls(self.mode == ImageMode::Aot)
     }
 
     /// The encoded machine-code byte length of each reached function, or zero when not compiled.
@@ -334,7 +335,10 @@ impl Image {
     /// An image of every function in `reached`, compiled under `mode`, with why each one that did not compile failed.
     pub(crate) fn build(cx: &mut Context<'_>, reached: &Reached, mode: ImageMode) -> Result<(Image, HashMap<usize, String>)> {
         let mut image = Self::create(reached, mode, (SHARED_BYTES, STATE_BYTES, reached.list.len().max(1)))?;
-        let all: Vec<usize> = (0..reached.list.len()).collect();
+        let all: Vec<usize> = match mode {
+            ImageMode::Check => (0..reached.list.len()).filter(|&idx| !cx.outline.is_fixed(reached.list[idx].0.0.krate)).collect(),
+            ImageMode::Jit | ImageMode::Aot => (0..reached.list.len()).collect(),
+        };
         let broken = image.compile(cx, reached, &all).into_iter().collect();
         image.bodies = lower::Bodies::default();
         Ok((image, broken))

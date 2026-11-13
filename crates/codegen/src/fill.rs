@@ -1,5 +1,5 @@
 use crate::fold::{constant, defs, extend};
-use crate::ir::{Binary, Convert, Function, Inst, Op, StackSlot, Type, Value};
+use crate::ir::{Convert, Function, Inst, Op, StackSlot, Type, Value};
 use crate::reloc::RuntimeSymbol;
 
 /// The most bytes a `memset` of a constant size is stored inline with.
@@ -35,22 +35,14 @@ fn fill(func: &Function, defs: &[Option<Inst>], inst: Inst) -> Option<(Value, i6
     Some((to, known(func, defs, byte, DEPTH)? & 0xFF, size as u32))
 }
 
-fn stack_of(func: &Function, defs: &[Option<Inst>], value: Value, depth: u32) -> Option<(StackSlot, i32)> {
-    let next = depth.checked_sub(1)?;
-    match func.insts[defs[value.index()]?.index()].op {
-        Op::StackAddr(slot, offset) => Some((slot, offset)),
-        Op::Binary(Binary::Iadd, a, b) => [(a, b), (b, a)].into_iter().find_map(|(ptr, off)| {
-            let (slot, base) = stack_of(func, defs, ptr, next)?;
-            let c = i32::try_from(known(func, defs, off, DEPTH)?).ok()?;
-            Some((slot, base.checked_add(c)?))
-        }),
-        _ => None,
-    }
+fn resolve_slot(slots: &[Option<(StackSlot, i64)>], ptr: Value, off: i32) -> Option<(StackSlot, i32)> {
+    let (slot, base) = slots.get(ptr.index()).copied().flatten()?;
+    i32::try_from(base).ok()?.checked_add(off).map(|total| (slot, total))
 }
 
-fn emit_load(func: &mut Function, defs: &[Option<Inst>], src: Value, off: i32, ty: Type, out: &mut Vec<Inst>) -> Value {
+fn emit_load(func: &mut Function, slots: &[Option<(StackSlot, i64)>], (src, off): (Value, i32), ty: Type, out: &mut Vec<Inst>) -> Value {
     let val = func.value(ty);
-    let op = match stack_of(func, defs, src, DEPTH).and_then(|(s, b)| b.checked_add(off).map(|t| (s, t))) {
+    let op = match resolve_slot(slots, src, off) {
         Some((slot, total)) => Op::StackLoad(slot, total),
         None => Op::Load(src, off),
     };
@@ -58,8 +50,8 @@ fn emit_load(func: &mut Function, defs: &[Option<Inst>], src: Value, off: i32, t
     val
 }
 
-fn emit_store(func: &mut Function, defs: &[Option<Inst>], val: Value, dst: Value, off: i32, out: &mut Vec<Inst>) {
-    let op = match stack_of(func, defs, dst, DEPTH).and_then(|(s, b)| b.checked_add(off).map(|t| (s, t))) {
+fn emit_store(func: &mut Function, slots: &[Option<(StackSlot, i64)>], val: Value, (dst, off): (Value, i32), out: &mut Vec<Inst>) {
+    let op = match resolve_slot(slots, dst, off) {
         Some((slot, total)) => Op::StackStore(val, slot, total),
         None => Op::Store(val, dst, off),
     };
@@ -67,15 +59,15 @@ fn emit_store(func: &mut Function, defs: &[Option<Inst>], val: Value, dst: Value
 }
 
 /// Appends to `out` a store of `byte` repeated over each word of the `bytes` bytes at `to`.
-fn stores(func: &mut Function, defs: &[Option<Inst>], (to, byte, bytes): (Value, i64, u32), out: &mut Vec<Inst>) {
+fn stores(func: &mut Function, slots: &[Option<(StackSlot, i64)>], (to, byte, bytes): (Value, i64, u32), out: &mut Vec<Inst>) {
     for (ty, at) in crate::copy::words(bytes) {
         let word = func.value(ty);
         out.push(func.add(Op::Const(extend(byte.wrapping_mul(BYTES), ty, false)), Some(word)));
-        emit_store(func, defs, word, to, at as i32, out);
+        emit_store(func, slots, word, (to, at as i32), out);
     }
 }
 
-fn expand_copy(func: &mut Function, defs: &[Option<Inst>], inst: Inst, out: &mut Vec<Inst>) -> bool {
+fn expand_copy(func: &mut Function, defs: &[Option<Inst>], slots: &[Option<(StackSlot, i64)>], inst: Inst, out: &mut Vec<Inst>) -> bool {
     let Op::Copy(dst, src, len) = func.insts[inst.index()].op else { return false };
     let Some(bytes) = known(func, defs, len, DEPTH) else { return false };
     match bytes {
@@ -87,15 +79,15 @@ fn expand_copy(func: &mut Function, defs: &[Option<Inst>], inst: Inst, out: &mut
                 4 => Type::I32,
                 _ => Type::I64,
             };
-            let val = emit_load(func, defs, src, 0, ty, out);
-            emit_store(func, defs, val, dst, 0, out);
+            let val = emit_load(func, slots, (src, 0), ty, out);
+            emit_store(func, slots, val, (dst, 0), out);
             true
         }
         16 => {
-            let lo = emit_load(func, defs, src, 0, Type::I64, out);
-            let hi = emit_load(func, defs, src, 8, Type::I64, out);
-            emit_store(func, defs, lo, dst, 0, out);
-            emit_store(func, defs, hi, dst, 8, out);
+            let lo = emit_load(func, slots, (src, 0), Type::I64, out);
+            let hi = emit_load(func, slots, (src, 8), Type::I64, out);
+            emit_store(func, slots, lo, (dst, 0), out);
+            emit_store(func, slots, hi, (dst, 8), out);
             true
         }
         _ => false,
@@ -108,13 +100,14 @@ pub(crate) fn run(func: &mut Function) {
         return;
     }
     let defs = defs(func);
+    let (slots, _) = func.slot_offsets(|v| known(func, &defs, v, DEPTH));
     for block in 0..func.blocks.len() {
         let insts = std::mem::take(&mut func.blocks[block].insts);
         let mut out = Vec::with_capacity(insts.len());
         for inst in insts {
             if let Some(found) = fill(func, &defs, inst) {
-                stores(func, &defs, found, &mut out);
-            } else if !expand_copy(func, &defs, inst, &mut out) {
+                stores(func, &slots, found, &mut out);
+            } else if !expand_copy(func, &defs, &slots, inst, &mut out) {
                 out.push(inst);
             }
         }

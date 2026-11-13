@@ -372,7 +372,7 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             let asked = cx.asks.count() > asks0;
             let mut callees = Vec::new();
             if !deferred && (force_commit || !asked) {
-                pre_collect_callees(cx, &mut local_filter, &typed, include_fixed, &mut callees);
+                pre_collect_callees(cx, &mut local_filter, (instance, &typed, include_fixed), &mut callees);
             }
             results.push((at, instance, typed, unlaid, asked, deferred, callees));
         }

@@ -47,6 +47,12 @@ impl Type {
         matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
     }
 
+    /// The largest unsigned value representable in `self`, clamped to 64 bits.
+    pub(crate) fn unsigned_max(self) -> u64 {
+        let bits = self.bits();
+        if bits >= 64 { u64::MAX } else { (1_u64 << bits) - 1 }
+    }
+
     pub(crate) const fn sign_bit(self) -> i64 {
         if matches!(self, Type::F64) { i64::MIN } else { 0x8000_0000 }
     }
@@ -209,11 +215,16 @@ pub enum ByteCC {
     SignedGreaterThan,
 }
 
-/// An x64 instruction on two 128-bit vectors that computes in place into the first.
+/// A SIMD vector instruction on two 128-bit vectors.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum VectorOp {
     ByteShuffle,
+    UmaxPairBytes,
+    Sqdmulh2S,
+    Sqdmulh4S,
+    Sqdmulh8H,
+    Sha256Su0,
     AddBytes,
     AddWords,
     AddDwords,
@@ -231,6 +242,15 @@ pub enum VectorOp {
     AesEncLast,
     AesDec,
     AesDecLast,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub(crate) enum Sha256Op {
+    X86Rnds2,
+    Arm64H,
+    Arm64H2,
+    Arm64Su1,
 }
 
 /// A floating-point comparison; every one but `NotEqual` is false when an operand is NaN.
@@ -348,8 +368,8 @@ pub(crate) enum Op {
     Movemask(Value),
     /// The x64 vector instruction on two vectors.
     Vector(VectorOp, Value, Value),
-    /// Two SHA-256 rounds (`sha256rnds2`) on the state vectors in the first two values with the message and constants in the third.
-    Sha256Rounds(Value, Value, Value),
+    /// SHA-256 round or schedule update on vectors.
+    Sha256Rounds(Sha256Op, Value, Value, Value),
     Select(Value, Value, Value),
     Load(Value, i32),
     Store(Value, Value, i32),
@@ -398,9 +418,15 @@ impl Op {
             | Op::Splat(_)
             | Op::Movemask(_)
             | Op::Vector(..)
+            | Op::Sha256Rounds(..)
             | Op::Select(..) => true,
             _ => false,
         }
+    }
+
+    /// Whether this instruction has no observable side effects and may be dropped when unused.
+    pub(crate) fn is_removable(&self) -> bool {
+        self.is_speculable() || matches!(self, Op::Binary(..) | Op::Runtime(_) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
     }
 
     /// Every block this instruction can go to.
@@ -444,7 +470,7 @@ impl Op {
                 f(*x);
                 f(*y);
             }
-            Op::Select(c, x, y) | Op::Sha256Rounds(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::Sha256Rounds(_, c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
                 f(*c);
                 f(*x);
                 f(*y);
@@ -482,7 +508,7 @@ impl Op {
                 *x = f(*x);
                 *y = f(*y);
             }
-            Op::Select(c, x, y) | Op::Sha256Rounds(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::Sha256Rounds(_, c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
                 *c = f(*c);
                 *x = f(*x);
                 *y = f(*y);
@@ -711,6 +737,43 @@ impl Function {
             }
         }
         preds
+    }
+
+    /// Resolves each value derived from a stack slot plus constant offsets, returning `(slot_offsets, addr_insts)`.
+    pub(crate) fn slot_offsets(&self, eval_const: impl Fn(Value) -> Option<i64>) -> (Vec<Option<(StackSlot, i64)>>, Vec<(Inst, StackSlot)>) {
+        let mut consts = vec![None; self.types.len()];
+        let mut addrs = vec![None; self.types.len()];
+        let mut addr_insts = Vec::new();
+        let mut adds = Vec::new();
+        for inst in self.blocks.iter().flat_map(|block| &block.insts) {
+            let data = &self.insts[inst.index()];
+            let Some(result) = data.result else { continue };
+            match &data.op {
+                Op::StackAddr(slot, offset) => {
+                    addrs[result.index()] = Some((*slot, i64::from(*offset)));
+                    addr_insts.push((*inst, *slot));
+                }
+                Op::Const(imm) => consts[result.index()] = Some(*imm),
+                Op::Binary(Binary::Iadd, x, c) => adds.push((*inst, result, *x, *c)),
+                _ => {}
+            }
+        }
+        loop {
+            let before = adds.len();
+            adds.retain(|&(inst, result, x, c)| {
+                let imm_of = |v: Value| consts[v.index()].or_else(|| eval_const(v));
+                let Some(((slot, base), imm)) = addrs[x.index()].zip(imm_of(c)).or_else(|| addrs[c.index()].zip(imm_of(x))) else {
+                    return true;
+                };
+                let Some(offset) = base.checked_add(imm) else { return true };
+                addrs[result.index()] = Some((slot, offset));
+                addr_insts.push((inst, slot));
+                false
+            });
+            if adds.len() == before {
+                return (addrs, addr_insts);
+            }
+        }
     }
 }
 

@@ -1,13 +1,5 @@
-use crate::fold::evaluate;
-use crate::ir::{Binary, Block, Function, Inst, InstData, Op, SigRef, Value};
-
-fn pure_op(op: &Op) -> bool {
-    match op {
-        Op::Binary(bin, ..) => !matches!(bin, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem),
-        Op::Const(_) | Op::Unary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fcmp(..) | Op::Select(..) => true,
-        _ => false,
-    }
-}
+use crate::fold::evaluate_wrapped;
+use crate::ir::{Block, Function, Inst, InstData, Op, SigRef, Value};
 
 fn lookup(map: &[(Value, Value)], value: Value) -> Value {
     map.iter().find(|&&(k, _)| k == value).map_or(value, |&(_, v)| v)
@@ -74,12 +66,12 @@ fn step_block(
     for &inst in body {
         let data = &func.insts[inst.index()];
         let res = data.result?;
-        if !pure_op(&data.op) {
+        if !data.op.is_speculable() {
             return None;
         }
         let mut op = data.op.clone();
         op.map_operands(|v| lookup(map, v));
-        if let Some(imm) = evaluate(func, &op, &|v| lookup_const(local_consts, consts, v)) {
+        if let Some(imm) = evaluate_wrapped(func, &op, func.ty(res), &|v| lookup_const(local_consts, consts, v)) {
             local_consts.push((res, imm));
         }
         local_ops.push((res, op));
@@ -246,8 +238,8 @@ pub(crate) fn run(func: &mut Function) {
     }
     let mut consts = vec![None; func.types.len()];
     for data in &func.insts {
-        if let (Op::Const(imm), Some(res)) = (&data.op, data.result) {
-            consts[res.index()] = Some(*imm);
+        if let (Op::Const(_), Some(res)) = (&data.op, data.result) {
+            consts[res.index()] = evaluate_wrapped(func, &data.op, func.ty(res), &|_| None);
         }
     }
     let mut any = false;

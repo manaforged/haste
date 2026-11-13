@@ -273,41 +273,11 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
 
 /// The frame slot and offset each value holds the address of, when an instruction computes it as one.
 pub(crate) fn slot_addresses(func: &Function) -> Vec<Option<(StackSlot, i32)>> {
-    let mut consts = vec![None; func.types.len()];
-    let mut slots = vec![None; func.types.len()];
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        let data = &func.insts[inst.index()];
-        match (&data.op, data.result) {
-            (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
-            (&Op::StackAddr(slot, offset), Some(result)) => slots[result.index()] = Some((slot, offset)),
-            _ => {}
-        }
-    }
-    loop {
-        let mut changed = false;
-        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-            let data = &func.insts[inst.index()];
-            let Some(result) = data.result else { continue };
-            if slots[result.index()].is_some() {
-                continue;
-            }
-            if let Op::Binary(Binary::Iadd, a, b) = data.op {
-                let derived = [(a, b), (b, a)].into_iter().find_map(|(ptr, off)| {
-                    let (slot, base) = slots[ptr.index()]?;
-                    let c = i32::try_from(consts[off.index()]?).ok()?;
-                    Some((slot, base.checked_add(c)?))
-                });
-                if let Some(val) = derived {
-                    slots[result.index()] = Some(val);
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    slots
+    func.slot_offsets(|_| None)
+        .0
+        .into_iter()
+        .map(|entry| entry.and_then(|(slot, off)| i32::try_from(off).ok().map(|o| (slot, o))))
+        .collect()
 }
 
 fn slot_use_counts(func: &Function, slots: &[Option<(StackSlot, i32)>]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
@@ -599,10 +569,8 @@ fn sink_terminator_defs(func: &mut Function) {
         let mut sunk = Vec::new();
         for &inst in &insts[..len - 1] {
             let data = &func.insts[inst.index()];
-            let pure_alu = matches!(data.op, Op::Binary(op, ..) if !matches!(op, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem))
-                || matches!(data.op, Op::Unary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Select(..));
             if let Some(res) = data.result
-                && pure_alu
+                && data.op.is_speculable()
                 && !fits_used[res.index()]
                 && term_uses[res.index()] > 0
                 && uses[res.index()] == term_uses[res.index()]

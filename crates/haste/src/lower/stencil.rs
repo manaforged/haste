@@ -5,23 +5,23 @@ use anyhow::{Result, bail};
 use haste_codegen::{AbiParam, ArgumentPurpose, Function, FunctionBuilder, Type, Value};
 use rustc_hash::FxHashMap;
 
+use crate::body::ExprId;
 use crate::host::HostSymbol;
 use crate::names::ItemRef;
 use crate::sema::Context;
-use crate::body::{Body, Expr, ExprId, List, Stmt};
-use crate::sema::infer::{Arena, Coercion, Res, Shape, Typed};
-use crate::sema::substs::Substs;
+use crate::sema::infer::{Arena, Shape, Typed};
 use crate::sema::reach::Reached;
 use crate::sema::table::Table;
 use crate::sync::{read_lock, write_lock};
 
-use super::plan::{BodyFootprintPlan, eval_footprint_with_cycle};
+use super::plan::{BodyFootprintPlan, closure_calls_uncached, eval_footprint_with_cycle};
 use super::reloc::{RelocPlan, RelocStep, SiteOrigin, eval_relocs};
 use super::{Inline, Lower, Slots, Word, is_static, signature, signature_of};
 
 /// The 128-bit structural footprint digest of a lowered function and its inlined callees.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct FootprintId(pub u128);
+impl FootprintId { pub fn is_portable(self) -> bool { self.0 & 1 == 0 } }
 
 /// An interned read-only data blob identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -325,7 +325,7 @@ fn step_edge(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>
 fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, u: usize) -> (Vec<usize>, bool, bool) {
     let mut info = NodeInfo { index: 0, low: 0, on_stack: false, self_loop: false, complete: true };
     let mut edges = Vec::new();
-    let closure = crate::profile() == crate::outline::tree::Profile::Release && matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
+    let closure = matches!(&reached.list[u].1, Ok(typed) if matches!(typed.shape, Shape::Closure(_)));
     if let Some(slice) = reached.direct_calls(u).filter(|_| !closure) {
         for &v in slice {
             scan_callee(cx, reached, cyclic, (u, v), (&mut info, &mut edges));
@@ -333,7 +333,7 @@ fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_
         return (edges, info.self_loop, info.complete);
     }
     let Ok(typed) = &reached.list[u].1 else { return (edges, false, true) };
-    let calls = closure.then(|| closure_calls(cx, typed)).flatten().unwrap_or_else(|| typed.calls().collect());
+    let calls = closure.then(|| closure_calls_uncached(cx, typed)).flatten().unwrap_or_else(|| typed.calls().collect());
     for (item, substs) in calls {
         if cx.intrinsic(item).is_some() {
             continue;
@@ -344,77 +344,6 @@ fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_
         }
     }
     (edges, info.self_loop, info.complete)
-}
-
-/// The functions a closure's own body calls; its typed data is its parent's, whose calls hold those of every closure in the parent's body, so each table is read at the closure's own expressions.
-fn closure_calls(cx: &mut Context<'_>, typed: &Typed) -> Option<Vec<(ItemRef, Substs)>> {
-    let typed = typed.scoped(&cx.types);
-    let Shape::Closure(closure) = &typed.shape else { return None };
-    let body = cx.body(closure.parent).ok()?;
-    let own = own_exprs(&body, closure.closure.body);
-    let mut calls: Vec<&Res> = Vec::new();
-    for expr in &own {
-        calls.extend([&typed.res, &typed.operators, &typed.try_blocks, &typed.box_frees].into_iter().filter_map(|map| map.get(expr)));
-        calls.extend(typed.fors.get(expr).into_iter().flat_map(|each| [&each.into_iter, &each.next]));
-        calls.extend(typed.tries.get(expr).into_iter().flat_map(|each| [&each.branch, &each.from_residual]));
-        calls.extend(typed.awaits.get(expr).into_iter().flat_map(|each| [&each.into_future, &each.poll]));
-        calls.extend(typed.coercions.get(expr).into_iter().flat_map(coercion_calls));
-    }
-    let derefs = typed.derefs.iter().filter(|((expr, _), _)| own.binary_search(expr).is_ok()).map(|(_, res)| res);
-    let shared = typed.pat_res.values().chain(&typed.drops);
-    let all = calls.into_iter().chain(derefs).chain(shared);
-    Some(all.filter_map(|res| if let Res::Fn(item, substs) = res { Some((*item, *substs)) } else { None }).collect())
-}
-
-/// The functions a coercion calls.
-fn coercion_calls(coercion: &Coercion) -> Vec<&Res> {
-    match coercion {
-        Coercion::Vtable(vtable) => vtable.calls(),
-        Coercion::Reify(res) => vec![res],
-        Coercion::Deref(steps, _) => steps.iter().filter_map(|(_, res)| res.as_ref()).collect(),
-        Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => Vec::new(),
-    }
-}
-
-/// The expressions of `body` in the tree under `root` outside any closure nested there, in increasing order.
-fn own_exprs(body: &Body, root: ExprId) -> Vec<ExprId> {
-    let mut own = Vec::new();
-    let mut todo = vec![root];
-    while let Some(expr) = todo.pop() {
-        own.push(expr);
-        children(body, expr, &mut todo);
-    }
-    own.sort_unstable();
-    own.dedup();
-    own
-}
-
-/// Pushes onto `out` the expressions directly under `expr`, except the body of a closure.
-fn children(body: &Body, expr: ExprId, out: &mut Vec<ExprId>) {
-    let list = |list: List| body.list(list).iter().map(|&at| ExprId(at));
-    match *body.expr(expr) {
-        Expr::Unary(_, a) | Expr::Field(a, _) | Expr::TupleField(a, _) | Expr::Cast(a, _) | Expr::Ref { expr: a, .. } | Expr::Let(_, a) | Expr::Loop { body: a, .. } | Expr::Try(a) | Expr::Await(a) | Expr::Become(a) | Expr::Paren(a) => out.push(a),
-        Expr::Binary(_, a, b) | Expr::Assign(a, b) | Expr::AssignOp(_, a, b) | Expr::Index(a, b) | Expr::Repeat(a, b) | Expr::While { cond: a, body: b, .. } | Expr::For { iter: a, body: b, .. } => out.extend([a, b]),
-        Expr::Call(callee, args) => out.extend(std::iter::once(callee).chain(list(args))),
-        Expr::Method { receiver, params, .. } => out.extend(std::iter::once(receiver).chain(list(params))),
-        Expr::Tuple(items) | Expr::Array(items) => out.extend(list(items)),
-        Expr::If(cond, then, otherwise) => out.extend([cond, then].into_iter().chain(otherwise)),
-        Expr::Range { from, to, .. } => out.extend(from.into_iter().chain(to)),
-        Expr::Return(value) | Expr::Break(_, value) | Expr::Yield(value) => out.extend(value),
-        Expr::Struct { fields, base, .. } => out.extend(body.list(fields).iter().map(|&at| body.fields[at as usize].value).chain(base)),
-        Expr::Match(scrutinee, arms) => out.extend(std::iter::once(scrutinee).chain(body.list(arms).iter().flat_map(|&at| body.arms[at as usize].guard.into_iter().chain([body.arms[at as usize].body])))),
-        Expr::Block { stmts, tail, .. } => out.extend(body.list(stmts).iter().flat_map(|&at| stmt_exprs(body.stmts[at as usize])).chain(tail)),
-        Expr::Closure { .. } | Expr::Lit(..) | Expr::Path(_) | Expr::Continue(_) | Expr::Macro { .. } | Expr::Underscore | Expr::FormatArgs(_) | Expr::OffsetOf { .. } => {}
-    }
-}
-
-/// The expressions directly under statement `stmt`.
-fn stmt_exprs(stmt: Stmt) -> Vec<ExprId> {
-    match stmt {
-        Stmt::Let { init, otherwise, .. } => init.into_iter().chain(otherwise).collect(),
-        Stmt::Expr(expr, _) => vec![expr],
-        Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => Vec::new(),
-    }
 }
 
 fn scan_callee(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_>, (u, v): (usize, usize), (info, edges): (&mut NodeInfo, &mut Vec<usize>)) {

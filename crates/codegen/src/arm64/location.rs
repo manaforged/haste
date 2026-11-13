@@ -19,7 +19,9 @@ impl Emit<'_> {
     }
 
     pub(super) fn at(&self, value: Value) -> Mem {
-        self.frame_mem(self.frame.values[value.index()])
+        let disp = self.frame.values[value.index()];
+        debug_assert_ne!(disp, 0, "unhomed value {value:?} in at()");
+        self.frame_mem(disp)
     }
 
     pub(super) fn slot(&self, slot: StackSlot, offset: i32) -> Mem {
@@ -107,8 +109,18 @@ impl Emit<'_> {
             Location::Reg(from) => self.asm.mov(reg, from),
             Location::Float(from) => self.asm.fmov_out(self.ty(value) == Type::F64, reg, Vreg(from)),
             Location::Slot => {
-                let at = self.at(value);
-                self.asm.load(Size::X, false, reg, at);
+                let disp = self.frame.values[value.index()];
+                debug_assert_ne!(disp, 0, "unhomed value {value:?} in raw()");
+                if let Some((cached_disp, cached_reg, stamp)) = self.last_spill
+                    && cached_disp == disp
+                    && stamp == self.asm.stamp()
+                {
+                    self.asm.mov(reg, cached_reg);
+                    self.last_spill = Some((disp, cached_reg, self.asm.stamp()));
+                } else {
+                    let at = self.frame_mem(disp);
+                    self.asm.load(Size::X, false, reg, at);
+                }
             }
         }
     }
@@ -127,8 +139,22 @@ impl Emit<'_> {
                 self.asm.extend(signed, bytes, reg, reg);
             }
             Location::Slot => {
-                let at = self.at(value);
-                self.asm.load(Size::of(bytes), signed && bytes < 8, reg, at);
+                let disp = self.frame.values[value.index()];
+                debug_assert_ne!(disp, 0, "unhomed value {value:?} in get()");
+                if let Some((cached_disp, cached_reg, stamp)) = self.last_spill
+                    && cached_disp == disp
+                    && stamp == self.asm.stamp()
+                {
+                    self.asm.extend(signed, bytes, reg, cached_reg);
+                    self.last_spill = if reg != cached_reg || bytes >= 8 {
+                        Some((disp, cached_reg, self.asm.stamp()))
+                    } else {
+                        None
+                    };
+                } else {
+                    let at = self.frame_mem(disp);
+                    self.asm.load(Size::of(bytes), signed && bytes < 8, reg, at);
+                }
             }
         }
     }
@@ -160,6 +186,9 @@ impl Emit<'_> {
             _ => {
                 let at = self.at(value);
                 self.asm.store(Size::X, at, reg);
+                if self.ty(value).bytes() <= 8 {
+                    self.last_spill = Some((self.frame.values[value.index()], reg, self.asm.stamp()));
+                }
             }
         }
     }
@@ -170,7 +199,25 @@ impl Emit<'_> {
             Location::Float(from) if ty == Type::V128 => self.asm.vmov(reg, Vreg(from)),
             Location::Float(from) => self.asm.fmov_reg(ty == Type::F64, reg, Vreg(from)),
             Location::Imm(0) if ty == Type::V128 => self.asm.veor_zero(reg),
-            Location::Slot => self.asm.vload(ty.bytes(), reg, self.at(value)),
+            Location::Slot => {
+                let disp = self.frame.values[value.index()];
+                debug_assert_ne!(disp, 0, "unhomed value {value:?} in fget()");
+                if let Some((cached_disp, cached_reg, cached_ty, stamp)) = self.last_fspill
+                    && cached_disp == disp
+                    && cached_ty == ty
+                    && stamp == self.asm.stamp()
+                {
+                    if ty == Type::V128 {
+                        self.asm.vmov(reg, cached_reg);
+                    } else {
+                        self.asm.fmov_reg(ty == Type::F64, reg, cached_reg);
+                    }
+                    self.last_fspill = Some((disp, cached_reg, cached_ty, self.asm.stamp()));
+                } else {
+                    let at = self.frame_mem(disp);
+                    self.asm.vload(ty.bytes(), reg, at);
+                }
+            }
             _ => {
                 self.raw(D, value);
                 self.asm.fmov_in(ty == Type::F64, reg, D);
@@ -183,7 +230,10 @@ impl Emit<'_> {
         match self.plan.location(value) {
             Location::Float(to) if ty == Type::V128 => self.asm.vmov(Vreg(to), reg),
             Location::Float(to) => self.asm.fmov_reg(ty == Type::F64, Vreg(to), reg),
-            _ => self.asm.vstore(ty.bytes(), self.at(value), reg),
+            _ => {
+                self.asm.vstore(ty.bytes(), self.at(value), reg);
+                self.last_fspill = Some((self.frame.values[value.index()], reg, ty, self.asm.stamp()));
+            }
         }
     }
 

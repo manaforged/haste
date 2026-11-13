@@ -652,7 +652,7 @@ impl Source {
     /// The index of the delimiter that matches token `at`.
     pub fn pair(&self, at: u32) -> u32 {
         let (src, local) = self.layer(at);
-        src.tokens[local].pair + (at - local as u32)
+        src.tokens.get(local).map_or(at, |token| token.pair + (at - local as u32))
     }
 
     /// Whether token `at` is followed by the next token with no space between them.

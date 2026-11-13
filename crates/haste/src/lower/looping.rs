@@ -37,7 +37,7 @@ impl Lower<'_, '_> {
             && let Some(signed) = range_signed(prim)
             && let Repr::Scalar(ir_ty) = repr(self.cx, elem_ty)?
         {
-            return self.for_range(pat, iter, (each.iter, elem_ty), (signed, inclusive, ir_ty), (label, body));
+            return self.for_range(pat, iter, (each.iter, elem_ty), (signed, inclusive, prim == Primitive::Char, ir_ty), (label, body));
         }
         let value = self.expr(iter)?;
         let iterator = self.invoke(SiteOrigin::Table(SiteKey::ForInto(expr)), into, into_substs, value.into_iter().collect())?;
@@ -65,7 +65,7 @@ impl Lower<'_, '_> {
         pat: PatId,
         iter: ExprId,
         (range_ty, elem_ty): (Ty, Ty),
-        (signed, inclusive, ir_ty): (bool, bool, Type),
+        (signed, inclusive, is_char, ir_ty): (bool, bool, bool, Type),
         (label, body): (Option<u32>, ExprId),
     ) -> Result<Option<Value>> {
         let value = self.expr(iter)?;
@@ -115,12 +115,22 @@ impl Lower<'_, '_> {
             let at_end = self.ins().icmp(IntCC::Equal, cur, end);
             self.write(done_place, at_end);
         }
-        let one = self.ins().iconst(ir_ty, 1);
-        let next = self.ins().iadd(cur, one);
+        let next = self.next_range_elem(cur, ir_ty, is_char);
         self.write(cur_place, next);
         let item = self.spill(Some(cur), elem_ty)?;
         self.bind_matched(pat, item, None)?;
         self.loop_body((head, exit, depth), label, body)
+    }
+
+    fn next_range_elem(&mut self, cur: Value, ir_ty: Type, is_char: bool) -> Value {
+        let one = self.ins().iconst(ir_ty, 1);
+        let next = self.ins().iadd(cur, one);
+        if !is_char {
+            return next;
+        }
+        let is_surrogate = self.ins().icmp_imm(IntCC::Equal, next, 0xD800);
+        let after_gap = self.ins().iconst(ir_ty, 0xE000);
+        self.ins().select(is_surrogate, after_gap, next)
     }
 
     /// Lowers the body of a loop whose iterations start at block `head` and leave to `exit`, with `depth` owned values outside it, then the jump back to `head`; the loop's value is `()`.
@@ -241,7 +251,7 @@ impl Lower<'_, '_> {
         let mut values = Vec::new();
         for (at, &index) in fields.iter().enumerate() {
             let value = match ends.get(at) {
-                Some(&end) => self.expr(end)?,
+                Some(&end) => self.eval_operand(end)?,
                 None => Some(self.ins().iconst(Type::I8, 0)),
             };
             values.push((index, value));

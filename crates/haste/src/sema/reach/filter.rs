@@ -273,50 +273,62 @@ fn substs_has_non_fixed(cx: &Context<'_>, substs: Substs) -> bool {
 pub(super) fn pre_collect_callees(
     cx: &mut Context<'_>,
     filter: &mut ReachFilter,
-    typed: &Result<Arc<Typed>, String>,
-    include_fixed: bool,
+    (caller, typed, include_fixed): (Instance, &Result<Arc<Typed>, String>, bool),
     out: &mut Vec<(Instance, bool)>,
 ) {
     let Ok(typed) = typed else { return };
     let check_only = cx.store.lookups.skip_warm_sysroot_bodies;
+    let caller_is_fixed = cx.outline.is_fixed(caller.0.krate);
     let mut visiting = HashSet::default();
-    let mut push_callee = |cx: &mut Context<'_>, filter: &mut ReachFilter, item: ItemRef, substs: Substs| {
-        if cx.intrinsic(item).is_some() {
+    let mut push = |item: ItemRef, substs: Substs| push_filtered_callee(cx, filter, (&mut visiting, check_only && caller_is_fixed), (item, substs), out);
+    match &typed.tables {
+        LazyTables::Poly(poly) => push_poly_callees(typed, poly, include_fixed, &mut push),
+        LazyTables::Eager(_) => {
+            for (item, substs) in typed.calls() {
+                push(item, substs);
+            }
+        }
+    }
+}
+
+fn push_filtered_callee(
+    cx: &mut Context<'_>,
+    filter: &mut ReachFilter,
+    (visiting, prune_fixed): (&mut HashSet<ItemRef>, bool),
+    (item, substs): Instance,
+    out: &mut Vec<(Instance, bool)>,
+) {
+    if cx.intrinsic(item).is_some() {
+        return;
+    }
+    let mut sealed = false;
+    if prune_fixed && cx.outline.is_fixed(item.krate) {
+        if !substs_has_non_fixed(cx, substs) {
             return;
         }
-        let mut sealed = false;
-        if check_only && cx.outline.is_fixed(item.krate) {
-            if !substs_has_non_fixed(cx, substs) {
-                return;
-            }
-            sealed = filter.check_sealed(cx, item, &mut visiting) == Some(true);
-        }
-        out.push(((item, substs), sealed));
-    };
-    match &typed.tables {
-        LazyTables::Poly(poly) => {
-            if include_fixed {
-                for (item, substs) in poly.calls() { push_callee(cx, filter, item, substs); }
-            } else {
-                for (item, substs) in poly.dynamic_calls() { push_callee(cx, filter, item, substs); }
-            }
-            for r in &typed.drops {
-                if let Res::Fn(item, substs) = *r { push_callee(cx, filter, item, substs); }
-            }
-            match &typed.shape {
-                Shape::Glue(g) => for r in g.drop.iter().chain(&g.parts).chain(&g.resume) {
-                    if let Res::Fn(item, substs) = *r { push_callee(cx, filter, item, substs); }
-                },
-                Shape::Untuple(r) => if let Res::Fn(item, substs) = *r { push_callee(cx, filter, item, substs); },
-                Shape::Clone(calls) => for r in calls {
-                    if let Res::Fn(item, substs) = *r { push_callee(cx, filter, item, substs); }
-                },
-                _ => {}
-            }
-        }
-        LazyTables::Eager(_) => {
-            for (item, substs) in typed.calls() { push_callee(cx, filter, item, substs); }
-        }
+        sealed = filter.check_sealed(cx, item, visiting) == Some(true);
+    }
+    out.push(((item, substs), sealed));
+}
+
+fn push_poly_callees(typed: &Typed, poly: &crate::sema::summary::PolyInst, include_fixed: bool, push: &mut impl FnMut(ItemRef, Substs)) {
+    if include_fixed {
+        for (item, substs) in poly.calls() { push(item, substs); }
+    } else {
+        for (item, substs) in poly.dynamic_calls() { push(item, substs); }
+    }
+    for r in &typed.drops {
+        if let Res::Fn(item, substs) = *r { push(item, substs); }
+    }
+    match &typed.shape {
+        Shape::Glue(g) => for r in g.drop.iter().chain(&g.parts).chain(&g.resume) {
+            if let Res::Fn(item, substs) = *r { push(item, substs); }
+        },
+        Shape::Untuple(r) => if let Res::Fn(item, substs) = *r { push(item, substs); },
+        Shape::Clone(calls) => for r in calls {
+            if let Res::Fn(item, substs) = *r { push(item, substs); }
+        },
+        _ => {}
     }
 }
 
@@ -338,7 +350,7 @@ pub(super) fn collect_filtered_callees(
 ) {
     let include_fixed = !filter.seen_fixed_poly.contains(&caller.0);
     let mut pre = Vec::new();
-    pre_collect_callees(cx, filter, typed, include_fixed, &mut pre);
+    pre_collect_callees(cx, filter, (caller, typed, include_fixed), &mut pre);
     commit_filter_caller(cx, filter, caller, typed);
     for (callee, sealed) in pre {
         if sealed && !filter.seen_sealed_sysroot.insert(callee.0) {

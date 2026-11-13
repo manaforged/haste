@@ -45,72 +45,14 @@ fn magic_udiv(func: &mut Function, defs: &mut Vec<Option<Inst>>, consts: &mut Ve
     Op::Binary(Binary::Ushr, t2, sh)
 }
 
-fn width_mask(ty: Type) -> u64 {
-    let bits = ty.bits();
-    if bits >= 64 { u64::MAX } else { (1_u64 << bits) - 1 }
-}
-
-fn known_bits(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value, depth: u8) -> (u64, u64) {
-    let ty = func.ty(v);
-    if !ty.is_small_int() {
-        return (0, 0);
-    }
-    let w = width_mask(ty);
-    if let Some(imm) = consts.get(v.index()).copied().flatten() {
-        let u = extend(imm, ty, false) as u64;
-        return (!u & w, u & w);
-    }
-    if depth >= 6 {
-        return (0, 0);
-    }
-    let Some(inst) = defs.get(v.index()).copied().flatten() else { return (0, 0) };
-    match func.insts[inst.index()].op {
-        Op::Unary(Unary::Bnot, a) => {
-            let (z, o) = known_bits(func, defs, consts, a, depth + 1);
-            (o & w, z & w)
-        }
-        Op::Binary(Binary::Band, a, b) => {
-            let (za, oa) = known_bits(func, defs, consts, a, depth + 1);
-            let (zb, ob) = known_bits(func, defs, consts, b, depth + 1);
-            ((za | zb) & w, (oa & ob) & w)
-        }
-        Op::Binary(Binary::Bor, a, b) => {
-            let (za, oa) = known_bits(func, defs, consts, a, depth + 1);
-            let (zb, ob) = known_bits(func, defs, consts, b, depth + 1);
-            ((za & zb) & w, (oa | ob) & w)
-        }
-        Op::Binary(Binary::Bxor, a, b) => {
-            let (za, oa) = known_bits(func, defs, consts, a, depth + 1);
-            let (zb, ob) = known_bits(func, defs, consts, b, depth + 1);
-            (((za & zb) | (oa & ob)) & w, ((za & ob) | (oa & zb)) & w)
-        }
-        Op::Binary(Binary::Ushr, a, sh) => {
-            let Some(k) = consts.get(sh.index()).copied().flatten().and_then(|c| u32::try_from(c).ok()).filter(|&k| k < ty.bits()) else {
-                return (0, 0);
-            };
-            let (za, oa) = known_bits(func, defs, consts, a, depth + 1);
-            let top = if k == 0 { 0 } else { !0_u64 << (ty.bits() - k) };
-            (((za >> k) | top) & w, (oa >> k) & w)
-        }
-        Op::Binary(Binary::Ishl, a, sh) => {
-            let Some(k) = consts.get(sh.index()).copied().flatten().and_then(|c| u32::try_from(c).ok()).filter(|&k| k < ty.bits()) else {
-                return (0, 0);
-            };
-            let (za, oa) = known_bits(func, defs, consts, a, depth + 1);
-            let low = if k == 0 { 0 } else { (1_u64 << k) - 1 };
-            (((za << k) | low) & w, (oa << k) & w)
-        }
-        Op::Convert(Convert::Uextend, a) if func.ty(a).is_small_int() => {
-            let (za, oa) = known_bits(func, defs, consts, a, depth + 1);
-            let aw = width_mask(func.ty(a));
-            ((za | !aw) & w, oa & aw)
-        }
-        Op::Convert(Convert::Ireduce, a) if func.ty(a).is_small_int() => {
-            let (za, oa) = known_bits(func, defs, consts, a, depth + 1);
-            (za & w, oa & w)
-        }
-        _ => (0, 0),
-    }
+fn known_bits(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value) -> (u64, u64) {
+    crate::fold::known_bits(
+        func,
+        &|x| defs.get(x.index()).copied().flatten(),
+        &|x| consts.get(x.index()).copied().flatten(),
+        v,
+        0,
+    )
 }
 
 enum Masked {
@@ -122,7 +64,7 @@ fn simplify_masked(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>
     if mask == 0 {
         return Some(Masked::Const(0));
     }
-    let (kz, ko) = known_bits(func, defs, consts, v, 0);
+    let (kz, ko) = known_bits(func, defs, consts, v);
     if (kz & mask) == mask {
         return Some(Masked::Const(0));
     }
@@ -135,22 +77,22 @@ fn simplify_masked(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>
     let inst = defs.get(v.index()).copied().flatten()?;
     match func.insts[inst.index()].op {
         Op::Binary(Binary::Bor | Binary::Bxor, a, b) => {
-            let (zb, _) = known_bits(func, defs, consts, b, 0);
+            let (zb, _) = known_bits(func, defs, consts, b);
             if (zb & mask) == mask {
                 return simplify_masked(func, defs, consts, a, mask, depth + 1).or(Some(Masked::And(a, mask)));
             }
-            let (za, _) = known_bits(func, defs, consts, a, 0);
+            let (za, _) = known_bits(func, defs, consts, a);
             if (za & mask) == mask {
                 return simplify_masked(func, defs, consts, b, mask, depth + 1).or(Some(Masked::And(b, mask)));
             }
             None
         }
         Op::Binary(Binary::Band, a, b) => {
-            let (_, ob) = known_bits(func, defs, consts, b, 0);
+            let (_, ob) = known_bits(func, defs, consts, b);
             if (ob & mask) == mask {
                 return simplify_masked(func, defs, consts, a, mask, depth + 1).or(Some(Masked::And(a, mask)));
             }
-            let (_, oa) = known_bits(func, defs, consts, a, 0);
+            let (_, oa) = known_bits(func, defs, consts, a);
             if (oa & mask) == mask {
                 return simplify_masked(func, defs, consts, b, mask, depth + 1).or(Some(Masked::And(b, mask)));
             }
@@ -174,7 +116,7 @@ fn simplify_masked(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>
 }
 
 fn has_clear_low_byte_bits(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value) -> bool {
-    let (kz, _) = known_bits(func, defs, consts, v, 0);
+    let (kz, _) = known_bits(func, defs, consts, v);
     (kz & 0x7f7f_7f7f_7f7f_7f7f) == 0x7f7f_7f7f_7f7f_7f7f
 }
 
@@ -252,8 +194,8 @@ fn redundant_mask(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>]
     if func.ty(src) != ty {
         return false;
     }
-    let w = width_mask(ty);
-    let (kz, _) = known_bits(func, defs, consts, src, 0);
+    let w = ty.unsigned_max();
+    let (kz, _) = known_bits(func, defs, consts, src);
     let active = !kz & w;
     (active & mask) == active
 }
@@ -261,13 +203,6 @@ fn redundant_mask(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>]
 fn set_alias(subst: &mut Vec<Value>, len: usize, r: Value, target: Value) {
     subst.extend((subst.len()..len).map(|i| Value(i as u32)));
     subst[r.index()] = target;
-}
-
-fn find_alias(subst: &[Value], mut v: Value) -> Value {
-    while let Some(&next) = subst.get(v.index()).filter(|&&n| n != v) {
-        v = next;
-    }
-    v
 }
 
 fn simplify_band(func: &mut Function, defs: &mut Vec<Option<Inst>>, consts: &mut Vec<Option<i64>>, out: &mut Vec<Inst>, res: Option<Value>, subst: &mut Vec<Value>, a: Value, b: Value) -> Option<Op> {
@@ -317,7 +252,7 @@ fn simplify_bxor(func: &mut Function, defs: &mut Vec<Option<Inst>>, consts: &mut
     if !ty.is_small_int() {
         return None;
     }
-    let all_ones = width_mask(ty);
+    let all_ones = ty.unsigned_max();
     for (inner, c2_val) in [(a, b), (b, a)] {
         let Some(c2) = consts.get(c2_val.index()).copied().flatten() else { continue };
         if (extend(c2, ty, false) as u64) == all_ones {
@@ -535,7 +470,7 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
     }
     if !subst.is_empty() {
         for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-            func.insts[inst.index()].op.map_operands(|v| find_alias(&subst, v));
+            func.insts[inst.index()].op.map_operands(|v| crate::merge::find(&subst, v));
         }
     }
 }

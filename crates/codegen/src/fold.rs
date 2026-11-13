@@ -155,6 +155,59 @@ pub(crate) fn evaluate(func: &Function, op: &Op, known: &dyn Fn(Value) -> Option
     }
 }
 
+/// Evaluates `op` for `ty`, sign-wrapping small-integer results to the canonical `Op::Const` representation.
+pub(crate) fn evaluate_wrapped(func: &Function, op: &Op, ty: Type, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
+    if !ty.is_small_int() {
+        return None;
+    }
+    evaluate(func, op, known).map(|v| extend(v, ty, true))
+}
+
+fn known_shift_bits(op: Binary, ty: Type, (za, oa): (u64, u64), count: i64) -> (u64, u64) {
+    let w = ty.unsigned_max();
+    let k = (count as u32) & (ty.bits() - 1);
+    match op {
+        Binary::Ushr => (((za >> k) | if k == 0 { 0 } else { !0_u64 << (ty.bits() - k) }) & w, (oa >> k) & w),
+        _ => (((za << k) | if k == 0 { 0 } else { (1_u64 << k) - 1 }) & w, (oa << k) & w),
+    }
+}
+
+/// Returns `(known_zero_bits, known_one_bits)` within `v`'s integer type width.
+pub(crate) fn known_bits(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, known: &dyn Fn(Value) -> Option<i64>, v: Value, depth: u8) -> (u64, u64) {
+    let ty = func.ty(v);
+    if !ty.is_small_int() {
+        return (0, 0);
+    }
+    let w = ty.unsigned_max();
+    if let Some(imm) = known(v) {
+        let u = extend(imm, ty, false) as u64;
+        return (!u & w, u & w);
+    }
+    if depth >= 6 {
+        return (0, 0);
+    }
+    let Some(inst) = def_of(v) else { return (0, 0) };
+    let rec = |u: Value| known_bits(func, def_of, known, u, depth + 1);
+    match func.insts[inst.index()].op {
+        Op::Unary(Unary::Bnot, a) => { let (z, o) = rec(a); (o & w, z & w) }
+        Op::Binary(Binary::Band, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); ((za | zb) & w, oa & ob & w) }
+        Op::Binary(Binary::Bor, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); (za & zb & w, (oa | ob) & w) }
+        Op::Binary(Binary::Bxor, a, b) => {
+            let ((za, oa), (zb, ob)) = (rec(a), rec(b));
+            (((za & zb) | (oa & ob)) & w, ((za & ob) | (oa & zb)) & w)
+        }
+        Op::Binary(op @ (Binary::Ushr | Binary::Ishl), a, sh) => known(sh).map_or((0, 0), |c| known_shift_bits(op, ty, rec(a), c)),
+        Op::Convert(Convert::Uextend, a) if func.ty(a).is_small_int() => {
+            let ((za, oa), aw) = (rec(a), func.ty(a).unsigned_max());
+            ((za | !aw) & w, oa & aw)
+        }
+        Op::Convert(Convert::Ireduce, a) if func.ty(a).is_small_int() => { let (za, oa) = rec(a); (za & w, oa & w) }
+        Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => (w & !1, 0),
+        Op::Select(_, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); (za & zb & w, oa & ob & w) }
+        _ => (0, 0),
+    }
+}
+
 struct Fold {
     consts: Vec<Option<i64>>,
     subst: Vec<Value>,
@@ -176,9 +229,9 @@ impl Fold {
         Some((self.known(x)?, self.known(y)?))
     }
 
-    fn evaluate(&self, func: &Function, op: &Op) -> Option<i64> {
-        evaluate(func, op, &|value| self.known(value)).or_else(|| match *op {
-            Op::Binary(op, x, y) if func.ty(x).is_small_int() => self.absorbed(op, func.ty(x), x, y),
+    fn evaluate(&self, func: &Function, op: &Op, ty: Type) -> Option<i64> {
+        evaluate_wrapped(func, op, ty, &|value| self.known(value)).or_else(|| match *op {
+            Op::Binary(op, x, y) if ty.is_small_int() => self.absorbed(op, ty, x, y).map(|v| extend(v, ty, true)),
             _ => None,
         })
     }
@@ -295,36 +348,6 @@ impl Fold {
         }
     }
 
-    fn known_active_bits(&self, func: &Function, val: Value, depth: u32) -> Option<u32> {
-        if depth == 0 {
-            return None;
-        }
-        if self.boolean(func, val) {
-            return Some(1);
-        }
-        match *self.def(func, val)? {
-            Op::Binary(Binary::Ushr, src, s) => {
-                let bits = func.ty(src).bits();
-                let count = (self.known(s)? as u32) & (bits - 1);
-                (count > 0).then_some(bits - count)
-            }
-            Op::Binary(Binary::Band, a, b) => match (self.known_active_bits(func, a, depth - 1), self.known(b)) {
-                (_, Some(mask)) => Some(64 - (extend(mask, func.ty(a), false) as u64).leading_zeros()),
-                (Some(ab), _) => Some(ab),
-                _ => self.known(a).map(|mask| 64 - (extend(mask, func.ty(a), false) as u64).leading_zeros()),
-            },
-            Op::Convert(Convert::Ireduce, src) => {
-                let dst_bits = func.ty(val).bits();
-                Some(self.known_active_bits(func, src, depth - 1).map_or(dst_bits, |b| b.min(dst_bits)))
-            }
-            Op::Convert(Convert::Uextend, src) => {
-                let src_bits = func.ty(src).bits();
-                Some(self.known_active_bits(func, src, depth - 1).map_or(src_bits, |b| b.min(src_bits)))
-            }
-            _ => None,
-        }
-    }
-
     /// `x` when `y` is the unit of `op` at type `ty` or a shift count that masks to zero, or `y` when `x` is the unit of a commuting `op`.
     fn neutral(&self, func: &Function, op: Binary, ty: Type, x: Value, y: Value) -> Option<Value> {
         let is = |value: Value, want: i64| self.known(value).is_some_and(|imm| extend(imm, ty, false) == extend(want, ty, false));
@@ -340,11 +363,10 @@ impl Fold {
         }
         if op == Binary::Band {
             for (val, other) in [(x, y), (y, x)] {
-                if let (Some(active), Some(mask)) = (self.known_active_bits(func, val, 4), self.known(other))
-                    && active < 64
-                {
-                    let max_bits = if active == 0 { 0 } else { (1_u64 << active) - 1 };
-                    if (extend(mask, ty, false) as u64) & max_bits == max_bits {
+                if let Some(mask) = self.known(other) {
+                    let (kz, _) = known_bits(func, &|v| self.defs[self.find(v).index()], &|v| self.known(v), val, 0);
+                    let active = !kz & ty.unsigned_max();
+                    if (active & (extend(mask, ty, false) as u64)) == active {
                         return Some(val);
                     }
                 }
@@ -379,10 +401,8 @@ impl Fold {
             let data = &func.insts[inst.index()];
             let Some(result) = data.result.filter(|result| self.subst[result.index()] == *result && self.consts[result.index()].is_none()) else { continue };
             let ty = func.ty(result);
-            if ty.is_small_int()
-                && let Some(imm) = self.evaluate(func, &data.op)
-            {
-                self.consts[result.index()] = Some(extend(imm, ty, true));
+            if let Some(imm) = self.evaluate(func, &data.op, ty) {
+                self.consts[result.index()] = Some(imm);
             } else if let Some(value) = self.identity(func, &data.op) {
                 self.subst[result.index()] = value;
             }
@@ -639,10 +659,6 @@ fn drop_params(func: &mut Function, fold: &Fold) {
     }
 }
 
-fn pure(op: &Op) -> bool {
-    matches!(op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Sha256Rounds(..) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
-}
-
 /// The instruction in a block that defines each value.
 pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
     let mut defs = vec![None; func.types.len()];
@@ -674,7 +690,7 @@ fn dead(func: &mut Function) {
         keep.resize(block.insts.len(), true);
         for (at, inst) in block.insts.iter().enumerate().rev() {
             let data = &func.insts[inst.index()];
-            if pure(&data.op) && data.result.is_some_and(|result| uses[result.index()] == 0) {
+            if data.op.is_removable() && data.result.is_some_and(|result| uses[result.index()] == 0) {
                 keep[at] = false;
                 data.op.for_operands(|value| uses[value.index()] -= 1);
             }

@@ -63,10 +63,10 @@ impl Emit<'_> {
 
     /// The memory at `addr + offset`: relative to rbp for a frame address, to the location register of `addr`, or through rcx.
     pub(super) fn address(&mut self, addr: Value, offset: i32) -> Mem {
-        self.address_in(addr, offset, Reg::Rcx)
+        self.address_in(addr, offset, Reg::Rcx, Reg::R11)
     }
 
-    pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg) -> Mem {
+    pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg, temp: Reg) -> Mem {
         if let Some(mode) = self.plan.sib[addr.index()] {
             return match mode.base {
                 SibBase::Frame(slot) => {
@@ -96,7 +96,18 @@ impl Emit<'_> {
                             if mode.shift > 0 {
                                 self.asm.shift_imm(Size::Q, Shift::Shl, scratch, mode.shift);
                             }
-                            self.asm.alu(Alu::Add, scratch, self.at(base));
+                            match self.location(base) {
+                                Location::Slot => self.asm.alu(Alu::Add, scratch, self.at(base)),
+                                Location::Imm(imm) if i32::try_from(imm).is_ok() => self.asm.alu_imm(Alu::Add, scratch, imm as i32),
+                                Location::Frame(slot, off) => {
+                                    self.asm.alu(Alu::Add, scratch, Reg::Rbp);
+                                    self.asm.alu_imm(Alu::Add, scratch, self.frame.slots[slot.index()] + off);
+                                }
+                                _ => {
+                                    self.raw(temp, base);
+                                    self.asm.alu(Alu::Add, scratch, temp);
+                                }
+                            }
                             Mem::new(scratch, disp)
                         }
                     }
@@ -211,28 +222,27 @@ impl Emit<'_> {
         })
     }
 
-    /// A float register or memory operand that holds `value`.
-    pub(super) fn foperand(&self, value: Value) -> Rm {
-        match self.xmm_of(value) {
-            Some(xmm) => xmm.into(),
-            None => self.at(value).into(),
+    /// A float register or memory operand that holds `value`, using `scratch` when `value` has no float home.
+    pub(super) fn foperand(&mut self, value: Value, scratch: Xmm) -> Rm {
+        match self.location(value) {
+            Location::Float(xmm) => Xmm(xmm).into(),
+            Location::Slot => self.at(value).into(),
+            _ => {
+                self.fget(scratch, value);
+                scratch.into()
+            }
         }
     }
 
-    /// A register or memory operand that holds `value`, using r11 for a frame address or a float register.
+    /// A register or memory operand that holds `value`, using r11 when `value` has no register or stack home.
     pub(super) fn operand(&mut self, value: Value) -> Rm {
         match self.location(value) {
             Location::Reg(reg) => reg.into(),
-            Location::Imm(_) | Location::SlotAddr(_) => {
-                let at = self.at(value);
-                self.move_to(at, value);
-                at.into()
-            }
-            Location::Frame(..) | Location::Float(_) => {
+            Location::Slot => self.at(value).into(),
+            _ => {
                 self.raw(Reg::R11, value);
                 Reg::R11.into()
             }
-            Location::Slot => self.at(value).into(),
         }
     }
 

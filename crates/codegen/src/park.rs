@@ -119,14 +119,7 @@ fn loop_back_args(func: &Function) -> Vec<(usize, usize)> {
             }
         };
         for &inst in &block.insts {
-            match &func.insts[inst.index()].op {
-                crate::ir::Op::Jump(target, args) => edge(*target, args),
-                crate::ir::Op::Brif(_, then, then_args, otherwise, else_args) => {
-                    edge(*then, then_args);
-                    edge(*otherwise, else_args);
-                }
-                _ => {}
-            }
+            crate::frame::terminator_edges(&func.insts[inst.index()].op, &mut edge);
         }
     }
     pairs

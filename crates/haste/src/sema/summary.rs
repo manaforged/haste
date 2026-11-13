@@ -18,6 +18,7 @@ use super::infer::{BodyTables, Coercion, Infer, LazyTables, Local, Res, Shape, S
 use super::reach::Instance;
 use super::substs::{ProjId, Substs};
 use super::ty::{Kind, Ty, Types, object_parts};
+use inst::{TyFolder, fold_substs, fold_ty};
 
 /// How generic sema summarizes one function item: a reusable polymorphic summary or monomorphic fallback.
 #[derive(Clone, Debug)]
@@ -608,47 +609,39 @@ fn eval_one_proj(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, proj_id: Pro
     Ok(zonked)
 }
 
-fn sub_ty(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, ty: Ty) -> Result<Ty> {
-    if ty == Ty::NONE || !infer.cx.types.has_params(ty) {
-        return Ok(ty);
-    }
-    if let Some(&cached) = sub.tys.get(&ty) {
-        return Ok(cached);
-    }
-    let kind = infer.cx.types.kind(ty).clone();
-    let mapped = match kind {
-        Kind::Param(idx) => *sub.args.get(idx as usize).ok_or_else(|| anyhow::anyhow!("param {idx} out of bounds"))?,
-        Kind::Proj(proj_id) => eval_one_proj(infer, sub, proj_id)?,
-        _ => sub_compound_kind(infer, sub, &kind)?,
-    };
-    sub.tys.insert(ty, mapped);
-    Ok(mapped)
+struct SummaryFolder<'a, 'b, 'c, 'd> {
+    infer: &'a mut Infer<'b, 'c>,
+    sub: &'a mut SubState<'d>,
 }
 
-fn sub_compound_kind(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, kind: &Kind) -> Result<Ty> {
-    let pools = infer.cx.types.pools();
-    let mut err: Option<anyhow::Error> = None;
-    let mapped = kind.map_pool(&pools, &mut |child| match sub_ty(infer, sub, child) {
-        Ok(found) => found,
-        Err(e) => {
-            if err.is_none() {
-                err = Some(e);
-            }
-            child
-        }
-    });
-    if let Some(e) = err {
-        return Err(e);
+impl TyFolder for SummaryFolder<'_, '_, '_, '_> {
+    type Error = anyhow::Error;
+    fn types(&self) -> &Types {
+        &self.infer.cx.types
     }
-    Ok(infer.cx.types.intern(mapped))
+    fn args(&self) -> &[Ty] {
+        self.sub.args
+    }
+    fn get_cached(&self, ty: Ty) -> Option<Ty> {
+        self.sub.tys.get(&ty).copied()
+    }
+    fn set_cached(&mut self, ty: Ty, mapped: Ty) {
+        self.sub.tys.insert(ty, mapped);
+    }
+    fn param_oob(&self, idx: u16) -> Self::Error {
+        anyhow::anyhow!("param {idx} out of bounds")
+    }
+    fn fold_proj(&mut self, proj_id: ProjId) -> Result<Ty> {
+        eval_one_proj(self.infer, self.sub, proj_id)
+    }
+}
+
+fn sub_ty(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, ty: Ty) -> Result<Ty> {
+    fold_ty(&mut SummaryFolder { infer, sub }, ty)
 }
 
 fn sub_substs(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, substs: Substs) -> Result<Substs> {
-    if !infer.cx.types.substs_have_params(substs) {
-        return Ok(substs);
-    }
-    let mapped = sub_substs_vec(infer, sub, substs)?;
-    Ok(infer.cx.types.intern_substs(&mapped))
+    fold_substs(&mut SummaryFolder { infer, sub }, substs)
 }
 
 fn sub_substs_vec(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, substs: Substs) -> Result<Vec<Ty>> {

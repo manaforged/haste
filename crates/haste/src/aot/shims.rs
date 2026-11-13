@@ -1,11 +1,12 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Arch, Os};
 
+use super::wide::WideShim;
 use super::{Buf, Plan, SectionAddrs};
 use crate::host::cpu::HIDDEN;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum Shim {
+pub(in crate::aot) enum Shim {
     Noop,
     Barrier,
     Cpuid,
@@ -17,6 +18,7 @@ pub(super) enum Shim {
     Realloc,
     FillOnce,
     ThreadCell,
+    Wide(WideShim),
 }
 
 pub(super) fn deps(shim: Shim) -> &'static [&'static str] {
@@ -338,6 +340,7 @@ fn emit_shim_x64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &dyn
             out.bytes(&[0xEB, 0xEB, 0x41, 0xFF, 0xD4, 0xC6, 0x03, 0x01, 0x41, 0x5C, 0x5B, 0xC3]);
         }
         Shim::ThreadCell => emit_x64_thread_cell(va, addrs.thread_key, stub_va, out)?,
+        Shim::Wide(wide) => super::wide::emit(Arch::X64, os, wide, out)?,
     }
     Ok(())
 }
@@ -388,6 +391,7 @@ fn emit_shim_arm64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &d
             out.words(&[0x1400_0000 | (back & 0x03FF_FFFF), 0xA941_53F3, 0xA8C2_7BFD, 0xD65F_03C0]);
         }
         Shim::ThreadCell => emit_arm64_thread_cell(va, addrs.thread_key, stub_va, out)?,
+        Shim::Wide(wide) => super::wide::emit(Arch::Arm64, os, wide, out)?,
     }
     Ok(())
 }

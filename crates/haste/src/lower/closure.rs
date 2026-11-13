@@ -143,6 +143,15 @@ impl Lower<'_, '_> {
         {
             self.moved_out(root, &path)?;
         }
+        let env = if self.cx.closure_consumes(callee_ty)
+            && self.may_alias_place(callee)
+            && let Some(place) = place
+            && matches!(place.repr, super::Repr::Mem { .. })
+        {
+            self.snapshot_repr(place.repr, env)
+        } else {
+            env
+        };
         Ok(vec![env])
     }
 

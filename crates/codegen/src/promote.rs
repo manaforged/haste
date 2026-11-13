@@ -102,46 +102,7 @@ impl Scan {
     }
 
     fn addresses(&mut self, func: &Function) {
-        let mut consts = vec![None; func.types.len()];
-        let mut adds = Vec::new();
-        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-            let data = &func.insts[inst.index()];
-            let Some(result) = data.result else { continue };
-            match &data.op {
-                Op::StackAddr(slot, offset) => {
-                    self.addrs[result.index()] = Some((*slot, i64::from(*offset)));
-                    self.addr_insts.push((*inst, *slot));
-                }
-                Op::Const(imm) => consts[result.index()] = Some(*imm),
-                Op::Binary(Binary::Iadd, x, c) => adds.push((*inst, result, *x, *c)),
-                _ => {}
-            }
-        }
-        self.derive(&consts, adds);
-    }
-
-    fn derive(&mut self, consts: &[Option<i64>], mut adds: Vec<(Inst, Value, Value, Value)>) {
-        loop {
-            let before = adds.len();
-            adds.retain(|&(inst, result, x, c)| {
-                let ((slot, base), imm) = match (self.addrs[x.index()], consts[c.index()]) {
-                    (Some(addr), Some(imm)) => (addr, imm),
-                    _ => match (self.addrs[c.index()], consts[x.index()]) {
-                        (Some(addr), Some(imm)) => (addr, imm),
-                        _ => return true,
-                    },
-                };
-                let Some(offset) = base.checked_add(imm) else {
-                    return true;
-                };
-                self.addrs[result.index()] = Some((slot, offset));
-                self.addr_insts.push((inst, slot));
-                false
-            });
-            if adds.len() == before {
-                return;
-            }
-        }
+        (self.addrs, self.addr_insts) = func.slot_offsets(|_| None);
     }
 
     fn classify(&mut self, func: &Function, block: Block, inst: Inst) {
