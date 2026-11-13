@@ -63,6 +63,7 @@ pub struct Jit {
     stubs: Vec<usize>,
     compiled: HashSet<usize>,
     children: Vec<Option<Child>>,
+    pending: std::collections::VecDeque<(usize, usize)>,
     strict: bool,
     expanded: HashSet<usize>,
 }
@@ -263,10 +264,10 @@ impl Jit {
     fn create(store: Cache, (shared_bytes, state_bytes, code_bytes, table_slots): (usize, usize, usize, usize)) -> Result<Jit> {
         let reached = Reached::default();
         let mut image = Image::create(&reached, super::ImageMode::Jit, (shared_bytes, state_bytes, table_slots))?;
-        image.jit_mode = true;
+        image.backend = super::ImageBackend::LazyJit { fast: false };
         image.stubs.reserve(table_slots * stub::STUB_BYTES)?;
         image.pass.memory.reserve(code_bytes)?;
-        Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
+        Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), pending: std::collections::VecDeque::new(), strict: true, expanded: HashSet::default() })
     }
 
     fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
@@ -330,6 +331,7 @@ impl Jit {
 
     /// Kills and reaps every child still running, as a run that stopped on an error leaves them waiting for answers.
     fn kill_children(&mut self) {
+        self.pending.clear();
         for child in self.children.drain(..).flatten() {
             // SAFETY: pid is a child this process forked and has not reaped, so the signal reaches only that child.
             unsafe { libc::kill(child.pid, libc::SIGKILL) };
@@ -426,16 +428,18 @@ impl Jit {
         Ok(None)
     }
 
-    /// Reads what the children wrote and answers their asks once, stopping at an answer that needs what inference asked for, whose child and function it returns.
+    /// Reads what the children wrote and answers their asks once, draining every ready pipe and queuing sibling asks if an answer needs what inference asked for.
     fn round(&mut self, cx: &mut Context<'_>) -> Result<Option<(usize, usize)>> {
-        for (id, asking) in self.ready()? {
-            if !asking {
-                self.drain(id);
-                continue;
+        if self.pending.is_empty() {
+            for (id, asking) in self.ready()? {
+                if !asking {
+                    self.drain(id);
+                } else if let Some(index) = self.read_ask(id) {
+                    self.pending.push_back((id, index));
+                }
             }
-            let Some(index) = self.read_ask(id) else {
-                continue;
-            };
+        }
+        while let Some((id, index)) = self.pending.pop_front() {
             if !self.respond(cx, id, index) {
                 return Ok(Some((id, index)));
             }
@@ -557,7 +561,9 @@ impl Jit {
 
     /// Configures whether this on-demand image compiles for one-shot host execution without cross-crate inlining.
     pub(crate) fn set_fast(&mut self, fast: bool) {
-        self.image.fast_jit = fast;
+        if let super::ImageBackend::EagerJit { fast: f } | super::ImageBackend::LazyJit { fast: f } = &mut self.image.backend {
+            *f = fast;
+        }
     }
 
     /// Declares and infers the functions `wanted`, and returns their indexes.

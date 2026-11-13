@@ -27,7 +27,7 @@ impl Lower<'_, '_> {
             Intrinsic::ConstEvalSelect => self.const_eval_select(origin, substs, args),
             Intrinsic::SelectUnpredictable => self.select_unpredictable(substs, args),
             Intrinsic::WithOverflow(op) => self.with_overflow(op, substs, args).map(Some),
-            Intrinsic::Simd(op) => self.simd(op, substs, args),
+            Intrinsic::Simd(op) => self.simd(origin, op, substs, args),
             Intrinsic::Trap => {
                 self.ins().trap();
                 self.close();
@@ -37,8 +37,9 @@ impl Lower<'_, '_> {
             Intrinsic::CallerLocation => self.caller_location().map(Some),
             Intrinsic::Cpuid => self.cpuid(args).map(Some),
             Intrinsic::FnAddr => Ok(args.first().copied()),
-            Intrinsic::BytePermute(bytes) => self.byte_permute(args, bytes).map(Some),
-            Intrinsic::BytePairMax => self.byte_pair_max(args).map(Some),
+            Intrinsic::ShuffleDyn { tbl } => self.shuffle_dyn(args, tbl).map(Some),
+            Intrinsic::BytePermute32 => self.byte_permute_32(args).map(Some),
+            Intrinsic::TargetOp { id, ty } => self.target_vector(id, ty, args).map(Some),
             Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
             _ => self.memory_intrinsic(origin, which, substs, args),
         }
@@ -159,7 +160,8 @@ impl Lower<'_, '_> {
             Repr::Zst => Ok(None),
             Repr::Scalar(_) => Ok(Some(self.ins().select(cond, yes, no))),
             Repr::Mem { .. } => {
-                let parts = super::abi::copied_parts(&*self.cx.layout(ty)?);
+                let layout = self.cx.layout(ty)?;
+                let parts = super::abi::copied_parts(&layout);
                 let Some(slot) = self.slot(whole) else { return Ok(None) };
                 let out = self.ins().stack_addr(Type::I64, slot, 0);
                 let mut pick = |m: Type, at: i32| {
@@ -203,6 +205,8 @@ impl Lower<'_, '_> {
             (Ceil, &[x]) => Ok(self.ins().ceil(x)),
             (Trunc, &[x]) => Ok(self.ins().trunc(x)),
             (Copysign, &[x, y]) => Ok(self.ins().fcopysign(x, y)),
+            (Fmin, &[x, y]) => Ok(self.ins().fmin(x, y)),
+            (Fmax, &[x, y]) => Ok(self.ins().fmax(x, y)),
             (Round(bits), &[x]) => self.round(if bits == 32 { Type::F32 } else { Type::F64 }, x),
             _ => {
                 let Some(&ty) = substs.first() else { bail!("intrinsic {which:?} has no type argument") };

@@ -1,6 +1,6 @@
-use super::asm::{Alu, Bits, Cond, Reg, Size, ZR};
+use super::asm::{Alu, Bits, Cond, Reg, Size, Vreg, ZR};
 use super::int::alu_of;
-use super::{A, C, D, Emit, S, T, WIDE_SCRATCH};
+use super::{A, C, D, Emit, S, T, V0, V1, WIDE_SCRATCH};
 use crate::ir::{Binary, IntCC, Unary, Value};
 
 const E: Reg = WIDE_SCRATCH[0];
@@ -99,17 +99,19 @@ impl Emit<'_> {
                 let (first, second) = if op == Binary::Rotl { (Binary::Ishl, Binary::Ushr) } else { (Binary::Ushr, Binary::Ishl) };
                 self.halves(x, (A, D));
                 self.raw(C, y);
-                let halves = self.wide_shift(first);
-                self.put_halves(result, halves);
-                self.halves(x, (A, D));
-                self.raw(C, y);
+                self.asm.fmov_in(true, V0, A);
+                self.asm.fmov_in(true, V1, D);
+                let (lo1, hi1) = self.wide_shift(first);
+                self.asm.fmov_in(true, Vreg(2), lo1);
+                self.asm.fmov_in(true, Vreg(3), hi1);
+                self.asm.fmov_out(true, A, V0);
+                self.asm.fmov_out(true, D, V1);
                 self.asm.alu(Alu::Sub, Size::X, C, ZR, C);
-                let (low, high) = self.wide_shift(second);
-                self.asm.mov(E, low);
-                self.asm.mov(F, high);
-                self.halves(result, (A, D));
-                self.asm.alu(Alu::Orr, Size::X, A, A, E);
-                self.asm.alu(Alu::Orr, Size::X, D, D, F);
+                let (lo2, hi2) = self.wide_shift(second);
+                self.asm.fmov_out(true, E, Vreg(2));
+                self.asm.fmov_out(true, F, Vreg(3));
+                self.asm.alu(Alu::Orr, Size::X, A, lo2, E);
+                self.asm.alu(Alu::Orr, Size::X, D, hi2, F);
                 self.put_halves(result, (A, D));
             }
             other => return Err(format!("{other:?} of a 128-bit integer")),

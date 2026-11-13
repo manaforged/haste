@@ -32,6 +32,15 @@ impl Emit<'_> {
             Binary::Fsub => Fop::Sub,
             Binary::Fmul => Fop::Mul,
             Binary::Fdiv => Fop::Div,
+            Binary::Fmin | Binary::Fmax => {
+                let dst = self.fdst(result);
+                let left = self.fin(x, V0);
+                let right = self.fin(y, V1);
+                let base = if op == Binary::Fmin { 0x1E20_7800 } else { 0x1E20_6800 };
+                self.asm.word(base | u32::from(ty == Type::F64) << 22 | u32::from(right.0) << 16 | u32::from(left.0) << 5 | u32::from(dst.0));
+                self.fput(result, dst);
+                return Ok(());
+            }
             Binary::Fcopysign => {
                 self.copysign(ty, x, y, result);
                 return Ok(());
@@ -57,6 +66,10 @@ impl Emit<'_> {
     }
 
     pub(super) fn fcmp(&mut self, cc: FloatCC, x: Value, y: Value, result: Value) {
+        if self.ty(x).is_vector() {
+            self.vec_fcmp(cc, x, y, result);
+            return;
+        }
         let left = self.fin(x, V0);
         let right = self.fin(y, V1);
         self.asm.fcmp(self.ty(x) == Type::F64, left, right);
@@ -98,14 +111,6 @@ impl Emit<'_> {
                 self.asm.fconv(conv, from == Type::F64, to.bits() > 32, dst, src);
                 self.clamp(to.bits(), signed, dst);
                 self.put(result, dst);
-            }
-            Convert::WidenVec64 | Convert::NarrowVec64 => {
-                let dst = self.fdst(result);
-                let src = self.fin(x, dst);
-                if dst != src {
-                    self.asm.fmov_reg(true, dst, src);
-                }
-                self.fput(result, dst);
             }
             Convert::Bitcast if to.is_float() => {
                 let src = self.src(x, A, Ext::Zero);

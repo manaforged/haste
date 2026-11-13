@@ -45,7 +45,7 @@ pub(crate) fn round(value: u32, to: u32) -> u32 {
 pub(crate) fn returns<R: Copy>(signature: &Signature, ints: &[R], floats: u8) -> Result<Vec<Loc<R>>, String> {
     let (mut int, mut float) = (0, 0);
     let place = |ty: Type| match ty {
-        Type::F32 | Type::F64 | Type::V128 if float < floats => {
+        Type::F32 | Type::F64 | Type::Vec { .. } if float < floats => {
             float += 1;
             Ok(Loc::Float(float - 1))
         }
@@ -204,6 +204,17 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
     (values, slots)
 }
 
+pub(crate) fn terminator_edges<'a>(op: &'a Op, mut f: impl FnMut(Block, &'a [Value])) {
+    match op {
+        Op::Jump(target, args) => f(*target, args),
+        Op::Brif(_, then, then_args, otherwise, else_args) => {
+            f(*then, then_args);
+            f(*otherwise, else_args);
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn layout<R: Copy + PartialEq>(
     func: &Function,
     (saves, float_saves): (Vec<R>, Vec<u8>),
@@ -213,18 +224,24 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     let outgoing = needs(func, classify)?;
     let (present, addressed) = present(func);
     let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
-    let mut values = Vec::with_capacity(func.types.len());
+    let mut values = vec![0; func.types.len()];
     let mut homes: Vec<i32> = Vec::new();
-    for (value, ty) in func.types.iter().enumerate() {
+    let mut value_order: Vec<usize> = (0..func.types.len()).collect();
+    value_order.sort_by_key(|&v| (
+        !matches!((homed.get(v), locations[v]), (Some(&true), Location::Reg(_))),
+        !matches!((homed.get(v), locations[v], func.types[v].bytes()), (Some(&true), Location::Float(_), 8)),
+        v,
+    ));
+    for value in value_order {
+        let ty = func.types[value];
         let static_loc = matches!(locations[value], Location::Imm(_) | Location::SlotAddr(_) | Location::Frame(..));
         let reg_unhomed = matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true);
         if !present[value] || elided.get(value) == Some(&true) || static_loc || reg_unhomed {
-            values.push(0);
             continue;
         }
         let Some(home) = shared.get(value).copied().flatten().map(|home| home as usize) else {
             cursor += round(ty.bytes(), WORD);
-            values.push(-(cursor as i32));
+            values[value] = -(cursor as i32);
             continue;
         };
         if homes.len() <= home {
@@ -234,7 +251,7 @@ pub(crate) fn layout<R: Copy + PartialEq>(
             cursor += round(ty.bytes(), WORD);
             homes[home] = -(cursor as i32);
         }
-        values.push(homes[home]);
+        values[value] = homes[home];
     }
     let mut max_saved = 0_usize;
     let mut check_edge = |block: Block, args: &[Value]| {
@@ -245,14 +262,7 @@ pub(crate) fn layout<R: Copy + PartialEq>(
         }
     };
     for op in live_ops(func) {
-        match op {
-            Op::Jump(block, args) => check_edge(*block, args),
-            Op::Brif(_, then, then_args, otherwise, else_args) => {
-                check_edge(*then, then_args);
-                check_edge(*otherwise, else_args);
-            }
-            _ => {}
-        }
+        terminator_edges(op, &mut check_edge);
     }
     let scratch = max_saved as u32 * EDGE_SLOT;
     let mut slots = vec![0; func.slots.len()];
@@ -260,7 +270,8 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     order.sort_by_key(|&slot| (func.slots[slot].size, slot));
     for slot in order {
         let data = &func.slots[slot];
-        let align = 1 << data.align_shift.min(MAX_ALIGN_SHIFT);
+        let min_align = if data.size >= 8 { 8 } else if data.size >= 4 { 4 } else if data.size >= 2 { 2 } else { 1 };
+        let align = (1 << data.align_shift.min(MAX_ALIGN_SHIFT)).max(min_align);
         cursor = round(cursor + data.size, align);
         slots[slot] = -(cursor as i32);
     }
@@ -279,6 +290,33 @@ pub(crate) struct Prepared<R> {
     pub framed: bool,
 }
 
+fn build_frame<R: Copy + PartialEq>(
+    func: &Function,
+    (saves, float_saves): (Vec<R>, Vec<u8>),
+    plan: &Plan<R>,
+    abi: &Abi<R>,
+    classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
+) -> Result<(Frame<R>, bool), String> {
+    let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided), classify)?;
+    let stack_params = abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)));
+    let framed = framed(func, &frame, stack_params);
+    Ok((frame, framed))
+}
+
+pub(crate) fn repack_after_elide<R: Copy + PartialEq>(
+    func: &Function,
+    plan: &Plan<R>,
+    abi: &Abi<R>,
+    frame: &mut Frame<R>,
+    framed: &mut bool,
+    classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
+) -> Result<(), String> {
+    let saves = std::mem::take(&mut frame.saves);
+    let float_saves = std::mem::take(&mut frame.float_saves);
+    (*frame, *framed) = build_frame(func, (saves, float_saves), plan, abi, &classify)?;
+    Ok(())
+}
+
 pub(crate) fn prepare<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
@@ -291,9 +329,7 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
     let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed), &abi.params, &classify);
     let saves = saved(func, &plan.used, regs.saved);
     let float_saves = saved(func, &plan.used_floats, regs.saved_float);
-    let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided), &classify)?;
-    let stack_params = abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)));
-    let framed = framed(func, &frame, stack_params);
+    let (frame, framed) = build_frame(func, (saves, float_saves), &plan, &abi, &classify)?;
     Ok(Prepared { order, copied, abi, plan, frame, framed })
 }
 
@@ -368,13 +404,8 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, pl
     if func.blocks[entry.index()].params.iter().any(|&p| !pure_value(p, plan, frame, clobbers)) {
         return None;
     }
-    let mut preds = vec![0_u32; func.blocks.len()];
-    for block in &func.blocks {
-        if let Some(&term) = block.insts.last() {
-            func.insts[term.index()].op.targets().for_each(|t| preds[t.index()] += 1);
-        }
-    }
-    if preds[entry.index()] != 0 || !pure_block(func, entry, plan, frame, clobbers) {
+    let cfg = crate::cfg::Cfg::new(func);
+    if cfg.pred_count(entry) != 0 || !pure_block(func, entry, plan, frame, clobbers) {
         return None;
     }
     let term = *func.blocks[entry.index()].insts.last()?;
@@ -383,7 +414,7 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, pl
         return None;
     }
     let fast_ret_ok = |block: Block, edge_args: &[Value]| {
-        preds[block.index()] == 1
+        cfg.pred_count(block) == 1
             && func.jump_target(block) == block
             && edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
             && func.blocks[block.index()].params.iter().all(|&p| pure_value(p, plan, frame, clobbers))
@@ -398,7 +429,7 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, pl
     };
     let slow_ok = |block: Block, edge_args: &[Value]| {
         edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
-            .then(|| preds[block.index()] != 1 || func.jump_target(block) != block)
+            .then(|| cfg.pred_count(block) != 1 || func.jump_target(block) != block)
     };
     if fast_ret_ok(*then_b, then_args)
         && let Some(use_slow_thunk) = slow_ok(*else_b, else_args)

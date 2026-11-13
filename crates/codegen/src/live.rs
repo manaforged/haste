@@ -1,9 +1,10 @@
+use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, Value};
 
 pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
-    let depths = crate::licm::depths(func);
-    let mut rev_preds = vec![Vec::new(); func.blocks.len()];
+    let cfg = Cfg::new(func);
+    let loops = cfg.loops(func);
     let mut can_exit = vec![false; func.blocks.len()];
     let mut work = Vec::new();
     for b in 0..func.blocks.len() {
@@ -12,12 +13,9 @@ pub(crate) fn order(func: &Function) -> Vec<Block> {
             can_exit[b] = true;
             work.push(block);
         }
-        for succ in func.successors(block) {
-            rev_preds[succ.index()].push(block);
-        }
     }
     while let Some(block) = work.pop() {
-        for &pred in &rev_preds[block.index()] {
+        for &pred in cfg.preds_of(block) {
             if !std::mem::replace(&mut can_exit[pred.index()], true) {
                 work.push(pred);
             }
@@ -37,7 +35,7 @@ pub(crate) fn order(func: &Function) -> Vec<Block> {
         }
         stack.push((block, true));
         let mut succs: Vec<Block> = func.successors(block).filter(|succ| !visited[succ.index()]).collect();
-        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), depths[succ.index()])));
+        succs.sort_by_key(|&succ| std::cmp::Reverse((!is_cold(succ), loops.depth_of(succ))));
         for succ in succs {
             stack.push((succ, false));
         }
@@ -64,7 +62,7 @@ pub(crate) fn order(func: &Function) -> Vec<Block> {
 const TEST_LIMIT: usize = 4;
 
 pub(crate) fn copied_tests(func: &Function, order: &[Block]) -> Vec<bool> {
-    let rank = crate::dom::ranks(order, func.blocks.len());
+    let rank = Cfg::ranks(order, func.blocks.len());
     let mut copied = vec![false; func.insts.len()];
     for (at, &latch) in order.iter().enumerate() {
         let Some(&last) = func.blocks[latch.index()].insts.last() else { continue };

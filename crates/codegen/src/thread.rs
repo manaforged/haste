@@ -1,13 +1,9 @@
-use crate::fold::evaluate;
-use crate::ir::{Binary, Block, Function, Inst, InstData, Op, SigRef, Value};
+use crate::fold::{evaluate_wrapped, extend};
+use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, IntCC, Op, SigRef, Type, Value};
 
-fn pure_op(op: &Op) -> bool {
-    match op {
-        Op::Binary(bin, ..) => !matches!(bin, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem),
-        Op::Const(_) | Op::Unary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fcmp(..) | Op::Select(..) => true,
-        _ => false,
-    }
-}
+const MAX_DISP_INSTS: usize = 10;
+const MAX_CHAIN: usize = 8;
+const MAX_BRIF_SPEC_OPS: usize = 2;
 
 fn lookup(map: &[(Value, Value)], value: Value) -> Value {
     map.iter().find(|&&(k, _)| k == value).map_or(value, |&(_, v)| v)
@@ -15,6 +11,39 @@ fn lookup(map: &[(Value, Value)], value: Value) -> Value {
 
 fn lookup_const(local: &[(Value, i64)], global: &[Option<i64>], value: Value) -> Option<i64> {
     local.iter().find(|&&(k, _)| k == value).map(|&(_, imm)| imm).or_else(|| global.get(value.index()).copied().flatten())
+}
+
+fn eval_op(func: &Function, op: &Op, ty: Type, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
+    if let Some(imm) = evaluate_wrapped(func, op, ty, known) {
+        return Some(imm);
+    }
+    if !ty.is_small_int() {
+        return None;
+    }
+    let is_zero = |v: Value| known(v).is_some_and(|imm| extend(imm, ty, false) == 0);
+    match *op {
+        Op::Convert(Convert::Bitcast, x) if func.ty(x).is_small_int() && func.ty(x).bits() == ty.bits() => {
+            known(x).map(|imm| extend(imm, ty, true))
+        }
+        Op::Select(c, x, y) => {
+            if x == y {
+                return known(x).map(|imm| extend(imm, ty, true));
+            }
+            let chosen = if extend(known(c)?, func.ty(c), false) != 0 { x } else { y };
+            known(chosen).map(|imm| extend(imm, ty, true))
+        }
+        Op::Binary(Binary::Imul | Binary::Umulhi | Binary::Smulhi | Binary::Band, x, y) if is_zero(x) || is_zero(y) => Some(0),
+        Op::Binary(Binary::Isub | Binary::Bxor, x, y) if x == y => Some(0),
+        Op::Icmp(cc, x, y) if x == y && func.ty(x).is_small_int() => Some(i64::from(matches!(
+            cc,
+            IntCC::Equal
+                | IntCC::SignedGreaterThanOrEqual
+                | IntCC::SignedLessThanOrEqual
+                | IntCC::UnsignedGreaterThanOrEqual
+                | IntCC::UnsignedLessThanOrEqual
+        ))),
+        _ => None,
+    }
 }
 
 struct Eval {
@@ -56,14 +85,11 @@ fn step_block(
     (map, local_ops, local_consts): (&mut Vec<(Value, Value)>, &mut Vec<(Value, Op)>, &mut Vec<(Value, i64)>),
 ) -> Option<(Block, Vec<Value>, Vec<Value>)> {
     let block = &func.blocks[cur.index()];
-    if cur_args.len() != block.params.len() || !(1..=6).contains(&block.insts.len()) {
+    if cur_args.len() != block.params.len() || !(1..=MAX_DISP_INSTS).contains(&block.insts.len()) {
         return None;
     }
     let (&last, body) = block.insts.split_last()?;
-    let Op::Brif(cond, then_b, then_args, else_b, else_args) = &func.insts[last.index()].op else {
-        return None;
-    };
-    if *then_b == cur || *else_b == cur {
+    if !matches!(func.insts[last.index()].op, Op::Brif(..) | Op::Jump(..)) {
         return None;
     }
     let mut defs_here: Vec<Value> = block.params.clone();
@@ -74,20 +100,30 @@ fn step_block(
     for &inst in body {
         let data = &func.insts[inst.index()];
         let res = data.result?;
-        if !pure_op(&data.op) {
+        if !data.op.is_speculable() {
             return None;
         }
         let mut op = data.op.clone();
         op.map_operands(|v| lookup(map, v));
-        if let Some(imm) = evaluate(func, &op, &|v| lookup_const(local_consts, consts, v)) {
+        if let Some(imm) = eval_op(func, &op, func.ty(res), &|v| lookup_const(local_consts, consts, v)) {
             local_consts.push((res, imm));
         }
         local_ops.push((res, op));
         defs_here.push(res);
         map.retain(|&(k, _)| k != res);
     }
-    let c = lookup_const(local_consts, consts, lookup(map, *cond))?;
-    let (next_b, raw_args) = if c != 0 { (*then_b, then_args) } else { (*else_b, else_args) };
+    let (next_b, raw_args) = match &func.insts[last.index()].op {
+        Op::Brif(cond, then_b, then_args, else_b, else_args) => {
+            let cond_val = lookup(map, *cond);
+            let c = lookup_const(local_consts, consts, cond_val)?;
+            if extend(c, func.ty(cond_val), false) != 0 { (*then_b, then_args) } else { (*else_b, else_args) }
+        }
+        Op::Jump(target, args) => (*target, args),
+        _ => return None,
+    };
+    if next_b == cur {
+        return None;
+    }
     let next_args: Vec<Value> = raw_args.iter().map(|&v| lookup(map, v)).collect();
     Some((next_b, next_args, defs_here))
 }
@@ -108,7 +144,7 @@ fn eval_dispatcher(
     let mut visited: Vec<(Block, Vec<Value>)> = Vec::new();
     let (mut next_b, mut next_args, first_defs) = step_block(func, disp, incoming, consts, (&mut map, &mut local_ops, &mut local_consts))?;
     visited.push((disp, first_defs));
-    while visited.len() < 4 && !pinned[next_b.index()] && !visited.iter().any(|&(b, _)| b == next_b) {
+    while visited.len() < MAX_CHAIN && !pinned[next_b.index()] && !visited.iter().any(|&(b, _)| b == next_b) {
         let marks = (map.len(), local_ops.len(), local_consts.len());
         let cur = next_b;
         if let Some((nb, na, defs)) = step_block(func, cur, &next_args, consts, (&mut map, &mut local_ops, &mut local_consts)) {
@@ -152,19 +188,15 @@ fn eval_dispatcher(
     Some(Eval { chosen_target, chosen_args, local_ops, local_consts, needed })
 }
 
-fn thread_jump(func: &mut Function, pred: Block, disp: Block, consts: &mut Vec<Option<i64>>, pinned: &[bool]) -> bool {
-    let Some(&term) = func.blocks[pred.index()].insts.last() else {
-        return false;
-    };
-    let Op::Jump(target, ref args) = func.insts[term.index()].op else {
-        return false;
-    };
-    if target != disp {
-        return false;
-    }
-    let Some(eval) = eval_dispatcher(func, disp, args, consts, pinned) else {
-        return false;
-    };
+fn non_const_needed(eval: &Eval) -> usize {
+    eval.local_ops
+        .iter()
+        .zip(&eval.needed)
+        .filter(|&((res, _), &need)| need && !eval.local_consts.iter().any(|&(r, _)| r == *res))
+        .count()
+}
+
+fn emit_needed(func: &mut Function, pred: Block, consts: &mut Vec<Option<i64>>, eval: Eval) -> (Block, Vec<Value>) {
     let mut emit_map: Vec<(Value, Value)> = Vec::new();
     let mut inserted: Vec<Inst> = Vec::new();
     for (idx, (res, op)) in eval.local_ops.into_iter().enumerate() {
@@ -193,11 +225,28 @@ fn thread_jump(func: &mut Function, pred: Block, disp: Block, consts: &mut Vec<O
         let at = insts.len() - 1;
         insts.splice(at..at, inserted);
     }
-    func.insts[term.index()].op = Op::Jump(eval.chosen_target, new_args);
+    (eval.chosen_target, new_args)
+}
+
+fn thread_jump(func: &mut Function, pred: Block, disp: Block, consts: &mut Vec<Option<i64>>, pinned: &[bool]) -> bool {
+    let Some(&term) = func.blocks[pred.index()].insts.last() else {
+        return false;
+    };
+    let Op::Jump(target, ref args) = func.insts[term.index()].op else {
+        return false;
+    };
+    if target != disp {
+        return false;
+    }
+    let Some(eval) = eval_dispatcher(func, disp, args, consts, pinned) else {
+        return false;
+    };
+    let (new_target, new_args) = emit_needed(func, pred, consts, eval);
+    func.insts[term.index()].op = Op::Jump(new_target, new_args);
     true
 }
 
-fn thread_brif(func: &mut Function, pred: Block, disp: Block, consts: &[Option<i64>], pinned: &[bool]) -> bool {
+fn thread_brif(func: &mut Function, pred: Block, disp: Block, consts: &mut Vec<Option<i64>>, pinned: &[bool]) -> bool {
     let Some(&term) = func.blocks[pred.index()].insts.last() else {
         return false;
     };
@@ -212,11 +261,10 @@ fn thread_brif(func: &mut Function, pred: Block, disp: Block, consts: &[Option<i
         let Some(eval) = eval_dispatcher(func, disp, args, consts, pinned) else {
             return;
         };
-        if eval.needed.iter().any(|&n| n) {
+        if non_const_needed(&eval) > MAX_BRIF_SPEC_OPS {
             return;
         }
-        *target = eval.chosen_target;
-        *args = eval.chosen_args;
+        (*target, *args) = emit_needed(func, pred, consts, eval);
         changed = true;
     };
     let (mut t_b, mut t_a, mut e_b, mut e_a) = (then_b, then_args, else_b, else_args);
@@ -229,12 +277,12 @@ fn thread_brif(func: &mut Function, pred: Block, disp: Block, consts: &[Option<i
 }
 
 /// Threads correlated constant-condition jump chains through small pure dispatcher blocks.
-pub(crate) fn run(func: &mut Function) {
+pub(crate) fn run(func: &mut Function) -> bool {
     let Some(entry) = func.entry else {
-        return;
+        return false;
     };
     if func.coroutine.is_some() {
-        return;
+        return false;
     }
     let mut pinned = vec![false; func.blocks.len()];
     pinned[entry.index()] = true;
@@ -246,8 +294,16 @@ pub(crate) fn run(func: &mut Function) {
     }
     let mut consts = vec![None; func.types.len()];
     for data in &func.insts {
-        if let (Op::Const(imm), Some(res)) = (&data.op, data.result) {
-            consts[res.index()] = Some(*imm);
+        if let (Op::Const(_), Some(res)) = (&data.op, data.result) {
+            consts[res.index()] = eval_op(func, &data.op, func.ty(res), &|_| None);
+        }
+    }
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            if let Some(res) = data.result && consts[res.index()].is_none() {
+                consts[res.index()] = eval_op(func, &data.op, func.ty(res), &|v| consts[v.index()]);
+            }
         }
     }
     let mut any = false;
@@ -259,7 +315,7 @@ pub(crate) fn run(func: &mut Function) {
             }
             let disp = Block(disp_idx as u32);
             let block = &func.blocks[disp_idx];
-            if block.params.is_empty() || !(1..=6).contains(&block.insts.len()) {
+            if block.params.is_empty() || !(1..=MAX_DISP_INSTS).contains(&block.insts.len()) {
                 continue;
             }
             let Some(&last) = block.insts.last() else {
@@ -274,7 +330,7 @@ pub(crate) fn run(func: &mut Function) {
                 }
                 let pred = Block(pred_idx as u32);
                 changed |= thread_jump(func, pred, disp, &mut consts, &pinned);
-                changed |= thread_brif(func, pred, disp, &consts, &pinned);
+                changed |= thread_brif(func, pred, disp, &mut consts, &pinned);
             }
         }
         if !changed {
@@ -285,6 +341,7 @@ pub(crate) fn run(func: &mut Function) {
     if any {
         crate::fold::prune(func, entry);
     }
+    any
 }
 
 /// Renumbers the instructions and values the blocks hold and drops the rest, so a body kept or copied whole carries no dead entries.

@@ -6,14 +6,16 @@ mod frame;
 mod int;
 mod location;
 mod vector;
+mod vector_lanes;
 mod wide;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
 use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
+use crate::emit::{Backend, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_try_call, intake_params};
 use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
-use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::ir::{ArgumentPurpose, Block, Function, Inst, Lane, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{CallAbi, Target};
@@ -49,6 +51,13 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let slow_thunk = asm.label();
+    let mut defs = vec![None; func.types.len()];
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        if let Some(res) = func.insts[inst.index()].result {
+            defs[res.index()] = Some(inst);
+        }
+    }
+    let last_block = order.last().copied();
     let emit = Emit {
         func,
         frame,
@@ -60,8 +69,14 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         sites: Vec::new(),
         relocs: Vec::new(),
         plan,
+        defs,
         flags: None,
+        last_spill: None,
+        last_fspill: None,
         next: None,
+        last_block,
+        at_end: false,
+        trap_label: None,
         features: Features::host(),
         copied,
         direct_calls: target.direct_calls,
@@ -111,8 +126,14 @@ pub(super) struct Emit<'a> {
     sites: Vec<Site>,
     relocs: Vec<StencilReloc>,
     plan: Plan<Reg>,
+    defs: Vec<Option<Inst>>,
     flags: Option<(Value, Cond)>,
+    last_spill: Option<(i32, Reg, (usize, u32))>,
+    last_fspill: Option<(i32, Xmm, Type, (usize, u32))>,
     next: Option<Block>,
+    last_block: Option<Block>,
+    at_end: bool,
+    trap_label: Option<Label>,
     features: Features,
     copied: Vec<bool>,
     direct_calls: bool,
@@ -149,21 +170,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     }
 
     fn intake(&mut self, entry: Block) -> Result<(), String> {
-        let func = self.func;
-        let params = func.blocks[entry.index()].params.iter().copied().zip(self.abi.params.clone());
-        let (registers, memory): (Vec<_>, Vec<_>) = params.partition(|(value, _)| self.reg_of(*value).is_some() || self.xmm_of(*value).is_some());
-        for (value, loc) in memory.into_iter().chain(registers) {
-            let incoming = |offset: u32| Mem::new(Reg::Rbp, INCOMING + offset as i32);
-            match loc {
-                Loc::Stack(offset) => self.load_home(value, incoming(offset)),
-                Loc::Struct(offset, _) => {
-                    self.asm.lea(Reg::Rax, incoming(offset));
-                    self.put(value, Reg::Rax);
-                }
-                _ => self.store_loc(value, loc),
-            }
-        }
-        Ok(())
+        intake_params(self, entry)
     }
 
     fn set_next(&mut self, next: Option<Block>) {
@@ -171,6 +178,9 @@ impl<'a> Emitter<'a> for Emit<'a> {
     }
 
     fn bind_block(&mut self, block: Block) {
+        self.last_spill = None;
+        self.last_fspill = None;
+        self.at_end = self.last_block == Some(block);
         self.asm.bind(self.blocks[block.index()]);
     }
 
@@ -188,7 +198,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
             && block == shrink.slow_entry
         {
             self.asm.bind(self.slow_thunk);
-            self.emit_slow_prologue_and_edge(shrink.slow_entry)?;
+            emit_slow_prologue(self, shrink.slow_entry)?;
         }
         Ok(())
     }
@@ -200,7 +210,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
             && !shrink.use_slow_thunk
             && block == shrink.slow_entry
         {
-            self.emit_slow_prologue_and_edge(shrink.slow_entry)?;
+            emit_slow_prologue(self, shrink.slow_entry)?;
         }
         Ok(())
     }
@@ -215,18 +225,18 @@ impl<'a> Emitter<'a> for Emit<'a> {
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
         match &data.op {
-            Op::Call { sig, callee, args, results } => self.call(inst, (*sig, *callee), args, results),
-            Op::TryCall { sig, callee, args, normal, handler } => self.try_call(*sig, *callee, args, *normal, *handler),
+            Op::Call { sig, callee, args, results } => emit_call(self, inst, (*sig, *callee), args, results),
+            Op::TryCall { sig, callee, args, normal, handler } => emit_try_call(self, (*sig, *callee), args, (*normal, *handler)),
             Op::Jump(block, args) => {
                 self.edge(*block, args)?;
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
                 }
-                self.goto(*block, true);
+                emit_goto(self, *block, true);
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
-                self.brif(*condition, (*then, then_args), (*otherwise, else_args))
+                emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args))
             }
             Op::BrTable(index, default, targets) => {
                 self.br_table(*index, *default, targets);
@@ -234,7 +244,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
             }
             Op::Return(values) => self.ret(values),
             Op::Trap => {
-                self.ud2();
+                self.emit_trap(self.at_end);
                 Ok(())
             }
             Op::Trapz(condition) => {
@@ -246,17 +256,23 @@ impl<'a> Emitter<'a> for Emit<'a> {
     }
 
     fn trap(&mut self) {
-        self.ud2();
+        self.emit_trap(self.at_end);
     }
 
-    fn finish(self) -> Result<Code, String> {
+    fn finish(mut self) -> Result<Code, String> {
+        if let Some(label) = self.trap_label {
+            self.asm.bind(label);
+            self.ud2();
+        }
         Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs })
     }
 }
 
 impl Emit<'_> {
     fn at(&self, value: Value) -> Mem {
-        Mem::new(Reg::Rbp, self.frame.values[value.index()])
+        let disp = self.frame.values[value.index()];
+        debug_assert_ne!(disp, 0, "unhomed value {value:?} in at()");
+        Mem::new(Reg::Rbp, disp)
     }
 
     fn ty(&self, value: Value) -> Type {
@@ -275,6 +291,17 @@ impl Emit<'_> {
 
     fn ud2(&mut self) {
         self.asm.bytes(&[0x0F, 0x0B]);
+    }
+
+    fn trap_label(&mut self) -> Label {
+        *self.trap_label.get_or_insert_with(|| self.asm.label())
+    }
+
+    fn emit_trap(&mut self, fallthrough: bool) {
+        let label = self.trap_label();
+        if !fallthrough {
+            self.asm.jmp(label);
+        }
     }
 
     fn probe(&mut self, size: u32) {
@@ -303,6 +330,8 @@ impl Emit<'_> {
         if ty.bytes() == 16 {
             self.asm.load(Size::Q, Reg::Rax, from.offset(8));
             self.asm.store(Size::Q, to.offset(8), Reg::Rax);
+        } else if to.base == Reg::Rbp && to.index.is_none() {
+            self.last_spill = Some((to.disp, Reg::Rax, self.asm.stamp()));
         }
     }
 
@@ -311,24 +340,23 @@ impl Emit<'_> {
     fn trapz(&mut self, condition: Value) {
         if let Some(known) = self.imm_extended(condition, Ext::Zero) {
             if known == 0 {
-                self.ud2();
+                self.emit_trap(false);
             }
             return;
         }
-        let skip = self.asm.label();
-        match self.flags.take() {
-            Some((value, cond)) if value == condition => self.asm.jcc(cond, skip),
+        let trap = self.trap_label();
+        let cond = match self.flags.take() {
+            Some((value, cond)) if value == condition => cond.invert(),
             _ => {
                 self.test_value(condition);
-                self.asm.jcc(Cond::Ne, skip);
+                Cond::E
             }
-        }
-        self.ud2();
-        self.asm.bind(skip);
+        };
+        self.asm.jcc(cond, trap);
     }
 
     fn test_value(&mut self, value: Value) {
-        let reg = self.reg_of(value).unwrap_or_else(|| {
+        let reg = self.reg_of(value).or_else(|| self.cached_spill(value)).unwrap_or_else(|| {
             self.get(Reg::Rax, value, Ext::Zero);
             Reg::Rax
         });
@@ -362,97 +390,9 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn emit_slow_prologue_and_edge(&mut self, slow_entry: Block) -> Result<(), String> {
-        self.prologue();
-        if let Some(entry) = self.func.entry
-            && let Some(term) = self.func.blocks[entry.index()].insts.last()
-            && let Op::Brif(_, then_b, then_args, else_b, else_args) = &self.func.insts[term.index()].op
-        {
-            let args = if *then_b == slow_entry { then_args.as_slice() } else if *else_b == slow_entry { else_args.as_slice() } else { &[] };
-            self.edge(slow_entry, args)?;
-        }
-        Ok(())
-    }
-
-    fn target_label(&self, block: Block) -> Label {
-        if self.in_shrink_entry && self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
-            self.slow_thunk
-        } else {
-            self.blocks[self.func.jump_target(block).index()]
-        }
-    }
-
-    fn goto_branch(&mut self, block: Block, last: bool) {
-        if self.in_shrink_entry && self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
-            self.asm.jmp(self.slow_thunk);
-        } else {
-            self.goto(block, last);
-        }
-    }
-
-    fn brif(&mut self, condition: Value, then: (Block, &[Value]), otherwise: (Block, &[Value])) -> Result<(), String> {
-        let (then, otherwise) = if self.in_shrink_entry {
-            let slow = self.shrink.map(|s| s.slow_entry);
-            (
-                (then.0, if Some(then.0) == slow { &[][..] } else { then.1 }),
-                (otherwise.0, if Some(otherwise.0) == slow { &[][..] } else { otherwise.1 }),
-            )
-        } else {
-            (then, otherwise)
-        };
-        if let Some(known) = self.imm_extended(condition, Ext::Zero) {
-            let (block, args) = if known != 0 { then } else { otherwise };
-            self.edge(block, args)?;
-            self.goto_branch(block, true);
-            return Ok(());
-        }
-        let cond = match self.flags.take() {
-            Some((value, cond)) if value == condition => cond,
-            _ => {
-                self.test_value(condition);
-                Cond::Ne
-            }
-        };
-        let (then_moves, else_moves) = (
-            self.plan.moves(self.func, &self.frame, then.0, then.1),
-            self.plan.moves(self.func, &self.frame, otherwise.0, otherwise.1),
-        );
-        let falls = self.next.is_some_and(|next| next == then.0 || next == self.func.jump_target(then.0));
-        if !else_moves && (then_moves || falls) {
-            let target = self.target_label(otherwise.0);
-            self.asm.jcc(cond.invert(), target);
-            self.edge(then.0, then.1)?;
-            self.goto_branch(then.0, true);
-            return Ok(());
-        }
-        if !then_moves {
-            let target = self.target_label(then.0);
-            self.asm.jcc(cond, target);
-            self.edge(otherwise.0, otherwise.1)?;
-            self.goto_branch(otherwise.0, true);
-            return Ok(());
-        }
-        let other = self.asm.label();
-        self.asm.jcc(cond.invert(), other);
-        self.edge(then.0, then.1)?;
-        self.goto_branch(then.0, false);
-        self.asm.bind(other);
-        self.edge(otherwise.0, otherwise.1)?;
-        self.goto_branch(otherwise.0, true);
-        Ok(())
-    }
-
-    fn goto(&mut self, block: Block, last: bool) {
-        let target = self.func.jump_target(block);
-        if last && (self.next == Some(block) || self.next == Some(target)) {
-            return;
-        }
-        self.asm.jmp(self.blocks[target.index()]);
-    }
-
     fn br_table(&mut self, index: Value, default: Block, targets: &[Block]) {
         if targets.is_empty() {
-            self.goto(default, true);
+            emit_goto(self, default, true);
             return;
         }
         self.get(Reg::Rax, index, Ext::Zero);
@@ -498,10 +438,10 @@ impl Emit<'_> {
                 ArgStep::Move(src, dst) => self.asm.movaps(Xmm(dst), Xmm(src)),
                 ArgStep::Save(src) => {
                     self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
-                    self.xmm_store(Type::V128, Mem::new(Reg::Rsp, 0), Xmm(src));
+                    self.xmm_store(Type::Vec { lane: Lane::I64, count: 2 }, Mem::new(Reg::Rsp, 0), Xmm(src));
                 }
                 ArgStep::Restore(dst) => {
-                    self.xmm_load(Type::V128, Xmm(dst), Mem::new(Reg::Rsp, 0));
+                    self.xmm_load(Type::Vec { lane: Lane::I64, count: 2 }, Xmm(dst), Mem::new(Reg::Rsp, 0));
                     self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
                 }
                 ArgStep::Load(val, dst) => self.fget(Xmm(dst), val),
@@ -540,10 +480,10 @@ impl Emit<'_> {
                 ArgStep::Move(src, dst) => self.asm.movaps(Xmm(dst), Xmm(src)),
                 ArgStep::Save(src) => {
                     self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
-                    self.xmm_store(Type::V128, Mem::new(Reg::Rsp, 0), Xmm(src));
+                    self.xmm_store(Type::Vec { lane: Lane::I64, count: 2 }, Mem::new(Reg::Rsp, 0), Xmm(src));
                 }
                 ArgStep::Restore(dst) => {
-                    self.xmm_load(Type::V128, Xmm(dst), Mem::new(Reg::Rsp, 0));
+                    self.xmm_load(Type::Vec { lane: Lane::I64, count: 2 }, Xmm(dst), Mem::new(Reg::Rsp, 0));
                     self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
                 }
                 ArgStep::Load(..) => {}
@@ -622,47 +562,55 @@ impl Emit<'_> {
         }
         Ok(abi)
     }
+}
 
-    fn call(&mut self, inst: Inst, (sig, callee): (SigRef, Value), args: &[Value], results: &[Value]) -> Result<(), String> {
-        let parked = self.plan.parked_at(inst).to_vec();
-        for &(value, reg, _) in &parked {
-            let home = self.at(value);
-            match reg {
-                ParkReg::Int(r) => self.asm.store(Size::Q, home, r),
-                ParkReg::Float(xmm) => self.xmm_store(self.ty(value), home, Xmm(xmm)),
+impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
+    fn plan(&self) -> &Plan<Reg> { &self.plan }
+    fn plan_mut(&mut self) -> &mut Plan<Reg> { &mut self.plan }
+    fn frame(&self) -> &Frame<Reg> { &self.frame }
+    fn abi(&self) -> &Abi { &self.abi }
+    fn shrink(&self) -> Option<ShrinkWrap> { self.shrink }
+    fn slow_thunk(&self) -> Label { self.slow_thunk }
+    fn in_shrink_entry(&self) -> bool { self.in_shrink_entry }
+    fn next_block(&self) -> Option<Block> { self.next }
+    fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
+    fn pos(&self) -> u32 { self.asm.pos() }
+    fn new_label(&mut self) -> Label { self.asm.label() }
+    fn bind_label(&mut self, label: Label) { self.asm.bind(label); }
+    fn jump_label(&mut self, label: Label) { self.asm.jmp(label); }
+    fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {
+        let cond = match self.flags.take() {
+            Some((value, cond)) if value == condition => cond,
+            _ => {
+                self.test_value(condition);
+                Cond::Ne
             }
-            self.plan.locations[value.index()] = Location::Slot;
-        }
-        let abi = self.arguments(sig, callee, args)?;
-        self.store_locs(results, &abi.returns);
-        for (value, reg, lives) in parked {
-            if lives {
-                let home = self.at(value);
-                match reg {
-                    ParkReg::Int(r) => self.asm.load(Size::Q, r, home),
-                    ParkReg::Float(xmm) => self.xmm_load(self.ty(value), Xmm(xmm), home),
-                }
-            }
-            self.plan.locations[value.index()] = match reg {
-                ParkReg::Int(r) => Location::Reg(r),
-                ParkReg::Float(xmm) => Location::Float(xmm),
-            };
-        }
-        Ok(())
-    }
-
-    fn try_call(&mut self, sig: SigRef, callee: Value, args: &[Value], normal: Block, handler: Block) -> Result<(), String> {
-        self.arguments(sig, callee, args)?;
-        let ret = self.asm.pos();
-        self.asm.jmp(self.blocks[normal.index()]);
-        let pad = self.asm.pos();
-        let func = self.func;
-        let [exception] = func.blocks[handler.index()].params[..] else {
-            return Err("a try_call handler takes exactly the exception".to_owned());
         };
-        self.put(exception, Reg::Rax);
-        self.asm.jmp(self.blocks[handler.index()]);
-        self.sites.push(Site { ret, handler: pad, frame_offset: self.frame.size });
-        Ok(())
+        self.asm.jcc(if invert { cond.invert() } else { cond }, label);
     }
+    fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> { self.arguments(sig, callee, args) }
+    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) { self.store_locs(values, locs); }
+    fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
+    fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, Mem::new(Reg::Rbp, INCOMING + offset as i32)); }
+    fn intake_struct(&mut self, value: Value, offset: u32) {
+        self.asm.lea(Reg::Rax, Mem::new(Reg::Rbp, INCOMING + offset as i32));
+        self.put(value, Reg::Rax);
+    }
+    fn park_spill(&mut self, value: Value, reg: ParkReg<Reg>) {
+        let home = self.at(value);
+        match reg {
+            ParkReg::Int(r) => self.asm.store(Size::Q, home, r),
+            ParkReg::Float(xmm) => self.xmm_store(self.ty(value), home, Xmm(xmm)),
+        }
+    }
+    fn park_reload(&mut self, value: Value, reg: ParkReg<Reg>) {
+        let home = self.at(value);
+        match reg {
+            ParkReg::Int(r) => self.asm.load(Size::Q, r, home),
+            ParkReg::Float(xmm) => self.xmm_load(self.ty(value), Xmm(xmm), home),
+        }
+    }
+    fn put_exception(&mut self, value: Value) { self.put(value, Reg::Rax); }
+    fn push_site(&mut self, site: Site) { self.sites.push(site); }
 }

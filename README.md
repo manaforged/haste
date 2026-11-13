@@ -1,58 +1,75 @@
 # haste
 
-haste runs a Rust project without building it first. It reads the
-workspace from `Cargo.lock`, resolves names and types itself, and
-compiles each function to x86-64 machine code the first time the program
-calls it. Nothing is written to `target/`.
+haste is a Rust compiler and execution engine for running, testing, and
+building workspaces without a `target/` build directory.
+
+You run a crate directly from source, or emit a standalone native executable
+when you want a binary on disk. haste reads `Cargo.lock`, resolves names and
+types itself, and compiles reached functions to x86-64 or Apple Silicon arm64
+machine code.
 
 ```bash
 cargo build --release -p haste
 ./target/release/haste run examples/hello
+./target/release/haste --release build -o /tmp/hello examples/hello
 ```
 
-The project needs a `Cargo.lock`; run `cargo generate-lockfile` in it
-first if it has none. `haste run` starts `main`. Functions that the run
-never reaches are never compiled, and build scripts and procedural macros run inside haste.
-Results that do not change between runs, such as build script output and
-macro expansions, are kept in `~/.cache/haste`, keyed by their inputs.
+If a workspace has no `Cargo.lock`, run `cargo generate-lockfile` in it first.
+`haste run` compiles functions the first time execution reaches them, and build
+scripts and procedural macros run inside haste. Unchanged build script outputs,
+macro expansions, and standard library summaries stay in `~/.cache/haste`,
+keyed by their inputs.
 
-Status: experimental. No release yet, and the command line can change.
+haste is experimental. There is no release yet, and the command line can change.
 
 ## Commands
 
 ```text
-haste [--jobs N] build|test|run|serve PATH [ARGS...]
-haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand PATH [CRATE]
+haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] [-o PATH] build|test|run|serve|prep PATH [--] [ARGS...]
+haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]
+haste [--release] debug code PATH DIR
 ```
 
 | Command | Does |
 | --- | --- |
-| `run PATH [ARGS...]` | Runs the workspace binary's `main` with `ARGS`. |
-| `test PATH` | Runs each `case_*` function of the workspace members. |
-| `build PATH` | Type-checks and compiles every function the binary reaches. |
-| `serve PATH` | Keeps the workspace loaded and answers `build`, `test` and `run` for `PATH` from other haste processes. An edited file is read again and only what it changes is rebuilt. |
-| `debug QUERY PATH` | Prints what one stage found: the unit graph, the module outline, scopes, items, macro expansions or type errors. |
+| `run PATH [--] [ARGS...]` | Runs the workspace binary's `main` with `ARGS`. |
+| `test PATH` | Runs each `fn(i64) -> i64` `case_*` function in the workspace members. |
+| `build [-o PATH] PATH` | Type-checks the workspace and lowers reached code, or writes a standalone executable when `-o PATH` is given. |
+| `serve PATH` | Keeps the workspace loaded in memory and answers `build`, `test`, and `run` requests for `PATH`, rebuilding only what edited files affect. |
+| `prep PATH` | Pre-compiles dependencies that `main` reaches into the prepared library cache for `--prepared`. |
+| `debug QUERY PATH [CRATE]` | Prints one compiler stage: unit graph, module outline, lazy reach, type checking, scopes, items, macro expansions, failures, or emitted machine code (`code PATH DIR`). |
 
-`--jobs N` sets how many processes or threads haste uses. The default is
-the number of cores the process may run on.
+### Options
 
-## Requirements
+- `--jobs N`: Sets the worker thread or process count. Defaults to the cores available to the process.
+- `--release`: Enables full codegen optimization and release `cfg` settings.
+- `-o PATH`, `--output PATH`: Writes a standalone native executable (`haste build` only).
+- `--stats-json PATH`: Writes stage timing and reachability statistics as JSON (`haste build` only).
+- `--prepared`: Links pre-compiled dependency code produced by `haste prep`.
+- `--prep-wait MS`: Waits up to `MS` milliseconds for a running `prep` job before compiling directly.
+- `--perf-map`: Writes `/tmp/perf-<pid>.map` symbol entries for JIT profiling.
 
-- Linux on x86-64 with glibc, or macOS on Apple Silicon.
-- A stable Rust toolchain from rustup with the `rust-src` component.
-  haste reads the standard library from that source tree. Set
-  `HASTE_LIBRARY` to point at another `library` directory.
+## Requirements and environment
 
-| Variable | Default | Use |
+- Linux on x86-64 (`x86_64-unknown-linux-gnu`) or macOS on Apple Silicon (`aarch64-apple-darwin`).
+- A stable Rust toolchain from `rustup` with the `rust-src` component installed.
+
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| `HASTE_HOME` | `$XDG_CACHE_HOME/haste`, else `~/.cache/haste` | The store for build script results and macro expansions. |
-| `HASTE_LIBRARY` | The newest `stable-*` toolchain under `$RUSTUP_HOME` | The standard library source. |
+| `HASTE_HOME` | `$XDG_CACHE_HOME/haste`, else `~/.cache/haste` | Cache directory for build script outputs, macro expansions, and standard library summaries. |
+| `HASTE_LIBRARY` | Newest `stable-*` `rust-src` `library` directory under `$RUSTUP_HOME` | Path to the Rust standard library `library/` source tree. |
+| `HASTE_NO_SUBSTRATE` | Unset (`0`) | Set to `1` to bypass the cached standard library substrate. |
+| `HASTE_X64_BASELINE` | Unset (`0`) | Set to `1` on x86-64 to disable host ISA feature detection beyond baseline SSE2. |
+| `HASTE_DICT_MIN_BYTES` | `2048` | Minimum generic body size in bytes before dictionary lowering is considered. |
+| `HASTE_DICT_MIN_FANOUT` | `2` (JIT) or `8` (AOT) | Minimum monomorphization fanout before sharing a dictionary body. |
+| `HASTE_JIT_TIER_UP` | `64` | Call count threshold before a hot dictionary function specializes in JIT mode (`0` disables tier-up). |
+| `HASTE_VERIFY_STENCIL` | Unset (`0`) | Set to `1` to verify stencil instantiations against concrete lowering. |
 
-## Check it against rustc
+## Check against rustc
 
-`tests/diff` holds a crate of `case_*` functions. `scripts/check.sh` runs
-it once with cargo and once with `haste test`, and fails when an output
-differs.
+`tests/diff`, `tests/async`, and `tests/proc-macro` hold `case_*` suites, and
+`tests/probes` holds standalone crates. `scripts/check.sh` compares `cargo run`
+against both `haste test` (JIT) and `haste --release build -o` (standalone AOT).
 
 ```bash
 bash scripts/check.sh
@@ -61,19 +78,13 @@ bash scripts/check.sh tests/proc-macro
 bash scripts/probes.sh
 ```
 
-The scripts run `cargo`, or the command in `$CARGO` or in
-`~/.config/haste/cargo`.
+The scripts run `cargo`, or the command in `$CARGO` or `~/.config/haste/cargo`.
 
 ## Limits
 
-- It runs on `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` and
-  compiles for the host only. There is no Windows support.
-- Some Rust code does not compile yet. The checks above show what agrees
-  with rustc.
-- A panic prints its message and aborts. There is no unwinding.
-- `haste build` does not write a binary.
-- The first `serve` load of a large workspace takes several seconds when
-  the cache is empty.
+- haste compiles only for the host (`x86_64-unknown-linux-gnu` or `aarch64-apple-darwin`). Windows and cross-compilation are not supported.
+- Some Rust features do not compile yet. If any reached function fails to compile, `haste build` exits non-zero.
+- Panics print their message and abort instead of unwinding the stack.
 
 ## Contributing
 

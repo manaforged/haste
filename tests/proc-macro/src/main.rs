@@ -33,8 +33,10 @@ pub fn case_bang_const(input: i64) -> i64 {
     SEVEN + input + literals!()
 }
 
+include!("../../case_inputs.rs");
+
 fn main() {
-    for input in [-5, 0, 1, 3, 20] {
+    for input in CASE_INPUTS {
         println!("case_derive_total {input} {}", case_derive_total(input));
         println!("case_attr_doubled {input} {}", case_attr_doubled(input));
         println!("case_bang_const {input} {}", case_bang_const(input));

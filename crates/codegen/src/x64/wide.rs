@@ -43,10 +43,11 @@ impl Emit<'_> {
                 self.asm.bswap(Size::Q, Reg::Rdx);
             }
             Unary::Bitrev => {
+                self.raw(Reg::R11, x);
                 self.high(Reg::Rax, x);
                 self.reverse_bits();
                 self.put(result, Reg::Rax);
-                self.raw(Reg::Rax, x);
+                self.asm.mov(Reg::Rax, Reg::R11);
                 self.reverse_bits();
                 self.put_high(result, Reg::Rax);
                 return Ok(());

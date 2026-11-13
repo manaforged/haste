@@ -1,4 +1,4 @@
-use super::asm::{Alu, Bits, Cond, Reg, Shift, Size, ZR, encode_bitmask_imm};
+use super::asm::{Alu, Bits, Cond, Reg, Shift, Size, ZR};
 use super::{A, C, D, Emit, T, V0};
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
@@ -32,6 +32,9 @@ pub(super) fn alu_of(op: Binary) -> Option<Alu> {
 impl Emit<'_> {
     pub(super) fn unary(&mut self, op: Unary, x: Value, result: Value) -> Result<(), String> {
         let ty = self.ty(x);
+        if ty.is_vector() {
+            return self.vec_unary(op, x, result);
+        }
         if ty.is_float() {
             return self.float_unary(op, x, result);
         }
@@ -117,6 +120,9 @@ impl Emit<'_> {
             self.put_high(result, A);
             return Ok(());
         }
+        if ty.is_vector() {
+            return self.vec_binary(op, x, y, result);
+        }
         if ty.is_float() {
             return self.float_binary(op, x, y, result);
         }
@@ -140,6 +146,16 @@ impl Emit<'_> {
         }
     }
 
+    fn peel_uextend(&self, val: Value) -> Value {
+        if self.plan.elided[val.index()]
+            && let Some(inst) = self.defs[val.index()]
+            && let Op::Convert(Convert::Uextend, inner) = self.func.insts[inst.index()].op
+        {
+            return inner;
+        }
+        val
+    }
+
     fn shifted_operand(&self, alu: Alu, ty: Type, val: Value) -> Option<(Value, Shift, u8)> {
         if !self.plan.elided[val.index()] || !matches!(ty, Type::I32 | Type::I64) {
             return None;
@@ -158,7 +174,7 @@ impl Emit<'_> {
             Binary::Rotl if logical => (Shift::Ror, (bits - amt) & mask),
             _ => return None,
         };
-        Some((b, shift, count as u8))
+        Some((self.peel_uextend(b), shift, count as u8))
     }
 
     fn cinc_operand(&self, val: Value) -> Option<(IntCC, Value, Value)> {
@@ -202,7 +218,7 @@ impl Emit<'_> {
             }
             let shifted = self.shifted_operand(alu, ty, y).map(|s| (x, s)).or_else(|| (alu != Alu::Sub).then(|| self.shifted_operand(alu, ty, x).map(|s| (y, s))).flatten());
             if let Some((other, (b, shift, imm))) = shifted {
-                let left = self.bits(other, A);
+                let left = self.bits(self.peel_uextend(other), A);
                 let right = self.bits(b, C);
                 let size = if ty == Type::I64 { Size::X } else { Size::W };
                 self.asm.alu_shifted(alu, size, shift, imm, dst, left, right);
@@ -240,11 +256,18 @@ impl Emit<'_> {
             Binary::Udiv | Binary::Urem if self.divide_by_power(op, (x, y), dst) => {}
             Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem => self.divide(op, (x, y), dst),
             Binary::Umulhi | Binary::Smulhi => self.multiply_high(op == Binary::Smulhi, (x, y), bits, dst),
-            Binary::Smin | Binary::Smax => {
-                let left = self.src(x, A, Ext::Sign);
-                let right = self.src(y, C, Ext::Sign);
+            Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax => {
+                let signed = matches!(op, Binary::Smin | Binary::Smax);
+                let left = self.src(x, A, Ext::of(signed));
+                let right = self.src(y, C, Ext::of(signed));
                 self.asm.alu(Alu::Subs, Size::X, ZR, left, right);
-                self.asm.csel(if op == Binary::Smin { Cond::Lt } else { Cond::Gt }, dst, left, right);
+                let cond = match op {
+                    Binary::Smin => Cond::Lt,
+                    Binary::Smax => Cond::Gt,
+                    Binary::Umin => Cond::Lo,
+                    _ => Cond::Hi,
+                };
+                self.asm.csel(cond, dst, left, right);
             }
             Binary::Ishl | Binary::Ushr | Binary::Sshr => self.shift_by(op, (x, y), bits, dst),
             Binary::Rotl | Binary::Rotr => self.rotate(op == Binary::Rotl, (x, y), bits, dst),
@@ -396,6 +419,9 @@ impl Emit<'_> {
         if self.plan.is_static(result) {
             return Ok(());
         }
+        if self.ty(x).is_vector() {
+            return self.vec_icmp(cc, x, y, result);
+        }
         let flags = if self.ty(x) == Type::I128 {
             self.last_cmp = None;
             self.wide_icmp(cc, x, y)
@@ -472,6 +498,9 @@ impl Emit<'_> {
         if self.plan.is_static(result) {
             return Ok(());
         }
+        if self.ty(x).is_vector() || self.ty(result).is_vector() {
+            return self.vec_convert(op, x, result);
+        }
         let wide = self.ty(result) == Type::I128;
         match op {
             Convert::Uextend | Convert::Sextend => {
@@ -489,11 +518,62 @@ impl Emit<'_> {
             }
             Convert::Ireduce => {
                 let dst = self.dst(result);
-                self.raw(dst, x);
+                if self.plan.elided[x.index()]
+                    && let Some(inst) = self.defs[x.index()]
+                    && let Op::Binary(Binary::Ushr, val, amt) = self.func.insts[inst.index()].op
+                {
+                    self.shift_by(Binary::Ushr, (val, amt), self.ty(x).bits() as u8, dst);
+                } else {
+                    self.raw(dst, x);
+                }
                 self.put(result, dst);
                 Ok(())
             }
             _ => self.float_convert(op, x, result),
         }
     }
+}
+
+pub(super) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32)> {
+    let w = if is_64 {
+        val
+    } else {
+        let low = (val as u32) as u64;
+        low | (low << 32)
+    };
+    if w == 0 || w == u64::MAX {
+        return None;
+    }
+    let mut esize = 64u32;
+    while esize > 2 && w == w.rotate_right(esize / 2) {
+        esize /= 2;
+    }
+    let mask = if esize == 64 { u64::MAX } else { (1u64 << esize) - 1 };
+    let elem = w & mask;
+    let ones = elem.count_ones();
+    if ones == 0 || ones == esize {
+        return None;
+    }
+    let tz = elem.trailing_zeros();
+    let immr = if tz > 0 {
+        (esize - tz) & (esize - 1)
+    } else {
+        let trailing_ones = (!elem & mask).trailing_zeros();
+        ones - trailing_ones
+    };
+    let n = u32::from(esize == 64);
+    let imms = ((!(esize - 1) << 1) | (ones - 1)) & 0x3F;
+    let pat = (1u64 << ones) - 1;
+    let rotated = if esize == 64 {
+        pat.rotate_right(immr)
+    } else {
+        ((pat >> immr) | (pat << (esize - immr))) & mask
+    };
+    let mut decoded = rotated;
+    let mut shift = esize;
+    while shift < 64 {
+        decoded |= decoded << shift;
+        shift *= 2;
+    }
+    (decoded == w).then_some((n, immr, imms))
 }

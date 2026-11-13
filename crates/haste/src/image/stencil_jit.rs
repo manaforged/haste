@@ -10,7 +10,7 @@ use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sync::lock;
 
-use super::stencil::{DictConfig, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord};
+use super::stencil::{DictConfig, FirstJit, FirstJitState, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord};
 use super::{Image, Pass, stub};
 
 impl Image {
@@ -37,20 +37,20 @@ impl Image {
                 let symbols: Vec<u64> = out.relocs.iter().map(|sym| self.symbol_value(sym)).collect();
                 let code = Arc::new(haste_codegen::compile(out.func, &self.compile_target())?);
                 let exec = pass.memory.write_patched(&code, &symbols)?;
-                pass.stencils.first_jit.insert(item, Some((index, code, symbols, exec, out.reloc_plan)));
+                pass.stencils.first_jit.insert(item, FirstJitState::First(FirstJit { index, code, symbols, exec, reloc_plan: out.reloc_plan }));
                 Ok(Some(exec))
             }
-            Some(Some((idx1, code1, syms1, exec1, plan1))) => {
-                let fp1 = lower::eval_footprint(cx, reached, self, idx1)?;
+            Some(FirstJitState::First(first)) => {
+                let fp1 = lower::eval_footprint(cx, reached, self, first.index)?;
                 if self.wanted_len() > wanted0 {
                     bail!("unreached inline callee");
                 }
-                pass.stencils.jit_templates.insert((item, fp1), JitTemplate { stencil: code1, dict: None, fanout: 1, reloc_plan: plan1 });
-                pass.stencils.aliases.insert((item, fp1, syms1), (exec1, false));
-                pass.stencils.first_jit.insert(item, None);
+                pass.stencils.jit_templates.insert((item, fp1), JitTemplate { stencil: first.code, dict: None, fanout: 1, reloc_plan: first.reloc_plan });
+                pass.stencils.aliases.insert((item, fp1, first.symbols), (first.exec, false));
+                pass.stencils.first_jit.insert(item, FirstJitState::Promoted);
                 Ok(None)
             }
-            Some(None) => Ok(None),
+            Some(FirstJitState::Promoted) => Ok(None),
         }
     }
 
@@ -144,7 +144,7 @@ impl Image {
     }
 
     fn make_tier_up(&self, index: usize, key: (ItemRef, FootprintId), symbols: &[u64], threshold: u32, pass: &mut Pass) -> Result<Option<DictTierUp>> {
-        if !self.jit_mode || threshold == 0 || index >= (stub::TIER_UP_BIT as usize) {
+        if !self.backend.is_lazy_jit() || threshold == 0 || index >= (stub::TIER_UP_BIT as usize) {
             return Ok(None);
         }
         let counter_addr = lock(&self.shared).alloc(8)?;
@@ -197,8 +197,26 @@ impl Image {
     fn verify_with_fresh(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, record: &VerifyRecord) -> Result<()> {
         match record {
             VerifyRecord::Patched { exec, len, sites } => Self::verify_patched(cx, reached, fresh, index, (*exec, *len), sites),
+            VerifyRecord::Compiled { code, symbols } => Self::verify_compiled(cx, reached, fresh, index, code, symbols),
             VerifyRecord::Dict { body_exec, stub_exec, stub_bytes, code } => Self::verify_dict(cx, reached, fresh, index, (*body_exec, *stub_exec), stub_bytes, code),
         }
+    }
+
+    fn verify_compiled(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, code: &Code, symbols: &[u64]) -> Result<()> {
+        let out = lower::lower_stencil(cx, reached, fresh, index)?;
+        let slots: &dyn Slots = fresh;
+        let fresh_syms: Vec<u64> = out.relocs.iter().map(|sym| slots.resolve_symbol(sym)).collect();
+        let fresh_code = haste_codegen::compile(out.func, &fresh.0.compile_target())?;
+        if code.bytes() != fresh_code.bytes() {
+            bail!("stencil verification byte mismatch ({} vs {} bytes)", code.bytes().len(), fresh_code.bytes().len());
+        }
+        if code.sites() != fresh_code.sites() {
+            bail!("stencil verification Site table mismatch");
+        }
+        if code.relocs() != fresh_code.relocs() || symbols != fresh_syms.as_slice() {
+            bail!("stencil verification relocation mismatch");
+        }
+        Ok(())
     }
 
     fn verify_patched(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, (exec, len): (usize, usize), sites: &[Site]) -> Result<()> {
@@ -221,21 +239,27 @@ impl Image {
 
     fn verify_dict(cx: &mut Context<'_>, reached: &Reached, fresh: &FreshSlots<'_>, index: usize, (body_exec, stub_exec): (usize, usize), stub_bytes: &[u8], code: &Code) -> Result<()> {
         let (func, _, _) = lower::lower_dict(cx, reached, fresh, index)?;
-        let fresh_code = haste_codegen::compile(func, &fresh.0.compile_target())?;
+        let fresh_code = haste_codegen::compile(func, &super::stencil::target())?;
         if !fresh_code.relocs().iter().all(|reloc| reloc.as_runtime().is_some()) {
             bail!("dict body verification found non-runtime relocations");
         }
-        let mut expected = vec![0u8; fresh_code.bytes().len()];
-        fresh_code.patch(&[], &mut expected);
-        // SAFETY: body_exec..body_exec + code.bytes().len() is mapped readable executable code in this image.
-        let actual_body = unsafe { std::slice::from_raw_parts(body_exec as *const u8, code.bytes().len()) };
-        if actual_body != expected.as_slice() {
-            bail!("dict body verification byte mismatch ({} vs {} bytes)", actual_body.len(), expected.len());
+        if body_exec == 0 {
+            if code.bytes() != fresh_code.bytes() || code.relocs() != fresh_code.relocs() {
+                bail!("dict body verification mismatch ({} vs {} bytes)", code.bytes().len(), fresh_code.bytes().len());
+            }
+        } else {
+            let mut expected = vec![0u8; fresh_code.bytes().len()];
+            fresh_code.patch(&[], &mut expected);
+            // SAFETY: body_exec..body_exec + code.bytes().len() is mapped readable executable code in this image.
+            let actual_body = unsafe { std::slice::from_raw_parts(body_exec as *const u8, code.bytes().len()) };
+            if actual_body != expected.as_slice() {
+                bail!("dict body verification byte mismatch ({} vs {} bytes)", actual_body.len(), expected.len());
+            }
         }
         if code.sites() != fresh_code.sites() {
             bail!("dict body verification Site table mismatch");
         }
-        if !stub_bytes.is_empty() {
+        if stub_exec != 0 && !stub_bytes.is_empty() {
             // SAFETY: stub_exec..stub_exec + stub_bytes.len() is mapped readable executable code in this image.
             let actual_stub = unsafe { std::slice::from_raw_parts(stub_exec as *const u8, stub_bytes.len()) };
             if actual_stub != stub_bytes {

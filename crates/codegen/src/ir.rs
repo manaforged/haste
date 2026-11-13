@@ -1,8 +1,11 @@
 use std::fmt;
 
+mod vector;
+
+pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
+
 /// The machine type of one value.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Type {
     I8,
     I16,
@@ -11,40 +14,65 @@ pub enum Type {
     I128,
     F32,
     F64,
-    /// Sixteen bytes held in one vector register.
-    V128,
+    Vec { lane: Lane, count: u8 },
 }
 
 impl Type {
     /// Width in bytes.
-    pub fn bytes(self) -> u32 {
+    pub const fn bytes(self) -> u32 {
         match self {
             Type::I8 => 1,
             Type::I16 => 2,
             Type::I32 | Type::F32 => 4,
             Type::I64 | Type::F64 => 8,
-            Type::I128 | Type::V128 => 16,
+            Type::I128 => 16,
+            Type::Vec { lane, count } => lane.bytes() * (count as u32),
         }
     }
 
     /// Width in bits.
-    pub fn bits(self) -> u32 {
-        self.bytes() * 8
-    }
+    pub const fn bits(self) -> u32 { self.bytes() * 8 }
 
-    /// Whether the type holds a floating-point number.
-    pub fn is_float(self) -> bool {
-        matches!(self, Type::F32 | Type::F64)
-    }
+    /// Whether the type holds a scalar floating-point number.
+    pub const fn is_float(self) -> bool { matches!(self, Type::F32 | Type::F64) }
+
+    /// Whether the type is a SIMD register vector.
+    pub const fn is_vector(self) -> bool { matches!(self, Type::Vec { .. }) }
 
     /// Whether a value of the type lives in a float register when it has one.
-    pub fn in_float_register(self) -> bool {
-        self.is_float() || self == Type::V128
-    }
+    pub const fn in_float_register(self) -> bool { self.is_float() || self.is_vector() }
 
     /// Whether the type holds an integer that fits in one general-purpose register.
-    pub fn is_small_int(self) -> bool {
-        matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+    pub const fn is_small_int(self) -> bool { matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64) }
+
+    /// The lane kind when `self` is a vector type.
+    pub const fn lane(self) -> Option<Lane> {
+        match self {
+            Type::Vec { lane, .. } => Some(lane),
+            _ => None,
+        }
+    }
+
+    /// The `(lane, count)` shape when `self` is a vector type.
+    pub const fn vec_shape(self) -> Option<(Lane, u8)> {
+        match self {
+            Type::Vec { lane, count } => Some((lane, count)),
+            _ => None,
+        }
+    }
+
+    /// Whether `self` is a valid 8-byte or 16-byte power-of-two vector type.
+    pub const fn is_valid_vec(self) -> bool {
+        match self {
+            Type::Vec { lane, count } => count.is_power_of_two() && matches!(lane.bytes() * (count as u32), 8 | 16),
+            _ => false,
+        }
+    }
+
+    /// The largest unsigned value representable in `self`, clamped to 64 bits.
+    pub(crate) fn unsigned_max(self) -> u64 {
+        let bits = self.bits();
+        if bits >= 64 { u64::MAX } else { (1_u64 << bits) - 1 }
     }
 
     pub(crate) const fn sign_bit(self) -> i64 {
@@ -108,22 +136,44 @@ pub enum ArgumentPurpose {
 pub struct AbiParam {
     pub value_type: Type,
     pub purpose: ArgumentPurpose,
+    pub readonly: bool,
+    pub noalias: bool,
+    pub deref_bytes: u32,
 }
 
 impl AbiParam {
     /// A plain value of `ty`.
     pub fn new(ty: Type) -> Self {
-        Self { value_type: ty, purpose: ArgumentPurpose::Normal }
+        Self { value_type: ty, purpose: ArgumentPurpose::Normal, readonly: false, noalias: false, deref_bytes: 0 }
     }
 
     /// A value of `ty` with a special purpose.
     pub fn special(ty: Type, purpose: ArgumentPurpose) -> Self {
-        Self { value_type: ty, purpose }
+        Self { value_type: ty, purpose, readonly: false, noalias: false, deref_bytes: 0 }
     }
 
     /// A C variadic argument of `ty`.
     pub fn variadic(ty: Type) -> Self {
-        Self { value_type: ty, purpose: ArgumentPurpose::Variadic }
+        Self { value_type: ty, purpose: ArgumentPurpose::Variadic, readonly: false, noalias: false, deref_bytes: 0 }
+    }
+
+    /// Marks this parameter as pointing to immutable memory for the duration of the call.
+    pub const fn with_readonly(mut self) -> Self {
+        self.readonly = true;
+        self
+    }
+
+    /// Marks this parameter as unaliased with all other accessible memory objects at entry.
+    pub const fn with_noalias(mut self) -> Self {
+        self.noalias = true;
+        self
+    }
+
+    /// Marks this parameter as pointing to `bytes` bytes of dereferenceable, immutable memory.
+    pub const fn with_deref_bytes(mut self, bytes: u32) -> Self {
+        self.readonly = true;
+        self.deref_bytes = bytes;
+        self
     }
 }
 
@@ -133,29 +183,12 @@ pub struct Signature {
     pub params: Vec<AbiParam>,
     pub returns: Vec<AbiParam>,
     pub call_conv: CallConv,
-    pub readonly_params: u64,
-    pub readonly_bytes: [u32; 16],
 }
 
 impl Signature {
     /// An empty signature in `call_conv`.
     pub fn new(call_conv: CallConv) -> Self {
-        Self { params: Vec::new(), returns: Vec::new(), call_conv, readonly_params: 0, readonly_bytes: [0; 16] }
-    }
-
-    /// Marks parameter `index` as pointing to immutable memory for the duration of the call.
-    pub fn mark_readonly(&mut self, index: usize) {
-        if index < 64 {
-            self.readonly_params |= 1_u64 << index;
-        }
-    }
-
-    /// Marks parameter `index` as pointing to `bytes` bytes of dereferenceable, immutable memory for the duration of the call.
-    pub fn mark_readonly_bytes(&mut self, index: usize, bytes: u32) {
-        self.mark_readonly(index);
-        if index < 16 {
-            self.readonly_bytes[index] = bytes;
-        }
+        Self { params: Vec::new(), returns: Vec::new(), call_conv }
     }
 }
 
@@ -199,38 +232,6 @@ impl IntCC {
             IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThan,
         }
     }
-}
-
-/// A comparison of the sixteen bytes of two vectors, giving a byte of all ones where it holds and of zeros where it does not.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
-pub enum ByteCC {
-    Equal,
-    SignedGreaterThan,
-}
-
-/// An x64 instruction on two 128-bit vectors that computes in place into the first.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
-pub enum VectorOp {
-    ByteShuffle,
-    AddBytes,
-    AddWords,
-    AddDwords,
-    AddQwords,
-    SubBytes,
-    SubWords,
-    SubDwords,
-    SubQwords,
-    Sha1NextE,
-    Sha1Msg1,
-    Sha1Msg2,
-    Sha256Msg1,
-    Sha256Msg2,
-    AesEnc,
-    AesEncLast,
-    AesDec,
-    AesDecLast,
 }
 
 /// A floating-point comparison; every one but `NotEqual` is false when an operand is NaN.
@@ -294,6 +295,8 @@ pub(crate) enum Binary {
     Smulhi,
     Smin,
     Smax,
+    Umin,
+    Umax,
     Band,
     Bor,
     Bxor,
@@ -307,6 +310,8 @@ pub(crate) enum Binary {
     Fsub,
     Fmul,
     Fdiv,
+    Fmin,
+    Fmax,
     Fcopysign,
 }
 
@@ -322,12 +327,10 @@ pub(crate) enum Convert {
     FromUint,
     ToSintSat,
     ToUintSat,
-    WidenVec64,
-    NarrowVec64,
     Bitcast,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Op {
     Const(i64),
     SlotAddr(u32),
@@ -340,16 +343,16 @@ pub(crate) enum Op {
     /// 1 when `x op y` (add, sub or mul, signed when the flag is set) fits the type of `x`, else 0.
     Fits(Binary, bool, Value, Value),
     Fcmp(FloatCC, Value, Value),
-    /// The sixteen byte comparisons of two vectors.
-    ByteCmp(ByteCC, Value, Value),
-    /// The vector whose sixteen bytes are all the byte in the value.
-    Splat(Value),
-    /// The 32-bit integer whose bit `i` is the top bit of byte `i` of the vector, for `i` below 16, and whose other bits are zero.
-    Movemask(Value),
-    /// The x64 vector instruction on two vectors.
-    Vector(VectorOp, Value, Value),
-    /// Two SHA-256 rounds (`sha256rnds2`) on the state vectors in the first two values with the message and constants in the third.
-    Sha256Rounds(Value, Value, Value),
+    /// Selects lanes from two vectors using a static mask or dynamic byte indices.
+    Shuffle(Value, Value, ShuffleMask),
+    /// Extracts one scalar lane from a vector.
+    Extract(Value, u8),
+    /// Replaces one scalar lane in a vector.
+    Insert(Value, Value, u8),
+    /// Reduces a vector to a scalar value or byte-sign bitmask.
+    Reduce(ReduceOp, Value),
+    /// A target-specific vector instruction with 1 to 3 operands.
+    TargetOp(TargetOpId, TinyArgs),
     Select(Value, Value, Value),
     Load(Value, i32),
     Store(Value, Value, i32),
@@ -394,13 +397,19 @@ impl Op {
             | Op::Icmp(..)
             | Op::Fits(..)
             | Op::Fcmp(..)
-            | Op::ByteCmp(..)
-            | Op::Splat(_)
-            | Op::Movemask(_)
-            | Op::Vector(..)
+            | Op::Shuffle(..)
+            | Op::Extract(..)
+            | Op::Insert(..)
+            | Op::Reduce(..)
+            | Op::TargetOp(..)
             | Op::Select(..) => true,
             _ => false,
         }
+    }
+
+    /// Whether this instruction has no observable side effects and may be dropped when unused.
+    pub(crate) fn is_removable(&self) -> bool {
+        self.is_speculable() || matches!(self, Op::Binary(..) | Op::Runtime(_) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
     }
 
     /// Every block this instruction can go to.
@@ -439,12 +448,20 @@ impl Op {
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Splat(x) | Op::Movemask(x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
-            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::ByteCmp(_, x, y) | Op::Vector(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
+            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Insert(x, y, _) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
                 f(*x);
                 f(*y);
             }
-            Op::Select(c, x, y) | Op::Sha256Rounds(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Shuffle(a, b, mask) => {
+                f(*a);
+                f(*b);
+                if let ShuffleMask::Dyn(idx) = mask {
+                    f(*idx);
+                }
+            }
+            Op::TargetOp(_, args) => args.as_slice().iter().for_each(|arg| f(*arg)),
+            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
                 f(*c);
                 f(*x);
                 f(*y);
@@ -466,15 +483,14 @@ impl Op {
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Splat(x) | Op::Movemask(x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
                 *x = f(*x);
             }
             Op::Binary(_, x, y)
             | Op::Icmp(_, x, y)
             | Op::Fits(_, _, x, y)
             | Op::Fcmp(_, x, y)
-            | Op::ByteCmp(_, x, y)
-            | Op::Vector(_, x, y)
+            | Op::Insert(x, y, _)
             | Op::Store(x, y, _)
             | Op::AtomicStore(x, y)
             | Op::AtomicRmw(_, x, y)
@@ -482,7 +498,15 @@ impl Op {
                 *x = f(*x);
                 *y = f(*y);
             }
-            Op::Select(c, x, y) | Op::Sha256Rounds(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Shuffle(a, b, mask) => {
+                *a = f(*a);
+                *b = f(*b);
+                if let ShuffleMask::Dyn(idx) = mask {
+                    *idx = f(*idx);
+                }
+            }
+            Op::TargetOp(_, args) => args.as_mut_slice().iter_mut().for_each(|arg| *arg = f(*arg)),
+            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
                 *c = f(*c);
                 *x = f(*x);
                 *y = f(*y);
@@ -642,18 +666,6 @@ impl Function {
         block
     }
 
-    /// Whether control that enters at `entry` can reach each block.
-    pub(crate) fn reachable(&self, entry: Block) -> Vec<bool> {
-        let mut seen = vec![false; self.blocks.len()];
-        let mut stack = vec![entry];
-        while let Some(block) = stack.pop() {
-            if !std::mem::replace(&mut seen[block.index()], true) {
-                stack.extend(self.successors(block));
-            }
-        }
-        seen
-    }
-
     /// The number of instructions in the body.
     pub fn size(&self) -> usize {
         self.blocks.iter().map(|block| block.insts.len()).sum()
@@ -702,15 +714,37 @@ impl Function {
         uses
     }
 
-    /// The number of control-flow edges into each block.
-    pub(crate) fn pred_counts(&self) -> Vec<u32> {
-        let mut preds = vec![0_u32; self.blocks.len()];
-        for block in 0..self.blocks.len() {
-            for target in self.successors(Block(block as u32)) {
-                preds[target.index()] += 1;
+    /// Resolves each value derived from a stack slot plus constant offsets, returning `(slot_offsets, addr_insts)`.
+    pub(crate) fn slot_offsets(&self, eval_const: impl Fn(Value) -> Option<i64>) -> (Vec<Option<(StackSlot, i64)>>, Vec<(Inst, StackSlot)>) {
+        let mut consts = vec![None; self.types.len()];
+        let mut addrs = vec![None; self.types.len()];
+        let mut addr_insts = Vec::new();
+        let mut adds = Vec::new();
+        for inst in self.blocks.iter().flat_map(|block| &block.insts) {
+            let data = &self.insts[inst.index()];
+            let Some(result) = data.result else { continue };
+            match &data.op {
+                Op::StackAddr(slot, offset) => {
+                    addrs[result.index()] = Some((*slot, i64::from(*offset)));
+                    addr_insts.push((*inst, *slot));
+                }
+                Op::Const(imm) => consts[result.index()] = Some(*imm),
+                Op::Binary(Binary::Iadd, x, c) => adds.push((*inst, result, *x, *c)),
+                _ => {}
             }
         }
-        preds
+        loop {
+            let before = adds.len();
+            adds.retain(|&(inst, result, x, c)| {
+                let imm_of = |v: Value| consts[v.index()].or_else(|| eval_const(v));
+                let Some(((slot, base), imm)) = addrs[x.index()].zip(imm_of(c)).or_else(|| addrs[c.index()].zip(imm_of(x))) else { return true };
+                let Some(offset) = base.checked_add(imm) else { return true };
+                addrs[result.index()] = Some((slot, offset));
+                addr_insts.push((inst, slot));
+                false
+            });
+            if adds.len() == before { return (addrs, addr_insts); }
+        }
     }
 }
 

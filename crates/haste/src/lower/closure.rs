@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Type, Value};
+use haste_codegen::{Coroutine, Type, Value};
 
 use crate::body::{ExprId, List};
 use crate::names::ItemRef;
@@ -36,13 +36,14 @@ impl Lower<'_, '_> {
         Ok(self.read(object))
     }
 
-    /// Zeroes the state word and frame pointer of the coroutine object at `object`, and gives the place and type of its captures.
+    /// Initializes the state word to `Coroutine::UNRESUMED` and zeroes the frame pointer of the coroutine object at `object`, and gives the place and type of its captures.
     fn coroutine_header(&mut self, ty: Ty, object: Place, env: Ty) -> Result<(Place, Ty)> {
-        let zero = self.ins().iconst(Type::I64, 0);
-        for word in 0..2 {
-            let part = self.part_place(object, env, (0, word))?;
-            self.write(part, zero);
-        }
+        let init_state = self.ins().iconst(Type::I64, Coroutine::UNRESUMED);
+        let state_part = self.part_place(object, env, (0, 0))?;
+        self.write(state_part, init_state);
+        let null_frame = self.ins().iconst(Type::I64, 0);
+        let frame_part = self.part_place(object, env, (0, 1))?;
+        self.write(frame_part, null_frame);
         let (inner, offset) = self.captures_of(ty)?;
         Ok((object.at(offset, repr(self.cx, inner)?), inner))
     }
@@ -143,6 +144,15 @@ impl Lower<'_, '_> {
         {
             self.moved_out(root, &path)?;
         }
+        let env = if self.cx.closure_consumes(callee_ty)
+            && self.may_alias_place(callee)
+            && let Some(place) = place
+            && matches!(place.repr, super::Repr::Mem { .. })
+        {
+            self.snapshot_repr(place.repr, env)
+        } else {
+            env
+        };
         Ok(vec![env])
     }
 

@@ -5,10 +5,29 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::body::{ExprId, PatId};
 use crate::names::ItemRef;
 
-use super::super::infer::{Awaited, BodyTables, Closure, Coercion, For, Res, SiteKey, Tried};
+use super::super::infer::{Awaited, BodyTables, Closure, Coercion, For, Local, Res, SiteKey, Tried};
 use super::super::substs::{PackedMap, PackedSet, ProjId, Substs};
 use super::super::ty::{Kind, Ty, Types};
 use super::{CallOverride, PolySummary};
+
+/// Stripped polymorphic check-only summary holding only resolved call edges.
+#[derive(Clone, Debug)]
+pub struct PolyCheck {
+    pub summary: Arc<PolySummary>,
+    pub resolved_calls: Box<[(SiteKey, ItemRef, Substs)]>,
+}
+
+impl PolyCheck {
+    /// Iterates every concrete and resolved call edge without materializing `BodyTables`.
+    pub fn calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+        self.summary.fixed_calls.iter().copied().chain(self.resolved_calls.iter().map(|&(_, i, s)| (i, s)))
+    }
+
+    /// Iterates only the instance-dependent call edges, excluding `summary.fixed_calls`.
+    pub fn dynamic_calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+        self.resolved_calls.iter().map(|&(_, i, s)| (i, s))
+    }
+}
 
 /// Compact per-instance instantiation state that materializes full `BodyTables` only on demand.
 #[derive(Clone, Debug)]
@@ -20,8 +39,134 @@ pub struct PolyInst {
     pub builtin_ops: Box<[ExprId]>,
     pub call_overrides: Box<[CallOverride]>,
     pub offset_overrides: Box<[(ExprId, u64)]>,
-    pub(crate) check_only: bool,
     pub(super) materialized: OnceLock<Arc<BodyTables>>,
+}
+
+/// Typed instantiation outcome distinguishing lowered full instances from stripped check-only ones.
+pub(super) enum InstOutcome {
+    Full(PolyInst, Vec<Local>, Option<Ty>, Vec<Ty>, Vec<Ty>),
+    CheckOnly(PolyCheck, Option<Ty>, Vec<Ty>, Vec<Ty>),
+}
+
+pub(super) fn instantiate_pure(types: &Types, args: Substs, summary: &Arc<PolySummary>, check_only: bool) -> InstOutcome {
+    let mut inst = PolyInst {
+        args,
+        summary: Arc::clone(summary),
+        projs: Box::new([]),
+        resolved_calls: Box::new([]),
+        builtin_ops: Box::new([]),
+        call_overrides: Box::new([]),
+        offset_overrides: Box::new([]),
+        materialized: OnceLock::new(),
+    };
+    if !summary.direct_calls.is_empty() {
+        let mut resolved: Vec<_> = summary.direct_calls.iter().map(|&(key, item, substs)| (key, item, inst.sub_substs(types, substs))).collect();
+        if !check_only {
+            resolved.sort_unstable_by_key(|&(key, ..)| key);
+        }
+        inst.resolved_calls = resolved.into_boxed_slice();
+    }
+    let ret = summary.ret.map(|ty| inst.sub_ty(types, ty));
+    let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(types, ty)).collect();
+    let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(types, ty)).collect();
+    if check_only {
+        InstOutcome::CheckOnly(PolyCheck { summary: inst.summary, resolved_calls: inst.resolved_calls }, ret, layouts, drop_tys)
+    } else {
+        let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(types, local.ty) }).collect();
+        InstOutcome::Full(inst, locals, ret, layouts, drop_tys)
+    }
+}
+
+/// Generic parameter and projection substitution policy for [`fold_ty`] and [`fold_substs`].
+pub(super) trait TyFolder {
+    type Error;
+    fn types(&self) -> &Types;
+    fn args(&self) -> &[Ty];
+    fn get_cached(&self, _ty: Ty) -> Option<Ty> {
+        None
+    }
+    fn set_cached(&mut self, _ty: Ty, _mapped: Ty) {}
+    fn param_oob(&self, idx: u16) -> Self::Error;
+    fn fold_proj(&mut self, id: ProjId) -> Result<Ty, Self::Error>;
+}
+
+/// Folds `ty` by substituting generic parameters and normalized projections via `folder`.
+pub(super) fn fold_ty<F: TyFolder>(folder: &mut F, ty: Ty) -> Result<Ty, F::Error> {
+    if ty == Ty::NONE || !folder.types().has_params(ty) {
+        return Ok(ty);
+    }
+    if let Some(cached) = folder.get_cached(ty) {
+        return Ok(cached);
+    }
+    let kind = folder.types().kind(ty).clone();
+    let mapped = match kind {
+        Kind::Param(idx) => *folder.args().get(idx as usize).ok_or_else(|| folder.param_oob(idx))?,
+        Kind::Proj(id) => folder.fold_proj(id)?,
+        ref compound => fold_compound(folder, compound)?,
+    };
+    folder.set_cached(ty, mapped);
+    Ok(mapped)
+}
+
+fn fold_compound<F: TyFolder>(folder: &mut F, kind: &Kind) -> Result<Ty, F::Error> {
+    let pools = folder.types().pools();
+    let mut err: Option<F::Error> = None;
+    let next = kind.map_pool(&pools, |child| match fold_ty(folder, child) {
+        Ok(found) => found,
+        Err(e) => {
+            if err.is_none() {
+                err = Some(e);
+            }
+            child
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(folder.types().intern(next))
+}
+
+/// Folds every type inside `substs` via `folder`, preserving identity when no parameters exist.
+pub(super) fn fold_substs<F: TyFolder>(folder: &mut F, substs: Substs) -> Result<Substs, F::Error> {
+    if !folder.types().substs_have_params(substs) {
+        return Ok(substs);
+    }
+    let slice = folder.types().substs(substs).to_vec();
+    let mut mapped = Vec::with_capacity(slice.len());
+    for ty in slice {
+        mapped.push(fold_ty(folder, ty)?);
+    }
+    Ok(folder.types().intern_substs(&mapped))
+}
+
+struct InstFolder<'a> {
+    inst: &'a PolyInst,
+    types: &'a Types,
+    cache: Option<&'a mut HashMap<Ty, Ty>>,
+}
+
+impl TyFolder for InstFolder<'_> {
+    type Error = std::convert::Infallible;
+    fn types(&self) -> &Types {
+        self.types
+    }
+    fn args(&self) -> &[Ty] {
+        self.types.substs(self.inst.args)
+    }
+    fn get_cached(&self, ty: Ty) -> Option<Ty> {
+        self.cache.as_ref().and_then(|map| map.get(&ty).copied())
+    }
+    fn set_cached(&mut self, ty: Ty, mapped: Ty) {
+        if let Some(map) = &mut self.cache {
+            map.insert(ty, mapped);
+        }
+    }
+    fn param_oob(&self, _idx: u16) -> Self::Error {
+        unreachable!()
+    }
+    fn fold_proj(&mut self, id: ProjId) -> Result<Ty, Self::Error> {
+        Ok(self.inst.proj_ty(id))
+    }
 }
 
 impl PolyInst {
@@ -53,25 +198,14 @@ impl PolyInst {
 
     /// Substitutes this instance's concrete arguments and normalized projections into `ty`.
     pub fn sub_ty(&self, types: &Types, ty: Ty) -> Ty {
-        if ty == Ty::NONE || !types.has_params(ty) {
-            return ty;
-        }
-        match *types.kind(ty) {
-            Kind::Param(idx) => types.substs(self.args)[idx as usize],
-            Kind::Proj(id) => self.proj_ty(id),
-            ref kind => {
-                let pools = types.pools();
-                types.intern(kind.map_pool(&pools, |child| self.sub_ty(types, child)))
-            }
-        }
+        let Ok(mapped) = fold_ty(&mut InstFolder { inst: self, types, cache: None }, ty);
+        mapped
     }
 
     /// Substitutes this instance's concrete arguments and normalized projections into `substs`.
     pub fn sub_substs(&self, types: &Types, substs: Substs) -> Substs {
-        if !types.substs_have_params(substs) {
-            return substs;
-        }
-        types.pool().map(substs, &mut |ty| self.sub_ty(types, ty))
+        let Ok(mapped) = fold_substs(&mut InstFolder { inst: self, types, cache: None }, substs);
+        mapped
     }
 
     /// The concrete type of `expr` in this instance without materializing `BodyTables`.
@@ -144,21 +278,7 @@ impl PolyInst {
     }
 
     fn sub_ty_cached(&self, types: &Types, cache: &mut HashMap<Ty, Ty>, ty: Ty) -> Ty {
-        if ty == Ty::NONE || !types.has_params(ty) {
-            return ty;
-        }
-        if let Some(&found) = cache.get(&ty) {
-            return found;
-        }
-        let mapped = match *types.kind(ty) {
-            Kind::Param(idx) => types.substs(self.args)[idx as usize],
-            Kind::Proj(id) => self.proj_ty(id),
-            ref kind => {
-                let pools = types.pools();
-                types.intern(kind.map_pool(&pools, |child| self.sub_ty_cached(types, cache, child)))
-            }
-        };
-        cache.insert(ty, mapped);
+        let Ok(mapped) = fold_ty(&mut InstFolder { inst: self, types, cache: Some(cache) }, ty);
         mapped
     }
 

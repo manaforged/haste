@@ -74,6 +74,10 @@ pub trait Slots {
         self.data(bytes);
         RodataId(0)
     }
+    /// Interns read-only bytes for immutable static `index` without deduplicating across distinct statics.
+    fn static_rodata(&self, _index: usize, bytes: &[u8]) -> RodataId {
+        self.rodata(bytes, &[])
+    }
     /// Whether calls may inline bodies through this image.
     fn allow_inline(&self) -> bool {
         true
@@ -184,13 +188,38 @@ pub fn passed_parts(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
         Repr::Mem { parts: parts @ Parts::One(_), .. } => Some(parts),
         Repr::Mem { parts: parts @ Parts::Pair(first, second, _), .. } if first != Type::I128 && second != Type::I128 => Some(parts),
         Repr::Mem { parts: parts @ Parts::Words(..), .. } if !is_repr_c(cx, ty) => Some(parts),
+        Repr::Mem { size, parts: Parts::Bytes, .. } if !is_repr_c(cx, ty) => match abi::packed_word_parts(size) {
+            Parts::Bytes => None,
+            parts => Some(parts),
+        },
         _ => None,
     })
 }
 
-/// The native signature of a reached function: memory values travel by address unless `passed_parts` splits them into one or two scalar registers, and a memory result returns in those registers or through a first `StructReturn` pointer.
+/// The native signature of a reached function: memory values travel by address unless `passed_parts` splits them into up to four scalar registers, and a memory result returns in those registers or through a first `StructReturn` pointer.
 pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
     signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))
+}
+
+fn ref_abi_param(cx: &mut Context<'_>, abi: AbiParam, param: Ty, thin: bool) -> AbiParam {
+    let Kind::Ref(mutability, inner) = *cx.types.kind(param) else {
+        return abi;
+    };
+    if mutability == crate::sema::ty::Mut::Mut {
+        return abi.with_noalias();
+    }
+    if thin {
+        if let Some(bytes) = freeze_pointee_bytes(cx, inner) {
+            return abi.with_deref_bytes(bytes);
+        }
+        return abi;
+    }
+    let immutable = match *cx.types.kind(inner) {
+        Kind::Slice(elem) => is_freeze_ty(cx, elem, 0),
+        Kind::Prim(Primitive::Str) => true,
+        _ => false,
+    };
+    if immutable { abi.with_readonly() } else { abi }
 }
 
 /// The native signature of a function that returns `ret` and takes `params`.
@@ -201,26 +230,32 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
             Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
             Repr::Mem { .. } => match passed_parts(cx, ret)? {
                 Some(parts) => signature.returns.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
-                None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn)),
+                None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn).with_noalias()),
             },
             Repr::Zst => {}
         }
     }
     for param in params {
-        let sig_idx = signature.params.len();
         match repr(cx, param)? {
             Repr::Scalar(ty) => {
-                if ty == Type::I64
-                    && let Kind::Ref(crate::sema::ty::Mut::Not, inner) = *cx.types.kind(param)
-                    && let Some(bytes) = freeze_pointee_bytes(cx, inner)
-                {
-                    signature.mark_readonly(sig_idx);
-                    signature.mark_readonly_bytes(sig_idx, bytes);
+                let mut abi = AbiParam::new(ty);
+                if ty == Type::I64 {
+                    abi = ref_abi_param(cx, abi, param, true);
                 }
-                signature.params.push(AbiParam::new(ty));
+                signature.params.push(abi);
             }
             Repr::Mem { .. } => match passed_parts(cx, param)? {
-                Some(parts) => signature.params.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
+                Some(parts) => {
+                    let mut first = true;
+                    for (machine, _) in parts.scalars() {
+                        let mut abi = AbiParam::new(machine);
+                        if first {
+                            abi = ref_abi_param(cx, abi, param, false);
+                            first = false;
+                        }
+                        signature.params.push(abi);
+                    }
+                }
                 None => signature.params.push(AbiParam::new(Type::I64)),
             },
             Repr::Zst => {}
@@ -489,12 +524,16 @@ impl Lower<'_, '_> {
     /// Stores into `place` the scalars or address that parameter `local` received from `params`, returning the last consumed `Value`.
     pub(super) fn store_passed(&mut self, local: u32, place: place::Place, params: &mut impl Iterator<Item = Value>) -> Result<Option<Value>> {
         let ty = self.typed.locals[local as usize].ty;
+        let size = match place.repr {
+            Repr::Mem { size, .. } => size,
+            _ => 0,
+        };
         let mut last = None;
         match passed_parts(self.cx, ty)? {
             Some(parts) => {
                 for (machine, offset) in parts.scalars() {
                     if let Some(value) = params.next() {
-                        self.write(place.at(offset, Repr::Scalar(machine)), value);
+                        self.store_packed_part(place, offset, machine, value, size);
                         last = Some(value);
                     }
                 }
@@ -511,8 +550,12 @@ impl Lower<'_, '_> {
 
     /// Appends `value`, a value of `ty`, as it crosses a call: scalars loaded from memory when `passed_parts` names them.
     pub(super) fn push_passed(&mut self, ty: Ty, value: Value, out: &mut Vec<Value>) -> Result<()> {
+        let Repr::Mem { size, .. } = repr(self.cx, ty)? else {
+            out.push(value);
+            return Ok(());
+        };
         match passed_parts(self.cx, ty)? {
-            Some(parts) => out.extend(parts.scalars().map(|(machine, offset)| self.ins().load(machine, value, offset))),
+            Some(parts) => out.extend(parts.scalars().map(|(machine, offset)| self.load_packed_part(value, offset, machine, size))),
             None => out.push(value),
         }
         Ok(())
@@ -577,7 +620,10 @@ impl Lower<'_, '_> {
             self.stmt(self.body.stmts[stmt as usize])?;
         }
         let value = match tail {
-            Some(tail) => self.expr(tail)?,
+            Some(tail) => {
+                let value = self.expr(tail)?;
+                self.snapshot_before_drops(mark, tail, value)?
+            }
             None => None,
         };
         self.end_scope(mark)?;

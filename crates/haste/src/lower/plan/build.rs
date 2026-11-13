@@ -109,10 +109,20 @@ fn collect_subtree(body: &Body, closure_root: Option<ExprId>) -> (Vec<ExprId>, V
     };
     let mut exprs = Vec::new();
     let mut pats = Vec::new();
-    for param in &body.params {
-        walk_pat(body, param.pat, &mut exprs, &mut pats);
+    for expr in &body.exprs {
+        if let Expr::Closure { params, body: b, .. } = *expr
+            && b == root
+        {
+            for &p in body.list(params) {
+                walk_pat(body, body.params[p as usize].pat, &mut exprs, &mut pats);
+            }
+        }
     }
     walk_expr(body, root, &mut exprs, &mut pats);
+    exprs.sort_unstable();
+    exprs.dedup();
+    pats.sort_unstable();
+    pats.dedup();
     (exprs, pats)
 }
 

@@ -1,4 +1,4 @@
-use crate::dom::dominates;
+use crate::cfg::{Cfg, dominates};
 use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
@@ -37,11 +37,6 @@ pub(crate) struct Fact {
     not: Vec<u64>,
 }
 
-/// The largest unsigned value of type `ty`.
-fn top(ty: Type) -> u64 {
-    if ty.bits() >= 64 { u64::MAX } else { (1_u64 << ty.bits()) - 1 }
-}
-
 /// `imm` as an unsigned value at the width of `ty`.
 fn unsigned(imm: i64, ty: Type) -> u64 {
     extend(imm, ty, false) as u64
@@ -50,7 +45,7 @@ fn unsigned(imm: i64, ty: Type) -> u64 {
 impl Fact {
     /// Nothing known about a value of type `ty`.
     fn full(ty: Type) -> Self {
-        Self { lo: 0, hi: top(ty), not: Vec::new() }
+        Self { lo: 0, hi: ty.unsigned_max(), not: Vec::new() }
     }
 
     /// Exactly the constant `imm` of type `ty`.
@@ -96,7 +91,7 @@ impl Fact {
 
     /// Whether the fact holds for both signed and unsigned readings alike: its range sits below the sign bit of `ty`.
     fn non_negative(&self, ty: Type) -> bool {
-        self.hi <= top(ty) >> 1
+        self.hi <= ty.unsigned_max() >> 1
     }
 }
 
@@ -147,7 +142,7 @@ fn order(always: bool, never: bool) -> Option<bool> {
 /// The fact on `x` that `x cc k` being `taken` gives, for an equality or unsigned `cc`.
 fn compared(cc: IntCC, ty: Type, k: u64, taken: bool) -> Option<Fact> {
     let cc = if taken { cc } else { cc.inverse() };
-    let max = top(ty);
+    let max = ty.unsigned_max();
     let mut fact = Fact::full(ty);
     match cc {
         IntCC::Equal => fact = Fact::range(k, k),
@@ -185,7 +180,7 @@ pub(crate) struct Ranges<'a> {
 impl<'a> Ranges<'a> {
     /// The ranges of `func`'s values over the blocks of `order`, with the constants `consts` an earlier fold found.
     pub(crate) fn new(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>])) -> Self {
-        let table = func.types.iter().map(|ty| (0, top(*ty))).collect();
+        let table = func.types.iter().map(|ty| (0, ty.unsigned_max())).collect();
         let mut ranges = Self { defs, table };
         let mut incoming: Vec<Vec<(Block, &[Value])>> = vec![Vec::new(); func.blocks.len()];
         let mut complete = vec![true; func.blocks.len()];
@@ -244,7 +239,7 @@ impl<'a> Ranges<'a> {
                     min_lo = min_lo.min(self.of(arg).lo);
                 }
             }
-            if valid && has_outside && min_lo > 0 && min_lo <= top(ty) {
+            if valid && has_outside && min_lo > 0 && min_lo <= ty.unsigned_max() {
                 self.table[p.index()].0 = min_lo;
             }
         }
@@ -284,7 +279,7 @@ impl<'a> Ranges<'a> {
         if depth > 4 {
             return false;
         }
-        let Some(max_p) = top(ty).checked_sub(step) else {
+        let Some(max_p) = ty.unsigned_max().checked_sub(step) else {
             return false;
         };
         match self.op(func, cond) {
@@ -332,7 +327,7 @@ impl<'a> Ranges<'a> {
             Op::Const(imm) => Fact::constant(ty, imm),
             Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => Fact::range(0, 1),
             Op::Convert(Convert::Uextend, x) => self.of(x),
-            Op::Convert(Convert::Ireduce, x) => Some(self.of(x)).filter(|inner| inner.hi <= top(ty)).unwrap_or_else(|| Fact::full(ty)),
+            Op::Convert(Convert::Ireduce, x) => Some(self.of(x)).filter(|inner| inner.hi <= ty.unsigned_max()).unwrap_or_else(|| Fact::full(ty)),
             Op::Binary(op, x, y) if func.ty(x).is_small_int() => self.binary(func, op, (x, y)),
             Op::Select(_, x, y) => {
                 let (a, b) = (self.of(x), self.of(y));
@@ -372,7 +367,7 @@ impl<'a> Ranges<'a> {
         let Some(k) = self.constant(y) else { return Fact::full(ty) };
         let inner = self.of(x);
         let moved = match subtract {
-            false => inner.lo.checked_add(k).zip(inner.hi.checked_add(k)).filter(|(_, hi)| *hi <= top(ty)),
+            false => inner.lo.checked_add(k).zip(inner.hi.checked_add(k)).filter(|(_, hi)| *hi <= ty.unsigned_max()),
             true => inner.lo.checked_sub(k).zip(inner.hi.checked_sub(k)),
         };
         moved.map_or_else(|| Fact::full(ty), |(lo, hi)| Fact::range(lo, hi))
@@ -540,7 +535,7 @@ impl Path {
                     for (base, c) in [(p, q), (q, p)] {
                         if let Some(k) = ranges.constant(c)
                             && k >= 1
-                            && ranges.of(base).hi.checked_add(k).is_some_and(|hi| hi <= top(ty))
+                            && ranges.of(base).hi.checked_add(k).is_some_and(|hi| hi <= ty.unsigned_max())
                             && self.reaches(ty, a, base, (RelKind::Ult, RelKind::Ule), false)
                         {
                             return true;
@@ -618,39 +613,22 @@ impl Path {
     }
 }
 
-/// The only block that branches to each block, for blocks with exactly one incoming edge.
-pub(crate) fn single_preds(func: &Function) -> Vec<Option<Block>> {
-    let mut single: Vec<Option<Option<Block>>> = vec![None; func.blocks.len()];
-    for block in 0..func.blocks.len() as u32 {
-        for target in func.successors(Block(block)) {
-            let slot = &mut single[target.index()];
-            *slot = match slot {
-                None => Some(Some(Block(block))),
-                Some(_) => Some(None),
-            };
-        }
-    }
-    if let Some(entry) = func.entry {
-        single[entry.index()] = Some(None);
-    }
-    single.into_iter().map(Option::flatten).collect()
-}
-
 /// Settles the compares, traps and branches that the facts on entry to each block and its earlier instructions decide: a settled compare's result becomes a constant in `consts`, a trap that cannot fire goes, and a settled branch becomes a jump. A block's facts on entry are its only predecessor's facts on exit plus that edge's branch. Returns whether anything changed.
 pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [Option<i64>]) -> bool {
     let Some(entry) = func.entry else { return false };
-    let (single, (order, _, idom)) = (single_preds(func), crate::dom::dominators(func, entry));
+    let cfg = Cfg::new(func);
+    let single: Vec<Option<Block>> = (0..func.blocks.len()).map(|b| cfg.single_pred(Block(b as u32))).collect();
     let (mut decided, mut compares) = (Vec::new(), Vec::new());
     {
-        let ranges = Ranges::new(func, (defs, consts), (&order, &single, &idom));
+        let ranges = Ranges::new(func, (defs, consts), (&cfg.rpo, &single, &cfg.idom));
         let mut exits: Vec<Option<Path>> = vec![None; func.blocks.len()];
-        for &block in &order {
+        for &block in &cfg.rpo {
             let mut path = match single[block.index()].and_then(|pred| exits[pred.index()].as_ref().map(|exit| (pred, exit.clone()))) {
                 Some((pred, mut path)) => {
                     path.follow(func, &ranges, pred, block);
                     path
                 }
-                None if block != entry => idom[block.index()].and_then(|d| exits[d.index()].clone()).unwrap_or_default(),
+                None if block != entry => cfg.idom[block.index()].and_then(|d| exits[d.index()].clone()).unwrap_or_default(),
                 None => Path::default(),
             };
             for &inst in &func.blocks[block.index()].insts {

@@ -181,11 +181,16 @@ pub(crate) struct Asm {
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, Label)>,
     table_fixups: Vec<(u32, Label, Label)>,
+    binds: u32,
 }
 
 impl Asm {
     pub fn pos(&self) -> u32 {
         self.code.len() as u32
+    }
+
+    pub fn stamp(&self) -> (usize, u32) {
+        (self.code.len(), self.binds)
     }
 
     fn rex(&mut self, w: bool, r: u8, x: u8, b: u8, force: bool) {
@@ -348,38 +353,39 @@ impl Asm {
         self.encode(&[], false, &[op as u8 * 8 + 3], dst as u8, src.into(), false);
     }
 
-    fn alu_imm_width(&mut self, w: bool, op: Alu, dst: Reg, imm: i32) {
+    fn alu_imm_width(&mut self, w: bool, op: Alu, dst: Rm, imm: i32) {
         if let Ok(small) = i8::try_from(imm) {
-            self.encode(&[], w, &[0x83], op as u8, dst.into(), false);
+            self.encode(&[], w, &[0x83], op as u8, dst, false);
             self.code.push(small as u8);
         } else {
-            self.encode(&[], w, &[0x81], op as u8, dst.into(), false);
+            self.encode(&[], w, &[0x81], op as u8, dst, false);
             self.code.extend(imm.to_le_bytes());
         }
     }
 
-    pub fn alu_imm(&mut self, op: Alu, dst: Reg, imm: i32) {
-        self.alu_imm_width(true, op, dst, imm);
+    pub fn alu_imm(&mut self, op: Alu, dst: impl Into<Rm>, imm: i32) {
+        self.alu_imm_width(true, op, dst.into(), imm);
     }
 
-    pub fn alu_imm32(&mut self, op: Alu, dst: Reg, imm: i32) {
-        self.alu_imm_width(false, op, dst, imm);
+    pub fn alu_imm32(&mut self, op: Alu, dst: impl Into<Rm>, imm: i32) {
+        self.alu_imm_width(false, op, dst.into(), imm);
     }
 
     /// `dst op= imm` on the low `size` bytes of `dst`, with `imm` cut to that width.
-    pub fn alu_imm_sized(&mut self, size: Size, op: Alu, dst: Reg, imm: i32) {
+    pub fn alu_imm_sized(&mut self, size: Size, op: Alu, dst: impl Into<Rm>, imm: i32) {
+        let dst = dst.into();
         match size {
             Size::B => {
-                self.encode(&[], false, &[0x80], op as u8, dst.into(), true);
+                self.encode(&[], false, &[0x80], op as u8, dst, matches!(dst, Rm::Reg(_)));
                 self.code.push(imm as u8);
             }
             Size::W => match i8::try_from(imm as i16) {
                 Ok(small) => {
-                    self.encode(&[0x66], false, &[0x83], op as u8, dst.into(), false);
+                    self.encode(&[0x66], false, &[0x83], op as u8, dst, false);
                     self.code.push(small as u8);
                 }
                 Err(_) => {
-                    self.encode(&[0x66], false, &[0x81], op as u8, dst.into(), false);
+                    self.encode(&[0x66], false, &[0x81], op as u8, dst, false);
                     self.code.extend((imm as u16).to_le_bytes());
                 }
             },
@@ -499,6 +505,33 @@ impl Asm {
         self.encode(&[prefix], true, &[0x0F, opcode], r, rm.into(), false);
     }
 
+    pub fn sse_imm(&mut self, prefix: &[u8], opcode: &[u8], r: u8, rm: impl Into<Rm>, imm: u8) {
+        self.encode(prefix, false, opcode, r, rm.into(), false);
+        self.code.push(imm);
+    }
+
+    pub fn sse_wide_imm(&mut self, prefix: &[u8], opcode: &[u8], r: u8, rm: impl Into<Rm>, imm: u8) {
+        self.encode(prefix, true, opcode, r, rm.into(), false);
+        self.code.push(imm);
+    }
+
+    pub fn pshift_imm(&mut self, ext: u8, lane_bytes: u32, dst: Xmm, imm: u8) {
+        let opcode = match lane_bytes {
+            2 => 0x71,
+            4 => 0x72,
+            _ => 0x73,
+        };
+        self.sse_imm(&[0x66], &[0x0F, opcode], ext, dst, imm);
+    }
+
+    pub fn movd_in(&mut self, xmm: Xmm, reg: Reg) {
+        self.encode(&[0x66], false, &[0x0F, 0x6E], xmm.0, reg.into(), false);
+    }
+
+    pub fn movd_out(&mut self, reg: Reg, xmm: Xmm) {
+        self.encode(&[0x66], false, &[0x0F, 0x7E], xmm.0, reg.into(), false);
+    }
+
     /// The three-operand VEX form `dst = src op rm` of the scalar SSE operation `opcode`, where `prefix` is 0xF2 for doubles and 0xF3 for singles.
     pub fn vex_scalar(&mut self, prefix: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>) {
         let rm = rm.into();
@@ -573,6 +606,7 @@ impl Asm {
 
     pub fn bind(&mut self, label: Label) {
         self.labels[label.0 as usize] = Some(self.pos());
+        self.binds = self.binds.wrapping_add(1);
     }
 
     fn fixup(&mut self, label: Label) {

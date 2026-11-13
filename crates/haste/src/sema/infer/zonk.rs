@@ -130,6 +130,16 @@ impl Infer<'_, '_> {
     }
 
     fn settle_all(&mut self) -> Result<()> {
+        self.settle_initial_passes()?;
+        self.settle_final_passes()?;
+        if let Some((of, substs)) = self.obligations.first() {
+            let ty = self.show(substs[0]);
+            anyhow::bail!("the trait bound `{ty}: {}` is not satisfied", self.cx.name(*of));
+        }
+        Ok(())
+    }
+
+    fn settle_initial_passes(&mut self) -> Result<()> {
         self.settle_projections()?;
         self.settle_obligations()?;
         self.settle_projections()?;
@@ -137,20 +147,36 @@ impl Infer<'_, '_> {
         self.settle_awaits()?;
         self.settle_operators(false)?;
         self.settle_obligations()?;
-        self.settle_casts()?;
+        self.settle_casts()
+    }
+
+    fn settle_final_passes(&mut self) -> Result<()> {
         self.fall_back_numbers()?;
+        self.fall_back_diverging()?;
         self.fall_back_residuals()?;
         self.settle_obligations()?;
         self.settle_operators(true)?;
-        self.settle_projections()?;
-        if self.poly.is_some() {
+        for _ in 0..crate::RECURSION_LIMIT {
+            let before = (self.projections.len(), self.obligations.len(), self.bound_vars());
+            self.settle_projections()?;
             self.settle_obligations()?;
+            let stalled = self.projections.len() >= before.0
+                && self.obligations.len() >= before.1
+                && self.bound_vars() == before.2;
+            if self.obligations.is_empty() || stalled {
+                break;
+            }
         }
         self.settle_captures()
     }
 
+    fn bound_vars(&self) -> usize {
+        self.vars.iter().filter(|slot| slot.is_some()).count()
+    }
+
     pub(super) fn finish(mut self) -> Result<Typed> {
         self.settle_all()?;
+        self.ensure_no_type_vars()?;
         self.pack_typed()
     }
 
@@ -322,6 +348,198 @@ impl Infer<'_, '_> {
         Ok(Tried { branch: self.zonk_res(each.branch)?, from_residual: self.zonk_res(each.from_residual)?, flow: self.zonk(each.flow), ..each })
     }
 
+    pub(super) fn settle_obligations(&mut self) -> Result<()> {
+        let limit = self.obligations.len().saturating_add(crate::RECURSION_LIMIT);
+        let mut steps = 0;
+        let mut at = 0;
+        while at < self.obligations.len() && steps < limit {
+            steps += 1;
+            let (of, substs) = self.obligations[at].clone();
+            if self.step_obligation(of, &substs)? {
+                self.obligations.swap_remove(at);
+            } else {
+                at += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn step_obligation(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
+        let self_ty = self.resolve(substs[0]);
+        if let Some(done) = self.step_var_obligation(of, self_ty, substs)? {
+            return Ok(done);
+        }
+        let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
+        let closed_key = (!self.has_vars(self_ty) && known).then(|| self.closed_obligation_key(of, substs));
+        if closed_key.is_some_and(|key| self.proved.contains(&key)) {
+            return Ok(true);
+        }
+        if self.poly.is_some() && closed_key.is_some() && self.any_has_params(substs) {
+            return self.poly_settle_obligation(of, self_ty, &substs[1..]);
+        }
+        let done = ((!known || self.any_has_params(substs)) && self.assume(of, substs)?)
+            || self.settled_by_impl(of, self_ty, &substs[1..])?;
+        if done && self.trail_depth == 0 && let Some(key) = closed_key {
+            self.proved.insert(key);
+        }
+        Ok(done)
+    }
+
+    fn closed_obligation_key(&mut self, of: ItemRef, substs: &[Ty]) -> (ItemRef, Substs) {
+        let resolved: Vec<Ty> = substs.iter().map(|&ty| self.substitute(ty)).collect();
+        (of, self.cx.types.intern_substs(&resolved))
+    }
+
+    fn step_var_obligation(&mut self, of: ItemRef, self_ty: Ty, substs: &[Ty]) -> Result<Option<bool>> {
+        match self.cx.types.kind(self_ty) {
+            Kind::Var(_) => {
+                let held = self.opaque_holds(of, substs)?;
+                Ok(Some(held == Some(true) || (held.is_none() && self.callable_opaque_holds(of, self_ty, &substs[1..])?)))
+            }
+            Kind::IntVar(_) | Kind::FloatVar(_) => Ok(Some(self.opaque_holds(of, substs)? == Some(true) || self.settled_num_var(of, self_ty, &substs[1..])?)),
+            _ => Ok(None),
+        }
+    }
+
+    fn settled_num_var(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
+        let settled = self.trial(|infer| {
+            Ok(infer
+                .select(of, self_ty, args)?
+                .filter(|_| !infer.has_vars(self_ty))
+                .map(|_| ()))
+        })?;
+        Ok(settled.is_some())
+    }
+
+    fn settled_by_impl(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
+        Ok(self.builtin_obligation_holds(of, self_ty, args)? || self.select(of, self_ty, args)?.is_some())
+    }
+
+    fn builtin_obligation_holds(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
+        if !self.has_vars(self_ty) {
+            if self.compiler_decides(of, self_ty) {
+                return Ok(self.compiler_holds(of, self_ty));
+            }
+            if self.compiler_impl(of, self_ty)
+                || matches!(self.cx.lang(of), Some("discriminant_kind" | "bikeshed_guaranteed_no_drop"))
+                || self.object_holds(of, self_ty, args) == Some(true)
+            {
+                return Ok(true);
+            }
+        }
+        self.callable_obligation_holds(of, self_ty, args)
+    }
+
+    fn callable_obligation_holds(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
+        if !self.is_callable_trait(of) {
+            return Ok(false);
+        }
+        if !matches!(self.cx.types.kind(self.resolve(self_ty)), Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
+            return Ok(false);
+        }
+        let Some((params, _)) = self.callable_sig(self_ty)? else { return Ok(false) };
+        let expected = self.cx.types.tuple(&params);
+        let Some(&actual) = args.first() else { return Ok(false) };
+        let mark = self.mark_vars();
+        if self.unifies(expected, actual) {
+            self.commit_vars(mark);
+            return Ok(true);
+        }
+        self.rollback_vars(mark);
+        Ok(false)
+    }
+
+    fn fall_back_diverging(&mut self) -> Result<()> {
+        let unit = self.cx.types.unit();
+        for index in 0..self.var_diverges.len() {
+            if self.var_diverges[index] && index < self.vars.len() && self.vars[index].is_none() {
+                let var = self.cx.types.intern(Kind::Var(index as u32));
+                self.unify(var, unit)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_no_type_vars(&self) -> Result<()> {
+        let mut seen = HashSet::default();
+        let tys = self
+            .out
+            .exprs
+            .iter()
+            .copied()
+            .filter(|&ty| ty != Ty::NONE)
+            .chain(self.out.locals.iter().map(|local| local.ty))
+            .chain(self.out.closures.values().map(|closure| closure.ret))
+            .chain(self.out.pats.values().copied())
+            .chain(self.out.ret);
+        for ty in tys {
+            self.check_no_type_vars(ty, &mut seen)?;
+        }
+        self.ensure_no_table_vars(&mut seen)
+    }
+
+    fn ensure_no_table_vars(&self, seen: &mut HashSet<Ty>) -> Result<()> {
+        for map in [&self.out.res, &self.out.operators, &self.out.try_blocks, &self.out.box_frees] {
+            for res in map.values() {
+                self.check_res_vars(res, seen)?;
+            }
+        }
+        for res in self.out.pat_res.values().chain(self.out.derefs.values()) {
+            self.check_res_vars(res, seen)?;
+        }
+        self.ensure_no_flow_vars(seen)
+    }
+
+    fn ensure_no_flow_vars(&self, seen: &mut HashSet<Ty>) -> Result<()> {
+        for each in self.out.fors.values() {
+            self.check_res_vars(&each.into_iter, seen)?;
+            self.check_res_vars(&each.next, seen)?;
+            self.check_no_type_vars(each.iter, seen)?;
+            self.check_no_type_vars(each.option, seen)?;
+        }
+        for each in self.out.awaits.values() {
+            self.check_res_vars(&each.into_future, seen)?;
+            self.check_res_vars(&each.poll, seen)?;
+            self.check_no_type_vars(each.future, seen)?;
+            self.check_no_type_vars(each.polled, seen)?;
+        }
+        for each in self.out.tries.values() {
+            self.check_res_vars(&each.branch, seen)?;
+            self.check_res_vars(&each.from_residual, seen)?;
+            self.check_no_type_vars(each.flow, seen)?;
+        }
+        Ok(())
+    }
+
+    fn check_no_type_vars(&self, ty: Ty, seen: &mut HashSet<Ty>) -> Result<()> {
+        let ty = self.resolve(ty);
+        if !seen.insert(ty) {
+            return Ok(());
+        }
+        match self.cx.types.kind(ty) {
+            Kind::Var(_) => anyhow::bail!("type annotations needed"),
+            kind => {
+                for child in kind.children(&self.cx.types) {
+                    self.check_no_type_vars(child, seen)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn check_res_vars(&self, res: &Res, seen: &mut HashSet<Ty>) -> Result<()> {
+        match res {
+            Res::Fn(_, substs) | Res::Ctor(_, _, substs) => {
+                for &ty in self.cx.types.substs(*substs) {
+                    self.check_no_type_vars(ty, seen)?;
+                }
+                Ok(())
+            }
+            Res::Const(ty) => self.check_no_type_vars(*ty, seen),
+            _ => Ok(()),
+        }
+    }
+
     pub(super) fn zonk_res(&mut self, res: Res) -> Result<Res> {
         match res {
             Res::Fn(item, substs) => {
@@ -333,4 +551,20 @@ impl Infer<'_, '_> {
             other => Ok(other),
         }
     }
+}
+
+/// Whether `item` is a non-generic synchronous `fn(i64) -> i64` suitable as a JIT test case.
+pub fn is_case_sig(cx: &mut Context<'_>, item: ItemRef) -> bool {
+    let Ok(sig) = cx.signature(item) else { return false };
+    if sig.params.len() != 1 || sig.ret.is_none() || sig.receiver.is_some() || sig.is_async || sig.variadic || sig.opaque || scope::type_params(&sig.generics).next().is_some() {
+        return false;
+    }
+    let i64_ty = cx.types.prim(Primitive::I64);
+    matches!(
+        detached(cx, item, |infer| {
+            let (params, ret) = infer.fn_types(item, &[])?;
+            Ok(params.as_slice() == [i64_ty] && infer.resolve(ret) == i64_ty)
+        }),
+        Ok(true)
+    )
 }

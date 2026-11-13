@@ -28,7 +28,7 @@ pub(super) fn uses_rsi(func: &Function, op: &Op) -> bool {
 impl Emit<'_> {
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
-            Op::Const(_) if result().is_ok_and(|result| self.ty(result) == Type::V128) => self.vector_zero(result()?),
+            Op::Const(_) if result().is_ok_and(|result| self.ty(result).is_vector()) => self.vector_zero(result()?),
             Op::Const(imm) => {
                 let result = result()?;
                 if !self.is_static(result) {
@@ -61,7 +61,7 @@ impl Emit<'_> {
                 self.put(result, dst);
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
-            Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Sha256Rounds(..) => self.vector_op(op, result()?)?,
+            Op::Shuffle(..) | Op::Extract(..) | Op::Insert(..) | Op::Reduce(..) | Op::TargetOp(..) => self.vector_op(op, result()?)?,
             _ => return self.access(op, result),
         }
         Ok(())
@@ -117,8 +117,8 @@ impl Emit<'_> {
 
     /// Copies `bytes` bytes between two ranges that are the same or disjoint: 16 at a time through xmm1, then word by word through rax; r11 and rcx hold addresses.
     fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
-        let source = self.address_in(from, 0, Reg::R11);
-        let target = self.address_in(to, 0, Reg::Rcx);
+        let source = self.address_in(from, 0, Reg::R11, Reg::Rax);
+        let target = self.address_in(to, 0, Reg::Rcx, Reg::Rax);
         let whole = bytes / VECTOR * VECTOR;
         for at in (0..whole).step_by(VECTOR as usize) {
             self.asm.sse(&[], &MOVUPS.0, X1.0, source.offset(at as i32));
@@ -214,10 +214,14 @@ impl Emit<'_> {
     }
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
+        if self.ty(condition).is_vector() {
+            self.vector_select(condition, x, y, result);
+            return;
+        }
         self.get(Reg::Rcx, condition, Ext::Zero);
         self.asm.test(Reg::Rcx, Reg::Rcx);
         let ty = self.ty(x);
-        if ty == Type::V128 || ty.is_float() {
+        if ty.in_float_register() {
             let done = self.asm.label();
             self.fget(Xmm(0), y);
             self.asm.jcc(Cond::E, done);

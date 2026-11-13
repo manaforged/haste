@@ -33,9 +33,6 @@ const DEBUG_BUDGET: Budget = Budget { insts: 30, always: 100, exprs: 20 };
 /// The budget of the release profile.
 const RELEASE_BUDGET: Budget = Budget { insts: 400, always: 1000, exprs: 400 };
 
-/// The release-profile instruction and expression limit at a call site carrying a static vtable.
-const DEVIRT_LIMIT: usize = 900;
-
 /// The budget of the build profile.
 fn budget() -> &'static Budget {
     match crate::profile() {
@@ -91,12 +88,24 @@ pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn supe
     resolve_inline(cx, (reached, slots), &mut super::Inline::default(), index, limit).is_ok_and(|(callee, _)| callee.is_some())
 }
 
-/// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
-pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
-    inline_limit_at(cx, reached, index, false)
+fn is_leaf_body(body: &crate::body::Body) -> bool {
+    !body.exprs.iter().any(|expr| matches!(expr, Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } | Expr::Await(..) | Expr::Yield(..)))
 }
 
-fn inline_limit_at(cx: &mut Context<'_>, reached: &Reached, index: usize, devirt: bool) -> Option<usize> {
+fn is_cold_or_never(cx: &Context<'_>, reached: &Reached, item: ItemRef, substs: Substs) -> bool {
+    if hint(cx, item) == Hint::Never {
+        return true;
+    }
+    reached
+        .index
+        .get(&(item, substs))
+        .and_then(|&idx| reached.list[idx].1.as_ref().ok())
+        .and_then(|callee| callee.ret)
+        .is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never))
+}
+
+/// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
+pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
     let ((item, _), Ok(typed)) = &reached.list[index] else {
         return None;
     };
@@ -104,7 +113,7 @@ fn inline_limit_at(cx: &mut Context<'_>, reached: &Reached, index: usize, devirt
         return None;
     }
     let hint = hint(cx, *item);
-    if hint != Hint::Always && typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
+    if hint == Hint::Never || typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
         return None;
     }
     let env = &cx.outline.crates[item.krate as usize].env;
@@ -113,20 +122,28 @@ fn inline_limit_at(cx: &mut Context<'_>, reached: &Reached, index: usize, devirt
     }
     let budget = budget();
     let release = crate::profile() == crate::outline::tree::Profile::Release;
-    let insts = if devirt && release { DEVIRT_LIMIT } else { budget.insts };
     if !matches!(typed.shape, Shape::Body) {
-        return Some(insts);
+        return Some(budget.insts);
+    }
+    let Ok(body) = cx.body(*item) else {
+        return None;
+    };
+    if hint != Hint::Always {
+        let cold_calls = typed.calls().filter(|&(ci, cs)| is_cold_or_never(cx, reached, ci, cs)).take(3).count();
+        if cold_calls >= 3 || (cold_calls >= 2 && body.exprs.len() > 80) {
+            return None;
+        }
     }
     match hint {
         Hint::Never => None,
         Hint::Always => Some(budget.always),
         Hint::Inline => {
-            let max_exprs = if release || env.release { 2500 } else { 200 };
-            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(insts)
+            let max_exprs = if release || env.release { 800 } else { 200 };
+            (body.exprs.len() <= max_exprs).then_some(budget.insts)
         }
         Hint::Default => {
-            let max_exprs = if devirt && release { DEVIRT_LIMIT } else { budget.exprs };
-            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(insts)
+            let max_exprs = if release && is_leaf_body(&body) { budget.exprs * 2 } else { budget.exprs };
+            (body.exprs.len() <= max_exprs).then_some(budget.insts)
         }
     }
 }
@@ -362,8 +379,9 @@ impl Lower<'_, '_> {
 
     pub(super) fn args(&mut self, args: List, mut values: Vec<Value>) -> Result<Vec<Value>> {
         for arg in self.body.list(args).to_vec() {
-            if !self.typed.const_args.contains(&ExprId(arg)) {
-                values.extend(self.expr(ExprId(arg))?);
+            let expr = ExprId(arg);
+            if !self.typed.const_args.contains(&expr) {
+                values.extend(self.eval_operand(expr)?);
             }
         }
         Ok(values)
@@ -387,8 +405,8 @@ impl Lower<'_, '_> {
         self.call_with(Callee::Reached(index, origin), (params, callee.ret), values)
     }
 
-    fn inline_callee(&mut self, index: usize, devirt: bool) -> Result<Option<Arc<InlinedCallee>>> {
-        let Some(limit) = inline_limit_at(self.cx, self.reached, index, devirt) else {
+    fn inline_callee(&mut self, index: usize) -> Result<Option<Arc<InlinedCallee>>> {
+        let Some(limit) = inline_limit(self.cx, self.reached, index) else {
             return Ok(None);
         };
         let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, limit)?;
@@ -415,10 +433,9 @@ impl Lower<'_, '_> {
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
     fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
-        let devirt = self.b.func.has_vtable_slots();
         let code = match callee {
             Callee::Code(code) => code,
-            Callee::Reached(index, origin) => match if self.slots.allow_inline() { self.inline_callee(index, devirt)? } else { None } {
+            Callee::Reached(index, origin) => match if self.slots.allow_inline() { self.inline_callee(index)? } else { None } {
                 Some(inlined) => return self.emit_inlined(&inlined, origin, values),
                 None => self.code_of(index, origin),
             },
@@ -594,6 +611,7 @@ impl Lower<'_, '_> {
         self.brif(test, (then_block, &[]), (else_block, &[]));
         self.enter(then_block);
         let value = self.expr(then)?;
+        let value = self.snapshot_before_drops(mark, then, value)?;
         if self.open {
             self.drop_to(mark)?;
         }
@@ -673,11 +691,14 @@ impl Lower<'_, '_> {
     }
 
     fn break_expr(&mut self, label: Option<u32>, value: Option<ExprId>) -> Result<Option<Value>> {
+        let Some(Loop { exit, value: slot, depth, .. }) = self.jump_target(label) else { bail!("`break` outside a loop") };
         let value = match value {
-            Some(value) => self.expr(value)?,
+            Some(expr) => {
+                let value = self.expr(expr)?;
+                self.snapshot_before_drops(depth, expr, value)?
+            }
             None => None,
         };
-        let Some(Loop { exit, value: slot, depth, .. }) = self.jump_target(label) else { bail!("`break` outside a loop") };
         if let (Some(value), Some(place)) = (value, slot) {
             self.write(place, value);
         }

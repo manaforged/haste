@@ -68,7 +68,7 @@ impl Lower<'_, '_> {
         Ok(by_value && self.cx.boxed(self.ty_of(operand)).is_some() && needs_drop(self.cx, self.ty_of(init))?)
     }
 
-    fn is_place(&self, expr: ExprId) -> bool {
+    pub(super) fn is_place(&self, expr: ExprId) -> bool {
         if let Some(inner) = self.transparent(expr) {
             return self.is_place(inner);
         }
@@ -80,6 +80,18 @@ impl Lower<'_, '_> {
             },
             Expr::Field(..) | Expr::TupleField(..) | Expr::Index(..) | Expr::Unary(UnOp::Deref, _) => true,
             _ => false,
+        }
+    }
+
+    /// Whether `expr` can evaluate to a memory address aliasing mutable or reassigned storage.
+    pub(super) fn may_alias_place(&self, expr: ExprId) -> bool {
+        if let Some(inner) = self.transparent(expr) {
+            return self.may_alias_place(inner);
+        }
+        match *self.body.expr(expr) {
+            Expr::Block { label: Some(_), .. } | Expr::If(..) | Expr::Match(..) | Expr::Loop { .. } => true,
+            Expr::Block { tail: Some(tail), .. } => self.may_alias_place(tail),
+            _ => self.is_place(expr),
         }
     }
 

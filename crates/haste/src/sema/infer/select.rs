@@ -90,10 +90,15 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
-        let found = self.applicable(of, self_ty, args, depth)?;
-        let Ok([(picked, vars)]) = <[_; 1]>::try_from(found) else {
+        let query = self.query(of, self_ty, args);
+        if self.selecting.contains(&query) {
+            self.cycle_hits += 1;
             return Ok(None);
-        };
+        }
+        self.selecting.push(query);
+        let found = self.applicable(of, self_ty, args, depth);
+        self.selecting.pop();
+        let Ok([(picked, vars)]) = <[_; 1]>::try_from(found?) else { return Ok(None) };
         self.adopt(vars);
         Ok(Some(picked))
     }

@@ -46,6 +46,7 @@ impl Lower<'_, '_> {
             }
             self.commit_moves()?;
             let value = self.expr(arm.body)?;
+            let value = self.snapshot_before_drops(mark, arm.body, value)?;
             self.end_scope(mark)?;
             self.branch_into(value, (join, slot));
             self.enter(next);
@@ -159,12 +160,9 @@ impl Lower<'_, '_> {
         let Variants::Multiple { tag, tag_encoding: TagEncoding::Direct, tag_field, .. } = &layout.variants else {
             return Ok(Some(Hoisted { derefs, peeled: Some(peeled), tag: None }));
         };
-        let tag_ty = match tag.size(crate::sema::layout::target()?).bytes() {
-            1 => Type::I8,
-            2 => Type::I16,
-            4 => Type::I32,
-            8 => Type::I64,
-            _ => return Ok(Some(Hoisted { derefs, peeled: Some(peeled), tag: None })),
+        let bytes = tag.size(crate::sema::layout::target()?).bytes();
+        let Ok(tag_ty) = super::adt::tag_type(bytes) else {
+            return Ok(Some(Hoisted { derefs, peeled: Some(peeled), tag: None }));
         };
         let offset = layout.fields.offset(tag_field.index()).bytes() as i32;
         let Some(val) = self.read(peeled.at(offset, Repr::Scalar(tag_ty))) else {

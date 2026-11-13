@@ -109,7 +109,9 @@ pub struct Infer<'c, 'a> {
     block: Option<super::impls::ImplRef>,
     frame_item: Option<ItemRef>,
     vars: Vec<Option<Ty>>,
+    var_diverges: Vec<bool>,
     var_trail: Vec<(u32, Option<Ty>)>,
+    diverge_trail: Vec<(u32, u32)>,
     trail_depth: u32,
     metadata: Vec<(Ty, Ty)>,
     obligations: Vec<(ItemRef, Vec<Ty>)>,
@@ -136,6 +138,7 @@ pub struct Infer<'c, 'a> {
     cycle_hits: u32,
     frames: usize,
     evaluating: Vec<ItemRef>,
+    proved: rustc_hash::FxHashSet<(ItemRef, Substs)>,
     imports: HashMap<(ItemRef, Option<crate::names::Sym>, Vec<u32>), Vec<crate::names::PerNs>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
 }
@@ -247,7 +250,9 @@ impl<'c, 'a> Infer<'c, 'a> {
             block: None,
             frame_item: None,
             vars,
+            var_diverges: Vec::new(),
             var_trail: Vec::new(),
+            diverge_trail: Vec::new(),
             trail_depth: 0,
             metadata,
             obligations,
@@ -274,6 +279,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             cycle_hits: 0,
             frames: 0,
             evaluating: Vec::new(),
+            proved: rustc_hash::FxHashSet::default(),
             imports: HashMap::default(),
             poly: None,
         }
@@ -402,11 +408,28 @@ impl Infer<'_, '_> {
                 self.vars[index as usize] = prev;
             }
         }
+        while self.diverge_trail.last().is_some_and(|&(depth, _)| depth >= self.trail_depth) {
+            if let Some((_, index)) = self.diverge_trail.pop()
+                && (index as usize) < vars_len
+                && (index as usize) < self.var_diverges.len()
+            {
+                self.var_diverges[index as usize] = false;
+            }
+        }
         self.vars.truncate(vars_len);
+        self.var_diverges.truncate(vars_len);
         self.trail_depth -= 1;
     }
 
     pub(super) fn commit_vars(&mut self, (_, trail_len): (usize, usize)) {
+        for (depth, _) in &mut self.diverge_trail {
+            if *depth >= self.trail_depth {
+                *depth = self.trail_depth - 1;
+            }
+        }
+        if self.trail_depth == 1 {
+            self.diverge_trail.clear();
+        }
         self.trail_depth -= 1;
         if self.trail_depth == 0 {
             self.var_trail.truncate(trail_len);
@@ -415,7 +438,21 @@ impl Infer<'_, '_> {
 
     fn fresh(&mut self, kind: fn(u32) -> Kind) -> Ty {
         self.vars.push(None);
+        self.var_diverges.push(false);
         self.cx.types.intern(kind(self.vars.len() as u32 - 1))
+    }
+
+    fn set_diverging(&mut self, index: usize) {
+        if self.var_diverges.len() <= index {
+            self.var_diverges.resize(self.vars.len().max(index + 1), false);
+        }
+        if self.var_diverges[index] {
+            return;
+        }
+        if self.trail_depth > 0 {
+            self.diverge_trail.push((self.trail_depth, index as u32));
+        }
+        self.var_diverges[index] = true;
     }
 
     fn var_of(&self, ty: Ty) -> Option<u32> {
@@ -452,6 +489,11 @@ impl Infer<'_, '_> {
             return Err(Clash { a: var, b: to, cycle: true });
         }
         self.set_var(index, Some(to));
+        if self.var_diverges.get(index).copied().unwrap_or(false)
+            && let Some(target) = self.var_of(to)
+        {
+            self.set_diverging(target as usize);
+        }
         Ok(())
     }
 
@@ -527,7 +569,12 @@ impl Infer<'_, '_> {
     pub fn coerce(&mut self, found: Ty, expected: Ty) -> Result<()> {
         let (found, expected) = (self.resolve(found), self.resolve(expected));
         match (self.cx.types.kind(found), self.weakened(found, expected)) {
-            (Kind::Never, _) => Ok(()),
+            (Kind::Never, _) => {
+                if let Kind::Var(index) = self.cx.types.kind(expected) {
+                    self.set_diverging(*index as usize);
+                }
+                Ok(())
+            }
             (_, Some((a, b))) => self.unify(a, b),
             _ => self.unify(found, expected),
         }?;
@@ -543,7 +590,7 @@ impl Infer<'_, '_> {
     }
 
     fn settle_pending(&mut self) -> Result<()> {
-        loop {
+        for _ in 0..crate::RECURSION_LIMIT {
             let before = self.backlog();
             self.settle_metadata()?;
             self.settle_projections()?;
@@ -554,6 +601,7 @@ impl Infer<'_, '_> {
                 return Ok(());
             }
         }
+        Ok(())
     }
 
     pub(super) fn backlog(&self) -> usize {
@@ -604,40 +652,6 @@ impl Infer<'_, '_> {
 
     pub(super) fn known(&self, expected: Option<Ty>) -> Option<Ty> {
         expected.filter(|ty| !matches!(self.cx.types.kind(self.resolve(*ty)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)))
-    }
-
-    pub(super) fn settle_obligations(&mut self) -> Result<()> {
-        let mut at = 0;
-        while at < self.obligations.len() {
-            let (of, substs) = self.obligations[at].clone();
-            if self.step_obligation(of, &substs)? {
-                self.obligations.swap_remove(at);
-            } else {
-                at += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn step_obligation(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
-        let self_ty = self.resolve(substs[0]);
-        match self.cx.types.kind(self_ty) {
-            Kind::Var(_) => {
-                let held = self.opaque_holds(of, substs)?;
-                return Ok(held == Some(true) || (held.is_none() && self.callable_opaque_holds(of, self_ty, &substs[1..])?));
-            }
-            Kind::IntVar(_) | Kind::FloatVar(_) => return Ok(self.opaque_holds(of, substs)? == Some(true) || self.settled_by_impl(of, self_ty, &substs[1..])?),
-            _ => {}
-        }
-        let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
-        if self.poly.is_some() && !self.has_vars(self_ty) && known && self.any_has_params(substs) {
-            return self.poly_settle_obligation(of, self_ty, &substs[1..]);
-        }
-        Ok((!known && self.assume(of, substs)?) || self.settled_by_impl(of, self_ty, &substs[1..])? || known)
-    }
-
-    fn settled_by_impl(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
-        Ok(self.select(of, self_ty, args)?.is_some() && !self.has_vars(self_ty))
     }
 
     pub(super) fn assume(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
@@ -715,6 +729,8 @@ pub fn discriminants(cx: &mut Context<'_>, item: ItemRef, primitive: Primitive) 
     detached(cx, item, |infer| infer.discriminants(item, primitive))
 }
 
+pub use zonk::is_case_sig;
+
 /// The return type of the non-generic function `item`.
 pub fn return_type(cx: &mut Context<'_>, item: ItemRef) -> Result<Ty> {
     detached(cx, item, |infer| Ok(infer.fn_types(item, &[])?.1))
@@ -745,7 +761,9 @@ pub(super) fn detached_summary<T>(cx: &mut Context<'_>, item: ItemRef, run: impl
         outputs: Default::default(),
         origins: crate::outline::source::Origins::Read,
     });
-    let home = ModRef { krate: item.krate, module: 0 };
+    let home = cx.module_of(item).unwrap_or(ModRef { krate: item.krate, module: 0 });
     let mut infer = Infer::start(cx, (body, sig, src), home);
+    infer.root = item.declaring_body();
+    infer.frame_item = Some(item);
     run(&mut infer)
 }

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{IntCC, Type, Value};
+use haste_codegen::{Arch, IntCC, Lane, ReduceOp, Target, Type, Value};
 
 use crate::body::BinOp;
 use crate::host::{HostSymbol, MathSymbol};
@@ -8,16 +8,19 @@ use crate::sema::ty::Ty;
 
 use super::super::Lower;
 use super::super::ops::Num;
-use super::Lanes;
+use super::{Lanes, vec_type};
 
 impl Lower<'_, '_> {
-    /// Emits the SIMD intrinsic `op` that has no operator of its own one lane at a time, or none when `op` is not one of them.
+    /// Emits the SIMD intrinsic `op` that has no operator of its own, using `Type::Vec` ops where supported.
     pub(super) fn lane_intrinsic(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let Some(&vector) = substs.first() else { bail!("a SIMD intrinsic with no vector") };
+        if let Some(value) = self.vec_lane_intrinsic(op, vector, args)? {
+            return Ok(Some(value));
+        }
         Ok(Some(match (op, args) {
-            (Simd::Unary(unary), &[x]) => self.lane_map(vector, &[x], |lower, num, lanes| lower.lane_unary(unary, num, lanes[0]))?,
-            (Simd::Pair(pair), &[x, y]) => self.lane_map(vector, &[x, y], |lower, num, lanes| lower.lane_pair(pair, num, (lanes[0], lanes[1])))?,
-            (Simd::Fma, &[x, y, z]) => self.lane_map(vector, &[x, y, z], |lower, num, lanes| lower.lane_fma(num, lanes))?,
+            (Simd::Unary(unary), &[x]) => self.scalar_map(vector, &[x], |lower, num, lanes| lower.lane_unary(unary, num, lanes[0]))?,
+            (Simd::Pair(pair), &[x, y]) => self.scalar_map(vector, &[x, y], |lower, num, lanes| lower.lane_pair(pair, num, (lanes[0], lanes[1])))?,
+            (Simd::Fma, &[x, y, z]) => self.scalar_map(vector, &[x, y, z], |lower, num, lanes| lower.lane_fma(num, lanes))?,
             (Simd::Sum { mul }, &[x, ref start @ ..]) => self.lane_sum(vector, x, (start.first().copied(), mul))?,
             (Simd::MaskedLoad, &[mask, pointer, fallback]) => self.masked(substs, mask, pointer, Some(fallback))?,
             (Simd::MaskedStore, &[mask, pointer, values]) => {
@@ -29,8 +32,51 @@ impl Lower<'_, '_> {
         }))
     }
 
-    /// The vector of type `vector` whose lane `i` is `each` of lane `i` of every vector in `inputs`.
-    fn lane_map(&mut self, vector: Ty, inputs: &[Value], mut each: impl FnMut(&mut Self, Num, &[Value]) -> Result<Value>) -> Result<Value> {
+    fn vec_lane_intrinsic(&mut self, op: Simd, vector: Ty, args: &[Value]) -> Result<Option<Value>> {
+        let lanes = self.lanes(vector)?;
+        let Some(vec_ty) = vec_type(&lanes) else { return Ok(None) };
+        let arm64 = Target::host().arch == Arch::Arm64;
+        match (op, args) {
+            (Simd::Unary(unary), &[x]) => {
+                let v = self.ins().load(vec_ty, x, 0);
+                let out = match (unary, lanes.num) {
+                    (LaneUnary::Neg, Num::Float(_)) => self.ins().fneg(v),
+                    (LaneUnary::Neg, Num::Int { .. }) => self.ins().ineg(v),
+                    (LaneUnary::Fabs, Num::Float(_)) => self.ins().fabs(v),
+                    (LaneUnary::Floor, Num::Float(_)) => self.ins().floor(v),
+                    (LaneUnary::Ceil, Num::Float(_)) => self.ins().ceil(v),
+                    (LaneUnary::Ctpop, Num::Int { .. }) if arm64 => self.ins().popcnt(v),
+                    (LaneUnary::Ctlz, Num::Int { .. }) if arm64 => self.ins().clz(v),
+                    (LaneUnary::Ctpop | LaneUnary::Ctlz, Num::Int { .. }) => return Ok(None),
+                    _ => bail!("SIMD {unary:?} on an unsupported lane"),
+                };
+                Ok(Some(self.store_vec(out, vec_ty.bytes())))
+            }
+            (Simd::Pair(pair @ (LanePair::Min | LanePair::Max)), &[x, y]) => {
+                let (a, b) = (self.ins().load(vec_ty, x, 0), self.ins().load(vec_ty, y, 0));
+                let max = pair == LanePair::Max;
+                let out = match lanes.num {
+                    Num::Float(_) => if max { self.ins().fmax(a, b) } else { self.ins().fmin(a, b) },
+                    Num::Int { signed: true, .. } => if max { self.ins().smax(a, b) } else { self.ins().smin(a, b) },
+                    Num::Int { signed: false, .. } => if max { self.ins().umax(a, b) } else { self.ins().umin(a, b) },
+                    Num::Bool => bail!("SIMD {pair:?} on boolean lane"),
+                };
+                Ok(Some(self.store_vec(out, vec_ty.bytes())))
+            }
+            (Simd::Sum { mul: false }, &[x, ref start @ ..]) if vec_ty.lane().is_some_and(Lane::is_int) => {
+                let v = self.ins().load(vec_ty, x, 0);
+                let sum = self.ins().reduce(ReduceOp::Add, v);
+                let out = match start.first().copied() {
+                    Some(init) => self.lane_op(BinOp::Add, lanes.num, (init, sum), lanes.machine)?,
+                    None => sum,
+                };
+                Ok(Some(out))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn scalar_map(&mut self, vector: Ty, inputs: &[Value], mut each: impl FnMut(&mut Self, Num, &[Value]) -> Result<Value>) -> Result<Value> {
         let lanes = self.lanes(vector)?;
         let (slot, address) = self.vector_slot(vector)?;
         for lane in 0..lanes.count {
@@ -70,15 +116,8 @@ impl Lower<'_, '_> {
         match (op, num) {
             (LanePair::SaturatingAdd, Num::Int { ty, signed }) => self.saturating(BinOp::Add, (ty, signed), x, y),
             (LanePair::SaturatingSub, Num::Int { ty, signed }) => self.saturating(BinOp::Sub, (ty, signed), x, y),
-            (LanePair::Min | LanePair::Max, Num::Float(ty)) => {
-                let symbol = match (op, ty == Type::F32) {
-                    (LanePair::Min, true) => MathSymbol::Minnumf32,
-                    (LanePair::Min, false) => MathSymbol::Minnumf64,
-                    (_, true) => MathSymbol::Maxnumf32,
-                    (_, false) => MathSymbol::Maxnumf64,
-                };
-                self.call_host(HostSymbol::Math(symbol), &[x, y], Some(ty)).ok_or_else(|| anyhow::anyhow!("a float host call with no result"))
-            }
+            (LanePair::Min, Num::Float(_)) => Ok(self.ins().fmin(x, y)),
+            (LanePair::Max, Num::Float(_)) => Ok(self.ins().fmax(x, y)),
             (LanePair::Min | LanePair::Max, Num::Int { .. }) => {
                 let wins = self.apply(if op == LanePair::Min { BinOp::Lt } else { BinOp::Gt }, num, (x, y), num)?;
                 Ok(self.ins().select(wins, x, y))

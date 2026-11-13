@@ -70,7 +70,7 @@ pub struct Cache {
 #[derive(Default)]
 pub(super) struct OutlineState {
     pub(super) langs: RwLock<Option<traits::Langs>>,
-    pub(super) loaded: RwLock<Vec<[usize; 5]>>,
+    pub(super) loaded: RwLock<Vec<crate::outline::tree::CrateExtent>>,
     pub(super) primitives: RwLock<Option<Arc<[u32]>>>,
 }
 
@@ -112,82 +112,83 @@ pub enum Answer {
 }
 
 impl Lookups {
-    fn after_pass(&mut self, outline: &Outline, answer: Answer) -> Lookups {
-        if !matches!(answer, Answer::Names) {
-            return std::mem::take(self);
-        }
-        let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
-        let selections = self.selections.retained(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
-        let projections = self.projections.retained(|_, found| found.is_some());
-        Lookups {
-            modules: std::mem::take(&mut self.modules),
-            heads,
-            owners: std::mem::take(&mut self.owners),
-            trait_defs: std::mem::take(&mut self.trait_defs),
-            discriminants: std::mem::take(&mut self.discriminants),
-            state: Arc::clone(&self.state),
-            drops: std::mem::take(&mut self.drops),
-            glues: std::mem::take(&mut self.glues),
-            fields: std::mem::take(&mut self.fields),
-            forms: self.forms.retained(|_, found| found.is_some()),
-            futures: std::mem::take(&mut self.futures),
-            scope_traits: self.scope_traits.retained(|home, _| outline.is_sysroot(home.krate)),
-            impl_traits: std::mem::take(&mut self.impl_traits),
-            selections,
-            projections,
-            summaries: std::mem::take(&mut self.summaries),
-            has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
-            has_new_sysroot_instances: Arc::clone(&self.has_new_sysroot_instances),
-            substrate: self.substrate.clone(),
-            sysroot_index: Arc::clone(&self.sysroot_index),
-            skip_warm_sysroot_bodies: self.skip_warm_sysroot_bodies,
-            ..Lookups::default()
-        }
+    pub(super) fn check(&mut self, outline: &Outline) {
+        self.reconcile(outline, None);
     }
 
-    pub(super) fn check(&mut self, outline: &Outline) {
-        let loaded: Vec<[usize; 5]> = outline.crates.iter().map(crate::outline::tree::Crate::extent).collect();
+    pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
+        if matches!(answer, Some(Answer::Names)) {
+            let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
+            let selections = self.selections.retained(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
+            let projections = self.projections.retained(|_, found| found.is_some());
+            *self = Lookups {
+                modules: std::mem::take(&mut self.modules),
+                heads,
+                owners: std::mem::take(&mut self.owners),
+                trait_defs: std::mem::take(&mut self.trait_defs),
+                discriminants: std::mem::take(&mut self.discriminants),
+                state: Arc::clone(&self.state),
+                drops: std::mem::take(&mut self.drops),
+                glues: std::mem::take(&mut self.glues),
+                fields: std::mem::take(&mut self.fields),
+                forms: self.forms.retained(|_, found| found.is_some()),
+                futures: std::mem::take(&mut self.futures),
+                scope_traits: self.scope_traits.retained(|home, _| outline.is_sysroot(home.krate)),
+                impl_traits: std::mem::take(&mut self.impl_traits),
+                selections,
+                projections,
+                summaries: std::mem::take(&mut self.summaries),
+                has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
+                has_new_sysroot_instances: Arc::clone(&self.has_new_sysroot_instances),
+                substrate: self.substrate.clone(),
+                sysroot_index: Arc::clone(&self.sysroot_index),
+                skip_warm_sysroot_bodies: self.skip_warm_sysroot_bodies,
+                ..Lookups::default()
+            };
+        }
+        let loaded: Vec<crate::outline::tree::CrateExtent> = outline.crates.iter().map(crate::outline::tree::Crate::extent).collect();
         let mut guard = write_lock(&self.state.loaded);
-        if *guard != loaded {
-            let same_len = guard.len() == loaded.len();
-            let reset_sysroot = !same_len
-                || guard
-                    .iter()
-                    .zip(&loaded)
-                    .enumerate()
-                    .any(|(k, (a, b))| a != b && outline.is_sysroot(k as u32));
-            if same_len {
-                self.modules.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
-                self.owners.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
-                self.scope_traits.retain(|home, _| guard.get(home.krate as usize) == loaded.get(home.krate as usize));
-                self.heads.retain(|holder, _| match *holder {
-                    impls::Holder::Crate(k) => guard.get(k as usize) == loaded.get(k as usize),
-                    impls::Holder::Body(item) => guard.get(item.krate as usize) == loaded.get(item.krate as usize),
-                });
-                self.summaries.retain_keys(|item| guard.get(item.krate as usize) == loaded.get(item.krate as usize));
-                if guard.iter().zip(&loaded).any(|(a, b)| a[3] != b[3]) {
-                    self.discriminants.retain(|item, _| guard.get(item.krate as usize) == loaded.get(item.krate as usize));
-                    self.glues.clear();
-                }
-            } else {
-                self.modules.clear();
-                self.owners.clear();
-                self.scope_traits.clear();
-                self.heads.clear();
-                self.discriminants.clear();
-                self.summaries = table::Flight::default();
+        if *guard == loaded {
+            return;
+        }
+        let same_len = guard.len() == loaded.len();
+        let reset_sysroot = !same_len
+            || guard
+                .iter()
+                .zip(&loaded)
+                .enumerate()
+                .any(|(k, (a, b))| a != b && outline.is_sysroot(k as u32));
+        if same_len {
+            self.modules.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
+            self.owners.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
+            self.scope_traits.retain(|home, _| guard.get(home.krate as usize) == loaded.get(home.krate as usize));
+            self.heads.retain(|holder, _| match *holder {
+                impls::Holder::Crate(k) => guard.get(k as usize) == loaded.get(k as usize),
+                impls::Holder::Body(item) => guard.get(item.krate as usize) == loaded.get(item.krate as usize),
+            });
+            self.summaries.retain_keys(|item| guard.get(item.krate as usize) == loaded.get(item.krate as usize));
+            if guard.iter().zip(&loaded).any(|(a, b)| a.consumed != b.consumed) {
+                self.discriminants.retain(|item, _| guard.get(item.krate as usize) == loaded.get(item.krate as usize));
                 self.glues.clear();
             }
-            if reset_sysroot {
-                *write_lock(&self.state.langs) = None;
-                *write_lock(&self.state.primitives) = None;
-                self.sysroot_index = Arc::new(std::sync::OnceLock::new());
-            }
-            self.trait_calls.clear();
-            self.assoc_types.clear();
-            self.type_defs.clear();
-            *guard = loaded;
+        } else {
+            self.modules.clear();
+            self.owners.clear();
+            self.scope_traits.clear();
+            self.heads.clear();
+            self.discriminants.clear();
+            self.summaries = table::Flight::default();
+            self.glues.clear();
         }
+        if reset_sysroot {
+            *write_lock(&self.state.langs) = None;
+            *write_lock(&self.state.primitives) = None;
+            self.sysroot_index = Arc::new(std::sync::OnceLock::new());
+        }
+        self.trait_calls.clear();
+        self.assoc_types.clear();
+        self.type_defs.clear();
+        *guard = loaded;
     }
 }
 
@@ -250,7 +251,7 @@ impl Cache {
 
     /// Drops the cached lookups that `answer` may make stale, keeping settled summaries and unchanged crate indexes.
     pub fn forget_after(&mut self, outline: &Outline, answer: Answer) {
-        self.lookups = self.lookups.after_pass(outline, answer);
+        self.lookups.reconcile(outline, Some(answer));
     }
 
     /// Drops what the store keeps about the items that `edited` holds, and about the instances, types and lookups that name one of them.

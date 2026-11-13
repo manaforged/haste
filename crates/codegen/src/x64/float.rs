@@ -69,7 +69,7 @@ impl Emit<'_> {
     }
 
     /// Rounds the float in `dst` by `op` without SSE4.1: through a 64-bit integer below the magnitude where every float is whole, then the sign of the input, using rax, rcx, rdx, xmm1 and xmm2.
-    fn round_baseline(&mut self, op: Unary, ty: Type, dst: Xmm) {
+    pub(super) fn round_baseline(&mut self, op: Unary, ty: Type, dst: Xmm) {
         let (size, whole, one) = if ty == Type::F64 { (Size::Q, F64_WHOLE, F64_ONE) } else { (Size::D, F32_WHOLE, F32_ONE) };
         let done = self.asm.label();
         self.asm.movq_out(Reg::Rax, dst);
@@ -110,6 +110,21 @@ impl Emit<'_> {
             Binary::Fmul => 0x59,
             Binary::Fsub => 0x5C,
             Binary::Fdiv => 0x5E,
+            Binary::Fmin | Binary::Fmax => {
+                let opcode = if op == Binary::Fmin { 0x5D } else { 0x5F };
+                let dst = self.xmm_of(result).unwrap_or(X2);
+                self.fget(X0, x);
+                self.fget(X1, y);
+                self.asm.movaps(dst, X0);
+                self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, X1);
+                let done = self.asm.label();
+                self.ucomi(ty, X1, X1);
+                self.asm.jcc(Cond::Np, done);
+                self.asm.movaps(dst, X0);
+                self.asm.bind(done);
+                self.fput(result, dst);
+                return Ok(());
+            }
             Binary::Fcopysign => {
                 self.copysign(ty, x, y, result);
                 return Ok(());
@@ -119,7 +134,7 @@ impl Emit<'_> {
         let dst = self.fdst(result);
         match self.xmm_of(x).filter(|_| self.features.avx) {
             Some(src) => {
-                let source = self.foperand(y);
+                let source = self.foperand(y, X1);
                 self.asm.vex_scalar(scalar(ty), opcode, (dst, src), source);
             }
             None => {
@@ -127,7 +142,7 @@ impl Emit<'_> {
                     self.asm.movaps(X1, dst);
                     X1.into()
                 } else {
-                    self.foperand(y)
+                    self.foperand(y, X1)
                 };
                 self.fget(dst, x);
                 self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, source);
@@ -150,6 +165,10 @@ impl Emit<'_> {
 
     /// Compares by `ucomis`, the less-than forms with swapped operands; a compare fused with the next branch leaves its one condition in the flags.
     pub(super) fn fcmp(&mut self, cc: FloatCC, x: Value, y: Value, result: Value) {
+        if self.ty(x).is_vector() {
+            self.vector_fcmp(cc, x, y, result);
+            return;
+        }
         let (a, b, cond) = match cc {
             FloatCC::Equal => (x, y, Cond::E),
             FloatCC::NotEqual => (x, y, Cond::Ne),
@@ -159,7 +178,7 @@ impl Emit<'_> {
             FloatCC::GreaterThanOrEqual => (x, y, Cond::Ae),
         };
         let left = self.fin(a, X0);
-        let right = self.foperand(b);
+        let right = self.foperand(b, X1);
         self.ucomi(self.ty(x), left, right);
         if self.plan.fused[result.index()] {
             self.flags = Some((result, cond));
@@ -179,7 +198,7 @@ impl Emit<'_> {
         let to = self.ty(result);
         match op {
             Convert::Fpromote | Convert::Fdemote => {
-                let (dst, source) = (self.fdst(result), self.foperand(x));
+                let (dst, source) = (self.fdst(result), self.foperand(x, X1));
                 self.asm.sse(&[scalar(self.ty(x))], &[0x0F, 0x5A], dst.0, source);
                 self.fput(result, dst);
             }
@@ -204,7 +223,7 @@ impl Emit<'_> {
                 self.clamp(to, signed);
                 self.put(result, Reg::Rax);
             }
-            Convert::WidenVec64 | Convert::NarrowVec64 => {
+            Convert::Bitcast if to.in_float_register() && self.ty(x).in_float_register() => {
                 let dst = self.fdst(result);
                 let src = self.fin(x, dst);
                 if dst != src {
@@ -212,7 +231,7 @@ impl Emit<'_> {
                 }
                 self.fput(result, dst);
             }
-            Convert::Bitcast if to.is_float() => {
+            Convert::Bitcast if to.in_float_register() => {
                 let dst = self.fdst(result);
                 self.get(Reg::Rax, x, Ext::Zero);
                 self.asm.movq_in(dst, Reg::Rax);
@@ -254,7 +273,7 @@ impl Emit<'_> {
 
     fn widen_to_double(&mut self, x: Value) {
         if self.ty(x) == Type::F32 {
-            let source = self.foperand(x);
+            let source = self.foperand(x, X1);
             self.asm.sse(&[0xF3], &[0x0F, 0x5A], X0.0, source);
         } else {
             self.fget(X0, x);
@@ -262,7 +281,7 @@ impl Emit<'_> {
     }
 
     /// Converts the double in xmm0 to a saturated i64 in rax, with NaN as zero.
-    fn to_signed(&mut self) {
+    pub(super) fn to_signed(&mut self) {
         let (nan, done) = (self.asm.label(), self.asm.label());
         self.asm.sse_wide(0xF2, 0x2C, Reg::Rax as u8, X0);
         self.asm.alu_imm(Alu::Cmp, Reg::Rax, 1);
@@ -280,7 +299,7 @@ impl Emit<'_> {
     }
 
     /// Converts the double in xmm0 to a saturated u64 in rax, with NaN as zero.
-    fn to_unsigned(&mut self) {
+    pub(super) fn to_unsigned(&mut self) {
         let (positive, big, max, done) = (self.asm.label(), self.asm.label(), self.asm.label(), self.asm.label());
         self.zero_xmm(X1);
         self.ucomi(Type::F64, X0, X1);
@@ -308,7 +327,7 @@ impl Emit<'_> {
         self.asm.bind(done);
     }
 
-    fn clamp(&mut self, to: Type, signed: bool) {
+    pub(super) fn clamp(&mut self, to: Type, signed: bool) {
         let bits = to.bits();
         if bits >= 64 {
             return;

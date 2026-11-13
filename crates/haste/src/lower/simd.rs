@@ -1,42 +1,47 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, ByteCC, IntCC, StackSlot, Target, Type, Value, VectorOp};
+use haste_codegen::{Arch, FloatCC, IntCC, Lane, ReduceOp, StackSlot, Target, Type, Value};
 
-use crate::body::BinOp;
-use crate::host::{HostSymbol, X86Symbol};
+use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Lit};
+use crate::outline::item::ItemKind;
+use crate::outline::source::Source;
+use crate::sema::infer::{Res, SiteKey, parse_int};
 use crate::sema::intrinsic::Simd;
 use crate::sema::ty::{Kind, Ty};
 
 use super::ops::{Num, compare};
+use super::reloc::SiteOrigin;
 use super::{Lower, machine, repr};
 
 mod lanes;
+mod target;
 
-struct Lanes {
+pub(super) struct Lanes {
     num: Num,
     machine: Type,
     size: i32,
     count: i32,
 }
 
-/// The bytes of a vector the code generator holds in one register.
-const PACKED_BYTES: i32 = 16;
-
-impl Lanes {
-    /// Whether the vector is integer lanes that fill one 128-bit register.
-    fn is_packed(&self) -> bool {
-        self.size * self.count == PACKED_BYTES && matches!(self.num, Num::Int { .. })
+pub(super) fn vec_type(lanes: &Lanes) -> Option<Type> {
+    if !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+        return None;
     }
+    let lane = Lane::from_type(lanes.machine)?;
+    let count = u8::try_from(lanes.count).ok()?;
+    let ty = Type::Vec { lane, count };
+    ty.is_valid_vec().then_some(ty)
 }
 
 impl Lower<'_, '_> {
-    /// Emits the SIMD intrinsic `op` one lane at a time on vectors held in memory, as a scalar backend does.
-    pub(super) fn simd(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    /// Emits the SIMD intrinsic `op` using native `Type::Vec` operations when possible and scalarizing unsupported shapes.
+    pub(super) fn simd(&mut self, origin: &SiteOrigin, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&vector), Some(&first)) = (substs.first(), args.first()) else { bail!("a SIMD intrinsic with no vector") };
         let out = substs.get(1).copied();
-        if matches!(Target::host().arch, Arch::X64 | Arch::Arm64)
-            && let Some(value) = self.packed(op, (vector, out.unwrap_or(vector)), args)?
-        {
+        if let Some(value) = self.vec_simd(origin, op, (vector, out.unwrap_or(vector)), substs, args)? {
             return Ok(Some(value));
+        }
+        if matches!(op, Simd::Unary(_) | Simd::Pair(_) | Simd::Fma | Simd::Sum { .. } | Simd::MaskedLoad | Simd::MaskedStore) {
+            return self.lane_intrinsic(op, substs, args);
         }
         if let Some(value) = self.packed_swar64(op, (vector, out.unwrap_or(vector)), args)? {
             return Ok(Some(value));
@@ -49,88 +54,294 @@ impl Lower<'_, '_> {
             (Simd::Extreme { max }, _) => self.extreme(vector, first, max)?,
             (Simd::Fold(op), _) => self.fold(vector, first, op)?,
             (Simd::Sqrt, _) => self.lane_sqrt(vector, first)?,
-            (Simd::Unary(_) | Simd::Pair(_) | Simd::Fma | Simd::Sum { .. } | Simd::MaskedLoad | Simd::MaskedStore, _) => return self.lane_intrinsic(op, substs, args),
             _ => self.simd_lanes(op, substs, args)?,
         };
         Ok(Some(value))
     }
 
-    /// Emits `op` as one 128-bit vector operation when it is one the code generator has: a bitwise operation on a register of 8 or 16 integer bytes, or a splat, equality, signed order or bitmask.
-    fn packed(&mut self, op: Simd, (input, output): (Ty, Ty), args: &[Value]) -> Result<Option<Value>> {
+    pub(super) fn store_vec(&mut self, vec: Value, bytes: u32) -> Value {
+        let slot = self.b.create_stack_slot(bytes, if bytes <= 8 { 3 } else { 4 });
+        self.ins().stack_store(vec, slot, 0);
+        self.ins().stack_addr(Type::I64, slot, 0)
+    }
+
+    fn vec_simd(&mut self, origin: &SiteOrigin, op: Simd, (input, output): (Ty, Ty), substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let lanes = self.lanes(input)?;
-        let is_16 = lanes.is_packed();
-        let is_8 = lanes.size * lanes.count == 8 && matches!(lanes.num, Num::Int { .. });
-        if !is_16 && !is_8 {
+        if op == Simd::SelectBitmask {
             return Ok(None);
         }
-        let is_bytes = lanes.size == 1 && (lanes.count == PACKED_BYTES || lanes.count == 8);
-        let signed = matches!(lanes.num, Num::Int { signed: true, .. });
-        let load_vec = |lower: &mut Self, addr: Value| {
-            if is_8 {
-                let f = lower.ins().load(Type::F64, addr, 0);
-                lower.ins().widen_vec64(f)
-            } else {
-                lower.ins().load(Type::V128, addr, 0)
+        if op == Simd::Select {
+            return self.vec_select((input, output), args);
+        }
+        let Some(vec_ty) = vec_type(&lanes) else { return Ok(None) };
+        match (op, args) {
+            (Simd::Splat, &[x]) => {
+                let v = self.ins().splat(vec_ty, x);
+                Ok(Some(self.store_vec(v, vec_ty.bytes())))
             }
-        };
-        let vector = match (op, args) {
-            (Simd::Splat, &[x]) if is_bytes => self.ins().splat(x),
-            (Simd::Lanewise(bin @ (BinOp::Add | BinOp::Sub)), &[x, y]) if is_16 && input == output && lanes.size <= 8 => {
-                let (a, b) = (load_vec(self, x), load_vec(self, y));
-                self.ins().vector(lane_arithmetic(bin, lanes.size), a, b)
-            }
-            (Simd::Bitmask, &[x]) if is_16 && is_bytes => {
+            (Simd::Bitmask, &[x]) if vec_ty.lane().is_some_and(Lane::is_int) => {
                 let Some(target) = machine(self.cx, output)? else { return Ok(None) };
-                let loaded = load_vec(self, x);
-                let mask = self.ins().movemask(loaded);
-                return Ok(Some(self.resize(mask, (Type::I32, false), target)));
+                let v = self.ins().load(vec_ty, x, 0);
+                let mask = self.ins().reduce(ReduceOp::Movemask, v);
+                Ok(Some(self.resize(mask, (Type::I32, false), target)))
             }
-            (Simd::Lanewise(bin @ (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)), &[x, y]) if input == output => {
-                let (a, b) = (load_vec(self, x), load_vec(self, y));
-                match bin {
-                    BinOp::BitAnd => self.ins().band(a, b),
-                    BinOp::BitOr => self.ins().bor(a, b),
-                    _ => self.ins().bxor(a, b),
-                }
+            (Simd::Sqrt, &[x]) if vec_ty.lane().is_some_and(Lane::is_float) => {
+                let v = self.ins().load(vec_ty, x, 0);
+                let root = self.ins().sqrt(v);
+                Ok(Some(self.store_vec(root, vec_ty.bytes())))
             }
-            (Simd::Lanewise(cmp @ (BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le)), &[x, y])
-                if is_bytes
-                    && (matches!(cmp, BinOp::Eq | BinOp::Ne) || signed)
-                    && {
-                        let out = self.lanes(output)?;
-                        out.size == 1 && out.count == lanes.count && matches!(out.num, Num::Int { .. })
-                    } =>
-            {
-                let (a, b) = (load_vec(self, x), load_vec(self, y));
-                let invert = |v: Value, lower: &mut Self| {
-                    let ones = lower.ins().byte_cmp(ByteCC::Equal, a, a);
-                    lower.ins().bxor(v, ones)
+            (Simd::Reduce { all }, &[x]) if vec_ty.lane().is_some_and(Lane::is_int) => {
+                let v = self.ins().load(vec_ty, x, 0);
+                let zero = self.ins().iconst(vec_ty, 0);
+                let mask = self.ins().icmp(IntCC::NotEqual, v, zero);
+                let red = self.ins().reduce(if all { ReduceOp::And } else { ReduceOp::Or }, mask);
+                Ok(Some(self.ins().icmp_imm(IntCC::NotEqual, red, 0)))
+            }
+            (Simd::Fold(bin), &[x]) if vec_ty.lane().is_some_and(Lane::is_int) => {
+                let red = match bin {
+                    BinOp::BitAnd => ReduceOp::And,
+                    BinOp::BitOr => ReduceOp::Or,
+                    BinOp::BitXor => ReduceOp::Xor,
+                    _ => return Ok(None),
                 };
-                match cmp {
-                    BinOp::Eq => self.ins().byte_cmp(ByteCC::Equal, a, b),
-                    BinOp::Ne => {
-                        let eq = self.ins().byte_cmp(ByteCC::Equal, a, b);
-                        invert(eq, self)
-                    }
-                    BinOp::Gt => self.ins().byte_cmp(ByteCC::SignedGreaterThan, a, b),
-                    BinOp::Lt => self.ins().byte_cmp(ByteCC::SignedGreaterThan, b, a),
-                    BinOp::Ge => {
-                        let lt = self.ins().byte_cmp(ByteCC::SignedGreaterThan, b, a);
-                        invert(lt, self)
-                    }
-                    _ => {
-                        let gt = self.ins().byte_cmp(ByteCC::SignedGreaterThan, a, b);
-                        invert(gt, self)
-                    }
+                let v = self.ins().load(vec_ty, x, 0);
+                Ok(Some(self.ins().reduce(red, v)))
+            }
+            (Simd::Extreme { max }, &[x]) => {
+                let red = match (lanes.num, max) {
+                    (Num::Float(_), true) => ReduceOp::Fmax,
+                    (Num::Float(_), false) => ReduceOp::Fmin,
+                    (Num::Int { signed: true, .. }, true) => ReduceOp::Smax,
+                    (Num::Int { signed: true, .. }, false) => ReduceOp::Smin,
+                    (_, true) => ReduceOp::Umax,
+                    (_, false) => ReduceOp::Umin,
+                };
+                let v = self.ins().load(vec_ty, x, 0);
+                Ok(Some(self.ins().reduce(red, v)))
+            }
+            (Simd::Lanewise(bin), &[x, y]) => self.vec_lanewise(bin, (input, output), (&lanes, vec_ty), (x, y)),
+            (Simd::Cast, &[x]) => self.vec_cast((&lanes, vec_ty), output, x),
+            (Simd::Extract, &[x, _]) => {
+                let Some(idx) = self.const_arg_u8(origin, 1, lanes.count as u8) else { return Ok(None) };
+                let v = self.ins().load(vec_ty, x, 0);
+                Ok(Some(self.ins().extract(v, idx)))
+            }
+            (Simd::Insert, &[x, _, val]) => {
+                let Some(idx) = self.const_arg_u8(origin, 1, lanes.count as u8) else { return Ok(None) };
+                let v = self.ins().load(vec_ty, x, 0);
+                let out = self.ins().insert(v, val, idx);
+                Ok(Some(self.store_vec(out, vec_ty.bytes())))
+            }
+            (Simd::Shuffle, &[x, y, _]) => {
+                let Some(&out_ty) = substs.get(2) else { return Ok(None) };
+                let out_lanes = self.lanes(out_ty)?;
+                if vec_type(&out_lanes) != Some(vec_ty) {
+                    return Ok(None);
                 }
+                let Some(mask) = self.shuffle_const_mask(origin, lanes.count as usize) else { return Ok(None) };
+                let (a, b) = (self.ins().load(vec_ty, x, 0), self.ins().load(vec_ty, y, 0));
+                let res = self.ins().shuffle(a, b, mask);
+                Ok(Some(self.store_vec(res, vec_ty.bytes())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn vec_lanewise(&mut self, bin: BinOp, (input, output): (Ty, Ty), (from, vec_ty): (&Lanes, Type), (x, y): (Value, Value)) -> Result<Option<Value>> {
+        let to = self.lanes(output)?;
+        let Some(out_vec) = vec_type(&to) else { return Ok(None) };
+        if compare(bin).is_some() {
+            if out_vec.vec_shape().is_some_and(|(l, c)| l.is_int() && c == from.count as u8 && l.bytes() == from.size as u32) {
+                let (a, b) = (self.ins().load(vec_ty, x, 0), self.ins().load(vec_ty, y, 0));
+                let out = match from.num {
+                    Num::Float(_) => self.ins().fcmp(vec_float_cc(bin), a, b),
+                    Num::Int { signed, .. } => self.ins().icmp(vec_int_cc(bin, signed), a, b),
+                    Num::Bool => return Ok(None),
+                };
+                return Ok(Some(self.store_vec(out, out_vec.bytes())));
+            }
+            return Ok(None);
+        }
+        if input != output {
+            return Ok(None);
+        }
+        let (a, b) = (self.ins().load(vec_ty, x, 0), self.ins().load(vec_ty, y, 0));
+        let out = match (bin, from.num) {
+            (BinOp::Add, Num::Int { .. }) => self.ins().iadd(a, b),
+            (BinOp::Sub, Num::Int { .. }) => self.ins().isub(a, b),
+            (BinOp::Mul, Num::Int { .. }) => self.ins().imul(a, b),
+            (BinOp::BitAnd, Num::Int { .. }) => self.ins().band(a, b),
+            (BinOp::BitOr, Num::Int { .. }) => self.ins().bor(a, b),
+            (BinOp::BitXor, Num::Int { .. }) => self.ins().bxor(a, b),
+            (BinOp::Shl, Num::Int { .. }) => self.ins().ishl(a, b),
+            (BinOp::Shr, Num::Int { signed: true, .. }) => self.ins().sshr(a, b),
+            (BinOp::Shr, Num::Int { signed: false, .. }) => self.ins().ushr(a, b),
+            (BinOp::Add, Num::Float(_)) => self.ins().fadd(a, b),
+            (BinOp::Sub, Num::Float(_)) => self.ins().fsub(a, b),
+            (BinOp::Mul, Num::Float(_)) => self.ins().fmul(a, b),
+            (BinOp::Div, Num::Float(_)) => self.ins().fdiv(a, b),
+            _ => return Ok(None),
+        };
+        Ok(Some(self.store_vec(out, vec_ty.bytes())))
+    }
+
+    fn vec_cast(&mut self, (from, from_vec): (&Lanes, Type), output: Ty, x: Value) -> Result<Option<Value>> {
+        let to = self.lanes(output)?;
+        let Some(to_vec) = vec_type(&to) else { return Ok(None) };
+        if from.count != to.count {
+            return Ok(None);
+        }
+        let v = self.ins().load(from_vec, x, 0);
+        let out = match (from.num, to.num) {
+            (Num::Int { ty: a, signed }, Num::Int { ty: b, .. }) => {
+                if a == b {
+                    v
+                } else if a.bytes() < b.bytes() {
+                    if signed { self.ins().sextend(to_vec, v) } else { self.ins().uextend(to_vec, v) }
+                } else {
+                    self.ins().ireduce(to_vec, v)
+                }
+            }
+            (Num::Float(a), Num::Float(b)) => {
+                if a == b {
+                    v
+                } else if a == Type::F32 {
+                    self.ins().fpromote(to_vec, v)
+                } else {
+                    self.ins().fdemote(to_vec, v)
+                }
+            }
+            (Num::Int { ty: a, signed }, Num::Float(b)) if a.bytes() == b.bytes() || a.bytes() * 2 == b.bytes() => {
+                if signed { self.ins().fcvt_from_sint(to_vec, v) } else { self.ins().fcvt_from_uint(to_vec, v) }
+            }
+            (Num::Float(a), Num::Int { ty: b, signed }) if a.bytes() == b.bytes() => {
+                if signed { self.ins().fcvt_to_sint_sat(to_vec, v) } else { self.ins().fcvt_to_uint_sat(to_vec, v) }
             }
             _ => return Ok(None),
         };
-        let stored = if is_8 { self.ins().narrow_vec64(vector) } else { vector };
-        let (slot, address) = self.vector_slot(if matches!(op, Simd::Splat) { input } else { output })?;
-        self.ins().stack_store(stored, slot, 0);
-        Ok(Some(address))
+        Ok(Some(self.store_vec(out, to_vec.bytes())))
     }
+
+    fn vec_select(&mut self, (mask_ty, out_ty): (Ty, Ty), args: &[Value]) -> Result<Option<Value>> {
+        let &[mask, yes, no] = args else { return Ok(None) };
+        let (from, to) = (self.lanes(mask_ty)?, self.lanes(out_ty)?);
+        let (Some(mask_vec), Some(out_vec)) = (vec_type(&from), vec_type(&to)) else { return Ok(None) };
+        if from.count != to.count || from.size != to.size || !mask_vec.lane().is_some_and(Lane::is_int) {
+            return Ok(None);
+        }
+        let (m, a, b) = (self.ins().load(mask_vec, mask, 0), self.ins().load(out_vec, yes, 0), self.ins().load(out_vec, no, 0));
+        let zero = self.ins().iconst(mask_vec, 0);
+        let norm = self.ins().icmp(IntCC::NotEqual, m, zero);
+        let chosen = self.ins().select(norm, a, b);
+        Ok(Some(self.store_vec(chosen, out_vec.bytes())))
+    }
+
+    fn call_arg_expr(&self, origin: &SiteOrigin, index: usize) -> Option<ExprId> {
+        let SiteOrigin::Table(SiteKey::ExprRes(key)) = *origin else { return None };
+        let list = match *self.body.expr(key) {
+            Expr::Call(_, list) => list,
+            _ => self.body.exprs.iter().find_map(|expr| match *expr {
+                Expr::Call(callee, list) if callee == key => Some(list),
+                _ => None,
+            })?,
+        };
+        self.body.list(list).iter().copied().map(ExprId).filter(|id| !self.typed.const_args.contains(id)).nth(index)
+    }
+
+    fn const_arg_u8(&mut self, origin: &SiteOrigin, index: usize, limit: u8) -> Option<u8> {
+        let expr = self.call_arg_expr(origin, index)?;
+        let val = eval_const_int(self.cx, self.body, self.typed, self.body, self.src, expr, 0)?;
+        u8::try_from(val).ok().filter(|&n| n < limit)
+    }
+
+    fn shuffle_const_mask(&mut self, origin: &SiteOrigin, count: usize) -> Option<[u8; 16]> {
+        if count > 16 {
+            return None;
+        }
+        let expr = self.call_arg_expr(origin, 2)?;
+        eval_shuffle_array(self.cx, self.body, self.typed, self.body, self.src, expr, count, 0)
+    }
+}
+
+fn unwrap_const_expr(body: &Body, mut expr: ExprId) -> ExprId {
+    loop {
+        match *body.expr(expr) {
+            Expr::Paren(inner) | Expr::Cast(inner, _) => expr = inner,
+            Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const, .. } if stmts.len == 0 => expr = tail,
+            _ => return expr,
+        }
+    }
+}
+
+fn eval_const_int<'a>(cx: &mut crate::sema::Context<'a>, origin_body: &Body, typed: &crate::sema::infer::Typed, body: &Body, src: &Source, expr: ExprId, depth: u8) -> Option<u128> {
+    if depth > 4 {
+        return None;
+    }
+    let expr = unwrap_const_expr(body, expr);
+    match *body.expr(expr) {
+        Expr::Lit(Lit::Int, tok) => parse_int(src.text(tok)).ok().map(|(n, _)| n),
+        Expr::Path(_) if std::ptr::eq(body, origin_body) => match typed.res.get(&expr).copied()? {
+            Res::Const(val) => match *cx.types.kind(val) {
+                Kind::Value(n) => Some(n),
+                _ => None,
+            },
+            Res::Fn(item, substs) if cx.item(item).1.kind == ItemKind::Const && cx.types.substs(substs).is_empty() => {
+                let item_body = cx.body(item).ok()?;
+                let root = item_body.root?;
+                let item_src = cx.body_src(item);
+                eval_const_int(cx, origin_body, typed, &item_body, item_src, root, depth + 1)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn eval_shuffle_array<'a>(cx: &mut crate::sema::Context<'a>, origin_body: &Body, typed: &crate::sema::infer::Typed, body: &Body, src: &Source, expr: ExprId, count: usize, depth: u8) -> Option<[u8; 16]> {
+    if depth > 4 {
+        return None;
+    }
+    let expr = unwrap_const_expr(body, expr);
+    let limit = u128::try_from(2 * count).ok()?;
+    let mut mask = [0u8; 16];
+    match *body.expr(expr) {
+        Expr::Array(list) => {
+            let ids = body.list(list);
+            if ids.len() != count {
+                return None;
+            }
+            for (slot, &id) in mask[..count].iter_mut().zip(ids) {
+                let n = eval_const_int(cx, origin_body, typed, body, src, ExprId(id), depth + 1)?;
+                if n >= limit {
+                    return None;
+                }
+                *slot = n as u8;
+            }
+            Some(mask)
+        }
+        Expr::Repeat(elem, _) => {
+            let n = eval_const_int(cx, origin_body, typed, body, src, elem, depth + 1)?;
+            if n >= limit {
+                return None;
+            }
+            mask[..count].fill(n as u8);
+            Some(mask)
+        }
+        Expr::Path(_) if std::ptr::eq(body, origin_body) => {
+            let Res::Fn(item, substs) = typed.res.get(&expr).copied()? else { return None };
+            if cx.item(item).1.kind != ItemKind::Const || !cx.types.substs(substs).is_empty() {
+                return None;
+            }
+            let item_body = cx.body(item).ok()?;
+            let root = item_body.root?;
+            let item_src = cx.body_src(item);
+            eval_shuffle_array(cx, origin_body, typed, &item_body, item_src, root, count, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+impl Lower<'_, '_> {
 
     fn packed_swar64(&mut self, op: Simd, (input, output): (Ty, Ty), args: &[Value]) -> Result<Option<Value>> {
         let lanes = self.lanes(input)?;
@@ -309,11 +520,17 @@ impl Lower<'_, '_> {
         let &[input, indices, output] = substs else { bail!("`simd_shuffle` takes three types") };
         let (from, to) = (self.lanes(input)?, self.lanes(output)?);
         let (both, joined) = self.pair_slot(&from)?;
-        for lane in 0..from.count {
-            let a = self.ins().load(from.machine, x, lane * from.size);
-            let b = self.ins().load(from.machine, y, lane * from.size);
-            self.ins().stack_store(a, both, lane * from.size);
-            self.ins().stack_store(b, both, (from.count + lane) * from.size);
+        if let Some(vt) = vec_type(&from) {
+            let (a, b) = (self.ins().load(vt, x, 0), self.ins().load(vt, y, 0));
+            self.ins().stack_store(a, both, 0);
+            self.ins().stack_store(b, both, from.count * from.size);
+        } else {
+            for lane in 0..from.count {
+                let a = self.ins().load(from.machine, x, lane * from.size);
+                let b = self.ins().load(from.machine, y, lane * from.size);
+                self.ins().stack_store(a, both, lane * from.size);
+                self.ins().stack_store(b, both, (from.count + lane) * from.size);
+            }
         }
         let Some(held) = self.spill(Some(idx), indices)? else { bail!("`simd_shuffle` indices take no bytes") };
         let idx = self.address(held);
@@ -340,9 +557,14 @@ impl Lower<'_, '_> {
     fn insert(&mut self, vector: Ty, x: Value, (at, value): (Value, Value)) -> Result<Value> {
         let lanes = self.lanes(vector)?;
         let (slot, address) = self.vector_slot(vector)?;
-        for lane in 0..lanes.count {
-            let held = self.ins().load(lanes.machine, x, lane * lanes.size);
-            self.ins().stack_store(held, slot, lane * lanes.size);
+        if let Some(vt) = vec_type(&lanes) {
+            let v = self.ins().load(vt, x, 0);
+            self.ins().stack_store(v, slot, 0);
+        } else {
+            for lane in 0..lanes.count {
+                let held = self.ins().load(lanes.machine, x, lane * lanes.size);
+                self.ins().stack_store(held, slot, lane * lanes.size);
+            }
         }
         let (_, lane) = self.lane_address(vector, address, at)?;
         self.ins().store(value, lane, 0);
@@ -386,62 +608,6 @@ impl Lower<'_, '_> {
             best = self.ins().select(wins, value, best);
         }
         Ok(best)
-    }
-
-    /// Calls the host function of the x86 intrinsic `x86` with `args`, each vector by address, and returns the address of the frame slot it writes a vector result to, or the integer it returns.
-    pub(super) fn host_vector(&mut self, x86: X86Symbol, args: &[Value]) -> Result<Value> {
-        if let Some(value) = self.inline_vector(x86, args) {
-            return Ok(value);
-        }
-        if x86.host_addr().is_none() {
-            bail!("{} has no host function on this machine", x86.link_name());
-        }
-        let slot = self.b.create_stack_slot(x86.out_bytes(), 5);
-        let out = self.ins().stack_addr(Type::I64, slot, 0);
-        let values: Vec<Value> = std::iter::once(out).chain(args.iter().copied()).collect();
-        self.call_host(HostSymbol::X86(x86), &values, None);
-        Ok(match x86.scalar_bytes() {
-            Some(8) => self.ins().load(Type::I64, out, 0),
-            Some(_) => self.ins().load(Type::I32, out, 0),
-            None => out,
-        })
-    }
-
-    /// The `bytes` bytes whose byte `i` is byte `index[i] & 15` of the 16-byte lane of `table` that holds byte `i`, or zero when bit 7 of `index[i]` is set, as `pshufb` gives.
-    pub(super) fn byte_permute(&mut self, args: &[Value], bytes: u8) -> Result<Value> {
-        let &[table, index] = args else { bail!("`pshufb` takes two vectors") };
-        if i32::from(bytes) == PACKED_BYTES && Target::host().arch == Arch::X64 {
-            return Ok(self.vector_result(VectorOp::ByteShuffle, (table, index)));
-        }
-        let slot = self.b.create_stack_slot(u32::from(bytes), 5);
-        let (low, zero) = (self.ins().iconst(Type::I8, 15), self.ins().iconst(Type::I8, 0));
-        for lane in 0..i32::from(bytes) {
-            let at = self.ins().load(Type::I8, index, lane);
-            let pick = self.ins().band(at, low);
-            let pick = self.ins().uextend(Type::I64, pick);
-            let base = self.ins().iadd_imm(table, i64::from(lane & !15));
-            let source = self.ins().iadd(base, pick);
-            let byte = self.ins().load(Type::I8, source, 0);
-            let cleared = self.ins().icmp_imm(IntCC::SignedLessThan, at, 0);
-            let value = self.ins().select(cleared, zero, byte);
-            self.ins().stack_store(value, slot, lane);
-        }
-        Ok(self.ins().stack_addr(Type::I64, slot, 0))
-    }
-
-    /// The 16 bytes whose byte `i` is the larger of bytes `2i` and `2i + 1` of the first vector followed by the second, as NEON `umaxp` gives.
-    pub(super) fn byte_pair_max(&mut self, args: &[Value]) -> Result<Value> {
-        let &[first, second] = args else { bail!("`umaxp` takes two vectors") };
-        let slot = self.b.create_stack_slot(16, 4);
-        for lane in 0..16 {
-            let from = if lane < 8 { first } else { second };
-            let at = lane % 8 * 2;
-            let (x, y) = (self.ins().load(Type::I8, from, at), self.ins().load(Type::I8, from, at + 1));
-            let wins = self.ins().icmp(IntCC::UnsignedGreaterThan, x, y);
-            let value = self.ins().select(wins, x, y);
-            self.ins().stack_store(value, slot, lane);
-        }
-        Ok(self.ins().stack_addr(Type::I64, slot, 0))
     }
 
     fn bitmask(&mut self, vector: Ty, x: Value, out: Ty) -> Result<Value> {
@@ -491,63 +657,30 @@ impl Lower<'_, '_> {
         }
         Ok(address)
     }
+}
 
-    /// The address of a frame slot holding the x64 vector instruction `op` on the vectors at `x` and `y`.
-    fn vector_result(&mut self, op: VectorOp, (x, y): (Value, Value)) -> Value {
-        let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
-        let vector = self.ins().vector(op, a, b);
-        self.store_vector(vector)
-    }
-
-    fn store_vector(&mut self, vector: Value) -> Value {
-        let slot = self.b.create_stack_slot(PACKED_BYTES as u32, 4);
-        self.ins().stack_store(vector, slot, 0);
-        self.ins().stack_addr(Type::I64, slot, 0)
-    }
-
-    /// The x86 intrinsic `x86` on the vectors at `args` as one instruction in the code, on an x64 host, when it is one the code generator encodes.
-    fn inline_vector(&mut self, x86: X86Symbol, args: &[Value]) -> Option<Value> {
-        if Target::host().arch != Arch::X64 {
-            return None;
-        }
-        match (x86, args) {
-            (X86Symbol::Sha256rnds2, &[x, y, k]) => {
-                let (a, b, c) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0), self.ins().load(Type::V128, k, 0));
-                let vector = self.ins().sha256_rounds(a, b, c);
-                Some(self.store_vector(vector))
-            }
-            (_, &[x, y]) => Some(self.vector_result(instruction(x86)?, (x, y))),
-            _ => None,
-        }
+fn vec_int_cc(op: BinOp, signed: bool) -> IntCC {
+    match (op, signed) {
+        (BinOp::Eq, _) => IntCC::Equal,
+        (BinOp::Ne, _) => IntCC::NotEqual,
+        (BinOp::Lt, true) => IntCC::SignedLessThan,
+        (BinOp::Le, true) => IntCC::SignedLessThanOrEqual,
+        (BinOp::Gt, true) => IntCC::SignedGreaterThan,
+        (BinOp::Ge, true) => IntCC::SignedGreaterThanOrEqual,
+        (BinOp::Lt, false) => IntCC::UnsignedLessThan,
+        (BinOp::Le, false) => IntCC::UnsignedLessThanOrEqual,
+        (BinOp::Gt, false) => IntCC::UnsignedGreaterThan,
+        _ => IntCC::UnsignedGreaterThanOrEqual,
     }
 }
 
-/// The vector instruction that computes the two-operand x86 intrinsic `x86`, when there is one.
-fn instruction(x86: X86Symbol) -> Option<VectorOp> {
-    Some(match x86 {
-        X86Symbol::Sha1nexte => VectorOp::Sha1NextE,
-        X86Symbol::Sha1msg1 => VectorOp::Sha1Msg1,
-        X86Symbol::Sha1msg2 => VectorOp::Sha1Msg2,
-        X86Symbol::Sha256msg1 => VectorOp::Sha256Msg1,
-        X86Symbol::Sha256msg2 => VectorOp::Sha256Msg2,
-        X86Symbol::Aesenc => VectorOp::AesEnc,
-        X86Symbol::Aesenclast => VectorOp::AesEncLast,
-        X86Symbol::Aesdec => VectorOp::AesDec,
-        X86Symbol::Aesdeclast => VectorOp::AesDecLast,
-        _ => return None,
-    })
-}
-
-/// The packed add or subtract of `op` on lanes of `size` bytes.
-fn lane_arithmetic(op: BinOp, size: i32) -> VectorOp {
-    match (op == BinOp::Add, size) {
-        (true, 1) => VectorOp::AddBytes,
-        (true, 2) => VectorOp::AddWords,
-        (true, 4) => VectorOp::AddDwords,
-        (true, _) => VectorOp::AddQwords,
-        (false, 1) => VectorOp::SubBytes,
-        (false, 2) => VectorOp::SubWords,
-        (false, 4) => VectorOp::SubDwords,
-        (false, _) => VectorOp::SubQwords,
+fn vec_float_cc(op: BinOp) -> FloatCC {
+    match op {
+        BinOp::Eq => FloatCC::Equal,
+        BinOp::Ne => FloatCC::NotEqual,
+        BinOp::Lt => FloatCC::LessThan,
+        BinOp::Le => FloatCC::LessThanOrEqual,
+        BinOp::Gt => FloatCC::GreaterThan,
+        _ => FloatCC::GreaterThanOrEqual,
     }
 }

@@ -316,21 +316,12 @@ fn peel_entry_guard(
     if then_b == else_b || func.blocks[new_entry.index()].insts.is_empty() {
         return;
     }
-    let mut preds = vec![0_u32; orig_blocks];
-    for block in &func.blocks[..orig_blocks] {
-        if let Some(&last) = block.insts.last() {
-            func.insts[last.index()].op.targets().for_each(|t| {
-                if t.index() < orig_blocks {
-                    preds[t.index()] += 1;
-                }
-            });
-        }
-    }
+    let cfg = crate::cfg::Cfg::new(func);
     let is_base = |b: Block| {
         b != old_entry
             && b.index() < orig_blocks
             && !rewritten[b.index()]
-            && preds[b.index()] == 1
+            && cfg.pred_count(b) == 1
             && func.blocks[b.index()].insts.last().is_some_and(|&t| matches!(func.insts[t.index()].op, Op::Return(_)))
     };
     let (base_b, base_args, rec_b, rec_args, then_is_base) = if is_base(then_b) {
@@ -380,7 +371,7 @@ fn peel_entry_guard(
     entry_insts.push(func.add(brif, None));
     func.blocks[new_entry.index()].insts = entry_insts;
 
-    if preds[old_entry.index()] != 0 {
+    if cfg.preds_of(old_entry).iter().any(|&p| p != loop_head) {
         return;
     }
     let mut old_defs = vec![false; func.types.len()];

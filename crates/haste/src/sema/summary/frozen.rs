@@ -11,7 +11,8 @@ use super::super::reach::Instance;
 use super::super::substs::{ProjId, Substs};
 use super::super::table::Table;
 use super::super::ty::{Kind, Ty, Types};
-use super::{PolyInst, PolyObligation, PolySummary, codec};
+use super::inst::{TyFolder, fold_substs, fold_ty};
+use super::{InstOutcome, PolyCheck, PolyInst, PolyObligation, PolySummary, codec};
 
 pub(in crate::sema) fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
     let tree = cx.outline.crates.get(item.krate as usize)?;
@@ -51,7 +52,6 @@ pub(super) fn frozen_instance(
                 builtin_ops: decoded.builtin_ops,
                 call_overrides: decoded.call_overrides,
                 offset_overrides: decoded.offset_overrides,
-                check_only: false,
                 materialized: OnceLock::new(),
             };
             let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
@@ -79,7 +79,6 @@ pub(in crate::sema) fn export_sysroot_instances(
             return true;
         }
         if let LazyTables::Poly(inst) = &typed.tables
-            && !inst.check_only
             && inst.summary.template.closures.is_empty()
             && let Some(item_key) = crate::substrate::sysroot_item_key(outline, item)
             && let Some(substs_key) = codec::substs_key(outline, types, substs, crate::substrate::sysroot_item_key)
@@ -96,56 +95,50 @@ pub(in crate::sema) fn export_sysroot_instances(
     }
 }
 
-fn resolve_proj_ty(cx: &Context<'_>, args: &[Ty], projs: &mut Vec<(ProjId, Ty)>, ty: Ty, depth: u8) -> Option<Ty> {
-    if ty == Ty::NONE || !cx.types.has_params(ty) {
-        return Some(ty);
+struct FrozenFolder<'a, 'c> {
+    cx: &'a Context<'c>,
+    args: &'a [Ty],
+    projs: &'a mut Vec<(ProjId, Ty)>,
+    depth: u8,
+}
+
+impl TyFolder for FrozenFolder<'_, '_> {
+    type Error = ();
+    fn types(&self) -> &Types {
+        &self.cx.types
     }
-    if depth > 8 {
-        return None;
+    fn args(&self) -> &[Ty] {
+        self.args
     }
-    match cx.types.kind(ty).clone() {
-        Kind::Param(idx) => args.get(idx as usize).copied(),
-        Kind::Proj(proj_id) => {
-            if let Ok(idx) = projs.binary_search_by_key(&proj_id.0, |&(p, _)| p.0) {
-                return Some(projs[idx].1);
-            }
-            let def = cx.types.proj(proj_id);
-            let self_ty = resolve_proj_ty(cx, args, projs, def.self_ty, depth + 1)?;
-            let trait_substs = resolve_proj_substs(cx, args, projs, def.args, depth + 1)?;
-            let own_substs = resolve_proj_substs(cx, args, projs, def.own, depth + 1)?;
-            if cx.types.has_params(self_ty) || cx.types.substs_have_params(trait_substs) || cx.types.substs_have_params(own_substs) {
-                return None;
-            }
-            let val = cx.store.lookups.assoc_types.get(&(def.of, self_ty, trait_substs, def.assoc, own_substs))?;
-            let at = projs.partition_point(|&(p, _)| p.0 < proj_id.0);
-            projs.insert(at, (proj_id, val));
-            Some(val)
+    fn param_oob(&self, _idx: u16) -> Self::Error {}
+    fn fold_proj(&mut self, proj_id: ProjId) -> Result<Ty, Self::Error> {
+        if let Ok(idx) = self.projs.binary_search_by_key(&proj_id.0, |&(p, _)| p.0) {
+            return Ok(self.projs[idx].1);
         }
-        kind => {
-            let mut failed = false;
-            let pools = cx.types.pools();
-            let mapped = cx.types.intern(kind.map_pool(&pools, |child| match resolve_proj_ty(cx, args, projs, child, depth + 1) {
-                Some(t) => t,
-                None => {
-                    failed = true;
-                    Ty::NONE
-                }
-            }));
-            (!failed).then_some(mapped)
+        if self.depth >= 8 {
+            return Err(());
         }
+        let def = self.cx.types.proj(proj_id);
+        let mut child = FrozenFolder { cx: self.cx, args: self.args, projs: self.projs, depth: self.depth + 1 };
+        let self_ty = fold_ty(&mut child, def.self_ty)?;
+        let trait_substs = fold_substs(&mut child, def.args)?;
+        let own_substs = fold_substs(&mut child, def.own)?;
+        if self.cx.types.has_params(self_ty) || self.cx.types.substs_have_params(trait_substs) || self.cx.types.substs_have_params(own_substs) {
+            return Err(());
+        }
+        let val = self.cx.store.lookups.assoc_types.get(&(def.of, self_ty, trait_substs, def.assoc, own_substs)).ok_or(())?;
+        let at = self.projs.partition_point(|&(p, _)| p.0 < proj_id.0);
+        self.projs.insert(at, (proj_id, val));
+        Ok(val)
     }
 }
 
+fn resolve_proj_ty(cx: &Context<'_>, args: &[Ty], projs: &mut Vec<(ProjId, Ty)>, ty: Ty, depth: u8) -> Option<Ty> {
+    fold_ty(&mut FrozenFolder { cx, args, projs, depth }, ty).ok()
+}
+
 fn resolve_proj_substs(cx: &Context<'_>, args: &[Ty], projs: &mut Vec<(ProjId, Ty)>, substs: Substs, depth: u8) -> Option<Substs> {
-    if !cx.types.substs_have_params(substs) {
-        return Some(substs);
-    }
-    let slice = cx.types.substs(substs).to_vec();
-    let mut out = Vec::with_capacity(slice.len());
-    for ty in slice {
-        out.push(resolve_proj_ty(cx, args, projs, ty, depth)?);
-    }
-    Some(cx.types.intern_substs(&out))
+    fold_substs(&mut FrozenFolder { cx, args, projs, depth }, substs).ok()
 }
 
 pub(super) fn try_cached_instantiate(
@@ -153,7 +146,7 @@ pub(super) fn try_cached_instantiate(
     instance: Instance,
     summary: &Arc<PolySummary>,
     check_only: bool,
-) -> Option<(PolyInst, Vec<Local>, Option<Ty>, Vec<Ty>, Vec<Ty>)> {
+) -> Option<InstOutcome> {
     if !summary.op_holes.is_empty()
         || !summary.const_holes.is_empty()
         || !summary.template.closures.is_empty()
@@ -193,7 +186,6 @@ pub(super) fn try_cached_instantiate(
         builtin_ops: Box::new([]),
         call_overrides: Box::new([]),
         offset_overrides: Box::new([]),
-        check_only,
         materialized: OnceLock::new(),
     };
     for ob in &summary.obligations {
@@ -218,10 +210,14 @@ pub(super) fn try_cached_instantiate(
     if !check_only {
         resolved.sort_unstable_by_key(|&(key, ..)| key);
     }
-    inst.resolved_calls = resolved.into_boxed_slice();
-    let locals = if check_only { Vec::new() } else { summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect() };
+    let resolved_calls = resolved.into_boxed_slice();
     let ret = summary.ret.map(|ty| inst.sub_ty(&cx.types, ty));
     let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
     let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
-    Some((inst, locals, ret, layouts, drop_tys))
+    if check_only {
+        return Some(InstOutcome::CheckOnly(PolyCheck { summary: inst.summary, resolved_calls }, ret, layouts, drop_tys));
+    }
+    inst.resolved_calls = resolved_calls;
+    let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
+    Some(InstOutcome::Full(inst, locals, ret, layouts, drop_tys))
 }

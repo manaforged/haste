@@ -69,11 +69,11 @@ impl Counter {
                     self.stack(16)
                 }
             }
-            Type::F32 | Type::F64 | Type::V128 if self.float < FLOAT_ARGS => {
+            Type::F32 | Type::F64 | Type::Vec { .. } if self.float < FLOAT_ARGS => {
                 self.float += 1;
                 Loc::Float(self.float - 1)
             }
-            _ if !ty.is_float() && ty != Type::V128 && self.int < INT_ARGS.len() => {
+            _ if !ty.in_float_register() && self.int < INT_ARGS.len() => {
                 self.int += 1;
                 Loc::Int(INT_ARGS[self.int - 1])
             }

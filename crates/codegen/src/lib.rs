@@ -3,11 +3,12 @@
 mod algebra;
 mod alloc;
 mod builder;
+pub(crate) mod cfg;
 mod color;
 mod coroutine;
 mod copy;
 mod cse;
-mod dom;
+mod emit;
 mod error;
 mod ir;
 mod memory;
@@ -19,12 +20,14 @@ mod ifconv;
 mod licm;
 mod live;
 mod loads;
+pub(crate) mod mem;
 mod merge;
 mod native;
 mod park;
 mod promote;
 mod reloc;
 mod returns;
+mod schedule;
 mod split;
 mod switch;
 mod tailrec;
@@ -56,7 +59,7 @@ mod arm64;
 mod x64;
 
 pub use builder::{FunctionBuilder, Ins, Mark};
-pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, ByteCC, CallConv, FloatCC, Function, Inst, IntCC, SigRef, Signature, StackSlot, Type, Value, VectorOp};
+pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst, IntCC, Lane, ReduceOp, ShuffleMask, SigRef, Signature, StackSlot, TargetOpId, TinyArgs, Type, Value};
 pub use coroutine::Coroutine;
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
@@ -131,70 +134,15 @@ impl Target {
 
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
 pub fn simplify(func: &mut Function, effort: Effort) {
-    optimize(func, promote::Moves::Guided, effort);
+    schedule::run(func, promote::Moves::Guided, effort);
     fold::compact(func);
-}
-
-fn promote_rounds(func: &mut Function, kind: promote::Moves, effort: Effort, rounds: usize) {
-    for _ in 0..rounds {
-        if !promote::step(func, kind) {
-            break;
-        }
-        fold::run(func, effort);
-        merge::run(func);
-    }
-}
-
-fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
-    fill::run(func);
-    fold::run(func, effort);
-    merge::run(func);
-    let kind = if effort == Effort::Full { moves } else { promote::Moves::Words };
-    promote_rounds(func, kind, effort, if effort == Effort::Full { 4 } else { 2 });
-    if effort == Effort::Full && unroll::run(func) {
-        fold::run(func, effort);
-        merge::run(func);
-    }
-    cse::run(func);
-    if effort == Effort::Full {
-        thread::run(func);
-        merge::run(func);
-        ifconv::run(func);
-        merge::run(func);
-        loads::run(func);
-        thread::run(func);
-        fold::run(func, effort);
-        merge::run(func);
-        if unroll::run(func) {
-            fold::run(func, effort);
-            merge::run(func);
-        }
-        promote_rounds(func, kind, effort, 2);
-        cse::run(func);
-        licm::run(func);
-        loads::run(func);
-        fold::run(func, effort);
-        merge::run(func);
-        if unroll::run(func) {
-            fold::run(func, effort);
-            merge::run(func);
-            loads::run(func);
-            promote_rounds(func, kind, effort, 2);
-        }
-        cse::run(func);
-        switch::run(func);
-    }
-    returns::run(func);
-    if effort == Effort::Full && tailrec::run(func) {
-        fold::compact(func);
-    }
 }
 
 /// Encodes `func` for `target`.
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, message))?;
-    optimize(&mut func, promote::Moves::Split, target.effort);
+    schedule::run(&mut func, promote::Moves::Split, target.effort);
     if !matches!(target.arch, Arch::X64 | Arch::Arm64) {
         copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
     }

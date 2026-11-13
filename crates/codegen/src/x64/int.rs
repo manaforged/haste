@@ -1,5 +1,6 @@
 use super::asm::{Alu, Cond, Count, Group3, Mem, Reg, Shift, Size};
 use super::Emit;
+use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Type, Unary, Value};
 
@@ -21,6 +22,21 @@ pub(super) fn cond(cc: IntCC) -> Cond {
     }
 }
 
+fn swap_cc(cc: IntCC) -> IntCC {
+    match cc {
+        IntCC::Equal => IntCC::Equal,
+        IntCC::NotEqual => IntCC::NotEqual,
+        IntCC::SignedLessThan => IntCC::SignedGreaterThan,
+        IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThanOrEqual,
+        IntCC::SignedGreaterThan => IntCC::SignedLessThan,
+        IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThanOrEqual,
+        IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThan,
+        IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThanOrEqual,
+        IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThan,
+        IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
+    }
+}
+
 pub(super) fn alu_of(op: Binary) -> Option<Alu> {
     match op {
         Binary::Iadd => Some(Alu::Add),
@@ -35,6 +51,9 @@ pub(super) fn alu_of(op: Binary) -> Option<Alu> {
 impl Emit<'_> {
     pub(super) fn unary(&mut self, op: Unary, x: Value, result: Value) -> Result<(), String> {
         let ty = self.ty(x);
+        if ty.is_vector() {
+            return self.vector_unary(op, x, result);
+        }
         if ty.is_float() {
             return self.float_unary(op, x, result);
         }
@@ -54,7 +73,7 @@ impl Emit<'_> {
             }
             Unary::Bswap => self.swap_bytes(x, bits),
             Unary::Bitrev => {
-                self.get(Reg::Rax, x, Ext::Zero);
+                self.raw(Reg::Rax, x);
                 self.reverse_bits();
                 if bits < 64 {
                     self.asm.shift_imm(Size::Q, Shift::Shr, Reg::Rax, 64 - bits);
@@ -68,7 +87,7 @@ impl Emit<'_> {
                 }
             }
             Unary::Ctz => {
-                self.get(Reg::Rax, x, Ext::Zero);
+                self.raw(Reg::Rax, x);
                 if bits < 64 {
                     self.asm.bts(Reg::Rax, bits);
                 }
@@ -161,7 +180,7 @@ impl Emit<'_> {
             self.put_high(result, Reg::Rax);
             return Ok(());
         }
-        if ty == Type::V128 {
+        if ty.is_vector() {
             return self.vector_binary(op, (x, y), result);
         }
         if ty.is_float() {
@@ -179,9 +198,32 @@ impl Emit<'_> {
     /// Computes `x op y` into `dst` for the operations that can, or into rax, and returns the register that holds it.
     fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<Reg, String> {
         if let Some(alu) = alu_of(op) {
+            let size = if ty == Type::I32 { Size::D } else { Size::Q };
+            let (x, y) = if !matches!(alu, Alu::Sub)
+                && x != y
+                && ((self.imm_sized(y, size).is_none() && self.reg_of(y) == Some(dst))
+                    || (self.imm_sized(x, size).is_some() && self.imm_sized(y, size).is_none()))
+            {
+                (y, x)
+            } else {
+                (x, y)
+            };
+            if matches!(alu, Alu::And)
+                && let Some(mask) = self.const_of(y)
+                && let Some(narrow) = match mask {
+                    0xFF => Some(Size::B),
+                    0xFFFF => Some(Size::W),
+                    0xFFFF_FFFF => Some(Size::D),
+                    _ => None,
+                }
+            {
+                let source = self.operand(x);
+                self.asm.load(narrow, dst, source);
+                return Ok(dst);
+            }
             if matches!(alu, Alu::Add) {
                 if let Some(rx) = self.reg_of(x).filter(|&rx| rx != dst) {
-                    if let Some(imm) = self.imm_of(y) {
+                    if let Some(imm) = self.imm_sized(y, size) {
                         self.asm.lea(dst, Mem::new(rx, imm));
                         return Ok(dst);
                     }
@@ -190,22 +232,22 @@ impl Emit<'_> {
                         return Ok(dst);
                     }
                 }
-                if let (Some(imm), Some(ry)) = (self.imm_of(x), self.reg_of(y).filter(|&ry| ry != dst)) {
+                if let (Some(imm), Some(ry)) = (self.imm_sized(x, size), self.reg_of(y).filter(|&ry| ry != dst)) {
                     self.asm.lea(dst, Mem::new(ry, imm));
                     return Ok(dst);
                 }
             }
-            if self.imm_of(y).is_none() && self.reg_of(y) == Some(dst) && x != y {
+            if self.imm_sized(y, size).is_none() && self.reg_of(y) == Some(dst) && x != y {
                 self.asm.mov(Reg::Rax, dst);
                 self.raw(dst, x);
-                self.asm.alu(alu, dst, Reg::Rax);
+                self.asm.alu_sized(size, alu, dst, Reg::Rax);
             } else {
                 self.raw(dst, x);
-                match self.imm_of(y) {
-                    Some(imm) => self.asm.alu_imm(alu, dst, imm),
+                match self.imm_sized(y, size) {
+                    Some(imm) => self.asm.alu_imm_sized(size, alu, dst, imm),
                     None => {
                         let source = self.operand(y);
-                        self.asm.alu(alu, dst, source);
+                        self.asm.alu_sized(size, alu, dst, source);
                     }
                 }
             }
@@ -237,18 +279,17 @@ impl Emit<'_> {
             (_, Some(imm)) => (x, imm),
             (Some(imm), None) => (y, imm),
             (None, None) => {
-                if self.reg_of(y) == Some(dst) && x != y {
-                    self.asm.mov(Reg::Rax, dst);
-                    self.raw(dst, x);
-                    self.asm.imul(dst, Reg::Rax);
-                } else {
-                    self.raw(dst, x);
-                    let source = self.operand(y);
-                    self.asm.imul(dst, source);
-                }
+                let (x, y) = if self.reg_of(y) == Some(dst) && x != y { (y, x) } else { (x, y) };
+                self.raw(dst, x);
+                let source = self.operand(y);
+                self.asm.imul(dst, source);
                 return;
             }
         };
+        if imm == 0 {
+            self.asm.mov_imm(dst, 0);
+            return;
+        }
         if imm > 0 && imm.count_ones() == 1 {
             self.raw(dst, x);
             if imm > 1 {
@@ -262,14 +303,24 @@ impl Emit<'_> {
 
     /// Divides or takes the remainder by a power of two into `dst` with a shift or a mask, when `op` is unsigned and `y` is one.
     fn divide_by_power(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) -> bool {
-        let Some(divisor) = self.imm_extended(y, Ext::Zero).filter(|imm| *imm > 0 && imm.count_ones() == 1) else { return false };
-        if !matches!(op, Binary::Udiv | Binary::Urem) {
+        let ty = self.ty(y);
+        let Some(divisor) = self.const_of(y).map(|imm| crate::fold::extend(imm, ty, false) as u64).filter(|d| d.is_power_of_two()) else {
             return false;
-        }
-        self.get(dst, x, Ext::Zero);
+        };
         match op {
-            Binary::Udiv => self.asm.shift_imm(Size::Q, Shift::Shr, dst, divisor.trailing_zeros() as u8),
-            _ => self.asm.alu_imm(Alu::And, dst, divisor - 1),
+            Binary::Udiv => {
+                self.get(dst, x, Ext::Zero);
+                let shift = divisor.trailing_zeros() as u8;
+                if shift != 0 {
+                    self.asm.shift_imm(Size::Q, Shift::Shr, dst, shift);
+                }
+            }
+            Binary::Urem => {
+                let Ok(mask) = i32::try_from(divisor - 1) else { return false };
+                self.raw(dst, x);
+                self.asm.alu_imm(Alu::And, dst, mask);
+            }
+            _ => return false,
         }
         true
     }
@@ -313,15 +364,31 @@ impl Emit<'_> {
             Binary::Rotl => (Ext::Zero, Shift::Rol),
             _ => (Ext::Zero, Shift::Ror),
         };
-        let size = if matches!(op, Binary::Rotl | Binary::Rotr) { Size::of(ty.bytes()) } else { Size::Q };
+        let size = match op {
+            Binary::Rotl | Binary::Rotr => Size::of(ty.bytes()),
+            _ if ty == Type::I32 => Size::D,
+            _ => Size::Q,
+        };
+        let need_ext = op != Binary::Ishl && ty != Type::I32;
         if let Some(imm) = self.const_of(y) {
-            self.get(dst, x, ext);
-            self.asm.shift_imm(size, shift, dst, (imm & i64::from(ty.bits() - 1)) as u8);
+            let count = (imm & i64::from(ty.bits() - 1)) as u8;
+            if need_ext {
+                self.get(dst, x, ext);
+            } else {
+                self.raw(dst, x);
+            }
+            if count != 0 {
+                self.asm.shift_imm(size, shift, dst, count);
+            }
             return dst;
         }
-        self.get(Reg::Rax, x, ext);
+        if need_ext {
+            self.get(Reg::Rax, x, ext);
+        } else {
+            self.raw(Reg::Rax, x);
+        }
         self.raw(Reg::Rcx, y);
-        if size == Size::Q {
+        if matches!(ty, Type::I8 | Type::I16) && !matches!(op, Binary::Rotl | Binary::Rotr) {
             self.asm.alu_imm32(Alu::And, Reg::Rcx, ty.bits() as i32 - 1);
         }
         self.asm.shift(size, shift, Reg::Rax);
@@ -332,14 +399,36 @@ impl Emit<'_> {
         if self.is_static(result) {
             return Ok(());
         }
+        if self.ty(x).is_vector() {
+            return self.vector_icmp(cc, x, y, result);
+        }
         let flags = if self.ty(x) == Type::I128 {
             self.wide_icmp(cc, x, y)
         } else {
-            let left = self.reg_of(x).unwrap_or_else(|| {
-                self.raw(Reg::Rax, x);
-                Reg::Rax
-            });
-            self.alu_at(Size::of(self.ty(x).bytes()), Alu::Cmp, left, y);
+            let size = Size::of(self.ty(x).bytes());
+            let (cc, x, y) = if self.reg_of(x).is_none() && (self.reg_of(y).is_some() || self.imm_sized(x, size).is_some()) {
+                (swap_cc(cc), y, x)
+            } else {
+                (cc, x, y)
+            };
+            if matches!(self.location(x), Location::Slot)
+                && self.cached_spill(x).is_none()
+                && let Some(imm) = self.imm_sized(y, size)
+            {
+                self.asm.alu_imm_sized(size, Alu::Cmp, self.at(x), imm);
+            } else {
+                let left = self.reg_of(x).or_else(|| self.cached_spill(x)).unwrap_or_else(|| {
+                    self.raw(Reg::Rax, x);
+                    Reg::Rax
+                });
+                if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+                    && self.const_of(y).is_some_and(|imm| crate::fold::extend(imm, self.ty(y), false) == 0)
+                {
+                    self.asm.test_sized(size, left, left);
+                } else {
+                    self.alu_at(size, Alu::Cmp, left, y);
+                }
+            }
             cond(cc)
         };
         if self.plan.fused[result.index()] {
@@ -393,7 +482,7 @@ impl Emit<'_> {
 
     /// `dst op= y` on the low `size` bytes, with an immediate when `y` is a constant that fits one at that width.
     pub(super) fn alu_at(&mut self, size: Size, alu: Alu, dst: Reg, y: Value) {
-        match self.imm_of(y) {
+        match self.imm_sized(y, size) {
             Some(imm) => self.asm.alu_imm_sized(size, alu, dst, imm),
             None => {
                 let source = self.operand(y);
@@ -406,10 +495,21 @@ impl Emit<'_> {
         if self.is_static(result) {
             return Ok(());
         }
+        if self.ty(x).is_vector() || self.ty(result).is_vector() {
+            return self.vector_convert(op, x, result);
+        }
         let wide = self.ty(result) == Type::I128;
         match op {
             Convert::Uextend | Convert::Sextend => {
                 let signed = op == Convert::Sextend;
+                if !wide
+                    && matches!(self.location(result), Location::Slot)
+                    && let Some(rx) = self.reg_of(x).or_else(|| self.cached_spill(x))
+                    && (self.ty(x).bytes() >= 8 || (!signed && self.plan.zero_ext[x.index()]))
+                {
+                    self.put(result, rx);
+                    return Ok(());
+                }
                 let dst = self.dst(result);
                 self.get(dst, x, Ext::of(signed));
                 self.put(result, dst);
@@ -424,6 +524,12 @@ impl Emit<'_> {
                 Ok(())
             }
             Convert::Ireduce => {
+                if matches!(self.location(result), Location::Slot)
+                    && let Some(rx) = self.reg_of(x).or_else(|| self.cached_spill(x))
+                {
+                    self.put(result, rx);
+                    return Ok(());
+                }
                 let dst = self.dst(result);
                 self.raw(dst, x);
                 self.put(result, dst);

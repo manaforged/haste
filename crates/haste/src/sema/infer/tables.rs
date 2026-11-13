@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use crate::body::{ExprId, PatId};
 use crate::names::ItemRef;
 use crate::sema::substs::{PackedMap, PackedSet, Substs};
-use crate::sema::summary::PolyInst;
+use crate::sema::summary::{PolyCheck, PolyInst};
 use crate::sema::ty::{Mut, Ty, Types};
 
 use super::{Adjust, Awaited, Closure, Coercion, For, Local, Res, Shape, Tried};
@@ -104,6 +104,26 @@ impl BodyTables {
         Arc::clone(EMPTY.get_or_init(|| Arc::new(Self::default())))
     }
 
+    /// Every expression and desugared `for`/`await` temporary type that lowering may own and drop.
+    pub fn owned_tys(&self) -> impl Iterator<Item = Ty> + '_ {
+        self.exprs
+            .iter()
+            .copied()
+            .chain(self.fors.values().map(|f| f.iter))
+            .chain(self.awaits.values().map(|a| a.future))
+    }
+
+    /// Expression and desugared `for`/`await` temporary types owned at `expr`.
+    pub fn expr_owned_tys(&self, expr: ExprId) -> impl Iterator<Item = Ty> + '_ {
+        [
+            Some(self.exprs[expr.0 as usize]),
+            self.fors.get(&expr).map(|f| f.iter),
+            self.awaits.get(&expr).map(|a| a.future),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
     /// The resolution stored at `key` in these tables.
     pub fn site_res(&self, key: SiteKey) -> Option<Res> {
         match key {
@@ -145,11 +165,12 @@ impl std::ops::DerefMut for BodyTables {
     }
 }
 
-/// Either eagerly materialized body tables or a lazy polymorphic instantiation.
+/// Either eagerly materialized body tables, a lazy polymorphic instantiation, or a stripped check-only summary.
 #[derive(Clone, Debug)]
 pub enum LazyTables {
     Eager(Arc<BodyTables>),
     Poly(Box<PolyInst>),
+    CheckOnly(Box<PolyCheck>),
 }
 
 /// The inferred types and resolutions of one function body at one set of type arguments.
@@ -176,6 +197,7 @@ impl std::ops::Deref for Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables,
             LazyTables::Poly(poly) => poly.materialized(),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed has no BodyTables"),
         }
     }
 }
@@ -223,6 +245,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables,
             LazyTables::Poly(poly) => poly.ensure_tables(types),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed cannot materialize BodyTables"),
         }
     }
 
@@ -241,6 +264,7 @@ impl Typed {
                 }),
                 None => std::borrow::Cow::Borrowed(self),
             },
+            LazyTables::CheckOnly(_) => panic!("check-only Typed cannot materialize scoped BodyTables"),
         }
     }
 
@@ -249,6 +273,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => &tables.syntax,
             LazyTables::Poly(poly) => &poly.summary.template.syntax,
+            LazyTables::CheckOnly(check) => &check.summary.template.syntax,
         }
     }
 
@@ -257,6 +282,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => !tables.closures.is_empty(),
             LazyTables::Poly(poly) => !poly.summary.template.closures.is_empty(),
+            LazyTables::CheckOnly(check) => !check.summary.template.closures.is_empty(),
         }
     }
 
@@ -265,6 +291,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => !tables.awaits.is_empty(),
             LazyTables::Poly(poly) => !poly.summary.template.awaits.is_empty(),
+            LazyTables::CheckOnly(check) => !check.summary.template.awaits.is_empty(),
         }
     }
 
@@ -273,6 +300,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.exprs[expr.0 as usize],
             LazyTables::Poly(poly) => poly.expr_ty(types, expr),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed has no expr_ty"),
         }
     }
 
@@ -281,6 +309,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.pats.get(&pat).copied(),
             LazyTables::Poly(poly) => poly.pat_ty(types, pat),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed has no pat_ty"),
         }
     }
 
@@ -289,6 +318,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.site_res(key),
             LazyTables::Poly(poly) => poly.site_res(types, key),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed has no site_res"),
         }
     }
 
@@ -300,6 +330,7 @@ impl Typed {
                 _ => None,
             },
             LazyTables::Poly(poly) => poly.site_fn(key),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed has no site_fn"),
         }
     }
 
@@ -308,6 +339,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.autoderefs.get(&expr).copied().unwrap_or(0),
             LazyTables::Poly(poly) => poly.autoderefs_at(expr),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed has no autoderefs"),
         }
     }
 
@@ -316,6 +348,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.fors.get(&expr).map(|f| f.iter),
             LazyTables::Poly(poly) => poly.summary.template.fors.get(&expr).map(|f| poly.sub_ty(types, f.iter)),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed has no for_iter"),
         }
     }
 
@@ -324,6 +357,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.awaits.get(&expr).map(|a| a.future),
             LazyTables::Poly(poly) => poly.summary.template.awaits.get(&expr).map(|a| poly.sub_ty(types, a.future)),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed has no await_future"),
         }
     }
 
@@ -332,6 +366,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.awaits.contains_key(&expr),
             LazyTables::Poly(poly) => poly.summary.template.awaits.contains_key(&expr),
+            LazyTables::CheckOnly(check) => check.summary.template.awaits.contains_key(&expr),
         }
     }
 
@@ -340,6 +375,7 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.overloaded.contains(&expr),
             LazyTables::Poly(poly) => poly.is_overloaded_call(expr),
+            LazyTables::CheckOnly(_) => panic!("check-only Typed has no overloaded call table"),
         }
     }
 
@@ -357,6 +393,7 @@ impl Typed {
                 Box::new(direct.chain(loops).chain(tries).chain(awaits).chain(coerced).filter_map(res_fn).chain(drops).chain(shaped))
             }
             LazyTables::Poly(poly) => Box::new(poly.calls().chain(drops).chain(shaped)),
+            LazyTables::CheckOnly(check) => Box::new(check.calls().chain(drops).chain(shaped)),
         }
     }
 }

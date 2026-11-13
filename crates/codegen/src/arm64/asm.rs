@@ -1,5 +1,7 @@
 //! The A64 instruction encoder: one 32-bit word per instruction, with labels patched when they are bound.
 
+use super::int::encode_bitmask_imm;
+
 /// A general register `x0..x30`; 31 reads as the zero register or the stack pointer, by instruction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Reg(pub u8);
@@ -37,50 +39,6 @@ pub enum Shift {
     Lsr = 1,
     Asr = 2,
     Ror = 3,
-}
-
-pub(super) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32)> {
-    let w = if is_64 {
-        val
-    } else {
-        let low = (val as u32) as u64;
-        low | (low << 32)
-    };
-    if w == 0 || w == u64::MAX {
-        return None;
-    }
-    let mut esize = 64u32;
-    while esize > 2 && w == w.rotate_right(esize / 2) {
-        esize /= 2;
-    }
-    let mask = if esize == 64 { u64::MAX } else { (1u64 << esize) - 1 };
-    let elem = w & mask;
-    let ones = elem.count_ones();
-    if ones == 0 || ones == esize {
-        return None;
-    }
-    let tz = elem.trailing_zeros();
-    let immr = if tz > 0 {
-        (esize - tz) & (esize - 1)
-    } else {
-        let trailing_ones = (!elem & mask).trailing_zeros();
-        ones - trailing_ones
-    };
-    let n = u32::from(esize == 64);
-    let imms = ((!(esize - 1) << 1) | (ones - 1)) & 0x3F;
-    let pat = (1u64 << ones) - 1;
-    let rotated = if esize == 64 {
-        pat.rotate_right(immr)
-    } else {
-        ((pat >> immr) | (pat << (esize - immr))) & mask
-    };
-    let mut decoded = rotated;
-    let mut shift = esize;
-    while shift < 64 {
-        decoded |= decoded << shift;
-        shift *= 2;
-    }
-    (decoded == w).then_some((n, immr, imms))
 }
 
 /// The width of a memory access or of an integer operation: 1, 2, 4 or 8 bytes.
@@ -214,7 +172,7 @@ pub(crate) enum Fconv {
 #[derive(Clone, Copy)]
 pub(crate) struct Label(usize);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Fixup {
     /// A 26-bit word offset: `b` and `bl`.
     Branch,
@@ -226,12 +184,34 @@ enum Fixup {
     Adr,
 }
 
+fn fixup_bits(kind: Fixup, bytes: i64) -> Option<u32> {
+    let delta = bytes / 4;
+    match kind {
+        Fixup::Branch if (-(1 << 25)..1 << 25).contains(&delta) => Some((delta as u32) & 0x03FF_FFFF),
+        Fixup::Cond if (-(1 << 18)..1 << 18).contains(&delta) => Some(((delta as u32) & 0x7_FFFF) << 5),
+        Fixup::Tbz if (-(1 << 13)..1 << 13).contains(&delta) => Some(((delta as u32) & 0x3FFF) << 5),
+        Fixup::Adr if (-(1 << 20)..1 << 20).contains(&bytes) => {
+            let imm = bytes as u32;
+            Some(((imm & 3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairKind { IntLoad, IntStore, FloatLoad, FloatStore }
+
+#[derive(Clone, Copy)]
+struct LastMem { end_pos: u32, binds: u32, kind: PairKind, reg: u8, base: Reg, disp: i32 }
+
 #[derive(Default)]
 pub(crate) struct Asm {
     code: Vec<u8>,
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, usize, Fixup)>,
     table_fixups: Vec<(u32, usize, usize)>,
+    binds: u32,
+    last_mem: Option<LastMem>,
 }
 
 fn sized(base: u32, size: Size) -> u32 {
@@ -241,6 +221,10 @@ fn sized(base: u32, size: Size) -> u32 {
 impl Asm {
     pub fn pos(&self) -> u32 {
         self.code.len() as u32
+    }
+
+    pub fn stamp(&self) -> (usize, u32) {
+        (self.code.len(), self.binds)
     }
 
     pub fn word(&mut self, word: u32) {
@@ -254,6 +238,7 @@ impl Asm {
 
     pub fn bind(&mut self, label: Label) {
         self.labels[label.0] = Some(self.pos());
+        self.binds = self.binds.wrapping_add(1);
     }
 
     fn jump(&mut self, word: u32, label: Label, kind: Fixup) {
@@ -261,26 +246,81 @@ impl Asm {
         self.word(word);
     }
 
+    fn jump_cond(&mut self, kind: Fixup, word: u32, invert: u32, label: Label) {
+        if let Some(target) = self.labels[label.0]
+            && fixup_bits(kind, i64::from(target) - i64::from(self.pos())).is_none()
+        {
+            self.word(invert | (2 << 5));
+            self.b(label);
+            return;
+        }
+        self.jump(word, label, kind);
+    }
+
     pub fn b(&mut self, label: Label) {
         self.jump(0x1400_0000, label, Fixup::Branch);
     }
 
     pub fn bcond(&mut self, cond: Cond, label: Label) {
-        self.jump(0x5400_0000 | cond as u32, label, Fixup::Cond);
+        self.jump_cond(Fixup::Cond, 0x5400_0000 | cond as u32, 0x5400_0000 | cond.invert() as u32, label);
     }
 
     /// Branches to `label` when `reg` is zero, or nonzero when `nonzero`.
     pub fn cbz(&mut self, nonzero: bool, size: Size, reg: Reg, label: Label) {
         let base = if nonzero { 0xB500_0000 } else { 0xB400_0000 };
-        self.jump(sized(base, size) | u32::from(reg.0), label, Fixup::Cond);
+        let word = sized(base, size) | u32::from(reg.0);
+        self.jump_cond(Fixup::Cond, word, word ^ (1 << 24), label);
     }
 
     /// Branches to `label` when bit `bit` of `reg` is zero, or nonzero when `nonzero`.
     pub fn tbz(&mut self, nonzero: bool, reg: Reg, bit: u8, label: Label) {
         let base = if nonzero { 0x3700_0000 } else { 0x3600_0000 };
-        let b5 = u32::from(bit >> 5) << 31;
-        let b40 = u32::from(bit & 0x1F) << 19;
-        self.jump(base | b5 | b40 | u32::from(reg.0), label, Fixup::Tbz);
+        let word = base | u32::from(bit >> 5) << 31 | u32::from(bit & 0x1F) << 19 | u32::from(reg.0);
+        self.jump_cond(Fixup::Tbz, word, word ^ (1 << 24), label);
+    }
+
+    fn try_patch(&mut self, at: u32, kind: Fixup, target: u32) -> bool {
+        let Some(bits) = fixup_bits(kind, i64::from(target) - i64::from(at)) else { return false };
+        let at = at as usize;
+        let mut word = u32::from_le_bytes([self.code[at], self.code[at + 1], self.code[at + 2], self.code[at + 3]]);
+        word |= bits;
+        self.code[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        true
+    }
+
+    fn emit_veneer(&mut self, veneers: &mut Vec<(usize, u32)>, label: usize) -> u32 {
+        if let Some(&(_, pos)) = veneers.iter().find(|&&(l, _)| l == label) {
+            return pos;
+        }
+        let pos = self.pos();
+        self.b(Label(label));
+        veneers.push((label, pos));
+        pos
+    }
+
+    pub fn maybe_island(&mut self) -> Result<(), String> {
+        let now = self.pos();
+        let need_tbz = self.fixups.iter().any(|&(at, l, k)| k == Fixup::Tbz && self.labels[l].is_none() && now - at >= 16_384);
+        let need_cond = self.fixups.iter().any(|&(at, l, k)| k == Fixup::Cond && self.labels[l].is_none() && now - at >= 524_288);
+        if !need_tbz && !need_cond {
+            return Ok(());
+        }
+        let over = self.label();
+        self.b(over);
+        let mut veneers = Vec::new();
+        for (at, label, kind) in std::mem::take(&mut self.fixups) {
+            let flush = self.labels[label].is_none() && ((kind == Fixup::Tbz && (need_tbz || now - at >= 8_192)) || (kind == Fixup::Cond && need_cond));
+            if !flush {
+                self.fixups.push((at, label, kind));
+            } else {
+                let veneer = self.emit_veneer(&mut veneers, label);
+                if !self.try_patch(at, kind, veneer) {
+                    return Err("a branch out of range".to_owned());
+                }
+            }
+        }
+        self.bind(over);
+        Ok(())
     }
 
     pub fn adr(&mut self, dst: Reg, label: Label) {
@@ -297,23 +337,25 @@ impl Asm {
     }
 
     pub fn finish(mut self) -> Result<Vec<u8>, String> {
+        let mut veneers = Vec::new();
         for (at, label, kind) in std::mem::take(&mut self.fixups) {
             let target = self.labels[label].ok_or("a jump to a label that was never bound")?;
-            let bytes = i64::from(target) - i64::from(at);
-            let delta = bytes / 4;
-            let at = at as usize;
-            let mut word = u32::from_le_bytes(self.code[at..at + 4].try_into().expect("four bytes"));
-            word |= match kind {
-                Fixup::Branch if (-(1 << 25)..1 << 25).contains(&delta) => (delta as u32) & 0x03FF_FFFF,
-                Fixup::Cond if (-(1 << 18)..1 << 18).contains(&delta) => ((delta as u32) & 0x7_FFFF) << 5,
-                Fixup::Tbz if (-(1 << 13)..1 << 13).contains(&delta) => ((delta as u32) & 0x3FFF) << 5,
-                Fixup::Adr if (-(1 << 20)..1 << 20).contains(&bytes) => {
-                    let imm = bytes as u32;
-                    ((imm & 3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5)
-                }
-                _ => return Err("a branch out of range".to_owned()),
-            };
-            self.code[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            if self.try_patch(at, kind, target) {
+                continue;
+            }
+            if !matches!(kind, Fixup::Cond | Fixup::Tbz) {
+                return Err("a branch out of range".to_owned());
+            }
+            let veneer = self.emit_veneer(&mut veneers, label);
+            if !self.try_patch(at, kind, veneer) {
+                return Err("a branch out of range".to_owned());
+            }
+        }
+        for (at, label, kind) in std::mem::take(&mut self.fixups) {
+            let target = self.labels[label].ok_or("a jump to a label that was never bound")?;
+            if !self.try_patch(at, kind, target) {
+                return Err("a branch out of range".to_owned());
+            }
         }
         for (at, base, target) in std::mem::take(&mut self.table_fixups) {
             let base = self.labels[base].ok_or("a jump table without a base label")?;
@@ -490,24 +532,59 @@ impl Asm {
         [0x3800_0000, 0x7800_0000, 0xB800_0000, 0xF800_0000][size as usize]
     }
 
+    fn access_pair(&mut self, pair: Option<(PairKind, u8)>, base: u32, scale: u32, rt: u32, mem: Mem) {
+        if let Some((kind, reg)) = pair
+            && let Some(prev) = self.last_mem
+            && prev.end_pos == self.pos()
+            && prev.binds == self.binds
+            && prev.kind == kind
+            && prev.base == mem.base
+            && let Some((r1, r2, min_disp)) = match mem.disp.checked_sub(prev.disp) {
+                Some(8) => Some((prev.reg, reg, prev.disp)),
+                Some(-8) => Some((reg, prev.reg, mem.disp)),
+                _ => None,
+            }
+            && min_disp % 8 == 0
+            && (-512..=504).contains(&min_disp)
+            && !(kind == PairKind::IntLoad && (r1 == r2 || r1 == ZR.0 || r2 == ZR.0 || (mem.base != SP && (prev.reg == mem.base.0 || reg == mem.base.0))))
+            && !(kind == PairKind::FloatLoad && r1 == r2)
+        {
+            self.code.truncate((prev.end_pos - 4) as usize);
+            match kind {
+                PairKind::IntLoad => self.ldp_offset(Reg(r1), Reg(r2), mem.base, min_disp),
+                PairKind::IntStore => self.stp_offset(Reg(r1), Reg(r2), mem.base, min_disp),
+                PairKind::FloatLoad => self.fldp_offset(Vreg(r1), Vreg(r2), mem.base, min_disp),
+                PairKind::FloatStore => self.fstp_offset(Vreg(r1), Vreg(r2), mem.base, min_disp),
+            }
+            self.last_mem = None;
+            return;
+        }
+        let single = self.access(base, scale, rt, mem);
+        self.last_mem = pair.filter(|_| single).map(|(kind, reg)| LastMem { end_pos: self.pos(), binds: self.binds, kind, reg, base: mem.base, disp: mem.disp });
+    }
+
     /// Loads `size` bytes at `mem` into `dst`, sign-extending to 64 bits when `signed`, else zero-extending.
     pub fn load(&mut self, size: Size, signed: bool, dst: Reg, mem: Mem) {
-        self.access(Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
+        let pair = (size == Size::X).then_some((PairKind::IntLoad, dst.0));
+        self.access_pair(pair, Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
     }
 
     pub fn store(&mut self, size: Size, mem: Mem, src: Reg) {
-        self.access(Self::store_base(size), size.log2(), u32::from(src.0), mem);
+        let pair = (size == Size::X).then_some((PairKind::IntStore, src.0));
+        self.access_pair(pair, Self::store_base(size), size.log2(), u32::from(src.0), mem);
     }
 
     /// Loads a float or vector register of `bytes` 4, 8 or 16.
     pub fn vload(&mut self, bytes: u32, dst: Vreg, mem: Mem) {
         let (base, scale) = Self::vbase(bytes);
-        self.access(base | 0x40_0000, scale, u32::from(dst.0), mem);
+        let pair = (bytes == 8).then_some((PairKind::FloatLoad, dst.0));
+        self.access_pair(pair, base | 0x40_0000, scale, u32::from(dst.0), mem);
     }
 
     pub fn vstore(&mut self, bytes: u32, mem: Mem, src: Vreg) {
         let (base, scale) = Self::vbase(bytes);
-        self.access(base, scale, u32::from(src.0), mem);
+        let pair = (bytes == 8).then_some((PairKind::FloatStore, src.0));
+        self.access_pair(pair, base, scale, u32::from(src.0), mem);
     }
 
     /// Loads `size` bytes at `base + (index << shift)` into `dst`.
@@ -543,16 +620,19 @@ impl Asm {
     }
 
     /// One load or store from its unscaled-offset encoding `base`: the scaled form when the offset fits it, the unscaled form for small offsets, else through x17.
-    fn access(&mut self, base: u32, scale: u32, rt: u32, mem: Mem) {
+    fn access(&mut self, base: u32, scale: u32, rt: u32, mem: Mem) -> bool {
         let (disp, rn) = (mem.disp, u32::from(mem.base.0));
         let unit = 1 << scale;
         if disp >= 0 && disp % unit == 0 && disp / unit < 4096 {
             self.word(base | 1 << 24 | ((disp / unit) as u32) << 10 | rn << 5 | rt);
+            true
         } else if (-256..256).contains(&disp) {
             self.word(base | ((disp as u32) & 0x1FF) << 12 | rn << 5 | rt);
+            true
         } else {
             self.mov_imm(Reg(17), i64::from(disp));
             self.access_indexed(base, rt, mem.base, Reg(17), 0);
+            false
         }
     }
 
@@ -707,24 +787,6 @@ impl Asm {
 
     pub fn vbit(&mut self, base: u32, dst: Vreg, a: Vreg, b: Vreg) {
         self.word(base | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
-    }
-
-    pub fn vdup_byte(&mut self, dst: Vreg, src: Reg) {
-        self.word(0x4E01_0C00 | u32::from(src.0) << 5 | u32::from(dst.0));
-    }
-
-    pub fn vcmp_byte(&mut self, eq: bool, dst: Vreg, a: Vreg, b: Vreg) {
-        let base = if eq { 0x6E20_8C00 } else { 0x4E20_3400 };
-        self.word(base | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
-    }
-
-    pub fn varith(&mut self, sub: bool, size: u32, dst: Vreg, a: Vreg, b: Vreg) {
-        let base = if sub { 0x6E20_8400 } else { 0x4E20_8400 };
-        self.word(base | size << 22 | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
-    }
-
-    pub fn vtbl(&mut self, dst: Vreg, table: Vreg, idx: Vreg) {
-        self.word(0x4E00_0000 | u32::from(idx.0) << 16 | u32::from(table.0) << 5 | u32::from(dst.0));
     }
 
     pub fn umov_d1(&mut self, dst: Reg, src: Vreg) {

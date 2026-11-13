@@ -43,8 +43,10 @@ impl Counter {
             self.int += 1;
             return match ty {
                 Type::F32 | Type::F64 if slot < WIN64_INT_ARGS.len() => Loc::Float(slot as u8),
+                Type::Vec { .. } if ty.bytes() == 8 && slot < WIN64_INT_ARGS.len() => Loc::Float(slot as u8),
                 Type::F32 | Type::F64 => self.stack(WORD, WORD),
-                Type::I128 | Type::V128 => self.stack(16, 16),
+                Type::Vec { .. } if ty.bytes() == 8 => self.stack(WORD, WORD),
+                Type::I128 | Type::Vec { .. } => self.stack(16, 16),
                 _ if slot < WIN64_INT_ARGS.len() => Loc::Int(WIN64_INT_ARGS[slot]),
                 _ => self.stack(WORD, WORD),
             };
@@ -55,11 +57,14 @@ impl Counter {
                 Loc::Pair(INT_ARGS[self.int - 2], INT_ARGS[self.int - 1])
             }
             Type::I128 => self.stack(16, 16),
-            Type::F32 | Type::F64 | Type::V128 if self.float < FLOAT_ARGS => {
+            Type::F32 | Type::F64 | Type::Vec { .. } if self.float < FLOAT_ARGS => {
                 self.float += 1;
                 Loc::Float(self.float - 1)
             }
-            Type::V128 => self.stack(16, 16),
+            Type::Vec { .. } => {
+                let bytes = ty.bytes();
+                self.stack(bytes, bytes)
+            }
             Type::F32 | Type::F64 => self.stack(WORD, WORD),
             _ if self.int < INT_ARGS.len() => {
                 self.int += 1;
@@ -74,7 +79,7 @@ pub(super) fn classify(signature: &Signature, abi: CallAbi) -> Result<Abi, Strin
     let win64 = abi == CallAbi::Win64;
     let mut params = Counter { int: 0, float: 0, stack: if win64 { 32 } else { 0 }, win64 };
     let placed = signature.params.iter().map(|param| params.param(param.purpose, param.value_type)).collect();
-    let ints: &[Reg] = if signature.call_conv == CallConv::Internal && !win64 { &[Reg::Rax, Reg::Rdx, Reg::Rcx, Reg::Rsi] } else { &INT_RETURNS };
-    let floats = if signature.call_conv == CallConv::Internal && !win64 { 4 } else if win64 { 1 } else { FLOAT_RETURNS };
+    let ints: &[Reg] = if signature.call_conv == CallConv::Internal { &[Reg::Rax, Reg::Rdx, Reg::Rcx, Reg::R8] } else { &INT_RETURNS };
+    let floats = if signature.call_conv == CallConv::Internal { 4 } else if win64 { 1 } else { FLOAT_RETURNS };
     Ok(Abi { params: placed, returns: returns(signature, ints, floats)?, stack: round(params.stack, 16) })
 }

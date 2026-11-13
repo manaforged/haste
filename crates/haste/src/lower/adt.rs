@@ -202,10 +202,10 @@ impl Lower<'_, '_> {
         for at in self.body.list(fields).to_vec() {
             let init = self.body.fields[at as usize];
             let Some(&index) = self.typed.inits.get(&init.value) else { bail!("field initializer has no field") };
-            values.push((index, self.expr(init.value)?));
+            values.push((index, self.eval_operand(init.value)?));
         }
         let base = match base {
-            Some(base) => self.expr(base)?,
+            Some(base) => self.eval_operand(base)?,
             None => None,
         };
         self.construct(self.ty_of(expr), variant, values, base)
@@ -226,7 +226,7 @@ impl Lower<'_, '_> {
     pub fn ctor_call(&mut self, expr: ExprId, variant: u32, args: List) -> Result<Option<Value>> {
         let mut values = Vec::new();
         for (index, at) in self.body.list(args).to_vec().into_iter().enumerate() {
-            values.push((index as u32, self.expr(ExprId(at))?));
+            values.push((index as u32, self.eval_operand(ExprId(at))?));
         }
         self.construct(self.ty_of(expr), variant, values, None)
     }

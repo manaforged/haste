@@ -168,11 +168,17 @@ impl<'a> Infer<'_, 'a> {
     fn probe_adjusted(&mut self, step: Ty, autoref: Option<Mut>, candidates: &[Candidate], (bounded, all_unbounded, unshadowed): (&[TraitCandidate], &[TraitCandidate], &[TraitCandidate]), wanted: Option<Ty>) -> Result<Option<Pick>> {
         let adjusted = autoref.map_or(step, |mutability| self.cx.types.intern(Kind::Ref(mutability, step)));
         let mut bypassed = false;
-        if let Some(pick) = self.probe_traits(bounded, (adjusted, autoref), true)? {
-            if all_unbounded.is_empty() || wanted.is_none_or(|wanted| self.fits_expected(&pick, wanted)) {
+        if let Some(pick) = self.trial(|infer| {
+            let Some(pick) = infer.probe_traits(bounded, (adjusted, autoref), true)? else {
+                return Ok(None);
+            };
+            if all_unbounded.is_empty() || wanted.is_none_or(|wanted| infer.fits_expected(&pick, wanted)) {
                 return Ok(Some(pick));
             }
             bypassed = true;
+            Ok(None)
+        })? {
+            return Ok(Some(pick));
         }
         for &candidate in candidates {
             if let Some((args, own)) = self.try_receiver(candidate, adjusted)? {
@@ -475,7 +481,6 @@ impl<'a> Infer<'_, 'a> {
         }
         substs.extend(given);
         self.bind_bounds(item, &substs)?;
-        self.bind_impl_bounds(item, &substs)?;
         self.out.res.insert(expr, Res::fn_of(&self.cx.types, item, &substs));
         self.out.adjusts.insert(expr, adjust);
         if let (Some(Mut::Mut), crate::body::Expr::Method { receiver, .. }) = (adjust.autoref, *self.body.expr(expr)) {

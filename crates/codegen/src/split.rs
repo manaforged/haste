@@ -43,13 +43,19 @@ impl Layouts {
         }
     }
 
-    /// Copies into `target` the accesses inside `source` when it has none of its own there, and tells whether it copied any.
+    /// Copies into `target` the accesses inside `source` that do not overlap any existing access in `target`, and tells whether it copied any.
     fn adopt(&mut self, target: End, source: End, bytes: u32) -> bool {
         let Some((slot, base)) = target else { return false };
-        if self.window(target, bytes).next().is_some() {
-            return false;
-        }
-        let found: Vec<(i64, Type)> = self.window(source, bytes).map(|(at, ty)| (at + base, ty)).collect();
+        let existing: Vec<(i64, i64)> = self.window(target, bytes).map(|(at, ty)| (at, at + i64::from(ty.bytes()))).collect();
+        let found: Vec<(i64, Type)> = self
+            .window(source, bytes)
+            .filter(|&(at, ty)| {
+                let end = at + i64::from(ty.bytes());
+                !existing.iter().any(|&(ea, ee)| at < ee && ea < end)
+            })
+            .map(|(at, ty)| (at + base, ty))
+            .filter(|pair| !self.spans[slot].contains(pair))
+            .collect();
         let adopted = !found.is_empty();
         self.spans[slot].extend(found);
         adopted
