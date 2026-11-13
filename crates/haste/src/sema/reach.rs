@@ -12,7 +12,7 @@ use super::infer::{Typed, infer, register};
 use super::substs::Substs;
 mod filter;
 
-use filter::{ReachFilter, collect_filtered_callees};
+use filter::{ReachFilter, collect_filtered_callees, commit_filter_caller, pre_collect_callees};
 use super::ty::{Kind, Ty};
 
 const MIN_PARALLEL_WAVE: usize = 4;
@@ -339,6 +339,7 @@ fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: Vec<usize>,
 fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Condvar), workers: usize, force_commit: bool) {
     let mut batch = Vec::with_capacity(MAX_WORKER_BATCH);
     let mut results = Vec::with_capacity(MAX_WORKER_BATCH);
+    let mut local_filter = ReachFilter::default();
     loop {
         batch.clear();
         {
@@ -352,38 +353,44 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             }
             let take = (q.queue.len() / workers.max(1)).clamp(1, MAX_WORKER_BATCH);
             for _ in 0..take {
-                let Some(item) = q.queue.pop_front() else { break };
-                batch.push(item);
+                let Some((at, instance)) = q.queue.pop_front() else { break };
+                let include_fixed = !q.filter.seen_fixed_poly.contains(&instance.0);
+                batch.push((at, instance, include_fixed));
             }
             q.active += batch.len();
         }
         let mut active = ActiveGuard(mutex, cvar, batch.len());
         results.clear();
-        for &(at, instance) in &batch {
+        for &(at, instance, include_fixed) in &batch {
             let asks0 = cx.asks.count();
             let mut unlaid = Vec::new();
             let before = cx.deferred_evals.len();
             let typed = infer_entry(cx, &instance, &mut unlaid, false);
             let deferred = cx.deferred_evals.len() > before;
             let asked = cx.asks.count() > asks0;
-            results.push((at, instance, typed, unlaid, asked, deferred));
+            let mut callees = Vec::new();
+            if !deferred && (force_commit || !asked) {
+                pre_collect_callees(cx, &mut local_filter, &typed, include_fixed, &mut callees);
+            }
+            results.push((at, instance, typed, unlaid, asked, deferred, callees));
         }
         {
             let mut q = crate::sync::lock(mutex);
             q.active = q.active.saturating_sub(active.2);
             active.2 = 0;
             let mut pushed = false;
-            let mut callees = Vec::new();
-            for (at, instance, typed, unlaid, asked, deferred) in results.drain(..) {
+            for (at, instance, typed, unlaid, asked, deferred, callees) in results.drain(..) {
                 if deferred {
                     q.deferred_items.push((at, instance));
                 } else if !force_commit && asked {
                     q.settled.push((at, typed, unlaid, true));
                 } else {
-                    callees.clear();
-                    collect_filtered_callees(cx, &mut q.filter, instance, &typed, &mut callees);
+                    commit_filter_caller(cx, &mut q.filter, instance, &typed);
                     q.settled.push((at, typed, unlaid, false));
-                    for callee in callees.drain(..) {
+                    for (callee, sealed) in callees {
+                        if sealed && !q.filter.seen_sealed_sysroot.insert(callee.0) {
+                            continue;
+                        }
                         if !q.seen.contains_key(&callee) {
                             let next_at = q.instances.len();
                             q.seen.insert(callee, next_at);

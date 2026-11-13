@@ -4,7 +4,7 @@ use crate::ir::{Binary, Block, Function, Inst, Op, StackSlot, Type, Value};
 use crate::merge::{find, identity, pred_counts, rename};
 
 /// The most cells one path remembers, so a long block costs linear time.
-const CELLS: usize = 64;
+const CELLS: usize = 256;
 
 /// Where remembered bytes start: a frame slot, or an address held in a value.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -21,19 +21,24 @@ struct Cell {
     ty: Type,
 }
 
+fn ranges_alias((a_base, a_off, a_len): (Base, i64, i64), (b_base, b_off, b_len): (Base, i64, i64), unescaped: &[bool]) -> bool {
+    let overlaps = a_off < b_off + b_len && b_off < a_off + a_len;
+    match (a_base, b_base) {
+        (Base::Slot(a), Base::Slot(b)) => a == b && overlaps,
+        (Base::Addr(a), Base::Addr(b)) if a == b => overlaps,
+        (Base::Addr(_), Base::Slot(b)) | (Base::Slot(b), Base::Addr(_)) => !unescaped[b.index()],
+        (Base::Addr(_), Base::Addr(_)) => true,
+    }
+}
+
 impl Cell {
-    fn overlaps(&self, other: &Cell) -> bool {
-        self.offset < other.offset + i64::from(other.ty.bytes()) && other.offset < self.offset + i64::from(self.ty.bytes())
+    fn span(&self) -> (Base, i64, i64) {
+        (self.base, self.offset, i64::from(self.ty.bytes()))
     }
 
     /// Whether a write of `self` may change the bytes of `other`: frame slots never overlap each other, an unescaped slot never aliases an address.
     fn clobbers(&self, other: &Cell, unescaped: &[bool]) -> bool {
-        match (self.base, other.base) {
-            (Base::Slot(a), Base::Slot(b)) => a == b && self.overlaps(other),
-            (Base::Addr(a), Base::Addr(b)) if a == b => self.overlaps(other),
-            (Base::Addr(_), Base::Slot(b)) | (Base::Slot(b), Base::Addr(_)) => !unescaped[b.index()],
-            (Base::Addr(_), Base::Addr(_)) => true,
-        }
+        ranges_alias(self.span(), other.span(), unescaped)
     }
 }
 
@@ -53,9 +58,14 @@ impl Known {
     }
 
     fn remember(&mut self, cell: Cell, value: Value) {
-        if self.0.len() < CELLS {
-            self.0.push((cell, value));
+        if let Some(entry) = self.0.iter_mut().find(|(known, _)| *known == cell) {
+            entry.1 = value;
+            return;
         }
+        if self.0.len() == CELLS {
+            self.0.remove(0);
+        }
+        self.0.push((cell, value));
     }
 
     fn assemble_const(&self, cell: &Cell, consts: &[Option<i64>]) -> Option<Assembled> {
@@ -95,13 +105,7 @@ impl Known {
     }
 
     fn clobber_slot(&mut self, slot: StackSlot, offset: i64, bytes: i64, unescaped: &[bool]) {
-        let end = offset + bytes;
-        let slot_escaped = !unescaped[slot.index()];
-        self.0.retain(|(known, _)| match known.base {
-            Base::Slot(s) if s == slot => !(known.offset < end && offset < known.offset + i64::from(known.ty.bytes())),
-            Base::Addr(_) if slot_escaped => false,
-            _ => true,
-        });
+        self.0.retain(|(known, _)| !ranges_alias((Base::Slot(slot), offset, bytes), known.span(), unescaped));
     }
 }
 
@@ -160,24 +164,30 @@ fn effect(func: &Function, state: &State<'_>, inst: Inst) -> Effect {
     }
 }
 
-fn flush_reads(pending: &mut Vec<(StackSlot, i64, i64, usize)>, slot: StackSlot, offset: i64, bytes: i64) {
-    let end = offset + bytes;
-    pending.retain(|&(s, off, len, _)| s != slot || !(off < end && offset < off + len));
+fn flush_pending_addr(pending: &mut Vec<(Base, i64, i64, usize)>) {
+    pending.retain(|&(base, _, _, _)| matches!(base, Base::Slot(_)));
 }
 
-/// Drops from `block` each load whose bytes `known` holds, recording its replacement in `subst`, eliminates dead overwritten stores to unescaped slots, and leaves in `known` what memory holds at the block's end.
+fn flush_reads(pending: &mut Vec<(Base, i64, i64, usize)>, read_base: Base, offset: i64, bytes: i64, unescaped: &[bool]) {
+    pending.retain(|&(base, off, len, _)| !ranges_alias((read_base, offset, bytes), (base, off, len), unescaped));
+}
+
+/// Drops from `block` each load whose bytes `known` holds, recording its replacement in `subst`, eliminates dead overwritten stores, and leaves in `known` what memory holds at the block's end.
 fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Known) -> bool {
     let insts = std::mem::take(&mut func.blocks[block.index()].insts);
     let mut kept: Vec<Option<Inst>> = Vec::with_capacity(insts.len());
-    let mut pending_stores: Vec<(StackSlot, i64, i64, usize)> = Vec::new();
+    let mut pending_stores: Vec<(Base, i64, i64, usize)> = Vec::new();
     let mut renamed = false;
     for inst in insts {
         match func.insts[inst.index()].op {
             Op::Move(_, from, bytes) => {
                 if let Some((slot, base)) = state.slots[from.index()] {
-                    flush_reads(&mut pending_stores, slot, i64::from(base), i64::from(bytes));
+                    flush_reads(&mut pending_stores, Base::Slot(slot), i64::from(base), i64::from(bytes), state.unescaped);
+                } else {
+                    flush_pending_addr(&mut pending_stores);
                 }
             }
+            Op::Trap | Op::Trapz(_) => flush_pending_addr(&mut pending_stores),
             Op::TryCall { .. } => pending_stores.clear(),
             _ => {}
         }
@@ -221,21 +231,21 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                         known.remember(cell, result);
                     } else {
                         known.remember(cell, result);
-                        if let Base::Slot(s) = cell.base {
-                            flush_reads(&mut pending_stores, s, cell.offset, i64::from(cell.ty.bytes()));
-                        }
+                        flush_reads(&mut pending_stores, cell.base, cell.offset, i64::from(cell.ty.bytes()), state.unescaped);
                     }
                 }
             },
             Effect::Write(cell, value) => {
                 known.write(cell, value, state.unescaped);
-                if let Base::Slot(s) = cell.base
-                    && state.unescaped[s.index()]
-                {
+                let track = match cell.base {
+                    Base::Slot(s) => state.unescaped[s.index()],
+                    Base::Addr(_) => true,
+                };
+                if track {
                     let bytes = i64::from(cell.ty.bytes());
                     let end = cell.offset + bytes;
-                    pending_stores.retain(|&(ps, off, len, kept_idx)| {
-                        if ps == s && off >= cell.offset && off + len <= end {
+                    pending_stores.retain(|&(pbase, off, len, kept_idx)| {
+                        if pbase == cell.base && off >= cell.offset && off + len <= end {
                             if let Some(dead_store) = kept[kept_idx].take() {
                                 func.insts[dead_store.index()].op = Op::Trap;
                             }
@@ -244,13 +254,14 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                             true
                         }
                     });
-                    pending_stores.push((s, cell.offset, bytes, kept.len()));
+                    pending_stores.push((cell.base, cell.offset, bytes, kept.len()));
                 }
             }
             Effect::ClobberSlot { slot, offset, bytes } => known.clobber_slot(slot, offset, bytes, state.unescaped),
             Effect::Unknown => {
                 let is_call = matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. });
                 known.0.retain(|(c, _)| matches!(c.base, Base::Slot(s) if state.unescaped[s.index()] || (is_call && state.call_readonly[s.index()])));
+                flush_pending_addr(&mut pending_stores);
             }
             Effect::None => {}
         }

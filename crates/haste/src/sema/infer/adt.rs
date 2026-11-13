@@ -352,7 +352,7 @@ pub fn maybe_unsized(cx: &mut super::super::Context<'_>, item: ItemRef) -> Resul
     let args: Vec<Ty> = super::scope::type_params(&def.generics.params)
         .map(|generic| match generic.kind {
             crate::body::sig::GenericKind::Const(_) => stand_ins[0],
-            _ if relaxed(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
+            _ if param_relaxes_sized(&def.body, src, &def.generics.predicates, generic) => stand_ins[1],
             _ => stand_ins[2],
         })
         .collect();
@@ -365,7 +365,28 @@ pub fn maybe_unsized(cx: &mut super::super::Context<'_>, item: ItemRef) -> Resul
     }
 }
 
-fn relaxed(arena: &Body, src: &crate::outline::source::Source, predicates: &[crate::body::sig::Predicate], generic: &crate::body::sig::Generic) -> bool {
-    let bounds = super::scope::generic_bounds(arena, src, predicates, generic);
-    bounds.iter().any(|&bound| matches!(arena.bounds[bound as usize], crate::body::Bound::Trait { maybe: true, .. }))
+fn bound_relaxes_sized(arena: &Body, src: &crate::outline::source::Source, bound: &crate::body::Bound) -> bool {
+    match *bound {
+        crate::body::Bound::Trait { maybe: true, .. } => true,
+        crate::body::Bound::Trait { path, .. } => arena
+            .list(arena.path(path).segments)
+            .last()
+            .is_some_and(|&seg| matches!(src.text(arena.segments[seg as usize].name), "PointeeSized" | "MetaSized")),
+        _ => false,
+    }
+}
+
+pub(in crate::sema) fn body_relaxes_sized(arena: &Body, src: &crate::outline::source::Source) -> bool {
+    arena.bounds.iter().any(|b| bound_relaxes_sized(arena, src, b))
+}
+
+pub(in crate::sema) fn param_relaxes_sized(
+    arena: &Body,
+    src: &crate::outline::source::Source,
+    predicates: &[crate::body::sig::Predicate],
+    generic: &crate::body::sig::Generic,
+) -> bool {
+    super::scope::generic_bounds(arena, src, predicates, generic)
+        .into_iter()
+        .any(|bound| bound_relaxes_sized(arena, src, &arena.bounds[bound as usize]))
 }

@@ -310,6 +310,13 @@ impl Lower<'_, '_> {
     }
 
     fn call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
+        if self.body.list(args).is_empty() && super::array::is_maybe_uninit_fn(self.cx, self.typed, expr, callee) {
+            if !self.open {
+                return Ok(None);
+            }
+            let whole = repr(self.cx, self.ty_of(expr))?;
+            return Ok(self.slot(whole).and_then(|slot| self.read(Place::slot(slot, whole))));
+        }
         if let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) {
             return self.call_value((expr, callee), (item, substs), args);
         }

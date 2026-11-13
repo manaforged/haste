@@ -28,6 +28,7 @@ mod tables;
 mod zonk;
 
 pub use adt::{Fields, field_types, maybe_unsized};
+pub(in crate::sema) use adt::{body_relaxes_sized, param_relaxes_sized};
 pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, register};
 pub use coerce::Coercion;

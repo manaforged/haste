@@ -2,12 +2,11 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::body::Bound;
 use crate::body::sig::GenericKind;
 use crate::names::{ItemRef, Primitive};
 
 use super::super::Context;
-use super::super::infer::{LazyTables, Res, Shape, Typed, maybe_unsized};
+use super::super::infer::{LazyTables, Res, Shape, Typed, body_relaxes_sized, maybe_unsized, param_relaxes_sized};
 use super::super::substs::Substs;
 use super::super::summary::{PolyObligation, SummaryKind};
 use super::super::ty::{Kind, Ty};
@@ -82,27 +81,25 @@ impl ReachFilter {
     }
 }
 
-fn has_relaxed_bound(bounds: &[Bound]) -> bool {
-    bounds.iter().any(|b| matches!(b, Bound::Trait { maybe: true, .. }))
-}
-
 fn param_is_sized(cx: &mut Context<'_>, item: ItemRef, idx: u16) -> bool {
     if cx.owner_trait(item).is_some() && idx == 0 {
         return false;
     }
     let Ok(sig) = cx.signature(item) else { return false };
-    if has_relaxed_bound(&sig.body.bounds) {
+    if body_relaxes_sized(&sig.body, &cx.file(item).source) {
         return false;
     }
-    if let Some(owner) = cx.owner_impl(item)
-        && !cx.impl_header(owner).is_ok_and(|h| !has_relaxed_bound(&h.body.bounds))
-    {
-        return false;
+    if let Some(owner) = cx.owner_impl(item) {
+        let Ok(h) = cx.impl_header(owner) else { return false };
+        if body_relaxes_sized(&h.body, &cx.impl_file(owner).source) {
+            return false;
+        }
     }
-    if let Some(tr) = cx.owner_trait(item)
-        && !cx.trait_generics(tr).is_ok_and(|tg| !has_relaxed_bound(&tg.0.bounds))
-    {
-        return false;
+    if let Some(tr) = cx.owner_trait(item) {
+        let Ok(tg) = cx.trait_generics(tr) else { return false };
+        if body_relaxes_sized(&tg.0, &cx.file(tr).source) {
+            return false;
+        }
     }
     true
 }
@@ -149,15 +146,21 @@ fn layout_ty_infallible(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> bool {
             if def.generics.params.iter().any(|g| matches!(g.kind, GenericKind::Const(_))) {
                 return false;
             }
+            let any_relaxed = body_relaxes_sized(&def.body, &cx.file(adt).source);
+            let adt_unsized = any_relaxed && maybe_unsized(cx, adt).unwrap_or(true);
+            let src = &cx.file(adt).source;
             let args = cx.types.substs(args).to_vec();
-            if !args.iter().all(|&arg| layout_ty_infallible(cx, item, arg)) {
-                return false;
+            let type_params: Vec<_> = def.generics.params.iter().filter(|g| g.kind != GenericKind::Lifetime).collect();
+            for (i, &arg) in args.iter().enumerate() {
+                let param_relaxed = type_params.get(i).is_some_and(|g| param_relaxes_sized(&def.body, src, &def.generics.predicates, g));
+                if !adt_unsized && param_relaxed {
+                    continue;
+                }
+                if !layout_ty_infallible(cx, item, arg) || !ty_is_sized(cx, item, arg) {
+                    return false;
+                }
             }
-            if !has_relaxed_bound(&def.body.bounds) || maybe_unsized(cx, adt).unwrap_or(true) {
-                args.iter().all(|&arg| ty_is_sized(cx, item, arg))
-            } else {
-                true
-            }
+            true
         }
         _ => false,
     }
@@ -183,12 +186,12 @@ fn substs_has_non_fixed(cx: &Context<'_>, substs: Substs) -> bool {
     !substs.is_empty() && cx.types.substs(substs).iter().any(|&ty| ty_has_non_fixed(cx, ty))
 }
 
-pub(super) fn collect_filtered_callees(
+pub(super) fn pre_collect_callees(
     cx: &mut Context<'_>,
     filter: &mut ReachFilter,
-    caller: Instance,
     typed: &Result<Arc<Typed>, String>,
-    out: &mut Vec<Instance>,
+    include_fixed: bool,
+    out: &mut Vec<(Instance, bool)>,
 ) {
     let Ok(typed) = typed else { return };
     let check_only = cx.store.lookups.skip_warm_sysroot_bodies;
@@ -197,25 +200,21 @@ pub(super) fn collect_filtered_callees(
         if cx.intrinsic(item).is_some() {
             return;
         }
+        let mut sealed = false;
         if check_only && cx.outline.is_fixed(item.krate) {
             if !substs_has_non_fixed(cx, substs) {
                 return;
             }
-            if filter.check_sealed(cx, item, &mut visiting) == Some(true) && !filter.seen_sealed_sysroot.insert(item) {
-                return;
-            }
+            sealed = filter.check_sealed(cx, item, &mut visiting) == Some(true);
         }
-        out.push((item, substs));
+        out.push(((item, substs), sealed));
     };
     match &typed.tables {
         LazyTables::Poly(poly) => {
-            if filter.seen_fixed_poly.insert(caller.0) {
+            if include_fixed {
                 for (item, substs) in poly.calls() { push_callee(cx, filter, item, substs); }
             } else {
                 for (item, substs) in poly.dynamic_calls() { push_callee(cx, filter, item, substs); }
-            }
-            if cx.outline.is_fixed(caller.0.krate) {
-                filter.seen_sealed_sysroot.insert(caller.0);
             }
             for r in &typed.drops {
                 if let Res::Fn(item, substs) = *r { push_callee(cx, filter, item, substs); }
@@ -234,5 +233,33 @@ pub(super) fn collect_filtered_callees(
         LazyTables::Eager(_) => {
             for (item, substs) in typed.calls() { push_callee(cx, filter, item, substs); }
         }
+    }
+}
+
+pub(super) fn commit_filter_caller(cx: &Context<'_>, filter: &mut ReachFilter, caller: Instance, typed: &Result<Arc<Typed>, String>) {
+    if let Ok(typed) = typed && matches!(typed.tables, LazyTables::Poly(_)) {
+        filter.seen_fixed_poly.insert(caller.0);
+        if cx.outline.is_fixed(caller.0.krate) {
+            filter.seen_sealed_sysroot.insert(caller.0);
+        }
+    }
+}
+
+pub(super) fn collect_filtered_callees(
+    cx: &mut Context<'_>,
+    filter: &mut ReachFilter,
+    caller: Instance,
+    typed: &Result<Arc<Typed>, String>,
+    out: &mut Vec<Instance>,
+) {
+    let include_fixed = !filter.seen_fixed_poly.contains(&caller.0);
+    let mut pre = Vec::new();
+    pre_collect_callees(cx, filter, typed, include_fixed, &mut pre);
+    commit_filter_caller(cx, filter, caller, typed);
+    for (callee, sealed) in pre {
+        if sealed && !filter.seen_sealed_sysroot.insert(callee.0) {
+            continue;
+        }
+        out.push(callee);
     }
 }

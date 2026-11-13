@@ -18,17 +18,8 @@ pub(super) fn hash_plan_sites(cx: &mut Context<'_>, reached: &Reached, mix: &mut
     for ps in &plan.pat_sites {
         hash_pat_site(cx, mix, typed, ps)?;
     }
-    for &(_, val_expr) in &plan.repeat_sites {
-        let val_ty = typed.expr_ty(&cx.types, val_expr);
-        let is_uninit = val_ty != Ty::NONE
-            && typed.site_fn(SiteKey::ExprRes(val_expr)).is_some_and(|(i, _)| {
-                let ret_adt = match *cx.types.kind(val_ty) {
-                    Kind::Adt(adt, _) => cx.lang(adt) == Some("maybe_uninit"),
-                    _ => false,
-                };
-                (cx.name(i) == "uninit" && ret_adt) || cx.lang(i) == Some("maybe_uninit_uninit")
-            });
-        mix.bool(is_uninit);
+    for &(call_expr, callee) in &plan.repeat_sites {
+        mix.bool(super::super::array::is_maybe_uninit_fn(cx, typed, call_expr, callee));
     }
     for &clos_expr in &plan.closure_exprs {
         let clos_ty = typed.expr_ty(&cx.types, clos_expr);
@@ -136,6 +127,16 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
             }
             for arg in args {
                 mix.bool(typed.syntax().const_args.contains(arg));
+            }
+            let uninit_call = args.is_empty() && super::super::array::is_maybe_uninit_fn(cx, typed, *expr, *callee);
+            mix.bool(uninit_call);
+            if uninit_call {
+                let ty = typed.expr_ty(&cx.types, *expr);
+                if ty == Ty::NONE {
+                    mix.byte(0xff);
+                } else if !cx.is_unsized(ty)? {
+                    hash_repr(cx, mix, ty)?;
+                }
             }
         }
         FieldSite::MethodSite { expr, receiver, args } => {
