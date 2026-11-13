@@ -340,6 +340,7 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
     let mut batch = Vec::with_capacity(MAX_WORKER_BATCH);
     let mut results = Vec::with_capacity(MAX_WORKER_BATCH);
     let mut local_filter = ReachFilter::default();
+    let mut synced_len = 0usize;
     loop {
         batch.clear();
         {
@@ -350,6 +351,11 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
                     return;
                 }
                 q = cvar.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if q.filter.sealed_cache.len() > synced_len {
+                for (&k, &v) in &q.filter.sealed_cache {
+                    local_filter.sealed_cache.entry(k).or_insert(v);
+                }
             }
             let take = (q.queue.len() / workers.max(1)).clamp(1, MAX_WORKER_BATCH);
             for _ in 0..take {
@@ -378,6 +384,10 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             let mut q = crate::sync::lock(mutex);
             q.active = q.active.saturating_sub(active.2);
             active.2 = 0;
+            for (&k, &v) in &local_filter.sealed_cache {
+                q.filter.sealed_cache.entry(k).or_insert(v);
+            }
+            synced_len = q.filter.sealed_cache.len();
             let mut pushed = false;
             for (at, instance, typed, unlaid, asked, deferred, callees) in results.drain(..) {
                 if deferred {

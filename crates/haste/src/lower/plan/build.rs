@@ -43,6 +43,15 @@ pub(super) fn build_plan(body: &Body, closure_root: Option<ExprId>) -> BodyFootp
             Expr::Cast(opnd, _) => {
                 num_sites.extend([id, opnd]);
             }
+            Expr::Block { stmts, .. } => {
+                for &s in body.list(stmts) {
+                    if let Stmt::Let { init: Some(init), otherwise: None, .. } = body.stmts[s as usize]
+                        && let Some(site) = super::super::array::uninit_call_site(body, init)
+                    {
+                        repeat_sites.push(site);
+                    }
+                }
+            }
             Expr::Repeat(val, _) => {
                 if let Some(site) = super::super::array::uninit_call_site(body, val) {
                     repeat_sites.push(site);

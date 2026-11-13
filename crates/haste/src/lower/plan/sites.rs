@@ -19,7 +19,7 @@ pub(super) fn hash_plan_sites(cx: &mut Context<'_>, reached: &Reached, mix: &mut
         hash_pat_site(cx, mix, typed, ps)?;
     }
     for &(call_expr, callee) in &plan.repeat_sites {
-        mix.bool(super::super::array::is_maybe_uninit_fn(cx, typed, call_expr, callee));
+        hash_uninit_site(cx, mix, typed, call_expr, super::super::array::is_maybe_uninit_fn(cx, typed, call_expr, callee))?;
     }
     for &clos_expr in &plan.closure_exprs {
         let clos_ty = typed.expr_ty(&cx.types, clos_expr);
@@ -28,6 +28,19 @@ pub(super) fn hash_plan_sites(cx: &mut Context<'_>, reached: &Reached, mix: &mut
         {
             hash_ty_facts(cx, mix, env_ty)?;
             hash_tuple_offsets(cx, mix, env_ty)?;
+        }
+    }
+    Ok(())
+}
+
+fn hash_uninit_site(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, expr: crate::body::ExprId, is_uninit: bool) -> Result<()> {
+    mix.bool(is_uninit);
+    if is_uninit {
+        let ty = typed.expr_ty(&cx.types, expr);
+        if ty == Ty::NONE {
+            mix.byte(0xff);
+        } else if !cx.is_unsized(ty)? {
+            hash_repr(cx, mix, ty)?;
         }
     }
     Ok(())
@@ -128,16 +141,7 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
             for arg in args {
                 mix.bool(typed.syntax().const_args.contains(arg));
             }
-            let uninit_call = args.is_empty() && super::super::array::is_maybe_uninit_fn(cx, typed, *expr, *callee);
-            mix.bool(uninit_call);
-            if uninit_call {
-                let ty = typed.expr_ty(&cx.types, *expr);
-                if ty == Ty::NONE {
-                    mix.byte(0xff);
-                } else if !cx.is_unsized(ty)? {
-                    hash_repr(cx, mix, ty)?;
-                }
-            }
+            hash_uninit_site(cx, mix, typed, *expr, args.is_empty() && super::super::array::is_maybe_uninit_fn(cx, typed, *expr, *callee))?;
         }
         FieldSite::MethodSite { expr, receiver, args } => {
             let mut ty = typed.expr_ty(&cx.types, *receiver);

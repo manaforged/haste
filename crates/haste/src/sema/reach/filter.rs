@@ -7,8 +7,9 @@ use crate::names::{ItemRef, Primitive};
 
 use super::super::Context;
 use super::super::infer::{LazyTables, Res, Shape, Typed, body_relaxes_sized, maybe_unsized, param_relaxes_sized};
+use super::super::intrinsic::Intrinsic;
 use super::super::substs::Substs;
-use super::super::summary::{PolyObligation, SummaryKind};
+use super::super::summary::{ConstHole, PolyObligation, SummaryKind};
 use super::super::ty::{Kind, Ty};
 use super::Instance;
 
@@ -23,6 +24,11 @@ impl ReachFilter {
     pub(super) fn check_sealed(&mut self, cx: &mut Context<'_>, item: ItemRef, visiting: &mut HashSet<ItemRef>) -> Option<bool> {
         if let Some(&cached) = self.sealed_cache.get(&item) {
             return Some(cached);
+        }
+        if let Some(intrinsic) = cx.intrinsic(item) {
+            let safe = !matches!(intrinsic, Intrinsic::Transmute);
+            self.sealed_cache.insert(item, safe);
+            return Some(safe);
         }
         if !cx.outline.is_fixed(item.krate) {
             self.sealed_cache.insert(item, false);
@@ -50,7 +56,7 @@ impl ReachFilter {
             && summary.obligations.iter().all(|o| matches!(o, PolyObligation::Prove { .. }))
             && summary.call_holes.is_empty()
             && summary.op_holes.is_empty()
-            && summary.const_holes.is_empty()
+            && summary.const_holes.iter().all(|h| matches!(h, ConstHole::Intrinsic { .. }))
             && summary.template.closures.is_empty()
             && summary.layout_tys.iter().all(|&ty| layout_ty_infallible(cx, item, ty))
             && summary.drop_tys.iter().all(|&ty| layout_ty_infallible(cx, item, ty));

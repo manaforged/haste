@@ -396,7 +396,7 @@ impl Lower<'_, '_> {
         Ok(callee)
     }
 
-    fn emit_inlined(&mut self, inlined: &InlinedCallee, origin: SiteOrigin, values: &[Value]) -> Vec<Value> {
+    fn emit_inlined(&mut self, inlined: &InlinedCallee, origin: SiteOrigin, values: &[Value]) -> Result<Vec<Value>> {
         if !self.open {
             let dead = *self.dead.get_or_insert_with(|| self.b.create_block());
             self.b.switch_to_block(dead);
@@ -404,13 +404,13 @@ impl Lower<'_, '_> {
         let sym_base = self.relocs.len() as u32;
         self.relocs.extend(inlined.relocs.iter().cloned());
         self.reloc_plan.push(RelocStep::SiteInline { origin, plan: Arc::clone(&inlined.reloc_plan) });
-        match self.mode {
+        Ok(match self.mode {
             LowerMode::Stencil => self.b.inline_shifted(&inlined.body, values, sym_base),
             LowerMode::Dict => {
-                let dict = self.dict_param.expect("dictionary parameter is set");
+                let Some(dict) = self.dict_param else { bail!("dictionary parameter is not set") };
                 self.b.inline_dict(&inlined.body, values, dict, sym_base)
             }
-        }
+        })
     }
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
@@ -419,7 +419,7 @@ impl Lower<'_, '_> {
         let code = match callee {
             Callee::Code(code) => code,
             Callee::Reached(index, origin) => match if self.slots.allow_inline() { self.inline_callee(index, devirt)? } else { None } {
-                Some(inlined) => return Ok(self.emit_inlined(&inlined, origin, values)),
+                Some(inlined) => return self.emit_inlined(&inlined, origin, values),
                 None => self.code_of(index, origin),
             },
         };

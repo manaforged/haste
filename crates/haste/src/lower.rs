@@ -615,8 +615,11 @@ impl Lower<'_, '_> {
 
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<()> {
         let Some(init) = init else {
-            return self.declare_uninit(pat);
+            return self.declare_binding(pat, false);
         };
+        if self.open && self.uninit_call(init) && self.can_declare_uninit_val(pat) && !self.typed.coercions.contains_key(&init) {
+            return self.declare_binding(pat, true);
+        }
         self.extend(init);
         let unboxed = self.moves_whole_box(pat, init)?;
         let place = if unboxed { self.temp(init)? } else { self.place_or_temp(init)? };
@@ -628,15 +631,24 @@ impl Lower<'_, '_> {
         self.commit_moves()
     }
 
-    fn declare_uninit(&mut self, pat: PatId) -> Result<()> {
+    fn can_declare_uninit_val(&self, pat: PatId) -> bool {
+        match *self.body.pat(pat) {
+            Pat::Bind { sub: None, by_ref: false, .. } => !self.typed.pat_res.contains_key(&pat) && !self.typed.ref_binds.contains_key(&pat),
+            Pat::Wild => true,
+            Pat::Paren(inner) => self.can_declare_uninit_val(inner),
+            _ => false,
+        }
+    }
+
+    fn declare_binding(&mut self, pat: PatId, init: bool) -> Result<()> {
         match *self.body.pat(pat) {
             Pat::Bind { sub: None, .. } => match self.typed.binds.get(&pat) {
-                Some(&local) => self.declare_as(local, None, false),
+                Some(&local) => self.declare_as(local, None, init),
                 None => bail!("an uninitialized binding with no local"),
             },
             Pat::Wild => Ok(()),
-            Pat::Paren(inner) => self.declare_uninit(inner),
-            Pat::Tuple(items) => self.body.list(items).to_vec().into_iter().try_for_each(|item| self.declare_uninit(PatId(item))),
+            Pat::Paren(inner) => self.declare_binding(inner, init),
+            Pat::Tuple(items) => self.body.list(items).to_vec().into_iter().try_for_each(|item| self.declare_binding(PatId(item), init)),
             _ => bail!("uninitialized `let` with a pattern"),
         }
     }

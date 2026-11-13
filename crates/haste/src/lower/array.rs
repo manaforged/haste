@@ -66,8 +66,8 @@ impl Lower<'_, '_> {
         Ok(self.read(Place::slot(slot, whole)))
     }
 
-    /// Whether `expr` is `MaybeUninit::uninit()`, whose bytes are undefined, so a repeat of it need not store them.
-    fn uninit_call(&self, expr: ExprId) -> bool {
+    /// Whether `expr` is `MaybeUninit::uninit()`, whose bytes are undefined, so a repeat or binding of it need not store them.
+    pub(super) fn uninit_call(&self, expr: ExprId) -> bool {
         uninit_call_site(self.body, expr).is_some_and(|(e, callee)| is_maybe_uninit_fn(self.cx, self.typed, e, callee))
     }
 
