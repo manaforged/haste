@@ -145,8 +145,7 @@ impl Emit<'_> {
             return None;
         }
         let inst = self.defs[val.index()]?;
-        let Op::Binary(op, b, c) = self.func.insts[inst.index()].op else { return None };
-        let imm = self.plan.const_of(c)?;
+        let (op, b, imm) = super::fuse::shift_parts(&self.func.insts[inst.index()].op, &self.plan)?;
         let bits = ty.bits();
         let mask = bits - 1;
         let amt = (imm as u32) & mask;

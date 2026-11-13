@@ -623,11 +623,11 @@ impl Image {
 
     pub(super) fn emit_dict_stub_with_tier(&self, body_exec: usize, symbols: &[u64], tier_up: Option<haste_codegen::DictTierUp>, pass: &mut Pass) -> Result<(usize, Vec<u8>)> {
         let dict_addr = self.alloc_dict(symbols);
-        let arch = target().arch;
+        let target = target();
         let space = if tier_up.is_some() { 128 } else { DICT_STUB_SPACE };
         let mut written = Vec::new();
         let exec = pass.memory.write_with(space, |stub_exec| {
-            let bytes = haste_codegen::dict_entry_stub(arch, stub_exec, body_exec, dict_addr, tier_up)?;
+            let bytes = target.dict_entry_stub(stub_exec, body_exec, dict_addr, tier_up)?;
             written = bytes.clone();
             Ok(bytes)
         })?;

@@ -21,7 +21,7 @@ const TRAITS: [(&str, &str, u32); 11] = [
 
 pub(crate) const DEFAULT_FLAGS: u32 = 3 << 29 | ' ' as u32;
 const WIDTH_SET: u32 = 1 << 27;
-const PRECISION_SET: u32 = 1 << 28;
+pub(crate) const PRECISION_SET: u32 = 1 << 28;
 
 /// Which argument a placeholder or a count reads.
 #[derive(Clone, PartialEq, Eq)]

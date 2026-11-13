@@ -2,7 +2,6 @@
 
 use crate::dom::dominators;
 use crate::ir::{Binary, Block, BlockData, Function, Inst, Op, StackSlot, Value};
-use crate::live::results;
 use crate::loads::{classify_slots, clobbers, slot_addresses};
 
 /// One natural loop: its head, the blocks of its body including the head, and the one block outside it that enters the head by a jump, when there is one.
@@ -63,18 +62,6 @@ fn loops(func: &Function, entry: Block) -> Vec<Loop> {
         .collect();
     found.sort_by_key(|each| each.size);
     found
-}
-
-/// For each value, the block that defines it.
-fn homes(func: &Function) -> Vec<Option<Block>> {
-    let mut home = vec![None; func.types.len()];
-    for (index, block) in func.blocks.iter().enumerate() {
-        block.params.iter().for_each(|param| home[param.index()] = Some(Block(index as u32)));
-        for inst in &block.insts {
-            results(&func.insts[inst.index()]).for_each(|value| home[value.index()] = Some(Block(index as u32)));
-        }
-    }
-    home
 }
 
 /// The number of natural loops each block lies in.
@@ -233,7 +220,7 @@ pub(crate) fn run(func: &mut Function) {
     }
     let slot_addrs = slot_addresses(func);
     let (_, slot_ro) = classify_slots(func, &slot_addrs);
-    let mut home = homes(func);
+    let mut home = func.def_blocks();
     for idx in 0..found.len() {
         let pre = found[idx].entry.or_else(|| {
             let created = preheader(func, &found[idx], &mut home)?;

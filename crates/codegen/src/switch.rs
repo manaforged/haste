@@ -12,18 +12,14 @@ struct Info {
 }
 
 fn analyze(func: &Function) -> Info {
-    let mut preds = vec![0_u32; func.blocks.len()];
-    let mut uses = vec![0_u32; func.types.len()];
+    let preds = func.pred_counts();
+    let uses = func.use_counts();
     let mut consts = vec![None; func.types.len()];
     let mut def_block = vec![None; func.types.len()];
     let mut cmps = vec![None; func.types.len()];
     for (b, block) in func.blocks.iter().enumerate() {
-        for target in func.successors(Block(b as u32)) {
-            preds[target.index()] += 1;
-        }
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
-            data.op.for_operands(|v| uses[v.index()] += 1);
             if let Some(res) = data.result {
                 def_block[res.index()] = Some(b);
                 match data.op {

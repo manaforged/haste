@@ -18,13 +18,7 @@ pub(crate) fn run(func: &mut Function) {
 
 /// The number of control-flow edges into each block.
 pub(crate) fn pred_counts(func: &Function) -> Vec<u32> {
-    let mut preds = vec![0_u32; func.blocks.len()];
-    for block in 0..func.blocks.len() {
-        for target in func.successors(Block(block as u32)) {
-            preds[target.index()] += 1;
-        }
-    }
-    preds
+    func.pred_counts()
 }
 
 /// Builds an identity replacement table mapping each of `count` values to itself.

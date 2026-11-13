@@ -358,7 +358,7 @@ impl Fold {
 
     /// Sends each edge that passes a constant to a block holding only a branch on that parameter straight to the target the branch takes.
     fn thread(&self, func: &mut Function, pinned: &[bool]) -> bool {
-        let mut uses = use_counts(func);
+        let mut uses = func.use_counts();
         let mut changed = false;
         for block in 0..func.blocks.len() {
             let Some(&last) = func.blocks[block].insts.last() else { continue };
@@ -547,15 +547,6 @@ fn pure(op: &Op) -> bool {
     matches!(op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Sha256Rounds(..) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
 }
 
-/// How many times the instructions in blocks read each value.
-fn use_counts(func: &Function) -> Vec<u32> {
-    let mut uses = vec![0_u32; func.types.len()];
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        func.insts[inst.index()].op.for_operands(|value| uses[value.index()] += 1);
-    }
-    uses
-}
-
 /// The instruction in a block that defines each value.
 pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
     let mut defs = vec![None; func.types.len()];
@@ -580,7 +571,7 @@ pub(crate) fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
 
 /// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
 fn dead(func: &mut Function) {
-    let mut uses = use_counts(func);
+    let mut uses = func.use_counts();
     let mut keep = Vec::new();
     for block in func.blocks.iter_mut().rev() {
         keep.clear();
@@ -625,8 +616,8 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
         for inst in &block.insts {
             func.insts[inst.index()].op.map_operands(|value| fold.find(value));
             let replacement = match func.insts[inst.index()].op {
-                Op::Binary(Binary::Fmul, x, y) if is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
-                Op::Binary(Binary::Fmul, x, y) if is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
+                Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
+                Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
                 _ => func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const),
             };
             if let Some(op) = replacement {
@@ -634,151 +625,15 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
             }
         }
     }
-    invert(func);
+    crate::algebra::rewrite(func, &fold.defs);
+    crate::algebra::invert(func);
     dead(func);
     if fold.thread(func, &pinned) | fold.branches(func) {
         prune(func, entry);
         dead(func);
     }
-    if devirt_vtables(func, &fold.defs) {
+    if crate::algebra::devirt_vtables(func, &fold.defs) {
         dead(func);
-    }
-}
-
-fn devirt_vtables(func: &mut Function, defs: &[Option<Inst>]) -> bool {
-    if func.vtable_slots.is_empty() {
-        return false;
-    }
-    let mut changed = false;
-    for b in 0..func.blocks.len() {
-        let mut i = 0;
-        while i < func.blocks[b].insts.len() {
-            let inst = func.blocks[b].insts[i];
-            if let (Op::Load(addr, off), Some(res)) = (func.insts[inst.index()].op.clone(), func.insts[inst.index()].result)
-                && func.ty(res) == Type::I64
-                && let Some(def_inst) = defs.get(addr.index()).copied().flatten()
-                && let Op::Symbol(vt_sym) = func.insts[def_inst.index()].op
-                && let Some(&(_, _, slot_sym, low)) = func.vtable_slots.iter().find(|&&(v, o, _, _)| v == vt_sym && o == off)
-            {
-                let slot_val = func.value(Type::I64);
-                let slot_op = if low { Op::SlotAddr(slot_sym) } else { Op::Symbol(slot_sym) };
-                let slot_inst = func.add(slot_op, Some(slot_val));
-                func.blocks[b].insts.insert(i, slot_inst);
-                func.insts[inst.index()].op = Op::Load(slot_val, 0);
-                changed = true;
-                i += 2;
-                continue;
-            }
-            i += 1;
-        }
-    }
-    changed
-}
-
-fn is_float_two(func: &Function, defs: &[Option<Inst>], value: Value) -> bool {
-    let Some(inst) = defs[value.index()] else { return false };
-    let Op::Const(imm) = func.insts[inst.index()].op else { return false };
-    match func.ty(value) {
-        Type::F64 => imm as u64 == 0x4000_0000_0000_0000,
-        Type::F32 => imm as u32 == 0x4000_0000,
-        _ => false,
-    }
-}
-
-/// The boolean value `op` negates (`v ^ 1`, `v == 0`, `v != 1`, or `select(v, 0, 1)`), plus any existing `1` constant.
-fn negated(op: &Op, consts: &[Option<i64>], bools: &[bool]) -> Option<(Value, Option<Value>)> {
-    let is = |value: Value, want: i64| consts[value.index()] == Some(want);
-    match *op {
-        Op::Binary(Binary::Bxor, x, y) | Op::Icmp(IntCC::NotEqual, x, y) if is(y, 1) => Some((x, Some(y))),
-        Op::Binary(Binary::Bxor, y, x) | Op::Icmp(IntCC::NotEqual, y, x) if is(y, 1) => Some((x, Some(y))),
-        Op::Icmp(IntCC::Equal, x, y) if is(y, 0) => Some((x, None)),
-        Op::Icmp(IntCC::Equal, y, x) if is(y, 0) => Some((x, None)),
-        Op::Select(c, x, y) if is(x, 0) && is(y, 1) && bools[c.index()] => Some((c, Some(y))),
-        _ => None,
-    }
-}
-
-/// Rewrites a negation of a compare, `x ^ 1`, `x == 0`, `x != 1`, or `select(x, 0, 1)`, as the inverse compare or `x ^ 1`, and simplifies branches on `x == 0` / `x != 0`.
-fn invert(func: &mut Function) {
-    let count = func.types.len();
-    let (mut compares, mut consts, mut xors, mut bools) = (vec![None; count], vec![None; count], vec![None; count], vec![false; count]);
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        let data = &func.insts[inst.index()];
-        match (&data.op, data.result) {
-            (&Op::Icmp(cc, x, y), Some(result)) => {
-                compares[result.index()] = Some((cc, x, y));
-                bools[result.index()] = true;
-            }
-            (&Op::Fcmp(..) | &Op::Fits(..), Some(result)) => bools[result.index()] = true,
-            (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
-            (&Op::Binary(Binary::Bxor, x, y), Some(result)) => xors[result.index()] = Some((x, y)),
-            _ => {}
-        }
-    }
-    let is_01 = |v: Value, bools: &[bool]| bools[v.index()] || matches!(consts[v.index()], Some(0 | 1));
-    for _ in 0..2 {
-        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-            let data = &func.insts[inst.index()];
-            let Some(result) = data.result else { continue };
-            bools[result.index()] |= match data.op {
-                Op::Binary(Binary::Band, x, y) => matches!(consts[x.index()], Some(0 | 1)) || matches!(consts[y.index()], Some(0 | 1)) || (is_01(x, &bools) && is_01(y, &bools)),
-                Op::Binary(Binary::Bor | Binary::Bxor, x, y) | Op::Select(_, x, y) => is_01(x, &bools) && is_01(y, &bools),
-                Op::Convert(Convert::Uextend, inner) => bools[inner.index()],
-                _ => false,
-            };
-        }
-    }
-    let types = &func.types;
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        let res = func.insts[inst.index()].result;
-        let op = &mut func.insts[inst.index()].op;
-        if let (Some(res), Some((inner, opt_one))) = (res, negated(op, &consts, &bools)) {
-            let res_ty = types[res.index()];
-            if res_ty == Type::I8
-                && let Some((cc, a, b)) = compares[inner.index()]
-            {
-                *op = Op::Icmp(cc.inverse(), a, b);
-                continue;
-            }
-            if bools[inner.index()]
-                && let Some(one) = opt_one
-                && types[inner.index()] == res_ty
-                && types[one.index()] == res_ty
-                && !matches!(*op, Op::Binary(Binary::Bxor, ..))
-            {
-                *op = Op::Binary(Binary::Bxor, inner, one);
-                continue;
-            }
-        }
-        let Op::Brif(condition, then, then_args, otherwise, else_args) = op else { continue };
-        if let Some((x, y)) = xors[condition.index()] {
-            let inner = if consts[y.index()] == Some(1) {
-                Some(x)
-            } else if consts[x.index()] == Some(1) {
-                Some(y)
-            } else {
-                None
-            };
-            if let Some(inner) = inner.filter(|v| bools[v.index()]) {
-                *condition = inner;
-                std::mem::swap(then, otherwise);
-                std::mem::swap(then_args, else_args);
-                continue;
-            }
-        }
-        let Some((cc, x, y)) = compares[condition.index()] else { continue };
-        if consts[y.index()] != Some(0) || !types[x.index()].is_small_int() {
-            continue;
-        }
-        match cc {
-            IntCC::NotEqual => *condition = x,
-            IntCC::Equal => {
-                *condition = x;
-                std::mem::swap(then, otherwise);
-                std::mem::swap(then_args, else_args);
-            }
-            _ => {}
-        }
     }
 }
 

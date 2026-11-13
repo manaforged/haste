@@ -104,6 +104,7 @@ pub(crate) fn clobbers(op: &Op) -> bool {
 
 struct State<'a> {
     slots: &'a [Option<(StackSlot, i32)>],
+    affine: &'a [(Value, i64)],
     unescaped: &'a [bool],
     call_readonly: &'a [bool],
     selects: &'a [Option<(Value, Value, Value)>],
@@ -111,22 +112,29 @@ struct State<'a> {
     subst: &'a mut [Value],
 }
 
-fn addr_cell(slots: &[Option<(StackSlot, i32)>], subst: &[Value], addr: Value, offset: i32, ty: Type) -> Cell {
+fn addr_cell(slots: &[Option<(StackSlot, i32)>], affine: &[(Value, i64)], subst: &[Value], addr: Value, offset: i32, ty: Type) -> Cell {
     match slots[addr.index()] {
         Some((slot, base)) => Cell { base: Base::Slot(slot), offset: i64::from(base) + i64::from(offset), ty },
-        None => Cell { base: Base::Addr(find(subst, addr)), offset: i64::from(offset), ty },
+        None => {
+            let resolved = find(subst, addr);
+            let (root, base_off) = affine[resolved.index()];
+            match base_off.checked_add(i64::from(offset)) {
+                Some(total) => Cell { base: Base::Addr(find(subst, root)), offset: total, ty },
+                None => Cell { base: Base::Addr(resolved), offset: i64::from(offset), ty },
+            }
+        }
     }
 }
 
-fn effect(func: &Function, slots: &[Option<(StackSlot, i32)>], subst: &[Value], inst: Inst) -> Effect {
+fn effect(func: &Function, state: &State<'_>, inst: Inst) -> Effect {
     let data = &func.insts[inst.index()];
     let slot = |slot: StackSlot, offset: i32, ty: Type| Cell { base: Base::Slot(slot), offset: i64::from(offset), ty };
     match (&data.op, data.result) {
-        (&Op::Load(addr, offset), Some(result)) => Effect::Read(addr_cell(slots, subst, addr, offset, func.ty(result)), result),
+        (&Op::Load(addr, offset), Some(result)) => Effect::Read(addr_cell(state.slots, state.affine, state.subst, addr, offset, func.ty(result)), result),
         (&Op::StackLoad(from, offset), Some(result)) => Effect::Read(slot(from, offset, func.ty(result)), result),
-        (&Op::Store(value, addr, offset), _) => Effect::Write(addr_cell(slots, subst, addr, offset, func.ty(value)), find(subst, value)),
-        (&Op::StackStore(value, to, offset), _) => Effect::Write(slot(to, offset, func.ty(value)), find(subst, value)),
-        (&Op::Move(to, _, bytes), _) => match slots[to.index()] {
+        (&Op::Store(value, addr, offset), _) => Effect::Write(addr_cell(state.slots, state.affine, state.subst, addr, offset, func.ty(value)), find(state.subst, value)),
+        (&Op::StackStore(value, to, offset), _) => Effect::Write(slot(to, offset, func.ty(value)), find(state.subst, value)),
+        (&Op::Move(to, _, bytes), _) => match state.slots[to.index()] {
             Some((slot, base)) => Effect::ClobberSlot { slot, offset: i64::from(base), bytes: i64::from(bytes) },
             None => Effect::Unknown,
         },
@@ -156,7 +164,7 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
             Op::TryCall { .. } => pending_stores.clear(),
             _ => {}
         }
-        match effect(func, state.slots, state.subst, inst) {
+        match effect(func, state, inst) {
             Effect::Read(cell, result) => match known.get(&cell) {
                 Some(value) => {
                     state.subst[result.index()] = value;
@@ -171,8 +179,8 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                     } else if let Op::Load(addr, offset) = func.insts[inst.index()].op
                         && let Some((c, ptr_a, ptr_b)) = state.selects[find(state.subst, addr).index()]
                         && let (Some(val_a), Some(val_b)) = (
-                            known.get(&addr_cell(state.slots, state.subst, ptr_a, offset, cell.ty)),
-                            known.get(&addr_cell(state.slots, state.subst, ptr_b, offset, cell.ty)),
+                            known.get(&addr_cell(state.slots, state.affine, state.subst, ptr_a, offset, cell.ty)),
+                            known.get(&addr_cell(state.slots, state.affine, state.subst, ptr_b, offset, cell.ty)),
                         )
                     {
                         func.insts[inst.index()].op = Op::Select(find(state.subst, c), val_a, val_b);
@@ -308,14 +316,182 @@ pub(crate) fn classify_slots(func: &Function, slots: &[Option<(StackSlot, i32)>]
     (unescaped, call_readonly)
 }
 
+fn affine_table(func: &Function) -> Vec<(Value, i64)> {
+    let count = func.types.len();
+    let mut consts = vec![None; count];
+    let mut out: Vec<(Value, i64)> = (0..count as u32).map(|i| (Value(i), 0)).collect();
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[inst.index()];
+        if let (&Op::Const(imm), Some(res)) = (&data.op, data.result) {
+            consts[res.index()] = Some(imm);
+        }
+    }
+    for _ in 0..8 {
+        let mut changed = false;
+        for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            if func.ty(res) != Type::I64 {
+                continue;
+            }
+            let cand = match data.op {
+                Op::Binary(Binary::Iadd, a, b) => {
+                    if let Some(c) = consts[b.index()] {
+                        (out[a.index()].0, out[a.index()].1.wrapping_add(c))
+                    } else if let Some(c) = consts[a.index()] {
+                        (out[b.index()].0, out[b.index()].1.wrapping_add(c))
+                    } else {
+                        continue;
+                    }
+                }
+                Op::Binary(Binary::Isub, a, b) => {
+                    let Some(c) = consts[b.index()] else { continue };
+                    (out[a.index()].0, out[a.index()].1.wrapping_sub(c))
+                }
+                _ => continue,
+            };
+            if cand != out[res.index()] {
+                out[res.index()] = cand;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    out
+}
+
+fn eliminate_affine_block_params(func: &mut Function) {
+    let Some(entry) = func.entry else { return };
+    let affine = affine_table(func);
+    let mut subst = identity(func.types.len());
+    let mut any_changed = false;
+    for b_idx in 0..func.blocks.len() {
+        let target = Block(b_idx as u32);
+        if target == entry || func.blocks[b_idx].params.len() < 2 {
+            continue;
+        }
+        let mut incoming: Vec<Vec<Value>> = Vec::new();
+        let mut non_branch_pred = false;
+        for pred in &func.blocks {
+            let Some(&last) = pred.insts.last() else { continue };
+            let op = &func.insts[last.index()].op;
+            match op {
+                Op::Jump(b, args) if *b == target => incoming.push(args.clone()),
+                Op::Brif(_, t, t_args, e, e_args) => {
+                    if *t == target {
+                        incoming.push(t_args.clone());
+                    }
+                    if *e == target {
+                        incoming.push(e_args.clone());
+                    }
+                }
+                _ if op.targets().any(|t| t == target) => {
+                    non_branch_pred = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let params = func.blocks[b_idx].params.clone();
+        if non_branch_pred || incoming.is_empty() || incoming.iter().any(|args| args.len() != params.len()) {
+            continue;
+        }
+        let mut eliminated = vec![false; params.len()];
+        let mut prepended = Vec::new();
+        for i in 1..params.len() {
+            if func.ty(params[i]) != Type::I64 {
+                continue;
+            }
+            for j in 0..i {
+                if eliminated[j] || func.ty(params[j]) != Type::I64 {
+                    continue;
+                }
+                let (r0_i, o0_i) = affine[incoming[0][i].index()];
+                let (r0_j, o0_j) = affine[incoming[0][j].index()];
+                if r0_i != r0_j {
+                    continue;
+                }
+                let delta = o0_i.wrapping_sub(o0_j);
+                let all_match = incoming.iter().skip(1).all(|args| {
+                    let (ri, oi) = affine[args[i].index()];
+                    let (rj, oj) = affine[args[j].index()];
+                    ri == rj && oi.wrapping_sub(oj) == delta
+                });
+                if !all_match {
+                    continue;
+                }
+                eliminated[i] = true;
+                if delta == 0 {
+                    subst[params[i].index()] = params[j];
+                } else {
+                    let c_val = func.value(Type::I64);
+                    let c_inst = func.add(Op::Const(delta), Some(c_val));
+                    let derived = func.value(Type::I64);
+                    let d_inst = func.add(Op::Binary(Binary::Iadd, params[j], c_val), Some(derived));
+                    subst.push(c_val);
+                    subst.push(derived);
+                    subst[params[i].index()] = derived;
+                    prepended.push(c_inst);
+                    prepended.push(d_inst);
+                }
+                break;
+            }
+        }
+        if !eliminated.iter().any(|&e| e) {
+            continue;
+        }
+        any_changed = true;
+        if !prepended.is_empty() {
+            prepended.append(&mut func.blocks[b_idx].insts);
+            func.blocks[b_idx].insts = prepended;
+        }
+        let mut idx = 0;
+        func.blocks[b_idx].params.retain(|_| {
+            let keep = !eliminated[idx];
+            idx += 1;
+            keep
+        });
+        for pred_idx in 0..func.blocks.len() {
+            let Some(&last) = func.blocks[pred_idx].insts.last() else { continue };
+            let retain_args = |args: &mut Vec<Value>| {
+                let mut k = 0;
+                args.retain(|_| {
+                    let keep = !eliminated[k];
+                    k += 1;
+                    keep
+                });
+            };
+            match &mut func.insts[last.index()].op {
+                Op::Jump(b, args) if *b == target => retain_args(args),
+                Op::Brif(_, t, t_args, e, e_args) => {
+                    if *t == target {
+                        retain_args(t_args);
+                    }
+                    if *e == target {
+                        retain_args(e_args);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if any_changed {
+        rename(func, &subst);
+    }
+}
+
 /// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between: through each block and on into a successor that only it enters.
 pub(crate) fn run(func: &mut Function) {
     let Some(entry) = func.entry else { return };
     if func.coroutine.is_some() {
         return;
     }
+    eliminate_affine_block_params(func);
     let preds = pred_counts(func);
     let slots = slot_addresses(func);
+    let affine = affine_table(func);
     let (unescaped, call_readonly) = classify_slots(func, &slots);
     let mut consts = vec![None; func.types.len()];
     let mut selects = vec![None; func.types.len()];
@@ -327,7 +503,7 @@ pub(crate) fn run(func: &mut Function) {
         }
     }
     let mut subst = identity(func.types.len());
-    let mut state = State { slots: &slots, unescaped: &unescaped, call_readonly: &call_readonly, selects: &selects, consts: &mut consts, subst: &mut subst };
+    let mut state = State { slots: &slots, affine: &affine, unescaped: &unescaped, call_readonly: &call_readonly, selects: &selects, consts: &mut consts, subst: &mut subst };
     let mut dropped = false;
     let mut seen = vec![false; func.blocks.len()];
     let mut stack = vec![(entry, Known::default())];

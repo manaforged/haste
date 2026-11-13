@@ -1,10 +1,10 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Block, IntCC, Type, Value};
+use haste_codegen::{Block, FloatCC, IntCC, Type, Value};
 
 use crate::body::literal::string_bytes;
 use crate::body::{Expr, ExprId, List, Lit};
-use crate::names::ItemRef;
-use crate::sema::format::DEFAULT_FLAGS;
+use crate::names::{ItemRef, Primitive};
+use crate::sema::format::{DEFAULT_FLAGS, PRECISION_SET};
 use crate::sema::infer::{Coercion, Res, Vtable};
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty, int_info};
@@ -313,6 +313,15 @@ impl Lower<'_, '_> {
                 return self.emit_write_option_int(dst, write_str, arg_val, hole.inner_ty, mty, signed, result_ty, err_block);
             }
         }
+        if hole.kind == HoleTrait::Display
+            && hole.flags == (DEFAULT_FLAGS | PRECISION_SET)
+            && hole.width.is_none()
+            && let Some(prec) = hole.precision
+            && (1..=6).contains(&prec)
+            && matches!(*self.cx.types.kind(hole.inner_ty), Kind::Prim(Primitive::F64))
+        {
+            return self.emit_write_f64_prec(dst, write_str, vtable, hole, arg_val, prec, result_ty, err_block);
+        }
         self.emit_formatter_call(dst, vtable, hole, arg_val, result_ty, err_block)
     }
 
@@ -325,6 +334,29 @@ impl Lower<'_, '_> {
         } else {
             Ok(None)
         }
+    }
+
+    fn emit_digits_loop(&mut self, mag: Value, ptr_end: Value) -> Value {
+        let zero = self.ins().iconst(Type::I64, 0);
+        let loop_bb = self.b.create_block();
+        let done_bb = self.b.create_block();
+        let rem = self.b.append_block_param(loop_bb, Type::I64);
+        let ptr = self.b.append_block_param(loop_bb, Type::I64);
+        let start_ptr = self.b.append_block_param(done_bb, Type::I64);
+        self.jump(loop_bb, &[mag, ptr_end]);
+        self.enter(loop_bb);
+        let ptr_next = self.ins().iadd_imm(ptr, -1);
+        let ten = self.ins().iconst(Type::I64, 10);
+        let q = self.ins().udiv(rem, ten);
+        let q10 = self.ins().imul(q, ten);
+        let r = self.ins().isub(rem, q10);
+        let digit = self.ins().iadd_imm(r, i64::from(b'0'));
+        let digit8 = self.ins().ireduce(Type::I8, digit);
+        self.ins().store(digit8, ptr_next, 0);
+        let nz = self.ins().icmp(IntCC::NotEqual, q, zero);
+        self.brif(nz, (loop_bb, &[q, ptr_next]), (done_bb, &[ptr_next]));
+        self.enter(done_bb);
+        start_ptr
     }
 
     fn emit_write_int(
@@ -352,24 +384,7 @@ impl Lower<'_, '_> {
         };
         let buf = self.b.create_stack_slot(24, 0);
         let end = self.ins().stack_addr(Type::I64, buf, 24);
-        let loop_bb = self.b.create_block();
-        let done_bb = self.b.create_block();
-        let rem = self.b.append_block_param(loop_bb, Type::I64);
-        let ptr = self.b.append_block_param(loop_bb, Type::I64);
-        let start_ptr = self.b.append_block_param(done_bb, Type::I64);
-        self.jump(loop_bb, &[mag, end]);
-        self.enter(loop_bb);
-        let ptr_next = self.ins().iadd_imm(ptr, -1);
-        let ten = self.ins().iconst(Type::I64, 10);
-        let q = self.ins().udiv(rem, ten);
-        let q10 = self.ins().imul(q, ten);
-        let r = self.ins().isub(rem, q10);
-        let digit = self.ins().iadd_imm(r, i64::from(b'0'));
-        let digit8 = self.ins().ireduce(Type::I8, digit);
-        self.ins().store(digit8, ptr_next, 0);
-        let nz = self.ins().icmp(IntCC::NotEqual, q, zero);
-        self.brif(nz, (loop_bb, &[q, ptr_next]), (done_bb, &[ptr_next]));
-        self.enter(done_bb);
+        let start_ptr = self.emit_digits_loop(mag, end);
         let final_ptr = if let Some(neg) = neg {
             let minus_ptr = self.ins().iadd_imm(start_ptr, -1);
             let minus = self.ins().iconst(Type::I8, i64::from(b'-'));
@@ -382,6 +397,76 @@ impl Lower<'_, '_> {
         let slice = self.wide(final_ptr, len);
         let res = self.invoke(SiteOrigin::Known(write_str.0, write_str.1), write_str.0, write_str.1, vec![dst, slice])?;
         self.branch_on_fmt_err(res, result_ty, err_block)
+    }
+
+    fn emit_write_f64_prec(
+        &mut self,
+        dst: Value,
+        write_str: (ItemRef, Substs),
+        vtable: &Vtable,
+        hole: &HolePlan,
+        arg_val: Value,
+        prec: u16,
+        result_ty: Ty,
+        err_block: Block,
+    ) -> Result<()> {
+        let val = self.ins().load(Type::F64, arg_val, 0);
+        let bits = self.ins().load(Type::I64, arg_val, 0);
+        let limit = self.ins().iconst(Type::I64, 0x4170_0000_0000_0000_u64 as i64);
+        let in_range = self.ins().icmp(IntCC::UnsignedLessThan, bits, limit);
+        let check_tie_bb = self.b.create_block();
+        let check_hi_bb = self.b.create_block();
+        let fast_bb = self.b.create_block();
+        let slow_bb = self.b.create_block();
+        let join_bb = self.b.create_block();
+        let scaled = self.b.append_block_param(fast_bb, Type::I64);
+        self.brif(in_range, (check_tie_bb, &[]), (slow_bb, &[]));
+        self.enter(check_tie_bb);
+        let scale = 10_u64.pow(u32::from(prec));
+        let scale_f = self.float_const(Type::F64, scale as f64)?;
+        let y = self.ins().fmul(val, scale_f);
+        let n = self.ins().fcvt_to_uint_sat(Type::I64, y);
+        let n_f = self.ins().fcvt_from_uint(Type::F64, n);
+        let frac = self.ins().fsub(y, n_f);
+        let lo = self.float_const(Type::F64, 0.484375_f64)?;
+        let hi = self.float_const(Type::F64, 0.515625_f64)?;
+        let is_lo = self.ins().fcmp(FloatCC::LessThan, frac, lo);
+        self.brif(is_lo, (fast_bb, &[n]), (check_hi_bb, &[]));
+        self.enter(check_hi_bb);
+        let is_hi = self.ins().fcmp(FloatCC::GreaterThan, frac, hi);
+        let n_plus_1 = self.ins().iadd_imm(n, 1);
+        self.brif(is_hi, (fast_bb, &[n_plus_1]), (slow_bb, &[]));
+        self.enter(fast_bb);
+        let buf = self.b.create_stack_slot(32, 0);
+        let end = self.ins().stack_addr(Type::I64, buf, 32);
+        let ten = self.ins().iconst(Type::I64, 10);
+        let mut rem = scaled;
+        let mut cursor = 32_i32;
+        for _ in 0..prec {
+            cursor -= 1;
+            let q = self.ins().udiv(rem, ten);
+            let q10 = self.ins().imul(q, ten);
+            let r = self.ins().isub(rem, q10);
+            let digit = self.ins().iadd_imm(r, i64::from(b'0'));
+            let digit8 = self.ins().ireduce(Type::I8, digit);
+            self.ins().stack_store(digit8, buf, cursor);
+            rem = q;
+        }
+        cursor -= 1;
+        let dot = self.ins().iconst(Type::I8, i64::from(b'.'));
+        self.ins().stack_store(dot, buf, cursor);
+        let frac_ptr = self.ins().stack_addr(Type::I64, buf, cursor);
+        let start_ptr = self.emit_digits_loop(rem, frac_ptr);
+        let len = self.ins().isub(end, start_ptr);
+        let slice = self.wide(start_ptr, len);
+        let res = self.invoke(SiteOrigin::Known(write_str.0, write_str.1), write_str.0, write_str.1, vec![dst, slice])?;
+        self.branch_on_fmt_err(res, result_ty, err_block)?;
+        self.jump(join_bb, &[]);
+        self.enter(slow_bb);
+        self.emit_formatter_call(dst, vtable, hole, arg_val, result_ty, err_block)?;
+        self.jump(join_bb, &[]);
+        self.enter(join_bb);
+        Ok(())
     }
 
     fn emit_write_option_int(

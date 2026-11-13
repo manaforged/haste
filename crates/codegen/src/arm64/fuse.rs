@@ -3,8 +3,24 @@ use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, IntCC, Op, Type, Value};
 use crate::live::{Sib, SibBase};
 
+pub(super) fn shift_parts(op: &Op, plan: &Plan<Reg>) -> Option<(Binary, Value, i64)> {
+    match *op {
+        Op::Binary(sop @ (Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr), b, c) => Some((sop, b, plan.const_of(c)?)),
+        Op::Binary(Binary::Imul, a, b) => {
+            if let Some(m) = plan.const_of(b).filter(|&m| m > 1 && m.count_ones() == 1) {
+                Some((Binary::Ishl, a, i64::from(m.trailing_zeros())))
+            } else if let Some(m) = plan.const_of(a).filter(|&m| m > 1 && m.count_ones() == 1) {
+                Some((Binary::Ishl, b, i64::from(m.trailing_zeros())))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn preserved(func: &Function, plan: &Plan<Reg>, block_idx: usize, start: usize, end: usize, val: Value) -> bool {
-    if start + 1 == end || matches!(plan.location(val), Location::Imm(_) | Location::SlotAddr(_) | Location::Frame(..)) {
+    if start + 1 >= end || matches!(plan.location(val), Location::Imm(_) | Location::Slot | Location::SlotAddr(_) | Location::Frame(..)) {
         return true;
     }
     let Some(reg) = plan.reg_of(val) else { return false };
@@ -60,10 +76,16 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                             && !plan.elided[flag_val.index()]
                             && let Some((fb, fpos, finst)) = pos_of[flag_val.index()]
                             && fb == b_idx
-                            && fpos + 1 == pos
+                            && fpos < pos
                         {
                             match func.insts[finst.index()].op {
-                                Op::Icmp(_, a, _) if func.ty(a) != Type::I128 => {
+                                Op::Icmp(_, a, b)
+                                    if func.ty(a) != Type::I128
+                                        && a != res
+                                        && b != res
+                                        && preserved(func, plan, b_idx, fpos, pos, a)
+                                        && preserved(func, plan, b_idx, fpos, pos, b) =>
+                                {
                                     plan.elided[flag_val.index()] = true;
                                     done = true;
                                     break;
@@ -73,8 +95,16 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                                         && !plan.elided[inner.index()]
                                         && let Some((ib, ipos, iinst)) = pos_of[inner.index()]
                                         && ib == b_idx
-                                        && ipos + 1 == fpos
-                                        && matches!(func.insts[iinst.index()].op, Op::Icmp(_, a, _) if func.ty(a) != Type::I128) =>
+                                        && ipos < fpos
+                                        && matches!(
+                                            func.insts[iinst.index()].op,
+                                            Op::Icmp(_, a, b)
+                                                if func.ty(a) != Type::I128
+                                                    && a != res
+                                                    && b != res
+                                                    && preserved(func, plan, b_idx, ipos, pos, a)
+                                                    && preserved(func, plan, b_idx, ipos, pos, b)
+                                        ) =>
                                 {
                                     plan.elided[flag_val.index()] = true;
                                     plan.elided[inner.index()] = true;
@@ -91,8 +121,8 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                         if let Some((sb, spos, sinst)) = pos_of[shl.index()]
                             && sb == b_idx
                             && spos < pos
-                            && let Op::Binary(Binary::Ishl, idx, c) = func.insts[sinst.index()].op
-                            && let Some(shift) = plan.const_of(c).filter(|&s| (1..=3).contains(&s))
+                            && let Some((Binary::Ishl, idx, shift)) = shift_parts(&func.insts[sinst.index()].op, plan)
+                            && (1..=3).contains(&shift)
                             && plan.reg_of(base).is_some()
                             && plan.reg_of(idx).is_some()
                         {
@@ -139,8 +169,8 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                             && let Some((sb, spos, sinst)) = pos_of[shift_val.index()]
                             && sb == b_idx
                             && spos < pos
-                            && let Op::Binary(sop, b, c) = func.insts[sinst.index()].op
-                            && plan.const_of(c).is_some()
+                            && let Some((sop, b, _)) = shift_parts(&func.insts[sinst.index()].op, plan)
+                            && b != res
                             && (matches!(sop, Binary::Ishl | Binary::Ushr | Binary::Sshr)
                                 || (matches!(alu_op, Binary::Band | Binary::Bor | Binary::Bxor) && matches!(sop, Binary::Rotl | Binary::Rotr)))
                             && preserved(func, plan, b_idx, spos, pos, b)

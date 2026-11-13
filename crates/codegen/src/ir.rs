@@ -637,6 +637,39 @@ impl Function {
     pub fn has_return(&self) -> bool {
         self.insts.iter().any(|data| matches!(data.op, Op::Return(_)))
     }
+
+    /// For each value, the block that defines it.
+    pub(crate) fn def_blocks(&self) -> Vec<Option<Block>> {
+        let mut defs = vec![None; self.types.len()];
+        for (index, block) in self.blocks.iter().enumerate() {
+            let here = Some(Block(index as u32));
+            block.params.iter().for_each(|value| defs[value.index()] = here);
+            for inst in &block.insts {
+                crate::live::results(&self.insts[inst.index()]).for_each(|value| defs[value.index()] = here);
+            }
+        }
+        defs
+    }
+
+    /// The number of instruction operand reads of each value.
+    pub(crate) fn use_counts(&self) -> Vec<u32> {
+        let mut uses = vec![0_u32; self.types.len()];
+        for inst in self.blocks.iter().flat_map(|block| &block.insts) {
+            self.insts[inst.index()].op.for_operands(|value| uses[value.index()] += 1);
+        }
+        uses
+    }
+
+    /// The number of control-flow edges into each block.
+    pub(crate) fn pred_counts(&self) -> Vec<u32> {
+        let mut preds = vec![0_u32; self.blocks.len()];
+        for block in 0..self.blocks.len() {
+            for target in self.successors(Block(block as u32)) {
+                preds[target.index()] += 1;
+            }
+        }
+        preds
+    }
 }
 
 impl fmt::Display for Function {

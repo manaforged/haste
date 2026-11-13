@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use haste_codegen::{Code, RelocKind, Target, dict_entry_stub, dict_stub_relocs};
+use haste_codegen::{Code, RelocKind, Target};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::aot::{Executable, Symbol};
@@ -121,8 +121,8 @@ fn emit_functions(state: &AotState, target: &Target, syms: &SymTable<'_>, dict_b
                 for (i, reloc) in relocs.iter().enumerate() {
                     exe.pointer(true, dict_off + (i * 8) as u32, syms.translate(reloc)?);
                 }
-                let stub = dict_entry_stub(target.arch, 0, 1usize << 40, 0, None)?;
-                let [(dict_rel, dict_kind), (body_rel, body_kind)] = dict_stub_relocs(target.arch)?;
+                let stub = target.dict_entry_stub(0, 1usize << 40, 0, None)?;
+                let [(dict_rel, dict_kind), (body_rel, body_kind)] = target.dict_stub_relocs()?;
                 let off = exe.text(&stub);
                 fn_offs[idx] = Some(off);
                 let body_off = dict_bodies[&(Arc::as_ptr(body) as usize)];

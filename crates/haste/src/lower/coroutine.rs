@@ -1,7 +1,7 @@
 //! Lowering of coroutines: the object an `async` block or body makes, and its `Future::poll`, which suspends at each `.await` and which `haste_codegen` splits into a state machine.
 
 use anyhow::{Result, bail};
-use haste_codegen::{Block, Coroutine, FIRST_SUSPEND, IntCC, RETURNED, StackSlot, Type, UNRESUMED, Value};
+use haste_codegen::{Block, Coroutine, IntCC, StackSlot, Type, Value};
 
 use crate::body::{Expr, ExprId};
 use crate::sema::infer::{Awaited, Res};
@@ -66,7 +66,7 @@ impl Lower<'_, '_> {
     pub(super) fn resume_finish(&mut self, value: Option<Value>) -> Result<()> {
         let ready = self.poll_value("Ready", value)?;
         self.drop_to(0)?;
-        self.set_state(RETURNED)?;
+        self.set_state(Coroutine::RETURNED)?;
         self.return_poll(ready, true)
     }
 
@@ -179,7 +179,7 @@ impl Lower<'_, '_> {
     /// Suspends: records the resume point, returns `Poll::Pending`, and on resume takes the new call's arguments, then drops everything and ends when the call drops the coroutine, or polls again at `head`.
     fn suspend(&mut self, head: Block) -> Result<()> {
         let Some(count) = self.resume.as_ref().map(|resume| resume.resumes.len()) else { bail!("a suspension outside a resume function") };
-        self.set_state(FIRST_SUSPEND + count as i64)?;
+        self.set_state(Coroutine::FIRST_SUSPEND + count as i64)?;
         let pending = self.poll_value("Pending", None)?;
         self.return_poll(pending, false)?;
         let block = self.b.create_block();
@@ -196,7 +196,7 @@ impl Lower<'_, '_> {
         self.brif(dropped, (dropping, &[]), (again, &[]));
         self.enter(dropping);
         self.drop_to(0)?;
-        self.set_state(RETURNED)?;
+        self.set_state(Coroutine::RETURNED)?;
         let pending = self.poll_value("Pending", None)?;
         self.return_poll(pending, true)?;
         self.enter(again);
@@ -225,7 +225,7 @@ impl Lower<'_, '_> {
         let Res::Fn(poll, substs) = resume else { bail!("a coroutine whose glue has no `poll`") };
         let header = self.header_of(ty)?;
         let state = self.ins().load(Type::I64, target, header.0);
-        let fresh = self.ins().icmp_imm(IntCC::Equal, state, UNRESUMED);
+        let fresh = self.ins().icmp_imm(IntCC::Equal, state, Coroutine::UNRESUMED);
         let (unresumed, check, suspended, out) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.brif(fresh, (unresumed, &[]), (check, &[]));
         self.enter(unresumed);
@@ -234,7 +234,7 @@ impl Lower<'_, '_> {
         self.drop_fields(inner, place, super::reloc::TyOrigin::Subst(0))?;
         self.jump(out, &[]);
         self.enter(check);
-        let waiting = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, state, FIRST_SUSPEND);
+        let waiting = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, state, Coroutine::FIRST_SUSPEND);
         self.brif(waiting, (suspended, &[]), (out, &[]));
         self.enter(suspended);
         let pin = self.pin_of(target)?;

@@ -667,6 +667,19 @@ impl Lower<'_, '_> {
     pub(super) fn emit_slot_with(&mut self, src: SymbolSource, step: RelocStep) -> Value {
         let self_call = matches!(self.mode, LowerMode::Stencil) && matches!(&src, SymbolSource::Slot(i) if *i == self.index);
         let low = self.slots.low_entries();
+        self.emit_reloc(src, step, self_call, low)
+    }
+
+    pub(super) fn emit_symbol(&mut self, src: SymbolSource) -> Value {
+        let step = RelocStep::Const(src.clone());
+        self.emit_symbol_with(src, step)
+    }
+
+    pub(super) fn emit_symbol_with(&mut self, src: SymbolSource, step: RelocStep) -> Value {
+        self.emit_reloc(src, step, false, false)
+    }
+
+    fn emit_reloc(&mut self, src: SymbolSource, step: RelocStep, self_call: bool, low_slot: bool) -> Value {
         let idx = self.push_reloc(src, step);
         if self_call {
             self.b.func.add_self_slot(idx);
@@ -676,23 +689,7 @@ impl Lower<'_, '_> {
                 let dict = self.dict_param.expect("dictionary parameter is set");
                 self.ins().load(Type::I64, dict, (idx * 8) as i32)
             }
-            LowerMode::Stencil if low => self.ins().slot_addr(idx),
-            LowerMode::Stencil => self.ins().symbol(idx),
-        }
-    }
-
-    pub(super) fn emit_symbol(&mut self, src: SymbolSource) -> Value {
-        let step = RelocStep::Const(src.clone());
-        self.emit_symbol_with(src, step)
-    }
-
-    pub(super) fn emit_symbol_with(&mut self, src: SymbolSource, step: RelocStep) -> Value {
-        let idx = self.push_reloc(src, step);
-        match self.mode {
-            LowerMode::Dict => {
-                let dict = self.dict_param.expect("dictionary parameter is set");
-                self.ins().load(Type::I64, dict, (idx * 8) as i32)
-            }
+            LowerMode::Stencil if low_slot => self.ins().slot_addr(idx),
             LowerMode::Stencil => self.ins().symbol(idx),
         }
     }

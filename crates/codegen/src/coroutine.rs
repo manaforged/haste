@@ -7,24 +7,26 @@ use crate::live::results;
 use crate::ir::{AbiParam, Binary, Block, CallConv, Function, InstData, IntCC, Op, SlotData, StackSlot, Type, Value};
 use crate::reloc::RuntimeSymbol;
 
-/// The state word of a coroutine that has not started.
-pub const UNRESUMED: i64 = 0;
-/// The state word of a coroutine that finished or was dropped.
-pub const RETURNED: i64 = 1;
-/// The state word of a coroutine suspended at its first suspension point; later points count up from it.
-pub const FIRST_SUSPEND: i64 = 3;
-
 /// How a resume function finds its coroutine and where it continues, which `compile` uses to split it.
 #[derive(Clone, Debug)]
 pub struct Coroutine {
     /// The function parameter that holds the address of the coroutine object.
     pub object: usize,
-    /// The block that runs after each suspension point, in state order from `FIRST_SUSPEND`, each taking the function's parameters.
+    /// The block that runs after each suspension point, in state order from `Coroutine::FIRST_SUSPEND`, each taking the function's parameters.
     pub resumes: Vec<Block>,
     /// The blocks whose return ends the coroutine, after which its frame is freed.
     pub done: Vec<Block>,
     /// The offsets of the state word and of the heap frame pointer in the coroutine object.
     pub header: (i32, i32),
+}
+
+impl Coroutine {
+    /// The state word of a coroutine that has not started.
+    pub const UNRESUMED: i64 = 0;
+    /// The state word of a coroutine that finished or was dropped.
+    pub const RETURNED: i64 = 1;
+    /// The state word of a coroutine suspended at its first suspension point; later points count up from it.
+    pub const FIRST_SUSPEND: i64 = 3;
 }
 
 /// Where a stack slot of a resume function lives after the split: at an offset in the heap frame, or still on the native stack.
@@ -65,7 +67,7 @@ pub(crate) fn split(func: &mut Function) {
         };
         frame.slots.push(home);
     }
-    let defs = def_blocks(func);
+    let defs = func.def_blocks();
     for value in crossing(func, &defs) {
         let bytes = func.types[value.index()].bytes();
         let at = frame.place(bytes, bytes);
@@ -123,19 +125,6 @@ fn live_in(func: &Function, effects: &[(Vec<bool>, Vec<bool>)]) -> Vec<Vec<bool>
         }
     }
     live
-}
-
-fn def_blocks(func: &Function) -> Vec<Option<Block>> {
-    let mut defs = vec![None; func.types.len()];
-    for (index, block) in func.blocks.iter().enumerate() {
-        let here = Some(Block(index as u32));
-        block.params.iter().for_each(|value| defs[value.index()] = here);
-        for inst in &block.insts {
-            let data = &func.insts[inst.index()];
-            results(data).for_each(|value| defs[value.index()] = here);
-        }
-    }
-    defs
 }
 
 fn crossing(func: &Function, defs: &[Option<Block>]) -> Vec<Value> {
@@ -233,7 +222,7 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     b.switch_to_block(start);
     let object = params[spec.object];
     let state = b.ins().load(Type::I64, object, spec.header.0);
-    let fresh = b.ins().icmp_imm(IntCC::Equal, state, UNRESUMED);
+    let fresh = b.ins().icmp_imm(IntCC::Equal, state, Coroutine::UNRESUMED);
     b.ins().brif(fresh, init, &[], dispatch, &[]);
     b.switch_to_block(init);
     let mut insts = std::mem::take(&mut b.func.blocks[init.index()].insts);
@@ -247,7 +236,7 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     let fp = b.ins().load(Type::I64, object, spec.header.1);
     b.ins().stack_store(fp, anchor, 0);
     if spec.resumes.len() >= 2 {
-        let idx = b.ins().iadd_imm(state, -FIRST_SUSPEND);
+        let idx = b.ins().iadd_imm(state, -Coroutine::FIRST_SUSPEND);
         let trap = b.create_block();
         let fwds: Vec<Block> = spec.resumes.iter().map(|_| b.create_block()).collect();
         b.ins().br_table(idx, trap, &fwds);
@@ -261,7 +250,7 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     }
     for (index, &resume) in spec.resumes.iter().enumerate() {
         let next = b.create_block();
-        let here = b.ins().icmp_imm(IntCC::Equal, state, FIRST_SUSPEND + index as i64);
+        let here = b.ins().icmp_imm(IntCC::Equal, state, Coroutine::FIRST_SUSPEND + index as i64);
         b.ins().brif(here, resume, &params, next, &[]);
         b.switch_to_block(next);
     }

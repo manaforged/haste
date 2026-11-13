@@ -10,13 +10,12 @@ use crate::body::{ExprId, PatId};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
-use crate::sema::infer::{ClosureBody, Coercion, Fields, Glue, LazyTables, Res, Shape, SiteKey, Typed, cloned_tuple, field_types, needs_drop};
+use crate::sema::infer::{ClosureBody, Coercion, Fields, Glue, LazyTables, Res, Shape, Typed, cloned_tuple, field_types, needs_drop};
 use crate::sema::layout::field_offset;
 use crate::sema::reach::Reached;
 use crate::sema::summary::{ConstHole, PolyInst};
 use crate::sema::ty::{Kind, Mut, Ty};
 
-use super::reloc::eval_expr_ty;
 use super::stencil::{FootprintId, item_bits};
 use super::{Inline, Slots, passed_parts, signature, signature_of};
 
@@ -535,7 +534,7 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
         Coercion::Upcast(slot) => {
             mix.byte(3);
             mix.u32(*slot);
-            let expr_ty = eval_expr_ty(cx, typed, id);
+            let expr_ty = typed.expr_ty(&cx.types, id);
             if expr_ty == Ty::NONE {
                 mix.byte(0xff);
             } else if let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *cx.types.kind(expr_ty)
@@ -565,20 +564,6 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
         }
     }
     Ok(())
-}
-
-fn site_res_any(cx: &Context<'_>, typed: &Typed, key: SiteKey) -> Option<Res> {
-    match &typed.tables {
-        LazyTables::Poly(p) => p.site_res(&cx.types, key),
-        LazyTables::Eager(t) => t.site_res(key),
-    }
-}
-
-fn pat_ty_any(cx: &Context<'_>, typed: &Typed, pat: PatId) -> Option<Ty> {
-    match &typed.tables {
-        LazyTables::Poly(p) => p.pat_ty(&cx.types, pat),
-        LazyTables::Eager(t) => t.pats.get(&pat).copied(),
-    }
 }
 
 fn get_or_build_plan(cx: &mut Context<'_>, slots: &dyn Slots, source_item: ItemRef, closure_root: Option<ExprId>) -> Result<Arc<BodyFootprintPlan>> {

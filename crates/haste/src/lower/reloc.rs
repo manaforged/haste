@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use crate::body::ExprId;
 use crate::names::ItemRef;
 use crate::sema::Context;
-use crate::sema::infer::{Coercion, LazyTables, Res, Shape, SiteKey, Typed, drop_fn, field_types, type_name};
+use crate::sema::infer::{Coercion, Res, Shape, SiteKey, Typed, drop_fn, field_types, type_name};
 use crate::sema::reach::Reached;
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
@@ -33,11 +33,13 @@ impl TyOrigin {
         match root {
             Root::Local(local) => Self::Local(local),
             Root::Temp(expr) => Self::Expr(expr),
-            Root::Held(expr) => match &typed.tables {
-                LazyTables::Eager(t) if t.awaits.contains_key(&expr) => Self::AwaitFuture(expr),
-                LazyTables::Poly(p) if p.summary.template.awaits.contains_key(&expr) => Self::AwaitFuture(expr),
-                _ => Self::ForIter(expr),
-            },
+            Root::Held(expr) => {
+                if typed.has_await_at(expr) {
+                    Self::AwaitFuture(expr)
+                } else {
+                    Self::ForIter(expr)
+                }
+            }
         }
     }
 
@@ -213,7 +215,7 @@ fn eval_vtable_at(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, ty
 
 fn eval_site(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Substs, origin: &SiteOrigin) -> Result<(ItemRef, Substs)> {
     match origin {
-        SiteOrigin::Table(key) => eval_table_site(typed, *key).ok_or_else(|| anyhow::anyhow!("missing site {:?}", key)),
+        SiteOrigin::Table(key) => typed.site_fn(*key).ok_or_else(|| anyhow::anyhow!("missing site {:?}", key)),
         SiteOrigin::PointerFnDef { expr, callee } => eval_pointer_fndef(cx, reached, typed, *expr, *callee),
         SiteOrigin::DropGlue(ty_origin) => {
             let ty = eval_ty(cx, reached, typed, substs, ty_origin)?;
@@ -261,25 +263,8 @@ fn eval_site(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Sub
     }
 }
 
-pub(super) fn eval_table_site(typed: &Typed, key: SiteKey) -> Option<(ItemRef, Substs)> {
-    match &typed.tables {
-        LazyTables::Poly(poly) => poly.site_fn(key),
-        LazyTables::Eager(tables) => match tables.site_res(key)? {
-            Res::Fn(item, substs) => Some((item, substs)),
-            _ => None,
-        },
-    }
-}
-
-pub(super) fn eval_expr_ty(cx: &Context<'_>, typed: &Typed, expr: ExprId) -> Ty {
-    match &typed.tables {
-        LazyTables::Poly(poly) => poly.expr_ty(&cx.types, expr),
-        LazyTables::Eager(tables) => tables.exprs[expr.0 as usize],
-    }
-}
-
 pub(super) fn eval_deref_step(cx: &Context<'_>, reached: &Reached, typed: &Typed, expr: ExprId, step: u32, ty: Ty) -> Result<Ty> {
-    if let Some((item, substs)) = eval_table_site(typed, SiteKey::Deref(expr, step)) {
+    if let Some((item, substs)) = typed.site_fn(SiteKey::Deref(expr, step)) {
         let Some(&idx) = reached.index.get(&(item, substs)) else { bail!("unreached deref callee") };
         let Ok(callee) = &reached.list[idx].1 else { bail!("broken deref callee") };
         let Some(ret) = callee.ret else { bail!("deref callee without return") };
@@ -295,14 +280,11 @@ pub(super) fn eval_deref_step(cx: &Context<'_>, reached: &Reached, typed: &Typed
 }
 
 pub(super) fn eval_autoderef_ty(cx: &Context<'_>, reached: &Reached, typed: &Typed, expr: ExprId, base: ExprId) -> Result<Ty> {
-    let mut ty = eval_expr_ty(cx, typed, base);
+    let mut ty = typed.expr_ty(&cx.types, base);
     if ty == Ty::NONE {
         return Ok(Ty::NONE);
     }
-    let steps = match &typed.tables {
-        LazyTables::Poly(poly) => poly.autoderefs_at(expr),
-        LazyTables::Eager(tables) => tables.autoderefs.get(&expr).copied().unwrap_or(0),
-    };
+    let steps = typed.autoderefs_at(expr);
     for step in 0..steps {
         ty = eval_deref_step(cx, reached, typed, expr, step, ty)?;
     }
@@ -319,15 +301,9 @@ fn eval_ty(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Subst
     match origin {
         TyOrigin::Subst(idx) => cx.types.substs(substs).get(*idx as usize).copied().ok_or_else(|| anyhow::anyhow!("subst {} out of bounds", idx)),
         TyOrigin::Local(idx) => typed.locals.get(*idx as usize).map(|l| l.ty).ok_or_else(|| anyhow::anyhow!("local {} out of bounds", idx)),
-        TyOrigin::Expr(id) => Ok(eval_expr_ty(cx, typed, *id)),
-        TyOrigin::ForIter(id) => match &typed.tables {
-            LazyTables::Poly(p) => p.summary.template.fors.get(id).map(|f| p.sub_ty(&cx.types, f.iter)).ok_or_else(|| anyhow::anyhow!("missing for {}", id.0)),
-            LazyTables::Eager(t) => t.fors.get(id).map(|f| f.iter).ok_or_else(|| anyhow::anyhow!("missing for {}", id.0)),
-        },
-        TyOrigin::AwaitFuture(id) => match &typed.tables {
-            LazyTables::Poly(p) => p.summary.template.awaits.get(id).map(|a| p.sub_ty(&cx.types, a.future)).ok_or_else(|| anyhow::anyhow!("missing await {}", id.0)),
-            LazyTables::Eager(t) => t.awaits.get(id).map(|a| a.future).ok_or_else(|| anyhow::anyhow!("missing await {}", id.0)),
-        },
+        TyOrigin::Expr(id) => Ok(typed.expr_ty(&cx.types, *id)),
+        TyOrigin::ForIter(id) => typed.for_iter(&cx.types, *id).ok_or_else(|| anyhow::anyhow!("missing for {}", id.0)),
+        TyOrigin::AwaitFuture(id) => typed.await_future(&cx.types, *id).ok_or_else(|| anyhow::anyhow!("missing await {}", id.0)),
         TyOrigin::SiteSubst(site, idx) => {
             let (_, site_substs) = eval_site(cx, reached, typed, substs, site)?;
             cx.types.substs(site_substs).get(*idx as usize).copied().ok_or_else(|| anyhow::anyhow!("site subst {} out of bounds", idx))

@@ -1,5 +1,6 @@
 //! Haste's code generator: an SSA function builder, a machine encoder per target, and executable memory.
 
+mod algebra;
 mod alloc;
 mod builder;
 mod color;
@@ -55,7 +56,7 @@ mod x64;
 
 pub use builder::{FunctionBuilder, Ins, Mark};
 pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, ByteCC, CallConv, FloatCC, Function, Inst, IntCC, SigRef, Signature, StackSlot, Type, Value, VectorOp};
-pub use coroutine::{Coroutine, FIRST_SUSPEND, RETURNED, UNRESUMED};
+pub use coroutine::Coroutine;
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
 pub use reloc::{DictTierUp, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
@@ -101,22 +102,24 @@ impl Code {
     }
 }
 
-/// Encodes a call-table entry stub that loads `dict_addr` into the dictionary register and jumps to `body_exec`.
-pub fn dict_entry_stub(arch: Arch, stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, Error> {
-    let bytes = match arch {
-        Arch::X64 => x64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
-        Arch::Arm64 => arm64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
-        other => Err(format!("no encoder for {other:?} yet")),
-    };
-    bytes.map_err(|message| Error::new(ErrorKind::Unsupported, message))
-}
+impl Target {
+    /// Encodes a call-table entry stub that loads `dict_addr` into the dictionary register and jumps to `body_exec`.
+    pub fn dict_entry_stub(&self, stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, Error> {
+        let bytes = match self.arch {
+            Arch::X64 => x64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
+            Arch::Arm64 => arm64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
+            other => Err(format!("no encoder for {other:?} yet")),
+        };
+        bytes.map_err(|message| Error::new(ErrorKind::Unsupported, message))
+    }
 
-/// Returns the `(dict_offset, body_offset, kind)` relocation offsets inside an unlinked `dict_entry_stub(arch, 0, 1 << 40, 0, None)`.
-pub fn dict_stub_relocs(arch: Arch) -> Result<[(u32, RelocKind); 2], Error> {
-    match arch {
-        Arch::X64 => Ok([(2, RelocKind::Abs64), (12, RelocKind::Abs64)]),
-        Arch::Arm64 => Ok([(0, RelocKind::Arm64Movw64), (16, RelocKind::Arm64Movw64)]),
-        other => Err(Error::new(ErrorKind::Unsupported, format!("no encoder for {other:?} yet"))),
+    /// Returns the `(dict_offset, body_offset, kind)` relocation offsets inside an unlinked `dict_entry_stub(0, 1 << 40, 0, None)`.
+    pub fn dict_stub_relocs(&self) -> Result<[(u32, RelocKind); 2], Error> {
+        match self.arch {
+            Arch::X64 => Ok([(2, RelocKind::Abs64), (12, RelocKind::Abs64)]),
+            Arch::Arm64 => Ok([(0, RelocKind::Arm64Movw64), (16, RelocKind::Arm64Movw64)]),
+            other => Err(Error::new(ErrorKind::Unsupported, format!("no encoder for {other:?} yet"))),
+        }
     }
 }
 
