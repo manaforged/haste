@@ -125,12 +125,14 @@ const TRANSIENT_CAP: usize = 32_768;
 const TRIM_SHARDS: usize = 4;
 const MAX_INLINE_HEIGHT: u8 = 10;
 
+pub(super) type InlineMeta = (ItemRef, FootprintId, bool, u8, u16);
+
 /// Cached inlineable callee stencils and footprints across a compilation.
 #[derive(Default)]
 pub struct Bodies {
     pub(super) plans: Table<(ItemRef, Option<ExprId>), Arc<BodyFootprintPlan>>,
     inlined: Table<usize, Option<Arc<InlinedCallee>>>,
-    inline_meta: Table<usize, Option<(ItemRef, FootprintId, bool, u8, u16)>>,
+    inline_meta: Table<usize, Option<InlineMeta>>,
     templates: Table<TemplateKey, Option<Arc<InlineTemplate>>>,
     cyclic: RwLock<FxHashMap<usize, CycleState>>,
     transient_entries: AtomicUsize,
@@ -466,36 +468,47 @@ fn record_callee_height(inline: &mut Inline, callee: Option<Arc<InlinedCallee>>)
     callee
 }
 
+fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<InlineHit>, usize, usize, Quiet)> {
+    let (depth, quiet) = (inline.stack.len(), Quiet::mark(cx, slots));
+    inline.stack.push(index);
+    let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, &quiet));
+    inline.pop(depth);
+    let (tmpl, cycle) = outcome?;
+    Ok((tmpl, cycle, depth, quiet))
+}
+
 pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<(ItemRef, FootprintId, bool)>, usize)> {
     let bodies = slots.bodies();
     if bodies.is_cyclic(cx, reached, index) {
         return Ok((None, usize::MAX));
     }
-    if let Some(cached) = bodies.inlined.get(&index) {
+    let standard = super::expr::inline_limit(cx, reached, index) == Some(limit);
+    if let Some(cached) = bodies.inlined.get(&index).filter(|c| c.is_some() || standard) {
         return Ok((record_meta_height(inline, cached.map(|c| (c.item, c.footprint, c.returns, c.height, c.size))), usize::MAX));
     }
-    if let Some(cached) = bodies.inline_meta.get(&index) {
+    if let Some(cached) = bodies.inline_meta.get(&index).filter(|c| c.is_some() || standard) {
         return Ok((record_meta_height(inline, cached), usize::MAX));
     }
     if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
         return Ok((None, pos));
     }
-    if let Some((cached, cycle)) = inline.local.get(&index) {
+    if let Some((cached, cycle)) = inline.local.get(&index).filter(|(c, _)| c.is_some() || standard) {
         let (meta, cyc) = (cached.as_ref().map(|c| (c.item, c.footprint, c.returns, c.height, c.size)), *cycle);
         return Ok((record_meta_height(inline, meta), cyc));
     }
+    if let Some(&(meta, cyc)) = inline.local_meta.get(&index).filter(|(m, _)| m.is_some() || standard) {
+        return Ok((record_meta_height(inline, meta), cyc));
+    }
     let item = reached.list[index].0.0;
-    let depth = inline.stack.len();
-    inline.stack.push(index);
-    let quiet = Quiet::mark(cx, slots);
-    let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, &quiet));
-    inline.stack.pop();
-    let (tmpl, cycle) = outcome?;
+    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, limit)?;
     let meta = tmpl.map(|(footprint, t, _)| (item, footprint, t.returns, t.height, t.size));
-    if cycle > depth && quiet.holds(cx, slots) {
-        bodies.bump_transient();
-        let stored = bodies.inline_meta.get_or_insert_with(index, || meta);
-        return Ok((record_meta_height(inline, stored), cycle));
+    if standard {
+        if cycle > depth && quiet.holds(cx, slots) {
+            bodies.bump_transient();
+            let stored = bodies.inline_meta.get_or_insert_with(index, || meta);
+            return Ok((record_meta_height(inline, stored), cycle));
+        }
+        inline.local_meta.insert(index, (meta, if cycle < depth { cycle } else { usize::MAX }));
     }
     Ok((record_meta_height(inline, meta), cycle))
 }
@@ -506,27 +519,18 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         return Ok((None, usize::MAX));
     }
     let standard = super::expr::inline_limit(cx, reached, index) == Some(limit);
-    if let Some(cached) = bodies.inlined.get(&index)
-        && (cached.is_some() || standard)
-    {
+    if let Some(cached) = bodies.inlined.get(&index).filter(|c| c.is_some() || standard) {
         return Ok((record_callee_height(inline, cached), usize::MAX));
     }
     if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
         return Ok((None, pos));
     }
-    if let Some((cached, cycle)) = inline.local.get(&index)
-        && (cached.is_some() || standard)
-    {
+    if let Some((cached, cycle)) = inline.local.get(&index).filter(|(c, _)| c.is_some() || standard) {
         let (hit, cyc) = (cached.clone(), *cycle);
         return Ok((record_callee_height(inline, hit), cyc));
     }
     let item = reached.list[index].0.0;
-    let depth = inline.stack.len();
-    inline.stack.push(index);
-    let quiet = Quiet::mark(cx, slots);
-    let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, &quiet));
-    inline.stack.pop();
-    let (tmpl, cycle) = outcome?;
+    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, limit)?;
     let result = match tmpl {
         Some((footprint, t, Some(relocs))) => Some(Arc::new(InlinedCallee { item, footprint, relocs, reloc_plan: Arc::clone(&t.reloc_plan), body: Arc::clone(&t.body), returns: t.returns, height: t.height, size: t.size })),
         Some((footprint, t, None)) => {

@@ -19,20 +19,45 @@ pub(super) struct ReachFilter {
     pub(super) seen_fixed_poly: HashSet<ItemRef>,
     pub(super) seen_sealed_sysroot: HashSet<ItemRef>,
     pub(super) sealed_cache: HashMap<ItemRef, bool>,
+    pub(super) sealed_log: Vec<(ItemRef, bool)>,
+    pub(super) dirty: Vec<(ItemRef, bool)>,
 }
 
 impl ReachFilter {
+    fn record_sealed(&mut self, item: ItemRef, sealed: bool) {
+        if self.sealed_cache.insert(item, sealed).is_none() {
+            self.dirty.push((item, sealed));
+        }
+    }
+
+    pub(super) fn sync_from(&mut self, global: &Self, synced_len: &mut usize) {
+        if global.sealed_log.len() > *synced_len {
+            for &(k, v) in &global.sealed_log[*synced_len..] {
+                self.sealed_cache.entry(k).or_insert(v);
+            }
+            *synced_len = global.sealed_log.len();
+        }
+    }
+
+    pub(super) fn drain_to(&mut self, global: &mut Self) {
+        for (k, v) in self.dirty.drain(..) {
+            if global.sealed_cache.insert(k, v).is_none() {
+                global.sealed_log.push((k, v));
+            }
+        }
+    }
+
     pub(super) fn check_sealed(&mut self, cx: &mut Context<'_>, item: ItemRef, visiting: &mut HashSet<ItemRef>) -> Option<bool> {
         if let Some(&cached) = self.sealed_cache.get(&item) {
             return Some(cached);
         }
         if let Some(intrinsic) = cx.intrinsic(item) {
             let safe = !matches!(intrinsic, Intrinsic::Transmute);
-            self.sealed_cache.insert(item, safe);
+            self.record_sealed(item, safe);
             return Some(safe);
         }
         if !cx.outline.is_fixed(item.krate) {
-            self.sealed_cache.insert(item, false);
+            self.record_sealed(item, false);
             return Some(false);
         }
         if !visiting.insert(item) {
@@ -40,7 +65,7 @@ impl ReachFilter {
         }
         let Some(summary) = poly_summary(cx, item) else {
             visiting.remove(&item);
-            self.sealed_cache.insert(item, false);
+            self.record_sealed(item, false);
             return Some(false);
         };
         let local_ok = summary.projections.is_empty()
@@ -52,7 +77,7 @@ impl ReachFilter {
             && summary.drop_tys.iter().all(|&ty| layout_ty_infallible(cx, item, ty));
         if !local_ok {
             visiting.remove(&item);
-            self.sealed_cache.insert(item, false);
+            self.record_sealed(item, false);
             return Some(false);
         }
         let mut all_ready = true;
@@ -61,7 +86,7 @@ impl ReachFilter {
                 Some(true) => {}
                 Some(false) => {
                     visiting.remove(&item);
-                    self.sealed_cache.insert(item, false);
+                    self.record_sealed(item, false);
                     return Some(false);
                 }
                 None => all_ready = false,
@@ -72,7 +97,7 @@ impl ReachFilter {
                 Some(true) => {}
                 Some(false) => {
                     visiting.remove(&item);
-                    self.sealed_cache.insert(item, false);
+                    self.record_sealed(item, false);
                     return Some(false);
                 }
                 None => all_ready = false,
@@ -80,7 +105,7 @@ impl ReachFilter {
         }
         visiting.remove(&item);
         if all_ready {
-            self.sealed_cache.insert(item, true);
+            self.record_sealed(item, true);
             Some(true)
         } else {
             None

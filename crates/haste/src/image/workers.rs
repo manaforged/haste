@@ -78,11 +78,12 @@ impl Image {
         }
         let cfg = DictConfig::from_env();
         self.pass.stencils.cfg = cfg;
-        let had_templates = !self.pass.stencils.templates.is_empty();
-        let plan = (cfg, !had_templates && !cfg.verify && cfg.min_fanout > 1);
+        let block_parallel = !self.pass.stencils.templates.is_empty() && self.mode != super::ImageMode::Aot;
+        let plan = (cfg, !block_parallel && !cfg.verify && cfg.min_fanout > 1);
         let buckets = bucket_work(reached, work);
         let jobs = crate::jobs();
-        if jobs <= 1 || cfg.verify || work.len() < MIN_PARALLEL || had_templates {
+        let min_parallel = if self.mode == super::ImageMode::Aot { 4 } else { MIN_PARALLEL };
+        if jobs <= 1 || cfg.verify || work.len() < min_parallel || block_parallel {
             return self.compile_buckets(cx, reached, &buckets, plan);
         }
         let shards = lpt_shards(buckets, jobs);

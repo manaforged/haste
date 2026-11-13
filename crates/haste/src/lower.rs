@@ -279,8 +279,17 @@ struct Loop {
 pub(super) struct Inline {
     pub stack: Vec<usize>,
     pub local: rustc_hash::FxHashMap<usize, (Option<Arc<stencil::InlinedCallee>>, usize)>,
+    pub local_meta: rustc_hash::FxHashMap<usize, (Option<stencil::InlineMeta>, usize)>,
     pub max_callee_height: u8,
     pub max_callee_size: u16,
+}
+
+impl Inline {
+    pub(super) fn pop(&mut self, depth: usize) {
+        self.stack.pop();
+        self.local.retain(|_, (_, cyc)| *cyc == usize::MAX || *cyc < depth);
+        self.local_meta.retain(|_, (_, cyc)| *cyc == usize::MAX || *cyc < depth);
+    }
 }
 
 /// The lowering of one body.

@@ -53,7 +53,7 @@ impl AotState {
     }
 }
 
-struct AotReach {
+pub(super) struct AotReach {
     fns: Vec<bool>,
     rodata: Vec<bool>,
     vtables: Vec<bool>,
@@ -67,11 +67,11 @@ struct AotReach {
 }
 
 impl AotReach {
-    fn collect(state: &AotState, roots: [usize; 2]) -> Self {
+    pub(super) fn new(len: usize, roots: [usize; 2]) -> Self {
         let mut this = Self {
-            fns: vec![false; state.functions.len()],
-            rodata: vec![false; state.rodata.len()],
-            vtables: vec![false; state.vtables.len()],
+            fns: vec![false; len],
+            rodata: Vec::new(),
+            vtables: Vec::new(),
             slots: HashSet::default(),
             slot_list: Vec::new(),
             statics: HashSet::default(),
@@ -83,7 +83,14 @@ impl AotReach {
         for root in roots {
             this.mark_fn(root);
         }
-        this.drain(state);
+        this
+    }
+
+    fn collect(state: &AotState, roots: [usize; 2]) -> Self {
+        let mut this = Self::new(state.functions.len(), roots);
+        this.rodata.resize(state.rodata.len(), false);
+        this.vtables.resize(state.vtables.len(), false);
+        this.drain(state, None);
         this.slot_list.sort_unstable();
         this
     }
@@ -96,14 +103,20 @@ impl AotReach {
     }
 
     fn mark_rodata(&mut self, id: usize) {
-        if id < self.rodata.len() && !self.rodata[id] {
+        if id >= self.rodata.len() {
+            self.rodata.resize(id + 1, false);
+        }
+        if !self.rodata[id] {
             self.rodata[id] = true;
             self.work_rodata.push(id);
         }
     }
 
     fn mark_vtable(&mut self, id: usize) {
-        if id < self.vtables.len() && !self.vtables[id] {
+        if id >= self.vtables.len() {
+            self.vtables.resize(id + 1, false);
+        }
+        if !self.vtables[id] {
             self.vtables[id] = true;
             self.work_vtables.push(id);
         }
@@ -121,6 +134,7 @@ impl AotReach {
             SymbolSource::Rodata(id) => self.mark_rodata(id.0 as usize),
             SymbolSource::StaticCell { index, .. } => {
                 self.statics.insert(*index);
+                self.mark_fn(*index);
             }
             SymbolSource::PromotedCell { owner, seq, .. } => {
                 self.promoted.insert((*owner, *seq));
@@ -129,9 +143,15 @@ impl AotReach {
         }
     }
 
-    fn drain(&mut self, state: &AotState) {
+    pub(super) fn drain(&mut self, state: &AotState, mut pending: Option<(&[bool], &mut Vec<usize>)>) {
         while !self.work_fns.is_empty() || !self.work_rodata.is_empty() || !self.work_vtables.is_empty() {
             while let Some(idx) = self.work_fns.pop() {
+                if let Some((compiled, next_wave)) = pending.as_mut()
+                    && !compiled.get(idx).copied().unwrap_or(true)
+                {
+                    next_wave.push(idx);
+                    continue;
+                }
                 match state.functions.get(idx).and_then(Option::as_ref) {
                     Some(AotFn::Direct { code, relocs }) => {
                         for reloc in code.relocs() {
@@ -176,6 +196,9 @@ impl AotReach {
                     }
                 }
             }
+        }
+        if let Some((_, next_wave)) = pending {
+            self.work_fns.extend_from_slice(next_wave);
         }
     }
 }

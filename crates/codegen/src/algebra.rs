@@ -105,6 +105,10 @@ fn known_bits(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v:
             let aw = width_mask(func.ty(a));
             ((za | !aw) & w, oa & aw)
         }
+        Op::Convert(Convert::Ireduce, a) if func.ty(a).is_small_int() => {
+            let (za, oa) = known_bits(func, defs, consts, a, depth + 1);
+            (za & w, oa & w)
+        }
         _ => (0, 0),
     }
 }
@@ -244,7 +248,29 @@ fn negated_shift_add(func: &Function, defs: &[Option<Inst>], consts: &[Option<i6
     None
 }
 
-fn simplify_band(func: &mut Function, defs: &mut Vec<Option<Inst>>, consts: &mut Vec<Option<i64>>, out: &mut Vec<Inst>, a: Value, b: Value) -> Option<Op> {
+fn redundant_mask(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], src: Value, ty: Type, mask: u64) -> bool {
+    if func.ty(src) != ty {
+        return false;
+    }
+    let w = width_mask(ty);
+    let (kz, _) = known_bits(func, defs, consts, src, 0);
+    let active = !kz & w;
+    (active & mask) == active
+}
+
+fn set_alias(subst: &mut Vec<Value>, len: usize, r: Value, target: Value) {
+    subst.extend((subst.len()..len).map(|i| Value(i as u32)));
+    subst[r.index()] = target;
+}
+
+fn find_alias(subst: &[Value], mut v: Value) -> Value {
+    while let Some(&next) = subst.get(v.index()).filter(|&&n| n != v) {
+        v = next;
+    }
+    v
+}
+
+fn simplify_band(func: &mut Function, defs: &mut Vec<Option<Inst>>, consts: &mut Vec<Option<i64>>, out: &mut Vec<Inst>, res: Option<Value>, subst: &mut Vec<Value>, a: Value, b: Value) -> Option<Op> {
     let ty = func.ty(a);
     if !ty.is_small_int() {
         return None;
@@ -252,23 +278,35 @@ fn simplify_band(func: &mut Function, defs: &mut Vec<Option<Inst>>, consts: &mut
     for (lhs, mask_v) in [(a, b), (b, a)] {
         let Some(mask_imm) = consts.get(mask_v.index()).copied().flatten() else { continue };
         let mask = extend(mask_imm, ty, false) as u64;
+        if redundant_mask(func, defs, consts, lhs, ty, mask) {
+            if let Some(r) = res {
+                set_alias(subst, func.types.len(), r, lhs);
+            }
+            return None;
+        }
         if mask == 0x8080_8080_8080_8080
             && let Some(x) = match_swar_msb_broadcast(func, defs, consts, lhs)
         {
             return Some(Op::Binary(Binary::Band, x, mask_v));
         }
         if let Some(m) = simplify_masked(func, defs, consts, lhs, mask, 0) {
-            return Some(match m {
-                Masked::Const(c) => Op::Const(extend(c as i64, ty, true)),
+            return match m {
+                Masked::Const(c) => Some(Op::Const(extend(c as i64, ty, true))),
                 Masked::And(src, new_mask) => {
+                    if redundant_mask(func, defs, consts, src, ty, new_mask) {
+                        if let Some(r) = res {
+                            set_alias(subst, func.types.len(), r, src);
+                        }
+                        return None;
+                    }
                     let mv = if new_mask == mask {
                         mask_v
                     } else {
                         emit_op(func, defs, consts, out, ty, Op::Const(extend(new_mask as i64, ty, true)))
                     };
-                    Op::Binary(Binary::Band, src, mv)
+                    Some(Op::Binary(Binary::Band, src, mv))
                 }
-            });
+            };
         }
     }
     None
@@ -392,9 +430,7 @@ fn reassociate_add_sub(
 
 /// Rewrites constant unsigned divisions/remainders, unsigned zero compares, negated shift-adds, and bitwise/SWAR masks.
 pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
-    let mut defs = initial_defs.to_vec();
-    let mut consts = vec![None; func.types.len()];
-    let mut fits_used = vec![false; func.types.len()];
+    let (mut defs, mut consts, mut fits_used, mut subst) = (initial_defs.to_vec(), vec![None; func.types.len()], vec![false; func.types.len()], Vec::new());
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         let data = &func.insts[inst.index()];
         if let (Op::Const(imm), Some(res)) = (&data.op, data.result) {
@@ -433,7 +469,7 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
                     })
                     .or_else(|| reassociate_add_sub(func, &mut defs, &mut consts, &mut out, &fits_used, false, a, b)),
                 Op::Binary(Binary::Isub, a, b) => reassociate_add_sub(func, &mut defs, &mut consts, &mut out, &fits_used, true, a, b),
-                Op::Binary(Binary::Band, a, b) => simplify_band(func, &mut defs, &mut consts, &mut out, a, b),
+                Op::Binary(Binary::Band, a, b) => simplify_band(func, &mut defs, &mut consts, &mut out, res, &mut subst, a, b),
                 Op::Binary(Binary::Bxor, a, b) => simplify_bxor(func, &mut defs, &mut consts, &mut out, a, b),
                 Op::Binary(Binary::Ushr, ctz_val, sh) if func.ty(ctz_val) == Type::I64 && consts.get(sh.index()).copied().flatten() == Some(3) => {
                     defs.get(ctz_val.index()).copied().flatten().and_then(|ctz_inst| {
@@ -496,6 +532,11 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
             out.push(inst);
         }
         func.blocks[b].insts = out;
+    }
+    if !subst.is_empty() {
+        for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+            func.insts[inst.index()].op.map_operands(|v| find_alias(&subst, v));
+        }
     }
 }
 

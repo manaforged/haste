@@ -20,6 +20,7 @@ pub struct PolyInst {
     pub builtin_ops: Box<[ExprId]>,
     pub call_overrides: Box<[CallOverride]>,
     pub offset_overrides: Box<[(ExprId, u64)]>,
+    pub(crate) check_only: bool,
     pub(super) materialized: OnceLock<Arc<BodyTables>>,
 }
 

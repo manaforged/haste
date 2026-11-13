@@ -352,11 +352,7 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
                 }
                 q = cvar.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            if q.filter.sealed_cache.len() > synced_len {
-                for (&k, &v) in &q.filter.sealed_cache {
-                    local_filter.sealed_cache.entry(k).or_insert(v);
-                }
-            }
+            local_filter.sync_from(&q.filter, &mut synced_len);
             let take = (q.queue.len() / workers.max(1)).clamp(1, MAX_WORKER_BATCH);
             for _ in 0..take {
                 let Some((at, instance)) = q.queue.pop_front() else { break };
@@ -384,10 +380,8 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             let mut q = crate::sync::lock(mutex);
             q.active = q.active.saturating_sub(active.2);
             active.2 = 0;
-            for (&k, &v) in &local_filter.sealed_cache {
-                q.filter.sealed_cache.entry(k).or_insert(v);
-            }
-            synced_len = q.filter.sealed_cache.len();
+            local_filter.drain_to(&mut q.filter);
+            synced_len = q.filter.sealed_log.len();
             let mut pushed = false;
             for (at, instance, typed, unlaid, asked, deferred, callees) in results.drain(..) {
                 if deferred {
@@ -610,7 +604,7 @@ fn infer_entry(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<Strin
 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
 pub(super) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
-    if let Some(typed) = cx.store.finals.get(instance) {
+    if let Some(typed) = cx.store.finals.get(instance).filter(|t| cx.store.lookups.skip_warm_sysroot_bodies || !matches!(&t.tables, super::infer::LazyTables::Poly(p) if p.check_only)) {
         register(cx, *instance, &typed);
         return Ok(typed);
     }

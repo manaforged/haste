@@ -179,6 +179,16 @@ impl Emit<'_> {
         }
     }
 
+    fn const_imm(&self, val: Value) -> Option<i64> {
+        self.plan.const_of(val).or_else(|| {
+            let inst = self.defs[val.index()]?;
+            match self.func.insts[inst.index()].op {
+                Op::Const(imm) => Some(imm),
+                _ => None,
+            }
+        })
+    }
+
     fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<(), String> {
         if let Some(alu) = alu_of(op) {
             if alu == Alu::Add && matches!(ty, Type::I32 | Type::I64) {
@@ -200,7 +210,7 @@ impl Emit<'_> {
             }
             if matches!(alu, Alu::And | Alu::Orr | Alu::Eor) && dst != ZR {
                 let size = if ty == Type::I64 { Size::X } else { Size::W };
-                let imm_pair = match (self.plan.const_of(y), self.plan.const_of(x)) {
+                let imm_pair = match (self.const_imm(y), self.const_imm(x)) {
                     (Some(imm), _) => Some((x, imm)),
                     (None, Some(imm)) => Some((y, imm)),
                     (None, None) => None,

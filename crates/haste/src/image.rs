@@ -89,11 +89,17 @@ impl Pass {
         }
     }
 
-    /// Moves the code chunks and sparse compile records of a worker's pass into this one; the worker's stencil cache is dropped.
+    /// Moves the code chunks, sparse compile records, and stencil entries of a worker's pass into this one.
     fn merge(&mut self, other: Pass) {
         self.memory.merge(other.memory);
         self.records.extend(other.records);
         self.frozen_stencils.extend(other.frozen_stencils);
+        for (key, template) in other.stencils.templates {
+            self.stencils.templates.entry(key).or_insert(template);
+        }
+        for (key, alias) in other.stencils.aliases {
+            self.stencils.aliases.entry(key).or_insert(alias);
+        }
     }
 }
 
@@ -334,8 +340,42 @@ impl Image {
         Ok((image, broken))
     }
 
+    pub(crate) fn build_aot(cx: &mut Context<'_>, reached: &Reached, roots: [usize; 2]) -> Result<(Image, HashMap<usize, String>)> {
+        let mut image = Self::create(reached, ImageMode::Aot, (SHARED_BYTES, STATE_BYTES, reached.list.len().max(1)))?;
+        let mut compiled = vec![false; reached.list.len()];
+        let mut reach = aot::AotReach::new(reached.list.len(), roots);
+        let mut broken = HashMap::default();
+        let mut wave = Vec::new();
+        loop {
+            if let Some(aot) = &image.aot {
+                let state = lock(aot);
+                reach.drain(&state, Some((&compiled, &mut wave)));
+            }
+            if wave.is_empty() {
+                break;
+            }
+            wave.sort_unstable();
+            for &idx in &wave {
+                if let Some(slot) = compiled.get_mut(idx) {
+                    *slot = true;
+                }
+            }
+            for (idx, err) in image.compile_inner(cx, reached, &wave, false) {
+                broken.insert(idx, err);
+            }
+            wave.clear();
+        }
+        image.bodies = lower::Bodies::default();
+        Ok((image, broken))
+    }
+
     /// Lowers and encodes the reached functions `indices` that type-checked, on every core when there are many, links them, and returns the errors of those that did not compile, by index.
     pub fn compile(&mut self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize]) -> Vec<(usize, String)> {
+        let reset = !indices.is_empty() && indices.len() < reached.list.len();
+        self.compile_inner(cx, reached, indices, reset)
+    }
+
+    fn compile_inner(&mut self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize], reset: bool) -> Vec<(usize, String)> {
         if self.sizes.len() < reached.list.len() {
             self.sizes.resize(reached.list.len(), 0);
             self.times.resize(reached.list.len(), 0);
@@ -343,7 +383,7 @@ impl Image {
         if let Some(aot) = &self.aot {
             lock(aot).ensure_len(reached.list.len());
         }
-        if !indices.is_empty() && indices.len() < reached.list.len() {
+        if reset {
             self.reset_caches();
         }
         self.bind_foreign_statics(cx, reached, indices);

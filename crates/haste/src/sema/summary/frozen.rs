@@ -51,6 +51,7 @@ pub(super) fn frozen_instance(
                 builtin_ops: decoded.builtin_ops,
                 call_overrides: decoded.call_overrides,
                 offset_overrides: decoded.offset_overrides,
+                check_only: false,
                 materialized: OnceLock::new(),
             };
             let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
@@ -78,6 +79,7 @@ pub(in crate::sema) fn export_sysroot_instances(
             return true;
         }
         if let LazyTables::Poly(inst) = &typed.tables
+            && !inst.check_only
             && inst.summary.template.closures.is_empty()
             && let Some(item_key) = crate::substrate::sysroot_item_key(outline, item)
             && let Some(substs_key) = codec::substs_key(outline, types, substs, crate::substrate::sysroot_item_key)
@@ -150,6 +152,7 @@ pub(super) fn try_cached_instantiate(
     cx: &Context<'_>,
     instance: Instance,
     summary: &Arc<PolySummary>,
+    check_only: bool,
 ) -> Option<(PolyInst, Vec<Local>, Option<Ty>, Vec<Ty>, Vec<Ty>)> {
     if !summary.op_holes.is_empty()
         || !summary.const_holes.is_empty()
@@ -163,12 +166,25 @@ pub(super) fn try_cached_instantiate(
     for &proj_id in &summary.projections {
         resolve_proj_ty(cx, &args, &mut projs, cx.types.intern(Kind::Proj(proj_id)), 0)?;
     }
-    for &ty in &summary.parametric_tys {
-        resolve_proj_ty(cx, &args, &mut projs, ty, 0)?;
+    if check_only {
+        for ob in &summary.obligations {
+            if let PolyObligation::Prove { self_ty, args: ob_args, .. } = *ob {
+                resolve_proj_ty(cx, &args, &mut projs, self_ty, 0)?;
+                resolve_proj_substs(cx, &args, &mut projs, ob_args, 0)?;
+            }
+        }
+        for &ty in summary.layout_tys.iter().chain(&summary.drop_tys).chain(summary.ret.as_slice()) {
+            resolve_proj_ty(cx, &args, &mut projs, ty, 0)?;
+        }
+    } else {
+        for &ty in &summary.parametric_tys {
+            resolve_proj_ty(cx, &args, &mut projs, ty, 0)?;
+        }
     }
     for &(_, _, substs) in summary.direct_calls.iter().chain(&summary.call_holes) {
         resolve_proj_substs(cx, &args, &mut projs, substs, 0)?;
     }
+    projs.sort_unstable_by_key(|&(id, _)| id.0);
     let mut inst = PolyInst {
         args: instance.1,
         summary: Arc::clone(summary),
@@ -177,6 +193,7 @@ pub(super) fn try_cached_instantiate(
         builtin_ops: Box::new([]),
         call_overrides: Box::new([]),
         offset_overrides: Box::new([]),
+        check_only,
         materialized: OnceLock::new(),
     };
     for ob in &summary.obligations {
@@ -198,9 +215,11 @@ pub(super) fn try_cached_instantiate(
             resolved.push((key, ri, rs));
         }
     }
-    resolved.sort_unstable_by_key(|&(key, ..)| key);
+    if !check_only {
+        resolved.sort_unstable_by_key(|&(key, ..)| key);
+    }
     inst.resolved_calls = resolved.into_boxed_slice();
-    let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
+    let locals = if check_only { Vec::new() } else { summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect() };
     let ret = summary.ret.map(|ty| inst.sub_ty(&cx.types, ty));
     let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
     let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
