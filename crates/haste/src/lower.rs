@@ -206,8 +206,17 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
         }
     }
     for param in params {
+        let sig_idx = signature.params.len();
         match repr(cx, param)? {
-            Repr::Scalar(ty) => signature.params.push(AbiParam::new(ty)),
+            Repr::Scalar(ty) => {
+                if ty == Type::I64
+                    && let Kind::Ref(crate::sema::ty::Mut::Not, inner) = *cx.types.kind(param)
+                    && is_freeze_pointee(cx, inner)
+                {
+                    signature.mark_readonly(sig_idx);
+                }
+                signature.params.push(AbiParam::new(ty));
+            }
             Repr::Mem { .. } => match passed_parts(cx, param)? {
                 Some(parts) => signature.params.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
                 None => signature.params.push(AbiParam::new(Type::I64)),
@@ -216,6 +225,32 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
         }
     }
     Ok(signature)
+}
+
+fn is_freeze_pointee(cx: &mut Context<'_>, ty: Ty) -> bool {
+    cx.is_unsized(ty).is_ok_and(|u| !u) && cx.layout(ty).is_ok_and(|l| l.size.bytes() > 0) && is_freeze_ty(cx, ty, 0)
+}
+
+fn is_freeze_ty(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
+    if depth > 16 || ty == Ty::NONE || cx.types.has_params(ty) {
+        return false;
+    }
+    match *cx.types.kind(ty) {
+        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => true,
+        Kind::Pat(base, ..) | Kind::Array(base, _) | Kind::Slice(base) => is_freeze_ty(cx, base, depth + 1),
+        Kind::Tuple(substs) => cx.types.substs(substs).to_vec().into_iter().all(|t| is_freeze_ty(cx, t, depth + 1)),
+        Kind::Adt(item, substs) => {
+            if cx.types.substs_have_params(substs) || matches!(cx.lang(item), Some("unsafe_cell" | "unsafe_pinned")) {
+                return false;
+            }
+            let args = cx.types.substs(substs).to_vec();
+            let Ok(variants) = crate::sema::infer::field_types(cx, item, &args) else {
+                return false;
+            };
+            variants.iter().flatten().all(|&field| is_freeze_ty(cx, field, depth + 1))
+        }
+        Kind::Closure(..) | Kind::Dyn(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
+    }
 }
 
 /// Whether `signature` returns its result through a first `StructReturn` pointer.

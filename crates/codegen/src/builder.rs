@@ -171,6 +171,44 @@ impl<'f> FunctionBuilder<'f> {
     }
 }
 
+impl Function {
+    /// Replaces the `Op::Call` at `block[inst_pos]` with an inline copy of `callee`, shifting symbols by `sym_base` and splitting the tail into a continuation block.
+    pub fn splice_call(&mut self, block: Block, inst_pos: usize, callee: &Function, sym_base: u32) {
+        let old_inst = self.blocks[block.index()].insts[inst_pos];
+        let Op::Call { args, results, .. } = std::mem::replace(&mut self.insts[old_inst.index()].op, Op::Trap) else {
+            return;
+        };
+        self.insts[old_inst.index()].result = None;
+        let values: Vec<Value> = callee.types.iter().map(|ty| self.value(*ty)).collect();
+        let base_block = self.blocks.len() as u32;
+        let blocks: Vec<Block> = (0..callee.blocks.len() as u32).map(|i| Block(base_block + i)).collect();
+        self.blocks.resize_with(self.blocks.len() + callee.blocks.len(), BlockData::default);
+        let after = Block(self.blocks.len() as u32);
+        let tail = self.blocks[block.index()].insts.split_off(inst_pos + 1);
+        self.blocks[block.index()].insts.pop();
+        self.blocks.push(BlockData { params: results, insts: tail });
+        let map = Remap { values, blocks, after, slots: self.slots.len() as u32, sigs: self.sigs.len() as u32, sym_base, dict: None };
+        self.slots.extend(callee.slots.iter().cloned());
+        self.sigs.extend(callee.sigs.iter().cloned());
+        for &(vt_sym, off, slot_sym, low) in &callee.vtable_slots {
+            self.vtable_slots.push((vt_sym + sym_base, off, slot_sym + sym_base, low));
+        }
+        for (index, c_block) in callee.blocks.iter().enumerate() {
+            let target = map.blocks[index];
+            self.blocks[target.index()].params = c_block.params.iter().map(|param| map.values[param.index()]).collect();
+            for inst in &c_block.insts {
+                let data = map.inst(&callee.insts[inst.index()]);
+                self.insts.push(data);
+                let new_inst = Inst(self.insts.len() as u32 - 1);
+                self.blocks[target.index()].insts.push(new_inst);
+            }
+        }
+        let entry = callee.entry.map_or(after, |entry| map.blocks[entry.index()]);
+        let jump = self.add(Op::Jump(entry, args), None);
+        self.blocks[block.index()].insts.push(jump);
+    }
+}
+
 /// The sizes of a function's parts at one point of building.
 #[derive(Clone, Debug)]
 pub struct Mark {

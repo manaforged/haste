@@ -593,7 +593,57 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         lower.run()?;
         lower.cycle_root
     };
+    let cycle = if mode == LowerMode::Stencil
+        && slots.allow_inline()
+        && func.has_vtable_slots()
+        && !func.is_coroutine()
+    {
+        splice_devirt_vtable_calls(cx, (reached, slots), inline, (&mut func, &mut relocs, &mut reloc_plan), cycle)?
+    } else {
+        cycle
+    };
     Ok((func, relocs, Arc::new(RelocPlan::from_vec(reloc_plan)), cycle))
+}
+
+fn splice_devirt_vtable_calls(
+    cx: &mut Context<'_>,
+    (reached, slots): (&Reached, &dyn Slots),
+    inline: &mut Inline,
+    (func, relocs, reloc_plan): (&mut Function, &mut RelocVec, &mut Vec<RelocStep>),
+    mut cycle_root: usize,
+) -> Result<usize> {
+    let mut any = false;
+    for _ in 0..8 {
+        haste_codegen::simplify(func, crate::profile().into());
+        any = false;
+        let current_plan = RelocPlan { steps: reloc_plan.clone().into_boxed_slice() };
+        let mut spliced = false;
+        for (block, pos, callee_sym) in func.devirt_call_sites() {
+            let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(callee_sym as usize) else { continue };
+            let Some((expr, slot)) = current_plan.vtable_slot_at(callee_sym as usize) else { continue };
+            let Some(limit) = super::expr::inline_limit(cx, reached, callee_idx) else { continue };
+            let (hit, cycle) = resolve_inline(cx, (reached, slots), inline, callee_idx, limit)?;
+            cycle_root = cycle_root.min(cycle);
+            let Some(inlined) = hit else { continue };
+            if !inlined.body.can_inline() {
+                continue;
+            }
+            let sym_base = relocs.len() as u32;
+            relocs.extend(inlined.relocs.iter().cloned());
+            reloc_plan.push(RelocStep::SiteInline { origin: SiteOrigin::VtableMethod { expr, slot }, plan: Arc::clone(&inlined.reloc_plan) });
+            func.splice_call(block, pos, &inlined.body, sym_base);
+            spliced = true;
+            any = true;
+            break;
+        }
+        if !spliced {
+            break;
+        }
+    }
+    if any {
+        haste_codegen::simplify(func, crate::profile().into());
+    }
+    Ok(cycle_root)
 }
 
 impl Lower<'_, '_> {

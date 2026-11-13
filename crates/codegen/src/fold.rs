@@ -1,4 +1,4 @@
-use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, SigRef, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
 /// `imm` of type `ty` extended to 64 bits, by its sign when `signed`.
 pub(crate) fn extend(imm: i64, ty: Type, signed: bool) -> i64 {
@@ -135,7 +135,7 @@ pub(crate) fn fits(op: Binary, signed: bool, ty: Type, (x, y): (i64, i64)) -> Op
 }
 
 /// `op` on small integers when `known` gives the constants it reads.
-fn evaluate(func: &Function, op: &Op, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
+pub(crate) fn evaluate(func: &Function, op: &Op, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
     let (Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) | Op::Convert(_, x) | Op::Fits(_, _, x, _)) = *op else {
         return if let Op::Const(imm) = *op { Some(imm) } else { None };
     };
@@ -253,12 +253,19 @@ impl Fold {
         None
     }
 
-    /// `a` when `x ^ y` is `(a ^ c) ^ c` in either order of either xor.
+    /// `a` when `x ^ y` is `(a ^ c) ^ c`, or `b` when `(a + b) - a` in either order of `Iadd`.
     fn cancel(&self, func: &Function, op: Binary, x: Value, y: Value) -> Option<Value> {
+        let ty = func.ty(x);
+        if op == Binary::Isub {
+            return match *self.def(func, x)? {
+                Op::Binary(Binary::Iadd, a, b) if self.same(ty, a, y) => Some(b),
+                Op::Binary(Binary::Iadd, a, b) if self.same(ty, b, y) => Some(a),
+                _ => None,
+            };
+        }
         if op != Binary::Bxor {
             return None;
         }
-        let ty = func.ty(x);
         [(x, y), (y, x)].into_iter().find_map(|(inner, other)| match *self.def(func, inner)? {
             Op::Binary(Binary::Bxor, a, b) if self.same(ty, b, other) => Some(a),
             Op::Binary(Binary::Bxor, a, b) if self.same(ty, a, other) => Some(b),
@@ -537,7 +544,7 @@ pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
 }
 
 /// Empties the blocks no path from `entry` reaches and returns which blocks a path reaches.
-fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
+pub(crate) fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
     let reachable = func.reachable(entry);
     for (block, live) in func.blocks.iter_mut().zip(&reachable) {
         if !live && !block.insts.is_empty() {
@@ -726,74 +733,4 @@ fn invert(func: &mut Function) {
     }
 }
 
-/// Renumbers the instructions and values the blocks hold and drops the rest, so a body kept or copied whole carries no dead entries.
-pub(crate) fn compact(func: &mut Function) {
-    if func.coroutine.is_some() {
-        return;
-    }
-    let mut map: Vec<Option<Value>> = vec![None; func.types.len()];
-    let mut types = Vec::new();
-    let mut take = |value: Value| -> Value {
-        *map[value.index()].get_or_insert_with(|| {
-            types.push(func.types[value.index()]);
-            Value(types.len() as u32 - 1)
-        })
-    };
-    let live = func.blocks.iter().map(|block| block.insts.len()).sum();
-    let mut insts = Vec::with_capacity(live);
-    let mut blocks = std::mem::take(&mut func.blocks);
-    for block in &mut blocks {
-        block.params.iter_mut().for_each(|param| *param = take(*param));
-        for inst in &mut block.insts {
-            let slot = &mut func.insts[inst.index()];
-            let mut data = crate::ir::InstData { op: std::mem::replace(&mut slot.op, Op::Trap), result: slot.result };
-            data.result = data.result.map(&mut take);
-            if let Op::Call { results, .. } = &mut data.op {
-                results.iter_mut().for_each(|result| *result = take(*result));
-            }
-            data.op.map_operands(&mut take);
-            insts.push(data);
-            *inst = crate::ir::Inst(insts.len() as u32 - 1);
-        }
-    }
-    func.blocks = blocks;
-    func.insts = insts;
-    types.shrink_to_fit();
-    func.types = types;
-    compact_blocks(func);
-    compact_sigs(func);
-}
-
-/// Drops the empty blocks, which nothing reaches, renumbers the rest, and trims every list to its length.
-fn compact_blocks(func: &mut Function) {
-    let mut map: Vec<Option<Block>> = vec![None; func.blocks.len()];
-    let mut blocks = Vec::new();
-    for (index, mut block) in std::mem::take(&mut func.blocks).into_iter().enumerate() {
-        if block.insts.is_empty() && func.entry != Some(Block(index as u32)) {
-            continue;
-        }
-        block.params.shrink_to_fit();
-        block.insts.shrink_to_fit();
-        map[index] = Some(Block(blocks.len() as u32));
-        blocks.push(block);
-    }
-    let renumber = |block: Block| map[block.index()].expect("a branch reaches only blocks that hold instructions");
-    func.insts.iter_mut().for_each(|data| data.op.map_targets(renumber));
-    func.entry = func.entry.map(renumber);
-    func.blocks = blocks;
-}
-
-/// Drops the signatures no call uses and renumbers the rest.
-fn compact_sigs(func: &mut Function) {
-    let mut map: Vec<Option<SigRef>> = vec![None; func.sigs.len()];
-    let mut sigs = Vec::new();
-    for data in &mut func.insts {
-        if let Op::Call { sig, .. } | Op::TryCall { sig, .. } = &mut data.op {
-            *sig = *map[sig.index()].get_or_insert_with(|| {
-                sigs.push(func.sigs[sig.index()].clone());
-                SigRef(sigs.len() as u32 - 1)
-            });
-        }
-    }
-    func.sigs = sigs;
-}
+pub(crate) use crate::thread::compact;

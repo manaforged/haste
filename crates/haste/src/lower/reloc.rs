@@ -64,6 +64,7 @@ pub(super) enum SiteOrigin {
     ShapeGlueResume,
     ShapeUntuple,
     ShapeClone(u16),
+    VtableMethod { expr: ExprId, slot: u16 },
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +88,34 @@ pub struct RelocPlan {
 impl RelocPlan {
     pub(super) fn from_vec(steps: Vec<RelocStep>) -> Self {
         Self { steps: steps.into_boxed_slice() }
+    }
+
+    pub(super) fn reloc_len(&self) -> usize {
+        self.steps
+            .iter()
+            .map(|step| match step {
+                RelocStep::TypeName(_) => 2,
+                RelocStep::SiteInline { plan, .. } => plan.reloc_len(),
+                _ => 1,
+            })
+            .sum()
+    }
+
+    pub(super) fn vtable_slot_at(&self, target_sym: usize) -> Option<(ExprId, u16)> {
+        let mut offset = 0usize;
+        for step in &self.steps {
+            let len = match step {
+                RelocStep::VtableSlot { expr, slot } if offset == target_sym => return Some((*expr, *slot)),
+                RelocStep::TypeName(_) => 2,
+                RelocStep::SiteInline { plan, .. } => plan.reloc_len(),
+                _ => 1,
+            };
+            if target_sym < offset + len {
+                return None;
+            }
+            offset += len;
+        }
+        None
     }
 
     pub(super) fn has_promoted(&self) -> bool {
@@ -133,6 +162,15 @@ fn eval_into(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, plan: &
                 let callee_idx = reached_index_of(cx, reached, slots, (callee_item, callee_substs))?;
                 out.push(SymbolSource::Slot(callee_idx));
             }
+            RelocStep::SiteInline { origin: SiteOrigin::VtableMethod { expr, slot }, plan: sub_plan } => {
+                let id = eval_vtable_at(cx, reached, slots, typed, *expr)?;
+                let entries = slots.vtable_entries(id).ok_or_else(|| anyhow::anyhow!("missing vtable entries for {:?}", id))?;
+                let callee_idx = match entries.get(*slot as usize) {
+                    Some(super::stencil::VtableEntry::Word(super::Word::Code(idx))) => *idx,
+                    other => bail!("vtable slot {} is not code: {:?}", slot, other),
+                };
+                eval_into(cx, reached, slots, sub_plan, callee_idx, out)?;
+            }
             RelocStep::SiteInline { origin, plan: sub_plan } => {
                 let (callee_item, callee_substs) = eval_site(cx, reached, typed, substs, origin)?;
                 let callee_idx = reached_index_of(cx, reached, slots, (callee_item, callee_substs))?;
@@ -165,17 +203,11 @@ pub(super) fn reached_index_of(cx: &Context<'_>, reached: &Reached, slots: &dyn 
 }
 
 fn eval_vtable_at(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, typed: &Typed, expr: ExprId) -> Result<super::stencil::VtableId> {
-    let vtable = match &typed.tables {
-        LazyTables::Eager(t) => match t.coercions.get(&expr) {
-            Some(Coercion::Vtable(vt)) => vt,
-            _ => bail!("missing vtable coercion at {:?}", expr),
-        },
-        LazyTables::Poly(p) => match p.summary.template.coercions.get(&expr) {
-            Some(Coercion::Vtable(vt)) => vt,
-            _ => bail!("missing poly vtable coercion at {:?}", expr),
-        },
+    let scoped = typed.scoped(&cx.types);
+    let Some(Coercion::Vtable(vt)) = scoped.coercions.get(&expr) else {
+        bail!("missing vtable coercion at {:?}", expr);
     };
-    build_vtable_id(cx, reached, slots, vtable)
+    build_vtable_id(cx, reached, slots, vt)
 }
 
 fn eval_site(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Substs, origin: &SiteOrigin) -> Result<(ItemRef, Substs)> {
@@ -223,6 +255,7 @@ fn eval_site(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Sub
             },
             _ => bail!("expected clone shape"),
         },
+        SiteOrigin::VtableMethod { slot, .. } => bail!("unexpected eval_site for vtable method slot {slot}"),
     }
 }
 

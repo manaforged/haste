@@ -123,11 +123,12 @@ const SYSCALL_CLOBBERS: [&str; 2] = ["rcx", "r11"];
 
 /// One instruction an `asm!` template holds, which its expansion writes as Rust.
 #[derive(Clone, Copy)]
-enum Instruction {
+enum Instruction<'a> {
     Barrier,
     Syscall,
     LockNot(u32),
     Divide(u32),
+    Crc32 { bits: u32, poly: u32, crc: &'a str, data: &'a str },
 }
 
 /// The expansion of an `asm!` whose `templates` the call spells before its `operands`: an optimization barrier when they hold no instruction, a call of the host's system call entry for one `syscall`, an atomic invert for one `lock not` of memory, and a wide division for one `div`.
@@ -138,12 +139,13 @@ pub fn asm(src: &Source, templates: &[String], operands: &[(u32, u32)], out: &mu
         Some(Instruction::Syscall) => asm_syscall(src, operands, out),
         Some(Instruction::LockNot(bits)) => asm_lock_not(src, operands, bits, out),
         Some(Instruction::Divide(bits)) => asm_divide(src, operands, bits, out),
+        Some(Instruction::Crc32 { bits, poly, crc, data }) => asm_crc32(src, operands, (bits, poly, crc, data), out),
         None => bail!("inline assembly `{}` is not supported", text.trim()),
     }
 }
 
 /// The instruction that the comment-free template `text` holds.
-fn instruction(text: &str) -> Option<Instruction> {
+fn instruction(text: &str) -> Option<Instruction<'_>> {
     let words: Vec<&str> = text.split_whitespace().collect();
     let placeholder = |word: &str| word.starts_with('{') && word.ends_with('}');
     match words.as_slice() {
@@ -152,8 +154,29 @@ fn instruction(text: &str) -> Option<Instruction> {
         ["lock", "not", width, "ptr", "[{0}]"] => Some(Instruction::LockNot(memory_bits(width)?)),
         ["div", "{0:r}"] => Some(Instruction::Divide(64)),
         ["div", "{0:e}"] => Some(Instruction::Divide(32)),
+        [op, dst, src1, src2] => crc32_instruction(op, dst, src1, src2),
         _ => None,
     }
+}
+
+fn crc32_instruction<'a>(op: &str, dst: &'a str, src1: &'a str, src2: &'a str) -> Option<Instruction<'a>> {
+    let (bits, poly) = match op {
+        "crc32b" => (8, 0xEDB8_8320),
+        "crc32h" => (16, 0xEDB8_8320),
+        "crc32w" => (32, 0xEDB8_8320),
+        "crc32x" => (64, 0xEDB8_8320),
+        "crc32cb" => (8, 0x82F6_3B78),
+        "crc32ch" => (16, 0x82F6_3B78),
+        "crc32cw" => (32, 0x82F6_3B78),
+        "crc32cx" => (64, 0x82F6_3B78),
+        _ => return None,
+    };
+    let strip = |tok: &'a str| -> Option<&'a str> {
+        let inner = tok.trim_end_matches(',').strip_prefix('{')?.strip_suffix('}')?;
+        Some(inner.split(':').next().unwrap_or(inner))
+    };
+    let (d, s1, s2) = (strip(dst)?, strip(src1)?, strip(src2)?);
+    (d == s1).then_some(Instruction::Crc32 { bits, poly, crc: d, data: s2 })
 }
 
 /// The bits of the memory operand size `width`.
@@ -199,6 +222,40 @@ fn asm_lock_not(src: &Source, args: &[(u32, u32)], bits: u32, out: &mut Tokens) 
     out.lexed("{ let __haste_cell = (");
     out.copy_range(src, from, to);
     out.lexed(&format!(") as *const ::core::sync::atomic::AtomicU{bits}; (*__haste_cell).fetch_xor(!0, ::core::sync::atomic::Ordering::SeqCst); }}"));
+    Ok(())
+}
+
+fn asm_crc32(src: &Source, args: &[(u32, u32)], (bits, poly, crc_name, data_name): (u32, u32, &str, &str), out: &mut Tokens) -> Result<()> {
+    let mut named: Vec<(Option<&str>, Operand)> = Vec::new();
+    for &(from, to) in args.iter().filter(|(from, _)| src.text(*from) != "options") {
+        if from + 2 <= to && src.text(from + 1) == "=" {
+            named.push((Some(src.text(from)), operand(src, (from + 2, to))?));
+        } else {
+            named.push((None, operand(src, (from, to))?));
+        }
+    }
+    let find = |key: &str| -> Option<&Operand> {
+        if let Ok(pos) = key.parse::<usize>() {
+            return named.get(pos).map(|(_, op)| op);
+        }
+        named.iter().find(|(n, _)| *n == Some(key)).map(|(_, op)| op)
+    };
+    let crc_op = find(crc_name).ok_or_else(|| anyhow::anyhow!("crc32 missing operand `{crc_name}`"))?;
+    let data_op = find(data_name).ok_or_else(|| anyhow::anyhow!("crc32 missing operand `{data_name}`"))?;
+    let crc_in = crc_op.input.ok_or_else(|| anyhow::anyhow!("crc32 `{crc_name}` has no input"))?;
+    let data_in = data_op.input.ok_or_else(|| anyhow::anyhow!("crc32 `{data_name}` has no input"))?;
+    out.lexed("{ let mut __haste_crc: u32 = (");
+    out.copy_range(src, crc_in.0, crc_in.1);
+    out.lexed(") as u32; let mut __haste_data: u64 = (");
+    out.copy_range(src, data_in.0, data_in.1);
+    out.lexed(&format!(
+        ") as u64; let mut __haste_i: u32 = 0; while __haste_i < {bits} {{ let __haste_lsb = (__haste_crc ^ (__haste_data as u32)) & 1; __haste_crc = (__haste_crc >> 1) ^ (0u32.wrapping_sub(__haste_lsb) & {poly}); __haste_data >>= 1; __haste_i += 1; }} "
+    ));
+    if let Some((out_from, out_to)) = crc_op.output {
+        out.copy_range(src, out_from, out_to);
+        out.lexed(" = __haste_crc as _; ");
+    }
+    out.lexed("}");
     Ok(())
 }
 

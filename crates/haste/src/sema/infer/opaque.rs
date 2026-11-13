@@ -179,6 +179,35 @@ impl<'a> Infer<'_, 'a> {
         self.opaques.iter().find(|opaque| self.resolve(opaque.ret) == ty).and_then(|opaque| opaque.sig)
     }
 
+    /// Unifies the parameter types of a callable `impl Trait` return signature `sig` with the `Args` tuple in `args` when `of` is a callable trait.
+    pub(super) fn tie_callable_opaque(&mut self, of: ItemRef, sig: Ty, args: &[Ty]) -> Result<Option<bool>> {
+        if !self.is_callable_trait(of) {
+            return Ok(None);
+        }
+        let Kind::FnPtr(params, _) = *self.cx.types.kind(sig) else { return Ok(None) };
+        let Some(&tuple) = args.first() else { return Ok(None) };
+        let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(tuple)) else { return Ok(None) };
+        let params = self.cx.types.substs(params).to_vec();
+        let inputs = self.cx.types.substs(inputs).to_vec();
+        if params.len() != inputs.len() {
+            return Ok(Some(false));
+        }
+        let mark = self.mark_vars();
+        if params.into_iter().zip(inputs).all(|(p, i)| self.unify(p, i).is_ok()) {
+            return Ok(Some(true));
+        }
+        self.rollback_vars(mark);
+        Ok(Some(false))
+    }
+
+    pub(super) fn callable_opaque_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Result<bool> {
+        let Some(sig) = self.opaque_sig(self.resolve(ty)) else { return Ok(false) };
+        if let Some(held) = self.tie_callable_opaque(of, sig, args)? { return Ok(held); }
+        let Ok([(_, vars)]) = <[_; 1]>::try_from(self.applicable(of, sig, args, 0)?) else { return Ok(false) };
+        self.adopt(vars);
+        Ok(true)
+    }
+
     /// The function pointer type that the first `Fn` bound among `bounds` in `arena` spells, read through `frame`.
     pub(super) fn first_fn_bound(&mut self, frame: Frame<'a>, arena: &Body, bounds: Vec<u32>) -> Result<Option<Ty>> {
         let home = frame.home;

@@ -47,10 +47,12 @@ fn try_head(func: &mut Function, head: Block, preds: &mut [u32]) -> bool {
     let Op::Brif(cond, then_b, then_args, else_b, else_args) = func.insts[brif_inst.index()].op.clone() else {
         return false;
     };
-    if then_b == else_b || then_b == head || else_b == head || func.entry == Some(then_b) || func.entry == Some(else_b) {
+    if then_b == head || else_b == head || func.entry == Some(then_b) || func.entry == Some(else_b) {
         return false;
     }
-    let (join_b, t_args, e_args, clear) = if then_args.is_empty()
+    let (join_b, t_args, e_args, clear) = if then_b == else_b {
+        (then_b, then_args, else_args, [None, None])
+    } else if then_args.is_empty()
         && else_args.is_empty()
         && preds[then_b.index()] == 1
         && preds[else_b.index()] == 1
@@ -81,7 +83,7 @@ fn try_head(func: &mut Function, head: Block, preds: &mut [u32]) -> bool {
     };
 
     let join_params = &func.blocks[join_b.index()].params;
-    if !(1..=2).contains(&join_params.len())
+    if !(1..=4).contains(&join_params.len())
         || t_args.len() != join_params.len()
         || e_args.len() != join_params.len()
         || !join_params.iter().all(|p| scalar_select(func.ty(*p)))
@@ -119,7 +121,7 @@ fn try_head(func: &mut Function, head: Block, preds: &mut [u32]) -> bool {
     let jump = Inst(func.insts.len() as u32);
     func.insts.push(InstData { op: Op::Jump(join_b, selected), result: None });
     func.blocks[head.index()].insts.push(jump);
-    preds[join_b.index()] = 1;
+    preds[join_b.index()] = preds[join_b.index()].saturating_sub(1);
     true
 }
 

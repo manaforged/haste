@@ -66,6 +66,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         plan,
         defs,
         flags: None,
+        last_cmp: None,
         next: None,
         copied,
         direct_calls: target.direct_calls,
@@ -267,6 +268,7 @@ pub(super) struct Emit<'a> {
     plan: Plan<Reg>,
     defs: Vec<Option<Inst>>,
     flags: Option<(Value, Cond)>,
+    last_cmp: Option<(Size, Value, Value, bool)>,
     next: Option<Block>,
     copied: Vec<bool>,
     direct_calls: bool,
@@ -325,6 +327,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn clear_flags(&mut self) {
         self.flags = None;
+        self.last_cmp = None;
     }
 
     fn inst(&mut self, inst: Inst) -> Result<(), String> {
@@ -332,6 +335,11 @@ impl<'a> Emitter<'a> for Emit<'a> {
         let data = &func.insts[inst.index()];
         if !matches!(data.op, Op::Brif(..) | Op::Trapz(..) | Op::Select(..)) {
             self.flags = None;
+        }
+        match data.op {
+            Op::Brif(..) | Op::Trapz(..) | Op::Icmp(..) => {}
+            Op::Select(cond, ..) if self.flags.is_some_and(|(v, _)| v == cond) => {}
+            _ => self.last_cmp = None,
         }
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
@@ -417,6 +425,7 @@ impl Emit<'_> {
         match self.flags.take() {
             Some((value, cond)) if value == condition => cond,
             _ => {
+                self.last_cmp = None;
                 let reg = self.src(condition, A, Ext::Zero);
                 let size = Size::of(self.ty(condition).bytes());
                 self.asm.alu(Alu::Subs, if size == Size::X { Size::X } else { Size::W }, ZR, reg, ZR);

@@ -311,6 +311,10 @@ impl Emit<'_> {
         let value = if op == Binary::Ishl { self.bits(x, A) } else { self.src(x, A, ext) };
         if let Some(count) = self.plan.const_of(y) {
             let count = (count as u8) & (bits - 1);
+            if count == 0 {
+                self.asm.mov(dst, value);
+                return;
+            }
             match alu {
                 Alu::Lslv => self.asm.lsl_imm(dst, value, count),
                 Alu::Lsrv => self.asm.lsr_imm(dst, value, count),
@@ -360,9 +364,13 @@ impl Emit<'_> {
     pub(super) fn compare(&mut self, cc: IntCC, x: Value, y: Value) -> Cond {
         let bytes = self.ty(x).bytes();
         let size = if bytes >= 8 { Size::X } else { Size::W };
-        let ext = Ext::of(cc.is_signed());
+        let signed = cc.is_signed();
+        if self.last_cmp == Some((size, x, y, signed)) {
+            return cond(cc);
+        }
+        let ext = Ext::of(signed);
         let left = if bytes >= 4 { self.bits(x, A) } else { self.src(x, A, ext) };
-        let imm = self.plan.const_of(y).map(|imm| crate::fold::extend(imm, self.ty(y), cc.is_signed()));
+        let imm = self.plan.const_of(y).map(|imm| crate::fold::extend(imm, self.ty(y), signed));
         match imm {
             Some(imm) if (0..4096).contains(&imm) => self.asm.add_imm(true, true, size, ZR, left, imm as u32),
             Some(imm) if (-4095..0).contains(&imm) => self.asm.add_imm(false, true, size, ZR, left, (-imm) as u32),
@@ -371,6 +379,7 @@ impl Emit<'_> {
                 self.asm.alu(Alu::Subs, size, ZR, left, right);
             }
         }
+        self.last_cmp = Some((size, x, y, signed));
         cond(cc)
     }
 
@@ -378,7 +387,12 @@ impl Emit<'_> {
         if self.plan.is_static(result) {
             return Ok(());
         }
-        let flags = if self.ty(x) == Type::I128 { self.wide_icmp(cc, x, y) } else { self.compare(cc, x, y) };
+        let flags = if self.ty(x) == Type::I128 {
+            self.last_cmp = None;
+            self.wide_icmp(cc, x, y)
+        } else {
+            self.compare(cc, x, y)
+        };
         self.set_flag(result, flags);
         Ok(())
     }

@@ -28,6 +28,7 @@ mod split;
 mod switch;
 mod tailrec;
 mod target;
+mod thread;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
 macro_rules! value_op {
@@ -140,9 +141,12 @@ fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
     }
     cse::run(func);
     if effort == Effort::Full {
+        thread::run(func);
+        merge::run(func);
         ifconv::run(func);
         merge::run(func);
         loads::run(func);
+        thread::run(func);
         fold::run(func, effort);
         merge::run(func);
         cse::run(func);

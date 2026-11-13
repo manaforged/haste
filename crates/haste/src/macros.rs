@@ -177,9 +177,9 @@ pub fn load(compilation: &mut Compilation, asks: Requests) -> Result<Answer> {
     let more = compilation.names.load(&mut compilation.outline, asks)?;
     let expanded = expand_bound(compilation)?;
     Ok(match (more, expanded, procs.is_empty()) {
-        (true, _, _) | (false, true, false) => Answer::Names,
+        (true, _, _) | (false, true, _) => Answer::Names,
         (false, false, false) => Answer::Bodies,
-        (false, _, true) => Answer::Nothing,
+        (false, false, true) => Answer::Nothing,
     })
 }
 

@@ -133,12 +133,20 @@ pub struct Signature {
     pub params: Vec<AbiParam>,
     pub returns: Vec<AbiParam>,
     pub call_conv: CallConv,
+    pub readonly_params: u64,
 }
 
 impl Signature {
     /// An empty signature in `call_conv`.
     pub fn new(call_conv: CallConv) -> Self {
-        Self { params: Vec::new(), returns: Vec::new(), call_conv }
+        Self { params: Vec::new(), returns: Vec::new(), call_conv, readonly_params: 0 }
+    }
+
+    /// Marks parameter `index` as pointing to immutable memory for the duration of the call.
+    pub fn mark_readonly(&mut self, index: usize) {
+        if index < 64 {
+            self.readonly_params |= 1_u64 << index;
+        }
     }
 }
 
@@ -509,6 +517,49 @@ impl Function {
     /// Records that an 8-byte load at `offset` from vtable symbol `vt_sym` resolves to call-table slot `slot_sym`.
     pub fn add_vtable_slot(&mut self, vt_sym: u32, offset: i32, slot_sym: u32, low: bool) {
         self.vtable_slots.push((vt_sym, offset, slot_sym, low));
+    }
+
+    /// Whether this function has any static vtable-slot entries recorded.
+    pub fn has_vtable_slots(&self) -> bool {
+        !self.vtable_slots.is_empty()
+    }
+
+    /// Whether this function is an unsplit coroutine body.
+    pub fn is_coroutine(&self) -> bool {
+        self.coroutine.is_some()
+    }
+
+    /// Returns `(block, inst_pos, callee_sym)` for every `Op::Call` whose callee is a symbol or slot-addr recorded in `vtable_slots`.
+    pub fn devirt_call_sites(&self) -> Vec<(Block, usize, u32)> {
+        if self.vtable_slots.is_empty() {
+            return Vec::new();
+        }
+        let mut slot_syms = vec![None; self.types.len()];
+        for data in &self.insts {
+            if let (Op::Symbol(sym) | Op::SlotAddr(sym), Some(res)) = (&data.op, data.result) {
+                slot_syms[res.index()] = Some(*sym);
+            }
+        }
+        let mut syms = slot_syms.clone();
+        for data in &self.insts {
+            if let (Op::Load(addr, 0), Some(res)) = (&data.op, data.result)
+                && let Some(sym) = slot_syms[addr.index()]
+            {
+                syms[res.index()] = Some(sym);
+            }
+        }
+        let mut out = Vec::new();
+        for (b_idx, block) in self.blocks.iter().enumerate() {
+            for (pos, &inst) in block.insts.iter().enumerate() {
+                if let Op::Call { callee, .. } = self.insts[inst.index()].op
+                    && let Some(sym) = syms[callee.index()]
+                    && self.vtable_slots.iter().any(|&(_, _, s, _)| s == sym)
+                {
+                    out.push((Block(b_idx as u32), pos, sym));
+                }
+            }
+        }
+        out
     }
 
     /// The type of `value`.

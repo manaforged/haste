@@ -18,7 +18,7 @@ pub type Picked = (ImplRef, Vec<Ty>);
 
 /// What trying one impl left: its variable bindings, and the projections and obligations it deferred.
 #[derive(Clone)]
-struct Vars {
+pub(super) struct Vars {
     bound: Vec<Option<Ty>>,
     projections: Vec<super::project::Projection>,
     obligations: Vec<(ItemRef, Vec<Ty>)>,
@@ -103,7 +103,7 @@ impl<'a> Infer<'_, 'a> {
         Ok(!self.applicable(of, self_ty, args, 0)?.is_empty() || self.poly_may_implement(of, self_ty, args)?)
     }
 
-    fn applicable(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
+    pub(super) fn applicable(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
         let self_ty = self.resolve(self_ty);
         if depth as usize > crate::RECURSION_LIMIT || matches!(self.cx.types.kind(self_ty), Kind::Var(_)) {
             return Ok(Vec::new());
@@ -153,7 +153,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Takes on the bindings and deferred work of the impl trial `vars`.
-    fn adopt(&mut self, vars: Vars) {
+    pub(super) fn adopt(&mut self, vars: Vars) {
         if self.trail_depth > 0 {
             let shared = self.vars.len().min(vars.bound.len());
             for i in 0..shared {
@@ -626,14 +626,6 @@ impl<'a> Infer<'_, 'a> {
             self.obligations.push((of, substs));
         }
         Ok(held != Some(false))
-    }
-
-    /// Whether the one impl of `of<args>` that the function pointer of the `Fn` bound on the pending `impl Fn` value `ty` selects applies, tying `args` to that signature as an impl over any `F: Fn` does for the value it reveals.
-    pub(super) fn callable_opaque_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Result<bool> {
-        let Some(sig) = self.opaque_sig(self.resolve(ty)) else { return Ok(false) };
-        let Ok([(_, vars)]) = <[_; 1]>::try_from(self.applicable(of, sig, args, 0)?) else { return Ok(false) };
-        self.adopt(vars);
-        Ok(true)
     }
 
     /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.

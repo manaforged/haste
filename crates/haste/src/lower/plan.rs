@@ -547,6 +547,8 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
             mix.byte(4);
             let ty = sub(cx, vt.ty);
             hash_ty_facts(cx, mix, ty)?;
+            let obj = sub(cx, vt.object);
+            hash_ty_facts(cx, mix, obj)?;
         }
         Coercion::Reify(_) => mix.byte(5),
         Coercion::Deref(steps, to) => {

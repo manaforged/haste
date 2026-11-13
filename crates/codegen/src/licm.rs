@@ -1,7 +1,7 @@
 //! Moves out of each loop what every trip computes alike: pure instructions that cannot trap and whose operands the loop does not change, and loads at the head of a loop that writes no memory.
 
 use crate::dom::dominators;
-use crate::ir::{Binary, Block, Function, Inst, Op, Value};
+use crate::ir::{Binary, Block, BlockData, Function, Inst, Op, Value};
 use crate::loads::clobbers;
 use crate::live::results;
 
@@ -88,24 +88,69 @@ pub(crate) fn depths(func: &Function) -> Vec<u32> {
     depth
 }
 
+/// Synthesizes a preheader block for `each` when `each.head` is not the entry and every outside predecessor jumps or branches to it.
+fn preheader(func: &mut Function, each: &Loop, home: &mut Vec<Option<Block>>) -> Option<Block> {
+    if Some(each.head) == func.entry {
+        return None;
+    }
+    let outside: Vec<Block> = (0..func.blocks.len())
+        .filter(|&pred| !each.body.get(pred).copied().unwrap_or(false))
+        .map(|pred| Block(pred as u32))
+        .filter(|&pred| func.successors(pred).any(|target| target == each.head))
+        .collect();
+    if outside.is_empty() || !outside.iter().all(|&pred| matches!(func.last(pred), Some(Op::Jump(..) | Op::Brif(..)))) {
+        return None;
+    }
+    let param_types: Vec<_> = func.blocks[each.head.index()].params.iter().map(|&p| func.ty(p)).collect();
+    let pre_params: Vec<Value> = param_types.into_iter().map(|ty| func.value(ty)).collect();
+    let jump = func.add(Op::Jump(each.head, pre_params.clone()), None);
+    let pre = Block(func.blocks.len() as u32);
+    func.blocks.push(BlockData { params: pre_params, insts: vec![jump] });
+    home.resize(func.types.len(), Some(pre));
+    for pred in outside {
+        let Some(&last) = func.blocks[pred.index()].insts.last() else { continue };
+        match &mut func.insts[last.index()].op {
+            Op::Jump(target, _) if *target == each.head => *target = pre,
+            Op::Brif(_, then, _, otherwise, _) => {
+                if *then == each.head {
+                    *then = pre;
+                }
+                if *otherwise == each.head {
+                    *otherwise = pre;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(pre)
+}
+
 /// Moves into the loop's entry block, before its jump, each instruction of the loop that may move, in order, and records their new home.
-fn hoist(func: &mut Function, each: &Loop, entry: Block, home: &mut [Option<Block>]) {
-    let writes = (0..func.blocks.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts).any(|inst| {
+fn hoist(func: &mut Function, each: &Loop, entry: Block, readonly: &[bool], home: &mut [Option<Block>]) {
+    let writes = (0..each.body.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts).any(|inst| {
         let op = &func.insts[inst.index()].op;
         clobbers(op) || matches!(op, Op::Store(..) | Op::StackStore(..))
     });
-    let calls = (0..func.blocks.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts).any(|inst| matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. }));
+    let calls = (0..each.body.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts).any(|inst| matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. }));
     let mut moved: Vec<Inst> = Vec::new();
-    for block in (0..func.blocks.len()).filter(|block| each.body[*block]) {
+    for block in (0..each.body.len()).filter(|block| each.body[*block]) {
         let head = block == each.head.index();
         let insts = std::mem::take(&mut func.blocks[block].insts);
         let mut kept = Vec::with_capacity(insts.len());
+        let mut head_prefix = head;
         for inst in insts {
             let data = &func.insts[inst.index()];
+            if matches!(data.op, Op::Call { .. } | Op::TryCall { .. } | Op::Trap | Op::Trapz(_) | Op::Brif(..)) {
+                head_prefix = false;
+            }
             let static_loc = matches!(data.op, Op::StackAddr(..) | Op::SlotAddr(_))
                 || (matches!(data.op, Op::Const(_)) && data.result.is_none_or(|result| !func.ty(result).is_float()));
-            let movable = (speculable(&data.op) && !(calls && static_loc)) || (head && !writes && !calls && matches!(data.op, Op::Load(..)));
-            let invariant = |value: Value| home[value.index()].is_none_or(|at| !each.body[at.index()]);
+            let load_ok = match data.op {
+                Op::Load(addr, _) => head && !calls && (!writes || (head_prefix && readonly.get(addr.index()).copied().unwrap_or(false))),
+                _ => false,
+            };
+            let movable = (speculable(&data.op) && !(calls && static_loc)) || load_ok;
+            let invariant = |value: Value| home.get(value.index()).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false));
             let mut operands_invariant = true;
             data.op.for_operands(|value| operands_invariant &= invariant(value));
             if movable && operands_invariant && data.result.is_some() {
@@ -128,14 +173,30 @@ pub(crate) fn run(func: &mut Function) {
     if func.coroutine.is_some() {
         return;
     }
-    let found = loops(func, entry);
+    let mut found = loops(func, entry);
     if found.is_empty() {
         return;
     }
+    let mut readonly = vec![false; func.types.len()];
+    for (i, &param) in func.blocks[entry.index()].params.iter().enumerate() {
+        if i < 64 && (func.signature.readonly_params >> i) & 1 != 0 {
+            readonly[param.index()] = true;
+        }
+    }
     let mut home = homes(func);
-    for each in &found {
-        if let Some(entry) = each.entry {
-            hoist(func, each, entry, &mut home);
+    for idx in 0..found.len() {
+        let pre = found[idx].entry.or_else(|| {
+            let created = preheader(func, &found[idx], &mut home)?;
+            let head_idx = found[idx].head.index();
+            for later in &mut found[idx + 1..] {
+                let inside = later.body.get(head_idx).copied().unwrap_or(false);
+                later.body.resize(created.index(), false);
+                later.body.push(inside);
+            }
+            Some(created)
+        });
+        if let Some(entry) = pre {
+            hoist(func, &found[idx], entry, &readonly, &mut home);
         }
     }
 }
