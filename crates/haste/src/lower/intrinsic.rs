@@ -9,12 +9,13 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::ops::Num;
 use super::place::{Base, Place};
+use super::reloc::SiteOrigin;
 use super::stencil::{RodataReloc, RodataTarget, SymbolSource};
 use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
     /// Emits intrinsic `which` at type arguments `substs` on `args` inline.
-    pub fn intrinsic(&mut self, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    pub(super) fn intrinsic(&mut self, origin: &SiteOrigin, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         match which {
             Intrinsic::Transmute => self.transmute(substs, args),
             Intrinsic::FloatToInt => {
@@ -23,7 +24,8 @@ impl Lower<'_, '_> {
                 self.convert(value, from, to).map(Some)
             }
             Intrinsic::PtrMetadata => self.metadata(substs, args),
-            Intrinsic::ConstEvalSelect => self.const_eval_select(substs, args),
+            Intrinsic::ConstEvalSelect => self.const_eval_select(origin, substs, args),
+            Intrinsic::SelectUnpredictable => self.select_unpredictable(substs, args),
             Intrinsic::WithOverflow(op) => self.with_overflow(op, substs, args).map(Some),
             Intrinsic::Simd(op) => self.simd(op, substs, args),
             Intrinsic::Trap => {
@@ -38,7 +40,7 @@ impl Lower<'_, '_> {
             Intrinsic::BytePermute(bytes) => self.byte_permute(args, bytes).map(Some),
             Intrinsic::BytePairMax => self.byte_pair_max(args).map(Some),
             Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
-            _ => self.memory_intrinsic(which, substs, args),
+            _ => self.memory_intrinsic(origin, which, substs, args),
         }
     }
 
@@ -131,7 +133,7 @@ impl Lower<'_, '_> {
         Ok(self.ins().stack_addr(Type::I64, slot, 0))
     }
 
-    fn const_eval_select(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    fn const_eval_select(&mut self, origin: &SiteOrigin, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&tuple), Some(&runtime)) = (substs.first(), substs.get(2)) else { bail!("const_eval_select takes four type arguments") };
         let (Kind::Tuple(fields), Kind::FnDef(item, fn_substs)) = (self.cx.types.kind(tuple).clone(), self.cx.types.kind(runtime).clone()) else { bail!("const_eval_select needs a tuple of arguments and a function item") };
         let fields = self.cx.types.substs(fields).to_vec();
@@ -143,7 +145,43 @@ impl Lower<'_, '_> {
                 values.extend(self.read(place));
             }
         }
-        self.invoke(item, fn_substs, values)
+        self.invoke(SiteOrigin::ConstEvalSelect(Box::new(origin.clone())), item, fn_substs, values)
+    }
+
+    fn select_unpredictable(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+        let Some(&ty) = substs.first() else { bail!("select_unpredictable takes one type argument") };
+        let whole = repr(self.cx, ty)?;
+        if whole == Repr::Zst {
+            return Ok(None);
+        }
+        let &[cond, yes, no] = args else { bail!("select_unpredictable takes three arguments") };
+        match whole {
+            Repr::Zst => Ok(None),
+            Repr::Scalar(_) => Ok(Some(self.ins().select(cond, yes, no))),
+            Repr::Mem { .. } => {
+                let parts = super::abi::copied_parts(&*self.cx.layout(ty)?);
+                let Some(slot) = self.slot(whole) else { return Ok(None) };
+                let out = self.ins().stack_addr(Type::I64, slot, 0);
+                let mut pick = |m: Type, at: i32| {
+                    let a = self.ins().load(m, yes, at);
+                    let b = self.ins().load(m, no, at);
+                    let sel = self.ins().select(cond, a, b);
+                    self.ins().stack_store(sel, slot, at);
+                };
+                match parts {
+                    super::Parts::Bytes => {
+                        let chosen = self.ins().select(cond, yes, no);
+                        self.copy(out, chosen, whole);
+                    }
+                    other => {
+                        for (m, at) in other.scalars() {
+                            pick(m, at);
+                        }
+                    }
+                }
+                Ok(Some(out))
+            }
+        }
     }
 
     fn metadata(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {

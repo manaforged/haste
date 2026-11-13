@@ -251,8 +251,24 @@ pub(super) fn hash_repr(repr: &Repr, mix: &mut Mix) {
                     mix.byte(b as u8);
                     mix.i32(off);
                 }
+                Parts::Words(words, len) => {
+                    mix.byte(3);
+                    mix.byte(len);
+                    for &(ty, off) in &words[..usize::from(len)] {
+                        mix.byte(ty as u8);
+                        mix.i32(off);
+                    }
+                }
             }
         }
+    }
+}
+
+fn hash_purpose(purpose: ArgumentPurpose, mix: &mut Mix) {
+    let (tag, extra) = lower::purpose_tag(purpose);
+    mix.byte(tag);
+    if let Some(n) = extra {
+        mix.u32(n);
     }
 }
 
@@ -260,12 +276,12 @@ pub(super) fn hash_signature(sig: &Signature, mix: &mut Mix) {
     mix.usize(sig.params.len());
     for param in &sig.params {
         mix.byte(param.value_type as u8);
-        mix.byte(u8::from(param.purpose == ArgumentPurpose::StructReturn));
+        hash_purpose(param.purpose, mix);
     }
     mix.usize(sig.returns.len());
     for ret in &sig.returns {
         mix.byte(ret.value_type as u8);
-        mix.byte(u8::from(ret.purpose == ArgumentPurpose::StructReturn));
+        hash_purpose(ret.purpose, mix);
     }
 }
 

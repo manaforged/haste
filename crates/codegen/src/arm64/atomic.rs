@@ -1,9 +1,9 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
-use super::{A, C, D, Emit, Ext, S, T};
+use super::{A, C, D, Emit, S, T};
+use crate::frame::Ext;
 use crate::ir::{AtomicRmwOp, Op, Type, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
-/// Scratch registers an inline copy holds its chunks in; none of them forms an address.
 const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
 
 impl Emit<'_> {
@@ -19,10 +19,12 @@ impl Emit<'_> {
             }
             Op::SlotAddr(sym) | Op::Symbol(sym) => {
                 let result = result()?;
-                let dst = self.dst(result);
-                let at = self.asm.mov_symbol(dst);
-                self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Arm64Movw64));
-                self.put(result, dst);
+                if !self.plan.is_static(result) {
+                    let dst = self.dst(result);
+                    let at = self.asm.mov_symbol(dst);
+                    self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Arm64Movw64));
+                    self.put(result, dst);
+                }
             }
             Op::Runtime(rt) => {
                 let result = result()?;
@@ -39,14 +41,8 @@ impl Emit<'_> {
 
     fn access(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
-            Op::Load(addr, offset) => {
-                let from = self.address(*addr, *offset);
-                self.read(result()?, from);
-            }
-            Op::Store(value, addr, offset) => {
-                let to = self.address(*addr, *offset);
-                self.write(*value, to);
-            }
+            Op::Load(addr, offset) => self.load_at(result()?, *addr, *offset),
+            Op::Store(value, addr, offset) => self.store_at(*value, *addr, *offset),
             Op::StackAddr(slot, offset) => {
                 let result = result()?;
                 if !self.plan.is_static(result) {
@@ -60,12 +56,65 @@ impl Emit<'_> {
             Op::Fence => self.asm.dmb(),
             Op::FramePointer => self.put(result()?, FP),
             Op::Copy(to, from, bytes) => self.copy(*to, *from, *bytes)?,
+            Op::Move(to, from, bytes) => self.move_bytes(*to, *from, *bytes),
             _ => return self.atomic(op, result),
         }
         Ok(())
     }
 
-    /// Copies a constant number of bytes inline: every chunk into its own scratch register first, so overlapping ranges copy correctly.
+    fn load_at(&mut self, result: Value, addr: Value, offset: i32) {
+        let ty = self.ty(result);
+        if ty != Type::I128
+            && let Some((base, index, shift)) = self.sib_indexed(addr, offset, ty.bytes())
+        {
+            if ty.is_float() {
+                let dst = self.fdst(result);
+                self.asm.vload_indexed(ty.bytes(), dst, base, index, shift);
+                self.fput(result, dst);
+            } else {
+                let dst = self.dst(result);
+                self.asm.load_indexed(Size::of(ty.bytes()), false, dst, base, index, shift);
+                self.put(result, dst);
+            }
+            return;
+        }
+        let from = self.address(addr, offset);
+        self.read(result, from);
+    }
+
+    fn store_at(&mut self, value: Value, addr: Value, offset: i32) {
+        let ty = self.ty(value);
+        if ty != Type::I128
+            && let Some((base, index, shift)) = self.sib_indexed(addr, offset, ty.bytes())
+        {
+            if ty.is_float() {
+                let source = self.fin(value, super::V0);
+                self.asm.vstore_indexed(ty.bytes(), base, index, shift, source);
+            } else {
+                let source = self.store_src(value);
+                self.asm.store_indexed(Size::of(ty.bytes()), base, index, shift, source);
+            }
+            return;
+        }
+        let to = self.address(addr, offset);
+        self.write(value, to);
+    }
+
+    fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
+        let source = self.address_in(from, 0, S);
+        let target = self.address_in(to, 0, C);
+        let whole = bytes / 16 * 16;
+        for at in (0..whole).step_by(16) {
+            self.asm.vload(16, super::V1, source.offset(at as i32));
+            self.asm.vstore(16, target.offset(at as i32), super::V1);
+        }
+        for (ty, at) in crate::copy::words(bytes - whole) {
+            let at = (whole + at) as i32;
+            self.asm.load(Size::of(ty.bytes()), false, A, source.offset(at));
+            self.asm.store(Size::of(ty.bytes()), target.offset(at), A);
+        }
+    }
+
     fn copy(&mut self, to: Value, from: Value, bytes: Value) -> Result<(), String> {
         let chunks = self.plan.const_of(bytes).and_then(crate::copy::chunks).ok_or("a copy of a size that is not a small constant")?;
         let source = self.address(from, 0);
@@ -81,6 +130,12 @@ impl Emit<'_> {
 
     fn read(&mut self, result: Value, from: Mem) {
         let ty = self.ty(result);
+        if ty.is_float() {
+            let dst = self.fdst(result);
+            self.asm.vload(ty.bytes(), dst, from);
+            self.fput(result, dst);
+            return;
+        }
         if ty == Type::I128 {
             self.asm.load(Size::X, false, A, from);
             self.put(result, A);
@@ -95,6 +150,11 @@ impl Emit<'_> {
 
     fn write(&mut self, value: Value, to: Mem) {
         let ty = self.ty(value);
+        if ty.is_float() {
+            let source = self.fin(value, super::V0);
+            self.asm.vstore(ty.bytes(), to, source);
+            return;
+        }
         if ty == Type::I128 {
             self.raw(A, value);
             self.asm.store(Size::X, to, A);
@@ -102,17 +162,29 @@ impl Emit<'_> {
             self.asm.store(Size::X, to.offset(8), A);
             return;
         }
-        let source = match self.plan.const_of(value) {
+        let source = self.store_src(value);
+        self.asm.store(Size::of(ty.bytes()), to, source);
+    }
+
+    fn store_src(&mut self, value: Value) -> Reg {
+        match self.plan.const_of(value) {
             Some(0) => ZR,
             _ => self.bits(value, A),
-        };
-        self.asm.store(Size::of(ty.bytes()), to, source);
+        }
     }
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
         let flag = self.src(condition, C, Ext::Zero);
         self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
-        if self.ty(x) == Type::I128 {
+        let ty = self.ty(x);
+        if ty.is_float() {
+            let (left, right) = (self.fin(x, super::V0), self.fin(y, super::V1));
+            let dst = self.fdst(result);
+            self.asm.fcsel(Cond::Ne, ty == Type::F64, dst, left, right);
+            self.fput(result, dst);
+            return;
+        }
+        if ty == Type::I128 {
             self.raw(A, x);
             self.raw(D, y);
             self.asm.csel(Cond::Ne, A, A, D);
@@ -163,12 +235,11 @@ impl Emit<'_> {
         Ok(())
     }
 
-    /// Loops on an exclusive load and store until `op` applies; leaves the old contents in A.
     fn rmw(&mut self, op: AtomicRmwOp, size: Size, addr: Value, value: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
-        self.get(D, value, if signed { Ext::Sign } else { Ext::Zero });
+        self.get(D, value, Ext::of(signed));
         let again = self.asm.label();
         self.asm.bind(again);
         self.asm.load_acquire(true, size, A, S);
@@ -205,7 +276,6 @@ impl Emit<'_> {
         self.asm.cbz(true, Size::W, T, again);
     }
 
-    /// Compares and swaps with an exclusive load and store; leaves the old contents in A.
     fn cas(&mut self, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);

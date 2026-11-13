@@ -93,6 +93,9 @@ fn primitive(dl: &TargetDataLayout, primitive: Primitive) -> Result<Layout> {
 impl Context<'_> {
     /// The layout of `ty`, which must hold no inference variables or parameters.
     pub fn layout(&mut self, ty: Ty) -> Result<Arc<Layout>> {
+        if ty == Ty::NONE {
+            bail!("cannot lay out an uninferred type");
+        }
         if let Some(found) = self.store.layouts.get(&ty) {
             return Ok(found);
         }
@@ -149,6 +152,9 @@ impl Context<'_> {
 
     /// The type at the end of `ty` whose metadata a pointer to `ty` carries: `ty` itself, or the tail of its last struct field.
     pub fn tail(&mut self, ty: Ty) -> Result<Ty> {
+        if ty == Ty::NONE {
+            return Ok(ty);
+        }
         let Kind::Adt(item, _) = *self.types.kind(ty) else { return Ok(ty) };
         if self.types.has_var_flag(ty) {
             bail!("cannot compute tail of open inference variable outside Infer");
@@ -163,6 +169,9 @@ impl Context<'_> {
 
     /// Whether a pointer to `ty` carries metadata after its address.
     pub fn is_unsized(&mut self, ty: Ty) -> Result<bool> {
+        if ty == Ty::NONE {
+            return Ok(false);
+        }
         let tail = self.tail(ty)?;
         Ok(self.types.kind(tail).is_unsized())
     }
@@ -188,7 +197,7 @@ impl Context<'_> {
     }
 
     fn closure_layout(&mut self, ty: Ty) -> Result<Layout> {
-        let Some(env) = self.closure_env(ty) else { bail!("layout of a closure whose defining body was not inferred") };
+        let Some(env) = self.ensure_closure(ty).map(|info| info.env) else { bail!("layout of a closure whose defining body was not inferred") };
         Ok((*self.layout(env)?).clone())
     }
 

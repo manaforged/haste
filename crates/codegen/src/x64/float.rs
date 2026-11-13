@@ -1,5 +1,6 @@
 use super::asm::{Alu, Cond, Group3, Reg, Rm, Shift, Size, Xmm};
-use super::{Emit, Ext};
+use super::Emit;
+use crate::frame::Ext;
 use crate::ir::{Binary, Convert, FloatCC, Type, Unary, Value};
 
 pub(super) const X0: Xmm = Xmm(0);
@@ -24,10 +25,6 @@ pub(super) fn scalar(ty: Type) -> u8 {
     if ty == Type::F64 { 0xF2 } else { 0xF3 }
 }
 
-fn sign(ty: Type) -> i64 {
-    if ty == Type::F64 { i64::MIN } else { 0x8000_0000 }
-}
-
 impl Emit<'_> {
     fn ucomi(&mut self, ty: Type, a: Xmm, b: impl Into<Rm>) {
         let prefix: &[u8] = if ty == Type::F64 { &[0x66] } else { &[] };
@@ -44,7 +41,8 @@ impl Emit<'_> {
             Unary::Fneg | Unary::Fabs => {
                 self.raw(Reg::Rax, x);
                 let neg = op == Unary::Fneg;
-                self.asm.mov_imm(Reg::Rcx, if neg { sign(ty) } else { !sign(ty) });
+                let sign = ty.sign_bit();
+                self.asm.mov_imm(Reg::Rcx, if neg { sign } else { !sign });
                 self.asm.alu(if neg { Alu::Xor } else { Alu::And }, Reg::Rax, Reg::Rcx);
                 self.put(result, Reg::Rax);
                 return Ok(());
@@ -86,7 +84,7 @@ impl Emit<'_> {
             self.step(op == Unary::Floor, ty, dst, one);
         }
         self.asm.movq_out(Reg::Rcx, X1);
-        self.asm.mov_imm(Reg::Rdx, sign(ty));
+        self.asm.mov_imm(Reg::Rdx, ty.sign_bit());
         self.asm.alu_sized(size, Alu::And, Reg::Rax, Reg::Rdx);
         self.asm.alu_sized(size, Alu::Or, Reg::Rcx, Reg::Rax);
         self.asm.movq_in(dst, Reg::Rcx);
@@ -125,8 +123,13 @@ impl Emit<'_> {
                 self.asm.vex_scalar(scalar(ty), opcode, (dst, src), source);
             }
             None => {
+                let source = if self.xmm_of(y) == Some(dst) && x != y {
+                    self.asm.movaps(X1, dst);
+                    X1.into()
+                } else {
+                    self.foperand(y)
+                };
                 self.fget(dst, x);
-                let source = self.foperand(y);
                 self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, source);
             }
         }
@@ -137,7 +140,7 @@ impl Emit<'_> {
     fn copysign(&mut self, ty: Type, x: Value, y: Value, result: Value) {
         self.raw(Reg::Rax, x);
         self.raw(Reg::Rcx, y);
-        self.asm.mov_imm(Reg::Rdx, sign(ty));
+        self.asm.mov_imm(Reg::Rdx, ty.sign_bit());
         self.asm.alu(Alu::And, Reg::Rcx, Reg::Rdx);
         self.asm.group3(Group3::Not, Reg::Rdx);
         self.asm.alu(Alu::And, Reg::Rax, Reg::Rdx);

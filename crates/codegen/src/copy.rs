@@ -1,7 +1,7 @@
 use crate::ir::{Function, Inst, Op, Type, Value};
 
 /// The most bytes a move is emitted inline with; a larger one calls `memmove`.
-pub(crate) const MOVE_INLINE: u32 = 256;
+pub(crate) const MOVE_INLINE: u32 = 64;
 
 /// The most chunks a copy of a constant size is emitted inline with, one scratch register each.
 const CHUNKS: usize = 4;

@@ -57,7 +57,7 @@ impl Infer<'_, '_> {
         if self.coroutine_output(ty).is_some() {
             return Ok(false);
         }
-        match self.cx.closure_env(ty) {
+        match self.cx.ensure_closure(ty).map(|info| info.env) {
             Some(env) => self.is_copy(env),
             None => Ok(true),
         }
@@ -110,18 +110,29 @@ pub fn glue_typed(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<Typed> 
 
 /// The call of the drop glue of `ty`, when dropping a value of `ty` runs code.
 pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
-    if !needs_drop(cx, ty)? {
-        return Ok(None);
+    if let Some(cached) = cx.store.lookups.glues.get(&ty) {
+        return Ok(cached);
     }
-    let Some(glue) = cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
-    Ok(Some(Res::fn_of(&cx.types, glue, &[ty])))
+    let before = cx.quiet_mark();
+    let call = if needs_drop(cx, ty)? {
+        let Some(glue) = cx.lang_item("drop_glue") else { bail!("core has no drop glue") };
+        Some(Res::fn_of(&cx.types, glue, &[ty]))
+    } else {
+        None
+    };
+    if cx.quiet_mark() == before && !cx.types.has_params(ty) {
+        cx.store.lookups.glues.insert(ty, call);
+    }
+    Ok(call)
 }
 
 /// The drop glue calls for every type that a local or an expression of `typed` holds and that needs drop.
 pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
+    let scoped = typed.scoped(&cx.types);
+    let tables = scoped.ensure_tables(&cx.types);
     let mut seen = rustc_hash::FxHashSet::default();
     let mut calls = Vec::new();
-    for ty in typed.locals.iter().map(|local| local.ty).chain(typed.exprs.iter().copied()) {
+    for ty in typed.locals.iter().map(|local| local.ty).chain(tables.exprs.iter().copied()) {
         if ty != Ty::NONE && seen.insert(ty) {
             calls.extend(glue_call(cx, ty)?);
         }
@@ -170,8 +181,8 @@ impl Infer<'_, '_> {
         })
     }
 
-    fn closure_drop_parts(&self, ty: Ty) -> Result<Vec<Ty>> {
-        let Some(&Kind::Tuple(items)) = self.cx.closure_env(ty).map(|env| self.cx.types.kind(env)) else {
+    fn closure_drop_parts(&mut self, ty: Ty) -> Result<Vec<Ty>> {
+        let Some(&Kind::Tuple(items)) = self.cx.ensure_closure(ty).map(|info| self.cx.types.kind(info.env)) else {
             bail!("drop of a closure whose defining body was not inferred");
         };
         if self.coroutine_output(ty).is_none() {
@@ -191,11 +202,31 @@ fn with_drop<T>(cx: &mut Context<'_>, run: impl FnOnce(&mut Infer<'_, '_>) -> Re
 
 /// Whether dropping a value of `ty` runs code.
 pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    if ty == Ty::NONE {
+        return Ok(false);
+    }
+    match cx.types.kind(ty) {
+        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => return Ok(false),
+        Kind::Dyn(..) => return Ok(true),
+        _ => {}
+    }
+    if !cx.types.has_var_flag(ty)
+        && !cx.types.has_params(ty)
+        && let Some(known) = cx.store.lookups.drops.get(&ty)
+    {
+        return Ok(known);
+    }
     with_drop(cx, |infer| infer.needs_drop(ty))
 }
 
 /// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
 pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    if ty == Ty::NONE {
+        return Ok(false);
+    }
+    if !matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)) {
+        return Ok(false);
+    }
     with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
 }
 

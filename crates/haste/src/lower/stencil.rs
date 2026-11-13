@@ -14,6 +14,8 @@ use crate::sema::reach::Reached;
 use crate::sema::table::Table;
 use crate::sync::{read_lock, write_lock};
 
+use super::plan::{BodyFootprintPlan, eval_footprint_with_cycle};
+use super::reloc::{RelocPlan, RelocStep, SiteOrigin, eval_relocs};
 use super::{Inline, Lower, Slots, Word, is_static, signature, signature_of};
 
 /// The 128-bit structural footprint digest of a lowered function and its inlined callees.
@@ -68,6 +70,7 @@ pub type RelocVec = Vec<SymbolSource>;
 pub struct StencilOutput {
     pub func: Function,
     pub relocs: RelocVec,
+    pub reloc_plan: Arc<RelocPlan>,
 }
 
 /// A cached, simplified callee body ready to splice inline into callers.
@@ -75,13 +78,13 @@ pub struct InlinedCallee {
     pub item: ItemRef,
     pub footprint: FootprintId,
     pub relocs: RelocVec,
+    pub reloc_plan: Arc<RelocPlan>,
     pub body: Arc<Function>,
     pub returns: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum LowerMode {
-    Probe,
     Stencil,
     Dict,
 }
@@ -92,6 +95,12 @@ struct TemplateKey {
     footprint: FootprintId,
     limit: usize,
     low: bool,
+}
+
+struct InlineTemplate {
+    body: Arc<Function>,
+    returns: bool,
+    reloc_plan: Arc<RelocPlan>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,8 +119,10 @@ impl CycleState {
 /// Cached inlineable callee stencils and footprints across a compilation.
 #[derive(Default)]
 pub struct Bodies {
-    probed: Table<usize, Option<Arc<InlinedCallee>>>,
-    templates: Table<TemplateKey, Option<(Arc<Function>, bool)>>,
+    pub(super) plans: Table<(ItemRef, Option<ExprId>), Arc<BodyFootprintPlan>>,
+    inlined: Table<usize, Option<Arc<InlinedCallee>>>,
+    inline_meta: Table<usize, Option<(ItemRef, FootprintId, bool)>>,
+    templates: Table<TemplateKey, Option<Arc<InlineTemplate>>>,
     cyclic: RwLock<FxHashMap<usize, CycleState>>,
 }
 
@@ -190,12 +201,14 @@ impl Bodies {
     /// Drops all cached inlineable bodies and footprints.
     pub fn clear(&self) {
         self.clear_transient();
+        self.plans.clear();
         write_lock(&self.cyclic).clear();
     }
 
-    /// Drops cached inline probes and templates while retaining any precomputed cycle entries.
+    /// Drops cached inline templates while retaining footprint plans and precomputed cycle entries.
     pub fn clear_transient(&self) {
-        self.probed.clear();
+        self.inlined.clear();
+        self.inline_meta.clear();
         self.templates.clear();
     }
 
@@ -292,6 +305,7 @@ fn node_edges(cx: &mut Context<'_>, reached: &Reached, cyclic: &mut CycleView<'_
 
 /// The functions a closure's own body calls; its typed data is its parent's, whose calls hold those of every closure in the parent's body, so each table is read at the closure's own expressions.
 fn closure_calls(cx: &mut Context<'_>, typed: &Typed) -> Option<Vec<(ItemRef, Substs)>> {
+    let typed = typed.scoped(&cx.types);
     let Shape::Closure(closure) = &typed.shape else { return None };
     let body = cx.body(closure.parent).ok()?;
     let own = own_exprs(&body, closure.closure.body);
@@ -383,22 +397,47 @@ pub(super) fn item_bits(item: ItemRef) -> u128 {
     (u128::from(item.krate) << 64) | (u128::from(item.file) << 32) | u128::from(item.item)
 }
 
-/// Computes the 128-bit footprint and symbolic relocations of reached function `index` without allocating IR instructions.
-pub fn probe_footprint(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<(FootprintId, RelocVec)> {
-    let (_, footprint, relocs, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Probe)?;
-    Ok((footprint, relocs))
-}
-
 /// Lowers reached function `index` into an SSA stencil with symbolic relocations.
 pub fn lower_stencil(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<StencilOutput> {
-    let (func, _, relocs, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Stencil)?;
-    Ok(StencilOutput { func, relocs })
+    let (func, relocs, reloc_plan, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Stencil)?;
+    Ok(StencilOutput { func, relocs, reloc_plan })
 }
 
 /// Lowers reached function `index` into a shared dictionary-parameterized SSA body and its relocation vector.
-pub fn lower_dict(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<(Function, RelocVec)> {
-    let (func, _, relocs, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Dict)?;
-    Ok((func, relocs))
+pub fn lower_dict(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<(Function, RelocVec, Arc<RelocPlan>)> {
+    let (func, relocs, reloc_plan, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Dict)?;
+    Ok((func, relocs, reloc_plan))
+}
+
+pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<(ItemRef, FootprintId, bool)>, usize)> {
+    let bodies = slots.bodies();
+    if bodies.is_cyclic(cx, reached, index) {
+        return Ok((None, usize::MAX));
+    }
+    if let Some(cached) = bodies.inlined.get(&index) {
+        return Ok((cached.map(|c| (c.item, c.footprint, c.returns)), usize::MAX));
+    }
+    if let Some(cached) = bodies.inline_meta.get(&index) {
+        return Ok((cached, usize::MAX));
+    }
+    if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
+        return Ok((None, pos));
+    }
+    if let Some((cached, cycle)) = inline.local.get(&index) {
+        return Ok((cached.as_ref().map(|c| (c.item, c.footprint, c.returns)), *cycle));
+    }
+    let item = reached.list[index].0.0;
+    let depth = inline.stack.len();
+    inline.stack.push(index);
+    let quiet = Quiet::mark(cx, slots);
+    let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, &quiet));
+    inline.stack.pop();
+    let (tmpl, cycle) = outcome?;
+    let meta = tmpl.map(|(footprint, t, _)| (item, footprint, t.returns));
+    if cycle > depth && quiet.holds(cx, slots) {
+        return Ok((bodies.inline_meta.get_or_insert_with(index, || meta), cycle));
+    }
+    Ok((meta, cycle))
 }
 
 pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
@@ -406,7 +445,7 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
     if bodies.is_cyclic(cx, reached, index) {
         return Ok((None, usize::MAX));
     }
-    if let Some(cached) = bodies.probed.get(&index) {
+    if let Some(cached) = bodies.inlined.get(&index) {
         return Ok((cached, usize::MAX));
     }
     if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
@@ -415,14 +454,23 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
     if let Some((cached, cycle)) = inline.local.get(&index) {
         return Ok((cached.clone(), *cycle));
     }
+    let item = reached.list[index].0.0;
     let depth = inline.stack.len();
     inline.stack.push(index);
     let quiet = Quiet::mark(cx, slots);
-    let outcome = build_inline(cx, (reached, slots), inline, index, (limit, &quiet));
+    let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, &quiet));
     inline.stack.pop();
-    let (result, cycle) = outcome?;
+    let (tmpl, cycle) = outcome?;
+    let result = match tmpl {
+        Some((footprint, t, Some(relocs))) => Some(Arc::new(InlinedCallee { item, footprint, relocs, reloc_plan: Arc::clone(&t.reloc_plan), body: Arc::clone(&t.body), returns: t.returns })),
+        Some((footprint, t, None)) => {
+            let evaluated = quiet.lowered(slots, eval_relocs(cx, reached, slots, &t.reloc_plan, index))?;
+            evaluated.map(|relocs| Arc::new(InlinedCallee { item, footprint, relocs, reloc_plan: Arc::clone(&t.reloc_plan), body: Arc::clone(&t.body), returns: t.returns }))
+        }
+        None => None,
+    };
     if cycle > depth && quiet.holds(cx, slots) {
-        return Ok((bodies.probed.get_or_insert_with(index, || result), cycle));
+        return Ok((bodies.inlined.get_or_insert_with(index, || result), cycle));
     }
     inline.local.insert(index, (result.clone(), if cycle < depth { cycle } else { usize::MAX }));
     Ok((result, cycle))
@@ -451,34 +499,29 @@ impl Quiet {
     }
 }
 
-fn has_promoted_cell(relocs: &[SymbolSource]) -> bool {
-    relocs.iter().any(|r| matches!(r, SymbolSource::PromotedCell { .. }))
-}
+type InlineHit = (FootprintId, Arc<InlineTemplate>, Option<RelocVec>);
 
-fn build_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
+fn ensure_inline_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<(Option<InlineHit>, usize)> {
     let item = reached.list[index].0.0;
-    let probed = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Probe);
-    let Some((_, footprint, relocs, probe_cycle)) = quiet.lowered(slots, probed)? else { return Ok((None, usize::MAX)) };
-    if has_promoted_cell(&relocs) {
-        return Ok((None, probe_cycle));
-    }
+    let fp_res = eval_footprint_with_cycle(cx, (reached, slots), inline, index);
+    let Some((footprint, fp_cycle)) = quiet.lowered(slots, fp_res)? else { return Ok((None, usize::MAX)) };
     let key = TemplateKey { item, footprint, limit, low: slots.low_entries() };
     if let Some(template) = slots.bodies().templates.get(&key) {
-        return Ok((callee(item, footprint, relocs, template), probe_cycle));
+        return Ok((template.map(|t| (footprint, t, None)), fp_cycle));
     }
     let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
-    let Some((func, _, _, ir_cycle)) = quiet.lowered(slots, lowered)? else { return Ok((None, probe_cycle)) };
-    let cycle = probe_cycle.min(ir_cycle);
-    let mut template = simplify_inline(func, limit);
+    let Some((func, relocs, reloc_plan, ir_cycle)) = quiet.lowered(slots, lowered)? else { return Ok((None, fp_cycle)) };
+    let cycle = fp_cycle.min(ir_cycle);
+    let mut template = if reloc_plan.has_promoted() {
+        None
+    } else {
+        simplify_inline(func, limit).map(|(body, returns)| Arc::new(InlineTemplate { body, returns, reloc_plan }))
+    };
     let depth = inline.stack.len().saturating_sub(1);
     if cycle > depth && quiet.holds(cx, slots) {
         template = slots.bodies().templates.get_or_insert_with(key, || template);
     }
-    Ok((callee(item, footprint, relocs, template), cycle))
-}
-
-fn callee(item: ItemRef, footprint: FootprintId, relocs: RelocVec, template: Option<(Arc<Function>, bool)>) -> Option<Arc<InlinedCallee>> {
-    template.map(|(body, returns)| Arc::new(InlinedCallee { item, footprint, relocs, body, returns }))
+    Ok((template.map(|t| (footprint, t, Some(relocs))), cycle))
 }
 
 fn simplify_inline(mut func: Function, limit: usize) -> Option<(Arc<Function>, bool)> {
@@ -492,9 +535,11 @@ fn simplify_inline(mut func: Function, limit: usize) -> Option<(Arc<Function>, b
     })
 }
 
-fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode) -> Result<(Function, FootprintId, RelocVec, usize)> {
+fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode) -> Result<(Function, RelocVec, Arc<RelocPlan>, usize)> {
     let ((item, _), typed) = &reached.list[index];
     let Ok(typed) = typed else { bail!("{} did not type-check", cx.name(*item)) };
+    let typed = typed.scoped(&cx.types);
+    let typed: &Typed = &typed;
     let source = match &typed.shape {
         Shape::Closure(closure) => closure.parent,
         _ => *item,
@@ -511,12 +556,10 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         sig.params.push(AbiParam::special(Type::I64, ArgumentPurpose::Dict));
     }
     let mut func = Function::new(sig);
-    let b = match mode {
-        LowerMode::Probe => FunctionBuilder::new_probe(&mut func),
-        LowerMode::Stencil | LowerMode::Dict => FunctionBuilder::new(&mut func),
-    };
+    let b = FunctionBuilder::new(&mut func);
     let mut relocs = Vec::new();
-    let (digest, cycle) = {
+    let mut reloc_plan = Vec::new();
+    let cycle = {
         let mut lower = Lower {
             cx,
             reached,
@@ -535,6 +578,7 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
             dict_param: None,
             mode,
             relocs: &mut relocs,
+            reloc_plan: &mut reloc_plan,
             promoted_seq: 0,
             cycle_root: usize::MAX,
             owned: Vec::new(),
@@ -547,40 +591,53 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
             overflow_checks,
         };
         lower.run()?;
-        let digest = if mode == LowerMode::Probe { FootprintId(lower.b.finish_probe()) } else { FootprintId(0) };
-        (digest, lower.cycle_root)
+        lower.cycle_root
     };
-    Ok((func, digest, relocs, cycle))
+    Ok((func, relocs, Arc::new(RelocPlan::from_vec(reloc_plan)), cycle))
 }
 
 impl Lower<'_, '_> {
-    pub(super) fn push_reloc(&mut self, src: SymbolSource) -> u32 {
+    pub(super) fn push_reloc(&mut self, src: SymbolSource, step: RelocStep) -> u32 {
         let idx = self.relocs.len() as u32;
         self.relocs.push(src);
+        self.reloc_plan.push(step);
         idx
     }
 
-    pub(super) fn emit_slot(&mut self, src: SymbolSource) -> Value {
+    pub(super) fn emit_slot(&mut self, src: SymbolSource, origin: SiteOrigin) -> Value {
+        self.emit_slot_with(src, RelocStep::SiteSlot(origin))
+    }
+
+    pub(super) fn emit_slot_with(&mut self, src: SymbolSource, step: RelocStep) -> Value {
+        let self_call = matches!(self.mode, LowerMode::Stencil) && matches!(&src, SymbolSource::Slot(i) if *i == self.index);
         let low = self.slots.low_entries();
-        let idx = self.push_reloc(src);
+        let idx = self.push_reloc(src, step);
+        if self_call {
+            self.b.func.add_self_slot(idx);
+        }
         match self.mode {
             LowerMode::Dict => {
                 let dict = self.dict_param.expect("dictionary parameter is set");
                 self.ins().load(Type::I64, dict, (idx * 8) as i32)
             }
-            LowerMode::Probe | LowerMode::Stencil if low => self.ins().slot_addr(idx),
-            LowerMode::Probe | LowerMode::Stencil => self.ins().symbol(idx),
+            LowerMode::Stencil if low => self.ins().slot_addr(idx),
+            LowerMode::Stencil => self.ins().symbol(idx),
         }
     }
 
     pub(super) fn emit_symbol(&mut self, src: SymbolSource) -> Value {
-        let idx = self.push_reloc(src);
+        let step = RelocStep::Const(src.clone());
+        self.emit_symbol_with(src, step)
+    }
+
+    pub(super) fn emit_symbol_with(&mut self, src: SymbolSource, step: RelocStep) -> Value {
+        let idx = self.push_reloc(src, step);
         match self.mode {
             LowerMode::Dict => {
                 let dict = self.dict_param.expect("dictionary parameter is set");
                 self.ins().load(Type::I64, dict, (idx * 8) as i32)
             }
-            LowerMode::Probe | LowerMode::Stencil => self.ins().symbol(idx),
+            LowerMode::Stencil => self.ins().symbol(idx),
         }
     }
 }

@@ -15,7 +15,7 @@ use crate::sema::evaluate::Evaluate;
 use crate::sema::reach::{Instance, Reached, calls, infer_declared, main_roots};
 use crate::sema::{Answer, Cache, Context, Edited};
 
-use super::{CODE_BYTES, Image, TABLE_SLOTS, host_symbol, stub, wait};
+use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, host_symbol, stub, wait};
 
 /// What answers what a pass of inference asked for, and says what it added.
 pub type Answerer<'f> = &'f dyn Fn(&mut Compilation, Requests) -> Result<Answer>;
@@ -157,14 +157,19 @@ impl Driver for Once {
     }
 }
 
+const EVAL_SHARED_BYTES: usize = 64 << 20;
+const EVAL_STATE_BYTES: usize = 64 << 20;
+const EVAL_CODE_BYTES: usize = 64 << 20;
+const EVAL_TABLE_SLOTS: usize = 1 << 16;
+
 /// Makes the runner of constant items that the type checker installs: a demand of its own, whose functions compile on their first call.
 pub fn evaluator() -> Result<Box<dyn Evaluate>> {
-    Ok(Box::new(Jit::new(Cache::default())?))
+    Ok(Box::new(Jit::create(Cache::default(), (EVAL_SHARED_BYTES, EVAL_STATE_BYTES, EVAL_CODE_BYTES, EVAL_TABLE_SLOTS))?))
 }
 
 impl Evaluate for Jit {
     fn evaluate(&mut self, cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128> {
-        let (entry, wide) = (self.declare(instance.clone()), bits > 64);
+        let (entry, wide) = (self.declare(*instance), bits > 64);
         let mut once = Once(None);
         self.strict = false;
         let ran = self.fork(true, |image, out| image.evaluate_in_child(entry, wide, out)).and_then(|_| self.pump(cx, &mut once, None));
@@ -251,11 +256,15 @@ pub fn serve(compilation: &mut Compilation, ask: Answerer<'_>, demand: &mut Jit,
 
 impl Jit {
     pub fn new(store: Cache) -> Result<Jit> {
+        Self::create(store, (SHARED_BYTES, STATE_BYTES, CODE_BYTES, TABLE_SLOTS))
+    }
+
+    fn create(store: Cache, (shared_bytes, state_bytes, code_bytes, table_slots): (usize, usize, usize, usize)) -> Result<Jit> {
         let reached = Reached::default();
-        let mut image = Image::new(&reached)?;
+        let mut image = Image::create(&reached, super::ImageMode::Jit, (shared_bytes, state_bytes, table_slots))?;
         image.jit_mode = true;
-        image.stubs.reserve(TABLE_SLOTS * stub::STUB_BYTES)?;
-        image.pass.memory.reserve(CODE_BYTES)?;
+        image.stubs.reserve(table_slots * stub::STUB_BYTES)?;
+        image.pass.memory.reserve(code_bytes)?;
         Ok(Jit { reached, store, image, stubs: Vec::new(), compiled: HashSet::default(), children: Vec::new(), strict: true, expanded: HashSet::default() })
     }
 
@@ -513,7 +522,7 @@ impl Jit {
         match crate::prep::prepped(cx, &self.reached, index)? {
             crate::prep::Prepped::Direct(address) => Some(address),
             crate::prep::Prepped::Adapter(func) => {
-                let code = haste_codegen::compile(func, haste_codegen::Target::host()).ok()?;
+                let code = haste_codegen::compile(func, &crate::host_target()).ok()?;
                 self.image.with_pass(|_, pass| pass.memory.write_patched(&code, &[])).ok()
             }
         }

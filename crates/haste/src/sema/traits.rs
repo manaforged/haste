@@ -20,7 +20,7 @@ pub struct Langs {
     /// The standard crates that were read only in part when the table was built, which each lookup asks to load.
     partial: Vec<u32>,
     /// The standard crates whose files the table was built from.
-    pub(super) crates: Vec<u32>,
+    pub(super) crates: Arc<[u32]>,
 }
 
 /// The lang-table key of the function `#[panic_handler]` marks, which no `#[lang]` value can spell.
@@ -140,7 +140,7 @@ impl<'a> Context<'a> {
     fn lang_table(&self) -> Langs {
         let (mut table, mut partial, crates) = (HashMap::default(), Vec::new(), self.primitive_holders());
         let wanted = mark("lang") | mark("panic_handler");
-        for &krate in &crates {
+        for &krate in crates.iter() {
             let tree = &self.outline.crates[krate as usize];
             let std = self.outline.roots[krate as usize].name == "std";
             if tree.partial() {

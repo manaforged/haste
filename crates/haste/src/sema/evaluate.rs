@@ -8,7 +8,6 @@ use crate::body::BinOp;
 
 use super::Context;
 use super::reach::Instance;
-use super::table::Table;
 use super::ty::mask;
 
 /// The width and signedness of an integer type.
@@ -53,7 +52,7 @@ pub(super) const CONST_METHODS: [(&str, ConstMethod); 9] = [
 ];
 
 /// What runs constant items: compiles the body of one and each function it calls, runs it, and gives its value.
-pub trait Evaluate {
+pub trait Evaluate: Send {
     /// The value of the integer constant `instance`, `bits` wide, from running its body.
     fn evaluate(&mut self, cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128>;
 }
@@ -68,37 +67,57 @@ pub fn install(make: Make) {
     MAKE.get_or_init(|| make);
 }
 
-/// What one pass ran: the value of each constant item, shared across worker contexts.
-#[derive(Clone, Default)]
-pub struct Evaluated {
-    values: Table<Instance, u128>,
-}
-
 /// The value of the integer constant `instance`, `bits` wide, from running its body once per pass; a constant whose evaluation needs its own value is an error.
 pub fn run(cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128> {
-    if let Some(value) = cx.evaluated.values.get(instance) {
+    if let Some(value) = cx.store.evaluated.get(instance) {
         return Ok(value);
     }
+    if let Some(err) = cx.eval_errors.get(instance) {
+        bail!("{err}");
+    }
     if cx.in_parallel {
-        cx.deferred_evals.push((instance.clone(), bits));
+        cx.deferred_evals.push((*instance, bits));
         bail!("constant evaluation deferred");
     }
     if cx.eval_stack.contains(instance) {
         bail!("the constant {} depends on itself", cx.name(instance.0));
     }
-    cx.eval_stack.push(instance.clone());
-    let Some(make) = MAKE.get() else {
-        cx.eval_stack.pop();
-        bail!("no runner of constants is installed");
+    cx.eval_stack.push(*instance);
+    let mut runner = match cx.store.runner.take() {
+        Some(runner) => runner,
+        None => {
+            let Some(make) = MAKE.get() else {
+                cx.eval_stack.pop();
+                bail!("no runner of constants is installed");
+            };
+            match make() {
+                Ok(runner) => runner,
+                Err(err) => {
+                    cx.eval_stack.pop();
+                    return Err(err);
+                }
+            }
+        }
     };
-    let before = cx.quiet_mark();
-    let result = make().and_then(|mut runner| runner.evaluate(cx, instance, bits));
+    let result = runner.evaluate(cx, instance, bits);
+    cx.store.runner.put(runner);
     cx.eval_stack.pop();
-    let value = result?;
-    if cx.quiet_mark() == before {
-        cx.evaluated.values.insert(instance.clone(), value);
+    match result {
+        Ok(value) => {
+            cx.store.evaluated.insert(*instance, value);
+            Ok(value)
+        }
+        Err(err) => {
+            cx.eval_errors.insert(*instance, format!("{err:#}"));
+            Err(err)
+        }
     }
-    Ok(value)
+}
+
+pub(super) fn prime(cx: &mut Context<'_>, instance: &Instance, bits: u32) {
+    match run(cx, instance, bits) {
+        Ok(_) | Err(_) => {}
+    }
 }
 
 fn ilog(value: u128, base: u128) -> u128 {

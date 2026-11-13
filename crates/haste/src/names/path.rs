@@ -282,9 +282,29 @@ impl<'a> Paths<'a> {
         }
     }
 
+    pub(super) fn demand_macro_module(&self, submod: ModRef) {
+        if self.scope(submod).is_some() {
+            self.ask_crate(ModRef { krate: submod.krate, module: 0 });
+        }
+    }
+
+    pub(super) fn demand_macro_in(&self, root: ModRef, found: PerNs) {
+        match found.types {
+            Some(Binding { def: Def::Module(submod), .. }) if submod.krate == root.krate => self.demand_macro_module(submod),
+            _ => self.ask_crate(root),
+        }
+    }
+
     /// The macro `word` that a crate this crate names in `#[macro_use] extern crate` exports at its root.
     pub fn macro_use(&self, word: Sym) -> Option<Binding> {
-        self.trees[self.krate as usize].macro_use.iter().find_map(|&krate| self.member(module(krate as u32, 0), word).macros)
+        self.trees[self.krate as usize].macro_use.iter().find_map(|&krate| {
+            let root = ModRef { krate: krate as u32, module: 0 };
+            let found = self.member(Def::Module(root), word);
+            if found.macros.is_none() {
+                self.demand_macro_in(root, found);
+            }
+            found.macros
+        })
     }
 
     /// The path that a `use` declaration of `path` names: in edition 2015 it starts at the crate root unless it starts with a keyword.

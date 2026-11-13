@@ -182,6 +182,15 @@ impl<K, V> Flight<K, V> {
         self.inner.slots.retain(|key, _| keep(key));
     }
 
+    pub(super) fn for_each_ready(&self, mut f: impl FnMut(&K, &V)) {
+        self.inner.slots.retain(|key, slot| {
+            if let SlotState::Ready(value) = &*lock(&slot.state) {
+                f(key, value);
+            }
+            true
+        });
+    }
+
     fn begin_wait(&self, me: ThreadId, owner: ThreadId) -> bool {
         if me == owner {
             return false;
@@ -209,6 +218,13 @@ impl<K, V> Flight<K, V> {
         self.inner.slots.remove(key);
         *lock(&slot.state) = SlotState::Failed;
         slot.ready.notify_all();
+    }
+
+    pub fn retain_keys(&self, mut keep: impl FnMut(&K) -> bool)
+    where
+        K: Eq + Hash,
+    {
+        self.inner.slots.retain(|k, _| keep(k));
     }
 }
 

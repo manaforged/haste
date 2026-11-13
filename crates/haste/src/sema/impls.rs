@@ -229,14 +229,16 @@ impl<'a> Context<'a> {
     /// The inherent impls of types with head `head`, asking for every module of the crates that may hold one.
     pub fn inherent(&mut self, head: Head) -> Vec<ImplRef> {
         let standard = self.primitive_holders();
-        let holders = match head {
+        let one;
+        let holders: &[u32] = match head {
             Head::Adt(item) | Head::Dyn(item) if !standard.contains(&item.krate) => {
-                vec![item.krate]
+                one = [item.krate];
+                &one
             }
-            _ => standard,
+            _ => &standard,
         };
         let mut found = Vec::new();
-        for holder in self.holders_with_body(&holders, (Some(head), None)) {
+        for holder in self.holders_with_body(holders, (Some(head), None)) {
             found.extend(self.index_of(holder).inherent.get(&head).into_iter().flatten().copied());
         }
         found
@@ -313,17 +315,17 @@ impl<'a> Context<'a> {
     }
 
     /// The standard crates, which hold the impls and lang items of primitive types.
-    pub fn primitive_holders(&self) -> Vec<u32> {
+    pub fn primitive_holders(&self) -> Arc<[u32]> {
+        if let Some(found) = super::read_lock(&self.store.lookups.state.primitives).as_ref() {
+            return Arc::clone(found);
+        }
         let roots = self.outline.roots.iter().enumerate();
-        roots.filter(|(_, root)| root.role == crate::outline::Role::Lib && PRIMITIVE_HOLDERS.contains(&root.name.as_str())).map(|(krate, _)| krate as u32).collect()
+        let found: Arc<[u32]> = roots.filter(|(_, root)| root.role == crate::outline::Role::Lib && PRIMITIVE_HOLDERS.contains(&root.name.as_str())).map(|(krate, _)| krate as u32).collect();
+        *super::write_lock(&self.store.lookups.state.primitives) = Some(Arc::clone(&found));
+        found
     }
 
     fn index_of(&mut self, holder: Holder) -> Arc<Index> {
-        if let Holder::Crate(krate) = holder
-            && self.outline.crates[krate as usize].partial()
-        {
-            self.asks.crates.borrow_mut().push(krate);
-        }
         if let Some(found) = self.store.lookups.heads.get(&holder) {
             found.asked.replay(&self.asks);
             return found;
@@ -334,6 +336,11 @@ impl<'a> Context<'a> {
             return Arc::default();
         }
         let mark = self.asks.mark();
+        if let Holder::Crate(krate) = holder
+            && self.outline.crates[krate as usize].unsettled()
+        {
+            self.asks.crates.borrow_mut().push(krate);
+        }
         let blocks = match holder {
             Holder::Crate(krate) => self.crate_impls(krate),
             Holder::Body(root) => self.body_impls(root),

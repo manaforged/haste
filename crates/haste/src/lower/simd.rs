@@ -38,7 +38,10 @@ impl Lower<'_, '_> {
     pub(super) fn simd(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&vector), Some(&first)) = (substs.first(), args.first()) else { bail!("a SIMD intrinsic with no vector") };
         let out = substs.get(1).copied();
-        if Target::host().arch == Arch::X64
+        if let Some(value) = self.packed_swar64(op, (vector, out.unwrap_or(vector)), args)? {
+            return Ok(Some(value));
+        }
+        if matches!(Target::host().arch, Arch::X64 | Arch::Arm64)
             && let Some(value) = self.packed(op, (vector, out.unwrap_or(vector)), args)?
         {
             return Ok(Some(value));
@@ -84,18 +87,118 @@ impl Lower<'_, '_> {
                     _ => self.ins().bxor(a, b),
                 }
             }
-            (Simd::Lanewise(cmp @ (BinOp::Eq | BinOp::Gt | BinOp::Lt)), &[x, y]) if lanes.is_bytes() && (cmp == BinOp::Eq || signed) && self.lanes(output)?.is_bytes() => {
+            (Simd::Lanewise(cmp @ (BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le)), &[x, y])
+                if lanes.is_bytes() && (matches!(cmp, BinOp::Eq | BinOp::Ne) || signed) && self.lanes(output)?.is_bytes() =>
+            {
                 let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+                let invert = |v: Value, lower: &mut Self| {
+                    let ones = lower.ins().byte_cmp(ByteCC::Equal, a, a);
+                    lower.ins().bxor(v, ones)
+                };
                 match cmp {
                     BinOp::Eq => self.ins().byte_cmp(ByteCC::Equal, a, b),
+                    BinOp::Ne => {
+                        let eq = self.ins().byte_cmp(ByteCC::Equal, a, b);
+                        invert(eq, self)
+                    }
                     BinOp::Gt => self.ins().byte_cmp(ByteCC::SignedGreaterThan, a, b),
-                    _ => self.ins().byte_cmp(ByteCC::SignedGreaterThan, b, a),
+                    BinOp::Lt => self.ins().byte_cmp(ByteCC::SignedGreaterThan, b, a),
+                    BinOp::Ge => {
+                        let lt = self.ins().byte_cmp(ByteCC::SignedGreaterThan, b, a);
+                        invert(lt, self)
+                    }
+                    _ => {
+                        let gt = self.ins().byte_cmp(ByteCC::SignedGreaterThan, a, b);
+                        invert(gt, self)
+                    }
                 }
             }
             _ => return Ok(None),
         };
         let (slot, address) = self.vector_slot(if matches!(op, Simd::Splat) { input } else { output })?;
         self.ins().stack_store(vector, slot, 0);
+        Ok(Some(address))
+    }
+
+    fn packed_swar64(&mut self, op: Simd, (input, output): (Ty, Ty), args: &[Value]) -> Result<Option<Value>> {
+        let lanes = self.lanes(input)?;
+        if lanes.size * lanes.count != 8 || !matches!(lanes.num, Num::Int { .. }) {
+            return Ok(None);
+        }
+        let signed = matches!(lanes.num, Num::Int { signed: true, .. });
+        let is_u8x8 = lanes.size == 1 && lanes.count == 8;
+        let word = match (op, args) {
+            (Simd::Splat, &[x]) if is_u8x8 => {
+                let wide = self.resize(x, (lanes.machine, false), Type::I64);
+                let ff = self.ins().iconst(Type::I64, 0xFF);
+                let byte = self.ins().band(wide, ff);
+                self.ins().imul_imm(byte, 0x0101_0101_0101_0101_u64 as i64)
+            }
+            (Simd::Extract, &[x, _]) if lanes.size == 8 && lanes.count == 1 => {
+                return Ok(Some(self.ins().load(lanes.machine, x, 0)));
+            }
+            (Simd::Lanewise(bin @ (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)), &[x, y]) if input == output => {
+                let (a, b) = (self.ins().load(Type::I64, x, 0), self.ins().load(Type::I64, y, 0));
+                match bin {
+                    BinOp::BitAnd => self.ins().band(a, b),
+                    BinOp::BitOr => self.ins().bor(a, b),
+                    _ => self.ins().bxor(a, b),
+                }
+            }
+            (Simd::Lanewise(cmp @ (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)), &[x, y])
+                if is_u8x8 && self.lanes(output)?.size == 1 && self.lanes(output)?.count == 8 =>
+            {
+                let (a, b) = (self.ins().load(Type::I64, x, 0), self.ins().load(Type::I64, y, 0));
+                let m7f = self.ins().iconst(Type::I64, 0x7F7F_7F7F_7F7F_7F7F_u64 as i64);
+                let m80 = self.ins().iconst(Type::I64, 0x8080_8080_8080_8080_u64 as i64);
+                let seven = self.ins().iconst(Type::I64, 7);
+                let bits = match cmp {
+                    BinOp::Eq | BinOp::Ne => {
+                        let d = self.ins().bxor(a, b);
+                        let masked = self.ins().band(d, m7f);
+                        let low = self.ins().iadd(masked, m7f);
+                        let low_or_d = self.ins().bor(low, d);
+                        let nz_or_7f = self.ins().bor(low_or_d, m7f);
+                        let msb = if cmp == BinOp::Eq {
+                            self.ins().bnot(nz_or_7f)
+                        } else {
+                            self.ins().band(nz_or_7f, m80)
+                        };
+                        self.ins().ushr(msb, seven)
+                    }
+                    _ => {
+                        let (lhs, rhs, invert) = match cmp {
+                            BinOp::Gt => (b, a, false),
+                            BinOp::Ge => (a, b, true),
+                            BinOp::Le => (b, a, true),
+                            _ => (a, b, false),
+                        };
+                        let (ua, ub) = if signed {
+                            (self.ins().bxor(lhs, m80), self.ins().bxor(rhs, m80))
+                        } else {
+                            (lhs, rhs)
+                        };
+                        let ua_hi = self.ins().bor(ua, m80);
+                        let ub_lo = self.ins().band(ub, m7f);
+                        let diff = self.ins().isub(ua_hi, ub_lo);
+                        let not_ua = self.ins().bnot(ua);
+                        let term1 = self.ins().band(not_ua, ub);
+                        let xor_ab = self.ins().bxor(ua, ub);
+                        let same_hi = self.ins().bnot(xor_ab);
+                        let not_diff = self.ins().bnot(diff);
+                        let term2 = self.ins().band(same_hi, not_diff);
+                        let lt_hi = self.ins().bor(term1, term2);
+                        let raw = if invert { self.ins().bnot(lt_hi) } else { lt_hi };
+                        let msb = self.ins().band(raw, m80);
+                        self.ins().ushr(msb, seven)
+                    }
+                };
+                self.ins().imul_imm(bits, 0xFF)
+            }
+            _ => return Ok(None),
+        };
+        let (slot, address) = self.vector_slot(if matches!(op, Simd::Splat) { input } else { output })?;
+        self.ins().stack_store(word, slot, 0);
         Ok(Some(address))
     }
 

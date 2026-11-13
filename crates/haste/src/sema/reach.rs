@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use rustc_hash::FxHashMap as HashMap;
 
@@ -11,8 +12,8 @@ use super::infer::{Typed, infer, register};
 use super::substs::Substs;
 use super::ty::{Kind, Ty};
 
-const MIN_PARALLEL_WAVE: usize = 16;
-const WAVE_BATCH: usize = 4;
+const MIN_PARALLEL_WAVE: usize = 4;
+const WAVE_BATCH: usize = 2;
 
 /// One function at concrete type arguments.
 pub type Instance = (ItemRef, Substs);
@@ -28,6 +29,7 @@ pub struct Reached {
     pub unlaid: Vec<String>,
     calls: Vec<Vec<usize>>,
     untyped: rustc_hash::FxHashSet<usize>,
+    blocked: Vec<usize>,
 }
 
 impl Reached {
@@ -90,12 +92,12 @@ impl Reached {
     }
 }
 
-/// Infers `roots` and every function their bodies call, at the type arguments the calls give.
-pub fn reach(cx: &mut Context<'_>, roots: &[Instance]) -> Reached {
-    let mut reached = Reached::default();
-    let found = drain(cx, &mut reached, roots.to_vec());
-    reached.link(&found);
-    reached
+/// Advances `reached` monotonically from `roots` and any previously blocked instances, parking instances that emit new asks unless `force_commit` is set.
+pub fn reach_wave(cx: &mut Context<'_>, reached: &mut Reached, roots: &[Instance], force_commit: bool) {
+    let mut initial = std::mem::take(&mut reached.blocked);
+    initial.extend(enqueue(reached, roots.to_vec()));
+    let settled = drain_wave(cx, reached, initial, force_commit);
+    reached.link(&settled);
 }
 
 /// Infers again the reached functions `stale` that an edit did not replace, whose source changed, and every function they now call that was not reached yet, and returns the indexes of both.
@@ -104,7 +106,8 @@ pub fn reach_again(cx: &mut Context<'_>, reached: &mut Reached, stale: &[usize])
     let waves = stale_waves(&cx.types, reached, &stale);
     let mut queue = Vec::new();
     for wave in &waves {
-        queue.extend(run_wave(cx, reached, wave, true));
+        let (_, next) = run_wave(cx, reached, wave, true, true);
+        queue.extend(next);
     }
     let mut found = stale;
     found.extend(drain(cx, reached, queue));
@@ -189,19 +192,196 @@ struct WaveItem {
     unlaid: Vec<String>,
     callees: Vec<Instance>,
     deferred: bool,
+    asked: bool,
 }
 
 type WorkerOut = (Requests, Vec<(Instance, u32)>, Vec<WaveItem>);
 
 fn drain(cx: &mut Context<'_>, reached: &mut Reached, queue: Vec<Instance>) -> Vec<usize> {
+    let wave = enqueue(reached, queue);
+    drain_wave(cx, reached, wave, true)
+}
+
+fn drain_wave(cx: &mut Context<'_>, reached: &mut Reached, mut wave: Vec<usize>, force_commit: bool) -> Vec<usize> {
     let mut added = Vec::new();
-    let mut wave = enqueue(reached, queue);
     while !wave.is_empty() {
-        let next = run_wave(cx, reached, &wave, false);
-        added.extend_from_slice(&wave);
+        if crate::jobs() > 1 && wave.len() >= MIN_PARALLEL_WAVE {
+            added.extend(parallel_drain(cx, reached, wave, force_commit));
+            break;
+        }
+        let (settled, next) = serial_wave(cx, reached, &wave, false, force_commit);
+        added.extend_from_slice(&settled);
         wave = enqueue(reached, next);
     }
     added
+}
+
+struct WaveQueue {
+    seen: HashMap<Instance, usize>,
+    instances: Vec<Instance>,
+    queue: VecDeque<(usize, Instance)>,
+    settled: Vec<(usize, Result<Arc<Typed>, String>, Vec<String>, bool)>,
+    deferred_items: Vec<(usize, Instance)>,
+    active: usize,
+}
+
+struct ActiveGuard<'a>(&'a Mutex<WaveQueue>, &'a Condvar, usize);
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        if self.2 > 0 {
+            let mut q = crate::sync::lock(self.0);
+            q.active = q.active.saturating_sub(self.2);
+            self.1.notify_all();
+        }
+    }
+}
+
+fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: Vec<usize>, force_commit: bool) -> Vec<usize> {
+    let workers = crate::jobs();
+    let seen = std::mem::take(&mut reached.index);
+    let instances: Vec<Instance> = reached.list.iter().map(|&(inst, _)| inst).collect();
+    let queue: VecDeque<(usize, Instance)> = wave.iter().map(|&at| (at, instances[at])).collect();
+    let shared = (Mutex::new(WaveQueue { seen, instances, queue, settled: Vec::new(), deferred_items: Vec::new(), active: 0 }), Condvar::new());
+    loop {
+        let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
+        let shared_ref = &shared;
+        cx.in_parallel = true;
+        let joined = std::thread::scope(|scope| {
+            let handles: Vec<_> = forks
+                .into_iter()
+                .map(|mut fork| {
+                    scope.spawn(move || {
+                        wavefront_worker(&mut fork, shared_ref, force_commit);
+                        let deferred = fork.take_deferred_evals();
+                        let (_, asks) = fork.release();
+                        (asks, deferred)
+                    })
+                })
+                .collect();
+            wavefront_worker(cx, shared_ref, force_commit);
+            handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect::<Vec<_>>()
+        });
+        cx.in_parallel = false;
+        let mut deferred = cx.take_deferred_evals();
+        for (asks, worker_deferred) in joined.into_iter().flatten() {
+            cx.asks.repeat(&asks);
+            deferred.extend(worker_deferred);
+        }
+        if !deferred.is_empty() {
+            eval_deferred_list(cx, deferred);
+        }
+        let deferred_items = {
+            let mut q = crate::sync::lock(&shared.0);
+            std::mem::take(&mut q.deferred_items)
+        };
+        if deferred_items.is_empty() {
+            break;
+        }
+        if deferred_items.len() < MIN_PARALLEL_WAVE {
+            let mut extra = Vec::new();
+            for (at, instance) in deferred_items {
+                let asks0 = cx.asks.count();
+                let mut unlaid = Vec::new();
+                let typed = infer_entry(cx, &instance, &mut unlaid, false);
+                let asked = cx.asks.count() > asks0;
+                let callees: Vec<Instance> = if !force_commit && asked { Vec::new() } else { calls(cx, &typed).collect() };
+                extra.push((at, typed, unlaid, !force_commit && asked, callees));
+            }
+            let mut q = crate::sync::lock(&shared.0);
+            for (at, typed, unlaid, blocked, callees) in extra {
+                q.settled.push((at, typed, unlaid, blocked));
+                for callee in callees {
+                    if !q.seen.contains_key(&callee) {
+                        let next_at = q.instances.len();
+                        q.seen.insert(callee, next_at);
+                        q.instances.push(callee);
+                        q.queue.push_back((next_at, callee));
+                    }
+                }
+            }
+            if q.queue.is_empty() {
+                break;
+            }
+        } else {
+            let mut q = crate::sync::lock(&shared.0);
+            q.queue.extend(deferred_items);
+        }
+    }
+    let q = shared.0.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    reached.index = q.seen;
+    for inst in q.instances.into_iter().skip(reached.list.len()) {
+        reached.list.push((inst, Err(String::new())));
+    }
+    let mut added = Vec::with_capacity(q.settled.len());
+    for (at, typed, unlaid, blocked) in q.settled {
+        reached.list[at].1 = typed;
+        if blocked {
+            reached.blocked.push(at);
+        } else {
+            reached.unlaid.extend(unlaid);
+            added.push(at);
+        }
+    }
+    added
+}
+
+fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Condvar), force_commit: bool) {
+    let mut batch = Vec::with_capacity(4);
+    let mut results = Vec::with_capacity(4);
+    loop {
+        batch.clear();
+        {
+            let mut q = crate::sync::lock(mutex);
+            while q.queue.is_empty() {
+                if q.active == 0 {
+                    cvar.notify_all();
+                    return;
+                }
+                q = cvar.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            for _ in 0..4 {
+                let Some(item) = q.queue.pop_front() else { break };
+                batch.push(item);
+            }
+            q.active += batch.len();
+        }
+        let mut active = ActiveGuard(mutex, cvar, batch.len());
+        results.clear();
+        for &(at, instance) in &batch {
+            let asks0 = cx.asks.count();
+            let mut unlaid = Vec::new();
+            let before = cx.deferred_evals.len();
+            let typed = infer_entry(cx, &instance, &mut unlaid, false);
+            let deferred = cx.deferred_evals.len() > before;
+            let asked = cx.asks.count() > asks0;
+            let callees: Vec<Instance> = if !deferred && (force_commit || !asked) { calls(cx, &typed).collect() } else { Vec::new() };
+            results.push((at, instance, typed, unlaid, asked, deferred, callees));
+        }
+        {
+            let mut q = crate::sync::lock(mutex);
+            q.active = q.active.saturating_sub(active.2);
+            active.2 = 0;
+            for (at, instance, typed, unlaid, asked, deferred, callees) in results.drain(..) {
+                if deferred {
+                    q.deferred_items.push((at, instance));
+                } else if !force_commit && asked {
+                    q.settled.push((at, typed, unlaid, true));
+                } else {
+                    q.settled.push((at, typed, unlaid, false));
+                    for callee in callees {
+                        if !q.seen.contains_key(&callee) {
+                            let next_at = q.instances.len();
+                            q.seen.insert(callee, next_at);
+                            q.instances.push(callee);
+                            q.queue.push_back((next_at, callee));
+                        }
+                    }
+                }
+            }
+            cvar.notify_all();
+        }
+    }
 }
 
 fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {
@@ -218,30 +398,40 @@ fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {
     wave
 }
 
-fn run_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], check_undeclared: bool) -> Vec<Instance> {
+fn run_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], check_undeclared: bool, force_commit: bool) -> (Vec<usize>, Vec<Instance>) {
     let workers = crate::jobs().min(wave.len().div_ceil(WAVE_BATCH));
     if workers <= 1 || wave.len() < MIN_PARALLEL_WAVE {
-        return serial_wave(cx, reached, wave, check_undeclared);
+        return serial_wave(cx, reached, wave, check_undeclared, force_commit);
     }
-    parallel_wave(cx, reached, wave, workers, check_undeclared)
+    parallel_wave(cx, reached, wave, workers, check_undeclared, force_commit)
 }
 
-fn serial_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], check_undeclared: bool) -> Vec<Instance> {
+fn serial_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], check_undeclared: bool, force_commit: bool) -> (Vec<usize>, Vec<Instance>) {
+    let mut settled = Vec::with_capacity(wave.len());
     let mut next = Vec::new();
     for &at in wave {
         let instance = reached.list[at].0;
-        let typed = infer_entry(cx, &instance, &mut reached.unlaid, check_undeclared);
+        let asks0 = cx.asks.count();
+        let mut unlaid = Vec::new();
+        let typed = infer_entry(cx, &instance, &mut unlaid, check_undeclared);
+        if !force_commit && cx.asks.count() > asks0 {
+            reached.blocked.push(at);
+            reached.list[at].1 = typed;
+            continue;
+        }
+        reached.unlaid.extend(unlaid);
         next.extend(calls(cx, &typed));
         reached.list[at].1 = typed;
+        settled.push(at);
     }
-    next
+    (settled, next)
 }
 
-fn parallel_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], workers: usize, check_undeclared: bool) -> Vec<Instance> {
+fn parallel_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], workers: usize, check_undeclared: bool, force_commit: bool) -> (Vec<usize>, Vec<Instance>) {
     let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
     let next = AtomicUsize::new(0);
     cx.in_parallel = true;
-    let (mut items, joined) = run_scoped(cx, forks, reached, (wave, &next, check_undeclared));
+    let (mut items, joined) = run_scoped(cx, forks, reached, (wave, &next, check_undeclared, force_commit));
     cx.in_parallel = false;
     let mut deferred = cx.take_deferred_evals();
     for (asks, worker_deferred, worker_items) in joined.into_iter().flatten() {
@@ -251,48 +441,80 @@ fn parallel_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], wo
     }
     items.sort_by_key(|item| item.pos);
     if !deferred.is_empty() || items.iter().any(|item| item.deferred) {
-        run_deferred(cx, (reached, wave, check_undeclared), deferred, &mut items);
+        run_deferred(cx, (reached, wave, workers, check_undeclared, force_commit), deferred, &mut items);
     }
-    commit_wave(cx, reached, wave, items)
+    commit_wave(cx, reached, wave, items, force_commit)
 }
 
-fn run_deferred(cx: &mut Context<'_>, (reached, wave, check_undeclared): (&Reached, &[usize], bool), deferred: Vec<(Instance, u32)>, items: &mut [WaveItem]) {
+fn eval_deferred_list(cx: &mut Context<'_>, deferred: Vec<(Instance, u32)>) {
     let mut seen = rustc_hash::FxHashSet::default();
     for (inst, bits) in deferred {
         if seen.insert((inst, bits)) {
-            drop(super::evaluate::run(cx, &inst, bits));
+            super::evaluate::prime(cx, &inst, bits);
         }
     }
+}
+
+fn run_deferred(cx: &mut Context<'_>, (reached, wave, workers, check_undeclared, force_commit): (&Reached, &[usize], usize, bool, bool), deferred: Vec<(Instance, u32)>, items: &mut [WaveItem]) {
+    eval_deferred_list(cx, deferred);
+    for _ in 0..4 {
+        let pending: Vec<usize> = items.iter().enumerate().filter(|(_, item)| item.deferred).map(|(i, _)| i).collect();
+        if pending.len() < MIN_PARALLEL_WAVE || workers <= 1 {
+            break;
+        }
+        let sub_wave: Vec<usize> = pending.iter().map(|&i| wave[items[i].pos]).collect();
+        let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
+        let next = AtomicUsize::new(0);
+        cx.in_parallel = true;
+        let (mut sub_items, joined) = run_scoped(cx, forks, reached, (&sub_wave, &next, check_undeclared, force_commit));
+        cx.in_parallel = false;
+        let mut next_deferred = cx.take_deferred_evals();
+        for (asks, worker_deferred, worker_items) in joined.into_iter().flatten() {
+            cx.asks.repeat(&asks);
+            next_deferred.extend(worker_deferred);
+            sub_items.extend(worker_items);
+        }
+        for sub_item in sub_items {
+            let slot = &mut items[pending[sub_item.pos]];
+            *slot = WaveItem { pos: slot.pos, asked: slot.asked | sub_item.asked, ..sub_item };
+        }
+        if next_deferred.is_empty() {
+            break;
+        }
+        eval_deferred_list(cx, next_deferred);
+    }
     for item in items.iter_mut().filter(|item| item.deferred) {
+        let asks0 = cx.asks.count();
         let mut unlaid = Vec::new();
         let typed = infer_entry(cx, &reached.list[wave[item.pos]].0, &mut unlaid, check_undeclared);
-        item.callees = calls(cx, &typed).collect();
+        item.asked |= cx.asks.count() > asks0;
+        item.callees = if !force_commit && item.asked { Vec::new() } else { calls(cx, &typed).collect() };
         item.typed = typed;
         item.unlaid = unlaid;
         item.deferred = false;
     }
 }
 
-fn run_scoped<'a>(cx: &mut Context<'a>, forks: Vec<Context<'a>>, reached: &Reached, (wave, next, check_undeclared): (&[usize], &AtomicUsize, bool)) -> (Vec<WaveItem>, Vec<Option<WorkerOut>>) {
+fn run_scoped<'a>(cx: &mut Context<'a>, forks: Vec<Context<'a>>, reached: &Reached, (wave, next, check_undeclared, force_commit): (&[usize], &AtomicUsize, bool, bool)) -> (Vec<WaveItem>, Vec<Option<WorkerOut>>) {
     std::thread::scope(|scope| {
         let handles: Vec<_> = forks
             .into_iter()
             .map(|mut fork| {
                 scope.spawn(move || {
-                    let items = worker_loop(&mut fork, reached, wave, next, check_undeclared);
+                    let items = worker_loop(&mut fork, reached, wave, next, check_undeclared, force_commit);
                     let deferred = fork.take_deferred_evals();
                     let (_, asks) = fork.release();
                     (asks, deferred, items)
                 })
             })
             .collect();
-        let own = worker_loop(cx, reached, wave, next, check_undeclared);
+        let own = worker_loop(cx, reached, wave, next, check_undeclared, force_commit);
         let joined = handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect();
         (own, joined)
     })
 }
 
-fn worker_loop(cx: &mut Context<'_>, reached: &Reached, wave: &[usize], next: &AtomicUsize, check_undeclared: bool) -> Vec<WaveItem> {
+fn worker_loop(cx: &mut Context<'_>, reached: &Reached, wave: &[usize], next: &AtomicUsize, check_undeclared: bool, force_commit: bool) -> Vec<WaveItem> {
     let mut items = Vec::new();
     loop {
         let start = next.fetch_add(WAVE_BATCH, Ordering::Relaxed);
@@ -301,35 +523,46 @@ fn worker_loop(cx: &mut Context<'_>, reached: &Reached, wave: &[usize], next: &A
         }
         let end = (start + WAVE_BATCH).min(wave.len());
         for (offset, &at) in wave[start..end].iter().enumerate() {
+            let asks0 = cx.asks.count();
             let mut unlaid = Vec::new();
             let before = cx.deferred_evals.len();
             let typed = infer_entry(cx, &reached.list[at].0, &mut unlaid, check_undeclared);
             let deferred = cx.deferred_evals.len() > before;
-            let callees = calls(cx, &typed).collect();
-            items.push(WaveItem { pos: start + offset, typed, unlaid, callees, deferred });
+            let asked = cx.asks.count() > asks0;
+            let callees = if !force_commit && asked { Vec::new() } else { calls(cx, &typed).collect() };
+            items.push(WaveItem { pos: start + offset, typed, unlaid, callees, deferred, asked });
         }
     }
 }
 
-fn commit_wave(cx: &Context<'_>, reached: &mut Reached, wave: &[usize], items: Vec<WaveItem>) -> Vec<Instance> {
+fn commit_wave(cx: &Context<'_>, reached: &mut Reached, wave: &[usize], items: Vec<WaveItem>, force_commit: bool) -> (Vec<usize>, Vec<Instance>) {
     let mut slots: Vec<Option<WaveItem>> = (0..wave.len()).map(|_| None).collect();
     for item in items {
         let pos = item.pos;
         slots[pos] = Some(item);
     }
+    let mut settled = Vec::with_capacity(wave.len());
     let mut next = Vec::new();
     for (pos, slot) in slots.into_iter().enumerate() {
         let at = wave[pos];
         match slot {
+            Some(item) if !force_commit && item.asked => {
+                reached.blocked.push(at);
+                reached.list[at].1 = item.typed;
+            }
             Some(item) => {
                 reached.list[at].1 = item.typed;
                 reached.unlaid.extend(item.unlaid);
                 next.extend(item.callees);
+                settled.push(at);
             }
-            None => reached.list[at].1 = Err(format!("{}: sema worker panicked", cx.name(reached.list[at].0.0))),
+            None => {
+                reached.list[at].1 = Err(format!("{}: sema worker panicked", cx.name(reached.list[at].0.0)));
+                settled.push(at);
+            }
         }
     }
-    next
+    (settled, next)
 }
 
 fn infer_entry(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>, check_undeclared: bool) -> Result<Arc<Typed>, String> {
@@ -340,7 +573,7 @@ fn infer_entry(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<Strin
 }
 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
-fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
+pub(super) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
     if let Some(typed) = cx.store.finals.get(instance) {
         register(cx, *instance, &typed);
         return Ok(typed);
@@ -359,10 +592,12 @@ fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String
 
 /// Computes the layout of each ADT, tuple and array type that lowering `typed` reads, so the names those layouts need are asked for while inference can still retry.
 pub(super) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
+    let scoped = typed.scoped(&cx.types);
+    let tables = scoped.ensure_tables(&cx.types);
     let intrinsic_args: Vec<Ty> = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_some()).flat_map(|(_, substs)| cx.types.substs(substs).iter().copied()).collect();
     let locals = typed.locals.iter().map(|local| local.ty);
-    let pats = typed.pats.values().copied();
-    for ty in typed.exprs.iter().copied().chain(locals).chain(pats).chain(intrinsic_args) {
+    let pats = tables.pats.values().copied();
+    for ty in tables.exprs.iter().copied().chain(locals).chain(pats).chain(intrinsic_args) {
         if ty == Ty::NONE {
             continue;
         }

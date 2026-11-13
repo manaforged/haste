@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{AbiParam, CallConv, Signature, Type, Value};
+use haste_codegen::{AbiParam, Arch, ArgumentPurpose, CallConv, Signature, Target, Type, Value};
 use rustc_abi::{BackendRepr, Float, Primitive, Scalar, TargetDataLayout};
 
 use crate::sema::layout::{Layout, target};
@@ -11,6 +11,17 @@ use super::{Lower, Parts, Repr, repr};
 
 /// The machine values that a value of one type travels as in the platform convention, each with its byte offset inside the value.
 type Passed = Vec<(Type, i32)>;
+
+/// The canonical discriminant and optional payload of `purpose` for signature hashing.
+pub(crate) fn purpose_tag(purpose: ArgumentPurpose) -> (u8, Option<u32>) {
+    match purpose {
+        ArgumentPurpose::Normal => (0, None),
+        ArgumentPurpose::StructReturn => (1, None),
+        ArgumentPurpose::StructArgument(n) => (2, Some(n)),
+        ArgumentPurpose::Dict => (3, None),
+        ArgumentPurpose::Variadic => (4, None),
+    }
+}
 
 pub(super) fn scalar_type(dl: &TargetDataLayout, scalar: &Scalar) -> Result<Type> {
     match scalar.primitive() {
@@ -31,11 +42,44 @@ pub(super) fn parts(layout: &Layout) -> Result<Parts> {
     })
 }
 
-/// The parts that a typed copy of a value of `layout` moves: its scalars, or every byte when both scalars are a union's, whose bytes between them may hold data.
+fn word_parts(size: u64) -> Parts {
+    if !(1..=32).contains(&size) {
+        return Parts::Bytes;
+    }
+    let mut words = [(Type::I8, 0); 4];
+    let mut len = 0usize;
+    let mut offset = 0u64;
+    for (ty, width) in [(Type::I64, 8), (Type::I32, 4), (Type::I16, 2), (Type::I8, 1)] {
+        while offset + width <= size {
+            if len == 4 {
+                return Parts::Bytes;
+            }
+            words[len] = (ty, offset as i32);
+            len += 1;
+            offset += width;
+        }
+    }
+    match len {
+        1 => Parts::One(words[0].0),
+        2 => Parts::Pair(words[0].0, words[1].0, words[1].1),
+        _ => Parts::Words(words, len as u8),
+    }
+}
+
+/// The parts that a typed copy of a value of `layout` moves: its scalars, or contiguous word chunks up to 32 bytes when both scalars are a union's or the layout names none.
 pub(super) fn copied_parts(layout: &Layout) -> Parts {
     match &layout.backend_repr {
-        BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => Parts::Bytes,
-        _ => parts(layout).unwrap_or(Parts::Bytes),
+        BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => word_parts(layout.size.bytes()),
+        BackendRepr::SimdVector { .. } => match layout.size.bytes() {
+            8 => Parts::One(Type::I64),
+            16 if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Parts::One(Type::V128),
+            16 => Parts::Pair(Type::I64, Type::I64, 8),
+            _ => Parts::Bytes,
+        },
+        _ => match parts(layout).unwrap_or(Parts::Bytes) {
+            Parts::Bytes => word_parts(layout.size.bytes()),
+            found => found,
+        },
     }
 }
 
@@ -72,7 +116,11 @@ impl Lower<'_, '_> {
             signature.params.extend(parts.iter().map(|&(ty, _)| AbiParam::new(ty)));
         }
         for value in values {
-            signature.params.push(AbiParam::new(self.b.func.ty(value)));
+            let (ty, value) = match self.b.func.ty(value) {
+                Type::F32 => (Type::F64, self.ins().fpromote(Type::F64, value)),
+                ty => (ty, value),
+            };
+            signature.params.push(AbiParam::variadic(ty));
             args.push(value);
         }
         let returned = ret.map(|ret| self.native_parts(ret)).transpose()?.unwrap_or_default();

@@ -289,7 +289,7 @@ impl Infer<'_, '_> {
             try_blocks,
             box_frees,
         };
-        Ok(Typed { tables: Arc::new(tables), locals, params, ret, drops: Vec::new(), shape: Shape::default() })
+        Ok(Typed { tables: super::LazyTables::Eager(Arc::new(tables)), locals, params, ret, drops: Vec::new(), shape: Shape::default() })
     }
 
     fn drain_res_field<K: Copy + Ord + std::hash::Hash>(&mut self, field: fn(&mut InferOut) -> &mut HashMap<K, Res>) -> Result<PackedMap<K, Res>> {

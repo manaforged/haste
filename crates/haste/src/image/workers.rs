@@ -72,7 +72,9 @@ impl Image {
         if work.is_empty() {
             return Vec::new();
         }
-        work.iter().for_each(|&index| self.slot(index).store(0, Ordering::Release));
+        if self.mode == super::ImageMode::Jit {
+            work.iter().for_each(|&index| self.slot(index).store(0, Ordering::Release));
+        }
         let cfg = DictConfig::from_env();
         self.pass.stencils.cfg = cfg;
         let had_templates = !self.pass.stencils.templates.is_empty();
@@ -118,7 +120,9 @@ impl Image {
     /// Clears the slots of a worker that panicked, whose code chunks unmapped as it unwound, and gives each of its functions an error.
     fn lost(&self, cx: &Context<'_>, reached: &Reached, shard: &[Vec<usize>]) -> Vec<(usize, String)> {
         let lost = shard.iter().flatten().map(|&index| {
-            self.slot(index).store(0, Ordering::Release);
+            if self.mode == super::ImageMode::Jit {
+                self.slot(index).store(0, Ordering::Release);
+            }
             (index, format!("{}: compile worker panicked", cx.name(reached.list[index].0.0)))
         });
         lost.collect()
@@ -133,19 +137,17 @@ impl Image {
 
     /// Compiles each bucket of `shard` into a pass of this worker's own; a bucket whose lowering deferred a constant evaluation is handed back to compile after the workers join.
     fn worker_loop(&self, mut cx: Context<'_>, reached: &Reached, shard: &[Vec<usize>], (cfg, allow_singleton): Plan) -> WorkerOutput {
-        let mut pass = Pass::new(reached.list.len());
+        let mut pass = Pass::default();
         pass.stencils.cfg = cfg;
         let (mut errors, mut deferred) = (Vec::new(), Vec::new());
         for bucket in shard {
+            let mark = pass.records.len();
             let failed = self.compile_bucket(&mut cx, reached, bucket, cfg, (false, allow_singleton), &mut pass);
             if cx.take_deferred_evals().is_empty() {
                 errors.extend(failed);
                 continue;
             }
-            for &index in bucket {
-                pass.sizes[index] = 0;
-                pass.times[index] = 0;
-            }
+            pass.records.truncate(mark);
             deferred.extend_from_slice(bucket);
         }
         (pass, errors, deferred)

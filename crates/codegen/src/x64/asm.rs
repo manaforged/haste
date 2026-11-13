@@ -25,16 +25,22 @@ pub(crate) struct Xmm(pub u8);
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Mem {
     pub base: Reg,
+    pub index: Option<(Reg, u8)>,
     pub disp: i32,
 }
 
 impl Mem {
     pub fn new(base: Reg, disp: i32) -> Self {
-        Self { base, disp }
+        Self { base, index: None, disp }
+    }
+
+    pub fn sib(base: Reg, index: Reg, shift: u8, disp: i32) -> Self {
+        debug_assert!(index != Reg::Rsp && shift <= 3);
+        Self { base, index: Some((index, shift)), disp }
     }
 
     pub fn offset(self, by: i32) -> Self {
-        Self { base: self.base, disp: self.disp + by }
+        Self { base: self.base, index: self.index, disp: self.disp + by }
     }
 }
 
@@ -174,6 +180,7 @@ pub(crate) struct Asm {
     pub code: Vec<u8>,
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, Label)>,
+    table_fixups: Vec<(u32, Label, Label)>,
 }
 
 impl Asm {
@@ -181,8 +188,8 @@ impl Asm {
         self.code.len() as u32
     }
 
-    fn rex(&mut self, w: bool, r: u8, b: u8, force: bool) {
-        let rex = 0x40 | (u8::from(w) << 3) | ((r >> 3) << 2) | (b >> 3);
+    fn rex(&mut self, w: bool, r: u8, x: u8, b: u8, force: bool) {
+        let rex = 0x40 | (u8::from(w) << 3) | ((r >> 3 & 1) << 2) | ((x >> 3 & 1) << 1) | (b >> 3 & 1);
         if rex != 0x40 || force {
             self.code.push(rex);
         }
@@ -201,9 +208,17 @@ impl Asm {
         } else {
             2
         };
-        self.code.push(mode << 6 | (r & 7) << 3 | (base & 7));
-        if base & 7 == 4 {
-            self.code.push(0x24);
+        match mem.index {
+            Some((idx, shift)) => {
+                self.code.push(mode << 6 | (r & 7) << 3 | 4);
+                self.code.push((shift & 3) << 6 | ((idx as u8) & 7) << 3 | (base & 7));
+            }
+            None => {
+                self.code.push(mode << 6 | (r & 7) << 3 | (base & 7));
+                if base & 7 == 4 {
+                    self.code.push(0x24);
+                }
+            }
         }
         match mode {
             1 => self.code.push(mem.disp as i8 as u8),
@@ -214,11 +229,11 @@ impl Asm {
 
     pub fn encode(&mut self, prefix: &[u8], w: bool, opcode: &[u8], r: u8, rm: Rm, force: bool) {
         self.code.extend_from_slice(prefix);
-        let b = match rm {
-            Rm::Reg(reg) => reg,
-            Rm::Mem(mem) => mem.base as u8,
+        let (x, b) = match rm {
+            Rm::Reg(reg) => (0, reg),
+            Rm::Mem(mem) => (mem.index.map_or(0, |(idx, _)| idx as u8), mem.base as u8),
         };
-        self.rex(w, r, b, force);
+        self.rex(w, r, x, b, force);
         self.code.extend_from_slice(opcode);
         self.modrm(r, rm);
     }
@@ -286,7 +301,7 @@ impl Asm {
 
     pub fn mov_slot_reloc(&mut self, dst: Reg) -> u32 {
         let reg = dst as u8;
-        self.rex(false, 0, reg, false);
+        self.rex(false, 0, 0, reg, false);
         self.code.push(0xB8 + (reg & 7));
         let at = self.pos();
         self.code.extend(0_u32.to_le_bytes());
@@ -295,7 +310,7 @@ impl Asm {
 
     pub fn mov_abs64(&mut self, dst: Reg) -> u32 {
         let reg = dst as u8;
-        self.rex(true, 0, reg, false);
+        self.rex(true, 0, 0, reg, false);
         self.code.push(0xB8 + (reg & 7));
         let at = self.pos();
         self.code.extend(0_u64.to_le_bytes());
@@ -304,7 +319,7 @@ impl Asm {
 
     pub fn mov_abs64_val(&mut self, dst: Reg, val: u64) {
         let reg = dst as u8;
-        self.rex(true, 0, reg, false);
+        self.rex(true, 0, 0, reg, false);
         self.code.push(0xB8 + (reg & 7));
         self.code.extend(val.to_le_bytes());
     }
@@ -312,14 +327,14 @@ impl Asm {
     pub fn mov_imm(&mut self, dst: Reg, imm: i64) {
         let reg = dst as u8;
         if let Ok(small) = u32::try_from(imm) {
-            self.rex(false, 0, reg, false);
+            self.rex(false, 0, 0, reg, false);
             self.code.push(0xB8 + (reg & 7));
             self.code.extend(small.to_le_bytes());
         } else if let Ok(signed) = i32::try_from(imm) {
             self.encode(&[], true, &[0xC7], 0, dst.into(), false);
             self.code.extend(signed.to_le_bytes());
         } else {
-            self.rex(true, 0, reg, false);
+            self.rex(true, 0, 0, reg, false);
             self.code.push(0xB8 + (reg & 7));
             self.code.extend(imm.to_le_bytes());
         }
@@ -446,7 +461,7 @@ impl Asm {
     }
 
     pub fn bswap(&mut self, size: Size, reg: Reg) {
-        self.rex(size == Size::Q, 0, reg as u8, false);
+        self.rex(size == Size::Q, 0, 0, reg as u8, false);
         self.code.extend([0x0F, 0xC8 + (reg as u8 & 7)]);
     }
 
@@ -487,13 +502,13 @@ impl Asm {
     /// The three-operand VEX form `dst = src op rm` of the scalar SSE operation `opcode`, where `prefix` is 0xF2 for doubles and 0xF3 for singles.
     pub fn vex_scalar(&mut self, prefix: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>) {
         let rm = rm.into();
-        let b = match rm {
-            Rm::Reg(reg) => reg,
-            Rm::Mem(mem) => mem.base as u8,
+        let (x, b) = match rm {
+            Rm::Reg(reg) => (0, reg),
+            Rm::Mem(mem) => (mem.index.map_or(0, |(idx, _)| idx as u8), mem.base as u8),
         };
         let pp = if prefix == 0xF2 { 0b11 } else { 0b10 };
         self.code.push(0xC4);
-        self.code.push((!dst.0 >> 3 & 1) << 7 | 1 << 6 | (!b >> 3 & 1) << 5 | 0b00001);
+        self.code.push((!dst.0 >> 3 & 1) << 7 | (!x >> 3 & 1) << 6 | (!b >> 3 & 1) << 5 | 0b00001);
         self.code.push((!src.0 & 0xF) << 3 | pp);
         self.code.push(opcode);
         self.modrm(dst.0, rm);
@@ -515,7 +530,7 @@ impl Asm {
     }
 
     pub fn push(&mut self, reg: Reg) {
-        self.rex(false, 0, reg as u8, false);
+        self.rex(false, 0, 0, reg as u8, false);
         self.code.push(0x50 + (reg as u8 & 7));
     }
 
@@ -527,6 +542,13 @@ impl Asm {
 
     pub fn call_slot_reloc(&mut self) -> u32 {
         self.code.extend([0xFF, 0x14, 0x25]);
+        let at = self.pos();
+        self.code.extend(0_u32.to_le_bytes());
+        at
+    }
+
+    pub fn call_pcrel32(&mut self) -> u32 {
+        self.code.push(0xE8);
         let at = self.pos();
         self.code.extend(0_u32.to_le_bytes());
         at
@@ -568,10 +590,29 @@ impl Asm {
         self.fixup(label);
     }
 
+    pub fn lea_rip(&mut self, dst: Reg, label: Label) {
+        let reg = dst as u8;
+        self.rex(true, reg, 0, 0, false);
+        self.code.extend([0x8D, 0x05 | ((reg & 7) << 3)]);
+        self.fixup(label);
+    }
+
+    pub fn table_entry(&mut self, base: Label, target: Label) {
+        self.table_fixups.push((self.pos(), base, target));
+        self.code.extend([0; 4]);
+    }
+
     pub fn finish(mut self) -> Result<Vec<u8>, String> {
         for (at, label) in std::mem::take(&mut self.fixups) {
             let target = self.labels[label.0 as usize].ok_or("a jump to a label that was never placed")?;
             let relative = target as i64 - (at as i64 + 4);
+            let at = at as usize;
+            self.code[at..at + 4].copy_from_slice(&(relative as i32).to_le_bytes());
+        }
+        for (at, base, target) in std::mem::take(&mut self.table_fixups) {
+            let base = self.labels[base.0 as usize].ok_or("a jump table without a base label")?;
+            let target = self.labels[target.0 as usize].ok_or("a jump to a label that was never placed")?;
+            let relative = target as i64 - base as i64;
             let at = at as usize;
             self.code[at..at + 4].copy_from_slice(&(relative as i32).to_le_bytes());
         }

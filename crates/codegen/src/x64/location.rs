@@ -1,8 +1,10 @@
-use super::asm::{Mem, Reg, Rm, Size, Xmm};
+use super::asm::{Alu, Mem, Reg, Rm, Shift, Size, Xmm};
 use super::float::scalar;
-use super::{Emit, Ext};
+use super::Emit;
 use crate::alloc::Location;
+use crate::frame::Ext;
 use crate::ir::{Type, Value};
+use crate::live::SibBase;
 use crate::reloc::{RelocKind, StencilReloc};
 
 fn extend(imm: i64, ty: Type, ext: Ext) -> i64 {
@@ -64,8 +66,43 @@ impl Emit<'_> {
         self.address_in(addr, offset, Reg::Rcx)
     }
 
-    /// The memory operand at `addr + offset`, loading `addr` into `scratch` when it is neither in a register nor a frame address.
     pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg) -> Mem {
+        if let Some(mode) = self.plan.sib[addr.index()] {
+            return match mode.base {
+                SibBase::Frame(slot) => {
+                    let disp = self.frame.slots[slot.index()] + mode.disp + offset;
+                    match self.reg_of(mode.index) {
+                        Some(idx) => Mem::sib(Reg::Rbp, idx, mode.shift, disp),
+                        None => {
+                            self.raw(scratch, mode.index);
+                            Mem::sib(Reg::Rbp, scratch, mode.shift, disp)
+                        }
+                    }
+                }
+                SibBase::Value(base) => {
+                    let disp = mode.disp + offset;
+                    match (self.reg_of(base), self.reg_of(mode.index)) {
+                        (Some(b), Some(idx)) => Mem::sib(b, idx, mode.shift, disp),
+                        (Some(b), None) => {
+                            self.raw(scratch, mode.index);
+                            Mem::sib(b, scratch, mode.shift, disp)
+                        }
+                        (None, Some(idx)) => {
+                            self.raw(scratch, base);
+                            Mem::sib(scratch, idx, mode.shift, disp)
+                        }
+                        (None, None) => {
+                            self.raw(scratch, mode.index);
+                            if mode.shift > 0 {
+                                self.asm.shift_imm(Size::Q, Shift::Shl, scratch, mode.shift);
+                            }
+                            self.asm.alu(Alu::Add, scratch, self.at(base));
+                            Mem::new(scratch, disp)
+                        }
+                    }
+                }
+            };
+        }
         if let Some(reg) = self.reg_of(addr) {
             return Mem::new(reg, offset);
         }

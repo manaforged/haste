@@ -123,7 +123,7 @@ impl Lower<'_, '_> {
         }
         let value = self.expr(inner)?;
         let Res::Fn(into, into_substs) = awaited.into_future else { bail!("an `.await` with no `into_future`") };
-        let future = self.invoke(into, into_substs, value.into_iter().collect())?;
+        let future = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::AwaitInto(expr)), into, into_substs, value.into_iter().collect())?;
         let held = repr(self.cx, awaited.future)?;
         let place = self.slot(held).map(|slot| Place::slot(slot, held));
         if let (Some(place), Some(future)) = (place, future) {
@@ -133,7 +133,7 @@ impl Lower<'_, '_> {
         let head = self.b.create_block();
         self.jump(head, &[]);
         self.enter(head);
-        let polled = self.poll_once(&awaited, place)?;
+        let polled = self.poll_once(expr, &awaited, place)?;
         let ready = self.variant_index(awaited.polled, "Ready")?;
         let Some(is_ready) = self.is_variant(polled, awaited.polled, ready)? else { bail!("`Poll` has one variant") };
         let (done, pending) = (self.b.create_block(), self.b.create_block());
@@ -148,7 +148,7 @@ impl Lower<'_, '_> {
         Ok(self.read(output))
     }
 
-    fn poll_once(&mut self, awaited: &Awaited, future: Option<Place>) -> Result<Option<Place>> {
+    fn poll_once(&mut self, expr: ExprId, awaited: &Awaited, future: Option<Place>) -> Result<Option<Place>> {
         let Res::Fn(poll, substs) = awaited.poll else { bail!("an `.await` with no `poll`") };
         let address = match future {
             Some(place) => self.address(place),
@@ -156,7 +156,7 @@ impl Lower<'_, '_> {
         };
         let pin = self.pin_of(address)?;
         let Some(context) = self.locals[self.typed.params[1] as usize].and_then(|place| self.read(place)) else { bail!("a resume function with no task context") };
-        let polled = self.invoke(poll, substs, vec![pin, context])?;
+        let polled = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::AwaitPoll(expr)), poll, substs, vec![pin, context])?;
         let shape = repr(self.cx, awaited.polled)?;
         Ok(match (shape, polled) {
             (Repr::Mem { .. }, Some(address)) => Some(Place { base: Base::Addr(address), offset: 0, repr: shape }),
@@ -214,9 +214,8 @@ impl Lower<'_, '_> {
         let mut last = None;
         for at in 0..2 {
             let local = self.typed.params[at];
-            let (Some(place), Some(value)) = (self.locals[local as usize], params.next()) else { bail!("a resume block with missing arguments") };
-            self.store_passed(local, place, value)?;
-            last = Some(value);
+            let Some(place) = self.locals[local as usize] else { bail!("a resume block with missing arguments") };
+            last = self.store_passed(local, place, &mut params)?;
         }
         last.ok_or_else(|| anyhow::anyhow!("a resume block with no task context"))
     }
@@ -232,7 +231,7 @@ impl Lower<'_, '_> {
         self.enter(unresumed);
         let (inner, offset) = self.captures_of(ty)?;
         let place = Place { base: Base::Addr(target), offset, repr: repr(self.cx, inner)? };
-        self.drop_fields(inner, place)?;
+        self.drop_fields(inner, place, super::reloc::TyOrigin::Subst(0))?;
         self.jump(out, &[]);
         self.enter(check);
         let waiting = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, state, FIRST_SUSPEND);
@@ -240,7 +239,7 @@ impl Lower<'_, '_> {
         self.enter(suspended);
         let pin = self.pin_of(target)?;
         let none = self.ins().iconst(Type::I64, 0);
-        self.invoke(poll, substs, vec![pin, none])?;
+        self.invoke(super::reloc::SiteOrigin::ShapeGlueResume, poll, substs, vec![pin, none])?;
         self.jump(out, &[]);
         self.enter(out);
         Ok(())

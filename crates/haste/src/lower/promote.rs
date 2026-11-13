@@ -67,7 +67,8 @@ impl Lower<'_, '_> {
         let size = self.cx.layout(ty)?.size.bytes() as usize;
         let seq = self.promoted_seq;
         self.promoted_seq += 1;
-        let address = self.emit_symbol(SymbolSource::PromotedCell { owner: self.index, seq, size: (size + 1) as u32 });
+        let cell_size = (size + 1) as u32;
+        let address = self.emit_symbol_with(SymbolSource::PromotedCell { owner: self.index, seq, size: cell_size }, super::reloc::RelocStep::Promoted { seq, size: cell_size });
         let filled = self.ins().load(Type::I8, address, size as i32);
         let (fill, done) = (self.b.create_block(), self.b.create_block());
         self.brif(filled, (done, &[]), (fill, &[]));
@@ -99,7 +100,8 @@ impl Lower<'_, '_> {
             self.enter(fill);
             let usize_ty = self.cx.types.prim(Primitive::Usize);
             let flag = self.ins().iadd_imm(address, i64::from(size));
-            let code = self.code_of(index);
+            let table = self.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index)));
+            let code = self.ins().load(Type::I64, table, 0);
             let once = self.emit_symbol(SymbolSource::Host(HostSymbol::FillOnce));
             self.call_code(once, (vec![usize_ty, usize_ty], None), vec![flag, code])?;
             self.jump(done, &[]);
@@ -260,7 +262,7 @@ impl Lower<'_, '_> {
         }
         match self.literal_reference(item, substs)? {
             Some(value) => Ok(Some(value)),
-            None => self.invoke(item, substs, Vec::new()),
+            None => self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, Vec::new()),
         }
     }
 
@@ -275,6 +277,7 @@ impl Lower<'_, '_> {
 
     fn literal_constant(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         let Some((source, typed)) = self.literal_source(item, substs)? else { return Ok(None) };
+        let typed = typed.scoped(&self.cx.types);
         let ty = typed.ret_ty();
         let body = self.cx.body(source)?;
         let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
@@ -298,6 +301,7 @@ impl Lower<'_, '_> {
     /// The value of the constant `item` at `substs`, a shared reference whose body is `&` of a value made of literals: the address of those bytes laid out once, with the length of the array it points to when the reference is to a slice.
     fn literal_reference(&mut self, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         let Some((source, typed)) = self.literal_source(item, substs)? else { return Ok(None) };
+        let typed = typed.scoped(&self.cx.types);
         let ty = typed.ret_ty();
         let Kind::Ref(Mut::Not, pointee) = *self.cx.types.kind(ty) else { return Ok(None) };
         let body = self.cx.body(source)?;

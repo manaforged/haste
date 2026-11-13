@@ -246,6 +246,19 @@ fn entry(func: &mut Function, spec: &Coroutine, (old_entry, anchor): (Block, Sta
     b.switch_to_block(dispatch);
     let fp = b.ins().load(Type::I64, object, spec.header.1);
     b.ins().stack_store(fp, anchor, 0);
+    if spec.resumes.len() >= 2 {
+        let idx = b.ins().iadd_imm(state, -FIRST_SUSPEND);
+        let trap = b.create_block();
+        let fwds: Vec<Block> = spec.resumes.iter().map(|_| b.create_block()).collect();
+        b.ins().br_table(idx, trap, &fwds);
+        for (&fwd, &resume) in fwds.iter().zip(&spec.resumes) {
+            b.switch_to_block(fwd);
+            b.ins().jump(resume, &params);
+        }
+        b.switch_to_block(trap);
+        b.ins().trap();
+        return;
+    }
     for (index, &resume) in spec.resumes.iter().enumerate() {
         let next = b.create_block();
         let here = b.ins().icmp_imm(IntCC::Equal, state, FIRST_SUSPEND + index as i64);

@@ -10,7 +10,7 @@ use crate::names::ItemRef;
 use crate::outline::{self, edit::Edit, tree::Profile};
 use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
 use crate::sema::{self, Cache, Edited};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cli::{Failures, case_items, error_kind, print_failures};
@@ -86,25 +86,105 @@ fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<I
 }
 
 fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reached): (&mut sema::Context<'_>, &Reached), fresh: &[usize]) {
-    fresh.iter().for_each(|at| drop(broken.remove(at)));
-    broken.extend(image.compile(cx, reached, fresh));
+    let mut expanded = fresh.to_vec();
+    if crate::profile() == outline::tree::Profile::Release && !fresh.is_empty() && fresh.len() < reached.list.len() {
+        let mut dirty = vec![false; reached.list.len()];
+        for &at in fresh {
+            dirty[at] = true;
+        }
+        for _ in 0..3 {
+            let added: Vec<usize> = (0..reached.list.len())
+                .filter(|&u| !dirty[u] && reached.direct_calls(u).is_some_and(|callees| callees.iter().any(|&c| dirty[c])))
+                .collect();
+            if added.is_empty() {
+                break;
+            }
+            for u in added {
+                dirty[u] = true;
+                expanded.push(u);
+            }
+        }
+    }
+    expanded.iter().for_each(|at| drop(broken.remove(at)));
+    broken.extend(image.compile(cx, reached, &expanded));
 }
 
 impl Batch {
     /// Infers and compiles every root `pick` finds in `workspace` from nothing.
-    fn new(workspace: &graph::Workspace, compilation: &mut Compilation, pick: Pick) -> Result<Batch> {
+    fn new(workspace: &graph::Workspace, compilation: &mut Compilation, pick: Pick, mode: crate::image::ImageMode, drop_finals: bool) -> Result<Batch> {
         let reach_clock = sema::census::Clock::now();
-        let (cases, roots) = batch_roots(workspace, &compilation.outline, pick);
-        crate::macros::reach_resolved(
+        let main = if mode == crate::image::ImageMode::Aot { Some(main_item(workspace, &compilation.outline).context("no member binary has a `main`")?) } else { None };
+        let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, pick) };
+        let mut cache = Cache::default();
+        let substrate_key = crate::substrate::enabled().then(|| {
+            let target = crate::host_target();
+            (crate::substrate::toolchain_key(workspace, &target), crate::substrate::target_hash(&target))
+        });
+        let existing_sub = if let Some((key, target_key)) = substrate_key {
+            match crate::substrate::Substrate::open_toolchain(key) {
+                Ok(sub) if sub.toolchain_hash() == key && sub.target_hash() == target_key => {
+                    let sub = std::sync::Arc::new(sub);
+                    cache.set_substrate(Some(std::sync::Arc::clone(&sub)));
+                    Some(sub)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        crate::macros::reach_resolved_with_cache(
             compilation,
-            |_| roots.clone(),
+            cache,
+            |cx| match main {
+                Some(main) => sema::reach::main_roots(cx, main).map_or_else(|_| vec![(main, sema::substs::Substs::EMPTY)], Into::into),
+                None => root_insts.clone(),
+            },
             |mut cx, reached| {
                 let reach_span = reach_clock.elapsed();
                 let codegen_clock = sema::census::Clock::now();
-                let (image, broken) = Image::build(&mut cx, &reached)?;
+                let mut pre_builder = if drop_finals && cx.store().has_new_sysroot_summaries() {
+                    substrate_key.map(|(key, target_key)| crate::substrate::Substrate::builder().toolchain_hash(key).target_hash(target_key))
+                } else {
+                    None
+                };
+                if let Some(builder) = &mut pre_builder
+                    && let Err(error) = cx.store().export_sysroot_summaries(cx.outline, builder)
+                {
+                    eprintln!("haste: cannot export sysroot summaries: {error:#}");
+                    pre_builder = None;
+                }
+                if drop_finals {
+                    cx.compact_for_oneshot_codegen();
+                }
+                let (image, broken) = Image::build(&mut cx, &reached, mode)?;
                 let codegen_span = codegen_clock.elapsed();
+                if let Some((key, target_key)) = substrate_key
+                    && (image.has_new_frozen_stencils() || pre_builder.is_some())
+                {
+                    let mut builder = pre_builder.unwrap_or_else(|| crate::substrate::Substrate::builder().toolchain_hash(key).target_hash(target_key));
+                    let save_res = (|| -> Result<()> {
+                        if let Some(ex) = &existing_sub {
+                            builder.merge_from(ex)?;
+                        }
+                        if !drop_finals {
+                            cx.store().export_sysroot_summaries(cx.outline, &mut builder)?;
+                        }
+                        image.export_sysroot_stencils(&mut builder)?;
+                        let sub = builder.build()?;
+                        if sub.summary_count() > 0 || sub.stencil_count() > 0 {
+                            sub.save_toolchain()?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = save_res {
+                        eprintln!("haste: cannot save toolchain substrate: {error:#}");
+                    }
+                }
                 let labels = cases.iter().map(|item| cx.name(*item).to_owned()).collect();
-                let roots = roots.iter().map(|root| reached.index[root]).collect();
+                let roots = match main {
+                    Some(main) => sema::reach::main_roots(&mut cx, main)?.into_iter().map(|inst| reached.index[&inst]).collect(),
+                    None => root_insts.iter().map(|root| reached.index[root]).collect(),
+                };
                 Ok(Batch { pick, store: Some(cx.release().0), labels, roots, reached, image, broken, reach_span, codegen_span })
             },
         )
@@ -198,7 +278,7 @@ impl Build {
     /// Loads every crate of `workspace`, resolves its names and expands its macros, inferring and compiling nothing yet.
     pub fn load(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
         let outline_clock = sema::census::Clock::now();
-        let compilation = crate::macros::load_eager(workspace, targets, &[])?;
+        let compilation = crate::macros::load_lazy(workspace, targets)?;
         let stamps = stamps(workspace, &compilation.outline);
         let outline_span = outline_clock.elapsed();
         Ok(Build { compilation, cases: None, binary: None, program: None, stamps, outline_span })
@@ -207,18 +287,42 @@ impl Build {
     /// Infers and compiles the `case_` functions unless that is done.
     pub fn compile_cases(&mut self, workspace: &graph::Workspace) -> Result<()> {
         if self.cases.is_none() {
-            self.cases = Some(Batch::new(workspace, &mut self.compilation, case_items)?);
+            let members: Vec<usize> = self.compilation.outline.members(workspace).collect();
+            let mut loaded_more = false;
+            for member in members {
+                if self.compilation.outline.crates[member].partial() {
+                    self.compilation.outline.load_crate(member)?;
+                    loaded_more = true;
+                }
+            }
+            if loaded_more {
+                crate::macros::resolve(&mut self.compilation)?;
+                let errors = self.compilation.outline.local_errors(workspace);
+                if !errors.is_empty() {
+                    anyhow::bail!("{}", errors.join("\n"));
+                }
+            }
+            self.cases = Some(Batch::new(workspace, &mut self.compilation, case_items, crate::image::ImageMode::Jit, false)?);
         }
         Ok(())
     }
 
     /// Infers and compiles every function the binary's `main` reaches unless that is done.
     pub fn compile_binary(&mut self, workspace: &graph::Workspace) -> Result<()> {
+        self.compile_binary_with(workspace, false)
+    }
+
+    /// Infers and check-compiles `main` for one-shot `haste build`, dropping `Store.finals` before codegen.
+    pub fn compile_binary_oneshot(&mut self, workspace: &graph::Workspace) -> Result<()> {
+        self.compile_binary_with(workspace, true)
+    }
+
+    fn compile_binary_with(&mut self, workspace: &graph::Workspace, drop_finals: bool) -> Result<()> {
         if main_item(workspace, &self.compilation.outline).is_none() {
             bail!("no member binary has a `main`");
         }
         if self.binary.is_none() {
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items)?);
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, crate::image::ImageMode::Check, drop_finals)?);
         }
         Ok(())
     }
@@ -306,6 +410,28 @@ impl Build {
             self.compile_binary(workspace)?;
         }
         Ok(())
+    }
+
+    /// Compiles `main` and `std::rt::lang_start` into an AOT `Image` and writes a standalone executable to `path`.
+    pub(crate) fn emit_executable(&mut self, workspace: &graph::Workspace, path: &std::path::Path) -> Result<i32> {
+        let started = Instant::now();
+        if self.binary.is_none() {
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, crate::image::ImageMode::Aot, false)?);
+        }
+        let bin = self.binary.as_ref().context("the binary is not compiled")?;
+        if bin.broken.contains_key(&bin.roots[0]) || bin.broken.contains_key(&bin.roots[1]) {
+            for (idx, err) in &bin.broken {
+                eprintln!("broken [{idx}]: {err}");
+            }
+            bail!("entry point failed to compile");
+        }
+        if !bin.broken.is_empty() {
+            eprintln!("warning: {} functions did not compile (replaced by abort stubs)", bin.broken.len());
+        }
+        let target = crate::host_target();
+        bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]))?.write(path)?;
+        eprintln!("built {} ({} functions reached, {:.1} ms)", path.display(), bin.reached.list.len(), started.elapsed().as_secs_f64() * 1e3);
+        Ok(0)
     }
 
     /// Runs every case whose functions all compiled and prints what failed and how long building took.

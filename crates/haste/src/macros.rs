@@ -13,7 +13,7 @@ use crate::outline::attr::{self, split_commas};
 use crate::outline::item::{Attr, ItemKind, ProcKind};
 use crate::outline::source::Source;
 use crate::outline::tree::PROC_MACRO_ROOT;
-use crate::sema::reach::{Instance, Reached, reach};
+use crate::sema::reach::{Instance, Reached, reach_wave};
 use crate::sema::{Answer, Cache, Context};
 
 const ENTRIES: [&str; 2] = ["__haste_expand1", "__haste_expand2"];
@@ -55,30 +55,44 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
 /// Loads the member crates' roots, resolves their names and expands their procedural macro calls, reading of other crates only what those lookups reach, then drops the macro expander.
 pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<Compilation> {
     let mut outline = crate::outline::new(workspace, targets, &[]);
-    let members: Vec<usize> = outline.members(workspace).collect();
-    for &krate in &members {
-        outline.load(krate, 0)?;
-    }
+    let selected: Vec<bool> = (0..outline.crates.len())
+        .map(|krate| outline.package(workspace, krate).sysroot || workspace.graph.members.contains(&workspace.graph.units[outline.roots[krate].unit].package))
+        .collect();
+    outline.load_selected(&selected)?;
     let mut compilation = Compilation::new(workspace, outline);
-    members.iter().for_each(|krate| compilation.names.crates[*krate].eager = true);
+    for (krate, &on) in selected.iter().enumerate() {
+        if on {
+            compilation.names.crates[krate].eager = true;
+        }
+    }
     resolve(&mut compilation)?;
+    let errors = compilation.outline.local_errors(workspace);
+    if !errors.is_empty() {
+        anyhow::bail!("{}", errors.join("\n"));
+    }
     crate::host::native::load(&compilation.outline)?;
     Ok(compilation)
 }
 
 /// Reaches from the instances `roots` gives, answering what each pass asks for until a pass settles or nothing new can load, then hands that pass's context and what it reached to `finish`.
 pub fn reach_resolved<R>(compilation: &mut Compilation, roots: impl Fn(&mut Context<'_>) -> Vec<Instance>, finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
-    reach_with(compilation, (roots, load), finish)
+    reach_with(compilation, Cache::default(), (roots, load), finish)
+}
+
+/// Reaches from `roots` using an existing `cache`, answering what each pass asks for until a pass settles or nothing new can load.
+pub fn reach_resolved_with_cache<R>(compilation: &mut Compilation, cache: Cache, roots: impl Fn(&mut Context<'_>) -> Vec<Instance>, finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
+    reach_with(compilation, cache, (roots, load), finish)
 }
 
 /// Reaches from `roots` as `reach_resolved` does, answering each pass's asks with `ask`, which says whether anything new loaded.
-fn reach_with<R>(compilation: &mut Compilation, (roots, ask): (impl Fn(&mut Context<'_>) -> Vec<Instance>, impl Fn(&mut Compilation, Requests) -> Result<Answer>), finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
+fn reach_with<R>(compilation: &mut Compilation, cache: Cache, (roots, ask): (impl Fn(&mut Context<'_>) -> Vec<Instance>, impl Fn(&mut Compilation, Requests) -> Result<Answer>), finish: impl FnOnce(Context<'_>, Reached) -> Result<R>) -> Result<R> {
     let mut finish = Some(finish);
-    resolve_sema(compilation, (Cache::default(), ask), |mut cx, last| {
+    let mut reached = Reached::default();
+    resolve_sema(compilation, (cache, ask), |mut cx, last| {
         let from = roots(&mut cx);
-        let reached = reach(&mut cx, &from);
+        reach_wave(&mut cx, &mut reached, &from, last);
         match finish.take_if(|_| last || cx.resolved()) {
-            Some(finish) => finish(cx, reached).map(Ok),
+            Some(finish) => finish(cx, std::mem::take(&mut reached)).map(Ok),
             None => Ok(Err(cx.release())),
         }
     })
@@ -95,7 +109,7 @@ pub fn resolve_sema<R>(compilation: &mut Compilation, asking: (Cache, impl Fn(&m
 pub fn answer(compilation: &mut Compilation, ask: impl Fn(&mut Compilation, Requests) -> Result<Answer>, (mut kept, asks): (Cache, Requests)) -> (Cache, Result<Answer>) {
     let answer = ask(compilation, asks);
     if let Ok(answer) = &answer {
-        kept.forget_after(*answer);
+        kept.forget_after(&compilation.outline, *answer);
     }
     (kept, answer)
 }

@@ -164,6 +164,8 @@ fn empty_base() -> BaseRecord {
 fn analyze_base(cx: &mut Context<'_>, reached: &Reached, index: usize, inlined: bool, facts: &mut TraitFacts) -> BaseRecord {
     let ((item, substs), result) = &reached.list[index];
     let Ok(typed) = result else { return empty_base() };
+    let typed = typed.scoped(&cx.types);
+    let typed: &Typed = &typed;
     let generic = !substs.is_empty();
     if cx.foreign(*item) {
         let (mut k, mut d) = (Mix::new(1), Mix::new(2));
@@ -317,12 +319,17 @@ fn hash_header(cx: &mut Context<'_>, item: ItemRef, typed: &Typed, bins: &mut Ha
     for &param in &typed.params {
         let ty = typed.locals[param as usize].ty;
         hash_type_use(cx, ty, bins);
-        bins.k.byte(lower::unwrapped(cx, ty).ok().flatten().map_or(255, |m| m as u8));
+        bins.k.byte(lower::passed_parts(cx, ty).ok().flatten().map_or(0, |parts| match parts {
+            lower::Parts::One(_) => 1,
+            lower::Parts::Pair(..) => 2,
+            lower::Parts::Bytes => 3,
+            lower::Parts::Words(_, len) => 3 + len,
+        }));
     }
     if let Some(ret) = typed.ret {
         hash_type_use(cx, ret, bins);
         bins.k.flag(matches!(cx.types.kind(ret), Kind::Never));
-        bins.k.flag(lower::returned(cx, ret).ok().flatten().is_some());
+        bins.k.flag(lower::passed_parts(cx, ret).ok().flatten().is_some());
     }
     hash_shape_kind(cx, typed, bins);
 }
@@ -387,7 +394,8 @@ pub(super) fn hash_closure_env_offsets(cx: &mut Context<'_>, raw_ty: Ty, bins: &
     while let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *cx.types.kind(ty) {
         ty = inner;
     }
-    hash_all_field_offsets(cx, cx.closure_env(ty).unwrap_or(ty), bins);
+    let env = cx.ensure_closure(ty).map_or(ty, |info| info.env);
+    hash_all_field_offsets(cx, env, bins);
 }
 
 fn hash_locals_and_pats(cx: &mut Context<'_>, typed: &Typed, bins: &mut HashBins) {

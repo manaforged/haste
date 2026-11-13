@@ -1,10 +1,12 @@
 //! One process image: a call table with one entry per reached function, the code it points at, and constant data.
 
+mod aot;
 mod expand;
 mod lazy;
 pub mod perf;
 mod script;
 mod stencil;
+mod stencil_jit;
 mod stub;
 mod workers;
 
@@ -21,6 +23,7 @@ use rustc_hash::FxHashMap as HashMap;
 use anyhow::{Result, bail};
 use haste_codegen::{Arena, Memory};
 
+use crate::host::HostSymbol;
 use crate::lower::{self, Slots, Word};
 use crate::sema::Context;
 use crate::sema::reach::{Instance, Reached};
@@ -31,12 +34,22 @@ const STATE_BYTES: usize = 1 << 30;
 const CODE_BYTES: usize = 1 << 30;
 const TABLE_SLOTS: usize = 1 << 22;
 
+/// How `Image::build` emits code: live JIT pages, AOT object relocations, or check-only verification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ImageMode {
+    Jit,
+    Aot,
+    Check,
+}
+
 /// The call table, code memory and data of the running program, in memory shared with children forked from this process, and the cells the program writes, in memory each run holds its own copy of.
 pub struct Image {
     table: usize,
     _low: Arena,
     capacity: usize,
     pass: Pass,
+    sizes: Vec<u32>,
+    times: Vec<u64>,
     stubs: Memory,
     shared: Mutex<Arena>,
     state: Mutex<Arena>,
@@ -52,43 +65,56 @@ pub struct Image {
     thread_slots: Mutex<HashMap<usize, u64>>,
     wanted: Mutex<Vec<Instance>>,
     bodies: lower::Bodies,
+    mode: ImageMode,
     jit_mode: bool,
+    aot: Option<Mutex<aot::AotState>>,
 }
 
-/// What one compile pass writes: its code memory, its stencil cache, and the code size and compile time of each reached function.
+/// What one compile pass writes: its code memory, its stencil cache, and sparse `(index, size, ns)` records.
 #[derive(Default)]
 pub(super) struct Pass {
     memory: Memory,
     stencils: stencil::StencilState,
-    sizes: Vec<u32>,
-    times: Vec<u64>,
+    records: Vec<(usize, u32, u64)>,
+    frozen_stencils: Vec<(u64, u128, std::sync::Arc<haste_codegen::Code>)>,
 }
 
 impl Pass {
-    fn new(len: usize) -> Pass {
-        Pass { sizes: vec![0; len], times: vec![0; len], ..Pass::default() }
-    }
-
     /// Adds `size` code bytes and `ns` nanoseconds of compile time to reached function `index`.
     pub(super) fn record_size(&mut self, index: usize, size: u32, ns: u64) {
-        if index >= self.sizes.len() {
-            self.sizes.resize(index + 1, 0);
-            self.times.resize(index + 1, 0);
+        if size > 0 || ns > 0 {
+            self.records.push((index, size, ns));
         }
-        self.sizes[index] = self.sizes[index].saturating_add(size);
-        self.times[index] = self.times[index].saturating_add(ns);
     }
 
-    /// Moves the code chunks, sizes and times of a worker's pass into this one; the worker's stencil cache is dropped.
+    /// Moves the code chunks and sparse compile records of a worker's pass into this one; the worker's stencil cache is dropped.
     fn merge(&mut self, other: Pass) {
         self.memory.merge(other.memory);
-        let recorded = other.sizes.iter().zip(&other.times).enumerate().filter(|(_, (size, ns))| **size > 0 || **ns > 0);
-        recorded.for_each(|(index, (&size, &ns))| self.record_size(index, size, ns));
+        self.records.extend(other.records);
+        self.frozen_stencils.extend(other.frozen_stencils);
+    }
+}
+
+impl Image {
+    /// Returns whether this image compiled any new sysroot stencils not yet in a substrate.
+    pub(crate) fn has_new_frozen_stencils(&self) -> bool {
+        !self.pass.frozen_stencils.is_empty()
+    }
+
+    /// Appends all newly compiled sysroot `Effort::Full` stencils from this image into `builder`.
+    pub(crate) fn export_sysroot_stencils(&self, builder: &mut crate::substrate::SubstrateBuilder) -> Result<()> {
+        for (item_key, fp, code) in &self.pass.frozen_stencils {
+            builder.add_code_stencil(*item_key, *fp, code)?;
+        }
+        Ok(())
     }
 }
 
 impl Slots for Image {
     fn entry(&self, index: usize) -> i64 {
+        if self.mode != ImageMode::Jit {
+            return (self.table + index * size_of::<AtomicUsize>()) as i64;
+        }
         self.slot(index) as *const AtomicUsize as i64
     }
 
@@ -106,17 +132,20 @@ impl Slots for Image {
         }
         let value = |word: &Word| match *word {
             Word::Int(value) => value,
-            Word::Code(index) => self.slot(index).load(Ordering::Acquire) as u64,
+            Word::Code(index) if self.mode == ImageMode::Jit => self.slot(index).load(Ordering::Acquire) as u64,
+            Word::Code(_) => 0,
         };
         let bytes: Vec<u8> = words.iter().flat_map(|word| value(word).to_le_bytes()).collect();
         let address = self.data(&bytes);
-        let mut fixups = lock(&self.fixups);
-        for (at, word) in words.iter().enumerate() {
-            if let Word::Code(index) = *word {
-                let at = address as usize + at * 8;
-                fixups.entry(index).or_default().push(at);
-                self.registered.fetch_add(1, Ordering::SeqCst);
-                patch(&[at], self.slot(index).load(Ordering::SeqCst));
+        if self.mode == ImageMode::Jit {
+            let mut fixups = lock(&self.fixups);
+            for (at, word) in words.iter().enumerate() {
+                if let Word::Code(index) = *word {
+                    let at = address as usize + at * 8;
+                    fixups.entry(index).or_default().push(at);
+                    self.registered.fetch_add(1, Ordering::SeqCst);
+                    patch(&[at], self.slot(index).load(Ordering::SeqCst));
+                }
             }
         }
         tables.insert(words.to_vec(), address);
@@ -141,6 +170,10 @@ impl Slots for Image {
         &self.bodies
     }
 
+    fn allow_inline(&self) -> bool {
+        !self.jit_mode || crate::profile() == crate::outline::tree::Profile::Release
+    }
+
     fn cell(&self, index: usize, size: u32) -> i64 {
         let mut cells = lock(&self.cells);
         if let Some(&address) = cells.get(&index) {
@@ -148,11 +181,14 @@ impl Slots for Image {
         }
         let address = self.zeroed(size as usize + 1);
         cells.insert(index, address);
+        if let Some(aot) = &self.aot {
+            lock(aot).statics.entry(index).or_insert(aot::AotStatic::Local(size));
+        }
         address
     }
 
     fn low_entries(&self) -> bool {
-        self._low.is_low()
+        cfg!(target_arch = "aarch64") || self._low.is_low()
     }
 
     fn rodata(&self, bytes: &[u8], relocs: &[lower::RodataReloc]) -> lower::RodataId {
@@ -168,10 +204,14 @@ impl Slots for Image {
     }
 }
 
-fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, String> {
+fn resolve_host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<(HostSymbol, usize), String> {
     let name = cx.symbol_name(item);
-    let resolved = name.as_deref().and_then(crate::host::HostSymbol::resolve).and_then(|sym| sym.host_addr());
+    let resolved = name.as_deref().and_then(HostSymbol::resolve).and_then(|sym| sym.host_addr().map(|addr| (sym, addr)));
     resolved.ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
+}
+
+fn host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<usize, String> {
+    resolve_host_symbol(cx, item).map(|(_, addr)| addr)
 }
 
 /// Whether the foreign item `item` links weakly, so a missing symbol reads as null.
@@ -182,16 +222,26 @@ fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {
 impl Image {
     /// An image with one table entry per reached function and no code yet.
     pub fn new(reached: &Reached) -> Result<Image> {
-        let shared = Arena::shared(SHARED_BYTES)?;
-        let capacity = reached.list.len().max(TABLE_SLOTS);
+        Self::create(reached, ImageMode::Jit, (SHARED_BYTES, STATE_BYTES, TABLE_SLOTS))
+    }
+
+    fn create(reached: &Reached, mode: ImageMode, (shared_bytes, state_bytes, table_slots): (usize, usize, usize)) -> Result<Image> {
+        let (shared_bytes, state_bytes, capacity) = if mode == ImageMode::Jit {
+            (shared_bytes, state_bytes, reached.list.len().max(table_slots))
+        } else {
+            (64 << 20, 64 << 20, 1)
+        };
+        let shared = Arena::shared(shared_bytes)?;
         let mut low = Arena::low(capacity * size_of::<AtomicUsize>())?;
         let table = low.alloc(capacity * size_of::<AtomicUsize>())?;
-        let state = Arena::private(STATE_BYTES)?;
+        let state = Arena::private(state_bytes)?;
         Ok(Image {
             table,
             _low: low,
             capacity,
-            pass: Pass::new(reached.list.len()),
+            pass: Pass::default(),
+            sizes: vec![0; reached.list.len()],
+            times: vec![0; reached.list.len()],
             stubs: Memory::default(),
             shared: Mutex::new(shared),
             state: Mutex::new(state),
@@ -207,18 +257,31 @@ impl Image {
             thread_slots: Mutex::default(),
             wanted: Mutex::default(),
             bodies: lower::Bodies::default(),
+            mode,
             jit_mode: false,
+            aot: (mode == ImageMode::Aot).then(|| aot::AotState::new(reached.list.len())),
         })
     }
 
     /// The encoded machine-code byte length of each reached function, or zero when not compiled.
     pub fn code_sizes(&self) -> &[u32] {
-        &self.pass.sizes
+        &self.sizes
     }
 
     /// The lowering and encoding wall time in nanoseconds of each reached function, or zero when not compiled.
     pub fn compile_times(&self) -> &[u64] {
-        &self.pass.times
+        &self.times
+    }
+
+    fn apply_records(&mut self) {
+        for (index, size, ns) in self.pass.records.drain(..) {
+            if index >= self.sizes.len() {
+                self.sizes.resize(index + 1, 0);
+                self.times.resize(index + 1, 0);
+            }
+            self.sizes[index] = self.sizes[index].saturating_add(size);
+            self.times[index] = self.times[index].saturating_add(ns);
+        }
     }
 
     pub(super) fn take_wanted(&self) -> Vec<Instance> {
@@ -246,19 +309,23 @@ impl Image {
         unsafe { &*(self.table as *const AtomicUsize).add(index) }
     }
 
-    /// An image of every function in `reached`, compiled, with why each one that did not compile failed.
-    pub fn build(cx: &mut Context<'_>, reached: &Reached) -> Result<(Image, HashMap<usize, String>)> {
-        let mut image = Image::new(reached)?;
+    /// An image of every function in `reached`, compiled under `mode`, with why each one that did not compile failed.
+    pub(crate) fn build(cx: &mut Context<'_>, reached: &Reached, mode: ImageMode) -> Result<(Image, HashMap<usize, String>)> {
+        let mut image = Self::create(reached, mode, (SHARED_BYTES, STATE_BYTES, reached.list.len().max(1)))?;
         let all: Vec<usize> = (0..reached.list.len()).collect();
         let broken = image.compile(cx, reached, &all).into_iter().collect();
+        image.bodies = lower::Bodies::default();
         Ok((image, broken))
     }
 
     /// Lowers and encodes the reached functions `indices` that type-checked, on every core when there are many, links them, and returns the errors of those that did not compile, by index.
     pub fn compile(&mut self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize]) -> Vec<(usize, String)> {
-        if self.pass.sizes.len() < reached.list.len() {
-            self.pass.sizes.resize(reached.list.len(), 0);
-            self.pass.times.resize(reached.list.len(), 0);
+        if self.sizes.len() < reached.list.len() {
+            self.sizes.resize(reached.list.len(), 0);
+            self.times.resize(reached.list.len(), 0);
+        }
+        if let Some(aot) = &self.aot {
+            lock(aot).ensure_len(reached.list.len());
         }
         if !indices.is_empty() && indices.len() < reached.list.len() {
             self.reset_caches();
@@ -275,8 +342,15 @@ impl Image {
                 work.push(index);
                 continue;
             }
-            match host_symbol(cx, item) {
-                Ok(address) if !lower::is_static(cx, item) => self.slot(index).store(address, Ordering::Release),
+            match resolve_host_symbol(cx, item) {
+                Ok((sym, address)) if !lower::is_static(cx, item) => {
+                    if self.mode == ImageMode::Jit {
+                        self.slot(index).store(address, Ordering::Release);
+                    }
+                    if let Some(aot) = &self.aot {
+                        lock(aot).foreign_fns.insert(index, sym);
+                    }
+                }
                 Ok(_) => {}
                 Err(_) if lower::is_static(cx, item) && weak(cx, item) => {}
                 Err(error) => errors.push((index, error)),
@@ -284,6 +358,7 @@ impl Image {
         }
         self.place_statics(cx, reached, &work);
         errors.extend(self.compile_all(cx, reached, &work));
+        self.apply_records();
         self.link();
         errors
     }
@@ -293,16 +368,25 @@ impl Image {
             if typed.is_err() || !cx.foreign(*item) || !lower::is_static(cx, *item) {
                 continue;
             }
-            let cell = match (host_symbol(cx, *item), weak(cx, *item)) {
-                (found, true) => self.data(&found.unwrap_or(0).to_le_bytes()),
-                (Ok(address), false) => address as i64,
+            let resolved = resolve_host_symbol(cx, *item);
+            let is_weak = weak(cx, *item);
+            let (cell, host) = match (resolved, is_weak) {
+                (Ok((host, address)), true) => (self.data(&address.to_le_bytes()), Some(host)),
+                (Err(_), true) => (self.data(&0_usize.to_le_bytes()), None),
+                (Ok((host, address)), false) => (address as i64, Some(host)),
                 (Err(_), false) => continue,
             };
             lock(&self.cells).insert(index, cell);
+            if let Some(aot) = &self.aot {
+                lock(aot).statics.insert(index, aot::AotStatic::Foreign { weak: is_weak, host });
+            }
         }
     }
 
     fn link(&self) {
+        if self.mode != ImageMode::Jit {
+            return;
+        }
         for (&index, addresses) in lock(&self.fixups).iter() {
             patch(addresses, self.slot(index).load(Ordering::Acquire));
         }
@@ -310,6 +394,9 @@ impl Image {
 
     /// Points slot `index` at `code` and rewrites every constant table word that names it, so neither a call through the slot nor one through a table reaches its stub again.
     fn publish(&self, index: usize, code: usize) {
+        if self.mode != ImageMode::Jit {
+            return;
+        }
         self.slot(index).store(code, Ordering::SeqCst);
         if self.registered.load(Ordering::SeqCst) == 0 {
             return;

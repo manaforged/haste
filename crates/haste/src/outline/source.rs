@@ -596,7 +596,10 @@ impl Source {
         }
         let ((first, start), (last, end)) = (self.layer(from), self.layer(to - 1));
         if std::ptr::eq(first, last) {
-            let span = &first.text[first.tokens[start].start as usize..last.tokens[end].end() as usize];
+            let (Some(first_tok), Some(last_tok)) = (first.tokens.get(start), last.tokens.get(end)) else {
+                return false;
+            };
+            let span = &first.text[first_tok.start as usize..last_tok.end() as usize];
             if !span.contains(word) {
                 return false;
             }
@@ -607,7 +610,9 @@ impl Source {
     /// The text of token `at`.
     pub fn text(&self, at: u32) -> &str {
         let (src, local) = self.layer(at);
-        let token = src.tokens[local];
+        let Some(&token) = src.tokens.get(local) else {
+            return "";
+        };
         &src.text[token.start as usize..token.end() as usize]
     }
 
@@ -615,7 +620,9 @@ impl Source {
     pub fn span(&self, from: u32, to: u32) -> &str {
         let (src, first) = self.layer(from);
         let last = if src.offset == self.offset { (to - self.offset) as usize } else { (to.min(self.offset - 1)) as usize };
-        let (first, last) = (src.tokens[first], src.tokens[last]);
+        let (Some(&first), Some(&last)) = (src.tokens.get(first), src.tokens.get(last)) else {
+            return "";
+        };
         &src.text[first.start as usize..last.end() as usize]
     }
 
@@ -663,7 +670,7 @@ impl Source {
 
     pub fn joint(&self, at: u32) -> bool {
         let (src, local) = self.layer(at);
-        src.tokens[local].joint()
+        src.tokens.get(local).is_some_and(|token| token.joint())
     }
 
     /// The crate that the `$crate` starting at token `at` names, when a macro wrote it.

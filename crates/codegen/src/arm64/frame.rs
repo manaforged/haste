@@ -1,6 +1,6 @@
 use super::asm::Reg;
 use crate::frame::{returns, round};
-use crate::ir::{ArgumentPurpose, Signature, Type};
+use crate::ir::{ArgumentPurpose, CallConv, Signature, Type};
 
 const INT_ARGS: [Reg; 8] = [Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7)];
 const FLOAT_ARGS: u8 = 8;
@@ -11,6 +11,7 @@ const INDIRECT: Reg = Reg(8);
 
 /// The registers every function keeps for its caller besides the frame pointer and the link register.
 pub(super) const SAVED: [Reg; 10] = [Reg(19), Reg(20), Reg(21), Reg(22), Reg(23), Reg(24), Reg(25), Reg(26), Reg(27), Reg(28)];
+pub(super) const SAVED_FLOAT: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 
 pub(super) type Loc = crate::frame::Loc<Reg>;
 pub(super) type Abi = crate::frame::Abi<Reg>;
@@ -46,7 +47,16 @@ impl Counter {
             ArgumentPurpose::StructReturn => return Ok(Loc::Int(INDIRECT)),
             ArgumentPurpose::Dict => return Ok(Loc::Int(Reg(9))),
             ArgumentPurpose::StructArgument(_) => return Err("a struct passed by value on the stack has no arm64 lowering yet".to_owned()),
-            ArgumentPurpose::Normal => {}
+            ArgumentPurpose::Variadic if self.packing == Packing::Natural => {
+                self.int = INT_ARGS.len();
+                self.float = FLOAT_ARGS;
+                let size = ty.bytes().max(8);
+                self.stack = round(self.stack, size);
+                let at = self.stack;
+                self.stack += size;
+                return Ok(Loc::Stack(at));
+            }
+            ArgumentPurpose::Normal | ArgumentPurpose::Variadic => {}
         }
         Ok(match ty {
             Type::I128 => {
@@ -59,11 +69,11 @@ impl Counter {
                     self.stack(16)
                 }
             }
-            Type::F32 | Type::F64 if self.float < FLOAT_ARGS => {
+            Type::F32 | Type::F64 | Type::V128 if self.float < FLOAT_ARGS => {
                 self.float += 1;
                 Loc::Float(self.float - 1)
             }
-            _ if !ty.is_float() && self.int < INT_ARGS.len() => {
+            _ if !ty.is_float() && ty != Type::V128 && self.int < INT_ARGS.len() => {
                 self.int += 1;
                 Loc::Int(INT_ARGS[self.int - 1])
             }
@@ -76,5 +86,6 @@ impl Counter {
 pub(super) fn classify(signature: &Signature, packing: Packing) -> Result<Abi, String> {
     let mut params = Counter { int: 0, float: 0, stack: 0, packing };
     let placed = signature.params.iter().map(|param| params.param(param.purpose, param.value_type)).collect::<Result<_, _>>()?;
-    Ok(Abi { params: placed, returns: returns(signature, INT_RETURNS, FLOAT_RETURNS)?, stack: round(params.stack, 16) })
+    let ints: &[Reg] = if signature.call_conv == CallConv::Internal { &INT_ARGS[..4] } else { &INT_RETURNS };
+    Ok(Abi { params: placed, returns: returns(signature, ints, FLOAT_RETURNS)?, stack: round(params.stack, 16) })
 }

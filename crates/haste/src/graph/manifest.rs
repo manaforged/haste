@@ -29,7 +29,7 @@ pub struct Dep {
 }
 
 /// The parts of a `Cargo.toml` that the graph needs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Manifest {
     pub dir: PathBuf,
     pub name: String,

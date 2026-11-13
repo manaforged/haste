@@ -1,6 +1,7 @@
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
 use super::float::X1;
-use super::{Emit, Ext};
+use super::Emit;
+use crate::frame::Ext;
 use crate::ir::{AtomicRmwOp, Binary, Function, Op, StackSlot, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -215,7 +216,17 @@ impl Emit<'_> {
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
         self.get(Reg::Rcx, condition, Ext::Zero);
         self.asm.test(Reg::Rcx, Reg::Rcx);
-        if self.ty(x) == Type::I128 {
+        let ty = self.ty(x);
+        if ty == Type::V128 || ty.is_float() {
+            let done = self.asm.label();
+            self.fget(Xmm(0), y);
+            self.asm.jcc(Cond::E, done);
+            self.fget(Xmm(0), x);
+            self.asm.bind(done);
+            self.fput(result, Xmm(0));
+            return;
+        }
+        if ty == Type::I128 {
             self.asm.load(Size::Q, Reg::Rax, self.at(y));
             self.asm.cmov(Cond::Ne, Reg::Rax, self.at(x));
             self.put(result, Reg::Rax);
@@ -254,7 +265,7 @@ impl Emit<'_> {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let target = Mem::new(Reg::Rsi, 0);
         self.raw(Reg::Rsi, addr);
-        self.get(Reg::Rdx, value, if signed { Ext::Sign } else { Ext::Zero });
+        self.get(Reg::Rdx, value, Ext::of(signed));
         self.asm.load(size, Reg::Rax, target);
         let again = self.asm.label();
         self.asm.bind(again);

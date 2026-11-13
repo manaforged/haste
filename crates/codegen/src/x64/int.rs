@@ -1,5 +1,6 @@
-use super::asm::{Alu, Cond, Count, Group3, Reg, Shift, Size};
-use super::{Emit, Ext};
+use super::asm::{Alu, Cond, Count, Group3, Mem, Reg, Shift, Size};
+use super::Emit;
+use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Type, Unary, Value};
 
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
@@ -178,12 +179,34 @@ impl Emit<'_> {
     /// Computes `x op y` into `dst` for the operations that can, or into rax, and returns the register that holds it.
     fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<Reg, String> {
         if let Some(alu) = alu_of(op) {
-            self.raw(dst, x);
-            match self.imm_of(y) {
-                Some(imm) => self.asm.alu_imm(alu, dst, imm),
-                None => {
-                    let source = self.operand(y);
-                    self.asm.alu(alu, dst, source);
+            if matches!(alu, Alu::Add) {
+                if let Some(rx) = self.reg_of(x).filter(|&rx| rx != dst) {
+                    if let Some(imm) = self.imm_of(y) {
+                        self.asm.lea(dst, Mem::new(rx, imm));
+                        return Ok(dst);
+                    }
+                    if let Some(ry) = self.reg_of(y) {
+                        self.asm.lea(dst, Mem::sib(rx, ry, 0, 0));
+                        return Ok(dst);
+                    }
+                }
+                if let (Some(imm), Some(ry)) = (self.imm_of(x), self.reg_of(y).filter(|&ry| ry != dst)) {
+                    self.asm.lea(dst, Mem::new(ry, imm));
+                    return Ok(dst);
+                }
+            }
+            if self.imm_of(y).is_none() && self.reg_of(y) == Some(dst) && x != y {
+                self.asm.mov(Reg::Rax, dst);
+                self.raw(dst, x);
+                self.asm.alu(alu, dst, Reg::Rax);
+            } else {
+                self.raw(dst, x);
+                match self.imm_of(y) {
+                    Some(imm) => self.asm.alu_imm(alu, dst, imm),
+                    None => {
+                        let source = self.operand(y);
+                        self.asm.alu(alu, dst, source);
+                    }
                 }
             }
             return Ok(dst);
@@ -214,9 +237,15 @@ impl Emit<'_> {
             (_, Some(imm)) => (x, imm),
             (Some(imm), None) => (y, imm),
             (None, None) => {
-                self.raw(dst, x);
-                let source = self.operand(y);
-                self.asm.imul(dst, source);
+                if self.reg_of(y) == Some(dst) && x != y {
+                    self.asm.mov(Reg::Rax, dst);
+                    self.raw(dst, x);
+                    self.asm.imul(dst, Reg::Rax);
+                } else {
+                    self.raw(dst, x);
+                    let source = self.operand(y);
+                    self.asm.imul(dst, source);
+                }
                 return;
             }
         };
@@ -247,7 +276,7 @@ impl Emit<'_> {
 
     fn divide(&mut self, op: Binary, x: Value, y: Value) {
         let signed = matches!(op, Binary::Sdiv | Binary::Srem);
-        let ext = if signed { Ext::Sign } else { Ext::Zero };
+        let ext = Ext::of(signed);
         self.get(Reg::Rax, x, ext);
         self.get(Reg::Rcx, y, ext);
         if signed {
@@ -263,7 +292,7 @@ impl Emit<'_> {
     }
 
     fn multiply_high(&mut self, signed: bool, x: Value, y: Value, bits: u8) {
-        let ext = if signed { Ext::Sign } else { Ext::Zero };
+        let ext = Ext::of(signed);
         self.get(Reg::Rax, x, ext);
         self.get(Reg::Rcx, y, ext);
         if bits == 64 {
@@ -382,7 +411,7 @@ impl Emit<'_> {
             Convert::Uextend | Convert::Sextend => {
                 let signed = op == Convert::Sextend;
                 let dst = self.dst(result);
-                self.get(dst, x, if signed { Ext::Sign } else { Ext::Zero });
+                self.get(dst, x, Ext::of(signed));
                 self.put(result, dst);
                 if wide && signed {
                     self.asm.mov(Reg::Rcx, Reg::Rax);

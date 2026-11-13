@@ -167,6 +167,8 @@ enum Fixup {
     Branch,
     /// A 19-bit word offset at bit 5: `b.cond`, `cbz`, `cbnz`.
     Cond,
+    /// A 21-bit byte offset: `adr`.
+    Adr,
 }
 
 #[derive(Default)]
@@ -174,6 +176,7 @@ pub(crate) struct Asm {
     code: Vec<u8>,
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, usize, Fixup)>,
+    table_fixups: Vec<(u32, usize, usize)>,
 }
 
 fn sized(base: u32, size: Size) -> u32 {
@@ -217,18 +220,43 @@ impl Asm {
         self.jump(sized(base, size) | u32::from(reg.0), label, Fixup::Cond);
     }
 
+    pub fn adr(&mut self, dst: Reg, label: Label) {
+        self.jump(0x1000_0000 | u32::from(dst.0), label, Fixup::Adr);
+    }
+
+    pub fn ldrsw_scaled(&mut self, dst: Reg, base: Reg, index: Reg) {
+        self.word(0xB8A0_7800 | u32::from(index.0) << 16 | u32::from(base.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn table_entry(&mut self, base: Label, target: Label) {
+        self.table_fixups.push((self.pos(), base.0, target.0));
+        self.word(0);
+    }
+
     pub fn finish(mut self) -> Result<Vec<u8>, String> {
         for (at, label, kind) in std::mem::take(&mut self.fixups) {
             let target = self.labels[label].ok_or("a jump to a label that was never bound")?;
-            let delta = (i64::from(target) - i64::from(at)) / 4;
+            let bytes = i64::from(target) - i64::from(at);
+            let delta = bytes / 4;
             let at = at as usize;
             let mut word = u32::from_le_bytes(self.code[at..at + 4].try_into().expect("four bytes"));
             word |= match kind {
                 Fixup::Branch if (-(1 << 25)..1 << 25).contains(&delta) => (delta as u32) & 0x03FF_FFFF,
                 Fixup::Cond if (-(1 << 18)..1 << 18).contains(&delta) => ((delta as u32) & 0x7_FFFF) << 5,
+                Fixup::Adr if (-(1 << 20)..1 << 20).contains(&bytes) => {
+                    let imm = bytes as u32;
+                    ((imm & 3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5)
+                }
                 _ => return Err("a branch out of range".to_owned()),
             };
             self.code[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        for (at, base, target) in std::mem::take(&mut self.table_fixups) {
+            let base = self.labels[base].ok_or("a jump table without a base label")?;
+            let target = self.labels[target].ok_or("a jump to a label that was never bound")?;
+            let delta = i64::from(target) - i64::from(base);
+            let at = at as usize;
+            self.code[at..at + 4].copy_from_slice(&(delta as i32).to_le_bytes());
         }
         Ok(self.code)
     }
@@ -242,6 +270,11 @@ impl Asm {
     pub fn add_extended(&mut self, sub: bool, dst: Reg, a: Reg, b: Reg) {
         let base = if sub { 0xCB20_6000 } else { 0x8B20_6000 };
         self.word(base | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
+    }
+
+    /// `dst = base + (index << shift)`.
+    pub fn add_shifted(&mut self, dst: Reg, base: Reg, index: Reg, shift: u8) {
+        self.word(0x8B00_0000 | u32::from(shift) << 10 | u32::from(index.0) << 16 | u32::from(base.0) << 5 | u32::from(dst.0));
     }
 
     /// `dst = a +/- imm` for `imm < 4096` or a multiple of 4096 below 2^24, where `a` or `dst` may be the stack pointer; sets the flags when `flags`.
@@ -349,9 +382,8 @@ impl Asm {
         self.word(op as u32 | u32::from(src.0) << 5 | u32::from(dst.0));
     }
 
-    /// Loads `size` bytes at `mem` into `dst`, sign-extending to 64 bits when `signed`, else zero-extending.
-    pub fn load(&mut self, size: Size, signed: bool, dst: Reg, mem: Mem) {
-        let base = match (size, signed) {
+    fn load_base(size: Size, signed: bool) -> u32 {
+        match (size, signed) {
             (Size::X, _) => 0xF840_0000,
             (Size::W, false) => 0xB840_0000,
             (Size::H, false) => 0x7840_0000,
@@ -359,13 +391,20 @@ impl Asm {
             (Size::W, true) => 0xB880_0000,
             (Size::H, true) => 0x7880_0000,
             (Size::B, true) => 0x3880_0000,
-        };
-        self.access(base, size.log2(), u32::from(dst.0), mem);
+        }
+    }
+
+    fn store_base(size: Size) -> u32 {
+        [0x3800_0000, 0x7800_0000, 0xB800_0000, 0xF800_0000][size as usize]
+    }
+
+    /// Loads `size` bytes at `mem` into `dst`, sign-extending to 64 bits when `signed`, else zero-extending.
+    pub fn load(&mut self, size: Size, signed: bool, dst: Reg, mem: Mem) {
+        self.access(Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
     }
 
     pub fn store(&mut self, size: Size, mem: Mem, src: Reg) {
-        let base = [0x3800_0000, 0x7800_0000, 0xB800_0000, 0xF800_0000][size as usize];
-        self.access(base, size.log2(), u32::from(src.0), mem);
+        self.access(Self::store_base(size), size.log2(), u32::from(src.0), mem);
     }
 
     /// Loads a float or vector register of `bytes` 4, 8 or 16.
@@ -379,12 +418,36 @@ impl Asm {
         self.access(base, scale, u32::from(src.0), mem);
     }
 
+    /// Loads `size` bytes at `base + (index << shift)` into `dst`.
+    pub fn load_indexed(&mut self, size: Size, signed: bool, dst: Reg, base: Reg, index: Reg, shift: u8) {
+        self.access_indexed(Self::load_base(size, signed), u32::from(dst.0), base, index, shift);
+    }
+
+    /// Stores `size` bytes from `src` to `base + (index << shift)`.
+    pub fn store_indexed(&mut self, size: Size, base: Reg, index: Reg, shift: u8, src: Reg) {
+        self.access_indexed(Self::store_base(size), u32::from(src.0), base, index, shift);
+    }
+
+    /// Loads a float register of `bytes` 4 or 8 at `base + (index << shift)`.
+    pub fn vload_indexed(&mut self, bytes: u32, dst: Vreg, base: Reg, index: Reg, shift: u8) {
+        self.access_indexed(Self::vbase(bytes).0 | 0x40_0000, u32::from(dst.0), base, index, shift);
+    }
+
+    /// Stores a float register of `bytes` 4 or 8 to `base + (index << shift)`.
+    pub fn vstore_indexed(&mut self, bytes: u32, base: Reg, index: Reg, shift: u8, src: Vreg) {
+        self.access_indexed(Self::vbase(bytes).0, u32::from(src.0), base, index, shift);
+    }
+
     fn vbase(bytes: u32) -> (u32, u32) {
         match bytes {
             4 => (0xBC00_0000, 2),
             8 => (0xFC00_0000, 3),
             _ => (0x3C80_0000, 4),
         }
+    }
+
+    fn access_indexed(&mut self, base: u32, rt: u32, rn: Reg, rm: Reg, shift: u8) {
+        self.word(base | 1 << 21 | u32::from(rm.0) << 16 | 0b011 << 13 | u32::from(shift > 0) << 12 | 0b10 << 10 | u32::from(rn.0) << 5 | rt);
     }
 
     /// One load or store from its unscaled-offset encoding `base`: the scaled form when the offset fits it, the unscaled form for small offsets, else through x17.
@@ -397,7 +460,7 @@ impl Asm {
             self.word(base | ((disp as u32) & 0x1FF) << 12 | rn << 5 | rt);
         } else {
             self.mov_imm(Reg(17), i64::from(disp));
-            self.word(base | 1 << 21 | 17 << 16 | 0b011 << 13 | 0b10 << 10 | rn << 5 | rt);
+            self.access_indexed(base, rt, mem.base, Reg(17), 0);
         }
     }
 
@@ -411,6 +474,12 @@ impl Asm {
 
     pub fn blr(&mut self, reg: Reg) {
         self.word(0xD63F_0000 | u32::from(reg.0) << 5);
+    }
+
+    pub fn bl_reloc(&mut self) -> u32 {
+        let at = self.pos();
+        self.word(0x9400_0000);
+        at
     }
 
     pub fn br(&mut self, reg: Reg) {
@@ -480,18 +549,75 @@ impl Asm {
         self.word(base | src << 5 | dst);
     }
 
-    /// Moves the 64 bits of `src` into `dst`.
+    pub fn fmov_reg(&mut self, double: bool, dst: Vreg, src: Vreg) {
+        if dst != src {
+            self.word(Self::precision(0x1E20_4000, double) | u32::from(src.0) << 5 | u32::from(dst.0));
+        }
+    }
+
+    pub fn fcsel(&mut self, cond: Cond, double: bool, dst: Vreg, a: Vreg, b: Vreg) {
+        self.word(Self::precision(0x1E20_0C00, double) | u32::from(b.0) << 16 | (cond as u32) << 12 | u32::from(a.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn fmov_in(&mut self, double: bool, dst: Vreg, src: Reg) {
+        let base = Self::precision(0x1E27_0000, double) | u32::from(double) << 31;
+        self.word(base | u32::from(src.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn fmov_out(&mut self, double: bool, dst: Reg, src: Vreg) {
+        let base = Self::precision(0x1E26_0000, double) | u32::from(double) << 31;
+        self.word(base | u32::from(src.0) << 5 | u32::from(dst.0));
+    }
+
     pub fn fmov_to_float(&mut self, dst: Vreg, src: Reg) {
-        self.word(0x9E67_0000 | u32::from(src.0) << 5 | u32::from(dst.0));
+        self.fmov_in(true, dst, src);
     }
 
     pub fn fmov_to_int(&mut self, dst: Reg, src: Vreg) {
-        self.word(0x9E66_0000 | u32::from(src.0) << 5 | u32::from(dst.0));
+        self.fmov_out(true, dst, src);
     }
 
     /// Counts the set bits of each byte of `src` and adds them into the low byte of `dst`.
     pub fn popcount_bytes(&mut self, dst: Vreg, src: Vreg) {
         self.word(0x0E20_5800 | u32::from(src.0) << 5 | u32::from(dst.0));
         self.word(0x0E31_B800 | u32::from(dst.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn vmov(&mut self, dst: Vreg, src: Vreg) {
+        if dst != src {
+            let s = u32::from(src.0);
+            self.word(0x4EA0_1C00 | s << 16 | s << 5 | u32::from(dst.0));
+        }
+    }
+
+    pub fn veor_zero(&mut self, dst: Vreg) {
+        let d = u32::from(dst.0);
+        self.word(0x6E20_1C00 | d << 16 | d << 5 | d);
+    }
+
+    pub fn vbit(&mut self, base: u32, dst: Vreg, a: Vreg, b: Vreg) {
+        self.word(base | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn vdup_byte(&mut self, dst: Vreg, src: Reg) {
+        self.word(0x4E01_0C00 | u32::from(src.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn vcmp_byte(&mut self, eq: bool, dst: Vreg, a: Vreg, b: Vreg) {
+        let base = if eq { 0x6E20_8C00 } else { 0x4E20_3400 };
+        self.word(base | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn varith(&mut self, sub: bool, size: u32, dst: Vreg, a: Vreg, b: Vreg) {
+        let base = if sub { 0x6E20_8400 } else { 0x4E20_8400 };
+        self.word(base | size << 22 | u32::from(b.0) << 16 | u32::from(a.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn vtbl(&mut self, dst: Vreg, table: Vreg, idx: Vreg) {
+        self.word(0x4E00_0000 | u32::from(idx.0) << 16 | u32::from(table.0) << 5 | u32::from(dst.0));
+    }
+
+    pub fn umov_d1(&mut self, dst: Reg, src: Vreg) {
+        self.word(0x4E18_3C00 | u32::from(src.0) << 5 | u32::from(dst.0));
     }
 }

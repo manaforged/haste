@@ -123,14 +123,14 @@ impl Lower<'_, '_> {
         if self.typed.autoderefs.contains_key(&expr) {
             let values = self.pointed_env(expr, callee)?;
             let values = self.args(args, values)?;
-            return self.invoke(item, substs, values);
+            return self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values);
         }
         let values = self.callee_env(callee)?;
         let values = self.args(args, values)?;
-        self.invoke(item, substs, values)
+        self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)
     }
 
-    fn callee_env(&mut self, callee: ExprId) -> Result<Vec<Value>> {
+    pub(super) fn callee_env(&mut self, callee: ExprId) -> Result<Vec<Value>> {
         let callee_ty = self.ty_of(callee);
         if !self.cx.closure_takes_env(callee_ty) {
             self.expr(callee)?;
@@ -161,7 +161,7 @@ impl Lower<'_, '_> {
             self.moved_out(Root::Local(self.typed.params[0]), &[])?;
         }
         values.extend(self.untupled()?.1);
-        self.invoke(item, substs, values)
+        self.invoke(super::reloc::SiteOrigin::ShapeUntuple, item, substs, values)
     }
 
     /// Lowers the body of a call trait method at a function pointer: a call of the pointer that the receiver points at, with the fields of the argument tuple.
@@ -204,7 +204,7 @@ impl Lower<'_, '_> {
             false => self.cx.types.substs(substs).get(1).copied().ok_or_else(|| anyhow::anyhow!("a trait object call with no argument tuple"))?,
         };
         let packed = self.tuple_of(tuple, args)?;
-        self.invoke(item, substs, std::iter::once(receiver).chain(packed).collect())
+        self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, std::iter::once(receiver).chain(packed).collect())
     }
 
     /// Lowers the call of a value whose own `FnOnce` impl takes it by value, as `AssertUnwindSafe` has: the value moves into `call_once` with the argument tuple.
@@ -219,7 +219,7 @@ impl Lower<'_, '_> {
         }
         let tuple = self.args_tuple(args);
         values.extend(self.tuple_of(tuple, args)?);
-        self.invoke(item, substs, values)
+        self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)
     }
 
     /// Whether the call `expr` resolved to `(item, substs)` goes through the callee type's own `Fn` impl: inference saw that impl, or a generic body calls a call trait method at a struct such as `AssertUnwindSafe`.
@@ -253,7 +253,7 @@ impl Lower<'_, '_> {
         let result = self.call_code(code, (vec![pointer, tuple], Some(ret)), std::iter::once(data).chain(packed).collect())?;
         self.moved_out(root, &path)?;
         let target = self.address(boxed);
-        self.invoke(free, free_substs, vec![target])?;
+        self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::BoxFree(expr)), free, free_substs, vec![target])?;
         Ok(result)
     }
 
@@ -266,9 +266,9 @@ impl Lower<'_, '_> {
         let Some((place, closure)) = self.deref_step((expr, 0), Some(owner), boxed)? else { return Ok(None) };
         let env = if self.cx.closure_takes_env(closure) { vec![self.address(place)] } else { Vec::new() };
         let values = self.args(args, env)?;
-        let result = self.invoke(item, substs, values)?;
+        let result = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)?;
         let target = self.address(owner);
-        self.invoke(free, free_substs, vec![target])?;
+        self.invoke(super::reloc::SiteOrigin::DropFn(super::reloc::TyOrigin::Expr(callee)), free, free_substs, vec![target])?;
         self.moved_out(root, &path)?;
         Ok(result)
     }
@@ -286,9 +286,24 @@ impl Lower<'_, '_> {
         Ok(vec![self.address(place)])
     }
 
-    /// Whether a call of `item` at `substs` is a trait call of a closure, whose tupled arguments are not lowered yet.
     pub(super) fn tupled_closure_call(&mut self, item: ItemRef, substs: Substs) -> bool {
         let first = self.cx.types.substs(substs).first().copied();
         first.is_some_and(|ty| matches!(self.cx.types.kind(ty), Kind::Closure(..))) && self.cx.call_once() == Some(item)
+    }
+
+    pub(super) fn untuple_arg(&mut self, tuple_expr: ExprId, values: &mut Vec<Value>) -> Result<()> {
+        let tuple_ty = self.ty_of(tuple_expr);
+        let Kind::Tuple(items) = *self.cx.types.kind(tuple_ty) else { bail!("closure arguments that are not a tuple") };
+        let count = self.cx.types.substs(items).len() as u32;
+        if let Some(place) = self.place_or_temp(tuple_expr)? {
+            for index in 0..count {
+                let part = self.part_place(place, tuple_ty, (0, index))?;
+                values.extend(self.read(part));
+            }
+        }
+        if let Some((root, path)) = self.scrutinee_path(tuple_expr) {
+            self.moved_out(root, &path)?;
+        }
+        Ok(())
     }
 }

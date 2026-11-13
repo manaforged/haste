@@ -78,6 +78,13 @@ fn op(func: &Function, op: &Op) -> Result<(), String> {
         }
         Op::Jump(block, args) => edge(func, *block, args),
         Op::Brif(_, then, then_args, otherwise, else_args) => edge(func, *then, then_args).and(edge(func, *otherwise, else_args)),
+        Op::BrTable(index, default, targets) => {
+            if !func.ty(*index).is_small_int() {
+                return Err(format!("a br_table index must be an integer, got {:?}", func.ty(*index)));
+            }
+            edge(func, *default, &[])?;
+            targets.iter().try_for_each(|target| edge(func, *target, &[]))
+        }
         Op::Call { sig, args, .. } => call(func, sig.index(), args),
         Op::TryCall { sig, args, normal, handler, .. } => try_call(func, sig.index(), args, *normal, *handler),
         Op::Return(values) => returned(func, values),

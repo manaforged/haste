@@ -46,6 +46,10 @@ impl Type {
     pub fn is_small_int(self) -> bool {
         matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
     }
+
+    pub(crate) const fn sign_bit(self) -> i64 {
+        if matches!(self, Type::F64) { i64::MIN } else { 0x8000_0000 }
+    }
 }
 
 macro_rules! ids {
@@ -95,6 +99,8 @@ pub enum ArgumentPurpose {
     StructArgument(u32),
     /// The pointer to the static symbol dictionary of a shared generic body.
     Dict,
+    /// An unnamed argument after `...` in a C variadic call.
+    Variadic,
 }
 
 /// One parameter or return value of a signature.
@@ -113,6 +119,11 @@ impl AbiParam {
     /// A value of `ty` with a special purpose.
     pub fn special(ty: Type, purpose: ArgumentPurpose) -> Self {
         Self { value_type: ty, purpose }
+    }
+
+    /// A C variadic argument of `ty`.
+    pub fn variadic(ty: Type) -> Self {
+        Self { value_type: ty, purpose: ArgumentPurpose::Variadic }
     }
 }
 
@@ -339,6 +350,7 @@ pub(crate) enum Op {
     TryCall { sig: SigRef, callee: Value, args: Vec<Value>, normal: Block, handler: Block },
     Jump(Block, Vec<Value>),
     Brif(Value, Block, Vec<Value>, Block, Vec<Value>),
+    BrTable(Value, Block, Vec<Block>),
     Return(Vec<Value>),
     Trap,
     Trapz(Value),
@@ -346,18 +358,19 @@ pub(crate) enum Op {
 
 impl Op {
     pub(crate) fn is_terminator(&self) -> bool {
-        matches!(self, Op::TryCall { .. } | Op::Jump(..) | Op::Brif(..) | Op::Return(_) | Op::Trap)
+        matches!(self, Op::TryCall { .. } | Op::Jump(..) | Op::Brif(..) | Op::BrTable(..) | Op::Return(_) | Op::Trap)
     }
 
     /// Every block this instruction can go to.
-    pub(crate) fn targets(&self) -> impl Iterator<Item = Block> + use<> {
-        let (first, second) = match *self {
-            Op::Jump(block, _) => (Some(block), None),
-            Op::Brif(_, then, _, otherwise, _) => (Some(then), Some(otherwise)),
-            Op::TryCall { normal, handler, .. } => (Some(normal), Some(handler)),
-            _ => (None, None),
+    pub(crate) fn targets(&self) -> impl Iterator<Item = Block> + '_ {
+        let (first, second, slice) = match self {
+            Op::Jump(block, _) => (Some(*block), None, &[][..]),
+            Op::Brif(_, then, _, otherwise, _) => (Some(*then), Some(*otherwise), &[][..]),
+            Op::BrTable(_, default, targets) => (Some(*default), None, &targets[..]),
+            Op::TryCall { normal, handler, .. } => (Some(*normal), Some(*handler), &[][..]),
+            _ => (None, None, &[][..]),
         };
-        first.into_iter().chain(second)
+        first.into_iter().chain(second).chain(slice.iter().copied())
     }
 
     /// Replaces every block this instruction can go to with `f` of it.
@@ -367,6 +380,10 @@ impl Op {
             Op::Brif(_, then, _, otherwise, _) => {
                 *then = f(*then);
                 *otherwise = f(*otherwise);
+            }
+            Op::BrTable(_, default, targets) => {
+                *default = f(*default);
+                targets.iter_mut().for_each(|target| *target = f(*target));
             }
             Op::TryCall { normal, handler, .. } => {
                 *normal = f(*normal);
@@ -399,6 +416,7 @@ impl Op {
                 f(*c);
                 then.iter().chain(otherwise).for_each(|arg| f(*arg));
             }
+            Op::BrTable(index, ..) => f(*index),
         }
     }
 
@@ -436,30 +454,31 @@ impl Op {
                 *c = f(*c);
                 then.iter_mut().chain(otherwise.iter_mut()).for_each(|arg| *arg = f(*arg));
             }
+            Op::BrTable(index, ..) => *index = f(*index),
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct InstData {
     pub op: Op,
     pub result: Option<Value>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct BlockData {
     pub params: Vec<Value>,
     pub insts: Vec<Inst>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct SlotData {
     pub size: u32,
     pub align_shift: u8,
 }
 
 /// One function body: blocks of instructions over typed values.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Function {
     pub signature: Signature,
     pub(crate) types: Vec<Type>,
@@ -470,12 +489,20 @@ pub struct Function {
     pub(crate) entry: Option<Block>,
     /// The split that turns this function into a coroutine's resume function, when it is one.
     pub coroutine: Option<crate::coroutine::Coroutine>,
+    pub(crate) self_slots: Vec<u32>,
 }
 
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new() }
+    }
+
+    /// Marks relocation slot `sym` as a direct self-recursive target of this function.
+    pub fn add_self_slot(&mut self, sym: u32) {
+        if !self.self_slots.contains(&sym) {
+            self.self_slots.push(sym);
+        }
     }
 
     /// The type of `value`.
@@ -501,7 +528,7 @@ impl Function {
     }
 
     /// The blocks the last instruction of `block` can go to.
-    pub(crate) fn successors(&self, block: Block) -> impl Iterator<Item = Block> + use<> {
+    pub(crate) fn successors(&self, block: Block) -> impl Iterator<Item = Block> + '_ {
         self.last(block).map(Op::targets).into_iter().flatten()
     }
 
