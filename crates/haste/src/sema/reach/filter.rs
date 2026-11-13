@@ -9,7 +9,7 @@ use crate::names::{ItemRef, Primitive};
 use super::super::Context;
 use super::super::infer::{LazyTables, Res, Shape, Typed, maybe_unsized};
 use super::super::substs::Substs;
-use super::super::summary::SummaryKind;
+use super::super::summary::{PolyObligation, SummaryKind};
 use super::super::ty::{Kind, Ty};
 use super::Instance;
 
@@ -32,23 +32,29 @@ impl ReachFilter {
         if !visiting.insert(item) {
             return Some(false);
         }
-        let Some(kind) = cx.store.lookups.summaries.get_ready(&item) else {
-            visiting.remove(&item);
-            return None;
-        };
-        let SummaryKind::Poly(summary) = kind else {
-            visiting.remove(&item);
-            self.sealed_cache.insert(item, false);
-            return Some(false);
+        let summary = match cx.store.lookups.summaries.get_ready(&item) {
+            Some(SummaryKind::Poly(summary)) => summary,
+            Some(SummaryKind::MonomorphicFallback) => {
+                visiting.remove(&item);
+                self.sealed_cache.insert(item, false);
+                return Some(false);
+            }
+            None => match super::super::summary::frozen::frozen_summary(cx, item) {
+                Some(summary) => summary,
+                None => {
+                    visiting.remove(&item);
+                    return None;
+                }
+            },
         };
         let local_ok = summary.projections.is_empty()
-            && summary.obligations.is_empty()
+            && summary.obligations.iter().all(|o| matches!(o, PolyObligation::Prove { .. }))
             && summary.call_holes.is_empty()
             && summary.op_holes.is_empty()
             && summary.const_holes.is_empty()
-            && summary.drop_tys.is_empty()
             && summary.template.closures.is_empty()
-            && summary.layout_tys.iter().all(|&ty| layout_ty_infallible(cx, item, ty));
+            && summary.layout_tys.iter().all(|&ty| layout_ty_infallible(cx, item, ty))
+            && summary.drop_tys.iter().all(|&ty| layout_ty_infallible(cx, item, ty));
         if !local_ok {
             visiting.remove(&item);
             self.sealed_cache.insert(item, false);
@@ -171,7 +177,7 @@ pub(super) fn collect_filtered_callees(
         if cx.intrinsic(item).is_some() {
             return;
         }
-        if check_only && cx.outline.is_fixed(item.krate) && filter.seen_sealed_sysroot.contains(&item) && filter.check_sealed(cx, item, &mut visiting) == Some(true) {
+        if check_only && cx.outline.is_fixed(item.krate) && filter.check_sealed(cx, item, &mut visiting) == Some(true) && !filter.seen_sealed_sysroot.insert(item) {
             return;
         }
         out.push((item, substs));

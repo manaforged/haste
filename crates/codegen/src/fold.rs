@@ -675,6 +675,21 @@ fn fold_bxor_branches(func: &mut Function) -> bool {
     }
     let mut changed = false;
     for b in 0..func.blocks.len() {
+        for i in 0..func.blocks[b].insts.len() {
+            let inst = func.blocks[b].insts[i];
+            if let Op::Select(cond, a, b_val) = func.insts[inst.index()].op
+                && let inner = unwrap_uextend(func, &defs, cond)
+                && let Some(bxor_inst) = defs.get(inner.index()).copied().flatten()
+                && let Op::Binary(Binary::Bxor, x, y) = func.insts[bxor_inst.index()].op
+                && let Some((lhs, _)) = [(x, y), (y, x)].into_iter().find(|&(_, c)| consts.get(c.index()).copied().flatten() == Some(1))
+                && let bool_src = unwrap_uextend(func, &defs, lhs)
+                && let Some(src_inst) = defs.get(bool_src.index()).copied().flatten()
+                && matches!(func.insts[src_inst.index()].op, Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..))
+            {
+                func.insts[inst.index()].op = Op::Select(bool_src, b_val, a);
+                changed = true;
+            }
+        }
         let Some(&last) = func.blocks[b].insts.last() else { continue };
         let Op::Brif(cond, ..) = func.insts[last.index()].op else { continue };
         let inner = unwrap_uextend(func, &defs, cond);

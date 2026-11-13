@@ -769,7 +769,7 @@ fn prune_stale_substrates(dir: &Path, keep: &Path) {
         })
         .collect();
     others.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, path) in others.into_iter().skip(1) {
+    for (_, path) in others.into_iter().skip(7) {
         drop(std::fs::remove_file(path));
     }
 }

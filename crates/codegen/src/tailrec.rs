@@ -232,7 +232,7 @@ pub(crate) fn run(func: &mut Function) -> bool {
             }
         }
     }
-    peel_entry_guard(func, (old_entry, new_entry, loop_head), old_params_len, orig_blocks, &rewritten);
+    peel_entry_guard(func, (old_entry, new_entry, loop_head), old_params_len, orig_blocks, &rewritten, accum_op.zip(ret_ty));
     if let (Some(op), Some(acc), Some(rty)) = (accum_op, acc_param, ret_ty) {
         for b_idx in 0..orig_blocks {
             if rewritten[b_idx] {
@@ -309,6 +309,7 @@ fn peel_entry_guard(
     old_params_len: usize,
     orig_blocks: usize,
     rewritten: &[bool],
+    accum_op: Option<(Binary, Type)>,
 ) {
     let Some(&term) = func.blocks[old_entry.index()].insts.last() else { return };
     let Op::Brif(cond, then_b, then_args, else_b, else_args) = func.insts[term.index()].op.clone() else { return };
@@ -332,10 +333,10 @@ fn peel_entry_guard(
             && preds[b.index()] == 1
             && func.blocks[b.index()].insts.last().is_some_and(|&t| matches!(func.insts[t.index()].op, Op::Return(_)))
     };
-    let (base_b, base_args, then_is_base) = if is_base(then_b) {
-        (then_b, then_args, true)
+    let (base_b, base_args, rec_b, rec_args, then_is_base) = if is_base(then_b) {
+        (then_b, then_args, else_b, else_args, true)
     } else if is_base(else_b) {
-        (else_b, else_args, false)
+        (else_b, else_args, then_b, then_args, false)
     } else {
         return;
     };
@@ -378,4 +379,94 @@ fn peel_entry_guard(
     };
     entry_insts.push(func.add(brif, None));
     func.blocks[new_entry.index()].insts = entry_insts;
+
+    if preds[old_entry.index()] != 0 {
+        return;
+    }
+    let mut old_defs = vec![false; func.types.len()];
+    for &inst in old_body {
+        if let Some(res) = func.insts[inst.index()].result {
+            old_defs[res.index()] = true;
+        }
+    }
+    if rec_args.iter().any(|v| old_defs[v.index()]) {
+        return;
+    }
+    let mut used_outside = false;
+    for (b, block) in func.blocks[..orig_blocks].iter().enumerate() {
+        if b == old_entry.index() || b == base_b.index() {
+            continue;
+        }
+        for &inst in &block.insts {
+            func.insts[inst.index()].op.for_operands(|v| {
+                if old_defs[v.index()] {
+                    used_outside = true;
+                }
+            });
+        }
+    }
+    if used_outside {
+        return;
+    }
+
+    let loop_param_tys: Vec<Type> = func.blocks[loop_head.index()].params.iter().map(|&v| func.ty(v)).collect();
+    let latch_params: Vec<Value> = loop_param_tys.iter().map(|&ty| func.value(ty)).collect();
+    let mut latch_map = rustc_hash::FxHashMap::default();
+    for (&old_p, &latch_p) in func.blocks[loop_head.index()].params[..old_params_len].iter().zip(&latch_params[..old_params_len]) {
+        latch_map.insert(old_p, latch_p);
+    }
+    let mut latch_insts = Vec::with_capacity(old_body.len() + 1);
+    if !clone_pure_insts(func, old_body, &mut latch_map, &mut latch_insts) {
+        return;
+    }
+    let Some(&latch_cond) = latch_map.get(&cond) else { return };
+    for (&param, &arg) in base_params.iter().zip(&base_args) {
+        let Some(&mapped) = latch_map.get(&arg) else { return };
+        latch_map.insert(param, mapped);
+    }
+    let mut latch_ret_insts = Vec::with_capacity(base_insts.len() + 1);
+    if !clone_pure_insts(func, &base_insts, &mut latch_map, &mut latch_ret_insts) {
+        return;
+    }
+    if let Some((op, rty)) = accum_op
+        && latch_params.len() == old_params_len + 1
+    {
+        let Some(&last_ret) = latch_ret_insts.last() else { return };
+        let Op::Return(vals) = &func.insts[last_ret.index()].op else { return };
+        if vals.len() != 1 {
+            return;
+        }
+        let val = vals[0];
+        let latch_acc = latch_params[old_params_len];
+        let combined = func.value(rty);
+        let add_inst = func.add(Op::Binary(op, latch_acc, val), Some(combined));
+        latch_ret_insts.pop();
+        latch_ret_insts.push(add_inst);
+        latch_ret_insts.push(func.add(Op::Return(vec![combined]), None));
+    }
+
+    let latch_ret = Block(func.blocks.len() as u32);
+    func.blocks.push(BlockData { params: Vec::new(), insts: latch_ret_insts });
+    let latch = Block(func.blocks.len() as u32);
+    let latch_brif = if then_is_base {
+        Op::Brif(latch_cond, latch_ret, Vec::new(), loop_head, latch_params.clone())
+    } else {
+        Op::Brif(latch_cond, loop_head, latch_params.clone(), latch_ret, Vec::new())
+    };
+    latch_insts.push(func.add(latch_brif, None));
+    func.blocks.push(BlockData { params: latch_params, insts: latch_insts });
+
+    for (b, block) in func.blocks[..orig_blocks].iter().enumerate() {
+        if rewritten[b]
+            && let Some(&last) = block.insts.last()
+            && let Op::Jump(target, _) = &mut func.insts[last.index()].op
+            && *target == loop_head
+        {
+            *target = latch;
+        }
+    }
+    func.blocks[loop_head.index()].insts = vec![func.add(Op::Jump(rec_b, rec_args), None)];
+    func.blocks[old_entry.index()].insts.clear();
+    func.blocks[base_b.index()].params.clear();
+    func.blocks[base_b.index()].insts.clear();
 }

@@ -183,19 +183,131 @@ pub(crate) struct Ranges<'a> {
 
 impl<'a> Ranges<'a> {
     /// The ranges of `func`'s values over the blocks of `order`, with the constants `consts` an earlier fold found.
-    pub(crate) fn new(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), order: &[Block]) -> Self {
+    pub(crate) fn new(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>])) -> Self {
         let table = func.types.iter().map(|ty| (0, top(*ty))).collect();
         let mut ranges = Self { defs, table };
-        for inst in order.iter().flat_map(|block| &func.blocks[block.index()].insts) {
-            let data = &func.insts[inst.index()];
-            let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
-            let fact = match consts.get(result.index()).copied().flatten() {
-                Some(imm) => Fact::constant(func.ty(result), imm),
-                None => ranges.derive(func, &data.op, func.ty(result)),
-            };
-            ranges.table[result.index()] = (fact.lo, fact.hi);
+        let mut incoming: Vec<Vec<(Block, &[Value])>> = vec![Vec::new(); func.blocks.len()];
+        let mut complete = vec![true; func.blocks.len()];
+        for pred_idx in 0..func.blocks.len() {
+            let pred = Block(pred_idx as u32);
+            match func.last(pred) {
+                Some(Op::Jump(target, args)) => incoming[target.index()].push((pred, args.as_slice())),
+                Some(Op::Brif(_, then, then_args, otherwise, else_args)) => {
+                    incoming[then.index()].push((pred, then_args.as_slice()));
+                    incoming[otherwise.index()].push((pred, else_args.as_slice()));
+                }
+                _ => {
+                    for target in func.successors(pred) {
+                        complete[target.index()] = false;
+                    }
+                }
+            }
+        }
+        for &block in order {
+            ranges.refine_params(func, consts, (&incoming, &complete, single, idom), block);
+            for inst in &func.blocks[block.index()].insts {
+                let data = &func.insts[inst.index()];
+                let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
+                let fact = match consts.get(result.index()).copied().flatten() {
+                    Some(imm) => Fact::constant(func.ty(result), imm),
+                    None => ranges.derive(func, &data.op, func.ty(result)),
+                };
+                ranges.table[result.index()] = (fact.lo, fact.hi);
+            }
         }
         ranges
+    }
+
+    fn refine_params(&mut self, func: &Function, consts: &[Option<i64>], (incoming, complete, single, idom): (&[Vec<(Block, &[Value])>], &[bool], &[Option<Block>], &[Option<Block>]), block: Block) {
+        if !complete[block.index()] || incoming[block.index()].is_empty() {
+            return;
+        }
+        for (k, &p) in func.blocks[block.index()].params.iter().enumerate() {
+            let ty = func.ty(p);
+            if !ty.is_small_int() {
+                continue;
+            }
+            let (mut min_lo, mut has_outside, mut valid) = (u64::MAX, false, true);
+            for &(pred, args) in &incoming[block.index()] {
+                let Some(&arg) = args.get(k) else {
+                    valid = false;
+                    break;
+                };
+                if let Some(step) = self.add_step(func, consts, arg, p, ty) {
+                    if !self.edge_proves_no_wrap(func, single, idom, (block, pred), (p, ty, step)) {
+                        valid = false;
+                        break;
+                    }
+                } else {
+                    has_outside = true;
+                    min_lo = min_lo.min(self.of(arg).lo);
+                }
+            }
+            if valid && has_outside && min_lo > 0 && min_lo <= top(ty) {
+                self.table[p.index()].0 = min_lo;
+            }
+        }
+    }
+
+    fn add_step(&self, func: &Function, consts: &[Option<i64>], arg: Value, p: Value, ty: Type) -> Option<u64> {
+        let &Op::Binary(Binary::Iadd, x, y) = self.op(func, arg)? else {
+            return None;
+        };
+        let other = if x == p { y } else if y == p { x } else { return None };
+        let k = consts.get(other.index()).copied().flatten().map(|imm| unsigned(imm, ty)).or_else(|| match self.op(func, other) {
+            Some(&Op::Const(imm)) => Some(unsigned(imm, ty)),
+            _ => self.constant(other),
+        })?;
+        (k > 0).then_some(k)
+    }
+
+    fn edge_proves_no_wrap(&self, func: &Function, single: &[Option<Block>], idom: &[Option<Block>], (block, pred): (Block, Block), (p, ty, step): (Value, Type, u64)) -> bool {
+        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(pred)
+            && then != otherwise
+            && (then == block || otherwise == block)
+            && self.proves_no_wrap(func, cond, then == block, p, ty, step, 0)
+        {
+            return true;
+        }
+        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(block)
+            && then != otherwise
+        {
+            let via_then = single[then.index()] == Some(block) && dominates(idom, then, pred) && self.proves_no_wrap(func, cond, true, p, ty, step, 0);
+            let via_else = single[otherwise.index()] == Some(block) && dominates(idom, otherwise, pred) && self.proves_no_wrap(func, cond, false, p, ty, step, 0);
+            return via_then || via_else;
+        }
+        false
+    }
+
+    fn proves_no_wrap(&self, func: &Function, cond: Value, taken: bool, p: Value, ty: Type, step: u64, depth: u8) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        let Some(max_p) = top(ty).checked_sub(step) else {
+            return false;
+        };
+        match self.op(func, cond) {
+            Some(&Op::Binary(Binary::Band, a, b)) if taken => {
+                self.proves_no_wrap(func, a, true, p, ty, step, depth + 1) || self.proves_no_wrap(func, b, true, p, ty, step, depth + 1)
+            }
+            Some(&Op::Binary(Binary::Bor, a, b)) if !taken => {
+                self.proves_no_wrap(func, a, false, p, ty, step, depth + 1) || self.proves_no_wrap(func, b, false, p, ty, step, depth + 1)
+            }
+            Some(&Op::Icmp(cc, x, y)) => {
+                let eff = if taken { cc } else { cc.inverse() };
+                let (kind, lhs, rhs) = rel_of(eff, x, y);
+                if lhs != p {
+                    return false;
+                }
+                let rhs_hi = self.of(rhs).hi;
+                match kind {
+                    RelKind::Ult => rhs_hi > 0 && rhs_hi - 1 <= max_p,
+                    RelKind::Ule => rhs_hi <= max_p,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     fn op<'f>(&self, func: &'f Function, value: Value) -> Option<&'f Op> {
@@ -502,13 +614,28 @@ pub(crate) fn single_preds(func: &Function) -> Vec<Option<Block>> {
     single.into_iter().map(Option::flatten).collect()
 }
 
+fn dominates(idom: &[Option<Block>], dom: Block, mut node: Block) -> bool {
+    loop {
+        if node == dom {
+            return true;
+        }
+        let Some(parent) = idom[node.index()] else {
+            return false;
+        };
+        if parent == node {
+            return false;
+        }
+        node = parent;
+    }
+}
+
 /// Settles the compares, traps and branches that the facts on entry to each block and its earlier instructions decide: a settled compare's result becomes a constant in `consts`, a trap that cannot fire goes, and a settled branch becomes a jump. A block's facts on entry are its only predecessor's facts on exit plus that edge's branch. Returns whether anything changed.
 pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [Option<i64>]) -> bool {
     let Some(entry) = func.entry else { return false };
     let (single, (order, _, idom)) = (single_preds(func), crate::dom::dominators(func, entry));
     let (mut decided, mut compares) = (Vec::new(), Vec::new());
     {
-        let ranges = Ranges::new(func, (defs, consts), &order);
+        let ranges = Ranges::new(func, (defs, consts), (&order, &single, &idom));
         let mut exits: Vec<Option<Path>> = vec![None; func.blocks.len()];
         for &block in &order {
             let mut path = match single[block.index()].and_then(|pred| exits[pred.index()].as_ref().map(|exit| (pred, exit.clone()))) {

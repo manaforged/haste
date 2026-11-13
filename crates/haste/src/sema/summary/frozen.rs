@@ -13,7 +13,7 @@ use super::super::table::Table;
 use super::super::ty::{Kind, Ty, Types};
 use super::{PolyInst, PolyObligation, PolySummary, codec};
 
-pub(super) fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
+pub(in crate::sema) fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
     let tree = cx.outline.crates.get(item.krate as usize)?;
     if !tree.env.release || !tree.env.fixed {
         return None;
