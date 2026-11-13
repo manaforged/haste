@@ -569,11 +569,14 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     let ir_h = inline.max_callee_height;
     let Some((func, relocs, reloc_plan, ir_cycle)) = quiet.lowered(slots, lowered)? else { return Ok((None, fp_cycle)) };
     let cycle = fp_cycle.min(ir_cycle);
-    let height = fp_h.max(ir_h).saturating_add(1);
-    let mut template = if reloc_plan.has_promoted() || height > MAX_INLINE_HEIGHT {
+    let base_h = fp_h.max(ir_h);
+    let mut template = if reloc_plan.has_promoted() {
         None
     } else {
-        simplify_inline(func, limit).map(|(body, returns)| Arc::new(InlineTemplate { body, returns, reloc_plan, height }))
+        simplify_inline(func, limit).and_then(|(body, returns)| {
+            let height = if body.size() > 32 { base_h.saturating_add(1) } else { base_h };
+            (height <= MAX_INLINE_HEIGHT).then(|| Arc::new(InlineTemplate { body, returns, reloc_plan, height }))
+        })
     };
     let depth = inline.stack.len().saturating_sub(1);
     if cycle > depth && quiet.holds(cx, slots) {
