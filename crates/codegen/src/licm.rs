@@ -126,7 +126,7 @@ fn preheader(func: &mut Function, each: &Loop, home: &mut Vec<Option<Block>>) ->
 }
 
 /// Moves into the loop's entry block, before its jump, each instruction of the loop that may move, in order, and records their new home.
-fn hoist(func: &mut Function, each: &Loop, entry: Block, readonly: &[bool], home: &mut [Option<Block>]) {
+fn hoist(func: &mut Function, each: &Loop, entry: Block, (readonly, ro_bytes): (&[bool], &[u32]), home: &mut [Option<Block>]) {
     let writes = (0..each.body.len()).filter(|block| each.body[*block]).flat_map(|block| &func.blocks[block].insts).any(|inst| {
         let op = &func.insts[inst.index()].op;
         clobbers(op) || matches!(op, Op::Store(..) | Op::StackStore(..))
@@ -145,8 +145,12 @@ fn hoist(func: &mut Function, each: &Loop, entry: Block, readonly: &[bool], home
             }
             let static_loc = matches!(data.op, Op::StackAddr(..) | Op::SlotAddr(_))
                 || (matches!(data.op, Op::Const(_)) && data.result.is_none_or(|result| !func.ty(result).is_float()));
-            let load_ok = match data.op {
-                Op::Load(addr, _) => head && !calls && (!writes || (head_prefix && readonly.get(addr.index()).copied().unwrap_or(false))),
+            let load_ok = match (&data.op, data.result) {
+                (&Op::Load(addr, offset), Some(res)) if !calls => {
+                    let width = func.ty(res).bytes();
+                    let deref_ok = offset >= 0 && (offset as u64) + u64::from(width) <= u64::from(ro_bytes.get(addr.index()).copied().unwrap_or(0));
+                    (head && !writes) || (head_prefix && readonly.get(addr.index()).copied().unwrap_or(false)) || deref_ok
+                }
                 _ => false,
             };
             let movable = (speculable(&data.op) && !(calls && static_loc)) || load_ok;
@@ -178,9 +182,13 @@ pub(crate) fn run(func: &mut Function) {
         return;
     }
     let mut readonly = vec![false; func.types.len()];
+    let mut ro_bytes = vec![0_u32; func.types.len()];
     for (i, &param) in func.blocks[entry.index()].params.iter().enumerate() {
         if i < 64 && (func.signature.readonly_params >> i) & 1 != 0 {
             readonly[param.index()] = true;
+        }
+        if i < 16 {
+            ro_bytes[param.index()] = func.signature.readonly_bytes[i];
         }
     }
     let mut home = homes(func);
@@ -196,7 +204,7 @@ pub(crate) fn run(func: &mut Function) {
             Some(created)
         });
         if let Some(entry) = pre {
-            hoist(func, &found[idx], entry, &readonly, &mut home);
+            hoist(func, &found[idx], entry, (&readonly, &ro_bytes), &mut home);
         }
     }
 }

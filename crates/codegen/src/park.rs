@@ -151,10 +151,15 @@ fn victim_slot<F: Copy + PartialEq>(
             .filter(|&(u, _)| u > end)
             .map(|(_, s)| s);
     };
-    let density = |v: usize| (cost[v], live.total_len(v));
-    let below = |(a, la): (u64, u64), (b, lb): (u64, u64)| u128::from(a) * u128::from(lb) < u128::from(b) * u128::from(la);
-    let best = candidates.reduce(|a, b| if below(density(holders[b][0]), density(holders[a][0])) { b } else { a })?;
-    below(density(holders[best][0]), density(value)).then_some(best)
+    let below = |v: usize, u: usize| {
+        if cost[v] <= 2 && cost[u] <= 2 {
+            u128::from(cost[v]) * u128::from(live.total_len(u)) < u128::from(cost[u]) * u128::from(live.total_len(v))
+        } else {
+            cost[v] < cost[u] || (cost[v] == cost[u] && live.total_len(v) > live.total_len(u))
+        }
+    };
+    let best = candidates.reduce(|a, b| if below(holders[b][0], holders[a][0]) { b } else { a })?;
+    below(holders[best][0], value).then_some(best)
 }
 
 pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class: &Class<F>, pooled: &[bool], hints: &Hints) -> (Vec<Option<F>>, Vec<F>) {
@@ -208,7 +213,7 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         {
             chosen = partners[value].iter().filter_map(|p| homes[p.index()]).find_map(|reg| {
                 let s = pool.regs.iter().position(|r| *r == reg)?;
-                let ok = if needs_saved { pool.is_saved[s] && !wide_val } else { !pool.is_saved[s] || (!wide_val && used.contains(&reg)) };
+                let ok = if needs_saved { (pool.is_saved[s] || can_park) && !wide_val } else { !pool.is_saved[s] || (!wide_val && used.contains(&reg)) };
                 (ok && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start)).then_some(s)
             });
         }

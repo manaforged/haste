@@ -33,6 +33,9 @@ const DEBUG_BUDGET: Budget = Budget { insts: 30, always: 100, exprs: 20 };
 /// The budget of the release profile.
 const RELEASE_BUDGET: Budget = Budget { insts: 400, always: 1000, exprs: 400 };
 
+/// The release-profile instruction and expression limit at a call site carrying a static vtable.
+const DEVIRT_LIMIT: usize = 900;
+
 /// The budget of the build profile.
 fn budget() -> &'static Budget {
     match crate::profile() {
@@ -90,6 +93,10 @@ pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn supe
 
 /// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
 pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
+    inline_limit_at(cx, reached, index, false)
+}
+
+fn inline_limit_at(cx: &mut Context<'_>, reached: &Reached, index: usize, devirt: bool) -> Option<usize> {
     let ((item, _), Ok(typed)) = &reached.list[index] else {
         return None;
     };
@@ -105,17 +112,22 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
         return None;
     }
     let budget = budget();
+    let release = crate::profile() == crate::outline::tree::Profile::Release;
+    let insts = if devirt && release { DEVIRT_LIMIT } else { budget.insts };
     if !matches!(typed.shape, Shape::Body) {
-        return Some(budget.insts);
+        return Some(insts);
     }
     match hint {
         Hint::Never => None,
         Hint::Always => Some(budget.always),
         Hint::Inline => {
-            let max_exprs = if crate::profile() == crate::outline::tree::Profile::Release || env.release { 2500 } else { 200 };
-            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(budget.insts)
+            let max_exprs = if release || env.release { 2500 } else { 200 };
+            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(insts)
         }
-        Hint::Default => cx.body(*item).is_ok_and(|body| body.exprs.len() <= budget.exprs).then_some(budget.insts),
+        Hint::Default => {
+            let max_exprs = if devirt && release { DEVIRT_LIMIT } else { budget.exprs };
+            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(insts)
+        }
     }
 }
 
@@ -362,8 +374,8 @@ impl Lower<'_, '_> {
         self.call_with(Callee::Reached(index, origin), (params, callee.ret), values)
     }
 
-    fn inline_callee(&mut self, index: usize) -> Result<Option<Arc<InlinedCallee>>> {
-        let Some(limit) = inline_limit(self.cx, self.reached, index) else {
+    fn inline_callee(&mut self, index: usize, devirt: bool) -> Result<Option<Arc<InlinedCallee>>> {
+        let Some(limit) = inline_limit_at(self.cx, self.reached, index, devirt) else {
             return Ok(None);
         };
         let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, limit)?;
@@ -390,9 +402,10 @@ impl Lower<'_, '_> {
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
     fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
+        let devirt = self.b.func.has_vtable_slots();
         let code = match callee {
             Callee::Code(code) => code,
-            Callee::Reached(index, origin) => match if self.slots.allow_inline() { self.inline_callee(index)? } else { None } {
+            Callee::Reached(index, origin) => match if self.slots.allow_inline() { self.inline_callee(index, devirt)? } else { None } {
                 Some(inlined) => return Ok(self.emit_inlined(&inlined, origin, values)),
                 None => self.code_of(index, origin),
             },

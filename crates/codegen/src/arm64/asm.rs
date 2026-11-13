@@ -220,6 +220,8 @@ enum Fixup {
     Branch,
     /// A 19-bit word offset at bit 5: `b.cond`, `cbz`, `cbnz`.
     Cond,
+    /// A 14-bit word offset at bit 5: `tbz`, `tbnz`.
+    Tbz,
     /// A 21-bit byte offset: `adr`.
     Adr,
 }
@@ -273,6 +275,14 @@ impl Asm {
         self.jump(sized(base, size) | u32::from(reg.0), label, Fixup::Cond);
     }
 
+    /// Branches to `label` when bit `bit` of `reg` is zero, or nonzero when `nonzero`.
+    pub fn tbz(&mut self, nonzero: bool, reg: Reg, bit: u8, label: Label) {
+        let base = if nonzero { 0x3700_0000 } else { 0x3600_0000 };
+        let b5 = u32::from(bit >> 5) << 31;
+        let b40 = u32::from(bit & 0x1F) << 19;
+        self.jump(base | b5 | b40 | u32::from(reg.0), label, Fixup::Tbz);
+    }
+
     pub fn adr(&mut self, dst: Reg, label: Label) {
         self.jump(0x1000_0000 | u32::from(dst.0), label, Fixup::Adr);
     }
@@ -296,6 +306,7 @@ impl Asm {
             word |= match kind {
                 Fixup::Branch if (-(1 << 25)..1 << 25).contains(&delta) => (delta as u32) & 0x03FF_FFFF,
                 Fixup::Cond if (-(1 << 18)..1 << 18).contains(&delta) => ((delta as u32) & 0x7_FFFF) << 5,
+                Fixup::Tbz if (-(1 << 13)..1 << 13).contains(&delta) => ((delta as u32) & 0x3FFF) << 5,
                 Fixup::Adr if (-(1 << 20)..1 << 20).contains(&bytes) => {
                     let imm = bytes as u32;
                     ((imm & 3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5)

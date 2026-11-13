@@ -445,13 +445,17 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
     if bodies.is_cyclic(cx, reached, index) {
         return Ok((None, usize::MAX));
     }
-    if let Some(cached) = bodies.inlined.get(&index) {
+    if let Some(cached) = bodies.inlined.get(&index)
+        && (cached.is_some() || limit <= 400)
+    {
         return Ok((cached, usize::MAX));
     }
     if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
         return Ok((None, pos));
     }
-    if let Some((cached, cycle)) = inline.local.get(&index) {
+    if let Some((cached, cycle)) = inline.local.get(&index)
+        && (cached.is_some() || limit <= 400)
+    {
         return Ok((cached.clone(), *cycle));
     }
     let item = reached.list[index].0.0;
@@ -469,10 +473,12 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         }
         None => None,
     };
-    if cycle > depth && quiet.holds(cx, slots) {
-        return Ok((bodies.inlined.get_or_insert_with(index, || result), cycle));
+    if limit <= 400 {
+        if cycle > depth && quiet.holds(cx, slots) {
+            return Ok((bodies.inlined.get_or_insert_with(index, || result), cycle));
+        }
+        inline.local.insert(index, (result.clone(), if cycle < depth { cycle } else { usize::MAX }));
     }
-    inline.local.insert(index, (result.clone(), if cycle < depth { cycle } else { usize::MAX }));
     Ok((result, cycle))
 }
 

@@ -148,6 +148,9 @@ fn hash_purpose(mix: &mut HashMix, purpose: ArgumentPurpose) {
 pub(super) fn hash_sig(mix: &mut HashMix, sig: &Signature) {
     mix.byte(sig.call_conv as u8);
     mix.u64(sig.readonly_params);
+    for &b in &sig.readonly_bytes {
+        mix.u32(b);
+    }
     mix.usize(sig.params.len());
     for p in &sig.params {
         mix.byte(type_code(p.value_type));

@@ -359,7 +359,7 @@ fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<u8>>) ->
     Class { saved: regs.saved_float, leaf: regs.float.to_vec(), arrivals, passed }
 }
 
-const LOOP_WEIGHT: u64 = 8;
+const LOOP_WEIGHT: u64 = 16;
 const MAX_DEPTH: u32 = 4;
 
 fn block_weights(func: &Function) -> Vec<u64> {
@@ -517,6 +517,37 @@ fn promote_loop_consts<R>(func: &Function, census: &Uses, elided: &[bool], locat
     promoted
 }
 
+fn zero_ext<R>(func: &Function, order: &[Block], locations: &[Location<R>], census: &Uses) -> Vec<bool> {
+    let mut out = vec![false; func.types.len()];
+    let fits_mask = |v: Value, mask: i64| matches!(locations[v.index()], Location::Imm(m) if (0..=mask).contains(&m));
+    for block in order {
+        for &inst in &func.blocks[block.index()].insts {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            let z = match data.op {
+                Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(_) | Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(Convert::Uextend, _) => true,
+                Op::Binary(Binary::Band, a, b) => match func.types[res.index()] {
+                    Type::I8 => out[a.index()] || out[b.index()] || fits_mask(a, 0xff) || fits_mask(b, 0xff),
+                    Type::I16 => out[a.index()] || out[b.index()] || fits_mask(a, 0xffff) || fits_mask(b, 0xffff),
+                    _ => false,
+                },
+                Op::Convert(Convert::Ireduce, shifted) => {
+                    let src_ty = func.types[shifted.index()];
+                    let dst_bits = func.types[res.index()].bits();
+                    matches!(src_ty, Type::I64 | Type::I32)
+                        && census.def_inst[shifted.index()].is_some_and(|def| {
+                            matches!(func.insts[def.index()].op, Op::Binary(Binary::Ushr, _, c)
+                                if matches!(locations[c.index()], Location::Imm(shift) if (0..i64::from(src_ty.bits())).contains(&shift) && src_ty.bits() - (shift as u32) <= dst_bits))
+                        })
+                }
+                _ => false,
+            };
+            out[res.index()] = z;
+        }
+    }
+    out
+}
+
 pub(crate) fn plan<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
@@ -560,17 +591,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
     let (pairs, deferred) = pairs(func, &locations, &elided);
     let shared = if weighed { crate::color::share(func, &live, &locations, &deferred) } else { Vec::new() };
-    let zero_ext = func.insts.iter().fold(vec![false; count], |mut out, data| {
-        if let Some(res) = data.result
-            && matches!(
-                data.op,
-                Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(_) | Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(Convert::Uextend, _)
-            )
-        {
-            out[res.index()] = true;
-        }
-        out
-    });
+    let zero_ext = zero_ext(func, order, &locations, &census);
     Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext }
 }
 

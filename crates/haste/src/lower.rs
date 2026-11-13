@@ -211,9 +211,10 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
             Repr::Scalar(ty) => {
                 if ty == Type::I64
                     && let Kind::Ref(crate::sema::ty::Mut::Not, inner) = *cx.types.kind(param)
-                    && is_freeze_pointee(cx, inner)
+                    && let Some(bytes) = freeze_pointee_bytes(cx, inner)
                 {
                     signature.mark_readonly(sig_idx);
+                    signature.mark_readonly_bytes(sig_idx, bytes);
                 }
                 signature.params.push(AbiParam::new(ty));
             }
@@ -227,8 +228,12 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
     Ok(signature)
 }
 
-fn is_freeze_pointee(cx: &mut Context<'_>, ty: Ty) -> bool {
-    cx.is_unsized(ty).is_ok_and(|u| !u) && cx.layout(ty).is_ok_and(|l| l.size.bytes() > 0) && is_freeze_ty(cx, ty, 0)
+fn freeze_pointee_bytes(cx: &mut Context<'_>, ty: Ty) -> Option<u32> {
+    if !cx.is_unsized(ty).is_ok_and(|u| !u) || !is_freeze_ty(cx, ty, 0) {
+        return None;
+    }
+    let bytes = cx.layout(ty).ok()?.size.bytes();
+    u32::try_from(bytes).ok().filter(|&b| b > 0)
 }
 
 fn is_freeze_ty(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {

@@ -134,18 +134,27 @@ pub struct Signature {
     pub returns: Vec<AbiParam>,
     pub call_conv: CallConv,
     pub readonly_params: u64,
+    pub readonly_bytes: [u32; 16],
 }
 
 impl Signature {
     /// An empty signature in `call_conv`.
     pub fn new(call_conv: CallConv) -> Self {
-        Self { params: Vec::new(), returns: Vec::new(), call_conv, readonly_params: 0 }
+        Self { params: Vec::new(), returns: Vec::new(), call_conv, readonly_params: 0, readonly_bytes: [0; 16] }
     }
 
     /// Marks parameter `index` as pointing to immutable memory for the duration of the call.
     pub fn mark_readonly(&mut self, index: usize) {
         if index < 64 {
             self.readonly_params |= 1_u64 << index;
+        }
+    }
+
+    /// Marks parameter `index` as pointing to `bytes` bytes of dereferenceable, immutable memory for the duration of the call.
+    pub fn mark_readonly_bytes(&mut self, index: usize, bytes: u32) {
+        self.mark_readonly(index);
+        if index < 16 {
+            self.readonly_bytes[index] = bytes;
         }
     }
 }
