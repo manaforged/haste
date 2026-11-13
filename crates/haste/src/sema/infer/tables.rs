@@ -104,6 +104,26 @@ impl BodyTables {
         Arc::clone(EMPTY.get_or_init(|| Arc::new(Self::default())))
     }
 
+    /// Every expression and desugared `for`/`await` temporary type that lowering may own and drop.
+    pub fn owned_tys(&self) -> impl Iterator<Item = Ty> + '_ {
+        self.exprs
+            .iter()
+            .copied()
+            .chain(self.fors.values().map(|f| f.iter))
+            .chain(self.awaits.values().map(|a| a.future))
+    }
+
+    /// Expression and desugared `for`/`await` temporary types owned at `expr`.
+    pub fn expr_owned_tys(&self, expr: ExprId) -> impl Iterator<Item = Ty> + '_ {
+        [
+            Some(self.exprs[expr.0 as usize]),
+            self.fors.get(&expr).map(|f| f.iter),
+            self.awaits.get(&expr).map(|a| a.future),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
     /// The resolution stored at `key` in these tables.
     pub fn site_res(&self, key: SiteKey) -> Option<Res> {
         match key {

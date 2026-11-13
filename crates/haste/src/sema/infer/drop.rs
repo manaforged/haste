@@ -132,7 +132,7 @@ pub fn drop_calls(cx: &mut Context<'_>, typed: &Typed) -> Result<Vec<Res>> {
     let tables = scoped.ensure_tables(&cx.types);
     let mut seen = rustc_hash::FxHashSet::default();
     let mut calls = Vec::new();
-    for ty in typed.locals.iter().map(|local| local.ty).chain(tables.exprs.iter().copied()) {
+    for ty in typed.locals.iter().map(|local| local.ty).chain(tables.owned_tys()) {
         if ty != Ty::NONE && seen.insert(ty) {
             calls.extend(glue_call(cx, ty)?);
         }

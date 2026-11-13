@@ -34,13 +34,33 @@ struct Watch {
     by: Option<PathBuf>,
 }
 
-/// The roots a batch compiles from, picked from the loaded workspace.
-type Pick = fn(&graph::Workspace, &outline::Outline) -> Vec<ItemRef>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchKind {
+    Cases,
+    MainCheck,
+    MainAot,
+}
+
+impl BatchKind {
+    fn mode(self) -> crate::image::ImageMode {
+        match self {
+            BatchKind::Cases => crate::image::ImageMode::Jit,
+            BatchKind::MainCheck => crate::image::ImageMode::Check,
+            BatchKind::MainAot => crate::image::ImageMode::Aot,
+        }
+    }
+
+    fn pick(self, workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
+        match self {
+            BatchKind::Cases => case_items(workspace, outline),
+            BatchKind::MainCheck | BatchKind::MainAot => main_items(workspace, outline),
+        }
+    }
+}
 
 /// Root functions inferred and compiled ahead of time into one image: how to pick them, the inference store, their names and indexes, what they reach, and why each function that did not compile failed.
 struct Batch {
-    pick: Pick,
-    is_cases: bool,
+    kind: BatchKind,
     store: Option<Cache>,
     labels: Vec<String>,
     roots: Vec<usize>,
@@ -63,10 +83,10 @@ fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<Watch
     sources.into_iter().map(|path| (path, None)).chain(included).map(|(path, by)| Watch { stamp: stamp(&path), path, by }).collect()
 }
 
-fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, pick: Pick) -> (Vec<ItemRef>, Vec<Instance>) {
-    let cases = pick(workspace, outline);
-    let roots = cases.iter().map(|item| (*item, sema::substs::Substs::EMPTY)).collect();
-    (cases, roots)
+fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, kind: BatchKind) -> (Vec<ItemRef>, Vec<Instance>) {
+    let items = kind.pick(workspace, outline);
+    let roots = items.iter().map(|item| (*item, sema::substs::Substs::EMPTY)).collect();
+    (items, roots)
 }
 
 /// The `main` of the first member binary.
@@ -118,16 +138,21 @@ fn open_batch_substrate(workspace: &graph::Workspace) -> SubstrateSlot {
 }
 
 fn finish_batch(
-    (pick, main): (Pick, Option<ItemRef>),
+    (kind, main): (BatchKind, Option<ItemRef>),
     (cases, reached): (&[ItemRef], Reached),
-    (mode, drop_finals): (crate::image::ImageMode, bool),
+    drop_finals: bool,
     substrate: (Option<(u64, u64)>, &Option<std::sync::Arc<crate::substrate::Substrate>>),
     (mut cx, reach_clock): (sema::Context<'_>, sema::census::Clock),
 ) -> Result<Batch> {
+    let mode = kind.mode();
     let reach_span = reach_clock.elapsed();
     let codegen_clock = sema::census::Clock::now();
     let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate.0);
-    let valid: Vec<ItemRef> = if main.is_none() { cases.iter().copied().filter(|&item| sema::infer::is_case_sig(&mut cx, item)).collect() } else { Vec::new() };
+    let valid: Vec<ItemRef> = match kind {
+        BatchKind::Cases => cases.iter().copied().filter(|&item| sema::infer::is_case_sig(&mut cx, item)).collect(),
+        BatchKind::MainCheck => cases.to_vec(),
+        BatchKind::MainAot => Vec::new(),
+    };
     let roots: Vec<usize> = match main {
         Some(main) => sema::reach::main_roots(&mut cx, main)?.into_iter().map(|inst| reached.index[&inst]).collect(),
         None => valid.iter().map(|item| reached.index[&(*item, sema::substs::Substs::EMPTY)]).collect(),
@@ -143,7 +168,7 @@ fn finish_batch(
     let codegen_span = codegen_clock.elapsed();
     save_batch_substrate(&cx, &image, drop_finals, substrate, pre_builder);
     let labels = valid.iter().map(|item| cx.name(*item).to_owned()).collect();
-    Ok(Batch { pick, is_cases: main.is_none(), store: Some(cx.release().0), labels, roots, reached, image, broken, reach_span, codegen_span })
+    Ok(Batch { kind, store: Some(cx.release().0), labels, roots, reached, image, broken, reach_span, codegen_span })
 }
 
 fn export_pre_summaries(cx: &mut sema::Context<'_>, drop_finals: bool, substrate_key: Option<(u64, u64)>) -> Option<crate::substrate::SubstrateBuilder> {
@@ -191,11 +216,12 @@ fn save_batch_substrate(
 }
 
 impl Batch {
-    /// Infers and compiles every root `pick` finds in `workspace` from nothing.
-    fn new(workspace: &graph::Workspace, compilation: &mut Compilation, pick: Pick, mode: crate::image::ImageMode, drop_finals: bool) -> Result<Batch> {
+    /// Infers and compiles every root `kind` finds in `workspace` from nothing.
+    fn new(workspace: &graph::Workspace, compilation: &mut Compilation, kind: BatchKind, drop_finals: bool) -> Result<Batch> {
+        let mode = kind.mode();
         let reach_clock = sema::census::Clock::now();
-        let main = (mode == crate::image::ImageMode::Aot).then(|| main_item(workspace, &compilation.outline).context("no member binary has a `main`")).transpose()?;
-        let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, pick) };
+        let main = (kind == BatchKind::MainAot).then(|| main_item(workspace, &compilation.outline).context("no member binary has a `main`")).transpose()?;
+        let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, kind) };
         let (substrate_key, existing_sub) = open_batch_substrate(workspace);
         let mut cache = Cache::default();
         cache.set_warm_sysroot_bodies(mode != crate::image::ImageMode::Check);
@@ -205,11 +231,12 @@ impl Batch {
         crate::macros::reach_resolved_with_cache(
             compilation,
             cache,
-            |cx| match main {
-                Some(main) => sema::reach::main_roots(cx, main).map_or_else(|_| vec![(main, sema::substs::Substs::EMPTY)], Into::into),
-                None => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_case_sig(cx, item)).collect(),
+            |cx| match kind {
+                BatchKind::MainAot => sema::reach::main_roots(cx, main.expect("main checked")).map_or_else(|_| vec![(main.expect("main checked"), sema::substs::Substs::EMPTY)], Into::into),
+                BatchKind::Cases => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_case_sig(cx, item)).collect(),
+                BatchKind::MainCheck => root_insts.clone(),
             },
-            |cx, reached| finish_batch((pick, main), (&cases, reached), (mode, drop_finals), (substrate_key, &existing_sub), (cx, reach_clock)),
+            |cx, reached| finish_batch((kind, main), (&cases, reached), drop_finals, (substrate_key, &existing_sub), (cx, reach_clock)),
         )
     }
 
@@ -233,9 +260,9 @@ impl Batch {
             return false;
         };
         let touched = store.invalidate(&compilation.outline, self.reached.list.iter().map(|(instance, _)| instance), Edited::Crates(crates));
-        let (mut cases, mut roots) = batch_roots(workspace, &compilation.outline, self.pick);
+        let (mut cases, mut roots) = batch_roots(workspace, &compilation.outline, self.kind);
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
-        if self.is_cases {
+        if self.kind == BatchKind::Cases {
             cases.retain(|&item| sema::infer::is_case_sig(&mut cx, item));
             roots = cases.iter().map(|&item| (item, sema::substs::Substs::EMPTY)).collect();
         }
@@ -329,7 +356,7 @@ impl Build {
                     anyhow::bail!("{}", errors.join("\n"));
                 }
             }
-            self.cases = Some(Batch::new(workspace, &mut self.compilation, case_items, crate::image::ImageMode::Jit, false)?);
+            self.cases = Some(Batch::new(workspace, &mut self.compilation, BatchKind::Cases, false)?);
         }
         Ok(())
     }
@@ -349,7 +376,7 @@ impl Build {
             bail!("no member binary has a `main`");
         }
         if self.binary.is_none() {
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, crate::image::ImageMode::Check, drop_finals)?);
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainCheck, drop_finals)?);
         }
         Ok(())
     }
@@ -443,7 +470,7 @@ impl Build {
     pub(crate) fn emit_executable(&mut self, workspace: &graph::Workspace, path: &std::path::Path) -> Result<i32> {
         let started = Instant::now();
         if self.binary.is_none() {
-            self.binary = Some(Batch::new(workspace, &mut self.compilation, main_items, crate::image::ImageMode::Aot, false)?);
+            self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainAot, false)?);
         }
         let bin = self.binary.as_ref().context("the binary is not compiled")?;
         if !bin.broken.is_empty() {

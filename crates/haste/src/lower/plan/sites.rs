@@ -47,7 +47,7 @@ pub(super) fn closure_own_calls(cx: &mut Context<'_>, plan: &BodyFootprintPlan, 
     let mut out: Vec<(ItemRef, Substs)> = calls.into_iter().filter_map(|r| match r { Res::Fn(i, s) => Some((i, s)), _ => None }).collect();
     if !typed.drops.is_empty() {
         let mut seen = FxHashSet::default();
-        let tys = closure_locals(plan, typed, tables, cb).into_iter().map(|l| typed.locals[l as usize].ty).chain(plan.expr_ids.iter().map(|&e| tables.exprs[e.0 as usize]));
+        let tys = closure_locals(plan, typed, tables, cb).into_iter().map(|l| typed.locals[l as usize].ty).chain(plan.expr_ids.iter().flat_map(|&e| tables.expr_owned_tys(e)));
         for ty in tys {
             if ty != Ty::NONE && seen.insert(ty) && let Some(res @ Res::Fn(di, ds)) = glue_call(cx, ty)? && typed.drops.contains(&res) {
                 out.push((di, ds));

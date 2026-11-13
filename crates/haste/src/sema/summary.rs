@@ -347,7 +347,7 @@ fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Res
     let mut seen_drop = HashSet::default();
     let mut fixed_drops = Vec::new();
     let mut drop_tys = Vec::new();
-    for ty in summary.locals.iter().map(|l| l.ty).chain(summary.template.exprs.iter().copied()) {
+    for ty in summary.locals.iter().map(|l| l.ty).chain(summary.template.owned_tys()) {
         if ty == Ty::NONE || !seen_drop.insert(ty) {
             continue;
         }
@@ -364,7 +364,9 @@ fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Res
     }
     let mut seen_param = HashSet::default();
     let mut parametric_tys = Vec::new();
-    let all_tys = summary.locals.iter().map(|l| l.ty).chain(summary.ret).chain(summary.template.pats.values().copied()).chain(summary.template.exprs.iter().copied());
+    let tpl = &summary.template;
+    let flow_tys = tpl.fors.values().flat_map(|f| [f.iter, f.option]).chain(tpl.tries.values().map(|t| t.flow)).chain(tpl.awaits.values().flat_map(|a| [a.future, a.polled]));
+    let all_tys = summary.locals.iter().map(|l| l.ty).chain(summary.ret).chain(tpl.pats.values().copied()).chain(tpl.exprs.iter().copied()).chain(flow_tys);
     for ty in all_tys {
         if ty != Ty::NONE && cx.types.has_params(ty) && seen_param.insert(ty) {
             parametric_tys.push(ty);

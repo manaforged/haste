@@ -10,17 +10,28 @@ with_timeout() {
 }
 for build_target in examples/hello tests/diff tests/probes/cl; do
     build_out=$(run_haste build "$build_target" </dev/null 2>&1); build_status=$?
-    if [ "$build_status" -ne 0 ]; then
+    if [ "$build_status" -ne 0 ] || ! printf '%s\n' "$build_out" | grep -Eq '^[1-9][0-9]* functions reached, 0 failed'; then
         echo "build $build_target DIFF: status $build_status: $(printf '%s\n' "$build_out" | tail -2 | cut -c1-160)"
         exit 1
     fi
 done
-check_reject() {
-    local label=$1 body=$2 dir="$tmp/reject_$1" c_status b_status r_status
+write_scratch_crate() {
+    local dir=$1 pkg=$2 body=$3
     mkdir -p "$dir/src"
-    printf '[package]\nname = "reject_%s"\nversion = "0.1.0"\nedition = "2021"\n' "$label" >"$dir/Cargo.toml"
-    cp examples/hello/Cargo.lock "$dir/Cargo.lock"
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "$pkg" >"$dir/Cargo.toml"
+    printf 'version = 4\n\n[[package]]\nname = "%s"\nversion = "0.1.0"\n' "$pkg" >"$dir/Cargo.lock"
     printf '%s\n' "$body" >"$dir/src/main.rs"
+}
+write_scratch_crate "$tmp/accept_ok" "accept_ok" 'fn main() {}'
+accept_out=$(run_haste build "$tmp/accept_ok" </dev/null 2>&1); accept_b=$?
+run_cargo check --quiet --locked --manifest-path "$tmp/accept_ok/Cargo.toml" </dev/null >/dev/null 2>&1; accept_c=$?
+if [ "$accept_c" -ne 0 ] || [ "$accept_b" -ne 0 ] || ! printf '%s\n' "$accept_out" | grep -Eq '^[1-9][0-9]* functions reached, 0 failed'; then
+    echo "accept_ok DIFF: cargo=$accept_c build=$accept_b: $(printf '%s\n' "$accept_out" | tail -2 | cut -c1-160)"
+    exit 1
+fi
+check_reject() {
+    local label=$1 body=$2 dir="$tmp/reject_$1" pkg="reject_$1" c_status b_status r_status
+    write_scratch_crate "$dir" "$pkg" "$body"
     run_cargo check --quiet --locked --manifest-path "$dir/Cargo.toml" </dev/null >/dev/null 2>&1; c_status=$?
     run_haste build "$dir" </dev/null >/dev/null 2>&1; b_status=$?
     run_haste run "$dir" </dev/null >/dev/null 2>&1; r_status=$?
@@ -32,10 +43,7 @@ check_reject() {
 }
 check_reject unsatisfied_bound 'trait Marker {} fn needs<T: Marker>(_: T) {} fn main() { needs(1u8); }' || exit 1
 check_reject unconstrained_var 'fn main() { let _v = Vec::new(); }' || exit 1
-mkdir -p "$tmp/malformed/src"
-printf '[package]\nname = "malformed"\nversion = "0.1.0"\nedition = "2021"\n' >"$tmp/malformed/Cargo.toml"
-cp examples/hello/Cargo.lock "$tmp/malformed/Cargo.lock"
-printf 'macro x' >"$tmp/malformed/src/main.rs"
+write_scratch_crate "$tmp/malformed" "malformed" 'macro x'
 run_haste debug items "$tmp/malformed" </dev/null >/dev/null 2>"$tmp/malformed.err"; mal_status=$?
 if [ "$mal_status" -ge 128 ] || grep -q 'panicked at' "$tmp/malformed.err"; then
     echo "malformed macro DIFF: status $mal_status: $(tail -2 "$tmp/malformed.err")"
