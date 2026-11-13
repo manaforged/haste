@@ -232,6 +232,7 @@ pub(crate) fn run(func: &mut Function) -> bool {
             }
         }
     }
+    peel_entry_guard(func, (old_entry, new_entry, loop_head), old_params_len, orig_blocks, &rewritten);
     if let (Some(op), Some(acc), Some(rty)) = (accum_op, acc_param, ret_ty) {
         for b_idx in 0..orig_blocks {
             if rewritten[b_idx] {
@@ -253,4 +254,128 @@ pub(crate) fn run(func: &mut Function) -> bool {
         }
     }
     true
+}
+
+fn clone_pure_insts(
+    func: &mut Function,
+    insts: &[Inst],
+    map: &mut rustc_hash::FxHashMap<Value, Value>,
+    out: &mut Vec<Inst>,
+) -> bool {
+    for &inst in insts {
+        let mut data = func.insts[inst.index()].clone();
+        if matches!(
+            data.op,
+            Op::Call { .. }
+                | Op::TryCall { .. }
+                | Op::Store(..)
+                | Op::StackStore(..)
+                | Op::Copy(..)
+                | Op::Move(..)
+                | Op::AtomicLoad(..)
+                | Op::AtomicStore(..)
+                | Op::AtomicRmw(..)
+                | Op::AtomicCas(..)
+                | Op::Fence
+                | Op::Trap
+                | Op::Trapz(..)
+        ) {
+            return false;
+        }
+        let mut ok = true;
+        data.op.map_operands(|v| match map.get(&v) {
+            Some(&mapped) => mapped,
+            None => {
+                ok = false;
+                v
+            }
+        });
+        if !ok {
+            return false;
+        }
+        let res = data.result.map(|old| {
+            let fresh = func.value(func.ty(old));
+            map.insert(old, fresh);
+            fresh
+        });
+        out.push(func.add(data.op, res));
+    }
+    true
+}
+
+fn peel_entry_guard(
+    func: &mut Function,
+    (old_entry, new_entry, loop_head): (Block, Block, Block),
+    old_params_len: usize,
+    orig_blocks: usize,
+    rewritten: &[bool],
+) {
+    let Some(&term) = func.blocks[old_entry.index()].insts.last() else { return };
+    let Op::Brif(cond, then_b, then_args, else_b, else_args) = func.insts[term.index()].op.clone() else { return };
+    if then_b == else_b || func.blocks[new_entry.index()].insts.is_empty() {
+        return;
+    }
+    let mut preds = vec![0_u32; orig_blocks];
+    for block in &func.blocks[..orig_blocks] {
+        if let Some(&last) = block.insts.last() {
+            func.insts[last.index()].op.targets().for_each(|t| {
+                if t.index() < orig_blocks {
+                    preds[t.index()] += 1;
+                }
+            });
+        }
+    }
+    let is_base = |b: Block| {
+        b != old_entry
+            && b.index() < orig_blocks
+            && !rewritten[b.index()]
+            && preds[b.index()] == 1
+            && func.blocks[b.index()].insts.last().is_some_and(|&t| matches!(func.insts[t.index()].op, Op::Return(_)))
+    };
+    let (base_b, base_args, then_is_base) = if is_base(then_b) {
+        (then_b, then_args, true)
+    } else if is_base(else_b) {
+        (else_b, else_args, false)
+    } else {
+        return;
+    };
+
+    let mut map = rustc_hash::FxHashMap::default();
+    for (&old_p, &fresh_p) in func.blocks[loop_head.index()].params[..old_params_len].iter().zip(&func.blocks[new_entry.index()].params) {
+        map.insert(old_p, fresh_p);
+    }
+    let old_insts = func.blocks[old_entry.index()].insts.clone();
+    let Some((&_, old_body)) = old_insts.split_last() else { return };
+    let mut entry_insts = Vec::with_capacity(old_body.len() + 1);
+    if !clone_pure_insts(func, old_body, &mut map, &mut entry_insts) {
+        return;
+    }
+    let Some(&cloned_cond) = map.get(&cond) else { return };
+    let base_insts = func.blocks[base_b.index()].insts.clone();
+    let base_params = func.blocks[base_b.index()].params.clone();
+    if base_params.len() != base_args.len() {
+        return;
+    }
+    for (&param, &arg) in base_params.iter().zip(&base_args) {
+        let Some(&mapped) = map.get(&arg) else { return };
+        map.insert(param, mapped);
+    }
+    let mut fast_insts = Vec::with_capacity(base_insts.len());
+    if !clone_pure_insts(func, &base_insts, &mut map, &mut fast_insts) {
+        return;
+    }
+
+    let slow_insts = std::mem::take(&mut func.blocks[new_entry.index()].insts);
+    let slow_preheader = Block(func.blocks.len() as u32);
+    func.blocks.push(BlockData { params: Vec::new(), insts: slow_insts });
+    let fast_ret = Block(func.blocks.len() as u32);
+    func.blocks.push(BlockData { params: Vec::new(), insts: fast_insts });
+
+    let brif = if then_is_base {
+        Op::Brif(cloned_cond, fast_ret, Vec::new(), slow_preheader, Vec::new())
+    } else {
+        Op::Brif(cloned_cond, slow_preheader, Vec::new(), fast_ret, Vec::new())
+    };
+    entry_insts.push(func.add(brif, None));
+    func.blocks[new_entry.index()].insts = entry_insts;
 }

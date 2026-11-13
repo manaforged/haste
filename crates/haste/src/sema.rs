@@ -98,6 +98,7 @@ impl<'a> Context<'a> {
         self.trait_members.clear();
         self.impl_members.clear();
         self.aliases.clear();
+        self.eval_errors.clear();
     }
 
     /// A pass over an outline and its resolved names that reuses `store`.

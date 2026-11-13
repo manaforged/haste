@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Block, IntCC, Type, Value};
+use rustc_abi::{TagEncoding, Variants};
+use rustc_index::Idx;
 
 use crate::body::{ExprId, List, Pat, PatId};
 use crate::sema::infer::{Res, position, rest_split};
@@ -11,6 +13,13 @@ use super::ops::Num;
 use super::place::{Base, Place};
 use super::{Lower, Repr, repr};
 
+#[derive(Clone, Copy)]
+struct Hoisted {
+    derefs: u32,
+    peeled: Option<Place>,
+    tag: Option<(Ty, Type, Value)>,
+}
+
 impl Lower<'_, '_> {
     /// Lowers `match`: each arm tests its pattern and falls through to the next one when it fails.
     pub fn match_expr(&mut self, expr: ExprId, scrutinee: ExprId, arms: List) -> Result<Option<Value>> {
@@ -20,13 +29,15 @@ impl Lower<'_, '_> {
         }
         let from = self.scrutinee_path(scrutinee);
         let (join, joined, slot) = self.join_block(expr)?;
-        for at in self.body.list(arms).to_vec() {
+        let arm_ids = self.body.list(arms).to_vec();
+        let hoisted = self.hoist_match_scrutinee(&arm_ids, place)?;
+        for at in arm_ids {
             if !self.open {
                 break;
             }
             let arm = self.body.arms[at as usize];
             let next = self.b.create_block();
-            self.test(arm.pat, place, next)?;
+            self.test_with(arm.pat, place, hoisted, next)?;
             let mark = self.owned.len();
             self.bind_matched(arm.pat, place, from.clone())?;
             if let Some(guard) = arm.guard {
@@ -123,10 +134,71 @@ impl Lower<'_, '_> {
         self.typed.pats.get(&pat).copied().ok_or_else(|| anyhow::anyhow!("pattern has no type"))
     }
 
+    fn hoist_match_scrutinee(&mut self, arm_ids: &[u32], place: Option<Place>) -> Result<Option<Hoisted>> {
+        if arm_ids.len() < 4 {
+            return Ok(None);
+        }
+        let Some(first_pat) = arm_ids
+            .iter()
+            .map(|&at| self.body.arms[at as usize].pat)
+            .find(|&pat| !matches!(*self.body.pat(pat), Pat::Wild | Pat::Bind { sub: None, .. } | Pat::Or(_)))
+        else {
+            return Ok(None);
+        };
+        let derefs = self.typed.pat_derefs.get(&first_pat).copied().unwrap_or(0);
+        let Some(peeled) = self.peeled(first_pat, place)? else { return Ok(None) };
+        if matches!(peeled.repr, Repr::Scalar(_)) && matches!(peeled.base, Base::Addr(_)) {
+            let (Some(v), Some(slot)) = (self.read(peeled), self.slot(peeled.repr)) else { return Ok(None) };
+            let tmp = Place::slot(slot, peeled.repr);
+            self.write(tmp, v);
+            return Ok(Some(Hoisted { derefs, peeled: Some(tmp), tag: None }));
+        }
+        let Ok(ty) = self.pat_ty(first_pat) else { return Ok(None) };
+        let Kind::Adt(..) = *self.cx.types.kind(ty) else { return Ok(None) };
+        let layout = self.cx.layout(ty)?;
+        let Variants::Multiple { tag, tag_encoding: TagEncoding::Direct, tag_field, .. } = &layout.variants else {
+            return Ok(Some(Hoisted { derefs, peeled: Some(peeled), tag: None }));
+        };
+        let tag_ty = match tag.size(crate::sema::layout::target()?).bytes() {
+            1 => Type::I8,
+            2 => Type::I16,
+            4 => Type::I32,
+            8 => Type::I64,
+            _ => return Ok(Some(Hoisted { derefs, peeled: Some(peeled), tag: None })),
+        };
+        let offset = layout.fields.offset(tag_field.index()).bytes() as i32;
+        let Some(val) = self.read(peeled.at(offset, Repr::Scalar(tag_ty))) else {
+            return Ok(Some(Hoisted { derefs, peeled: Some(peeled), tag: None }));
+        };
+        Ok(Some(Hoisted { derefs, peeled: Some(peeled), tag: Some((ty, tag_ty, val)) }))
+    }
+
     /// Branches to `fail` unless the value at `place` matches `pat`.
     fn test(&mut self, pat: PatId, place: Option<Place>, fail: Block) -> Result<()> {
-        let place = self.peeled(pat, place)?;
-        self.test_variant(pat, place, fail)?;
+        self.test_with(pat, place, None, fail)
+    }
+
+    fn test_with(&mut self, pat: PatId, place: Option<Place>, hoisted: Option<Hoisted>, fail: Block) -> Result<()> {
+        let h = hoisted.filter(|h| {
+            !matches!(*self.body.pat(pat), Pat::Wild | Pat::Bind { sub: None, .. } | Pat::Or(_))
+                && self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) == h.derefs
+        });
+        let place = match h {
+            Some(h) => h.peeled,
+            None => self.peeled(pat, place)?,
+        };
+        if let Some((hty, tag_ty, tag_val)) = h.and_then(|h| h.tag)
+            && let Some(Res::Ctor(_, variant, _)) = self.typed.pat_res.get(&pat).cloned()
+            && self.pat_ty(pat)? == hty
+            && let Kind::Adt(item, _) = *self.cx.types.kind(hty)
+        {
+            let expected = self.cx.discriminants(item)?[variant as usize] as u128 & crate::sema::ty::mask(tag_ty.bits());
+            let expected = self.int_const(tag_ty, expected);
+            let ok = self.ins().icmp(IntCC::Equal, tag_val, expected);
+            self.pass(ok, fail);
+        } else {
+            self.test_variant(pat, place, fail)?;
+        }
         self.test_const(pat, place, fail)?;
         match *self.body.pat(pat) {
             Pat::Bind { sub: Some(sub), .. } => self.test(sub, place, fail),

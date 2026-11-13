@@ -234,12 +234,36 @@ impl Fold {
                 if let Some(known) = self.known(condition) {
                     return Some(if known != 0 { x } else { y });
                 }
-                (func.ty(condition) == func.ty(x)
+                if func.ty(condition) == func.ty(x)
                     && self.boolean(func, condition)
                     && self.known(x) == Some(1)
-                    && self.known(y) == Some(0))
-                .then_some(condition)
+                    && self.known(y) == Some(0)
+                {
+                    return Some(condition);
+                }
+                if let Some(&Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), lhs, rhs)) = self.def(func, condition) {
+                    for (var, imm_val) in [(lhs, rhs), (rhs, lhs)] {
+                        if let Some(c) = self.known(imm_val) {
+                            let ty = func.ty(var);
+                            let is_c = |v: Value| self.known(v).is_some_and(|imm| extend(imm, ty, false) == extend(c, ty, false));
+                            let is_var = |v: Value| self.find(v) == self.find(var);
+                            if (cc == IntCC::Equal && is_c(x) && is_var(y)) || (cc == IntCC::NotEqual && is_var(x) && is_c(y)) {
+                                return Some(var);
+                            }
+                        }
+                    }
+                }
+                None
             }
+            Op::Convert(kind @ (Convert::Bitcast | Convert::NarrowVec64), x) => match *self.def(func, x)? {
+                Op::Convert(inner, value)
+                    if (kind == Convert::Bitcast && inner == Convert::Bitcast && func.ty(value) != func.ty(x))
+                        || (kind == Convert::NarrowVec64 && inner == Convert::WidenVec64) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            },
             Op::Binary(kind, x, y) if func.ty(x).is_small_int() => self.neutral(func, kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
             Op::Unary(kind @ (Unary::Ineg | Unary::Bnot), x) => match *self.def(func, x)? {
                 Op::Unary(inner, value) if inner == kind => Some(value),
@@ -591,6 +615,36 @@ fn dead(func: &mut Function) {
     }
 }
 
+fn fold_bitcast_loads(func: &mut Function) {
+    let uses = func.use_counts();
+    let defs = defs(func);
+    let mut remap: Vec<Option<Value>> = vec![None; func.types.len()];
+    let mut dropped = vec![false; func.insts.len()];
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[inst.index()];
+        if let (Op::Convert(Convert::Bitcast, src), Some(res)) = (&data.op, data.result)
+            && uses[src.index()] == 1
+            && func.ty(*src).bytes() == func.ty(res).bytes()
+            && func.ty(*src) != func.ty(res)
+            && let Some(src_inst) = defs[src.index()]
+            && matches!(func.insts[src_inst.index()].op, Op::Load(..))
+        {
+            func.types[src.index()] = func.ty(res);
+            remap[res.index()] = Some(*src);
+            dropped[inst.index()] = true;
+        }
+    }
+    if remap.iter().all(Option::is_none) {
+        return;
+    }
+    for block in &mut func.blocks {
+        block.insts.retain(|inst| !dropped[inst.index()]);
+        for &inst in &block.insts {
+            func.insts[inst.index()].op.map_operands(|v| remap[v.index()].unwrap_or(v));
+        }
+    }
+}
+
 /// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump.
 pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
     let Some(entry) = func.entry else { return };
@@ -627,6 +681,7 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
     }
     crate::algebra::rewrite(func, &fold.defs);
     crate::algebra::invert(func);
+    fold_bitcast_loads(func);
     dead(func);
     if fold.thread(func, &pinned) | fold.branches(func) {
         prune(func, entry);

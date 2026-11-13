@@ -3,7 +3,27 @@ use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, Value};
 pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
     let depths = crate::licm::depths(func);
-    let is_cold = |block: Block| matches!(func.last(block), Some(Op::Trap));
+    let mut rev_preds = vec![Vec::new(); func.blocks.len()];
+    let mut can_exit = vec![false; func.blocks.len()];
+    let mut work = Vec::new();
+    for b in 0..func.blocks.len() {
+        let block = Block(b as u32);
+        if matches!(func.last(block), Some(Op::Return(_))) {
+            can_exit[b] = true;
+            work.push(block);
+        }
+        for succ in func.successors(block) {
+            rev_preds[succ.index()].push(block);
+        }
+    }
+    while let Some(block) = work.pop() {
+        for &pred in &rev_preds[block.index()] {
+            if !std::mem::replace(&mut can_exit[pred.index()], true) {
+                work.push(pred);
+            }
+        }
+    }
+    let is_cold = |block: Block| block != entry && !can_exit[block.index()];
     let mut visited = vec![false; func.blocks.len()];
     let mut post = Vec::with_capacity(func.blocks.len());
     let mut stack = vec![(entry, false)];
@@ -28,7 +48,17 @@ pub(crate) fn order(func: &Function) -> Vec<Block> {
     order.iter().for_each(|block| placed[block.index()] = true);
     order.retain(|block| *block == entry || !func.blocks[block.index()].insts.is_empty());
     order.extend((0..func.blocks.len() as u32).map(Block).filter(|block| !placed[block.index()] && !func.blocks[block.index()].insts.is_empty()));
-    order
+    let mut hot = Vec::with_capacity(order.len());
+    let mut cold = Vec::new();
+    for block in order {
+        if is_cold(block) {
+            cold.push(block);
+        } else {
+            hot.push(block);
+        }
+    }
+    hot.extend(cold);
+    hot
 }
 
 const TEST_LIMIT: usize = 4;

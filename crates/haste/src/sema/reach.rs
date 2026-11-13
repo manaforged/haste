@@ -13,7 +13,7 @@ use super::substs::Substs;
 use super::ty::{Kind, Ty};
 
 const MIN_PARALLEL_WAVE: usize = 4;
-const WAVE_BATCH: usize = 2;
+const MAX_WORKER_BATCH: usize = 32;
 
 /// One function at concrete type arguments.
 pub type Instance = (ItemRef, Substs);
@@ -252,14 +252,14 @@ fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: Vec<usize>,
                 .into_iter()
                 .map(|mut fork| {
                     scope.spawn(move || {
-                        wavefront_worker(&mut fork, shared_ref, force_commit);
+                        wavefront_worker(&mut fork, shared_ref, workers, force_commit);
                         let deferred = fork.take_deferred_evals();
                         let (_, asks) = fork.release();
                         (asks, deferred)
                     })
                 })
                 .collect();
-            wavefront_worker(cx, shared_ref, force_commit);
+            wavefront_worker(cx, shared_ref, workers, force_commit);
             handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect::<Vec<_>>()
         });
         cx.in_parallel = false;
@@ -326,9 +326,9 @@ fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: Vec<usize>,
     added
 }
 
-fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Condvar), force_commit: bool) {
-    let mut batch = Vec::with_capacity(4);
-    let mut results = Vec::with_capacity(4);
+fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Condvar), workers: usize, force_commit: bool) {
+    let mut batch = Vec::with_capacity(MAX_WORKER_BATCH);
+    let mut results = Vec::with_capacity(MAX_WORKER_BATCH);
     loop {
         batch.clear();
         {
@@ -340,7 +340,8 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
                 }
                 q = cvar.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            for _ in 0..4 {
+            let take = (q.queue.len() / workers.max(1)).clamp(1, MAX_WORKER_BATCH);
+            for _ in 0..take {
                 let Some(item) = q.queue.pop_front() else { break };
                 batch.push(item);
             }
@@ -362,6 +363,7 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             let mut q = crate::sync::lock(mutex);
             q.active = q.active.saturating_sub(active.2);
             active.2 = 0;
+            let mut pushed = false;
             for (at, instance, typed, unlaid, asked, deferred, callees) in results.drain(..) {
                 if deferred {
                     q.deferred_items.push((at, instance));
@@ -375,11 +377,14 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
                             q.seen.insert(callee, next_at);
                             q.instances.push(callee);
                             q.queue.push_back((next_at, callee));
+                            pushed = true;
                         }
                     }
                 }
             }
-            cvar.notify_all();
+            if pushed || (q.queue.is_empty() && q.active == 0) {
+                cvar.notify_all();
+            }
         }
     }
 }
@@ -399,7 +404,9 @@ fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {
 }
 
 fn run_wave(cx: &mut Context<'_>, reached: &mut Reached, wave: &[usize], check_undeclared: bool, force_commit: bool) -> (Vec<usize>, Vec<Instance>) {
-    let workers = crate::jobs().min(wave.len().div_ceil(WAVE_BATCH));
+    let jobs = crate::jobs().max(1);
+    let batch = (wave.len() / jobs).clamp(1, MAX_WORKER_BATCH);
+    let workers = jobs.min(wave.len().div_ceil(batch));
     if workers <= 1 || wave.len() < MIN_PARALLEL_WAVE {
         return serial_wave(cx, reached, wave, check_undeclared, force_commit);
     }
@@ -515,13 +522,14 @@ fn run_scoped<'a>(cx: &mut Context<'a>, forks: Vec<Context<'a>>, reached: &Reach
 }
 
 fn worker_loop(cx: &mut Context<'_>, reached: &Reached, wave: &[usize], next: &AtomicUsize, check_undeclared: bool, force_commit: bool) -> Vec<WaveItem> {
+    let batch = (wave.len() / crate::jobs().max(1)).clamp(1, MAX_WORKER_BATCH);
     let mut items = Vec::new();
     loop {
-        let start = next.fetch_add(WAVE_BATCH, Ordering::Relaxed);
+        let start = next.fetch_add(batch, Ordering::Relaxed);
         if start >= wave.len() {
             return items;
         }
-        let end = (start + WAVE_BATCH).min(wave.len());
+        let end = (start + batch).min(wave.len());
         for (offset, &at) in wave[start..end].iter().enumerate() {
             let asks0 = cx.asks.count();
             let mut unlaid = Vec::new();

@@ -16,7 +16,7 @@ struct Loop {
 fn speculable(op: &Op) -> bool {
     match op {
         Op::Binary(op, ..) => !matches!(op, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem),
-        Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Unary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Select(..) | Op::StackAddr(..) => true,
+        Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Unary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Select(..) | Op::StackAddr(..) => true,
         _ => false,
     }
 }
@@ -118,7 +118,7 @@ fn hoist(
     each: &Loop,
     entry: Block,
     (readonly, ro_bytes): (&[bool], &[u32]),
-    (slot_ro, slot_addrs): (&[bool], &[Option<(StackSlot, i32)>]),
+    (slot_ro, slot_addrs, has_stack_addr): (&[bool], &[Option<(StackSlot, i32)>], &[bool]),
     home: &mut [Option<Block>],
 ) {
     let mut writes = false;
@@ -165,7 +165,8 @@ fn hoist(
             let load_ok = match (&data.op, data.result) {
                 (&Op::StackLoad(slot, offset), Some(res)) => {
                     let width = u64::from(func.ty(res).bytes());
-                    slot_ok(slot, head)
+                    !written_slots[slot.index()]
+                        && (!has_stack_addr[slot.index()] || (!calls && !unknown_mem_writes))
                         && offset >= 0
                         && (offset as u64).checked_add(width).is_some_and(|end| end <= u64::from(func.slots[slot.index()].size))
                 }
@@ -225,6 +226,12 @@ pub(crate) fn run(func: &mut Function) {
     }
     let slot_addrs = slot_addresses(func);
     let (_, slot_ro) = classify_slots(func, &slot_addrs);
+    let mut has_stack_addr = vec![false; func.slots.len()];
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        if let Op::StackAddr(slot, _) = func.insts[inst.index()].op {
+            has_stack_addr[slot.index()] = true;
+        }
+    }
     let mut home = func.def_blocks();
     for idx in 0..found.len() {
         let pre = found[idx].entry.or_else(|| {
@@ -238,7 +245,7 @@ pub(crate) fn run(func: &mut Function) {
             Some(created)
         });
         if let Some(entry) = pre {
-            hoist(func, &found[idx], entry, (&readonly, &ro_bytes), (&slot_ro, &slot_addrs), &mut home);
+            hoist(func, &found[idx], entry, (&readonly, &ro_bytes), (&slot_ro, &slot_addrs, &has_stack_addr), &mut home);
         }
     }
 }

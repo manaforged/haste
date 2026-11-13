@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use haste_codegen::{Code, Effort, Site, Target};
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::lower::{self, FootprintId, RelocPlan, RodataId, RodataReloc, RodataTarget, Slots, SymbolSource, VtableEntry, VtableId, Word};
 use crate::names::ItemRef;
@@ -259,6 +259,9 @@ impl Image {
     }
 
     pub(super) fn compile_bucket(&self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize], cfg: DictConfig, (record_cache, allow_singleton): (bool, bool), pass: &mut Pass) -> Vec<(usize, String)> {
+        if self.mode == ImageMode::Check && !cfg.verify {
+            return self.check_bucket(cx, reached, indices, pass);
+        }
         if allow_singleton && indices.len() == 1 {
             let index = indices[0];
             return self.compile_singleton(cx, reached, index, pass).err().map(|err| (index, err)).into_iter().collect();
@@ -267,6 +270,38 @@ impl Image {
         for mut group in groups {
             if let Err(err) = self.compile_group(cx, reached, &mut group, cfg, record_cache, pass) {
                 errors.extend(group.all_indices().map(|idx| (idx, err.clone())));
+            }
+        }
+        errors
+    }
+
+    fn check_bucket(&self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize], pass: &mut Pass) -> Vec<(usize, String)> {
+        let mut errors = Vec::new();
+        let mut seen: HashSet<(ItemRef, FootprintId)> = HashSet::default();
+        for &index in indices {
+            let (item, substs) = reached.list[index].0;
+            if cx.outline.is_sysroot(item.krate) {
+                pass.record_size(index, 0, 0);
+                continue;
+            }
+            if indices.len() > 1 && !substs.is_empty() {
+                match lower::eval_footprint(cx, reached, self, index) {
+                    Ok(fp) if !seen.insert((item, fp)) => {
+                        pass.record_size(index, 0, 0);
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        errors.push((index, item_err(cx, item, &err)));
+                        continue;
+                    }
+                }
+            }
+            let started = std::time::Instant::now();
+            if let Err(err) = lower::lower_stencil(cx, reached, self, index) {
+                errors.push((index, item_err(cx, item, &err)));
+            } else {
+                pass.record_size(index, 0, started.elapsed().as_nanos() as u64);
             }
         }
         errors

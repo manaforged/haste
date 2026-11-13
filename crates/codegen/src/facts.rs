@@ -434,9 +434,19 @@ impl Path {
                         }
                     }
                 }
+                if let Some(&Op::Binary(Binary::Isub, base, c)) = ranges.op(func, a)
+                    && let Some(k) = ranges.constant(c)
+                    && self.fact(ranges, base).lo >= k
+                    && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), k == 0)
+                {
+                    return true;
+                }
                 false
             }
-            RelKind::Ule => self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), false),
+            RelKind::Ule => {
+                self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), false)
+                    || (matches!(ranges.op(func, a), Some(&Op::Binary(Binary::Isub, base, c)) if ranges.constant(c).is_some_and(|k| self.fact(ranges, base).lo >= k) && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), false)))
+            }
             RelKind::Slt => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true),
             RelKind::Sle => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), false),
             RelKind::Ne => {

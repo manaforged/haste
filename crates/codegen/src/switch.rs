@@ -97,6 +97,52 @@ fn push_before_last(func: &mut Function, block: usize, op: Op, ty: Type) -> Valu
     val
 }
 
+fn push_node(func: &mut Function, block: Option<(usize, crate::ir::Inst)>, insts: Vec<crate::ir::Inst>) -> Block {
+    match block {
+        Some((b, last)) => {
+            func.insts[last.index()].op = Op::Trap;
+            let dst = &mut func.blocks[b].insts;
+            dst.pop();
+            dst.extend(insts);
+            Block(b as u32)
+        }
+        None => {
+            let b = Block(func.blocks.len() as u32);
+            func.blocks.push(BlockData { params: Vec::new(), insts });
+            b
+        }
+    }
+}
+
+fn emit_btree(
+    func: &mut Function,
+    at: Option<(usize, crate::ir::Inst)>,
+    (v, ty): (Value, Type),
+    cases: &[(u64, i64, Block, Vec<Value>)],
+    default_blk: Block,
+) -> Block {
+    let mut insts = Vec::with_capacity(3);
+    if cases.len() <= 2 {
+        let (_, imm, hit, hit_args) = &cases[0];
+        let c = func.value(ty);
+        let eq = func.value(Type::I8);
+        insts.push(func.add(Op::Const(*imm), Some(c)));
+        insts.push(func.add(Op::Icmp(IntCC::Equal, v, c), Some(eq)));
+        let otherwise = if cases.len() == 2 { emit_btree(func, None, (v, ty), &cases[1..], default_blk) } else { default_blk };
+        insts.push(func.add(Op::Brif(eq, *hit, hit_args.clone(), otherwise, Vec::new()), None));
+        return push_node(func, at, insts);
+    }
+    let mid = cases.len() / 2;
+    let left = emit_btree(func, None, (v, ty), &cases[..mid], default_blk);
+    let right = emit_btree(func, None, (v, ty), &cases[mid..], default_blk);
+    let pivot = func.value(ty);
+    let lt = func.value(Type::I8);
+    insts.push(func.add(Op::Const(cases[mid].1), Some(pivot)));
+    insts.push(func.add(Op::Icmp(IntCC::UnsignedLessThan, v, pivot), Some(lt)));
+    insts.push(func.add(Op::Brif(lt, left, Vec::new(), right, Vec::new()), None));
+    push_node(func, at, insts)
+}
+
 pub(crate) fn run(func: &mut Function) {
     let info = analyze(func);
     let initial_blocks = func.blocks.len();
@@ -143,31 +189,34 @@ pub(crate) fn run(func: &mut Function) {
         let s_span = s_max.abs_diff(s_min);
         let signed = s_span < u_span;
         let span = if signed { s_span } else { u_span };
-        let Some(table_len) = usize::try_from(span).ok().and_then(|s| s.checked_add(1)) else { continue };
-        if table_len > 256 || table_len > distinct * 4 {
-            continue;
-        }
-        let min = if signed { s_min } else { u_min as i64 };
-        let v64 = if ty == Type::I64 {
-            v
-        } else {
-            let conv = if signed { Convert::Sextend } else { Convert::Uextend };
-            push_before_last(func, b0, Op::Convert(conv, v), Type::I64)
-        };
-        let idx = if min != 0 {
-            let min_val = push_before_last(func, b0, Op::Const(min), Type::I64);
-            push_before_last(func, b0, Op::Binary(Binary::Isub, v64, min_val), Type::I64)
-        } else {
-            v64
-        };
         let default_blk = Block(cur as u32);
-        let mut table = vec![default_blk; table_len];
-        for (u, (_, hit, hit_args)) in seen {
-            let key = if signed { extend(u as i64, ty, true) } else { u as i64 };
-            let offset = (key as i128 - min as i128) as usize;
-            table[offset] = forward(func, hit, hit_args);
+        let table_len = usize::try_from(span).ok().and_then(|s| s.checked_add(1));
+        if let Some(table_len) = table_len.filter(|&len| len <= 256 && len <= distinct * 4) {
+            let min = if signed { s_min } else { u_min as i64 };
+            let v64 = if ty == Type::I64 {
+                v
+            } else {
+                let conv = if signed { Convert::Sextend } else { Convert::Uextend };
+                push_before_last(func, b0, Op::Convert(conv, v), Type::I64)
+            };
+            let idx = if min != 0 {
+                let min_val = push_before_last(func, b0, Op::Const(min), Type::I64);
+                push_before_last(func, b0, Op::Binary(Binary::Isub, v64, min_val), Type::I64)
+            } else {
+                v64
+            };
+            let mut table = vec![default_blk; table_len];
+            for (u, (_, hit, hit_args)) in seen {
+                let key = if signed { extend(u as i64, ty, true) } else { u as i64 };
+                let offset = (key as i128 - min as i128) as usize;
+                table[offset] = forward(func, hit, hit_args);
+            }
+            func.insts[last0.index()] = InstData { op: Op::BrTable(idx, default_blk, table), result: None };
+        } else {
+            let mut cases: Vec<(u64, i64, Block, Vec<Value>)> = seen.into_iter().map(|(u, (_, hit, hit_args))| (u, u as i64, hit, hit_args)).collect();
+            cases.sort_unstable_by_key(|c| c.0);
+            emit_btree(func, Some((b0, last0)), (v, ty), &cases, default_blk);
         }
-        func.insts[last0.index()] = InstData { op: Op::BrTable(idx, default_blk, table), result: None };
         for b in chain {
             func.blocks[b].insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
             cleared[b] = true;
