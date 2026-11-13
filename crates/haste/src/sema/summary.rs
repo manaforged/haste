@@ -138,6 +138,17 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
         )
     };
     let Ok(SummaryKind::Poly(summary)) = built else { return None };
+    if is_sysroot
+        && cx.store.bodies.get(&item).is_none()
+        && crate::profile() == crate::outline::tree::Profile::Release
+        && cx.store.lookups.substrate.is_some()
+        && cx.attr_value(item, "cold").is_none()
+        && cx.attr_value(item, "inline") != Some("never")
+        && let Err(err) = cx.body(item)
+        && cx.quiet_mark() != before
+    {
+        return Some(Err(format!("{}: {err:#}", cx.name(item))));
+    }
     instantiate_summary(cx, *instance, &summary, unlaid, before)
 }
 

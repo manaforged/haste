@@ -525,6 +525,62 @@ fn fold_affine_mem(func: &mut Function, slots: &[Option<(StackSlot, i32)>], affi
     }
 }
 
+fn sink_terminator_defs(func: &mut Function) {
+    let uses = func.use_counts();
+    let mut fits_used = vec![false; func.types.len()];
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        if let Op::Fits(_, _, x, y) = func.insts[inst.index()].op {
+            fits_used[x.index()] = true;
+            fits_used[y.index()] = true;
+        }
+    }
+    let mut term_uses = vec![0_u32; func.types.len()];
+    for b in 0..func.blocks.len() {
+        if func.blocks[b].insts.len() < 2 {
+            continue;
+        }
+        let Some(&last) = func.blocks[b].insts.last() else { continue };
+        match &func.insts[last.index()].op {
+            Op::Jump(_, args) => args.iter().for_each(|v| term_uses[v.index()] += 1),
+            Op::Brif(_, _, t_args, _, e_args) => {
+                t_args.iter().for_each(|v| term_uses[v.index()] += 1);
+                e_args.iter().for_each(|v| term_uses[v.index()] += 1);
+            }
+            _ => continue,
+        }
+        let insts = std::mem::take(&mut func.blocks[b].insts);
+        let len = insts.len();
+        let mut kept = Vec::with_capacity(len);
+        let mut sunk = Vec::new();
+        for &inst in &insts[..len - 1] {
+            let data = &func.insts[inst.index()];
+            let pure_alu = matches!(data.op, Op::Binary(op, ..) if !matches!(op, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem))
+                || matches!(data.op, Op::Unary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Select(..));
+            if let Some(res) = data.result
+                && pure_alu
+                && !fits_used[res.index()]
+                && term_uses[res.index()] > 0
+                && uses[res.index()] == term_uses[res.index()]
+            {
+                sunk.push(inst);
+            } else {
+                kept.push(inst);
+            }
+        }
+        kept.extend(sunk);
+        kept.push(last);
+        func.blocks[b].insts = kept;
+        match &func.insts[last.index()].op {
+            Op::Jump(_, args) => args.iter().for_each(|v| term_uses[v.index()] = 0),
+            Op::Brif(_, _, t_args, _, e_args) => {
+                t_args.iter().for_each(|v| term_uses[v.index()] = 0);
+                e_args.iter().for_each(|v| term_uses[v.index()] = 0);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between: through each block and on into a successor that only it enters.
 pub(crate) fn run(func: &mut Function) {
     let Some(entry) = func.entry else { return };
@@ -536,6 +592,7 @@ pub(crate) fn run(func: &mut Function) {
     let slots = slot_addresses(func);
     let affine = affine_table(func);
     fold_affine_mem(func, &slots, &affine);
+    sink_terminator_defs(func);
     let (unescaped, call_readonly) = classify_slots(func, &slots);
     let mut consts = vec![None; func.types.len()];
     let mut selects = vec![None; func.types.len()];

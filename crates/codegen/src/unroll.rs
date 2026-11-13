@@ -1,3 +1,4 @@
+use crate::dom::dominators;
 use crate::fold::{evaluate, extend};
 use crate::ir::{Block, Function, Op, Value};
 
@@ -35,11 +36,13 @@ fn single_outside_pred(func: &Function, head: Block) -> Option<Vec<Value>> {
             return None;
         }
         let Some(&last) = block.insts.last() else { return None };
-        let Op::Jump(target, args) = &func.insts[last.index()].op else { return None };
-        if *target != head {
-            return None;
-        }
-        found = Some(args.clone());
+        let args = match &func.insts[last.index()].op {
+            Op::Jump(target, args) if *target == head => args.clone(),
+            Op::Brif(_, t_blk, t_args, f_blk, _) if *t_blk == head && *f_blk != head => t_args.clone(),
+            Op::Brif(_, t_blk, _, f_blk, f_args) if *f_blk == head && *t_blk != head => f_args.clone(),
+            _ => return None,
+        };
+        found = Some(args);
     }
     found
 }
@@ -48,11 +51,15 @@ fn single_outside_pred(func: &Function, head: Block) -> Option<Vec<Value>> {
 pub(crate) fn run(func: &mut Function) -> bool {
     let Some(entry) = func.entry else { return false };
     let preds = func.pred_counts();
+    let (order, _, _) = dominators(func, entry);
     let mut global_consts = vec![None; func.types.len()];
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        let data = &func.insts[inst.index()];
-        if let (Op::Const(imm), Some(res)) = (&data.op, data.result) {
-            global_consts[res.index()] = Some(*imm);
+    for &blk in &order {
+        for &inst in &func.blocks[blk.index()].insts {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            if let Some(imm) = evaluate(func, &data.op, &|v| global_consts[v.index()]) {
+                global_consts[res.index()] = Some(extend(imm, func.ty(res), true));
+            }
         }
     }
     let mut changed = false;

@@ -95,17 +95,15 @@ fn pick_slot<F: Copy + PartialEq>(
     start: u32,
     used: &[F],
     reserved: &[F],
+    allow_reserved: bool,
     pred: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    let pick = |allow_reserved: bool| {
-        let valid = |slot: usize| pred(slot) && (allow_reserved || !reserved.contains(&pool.regs[slot])) && slot_free(&holders[slot], live, ranges, pool.arrival_lock[slot], start);
-        (0..pool.regs.len())
-            .find(|&s| valid(s) && holders[s].is_empty() && (!pool.is_saved[s] || used.contains(&pool.regs[s])))
-            .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && (!pool.is_saved[s] || used.contains(&pool.regs[s]))))
-            .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && holders[s].is_empty()))
-            .or_else(|| (0..pool.regs.len()).find(|&s| valid(s)))
-    };
-    pick(false).or_else(|| pick(true))
+    let valid = |slot: usize| pred(slot) && (allow_reserved || !reserved.contains(&pool.regs[slot])) && slot_free(&holders[slot], live, ranges, pool.arrival_lock[slot], start);
+    (0..pool.regs.len())
+        .find(|&s| valid(s) && holders[s].is_empty() && (!pool.is_saved[s] || used.contains(&pool.regs[s])))
+        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && (!pool.is_saved[s] || used.contains(&pool.regs[s]))))
+        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && holders[s].is_empty()))
+        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s)))
 }
 
 fn loop_back_args(func: &Function) -> Vec<(usize, usize)> {
@@ -227,11 +225,22 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         }
         let suits_direct = |s: usize| if needs_saved { pool.is_saved[s] && !wide_val } else { !wide_val || !pool.is_saved[s] };
         let suits_any = |s: usize| suits_direct(s) || (can_park && !pool.is_saved[s]);
+        reserved.clear();
+        for &(param, arg) in &back_args {
+            if arg != value
+                && let Some(reg) = homes[param]
+                && homes[arg].is_none()
+                && live.bounds(arg).is_some_and(|(arg_start, _)| arg_start >= start)
+                && !reserved.contains(&reg)
+            {
+                reserved.push(reg);
+            }
+        }
         let mut chosen = hints.reuse[value].and_then(|op| {
             let op_idx = op.index();
             let reg = homes[op_idx]?;
             let s = pool.regs.iter().position(|r| *r == reg)?;
-            if !suits_any(s) || (start == 0 && pool.arrival_lock[s]) {
+            if !suits_any(s) || (start == 0 && pool.arrival_lock[s]) || reserved.contains(&reg) {
                 return None;
             }
             if !holders[s].iter().all(|&h| h == op_idx || !overlaps(live.ranges_of(h), ranges)) {
@@ -262,22 +271,17 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
             }
         }
         if chosen.is_none() {
-            reserved.clear();
-            for &(param, arg) in &back_args {
-                if let Some(reg) = homes[param]
-                    && homes[arg].is_none()
-                    && live.bounds(arg).is_some_and(|(arg_start, _)| arg_start >= start)
-                    && !reserved.contains(&reg)
-                {
-                    reserved.push(reg);
-                }
-            }
             chosen = if needs_saved {
-                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, |s| pool.is_saved[s] && !wide_val)
-                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, |s| !pool.is_saved[s])).flatten())
+                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s] && !wide_val)
+                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| !pool.is_saved[s])).flatten())
+                    .or_else(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| pool.is_saved[s] && !wide_val))
+                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| !pool.is_saved[s])).flatten())
             } else {
-                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, |s| !pool.is_saved[s])
-                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, |s| pool.is_saved[s])).flatten())
+                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| !pool.is_saved[s])
+                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s] && used.contains(&pool.regs[s]))).flatten())
+                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s])).flatten())
+                    .or_else(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| !pool.is_saved[s]))
+                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| pool.is_saved[s])).flatten())
             };
         }
         if chosen.is_none() && needs_saved && !wide_val {
