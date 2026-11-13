@@ -49,7 +49,7 @@ fn key(op: &Op, types: &[Type], ty: Type, subst: &[Value]) -> Option<Key> {
 #[derive(Default)]
 struct Table {
     known: HashMap<Key, Value>,
-    added: Vec<Key>,
+    added: Vec<(Key, Option<Value>)>,
 }
 
 impl Table {
@@ -61,6 +61,14 @@ impl Table {
             .into_iter()
             .filter(|inst| {
                 let data = &func.insts[inst.index()];
+                if matches!(data.op, Op::Call { .. } | Op::TryCall { .. }) {
+                    let const_keys: Vec<Key> = self.known.keys().copied().filter(|k| matches!(k, Key::Const(..))).collect();
+                    for k in const_keys {
+                        let prev = self.known.remove(&k);
+                        self.added.push((k, prev));
+                    }
+                    return true;
+                }
                 let Some(result) = data.result else { return true };
                 let Some(key) = key(&data.op, &func.types, func.ty(result), subst) else { return true };
                 match self.known.get(&key) {
@@ -69,8 +77,8 @@ impl Table {
                         false
                     }
                     None => {
-                        self.known.insert(key, result);
-                        self.added.push(key);
+                        let prev = self.known.insert(key, result);
+                        self.added.push((key, prev));
                         true
                     }
                 }
@@ -82,8 +90,15 @@ impl Table {
     }
 
     fn forget(&mut self, mark: usize) {
-        for key in self.added.drain(mark..) {
-            self.known.remove(&key);
+        for (key, prev) in self.added.drain(mark..).rev() {
+            match prev {
+                Some(v) => {
+                    self.known.insert(key, v);
+                }
+                None => {
+                    self.known.remove(&key);
+                }
+            }
         }
     }
 }

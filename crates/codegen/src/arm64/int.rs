@@ -1,7 +1,7 @@
-use super::asm::{Alu, Bits, Cond, Reg, Size, ZR};
+use super::asm::{Alu, Bits, Cond, Reg, Shift, Size, ZR, encode_bitmask_imm};
 use super::{A, C, D, Emit, T, V0};
 use crate::frame::Ext;
-use crate::ir::{Binary, Convert, IntCC, Type, Unary, Value};
+use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
 
 pub(super) fn cond(cc: IntCC) -> Cond {
     match cc {
@@ -140,8 +140,89 @@ impl Emit<'_> {
         }
     }
 
+    fn shifted_operand(&self, alu: Alu, ty: Type, val: Value) -> Option<(Value, Shift, u8)> {
+        if !self.plan.elided[val.index()] || !matches!(ty, Type::I32 | Type::I64) {
+            return None;
+        }
+        let inst = self.defs[val.index()]?;
+        let (op, b, imm) = super::fuse::shift_parts(&self.func.insts[inst.index()].op, &self.plan)?;
+        let bits = ty.bits();
+        let mask = bits - 1;
+        let amt = (imm as u32) & mask;
+        let logical = matches!(alu, Alu::And | Alu::Orr | Alu::Eor);
+        let (shift, count) = match op {
+            Binary::Ishl => (Shift::Lsl, amt),
+            Binary::Ushr => (Shift::Lsr, amt),
+            Binary::Sshr => (Shift::Asr, amt),
+            Binary::Rotr if logical => (Shift::Ror, amt),
+            Binary::Rotl if logical => (Shift::Ror, (bits - amt) & mask),
+            _ => return None,
+        };
+        Some((b, shift, count as u8))
+    }
+
+    fn cinc_operand(&self, val: Value) -> Option<(IntCC, Value, Value)> {
+        if !self.plan.elided[val.index()] {
+            return None;
+        }
+        let inst = self.defs[val.index()]?;
+        match self.func.insts[inst.index()].op {
+            Op::Icmp(cc, a, b) => Some((cc, a, b)),
+            Op::Convert(Convert::Uextend, inner) if self.plan.elided[inner.index()] => {
+                let inner_inst = self.defs[inner.index()]?;
+                match self.func.insts[inner_inst.index()].op {
+                    Op::Icmp(cc, a, b) => Some((cc, a, b)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn const_imm(&self, val: Value) -> Option<i64> {
+        self.plan.const_of(val).or_else(|| {
+            let inst = self.defs[val.index()]?;
+            match self.func.insts[inst.index()].op {
+                Op::Const(imm) => Some(imm),
+                _ => None,
+            }
+        })
+    }
+
     fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<(), String> {
         if let Some(alu) = alu_of(op) {
+            if alu == Alu::Add && matches!(ty, Type::I32 | Type::I64) {
+                let cinc = self.cinc_operand(y).map(|cmp| (x, cmp)).or_else(|| self.cinc_operand(x).map(|cmp| (y, cmp)));
+                if let Some((other, (cc, a, b))) = cinc {
+                    let cond = self.compare(cc, a, b);
+                    let reg = self.bits(other, A);
+                    self.asm.csinc(cond.invert(), dst, reg, reg);
+                    return Ok(());
+                }
+            }
+            let shifted = self.shifted_operand(alu, ty, y).map(|s| (x, s)).or_else(|| (alu != Alu::Sub).then(|| self.shifted_operand(alu, ty, x).map(|s| (y, s))).flatten());
+            if let Some((other, (b, shift, imm))) = shifted {
+                let left = self.bits(other, A);
+                let right = self.bits(b, C);
+                let size = if ty == Type::I64 { Size::X } else { Size::W };
+                self.asm.alu_shifted(alu, size, shift, imm, dst, left, right);
+                return Ok(());
+            }
+            if matches!(alu, Alu::And | Alu::Orr | Alu::Eor) && dst != ZR {
+                let size = if ty == Type::I64 { Size::X } else { Size::W };
+                let imm_pair = match (self.const_imm(y), self.const_imm(x)) {
+                    (Some(imm), _) => Some((x, imm)),
+                    (None, Some(imm)) => Some((y, imm)),
+                    (None, None) => None,
+                };
+                if let Some((val, imm)) = imm_pair
+                    && let Some(bitmask) = encode_bitmask_imm(imm as u64, size == Size::X)
+                {
+                    let left = self.bits(val, A);
+                    self.asm.alu_bitmask(alu, size, bitmask, dst, left);
+                    return Ok(());
+                }
+            }
             let left = self.bits(x, A);
             if matches!(alu, Alu::Add | Alu::Sub)
                 && let Some((sub, imm)) = self.add_imm_args(alu == Alu::Sub, y, ty)
@@ -239,6 +320,10 @@ impl Emit<'_> {
         let value = if op == Binary::Ishl { self.bits(x, A) } else { self.src(x, A, ext) };
         if let Some(count) = self.plan.const_of(y) {
             let count = (count as u8) & (bits - 1);
+            if count == 0 {
+                self.asm.mov(dst, value);
+                return;
+            }
             match alu {
                 Alu::Lslv => self.asm.lsl_imm(dst, value, count),
                 Alu::Lsrv => self.asm.lsr_imm(dst, value, count),
@@ -256,6 +341,14 @@ impl Emit<'_> {
     }
 
     fn rotate(&mut self, left: bool, (x, y): (Value, Value), bits: u8, dst: Reg) {
+        if bits >= 32 && let Some(c) = self.plan.const_of(y) {
+            let mask = u32::from(bits - 1);
+            let c = (c as u32) & mask;
+            let imm = if left { (u32::from(bits) - c) & mask } else { c } as u8;
+            let value = self.bits(x, A);
+            self.asm.ror_imm(Size::of(u32::from(bits) / 8), dst, value, imm);
+            return;
+        }
         let count = self.bits(y, C);
         if left {
             self.asm.alu(Alu::Sub, Size::X, C, ZR, count);
@@ -277,12 +370,16 @@ impl Emit<'_> {
         self.asm.alu(Alu::Orr, Size::X, dst, dst, T);
     }
 
-    fn compare(&mut self, cc: IntCC, x: Value, y: Value) -> Cond {
+    pub(super) fn compare(&mut self, cc: IntCC, x: Value, y: Value) -> Cond {
         let bytes = self.ty(x).bytes();
         let size = if bytes >= 8 { Size::X } else { Size::W };
-        let ext = Ext::of(cc.is_signed());
+        let signed = cc.is_signed();
+        if self.last_cmp == Some((size, x, y, signed)) {
+            return cond(cc);
+        }
+        let ext = Ext::of(signed);
         let left = if bytes >= 4 { self.bits(x, A) } else { self.src(x, A, ext) };
-        let imm = self.plan.const_of(y).map(|imm| crate::fold::extend(imm, self.ty(y), cc.is_signed()));
+        let imm = self.plan.const_of(y).map(|imm| crate::fold::extend(imm, self.ty(y), signed));
         match imm {
             Some(imm) if (0..4096).contains(&imm) => self.asm.add_imm(true, true, size, ZR, left, imm as u32),
             Some(imm) if (-4095..0).contains(&imm) => self.asm.add_imm(false, true, size, ZR, left, (-imm) as u32),
@@ -291,6 +388,7 @@ impl Emit<'_> {
                 self.asm.alu(Alu::Subs, size, ZR, left, right);
             }
         }
+        self.last_cmp = Some((size, x, y, signed));
         cond(cc)
     }
 
@@ -298,14 +396,19 @@ impl Emit<'_> {
         if self.plan.is_static(result) {
             return Ok(());
         }
-        let flags = if self.ty(x) == Type::I128 { self.wide_icmp(cc, x, y) } else { self.compare(cc, x, y) };
+        let flags = if self.ty(x) == Type::I128 {
+            self.last_cmp = None;
+            self.wide_icmp(cc, x, y)
+        } else {
+            self.compare(cc, x, y)
+        };
         self.set_flag(result, flags);
         Ok(())
     }
 
     pub(super) fn set_flag(&mut self, result: Value, flags: Cond) {
+        self.flags = Some((result, flags));
         if self.plan.fused[result.index()] {
-            self.flags = Some((result, flags));
             return;
         }
         let dst = self.dst(result);

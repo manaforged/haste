@@ -1,5 +1,5 @@
 use crate::alloc::{Location, Plan, Regs};
-use crate::ir::{Block, Function, Inst, Op, Signature, Type, Value};
+use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, Signature, Type, Value};
 
 pub(crate) const WORD: u32 = 8;
 const MAX_ALIGN_SHIFT: u8 = 4;
@@ -156,14 +156,13 @@ impl<R> Frame<R> {
     pub(crate) fn edge_slot(&self, index: usize) -> i32 {
         self.scratch + (EDGE_SLOT as usize * index) as i32
     }
+}
 
-    pub(crate) fn shares(&self, plan: &Plan<R>, a: Value, b: Value) -> bool
-    where
-        R: Copy,
-    {
-        let memory = |value: Value| matches!(plan.location(value), Location::Slot);
-        memory(a) && memory(b) && self.values[a.index()] == self.values[b.index()]
-    }
+pub(crate) fn same_home<R: Copy + PartialEq>(locations: &[Location<R>], values: &[i32], a: Value, b: Value) -> bool {
+    a == b
+        || matches!((locations[a.index()], locations[b.index()]), (Location::Reg(x), Location::Reg(y)) if x == y)
+        || matches!((locations[a.index()], locations[b.index()]), (Location::Float(x), Location::Float(y)) if x == y)
+        || (matches!(locations[a.index()], Location::Slot) && matches!(locations[b.index()], Location::Slot) && values[a.index()] == values[b.index()])
 }
 
 fn live_ops(func: &Function) -> impl Iterator<Item = &Op> {
@@ -179,17 +178,14 @@ pub(crate) fn framed<R>(func: &Function, frame: &Frame<R>, stack_params: bool) -
     stack_params || frame.size > 0 || !frame.saves.is_empty() || !frame.float_saves.is_empty() || live_ops(func).any(|op| matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::FramePointer))
 }
 
-fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<(u32, u32), String> {
-    let (mut outgoing, mut scratch) = (0, 0);
+fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<u32, String> {
+    let mut outgoing = 0;
     for op in live_ops(func) {
-        match op {
-            Op::Call { sig, .. } | Op::TryCall { sig, .. } => outgoing = outgoing.max(classify(&func.sigs[sig.index()])?.stack),
-            Op::Jump(_, args) => scratch = scratch.max(args.len() as u32 * EDGE_SLOT),
-            Op::Brif(_, _, then, _, otherwise) => scratch = scratch.max(then.len().max(otherwise.len()) as u32 * EDGE_SLOT),
-            _ => {}
+        if let Op::Call { sig, .. } | Op::TryCall { sig, .. } = op {
+            outgoing = outgoing.max(classify(&func.sigs[sig.index()])?.stack);
         }
     }
-    Ok((outgoing, scratch))
+    Ok(outgoing)
 }
 
 fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
@@ -208,19 +204,21 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
     (values, slots)
 }
 
-pub(crate) fn layout<R>(
+pub(crate) fn layout<R: Copy + PartialEq>(
     func: &Function,
     (saves, float_saves): (Vec<R>, Vec<u8>),
     (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<Frame<R>, String> {
-    let (outgoing, scratch) = needs(func, classify)?;
+    let outgoing = needs(func, classify)?;
     let (present, addressed) = present(func);
     let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
     let mut values = Vec::with_capacity(func.types.len());
     let mut homes: Vec<i32> = Vec::new();
     for (value, ty) in func.types.iter().enumerate() {
-        if !present[value] || elided.get(value) == Some(&true) || (matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true)) {
+        let static_loc = matches!(locations[value], Location::Imm(_) | Location::SlotAddr(_) | Location::Frame(..));
+        let reg_unhomed = matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true);
+        if !present[value] || elided.get(value) == Some(&true) || static_loc || reg_unhomed {
             values.push(0);
             continue;
         }
@@ -238,15 +236,33 @@ pub(crate) fn layout<R>(
         }
         values.push(homes[home]);
     }
-    let mut slots = Vec::with_capacity(func.slots.len());
-    for (slot, data) in func.slots.iter().enumerate() {
-        if !addressed[slot] {
-            slots.push(0);
-            continue;
+    let mut max_saved = 0_usize;
+    let mut check_edge = |block: Block, args: &[Value]| {
+        for step in edge_steps(args, &func.blocks[block.index()].params, |a, b| same_home(locations, &values, a, b)) {
+            if let Step::Save(_, index) = step {
+                max_saved = max_saved.max(index + 1);
+            }
         }
+    };
+    for op in live_ops(func) {
+        match op {
+            Op::Jump(block, args) => check_edge(*block, args),
+            Op::Brif(_, then, then_args, otherwise, else_args) => {
+                check_edge(*then, then_args);
+                check_edge(*otherwise, else_args);
+            }
+            _ => {}
+        }
+    }
+    let scratch = max_saved as u32 * EDGE_SLOT;
+    let mut slots = vec![0; func.slots.len()];
+    let mut order: Vec<usize> = (0..func.slots.len()).filter(|&slot| addressed[slot]).collect();
+    order.sort_by_key(|&slot| (func.slots[slot].size, slot));
+    for slot in order {
+        let data = &func.slots[slot];
         let align = 1 << data.align_shift.min(MAX_ALIGN_SHIFT);
         cursor = round(cursor + data.size, align);
-        slots.push(-(cursor as i32));
+        slots[slot] = -(cursor as i32);
     }
     cursor = round(cursor + scratch, 16);
     let scratch = -(cursor as i32);
@@ -281,6 +297,122 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
     Ok(Prepared { order, copied, abi, plan, frame, framed })
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ShrinkWrap {
+    pub fast_ret: Block,
+    pub slow_entry: Block,
+    pub use_slow_thunk: bool,
+}
+
+fn pure_value<R: Copy + PartialEq>(value: Value, plan: &Plan<R>, frame: &Frame<R>, clobbers: &[R]) -> bool {
+    if plan.elided[value.index()] || plan.fused[value.index()] {
+        return true;
+    }
+    match plan.location(value) {
+        Location::Imm(_) => true,
+        Location::Reg(r) => !frame.saves.contains(&r) && !clobbers.contains(&r),
+        Location::Float(f) => !frame.float_saves.contains(&f),
+        Location::Slot | Location::SlotAddr(_) | Location::Frame(..) => false,
+    }
+}
+
+fn pure_op(op: &Op) -> bool {
+    !matches!(
+        op,
+        Op::StackAddr(..)
+            | Op::StackLoad(..)
+            | Op::StackStore(..)
+            | Op::FramePointer
+            | Op::Store(..)
+            | Op::Call { .. }
+            | Op::TryCall { .. }
+            | Op::Copy(..)
+            | Op::Move(..)
+            | Op::AtomicLoad(..)
+            | Op::AtomicStore(..)
+            | Op::AtomicRmw(..)
+            | Op::AtomicCas(..)
+            | Op::Fence
+            | Op::Trap
+            | Op::Trapz(..)
+    )
+}
+
+fn pure_block<R: Copy + PartialEq>(func: &Function, block: Block, plan: &Plan<R>, frame: &Frame<R>, clobbers: &[R]) -> bool {
+    let insts = &func.blocks[block.index()].insts;
+    if insts.is_empty() {
+        return false;
+    }
+    for &inst in &insts[..insts.len() - 1] {
+        let data = &func.insts[inst.index()];
+        if !pure_op(&data.op) || data.result.is_some_and(|r| !pure_value(r, plan, frame, clobbers)) {
+            return false;
+        }
+        let mut ok = true;
+        data.op.for_operands(|v| ok &= pure_value(v, plan, frame, clobbers));
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn shrink_wrap<R: Copy + PartialEq>(func: &Function, framed: bool, plan: &Plan<R>, frame: &Frame<R>, params: &[Loc<R>], clobbers: &[R]) -> Option<ShrinkWrap> {
+    if !framed || func.signature.params.iter().any(|p| p.purpose == ArgumentPurpose::StructReturn) {
+        return None;
+    }
+    let entry = func.entry?;
+    if params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..) | Loc::Pair(..))) {
+        return None;
+    }
+    if func.blocks[entry.index()].params.iter().any(|&p| !pure_value(p, plan, frame, clobbers)) {
+        return None;
+    }
+    let mut preds = vec![0_u32; func.blocks.len()];
+    for block in &func.blocks {
+        if let Some(&term) = block.insts.last() {
+            func.insts[term.index()].op.targets().for_each(|t| preds[t.index()] += 1);
+        }
+    }
+    if preds[entry.index()] != 0 || !pure_block(func, entry, plan, frame, clobbers) {
+        return None;
+    }
+    let term = *func.blocks[entry.index()].insts.last()?;
+    let Op::Brif(cond, then_b, then_args, else_b, else_args) = &func.insts[term.index()].op else { return None };
+    if *then_b == *else_b || !pure_value(*cond, plan, frame, clobbers) {
+        return None;
+    }
+    let fast_ret_ok = |block: Block, edge_args: &[Value]| {
+        preds[block.index()] == 1
+            && func.jump_target(block) == block
+            && edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
+            && func.blocks[block.index()].params.iter().all(|&p| pure_value(p, plan, frame, clobbers))
+            && !edge_steps(edge_args, &func.blocks[block.index()].params, |a, b| plan.same_home(frame, a, b))
+                .iter()
+                .any(|s| matches!(s, Step::Save(..) | Step::Restore(..)))
+            && pure_block(func, block, plan, frame, clobbers)
+            && func.blocks[block.index()].insts.last().is_some_and(|&t| match &func.insts[t.index()].op {
+                Op::Return(vals) => vals.iter().all(|&v| pure_value(v, plan, frame, clobbers)),
+                _ => false,
+            })
+    };
+    let slow_ok = |block: Block, edge_args: &[Value]| {
+        edge_args.iter().all(|&a| pure_value(a, plan, frame, clobbers))
+            .then(|| preds[block.index()] != 1 || func.jump_target(block) != block)
+    };
+    if fast_ret_ok(*then_b, then_args)
+        && let Some(use_slow_thunk) = slow_ok(*else_b, else_args)
+    {
+        Some(ShrinkWrap { fast_ret: *then_b, slow_entry: *else_b, use_slow_thunk })
+    } else if fast_ret_ok(*else_b, else_args)
+        && let Some(use_slow_thunk) = slow_ok(*then_b, then_args)
+    {
+        Some(ShrinkWrap { fast_ret: *else_b, slow_entry: *then_b, use_slow_thunk })
+    } else {
+        None
+    }
+}
+
 pub(crate) trait Emitter<'a>: Sized {
     fn func(&self) -> &'a Function;
     fn prologue(&mut self);
@@ -288,9 +420,26 @@ pub(crate) trait Emitter<'a>: Sized {
     fn set_next(&mut self, next: Option<Block>);
     fn bind_block(&mut self, block: Block);
     fn clear_flags(&mut self);
+    fn is_elided(&self, value: Value) -> bool;
     fn inst(&mut self, inst: Inst) -> Result<(), String>;
     fn trap(&mut self);
     fn finish(self) -> Result<crate::Code, String>;
+
+    fn deferred_prologue(&self) -> bool {
+        false
+    }
+
+    fn blocks_fallthrough_to(&self, _block: Block) -> bool {
+        false
+    }
+
+    fn before_block_bind(&mut self, _block: Block) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn on_block_bound(&mut self, _block: Block) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Result<(), String> {
@@ -298,6 +447,10 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
     let func = emit.func();
     let insts = &func.blocks[block.index()].insts;
     for &inst in insts {
+        let data = &func.insts[inst.index()];
+        if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res)) {
+            continue;
+        }
         emit.inst(inst)?;
     }
     if !insts.last().is_some_and(|inst| func.insts[inst.index()].op.is_terminator()) {
@@ -308,11 +461,16 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
 
 pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<crate::Code, String> {
     let entry = emit.func().entry.ok_or("the function has no entry block")?;
-    emit.prologue();
+    if !emit.deferred_prologue() {
+        emit.prologue();
+    }
     emit.intake(entry)?;
     for (index, &block) in order.iter().enumerate() {
-        emit.set_next(order.get(index + 1).copied());
+        let next_blk = order.get(index + 1).copied().filter(|&nb| !emit.blocks_fallthrough_to(nb));
+        emit.set_next(next_blk);
+        emit.before_block_bind(block)?;
         emit.bind_block(block);
+        emit.on_block_bound(block)?;
         emit_body(&mut emit, block)?;
     }
     emit.finish()

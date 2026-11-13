@@ -110,7 +110,7 @@ impl Emit<'_> {
     fn splat(&mut self, x: Value, result: Value) {
         let dst = self.fdst(result);
         match self.const_of(x) {
-            Some(0) => self.asm.sse(&PACKED, &[0x0F, 0xEF], dst.0, dst),
+            Some(0) => self.zero_xmm(dst),
             Some(byte) => {
                 self.asm.mov_imm(Reg::Rax, (byte & 0xFF).wrapping_mul(BYTES));
                 self.word_splat(dst);
@@ -133,8 +133,10 @@ impl Emit<'_> {
 
     /// Zeroes `result`, the one vector constant there is.
     pub(super) fn vector_zero(&mut self, result: Value) {
-        let dst = self.fdst(result);
-        self.asm.sse(&PACKED, &[0x0F, 0xEF], dst.0, dst);
-        self.fput(result, dst);
+        if !self.is_static(result) {
+            let dst = self.fdst(result);
+            self.zero_xmm(dst);
+            self.fput(result, dst);
+        }
     }
 }

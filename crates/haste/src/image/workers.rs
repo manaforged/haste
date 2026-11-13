@@ -3,21 +3,22 @@
 use std::cmp::Reverse;
 use std::sync::atomic::Ordering;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::lower::{self, Slots};
 use crate::names::ItemRef;
 use crate::sema::Context;
-use crate::sema::reach::Reached;
+use crate::sema::reach::{Instance, Reached};
 
 use super::stencil::DictConfig;
 use super::{Image, Pass};
 
 const MIN_PARALLEL: usize = 64;
-const MAX_BUCKET: usize = 1024;
+const MAX_BUCKET: usize = 128;
+const MAX_PARALLEL_WAVES: usize = 4;
 
-/// What one worker hands back: its pass, the errors by index, and the functions whose constant evaluations it deferred.
-type WorkerOutput = (Pass, Vec<(usize, String)>, Vec<usize>);
+/// What one worker hands back: its pass, the errors by index, the functions whose constant evaluations it deferred, and the requested evals.
+type WorkerOutput = (Pass, Vec<(usize, String)>, Vec<usize>, Vec<(Instance, u32)>);
 
 /// How a pass compiles its buckets: the dictionary configuration, and whether a bucket of one function compiles alone.
 type Plan = (DictConfig, bool);
@@ -77,11 +78,12 @@ impl Image {
         }
         let cfg = DictConfig::from_env();
         self.pass.stencils.cfg = cfg;
-        let had_templates = !self.pass.stencils.templates.is_empty();
-        let plan = (cfg, !had_templates && !cfg.verify && cfg.min_fanout > 1);
+        let block_parallel = !self.pass.stencils.templates.is_empty() && self.mode != super::ImageMode::Aot;
+        let plan = (cfg, !block_parallel && !cfg.verify && cfg.min_fanout > 1);
         let buckets = bucket_work(reached, work);
         let jobs = crate::jobs();
-        if jobs <= 1 || cfg.verify || work.len() < MIN_PARALLEL || had_templates {
+        let min_parallel = if self.mode == super::ImageMode::Aot { 4 } else { MIN_PARALLEL };
+        if jobs <= 1 || cfg.verify || work.len() < min_parallel || block_parallel {
             return self.compile_buckets(cx, reached, &buckets, plan);
         }
         let shards = lpt_shards(buckets, jobs);
@@ -92,27 +94,62 @@ impl Image {
     }
 
     fn compile_buckets(&mut self, cx: &mut Context<'_>, reached: &Reached, buckets: &[Vec<usize>], (cfg, allow_singleton): Plan) -> Vec<(usize, String)> {
-        self.with_pass(|image, pass| buckets.iter().flat_map(|bucket| image.compile_bucket(cx, reached, bucket, cfg, (true, allow_singleton), pass)).collect())
+        self.with_pass(|image, pass| {
+            buckets
+                .iter()
+                .flat_map(|bucket| {
+                    let out = image.compile_bucket(cx, reached, bucket, cfg, (true, allow_singleton), pass);
+                    image.bodies.trim_transient();
+                    out
+                })
+                .collect()
+        })
     }
 
-    fn compile_parallel(&mut self, cx: &mut Context<'_>, reached: &Reached, shards: &[Vec<Vec<usize>>], plan: Plan) -> Vec<(usize, String)> {
-        let forks: Vec<Context<'_>> = shards.iter().map(|_| cx.fork()).collect();
-        let outputs = self.run_workers(forks, reached, shards, plan);
-        let (mut errors, mut deferred) = (Vec::new(), Vec::new());
-        for (shard, output) in shards.iter().zip(outputs) {
-            match output {
-                Some((pass, failed, later)) => {
-                    self.pass.merge(pass);
-                    errors.extend(failed);
-                    deferred.extend(later);
+    fn compile_parallel(&mut self, cx: &mut Context<'_>, reached: &Reached, initial_shards: &[Vec<Vec<usize>>], plan: Plan) -> Vec<(usize, String)> {
+        let mut errors = Vec::new();
+        let mut current_shards = initial_shards.to_vec();
+        let jobs = crate::jobs();
+        let mut deferred = Vec::new();
+        for wave in 0..MAX_PARALLEL_WAVES {
+            let forks: Vec<Context<'_>> = current_shards.iter().map(|_| cx.fork()).collect();
+            let outputs = self.run_workers(forks, reached, &current_shards, plan);
+            deferred.clear();
+            let mut eval_requests = Vec::new();
+            for (shard, output) in current_shards.iter().zip(outputs) {
+                match output {
+                    Some((pass, failed, later, reqs)) => {
+                        self.pass.merge(pass);
+                        errors.extend(failed);
+                        deferred.extend(later);
+                        eval_requests.extend(reqs);
+                    }
+                    None => errors.extend(self.lost(cx, reached, shard)),
                 }
-                None => errors.extend(self.lost(cx, reached, shard)),
             }
+            if deferred.is_empty() || eval_requests.is_empty() || wave + 1 == MAX_PARALLEL_WAVES || deferred.len() < MIN_PARALLEL {
+                break;
+            }
+            let was_parallel = std::mem::replace(&mut cx.in_parallel, false);
+            let mut seen = FxHashSet::default();
+            for (inst, bits) in eval_requests {
+                if seen.insert((inst, bits)) {
+                    crate::sema::evaluate::prime(cx, &inst, bits);
+                }
+            }
+            cx.in_parallel = was_parallel;
+            let next_shards = lpt_shards(bucket_work(reached, &deferred), jobs);
+            if next_shards.len() <= 1 {
+                break;
+            }
+            current_shards = next_shards;
         }
-        deferred.sort_unstable();
-        let was_parallel = std::mem::replace(&mut cx.in_parallel, false);
-        errors.extend(self.compile_buckets(cx, reached, &bucket_work(reached, &deferred), plan));
-        cx.in_parallel = was_parallel;
+        if !deferred.is_empty() {
+            deferred.sort_unstable();
+            let was_parallel = std::mem::replace(&mut cx.in_parallel, false);
+            errors.extend(self.compile_buckets(cx, reached, &bucket_work(reached, &deferred), plan));
+            cx.in_parallel = was_parallel;
+        }
         errors.sort_by_key(|&(index, _)| index);
         errors
     }
@@ -139,17 +176,23 @@ impl Image {
     fn worker_loop(&self, mut cx: Context<'_>, reached: &Reached, shard: &[Vec<usize>], (cfg, allow_singleton): Plan) -> WorkerOutput {
         let mut pass = Pass::default();
         pass.stencils.cfg = cfg;
-        let (mut errors, mut deferred) = (Vec::new(), Vec::new());
+        let (mut errors, mut deferred, mut eval_requests) = (Vec::new(), Vec::new(), Vec::new());
         for bucket in shard {
             let mark = pass.records.len();
+            let frozen_mark = pass.frozen_stencils.len();
             let failed = self.compile_bucket(&mut cx, reached, bucket, cfg, (false, allow_singleton), &mut pass);
-            if cx.take_deferred_evals().is_empty() {
+            let reqs = cx.take_deferred_evals();
+            if reqs.is_empty() {
                 errors.extend(failed);
+                self.bodies.trim_transient();
                 continue;
             }
             pass.records.truncate(mark);
+            pass.frozen_stencils.truncate(frozen_mark);
             deferred.extend_from_slice(bucket);
+            eval_requests.extend(reqs);
+            self.bodies.trim_transient();
         }
-        (pass, errors, deferred)
+        (pass, errors, deferred, eval_requests)
     }
 }

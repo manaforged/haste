@@ -99,7 +99,9 @@ pub fn run(cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128>
             }
         }
     };
+    let prev_skip = std::mem::replace(&mut cx.store.lookups.skip_warm_sysroot_bodies, false);
     let result = runner.evaluate(cx, instance, bits);
+    cx.store.lookups.skip_warm_sysroot_bodies = prev_skip;
     cx.store.runner.put(runner);
     cx.eval_stack.pop();
     match result {
@@ -114,7 +116,7 @@ pub fn run(cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128>
     }
 }
 
-pub(super) fn prime(cx: &mut Context<'_>, instance: &Instance, bits: u32) {
+pub(crate) fn prime(cx: &mut Context<'_>, instance: &Instance, bits: u32) {
     match run(cx, instance, bits) {
         Ok(_) | Err(_) => {}
     }

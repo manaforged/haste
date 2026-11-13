@@ -31,7 +31,7 @@ impl Emit<'_> {
         self.asm.sse(prefix, &[0x0F, 0x2E], a.0, b);
     }
 
-    fn zero_xmm(&mut self, xmm: Xmm) {
+    pub(super) fn zero_xmm(&mut self, xmm: Xmm) {
         self.asm.sse(&[0x66], &[0x0F, 0x57], xmm.0, xmm);
     }
 
@@ -203,6 +203,26 @@ impl Emit<'_> {
                 if signed { self.to_signed() } else { self.to_unsigned() }
                 self.clamp(to, signed);
                 self.put(result, Reg::Rax);
+            }
+            Convert::WidenVec64 | Convert::NarrowVec64 => {
+                let dst = self.fdst(result);
+                let src = self.fin(x, dst);
+                if dst != src {
+                    self.asm.movaps(dst, src);
+                }
+                self.fput(result, dst);
+            }
+            Convert::Bitcast if to.is_float() => {
+                let dst = self.fdst(result);
+                self.get(Reg::Rax, x, Ext::Zero);
+                self.asm.movq_in(dst, Reg::Rax);
+                self.fput(result, dst);
+            }
+            Convert::Bitcast => {
+                let src = self.fin(x, X0);
+                let dst = self.dst(result);
+                self.asm.movq_out(dst, src);
+                self.put(result, dst);
             }
             other => return Err(format!("{other:?} from {:?} to {to:?}", self.ty(x))),
         }

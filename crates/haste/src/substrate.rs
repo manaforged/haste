@@ -15,10 +15,11 @@ use haste_codegen::{Code, RelocKind, Site, StencilReloc, Target};
 use rustc_hash::FxHasher;
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 2;
+const VERSION: u32 = 4;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 48;
+const INSTANCE_REC_LEN: usize = 24;
 const SITE_WIRE_LEN: usize = 12;
 const RELOC_WIRE_LEN: usize = 12;
 
@@ -70,6 +71,11 @@ impl<'a> StencilSlice<'a> {
         }
         Ok(out)
     }
+
+    /// Decodes this slice into a `Code` stencil buffer.
+    pub fn to_code(&self) -> Result<Code> {
+        Ok(Code::from_parts(self.code.to_vec(), self.decode_sites()?, self.decode_relocs()?))
+    }
 }
 
 enum Backing {
@@ -109,13 +115,15 @@ struct Header {
     target_hash: u64,
     summary_count: usize,
     stencil_count: usize,
+    instance_count: usize,
     summaries_off: usize,
     stencils_off: usize,
+    instances_off: usize,
     blob_off: usize,
     blob_len: usize,
 }
 
-/// Mmap-backed frozen sysroot substrate storing summaries and stencils.
+/// Mmap-backed frozen sysroot substrate storing summaries, stencils, and concrete instances.
 pub struct Substrate {
     backing: Backing,
     header: Header,
@@ -128,6 +136,7 @@ impl fmt::Debug for Substrate {
             .field("target_hash", &format_args!("{:016x}", self.header.target_hash))
             .field("summaries", &self.header.summary_count)
             .field("stencils", &self.header.stencil_count)
+            .field("instances", &self.header.instance_count)
             .finish()
     }
 }
@@ -145,7 +154,7 @@ pub fn sysroot_item_key(outline: &crate::outline::Outline, item: crate::names::I
     }
     let root = outline.roots.get(item.krate as usize)?;
     let file = krate.files.get(item.file as usize)?;
-    if file.expanded {
+    if file.expanded && file.expand_origin == 0 {
         return None;
     }
     let (base_item, sub_idx) = match item.outer() {
@@ -159,6 +168,12 @@ pub fn sysroot_item_key(outline: &crate::outline::Outline, item: crate::names::I
     root.name.hash(&mut hasher);
     krate.env.target.triple.hash(&mut hasher);
     rel_path.hash(&mut hasher);
+    file.expanded.hash(&mut hasher);
+    if file.expanded {
+        file.expand_origin.hash(&mut hasher);
+        file.source.offset.hash(&mut hasher);
+        file.source.text.hash(&mut hasher);
+    }
     item.item.hash(&mut hasher);
     sub_idx.hash(&mut hasher);
     entry.start.hash(&mut hasher);
@@ -174,11 +189,21 @@ pub fn enabled() -> bool {
     std::env::var_os("HASTE_NO_SUBSTRATE").is_none_or(|v| v != "1")
 }
 
-/// Computes a 64-bit fingerprint for `target` from its triple and effort level.
+/// Computes a 64-bit fingerprint for `target` and the running compiler binary.
 pub fn target_hash(target: &Target) -> u64 {
     let mut hasher = FxHasher::default();
     target.triple.hash(&mut hasher);
     target.effort.hash(&mut hasher);
+    if let Ok(exe) = std::env::current_exe()
+        && let Ok(meta) = std::fs::metadata(exe)
+    {
+        meta.len().hash(&mut hasher);
+        if let Ok(modified) = meta.modified()
+            && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            dur.as_nanos().hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 
@@ -224,6 +249,9 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
     target.triple.hash(&mut hasher);
     target.effort.hash(&mut hasher);
     crate::graph::store::program().hash(&mut hasher);
+    if let Ok(exe) = std::env::current_exe() {
+        hash_file_meta(&exe, &mut hasher);
+    }
     MAGIC.hash(&mut hasher);
     VERSION.hash(&mut hasher);
     for (_, _, idx) in sysroot_units {
@@ -361,6 +389,21 @@ impl Substrate {
         Some(StencilSlice { code, sites, relocs })
     }
 
+    /// Iterates frozen concrete sysroot instance payloads matching `(item_hash, substs_hash)` in `O(log N)`.
+    pub fn instance_candidates(&self, item_hash: u64, substs_hash: u64) -> impl Iterator<Item = &[u8]> + '_ {
+        let data = self.backing.as_slice();
+        let count = self.header.instance_count;
+        let base = self.header.instances_off;
+        let start = lower_bound_index(count, |i| {
+            let rec = base + i * INSTANCE_REC_LEN;
+            (read_u64(data, rec), read_u64(data, rec + 8)).cmp(&(item_hash, substs_hash))
+        });
+        (start..count)
+            .map(move |i| base + i * INSTANCE_REC_LEN)
+            .take_while(move |&rec| read_u64(data, rec) == item_hash && read_u64(data, rec + 8) == substs_hash)
+            .filter_map(move |rec| self.blob_slice(read_u32(data, rec + 16) as usize, read_u32(data, rec + 20) as usize))
+    }
+
     /// Atomically writes the substrate to `path` via a sibling temporary file and rename.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
@@ -385,6 +428,9 @@ impl Substrate {
     pub fn save_toolchain(&self) -> Result<PathBuf> {
         let path = toolchain_path(self.header.toolchain_hash);
         self.save(&path)?;
+        if let Some(dir) = path.parent() {
+            prune_stale_substrates(dir, &path);
+        }
         Ok(path)
     }
 
@@ -417,7 +463,14 @@ struct PendingStencil {
     relocs_len: u32,
 }
 
-/// Builder that packs sorted sysroot summaries and stencils into a `Substrate`.
+struct PendingInstance {
+    item_hash: u64,
+    substs_hash: u64,
+    off: u32,
+    len: u32,
+}
+
+/// Builder that packs sorted sysroot summaries, stencils, and concrete instances into a `Substrate`.
 #[derive(Default)]
 #[must_use]
 pub struct SubstrateBuilder {
@@ -425,6 +478,7 @@ pub struct SubstrateBuilder {
     target_hash: u64,
     summaries: Vec<PendingSummary>,
     stencils: Vec<PendingStencil>,
+    instances: Vec<PendingInstance>,
     blob: Vec<u8>,
 }
 
@@ -435,6 +489,7 @@ impl fmt::Debug for SubstrateBuilder {
             .field("target_hash", &format_args!("{:016x}", self.target_hash))
             .field("summaries", &self.summaries.len())
             .field("stencils", &self.stencils.len())
+            .field("instances", &self.instances.len())
             .field("blob_bytes", &self.blob.len())
             .finish()
     }
@@ -475,6 +530,15 @@ impl SubstrateBuilder {
             let relocs = existing.blob_slice(read_u32(data, rec + 40) as usize, read_u32(data, rec + 44) as usize).context("corrupt existing stencil relocs")?;
             self.add_stencil(item_hash, footprint, code, sites, relocs)?;
         }
+        for i in 0..existing.header.instance_count {
+            let rec = existing.header.instances_off + i * INSTANCE_REC_LEN;
+            let item_hash = read_u64(data, rec);
+            let substs_hash = read_u64(data, rec + 8);
+            let off = read_u32(data, rec + 16) as usize;
+            let len = read_u32(data, rec + 20) as usize;
+            let bytes = existing.blob_slice(off, len).context("corrupt existing instance slice")?;
+            self.add_instance(item_hash, substs_hash, bytes)?;
+        }
         Ok(())
     }
 
@@ -482,6 +546,13 @@ impl SubstrateBuilder {
     pub fn add_summary(&mut self, item_hash: u64, bytes: &[u8]) -> Result<()> {
         let (off, len) = self.push_blob(bytes)?;
         self.summaries.push(PendingSummary { item_hash, off, len });
+        Ok(())
+    }
+
+    /// Appends a serialized concrete sysroot instance entry.
+    pub fn add_instance(&mut self, item_hash: u64, substs_hash: u64, bytes: &[u8]) -> Result<()> {
+        let (off, len) = self.push_blob(bytes)?;
+        self.instances.push(PendingInstance { item_hash, substs_hash, off, len });
         Ok(())
     }
 
@@ -528,10 +599,25 @@ impl SubstrateBuilder {
         self.summaries.dedup_by_key(|entry| entry.item_hash);
         self.stencils.sort_by_key(|entry| (entry.item_hash, entry.fp_hi, entry.fp_lo));
         self.stencils.dedup_by_key(|entry| (entry.item_hash, entry.fp_hi, entry.fp_lo));
+        self.instances.sort_by(|a, b| {
+            (a.item_hash, a.substs_hash)
+                .cmp(&(b.item_hash, b.substs_hash))
+                .then_with(|| {
+                    let ab = &self.blob[a.off as usize..a.off as usize + a.len as usize];
+                    let bb = &self.blob[b.off as usize..b.off as usize + b.len as usize];
+                    ab.cmp(bb)
+                })
+        });
+        self.instances.dedup_by(|a, b| {
+            a.item_hash == b.item_hash
+                && a.substs_hash == b.substs_hash
+                && self.blob[a.off as usize..a.off as usize + a.len as usize] == self.blob[b.off as usize..b.off as usize + b.len as usize]
+        });
 
         let summaries_off = HEADER_LEN;
         let stencils_off = summaries_off + self.summaries.len() * SUMMARY_REC_LEN;
-        let blob_off = stencils_off + self.stencils.len() * STENCIL_REC_LEN;
+        let instances_off = stencils_off + self.stencils.len() * STENCIL_REC_LEN;
+        let blob_off = instances_off + self.instances.len() * INSTANCE_REC_LEN;
         let total = blob_off + self.blob.len();
 
         let mut out = Vec::with_capacity(total);
@@ -542,7 +628,7 @@ impl SubstrateBuilder {
         out.extend_from_slice(&self.target_hash.to_le_bytes());
         out.extend_from_slice(&(self.summaries.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.stencils.len() as u64).to_le_bytes());
-        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&(self.instances.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.blob.len() as u64).to_le_bytes());
 
         for entry in &self.summaries {
@@ -560,6 +646,12 @@ impl SubstrateBuilder {
             out.extend_from_slice(&entry.sites_len.to_le_bytes());
             out.extend_from_slice(&entry.relocs_off.to_le_bytes());
             out.extend_from_slice(&entry.relocs_len.to_le_bytes());
+        }
+        for entry in &self.instances {
+            out.extend_from_slice(&entry.item_hash.to_le_bytes());
+            out.extend_from_slice(&entry.substs_hash.to_le_bytes());
+            out.extend_from_slice(&entry.off.to_le_bytes());
+            out.extend_from_slice(&entry.len.to_le_bytes());
         }
         out.extend_from_slice(&self.blob);
         Substrate::from_bytes(out)
@@ -581,18 +673,35 @@ fn parse_and_validate(data: &[u8]) -> Result<Header> {
     let target_hash = read_u64(data, 24);
     let summary_count = usize::try_from(read_u64(data, 32)).context("summary count overflow")?;
     let stencil_count = usize::try_from(read_u64(data, 40)).context("stencil count overflow")?;
+    let instance_count = usize::try_from(read_u64(data, 48)).context("instance count overflow")?;
     let blob_len = usize::try_from(read_u64(data, 56)).context("blob length overflow")?;
 
     let summaries_off = HEADER_LEN;
     let summaries_bytes = summary_count.checked_mul(SUMMARY_REC_LEN).context("summary table overflow")?;
     let stencils_off = summaries_off.checked_add(summaries_bytes).context("stencil offset overflow")?;
     let stencils_bytes = stencil_count.checked_mul(STENCIL_REC_LEN).context("stencil table overflow")?;
-    let blob_off = stencils_off.checked_add(stencils_bytes).context("blob offset overflow")?;
+    let instances_off = stencils_off.checked_add(stencils_bytes).context("instance offset overflow")?;
+    let instances_bytes = instance_count.checked_mul(INSTANCE_REC_LEN).context("instance table overflow")?;
+    let blob_off = instances_off.checked_add(instances_bytes).context("blob offset overflow")?;
     let total = blob_off.checked_add(blob_len).context("total length overflow")?;
     if data.len() < total {
         bail!("truncated substrate payload");
     }
-    Ok(Header { toolchain_hash, target_hash, summary_count, stencil_count, summaries_off, stencils_off, blob_off, blob_len })
+    Ok(Header { toolchain_hash, target_hash, summary_count, stencil_count, instance_count, summaries_off, stencils_off, instances_off, blob_off, blob_len })
+}
+
+fn lower_bound_index(len: usize, mut cmp: impl FnMut(usize) -> Ordering) -> usize {
+    let mut lo = 0usize;
+    let mut hi = len;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if cmp(mid) == Ordering::Less {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 fn binary_search_index(len: usize, mut cmp: impl FnMut(usize) -> Ordering) -> Option<usize> {
@@ -639,5 +748,28 @@ fn decode_reloc_kind(raw: u8) -> Result<RelocKind> {
         3 => Ok(RelocKind::PcRel32),
         4 => Ok(RelocKind::Arm64Call26),
         _ => bail!("unknown relocation kind"),
+    }
+}
+
+fn prune_stale_substrates(dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path == keep || path.extension().and_then(|e| e.to_str()) != Some("substrate") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+    others.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in others.into_iter().skip(7) {
+        drop(std::fs::remove_file(path));
     }
 }

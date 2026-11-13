@@ -145,6 +145,7 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize]) -> Result<Outc
     let owners = outline.roots.iter().map(|root| root.unit).collect();
     let (entries, store) = image::entries(&mut compilation, (crate::sema::Cache::default(), &mains))?;
     let mut demand = Jit::new(store)?;
+    demand.set_fast(true);
     let left = scripts.iter().zip(entries).map(|(&(unit, _), entry)| (unit, entry.map(|pair| pair.map(|root| demand.declare(root))))).collect();
     let mut driver = Runs { workspace, targets, owners, left, running: Vec::new(), ran: known(workspace), outcome: Outcome::new() };
     image::serve(&mut compilation, &crate::macros::load, &mut demand, &mut driver)?;

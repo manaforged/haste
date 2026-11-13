@@ -136,12 +136,18 @@ impl<'a> Paths<'a> {
     pub fn member(&self, def: Def, name: Sym) -> PerNs {
         match def {
             Def::Module(at) => {
-                if let Some(asks) = self.demands
-                    && !self.done.get(at.krate as usize).is_some_and(|krate| krate.wants(at.module, name))
-                {
-                    asks.names.borrow_mut().push((at, name));
-                }
                 let found = self.scope(at).and_then(|scope| scope.names.get(&name).copied());
+                if let Some(asks) = self.demands {
+                    let entry = self.done.get(at.krate as usize);
+                    if !entry.is_some_and(|krate| krate.wants(at.module, name)) {
+                        asks.names.borrow_mut().push((at, name));
+                    } else if found.is_none()
+                        && let Some(krate) = entry
+                        && self.demand_pending_import(krate, at, name)
+                    {
+                        asks.names.borrow_mut().push((at, name));
+                    }
+                }
                 if found.is_none() {
                     self.ask_crate(at);
                 }
@@ -166,6 +172,26 @@ impl<'a> Paths<'a> {
         {
             demands.crates.borrow_mut().push(root.krate);
         }
+    }
+
+    fn demand_pending_import(&self, krate: &super::Crate, at: ModRef, name: Sym) -> bool {
+        let named = krate.named.get(&(at.module, name)).into_iter().flatten();
+        let globs = krate.globs.get(&at.module).into_iter().flatten();
+        let mut any = false;
+        for &index in named.chain(globs) {
+            let pending = &krate.pending[index];
+            if pending.stamp.is_some() {
+                continue;
+            }
+            any = true;
+            if at.krate == self.krate
+                && let Some(&first) = pending.segments.first()
+                && let Some(Def::Module(ext)) = self.extern_crate(first)
+            {
+                self.ask_crate(ext);
+            }
+        }
+        any
     }
 
     /// Every variant of the enum `item`, as bindings.

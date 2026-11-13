@@ -291,8 +291,7 @@ impl Lower<'_, '_> {
             }
             Repr::Mem { .. } if !self.lent_mutably(expr) => {
                 let Some(bytes) = literal_bytes(self.cx, &literal, (root, ty)) else { return Ok(None) };
-                let id = self.slots.rodata(&bytes, &[]);
-                Ok(Some(self.emit_symbol(SymbolSource::Rodata(id))))
+                Ok(Some(self.emit_const_rodata(&bytes)))
             }
             _ => Ok(None),
         }
@@ -314,8 +313,7 @@ impl Lower<'_, '_> {
         let inner_ty = typed.exprs[inner.0 as usize];
         let literal = Literal { body: &body, src, typed: &typed };
         let Some(bytes) = literal_bytes(self.cx, &literal, (inner, inner_ty)) else { return Ok(None) };
-        let id = self.slots.rodata(&bytes, &[]);
-        let data = self.emit_symbol(SymbolSource::Rodata(id));
+        let data = self.emit_const_rodata(&bytes);
         Ok(match (self.cx.types.kind(pointee).clone(), self.cx.types.kind(inner_ty).clone()) {
             (Kind::Slice(_), Kind::Array(_, len)) => self.cx.types.len(len).map(|len| self.wide_pointer(data, len as i64)),
             (Kind::Slice(_), _) => None,
@@ -327,11 +325,29 @@ impl Lower<'_, '_> {
     /// The address of the bytes the compiler laid out for `expr` when it names a constant made of literals that lives in memory.
     fn literal_place(&mut self, expr: ExprId) -> Result<Option<Value>> {
         let inner = self.transparent(expr).unwrap_or(expr);
-        let Some(&Res::Fn(item, substs)) = self.typed.res.get(&inner).filter(|_| matches!(self.body.expr(inner), Expr::Path(_))) else { return Ok(None) };
-        if self.cx.item(item).1.kind != ItemKind::Const || !matches!(repr(self.cx, self.ty_of(inner))?, Repr::Mem { .. }) {
-            return Ok(None);
+        if let Some(&Res::Fn(item, substs)) = self.typed.res.get(&inner).filter(|_| matches!(self.body.expr(inner), Expr::Path(_)))
+            && self.cx.item(item).1.kind == ItemKind::Const
+            && !self.lent_mutably(expr)
+            && matches!(repr(self.cx, self.ty_of(inner))?, Repr::Scalar(_) | Repr::Mem { .. })
+            && let Some((source, typed)) = self.literal_source(item, substs)?
+        {
+            let typed = typed.scoped(&self.cx.types);
+            let ty = typed.ret_ty();
+            let body = self.cx.body(source)?;
+            if let (Some(root), src) = (body.root, self.cx.body_src(source)) {
+                let literal = Literal { body: &body, src, typed: &typed };
+                if let Some(bytes) = literal_bytes(self.cx, &literal, (root, ty)) {
+                    return Ok(Some(self.emit_const_rodata(&bytes)));
+                }
+            }
         }
-        self.literal_constant(inner, item, substs)
+        if !self.lent_mutably(expr) && self.cx.types.substs(self.reached.list[self.index].0.1).is_empty() {
+            let literal = Literal { body: self.body, src: self.src, typed: self.typed };
+            if let Some(bytes) = literal_bytes(self.cx, &literal, (expr, self.ty_of(expr))) {
+                return Ok(Some(self.emit_const_rodata(&bytes)));
+            }
+        }
+        Ok(None)
     }
 
     /// Whether the body writes through or lends mutably a place whose root is the value `expr`.

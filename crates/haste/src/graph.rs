@@ -121,11 +121,11 @@ fn manifest_name(dir: &Path) -> Option<String> {
     Some(table.get("package")?.get("name")?.as_str()?.to_owned())
 }
 
-/// The `[workspace]` table of the nearest manifest at or above `dir` that has one, which a local or git package inherits from.
-fn owning_workspace(dir: &Path) -> Result<Option<toml::Table>> {
+/// The root directory and `[workspace]` table of the nearest manifest at or above `dir` that has one, which a local or git package inherits from.
+fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
     for at in dir.ancestors().filter(|at| at.join("Cargo.toml").is_file()) {
         if let Some(workspace) = manifest::workspace_of(at)? {
-            return Ok(Some(workspace));
+            return Ok(Some((at.to_owned(), workspace)));
         }
     }
     Ok(None)
@@ -139,6 +139,12 @@ fn patch_paths(dir: &Path) -> Result<Vec<PathBuf>> {
             paths.extend(patches_in(&config, at)?);
         }
     }
+    if let Ok(home) = cargo_home() {
+        let config = ["config.toml", "config"].map(|leaf| home.join(leaf)).into_iter().find(|path| path.is_file());
+        if let Some(config) = config {
+            paths.extend(patches_in(&config, &home)?);
+        }
+    }
     Ok(paths)
 }
 
@@ -146,7 +152,7 @@ fn patches_in(file: &Path, base: &Path) -> Result<Vec<PathBuf>> {
     let table: toml::Table = toml::from_str(&std::fs::read_to_string(file)?).with_context(|| format!("parsing {}", file.display()))?;
     let patches = table.get("patch").and_then(toml::Value::as_table).into_iter().flat_map(|patch| patch.values());
     let entries = patches.filter_map(toml::Value::as_table).flat_map(|source| source.values());
-    Ok(entries.filter_map(|entry| entry.get("path")?.as_str()).map(|path| base.join(path)).collect())
+    Ok(entries.filter_map(|entry| entry.get("path")?.as_str()).map(|path| manifest::normalize(&base.join(path))).collect())
 }
 
 fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<PathBuf> {
@@ -166,15 +172,24 @@ pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
 
 fn local_paths(root: &Path, top: &Path, workspace: Option<&toml::Table>) -> Result<BTreeMap<String, PathBuf>> {
     let mut paths = BTreeMap::new();
+    let mut seen_ws = BTreeSet::from([top.to_owned()]);
     let mut stack = vec![root.to_owned()];
     stack.extend(patch_paths(top)?);
     stack.extend(member_dirs(top, workspace, "members"));
     while let Some(dir) = stack.pop() {
+        let dir = manifest::normalize(&dir);
         if manifest_name(&dir).is_none() {
             continue;
         }
-        let manifest = manifest::read(&dir, owning_workspace(&dir)?.as_ref())?;
-        if paths.insert(manifest.name.clone(), dir.clone()).is_some() {
+        let owner = owning_workspace(&dir)?;
+        if let Some((ws_dir, ws_table)) = &owner
+            && seen_ws.insert(ws_dir.clone())
+        {
+            stack.extend(patch_paths(ws_dir)?);
+            stack.extend(member_dirs(ws_dir, Some(ws_table), "members"));
+        }
+        let manifest = manifest::read(&dir, owner.as_ref().map(|(_, ws)| ws))?;
+        if paths.insert(manifest.name.clone(), dir).is_some() {
             continue;
         }
         stack.extend(manifest.deps.iter().filter_map(|dep| dep.path.clone()));
@@ -209,6 +224,8 @@ pub fn load(root: &Path, targets: &Targets) -> Result<Workspace> {
 
 /// Like [`load`], with `features` enabled on the root package besides its defaults.
 pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Workspace> {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    let root = canonical.as_path();
     let top = workspace_root(root)?;
     let workspace = manifest::workspace_of(&top)?;
     let locked = lock::read(&top.join("Cargo.lock"))?;
@@ -221,7 +238,7 @@ pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Wo
         match source_dir(&entry, &registries, &paths) {
             Ok(dir) => {
                 let owner = if entry.is_registry() { None } else { owning_workspace(&dir)? };
-                let manifest = manifest::read(&dir, owner.as_ref())?;
+                let manifest = manifest::read(&dir, owner.as_ref().map(|(_, ws)| ws))?;
                 packages.push(Package { locked: entry, manifest, resolved: BTreeMap::new(), sysroot: false });
                 missing.push(None);
             }
@@ -234,7 +251,8 @@ pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Wo
     }
     resolve_deps(&mut packages);
     let root_names: Vec<String> = if manifest_name(root).is_some() {
-        vec![manifest::read(root, owning_workspace(root)?.as_ref())?.name]
+        let owner = owning_workspace(root)?;
+        vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name]
     } else if root == top && workspace.is_some() {
         let mut dirs = member_dirs(&top, workspace.as_ref(), "default-members");
         if dirs.is_empty() {
@@ -242,7 +260,8 @@ pub fn load_with(root: &Path, targets: &Targets, features: &[&str]) -> Result<Wo
         }
         dirs.into_iter().filter_map(|dir| manifest_name(&dir)).collect()
     } else {
-        vec![manifest::read(root, owning_workspace(root)?.as_ref())?.name]
+        let owner = owning_workspace(root)?;
+        vec![manifest::read(root, owner.as_ref().map(|(_, ws)| ws))?.name]
     };
     let members: Vec<usize> = packages.iter().enumerate().filter(|(_, package)| !package.locked.is_registry() && root_names.contains(&package.locked.name)).map(|(at, _)| at).collect();
     if members.is_empty() {

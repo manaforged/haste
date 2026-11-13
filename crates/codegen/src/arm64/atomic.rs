@@ -9,6 +9,12 @@ const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
 impl Emit<'_> {
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
+            Op::Const(0) => {
+                let result = result()?;
+                if !self.plan.is_static(result) {
+                    self.put(result, ZR);
+                }
+            }
             Op::Const(imm) => {
                 let result = result()?;
                 if !self.plan.is_static(result) {
@@ -174,30 +180,54 @@ impl Emit<'_> {
     }
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
-        let flag = self.src(condition, C, Ext::Zero);
-        self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+        let cond = if let Some((val, c)) = self.flags
+            && val == condition
+        {
+            c
+        } else if self.plan.elided[condition.index()]
+            && let Some(inst) = self.defs[condition.index()]
+            && let Op::Icmp(cc, a, b) = self.func.insts[inst.index()].op
+        {
+            let c = self.compare(cc, a, b);
+            self.flags = Some((condition, c));
+            c
+        } else {
+            self.flags = None;
+            self.last_cmp = None;
+            let flag = self.src(condition, C, Ext::Zero);
+            self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+            Cond::Ne
+        };
         let ty = self.ty(x);
         if ty.is_float() {
             let (left, right) = (self.fin(x, super::V0), self.fin(y, super::V1));
             let dst = self.fdst(result);
-            self.asm.fcsel(Cond::Ne, ty == Type::F64, dst, left, right);
+            self.asm.fcsel(cond, ty == Type::F64, dst, left, right);
             self.fput(result, dst);
             return;
         }
         if ty == Type::I128 {
             self.raw(A, x);
             self.raw(D, y);
-            self.asm.csel(Cond::Ne, A, A, D);
+            self.asm.csel(cond, A, A, D);
             self.put(result, A);
             self.high(A, x);
             self.high(D, y);
-            self.asm.csel(Cond::Ne, A, A, D);
+            self.asm.csel(cond, A, A, D);
             self.put_high(result, A);
             return;
         }
-        let (left, right) = (self.bits(x, A), self.bits(y, D));
         let dst = self.dst(result);
-        self.asm.csel(Cond::Ne, dst, left, right);
+        let const_val = |v: Value| self.plan.const_of(v).map(|imm| crate::fold::extend(imm, ty, false));
+        match (const_val(x), const_val(y)) {
+            (Some(1), Some(0)) => self.asm.cset(cond, dst),
+            (Some(0), Some(1)) => self.asm.cset(cond.invert(), dst),
+            (kx, ky) => {
+                let left = if kx == Some(0) { ZR } else { self.bits(x, A) };
+                let right = if ky == Some(0) { ZR } else { self.bits(y, D) };
+                self.asm.csel(cond, dst, left, right);
+            }
+        }
         self.put(result, dst);
     }
 

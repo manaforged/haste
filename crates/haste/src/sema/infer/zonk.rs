@@ -131,6 +131,8 @@ impl Infer<'_, '_> {
 
     fn settle_all(&mut self) -> Result<()> {
         self.settle_projections()?;
+        self.settle_obligations()?;
+        self.settle_projections()?;
         self.settle_opaques(true)?;
         self.settle_awaits()?;
         self.settle_operators(false)?;

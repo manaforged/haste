@@ -9,6 +9,7 @@ mod coroutine;
 mod drop;
 mod equal;
 mod expr;
+mod format;
 mod intrinsic;
 mod looping;
 mod matching;
@@ -80,6 +81,10 @@ pub trait Slots {
     /// Interns a vtable layout and returns its symbol id.
     fn vtable_id(&self, _entries: &[VtableEntry]) -> VtableId {
         VtableId(0)
+    }
+    /// Returns the entries of an interned vtable `id`, if available.
+    fn vtable_entries(&self, _id: VtableId) -> Option<Vec<VtableEntry>> {
+        None
     }
     /// Resolves a symbolic relocation entry to its concrete 64-bit value in this image.
     fn resolve_symbol(&self, sym: &SymbolSource) -> u64 {
@@ -202,8 +207,18 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
         }
     }
     for param in params {
+        let sig_idx = signature.params.len();
         match repr(cx, param)? {
-            Repr::Scalar(ty) => signature.params.push(AbiParam::new(ty)),
+            Repr::Scalar(ty) => {
+                if ty == Type::I64
+                    && let Kind::Ref(crate::sema::ty::Mut::Not, inner) = *cx.types.kind(param)
+                    && let Some(bytes) = freeze_pointee_bytes(cx, inner)
+                {
+                    signature.mark_readonly(sig_idx);
+                    signature.mark_readonly_bytes(sig_idx, bytes);
+                }
+                signature.params.push(AbiParam::new(ty));
+            }
             Repr::Mem { .. } => match passed_parts(cx, param)? {
                 Some(parts) => signature.params.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
                 None => signature.params.push(AbiParam::new(Type::I64)),
@@ -212,6 +227,36 @@ pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIter
         }
     }
     Ok(signature)
+}
+
+fn freeze_pointee_bytes(cx: &mut Context<'_>, ty: Ty) -> Option<u32> {
+    if !cx.is_unsized(ty).is_ok_and(|u| !u) || !is_freeze_ty(cx, ty, 0) {
+        return None;
+    }
+    let bytes = cx.layout(ty).ok()?.size.bytes();
+    u32::try_from(bytes).ok().filter(|&b| b > 0)
+}
+
+fn is_freeze_ty(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
+    if depth > 16 || ty == Ty::NONE || cx.types.has_params(ty) {
+        return false;
+    }
+    match *cx.types.kind(ty) {
+        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => true,
+        Kind::Pat(base, ..) | Kind::Array(base, _) | Kind::Slice(base) => is_freeze_ty(cx, base, depth + 1),
+        Kind::Tuple(substs) => cx.types.substs(substs).to_vec().into_iter().all(|t| is_freeze_ty(cx, t, depth + 1)),
+        Kind::Adt(item, substs) => {
+            if cx.types.substs_have_params(substs) || matches!(cx.lang(item), Some("unsafe_cell" | "unsafe_pinned")) {
+                return false;
+            }
+            let args = cx.types.substs(substs).to_vec();
+            let Ok(variants) = crate::sema::infer::field_types(cx, item, &args) else {
+                return false;
+            };
+            variants.iter().flatten().all(|&field| is_freeze_ty(cx, field, depth + 1))
+        }
+        Kind::Closure(..) | Kind::Dyn(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
+    }
 }
 
 /// Whether `signature` returns its result through a first `StructReturn` pointer.
@@ -234,6 +279,17 @@ struct Loop {
 pub(super) struct Inline {
     pub stack: Vec<usize>,
     pub local: rustc_hash::FxHashMap<usize, (Option<Arc<stencil::InlinedCallee>>, usize)>,
+    pub local_meta: rustc_hash::FxHashMap<usize, (Option<stencil::InlineMeta>, usize)>,
+    pub max_callee_height: u8,
+    pub max_callee_size: u16,
+}
+
+impl Inline {
+    pub(super) fn pop(&mut self, depth: usize) {
+        self.stack.pop();
+        self.local.retain(|_, (_, cyc)| *cyc == usize::MAX || *cyc < depth);
+        self.local_meta.retain(|_, (_, cyc)| *cyc == usize::MAX || *cyc < depth);
+    }
 }
 
 /// The lowering of one body.
@@ -568,8 +624,11 @@ impl Lower<'_, '_> {
 
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<()> {
         let Some(init) = init else {
-            return self.declare_uninit(pat);
+            return self.declare_binding(pat, false);
         };
+        if self.open && self.uninit_call(init) && self.can_declare_uninit_val(pat) && !self.typed.coercions.contains_key(&init) {
+            return self.declare_binding(pat, true);
+        }
         self.extend(init);
         let unboxed = self.moves_whole_box(pat, init)?;
         let place = if unboxed { self.temp(init)? } else { self.place_or_temp(init)? };
@@ -581,15 +640,24 @@ impl Lower<'_, '_> {
         self.commit_moves()
     }
 
-    fn declare_uninit(&mut self, pat: PatId) -> Result<()> {
+    fn can_declare_uninit_val(&self, pat: PatId) -> bool {
+        match *self.body.pat(pat) {
+            Pat::Bind { sub: None, by_ref: false, .. } => !self.typed.pat_res.contains_key(&pat) && !self.typed.ref_binds.contains_key(&pat),
+            Pat::Wild => true,
+            Pat::Paren(inner) => self.can_declare_uninit_val(inner),
+            _ => false,
+        }
+    }
+
+    fn declare_binding(&mut self, pat: PatId, init: bool) -> Result<()> {
         match *self.body.pat(pat) {
             Pat::Bind { sub: None, .. } => match self.typed.binds.get(&pat) {
-                Some(&local) => self.declare_as(local, None, false),
+                Some(&local) => self.declare_as(local, None, init),
                 None => bail!("an uninitialized binding with no local"),
             },
             Pat::Wild => Ok(()),
-            Pat::Paren(inner) => self.declare_uninit(inner),
-            Pat::Tuple(items) => self.body.list(items).to_vec().into_iter().try_for_each(|item| self.declare_uninit(PatId(item))),
+            Pat::Paren(inner) => self.declare_binding(inner, init),
+            Pat::Tuple(items) => self.body.list(items).to_vec().into_iter().try_for_each(|item| self.declare_binding(PatId(item), init)),
             _ => bail!("uninitialized `let` with a pattern"),
         }
     }

@@ -2,6 +2,7 @@ mod asm;
 mod atomic;
 mod float;
 mod frame;
+mod fuse;
 mod int;
 mod location;
 mod vector;
@@ -10,8 +11,8 @@ mod wide;
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
-use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset};
-use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
+use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
+use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, IntCC, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{Os, Target};
@@ -45,11 +46,31 @@ const REGS: Regs<Reg> = Regs {
     fold_sib: true,
 };
 
+fn emit_save_pairs<T: Copy>(asm: &mut Asm, regs: &[T], base: usize, mut step: impl FnMut(&mut Asm, i32, T, Option<T>)) {
+    let mut i = 0;
+    while i < regs.len() {
+        if i + 1 < regs.len() {
+            let disp = save_offset(base + i + 1);
+            if (-512..=504).contains(&disp) && disp % 8 == 0 {
+                step(asm, disp, regs[i + 1], Some(regs[i]));
+                i += 2;
+                continue;
+            }
+        }
+        step(asm, save_offset(base + i), regs[i], None);
+        i += 1;
+    }
+}
+
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
-    let Prepared { order, copied, abi, plan, frame, framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
+    let Prepared { order, copied, abi, mut plan, frame, framed } = prepare(func, &REGS, target.effort == crate::Effort::Full, |sig| classify(sig, packing))?;
+    let defs = crate::fold::defs(func);
+    fuse::fuse(func, &mut plan);
+    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP]);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
+    let slow_thunk = asm.label();
     let emit = Emit {
         func,
         frame,
@@ -61,10 +82,17 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         sites: Vec::new(),
         relocs: Vec::new(),
         plan,
+        defs,
         flags: None,
+        last_cmp: None,
         next: None,
         copied,
         direct_calls: target.direct_calls,
+        sp_bias: 0,
+        shrink,
+        slow_thunk,
+        in_shrink_entry: false,
+        in_fast_ret: false,
     };
     drive(emit, &order)
 }
@@ -108,15 +136,26 @@ pub(super) struct Emit<'a> {
     sites: Vec<Site>,
     relocs: Vec<StencilReloc>,
     plan: Plan<Reg>,
+    defs: Vec<Option<Inst>>,
     flags: Option<(Value, Cond)>,
+    last_cmp: Option<(Size, Value, Value, bool)>,
     next: Option<Block>,
     copied: Vec<bool>,
     direct_calls: bool,
+    sp_bias: i32,
+    shrink: Option<ShrinkWrap>,
+    slow_thunk: Label,
+    in_shrink_entry: bool,
+    in_fast_ret: bool,
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
     fn func(&self) -> &'a Function {
         self.func
+    }
+
+    fn is_elided(&self, value: Value) -> bool {
+        self.plan.elided[value.index()]
     }
 
     fn prologue(&mut self) {
@@ -131,13 +170,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
         } else if size > 0 {
             self.asm.add_imm(true, false, Size::X, SP, SP, size);
         }
-        for (index, &reg) in self.frame.saves.iter().enumerate() {
-            self.asm.store(Size::X, Mem::new(FP, save_offset(index)), reg);
-        }
-        let base = self.frame.saves.len();
-        for (index, &v) in self.frame.float_saves.iter().enumerate() {
-            self.asm.vstore(8, Mem::new(FP, save_offset(base + index)), Vreg(v));
-        }
+        emit_save_pairs(&mut self.asm, &self.frame.saves, 0, |asm, disp, a, b| match b {
+            Some(r0) => asm.stp_offset(a, r0, FP, disp),
+            None => asm.store(Size::X, Mem::new(FP, disp), a),
+        });
+        emit_save_pairs(&mut self.asm, &self.frame.float_saves, self.frame.saves.len(), |asm, disp, a, b| match b {
+            Some(v0) => asm.fstp_offset(Vreg(a), Vreg(v0), FP, disp),
+            None => asm.vstore(8, Mem::new(FP, disp), Vreg(a)),
+        });
     }
 
     fn intake(&mut self, entry: Block) -> Result<(), String> {
@@ -160,13 +200,63 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.asm.bind(self.blocks[block.index()]);
     }
 
+    fn deferred_prologue(&self) -> bool {
+        self.shrink.is_some()
+    }
+
+    fn blocks_fallthrough_to(&self, block: Block) -> bool {
+        self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block)
+    }
+
+    fn before_block_bind(&mut self, block: Block) -> Result<(), String> {
+        if let Some(shrink) = self.shrink
+            && shrink.use_slow_thunk
+            && block == shrink.slow_entry
+        {
+            self.asm.bind(self.slow_thunk);
+            self.emit_slow_prologue_and_edge(shrink.slow_entry)?;
+        }
+        Ok(())
+    }
+
+    fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
+        self.in_shrink_entry = self.shrink.is_some() && self.func.entry == Some(block);
+        self.in_fast_ret = self.shrink.is_some_and(|s| s.fast_ret == block);
+        if let Some(shrink) = self.shrink
+            && !shrink.use_slow_thunk
+            && block == shrink.slow_entry
+        {
+            self.emit_slow_prologue_and_edge(shrink.slow_entry)?;
+        }
+        Ok(())
+    }
+
     fn clear_flags(&mut self) {
         self.flags = None;
+        self.last_cmp = None;
     }
 
     fn inst(&mut self, inst: Inst) -> Result<(), String> {
         let func = self.func;
         let data = &func.insts[inst.index()];
+        let keep_flags = matches!(
+            data.op,
+            Op::Brif(..)
+                | Op::Trapz(..)
+                | Op::Load(..)
+                | Op::Store(..)
+                | Op::StackAddr(..)
+                | Op::StackLoad(..)
+                | Op::StackStore(..)
+                | Op::Const(_)
+                | Op::FramePointer
+        ) || matches!(data.op, Op::Select(cond, ..) if self.flags.is_some_and(|(v, _)| v == cond));
+        if !keep_flags {
+            self.flags = None;
+            if !matches!(data.op, Op::Icmp(..)) {
+                self.last_cmp = None;
+            }
+        }
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
         match &data.op {
@@ -232,13 +322,14 @@ impl Emit<'_> {
 
     fn epilogue(&mut self) {
         if self.framed {
-            for (index, &reg) in self.frame.saves.iter().enumerate() {
-                self.asm.load(Size::X, false, reg, Mem::new(FP, save_offset(index)));
-            }
-            let base = self.frame.saves.len();
-            for (index, &v) in self.frame.float_saves.iter().enumerate() {
-                self.asm.vload(8, Vreg(v), Mem::new(FP, save_offset(base + index)));
-            }
+            emit_save_pairs(&mut self.asm, &self.frame.saves, 0, |asm, disp, a, b| match b {
+                Some(r0) => asm.ldp_offset(a, r0, FP, disp),
+                None => asm.load(Size::X, false, a, Mem::new(FP, disp)),
+            });
+            emit_save_pairs(&mut self.asm, &self.frame.float_saves, self.frame.saves.len(), |asm, disp, a, b| match b {
+                Some(v0) => asm.fldp_offset(Vreg(a), Vreg(v0), FP, disp),
+                None => asm.vload(8, Vreg(a), Mem::new(FP, disp)),
+            });
             self.asm.mov_sp(SP, FP);
             self.asm.ldp_post(FP, LR, SP, 16);
         }
@@ -251,6 +342,7 @@ impl Emit<'_> {
         match self.flags.take() {
             Some((value, cond)) if value == condition => cond,
             _ => {
+                self.last_cmp = None;
                 let reg = self.src(condition, A, Ext::Zero);
                 let size = Size::of(self.ty(condition).bytes());
                 self.asm.alu(Alu::Subs, if size == Size::X { Size::X } else { Size::W }, ZR, reg, ZR);
@@ -282,48 +374,143 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
-        for step in edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.plan.same_home(&self.frame, a, b)) {
+        let steps = edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.plan.same_home(&self.frame, a, b));
+        let reg_only = steps.iter().all(|step| match *step {
+            Step::Move(arg, param) => self.plan.reg_of(arg).is_some() && self.plan.reg_of(param).is_some(),
+            Step::Save(arg, index) => index < 2 && self.plan.reg_of(arg).is_some(),
+            Step::Restore(index, param) => index < 2 && self.plan.reg_of(param).is_some(),
+        });
+        let scratch = [S, T];
+        for step in steps {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
-                Step::Save(arg, index) => self.move_to(Mem::new(FP, self.frame.edge_slot(index)), arg),
-                Step::Restore(index, param) => self.load_home(param, Mem::new(FP, self.frame.edge_slot(index))),
+                Step::Save(arg, index) if reg_only => {
+                    if let Some(reg) = self.plan.reg_of(arg) {
+                        self.asm.mov(scratch[index], reg);
+                    }
+                }
+                Step::Restore(index, param) if reg_only => {
+                    if let Some(reg) = self.plan.reg_of(param) {
+                        self.asm.mov(reg, scratch[index]);
+                    }
+                }
+                Step::Save(arg, index) => self.move_to(self.frame_mem(self.frame.edge_slot(index)), arg),
+                Step::Restore(index, param) => self.load_home(param, self.frame_mem(self.frame.edge_slot(index))),
             }
         }
         Ok(())
     }
 
+    fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {
+        if self.plan.elided[condition.index()]
+            && let Some(inst) = self.defs[condition.index()]
+        {
+            match self.func.insts[inst.index()].op {
+                Op::Binary(Binary::Band, x, y) => {
+                    if let Some((val, bit)) = fuse::single_bit_mask(self.func, &self.plan, x, y) {
+                        let reg = self.bits(val, A);
+                        self.asm.tbz(!invert, reg, bit, label);
+                        return;
+                    }
+                }
+                Op::Icmp(cc, lhs, zero) => {
+                    let masked = if self.plan.const_of(zero) == Some(0) { lhs } else { zero };
+                    if let Some(m_inst) = self.defs[masked.index()]
+                        && let Op::Binary(Binary::Band, x, y) = self.func.insts[m_inst.index()].op
+                        && let Some((val, bit)) = fuse::single_bit_mask(self.func, &self.plan, x, y)
+                    {
+                        let eq_zero = cc == IntCC::Equal;
+                        let reg = self.bits(val, A);
+                        self.asm.tbz(eq_zero ^ !invert, reg, bit, label);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((value, cond)) = self.flags.take()
+            && value == condition
+        {
+            self.asm.bcond(if invert { cond.invert() } else { cond }, label);
+            return;
+        }
+        self.last_cmp = None;
+        let bytes = self.ty(condition).bytes();
+        let reg = if bytes >= 4 { self.bits(condition, A) } else { self.src(condition, A, Ext::Zero) };
+        let size = if bytes >= 8 { Size::X } else { Size::W };
+        self.asm.cbz(!invert, size, reg, label);
+    }
+
+    fn emit_slow_prologue_and_edge(&mut self, slow_entry: Block) -> Result<(), String> {
+        self.prologue();
+        if let Some(entry) = self.func.entry
+            && let Some(term) = self.func.blocks[entry.index()].insts.last()
+            && let Op::Brif(_, then_b, then_args, else_b, else_args) = &self.func.insts[term.index()].op
+        {
+            let args = if *then_b == slow_entry { then_args.as_slice() } else if *else_b == slow_entry { else_args.as_slice() } else { &[] };
+            self.edge(slow_entry, args)?;
+        }
+        Ok(())
+    }
+
+    fn target_label(&self, block: Block) -> Label {
+        if self.in_shrink_entry && self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
+            self.slow_thunk
+        } else {
+            self.blocks[self.func.jump_target(block).index()]
+        }
+    }
+
+    fn goto_branch(&mut self, block: Block, last: bool) {
+        if self.in_shrink_entry && self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
+            self.asm.b(self.slow_thunk);
+        } else {
+            self.goto(block, last);
+        }
+    }
+
     fn brif(&mut self, condition: Value, then: (Block, &[Value]), otherwise: (Block, &[Value])) -> Result<(), String> {
+        let (then, otherwise) = if self.in_shrink_entry {
+            let slow = self.shrink.map(|s| s.slow_entry);
+            (
+                (then.0, if Some(then.0) == slow { &[][..] } else { then.1 }),
+                (otherwise.0, if Some(otherwise.0) == slow { &[][..] } else { otherwise.1 }),
+            )
+        } else {
+            (then, otherwise)
+        };
         if let Some(known) = self.plan.const_of(condition) {
             let (block, args) = if crate::fold::extend(known, self.ty(condition), false) != 0 { then } else { otherwise };
             self.edge(block, args)?;
-            self.goto(block, true);
+            self.goto_branch(block, true);
             return Ok(());
         }
-        let cond = self.truth(condition);
         let (then_moves, else_moves) = (
             self.plan.moves(self.func, &self.frame, then.0, then.1),
             self.plan.moves(self.func, &self.frame, otherwise.0, otherwise.1),
         );
         let falls = self.next.is_some_and(|next| next == then.0 || next == self.func.jump_target(then.0));
         if !else_moves && (then_moves || falls) {
-            self.asm.bcond(cond.invert(), self.blocks[self.func.jump_target(otherwise.0).index()]);
+            let target = self.target_label(otherwise.0);
+            self.branch_cond(condition, true, target);
             self.edge(then.0, then.1)?;
-            self.goto(then.0, true);
+            self.goto_branch(then.0, true);
             return Ok(());
         }
         if !then_moves {
-            self.asm.bcond(cond, self.blocks[self.func.jump_target(then.0).index()]);
+            let target = self.target_label(then.0);
+            self.branch_cond(condition, false, target);
             self.edge(otherwise.0, otherwise.1)?;
-            self.goto(otherwise.0, true);
+            self.goto_branch(otherwise.0, true);
             return Ok(());
         }
         let other = self.asm.label();
-        self.asm.bcond(cond.invert(), other);
+        self.branch_cond(condition, true, other);
         self.edge(then.0, then.1)?;
-        self.goto(then.0, false);
+        self.goto_branch(then.0, false);
         self.asm.bind(other);
         self.edge(otherwise.0, otherwise.1)?;
-        self.goto(otherwise.0, true);
+        self.goto_branch(otherwise.0, true);
         Ok(())
     }
 
@@ -358,7 +545,11 @@ impl Emit<'_> {
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {
         let returns = self.abi.returns.clone();
         self.move_locs(values, &returns);
-        self.epilogue();
+        if self.in_fast_ret {
+            self.asm.ret();
+        } else {
+            self.epilogue();
+        }
         Ok(())
     }
 
@@ -369,11 +560,13 @@ impl Emit<'_> {
                 ArgStep::Move(src, dst) => self.asm.vmov(Vreg(dst), Vreg(src)),
                 ArgStep::Save(src) => {
                     self.asm.add_imm(true, false, Size::X, SP, SP, 16);
+                    self.sp_bias += 16;
                     self.asm.vstore(16, Mem::new(SP, 0), Vreg(src));
                 }
                 ArgStep::Restore(dst) => {
                     self.asm.vload(16, Vreg(dst), Mem::new(SP, 0));
                     self.asm.add_imm(false, false, Size::X, SP, SP, 16);
+                    self.sp_bias -= 16;
                 }
                 ArgStep::Load(val, dst) => self.fget(Vreg(dst), val),
             }
@@ -410,11 +603,13 @@ impl Emit<'_> {
                 ArgStep::Move(src, dst) => self.asm.vmov(Vreg(dst), Vreg(src)),
                 ArgStep::Save(src) => {
                     self.asm.add_imm(true, false, Size::X, SP, SP, 16);
+                    self.sp_bias += 16;
                     self.asm.vstore(16, Mem::new(SP, 0), Vreg(src));
                 }
                 ArgStep::Restore(dst) => {
                     self.asm.vload(16, Vreg(dst), Mem::new(SP, 0));
                     self.asm.add_imm(false, false, Size::X, SP, SP, 16);
+                    self.sp_bias -= 16;
                 }
                 ArgStep::Load(..) => {}
             }

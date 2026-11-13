@@ -1,3 +1,4 @@
+use crate::dom::dominates;
 use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
@@ -6,6 +7,27 @@ const MAX_FACTS: usize = 16;
 
 /// The most constants one fact records a value as differing from.
 const MAX_NOT: usize = 32;
+
+/// The most symbolic relations a path keeps; past it the oldest goes.
+const MAX_RELS: usize = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelKind {
+    Eq,
+    Ne,
+    Ult,
+    Ule,
+    Slt,
+    Sle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Rel {
+    kind: RelKind,
+    lhs: Value,
+    rhs: Value,
+    ty: Type,
+}
 
 /// What is known about an integer value: its unsigned range at its type's width, and constants it differs from.
 #[derive(Clone, PartialEq, Debug)]
@@ -162,19 +184,131 @@ pub(crate) struct Ranges<'a> {
 
 impl<'a> Ranges<'a> {
     /// The ranges of `func`'s values over the blocks of `order`, with the constants `consts` an earlier fold found.
-    pub(crate) fn new(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), order: &[Block]) -> Self {
+    pub(crate) fn new(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>])) -> Self {
         let table = func.types.iter().map(|ty| (0, top(*ty))).collect();
         let mut ranges = Self { defs, table };
-        for inst in order.iter().flat_map(|block| &func.blocks[block.index()].insts) {
-            let data = &func.insts[inst.index()];
-            let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
-            let fact = match consts.get(result.index()).copied().flatten() {
-                Some(imm) => Fact::constant(func.ty(result), imm),
-                None => ranges.derive(func, &data.op, func.ty(result)),
-            };
-            ranges.table[result.index()] = (fact.lo, fact.hi);
+        let mut incoming: Vec<Vec<(Block, &[Value])>> = vec![Vec::new(); func.blocks.len()];
+        let mut complete = vec![true; func.blocks.len()];
+        for pred_idx in 0..func.blocks.len() {
+            let pred = Block(pred_idx as u32);
+            match func.last(pred) {
+                Some(Op::Jump(target, args)) => incoming[target.index()].push((pred, args.as_slice())),
+                Some(Op::Brif(_, then, then_args, otherwise, else_args)) => {
+                    incoming[then.index()].push((pred, then_args.as_slice()));
+                    incoming[otherwise.index()].push((pred, else_args.as_slice()));
+                }
+                _ => {
+                    for target in func.successors(pred) {
+                        complete[target.index()] = false;
+                    }
+                }
+            }
+        }
+        for &block in order {
+            ranges.refine_params(func, consts, (&incoming, &complete, single, idom), block);
+            for inst in &func.blocks[block.index()].insts {
+                let data = &func.insts[inst.index()];
+                let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
+                let fact = match consts.get(result.index()).copied().flatten() {
+                    Some(imm) => Fact::constant(func.ty(result), imm),
+                    None => ranges.derive(func, &data.op, func.ty(result)),
+                };
+                ranges.table[result.index()] = (fact.lo, fact.hi);
+            }
         }
         ranges
+    }
+
+    fn refine_params(&mut self, func: &Function, consts: &[Option<i64>], (incoming, complete, single, idom): (&[Vec<(Block, &[Value])>], &[bool], &[Option<Block>], &[Option<Block>]), block: Block) {
+        if !complete[block.index()] || incoming[block.index()].is_empty() {
+            return;
+        }
+        for (k, &p) in func.blocks[block.index()].params.iter().enumerate() {
+            let ty = func.ty(p);
+            if !ty.is_small_int() {
+                continue;
+            }
+            let (mut min_lo, mut has_outside, mut valid) = (u64::MAX, false, true);
+            for &(pred, args) in &incoming[block.index()] {
+                let Some(&arg) = args.get(k) else {
+                    valid = false;
+                    break;
+                };
+                if let Some(step) = self.add_step(func, consts, arg, p, ty) {
+                    if !self.edge_proves_no_wrap(func, single, idom, (block, pred), (p, ty, step)) {
+                        valid = false;
+                        break;
+                    }
+                } else {
+                    has_outside = true;
+                    min_lo = min_lo.min(self.of(arg).lo);
+                }
+            }
+            if valid && has_outside && min_lo > 0 && min_lo <= top(ty) {
+                self.table[p.index()].0 = min_lo;
+            }
+        }
+    }
+
+    fn add_step(&self, func: &Function, consts: &[Option<i64>], arg: Value, p: Value, ty: Type) -> Option<u64> {
+        let &Op::Binary(Binary::Iadd, x, y) = self.op(func, arg)? else {
+            return None;
+        };
+        let other = if x == p { y } else if y == p { x } else { return None };
+        let k = consts.get(other.index()).copied().flatten().map(|imm| unsigned(imm, ty)).or_else(|| match self.op(func, other) {
+            Some(&Op::Const(imm)) => Some(unsigned(imm, ty)),
+            _ => self.constant(other),
+        })?;
+        (k > 0).then_some(k)
+    }
+
+    fn edge_proves_no_wrap(&self, func: &Function, single: &[Option<Block>], idom: &[Option<Block>], (block, pred): (Block, Block), (p, ty, step): (Value, Type, u64)) -> bool {
+        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(pred)
+            && then != otherwise
+            && (then == block || otherwise == block)
+            && self.proves_no_wrap(func, cond, then == block, p, ty, step, 0)
+        {
+            return true;
+        }
+        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(block)
+            && then != otherwise
+        {
+            let via_then = single[then.index()] == Some(block) && dominates(idom, then, pred) && self.proves_no_wrap(func, cond, true, p, ty, step, 0);
+            let via_else = single[otherwise.index()] == Some(block) && dominates(idom, otherwise, pred) && self.proves_no_wrap(func, cond, false, p, ty, step, 0);
+            return via_then || via_else;
+        }
+        false
+    }
+
+    fn proves_no_wrap(&self, func: &Function, cond: Value, taken: bool, p: Value, ty: Type, step: u64, depth: u8) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        let Some(max_p) = top(ty).checked_sub(step) else {
+            return false;
+        };
+        match self.op(func, cond) {
+            Some(&Op::Binary(Binary::Band, a, b)) if taken => {
+                self.proves_no_wrap(func, a, true, p, ty, step, depth + 1) || self.proves_no_wrap(func, b, true, p, ty, step, depth + 1)
+            }
+            Some(&Op::Binary(Binary::Bor, a, b)) if !taken => {
+                self.proves_no_wrap(func, a, false, p, ty, step, depth + 1) || self.proves_no_wrap(func, b, false, p, ty, step, depth + 1)
+            }
+            Some(&Op::Icmp(cc, x, y)) => {
+                let eff = if taken { cc } else { cc.inverse() };
+                let (kind, lhs, rhs) = rel_of(eff, x, y);
+                if lhs != p {
+                    return false;
+                }
+                let rhs_hi = self.of(rhs).hi;
+                match kind {
+                    RelKind::Ult => rhs_hi > 0 && rhs_hi - 1 <= max_p,
+                    RelKind::Ule => rhs_hi <= max_p,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     fn op<'f>(&self, func: &'f Function, value: Value) -> Option<&'f Op> {
@@ -249,6 +383,22 @@ impl<'a> Ranges<'a> {
 #[derive(Clone, Default)]
 pub(crate) struct Path {
     facts: Vec<(Value, Fact)>,
+    rels: Vec<Rel>,
+}
+
+fn rel_of(cc: IntCC, x: Value, y: Value) -> (RelKind, Value, Value) {
+    match cc {
+        IntCC::Equal => (RelKind::Eq, x, y),
+        IntCC::NotEqual => (RelKind::Ne, x, y),
+        IntCC::UnsignedLessThan => (RelKind::Ult, x, y),
+        IntCC::UnsignedGreaterThan => (RelKind::Ult, y, x),
+        IntCC::UnsignedLessThanOrEqual => (RelKind::Ule, x, y),
+        IntCC::UnsignedGreaterThanOrEqual => (RelKind::Ule, y, x),
+        IntCC::SignedLessThan => (RelKind::Slt, x, y),
+        IntCC::SignedGreaterThan => (RelKind::Slt, y, x),
+        IntCC::SignedLessThanOrEqual => (RelKind::Sle, x, y),
+        IntCC::SignedGreaterThanOrEqual => (RelKind::Sle, y, x),
+    }
 }
 
 impl Path {
@@ -275,8 +425,15 @@ impl Path {
         self.facts.push((value, merged));
     }
 
-    /// Records that the branch on `condition` went the `taken` way: the condition is nonzero or zero, and the integer compare that defines it held or failed.
+    /// Records that the branch on `condition` went the `taken` way: the condition is nonzero or zero, and the integer compare or boolean op that defines it held or failed.
     pub(crate) fn assume(&mut self, func: &Function, ranges: &Ranges, condition: Value, taken: bool) {
+        self.assume_depth(func, ranges, condition, taken, 0);
+    }
+
+    fn assume_depth(&mut self, func: &Function, ranges: &Ranges, condition: Value, taken: bool, depth: u8) {
+        if depth > 4 {
+            return;
+        }
         let ty = func.ty(condition);
         if !ty.is_small_int() {
             return;
@@ -284,22 +441,170 @@ impl Path {
         if let Some(truth) = compared(IntCC::NotEqual, ty, 0, taken) {
             self.add(ranges, condition, truth);
         }
-        let Some(&Op::Icmp(cc, x, y)) = ranges.op(func, condition) else { return };
-        let operand_ty = func.ty(x);
-        if !operand_ty.is_small_int() {
-            return;
+        match ranges.op(func, condition) {
+            Some(&Op::Binary(Binary::Band, a, b)) if taken => {
+                self.assume_depth(func, ranges, a, true, depth + 1);
+                self.assume_depth(func, ranges, b, true, depth + 1);
+            }
+            Some(&Op::Binary(Binary::Bor, a, b)) if !taken => {
+                self.assume_depth(func, ranges, a, false, depth + 1);
+                self.assume_depth(func, ranges, b, false, depth + 1);
+            }
+            Some(&Op::Icmp(cc, x, y)) => {
+                let operand_ty = func.ty(x);
+                if !operand_ty.is_small_int() {
+                    return;
+                }
+                let (left, right) = (self.fact(ranges, x), self.fact(ranges, y));
+                let order = match cc.is_signed() {
+                    true if left.non_negative(operand_ty) && right.non_negative(operand_ty) => as_unsigned(cc),
+                    _ => cc,
+                };
+                if !order.is_signed() {
+                    if let Some(fact) = right.exact().and_then(|k| compared(order, operand_ty, k, taken)) {
+                        self.add(ranges, x, fact);
+                    }
+                    if let Some(fact) = left.exact().and_then(|k| compared(swapped(order), operand_ty, k, taken)) {
+                        self.add(ranges, y, fact);
+                    }
+                }
+                if x != y {
+                    let eff = if taken { order } else { order.inverse() };
+                    let (kind, lhs, rhs) = rel_of(eff, x, y);
+                    let rel = Rel { kind, lhs, rhs, ty: operand_ty };
+                    if !self.rels.contains(&rel) {
+                        if self.rels.len() >= MAX_RELS {
+                            self.rels.remove(0);
+                        }
+                        self.rels.push(rel);
+                    }
+                }
+            }
+            _ => {}
         }
-        let (left, right) = (self.fact(ranges, x), self.fact(ranges, y));
-        let order = match cc.is_signed() {
-            true if left.non_negative(operand_ty) && right.non_negative(operand_ty) => as_unsigned(cc),
-            true => return,
-            false => cc,
-        };
-        if let Some(fact) = right.exact().and_then(|k| compared(order, operand_ty, k, taken)) {
-            self.add(ranges, x, fact);
+    }
+
+    fn reaches(&self, ty: Type, start: Value, target: Value, (strict_k, weak_k): (RelKind, RelKind), require_strict: bool) -> bool {
+        if start == target {
+            return !require_strict;
         }
-        if let Some(fact) = left.exact().and_then(|k| compared(swapped(order), operand_ty, k, taken)) {
-            self.add(ranges, y, fact);
+        let mut seen: Vec<(Value, bool)> = vec![(start, false)];
+        let mut idx = 0;
+        while idx < seen.len() {
+            let (cur, cur_strict) = seen[idx];
+            idx += 1;
+            for &r in &self.rels {
+                if r.ty != ty {
+                    continue;
+                }
+                let (next, step_strict) = if r.kind == RelKind::Eq && r.lhs == cur {
+                    (r.rhs, false)
+                } else if r.kind == RelKind::Eq && r.rhs == cur {
+                    (r.lhs, false)
+                } else if r.lhs == cur && r.kind == strict_k {
+                    (r.rhs, true)
+                } else if r.lhs == cur && r.kind == weak_k {
+                    (r.rhs, false)
+                } else {
+                    continue;
+                };
+                let next_strict = cur_strict || step_strict;
+                if next == target && (!require_strict || next_strict) {
+                    return true;
+                }
+                if let Some(entry) = seen.iter_mut().find(|(v, _)| *v == next) {
+                    if next_strict && !entry.1 {
+                        entry.1 = true;
+                        seen.push((next, true));
+                    }
+                } else {
+                    seen.push((next, next_strict));
+                }
+            }
+        }
+        false
+    }
+
+    fn proves(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> bool {
+        if x == y {
+            return holds(cc, ty, 0, 0);
+        }
+        let (kind, a, b) = rel_of(cc, x, y);
+        match kind {
+            RelKind::Eq => self.reaches(ty, a, b, (RelKind::Eq, RelKind::Eq), false),
+            RelKind::Ult => {
+                if self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), true) {
+                    return true;
+                }
+                if let Some(&Op::Binary(Binary::Iadd, p, q)) = ranges.op(func, b) {
+                    for (base, c) in [(p, q), (q, p)] {
+                        if let Some(k) = ranges.constant(c)
+                            && k >= 1
+                            && ranges.of(base).hi.checked_add(k).is_some_and(|hi| hi <= top(ty))
+                            && self.reaches(ty, a, base, (RelKind::Ult, RelKind::Ule), false)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                if let Some(&Op::Binary(Binary::Isub, base, c)) = ranges.op(func, a) {
+                    if let Some(k) = ranges.constant(c)
+                        && self.fact(ranges, base).lo >= k
+                        && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), k == 0)
+                    {
+                        return true;
+                    }
+                    if self.reaches(ty, c, base, (RelKind::Ult, RelKind::Ule), false)
+                        && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), self.fact(ranges, c).lo == 0)
+                    {
+                        return true;
+                    }
+                    if let Some(&Op::Binary(Binary::Isub, outer, k_val)) = ranges.op(func, base)
+                        && ranges.constant(k_val) == Some(1)
+                        && self.reaches(ty, c, outer, (RelKind::Ult, RelKind::Ule), true)
+                        && self.reaches(ty, outer, b, (RelKind::Ult, RelKind::Ule), false)
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+            RelKind::Ule => {
+                self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), false)
+                    || (matches!(ranges.op(func, a), Some(&Op::Binary(Binary::Isub, base, c)) if ranges.constant(c).is_some_and(|k| self.fact(ranges, base).lo >= k) && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), false)))
+            }
+            RelKind::Slt => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true),
+            RelKind::Sle => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), false),
+            RelKind::Ne => {
+                self.strictly_ordered(ty, a, b)
+                    || [(a, b), (b, a)].into_iter().any(|(sub, zero)| {
+                        self.fact(ranges, zero).exact() == Some(0)
+                            && matches!(ranges.op(func, sub), Some(&Op::Binary(Binary::Isub, lhs, rhs)) if self.strictly_ordered(ty, lhs, rhs))
+                    })
+                    || self.rels.iter().any(|r| {
+                        r.kind == RelKind::Ne
+                            && r.ty == ty
+                            && ((self.reaches(ty, a, r.lhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.rhs, (RelKind::Eq, RelKind::Eq), false))
+                                || (self.reaches(ty, a, r.rhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.lhs, (RelKind::Eq, RelKind::Eq), false)))
+                    })
+            }
+        }
+    }
+
+    fn strictly_ordered(&self, ty: Type, a: Value, b: Value) -> bool {
+        self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), true)
+            || self.reaches(ty, b, a, (RelKind::Ult, RelKind::Ule), true)
+            || self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true)
+            || self.reaches(ty, b, a, (RelKind::Slt, RelKind::Sle), true)
+    }
+
+    fn decide_rel(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> Option<bool> {
+        if self.proves(func, ranges, cc, ty, x, y) {
+            Some(true)
+        } else if self.proves(func, ranges, cc.inverse(), ty, x, y) {
+            Some(false)
+        } else {
+            None
         }
     }
 
@@ -334,10 +639,10 @@ pub(crate) fn single_preds(func: &Function) -> Vec<Option<Block>> {
 /// Settles the compares, traps and branches that the facts on entry to each block and its earlier instructions decide: a settled compare's result becomes a constant in `consts`, a trap that cannot fire goes, and a settled branch becomes a jump. A block's facts on entry are its only predecessor's facts on exit plus that edge's branch. Returns whether anything changed.
 pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [Option<i64>]) -> bool {
     let Some(entry) = func.entry else { return false };
-    let (single, order) = (single_preds(func), crate::dom::reverse_postorder(func, entry));
+    let (single, (order, _, idom)) = (single_preds(func), crate::dom::dominators(func, entry));
     let (mut decided, mut compares) = (Vec::new(), Vec::new());
     {
-        let ranges = Ranges::new(func, (defs, consts), &order);
+        let ranges = Ranges::new(func, (defs, consts), (&order, &single, &idom));
         let mut exits: Vec<Option<Path>> = vec![None; func.blocks.len()];
         for &block in &order {
             let mut path = match single[block.index()].and_then(|pred| exits[pred.index()].as_ref().map(|exit| (pred, exit.clone()))) {
@@ -345,6 +650,7 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
                     path.follow(func, &ranges, pred, block);
                     path
                 }
+                None if block != entry => idom[block.index()].and_then(|d| exits[d.index()].clone()).unwrap_or_default(),
                 None => Path::default(),
             };
             for &inst in &func.blocks[block.index()].insts {
@@ -365,7 +671,7 @@ fn settle_one(func: &Function, (ranges, path): (&Ranges, &mut Path), inst: Inst,
     let data = &func.insts[inst.index()];
     match (&data.op, data.result) {
         (&Op::Icmp(cc, x, y), Some(result)) if ranges.constant(result).is_none() && func.ty(x).is_small_int() => {
-            if let Some(known) = decide(cc, func.ty(x), &path.fact(ranges, x), &path.fact(ranges, y)) {
+            if let Some(known) = decide(cc, func.ty(x), &path.fact(ranges, x), &path.fact(ranges, y)).or_else(|| path.decide_rel(func, ranges, cc, func.ty(x), x, y)) {
                 compares.push((result, known));
             }
         }

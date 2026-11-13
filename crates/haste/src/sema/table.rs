@@ -8,7 +8,7 @@ use rustc_hash::FxHashMap;
 
 use crate::sync::{lock, read_lock, shard_index, write_lock};
 
-const SHARDS: usize = 32;
+pub(crate) const SHARDS: usize = 32;
 
 /// A sharded concurrent hash map shared across worker contexts by `Arc`.
 pub struct Table<K, V> {
@@ -83,6 +83,14 @@ impl<K, V> Table<K, V> {
         for shard in self.shards.iter() {
             write_lock(shard).clear();
         }
+    }
+
+    /// Empties one shard of the table and returns the number of removed entries.
+    pub fn clear_shard(&self, shard: usize) -> usize {
+        let mut map = write_lock(&self.shards[shard % SHARDS]);
+        let count = map.len();
+        map.clear();
+        count
     }
 
     /// Keeps only the entries for which `keep` holds.
@@ -180,6 +188,18 @@ impl<K, V> Drop for WaitGuard<'_, K, V> {
 impl<K, V> Flight<K, V> {
     pub(super) fn retain(&self, mut keep: impl FnMut(&K) -> bool) {
         self.inner.slots.retain(|key, _| keep(key));
+    }
+
+    pub(super) fn get_ready(&self, key: &K) -> Option<V>
+    where
+        K: Eq + Hash,
+        V: Clone,
+    {
+        let slot = self.inner.slots.get(key)?;
+        match &*lock(&slot.state) {
+            SlotState::Ready(value) => Some(value.clone()),
+            _ => None,
+        }
     }
 
     pub(super) fn for_each_ready(&self, mut f: impl FnMut(&K, &V)) {

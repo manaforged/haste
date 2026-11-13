@@ -10,13 +10,12 @@ use crate::body::{ExprId, PatId};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
-use crate::sema::infer::{ClosureBody, Coercion, Fields, Glue, LazyTables, Res, Shape, SiteKey, Typed, cloned_tuple, field_types, needs_drop};
+use crate::sema::infer::{ClosureBody, Coercion, Fields, Glue, LazyTables, Res, Shape, Typed, cloned_tuple, field_types, needs_drop};
 use crate::sema::layout::field_offset;
 use crate::sema::reach::Reached;
 use crate::sema::summary::{ConstHole, PolyInst};
 use crate::sema::ty::{Kind, Mut, Ty};
 
-use super::reloc::eval_expr_ty;
 use super::stencil::{FootprintId, item_bits};
 use super::{Inline, Slots, passed_parts, signature, signature_of};
 
@@ -82,7 +81,7 @@ pub(super) fn eval_footprint_with_cycle(cx: &mut Context<'_>, (reached, slots): 
     }
     let mut mix = HashMix::new(item_bits(item));
     let mut cycle_root = usize::MAX;
-    hash_instance_header(cx, &mut mix, slots.low_entries(), item, typed)?;
+    hash_instance_header(cx, &mut mix, (slots.low_entries(), slots.allow_inline()), item, typed)?;
     match &typed.shape {
         Shape::Glue(glue) => hash_glue_shape(cx, (reached, slots), inline, &mut mix, index, substs, glue, &mut cycle_root)?,
         Shape::Untuple(target) => hash_untuple_shape(cx, (reached, slots), inline, &mut mix, index, typed, *target, &mut cycle_root)?,
@@ -135,8 +134,9 @@ fn try_unique_footprint(cx: &Context<'_>, item: ItemRef, substs: crate::sema::su
     None
 }
 
-fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, low: bool, item: ItemRef, typed: &Typed) -> Result<()> {
+fn hash_instance_header(cx: &mut Context<'_>, mix: &mut HashMix, (low, allow_inline): (bool, bool), item: ItemRef, typed: &Typed) -> Result<()> {
     mix.bool(low);
+    mix.bool(allow_inline);
     mix.bool(cx.outline.crates[item.krate as usize].env.overflow_checks());
     let shape_tag = match &typed.shape {
         Shape::Body => 0,
@@ -534,7 +534,7 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
         Coercion::Upcast(slot) => {
             mix.byte(3);
             mix.u32(*slot);
-            let expr_ty = eval_expr_ty(cx, typed, id);
+            let expr_ty = typed.expr_ty(&cx.types, id);
             if expr_ty == Ty::NONE {
                 mix.byte(0xff);
             } else if let Kind::Ref(_, inner) | Kind::Ptr(_, inner) = *cx.types.kind(expr_ty)
@@ -547,6 +547,8 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
             mix.byte(4);
             let ty = sub(cx, vt.ty);
             hash_ty_facts(cx, mix, ty)?;
+            let obj = sub(cx, vt.object);
+            hash_ty_facts(cx, mix, obj)?;
         }
         Coercion::Reify(_) => mix.byte(5),
         Coercion::Deref(steps, to) => {
@@ -562,20 +564,6 @@ fn hash_one_coercion(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, id:
         }
     }
     Ok(())
-}
-
-fn site_res_any(cx: &Context<'_>, typed: &Typed, key: SiteKey) -> Option<Res> {
-    match &typed.tables {
-        LazyTables::Poly(p) => p.site_res(&cx.types, key),
-        LazyTables::Eager(t) => t.site_res(key),
-    }
-}
-
-fn pat_ty_any(cx: &Context<'_>, typed: &Typed, pat: PatId) -> Option<Ty> {
-    match &typed.tables {
-        LazyTables::Poly(p) => p.pat_ty(&cx.types, pat),
-        LazyTables::Eager(t) => t.pats.get(&pat).copied(),
-    }
 }
 
 fn get_or_build_plan(cx: &mut Context<'_>, slots: &dyn Slots, source_item: ItemRef, closure_root: Option<ExprId>) -> Result<Arc<BodyFootprintPlan>> {

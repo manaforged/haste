@@ -268,6 +268,81 @@ impl Typed {
         }
     }
 
+    /// The inferred type of expression `expr`, or `Ty::NONE` if absent.
+    pub fn expr_ty(&self, types: &Types, expr: ExprId) -> Ty {
+        match &self.tables {
+            LazyTables::Eager(tables) => tables.exprs[expr.0 as usize],
+            LazyTables::Poly(poly) => poly.expr_ty(types, expr),
+        }
+    }
+
+    /// The inferred type of pattern `pat`, if present.
+    pub fn pat_ty(&self, types: &Types, pat: PatId) -> Option<Ty> {
+        match &self.tables {
+            LazyTables::Eager(tables) => tables.pats.get(&pat).copied(),
+            LazyTables::Poly(poly) => poly.pat_ty(types, pat),
+        }
+    }
+
+    /// The resolution at call or path site `key`, if any.
+    pub fn site_res(&self, types: &Types, key: SiteKey) -> Option<Res> {
+        match &self.tables {
+            LazyTables::Eager(tables) => tables.site_res(key),
+            LazyTables::Poly(poly) => poly.site_res(types, key),
+        }
+    }
+
+    /// The function item and type arguments at call site `key`, if resolved to a function.
+    pub fn site_fn(&self, key: SiteKey) -> Option<(ItemRef, Substs)> {
+        match &self.tables {
+            LazyTables::Eager(tables) => match tables.site_res(key)? {
+                Res::Fn(item, substs) => Some((item, substs)),
+                _ => None,
+            },
+            LazyTables::Poly(poly) => poly.site_fn(key),
+        }
+    }
+
+    /// The number of autoderef steps recorded for expression `expr`.
+    pub fn autoderefs_at(&self, expr: ExprId) -> u32 {
+        match &self.tables {
+            LazyTables::Eager(tables) => tables.autoderefs.get(&expr).copied().unwrap_or(0),
+            LazyTables::Poly(poly) => poly.autoderefs_at(expr),
+        }
+    }
+
+    /// The iterator type of `for` expression `expr`, if present.
+    pub fn for_iter(&self, types: &Types, expr: ExprId) -> Option<Ty> {
+        match &self.tables {
+            LazyTables::Eager(tables) => tables.fors.get(&expr).map(|f| f.iter),
+            LazyTables::Poly(poly) => poly.summary.template.fors.get(&expr).map(|f| poly.sub_ty(types, f.iter)),
+        }
+    }
+
+    /// The future type of `.await` expression `expr`, if present.
+    pub fn await_future(&self, types: &Types, expr: ExprId) -> Option<Ty> {
+        match &self.tables {
+            LazyTables::Eager(tables) => tables.awaits.get(&expr).map(|a| a.future),
+            LazyTables::Poly(poly) => poly.summary.template.awaits.get(&expr).map(|a| poly.sub_ty(types, a.future)),
+        }
+    }
+
+    /// Whether expression `expr` is an `.await` site.
+    pub fn has_await_at(&self, expr: ExprId) -> bool {
+        match &self.tables {
+            LazyTables::Eager(tables) => tables.awaits.contains_key(&expr),
+            LazyTables::Poly(poly) => poly.summary.template.awaits.contains_key(&expr),
+        }
+    }
+
+    /// Whether expression `expr` is an overloaded operator or `Fn*` call.
+    pub fn is_overloaded_call(&self, expr: ExprId) -> bool {
+        match &self.tables {
+            LazyTables::Eager(tables) => tables.overloaded.contains(&expr),
+            LazyTables::Poly(poly) => poly.is_overloaded_call(expr),
+        }
+    }
+
     /// Every function the body calls, with its interned type arguments.
     pub fn calls(&self) -> Box<dyn Iterator<Item = (ItemRef, Substs)> + '_> {
         let drops = self.drops.iter().filter_map(res_fn);

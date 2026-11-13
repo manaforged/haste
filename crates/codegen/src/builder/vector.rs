@@ -1,7 +1,17 @@
 use super::Ins;
-use crate::ir::{ByteCC, Op, Type, Value, VectorOp};
+use crate::ir::{ByteCC, Convert, Op, Type, Value, VectorOp};
 
 impl Ins<'_> {
+    /// Zero-extending 64-bit float-register value `x` (`F64`) to a 128-bit vector (`V128`).
+    pub fn widen_vec64(self, x: Value) -> Value {
+        self.convert(Convert::WidenVec64, Type::V128, x)
+    }
+
+    /// Low 64 bits of a 128-bit vector `x` (`V128`) as `F64`.
+    pub fn narrow_vec64(self, x: Value) -> Value {
+        self.convert(Convert::NarrowVec64, Type::F64, x)
+    }
+
     /// The sixteen byte comparisons `cc` of vectors `x` and `y`.
     pub fn byte_cmp(mut self, cc: ByteCC, x: Value, y: Value) -> Value {
         self.value(Op::ByteCmp(cc, x, y), Type::V128)

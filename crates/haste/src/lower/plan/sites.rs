@@ -2,14 +2,14 @@ use anyhow::Result;
 
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
-use crate::sema::infer::{LazyTables, Res, SiteKey, Typed};
+use crate::sema::infer::{Res, SiteKey, Typed};
 use crate::sema::layout::field_offset;
 use crate::sema::reach::Reached;
 use crate::sema::ty::{Kind, Mut, Ty};
 
-use super::super::reloc::{eval_autoderef_ty, eval_deref_step, eval_expr_ty, eval_table_site};
+use super::super::reloc::{eval_autoderef_ty, eval_deref_step};
 use super::ty::{HashMix, hash_num_tag, hash_repr, hash_tuple_offsets, hash_ty_facts};
-use super::{BodyFootprintPlan, FieldSite, PatSite, PatSiteKind, pat_ty_any, site_res_any};
+use super::{BodyFootprintPlan, FieldSite, PatSite, PatSiteKind};
 
 pub(super) fn hash_plan_sites(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, plan: &BodyFootprintPlan, typed: &Typed) -> Result<()> {
     for site in &plan.field_sites {
@@ -18,25 +18,29 @@ pub(super) fn hash_plan_sites(cx: &mut Context<'_>, reached: &Reached, mix: &mut
     for ps in &plan.pat_sites {
         hash_pat_site(cx, mix, typed, ps)?;
     }
-    for &(_, val_expr) in &plan.repeat_sites {
-        let val_ty = eval_expr_ty(cx, typed, val_expr);
-        let is_uninit = val_ty != Ty::NONE
-            && eval_table_site(typed, SiteKey::ExprRes(val_expr)).is_some_and(|(i, _)| {
-                let ret_adt = match *cx.types.kind(val_ty) {
-                    Kind::Adt(adt, _) => cx.lang(adt) == Some("maybe_uninit"),
-                    _ => false,
-                };
-                (cx.name(i) == "uninit" && ret_adt) || cx.lang(i) == Some("maybe_uninit_uninit")
-            });
-        mix.bool(is_uninit);
+    for &(call_expr, callee) in &plan.repeat_sites {
+        hash_uninit_site(cx, mix, typed, call_expr, super::super::array::is_maybe_uninit_fn(cx, typed, call_expr, callee))?;
     }
     for &clos_expr in &plan.closure_exprs {
-        let clos_ty = eval_expr_ty(cx, typed, clos_expr);
+        let clos_ty = typed.expr_ty(&cx.types, clos_expr);
         if clos_ty != Ty::NONE
             && let Some(env_ty) = cx.closure_env(clos_ty)
         {
             hash_ty_facts(cx, mix, env_ty)?;
             hash_tuple_offsets(cx, mix, env_ty)?;
+        }
+    }
+    Ok(())
+}
+
+fn hash_uninit_site(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, expr: crate::body::ExprId, is_uninit: bool) -> Result<()> {
+    mix.bool(is_uninit);
+    if is_uninit {
+        let ty = typed.expr_ty(&cx.types, expr);
+        if ty == Ty::NONE {
+            mix.byte(0xff);
+        } else if !cx.is_unsized(ty)? {
+            hash_repr(cx, mix, ty)?;
         }
     }
     Ok(())
@@ -53,7 +57,7 @@ fn hash_access_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, 
         let l = cx.layout(owner)?;
         mix.i32(field_offset(&l, 0, idx));
     }
-    let out_ty = eval_expr_ty(cx, typed, expr);
+    let out_ty = typed.expr_ty(&cx.types, expr);
     if out_ty == Ty::NONE {
         mix.byte(0xff);
     } else if !cx.is_unsized(out_ty)? {
@@ -74,12 +78,12 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
             }
         },
         FieldSite::StructInit { expr, values } => {
-            let ty = eval_expr_ty(cx, typed, *expr);
+            let ty = typed.expr_ty(&cx.types, *expr);
             if ty == Ty::NONE {
                 mix.byte(0xff);
                 return Ok(());
             }
-            let variant = match site_res_any(cx, typed, SiteKey::ExprRes(*expr)) {
+            let variant = match typed.site_res(&cx.types, SiteKey::ExprRes(*expr)) {
                 Some(Res::Ctor(_, v, _)) => v,
                 _ => 0,
             };
@@ -93,7 +97,7 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
             }
         }
         FieldSite::RangeInit { expr } => {
-            let ty = eval_expr_ty(cx, typed, *expr);
+            let ty = typed.expr_ty(&cx.types, *expr);
             if ty == Ty::NONE {
                 mix.byte(0xff);
                 return Ok(());
@@ -110,10 +114,10 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
             }
         }
         FieldSite::CallSite { expr, callee, args } => {
-            if let Some(Res::Ctor(_, variant, _)) = site_res_any(cx, typed, SiteKey::ExprRes(*callee)) {
+            if let Some(Res::Ctor(_, variant, _)) = typed.site_res(&cx.types, SiteKey::ExprRes(*callee)) {
                 mix.byte(1);
                 mix.u32(variant);
-                let ty = eval_expr_ty(cx, typed, *expr);
+                let ty = typed.expr_ty(&cx.types, *expr);
                 if ty == Ty::NONE {
                     mix.byte(0xff);
                 } else {
@@ -124,12 +128,8 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
                 }
             } else {
                 mix.byte(0);
-                let overloaded = match &typed.tables {
-                    LazyTables::Poly(p) => p.is_overloaded_call(*expr),
-                    LazyTables::Eager(t) => t.overloaded.contains(expr),
-                };
-                if overloaded {
-                    let arg_tys: Vec<Ty> = args.iter().map(|&a| eval_expr_ty(cx, typed, a)).collect();
+                if typed.is_overloaded_call(*expr) {
+                    let arg_tys: Vec<Ty> = args.iter().map(|&a| typed.expr_ty(&cx.types, a)).collect();
                     if arg_tys.iter().any(|&t| t == Ty::NONE) {
                         mix.byte(0xff);
                     } else {
@@ -141,9 +141,10 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
             for arg in args {
                 mix.bool(typed.syntax().const_args.contains(arg));
             }
+            hash_uninit_site(cx, mix, typed, *expr, args.is_empty() && super::super::array::is_maybe_uninit_fn(cx, typed, *expr, *callee))?;
         }
         FieldSite::MethodSite { expr, receiver, args } => {
-            let mut ty = eval_expr_ty(cx, typed, *receiver);
+            let mut ty = typed.expr_ty(&cx.types, *receiver);
             if let Some(adj) = typed.syntax().adjusts.get(expr) {
                 mix.byte(1);
                 mix.u32(adj.derefs);
@@ -182,25 +183,25 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
             }
         }
         FieldSite::IndexSite { expr, base } => {
-            mix.bool(eval_table_site(typed, SiteKey::Operator(*expr)).is_some());
+            mix.bool(typed.site_fn(SiteKey::Operator(*expr)).is_some());
             let base_ty = eval_autoderef_ty(cx, reached, typed, *expr, *base)?;
             if base_ty == Ty::NONE {
                 mix.byte(0xff);
             } else {
                 hash_ty_facts(cx, mix, base_ty)?;
             }
-            let raw_base = eval_expr_ty(cx, typed, *base);
+            let raw_base = typed.expr_ty(&cx.types, *base);
             if raw_base != Ty::NONE && !cx.is_unsized(raw_base)? {
                 mix.u64(cx.layout(raw_base)?.align.bytes());
             }
-            let elem_ty = eval_expr_ty(cx, typed, *expr);
+            let elem_ty = typed.expr_ty(&cx.types, *expr);
             if elem_ty != Ty::NONE && !cx.is_unsized(elem_ty)? {
                 mix.u64(cx.layout(elem_ty)?.size.bytes());
                 hash_repr(cx, mix, elem_ty)?;
             }
         }
         FieldSite::RefSite { inner, shared } => {
-            let inner_ty = eval_expr_ty(cx, typed, *inner);
+            let inner_ty = typed.expr_ty(&cx.types, *inner);
             if inner_ty == Ty::NONE {
                 mix.byte(0xff);
             } else if !cx.is_unsized(inner_ty)? {
@@ -208,7 +209,7 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
                 mix.u64(cx.layout(inner_ty)?.align.bytes());
             }
             if *shared {
-                let mono_const = eval_table_site(typed, SiteKey::ExprRes(*inner)).is_some_and(|(i, s)| s.is_empty() && matches!(cx.item(i).1.kind, ItemKind::Const));
+                let mono_const = typed.site_fn(SiteKey::ExprRes(*inner)).is_some_and(|(i, s)| s.is_empty() && matches!(cx.item(i).1.kind, ItemKind::Const));
                 mix.bool(mono_const);
                 mix.bool(typed.syntax().ref_binds.values().any(|&b| b == Mut::Mut));
             }
@@ -218,7 +219,7 @@ fn hash_field_site(cx: &mut Context<'_>, reached: &Reached, mix: &mut HashMix, t
 }
 
 fn hash_pat_site(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, ps: &PatSite) -> Result<()> {
-    let Some(mut ty) = pat_ty_any(cx, typed, ps.pat) else { return Ok(()) };
+    let Some(mut ty) = typed.pat_ty(&cx.types, ps.pat) else { return Ok(()) };
     if ty == Ty::NONE {
         mix.byte(0xff);
         return Ok(());
@@ -244,7 +245,7 @@ fn hash_pat_site(cx: &mut Context<'_>, mix: &mut HashMix, typed: &Typed, ps: &Pa
         Some(Mut::Mut) => 2,
     });
     mix.bool(typed.syntax().or_binds.contains(&ps.pat));
-    let res = site_res_any(cx, typed, SiteKey::PatRes(ps.pat));
+    let res = typed.site_res(&cx.types, SiteKey::PatRes(ps.pat));
     if matches!(res, Some(Res::Const(_))) {
         let mut cur = ty;
         for _ in 0..3 {

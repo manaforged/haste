@@ -1,5 +1,6 @@
 //! Haste's code generator: an SSA function builder, a machine encoder per target, and executable memory.
 
+mod algebra;
 mod alloc;
 mod builder;
 mod color;
@@ -14,6 +15,7 @@ mod fold;
 mod facts;
 mod fill;
 mod frame;
+mod ifconv;
 mod licm;
 mod live;
 mod loads;
@@ -27,6 +29,8 @@ mod split;
 mod switch;
 mod tailrec;
 mod target;
+mod thread;
+mod unroll;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
 macro_rules! value_op {
@@ -53,7 +57,7 @@ mod x64;
 
 pub use builder::{FunctionBuilder, Ins, Mark};
 pub use ir::{AbiParam, ArgumentPurpose, AtomicRmwOp, Block, ByteCC, CallConv, FloatCC, Function, Inst, IntCC, SigRef, Signature, StackSlot, Type, Value, VectorOp};
-pub use coroutine::{Coroutine, FIRST_SUSPEND, RETURNED, UNRESUMED};
+pub use coroutine::Coroutine;
 pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
 pub use reloc::{DictTierUp, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
@@ -77,6 +81,11 @@ pub struct Code {
 }
 
 impl Code {
+    /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, and relocations.
+    pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>) -> Self {
+        Self { bytes, sites, relocs }
+    }
+
     /// The machine code.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -99,22 +108,24 @@ impl Code {
     }
 }
 
-/// Encodes a call-table entry stub that loads `dict_addr` into the dictionary register and jumps to `body_exec`.
-pub fn dict_entry_stub(arch: Arch, stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, Error> {
-    let bytes = match arch {
-        Arch::X64 => x64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
-        Arch::Arm64 => arm64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
-        other => Err(format!("no encoder for {other:?} yet")),
-    };
-    bytes.map_err(|message| Error::new(ErrorKind::Unsupported, message))
-}
+impl Target {
+    /// Encodes a call-table entry stub that loads `dict_addr` into the dictionary register and jumps to `body_exec`.
+    pub fn dict_entry_stub(&self, stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, Error> {
+        let bytes = match self.arch {
+            Arch::X64 => x64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
+            Arch::Arm64 => arm64::dict_stub(stub_exec, body_exec, dict_addr, tier_up),
+            other => Err(format!("no encoder for {other:?} yet")),
+        };
+        bytes.map_err(|message| Error::new(ErrorKind::Unsupported, message))
+    }
 
-/// Returns the `(dict_offset, body_offset, kind)` relocation offsets inside an unlinked `dict_entry_stub(arch, 0, 1 << 40, 0, None)`.
-pub fn dict_stub_relocs(arch: Arch) -> Result<[(u32, RelocKind); 2], Error> {
-    match arch {
-        Arch::X64 => Ok([(2, RelocKind::Abs64), (12, RelocKind::Abs64)]),
-        Arch::Arm64 => Ok([(0, RelocKind::Arm64Movw64), (16, RelocKind::Arm64Movw64)]),
-        other => Err(Error::new(ErrorKind::Unsupported, format!("no encoder for {other:?} yet"))),
+    /// Returns the `(dict_offset, body_offset, kind)` relocation offsets inside an unlinked `dict_entry_stub(0, 1 << 40, 0, None)`.
+    pub fn dict_stub_relocs(&self) -> Result<[(u32, RelocKind); 2], Error> {
+        match self.arch {
+            Arch::X64 => Ok([(2, RelocKind::Abs64), (12, RelocKind::Abs64)]),
+            Arch::Arm64 => Ok([(0, RelocKind::Arm64Movw64), (16, RelocKind::Arm64Movw64)]),
+            other => Err(Error::new(ErrorKind::Unsupported, format!("no encoder for {other:?} yet"))),
+        }
     }
 }
 
@@ -124,17 +135,54 @@ pub fn simplify(func: &mut Function, effort: Effort) {
     fold::compact(func);
 }
 
+fn promote_rounds(func: &mut Function, kind: promote::Moves, effort: Effort, rounds: usize) {
+    for _ in 0..rounds {
+        if !promote::step(func, kind) {
+            break;
+        }
+        fold::run(func, effort);
+        merge::run(func);
+    }
+}
+
 fn optimize(func: &mut Function, moves: promote::Moves, effort: Effort) {
     fill::run(func);
     fold::run(func, effort);
-    promote::run(func, if effort == Effort::Full { moves } else { promote::Moves::Words });
-    fold::run(func, effort);
     merge::run(func);
+    let kind = if effort == Effort::Full { moves } else { promote::Moves::Words };
+    promote_rounds(func, kind, effort, if effort == Effort::Full { 4 } else { 2 });
+    if effort == Effort::Full && unroll::run(func) {
+        fold::run(func, effort);
+        merge::run(func);
+    }
     cse::run(func);
     if effort == Effort::Full {
+        thread::run(func);
+        merge::run(func);
+        ifconv::run(func);
+        merge::run(func);
         loads::run(func);
-        switch::run(func);
+        thread::run(func);
+        fold::run(func, effort);
+        merge::run(func);
+        if unroll::run(func) {
+            fold::run(func, effort);
+            merge::run(func);
+        }
+        promote_rounds(func, kind, effort, 2);
+        cse::run(func);
         licm::run(func);
+        loads::run(func);
+        fold::run(func, effort);
+        merge::run(func);
+        if unroll::run(func) {
+            fold::run(func, effort);
+            merge::run(func);
+            loads::run(func);
+            promote_rounds(func, kind, effort, 2);
+        }
+        cse::run(func);
+        switch::run(func);
     }
     returns::run(func);
     if effort == Effort::Full && tailrec::run(func) {

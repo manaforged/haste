@@ -1,4 +1,4 @@
-use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, SigRef, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
 /// `imm` of type `ty` extended to 64 bits, by its sign when `signed`.
 pub(crate) fn extend(imm: i64, ty: Type, signed: bool) -> i64 {
@@ -135,7 +135,7 @@ pub(crate) fn fits(op: Binary, signed: bool, ty: Type, (x, y): (i64, i64)) -> Op
 }
 
 /// `op` on small integers when `known` gives the constants it reads.
-fn evaluate(func: &Function, op: &Op, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
+pub(crate) fn evaluate(func: &Function, op: &Op, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
     let (Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) | Op::Convert(_, x) | Op::Fits(_, _, x, _)) = *op else {
         return if let Op::Const(imm) = *op { Some(imm) } else { None };
     };
@@ -198,9 +198,25 @@ impl Fold {
         self.defs[self.find(value).index()].map(|inst| &func.insts[inst.index()].op)
     }
 
-    /// Whether `value` is 0 or 1 in its low byte because a comparison or overflow check defines it.
+    /// Whether `value` is 0 or 1 in its low byte because a comparison, overflow check, or boolean op defines it.
     fn boolean(&self, func: &Function, value: Value) -> bool {
-        matches!(self.def(func, value), Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..)))
+        self.boolean_at(func, value, 0)
+    }
+
+    fn boolean_at(&self, func: &Function, value: Value, depth: u8) -> bool {
+        if depth >= 8 {
+            return false;
+        }
+        let is_01 = |v: Value| matches!(self.known(v), Some(0 | 1)) || self.boolean_at(func, v, depth + 1);
+        match self.def(func, value) {
+            Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..)) => true,
+            Some(Op::Convert(Convert::Uextend, inner)) => self.boolean_at(func, *inner, depth + 1),
+            Some(Op::Binary(Binary::Band, a, b)) => {
+                matches!(self.known(*a), Some(0 | 1)) || matches!(self.known(*b), Some(0 | 1)) || (is_01(*a) && is_01(*b))
+            }
+            Some(Op::Binary(Binary::Bor | Binary::Bxor, a, b) | Op::Select(_, a, b)) => is_01(*a) && is_01(*b),
+            _ => false,
+        }
     }
 
     /// Whether `x` and `y` of type `ty` hold the same bits at that width.
@@ -211,22 +227,106 @@ impl Fold {
     /// The existing value the result of `op` always equals, when there is one.
     fn identity(&self, func: &Function, op: &Op) -> Option<Value> {
         match *op {
-            Op::Select(condition, x, y) => self.known(condition).map(|known| if known != 0 { x } else { y }),
-            Op::Binary(kind, x, y) if func.ty(x).is_small_int() => self.neutral(kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
+            Op::Select(condition, x, y) => {
+                if self.find(x) == self.find(y) {
+                    return Some(x);
+                }
+                if let Some(known) = self.known(condition) {
+                    return Some(if known != 0 { x } else { y });
+                }
+                if func.ty(condition) == func.ty(x)
+                    && self.boolean(func, condition)
+                    && self.known(x) == Some(1)
+                    && self.known(y) == Some(0)
+                {
+                    return Some(condition);
+                }
+                if func.ty(condition) == func.ty(x)
+                    && self.find(condition) == self.find(x)
+                    && self.known(y).is_some_and(|imm| extend(imm, func.ty(x), false) == 0)
+                {
+                    return Some(x);
+                }
+                if let Some(&Op::Icmp(cc, lhs, rhs)) = self.def(func, condition) {
+                    for (idx, (var, imm_val)) in [(lhs, rhs), (rhs, lhs)].into_iter().enumerate() {
+                        if let Some(c) = self.known(imm_val) {
+                            let ty = func.ty(var);
+                            let imm = extend(c, ty, false);
+                            let norm = match (cc, idx == 1) {
+                                (IntCC::Equal, _) => Some((IntCC::Equal, imm)),
+                                (IntCC::NotEqual, _) => Some((IntCC::NotEqual, imm)),
+                                (IntCC::UnsignedGreaterThan, false) | (IntCC::UnsignedLessThan, true) if imm == 0 => Some((IntCC::NotEqual, 0)),
+                                (IntCC::UnsignedGreaterThanOrEqual, false) | (IntCC::UnsignedLessThanOrEqual, true) if imm == 1 => Some((IntCC::NotEqual, 0)),
+                                (IntCC::UnsignedLessThan, false) | (IntCC::UnsignedGreaterThan, true) if imm == 1 => Some((IntCC::Equal, 0)),
+                                (IntCC::UnsignedLessThanOrEqual, false) | (IntCC::UnsignedGreaterThanOrEqual, true) if imm == 0 => Some((IntCC::Equal, 0)),
+                                _ => None,
+                            };
+                            if let Some((eq_cc, eq_c)) = norm {
+                                let is_c = |v: Value| self.known(v).is_some_and(|v_imm| extend(v_imm, ty, false) == eq_c);
+                                let is_var = |v: Value| self.find(v) == self.find(var);
+                                if (eq_cc == IntCC::Equal && is_c(x) && is_var(y)) || (eq_cc == IntCC::NotEqual && is_var(x) && is_c(y)) {
+                                    return Some(var);
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Op::Convert(kind @ (Convert::Bitcast | Convert::NarrowVec64), x) => match *self.def(func, x)? {
+                Op::Convert(inner, value)
+                    if (kind == Convert::Bitcast && inner == Convert::Bitcast && func.ty(value) != func.ty(x))
+                        || (kind == Convert::NarrowVec64 && inner == Convert::WidenVec64) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            },
+            Op::Binary(kind, x, y) if func.ty(x).is_small_int() => self.neutral(func, kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
             Op::Unary(kind @ (Unary::Ineg | Unary::Bnot), x) => match *self.def(func, x)? {
                 Op::Unary(inner, value) if inner == kind => Some(value),
                 _ => None,
             },
-            Op::Icmp(cc, x, y) if self.boolean(func, x) => {
-                let imm = extend(self.known(y)?, func.ty(x), false);
-                matches!((cc, imm), (IntCC::NotEqual, 0) | (IntCC::Equal, 1)).then_some(x)
+            Op::Icmp(cc, x, y) => [(x, y), (y, x)].into_iter().find_map(|(b, c)| {
+                let imm = extend(self.known(c)?, func.ty(b), false);
+                (func.ty(b) == Type::I8 && self.boolean(func, b) && matches!((cc, imm), (IntCC::NotEqual, 0) | (IntCC::Equal, 1))).then_some(b)
+            }),
+            _ => None,
+        }
+    }
+
+    fn known_active_bits(&self, func: &Function, val: Value, depth: u32) -> Option<u32> {
+        if depth == 0 {
+            return None;
+        }
+        if self.boolean(func, val) {
+            return Some(1);
+        }
+        match *self.def(func, val)? {
+            Op::Binary(Binary::Ushr, src, s) => {
+                let bits = func.ty(src).bits();
+                let count = (self.known(s)? as u32) & (bits - 1);
+                (count > 0).then_some(bits - count)
+            }
+            Op::Binary(Binary::Band, a, b) => match (self.known_active_bits(func, a, depth - 1), self.known(b)) {
+                (_, Some(mask)) => Some(64 - (extend(mask, func.ty(a), false) as u64).leading_zeros()),
+                (Some(ab), _) => Some(ab),
+                _ => self.known(a).map(|mask| 64 - (extend(mask, func.ty(a), false) as u64).leading_zeros()),
+            },
+            Op::Convert(Convert::Ireduce, src) => {
+                let dst_bits = func.ty(val).bits();
+                Some(self.known_active_bits(func, src, depth - 1).map_or(dst_bits, |b| b.min(dst_bits)))
+            }
+            Op::Convert(Convert::Uextend, src) => {
+                let src_bits = func.ty(src).bits();
+                Some(self.known_active_bits(func, src, depth - 1).map_or(src_bits, |b| b.min(src_bits)))
             }
             _ => None,
         }
     }
 
     /// `x` when `y` is the unit of `op` at type `ty` or a shift count that masks to zero, or `y` when `x` is the unit of a commuting `op`.
-    fn neutral(&self, op: Binary, ty: Type, x: Value, y: Value) -> Option<Value> {
+    fn neutral(&self, func: &Function, op: Binary, ty: Type, x: Value, y: Value) -> Option<Value> {
         let is = |value: Value, want: i64| self.known(value).is_some_and(|imm| extend(imm, ty, false) == extend(want, ty, false));
         if let Some(unit) = unit(op) {
             if is(y, unit) {
@@ -235,15 +335,37 @@ impl Fold {
             return (op != Binary::Isub && is(x, unit)).then_some(y);
         }
         let shift = matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr);
-        (shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0)).then_some(x)
+        if shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0) {
+            return Some(x);
+        }
+        if op == Binary::Band {
+            for (val, other) in [(x, y), (y, x)] {
+                if let (Some(active), Some(mask)) = (self.known_active_bits(func, val, 4), self.known(other))
+                    && active < 64
+                {
+                    let max_bits = if active == 0 { 0 } else { (1_u64 << active) - 1 };
+                    if (extend(mask, ty, false) as u64) & max_bits == max_bits {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+        None
     }
 
-    /// `a` when `x ^ y` is `(a ^ c) ^ c` in either order of either xor.
+    /// `a` when `x ^ y` is `(a ^ c) ^ c`, or `b` when `(a + b) - a` in either order of `Iadd`.
     fn cancel(&self, func: &Function, op: Binary, x: Value, y: Value) -> Option<Value> {
+        let ty = func.ty(x);
+        if op == Binary::Isub {
+            return match *self.def(func, x)? {
+                Op::Binary(Binary::Iadd, a, b) if self.same(ty, a, y) => Some(b),
+                Op::Binary(Binary::Iadd, a, b) if self.same(ty, b, y) => Some(a),
+                _ => None,
+            };
+        }
         if op != Binary::Bxor {
             return None;
         }
-        let ty = func.ty(x);
         [(x, y), (y, x)].into_iter().find_map(|(inner, other)| match *self.def(func, inner)? {
             Op::Binary(Binary::Bxor, a, b) if self.same(ty, b, other) => Some(a),
             Op::Binary(Binary::Bxor, a, b) if self.same(ty, a, other) => Some(b),
@@ -267,7 +389,7 @@ impl Fold {
         }
     }
 
-    /// Turns the branches `decide` settles into jumps and drops traps that cannot fire.
+    /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, and drops traps that cannot fire.
     fn branches(&self, func: &mut Function) -> bool {
         let mut changed = false;
         for block in 0..func.blocks.len() {
@@ -275,6 +397,26 @@ impl Fold {
             func.blocks[block].insts.retain(|inst| !matches!(func.insts[inst.index()].op, Op::Trapz(x) if self.known(x).is_some_and(|known| known != 0)));
             changed |= func.blocks[block].insts.len() != before;
             let Some(&last) = func.blocks[block].insts.last() else { continue };
+            let invert = match func.insts[last.index()].op {
+                Op::Brif(cond, ..) if self.known(cond).is_none() => match self.def(func, cond) {
+                    Some(&Op::Binary(Binary::Bxor, a, b)) => [(a, b), (b, a)].into_iter().find_map(|(inner, one)| {
+                        (func.ty(inner) == Type::I8
+                            && self.boolean(func, inner)
+                            && self.known(one).is_some_and(|imm| extend(imm, Type::I8, false) == 1))
+                        .then_some(inner)
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(inner) = invert
+                && let Op::Brif(cond, then, then_args, otherwise, else_args) = &mut func.insts[last.index()].op
+            {
+                *cond = inner;
+                std::mem::swap(then, otherwise);
+                std::mem::swap(then_args, else_args);
+                changed = true;
+            }
             changed |= self.decide(&func.types, &mut func.insts[last.index()].op);
         }
         changed
@@ -312,7 +454,7 @@ impl Fold {
 
     /// Sends each edge that passes a constant to a block holding only a branch on that parameter straight to the target the branch takes.
     fn thread(&self, func: &mut Function, pinned: &[bool]) -> bool {
-        let mut uses = use_counts(func);
+        let mut uses = func.use_counts();
         let mut changed = false;
         for block in 0..func.blocks.len() {
             let Some(&last) = func.blocks[block].insts.last() else { continue };
@@ -501,15 +643,6 @@ fn pure(op: &Op) -> bool {
     matches!(op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Sha256Rounds(..) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
 }
 
-/// How many times the instructions in blocks read each value.
-fn use_counts(func: &Function) -> Vec<u32> {
-    let mut uses = vec![0_u32; func.types.len()];
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        func.insts[inst.index()].op.for_operands(|value| uses[value.index()] += 1);
-    }
-    uses
-}
-
 /// The instruction in a block that defines each value.
 pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
     let mut defs = vec![None; func.types.len()];
@@ -522,7 +655,7 @@ pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
 }
 
 /// Empties the blocks no path from `entry` reaches and returns which blocks a path reaches.
-fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
+pub(crate) fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
     let reachable = func.reachable(entry);
     for (block, live) in func.blocks.iter_mut().zip(&reachable) {
         if !live && !block.insts.is_empty() {
@@ -534,7 +667,7 @@ fn prune(func: &mut Function, entry: Block) -> Vec<bool> {
 
 /// Drops pure instructions whose results nothing reads, in one backward pass that also frees the operands they read.
 fn dead(func: &mut Function) {
-    let mut uses = use_counts(func);
+    let mut uses = func.use_counts();
     let mut keep = Vec::new();
     for block in func.blocks.iter_mut().rev() {
         keep.clear();
@@ -551,6 +684,36 @@ fn dead(func: &mut Function) {
             at += 1;
             keep[at - 1]
         });
+    }
+}
+
+fn fold_bitcast_loads(func: &mut Function) {
+    let uses = func.use_counts();
+    let defs = defs(func);
+    let mut remap: Vec<Option<Value>> = vec![None; func.types.len()];
+    let mut dropped = vec![false; func.insts.len()];
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[inst.index()];
+        if let (Op::Convert(Convert::Bitcast, src), Some(res)) = (&data.op, data.result)
+            && uses[src.index()] == 1
+            && func.ty(*src).bytes() == func.ty(res).bytes()
+            && func.ty(*src) != func.ty(res)
+            && let Some(src_inst) = defs[src.index()]
+            && matches!(func.insts[src_inst.index()].op, Op::Load(..))
+        {
+            func.types[src.index()] = func.ty(res);
+            remap[res.index()] = Some(*src);
+            dropped[inst.index()] = true;
+        }
+    }
+    if remap.iter().all(Option::is_none) {
+        return;
+    }
+    for block in &mut func.blocks {
+        block.insts.retain(|inst| !dropped[inst.index()]);
+        for &inst in &block.insts {
+            func.insts[inst.index()].op.map_operands(|v| remap[v.index()].unwrap_or(v));
+        }
     }
 }
 
@@ -579,8 +742,11 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
         for inst in &block.insts {
             func.insts[inst.index()].op.map_operands(|value| fold.find(value));
             let replacement = match func.insts[inst.index()].op {
-                Op::Binary(Binary::Fmul, x, y) if is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
-                Op::Binary(Binary::Fmul, x, y) if is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
+                Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
+                Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
+                Op::Binary(Binary::Isub, x, y) if func.ty(x).is_small_int() && fold.known(x).is_some_and(|imm| extend(imm, func.ty(x), false) == 0) => Some(Op::Unary(Unary::Ineg, y)),
+                Op::Splat(x) if fold.known(x).is_some_and(|imm| (imm as u8) == 0) => Some(Op::Const(0)),
+                Op::Convert(Convert::WidenVec64, x) if is_zero_bits(func, &fold, x) => Some(Op::Const(0)),
                 _ => func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const),
             };
             if let Some(op) = replacement {
@@ -588,139 +754,27 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
             }
         }
     }
-    invert(func);
+    crate::algebra::rewrite(func, &fold.defs);
+    crate::algebra::invert(func);
+    fold_bitcast_loads(func);
     dead(func);
     if fold.thread(func, &pinned) | fold.branches(func) {
         prune(func, entry);
         dead(func);
     }
-}
-
-fn is_float_two(func: &Function, defs: &[Option<Inst>], value: Value) -> bool {
-    let Some(inst) = defs[value.index()] else { return false };
-    let Op::Const(imm) = func.insts[inst.index()].op else { return false };
-    match func.ty(value) {
-        Type::F64 => imm as u64 == 0x4000_0000_0000_0000,
-        Type::F32 => imm as u32 == 0x4000_0000,
-        _ => false,
+    if crate::algebra::devirt_vtables(func, &fold.defs) {
+        dead(func);
+    }
+    if crate::algebra::fold_bxor_conds(func) {
+        dead(func);
     }
 }
 
-/// The value `op` negates when the constants make it `v ^ 1`, `1 ^ v`, `v == 0` or `v != 1`.
-fn negated(op: &Op, consts: &[Option<i64>]) -> Option<Value> {
-    let is = |value: Value, want: i64| consts[value.index()] == Some(want);
-    match *op {
-        Op::Binary(Binary::Bxor, x, y) | Op::Icmp(IntCC::NotEqual, x, y) if is(y, 1) => Some(x),
-        Op::Binary(Binary::Bxor, y, x) if is(y, 1) => Some(x),
-        Op::Icmp(IntCC::Equal, x, y) if is(y, 0) => Some(x),
-        _ => None,
-    }
+fn is_zero_bits(func: &Function, fold: &Fold, val: Value) -> bool {
+    let val = fold.find(val);
+    fold.known(val) == Some(0)
+        || matches!(fold.def(func, val), Some(&Op::Const(0)))
+        || matches!(fold.def(func, val), Some(&Op::Convert(Convert::Bitcast, z)) if fold.known(z) == Some(0) || matches!(fold.def(func, fold.find(z)), Some(&Op::Const(0))))
 }
 
-/// Rewrites a negation of a compare, `x ^ 1`, `x == 0` or `x != 1`, as the inverse compare, so a negated condition branches on the flags, and a branch on `x == 0` or `x != 0` as a branch on `x`.
-fn invert(func: &mut Function) {
-    let count = func.types.len();
-    let (mut compares, mut consts) = (vec![None; count], vec![None; count]);
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        let data = &func.insts[inst.index()];
-        match (&data.op, data.result) {
-            (&Op::Icmp(cc, x, y), Some(result)) => compares[result.index()] = Some((cc, x, y)),
-            (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
-            _ => {}
-        }
-    }
-    let types = &func.types;
-    for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        let op = &mut func.insts[inst.index()].op;
-        if let Some((cc, a, b)) = negated(op, &consts).and_then(|value| compares[value.index()]) {
-            *op = Op::Icmp(cc.inverse(), a, b);
-            continue;
-        }
-        let Op::Brif(condition, then, then_args, otherwise, else_args) = op else { continue };
-        let Some((cc, x, y)) = compares[condition.index()] else { continue };
-        if consts[y.index()] != Some(0) || !types[x.index()].is_small_int() {
-            continue;
-        }
-        match cc {
-            IntCC::NotEqual => *condition = x,
-            IntCC::Equal => {
-                *condition = x;
-                std::mem::swap(then, otherwise);
-                std::mem::swap(then_args, else_args);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Renumbers the instructions and values the blocks hold and drops the rest, so a body kept or copied whole carries no dead entries.
-pub(crate) fn compact(func: &mut Function) {
-    if func.coroutine.is_some() {
-        return;
-    }
-    let mut map: Vec<Option<Value>> = vec![None; func.types.len()];
-    let mut types = Vec::new();
-    let mut take = |value: Value| -> Value {
-        *map[value.index()].get_or_insert_with(|| {
-            types.push(func.types[value.index()]);
-            Value(types.len() as u32 - 1)
-        })
-    };
-    let live = func.blocks.iter().map(|block| block.insts.len()).sum();
-    let mut insts = Vec::with_capacity(live);
-    let mut blocks = std::mem::take(&mut func.blocks);
-    for block in &mut blocks {
-        block.params.iter_mut().for_each(|param| *param = take(*param));
-        for inst in &mut block.insts {
-            let slot = &mut func.insts[inst.index()];
-            let mut data = crate::ir::InstData { op: std::mem::replace(&mut slot.op, Op::Trap), result: slot.result };
-            data.result = data.result.map(&mut take);
-            if let Op::Call { results, .. } = &mut data.op {
-                results.iter_mut().for_each(|result| *result = take(*result));
-            }
-            data.op.map_operands(&mut take);
-            insts.push(data);
-            *inst = crate::ir::Inst(insts.len() as u32 - 1);
-        }
-    }
-    func.blocks = blocks;
-    func.insts = insts;
-    types.shrink_to_fit();
-    func.types = types;
-    compact_blocks(func);
-    compact_sigs(func);
-}
-
-/// Drops the empty blocks, which nothing reaches, renumbers the rest, and trims every list to its length.
-fn compact_blocks(func: &mut Function) {
-    let mut map: Vec<Option<Block>> = vec![None; func.blocks.len()];
-    let mut blocks = Vec::new();
-    for (index, mut block) in std::mem::take(&mut func.blocks).into_iter().enumerate() {
-        if block.insts.is_empty() && func.entry != Some(Block(index as u32)) {
-            continue;
-        }
-        block.params.shrink_to_fit();
-        block.insts.shrink_to_fit();
-        map[index] = Some(Block(blocks.len() as u32));
-        blocks.push(block);
-    }
-    let renumber = |block: Block| map[block.index()].expect("a branch reaches only blocks that hold instructions");
-    func.insts.iter_mut().for_each(|data| data.op.map_targets(renumber));
-    func.entry = func.entry.map(renumber);
-    func.blocks = blocks;
-}
-
-/// Drops the signatures no call uses and renumbers the rest.
-fn compact_sigs(func: &mut Function) {
-    let mut map: Vec<Option<SigRef>> = vec![None; func.sigs.len()];
-    let mut sigs = Vec::new();
-    for data in &mut func.insts {
-        if let Op::Call { sig, .. } | Op::TryCall { sig, .. } = &mut data.op {
-            *sig = *map[sig.index()].get_or_insert_with(|| {
-                sigs.push(func.sigs[sig.index()].clone());
-                SigRef(sigs.len() as u32 - 1)
-            });
-        }
-    }
-    func.sigs = sigs;
-}
+pub(crate) use crate::thread::compact;

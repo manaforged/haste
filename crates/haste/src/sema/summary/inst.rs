@@ -20,6 +20,7 @@ pub struct PolyInst {
     pub builtin_ops: Box<[ExprId]>,
     pub call_overrides: Box<[CallOverride]>,
     pub offset_overrides: Box<[(ExprId, u64)]>,
+    pub(crate) check_only: bool,
     pub(super) materialized: OnceLock<Arc<BodyTables>>,
 }
 
@@ -43,6 +44,11 @@ impl PolyInst {
     /// Iterates every concrete and resolved call edge without materializing `BodyTables`.
     pub fn calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
         self.summary.fixed_calls.iter().copied().chain(self.resolved_calls.iter().map(|&(_, i, s)| (i, s)))
+    }
+
+    /// Iterates only the instance-dependent call edges, excluding `summary.fixed_calls`.
+    pub fn dynamic_calls(&self) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+        self.resolved_calls.iter().map(|&(_, i, s)| (i, s))
     }
 
     /// Substitutes this instance's concrete arguments and normalized projections into `ty`.

@@ -1,12 +1,35 @@
 use anyhow::{Result, bail};
 use haste_codegen::{IntCC, Type, Value};
 
-use crate::body::{BlockKind, Expr, ExprId, List};
-use crate::sema::infer::Res;
+use crate::body::{BlockKind, Body, Expr, ExprId, List};
+use crate::sema::Context;
+use crate::sema::infer::{Res, SiteKey, Typed};
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::{Base, Place};
 use super::{Lower, repr};
+
+/// Whether `expr` (or `callee`) resolves to `MaybeUninit::uninit()`.
+pub(super) fn is_maybe_uninit_fn(cx: &Context<'_>, typed: &Typed, expr: ExprId, callee: ExprId) -> bool {
+    let Some((item, _)) = typed.site_fn(SiteKey::ExprRes(expr)).or_else(|| typed.site_fn(SiteKey::ExprRes(callee))) else {
+        return false;
+    };
+    if cx.lang(item) == Some("maybe_uninit_uninit") {
+        return true;
+    }
+    let val_ty = typed.expr_ty(&cx.types, expr);
+    val_ty != Ty::NONE && cx.name(item) == "uninit" && matches!(*cx.types.kind(val_ty), Kind::Adt(adt, _) if cx.lang(adt) == Some("maybe_uninit"))
+}
+
+/// Extracts `(call_expr, callee)` when `expr` is a zero-argument call or `const { call() }`.
+pub(super) fn uninit_call_site(body: &Body, expr: ExprId) -> Option<(ExprId, ExprId)> {
+    let expr = match *body.expr(expr) {
+        Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Const, .. } if body.list(stmts).is_empty() => tail,
+        _ => expr,
+    };
+    let Expr::Call(callee, args) = *body.expr(expr) else { return None };
+    body.list(args).is_empty().then_some((expr, callee))
+}
 
 impl Lower<'_, '_> {
     /// Lowers `[items]` into a new frame slot and returns its address.
@@ -43,16 +66,9 @@ impl Lower<'_, '_> {
         Ok(self.read(Place::slot(slot, whole)))
     }
 
-    /// Whether `expr` is `MaybeUninit::uninit()`, whose bytes are undefined, so a repeat of it need not store them.
-    fn uninit_call(&self, expr: ExprId) -> bool {
-        let expr = match *self.body.expr(expr) {
-            Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Const, .. } if self.body.list(stmts).is_empty() => tail,
-            _ => expr,
-        };
-        let Expr::Call(callee, args) = *self.body.expr(expr) else { return false };
-        let Some(&Res::Fn(item, _)) = self.typed.res.get(&expr).or_else(|| self.typed.res.get(&callee)) else { return false };
-        let Kind::Adt(adt, _) = *self.cx.types.kind(self.ty_of(expr)) else { return false };
-        self.body.list(args).is_empty() && self.cx.name(item) == "uninit" && self.cx.lang(adt) == Some("maybe_uninit")
+    /// Whether `expr` is `MaybeUninit::uninit()`, whose bytes are undefined, so a repeat or binding of it need not store them.
+    pub(super) fn uninit_call(&self, expr: ExprId) -> bool {
+        uninit_call_site(self.body, expr).is_some_and(|(e, callee)| is_maybe_uninit_fn(self.cx, self.typed, e, callee))
     }
 
     /// The place that `base[index]` names after the autoderef steps of `base`: an element of an array or slice after a bounds check, or the target of `Index::index`.

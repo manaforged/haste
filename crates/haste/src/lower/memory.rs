@@ -232,9 +232,60 @@ impl Lower<'_, '_> {
         if size == 0 {
             return Ok(());
         }
-        let bytes = self.ins().imul_imm(count, size);
-        self.ins().copy(to, from, bytes);
+        if size != 1 || self.b.is_const(count) {
+            let bytes = if size == 1 { count } else { self.ins().imul_imm(count, size) };
+            self.ins().copy(to, from, bytes);
+            return Ok(());
+        }
+        self.copy_small_or_bulk(from, to, count);
         Ok(())
+    }
+
+    fn copy_two_ends(&mut self, ty: Type, width: i64, (from, to): (Value, Value), bytes: Value) {
+        let tail_off = self.ins().iadd_imm(bytes, -width);
+        let src_tail = self.ins().iadd(from, tail_off);
+        let dst_tail = self.ins().iadd(to, tail_off);
+        let head = self.ins().load(ty, from, 0);
+        let tail = self.ins().load(ty, src_tail, 0);
+        self.ins().store(head, to, 0);
+        self.ins().store(tail, dst_tail, 0);
+    }
+
+    fn copy_small_or_bulk(&mut self, from: Value, to: Value, bytes: Value) {
+        let (small, big, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let (ge8, lt8, ge4, lt4, nz) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let is_small = self.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, bytes, 16);
+        self.brif(is_small, (small, &[]), (big, &[]));
+        self.enter(big);
+        self.ins().copy(to, from, bytes);
+        self.jump(done, &[]);
+        self.enter(small);
+        let is_ge8 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, bytes, 8);
+        self.brif(is_ge8, (ge8, &[]), (lt8, &[]));
+        self.enter(ge8);
+        self.copy_two_ends(Type::I64, 8, (from, to), bytes);
+        self.jump(done, &[]);
+        self.enter(lt8);
+        let is_ge4 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, bytes, 4);
+        self.brif(is_ge4, (ge4, &[]), (lt4, &[]));
+        self.enter(ge4);
+        self.copy_two_ends(Type::I32, 4, (from, to), bytes);
+        self.jump(done, &[]);
+        self.enter(lt4);
+        let nonzero = self.ins().icmp_imm(IntCC::NotEqual, bytes, 0);
+        self.brif(nonzero, (nz, &[]), (done, &[]));
+        self.enter(nz);
+        let last_off = self.ins().iadd_imm(bytes, -1);
+        let one = self.ins().iconst(Type::I64, 1);
+        let mid_off = self.ins().ushr(bytes, one);
+        let (src_mid, src_last) = (self.ins().iadd(from, mid_off), self.ins().iadd(from, last_off));
+        let (dst_mid, dst_last) = (self.ins().iadd(to, mid_off), self.ins().iadd(to, last_off));
+        let (b0, b1, b2) = (self.ins().load(Type::I8, from, 0), self.ins().load(Type::I8, src_mid, 0), self.ins().load(Type::I8, src_last, 0));
+        self.ins().store(b0, to, 0);
+        self.ins().store(b1, dst_mid, 0);
+        self.ins().store(b2, dst_last, 0);
+        self.jump(done, &[]);
+        self.enter(done);
     }
 
     fn write_bytes(&mut self, ty: Ty, to: Value, byte: Value, count: Value) -> Result<()> {

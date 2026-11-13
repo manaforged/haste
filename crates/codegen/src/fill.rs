@@ -1,5 +1,5 @@
 use crate::fold::{constant, defs, extend};
-use crate::ir::{Convert, Function, Inst, Op, Value};
+use crate::ir::{Binary, Convert, Function, Inst, Op, StackSlot, Type, Value};
 use crate::reloc::RuntimeSymbol;
 
 /// The most bytes a `memset` of a constant size is stored inline with.
@@ -35,18 +35,76 @@ fn fill(func: &Function, defs: &[Option<Inst>], inst: Inst) -> Option<(Value, i6
     Some((to, known(func, defs, byte, DEPTH)? & 0xFF, size as u32))
 }
 
-/// Appends to `out` a store of `byte` repeated over each word of the `bytes` bytes at `to`.
-fn stores(func: &mut Function, (to, byte, bytes): (Value, i64, u32), out: &mut Vec<Inst>) {
-    for (ty, at) in crate::copy::words(bytes) {
-        let word = func.value(ty);
-        out.push(func.add(Op::Const(extend(byte.wrapping_mul(BYTES), ty, false)), Some(word)));
-        out.push(func.add(Op::Store(word, to, at as i32), None));
+fn stack_of(func: &Function, defs: &[Option<Inst>], value: Value, depth: u32) -> Option<(StackSlot, i32)> {
+    let next = depth.checked_sub(1)?;
+    match func.insts[defs[value.index()]?.index()].op {
+        Op::StackAddr(slot, offset) => Some((slot, offset)),
+        Op::Binary(Binary::Iadd, a, b) => [(a, b), (b, a)].into_iter().find_map(|(ptr, off)| {
+            let (slot, base) = stack_of(func, defs, ptr, next)?;
+            let c = i32::try_from(known(func, defs, off, DEPTH)?).ok()?;
+            Some((slot, base.checked_add(c)?))
+        }),
+        _ => None,
     }
 }
 
-/// Replaces each call of `memset` with a constant byte and a constant size of at most `FILL_INLINE` bytes by stores, so promotion sees the bytes it writes.
+fn emit_load(func: &mut Function, defs: &[Option<Inst>], src: Value, off: i32, ty: Type, out: &mut Vec<Inst>) -> Value {
+    let val = func.value(ty);
+    let op = match stack_of(func, defs, src, DEPTH).and_then(|(s, b)| b.checked_add(off).map(|t| (s, t))) {
+        Some((slot, total)) => Op::StackLoad(slot, total),
+        None => Op::Load(src, off),
+    };
+    out.push(func.add(op, Some(val)));
+    val
+}
+
+fn emit_store(func: &mut Function, defs: &[Option<Inst>], val: Value, dst: Value, off: i32, out: &mut Vec<Inst>) {
+    let op = match stack_of(func, defs, dst, DEPTH).and_then(|(s, b)| b.checked_add(off).map(|t| (s, t))) {
+        Some((slot, total)) => Op::StackStore(val, slot, total),
+        None => Op::Store(val, dst, off),
+    };
+    out.push(func.add(op, None));
+}
+
+/// Appends to `out` a store of `byte` repeated over each word of the `bytes` bytes at `to`.
+fn stores(func: &mut Function, defs: &[Option<Inst>], (to, byte, bytes): (Value, i64, u32), out: &mut Vec<Inst>) {
+    for (ty, at) in crate::copy::words(bytes) {
+        let word = func.value(ty);
+        out.push(func.add(Op::Const(extend(byte.wrapping_mul(BYTES), ty, false)), Some(word)));
+        emit_store(func, defs, word, to, at as i32, out);
+    }
+}
+
+fn expand_copy(func: &mut Function, defs: &[Option<Inst>], inst: Inst, out: &mut Vec<Inst>) -> bool {
+    let Op::Copy(dst, src, len) = func.insts[inst.index()].op else { return false };
+    let Some(bytes) = known(func, defs, len, DEPTH) else { return false };
+    match bytes {
+        0 => true,
+        1 | 2 | 4 | 8 => {
+            let ty = match bytes {
+                1 => Type::I8,
+                2 => Type::I16,
+                4 => Type::I32,
+                _ => Type::I64,
+            };
+            let val = emit_load(func, defs, src, 0, ty, out);
+            emit_store(func, defs, val, dst, 0, out);
+            true
+        }
+        16 => {
+            let lo = emit_load(func, defs, src, 0, Type::I64, out);
+            let hi = emit_load(func, defs, src, 8, Type::I64, out);
+            emit_store(func, defs, lo, dst, 0, out);
+            emit_store(func, defs, hi, dst, 8, out);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Replaces each `memset` of a constant byte and small constant size by stores, and scalarizes small constant-length `Copy` operations, so promotion sees the bytes they access.
 pub(crate) fn run(func: &mut Function) {
-    if !func.insts.iter().any(|data| matches!(data.op, Op::Runtime(RuntimeSymbol::Memset))) {
+    if !func.insts.iter().any(|data| matches!(data.op, Op::Runtime(RuntimeSymbol::Memset) | Op::Copy(..))) {
         return;
     }
     let defs = defs(func);
@@ -54,9 +112,10 @@ pub(crate) fn run(func: &mut Function) {
         let insts = std::mem::take(&mut func.blocks[block].insts);
         let mut out = Vec::with_capacity(insts.len());
         for inst in insts {
-            match fill(func, &defs, inst) {
-                Some(found) => stores(func, found, &mut out),
-                None => out.push(inst),
+            if let Some(found) = fill(func, &defs, inst) {
+                stores(func, &defs, found, &mut out);
+            } else if !expand_copy(func, &defs, inst, &mut out) {
+                out.push(inst);
             }
         }
         func.blocks[block].insts = out;

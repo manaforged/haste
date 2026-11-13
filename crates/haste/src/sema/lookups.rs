@@ -97,8 +97,10 @@ pub(super) struct Lookups {
     pub(super) assoc_types: Table<(ItemRef, ty::Ty, super::substs::Substs, ItemRef, super::substs::Substs), ty::Ty>,
     pub(super) summaries: table::Flight<ItemRef, summary::SummaryKind>,
     pub(super) has_new_sysroot_summaries: Arc<AtomicBool>,
+    pub(super) has_new_sysroot_instances: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
     pub(super) sysroot_index: Arc<std::sync::OnceLock<Arc<summary::codec::SysrootIndex>>>,
+    pub(super) skip_warm_sysroot_bodies: bool,
 }
 
 /// What answering the asks of a pass added: nothing new to infer with, the output of procedural macros that function bodies call, or loaded files, resolved names and expanded items.
@@ -114,7 +116,6 @@ impl Lookups {
         if !matches!(answer, Answer::Names) {
             return std::mem::take(self);
         }
-        let sysroot_crate = |krate: u32| outline.crates.get(krate as usize).is_some_and(|tree| tree.env.release && tree.env.fixed);
         let heads = self.heads.retained(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
         let selections = self.selections.retained(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
         let projections = self.projections.retained(|_, found| found.is_some());
@@ -130,14 +131,16 @@ impl Lookups {
             fields: std::mem::take(&mut self.fields),
             forms: self.forms.retained(|_, found| found.is_some()),
             futures: std::mem::take(&mut self.futures),
-            scope_traits: self.scope_traits.retained(|home, _| sysroot_crate(home.krate)),
+            scope_traits: self.scope_traits.retained(|home, _| outline.is_sysroot(home.krate)),
             impl_traits: std::mem::take(&mut self.impl_traits),
             selections,
             projections,
             summaries: std::mem::take(&mut self.summaries),
             has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
+            has_new_sysroot_instances: Arc::clone(&self.has_new_sysroot_instances),
             substrate: self.substrate.clone(),
             sysroot_index: Arc::clone(&self.sysroot_index),
+            skip_warm_sysroot_bodies: self.skip_warm_sysroot_bodies,
             ..Lookups::default()
         }
     }
@@ -152,7 +155,7 @@ impl Lookups {
                     .iter()
                     .zip(&loaded)
                     .enumerate()
-                    .any(|(k, (a, b))| a != b && outline.crates.get(k).is_some_and(|tree| tree.env.release && tree.env.fixed));
+                    .any(|(k, (a, b))| a != b && outline.is_sysroot(k as u32));
             if same_len {
                 self.modules.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
                 self.owners.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
@@ -182,6 +185,7 @@ impl Lookups {
             }
             self.trait_calls.clear();
             self.assoc_types.clear();
+            self.type_defs.clear();
             *guard = loaded;
         }
     }
@@ -194,9 +198,15 @@ impl Cache {
         self.lookups.sysroot_index = Arc::new(std::sync::OnceLock::new());
     }
 
-    /// Returns whether any new sysroot `PolySummary` was built in this session.
+    /// Controls whether warm `.substrate` sysroot lookups eagerly parse bodies for macro expansion.
+    pub fn set_warm_sysroot_bodies(&mut self, warm: bool) {
+        self.lookups.skip_warm_sysroot_bodies = !warm;
+    }
+
+    /// Returns whether any new sysroot `PolySummary` or concrete sysroot instance was built in this session.
     pub fn has_new_sysroot_summaries(&self) -> bool {
         self.lookups.has_new_sysroot_summaries.load(std::sync::atomic::Ordering::Relaxed)
+            || self.lookups.has_new_sysroot_instances.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the attached frozen sysroot substrate, if any.
@@ -204,15 +214,14 @@ impl Cache {
         self.lookups.substrate.as_ref()
     }
 
-    /// Encodes all settled sysroot `PolySummary` entries into `builder`.
+    /// Encodes all settled sysroot `PolySummary` and concrete sysroot instance entries into `builder`.
     pub fn export_sysroot_summaries(&self, outline: &Outline, builder: &mut crate::substrate::SubstrateBuilder) -> Result<()> {
         let mut err = None;
         self.lookups.summaries.for_each_ready(|&item, kind| {
             if err.is_some() {
                 return;
             }
-            let tree = &outline.crates[item.krate as usize];
-            if !tree.env.release || !tree.env.fixed {
+            if !outline.is_sysroot(item.krate) {
                 return;
             }
             if let summary::SummaryKind::Poly(summary) = kind
@@ -223,10 +232,10 @@ impl Cache {
                 err = Some(e);
             }
         });
-        match err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(e) = err {
+            return Err(e);
         }
+        summary::frozen::export_sysroot_instances(outline, &self.types, &self.finals, builder)
     }
 
     /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.
@@ -234,6 +243,7 @@ impl Cache {
         self.lookups = Lookups {
             substrate: self.lookups.substrate.clone(),
             sysroot_index: Arc::clone(&self.lookups.sysroot_index),
+            skip_warm_sysroot_bodies: self.lookups.skip_warm_sysroot_bodies,
             ..Lookups::default()
         };
     }

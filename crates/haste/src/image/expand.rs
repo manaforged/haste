@@ -32,6 +32,7 @@ pub fn run_macros(compilation: &mut Compilation, demand: &mut Jit, jobs: &[Job<'
         parts[part].push(at);
     }
     let mut shares = Shares { jobs, next: vec![0; parts.len()], parts, running: Vec::new(), results: jobs.iter().map(|_| None).collect() };
+    demand.set_fast(true);
     serve(compilation, ask, demand, &mut shares)?;
     Ok(shares.results)
 }

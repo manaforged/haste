@@ -185,6 +185,7 @@ impl Emit<'_> {
         match self.location(value) {
             Location::Float(from) if Xmm(from) == xmm => {}
             Location::Float(from) => self.asm.movaps(xmm, Xmm(from)),
+            Location::Imm(0) if self.ty(value) == Type::V128 => self.zero_xmm(xmm),
             Location::Slot => self.xmm_load(self.ty(value), xmm, self.at(value)),
             _ => {
                 self.raw(Reg::Rax, value);
@@ -238,6 +239,10 @@ impl Emit<'_> {
     /// Writes the eight (or sixteen) bytes of `value` to `to`, using rax or r11 as scratch; a float in a register writes the bytes of its type.
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
         match self.location(value) {
+            Location::Imm(0) if self.ty(value) == Type::V128 => {
+                self.asm.store_imm(to, 0);
+                self.asm.store_imm(to.offset(8), 0);
+            }
             Location::Imm(imm) => match i32::try_from(imm) {
                 Ok(small) => self.asm.store_imm(to, small),
                 Err(_) => {

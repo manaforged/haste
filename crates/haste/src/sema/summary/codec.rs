@@ -1,20 +1,22 @@
 //! Binary codec for workspace-invariant frozen sysroot `PolySummary` entries.
 
+use std::hash::{Hash as _, Hasher as _};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
 use crate::body::{BinOp, ExprId, PatId};
 use crate::names::{ItemRef, Primitive};
 use crate::outline::Outline;
 use crate::sema::infer::{Adjust, Awaited, BodyTables, By, Capture, Closure, Coercion, For, Local, Res, SiteKey, SyntaxTables, Tried, Vtable};
-use crate::sema::substs::{PackedMap, PackedSet, ProjDef, Substs};
+use crate::sema::substs::{PackedMap, PackedSet, ProjDef, ProjId, Substs};
 use crate::sema::ty::{Kind, Mut, Ty, Types};
 
-use super::{ConstHole, OpCheck, PolyObligation, PolySummary};
+use super::{CallOverride, ConstHole, OpCheck, PolyInst, PolyObligation, PolySummary};
 
 const CODEC_MAGIC: [u8; 4] = *b"HPS1";
+const INST_MAGIC: [u8; 4] = *b"HFI1";
 
 /// Reverse lookup table mapping canonical sysroot item keys back to workspace `ItemRef`s.
 #[derive(Debug, Default)]
@@ -84,6 +86,110 @@ pub fn decode_summary(index: &SysrootIndex, types: &Types, bytes: &[u8]) -> Resu
     }
     let dec = Decoder { types, items: &items, tys: &tys };
     Ok(Some(dec.read_summary(&mut cur)?))
+}
+
+/// Decoded concrete sysroot instance resolution data from a substrate.
+pub struct FrozenInst {
+    pub projs: Box<[(ProjId, Ty)]>,
+    pub resolved_calls: Box<[(SiteKey, ItemRef, Substs)]>,
+    pub builtin_ops: Box<[ExprId]>,
+    pub call_overrides: Box<[CallOverride]>,
+    pub offset_overrides: Box<[(ExprId, u64)]>,
+    pub drops: Vec<Res>,
+}
+
+/// Computes a workspace-invariant 64-bit hash of concrete sysroot `substs`, or `None` if non-sysroot or non-concrete.
+pub fn substs_key(outline: &Outline, types: &Types, substs: Substs, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Option<u64> {
+    let mut hasher = FxHasher::default();
+    hash_substs(outline, types, substs, &mut key_of, &mut hasher)?;
+    Some(hasher.finish())
+}
+
+fn hash_substs(outline: &Outline, types: &Types, substs: Substs, key_of: &mut impl FnMut(&Outline, ItemRef) -> Option<u64>, hasher: &mut FxHasher) -> Option<()> {
+    let slice = types.substs(substs);
+    slice.len().hash(hasher);
+    for &ty in slice {
+        hash_ty(outline, types, ty, key_of, hasher)?;
+    }
+    Some(())
+}
+
+fn hash_ty(outline: &Outline, types: &Types, ty: Ty, key_of: &mut impl FnMut(&Outline, ItemRef) -> Option<u64>, hasher: &mut FxHasher) -> Option<()> {
+    if ty == Ty::NONE {
+        0u8.hash(hasher);
+        return Some(());
+    }
+    match types.kind(ty).clone() {
+        Kind::Prim(p) => { 1u8.hash(hasher); (p as u8).hash(hasher); }
+        Kind::Never => { 2u8.hash(hasher); }
+        Kind::Tuple(s) => { 3u8.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
+        Kind::Ref(m, i) => { 4u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher)?; }
+        Kind::Ptr(m, i) => { 5u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher)?; }
+        Kind::Array(e, l) => { 6u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher)?; hash_ty(outline, types, l, key_of, hasher)?; }
+        Kind::Slice(e) => { 7u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher)?; }
+        Kind::Adt(i, s) => { 8u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
+        Kind::FnDef(i, s) => { 9u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
+        Kind::FnPtr(p, r) => { 10u8.hash(hasher); hash_substs(outline, types, p, key_of, hasher)?; hash_ty(outline, types, r, key_of, hasher)?; }
+        Kind::Closure(i, s, a) => { 11u8.hash(hasher); key_of(outline, i)?.hash(hasher); a.hash(hasher); hash_substs(outline, types, s, key_of, hasher)?; }
+        Kind::Dyn(o, s, m, a) => {
+            12u8.hash(hasher);
+            key_of(outline, o)?.hash(hasher);
+            hash_substs(outline, types, s, key_of, hasher)?;
+            m.len().hash(hasher);
+            for x in m { key_of(outline, x)?.hash(hasher); }
+            a.len().hash(hasher);
+            for x in a { key_of(outline, x)?.hash(hasher); }
+        }
+        Kind::Pat(b, lo, hi) => { 13u8.hash(hasher); lo.hash(hasher); hi.hash(hasher); hash_ty(outline, types, b, key_of, hasher)?; }
+        Kind::Value(v) => { 14u8.hash(hasher); v.hash(hasher); }
+        Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return None,
+    }
+    Some(())
+}
+
+/// Encodes a concrete sysroot `PolyInst` and its `drops`, or `None` if it references non-sysroot items.
+pub fn encode_instance(
+    outline: &Outline,
+    types: &Types,
+    substs: Substs,
+    inst: &PolyInst,
+    drops: &[Res],
+    mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>,
+) -> Result<Option<Vec<u8>>> {
+    let mut enc = Encoder { outline, types, key_of: &mut key_of, item_map: HashMap::default(), items: Vec::new(), ty_map: HashMap::default(), ty_count: 0, ty_buf: Vec::new() };
+    let mut body = Vec::new();
+    if enc.write_instance(&mut body, substs, inst, drops).is_none() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(16 + enc.items.len() * 8 + enc.ty_buf.len() + body.len());
+    out.extend_from_slice(&INST_MAGIC);
+    write_u32(&mut out, enc.items.len() as u32);
+    enc.items.iter().for_each(|&key| write_u64(&mut out, key));
+    write_u32(&mut out, enc.ty_count);
+    out.extend_from_slice(&enc.ty_buf);
+    out.extend_from_slice(&body);
+    Ok(Some(out))
+}
+
+/// Decodes a frozen concrete sysroot instance from `bytes`, returning `None` if `expected_substs` or any item mismatches.
+pub fn decode_instance(index: &SysrootIndex, types: &Types, expected_substs: Substs, bytes: &[u8]) -> Result<Option<FrozenInst>> {
+    let mut cur = Cursor { data: bytes, pos: 0 };
+    if cur.take(4)? != INST_MAGIC {
+        bail!("invalid frozen instance magic");
+    }
+    let item_count = cur.u32()? as usize;
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        let Some(item) = index.get(cur.u64()?) else { return Ok(None) };
+        items.push(item);
+    }
+    let ty_count = cur.u32()? as usize;
+    let mut tys = Vec::with_capacity(ty_count);
+    for _ in 0..ty_count {
+        tys.push(read_ty(&mut cur, types, &items, &tys)?);
+    }
+    let dec = Decoder { types, items: &items, tys: &tys };
+    dec.read_instance(&mut cur, expected_substs)
 }
 
 struct Encoder<'a, F> {
@@ -208,6 +314,8 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
         }
         write_u32(out, s.fixed_calls.len() as u32);
         for &(item, substs) in &s.fixed_calls { write_u32(out, self.item_id(item)?); self.write_substs(out, substs)?; }
+        write_u32(out, s.direct_calls.len() as u32);
+        for &(site, item, substs) in &s.direct_calls { write_site_key(out, site); write_u32(out, self.item_id(item)?); self.write_substs(out, substs)?; }
         write_u32(out, s.call_holes.len() as u32);
         for &(site, item, substs) in &s.call_holes { write_site_key(out, site); write_u32(out, self.item_id(item)?); self.write_substs(out, substs)?; }
         write_u32(out, s.op_holes.len() as u32);
@@ -218,6 +326,44 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
         for &t in &s.drop_tys { write_u32(out, self.ty_id(t)?); }
         write_u32(out, s.parametric_tys.len() as u32);
         for &t in &s.parametric_tys { write_u32(out, self.ty_id(t)?); }
+        Some(())
+    }
+
+    fn write_instance(&mut self, out: &mut Vec<u8>, substs: Substs, inst: &PolyInst, drops: &[Res]) -> Option<()> {
+        self.write_substs(out, substs)?;
+        write_u32(out, inst.projs.len() as u32);
+        for &(pid, ty) in &inst.projs {
+            let d = self.types.proj(pid);
+            write_u32(out, self.item_id(d.of)?);
+            write_u32(out, self.ty_id(d.self_ty)?);
+            self.write_substs(out, d.args)?;
+            write_u32(out, self.item_id(d.assoc)?);
+            self.write_substs(out, d.own)?;
+            write_u32(out, self.ty_id(ty)?);
+        }
+        write_u32(out, inst.resolved_calls.len() as u32);
+        for &(site, item, s) in &inst.resolved_calls {
+            write_site_key(out, site);
+            write_u32(out, self.item_id(item)?);
+            self.write_substs(out, s)?;
+        }
+        write_u32(out, inst.builtin_ops.len() as u32);
+        for e in &inst.builtin_ops { write_u32(out, e.0); }
+        write_u32(out, inst.call_overrides.len() as u32);
+        for ov in &inst.call_overrides {
+            write_u32(out, ov.expr.0);
+            write_opt(out, ov.res.as_ref(), |o, r| self.write_res(o, r))?;
+            write_opt(out, ov.autoderefs.as_ref(), |o, a| { write_u32(o, *a); Some(()) })?;
+            out.push(u8::from(ov.overloaded));
+            write_opt(out, ov.box_free.as_ref(), |o, r| self.write_res(o, r))?;
+        }
+        write_u32(out, inst.offset_overrides.len() as u32);
+        for &(e, v) in &inst.offset_overrides {
+            write_u32(out, e.0);
+            write_u64(out, v);
+        }
+        write_u32(out, drops.len() as u32);
+        for r in drops { self.write_res(out, r)?; }
         Some(())
     }
 
@@ -362,12 +508,58 @@ impl Decoder<'_> {
             _ => bail!("invalid const hole tag"),
         }).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let fixed_calls = (0..cur.u32()?).map(|_| Ok((self.item(cur.u32()?)?, self.substs(cur)?))).collect::<Result<Vec<_>>>()?.into_boxed_slice();
+        let direct_calls = (0..cur.u32()?).map(|_| Ok((read_site_key(cur)?, self.item(cur.u32()?)?, self.substs(cur)?))).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let call_holes = (0..cur.u32()?).map(|_| Ok((read_site_key(cur)?, self.item(cur.u32()?)?, self.substs(cur)?))).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let op_holes = (0..cur.u32()?).map(|_| Ok((ExprId(cur.u32()?), self.read_op_check(cur)?, self.res(cur)?))).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let fixed_drops = (0..cur.u32()?).map(|_| self.res(cur)).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let drop_tys = (0..cur.u32()?).map(|_| self.ty(cur.u32()?)).collect::<Result<Vec<_>>>()?.into_boxed_slice();
         let parametric_tys = (0..cur.u32()?).map(|_| self.ty(cur.u32()?)).collect::<Result<Vec<_>>>()?.into_boxed_slice();
-        Ok(PolySummary { param_count, template, locals, params, ret, obligations, projections, layout_tys, const_holes, fixed_calls, call_holes, op_holes, fixed_drops, drop_tys, parametric_tys })
+        Ok(PolySummary { param_count, template, locals, params, ret, obligations, projections, layout_tys, const_holes, fixed_calls, direct_calls, call_holes, op_holes, fixed_drops, drop_tys, parametric_tys })
+    }
+
+    fn read_instance(&self, cur: &mut Cursor<'_>, expected_substs: Substs) -> Result<Option<FrozenInst>> {
+        let substs = self.substs(cur)?;
+        if substs != expected_substs {
+            return Ok(None);
+        }
+        let mut projs = (0..cur.u32()?)
+            .map(|_| {
+                let pid = self.types.intern_proj(ProjDef {
+                    of: self.item(cur.u32()?)?,
+                    self_ty: self.ty(cur.u32()?)?,
+                    args: self.substs(cur)?,
+                    assoc: self.item(cur.u32()?)?,
+                    own: self.substs(cur)?,
+                });
+                let ty = self.ty(cur.u32()?)?;
+                Ok((pid, ty))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        projs.sort_unstable_by_key(|&(pid, _)| pid.0);
+        let projs = projs.into_boxed_slice();
+        let resolved_calls = (0..cur.u32()?)
+            .map(|_| Ok((read_site_key(cur)?, self.item(cur.u32()?)?, self.substs(cur)?)))
+            .collect::<Result<Vec<_>>>()?
+            .into_boxed_slice();
+        let builtin_ops = (0..cur.u32()?).map(|_| cur.u32().map(ExprId)).collect::<Result<Vec<_>>>()?.into_boxed_slice();
+        let call_overrides = (0..cur.u32()?)
+            .map(|_| {
+                Ok(CallOverride {
+                    expr: ExprId(cur.u32()?),
+                    res: read_opt(cur, |c| self.res(c))?,
+                    autoderefs: read_opt(cur, |c| c.u32())?,
+                    overloaded: cur.u8()? != 0,
+                    box_free: read_opt(cur, |c| self.res(c))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_boxed_slice();
+        let offset_overrides = (0..cur.u32()?)
+            .map(|_| Ok((ExprId(cur.u32()?), cur.u64()?)))
+            .collect::<Result<Vec<_>>>()?
+            .into_boxed_slice();
+        let drops = (0..cur.u32()?).map(|_| self.res(cur)).collect::<Result<Vec<_>>>()?;
+        Ok(Some(FrozenInst { projs, resolved_calls, builtin_ops, call_overrides, offset_overrides, drops }))
     }
 
     fn read_op_check(&self, cur: &mut Cursor<'_>) -> Result<OpCheck> {

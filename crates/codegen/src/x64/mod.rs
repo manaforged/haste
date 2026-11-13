@@ -12,7 +12,7 @@ use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
 use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
-use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset};
+use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
@@ -45,8 +45,10 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let abi_kind = target.abi;
     let regs = if abi_kind == CallAbi::Win64 { &REGS_WIN64 } else { &REGS };
     let Prepared { order, copied, abi, plan, frame, framed } = prepare(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
+    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[Reg::Rbp, Reg::Rsp, Reg::R11]);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
+    let slow_thunk = asm.label();
     let emit = Emit {
         func,
         frame,
@@ -63,6 +65,10 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         features: Features::host(),
         copied,
         direct_calls: target.direct_calls,
+        shrink,
+        slow_thunk,
+        in_shrink_entry: false,
+        in_fast_ret: false,
     };
     drive(emit, &order)
 }
@@ -110,11 +116,19 @@ pub(super) struct Emit<'a> {
     features: Features,
     copied: Vec<bool>,
     direct_calls: bool,
+    shrink: Option<ShrinkWrap>,
+    slow_thunk: Label,
+    in_shrink_entry: bool,
+    in_fast_ret: bool,
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
     fn func(&self) -> &'a Function {
         self.func
+    }
+
+    fn is_elided(&self, value: Value) -> bool {
+        self.plan.elided[value.index()]
     }
 
     fn prologue(&mut self) {
@@ -158,6 +172,37 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn bind_block(&mut self, block: Block) {
         self.asm.bind(self.blocks[block.index()]);
+    }
+
+    fn deferred_prologue(&self) -> bool {
+        self.shrink.is_some()
+    }
+
+    fn blocks_fallthrough_to(&self, block: Block) -> bool {
+        self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block)
+    }
+
+    fn before_block_bind(&mut self, block: Block) -> Result<(), String> {
+        if let Some(shrink) = self.shrink
+            && shrink.use_slow_thunk
+            && block == shrink.slow_entry
+        {
+            self.asm.bind(self.slow_thunk);
+            self.emit_slow_prologue_and_edge(shrink.slow_entry)?;
+        }
+        Ok(())
+    }
+
+    fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
+        self.in_shrink_entry = self.shrink.is_some() && self.func.entry == Some(block);
+        self.in_fast_ret = self.shrink.is_some_and(|s| s.fast_ret == block);
+        if let Some(shrink) = self.shrink
+            && !shrink.use_slow_thunk
+            && block == shrink.slow_entry
+        {
+            self.emit_slow_prologue_and_edge(shrink.slow_entry)?;
+        }
+        Ok(())
     }
 
     fn clear_flags(&mut self) {
@@ -317,11 +362,48 @@ impl Emit<'_> {
         Ok(())
     }
 
+    fn emit_slow_prologue_and_edge(&mut self, slow_entry: Block) -> Result<(), String> {
+        self.prologue();
+        if let Some(entry) = self.func.entry
+            && let Some(term) = self.func.blocks[entry.index()].insts.last()
+            && let Op::Brif(_, then_b, then_args, else_b, else_args) = &self.func.insts[term.index()].op
+        {
+            let args = if *then_b == slow_entry { then_args.as_slice() } else if *else_b == slow_entry { else_args.as_slice() } else { &[] };
+            self.edge(slow_entry, args)?;
+        }
+        Ok(())
+    }
+
+    fn target_label(&self, block: Block) -> Label {
+        if self.in_shrink_entry && self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
+            self.slow_thunk
+        } else {
+            self.blocks[self.func.jump_target(block).index()]
+        }
+    }
+
+    fn goto_branch(&mut self, block: Block, last: bool) {
+        if self.in_shrink_entry && self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block) {
+            self.asm.jmp(self.slow_thunk);
+        } else {
+            self.goto(block, last);
+        }
+    }
+
     fn brif(&mut self, condition: Value, then: (Block, &[Value]), otherwise: (Block, &[Value])) -> Result<(), String> {
+        let (then, otherwise) = if self.in_shrink_entry {
+            let slow = self.shrink.map(|s| s.slow_entry);
+            (
+                (then.0, if Some(then.0) == slow { &[][..] } else { then.1 }),
+                (otherwise.0, if Some(otherwise.0) == slow { &[][..] } else { otherwise.1 }),
+            )
+        } else {
+            (then, otherwise)
+        };
         if let Some(known) = self.imm_extended(condition, Ext::Zero) {
             let (block, args) = if known != 0 { then } else { otherwise };
             self.edge(block, args)?;
-            self.goto(block, true);
+            self.goto_branch(block, true);
             return Ok(());
         }
         let cond = match self.flags.take() {
@@ -337,24 +419,26 @@ impl Emit<'_> {
         );
         let falls = self.next.is_some_and(|next| next == then.0 || next == self.func.jump_target(then.0));
         if !else_moves && (then_moves || falls) {
-            self.asm.jcc(cond.invert(), self.blocks[self.func.jump_target(otherwise.0).index()]);
+            let target = self.target_label(otherwise.0);
+            self.asm.jcc(cond.invert(), target);
             self.edge(then.0, then.1)?;
-            self.goto(then.0, true);
+            self.goto_branch(then.0, true);
             return Ok(());
         }
         if !then_moves {
-            self.asm.jcc(cond, self.blocks[self.func.jump_target(then.0).index()]);
+            let target = self.target_label(then.0);
+            self.asm.jcc(cond, target);
             self.edge(otherwise.0, otherwise.1)?;
-            self.goto(otherwise.0, true);
+            self.goto_branch(otherwise.0, true);
             return Ok(());
         }
         let other = self.asm.label();
         self.asm.jcc(cond.invert(), other);
         self.edge(then.0, then.1)?;
-        self.goto(then.0, false);
+        self.goto_branch(then.0, false);
         self.asm.bind(other);
         self.edge(otherwise.0, otherwise.1)?;
-        self.goto(otherwise.0, true);
+        self.goto_branch(otherwise.0, true);
         Ok(())
     }
 
@@ -399,7 +483,11 @@ impl Emit<'_> {
             let pointer = params[index];
             self.raw(Reg::Rax, pointer);
         }
-        self.epilogue();
+        if self.in_fast_ret {
+            self.asm.bytes(&[0xC3]);
+        } else {
+            self.epilogue();
+        }
         Ok(())
     }
 

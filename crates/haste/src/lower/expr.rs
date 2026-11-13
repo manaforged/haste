@@ -33,6 +33,9 @@ const DEBUG_BUDGET: Budget = Budget { insts: 30, always: 100, exprs: 20 };
 /// The budget of the release profile.
 const RELEASE_BUDGET: Budget = Budget { insts: 400, always: 1000, exprs: 400 };
 
+/// The release-profile instruction and expression limit at a call site carrying a static vtable.
+const DEVIRT_LIMIT: usize = 900;
+
 /// The budget of the build profile.
 fn budget() -> &'static Budget {
     match crate::profile() {
@@ -90,6 +93,10 @@ pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn supe
 
 /// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
 pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
+    inline_limit_at(cx, reached, index, false)
+}
+
+fn inline_limit_at(cx: &mut Context<'_>, reached: &Reached, index: usize, devirt: bool) -> Option<usize> {
     let ((item, _), Ok(typed)) = &reached.list[index] else {
         return None;
     };
@@ -105,17 +112,22 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
         return None;
     }
     let budget = budget();
+    let release = crate::profile() == crate::outline::tree::Profile::Release;
+    let insts = if devirt && release { DEVIRT_LIMIT } else { budget.insts };
     if !matches!(typed.shape, Shape::Body) {
-        return Some(budget.insts);
+        return Some(insts);
     }
     match hint {
         Hint::Never => None,
         Hint::Always => Some(budget.always),
         Hint::Inline => {
-            let max_exprs = if crate::profile() == crate::outline::tree::Profile::Release || env.release { 2500 } else { 200 };
-            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(budget.insts)
+            let max_exprs = if release || env.release { 2500 } else { 200 };
+            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(insts)
         }
-        Hint::Default => cx.body(*item).is_ok_and(|body| body.exprs.len() <= budget.exprs).then_some(budget.insts),
+        Hint::Default => {
+            let max_exprs = if devirt && release { DEVIRT_LIMIT } else { budget.exprs };
+            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(insts)
+        }
     }
 }
 
@@ -298,6 +310,13 @@ impl Lower<'_, '_> {
     }
 
     fn call(&mut self, expr: ExprId, callee: ExprId, args: List) -> Result<Option<Value>> {
+        if self.body.list(args).is_empty() && super::array::is_maybe_uninit_fn(self.cx, self.typed, expr, callee) {
+            if !self.open {
+                return Ok(None);
+            }
+            let whole = repr(self.cx, self.ty_of(expr))?;
+            return Ok(self.slot(whole).and_then(|slot| self.read(Place::slot(slot, whole))));
+        }
         if let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) {
             return self.call_value((expr, callee), (item, substs), args);
         }
@@ -323,6 +342,12 @@ impl Lower<'_, '_> {
         let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) else { bail!("method call has no resolution") };
         let Some(&adjust) = self.typed.adjusts.get(&expr) else { bail!("method call has no receiver adjustment") };
         let first = self.receiver((expr, receiver), adjust)?;
+        if let Some(result) = self.try_write_fmt(expr, item, substs, first, params)? {
+            return Ok(Some(result));
+        }
+        if !self.open {
+            return Ok(None);
+        }
         if self.tupled_closure_call(item, substs) {
             let param_list = self.body.list(params).to_vec();
             let [tuple_expr] = param_list.as_slice() else { bail!("tupled closure method expects 1 argument") };
@@ -362,8 +387,8 @@ impl Lower<'_, '_> {
         self.call_with(Callee::Reached(index, origin), (params, callee.ret), values)
     }
 
-    fn inline_callee(&mut self, index: usize) -> Result<Option<Arc<InlinedCallee>>> {
-        let Some(limit) = inline_limit(self.cx, self.reached, index) else {
+    fn inline_callee(&mut self, index: usize, devirt: bool) -> Result<Option<Arc<InlinedCallee>>> {
+        let Some(limit) = inline_limit_at(self.cx, self.reached, index, devirt) else {
             return Ok(None);
         };
         let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, limit)?;
@@ -371,7 +396,7 @@ impl Lower<'_, '_> {
         Ok(callee)
     }
 
-    fn emit_inlined(&mut self, inlined: &InlinedCallee, origin: SiteOrigin, values: &[Value]) -> Vec<Value> {
+    fn emit_inlined(&mut self, inlined: &InlinedCallee, origin: SiteOrigin, values: &[Value]) -> Result<Vec<Value>> {
         if !self.open {
             let dead = *self.dead.get_or_insert_with(|| self.b.create_block());
             self.b.switch_to_block(dead);
@@ -379,21 +404,22 @@ impl Lower<'_, '_> {
         let sym_base = self.relocs.len() as u32;
         self.relocs.extend(inlined.relocs.iter().cloned());
         self.reloc_plan.push(RelocStep::SiteInline { origin, plan: Arc::clone(&inlined.reloc_plan) });
-        match self.mode {
+        Ok(match self.mode {
             LowerMode::Stencil => self.b.inline_shifted(&inlined.body, values, sym_base),
             LowerMode::Dict => {
-                let dict = self.dict_param.expect("dictionary parameter is set");
+                let Some(dict) = self.dict_param else { bail!("dictionary parameter is not set") };
                 self.b.inline_dict(&inlined.body, values, dict, sym_base)
             }
-        }
+        })
     }
 
     /// Calls `callee` with `values` by `signature`, or copies its body inline, and returns its results.
     fn emit_call(&mut self, callee: Callee, signature: Signature, values: &[Value]) -> Result<Vec<Value>> {
+        let devirt = self.b.func.has_vtable_slots();
         let code = match callee {
             Callee::Code(code) => code,
-            Callee::Reached(index, origin) => match if self.slots.allow_inline() { self.inline_callee(index)? } else { None } {
-                Some(inlined) => return Ok(self.emit_inlined(&inlined, origin, values)),
+            Callee::Reached(index, origin) => match if self.slots.allow_inline() { self.inline_callee(index, devirt)? } else { None } {
+                Some(inlined) => return self.emit_inlined(&inlined, origin, values),
                 None => self.code_of(index, origin),
             },
         };
@@ -522,8 +548,31 @@ impl Lower<'_, '_> {
         }
     }
 
+    pub(super) fn unwrap_expr(&self, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner) => expr = inner,
+                Expr::Block { stmts, tail: Some(inner), label: None, kind }
+                    if self.body.list(stmts).is_empty()
+                        && (matches!(kind, crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion)
+                            || (allow_unsafe && kind == crate::body::BlockKind::Unsafe)) =>
+                {
+                    expr = inner;
+                }
+                _ => return expr,
+            }
+        }
+    }
+
+    fn const_bool(&self, expr: ExprId) -> Option<bool> {
+        match *self.body.expr(self.unwrap_expr(expr, false)) {
+            Expr::Lit(crate::body::Lit::Bool(taken), _) => Some(taken),
+            _ => None,
+        }
+    }
+
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
-        if let Expr::Lit(crate::body::Lit::Bool(taken), _) = *self.body.expr(cond) {
+        if let Some(taken) = self.const_bool(cond) {
             return if taken {
                 self.expr(then)
             } else {

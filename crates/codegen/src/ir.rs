@@ -133,12 +133,29 @@ pub struct Signature {
     pub params: Vec<AbiParam>,
     pub returns: Vec<AbiParam>,
     pub call_conv: CallConv,
+    pub readonly_params: u64,
+    pub readonly_bytes: [u32; 16],
 }
 
 impl Signature {
     /// An empty signature in `call_conv`.
     pub fn new(call_conv: CallConv) -> Self {
-        Self { params: Vec::new(), returns: Vec::new(), call_conv }
+        Self { params: Vec::new(), returns: Vec::new(), call_conv, readonly_params: 0, readonly_bytes: [0; 16] }
+    }
+
+    /// Marks parameter `index` as pointing to immutable memory for the duration of the call.
+    pub fn mark_readonly(&mut self, index: usize) {
+        if index < 64 {
+            self.readonly_params |= 1_u64 << index;
+        }
+    }
+
+    /// Marks parameter `index` as pointing to `bytes` bytes of dereferenceable, immutable memory for the duration of the call.
+    pub fn mark_readonly_bytes(&mut self, index: usize, bytes: u32) {
+        self.mark_readonly(index);
+        if index < 16 {
+            self.readonly_bytes[index] = bytes;
+        }
     }
 }
 
@@ -305,6 +322,9 @@ pub(crate) enum Convert {
     FromUint,
     ToSintSat,
     ToUintSat,
+    WidenVec64,
+    NarrowVec64,
+    Bitcast,
 }
 
 #[derive(Clone, Debug)]
@@ -359,6 +379,28 @@ pub(crate) enum Op {
 impl Op {
     pub(crate) fn is_terminator(&self) -> bool {
         matches!(self, Op::TryCall { .. } | Op::Jump(..) | Op::Brif(..) | Op::BrTable(..) | Op::Return(_) | Op::Trap)
+    }
+
+    /// Whether this instruction computes its result from its operands alone, cannot trap, and may run speculatively.
+    pub(crate) fn is_speculable(&self) -> bool {
+        match self {
+            Op::Binary(bin, ..) => !matches!(bin, Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem),
+            Op::Const(_)
+            | Op::SlotAddr(_)
+            | Op::Symbol(_)
+            | Op::StackAddr(..)
+            | Op::Unary(..)
+            | Op::Convert(..)
+            | Op::Icmp(..)
+            | Op::Fits(..)
+            | Op::Fcmp(..)
+            | Op::ByteCmp(..)
+            | Op::Splat(_)
+            | Op::Movemask(_)
+            | Op::Vector(..)
+            | Op::Select(..) => true,
+            _ => false,
+        }
     }
 
     /// Every block this instruction can go to.
@@ -490,12 +532,19 @@ pub struct Function {
     /// The split that turns this function into a coroutine's resume function, when it is one.
     pub coroutine: Option<crate::coroutine::Coroutine>,
     pub(crate) self_slots: Vec<u32>,
+    pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
+    pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
 }
 
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new() }
+    }
+
+    /// Associates symbol index `sym` with known read-only constant bytes for load folding.
+    pub fn add_rodata_bytes(&mut self, sym: u32, bytes: Vec<u8>) {
+        self.rodata_bytes.push((sym, bytes));
     }
 
     /// Marks relocation slot `sym` as a direct self-recursive target of this function.
@@ -503,6 +552,54 @@ impl Function {
         if !self.self_slots.contains(&sym) {
             self.self_slots.push(sym);
         }
+    }
+
+    /// Records that an 8-byte load at `offset` from vtable symbol `vt_sym` resolves to call-table slot `slot_sym`.
+    pub fn add_vtable_slot(&mut self, vt_sym: u32, offset: i32, slot_sym: u32, low: bool) {
+        self.vtable_slots.push((vt_sym, offset, slot_sym, low));
+    }
+
+    /// Whether this function has any static vtable-slot entries recorded.
+    pub fn has_vtable_slots(&self) -> bool {
+        !self.vtable_slots.is_empty()
+    }
+
+    /// Whether this function is an unsplit coroutine body.
+    pub fn is_coroutine(&self) -> bool {
+        self.coroutine.is_some()
+    }
+
+    /// Returns `(block, inst_pos, callee_sym)` for every `Op::Call` whose callee is a symbol or slot-addr recorded in `vtable_slots`.
+    pub fn devirt_call_sites(&self) -> Vec<(Block, usize, u32)> {
+        if self.vtable_slots.is_empty() {
+            return Vec::new();
+        }
+        let mut slot_syms = vec![None; self.types.len()];
+        for data in &self.insts {
+            if let (Op::Symbol(sym) | Op::SlotAddr(sym), Some(res)) = (&data.op, data.result) {
+                slot_syms[res.index()] = Some(*sym);
+            }
+        }
+        let mut syms = slot_syms.clone();
+        for data in &self.insts {
+            if let (Op::Load(addr, 0), Some(res)) = (&data.op, data.result)
+                && let Some(sym) = slot_syms[addr.index()]
+            {
+                syms[res.index()] = Some(sym);
+            }
+        }
+        let mut out = Vec::new();
+        for (b_idx, block) in self.blocks.iter().enumerate() {
+            for (pos, &inst) in block.insts.iter().enumerate() {
+                if let Op::Call { callee, .. } = self.insts[inst.index()].op
+                    && let Some(sym) = syms[callee.index()]
+                    && self.vtable_slots.iter().any(|&(_, _, s, _)| s == sym)
+                {
+                    out.push((Block(b_idx as u32), pos, sym));
+                }
+            }
+        }
+        out
     }
 
     /// The type of `value`.
@@ -564,12 +661,56 @@ impl Function {
 
     /// Whether `FunctionBuilder::inline` can copy this function into a caller: it is no coroutine, catches no unwind and reads no frame pointer.
     pub fn can_inline(&self) -> bool {
-        self.coroutine.is_none() && self.entry.is_some() && !self.insts.iter().any(|data| matches!(data.op, Op::TryCall { .. } | Op::FramePointer))
+        self.coroutine.is_none()
+            && self.entry.is_some()
+            && !self
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .map(|i| &self.insts[i.index()])
+                .any(|data| matches!(data.op, Op::TryCall { .. } | Op::FramePointer))
     }
 
     /// Whether any instruction in this body returns to its caller.
     pub fn has_return(&self) -> bool {
-        self.insts.iter().any(|data| matches!(data.op, Op::Return(_)))
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .map(|i| &self.insts[i.index()])
+            .any(|data| matches!(data.op, Op::Return(_)))
+    }
+
+    /// For each value, the block that defines it.
+    pub(crate) fn def_blocks(&self) -> Vec<Option<Block>> {
+        let mut defs = vec![None; self.types.len()];
+        for (index, block) in self.blocks.iter().enumerate() {
+            let here = Some(Block(index as u32));
+            block.params.iter().for_each(|value| defs[value.index()] = here);
+            for inst in &block.insts {
+                crate::live::results(&self.insts[inst.index()]).for_each(|value| defs[value.index()] = here);
+            }
+        }
+        defs
+    }
+
+    /// The number of instruction operand reads of each value.
+    pub(crate) fn use_counts(&self) -> Vec<u32> {
+        let mut uses = vec![0_u32; self.types.len()];
+        for inst in self.blocks.iter().flat_map(|block| &block.insts) {
+            self.insts[inst.index()].op.for_operands(|value| uses[value.index()] += 1);
+        }
+        uses
+    }
+
+    /// The number of control-flow edges into each block.
+    pub(crate) fn pred_counts(&self) -> Vec<u32> {
+        let mut preds = vec![0_u32; self.blocks.len()];
+        for block in 0..self.blocks.len() {
+            for target in self.successors(Block(block as u32)) {
+                preds[target.index()] += 1;
+            }
+        }
+        preds
     }
 }
 

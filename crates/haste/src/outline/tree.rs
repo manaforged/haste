@@ -19,6 +19,7 @@ pub struct File {
     pub source: Source,
     pub items: Items,
     pub expanded: bool,
+    pub expand_origin: u64,
     bodies: OnceLock<Box<Bodies>>,
     index: OnceLock<Index>,
 }
@@ -78,7 +79,12 @@ pub struct Expansion {
 impl File {
     /// A file of `source` scanned to `items`, with no body expanded yet.
     pub fn new(source: Source, items: Items, expanded: bool) -> File {
-        File { source, items, expanded, bodies: OnceLock::new(), index: OnceLock::new() }
+        File { source, items, expanded, expand_origin: 0, bodies: OnceLock::new(), index: OnceLock::new() }
+    }
+
+    /// An expanded file carrying deterministic callsite provenance `expand_origin`.
+    pub fn new_expanded(source: Source, items: Items, expand_origin: u64) -> File {
+        File { source, items, expanded: true, expand_origin, bodies: OnceLock::new(), index: OnceLock::new() }
     }
 
     /// The name index of this file, made by `build` on first use and kept.
@@ -243,6 +249,16 @@ pub struct View {
 }
 
 impl Crate {
+    /// Whether this crate is an immutable release sysroot crate.
+    pub const fn is_sysroot(&self) -> bool {
+        self.env.release && self.env.fixed
+    }
+
+    /// Whether this crate is an immutable sysroot or pinned registry/git crate.
+    pub const fn is_fixed(&self) -> bool {
+        self.env.fixed
+    }
+
     /// The modules declared but not read yet.
     pub fn declared(&self) -> impl Iterator<Item = usize> + '_ {
         self.modules.iter().enumerate().filter(|(_, module)| matches!(module.state, State::Declared(_))).map(|(at, _)| at)

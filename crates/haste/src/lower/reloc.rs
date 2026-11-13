@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use crate::body::ExprId;
 use crate::names::ItemRef;
 use crate::sema::Context;
-use crate::sema::infer::{Coercion, LazyTables, Res, Shape, SiteKey, Typed, drop_fn, field_types, type_name};
+use crate::sema::infer::{Coercion, Res, Shape, SiteKey, Typed, drop_fn, field_types, type_name};
 use crate::sema::reach::Reached;
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
@@ -33,11 +33,13 @@ impl TyOrigin {
         match root {
             Root::Local(local) => Self::Local(local),
             Root::Temp(expr) => Self::Expr(expr),
-            Root::Held(expr) => match &typed.tables {
-                LazyTables::Eager(t) if t.awaits.contains_key(&expr) => Self::AwaitFuture(expr),
-                LazyTables::Poly(p) if p.summary.template.awaits.contains_key(&expr) => Self::AwaitFuture(expr),
-                _ => Self::ForIter(expr),
-            },
+            Root::Held(expr) => {
+                if typed.has_await_at(expr) {
+                    Self::AwaitFuture(expr)
+                } else {
+                    Self::ForIter(expr)
+                }
+            }
         }
     }
 
@@ -64,6 +66,8 @@ pub(super) enum SiteOrigin {
     ShapeGlueResume,
     ShapeUntuple,
     ShapeClone(u16),
+    VtableMethod { expr: ExprId, slot: u16 },
+    Known(ItemRef, Substs),
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +75,7 @@ pub(super) enum RelocStep {
     Const(SymbolSource),
     Promoted { seq: u32, size: u32 },
     VtableAt(ExprId),
+    VtableSlot { expr: ExprId, slot: u16 },
     SiteSlot(SiteOrigin),
     SiteInline { origin: SiteOrigin, plan: Arc<RelocPlan> },
     TypeId(TyOrigin),
@@ -86,6 +91,34 @@ pub struct RelocPlan {
 impl RelocPlan {
     pub(super) fn from_vec(steps: Vec<RelocStep>) -> Self {
         Self { steps: steps.into_boxed_slice() }
+    }
+
+    pub(super) fn reloc_len(&self) -> usize {
+        self.steps
+            .iter()
+            .map(|step| match step {
+                RelocStep::TypeName(_) => 2,
+                RelocStep::SiteInline { plan, .. } => plan.reloc_len(),
+                _ => 1,
+            })
+            .sum()
+    }
+
+    pub(super) fn vtable_slot_at(&self, target_sym: usize) -> Option<(ExprId, u16)> {
+        let mut offset = 0usize;
+        for step in &self.steps {
+            let len = match step {
+                RelocStep::VtableSlot { expr, slot } if offset == target_sym => return Some((*expr, *slot)),
+                RelocStep::TypeName(_) => 2,
+                RelocStep::SiteInline { plan, .. } => plan.reloc_len(),
+                _ => 1,
+            };
+            if target_sym < offset + len {
+                return None;
+            }
+            offset += len;
+        }
+        None
     }
 
     pub(super) fn has_promoted(&self) -> bool {
@@ -119,10 +152,27 @@ fn eval_into(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, plan: &
                 let id = eval_vtable_at(cx, reached, slots, typed, *expr)?;
                 out.push(SymbolSource::Vtable(id));
             }
+            RelocStep::VtableSlot { expr, slot } => {
+                let id = eval_vtable_at(cx, reached, slots, typed, *expr)?;
+                let entries = slots.vtable_entries(id).ok_or_else(|| anyhow::anyhow!("missing vtable entries for {:?}", id))?;
+                match entries.get(*slot as usize) {
+                    Some(super::stencil::VtableEntry::Word(super::Word::Code(callee_idx))) => out.push(SymbolSource::Slot(*callee_idx)),
+                    other => bail!("vtable slot {} is not code: {:?}", slot, other),
+                }
+            }
             RelocStep::SiteSlot(origin) => {
                 let (callee_item, callee_substs) = eval_site(cx, reached, typed, substs, origin)?;
                 let callee_idx = reached_index_of(cx, reached, slots, (callee_item, callee_substs))?;
                 out.push(SymbolSource::Slot(callee_idx));
+            }
+            RelocStep::SiteInline { origin: SiteOrigin::VtableMethod { expr, slot }, plan: sub_plan } => {
+                let id = eval_vtable_at(cx, reached, slots, typed, *expr)?;
+                let entries = slots.vtable_entries(id).ok_or_else(|| anyhow::anyhow!("missing vtable entries for {:?}", id))?;
+                let callee_idx = match entries.get(*slot as usize) {
+                    Some(super::stencil::VtableEntry::Word(super::Word::Code(idx))) => *idx,
+                    other => bail!("vtable slot {} is not code: {:?}", slot, other),
+                };
+                eval_into(cx, reached, slots, sub_plan, callee_idx, out)?;
             }
             RelocStep::SiteInline { origin, plan: sub_plan } => {
                 let (callee_item, callee_substs) = eval_site(cx, reached, typed, substs, origin)?;
@@ -156,22 +206,16 @@ pub(super) fn reached_index_of(cx: &Context<'_>, reached: &Reached, slots: &dyn 
 }
 
 fn eval_vtable_at(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, typed: &Typed, expr: ExprId) -> Result<super::stencil::VtableId> {
-    let vtable = match &typed.tables {
-        LazyTables::Eager(t) => match t.coercions.get(&expr) {
-            Some(Coercion::Vtable(vt)) => vt,
-            _ => bail!("missing vtable coercion at {:?}", expr),
-        },
-        LazyTables::Poly(p) => match p.summary.template.coercions.get(&expr) {
-            Some(Coercion::Vtable(vt)) => vt,
-            _ => bail!("missing poly vtable coercion at {:?}", expr),
-        },
+    let scoped = typed.scoped(&cx.types);
+    let Some(Coercion::Vtable(vt)) = scoped.coercions.get(&expr) else {
+        bail!("missing vtable coercion at {:?}", expr);
     };
-    build_vtable_id(cx, reached, slots, vtable)
+    build_vtable_id(cx, reached, slots, vt)
 }
 
 fn eval_site(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Substs, origin: &SiteOrigin) -> Result<(ItemRef, Substs)> {
     match origin {
-        SiteOrigin::Table(key) => eval_table_site(typed, *key).ok_or_else(|| anyhow::anyhow!("missing site {:?}", key)),
+        SiteOrigin::Table(key) => typed.site_fn(*key).ok_or_else(|| anyhow::anyhow!("missing site {:?}", key)),
         SiteOrigin::PointerFnDef { expr, callee } => eval_pointer_fndef(cx, reached, typed, *expr, *callee),
         SiteOrigin::DropGlue(ty_origin) => {
             let ty = eval_ty(cx, reached, typed, substs, ty_origin)?;
@@ -214,28 +258,13 @@ fn eval_site(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Sub
             },
             _ => bail!("expected clone shape"),
         },
-    }
-}
-
-pub(super) fn eval_table_site(typed: &Typed, key: SiteKey) -> Option<(ItemRef, Substs)> {
-    match &typed.tables {
-        LazyTables::Poly(poly) => poly.site_fn(key),
-        LazyTables::Eager(tables) => match tables.site_res(key)? {
-            Res::Fn(item, substs) => Some((item, substs)),
-            _ => None,
-        },
-    }
-}
-
-pub(super) fn eval_expr_ty(cx: &Context<'_>, typed: &Typed, expr: ExprId) -> Ty {
-    match &typed.tables {
-        LazyTables::Poly(poly) => poly.expr_ty(&cx.types, expr),
-        LazyTables::Eager(tables) => tables.exprs[expr.0 as usize],
+        SiteOrigin::VtableMethod { slot, .. } => bail!("unexpected eval_site for vtable method slot {slot}"),
+        SiteOrigin::Known(item, call_substs) => Ok((*item, *call_substs)),
     }
 }
 
 pub(super) fn eval_deref_step(cx: &Context<'_>, reached: &Reached, typed: &Typed, expr: ExprId, step: u32, ty: Ty) -> Result<Ty> {
-    if let Some((item, substs)) = eval_table_site(typed, SiteKey::Deref(expr, step)) {
+    if let Some((item, substs)) = typed.site_fn(SiteKey::Deref(expr, step)) {
         let Some(&idx) = reached.index.get(&(item, substs)) else { bail!("unreached deref callee") };
         let Ok(callee) = &reached.list[idx].1 else { bail!("broken deref callee") };
         let Some(ret) = callee.ret else { bail!("deref callee without return") };
@@ -251,14 +280,11 @@ pub(super) fn eval_deref_step(cx: &Context<'_>, reached: &Reached, typed: &Typed
 }
 
 pub(super) fn eval_autoderef_ty(cx: &Context<'_>, reached: &Reached, typed: &Typed, expr: ExprId, base: ExprId) -> Result<Ty> {
-    let mut ty = eval_expr_ty(cx, typed, base);
+    let mut ty = typed.expr_ty(&cx.types, base);
     if ty == Ty::NONE {
         return Ok(Ty::NONE);
     }
-    let steps = match &typed.tables {
-        LazyTables::Poly(poly) => poly.autoderefs_at(expr),
-        LazyTables::Eager(tables) => tables.autoderefs.get(&expr).copied().unwrap_or(0),
-    };
+    let steps = typed.autoderefs_at(expr);
     for step in 0..steps {
         ty = eval_deref_step(cx, reached, typed, expr, step, ty)?;
     }
@@ -275,15 +301,9 @@ fn eval_ty(cx: &mut Context<'_>, reached: &Reached, typed: &Typed, substs: Subst
     match origin {
         TyOrigin::Subst(idx) => cx.types.substs(substs).get(*idx as usize).copied().ok_or_else(|| anyhow::anyhow!("subst {} out of bounds", idx)),
         TyOrigin::Local(idx) => typed.locals.get(*idx as usize).map(|l| l.ty).ok_or_else(|| anyhow::anyhow!("local {} out of bounds", idx)),
-        TyOrigin::Expr(id) => Ok(eval_expr_ty(cx, typed, *id)),
-        TyOrigin::ForIter(id) => match &typed.tables {
-            LazyTables::Poly(p) => p.summary.template.fors.get(id).map(|f| p.sub_ty(&cx.types, f.iter)).ok_or_else(|| anyhow::anyhow!("missing for {}", id.0)),
-            LazyTables::Eager(t) => t.fors.get(id).map(|f| f.iter).ok_or_else(|| anyhow::anyhow!("missing for {}", id.0)),
-        },
-        TyOrigin::AwaitFuture(id) => match &typed.tables {
-            LazyTables::Poly(p) => p.summary.template.awaits.get(id).map(|a| p.sub_ty(&cx.types, a.future)).ok_or_else(|| anyhow::anyhow!("missing await {}", id.0)),
-            LazyTables::Eager(t) => t.awaits.get(id).map(|a| a.future).ok_or_else(|| anyhow::anyhow!("missing await {}", id.0)),
-        },
+        TyOrigin::Expr(id) => Ok(typed.expr_ty(&cx.types, *id)),
+        TyOrigin::ForIter(id) => typed.for_iter(&cx.types, *id).ok_or_else(|| anyhow::anyhow!("missing for {}", id.0)),
+        TyOrigin::AwaitFuture(id) => typed.await_future(&cx.types, *id).ok_or_else(|| anyhow::anyhow!("missing await {}", id.0)),
         TyOrigin::SiteSubst(site, idx) => {
             let (_, site_substs) = eval_site(cx, reached, typed, substs, site)?;
             cx.types.substs(site_substs).get(*idx as usize).copied().ok_or_else(|| anyhow::anyhow!("site subst {} out of bounds", idx))

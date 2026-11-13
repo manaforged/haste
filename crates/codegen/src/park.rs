@@ -94,14 +94,42 @@ fn pick_slot<F: Copy + PartialEq>(
     ranges: &[Range],
     start: u32,
     used: &[F],
+    reserved: &[F],
+    allow_reserved: bool,
     pred: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    let valid = |slot: usize| pred(slot) && slot_free(&holders[slot], live, ranges, pool.arrival_lock[slot], start);
+    let valid = |slot: usize| pred(slot) && (allow_reserved || !reserved.contains(&pool.regs[slot])) && slot_free(&holders[slot], live, ranges, pool.arrival_lock[slot], start);
     (0..pool.regs.len())
         .find(|&s| valid(s) && holders[s].is_empty() && (!pool.is_saved[s] || used.contains(&pool.regs[s])))
         .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && (!pool.is_saved[s] || used.contains(&pool.regs[s]))))
         .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && holders[s].is_empty()))
         .or_else(|| (0..pool.regs.len()).find(|&s| valid(s)))
+}
+
+fn loop_back_args(func: &Function) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        let mut edge = |target: crate::ir::Block, args: &[crate::ir::Value]| {
+            if target.index() <= b_idx {
+                for (param, arg) in func.blocks[target.index()].params.iter().zip(args) {
+                    if param != arg {
+                        pairs.push((param.index(), arg.index()));
+                    }
+                }
+            }
+        };
+        for &inst in &block.insts {
+            match &func.insts[inst.index()].op {
+                crate::ir::Op::Jump(target, args) => edge(*target, args),
+                crate::ir::Op::Brif(_, then, then_args, otherwise, else_args) => {
+                    edge(*then, then_args);
+                    edge(*otherwise, else_args);
+                }
+                _ => {}
+            }
+        }
+    }
+    pairs
 }
 
 fn try_demote<F: Copy + PartialEq>(
@@ -143,18 +171,57 @@ fn victim_slot<F: Copy + PartialEq>(
     weights: Option<&[u64]>,
     suits: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    let candidates = (0..pool.regs.len()).filter(|&s| suits(s) && !(start == 0 && pool.arrival_lock[s]) && holders[s].len() == 1);
+    let candidates = (0..pool.regs.len()).filter(|&s| suits(s) && !(start == 0 && pool.arrival_lock[s]));
     let Some(cost) = weights else {
         return candidates
+            .filter(|&s| holders[s].len() == 1 && pool.kept[holders[s][0]].is_none())
             .filter_map(|s| live.last_end(holders[s][0]).map(|u| (u, s)))
             .max_by_key(|&(u, _)| u)
             .filter(|&(u, _)| u > end)
             .map(|(_, s)| s);
     };
-    let density = |v: usize| (cost[v], live.total_len(v));
-    let below = |(a, la): (u64, u64), (b, lb): (u64, u64)| u128::from(a) * u128::from(lb) < u128::from(b) * u128::from(la);
-    let best = candidates.reduce(|a, b| if below(density(holders[b][0]), density(holders[a][0])) { b } else { a })?;
-    below(density(holders[best][0]), density(value)).then_some(best)
+    let ranges = live.ranges_of(value);
+    let below = |v: usize, u: usize| {
+        if cost[v] <= 2 && cost[u] <= 2 {
+            u128::from(cost[v]) * u128::from(live.total_len(u)) < u128::from(cost[u]) * u128::from(live.total_len(v))
+        } else {
+            cost[v] < cost[u] || (cost[v] == cost[u] && live.total_len(v) > live.total_len(u))
+        }
+    };
+    let mut best: Option<(u64, u64, usize)> = None;
+    for s in candidates {
+        let mut evict_cost = 0_u64;
+        let mut max_len = 0_u64;
+        let mut count = 0_usize;
+        let mut single = 0_usize;
+        let mut outer_only = pool.is_saved[s];
+        let mut ok = true;
+        for &h in &holders[s] {
+            if overlaps(live.ranges_of(h), ranges) {
+                if pool.kept[h].is_some() {
+                    ok = false;
+                    break;
+                }
+                outer_only &= cost[h] < 10;
+                evict_cost = evict_cost.saturating_add(cost[h]);
+                max_len = max_len.max(live.total_len(h));
+                single = h;
+                count += 1;
+            }
+        }
+        if !ok || count == 0 {
+            continue;
+        }
+        let cheaper = if holders[s].len() == 1 {
+            below(single, value)
+        } else {
+            outer_only && evict_cost.saturating_mul(4) < cost[value]
+        };
+        if cheaper && best.is_none_or(|(bc, bl, _)| evict_cost < bc || (evict_cost == bc && max_len > bl)) {
+            best = Some((evict_cost, max_len, s));
+        }
+    }
+    best.map(|(_, _, s)| s)
 }
 
 pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class: &Class<F>, pooled: &[bool], hints: &Hints) -> (Vec<Option<F>>, Vec<F>) {
@@ -176,7 +243,9 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         .filter_map(|v| live.bounds(v).map(|(start, end)| (start, end, v)))
         .collect();
     values.sort_unstable();
+    let back_args = loop_back_args(func);
     let mut used: Vec<F> = Vec::new();
+    let mut reserved: Vec<F> = Vec::new();
     for (start, end, value) in values {
         for list in &mut holders {
             list.retain(|&other| live.last_end(other).is_some_and(|u| u >= start));
@@ -190,11 +259,24 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         }
         let suits_direct = |s: usize| if needs_saved { pool.is_saved[s] && !wide_val } else { !wide_val || !pool.is_saved[s] };
         let suits_any = |s: usize| suits_direct(s) || (can_park && !pool.is_saved[s]);
+        let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start));
+        reserved.clear();
+        for &(param, arg) in &back_args {
+            if arg != value
+                && let Some(reg) = homes[param]
+                && homes[arg].is_none()
+                && live.bounds(arg).is_some_and(|(arg_start, _)| arg_start >= start)
+                && !reserved.contains(&reg)
+            {
+                reserved.push(reg);
+            }
+        }
         let mut chosen = hints.reuse[value].and_then(|op| {
             let op_idx = op.index();
             let reg = homes[op_idx]?;
             let s = pool.regs.iter().position(|r| *r == reg)?;
-            if !suits_any(s) || (start == 0 && pool.arrival_lock[s]) {
+            let suits_reuse = if has_free_saved { suits_direct(s) } else { suits_any(s) };
+            if !suits_reuse || (start == 0 && pool.arrival_lock[s]) || reserved.contains(&reg) {
                 return None;
             }
             if !holders[s].iter().all(|&h| h == op_idx || !overlaps(live.ranges_of(h), ranges)) {
@@ -208,7 +290,7 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         {
             chosen = partners[value].iter().filter_map(|p| homes[p.index()]).find_map(|reg| {
                 let s = pool.regs.iter().position(|r| *r == reg)?;
-                let ok = if needs_saved { pool.is_saved[s] && !wide_val } else { !pool.is_saved[s] || (!wide_val && used.contains(&reg)) };
+                let ok = if needs_saved { (pool.is_saved[s] || (can_park && !has_free_saved)) && !wide_val } else { !pool.is_saved[s] || (!wide_val && used.contains(&reg)) };
                 (ok && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start)).then_some(s)
             });
         }
@@ -226,11 +308,16 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         }
         if chosen.is_none() {
             chosen = if needs_saved {
-                pick_slot(&pool, &holders, live, ranges, start, &used, |s| pool.is_saved[s] && !wide_val)
-                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, |s| !pool.is_saved[s])).flatten())
+                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s] && !wide_val)
+                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| !pool.is_saved[s])).flatten())
+                    .or_else(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| pool.is_saved[s] && !wide_val))
+                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| !pool.is_saved[s])).flatten())
             } else {
-                pick_slot(&pool, &holders, live, ranges, start, &used, |s| !pool.is_saved[s])
-                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, |s| pool.is_saved[s])).flatten())
+                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| !pool.is_saved[s])
+                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s] && used.contains(&pool.regs[s]))).flatten())
+                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s])).flatten())
+                    .or_else(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| !pool.is_saved[s]))
+                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| pool.is_saved[s])).flatten())
             };
         }
         if chosen.is_none() && needs_saved && !wide_val {
@@ -238,10 +325,16 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         }
         if chosen.is_none()
             && let Some(s) = victim_slot(&pool, &holders, live, (start, end, value), hints.weights, suits_any)
-            && let Some(other) = holders[s].pop()
         {
-            assigned[s].retain(|&h| h != other);
-            homes[other] = None;
+            holders[s].retain(|&other| {
+                if overlaps(live.ranges_of(other), ranges) {
+                    assigned[s].retain(|&h| h != other);
+                    homes[other] = None;
+                    false
+                } else {
+                    true
+                }
+            });
             chosen = Some(s);
         }
         let Some(slot) = chosen else { continue };

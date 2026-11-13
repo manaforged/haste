@@ -2,7 +2,7 @@ use crate::ir::{Block, Function, Op, Value};
 
 /// Folds every block that only one jump enters into the block that jumps, so its values stay block-local.
 pub(crate) fn run(func: &mut Function) {
-    let preds = pred_counts(func);
+    let preds = func.pred_counts();
     let mut subst = identity(func.types.len());
     let mut merged = false;
     for block in 0..func.blocks.len() {
@@ -14,17 +14,6 @@ pub(crate) fn run(func: &mut Function) {
     if merged {
         rename(func, &subst);
     }
-}
-
-/// The number of control-flow edges into each block.
-pub(crate) fn pred_counts(func: &Function) -> Vec<u32> {
-    let mut preds = vec![0_u32; func.blocks.len()];
-    for block in 0..func.blocks.len() {
-        for target in func.successors(Block(block as u32)) {
-            preds[target.index()] += 1;
-        }
-    }
-    preds
 }
 
 /// Builds an identity replacement table mapping each of `count` values to itself.

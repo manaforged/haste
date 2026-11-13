@@ -7,12 +7,23 @@ use crate::live::SibBase;
 use crate::reloc::{RelocKind, StencilReloc};
 
 impl Emit<'_> {
+    pub(super) fn frame_mem(&self, fp_disp: i32) -> Mem {
+        if (-256..256).contains(&fp_disp) || !self.framed {
+            return Mem::new(FP, fp_disp);
+        }
+        let sp_disp = i64::from(self.frame.size) + i64::from(self.sp_bias) + i64::from(fp_disp);
+        match i32::try_from(sp_disp) {
+            Ok(d) if (0..32760).contains(&d) => Mem::new(super::asm::SP, d),
+            _ => Mem::new(FP, fp_disp),
+        }
+    }
+
     pub(super) fn at(&self, value: Value) -> Mem {
-        Mem::new(FP, self.frame.values[value.index()])
+        self.frame_mem(self.frame.values[value.index()])
     }
 
     pub(super) fn slot(&self, slot: StackSlot, offset: i32) -> Mem {
-        Mem::new(FP, self.frame.slots[slot.index()] + offset)
+        self.frame_mem(self.frame.slots[slot.index()] + offset)
     }
 
     pub(super) fn vreg_of(&self, value: Value) -> Option<Vreg> {
@@ -79,7 +90,7 @@ impl Emit<'_> {
         if let Location::Frame(slot, base) = self.plan.location(addr)
             && let Some(disp) = self.frame.slots[slot.index()].checked_add(base).and_then(|disp| disp.checked_add(offset))
         {
-            return Mem::new(FP, disp);
+            return self.frame_mem(disp);
         }
         self.raw(scratch, addr);
         Mem::new(scratch, offset)
@@ -109,6 +120,7 @@ impl Emit<'_> {
         match self.plan.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed)),
             Location::Frame(..) | Location::SlotAddr(_) => self.raw(reg, value),
+            Location::Reg(from) if !signed && self.plan.zero_ext[value.index()] => self.asm.mov(reg, from),
             Location::Reg(from) => self.asm.extend(signed, bytes, reg, from),
             Location::Float(from) => {
                 self.asm.fmov_out(ty == Type::F64, reg, Vreg(from));
@@ -157,6 +169,7 @@ impl Emit<'_> {
         match self.plan.location(value) {
             Location::Float(from) if ty == Type::V128 => self.asm.vmov(reg, Vreg(from)),
             Location::Float(from) => self.asm.fmov_reg(ty == Type::F64, reg, Vreg(from)),
+            Location::Imm(0) if ty == Type::V128 => self.asm.veor_zero(reg),
             Location::Slot => self.asm.vload(ty.bytes(), reg, self.at(value)),
             _ => {
                 self.raw(D, value);
@@ -210,6 +223,10 @@ impl Emit<'_> {
 
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
         match self.plan.location(value) {
+            Location::Imm(0) if self.ty(value) == Type::V128 => {
+                self.asm.store(Size::X, to, super::ZR);
+                self.asm.store(Size::X, to.offset(8), super::ZR);
+            }
             Location::Imm(0) => self.asm.store(Size::X, to, super::ZR),
             Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) => {
                 self.raw(IP, value);
