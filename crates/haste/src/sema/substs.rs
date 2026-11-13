@@ -5,9 +5,8 @@ use rustc_hash::FxHashMap;
 use crate::names::ItemRef;
 use crate::sync::{read_lock, shard_index, write_lock};
 
+use super::table::SHARDS;
 use super::ty::Ty;
-
-const SHARDS: usize = 32;
 
 fn pack_handle(shard: usize, index: usize) -> u32 {
     (((index as u32) << 5) | (shard as u32)) + 1

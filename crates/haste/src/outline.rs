@@ -203,6 +203,11 @@ fn root_module(path: &std::path::Path) -> Module {
 }
 
 impl Outline {
+    /// Whether crate `krate` is an immutable release sysroot crate.
+    pub fn is_sysroot(&self, krate: u32) -> bool {
+        self.crates.get(krate as usize).is_some_and(tree::Crate::is_sysroot)
+    }
+
     /// The path that `module_path!` spells for module `at`: the crate name, then each module name from the root down.
     pub fn module_path(&self, at: crate::names::ModRef) -> String {
         let modules = &self.crates[at.krate as usize].modules;

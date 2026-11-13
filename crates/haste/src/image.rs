@@ -173,7 +173,7 @@ impl Slots for Image {
     }
 
     fn allow_inline(&self) -> bool {
-        !self.fast_jit && (!self.jit_mode || crate::profile() == crate::outline::tree::Profile::Release)
+        self.mode != ImageMode::Check && !self.fast_jit && (!self.jit_mode || crate::profile() == crate::outline::tree::Profile::Release)
     }
 
     fn cell(&self, index: usize, size: u32) -> i64 {

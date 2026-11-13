@@ -156,14 +156,13 @@ impl<R> Frame<R> {
     pub(crate) fn edge_slot(&self, index: usize) -> i32 {
         self.scratch + (EDGE_SLOT as usize * index) as i32
     }
+}
 
-    pub(crate) fn shares(&self, plan: &Plan<R>, a: Value, b: Value) -> bool
-    where
-        R: Copy,
-    {
-        let memory = |value: Value| matches!(plan.location(value), Location::Slot);
-        memory(a) && memory(b) && self.values[a.index()] == self.values[b.index()]
-    }
+pub(crate) fn same_home<R: Copy + PartialEq>(locations: &[Location<R>], values: &[i32], a: Value, b: Value) -> bool {
+    a == b
+        || matches!((locations[a.index()], locations[b.index()]), (Location::Reg(x), Location::Reg(y)) if x == y)
+        || matches!((locations[a.index()], locations[b.index()]), (Location::Float(x), Location::Float(y)) if x == y)
+        || (matches!(locations[a.index()], Location::Slot) && matches!(locations[b.index()], Location::Slot) && values[a.index()] == values[b.index()])
 }
 
 fn live_ops(func: &Function) -> impl Iterator<Item = &Op> {
@@ -179,17 +178,14 @@ pub(crate) fn framed<R>(func: &Function, frame: &Frame<R>, stack_params: bool) -
     stack_params || frame.size > 0 || !frame.saves.is_empty() || !frame.float_saves.is_empty() || live_ops(func).any(|op| matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::FramePointer))
 }
 
-fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<(u32, u32), String> {
-    let (mut outgoing, mut scratch) = (0, 0);
+fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> Result<u32, String> {
+    let mut outgoing = 0;
     for op in live_ops(func) {
-        match op {
-            Op::Call { sig, .. } | Op::TryCall { sig, .. } => outgoing = outgoing.max(classify(&func.sigs[sig.index()])?.stack),
-            Op::Jump(_, args) => scratch = scratch.max(args.len() as u32 * EDGE_SLOT),
-            Op::Brif(_, _, then, _, otherwise) => scratch = scratch.max(then.len().max(otherwise.len()) as u32 * EDGE_SLOT),
-            _ => {}
+        if let Op::Call { sig, .. } | Op::TryCall { sig, .. } = op {
+            outgoing = outgoing.max(classify(&func.sigs[sig.index()])?.stack);
         }
     }
-    Ok((outgoing, scratch))
+    Ok(outgoing)
 }
 
 fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
@@ -208,19 +204,21 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
     (values, slots)
 }
 
-pub(crate) fn layout<R>(
+pub(crate) fn layout<R: Copy + PartialEq>(
     func: &Function,
     (saves, float_saves): (Vec<R>, Vec<u8>),
     (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<Frame<R>, String> {
-    let (outgoing, scratch) = needs(func, classify)?;
+    let outgoing = needs(func, classify)?;
     let (present, addressed) = present(func);
     let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
     let mut values = Vec::with_capacity(func.types.len());
     let mut homes: Vec<i32> = Vec::new();
     for (value, ty) in func.types.iter().enumerate() {
-        if !present[value] || elided.get(value) == Some(&true) || (matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true)) {
+        let static_loc = matches!(locations[value], Location::Imm(_) | Location::SlotAddr(_) | Location::Frame(..));
+        let reg_unhomed = matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true);
+        if !present[value] || elided.get(value) == Some(&true) || static_loc || reg_unhomed {
             values.push(0);
             continue;
         }
@@ -238,6 +236,25 @@ pub(crate) fn layout<R>(
         }
         values.push(homes[home]);
     }
+    let mut max_saved = 0_usize;
+    let mut check_edge = |block: Block, args: &[Value]| {
+        for step in edge_steps(args, &func.blocks[block.index()].params, |a, b| same_home(locations, &values, a, b)) {
+            if let Step::Save(_, index) = step {
+                max_saved = max_saved.max(index + 1);
+            }
+        }
+    };
+    for op in live_ops(func) {
+        match op {
+            Op::Jump(block, args) => check_edge(*block, args),
+            Op::Brif(_, then, then_args, otherwise, else_args) => {
+                check_edge(*then, then_args);
+                check_edge(*otherwise, else_args);
+            }
+            _ => {}
+        }
+    }
+    let scratch = max_saved as u32 * EDGE_SLOT;
     let mut slots = vec![0; func.slots.len()];
     let mut order: Vec<usize> = (0..func.slots.len()).filter(|&slot| addressed[slot]).collect();
     order.sort_by_key(|&slot| (func.slots[slot].size, slot));

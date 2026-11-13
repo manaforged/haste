@@ -82,7 +82,7 @@ impl<'a> Context<'a> {
     /// Drops cached reach-only tables and sysroot bodies to cut RSS before one-shot codegen.
     pub(crate) fn compact_for_oneshot_codegen(&mut self) {
         self.store.finals.clear();
-        self.store.bodies.retain(|item, _| !self.outline.crates.get(item.krate as usize).is_some_and(|t| t.env.release && t.env.fixed));
+        self.store.bodies.retain(|item, _| !self.outline.is_sysroot(item.krate));
         self.store.lookups.summaries = table::Flight::default();
         self.store.lookups.selections.clear();
         self.store.lookups.projections.clear();

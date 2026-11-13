@@ -116,6 +116,7 @@ impl Batch {
         let main = if mode == crate::image::ImageMode::Aot { Some(main_item(workspace, &compilation.outline).context("no member binary has a `main`")?) } else { None };
         let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, pick) };
         let mut cache = Cache::default();
+        cache.set_warm_sysroot_bodies(mode != crate::image::ImageMode::Check);
         let substrate_key = crate::substrate::enabled().then(|| {
             let target = crate::host_target();
             (crate::substrate::toolchain_key(workspace, &target), crate::substrate::target_hash(&target))

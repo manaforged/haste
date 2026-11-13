@@ -641,10 +641,7 @@ impl<R: Copy> Plan<R> {
 
 impl<R: Copy + PartialEq> Plan<R> {
     pub(crate) fn same_home(&self, frame: &crate::frame::Frame<R>, a: Value, b: Value) -> bool {
-        a == b
-            || matches!((self.location(a), self.location(b)), (Location::Reg(x), Location::Reg(y)) if x == y)
-            || matches!((self.location(a), self.location(b)), (Location::Float(x), Location::Float(y)) if x == y)
-            || frame.shares(self, a, b)
+        crate::frame::same_home(&self.locations, &frame.values, a, b)
     }
 
     pub(crate) fn moves(&self, func: &Function, frame: &crate::frame::Frame<R>, block: Block, args: &[Value]) -> bool {

@@ -96,7 +96,7 @@ impl<'a> SubState<'a> {
 pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Option<Result<Arc<Typed>, String>> {
     let before = cx.quiet_mark();
     let (item, substs) = *instance;
-    let is_sysroot = cx.outline.crates.get(item.krate as usize).is_some_and(|tree| tree.env.release && tree.env.fixed);
+    let is_sysroot = cx.outline.is_sysroot(item.krate);
     let summaries = cx.store.lookups.summaries.clone();
     let built = if substs.is_empty() && is_sysroot {
         let (_, entry) = cx.item(item);
@@ -139,6 +139,7 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
     };
     let Ok(SummaryKind::Poly(summary)) = built else { return None };
     if is_sysroot
+        && !cx.store.lookups.skip_warm_sysroot_bodies
         && cx.store.bodies.get(&item).is_none()
         && crate::profile() == crate::outline::tree::Profile::Release
         && cx.store.lookups.substrate.is_some()
@@ -154,7 +155,7 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
 
 fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
     let slice = cx.types.substs(substs);
-    let is_sysroot = cx.outline.crates.get(item.krate as usize).is_some_and(|tree| tree.env.release && tree.env.fixed);
+    let is_sysroot = cx.outline.is_sysroot(item.krate);
     if (slice.is_empty() && !is_sysroot) || cx.types.substs_have_params(substs) || slice.iter().any(|&ty| matches!(cx.types.kind(ty), Kind::Never)) {
         return false;
     }
@@ -186,7 +187,7 @@ fn build_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> Summa
     let SummaryKind::Poly(mut arc) = super::infer::poly::build_poly_summary(cx, item, param_count) else {
         return SummaryKind::MonomorphicFallback;
     };
-    if cx.outline.crates.get(item.krate as usize).is_some_and(|tree| tree.env.release && tree.env.fixed) {
+    if cx.outline.is_sysroot(item.krate) {
         cx.store.lookups.has_new_sysroot_summaries.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let Some(summary) = Arc::get_mut(&mut arc) else { return SummaryKind::MonomorphicFallback };
@@ -432,9 +433,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
     };
     let laid = lay_out_instantiated(cx, &concrete_layouts, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
     if laid.is_ok() && cx.quiet_mark() == before {
-        if summary.template.closures.is_empty()
-            && cx.outline.crates.get(instance.0.krate as usize).is_some_and(|tree| tree.env.release && tree.env.fixed)
-        {
+        if summary.template.closures.is_empty() && cx.outline.is_sysroot(instance.0.krate) {
             cx.store.lookups.has_new_sysroot_instances.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         cx.store.finals.insert(instance, Arc::clone(&typed));

@@ -280,6 +280,7 @@ pub(super) struct Inline {
     pub stack: Vec<usize>,
     pub local: rustc_hash::FxHashMap<usize, (Option<Arc<stencil::InlinedCallee>>, usize)>,
     pub max_callee_height: u8,
+    pub max_callee_size: u16,
 }
 
 /// The lowering of one body.

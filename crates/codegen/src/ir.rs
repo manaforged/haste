@@ -636,12 +636,23 @@ impl Function {
 
     /// Whether `FunctionBuilder::inline` can copy this function into a caller: it is no coroutine, catches no unwind and reads no frame pointer.
     pub fn can_inline(&self) -> bool {
-        self.coroutine.is_none() && self.entry.is_some() && !self.insts.iter().any(|data| matches!(data.op, Op::TryCall { .. } | Op::FramePointer))
+        self.coroutine.is_none()
+            && self.entry.is_some()
+            && !self
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .map(|i| &self.insts[i.index()])
+                .any(|data| matches!(data.op, Op::TryCall { .. } | Op::FramePointer))
     }
 
     /// Whether any instruction in this body returns to its caller.
     pub fn has_return(&self) -> bool {
-        self.insts.iter().any(|data| matches!(data.op, Op::Return(_)))
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .map(|i| &self.insts[i.index()])
+            .any(|data| matches!(data.op, Op::Return(_)))
     }
 
     /// For each value, the block that defines it.

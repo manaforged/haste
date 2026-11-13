@@ -83,6 +83,7 @@ pub struct InlinedCallee {
     pub body: Arc<Function>,
     pub returns: bool,
     pub height: u8,
+    pub size: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,6 +105,7 @@ struct InlineTemplate {
     returns: bool,
     reloc_plan: Arc<RelocPlan>,
     height: u8,
+    size: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,7 +121,8 @@ impl CycleState {
     }
 }
 
-const TRANSIENT_CAP: usize = 16_384;
+const TRANSIENT_CAP: usize = 32_768;
+const TRIM_SHARDS: usize = 4;
 const MAX_INLINE_HEIGHT: u8 = 10;
 
 /// Cached inlineable callee stencils and footprints across a compilation.
@@ -127,10 +130,11 @@ const MAX_INLINE_HEIGHT: u8 = 10;
 pub struct Bodies {
     pub(super) plans: Table<(ItemRef, Option<ExprId>), Arc<BodyFootprintPlan>>,
     inlined: Table<usize, Option<Arc<InlinedCallee>>>,
-    inline_meta: Table<usize, Option<(ItemRef, FootprintId, bool, u8)>>,
+    inline_meta: Table<usize, Option<(ItemRef, FootprintId, bool, u8, u16)>>,
     templates: Table<TemplateKey, Option<Arc<InlineTemplate>>>,
     cyclic: RwLock<FxHashMap<usize, CycleState>>,
     transient_entries: AtomicUsize,
+    evict_cursor: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -215,17 +219,33 @@ impl Bodies {
     /// Drops cached inline templates while retaining footprint plans and precomputed cycle entries.
     pub fn clear_transient(&self) {
         self.transient_entries.store(0, Ordering::Relaxed);
+        self.evict_cursor.store(0, Ordering::Relaxed);
         self.inlined.clear();
         self.inline_meta.clear();
         self.templates.clear();
     }
 
-    /// Clears cached inline bodies and templates once transient entries exceed the memory cap.
+    /// Evicts a small round-robin slice of shards once transient entries reach the trim watermark.
     pub(crate) fn trim_transient(&self) {
-        if self.transient_entries.load(Ordering::Relaxed) >= TRANSIENT_CAP
-            && self.transient_entries.swap(0, Ordering::Relaxed) >= TRANSIENT_CAP
-        {
-            self.clear_transient();
+        if self.transient_entries.load(Ordering::Relaxed) < TRANSIENT_CAP / 8 {
+            return;
+        }
+        let start = self.evict_cursor.fetch_add(TRIM_SHARDS, Ordering::Relaxed);
+        let mut removed = 0usize;
+        for offset in 0..TRIM_SHARDS {
+            let shard = (start + offset) % crate::sema::table::SHARDS;
+            removed += self.inlined.clear_shard(shard);
+            removed += self.inline_meta.clear_shard(shard);
+            removed += self.templates.clear_shard(shard);
+        }
+        if removed > 0 {
+            let mut cur = self.transient_entries.load(Ordering::Relaxed);
+            while cur > 0 {
+                match self.transient_entries.compare_exchange_weak(cur, cur.saturating_sub(removed), Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(next) => cur = next,
+                }
+            }
         }
     }
 
@@ -430,9 +450,10 @@ pub fn lower_dict(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, in
     Ok((func, relocs, reloc_plan))
 }
 
-fn record_meta_height(inline: &mut Inline, meta: Option<(ItemRef, FootprintId, bool, u8)>) -> Option<(ItemRef, FootprintId, bool)> {
-    meta.map(|(item, fp, returns, h)| {
+fn record_meta_height(inline: &mut Inline, meta: Option<(ItemRef, FootprintId, bool, u8, u16)>) -> Option<(ItemRef, FootprintId, bool)> {
+    meta.map(|(item, fp, returns, h, sz)| {
         inline.max_callee_height = inline.max_callee_height.max(h);
+        inline.max_callee_size = inline.max_callee_size.max(sz);
         (item, fp, returns)
     })
 }
@@ -440,6 +461,7 @@ fn record_meta_height(inline: &mut Inline, meta: Option<(ItemRef, FootprintId, b
 fn record_callee_height(inline: &mut Inline, callee: Option<Arc<InlinedCallee>>) -> Option<Arc<InlinedCallee>> {
     if let Some(c) = &callee {
         inline.max_callee_height = inline.max_callee_height.max(c.height);
+        inline.max_callee_size = inline.max_callee_size.max(c.size);
     }
     callee
 }
@@ -450,7 +472,7 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
         return Ok((None, usize::MAX));
     }
     if let Some(cached) = bodies.inlined.get(&index) {
-        return Ok((record_meta_height(inline, cached.map(|c| (c.item, c.footprint, c.returns, c.height))), usize::MAX));
+        return Ok((record_meta_height(inline, cached.map(|c| (c.item, c.footprint, c.returns, c.height, c.size))), usize::MAX));
     }
     if let Some(cached) = bodies.inline_meta.get(&index) {
         return Ok((record_meta_height(inline, cached), usize::MAX));
@@ -459,7 +481,7 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
         return Ok((None, pos));
     }
     if let Some((cached, cycle)) = inline.local.get(&index) {
-        let (meta, cyc) = (cached.as_ref().map(|c| (c.item, c.footprint, c.returns, c.height)), *cycle);
+        let (meta, cyc) = (cached.as_ref().map(|c| (c.item, c.footprint, c.returns, c.height, c.size)), *cycle);
         return Ok((record_meta_height(inline, meta), cyc));
     }
     let item = reached.list[index].0.0;
@@ -469,7 +491,7 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
     let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, &quiet));
     inline.stack.pop();
     let (tmpl, cycle) = outcome?;
-    let meta = tmpl.map(|(footprint, t, _)| (item, footprint, t.returns, t.height));
+    let meta = tmpl.map(|(footprint, t, _)| (item, footprint, t.returns, t.height, t.size));
     if cycle > depth && quiet.holds(cx, slots) {
         bodies.bump_transient();
         let stored = bodies.inline_meta.get_or_insert_with(index, || meta);
@@ -506,10 +528,10 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
     inline.stack.pop();
     let (tmpl, cycle) = outcome?;
     let result = match tmpl {
-        Some((footprint, t, Some(relocs))) => Some(Arc::new(InlinedCallee { item, footprint, relocs, reloc_plan: Arc::clone(&t.reloc_plan), body: Arc::clone(&t.body), returns: t.returns, height: t.height })),
+        Some((footprint, t, Some(relocs))) => Some(Arc::new(InlinedCallee { item, footprint, relocs, reloc_plan: Arc::clone(&t.reloc_plan), body: Arc::clone(&t.body), returns: t.returns, height: t.height, size: t.size })),
         Some((footprint, t, None)) => {
             let evaluated = quiet.lowered(slots, eval_relocs(cx, reached, slots, &t.reloc_plan, index))?;
-            evaluated.map(|relocs| Arc::new(InlinedCallee { item, footprint, relocs, reloc_plan: Arc::clone(&t.reloc_plan), body: Arc::clone(&t.body), returns: t.returns, height: t.height }))
+            evaluated.map(|relocs| Arc::new(InlinedCallee { item, footprint, relocs, reloc_plan: Arc::clone(&t.reloc_plan), body: Arc::clone(&t.body), returns: t.returns, height: t.height, size: t.size }))
         }
         None => None,
     };
@@ -551,8 +573,10 @@ type InlineHit = (FootprintId, Arc<InlineTemplate>, Option<RelocVec>);
 
 fn ensure_inline_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<(Option<InlineHit>, usize)> {
     let saved_h = std::mem::replace(&mut inline.max_callee_height, 0);
+    let saved_sz = std::mem::replace(&mut inline.max_callee_size, 0);
     let res = ensure_inline_template_inner(cx, (reached, slots), inline, index, (limit, quiet));
     inline.max_callee_height = saved_h;
+    inline.max_callee_size = saved_sz;
     res
 }
 
@@ -560,6 +584,7 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     let item = reached.list[index].0.0;
     let fp_res = eval_footprint_with_cycle(cx, (reached, slots), inline, index);
     let fp_h = std::mem::replace(&mut inline.max_callee_height, 0);
+    let fp_sz = std::mem::replace(&mut inline.max_callee_size, 0);
     let Some((footprint, fp_cycle)) = quiet.lowered(slots, fp_res)? else { return Ok((None, usize::MAX)) };
     let key = TemplateKey { item, footprint, limit, low: slots.low_entries() };
     if let Some(template) = slots.bodies().templates.get(&key) {
@@ -567,15 +592,20 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     }
     let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
     let ir_h = inline.max_callee_height;
+    let ir_sz = inline.max_callee_size;
     let Some((func, relocs, reloc_plan, ir_cycle)) = quiet.lowered(slots, lowered)? else { return Ok((None, fp_cycle)) };
     let cycle = fp_cycle.min(ir_cycle);
     let base_h = fp_h.max(ir_h);
+    let base_size = fp_sz.max(ir_sz) as usize;
     let mut template = if reloc_plan.has_promoted() {
         None
     } else {
         simplify_inline(func, limit).and_then(|(body, returns)| {
-            let height = if body.size() > 32 { base_h.saturating_add(1) } else { base_h };
-            (height <= MAX_INLINE_HEIGHT).then(|| Arc::new(InlineTemplate { body, returns, reloc_plan, height }))
+            let body_size = body.size();
+            let grew = (base_size == 0 && body_size > 32) || (base_size > 0 && body_size.saturating_sub(base_size) > 16);
+            let height = if grew { base_h.saturating_add(1) } else { base_h };
+            let size = body_size.min(u16::MAX as usize) as u16;
+            (height <= MAX_INLINE_HEIGHT).then(|| Arc::new(InlineTemplate { body, returns, reloc_plan, height, size }))
         })
     };
     let depth = inline.stack.len().saturating_sub(1);
@@ -587,11 +617,11 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
 }
 
 fn simplify_inline(mut func: Function, limit: usize) -> Option<(Arc<Function>, bool)> {
-    if !func.can_inline() {
+    if func.is_coroutine() {
         return None;
     }
     haste_codegen::simplify(&mut func, crate::profile().into());
-    (func.size() <= limit).then(|| {
+    (func.can_inline() && func.size() <= limit).then(|| {
         let returns = func.has_return();
         (Arc::new(func), returns)
     })
