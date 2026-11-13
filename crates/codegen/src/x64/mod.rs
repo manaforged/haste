@@ -5,13 +5,14 @@ mod float;
 mod frame;
 mod location;
 mod int;
+mod vector;
 mod wide;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
 use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs, plan};
-use crate::frame::{Frame, INCOMING, PAGE, edge_moves, layout, saved};
+use crate::frame::{Frame, INCOMING, PAGE, edge_steps, Step, layout, saved};
 
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
@@ -21,23 +22,29 @@ use crate::{Code, Site};
 /// The registers planning hands out: the saved pool, caller-saved registers the emitter never uses as scratch, and the float pool.
 const REGS: Regs<Reg> = Regs {
     saved: &SAVED,
-    leaf: &[Reg::Rdi, Reg::R9, Reg::R8, Reg::R10],
+    leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10],
     wide_scratch: &wide::WIDE_SCRATCH,
+    op_scratch: &[Reg::Rsi],
+    uses_scratch: atomic::uses_rsi,
     dict: Some(Reg::R10),
     float: &float::POOL,
     float_branches: &float::BRANCHES,
     absolute_calls: true,
+    two_address: true,
+    park: true,
 };
 
 /// Encodes `func` as x86-64 machine code.
-pub(crate) fn compile(func: &Function) -> Result<Code, String> {
+pub(crate) fn compile(func: &Function, effort: crate::Effort) -> Result<Code, String> {
     let order = crate::live::order(func);
     let abi = classify(&func.signature)?;
-    let plan = plan(func, &REGS, &order, &abi.params);
-    let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, classify)?;
+    let plan = plan(func, &REGS, (&order, effort == crate::Effort::Full), &abi.params, classify);
+    let frame = layout(func, saved(func, &plan.used, &SAVED), (&plan.locations, &plan.shared, &plan.homed), classify)?;
+    let framed = crate::frame::framed(func, &frame, abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..))));
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    Emit { func, frame, abi, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, features: Features::host() }.run(order)
+    let copied = crate::live::copied_tests(func, &order);
+    Emit { func, frame, framed, abi, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, features: Features::host(), copied }.run(order)
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -80,6 +87,7 @@ pub(super) enum Ext {
 pub(super) struct Emit<'a> {
     func: &'a Function,
     frame: Frame<Reg>,
+    framed: bool,
     abi: Abi,
     asm: Asm,
     blocks: Vec<Label>,
@@ -89,6 +97,7 @@ pub(super) struct Emit<'a> {
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
     features: Features,
+    copied: Vec<bool>,
 }
 
 impl Emit<'_> {
@@ -105,6 +114,11 @@ impl Emit<'_> {
 
     fn block(&mut self, block: Block) -> Result<(), String> {
         self.asm.bind(self.blocks[block.index()]);
+        self.body(block)
+    }
+
+    /// Emits the instructions of `block`, at its label or as a copy in place of a jump to it.
+    fn body(&mut self, block: Block) -> Result<(), String> {
         self.flags = None;
         let func = self.func;
         let insts = &func.blocks[block.index()].insts;
@@ -141,6 +155,9 @@ impl Emit<'_> {
     }
 
     fn prologue(&mut self) {
+        if !self.framed {
+            return;
+        }
         self.asm.push(Reg::Rbp);
         self.asm.mov(Reg::Rbp, Reg::Rsp);
         let size = self.frame.size;
@@ -171,7 +188,7 @@ impl Emit<'_> {
         for (index, reg) in self.frame.saves.iter().enumerate() {
             self.asm.load(Size::Q, *reg, save_slot(index));
         }
-        self.asm.bytes(&[0xC9, 0xC3]);
+        self.asm.bytes(if self.framed { &[0xC9, 0xC3] } else { &[0xC3] });
     }
 
     /// Moves the entry parameters to their locations, those in memory first, so each reads its arrival register before a register location overwrites it.
@@ -196,7 +213,7 @@ impl Emit<'_> {
     fn copy_to(&mut self, to: Mem, from: Mem, ty: Type) {
         self.asm.load(Size::Q, Reg::Rax, from);
         self.asm.store(Size::Q, to, Reg::Rax);
-        if ty == Type::I128 {
+        if ty.bytes() == 16 {
             self.asm.load(Size::Q, Reg::Rax, from.offset(8));
             self.asm.store(Size::Q, to.offset(8), Reg::Rax);
         }
@@ -208,10 +225,13 @@ impl Emit<'_> {
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
         match &data.op {
-            Op::Call { sig, callee, args, results } => self.call(*sig, *callee, args, results),
+            Op::Call { sig, callee, args, results } => self.call(inst, (*sig, *callee), args, results),
             Op::TryCall { sig, callee, args, normal, handler } => self.try_call(*sig, *callee, args, *normal, *handler),
             Op::Jump(block, args) => {
                 self.edge(*block, args)?;
+                if self.copied[inst.index()] {
+                    return self.body(*block);
+                }
                 self.goto(*block, true);
                 Ok(())
             }
@@ -263,7 +283,7 @@ impl Emit<'_> {
 
     /// Whether `a` and `b` live in the same place, so writing one overwrites the other.
     fn same_home(&self, a: Value, b: Value) -> bool {
-        a == b || (self.reg_of(a).is_some() && self.reg_of(a) == self.reg_of(b)) || (self.xmm_of(a).is_some() && self.xmm_of(a) == self.xmm_of(b))
+        a == b || (self.reg_of(a).is_some() && self.reg_of(a) == self.reg_of(b)) || (self.xmm_of(a).is_some() && self.xmm_of(a) == self.xmm_of(b)) || self.frame.shares(&self.plan, a, b)
     }
 
     /// Writes `value` into the location of `param`.
@@ -285,18 +305,12 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
-        let (pairs, clash) = edge_moves(args, &self.func.blocks[block.index()].params, |a, b| self.same_home(a, b));
-        if !clash {
-            for (arg, param) in pairs {
-                self.assign(param, arg);
+        for step in edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.same_home(a, b)) {
+            match step {
+                Step::Move(arg, param) => self.assign(param, arg),
+                Step::Save(arg, index) => self.move_to(Mem::new(Reg::Rbp, self.frame.edge_slot(index)), arg),
+                Step::Restore(index, param) => self.load_home(param, Mem::new(Reg::Rbp, self.frame.edge_slot(index))),
             }
-            return Ok(());
-        }
-        for (index, (arg, _)) in pairs.iter().enumerate() {
-            self.move_to(Mem::new(Reg::Rbp, self.frame.edge_slot(index)), *arg);
-        }
-        for (index, (_, param)) in pairs.iter().enumerate() {
-            self.load_home(*param, Mem::new(Reg::Rbp, self.frame.edge_slot(index)));
         }
         Ok(())
     }
@@ -433,10 +447,24 @@ impl Emit<'_> {
         Ok(abi)
     }
 
-    fn call(&mut self, sig: SigRef, callee: Value, args: &[Value], results: &[Value]) -> Result<(), String> {
+    /// Emits a call; each value parked in a caller-saved register around it is stored to its home first, read from there by the call, and reloaded after it when it lives on.
+    fn call(&mut self, inst: Inst, (sig, callee): (SigRef, Value), args: &[Value], results: &[Value]) -> Result<(), String> {
+        let parked = self.plan.parked_at(inst).to_vec();
+        for &(value, reg, _) in &parked {
+            let home = self.at(value);
+            self.asm.store(Size::Q, home, reg);
+            self.plan.locations[value.index()] = Location::Slot;
+        }
         let abi = self.arguments(sig, callee, args)?;
         for (value, loc) in results.iter().zip(abi.returns) {
             self.store_loc(*value, loc);
+        }
+        for (value, reg, lives) in parked {
+            if lives {
+                let home = self.at(value);
+                self.asm.load(Size::Q, reg, home);
+            }
+            self.plan.locations[value.index()] = Location::Reg(reg);
         }
         Ok(())
     }

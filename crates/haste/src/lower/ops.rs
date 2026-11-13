@@ -3,6 +3,7 @@ use haste_codegen::{FloatCC, IntCC, Type, Value};
 
 use crate::body::literal::{byte_value, char_value, string_bytes};
 use crate::body::{BinOp, Expr, ExprId, Lit, UnOp};
+use crate::host::{HostSymbol, MathSymbol};
 use crate::names::{ItemRef, Primitive};
 use crate::sema::infer::parse_int;
 use crate::sema::infer::{Adjust, Res};
@@ -87,15 +88,12 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn float_const(&mut self, ty: Type, value: f64) -> Result<Value> {
-        let (bits, int) = match ty {
-            Type::F32 => (i64::from((value as f32).to_bits()), Type::I32),
-            Type::F64 => (value.to_bits() as i64, Type::I64),
+        let bits = match ty {
+            Type::F32 => i64::from((value as f32).to_bits()),
+            Type::F64 => value.to_bits() as i64,
             other => bail!("no float constant of {other:?}"),
         };
-        let slot = self.b.create_stack_slot(ty.bytes(), ty.bytes().trailing_zeros() as u8);
-        let bits = self.ins().iconst(int, bits);
-        self.ins().stack_store(bits, slot, 0);
-        Ok(self.ins().stack_load(ty, slot, 0))
+        Ok(self.ins().iconst(ty, bits))
     }
 
     pub(super) fn unary(&mut self, expr: ExprId, op: UnOp, operand: ExprId) -> Result<Option<Value>> {
@@ -244,6 +242,12 @@ impl Lower<'_, '_> {
             BinOp::Sub => self.ins().fsub(x, y),
             BinOp::Mul => self.ins().fmul(x, y),
             BinOp::Div => self.ins().fdiv(x, y),
+            BinOp::Rem => {
+                let ty = self.b.func.ty(x);
+                let fmod = if ty == Type::F32 { MathSymbol::Fmodf32 } else { MathSymbol::Fmodf64 };
+                let Some(value) = self.call_host(HostSymbol::Math(fmod), &[x, y], Some(ty)) else { bail!("float remainder returned no value") };
+                value
+            }
             other => bail!("cannot lower float {other:?} yet"),
         })
     }

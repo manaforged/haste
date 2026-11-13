@@ -19,8 +19,38 @@ pub struct File {
     pub source: Source,
     pub items: Items,
     pub expanded: bool,
-    bodies: OnceLock<Box<[OnceLock<Option<Box<Expansion>>>]>>,
+    bodies: OnceLock<Box<Bodies>>,
     index: OnceLock<Index>,
+}
+
+/// The body expansions that one crate read from a file, then those of the next crate that includes the same file, since a body expands to different paths in a host and a target build of one package.
+#[derive(Debug)]
+struct Bodies {
+    krate: u32,
+    slots: Box<[OnceLock<Option<Box<Expansion>>>]>,
+    next: OnceLock<Box<Bodies>>,
+}
+
+impl Bodies {
+    fn new(krate: u32, items: usize) -> Box<Bodies> {
+        Box::new(Bodies { krate, slots: (0..items).map(|_| OnceLock::new()).collect(), next: OnceLock::new() })
+    }
+
+    fn of(&self, krate: u32) -> Option<&Bodies> {
+        let mut at = self;
+        while at.krate != krate {
+            at = at.next.get()?;
+        }
+        Some(at)
+    }
+
+    fn claim(&self, krate: u32, items: usize) -> &Bodies {
+        let mut at = self;
+        while at.krate != krate {
+            at = at.next.get_or_init(|| Bodies::new(krate, items));
+        }
+        at
+    }
 }
 
 /// The items and imports of a file by name, each list in declaration order.
@@ -32,7 +62,7 @@ pub struct Index {
     pub imports: HashMap<Box<str>, Vec<u32>>,
     /// The glob imports.
     pub globs: Vec<u32>,
-    /// The functions whose tokens hold each import.
+    /// The functions and modules whose tokens hold each import.
     pub holders: Vec<Box<[u32]>>,
 }
 
@@ -56,21 +86,26 @@ impl File {
         self.index.get_or_init(|| build(self))
     }
 
-    /// The expansion of the body of item `item`, once a pass read it and found macro calls or items in it.
-    pub fn expansion(&self, item: u32) -> Option<&Expansion> {
-        self.bodies.get()?.get(item as usize)?.get()?.as_deref()
+    fn body_slot(&self, krate: u32, item: u32) -> Option<&OnceLock<Option<Box<Expansion>>>> {
+        self.bodies.get()?.of(krate)?.slots.get(item as usize)
     }
 
-    /// Whether a pass already read the body of item `item`.
-    pub fn body_read(&self, item: u32) -> bool {
-        self.bodies.get().and_then(|slots| slots.get(item as usize)).is_some_and(|slot| slot.get().is_some())
+    /// The expansion of the body of item `item` in crate `krate`, once a pass read it and found macro calls or items in it.
+    pub fn expansion(&self, krate: u32, item: u32) -> Option<&Expansion> {
+        self.body_slot(krate, item)?.get()?.as_deref()
     }
 
-    /// Records what reading the body of item `item` found, unless a pass already did.
-    pub fn set_expansion(&self, item: u32, found: Option<Box<Expansion>>) {
-        let slots = self.bodies.get_or_init(|| (0..self.items.items.len()).map(|_| OnceLock::new()).collect());
-        if let Some(slot) = slots.get(item as usize) {
-            let _ = slot.set(found);
+    /// Whether a pass already read the body of item `item` in crate `krate`.
+    pub fn body_read(&self, krate: u32, item: u32) -> bool {
+        self.body_slot(krate, item).is_some_and(|slot| slot.get().is_some())
+    }
+
+    /// Records what reading the body of item `item` in crate `krate` found, unless a pass already did.
+    pub fn set_expansion(&self, krate: u32, item: u32, found: Option<Box<Expansion>>) {
+        let items = self.items.items.len();
+        let bodies = self.bodies.get_or_init(|| Bodies::new(krate, items)).claim(krate, items);
+        if let Some(slot) = bodies.slots.get(item as usize) {
+            drop(slot.set(found));
         }
     }
 }
@@ -265,9 +300,19 @@ pub struct Env {
     pub known: bool,
     pub vars: Vec<(String, String)>,
     pub release: bool,
+    /// Whether the crate's sources cannot change while haste runs: the standard library, or a registry or git package.
+    pub fixed: bool,
 }
 
-const PROFILE: [&str; 3] = ["debug_assertions", "overflow_checks", "ub_checks"];
+/// The build profile every crate compiles under: Cargo's dev profile, or its release profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Profile {
+    #[default]
+    Debug,
+    Release,
+}
+
+pub(crate) const PROFILE: [&str; 3] = ["debug_assertions", "overflow_checks", "ub_checks"];
 const RELEASE: [&str; 1] = ["ub_checks"];
 const OFF: [&str; 10] = ["test", "doc", "doctest", "miri", "rustfmt", "clippy", "windows", "wasm", "bootstrap", "docsrs"];
 
@@ -298,15 +343,19 @@ impl Env {
         self.profile().contains(&"overflow_checks")
     }
 
-    /// The profile cfgs that hold: the debug profile, or for a sysroot crate the release build rustc ships, whose UB checks follow the user crate.
+    /// The profile cfgs that hold: none under the release profile, else the debug profile, or for a sysroot crate the release build rustc ships, whose UB checks follow the user crate.
     fn profile(&self) -> &'static [&'static str] {
-        if self.release { &RELEASE } else { &PROFILE }
+        match crate::profile() {
+            Profile::Release => &[],
+            Profile::Debug if self.release => &RELEASE,
+            Profile::Debug => &PROFILE,
+        }
     }
 
     fn name(&self, name: &str) -> Truth {
         if self.target.has_name(name) || self.profile().contains(&name) || self.script.as_ref().is_some_and(|set| set.names.contains(name)) {
             Truth::Yes
-        } else if self.known || OFF.contains(&name) {
+        } else if self.known || OFF.contains(&name) || (crate::profile() == Profile::Release && PROFILE.contains(&name)) {
             Truth::No
         } else {
             Truth::Unknown

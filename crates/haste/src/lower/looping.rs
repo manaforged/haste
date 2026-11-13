@@ -56,13 +56,11 @@ impl Lower<'_, '_> {
         let value = self.expr(inner)?;
         let flow = self.invoke(branch, branch_substs, value.into_iter().collect())?;
         let Some(flow) = self.spill(flow, tried.flow)? else { return self.zero_sized_try(&tried, (from, from_substs)) };
-        let Some(stopped) = self.is_variant(Some(flow), tried.flow, tried.stop)? else { bail!("`?` on a `ControlFlow` with one variant") };
+        let Some(stopped) = self.is_variant(Some(flow), tried.flow, tried.stop)? else { return self.always_stop(Some(flow), &tried, (from, from_substs)) };
         let (stop, proceed) = (self.b.create_block(), self.b.create_block());
         self.brif(stopped, (stop, &[]), (proceed, &[]));
         self.enter(stop);
-        let residual = self.variant_field(flow, tried.flow, (tried.stop, 0))?;
-        let residual = self.read(residual);
-        self.leave_residual(&tried, (from, from_substs), residual.into_iter().collect())?;
+        self.stop_with(Some(flow), &tried, (from, from_substs))?;
         self.enter(proceed);
         let output = self.variant_field(flow, tried.flow, (tried.proceed, 0))?;
         Ok(self.read(output))
@@ -73,10 +71,27 @@ impl Lower<'_, '_> {
         if matches!(self.cx.layout(tried.flow)?.variants, Variants::Single { index } if index.index() == tried.proceed as usize) {
             return Ok(None);
         }
-        self.leave_residual(tried, from, Vec::new())?;
+        self.always_stop(None, tried, from)
+    }
+
+    /// Lowers `?` on a `ControlFlow` at `flow` whose one inhabited variant is `Break`: a return of its residual, after which nothing runs.
+    fn always_stop(&mut self, flow: Option<Place>, tried: &Tried, from: (ItemRef, Substs)) -> Result<Option<Value>> {
+        self.stop_with(flow, tried, from)?;
         let unreachable = self.b.create_block();
         self.enter(unreachable);
         Ok(None)
+    }
+
+    /// Leaves with `FromResidual::from_residual` on the `Break` value of the `ControlFlow` at `flow`.
+    fn stop_with(&mut self, flow: Option<Place>, tried: &Tried, from: (ItemRef, Substs)) -> Result<()> {
+        let residual = match flow {
+            Some(flow) => {
+                let field = self.variant_field(flow, tried.flow, (tried.stop, 0))?;
+                self.read(field)
+            }
+            None => None,
+        };
+        self.leave_residual(tried, from, residual.into_iter().collect())
     }
 
     /// Returns `FromResidual::from_residual` on the `Break` value `residual` from the function, or leaves the `try` block with it.

@@ -103,7 +103,7 @@ fn hash_one_coercion(cx: &mut Context<'_>, reached: &Reached, (key, coercion): (
 fn hash_vtable(cx: &mut Context<'_>, reached: &Reached, vtable: &Vtable, mix: &mut Mix) {
     if let Ok(layout) = cx.layout(vtable.ty) {
         mix.u64(layout.size.bytes());
-        mix.u64(layout.align.abi.bytes());
+        mix.u64(layout.align.bytes());
     }
     hash_vtable_fn(reached, vtable.drop.as_ref(), mix);
     mix.usize(vtable.methods.len());
@@ -251,7 +251,7 @@ fn hash_intrinsic_site(cx: &mut Context<'_>, reached: &Reached, (owner, tag, key
         Intrinsic::TypeName => {
             bins.k.byte(2);
             if let Some(&ty) = substs.first() {
-                let text = cx.type_text(ty, &|t| t);
+                let text = crate::sema::infer::type_name(cx, ty);
                 bins.d.byte(21);
                 bins.d.u64(key);
                 bins.d.bytes(text.as_bytes());
@@ -289,7 +289,7 @@ fn hash_layout_intrinsic(cx: &mut Context<'_>, which: Intrinsic, ty: Option<Ty>,
         }
         (Intrinsic::AlignOf, Some(ty)) => {
             bins.k.byte(5);
-            bins.k.u64(cx.layout(ty).map_or(1, |l| l.align.abi.bytes()));
+            bins.k.u64(cx.layout(ty).map_or(1, |l| l.align.bytes()));
         }
         (Intrinsic::NeedsDrop, Some(ty)) => {
             bins.k.byte(6);
@@ -326,6 +326,13 @@ fn simd_op_code(op: Simd) -> (u8, u8) {
         Simd::Select => (12, 0),
         Simd::SelectBitmask => (13, 0),
         Simd::Sqrt => (14, 0),
+        Simd::Fold(bin) => (15, bin as u8),
+        Simd::Unary(op) => (16, op as u8),
+        Simd::Pair(op) => (17, op as u8),
+        Simd::Fma => (18, 0),
+        Simd::Sum { mul } => (19, u8::from(mul)),
+        Simd::MaskedLoad => (20, 0),
+        Simd::MaskedStore => (21, 0),
     }
 }
 

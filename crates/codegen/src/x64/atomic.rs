@@ -1,6 +1,7 @@
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
+use super::float::X1;
 use super::{Emit, Ext};
-use crate::ir::{AtomicRmwOp, Op, StackSlot, Type, Value};
+use crate::ir::{AtomicRmwOp, Binary, Function, Op, StackSlot, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
@@ -8,9 +9,25 @@ const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
 /// Scratch registers an inline copy holds its chunks in; none of them forms an address.
 const COPY_SCRATCH: [Reg; 4] = [Reg::Rax, Reg::Rdx, Reg::R11, Reg::Rsi];
 
+/// The bytes a move copies through one xmm register at a time.
+const VECTOR: u32 = 16;
+
+/// The opcodes of `movups` from memory into an xmm register, and from an xmm register into memory.
+const MOVUPS: ([u8; 2], [u8; 2]) = ([0x0F, 0x10], [0x0F, 0x11]);
+
+/// Whether `op` of `func` uses rsi as scratch: a copy of a constant size, a compare-exchange or read-modify-write, a population count, or a 128-bit shift or rotate.
+pub(super) fn uses_rsi(func: &Function, op: &Op) -> bool {
+    match op {
+        Op::Copy(..) | Op::AtomicCas(..) | Op::AtomicRmw(..) | Op::Unary(Unary::Popcnt, _) => true,
+        Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, x, _) => func.ty(*x) == Type::I128,
+        _ => false,
+    }
+}
+
 impl Emit<'_> {
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
+            Op::Const(_) if result().is_ok_and(|result| self.ty(result) == Type::V128) => self.vector_zero(result()?),
             Op::Const(imm) => {
                 let result = result()?;
                 if !self.is_static(result) {
@@ -43,6 +60,7 @@ impl Emit<'_> {
                 self.put(result, dst);
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
+            Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Sha256Rounds(..) => self.vector_op(op, result()?)?,
             _ => return self.access(op, result),
         }
         Ok(())
@@ -68,6 +86,7 @@ impl Emit<'_> {
             Op::Fence => self.asm.bytes(&MFENCE),
             Op::FramePointer => self.put(result()?, Reg::Rbp),
             Op::Copy(to, from, bytes) => self.copy(*to, *from, *bytes)?,
+            Op::Move(to, from, bytes) => self.move_bytes(*to, *from, *bytes),
             _ => return self.atomic(op, result),
         }
         Ok(())
@@ -93,6 +112,22 @@ impl Emit<'_> {
             self.asm.store(Size::of(width), target.offset(offset as i32), reg);
         }
         Ok(())
+    }
+
+    /// Copies `bytes` bytes between two ranges that are the same or disjoint: 16 at a time through xmm1, then word by word through rax; r11 and rcx hold addresses.
+    fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
+        let source = self.address_in(from, 0, Reg::R11);
+        let target = self.address_in(to, 0, Reg::Rcx);
+        let whole = bytes / VECTOR * VECTOR;
+        for at in (0..whole).step_by(VECTOR as usize) {
+            self.asm.sse(&[], &MOVUPS.0, X1.0, source.offset(at as i32));
+            self.asm.sse(&[], &MOVUPS.1, X1.0, target.offset(at as i32));
+        }
+        for (ty, at) in crate::copy::words(bytes - whole) {
+            let at = (whole + at) as i32;
+            self.asm.load(Size::of(ty.bytes()), Reg::Rax, source.offset(at));
+            self.asm.store(Size::of(ty.bytes()), target.offset(at), Reg::Rax);
+        }
     }
 
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
@@ -136,7 +171,7 @@ impl Emit<'_> {
 
     fn read(&mut self, result: Value, from: Mem) {
         let ty = self.ty(result);
-        if ty.is_float() {
+        if ty.in_float_register() {
             let dst = self.fdst(result);
             self.xmm_load(ty, dst, from);
             self.fput(result, dst);
@@ -156,9 +191,14 @@ impl Emit<'_> {
 
     fn write(&mut self, value: Value, to: Mem) {
         let ty = self.ty(value);
-        if ty.is_float() {
+        if ty.in_float_register() {
             let source = self.fin(value, Xmm(0));
             self.xmm_store(ty, to, source);
+            return;
+        }
+        let size = Size::of(ty.bytes());
+        if let Some(imm) = self.const_of(value).and_then(|imm| if ty.bytes() < 8 { Some(imm as i32) } else { i32::try_from(imm).ok() }) {
+            self.asm.store_imm_sized(size, to, imm);
             return;
         }
         let source = self.reg_of(value).unwrap_or(Reg::Rax);
@@ -169,7 +209,7 @@ impl Emit<'_> {
             self.asm.store(Size::Q, to.offset(8), Reg::Rax);
             return;
         }
-        self.asm.store(Size::of(ty.bytes()), to, source);
+        self.asm.store(size, to, source);
     }
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {

@@ -26,10 +26,7 @@ pub(super) fn parts(layout: &Layout) -> Result<Parts> {
     let dl = target()?;
     Ok(match &layout.backend_repr {
         BackendRepr::Scalar(scalar) => Parts::One(scalar_type(dl, scalar)?),
-        BackendRepr::ScalarPair(first, second) => {
-            let offset = first.size(dl).align_to(second.align(dl).abi).bytes() as i32;
-            Parts::Pair(scalar_type(dl, first)?, scalar_type(dl, second)?, offset)
-        }
+        BackendRepr::ScalarPair { a, b, b_offset } => Parts::Pair(scalar_type(dl, a)?, scalar_type(dl, b)?, b_offset.bytes() as i32),
         _ => Parts::Bytes,
     })
 }
@@ -37,7 +34,7 @@ pub(super) fn parts(layout: &Layout) -> Result<Parts> {
 /// The parts that a typed copy of a value of `layout` moves: its scalars, or every byte when both scalars are a union's, whose bytes between them may hold data.
 pub(super) fn copied_parts(layout: &Layout) -> Parts {
     match &layout.backend_repr {
-        BackendRepr::ScalarPair(Scalar::Union { .. }, Scalar::Union { .. }) => Parts::Bytes,
+        BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => Parts::Bytes,
         _ => parts(layout).unwrap_or(Parts::Bytes),
     }
 }

@@ -3,11 +3,19 @@ set -u
 cd "$(dirname "$0")/.."
 source scripts/cargo.sh
 dir="${1:-tests/diff}"
-rustc_side=$(run_cargo run --quiet --manifest-path $dir/Cargo.toml </dev/null 2>/dev/null | grep '^case_' | sort)
-engine_all=$(run_cargo run --quiet --release -p haste -- test $dir </dev/null 2>&1); finished='^cases '
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+run_manifest "$dir" </dev/null >"$tmp/rustc.out" 2>"$tmp/rustc.err" &
+pid_rustc=$!
+(build_haste && run_haste test "$dir") </dev/null >"$tmp/engine" 2>&1 &
+pid_engine=$!
+wait "$pid_rustc"
+wait "$pid_engine"
+rustc_side=$(grep '^case_' "$tmp/rustc.out" | sort)
+engine_all=$(cat "$tmp/engine"); finished='^cases '
 engine_side=$(printf '%s\n' "$engine_all" | grep '^case_' | sort)
 printf '%s\n' "$engine_all" | grep -E "$finished" | cut -c1-200
-[ -n "$rustc_side" ] || { echo "no rustc output"; run_cargo run --quiet --manifest-path $dir/Cargo.toml </dev/null 2>&1 | grep -E '^error|panicked' -A4 | head -20 | cut -c1-160; exit 2; }
+[ -n "$rustc_side" ] || { echo "no rustc output"; cat "$tmp/rustc.err" "$tmp/rustc.out" | grep -E '^error|panicked' -A4 | head -20 | cut -c1-160; exit 2; }
 [ -n "$engine_all" ] || { echo "engine did not build or start"; exit 2; }
 printf '%s\n' "$engine_all" | grep -q "$finished" || { printf '%s\n' "$engine_all" | grep '^stub ' | tail -4 | cut -c1-220; echo "died at: $(printf '%s\n' "$engine_all" | grep '^running ' | tail -1)"; exit 1; }
 wrong=$(comm -13 <(printf '%s\n' "$rustc_side") <(printf '%s\n' "$engine_side"))

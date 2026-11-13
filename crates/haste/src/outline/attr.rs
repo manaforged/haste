@@ -3,9 +3,10 @@ use rustc_lexer::TokenKind;
 
 use super::item::{Attr, mark};
 use super::source::{Source, opens};
+use super::tree::{Env, Truth};
 use crate::graph::cfg;
 
-/// The top-level comma-separated ranges of tokens in `from..to`, where the generic arguments of a `::<...>` turbofish nest like a group.
+/// The top-level comma-separated ranges of tokens in `from..to`, where the generic arguments of a `::<...>` turbofish and a qualified path `<...>` that starts a part nest like a group.
 pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
     let mut parts = Vec::new();
     let (mut start, mut at, mut angles) = (from, from, 0u32);
@@ -15,7 +16,7 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
                 parts.push((start, at));
                 start = at + 1;
             }
-            TokenKind::Lt if angles > 0 || turbofish(src, at) => angles += 1,
+            TokenKind::Lt if angles > 0 || at == start || turbofish(src, at) => angles += 1,
             TokenKind::Gt if angles > 0 && !(src.kind(at - 1) == TokenKind::Minus && src.joint(at - 1)) => angles -= 1,
             kind if opens(kind) => at = src.pair(at),
             _ => {}
@@ -26,6 +27,19 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
         parts.push((start, to));
     }
     parts
+}
+
+/// The first token of each word of every `#[repr(..)]` among `attrs`, written directly or through a `cfg_attr` that holds under `env`.
+pub fn repr_words(src: &Source, attrs: &[Attr], env: &Env) -> Vec<u32> {
+    let mut words = Vec::new();
+    for attr in attrs {
+        match attr {
+            Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => words.extend(repr_words(src, inner, env)),
+            &Attr::Other(at) if src.text(at) == "repr" && src.kind(at + 1) == TokenKind::OpenParen => words.extend(split_commas(src, at + 2, src.pair(at + 1)).into_iter().map(|(from, _)| from)),
+            _ => {}
+        }
+    }
+    words
 }
 
 fn turbofish(src: &Source, at: u32) -> bool {

@@ -22,7 +22,7 @@ impl Lower<'_, '_> {
             (SizeOfVal | AlignOfVal, Some(ty), &[pointer]) => self.value_layout(which == SizeOfVal, ty, pointer).map(Some),
             (NeedsDrop | TypeId, Some(ty), _) => self.type_fact(which, ty).map(Some),
             (TypeName, Some(ty), _) => {
-                let name = self.cx.type_text(ty, &|ty| ty);
+                let name = crate::sema::infer::type_name(self.cx, ty);
                 let id = self.slots.rodata(name.as_bytes(), &[]);
                 let data = self.emit_symbol(SymbolSource::Rodata(id));
                 let len = self.emit_symbol(SymbolSource::Word(name.len() as u64));
@@ -119,7 +119,7 @@ impl Lower<'_, '_> {
 
     fn layout_const(&mut self, which: Intrinsic, ty: Ty) -> Result<Value> {
         let layout = self.cx.layout(ty)?;
-        let value = if which == Intrinsic::SizeOf { layout.size.bytes() } else { layout.align.abi.bytes() };
+        let value = if which == Intrinsic::SizeOf { layout.size.bytes() } else { layout.align.bytes() };
         Ok(self.ins().iconst(Type::I64, value as i64))
     }
 
@@ -153,7 +153,7 @@ impl Lower<'_, '_> {
         let Some((index, &field)) = fields.first().and_then(|fields| fields.iter().enumerate().last()) else { bail!("an unsized struct with no fields") };
         let offset = crate::sema::layout::field_offset(&layout, 0, index as u32);
         let field_align = self.value_layout(false, field, pointer)?;
-        let own_align = self.ins().iconst(Type::I64, layout.align.abi.bytes() as i64);
+        let own_align = self.ins().iconst(Type::I64, layout.align.bytes() as i64);
         let wider = self.ins().icmp(IntCC::UnsignedGreaterThan, own_align, field_align);
         let align = self.ins().select(wider, own_align, field_align);
         if !size {

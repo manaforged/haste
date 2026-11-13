@@ -33,7 +33,7 @@ fn stamp(paths: &Paths<'_>, target: Def) -> Option<(Def, u32)> {
 const NAMESPACES: [Ns; 3] = [Ns::Types, Ns::Values, Ns::Macros];
 
 /// Whether a name of visibility `vis` declared in module `home` is visible to module `importer`.
-pub(super) fn visible(paths: &Paths<'_>, vis: Vis, home: ModRef, importer: ModRef) -> bool {
+pub(crate) fn visible(paths: &Paths<'_>, vis: Vis, home: ModRef, importer: ModRef) -> bool {
     match vis {
         Vis::Pub => true,
         _ if home.krate != importer.krate => false,

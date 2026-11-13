@@ -11,6 +11,8 @@ pub enum Type {
     I128,
     F32,
     F64,
+    /// Sixteen bytes held in one vector register.
+    V128,
 }
 
 impl Type {
@@ -21,7 +23,7 @@ impl Type {
             Type::I16 => 2,
             Type::I32 | Type::F32 => 4,
             Type::I64 | Type::F64 => 8,
-            Type::I128 => 16,
+            Type::I128 | Type::V128 => 16,
         }
     }
 
@@ -33,6 +35,11 @@ impl Type {
     /// Whether the type holds a floating-point number.
     pub fn is_float(self) -> bool {
         matches!(self, Type::F32 | Type::F64)
+    }
+
+    /// Whether a value of the type lives in a float register when it has one.
+    pub fn in_float_register(self) -> bool {
+        self.is_float() || self == Type::V128
     }
 
     /// Whether the type holds an integer that fits in one general-purpose register.
@@ -166,6 +173,38 @@ impl IntCC {
     }
 }
 
+/// A comparison of the sixteen bytes of two vectors, giving a byte of all ones where it holds and of zeros where it does not.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum ByteCC {
+    Equal,
+    SignedGreaterThan,
+}
+
+/// An x64 instruction on two 128-bit vectors that computes in place into the first.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum VectorOp {
+    ByteShuffle,
+    AddBytes,
+    AddWords,
+    AddDwords,
+    AddQwords,
+    SubBytes,
+    SubWords,
+    SubDwords,
+    SubQwords,
+    Sha1NextE,
+    Sha1Msg1,
+    Sha1Msg2,
+    Sha256Msg1,
+    Sha256Msg2,
+    AesEnc,
+    AesEncLast,
+    AesDec,
+    AesDecLast,
+}
+
 /// A floating-point comparison; every one but `NotEqual` is false when an operand is NaN.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
@@ -195,7 +234,7 @@ pub enum AtomicRmwOp {
     Smax,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub(crate) enum Unary {
     Ineg,
@@ -213,7 +252,7 @@ pub(crate) enum Unary {
     Trunc,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub(crate) enum Binary {
     Iadd,
@@ -243,7 +282,7 @@ pub(crate) enum Binary {
     Fcopysign,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub(crate) enum Convert {
     Uextend,
@@ -270,6 +309,16 @@ pub(crate) enum Op {
     /// 1 when `x op y` (add, sub or mul, signed when the flag is set) fits the type of `x`, else 0.
     Fits(Binary, bool, Value, Value),
     Fcmp(FloatCC, Value, Value),
+    /// The sixteen byte comparisons of two vectors.
+    ByteCmp(ByteCC, Value, Value),
+    /// The vector whose sixteen bytes are all the byte in the value.
+    Splat(Value),
+    /// The 32-bit integer whose bit `i` is the top bit of byte `i` of the vector, for `i` below 16, and whose other bits are zero.
+    Movemask(Value),
+    /// The x64 vector instruction on two vectors.
+    Vector(VectorOp, Value, Value),
+    /// Two SHA-256 rounds (`sha256rnds2`) on the state vectors in the first two values with the message and constants in the third.
+    Sha256Rounds(Value, Value, Value),
     Select(Value, Value, Value),
     Load(Value, i32),
     Store(Value, Value, i32),
@@ -284,6 +333,8 @@ pub(crate) enum Op {
     FramePointer,
     /// Copies the number of bytes in the third value from the address in the second to the address in the first; the two may overlap.
     Copy(Value, Value, Value),
+    /// Copies a value of this many bytes from the address in the second value to the address in the first; the two ranges are the same or disjoint.
+    Move(Value, Value, u32),
     Call { sig: SigRef, callee: Value, args: Vec<Value>, results: Vec<Value> },
     TryCall { sig: SigRef, callee: Value, args: Vec<Value>, normal: Block, handler: Block },
     Jump(Block, Vec<Value>),
@@ -329,12 +380,12 @@ impl Op {
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
-            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) => {
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Splat(x) | Op::Movemask(x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
+            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::ByteCmp(_, x, y) | Op::Vector(_, x, y) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
                 f(*x);
                 f(*y);
             }
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::Sha256Rounds(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
                 f(*c);
                 f(*x);
                 f(*y);
@@ -355,20 +406,23 @@ impl Op {
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Splat(x) | Op::Movemask(x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
                 *x = f(*x);
             }
             Op::Binary(_, x, y)
             | Op::Icmp(_, x, y)
             | Op::Fits(_, _, x, y)
             | Op::Fcmp(_, x, y)
+            | Op::ByteCmp(_, x, y)
+            | Op::Vector(_, x, y)
             | Op::Store(x, y, _)
             | Op::AtomicStore(x, y)
-            | Op::AtomicRmw(_, x, y) => {
+            | Op::AtomicRmw(_, x, y)
+            | Op::Move(x, y, _) => {
                 *x = f(*x);
                 *y = f(*y);
             }
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::Sha256Rounds(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
                 *c = f(*c);
                 *x = f(*x);
                 *y = f(*y);
@@ -433,6 +487,12 @@ impl Function {
     pub(crate) fn value(&mut self, ty: Type) -> Value {
         self.types.push(ty);
         Value(self.types.len() as u32 - 1)
+    }
+
+    /// A new instruction outside every block that runs `op` and defines `result`.
+    pub(crate) fn add(&mut self, op: Op, result: Option<Value>) -> Inst {
+        self.insts.push(InstData { op, result });
+        Inst(self.insts.len() as u32 - 1)
     }
 
     /// The operation of the last instruction of `block`.

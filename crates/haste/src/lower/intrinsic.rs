@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
-use haste_codegen::{FloatCC, IntCC, Type, Value};
+use haste_codegen::{AbiParam, CallConv, FloatCC, IntCC, Signature, Type, Value};
 
 use crate::body::BinOp;
+use crate::host::HostSymbol;
 use crate::names::Primitive;
 use crate::sema::intrinsic::Intrinsic;
 use crate::sema::ty::{Kind, Ty};
@@ -32,11 +33,24 @@ impl Lower<'_, '_> {
             }
             Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
             Intrinsic::CallerLocation => self.caller_location().map(Some),
-            Intrinsic::Cpuid => Ok(Some(self.no_cpuid())),
+            Intrinsic::Cpuid => self.cpuid(args).map(Some),
+            Intrinsic::FnAddr => Ok(args.first().copied()),
             Intrinsic::BytePermute(bytes) => self.byte_permute(args, bytes).map(Some),
             Intrinsic::BytePairMax => self.byte_pair_max(args).map(Some),
+            Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
             _ => self.memory_intrinsic(which, substs, args),
         }
+    }
+
+    /// Calls the host function `host` in the platform convention with `args`, and returns its result of machine type `ret`.
+    pub(super) fn call_host(&mut self, host: HostSymbol, args: &[Value], ret: Option<Type>) -> Option<Value> {
+        let code = self.emit_symbol(SymbolSource::Host(host));
+        let mut signature = Signature::new(CallConv::Native);
+        signature.params.extend(args.iter().map(|&arg| AbiParam::new(self.b.func.ty(arg))));
+        signature.returns.extend(ret.map(AbiParam::new));
+        let sig = self.b.import_signature(signature);
+        let call = self.ins().call_indirect(sig, code, args);
+        self.b.inst_results(call).first().copied()
     }
 
     fn caller_location(&mut self) -> Result<Value> {
@@ -70,13 +84,12 @@ impl Lower<'_, '_> {
         Ok(self.ins().iconst(Type::I32, 0))
     }
 
-    fn no_cpuid(&mut self) -> Value {
+    fn cpuid(&mut self, args: &[Value]) -> Result<Value> {
+        let &[leaf, sub_leaf] = args else { bail!("`__cpuid_count` takes a leaf and a subleaf") };
         let slot = self.b.create_stack_slot(16, 3);
-        let zero = self.ins().iconst(Type::I64, 0);
-        for offset in [0, 8] {
-            self.ins().stack_store(zero, slot, offset);
-        }
-        self.ins().stack_addr(Type::I64, slot, 0)
+        let out = self.ins().stack_addr(Type::I64, slot, 0);
+        self.call_host(HostSymbol::Cpuid, &[out, leaf, sub_leaf], None);
+        Ok(out)
     }
 
     fn transmute(&mut self, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
@@ -185,7 +198,7 @@ impl Lower<'_, '_> {
         self.resize(value, (ty, false), Type::I32)
     }
 
-    fn saturating(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
+    pub(super) fn saturating(&mut self, op: BinOp, (ty, signed): (Type, bool), x: Value, y: Value) -> Result<Value> {
         let (result, ok) = self.overflowing(op, (ty, signed), x, y)?;
         let bound = match (op, signed) {
             (BinOp::Add, false) => self.int_const(ty, u128::MAX),

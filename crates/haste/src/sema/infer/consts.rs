@@ -587,7 +587,7 @@ impl<'a> Infer<'_, 'a> {
         };
         match self.cx.intrinsic(item) {
             Some(Intrinsic::SizeOf) => Ok((u128::from(layout_of(self)?.size.bytes()), Some(USIZE))),
-            Some(Intrinsic::AlignOf) => Ok((u128::from(layout_of(self)?.align.abi.bytes()), Some(USIZE))),
+            Some(Intrinsic::AlignOf) => Ok((u128::from(layout_of(self)?.align.bytes()), Some(USIZE))),
             Some(other) => bail!("the intrinsic {other:?} in a constant is not evaluated yet"),
             None => self.const_body(item, &substs, (&values, want)),
         }

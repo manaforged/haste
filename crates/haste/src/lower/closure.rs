@@ -117,6 +117,9 @@ impl Lower<'_, '_> {
         if self.by_impl(expr, (item, substs)) || !item_value && first.is_some_and(|ty| matches!(self.cx.types.kind(ty), Kind::Dyn(..))) {
             return self.object_call((expr, callee), (item, substs), args);
         }
+        if self.typed.autoderefs.get(&expr) == Some(&1) && self.cx.boxed(self.ty_of(callee)).is_some_and(|inner| self.cx.closure_consumes(inner)) {
+            return self.boxed_closure_call((expr, callee), (item, substs), args);
+        }
         if self.typed.autoderefs.contains_key(&expr) {
             let values = self.pointed_env(expr, callee)?;
             let values = self.args(args, values)?;
@@ -145,8 +148,11 @@ impl Lower<'_, '_> {
 
     /// Lowers the body of `Fn::call` or `FnMut::call_mut` at a closure: the call `res` of the closure's body with the fields of the argument tuple.
     pub(super) fn untuple_call(&mut self, res: Res) -> Result<Option<Value>> {
-        let Res::Fn(item, substs) = res else { bail!("a closure trait call that calls no function") };
-        let tuple = self.typed.locals[self.typed.params[1] as usize].ty;
+        let (item, substs) = match res {
+            Res::Fn(item, substs) => (item, substs),
+            Res::Local(_) => return self.pointer_untuple_call(),
+            _ => bail!("a closure trait call that calls no function"),
+        };
         let mut values = Vec::new();
         let first = self.cx.types.substs(substs).first().copied();
         if self.cx.call_once() == Some(item) && first.is_some_and(|ty| self.cx.closure_takes_env(ty)) {
@@ -154,16 +160,32 @@ impl Lower<'_, '_> {
             values.extend(self.read(receiver));
             self.moved_out(Root::Local(self.typed.params[0]), &[])?;
         }
+        values.extend(self.untupled()?.1);
+        self.invoke(item, substs, values)
+    }
+
+    /// Lowers the body of a call trait method at a function pointer: a call of the pointer that the receiver points at, with the fields of the argument tuple.
+    fn pointer_untuple_call(&mut self) -> Result<Option<Value>> {
+        let Some(address) = self.locals[self.typed.params[0] as usize].and_then(|place| self.read(place)) else { bail!("a function pointer call with no pointer") };
+        let code = self.ins().load(Type::I64, address, 0);
+        let (params, values) = self.untupled()?;
+        self.call_code(code, (params, self.typed.ret), values)
+    }
+
+    /// The types of the fields of the argument tuple parameter of a call trait method, and their values, which then count as moved.
+    fn untupled(&mut self) -> Result<(Vec<Ty>, Vec<Value>)> {
+        let tuple = self.typed.locals[self.typed.params[1] as usize].ty;
         let Kind::Tuple(items) = *self.cx.types.kind(tuple) else { bail!("closure arguments that are not a tuple") };
-        let len = self.cx.types.substs(items).len() as u32;
+        let types = self.cx.types.substs(items).to_vec();
+        let mut values = Vec::new();
         if let Some(args) = self.locals[self.typed.params[1] as usize] {
-            for index in 0..len {
+            for index in 0..types.len() as u32 {
                 let part = self.part_place(args, tuple, (0, index))?;
                 values.extend(self.read(part));
             }
             self.moved_out(Root::Local(self.typed.params[1]), &[])?;
         }
-        self.invoke(item, substs, values)
+        Ok((types, values))
     }
 
     fn object_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Substs), args: List) -> Result<Option<Value>> {
@@ -232,6 +254,22 @@ impl Lower<'_, '_> {
         self.moved_out(root, &path)?;
         let target = self.address(boxed);
         self.invoke(free, free_substs, vec![target])?;
+        Ok(result)
+    }
+
+    /// Lowers the call of a `Box` of a closure that consumes itself: the closure runs on its captures inside the box, and then the box frees its memory and counts as moved.
+    fn boxed_closure_call(&mut self, (expr, callee): (ExprId, ExprId), (item, substs): (ItemRef, Substs), args: List) -> Result<Option<Value>> {
+        let Some((root, path)) = self.scrutinee_path(callee) else { bail!("calling a `Box` of a closure that no local owns is not supported yet") };
+        let boxed = self.ty_of(callee);
+        let Some(Res::Fn(free, free_substs)) = crate::sema::infer::drop_fn(self.cx, boxed)? else { bail!("`Box` has no `Drop` impl") };
+        let Some(owner) = self.place_or_temp(callee)? else { return Ok(None) };
+        let Some((place, closure)) = self.deref_step((expr, 0), Some(owner), boxed)? else { return Ok(None) };
+        let env = if self.cx.closure_takes_env(closure) { vec![self.address(place)] } else { Vec::new() };
+        let values = self.args(args, env)?;
+        let result = self.invoke(item, substs, values)?;
+        let target = self.address(owner);
+        self.invoke(free, free_substs, vec![target])?;
+        self.moved_out(root, &path)?;
         Ok(result)
     }
 

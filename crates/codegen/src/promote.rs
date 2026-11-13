@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, Op, StackSlot, Type, Value};
+use crate::split::{End, Layouts};
 
 /// One promoted place: the bytes at `offset` in `slot`, read and written at one or more integer widths.
 struct Var {
@@ -132,6 +133,9 @@ impl Scan {
 
     fn classify(&mut self, func: &Function, block: Block, inst: Inst) {
         let data = &func.insts[inst.index()];
+        if matches!(data.op, Op::Move(..)) {
+            return;
+        }
         let mut skip = [None, None];
         if let Some(touch) = self.touch(data) {
             skip[0] = touch.addr;
@@ -187,6 +191,41 @@ impl Scan {
         };
         self.vars[var].add(ty, matches!(kind, Kind::Store(_)));
         self.accesses.push(Access { block: at.0, inst: at.1, var, kind, ty });
+    }
+
+    /// The slot and offset `addr` points into, when it is a slot address.
+    fn end(&self, addr: Value) -> End {
+        self.addrs[addr.index()].map(|(slot, offset)| (slot.index(), offset))
+    }
+
+    /// The layouts the accesses give each slot, spread through the moves of `func`.
+    fn layouts(&self, func: &Function) -> Layouts {
+        let accesses = self.accesses.iter().map(|access| (self.vars[access.var].slot.index(), self.vars[access.var].offset, access.ty));
+        let mut layouts = Layouts::new(func.slots.len(), accesses);
+        let moves: Vec<(End, End, u32)> = func.blocks.iter().flat_map(|block| &block.insts).filter_map(|inst| match func.insts[inst.index()].op {
+            Op::Move(to, from, bytes) => Some((self.end(to), self.end(from), bytes)),
+            _ => None,
+        }).collect();
+        layouts.spread(&moves);
+        layouts
+    }
+
+    /// Marks as escaped every slot a move that stayed whole reads or writes, since promotion would drop the stores it reads and miss the bytes it writes.
+    fn pin_moves(&mut self, func: &Function) {
+        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+            if let Op::Move(to, from, _) = func.insts[inst.index()].op {
+                for addr in [to, from] {
+                    if let Some((slot, _)) = self.addrs[addr.index()] {
+                        self.escaped[slot.index()] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `addr` is the address of a slot that nothing but moves lets escape.
+    fn open(&self, addr: Value) -> bool {
+        self.addrs[addr.index()].is_some_and(|(slot, _)| !self.escaped[slot.index()])
     }
 
     fn promotable(&self, slot: usize) -> bool {
@@ -577,34 +616,56 @@ fn push_edge_arg(func: &mut Function, pred: Block, target: Block, arg: Value) {
     }
 }
 
-fn push_inst(func: &mut Function, op: Op, result: Value) -> Inst {
-    func.insts.push(InstData { op, result: Some(result) });
-    Inst(func.insts.len() as u32 - 1)
-}
-
 fn materialize(func: &mut Function, zeros: &[(Type, Value)]) -> Vec<Inst> {
     let mut insts = Vec::new();
     for &(ty, value) in zeros {
         if ty != Type::I128 {
-            insts.push(push_inst(func, Op::Const(0), value));
+            insts.push(func.add(Op::Const(0), Some(value)));
             continue;
         }
         let half = func.value(Type::I64);
-        insts.push(push_inst(func, Op::Const(0), half));
-        insts.push(push_inst(func, Op::Binary(Binary::Iconcat, half, half), value));
+        insts.push(func.add(Op::Const(0), Some(half)));
+        insts.push(func.add(Op::Binary(Binary::Iconcat, half, half), Some(value)));
     }
     insts
 }
 
-/// Promotes every stack slot whose address never escapes into SSA values carried in block parameters.
-pub(crate) fn run(func: &mut Function) {
+/// Which moves promotion splits into pieces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moves {
+    /// Every move that touches a slot only moves let escape.
+    Split,
+    /// Those of them that an access of either end gives a layout for; a body kept for copying leaves the others whole for the caller, which may know how their bytes are read.
+    Guided,
+    /// Every move that touches a slot only moves let escape, into words, without reading layouts.
+    Words,
+}
+
+/// Promotes every stack slot whose address never escapes into SSA values carried in block parameters, first splitting into pieces each move that `moves` splits and that touches a slot only moves let escape.
+pub(crate) fn run(func: &mut Function, moves: Moves) {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
         return;
     };
-    let scan = Scan::new(func);
-    if !(0..func.slots.len()).any(|slot| scan.promotable(slot)) {
-        return;
+    let mut scan = Scan::new(func);
+    let mut splits = Vec::new();
+    if func.insts.iter().any(|data| matches!(data.op, Op::Move(to, from, _) if scan.open(to) || scan.open(from))) {
+        let layouts = (moves != Moves::Words).then(|| scan.layouts(func));
+        let pieces = |to: Value, from: Value, bytes: u32| match layouts.as_ref().and_then(|layouts| layouts.pieces(scan.end(to), scan.end(from), bytes)) {
+            None if moves != Moves::Guided => Some(crate::copy::words(bytes)),
+            guided => guided,
+        };
+        splits = crate::copy::expand(func, |to, from, bytes| if scan.open(to) || scan.open(from) { pieces(to, from, bytes) } else { None });
+        scan = Scan::new(func);
+        scan.pin_moves(func);
     }
+    if (0..func.slots.len()).any(|slot| scan.promotable(slot)) {
+        promote(func, entry, scan);
+    }
+    crate::copy::rejoin(func, &splits);
+}
+
+/// Promotes every promotable slot `scan` found.
+fn promote(func: &mut Function, entry: Block, scan: Scan) {
     let local = Local::new(&scan);
     let count = func.types.len();
     let fresh = Fresh { base: count, types: Vec::new(), zeros: Vec::new() };

@@ -9,7 +9,7 @@ mod wide;
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, classify};
 use crate::alloc::{Location, Plan, Regs, plan};
-use crate::frame::{Frame, INCOMING, PAGE, edge_moves, layout, saved};
+use crate::frame::{Frame, INCOMING, PAGE, edge_steps, Step, layout, saved};
 use crate::ir::{Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::reloc::{DictTierUp, StencilReloc};
 use crate::target::{Os, Target};
@@ -30,18 +30,19 @@ const V1: Vreg = Vreg(1);
 const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
 
 /// The registers planning hands out: the saved pool, and caller-saved registers that are neither scratch, return registers nor the indirect-result register.
-const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)], wide_scratch: &WIDE_SCRATCH, dict: None, float: &[], float_branches: &[], absolute_calls: false };
+const REGS: Regs<Reg> = Regs { saved: &SAVED, leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)], wide_scratch: &WIDE_SCRATCH, op_scratch: &[], uses_scratch: crate::alloc::no_scratch, dict: None, float: &[], float_branches: &[], absolute_calls: false, two_address: false, park: false };
 
 /// Encodes `func` as A64 machine code for `target`.
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let packing = if target.os == Os::Darwin { Packing::Natural } else { Packing::Slots };
     let order = crate::live::order(func);
     let abi = classify(&func.signature, packing)?;
-    let plan = plan(func, &REGS, &order, &abi.params);
-    let frame = layout(func, saved(func, &plan.used, &SAVED), &plan.locations, |sig| classify(sig, packing))?;
+    let plan = plan(func, &REGS, (&order, target.effort == crate::Effort::Full), &abi.params, |sig| classify(sig, packing));
+    let frame = layout(func, saved(func, &plan.used, &SAVED), (&plan.locations, &plan.shared, &plan.homed), |sig| classify(sig, packing))?;
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    Emit { func, frame, abi, packing, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None }.run(order)
+    let copied = crate::live::copied_tests(func, &order);
+    Emit { func, frame, abi, packing, asm, blocks, sites: Vec::new(), relocs: Vec::new(), plan, flags: None, next: None, copied }.run(order)
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -90,6 +91,7 @@ pub(super) struct Emit<'a> {
     plan: Plan<Reg>,
     flags: Option<(Value, Cond)>,
     next: Option<Block>,
+    copied: Vec<bool>,
 }
 
 impl Emit<'_> {
@@ -106,6 +108,11 @@ impl Emit<'_> {
 
     fn block(&mut self, block: Block) -> Result<(), String> {
         self.asm.bind(self.blocks[block.index()]);
+        self.body(block)
+    }
+
+    /// Emits the instructions of `block`, at its label or as a copy in place of a jump to it.
+    fn body(&mut self, block: Block) -> Result<(), String> {
         self.flags = None;
         let func = self.func;
         let insts = &func.blocks[block.index()].insts;
@@ -187,6 +194,9 @@ impl Emit<'_> {
             Op::TryCall { sig, callee, args, normal, handler } => self.try_call(*sig, *callee, args, *normal, *handler),
             Op::Jump(block, args) => {
                 self.edge(*block, args);
+                if self.copied[inst.index()] {
+                    return self.body(*block);
+                }
                 self.goto(*block, true);
                 Ok(())
             }
@@ -241,7 +251,7 @@ impl Emit<'_> {
 
     /// Whether `a` and `b` live in the same place, so writing one overwrites the other.
     fn same_home(&self, a: Value, b: Value) -> bool {
-        a == b || matches!((self.plan.location(a), self.plan.location(b)), (Location::Reg(x), Location::Reg(y)) if x == y)
+        a == b || matches!((self.plan.location(a), self.plan.location(b)), (Location::Reg(x), Location::Reg(y)) if x == y) || self.frame.shares(&self.plan, a, b)
     }
 
     /// Writes `value` into the location of `param`.
@@ -253,18 +263,12 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) {
-        let (pairs, clash) = edge_moves(args, &self.func.blocks[block.index()].params, |a, b| self.same_home(a, b));
-        if !clash {
-            for (arg, param) in pairs {
-                self.assign(param, arg);
+        for step in edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.same_home(a, b)) {
+            match step {
+                Step::Move(arg, param) => self.assign(param, arg),
+                Step::Save(arg, index) => self.move_to(Mem::new(FP, self.frame.edge_slot(index)), arg),
+                Step::Restore(index, param) => self.load_home(param, Mem::new(FP, self.frame.edge_slot(index))),
             }
-            return;
-        }
-        for (index, (arg, _)) in pairs.iter().enumerate() {
-            self.move_to(Mem::new(FP, self.frame.edge_slot(index)), *arg);
-        }
-        for (index, (_, param)) in pairs.iter().enumerate() {
-            self.load_home(*param, Mem::new(FP, self.frame.edge_slot(index)));
         }
     }
 

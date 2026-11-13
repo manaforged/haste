@@ -252,7 +252,7 @@ impl<'a> Infer<'_, 'a> {
             let Some(index) = self.field_index(item, variant, name)? else { bail!("no field `{name}` on {}", self.cx.name(item)) };
             let ty = tys[index as usize];
             self.out.inits.insert(field.value, index);
-            self.call_arg(Some((item, &slice[..])), field.value, (ty, None))?;
+            self.call_arg(Some((item, &slice[..])), field.value, (ty, None), &mut None)?;
         }
         if let Some(base) = base {
             let found = self.expr(base, Some(adt))?;

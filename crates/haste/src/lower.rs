@@ -80,6 +80,7 @@ pub trait Slots {
             SymbolSource::PromotedCell { size, .. } => self.zeroed(size as usize) as u64,
             SymbolSource::Host(ref host) => host.host_addr().unwrap_or(0) as u64,
             SymbolSource::Word(word) => word,
+            SymbolSource::ThreadSlot(index) => index as u64,
             SymbolSource::Vtable(_) | SymbolSource::Rodata(_) => 0,
         }
     }
@@ -148,7 +149,7 @@ pub fn repr(cx: &mut Context<'_>, ty: Ty) -> Result<Repr> {
     }
     let layout = cx.layout(ty)?;
     let size = layout.size.bytes() as u32;
-    Ok(if size == 0 { Repr::Zst } else { Repr::Mem { size, align: layout.align.abi.bytes().trailing_zeros() as u8, parts: abi::copied_parts(&layout) } })
+    Ok(if size == 0 { Repr::Zst } else { Repr::Mem { size, align: layout.align.bytes().trailing_zeros() as u8, parts: abi::copied_parts(&layout) } })
 }
 
 /// The register that a value of `ty` crosses a call in when it lives in memory but its layout is one scalar, as rustc passes such a value.

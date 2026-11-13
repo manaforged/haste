@@ -70,4 +70,6 @@ math! {
     Minnumf64 = minnumf64(x: f64, y: f64) -> f64 = x.min(y);
     RoundTiesEvenF32 = round_ties_even_f32(x: f32) -> f32 = x.round_ties_even();
     RoundTiesEvenF64 = round_ties_even_f64(x: f64) -> f64 = x.round_ties_even();
+    Fmodf32 = fmodf32(x: f32, y: f32) -> f32 = x % y;
+    Fmodf64 = fmodf64(x: f64, y: f64) -> f64 = x % y;
 }

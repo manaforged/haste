@@ -252,6 +252,7 @@ impl<'a> Infer<'_, 'a> {
             let header = match self.cx.item(item).1.kind {
                 ItemKind::Struct | ItemKind::Enum | ItemKind::Union => Header::Adt(self.cx.adt_def(item)?),
                 ItemKind::Type => Header::Generics(self.cx.alias_def(item)?.generics.clone()),
+                ItemKind::Trait => Header::Generics(self.cx.trait_generics(item)?),
                 _ => Header::Fn(self.cx.signature(item)?),
             };
             headers.push((header, &self.cx.file(item).source));
@@ -279,16 +280,21 @@ impl<'a> Infer<'_, 'a> {
         Ok(None)
     }
 
-    /// Runs `run` with names read through `frame`.
+    /// Runs `run` with names read through `frame`, which does not see the items of the body's open blocks when it reads another item's header.
     pub fn with_frame<T>(&mut self, frame: Frame<'a>, run: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if self.frames == crate::RECURSION_LIMIT {
             let item = frame.item.map_or("an item", |item| self.cx.name(item));
             anyhow::bail!("reached the recursion limit while expanding {item}");
         }
+        let foreign = frame.item != self.frame_item || frame.block != self.block;
         let saved = self.swap_frame(frame);
+        let items = if foreign { std::mem::take(&mut self.items) } else { Vec::new() };
         self.frames += 1;
         let result = run(self);
         self.frames -= 1;
+        if foreign {
+            self.items = items;
+        }
         self.swap_frame(saved);
         result
     }
@@ -394,6 +400,9 @@ impl<'a> Infer<'_, 'a> {
             let Some(member) = self.cx.member(block, name) else {
                 continue;
             };
+            if !self.cx.member_visible(member, self.home)? {
+                continue;
+            }
             if let Some(args) = self.trial(|infer| Ok(infer.match_impl(block, ty)))? {
                 return Ok(Some((member, args)));
             }

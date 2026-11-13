@@ -7,7 +7,7 @@ use crate::names::path::Path as NamePath;
 use crate::names::{Def, ItemRef, ModRef};
 use crate::outline::item::ItemKind;
 
-use super::super::impls::{ImplRef, head};
+use super::super::impls::{Head, ImplRef, head};
 use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty};
 use super::Infer;
@@ -25,9 +25,12 @@ struct Vars {
 }
 
 /// The traits that closures, function items and function pointers implement by the compiler, with no impl to select.
-const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
+pub(super) const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
 
 const BUILTIN: [&str; 12] = ["sized", "meta_sized", "pointee_sized", "copy", "clone", "destruct", "tuple_trait", "freeze", "pointee_trait", "unsize", "sync", "unpin"];
+
+/// The sizedness traits weaker than `Sized`, whose bound on a parameter drops its implicit `Sized` bound.
+const WEAKER_THAN_SIZED: [&str; 2] = ["meta_sized", "pointee_sized"];
 
 /// The compiler traits that no unsized type implements.
 const SIZED_ONLY: [&str; 3] = ["sized", "copy", "clone"];
@@ -257,15 +260,19 @@ impl<'a> Infer<'_, 'a> {
         Ok(args.contains(&self_ty))
     }
 
+    /// The crates whose impls of `of` may apply to `self_ty` at `args`: the trait's, each named type's, and the body's own while a type is still unknown, since an impl there may name the type it becomes.
     fn holders(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Vec<u32> {
         let mut crates = vec![of.krate];
         let mut stack: Vec<Ty> = std::iter::once(self_ty).chain(args.iter().copied()).collect();
         while let Some(ty) = stack.pop() {
             let kind = self.cx.types.kind(self.resolve(ty));
-            if let Kind::Adt(item, _) | Kind::Dyn(item, ..) = kind
-                && !crates.contains(&item.krate)
-            {
-                crates.push(item.krate);
+            let named = match kind {
+                Kind::Adt(item, _) | Kind::Dyn(item, ..) => Some(item.krate),
+                Kind::Var(_) => Some(self.home.krate),
+                _ => None,
+            };
+            if let Some(krate) = named.filter(|krate| !crates.contains(krate)) {
+                crates.push(krate);
             }
             stack.extend(kind.children(&self.cx.types));
         }
@@ -352,6 +359,9 @@ impl<'a> Infer<'_, 'a> {
             wanted.extend(header.body.list(generic.bounds).iter().map(|&bound| (arg, bound)));
         }
         self.with_frame(frame, |infer| {
+            if infer.sets_unsized_param(block, &header, (impl_args, home))? {
+                return Ok(false);
+            }
             infer.self_ty = Some(infer.lower_ty(&header.body, header.self_ty)?);
             for (ty, bound) in wanted {
                 if !infer.bound_holds(&header.body, home, (ty, bound), depth)? {
@@ -371,6 +381,26 @@ impl<'a> Infer<'_, 'a> {
         })
     }
 
+    /// Whether impl `block` at `impl_args` sets a type parameter to a slice, `str` or trait object while the parameter keeps its implicit `Sized` bound, which rules the impl out.
+    fn sets_unsized_param(&mut self, block: ImplRef, header: &crate::body::sig::ImplHeader, (impl_args, home): (&[Ty], ModRef)) -> Result<bool> {
+        let src = &self.cx.impl_file(block).source;
+        for (generic, &arg) in type_params(&header.generics).zip(impl_args) {
+            if generic.kind != crate::body::sig::GenericKind::Type || !self.cx.types.kind(self.resolve(arg)).is_unsized() {
+                continue;
+            }
+            let bounds = super::scope::generic_bounds(&header.body, src, &header.predicates, generic);
+            if !bounds.into_iter().any(|bound| self.relaxes_sized(&header.body, bound, home)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `bound` drops the implicit `Sized` bound of the parameter it is on: `?Sized`, or a bound on a sizedness trait weaker than `Sized`.
+    fn relaxes_sized(&mut self, arena: &Body, bound: u32, home: ModRef) -> bool {
+        matches!(arena.bounds[bound as usize], Bound::Trait { maybe: true, .. }) || self.bound_trait_at(arena, bound, home).and_then(|(of, _)| self.cx.lang(of)).is_some_and(|lang| WEAKER_THAN_SIZED.contains(&lang))
+    }
+
     fn bound_holds(&mut self, arena: &Body, home: ModRef, (ty, bound): (Ty, u32), depth: u32) -> Result<bool> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
             return Ok(true);
@@ -380,7 +410,7 @@ impl<'a> Infer<'_, 'a> {
         }
         let kind = self.cx.types.kind(self.resolve(ty));
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
-            return self.var_holds(arena, (of, path), ty);
+            return self.var_holds(arena, (of, path), ty, depth);
         }
         if self.compiler_impl(of, ty) {
             let args = self.bound_args(of, arena, path, ty)?;
@@ -563,13 +593,30 @@ impl<'a> Infer<'_, 'a> {
         Ok(true)
     }
 
-    /// Whether the bound `of` at `path` can hold for the unknown type `ty`: false only when `ty` is a pending `impl Trait` value whose own bound of that trait does not unify.
-    fn var_holds(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty) -> Result<bool> {
-        if !matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
-            return Ok(true);
-        }
+    /// Whether the bound `of` at `path` can hold for the unknown type `ty`: for an integer or float variable, whether an impl for some number type applies, kept as an obligation that picks the type when one impl alone applies, as rustc selects with one; else false only when `ty` is a pending `impl Trait` value whose own bound of that trait does not unify.
+    fn var_holds(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty, depth: u32) -> Result<bool> {
         let args = self.bound_args(of, arena, path, ty)?;
-        Ok(self.opaque_holds(of, &std::iter::once(ty).chain(args).collect::<Vec<_>>())? != Some(false))
+        let substs: Vec<Ty> = std::iter::once(ty).chain(args.iter().copied()).collect();
+        if !matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)) {
+            let held = !self.applicable(of, ty, &args, depth + 1)?.is_empty() || self.poly_may_implement(of, ty, &args)?;
+            if held {
+                self.obligations.push((of, substs));
+            }
+            return Ok(held);
+        }
+        let held = self.opaque_holds(of, &substs)?;
+        if held.is_none() {
+            self.obligations.push((of, substs));
+        }
+        Ok(held != Some(false))
+    }
+
+    /// Whether the one impl of `of<args>` that the function pointer of the `Fn` bound on the pending `impl Fn` value `ty` selects applies, tying `args` to that signature as an impl over any `F: Fn` does for the value it reveals.
+    pub(super) fn callable_opaque_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Result<bool> {
+        let Some(sig) = self.opaque_sig(self.resolve(ty)) else { return Ok(false) };
+        let Ok([(_, vars)]) = <[_; 1]>::try_from(self.applicable(of, sig, args, 0)?) else { return Ok(false) };
+        self.adopt(vars);
+        Ok(true)
     }
 
     /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.
@@ -605,7 +652,7 @@ impl<'a> Infer<'_, 'a> {
         self.cx.lang(of).is_some_and(|lang| BUILTIN.contains(&lang)) || self.cx.is_auto_trait(of)
     }
 
-    /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one, such as a struct that ends in a slice, is neither `Sized`, `Copy` nor `Clone`, and `&mut T` is neither `Copy` nor `Clone`.
+    /// Whether the compiler trait `of` holds for `ty`: for every type, except that an unsized one, such as a struct that ends in a slice, is neither `Sized`, `Copy` nor `Clone`, `&mut T` is neither `Copy` nor `Clone`, and `Unpin` follows the parts of the type.
     pub(in crate::sema) fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
         let Some(lang) = self.cx.lang(of) else { return true };
         let ty = self.resolve(ty);
@@ -614,8 +661,52 @@ impl<'a> Infer<'_, 'a> {
             Kind::Ref(Mut::Mut, _) => !matches!(lang, "copy" | "clone"),
             Kind::Adt(..) | Kind::Tuple(..) | Kind::Param(_) | Kind::Proj(_) if SIZED_ONLY.contains(&lang) && self.poly.is_some() && self.has_params(ty) => self.poly_sized(ty),
             Kind::Adt(item, _) if SIZED_ONLY.contains(&lang) => !self.cx.foreign(*item) && !self.is_unsized(ty).unwrap_or(false),
+            Kind::Tuple(_) | Kind::Array(..) if matches!(lang, "copy" | "clone") => self.parts_hold(of, ty),
+            _ if lang == "unpin" => self.unpin_holds(of, ty, &mut Vec::new()),
             _ => true,
         }
+    }
+
+    /// Whether `Copy` or `Clone`, as `of`, holds for every element of the tuple or array `ty`, as rustc's built-in impls require.
+    fn parts_hold(&mut self, of: ItemRef, ty: Ty) -> bool {
+        self.parts(ty).into_iter().all(|part| if self.compiler_decides(of, part) { self.compiler_holds(of, part) } else { self.select(of, part, &[]).is_ok_and(|picked| picked.is_some()) })
+    }
+
+    /// The types a value of the tuple, array, struct, enum or union `ty` holds inline: its elements or the fields of every variant.
+    fn parts(&mut self, ty: Ty) -> Vec<Ty> {
+        match self.cx.types.kind(ty).clone() {
+            Kind::Tuple(items) => self.cx.types.substs(items).to_vec(),
+            Kind::Array(inner, _) => vec![inner],
+            Kind::Adt(item, args) => {
+                let args = self.cx.types.substs(args).to_vec();
+                self.adt_fields(item, &args).map(|fields| fields.iter().flatten().copied().collect()).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether `Unpin`, as `of`, holds for `ty` as rustc's auto trait decides: never for a coroutine or a type with a negative impl, always for one with an impl, else when every part holds it; a type already in `seen` holds it, as auto trait cycles do.
+    fn unpin_holds(&mut self, of: ItemRef, ty: Ty, seen: &mut Vec<Ty>) -> bool {
+        let ty = self.resolve(ty);
+        if seen.contains(&ty) {
+            return true;
+        }
+        match *self.cx.types.kind(ty) {
+            Kind::Closure(..) => return self.coroutine_output(ty).is_none(),
+            Kind::Adt(item, _) => {
+                let holders = self.holders(of, ty, &[]);
+                if self.cx.negative_impl(of, Head::Adt(item), &holders) {
+                    return false;
+                }
+                if self.select(of, ty, &[]).is_ok_and(|picked| picked.is_some()) {
+                    return true;
+                }
+            }
+            Kind::Tuple(_) | Kind::Array(..) => {}
+            _ => return true,
+        }
+        seen.push(ty);
+        self.parts(ty).into_iter().all(|part| self.unpin_holds(of, part, seen))
     }
 
     /// Whether trait `of` is `Fn`, `FnMut` or `FnOnce`, which callables implement with no impl to select.

@@ -1,5 +1,6 @@
 mod adt;
 mod array;
+mod assign;
 mod assoc;
 mod call;
 mod clone;
@@ -12,6 +13,7 @@ mod expr;
 mod looping;
 mod matching;
 mod method;
+mod name;
 mod object;
 mod opaque;
 mod pat;
@@ -33,6 +35,7 @@ pub use consts::{Anon, Arena};
 pub use drop::{Glue, drop_fn, has_drop_impl, needs_drop};
 pub use looping::{For, Tried};
 pub use method::Adjust;
+pub use name::type_name;
 pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
@@ -110,12 +113,16 @@ pub struct Infer<'c, 'a> {
     projections: Vec<project::Projection>,
     opaques: Vec<opaque::Opaque>,
     operands: Vec<(ExprId, crate::body::BinOp, (Ty, Ty), Ty)>,
+    casts: Vec<(Ty, Ty)>,
+    param_origins: Vec<(u32, &'a str)>,
+    receiver_param: Option<&'a str>,
     try_blocks: Vec<(ExprId, Ty)>,
     awaits: Vec<(ExprId, Ty)>,
     ret_sig: Option<Ty>,
     out: zonk::InferOut,
     scopes: Vec<(Name<'a>, u32)>,
     items: Vec<(&'a str, ItemRef)>,
+    block_uses: Vec<u32>,
     loops: Vec<Breaks>,
     uses: Vec<closure::Captures>,
     unsure: Vec<(ExprId, closure::Captures, bool, Vec<u32>)>,
@@ -125,7 +132,7 @@ pub struct Infer<'c, 'a> {
     selecting: Vec<u64>,
     frames: usize,
     evaluating: Vec<ItemRef>,
-    imports: HashMap<(ItemRef, Option<crate::names::Sym>), Vec<crate::names::PerNs>>,
+    imports: HashMap<(ItemRef, Option<crate::names::Sym>, Vec<u32>), Vec<crate::names::PerNs>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
 }
 
@@ -214,7 +221,7 @@ pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs)
     let (once, by_ref) = (cx.call_once() == Some(item), closure::by_reference(cx, item).is_some());
     match cx.types.kind(ty) {
         Kind::Closure(..) if once => closure::closure_typed(cx, ty).map(Some),
-        Kind::Closure(..) | Kind::FnDef(..) if once || by_ref => closure::untuple_typed(cx, item, substs).map(Some),
+        Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) if once || by_ref => closure::untuple_typed(cx, item, substs).map(Some),
         _ => Ok(None),
     }
 }
@@ -241,12 +248,16 @@ impl<'c, 'a> Infer<'c, 'a> {
             projections,
             opaques,
             operands,
+            casts: Vec::new(),
+            param_origins: Vec::new(),
+            receiver_param: None,
             try_blocks,
             awaits: Vec::new(),
             ret_sig: None,
             out,
             scopes,
             items,
+            block_uses: Vec::new(),
             loops,
             uses,
             unsure: Vec::new(),
@@ -295,13 +306,29 @@ impl Infer<'_, '_> {
             self.scopes.push((("self", 0), local));
             self.out.params.push(local);
         }
-        for (index, &(pat, ty)) in sig.params.iter().enumerate() {
-            let ty = self.lower_ty(&sig.body, ty)?;
+        for (index, &(pat, declared)) in sig.params.iter().enumerate() {
+            let ty = self.lower_ty(&sig.body, declared)?;
             let own = self.body.fn_params.get(index).copied();
             let local = self.param_pat(&sig.body, pat, ty, own)?;
+            if let Some(at) = self.type_param_named(&sig.body, declared) {
+                self.param_origins.push((local, self.generics[at].0));
+            }
             self.out.params.push(local);
         }
         Ok(())
+    }
+
+    /// The index in the frame's generics of the type parameter that the declared type `ty` names alone, as `key: K`.
+    fn type_param_named(&self, arena: &Body, ty: crate::body::TyId) -> Option<usize> {
+        let crate::body::Ty::Path(path) = *arena.ty(ty) else { return None };
+        let path = arena.path(path);
+        let &[segment] = arena.list(path.segments) else { return None };
+        let segment = &arena.segments[segment as usize];
+        if path.qself.is_some() || segment.args.is_some() {
+            return None;
+        }
+        let name = self.src.text(segment.name);
+        self.generics.iter().position(|(generic, _)| *generic == name)
     }
 
     fn param_pat(&mut self, arena: &Body, pat: PatId, ty: Ty, own: Option<PatId>) -> Result<u32> {
@@ -328,19 +355,30 @@ impl Infer<'_, '_> {
     }
 
     fn trial<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<Option<T>>) -> Result<Option<T>> {
-        let saved = self.vars.clone();
+        let saved = self.snapshot();
         let out = f(self);
         if !matches!(out, Ok(Some(_))) {
-            self.vars = saved;
+            self.roll_back(saved);
         }
         out
     }
 
     fn probe<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-        let saved = self.vars.clone();
+        let saved = self.snapshot();
         let out = f(self);
-        self.vars = saved;
+        self.roll_back(saved);
         out
+    }
+
+    /// The variable bindings and the deferred projections and obligations, which name those variables and so roll back with them.
+    fn snapshot(&self) -> Snapshot {
+        (self.vars.clone(), self.projections.clone(), self.obligations.clone())
+    }
+
+    fn roll_back(&mut self, (vars, projections, obligations): Snapshot) {
+        self.vars = vars;
+        self.projections = projections;
+        self.obligations = obligations;
     }
 
     fn fresh(&mut self, kind: fn(u32) -> Kind) -> Ty {
@@ -551,8 +589,13 @@ impl Infer<'_, '_> {
 
     fn step_obligation(&mut self, of: ItemRef, substs: &[Ty]) -> Result<bool> {
         let self_ty = self.resolve(substs[0]);
-        if matches!(self.cx.types.kind(self_ty), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
-            return Ok(self.opaque_holds(of, substs)? == Some(true));
+        match self.cx.types.kind(self_ty) {
+            Kind::Var(_) => {
+                let held = self.opaque_holds(of, substs)?;
+                return Ok(held == Some(true) || (held.is_none() && self.callable_opaque_holds(of, self_ty, &substs[1..])?));
+            }
+            Kind::IntVar(_) | Kind::FloatVar(_) => return Ok(self.opaque_holds(of, substs)? == Some(true) || self.settled_by_impl(of, self_ty, &substs[1..])?),
+            _ => {}
         }
         let known = substs[1..].iter().all(|ty| !self.has_vars(*ty));
         if self.poly.is_some() && !self.has_vars(self_ty) && known && self.any_has_params(substs) {
@@ -576,11 +619,23 @@ impl Infer<'_, '_> {
                 matched.push(types);
             }
         }
+        if matched.len() > 1 {
+            self.receiver_bounds(of, &mut matched)?;
+        }
         let [types] = &matched[..] else {
             return Ok(false);
         };
         substs.iter().zip(types).try_for_each(|(&a, &b)| self.unify(a, b))?;
         Ok(true)
+    }
+
+    /// Keeps of `matched` the bounds of trait `of` that the header puts on the type parameter the method receiver was declared as, as rustc sees `key: K` apart from `value: V` when both are `&str`.
+    fn receiver_bounds(&mut self, of: ItemRef, matched: &mut Vec<Vec<Ty>>) -> Result<()> {
+        let Some(param) = self.receiver_param else { return Ok(()) };
+        let Some(ty) = self.param_ty(param) else { return Ok(()) };
+        let own = self.header_bounds((param, ty), &mut |_, bound| Ok(bound == of), false)?;
+        matched.retain(|types| own.iter().any(|(_, args)| types[0] == ty && types[1..] == args[..]));
+        Ok(())
     }
 
     fn settle_metadata(&mut self) -> Result<()> {
@@ -611,6 +666,9 @@ impl Infer<'_, '_> {
         self.cx.type_text(ty, &|ty| self.resolve(ty))
     }
 }
+
+/// What `Infer::snapshot` saves: the variable bindings, then the deferred projections and obligations.
+type Snapshot = (Vec<Option<Ty>>, Vec<project::Projection>, Vec<(ItemRef, Vec<Ty>)>);
 
 fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
     match kind {

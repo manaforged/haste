@@ -27,9 +27,16 @@ pub struct Coroutine {
     pub header: (i32, i32),
 }
 
+/// Where a stack slot of a resume function lives after the split: at an offset in the heap frame, or still on the native stack.
+#[derive(Clone, Copy)]
+enum Home {
+    Frame(u32),
+    Stack(StackSlot),
+}
+
 struct Frame {
     size: u32,
-    slots: Vec<u32>,
+    slots: Vec<Home>,
     spills: HashMap<Value, i32>,
 }
 
@@ -46,19 +53,76 @@ pub(crate) fn split(func: &mut Function) {
     let Some(spec) = func.coroutine.take() else { return };
     let old_entry = func.entry.expect("a coroutine has an entry");
     let mut frame = Frame { size: 0, slots: Vec::new(), spills: HashMap::default() };
-    frame.slots = func.slots.iter().map(|slot| frame.place(slot.size, 1 << slot.align_shift)).collect();
+    let kept = framed(func, &spec.resumes);
+    let mut stack = vec![SlotData { size: 8, align_shift: 3 }];
+    for (slot, framed) in func.slots.iter().zip(kept) {
+        let home = match framed {
+            true => Home::Frame(frame.place(slot.size, 1 << slot.align_shift)),
+            false => {
+                stack.push(slot.clone());
+                Home::Stack(StackSlot(stack.len() as u32 - 1))
+            }
+        };
+        frame.slots.push(home);
+    }
     let defs = def_blocks(func);
     for value in crossing(func, &defs) {
         let bytes = func.types[value.index()].bytes();
         let at = frame.place(bytes, bytes);
         frame.spills.insert(value, at as i32);
     }
-    func.slots = vec![SlotData { size: 8, align_shift: 3 }];
+    func.slots = stack;
     let anchor = StackSlot(0);
     for block in 0..func.blocks.len() {
         rewrite(func, Block(block as u32), (&frame, anchor), spec.done.contains(&Block(block as u32)));
     }
     entry(func, &spec, (old_entry, anchor), frame.size);
+}
+
+/// Which stack slots must live in the heap frame: those whose address is taken, and those that some path from a resume block reads before writing them whole.
+fn framed(func: &Function, resumes: &[Block]) -> Vec<bool> {
+    let (taken, effects) = slot_effects(func);
+    let live = live_in(func, &effects);
+    (0..func.slots.len()).map(|at| taken[at] || resumes.iter().any(|resume| live[resume.index()][at])).collect()
+}
+
+/// Per slot, whether its address is taken; per block, the slots it reads before writing them whole and the slots it writes whole.
+fn slot_effects(func: &Function) -> (Vec<bool>, Vec<(Vec<bool>, Vec<bool>)>) {
+    let slots = func.slots.len();
+    let mut taken = vec![false; slots];
+    let mut effects = vec![(vec![false; slots], vec![false; slots]); func.blocks.len()];
+    for (block, (reads, writes)) in func.blocks.iter().zip(effects.iter_mut()) {
+        for inst in &block.insts {
+            match func.insts[inst.index()].op {
+                Op::StackAddr(slot, _) => taken[slot.index()] = true,
+                Op::StackLoad(slot, _) => reads[slot.index()] |= !writes[slot.index()],
+                Op::StackStore(value, slot, 0) => writes[slot.index()] |= func.types[value.index()].bytes() >= func.slots[slot.index()].size,
+                _ => {}
+            }
+        }
+    }
+    (taken, effects)
+}
+
+/// The slots live on entry to each block, by backward dataflow to a fixed point over `effects`.
+fn live_in(func: &Function, effects: &[(Vec<bool>, Vec<bool>)]) -> Vec<Vec<bool>> {
+    let slots = func.slots.len();
+    let mut live = vec![vec![false; slots]; func.blocks.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in (0..func.blocks.len()).rev() {
+            let mut out = vec![false; slots];
+            for next in func.successors(Block(block as u32)) {
+                out.iter_mut().zip(&live[next.index()]).for_each(|(o, &l)| *o |= l);
+            }
+            let (reads, writes) = &effects[block];
+            let fresh: Vec<bool> = (0..slots).map(|at| reads[at] || (out[at] && !writes[at])).collect();
+            changed |= fresh != live[block];
+            live[block] = fresh;
+        }
+    }
+    live
 }
 
 fn def_blocks(func: &Function) -> Vec<Option<Block>> {
@@ -116,12 +180,21 @@ fn rewrite(func: &mut Function, block: Block, (frame, anchor): (&Frame, StackSlo
         });
         data.op.map_operands(|value| loaded.get(&value).copied().unwrap_or(value));
         data.op = match data.op {
-            Op::StackAddr(slot, offset) => {
-                let at = push(func, &mut insts, Op::Const(i64::from(frame.slots[slot.index()]) + i64::from(offset)), Some(Type::I64)).expect("a constant has a result");
-                Op::Binary(Binary::Iadd, fp, at)
-            }
-            Op::StackLoad(slot, offset) => Op::Load(fp, frame.slots[slot.index()] as i32 + offset),
-            Op::StackStore(value, slot, offset) => Op::Store(value, fp, frame.slots[slot.index()] as i32 + offset),
+            Op::StackAddr(slot, offset) => match frame.slots[slot.index()] {
+                Home::Frame(home) => {
+                    let at = push(func, &mut insts, Op::Const(i64::from(home) + i64::from(offset)), Some(Type::I64)).expect("a constant has a result");
+                    Op::Binary(Binary::Iadd, fp, at)
+                }
+                Home::Stack(native) => Op::StackAddr(native, offset),
+            },
+            Op::StackLoad(slot, offset) => match frame.slots[slot.index()] {
+                Home::Frame(home) => Op::Load(fp, home as i32 + offset),
+                Home::Stack(native) => Op::StackLoad(native, offset),
+            },
+            Op::StackStore(value, slot, offset) => match frame.slots[slot.index()] {
+                Home::Frame(home) => Op::Store(value, fp, home as i32 + offset),
+                Home::Stack(native) => Op::StackStore(value, native, offset),
+            },
             op => op,
         };
         if data.op.is_terminator() && free {

@@ -263,6 +263,16 @@ impl Asm {
         self.code.extend(imm.to_le_bytes());
     }
 
+    /// Stores the low `size` bytes of `imm` to `dst`; a quadword takes `imm` sign-extended.
+    pub fn store_imm_sized(&mut self, size: Size, dst: Mem, imm: i32) {
+        self.sized(false, size, (&[0xC6], &[0xC7]), 0, dst.into());
+        match size {
+            Size::B => self.code.push(imm as u8),
+            Size::W => self.code.extend((imm as i16).to_le_bytes()),
+            _ => self.code.extend(imm.to_le_bytes()),
+        }
+    }
+
     pub fn store_slot_reloc(&mut self, dst: Mem) -> u32 {
         self.encode(&[], true, &[0xC7], 0, dst.into(), false);
         let at = self.pos();
@@ -339,6 +349,28 @@ impl Asm {
 
     pub fn alu_imm32(&mut self, op: Alu, dst: Reg, imm: i32) {
         self.alu_imm_width(false, op, dst, imm);
+    }
+
+    /// `dst op= imm` on the low `size` bytes of `dst`, with `imm` cut to that width.
+    pub fn alu_imm_sized(&mut self, size: Size, op: Alu, dst: Reg, imm: i32) {
+        match size {
+            Size::B => {
+                self.encode(&[], false, &[0x80], op as u8, dst.into(), true);
+                self.code.push(imm as u8);
+            }
+            Size::W => match i8::try_from(imm as i16) {
+                Ok(small) => {
+                    self.encode(&[0x66], false, &[0x83], op as u8, dst.into(), false);
+                    self.code.push(small as u8);
+                }
+                Err(_) => {
+                    self.encode(&[0x66], false, &[0x81], op as u8, dst.into(), false);
+                    self.code.extend((imm as u16).to_le_bytes());
+                }
+            },
+            Size::D => self.alu_imm32(op, dst, imm),
+            Size::Q => self.alu_imm(op, dst, imm),
+        }
     }
 
     pub fn test(&mut self, a: Reg, b: Reg) {
@@ -450,6 +482,21 @@ impl Asm {
 
     pub fn sse_wide(&mut self, prefix: u8, opcode: u8, r: u8, rm: impl Into<Rm>) {
         self.encode(&[prefix], true, &[0x0F, opcode], r, rm.into(), false);
+    }
+
+    /// The three-operand VEX form `dst = src op rm` of the scalar SSE operation `opcode`, where `prefix` is 0xF2 for doubles and 0xF3 for singles.
+    pub fn vex_scalar(&mut self, prefix: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>) {
+        let rm = rm.into();
+        let b = match rm {
+            Rm::Reg(reg) => reg,
+            Rm::Mem(mem) => mem.base as u8,
+        };
+        let pp = if prefix == 0xF2 { 0b11 } else { 0b10 };
+        self.code.push(0xC4);
+        self.code.push((!dst.0 >> 3 & 1) << 7 | 1 << 6 | (!b >> 3 & 1) << 5 | 0b00001);
+        self.code.push((!src.0 & 0xF) << 3 | pp);
+        self.code.push(opcode);
+        self.modrm(dst.0, rm);
     }
 
     /// `movaps dst, src`: copies the whole register, with no dependency on the old contents of `dst`.

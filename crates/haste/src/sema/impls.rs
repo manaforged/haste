@@ -110,6 +110,7 @@ impl Asked {
 pub struct Index {
     inherent: HashMap<Head, Vec<ImplRef>>,
     traits: HashMap<ItemRef, Vec<(ImplRef, Option<Head>)>>,
+    negative: HashMap<ItemRef, Vec<Head>>,
     asked: Asked,
 }
 
@@ -181,7 +182,7 @@ impl<'a> Context<'a> {
         let members = self.impl_members.get_or_insert_with(block, || {
             let mut map = HashMap::default();
             for member in self.members(block) {
-                map.entry(self.name(member)).or_insert(member);
+                map.entry(self.plain_name(member)).or_insert(member);
             }
             Arc::new(map)
         });
@@ -213,6 +214,16 @@ impl<'a> Context<'a> {
             }
             Arc::new(map)
         })
+    }
+
+    /// Whether code in module `from` may name the inherent member `item`, as the member's visibility allows.
+    pub fn member_visible(&mut self, item: ItemRef, from: ModRef) -> Result<bool> {
+        let vis = self.item(item).1.vis;
+        if vis == crate::outline::item::Vis::Pub {
+            return Ok(true);
+        }
+        let home = self.module_of(item)?;
+        Ok(crate::names::resolve::visible(&self.paths(from.krate), vis, home, from))
     }
 
     /// The inherent impls of types with head `head`, asking for every module of the crates that may hold one.
@@ -257,6 +268,11 @@ impl<'a> Context<'a> {
         found
     }
 
+    /// Whether crates `holders` write a negative impl of trait `of` for a self type with head `head`.
+    pub fn negative_impl(&mut self, of: ItemRef, head: Head, holders: &[u32]) -> bool {
+        self.holders_with_body(holders, (Some(head), Some(of))).into_iter().any(|holder| self.index_of(holder).negative.get(&of).is_some_and(|heads| heads.contains(&head)))
+    }
+
     /// The trait that impl `block` implements, or none for an inherent impl.
     pub fn impl_trait(&mut self, block: ImplRef) -> Option<ItemRef> {
         if let Some(known) = self.store.lookups.impl_traits.get(&block) {
@@ -288,7 +304,7 @@ impl<'a> Context<'a> {
     fn resolve_in(&self, at: Option<ItemRef>, path: &NamePath<'_>, home: ModRef) -> Option<Def> {
         let anchor = at.and_then(ItemRef::outer).map(|(root, from)| (root, Some(from)));
         let paths = self.paths(home.krate);
-        match self.local_path(anchor, path, Ns::Types) {
+        match self.local_path(home, anchor, path, Ns::Types) {
             Some(BodyPath::Def(def)) => Some(def),
             Some(BodyPath::Variant(_)) => None,
             Some(BodyPath::Outside(skip)) => paths.resolve(&outside(path, skip), home),
@@ -358,14 +374,17 @@ impl<'a> Context<'a> {
         let Ok(header) = self.impl_header(block) else {
             return;
         };
-        if header.negative {
-            return;
-        }
         let src = &self.impl_file(block).source;
         let Ok(home) = self.impl_module(block) else {
             return;
         };
         let head = if generic_self(src, &header) { None } else { self.syntax_head(src, &header.body, header.self_ty, (home, block.item())) };
+        if header.negative {
+            if let (Some(head), Some(of)) = (head, self.impl_trait(block)) {
+                index.negative.entry(of).or_default().push(head);
+            }
+            return;
+        }
         match (header.trait_ref.is_some(), head) {
             (false, Some(head)) => index.inherent.entry(head).or_default().push(block),
             (false, None) => {}

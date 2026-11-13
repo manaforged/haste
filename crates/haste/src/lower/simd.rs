@@ -1,12 +1,15 @@
 use anyhow::{Result, bail};
-use haste_codegen::{IntCC, StackSlot, Type, Value};
+use haste_codegen::{Arch, ByteCC, IntCC, StackSlot, Target, Type, Value, VectorOp};
 
 use crate::body::BinOp;
+use crate::host::{HostSymbol, X86Symbol};
 use crate::sema::intrinsic::Simd;
 use crate::sema::ty::{Kind, Ty};
 
 use super::ops::{Num, compare};
 use super::{Lower, machine, repr};
+
+mod lanes;
 
 struct Lanes {
     num: Num,
@@ -15,21 +18,85 @@ struct Lanes {
     count: i32,
 }
 
+/// The bytes of a vector the code generator holds in one register.
+const PACKED_BYTES: i32 = 16;
+
+impl Lanes {
+    /// Whether the vector is sixteen integer bytes.
+    fn is_bytes(&self) -> bool {
+        self.size == 1 && self.count == PACKED_BYTES && matches!(self.num, Num::Int { .. })
+    }
+
+    /// Whether the vector is integer lanes that fill one 128-bit register.
+    fn is_packed(&self) -> bool {
+        self.size * self.count == PACKED_BYTES && matches!(self.num, Num::Int { .. })
+    }
+}
+
 impl Lower<'_, '_> {
     /// Emits the SIMD intrinsic `op` one lane at a time on vectors held in memory, as a scalar backend does.
     pub(super) fn simd(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&vector), Some(&first)) = (substs.first(), args.first()) else { bail!("a SIMD intrinsic with no vector") };
         let out = substs.get(1).copied();
+        if Target::host().arch == Arch::X64
+            && let Some(value) = self.packed(op, (vector, out.unwrap_or(vector)), args)?
+        {
+            return Ok(Some(value));
+        }
         let value = match (op, out) {
             (Simd::Splat, _) => self.splat(vector, first)?,
             (Simd::Bitmask, Some(out)) => self.bitmask(vector, first, out)?,
             (Simd::Cast, Some(out)) => self.lane_cast((vector, out), first)?,
             (Simd::Reduce { all }, _) => self.reduce(vector, first, all)?,
             (Simd::Extreme { max }, _) => self.extreme(vector, first, max)?,
+            (Simd::Fold(op), _) => self.fold(vector, first, op)?,
             (Simd::Sqrt, _) => self.lane_sqrt(vector, first)?,
+            (Simd::Unary(_) | Simd::Pair(_) | Simd::Fma | Simd::Sum { .. } | Simd::MaskedLoad | Simd::MaskedStore, _) => return self.lane_intrinsic(op, substs, args),
             _ => self.simd_lanes(op, substs, args)?,
         };
         Ok(Some(value))
+    }
+
+    /// Emits `op` as one 128-bit vector operation when it is one the code generator has: a bitwise operation on a register of integer lanes, or a splat, equality, signed order or bitmask on sixteen bytes.
+    fn packed(&mut self, op: Simd, (input, output): (Ty, Ty), args: &[Value]) -> Result<Option<Value>> {
+        let lanes = self.lanes(input)?;
+        if !lanes.is_packed() {
+            return Ok(None);
+        }
+        let signed = matches!(lanes.num, Num::Int { signed: true, .. });
+        let vector = match (op, args) {
+            (Simd::Splat, &[x]) if lanes.is_bytes() => self.ins().splat(x),
+            (Simd::Lanewise(bin @ (BinOp::Add | BinOp::Sub)), &[x, y]) if input == output && lanes.size <= 8 => {
+                let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+                self.ins().vector(lane_arithmetic(bin, lanes.size), a, b)
+            }
+            (Simd::Bitmask, &[x]) if lanes.is_bytes() => {
+                let Some(target) = machine(self.cx, output)? else { return Ok(None) };
+                let loaded = self.ins().load(Type::V128, x, 0);
+                let mask = self.ins().movemask(loaded);
+                return Ok(Some(self.resize(mask, (Type::I32, false), target)));
+            }
+            (Simd::Lanewise(bin @ (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)), &[x, y]) if input == output => {
+                let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+                match bin {
+                    BinOp::BitAnd => self.ins().band(a, b),
+                    BinOp::BitOr => self.ins().bor(a, b),
+                    _ => self.ins().bxor(a, b),
+                }
+            }
+            (Simd::Lanewise(cmp @ (BinOp::Eq | BinOp::Gt | BinOp::Lt)), &[x, y]) if lanes.is_bytes() && (cmp == BinOp::Eq || signed) && self.lanes(output)?.is_bytes() => {
+                let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+                match cmp {
+                    BinOp::Eq => self.ins().byte_cmp(ByteCC::Equal, a, b),
+                    BinOp::Gt => self.ins().byte_cmp(ByteCC::SignedGreaterThan, a, b),
+                    _ => self.ins().byte_cmp(ByteCC::SignedGreaterThan, b, a),
+                }
+            }
+            _ => return Ok(None),
+        };
+        let (slot, address) = self.vector_slot(if matches!(op, Simd::Splat) { input } else { output })?;
+        self.ins().stack_store(vector, slot, 0);
+        Ok(Some(address))
     }
 
     fn simd_lanes(&mut self, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Value> {
@@ -184,6 +251,16 @@ impl Lower<'_, '_> {
         Ok(found)
     }
 
+    fn fold(&mut self, vector: Ty, x: Value, op: BinOp) -> Result<Value> {
+        let lanes = self.lanes(vector)?;
+        let mut folded = self.ins().load(lanes.machine, x, 0);
+        for lane in 1..lanes.count {
+            let value = self.ins().load(lanes.machine, x, lane * lanes.size);
+            folded = self.apply(op, lanes.num, (folded, value), lanes.num)?;
+        }
+        Ok(folded)
+    }
+
     fn extreme(&mut self, vector: Ty, x: Value, max: bool) -> Result<Value> {
         let lanes = self.lanes(vector)?;
         let better = if max { BinOp::Gt } else { BinOp::Lt };
@@ -196,9 +273,31 @@ impl Lower<'_, '_> {
         Ok(best)
     }
 
+    /// Calls the host function of the x86 intrinsic `x86` with `args`, each vector by address, and returns the address of the frame slot it writes a vector result to, or the integer it returns.
+    pub(super) fn host_vector(&mut self, x86: X86Symbol, args: &[Value]) -> Result<Value> {
+        if let Some(value) = self.inline_vector(x86, args) {
+            return Ok(value);
+        }
+        if x86.host_addr().is_none() {
+            bail!("{} has no host function on this machine", x86.link_name());
+        }
+        let slot = self.b.create_stack_slot(x86.out_bytes(), 5);
+        let out = self.ins().stack_addr(Type::I64, slot, 0);
+        let values: Vec<Value> = std::iter::once(out).chain(args.iter().copied()).collect();
+        self.call_host(HostSymbol::X86(x86), &values, None);
+        Ok(match x86.scalar_bytes() {
+            Some(8) => self.ins().load(Type::I64, out, 0),
+            Some(_) => self.ins().load(Type::I32, out, 0),
+            None => out,
+        })
+    }
+
     /// The `bytes` bytes whose byte `i` is byte `index[i] & 15` of the 16-byte lane of `table` that holds byte `i`, or zero when bit 7 of `index[i]` is set, as `pshufb` gives.
     pub(super) fn byte_permute(&mut self, args: &[Value], bytes: u8) -> Result<Value> {
         let &[table, index] = args else { bail!("`pshufb` takes two vectors") };
+        if i32::from(bytes) == PACKED_BYTES && Target::host().arch == Arch::X64 {
+            return Ok(self.vector_result(VectorOp::ByteShuffle, (table, index)));
+        }
         let slot = self.b.create_stack_slot(u32::from(bytes), 5);
         let (low, zero) = (self.ins().iconst(Type::I8, 15), self.ins().iconst(Type::I8, 0));
         for lane in 0..i32::from(bytes) {
@@ -276,5 +375,64 @@ impl Lower<'_, '_> {
             self.ins().stack_store(chosen, slot, lane * to.size);
         }
         Ok(address)
+    }
+
+    /// The address of a frame slot holding the x64 vector instruction `op` on the vectors at `x` and `y`.
+    fn vector_result(&mut self, op: VectorOp, (x, y): (Value, Value)) -> Value {
+        let (a, b) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0));
+        let vector = self.ins().vector(op, a, b);
+        self.store_vector(vector)
+    }
+
+    fn store_vector(&mut self, vector: Value) -> Value {
+        let slot = self.b.create_stack_slot(PACKED_BYTES as u32, 4);
+        self.ins().stack_store(vector, slot, 0);
+        self.ins().stack_addr(Type::I64, slot, 0)
+    }
+
+    /// The x86 intrinsic `x86` on the vectors at `args` as one instruction in the code, on an x64 host, when it is one the code generator encodes.
+    fn inline_vector(&mut self, x86: X86Symbol, args: &[Value]) -> Option<Value> {
+        if Target::host().arch != Arch::X64 {
+            return None;
+        }
+        match (x86, args) {
+            (X86Symbol::Sha256rnds2, &[x, y, k]) => {
+                let (a, b, c) = (self.ins().load(Type::V128, x, 0), self.ins().load(Type::V128, y, 0), self.ins().load(Type::V128, k, 0));
+                let vector = self.ins().sha256_rounds(a, b, c);
+                Some(self.store_vector(vector))
+            }
+            (_, &[x, y]) => Some(self.vector_result(instruction(x86)?, (x, y))),
+            _ => None,
+        }
+    }
+}
+
+/// The vector instruction that computes the two-operand x86 intrinsic `x86`, when there is one.
+fn instruction(x86: X86Symbol) -> Option<VectorOp> {
+    Some(match x86 {
+        X86Symbol::Sha1nexte => VectorOp::Sha1NextE,
+        X86Symbol::Sha1msg1 => VectorOp::Sha1Msg1,
+        X86Symbol::Sha1msg2 => VectorOp::Sha1Msg2,
+        X86Symbol::Sha256msg1 => VectorOp::Sha256Msg1,
+        X86Symbol::Sha256msg2 => VectorOp::Sha256Msg2,
+        X86Symbol::Aesenc => VectorOp::AesEnc,
+        X86Symbol::Aesenclast => VectorOp::AesEncLast,
+        X86Symbol::Aesdec => VectorOp::AesDec,
+        X86Symbol::Aesdeclast => VectorOp::AesDecLast,
+        _ => return None,
+    })
+}
+
+/// The packed add or subtract of `op` on lanes of `size` bytes.
+fn lane_arithmetic(op: BinOp, size: i32) -> VectorOp {
+    match (op == BinOp::Add, size) {
+        (true, 1) => VectorOp::AddBytes,
+        (true, 2) => VectorOp::AddWords,
+        (true, 4) => VectorOp::AddDwords,
+        (true, _) => VectorOp::AddQwords,
+        (false, 1) => VectorOp::SubBytes,
+        (false, 2) => VectorOp::SubWords,
+        (false, 4) => VectorOp::SubDwords,
+        (false, _) => VectorOp::SubQwords,
     }
 }

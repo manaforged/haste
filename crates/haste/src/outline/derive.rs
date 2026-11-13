@@ -6,7 +6,7 @@ use crate::body::sig::GenericKind;
 use crate::graph::cfg::Cfg;
 use crate::names::Primitive;
 
-use super::attr::split_commas;
+use super::attr::{repr_words, split_commas};
 use super::item::{Attr, Item, ItemKind};
 use super::source::{Source, Tokens};
 use super::tree::Env;
@@ -72,17 +72,17 @@ pub fn derived(src: &Source, item: &Item, env: &Env, (krate, deps): (usize, &[(S
     }
     let named = |name: &&str| deps.iter().find(|(dep, _)| dep == name).map(|(_, at)| *at);
     let holder = CORE_HOLDERS.iter().find_map(named).unwrap_or(krate) as u32;
-    (Some(expand(src, item, (&wanted, holder), &|attrs| env.enabled(attrs))), foreign)
+    (Some(expand(src, item, (&wanted, holder), env)), foreign)
 }
 
-/// The impls of the builtin derives `wanted` for the struct, enum or union `item` of `src`, naming core's traits through `$crate` of crate `holder`, over the variants and fields that `enabled` keeps.
-pub fn expand(src: &Source, item: &Item, (wanted, holder): (&[Derive], u32), enabled: &dyn Fn(&[Attr]) -> bool) -> Result<Source> {
+/// The impls of the builtin derives `wanted` for the struct, enum or union `item` of `src`, naming core's traits through `$crate` of crate `holder`, over the variants and fields that `env` keeps.
+pub fn expand(src: &Source, item: &Item, (wanted, holder): (&[Derive], u32), env: &Env) -> Result<Source> {
     let Some(name) = item.name else { bail!("a derive on an item with no name") };
     let mut def = adt(src, name, item.end, item.kind == ItemKind::Enum)?;
-    def.configure(src, enabled);
+    def.configure(src, &|attrs| env.enabled(attrs));
     let simple = wanted.contains(&Derive::Copy) && !def.generics.params.iter().any(|param| param.kind == GenericKind::Type);
     let union = item.kind == ItemKind::Union;
-    let mut writer = Writer { src, name: src.text(name).to_owned(), is_enum: item.kind == ItemKind::Enum, repr: repr(src, &item.attrs), def, holder, out: Tokens::default() };
+    let mut writer = Writer { src, name: src.text(name).to_owned(), is_enum: item.kind == ItemKind::Enum, repr: repr(src, &item.attrs, env), def, holder, out: Tokens::default() };
     for &derive in wanted {
         writer.header(derive);
         let body = writer.method(derive, simple || union)?;
@@ -93,12 +93,8 @@ pub fn expand(src: &Source, item: &Item, (wanted, holder): (&[Derive], u32), ena
     writer.out.finish(src.path.clone())
 }
 
-fn repr(src: &Source, attrs: &[Attr]) -> String {
-    let words = attrs.iter().filter_map(|attr| match *attr {
-        Attr::Other(at) if src.text(at) == "repr" && src.kind(at + 1) == TokenKind::OpenParen => Some(split_commas(src, at + 2, src.pair(at + 1))),
-        _ => None,
-    });
-    let int = words.flatten().map(|(from, _)| src.text(from)).find(|word| Primitive::named(word).is_some());
+fn repr(src: &Source, attrs: &[Attr], env: &Env) -> String {
+    let int = repr_words(src, attrs, env).into_iter().map(|at| src.text(at)).find(|word| Primitive::named(word).is_some());
     int.unwrap_or("isize").to_owned()
 }
 

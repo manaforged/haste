@@ -160,6 +160,9 @@ impl Emit<'_> {
             self.put_high(result, Reg::Rax);
             return Ok(());
         }
+        if ty == Type::V128 {
+            return self.vector_binary(op, (x, y), result);
+        }
         if ty.is_float() {
             return self.float_binary(op, x, y, result);
         }
@@ -199,7 +202,7 @@ impl Emit<'_> {
                 self.asm.alu(Alu::Cmp, Reg::Rax, Reg::Rcx);
                 self.asm.cmov(if op == Binary::Smin { Cond::G } else { Cond::L }, Reg::Rax, Reg::Rcx);
             }
-            Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr => self.shift_by(op, x, y, ty),
+            Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr => return Ok(self.shift_by(op, (x, y), ty, dst)),
             other => return Err(format!("{other:?} of an integer")),
         }
         Ok(Reg::Rax)
@@ -272,7 +275,8 @@ impl Emit<'_> {
         }
     }
 
-    fn shift_by(&mut self, op: Binary, x: Value, y: Value, ty: Type) {
+    /// Shifts or rotates `x` by `y`: into `dst` by an immediate when `y` is a constant, else into rax by cl; returns the register that holds the result.
+    fn shift_by(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Reg {
         let (ext, shift) = match op {
             Binary::Ishl => (Ext::Zero, Shift::Shl),
             Binary::Ushr => (Ext::Zero, Shift::Shr),
@@ -280,14 +284,19 @@ impl Emit<'_> {
             Binary::Rotl => (Ext::Zero, Shift::Rol),
             _ => (Ext::Zero, Shift::Ror),
         };
+        let size = if matches!(op, Binary::Rotl | Binary::Rotr) { Size::of(ty.bytes()) } else { Size::Q };
+        if let Some(imm) = self.const_of(y) {
+            self.get(dst, x, ext);
+            self.asm.shift_imm(size, shift, dst, (imm & i64::from(ty.bits() - 1)) as u8);
+            return dst;
+        }
         self.get(Reg::Rax, x, ext);
         self.raw(Reg::Rcx, y);
-        if matches!(op, Binary::Rotl | Binary::Rotr) {
-            self.asm.shift(Size::of(ty.bytes()), shift, Reg::Rax);
-        } else {
+        if size == Size::Q {
             self.asm.alu_imm32(Alu::And, Reg::Rcx, ty.bits() as i32 - 1);
-            self.asm.shift(Size::Q, shift, Reg::Rax);
         }
+        self.asm.shift(size, shift, Reg::Rax);
+        Reg::Rax
     }
 
     pub(super) fn icmp(&mut self, cc: IntCC, x: Value, y: Value, result: Value) -> Result<(), String> {
@@ -355,14 +364,9 @@ impl Emit<'_> {
 
     /// `dst op= y` on the low `size` bytes, with an immediate when `y` is a constant that fits one at that width.
     pub(super) fn alu_at(&mut self, size: Size, alu: Alu, dst: Reg, y: Value) {
-        match (size, self.imm_of(y)) {
-            (Size::Q, Some(imm)) => self.asm.alu_imm(alu, dst, imm),
-            (Size::D, Some(imm)) => self.asm.alu_imm32(alu, dst, imm),
-            (_, Some(_)) => {
-                self.raw(Reg::Rcx, y);
-                self.asm.alu_sized(size, alu, dst, Reg::Rcx);
-            }
-            (_, None) => {
+        match self.imm_of(y) {
+            Some(imm) => self.asm.alu_imm_sized(size, alu, dst, imm),
+            None => {
                 let source = self.operand(y);
                 self.asm.alu_sized(size, alu, dst, source);
             }

@@ -82,6 +82,13 @@ impl Infer<'_, '_> {
         {
             return Ok(poly.assumptions.clone());
         }
+        let pending = self.obligations.len();
+        let found = self.assumed_bounds();
+        self.obligations.truncate(pending);
+        found
+    }
+
+    fn assumed_bounds(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let mut found = self.param_bounds()?;
         found.extend(self.own_trait()?);
         found.extend(self.type_bounds()?);
@@ -132,7 +139,7 @@ impl Infer<'_, '_> {
         if def.1.supers.len == 0 || substs.len() != params.len() + 1 {
             return Ok(Vec::new());
         }
-        let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), None))?;
+        let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), Some(of)))?;
         let home = frame.home;
         self.with_frame(frame, |infer| {
             let mut found = Vec::new();
@@ -210,7 +217,7 @@ impl Infer<'_, '_> {
         Ok(found)
     }
 
-    fn header_bounds(&mut self, (param, ty): (&str, Ty), keep: &mut dyn FnMut(&mut Self, ItemRef) -> Result<bool>, first: bool) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
+    pub(super) fn header_bounds(&mut self, (param, ty): (&str, Ty), keep: &mut dyn FnMut(&mut Self, ItemRef) -> Result<bool>, first: bool) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let mut found = Vec::new();
         for (header, src) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
@@ -377,7 +384,7 @@ impl Infer<'_, '_> {
         }
         if self.cx.lang(of) == Some("future_trait")
             && name == "Output"
-            && let Some(output) = self.coroutine_output(ty)
+            && let Some(output) = self.coroutine_output(ty).or_else(|| self.opaque_output(self.resolve(ty)))
         {
             return Ok(Some(output));
         }
@@ -423,7 +430,7 @@ impl Infer<'_, '_> {
         }
         let frame = self.frame(item, substs)?;
         let (src, home) = (frame.src, frame.home);
-        let params = frame.generics.clone();
+        let params: Vec<(&str, Ty)> = frame.generics.iter().copied().chain(frame.self_ty.map(|ty| ("Self", ty))).collect();
         self.with_frame(frame, |infer| {
             for (name, ty) in params {
                 for bound in named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), name) {
@@ -437,6 +444,44 @@ impl Infer<'_, '_> {
                 infer.bind_bound(&sig.body, home, (bound, ty))?;
             }
             Ok(())
+        })
+    }
+
+    /// Binds the bounds on the parameters of the inherent impl that owns `item` at its arguments in `substs` while one is unknown, as `C: Deref<Target = T>` names `T`.
+    pub(super) fn bind_impl_bounds(&mut self, item: ItemRef, substs: &[Ty]) -> Result<()> {
+        let Some(block) = self.cx.owner_impl(item) else { return Ok(()) };
+        let count = self.impl_params(block)?;
+        let Some(args) = substs.get(..count) else { return Ok(()) };
+        if self.cx.impl_trait(block).is_some() || !args.iter().any(|&arg| matches!(self.cx.types.kind(self.resolve(arg)), Kind::Var(_))) {
+            return Ok(());
+        }
+        for (of, ty, args, bindings) in self.impl_param_bounds(block, args)? {
+            if self.obligation_open(ty, &args) {
+                self.obligations.push((of, std::iter::once(ty).chain(args.iter().copied()).collect()));
+            }
+            for (name, bound) in bindings {
+                self.binding_holds((of, &args), ty, (&name, bound))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Each trait bound on a parameter of impl `block` at `args`, lowered in the impl's frame: the trait, the bounded type, the trait's arguments and the associated types it binds.
+    fn impl_param_bounds(&mut self, block: ImplRef, args: &[Ty]) -> Result<Vec<(ItemRef, Ty, Vec<Ty>, Vec<(String, Ty)>)>> {
+        let header = self.cx.impl_header(block)?;
+        let (_, self_ty) = self.impl_frame(block, args)?;
+        let frame = self.impl_frame_of(block, args, Some(self_ty))?;
+        let (src, home, arena) = (frame.src, frame.home, &header.body);
+        let params = frame.generics.clone();
+        self.with_frame(frame, |infer| {
+            let mut found = Vec::new();
+            for (name, ty) in params {
+                for bound in named_bounds(arena, src, (&header.generics, &header.predicates), name) {
+                    let Some((of, path)) = infer.bound_trait_at(arena, bound, home).filter(|&(of, _)| !infer.compiler_trait(of) && !infer.is_callable_trait(of)) else { continue };
+                    found.push((of, ty, infer.bound_args(of, arena, path, ty)?, infer.path_bindings(arena, path)?));
+                }
+            }
+            Ok(found)
         })
     }
 

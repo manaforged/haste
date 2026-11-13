@@ -118,7 +118,7 @@ impl Infer<'_, '_> {
             bail!("call takes {} arguments, {} given", params.len(), args.len());
         }
         for (&arg, &param) in args.iter().zip(params) {
-            self.call_arg(def, ExprId(arg), (param, None))?;
+            self.call_arg(def, ExprId(arg), (param, None), &mut None)?;
         }
         for &arg in &args[params.len()..] {
             self.expr(ExprId(arg), None)?;
@@ -137,6 +137,46 @@ impl Infer<'_, '_> {
             }
         }
         Ok(None)
+    }
+
+    /// Takes back the `Self` obligation of a call of trait item `item` at `substs` while a trait argument is still unknown, so the arguments are typed before an impl is picked, as rustc selects a callee's obligations only after its arguments that are not closures.
+    pub(super) fn hold_open_obligation(&mut self, def: Option<&(ItemRef, Vec<Ty>)>) -> Result<Option<(ItemRef, Vec<Ty>)>> {
+        let Some((of, substs)) = def.and_then(|(item, substs)| Some((self.cx.owner_trait(*item)?, substs))) else {
+            return Ok(None);
+        };
+        let count = 1 + super::scope::type_params(&self.cx.trait_generics(of)?.1.params).count();
+        let Some(outer) = substs.get(..count) else { return Ok(None) };
+        let open = outer[1..].iter().any(|&ty| matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_)));
+        let Some(at) = self.obligations.iter().position(|(held, tys)| open && *held == of && tys[..] == *outer) else {
+            return Ok(None);
+        };
+        Ok(Some(self.obligations.remove(at)))
+    }
+
+    /// Gives back the held obligation once an argument of type `found` is typed and before it is coerced to the open parameter `param`, as rustc selects pending obligations there, when the impl that picks takes that argument; an open trait argument may have impls here that selection does not see, so a pick the argument does not fit stays held until the arguments are coerced.
+    pub(super) fn release_if_fits(&mut self, held: &mut Option<(ItemRef, Vec<Ty>)>, found: Ty, param: Ty) -> Result<()> {
+        let Some(entry) = held.clone() else { return Ok(()) };
+        if !matches!(self.cx.types.kind(self.resolve(param)), Kind::Var(_)) {
+            return Ok(());
+        }
+        let fits = self.trial(|infer| {
+            infer.obligations.push(entry);
+            if infer.settle_obligations().is_err() || matches!(infer.cx.types.kind(infer.resolve(param)), Kind::Var(_)) {
+                return Ok(None);
+            }
+            Ok(infer.coerces_to(found, param).then_some(()))
+        })?;
+        if fits.is_some() {
+            *held = None;
+        }
+        Ok(())
+    }
+
+    /// Gives back an obligation that `hold_open_obligation` took and settles what it now decides.
+    pub(super) fn release_obligation(&mut self, held: &mut Option<(ItemRef, Vec<Ty>)>) -> Result<()> {
+        let Some(entry) = held.take() else { return Ok(()) };
+        self.obligations.push(entry);
+        self.settle_pending()
     }
 
     fn free_box(&mut self, expr: ExprId, found: Ty) -> Result<()> {

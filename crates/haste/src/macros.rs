@@ -48,6 +48,7 @@ pub fn load_eager(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -
     if !errors.is_empty() {
         anyhow::bail!("{}", errors.join("\n"));
     }
+    crate::host::native::load(&compilation.outline)?;
     Ok(compilation)
 }
 
@@ -61,6 +62,7 @@ pub fn load_lazy(workspace: &Workspace, targets: &Targets) -> Result<Compilation
     let mut compilation = Compilation::new(workspace, outline);
     members.iter().for_each(|krate| compilation.names.crates[*krate].eager = true);
     resolve(&mut compilation)?;
+    crate::host::native::load(&compilation.outline)?;
     Ok(compilation)
 }
 
@@ -214,7 +216,7 @@ fn inputs(outline: &Outline, call: &Bound) -> Vec<String> {
     match &call.site {
         Site::Bang(waiting) => {
             let item = &waiting.file.items.items[waiting.at as usize];
-            vec![item.body.map_or_else(String::new, |open| inside(&waiting.file.source, open))]
+            vec![item.body.map_or_else(String::new, |open| bang_input(&outline.deps[call.krate], call.krate, &waiting.file.source, open))]
         }
         Site::Derive(held) => vec![derive_input(&held.file.source, &held.file.items.items[held.at as usize], &outline.crates[call.krate].env)],
         Site::Attribute(held) => {
@@ -229,6 +231,32 @@ fn inputs(outline: &Outline, call: &Bound) -> Vec<String> {
 /// The text of `item` as a procedural derive macro receives it: without its `#[derive]` attributes or cfg-disabled fields and variants.
 pub(crate) fn derive_input(src: &Source, item: &crate::outline::item::Item, env: &crate::outline::tree::Env) -> String {
     item_text(src, item, &|path| !crate::outline::attr::is_derive_at(src, path, src.pair(path - 1)), Some(&|attrs| env.enabled(attrs)))
+}
+
+/// The tokens between the delimiter that opens at `open` and its pair, as a function-like macro of crate `krate`, whose dependencies are `deps`, receives them: with each `$crate` a `macro_rules!` wrote spelled as a path to its crate.
+pub(crate) fn bang_input(deps: &[(String, usize)], krate: usize, src: &Source, open: u32) -> String {
+    let close = src.pair(open);
+    let (mut parts, mut from) = (Vec::new(), open + 1);
+    for at in open + 1..close {
+        let Some(path) = src.dollar(at).filter(|_| at >= from).and_then(|named| crate_path(deps, krate, named as usize)) else { continue };
+        if at > from {
+            parts.push(src.span(from, at - 1).to_owned());
+        }
+        parts.push(path);
+        from = at + 2;
+    }
+    if close > from {
+        parts.push(src.span(from, close - 1).to_owned());
+    }
+    parts.join(" ")
+}
+
+/// The path that names crate `named` from crate `krate`, whose dependencies are `deps`.
+fn crate_path(deps: &[(String, usize)], krate: usize, named: usize) -> Option<String> {
+    if named == krate {
+        return Some("crate".to_owned());
+    }
+    deps.iter().find(|(_, dep)| *dep == named).map(|(name, _)| format!("::{name}"))
 }
 
 /// The tokens between the delimiter that opens at `open` and its pair.

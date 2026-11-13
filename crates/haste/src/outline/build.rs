@@ -210,11 +210,11 @@ impl Loader<'_> {
         let src = &file.source;
         for attr in &item.attrs {
             let Attr::Other(first) = *attr else { continue };
-            let name = src.text(first);
-            if inert(name) {
+            let absolute = src.kind(first) == TokenKind::Colon && src.kind(first + 1) == TokenKind::Colon && src.kind(first + 2) == TokenKind::Ident;
+            if !absolute && inert(src.text(first)) {
                 continue;
             }
-            let mut last = first;
+            let mut last = if absolute { first + 2 } else { first };
             while src.kind(last + 1) == TokenKind::Colon && src.kind(last + 2) == TokenKind::Colon && src.kind(last + 3) == TokenKind::Ident {
                 last += 3;
             }

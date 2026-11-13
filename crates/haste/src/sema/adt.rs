@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use rustc_abi::{Align, Integer, IntegerType, LayoutCalculator, ReprFlags, ReprOptions, TargetDataLayout};
+use rustc_abi::{Align, Integer, IntegerType, LayoutCalculator, NicheOptimizations, ReprFlags, ReprOptions, TargetDataLayout};
 use rustc_index::IndexVec;
 
 use crate::names::{ItemRef, Primitive};
-use crate::outline::attr::split_commas;
+use crate::outline::attr::{repr_words, split_commas};
 use crate::outline::item::{Attr, ItemKind};
+use crate::outline::source::Source;
 
 use super::Context;
 use super::infer::field_types;
@@ -37,27 +38,14 @@ impl<'a> Context<'a> {
         self.repr(item).int.map_or(Primitive::Isize, repr_primitive)
     }
 
-    /// The `#[repr]` options of `item`.
+    /// The `#[repr]` options of `item`, written directly or through a `cfg_attr` that holds.
     pub fn repr(&self, item: ItemRef) -> ReprOptions {
         let (src, entry) = self.item(item);
         let mut repr = ReprOptions::default();
-        for attr in &entry.attrs {
-            let Attr::Other(at) = *attr else { continue };
-            if src.text(at) != "repr" || src.kind(at + 1) != rustc_lexer::TokenKind::OpenParen {
-                continue;
-            }
-            for (from, _) in split_commas(src, at + 2, src.pair(at + 1)) {
-                match src.text(from) {
-                    "C" => repr.flags |= ReprFlags::IS_C,
-                    "transparent" => repr.flags |= ReprFlags::IS_TRANSPARENT,
-                    "packed" => repr.pack = Some(repr_align(src, from).unwrap_or(Align::ONE)),
-                    "align" => repr.align = repr_align(src, from).or(repr.align),
-                    word => repr.int = REPR_INTS.iter().find(|(name, _)| *name == word).map(|(_, int)| integer_type(*int)).or(repr.int),
-                }
-            }
-        }
+        read_repr_words(src, repr_words(src, &entry.attrs, &self.outline.crates[item.krate as usize].env), &mut repr);
         repr
     }
+
 
     /// The argument positions that `#[rustc_legacy_const_generics(..)]` on the function `item` gives its const generics, in order.
     pub fn legacy_const_args(&self, item: ItemRef) -> Vec<usize> {
@@ -75,6 +63,14 @@ impl<'a> Context<'a> {
         self.attr_value(item, "lang")
     }
 
+    /// The symbol that the foreign `item` links to: its `#[link_name]` with escapes read and without the leading `\u{1}` that asks for the name verbatim, else its own name.
+    pub fn symbol_name(&self, item: ItemRef) -> Option<String> {
+        let (src, entry) = self.item(item);
+        let Some(at) = self.attr_at(item, "link_name") else { return entry.name.map(|at| src.text(at).to_owned()) };
+        let text = src.literal_text(at + 2).ok().flatten()?;
+        Some(text.strip_prefix('\u{1}').map(str::to_owned).unwrap_or(text))
+    }
+
     /// The value of the name-value attribute `#[key = "..."]` on `item`, written directly or through a `cfg_attr` that holds.
     pub fn attr_value(&self, item: ItemRef, key: &str) -> Option<&'a str> {
         let at = self.attr_at(item, key)?;
@@ -89,6 +85,11 @@ impl<'a> Context<'a> {
     /// Whether the function `item` is `#[inline(always)]`.
     pub fn inline_always(&self, item: ItemRef) -> bool {
         self.attr_at(item, "inline").is_some_and(|at| self.item(item).0.text(at + 2) == "always")
+    }
+
+    /// Whether the const function `item` is `#[rustc_promotable]`, so a reference to its call on promotable arguments lives for the whole program.
+    pub fn rustc_promotable(&self, item: ItemRef) -> bool {
+        self.attr_at(item, "rustc_promotable").is_some()
     }
 
     /// The token of the attribute `key` that `item` carries, through `cfg_attr` whose cfg holds.
@@ -123,12 +124,26 @@ impl<'a> Context<'a> {
             ItemKind::Union => calc.layout_of_union(&repr, &variants),
             _ => {
                 let discriminants = if kind == ItemKind::Enum { self.discriminants(item)? } else { Arc::from([0]) };
-                let no_niche = matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned"));
-                let tagged = discriminants.iter().enumerate().map(|(at, &value)| (rustc_index::Idx::new(at), value));
-                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, no_niche, |min, max| discr_range(dl, &repr, min, max), tagged, sized)
+                let niches = if matches!(self.lang(item), Some("unsafe_cell" | "unsafe_pinned")) { NicheOptimizations::Disabled } else { NicheOptimizations::Enabled };
+                let bits = Integer::from_attr(dl, repr.discr_type()).size();
+                let tagged = discriminants.iter().enumerate().map(|(at, &value)| (rustc_index::Idx::new(at), bits.truncate(value as u128)));
+                calc.layout_of_struct_or_enum(&repr, &variants, kind == ItemKind::Enum, niches, |min, max| discr_range(dl, &repr, min.start, max.last), tagged, sized)
             }
         };
         result.map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))
+    }
+}
+
+/// Adds the `#[repr]` words that start at the tokens `words` to `repr`.
+fn read_repr_words(src: &Source, words: Vec<u32>, repr: &mut ReprOptions) {
+    for from in words {
+        match src.text(from) {
+            "C" => repr.flags |= ReprFlags::IS_C,
+            "transparent" => repr.flags |= ReprFlags::IS_TRANSPARENT,
+            "packed" => repr.pack = Some(repr_align(src, from).unwrap_or(Align::ONE)),
+            "align" => repr.align = repr_align(src, from).or(repr.align),
+            word => repr.int = REPR_INTS.iter().find(|(name, _)| *name == word).map(|(_, int)| integer_type(*int)).or(repr.int),
+        }
     }
 }
 
@@ -154,14 +169,14 @@ fn integer_type(primitive: Primitive) -> IntegerType {
     }
 }
 
-fn discr_range(dl: &TargetDataLayout, repr: &ReprOptions, min: i128, max: i128) -> (Integer, bool) {
+fn discr_range(dl: &TargetDataLayout, repr: &ReprOptions, min: i128, max: u128) -> (Integer, bool) {
     match repr.int {
         Some(IntegerType::Fixed(integer, signed)) => return (integer, signed),
         Some(IntegerType::Pointer(signed)) => return (dl.ptr_sized_integer(), signed),
         None => {}
     }
-    let unsigned = Integer::fit_unsigned(std::cmp::max(min as u128, max as u128));
-    let signed = std::cmp::max(Integer::fit_signed(min), Integer::fit_signed(max));
+    let unsigned = Integer::fit_unsigned(max);
+    let signed = std::cmp::max(Integer::fit_signed(min), Integer::fit_signed(i128::try_from(max).unwrap_or(i128::MAX)));
     let at_least = if repr.c() { Integer::I32 } else { Integer::I8 };
     if min >= 0 { (std::cmp::max(unsigned, at_least), false) } else { (std::cmp::max(signed, at_least), true) }
 }

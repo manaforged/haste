@@ -2,9 +2,9 @@ use super::asm::{Alu, Cond, Group3, Reg, Rm, Shift, Size, Xmm};
 use super::{Emit, Ext};
 use crate::ir::{Binary, Convert, FloatCC, Type, Unary, Value};
 
-const X0: Xmm = Xmm(0);
-const X1: Xmm = Xmm(1);
-const X2: Xmm = Xmm(2);
+pub(super) const X0: Xmm = Xmm(0);
+pub(super) const X1: Xmm = Xmm(1);
+pub(super) const X2: Xmm = Xmm(2);
 const TWO_63: i64 = 0x43E0_0000_0000_0000;
 const TWO_64: i64 = 0x43F0_0000_0000_0000;
 /// The bits of 2^52, the least magnitude at which every f64 is whole.
@@ -119,9 +119,17 @@ impl Emit<'_> {
             other => return Err(format!("{other:?} of a float")),
         };
         let dst = self.fdst(result);
-        self.fget(dst, x);
-        let source = self.foperand(y);
-        self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, source);
+        match self.xmm_of(x).filter(|_| self.features.avx) {
+            Some(src) => {
+                let source = self.foperand(y);
+                self.asm.vex_scalar(scalar(ty), opcode, (dst, src), source);
+            }
+            None => {
+                self.fget(dst, x);
+                let source = self.foperand(y);
+                self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, source);
+            }
+        }
         self.fput(result, dst);
         Ok(())
     }

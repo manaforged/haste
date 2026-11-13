@@ -7,7 +7,7 @@ use crate::graph::{self, Targets};
 use crate::image::{Image, Program};
 use crate::macros::Compilation;
 use crate::names::ItemRef;
-use crate::outline::{self, edit::Edit};
+use crate::outline::{self, edit::Edit, tree::Profile};
 use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
 use crate::sema::{self, Cache, Edited};
 use anyhow::{Result, bail};
@@ -76,7 +76,7 @@ fn batch_roots(workspace: &graph::Workspace, outline: &outline::Outline, pick: P
 }
 
 /// The `main` of the first member binary.
-fn main_item(workspace: &graph::Workspace, outline: &outline::Outline) -> Option<ItemRef> {
+pub(crate) fn main_item(workspace: &graph::Workspace, outline: &outline::Outline) -> Option<ItemRef> {
     let krate = outline.members(workspace).find(|&krate| outline.roots[krate].role == outline::Role::Bin)?;
     outline.main(krate)
 }
@@ -156,6 +156,20 @@ impl Batch {
             }
         }
         (failures, runnable)
+    }
+
+    /// Why each function the roots reach did not type-check or compile, at the file and line of its item and with its type arguments, keyed by the kind of error.
+    fn failures(&self, cx: &sema::Context<'_>) -> Failures {
+        let mut failures = Failures::new();
+        for at in self.reached.closure(&self.roots) {
+            if let Some(error) = self.reached.list[at].1.as_ref().err().or_else(|| self.broken.get(&at)) {
+                let (item, substs) = self.reached.list[at].0;
+                let (src, entry) = cx.item(item);
+                let substs: Vec<String> = cx.types.substs(substs).iter().map(|&ty| cx.type_text(ty, &|ty| ty)).collect();
+                failures.entry(error_kind(error)).or_default().push(format!("{}:{} {error} [{}]", src.path.display(), src.line(entry.start), substs.join(", ")));
+            }
+        }
+        failures
     }
 
     /// Prints what failed to build and how long building took, and returns 1 when anything failed.
@@ -306,6 +320,16 @@ impl Build {
         Ok(binary.check(built))
     }
 
+    /// Why each function the binary's `main` reaches did not type-check or compile, at the file and line of its item, keyed by the kind of error.
+    pub fn failures(&mut self) -> Result<Failures> {
+        let Some(binary) = &mut self.binary else { bail!("the binary is not compiled") };
+        let Some(store) = binary.store.take() else { bail!("the binary has no inference store") };
+        let cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
+        let failures = binary.failures(&cx);
+        binary.store = Some(cx.release().0);
+        Ok(failures)
+    }
+
     /// Writes the equivalence-class, hazard, origin, and code-size census of the compiled binary to `path`.
     pub fn write_stats(&mut self, workspace: &graph::Workspace, graph: sema::census::Span, path: &std::path::Path) -> Result<()> {
         let Some(binary) = &mut self.binary else { bail!("the binary is not compiled") };
@@ -332,13 +356,59 @@ impl Build {
     }
 }
 
-/// Runs the binary's `main` with `args` as argv, compiling each function on its first call.
+/// Runs the binary's `main` with `args` as argv, compiling each function on its first call, and, when prepared code is switched on, under the release profile calling prepped code where it can, racing a prep of what changed since the library was built.
 pub fn run(workspace: &graph::Workspace, targets: &Targets, args: &[String]) -> Result<i32> {
+    let mut ahead = if crate::profile() == Profile::Release && crate::prep::prepared() { crate::prep::ahead(workspace, targets) } else { None };
+    let status = run_loaded(workspace, targets, args, ahead.as_mut());
+    if !matches!(status, Ok(0))
+        && let Some(said) = ahead.as_mut().and_then(crate::prep::Ahead::rejected)
+    {
+        eprintln!("haste: rustc rejects this program too:\n{said}");
+    }
+    status
+}
+
+fn run_loaded(workspace: &graph::Workspace, targets: &Targets, args: &[String], ahead: Option<&mut crate::prep::Ahead>) -> Result<i32> {
     let mut compilation = crate::macros::load_eager(workspace, targets, &[])?;
     let Some(main) = main_item(workspace, &compilation.outline) else { bail!("no member binary has a `main`") };
+    if crate::profile() == Profile::Release && crate::prep::prepared() {
+        bind_prepped(workspace, &mut compilation, args, ahead);
+    }
     let status = crate::image::run_on_demand(&mut compilation, (sema::Cache::default(), main), args);
     std::mem::forget(compilation);
     status
+}
+
+/// Builds the prepped library of the build of `workspace`, starting rustc before the sources load when it can, and returns what it holds.
+pub fn prep(workspace: &graph::Workspace, targets: &Targets) -> Result<crate::prep::Counts> {
+    let started = crate::prep::begin(workspace, targets)?;
+    let compilation = match crate::macros::load_eager(workspace, targets, &[]) {
+        Ok(compilation) => compilation,
+        Err(error) => {
+            started.cancel();
+            return Err(error);
+        }
+    };
+    let counts = started.end(&compilation.outline, workspace);
+    std::mem::forget(compilation);
+    counts
+}
+
+/// Binds this process to what of the prepped library of the build still matches the sources, once the prep `ahead` races lands or its wait runs out, and starts a prep in the background when the library is missing or older than the sources; a build that cannot bind it compiles everything.
+fn bind_prepped(workspace: &graph::Workspace, compilation: &mut Compilation, args: &[String], mut ahead: Option<&mut crate::prep::Ahead>) {
+    if let Some(ahead) = ahead.as_deref_mut() {
+        ahead.wait();
+    }
+    let (manifest, current) = match crate::prep::load(&compilation.outline, workspace, ahead) {
+        Ok(loaded) => loaded,
+        Err(error) => (Err(error), true),
+    };
+    if !current && let Err(error) = crate::prep::refresh(&compilation.outline, workspace) {
+        eprintln!("haste: not preparing in the background: {error:#}");
+    }
+    if let Err(error) = manifest.and_then(|manifest| manifest.map_or(Ok(()), |manifest| crate::prep::install(manifest, args))) {
+        eprintln!("haste: running without prepped code: {error:#}");
+    }
 }
 
 /// Whether crate `krate` is a procedural macro crate, whose bodies decide the code of the crates that call its macros.

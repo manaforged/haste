@@ -231,7 +231,7 @@ fn print_scope(outline: &outline::Outline, names: &Names, name: &str) {
     }
 }
 
-const USAGE: &str = "usage: haste [--jobs N] [--stats-json PATH] build|test|run|serve PATH [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand PATH [CRATE]";
+const USAGE: &str = "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] build|test|run|serve|prep PATH [--] [ARGS...]\n       haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]\n       haste [--release] debug code PATH DIR";
 
 /// What the command line asks for.
 #[derive(Clone, Copy)]
@@ -240,6 +240,8 @@ enum Command {
     Request(Request),
     /// Keep a build of the workspace in memory and answer requests.
     Serve,
+    /// Prepare the code the binary reaches for the prepped library.
+    Prep,
     /// Print what one stage found.
     Debug(Query),
 }
@@ -254,14 +256,18 @@ enum Query {
     Scope,
     Items,
     Expand,
+    Failures,
+    /// Write the machine code of every function `main` reaches, with the rustc symbol each binds to.
+    Code,
 }
 
-const QUERIES: [(Query, &str); 7] = [(Query::Graph, "graph"), (Query::Outline, "outline"), (Query::Lazy, "lazy"), (Query::Typeck, "typeck"), (Query::Scope, "scope"), (Query::Items, "items"), (Query::Expand, "expand")];
+const QUERIES: [(Query, &str); 9] = [(Query::Graph, "graph"), (Query::Outline, "outline"), (Query::Lazy, "lazy"), (Query::Typeck, "typeck"), (Query::Scope, "scope"), (Query::Items, "items"), (Query::Expand, "expand"), (Query::Failures, "failures"), (Query::Code, "code")];
 
 fn parse(args: &mut impl Iterator<Item = String>) -> Result<Command> {
     let word = args.next().context(USAGE)?;
     match word.as_str() {
         "serve" => Ok(Command::Serve),
+        "prep" => Ok(Command::Prep),
         "debug" => {
             let name = args.next().context(USAGE)?;
             QUERIES.into_iter().find(|(_, query)| *query == name).map(|(query, _)| Command::Debug(query)).context(USAGE)
@@ -277,6 +283,23 @@ fn consume_options<I: Iterator<Item = String>>(args: &mut std::iter::Peekable<I>
                 args.next();
                 let count: usize = args.next().context(USAGE)?.parse().context("--jobs takes a positive number")?;
                 crate::set_jobs(count.max(1));
+            }
+            "--release" => {
+                args.next();
+                crate::set_profile(outline::tree::Profile::Release);
+            }
+            "--prepared" => {
+                args.next();
+                crate::prep::set_prepared();
+            }
+            "--prep-wait" => {
+                args.next();
+                let millis: u64 = args.next().context(USAGE)?.parse().context("--prep-wait takes a number of milliseconds")?;
+                crate::prep::set_wait(std::time::Duration::from_millis(millis));
+            }
+            "--perf-map" => {
+                args.next();
+                crate::image::perf::enable();
             }
             "--stats-json" => {
                 args.next();
@@ -323,6 +346,10 @@ fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>)
     }
     let path = PathBuf::from(args.next().context(USAGE)?);
     let rest: Vec<String> = args.collect();
+    let rest = match rest.split_first() {
+        Some((first, tail)) if first == "--" => tail.to_vec(),
+        _ => rest,
+    };
     Ok((command, path, rest, stats_json))
 }
 
@@ -339,6 +366,7 @@ pub fn main() -> Result<()> {
     let root = std::path::absolute(path)?;
     let argv: Vec<String> = std::iter::once(program_name(&root)).chain(rest).collect();
     if stats_json.is_none()
+        && crate::profile() == outline::tree::Profile::Debug
         && let Command::Request(request) = command
         && let Some(status) = crate::serve::ask(&root, request, &argv)?
     {
@@ -362,8 +390,34 @@ fn report_query(query: Query, (workspace, targets): (&graph::Workspace, &Targets
             print_scope(&compilation.outline, &compilation.names, name);
             Ok(())
         }
+        Query::Failures => report_failures(workspace, targets),
+        Query::Code => crate::dump::write(workspace, targets, std::path::Path::new(argv.get(1).context(USAGE)?)),
         Query::Items | Query::Expand => Ok(()),
     }
+}
+
+/// Builds the binary and prints every function its `main` reaches that did not type-check or compile, grouped by the kind of error, largest group first.
+fn report_failures(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let mut build = crate::build::Build::load(workspace, targets)?;
+    build.compile_binary(workspace)?;
+    let mut groups: Vec<(String, Vec<String>)> = build.failures()?.into_iter().collect();
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    for (kind, errors) in &groups {
+        println!("{} {kind}", errors.len());
+        for error in errors {
+            println!("    {error}");
+        }
+    }
+    eprintln!("{} functions failed in {} groups", groups.iter().map(|(_, errors)| errors.len()).sum::<usize>(), groups.len());
+    std::mem::forget(build);
+    Ok(())
+}
+
+fn report_prep(workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
+    let started = Instant::now();
+    let counts = crate::build::prep(workspace, targets)?;
+    println!("{counts} in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+    Ok(())
 }
 
 fn program_name(root: &std::path::Path) -> String {
@@ -391,6 +445,7 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
     let status = match command {
         Command::Request(request) => report_cases(&workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)))?,
         Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
+        Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };
     eprintln!("graph {} packages {} units in {:.1} ms", workspace.packages.len(), workspace.graph.units.len(), loaded.as_secs_f64() * 1e3);

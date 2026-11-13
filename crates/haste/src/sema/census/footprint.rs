@@ -249,7 +249,7 @@ fn hash_enum_encoding(cx: &mut Context<'_>, item: ItemRef, ty: Ty, repr: &Repr, 
     let Ok(layout) = cx.layout(ty) else { return };
     hash_repr(repr, &mut bins.niche);
     bins.niche.u64(layout.size.bytes());
-    bins.niche.u64(layout.align.abi.bytes());
+    bins.niche.u64(layout.align.bytes());
     match &layout.variants {
         Variants::Empty => {
             bins.k.byte(0);
@@ -294,8 +294,8 @@ fn hash_tag_encoding(cx: &mut Context<'_>, item: ItemRef, encoding: &TagEncoding
             for out in [&mut bins.k, &mut bins.niche] {
                 out.byte(1);
                 out.usize(untagged_variant.index());
-                out.usize(niche_variants.start().index());
-                out.usize(niche_variants.end().index());
+                out.usize(niche_variants.start.index());
+                out.usize(niche_variants.last.index());
                 out.u128(*niche_start);
             }
         }

@@ -20,7 +20,7 @@ impl Infer<'_, '_> {
 
     fn expr_kind(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
         match *self.body.expr(expr) {
-            Expr::Lit(lit, at) => self.lit(lit, at),
+            Expr::Lit(lit, at) => self.lit(lit, at, expected),
             Expr::Path(path) => self.path_expr(expr, path),
             Expr::Paren(inner) => self.expr(inner, expected),
             Expr::Unary(op, operand) => self.unary(expr, (op, operand), expected),
@@ -41,6 +41,7 @@ impl Infer<'_, '_> {
         let target = self.lower_ty(self.body, ty)?;
         let hint = matches!(self.cx.types.kind(self.resolve(target)), Kind::FnPtr(..)).then_some(target);
         let found = self.expr(inner, hint)?;
+        self.note_cast_pointee(found, target);
         let address = matches!(self.cx.types.kind(self.resolve(target)), Kind::Ptr(..) | Kind::Prim(Primitive::Usize | Primitive::Isize));
         let coercion = match self.cx.types.kind(self.resolve(found)).clone() {
             Kind::FnDef(item, substs) if address => Some(super::coerce::Coercion::Reify(Res::Fn(item, substs))),
@@ -50,6 +51,26 @@ impl Infer<'_, '_> {
             self.out.coercions.insert(inner, coercion);
         }
         Ok(target)
+    }
+
+    /// Notes a cast to `*const _` or `*mut _` from the reference or pointer `found`, whose open pointee takes the pointee of `found` when nothing else fixes it, as the coercion to a raw pointer gives it.
+    fn note_cast_pointee(&mut self, found: Ty, target: Ty) {
+        let Kind::Ptr(_, open) = *self.cx.types.kind(self.resolve(target)) else { return };
+        if let Kind::Var(_) = self.cx.types.kind(self.resolve(open))
+            && let Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) = *self.cx.types.kind(self.resolve(found))
+        {
+            self.casts.push((open, pointee));
+        }
+    }
+
+    /// Gives each cast pointee that is still open the pointee of the value cast.
+    pub(super) fn settle_casts(&mut self) -> Result<()> {
+        for (open, pointee) in std::mem::take(&mut self.casts) {
+            if matches!(self.cx.types.kind(self.resolve(open)), Kind::Var(_)) {
+                self.unify(open, pointee)?;
+            }
+        }
+        Ok(())
     }
 
     fn tuple(&mut self, list: List, expected: Option<Ty>) -> Result<Ty> {
@@ -123,19 +144,28 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn lit(&mut self, lit: Lit, at: u32) -> Result<Ty> {
+    /// The type of the literal `lit` at token `at`: its suffix's, else the integer or float type `expected` names, as rustc types an unsuffixed literal, else a fresh numeric variable.
+    fn lit(&mut self, lit: Lit, at: u32, expected: Option<Ty>) -> Result<Ty> {
         let text = self.src.text(at);
+        let wanted = self.known(expected).map(|ty| self.resolve(ty));
+        let numeric = |float: bool| {
+            wanted.filter(|&ty| match *self.cx.types.kind(ty) {
+                Kind::Prim(prim) if float => float_bits(prim).is_some(),
+                Kind::Prim(prim) => int_info(prim).is_some(),
+                _ => false,
+            })
+        };
         Ok(match lit {
             Lit::Bool(_) => self.cx.types.bool(),
             Lit::Char => self.cx.types.prim(Primitive::Char),
             Lit::Byte => self.cx.types.prim(Primitive::U8),
             Lit::Int => match parse_int(text)?.1 {
                 Some(primitive) => self.cx.types.prim(primitive),
-                None => self.fresh(Kind::IntVar),
+                None => numeric(false).unwrap_or_else(|| self.fresh(Kind::IntVar)),
             },
             Lit::Float => match ["f16", "f32", "f64", "f128"].iter().find(|suffix| text.ends_with(*suffix)) {
                 Some(suffix) => self.cx.types.prim(Primitive::named(suffix).unwrap_or(Primitive::F64)),
-                None => self.fresh(Kind::FloatVar),
+                None => numeric(true).unwrap_or_else(|| self.fresh(Kind::FloatVar)),
             },
             Lit::Str => {
                 let str_ty = self.cx.types.prim(Primitive::Str);
@@ -164,7 +194,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn is_float(&self, ty: Ty) -> bool {
+    pub(super) fn is_float(&self, ty: Ty) -> bool {
         match self.cx.types.kind(self.resolve(ty)) {
             Kind::FloatVar(_) => true,
             Kind::Prim(primitive) => float_bits(*primitive).is_some(),
@@ -231,7 +261,7 @@ impl Infer<'_, '_> {
     }
 
     /// The right operand type of the operator trait `of` when one impl of it applies to the ADT `left`.
-    fn only_right(&mut self, of: ItemRef, left: Ty) -> Option<Ty> {
+    pub(super) fn only_right(&mut self, of: ItemRef, left: Ty) -> Option<Ty> {
         let left = self.resolve(left);
         if matches!(self.cx.types.kind(left), Kind::Param(_) | Kind::Proj(_)) {
             return self.poly_only_right(of, left);
@@ -291,12 +321,16 @@ impl Infer<'_, '_> {
             let mut at = 0;
             while at < self.operands.len() {
                 let (expr, op, operands, out) = self.operands[at];
-                if self.pending(op, operands)? {
+                let compound = matches!(self.body.expr(expr), Expr::AssignOp(..));
+                if if compound { self.unknown_left(operands.0) } else { self.pending(op, operands)? } {
                     at += 1;
                     continue;
                 }
                 self.operands.swap_remove(at);
-                let found = self.operator_type(expr, op, operands)?;
+                let found = match *self.body.expr(expr) {
+                    Expr::AssignOp(_, _, rhs) => self.compound(expr, op, (operands.0, rhs, operands.1)).map(|()| out)?,
+                    _ => self.operator_type(expr, op, operands)?,
+                };
                 self.unify(found, out)?;
             }
             if self.operands.is_empty() || self.operands.len() == before {
@@ -313,12 +347,7 @@ impl Infer<'_, '_> {
 
     /// Whether operator `op` on `left` and `right` must wait to pick its impl: the left operand is a variable or a reference to one, or several impls fit only because the right operand is an untyped number.
     fn pending(&mut self, op: BinOp, (left, right): (Ty, Ty)) -> Result<bool> {
-        let unknown_left = match self.cx.types.kind(self.resolve(left)) {
-            Kind::Var(_) => true,
-            Kind::Ref(_, inner) => matches!(self.cx.types.kind(self.resolve(*inner)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)),
-            _ => false,
-        };
-        if unknown_left {
+        if self.unknown_left(left) {
             return Ok(true);
         }
         if self.builtin_left(op, left) || !matches!(self.cx.types.kind(self.resolve(right)), Kind::IntVar(_) | Kind::FloatVar(_)) {
@@ -327,6 +356,15 @@ impl Infer<'_, '_> {
         let Some((lang, _)) = operator_trait(op) else { return Ok(false) };
         let Some(of) = self.cx.lang_item(lang) else { return Ok(false) };
         Ok(!self.probe(|infer| infer.select_or_assume(of, left, &[right]).unwrap_or(false)))
+    }
+
+    /// Whether the left operand `left` is a variable or a reference to one, so no operator impl can be picked for it yet.
+    fn unknown_left(&self, left: Ty) -> bool {
+        match self.cx.types.kind(self.resolve(left)) {
+            Kind::Var(_) => true,
+            Kind::Ref(_, inner) => matches!(self.cx.types.kind(self.resolve(*inner)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)),
+            _ => false,
+        }
     }
 
     fn overloaded(&mut self, expr: ExprId, op: BinOp, (left, right): (Ty, Ty)) -> Result<Ty> {
@@ -340,7 +378,7 @@ impl Infer<'_, '_> {
     }
 
     /// The trait with lang item `lang` and its method `name`, when an impl of that trait applies to `left` with the trait arguments `args`.
-    fn operator_impl(&mut self, (lang, name): (&str, &str), left: Ty, args: &[Ty]) -> Result<Option<(ItemRef, ItemRef)>> {
+    pub(super) fn operator_impl(&mut self, (lang, name): (&str, &str), left: Ty, args: &[Ty]) -> Result<Option<(ItemRef, ItemRef)>> {
         let Some(of) = self.cx.lang_item(lang) else { bail!("core has no `{lang}` trait") };
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{lang}` has no `{name}`") };
         Ok(self.select_or_prove(of, left, args)?.then_some((of, method)))
@@ -369,43 +407,6 @@ impl Infer<'_, '_> {
         scalar || self.is_int(ty) || self.is_float(ty)
     }
 
-    fn assign(&mut self, expr: ExprId, (lhs, rhs): (ExprId, ExprId), op: Option<BinOp>) -> Result<Ty> {
-        let place = self.expr(lhs, None)?;
-        self.note_mut(lhs)?;
-        match op {
-            Some(bin) if !self.builtin_compound(bin, place) => self.overloaded_assign(expr, bin, (place, rhs))?,
-            Some(BinOp::Shl | BinOp::Shr) => drop(self.expr(rhs, None)?),
-            _ => {
-                let value = self.expr(rhs, Some(place))?;
-                self.coerce_expr(rhs, value, place)?;
-            }
-        }
-        Ok(self.cx.types.unit())
-    }
-
-    /// Types `place op= rhs` through the operator's assign trait, coercing `rhs` to the right operand type when one impl fixes it, as rustc does.
-    fn overloaded_assign(&mut self, expr: ExprId, op: BinOp, (place, rhs): (Ty, ExprId)) -> Result<()> {
-        let Some((lang, name)) = operator_trait(op) else { bail!("{op:?} has no operator trait") };
-        let (lang, name) = (format!("{lang}_assign"), format!("{name}_assign"));
-        let right = self.cx.lang_item(&lang).and_then(|of| self.only_right(of, place));
-        let found = self.expr(rhs, right)?;
-        let value = match right {
-            Some(want) => self.coerce_expr(rhs, found, want).map(|()| want)?,
-            None => found,
-        };
-        let Some((of, method)) = self.operator_impl((&lang, &name), place, &[value])? else { bail!("unsupported compound assignment on {}", self.show(place)) };
-        if self.has_vars(value) {
-            self.obligations.push((of, vec![place, value]));
-        }
-        self.out.operators.insert(expr, Res::fn_of(&self.cx.types, method, &[place, value]));
-        Ok(())
-    }
-
-    fn builtin_compound(&mut self, op: BinOp, place: Ty) -> bool {
-        let logical = matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor);
-        self.is_int(place) || self.is_float(place) || logical && self.resolve(place) == self.cx.types.bool()
-    }
-
     fn call(&mut self, expr: ExprId, (callee, args): (ExprId, List), expected: Option<Ty>) -> Result<Ty> {
         let found = self.callee(callee)?;
         let callee_ty = self.callee_base(expr, found);
@@ -427,13 +428,19 @@ impl Infer<'_, '_> {
             _ => return self.other_call(expr, found, callee_ty, args),
         };
         let args = self.passed_args(def.as_ref(), args, params.len())?;
+        let held = self.hold_open_obligation(def.as_ref())?;
         let def = def.or_else(|| self.ctor_callee(callee));
-        self.call_args(args, (params, ret, def), expected)
+        self.call_args(args, (params, ret, def), (expected, held))
     }
 
     fn other_call(&mut self, expr: ExprId, found: Ty, callee_ty: Ty, args: List) -> Result<Ty> {
         if self.poly.is_some() && matches!(self.cx.types.kind(callee_ty), Kind::Param(_) | Kind::Proj(_)) {
             return self.poly_call(expr, found, callee_ty, args);
+        }
+        if matches!(self.cx.types.kind(callee_ty), Kind::Var(_))
+            && let Some((params, ret)) = self.callable_sig(callee_ty)?
+        {
+            return self.call_once_of(expr, callee_ty, (params, ret), args);
         }
         bail!("calling {} is not supported yet", self.show(callee_ty))
     }
@@ -476,15 +483,19 @@ impl Infer<'_, '_> {
     }
 
     /// Infers the arguments `args` of a call of a function with `params` that returns `ret`, the function item `def` when it is one, and returns `ret`.
-    fn call_args(&mut self, args: Vec<u32>, (params, ret, def): (Vec<Ty>, Ty, Option<(ItemRef, Vec<Ty>)>), expected: Option<Ty>) -> Result<Ty> {
+    fn call_args(&mut self, args: Vec<u32>, (params, ret, def): (Vec<Ty>, Ty, Option<(ItemRef, Vec<Ty>)>), (expected, mut held): (Option<Ty>, Option<(ItemRef, Vec<Ty>)>)) -> Result<Ty> {
         let extra = self.variadic_extra(def.as_ref().map(|(item, _)| *item), args.len(), params.len())?;
         let hints = self.expected_inputs(&params, ret, expected);
         for ((&arg, param), hint) in args.iter().zip(params).zip(hints) {
-            self.call_arg(def.as_ref().map(|(item, substs)| (*item, &substs[..])), ExprId(arg), (param, hint))?;
+            if self.is_closure(ExprId(arg)) {
+                self.release_obligation(&mut held)?;
+            }
+            self.call_arg(def.as_ref().map(|(item, substs)| (*item, &substs[..])), ExprId(arg), (param, hint), &mut held)?;
         }
         for &arg in &args[args.len() - extra..] {
             self.expr(ExprId(arg), None)?;
         }
+        self.release_obligation(&mut held)?;
         Ok(ret)
     }
 
@@ -531,7 +542,7 @@ impl Infer<'_, '_> {
         let then_ty = self.expr(then, expected)?;
         self.scopes.truncate(depth);
         let then_diverges = std::mem::replace(&mut self.diverges, false);
-        let hint = Some(then_ty).filter(|&ty| !self.is_never(ty));
+        let hint = Some(then_ty).filter(|&ty| !self.is_never(ty) && !matches!(self.cx.types.kind(self.resolve(ty)), Kind::FnDef(..)));
         let else_ty = self.expr(otherwise, expected.or(hint))?;
         self.diverges = before || (then_diverges && self.diverges);
         let target = match self.known(expected) {
@@ -575,7 +586,7 @@ impl Infer<'_, '_> {
         Ok(a)
     }
 
-    /// The type both branches coerce to when they differ: an unsized slice, a function pointer, or one branch's reference that the other coerces to.
+    /// The type both branches coerce to when they differ: an unsized slice, a function pointer, or one branch's reference or pointer of the same type, such as a `Box`, that the other coerces to.
     pub(super) fn branch_target(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
         if let Some(target) = self.slice_branch(a, b) {
             return Ok(Some(target));
@@ -583,7 +594,13 @@ impl Infer<'_, '_> {
         if let Some(target) = self.fn_branch(a, b)? {
             return Ok(Some(target));
         }
-        if ![a, b].iter().all(|&ty| matches!(self.cx.types.kind(self.resolve(ty)), Kind::Ref(..))) {
+        let (ka, kb) = (self.cx.types.kind(self.resolve(a)), self.cx.types.kind(self.resolve(b)));
+        let pointers = match (ka, kb) {
+            (Kind::Ref(..), Kind::Ref(..)) => true,
+            (Kind::Adt(x, _), Kind::Adt(y, _)) => x == y,
+            _ => false,
+        };
+        if !pointers {
             return Ok(None);
         }
         if self.trial(|infer| Ok(infer.coercion(b, a).ok().flatten()))?.is_some() {
@@ -605,17 +622,17 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// The function pointer type both branches reify to, when they are two different function items, as rustc's common type of two branches does.
+    /// The function pointer type both branches reify to, when they are two different function items or a function item and a function pointer, as rustc's common type of two branches does.
     fn fn_branch(&mut self, a: Ty, b: Ty) -> Result<Option<Ty>> {
-        let (a, b) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
-        let (Kind::FnDef(item, substs), Kind::FnDef(..)) = (&a, &b) else {
-            return Ok(None);
+        let (a_kind, b_kind) = (self.cx.types.kind(self.resolve(a)).clone(), self.cx.types.kind(self.resolve(b)).clone());
+        let (item, substs) = match (&a_kind, &b_kind) {
+            (Kind::FnDef(..), Kind::FnPtr(..)) => return Ok(Some(b)),
+            (Kind::FnPtr(..), Kind::FnDef(..)) => return Ok(Some(a)),
+            (Kind::FnDef(item, substs), Kind::FnDef(..)) if a_kind != b_kind => (*item, *substs),
+            _ => return Ok(None),
         };
-        if a == b {
-            return Ok(None);
-        }
-        let slice = self.cx.types.substs(*substs).to_vec();
-        let (params, ret) = self.fn_types(*item, &slice)?;
+        let slice = self.cx.types.substs(substs).to_vec();
+        let (params, ret) = self.fn_types(item, &slice)?;
         Ok(Some(self.cx.types.fn_ptr(&params, ret)))
     }
 
@@ -744,6 +761,6 @@ const OPERATORS: [(BinOp, &str, &str); 16] = [
 ];
 
 /// The lang item of the trait that overloads `op`, and its method.
-fn operator_trait(op: BinOp) -> Option<(&'static str, &'static str)> {
+pub(super) fn operator_trait(op: BinOp) -> Option<(&'static str, &'static str)> {
     OPERATORS.iter().find(|(each, ..)| *each == op).map(|&(_, lang, name)| (lang, name))
 }

@@ -705,7 +705,7 @@ impl Infer<'_, '_> {
             bail!("call takes {} arguments, {} given", params.len(), arg_ids.len());
         }
         for (&arg, &param) in arg_ids.iter().zip(&params) {
-            self.call_arg(None, ExprId(arg), (param, None))?;
+            self.call_arg(None, ExprId(arg), (param, None), &mut None)?;
         }
         let tuple = self.cx.types.tuple(&params);
         self.out.res.insert(expr, Res::fn_of(&self.cx.types, method, &[callee_ty, tuple]));

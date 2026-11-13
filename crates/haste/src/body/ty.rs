@@ -4,6 +4,7 @@ use rustc_lexer::TokenKind;
 use super::cursor::Cursor;
 use super::path::Style;
 use super::{Ty, TyId};
+use crate::outline::rules::Frag;
 use crate::outline::source::opens;
 
 impl Cursor<'_> {
@@ -19,11 +20,27 @@ impl Cursor<'_> {
             let bounds = self.bounds()?;
             return Ok(self.push_ty(Ty::DynTrait(bounds)));
         }
+        if self.punct("+") && matches!(self.body.tys[first.0 as usize], Ty::Paren(_)) {
+            self.at += 1;
+            self.bounds()?;
+        }
         Ok(first)
     }
 
-    /// Parses a type that stops before `+`.
+    /// Parses a type that stops before `+`, and at the end of a `ty` fragment that a macro passed in.
     pub fn ty_no_bounds(&mut self) -> Result<TyId> {
+        if let Some((end, Frag::Ty)) = self.src.opaque_at(self.at)
+            && end < self.end
+        {
+            let outer = std::mem::replace(&mut self.end, end);
+            let ty = self.ty_unbounded();
+            self.end = outer;
+            return ty;
+        }
+        self.ty_unbounded()
+    }
+
+    fn ty_unbounded(&mut self) -> Result<TyId> {
         match self.kind() {
             TokenKind::OpenParen => return self.paren_ty(),
             TokenKind::OpenBracket => return self.bracket_ty(),
@@ -116,12 +133,7 @@ impl Cursor<'_> {
             Ok((types, trailing))
         })?;
         if types.len() == 1 && !trailing {
-            let inner = TyId(types[0]);
-            if self.punct("+") {
-                self.at += 1;
-                self.bounds()?;
-            }
-            return Ok(self.push_ty(Ty::Paren(inner)));
+            return Ok(self.push_ty(Ty::Paren(TyId(types[0]))));
         }
         let list = self.list(&types);
         Ok(self.push_ty(Ty::Tuple(list)))

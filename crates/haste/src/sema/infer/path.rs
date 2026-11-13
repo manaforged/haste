@@ -7,7 +7,7 @@ use crate::names::{Def, ItemRef, Ns, PerNs, Primitive, Sym, Symbols, plain};
 use crate::outline::item::ItemKind;
 use crate::outline::source::{Mark, Source};
 
-use super::super::body_scope::{BodyPath, outside};
+use super::super::body_scope::{BodyPath, head_ns, in_namespace, outside};
 use super::super::impls::ImplRef;
 use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty};
@@ -72,7 +72,7 @@ impl<'a> Infer<'_, 'a> {
         } else {
             let path = NamePath { segments: prefix, absolute, dollar };
             let head = if inside { self.type_def(&path) } else { self.cx.paths(self.home.krate).resolve(&path, self.home) };
-            head.map(|def| self.cx.path_member(self.home.krate, def, *last)).and_then(|entry| entry.values)
+            head.map(|def| self.cx.path_member(self.home, def, *last)).and_then(|entry| entry.values)
         };
         match found {
             Some(binding) => Ok(binding.def),
@@ -114,10 +114,11 @@ impl<'a> Infer<'_, 'a> {
 
     /// Where `path` leads among the items that the body declares: the item or variant it names, or `Err` with the count of segments that led out through `super`.
     fn local_def(&mut self, path: &NamePath<'_>, ns: Ns) -> Option<Result<Def, usize>> {
-        let head = path.segments.first().filter(|_| !path.absolute).and_then(|first| self.block_item(self.cx.names.symbols.text(*first)));
+        let wanted = head_ns(path.segments.len(), ns);
+        let head = path.segments.first().filter(|_| !path.absolute).and_then(|first| self.block_item(self.cx.names.symbols.text(*first), wanted));
         let found = match head {
-            Some(item) => self.cx.local_descend(item, &path.segments[1..], ns)?,
-            None => self.cx.local_path(self.anchor().filter(|(_, from)| from.is_some()), path, ns)?,
+            Some(item) => self.cx.local_descend(self.home, item, &path.segments[1..], ns)?,
+            None => self.cx.local_path(self.home, self.anchor().filter(|(_, from)| from.is_some()), path, ns)?,
         };
         Some(match found {
             BodyPath::Def(def) => Ok(def),
@@ -141,7 +142,7 @@ impl<'a> Infer<'_, 'a> {
         let Some(binding) = local else {
             return paths.resolve(path, self.home);
         };
-        rest.iter().try_fold(binding.def, |def, segment| self.cx.path_member(self.home.krate, def, *segment).types.map(|found| found.def))
+        rest.iter().try_fold(binding.def, |def, segment| self.cx.path_member(self.home, def, *segment).types.map(|found| found.def))
     }
 
     /// The bindings that the `use` declarations inside the body give `word`, each namespace from the first one that binds it.
@@ -168,7 +169,8 @@ impl<'a> Infer<'_, 'a> {
         let Some(root) = self.root.filter(|&root| self.cx.expansion(root).is_some_and(|found| !found.file.items.imports.is_empty())) else {
             return Vec::new();
         };
-        if let Some(found) = self.imports.get(&(root, word)) {
+        let hidden = self.closed_uses(root);
+        if let Some(found) = self.imports.get(&(root, word, hidden.clone())) {
             return found.clone();
         }
         let Ok(home) = self.cx.module_of(root) else {
@@ -176,16 +178,29 @@ impl<'a> Infer<'_, 'a> {
         };
         let here = self.instance.as_ref().map(|(item, _)| *item).filter(|item| item.outer().is_some()).map(|item| self.cx.item(item).1.start);
         let before = self.cx.asks.mark();
-        let found = self.cx.body_imports((root, home), word, here);
+        let found = self.cx.body_imports((root, home), word, (here, &hidden));
         if self.cx.asks.mark() == before {
-            self.imports.insert((root, word), found.clone());
+            self.imports.insert((root, word, hidden), found.clone());
         }
         found
     }
 
-    /// The item named `name` that a block around the use declares.
-    fn block_item(&self, name: &str) -> Option<ItemRef> {
-        self.items.iter().rev().find(|(bound, _)| *bound == name).map(|(_, item)| *item)
+    /// The `use` items of this body's expansion that a block of the body declares and that no block open now holds, which code here does not see.
+    fn closed_uses(&self, root: ItemRef) -> Vec<u32> {
+        let Some(found) = self.cx.expansion(root) else {
+            return Vec::new();
+        };
+        let items = &found.file.items.items;
+        let declared = self.body.stmts.iter().filter_map(|stmt| match *stmt {
+            crate::body::Stmt::Item(start, end) => Some(super::super::expand::stmt_items(items, (start, end))),
+            _ => None,
+        });
+        declared.flatten().map(|at| at as u32).filter(|at| items[*at as usize].kind == crate::outline::item::ItemKind::Use && !self.block_uses.contains(at)).collect()
+    }
+
+    /// The item named `name` in namespace `ns` that a block around the use declares.
+    fn block_item(&self, name: &str, ns: Ns) -> Option<ItemRef> {
+        self.items.iter().rev().find(|(bound, item)| *bound == name && in_namespace(self.cx.item(*item).1, ns)).map(|(_, item)| *item)
     }
 
     /// Resolves the value path expression `expr` to a local or an item, and returns its type.

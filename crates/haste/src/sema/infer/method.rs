@@ -60,8 +60,25 @@ impl<'a> Infer<'_, 'a> {
         if let Some(pick) = self.opaque_pick(steps[0], name)? {
             return self.picked(expr, (pick, 0), params, expected);
         }
-        let probed = self.probe_steps((expr, found), name, &steps, expected)?;
+        let count = self.body.list(params.1).len();
+        let origin = self.receiver_origin(receiver);
+        let outer = std::mem::replace(&mut self.receiver_param, origin);
+        let probed = self.probe_steps((expr, found), (name, count), &steps, expected);
+        self.receiver_param = outer;
+        let probed = probed?;
         self.finish_method_call((expr, found), (name, at), &steps, probed, params, expected)
+    }
+
+    /// The type parameter that the receiver `receiver` was declared as when it names a parameter of the function, as `key` in `fn header<K>(key: K)`.
+    fn receiver_origin(&self, receiver: ExprId) -> Option<&'a str> {
+        match *self.body.expr(receiver) {
+            crate::body::Expr::Paren(inner) => self.receiver_origin(inner),
+            crate::body::Expr::Path(_) => match self.out.res.get(&receiver) {
+                Some(super::Res::Local(local)) => self.param_origins.iter().find(|(at, _)| at == local).map(|&(_, name)| name),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn finish_method_call(&mut self, (expr, found): (ExprId, Ty), (name, at): (&str, u32), steps: &[Ty], probed: Option<(Pick, u32)>, params: (Option<List>, List), expected: Option<Ty>) -> Result<Ty> {
@@ -87,8 +104,9 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The method `name` that the first of `steps` to have one picks, and how many references it reads through.
-    fn probe_steps(&mut self, (expr, found): (ExprId, Ty), name: &str, steps: &[Ty], expected: Option<Ty>) -> Result<Option<(Pick, u32)>> {
-        let traits = self.trait_candidates(name, steps)?;
+    fn probe_steps(&mut self, (expr, found): (ExprId, Ty), (name, count): (&str, usize), steps: &[Ty], expected: Option<Ty>) -> Result<Option<(Pick, u32)>> {
+        let mut traits = self.trait_candidates(name, steps)?;
+        self.keep_fitting_bounds(&mut traits, count)?;
         let mut candidates = Vec::new();
         for &step in steps {
             self.candidates(step, name, &mut candidates)?;
@@ -183,7 +201,7 @@ impl<'a> Infer<'_, 'a> {
             let Ok((_, ret)) = infer.fn_types(pick.item, &substs) else {
                 return true;
             };
-            infer.unifies(ret, wanted) || infer.coerces_to(ret, wanted)
+            infer.is_never(ret) || infer.unifies(ret, wanted) || infer.coerces_to(ret, wanted)
         })
     }
 
@@ -210,6 +228,9 @@ impl<'a> Infer<'_, 'a> {
             let Some(item) = self.cx.member(block, name) else {
                 continue;
             };
+            if !self.cx.member_visible(item, self.home)? {
+                continue;
+            }
             if let Some((kind, _)) = self.cx.signature(item)?.receiver {
                 found.push(Candidate { block, item, kind });
             }
@@ -251,6 +272,18 @@ impl<'a> Infer<'_, 'a> {
             }
         }
         Ok(found)
+    }
+
+    /// Drops each bounded candidate whose method does not take `count` arguments when another bound on the same type has one that does: two associated types of one parameter can be the same type here, where rustc saw each value only through its own bound.
+    fn keep_fitting_bounds(&mut self, found: &mut Vec<TraitCandidate>, count: usize) -> Result<()> {
+        let mut fits = Vec::with_capacity(found.len());
+        for candidate in found.iter() {
+            fits.push(self.cx.signature(candidate.item)?.params.len() == count);
+        }
+        let fitting: Vec<Option<Ty>> = found.iter().zip(&fits).filter(|(candidate, fit)| candidate.bound.is_some() && **fit).map(|(candidate, _)| candidate.bound).collect();
+        let mut kept = fits.iter().map(|&fit| fit);
+        found.retain(|candidate| kept.next().unwrap_or(true) || candidate.bound.is_none() || !fitting.contains(&candidate.bound));
+        Ok(())
     }
 
     pub(super) fn current_trait(&mut self) -> Option<ItemRef> {
@@ -442,6 +475,7 @@ impl<'a> Infer<'_, 'a> {
         }
         substs.extend(given);
         self.bind_bounds(item, &substs)?;
+        self.bind_impl_bounds(item, &substs)?;
         self.out.res.insert(expr, Res::fn_of(&self.cx.types, item, &substs));
         self.out.adjusts.insert(expr, adjust);
         if let (Some(Mut::Mut), crate::body::Expr::Method { receiver, .. }) = (adjust.autoref, *self.body.expr(expr)) {
@@ -454,7 +488,7 @@ impl<'a> Infer<'_, 'a> {
         }
         let hints = self.expected_inputs(&types[1..], ret, expected);
         for ((arg, param), hint) in given.into_iter().zip(types.into_iter().skip(1)).zip(hints) {
-            self.call_arg(Some((item, &substs[..])), ExprId(arg), (param, hint))?;
+            self.call_arg(Some((item, &substs[..])), ExprId(arg), (param, hint), &mut None)?;
         }
         Ok(ret)
     }

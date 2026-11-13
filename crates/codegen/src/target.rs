@@ -37,8 +37,18 @@ pub enum Format {
     Wasm,
 }
 
+/// How much work the code generator spends on each function.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Effort {
+    /// The passes that pay for themselves when code runs briefly after an edit: the dev profile.
+    #[default]
+    Quick,
+    /// Every pass: the release profile.
+    Full,
+}
+
 /// One compilation target: everything that differs between triples, as data.
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Target {
     pub triple: &'static str,
     pub arch: Arch,
@@ -52,6 +62,8 @@ pub struct Target {
     pub symbol_prefix: &'static str,
     /// `rustc --print cfg` without `debug_assertions`, then `[internal]` and the cfgs only `-Z unstable-options` shows.
     pub cfg: &'static str,
+    /// How much work the code generator spends on each function.
+    pub effort: Effort,
 }
 
 macro_rules! target {
@@ -66,6 +78,7 @@ macro_rules! target {
             ptr_bytes: $ptr,
             symbol_prefix: $prefix,
             cfg: include_str!(concat!("targets/", $triple, ".cfg")),
+            effort: Effort::Quick,
         }
     };
 }
@@ -108,5 +121,10 @@ impl Target {
     /// The target of the machine this program runs on.
     pub fn host() -> &'static Target {
         &TARGETS[HOST]
+    }
+
+    /// This target with the code generator spending `effort` on each function.
+    pub fn with(&self, effort: Effort) -> Target {
+        Target { effort, ..*self }
     }
 }

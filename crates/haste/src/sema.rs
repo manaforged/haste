@@ -514,6 +514,24 @@ impl<'a> Context<'a> {
                 let def = self.types.proj(id);
                 format!("<{} as {}>::{}", self.type_text(def.self_ty, resolve), self.name(def.of), self.name(def.assoc))
             }
+            other => self.callable_text(other, resolve),
+        }
+    }
+
+    fn callable_text(&self, kind: ty::Kind, resolve: &dyn Fn(ty::Ty) -> ty::Ty) -> String {
+        use ty::{Kind, Mut};
+        let list = |tys: &[ty::Ty]| tys.iter().map(|&ty| self.type_text(ty, resolve)).collect::<Vec<_>>().join(", ");
+        let angled = |args: substs::Substs| if self.types.substs(args).is_empty() { String::new() } else { format!("<{}>", list(self.types.substs(args))) };
+        match kind {
+            Kind::FnDef(item, args) => format!("fn {}{}", self.name(item), angled(args)),
+            Kind::Closure(item, args, expr) => format!("{{closure#{expr} in {}{}}}", self.name(item), angled(args)),
+            Kind::FnPtr(params, ret) => format!("fn({}) -> {}", list(self.types.substs(params)), self.type_text(ret, resolve)),
+            Kind::Dyn(item, args, ..) => format!("dyn {}{}", self.name(item), angled(args)),
+            Kind::Ptr(Mut::Not, inner) => format!("*const {}", self.type_text(inner, resolve)),
+            Kind::Ptr(Mut::Mut, inner) => format!("*mut {}", self.type_text(inner, resolve)),
+            Kind::Array(element, len) => format!("[{}; {}]", self.type_text(element, resolve), self.type_text(len, resolve)),
+            Kind::Never => "!".to_owned(),
+            Kind::Value(bits) => bits.to_string(),
             other => format!("{other:?}"),
         }
     }
@@ -670,5 +688,10 @@ impl<'a> Context<'a> {
     pub fn name(&self, item: ItemRef) -> &'a str {
         let (src, entry) = self.item(item);
         entry.name.map_or("<anonymous>", |name| src.text(name))
+    }
+
+    /// The name of `item` as a path or method call names it, without an `r#` prefix.
+    pub fn plain_name(&self, item: ItemRef) -> &'a str {
+        crate::names::plain(self.name(item))
     }
 }

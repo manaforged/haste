@@ -50,7 +50,7 @@ impl Cursor<'_> {
             }
             self.push_stmt(stmt, attrs, &mut stmts);
         }
-        Ok((stmts, None))
+        Ok(self.last_as_tail(stmts))
     }
 
     /// The statements and tail of a block whose last expression is `tail` with attributes `attrs`: the last statement without a semicolon when `tail` is configured out or a macro that expands to no tail.

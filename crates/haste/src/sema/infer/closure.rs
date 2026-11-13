@@ -72,19 +72,11 @@ impl<'a> Infer<'_, 'a> {
         let hint = expected.and_then(|ty| self.expected_sig(ty)).filter(|(inputs, _)| inputs.len() == self.body.list(params).len());
         let depth = self.scopes.len();
         self.uses.push(Captures { first: self.out.locals.len() as u32, ..Captures::default() });
-        let ret = match (ret, &hint) {
-            (Some(ty), _) => self.lower_ty(self.body, ty)?,
-            (None, Some((_, output))) => *output,
-            (None, None) => self.fresh(Kind::Var),
-        };
+        let ret = self.closure_part(ret, hint.as_ref().map(|(_, output)| *output))?;
         let mut locals = Vec::new();
         for (index, &at) in self.body.list(params).iter().enumerate() {
             let Param { pat, ty } = self.body.params[at as usize];
-            let ty = match (ty, &hint) {
-                (Some(ty), _) => self.lower_ty(self.body, ty)?,
-                (None, Some((inputs, _))) => inputs[index],
-                (None, None) => self.fresh(Kind::Var),
-            };
+            let ty = self.closure_part(ty, hint.as_ref().map(|(inputs, _)| inputs[index]))?;
             let arena = self.body;
             locals.push(self.param_pat(arena, pat, ty, Some(pat))?);
         }
@@ -110,6 +102,16 @@ impl<'a> Infer<'_, 'a> {
         found?;
         self.record_closure(expr, uses, (Vec::new(), ret, expr, true), (by_move, forced))?;
         Ok(self.cx.types.intern(Kind::Closure(parent, substs, expr.0)))
+    }
+
+    /// The type of a closure parameter or return: its annotation, made the same as the expected `hinted` where the two agree, else `hinted`, else a fresh variable.
+    fn closure_part(&mut self, annotated: Option<TyId>, hinted: Option<Ty>) -> Result<Ty> {
+        let Some(annotated) = annotated else { return Ok(hinted.unwrap_or_else(|| self.fresh(Kind::Var))) };
+        let ty = self.lower_ty(self.body, annotated)?;
+        if let Some(hinted) = hinted {
+            self.unifies(ty, hinted);
+        }
+        Ok(ty)
     }
 
     fn record_closure(&mut self, expr: ExprId, uses: Captures, (params, ret, body, coroutine): (Vec<u32>, Ty, ExprId, bool), (by_move, forced): (bool, &[u32])) -> Result<()> {
@@ -389,6 +391,11 @@ impl<'a> Infer<'_, 'a> {
     /// Infers the call `expr` of the closure value of type `ty`, recording it as a call of `FnOnce::call_once` at the closure and its argument tuple.
     pub(super) fn closure_call(&mut self, expr: ExprId, ty: Ty, args: List) -> Result<Ty> {
         let (params, ret, _) = self.closure_sig(ty)?;
+        self.call_once_of(expr, ty, (params, ret), args)
+    }
+
+    /// Infers the call `expr` of the closure or pending `impl Fn` value `ty` with signature `(params, ret)` as `FnOnce::call_once` of it.
+    pub(super) fn call_once_of(&mut self, expr: ExprId, ty: Ty, (params, ret): (Vec<Ty>, Ty), args: List) -> Result<Ty> {
         self.infer_call_args(args, &params, None)?;
         let Some(call_once) = self.cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
         let tuple = self.cx.types.tuple(&params);
@@ -416,7 +423,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// Infers and coerces the argument `arg` of a call of `callee` to its parameter type `param`, giving a closure argument the signature of the parameter's `Fn` bound.
-    pub(super) fn call_arg(&mut self, callee: Option<(ItemRef, &[Ty])>, arg: ExprId, (param, expectation): (Ty, Option<Ty>)) -> Result<()> {
+    pub(super) fn call_arg(&mut self, callee: Option<(ItemRef, &[Ty])>, arg: ExprId, (param, expectation): (Ty, Option<Ty>), held: &mut Option<(ItemRef, Vec<Ty>)>) -> Result<()> {
         let callable = match *self.cx.types.kind(self.resolve(param)) {
             Kind::Ref(_, pointee) => pointee,
             _ => param,
@@ -429,6 +436,7 @@ impl<'a> Infer<'_, 'a> {
         let propagate = closure || self.holds_closure(arg) || matches!(self.body.expr(self.wrapped(arg)), Expr::Array(_));
         let usable = expectation.filter(|&wanted| propagate || self.sized_expectation(wanted));
         let found = self.expr(arg, Some(hint.or(usable).unwrap_or(param)))?;
+        self.release_if_fits(held, found, param)?;
         self.coerce_arg((arg, found, closure), param, expectation)?;
         match bound {
             Some(bound) => self.tie_callable(callable, bound),
@@ -519,7 +527,7 @@ impl<'a> Infer<'_, 'a> {
         }))
     }
 
-    fn is_closure(&self, arg: ExprId) -> bool {
+    pub(super) fn is_closure(&self, arg: ExprId) -> bool {
         matches!(*self.body.expr(self.wrapped(arg)), Expr::Closure { .. })
     }
 
@@ -596,11 +604,12 @@ pub fn by_reference(cx: &Context<'_>, item: ItemRef) -> Option<Mut> {
     }
 }
 
-/// The typed form of a call trait method at a closure or function item and its argument tuple, which calls the closure's body or the function with the tuple's fields.
+/// The typed form of a call trait method at a closure, function item or function pointer and its argument tuple, which calls the closure's body, the function or the pointer that the receiver `Res::Local(0)` points at, as a vtable passes it, with the tuple's fields.
 pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Typed> {
     let slice = cx.types.substs(substs);
     let (Some(&callee), Some(&tuple)) = (slice.first(), slice.get(1)) else { bail!("a call trait method with no callee and arguments") };
     let (target, ret) = match *cx.types.kind(callee) {
+        Kind::FnPtr(_, ret) => (Res::Local(0), ret),
         Kind::FnDef(target, args) => {
             let arg_slice = cx.types.substs(args).to_vec();
             let (res, (_, ret)) = super::detached(cx, target, |infer| Ok((infer.trait_call(target, args)?, infer.fn_types(target, &arg_slice)?)))?;
@@ -612,7 +621,8 @@ pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Res
             (Res::fn_of(&cx.types, call_once, &[callee, tuple]), info.closure.ret)
         }
     };
-    let receiver = by_reference(cx, item).map_or(callee, |by| cx.types.intern(Kind::Ref(by, callee)));
+    let pointer = matches!(cx.types.kind(callee), Kind::FnPtr(..)).then_some(Mut::Not);
+    let receiver = by_reference(cx, item).or(pointer).map_or(callee, |by| cx.types.intern(Kind::Ref(by, callee)));
     let locals = vec![Local { ty: receiver }, Local { ty: tuple }];
     Ok(Typed { locals, params: vec![0, 1], ret: Some(ret), shape: Shape::Untuple(target), ..Typed::default() })
 }

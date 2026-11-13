@@ -134,6 +134,27 @@ pub(crate) fn fits(op: Binary, signed: bool, ty: Type, (x, y): (i64, i64)) -> Op
     Some((low..=high).contains(&result))
 }
 
+/// `op` on small integers when `known` gives the constants it reads.
+fn evaluate(func: &Function, op: &Op, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
+    let (Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) | Op::Convert(_, x) | Op::Fits(_, _, x, _)) = *op else {
+        return if let Op::Const(imm) = *op { Some(imm) } else { None };
+    };
+    let ty = func.ty(x);
+    if !ty.is_small_int() {
+        return None;
+    }
+    let both = |x: Value, y: Value| Some((known(x)?, known(y)?));
+    match *op {
+        Op::Unary(op, x) => unary(op, ty, known(x)?),
+        Op::Binary(op, x, y) => both(x, y).and_then(|(a, b)| binary(op, ty, a, b)),
+        Op::Icmp(cc, x, y) => both(x, y).map(|(a, b)| i64::from(holds(cc, ty, a, b))),
+        Op::Convert(Convert::Uextend | Convert::Ireduce, x) => Some(extend(known(x)?, ty, false)),
+        Op::Convert(Convert::Sextend, x) => Some(extend(known(x)?, ty, true)),
+        Op::Fits(op, signed, x, y) => both(x, y).and_then(|pair| fits(op, signed, ty, pair)).map(i64::from),
+        _ => None,
+    }
+}
+
 struct Fold {
     consts: Vec<Option<i64>>,
     subst: Vec<Value>,
@@ -156,22 +177,10 @@ impl Fold {
     }
 
     fn evaluate(&self, func: &Function, op: &Op) -> Option<i64> {
-        let (Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) | Op::Convert(_, x) | Op::Fits(_, _, x, _)) = *op else {
-            return if let Op::Const(imm) = *op { Some(imm) } else { None };
-        };
-        let ty = func.ty(x);
-        if !ty.is_small_int() {
-            return None;
-        }
-        match *op {
-            Op::Unary(op, x) => unary(op, ty, self.known(x)?),
-            Op::Binary(op, x, y) => self.both(x, y).and_then(|(a, b)| binary(op, ty, a, b)).or_else(|| self.absorbed(op, ty, x, y)),
-            Op::Icmp(cc, x, y) => self.both(x, y).map(|(a, b)| i64::from(holds(cc, ty, a, b))),
-            Op::Convert(Convert::Uextend | Convert::Ireduce, x) => Some(extend(self.known(x)?, ty, false)),
-            Op::Convert(Convert::Sextend, x) => Some(extend(self.known(x)?, ty, true)),
-            Op::Fits(op, signed, x, y) => self.both(x, y).and_then(|pair| fits(op, signed, ty, pair)).map(i64::from),
+        evaluate(func, op, &|value| self.known(value)).or_else(|| match *op {
+            Op::Binary(op, x, y) if func.ty(x).is_small_int() => self.absorbed(op, func.ty(x), x, y),
             _ => None,
-        }
+        })
     }
 
     /// The constant `x op y` of type `ty` gives whatever one operand holds: a product, high product or mask with zero, or the difference or xor of a value with itself.
@@ -333,18 +342,22 @@ impl Fold {
         func.blocks[block.index()].params.iter().zip(args).all(|(param, arg)| self.subst[param.index()] == *param || self.find(*arg) == self.find(*param))
     }
 
-    /// Where an edge into `block` with `args` goes next when `block` holds only a jump, or a branch on a parameter `args` makes a constant, and reads its parameters nowhere else.
+    /// Where an edge into `block` with `args` goes next when `block` holds only a jump, or a branch on a parameter `args` makes a constant or on a comparison of such a parameter with a constant, and reads its parameters nowhere else.
     fn step(&self, func: &Function, (uses, pinned): (&[u32], &[bool]), block: Block, args: &[Value]) -> Option<(Block, Vec<Value>)> {
         let data = &func.blocks[block.index()];
-        let [only] = data.insts[..] else { return None };
+        let (compare, last) = match data.insts[..] {
+            [only] => (None, only),
+            [compare, last] => (Some(compare), last),
+            _ => return None,
+        };
         if !self.agrees(func, block, args) {
             return None;
         }
-        let op = &func.insts[only.index()].op;
+        let op = &func.insts[last.index()].op;
         let param = |value: &Value| data.params.iter().position(|param| param == value);
         let (next, next_args) = match op {
-            Op::Jump(next, next_args) => (*next, next_args),
-            Op::Brif(condition, then, then_args, otherwise, else_args) => match self.known(args[param(condition)?])? {
+            Op::Jump(next, next_args) if compare.is_none() => (*next, next_args),
+            Op::Brif(condition, then, then_args, otherwise, else_args) => match self.edge_condition(func, (compare, uses), *condition, &|value| param(&value).map(|at| args[at]))? {
                 0 => (*otherwise, else_args),
                 _ => (*then, then_args),
             },
@@ -352,13 +365,25 @@ impl Fold {
         };
         let reads = |param: Value| {
             let mut count = 0_u32;
-            op.for_operands(|value| count += u32::from(value == param));
+            compare.iter().map(|inst| &func.insts[inst.index()].op).chain([op]).for_each(|op| op.for_operands(|value| count += u32::from(value == param)));
             count
         };
         if pinned[next.index()] || data.params.iter().any(|param| uses[param.index()] != reads(*param)) {
             return None;
         }
         Some((next, next_args.iter().map(|value| param(value).map_or(*value, |at| args[at])).collect()))
+    }
+
+    /// The constant a branch on `condition` sees when the block's parameters hold what `arg` gives them: `condition` itself is such a parameter, or `compare` alone uses it and compares parameters or constants.
+    fn edge_condition(&self, func: &Function, (compare, uses): (Option<Inst>, &[u32]), condition: Value, arg: &dyn Fn(Value) -> Option<Value>) -> Option<i64> {
+        let Some(compare) = compare else { return self.known(arg(condition)?) };
+        let data = &func.insts[compare.index()];
+        let (Op::Icmp(cc, x, y), Some(result)) = (&data.op, data.result) else { return None };
+        if result != condition || uses[result.index()] != 1 || !func.ty(*x).is_small_int() {
+            return None;
+        }
+        let value = |operand: Value| arg(operand).map_or_else(|| self.known(operand), |given| self.known(given));
+        Some(i64::from(holds(*cc, func.ty(*x), value(*x)?, value(*y)?)))
     }
 
     /// Replaces each block parameter that every reachable edge gives one value, other than itself.
@@ -450,7 +475,7 @@ fn drop_params(func: &mut Function, fold: &Fold) {
 }
 
 fn pure(op: &Op) -> bool {
-    matches!(op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
+    matches!(op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::Unary(..) | Op::Binary(..) | Op::Convert(..) | Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..) | Op::ByteCmp(..) | Op::Splat(_) | Op::Movemask(_) | Op::Vector(..) | Op::Sha256Rounds(..) | Op::Select(..) | Op::StackAddr(..) | Op::Load(..) | Op::StackLoad(..) | Op::FramePointer)
 }
 
 /// How many times the instructions in blocks read each value.
@@ -463,7 +488,7 @@ fn use_counts(func: &Function) -> Vec<u32> {
 }
 
 /// The instruction in a block that defines each value.
-fn defs(func: &Function) -> Vec<Option<Inst>> {
+pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
     let mut defs = vec![None; func.types.len()];
     for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
         if let Some(result) = func.insts[inst.index()].result {
@@ -506,8 +531,8 @@ fn dead(func: &mut Function) {
     }
 }
 
-/// Folds constants, identities and branches on them, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump.
-pub(crate) fn run(func: &mut Function) {
+/// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump.
+pub(crate) fn run(func: &mut Function, effort: crate::Effort) {
     let Some(entry) = func.entry else { return };
     let count = func.types.len();
     let defs = defs(func);
@@ -516,7 +541,8 @@ pub(crate) fn run(func: &mut Function) {
     let mut reachable = Vec::new();
     loop {
         fold.constants(func);
-        let branched = fold.branches(func) | fold.thread(func, &pinned);
+        let settled = effort == crate::Effort::Full && reachable.is_empty() && crate::facts::settle(func, &fold.defs, &mut fold.consts);
+        let branched = settled | fold.branches(func) | fold.thread(func, &pinned);
         if branched || reachable.is_empty() {
             reachable = prune(func, entry);
         }

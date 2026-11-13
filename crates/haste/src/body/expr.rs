@@ -183,6 +183,11 @@ impl Cursor<'_> {
 
     fn dot(&mut self, expr: ExprId) -> Result<ExprId> {
         self.at += 1;
+        self.member(expr)
+    }
+
+    /// Parses the tuple index, field, method call or `.await` after a `.` on `expr`; a float token such as `0.` that a macro's `$name` follows holds the next `.` too.
+    fn member(&mut self, expr: ExprId) -> Result<ExprId> {
         if let TokenKind::Literal { kind, .. } = self.kind() {
             let text = self.src.text(self.at);
             self.at += 1;
@@ -192,7 +197,7 @@ impl Cursor<'_> {
                 let index = part.parse::<u32>().or_else(|_| self.fail("expected a tuple index"))?;
                 out = self.push_expr(Expr::TupleField(out, index));
             }
-            return Ok(out);
+            return if float && text.ends_with('.') { self.member(out) } else { Ok(out) };
         }
         if self.eat_word("await") {
             return Ok(self.push_expr(Expr::Await(expr)));
@@ -274,7 +279,7 @@ impl Cursor<'_> {
 
     fn prefixed(&mut self) -> Result<Option<ExprId>> {
         let word = self.word();
-        if matches!(word, "async" | "gen" | "unsafe" | "const" | "try") && self.block_kind_ahead() {
+        if self.kinded_block_ahead(word) {
             return self.kinded_block().map(Some);
         }
         let closure_next = self.punct_at(self.at + 1, "|") || self.punct_at(self.at + 1, "||") || self.word_at(self.at + 1) == "move";
@@ -308,6 +313,16 @@ impl Cursor<'_> {
         })?;
         let fields = self.list(&fields);
         Ok(self.push_expr(Expr::OffsetOf { ty, fields }))
+    }
+
+    /// Whether `word` opens a kinded block here; `gen` and `try` before a brace in a condition or scrutinee are names, as they are before edition 2024.
+    fn kinded_block_ahead(&self, word: &str) -> bool {
+        let keyword = match word {
+            "async" | "unsafe" | "const" => true,
+            "gen" | "try" => !self.no_struct,
+            _ => false,
+        };
+        keyword && self.block_kind_ahead()
     }
 
     fn block_kind_ahead(&self) -> bool {
@@ -527,8 +542,7 @@ impl Cursor<'_> {
             TokenKind::Lifetime { .. } => self.punct_at(self.at + 1, ":"),
             _ => match self.word() {
                 "if" | "match" | "loop" | "while" | "for" => true,
-                "unsafe" | "const" | "async" | "gen" | "try" => self.block_kind_ahead(),
-                _ => false,
+                word => self.kinded_block_ahead(word),
             },
         }
     }

@@ -40,13 +40,12 @@ pub type Layout = LayoutData<Field, Variant>;
 
 /// The byte offset of field `index` of variant `variant` in a value of `layout`.
 pub fn field_offset(layout: &Layout, variant: u32, index: u32) -> i32 {
-    let fields = match &layout.variants {
-        rustc_abi::Variants::Multiple { variants, .. } => &variants[Variant::new(variant as usize)].fields,
-        rustc_abi::Variants::Single { index } if index.0 != variant => return 0,
-        rustc_abi::Variants::Empty => return 0,
-        _ => &layout.fields,
-    };
-    fields.offset(index as usize).bytes() as i32
+    match &layout.variants {
+        rustc_abi::Variants::Multiple { variants, .. } => variants[Variant::new(variant as usize)].field_offsets.get(Field::new(index as usize)).map_or(0, |offset| offset.bytes() as i32),
+        rustc_abi::Variants::Single { index } if index.0 != variant => 0,
+        rustc_abi::Variants::Empty => 0,
+        _ => layout.fields.offset(index as usize).bytes() as i32,
+    }
 }
 
 /// The data layout of the machine the compiled code runs on.
@@ -122,7 +121,7 @@ impl Context<'_> {
             Kind::Array(element, count) => {
                 let Some(count) = self.types.len(count) else { bail!("layout of an array whose length is not known") };
                 let element = self.layout(element)?;
-                return calc.array_like::<Field, Variant, ()>(&element, Some(count)).map_err(|error| anyhow!("layout of an array: {error:?}"));
+                return calc.layout_of_array_like::<Field, Variant, ()>(&element, Some(count)).map_err(|error| anyhow!("layout of an array: {error:?}"));
             }
             ref kind if kind.is_unsized() => return self.unsized_layout(&calc, kind.clone()),
             ref other => bail!("no layout for {other:?} yet"),
@@ -130,7 +129,8 @@ impl Context<'_> {
         let layouts = fields.iter().map(|field| self.layout(*field)).collect::<Result<Vec<_>>>()?;
         let refs: Vec<&Layout> = layouts.iter().map(|layout| &**layout).collect();
         let refs: IndexVec<Field, &&Layout> = refs.iter().collect();
-        calc.univariant(&refs, &ReprOptions::default(), StructKind::AlwaysSized).map_err(|error| anyhow!("layout: {error:?}"))
+        let kind = if fields.is_empty() { StructKind::AlwaysSized } else { StructKind::MaybeUnsized };
+        calc.layout_of_univariant(&refs, &ReprOptions::default(), kind).map_err(|error| anyhow!("layout: {error:?}"))
     }
 
     fn unsized_layout(&mut self, calc: &LayoutCalculator<&TargetDataLayout>, kind: Kind) -> Result<Layout> {
@@ -138,13 +138,13 @@ impl Context<'_> {
             Kind::Slice(element) => element,
             Kind::Prim(Primitive::Str) => self.types.intern(Kind::Prim(Primitive::U8)),
             _ => {
-                let mut unit = calc.univariant::<Field, Variant, &&Layout>(&IndexVec::new(), &ReprOptions::default(), StructKind::AlwaysSized).map_err(|error| anyhow!("layout of a trait object: {error:?}"))?;
+                let mut unit = calc.layout_of_univariant::<Field, Variant, &&Layout>(&IndexVec::new(), &ReprOptions::default(), StructKind::AlwaysSized).map_err(|error| anyhow!("layout of a trait object: {error:?}"))?;
                 unit.backend_repr = BackendRepr::Memory { sized: false };
                 return Ok(unit);
             }
         };
         let element = self.layout(element)?;
-        calc.array_like::<Field, Variant, ()>(&element, None).map_err(|error| anyhow!("layout of a slice: {error:?}"))
+        calc.layout_of_array_like::<Field, Variant, ()>(&element, None).map_err(|error| anyhow!("layout of a slice: {error:?}"))
     }
 
     /// The type at the end of `ty` whose metadata a pointer to `ty` carries: `ty` itself, or the tail of its last struct field.
@@ -182,7 +182,7 @@ impl Context<'_> {
     fn pattern(&mut self, dl: &TargetDataLayout, base: Ty, valid_range: WrappingRange) -> Result<Layout> {
         match self.layout(base)?.backend_repr {
             BackendRepr::Scalar(Scalar::Initialized { value, .. }) => Ok(Layout::scalar(dl, Scalar::Initialized { value, valid_range })),
-            BackendRepr::ScalarPair(Scalar::Initialized { value, .. }, metadata) => Ok(Layout::scalar_pair(dl, Scalar::Initialized { value, valid_range }, metadata)),
+            BackendRepr::ScalarPair { a: Scalar::Initialized { value, .. }, b: metadata, .. } => Ok(Layout::scalar_pair(dl, Scalar::Initialized { value, valid_range }, metadata)),
             _ => bail!("a pattern type on a type that is not a scalar or a pointer with metadata"),
         }
     }

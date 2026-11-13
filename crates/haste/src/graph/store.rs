@@ -17,7 +17,7 @@ const OK_MARK: &str = "+";
 const FAILED_MARK: &str = "-";
 
 /// The directory of the store: `$HASTE_HOME`, else `$XDG_CACHE_HOME/haste`, else `$HOME/.cache/haste`.
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
     let home = var("HASTE_HOME").or_else(|| var("XDG_CACHE_HOME").map(|cache| cache.join("haste"))).or_else(|| var("HOME").map(|home| home.join(".cache/haste")));
     home.unwrap_or_else(|| std::env::temp_dir().join("haste"))
@@ -71,7 +71,7 @@ impl Expansion {
 }
 
 /// The size and modification time of this program, whose changes make what the store kept stale.
-fn program() -> Option<(u64, i64, i64)> {
+pub(crate) fn program() -> Option<(u64, i64, i64)> {
     static PROGRAM: std::sync::OnceLock<Option<(u64, i64, i64)>> = std::sync::OnceLock::new();
     *PROGRAM.get_or_init(|| std::env::current_exe().and_then(std::fs::metadata).map(|meta| (meta.len(), meta.mtime(), meta.mtime_nsec())).ok())
 }
@@ -152,10 +152,15 @@ pub fn lock(workspace: &Workspace, unit: usize) -> io::Result<Lock> {
     Ok(Lock { _file: file })
 }
 
-fn write_new(path: &Path, text: &str) -> io::Result<()> {
-    let fresh = path.with_extension(format!("{}", std::process::id()));
+pub(crate) fn write_new(path: &Path, text: &str) -> io::Result<()> {
+    let fresh = fresh(path);
     std::fs::write(&fresh, text)?;
     std::fs::rename(&fresh, path)
+}
+
+/// The path this process writes `path` at before it renames the file into place, so no reader sees it half written.
+pub(crate) fn fresh(path: &Path) -> PathBuf {
+    path.with_extension(format!("{}", std::process::id()))
 }
 
 /// The hash of the variables a script ran with and of this program, whose compile of the script decides what it prints.
@@ -211,7 +216,7 @@ impl Watched {
 }
 
 /// Adds the path, size and modification time of `path`, or of every file under it when it is a directory other than a build output or VCS directory.
-fn walk(path: &Path, into: &mut Vec<(PathBuf, u64, i64, i64)>) {
+pub(crate) fn walk(path: &Path, into: &mut Vec<(PathBuf, u64, i64, i64)>) {
     let Ok(meta) = std::fs::metadata(path) else {
         into.push((path.to_owned(), 0, 0, -1));
         return;

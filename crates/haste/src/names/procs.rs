@@ -1,9 +1,11 @@
 //! Binding the procedural macro calls that the outline holds back to the macro functions their paths name.
 
+use std::sync::Arc;
+
 use crate::outline::Outline;
 use crate::outline::item::ProcKind;
 use crate::outline::source::Source;
-use crate::outline::tree::{Held, Waiting};
+use crate::outline::tree::{File, Held, Waiting};
 
 use super::path::{Paths, Requests};
 use super::resolve::{macro_at, paths_of};
@@ -62,7 +64,7 @@ impl Names {
             let derives = std::mem::take(&mut holder.derived).into_iter().map(Site::Derive);
             let sites: Vec<Site> = bangs.chain(derives).chain(std::mem::take(&mut holder.attributed).into_iter().map(Site::Attribute)).collect();
             let paths = paths_of(self, outline, krate, &demands);
-            let mut left = Vec::new();
+            let (mut left, start) = (Vec::new(), bound.len());
             for site in sites {
                 let before = demands.count();
                 match proc_at(outline, &paths, &site, krate) {
@@ -71,9 +73,36 @@ impl Names {
                 }
             }
             drop(paths);
+            defer_derives(&mut bound, start, &mut left);
             left.into_iter().for_each(|(asked, site)| hold(outline, krate, asked, site));
         }
         (bound, demands)
+    }
+}
+
+/// Leaves out each derive of crate calls `bound[start..]` and `left` whose item an attribute macro written before it rewrites, since the derive runs on that macro's output, and holds back the derives whose attribute is still being resolved.
+fn defer_derives(bound: &mut Vec<Bound>, start: usize, left: &mut Vec<(bool, Site)>) {
+    let ready = bound[start..].iter().map(|call| (&call.site, true));
+    let pending = left.iter().filter(|(asked, _)| *asked).map(|(_, site)| (site, false));
+    let attrs: Vec<(Arc<File>, u32, u32, bool)> = ready
+        .chain(pending)
+        .filter_map(|(site, ready)| match site {
+            Site::Attribute(held) => Some((held.file.clone(), held.at, held.path.0, ready)),
+            _ => None,
+        })
+        .collect();
+    let over = |site: &Site| match site {
+        Site::Derive(held) => attrs.iter().find(|(file, at, path, _)| Arc::ptr_eq(file, &held.file) && *at == held.at && *path < held.path.0).map(|entry| entry.3),
+        _ => None,
+    };
+    left.retain(|(_, site)| over(site) != Some(true));
+    let mut at = start;
+    while at < bound.len() {
+        match over(&bound[at].site) {
+            Some(true) => drop(bound.remove(at)),
+            Some(false) => left.push((true, bound.remove(at).site)),
+            None => at += 1,
+        }
     }
 }
 

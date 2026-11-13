@@ -5,6 +5,7 @@ use rustc_index::Idx;
 
 use crate::body::{ExprId, List};
 use crate::names::ItemRef;
+use crate::sema::Context;
 use crate::sema::infer::{ALIGN_SLOT, field_types};
 use crate::sema::layout::{Layout, Variant, field_offset, target};
 use crate::sema::ty::{Kind, Ty};
@@ -32,16 +33,33 @@ struct Tag {
     encoding: TagEncoding<Variant>,
 }
 
-impl Lower<'_, '_> {
-    fn tag(&mut self, layout: &Layout) -> Result<Option<Tag>> {
-        let Variants::Multiple { tag, tag_encoding, tag_field, .. } = &layout.variants else {
-            return Ok(None);
-        };
-        let size = tag.size(target()?);
-        let mask = crate::sema::ty::mask(size.bits() as u32);
-        Ok(Some(Tag { offset: layout.fields.offset(tag_field.index()).bytes() as i32, ty: tag_type(size.bytes())?, mask, encoding: tag_encoding.clone() }))
-    }
+fn tag_of(layout: &Layout) -> Result<Option<Tag>> {
+    let Variants::Multiple { tag, tag_encoding, tag_field, .. } = &layout.variants else {
+        return Ok(None);
+    };
+    let size = tag.size(target()?);
+    let mask = crate::sema::ty::mask(size.bits() as u32);
+    Ok(Some(Tag { offset: layout.fields.offset(tag_field.index()).bytes() as i32, ty: tag_type(size.bytes())?, mask, encoding: tag_encoding.clone() }))
+}
 
+/// The offset, type and bits of the tag that a value of variant `variant` of the enum `item` with `layout` holds, or none when the layout keeps no tag for it.
+pub(super) fn tag_bits(cx: &mut Context<'_>, item: ItemRef, layout: &Layout, variant: u32) -> Result<Option<(i32, Type, u128)>> {
+    let Some(tag) = tag_of(layout)? else {
+        return Ok(None);
+    };
+    let value = match &tag.encoding {
+        TagEncoding::Direct => cx.discriminants(item)?[variant as usize] as u128,
+        TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+            if untagged_variant.index() == variant as usize {
+                return Ok(None);
+            }
+            ((variant as u128).wrapping_sub(niche_variants.start.index() as u128)).wrapping_add(*niche_start)
+        }
+    };
+    Ok(Some((tag.offset, tag.ty, value & tag.mask)))
+}
+
+impl Lower<'_, '_> {
     /// Writes variant `variant` of `ty`, an ADT `item` at `args`, with `fields` given by index, over a copy of `base`; returns the value.
     pub fn construct(&mut self, ty: Ty, variant: u32, fields: Vec<(u32, Option<Value>)>, base: Option<Value>) -> Result<Option<Value>> {
         let Kind::Adt(item, args) = *self.cx.types.kind(ty) else { bail!("constructing {:?}, a type that is not an ADT", self.cx.types.kind(ty)) };
@@ -69,20 +87,11 @@ impl Lower<'_, '_> {
     }
 
     fn set_tag(&mut self, place: Place, item: ItemRef, layout: &Layout, variant: u32) -> Result<()> {
-        let Some(tag) = self.tag(layout)? else {
+        let Some((offset, ty, bits)) = tag_bits(self.cx, item, layout, variant)? else {
             return Ok(());
         };
-        let value = match &tag.encoding {
-            TagEncoding::Direct => self.cx.discriminants(item)?[variant as usize] as u128,
-            TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
-                if untagged_variant.index() == variant as usize {
-                    return Ok(());
-                }
-                ((variant as u128).wrapping_sub(niche_variants.start().index() as u128)).wrapping_add(*niche_start)
-            }
-        };
-        let value = self.int_const(tag.ty, value & tag.mask);
-        self.write(place.at(tag.offset, Repr::Scalar(tag.ty)), value);
+        let value = self.int_const(ty, bits);
+        self.write(place.at(offset, Repr::Scalar(ty)), value);
         Ok(())
     }
 
@@ -90,7 +99,7 @@ impl Lower<'_, '_> {
     pub fn is_variant(&mut self, place: Option<Place>, ty: Ty, variant: u32) -> Result<Option<Value>> {
         let Kind::Adt(item, _) = self.cx.types.kind(ty).clone() else { bail!("variant test on a type that is not an ADT") };
         let layout = self.cx.layout(ty)?;
-        let Some(tag) = self.tag(&layout)? else {
+        let Some(tag) = tag_of(&layout)? else {
             return Ok(match layout.variants {
                 Variants::Single { index } if index.index() != variant as usize => Some(self.ins().iconst(Type::I8, 0)),
                 _ => None,
@@ -106,8 +115,8 @@ impl Lower<'_, '_> {
             TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
                 let start = self.int_const(tag.ty, *niche_start & tag.mask);
                 let relative = self.ins().isub(value, start);
-                let first = niche_variants.start().index() as u128;
-                let span = self.int_const(tag.ty, niche_variants.end().index() as u128 - first);
+                let first = niche_variants.start.index() as u128;
+                let span = self.int_const(tag.ty, niche_variants.last.index() as u128 - first);
                 if untagged_variant.index() == variant as usize {
                     self.ins().icmp(IntCC::UnsignedGreaterThan, relative, span)
                 } else {
@@ -127,7 +136,7 @@ impl Lower<'_, '_> {
             return Ok((self.int_const(Type::I64, value as u128), Num::Int { ty: Type::I64, signed: true }));
         };
         let signed = matches!(scalar.primitive(), Primitive::Int(_, true));
-        let Some(tag) = self.tag(&layout)? else { bail!("enum with variants has no tag") };
+        let Some(tag) = tag_of(&layout)? else { bail!("enum with variants has no tag") };
         if !matches!(tag.encoding, TagEncoding::Direct) {
             bail!("casting an enum with fields");
         }

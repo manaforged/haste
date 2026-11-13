@@ -2,16 +2,16 @@ use anyhow::{Result, anyhow, bail};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_lexer::TokenKind;
 
-use crate::body::cursor::{RESERVED, is_name};
+use crate::body::cursor::{PATH_KEYWORDS, RESERVED, is_name};
 use crate::body::{self as syntax, Body, sig};
 use crate::names::collect::{extern_crate_root, proc_kind};
 use crate::names::resolve::macro_at;
 use crate::names::{ItemRef, ModRef, plain};
-use crate::outline::item::{ItemKind, Items, ProcKind};
+use crate::outline::item::{Attr, ItemKind, Items, ProcKind};
 use crate::outline::rules::{self, Rule};
 use crate::outline::source::{Mark, Source, Tokens, opens};
 use crate::outline::tree::{Expansion, File, Truth};
-use crate::outline::{derive, mbe, scan};
+use crate::outline::{attr, derive, mbe, scan};
 
 use super::Context;
 use super::builtin::{self, Builtin};
@@ -60,7 +60,7 @@ fn call_path(src: &Source, bang: u32, from: u32) -> Option<(u32, u32)> {
         return None;
     }
     let mut start = name;
-    while start >= from + 3 && src.kind(start - 1) == TokenKind::Colon && src.kind(start - 2) == TokenKind::Colon && is_name(src.kind(start - 3)) {
+    while start >= from + 3 && src.kind(start - 1) == TokenKind::Colon && src.kind(start - 2) == TokenKind::Colon && path_word(src, start - 3) {
         start -= 3;
     }
     if start >= from + 2 && src.kind(start - 1) == TokenKind::Colon && src.kind(start - 2) == TokenKind::Colon {
@@ -69,6 +69,12 @@ fn call_path(src: &Source, bang: u32, from: u32) -> Option<(u32, u32)> {
         start -= 1;
     }
     Some((start, name))
+}
+
+/// Whether token `at` can lead a path segment: a name that is not a keyword, or one of the keywords a path starts from.
+fn path_word(src: &Source, at: u32) -> bool {
+    let kind = src.kind(at);
+    is_name(kind) && (kind != TokenKind::Ident || !RESERVED.contains(&src.text(at)) || PATH_KEYWORDS.contains(&src.text(at)))
 }
 
 /// The macro that the single name at `path` calls, resolved from the module of the `macro` item that wrote the name.
@@ -87,10 +93,9 @@ fn defined_expand(cx: &Context<'_>, found: ItemRef, src: &Source, open: u32) -> 
     Some(mbe::expand(&definition.file.source, &definition.rules, src, (open, definition.krate as u32), home))
 }
 
-/// The output of the procedural macro `run` called with the delimiter at `open`, once the macro expander ran it; until then the call asks for it.
-fn proc_bang(cx: &mut Context<'_>, src: &Source, run: ItemRef, open: u32) -> Result<Option<Source>> {
-    let close = src.pair(open);
-    let input = if close > open + 1 { src.span(open + 1, close - 1).to_owned() } else { String::new() };
+/// The output of the procedural macro `run` called from crate `krate` with the delimiter at `open`, once the macro expander ran it; until then the call asks for it.
+fn proc_bang(cx: &mut Context<'_>, krate: u32, src: &Source, run: ItemRef, open: u32) -> Result<Option<Source>> {
+    let input = crate::macros::bang_input(&cx.outline.deps[krate as usize], krate as usize, src, open);
     let key = (run, input);
     match cx.outline.procs.get(&key) {
         Some(Ok(text)) => Source::parse(src.path.clone(), text.clone()).map(Some),
@@ -100,6 +105,38 @@ fn proc_bang(cx: &mut Context<'_>, src: &Source, run: ItemRef, open: u32) -> Res
             Ok(None)
         }
     }
+}
+
+/// Adds the tokens of each `path` that the use tree entries in `from..to` name under `prefix`, with the token of its name or alias, to `found`, descending into nested groups; false when an entry is not a plain path.
+fn use_entries(src: &Source, prefix: &[u32], (from, to): (u32, u32), found: &mut Vec<(Vec<u32>, u32)>) -> bool {
+    let mut at = from;
+    while at < to {
+        let mut end = at;
+        while end < to && src.kind(end) != TokenKind::Comma {
+            end = if src.kind(end) == TokenKind::OpenBrace { src.pair(end) + 1 } else { end + 1 };
+        }
+        if end > at && !use_entry(src, prefix, (at, end), found) {
+            return false;
+        }
+        at = end + 1;
+    }
+    true
+}
+
+/// Adds the path that the one use tree entry `from..to` names under `prefix` to `found`, as `use_entries` does.
+fn use_entry(src: &Source, prefix: &[u32], (from, to): (u32, u32), found: &mut Vec<(Vec<u32>, u32)>) -> bool {
+    let pathlike = |range: std::ops::Range<u32>| range.clone().all(|at| is_name(src.kind(at)) || src.kind(at) == TokenKind::Colon);
+    let joined = |end: u32| prefix.iter().copied().chain(from..end).collect::<Vec<u32>>();
+    if src.kind(to - 1) == TokenKind::CloseBrace {
+        let open = src.pair(to - 1);
+        return pathlike(from..open) && use_entries(src, &joined(open), (open + 1, to - 1), found);
+    }
+    let (end, alias) = if to >= from + 3 && src.text(to - 2) == "as" { (to - 2, to - 1) } else { (to, to - 1) };
+    if !pathlike(from..end) || !is_name(src.kind(end - 1)) || !is_name(src.kind(alias)) {
+        return false;
+    }
+    found.push((joined(end), alias));
+    true
 }
 
 fn body_range(file: &File, item: u32) -> Option<(u32, u32)> {
@@ -121,6 +158,16 @@ impl Writer {
 
     fn step(&mut self, cx: &mut Context<'_>, run: Run<'_>, at: u32) -> Result<u32> {
         let src = run.src;
+        if src.kind(at) == TokenKind::Pound
+            && let Some(next) = self.module_file(cx, run, at)?
+        {
+            return Ok(next);
+        }
+        if src.kind(at) == TokenKind::Pound
+            && let Some(next) = self.configured_out(cx, src, at)
+        {
+            return Ok(next);
+        }
         if src.kind(at) != TokenKind::Bang {
             return self.non_bang(cx, src, at);
         }
@@ -137,6 +184,23 @@ impl Writer {
         };
         self.call(cx, run, path, next)?;
         Ok(src.pair(next) + 1)
+    }
+
+    /// The token after the macro call or block that attributes starting at `at` turn off with a `#[cfg]`, which is left unexpanded.
+    fn configured_out(&self, cx: &Context<'_>, src: &Source, at: u32) -> Option<u32> {
+        let mut attrs = Vec::new();
+        let Ok(word) = attr::attrs(src, at, false, &mut attrs) else { return None };
+        if word == at || cx.outline.crates[self.home.krate as usize].env.enabled(&attrs) {
+            return None;
+        }
+        if src.kind(word) == TokenKind::OpenBrace {
+            return Some(src.pair(word) + 1);
+        }
+        let mut end = word;
+        while is_name(src.kind(end)) || src.kind(end) == TokenKind::Colon {
+            end += 1;
+        }
+        (end > word && src.kind(end) == TokenKind::Bang && opens(src.kind(end + 1))).then(|| src.pair(end + 1) + 1)
     }
 
     fn non_bang(&mut self, cx: &Context<'_>, src: &Source, at: u32) -> Result<u32> {
@@ -171,6 +235,32 @@ impl Writer {
         self.scan(cx, Run { src: &output, from: 0, shift: block + 1, depth: run.depth + 1, call: run.call_at(path.0) }, output.len())
     }
 
+    /// Writes the file that a `#[path = ".."] mod name;` starting at `at` names as the module's block, keyed by its `;`, and returns the token after it.
+    fn module_file(&mut self, cx: &mut Context<'_>, run: Run<'_>, at: u32) -> Result<Option<u32>> {
+        let src = run.src;
+        let mut attrs = Vec::new();
+        let mut word = attr::attrs(src, at, false, &mut attrs)?;
+        let Some(path) = attrs.iter().find_map(|found| if let Attr::Path(path) = found { Some(path.clone()) } else { None }) else { return Ok(None) };
+        if src.text(word) == "pub" {
+            word += 1;
+            if src.kind(word) == TokenKind::OpenParen {
+                word = src.pair(word) + 1;
+            }
+        }
+        if src.text(word) != "mod" || !is_name(src.kind(word + 1)) || src.kind(word + 2) != TokenKind::Semi {
+            return Ok(None);
+        }
+        let output = Source::read(&run.call_at(at).0.beside(&path))?;
+        let block = self.offset + self.out.len();
+        self.calls.insert(run.shift + word + 2, block);
+        self.out.lexed("{");
+        self.out.copy_range(&output, 0, output.len());
+        self.out.space();
+        self.out.lexed("}");
+        self.scan(cx, Run { src: &output, from: 0, shift: block + 1, depth: run.depth, call: (&output, 0) }, output.len())?;
+        Ok(Some(word + 3))
+    }
+
     fn note_use(&mut self, src: &Source, at: u32) -> Result<Option<u32>> {
         let mut end = at + 1;
         while src.kind(end) != TokenKind::Semi {
@@ -179,6 +269,9 @@ impl Writer {
                 (at + 1..end).for_each(|token| copy.copy(src, token));
                 self.globs.push(copy.finish(src.path.clone())?);
                 return Ok(Some(end + 2));
+            }
+            if src.kind(end) == TokenKind::OpenBrace && end >= at + 3 && src.kind(end - 1) == TokenKind::Colon {
+                return self.note_use_group(src, (at + 1, end));
             }
             if !is_name(src.kind(end)) && src.kind(end) != TokenKind::Colon {
                 return Ok(None);
@@ -193,6 +286,24 @@ impl Writer {
         (at + 1..=last).for_each(|token| copy.copy(src, token));
         self.uses.push((plain(src.text(alias)).to_owned(), copy.finish(src.path.clone())?));
         Ok(Some(end + 1))
+    }
+
+    /// Notes each `path` or `path as alias` of the group at `open` of a `use prefix::{..};` whose prefix starts at `from`, with nested groups, and returns the token after the `;`.
+    fn note_use_group(&mut self, src: &Source, (from, open): (u32, u32)) -> Result<Option<u32>> {
+        let close = src.pair(open);
+        if src.kind(close + 1) != TokenKind::Semi {
+            return Ok(None);
+        }
+        let mut found = Vec::new();
+        if !use_entries(src, &(from..open).collect::<Vec<_>>(), (open + 1, close), &mut found) {
+            return Ok(None);
+        }
+        for (path, alias) in found {
+            let mut copy = Tokens::default();
+            path.into_iter().for_each(|token| copy.copy(src, token));
+            self.uses.push((plain(src.text(alias)).to_owned(), copy.finish(src.path.clone())?));
+        }
+        Ok(Some(close + 2))
     }
 
     fn define(&mut self, src: &Source, name: u32) -> Result<()> {
@@ -241,19 +352,20 @@ impl Writer {
     }
 
     fn resolve_glob(&self, cx: &Context<'_>, src: &Source, path: (u32, u32)) -> Result<Option<ItemRef>> {
-        if path.0 != path.1 {
-            return Ok(None);
-        }
         for prefix in self.globs.iter().rev() {
-            let mut full = Tokens::default();
-            full.copy_range(prefix, 0, prefix.len());
-            full.copy(src, path.1);
-            let joined = full.finish(src.path.clone())?;
-            if let Some(found) = self.resolve_macro(cx, &joined, (0, prefix.len())) {
+            if let Some(found) = self.resolve_joined(cx, prefix, src, path)? {
                 return Ok(Some(found));
             }
         }
         Ok(None)
+    }
+
+    fn resolve_joined(&self, cx: &Context<'_>, prefix: &Source, src: &Source, (from, to): (u32, u32)) -> Result<Option<ItemRef>> {
+        let mut full = Tokens::default();
+        full.copy_range(prefix, 0, prefix.len());
+        (from..=to).for_each(|token| full.copy(src, token));
+        let joined = full.finish(src.path.clone())?;
+        Ok(self.resolve_macro(cx, &joined, (0, joined.len() - 1)))
     }
 
     fn expand_one(&self, cx: &mut Context<'_>, run: Run<'_>, path: (u32, u32), open: u32) -> Result<Option<Source>> {
@@ -271,7 +383,7 @@ impl Writer {
             return output.map(Some);
         }
         if let Some((_, ProcKind::Bang)) = found.outer().is_none().then(|| cx.item(found)).and_then(|(src, item)| proc_kind(src, item)) {
-            return proc_bang(cx, run.src, found, open);
+            return proc_bang(cx, self.home.krate, run.src, found, open);
         }
         let Some(builtin) = cx.builtin(found) else {
             return Ok(None);
@@ -288,6 +400,13 @@ impl Writer {
         if let Some((_, source)) = self.uses.iter().rev().find(|(alias, _)| path.0 == path.1 && *alias == name) {
             return Ok(self.resolve_macro(cx, source, (0, source.len() - 1)));
         }
+        let first = plain(run.src.text(path.0));
+        if path.0 < path.1
+            && let Some((_, source)) = self.uses.iter().rev().find(|(alias, _)| *alias == first)
+            && let Some(found) = self.resolve_joined(cx, source, run.src, (path.0 + 1, path.1))?
+        {
+            return Ok(Some(found));
+        }
         match self.resolve_macro(cx, run.src, path).or_else(|| def_site_macro(cx, run.src, path)) {
             Some(found) => Ok(Some(found)),
             None => self.resolve_glob(cx, run.src, path),
@@ -300,7 +419,7 @@ impl Writer {
         match site.builtin {
             Builtin::Concat => return self.concat(cx, run, open, out),
             Builtin::Env | Builtin::OptionEnv => return self.env(cx, run, site, out),
-            Builtin::IncludeStr | Builtin::IncludeBytes => return self.include(cx, run, site, out),
+            Builtin::Include | Builtin::IncludeStr | Builtin::IncludeBytes => return self.include(cx, run, site, out),
             Builtin::FormatArgs | Builtin::FormatArgsNl => {
                 return self.format_args(cx, run, site, out);
             }
@@ -310,7 +429,7 @@ impl Writer {
             Builtin::ModulePath => out.lexed(&format!("{:?}", cx.outline.module_path(self.home))),
             Builtin::CfgSelect => return self.cfg_select(cx, run, open, out),
             Builtin::Assert => builtin::assert(src, &src.args(open), site.krate, out),
-            Builtin::Asm => builtin::asm_barrier(src, &src.args(open), out)?,
+            Builtin::Asm => self.asm(cx, run, open, out)?,
             Builtin::Panic | Builtin::Unreachable => self.panic(cx, run, site, out),
         }
         Ok(true)
@@ -345,6 +464,16 @@ impl Writer {
         out.lexed(")");
     }
 
+    fn asm(&self, cx: &mut Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<()> {
+        let args = run.src.args(open);
+        let mut templates = Vec::new();
+        for &range in &args {
+            let Some(template) = self.literal(cx, run, range)? else { break };
+            templates.push(template);
+        }
+        builtin::asm(run.src, &templates, &args[templates.len()..], out)
+    }
+
     fn concat(&self, cx: &mut Context<'_>, run: Run<'_>, open: u32, out: &mut Tokens) -> Result<bool> {
         let mut text = String::new();
         for range in run.src.args(open) {
@@ -377,14 +506,16 @@ impl Writer {
     }
 
     fn include(&self, cx: &mut Context<'_>, run: Run<'_>, site: Site, out: &mut Tokens) -> Result<bool> {
-        let Some(&path) = run.src.args(site.open).first() else { bail!("include_str! and include_bytes! take a path") };
+        let Some(&path) = run.src.args(site.open).first() else { bail!("include!, include_str! and include_bytes! take a path") };
         let Some(path) = self.literal(cx, run, path)? else {
             return Ok(false);
         };
         let path = run.call_at(site.start).0.beside(&path);
         let bytes = std::fs::read(&path).map_err(|error| anyhow!("cannot read {}: {error}", path.display()))?;
+        let text = |bytes: Vec<u8>| String::from_utf8(bytes).map_err(|error| anyhow!("{} is not UTF-8: {error}", path.display()));
         match site.builtin {
-            Builtin::IncludeStr => out.lexed(&format!("{:?}", String::from_utf8(bytes).map_err(|error| anyhow!("{} is not UTF-8: {error}", path.display()))?)),
+            Builtin::Include => out.lexed(&text(bytes)?),
+            Builtin::IncludeStr => out.lexed(&format!("{:?}", text(bytes)?)),
             _ => out.lexed(&builtin::byte_string(&bytes)),
         }
         Ok(true)
@@ -481,7 +612,7 @@ impl<'a> Context<'a> {
     /// The expansion of the body of `item`, or of the body that declares it, once a pass read that body and found macro calls or items in it.
     pub fn expansion(&self, item: ItemRef) -> Option<&'a Expansion> {
         let item = item.body_owner();
-        self.outline.crates[item.krate as usize].files[item.file as usize].expansion(item.item)
+        self.outline.crates[item.krate as usize].files[item.file as usize].expansion(item.krate, item.item)
     }
 
     /// The source that the body of `item` is parsed from: its file, with the expansions of its macro calls when it has some.
@@ -505,7 +636,7 @@ impl<'a> Context<'a> {
     /// Parses the body of `item`, expanding its macro calls and scanning the items it declares when no pass did yet.
     pub(super) fn parse_body(&mut self, item: ItemRef) -> Result<Body> {
         let file = self.file(item);
-        if item.outer().is_some() || file.body_read(item.item) {
+        if item.outer().is_some() || file.body_read(item.krate, item.item) {
             let found = self.expansion(item);
             return super::body_scope::parse_in(self.body_src(item), self.body_config(item, found.map(|found| &found.calls)), self.item(item).1);
         }
@@ -526,7 +657,7 @@ impl<'a> Context<'a> {
         let (source, items, item_scopes) = self.body_derives(item, before, &mut writer, (source, items, &mut scopes, item_scopes))?;
         let calls = writer.calls;
         let found = (!calls.is_empty() || !items.items.is_empty()).then(|| Box::new(Expansion { file: File::new(source, items, true), calls, scopes: scopes.into(), item_scopes: item_scopes.into() }));
-        self.file(item).set_expansion(item.item, found);
+        self.file(item).set_expansion(item.krate, item.item, found);
         Ok(body)
     }
 }

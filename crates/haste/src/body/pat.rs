@@ -49,7 +49,7 @@ impl Cursor<'_> {
     }
 
     fn range_end_ahead(&self) -> bool {
-        matches!(self.kind(), TokenKind::Literal { .. }) || self.punct("-") || self.ident() || self.punct("::") || self.punct("<") || self.is_word("crate") || self.is_word("self") || self.is_word("Self") || self.is_word("super")
+        matches!(self.kind(), TokenKind::Literal { .. }) || self.punct("-") || self.ident() || self.punct("::") || self.punct("<") || super::cursor::PATH_KEYWORDS.iter().any(|word| self.is_word(word))
     }
 
     fn range_bound(&mut self) -> Result<super::ExprId> {

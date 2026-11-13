@@ -24,7 +24,7 @@ pub struct Langs {
 }
 
 /// The lang-table key of the function `#[panic_handler]` marks, which no `#[lang]` value can spell.
-const PANIC_HANDLER: &str = "#[panic_handler]";
+pub(crate) const PANIC_HANDLER: &str = "#[panic_handler]";
 
 impl<'a> Context<'a> {
     /// The generic parameters and where clause of trait `item`.
@@ -49,7 +49,7 @@ impl<'a> Context<'a> {
         let members = self.trait_members.get_or_insert_with(of, || {
             let mut map = HashMap::default();
             for member in self.children(of) {
-                map.entry(self.name(member)).or_insert(member);
+                map.entry(self.plain_name(member)).or_insert(member);
             }
             Arc::new(map)
         });

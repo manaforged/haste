@@ -5,6 +5,8 @@ use crate::ir::{
 use crate::probe::Probe;
 use crate::reloc::RuntimeSymbol;
 
+mod vector;
+
 /// Appends blocks, values and instructions to a function.
 pub struct FunctionBuilder<'f> {
     pub func: &'f mut Function,
@@ -661,6 +663,11 @@ impl Ins<'_> {
     /// Copies `bytes` bytes from `from` to `to`, which may overlap.
     pub fn copy(mut self, to: Value, from: Value, bytes: Value) -> Inst {
         self.effect(Op::Copy(to, from, bytes))
+    }
+
+    /// Copies a value of `bytes` bytes from `from` to `to`, two ranges that are the same or disjoint.
+    pub fn move_value(mut self, to: Value, from: Value, bytes: u32) -> Inst {
+        self.effect(Op::Move(to, from, bytes))
     }
 
     /// Writes `value` at `addr + offset`.
