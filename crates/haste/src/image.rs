@@ -454,6 +454,7 @@ impl Image {
         self.bind_foreign_statics(cx, reached, indices);
         let mut errors = Vec::new();
         let mut work = Vec::new();
+        let mut foreign_fns = Vec::new();
         for &index in indices {
             if reached.list[index].1.is_err() {
                 continue;
@@ -468,13 +469,21 @@ impl Image {
                     if self.backend.is_jit() {
                         self.slot(index).store(address, Ordering::Release);
                     }
-                    if let Some(aot) = self.aot() {
-                        lock(aot).foreign_fns.insert(index, sym);
+                    if self.aot().is_some() {
+                        foreign_fns.push((index, sym));
                     }
                 }
                 Ok(_) => {}
                 Err(_) if lower::is_static(cx, item) && weak(cx, item) => {}
                 Err(error) => errors.push((index, error)),
+            }
+        }
+        if !foreign_fns.is_empty()
+            && let Some(aot) = self.aot()
+        {
+            let mut state = lock(aot);
+            for (index, sym) in foreign_fns {
+                state.foreign_fns.insert(index, sym);
             }
         }
         self.place_statics(cx, reached, &work);
@@ -485,6 +494,8 @@ impl Image {
     }
 
     fn bind_foreign_statics(&self, cx: &Context<'_>, reached: &Reached, indices: &[usize]) {
+        let mut cells_batch = Vec::new();
+        let mut aot_batch = Vec::new();
         for (index, ((item, _), typed)) in indices.iter().map(|&index| (index, &reached.list[index])) {
             if typed.is_err() || !cx.foreign(*item) || !lower::is_static(cx, *item) {
                 continue;
@@ -497,9 +508,23 @@ impl Image {
                 (Ok((host, address)), false) => (address as i64, Some(host)),
                 (Err(_), false) => continue,
             };
-            lock(&self.cells).insert(index, cell);
-            if let Some(aot) = self.aot() {
-                lock(aot).statics.insert(index, aot::AotStatic::Foreign { weak: is_weak, host });
+            cells_batch.push((index, cell));
+            if self.aot().is_some() {
+                aot_batch.push((index, aot::AotStatic::Foreign { weak: is_weak, host }));
+            }
+        }
+        if !cells_batch.is_empty() {
+            let mut cells = lock(&self.cells);
+            for (index, cell) in cells_batch {
+                cells.insert(index, cell);
+            }
+        }
+        if !aot_batch.is_empty()
+            && let Some(aot) = self.aot()
+        {
+            let mut state = lock(aot);
+            for (index, entry) in aot_batch {
+                state.statics.insert(index, entry);
             }
         }
     }

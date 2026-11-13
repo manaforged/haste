@@ -15,7 +15,69 @@ pub(crate) fn run(func: &mut Function) -> bool {
     if merged {
         rename(func, &subst);
     }
-    merged
+    merged | merge_traps(func)
+}
+
+fn is_trap_block(func: &Function, block: usize) -> bool {
+    let data = &func.blocks[block];
+    data.params.is_empty() && matches!(data.insts[..], [inst] if func.insts[inst.index()].op == Op::Trap)
+}
+
+fn merge_traps(func: &mut Function) -> bool {
+    let entry = func.entry.map(Block::index);
+    let mut canonical = None;
+    let mut is_dup = vec![false; func.blocks.len()];
+    let mut has_dup = false;
+    for block in 0..func.blocks.len() {
+        if Some(block) != entry && is_trap_block(func, block) {
+            if canonical.is_none() {
+                canonical = Some(Block(block as u32));
+            } else {
+                is_dup[block] = true;
+                has_dup = true;
+            }
+        }
+    }
+    let Some(canon) = canonical.filter(|_| has_dup) else {
+        return false;
+    };
+    let mut changed = false;
+    let mut kept_dup = vec![false; func.blocks.len()];
+    for inst in &mut func.insts {
+        let mut redirect = |target: &mut Block, empty_args: bool| {
+            let idx = target.index();
+            if is_dup[idx] && *target != canon {
+                if empty_args {
+                    *target = canon;
+                    changed = true;
+                } else {
+                    kept_dup[idx] = true;
+                }
+            }
+        };
+        match &mut inst.op {
+            Op::Jump(target, args) => redirect(target, args.is_empty()),
+            Op::Brif(_, then, then_args, otherwise, else_args) => {
+                redirect(then, then_args.is_empty());
+                redirect(otherwise, else_args.is_empty());
+            }
+            Op::BrTable(_, default, targets) => {
+                redirect(default, true);
+                for target in targets {
+                    redirect(target, true);
+                }
+            }
+            Op::TryCall { normal, .. } => redirect(normal, true),
+            _ => {}
+        }
+    }
+    for (block, dup) in is_dup.into_iter().enumerate() {
+        if dup && !kept_dup[block] {
+            func.blocks[block].insts.clear();
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Builds an identity replacement table mapping each of `count` values to itself.

@@ -23,10 +23,6 @@ pub(crate) struct Regs<R: 'static> {
 
 const FOLD_LIMIT: i64 = 1 << 24;
 
-pub(crate) fn no_scratch(_: &Function, _: &Op) -> bool {
-    false
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Location<R> {
     Slot,
@@ -310,25 +306,58 @@ fn eligible(live: &Live, wanted: &[bool], value: usize) -> bool {
     wanted[value] && !live.ranges_of(value).is_empty() && !crate::park::crosses_ranges(&live.unwinds, live.ranges_of(value))
 }
 
-fn passed<R: Copy>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> (Vec<Option<R>>, Vec<Option<u8>>) {
+fn passed<R: Copy>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> (Vec<Option<(R, bool)>>, Vec<Option<(u8, bool)>>) {
     let (mut ints, mut floats) = (vec![None; func.types.len()], vec![None; func.types.len()]);
+    let ret_abi = classify(&func.signature).ok();
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        if let Op::Call { sig, args, .. } | Op::TryCall { sig, args, .. } = &func.insts[inst.index()].op
-            && let Ok(abi) = classify(&func.sigs[sig.index()])
-        {
-            for (arg, loc) in args.iter().zip(&abi.params) {
-                match *loc {
-                    Loc::Int(reg) => ints[arg.index()] = Some(reg),
-                    Loc::Float(reg) => floats[arg.index()] = Some(reg),
-                    _ => {}
+        match &func.insts[inst.index()].op {
+            Op::Call { sig, args, results, .. } => {
+                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
+                    for (arg, loc) in args.iter().zip(&abi.params) {
+                        match *loc {
+                            Loc::Int(reg) => ints[arg.index()] = Some((reg, true)),
+                            Loc::Float(reg) => floats[arg.index()] = Some((reg, true)),
+                            _ => {}
+                        }
+                    }
+                    for (res, loc) in results.iter().zip(&abi.returns) {
+                        match *loc {
+                            Loc::Int(reg) if ints[res.index()].is_none() => ints[res.index()] = Some((reg, false)),
+                            Loc::Float(reg) if floats[res.index()].is_none() => floats[res.index()] = Some((reg, false)),
+                            _ => {}
+                        }
+                    }
                 }
             }
+            Op::TryCall { sig, args, .. } => {
+                if let Ok(abi) = classify(&func.sigs[sig.index()]) {
+                    for (arg, loc) in args.iter().zip(&abi.params) {
+                        match *loc {
+                            Loc::Int(reg) => ints[arg.index()] = Some((reg, true)),
+                            Loc::Float(reg) => floats[arg.index()] = Some((reg, true)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Op::Return(vals) => {
+                if let Some(abi) = &ret_abi {
+                    for (val, loc) in vals.iter().zip(&abi.returns) {
+                        match *loc {
+                            Loc::Int(reg) if ints[val.index()].is_none() => ints[val.index()] = Some((reg, false)),
+                            Loc::Float(reg) if floats[val.index()].is_none() => floats[val.index()] = Some((reg, false)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     (ints, floats)
 }
 
-fn int_class<'a, R: Copy + PartialEq>(func: &Function, regs: &'a Regs<R>, order: &[Block], params: &[Loc<R>], passed: Vec<Option<R>>) -> Class<'a, R> {
+fn int_class<'a, R: Copy + PartialEq>(func: &Function, regs: &'a Regs<R>, order: &[Block], params: &[Loc<R>], passed: Vec<Option<(R, bool)>>) -> Class<'a, R> {
     let (mut wide, mut scratch) = (false, false);
     for data in order.iter().flat_map(|block| &func.blocks[block.index()].insts).map(|inst| &func.insts[inst.index()]) {
         wide |= data.result.is_some_and(|result| func.ty(result) == Type::I128);
@@ -348,7 +377,7 @@ fn int_class<'a, R: Copy + PartialEq>(func: &Function, regs: &'a Regs<R>, order:
     Class { saved: regs.saved, leaf, arrivals, passed }
 }
 
-fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<u8>>) -> Class<'static, u8> {
+fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<(u8, bool)>>) -> Class<'static, u8> {
     let arrivals = params
         .iter()
         .map(|loc| match *loc {
@@ -610,6 +639,18 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
     let loop_depths = weighed.then(|| crate::cfg::Cfg::new(func).loops(func).depths);
     let promoted_consts = loop_depths.as_deref().map(|depths| promote_loop_consts(func, &census, depths, &elided, regs.two_address, &mut locations)).unwrap_or_default();
+    let mut promoted_syms = Vec::new();
+    if regs.absolute_calls {
+        for (v, loc) in locations.iter_mut().enumerate() {
+            if let Location::SlotAddr(sym) = *loc
+                && !elided[v]
+                && (census.uses[v] > 1 || loop_depths.as_deref().is_some_and(|d| census.def[v].is_some_and(|(b, _)| d[b] > 0)))
+            {
+                *loc = Location::Slot;
+                promoted_syms.push((v, sym));
+            }
+        }
+    }
     let wanted: Vec<bool> = (0..count).map(|value| !elided[value] && matches!(locations[value], Location::Slot) && registered(regs, func.types[value])).collect();
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
     let live = live(func, order, copied, &tracked, &sib, &elided);
@@ -629,6 +670,11 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     for (v, imm) in promoted_consts {
         if !matches!(locations[v], Location::Reg(_)) {
             locations[v] = Location::Imm(imm);
+        }
+    }
+    for (v, sym) in promoted_syms {
+        if !matches!(locations[v], Location::Reg(_)) {
+            locations[v] = Location::SlotAddr(sym);
         }
     }
     let (float_homes, used_floats) = allocate(func, &live, &float_class(regs, params, passed_floats), &floats, &hints);

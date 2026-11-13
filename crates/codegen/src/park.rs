@@ -13,7 +13,7 @@ pub(crate) struct Class<'a, F> {
     pub saved: &'a [F],
     pub leaf: Vec<F>,
     pub arrivals: Vec<Vec<F>>,
-    pub passed: Vec<Option<F>>,
+    pub passed: Vec<Option<(F, bool)>>,
 }
 
 pub(crate) struct Hints<'a> {
@@ -28,7 +28,7 @@ struct Pool<F> {
     is_saved: Vec<bool>,
     kept: Vec<Option<F>>,
     arrival_lock: Vec<bool>,
-    passed: Vec<Option<F>>,
+    passed: Vec<Option<(F, bool)>>,
 }
 
 pub(crate) fn crosses_span(calls: &[u32], (start, end): (u32, u32)) -> bool {
@@ -74,7 +74,7 @@ fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, poo
     let is_saved: Vec<bool> = regs.iter().map(|r| class.saved.contains(r)).collect();
     let locked_arrivals: Vec<F> = class.arrivals.iter().flatten().copied().filter(|reg| class.leaf.contains(reg) && !kept.contains(&Some(*reg))).collect();
     let arrival_lock: Vec<bool> = regs.iter().map(|r| locked_arrivals.contains(r)).collect();
-    let passed = class.passed.iter().map(|reg| reg.filter(|reg| class.leaf.contains(reg))).collect();
+    let passed = class.passed.iter().map(|entry| entry.filter(|(reg, _)| class.leaf.contains(reg))).collect();
     Pool { regs, is_saved, kept, arrival_lock, passed }
 }
 
@@ -408,11 +408,12 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
             });
         }
         if chosen.is_none()
-            && let Some(reg) = pool.passed.get(value).copied().flatten()
+            && let Some((reg, at_call_end)) = pool.passed.get(value).copied().flatten()
         {
             let call_at = end + 1;
             let plain_call = live.calls.binary_search(&call_at).is_ok() && live.unwinds.binary_search(&call_at).is_err();
-            if plain_call && !crosses_ranges(&live.calls, ranges)
+            if (!at_call_end || plain_call)
+                && !crosses_ranges(&live.calls, ranges)
                 && let Some(s) = pool.regs.iter().position(|r| *r == reg)
                 && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start)
             {
@@ -506,6 +507,9 @@ pub(crate) fn parked<R: Copy + PartialEq>(
                 }
             }
         }
+    }
+    for entries in &mut at_call {
+        entries.sort_unstable_by_key(|&(v, r, _)| (matches!(r, ParkReg::Float(_)), func.ty(v).bytes(), v.index()));
     }
     let mut out: Vec<(Inst, Vec<(Value, ParkReg<R>, bool)>)> = live.sites.iter().map(|site| site.0).zip(at_call).filter(|(_, values)| !values.is_empty()).collect();
     out.sort_unstable_by_key(|(inst, _)| inst.index());

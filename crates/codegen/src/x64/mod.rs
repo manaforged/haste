@@ -57,6 +57,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
             defs[res.index()] = Some(inst);
         }
     }
+    let last_block = order.last().copied();
     let emit = Emit {
         func,
         frame,
@@ -73,6 +74,9 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         last_spill: None,
         last_fspill: None,
         next: None,
+        last_block,
+        at_end: false,
+        trap_label: None,
         features: Features::host(),
         copied,
         direct_calls: target.direct_calls,
@@ -127,6 +131,9 @@ pub(super) struct Emit<'a> {
     last_spill: Option<(i32, Reg, (usize, u32))>,
     last_fspill: Option<(i32, Xmm, Type, (usize, u32))>,
     next: Option<Block>,
+    last_block: Option<Block>,
+    at_end: bool,
+    trap_label: Option<Label>,
     features: Features,
     copied: Vec<bool>,
     direct_calls: bool,
@@ -173,6 +180,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn bind_block(&mut self, block: Block) {
         self.last_spill = None;
         self.last_fspill = None;
+        self.at_end = self.last_block == Some(block);
         self.asm.bind(self.blocks[block.index()]);
     }
 
@@ -236,7 +244,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
             }
             Op::Return(values) => self.ret(values),
             Op::Trap => {
-                self.ud2();
+                self.emit_trap(self.at_end);
                 Ok(())
             }
             Op::Trapz(condition) => {
@@ -248,10 +256,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
     }
 
     fn trap(&mut self) {
-        self.ud2();
+        self.emit_trap(self.at_end);
     }
 
-    fn finish(self) -> Result<Code, String> {
+    fn finish(mut self) -> Result<Code, String> {
+        if let Some(label) = self.trap_label {
+            self.asm.bind(label);
+            self.ud2();
+        }
         Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs })
     }
 }
@@ -279,6 +291,17 @@ impl Emit<'_> {
 
     fn ud2(&mut self) {
         self.asm.bytes(&[0x0F, 0x0B]);
+    }
+
+    fn trap_label(&mut self) -> Label {
+        *self.trap_label.get_or_insert_with(|| self.asm.label())
+    }
+
+    fn emit_trap(&mut self, fallthrough: bool) {
+        let label = self.trap_label();
+        if !fallthrough {
+            self.asm.jmp(label);
+        }
     }
 
     fn probe(&mut self, size: u32) {
@@ -317,20 +340,19 @@ impl Emit<'_> {
     fn trapz(&mut self, condition: Value) {
         if let Some(known) = self.imm_extended(condition, Ext::Zero) {
             if known == 0 {
-                self.ud2();
+                self.emit_trap(false);
             }
             return;
         }
-        let skip = self.asm.label();
-        match self.flags.take() {
-            Some((value, cond)) if value == condition => self.asm.jcc(cond, skip),
+        let trap = self.trap_label();
+        let cond = match self.flags.take() {
+            Some((value, cond)) if value == condition => cond.invert(),
             _ => {
                 self.test_value(condition);
-                self.asm.jcc(Cond::Ne, skip);
+                Cond::E
             }
-        }
-        self.ud2();
-        self.asm.bind(skip);
+        };
+        self.asm.jcc(cond, trap);
     }
 
     fn test_value(&mut self, value: Value) {

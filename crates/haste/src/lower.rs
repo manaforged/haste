@@ -188,11 +188,15 @@ pub fn passed_parts(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
         Repr::Mem { parts: parts @ Parts::One(_), .. } => Some(parts),
         Repr::Mem { parts: parts @ Parts::Pair(first, second, _), .. } if first != Type::I128 && second != Type::I128 => Some(parts),
         Repr::Mem { parts: parts @ Parts::Words(..), .. } if !is_repr_c(cx, ty) => Some(parts),
+        Repr::Mem { size, parts: Parts::Bytes, .. } if !is_repr_c(cx, ty) => match abi::packed_word_parts(size) {
+            Parts::Bytes => None,
+            parts => Some(parts),
+        },
         _ => None,
     })
 }
 
-/// The native signature of a reached function: memory values travel by address unless `passed_parts` splits them into one or two scalar registers, and a memory result returns in those registers or through a first `StructReturn` pointer.
+/// The native signature of a reached function: memory values travel by address unless `passed_parts` splits them into up to four scalar registers, and a memory result returns in those registers or through a first `StructReturn` pointer.
 pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
     signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))
 }
@@ -520,12 +524,16 @@ impl Lower<'_, '_> {
     /// Stores into `place` the scalars or address that parameter `local` received from `params`, returning the last consumed `Value`.
     pub(super) fn store_passed(&mut self, local: u32, place: place::Place, params: &mut impl Iterator<Item = Value>) -> Result<Option<Value>> {
         let ty = self.typed.locals[local as usize].ty;
+        let size = match place.repr {
+            Repr::Mem { size, .. } => size,
+            _ => 0,
+        };
         let mut last = None;
         match passed_parts(self.cx, ty)? {
             Some(parts) => {
                 for (machine, offset) in parts.scalars() {
                     if let Some(value) = params.next() {
-                        self.write(place.at(offset, Repr::Scalar(machine)), value);
+                        self.store_packed_part(place, offset, machine, value, size);
                         last = Some(value);
                     }
                 }
@@ -542,8 +550,12 @@ impl Lower<'_, '_> {
 
     /// Appends `value`, a value of `ty`, as it crosses a call: scalars loaded from memory when `passed_parts` names them.
     pub(super) fn push_passed(&mut self, ty: Ty, value: Value, out: &mut Vec<Value>) -> Result<()> {
+        let Repr::Mem { size, .. } = repr(self.cx, ty)? else {
+            out.push(value);
+            return Ok(());
+        };
         match passed_parts(self.cx, ty)? {
-            Some(parts) => out.extend(parts.scalars().map(|(machine, offset)| self.ins().load(machine, value, offset))),
+            Some(parts) => out.extend(parts.scalars().map(|(machine, offset)| self.load_packed_part(value, offset, machine, size))),
             None => out.push(value),
         }
         Ok(())

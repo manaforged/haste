@@ -408,21 +408,26 @@ impl Fold {
         }
     }
 
-    /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, and drops traps that cannot fire.
+    /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, drops traps that cannot fire, rewrites always-firing traps to `Op::Trap`, and truncates after `Op::Trap`.
     fn branches(&self, func: &mut Function) -> bool {
         let mut changed = false;
         for block in 0..func.blocks.len() {
-            let before = func.blocks[block].insts.len();
-            func.blocks[block].insts.retain(|inst| !matches!(func.insts[inst.index()].op, Op::Trapz(x) if self.known(x).is_some_and(|known| known != 0)));
-            changed |= func.blocks[block].insts.len() != before;
+            let mut trapped = false;
+            let Function { blocks, insts, types, .. } = func;
+            blocks[block].insts.retain(|&inst| {
+                let op = &mut insts[inst.index()].op;
+                if trapped { *op = Op::Trap; changed = true; return false; }
+                if let Op::Trapz(x) = *op && let Some(k) = self.known(x) {
+                    *op = Op::Trap; changed = true; trapped = extend(k, types[x.index()], false) == 0; return trapped;
+                }
+                trapped = *op == Op::Trap;
+                true
+            });
             let Some(&last) = func.blocks[block].insts.last() else { continue };
             let invert = match func.insts[last.index()].op {
                 Op::Brif(cond, ..) if self.known(cond).is_none() => match self.def(func, cond) {
                     Some(&Op::Binary(Binary::Bxor, a, b)) => [(a, b), (b, a)].into_iter().find_map(|(inner, one)| {
-                        (func.ty(inner) == Type::I8
-                            && self.boolean(func, inner)
-                            && self.known(one).is_some_and(|imm| extend(imm, Type::I8, false) == 1))
-                        .then_some(inner)
+                        (func.ty(inner) == Type::I8 && self.boolean(func, inner) && self.known(one).is_some_and(|imm| extend(imm, Type::I8, false) == 1)).then_some(inner)
                     }),
                     _ => None,
                 },

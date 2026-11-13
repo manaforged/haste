@@ -411,16 +411,23 @@ impl Emit<'_> {
             } else {
                 (cc, x, y)
             };
-            let left = self.reg_of(x).or_else(|| self.cached_spill(x)).unwrap_or_else(|| {
-                self.raw(Reg::Rax, x);
-                Reg::Rax
-            });
-            if matches!(cc, IntCC::Equal | IntCC::NotEqual)
-                && self.const_of(y).is_some_and(|imm| crate::fold::extend(imm, self.ty(y), false) == 0)
+            if matches!(self.location(x), Location::Slot)
+                && self.cached_spill(x).is_none()
+                && let Some(imm) = self.imm_sized(y, size)
             {
-                self.asm.test_sized(size, left, left);
+                self.asm.alu_imm_sized(size, Alu::Cmp, self.at(x), imm);
             } else {
-                self.alu_at(size, Alu::Cmp, left, y);
+                let left = self.reg_of(x).or_else(|| self.cached_spill(x)).unwrap_or_else(|| {
+                    self.raw(Reg::Rax, x);
+                    Reg::Rax
+                });
+                if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+                    && self.const_of(y).is_some_and(|imm| crate::fold::extend(imm, self.ty(y), false) == 0)
+                {
+                    self.asm.test_sized(size, left, left);
+                } else {
+                    self.alu_at(size, Alu::Cmp, left, y);
+                }
             }
             cond(cc)
         };

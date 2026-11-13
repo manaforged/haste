@@ -529,19 +529,14 @@ impl Image {
 
     fn reuse_cached(&self, (item, footprint): (ItemRef, FootprintId), index: usize, symbols: &[u64], aot_relocs: Option<&Vec<SymbolSource>>, pass: &mut Pass) -> Option<VerifyRecord> {
         let alias_key = (item, footprint, symbols.to_vec());
-        if let Some(&(addr, is_dict)) = pass.stencils.aliases.get(&alias_key) {
+        if let Some(&(addr_or_leader, is_dict)) = pass.stencils.aliases.get(&alias_key) {
             if self.backend.is_jit() {
-                self.publish(index, addr);
+                self.publish(index, addr_or_leader);
             }
-            if let Some(relocs) = aot_relocs
-                && let Some(template) = pass.stencils.templates.get(&(item, footprint))
-            {
-                match template {
-                    CachedTemplate::Stencil { code, .. } => self.record_aot(index, AotFn::Direct { code: Arc::clone(code), relocs: relocs.clone() }, &[]),
-                    CachedTemplate::Dict { code, .. } => self.record_aot(index, AotFn::Dict { body: Arc::clone(code), relocs: relocs.clone() }, &[]),
-                }
+            if aot_relocs.is_some() {
+                self.record_aot(index, AotFn::Alias(addr_or_leader), &[]);
             }
-            return self.cached_verify_record((item, footprint), addr, is_dict, symbols, pass);
+            return self.cached_verify_record((item, footprint), addr_or_leader, is_dict, symbols, pass);
         }
         let template = pass.stencils.templates.get(&(item, footprint)).cloned()?;
         match template {
@@ -552,7 +547,8 @@ impl Image {
                 }
                 pass.record_size(index, code.bytes().len() as u32, 0);
                 if !self.backend.is_check() {
-                    pass.stencils.aliases.insert(alias_key, (exec, false));
+                    let stored = if aot_relocs.is_some() { index } else { exec };
+                    pass.stencils.aliases.insert(alias_key, (stored, false));
                 }
                 if self.backend.is_jit() {
                     Some(VerifyRecord::Patched { exec, len: code.bytes().len(), sites: code.sites().to_vec() })
@@ -567,7 +563,8 @@ impl Image {
                 }
                 pass.record_size(index, stub_bytes.len() as u32, 0);
                 if !self.backend.is_check() {
-                    pass.stencils.aliases.insert(alias_key, (stub_exec, true));
+                    let stored = if aot_relocs.is_some() { index } else { stub_exec };
+                    pass.stencils.aliases.insert(alias_key, (stored, true));
                 }
                 Some(VerifyRecord::Dict { body_exec, stub_exec, stub_bytes, code })
             }
@@ -666,7 +663,8 @@ impl Image {
             }
             pass.record_size(inst.leader, code.bytes().len() as u32, 0);
             if record_cache && !self.backend.is_check() {
-                pass.stencils.aliases.insert((group.item, group.footprint, inst.symbols.clone()), (exec, false));
+                let stored = if inst.relocs.is_some() { inst.leader } else { exec };
+                pass.stencils.aliases.insert((group.item, group.footprint, inst.symbols.clone()), (stored, false));
             }
             if cfg.verify {
                 for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {
@@ -707,7 +705,8 @@ impl Image {
             }
             pass.record_size(inst.leader, stub_bytes.len() as u32, 0);
             if record_cache && !self.backend.is_check() {
-                pass.stencils.aliases.insert((group.item, group.footprint, inst.symbols.clone()), (stub_exec, true));
+                let stored = if inst.relocs.is_some() { inst.leader } else { stub_exec };
+                pass.stencils.aliases.insert((group.item, group.footprint, inst.symbols.clone()), (stored, true));
             }
             if cfg.verify {
                 for idx in std::iter::once(inst.leader).chain(inst.followers.iter().copied()) {

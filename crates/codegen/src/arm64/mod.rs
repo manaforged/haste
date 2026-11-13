@@ -30,14 +30,26 @@ const V0: Vreg = Vreg(0);
 const V1: Vreg = Vreg(1);
 
 const WIDE_SCRATCH: [Reg; 2] = [Reg(14), Reg(15)];
+const OP_SCRATCH: [Reg; 2] = [S, T];
+
+fn arm64_uses_scratch(func: &Function, op: &Op) -> bool {
+    let mut wide = false;
+    op.for_operands(|v| wide |= func.ty(v) == Type::I128);
+    wide || match op {
+        Op::Copy(..) | Op::Move(..) | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fits(..) => true,
+        Op::Binary(Binary::Rotl | Binary::Rotr, x, _) => func.ty(*x).bits() < 32,
+        Op::Binary(Binary::Imul, x, _) => matches!(func.ty(*x), Type::Vec { lane: crate::ir::Lane::I64, count: 2 }),
+        _ => false,
+    }
+}
 
 const REGS: Regs<Reg> = Regs {
     saved: &SAVED,
     saved_float: &SAVED_FLOAT,
-    leaf: &[Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(14), Reg(15)],
+    leaf: &[Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), S, T, Reg(14), Reg(15)],
     wide_scratch: &WIDE_SCRATCH,
-    op_scratch: &[],
-    uses_scratch: crate::alloc::no_scratch,
+    op_scratch: &OP_SCRATCH,
+    uses_scratch: arm64_uses_scratch,
     dict: None,
     float: &float::POOL,
     float_branches: &float::BRANCHES,
@@ -99,6 +111,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         sp_bias: 0,
         shrink,
         slow_thunk,
+        trap_label: None,
         in_shrink_entry: false,
         in_fast_ret: false,
     };
@@ -155,6 +168,7 @@ pub(super) struct Emit<'a> {
     sp_bias: i32,
     shrink: Option<ShrinkWrap>,
     slow_thunk: Label,
+    trap_label: Option<Label>,
     in_shrink_entry: bool,
     in_fast_ret: bool,
 }
@@ -280,7 +294,8 @@ impl<'a> Emitter<'a> for Emit<'a> {
             }
             Op::Return(values) => self.ret(values),
             Op::Trap => {
-                self.asm.brk();
+                let target = self.trap_target();
+                self.asm.b(target);
                 Ok(())
             }
             Op::Trapz(condition) => {
@@ -297,10 +312,15 @@ impl<'a> Emitter<'a> for Emit<'a> {
     }
 
     fn trap(&mut self) {
-        self.asm.brk();
+        let target = self.trap_target();
+        self.asm.b(target);
     }
 
-    fn finish(self) -> Result<Code, String> {
+    fn finish(mut self) -> Result<Code, String> {
+        if let Some(label) = self.trap_label.take() {
+            self.asm.bind(label);
+            self.asm.brk();
+        }
         Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs })
     }
 }
@@ -341,31 +361,20 @@ impl Emit<'_> {
 
     value_op!();
 
-    fn truth(&mut self, condition: Value) -> Cond {
-        match self.flags.take() {
-            Some((value, cond)) if value == condition => cond,
-            _ => {
-                self.last_cmp = None;
-                let reg = self.src(condition, A, Ext::Zero);
-                let size = Size::of(self.ty(condition).bytes());
-                self.asm.alu(Alu::Subs, if size == Size::X { Size::X } else { Size::W }, ZR, reg, ZR);
-                Cond::Ne
-            }
-        }
+    fn trap_target(&mut self) -> Label {
+        *self.trap_label.get_or_insert_with(|| self.asm.label())
     }
 
     fn trapz(&mut self, condition: Value) {
         if let Some(known) = self.plan.const_of(condition) {
             if crate::fold::extend(known, self.ty(condition), false) == 0 {
-                self.asm.brk();
+                let target = self.trap_target();
+                self.asm.b(target);
             }
             return;
         }
-        let skip = self.asm.label();
-        let cond = self.truth(condition);
-        self.asm.bcond(cond, skip);
-        self.asm.brk();
-        self.asm.bind(skip);
+        let target = self.trap_target();
+        self.branch_cond(condition, true, target);
     }
 
     fn assign(&mut self, param: Value, value: Value) {
@@ -383,7 +392,7 @@ impl Emit<'_> {
             Step::Save(arg, index) => index < 2 && self.plan.reg_of(arg).is_some(),
             Step::Restore(index, param) => index < 2 && self.plan.reg_of(param).is_some(),
         });
-        let scratch = [S, T];
+        let scratch = [A, C];
         for step in steps {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
@@ -466,7 +475,7 @@ impl Emit<'_> {
 
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {
         let returns = self.abi.returns.clone();
-        self.move_locs(values, &returns);
+        self.move_locs(values, &returns, None);
         if self.in_fast_ret {
             self.asm.ret();
         } else {
@@ -475,7 +484,7 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn move_locs(&mut self, values: &[Value], locs: &[Loc]) {
+    fn move_locs(&mut self, values: &[Value], locs: &[Loc], extra: Option<(Value, Reg)>) {
         let float_targets: Vec<(Value, u8)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Float(v) = loc { Some((val, v)) } else { None }).collect();
         for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
             match step {
@@ -493,7 +502,8 @@ impl Emit<'_> {
                 ArgStep::Load(val, dst) => self.fget(Vreg(dst), val),
             }
         }
-        let int_targets: Vec<(Value, Reg)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Int(reg) = loc { Some((val, reg)) } else { None }).collect();
+        let mut int_targets: Vec<(Value, Reg)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Int(reg) = loc { Some((val, reg)) } else { None }).collect();
+        int_targets.extend(extra);
         for step in arg_steps(&int_targets, |v| self.plan.reg_of(v)) {
             match step {
                 ArgStep::Move(src, dst) => self.asm.mov(dst, src),
@@ -579,18 +589,15 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
-        let target = if direct.is_none() {
+        let (target, extra) = if direct.is_none() {
             match self.plan.reg_of(callee).filter(|reg| SAVED.contains(reg)) {
-                Some(reg) => reg,
-                None => {
-                    self.raw(T, callee);
-                    T
-                }
+                Some(reg) => (reg, None),
+                None => (T, Some((callee, T))),
             }
         } else {
-            T
+            (T, None)
         };
-        self.move_locs(args, &abi.params);
+        self.move_locs(args, &abi.params, extra);
         match direct {
             Some(CallTarget::Slot(sym)) if self.direct_calls => {
                 let at = self.asm.bl_reloc();

@@ -198,6 +198,12 @@ fn fixup_bits(kind: Fixup, bytes: i64) -> Option<u32> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairKind { IntLoad, IntStore, FloatLoad, FloatStore }
+
+#[derive(Clone, Copy)]
+struct LastMem { end_pos: u32, binds: u32, kind: PairKind, reg: u8, base: Reg, disp: i32 }
+
 #[derive(Default)]
 pub(crate) struct Asm {
     code: Vec<u8>,
@@ -205,6 +211,7 @@ pub(crate) struct Asm {
     fixups: Vec<(u32, usize, Fixup)>,
     table_fixups: Vec<(u32, usize, usize)>,
     binds: u32,
+    last_mem: Option<LastMem>,
 }
 
 fn sized(base: u32, size: Size) -> u32 {
@@ -525,24 +532,59 @@ impl Asm {
         [0x3800_0000, 0x7800_0000, 0xB800_0000, 0xF800_0000][size as usize]
     }
 
+    fn access_pair(&mut self, pair: Option<(PairKind, u8)>, base: u32, scale: u32, rt: u32, mem: Mem) {
+        if let Some((kind, reg)) = pair
+            && let Some(prev) = self.last_mem
+            && prev.end_pos == self.pos()
+            && prev.binds == self.binds
+            && prev.kind == kind
+            && prev.base == mem.base
+            && let Some((r1, r2, min_disp)) = match mem.disp.checked_sub(prev.disp) {
+                Some(8) => Some((prev.reg, reg, prev.disp)),
+                Some(-8) => Some((reg, prev.reg, mem.disp)),
+                _ => None,
+            }
+            && min_disp % 8 == 0
+            && (-512..=504).contains(&min_disp)
+            && !(kind == PairKind::IntLoad && (r1 == r2 || r1 == ZR.0 || r2 == ZR.0 || (mem.base != SP && (prev.reg == mem.base.0 || reg == mem.base.0))))
+            && !(kind == PairKind::FloatLoad && r1 == r2)
+        {
+            self.code.truncate((prev.end_pos - 4) as usize);
+            match kind {
+                PairKind::IntLoad => self.ldp_offset(Reg(r1), Reg(r2), mem.base, min_disp),
+                PairKind::IntStore => self.stp_offset(Reg(r1), Reg(r2), mem.base, min_disp),
+                PairKind::FloatLoad => self.fldp_offset(Vreg(r1), Vreg(r2), mem.base, min_disp),
+                PairKind::FloatStore => self.fstp_offset(Vreg(r1), Vreg(r2), mem.base, min_disp),
+            }
+            self.last_mem = None;
+            return;
+        }
+        let single = self.access(base, scale, rt, mem);
+        self.last_mem = pair.filter(|_| single).map(|(kind, reg)| LastMem { end_pos: self.pos(), binds: self.binds, kind, reg, base: mem.base, disp: mem.disp });
+    }
+
     /// Loads `size` bytes at `mem` into `dst`, sign-extending to 64 bits when `signed`, else zero-extending.
     pub fn load(&mut self, size: Size, signed: bool, dst: Reg, mem: Mem) {
-        self.access(Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
+        let pair = (size == Size::X).then_some((PairKind::IntLoad, dst.0));
+        self.access_pair(pair, Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
     }
 
     pub fn store(&mut self, size: Size, mem: Mem, src: Reg) {
-        self.access(Self::store_base(size), size.log2(), u32::from(src.0), mem);
+        let pair = (size == Size::X).then_some((PairKind::IntStore, src.0));
+        self.access_pair(pair, Self::store_base(size), size.log2(), u32::from(src.0), mem);
     }
 
     /// Loads a float or vector register of `bytes` 4, 8 or 16.
     pub fn vload(&mut self, bytes: u32, dst: Vreg, mem: Mem) {
         let (base, scale) = Self::vbase(bytes);
-        self.access(base | 0x40_0000, scale, u32::from(dst.0), mem);
+        let pair = (bytes == 8).then_some((PairKind::FloatLoad, dst.0));
+        self.access_pair(pair, base | 0x40_0000, scale, u32::from(dst.0), mem);
     }
 
     pub fn vstore(&mut self, bytes: u32, mem: Mem, src: Vreg) {
         let (base, scale) = Self::vbase(bytes);
-        self.access(base, scale, u32::from(src.0), mem);
+        let pair = (bytes == 8).then_some((PairKind::FloatStore, src.0));
+        self.access_pair(pair, base, scale, u32::from(src.0), mem);
     }
 
     /// Loads `size` bytes at `base + (index << shift)` into `dst`.
@@ -578,16 +620,19 @@ impl Asm {
     }
 
     /// One load or store from its unscaled-offset encoding `base`: the scaled form when the offset fits it, the unscaled form for small offsets, else through x17.
-    fn access(&mut self, base: u32, scale: u32, rt: u32, mem: Mem) {
+    fn access(&mut self, base: u32, scale: u32, rt: u32, mem: Mem) -> bool {
         let (disp, rn) = (mem.disp, u32::from(mem.base.0));
         let unit = 1 << scale;
         if disp >= 0 && disp % unit == 0 && disp / unit < 4096 {
             self.word(base | 1 << 24 | ((disp / unit) as u32) << 10 | rn << 5 | rt);
+            true
         } else if (-256..256).contains(&disp) {
             self.word(base | ((disp as u32) & 0x1FF) << 12 | rn << 5 | rt);
+            true
         } else {
             self.mov_imm(Reg(17), i64::from(disp));
             self.access_indexed(base, rt, mem.base, Reg(17), 0);
+            false
         }
     }
 

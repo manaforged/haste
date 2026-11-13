@@ -110,6 +110,7 @@ impl Image {
         let mut errors = Vec::new();
         let mut current_shards = initial_shards.to_vec();
         let jobs = crate::jobs();
+        let min_parallel = if self.backend.is_aot() { 4 } else { MIN_PARALLEL };
         let mut deferred = Vec::new();
         for wave in 0..MAX_PARALLEL_WAVES {
             let forks: Vec<Context<'_>> = current_shards.iter().map(|_| cx.fork()).collect();
@@ -127,7 +128,7 @@ impl Image {
                     None => errors.extend(self.lost(cx, reached, shard)),
                 }
             }
-            if deferred.is_empty() || eval_requests.is_empty() || wave + 1 == MAX_PARALLEL_WAVES || deferred.len() < MIN_PARALLEL {
+            if deferred.is_empty() || eval_requests.is_empty() || wave + 1 == MAX_PARALLEL_WAVES || deferred.len() < min_parallel {
                 break;
             }
             let was_parallel = std::mem::replace(&mut cx.in_parallel, false);

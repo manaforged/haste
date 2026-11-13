@@ -1,8 +1,12 @@
 //! Reuses what memory holds along straight-line code: a load of the bytes an earlier load or store on the same path read or wrote, with no write of unknown reach between them, takes that value.
 
+mod coalesce;
+
+use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
+
 use crate::cfg::Cfg;
 use crate::ir::{Binary, Block, Convert, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
-use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, compute_affine};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, compute_affine, may_alias};
 use crate::merge::{find, identity, rename};
 
 enum Assembled {
@@ -216,19 +220,27 @@ fn forward_concat(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Opt
 /// Drops from `block` each load whose bytes `known` holds, recording its replacement in `subst`, eliminates dead overwritten stores, and leaves in `known` what memory holds at the block's end; returns `(changed, renamed)`.
 fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut KnownLoads) -> (bool, bool) {
     let insts = std::mem::take(&mut func.blocks[block.index()].insts);
-    let mut kept: Vec<Option<Inst>> = Vec::with_capacity(insts.len());
-    let mut pending_stores: Vec<(MemLoc, usize)> = Vec::new();
+    let mut bufs = ScanBuf {
+        kept: Vec::with_capacity(insts.len()),
+        pending_stores: Vec::new(),
+        const_stores: Vec::new(),
+    };
     let (mut changed, mut renamed) = (false, false);
     for inst in insts {
         match func.insts[inst.index()].op {
             Op::Move(_, from, bytes) => {
                 let read_loc = addr_loc(state.prov, state.subst, from, 0, bytes);
-                pending_stores.retain(|&(ploc, _)| !crate::mem::may_alias(read_loc, ploc, state.prov));
+                bufs.pending_stores.retain(|&(ploc, _)| !may_alias(read_loc, ploc, state.prov));
+                bufs.const_stores.retain(|cs| !may_alias(read_loc, cs.loc, state.prov));
             }
             Op::Trap | Op::Trapz(_) => {
-                pending_stores.retain(|&(ploc, _)| matches!(ploc.root, MemRoot::Slot(s) if state.prov.slot_unescaped(s)));
+                bufs.pending_stores.retain(|&(ploc, _)| slot_unescaped(state.prov, ploc));
+                bufs.const_stores.retain(|cs| slot_unescaped(state.prov, cs.loc));
             }
-            Op::TryCall { .. } => pending_stores.clear(),
+            Op::TryCall { .. } => {
+                bufs.pending_stores.clear();
+                bufs.const_stores.clear();
+            }
             _ => {}
         }
         match effect(func, state, inst) {
@@ -250,22 +262,22 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                             Assembled::VecZero => func.insts[inst.index()].op = Op::Const(0),
                             Assembled::VecByteSplat(b) => {
                                 let byte_ty = Type::Vec { lane: Lane::I8, count: ty.bytes() as u8 };
-                                let b_val = emit_op(func, state, &mut kept, Type::I8, Op::Const(i64::from(b)));
-                                let zero = emit_op(func, state, &mut kept, byte_ty, Op::Const(0));
-                                let first = emit_op(func, state, &mut kept, byte_ty, Op::Insert(zero, b_val, 0));
+                                let b_val = emit_op(func, state, &mut bufs.kept, Type::I8, Op::Const(i64::from(b)));
+                                let zero = emit_op(func, state, &mut bufs.kept, byte_ty, Op::Const(0));
+                                let first = emit_op(func, state, &mut bufs.kept, byte_ty, Op::Insert(zero, b_val, 0));
                                 let splat = Op::Shuffle(first, first, ShuffleMask::Const([0; 16]));
                                 if ty == byte_ty {
                                     func.insts[inst.index()].op = splat;
                                 } else {
-                                    let vec = emit_op(func, state, &mut kept, byte_ty, splat);
+                                    let vec = emit_op(func, state, &mut bufs.kept, byte_ty, splat);
                                     func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, vec);
                                 }
                             }
                         }
                         known.remember(loc, ty, result);
                         changed = true;
-                    } else if forward_subword(func, state, &mut kept, known, inst, loc, ty)
-                        || forward_concat(func, state, &mut kept, known, inst, loc, ty)
+                    } else if forward_subword(func, state, &mut bufs.kept, known, inst, loc, ty)
+                        || forward_concat(func, state, &mut bufs.kept, known, inst, loc, ty)
                     {
                         known.remember(loc, ty, result);
                         changed = true;
@@ -282,22 +294,33 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                         changed = true;
                     } else {
                         known.remember(loc, ty, result);
-                        pending_stores.retain(|&(ploc, _)| !crate::mem::may_alias(loc, ploc, state.prov));
+                        bufs.pending_stores.retain(|&(ploc, _)| !may_alias(loc, ploc, state.prov));
+                        let safe_read = slot_unescaped(state.prov, loc);
+                        bufs.const_stores.retain(|cs| {
+                            !may_alias(loc, cs.loc, state.prov)
+                                && (slot_unescaped(state.prov, cs.loc) || safe_read || cs.loc.base == loc.base)
+                        });
                     }
                 }
             },
             Effect::Write(loc, ty, value) => {
                 known.write(loc, ty, value, state.prov);
+                let safe_write = slot_unescaped(state.prov, loc);
+                bufs.const_stores.retain(|cs| {
+                    !may_alias(loc, cs.loc, state.prov)
+                        && (slot_unescaped(state.prov, cs.loc) || safe_write || cs.loc.base == loc.base)
+                });
                 let track = match loc.root {
                     MemRoot::Slot(s) => state.prov.slot_unescaped(s),
                     _ => true,
                 };
+                let mut push_loc = loc;
                 if track {
                     let end = i128::from(loc.offset) + i128::from(loc.size);
-                    pending_stores.retain(|&(ploc, kept_idx)| {
+                    bufs.pending_stores.retain(|&(ploc, kept_idx)| {
                         let pend = i128::from(ploc.offset) + i128::from(ploc.size);
                         if ploc.base == loc.base && ploc.offset >= loc.offset && pend <= end {
-                            if let Some(dead_store) = kept[kept_idx].take() {
+                            if let Some(dead_store) = bufs.kept[kept_idx].take() {
                                 func.insts[dead_store.index()].op = Op::Trap;
                                 changed = true;
                             }
@@ -306,23 +329,29 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                             true
                         }
                     });
-                    pending_stores.push((loc, kept.len()));
+                    if let Some(wide_loc) = try_coalesce_store(func, state, known, &mut bufs, (inst, loc, ty, value)) {
+                        push_loc = wide_loc;
+                        changed = true;
+                    }
+                    bufs.pending_stores.push((push_loc, bufs.kept.len()));
                 }
             }
             Effect::Unknown => {
                 let op = &func.insts[inst.index()].op;
                 known.invalidate(func, op, state.prov);
-                pending_stores.retain(|&(ploc, _)| match ploc.root {
+                let keep_fn = |ploc: MemLoc| match ploc.root {
                     MemRoot::Slot(s) => state.prov.slot_unescaped(s),
                     MemRoot::NoAliasParam(p) => !clobbers(func, op, ploc, state.prov) && state.prov.noalias_unescaped(p),
                     _ => false,
-                });
+                };
+                bufs.pending_stores.retain(|&(ploc, _)| keep_fn(ploc));
+                bufs.const_stores.retain(|cs| keep_fn(cs.loc));
             }
             Effect::None => {}
         }
-        kept.push(Some(inst));
+        bufs.kept.push(Some(inst));
     }
-    func.blocks[block.index()].insts = kept.into_iter().flatten().collect();
+    func.blocks[block.index()].insts = bufs.kept.into_iter().flatten().collect();
     (changed, renamed)
 }
 
@@ -552,7 +581,86 @@ fn sink_terminator_defs(func: &mut Function) -> bool {
     changed
 }
 
-/// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between: through each block and on into a successor that only it enters; returns whether `func` was mutated.
+struct BlockWrites<'a> {
+    cfg: &'a Cfg,
+    prov: &'a Provenance,
+    writes: &'a [Vec<Inst>],
+    trycall: &'a [bool],
+}
+
+fn collect_block_writes(func: &Function) -> (Vec<Vec<Inst>>, Vec<bool>) {
+    let mut writes = vec![Vec::new(); func.blocks.len()];
+    let mut trycall = vec![false; func.blocks.len()];
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        trycall[b_idx] = func.last(Block(b_idx as u32)).is_some_and(|op| matches!(op, Op::TryCall { .. }));
+        for &inst in &block.insts {
+            if matches!(
+                func.insts[inst.index()].op,
+                Op::Store(..)
+                    | Op::StackStore(..)
+                    | Op::Copy(..)
+                    | Op::Move(..)
+                    | Op::AtomicLoad(_)
+                    | Op::AtomicStore(..)
+                    | Op::AtomicRmw(..)
+                    | Op::AtomicCas(..)
+                    | Op::Fence
+                    | Op::Call { .. }
+                    | Op::TryCall { .. }
+            ) {
+                writes[b_idx].push(inst);
+            }
+        }
+    }
+    (writes, trycall)
+}
+
+fn entry_known(func: &Function, bw: &BlockWrites<'_>, known_out: &[KnownLoads], block: Block) -> KnownLoads {
+    if Some(block) == bw.cfg.entry {
+        return KnownLoads::new();
+    }
+    if let Some(pred) = bw.cfg.single_pred(block) {
+        return if bw.trycall[pred.index()] { KnownLoads::new() } else { known_out[pred.index()].clone() };
+    }
+    let Some(dom) = bw.cfg.idom[block.index()] else {
+        return KnownLoads::new();
+    };
+    if bw.trycall[dom.index()] {
+        return KnownLoads::new();
+    }
+    let mut known = known_out[dom.index()].clone();
+    if known.is_empty() {
+        return known;
+    }
+    let mut in_region = vec![false; func.blocks.len()];
+    let mut work = Vec::new();
+    for &pred in bw.cfg.preds_of(block) {
+        if bw.cfg.reachable[pred.index()] && pred != dom && !in_region[pred.index()] {
+            in_region[pred.index()] = true;
+            work.push(pred);
+        }
+    }
+    while let Some(m) = work.pop() {
+        if bw.trycall[m.index()] {
+            return KnownLoads::new();
+        }
+        for &w in &bw.writes[m.index()] {
+            known.invalidate(func, &func.insts[w.index()].op, bw.prov);
+            if known.is_empty() {
+                return known;
+            }
+        }
+        for &pred in bw.cfg.preds_of(m) {
+            if bw.cfg.reachable[pred.index()] && pred != dom && !in_region[pred.index()] {
+                in_region[pred.index()] = true;
+                work.push(pred);
+            }
+        }
+    }
+    known
+}
+
+/// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between; returns whether `func` was mutated.
 pub(crate) fn run(func: &mut Function) -> bool {
     let Some(entry) = func.entry else { return false };
     if func.coroutine.is_some() {
@@ -572,23 +680,18 @@ pub(crate) fn run(func: &mut Function) -> bool {
             _ => {}
         }
     }
+    let (writes, trycall) = collect_block_writes(func);
+    let bw = BlockWrites { cfg: &cfg, prov: &prov, writes: &writes, trycall: &trycall };
     let mut subst = identity(func.types.len());
     let mut state = State { prov: &prov, selects: &selects, consts: &mut consts, subst: &mut subst };
     let mut renamed = false;
-    let mut seen = vec![false; func.blocks.len()];
-    let mut stack = vec![(entry, KnownLoads::new())];
-    while let Some((block, mut known)) = stack.pop() {
-        if std::mem::replace(&mut seen[block.index()], true) {
-            continue;
-        }
+    let mut known_out: Vec<KnownLoads> = (0..func.blocks.len()).map(|_| KnownLoads::new()).collect();
+    for &block in &cfg.rpo {
+        let mut known = entry_known(func, &bw, &known_out, block);
         let (block_changed, block_renamed) = scan(func, block, &mut state, &mut known);
         changed |= block_changed;
         renamed |= block_renamed;
-        let ends_in_call = func.last(block).is_some_and(|op| matches!(op, Op::TryCall { .. }));
-        for next in func.successors(block) {
-            let inherits = cfg.pred_count(next) == 1 && next != entry && !ends_in_call;
-            stack.push((next, if inherits { known.clone() } else { KnownLoads::new() }));
-        }
+        known_out[block.index()] = known;
     }
     if renamed {
         rename(func, state.subst);

@@ -258,9 +258,86 @@ fn slot_target(fn_offs: &[Option<u32>], foreign_fns: &HashMap<usize, HostSymbol>
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum RelocTargetKey {
+    SelfCall,
+    Fn(usize),
+    Sym(Symbol),
+}
+
+type IcfKey<'a> = (&'a [u8], Vec<(u32, RelocKind, RelocTargetKey)>);
+
+fn alias_roots(functions: &[Option<AotFn>]) -> Vec<usize> {
+    (0..functions.len())
+        .map(|mut cur| {
+            for _ in 0..functions.len() {
+                match functions.get(cur).and_then(Option::as_ref) {
+                    Some(AotFn::Alias(next)) if *next < functions.len() => cur = *next,
+                    _ => break,
+                }
+            }
+            cur
+        })
+        .collect()
+}
+
+fn foreign_sym(foreign_fns: &HashMap<usize, HostSymbol>, idx: usize) -> Symbol {
+    foreign_fns.get(&idx).map_or(Symbol::Host(HostSymbol::Abort), |host| Symbol::Host(host.clone()))
+}
+
+fn icf_key<'a>(self_idx: usize, code: &'a Code, relocs: &[SymbolSource], state: &AotState, syms: &SymTable<'_>, roots: &[usize], canon: &[usize]) -> Result<IcfKey<'a>> {
+    let mut sig = Vec::with_capacity(code.relocs().len());
+    for reloc in code.relocs() {
+        let target = match reloc.as_runtime() {
+            Some(rt) => RelocTargetKey::Sym(Symbol::Runtime(rt)),
+            None if matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32) => match relocs[reloc.symbol as usize] {
+                SymbolSource::Slot(callee) => {
+                    let root = roots.get(callee).copied().unwrap_or(callee);
+                    if state.functions.get(root).and_then(Option::as_ref).is_some() {
+                        if root == self_idx { RelocTargetKey::SelfCall } else { RelocTargetKey::Fn(canon[root]) }
+                    } else {
+                        RelocTargetKey::Sym(foreign_sym(&state.foreign_fns, callee))
+                    }
+                }
+                ref other => RelocTargetKey::Sym(syms.translate(other)?),
+            },
+            None => RelocTargetKey::Sym(syms.translate(&relocs[reloc.symbol as usize])?),
+        };
+        sig.push((reloc.offset, reloc.kind, target));
+    }
+    Ok((code.bytes(), sig))
+}
+
+fn fold_direct_functions(state: &AotState, live_fns: &[bool], syms: &SymTable<'_>, roots: &[usize]) -> Result<Vec<usize>> {
+    let mut canon = roots.to_vec();
+    for _ in 0..4 {
+        let mut seen: HashMap<IcfKey<'_>, usize> = HashMap::default();
+        let mut changed = false;
+        let prev = canon.clone();
+        for idx in 0..state.functions.len() {
+            if !live_fns[idx] || roots[idx] != idx {
+                continue;
+            }
+            let Some(AotFn::Direct { code, relocs }) = &state.functions[idx] else { continue };
+            let key = icf_key(idx, code, relocs, state, syms, roots, &prev)?;
+            let leader = *seen.entry(key).or_insert(idx);
+            if canon[idx] != leader {
+                canon[idx] = leader;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(canon)
+}
+
 fn emit_functions(state: &AotState, live_fns: &[bool], target: &Target, syms: &SymTable<'_>, dict_bodies: &HashMap<usize, u32>, exe: &mut Executable) -> Result<Vec<Option<u32>>> {
+    let roots = alias_roots(&state.functions);
+    let canon = fold_direct_functions(state, live_fns, syms, &roots)?;
     let mut fn_offs = vec![None; state.functions.len()];
-    let mut aliases = Vec::new();
+    let mut folded = Vec::new();
     let mut pending = Vec::new();
     for (idx, item) in state.functions.iter().enumerate() {
         if !live_fns[idx] {
@@ -268,6 +345,10 @@ fn emit_functions(state: &AotState, live_fns: &[bool], target: &Target, syms: &S
         }
         match item {
             Some(AotFn::Direct { code, relocs }) => {
+                if canon[idx] != idx {
+                    folded.push((idx, canon[idx]));
+                    continue;
+                }
                 let off = exe.text(code.bytes());
                 fn_offs[idx] = Some(off);
                 pending.push((off, code, relocs));
@@ -285,11 +366,11 @@ fn emit_functions(state: &AotState, live_fns: &[bool], target: &Target, syms: &S
                 exe.patch(off + dict_rel, dict_kind, Symbol::Rodata(dict_off));
                 exe.patch(off + body_rel, body_kind, Symbol::Text(body_off));
             }
-            Some(AotFn::Alias(leader)) => aliases.push((idx, *leader)),
+            Some(AotFn::Alias(_)) => folded.push((idx, canon[roots[idx]])),
             None => {}
         }
     }
-    for (idx, leader) in aliases {
+    for (idx, leader) in folded {
         fn_offs[idx] = fn_offs[leader];
     }
     for (off, code, relocs) in pending {

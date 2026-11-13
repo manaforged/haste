@@ -79,7 +79,7 @@ pub(super) fn classify(signature: &Signature, abi: CallAbi) -> Result<Abi, Strin
     let win64 = abi == CallAbi::Win64;
     let mut params = Counter { int: 0, float: 0, stack: if win64 { 32 } else { 0 }, win64 };
     let placed = signature.params.iter().map(|param| params.param(param.purpose, param.value_type)).collect();
-    let ints: &[Reg] = if signature.call_conv == CallConv::Internal && !win64 { &[Reg::Rax, Reg::Rdx, Reg::Rcx, Reg::Rsi] } else { &INT_RETURNS };
-    let floats = if signature.call_conv == CallConv::Internal && !win64 { 4 } else if win64 { 1 } else { FLOAT_RETURNS };
+    let ints: &[Reg] = if signature.call_conv == CallConv::Internal { &[Reg::Rax, Reg::Rdx, Reg::Rcx, Reg::R8] } else { &INT_RETURNS };
+    let floats = if signature.call_conv == CallConv::Internal { 4 } else if win64 { 1 } else { FLOAT_RETURNS };
     Ok(Abi { params: placed, returns: returns(signature, ints, floats)?, stack: round(params.stack, 16) })
 }

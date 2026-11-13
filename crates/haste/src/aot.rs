@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use haste_codegen::{Arch, Format, Os, RelocKind, RuntimeSymbol, Target, patch_reloc};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::host::{HostSymbol, MathSymbol};
 
@@ -295,6 +295,20 @@ pub(super) struct Plan<'a> {
     pub(super) libs: BTreeSet<&'a str>,
 }
 
+fn collect_dynamic_chunk<'a>(syms: impl Iterator<Item = &'a Symbol>) -> Result<Vec<Binding<'a>>> {
+    let mut seen_host = FxHashSet::default();
+    let mut seen_rt = FxHashSet::default();
+    let mut found = Vec::new();
+    for sym in syms {
+        match sym {
+            Symbol::Host(host) if seen_host.insert(host) => found.push(classify_host(host)?),
+            Symbol::Runtime(rt) if seen_rt.insert(*rt) => found.push(classify_runtime(*rt)?),
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
 impl<'a> Plan<'a> {
     pub(super) fn collect(exe: &'a Executable, extra_imports: &[&'static str]) -> Result<Self> {
         let mut plan = Self {
@@ -305,9 +319,41 @@ impl<'a> Plan<'a> {
             libs: BTreeSet::new(),
         };
         extra_imports.iter().for_each(|&imp| plan.add_import(imp, None));
-        let zero = SectionAddrs::default();
-        for sym in exe.relocs.iter().map(|r| &r.symbol).chain(exe.pointers.iter().map(|p| &p.symbol)) {
-            plan.visit(classify(sym, zero)?);
+        let total = exe.relocs.len() + exe.pointers.len();
+        let workers = crate::jobs().min(total / 2048);
+        if workers <= 1 {
+            for binding in collect_dynamic_chunk(exe.relocs.iter().map(|r| &r.symbol).chain(exe.pointers.iter().map(|p| &p.symbol)))? {
+                plan.visit(binding);
+            }
+            return Ok(plan);
+        }
+        let reloc_chunk = exe.relocs.len().div_ceil(workers).max(1);
+        let ptr_chunk = exe.pointers.len().div_ceil(workers).max(1);
+        let (reloc_batches, ptr_batches): (Result<Vec<_>>, Result<Vec<_>>) = std::thread::scope(|scope| {
+            let reloc_handles: Vec<_> = exe
+                .relocs
+                .chunks(reloc_chunk)
+                .map(|chunk| scope.spawn(move || collect_dynamic_chunk(chunk.iter().map(|r| &r.symbol))))
+                .collect();
+            let ptr_handles: Vec<_> = exe
+                .pointers
+                .chunks(ptr_chunk)
+                .map(|chunk| scope.spawn(move || collect_dynamic_chunk(chunk.iter().map(|p| &p.symbol))))
+                .collect();
+            let r = reloc_handles
+                .into_iter()
+                .map(|h| h.join().map_err(|_| anyhow::anyhow!("AOT plan worker panicked"))?)
+                .collect();
+            let p = ptr_handles
+                .into_iter()
+                .map(|h| h.join().map_err(|_| anyhow::anyhow!("AOT plan worker panicked"))?)
+                .collect();
+            (r, p)
+        });
+        for batch in reloc_batches?.into_iter().chain(ptr_batches?) {
+            for binding in batch {
+                plan.visit(binding);
+            }
         }
         Ok(plan)
     }
@@ -380,19 +426,36 @@ pub(super) struct PatchCtx<'a> {
     pub(super) got_va: &'a dyn Fn(&str) -> Result<u64>,
 }
 
-pub(super) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8]) -> Result<()> {
-    for reloc in relocs {
-        let at = ctx.text_base + reloc.offset as usize;
-        if ctx.pie_arm64 && reloc.kind == RelocKind::Arm64Movw64 && !matches!(reloc.symbol, Symbol::Word(_)) {
-            let pc_va = ctx.text_va + u64::from(reloc.offset);
-            let (load_got, target_va) = resolve_binding(&reloc.symbol, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan, ctx.got_va)?;
+fn reloc_width(kind: RelocKind) -> usize {
+    match kind {
+        RelocKind::Abs32 | RelocKind::PcRel32 | RelocKind::Arm64Call26 => 4,
+        RelocKind::Abs64 => 8,
+        RelocKind::Arm64Movw64 => 16,
+    }
+}
+
+fn resolve_fast(sym: &Symbol, addrs: SectionAddrs, base_va: u64, shim_offs: &[usize], plan: &Plan<'_>, vas: &[u64]) -> Result<(bool, u64)> {
+    Ok(match classify(sym, addrs)? {
+        Binding::Static(val) => (false, val),
+        Binding::DsoHandle => (false, addrs.dso_handle),
+        Binding::Shim(shim) => (false, base_va + shim_offs[plan.shim_idx(shim)?] as u64),
+        Binding::Import(name, _) => (true, vas[plan.import_idx(name)?]),
+    })
+}
+
+fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64: bool, addrs: SectionAddrs, base_va: u64, shim_offs: &[usize], plan: &Plan<'_>, stub_vas: &[u64], got_vas: &[u64], out: &mut [u8]) -> Result<()> {
+    for &reloc in relocs {
+        let at = (reloc.offset as usize) - slice_base;
+        if pie_arm64 && reloc.kind == RelocKind::Arm64Movw64 && !matches!(reloc.symbol, Symbol::Word(_)) {
+            let pc_va = text_va + u64::from(reloc.offset);
+            let (load_got, target_va) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, got_vas)?;
             shims::patch_arm64_pie(&mut out[at..at + 16], pc_va, load_got, target_va)?;
             continue;
         }
-        let value = resolve_sym(&reloc.symbol, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan, ctx.stub_va)?;
+        let (_, value) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, stub_vas)?;
         match reloc.kind {
             RelocKind::Arm64Call26 => {
-                let pc_va = ctx.text_va + u64::from(reloc.offset);
+                let pc_va = text_va + u64::from(reloc.offset);
                 let delta = value as i64 - pc_va as i64;
                 if delta & 3 != 0 || !(-0x800_0000..0x800_0000).contains(&delta) {
                     bail!("Arm64Call26 target {value:#x} out of range from {pc_va:#x}");
@@ -401,12 +464,72 @@ pub(super) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8
                 out[at..at + 4].copy_from_slice(&word.to_le_bytes());
             }
             RelocKind::PcRel32 => {
-                let next_ip = ctx.text_va + u64::from(reloc.offset) + 4;
+                let next_ip = text_va + u64::from(reloc.offset) + 4;
                 let delta = i32::try_from(value as i64 - next_ip as i64).context("PcRel32 target out of range")?;
                 out[at..at + 4].copy_from_slice(&delta.to_le_bytes());
             }
             kind => patch_reloc(kind, value, &mut out[at..])?,
         }
+    }
+    Ok(())
+}
+
+pub(super) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8]) -> Result<()> {
+    let mut stub_vas = Vec::with_capacity(ctx.plan.imports.len());
+    let mut got_vas = Vec::with_capacity(ctx.plan.imports.len());
+    for &name in &ctx.plan.imports {
+        stub_vas.push((ctx.stub_va)(name)?);
+        got_vas.push((ctx.got_va)(name)?);
+    }
+    let refs: Vec<&CodeReloc> = relocs.iter().collect();
+    let workers = crate::jobs().min(refs.len() / 1024);
+    if workers <= 1 {
+        return patch_slice(&refs, 0, ctx.text_va, ctx.pie_arm64, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan, &stub_vas, &got_vas, &mut out[ctx.text_base..]);
+    }
+    let mut sorted = refs;
+    sorted.sort_unstable_by_key(|r| r.offset);
+    let step = sorted.len().div_ceil(workers).max(1);
+    let mut bounds = Vec::with_capacity(workers + 1);
+    let mut pos = 0;
+    while pos < sorted.len() {
+        let target_end = (pos + step).min(sorted.len());
+        let mut max_end = 0_usize;
+        for reloc in &sorted[pos..target_end] {
+            max_end = max_end.max(reloc.offset as usize + reloc_width(reloc.kind));
+        }
+        let mut end = target_end;
+        while end < sorted.len() && (sorted[end].offset as usize) < max_end {
+            max_end = max_end.max(sorted[end].offset as usize + reloc_width(sorted[end].kind));
+            end += 1;
+        }
+        let slice_start = if pos == 0 { 0 } else { sorted[pos].offset as usize };
+        bounds.push((pos, end, slice_start));
+        pos = end;
+    }
+    let mut slices = Vec::with_capacity(bounds.len());
+    let mut tail = &mut out[ctx.text_base..];
+    let mut prev_start = 0_usize;
+    for (idx, &(c_start, c_end, _)) in bounds.iter().enumerate() {
+        let slice_len = if idx + 1 == bounds.len() { tail.len() } else { bounds[idx + 1].2 - prev_start };
+        let (head, rest) = tail.split_at_mut(slice_len);
+        slices.push((&sorted[c_start..c_end], prev_start, head));
+        prev_start += slice_len;
+        tail = rest;
+    }
+    let (text_va, pie_arm64, addrs, base_va, shim_offs, plan) = (ctx.text_va, ctx.pie_arm64, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan);
+    let (stub_vas_ref, got_vas_ref) = (stub_vas.as_slice(), got_vas.as_slice());
+    let results: Vec<Result<()>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = slices
+            .into_iter()
+            .map(|(chunk, base, buf)| scope.spawn(move || patch_slice(chunk, base, text_va, pie_arm64, addrs, base_va, shim_offs, plan, stub_vas_ref, got_vas_ref, buf)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().map_err(|_| anyhow::anyhow!("AOT patch worker panicked"))?)
+            .collect()
+    });
+    for res in results {
+        res?;
     }
     Ok(())
 }

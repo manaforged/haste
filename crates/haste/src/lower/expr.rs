@@ -92,6 +92,18 @@ fn is_leaf_body(body: &crate::body::Body) -> bool {
     !body.exprs.iter().any(|expr| matches!(expr, Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } | Expr::Await(..) | Expr::Yield(..)))
 }
 
+fn is_cold_or_never(cx: &Context<'_>, reached: &Reached, item: ItemRef, substs: Substs) -> bool {
+    if hint(cx, item) == Hint::Never {
+        return true;
+    }
+    reached
+        .index
+        .get(&(item, substs))
+        .and_then(|&idx| reached.list[idx].1.as_ref().ok())
+        .and_then(|callee| callee.ret)
+        .is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never))
+}
+
 /// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
 pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
     let ((item, _), Ok(typed)) = &reached.list[index] else {
@@ -101,7 +113,7 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
         return None;
     }
     let hint = hint(cx, *item);
-    if hint != Hint::Always && typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
+    if hint == Hint::Never || typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
         return None;
     }
     let env = &cx.outline.crates[item.krate as usize].env;
@@ -113,20 +125,26 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
     if !matches!(typed.shape, Shape::Body) {
         return Some(budget.insts);
     }
+    let Ok(body) = cx.body(*item) else {
+        return None;
+    };
+    if hint != Hint::Always {
+        let cold_calls = typed.calls().filter(|&(ci, cs)| is_cold_or_never(cx, reached, ci, cs)).take(3).count();
+        if cold_calls >= 3 || (cold_calls >= 2 && body.exprs.len() > 80) {
+            return None;
+        }
+    }
     match hint {
         Hint::Never => None,
         Hint::Always => Some(budget.always),
         Hint::Inline => {
-            let max_exprs = if release || env.release { 2500 } else { 200 };
-            cx.body(*item).is_ok_and(|body| body.exprs.len() <= max_exprs).then_some(budget.insts)
+            let max_exprs = if release || env.release { 800 } else { 200 };
+            (body.exprs.len() <= max_exprs).then_some(budget.insts)
         }
-        Hint::Default => cx
-            .body(*item)
-            .is_ok_and(|body| {
-                let max_exprs = if release && is_leaf_body(&body) { budget.exprs * 2 } else { budget.exprs };
-                body.exprs.len() <= max_exprs
-            })
-            .then_some(budget.insts),
+        Hint::Default => {
+            let max_exprs = if release && is_leaf_body(&body) { budget.exprs * 2 } else { budget.exprs };
+            (body.exprs.len() <= max_exprs).then_some(budget.insts)
+        }
     }
 }
 

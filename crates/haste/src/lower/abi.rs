@@ -75,6 +75,21 @@ fn word_parts(size: u64) -> Parts {
     }
 }
 
+/// Breaks `size` (`1..=32`) into up to four `I64` words when `word_parts` overflows four exact power-of-two chunks.
+pub(super) fn packed_word_parts(size: u32) -> Parts {
+    match word_parts(u64::from(size)) {
+        Parts::Bytes if (1..=32).contains(&size) => {
+            let mut words = [(Type::I8, 0); 4];
+            let len = size.div_ceil(8) as usize;
+            for (i, slot) in words[..len].iter_mut().enumerate() {
+                *slot = (Type::I64, (i * 8) as i32);
+            }
+            Parts::Words(words, len as u8)
+        }
+        found => found,
+    }
+}
+
 fn simd_vec_type(element: &Scalar, count: BackendLaneCount) -> Option<Type> {
     let dl = target().ok()?;
     let scalar = scalar_type(dl, element).ok()?;
@@ -346,23 +361,61 @@ impl Lower<'_, '_> {
         }
     }
 
+    pub(super) fn load_packed_part(&mut self, base: Value, offset: i32, ty: Type, size: u32) -> Value {
+        if offset as u32 + ty.bytes() <= size {
+            return self.ins().load(ty, base, offset);
+        }
+        let rem = size - offset as u32;
+        let mut acc: Option<Value> = None;
+        for (chunk_ty, chunk_off) in word_parts(u64::from(rem)).scalars() {
+            let raw = self.ins().load(chunk_ty, base, offset + chunk_off);
+            let wide = if chunk_ty == Type::I64 { raw } else { self.ins().uextend(Type::I64, raw) };
+            let shifted = if chunk_off == 0 {
+                wide
+            } else {
+                let shift = self.ins().iconst(Type::I64, i64::from(chunk_off) * 8);
+                self.ins().ishl(wide, shift)
+            };
+            acc = Some(match acc {
+                Some(prev) => self.ins().bor(prev, shifted),
+                None => shifted,
+            });
+        }
+        let packed = acc.unwrap_or_else(|| self.ins().iconst(Type::I64, 0));
+        if ty == Type::I64 { packed } else { self.ins().ireduce(ty, packed) }
+    }
+
+    pub(super) fn store_packed_part(&mut self, place: Place, offset: i32, ty: Type, value: Value, size: u32) {
+        if offset as u32 + ty.bytes() <= size {
+            self.write(place.at(offset, Repr::Scalar(ty)), value);
+            return;
+        }
+        let rem = size - offset as u32;
+        let wide = if self.b.func.ty(value) == Type::I64 { value } else { self.ins().uextend(Type::I64, value) };
+        for (chunk_ty, chunk_off) in word_parts(u64::from(rem)).scalars() {
+            let shifted = if chunk_off == 0 {
+                wide
+            } else {
+                let shift = self.ins().iconst(Type::I64, i64::from(chunk_off) * 8);
+                self.ins().ushr(wide, shift)
+            };
+            let piece = if chunk_ty == Type::I64 { shifted } else { self.ins().ireduce(chunk_ty, shifted) };
+            self.write(place.at(offset + chunk_off, Repr::Scalar(chunk_ty)), piece);
+        }
+    }
+
     /// The value of a result of type `ret` that a call left in the registers `results`, one per part in `parts`: a frame slot holding them when the result lives in memory.
     pub(super) fn received(&mut self, ret: Ty, parts: &[(Type, i32)], results: &[Value]) -> Result<Option<Value>> {
         let whole = repr(self.cx, ret)?;
-        let Repr::Mem { size, align, .. } = whole else {
+        let Repr::Mem { size, .. } = whole else {
             return Ok(results.first().copied());
         };
-        let slot = if parts.iter().any(|&(ty, off)| off as u32 + ty.bytes() > size) {
-            self.b.create_stack_slot(size.next_multiple_of(8), align.max(3))
-        } else {
-            let Some(slot) = self.slot(whole) else {
-                return Ok(None);
-            };
-            slot
+        let Some(slot) = self.slot(whole) else {
+            return Ok(None);
         };
         let place = Place::slot(slot, whole);
         for (&(ty, offset), &value) in parts.iter().zip(results) {
-            self.write(place.at(offset, Repr::Scalar(ty)), value);
+            self.store_packed_part(place, offset, ty, value, size);
         }
         Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
     }

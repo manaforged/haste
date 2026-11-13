@@ -224,18 +224,24 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     let outgoing = needs(func, classify)?;
     let (present, addressed) = present(func);
     let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
-    let mut values = Vec::with_capacity(func.types.len());
+    let mut values = vec![0; func.types.len()];
     let mut homes: Vec<i32> = Vec::new();
-    for (value, ty) in func.types.iter().enumerate() {
+    let mut value_order: Vec<usize> = (0..func.types.len()).collect();
+    value_order.sort_by_key(|&v| (
+        !matches!((homed.get(v), locations[v]), (Some(&true), Location::Reg(_))),
+        !matches!((homed.get(v), locations[v], func.types[v].bytes()), (Some(&true), Location::Float(_), 8)),
+        v,
+    ));
+    for value in value_order {
+        let ty = func.types[value];
         let static_loc = matches!(locations[value], Location::Imm(_) | Location::SlotAddr(_) | Location::Frame(..));
         let reg_unhomed = matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true);
         if !present[value] || elided.get(value) == Some(&true) || static_loc || reg_unhomed {
-            values.push(0);
             continue;
         }
         let Some(home) = shared.get(value).copied().flatten().map(|home| home as usize) else {
             cursor += round(ty.bytes(), WORD);
-            values.push(-(cursor as i32));
+            values[value] = -(cursor as i32);
             continue;
         };
         if homes.len() <= home {
@@ -245,7 +251,7 @@ pub(crate) fn layout<R: Copy + PartialEq>(
             cursor += round(ty.bytes(), WORD);
             homes[home] = -(cursor as i32);
         }
-        values.push(homes[home]);
+        values[value] = homes[home];
     }
     let mut max_saved = 0_usize;
     let mut check_edge = |block: Block, args: &[Value]| {
