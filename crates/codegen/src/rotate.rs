@@ -7,7 +7,7 @@ fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
 
 fn safe_head_inst(func: &Function, inst: Inst) -> bool {
     let op = &func.insts[inst.index()].op;
-    op.is_speculable() || matches!(op, Op::Load(..) | Op::StackLoad(..) | Op::Trapz(..))
+    op.is_speculable() || matches!(op, Op::Load(..) | Op::StackLoad(..) | Op::Trapz(..) | Op::Assume(..))
 }
 
 struct RotatePlan {

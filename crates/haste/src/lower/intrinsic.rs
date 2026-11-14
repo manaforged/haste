@@ -33,6 +33,11 @@ impl Lower<'_, '_> {
                 self.close();
                 Ok(None)
             }
+            Intrinsic::Assume => {
+                let &[cond] = args else { bail!("assume takes one bool") };
+                self.ins().assume(cond);
+                Ok(None)
+            }
             Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
             Intrinsic::CallerLocation => self.caller_location().map(Some),
             Intrinsic::Cpuid => self.cpuid(args).map(Some),

@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::ir::{Domain, Function};
+use crate::ir::{Domain, Function, Op};
 use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -176,6 +176,22 @@ fn run_fixpoint(func: &mut Function, plan: &Plan) {
     }
 }
 
+fn strip_assumes(func: &mut Function) -> bool {
+    let Function { blocks, insts, .. } = func;
+    let mut stripped = false;
+    for block in blocks {
+        block.insts.retain(|inst| {
+            let assume = matches!(insts[inst.index()].op, Op::Assume(_));
+            if assume {
+                insts[inst.index()].op = Op::Trap;
+            }
+            stripped |= assume;
+            !assume
+        });
+    }
+    stripped
+}
+
 pub(crate) fn run(func: &mut Function, moves: promote::Moves, effort: Effort) {
     let plan = match effort {
         Effort::Quick => Plan {
@@ -197,6 +213,9 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, effort: Effort) {
         run_pass(func, pass, plan.moves, plan.effort);
     }
     run_fixpoint(func, &plan);
+    if moves != promote::Moves::Guided && strip_assumes(func) {
+        run_fixpoint(func, &plan);
+    }
     for &pass in plan.finish {
         run_pass(func, pass, plan.moves, plan.effort);
     }

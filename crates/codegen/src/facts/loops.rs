@@ -259,7 +259,7 @@ fn latch_guards(func: &Function, cfg: &Cfg, ranges: &Ranges, env: &Env, each: &L
     let mut extra = ExtraPath::default();
     for blk in std::iter::once(each.head).chain(chain.into_iter().rev()) {
         for &inst in &func.blocks[blk.index()].insts {
-            if let Op::Trapz(cond) = func.insts[inst.index()].op {
+            if let Op::Trapz(cond) | Op::Assume(cond) = func.insts[inst.index()].op {
                 path.assume(func, ranges, cond, true);
                 extra.assume(func, (cfg, ranges, env, &path, blk), cond, true, 0);
             }

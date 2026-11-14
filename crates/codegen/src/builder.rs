@@ -788,12 +788,11 @@ impl Ins<'_> {
     }
 
     /// Stops with an illegal instruction.
-    pub fn trap(mut self) -> Inst {
-        self.effect(Op::Trap)
-    }
+    pub fn trap(mut self) -> Inst { self.effect(Op::Trap) }
 
     /// Stops with an illegal instruction when `condition` is zero.
-    pub fn trapz(mut self, condition: Value) -> Inst {
-        self.effect(Op::Trapz(condition))
-    }
+    pub fn trapz(mut self, condition: Value) -> Inst { self.effect(Op::Trapz(condition)) }
+
+    /// Tells the optimizer that `condition` is nonzero here; emits no code.
+    pub fn assume(mut self, condition: Value) -> Inst { self.effect(Op::Assume(condition)) }
 }

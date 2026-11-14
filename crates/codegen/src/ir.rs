@@ -388,6 +388,8 @@ pub(crate) enum Op {
     Return(Vec<Value>),
     Trap,
     Trapz(Value),
+    /// States that the value is nonzero wherever control reaches this; it emits nothing and the schedule drops it before encoding.
+    Assume(Value),
 }
 
 impl Op {
@@ -460,7 +462,7 @@ impl Op {
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) | Op::Assume(x) => f(*x),
             Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Insert(x, y, _) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
                 f(*x);
                 f(*y);
@@ -495,7 +497,7 @@ impl Op {
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) | Op::Assume(x) => {
                 *x = f(*x);
             }
             Op::Binary(_, x, y)

@@ -38,6 +38,8 @@ pub enum Intrinsic {
     ConstEvalSelect,
     SelectUnpredictable,
     Trap,
+    /// `assume`, a condition the optimizer may take as true.
+    Assume,
     CallerLocation,
     Cpuid,
     /// `FnPtr::addr`, the address of a function pointer.
@@ -241,6 +243,7 @@ const NAMES: &[(&str, Intrinsic)] = {
         ("const_eval_select", ConstEvalSelect),
         ("select_unpredictable", SelectUnpredictable),
         ("abort", Trap),
+        ("assume", Assume),
         ("catch_unwind", CatchUnwind),
         ("unreachable", Trap),
         ("caller_location", CallerLocation),

@@ -584,7 +584,7 @@ fn collect_selects(func: &Function) -> Option<Vec<SelectRec>> {
     for (b_idx, block) in func.blocks.iter().enumerate() {
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
-            open |= matches!(data.op, Op::Icmp(..) | Op::Fits(..) | Op::Trapz(_) | Op::Brif(..));
+            open |= matches!(data.op, Op::Icmp(..) | Op::Fits(..) | Op::Trapz(_) | Op::Assume(_) | Op::Brif(..));
             if let (Op::Select(cond, t_val, f_val), Some(res)) = (&data.op, data.result)
                 && func.ty(res).is_small_int()
             {
@@ -730,7 +730,7 @@ fn settle_one(
                 dom.record_alias(result, chosen);
             }
         }
-        (&Op::Trapz(raw_cond), _) => {
+        (&Op::Trapz(raw_cond) | &Op::Assume(raw_cond), _) => {
             let condition = dom.resolve(raw_cond);
             if cond_truth(func, ranges, path, condition)
                 .or_else(|| extra.cond_truth(func, (cfg, ranges, env, path, block), condition, 0))
