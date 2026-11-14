@@ -122,6 +122,31 @@ const MAX_INLINE_HEIGHT: u8 = 10;
 
 pub(super) type InlineMeta = (ItemRef, FootprintId, bool, u8, u16);
 
+#[derive(Clone, Copy)]
+enum Tally {
+    Hit,
+    Miss,
+    Built,
+    Raced,
+    OpenCycle,
+    Deferred,
+    Devirt,
+    Trim,
+    Flush,
+}
+
+const TALLY_NAMES: [&str; 9] = ["template_hit", "template_miss", "template_simplify", "template_raced", "unstored_cycle", "unstored_deferred", "devirt_simplify", "trim_partial", "trim_full"];
+static TALLIES: [AtomicUsize; TALLY_NAMES.len()] = [const { AtomicUsize::new(0) }; TALLY_NAMES.len()];
+
+fn tally(kind: Tally) {
+    TALLIES[kind as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+fn simplify_tallied(func: &mut Function, kind: Tally) {
+    tally(kind);
+    haste_codegen::simplify(func, crate::profile().into());
+}
+
 /// Cached inlineable callee stencils and footprints across a compilation.
 #[derive(Default)]
 pub struct Bodies {
@@ -151,26 +176,27 @@ impl Bodies {
         self.templates.clear();
     }
 
-    /// Evicts cached inline templates and a rolling slice of footprint plans once transient entries reach the trim watermark.
+    /// Evicts a rolling slice of cached inlined callees and footprint plans at the trim watermark, and every transient entry at the cap.
     pub(crate) fn trim_transient(&self) {
         let count = self.transient_entries.load(Ordering::Relaxed);
-        if count < TRANSIENT_CAP / 8 {
+        if count < TRANSIENT_CAP / 2 {
             return;
         }
         let start = self.evict_cursor.fetch_add(TRIM_SHARDS, Ordering::Relaxed);
         if count >= TRANSIENT_CAP {
+            tally(Tally::Flush);
             self.clear_transient();
             for offset in 0..TRIM_SHARDS {
                 self.plans.clear_shard((start + offset) % crate::sema::table::SHARDS);
             }
             return;
         }
+        tally(Tally::Trim);
         let mut removed = 0usize;
         for offset in 0..TRIM_SHARDS {
             let shard = (start + offset) % crate::sema::table::SHARDS;
             removed += self.inlined.clear_shard(shard);
             removed += self.inline_meta.clear_shard(shard);
-            removed += self.templates.clear_shard(shard);
         }
         self.plans.clear_shard((start / TRIM_SHARDS) % crate::sema::table::SHARDS);
         if removed > 0 {
@@ -186,6 +212,19 @@ impl Bodies {
 
     fn bump_transient(&self) {
         self.transient_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Formats the inline template cache counters as one line, or nothing unless `HASTE_MISSED` is set.
+    pub(crate) fn inline_report() -> String {
+        if haste_codegen::missed_report().is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("inline:");
+        for (name, count) in TALLY_NAMES.iter().zip(&TALLIES) {
+            out.push_str(&format!(" {name}={}", count.load(Ordering::Relaxed)));
+        }
+        out.push('\n');
+        out
     }
 }
 
@@ -384,8 +423,10 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     let Some((footprint, fp_cycle)) = quiet.lowered(slots, fp_res)? else { return Ok((None, usize::MAX)) };
     let key = TemplateKey { item, footprint, limit, low: slots.low_entries() };
     if let Some(template) = slots.bodies().templates.get(&key) {
+        tally(Tally::Hit);
         return Ok((template.map(|t| (footprint, t, None)), fp_cycle));
     }
+    tally(Tally::Miss);
     let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
     let ir_h = inline.max_callee_height;
     let ir_sz = inline.max_callee_size;
@@ -402,9 +443,17 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
         (height <= MAX_INLINE_HEIGHT).then(|| Arc::new(InlineTemplate { body, returns, reloc_plan, height, size }))
     });
     let depth = inline.stack.len().saturating_sub(1);
-    if cycle > depth && quiet.holds(cx, slots) {
+    if cycle <= depth {
+        tally(Tally::OpenCycle);
+    } else if quiet.holds(cx, slots) {
         slots.bodies().bump_transient();
+        let built = template.as_ref().map(Arc::as_ptr);
         template = slots.bodies().templates.get_or_insert_with(key, || template);
+        if built != template.as_ref().map(Arc::as_ptr) {
+            tally(Tally::Raced);
+        }
+    } else {
+        tally(Tally::Deferred);
     }
     Ok((template.map(|t| (footprint, t, Some(relocs))), cycle))
 }
@@ -428,7 +477,7 @@ fn simplify_inline(mut func: Function, limit: usize, leaf: bool) -> Option<(Arc<
     if func.size() > effective_limit.saturating_mul(6).max(1600) {
         return None;
     }
-    haste_codegen::simplify(&mut func, crate::profile().into());
+    simplify_tallied(&mut func, Tally::Built);
     (func.can_inline() && func.inline_size() <= effective_limit).then(|| {
         let returns = func.has_return();
         (Arc::new(func), returns)
@@ -553,7 +602,7 @@ fn splice_devirt_vtable_calls(
 ) -> Result<usize> {
     let mut any = false;
     for _ in 0..8 {
-        haste_codegen::simplify(func, crate::profile().into());
+        simplify_tallied(func, Tally::Devirt);
         any = false;
         let current_plan = RelocPlan { steps: reloc_plan.clone().into_boxed_slice() };
         let mut spliced = false;
@@ -581,7 +630,7 @@ fn splice_devirt_vtable_calls(
     }
     if any {
         canonicalize_const_symbols(func, reloc_plan);
-        haste_codegen::simplify(func, crate::profile().into());
+        simplify_tallied(func, Tally::Devirt);
     }
     Ok(cycle_root)
 }
