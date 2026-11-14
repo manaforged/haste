@@ -1,6 +1,7 @@
 use crate::cse::flip_int_cc;
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
+use super::icmp::three_way_non_zero;
 use super::{RewriteCx, is_non_null_addr};
 
 pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Value, t: Value, f: Value) -> Option<Op> {
@@ -8,7 +9,15 @@ pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Valu
         cx.alias(res, t);
         return None;
     }
+    if is_non_zero(cx, cond, 0) {
+        cx.alias(res, t);
+        return None;
+    }
     let inner = cx.unwrap_uextend(cond);
+    if let Some(arm) = tested_arm(cx, inner, t, f) {
+        cx.alias(res, arm);
+        return None;
+    }
     if res.is_some_and(|r| cx.func.ty(r) == Type::I8) && cx.func.ty(inner) == Type::I8 && cx.is_unit_bool(inner) {
         match (cx.uconst(t, Type::I8), cx.uconst(f, Type::I8)) {
             (Some(1), Some(0)) => {
@@ -22,6 +31,27 @@ pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Valu
         }
     }
     (inner != cond).then_some(Op::Select(inner, t, f))
+}
+
+fn tested_arm(cx: &RewriteCx, cond: Value, t: Value, f: Value) -> Option<Value> {
+    let ty = cx.func.ty(t);
+    if !ty.is_small_int() {
+        return None;
+    }
+    let key = |v: Value| cx.uconst(v, ty).map_or(Ok(v), Err);
+    let (pair, differ) = match *cx.op(cond)? {
+        Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), a, b) if cx.func.ty(a) == ty => {
+            ([key(a), key(b)], cc == IntCC::NotEqual)
+        }
+        Op::Binary(Binary::Isub | Binary::Bxor, a, b) if cx.func.ty(cond) == ty => ([key(a), key(b)], true),
+        Op::Binary(Binary::Iadd, a, b) if cx.func.ty(cond) == ty => {
+            let (v, k) = [(a, b), (b, a)].into_iter().find_map(|(v, k)| Some((v, cx.uconst(k, ty)?)))?;
+            ([key(v), Err(k.wrapping_neg() & ty.unsigned_max())], true)
+        }
+        _ => return None,
+    };
+    let arms = [key(t), key(f)];
+    (pair == arms || pair == [arms[1], arms[0]]).then_some(if differ { t } else { f })
 }
 
 fn entry_deref_bytes(cx: &RewriteCx, v: Value) -> u32 {
@@ -42,7 +72,7 @@ pub(super) fn is_non_zero(cx: &RewriteCx, v: Value, depth: u8) -> bool {
     if is_non_null_addr(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), v, 0) || cx.known(v).1 != 0 {
         return true;
     }
-    if entry_deref_bytes(cx, v) > 0 {
+    if entry_deref_bytes(cx, v) > 0 || three_way_non_zero(cx, v) {
         return true;
     }
     let Some(inst) = cx.def(v) else { return false };

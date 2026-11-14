@@ -6,6 +6,7 @@ use super::RewriteCx;
 
 #[path = "ord.rs"]
 mod ord;
+pub(super) use ord::three_way_non_zero;
 
 const MAX_DEPTH: u8 = 4;
 

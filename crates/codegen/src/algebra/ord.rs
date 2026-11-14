@@ -108,6 +108,11 @@ fn match_three_way(cx: &RewriteCx, v: Value, depth: u8) -> Option<ThreeWay> {
     }
 }
 
+pub(in crate::algebra) fn three_way_non_zero(cx: &RewriteCx, v: Value) -> bool {
+    let ty = cx.func.ty(v);
+    match_three_way(cx, v, 0).is_some_and(|tw| tw.vals.iter().all(|&val| extend(val, ty, false) != 0))
+}
+
 pub(super) fn eval_three_way(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     let ty = cx.func.ty(x);
     for (norm, expr_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
