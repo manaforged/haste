@@ -14,7 +14,7 @@ use crate::outline::Outline;
 use crate::sema::infer::SiteKey;
 use crate::sema::reach::Reached;
 use crate::sema::substs::{ProjDef, Substs};
-use crate::sema::summary::codec::SysrootIndex;
+use crate::sema::summary::codec::{Cursor, SysrootIndex, read_mut, write_u16, write_u32, write_u32s, write_u64, write_u128};
 use crate::sema::ty::{Kind, Mut, Ty, Types};
 
 const PLAN_MAGIC: [u8; 4] = *b"HRP1";
@@ -88,7 +88,7 @@ pub fn decode_reloc_plan<'a>(
     sysroot_only: bool,
     bytes: &[u8],
 ) -> Result<Option<RelocPlan>> {
-    let mut cur = Cursor { data: bytes, pos: 0 };
+    let mut cur = Cursor::new(bytes);
     if cur.take(4)? != PLAN_MAGIC {
         bail!("invalid portable reloc plan magic");
     }
@@ -118,7 +118,7 @@ pub fn decode_reloc_plan<'a>(
     let ty_count = cur.count()?;
     let ty_len = cur.u32()? as usize;
     let ty_data = cur.take(ty_len)?;
-    let mut ty_cur = Cursor { data: ty_data, pos: 0 };
+    let mut ty_cur = Cursor::new(ty_data);
     let mut tys = Vec::with_capacity(ty_count);
     for _ in 0..ty_count {
         tys.push(read_ty(&mut ty_cur, types, &items, &tys)?);
@@ -708,36 +708,6 @@ fn read_site_key(cur: &mut Cursor<'_>) -> Result<SiteKey> {
     })
 }
 
-struct Cursor<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).context("cursor overflow")?;
-        let slice = self.data.get(self.pos..end).context("unexpected eof")?;
-        self.pos = end;
-        Ok(slice)
-    }
-    fn count(&mut self) -> Result<usize> {
-        let n = self.u32()? as usize;
-        if n > self.data.len() - self.pos {
-            bail!("count exceeds remaining bytes");
-        }
-        Ok(n)
-    }
-    fn u8(&mut self) -> Result<u8> { Ok(self.take(1)?[0]) }
-    fn u16(&mut self) -> Result<u16> { Ok(u16::from_le_bytes(self.take(2)?.try_into()?)) }
-    fn u32(&mut self) -> Result<u32> { Ok(u32::from_le_bytes(self.take(4)?.try_into()?)) }
-    fn u64(&mut self) -> Result<u64> { Ok(u64::from_le_bytes(self.take(8)?.try_into()?)) }
-    fn u128(&mut self) -> Result<u128> { Ok(u128::from_le_bytes(self.take(16)?.try_into()?)) }
-}
-
-fn read_mut(cur: &mut Cursor<'_>) -> Result<Mut> {
-    Ok(if cur.u8()? != 0 { Mut::Mut } else { Mut::Not })
-}
-
 fn write_str(out: &mut Vec<u8>, s: &str) -> Option<()> {
     write_u32(out, u32::try_from(s.len()).ok()?);
     out.extend_from_slice(s.as_bytes());
@@ -749,8 +719,3 @@ fn read_str<'a>(cur: &mut Cursor<'a>) -> Result<&'a str> {
     std::str::from_utf8(cur.take(len)?).context("invalid utf-8 symbol")
 }
 
-fn write_u16(out: &mut Vec<u8>, v: u16) { out.extend_from_slice(&v.to_le_bytes()); }
-fn write_u32(out: &mut Vec<u8>, v: u32) { out.extend_from_slice(&v.to_le_bytes()); }
-fn write_u64(out: &mut Vec<u8>, v: u64) { out.extend_from_slice(&v.to_le_bytes()); }
-fn write_u128(out: &mut Vec<u8>, v: u128) { out.extend_from_slice(&v.to_le_bytes()); }
-fn write_u32s(out: &mut Vec<u8>, s: &[u32]) { write_u32(out, s.len() as u32); s.iter().for_each(|&v| write_u32(out, v)); }

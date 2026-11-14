@@ -207,33 +207,27 @@ impl Path {
         let (forms, len) = self.add_const_chain(func, ranges, a, ty);
         let a_forms = &forms[..len];
         let into_b = self.steps_into(ty, b, UNSIGNED);
-        let prune = !into_b && (strict || a_forms.len() > 1);
         let mut upper_terms: Vec<(Value, Value, u64)> = Vec::new();
         if is_add(b) {
             for (b_base, k) in self.non_wrap_iadd_chain(func, ranges, b, ty) {
                 upper_terms.push((b, b_base, k));
             }
         }
-        for &r in &self.rels {
-            if r.ty != ty {
+        let candidates = self.rels.iter().filter(|r| r.ty == ty).flat_map(|r| match r.kind {
+            RelKind::Ult | RelKind::Ule => [Some(r.lhs), None],
+            RelKind::Eq => [Some(r.lhs), Some(r.rhs)],
+            _ => [None, None],
+        });
+        for (i, s) in candidates.clone().flatten().enumerate() {
+            if (!into_b && s != b) || candidates.clone().flatten().take(i).any(|seen| seen == s) {
                 continue;
             }
-            let candidates = match r.kind {
-                RelKind::Ult | RelKind::Ule => [Some(r.lhs), None],
-                RelKind::Eq => [Some(r.lhs), Some(r.rhs)],
-                _ => [None, None],
-            };
-            for s in candidates.into_iter().flatten() {
-                if prune && s != b {
-                    continue;
-                }
-                if a_forms.len() > 1 {
-                    upper_terms.push((s, s, 0));
-                }
-                if is_add(s) {
-                    for (s_base, k) in self.non_wrap_iadd_chain(func, ranges, s, ty) {
-                        upper_terms.push((s, s_base, k));
-                    }
+            if a_forms.len() > 1 {
+                upper_terms.push((s, s, 0));
+            }
+            if s != b && is_add(s) {
+                for (s_base, k) in self.non_wrap_iadd_chain(func, ranges, s, ty) {
+                    upper_terms.push((s, s_base, k));
                 }
             }
         }
