@@ -2,10 +2,11 @@ mod backprop;
 mod live;
 mod loops;
 mod rel;
+mod transfer;
 
 use crate::cfg::{Cfg, dominates};
 use crate::fold::{extend, holds};
-use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Block, Function, Inst, IntCC, Op, Type, Value};
 use loops::{Env, ExtraPath};
 use rel::{Path, RelKind, cond_truth, fits_truth, rel_of};
 
@@ -95,16 +96,21 @@ pub(super) fn as_unsigned(cc: IntCC) -> IntCC {
     }
 }
 
+/// `cc` as the unsigned order that agrees with it on `x` and `y`: itself when unsigned, its unsigned twin when both sit below the sign bit of `ty`.
+pub(super) fn unsigned_order(cc: IntCC, ty: Type, x: &Fact, y: &Fact) -> Option<IntCC> {
+    match cc.is_signed() {
+        true if x.non_negative(ty) && y.non_negative(ty) => Some(as_unsigned(cc)),
+        true => None,
+        false => Some(cc),
+    }
+}
+
 /// `x cc y` when the facts settle it for every pair of values they allow.
 pub(crate) fn decide(cc: IntCC, ty: Type, x: &Fact, y: &Fact) -> Option<bool> {
     if let (Some(a), Some(b)) = (x.exact(), y.exact()) {
         return Some(holds(cc, ty, a as i64, b as i64));
     }
-    let cc = match cc.is_signed() {
-        true if x.non_negative(ty) && y.non_negative(ty) => as_unsigned(cc),
-        true => return None,
-        false => cc,
-    };
+    let cc = unsigned_order(cc, ty, x, y)?;
     let disjoint = x.hi < y.lo || y.hi < x.lo || y.exact().is_some_and(|b| !x.admits(b)) || x.exact().is_some_and(|a| !y.admits(a));
     match cc {
         IntCC::Equal => disjoint.then_some(false),
@@ -233,7 +239,7 @@ impl<'a> Ranges<'a> {
                 let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
                 let fact = match info.consts.get(result.index()).copied().flatten() {
                     Some(imm) => Fact::constant(func.ty(result), imm),
-                    None => self.derive(func, &data.op, func.ty(result)),
+                    None => transfer::transfer(func, self, &data.op, func.ty(result), &|value| self.of(value)),
                 };
                 self.table[result.index()] = (fact.lo, fact.hi);
             }
@@ -371,11 +377,7 @@ impl<'a> Ranges<'a> {
             Some(&Op::Binary(Binary::Bor, a, b)) if !taken => combine(self.proves_bound(func, a, false, (val, upper), depth + 1), self.proves_bound(func, b, false, (val, upper), depth + 1)),
             Some(&Op::Icmp(cc, x, y)) if func.ty(x) == ty => {
                 let raw = if taken { cc } else { cc.inverse() };
-                let eff = match raw.is_signed() {
-                    true if self.of(x).non_negative(ty) && self.of(y).non_negative(ty) => as_unsigned(raw),
-                    true => return None,
-                    false => raw,
-                };
+                let eff = unsigned_order(raw, ty, &self.of(x), &self.of(y))?;
                 let (kind, lhs, rhs) = rel_of(eff, x, y);
                 match (upper, kind) {
                     (true, RelKind::Eq | RelKind::Ule) if lhs == val => Some(self.of(rhs).hi),
@@ -404,90 +406,6 @@ impl<'a> Ranges<'a> {
     /// The constant `value` holds, read unsigned at its width, when its range is one value.
     pub(super) fn constant(&self, value: Value) -> Option<u64> {
         self.of(value).exact()
-    }
-
-    /// The range of the result of `op`, of type `ty`, from the ranges of its operands.
-    fn derive(&self, func: &Function, op: &Op, ty: Type) -> Fact {
-        match *op {
-            Op::Const(imm) => Fact::constant(ty, imm),
-            Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => Fact::range(0, 1),
-            Op::StackAddr(..) if ty == Type::I64 => Fact::range(1, u64::MAX - 0x1000_0000),
-            Op::Symbol(_) | Op::SlotAddr(_) => Fact::range(1, ty.unsigned_max()),
-            Op::Convert(Convert::Uextend, x) => self.of(x),
-            Op::Convert(Convert::Ireduce, x) => Some(self.of(x)).filter(|inner| inner.hi <= ty.unsigned_max()).unwrap_or_else(|| Fact::full(ty)),
-            Op::Binary(op, x, y) if func.ty(x).is_small_int() => self.binary(func, op, (x, y)),
-            Op::Select(_, x, y) => {
-                let (a, b) = (self.of(x), self.of(y));
-                Fact::range(a.lo.min(b.lo), a.hi.max(b.hi))
-            }
-            _ => Fact::full(ty),
-        }
-    }
-
-    /// The range of `x op y` that a constant operand proves.
-    fn binary(&self, func: &Function, op: Binary, (x, y): (Value, Value)) -> Fact {
-        let ty = func.ty(x);
-        match op {
-            Binary::Band => Fact::range(0, self.of(x).hi.min(self.of(y).hi)),
-            Binary::Ushr => match self.constant(y) {
-                Some(count) => {
-                    let (inner, shift) = (self.of(x), (count & u64::from(ty.bits() - 1)) as u32);
-                    Fact::range(inner.lo >> shift, inner.hi >> shift)
-                }
-                None => Fact::full(ty),
-            },
-            Binary::Ishl => match self.constant(y) {
-                Some(count) => {
-                    let (inner, shift) = (self.of(x), (count & u64::from(ty.bits() - 1)) as u32);
-                    if inner.hi <= (ty.unsigned_max() >> shift) {
-                        Fact::range(inner.lo << shift, inner.hi << shift)
-                    } else {
-                        Fact::full(ty)
-                    }
-                }
-                None => Fact::full(ty),
-            },
-            Binary::Udiv => match self.constant(y) {
-                Some(divisor) if divisor > 0 => {
-                    let inner = self.of(x);
-                    Fact::range(inner.lo / divisor, inner.hi / divisor)
-                }
-                _ => Fact::full(ty),
-            },
-            Binary::Urem => match self.constant(y) {
-                Some(divisor) if divisor > 0 => Fact::range(0, divisor - 1),
-                _ => Fact::full(ty),
-            },
-            Binary::Imul => {
-                let (a, b) = (self.of(x), self.of(y));
-                a.hi.checked_mul(b.hi)
-                    .filter(|&hi| hi <= ty.unsigned_max())
-                    .map_or_else(|| Fact::full(ty), |hi| Fact::range(a.lo * b.lo, hi))
-            }
-            Binary::Iadd => self.shifted(ty, (x, y), false),
-            Binary::Isub => {
-                if let Some(&Op::Binary(Binary::Ushr, base, sh)) = self.op(func, y)
-                    && base == x
-                {
-                    let inner = self.of(x);
-                    let s = self.constant(sh).map(|c| (c & u64::from(ty.bits() - 1)) as u32);
-                    let (lo, hi) = s.map_or((0, inner.hi), |k| (inner.lo - (inner.lo >> k), inner.hi - (inner.hi >> k)));
-                    return Fact::range(lo, hi);
-                }
-                self.shifted(ty, (x, y), true)
-            }
-            _ => Fact::full(ty),
-        }
-    }
-
-    /// The range of `x + y` or `x - y`, when no values in their ranges wrap at the width of `ty`.
-    fn shifted(&self, ty: Type, (x, y): (Value, Value), subtract: bool) -> Fact {
-        let (a, b) = (self.of(x), self.of(y));
-        let moved = match subtract {
-            false => a.hi.checked_add(b.hi).filter(|&hi| hi <= ty.unsigned_max()).map(|hi| (a.lo + b.lo, hi)),
-            true => (a.lo >= b.hi).then(|| (a.lo - b.hi, a.hi - b.lo)),
-        };
-        moved.map_or_else(|| Fact::full(ty), |(lo, hi)| Fact::range(lo, hi))
     }
 }
 
@@ -742,15 +660,33 @@ fn settle_one(
             extra.assume(func, (cfg, ranges, env, path, block), condition, true, 0);
             dom.propagate_selects(func, (cfg, ranges, env, path, extra), selects, block, seen);
         }
-        (&Op::Brif(raw_cond, ..), _) if ranges.constant(raw_cond).is_none() => {
+        (&Op::Brif(raw_cond, then, _, otherwise, _), _) if ranges.constant(raw_cond).is_none() => {
             let condition = dom.resolve(raw_cond);
             if let Some(taken) = cond_truth(func, ranges, path, condition)
                 .or_else(|| extra.cond_truth(func, (cfg, ranges, env, path, block), condition, 0))
+                .or_else(|| avoided(func, ranges, then, otherwise))
             {
                 decided.push((inst, Some(taken)));
             }
         }
         _ => {}
+    }
+}
+
+/// The way a branch goes when exactly one of its targets assumes a constant zero before any call or trap: control that enters that target breaks the assumption, so it never does.
+fn avoided(func: &Function, ranges: &Ranges, then: Block, otherwise: Block) -> Option<bool> {
+    let barred = |block: Block| {
+        func.blocks[block.index()]
+            .insts
+            .iter()
+            .map(|inst| &func.insts[inst.index()].op)
+            .take_while(|op| !matches!(op, Op::Call { .. } | Op::Trapz(_)))
+            .any(|op| matches!(op, Op::Assume(value) if ranges.constant(*value) == Some(0)))
+    };
+    match (barred(then), barred(otherwise)) {
+        (true, false) => Some(false),
+        (false, true) => Some(true),
+        _ => None,
     }
 }
 

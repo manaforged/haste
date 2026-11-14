@@ -1,6 +1,7 @@
 use crate::ir::{Binary, Convert, Function, Op, Type, Value};
 
 use super::rel::{Path, RelKind, UNSIGNED};
+use super::transfer::{transfer, unwrapped};
 use super::{Fact, Ranges};
 
 const CHAIN_STEPS: usize = 4;
@@ -70,52 +71,21 @@ impl Path {
         }
     }
 
+    /// Everything known about `value` here, with its definition evaluated again on what the path knows of its operands.
     pub(super) fn refined_fact(&self, func: &Function, ranges: &Ranges, value: Value, depth: u8) -> Fact {
-        let mut fact = self.fact(ranges, value);
-        if depth >= 3 {
-            return fact;
+        let fact = self.fact(ranges, value);
+        let ty = func.ty(value);
+        let Some(op) = ranges.op(func, value).filter(|_| depth < 3 && ty.is_small_int()) else { return fact };
+        let operand = |inner: Value| Some(self.refined_fact(func, ranges, inner, depth + 1)).filter(|known| known.lo <= known.hi).unwrap_or_else(|| ranges.of(inner));
+        let fact = fact.meet(&transfer(func, ranges, op, ty, &operand));
+        let sum = match *op {
+            Op::Binary(Binary::Iadd, a, b) if self.has_no_wrap_add(a, b) => unwrapped(Binary::Iadd, ty, &operand(a), &operand(b)),
+            _ => None,
+        };
+        match sum {
+            Some(sum) => fact.meet(&sum),
+            None => fact,
         }
-        match ranges.op(func, value) {
-            Some(&Op::Convert(Convert::Uextend, inner)) if func.ty(inner).is_small_int() => {
-                fact = fact.meet(&self.refined_fact(func, ranges, inner, depth + 1));
-            }
-            Some(&Op::Binary(Binary::Band, a, b)) => {
-                let hi = self.refined_fact(func, ranges, a, depth + 1).hi.min(self.refined_fact(func, ranges, b, depth + 1).hi);
-                fact = fact.meet(&Fact::range(0, hi));
-            }
-            Some(&Op::Binary(Binary::Ushr, a, sh)) => {
-                if let Some(c) = self.fact(ranges, sh).exact() {
-                    let inner = self.refined_fact(func, ranges, a, depth + 1);
-                    let k = (c & u64::from(func.ty(value).bits() - 1)) as u32;
-                    fact = fact.meet(&Fact::range(inner.lo >> k, inner.hi >> k));
-                }
-            }
-            Some(&Op::Binary(Binary::Isub, a, b)) => {
-                let (fa, fb) = (self.refined_fact(func, ranges, a, depth + 1), self.refined_fact(func, ranges, b, depth + 1));
-                if fa.lo >= fb.hi {
-                    fact = fact.meet(&Fact::range(fa.lo - fb.hi, fa.hi - fb.lo));
-                }
-            }
-            Some(&Op::Binary(Binary::Iadd, a, b)) => {
-                let ty = func.ty(value);
-                let max = ty.unsigned_max();
-                let (fa, fb) = (self.refined_fact(func, ranges, a, depth + 1), self.refined_fact(func, ranges, b, depth + 1));
-                if let Some(hi) = fa.hi.checked_add(fb.hi).filter(|&h| h <= max) {
-                    fact = fact.meet(&Fact::range(fa.lo + fb.lo, hi));
-                } else {
-                    for (x_f, k_f) in [(&fa, &fb), (&fb, &fa)] {
-                        if let Some(k) = k_f.exact().filter(|&k| k > 0) {
-                            let c = (max - k) + 1;
-                            if x_f.lo >= c {
-                                fact = fact.meet(&Fact::range(x_f.lo - c, x_f.hi - c));
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        fact
     }
 
     fn add_const_chain(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> ([(Value, u64); CHAIN_STEPS + 1], usize) {

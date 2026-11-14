@@ -1,7 +1,7 @@
 use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Function, IntCC, Op, Type, Value};
 
-use super::{Fact, MAX_FACTS, MAX_RELS, Ranges, as_unsigned, compared_range, decide, swapped, truth};
+use super::{Fact, MAX_FACTS, MAX_RELS, Ranges, compared_range, decide, swapped, truth, unsigned_order};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RelKind {
@@ -180,10 +180,7 @@ impl Path {
                     return;
                 }
                 let (left, right) = (self.fact(ranges, x), self.fact(ranges, y));
-                let order = match cc.is_signed() {
-                    true if left.non_negative(operand_ty) && right.non_negative(operand_ty) => as_unsigned(cc),
-                    _ => cc,
-                };
+                let order = unsigned_order(cc, operand_ty, &left, &right).unwrap_or(cc);
                 if !order.is_signed() {
                     if let Some(fact) = compared_range(order, operand_ty, &right, taken) {
                         self.add_with_backprop(func, ranges, x, fact, 0);
@@ -507,7 +504,7 @@ pub(super) fn cond_truth(func: &Function, ranges: &Ranges, path: &Path, conditio
 }
 
 fn cond_truth_depth(func: &Function, ranges: &Ranges, path: &Path, condition: Value, depth: u8) -> Option<bool> {
-    if let Some(taken) = truth(&path.fact(ranges, condition)) {
+    if let Some(taken) = truth(&path.refined_fact(func, ranges, condition, 0)) {
         return Some(taken);
     }
     if depth > 4 {
