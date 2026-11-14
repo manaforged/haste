@@ -1,6 +1,7 @@
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
 use super::float::X1;
 use super::Emit;
+use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{AtomicRmwOp, Binary, Function, Op, StackSlot, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
@@ -333,43 +334,121 @@ impl Emit<'_> {
         self.asm.store(size, to, source);
     }
 
+    fn select_cond(&mut self, condition: Value, live_flags: Option<(Value, Cond)>) -> Cond {
+        if let Some((value, cond)) = live_flags
+            && value == condition
+        {
+            return cond;
+        }
+        if !self.plan.elided[condition.index()]
+            && matches!(self.location(condition), Location::Slot)
+            && self.cached_spill(condition).is_none()
+        {
+            self.asm.alu_imm_sized(Size::of(self.ty(condition).bytes()), Alu::Cmp, self.at(condition), 0);
+            return Cond::Ne;
+        }
+        self.test_cond(condition)
+    }
+
+    fn select_copy(&mut self, value: Value, result: Value) {
+        let ty = self.ty(result);
+        if ty.in_float_register() {
+            let dst = self.xmm_of(value).unwrap_or_else(|| {
+                let dst = self.fdst(result);
+                self.fget(dst, value);
+                dst
+            });
+            self.fput(result, dst);
+            return;
+        }
+        if ty == Type::I128 {
+            self.asm.load(Size::Q, Reg::Rax, self.at(value));
+            self.clobber_reg(Reg::Rax);
+            self.put(result, Reg::Rax);
+            self.asm.load(Size::Q, Reg::Rax, self.at(value).offset(8));
+            self.put_high(result, Reg::Rax);
+            self.clobber_reg(Reg::Rax);
+            return;
+        }
+        if matches!(self.location(result), Location::Slot)
+            && let Some(reg) = self.reg_of(value).or_else(|| self.cached_spill(value))
+        {
+            self.put(result, reg);
+            return;
+        }
+        let dst = self.dst(result);
+        self.raw(dst, value);
+        self.put(result, dst);
+    }
+
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
+        let live_flags = self.flags.take();
         if self.ty(condition).is_vector() {
             self.invalidate_spills();
             self.vector_select(condition, x, y, result);
             self.invalidate_spills();
             return;
         }
-        self.get(Reg::Rcx, condition, Ext::Zero);
-        self.asm.test(Reg::Rcx, Reg::Rcx);
+        if x == y {
+            self.select_copy(x, result);
+            return;
+        }
+        if let Some(imm) = self.const_of(condition) {
+            let known = crate::fold::extend(imm, self.ty(condition), false);
+            self.select_copy(if known != 0 { x } else { y }, result);
+            return;
+        }
+        let mut cond = self.select_cond(condition, live_flags);
         let ty = self.ty(x);
         if ty.in_float_register() {
+            let dst = self.fdst(result);
+            let (mut x, mut y) = (x, y);
+            if self.xmm_of(x) == Some(dst) {
+                (x, y) = (y, x);
+                cond = cond.invert();
+            }
             let done = self.asm.label();
-            self.fget(Xmm(0), y);
-            self.asm.jcc(Cond::E, done);
-            self.fget(Xmm(0), x);
+            self.fget(dst, y);
+            self.asm.jcc(cond.invert(), done);
+            self.fget(dst, x);
             self.asm.bind(done);
             self.clobber_reg(Reg::Rax);
             self.last_fspill = None;
-            self.fput(result, Xmm(0));
+            self.fput(result, dst);
             return;
         }
         if ty == Type::I128 {
             self.asm.load(Size::Q, Reg::Rax, self.at(y));
-            self.asm.cmov(Cond::Ne, Reg::Rax, self.at(x));
+            self.asm.cmov(cond, Reg::Rax, self.at(x));
             self.clobber_reg(Reg::Rax);
             self.put(result, Reg::Rax);
             self.asm.load(Size::Q, Reg::Rax, self.at(y).offset(8));
-            self.asm.cmov(Cond::Ne, Reg::Rax, self.at(x).offset(8));
+            self.asm.cmov(cond, Reg::Rax, self.at(x).offset(8));
             self.put_high(result, Reg::Rax);
             self.clobber_reg(Reg::Rax);
             return;
         }
-        self.raw(Reg::Rax, y);
+        let dst = self.dst(result);
+        let val_of = |v| self.const_of(v).map(|imm| crate::fold::extend(imm, ty, false));
+        if let (Some(xv), Some(yv)) = (val_of(x), val_of(y))
+            && ((xv == 1 && yv == 0) || (xv == 0 && yv == 1))
+        {
+            self.asm.setcc(if xv == 1 { cond } else { cond.invert() }, dst);
+            self.asm.load(Size::B, dst, dst);
+            self.clobber_reg(dst);
+            self.put(result, dst);
+            return;
+        }
+        let (mut x, mut y) = (x, y);
+        if self.reg_of(x) == Some(dst) {
+            (x, y) = (y, x);
+            cond = cond.invert();
+        }
+        self.raw(dst, y);
         let source = self.operand(x);
-        self.asm.cmov(Cond::Ne, Reg::Rax, source);
-        self.clobber_reg(Reg::Rax);
-        self.put(result, Reg::Rax);
+        self.asm.cmov(cond, dst, source);
+        self.clobber_reg(dst);
+        self.put(result, dst);
     }
 
     /// Leaves the old contents in rax.
