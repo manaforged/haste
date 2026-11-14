@@ -239,41 +239,74 @@ pub(super) fn parts(layout: &Layout) -> Result<Parts> {
     })
 }
 
-fn word_parts(size: u64) -> Parts {
-    if !(1..=32).contains(&size) {
-        return Parts::Bytes;
-    }
+const WIDTHS: [(Type, u64); 4] = [(Type::I64, 8), (Type::I32, 4), (Type::I16, 2), (Type::I8, 1)];
+
+/// The parts named by up to four `chunks`, or `Bytes` when there are none or more than four.
+fn table(chunks: impl IntoIterator<Item = (Type, i32)>) -> Parts {
     let mut words = [(Type::I8, 0); 4];
     let mut len = 0usize;
-    let mut offset = 0u64;
-    for (ty, width) in [(Type::I64, 8), (Type::I32, 4), (Type::I16, 2), (Type::I8, 1)] {
-        while offset + width <= size {
-            if len == 4 {
-                return Parts::Bytes;
-            }
-            words[len] = (ty, offset as i32);
-            len += 1;
-            offset += width;
+    for chunk in chunks {
+        if len == 4 {
+            return Parts::Bytes;
         }
+        words[len] = chunk;
+        len += 1;
     }
     match len {
+        0 => Parts::Bytes,
         1 => Parts::One(words[0].0),
         2 => Parts::Pair(words[0].0, words[1].0, words[1].1),
         _ => Parts::Words(words, len as u8),
     }
 }
 
+/// The widest aligned power-of-two integer chunks that cover bytes `start..end`.
+fn span_chunks(start: u64, end: u64) -> impl Iterator<Item = (Type, i32)> {
+    let mut at = start;
+    std::iter::from_fn(move || {
+        let (ty, width) = WIDTHS.into_iter().find(|&(_, width)| at % width == 0 && at + width <= end)?;
+        let chunk = (ty, at as i32);
+        at += width;
+        Some(chunk)
+    })
+}
+
+fn word_parts(size: u64) -> Parts {
+    if !(1..=32).contains(&size) {
+        return Parts::Bytes;
+    }
+    table(span_chunks(0, size))
+}
+
 /// Breaks `size` (`1..=32`) into up to four `I64` words when `word_parts` overflows four exact power-of-two chunks.
 pub(super) fn packed_word_parts(size: u32) -> Parts {
     match word_parts(u64::from(size)) {
-        Parts::Bytes if (1..=32).contains(&size) => {
-            let mut words = [(Type::I8, 0); 4];
-            let len = size.div_ceil(8) as usize;
-            for (i, slot) in words[..len].iter_mut().enumerate() {
-                *slot = (Type::I64, (i * 8) as i32);
-            }
-            Parts::Words(words, len as u8)
-        }
+        Parts::Bytes if (1..=32).contains(&size) => table(eightbytes(size)),
+        found => found,
+    }
+}
+
+/// The integer chunks of a memory value of at most two words, cut at each field, variant field and tag boundary so each field is its own part.
+fn field_parts(layout: &Layout) -> Parts {
+    let size = layout.size.bytes();
+    let Ok(dl) = target() else { return word_parts(size) };
+    if !(1..=16).contains(&size) || matches!(layout.fields, FieldsShape::Union(_)) {
+        return word_parts(size);
+    }
+    let mut cuts = vec![0, size];
+    if let FieldsShape::Arbitrary { offsets, .. } = &layout.fields {
+        cuts.extend(offsets.iter().map(|offset| offset.bytes()));
+    }
+    if let Variants::Multiple { tag, tag_field, variants, .. } = &layout.variants {
+        let at = layout.fields.offset(tag_field.index()).bytes();
+        cuts.extend([at, at + tag.primitive().size(dl).bytes()]);
+        cuts.extend(variants.iter().flat_map(|variant| variant.field_offsets.iter().map(|offset| offset.bytes())));
+    }
+    cuts.retain(|&cut| cut <= size);
+    cuts.sort_unstable();
+    cuts.dedup();
+    match table(cuts.windows(2).flat_map(|span| span_chunks(span[0], span[1]))) {
+        Parts::Bytes => word_parts(size),
         found => found,
     }
 }
@@ -303,13 +336,13 @@ fn simd_parts(element: &Scalar, count: BackendLaneCount, size: u64) -> Parts {
     }
 }
 
-/// The parts that a typed copy of a value of `layout` moves: its scalars, the whole of a vector that fills one register, the 16-byte halves of a wider one, or contiguous word chunks up to 32 bytes when both scalars are a union's or the layout names none.
+/// The parts that a typed copy of a value of `layout` moves: its scalars, the whole of a vector that fills one register, the 16-byte halves of a wider one, or contiguous word chunks up to 32 bytes when both scalars are a union's, or chunks cut at its field and tag boundaries when the layout names none.
 pub(super) fn copied_parts(layout: &Layout) -> Parts {
     match &layout.backend_repr {
         BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => word_parts(layout.size.bytes()),
         BackendRepr::SimdVector { element, count } => simd_parts(element, *count, layout.size.bytes()),
         _ => match parts(layout).unwrap_or(Parts::Bytes) {
-            Parts::Bytes => word_parts(layout.size.bytes()),
+            Parts::Bytes => field_parts(layout),
             found => found,
         },
     }
