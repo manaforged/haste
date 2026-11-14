@@ -33,6 +33,10 @@ impl Lower<'_, '_> {
                 self.close();
                 Ok(None)
             }
+            Intrinsic::Unreachable => {
+                self.unreachable();
+                Ok(None)
+            }
             Intrinsic::Assume => {
                 let &[cond] = args else { bail!("assume takes one bool") };
                 self.ins().assume(cond);
@@ -51,6 +55,14 @@ impl Lower<'_, '_> {
             Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
             _ => self.memory_intrinsic(origin, which, substs, args),
         }
+    }
+
+    /// Ends the block at a point that control never reaches: an assumption that is false there, then a trap.
+    pub(super) fn unreachable(&mut self) {
+        let never = self.ins().iconst(Type::I8, 0);
+        self.ins().assume(never);
+        self.ins().trap();
+        self.close();
     }
 
     /// Calls the host function `host` in the platform convention with `args`, and returns its result of machine type `ret`.

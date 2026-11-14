@@ -3,6 +3,7 @@ use haste_codegen::{AtomicRmwOp, Lane, TargetOpId, Type};
 use crate::body::BinOp;
 use crate::names::ItemRef;
 use crate::outline::item::{Attr, ItemKind};
+use crate::outline::tree::Profile;
 
 use super::Context;
 
@@ -38,6 +39,8 @@ pub enum Intrinsic {
     ConstEvalSelect,
     SelectUnpredictable,
     Trap,
+    /// `unreachable`, a point that control never reaches.
+    Unreachable,
     /// `assume`, a condition the optimizer may take as true.
     Assume,
     CallerLocation,
@@ -245,7 +248,7 @@ const NAMES: &[(&str, Intrinsic)] = {
         ("abort", Trap),
         ("assume", Assume),
         ("catch_unwind", CatchUnwind),
-        ("unreachable", Trap),
+        ("unreachable", Unreachable),
         ("caller_location", CallerLocation),
         ("size_of", SizeOf),
         ("align_of", AlignOf),
@@ -361,7 +364,7 @@ const NAMES: &[(&str, Intrinsic)] = {
 };
 
 impl Context<'_> {
-    /// The intrinsic that the function `item` is, when it carries `#[rustc_intrinsic]` and lowering knows it, or when it is the panic handler. `Trap` stands for the panic runtime, which is not lowered yet, and for code that must never run.
+    /// The intrinsic that the function `item` is, when it carries `#[rustc_intrinsic]` and lowering knows it, or when it is the panic handler. `Trap` stands for the panic runtime, which is not lowered yet. `Unreachable` also stands for `core::hint::unreachable_unchecked` where its precondition check is compiled out.
     pub fn intrinsic(&self, item: ItemRef) -> Option<Intrinsic> {
         let (src, entry) = self.item(item);
         match self.lang(item) {
@@ -381,8 +384,12 @@ impl Context<'_> {
         {
             return Some(Intrinsic::X86(x86));
         }
-        if entry.kind == ItemKind::Fn && name == "__cpuid_count" && self.outline.roots[item.krate as usize].name == "core" {
-            return Some(Intrinsic::Cpuid);
+        if entry.kind == ItemKind::Fn && self.outline.roots[item.krate as usize].name == "core" {
+            match name {
+                "__cpuid_count" => return Some(Intrinsic::Cpuid),
+                "unreachable_unchecked" if crate::profile() == Profile::Release => return Some(Intrinsic::Unreachable),
+                _ => {}
+            }
         }
         marked.then(|| NAMES.iter().find(|(known, _)| *known == name).map(|(_, which)| *which)).flatten()
     }
