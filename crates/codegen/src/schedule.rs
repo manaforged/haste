@@ -193,20 +193,29 @@ fn strip_assumes(func: &mut Function) -> bool {
     stripped
 }
 
-/// Moves each compare read only by the `Brif` of its own block to sit directly before that branch.
+/// Moves each single-use compare read by a `Brif` or `Select` of its own block to sit directly before that reader.
 pub(crate) fn sink_compares(func: &mut Function) {
     let uses = func.use_counts();
     for block in &mut func.blocks {
-        let len = block.insts.len();
-        if len < 2 { continue; }
-        let Op::Brif(cond, ..) = func.insts[block.insts[len - 1].index()].op else { continue };
-        if uses[cond.index()] != 1 { continue; }
-        if let Some(cpos) = block.insts[..len - 1].iter().rposition(|&inst| {
-            let d = &func.insts[inst.index()];
-            d.result == Some(cond) && matches!(d.op, Op::Icmp(..) | Op::Fcmp(..))
-        }) && cpos + 1 < len - 1 {
-            let cinst = block.insts.remove(cpos);
-            block.insts.insert(len - 2, cinst);
+        let mut at = 0;
+        while at < block.insts.len() {
+            let data = &func.insts[block.insts[at].index()];
+            let Some(cond) = data.result.filter(|c| uses[c.index()] == 1 && matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))) else {
+                at += 1;
+                continue;
+            };
+            let reads = |inst: &crate::ir::Inst| {
+                let mut hit = false;
+                func.insts[inst.index()].op.for_operands(|v| hit |= v == cond);
+                hit
+            };
+            match block.insts[at + 1..].iter().position(reads) {
+                Some(gap) if gap > 0 && matches!(func.insts[block.insts[at + 1 + gap].index()].op, Op::Brif(c, ..) | Op::Select(c, ..) if c == cond) => {
+                    let inst = block.insts.remove(at);
+                    block.insts.insert(at + gap, inst);
+                }
+                _ => at += 1,
+            }
         }
     }
 }
@@ -240,6 +249,9 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     }
     for &pass in plan.finish {
         run_pass(func, pass, plan.moves, plan.effort, plan.target);
+    }
+    if moves != promote::Moves::Guided {
+        crate::algebra::compare_offsets(func);
     }
     sink_compares(func);
 }

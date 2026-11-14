@@ -9,6 +9,7 @@ mod ord;
 pub(super) use ord::three_way_non_zero;
 
 const MAX_DEPTH: u8 = 4;
+pub(super) const ADDR_SPAN: i64 = 0x1000_0000;
 
 #[derive(Clone, Copy)]
 enum Step {
@@ -25,11 +26,11 @@ struct Cmp {
 
 fn stack_base(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, v: Value) -> bool {
     let inner = match def_of(v).map(|inst| &func.insts[inst.index()].op) {
-        Some(Op::StackAddr(..)) => return true,
+        Some(Op::StackAddr(..) | Op::SlotAddr(_)) => return true,
         Some(&Op::Convert(Convert::Bitcast, a)) if func.ty(a) == func.ty(v) => a,
         _ => return false,
     };
-    matches!(def_of(inner).map(|inst| &func.insts[inst.index()].op), Some(Op::StackAddr(..)))
+    matches!(def_of(inner).map(|inst| &func.insts[inst.index()].op), Some(Op::StackAddr(..) | Op::SlotAddr(_)))
 }
 
 /// Returns whether `v` denotes a guaranteed non-null stack, symbol, or slot address.
@@ -45,7 +46,7 @@ pub(crate) fn is_non_null_addr(
     }
     let Some(inst) = def_of(v) else { return false };
     let stack_disp = |base: Value, off: Value| {
-        stack_base(func, def_of, base) && known(off).is_some_and(|c| (-0x1000_0000..=0x1000_0000).contains(&c))
+        stack_base(func, def_of, base) && known(off).is_some_and(|c| (-ADDR_SPAN..=ADDR_SPAN).contains(&c))
     };
     match func.insts[inst.index()].op {
         Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) => true,

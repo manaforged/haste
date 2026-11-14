@@ -1,10 +1,11 @@
 use crate::cse::flip_int_cc;
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
-use super::icmp::three_way_non_zero;
+use super::icmp::{ADDR_SPAN, three_way_non_zero};
 use super::{RewriteCx, is_non_null_addr};
 
 pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Value, t: Value, f: Value) -> Option<Op> {
+    let given = (t, f);
     if t == f {
         cx.alias(res, t);
         return None;
@@ -16,6 +17,11 @@ pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Valu
     let inner = cx.unwrap_uextend(cond);
     if let Some(arm) = tested_arm(cx, inner, t, f) {
         cx.alias(res, arm);
+        return None;
+    }
+    let (t, f) = (refuted_arm(cx, inner, t, true).unwrap_or(t), refuted_arm(cx, inner, f, false).unwrap_or(f));
+    if t == f {
+        cx.alias(res, t);
         return None;
     }
     if res.is_some_and(|r| cx.func.ty(r) == Type::I8) && cx.func.ty(inner) == Type::I8 && cx.is_unit_bool(inner) {
@@ -30,7 +36,41 @@ pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Valu
             _ => {}
         }
     }
-    (inner != cond).then_some(Op::Select(inner, t, f))
+    (inner != cond || (t, f) != given).then_some(Op::Select(inner, t, f))
+}
+
+fn opposite(cx: &RewriteCx, a: Value, b: Value) -> bool {
+    let (Some(&Op::Icmp(ca, xa, ya)), Some(&Op::Icmp(cb, xb, yb))) = (cx.op(a), cx.op(b)) else { return false };
+    cx.func.ty(xa).is_small_int() && ((xa == xb && ya == yb && cb == ca.inverse()) || (xa == yb && ya == xb && cb == flip_int_cc(ca.inverse())))
+}
+
+fn refuted_arm(cx: &RewriteCx, cond: Value, arm: Value, taken: bool) -> Option<Value> {
+    let &Op::Select(test, x, y) = cx.op(arm)? else { return None };
+    opposite(cx, cond, cx.unwrap_uextend(test)).then_some(if taken { y } else { x })
+}
+
+pub(super) fn tested_select(cx: &RewriteCx, cond: Value) -> Option<(Value, bool)> {
+    let &Op::Select(test, t, f) = cx.op(cx.unwrap_uextend(cond))? else { return None };
+    let ty = cx.func.ty(t);
+    if !ty.is_small_int() || !cx.func.ty(test).is_small_int() {
+        return None;
+    }
+    if cx.uconst(f, ty) == Some(0) && is_non_zero(cx, t, 0) {
+        Some((test, true))
+    } else if cx.uconst(t, ty) == Some(0) && is_non_zero(cx, f, 0) {
+        Some((test, false))
+    } else {
+        None
+    }
+}
+
+fn reach(cx: &RewriteCx, v: Value) -> u64 {
+    let ty = cx.func.ty(v);
+    let bound = |x: Value| ty.unsigned_max() & !cx.known(x).0;
+    match cx.op(v) {
+        Some(&Op::Binary(Binary::Imul, x, y)) => [(x, y), (y, x)].into_iter().find_map(|(x, k)| bound(x).checked_mul(cx.uconst(k, ty)?)).unwrap_or(u64::MAX),
+        _ => bound(v),
+    }
 }
 
 fn tested_arm(cx: &RewriteCx, cond: Value, t: Value, f: Value) -> Option<Value> {
@@ -78,15 +118,9 @@ pub(super) fn is_non_zero(cx: &RewriteCx, v: Value, depth: u8) -> bool {
     let Some(inst) = cx.def(v) else { return false };
     match cx.func.insts[inst.index()].op {
         Op::Binary(Binary::Iadd, a, b) => [(a, b), (b, a)].into_iter().any(|(base, off_v)| {
-            cx.sconst(off_v).is_some_and(|c| {
-                let deref = u64::from(entry_deref_bytes(cx, base));
-                if deref > 0 && c >= 0 && (c as u64) < deref {
-                    return true;
-                }
-                cx.def(base).is_some_and(|b_inst| {
-                    matches!(cx.func.insts[b_inst.index()].op, Op::StackAddr(..) | Op::SlotAddr(_))
-                }) && (0..=0x1000_0000).contains(&c)
-            })
+            let fixed = matches!(cx.op(base), Some(Op::Symbol(_) | Op::SlotAddr(_)));
+            (fixed && reach(cx, off_v) <= ADDR_SPAN as u64)
+                || cx.sconst(off_v).is_some_and(|c| c >= 0 && (c as u64) < u64::from(entry_deref_bytes(cx, base)))
         }),
         Op::Convert(Convert::Bitcast, a) if cx.func.ty(a).bytes() == ty.bytes() => is_non_zero(cx, a, depth + 1),
         Op::Convert(Convert::Uextend | Convert::Sextend, a) if cx.func.ty(a).is_small_int() => {
@@ -395,4 +429,78 @@ pub(crate) fn fold_bxor_conds(func: &mut Function) -> bool {
     }
     if changed { crate::schedule::sink_compares(func); }
     changed
+}
+
+fn difference(func: &Function, defs: &[Option<Inst>], uses: &[u32], v: Value) -> Option<(Inst, Value, Value)> {
+    let inst = defs.get(v.index()).copied().flatten().filter(|_| uses.get(v.index()) == Some(&1))?;
+    match func.insts[inst.index()].op {
+        Op::Binary(Binary::Isub | Binary::Bxor, a, b) if func.ty(a).is_small_int() => Some((inst, a, b)),
+        _ => None,
+    }
+}
+
+fn offset_compare(func: &mut Function, defs: &[Option<Inst>], uses: &[u32], out: &mut Vec<Inst>, inst: Inst) -> Option<Inst> {
+    let konst = |func: &Function, v: Value| match defs.get(v.index()).copied().flatten().map(|def| &func.insts[def.index()].op) {
+        Some(&Op::Const(imm)) => Some(imm),
+        _ => None,
+    };
+    let (cc, diff, rhs) = match func.insts[inst.index()].op {
+        Op::Brif(cond, ..) | Op::Select(cond, ..) => (None, cond, 0),
+        Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), x, y) => match (konst(func, x), konst(func, y)) {
+            (None, Some(k)) => (Some(cc), x, k),
+            (Some(k), None) => (Some(cc), y, k),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let (gone, a, b) = difference(func, defs, uses, diff)?;
+    let ty = func.ty(a);
+    let (lhs, bound) = if crate::fold::extend(rhs, ty, false) == 0 {
+        (a, b)
+    } else {
+        let sub = matches!(func.insts[gone.index()].op, Op::Binary(Binary::Isub, ..));
+        let (base, imm) = match (konst(func, a), konst(func, b), sub) {
+            (None, Some(c), true) => (a, c.wrapping_add(rhs)),
+            (Some(c), None, true) => (b, c.wrapping_sub(rhs)),
+            (None, Some(c), false) => (a, c ^ rhs),
+            (Some(c), None, false) => (b, c ^ rhs),
+            _ => return None,
+        };
+        let val = func.value(ty);
+        out.push(func.add(Op::Const(crate::fold::extend(imm, ty, true)), Some(val)));
+        (base, val)
+    };
+    match cc {
+        Some(cc) => func.insts[inst.index()].op = Op::Icmp(cc, lhs, bound),
+        None => {
+            let test = func.value(Type::I8);
+            out.push(func.add(Op::Icmp(IntCC::NotEqual, lhs, bound), Some(test)));
+            if let Op::Brif(cond, ..) | Op::Select(cond, ..) = &mut func.insts[inst.index()].op {
+                *cond = test;
+            }
+        }
+    }
+    Some(gone)
+}
+
+/// Rewrites a branch, a select, or an equality with a constant that is the only reader of `a - b` or `a ^ b` as a compare of `a`, and drops the difference; it runs after the passes that read ranges from the difference.
+pub(crate) fn compare_offsets(func: &mut Function) -> bool {
+    let (defs, uses) = (crate::fold::defs(func), func.use_counts());
+    let mut dead = Vec::new();
+    for b in 0..func.blocks.len() {
+        let insts = std::mem::take(&mut func.blocks[b].insts);
+        let mut out = Vec::with_capacity(insts.len());
+        for inst in insts {
+            dead.extend(offset_compare(func, &defs, &uses, &mut out, inst));
+            out.push(inst);
+        }
+        func.blocks[b].insts = out;
+    }
+    for block in &mut func.blocks {
+        block.insts.retain(|inst| !dead.contains(inst));
+    }
+    for &inst in &dead {
+        func.insts[inst.index()].op = Op::Trap;
+    }
+    !dead.is_empty()
 }

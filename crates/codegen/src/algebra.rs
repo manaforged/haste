@@ -5,7 +5,7 @@ mod icmp;
 mod select;
 mod vec;
 pub(crate) use icmp::{is_non_null_addr, non_null_cmp};
-pub(crate) use select::{fold_bxor_conds, invert};
+pub(crate) use select::{compare_offsets, fold_bxor_conds, invert};
 
 struct RewriteCx<'a> {
     func: &'a mut Function,
@@ -659,7 +659,11 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
         Op::Extract(v, lane) => vec::simplify_extract(cx, res, v, lane),
         Op::Shuffle(a, b, ShuffleMask::Const(m)) => vec::simplify_shuffle(cx, res, a, b, m),
         Op::Select(cond, t, f) => select::simplify_select(cx, res, cond, t, f),
-        Op::Brif(cond, tb, ta, eb, ea) => known_cond(cx, cond).or_else(|| match_swar_msb_broadcast(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
+        Op::Brif(cond, tb, ta, eb, ea) => match select::tested_select(cx, cond) {
+            Some((test, true)) => Some(Op::Brif(test, tb, ta, eb, ea)),
+            Some((test, false)) => Some(Op::Brif(test, eb, ea, tb, ta)),
+            None => known_cond(cx, cond).or_else(|| match_swar_msb_broadcast(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
+        },
         Op::Load(addr, off) => {
             let ty = cx.func.ty(res?);
             fold_rodata_load(cx, ty, addr, off).or_else(|| fold_disp(cx, addr, off, ty.bytes()).map(|(base, disp)| Op::Load(base, disp)))
