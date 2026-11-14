@@ -1,11 +1,10 @@
-//! Size trim that evicts stencils until a capped substrate fits its byte limit.
-
-use std::cmp::Reverse;
+//! Eviction that keeps every stencil a live consumer still needs and drops the rest.
 
 use anyhow::Result;
 
-use super::tally::{Tally, add, tally};
-use super::{HEADER_LEN, INSTANCE_REC_LEN, PendingStencil, STENCIL_REC_LEN, SUMMARY_REC_LEN, SubstrateBuilder, aligned8, push_aligned_blob};
+use super::consumers::retain_live;
+use super::tally::{Tally, add};
+use super::{PendingStencil, STENCIL_REC_LEN, SubstrateBuilder, aligned8, push_aligned_blob};
 
 impl PendingStencil {
     fn cost(&self) -> usize {
@@ -14,48 +13,37 @@ impl PendingStencil {
 }
 
 impl SubstrateBuilder {
-    pub(super) fn trim_stencils_to_limit(&mut self, limit: usize) -> Result<()> {
-        let base_table = HEADER_LEN + self.summaries.len() * SUMMARY_REC_LEN + self.instances.len() * INSTANCE_REC_LEN;
-        let current = base_table + self.stencils.len() * STENCIL_REC_LEN + self.blob.len();
-        let base = base_table
-            + self.summaries.iter().map(|s| aligned8(s.len as usize)).sum::<usize>()
-            + self.instances.iter().map(|i| aligned8(i.len as usize)).sum::<usize>();
-        let need = base + self.stencils.iter().map(PendingStencil::cost).sum::<usize>();
+    pub(super) fn evict_unneeded_stencils(&mut self) -> Result<()> {
+        let current = self.current_consumer();
+        let floor = retain_live(&mut self.consumers, current);
+        let need = self.stencils.iter().map(PendingStencil::cost).sum::<usize>();
         add(Tally::TrimStencils, self.stencils.len());
-        add(Tally::TrimBaseBytes, base);
         add(Tally::TrimNeedBytes, need);
-        if current <= limit {
-            add(Tally::TrimKeptBytes, need);
+        add(Tally::TrimBaseBytes, self.summaries.iter().map(|s| aligned8(s.len as usize)).sum::<usize>() + self.instances.iter().map(|i| aligned8(i.len as usize)).sum::<usize>());
+        let before = self.stencils.len();
+        self.stencils.retain(|s| s.last_used.is_none_or(|g| g >= floor));
+        add(Tally::TrimDropped, before - self.stencils.len());
+        add(Tally::TrimKeptBytes, self.stencils.iter().map(PendingStencil::cost).sum::<usize>());
+        if self.stencils.len() == before {
             return Ok(());
         }
-        let mut used = base;
-        self.stencils.sort_by_key(|s| (Reverse(s.code_len), Reverse(s.plan_len), s.item_hash));
-        let mut kept = Vec::with_capacity(self.stencils.len());
-        for s in self.stencils.drain(..) {
-            let cost = s.cost();
-            if used.saturating_add(cost) > limit {
-                tally(Tally::TrimDropped);
-                continue;
-            }
-            used += cost;
-            kept.push(s);
-        }
-        add(Tally::TrimKeptBytes, used);
-        kept.sort_by_key(|entry| (entry.item_hash, entry.fp_hi, entry.fp_lo));
-        self.stencils = kept;
         let old = std::mem::take(&mut self.blob);
+        let mut repack = |off: &mut u32, len: &mut u32| -> Result<()> {
+            (*off, *len) = push_aligned_blob(&mut self.blob, &old[*off as usize..*off as usize + *len as usize])?;
+            Ok(())
+        };
         for s in &mut self.summaries {
-            (s.off, s.len) = push_aligned_blob(&mut self.blob, &old[s.off as usize..s.off as usize + s.len as usize])?;
+            repack(&mut s.off, &mut s.len)?;
         }
         for s in &mut self.stencils {
-            (s.code_off, s.code_len) = push_aligned_blob(&mut self.blob, &old[s.code_off as usize..s.code_off as usize + s.code_len as usize])?;
-            (s.sites_off, s.sites_len) = push_aligned_blob(&mut self.blob, &old[s.sites_off as usize..s.sites_off as usize + s.sites_len as usize])?;
-            (s.relocs_off, s.relocs_len) = push_aligned_blob(&mut self.blob, &old[s.relocs_off as usize..s.relocs_off as usize + s.relocs_len as usize])?;
-            (s.plan_off, s.plan_len) = push_aligned_blob(&mut self.blob, &old[s.plan_off as usize..s.plan_off as usize + s.plan_len as usize])?;
-            (s.loops_off, s.loops_len) = push_aligned_blob(&mut self.blob, &old[s.loops_off as usize..s.loops_off as usize + s.loops_len as usize])?;
+            repack(&mut s.code_off, &mut s.code_len)?;
+            repack(&mut s.sites_off, &mut s.sites_len)?;
+            repack(&mut s.relocs_off, &mut s.relocs_len)?;
+            repack(&mut s.plan_off, &mut s.plan_len)?;
+            repack(&mut s.loops_off, &mut s.loops_len)?;
         }
         for i in &mut self.instances {
-            (i.off, i.len) = push_aligned_blob(&mut self.blob, &old[i.off as usize..i.off as usize + i.len as usize])?;
+            repack(&mut i.off, &mut i.len)?;
         }
         Ok(())
     }

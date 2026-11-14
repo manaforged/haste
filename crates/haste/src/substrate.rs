@@ -1,7 +1,9 @@
 //! Toolchain- and dependency-scoped mmap-able substrate for frozen summaries, stencils, and symbols.
 
+mod consumers;
 mod inline;
 mod keys;
+mod merge;
 pub mod noop;
 pub mod relocs;
 pub(crate) mod tally;
@@ -22,15 +24,20 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use haste_codegen::{Code, RelocKind, Site, StencilReloc};
 
+use consumers::{CONSUMER_REC_LEN, Consumer, KEPT_WORKSPACES};
+
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 21;
-const HEADER_LEN: usize = 64;
+const VERSION: u32 = 22;
+const HEADER_LEN: usize = 72;
 const SUMMARY_REC_LEN: usize = 16;
-const STENCIL_REC_LEN: usize = 64;
+const STENCIL_REC_LEN: usize = 72;
+const STENCIL_BLOB_AT: [usize; 5] = [24, 32, 40, 48, 56];
+const STENCIL_LAST_USED_AT: usize = 64;
 const INSTANCE_REC_LEN: usize = 24;
 const SITE_WIRE_LEN: usize = 12;
 const RELOC_WIRE_LEN: usize = 12;
@@ -134,6 +141,9 @@ struct Header {
     instances_off: usize,
     blob_off: usize,
     blob_len: usize,
+    generation: u32,
+    consumer_count: usize,
+    consumers_off: usize,
 }
 
 /// Mmap-backed frozen substrate storing summaries, stencils, and concrete instances.
@@ -141,6 +151,7 @@ pub struct Substrate {
     backing: Backing,
     header: Header,
     parent: Option<Arc<Substrate>>,
+    used: Box<[AtomicBool]>,
 }
 
 impl fmt::Debug for Substrate {
@@ -259,7 +270,8 @@ impl Substrate {
 
     fn from_backing(backing: Backing) -> Result<Self> {
         let header = parse_and_validate(backing.as_slice())?;
-        Ok(Self { backing, header, parent: None })
+        let used = (0..header.stencil_count).map(|_| AtomicBool::new(false)).collect();
+        Ok(Self { backing, header, parent: None, used })
     }
 
     /// Starts building a new frozen substrate.
@@ -315,13 +327,15 @@ impl Substrate {
             let k_hi = read_u64(data, rec + 16);
             (k_item, k_hi, k_lo).cmp(&(item_hash, fp_hi, fp_lo))
         })?;
+        self.used[idx].store(true, AtomicOrdering::Relaxed);
         self.stencil_at(self.header.stencils_off + idx * STENCIL_REC_LEN)
     }
 
     fn stencil_at(&self, rec: usize) -> Option<StencilSlice<'_>> {
         let data = self.backing.as_slice();
         let blob = |at: usize| self.blob_slice(read_u32(data, rec + at) as usize, read_u32(data, rec + at + 4) as usize);
-        Some(StencilSlice { code: blob(24)?, sites: blob(32)?, relocs: blob(40)?, plan: blob(48)?, loops: blob(56)? })
+        let [code, sites, relocs, plan, loops] = STENCIL_BLOB_AT;
+        Some(StencilSlice { code: blob(code)?, sites: blob(sites)?, relocs: blob(relocs)?, plan: blob(plan)?, loops: blob(loops)? })
     }
 
     /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its parent.
@@ -362,9 +376,9 @@ impl Substrate {
         self.save_scoped(deps_path(self.header.toolchain_hash), 16)
     }
 
-    /// Atomically saves the substrate into the workspace cache directory (bounded LRU <= 8 workspaces).
+    /// Atomically saves the substrate into the workspace cache directory (bounded LRU of `KEPT_WORKSPACES`).
     pub fn save_workspace(&self) -> Result<PathBuf> {
-        self.save_scoped(workspace_path(self.header.toolchain_hash), 7)
+        self.save_scoped(workspace_path(self.header.toolchain_hash), KEPT_WORKSPACES - 1)
     }
 
     fn save_scoped(&self, path: PathBuf, keep_others: usize) -> Result<PathBuf> {
@@ -406,6 +420,7 @@ struct PendingStencil {
     plan_len: u32,
     loops_off: u32,
     loops_len: u32,
+    last_used: Option<u32>,
 }
 
 struct PendingInstance {
@@ -425,6 +440,9 @@ pub struct SubstrateBuilder {
     stencils: Vec<PendingStencil>,
     instances: Vec<PendingInstance>,
     blob: Vec<u8>,
+    generation: u32,
+    consumer: (u64, u32),
+    consumers: Vec<Consumer>,
 }
 
 impl fmt::Debug for SubstrateBuilder {
@@ -453,40 +471,19 @@ impl SubstrateBuilder {
         self
     }
 
+    /// Names the build that is saving this layer, as its workspace key and batch kind tag.
+    pub fn consumer(mut self, workspace: u64, kind: u32) -> Self {
+        self.consumer = (workspace, kind);
+        self
+    }
+
+    fn current_consumer(&self) -> Consumer {
+        Consumer { workspace: self.consumer.0, kind: self.consumer.1, generation: self.generation }
+    }
+
     /// Returns whether no summaries, stencils, or concrete instances have been added yet.
     pub fn is_empty(&self) -> bool {
         self.summaries.is_empty() && self.stencils.is_empty() && self.instances.is_empty()
-    }
-
-    /// Appends all summaries, stencils, and instances from `existing`'s own backing into this builder.
-    pub fn merge_from(&mut self, existing: &Substrate) -> Result<()> {
-        let data = existing.backing.as_slice();
-        for i in 0..existing.header.summary_count {
-            let rec = existing.header.summaries_off + i * SUMMARY_REC_LEN;
-            let item_hash = read_u64(data, rec);
-            let off = read_u32(data, rec + 8) as usize;
-            let len = read_u32(data, rec + 12) as usize;
-            let bytes = existing.blob_slice(off, len).context("corrupt existing summary slice")?;
-            self.add_summary(item_hash, bytes)?;
-        }
-        for i in 0..existing.header.stencil_count {
-            let rec = existing.header.stencils_off + i * STENCIL_REC_LEN;
-            let item_hash = read_u64(data, rec);
-            let fp_lo = read_u64(data, rec + 8);
-            let fp_hi = read_u64(data, rec + 16);
-            let footprint = u128::from(fp_lo) | (u128::from(fp_hi) << 64);
-            self.push_stencil(item_hash, footprint, existing.stencil_at(rec).context("corrupt existing stencil")?)?;
-        }
-        for i in 0..existing.header.instance_count {
-            let rec = existing.header.instances_off + i * INSTANCE_REC_LEN;
-            let item_hash = read_u64(data, rec);
-            let substs_hash = read_u64(data, rec + 8);
-            let off = read_u32(data, rec + 16) as usize;
-            let len = read_u32(data, rec + 20) as usize;
-            let bytes = existing.blob_slice(off, len).context("corrupt existing instance slice")?;
-            self.add_instance(item_hash, substs_hash, bytes)?;
-        }
-        Ok(())
     }
 
     /// Appends a serialized `PolySummary` entry.
@@ -510,10 +507,10 @@ impl SubstrateBuilder {
 
     /// Appends a pre-compiled stencil entry with an optional serialized portable `RelocPlan`.
     pub fn add_stencil_with_plan(&mut self, item_hash: u64, footprint: u128, code: &[u8], sites: &[u8], relocs: &[u8], plan: &[u8]) -> Result<()> {
-        self.push_stencil(item_hash, footprint, StencilSlice { code, sites, relocs, plan, loops: &[] })
+        self.push_stencil(item_hash, footprint, StencilSlice { code, sites, relocs, plan, loops: &[] }, None)
     }
 
-    fn push_stencil(&mut self, item_hash: u64, footprint: u128, slice: StencilSlice<'_>) -> Result<()> {
+    fn push_stencil(&mut self, item_hash: u64, footprint: u128, slice: StencilSlice<'_>, last_used: Option<u32>) -> Result<()> {
         let (code_off, code_len) = self.push_blob(slice.code)?;
         let (sites_off, sites_len) = self.push_blob(slice.sites)?;
         let (relocs_off, relocs_len) = self.push_blob(slice.relocs)?;
@@ -533,6 +530,7 @@ impl SubstrateBuilder {
             plan_len,
             loops_off,
             loops_len,
+            last_used,
         });
         Ok(())
     }
@@ -551,20 +549,15 @@ impl SubstrateBuilder {
         encode_relocs(code.relocs(), &mut relocs);
         let mut loops = Vec::new();
         encode_loops(code.loops(), &mut loops);
-        self.push_stencil(item_hash, footprint, StencilSlice { code: code.bytes(), sites: &sites, relocs: &relocs, plan, loops: &loops })
+        self.push_stencil(item_hash, footprint, StencilSlice { code: code.bytes(), sites: &sites, relocs: &relocs, plan, loops: &loops }, None)
     }
 
     fn push_blob(&mut self, bytes: &[u8]) -> Result<(u32, u32)> {
         push_aligned_blob(&mut self.blob, bytes)
     }
 
-    /// Sorts all index tables, serializes the binary image, and returns a validated `Substrate`.
-    pub fn build(self) -> Result<Substrate> {
-        self.build_within(None)
-    }
-
-    /// Builds the substrate while evicting smaller stencils if needed to keep the total file within `max_bytes`.
-    pub fn build_within(mut self, max_bytes: Option<usize>) -> Result<Substrate> {
+    /// Sorts all index tables, evicts stencils no live consumer needs, and returns a validated `Substrate`.
+    pub fn build(mut self) -> Result<Substrate> {
         self.summaries.sort_by_key(|entry| entry.item_hash);
         self.summaries.dedup_by_key(|entry| entry.item_hash);
         self.stencils.sort_by_key(|entry| (entry.item_hash, entry.fp_hi, entry.fp_lo));
@@ -583,26 +576,26 @@ impl SubstrateBuilder {
                 && a.substs_hash == b.substs_hash
                 && self.blob[a.off as usize..a.off as usize + a.len as usize] == self.blob[b.off as usize..b.off as usize + b.len as usize]
         });
-        if let Some(limit) = max_bytes {
-            self.trim_stencils_to_limit(limit)?;
-        }
+        self.evict_unneeded_stencils()?;
 
         let summaries_off = HEADER_LEN;
         let stencils_off = summaries_off + self.summaries.len() * SUMMARY_REC_LEN;
         let instances_off = stencils_off + self.stencils.len() * STENCIL_REC_LEN;
-        let blob_off = instances_off + self.instances.len() * INSTANCE_REC_LEN;
+        let consumers_off = instances_off + self.instances.len() * INSTANCE_REC_LEN;
+        let blob_off = consumers_off + self.consumers.len() * CONSUMER_REC_LEN;
         let total = blob_off + self.blob.len();
 
         let mut out = Vec::with_capacity(total);
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&self.generation.to_le_bytes());
         out.extend_from_slice(&self.toolchain_hash.to_le_bytes());
         out.extend_from_slice(&self.target_hash.to_le_bytes());
         out.extend_from_slice(&(self.summaries.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.stencils.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.instances.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.blob.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(self.consumers.len() as u64).to_le_bytes());
 
         for entry in &self.summaries {
             out.extend_from_slice(&entry.item_hash.to_le_bytes());
@@ -623,6 +616,8 @@ impl SubstrateBuilder {
             out.extend_from_slice(&entry.plan_len.to_le_bytes());
             out.extend_from_slice(&entry.loops_off.to_le_bytes());
             out.extend_from_slice(&entry.loops_len.to_le_bytes());
+            out.extend_from_slice(&entry.last_used.unwrap_or(self.generation).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
         }
         for entry in &self.instances {
             out.extend_from_slice(&entry.item_hash.to_le_bytes());
@@ -630,6 +625,7 @@ impl SubstrateBuilder {
             out.extend_from_slice(&entry.off.to_le_bytes());
             out.extend_from_slice(&entry.len.to_le_bytes());
         }
+        self.consumers.iter().for_each(|c| c.write(&mut out));
         out.extend_from_slice(&self.blob);
         Substrate::from_bytes(out)
     }
@@ -658,12 +654,14 @@ fn parse_and_validate(data: &[u8]) -> Result<Header> {
     if version != VERSION {
         bail!("unsupported substrate version {version}");
     }
+    let generation = read_u32(data, 12);
     let toolchain_hash = read_u64(data, 16);
     let target_hash = read_u64(data, 24);
     let summary_count = usize::try_from(read_u64(data, 32)).context("summary count overflow")?;
     let stencil_count = usize::try_from(read_u64(data, 40)).context("stencil count overflow")?;
     let instance_count = usize::try_from(read_u64(data, 48)).context("instance count overflow")?;
     let blob_len = usize::try_from(read_u64(data, 56)).context("blob length overflow")?;
+    let consumer_count = usize::try_from(read_u64(data, 64)).context("consumer count overflow")?;
 
     let summaries_off = HEADER_LEN;
     let summaries_bytes = summary_count.checked_mul(SUMMARY_REC_LEN).context("summary table overflow")?;
@@ -671,12 +669,14 @@ fn parse_and_validate(data: &[u8]) -> Result<Header> {
     let stencils_bytes = stencil_count.checked_mul(STENCIL_REC_LEN).context("stencil table overflow")?;
     let instances_off = stencils_off.checked_add(stencils_bytes).context("instance offset overflow")?;
     let instances_bytes = instance_count.checked_mul(INSTANCE_REC_LEN).context("instance table overflow")?;
-    let blob_off = instances_off.checked_add(instances_bytes).context("blob offset overflow")?;
+    let consumers_off = instances_off.checked_add(instances_bytes).context("consumer offset overflow")?;
+    let consumers_bytes = consumer_count.checked_mul(CONSUMER_REC_LEN).context("consumer table overflow")?;
+    let blob_off = consumers_off.checked_add(consumers_bytes).context("blob offset overflow")?;
     let total = blob_off.checked_add(blob_len).context("total length overflow")?;
     if data.len() < total {
         bail!("truncated substrate payload");
     }
-    Ok(Header { toolchain_hash, target_hash, summary_count, stencil_count, instance_count, summaries_off, stencils_off, instances_off, blob_off, blob_len })
+    Ok(Header { toolchain_hash, target_hash, summary_count, stencil_count, instance_count, summaries_off, stencils_off, instances_off, blob_off, blob_len, generation, consumer_count, consumers_off })
 }
 
 fn lower_bound_index(len: usize, mut cmp: impl FnMut(usize) -> Ordering) -> usize {
