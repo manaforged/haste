@@ -161,8 +161,8 @@ struct NaiveGroup {
     reflection_set: FxHashSet<Digest>,
 }
 
-const DICT_MIN_BYTES: u64 = 512;
-const DICT_MIN_FANOUT: u64 = 8;
+const DICT_MIN_BYTES: u64 = crate::image::DICT_MIN_BYTES as u64;
+const DICT_MIN_FANOUT: u64 = crate::image::DICT_MIN_FANOUT as u64;
 
 #[derive(Default)]
 struct StencilClass {

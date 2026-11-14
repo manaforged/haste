@@ -1,11 +1,14 @@
-use crate::cfg::{self, Cfg, Loop};
-use crate::ir::{Block, BlockData, Function, Inst, Op, Value};
-use crate::mem::{LoopMem, MemLoc, PromoteBase, PromoteCand, Provenance};
+use std::sync::Arc;
+
+use crate::cfg::{self, Cfg, Loop, Loops};
+use crate::ir::{Block, BlockData, Domain, Function, Inst, Op, Type, Value};
+use crate::mem::{LoopMem, MemLoc, MemRoot, PromoteBase, PromoteCand, Provenance};
 use crate::merge::{find, identity, rename};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SymVal {
     Phi,
+    Merge(Block),
     Inst(Value),
 }
 
@@ -30,7 +33,7 @@ struct LoopShape {
 
 struct PromoteState<'a> {
     func: &'a mut Function,
-    cfg: &'a mut Cfg,
+    cfg: &'a mut Arc<Cfg>,
     each: &'a Loop,
     later: &'a mut [Loop],
     home: &'a mut Vec<Option<Block>>,
@@ -90,21 +93,63 @@ fn inst_matches_cand(func: &Function, prov: &Provenance, op: &Op, res: Option<Va
     ((loc.base, loc.offset, ty) == (cand.loc.base, cand.loc.offset, cand.ty)).then_some((is_write, stored))
 }
 
-fn join_loop_preds(out_state: &[Option<(SymVal, bool)>], preds: &[Block]) -> Option<(SymVal, bool)> {
+fn can_zero_trip_store(prov: &Provenance, cand: PromoteCand) -> bool {
+    match cand.base {
+        PromoteBase::Slot(_) => true,
+        PromoteBase::Addr(addr) => {
+            let end = i64::from(cand.offset).checked_add(i64::from(cand.ty.bytes()));
+            let deref = prov.ro_bytes.get(addr.index()).copied().unwrap_or(0);
+            end.is_some_and(|e| e >= 0 && e as u64 <= u64::from(deref))
+        }
+    }
+}
+
+fn can_merge_block(func: &Function, cfg: &Cfg, each: &Loop, b: Block) -> bool {
+    let preds = cfg.preds_of(b);
+    !preds.is_empty()
+        && preds.iter().all(|p| {
+            each.body.get(p.index()).copied().unwrap_or(false)
+                && matches!(func.last(*p), Some(Op::Jump(..) | Op::Brif(..)))
+        })
+}
+
+fn join_block_preds(
+    out_state: &[Option<(SymVal, bool)>],
+    preds: &[Block],
+    block: Block,
+    mergeable: bool,
+) -> Result<Option<(SymVal, bool)>, ()> {
     let mut joined: Option<(SymVal, bool)> = None;
+    let mut all_ready = !preds.is_empty();
+    let mut any_dirty = false;
+    let mut same = true;
     for &p in preds {
-        let Some(st) = out_state[p.index()] else { continue };
+        let Some(st) = out_state[p.index()] else {
+            all_ready = false;
+            continue;
+        };
+        any_dirty |= st.1;
         match joined {
             None => joined = Some(st),
-            Some(prev) if prev != st => return None,
+            Some(prev) if prev != st => same = false,
             Some(_) => {}
         }
     }
-    joined
+    let Some(first) = joined else {
+        return Ok(None);
+    };
+    if all_ready && same {
+        return Ok(Some(first));
+    }
+    if mergeable {
+        return Ok(Some((SymVal::Merge(block), any_dirty)));
+    }
+    Err(())
 }
 
 fn check_cand_flow(
     func: &Function,
+    cfg: &Cfg,
     prov: &Provenance,
     each: &Loop,
     shape: &LoopShape,
@@ -113,15 +158,33 @@ fn check_cand_flow(
     let n = func.blocks.len();
     let mut in_state = vec![None; n];
     let mut out_state = vec![None; n];
+    let head_in_preds: Vec<Block> = cfg
+        .preds_of(each.head)
+        .iter()
+        .copied()
+        .filter(|p| each.body.get(p.index()).copied().unwrap_or(false))
+        .collect();
+    let mergeable: Vec<bool> = (0..n).map(|i| can_merge_block(func, cfg, each, Block(i as u32))).collect();
+    let zero_trip_ok = can_zero_trip_store(prov, cand);
     in_state[each.head.index()] = Some((SymVal::Phi, false));
-    for _ in 0..=shape.rpo.len() {
+    for _ in 0..=shape.rpo.len() + 2 {
         let mut changed = false;
+        if in_state[each.head.index()].is_some_and(|(_, d)| !d)
+            && head_in_preds.iter().any(|p| out_state[p.index()].is_some_and(|(_, d)| d))
+        {
+            let head_writes = out_state[each.head.index()].is_some_and(|(_, d)| d);
+            if !zero_trip_ok && !head_writes {
+                return None;
+            }
+            in_state[each.head.index()] = Some((SymVal::Phi, true));
+            changed = true;
+        }
         for &b in &shape.rpo {
             if b != each.head {
-                let Some(st) = join_loop_preds(&out_state, &shape.in_preds[b.index()]) else {
-                    if shape.in_preds[b.index()].iter().any(|p| out_state[p.index()].is_some()) {
-                        return None;
-                    }
+                let Ok(maybe_st) = join_block_preds(&out_state, &shape.in_preds[b.index()], b, mergeable[b.index()]) else {
+                    return None;
+                };
+                let Some(st) = maybe_st else {
                     continue;
                 };
                 if in_state[b.index()] != Some(st) {
@@ -147,6 +210,11 @@ fn check_cand_flow(
         }
     }
     if shape.rpo.iter().any(|b| out_state[b.index()].is_none()) {
+        return None;
+    }
+    if shape.rpo.iter().any(|b| {
+        !matches!(func.last(*b), Some(Op::Jump(..) | Op::Brif(..) | Op::Return(_) | Op::Trap))
+    }) {
         return None;
     }
     let dirty_out = out_state.iter().map(|st| st.is_some_and(|(_, d)| d)).collect();
@@ -207,14 +275,16 @@ fn emit_exit_stores(state: &mut PromoteState<'_>, cand: PromoteCand, exits: Vec<
         let jump_inst = state.func.add(Op::Jump(edge.target, moved_args), None);
         state.func.blocks.push(BlockData { params: Vec::new(), insts: vec![store_inst, jump_inst] });
         state.home.resize(state.func.types.len(), None);
-        if let Some(ps) = state.cfg.preds.get_mut(edge.target.index())
+        let cfg = Arc::make_mut(&mut *state.cfg);
+        if let Some(ps) = cfg.preds.get_mut(edge.target.index())
             && let Some(slot) = ps.iter_mut().find(|p| **p == edge.src)
         {
             *slot = pad;
         }
-        state.cfg.preds.push(vec![edge.src]);
-        state.cfg.reachable.push(true);
-        state.cfg.idom.push(Some(edge.src));
+        cfg.preds.push(vec![edge.src]);
+        cfg.reachable.push(true);
+        cfg.idom.push(Some(edge.src));
+        insert_rpo(&mut cfg.rpo, edge.src, pad, true);
         for outer in state.later.iter_mut() {
             let inside = outer.body.get(edge.src.index()).copied().unwrap_or(false)
                 && outer.body.get(edge.target.index()).copied().unwrap_or(false);
@@ -251,10 +321,22 @@ fn rewrite_cand(
     shape: &LoopShape,
     cand: PromoteCand,
 ) -> bool {
-    let Some((in_state, dirty_out)) = check_cand_flow(state.func, prov, state.each, shape, cand) else {
+    let Some((in_state, dirty_out)) = check_cand_flow(state.func, state.cfg, prov, state.each, shape, cand) else {
         return false;
     };
     let phi = setup_preheader_phi(state, pre, cand);
+    let mut merge_phis = vec![None; state.func.blocks.len()];
+    for &b in &shape.rpo {
+        if let Some((SymVal::Merge(mb), _)) = in_state[b.index()]
+            && mb == b
+        {
+            let m_phi = state.func.value(cand.ty);
+            state.func.blocks[b.index()].params.push(m_phi);
+            state.home.resize(state.func.types.len(), None);
+            state.home[m_phi.index()] = Some(b);
+            merge_phis[b.index()] = Some(m_phi);
+        }
+    }
     let mut subst = identity(state.func.types.len());
     let mut renamed = false;
     let mut exits = Vec::new();
@@ -262,6 +344,10 @@ fn rewrite_cand(
         let Some((sym_in, _)) = in_state[b.index()] else { continue };
         let mut cur = match sym_in {
             SymVal::Phi => phi,
+            SymVal::Merge(mb) => match merge_phis[mb.index()] {
+                Some(m_phi) => m_phi,
+                None => continue,
+            },
             SymVal::Inst(v) => find(&subst, v),
         };
         let insts = std::mem::take(&mut state.func.blocks[b.index()].insts);
@@ -283,7 +369,16 @@ fn rewrite_cand(
         }
         state.func.blocks[b.index()].insts = kept;
         if let Some(&term) = state.func.blocks[b.index()].insts.last() {
-            record_term_edges(state.func, state.each, &dirty_out, (b, term, cur), &mut exits);
+            if dirty_out[b.index()]
+                && matches!(cand.base, PromoteBase::Addr(_))
+                && matches!(state.func.insts[term.index()].op, Op::Return(_))
+            {
+                let store_inst = state.func.add(base_mem_op(cand, Some(cur)), None);
+                let blk = &mut state.func.blocks[b.index()].insts;
+                let at = blk.len() - 1;
+                blk.insert(at, store_inst);
+            }
+            record_term_edges(state.func, state.each, &dirty_out, &merge_phis, (b, term, cur), &mut exits);
         }
     }
     emit_exit_stores(state, cand, exits);
@@ -293,29 +388,34 @@ fn rewrite_cand(
     true
 }
 
+fn needs_phi_arg(each: &Loop, merge_phis: &[Option<Value>], target: Block) -> bool {
+    target == each.head || merge_phis.get(target.index()).copied().flatten().is_some()
+}
+
 fn record_term_edges(
     func: &mut Function,
     each: &Loop,
     dirty_out: &[bool],
+    merge_phis: &[Option<Value>],
     (b, term, cur): (Block, Inst, Value),
     exits: &mut Vec<ExitEdge>,
 ) {
     let dirty = dirty_out[b.index()];
     match &mut func.insts[term.index()].op {
         Op::Jump(t, args) => {
-            if *t == each.head {
+            if needs_phi_arg(each, merge_phis, *t) {
                 args.push(cur);
             } else if dirty && !each.body.get(t.index()).copied().unwrap_or(false) {
                 exits.push(ExitEdge { src: b, branch: BranchKind::Jump, target: *t, val: cur });
             }
         }
         Op::Brif(_, t1, a1, t2, a2) => {
-            if *t1 == each.head {
+            if needs_phi_arg(each, merge_phis, *t1) {
                 a1.push(cur);
             } else if dirty && !each.body.get(t1.index()).copied().unwrap_or(false) {
                 exits.push(ExitEdge { src: b, branch: BranchKind::Then, target: *t1, val: cur });
             }
-            if *t2 == each.head {
+            if needs_phi_arg(each, merge_phis, *t2) {
                 a2.push(cur);
             } else if dirty && !each.body.get(t2.index()).copied().unwrap_or(false) {
                 exits.push(ExitEdge { src: b, branch: BranchKind::Else, target: *t2, val: cur });
@@ -325,8 +425,7 @@ fn record_term_edges(
     }
 }
 
-fn promote_mem(state: &mut PromoteState<'_>, prov: &Provenance, pre: Block) -> bool {
-    let mem = LoopMem::analyze(state.func, state.each, prov);
+fn promote_mem(state: &mut PromoteState<'_>, mem: &LoopMem, prov: &Provenance, pre: Block) -> bool {
     let cands = mem.promote_candidates(state.func, state.each, prov, state.home);
     if cands.is_empty() {
         return false;
@@ -341,16 +440,105 @@ fn promote_mem(state: &mut PromoteState<'_>, prov: &Provenance, pre: Block) -> b
     changed
 }
 
+fn insert_rpo(rpo: &mut Vec<Block>, anchor: Block, block: Block, after: bool) {
+    if rpo.contains(&block) {
+        return;
+    }
+    if let Some(pos) = rpo.iter().position(|&b| b == anchor) {
+        rpo.insert(pos + usize::from(after), block);
+    } else {
+        rpo.push(block);
+    }
+}
+
+fn can_hoist_global_load(func: &Function, mem: &LoopMem, prov: &Provenance, head_prefix: bool, inst: Inst) -> bool {
+    let data = &func.insts[inst.index()];
+    let Some(res) = data.result else { return false };
+    let Op::Load(addr, offset) = data.op else { return false };
+    if mem.calls || mem.atomics || mem.unknown_mem_writes {
+        return false;
+    }
+    let width = func.ty(res).bytes();
+    let deref_ok = offset >= 0
+        && (offset as u64)
+            .checked_add(u64::from(width))
+            .is_some_and(|end| end <= u64::from(prov.ro_bytes.get(addr.index()).copied().unwrap_or(0)));
+    if !head_prefix && !deref_ok {
+        return false;
+    }
+    matches!(prov.loc(addr, i64::from(offset), width).root, MemRoot::Global(_))
+}
+
+const MAX_HOISTED_SYMBOLS: usize = 4;
+const MAX_LOOP_GP_LIVE: usize = 18;
+const MAX_LOOP_VEC_LIVE: usize = 11;
+
+struct Invariants<'a> {
+    prov: &'a Provenance,
+    is_const: &'a [bool],
+}
+
+fn loop_live_counts(func: &Function, each: &Loop, is_const: &[bool], home: &[Option<Block>]) -> (usize, usize, Vec<u32>) {
+    let mut seen = vec![false; func.types.len()];
+    let mut uses = vec![0_u32; func.types.len()];
+    let mut gp_live = 0_usize;
+    let mut vec_live = 0_usize;
+    let mut count = |v: Value| {
+        if !seen[v.index()] {
+            seen[v.index()] = true;
+            if func.ty(v).in_float_register() {
+                vec_live += 1;
+            } else {
+                gp_live += 1;
+            }
+        }
+    };
+    for &p in &func.blocks[each.head.index()].params {
+        count(p);
+    }
+    for b in (0..each.body.len()).filter(|&b| each.body[b]) {
+        for &inst in &func.blocks[b].insts {
+            func.insts[inst.index()].op.for_operands(|v| {
+                let vi = v.index();
+                if is_const.get(vi).copied().unwrap_or(false) {
+                    return;
+                }
+                uses[vi] += 1;
+                if home.get(vi).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false)) {
+                    count(v);
+                }
+            });
+        }
+    }
+    (gp_live, vec_live, uses)
+}
+
 fn hoist(
     func: &mut Function,
+    cfg: &Cfg,
     each: &Loop,
     entry: Block,
-    prov: &Provenance,
+    inv: &Invariants<'_>,
+    mem: &LoopMem,
     home: &mut [Option<Block>],
 ) -> bool {
-    let mem = LoopMem::analyze(func, each, prov);
+    let prov = inv.prov;
+    let (gp_live, vec_live, loop_uses) = loop_live_counts(func, each, inv.is_const, home);
+    let has_insert = (0..each.body.len())
+        .filter(|&b| each.body[b])
+        .flat_map(|b| &func.blocks[b].insts)
+        .any(|inst| matches!(func.insts[inst.index()].op, Op::Insert(..)));
+    let uses = has_insert.then(|| func.use_counts());
+    let mut hoisted_vec: Vec<Value> = Vec::new();
+    let mut hoisted_symbols = 0_usize;
+    let mut hoisted_gp = 0_usize;
+    let mut hoisted_vecs = 0_usize;
     let mut moved: Vec<Inst> = Vec::new();
-    for block in (0..each.body.len()).filter(|block| each.body[*block]) {
+    for &blk in &cfg.rpo {
+        let block = blk.index();
+        if !each.body.get(block).copied().unwrap_or(false) {
+            continue;
+        }
         let head = block == each.head.index();
         let insts = std::mem::take(&mut func.blocks[block].insts);
         let mut kept = Vec::with_capacity(insts.len());
@@ -360,12 +548,36 @@ fn hoist(
             if matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::Trap | Op::Trapz(_) | Op::Brif(..)) {
                 head_prefix = false;
             }
+            let is_symbol = matches!(op, Op::Symbol(_));
             let static_loc = matches!(op, Op::StackAddr(..) | Op::SlotAddr(_));
-            let movable = (op.is_speculable() && !(mem.calls && static_loc))
-                || mem.can_hoist_load(func, prov, head_prefix, inst);
+            let sym_ok = !mem.calls || hoisted_symbols < MAX_HOISTED_SYMBOLS;
+            let res_ty = func.insts[inst.index()].result.map(|r| func.ty(r));
+            let is_vec_mat = res_ty.is_some_and(Type::in_float_register)
+                && matches!(op, Op::Insert(..) | Op::Shuffle(..) | Op::Const(_) | Op::Load(..) | Op::StackLoad(..));
+            let replaces_single_use = matches!(op, Op::Insert(prev, ..) if hoisted_vec.contains(prev) && uses.as_ref().is_some_and(|u| u[prev.index()] == 1));
+            let vec_ok = !is_vec_mat || replaces_single_use || vec_live + hoisted_vecs < MAX_LOOP_VEC_LIVE;
+            let movable = (op.is_speculable() && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
+                || mem.can_hoist_load(func, prov, head_prefix, inst)
+                || can_hoist_global_load(func, mem, prov, head_prefix, inst);
             let mut operands_invariant = true;
-            op.for_operands(|v| operands_invariant &= home.get(v.index()).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false)));
-            if movable && operands_invariant && let Some(res) = func.insts[inst.index()].result {
+            let mut frees_operand = false;
+            op.for_operands(|v| {
+                operands_invariant &= home.get(v.index()).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false));
+                frees_operand |= loop_uses[v.index()] == 1 && !func.ty(v).in_float_register();
+            });
+            let adds_gp = !frees_operand && !matches!(op, Op::Const(_)) && res_ty.is_some_and(|ty| !ty.in_float_register());
+            let gp_ok = !(adds_gp && op.is_speculable()) || gp_live + hoisted_gp < MAX_LOOP_GP_LIVE;
+            if movable && vec_ok && gp_ok && operands_invariant && let Some(res) = func.insts[inst.index()].result {
+                hoisted_gp += usize::from(adds_gp);
+                if is_symbol {
+                    hoisted_symbols += 1;
+                }
+                if is_vec_mat {
+                    if !replaces_single_use {
+                        hoisted_vecs += 1;
+                    }
+                    hoisted_vec.push(res);
+                }
                 home[res.index()] = Some(entry);
                 moved.push(inst);
             } else {
@@ -383,27 +595,41 @@ fn hoist(
     true
 }
 
+fn loops_touch_memory(func: &Function, loops: &Loops) -> bool {
+    func.blocks.iter().zip(&loops.depths).filter(|(_, depth)| **depth > 0).flat_map(|(block, _)| &block.insts).any(|inst| {
+        matches!(func.insts[inst.index()].op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..) | Op::Move(..) | Op::Copy(..))
+    })
+}
+
 /// Moves loop-invariant work of every natural loop that one jump enters out to the block that enters it.
-pub(crate) fn run(func: &mut Function) -> bool {
+pub(crate) fn run(func: &mut Function) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
-        return false;
+        return Domain::NONE;
     }
-    let mut cfg = Cfg::new(func);
-    let mut found = cfg.loops(func);
-    if found.list.is_empty() {
-        return false;
+    let mut cfg = func.cfg();
+    if cfg.loops().list.is_empty() {
+        return Domain::NONE;
     }
-    let prov = Provenance::new(func, &cfg);
+    let mut found = cfg.loops().clone();
+    let prov = if loops_touch_memory(func, &found) { Provenance::new(func, &cfg) } else { Provenance::default() };
     let mut home = func.def_blocks();
-    let mut changed = false;
+    let mut is_const = vec![false; func.types.len()];
+    for data in &func.insts {
+        if let (&Op::Const(_), Some(res)) = (&data.op, data.result) {
+            is_const[res.index()] = true;
+        }
+    }
+    let inv = Invariants { prov: &prov, is_const: &is_const };
+    let mut dirty = Domain::NONE;
     for idx in 0..found.list.len() {
         let before = func.blocks.len();
         let Some(pre) = cfg::preheader(func, &cfg, &found.list[idx]) else { continue };
         if func.blocks.len() > before {
-            changed = true;
+            dirty |= Domain::CFG;
             home.resize(func.types.len(), Some(pre));
             let head_idx = found.list[idx].head.index();
             let mut pre_preds = Vec::new();
+            let cfg = Arc::make_mut(&mut cfg);
             cfg.preds[head_idx].retain(|p| {
                 let inside = found.list[idx].body.get(p.index()).copied().unwrap_or(false);
                 if !inside {
@@ -416,6 +642,7 @@ pub(crate) fn run(func: &mut Function) -> bool {
             cfg.reachable.push(true);
             cfg.idom.push(cfg.idom[head_idx]);
             cfg.idom[head_idx] = Some(pre);
+            insert_rpo(&mut cfg.rpo, found.list[idx].head, pre, false);
             found.list[idx].body.resize(pre.index() + 1, false);
             for later in &mut found.list[idx + 1..] {
                 let inside = later.body.get(head_idx).copied().unwrap_or(false);
@@ -425,9 +652,22 @@ pub(crate) fn run(func: &mut Function) -> bool {
         }
         let (left, later) = found.list.split_at_mut(idx + 1);
         let each = &left[idx];
+        let mut mem = LoopMem::analyze(func, each, &prov);
         let mut state = PromoteState { func, cfg: &mut cfg, each, later, home: &mut home };
-        changed |= promote_mem(&mut state, &prov, pre);
-        changed |= hoist(func, &found.list[idx], pre, &prov, &mut home);
+        let blocks_before = state.func.blocks.len();
+        if promote_mem(&mut state, &mem, &prov, pre) {
+            dirty |= Domain::VALUES | Domain::MEM;
+            if state.func.blocks.len() > blocks_before {
+                dirty |= Domain::CFG;
+            }
+            mem = LoopMem::analyze(func, &found.list[idx], &prov);
+        }
+        if hoist(func, &cfg, &found.list[idx], pre, &inv, &mem, &mut home) {
+            dirty |= Domain::VALUES;
+        }
     }
-    changed
+    if dirty.contains(Domain::CFG) {
+        func.bump_cfg();
+    }
+    dirty
 }

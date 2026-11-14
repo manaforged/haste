@@ -1,16 +1,10 @@
-use crate::ir::{
-    AtomicRmwOp, Binary, Block, BlockData, Convert, FloatCC, Function, Inst, InstData, IntCC, Op, SigRef, Signature, SlotData,
-    StackSlot, Type, Unary, Value,
-};
+use crate::ir::{AtomicRmwOp, Binary, Block, BlockData, Convert, FloatCC, Function, Inst, InstData, IntCC, Op, SigRef, Signature, SlotData, StackSlot, Type, Unary, Value};
 use crate::reloc::RuntimeSymbol;
 
 mod vector;
 
 fn cmp_result_ty(ty: Type) -> Type {
-    match ty {
-        Type::Vec { lane, count } => Type::Vec { lane: lane.int_mask(), count },
-        _ => Type::I8,
-    }
+    if let Type::Vec { lane, count } = ty { Type::Vec { lane: lane.int_mask(), count } } else { Type::I8 }
 }
 
 /// Appends blocks, values and instructions to a function.
@@ -24,14 +18,14 @@ pub struct FunctionBuilder<'f> {
 impl<'f> FunctionBuilder<'f> {
     /// A builder that appends to `func`.
     pub fn new(func: &'f mut Function) -> Self {
-        let incoming = vec![0; func.blocks.len()];
-        Self { func, current: None, incoming }
+        Self { incoming: vec![0; func.blocks.len()], func, current: None }
     }
 
     /// Adds an empty block.
     pub fn create_block(&mut self) -> Block {
         self.func.blocks.push(BlockData::default());
         self.incoming.push(0);
+        self.func.bump_cfg();
         Block(self.func.blocks.len() as u32 - 1)
     }
 
@@ -64,6 +58,7 @@ impl<'f> FunctionBuilder<'f> {
             self.append_block_param(block, ty);
         }
         self.func.entry = Some(block);
+        self.func.bump_cfg();
     }
 
     /// Adds a frame area of `size` bytes aligned to `1 << align_shift`.
@@ -112,6 +107,7 @@ impl<'f> FunctionBuilder<'f> {
             block.insts.retain(|inst| inst.index() < mark.insts);
             block.params.retain(|value| value.index() < mark.types);
         }
+        func.bump_cfg();
         self.current = mark.current;
     }
 
@@ -161,6 +157,9 @@ impl<'f> FunctionBuilder<'f> {
     }
 
     fn append(&mut self, block: Block, data: InstData) {
+        if data.op.is_terminator() {
+            self.func.bump_cfg();
+        }
         for target in data.op.targets() {
             self.incoming[target.index()] += 1;
         }
@@ -188,6 +187,7 @@ impl Function {
         let Op::Call { args, results, .. } = std::mem::replace(&mut self.insts[old_inst.index()].op, Op::Trap) else {
             return;
         };
+        self.bump_cfg();
         self.insts[old_inst.index()].result = None;
         let values: Vec<Value> = callee.types.iter().map(|ty| self.value(*ty)).collect();
         let base_block = self.blocks.len() as u32;
@@ -219,6 +219,12 @@ impl Function {
         let entry = callee.entry.map_or(after, |entry| map.blocks[entry.index()]);
         let jump = self.add(Op::Jump(entry, args), None);
         self.blocks[block.index()].insts.push(jump);
+    }
+    /// Rewrites non-self symbol operands and rodata metadata using `build(self_slots)`.
+    pub fn remap_symbols(&mut self, build: impl FnOnce(&[u32]) -> Option<Vec<u32>>) {
+        let Some(remap) = build(&self.self_slots) else { return };
+        for d in &mut self.insts { if let Op::Symbol(s) | Op::SlotAddr(s) = &mut d.op { *s = remap.get(*s as usize).copied().unwrap_or(*s); } }
+        for (s, _) in &mut self.rodata_bytes { *s = remap.get(*s as usize).copied().unwrap_or(*s); }
     }
 }
 
@@ -289,6 +295,9 @@ impl Ins<'_> {
     }
 
     fn effect(&mut self, op: Op) -> Inst {
+        if op.is_terminator() {
+            self.func.bump_cfg();
+        }
         for target in op.targets() {
             if let Some(count) = self.incoming.get_mut(target.index()) {
                 *count += 1;
@@ -610,6 +619,11 @@ impl Ins<'_> {
         self.convert(Convert::ToUintSat, ty, x)
     }
 
+    /// Reinterprets the bits of `x` as `ty`.
+    pub fn bitcast(self, ty: Type, x: Value) -> Value {
+        self.convert(Convert::Bitcast, ty, x)
+    }
+
     /// Float addition.
     pub fn fadd(self, x: Value, y: Value) -> Value {
         self.binary(Binary::Fadd, x, y)
@@ -774,12 +788,11 @@ impl Ins<'_> {
     }
 
     /// Stops with an illegal instruction.
-    pub fn trap(mut self) -> Inst {
-        self.effect(Op::Trap)
-    }
+    pub fn trap(mut self) -> Inst { self.effect(Op::Trap) }
 
     /// Stops with an illegal instruction when `condition` is zero.
-    pub fn trapz(mut self, condition: Value) -> Inst {
-        self.effect(Op::Trapz(condition))
-    }
+    pub fn trapz(mut self, condition: Value) -> Inst { self.effect(Op::Trapz(condition)) }
+
+    /// Tells the optimizer that `condition` is nonzero here; emits no code.
+    pub fn assume(mut self, condition: Value) -> Inst { self.effect(Op::Assume(condition)) }
 }

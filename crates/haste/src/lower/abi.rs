@@ -4,13 +4,14 @@ use rustc_abi::{BackendLaneCount, BackendRepr, FieldsShape, Float, Primitive, Sc
 use rustc_index::Idx;
 
 use crate::sema::Context;
-use crate::sema::infer::field_types;
+use crate::sema::impls::Head;
+use crate::sema::infer::{Shape, Typed, field_types};
 use crate::sema::layout::{Layout, field_offset, target};
-use crate::sema::ty::{Kind, Ty};
+use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::adt::tag_type;
 use super::place::Place;
-use super::{Lower, Parts, Repr, repr};
+use super::{Lower, Parts, Repr, indirect, passed_parts, repr};
 
 /// The machine values that a value of one type travels as in the platform convention, each with its byte offset inside the value.
 type Passed = Vec<(Type, i32)>;
@@ -29,6 +30,193 @@ pub(crate) fn purpose_tag(purpose: ArgumentPurpose) -> (u8, Option<u32>) {
         ArgumentPurpose::StructArgument(n) => (2, Some(n)),
         ArgumentPurpose::Dict => (3, None),
         ArgumentPurpose::Variadic => (4, None),
+    }
+}
+
+/// The native signature of a reached function: memory values travel by address unless `passed_parts` splits them into up to four scalar registers, and a memory result returns in those registers or through a first `StructReturn` pointer.
+pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
+    let mut sig = signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))?;
+    if matches!(&typed.shape, Shape::Closure(closure) if closure.closure.coroutine) {
+        let object = usize::from(indirect(&sig));
+        if let Some(cx_param) = sig.params.get_mut(object + 1) {
+            cx_param.deref_bytes = 0;
+            cx_param.noalias = false;
+            cx_param.readonly = false;
+        }
+    }
+    Ok(sig)
+}
+
+fn sret_param(size: u32) -> AbiParam {
+    AbiParam::special(Type::I64, ArgumentPurpose::StructReturn).with_noalias().with_deref_size(size)
+}
+
+/// The native signature of a function that returns `ret` and takes `params`.
+pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIterator<Item = Ty>) -> Result<Signature> {
+    let mut signature = Signature::new(CallConv::Internal);
+    if let Some(ret) = ret {
+        match repr(cx, ret)? {
+            Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
+            Repr::Mem { size, .. } => match passed_parts(cx, ret)? {
+                Some(parts) => signature.returns.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
+                None => signature.params.push(sret_param(size)),
+            },
+            Repr::Zst => {}
+        }
+    }
+    for param in params {
+        match repr(cx, param)? {
+            Repr::Scalar(ty) => signature.params.push(apply_param_provenance(cx, AbiParam::new(ty), param, 0)),
+            Repr::Mem { size, .. } => match passed_parts(cx, param)? {
+                Some(parts) => signature.params.extend(parts.scalars().map(|(machine, off)| apply_param_provenance(cx, AbiParam::new(machine), param, off))),
+                None => signature.params.push(AbiParam::new(Type::I64).with_noalias().with_deref_bytes(size)),
+            },
+            Repr::Zst => {}
+        }
+    }
+    Ok(signature)
+}
+
+fn apply_param_provenance(cx: &mut Context<'_>, abi: AbiParam, param: Ty, offset: i32) -> AbiParam {
+    if abi.value_type != Type::I64 {
+        return abi;
+    }
+    let Some(core_ty) = field_ty_at_offset(cx, param, offset, 0) else {
+        return abi;
+    };
+    let exclusive_inner = cx.boxed(core_ty).or_else(|| match *cx.types.kind(core_ty) {
+        Kind::Ref(Mut::Mut, inner) => Some(inner),
+        _ => None,
+    });
+    if let Some(inner) = exclusive_inner {
+        let abi = if is_unpin_like(cx, inner, 0) { abi.with_noalias() } else { abi };
+        return match pointee_bytes(cx, inner) {
+            Some(bytes) => abi.with_deref_size(bytes),
+            None => abi,
+        };
+    }
+    let Kind::Ref(Mut::Not, inner) = *cx.types.kind(core_ty) else {
+        return abi;
+    };
+    if !is_freeze_ty(cx, inner, 0) {
+        return abi;
+    }
+    match pointee_bytes(cx, inner) {
+        Some(bytes) => abi.with_deref_bytes(bytes),
+        None => abi.with_readonly(),
+    }
+}
+
+fn field_ty_at_offset(cx: &mut Context<'_>, ty: Ty, off: i32, depth: u32) -> Option<Ty> {
+    if depth > 8 || off < 0 || ty == Ty::NONE || cx.types.has_params(ty) {
+        return None;
+    }
+    if off == 0 && (matches!(cx.types.kind(ty), Kind::Ref(..)) || cx.boxed(ty).is_some()) {
+        return Some(ty);
+    }
+    match cx.types.kind(ty).clone() {
+        Kind::Pat(inner, ..) => field_ty_at_offset(cx, inner, off, depth + 1),
+        Kind::Array(elem, _) => {
+            if cx.is_unsized(elem).unwrap_or(true) || cx.layout(ty).ok()?.align.bytes() < 8 {
+                return None;
+            }
+            let stride = i32::try_from(cx.layout(elem).ok()?.size.bytes()).ok().filter(|&s| s > 0)?;
+            field_ty_at_offset(cx, elem, off % stride, depth + 1)
+        }
+        Kind::Tuple(items) => {
+            let fields = cx.types.substs(items).to_vec();
+            find_field_at_offset(cx, ty, 0, &fields, off, depth)
+        }
+        Kind::Adt(item, args) => {
+            if cx.boxed(ty).is_some() || cx.types.substs_have_params(args) || cx.is_unsized(ty).unwrap_or(true) {
+                return None;
+            }
+            let layout = cx.layout(ty).ok()?;
+            let Variants::Single { index } = layout.variants else { return None };
+            let slice = cx.types.substs(args).to_vec();
+            let fields = field_types(cx, item, &slice).ok()?.get(index.index())?.clone();
+            find_field_at_offset(cx, ty, index.index() as u32, &fields, off, depth)
+        }
+        _ => None,
+    }
+}
+
+fn find_field_at_offset(cx: &mut Context<'_>, ty: Ty, variant: u32, fields: &[Ty], off: i32, depth: u32) -> Option<Ty> {
+    if cx.is_unsized(ty).unwrap_or(true) {
+        return None;
+    }
+    let layout = cx.layout(ty).ok()?;
+    if matches!(layout.fields, FieldsShape::Union(_)) || !matches!(layout.variants, Variants::Single { .. }) || layout.align.bytes() < 8 {
+        return None;
+    }
+    for (idx, &fty) in fields.iter().enumerate() {
+        let size = i32::try_from(cx.layout(fty).ok()?.size.bytes()).ok()?;
+        if size == 0 {
+            continue;
+        }
+        let f_off = field_offset(&layout, variant, idx as u32);
+        if f_off >= 0 && off >= f_off && off - f_off < size {
+            return field_ty_at_offset(cx, fty, off - f_off, depth + 1);
+        }
+    }
+    None
+}
+
+fn pointee_bytes(cx: &mut Context<'_>, ty: Ty) -> Option<u32> {
+    if !cx.is_unsized(ty).is_ok_and(|u| !u) {
+        return None;
+    }
+    let bytes = cx.layout(ty).ok()?.size.bytes();
+    u32::try_from(bytes).ok().filter(|&b| b > 0)
+}
+
+fn is_unpin_like(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
+    if depth > 8 || ty == Ty::NONE || cx.types.has_params(ty) {
+        return false;
+    }
+    match *cx.types.kind(ty) {
+        Kind::Closure(..) => cx.ensure_closure(ty).is_none_or(|info| !info.closure.coroutine),
+        Kind::Adt(item, args) => {
+            if cx.types.substs_have_params(args) || cx.lang(item) == Some("unsafe_pinned") {
+                return false;
+            }
+            if let Some(unpin) = cx.lang_item("unpin")
+                && cx.negative_impl(unpin, Head::Adt(item), &[item.krate, unpin.krate])
+            {
+                return false;
+            }
+            let slice = cx.types.substs(args).to_vec();
+            let Ok(variants) = field_types(cx, item, &slice) else {
+                return false;
+            };
+            variants.iter().flatten().all(|&field| is_unpin_like(cx, field, depth + 1))
+        }
+        Kind::Pat(inner, ..) | Kind::Array(inner, _) => is_unpin_like(cx, inner, depth + 1),
+        Kind::Tuple(items) => cx.types.substs(items).to_vec().into_iter().all(|t| is_unpin_like(cx, t, depth + 1)),
+        Kind::Param(_) | Kind::Proj(_) | Kind::Dyn(..) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
+        _ => true,
+    }
+}
+
+pub(crate) fn is_freeze_ty(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
+    if depth > 16 || ty == Ty::NONE || cx.types.has_params(ty) {
+        return false;
+    }
+    match *cx.types.kind(ty) {
+        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => true,
+        Kind::Pat(base, ..) | Kind::Array(base, _) | Kind::Slice(base) => is_freeze_ty(cx, base, depth + 1),
+        Kind::Tuple(substs) => cx.types.substs(substs).to_vec().into_iter().all(|t| is_freeze_ty(cx, t, depth + 1)),
+        Kind::Adt(item, substs) => {
+            if cx.types.substs_have_params(substs) || matches!(cx.lang(item), Some("unsafe_cell" | "unsafe_pinned")) {
+                return false;
+            }
+            let args = cx.types.substs(substs).to_vec();
+            let Ok(variants) = field_types(cx, item, &args) else {
+                return false;
+            };
+            variants.iter().flatten().all(|&field| is_freeze_ty(cx, field, depth + 1))
+        }
+        Kind::Closure(..) | Kind::Dyn(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
     }
 }
 
@@ -51,68 +239,110 @@ pub(super) fn parts(layout: &Layout) -> Result<Parts> {
     })
 }
 
-fn word_parts(size: u64) -> Parts {
-    if !(1..=32).contains(&size) {
-        return Parts::Bytes;
-    }
+const WIDTHS: [(Type, u64); 4] = [(Type::I64, 8), (Type::I32, 4), (Type::I16, 2), (Type::I8, 1)];
+
+/// The parts named by up to four `chunks`, or `Bytes` when there are none or more than four.
+fn table(chunks: impl IntoIterator<Item = (Type, i32)>) -> Parts {
     let mut words = [(Type::I8, 0); 4];
     let mut len = 0usize;
-    let mut offset = 0u64;
-    for (ty, width) in [(Type::I64, 8), (Type::I32, 4), (Type::I16, 2), (Type::I8, 1)] {
-        while offset + width <= size {
-            if len == 4 {
-                return Parts::Bytes;
-            }
-            words[len] = (ty, offset as i32);
-            len += 1;
-            offset += width;
+    for chunk in chunks {
+        if len == 4 {
+            return Parts::Bytes;
         }
+        words[len] = chunk;
+        len += 1;
     }
     match len {
+        0 => Parts::Bytes,
         1 => Parts::One(words[0].0),
         2 => Parts::Pair(words[0].0, words[1].0, words[1].1),
         _ => Parts::Words(words, len as u8),
     }
 }
 
+/// The widest aligned power-of-two integer chunks that cover bytes `start..end`.
+fn span_chunks(start: u64, end: u64) -> impl Iterator<Item = (Type, i32)> {
+    let mut at = start;
+    std::iter::from_fn(move || {
+        let (ty, width) = WIDTHS.into_iter().find(|&(_, width)| at % width == 0 && at + width <= end)?;
+        let chunk = (ty, at as i32);
+        at += width;
+        Some(chunk)
+    })
+}
+
+fn word_parts(size: u64) -> Parts {
+    if !(1..=32).contains(&size) {
+        return Parts::Bytes;
+    }
+    table(span_chunks(0, size))
+}
+
 /// Breaks `size` (`1..=32`) into up to four `I64` words when `word_parts` overflows four exact power-of-two chunks.
 pub(super) fn packed_word_parts(size: u32) -> Parts {
     match word_parts(u64::from(size)) {
-        Parts::Bytes if (1..=32).contains(&size) => {
-            let mut words = [(Type::I8, 0); 4];
-            let len = size.div_ceil(8) as usize;
-            for (i, slot) in words[..len].iter_mut().enumerate() {
-                *slot = (Type::I64, (i * 8) as i32);
-            }
-            Parts::Words(words, len as u8)
-        }
+        Parts::Bytes if (1..=32).contains(&size) => table(eightbytes(size)),
         found => found,
     }
 }
 
-fn simd_vec_type(element: &Scalar, count: BackendLaneCount) -> Option<Type> {
+/// The integer chunks of a memory value of at most two words, cut at each field, variant field and tag boundary so each field is its own part.
+fn field_parts(layout: &Layout) -> Parts {
+    let size = layout.size.bytes();
+    let Ok(dl) = target() else { return word_parts(size) };
+    if !(1..=16).contains(&size) || matches!(layout.fields, FieldsShape::Union(_)) {
+        return word_parts(size);
+    }
+    let mut cuts = vec![0, size];
+    if let FieldsShape::Arbitrary { offsets, .. } = &layout.fields {
+        cuts.extend(offsets.iter().map(|offset| offset.bytes()));
+    }
+    if let Variants::Multiple { tag, tag_field, variants, .. } = &layout.variants {
+        let at = layout.fields.offset(tag_field.index()).bytes();
+        cuts.extend([at, at + tag.primitive().size(dl).bytes()]);
+        cuts.extend(variants.iter().flat_map(|variant| variant.field_offsets.iter().map(|offset| offset.bytes())));
+    }
+    cuts.retain(|&cut| cut <= size);
+    cuts.sort_unstable();
+    cuts.dedup();
+    match table(cuts.windows(2).flat_map(|span| span_chunks(span[0], span[1]))) {
+        Parts::Bytes => word_parts(size),
+        found => found,
+    }
+}
+
+fn simd_vec_type(element: &Scalar, count: impl FnOnce(Lane) -> u64) -> Option<Type> {
     let dl = target().ok()?;
     let scalar = scalar_type(dl, element).ok()?;
     let lane = Lane::from_type(scalar)?;
-    let count = u8::try_from(count.as_u64()).ok()?;
+    let count = u8::try_from(count(lane)).ok()?;
     let ty = Type::Vec { lane, count };
     ty.is_valid_vec().then_some(ty)
 }
 
-/// The parts that a typed copy of a value of `layout` moves: its scalars, or contiguous word chunks up to 32 bytes when both scalars are a union's or the layout names none.
+fn simd_parts(element: &Scalar, count: BackendLaneCount, size: u64) -> Parts {
+    let native = matches!(Target::host().arch, Arch::X64 | Arch::Arm64);
+    let half = || simd_vec_type(element, |lane| u64::from(16 / lane.bytes())).filter(|_| native);
+    match (simd_vec_type(element, |_| count.as_u64()).filter(|_| native), size) {
+        (Some(ty), _) => Parts::One(ty),
+        (None, 8) => Parts::One(Type::I64),
+        (None, 16) => Parts::Pair(Type::I64, Type::I64, 8),
+        (None, 32) => half().map_or(Parts::Bytes, |half| match half.double_vec().filter(|wide| wide.is_register_vec(Target::host())) {
+            Some(wide) => Parts::One(wide),
+            None => Parts::Pair(half, half, 16),
+        }),
+        (None, 64) => half().map_or(Parts::Bytes, |half| Parts::Words([(half, 0), (half, 16), (half, 32), (half, 48)], 4)),
+        _ => Parts::Bytes,
+    }
+}
+
+/// The parts that a typed copy of a value of `layout` moves: its scalars, the whole of a vector that fills one register, the 16-byte halves of a wider one, or contiguous word chunks up to 32 bytes when both scalars are a union's, or chunks cut at its field and tag boundaries when the layout names none.
 pub(super) fn copied_parts(layout: &Layout) -> Parts {
     match &layout.backend_repr {
         BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => word_parts(layout.size.bytes()),
-        BackendRepr::SimdVector { element, count } => match simd_vec_type(element, *count) {
-            Some(ty) if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Parts::One(ty),
-            _ => match layout.size.bytes() {
-                8 => Parts::One(Type::I64),
-                16 => Parts::Pair(Type::I64, Type::I64, 8),
-                _ => Parts::Bytes,
-            },
-        },
+        BackendRepr::SimdVector { element, count } => simd_parts(element, *count, layout.size.bytes()),
         _ => match parts(layout).unwrap_or(Parts::Bytes) {
-            Parts::Bytes => word_parts(layout.size.bytes()),
+            Parts::Bytes => field_parts(layout),
             found => found,
         },
     }
@@ -218,7 +448,7 @@ fn x64_eightbytes(leaves: Option<&[(Type, i32)]>, size: u32) -> Passed {
 
 fn simd_native_type(element: &Scalar, count: BackendLaneCount, size: u32, arch: Arch) -> Result<Type> {
     if matches!(arch, Arch::X64 | Arch::Arm64)
-        && let Some(vec_ty) = simd_vec_type(element, count)
+        && let Some(vec_ty) = simd_vec_type(element, |_| count.as_u64())
     {
         return Ok(vec_ty);
     }
@@ -288,12 +518,17 @@ impl Lower<'_, '_> {
                 } else {
                     args.push(value);
                 }
-                signature.params.extend(parts.iter().map(|&(ty, _)| AbiParam::new(ty)));
+                signature.params.extend(parts.iter().map(|&(ty, off)| apply_param_provenance(self.cx, AbiParam::new(ty), param, off)));
             }
             NativePass::Indirect => {
                 let whole = repr(self.cx, param)?;
+                let size = match whole {
+                    Repr::Mem { size, .. } => size,
+                    _ => 0,
+                };
                 args.push(self.snapshot_repr(whole, value));
-                signature.params.push(AbiParam::new(Type::I64));
+                let abi = AbiParam::new(Type::I64).with_noalias();
+                signature.params.push(if size > 0 { abi.with_deref_size(size) } else { abi });
             }
             NativePass::ByVal(size) => {
                 args.push(value);
@@ -310,7 +545,12 @@ impl Lower<'_, '_> {
         let ret_repr = repr(self.cx, ret_ty)?;
         let slot = self.slot(ret_repr);
         if let Some(slot) = slot {
-            signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn));
+            let size = match ret_repr {
+                Repr::Mem { size, .. } => size,
+                Repr::Scalar(ty) => ty.bytes(),
+                Repr::Zst => 0,
+            };
+            signature.params.push(sret_param(size));
             args.push(self.ins().stack_addr(Type::I64, slot, 0));
         }
         Ok(slot)

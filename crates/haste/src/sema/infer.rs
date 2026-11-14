@@ -3,6 +3,7 @@ mod array;
 mod assign;
 mod assoc;
 mod call;
+mod callable;
 mod clone;
 mod closure;
 mod coerce;
@@ -28,6 +29,7 @@ mod tables;
 mod zonk;
 
 pub use adt::{Fields, field_types, maybe_unsized};
+pub(in crate::sema) use callable::callable_method_name;
 pub(in crate::sema) use adt::{body_relaxes_sized, param_relaxes_sized};
 pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, register};
@@ -118,7 +120,7 @@ pub struct Infer<'c, 'a> {
     projections: Vec<project::Projection>,
     opaques: Vec<opaque::Opaque>,
     operands: Vec<(ExprId, crate::body::BinOp, (Ty, Ty), Ty)>,
-    casts: Vec<(Ty, Ty)>,
+    casts: Vec<(ExprId, Ty, Ty)>,
     param_origins: Vec<(u32, &'a str)>,
     receiver_param: Option<&'a str>,
     try_blocks: Vec<(ExprId, Ty)>,
@@ -140,6 +142,7 @@ pub struct Infer<'c, 'a> {
     evaluating: Vec<ItemRef>,
     proved: rustc_hash::FxHashSet<(ItemRef, Substs)>,
     imports: HashMap<(ItemRef, Option<crate::names::Sym>, Vec<u32>), Vec<crate::names::PerNs>>,
+    method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
 }
 
@@ -166,6 +169,15 @@ struct Clash {
 
 /// Infers the body of the function `item` with its generic parameters set to `substs`.
 pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Typed> {
+    infer_with_hints(cx, item, substs, None)
+}
+
+pub(super) fn infer_with_hints(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    substs: Substs,
+    method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
+) -> Result<Typed> {
     if let Some(typed) = compiler_made(cx, item, substs)? {
         return Ok(typed);
     }
@@ -178,7 +190,7 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Type
     let root = Some(item.body_owner());
     let args = cx.types.substs(substs).to_vec();
     let mut infer = Infer::start(cx, (&body, &sig, src), home);
-    (infer.root, infer.instance) = (root, Some((item, substs)));
+    (infer.root, infer.instance, infer.method_hints) = (root, Some((item, substs)), method_hints);
     let mut frame = infer.frame(item, &args)?;
     (frame.src, frame.root) = (src, root);
     infer.swap_frame(frame);
@@ -210,7 +222,7 @@ pub struct Awaited {
 }
 
 pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Option<Typed>> {
-    if matches!(cx.item(item).1.kind, crate::outline::item::ItemKind::Struct | crate::outline::item::ItemKind::Enum) {
+    if adt::is_ctor(cx, item) {
         return adt::ctor_typed(cx, item, substs).map(Some);
     }
     let slice = cx.types.substs(substs);
@@ -225,10 +237,14 @@ pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs)
     if cx.lang(item) == Some("poll") && cx.ensure_closure(ty).is_some_and(|info| info.closure.coroutine) {
         return closure::coroutine_typed(cx, item, ty).map(Some);
     }
-    let (once, by_ref) = (cx.call_once() == Some(item), closure::by_reference(cx, item).is_some());
+    let (once, by_ref, async_once) = (
+        cx.call_once() == Some(item),
+        closure::by_reference(cx, item).is_some(),
+        callable::is_async_call_once(cx, item),
+    );
     match cx.types.kind(ty) {
         Kind::Closure(..) if once => closure::closure_typed(cx, ty).map(Some),
-        Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) if once || by_ref => closure::untuple_typed(cx, item, substs).map(Some),
+        Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) if once || by_ref || async_once => closure::untuple_typed(cx, item, substs).map(Some),
         _ => Ok(None),
     }
 }
@@ -281,6 +297,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             evaluating: Vec::new(),
             proved: rustc_hash::FxHashSet::default(),
             imports: HashMap::default(),
+            method_hints: None,
             poly: None,
         }
     }

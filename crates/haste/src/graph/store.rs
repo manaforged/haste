@@ -2,13 +2,16 @@
 
 use std::fs::File;
 use std::hash::BuildHasher as _;
-use std::io;
+use std::io::{self, Write as _};
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::script::Output;
 use super::{Side, Workspace};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 const STAMP: &str = "stamp";
 const OUTPUT: &str = "output";
@@ -145,9 +148,33 @@ fn remove(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Drops the stamp of `unit` before its script runs again, so an interrupted run leaves no output that looks current.
+fn make_writable(path: &Path) -> io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if meta.is_dir() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.mode() | 0o700))?;
+        for entry in std::fs::read_dir(path)? {
+            make_writable(&entry?.path())?;
+        }
+    } else if !meta.file_type().is_symlink() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.mode() | 0o600))?;
+    }
+    Ok(())
+}
+
+/// Drops the stamp and clears `out/` of `unit` before its script runs again, so an interrupted run leaves no stale or read-only output.
 pub fn forget(workspace: &Workspace, unit: usize) -> io::Result<()> {
-    remove(&dir(workspace, unit).join(STAMP))
+    let unit_dir = dir(workspace, unit);
+    remove(&unit_dir.join(STAMP))?;
+    let out_dir = unit_dir.join("out");
+    if std::fs::symlink_metadata(&out_dir).is_ok() {
+        make_writable(&out_dir)?;
+        std::fs::remove_dir_all(&out_dir)?;
+    }
+    Ok(())
 }
 
 /// An exclusive hold on the entry of one unit, so two runs never run the same script into one `OUT_DIR` at once; dropping it lets go.
@@ -167,15 +194,41 @@ pub fn lock(workspace: &Workspace, unit: usize) -> io::Result<Lock> {
     Ok(Lock { _file: file })
 }
 
-pub(crate) fn write_new(path: &Path, text: &str) -> io::Result<()> {
-    let fresh = fresh(path);
-    std::fs::write(&fresh, text)?;
-    std::fs::rename(&fresh, path)
+fn replace_with(path: &Path, stage: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = fresh(path);
+    if let Err(err) = stage(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| drop(std::fs::remove_file(&tmp)))
+}
+
+/// Atomically writes `bytes` to `path` via a unique sibling temporary file and rename.
+pub fn write_new_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    replace_with(path, |tmp| {
+        let mut file = File::create(tmp)?;
+        file.write_all(bytes)?;
+        Ok(())
+    })
+}
+
+/// Atomically writes `bytes` to `path` via a unique sibling temporary file and rename.
+pub(crate) fn write_new(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
+    write_new_bytes(path, bytes.as_ref())
+}
+
+/// Atomically replaces symlink `path` with a link pointing to `target`.
+pub(crate) fn replace_symlink(target: &std::ffi::OsStr, path: &Path) -> io::Result<()> {
+    replace_with(path, |tmp| std::os::unix::fs::symlink(target, tmp))
 }
 
 /// The path this process writes `path` at before it renames the file into place, so no reader sees it half written.
 pub(crate) fn fresh(path: &Path) -> PathBuf {
-    path.with_extension(format!("{}", std::process::id()))
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{seq}", std::process::id()))
 }
 
 /// The hash of the variables a script ran with and of this program, whose compile of the script decides what it prints.

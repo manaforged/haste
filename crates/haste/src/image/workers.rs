@@ -1,20 +1,27 @@
 //! Compile workers: scoped threads that each encode a fixed share of the reached functions, grouped by footprint into stencils, into thread-local code chunks merged into the image.
 
-use std::cmp::Reverse;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::lower::{self, Slots};
+use crate::lower::{self, FootprintId, RelocPlan, Slots, SymbolSource};
 use crate::names::ItemRef;
 use crate::sema::Context;
 use crate::sema::reach::{Instance, Reached};
+use crate::substrate::tally::{Tally, clock, tally};
+use crate::sync::lock;
+use haste_codegen::Code;
 
-use super::stencil::DictConfig;
-use super::{Image, Pass};
+use super::aot::{self, AotCode, AotFn, AotQueue, CachedAotTemplate, bucket_by_item, lpt_chunks};
+use super::stencil::{DictConfig, DistinctInst, GroupWork, aot_relocs_valid, item_err, mode_dict_key, mode_stencil_key};
+use super::{Image, ImageMode, Pass, resolve_host_symbol, weak};
 
 const MIN_PARALLEL: usize = 64;
+const AOT_MIN_PARALLEL: usize = 2;
 const MAX_BUCKET: usize = 128;
+const AOT_MAX_BUCKET: usize = 64;
 const MAX_PARALLEL_WAVES: usize = 4;
 
 /// What one worker hands back: its pass, the errors by index, the functions whose constant evaluations it deferred, and the requested evals.
@@ -24,23 +31,11 @@ type WorkerOutput = (Pass, Vec<(usize, String)>, Vec<usize>, Vec<(Instance, u32)
 type Plan = (DictConfig, bool);
 
 fn bucket_work(reached: &Reached, work: &[usize]) -> Vec<Vec<usize>> {
-    let mut pos_map: FxHashMap<ItemRef, usize> = FxHashMap::default();
-    let mut buckets: Vec<Vec<usize>> = Vec::new();
-    for &index in work {
-        let item = reached.list[index].0.0;
-        if let Some(&pos) = pos_map.get(&item) {
-            buckets[pos].push(index);
-        } else {
-            pos_map.insert(item, buckets.len());
-            buckets.push(vec![index]);
-        }
-    }
-    buckets
+    bucket_by_item(work, |index| reached.list[index].0.0)
 }
 
 fn lpt_shards(buckets: Vec<Vec<usize>>, jobs: usize) -> Vec<Vec<Vec<usize>>> {
-    let mut chunks: Vec<Vec<usize>> = buckets.into_iter().flat_map(|b| if b.len() <= MAX_BUCKET { vec![b] } else { b.chunks(MAX_BUCKET).map(|c| c.to_vec()).collect() }).collect();
-    chunks.sort_by_key(|b| Reverse(b.len()));
+    let chunks = lpt_chunks(buckets, MAX_BUCKET);
     let count = jobs.min(chunks.len());
     let mut loads = vec![0usize; count];
     let mut shards: Vec<Vec<Vec<usize>>> = (0..count).map(|_| Vec::new()).collect();
@@ -50,6 +45,18 @@ fn lpt_shards(buckets: Vec<Vec<usize>>, jobs: usize) -> Vec<Vec<Vec<usize>>> {
         shards[part].push(chunk);
     }
     shards
+}
+
+fn seed_aot_roots(reached: &Reached, roots: [usize; 2]) -> (Vec<AtomicBool>, Vec<usize>) {
+    let claimed: Vec<AtomicBool> = (0..reached.list.len()).map(|_| AtomicBool::new(false)).collect();
+    let mut seed = Vec::new();
+    for root in roots {
+        if root < claimed.len() && !claimed[root].swap(true, Ordering::AcqRel) {
+            seed.push(root);
+        }
+    }
+    seed.sort_unstable();
+    (claimed, seed)
 }
 
 impl Image {
@@ -68,6 +75,22 @@ impl Image {
         }
     }
 
+    fn persist_inline(&self, cfg: DictConfig) {
+        if !self.backend.is_lazy_jit() && crate::prep::decided().is_none() {
+            self.bodies.persist(mode_stencil_key(self.backend.mode(), 0), cfg.verify);
+        }
+    }
+
+    /// Whether this image recorded inline template outcomes that the substrate does not hold yet.
+    pub(crate) fn has_new_inline_meta(&self) -> bool {
+        self.bodies.has_fresh_meta()
+    }
+
+    /// Appends the inline template outcomes this image recorded for sysroot items into `toolchain` and for dependency items into `deps`.
+    pub(crate) fn export_inline_meta(&self, toolchain: Option<&mut crate::substrate::SubstrateBuilder>, deps: Option<&mut crate::substrate::SubstrateBuilder>) -> Result<()> {
+        self.bodies.export_meta(toolchain, deps)
+    }
+
     /// Compiles every function of `work` through stencils, split across scoped worker threads when there is enough of it, and returns the errors by index.
     pub(super) fn compile_all(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize]) -> Vec<(usize, String)> {
         if work.is_empty() {
@@ -78,11 +101,12 @@ impl Image {
         }
         let cfg = DictConfig::from_env();
         self.pass.stencils.cfg = cfg;
+        self.persist_inline(cfg);
         let block_parallel = !self.pass.stencils.templates.is_empty() && !self.backend.is_aot();
         let plan = (cfg, !block_parallel && !cfg.verify && cfg.min_fanout > 1);
         let buckets = bucket_work(reached, work);
         let jobs = crate::jobs();
-        let min_parallel = if self.backend.is_aot() { 4 } else { MIN_PARALLEL };
+        let min_parallel = if self.backend.is_aot() { AOT_MIN_PARALLEL } else { MIN_PARALLEL };
         if jobs <= 1 || cfg.verify || work.len() < min_parallel || block_parallel {
             return self.compile_buckets(cx, reached, &buckets, plan);
         }
@@ -110,7 +134,7 @@ impl Image {
         let mut errors = Vec::new();
         let mut current_shards = initial_shards.to_vec();
         let jobs = crate::jobs();
-        let min_parallel = if self.backend.is_aot() { 4 } else { MIN_PARALLEL };
+        let min_parallel = if self.backend.is_aot() { AOT_MIN_PARALLEL } else { MIN_PARALLEL };
         let mut deferred = Vec::new();
         for wave in 0..MAX_PARALLEL_WAVES {
             let forks: Vec<Context<'_>> = current_shards.iter().map(|_| cx.fork()).collect();
@@ -131,14 +155,7 @@ impl Image {
             if deferred.is_empty() || eval_requests.is_empty() || wave + 1 == MAX_PARALLEL_WAVES || deferred.len() < min_parallel {
                 break;
             }
-            let was_parallel = std::mem::replace(&mut cx.in_parallel, false);
-            let mut seen = FxHashSet::default();
-            for (inst, bits) in eval_requests {
-                if seen.insert((inst, bits)) {
-                    crate::sema::evaluate::prime(cx, &inst, bits);
-                }
-            }
-            cx.in_parallel = was_parallel;
+            prime_eval_requests(cx, eval_requests);
             let next_shards = lpt_shards(bucket_work(reached, &deferred), jobs);
             if next_shards.len() <= 1 {
                 break;
@@ -179,21 +196,539 @@ impl Image {
         pass.stencils.cfg = cfg;
         let (mut errors, mut deferred, mut eval_requests) = (Vec::new(), Vec::new(), Vec::new());
         for bucket in shard {
-            let mark = pass.records.len();
-            let frozen_mark = pass.frozen_stencils.len();
-            let failed = self.compile_bucket(&mut cx, reached, bucket, cfg, (false, allow_singleton), &mut pass);
-            let reqs = cx.take_deferred_evals();
-            if reqs.is_empty() {
-                errors.extend(failed);
-                self.bodies.trim_transient();
-                continue;
-            }
+            self.compile_worker_bucket(&mut cx, reached, bucket, (cfg, allow_singleton), &mut pass, (&mut errors, &mut deferred, &mut eval_requests));
+        }
+        (pass, errors, deferred, eval_requests)
+    }
+
+    fn compile_worker_bucket(&self, cx: &mut Context<'_>, reached: &Reached, bucket: &[usize], (cfg, allow_singleton): Plan, pass: &mut Pass, (errors, deferred, eval_requests): (&mut Vec<(usize, String)>, &mut Vec<usize>, &mut Vec<(Instance, u32)>)) {
+        let mark = pass.records.len();
+        let frozen_mark = pass.frozen_stencils.len();
+        let failed = self.compile_bucket(cx, reached, bucket, cfg, (false, allow_singleton), pass);
+        let reqs = cx.take_deferred_evals();
+        if reqs.is_empty() {
+            errors.extend(failed);
+        } else {
             pass.records.truncate(mark);
             pass.frozen_stencils.truncate(frozen_mark);
             deferred.extend_from_slice(bucket);
             eval_requests.extend(reqs);
-            self.bodies.trim_transient();
+        }
+        self.bodies.trim_transient();
+    }
+
+    pub(super) fn build_aot_streaming(cx: &mut Context<'_>, reached: &Reached, roots: [usize; 2]) -> Result<(Image, FxHashMap<usize, String>)> {
+        let mut image = Self::create(reached, ImageMode::Aot, (0, 0, 0))?;
+        let cfg = DictConfig::from_env();
+        image.pass.stencils.cfg = cfg;
+        image.persist_inline(cfg);
+        let plan = (cfg, !cfg.verify && cfg.min_fanout > 1);
+        let (claimed, seed) = seed_aot_roots(reached, roots);
+        let mut broken = FxHashMap::default();
+        let mut init_errors = Vec::new();
+        let work = image.prepare_work(cx, reached, &seed, &mut init_errors);
+        for (idx, err) in init_errors {
+            broken.insert(idx, err);
+        }
+        let items: Box<[ItemRef]> = reached.list.iter().map(|((item, _), _)| *item).collect();
+        let queue = AotQueue::new(claimed, items, AOT_MAX_BUCKET, lpt_chunks(bucket_work(reached, &work), AOT_MAX_BUCKET));
+        if let Some(aot) = image.aot() {
+            lock(aot).frontier = Some(Arc::clone(&queue));
+        }
+        let jobs = crate::jobs();
+        let mut deferred = Vec::new();
+        if jobs <= 1 || cfg.verify {
+            image.drain_aot_serial(cx, reached, &queue, plan, &mut broken);
+        } else {
+            for wave in 0..MAX_PARALLEL_WAVES {
+                let outputs = image.run_aot_workers(cx, reached, &queue, jobs, plan);
+                deferred.clear();
+                let mut eval_requests = Vec::new();
+                for output in outputs {
+                    match output {
+                        Some((pass, failed, later, reqs)) => {
+                            image.pass.merge(pass);
+                            for (idx, err) in failed {
+                                broken.insert(idx, err);
+                            }
+                            deferred.extend(later);
+                            eval_requests.extend(reqs);
+                        }
+                        None => return Err(anyhow::anyhow!("AOT compile worker panicked")),
+                    }
+                }
+                image.apply_records();
+                if deferred.is_empty() || eval_requests.is_empty() {
+                    break;
+                }
+                prime_eval_requests(cx, eval_requests);
+                if wave + 1 == MAX_PARALLEL_WAVES || deferred.len() < AOT_MIN_PARALLEL {
+                    break;
+                }
+                deferred.sort_unstable();
+                queue.reseed_buckets(lpt_chunks(bucket_work(reached, &deferred), AOT_MAX_BUCKET));
+            }
+            if !deferred.is_empty() {
+                deferred.sort_unstable();
+                queue.reseed_buckets(lpt_chunks(bucket_work(reached, &deferred), AOT_MAX_BUCKET));
+                let was_parallel = std::mem::replace(&mut cx.in_parallel, false);
+                image.drain_aot_serial(cx, reached, &queue, plan, &mut broken);
+                cx.in_parallel = was_parallel;
+            }
+        }
+        if let Some(aot) = image.aot() {
+            let mut state = lock(aot);
+            state.frontier = None;
+            state.stencils.clear();
+        }
+        image.bodies.reset();
+        image.pass.stencils.clear();
+        Ok((image, broken))
+    }
+
+    fn drain_aot_serial(&mut self, cx: &mut Context<'_>, reached: &Reached, queue: &AotQueue, plan: Plan, broken: &mut FxHashMap<usize, String>) {
+        loop {
+            let mut batch = queue.take_all_pending();
+            if batch.is_empty() {
+                break;
+            }
+            batch.sort_unstable();
+            let mut batch_errors = Vec::new();
+            let work = self.prepare_work(cx, reached, &batch, &mut batch_errors);
+            for (idx, err) in batch_errors {
+                broken.insert(idx, err);
+            }
+            let buckets = lpt_chunks(bucket_work(reached, &work), AOT_MAX_BUCKET);
+            for (idx, err) in self.compile_buckets(cx, reached, &buckets, plan) {
+                broken.insert(idx, err);
+            }
+        }
+        self.apply_records();
+    }
+
+    fn run_aot_workers(&self, cx: &Context<'_>, reached: &Reached, queue: &AotQueue, jobs: usize, plan: Plan) -> Vec<Option<WorkerOutput>> {
+        let forks: Vec<Context<'_>> = (0..jobs).map(|_| cx.fork()).collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = forks.into_iter().map(|fork| scope.spawn(move || self.aot_worker_loop(fork, reached, queue, plan))).collect();
+            handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect()
+        })
+    }
+
+    fn aot_worker_loop(&self, mut cx: Context<'_>, reached: &Reached, queue: &AotQueue, (cfg, allow_singleton): Plan) -> WorkerOutput {
+        let mut pass = Pass::default();
+        pass.stencils.cfg = cfg;
+        let (mut errors, mut deferred, mut eval_requests) = (Vec::new(), Vec::new(), Vec::new());
+        while let Some((batch, _guard)) = queue.pop() {
+            let mut batch_errors = Vec::new();
+            let work = self.prepare_work(&mut cx, reached, &batch, &mut batch_errors);
+            errors.extend(batch_errors);
+            if !work.is_empty() {
+                self.compile_worker_bucket(&mut cx, reached, &work, (cfg, allow_singleton), &mut pass, (&mut errors, &mut deferred, &mut eval_requests));
+            }
         }
         (pass, errors, deferred, eval_requests)
     }
+
+    pub(super) fn prepare_work(&self, cx: &mut Context<'_>, reached: &Reached, indices: &[usize], errors: &mut Vec<(usize, String)>) -> Vec<usize> {
+        self.bind_foreign_statics(cx, reached, indices);
+        let mut work = Vec::new();
+        let mut foreign_fns = Vec::new();
+        for &index in indices {
+            if reached.list[index].1.is_err() {
+                continue;
+            }
+            let item = reached.list[index].0.0;
+            if !cx.foreign(item) {
+                work.push(index);
+                continue;
+            }
+            match resolve_host_symbol(cx, item) {
+                Ok((sym, address)) if !lower::is_static(cx, item) => {
+                    if self.backend.is_jit() {
+                        self.slot(index).store(address, Ordering::Release);
+                    }
+                    if self.aot().is_some() {
+                        foreign_fns.push((index, sym));
+                    }
+                }
+                Ok(_) => {}
+                Err(_) if lower::is_static(cx, item) && weak(cx, item) => {}
+                Err(error) => errors.push((index, error)),
+            }
+        }
+        if !foreign_fns.is_empty()
+            && let Some(aot) = self.aot()
+        {
+            let mut state = lock(aot);
+            for (index, sym) in foreign_fns {
+                state.foreign_fns.insert(index, sym);
+            }
+        }
+        self.place_statics(cx, reached, &work);
+        work
+    }
+
+    pub(super) fn bind_foreign_statics(&self, cx: &Context<'_>, reached: &Reached, indices: &[usize]) {
+        let jit = self.backend.is_jit();
+        let mut cells_batch = Vec::new();
+        let mut aot_batch = Vec::new();
+        for (index, ((item, _), typed)) in indices.iter().map(|&index| (index, &reached.list[index])) {
+            if typed.is_err() || !cx.foreign(*item) || !lower::is_static(cx, *item) {
+                continue;
+            }
+            let resolved = resolve_host_symbol(cx, *item);
+            let is_weak = weak(cx, *item);
+            let host = match (&resolved, is_weak) {
+                (Ok((host, _)), _) => Some(host.clone()),
+                (Err(_), true) => None,
+                (Err(_), false) => continue,
+            };
+            if jit {
+                let cell = match (resolved, is_weak) {
+                    (Ok((_, address)), true) => self.data(&address.to_le_bytes()),
+                    (Err(_), true) => self.data(&0_usize.to_le_bytes()),
+                    (Ok((_, address)), false) => address as i64,
+                    (Err(_), false) => continue,
+                };
+                cells_batch.push((index, cell));
+            }
+            if self.aot().is_some() {
+                aot_batch.push((index, aot::AotStatic::Foreign { weak: is_weak, host }));
+            }
+        }
+        if !cells_batch.is_empty() {
+            let mut cells = lock(&self.cells);
+            for (index, cell) in cells_batch {
+                cells.insert(index, cell);
+            }
+        }
+        if !aot_batch.is_empty()
+            && let Some(aot) = self.aot()
+        {
+            let mut state = lock(aot);
+            for (index, entry) in aot_batch {
+                state.statics.insert(index, entry);
+            }
+        }
+    }
+
+    pub(super) fn compile_partitioned(&self, cx: &mut Context<'_>, reached: &Reached, work: &[usize], cfg: DictConfig, record_cache: bool, pass: &mut Pass) -> Vec<(usize, String)> {
+        let mut errors = Vec::new();
+        let mut order: Vec<(ItemRef, FootprintId)> = Vec::new();
+        let mut by_fp: FxHashMap<(ItemRef, FootprintId), Vec<usize>> = FxHashMap::default();
+        let footprint_clock = std::time::Instant::now();
+        for &index in work {
+            let item = reached.list[index].0.0;
+            let footprint = match lower::eval_footprint(cx, reached, self, index) {
+                Ok(fp) => fp,
+                Err(err) => {
+                    errors.push((index, item_err(cx, item, &err)));
+                    continue;
+                }
+            };
+            by_fp.entry((item, footprint)).or_insert_with(|| {
+                order.push((item, footprint));
+                Vec::new()
+            }).push(index);
+        }
+        clock(Tally::FootprintUs, footprint_clock);
+        let mut verify_hits = Vec::new();
+        let aot_fast = self.backend.is_aot() && !cfg.verify;
+        for (item, footprint) in order {
+            let Some(indices) = by_fp.remove(&(item, footprint)) else { continue };
+            if record_cache && let Some(reloc_plan) = pass.stencils.templates.get(&(item, footprint)).map(|t| Arc::clone(t.reloc_plan())) {
+                for index in indices {
+                    let relocs = match lower::eval_relocs(cx, reached, self, &reloc_plan, index) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            errors.push((index, item_err(cx, item, &err)));
+                            continue;
+                        }
+                    };
+                    let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+                    if let Some(hit) = self.reuse_cached((item, footprint), index, &symbols, self.backend.is_aot().then_some(&relocs), pass)
+                        && cfg.verify
+                    {
+                        verify_hits.push((index, hit));
+                    }
+                }
+                continue;
+            }
+            if aot_fast && let Some(cached) = self.cached_aot_template(item, footprint) {
+                self.apply_cached_aot_template(cx, reached, item, &indices, &cached, pass, &mut errors);
+                continue;
+            }
+            let Some((&rep, rest)) = indices.split_first() else { continue };
+            let lookup_clock = std::time::Instant::now();
+            let frozen = self.try_frozen_partitioned(cx, reached, item, footprint, rep, rest, &indices, cfg, pass);
+            clock(Tally::LookupUs, lookup_clock);
+            if frozen {
+                continue;
+            }
+            let lower_clock = std::time::Instant::now();
+            let lowered = lower::lower_stencil(cx, reached, self, rep);
+            clock(Tally::LowerUs, lower_clock);
+            let out = match lowered {
+                Ok(out) => out,
+                Err(err) => {
+                    let msg = item_err(cx, item, &err);
+                    errors.extend(indices.into_iter().map(|idx| (idx, msg.clone())));
+                    continue;
+                }
+            };
+            let distinct = self.group_instances(cx, reached, item, &out, rep, rest, aot_fast, &mut errors);
+            let mut group = GroupWork { item, footprint, distinct, leader_out: Some(out) };
+            if let Err(err) = self.compile_group(cx, reached, &mut group, cfg, record_cache, pass) {
+                errors.extend(group.all_indices().map(|idx| (idx, err.clone())));
+            }
+            drop(group);
+            self.bodies.trim_transient();
+        }
+        if cfg.verify {
+            errors.extend(self.verify_records(cx, reached, &verify_hits));
+        }
+        errors
+    }
+
+    fn apply_cached_aot_template(&self, cx: &mut Context<'_>, reached: &Reached, item: ItemRef, indices: &[usize], cached: &CachedAotTemplate, pass: &mut Pass, errors: &mut Vec<(usize, String)>) {
+        let mut evaluated = Vec::with_capacity(indices.len());
+        for &index in indices {
+            match lower::eval_relocs(cx, reached, self, cached.reloc_plan(), index) {
+                Ok(relocs) => evaluated.push((index, relocs)),
+                Err(err) => errors.push((index, item_err(cx, item, &err))),
+            }
+        }
+        if !cx.deferred_evals.is_empty() {
+            return;
+        }
+        self.commit_aot_groups(&evaluated, cached, 0, pass);
+    }
+
+    fn try_frozen_partitioned(&self, cx: &mut Context<'_>, reached: &Reached, item: ItemRef, footprint: FootprintId, rep: usize, rest: &[usize], indices: &[usize], cfg: DictConfig, pass: &mut Pass) -> bool {
+        if cfg.verify {
+            return false;
+        }
+        tally(Tally::Lookup);
+        let Some((is_sysroot, direct_key, fp_bits)) = self.frozen_stencil_key(cx, reached, rep, footprint) else {
+            tally(if footprint.is_portable() { Tally::MissUnkeyed } else { Tally::MissUnportable });
+            return false;
+        };
+        let Some(substrate) = cx.store().substrate().cloned() else {
+            tally(Tally::MissOther);
+            return false;
+        };
+        let mut reason = Tally::MissAbsent;
+        let prefer_dict = self.backend.is_aot() && cfg.min_bytes == 0 && indices.len() >= cfg.min_fanout;
+        if !prefer_dict && let Some(slice) = substrate.stencil(direct_key, fp_bits) {
+            if self.backend.is_check() {
+                let len = slice.code().len() as u32;
+                for &idx in indices {
+                    pass.record_size(idx, len, 0);
+                }
+                tally(Tally::Hit);
+                return true;
+            }
+            reason = Tally::MissOther;
+            if self.backend.is_aot() && let Ok(code) = slice.to_code().map(Arc::new) {
+                if code.relocs().iter().all(|r| r.symbol_index().is_none()) {
+                    let len = code.bytes().len() as u32;
+                    let aot_code = AotCode::from_code(&code);
+                    self.cache_aot_template(cx, reached, (item, footprint, rep), CachedAotTemplate::Direct { code: Arc::clone(&aot_code), reloc_plan: Arc::default() });
+                    self.record_aot(rep, AotFn::Direct { code: aot_code, relocs: Vec::new() }, rest);
+                    for &idx in indices {
+                        pass.record_size(idx, len, 0);
+                    }
+                    tally(Tally::Hit);
+                    return true;
+                }
+                match self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, slice.plan()).map(Arc::new) {
+                    Some(reloc_plan) => {
+                        if aot_relocs_valid(&code, reloc_plan.reloc_len())
+                            && self.try_commit_frozen_template(cx, reached, (item, footprint, rep), indices, CachedAotTemplate::Direct { code: AotCode::from_code(&code), reloc_plan }, 0, pass)
+                        {
+                            tally(Tally::Hit);
+                            return true;
+                        }
+                    }
+                    None => reason = Tally::MissPlan,
+                }
+            }
+        }
+        if self.backend.is_aot()
+            && indices.len() >= cfg.min_fanout
+            && let Some(slice) = substrate.stencil(mode_dict_key(direct_key), fp_bits)
+            && (prefer_dict || slice.code().len() > cfg.min_bytes)
+            && let Ok(code) = slice.to_code().map(Arc::new)
+        {
+            match self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, slice.plan()).map(Arc::new) {
+                Some(reloc_plan) => {
+                    let dict_len = code.bytes().len() as u32;
+                    let done = self.try_commit_frozen_template(cx, reached, (item, footprint, rep), indices, CachedAotTemplate::Dict { body: AotCode::from_code(&code), reloc_plan }, dict_len, pass);
+                    tally(if done { Tally::Hit } else { Tally::MissOther });
+                    return done;
+                }
+                None => reason = Tally::MissPlan,
+            }
+        }
+        tally(reason);
+        false
+    }
+
+    fn try_commit_frozen_template(&self, cx: &mut Context<'_>, reached: &Reached, key: (ItemRef, FootprintId, usize), indices: &[usize], cached: CachedAotTemplate, dict_len: u32, pass: &mut Pass) -> bool {
+        let mut evaluated = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let Ok(relocs) = lower::eval_relocs(cx, reached, self, cached.reloc_plan(), index) else {
+                return !cx.deferred_evals.is_empty();
+            };
+            evaluated.push((index, relocs));
+        }
+        if !cx.deferred_evals.is_empty() {
+            return true;
+        }
+        self.commit_aot_groups(&evaluated, &cached, dict_len, pass);
+        self.cache_aot_template(cx, reached, key, cached);
+        true
+    }
+
+    fn commit_aot_groups(&self, evaluated: &[(usize, Vec<SymbolSource>)], cached: &CachedAotTemplate, dict_len: u32, pass: &mut Pass) {
+        let mut reloc_pos: FxHashMap<&[SymbolSource], usize> = FxHashMap::default();
+        let mut groups: Vec<(usize, Vec<usize>, Vec<SymbolSource>)> = Vec::new();
+        let code_len = match cached {
+            CachedAotTemplate::Direct { code, .. } => code.bytes().len() as u32,
+            CachedAotTemplate::Dict { .. } => 0,
+        };
+        for (i, (index, relocs)) in evaluated.iter().enumerate() {
+            if let Some(&pos) = reloc_pos.get(relocs.as_slice()) {
+                groups[pos].1.push(*index);
+            } else {
+                reloc_pos.insert(relocs.as_slice(), groups.len());
+                groups.push((*index, Vec::new(), relocs.clone()));
+            }
+            let size = if i == 0 && dict_len > 0 { dict_len } else { code_len };
+            pass.record_size(*index, size, 0);
+        }
+        for (leader, followers, relocs) in groups {
+            self.register_aot_relocs(&relocs);
+            let entry = match cached {
+                CachedAotTemplate::Direct { code, .. } => AotFn::Direct { code: Arc::clone(code), relocs },
+                CachedAotTemplate::Dict { body, .. } => AotFn::Dict { body: Arc::clone(body), relocs },
+            };
+            self.record_aot(leader, entry, &followers);
+        }
+    }
+
+    pub(super) fn try_frozen_dict_group(&self, cx: &mut Context<'_>, reached: &Reached, group: &GroupWork, pass: &mut Pass) -> Option<Result<(), String>> {
+        let rep = group.representative();
+        let (is_sysroot, direct_key, fp_bits) = self.frozen_stencil_key(cx, reached, rep, group.footprint)?;
+        let slice = cx.store().substrate()?.stencil(mode_dict_key(direct_key), fp_bits)?;
+        let code = Arc::new(slice.to_code().ok()?);
+        let reloc_plan = Arc::new(self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, slice.plan())?);
+        let mut evaluated = Vec::with_capacity(group.distinct.len());
+        for inst in &group.distinct {
+            let relocs = lower::eval_relocs(cx, reached, self, &reloc_plan, inst.leader).ok()?;
+            if !cx.deferred_evals.is_empty() {
+                return Some(Ok(()));
+            }
+            evaluated.push((inst.leader, &inst.followers, relocs));
+        }
+        let body = AotCode::from_code(&code);
+        for (leader, followers, relocs) in evaluated {
+            self.register_aot_relocs(&relocs);
+            self.record_aot(leader, AotFn::Dict { body: Arc::clone(&body), relocs }, followers);
+            pass.record_size(leader, 0, 0);
+        }
+        pass.record_size(rep, code.bytes().len() as u32, 0);
+        self.cache_aot_template(cx, reached, (group.item, group.footprint, rep), CachedAotTemplate::Dict { body, reloc_plan });
+        tally(Tally::HitLowered);
+        Some(Ok(()))
+    }
+
+    pub(super) fn freeze_stencil(&self, cx: &Context<'_>, reached: &Reached, index: usize, fp: FootprintId, is_dict: bool, code: &Arc<Code>, plan: Option<&RelocPlan>, pass: &mut Pass) {
+        let valid_relocs = if is_dict {
+            code.relocs().iter().all(|r| r.as_runtime().is_some())
+        } else {
+            code.relocs().iter().all(|r| r.symbol_index().is_some() || (self.backend.is_aot() && r.as_runtime().is_some()))
+        };
+        if !cx.deferred_evals.is_empty() {
+            tally(Tally::FreezeDeferred);
+        } else if valid_relocs
+            && let Some((is_sysroot, direct_key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp)
+        {
+            let needs_plan = is_dict || code.relocs().iter().any(|r| r.symbol_index().is_some());
+            let plan_bytes = if self.backend.is_aot() && needs_plan {
+                match plan.and_then(|p| self.encode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, p)) {
+                    Some(bytes) => bytes,
+                    None if is_dict => {
+                        tally(Tally::FreezeSkipped);
+                        return;
+                    }
+                    None => {
+                        tally(Tally::FreezePlanless);
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let key = if is_dict { mode_dict_key(direct_key) } else { direct_key };
+            pass.frozen_stencils.push(super::FrozenStencil { is_sysroot, key, fp: fp_bits, code: Arc::clone(code), plan: plan_bytes });
+        } else {
+            tally(Tally::FreezeSkipped);
+        }
+    }
+
+    fn group_instances(&self, cx: &mut Context<'_>, reached: &Reached, item: ItemRef, out: &lower::StencilOutput, rep: usize, rest: &[usize], aot_fast: bool, errors: &mut Vec<(usize, String)>) -> Vec<DistinctInst> {
+        let mut sym_pos: FxHashMap<InstanceKey, usize> = FxHashMap::default();
+        let mut distinct: Vec<DistinctInst> = Vec::new();
+        let (rep_key, rep_inst) = self.build_inst(rep, out.relocs.clone(), aot_fast);
+        sym_pos.insert(rep_key, 0);
+        distinct.push(rep_inst);
+        for &index in rest {
+            let relocs = match lower::eval_relocs(cx, reached, self, &out.reloc_plan, index) {
+                Ok(r) => r,
+                Err(err) => {
+                    errors.push((index, item_err(cx, item, &err)));
+                    continue;
+                }
+            };
+            let (key, inst) = self.build_inst(index, relocs, aot_fast);
+            if let Some(&pos) = sym_pos.get(&key) {
+                distinct[pos].followers.push(index);
+            } else {
+                sym_pos.insert(key, distinct.len());
+                distinct.push(inst);
+            }
+        }
+        distinct
+    }
+
+    fn build_inst(&self, index: usize, relocs: Vec<SymbolSource>, aot_fast: bool) -> (InstanceKey, DistinctInst) {
+        if aot_fast {
+            self.register_aot_relocs(&relocs);
+            let inst = DistinctInst { leader: index, followers: Vec::new(), symbols: Vec::new(), relocs: Some(relocs.clone()) };
+            (InstanceKey::Relocs(relocs), inst)
+        } else {
+            let symbols: Vec<u64> = relocs.iter().map(|sym| self.symbol_value(sym)).collect();
+            let key = InstanceKey::Syms(symbols.clone());
+            let inst = DistinctInst { leader: index, followers: Vec::new(), symbols, relocs: self.backend.is_aot().then_some(relocs) };
+            (key, inst)
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum InstanceKey {
+    Relocs(Vec<SymbolSource>),
+    Syms(Vec<u64>),
+}
+
+fn prime_eval_requests(cx: &mut Context<'_>, eval_requests: Vec<(Instance, u32)>) {
+    let was_parallel = std::mem::replace(&mut cx.in_parallel, false);
+    let mut seen = FxHashSet::default();
+    for (inst, bits) in eval_requests {
+        if seen.insert((inst, bits)) {
+            crate::sema::evaluate::prime(cx, &inst, bits);
+        }
+    }
+    cx.in_parallel = was_parallel;
 }

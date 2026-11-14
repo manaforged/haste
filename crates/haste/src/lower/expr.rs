@@ -3,70 +3,20 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use haste_codegen::{Block, Signature, Type, Value};
 
-use crate::body::{Expr, ExprId, List, UnOp};
+use crate::body::{Body, Expr, ExprId, List, UnOp};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
-use crate::sema::infer::{Coercion, Res, Shape, SiteKey};
+use crate::sema::infer::{Coercion, Res, SiteKey};
 use crate::sema::reach::Reached;
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
 
+pub(super) use super::budget::inline_limit;
 use super::place::Place;
 use super::reloc::{RelocStep, SiteOrigin, TyOrigin};
-use super::stencil::{InlinedCallee, LowerMode, SymbolSource, resolve_inline};
+use super::stencil::{Form, InlinedCallee, LowerMode, SymbolSource, resolve_inline};
 use super::{Loop, Lower, Parts, Repr, repr};
-
-/// How large a sysroot body a call may copy inline under one build profile.
-struct Budget {
-    /// The most instructions a body may have, after slot promotion, for a call to copy it inline.
-    insts: usize,
-    /// The most instructions an `#[inline(always)]` body may have for a call to copy it inline.
-    always: usize,
-    /// The most source expressions a function body may have for lowering it to try `insts`.
-    exprs: usize,
-}
-
-/// The budget of the dev profile.
-const DEBUG_BUDGET: Budget = Budget { insts: 30, always: 100, exprs: 20 };
-
-/// The budget of the release profile.
-const RELEASE_BUDGET: Budget = Budget { insts: 400, always: 1000, exprs: 400 };
-
-/// The budget of the build profile.
-fn budget() -> &'static Budget {
-    match crate::profile() {
-        crate::outline::tree::Profile::Debug => &DEBUG_BUDGET,
-        crate::outline::tree::Profile::Release => &RELEASE_BUDGET,
-    }
-}
-
-/// Whether calls may copy bodies of the crate with `env` inline: the standard library's, and every crate under the release profile.
-fn inlinable(env: &crate::outline::tree::Env) -> bool {
-    env.release || crate::profile() == crate::outline::tree::Profile::Release
-}
-
-/// What an item's attributes ask of inlining.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Hint {
-    Default,
-    Inline,
-    Always,
-    Never,
-}
-
-/// The inlining hint of `item`: `#[inline(always)]`, `#[inline(never)]`/`#[cold]`, or `#[inline]`.
-fn hint(cx: &Context<'_>, item: ItemRef) -> Hint {
-    if cx.inline_always(item) {
-        Hint::Always
-    } else if cx.attr_value(item, "cold").is_some() || cx.attr_value(item, "inline") == Some("never") {
-        Hint::Never
-    } else if cx.attr_value(item, "inline").is_some() {
-        Hint::Inline
-    } else {
-        Hint::Default
-    }
-}
 
 /// What a call runs: code at an address, or reached function `index`, which may be copied inline.
 enum Callee {
@@ -85,66 +35,29 @@ pub fn can_inline_body(cx: &mut Context<'_>, reached: &Reached, slots: &dyn supe
         return false;
     }
     let Some(limit) = inline_limit(cx, reached, index) else { return false };
-    resolve_inline(cx, (reached, slots), &mut super::Inline::default(), index, limit).is_ok_and(|(callee, _)| callee.is_some())
+    resolve_inline(cx, (reached, slots), &mut super::Inline::default(), index, (limit, false)).is_ok_and(|(callee, _)| callee.is_some())
 }
 
-fn is_leaf_body(body: &crate::body::Body) -> bool {
-    !body.exprs.iter().any(|expr| matches!(expr, Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } | Expr::Await(..) | Expr::Yield(..)))
+fn unwrap_expr(body: &Body, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
+    loop {
+        match *body.expr(expr) {
+            Expr::Paren(inner) => expr = inner,
+            Expr::Block { stmts, tail: Some(inner), label: None, kind }
+                if body.list(stmts).is_empty()
+                    && (matches!(kind, crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion)
+                        || (allow_unsafe && kind == crate::body::BlockKind::Unsafe)) =>
+            {
+                expr = inner;
+            }
+            _ => return expr,
+        }
+    }
 }
 
-fn is_cold_or_never(cx: &Context<'_>, reached: &Reached, item: ItemRef, substs: Substs) -> bool {
-    if hint(cx, item) == Hint::Never {
-        return true;
-    }
-    reached
-        .index
-        .get(&(item, substs))
-        .and_then(|&idx| reached.list[idx].1.as_ref().ok())
-        .and_then(|callee| callee.ret)
-        .is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never))
-}
-
-/// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
-pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
-    let ((item, _), Ok(typed)) = &reached.list[index] else {
-        return None;
-    };
-    if cx.foreign(*item) {
-        return None;
-    }
-    let hint = hint(cx, *item);
-    if hint == Hint::Never || typed.ret.is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never)) {
-        return None;
-    }
-    let env = &cx.outline.crates[item.krate as usize].env;
-    if !inlinable(env) || crate::prep::bind(cx, reached, index).is_some() {
-        return None;
-    }
-    let budget = budget();
-    let release = crate::profile() == crate::outline::tree::Profile::Release;
-    if !matches!(typed.shape, Shape::Body) {
-        return Some(budget.insts);
-    }
-    let Ok(body) = cx.body(*item) else {
-        return None;
-    };
-    if hint != Hint::Always {
-        let cold_calls = typed.calls().filter(|&(ci, cs)| is_cold_or_never(cx, reached, ci, cs)).take(3).count();
-        if cold_calls >= 3 || (cold_calls >= 2 && body.exprs.len() > 80) {
-            return None;
-        }
-    }
-    match hint {
-        Hint::Never => None,
-        Hint::Always => Some(budget.always),
-        Hint::Inline => {
-            let max_exprs = if release || env.release { 800 } else { 200 };
-            (body.exprs.len() <= max_exprs).then_some(budget.insts)
-        }
-        Hint::Default => {
-            let max_exprs = if release && is_leaf_body(&body) { budget.exprs * 2 } else { budget.exprs };
-            (body.exprs.len() <= max_exprs).then_some(budget.insts)
-        }
+pub(super) fn const_bool(body: &Body, expr: ExprId) -> Option<bool> {
+    match *body.expr(unwrap_expr(body, expr, false)) {
+        Expr::Lit(crate::body::Lit::Bool(taken), _) => Some(taken),
+        _ => None,
     }
 }
 
@@ -230,8 +143,11 @@ impl Lower<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Tuple(list) => self.tuple(expr, list),
             Expr::Closure { .. } => self.closure(expr),
-            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner) => self.promoted(inner),
-            Expr::Ref { expr: inner, .. } => self.reference(inner),
+            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner) => match self.const_rodata_expr(inner)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.promoted(inner),
+            },
+            Expr::Ref { expr: inner, raw, .. } => self.reference(inner, raw),
             Expr::TupleField(..) => self.field_value(expr),
             _ => self.flow(expr),
         }
@@ -243,6 +159,7 @@ impl Lower<'_, '_> {
             Expr::Block { kind: crate::body::BlockKind::Async | crate::body::BlockKind::AsyncMove, .. } => self.closure(expr),
             Expr::Await(inner) => self.await_expr(expr, inner),
             Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Expansion } => self.expansion(stmts, tail),
+            Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Const } => self.const_block(expr, stmts, tail),
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail),
             Expr::Block { stmts, tail, label: Some(label), .. } => self.labeled_block(expr, (stmts, tail), label),
             Expr::If(cond, then, otherwise) => self.if_expr(expr, cond, then, otherwise),
@@ -261,8 +178,14 @@ impl Lower<'_, '_> {
             Expr::Field(..) => self.field_value(expr),
             Expr::Match(scrutinee, arms) => self.match_expr(expr, scrutinee, arms),
             Expr::Let(pat, init) => self.let_expr(pat, init),
-            Expr::Array(items) => self.array(expr, items),
-            Expr::Repeat(value, _) => self.repeat(expr, value),
+            Expr::Array(items) => match self.const_rodata_expr(expr)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.array(expr, items),
+            },
+            Expr::Repeat(value, _) => match self.const_rodata_expr(expr)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.repeat(expr, value),
+            },
             Expr::Index(..) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
             Expr::For { label, pat, iter, body } => self.for_expr(expr, pat, iter, (label, body)),
             Expr::Try(inner) => self.try_expr(expr, inner),
@@ -295,8 +218,11 @@ impl Lower<'_, '_> {
                 let (Kind::Value(bits), Repr::Scalar(machine)) = (self.cx.types.kind(value).clone(), self.repr_of(expr)?) else { bail!("a const parameter whose value is not known") };
                 Ok(Some(self.int_const(machine, bits)))
             }
-            Some(Res::Ctor(..)) if self.typed.coercions.contains_key(&expr) => Ok(None),
-            Some(&Res::Ctor(_, variant, _)) => self.construct(self.ty_of(expr), variant, Vec::new(), None),
+            Some(Res::Ctor(..)) if matches!(self.cx.types.kind(self.ty_of(expr)), Kind::FnDef(..)) => Ok(None),
+            Some(&Res::Ctor(_, variant, _)) => match self.const_rodata_expr(expr)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.construct(self.ty_of(expr), variant, Vec::new(), None),
+            },
             None => bail!("path has no resolution"),
         }
     }
@@ -304,7 +230,10 @@ impl Lower<'_, '_> {
     fn item_path(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         match self.cx.item(item).1.kind {
             ItemKind::Static => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
-            ItemKind::Const => self.constant(expr, item, substs),
+            ItemKind::Const => match self.const_rodata_item(expr, item, substs)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.constant(expr, item, substs),
+            },
             _ => Ok(None),
         }
     }
@@ -409,9 +338,15 @@ impl Lower<'_, '_> {
         let Some(limit) = inline_limit(self.cx, self.reached, index) else {
             return Ok(None);
         };
-        let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, limit)?;
+        let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, (limit, false))?;
         self.cycle_root = self.cycle_root.min(cycle);
-        Ok(callee)
+        let Some(found) = callee.filter(|found| self.inline.host.takes(self.cx, self.reached, index, found)) else { return Ok(None) };
+        if !self.inline.host.compact || found.form != Form::Dense {
+            return Ok(Some(found));
+        }
+        let (compact, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, (limit, true))?;
+        self.cycle_root = self.cycle_root.min(cycle);
+        Ok(compact)
     }
 
     fn emit_inlined(&mut self, inlined: &InlinedCallee, origin: SiteOrigin, values: &[Value]) -> Result<Vec<Value>> {
@@ -565,31 +500,12 @@ impl Lower<'_, '_> {
         }
     }
 
-    pub(super) fn unwrap_expr(&self, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
-        loop {
-            match *self.body.expr(expr) {
-                Expr::Paren(inner) => expr = inner,
-                Expr::Block { stmts, tail: Some(inner), label: None, kind }
-                    if self.body.list(stmts).is_empty()
-                        && (matches!(kind, crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion)
-                            || (allow_unsafe && kind == crate::body::BlockKind::Unsafe)) =>
-                {
-                    expr = inner;
-                }
-                _ => return expr,
-            }
-        }
-    }
-
-    fn const_bool(&self, expr: ExprId) -> Option<bool> {
-        match *self.body.expr(self.unwrap_expr(expr, false)) {
-            Expr::Lit(crate::body::Lit::Bool(taken), _) => Some(taken),
-            _ => None,
-        }
+    pub(super) fn unwrap_expr(&self, expr: ExprId, allow_unsafe: bool) -> ExprId {
+        unwrap_expr(self.body, expr, allow_unsafe)
     }
 
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
-        if let Some(taken) = self.const_bool(cond) {
+        if let Some(taken) = const_bool(self.body, cond) {
             return if taken {
                 self.expr(then)
             } else {

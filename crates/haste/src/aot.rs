@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +19,8 @@ use wide::WideShim;
 pub(super) const ELF_BASE: u64 = 0x0040_0000;
 pub(super) const MACH_BASE: u64 = 0x1_0000_0000;
 pub(super) const MACH_PAGE: u64 = 0x4000;
+const LOOP_PAGE: u32 = 0x1000;
+const LOOP_SHIFT: u32 = 256;
 
 /// A relocation target inside a standalone AOT executable.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -57,6 +60,7 @@ pub(crate) struct Executable {
     pub(super) entry: Option<(u32, u32)>,
     pub(super) relocs: Vec<CodeReloc>,
     pub(super) pointers: Vec<PtrReloc>,
+    pub(super) symbols: Vec<(u32, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -80,12 +84,41 @@ impl Executable {
             entry: None,
             relocs: Vec::new(),
             pointers: Vec::new(),
+            symbols: Vec::new(),
         }
+    }
+
+    /// Names the function at each `.text` offset in the executable's symbol table.
+    pub(crate) fn symbols(&mut self, mut named: Vec<(u32, String)>) {
+        named.sort_unstable_by_key(|&(offset, _)| offset);
+        self.symbols = named;
+    }
+
+    fn symbol_names(&self, prefix: &str, strtab: &mut Vec<u8>) -> Vec<u32> {
+        self.symbols
+            .iter()
+            .map(|(_, name)| {
+                let at = strtab.len() as u32;
+                strtab.extend_from_slice(prefix.as_bytes());
+                strtab.extend_from_slice(name.as_bytes());
+                strtab.push(0);
+                at
+            })
+            .collect()
     }
 
     /// Appends 16-byte-aligned machine code to `.text` and returns its section offset.
     pub(crate) fn text(&mut self, bytes: &[u8]) -> u32 {
         append_aligned(&mut self.text, bytes, 16)
+    }
+
+    /// Appends a function to `.text` at `align` bytes, shifted until the fewest of its `loops` cross a 4 KiB address, and returns its section offset.
+    pub(crate) fn function(&mut self, bytes: &[u8], align: u32, loops: &[Range<u32>]) -> u32 {
+        let base = (self.text.len() as u32).next_multiple_of(align);
+        let split = |at: u32| loops.iter().filter(|each| each.end > each.start && (at + each.start) / LOOP_PAGE != (at + each.end - 1) / LOOP_PAGE).count();
+        let at = (0..=LOOP_SHIFT / align).map(|step| base + step * align).min_by_key(|&at| split(at)).unwrap_or(base);
+        self.text.resize(at as usize, 0);
+        append_aligned(&mut self.text, bytes, align)
     }
 
     /// Appends `align`-byte-aligned constant bytes to `.rodata` and returns its section offset.
@@ -342,11 +375,11 @@ impl<'a> Plan<'a> {
                 .collect();
             let r = reloc_handles
                 .into_iter()
-                .map(|h| h.join().map_err(|_| anyhow::anyhow!("AOT plan worker panicked"))?)
+                .map(|h| h.join().map_err(|panic| anyhow::anyhow!("AOT plan worker panicked: {}", crate::sync::panic_text(&*panic)))?)
                 .collect();
             let p = ptr_handles
                 .into_iter()
-                .map(|h| h.join().map_err(|_| anyhow::anyhow!("AOT plan worker panicked"))?)
+                .map(|h| h.join().map_err(|panic| anyhow::anyhow!("AOT plan worker panicked: {}", crate::sync::panic_text(&*panic)))?)
                 .collect();
             (r, p)
         });
@@ -424,13 +457,110 @@ pub(super) struct PatchCtx<'a> {
     pub(super) plan: &'a Plan<'a>,
     pub(super) stub_va: &'a dyn Fn(&str) -> Result<u64>,
     pub(super) got_va: &'a dyn Fn(&str) -> Result<u64>,
+    pub(super) veneers: &'a Veneers,
 }
 
-fn reloc_width(kind: RelocKind) -> usize {
+#[derive(Default)]
+pub(super) struct Veneers {
+    pub(super) pre_len: usize,
+    pub(super) post_len: usize,
+    pre: Vec<(Symbol, u64)>,
+    post: Vec<(Symbol, u64)>,
+    pre_vas: FxHashMap<Symbol, u64>,
+    post_vas: FxHashMap<Symbol, u64>,
+}
+
+impl Veneers {
+    fn resolve(&self, pc_va: u64, value: u64, sym: &Symbol) -> Option<u64> {
+        if in_bl_range(pc_va, value) {
+            return Some(value);
+        }
+        self.pre_vas
+            .get(sym)
+            .copied()
+            .filter(|&va| in_bl_range(pc_va, va))
+            .or_else(|| self.post_vas.get(sym).copied().filter(|&va| in_bl_range(pc_va, va)))
+    }
+
+    pub(super) fn emit_pre(&self, resolve: &dyn Fn(&Symbol) -> Result<u64>, out: &mut Buf) -> Result<()> {
+        emit_veneer_list(&self.pre, self.pre_len, resolve, out)
+    }
+
+    pub(super) fn emit_post(&self, resolve: &dyn Fn(&Symbol) -> Result<u64>, out: &mut Buf) -> Result<()> {
+        emit_veneer_list(&self.post, self.post_len, resolve, out)
+    }
+}
+
+fn in_bl_range(pc_va: u64, target_va: u64) -> bool {
+    let delta = target_va as i64 - pc_va as i64;
+    delta & 3 == 0 && (-0x800_0000..0x800_0000).contains(&delta)
+}
+
+fn emit_veneer_list(list: &[(Symbol, u64)], total_len: usize, resolve: &dyn Fn(&Symbol) -> Result<u64>, out: &mut Buf) -> Result<()> {
+    let start = out.pos();
+    for (sym, va) in list {
+        shims::emit_arm64_veneer(*va, resolve(sym)?, out);
+    }
+    out.0.resize(start + total_len, 0);
+    Ok(())
+}
+
+pub(super) fn plan_veneers(exe: &Executable, plan: &Plan<'_>, base_va: u64, head_off: usize, shim_offs: &[usize], calc_stubs_off: impl Fn(usize, usize) -> usize) -> Result<Veneers> {
+    let lead = |veneers: usize| (head_off + veneers * 12).next_multiple_of(LOOP_PAGE as usize) - head_off;
+    if exe.target.arch != Arch::Arm64 || (head_off + exe.text.len() + plan.imports.len() * 12) < 0x700_0000 {
+        return Ok(Veneers { pre_len: lead(0), ..Veneers::default() });
+    }
+    let post_rel = exe.text.len().next_multiple_of(16);
+    let mut pre_syms = Vec::new();
+    let mut post_syms = Vec::new();
+    let mut pre_seen = FxHashSet::default();
+    let mut post_seen = FxHashSet::default();
+    loop {
+        let pre_len = lead(pre_syms.len());
+        let post_len = (post_syms.len() * 12).next_multiple_of(16);
+        let text_off = head_off + pre_len;
+        let stubs_off = calc_stubs_off(pre_len, post_len);
+        let addrs = SectionAddrs { text: base_va + text_off as u64, ..SectionAddrs::default() };
+        let stub_va = |name: &str| Ok(base_va + (stubs_off + plan.import_idx(name)? * 12) as u64);
+        let mut added = false;
+        for reloc in &exe.relocs {
+            if reloc.kind != RelocKind::Arm64Call26 {
+                continue;
+            }
+            let pc_va = addrs.text + u64::from(reloc.offset);
+            let target_va = resolve_sym(&reloc.symbol, addrs, base_va, shim_offs, plan, &stub_va)?;
+            if in_bl_range(pc_va, target_va) {
+                continue;
+            }
+            if reloc.offset as usize >= 0x700_0000 {
+                if post_seen.insert(reloc.symbol.clone()) {
+                    post_syms.push(reloc.symbol.clone());
+                    added = true;
+                }
+            } else if pre_seen.insert(reloc.symbol.clone()) {
+                pre_syms.push(reloc.symbol.clone());
+                added = true;
+            }
+        }
+        if !added {
+            let pre_va = base_va + head_off as u64;
+            let post_va = base_va + (text_off + post_rel) as u64;
+            let pre: Vec<_> = pre_syms.into_iter().enumerate().map(|(i, s)| (s, pre_va + (i * 12) as u64)).collect();
+            let post: Vec<_> = post_syms.into_iter().enumerate().map(|(i, s)| (s, post_va + (i * 12) as u64)).collect();
+            let pre_vas = pre.iter().map(|(s, va)| (s.clone(), *va)).collect();
+            let post_vas = post.iter().map(|(s, va)| (s.clone(), *va)).collect();
+            return Ok(Veneers { pre_len, post_len, pre, post, pre_vas, post_vas });
+        }
+    }
+}
+
+fn reloc_span(kind: RelocKind, offset: u32) -> (usize, usize) {
+    let off = offset as usize;
     match kind {
-        RelocKind::Abs32 | RelocKind::PcRel32 | RelocKind::Arm64Call26 => 4,
-        RelocKind::Abs64 => 8,
-        RelocKind::Arm64Movw64 => 16,
+        RelocKind::X64RipRel32 => (off.saturating_sub(3), off + 4),
+        RelocKind::Abs32 | RelocKind::PcRel32 | RelocKind::Arm64Call26 => (off, off + 4),
+        RelocKind::Abs64 | RelocKind::Arm64AdrpAdd => (off, off + 8),
+        RelocKind::Arm64Movw64 => (off, off + 16),
     }
 }
 
@@ -443,23 +573,45 @@ fn resolve_fast(sym: &Symbol, addrs: SectionAddrs, base_va: u64, shim_offs: &[us
     })
 }
 
-fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64: bool, addrs: SectionAddrs, base_va: u64, shim_offs: &[usize], plan: &Plan<'_>, stub_vas: &[u64], got_vas: &[u64], out: &mut [u8]) -> Result<()> {
+fn patch_slice(relocs: &[&CodeReloc], slice_base: usize, text_va: u64, pie_arm64: bool, addrs: SectionAddrs, base_va: u64, shim_offs: &[usize], plan: &Plan<'_>, stub_vas: &[u64], got_vas: &[u64], veneers: &Veneers, out: &mut [u8]) -> Result<()> {
     for &reloc in relocs {
         let at = (reloc.offset as usize) - slice_base;
+        if reloc.kind == RelocKind::Arm64AdrpAdd {
+            let pc_va = text_va + u64::from(reloc.offset);
+            let (load_got, target_va) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, got_vas)?;
+            shims::patch_arm64_adrp_add(&mut out[at..at + 8], pc_va, load_got, target_va, matches!(reloc.symbol, Symbol::Word(_)))?;
+            continue;
+        }
         if pie_arm64 && reloc.kind == RelocKind::Arm64Movw64 && !matches!(reloc.symbol, Symbol::Word(_)) {
             let pc_va = text_va + u64::from(reloc.offset);
             let (load_got, target_va) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, got_vas)?;
             shims::patch_arm64_pie(&mut out[at..at + 16], pc_va, load_got, target_va)?;
             continue;
         }
+        if reloc.kind == RelocKind::X64RipRel32 {
+            if let Symbol::Word(val) = reloc.symbol {
+                let val32 = u32::try_from(val).context("X64RipRel32 word exceeds u32")?;
+                let reg = ((out[at - 3] & 4) << 1) | ((out[at - 1] >> 3) & 7);
+                let mut bytes = [0x40 | ((reg >> 3) & 1), 0xB8 | (reg & 7), 0, 0, 0, 0, 0x90];
+                bytes[2..6].copy_from_slice(&val32.to_le_bytes());
+                out[at - 3..at + 4].copy_from_slice(&bytes);
+                continue;
+            }
+            let (load_got, value) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, got_vas)?;
+            if load_got {
+                out[at - 2] = 0x8B;
+            }
+            let next_ip = text_va + u64::from(reloc.offset) + 4;
+            let delta = i32::try_from(value as i64 - next_ip as i64).context("X64RipRel32 target out of range")?;
+            out[at..at + 4].copy_from_slice(&delta.to_le_bytes());
+            continue;
+        }
         let (_, value) = resolve_fast(&reloc.symbol, addrs, base_va, shim_offs, plan, stub_vas)?;
         match reloc.kind {
             RelocKind::Arm64Call26 => {
                 let pc_va = text_va + u64::from(reloc.offset);
-                let delta = value as i64 - pc_va as i64;
-                if delta & 3 != 0 || !(-0x800_0000..0x800_0000).contains(&delta) {
-                    bail!("Arm64Call26 target {value:#x} out of range from {pc_va:#x}");
-                }
+                let target = veneers.resolve(pc_va, value, &reloc.symbol).with_context(|| format!("Arm64Call26 target {value:#x} out of range from {pc_va:#x}"))?;
+                let delta = target as i64 - pc_va as i64;
                 let word = 0x9400_0000 | (((delta >> 2) as u32) & 0x03FF_FFFF);
                 out[at..at + 4].copy_from_slice(&word.to_le_bytes());
             }
@@ -484,7 +636,7 @@ pub(super) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8
     let refs: Vec<&CodeReloc> = relocs.iter().collect();
     let workers = crate::jobs().min(refs.len() / 1024);
     if workers <= 1 {
-        return patch_slice(&refs, 0, ctx.text_va, ctx.pie_arm64, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan, &stub_vas, &got_vas, &mut out[ctx.text_base..]);
+        return patch_slice(&refs, 0, ctx.text_va, ctx.pie_arm64, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan, &stub_vas, &got_vas, ctx.veneers, &mut out[ctx.text_base..]);
     }
     let mut sorted = refs;
     sorted.sort_unstable_by_key(|r| r.offset);
@@ -495,14 +647,14 @@ pub(super) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8
         let target_end = (pos + step).min(sorted.len());
         let mut max_end = 0_usize;
         for reloc in &sorted[pos..target_end] {
-            max_end = max_end.max(reloc.offset as usize + reloc_width(reloc.kind));
+            max_end = max_end.max(reloc_span(reloc.kind, reloc.offset).1);
         }
         let mut end = target_end;
-        while end < sorted.len() && (sorted[end].offset as usize) < max_end {
-            max_end = max_end.max(sorted[end].offset as usize + reloc_width(sorted[end].kind));
+        while end < sorted.len() && reloc_span(sorted[end].kind, sorted[end].offset).0 < max_end {
+            max_end = max_end.max(reloc_span(sorted[end].kind, sorted[end].offset).1);
             end += 1;
         }
-        let slice_start = if pos == 0 { 0 } else { sorted[pos].offset as usize };
+        let slice_start = if pos == 0 { 0 } else { reloc_span(sorted[pos].kind, sorted[pos].offset).0 };
         bounds.push((pos, end, slice_start));
         pos = end;
     }
@@ -516,16 +668,16 @@ pub(super) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8
         prev_start += slice_len;
         tail = rest;
     }
-    let (text_va, pie_arm64, addrs, base_va, shim_offs, plan) = (ctx.text_va, ctx.pie_arm64, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan);
+    let (text_va, pie_arm64, addrs, base_va, shim_offs, plan, veneers) = (ctx.text_va, ctx.pie_arm64, ctx.addrs, ctx.base_va, ctx.shim_offs, ctx.plan, ctx.veneers);
     let (stub_vas_ref, got_vas_ref) = (stub_vas.as_slice(), got_vas.as_slice());
     let results: Vec<Result<()>> = std::thread::scope(|scope| {
         let handles: Vec<_> = slices
             .into_iter()
-            .map(|(chunk, base, buf)| scope.spawn(move || patch_slice(chunk, base, text_va, pie_arm64, addrs, base_va, shim_offs, plan, stub_vas_ref, got_vas_ref, buf)))
+            .map(|(chunk, base, buf)| scope.spawn(move || patch_slice(chunk, base, text_va, pie_arm64, addrs, base_va, shim_offs, plan, stub_vas_ref, got_vas_ref, veneers, buf)))
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().map_err(|_| anyhow::anyhow!("AOT patch worker panicked"))?)
+            .map(|h| h.join().map_err(|panic| anyhow::anyhow!("AOT patch worker panicked: {}", crate::sync::panic_text(&*panic)))?)
             .collect()
     });
     for res in results {

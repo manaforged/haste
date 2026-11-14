@@ -4,6 +4,7 @@ mod abi;
 mod adt;
 mod array;
 mod atomic;
+mod budget;
 mod closure;
 mod coroutine;
 mod drop;
@@ -20,13 +21,15 @@ mod ops;
 mod place;
 mod plan;
 mod promote;
-mod reloc;
+pub(crate) mod reloc;
 mod simd;
 mod slice_pat;
 mod stencil;
 
 pub use expr::{can_inline_body, may_inline};
+pub use abi::{signature, signature_of};
 pub(crate) use abi::purpose_tag;
+pub(super) use abi::is_freeze_ty;
 pub use plan::eval_footprint;
 pub use reloc::{RelocPlan, eval_relocs};
 pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil};
@@ -34,7 +37,7 @@ pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTa
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use haste_codegen::{AbiParam, ArgumentPurpose, Block, CallConv, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
+use haste_codegen::{ArgumentPurpose, Block, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
 
 use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
 use crate::names::{ItemRef, Primitive};
@@ -188,110 +191,12 @@ pub fn passed_parts(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
         Repr::Mem { parts: parts @ Parts::One(_), .. } => Some(parts),
         Repr::Mem { parts: parts @ Parts::Pair(first, second, _), .. } if first != Type::I128 && second != Type::I128 => Some(parts),
         Repr::Mem { parts: parts @ Parts::Words(..), .. } if !is_repr_c(cx, ty) => Some(parts),
-        Repr::Mem { size, parts: Parts::Bytes, .. } if !is_repr_c(cx, ty) => match abi::packed_word_parts(size) {
+        Repr::Mem { size, parts: Parts::Bytes | Parts::Pair(..), .. } if !is_repr_c(cx, ty) => match abi::packed_word_parts(size) {
             Parts::Bytes => None,
             parts => Some(parts),
         },
         _ => None,
     })
-}
-
-/// The native signature of a reached function: memory values travel by address unless `passed_parts` splits them into up to four scalar registers, and a memory result returns in those registers or through a first `StructReturn` pointer.
-pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
-    signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))
-}
-
-fn ref_abi_param(cx: &mut Context<'_>, abi: AbiParam, param: Ty, thin: bool) -> AbiParam {
-    let Kind::Ref(mutability, inner) = *cx.types.kind(param) else {
-        return abi;
-    };
-    if mutability == crate::sema::ty::Mut::Mut {
-        return abi.with_noalias();
-    }
-    if thin {
-        if let Some(bytes) = freeze_pointee_bytes(cx, inner) {
-            return abi.with_deref_bytes(bytes);
-        }
-        return abi;
-    }
-    let immutable = match *cx.types.kind(inner) {
-        Kind::Slice(elem) => is_freeze_ty(cx, elem, 0),
-        Kind::Prim(Primitive::Str) => true,
-        _ => false,
-    };
-    if immutable { abi.with_readonly() } else { abi }
-}
-
-/// The native signature of a function that returns `ret` and takes `params`.
-pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIterator<Item = Ty>) -> Result<Signature> {
-    let mut signature = Signature::new(CallConv::Internal);
-    if let Some(ret) = ret {
-        match repr(cx, ret)? {
-            Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
-            Repr::Mem { .. } => match passed_parts(cx, ret)? {
-                Some(parts) => signature.returns.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
-                None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn).with_noalias()),
-            },
-            Repr::Zst => {}
-        }
-    }
-    for param in params {
-        match repr(cx, param)? {
-            Repr::Scalar(ty) => {
-                let mut abi = AbiParam::new(ty);
-                if ty == Type::I64 {
-                    abi = ref_abi_param(cx, abi, param, true);
-                }
-                signature.params.push(abi);
-            }
-            Repr::Mem { .. } => match passed_parts(cx, param)? {
-                Some(parts) => {
-                    let mut first = true;
-                    for (machine, _) in parts.scalars() {
-                        let mut abi = AbiParam::new(machine);
-                        if first {
-                            abi = ref_abi_param(cx, abi, param, false);
-                            first = false;
-                        }
-                        signature.params.push(abi);
-                    }
-                }
-                None => signature.params.push(AbiParam::new(Type::I64)),
-            },
-            Repr::Zst => {}
-        }
-    }
-    Ok(signature)
-}
-
-fn freeze_pointee_bytes(cx: &mut Context<'_>, ty: Ty) -> Option<u32> {
-    if !cx.is_unsized(ty).is_ok_and(|u| !u) || !is_freeze_ty(cx, ty, 0) {
-        return None;
-    }
-    let bytes = cx.layout(ty).ok()?.size.bytes();
-    u32::try_from(bytes).ok().filter(|&b| b > 0)
-}
-
-fn is_freeze_ty(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
-    if depth > 16 || ty == Ty::NONE || cx.types.has_params(ty) {
-        return false;
-    }
-    match *cx.types.kind(ty) {
-        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => true,
-        Kind::Pat(base, ..) | Kind::Array(base, _) | Kind::Slice(base) => is_freeze_ty(cx, base, depth + 1),
-        Kind::Tuple(substs) => cx.types.substs(substs).to_vec().into_iter().all(|t| is_freeze_ty(cx, t, depth + 1)),
-        Kind::Adt(item, substs) => {
-            if cx.types.substs_have_params(substs) || matches!(cx.lang(item), Some("unsafe_cell" | "unsafe_pinned")) {
-                return false;
-            }
-            let args = cx.types.substs(substs).to_vec();
-            let Ok(variants) = crate::sema::infer::field_types(cx, item, &args) else {
-                return false;
-            };
-            variants.iter().flatten().all(|&field| is_freeze_ty(cx, field, depth + 1))
-        }
-        Kind::Closure(..) | Kind::Dyn(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
-    }
 }
 
 /// Whether `signature` returns its result through a first `StructReturn` pointer.
@@ -309,7 +214,7 @@ struct Loop {
     block: bool,
 }
 
-/// The inline state of one top-level lowering: the reached indexes being lowered, and the callees whose inline decision rests on an open cycle, each with the stack depth that cycle reaches.
+/// The inline state of one top-level lowering: the reached indexes being lowered, the callees whose inline decision rests on an open cycle, each with the stack depth that cycle reaches, and what the body being lowered copies.
 #[derive(Default)]
 pub(super) struct Inline {
     pub stack: Vec<usize>,
@@ -317,6 +222,7 @@ pub(super) struct Inline {
     pub local_meta: rustc_hash::FxHashMap<usize, (Option<stencil::InlineMeta>, usize)>,
     pub max_callee_height: u8,
     pub max_callee_size: u16,
+    pub host: budget::Copies,
 }
 
 impl Inline {

@@ -20,6 +20,25 @@ struct Hoisted {
     tag: Option<(Ty, Type, Value)>,
 }
 
+fn pat_equality_tests(body: &crate::body::Body, typed: &crate::sema::infer::Typed, pat: PatId) -> usize {
+    let ctor = usize::from(matches!(typed.pat_res.get(&pat), Some(Res::Ctor(..) | Res::Fn(..))));
+    match *body.pat(pat) {
+        Pat::Or(list) => body.list(list).iter().map(|&at| pat_equality_tests(body, typed, PatId(at))).sum(),
+        Pat::Paren(inner) | Pat::Bind { sub: Some(inner), .. } => pat_equality_tests(body, typed, inner),
+        Pat::Lit(_) => 1,
+        _ => ctor,
+    }
+}
+
+fn concrete_pat(body: &crate::body::Body, pat: PatId) -> Option<PatId> {
+    match *body.pat(pat) {
+        Pat::Wild | Pat::Bind { sub: None, .. } => None,
+        Pat::Paren(inner) | Pat::Bind { sub: Some(inner), .. } => concrete_pat(body, inner),
+        Pat::Or(list) => body.list(list).iter().find_map(|&at| concrete_pat(body, PatId(at))),
+        _ => Some(pat),
+    }
+}
+
 impl Lower<'_, '_> {
     /// Lowers `match`: each arm tests its pattern and falls through to the next one when it fails.
     pub fn match_expr(&mut self, expr: ExprId, scrutinee: ExprId, arms: List) -> Result<Option<Value>> {
@@ -136,14 +155,11 @@ impl Lower<'_, '_> {
     }
 
     fn hoist_match_scrutinee(&mut self, arm_ids: &[u32], place: Option<Place>) -> Result<Option<Hoisted>> {
-        if arm_ids.len() < 4 {
+        let total_tests: usize = arm_ids.iter().map(|&at| pat_equality_tests(self.body, self.typed, self.body.arms[at as usize].pat)).sum();
+        if total_tests < 2 {
             return Ok(None);
         }
-        let Some(first_pat) = arm_ids
-            .iter()
-            .map(|&at| self.body.arms[at as usize].pat)
-            .find(|&pat| !matches!(*self.body.pat(pat), Pat::Wild | Pat::Bind { sub: None, .. } | Pat::Or(_)))
-        else {
+        let Some(first_pat) = arm_ids.iter().find_map(|&at| concrete_pat(self.body, self.body.arms[at as usize].pat)) else {
             return Ok(None);
         };
         let derefs = self.typed.pat_derefs.get(&first_pat).copied().unwrap_or(0);
@@ -176,11 +192,27 @@ impl Lower<'_, '_> {
         self.test_with(pat, place, None, fail)
     }
 
+    fn or_same_derefs(&self, list: List, derefs: u32) -> bool {
+        self.body.list(list).iter().all(|&at| {
+            let alt = PatId(at);
+            match *self.body.pat(alt) {
+                Pat::Or(sub) => self.or_same_derefs(sub, derefs),
+                Pat::Wild | Pat::Bind { sub: None, .. } => true,
+                _ => self.typed.pat_derefs.get(&alt).copied().unwrap_or(0) == derefs,
+            }
+        })
+    }
+
+    fn hoisted_for(&self, pat: PatId, hoisted: Option<Hoisted>) -> Option<Hoisted> {
+        hoisted.filter(|h| match *self.body.pat(pat) {
+            Pat::Wild | Pat::Bind { sub: None, .. } => false,
+            Pat::Or(list) => self.or_same_derefs(list, h.derefs),
+            _ => self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) == h.derefs,
+        })
+    }
+
     fn test_with(&mut self, pat: PatId, place: Option<Place>, hoisted: Option<Hoisted>, fail: Block) -> Result<()> {
-        let h = hoisted.filter(|h| {
-            !matches!(*self.body.pat(pat), Pat::Wild | Pat::Bind { sub: None, .. } | Pat::Or(_))
-                && self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) == h.derefs
-        });
+        let h = self.hoisted_for(pat, hoisted);
         let place = match h {
             Some(h) => h.peeled,
             None => self.peeled(pat, place)?,
@@ -197,17 +229,17 @@ impl Lower<'_, '_> {
         } else {
             self.test_variant(pat, place, fail)?;
         }
-        self.test_const(pat, place, fail)?;
+        self.test_const(pat, place, None, fail)?;
         match *self.body.pat(pat) {
             Pat::Bind { sub: Some(sub), .. } => self.test(sub, place, fail),
             Pat::Paren(inner) => self.test(inner, place, fail),
-            Pat::Lit(lit) => self.test_lit(pat, lit, place, fail),
+            Pat::Lit(lit) => self.test_lit(pat, lit, place, None, fail),
             Pat::Range { from, to, inclusive } => self.test_range(pat, (from, to, inclusive), place, fail),
             Pat::Ref { pat: inner, .. } => {
                 let pointee = self.ref_target(pat, place)?;
                 self.test(inner, Some(pointee), fail)
             }
-            Pat::Or(list) => self.test_or(list, place, fail),
+            Pat::Or(list) => self.test_or(list, place, hoisted, fail),
             Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct { .. } | Pat::Slice(_) => {
                 for (sub, sub_place, _) in self.subpatterns(pat, place, Some(fail))? {
                     self.test(sub, sub_place, fail)?;
@@ -229,13 +261,37 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    fn test_or(&mut self, list: List, place: Option<Place>, fail: Block) -> Result<()> {
+    fn try_leaf_or(&mut self, mut pat: PatId, place: Option<Place>, hoisted: Option<Hoisted>, matched: Block, fail: Block) -> Result<bool> {
+        while let Pat::Paren(inner) = *self.body.pat(pat) {
+            pat = inner;
+        }
+        let h = self.hoisted_for(pat, hoisted);
+        let place = match h {
+            Some(h) => h.peeled,
+            None => self.peeled(pat, place)?,
+        };
+        match *self.body.pat(pat) {
+            Pat::Lit(lit) => {
+                self.test_lit(pat, lit, place, Some(matched), fail)?;
+                Ok(true)
+            }
+            Pat::Path(_) if matches!(self.typed.pat_res.get(&pat), Some(Res::Fn(..))) => {
+                self.test_const(pat, place, Some(matched), fail)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn test_or(&mut self, list: List, place: Option<Place>, hoisted: Option<Hoisted>, fail: Block) -> Result<()> {
         let matched = self.b.create_block();
         let alts: Vec<PatId> = self.body.list(list).iter().map(|&at| PatId(at)).collect();
-        for (at, alt) in alts.iter().enumerate() {
+        for (at, &alt) in alts.iter().enumerate() {
             let next = if at + 1 == alts.len() { fail } else { self.b.create_block() };
-            self.test(*alt, place, next)?;
-            self.jump(matched, &[]);
+            if !self.try_leaf_or(alt, place, hoisted, matched, next)? {
+                self.test_with(alt, place, hoisted, next)?;
+                self.jump(matched, &[]);
+            }
             if next != fail {
                 self.enter(next);
             }
@@ -250,22 +306,25 @@ impl Lower<'_, '_> {
         Ok((value, num))
     }
 
-    fn test_const(&mut self, pat: PatId, place: Option<Place>, fail: Block) -> Result<()> {
+    fn test_const(&mut self, pat: PatId, place: Option<Place>, on_match: Option<Block>, fail: Block) -> Result<()> {
         let Some(&Res::Fn(item, substs)) = self.typed.pat_res.get(&pat) else { return Ok(()) };
         let Some(expected) = self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::PatRes(pat)), item, substs, Vec::new())? else { bail!("constant pattern with no value") };
-        self.test_equal(pat, place, expected, fail)
+        self.test_equal(pat, place, expected, on_match, fail)
     }
 
-    fn test_lit(&mut self, pat: PatId, lit: ExprId, place: Option<Place>, fail: Block) -> Result<()> {
+    fn test_lit(&mut self, pat: PatId, lit: ExprId, place: Option<Place>, on_match: Option<Block>, fail: Block) -> Result<()> {
         let Some(expected) = self.expr(lit)? else { bail!("literal with no value") };
-        self.test_equal(pat, place, expected, fail)
+        self.test_equal(pat, place, expected, on_match, fail)
     }
 
-    fn test_equal(&mut self, pat: PatId, place: Option<Place>, expected: Value, fail: Block) -> Result<()> {
+    fn test_equal(&mut self, pat: PatId, place: Option<Place>, expected: Value, on_match: Option<Block>, fail: Block) -> Result<()> {
         let ty = self.pat_ty(pat)?;
         let Some(value) = place.and_then(|place| self.read(place)) else { bail!("literal pattern on a value with no bytes") };
         let ok = self.equal(ty, value, expected)?;
-        self.pass(ok, fail);
+        match on_match {
+            Some(matched) => self.brif(ok, (matched, &[]), (fail, &[])),
+            None => self.pass(ok, fail),
+        }
         Ok(())
     }
 

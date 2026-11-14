@@ -296,7 +296,7 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    fn call_libc(&mut self, symbol: RuntimeSymbol, args: Vec<Value>, ret: Option<Ty>) -> Result<Option<Value>> {
+    pub(super) fn call_libc(&mut self, symbol: RuntimeSymbol, args: Vec<Value>, ret: Option<Ty>) -> Result<Option<Value>> {
         let usize_ty = self.cx.types.prim(Primitive::Usize);
         let code = self.ins().runtime(symbol);
         self.call_code(code, (vec![usize_ty; args.len()], ret), args)
@@ -359,9 +359,7 @@ impl Lower<'_, '_> {
             false => (IntCC::UnsignedLessThan, IntCC::UnsignedGreaterThan),
         };
         let (below, above) = (self.ins().icmp(less, x, y), self.ins().icmp(greater, x, y));
-        let (minus, zero, one) = (self.ins().iconst(Type::I8, -1), self.ins().iconst(Type::I8, 0), self.ins().iconst(Type::I8, 1));
-        let other = self.ins().select(above, one, zero);
-        let order = self.ins().select(below, minus, other);
+        let order = self.ins().isub(above, below);
         let slot = self.b.create_stack_slot(1, 0);
         self.ins().stack_store(order, slot, 0);
         Ok(self.ins().stack_addr(Type::I64, slot, 0))

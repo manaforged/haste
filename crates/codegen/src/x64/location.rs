@@ -1,10 +1,16 @@
+mod fuse;
+mod patterns;
+
+pub(super) use fuse::fuse;
+pub(super) use patterns::{LEAF, Root, adc_plan, bextr_parts, shld_parts, unwrap_shift_mask};
+
 use super::asm::{Alu, Mem, Reg, Rm, Shift, Size, Xmm};
-use super::float::scalar;
+use super::float::{X2, scalar};
 use super::Emit;
 use crate::alloc::Location;
-use crate::frame::Ext;
-use crate::ir::{Type, Value};
-use crate::live::SibBase;
+use crate::frame::{Emitter, Ext};
+use crate::ir::{Op, Type, Value};
+use crate::live::{Sib, SibBase};
 use crate::reloc::{RelocKind, StencilReloc};
 
 fn extend(imm: i64, ty: Type, ext: Ext) -> i64 {
@@ -43,13 +49,12 @@ impl Emit<'_> {
     }
 
     pub(super) fn cached_spill(&self, value: Value) -> Option<Reg> {
-        if !matches!(self.location(value), Location::Slot) {
+        if self.plan.elided[value.index()] || !matches!(self.location(value), Location::Slot) {
             return None;
         }
         let disp = self.frame.values[value.index()];
         debug_assert_ne!(disp, 0, "unhomed value {value:?}");
-        let (cached_disp, cached_reg, stamp) = self.last_spill?;
-        (cached_disp == disp && stamp == self.asm.stamp()).then_some(cached_reg)
+        self.cached_spill_for(disp, Reg::Rax)
     }
 
     /// The constant `value` extended to 64 bits by `ext`, when it fits a sign-extended 32-bit immediate.
@@ -62,7 +67,27 @@ impl Emit<'_> {
 
     /// The register that holds `value`, when its location is one.
     pub(super) fn reg_of(&self, value: Value) -> Option<Reg> {
+        if self.plan.elided[value.index()] {
+            return None;
+        }
         self.plan.reg_of(value)
+    }
+
+    pub(super) fn has_elided_mem(&self, value: Value) -> bool {
+        self.plan.elided[value.index()]
+            && self.defs[value.index()].is_some_and(|inst| matches!(self.func.insts[inst.index()].op, Op::Load(..) | Op::StackLoad(..)))
+    }
+
+    pub(super) fn elided_mem(&mut self, value: Value) -> Option<Mem> {
+        if !self.plan.elided[value.index()] {
+            return None;
+        }
+        let inst = self.defs[value.index()]?;
+        match self.func.insts[inst.index()].op {
+            Op::Load(addr, off) => Some(self.address(addr, off)),
+            Op::StackLoad(slot, off) => Some(self.slot(slot, off)),
+            _ => None,
+        }
     }
 
     /// The float register that holds `value`, when its location is one.
@@ -80,58 +105,77 @@ impl Emit<'_> {
         self.xmm_of(value).unwrap_or(Xmm(0))
     }
 
-    /// The memory at `addr + offset`: relative to rbp for a frame address, to the location register of `addr`, or through rcx.
+    /// The frame memory at `disp` from where rbp would point, addressed from the frame base.
+    pub(super) fn frame_mem(&self, disp: i32) -> Mem {
+        Mem::new(self.base, disp + self.bias)
+    }
+
+    /// The displacement of `mem` from where rbp would point when it is a plain frame address.
+    pub(super) fn frame_disp(&self, mem: Mem) -> Option<i32> {
+        (mem.base == self.base && mem.index.is_none()).then(|| mem.disp - self.bias)
+    }
+
+    /// The memory at `addr + offset`: relative to the frame base for a frame address, to the location register of `addr`, or through rcx.
     pub(super) fn address(&mut self, addr: Value, offset: i32) -> Mem {
         self.address_in(addr, offset, Reg::Rcx, Reg::R11)
     }
 
+    pub(super) fn sib_mem(&mut self, mode: Sib, offset: i32, scratch: Reg, temp: Reg) -> Mem {
+        let idx_reg = self.reg_of(mode.index).filter(|_| self.ty(mode.index).bytes() >= 8 || self.plan.zero_ext[mode.index.index()]);
+        match mode.base {
+            SibBase::Frame(slot) => {
+                let disp = self.frame.slots[slot.index()] + mode.disp + offset;
+                match idx_reg {
+                    Some(idx) => Mem::sib(self.base, idx, mode.shift, disp + self.bias),
+                    None => {
+                        self.get(scratch, mode.index, Ext::Zero);
+                        Mem::sib(self.base, scratch, mode.shift, disp + self.bias)
+                    }
+                }
+            }
+            SibBase::Value(base) => {
+                let disp = mode.disp + offset;
+                match (self.reg_of(base), idx_reg) {
+                    (Some(b), Some(idx)) => Mem::sib(b, idx, mode.shift, disp),
+                    (Some(b), None) => {
+                        self.get(scratch, mode.index, Ext::Zero);
+                        Mem::sib(b, scratch, mode.shift, disp)
+                    }
+                    (None, Some(idx)) => {
+                        self.raw(scratch, base);
+                        Mem::sib(scratch, idx, mode.shift, disp)
+                    }
+                    (None, None) => {
+                        self.clear_flags();
+                        self.get(scratch, mode.index, Ext::Zero);
+                        if mode.shift > 0 {
+                            self.asm.shift_imm(Size::Q, Shift::Shl, scratch, mode.shift);
+                        }
+                        match self.location(base) {
+                            Location::Slot => self.asm.alu(Alu::Add, scratch, self.at(base)),
+                            Location::Imm(imm) if i32::try_from(imm).is_ok() => self.asm.alu_imm(Alu::Add, scratch, imm as i32),
+                            Location::Frame(slot, off) => {
+                                self.asm.alu(Alu::Add, scratch, self.base);
+                                self.asm.alu_imm(Alu::Add, scratch, self.frame.slots[slot.index()] + off + self.bias);
+                            }
+                            _ => {
+                                self.raw(temp, base);
+                                self.asm.alu(Alu::Add, scratch, temp);
+                            }
+                        }
+                        self.clobber_reg(scratch);
+                        Mem::new(scratch, disp)
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg, temp: Reg) -> Mem {
-        if let Some(mode) = self.plan.sib[addr.index()] {
-            return match mode.base {
-                SibBase::Frame(slot) => {
-                    let disp = self.frame.slots[slot.index()] + mode.disp + offset;
-                    match self.reg_of(mode.index) {
-                        Some(idx) => Mem::sib(Reg::Rbp, idx, mode.shift, disp),
-                        None => {
-                            self.raw(scratch, mode.index);
-                            Mem::sib(Reg::Rbp, scratch, mode.shift, disp)
-                        }
-                    }
-                }
-                SibBase::Value(base) => {
-                    let disp = mode.disp + offset;
-                    match (self.reg_of(base), self.reg_of(mode.index)) {
-                        (Some(b), Some(idx)) => Mem::sib(b, idx, mode.shift, disp),
-                        (Some(b), None) => {
-                            self.raw(scratch, mode.index);
-                            Mem::sib(b, scratch, mode.shift, disp)
-                        }
-                        (None, Some(idx)) => {
-                            self.raw(scratch, base);
-                            Mem::sib(scratch, idx, mode.shift, disp)
-                        }
-                        (None, None) => {
-                            self.raw(scratch, mode.index);
-                            if mode.shift > 0 {
-                                self.asm.shift_imm(Size::Q, Shift::Shl, scratch, mode.shift);
-                            }
-                            match self.location(base) {
-                                Location::Slot => self.asm.alu(Alu::Add, scratch, self.at(base)),
-                                Location::Imm(imm) if i32::try_from(imm).is_ok() => self.asm.alu_imm(Alu::Add, scratch, imm as i32),
-                                Location::Frame(slot, off) => {
-                                    self.asm.alu(Alu::Add, scratch, Reg::Rbp);
-                                    self.asm.alu_imm(Alu::Add, scratch, self.frame.slots[slot.index()] + off);
-                                }
-                                _ => {
-                                    self.raw(temp, base);
-                                    self.asm.alu(Alu::Add, scratch, temp);
-                                }
-                            }
-                            Mem::new(scratch, disp)
-                        }
-                    }
-                }
-            };
+        if self.plan.elided[addr.index()]
+            && let Some(mode) = self.plan.sib[addr.index()]
+        {
+            return self.sib_mem(mode, offset, scratch, temp);
         }
         if let Some(reg) = self.reg_of(addr) {
             return Mem::new(reg, offset);
@@ -139,119 +183,146 @@ impl Emit<'_> {
         if let Location::Frame(slot, base) = self.location(addr)
             && let Some(disp) = self.frame.slots[slot.index()].checked_add(base).and_then(|disp| disp.checked_add(offset))
         {
-            return Mem::new(Reg::Rbp, disp);
+            return self.frame_mem(disp);
         }
         self.raw(scratch, addr);
         Mem::new(scratch, offset)
     }
 
-    pub(super) fn get(&mut self, reg: Reg, value: Value, ext: Ext) {
-        let ty = self.ty(value);
-        let bytes = ty.bytes();
-        let full = bytes >= 8 || (!matches!(ext, Ext::Sign) && self.plan.zero_ext[value.index()]);
-        let source: Rm = match self.location(value) {
-            Location::Imm(imm) => return self.asm.mov_imm(reg, extend(imm, ty, ext)),
-            Location::SlotAddr(_) | Location::Frame(..) => return self.raw(reg, value),
-            Location::Float(from) => {
-                self.asm.movq_out(reg, Xmm(from));
-                if full {
-                    return;
-                }
-                reg.into()
-            }
-            Location::Reg(from) => {
-                if full {
-                    if from != reg {
-                        self.asm.mov(reg, from);
-                    }
-                    return;
-                }
-                from.into()
-            }
-            Location::Slot => {
-                let disp = self.frame.values[value.index()];
-                debug_assert_ne!(disp, 0, "unhomed value {value:?} in get()");
-                if let Some((cached_disp, cached_reg, stamp)) = self.last_spill
-                    && cached_disp == disp
-                    && stamp == self.asm.stamp()
-                {
-                    if full {
-                        if cached_reg != reg {
-                            self.asm.mov(reg, cached_reg);
-                        }
-                        self.last_spill = Some((disp, cached_reg, self.asm.stamp()));
-                        return;
-                    }
-                    match ext {
-                        Ext::Zero => self.asm.load(Size::of(bytes), reg, cached_reg),
-                        Ext::Sign => self.asm.load_signed(Size::of(bytes), reg, cached_reg),
-                    }
-                    self.last_spill = if reg != cached_reg {
-                        Some((disp, cached_reg, self.asm.stamp()))
-                    } else {
-                        None
-                    };
-                    return;
-                }
-                Mem::new(Reg::Rbp, disp).into()
-            }
-        };
+    fn load_ext(&mut self, reg: Reg, source: impl Into<Rm>, bytes: u32, ext: Ext) {
         match ext {
             _ if bytes >= 8 => self.asm.load(Size::Q, reg, source),
             Ext::Zero => self.asm.load(Size::of(bytes), reg, source),
             Ext::Sign => self.asm.load_signed(Size::of(bytes), reg, source),
         }
+        self.clobber_reg(reg);
+    }
+
+    pub(super) fn get(&mut self, reg: Reg, value: Value, ext: Ext) {
+        if let Some(mem) = self.elided_mem(value) {
+            self.load_ext(reg, mem, self.ty(value).bytes(), ext);
+            return;
+        }
+        let ty = self.ty(value);
+        let bytes = ty.bytes();
+        let full = bytes >= 8 || (!matches!(ext, Ext::Sign) && self.plan.zero_ext[value.index()]);
+        match self.location(value) {
+            Location::Imm(imm) => {
+                self.asm.mov_imm(reg, extend(imm, ty, ext));
+                self.clobber_reg(reg);
+            }
+            Location::SlotAddr(_) | Location::Symbol(_) | Location::Frame(..) => self.raw(reg, value),
+            Location::Float(from) => {
+                self.asm.movq_out(reg, Xmm(from));
+                if full {
+                    self.clobber_reg(reg);
+                } else {
+                    self.load_ext(reg, reg, bytes, ext);
+                }
+            }
+            Location::Reg(from) if full => {
+                if from != reg {
+                    self.asm.mov(reg, from);
+                    self.clobber_reg(reg);
+                }
+            }
+            Location::Reg(from) => self.load_ext(reg, from, bytes, ext),
+            Location::Slot => {
+                let disp = self.frame.values[value.index()];
+                debug_assert_ne!(disp, 0, "unhomed value {value:?} in get()");
+                if let Some(cached_reg) = self.cached_spill_for(disp, reg) {
+                    if full {
+                        if cached_reg != reg {
+                            self.asm.mov(reg, cached_reg);
+                        }
+                        self.record_spill(disp, reg);
+                    } else {
+                        self.load_ext(reg, cached_reg, bytes, ext);
+                    }
+                    return;
+                }
+                self.load_ext(reg, self.frame_mem(disp), bytes, ext);
+                if bytes >= 8 {
+                    self.record_spill(disp, reg);
+                }
+            }
+        }
     }
 
     pub(super) fn raw(&mut self, reg: Reg, value: Value) {
+        if let Some(mem) = self.elided_mem(value) {
+            self.asm.load(Size::of(self.ty(value).bytes()), reg, mem);
+            self.clobber_reg(reg);
+            return;
+        }
         match self.location(value) {
             Location::Imm(imm) => self.asm.mov_imm(reg, imm),
+            Location::SlotAddr(sym) if self.direct_calls => {
+                let at = self.asm.lea_rip_reloc(reg);
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::X64RipRel32));
+            }
             Location::SlotAddr(sym) => {
                 let at = self.asm.mov_slot_reloc(reg);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
+            }
+            Location::Symbol(sym) => {
+                let at = self.asm.mov_abs64(reg);
+                self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs64));
             }
             Location::Frame(slot, offset) => {
                 let at = self.slot(slot, offset);
                 self.asm.lea(reg, at);
             }
-            Location::Reg(from) if from == reg => {}
+            Location::Reg(from) if from == reg => return,
             Location::Reg(from) => self.asm.mov(reg, from),
             Location::Float(from) => self.asm.movq_out(reg, Xmm(from)),
             Location::Slot => {
                 let disp = self.frame.values[value.index()];
                 debug_assert_ne!(disp, 0, "unhomed value {value:?} in raw()");
-                if let Some((cached_disp, cached_reg, stamp)) = self.last_spill
-                    && cached_disp == disp
-                    && stamp == self.asm.stamp()
-                {
+                if let Some(cached_reg) = self.cached_spill_for(disp, reg) {
                     if cached_reg != reg {
                         self.asm.mov(reg, cached_reg);
                     }
-                    self.last_spill = Some((disp, cached_reg, self.asm.stamp()));
                 } else {
-                    self.asm.load(Size::Q, reg, Mem::new(Reg::Rbp, disp));
+                    self.asm.load(Size::Q, reg, self.frame_mem(disp));
                 }
+                self.record_spill(disp, reg);
+                return;
             }
         }
+        self.clobber_reg(reg);
     }
 
     pub(super) fn put(&mut self, value: Value, reg: Reg) {
         match self.location(value) {
-            Location::Reg(location) if location == reg => {}
-            Location::Reg(location) => self.asm.mov(location, reg),
-            Location::Float(location) => self.asm.movq_in(Xmm(location), reg),
-            _ => {
-                let at = self.at(value);
-                self.asm.store(Size::Q, at, reg);
-                if self.ty(value).bytes() <= 8 {
-                    self.last_spill = Some((at.disp, reg, self.asm.stamp()));
+            Location::Reg(location) => {
+                if location != reg {
+                    self.asm.mov(location, reg);
                 }
+                self.clobber_reg(location);
             }
+            Location::Float(location) => {
+                self.clobber_xmm(Xmm(location));
+                self.asm.movq_in(Xmm(location), reg);
+            }
+            Location::Slot => self.store_reg_home(self.at(value), reg, self.ty(value).bytes()),
+            _ => self.clobber_reg(reg),
         }
     }
 
     /// Loads the float or vector of type `ty` at `from` into `xmm`; an 8-byte vector by `movq` and a 16-byte vector by `movdqu`, which needs no alignment.
     pub(super) fn xmm_load(&mut self, ty: Type, xmm: Xmm, from: Mem) {
+        if ty.is_wide_vec() {
+            return self.ymm_load(xmm, from);
+        }
+        if self.features.avx {
+            let (pp, opcode) = if ty.is_vector() {
+                (0b10, if ty.bytes() == 16 { 0x6F } else { 0x7E })
+            } else {
+                (if ty == Type::F64 { 0b11 } else { 0b10 }, 0x10)
+            };
+            return self.asm.vex_xmm(0b00001, pp, opcode, (xmm, Xmm(0)), from);
+        }
         if ty.is_vector() {
             let (prefix, opcode) = if ty.bytes() == 16 { (0xF3, 0x6F) } else { (0xF3, 0x7E) };
             self.asm.sse(&[prefix], &[0x0F, opcode], xmm.0, from);
@@ -262,6 +333,17 @@ impl Emit<'_> {
 
     /// Stores the float or vector of type `ty` in `xmm` to `to`.
     pub(super) fn xmm_store(&mut self, ty: Type, to: Mem, xmm: Xmm) {
+        if ty.is_wide_vec() {
+            return self.ymm_store(to, xmm);
+        }
+        if self.features.avx {
+            let (pp, opcode) = if ty.is_vector() {
+                if ty.bytes() == 16 { (0b10, 0x7F) } else { (0b01, 0xD6) }
+            } else {
+                (if ty == Type::F64 { 0b11 } else { 0b10 }, 0x11)
+            };
+            return self.asm.vex_xmm(0b00001, pp, opcode, (xmm, Xmm(0)), to);
+        }
         if ty.is_vector() {
             let (prefix, opcode) = if ty.bytes() == 16 { (0xF3, 0x7F) } else { (0x66, 0xD6) };
             self.asm.sse(&[prefix], &[0x0F, opcode], xmm.0, to);
@@ -275,27 +357,32 @@ impl Emit<'_> {
         let ty = self.ty(value);
         match self.location(value) {
             Location::Float(from) if Xmm(from) == xmm => {}
-            Location::Float(from) => self.asm.movaps(xmm, Xmm(from)),
+            Location::Float(from) => {
+                self.fmov(ty, xmm, Xmm(from));
+                self.clobber_xmm(xmm);
+            }
             Location::Imm(0) if ty.is_vector() => self.zero_xmm(xmm),
             Location::Slot => {
                 let disp = self.frame.values[value.index()];
                 debug_assert_ne!(disp, 0, "unhomed value {value:?} in fget()");
-                if let Some((cached_disp, cached_reg, cached_ty, stamp)) = self.last_fspill
+                if let Some((cached_disp, cached_reg, cached_ty)) = self.last_fspill
                     && cached_disp == disp
                     && cached_ty == ty
-                    && stamp == self.asm.stamp()
                 {
                     if cached_reg != xmm {
-                        self.asm.movaps(xmm, cached_reg);
+                        self.fmov(ty, xmm, cached_reg);
+                        self.clobber_xmm(xmm);
                     }
-                    self.last_fspill = Some((disp, cached_reg, cached_ty, self.asm.stamp()));
                 } else {
-                    self.xmm_load(ty, xmm, Mem::new(Reg::Rbp, disp));
+                    self.xmm_load(ty, xmm, self.frame_mem(disp));
+                    self.clobber_xmm(xmm);
+                    self.last_fspill = Some((disp, xmm, ty));
                 }
             }
             _ => {
                 self.raw(Reg::Rax, value);
                 self.asm.movq_in(xmm, Reg::Rax);
+                self.clobber_xmm(xmm);
             }
         }
     }
@@ -304,13 +391,13 @@ impl Emit<'_> {
     pub(super) fn fput(&mut self, value: Value, xmm: Xmm) {
         let ty = self.ty(value);
         match self.location(value) {
-            Location::Float(to) if Xmm(to) == xmm => {}
-            Location::Float(to) => self.asm.movaps(Xmm(to), xmm),
-            _ => {
-                let at = self.at(value);
-                self.xmm_store(ty, at, xmm);
-                self.last_fspill = Some((at.disp, xmm, ty, self.asm.stamp()));
+            Location::Float(to) => {
+                if Xmm(to) != xmm {
+                    self.fmov(ty, Xmm(to), xmm);
+                }
+                self.clobber_xmm(Xmm(to));
             }
+            _ => self.store_xmm_home(self.at(value), xmm, ty),
         }
     }
 
@@ -336,6 +423,9 @@ impl Emit<'_> {
 
     /// A register or memory operand that holds `value`, using r11 when `value` has no register or stack home.
     pub(super) fn operand(&mut self, value: Value) -> Rm {
+        if let Some(mem) = self.elided_mem(value) {
+            return mem.into();
+        }
         match self.location(value) {
             Location::Reg(reg) => reg.into(),
             Location::Slot => self.cached_spill(value).map_or_else(|| Rm::from(self.at(value)), Rm::from),
@@ -346,62 +436,70 @@ impl Emit<'_> {
         }
     }
 
-    /// Writes the eight (or sixteen) bytes of `value` to `to`, using rax or r11 as scratch; a float in a register writes the bytes of its type.
+    fn store_reg_home(&mut self, to: Mem, reg: Reg, bytes: u32) {
+        self.asm.store(Size::Q, to, reg);
+        if let Some(disp) = self.frame_disp(to) {
+            if bytes <= 8 {
+                self.write_spill(disp, reg);
+            } else {
+                self.invalidate_disp(disp);
+            }
+        }
+    }
+
+    /// Stores the float or vector of type `ty` in `xmm` to `to` in one store and caches it as the spill of a frame home.
+    pub(super) fn store_xmm_home(&mut self, to: Mem, xmm: Xmm, ty: Type) {
+        self.xmm_store(ty, to, xmm);
+        if let Some(disp) = self.frame_disp(to) {
+            self.invalidate_disp(disp);
+            self.last_fspill = Some((disp, xmm, ty));
+        }
+    }
+
+    /// Writes the eight (or sixteen) bytes of `value` to `to`, using rax as scratch; a float in a register writes the bytes of its type and a 16-byte vector goes through xmm2 in one store.
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
+        let stack_home = self.frame_disp(to);
+        let ty = self.ty(value);
         match self.location(value) {
-            Location::Imm(0) if self.ty(value).is_vector() => {
-                self.asm.store_imm(to, 0);
-                if self.ty(value).bytes() == 16 {
-                    self.asm.store_imm(to.offset(8), 0);
-                }
+            Location::Imm(0) if ty.is_vector() && ty.bytes() >= 16 => {
+                self.zero_xmm(X2);
+                return self.store_xmm_home(to, X2, ty);
             }
             Location::Imm(imm) => match i32::try_from(imm) {
                 Ok(small) => self.asm.store_imm(to, small),
                 Err(_) => {
-                    self.asm.mov_imm(Reg::R11, imm);
-                    self.asm.store(Size::Q, to, Reg::R11);
+                    self.asm.mov_imm(Reg::Rax, imm);
+                    self.clobber_reg(Reg::Rax);
+                    self.asm.store(Size::Q, to, Reg::Rax);
                 }
             },
-            Location::SlotAddr(sym) => {
+            Location::SlotAddr(sym) if !self.direct_calls => {
                 let at = self.asm.store_slot_reloc(to);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
             }
-            Location::Frame(..) => {
-                self.raw(Reg::R11, value);
-                self.asm.store(Size::Q, to, Reg::R11);
+            Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => {
+                self.raw(Reg::Rax, value);
+                self.asm.store(Size::Q, to, Reg::Rax);
             }
-            Location::Reg(reg) => {
-                self.asm.store(Size::Q, to, reg);
-                if to.base == Reg::Rbp && to.index.is_none() && self.ty(value).bytes() <= 8 {
-                    self.last_spill = Some((to.disp, reg, self.asm.stamp()));
-                }
-            }
-            Location::Float(xmm) => {
-                let ty = self.ty(value);
-                self.xmm_store(ty, to, Xmm(xmm));
-                if to.base == Reg::Rbp && to.index.is_none() {
-                    self.last_fspill = Some((to.disp, Xmm(xmm), ty, self.asm.stamp()));
-                }
-            }
+            Location::Reg(reg) => return self.store_reg_home(to, reg, ty.bytes()),
+            Location::Float(xmm) => return self.store_xmm_home(to, Xmm(xmm), ty),
             Location::Slot => {
-                let ty = self.ty(value);
                 if ty.bytes() <= 8 && let Some(cached_reg) = self.cached_spill(value) {
-                    self.asm.store(Size::Q, to, cached_reg);
-                    if to.base == Reg::Rbp && to.index.is_none() {
-                        self.last_spill = Some((to.disp, cached_reg, self.asm.stamp()));
-                    }
-                } else if let Some((cached_disp, cached_reg, cached_ty, stamp)) = self.last_fspill
+                    return self.store_reg_home(to, cached_reg, ty.bytes());
+                }
+                if let Some((cached_disp, cached_reg, cached_ty)) = self.last_fspill
                     && cached_disp == self.frame.values[value.index()]
                     && cached_ty == ty
-                    && stamp == self.asm.stamp()
                 {
-                    self.xmm_store(ty, to, cached_reg);
-                    if to.base == Reg::Rbp && to.index.is_none() {
-                        self.last_fspill = Some((to.disp, cached_reg, cached_ty, self.asm.stamp()));
-                    }
-                } else {
-                    self.copy_to(to, self.at(value), ty);
+                    return self.store_xmm_home(to, cached_reg, cached_ty);
                 }
+                return self.copy_to(to, self.at(value), ty, X2);
+            }
+        }
+        if let Some(disp) = stack_home {
+            self.invalidate_disp(disp);
+            if ty.bytes() == 16 {
+                self.invalidate_disp(disp + 8);
             }
         }
     }

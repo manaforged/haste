@@ -1,27 +1,36 @@
 use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, Value};
 
-pub(crate) fn order(func: &Function) -> Vec<Block> {
-    let Some(entry) = func.entry else { return Vec::new() };
-    let cfg = Cfg::new(func);
-    let loops = cfg.loops(func);
-    let mut can_exit = vec![false; func.blocks.len()];
+pub(crate) fn cold(func: &Function) -> Vec<bool> {
+    let cfg = func.cfg();
+    let mut cold = vec![true; func.blocks.len()];
     let mut work = Vec::new();
     for b in 0..func.blocks.len() {
         let block = Block(b as u32);
         if matches!(func.last(block), Some(Op::Return(_))) {
-            can_exit[b] = true;
+            cold[b] = false;
             work.push(block);
         }
     }
     while let Some(block) = work.pop() {
         for &pred in cfg.preds_of(block) {
-            if !std::mem::replace(&mut can_exit[pred.index()], true) {
+            if std::mem::replace(&mut cold[pred.index()], false) {
                 work.push(pred);
             }
         }
     }
-    let is_cold = |block: Block| block != entry && !can_exit[block.index()];
+    if let Some(entry) = func.entry {
+        cold[entry.index()] = false;
+    }
+    cold
+}
+
+pub(crate) fn order(func: &Function) -> Vec<Block> {
+    let Some(entry) = func.entry else { return Vec::new() };
+    let cfg = func.cfg();
+    let loops = cfg.loops();
+    let cold = cold(func);
+    let is_cold = |block: Block| cold[block.index()];
     let mut visited = vec![false; func.blocks.len()];
     let mut post = Vec::with_capacity(func.blocks.len());
     let mut stack = vec![(entry, false)];
@@ -98,13 +107,18 @@ pub(crate) fn for_effective_operands(data: &InstData, sib: &[Option<Sib>], elide
     if data.result.is_some_and(|res| elided.get(res.index()) == Some(&true)) {
         return;
     }
-    let visit_addr = |addr: Value, f: &mut dyn FnMut(Value)| match sib.get(addr.index()).copied().flatten() {
-        Some(mode) => {
-            if let SibBase::Value(base) = mode.base {
-                f(base);
-            }
-            f(mode.index);
+    let visit_mode = |mode: Sib, f: &mut dyn FnMut(Value)| {
+        if let SibBase::Value(base) = mode.base {
+            f(base);
         }
+        f(mode.index);
+    };
+    if let Some(mode) = data.result.and_then(|res| sib.get(res.index()).copied().flatten()) {
+        visit_mode(mode, &mut f);
+        return;
+    }
+    let visit_addr = |addr: Value, f: &mut dyn FnMut(Value)| match sib.get(addr.index()).copied().flatten() {
+        Some(mode) => visit_mode(mode, f),
         None => f(addr),
     };
     match &data.op {
@@ -124,7 +138,6 @@ pub(crate) struct Live {
     pub unwinds: Vec<u32>,
     pub calls: Vec<u32>,
     pub sites: Vec<(Inst, Block)>,
-    pub trapped: Vec<bool>,
 }
 
 impl Live {
@@ -291,7 +304,6 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
     let mut touched: Vec<usize> = Vec::new();
     let mut defs = vec![0; count];
     let (mut unwinds, mut calls, mut sites) = (Vec::new(), Vec::new(), Vec::new());
-    let mut trapped = vec![false; count];
     let mut at = 0_u32;
     for &block in order {
         let index = block.index();
@@ -382,9 +394,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
                     unwinds.push(at);
                 }
                 let traps = insts.get(place + 1).is_some_and(|next| matches!(func.insts[next.index()].op, Op::Trap));
-                if matches!(data.op, Op::Call { .. }) && traps {
-                    for_effective_operands(data, sib, elided, |v| trapped[v.index()] = true);
-                } else {
+                if !(traps && matches!(data.op, Op::Call { .. })) {
                     calls.push(at);
                     sites.push((inst, block));
                 }
@@ -425,7 +435,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
         ranges.extend(list);
         slice.push((off, len));
     }
-    Live { ranges, slice, defs, unwinds, calls, sites, trapped }
+    Live { ranges, slice, defs, unwinds, calls, sites }
 }
 
 pub(crate) fn results(data: &InstData) -> impl Iterator<Item = Value> + '_ {

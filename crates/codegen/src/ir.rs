@@ -3,6 +3,7 @@ use std::fmt;
 mod vector;
 
 pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
+pub(crate) use vector::{CfgCache, Domain};
 
 /// The machine type of one value.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -169,11 +170,15 @@ impl AbiParam {
         self
     }
 
-    /// Marks this parameter as pointing to `bytes` bytes of dereferenceable, immutable memory.
-    pub const fn with_deref_bytes(mut self, bytes: u32) -> Self {
-        self.readonly = true;
+    /// Marks this parameter as pointing to `bytes` bytes of dereferenceable memory.
+    pub const fn with_deref_size(mut self, bytes: u32) -> Self {
         self.deref_bytes = bytes;
         self
+    }
+
+    /// Marks this parameter as pointing to `bytes` bytes of dereferenceable, immutable memory.
+    pub const fn with_deref_bytes(self, bytes: u32) -> Self {
+        self.with_readonly().with_deref_size(bytes)
     }
 }
 
@@ -313,10 +318,14 @@ pub(crate) enum Binary {
     Fmin,
     Fmax,
     Fcopysign,
+    SaddSat,
+    UaddSat,
+    SsubSat,
+    UsubSat,
+    AvgRound,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[repr(u8)]
 pub(crate) enum Convert {
     Uextend,
     Sextend,
@@ -328,6 +337,7 @@ pub(crate) enum Convert {
     ToSintSat,
     ToUintSat,
     Bitcast,
+    NarrowSat { signed: bool },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -338,6 +348,7 @@ pub(crate) enum Op {
     Runtime(crate::reloc::RuntimeSymbol),
     Unary(Unary, Value),
     Binary(Binary, Value, Value),
+    Fma(Value, Value, Value),
     Convert(Convert, Value),
     Icmp(IntCC, Value, Value),
     /// 1 when `x op y` (add, sub or mul, signed when the flag is set) fits the type of `x`, else 0.
@@ -377,6 +388,8 @@ pub(crate) enum Op {
     Return(Vec<Value>),
     Trap,
     Trapz(Value),
+    /// States that the value is nonzero wherever control reaches this; it emits nothing and the schedule drops it before encoding.
+    Assume(Value),
 }
 
 impl Op {
@@ -402,7 +415,8 @@ impl Op {
             | Op::Insert(..)
             | Op::Reduce(..)
             | Op::TargetOp(..)
-            | Op::Select(..) => true,
+            | Op::Select(..)
+            | Op::Fma(..) => true,
             _ => false,
         }
     }
@@ -448,7 +462,7 @@ impl Op {
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => f(*x),
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) | Op::Assume(x) => f(*x),
             Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Insert(x, y, _) | Op::Store(x, y, _) | Op::AtomicStore(x, y) | Op::AtomicRmw(_, x, y) | Op::Move(x, y, _) => {
                 f(*x);
                 f(*y);
@@ -461,7 +475,7 @@ impl Op {
                 }
             }
             Op::TargetOp(_, args) => args.as_slice().iter().for_each(|arg| f(*arg)),
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
                 f(*c);
                 f(*x);
                 f(*y);
@@ -483,7 +497,7 @@ impl Op {
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) => {
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x) | Op::Trapz(x) | Op::Assume(x) => {
                 *x = f(*x);
             }
             Op::Binary(_, x, y)
@@ -506,7 +520,7 @@ impl Op {
                 }
             }
             Op::TargetOp(_, args) => args.as_mut_slice().iter_mut().for_each(|arg| *arg = f(*arg)),
-            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) => {
+            Op::Select(c, x, y) | Op::AtomicCas(c, x, y) | Op::Copy(c, x, y) | Op::Fma(c, x, y) => {
                 *c = f(*c);
                 *x = f(*x);
                 *y = f(*y);
@@ -558,12 +572,29 @@ pub struct Function {
     pub(crate) self_slots: Vec<u32>,
     pub(crate) vtable_slots: Vec<(u32, i32, u32, bool)>,
     pub(crate) rodata_bytes: Vec<(u32, Vec<u8>)>,
+    pub(crate) cfg_rev: u32,
+    pub(crate) cfg_cache: CfgCache,
 }
 
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), cfg_rev: 0, cfg_cache: CfgCache::default() }
+    }
+
+    pub(crate) fn bump_cfg(&mut self) {
+        self.cfg_rev = self.cfg_rev.wrapping_add(1);
+    }
+
+    pub(crate) fn cfg(&self) -> std::sync::Arc<crate::cfg::Cfg> {
+        let mut guard = self.cfg_cache.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((rev, cfg)) = &mut *guard && (*rev == self.cfg_rev || cfg.matches(self)) {
+            *rev = self.cfg_rev;
+            return std::sync::Arc::clone(cfg);
+        }
+        let cfg = std::sync::Arc::new(crate::cfg::Cfg::new(self));
+        *guard = Some((self.cfg_rev, std::sync::Arc::clone(&cfg)));
+        cfg
     }
 
     /// Associates symbol index `sym` with known read-only constant bytes for load folding.
@@ -671,25 +702,25 @@ impl Function {
         self.blocks.iter().map(|block| block.insts.len()).sum()
     }
 
+    /// The number of non-trivial instructions in the body, discounting constant and address-materialization ops.
+    pub fn inline_size(&self) -> usize {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| !matches!(self.insts[i.index()].op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::SlotAddr(_)))
+            .count()
+    }
+
     /// Whether `FunctionBuilder::inline` can copy this function into a caller: it is no coroutine, catches no unwind and reads no frame pointer.
     pub fn can_inline(&self) -> bool {
         self.coroutine.is_none()
             && self.entry.is_some()
-            && !self
-                .blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .map(|i| &self.insts[i.index()])
-                .any(|data| matches!(data.op, Op::TryCall { .. } | Op::FramePointer))
+            && !self.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(self.insts[i.index()].op, Op::TryCall { .. } | Op::FramePointer))
     }
 
     /// Whether any instruction in this body returns to its caller.
     pub fn has_return(&self) -> bool {
-        self.blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .map(|i| &self.insts[i.index()])
-            .any(|data| matches!(data.op, Op::Return(_)))
+        self.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(self.insts[i.index()].op, Op::Return(_)))
     }
 
     /// For each value, the block that defines it.

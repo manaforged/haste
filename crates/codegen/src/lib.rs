@@ -20,6 +20,7 @@ mod ifconv;
 mod licm;
 mod live;
 mod loads;
+mod lsr;
 pub(crate) mod mem;
 mod merge;
 mod native;
@@ -27,12 +28,14 @@ mod park;
 mod promote;
 mod reloc;
 mod returns;
+mod rotate;
 mod schedule;
 mod split;
 mod switch;
 mod tailrec;
 mod target;
 mod thread;
+pub mod trace;
 mod unroll;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
@@ -45,6 +48,7 @@ macro_rules! value_op {
                 Op::Convert(op, x) => self.convert(*op, *x, result()?),
                 Op::Icmp(cc, x, y) => self.icmp(*cc, *x, *y, result()?),
                 Op::Fits(op, signed, x, y) => self.fits(*op, *signed, (*x, *y), result()?),
+                Op::Fma(a, b, c) => self.fma(*a, *b, *c, result()?),
                 Op::Fcmp(cc, x, y) => {
                     self.fcmp(*cc, *x, *y, result()?);
                     Ok(())
@@ -65,6 +69,9 @@ pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
 pub use reloc::{DictTierUp, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
 pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
+pub use trace::{missed_report, with_label as with_trace_label};
+
+use std::ops::Range;
 
 /// A call site that has an exception handler, as offsets into its function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,19 +81,20 @@ pub struct Site {
     pub frame_offset: u32,
 }
 
-/// Machine code for one function, its exception call sites, and its stencil relocations.
+/// Machine code for one function, its exception call sites, its stencil relocations, and its small loops.
 #[must_use]
 #[derive(Clone, Debug)]
 pub struct Code {
     bytes: Vec<u8>,
     sites: Vec<Site>,
     relocs: Vec<StencilReloc>,
+    loops: Vec<Range<u32>>,
 }
 
 impl Code {
-    /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, and relocations.
-    pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>) -> Self {
-        Self { bytes, sites, relocs }
+    /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, relocations, and small loop ranges.
+    pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>, loops: Vec<Range<u32>>) -> Self {
+        Self { bytes, sites, relocs, loops }
     }
 
     /// The machine code.
@@ -102,6 +110,11 @@ impl Code {
     /// The relocations inside `bytes`.
     pub fn relocs(&self) -> &[StencilReloc] {
         &self.relocs
+    }
+
+    /// The byte ranges of the small innermost loops, which run slower when they cross a page boundary.
+    pub fn loops(&self) -> &[Range<u32>] {
+        &self.loops
     }
 
     /// Copies `bytes` into `out` and patches every relocation against `symbols`.
@@ -134,20 +147,27 @@ impl Target {
 
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
 pub fn simplify(func: &mut Function, effort: Effort) {
-    schedule::run(func, promote::Moves::Guided, effort);
+    schedule::run(func, promote::Moves::Guided, &Target::host().effort(effort));
     fold::compact(func);
 }
 
 /// Encodes `func` for `target`.
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
-    verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, message))?;
-    schedule::run(&mut func, promote::Moves::Split, target.effort);
+    verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, message))?;
+    let tracing = trace::enabled();
+    if tracing {
+        trace::on_compile_start(&func);
+    }
+    schedule::run(&mut func, promote::Moves::Split, target);
+    if tracing {
+        trace::on_compile_end(&func);
+    }
     if !matches!(target.arch, Arch::X64 | Arch::Arm64) {
         copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
     }
     native::lower(&mut func);
-    verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
+    verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
     let code = match target.arch {
         Arch::X64 => x64::compile(&func, target),
         Arch::Arm64 => arm64::compile(&func, target),

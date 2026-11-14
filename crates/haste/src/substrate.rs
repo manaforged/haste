@@ -1,29 +1,40 @@
-//! Toolchain-scoped mmap-able substrate for frozen sysroot summaries, stencils, and symbols.
+//! Toolchain- and dependency-scoped mmap-able substrate for frozen summaries, stencils, and symbols.
+
+mod inline;
+mod keys;
+pub mod noop;
+pub mod relocs;
+pub(crate) mod tally;
+mod trim;
+
+pub use inline::{InlineKey, InlineShape};
+pub use keys::{
+    deps_key, deps_path, enabled, layer_item_key, sysroot_item_key, sysroot_only_item_key, target_hash, toolchain_key,
+    toolchain_path, workspace_key, workspace_path,
+};
 
 use std::cmp::Ordering;
 use std::fmt;
 use std::fs::File;
-use std::hash::{Hash as _, Hasher as _};
-use std::io::{self, Write as _};
+use std::io;
+use std::ops::Range;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use haste_codegen::{Code, RelocKind, Site, StencilReloc, Target};
-use rustc_hash::FxHasher;
+use haste_codegen::{Code, RelocKind, Site, StencilReloc};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 11;
+const VERSION: u32 = 21;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
-const STENCIL_REC_LEN: usize = 48;
+const STENCIL_REC_LEN: usize = 64;
 const INSTANCE_REC_LEN: usize = 24;
 const SITE_WIRE_LEN: usize = 12;
 const RELOC_WIRE_LEN: usize = 12;
-
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+const LOOP_WIRE_LEN: usize = 8;
 
 /// Zero-copy view of a pre-compiled `Effort::Full` stencil in a substrate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +42,8 @@ pub struct StencilSlice<'a> {
     code: &'a [u8],
     sites: &'a [u8],
     relocs: &'a [u8],
+    plan: &'a [u8],
+    loops: &'a [u8],
 }
 
 impl<'a> StencilSlice<'a> {
@@ -39,43 +52,43 @@ impl<'a> StencilSlice<'a> {
         self.code
     }
 
+    /// Serialized portable relocation plan bytes, empty when absent.
+    pub fn plan(&self) -> &'a [u8] {
+        self.plan
+    }
+
     /// Decodes the unwind site table into `Site` records.
     pub fn decode_sites(&self) -> Result<Vec<Site>> {
-        if self.sites.len() % SITE_WIRE_LEN != 0 {
-            bail!("misaligned site table");
-        }
-        let mut out = Vec::with_capacity(self.sites.len() / SITE_WIRE_LEN);
-        for at in (0..self.sites.len()).step_by(SITE_WIRE_LEN) {
-            out.push(Site {
-                ret: read_u32(self.sites, at),
-                handler: read_u32(self.sites, at + 4),
-                frame_offset: read_u32(self.sites, at + 8),
-            });
-        }
-        Ok(out)
+        let sites = self.sites;
+        decode_table(sites, SITE_WIRE_LEN, "site", |at| {
+            Ok(Site { ret: read_u32(sites, at), handler: read_u32(sites, at + 4), frame_offset: read_u32(sites, at + 8) })
+        })
     }
 
     /// Decodes the relocation descriptor table into `StencilReloc` records.
     pub fn decode_relocs(&self) -> Result<Vec<StencilReloc>> {
-        if self.relocs.len() % RELOC_WIRE_LEN != 0 {
-            bail!("misaligned reloc table");
-        }
-        let mut out = Vec::with_capacity(self.relocs.len() / RELOC_WIRE_LEN);
-        for at in (0..self.relocs.len()).step_by(RELOC_WIRE_LEN) {
-            let kind = decode_reloc_kind(self.relocs[at + 8])?;
-            out.push(StencilReloc {
-                offset: read_u32(self.relocs, at),
-                symbol: read_u32(self.relocs, at + 4),
-                kind,
-            });
-        }
-        Ok(out)
+        let relocs = self.relocs;
+        decode_table(relocs, RELOC_WIRE_LEN, "reloc", |at| {
+            Ok(StencilReloc { offset: read_u32(relocs, at), symbol: read_u32(relocs, at + 4), kind: decode_reloc_kind(relocs[at + 8])? })
+        })
+    }
+
+    fn decode_loops(&self) -> Result<Vec<Range<u32>>> {
+        let loops = self.loops;
+        decode_table(loops, LOOP_WIRE_LEN, "loop", |at| Ok(read_u32(loops, at)..read_u32(loops, at + 4)))
     }
 
     /// Decodes this slice into a `Code` stencil buffer.
     pub fn to_code(&self) -> Result<Code> {
-        Ok(Code::from_parts(self.code.to_vec(), self.decode_sites()?, self.decode_relocs()?))
+        Ok(Code::from_parts(self.code.to_vec(), self.decode_sites()?, self.decode_relocs()?, self.decode_loops()?))
     }
+}
+
+fn decode_table<T>(bytes: &[u8], width: usize, name: &str, entry: impl FnMut(usize) -> Result<T>) -> Result<Vec<T>> {
+    if bytes.len() % width != 0 {
+        bail!("misaligned {name} table");
+    }
+    (0..bytes.len()).step_by(width).map(entry).collect()
 }
 
 enum Backing {
@@ -123,10 +136,11 @@ struct Header {
     blob_len: usize,
 }
 
-/// Mmap-backed frozen sysroot substrate storing summaries, stencils, and concrete instances.
+/// Mmap-backed frozen substrate storing summaries, stencils, and concrete instances.
 pub struct Substrate {
     backing: Backing,
     header: Header,
+    parent: Option<Arc<Substrate>>,
 }
 
 impl fmt::Debug for Substrate {
@@ -137,67 +151,9 @@ impl fmt::Debug for Substrate {
             .field("summaries", &self.header.summary_count)
             .field("stencils", &self.header.stencil_count)
             .field("instances", &self.header.instance_count)
+            .field("has_parent", &self.parent.is_some())
             .finish()
     }
-}
-
-/// Returns the toolchain-scoped substrate path under `$HASTE_HOME` / `$XDG_CACHE_HOME/haste` / `$HOME/.cache/haste`.
-pub fn toolchain_path(toolchain_hash: u64) -> PathBuf {
-    crate::graph::store::home().join("toolchain").join(format!("{toolchain_hash:016x}.substrate"))
-}
-
-/// Computes a workspace-invariant key for a sysroot item, or `None` for non-sysroot items.
-pub fn sysroot_item_key(outline: &crate::outline::Outline, item: crate::names::ItemRef) -> Option<u64> {
-    let krate = outline.crates.get(item.krate as usize)?;
-    if !krate.env.release || !krate.env.fixed {
-        return None;
-    }
-    let root = outline.roots.get(item.krate as usize)?;
-    let file = krate.files.get(item.file as usize)?;
-    if file.expanded && file.expand_origin == 0 {
-        return None;
-    }
-    let (base_item, sub_idx) = match item.outer() {
-        Some((outer, sub)) => (outer.item, Some(sub)),
-        None => (item.item, None),
-    };
-    let entry = file.items.items.get(base_item as usize)?;
-    let base_dir = root.path.parent().unwrap_or(Path::new(""));
-    let rel_path = file.source.path.strip_prefix(base_dir).unwrap_or(&file.source.path);
-    let mut hasher = FxHasher::default();
-    root.name.hash(&mut hasher);
-    krate.env.target.triple.hash(&mut hasher);
-    rel_path.hash(&mut hasher);
-    file.expanded.hash(&mut hasher);
-    if file.expanded {
-        file.expand_origin.hash(&mut hasher);
-        file.source.offset.hash(&mut hasher);
-        file.source.text.hash(&mut hasher);
-    }
-    item.item.hash(&mut hasher);
-    sub_idx.hash(&mut hasher);
-    entry.start.hash(&mut hasher);
-    entry.kind.hash(&mut hasher);
-    if let Some(name_tok) = entry.name {
-        file.source.text(name_tok).hash(&mut hasher);
-    }
-    Some(hasher.finish())
-}
-
-/// Returns whether substrate caching is enabled (disabled when `HASTE_NO_SUBSTRATE=1`).
-pub fn enabled() -> bool {
-    std::env::var_os("HASTE_NO_SUBSTRATE").is_none_or(|v| v != "1")
-}
-
-/// Computes a 64-bit fingerprint for `target` and the running compiler binary.
-pub fn target_hash(target: &Target) -> u64 {
-    let mut hasher = FxHasher::default();
-    target.triple.hash(&mut hasher);
-    target.effort.hash(&mut hasher);
-    if let Ok(exe) = std::env::current_exe() {
-        hash_file_meta(&exe, &mut hasher);
-    }
-    hasher.finish()
 }
 
 /// Patches a frozen `StencilSlice` against `symbols` into a fresh byte buffer, or fails if any relocation is runtime-only.
@@ -213,83 +169,6 @@ pub fn patch_stencil(slice: &StencilSlice<'_>, symbols: &[u64]) -> Result<Vec<u8
             .map_err(|err| anyhow!("{err}"))?;
     }
     Ok(buf)
-}
-
-fn hash_file_meta(path: &Path, hasher: &mut FxHasher) {
-    (path, crate::graph::store::file_stamp(path)).hash(hasher);
-}
-
-fn sysroot_library_roots(workspace: &crate::graph::Workspace, units: &[usize]) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = units
-        .iter()
-        .map(|&idx| {
-            let dir = &workspace.packages[workspace.graph.units[idx].package].manifest.dir;
-            dir.ancestors().find(|a| a.file_name().is_some_and(|n| n == "library")).unwrap_or(dir.as_path()).to_owned()
-        })
-        .collect();
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-fn hash_sysroot_rs(dir: &Path, hasher: &mut FxHasher) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut children: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect();
-    children.sort();
-    for child in children {
-        if matches!(child.file_name().and_then(|n| n.to_str()), Some("target" | ".git")) {
-            continue;
-        }
-        let Ok(meta) = std::fs::metadata(&child) else { continue };
-        if meta.is_dir() {
-            hash_sysroot_rs(&child, hasher);
-        } else if child.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-            (child, crate::graph::store::meta_stamp(&meta)).hash(hasher);
-        }
-    }
-}
-
-/// Computes a workspace-invariant toolchain key from sysroot packages, target, and compiler binary.
-pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u64 {
-    let mut sysroot_units: Vec<(&str, crate::graph::Side, usize)> = workspace
-        .graph
-        .units
-        .iter()
-        .enumerate()
-        .filter(|(_, unit)| workspace.packages[unit.package].sysroot)
-        .map(|(idx, unit)| (workspace.packages[unit.package].locked.name.as_str(), unit.side, idx))
-        .collect();
-    sysroot_units.sort_unstable_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
-    let mut hasher = FxHasher::default();
-    target.triple.hash(&mut hasher);
-    target.effort.hash(&mut hasher);
-    crate::graph::store::program().hash(&mut hasher);
-    if let Ok(exe) = std::env::current_exe() {
-        hash_file_meta(&exe, &mut hasher);
-    }
-    MAGIC.hash(&mut hasher);
-    VERSION.hash(&mut hasher);
-    let mut unit_indices = Vec::with_capacity(sysroot_units.len());
-    for (_, _, idx) in sysroot_units {
-        unit_indices.push(idx);
-        let unit = &workspace.graph.units[idx];
-        let pkg = &workspace.packages[unit.package];
-        let locked = &pkg.locked;
-        locked.name.hash(&mut hasher);
-        locked.version.to_string().hash(&mut hasher);
-        locked.source.hash(&mut hasher);
-        matches!(unit.side, crate::graph::Side::Host).hash(&mut hasher);
-        if let Some(lib) = &pkg.manifest.lib {
-            hash_file_meta(lib, &mut hasher);
-        }
-        for feat in &unit.features {
-            feat.hash(&mut hasher);
-        }
-    }
-    for root in sysroot_library_roots(workspace, &unit_indices) {
-        hash_sysroot_rs(&root, &mut hasher);
-    }
-    hasher.finish()
 }
 
 /// Encodes `sites` into compact fixed-width little-endian bytes.
@@ -313,6 +192,14 @@ pub fn encode_relocs(relocs: &[StencilReloc], out: &mut Vec<u8>) {
     }
 }
 
+fn encode_loops(loops: &[Range<u32>], out: &mut Vec<u8>) {
+    out.reserve(loops.len() * LOOP_WIRE_LEN);
+    for range in loops {
+        out.extend_from_slice(&range.start.to_le_bytes());
+        out.extend_from_slice(&range.end.to_le_bytes());
+    }
+}
+
 impl Substrate {
     /// Opens and memory-maps a substrate file from `path`, validating its header and section bounds.
     pub fn open(path: &Path) -> Result<Self> {
@@ -329,8 +216,7 @@ impl Substrate {
             return Err(io::Error::last_os_error()).with_context(|| format!("mmap {}", path.display()));
         }
         let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(|| anyhow!("mmap returned null pointer"))?;
-        let backing = Backing::Mmap { ptr, len };
-        Self::from_backing(backing)
+        Self::from_backing(Backing::Mmap { ptr, len })
     }
 
     /// Opens the substrate for `toolchain_hash` from the toolchain cache directory.
@@ -342,6 +228,30 @@ impl Substrate {
         Ok(substrate)
     }
 
+    fn open_scoped(path: &Path, scope_hash: u64, target_hash: u64) -> Result<Self> {
+        let substrate = Self::open(path)?;
+        if substrate.header.toolchain_hash != scope_hash || substrate.header.target_hash != target_hash {
+            bail!("scoped substrate hash mismatch");
+        }
+        Ok(substrate)
+    }
+
+    /// Opens the dependency substrate for `(deps_hash, target_hash)` from the dependency cache directory.
+    pub fn open_deps(deps_hash: u64, target_hash: u64) -> Result<Self> {
+        Self::open_scoped(&deps_path(deps_hash), deps_hash, target_hash)
+    }
+
+    /// Opens the local workspace substrate for `(ws_hash, target_hash)` from the workspace cache directory.
+    pub fn open_workspace(ws_hash: u64, target_hash: u64) -> Result<Self> {
+        Self::open_scoped(&workspace_path(ws_hash), ws_hash, target_hash)
+    }
+
+    /// Chains `parent` as a fallback layer consulted after this substrate.
+    pub fn with_parent(mut self, parent: Arc<Substrate>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
     /// Constructs a substrate from an in-memory byte buffer.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         Self::from_backing(Backing::Owned(bytes))
@@ -349,7 +259,7 @@ impl Substrate {
 
     fn from_backing(backing: Backing) -> Result<Self> {
         let header = parse_and_validate(backing.as_slice())?;
-        Ok(Self { backing, header })
+        Ok(Self { backing, header, parent: None })
     }
 
     /// Starts building a new frozen substrate.
@@ -357,7 +267,7 @@ impl Substrate {
         SubstrateBuilder::default()
     }
 
-    /// Toolchain fingerprint this substrate was compiled for.
+    /// Toolchain or dependency scope fingerprint this substrate was compiled for.
     pub fn toolchain_hash(&self) -> u64 {
         self.header.toolchain_hash
     }
@@ -367,18 +277,17 @@ impl Substrate {
         self.header.target_hash
     }
 
-    /// Number of frozen `PolySummary` entries.
-    pub fn summary_count(&self) -> usize {
-        self.header.summary_count
-    }
-
-    /// Number of frozen `Effort::Full` stencil entries.
-    pub fn stencil_count(&self) -> usize {
-        self.header.stencil_count
+    /// Returns whether this substrate layer holds any summaries, stencils, or concrete instances.
+    pub fn has_entries(&self) -> bool {
+        self.header.summary_count > 0 || self.header.stencil_count > 0 || self.header.instance_count > 0
     }
 
     /// Looks up a frozen `PolySummary` payload by `item_hash` in `O(log N)`.
     pub fn summary(&self, item_hash: u64) -> Option<&[u8]> {
+        self.local_summary(item_hash).or_else(|| self.parent.as_deref().and_then(|p| p.summary(item_hash)))
+    }
+
+    fn local_summary(&self, item_hash: u64) -> Option<&[u8]> {
         let data = self.backing.as_slice();
         let idx = binary_search_index(self.header.summary_count, |i| {
             let rec = self.header.summaries_off + i * SUMMARY_REC_LEN;
@@ -392,6 +301,10 @@ impl Substrate {
 
     /// Looks up a frozen `Effort::Full` stencil by `(item_hash, footprint)` in `O(log N)`.
     pub fn stencil(&self, item_hash: u64, footprint: u128) -> Option<StencilSlice<'_>> {
+        self.local_stencil(item_hash, footprint).or_else(|| self.parent.as_deref().and_then(|p| p.stencil(item_hash, footprint)))
+    }
+
+    fn local_stencil(&self, item_hash: u64, footprint: u128) -> Option<StencilSlice<'_>> {
         let data = self.backing.as_slice();
         let fp_lo = footprint as u64;
         let fp_hi = (footprint >> 64) as u64;
@@ -402,15 +315,22 @@ impl Substrate {
             let k_hi = read_u64(data, rec + 16);
             (k_item, k_hi, k_lo).cmp(&(item_hash, fp_hi, fp_lo))
         })?;
-        let rec = self.header.stencils_off + idx * STENCIL_REC_LEN;
-        let code = self.blob_slice(read_u32(data, rec + 24) as usize, read_u32(data, rec + 28) as usize)?;
-        let sites = self.blob_slice(read_u32(data, rec + 32) as usize, read_u32(data, rec + 36) as usize)?;
-        let relocs = self.blob_slice(read_u32(data, rec + 40) as usize, read_u32(data, rec + 44) as usize)?;
-        Some(StencilSlice { code, sites, relocs })
+        self.stencil_at(self.header.stencils_off + idx * STENCIL_REC_LEN)
     }
 
-    /// Iterates frozen concrete sysroot instance payloads matching `(item_hash, substs_hash)` in `O(log N)`.
+    fn stencil_at(&self, rec: usize) -> Option<StencilSlice<'_>> {
+        let data = self.backing.as_slice();
+        let blob = |at: usize| self.blob_slice(read_u32(data, rec + at) as usize, read_u32(data, rec + at + 4) as usize);
+        Some(StencilSlice { code: blob(24)?, sites: blob(32)?, relocs: blob(40)?, plan: blob(48)?, loops: blob(56)? })
+    }
+
+    /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its parent.
     pub fn instance_candidates(&self, item_hash: u64, substs_hash: u64) -> impl Iterator<Item = &[u8]> + '_ {
+        self.local_instance_candidates(item_hash, substs_hash)
+            .chain(self.parent.as_deref().into_iter().flat_map(move |p| p.local_instance_candidates(item_hash, substs_hash)))
+    }
+
+    fn local_instance_candidates(&self, item_hash: u64, substs_hash: u64) -> impl Iterator<Item = &[u8]> + '_ {
         let data = self.backing.as_slice();
         let count = self.header.instance_count;
         let base = self.header.instances_off;
@@ -426,30 +346,31 @@ impl Substrate {
 
     /// Atomically writes the substrate to `path` via a sibling temporary file and rename.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-        }
-        let seq = TMP_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
-        let tmp = path.with_extension(format!("substrate.tmp.{}.{seq}", std::process::id()));
-        let write_res = (|| -> io::Result<()> {
-            let mut file = File::create(&tmp)?;
-            file.write_all(self.backing.as_slice())?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        if let Err(err) = write_res {
-            drop(std::fs::remove_file(&tmp));
-            return Err(err).with_context(|| format!("write {}", tmp.display()));
-        }
-        std::fs::rename(&tmp, path).inspect_err(|_| drop(std::fs::remove_file(&tmp))).with_context(|| format!("rename {}", path.display()))
+        crate::graph::store::write_new_bytes(path, self.backing.as_slice()).with_context(|| format!("writing {}", path.display()))
     }
 
-    /// Atomically saves the substrate into the toolchain cache directory.
+    /// Atomically saves the substrate into the toolchain cache directory and prunes superseded toolchain/deps substrates.
     pub fn save_toolchain(&self) -> Result<PathBuf> {
         let path = toolchain_path(self.header.toolchain_hash);
         self.save(&path)?;
+        prune_superseded(self.header.toolchain_hash);
+        Ok(path)
+    }
+
+    /// Atomically saves the substrate into the dependency cache directory.
+    pub fn save_deps(&self) -> Result<PathBuf> {
+        self.save_scoped(deps_path(self.header.toolchain_hash), 16)
+    }
+
+    /// Atomically saves the substrate into the workspace cache directory (bounded LRU <= 8 workspaces).
+    pub fn save_workspace(&self) -> Result<PathBuf> {
+        self.save_scoped(workspace_path(self.header.toolchain_hash), 7)
+    }
+
+    fn save_scoped(&self, path: PathBuf, keep_others: usize) -> Result<PathBuf> {
+        self.save(&path)?;
         if let Some(dir) = path.parent() {
-            prune_stale_substrates(dir, &path);
+            prune_stale_substrates(dir, &path, keep_others);
         }
         Ok(path)
     }
@@ -481,6 +402,10 @@ struct PendingStencil {
     sites_len: u32,
     relocs_off: u32,
     relocs_len: u32,
+    plan_off: u32,
+    plan_len: u32,
+    loops_off: u32,
+    loops_len: u32,
 }
 
 struct PendingInstance {
@@ -490,7 +415,7 @@ struct PendingInstance {
     len: u32,
 }
 
-/// Builder that packs sorted sysroot summaries, stencils, and concrete instances into a `Substrate`.
+/// Builder that packs sorted summaries, stencils, and concrete instances into a `Substrate`.
 #[derive(Default)]
 #[must_use]
 pub struct SubstrateBuilder {
@@ -516,7 +441,7 @@ impl fmt::Debug for SubstrateBuilder {
 }
 
 impl SubstrateBuilder {
-    /// Sets the toolchain fingerprint.
+    /// Sets the toolchain or dependency scope fingerprint.
     pub fn toolchain_hash(mut self, hash: u64) -> Self {
         self.toolchain_hash = hash;
         self
@@ -528,7 +453,12 @@ impl SubstrateBuilder {
         self
     }
 
-    /// Appends all summaries and stencils from an existing `Substrate` into this builder.
+    /// Returns whether no summaries, stencils, or concrete instances have been added yet.
+    pub fn is_empty(&self) -> bool {
+        self.summaries.is_empty() && self.stencils.is_empty() && self.instances.is_empty()
+    }
+
+    /// Appends all summaries, stencils, and instances from `existing`'s own backing into this builder.
     pub fn merge_from(&mut self, existing: &Substrate) -> Result<()> {
         let data = existing.backing.as_slice();
         for i in 0..existing.header.summary_count {
@@ -545,10 +475,7 @@ impl SubstrateBuilder {
             let fp_lo = read_u64(data, rec + 8);
             let fp_hi = read_u64(data, rec + 16);
             let footprint = u128::from(fp_lo) | (u128::from(fp_hi) << 64);
-            let code = existing.blob_slice(read_u32(data, rec + 24) as usize, read_u32(data, rec + 28) as usize).context("corrupt existing stencil code")?;
-            let sites = existing.blob_slice(read_u32(data, rec + 32) as usize, read_u32(data, rec + 36) as usize).context("corrupt existing stencil sites")?;
-            let relocs = existing.blob_slice(read_u32(data, rec + 40) as usize, read_u32(data, rec + 44) as usize).context("corrupt existing stencil relocs")?;
-            self.add_stencil(item_hash, footprint, code, sites, relocs)?;
+            self.push_stencil(item_hash, footprint, existing.stencil_at(rec).context("corrupt existing stencil")?)?;
         }
         for i in 0..existing.header.instance_count {
             let rec = existing.header.instances_off + i * INSTANCE_REC_LEN;
@@ -569,7 +496,7 @@ impl SubstrateBuilder {
         Ok(())
     }
 
-    /// Appends a serialized concrete sysroot instance entry.
+    /// Appends a serialized concrete instance entry.
     pub fn add_instance(&mut self, item_hash: u64, substs_hash: u64, bytes: &[u8]) -> Result<()> {
         let (off, len) = self.push_blob(bytes)?;
         self.instances.push(PendingInstance { item_hash, substs_hash, off, len });
@@ -578,9 +505,20 @@ impl SubstrateBuilder {
 
     /// Appends a pre-compiled `Effort::Full` stencil entry.
     pub fn add_stencil(&mut self, item_hash: u64, footprint: u128, code: &[u8], sites: &[u8], relocs: &[u8]) -> Result<()> {
-        let (code_off, code_len) = self.push_blob(code)?;
-        let (sites_off, sites_len) = self.push_blob(sites)?;
-        let (relocs_off, relocs_len) = self.push_blob(relocs)?;
+        self.add_stencil_with_plan(item_hash, footprint, code, sites, relocs, &[])
+    }
+
+    /// Appends a pre-compiled stencil entry with an optional serialized portable `RelocPlan`.
+    pub fn add_stencil_with_plan(&mut self, item_hash: u64, footprint: u128, code: &[u8], sites: &[u8], relocs: &[u8], plan: &[u8]) -> Result<()> {
+        self.push_stencil(item_hash, footprint, StencilSlice { code, sites, relocs, plan, loops: &[] })
+    }
+
+    fn push_stencil(&mut self, item_hash: u64, footprint: u128, slice: StencilSlice<'_>) -> Result<()> {
+        let (code_off, code_len) = self.push_blob(slice.code)?;
+        let (sites_off, sites_len) = self.push_blob(slice.sites)?;
+        let (relocs_off, relocs_len) = self.push_blob(slice.relocs)?;
+        let (plan_off, plan_len) = self.push_blob(slice.plan)?;
+        let (loops_off, loops_len) = self.push_blob(slice.loops)?;
         self.stencils.push(PendingStencil {
             item_hash,
             fp_lo: footprint as u64,
@@ -591,30 +529,42 @@ impl SubstrateBuilder {
             sites_len,
             relocs_off,
             relocs_len,
+            plan_off,
+            plan_len,
+            loops_off,
+            loops_len,
         });
         Ok(())
     }
 
     /// Appends a compiled `haste_codegen::Code` stencil by encoding its bytes, sites, and relocations.
     pub fn add_code_stencil(&mut self, item_hash: u64, footprint: u128, code: &Code) -> Result<()> {
+        self.add_code_stencil_with_plan(item_hash, footprint, code, &[])
+    }
+
+    /// Appends a compiled `haste_codegen::Code` stencil together with serialized portable `RelocPlan` bytes.
+    pub fn add_code_stencil_with_plan(&mut self, item_hash: u64, footprint: u128, code: &Code, plan: &[u8]) -> Result<()> {
+        tally::tally(tally::Tally::Offered);
         let mut sites = Vec::new();
         encode_sites(code.sites(), &mut sites);
         let mut relocs = Vec::new();
         encode_relocs(code.relocs(), &mut relocs);
-        self.add_stencil(item_hash, footprint, code.bytes(), &sites, &relocs)
+        let mut loops = Vec::new();
+        encode_loops(code.loops(), &mut loops);
+        self.push_stencil(item_hash, footprint, StencilSlice { code: code.bytes(), sites: &sites, relocs: &relocs, plan, loops: &loops })
     }
 
     fn push_blob(&mut self, bytes: &[u8]) -> Result<(u32, u32)> {
-        let off = u32::try_from(self.blob.len()).context("substrate blob exceeds 4 GiB")?;
-        let len = u32::try_from(bytes.len()).context("substrate entry exceeds 4 GiB")?;
-        self.blob.extend_from_slice(bytes);
-        let pad = (8 - (self.blob.len() & 7)) & 7;
-        self.blob.resize(self.blob.len() + pad, 0);
-        Ok((off, len))
+        push_aligned_blob(&mut self.blob, bytes)
     }
 
     /// Sorts all index tables, serializes the binary image, and returns a validated `Substrate`.
-    pub fn build(mut self) -> Result<Substrate> {
+    pub fn build(self) -> Result<Substrate> {
+        self.build_within(None)
+    }
+
+    /// Builds the substrate while evicting smaller stencils if needed to keep the total file within `max_bytes`.
+    pub fn build_within(mut self, max_bytes: Option<usize>) -> Result<Substrate> {
         self.summaries.sort_by_key(|entry| entry.item_hash);
         self.summaries.dedup_by_key(|entry| entry.item_hash);
         self.stencils.sort_by_key(|entry| (entry.item_hash, entry.fp_hi, entry.fp_lo));
@@ -633,6 +583,9 @@ impl SubstrateBuilder {
                 && a.substs_hash == b.substs_hash
                 && self.blob[a.off as usize..a.off as usize + a.len as usize] == self.blob[b.off as usize..b.off as usize + b.len as usize]
         });
+        if let Some(limit) = max_bytes {
+            self.trim_stencils_to_limit(limit)?;
+        }
 
         let summaries_off = HEADER_LEN;
         let stencils_off = summaries_off + self.summaries.len() * SUMMARY_REC_LEN;
@@ -666,6 +619,10 @@ impl SubstrateBuilder {
             out.extend_from_slice(&entry.sites_len.to_le_bytes());
             out.extend_from_slice(&entry.relocs_off.to_le_bytes());
             out.extend_from_slice(&entry.relocs_len.to_le_bytes());
+            out.extend_from_slice(&entry.plan_off.to_le_bytes());
+            out.extend_from_slice(&entry.plan_len.to_le_bytes());
+            out.extend_from_slice(&entry.loops_off.to_le_bytes());
+            out.extend_from_slice(&entry.loops_len.to_le_bytes());
         }
         for entry in &self.instances {
             out.extend_from_slice(&entry.item_hash.to_le_bytes());
@@ -676,6 +633,18 @@ impl SubstrateBuilder {
         out.extend_from_slice(&self.blob);
         Substrate::from_bytes(out)
     }
+}
+
+fn aligned8(len: usize) -> usize {
+    (len + 7) & !7
+}
+
+fn push_aligned_blob(blob: &mut Vec<u8>, bytes: &[u8]) -> Result<(u32, u32)> {
+    let off = u32::try_from(blob.len()).context("substrate blob exceeds 4 GiB")?;
+    let len = u32::try_from(bytes.len()).context("substrate entry exceeds 4 GiB")?;
+    blob.extend_from_slice(bytes);
+    blob.resize(aligned8(blob.len()), 0);
+    Ok((off, len))
 }
 
 fn parse_and_validate(data: &[u8]) -> Result<Header> {
@@ -738,42 +707,56 @@ fn binary_search_index(len: usize, mut cmp: impl FnMut(usize) -> Ordering) -> Op
     None
 }
 
-fn read_u32(data: &[u8], at: usize) -> u32 {
+pub(super) fn read_u32(data: &[u8], at: usize) -> u32 {
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&data[at..at + 4]);
     u32::from_le_bytes(bytes)
 }
 
-fn read_u64(data: &[u8], at: usize) -> u64 {
+pub(super) fn read_u64(data: &[u8], at: usize) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&data[at..at + 8]);
     u64::from_le_bytes(bytes)
 }
 
+const RELOC_KINDS: [RelocKind; 7] = [RelocKind::Abs32, RelocKind::Abs64, RelocKind::Arm64Movw64, RelocKind::PcRel32, RelocKind::Arm64Call26, RelocKind::Arm64AdrpAdd, RelocKind::X64RipRel32];
+
 fn encode_reloc_kind(kind: RelocKind) -> u8 {
-    match kind {
-        RelocKind::Abs32 => 0,
-        RelocKind::Abs64 => 1,
-        RelocKind::Arm64Movw64 => 2,
-        RelocKind::PcRel32 => 3,
-        RelocKind::Arm64Call26 => 4,
-    }
+    match kind { RelocKind::Abs32 => 0, RelocKind::Abs64 => 1, RelocKind::Arm64Movw64 => 2, RelocKind::PcRel32 => 3, RelocKind::Arm64Call26 => 4, RelocKind::Arm64AdrpAdd => 5, RelocKind::X64RipRel32 => 6 }
 }
 
 fn decode_reloc_kind(raw: u8) -> Result<RelocKind> {
-    match raw {
-        0 => Ok(RelocKind::Abs32),
-        1 => Ok(RelocKind::Abs64),
-        2 => Ok(RelocKind::Arm64Movw64),
-        3 => Ok(RelocKind::PcRel32),
-        4 => Ok(RelocKind::Arm64Call26),
-        _ => bail!("unknown relocation kind"),
+    RELOC_KINDS.get(raw as usize).copied().ok_or_else(|| anyhow!("unknown relocation kind"))
+}
+
+fn read_substrate_toolchain_hash(path: &Path) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let mut buf = [0u8; HEADER_LEN];
+    io::Read::read_exact(&mut file, &mut buf).ok()?;
+    (buf[0..8] == MAGIC).then(|| read_u64(&buf, 16))
+}
+
+fn prune_dir_by_hash(dir: &Path, active_toolchain_hash: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("substrate")
+            && read_substrate_toolchain_hash(&path).is_some_and(|h| h != active_toolchain_hash)
+        {
+            drop(std::fs::remove_file(path));
+        }
     }
 }
 
-fn prune_stale_substrates(dir: &Path, keep: &Path) {
+fn prune_superseded(toolchain_hash: u64) {
+    if let Some(dir) = toolchain_path(toolchain_hash).parent() {
+        prune_dir_by_hash(dir, toolchain_hash);
+    }
+}
+
+fn prune_stale_substrates(dir: &Path, keep: &Path, keep_others: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+    let mut others: Vec<_> = entries
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
@@ -781,15 +764,9 @@ fn prune_stale_substrates(dir: &Path, keep: &Path) {
                 return None;
             }
             let meta = entry.metadata().ok()?;
-            if !meta.is_file() {
-                return None;
-            }
-            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            Some((modified, path))
+            meta.is_file().then(|| (meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), path))
         })
         .collect();
     others.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, path) in others.into_iter().skip(7) {
-        drop(std::fs::remove_file(path));
-    }
+    others.into_iter().skip(keep_others).for_each(|(_, p)| drop(std::fs::remove_file(p)));
 }

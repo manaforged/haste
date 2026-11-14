@@ -1,7 +1,14 @@
-use crate::alloc::Location;
-use crate::frame::{Abi, Loc};
-use crate::ir::{Function, Inst, Op, Signature, Value};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+use crate::ir::{Function, Op, Value};
 use crate::live::{Live, Range, overlaps};
+
+mod choose;
+mod place;
+use choose::choose_free;
+pub(crate) use place::scratch_clobbers;
+use place::{apply_demote, evict_slot, find_demote_free, find_relocate, leaf_park_cost, slot_accepts, victim_slot_unweighted};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParkReg<R> {
@@ -14,21 +21,40 @@ pub(crate) struct Class<'a, F> {
     pub leaf: Vec<F>,
     pub arrivals: Vec<Vec<F>>,
     pub passed: Vec<Option<(F, bool)>>,
+    pub clobbers: Vec<(&'a [F], Vec<Range>)>,
 }
 
 pub(crate) struct Hints<'a> {
     pub reuse: &'a [Option<Value>],
     pub weights: Option<&'a [u64]>,
     pub partners: Option<&'a [Vec<Value>]>,
+    pub back_args: &'a [(usize, usize)],
     pub park: Option<&'a [u64]>,
+    pub two_address: bool,
 }
 
-struct Pool<F> {
-    regs: Vec<F>,
-    is_saved: Vec<bool>,
-    kept: Vec<Option<F>>,
-    arrival_lock: Vec<bool>,
-    passed: Vec<Option<(F, bool)>>,
+pub(super) struct Pool<F> {
+    pub(super) regs: Vec<F>,
+    pub(super) is_saved: Vec<bool>,
+    pub(super) kept: Vec<Option<F>>,
+    pub(super) arrival_lock: Vec<bool>,
+    pub(super) passed: Vec<Option<(F, bool)>>,
+    clobbers: Vec<Vec<Range>>,
+    slot_clobber: Vec<u8>,
+}
+
+impl<F> Pool<F> {
+    pub(super) fn slot_clobbered(&self, s: usize, ranges: &[Range]) -> bool {
+        let mut mask = self.slot_clobber[s];
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            if overlaps(&self.clobbers[idx], ranges) {
+                return true;
+            }
+            mask &= mask - 1;
+        }
+        false
+    }
 }
 
 pub(crate) fn crosses_span(calls: &[u32], (start, end): (u32, u32)) -> bool {
@@ -40,15 +66,8 @@ pub(crate) fn crosses_ranges(calls: &[u32], ranges: &[Range]) -> bool {
     ranges.iter().any(|r| crosses_span(calls, (r.start, r.end)))
 }
 
-fn park_cost(calls: &[u32], weights: &[u64], ranges: &[Range]) -> u64 {
-    ranges
-        .iter()
-        .map(|r| {
-            let first = calls.partition_point(|at| *at <= r.start);
-            let last = calls.partition_point(|at| *at <= r.end);
-            (first..last).map(|i| weights[i] * if calls[i] < r.end { 2 } else { 1 }).sum::<u64>()
-        })
-        .sum()
+pub(super) fn crosses_call(live: &Live, value: usize) -> bool {
+    crosses_ranges(&live.calls, live.ranges_of(value))
 }
 
 pub(crate) fn parks(live: &Live, hints: &Hints, value: usize) -> bool {
@@ -56,299 +75,438 @@ pub(crate) fn parks(live: &Live, hints: &Hints, value: usize) -> bool {
 }
 
 fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, pooled: &[bool]) -> Pool<F> {
-    let mut kept = vec![None; func.types.len()];
+    let regs: Vec<F> = class.saved.iter().chain(&class.leaf).copied().collect();
+    let is_saved: Vec<bool> = regs.iter().map(|r| class.saved.contains(r)).collect();
+    let locked_arrivals: Vec<F> = class.arrivals.iter().flatten().copied().filter(|reg| class.leaf.contains(reg)).collect();
+    let arrival_lock: Vec<bool> = regs.iter().map(|r| locked_arrivals.contains(r)).collect();
+    let clobbers: Vec<Vec<Range>> = class.clobbers.iter().map(|(_, ranges)| ranges.clone()).collect();
+    let slot_clobber: Vec<u8> = regs
+        .iter()
+        .enumerate()
+        .map(|(s, r)| {
+            let mut mask = 0_u8;
+            if !is_saved[s] {
+                for (i, (group, _)) in class.clobbers.iter().enumerate() {
+                    if i < 8 && group.contains(r) {
+                        mask |= 1 << i;
+                    }
+                }
+            }
+            mask
+        })
+        .collect();
+    let mut out = Pool {
+        regs,
+        is_saved,
+        kept: vec![None; func.types.len()],
+        arrival_lock,
+        passed: vec![None; func.types.len()],
+        clobbers,
+        slot_clobber,
+    };
     let entry = func.entry.map_or(&[][..], |entry| &func.blocks[entry.index()].params[..]);
     for (value, arrival) in entry.iter().zip(&class.arrivals) {
         if let [reg] = arrival[..]
-            && class.leaf.contains(&reg)
+            && let Some(slot) = out.regs.iter().position(|r| *r == reg)
+            && !out.is_saved[slot]
             && pooled[value.index()]
-            && !live.trapped[value.index()]
         {
             let ranges = live.ranges_of(value.index());
-            if !ranges.is_empty() && !crosses_ranges(&live.calls, ranges) {
-                kept[value.index()] = Some(reg);
+            if !ranges.is_empty() && !crosses_call(live, value.index()) && !out.slot_clobbered(slot, ranges) {
+                out.kept[value.index()] = Some(reg);
             }
         }
     }
-    let regs: Vec<F> = class.saved.iter().chain(&class.leaf).copied().collect();
-    let is_saved: Vec<bool> = regs.iter().map(|r| class.saved.contains(r)).collect();
-    let locked_arrivals: Vec<F> = class.arrivals.iter().flatten().copied().filter(|reg| class.leaf.contains(reg) && !kept.contains(&Some(*reg))).collect();
-    let arrival_lock: Vec<bool> = regs.iter().map(|r| locked_arrivals.contains(r)).collect();
-    let passed = class.passed.iter().map(|entry| entry.filter(|(reg, _)| class.leaf.contains(reg))).collect();
-    Pool { regs, is_saved, kept, arrival_lock, passed }
+    for (v, entry) in class.passed.iter().enumerate() {
+        out.passed[v] = entry.filter(|(reg, _)| {
+            out.regs
+                .iter()
+                .position(|r| *r == *reg)
+                .is_some_and(|slot| !out.is_saved[slot] && !out.slot_clobbered(slot, live.ranges_of(v)))
+        });
+    }
+    out
 }
 
-fn slot_free(holders: &[usize], live: &Live, ranges: &[Range], locked_entry: bool, start: u32) -> bool {
-    !(start == 0 && locked_entry) && holders.iter().all(|&other| !overlaps(live.ranges_of(other), ranges))
-}
-
-fn pick_slot<F: Copy + PartialEq>(
+pub(super) fn slot_free<F: Copy + PartialEq>(
     pool: &Pool<F>,
-    holders: &[Vec<usize>],
+    s: usize,
+    holders: &[usize],
     live: &Live,
     ranges: &[Range],
     start: u32,
-    used: &[F],
-    reserved: &[F],
-    allow_reserved: bool,
-    pred: impl Fn(usize) -> bool,
-) -> Option<usize> {
-    let valid = |slot: usize| pred(slot) && (allow_reserved || !reserved.contains(&pool.regs[slot])) && slot_free(&holders[slot], live, ranges, pool.arrival_lock[slot], start);
-    (0..pool.regs.len())
-        .find(|&s| valid(s) && holders[s].is_empty() && (!pool.is_saved[s] || used.contains(&pool.regs[s])))
-        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && (!pool.is_saved[s] || used.contains(&pool.regs[s]))))
-        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && holders[s].is_empty()))
-        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s)))
+    kept_reg: Option<F>,
+) -> bool {
+    slot_accepts(pool, s, ranges, start, kept_reg) && holders.iter().all(|&other| !overlaps(live.ranges_of(other), ranges))
 }
 
-fn loop_back_args(func: &Function) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        let mut edge = |target: crate::ir::Block, args: &[crate::ir::Value]| {
-            if target.index() <= b_idx {
-                for (param, arg) in func.blocks[target.index()].params.iter().zip(args) {
-                    if param != arg {
-                        pairs.push((param.index(), arg.index()));
-                    }
-                }
-            }
-        };
-        for &inst in &block.insts {
-            crate::frame::terminator_edges(&func.insts[inst.index()].op, &mut edge);
-        }
+pub(super) struct SlotSet {
+    slots: Vec<Vec<(u32, u32, usize)>>,
+}
+
+impl SlotSet {
+    fn new(count: usize) -> Self {
+        Self { slots: vec![Vec::new(); count] }
     }
-    pairs
-}
 
-fn leaf_park_cost(live: &Live, hints: &Hints, value: usize) -> Option<u64> {
-    let ranges = live.ranges_of(value);
-    if ranges.is_empty() || live.trapped[value] || crosses_ranges(&live.unwinds, ranges) {
-        return None;
+    pub(super) fn is_empty(&self, s: usize) -> bool {
+        self.slots[s].is_empty()
     }
-    if !crosses_ranges(&live.calls, ranges) {
-        return Some(0);
+
+    fn first(&self, s: usize) -> Option<usize> {
+        self.slots[s].first().map(|e| e.2)
     }
-    let (call_weights, val_weights) = hints.park.zip(hints.weights)?;
-    let cost = park_cost(&live.calls, call_weights, ranges);
-    (cost < val_weights[value]).then_some(cost)
-}
 
-#[derive(Clone, Copy)]
-struct Victim {
-    slot: usize,
-    penalty: u64,
-}
+    pub(super) fn has_overlap(&self, s: usize, ranges: &[Range]) -> bool {
+        let slot = &self.slots[s];
+        ranges.iter().any(|r| {
+            let idx = slot.partition_point(|&(_, end, _)| end < r.start);
+            slot.get(idx).is_some_and(|&(start, _, _)| start <= r.end)
+        })
+    }
 
-fn find_demote<F: Copy + PartialEq>(
-    pool: &Pool<F>,
-    holders: &[Vec<usize>],
-    assigned: &[Vec<usize>],
-    live: &Live,
-    hints: &Hints,
-    reserved: &[F],
-    (ranges, start, value): (&[Range], u32, usize),
-) -> Option<(usize, u64, Vec<(usize, usize)>)> {
-    let val_cost = hints.weights.map(|w| w[value]);
-    let mut best: Option<(u64, bool, usize, Vec<(usize, usize)>)> = None;
-    for s in (0..pool.regs.len()).filter(|&s| pool.is_saved[s] && !(start == 0 && pool.arrival_lock[s])) {
-        let mut moves: Vec<(usize, usize)> = Vec::new();
-        let mut total_park = 0_u64;
-        let mut ok = true;
-        for &h in &holders[s] {
-            if !overlaps(live.ranges_of(h), ranges) {
-                continue;
-            }
-            if pool.kept[h].is_some() {
-                ok = false;
-                break;
-            }
-            let Some(h_park) = leaf_park_cost(live, hints, h) else {
-                ok = false;
-                break;
-            };
-            let h_ranges = live.ranges_of(h);
-            let Some(h_start) = h_ranges.first().map(|r| r.start) else {
-                ok = false;
-                break;
-            };
-            let pick_leaf = |avoid_reserved: bool| {
-                (0..pool.regs.len()).find(|&l| {
-                    !pool.is_saved[l]
-                        && (!avoid_reserved || !reserved.contains(&pool.regs[l]))
-                        && slot_free(&assigned[l], live, h_ranges, pool.arrival_lock[l], h_start)
-                        && moves.iter().all(|&(mh, ml)| ml != l || !overlaps(live.ranges_of(mh), h_ranges))
-                })
-            };
-            let Some(leaf_slot) = pick_leaf(true).or_else(|| pick_leaf(false)) else {
-                ok = false;
-                break;
-            };
-            total_park = total_park.saturating_add(h_park);
-            moves.push((h, leaf_slot));
-        }
-        if !ok || moves.is_empty() {
-            continue;
-        }
-        if total_park > 0 && !val_cost.is_some_and(|vc| total_park < vc) {
-            continue;
-        }
-        let is_res = reserved.contains(&pool.regs[s]);
-        if best.as_ref().is_none_or(|&(bp, br, _, _)| (total_park, is_res) < (bp, br)) {
-            best = Some((total_park, is_res, s, moves));
-            if total_park == 0 && !is_res {
-                break;
+    fn first_overlap(&self, s: usize, ranges: &[Range]) -> Option<usize> {
+        let slot = &self.slots[s];
+        for r in ranges {
+            let idx = slot.partition_point(|&(_, end, _)| end < r.start);
+            if let Some(&(start, _, val)) = slot.get(idx)
+                && start <= r.end
+            {
+                return Some(val);
             }
         }
+        None
     }
-    best.map(|(cost, _, s, moves)| (s, cost, moves))
-}
 
-fn apply_demote<F: Copy>(
-    pool: &Pool<F>,
-    holders: &mut [Vec<usize>],
-    assigned: &mut [Vec<usize>],
-    homes: &mut [Option<F>],
-    slot: usize,
-    moves: &[(usize, usize)],
-) {
-    for &(other, leaf_slot) in moves {
-        holders[slot].retain(|&h| h != other);
-        holders[leaf_slot].push(other);
-        assigned[slot].retain(|&h| h != other);
-        assigned[leaf_slot].push(other);
-        homes[other] = Some(pool.regs[leaf_slot]);
-    }
-}
-
-fn evict_slot<F: Copy>(
-    holders: &mut Vec<usize>,
-    assigned: &mut Vec<usize>,
-    homes: &mut [Option<F>],
-    live: &Live,
-    ranges: &[Range],
-) {
-    holders.retain(|&other| {
-        if overlaps(live.ranges_of(other), ranges) {
-            assigned.retain(|&h| h != other);
-            homes[other] = None;
-            false
-        } else {
-            true
-        }
-    });
-}
-
-fn victim_slot<F: Copy + PartialEq>(
-    pool: &Pool<F>,
-    holders: &[Vec<usize>],
-    live: &Live,
-    hints: &Hints,
-    (start, end, value): (u32, u32, usize),
-    (needs_saved, can_park): (bool, bool),
-    (used, reserved): (&[F], &[F]),
-    suits: impl Fn(usize) -> bool,
-) -> Option<Victim> {
-    let ranges = live.ranges_of(value);
-    let candidates = (0..pool.regs.len()).filter(|&s| suits(s) && !(start == 0 && pool.arrival_lock[s]));
-    let Some(cost) = hints.weights else {
-        return candidates
-            .filter_map(|s| {
-                let mut count = 0_usize;
-                let mut single = 0_usize;
-                for &h in &holders[s] {
-                    if overlaps(live.ranges_of(h), ranges) {
-                        if pool.kept[h].is_some() {
-                            return None;
-                        }
-                        single = h;
-                        count += 1;
-                    }
-                }
-                (count == 1).then(|| live.last_end(single).map(|u| (u, s))).flatten()
-            })
-            .max_by_key(|&(u, _)| u)
-            .filter(|&(u, _)| u > end)
-            .map(|(_, slot)| Victim { slot, penalty: 0 });
-    };
-    let val_park = if needs_saved && can_park { leaf_park_cost(live, hints, value).unwrap_or(0) } else { 0 };
-    let mut best: Option<(u64, u8, bool, std::cmp::Reverse<u64>, usize)> = None;
-    for s in candidates {
-        let val_parks_here = !pool.is_saved[s] && needs_saved;
-        let added_park = if val_parks_here { val_park } else { 0 };
-        let cand_gain = cost[value].saturating_sub(added_park);
-        if cand_gain == 0 {
-            continue;
-        }
-        let mut evict_cost = 0_u64;
-        let mut max_len = 0_u64;
-        let mut count = 0_usize;
-        let mut single = 0_usize;
-        let mut ok = true;
-        for &h in &holders[s] {
-            if overlaps(live.ranges_of(h), ranges) {
-                if pool.kept[h].is_some() {
-                    ok = false;
+    pub(super) fn collect_overlaps(&self, s: usize, ranges: &[Range], out: &mut Vec<usize>) {
+        out.clear();
+        let slot = &self.slots[s];
+        for r in ranges {
+            let mut idx = slot.partition_point(|&(_, end, _)| end < r.start);
+            while let Some(&(start, _, val)) = slot.get(idx) {
+                if start > r.end {
                     break;
                 }
-                let h_park = if !pool.is_saved[s] && crosses_ranges(&live.calls, live.ranges_of(h)) {
-                    leaf_park_cost(live, hints, h).unwrap_or(0)
-                } else {
-                    0
-                };
-                evict_cost = evict_cost.saturating_add(cost[h].saturating_sub(h_park));
-                max_len = max_len.max(live.total_len(h));
-                single = h;
-                count += 1;
+                if !out.contains(&val) {
+                    out.push(val);
+                }
+                idx += 1;
             }
-        }
-        if !ok || count == 0 {
-            continue;
-        }
-        let cheaper = if count == 1 {
-            if val_parks_here {
-                evict_cost < cand_gain
-            } else {
-                let (len_single, len_val) = (live.total_len(single), live.total_len(value));
-                evict_cost < cand_gain
-                    || (evict_cost == cand_gain && len_single > len_val)
-                    || (len_single >= len_val.max(2).saturating_mul(4) && u128::from(evict_cost) * u128::from(len_val.max(2)) < u128::from(cand_gain) * u128::from(len_single))
-            }
-        } else {
-            evict_cost.saturating_mul(2) < cand_gain
-        };
-        if !cheaper {
-            continue;
-        }
-        let penalty = evict_cost.saturating_add(added_park);
-        let tier: u8 = if needs_saved {
-            u8::from(!pool.is_saved[s])
-        } else if !pool.is_saved[s] {
-            0
-        } else if used.contains(&pool.regs[s]) {
-            1
-        } else {
-            2
-        };
-        let key = (penalty, tier, reserved.contains(&pool.regs[s]), std::cmp::Reverse(max_len), s);
-        if best.is_none_or(|b| key < b) {
-            best = Some(key);
         }
     }
-    best.map(|(penalty, _, _, _, slot)| Victim { slot, penalty })
+
+    pub(super) fn free<F: Copy + PartialEq>(&self, pool: &Pool<F>, s: usize, ranges: &[Range], start: u32, kept_reg: Option<F>) -> bool {
+        slot_accepts(pool, s, ranges, start, kept_reg) && !self.has_overlap(s, ranges)
+    }
+
+    fn insert(&mut self, s: usize, ranges: &[Range], val: usize) {
+        let slot = &mut self.slots[s];
+        for r in ranges {
+            let pos = slot.partition_point(|&(start, _, _)| start < r.start);
+            slot.insert(pos, (r.start, r.end, val));
+        }
+    }
+
+    fn remove(&mut self, s: usize, ranges: &[Range], val: usize) {
+        let slot = &mut self.slots[s];
+        for r in ranges {
+            let pos = slot.partition_point(|&(start, _, _)| start < r.start);
+            if slot.get(pos) == Some(&(r.start, r.end, val)) {
+                slot.remove(pos);
+            }
+        }
+    }
+}
+
+fn back_partner_map(count: usize, pooled: &[bool], back_args: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    let mut map = vec![Vec::new(); count];
+    for &(param, arg) in back_args {
+        if pooled[param] && pooled[arg] {
+            if !map[param].contains(&arg) {
+                map[param].push(arg);
+            }
+            if !map[arg].contains(&param) {
+                map[arg].push(param);
+            }
+        }
+    }
+    map
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Priority {
+    density: u128,
+    weight: u64,
+    non_remat: bool,
+    start: Reverse<u32>,
+    tie: Reverse<usize>,
+    value: usize,
+}
+
+fn value_priority(weights: &[u64], live: &Live, remat: &[bool], start: u32, value: usize) -> Priority {
+    let weight = weights[value];
+    let len = live.total_len(value).max(4);
+    let density = (u128::from(weight) << 24) / u128::from(len);
+    Priority { density, weight, non_remat: !remat[value], start: Reverse(start), tie: Reverse(value), value }
+}
+
+const MAX_REQUEUE: u8 = 8;
+const RES_CHUNK: usize = 32;
+
+struct BackIndex {
+    entries: Vec<(u32, u32, usize, usize, bool)>,
+    chunk_max: Vec<u32>,
+}
+
+impl BackIndex {
+    fn new(back_args: &[(usize, usize)], live: &Live) -> Self {
+        let mut pairs = Vec::with_capacity(back_args.len() * 2);
+        for &(param, arg) in back_args {
+            if param != arg {
+                pairs.push((arg, param, false));
+                pairs.push((param, arg, true));
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        let mut entries: Vec<(u32, u32, usize, usize, bool)> = pairs
+            .into_iter()
+            .filter_map(|(target, partner, is_param)| live.bounds(target).map(|(s, e)| (s, e, target, partner, is_param)))
+            .collect();
+        entries.sort_unstable_by_key(|e| e.0);
+        let chunk_max = entries.chunks(RES_CHUNK).map(|c| c.iter().map(|e| e.1).max().unwrap_or(0)).collect();
+        Self { entries, chunk_max }
+    }
+
+    fn fill<F: Copy + PartialEq>(&self, homes: &[Option<F>], live: &Live, (value, start, end, ranges): (usize, u32, u32, &[Range]), check_order: bool, limit: usize, reserved: &mut Vec<F>) {
+        reserved.clear();
+        let bound = self.entries.partition_point(|e| e.0 <= end);
+        for (c, chunk) in self.entries[..bound].chunks(RES_CHUNK).enumerate() {
+            if self.chunk_max[c] < start {
+                continue;
+            }
+            for &(ts, te, target, partner, is_param) in chunk {
+                if te >= start
+                    && ts <= end
+                    && target != value
+                    && (!check_order || (!is_param && ts >= start))
+                    && let Some(reg) = homes[partner]
+                    && homes[target].is_none()
+                    && !reserved.contains(&reg)
+                    && overlaps(live.ranges_of(target), ranges)
+                {
+                    reserved.push(reg);
+                    if reserved.len() == limit {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn fill_scratch_holders<'a, F>(
+    slots: &SlotSet,
+    homes: &[Option<F>],
+    live: &'a Live,
+    hints: &Hints,
+    back_partners: &[usize],
+    reverse_reuse: &[Option<Value>],
+    value: usize,
+    query_ranges: &mut Vec<(usize, &'a [Range])>,
+    out: &mut [Vec<usize>],
+) {
+    query_ranges.clear();
+    query_ranges.push((value, live.ranges_of(value)));
+    let mut add_partner = |p: usize| {
+        if p < homes.len() && homes[p].is_none() && !query_ranges.iter().any(|&(q, _)| q == p) {
+            let r = live.ranges_of(p);
+            if !r.is_empty() {
+                query_ranges.push((p, r));
+            }
+        }
+    };
+    for &p in back_partners {
+        add_partner(p);
+    }
+    if let Some(partners) = hints.partners {
+        for p in &partners[value] {
+            add_partner(p.index());
+        }
+    }
+    if let Some(r) = hints.reuse[value] {
+        add_partner(r.index());
+    }
+    if let Some(r) = reverse_reuse.get(value).copied().flatten() {
+        add_partner(r.index());
+    }
+    for (s, list) in out.iter_mut().enumerate() {
+        list.clear();
+        for &(_, ranges) in query_ranges.iter() {
+            if let Some(hit) = slots.first_overlap(s, ranges)
+                && !list.contains(&hit)
+            {
+                list.push(hit);
+            }
+        }
+        if list.is_empty()
+            && let Some(first) = slots.first(s)
+        {
+            list.push(first);
+        }
+    }
+}
+
+fn try_place_weighted<'a, F: Copy + PartialEq>(
+    (func, live, pool): (&Function, &'a Live, &Pool<F>),
+    (hints, weights): (&Hints, &[u64]),
+    (back_partners, reverse_reuse, back_index): (&[Vec<usize>], &[Option<Value>], &BackIndex),
+    (slots, homes): (&mut SlotSet, &mut [Option<F>]),
+    (reserved, scratch_holders, query_ranges): (&mut Vec<F>, &mut Vec<Vec<usize>>, &mut Vec<(usize, &'a [Range])>),
+    value: usize,
+) -> (bool, Vec<usize>) {
+    let Some((start, end)) = live.bounds(value) else { return (false, Vec::new()) };
+    let ranges = live.ranges_of(value);
+    let wide_val = func.types[value].bytes() > 8;
+    let needs_saved = crosses_call(live, value);
+    let can_park = needs_saved && parks(live, hints, value);
+    if needs_saved && wide_val && !can_park {
+        return (false, Vec::new());
+    }
+    let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slots.free(pool, s, ranges, start, pool.kept[value]));
+    back_index.fill(homes, live, (value, start, end, ranges), false, pool.regs.len(), reserved);
+    fill_scratch_holders(slots, homes, live, hints, &back_partners[value], reverse_reuse, value, query_ranges, scratch_holders);
+    let mut chosen = choose_free(
+        pool,
+        scratch_holders,
+        homes,
+        live,
+        hints,
+        &back_partners[value],
+        reverse_reuse,
+        reserved,
+        |s| !slots.is_empty(s),
+        (value, start, end, wide_val, needs_saved, can_park, has_free_saved),
+    );
+    let mut dropped = Vec::new();
+    if chosen.is_none()
+        && let Some(demote) = find_relocate(func, pool, slots, homes, live, hints, &back_partners[value], reserved, weights, (ranges, start, value), (needs_saved, can_park, wide_val))
+    {
+        chosen = Some(demote.slot);
+        dropped = apply_demote(pool, live, None, slots, homes, &demote);
+    }
+    let Some(slot) = chosen else {
+        return (false, dropped);
+    };
+    homes[value] = Some(pool.regs[slot]);
+    slots.insert(slot, ranges, value);
+    (true, dropped)
+}
+
+fn allocate_weighted<F: Copy + PartialEq>(func: &Function, live: &Live, pool: &Pool<F>, pooled: &[bool], hints: &Hints, weights: &[u64]) -> (Vec<Option<F>>, Vec<F>) {
+    let mut homes = vec![None; pooled.len()];
+    let mut slots = SlotSet::new(pool.regs.len());
+    let mut remat = vec![false; pooled.len()];
+    for data in &func.insts {
+        if matches!(data.op, Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_))
+            && let Some(res) = data.result
+            && res.index() < remat.len()
+        {
+            remat[res.index()] = true;
+        }
+    }
+    let mut reverse_reuse = vec![None; pooled.len()];
+    for (dst, &src) in hints.reuse.iter().enumerate() {
+        if let Some(src) = src
+            && reverse_reuse[src.index()].is_none()
+        {
+            reverse_reuse[src.index()] = Some(Value(dst as u32));
+        }
+    }
+    let mut heap = BinaryHeap::new();
+    for (v, &is_pooled) in pooled.iter().enumerate() {
+        if is_pooled && let Some((start, _)) = live.bounds(v) {
+            heap.push(value_priority(weights, live, &remat, start, v));
+        }
+    }
+    let back_partners = back_partner_map(pooled.len(), pooled, hints.back_args);
+    let back_index = BackIndex::new(hints.back_args, live);
+    let mut reserved: Vec<F> = Vec::new();
+    let mut scratch_holders: Vec<Vec<usize>> = vec![Vec::new(); pool.regs.len()];
+    let mut query_ranges: Vec<(usize, &[Range])> = Vec::new();
+    let mut requeues = vec![0_u8; pooled.len()];
+    let mut spilled = Vec::new();
+    let mut in_spilled = vec![false; pooled.len()];
+    while let Some(item) = heap.pop() {
+        let value = item.value;
+        if homes[value].is_some() {
+            continue;
+        }
+        let (placed, dropped) = try_place_weighted(
+            (func, live, pool),
+            (hints, weights),
+            (&back_partners, &reverse_reuse, &back_index),
+            (&mut slots, &mut homes),
+            (&mut reserved, &mut scratch_holders, &mut query_ranges),
+            value,
+        );
+        for eh in dropped {
+            if requeues[eh] < MAX_REQUEUE
+                && let Some((eh_start, _)) = live.bounds(eh)
+            {
+                requeues[eh] += 1;
+                heap.push(value_priority(weights, live, &remat, eh_start, eh));
+            } else if !std::mem::replace(&mut in_spilled[eh], true) {
+                spilled.push(eh);
+            }
+        }
+        if !placed && !std::mem::replace(&mut in_spilled[value], true) {
+            spilled.push(value);
+        }
+    }
+    while !spilled.is_empty() {
+        spilled.sort_unstable_by_key(|&v| (Reverse(weights[v]), v));
+        let round = std::mem::take(&mut spilled);
+        for value in round {
+            in_spilled[value] = false;
+            if homes[value].is_some() {
+                continue;
+            }
+            let (_, dropped) = try_place_weighted(
+                (func, live, pool),
+                (hints, weights),
+                (&back_partners, &reverse_reuse, &back_index),
+                (&mut slots, &mut homes),
+                (&mut reserved, &mut scratch_holders, &mut query_ranges),
+                value,
+            );
+            for eh in dropped {
+                if requeues[eh] < MAX_REQUEUE + 2 && !std::mem::replace(&mut in_spilled[eh], true) {
+                    requeues[eh] += 1;
+                    spilled.push(eh);
+                }
+            }
+        }
+    }
+    let used = (0..pool.regs.len()).filter(|&s| pool.is_saved[s] && !slots.is_empty(s)).map(|s| pool.regs[s]).collect();
+    (homes, used)
 }
 
 pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class: &Class<F>, pooled: &[bool], hints: &Hints) -> (Vec<Option<F>>, Vec<F>) {
     let pool = pool(func, class, live, pooled);
+    if let Some(weights) = hints.weights {
+        return allocate_weighted(func, live, &pool, pooled, hints, weights);
+    }
     let mut homes = vec![None; pooled.len()];
     let mut holders: Vec<Vec<usize>> = vec![Vec::new(); pool.regs.len()];
-    let mut assigned: Vec<Vec<usize>> = vec![Vec::new(); pool.regs.len()];
+    let mut slots = SlotSet::new(pool.regs.len());
     for (v, reg) in pool.kept.iter().enumerate() {
         if let Some(reg) = *reg
             && let Some(slot) = pool.regs.iter().position(|r| *r == reg)
         {
             homes[v] = Some(reg);
             holders[slot].push(v);
-            assigned[slot].push(v);
+            slots.insert(slot, live.ranges_of(v), v);
         }
     }
     let mut values: Vec<(u32, u32, usize)> = (0..pooled.len())
@@ -356,7 +514,8 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         .filter_map(|v| live.bounds(v).map(|(start, end)| (start, end, v)))
         .collect();
     values.sort_unstable();
-    let back_args = loop_back_args(func);
+    let back_partners = back_partner_map(pooled.len(), pooled, hints.back_args);
+    let back_index = BackIndex::new(hints.back_args, live);
     let mut used: Vec<F> = Vec::new();
     let mut reserved: Vec<F> = Vec::new();
     for (start, end, value) in values {
@@ -365,91 +524,41 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         }
         let ranges = live.ranges_of(value);
         let wide_val = func.types[value].bytes() > 8;
-        let needs_saved = live.trapped[value] || crosses_ranges(&live.calls, ranges);
+        let needs_saved = crosses_call(live, value);
         let can_park = needs_saved && parks(live, hints, value);
         if needs_saved && wide_val && !can_park {
             continue;
         }
         let suits_direct = |s: usize| if needs_saved { pool.is_saved[s] && !wide_val } else { !wide_val || !pool.is_saved[s] };
         let suits_any = |s: usize| suits_direct(s) || (can_park && !pool.is_saved[s]);
-        let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start));
-        reserved.clear();
-        for &(param, arg) in &back_args {
-            if arg != value
-                && let Some(reg) = homes[param]
-                && homes[arg].is_none()
-                && live.bounds(arg).is_some_and(|(arg_start, _)| arg_start >= start)
-                && !reserved.contains(&reg)
-            {
-                reserved.push(reg);
-            }
-        }
-        let mut chosen = hints.reuse[value].and_then(|op| {
-            let op_idx = op.index();
-            let reg = homes[op_idx]?;
-            let s = pool.regs.iter().position(|r| *r == reg)?;
-            let suits_reuse = if has_free_saved { suits_direct(s) } else { suits_any(s) };
-            if !suits_reuse || (start == 0 && pool.arrival_lock[s]) || reserved.contains(&reg) {
-                return None;
-            }
-            if !holders[s].iter().all(|&h| h == op_idx || !overlaps(live.ranges_of(h), ranges)) {
-                return None;
-            }
-            holders[s].retain(|&h| h != op_idx);
-            Some(s)
-        });
-        if chosen.is_none()
-            && let Some(partners) = hints.partners
-        {
-            chosen = partners[value].iter().filter_map(|p| homes[p.index()]).find_map(|reg| {
-                let s = pool.regs.iter().position(|r| *r == reg)?;
-                let ok = if needs_saved { (pool.is_saved[s] || (can_park && !has_free_saved)) && !wide_val } else { !pool.is_saved[s] || (!wide_val && used.contains(&reg)) };
-                (ok && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start)).then_some(s)
-            });
-        }
-        if chosen.is_none()
-            && let Some((reg, at_call_end)) = pool.passed.get(value).copied().flatten()
-        {
-            let call_at = end + 1;
-            let plain_call = live.calls.binary_search(&call_at).is_ok() && live.unwinds.binary_search(&call_at).is_err();
-            if (!at_call_end || plain_call)
-                && !crosses_ranges(&live.calls, ranges)
-                && let Some(s) = pool.regs.iter().position(|r| *r == reg)
-                && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start)
-            {
-                chosen = Some(s);
-            }
-        }
-        if chosen.is_none() {
-            chosen = if needs_saved {
-                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s] && !wide_val)
-                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| !pool.is_saved[s])).flatten())
-                    .or_else(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| pool.is_saved[s] && !wide_val))
-                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| !pool.is_saved[s])).flatten())
-            } else {
-                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| !pool.is_saved[s])
-                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s] && used.contains(&pool.regs[s]))).flatten())
-                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s])).flatten())
-                    .or_else(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| !pool.is_saved[s]))
-                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| pool.is_saved[s])).flatten())
-            };
-        }
+        let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slot_free(&pool, s, &holders[s], live, ranges, start, None));
+        back_index.fill(&homes, live, (value, start, end, ranges), true, pool.regs.len(), &mut reserved);
+        let mut chosen = choose_free(
+            &pool,
+            &holders,
+            &homes,
+            live,
+            hints,
+            &back_partners[value],
+            &[],
+            &reserved,
+            |s| used.contains(&pool.regs[s]),
+            (value, start, end, wide_val, needs_saved, can_park, has_free_saved),
+        );
         if chosen.is_none() {
             let demote = (!wide_val)
-                .then(|| find_demote(&pool, &holders, &assigned, live, hints, &reserved, (ranges, start, value)))
+                .then(|| find_demote_free(&pool, &slots, live, hints, &reserved, (ranges, start, value)))
                 .flatten();
-            let victim = if demote.as_ref().is_some_and(|(_, cost, _)| *cost == 0) {
+            let victim = if demote.is_some() {
                 None
             } else {
-                victim_slot(&pool, &holders, live, hints, (start, end, value), (needs_saved, can_park), (&used, &reserved), suits_any)
+                victim_slot_unweighted(&pool, &slots, &homes, live, &back_partners[value], (start, end, value), suits_any)
             };
-            if let Some((s, d_cost, moves)) = demote
-                && victim.is_none_or(|v| d_cost <= v.penalty)
-            {
-                apply_demote(&pool, &mut holders, &mut assigned, &mut homes, s, &moves);
-                chosen = Some(s);
+            if let Some(demote) = demote {
+                apply_demote(&pool, live, Some(&mut holders), &mut slots, &mut homes, &demote);
+                chosen = Some(demote.slot);
             } else if let Some(v) = victim {
-                evict_slot(&mut holders[v.slot], &mut assigned[v.slot], &mut homes, live, ranges);
+                evict_slot(Some(&mut holders[v.slot]), &mut slots, v.slot, &mut homes, live, ranges);
                 chosen = Some(v.slot);
             }
         }
@@ -457,61 +566,10 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         let reg = pool.regs[slot];
         homes[value] = Some(reg);
         holders[slot].push(value);
-        assigned[slot].push(value);
+        slots.insert(slot, ranges, value);
         if pool.is_saved[slot] && !used.contains(&reg) {
             used.push(reg);
         }
     }
     (homes, used)
-}
-
-fn passed_own<R: Copy + PartialEq>(func: &Function, inst: Inst, value: Value, reg: ParkReg<R>, classify: &impl Fn(&Signature) -> Result<Abi<R>, String>) -> bool {
-    let Op::Call { sig, args, .. } = &func.insts[inst.index()].op else { return false };
-    let Ok(abi) = classify(&func.sigs[sig.index()]) else { return false };
-    args.iter().zip(&abi.params).any(|(arg, loc)| {
-        *arg == value
-            && match (reg, *loc) {
-                (ParkReg::Int(r), Loc::Int(at)) => r == at,
-                (ParkReg::Float(v), Loc::Float(at)) => v == at,
-                _ => false,
-            }
-    })
-}
-
-pub(crate) fn parked<R: Copy + PartialEq>(
-    func: &Function,
-    live: &Live,
-    locations: &[Location<R>],
-    (saved_int, saved_float): (&[R], &[u8]),
-    classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
-) -> Vec<(Inst, Vec<(Value, ParkReg<R>, bool)>)> {
-    let mut at_call: Vec<Vec<(Value, ParkReg<R>, bool)>> = vec![Vec::new(); live.calls.len()];
-    for (index, location) in locations.iter().enumerate() {
-        let park_reg = match *location {
-            Location::Reg(r) if !saved_int.contains(&r) => ParkReg::Int(r),
-            Location::Float(v) if !saved_float.contains(&v) => ParkReg::Float(v),
-            _ => continue,
-        };
-        let ranges = live.ranges_of(index);
-        if ranges.is_empty() {
-            continue;
-        }
-        let value = Value(index as u32);
-        for r in ranges {
-            let first = live.calls.partition_point(|at| *at <= r.start);
-            let last = live.calls.partition_point(|at| *at <= r.end);
-            for call in first..last {
-                let at = live.calls[call];
-                if at < r.end || !passed_own(func, live.sites[call].0, value, park_reg, classify) {
-                    at_call[call].push((value, park_reg, at < r.end));
-                }
-            }
-        }
-    }
-    for entries in &mut at_call {
-        entries.sort_unstable_by_key(|&(v, r, _)| (matches!(r, ParkReg::Float(_)), func.ty(v).bytes(), v.index()));
-    }
-    let mut out: Vec<(Inst, Vec<(Value, ParkReg<R>, bool)>)> = live.sites.iter().map(|site| site.0).zip(at_call).filter(|(_, values)| !values.is_empty()).collect();
-    out.sort_unstable_by_key(|(inst, _)| inst.index());
-    out
 }

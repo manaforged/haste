@@ -12,11 +12,11 @@ use super::super::substs::{ProjId, Substs};
 use super::super::table::Table;
 use super::super::ty::{Kind, Ty, Types};
 use super::inst::{TyFolder, fold_substs, fold_ty};
-use super::{InstOutcome, PolyCheck, PolyInst, PolyObligation, PolySummary, codec};
+use super::{InstOutcome, PolyInst, PolyObligation, PolySummary, codec};
 
 pub(in crate::sema) fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
     let tree = cx.outline.crates.get(item.krate as usize)?;
-    if !tree.env.release || !tree.env.fixed {
+    if !tree.env.fixed {
         return None;
     }
     let substrate = cx.store.lookups.substrate.clone()?;
@@ -35,7 +35,7 @@ pub(super) fn frozen_instance(
         return None;
     }
     let tree = cx.outline.crates.get(instance.0.krate as usize)?;
-    if !tree.env.release || !tree.env.fixed {
+    if !tree.env.fixed {
         return None;
     }
     let substrate = cx.store.lookups.substrate.clone()?;
@@ -63,11 +63,30 @@ pub(super) fn frozen_instance(
     None
 }
 
+fn try_add_instance(
+    outline: &Outline,
+    types: &Types,
+    (item, substs): Instance,
+    inst: &PolyInst,
+    drops: &[Res],
+    key_fn: fn(&Outline, ItemRef) -> Option<u64>,
+    builder: &mut crate::substrate::SubstrateBuilder,
+) -> Result<()> {
+    if let Some(item_key) = key_fn(outline, item)
+        && let Some(substs_key) = codec::substs_key(outline, types, substs, key_fn)
+        && let Ok(Some(bytes)) = codec::encode_instance(outline, types, substs, inst, drops, key_fn)
+    {
+        builder.add_instance(item_key, substs_key, &bytes)?;
+    }
+    Ok(())
+}
+
 pub(in crate::sema) fn export_sysroot_instances(
     outline: &Outline,
     types: &Types,
     finals: &Table<Instance, Arc<Typed>>,
-    builder: &mut crate::substrate::SubstrateBuilder,
+    mut toolchain: Option<&mut crate::substrate::SubstrateBuilder>,
+    mut deps: Option<&mut crate::substrate::SubstrateBuilder>,
 ) -> Result<()> {
     let mut err = None;
     finals.retain(|&(item, substs), typed| {
@@ -75,17 +94,20 @@ pub(in crate::sema) fn export_sysroot_instances(
             return true;
         }
         let tree = &outline.crates[item.krate as usize];
-        if !tree.env.release || !tree.env.fixed || substs.is_empty() {
+        if !tree.env.fixed || substs.is_empty() {
             return true;
         }
-        if let LazyTables::Poly(inst) = &typed.tables
-            && inst.summary.template.closures.is_empty()
-            && let Some(item_key) = crate::substrate::sysroot_item_key(outline, item)
-            && let Some(substs_key) = codec::substs_key(outline, types, substs, crate::substrate::sysroot_item_key)
-            && let Ok(Some(bytes)) = codec::encode_instance(outline, types, substs, inst, &typed.drops, crate::substrate::sysroot_item_key)
-            && let Err(e) = builder.add_instance(item_key, substs_key, &bytes)
-        {
-            err = Some(e);
+        if let LazyTables::Poly(inst) = &typed.tables && inst.summary.template.closures.is_empty() {
+            let pure_sysroot = tree.env.release
+                && crate::substrate::sysroot_only_item_key(outline, item).is_some()
+                && codec::substs_key(outline, types, substs, crate::substrate::sysroot_only_item_key).is_some();
+            let (target_builder, key_fn): (Option<&mut crate::substrate::SubstrateBuilder>, fn(&Outline, ItemRef) -> Option<u64>) =
+                if pure_sysroot { (toolchain.as_deref_mut(), crate::substrate::sysroot_only_item_key) } else { (deps.as_deref_mut(), crate::substrate::sysroot_item_key) };
+            if let Some(builder) = target_builder
+                && let Err(e) = try_add_instance(outline, types, (item, substs), inst, &typed.drops, key_fn, builder)
+            {
+                err = Some(e);
+            }
         }
         true
     });
@@ -178,7 +200,7 @@ pub(super) fn try_cached_instantiate(
         resolve_proj_substs(cx, &args, &mut projs, substs, 0)?;
     }
     projs.sort_unstable_by_key(|&(id, _)| id.0);
-    let mut inst = PolyInst {
+    let inst = PolyInst {
         args: instance.1,
         summary: Arc::clone(summary),
         projs: projs.into_boxed_slice(),
@@ -210,14 +232,5 @@ pub(super) fn try_cached_instantiate(
     if !check_only {
         resolved.sort_unstable_by_key(|&(key, ..)| key);
     }
-    let resolved_calls = resolved.into_boxed_slice();
-    let ret = summary.ret.map(|ty| inst.sub_ty(&cx.types, ty));
-    let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
-    let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(&cx.types, ty)).collect();
-    if check_only {
-        return Some(InstOutcome::CheckOnly(PolyCheck { summary: inst.summary, resolved_calls }, ret, layouts, drop_tys));
-    }
-    inst.resolved_calls = resolved_calls;
-    let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(&cx.types, local.ty) }).collect();
-    Some(InstOutcome::Full(inst, locals, ret, layouts, drop_tys))
+    Some(inst.into_outcome(&cx.types, resolved.into_boxed_slice(), check_only))
 }

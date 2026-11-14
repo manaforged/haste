@@ -1,5 +1,5 @@
 use super::Ins;
-use crate::ir::{Op, ReduceOp, ShuffleMask, TargetOpId, TinyArgs, Type, Value};
+use crate::ir::{Binary, Convert, Op, ReduceOp, ShuffleMask, TargetOpId, TinyArgs, Type, Value};
 
 impl Ins<'_> {
     /// Vector whose lanes all equal `scalar`.
@@ -46,5 +46,29 @@ impl Ins<'_> {
     pub fn target_op(mut self, op: TargetOpId, ty: Type, args: &[Value]) -> Value {
         let tiny = TinyArgs::from_slice(args).expect("target_op requires 1 to 3 arguments");
         self.value(Op::TargetOp(op, tiny), ty)
+    }
+
+    /// Signed saturating addition.
+    pub fn sadd_sat(self, x: Value, y: Value) -> Value { self.binary(Binary::SaddSat, x, y) }
+
+    /// Unsigned saturating addition.
+    pub fn uadd_sat(self, x: Value, y: Value) -> Value { self.binary(Binary::UaddSat, x, y) }
+
+    /// Signed saturating subtraction.
+    pub fn ssub_sat(self, x: Value, y: Value) -> Value { self.binary(Binary::SsubSat, x, y) }
+
+    /// Unsigned saturating subtraction.
+    pub fn usub_sat(self, x: Value, y: Value) -> Value { self.binary(Binary::UsubSat, x, y) }
+
+    /// Unsigned rounding average `((x + y + 1) >> 1)`.
+    pub fn avg_round(self, x: Value, y: Value) -> Value { self.binary(Binary::AvgRound, x, y) }
+
+    /// Saturating integer narrowing conversion to `to`.
+    pub fn narrow_sat(self, to: Type, signed: bool, x: Value) -> Value { self.convert(Convert::NarrowSat { signed }, to, x) }
+
+    /// Fused multiply-add `a * b + c`.
+    pub fn fma(mut self, a: Value, b: Value, c: Value) -> Value {
+        let ty = self.func.ty(a);
+        self.value(Op::Fma(a, b, c), ty)
     }
 }

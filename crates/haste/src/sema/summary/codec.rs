@@ -29,7 +29,7 @@ impl SysrootIndex {
     pub fn build(outline: &Outline, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Self {
         let mut items = HashMap::default();
         for (krate, tree) in outline.crates.iter().enumerate() {
-            if !tree.env.release || !tree.env.fixed {
+            if !tree.env.fixed {
                 continue;
             }
             for (file_idx, file) in tree.files.iter().enumerate() {
@@ -671,30 +671,41 @@ fn decode_prim(raw: u8) -> Result<Primitive> {
     ALL.get(raw as usize).copied().context("invalid primitive tag")
 }
 
-fn read_mut(cur: &mut Cursor<'_>) -> Result<Mut> { Ok(if cur.u8()? != 0 { Mut::Mut } else { Mut::Not }) }
+pub(crate) fn read_mut(cur: &mut Cursor<'_>) -> Result<Mut> { Ok(if cur.u8()? != 0 { Mut::Mut } else { Mut::Not }) }
 
-struct Cursor<'a> { data: &'a [u8], pos: usize }
+/// A little-endian reader over the bytes of an encoded summary or relocation table.
+pub(crate) struct Cursor<'a> { data: &'a [u8], pub(crate) pos: usize }
 
 impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    /// A reader at the start of `data`.
+    pub(crate) fn new(data: &'a [u8]) -> Self { Cursor { data, pos: 0 } }
+    /// A `u32` count, refused when it exceeds the bytes left.
+    pub(crate) fn count(&mut self) -> Result<usize> {
+        let n = self.u32()? as usize;
+        if n > self.data.len() - self.pos {
+            bail!("count exceeds remaining bytes");
+        }
+        Ok(n)
+    }
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.pos.checked_add(n).context("cursor overflow")?;
         let slice = self.data.get(self.pos..end).context("unexpected eof")?;
         self.pos = end;
         Ok(slice)
     }
-    fn u8(&mut self) -> Result<u8> { Ok(self.take(1)?[0]) }
-    fn u16(&mut self) -> Result<u16> { Ok(u16::from_le_bytes(self.take(2)?.try_into()?)) }
-    fn u32(&mut self) -> Result<u32> { Ok(u32::from_le_bytes(self.take(4)?.try_into()?)) }
-    fn u64(&mut self) -> Result<u64> { Ok(u64::from_le_bytes(self.take(8)?.try_into()?)) }
-    fn u128(&mut self) -> Result<u128> { Ok(u128::from_le_bytes(self.take(16)?.try_into()?)) }
-    fn u32s(&mut self) -> Result<Vec<u32>> { (0..self.u32()?).map(|_| self.u32()).collect() }
+    pub(crate) fn u8(&mut self) -> Result<u8> { Ok(self.take(1)?[0]) }
+    pub(crate) fn u16(&mut self) -> Result<u16> { Ok(u16::from_le_bytes(self.take(2)?.try_into()?)) }
+    pub(crate) fn u32(&mut self) -> Result<u32> { Ok(u32::from_le_bytes(self.take(4)?.try_into()?)) }
+    pub(crate) fn u64(&mut self) -> Result<u64> { Ok(u64::from_le_bytes(self.take(8)?.try_into()?)) }
+    pub(crate) fn u128(&mut self) -> Result<u128> { Ok(u128::from_le_bytes(self.take(16)?.try_into()?)) }
+    pub(crate) fn u32s(&mut self) -> Result<Vec<u32>> { (0..self.u32()?).map(|_| self.u32()).collect() }
 }
 
-fn write_u16(out: &mut Vec<u8>, v: u16) { out.extend_from_slice(&v.to_le_bytes()); }
-fn write_u32(out: &mut Vec<u8>, v: u32) { out.extend_from_slice(&v.to_le_bytes()); }
-fn write_u64(out: &mut Vec<u8>, v: u64) { out.extend_from_slice(&v.to_le_bytes()); }
-fn write_u128(out: &mut Vec<u8>, v: u128) { out.extend_from_slice(&v.to_le_bytes()); }
-fn write_u32s(out: &mut Vec<u8>, s: &[u32]) { write_u32(out, s.len() as u32); s.iter().for_each(|&v| write_u32(out, v)); }
+pub(crate) fn write_u16(out: &mut Vec<u8>, v: u16) { out.extend_from_slice(&v.to_le_bytes()); }
+pub(crate) fn write_u32(out: &mut Vec<u8>, v: u32) { out.extend_from_slice(&v.to_le_bytes()); }
+pub(crate) fn write_u64(out: &mut Vec<u8>, v: u64) { out.extend_from_slice(&v.to_le_bytes()); }
+pub(crate) fn write_u128(out: &mut Vec<u8>, v: u128) { out.extend_from_slice(&v.to_le_bytes()); }
+pub(crate) fn write_u32s(out: &mut Vec<u8>, s: &[u32]) { write_u32(out, s.len() as u32); s.iter().for_each(|&v| write_u32(out, v)); }
 
 fn write_opt<T>(out: &mut Vec<u8>, opt: Option<&T>, mut f: impl FnMut(&mut Vec<u8>, &T) -> Option<()>) -> Option<()> {
     match opt { Some(v) => { out.push(1); f(out, v) } None => { out.push(0); Some(()) } }

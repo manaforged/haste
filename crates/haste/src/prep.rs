@@ -158,7 +158,7 @@ impl Started {
 
 /// The directory the driver build `build` made, once it ends.
 fn joined(build: JoinHandle<Result<PathBuf>>) -> Result<PathBuf> {
-    build.join().map_err(|_| anyhow::anyhow!("the prep build panicked")).and_then(|built| built)
+    build.join().map_err(|panic| anyhow::anyhow!("the prep build panicked: {}", crate::sync::panic_text(&*panic))).and_then(|built| built)
 }
 
 /// Publishes at `out` the library of the build in `built` when rustc read the sources that `outline` holds as `sources` says, else builds it again from the sources as they read now and publishes that unless one changed while the driver ran; each beside a snapshot of the sources.
@@ -195,7 +195,7 @@ fn rebuild(out: &Path, (outline, workspace): (&Outline, &Workspace)) -> Result<(
 pub fn install(mut manifest: Manifest, args: &[String]) -> Result<()> {
     manifest.rustc.open()?;
     manifest.rustc.start(args)?;
-    let entries = manifest.entries.get_mut().map_err(|_| anyhow::anyhow!("vtable entries poisoned"))?;
+    let entries = manifest.entries.get_mut().map_err(|error| anyhow::anyhow!("vtable entries poisoned: {error}"))?;
     entries.memory.reserve(ENTRY_BYTES).map_err(|error| anyhow::anyhow!("reserving vtable entry memory: {error:?}"))?;
     entries.memory.split(1, 0);
     if BOUND.set(manifest).is_err() {
@@ -281,7 +281,7 @@ pub fn entry(cx: &mut Context<'_>, slots: &dyn Slots, index: usize, method: &Met
     if !compiled.relocs().is_empty() || !compiled.sites().is_empty() {
         bail!("a vtable entry whose code names addresses it is placed at");
     }
-    let mut entries = manifest.entries.lock().map_err(|_| anyhow::anyhow!("vtable entries poisoned"))?;
+    let mut entries = crate::sync::lock(&manifest.entries);
     let address = entries.memory.write(compiled.bytes()).map_err(|error| anyhow::anyhow!("placing a vtable entry: {error:?}"))? as u64;
     entries.placed.insert(key, address);
     Ok(address)

@@ -3,6 +3,7 @@ use haste_codegen::{AtomicRmwOp, Lane, TargetOpId, Type};
 use crate::body::BinOp;
 use crate::names::ItemRef;
 use crate::outline::item::{Attr, ItemKind};
+use crate::outline::tree::Profile;
 
 use super::Context;
 
@@ -29,6 +30,7 @@ pub enum Intrinsic {
     Copysign,
     Fmin,
     Fmax,
+    Fma,
     Round(u8),
     FloatToInt,
     Transmute,
@@ -37,6 +39,10 @@ pub enum Intrinsic {
     ConstEvalSelect,
     SelectUnpredictable,
     Trap,
+    /// `unreachable`, a point that control never reaches.
+    Unreachable,
+    /// `assume`, a condition the optimizer may take as true.
+    Assume,
     CallerLocation,
     Cpuid,
     /// `FnPtr::addr`, the address of a function pointer.
@@ -47,6 +53,12 @@ pub enum Intrinsic {
     },
     /// AVX2 32-byte `pshufb`.
     BytePermute32,
+    /// Unsigned integer rounded average `(a + b + 1) >> 1` on `Type::Vec`.
+    AvgRound(Type),
+    /// Unsigned byte pairwise maximum across two 16-byte vectors.
+    Umaxp,
+    /// Signed saturating doubling multiply returning high half on `Type::Vec`.
+    Sqdmulh(Type),
     /// A target-specific SIMD instruction emitted via `TargetOpId`.
     TargetOp {
         id: TargetOpId,
@@ -158,13 +170,13 @@ pub enum Atomic {
 const LLVM: &[(&str, Intrinsic)] = &[
     ("llvm.x86.ssse3.pshuf.b.128", Intrinsic::ShuffleDyn { tbl: false }),
     ("llvm.x86.avx2.pshuf.b", Intrinsic::BytePermute32),
-    ("llvm.x86.sse2.pavg.b", Intrinsic::TargetOp { id: TargetOpId::X64Pavgb, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
-    ("llvm.x86.sse2.pavg.w", Intrinsic::TargetOp { id: TargetOpId::X64Pavgw, ty: Type::Vec { lane: Lane::I16, count: 8 } }),
-    ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::TargetOp { id: TargetOpId::Arm64Umaxp, ty: Type::Vec { lane: Lane::I8, count: 16 } }),
+    ("llvm.x86.sse2.pavg.b", Intrinsic::AvgRound(Type::Vec { lane: Lane::I8, count: 16 })),
+    ("llvm.x86.sse2.pavg.w", Intrinsic::AvgRound(Type::Vec { lane: Lane::I16, count: 8 })),
+    ("llvm.aarch64.neon.umaxp.v16i8", Intrinsic::Umaxp),
     ("llvm.aarch64.neon.tbl1.v16i8", Intrinsic::ShuffleDyn { tbl: true }),
-    ("llvm.aarch64.neon.sqdmulh.v2i32", Intrinsic::TargetOp { id: TargetOpId::Arm64Sqdmulh, ty: Type::Vec { lane: Lane::I32, count: 2 } }),
-    ("llvm.aarch64.neon.sqdmulh.v4i32", Intrinsic::TargetOp { id: TargetOpId::Arm64Sqdmulh, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
-    ("llvm.aarch64.neon.sqdmulh.v8i16", Intrinsic::TargetOp { id: TargetOpId::Arm64Sqdmulh, ty: Type::Vec { lane: Lane::I16, count: 8 } }),
+    ("llvm.aarch64.neon.sqdmulh.v2i32", Intrinsic::Sqdmulh(Type::Vec { lane: Lane::I32, count: 2 })),
+    ("llvm.aarch64.neon.sqdmulh.v4i32", Intrinsic::Sqdmulh(Type::Vec { lane: Lane::I32, count: 4 })),
+    ("llvm.aarch64.neon.sqdmulh.v8i16", Intrinsic::Sqdmulh(Type::Vec { lane: Lane::I16, count: 8 })),
     ("llvm.aarch64.crypto.sha256h", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256H, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
     ("llvm.aarch64.crypto.sha256h2", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256H2, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
     ("llvm.aarch64.crypto.sha256su0", Intrinsic::TargetOp { id: TargetOpId::Arm64Sha256Su0, ty: Type::Vec { lane: Lane::I32, count: 4 } }),
@@ -217,6 +229,10 @@ const NAMES: &[(&str, Intrinsic)] = {
         ("floor", Floor),
         ("roundf32", Round(32)),
         ("roundf64", Round(64)),
+        ("fmaf32", Fma),
+        ("fmaf64", Fma),
+        ("fmuladdf32", Fma),
+        ("fmuladdf64", Fma),
         ("float_to_int_unchecked", FloatToInt),
         ("transmute", Transmute),
         ("transmute_unchecked", Transmute),
@@ -230,8 +246,9 @@ const NAMES: &[(&str, Intrinsic)] = {
         ("const_eval_select", ConstEvalSelect),
         ("select_unpredictable", SelectUnpredictable),
         ("abort", Trap),
+        ("assume", Assume),
         ("catch_unwind", CatchUnwind),
-        ("unreachable", Trap),
+        ("unreachable", Unreachable),
         ("caller_location", CallerLocation),
         ("size_of", SizeOf),
         ("align_of", AlignOf),
@@ -347,7 +364,7 @@ const NAMES: &[(&str, Intrinsic)] = {
 };
 
 impl Context<'_> {
-    /// The intrinsic that the function `item` is, when it carries `#[rustc_intrinsic]` and lowering knows it, or when it is the panic handler. `Trap` stands for the panic runtime, which is not lowered yet, and for code that must never run.
+    /// The intrinsic that the function `item` is, when it carries `#[rustc_intrinsic]` and lowering knows it, or when it is the panic handler. `Trap` stands for the panic runtime, which is not lowered yet. `Unreachable` also stands for `core::hint::unreachable_unchecked` where its precondition check is compiled out.
     pub fn intrinsic(&self, item: ItemRef) -> Option<Intrinsic> {
         let (src, entry) = self.item(item);
         match self.lang(item) {
@@ -367,8 +384,12 @@ impl Context<'_> {
         {
             return Some(Intrinsic::X86(x86));
         }
-        if entry.kind == ItemKind::Fn && name == "__cpuid_count" && self.outline.roots[item.krate as usize].name == "core" {
-            return Some(Intrinsic::Cpuid);
+        if entry.kind == ItemKind::Fn && self.outline.roots[item.krate as usize].name == "core" {
+            match name {
+                "__cpuid_count" => return Some(Intrinsic::Cpuid),
+                "unreachable_unchecked" if crate::profile() == Profile::Release => return Some(Intrinsic::Unreachable),
+                _ => {}
+            }
         }
         marked.then(|| NAMES.iter().find(|(known, _)| *known == name).map(|(_, which)| *which)).flatten()
     }

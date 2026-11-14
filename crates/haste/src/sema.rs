@@ -82,7 +82,7 @@ impl<'a> Context<'a> {
     /// Drops cached reach-only tables and sysroot bodies to cut RSS before one-shot codegen.
     pub(crate) fn compact_for_oneshot_codegen(&mut self) {
         self.store.finals.clear();
-        self.store.bodies.retain(|item, _| !self.outline.is_sysroot(item.krate));
+        self.store.bodies.retain(|item, _| !self.outline.is_fixed(item.krate));
         self.store.lookups.summaries = table::Flight::default();
         self.store.lookups.selections.clear();
         self.store.lookups.projections.clear();
@@ -370,6 +370,16 @@ impl<'a> Context<'a> {
     /// Path resolution inside crate `krate`, recording what it finds not loaded yet.
     pub fn paths(&self, krate: u32) -> Paths<'_> {
         Paths { demands: Some(&self.asks), ..self.names.paths(self.outline, krate) }
+    }
+
+    /// The path of the module that holds `item`, or its crate's name when no module is found.
+    pub fn module_text(&mut self, item: ItemRef) -> String {
+        self.module_of(item).map_or_else(|_| self.outline.roots[item.krate as usize].name.clone(), |at| self.outline.module_path(at))
+    }
+
+    /// The name of `item` under the path of the module that holds it.
+    pub fn qualified(&mut self, item: ItemRef) -> String {
+        format!("{}::{}", self.module_text(item), self.name(item))
     }
 
     /// The module that holds `item`, through any impl, trait or extern block around it.

@@ -16,7 +16,7 @@ pub enum Family {
 }
 
 /// The families without native encodings in the code generator, which compiled code sees as absent so that run-time dispatch picks paths this backend runs well.
-pub const UNENCODED: &[Family] = &[Family::Avx];
+pub const UNENCODED: &[Family] = &[Family::Avx512, Family::VectorCrypto];
 
 /// The `cpuid` and `xgetbv` bits that a set of families occupies.
 #[derive(Clone, Copy)]

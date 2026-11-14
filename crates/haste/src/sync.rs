@@ -9,6 +9,10 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload.downcast_ref::<&str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("a panic with no message")
+}
+
 pub(crate) fn into_inner<T>(mutex: Mutex<T>) -> T {
     mutex.into_inner().unwrap_or_else(PoisonError::into_inner)
 }

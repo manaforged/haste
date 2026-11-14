@@ -20,10 +20,11 @@ use super::substs::{ProjId, Substs};
 use super::ty::{Kind, Ty, Types, object_parts};
 use inst::{InstOutcome, TyFolder, fold_substs, fold_ty, instantiate_pure};
 
-/// How generic sema summarizes one function item: a reusable polymorphic summary or monomorphic fallback.
+/// How generic sema summarizes one function item: a reusable polymorphic summary, monomorphic inference with bounded-trait method hints, or plain monomorphic fallback.
 #[derive(Clone, Debug)]
 pub enum SummaryKind {
     Poly(Arc<PolySummary>),
+    MonomorphicHints(Arc<HashMap<ExprId, ItemRef>>),
     MonomorphicFallback,
 }
 
@@ -98,54 +99,44 @@ impl<'a> SubState<'a> {
 pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Option<Result<Arc<Typed>, String>> {
     let before = cx.quiet_mark();
     let (item, substs) = *instance;
-    let is_sysroot = cx.outline.is_sysroot(item.krate);
+    let is_fixed = cx.outline.is_fixed(item.krate);
+    if !eligible(cx, item, substs) {
+        return None;
+    }
+    let expected = expected_param_count(cx, item)?;
+    if cx.types.substs(substs).len() != expected || expected > u16::MAX as usize {
+        return None;
+    }
     let summaries = cx.store.lookups.summaries.clone();
-    let built = if substs.is_empty() && is_sysroot {
-        let (_, entry) = cx.item(item);
-        if entry.kind != ItemKind::Fn || entry.body.is_none() || cx.foreign(item) {
-            return None;
+    let built = summaries.run(
+        cx,
+        item,
+        |cx| Ok(load_summary(cx, item, expected as u16)),
+        |_| Ok(SummaryKind::MonomorphicFallback),
+    );
+    let summary = match built {
+        Ok(SummaryKind::Poly(summary)) => summary,
+        Ok(SummaryKind::MonomorphicHints(hints)) => {
+            let m_before = cx.quiet_mark();
+            let typed = match super::infer::infer_with_hints(cx, instance.0, instance.1, Some(hints)) {
+                Ok(typed) => Arc::new(typed),
+                Err(error) => return Some(Err(format!("{}: {error:#}", cx.name(instance.0)))),
+            };
+            let laid = super::reach::lay_out(cx, &typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
+            if laid.is_ok() && cx.quiet_mark() == m_before {
+                cx.store.finals.insert(*instance, Arc::clone(&typed));
+            }
+            return Some(Ok(typed));
         }
-        summaries.run(
-            cx,
-            item,
-            |cx| {
-                if let Some(poly) = frozen::frozen_summary(cx, item) {
-                    return Ok(SummaryKind::Poly(poly));
-                }
-                if !eligible(cx, item, substs) || expected_param_count(cx, item) != Some(0) {
-                    return Ok(SummaryKind::MonomorphicFallback);
-                }
-                Ok(build_summary(cx, item, 0))
-            },
-            |_| Ok(SummaryKind::MonomorphicFallback),
-        )
-    } else {
-        if !eligible(cx, item, substs) {
-            return None;
-        }
-        let expected = expected_param_count(cx, item)?;
-        if cx.types.substs(substs).len() != expected || expected > u16::MAX as usize {
-            return None;
-        }
-        summaries.run(
-            cx,
-            item,
-            |cx| {
-                if let Some(poly) = frozen::frozen_summary(cx, item) {
-                    return Ok(SummaryKind::Poly(poly));
-                }
-                Ok(build_summary(cx, item, expected as u16))
-            },
-            |_| Ok(SummaryKind::MonomorphicFallback),
-        )
+        _ => return None,
     };
-    let Ok(SummaryKind::Poly(summary)) = built else { return None };
-    if is_sysroot
+    if is_fixed
         && !cx.store.lookups.skip_warm_sysroot_bodies
         && cx.store.bodies.get(&item).is_none()
         && cx.store.lookups.substrate.is_some()
-        && cx.attr_value(item, "cold").is_none()
-        && cx.attr_value(item, "inline") != Some("never")
+        && !(cx.outline.is_sysroot(item.krate)
+            && summary.param_count == 0
+            && (cx.attr_value(item, "cold").is_some() || cx.attr_value(item, "inline") == Some("never")))
         && let Err(err) = cx.body(item)
         && cx.quiet_mark() != before
     {
@@ -158,7 +149,7 @@ fn cached_poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySu
     if let Some(kind) = cx.store.lookups.summaries.get_ready(&item) {
         return match kind {
             SummaryKind::Poly(summary) => Some(summary),
-            SummaryKind::MonomorphicFallback => None,
+            SummaryKind::MonomorphicHints(_) | SummaryKind::MonomorphicFallback => None,
         };
     }
     frozen::frozen_summary(cx, item)
@@ -173,14 +164,14 @@ pub(super) fn poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<Po
         return None;
     }
     let expected = expected_param_count(cx, item)?;
-    if (expected == 0 && !cx.outline.is_sysroot(item.krate)) || expected > u16::MAX as usize {
+    if (expected == 0 && !cx.outline.is_fixed(item.krate)) || expected > u16::MAX as usize {
         return None;
     }
     let summaries = cx.store.lookups.summaries.clone();
     let built = summaries.run(
         cx,
         item,
-        |cx| Ok(frozen::frozen_summary(cx, item).map_or_else(|| build_summary(cx, item, expected as u16), SummaryKind::Poly)),
+        |cx| Ok(load_summary(cx, item, expected as u16)),
         |_| Ok(SummaryKind::MonomorphicFallback),
     );
     match built {
@@ -191,8 +182,8 @@ pub(super) fn poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<Po
 
 fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
     let slice = cx.types.substs(substs);
-    let is_sysroot = cx.outline.is_sysroot(item.krate);
-    if (slice.is_empty() && !is_sysroot) || cx.types.substs_have_params(substs) || slice.iter().any(|&ty| matches!(cx.types.kind(ty), Kind::Never)) {
+    let is_fixed = cx.outline.is_fixed(item.krate);
+    if (slice.is_empty() && !is_fixed) || cx.types.substs_have_params(substs) || slice.iter().any(|&ty| matches!(cx.types.kind(ty), Kind::Never)) {
         return false;
     }
     let (_, entry) = cx.item(item);
@@ -219,11 +210,18 @@ fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
     Some(own)
 }
 
+fn load_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
+    let Some(summary) = frozen::frozen_summary(cx, item) else { return build_summary(cx, item, param_count) };
+    lay_out_fixed(cx, &summary);
+    SummaryKind::Poly(summary)
+}
+
 fn build_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
-    let SummaryKind::Poly(mut arc) = super::infer::poly::build_poly_summary(cx, item, param_count) else {
-        return SummaryKind::MonomorphicFallback;
+    let built = super::infer::poly::build_poly_summary(cx, item, param_count);
+    let SummaryKind::Poly(mut arc) = built else {
+        return built;
     };
-    if cx.outline.is_sysroot(item.krate) {
+    if cx.outline.is_fixed(item.krate) {
         cx.store.lookups.has_new_sysroot_summaries.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let Some(summary) = Arc::get_mut(&mut arc) else { return SummaryKind::MonomorphicFallback };
@@ -343,24 +341,45 @@ fn extract_op_holes(types: &Types, body: &Body, tpl: &BodyTables) -> Box<[(ExprI
         .collect()
 }
 
+fn is_aggregate(cx: &Context<'_>, ty: Ty) -> bool {
+    ty != Ty::NONE && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..))
+}
+
+fn owned_tys(summary: &PolySummary) -> impl Iterator<Item = Ty> + '_ {
+    summary.locals.iter().map(|l| l.ty).chain(summary.template.owned_tys())
+}
+
+fn lay_out_fixed(cx: &mut Context<'_>, summary: &PolySummary) {
+    let fixed = summary.template.closures.is_empty().then(|| owned_tys(summary));
+    for ty in fixed.into_iter().flatten() {
+        if is_aggregate(cx, ty) && !cx.types.has_params(ty) {
+            drop(cx.layout(ty));
+        }
+    }
+}
+
 fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Result<()> {
-    let mut seen_drop = HashSet::default();
-    let mut fixed_drops = Vec::new();
-    let mut drop_tys = Vec::new();
-    for ty in summary.locals.iter().map(|l| l.ty).chain(summary.template.owned_tys()) {
-        if ty == Ty::NONE || !seen_drop.insert(ty) {
-            continue;
-        }
-        if !cx.types.has_params(ty) {
-            if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
-                drop(cx.layout(ty));
+    if summary.template.closures.is_empty() {
+        let mut seen_drop = HashSet::default();
+        let mut fixed_drops = Vec::new();
+        let mut drop_tys = Vec::new();
+        for ty in owned_tys(summary) {
+            if ty == Ty::NONE || !seen_drop.insert(ty) {
+                continue;
             }
-            if let Some(call) = super::infer::glue_call(cx, ty)? {
-                fixed_drops.push(call);
+            if !cx.types.has_params(ty) {
+                if is_aggregate(cx, ty) {
+                    drop(cx.layout(ty));
+                }
+                if let Some(call) = super::infer::glue_call(cx, ty)? {
+                    fixed_drops.push(call);
+                }
+            } else if !matches!(cx.types.kind(ty), Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_)) {
+                drop_tys.push(ty);
             }
-        } else if !matches!(cx.types.kind(ty), Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_)) {
-            drop_tys.push(ty);
         }
+        summary.fixed_drops = fixed_drops.into_boxed_slice();
+        summary.drop_tys = drop_tys.into_boxed_slice();
     }
     let mut seen_param = HashSet::default();
     let mut parametric_tys = Vec::new();
@@ -372,10 +391,17 @@ fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Res
             parametric_tys.push(ty);
         }
     }
-    summary.fixed_drops = fixed_drops.into_boxed_slice();
-    summary.drop_tys = drop_tys.into_boxed_slice();
     summary.parametric_tys = parametric_tys.into_boxed_slice();
     Ok(())
+}
+
+fn record_instantiated(cx: &mut Context<'_>, instance: Instance, layouts: &[Ty], typed: &Arc<Typed>, unlaid: &mut Vec<String>, before: (usize, usize)) -> bool {
+    let laid = lay_out_instantiated(cx, layouts, typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
+    let clean = laid.is_ok() && cx.quiet_mark() == before;
+    if clean {
+        cx.store.finals.insert(instance, Arc::clone(typed));
+    }
+    clean
 }
 
 fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<PolySummary>, unlaid: &mut Vec<String>, before: (usize, usize)) -> Option<Result<Arc<Typed>, String>> {
@@ -398,10 +424,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
             drops: summary.fixed_drops.to_vec(),
             shape: Shape::Body,
         });
-        let laid = lay_out_instantiated(cx, &summary.layout_tys, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
-        if laid.is_ok() && cx.quiet_mark() == before {
-            cx.store.finals.insert(instance, Arc::clone(&typed));
-        }
+        record_instantiated(cx, instance, &summary.layout_tys, &typed, unlaid, before);
         return Some(Ok(typed));
     }
     let concrete_args = cx.types.substs(instance.1).to_vec();
@@ -410,10 +433,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
     }
     if let Some((poly_inst, locals, ret, concrete_layouts, drops)) = frozen::frozen_instance(cx, instance, summary) {
         let typed = Arc::new(Typed { tables: LazyTables::Poly(Box::new(poly_inst)), locals, params: summary.params.to_vec(), ret, drops, shape: Shape::Body });
-        let laid = lay_out_instantiated(cx, &concrete_layouts, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
-        if laid.is_ok() && cx.quiet_mark() == before {
-            cx.store.finals.insert(instance, Arc::clone(&typed));
-        }
+        record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before);
         return Some(Ok(typed));
     }
     let check_only = cx.store.lookups.skip_warm_sysroot_bodies && cx.outline.is_fixed(instance.0.krate) && summary.template.closures.is_empty();
@@ -475,12 +495,11 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
             (typed, concrete_layouts)
         }
     };
-    let laid = lay_out_instantiated(cx, &concrete_layouts, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
-    if laid.is_ok() && cx.quiet_mark() == before {
-        if matches!(&typed.tables, LazyTables::Poly(inst) if inst.summary.template.closures.is_empty()) && cx.outline.is_sysroot(instance.0.krate) {
-            cx.store.lookups.has_new_sysroot_instances.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        cx.store.finals.insert(instance, Arc::clone(&typed));
+    if record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before)
+        && matches!(&typed.tables, LazyTables::Poly(inst) if inst.summary.template.closures.is_empty())
+        && cx.outline.is_fixed(instance.0.krate)
+    {
+        cx.store.lookups.has_new_sysroot_instances.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Some(Ok(typed))
 }
@@ -548,7 +567,7 @@ fn sub_op_check(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, check: OpChec
 
 fn lay_out_instantiated(cx: &mut Context<'_>, layouts: &[Ty], typed: &Typed) -> Result<()> {
     for &ty in layouts {
-        if ty != Ty::NONE && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
+        if is_aggregate(cx, ty) {
             cx.layout(ty)?;
         }
     }
@@ -682,7 +701,7 @@ fn concrete_holds(infer: &mut Infer<'_, '_>, of: ItemRef, self_ty: Ty, args: &[T
         return Ok(true);
     }
     if infer.is_callable_trait(of) && matches!(infer.cx.types.kind(self_ty), Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
-        return Ok(true);
+        return infer.check_callable_obligation(of, self_ty, args);
     }
     Ok(infer.select(of, self_ty, args)?.is_some())
 }
@@ -714,11 +733,10 @@ fn resolve_call_override(infer: &mut Infer<'_, '_>, expr: ExprId, found: Ty, tup
 
 fn resolve_dyn_call(infer: &mut Infer<'_, '_>, (expr, found, ty): (ExprId, Ty, Ty), (of, parts, members): (ItemRef, Substs, &[ItemRef]), autoderefs: Option<u32>) -> Result<CallOverride> {
     let dyn_tuple = *object_parts(infer.cx.types.substs(parts), members).0.first().ok_or_else(|| anyhow::anyhow!("callable trait object without tuple"))?;
-    let (name, box_free) = match infer.cx.lang(of) {
-        Some("fn") => ("call", None),
-        Some("fn_mut") => ("call_mut", None),
-        _ => ("call_once", Some(resolve_box_free(infer, found, autoderefs)?)),
-    };
+    let name = super::infer::callable_method_name(infer.cx.lang(of));
+    let box_free = matches!(name, "call_once" | "async_call_once")
+        .then(|| resolve_box_free(infer, found, autoderefs))
+        .transpose()?;
     let Some(method) = infer.cx.trait_member(of, name) else { bail!("missing `{name}`") };
     let res = Some(Res::fn_of(&infer.cx.types, method, &[ty, dyn_tuple]));
     Ok(CallOverride { expr, res, autoderefs, overloaded: false, box_free })

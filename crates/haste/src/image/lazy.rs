@@ -188,7 +188,7 @@ impl Evaluate for Jit {
 fn value_of(ended: Option<Ended>) -> Result<u128> {
     match ended {
         Some(Ended { failure: Some((error, _)), .. }) => bail!("{error}"),
-        Some(Ended { status: 0, bytes, .. }) => Ok(u128::from_le_bytes(<[u8; 16]>::try_from(bytes).map_err(|_| anyhow!("it gave no value"))?)),
+        Some(Ended { status: 0, bytes, .. }) => Ok(u128::from_le_bytes(<[u8; 16]>::try_from(bytes).map_err(|bytes| anyhow!("it gave no value: {} bytes, not 16", bytes.len()))?)),
         Some(Ended { status, .. }) if status == 128 + libc::SIGVTALRM => {
             bail!("it ran for more than {EVALUATION_SECONDS} s of CPU time")
         }

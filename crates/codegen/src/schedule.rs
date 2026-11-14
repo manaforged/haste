@@ -1,5 +1,7 @@
-use crate::ir::Function;
-use crate::{Effort, cse, fill, fold, ifconv, licm, loads, merge, promote, returns, switch, tailrec, thread, unroll};
+use std::time::Instant;
+
+use crate::ir::{Domain, Function, Op};
+use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -12,138 +14,244 @@ pub(crate) enum Pass {
     Loads = 5,
     Thread = 6,
     IfConv = 7,
-    Unroll = 8,
-    Licm = 9,
-    Switch = 10,
-    Returns = 11,
-    TailRec = 12,
+    Rotate = 8,
+    Unroll = 9,
+    Licm = 10,
+    Switch = 11,
+    Returns = 12,
+    TailRec = 13,
+    Lsr = 14,
 }
 
-const PASS_COUNT: usize = 13;
-const MAX_ROUNDS: usize = 6;
+impl Pass {
+    pub(crate) const ALL: &[Self] = &[
+        Self::Fill,
+        Self::Fold,
+        Self::Merge,
+        Self::Promote,
+        Self::Cse,
+        Self::Loads,
+        Self::Thread,
+        Self::IfConv,
+        Self::Rotate,
+        Self::Unroll,
+        Self::Licm,
+        Self::Switch,
+        Self::Returns,
+        Self::TailRec,
+        Self::Lsr,
+    ];
+
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Fill => "fill",
+            Self::Fold => "fold",
+            Self::Merge => "merge",
+            Self::Promote => "promote",
+            Self::Cse => "cse",
+            Self::Loads => "loads",
+            Self::Thread => "thread",
+            Self::IfConv => "ifconv",
+            Self::Rotate => "rotate",
+            Self::Unroll => "unroll",
+            Self::Licm => "licm",
+            Self::Switch => "switch",
+            Self::Returns => "returns",
+            Self::TailRec => "tailrec",
+            Self::Lsr => "lsr",
+        }
+    }
+}
 
 struct Rule {
     pass: Pass,
-    max_runs: u8,
-    enables: &'static [Pass],
+    reads: Domain,
 }
 
-struct Plan {
+struct Plan<'t> {
     moves: promote::Moves,
     effort: Effort,
-    init: &'static [Pass],
-    seed: &'static [Pass],
+    target: &'t crate::Target,
     rules: &'static [Rule],
-    max_rounds: usize,
+    budget: usize,
     finish: &'static [Pass],
 }
 
-static QUICK_INIT: &[Pass] = &[Pass::Fill, Pass::Fold, Pass::Merge];
-static QUICK_SEED: &[Pass] = &[Pass::Promote];
+static INIT: &[Pass] = &[Pass::Fill, Pass::Fold, Pass::Merge];
+
 static QUICK_RULES: &[Rule] = &[
-    Rule { pass: Pass::Promote, max_runs: 2, enables: &[Pass::Promote, Pass::Fold, Pass::Merge] },
-    Rule { pass: Pass::Fold, max_runs: 2, enables: &[] },
-    Rule { pass: Pass::Merge, max_runs: 2, enables: &[] },
+    Rule { pass: Pass::Promote, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
+    Rule { pass: Pass::Fold, reads: Domain::VALUES.union(Domain::CFG) },
+    Rule { pass: Pass::Merge, reads: Domain::CFG.union(Domain::VALUES) },
 ];
 static QUICK_FINISH: &[Pass] = &[Pass::Cse, Pass::Returns];
 
-static FULL_INIT: &[Pass] = &[Pass::Fill, Pass::Fold, Pass::Merge];
-static FULL_SEED: &[Pass] = &[Pass::Promote, Pass::Loads, Pass::Cse, Pass::Thread, Pass::IfConv, Pass::Unroll, Pass::Licm];
 static FULL_RULES: &[Rule] = &[
-    Rule {
-        pass: Pass::Promote,
-        max_runs: 6,
-        enables: &[Pass::Promote, Pass::Fold, Pass::Merge, Pass::Loads, Pass::Cse, Pass::Unroll, Pass::Licm],
-    },
-    Rule { pass: Pass::Fold, max_runs: 8, enables: &[Pass::Merge, Pass::Promote, Pass::Cse, Pass::Thread, Pass::IfConv, Pass::Unroll] },
-    Rule { pass: Pass::Merge, max_runs: 8, enables: &[Pass::Fold, Pass::Promote, Pass::IfConv, Pass::Unroll] },
-    Rule { pass: Pass::Loads, max_runs: 4, enables: &[Pass::Fold, Pass::Promote, Pass::Cse, Pass::Licm] },
-    Rule { pass: Pass::Cse, max_runs: 4, enables: &[Pass::Fold, Pass::Loads] },
-    Rule { pass: Pass::Thread, max_runs: 3, enables: &[Pass::Merge, Pass::Fold, Pass::Cse, Pass::Loads] },
-    Rule { pass: Pass::IfConv, max_runs: 3, enables: &[Pass::Merge, Pass::Fold, Pass::Cse, Pass::Loads] },
-    Rule { pass: Pass::Unroll, max_runs: 3, enables: &[Pass::Fold, Pass::Merge, Pass::Loads, Pass::Promote, Pass::Cse] },
-    Rule { pass: Pass::Licm, max_runs: 3, enables: &[Pass::Loads, Pass::Fold, Pass::Cse] },
+    Rule { pass: Pass::Fill, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::Promote, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
+    Rule { pass: Pass::Fold, reads: Domain::VALUES.union(Domain::CFG) },
+    Rule { pass: Pass::Merge, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::Loads, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
+    Rule { pass: Pass::Cse, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::Thread, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::IfConv, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::Rotate, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
+    Rule { pass: Pass::Unroll, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
+    Rule { pass: Pass::Licm, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
+    Rule { pass: Pass::Lsr, reads: Domain::CFG.union(Domain::VALUES) },
 ];
 static FULL_FINISH: &[Pass] = &[Pass::Switch, Pass::Returns, Pass::TailRec];
 
-fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort) -> bool {
-    match pass {
+fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort, target: &crate::Target) -> Domain {
+    let tracing = crate::trace::enabled();
+    let (before_blocks, before_insts) = if tracing { (func.blocks.len(), func.size()) } else { (0, 0) };
+    let start = tracing.then(Instant::now);
+    let changed = match pass {
         Pass::Fill => fill::run(func),
         Pass::Fold => fold::run(func, effort),
         Pass::Merge => merge::run(func),
         Pass::Promote => promote::step(func, moves),
         Pass::Cse => cse::run(func),
-        Pass::Loads => loads::run(func),
+        Pass::Loads => loads::run(func, target),
         Pass::Thread => thread::run(func),
         Pass::IfConv => ifconv::run(func),
+        Pass::Rotate => rotate::run(func),
         Pass::Unroll => unroll::run(func),
         Pass::Licm => licm::run(func),
+        Pass::Lsr => lsr::run(func),
         Pass::Switch => switch::run(func),
         Pass::Returns => returns::run(func),
         Pass::TailRec => {
             let did = tailrec::run(func);
-            if did {
+            if !did.is_empty() {
                 fold::compact(func);
             }
             did
         }
+    };
+    if changed.contains(Domain::CFG) {
+        func.bump_cfg();
     }
+    if let Some(start) = start {
+        crate::trace::after_pass(pass, before_blocks, before_insts, changed, start.elapsed(), func);
+    }
+    changed
 }
 
 fn run_fixpoint(func: &mut Function, plan: &Plan) {
-    let mut active = [false; PASS_COUNT];
-    let mut runs = [0_u8; PASS_COUNT];
-    for &pass in plan.seed {
-        active[pass as usize] = true;
+    let mut dirty = [Domain::NONE; Pass::ALL.len()];
+    for rule in plan.rules {
+        dirty[rule.pass as usize] = rule.reads;
     }
-    for _ in 0..plan.max_rounds {
-        let mut any = false;
+    let mut remaining = plan.budget;
+    while remaining > 0 {
+        let mut ran = false;
         for rule in plan.rules {
+            if remaining == 0 {
+                break;
+            }
             let idx = rule.pass as usize;
-            if !active[idx] || runs[idx] >= rule.max_runs {
+            if (dirty[idx] & rule.reads).is_empty() {
                 continue;
             }
-            active[idx] = false;
-            runs[idx] += 1;
-            if run_pass(func, rule.pass, plan.moves, plan.effort) {
-                any = true;
-                for &next in rule.enables {
-                    active[next as usize] = true;
+            dirty[idx] = Domain::NONE;
+            remaining -= 1;
+            ran = true;
+            let changed = run_pass(func, rule.pass, plan.moves, plan.effort, plan.target);
+            if !changed.is_empty() {
+                for other in plan.rules {
+                    if other.pass != rule.pass {
+                        dirty[other.pass as usize] |= changed;
+                    }
+                }
+                if rule.pass == Pass::Promote {
+                    dirty[idx] |= changed;
                 }
             }
         }
-        if !any {
+        if !ran {
             break;
         }
     }
 }
 
-pub(crate) fn run(func: &mut Function, moves: promote::Moves, effort: Effort) {
+fn strip_assumes(func: &mut Function) -> bool {
+    let Function { blocks, insts, .. } = func;
+    let mut stripped = false;
+    for block in blocks {
+        block.insts.retain(|inst| {
+            let assume = matches!(insts[inst.index()].op, Op::Assume(_));
+            if assume {
+                insts[inst.index()].op = Op::Trap;
+            }
+            stripped |= assume;
+            !assume
+        });
+    }
+    stripped
+}
+
+/// Moves each single-use compare read by a `Brif` or `Select` of its own block to sit directly before that reader.
+pub(crate) fn sink_compares(func: &mut Function) {
+    let uses = func.use_counts();
+    for block in &mut func.blocks {
+        let mut at = 0;
+        while at < block.insts.len() {
+            let data = &func.insts[block.insts[at].index()];
+            let Some(cond) = data.result.filter(|c| uses[c.index()] == 1 && matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))) else {
+                at += 1;
+                continue;
+            };
+            let reads = |inst: &crate::ir::Inst| {
+                let mut hit = false;
+                func.insts[inst.index()].op.for_operands(|v| hit |= v == cond);
+                hit
+            };
+            match block.insts[at + 1..].iter().position(reads) {
+                Some(gap) if gap > 0 && matches!(func.insts[block.insts[at + 1 + gap].index()].op, Op::Brif(c, ..) | Op::Select(c, ..) if c == cond) => {
+                    let inst = block.insts.remove(at);
+                    block.insts.insert(at + gap, inst);
+                }
+                _ => at += 1,
+            }
+        }
+    }
+}
+
+pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Target) {
+    let effort = target.effort;
     let plan = match effort {
         Effort::Quick => Plan {
             moves: promote::Moves::Words,
             effort,
-            init: QUICK_INIT,
-            seed: QUICK_SEED,
+            target,
             rules: QUICK_RULES,
-            max_rounds: 2,
+            budget: 6,
             finish: QUICK_FINISH,
         },
         Effort::Full => Plan {
             moves,
             effort,
-            init: FULL_INIT,
-            seed: FULL_SEED,
+            target,
             rules: FULL_RULES,
-            max_rounds: MAX_ROUNDS,
+            budget: 32,
             finish: FULL_FINISH,
         },
     };
-    for &pass in plan.init {
-        run_pass(func, pass, plan.moves, plan.effort);
+    for &pass in INIT {
+        run_pass(func, pass, plan.moves, plan.effort, plan.target);
     }
     run_fixpoint(func, &plan);
-    for &pass in plan.finish {
-        run_pass(func, pass, plan.moves, plan.effort);
+    if moves != promote::Moves::Guided && strip_assumes(func) {
+        run_fixpoint(func, &plan);
     }
+    for &pass in plan.finish {
+        run_pass(func, pass, plan.moves, plan.effort, plan.target);
+    }
+    if moves != promote::Moves::Guided {
+        crate::algebra::compare_offsets(func);
+    }
+    sink_compares(func);
 }

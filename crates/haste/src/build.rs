@@ -123,31 +123,64 @@ fn recompile(image: &mut Image, broken: &mut HashMap<usize, String>, (cx, reache
     broken.extend(image.compile(cx, reached, &expanded));
 }
 
-type SubstrateSlot = (Option<(u64, u64)>, Option<std::sync::Arc<crate::substrate::Substrate>>);
+struct SubstrateSlot {
+    toolchain_key: u64,
+    deps_key: Option<u64>,
+    workspace_key: Option<u64>,
+    target_key: u64,
+    toolchain: Option<std::sync::Arc<crate::substrate::Substrate>>,
+    deps: Option<std::sync::Arc<crate::substrate::Substrate>>,
+    workspace: Option<std::sync::Arc<crate::substrate::Substrate>>,
+}
 
-fn open_batch_substrate(workspace: &graph::Workspace) -> SubstrateSlot {
-    let key = crate::substrate::enabled().then(|| {
-        let target = crate::host_target();
-        (crate::substrate::toolchain_key(workspace, &target), crate::substrate::target_hash(&target))
-    });
-    let existing = key.and_then(|(toolchain_key, target_key)| match crate::substrate::Substrate::open_toolchain(toolchain_key) {
+struct PreBuilders {
+    toolchain: crate::substrate::SubstrateBuilder,
+    deps: Option<crate::substrate::SubstrateBuilder>,
+    workspace: Option<crate::substrate::SubstrateBuilder>,
+}
+
+fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
+    if !crate::substrate::enabled() {
+        return None;
+    }
+    let target = crate::host_target();
+    let toolchain_key = crate::substrate::toolchain_key(workspace, &target);
+    let target_key = crate::substrate::target_hash(&target);
+    let deps_key = crate::substrate::deps_key(workspace, &target, toolchain_key);
+    let workspace_key = crate::substrate::workspace_key(workspace, &target, toolchain_key);
+    let toolchain = match crate::substrate::Substrate::open_toolchain(toolchain_key) {
         Ok(sub) if sub.toolchain_hash() == toolchain_key && sub.target_hash() == target_key => Some(std::sync::Arc::new(sub)),
         _ => None,
+    };
+    let deps = deps_key.and_then(|dk| match crate::substrate::Substrate::open_deps(dk, target_key) {
+        Ok(sub) => Some(std::sync::Arc::new(match &toolchain {
+            Some(tc) => sub.with_parent(std::sync::Arc::clone(tc)),
+            None => sub,
+        })),
+        _ => None,
     });
-    (key, existing)
+    let base = deps.as_ref().or(toolchain.as_ref());
+    let workspace_sub = workspace_key.and_then(|wk| match crate::substrate::Substrate::open_workspace(wk, target_key) {
+        Ok(sub) => Some(std::sync::Arc::new(match base {
+            Some(parent) => sub.with_parent(std::sync::Arc::clone(parent)),
+            None => sub,
+        })),
+        _ => None,
+    });
+    Some(SubstrateSlot { toolchain_key, deps_key, workspace_key, target_key, toolchain, deps, workspace: workspace_sub })
 }
 
 fn finish_batch(
     (kind, main): (BatchKind, Option<ItemRef>),
     (cases, reached): (&[ItemRef], Reached),
     drop_finals: bool,
-    substrate: (Option<(u64, u64)>, &Option<std::sync::Arc<crate::substrate::Substrate>>),
+    substrate: Option<&SubstrateSlot>,
     (mut cx, reach_clock): (sema::Context<'_>, sema::census::Clock),
 ) -> Result<Batch> {
     let mode = kind.mode();
     let reach_span = reach_clock.elapsed();
     let codegen_clock = sema::census::Clock::now();
-    let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate.0);
+    let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate);
     let valid: Vec<ItemRef> = match kind {
         BatchKind::Cases => cases.iter().copied().filter(|&item| sema::infer::is_case_sig(&mut cx, item)).collect(),
         BatchKind::MainCheck => cases.to_vec(),
@@ -171,47 +204,77 @@ fn finish_batch(
     Ok(Batch { kind, store: Some(cx.release().0), labels, roots, reached, image, broken, reach_span, codegen_span })
 }
 
-fn export_pre_summaries(cx: &mut sema::Context<'_>, drop_finals: bool, substrate_key: Option<(u64, u64)>) -> Option<crate::substrate::SubstrateBuilder> {
+fn make_builders(slot: &SubstrateSlot) -> PreBuilders {
+    let toolchain = crate::substrate::Substrate::builder().toolchain_hash(slot.toolchain_key).target_hash(slot.target_key);
+    let deps = slot.deps_key.map(|dk| crate::substrate::Substrate::builder().toolchain_hash(dk).target_hash(slot.target_key));
+    let workspace = slot.workspace_key.map(|wk| crate::substrate::Substrate::builder().toolchain_hash(wk).target_hash(slot.target_key));
+    PreBuilders { toolchain, deps, workspace }
+}
+
+fn export_pre_summaries(cx: &mut sema::Context<'_>, drop_finals: bool, slot: Option<&SubstrateSlot>) -> Option<PreBuilders> {
     if !drop_finals || !cx.store().has_new_sysroot_summaries() {
         return None;
     }
-    let (key, target_key) = substrate_key?;
-    let mut builder = crate::substrate::Substrate::builder().toolchain_hash(key).target_hash(target_key);
-    if let Err(error) = cx.store().export_sysroot_summaries(cx.outline, &mut builder) {
+    let mut builders = make_builders(slot?);
+    if let Err(error) = cx.store().export_sysroot_summaries(cx.outline, Some(&mut builders.toolchain), builders.deps.as_mut()) {
         eprintln!("haste: cannot export sysroot summaries: {error:#}");
         return None;
     }
-    Some(builder)
+    Some(builders)
+}
+
+const MAX_TOOLCHAIN_SUBSTRATE_BYTES: usize = 8 * 1024 * 1024 - 1;
+
+fn save_substrate_layer(
+    mut builder: crate::substrate::SubstrateBuilder,
+    existing: Option<&crate::substrate::Substrate>,
+    max_bytes: Option<usize>,
+    save: impl FnOnce(&crate::substrate::Substrate) -> Result<PathBuf>,
+) -> Result<()> {
+    if builder.is_empty() {
+        return Ok(());
+    }
+    if let Some(ex) = existing {
+        builder.merge_from(ex)?;
+    }
+    let sub = builder.build_within(max_bytes)?;
+    if sub.has_entries() {
+        save(&sub)?;
+    }
+    Ok(())
 }
 
 fn save_batch_substrate(
     cx: &sema::Context<'_>,
     image: &Image,
     drop_finals: bool,
-    (substrate_key, existing_sub): (Option<(u64, u64)>, &Option<std::sync::Arc<crate::substrate::Substrate>>),
-    pre_builder: Option<crate::substrate::SubstrateBuilder>,
+    slot: Option<&SubstrateSlot>,
+    pre_builder: Option<PreBuilders>,
 ) {
-    let Some((key, target_key)) = substrate_key else { return };
-    if !image.has_new_frozen_stencils() && pre_builder.is_none() {
+    let Some(slot) = slot else { return };
+    if !image.has_new_frozen_stencils() && !image.has_new_inline_meta() && pre_builder.is_none() && (drop_finals || !cx.store().has_new_sysroot_summaries()) {
         return;
     }
-    let mut builder = pre_builder.unwrap_or_else(|| crate::substrate::Substrate::builder().toolchain_hash(key).target_hash(target_key));
+    let mut builders = pre_builder.unwrap_or_else(|| make_builders(slot));
     let save_res = (|| -> Result<()> {
-        if let Some(ex) = existing_sub {
-            builder.merge_from(ex)?;
-        }
         if !drop_finals {
-            cx.store().export_sysroot_summaries(cx.outline, &mut builder)?;
+            cx.store().export_sysroot_summaries(cx.outline, Some(&mut builders.toolchain), builders.deps.as_mut())?;
         }
-        image.export_sysroot_stencils(&mut builder)?;
-        let sub = builder.build()?;
-        if sub.summary_count() > 0 || sub.stencil_count() > 0 {
-            sub.save_toolchain()?;
+        if image.has_new_frozen_stencils() {
+            image.export_sysroot_stencils(Some(&mut builders.toolchain), builders.deps.as_mut())?;
+        }
+        image.export_inline_meta(Some(&mut builders.toolchain), builders.deps.as_mut())?;
+        save_substrate_layer(builders.toolchain, slot.toolchain.as_deref(), Some(MAX_TOOLCHAIN_SUBSTRATE_BYTES), crate::substrate::Substrate::save_toolchain)?;
+        if let Some(deps_builder) = builders.deps {
+            save_substrate_layer(deps_builder, slot.deps.as_deref(), None, crate::substrate::Substrate::save_deps)?;
+        }
+        if let Some(ws_builder) = builders.workspace {
+            save_substrate_layer(ws_builder, slot.workspace.as_deref(), None, crate::substrate::Substrate::save_workspace)?;
         }
         Ok(())
     })();
     if let Err(error) = save_res {
-        eprintln!("haste: cannot save toolchain substrate: {error:#}");
+        eprintln!("haste: cannot save substrate: {error:#}");
     }
 }
 
@@ -222,21 +285,23 @@ impl Batch {
         let reach_clock = sema::census::Clock::now();
         let main = (kind == BatchKind::MainAot).then(|| main_item(workspace, &compilation.outline).context("no member binary has a `main`")).transpose()?;
         let (cases, root_insts) = if main.is_some() { (Vec::new(), Vec::new()) } else { batch_roots(workspace, &compilation.outline, kind) };
-        let (substrate_key, existing_sub) = open_batch_substrate(workspace);
+        let substrate = open_batch_substrate(workspace);
         let mut cache = Cache::default();
         cache.set_warm_sysroot_bodies(mode != crate::image::ImageMode::Check);
-        if let Some(sub) = &existing_sub {
+        if let Some(slot) = &substrate
+            && let Some(sub) = slot.workspace.as_ref().or(slot.deps.as_ref()).or(slot.toolchain.as_ref())
+        {
             cache.set_substrate(Some(std::sync::Arc::clone(sub)));
         }
         crate::macros::reach_resolved_with_cache(
             compilation,
             cache,
-            |cx| match kind {
-                BatchKind::MainAot => sema::reach::main_roots(cx, main.expect("main checked")).map_or_else(|_| vec![(main.expect("main checked"), sema::substs::Substs::EMPTY)], Into::into),
-                BatchKind::Cases => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_case_sig(cx, item)).collect(),
-                BatchKind::MainCheck => root_insts.clone(),
+            |cx| match (kind, main) {
+                (BatchKind::MainAot, Some(main_ref)) => sema::reach::main_roots(cx, main_ref).map_or_else(|_| vec![(main_ref, sema::substs::Substs::EMPTY)], Into::into),
+                (BatchKind::Cases, _) => root_insts.iter().copied().filter(|&(item, _)| sema::infer::is_case_sig(cx, item)).collect(),
+                _ => root_insts.clone(),
             },
-            |cx, reached| finish_batch((kind, main), (&cases, reached), drop_finals, (substrate_key, &existing_sub), (cx, reach_clock)),
+            |cx, reached| finish_batch((kind, main), (&cases, reached), drop_finals, substrate.as_ref(), (cx, reach_clock)),
         )
     }
 
@@ -381,6 +446,16 @@ impl Build {
         Ok(())
     }
 
+    /// Number of reached functions in the compiled binary batch.
+    pub(crate) fn reached_count(&self) -> usize {
+        self.binary.as_ref().map_or(0, |bin| bin.reached.list.len())
+    }
+
+    /// Local source and included file paths watched by this build.
+    pub(crate) fn watch_paths(&self) -> Vec<PathBuf> {
+        self.stamps.iter().map(|watch| watch.path.clone()).collect()
+    }
+
     /// Brings the build up to date with the local files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and loads from nothing when that fails.
     pub fn refresh(&mut self, workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
         let (mut stale, mut crates) = (Vec::new(), Vec::new());
@@ -472,7 +547,7 @@ impl Build {
         if self.binary.is_none() {
             self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainAot, false)?);
         }
-        let bin = self.binary.as_ref().context("the binary is not compiled")?;
+        let bin = self.binary.as_mut().context("the binary is not compiled")?;
         if !bin.broken.is_empty() {
             for (idx, err) in &bin.broken {
                 eprintln!("broken [{idx}]: {err}");
@@ -480,7 +555,12 @@ impl Build {
             bail!("{} functions failed to compile", bin.broken.len());
         }
         let target = crate::host_target();
-        bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]))?.write(path)?;
+        let store = bin.store.take().context("the binary's inference store is in use")?;
+        let mut cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
+        let reached = &bin.reached;
+        let exe = bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]), &mut |index| reached.list.get(index).map_or_else(|| format!("fn{index}"), |((item, _), _)| cx.qualified(*item)));
+        bin.store = Some(cx.release().0);
+        exe?.write(path)?;
         eprintln!("built {} ({} functions reached, {:.1} ms)", path.display(), bin.reached.list.len(), started.elapsed().as_secs_f64() * 1e3);
         Ok(0)
     }

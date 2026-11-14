@@ -85,7 +85,7 @@ fn inline_callees(cx: &mut Context<'_>, reached: &Reached, index: usize) -> usiz
 
 fn row(cx: &mut Context<'_>, reached: &Reached, one: &Compiled, text: &mut String) -> Result<()> {
     let ((item, substs), _) = reached.list[one.index];
-    let module = cx.module_of(item).map_or_else(|_| cx.outline.roots[item.krate as usize].name.clone(), |at| cx.outline.module_path(at));
+    let module = cx.module_text(item);
     let args = cx.types.substs(substs).len();
     let definition = place(cx, item).unwrap_or_else(|| NONE.to_owned());
     write!(text, "{}\t{module}\t{}\t{definition}\t{args}\t{}\t{}\t", one.index, cx.name(item), one.inline, one.code.len())?;

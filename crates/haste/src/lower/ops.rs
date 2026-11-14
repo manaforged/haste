@@ -10,11 +10,10 @@ use crate::sema::infer::{Adjust, Res};
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty, int_info};
 
-use super::stencil::SymbolSource;
 use super::{Lower, Parts, Repr};
 
 /// What arithmetic means for one operand type.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Num {
     Int { ty: Type, signed: bool },
     Float(Type),
@@ -59,8 +58,7 @@ impl Lower<'_, '_> {
             bytes.push(0);
         }
         let wide = lit != Lit::ByteStr;
-        let id = self.slots.rodata(&bytes, &[]);
-        let data = self.emit_symbol(SymbolSource::Rodata(id));
+        let data = self.emit_const_rodata(&bytes);
         Ok(if wide { self.wide_pointer(data, bytes.len() as i64) } else { data })
     }
 
@@ -654,7 +652,7 @@ fn float_cc(cmp: Cmp) -> FloatCC {
     }
 }
 
-fn parse_float(ty: Type, text: &str) -> Result<i64> {
+pub(super) fn parse_float(ty: Type, text: &str) -> Result<i64> {
     let digits: String = text.chars().filter(|ch| *ch != '_').collect();
     let digits = ["f16", "f32", "f64", "f128"].iter().find_map(|suffix| digits.strip_suffix(suffix)).unwrap_or(&digits);
     match ty {

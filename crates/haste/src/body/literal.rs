@@ -11,14 +11,14 @@ pub fn char_value(text: &str) -> Result<char> {
         Ok(ch) => return Ok(ch),
         Err(out) => out,
     };
-    let decoded = String::from_utf8(out).map_err(|_| anyhow!("bad char {text}"))?;
+    let decoded = String::from_utf8(out).map_err(|error| anyhow!("bad char {text}: {error}"))?;
     decoded.chars().next().ok_or_else(|| anyhow!("bad char {text}"))
 }
 
 /// The value of a byte literal, quotes included.
 pub fn byte_value(text: &str) -> Result<u8> {
     match unit(text)? {
-        Ok(ch) => u8::try_from(ch).map_err(|_| anyhow!("bad byte {text}")),
+        Ok(ch) => u8::try_from(ch).map_err(|error| anyhow!("bad byte {text}: {error}")),
         Err(out) => out.first().copied().ok_or_else(|| anyhow!("bad byte {text}")),
     }
 }

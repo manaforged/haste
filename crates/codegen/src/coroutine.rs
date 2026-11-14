@@ -118,10 +118,11 @@ pub(crate) fn split(func: &mut Function) {
     let old_entry = func.entry.expect("a coroutine has an entry");
     if spec.resumes.is_empty() {
         ready_entry(func, &spec, old_entry);
+        func.bump_cfg();
         return;
     }
     let defs = func.def_blocks();
-    let cfg = Cfg::new(func);
+    let cfg = func.cfg();
     let spills = live_across_suspend(func, &cfg, &spec.resumes, &defs);
     let mut is_spill = vec![false; func.types.len()];
     for &value in &spills {
@@ -153,7 +154,8 @@ pub(crate) fn split(func: &mut Function) {
     let anchor = StackSlot(0);
     let orig_blocks = func.blocks.len();
     let (init, init_fp, dispatch, disp_fp) = entry(func, &spec, (old_entry, anchor), frame.size);
-    let split_cfg = Cfg::new(func);
+    func.bump_cfg();
+    let split_cfg = func.cfg();
     let mut active_fp: Vec<Option<Value>> = vec![None; func.blocks.len()];
     active_fp[init.index()] = Some(init_fp);
     active_fp[dispatch.index()] = Some(disp_fp);
@@ -178,6 +180,7 @@ pub(crate) fn split(func: &mut Function) {
             rewrite(func, block, (&frame, anchor), (&split_cfg, &defs), (None, done));
         }
     }
+    func.bump_cfg();
 }
 
 fn check_unresumed(b: &mut FunctionBuilder<'_>, spec: &Coroutine) -> (Vec<Value>, Value, Value) {
@@ -219,40 +222,78 @@ fn collect_value_uses(func: &Function) -> Vec<Vec<(Block, Inst)>> {
     uses
 }
 
+fn push_target_params(
+    func: &Function,
+    val: Value,
+    (target, args): (Block, &[Value]),
+    stamp: u32,
+    queued: &mut [u32],
+    work: &mut Vec<Value>,
+) {
+    for (pos, &arg) in args.iter().enumerate() {
+        if arg == val
+            && let Some(&param) = func.blocks[target.index()].params.get(pos)
+            && std::mem::replace(&mut queued[param.index()], stamp) != stamp
+        {
+            work.push(param);
+        }
+    }
+}
+
+fn propagate_alias_uses(func: &Function, slot_alias: &[Vec<usize>], extra_uses: &mut [Vec<(Block, Inst)>]) {
+    for (dst, srcs) in slot_alias.iter().enumerate() {
+        if srcs.is_empty() {
+            continue;
+        }
+        for (b_idx, block) in func.blocks.iter().enumerate() {
+            let block_id = Block(b_idx as u32);
+            for &inst in &block.insts {
+                match func.insts[inst.index()].op {
+                    Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _) if s.index() == dst => {
+                        for &src in srcs {
+                            extra_uses[src].push((block_id, inst));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let dst_extra = extra_uses[dst].clone();
+        for &src in srcs {
+            extra_uses[src].extend(dst_extra.iter().copied());
+        }
+    }
+}
+
 fn trace_stack_addrs(func: &Function, value_uses: &[Vec<(Block, Inst)>], is_spill: &[bool]) -> (Vec<bool>, Vec<bool>, Vec<Vec<(Block, Inst)>>) {
     let slots = func.slots.len();
+    let escaped = crate::mem::Provenance::compute_with_spills(func, Some(is_spill)).escaped_slots();
     let mut taken = vec![false; slots];
-    let mut escaped = vec![false; slots];
     let mut extra_uses = vec![Vec::new(); slots];
     let mut addr_roots: Vec<Vec<usize>> = vec![Vec::new(); slots];
-    for block in &func.blocks {
-        for &inst in &block.insts {
-            let data = &func.insts[inst.index()];
-            if let Op::StackAddr(slot, _) = data.op {
-                taken[slot.index()] = true;
-                if let Some(res) = data.result {
-                    addr_roots[slot.index()].push(res.index());
-                }
+    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[inst.index()];
+        if let Op::StackAddr(slot, _) = data.op {
+            taken[slot.index()] = true;
+            if let Some(res) = data.result {
+                addr_roots[slot.index()].push(res.index());
             }
         }
     }
     let mut slot_alias: Vec<Vec<usize>> = vec![Vec::new(); slots];
     let mut queued = vec![0_u32; func.types.len()];
     let mut work = Vec::new();
-    for slot in 0..slots {
-        if addr_roots[slot].is_empty() {
+    for (slot, roots) in addr_roots.iter().enumerate() {
+        if roots.is_empty() {
             continue;
         }
         let stamp = (slot + 1) as u32;
         work.clear();
-        for &root in &addr_roots[slot] {
+        for &root in roots {
             queued[root] = stamp;
             work.push(Value(root as u32));
         }
         while let Some(val) = work.pop() {
-            if is_spill[val.index()] {
-                escaped[slot] = true;
-            }
             for &(block, inst) in &value_uses[val.index()] {
                 extra_uses[slot].push((block, inst));
                 let data = &func.insts[inst.index()];
@@ -264,85 +305,20 @@ fn trace_stack_addrs(func: &Function, value_uses: &[Vec<(Block, Inst)>], is_spil
                             work.push(res);
                         }
                     }
-                    Op::Store(stored, ..) | Op::AtomicStore(stored, _) if *stored == val => {
-                        escaped[slot] = true;
+                    Op::StackStore(stored, dst, _) if *stored == val && !slot_alias[dst.index()].contains(&slot) => {
+                        slot_alias[dst.index()].push(slot);
                     }
-                    Op::StackStore(stored, dst, _) if *stored == val => {
-                        if !slot_alias[dst.index()].contains(&slot) {
-                            slot_alias[dst.index()].push(slot);
-                        }
-                    }
-                    Op::Jump(target, args) => {
-                        for (pos, &arg) in args.iter().enumerate() {
-                            if arg == val
-                                && let Some(&param) = func.blocks[target.index()].params.get(pos)
-                                && std::mem::replace(&mut queued[param.index()], stamp) != stamp
-                            {
-                                work.push(param);
-                            }
-                        }
-                    }
+                    Op::Jump(target, args) => push_target_params(func, val, (*target, args), stamp, &mut queued, &mut work),
                     Op::Brif(_, t, t_args, f, f_args) => {
-                        for (target, args) in [(*t, t_args), (*f, f_args)] {
-                            for (pos, &arg) in args.iter().enumerate() {
-                                if arg == val
-                                    && let Some(&param) = func.blocks[target.index()].params.get(pos)
-                                    && std::mem::replace(&mut queued[param.index()], stamp) != stamp
-                                {
-                                    work.push(param);
-                                }
-                            }
-                        }
-                    }
-                    Op::Call { args, results, .. } if args.contains(&val) => {
-                        if results.iter().any(|res| is_spill[res.index()]) {
-                            escaped[slot] = true;
-                        }
-                    }
-                    Op::Return(vals) if vals.contains(&val) => {
-                        escaped[slot] = true;
+                        push_target_params(func, val, (*t, t_args), stamp, &mut queued, &mut work);
+                        push_target_params(func, val, (*f, f_args), stamp, &mut queued, &mut work);
                     }
                     _ => {}
                 }
             }
         }
     }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for dst in 0..slots {
-            for idx in 0..slot_alias[dst].len() {
-                let src = slot_alias[dst][idx];
-                if escaped[dst] && !escaped[src] {
-                    escaped[src] = true;
-                    changed = true;
-                }
-            }
-        }
-    }
-    for dst in 0..slots {
-        if slot_alias[dst].is_empty() {
-            continue;
-        }
-        let srcs = slot_alias[dst].clone();
-        for (b_idx, block) in func.blocks.iter().enumerate() {
-            let block_id = Block(b_idx as u32);
-            for &inst in &block.insts {
-                match func.insts[inst.index()].op {
-                    Op::StackAddr(s, _) | Op::StackLoad(s, _) | Op::StackStore(_, s, _) if s.index() == dst => {
-                        for &src in &srcs {
-                            extra_uses[src].push((block_id, inst));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let dst_extra = extra_uses[dst].clone();
-        for &src in &srcs {
-            extra_uses[src].extend(dst_extra.iter().copied());
-        }
-    }
+    propagate_alias_uses(func, &slot_alias, &mut extra_uses);
     (taken, escaped, extra_uses)
 }
 

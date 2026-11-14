@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::body::{Body, Bound, ExprId, List, PathId};
 use crate::names::{ItemRef, ModRef, Primitive, plain};
@@ -38,6 +38,7 @@ pub(in crate::sema) struct PolyState {
     pub projections: Vec<ProjId>,
     pub proj_set: HashSet<ProjId>,
     pub offset_holes: Vec<ConstHole>,
+    pub method_traits: HashMap<ExprId, ItemRef>,
 }
 
 pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
@@ -66,13 +67,18 @@ pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, p
     }
     infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
     if infer.run(false).is_err() {
-        return SummaryKind::MonomorphicFallback;
+        return fallback_kind(infer.poly.take().map(|poly| poly.method_traits).unwrap_or_default());
     }
-    let Ok((mut typed, poly, clean)) = infer.finish_poly() else { return SummaryKind::MonomorphicFallback };
+    let pre_hints = infer.poly.as_ref().map(|poly| poly.method_traits.clone()).unwrap_or_default();
+    let Ok((mut typed, poly, clean)) = infer.finish_poly() else { return fallback_kind(pre_hints) };
     if cx.quiet_mark() != before || (!typed.coercions.is_empty() && super::object::fill_drops(cx, &mut typed).is_err()) {
-        return SummaryKind::MonomorphicFallback;
+        return fallback_kind(poly.map(|poly| poly.method_traits).unwrap_or(pre_hints));
     }
     finalize_summary(cx, typed, poly, clean, param_count)
+}
+
+fn fallback_kind(hints: HashMap<ExprId, ItemRef>) -> SummaryKind {
+    if hints.is_empty() { SummaryKind::MonomorphicFallback } else { SummaryKind::MonomorphicHints(Arc::new(hints)) }
 }
 
 pub(super) fn zonk_poly_state(infer: &mut Infer<'_, '_>, poly: &mut PolyState) {
@@ -84,14 +90,14 @@ pub(super) fn zonk_poly_state(infer: &mut Infer<'_, '_>, poly: &mut PolyState) {
 fn finalize_summary(cx: &Context<'_>, typed: Typed, poly: Option<Box<PolyState>>, clean: bool, param_count: u16) -> SummaryKind {
     let Some(mut poly) = poly else { return SummaryKind::MonomorphicFallback };
     if poly.phase == PolyPhase::Fallback || !clean || has_param_closure(cx, &typed) {
-        return SummaryKind::MonomorphicFallback;
+        return fallback_kind(poly.method_traits);
     }
     collect_remaining_projs(&cx.types, &mut poly, &typed);
     let mut const_holes = poly.offset_holes;
     let mut layout_tys = Vec::new();
     let mut layout_seen = HashSet::default();
     collect_layouts_and_consts(cx, &typed, &mut layout_tys, &mut layout_seen, &mut const_holes);
-    let super::LazyTables::Eager(template) = typed.tables else { return SummaryKind::MonomorphicFallback };
+    let super::LazyTables::Eager(template) = typed.tables else { return fallback_kind(poly.method_traits) };
     SummaryKind::Poly(Arc::new(PolySummary {
         param_count,
         template,
@@ -113,11 +119,7 @@ fn finalize_summary(cx: &Context<'_>, typed: Typed, poly: Option<Box<PolyState>>
 }
 
 fn has_param_closure(cx: &Context<'_>, typed: &Typed) -> bool {
-    typed
-        .closures
-        .as_slice()
-        .iter()
-        .any(|(_, c)| c.captures.iter().any(|cap| cx.types.has_params(typed.locals[cap.local as usize].ty)))
+    typed.closures.as_slice().iter().any(|(_, c)| c.captures.iter().any(|cap| cx.types.has_params(typed.locals[cap.local as usize].ty)))
 }
 
 fn zonk_obligations(infer: &mut Infer<'_, '_>, raw: &mut Vec<PolyObligation>) -> Vec<PolyObligation> {
@@ -343,7 +345,7 @@ impl Infer<'_, '_> {
         let full: Vec<Ty> = std::iter::once(ty).chain(args.iter().copied()).collect();
         self.push_assumption((of, full));
         if self.is_callable_trait(of)
-            && let Some(sig) = self.fn_bound(arena, home, bound)?
+            && let Some((_, sig)) = self.callable_bound(arena, home, bound)?
         {
             self.push_fn_bound(ty, of, sig);
         }
@@ -394,7 +396,7 @@ impl Infer<'_, '_> {
             }
             let member_name = self.cx.name(member).to_string();
             let Some(value) = self.picked_alias(of, substs[0], &substs[1..], (&member_name, &[]))? else { continue };
-            let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), None))?;
+            let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), Some(of)))?;
             let (home, src) = (frame.home, frame.src);
             self.with_frame(frame, |infer| {
                 infer.in_source(src, |infer| {
@@ -431,7 +433,7 @@ impl Infer<'_, '_> {
 
     fn push_fn_bound(&mut self, ty: Ty, of: ItemRef, sig: Ty) {
         if let Kind::FnPtr(inputs, output) = *self.cx.types.kind(sig)
-            && let Some(once) = self.cx.lang_item("fn_once")
+            && let Some(once) = self.callable_output_trait(of)
         {
             let tuple = self.cx.types.intern(Kind::Tuple(inputs));
             let trait_args = self.cx.types.intern_substs(&[tuple]);
@@ -506,7 +508,7 @@ impl Infer<'_, '_> {
     pub(super) fn poly_fn_sig(&self, ty: Ty) -> Option<(Vec<Ty>, Ty)> {
         let ty = self.resolve(ty);
         let poly = self.poly.as_ref()?;
-        let &(_, _, sig) = poly.fn_bounds.iter().find(|&&(bound_ty, _, _)| self.resolve(bound_ty) == ty)?;
+        let &(_, _, sig) = poly.fn_bounds.iter().find(|&&(bound_ty, of, _)| self.resolve(bound_ty) == ty && self.is_sync_callable_trait(of))?;
         let Kind::FnPtr(params, ret) = *self.cx.types.kind(sig) else { return None };
         Some((self.cx.types.substs(params).to_vec(), ret))
     }
@@ -569,20 +571,6 @@ impl Infer<'_, '_> {
             return Ok(false);
         }
         self.assoc_bounds_hold((arena, home, path), (of, ty, args), depth)
-    }
-
-    pub(super) fn poly_callable_bound_holds(&mut self, (arena, home, bound): (&Body, ModRef, u32), (of, path, ty): (ItemRef, PathId, Ty), depth: u32) -> Result<bool> {
-        let ty = self.resolve(ty);
-        let found = self
-            .poly
-            .as_ref()
-            .and_then(|p| p.fn_bounds.iter().find(|&&(t, o, _)| self.resolve(t) == ty && o == of).map(|&(_, _, s)| s));
-        if let Some(sig) = found {
-            let Some(wanted) = self.fn_bound(arena, home, bound)? else { return Ok(true) };
-            return Ok(self.unifies(sig, wanted));
-        }
-        let args = self.bound_args(of, arena, path, ty)?;
-        self.poly_env_holds((arena, home, path), (of, ty, &args), depth)
     }
 
     pub(super) fn poly_picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
@@ -757,19 +745,6 @@ impl Infer<'_, '_> {
             poly.obligations.push(PolyObligation::Call { expr, found, tuple });
         }
         Ok(ret)
-    }
-
-    fn poly_callable_target(&mut self, callee_ty: Ty) -> Option<(ItemRef, Vec<Ty>, Ty)> {
-        let callee_ty = self.resolve(callee_ty);
-        let bounds = self.poly.as_ref()?.fn_bounds.clone();
-        for (lang, name) in [("fn", "call"), ("fn_mut", "call_mut"), ("fn_once", "call_once")] {
-            let Some(of) = self.cx.lang_item(lang) else { continue };
-            let Some(&(_, _, sig)) = bounds.iter().find(|&&(t, o, _)| o == of && self.resolve(t) == callee_ty) else { continue };
-            let Kind::FnPtr(params, ret) = *self.cx.types.kind(sig) else { continue };
-            let method = self.cx.trait_member(of, name)?;
-            return Some((method, self.cx.types.substs(params).to_vec(), ret));
-        }
-        None
     }
 
     pub(super) fn poly_offset_of(&mut self, expr: ExprId, mut current: Ty, fields: List) -> Result<Ty> {

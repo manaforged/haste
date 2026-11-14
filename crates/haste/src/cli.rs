@@ -138,7 +138,14 @@ fn report_typeck(workspace: &graph::Workspace, targets: &Targets) -> Result<()> 
     Ok(())
 }
 
-fn report_cases(workspace: &graph::Workspace, targets: &Targets, (request, args): (Request, &[String]), stats: Option<(&std::path::Path, sema::census::Span)>, out: Option<&std::path::Path>) -> Result<i32> {
+fn report_cases(
+    root: &std::path::Path,
+    workspace: &graph::Workspace,
+    targets: &Targets,
+    (request, args): (Request, &[String]),
+    stats: Option<(&std::path::Path, sema::census::Span)>,
+    out: Option<&std::path::Path>,
+) -> Result<i32> {
     if request == Request::Run {
         return crate::build::run(workspace, targets, args);
     }
@@ -151,6 +158,18 @@ fn report_cases(workspace: &graph::Workspace, targets: &Targets, (request, args)
     };
     if let Some((path, graph_span)) = stats {
         build.write_stats(workspace, graph_span, path)?;
+    }
+    eprint!("{}", haste_codegen::missed_report());
+    eprint!("{}", crate::lower::Bodies::inline_report());
+    eprint!("{}", crate::substrate::tally::report());
+    if request == Request::Build && crate::substrate::noop::active(stats.map(|(p, _)| p)) {
+        match &result {
+            Ok(0) => {
+                let watch_paths = build.watch_paths();
+                crate::substrate::noop::record(root, workspace, &watch_paths, out, build.reached_count());
+            }
+            _ => crate::substrate::noop::invalidate(root, out),
+        }
     }
     std::mem::forget(build);
     result
@@ -460,8 +479,19 @@ pub(crate) fn load_workspace(root: &std::path::Path, targets: &Targets) -> Resul
 }
 
 fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json: Option<&std::path::Path>, out: Option<&std::path::Path>) -> Result<i32> {
-    let targets = Targets { target: cfg::Target::host(), host: cfg::Target::host() };
     let started = Instant::now();
+    if matches!(command, Command::Request(Request::Build))
+        && crate::substrate::noop::active(stats_json)
+        && let Some(reached) = crate::substrate::noop::try_hit(root, out)
+    {
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        match out {
+            Some(path) => eprintln!("built {} ({reached} functions reached, {ms:.1} ms)", path.display()),
+            None => eprintln!("{reached} functions reached, 0 failed, built in {ms:.1} ms"),
+        }
+        return Ok(0);
+    }
+    let targets = Targets { target: cfg::Target::host(), host: cfg::Target::host() };
     let graph_clock = sema::census::Clock::now();
     let mut workspace = match command {
         Command::Debug(Query::Graph) => graph::load(root, &targets)?,
@@ -470,7 +500,7 @@ fn report(command: Command, root: &std::path::Path, argv: &[String], stats_json:
     let graph_span = graph_clock.elapsed();
     let loaded = started.elapsed();
     let status = match command {
-        Command::Request(request) => report_cases(&workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)), out)?,
+        Command::Request(request) => report_cases(root, &workspace, &targets, (request, argv), stats_json.map(|path| (path, graph_span)), out)?,
         Command::Serve => crate::serve::serve(&mut workspace, &targets, root).map(|()| 0)?,
         Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,

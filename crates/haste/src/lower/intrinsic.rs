@@ -33,16 +33,36 @@ impl Lower<'_, '_> {
                 self.close();
                 Ok(None)
             }
+            Intrinsic::Unreachable => {
+                self.unreachable();
+                Ok(None)
+            }
+            Intrinsic::Assume => {
+                let &[cond] = args else { bail!("assume takes one bool") };
+                self.ins().assume(cond);
+                Ok(None)
+            }
             Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
             Intrinsic::CallerLocation => self.caller_location().map(Some),
             Intrinsic::Cpuid => self.cpuid(args).map(Some),
             Intrinsic::FnAddr => Ok(args.first().copied()),
             Intrinsic::ShuffleDyn { tbl } => self.shuffle_dyn(args, tbl).map(Some),
             Intrinsic::BytePermute32 => self.byte_permute_32(args).map(Some),
+            Intrinsic::AvgRound(ty) => self.avg_round_vec(ty, args).map(Some),
+            Intrinsic::Umaxp => self.umaxp_vec(args).map(Some),
+            Intrinsic::Sqdmulh(ty) => self.sqdmulh_vec(ty, args).map(Some),
             Intrinsic::TargetOp { id, ty } => self.target_vector(id, ty, args).map(Some),
             Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
             _ => self.memory_intrinsic(origin, which, substs, args),
         }
+    }
+
+    /// Ends the block at a point that control never reaches: an assumption that is false there, then a trap.
+    pub(super) fn unreachable(&mut self) {
+        let never = self.ins().iconst(Type::I8, 0);
+        self.ins().assume(never);
+        self.ins().trap();
+        self.close();
     }
 
     /// Calls the host function `host` in the platform convention with `args`, and returns its result of machine type `ret`.
@@ -207,6 +227,7 @@ impl Lower<'_, '_> {
             (Copysign, &[x, y]) => Ok(self.ins().fcopysign(x, y)),
             (Fmin, &[x, y]) => Ok(self.ins().fmin(x, y)),
             (Fmax, &[x, y]) => Ok(self.ins().fmax(x, y)),
+            (Fma, &[a, b, c]) => Ok(self.ins().fma(a, b, c)),
             (Round(bits), &[x]) => self.round(if bits == 32 { Type::F32 } else { Type::F64 }, x),
             _ => {
                 let Some(&ty) = substs.first() else { bail!("intrinsic {which:?} has no type argument") };

@@ -2,8 +2,12 @@ use rustc_hash::FxHashMap as HashMap;
 
 #[path = "promote_subword.rs"]
 mod subword;
+#[path = "promote/join_slots.rs"]
+mod join_slots;
+#[path = "promote/vec_slot.rs"]
+mod vec_slot;
 
-use crate::ir::{Binary, Block, Convert, Function, Inst, InstData, Op, StackSlot, Type, Value};
+use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, InstData, Op, StackSlot, Type, Value};
 use crate::split::{End, Layouts};
 
 #[derive(Clone, Copy)]
@@ -16,7 +20,8 @@ enum VarMode {
 
 fn same_bitcast_family(a: Type, b: Type) -> bool {
     a.bytes() == b.bytes()
-        && (matches!((a, b), (Type::F64 | Type::I64, Type::F64 | Type::I64) | (Type::F32 | Type::I32, Type::F32 | Type::I32))
+        && ((a.bytes() == 8 && (a.is_vector() || matches!(a, Type::F64 | Type::I64)) && (b.is_vector() || matches!(b, Type::F64 | Type::I64)))
+            || matches!((a, b), (Type::F32 | Type::I32, Type::F32 | Type::I32))
             || (a.is_vector() && b.is_vector()))
 }
 
@@ -114,7 +119,6 @@ struct Access {
 }
 
 struct Touch {
-    addr: Option<Value>,
     slot: StackSlot,
     offset: Option<i64>,
     kind: Kind,
@@ -122,9 +126,11 @@ struct Touch {
 
 #[derive(Default)]
 struct Scan {
+    consts: Vec<Option<i64>>,
     addrs: Vec<Option<(StackSlot, i64)>>,
     addr_insts: Vec<(Inst, StackSlot)>,
     escaped: Vec<bool>,
+    open_slots: Vec<bool>,
     vars: Vec<Var>,
     ids: HashMap<(StackSlot, i64), usize>,
     slot_vars: Vec<Vec<usize>>,
@@ -134,54 +140,43 @@ struct Scan {
 impl Scan {
     fn new(func: &Function) -> Self {
         let slots = func.slots.len();
-        let mut scan = Scan { addrs: vec![None; func.types.len()], escaped: vec![false; slots], slot_vars: vec![Vec::new(); slots], ..Scan::default() };
+        let prov = crate::mem::Provenance::compute(func);
+        let consts = subword::eval_consts(func);
+        let escaped = prov.escaped_slots();
+        let mut scan = Scan {
+            consts,
+            addrs: vec![None; func.types.len()],
+            escaped,
+            open_slots: Vec::new(),
+            slot_vars: vec![Vec::new(); slots],
+            ..Scan::default()
+        };
         scan.addresses(func);
+        scan.open_slots = subword::copy_open_slots(func, &scan.addrs, &scan.consts, &prov.param_roots);
         for (index, block) in func.blocks.iter().enumerate() {
             for inst in &block.insts {
-                scan.classify(func, Block(index as u32), *inst);
+                let data = &func.insts[inst.index()];
+                if let Some(touch) = scan.touch(data) {
+                    scan.access(func, (Block(index as u32), *inst), (touch.slot, touch.offset), touch.kind);
+                } else if let Op::Load(addr, _) | Op::Store(_, addr, _) = data.op
+                    && let Some(&crate::mem::MemRoot::Slot(s)) = prov.param_roots.get(addr.index())
+                {
+                    scan.escaped[s.index()] = true;
+                    scan.open_slots[s.index()] = false;
+                }
             }
         }
         scan
     }
 
     fn addresses(&mut self, func: &Function) {
-        (self.addrs, self.addr_insts) = func.slot_offsets(|_| None);
-    }
-
-    fn classify(&mut self, func: &Function, block: Block, inst: Inst) {
-        let data = &func.insts[inst.index()];
-        if matches!(data.op, Op::Move(..)) {
-            return;
-        }
-        let mut skip = [None, None];
-        if let Some(touch) = self.touch(data) {
-            skip[0] = touch.addr;
-            self.access(func, (block, inst), (touch.slot, touch.offset), touch.kind);
-        }
-        if let Op::Binary(Binary::Iadd, x, y) = &data.op
-            && data.result.is_some_and(|result| self.addrs[result.index()].is_some())
-        {
-            skip[1] = if self.addrs[x.index()].is_some() {
-                Some(*x)
-            } else if self.addrs[y.index()].is_some() {
-                Some(*y)
-            } else {
-                None
-            };
-        }
-        data.op.for_operands(|value| {
-            if let Some(at) = skip.iter().position(|skipped| *skipped == Some(value)) {
-                skip[at] = None;
-            } else if let Some((slot, _)) = self.addrs[value.index()] {
-                self.escaped[slot.index()] = true;
-            }
-        });
+        (self.addrs, self.addr_insts) = join_slots::resolve_addrs(func, &self.consts);
     }
 
     fn touch(&self, data: &InstData) -> Option<Touch> {
         match &data.op {
-            Op::StackLoad(slot, offset) => Some(Touch { addr: None, slot: *slot, offset: Some(i64::from(*offset)), kind: Kind::Load(data.result?) }),
-            Op::StackStore(value, slot, offset) => Some(Touch { addr: None, slot: *slot, offset: Some(i64::from(*offset)), kind: Kind::Store(*value) }),
+            Op::StackLoad(slot, offset) => Some(Touch { slot: *slot, offset: Some(i64::from(*offset)), kind: Kind::Load(data.result?) }),
+            Op::StackStore(value, slot, offset) => Some(Touch { slot: *slot, offset: Some(i64::from(*offset)), kind: Kind::Store(*value) }),
             Op::Load(addr, offset) => self.through(*addr, *offset, Kind::Load(data.result?)),
             Op::Store(value, addr, offset) => self.through(*addr, *offset, Kind::Store(*value)),
             _ => None,
@@ -190,7 +185,7 @@ impl Scan {
 
     fn through(&self, addr: Value, offset: i32, kind: Kind) -> Option<Touch> {
         let (slot, base) = self.addrs[addr.index()]?;
-        Some(Touch { addr: Some(addr), slot, offset: base.checked_add(i64::from(offset)), kind })
+        Some(Touch { slot, offset: base.checked_add(i64::from(offset)), kind })
     }
 
     fn access(&mut self, func: &Function, at: (Block, Inst), place: (StackSlot, Option<i64>), kind: Kind) {
@@ -199,6 +194,7 @@ impl Scan {
         let size = i64::from(func.slots[slot.index()].size);
         let Some(offset) = offset.filter(|offset| *offset >= 0 && offset + i64::from(ty.bytes()) <= size) else {
             self.escaped[slot.index()] = true;
+            self.open_slots[slot.index()] = false;
             return;
         };
         let var = match self.ids.get(&(slot, offset)) {
@@ -220,43 +216,43 @@ impl Scan {
         self.addrs[addr.index()].map(|(slot, offset)| (slot.index(), offset))
     }
 
-    /// The layouts the accesses give each slot, spread through the moves of `func`.
+    /// The layouts the accesses give each slot, spread through the moves and constant copies of `func`.
     fn layouts(&self, func: &Function) -> Layouts {
         let accesses = self.accesses.iter().map(|access| (self.vars[access.var].slot.index(), self.vars[access.var].offset, access.ty));
         let mut layouts = Layouts::new(func.slots.len(), accesses);
         let moves: Vec<(End, End, u32)> = func.blocks.iter().flat_map(|block| &block.insts).filter_map(|inst| match func.insts[inst.index()].op {
             Op::Move(to, from, bytes) => Some((self.end(to), self.end(from), bytes)),
+            Op::Copy(to, from, len) => self.copy_bytes(to, from, len).map(|bytes| (self.end(to), self.end(from), bytes)),
             _ => None,
         }).collect();
         layouts.spread(&moves);
         layouts
     }
 
-    /// Marks as escaped every slot a move that stayed whole reads or writes, since promotion would drop the stores it reads and miss the bytes it writes.
-    fn pin_moves(&mut self, func: &Function) {
-        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
-            if let Op::Move(to, from, _) = func.insts[inst.index()].op {
-                for addr in [to, from] {
-                    if let Some((slot, _)) = self.addrs[addr.index()] {
-                        self.escaped[slot.index()] = true;
-                    }
-                }
-            }
-        }
+    fn copy_bytes(&self, to: Value, from: Value, len: Value) -> Option<u32> {
+        let limit = if self.addrs[to.index()].is_some() && self.addrs[from.index()].is_some() {
+            subword::PROMOTE_BOTH_BYTES
+        } else {
+            subword::MAX_COPY_BYTES
+        };
+        subword::copy_bytes_limit(&self.consts, len, limit)
     }
 
     /// Whether `addr` is the address of a slot that nothing but moves lets escape.
     fn open(&self, addr: Value) -> bool {
-        self.addrs[addr.index()].is_some_and(|(slot, _)| !self.escaped[slot.index()])
+        self.addrs[addr.index()].is_some_and(|(slot, _)| self.open_slots[slot.index()])
     }
 
-    fn promotable(&self, slot: usize) -> bool {
-        if self.escaped[slot] || self.slot_vars[slot].iter().any(|var| !self.vars[*var].sound()) {
+    fn var_promotable(&self, slot: usize, var: usize) -> bool {
+        if self.escaped[slot] || !self.vars[var].sound() {
             return false;
         }
-        let mut spans: Vec<(i64, i64)> = self.slot_vars[slot].iter().map(|var| (self.vars[*var].offset, self.vars[*var].end)).collect();
-        spans.sort_unstable();
-        !spans.windows(2).any(|pair| pair[1].0 < pair[0].1)
+        let v = &self.vars[var];
+        self.slot_vars[slot].iter().all(|&other| other == var || self.vars[other].end <= v.offset || v.end <= self.vars[other].offset)
+    }
+
+    fn any_promotable(&self) -> bool {
+        (0..self.slot_vars.len()).any(|slot| !self.escaped[slot] && self.slot_vars[slot].iter().any(|&var| self.var_promotable(slot, var)))
     }
 }
 
@@ -387,7 +383,7 @@ enum Step {
 }
 
 struct Pass {
-    cfg: crate::cfg::Cfg,
+    cfg: std::sync::Arc<crate::cfg::Cfg>,
     try_target: Vec<bool>,
     scan: Scan,
     local: Local,
@@ -397,7 +393,7 @@ struct Pass {
     memo: Vec<(u32, Value)>,
     stamp: u32,
     path: Vec<Block>,
-    promoted: Vec<bool>,
+    promoted_vars: Vec<bool>,
     kept: Vec<bool>,
 }
 
@@ -457,7 +453,7 @@ impl Pass {
         if !self.cfg.reachable[block.index()] || preds.is_empty() {
             return Some(Step::Done(self.fresh.zero(&mut self.subst, ty)));
         }
-        if let [pred] = preds[..] {
+        if let Some(&pred) = preds.first().filter(|&p| preds[1..].iter().all(|q| q == p)) {
             return Some(match self.local.def(var.index, pred) {
                 Some(def) => Step::Done(def),
                 None => Step::Up(pred),
@@ -547,23 +543,19 @@ impl Pass {
         }
     }
 
-    fn build(&mut self, slot: usize) -> Option<Build> {
-        let vars = self.scan.slot_vars[slot].len();
-        self.prepare(vars);
+    fn build_var(&mut self, index: usize) -> Option<Build> {
+        self.prepare(1);
         let mut build = Build::default();
-        for local in 0..vars {
-            let index = self.scan.slot_vars[slot][local];
-            let var = SlotVar { local, index };
-            let home = self.scan.vars[index].home();
-            for exposed in 0..self.local.exposed[index].len() {
-                let (block, load) = self.local.exposed[index][exposed];
-                let value = self.entry(&mut build, var, block)?;
-                self.bind(&mut build, home, load, value);
-            }
-            for forward in 0..self.local.forward[index].len() {
-                let (load, def) = self.local.forward[index][forward];
-                self.bind(&mut build, home, load, def);
-            }
+        let var = SlotVar { local: 0, index };
+        let home = self.scan.vars[index].home();
+        for exposed in 0..self.local.exposed[index].len() {
+            let (block, load) = self.local.exposed[index][exposed];
+            let value = self.entry(&mut build, var, block)?;
+            self.bind(&mut build, home, load, value);
+        }
+        for forward in 0..self.local.forward[index].len() {
+            let (load, def) = self.local.forward[index][forward];
+            self.bind(&mut build, home, load, def);
         }
         self.fill(&mut build)?;
         self.minimize(&mut build.phis);
@@ -571,18 +563,16 @@ impl Pass {
         (!blocked).then_some(build)
     }
 
-    fn apply(&mut self, func: &mut Function, slot: usize, build: Build) {
+    fn apply_var(&mut self, func: &mut Function, var: usize, build: Build) {
         self.undo.clear();
-        for &var in &self.scan.slot_vars[slot] {
-            for &(inst, cast) in &self.local.store_casts[var] {
-                let val = match func.insts[inst.index()].op {
-                    Op::StackStore(v, ..) | Op::Store(v, ..) => v,
-                    _ => continue,
-                };
-                func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, val);
-                func.insts[inst.index()].result = Some(cast);
-                self.kept[inst.index()] = true;
-            }
+        for &(inst, cast) in &self.local.store_casts[var] {
+            let val = match func.insts[inst.index()].op {
+                Op::StackStore(v, ..) | Op::Store(v, ..) => v,
+                _ => continue,
+            };
+            func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, val);
+            func.insts[inst.index()].result = Some(cast);
+            self.kept[inst.index()] = true;
         }
         for (inst, op, value) in build.converts {
             func.insts[inst.index()].op = Op::Convert(op, value);
@@ -597,18 +587,21 @@ impl Pass {
                 }
             }
         }
-        self.promoted[slot] = true;
+        self.promoted_vars[var] = true;
     }
 
     fn dropped(&self, count: usize) -> Vec<bool> {
         let mut dropped = vec![false; count];
         for access in &self.scan.accesses {
-            if self.promoted[self.scan.vars[access.var].slot.index()] && !self.kept[access.inst.index()] {
+            if self.promoted_vars[access.var] && !self.kept[access.inst.index()] {
                 dropped[access.inst.index()] = true;
             }
         }
+        let all_promoted = |slot: usize| {
+            !self.scan.escaped[slot] && !self.scan.slot_vars[slot].is_empty() && self.scan.slot_vars[slot].iter().all(|&var| self.promoted_vars[var])
+        };
         for (inst, slot) in &self.scan.addr_insts {
-            if self.promoted[slot.index()] {
+            if all_promoted(slot.index()) {
                 dropped[inst.index()] = true;
             }
         }
@@ -674,52 +667,89 @@ pub(crate) enum Moves {
     Words,
 }
 
-pub(crate) fn step(func: &mut Function, moves: Moves) -> bool {
+pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
-        return false;
+        return Domain::NONE;
     };
+    let join_changed = moves != Moves::Words && join_slots::run(func);
     let mut scan = Scan::new(func);
     let mut splits = Vec::new();
-    if func.insts.iter().any(|data| matches!(data.op, Op::Move(to, from, _) if scan.open(to) || scan.open(from))) {
+    let mut copy_splits = Vec::new();
+    let mut dropped_zero = false;
+    let has_open_move = func.insts.iter().any(|data| match data.op {
+        Op::Move(to, from, _) => scan.open(to) || scan.open(from),
+        Op::Copy(to, from, len) => scan.copy_bytes(to, from, len).is_some() && (scan.open(to) || scan.open(from)),
+        _ => false,
+    });
+    if has_open_move {
         let layouts = (moves != Moves::Words).then(|| scan.layouts(func));
-        let pieces = |to: Value, from: Value, bytes: u32| match layouts.as_ref().and_then(|layouts| layouts.pieces(scan.end(to), scan.end(from), bytes)) {
-            None if moves != Moves::Guided => Some(crate::copy::words(bytes)),
-            guided => guided,
+        let pieces = |to: Value, from: Value, bytes: u32| {
+            let both_open = scan.open(to) && scan.open(from);
+            if !(both_open || scan.open(to) || scan.open(from)) {
+                return None;
+            }
+            let (max_b, max_p) = if both_open {
+                (subword::PROMOTE_BOTH_BYTES, subword::PROMOTE_BOTH_PIECES)
+            } else {
+                (crate::copy::MOVE_INLINE * 2, subword::PROMOTE_ONE_PIECES)
+            };
+            if bytes > max_b {
+                return None;
+            }
+            let word_limit = if both_open { max_p } else { crate::copy::EXPAND_WORDS };
+            let (found, limit) = match layouts.as_ref().and_then(|layouts| layouts.pieces(scan.end(to), scan.end(from), bytes)) {
+                None if moves != Moves::Guided => (Some(crate::copy::vec_words(bytes)), word_limit),
+                guided => (guided, max_p),
+            };
+            found.filter(|p| p.len() <= limit)
         };
-        splits = crate::copy::expand(func, |to, from, bytes| if scan.open(to) || scan.open(from) { pieces(to, from, bytes) } else { None });
+        splits = crate::copy::expand(func, pieces);
+        (copy_splits, dropped_zero) = subword::expand_copies(func, |to, from, len| {
+            let bytes = scan.copy_bytes(to, from, len)?;
+            pieces(to, from, bytes)
+        });
         scan = Scan::new(func);
-        scan.pin_moves(func);
     }
-    let split_changed = moves == Moves::Split && subword::split(func, &scan);
+    let mut split_changed = moves == Moves::Split && subword::split(func, &scan);
     if split_changed {
         scan = Scan::new(func);
-        scan.pin_moves(func);
     }
-    let changed = ((0..func.slots.len()).any(|slot| scan.promotable(slot)) && promote(func, entry, scan)) || split_changed;
+    if moves != Moves::Words && vec_slot::split(func, &scan) {
+        split_changed = true;
+        scan = Scan::new(func);
+    }
+    let changed = (scan.any_promotable() && promote(func, entry, scan)) || join_changed || split_changed || dropped_zero;
     crate::copy::rejoin(func, &splits);
-    changed
+    let all_copies_rejoined = subword::rejoin_copies(func, &copy_splits);
+    if changed || !all_copies_rejoined { Domain::MEM | Domain::VALUES } else { Domain::NONE }
 }
 
-/// Promotes every promotable slot `scan` found.
+/// Promotes every promotable variable `scan` found.
 fn promote(func: &mut Function, entry: Block, scan: Scan) -> bool {
     let count = func.types.len();
     let mut fresh = Fresh { base: count, types: Vec::new(), zeros: Vec::new() };
     let mut subst = crate::merge::identity(count);
     let local = Local::new(&scan, &mut fresh, &mut subst);
-    let promoted = vec![false; func.slots.len()];
+    let promoted_vars = vec![false; scan.vars.len()];
     let kept = vec![false; func.insts.len()];
-    let mut pass = Pass { cfg: crate::cfg::Cfg::from_entry(func, entry), try_target: try_targets(func), scan, local, fresh, subst, undo: Vec::new(), memo: Vec::new(), stamp: 0, path: Vec::new(), promoted, kept };
+    let mut pass = Pass { cfg: func.cfg(), try_target: try_targets(func), scan, local, fresh, subst, undo: Vec::new(), memo: Vec::new(), stamp: 0, path: Vec::new(), promoted_vars, kept };
     for slot in 0..func.slots.len() {
-        if !pass.scan.promotable(slot) {
+        if pass.scan.escaped[slot] {
             continue;
         }
-        let mark = pass.fresh.types.len();
-        match pass.build(slot) {
-            Some(build) => pass.apply(func, slot, build),
-            None => pass.rollback(mark),
+        for idx in 0..pass.scan.slot_vars[slot].len() {
+            let var = pass.scan.slot_vars[slot][idx];
+            if !pass.scan.var_promotable(slot, var) {
+                continue;
+            }
+            let mark = pass.fresh.types.len();
+            match pass.build_var(var) {
+                Some(build) => pass.apply_var(func, var, build),
+                None => pass.rollback(mark),
+            }
         }
     }
-    let changed = pass.promoted.iter().any(|&p| p);
+    let changed = pass.promoted_vars.iter().any(|&p| p);
     pass.finish(func, entry);
     changed
 }

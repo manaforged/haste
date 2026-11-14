@@ -2,7 +2,10 @@ use anyhow::{Result, bail};
 use haste_codegen::{Arch, Os};
 
 use super::shims::{emit_elf_start, emit_main_trampoline, emit_shims, emit_stub, plan_shims};
-use super::{Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, resolve_sym};
+use super::{Buf, ELF_BASE, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, resolve_sym};
+
+const SECTION_NAMES: &[u8] = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
+const LOCAL_FUNC_IN_TEXT: u32 = 0x0001_0002;
 
 struct ElfTables {
     dynstr: Vec<u8>,
@@ -51,6 +54,35 @@ fn write_phdr(out: &mut Buf, kind: u32, flags: u32, off: usize, vaddr: u64, file
     out.u64s(&[off as u64, vaddr, vaddr, filesz as u64, memsz as u64, align as u64]);
 }
 
+fn write_shdr(out: &mut Buf, [name, kind, link, info]: [u32; 4], [flags, addr, off, size, align, entsize]: [u64; 6]) {
+    out.words(&[name, kind]);
+    out.u64s(&[flags, addr, off, size]);
+    out.words(&[link, info]);
+    out.u64s(&[align, entsize]);
+}
+
+fn write_symbols(out: &mut Buf, exe: &Executable, text: (u64, usize), symtab_off: usize, (strtab, fn_strx): (&[u8], &[u32])) {
+    let (text_va, text_off) = text;
+    let nsyms = 1 + fn_strx.len();
+    out.0.resize(symtab_off, 0);
+    out.bytes(&[0; 24]);
+    for (at, (&strx, (off, _))) in fn_strx.iter().zip(&exe.symbols).enumerate() {
+        let end = exe.symbols.get(at + 1).map_or(exe.text.len() as u32, |(next, _)| *next);
+        out.words(&[strx, LOCAL_FUNC_IN_TEXT]);
+        out.u64s(&[text_va + u64::from(*off), u64::from(end - off)]);
+    }
+    let strtab_off = out.pos();
+    out.bytes(strtab);
+    let names_off = out.pos();
+    out.bytes(SECTION_NAMES);
+    out.align(8);
+    out.bytes(&[0; 64]);
+    write_shdr(out, [1, 1, 0, 0], [6, text_va, text_off as u64, exe.text.len() as u64, 16, 0]);
+    write_shdr(out, [7, 2, 3, nsyms as u32], [0, 0, symtab_off as u64, (nsyms * 24) as u64, 8, 24]);
+    write_shdr(out, [15, 3, 0, 0], [0, 0, strtab_off as u64, strtab.len() as u64, 1, 0]);
+    write_shdr(out, [23, 3, 0, 0], [0, 0, names_off as u64, SECTION_NAMES.len() as u64, 1, 0]);
+}
+
 pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Result<Vec<u8>> {
     let arch = exe.target.arch;
     let plan = Plan::collect(exe, &["__libc_start_main"])?;
@@ -75,8 +107,10 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let start_off = (stubs_off + plan.imports.len() * stub_size).next_multiple_of(16);
     let tramp_off = (start_off + start_size).next_multiple_of(16);
     let shims_off = (tramp_off + tramp_size).next_multiple_of(16);
-    let (shim_offs, text_off) = plan_shims(arch, Os::Linux, &plan, ELF_BASE, shims_off)?;
-    let rx_end = (text_off + exe.text.len()).next_multiple_of(16);
+    let (shim_offs, head_off) = plan_shims(arch, Os::Linux, &plan, ELF_BASE, shims_off)?;
+    let veneers = plan_veneers(exe, &plan, ELF_BASE, head_off, &shim_offs, |_, _| stubs_off)?;
+    let text_off = head_off + veneers.pre_len;
+    let rx_end = (text_off + exe.text.len().next_multiple_of(16) + veneers.post_len).next_multiple_of(16);
 
     let rw_off = rx_end;
     let rw_va = ELF_BASE + (rx_end + page) as u64;
@@ -86,6 +120,10 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let rw_filesz = (dyn_off + dyn_size) - rw_off;
     let bss_in_rw = rw_filesz.next_multiple_of(16);
     let (key_off, bss_total) = plan.bss_layout(exe.bss);
+    let mut strtab = vec![0u8];
+    let fn_strx = exe.symbol_names("", &mut strtab);
+    let symtab_off = (dyn_off + dyn_size).next_multiple_of(8);
+    let shdr_off = (symtab_off + (1 + fn_strx.len()) * 24 + strtab.len() + SECTION_NAMES.len()).next_multiple_of(8);
 
     let bss_va = rw_va + bss_in_rw as u64;
     let addrs = SectionAddrs {
@@ -105,9 +143,9 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     out.u16(2);
     out.u16(if arch == Arch::X64 { 62 } else { 183 });
     out.u32(1);
-    out.u64s(&[ELF_BASE + start_off as u64, 64, 0]);
+    out.u64s(&[ELF_BASE + start_off as u64, 64, shdr_off as u64]);
     out.u32(0);
-    [64_u16, 56, 5, 64, 0, 0].into_iter().for_each(|v| out.u16(v));
+    [64_u16, 56, 5, 64, 5, 4].into_iter().for_each(|v| out.u16(v));
     write_phdr(&mut out, 6, 4, 64, ELF_BASE + 64, 5 * 56, 5 * 56, 8);
     write_phdr(&mut out, 3, 4, interp_off, ELF_BASE + interp_off as u64, interp.len(), interp.len(), 1);
     write_phdr(&mut out, 1, 5, 0, ELF_BASE, rx_end, rx_end, page);
@@ -142,10 +180,12 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     out.align(16);
     emit_shims(arch, Os::Linux, &plan, ELF_BASE, 0, addrs, &stub_va, None, &mut out)?;
     out.align(16);
+    veneers.emit_pre(&resolve, &mut out)?;
     out.bytes(&exe.text);
     out.align(16);
+    veneers.emit_post(&resolve, &mut out)?;
     let resolve_got = |name: &str| Ok(got_va(plan.import_idx(name)?));
-    let ctx = PatchCtx { text_base: text_off, text_va: addrs.text, pie_arm64: false, addrs, base_va: ELF_BASE, shim_offs: &shim_offs, plan: &plan, stub_va: &stub_va, got_va: &resolve_got };
+    let ctx = PatchCtx { text_base: text_off, text_va: addrs.text, pie_arm64: false, addrs, base_va: ELF_BASE, shim_offs: &shim_offs, plan: &plan, stub_va: &stub_va, got_va: &resolve_got, veneers: &veneers };
     patch_code(&exe.relocs, &ctx, &mut out.0)?;
 
     out.bytes(&exe.data);
@@ -158,5 +198,6 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         out.i64(tag);
         out.u64(val);
     }
+    write_symbols(&mut out, exe, (addrs.text, text_off), symtab_off, (&strtab, &fn_strx));
     Ok(out.0)
 }

@@ -1,4 +1,6 @@
-use crate::ir::{ArgumentPurpose, Binary, Block, BlockData, Function, Inst, Op, Type, Value};
+use std::borrow::Cow;
+
+use crate::ir::{ArgumentPurpose, Binary, Block, BlockData, Domain, Function, Inst, Op, Type, Value};
 
 enum TailCase {
     Pure { args: Vec<Value>, callee: Value },
@@ -31,6 +33,27 @@ fn identity_of(op: Binary) -> i64 {
     }
 }
 
+/// The returned values of `term`, unwrapping a pure jump into a pure return block when safe.
+fn effective_return<'a>(func: &'a Function, block: usize, term: Inst) -> Option<Cow<'a, [Value]>> {
+    match &func.insts[term.index()].op {
+        Op::Return(vals) => Some(Cow::Borrowed(vals.as_slice())),
+        Op::Jump(target, jump_args) if target.index() != block => {
+            let target_data = &func.blocks[target.index()];
+            let (&ret_inst, prefix) = target_data.insts.split_last()?;
+            if !prefix.is_empty() || target_data.params.len() != jump_args.len() {
+                return None;
+            }
+            let Op::Return(ret_vals) = &func.insts[ret_inst.index()].op else { return None };
+            let resolved = ret_vals
+                .iter()
+                .map(|val| target_data.params.iter().position(|param| param == val).map_or(*val, |pos| jump_args[pos]))
+                .collect();
+            Some(Cow::Owned(resolved))
+        }
+        _ => None,
+    }
+}
+
 fn analyze_block(
     func: &Function,
     block: usize,
@@ -39,21 +62,22 @@ fn analyze_block(
     uses: &[u32],
 ) -> Option<TailCase> {
     let insts = &func.blocks[block].insts;
-    let &ret_inst = insts.last()?;
-    let Op::Return(ret_vals) = &func.insts[ret_inst.index()].op else { return None };
+    let &term_inst = insts.last()?;
+    let ret_vals = effective_return(func, block, term_inst)?;
     if insts.len() >= 2 {
         let call_inst = insts[insts.len() - 2];
         if let Op::Call { sig, callee, args, results } = &func.insts[call_inst.index()].op
             && func.sigs[sig.index()] == func.signature
             && args.len() == old_params_len
             && results.len() == func.signature.returns.len()
-            && results == ret_vals
+            && results.as_slice() == &ret_vals[..]
             && is_self_callee(func, def_inst, *callee).is_some()
         {
             return Some(TailCase::Pure { args: args.clone(), callee: *callee });
         }
     }
     if insts.len() >= 3
+        && func.signature.returns.len() == 1
         && let [ret_val] = ret_vals[..]
         && is_accum_ty(func.ty(ret_val))
     {
@@ -111,24 +135,23 @@ fn kill_dead_value(func: &mut Function, def_inst: &[Option<Inst>], val: Value) -
 }
 
 /// Turns self-recursive tail calls (and associative/commutative accumulator calls) into loops.
-pub(crate) fn run(func: &mut Function) -> bool {
+pub(crate) fn run(func: &mut Function) -> Domain {
     if func.self_slots.is_empty() || func.coroutine.is_some() {
-        return false;
+        return Domain::NONE;
     }
-    let Some(old_entry) = func.entry else { return false };
+    let Some(old_entry) = func.entry else { return Domain::NONE };
     if func.signature.params.iter().any(|p| p.purpose != ArgumentPurpose::Normal)
-        || func.signature.returns.len() > 1
         || func.signature.returns.iter().any(|p| p.purpose != ArgumentPurpose::Normal)
     {
-        return false;
+        return Domain::NONE;
     }
     for block in &func.blocks {
         if block.insts.last().is_some_and(|&i| func.insts[i.index()].op.targets().any(|t| t == old_entry)) {
-            return false;
+            return Domain::NONE;
         }
         for &inst in &block.insts {
             if matches!(func.insts[inst.index()].op, Op::StackAddr(..) | Op::TryCall { .. }) {
-                return false;
+                return Domain::NONE;
             }
         }
     }
@@ -155,7 +178,7 @@ pub(crate) fn run(func: &mut Function) -> bool {
         let Some(case) = analyze_block(func, block, old_params_len, &def_inst, &uses) else { continue };
         if let TailCase::Accum { op, .. } = case {
             match accum_op {
-                Some(prev) if prev != op => return false,
+                Some(prev) if prev != op => return Domain::NONE,
                 None => accum_op = Some(op),
                 _ => {}
             }
@@ -163,8 +186,14 @@ pub(crate) fn run(func: &mut Function) -> bool {
         cases.push((block, case));
     }
     if cases.is_empty() {
-        return false;
+        return Domain::NONE;
     }
+    let accum_ret_ty = accum_op.and_then(|_| {
+        cases.iter().find_map(|(_, case)| match case {
+            TailCase::Accum { other, .. } => Some(func.ty(*other)),
+            TailCase::Pure { .. } => None,
+        })
+    });
     let old_params = std::mem::take(&mut func.blocks[old_entry.index()].params);
     let fresh_params: Vec<Value> = old_params.iter().map(|&p| func.value(func.ty(p))).collect();
     let loop_head = Block(func.blocks.len() as u32);
@@ -173,15 +202,7 @@ pub(crate) fn run(func: &mut Function) -> bool {
     func.blocks.push(BlockData { params: fresh_params.clone(), insts: Vec::new() });
     func.entry = Some(new_entry);
 
-    let (acc_param, ret_ty) = if let Some(op) = accum_op {
-        let ret_ty = match &cases[0].1 {
-            TailCase::Accum { other, .. } => func.ty(*other),
-            TailCase::Pure { args: _, callee: _ } => {
-                let Some(last) = func.blocks[cases[0].0].insts.last() else { return false };
-                let Op::Return(vals) = &func.insts[last.index()].op else { return false };
-                func.ty(vals[0])
-            }
-        };
+    let (acc_param, ret_ty) = if let (Some(op), Some(ret_ty)) = (accum_op, accum_ret_ty) {
         let acc = func.value(ret_ty);
         func.blocks[loop_head.index()].params.push(acc);
         let init_acc = func.value(ret_ty);
@@ -233,9 +254,11 @@ pub(crate) fn run(func: &mut Function) -> bool {
         }
     }
     peel_entry_guard(func, (old_entry, new_entry, loop_head), old_params_len, orig_blocks, &rewritten, accum_op.zip(ret_ty));
+    func.bump_cfg();
     if let (Some(op), Some(acc), Some(rty)) = (accum_op, acc_param, ret_ty) {
+        let post_cfg = func.cfg();
         for b_idx in 0..orig_blocks {
-            if rewritten[b_idx] {
+            if rewritten[b_idx] || !post_cfg.reachable[b_idx] {
                 continue;
             }
             let Some(&ret_inst) = func.blocks[b_idx].insts.last() else { continue };
@@ -253,7 +276,8 @@ pub(crate) fn run(func: &mut Function) -> bool {
             kill_dead_value(func, &def_inst, addr);
         }
     }
-    true
+    func.bump_cfg();
+    Domain::CFG | Domain::VALUES
 }
 
 fn clone_pure_insts(
@@ -316,7 +340,8 @@ fn peel_entry_guard(
     if then_b == else_b || func.blocks[new_entry.index()].insts.is_empty() {
         return;
     }
-    let cfg = crate::cfg::Cfg::new(func);
+    func.bump_cfg();
+    let cfg = func.cfg();
     let is_base = |b: Block| {
         b != old_entry
             && b.index() < orig_blocks

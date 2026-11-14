@@ -379,7 +379,7 @@ impl Driver for Runs<'_, '_> {
         };
         let (_, unit, script) = self.running.swap_remove(at);
         let result = match (ended.status, ended.failure) {
-            (0, _) => String::from_utf8(ended.bytes).map(|text| finished(self.workspace, unit, &script, &text)).map_err(|_| Failure::from("printed output that is not UTF-8".to_owned())),
+            (0, _) => String::from_utf8(ended.bytes).map(|text| finished(self.workspace, unit, &script, &text)).map_err(|error| Failure::from(format!("printed output that is not UTF-8: {error}"))),
             (_, Some((error, item))) => Err(Failure { error: format!("does not build: {error}"), broken: self.owners.get(item.krate as usize).copied(), interrupted: false }),
             (status, None) => Err(Failure { interrupted: crate::image::interrupted(status), ..Failure::from(format!("exited with status {status}; its errors are in {}", script.log.display())) }),
         };

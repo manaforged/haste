@@ -30,8 +30,11 @@ impl Infer<'_, '_> {
         let Some(ty) = self.param_ty(param) else {
             return Ok(None);
         };
+        let owner_trait = self.frame_item.and_then(|item| {
+            (self.cx.item(item).1.kind == ItemKind::Trait).then_some(item).or_else(|| self.cx.owner_trait(item))
+        });
         if param == "Self"
-            && let Some(of) = self.frame_item.and_then(|item| self.cx.owner_trait(item))
+            && let Some(of) = owner_trait
         {
             let count = type_params(&self.cx.trait_generics(of)?.1.params).count();
             let args: Vec<Ty> = self.generics.iter().take(count).map(|&(_, ty)| ty).collect();
@@ -125,15 +128,6 @@ impl Infer<'_, '_> {
         Ok(found)
     }
 
-    /// The bounds that the associated types of the traits bounding the frame's type parameters declare, as `type S: Source` gives `<T as Logos>::S`.
-    pub(super) fn param_alias_bounds(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
-        let mut found = Vec::new();
-        for (of, substs) in self.param_bounds()? {
-            found.extend(self.alias_bounds(of, &substs)?);
-        }
-        Ok(found)
-    }
-
     /// The supertrait bounds that `substs[0]: of<substs[1..]>` implies, each with its arguments.
     pub(super) fn super_bounds(&mut self, of: ItemRef, substs: &[Ty]) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         Ok(self.super_bindings(of, substs)?.into_iter().map(|(bound, _)| bound).collect())
@@ -207,7 +201,7 @@ impl Infer<'_, '_> {
             let Some(value) = self.picked_alias(of, substs[0], &substs[1..], (self.cx.name(member), &[]))? else {
                 continue;
             };
-            let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), None))?;
+            let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), Some(of)))?;
             let home = frame.home;
             self.with_frame(frame, |infer| {
                 for &bound in bounds.0.list(bounds.1.supers) {
@@ -413,8 +407,8 @@ impl Infer<'_, '_> {
             };
             return self.object_super_alias(of, ty, (*principal, trait_args), name);
         }
-        if self.cx.lang(of) == Some("fn_once") && name == "Output" {
-            return Ok(self.callable_sig(ty)?.map(|(_, ret)| ret));
+        if let Some(found) = self.callable_assoc_alias(of, ty, name)? {
+            return Ok(Some(found));
         }
         if self.cx.lang(of) == Some("future_trait")
             && name == "Output"
@@ -608,7 +602,7 @@ impl Infer<'_, '_> {
             return Ok(None);
         }
         let params: Vec<_> = type_params(&def.1.params).copied().collect();
-        let frame = self.item_frame(of, (&params, &args), (Some(ty), None))?;
+        let frame = self.item_frame(of, (&params, &args), (Some(ty), Some(of)))?;
         let home = frame.home;
         let supers = self.with_frame(frame, |infer| {
             let mut found = Vec::new();

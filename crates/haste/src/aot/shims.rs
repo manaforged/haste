@@ -52,20 +52,51 @@ pub(super) fn emit_arm64_adrp_add(pc_va: u64, target_va: u64, reg: u32, out: &mu
     out.words(&[arm64_adrp(pc_va, target_va, reg), 0x9100_0000 | (((target_va & 0xFFF) as u32) << 10) | (reg << 5) | reg]);
 }
 
-pub(super) fn patch_arm64_pie(out: &mut [u8], pc_va: u64, load_got: bool, target_va: u64) -> Result<()> {
-    let word0 = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
-    if (word0 & 0xFFE0_0000) != 0xD280_0000 {
-        bail!("expected movz instruction at Arm64Movw64 relocation, found {word0:#010x}");
-    }
-    let rd = word0 & 0x1F;
+pub(super) fn emit_arm64_veneer(pc_va: u64, target_va: u64, out: &mut Buf) {
+    emit_arm64_adrp_add(pc_va, target_va, 16, out);
+    out.u32(0xD61F_0200);
+}
+
+fn write_arm64_pc_load(out: &mut [u8], pc_va: u64, rd: u32, load_got: bool, target_va: u64) {
     let w0 = arm64_adrp(pc_va, target_va, rd);
     let w1 = if load_got {
         0xF940_0000 | ((((target_va & 0xFFF) >> 3) as u32) << 10) | (rd << 5) | rd
     } else {
         0x9100_0000 | (((target_va & 0xFFF) as u32) << 10) | (rd << 5) | rd
     };
-    for (i, w) in [w0, w1, 0xD503_201F, 0xD503_201F].into_iter().enumerate() {
+    for (i, w) in [w0, w1].into_iter().enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+}
+
+pub(super) fn patch_arm64_pie(out: &mut [u8], pc_va: u64, load_got: bool, target_va: u64) -> Result<()> {
+    let word0 = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+    if (word0 & 0xFFE0_0000) != 0xD280_0000 {
+        bail!("expected movz instruction at Arm64Movw64 relocation, found {word0:#010x}");
+    }
+    write_arm64_pc_load(&mut out[..8], pc_va, word0 & 0x1F, load_got, target_va);
+    for i in 2..4 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&0xD503_201F_u32.to_le_bytes());
+    }
+    Ok(())
+}
+
+pub(super) fn patch_arm64_adrp_add(out: &mut [u8], pc_va: u64, load_got: bool, target_va: u64, is_word: bool) -> Result<()> {
+    let word0 = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+    if (word0 & 0x9F00_0000) != 0x9000_0000 {
+        bail!("expected adrp instruction at Arm64AdrpAdd relocation, found {word0:#010x}");
+    }
+    let rd = word0 & 0x1F;
+    if is_word {
+        let Ok(val32) = u32::try_from(target_va) else {
+            bail!("Arm64AdrpAdd Symbol::Word {target_va:#x} exceeds u32");
+        };
+        let w0 = 0xD280_0000 | ((val32 & 0xFFFF) << 5) | rd;
+        let w1 = 0xF2A0_0000 | (((val32 >> 16) & 0xFFFF) << 5) | rd;
+        out[..4].copy_from_slice(&w0.to_le_bytes());
+        out[4..8].copy_from_slice(&w1.to_le_bytes());
+    } else {
+        write_arm64_pc_load(out, pc_va, rd, load_got, target_va);
     }
     Ok(())
 }

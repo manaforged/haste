@@ -60,8 +60,8 @@ haste [--release] debug code PATH DIR
 | `HASTE_LIBRARY` | Newest `stable-*` `rust-src` `library` directory under `$RUSTUP_HOME` | Path to the Rust standard library `library/` source tree. |
 | `HASTE_NO_SUBSTRATE` | Unset (`0`) | Set to `1` to bypass the cached standard library substrate. |
 | `HASTE_X64_BASELINE` | Unset (`0`) | Set to `1` on x86-64 to disable host ISA feature detection beyond baseline SSE2. |
-| `HASTE_DICT_MIN_BYTES` | `2048` | Minimum generic body size in bytes before dictionary lowering is considered. |
-| `HASTE_DICT_MIN_FANOUT` | `2` (JIT) or `8` (AOT) | Minimum monomorphization fanout before sharing a dictionary body. |
+| `HASTE_DICT_MIN_BYTES` | `512` | Minimum generic body size in bytes before dictionary lowering is considered. |
+| `HASTE_DICT_MIN_FANOUT` | `8` | Minimum monomorphization fanout before sharing a dictionary body. |
 | `HASTE_JIT_TIER_UP` | `64` | Call count threshold before a hot dictionary function specializes in JIT mode (`0` disables tier-up). |
 | `HASTE_VERIFY_STENCIL` | Unset (`0`) | Set to `1` to verify stencil instantiations against concrete lowering. |
 

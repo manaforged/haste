@@ -117,9 +117,9 @@ impl Infer<'_, '_> {
         if !self.is_callable_trait(of) {
             return Ok(self.compiler_impl(of, from) || self.select(of, from, given)?.is_some());
         }
-        if let (Some((params, _)), Some(&wanted)) = (self.callable_sig(from)?, given.first()) {
+        if let (Some((params, ret)), Some(&wanted)) = (self.callable_sig(from)?, given.first()) {
             let inputs = self.cx.types.tuple(&params);
-            return Ok(self.unifies(inputs, wanted));
+            return Ok(self.unifies(inputs, wanted) && (!self.is_async_callable_trait(of) || self.is_future_type(ret)?));
         }
         Ok(self.select(of, from, given)?.is_some())
     }

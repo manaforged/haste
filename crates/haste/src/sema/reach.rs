@@ -8,7 +8,7 @@ use crate::names::ItemRef;
 use crate::names::path::Requests;
 
 use super::Context;
-use super::infer::{Typed, infer, register};
+use super::infer::{LazyTables, Res, Shape, Typed, infer, register};
 use super::substs::Substs;
 mod filter;
 
@@ -16,7 +16,7 @@ use filter::{ReachFilter, collect_filtered_callees, commit_filter_caller, pre_co
 use super::ty::{Kind, Ty};
 
 const MIN_PARALLEL_WAVE: usize = 4;
-const MAX_WORKER_BATCH: usize = 32;
+const MAX_WORKER_BATCH: usize = 128;
 
 /// One function at concrete type arguments.
 pub type Instance = (ItemRef, Substs);
@@ -127,14 +127,66 @@ impl Reached {
 
     fn link(&mut self, indices: &[usize]) {
         self.calls.resize(self.list.len(), Vec::new());
-        for &at in indices {
-            let callees = self.list[at].1.as_ref().map(|typed| self.callees(typed).collect()).unwrap_or_default();
+        let workers = crate::jobs().min(indices.len() / 256);
+        if workers <= 1 {
+            for &at in indices {
+                self.calls[at] = self.list[at].1.as_ref().map(|typed| collect_link_callees(typed, &self.index)).unwrap_or_default();
+            }
+            return;
+        }
+        let next = AtomicUsize::new(0);
+        let worker = || {
+            let mut local = Vec::new();
+            loop {
+                let start = next.fetch_add(256, Ordering::Relaxed);
+                let Some(slice) = indices.get(start..) else { return local };
+                for &at in &slice[..slice.len().min(256)] {
+                    local.push((at, self.list[at].1.as_ref().map(|t| collect_link_callees(t, &self.index)).unwrap_or_default()));
+                }
+            }
+        };
+        let (own, joined) = std::thread::scope(|scope| {
+            let handles: Vec<_> = (1..workers).map(|_| scope.spawn(worker)).collect();
+            let own = worker();
+            let joined: Vec<_> = handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect();
+            (own, joined)
+        });
+        for (at, callees) in own.into_iter().chain(joined) {
             self.calls[at] = callees;
         }
     }
+}
 
-    fn callees<'r>(&'r self, typed: &'r Typed) -> impl Iterator<Item = usize> + 'r {
-        typed.calls().filter_map(|callee| self.index.get(&callee).copied())
+fn collect_link_callees(typed: &Typed, index: &HashMap<Instance, usize>) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut push = |inst: Instance| if let Some(&id) = index.get(&inst) { out.push(id); };
+    match &typed.tables {
+        LazyTables::CheckOnly(check) => {
+            check.calls().for_each(&mut push);
+            push_tail_calls(typed, &mut push);
+        }
+        LazyTables::Poly(poly) => {
+            poly.calls().for_each(&mut push);
+            push_tail_calls(typed, &mut push);
+        }
+        LazyTables::Eager(_) => typed.calls().for_each(push),
+    }
+    out
+}
+
+pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
+    for r in &typed.drops {
+        if let Res::Fn(item, substs) = *r { push((item, substs)); }
+    }
+    match &typed.shape {
+        Shape::Glue(g) => for r in g.drop.iter().chain(&g.parts).chain(&g.resume) {
+            if let Res::Fn(item, substs) = *r { push((item, substs)); }
+        },
+        Shape::Untuple(r) => if let Res::Fn(item, substs) = *r { push((item, substs)); },
+        Shape::Clone(calls) => for r in calls {
+            if let Res::Fn(item, substs) = *r { push((item, substs)); }
+        },
+        _ => {}
     }
 }
 
@@ -363,6 +415,9 @@ fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: Vec<usize>,
     let q = shared.0.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
     reached.index = q.seen;
     reached.filter = q.filter;
+    let extra = q.instances.len().saturating_sub(reached.list.len());
+    reached.list.reserve(extra);
+    reached.states.reserve(extra);
     for inst in q.instances.into_iter().skip(reached.list.len()) {
         reached.list.push((inst, Err(String::new())));
         reached.states.push(ReachedEntry::Enqueued);
@@ -385,9 +440,10 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
     let mut results = Vec::with_capacity(MAX_WORKER_BATCH);
     let mut local_filter = ReachFilter::default();
     let mut synced_len = (0usize, 0usize);
+    let sync_filter = cx.store.lookups.skip_warm_sysroot_bodies;
     loop {
         batch.clear();
-        {
+        let delta = {
             let mut q = crate::sync::lock(mutex);
             while q.queue.is_empty() {
                 if q.active == 0 {
@@ -396,14 +452,18 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
                 }
                 q = cvar.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            local_filter.sync_from(&q.filter, &mut synced_len);
-            let take = (q.queue.len() / workers.max(1)).clamp(1, MAX_WORKER_BATCH);
+            let delta = sync_filter.then(|| q.filter.take_delta(&mut synced_len));
+            let take = (q.queue.len() / (workers * 2).max(1)).clamp(1, MAX_WORKER_BATCH);
             for _ in 0..take {
                 let Some((at, instance)) = q.queue.pop_front() else { break };
                 let include_fixed = !q.filter.seen_fixed_poly.contains(&instance.0);
                 batch.push((at, instance, include_fixed));
             }
             q.active += batch.len();
+            delta
+        };
+        if let Some((sealed, seen)) = delta {
+            local_filter.apply_delta(&sealed, &seen);
         }
         let mut active = ActiveGuard(mutex, cvar, batch.len());
         results.clear();
@@ -418,7 +478,7 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
             if !deferred && (force_commit || !asked) {
                 let first_fixed = include_fixed && !local_filter.seen_fixed_poly.contains(&instance.0);
                 pre_collect_callees(cx, &mut local_filter, (instance, &typed, first_fixed), &mut callees);
-                if let Ok(t) = &typed && matches!(t.tables, super::infer::LazyTables::Poly(_) | super::infer::LazyTables::CheckOnly(_)) {
+                if let Ok(t) = &typed && matches!(t.tables, LazyTables::Poly(_) | LazyTables::CheckOnly(_)) {
                     local_filter.seen_fixed_poly.insert(instance.0);
                 }
             }
@@ -442,9 +502,9 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
                         if sealed && !q.filter.mark_seen_sealed(callee.0) {
                             continue;
                         }
-                        if !q.seen.contains_key(&callee) {
-                            let next_at = q.instances.len();
-                            q.seen.insert(callee, next_at);
+                        let next_at = q.instances.len();
+                        if let std::collections::hash_map::Entry::Vacant(slot) = q.seen.entry(callee) {
+                            slot.insert(next_at);
                             q.instances.push(callee);
                             q.queue.push_back((next_at, callee));
                             pushed = true;
@@ -462,10 +522,13 @@ fn wavefront_worker(cx: &mut Context<'_>, (mutex, cvar): &(Mutex<WaveQueue>, Con
 fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {
     let mut wave = Vec::new();
     for instance in candidates {
-        if reached.index.contains_key(&instance) {
-            continue;
+        if let std::collections::hash_map::Entry::Vacant(slot) = reached.index.entry(instance) {
+            let at = reached.list.len();
+            slot.insert(at);
+            reached.list.push((instance, Err(String::new())));
+            reached.states.push(ReachedEntry::Enqueued);
+            wave.push(at);
         }
-        wave.push(reached.push_entry(instance, ReachedEntry::Enqueued));
     }
     wave
 }
@@ -645,12 +708,40 @@ fn infer_entry(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<Strin
     typed_once(cx, instance, unlaid)
 }
 
+std::thread_local! {
+    static INFERRING: std::cell::RefCell<Vec<Instance>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct InferGuard(bool);
+
+impl InferGuard {
+    fn enter(instance: Instance) -> Self {
+        INFERRING.with(|active| active.borrow_mut().push(instance));
+        Self(true)
+    }
+}
+
+impl Drop for InferGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            INFERRING.with(|active| {
+                active.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+pub(super) fn is_inferring(instance: Instance) -> bool {
+    INFERRING.with(|active| active.borrow().contains(&instance))
+}
+
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
 pub(super) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
     if let Some(typed) = cx.store.finals.get(instance).filter(|t| cx.store.lookups.skip_warm_sysroot_bodies || !matches!(&t.tables, super::infer::LazyTables::CheckOnly(_))) {
         register(cx, *instance, &typed);
         return Ok(typed);
     }
+    let _guard = InferGuard::enter(*instance);
     if let Some(result) = super::summary::typed_once_poly(cx, instance, unlaid) {
         return result;
     }
@@ -667,11 +758,17 @@ pub(super) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut
 pub(super) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
     let scoped = typed.scoped(&cx.types);
     let tables = scoped.ensure_tables(&cx.types);
-    let intrinsic_args: Vec<Ty> = typed.calls().filter(|(item, _)| cx.intrinsic(*item).is_some()).flat_map(|(_, substs)| cx.types.substs(substs).iter().copied()).collect();
+    let mut intrinsic_args = Vec::new();
+    for (item, substs) in typed.calls() {
+        if cx.intrinsic(item).is_some() {
+            intrinsic_args.extend_from_slice(cx.types.substs(substs));
+        }
+    }
     let locals = typed.locals.iter().map(|local| local.ty);
     let pats = tables.pats.values().copied();
+    let mut seen = rustc_hash::FxHashSet::default();
     for ty in tables.exprs.iter().copied().chain(locals).chain(pats).chain(intrinsic_args) {
-        if ty == Ty::NONE {
+        if ty == Ty::NONE || !seen.insert(ty) {
             continue;
         }
         if let Kind::Adt(item, _) = *cx.types.kind(ty)
@@ -679,7 +776,7 @@ pub(super) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()>
         {
             cx.discriminants(item)?;
         }
-        if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
+        if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..) | Kind::Closure(..)) {
             cx.layout(ty)?;
         }
     }

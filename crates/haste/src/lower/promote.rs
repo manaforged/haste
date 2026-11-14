@@ -1,21 +1,20 @@
 use anyhow::Result;
 use haste_codegen::{IntCC, Type, Value};
 
-use crate::body::literal::{byte_value, char_value};
-use crate::body::{BlockKind, Body, Expr, ExprId, Lit, UnOp};
+use crate::body::{BlockKind, Expr, ExprId, List, Stmt, UnOp};
 use crate::host::HostSymbol;
 use crate::names::{ItemRef, Primitive};
 use crate::outline::item::ItemKind;
-use crate::outline::source::Source;
-use crate::sema::Context;
-use crate::sema::infer::{Res, Shape, Typed, field_types, parse_int};
-use crate::sema::layout::field_offset;
+use crate::sema::infer::{Res, Shape, Typed};
 use crate::sema::substs::Substs;
-use crate::sema::ty::{Kind, Mut, Ty, int_info, mask};
+use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::place::{Base, Place};
-use super::stencil::SymbolSource;
+use super::stencil::{RodataReloc, RodataTarget, SymbolSource};
 use super::{Lower, Repr, repr};
+
+mod literal;
+use literal::Scope;
 
 impl Lower<'_, '_> {
     /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a function, a closure that captures nothing, a constructor, a shared reference to one, an aggregate or constructor call of them, or a field of one; in a constant or static initializer, which the compiler evaluates once, also a call, operator or block of them.
@@ -63,25 +62,60 @@ impl Lower<'_, '_> {
         if let Some(address) = self.literal_place(expr)? {
             return Ok(Some(address));
         }
-        let ty = self.ty_of(expr);
+        self.once(self.ty_of(expr), |lower| lower.expr(expr)).map(Some)
+    }
+
+    /// The address of a new program-lifetime cell of this function for a value of `ty`, which `fill` computes on the first use.
+    fn once(&mut self, ty: Ty, fill: impl FnOnce(&mut Self) -> Result<Option<Value>>) -> Result<Value> {
         let size = self.cx.layout(ty)?.size.bytes() as usize;
         let seq = self.promoted_seq;
         self.promoted_seq += 1;
         let cell_size = (size + 1) as u32;
         let address = self.emit_symbol_with(SymbolSource::PromotedCell { owner: self.index, seq, size: cell_size }, super::reloc::RelocStep::Promoted { seq, size: cell_size });
         let filled = self.ins().load(Type::I8, address, size as i32);
-        let (fill, done) = (self.b.create_block(), self.b.create_block());
-        self.brif(filled, (done, &[]), (fill, &[]));
-        self.enter(fill);
-        let whole = repr(self.cx, ty)?;
-        if let Some(value) = self.expr(expr)? {
-            self.write(Place { base: Base::Addr(address), offset: 0, repr: whole }, value);
-        }
-        let one = self.ins().iconst(Type::I8, 1);
-        self.ins().store(one, address, size as i32);
+        self.unless(filled, |lower| {
+            let whole = repr(lower.cx, ty)?;
+            if let Some(value) = fill(lower)? {
+                lower.write(Place { base: Base::Addr(address), offset: 0, repr: whole }, value);
+            }
+            let one = lower.ins().iconst(Type::I8, 1);
+            lower.ins().store(one, address, size as i32);
+            Ok(())
+        })?;
+        Ok(address)
+    }
+
+    /// Runs `fill` on the path where `filled` is zero, then joins the path where it is not.
+    fn unless(&mut self, filled: Value, fill: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let (empty, done) = (self.b.create_block(), self.b.create_block());
+        self.brif(filled, (done, &[]), (empty, &[]));
+        self.enter(empty);
+        fill(self)?;
         self.jump(done, &[]);
         self.enter(done);
-        Ok(Some(address))
+        Ok(())
+    }
+
+    /// The value of the `const` block `expr`: computed on the first use into a cell of this function when it loops and its value holds no address, else computed in place.
+    pub(super) fn const_block(&mut self, expr: ExprId, stmts: List, tail: Option<ExprId>) -> Result<Option<Value>> {
+        let ty = self.ty_of(expr);
+        let whole = repr(self.cx, ty)?;
+        let plain = match whole {
+            Repr::Zst => true,
+            Repr::Scalar(_) => matches!(*self.cx.types.kind(ty), Kind::Prim(_)),
+            Repr::Mem { .. } => false,
+        };
+        if !plain || !self.loops(stmts, tail) {
+            return self.block(stmts, tail);
+        }
+        let address = self.once(ty, |lower| lower.block(stmts, tail))?;
+        Ok(self.read(Place { base: Base::Addr(address), offset: 0, repr: whole }))
+    }
+
+    /// Whether a statement or the tail of a block is a loop.
+    fn loops(&self, stmts: List, tail: Option<ExprId>) -> bool {
+        let looping = |expr: ExprId| matches!(*self.body.expr(expr), Expr::While { .. } | Expr::Loop { .. } | Expr::For { .. });
+        tail.is_some_and(looping) || self.body.list(stmts).iter().any(|&stmt| matches!(self.body.stmts[stmt as usize], Stmt::Expr(expr, _) if looping(expr)))
     }
 
     fn is_mutable_static(&self, item: ItemRef) -> bool {
@@ -89,7 +123,7 @@ impl Lower<'_, '_> {
         entry.name.is_none_or(|name| name == 0 || src.text(name - 1) == "mut")
     }
 
-    fn static_rodata_bytes(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<Vec<u8>>> {
+    fn static_rodata_blob(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
         if self.cx.foreign(item) || self.cx.thread_local(item) || self.is_mutable_static(item) || !super::is_freeze_ty(self.cx, ty, 0) {
             return Ok(None);
         }
@@ -104,8 +138,25 @@ impl Lower<'_, '_> {
         }
         let body = self.cx.body(source)?;
         let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
-        let literal = Literal { body: &body, src, typed: &typed };
-        Ok(literal_bytes(self.cx, &literal, (root, static_ty)))
+        Ok(self.literal_blob(Scope { body: &body, src, typed: &typed }, (root, static_ty), 0))
+    }
+
+    fn emit_rodata_blob(&mut self, bytes: &[u8], relocs: &[RodataReloc]) -> Value {
+        if relocs.is_empty() {
+            self.emit_const_rodata(bytes)
+        } else {
+            let id = self.slots.rodata(bytes, relocs);
+            self.emit_symbol(SymbolSource::Rodata(id))
+        }
+    }
+
+    fn emit_static_rodata_blob(&mut self, index: usize, bytes: &[u8], relocs: &[RodataReloc]) -> Value {
+        if relocs.is_empty() {
+            self.emit_static_rodata(index, bytes)
+        } else {
+            let id = self.slots.rodata(bytes, relocs);
+            self.emit_symbol(SymbolSource::Rodata(id))
+        }
     }
 
     /// The place of the static `item` at `substs`, of type `ty`: the prepped library's copy when Haste shares it, immutable literal bytes in read-only data when eligible, else its cell, which the static's initializer fills on the first use that finds it empty.
@@ -115,8 +166,8 @@ impl Lower<'_, '_> {
             return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
         }
         let index = self.reached_index(item, substs)?;
-        if let Some(bytes) = self.static_rodata_bytes(item, substs, ty)? {
-            let base = self.emit_static_rodata(index, &bytes);
+        if let Some((bytes, relocs)) = self.static_rodata_blob(item, substs, ty)? {
+            let base = self.emit_static_rodata_blob(index, &bytes, &relocs);
             return Ok(Place { base: Base::Addr(base), offset: 0, repr: repr(self.cx, ty)? });
         }
         let (address, size) = self.static_cell(index, ty)?;
@@ -124,16 +175,14 @@ impl Lower<'_, '_> {
             let flag = self.ins().iadd_imm(address, i64::from(size));
             let state = self.ins().atomic_load(Type::I8, flag);
             let filled = self.ins().icmp_imm(IntCC::Equal, state, i64::from(crate::image::StaticInit::Filled as u8));
-            let (fill, done) = (self.b.create_block(), self.b.create_block());
-            self.brif(filled, (done, &[]), (fill, &[]));
-            self.enter(fill);
-            let usize_ty = self.cx.types.prim(Primitive::Usize);
-            let table = self.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index)));
-            let code = self.ins().load(Type::I64, table, 0);
-            let once = self.emit_symbol(SymbolSource::Host(HostSymbol::FillOnce));
-            self.call_code(once, (vec![usize_ty, usize_ty], None), vec![flag, code])?;
-            self.jump(done, &[]);
-            self.enter(done);
+            self.unless(filled, |lower| {
+                let usize_ty = lower.cx.types.prim(Primitive::Usize);
+                let table = lower.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index)));
+                let code = lower.ins().load(Type::I64, table, 0);
+                let once = lower.emit_symbol(SymbolSource::Host(HostSymbol::FillOnce));
+                lower.call_code(once, (vec![usize_ty, usize_ty], None), vec![flag, code])?;
+                Ok(())
+            })?;
         }
         Ok(Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? })
     }
@@ -156,7 +205,7 @@ impl Lower<'_, '_> {
     /// Writes `value`, the value of the static that this function initializes, into the static's cell, and returns.
     pub fn fill_static(&mut self, value: Option<Value>) -> Result<()> {
         let ((item, substs), ty) = (self.reached.list[self.index].0, self.typed.ret_ty());
-        if self.open && crate::prep::static_address(self.cx, item).is_none() && self.static_rodata_bytes(item, substs, ty)?.is_none() {
+        if self.open && crate::prep::static_address(self.cx, item).is_none() && self.static_rodata_blob(item, substs, ty)?.is_none() {
             let place = self.static_place((item, substs), ty)?;
             if let Some(value) = value {
                 self.write(place, value);
@@ -166,114 +215,17 @@ impl Lower<'_, '_> {
     }
 }
 
-/// The most bytes of a constant that lowering lays out from its literals.
-const LITERAL_BYTES: usize = 1 << 16;
-
-/// The bits of the scalar literal `expr` of `body` as a value of `primitive`, when it is one the compiler reads without running anything.
-fn literal_scalar((body, src): (&Body, &Source), expr: ExprId, primitive: Primitive) -> Option<u128> {
-    let int = int_info(primitive);
-    let value = match *body.expr(expr) {
-        Expr::Paren(inner) => literal_scalar((body, src), inner, primitive)?,
-        Expr::Lit(Lit::Bool(value), _) if primitive == Primitive::Bool => u128::from(value),
-        Expr::Lit(Lit::Int, at) if int.is_some() => parse_int(src.text(at)).ok()?.0,
-        Expr::Lit(Lit::Byte, at) if primitive == Primitive::U8 => u128::from(byte_value(src.text(at)).ok()?),
-        Expr::Lit(Lit::Char, at) if primitive == Primitive::Char => u128::from(u32::from(char_value(src.text(at)).ok()?)),
-        Expr::Unary(UnOp::Neg, inner) if int.is_some_and(|(_, signed)| signed) => literal_scalar((body, src), inner, primitive)?.wrapping_neg(),
-        _ => return None,
-    };
-    Some(int.map_or(value, |(bits, _)| value & mask(bits)))
-}
-
-/// A constant's body, source and inference, from which `write` lays out the bytes of a value made of literals.
-struct Literal<'b> {
-    body: &'b Body,
-    src: &'b Source,
-    typed: &'b Typed,
-}
-
-impl Literal<'_> {
-    /// Writes into `out` at `at` the bytes of `expr`, a value of `ty`, when it is made of integer, `bool` and `char` literals, arrays, repeats, tuples and constructors of them.
-    fn write(&self, cx: &mut Context<'_>, (expr, ty): (ExprId, Ty), at: usize, out: &mut [u8]) -> Option<()> {
-        match (*self.body.expr(expr), cx.types.kind(ty).clone()) {
-            (Expr::Paren(inner), _) => self.write(cx, (inner, ty), at, out),
-            (Expr::Array(list), Kind::Array(elem, _)) => {
-                let stride = cx.layout(elem).ok()?.size.bytes() as usize;
-                self.body.list(list).iter().enumerate().try_for_each(|(index, &item)| self.write(cx, (ExprId(item), elem), at + index * stride, out))
-            }
-            (Expr::Repeat(item, _), Kind::Array(elem, count)) => {
-                let stride = cx.layout(elem).ok()?.size.bytes() as usize;
-                let count = usize::try_from(cx.types.len(count)?).ok()?;
-                if count > 0 {
-                    self.write(cx, (item, elem), at, out)?;
-                }
-                (1..count).for_each(|index| out.copy_within(at..at + stride, at + index * stride));
-                Some(())
-            }
-            (Expr::Tuple(list), Kind::Tuple(items)) => {
-                let layout = cx.layout(ty).ok()?;
-                let items = cx.types.substs(items).to_vec();
-                let fields: Vec<(u32, ExprId)> = self.body.list(list).iter().enumerate().map(|(index, &item)| (index as u32, ExprId(item))).collect();
-                fields.into_iter().try_for_each(|(index, item)| self.write(cx, (item, *items.get(index as usize)?), at + field_offset(&layout, 0, index) as usize, out))
-            }
-            (_, Kind::Adt(item, args)) => self.construct(cx, (expr, ty), (item, args), at, out),
-            (_, Kind::Prim(primitive)) => {
-                let size = match primitive {
-                    Primitive::Bool => 1,
-                    Primitive::Char => 4,
-                    _ => int_info(primitive)?.0 as usize / 8,
-                };
-                let bits = literal_scalar((self.body, self.src), expr, primitive)?;
-                out.get_mut(at..at + size)?.copy_from_slice(&bits.to_le_bytes()[..size]);
-                Some(())
-            }
-            _ => None,
-        }
-    }
-
-    /// The variant `expr` constructs, with each field it gives by index, when it is a unit, tuple or struct constructor with no base.
-    fn constructor(&self, expr: ExprId) -> Option<(u32, Vec<(u32, ExprId)>)> {
-        let variant = |at: ExprId| match self.typed.res.get(&at) {
-            Some(&Res::Ctor(_, variant, _)) => Some(variant),
-            _ => None,
-        };
-        match *self.body.expr(expr) {
-            Expr::Path(_) if !self.typed.coercions.contains_key(&expr) => Some((variant(expr)?, Vec::new())),
-            Expr::Call(callee, args) => Some((variant(callee)?, self.body.list(args).iter().enumerate().map(|(index, &at)| (index as u32, ExprId(at))).collect())),
-            Expr::Struct { fields, base: None, .. } => {
-                let fields = self.body.list(fields).iter().map(|&at| self.body.fields[at as usize].value).map(|value| Some((*self.typed.inits.get(&value)?, value))).collect::<Option<Vec<_>>>()?;
-                Some((variant(expr)?, fields))
-            }
-            _ => None,
-        }
-    }
-
-    /// Writes the fields and the tag of the constructor `expr` of the ADT `item` at `args`, a value of `ty`.
-    fn construct(&self, cx: &mut Context<'_>, (expr, ty): (ExprId, Ty), (item, args): (ItemRef, Substs), at: usize, out: &mut [u8]) -> Option<()> {
-        let (variant, fields) = self.constructor(expr)?;
-        let layout = cx.layout(ty).ok()?;
-        let args = cx.types.substs(args).to_vec();
-        let types = field_types(cx, item, &args).ok()?.get(variant as usize)?.clone();
-        for (index, value) in fields {
-            self.write(cx, (value, *types.get(index as usize)?), at + field_offset(&layout, variant, index) as usize, out)?;
-        }
-        if let Some((offset, tag, bits)) = super::adt::tag_bits(cx, item, &layout, variant).ok()? {
-            let size = tag.bytes() as usize;
-            let start = at + offset as usize;
-            out.get_mut(start..start + size)?.copy_from_slice(&bits.to_le_bytes()[..size]);
-        }
-        Some(())
-    }
-}
-
-/// The bytes of `expr`, a value of `ty` made of literals, when they fit `LITERAL_BYTES`.
-fn literal_bytes(cx: &mut Context<'_>, literal: &Literal<'_>, (expr, ty): (ExprId, Ty)) -> Option<Vec<u8>> {
-    let size = usize::try_from(cx.layout(ty).ok()?.size.bytes()).ok().filter(|size| *size <= LITERAL_BYTES)?;
-    let mut out = vec![0; size];
-    literal.write(cx, (expr, ty), 0, &mut out)?;
-    Some(out)
-}
-
 impl Lower<'_, '_> {
+    /// Whether `expr` evaluates purely to all-zero literal bytes within `LITERAL_BYTES`.
+    pub(super) fn literal_is_zero(&mut self, expr: ExprId) -> Result<bool> {
+        if !self.cx.types.substs(self.reached.list[self.index].0.1).is_empty() {
+            return Ok(false);
+        }
+        let ty = self.ty_of(expr);
+        let (body, src, typed) = (self.body, self.src, self.typed);
+        Ok(self.literal_blob(Scope { body, src, typed }, (expr, ty), 0).is_some_and(|(bytes, relocs)| relocs.is_empty() && bytes.iter().all(|&b| b == 0)))
+    }
+
     /// The value of the constant `item` at `substs` that `expr` reads: an immediate, or bytes laid out once, when its body is literals of a crate that cannot change while haste runs; else a call of its body.
     pub(super) fn constant(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         if let Some(value) = self.literal_constant(expr, item, substs)? {
@@ -286,7 +238,7 @@ impl Lower<'_, '_> {
     }
 
     /// The definition and inference of the constant `item` at `substs` when lowering may read its value from its body: a body that takes no type arguments, of a crate whose sources cannot change while haste runs.
-    fn literal_source(&mut self, item: ItemRef, substs: Substs) -> Result<Option<(ItemRef, std::sync::Arc<Typed>)>> {
+    pub(super) fn literal_source(&mut self, item: ItemRef, substs: Substs) -> Result<Option<(ItemRef, std::sync::Arc<Typed>)>> {
         let index = self.reached_index(item, substs)?;
         let ((source, _), Ok(typed)) = &self.reached.list[index] else { return Ok(None) };
         let env = &self.cx.outline.crates[source.krate as usize].env;
@@ -300,18 +252,27 @@ impl Lower<'_, '_> {
         let ty = typed.ret_ty();
         let body = self.cx.body(source)?;
         let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
-        let literal = Literal { body: &body, src, typed: &typed };
+        let Some((bytes, relocs)) = self.literal_blob(Scope { body: &body, src, typed: &typed }, (root, ty), 0) else { return Ok(None) };
         match repr(self.cx, ty)? {
-            Repr::Scalar(machine) => {
-                let Some(bytes) = literal_bytes(self.cx, &literal, (root, ty)) else { return Ok(None) };
+            Repr::Scalar(machine) if relocs.is_empty() => {
                 let mut word = [0; 16];
                 word[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
                 Ok(Some(self.int_const(machine, u128::from_le_bytes(word))))
             }
-            Repr::Mem { .. } if !self.lent_mutably(expr) => {
-                let Some(bytes) = literal_bytes(self.cx, &literal, (root, ty)) else { return Ok(None) };
-                Ok(Some(self.emit_const_rodata(&bytes)))
+            Repr::Scalar(Type::I64) if bytes.len() == 8 => {
+                if let [RodataReloc { offset: 0, target: RodataTarget::Rodata(child_id) }] = relocs.as_slice() {
+                    Ok(Some(self.emit_symbol(SymbolSource::Rodata(*child_id))))
+                } else {
+                    Ok(None)
+                }
             }
+            Repr::Mem { .. } if bytes.len() == 16 && matches!(relocs.as_slice(), [RodataReloc { offset: 0, .. }]) && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) => {
+                let RodataTarget::Rodata(child_id) = relocs[0].target;
+                let data = self.emit_symbol(SymbolSource::Rodata(child_id));
+                let len = u64::from_le_bytes(bytes[8..].try_into()?);
+                Ok(Some(self.wide_pointer(data, len as i64)))
+            }
+            Repr::Mem { .. } if !self.lent_mutably(expr) => Ok(Some(self.emit_rodata_blob(&bytes, &relocs))),
             _ => Ok(None),
         }
     }
@@ -329,10 +290,9 @@ impl Lower<'_, '_> {
             root = inner;
         }
         let Expr::Ref { mutable: false, raw: false, expr: inner } = *body.expr(root) else { return Ok(None) };
-        let inner_ty = typed.exprs[inner.0 as usize];
-        let literal = Literal { body: &body, src, typed: &typed };
-        let Some(bytes) = literal_bytes(self.cx, &literal, (inner, inner_ty)) else { return Ok(None) };
-        let data = self.emit_const_rodata(&bytes);
+        let inner_ty = typed.expr_ty(&self.cx.types, inner);
+        let Some((bytes, relocs)) = self.literal_blob(Scope { body: &body, src, typed: &typed }, (inner, inner_ty), 0) else { return Ok(None) };
+        let data = self.emit_rodata_blob(&bytes, &relocs);
         Ok(match (self.cx.types.kind(pointee).clone(), self.cx.types.kind(inner_ty).clone()) {
             (Kind::Slice(_), Kind::Array(_, len)) => self.cx.types.len(len).map(|len| self.wide_pointer(data, len as i64)),
             (Kind::Slice(_), _) => None,
@@ -353,17 +313,17 @@ impl Lower<'_, '_> {
             let typed = typed.scoped(&self.cx.types);
             let ty = typed.ret_ty();
             let body = self.cx.body(source)?;
-            if let (Some(root), src) = (body.root, self.cx.body_src(source)) {
-                let literal = Literal { body: &body, src, typed: &typed };
-                if let Some(bytes) = literal_bytes(self.cx, &literal, (root, ty)) {
-                    return Ok(Some(self.emit_const_rodata(&bytes)));
-                }
+            if let (Some(root), src) = (body.root, self.cx.body_src(source))
+                && let Some((bytes, relocs)) = self.literal_blob(Scope { body: &body, src, typed: &typed }, (root, ty), 0)
+            {
+                return Ok(Some(self.emit_rodata_blob(&bytes, &relocs)));
             }
         }
         if !self.lent_mutably(expr) && self.cx.types.substs(self.reached.list[self.index].0.1).is_empty() {
-            let literal = Literal { body: self.body, src: self.src, typed: self.typed };
-            if let Some(bytes) = literal_bytes(self.cx, &literal, (expr, self.ty_of(expr))) {
-                return Ok(Some(self.emit_const_rodata(&bytes)));
+            let ty = self.ty_of(expr);
+            let (body, src, typed) = (self.body, self.src, self.typed);
+            if let Some((bytes, relocs)) = self.literal_blob(Scope { body, src, typed }, (expr, ty), 0) {
+                return Ok(Some(self.emit_rodata_blob(&bytes, &relocs)));
             }
         }
         Ok(None)

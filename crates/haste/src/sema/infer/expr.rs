@@ -41,7 +41,7 @@ impl Infer<'_, '_> {
         let target = self.lower_ty(self.body, ty)?;
         let hint = matches!(self.cx.types.kind(self.resolve(target)), Kind::FnPtr(..)).then_some(target);
         let found = self.expr(inner, hint)?;
-        self.note_cast_pointee(found, target);
+        self.note_cast_pointee(inner, found, target);
         let address = matches!(self.cx.types.kind(self.resolve(target)), Kind::Ptr(..) | Kind::Prim(Primitive::Usize | Primitive::Isize));
         let coercion = match self.cx.types.kind(self.resolve(found)).clone() {
             Kind::FnDef(item, substs) if address => Some(super::coerce::Coercion::Reify(Res::Fn(item, substs))),
@@ -53,24 +53,12 @@ impl Infer<'_, '_> {
         Ok(target)
     }
 
-    /// Notes a cast to `*const _` or `*mut _` from the reference or pointer `found`, whose open pointee takes the pointee of `found` when nothing else fixes it, as the coercion to a raw pointer gives it.
-    fn note_cast_pointee(&mut self, found: Ty, target: Ty) {
+    /// Notes a cast to a raw pointer whose pointee has unresolved inference variables.
+    fn note_cast_pointee(&mut self, inner: ExprId, found: Ty, target: Ty) {
         let Kind::Ptr(_, open) = *self.cx.types.kind(self.resolve(target)) else { return };
-        if let Kind::Var(_) = self.cx.types.kind(self.resolve(open))
-            && let Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) = *self.cx.types.kind(self.resolve(found))
-        {
-            self.casts.push((open, pointee));
+        if self.has_vars(open) {
+            self.casts.push((inner, found, target));
         }
-    }
-
-    /// Gives each cast pointee that is still open the pointee of the value cast.
-    pub(super) fn settle_casts(&mut self) -> Result<()> {
-        for (open, pointee) in std::mem::take(&mut self.casts) {
-            if matches!(self.cx.types.kind(self.resolve(open)), Kind::Var(_)) {
-                self.unify(open, pointee)?;
-            }
-        }
-        Ok(())
     }
 
     fn tuple(&mut self, list: List, expected: Option<Ty>) -> Result<Ty> {
@@ -425,7 +413,7 @@ impl Infer<'_, '_> {
     }
 
     fn call(&mut self, expr: ExprId, (callee, args): (ExprId, List), expected: Option<Ty>) -> Result<Ty> {
-        let found = self.callee(callee)?;
+        let found = self.expr(callee, None)?;
         let callee_ty = self.callee_base(expr, found);
         let (params, ret, def) = match self.cx.types.kind(callee_ty).clone() {
             Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
@@ -433,12 +421,12 @@ impl Infer<'_, '_> {
                 return self.object_call((expr, found), callee_ty, args);
             }
             Kind::FnDef(item, substs) => {
-                if !self.body.names_callee(callee) || !matches!(self.out.res.get(&callee), Some(Res::Fn(..))) {
+                if !self.body.names_callee(callee) || !matches!(self.out.res.get(&callee), Some(Res::Fn(..) | Res::Ctor(..))) {
                     self.out.res.insert(expr, Res::Fn(item, substs));
                 }
                 let slice = self.cx.types.substs(substs).to_vec();
                 let (params, ret) = self.fn_types(item, &slice)?;
-                (params, ret, Some((item, slice)))
+                (params, ret, (!super::adt::is_ctor(self.cx, item)).then_some((item, slice)))
             }
             Kind::FnPtr(params, ret) => (self.cx.types.substs(params).to_vec(), ret, None),
             Kind::Adt(..) => return self.overloaded_call(expr, found, args),
@@ -514,14 +502,6 @@ impl Infer<'_, '_> {
         }
         self.release_obligation(&mut held)?;
         Ok(ret)
-    }
-
-    fn callee(&mut self, callee: ExprId) -> Result<Ty> {
-        let found = self.expr(callee, None)?;
-        if matches!(self.out.res.get(&callee), Some(Res::Ctor(..))) {
-            self.out.coercions.remove(&callee);
-        }
-        Ok(found)
     }
 
     /// How many arguments past its `params` a call of `callee` with `given` arguments passes, which only a C-variadic foreign function takes.

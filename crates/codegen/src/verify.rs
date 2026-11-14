@@ -1,4 +1,4 @@
-use crate::ir::{AbiParam, Binary, Block, Function, Lane, Op, ReduceOp, ShuffleMask, TargetOpId, Type, Unary, Value};
+use crate::ir::{AbiParam, Binary, Block, Convert, Function, Lane, Op, ReduceOp, ShuffleMask, TargetOpId, Type, Unary, Value};
 
 fn value_types<'a>(func: &'a Function, values: &'a [Value]) -> impl Iterator<Item = Type> + 'a {
     values.iter().map(|value| func.ty(*value))
@@ -73,7 +73,15 @@ fn binary(func: &Function, op: Binary, x: Value, y: Value, result: Option<Value>
     }
     let ok = match op {
         Binary::Fadd | Binary::Fsub | Binary::Fmul | Binary::Fdiv | Binary::Fmin | Binary::Fmax | Binary::Fcopysign => is_float_or_vec(tx),
-        Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax => is_int_or_vec(tx),
+        Binary::Smin
+        | Binary::Smax
+        | Binary::Umin
+        | Binary::Umax
+        | Binary::SaddSat
+        | Binary::UaddSat
+        | Binary::SsubSat
+        | Binary::UsubSat
+        | Binary::AvgRound => is_int_or_vec(tx),
         _ => true,
     };
     if !ok {
@@ -106,7 +114,7 @@ fn select_check(func: &Function, cond: Value, x: Value, y: Value, result: Option
 
 fn target_arity(id: TargetOpId) -> usize {
     match id {
-        TargetOpId::Arm64AesMc | TargetOpId::Arm64AesImc | TargetOpId::X64AesImc => 1,
+        TargetOpId::Arm64AesMc | TargetOpId::Arm64AesImc | TargetOpId::X64AesImc | TargetOpId::X64Low128 | TargetOpId::X64High128 | TargetOpId::X64Pmovmskb256 => 1,
         TargetOpId::Arm64Sha256H | TargetOpId::Arm64Sha256H2 | TargetOpId::Arm64Sha256Su1 | TargetOpId::X64Sha256Rnds2 => 3,
         _ => 2,
     }
@@ -209,6 +217,30 @@ fn op(func: &Function, op: &Op, result: Option<Value>) -> Result<(), String> {
         Op::Select(cond, x, y) => select_check(func, *cond, *x, *y, result),
         Op::Unary(kind, x) => unary(func, *kind, *x, result),
         Op::Binary(kind, x, y) => binary(func, *kind, *x, *y, result),
+        Op::Convert(Convert::NarrowSat { .. }, x) => {
+            let src = func.ty(*x);
+            let Some(dst) = result.map(|r| func.ty(r)) else {
+                return Err(String::from("NarrowSat requires a result"));
+            };
+            let ok = if src.is_small_int() && dst.is_small_int() {
+                dst.bytes() < src.bytes()
+            } else if let (Some((sl, sn)), Some((dl, dn))) = (src.vec_shape(), dst.vec_shape()) {
+                sn == dn && sl.is_int() && dl.is_int() && sl.bytes() == 2 * dl.bytes()
+            } else {
+                false
+            };
+            if !ok {
+                return Err(format!("NarrowSat cannot convert {src:?} to {dst:?}"));
+            }
+            Ok(())
+        }
+        Op::Fma(a, b, c) => {
+            let (ta, tb, tc) = (func.ty(*a), func.ty(*b), func.ty(*c));
+            if ta != tb || tb != tc || result.map(|r| func.ty(r)) != Some(ta) || !is_float_or_vec(ta) {
+                return Err(format!("Fma type mismatch: {ta:?}, {tb:?}, {tc:?}"));
+            }
+            Ok(())
+        }
         Op::Icmp(_, x, y) | Op::Fcmp(_, x, y) => {
             let tx = func.ty(*x);
             if tx != func.ty(*y) || result.map(|r| func.ty(r)) != Some(cmp_result_ty(tx)) {
@@ -258,13 +290,13 @@ fn returned(func: &Function, values: &[Value]) -> Result<(), String> {
 }
 
 /// Checks that every instruction agrees with the types of its operands, blocks and signatures, and every block ends with one terminator.
-pub(crate) fn verify(func: &Function) -> Result<(), String> {
+pub(crate) fn verify(func: &Function, target: &crate::Target) -> Result<(), String> {
     let entry = func.entry.ok_or("the function has no entry block")?;
     if !typed(func, &func.blocks[entry.index()].params, &func.signature.params) {
         return Err("the entry block parameters do not match the signature".to_owned());
     }
     for &ty in &func.types {
-        if ty.is_vector() && !ty.is_valid_vec() {
+        if ty.is_vector() && !ty.is_register_vec(target) {
             return Err(format!("invalid vector type {ty:?}"));
         }
     }
