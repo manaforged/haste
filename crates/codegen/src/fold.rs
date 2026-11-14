@@ -161,6 +161,53 @@ pub(crate) fn known_bits(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>
     }
 }
 
+const DEREF_SCAN: usize = 256;
+
+/// Where a value is read: after `prefix` in its block, and below every block that dominates `block`.
+#[derive(Clone, Copy)]
+pub(crate) struct Before<'a> {
+    pub(crate) prefix: &'a [Inst],
+    pub(crate) block: Option<Block>,
+}
+
+impl<'a> Before<'a> {
+    fn insts(self, func: &'a Function) -> impl Iterator<Item = Inst> + 'a {
+        let (mut at, mut cfg) = (self.block, None);
+        let above = std::iter::from_fn(move || {
+            let block = at?;
+            let idom = &cfg.get_or_insert_with(|| func.cfg()).idom;
+            at = idom.get(block.index()).copied().flatten().filter(|parent| *parent != block);
+            at
+        });
+        self.prefix.iter().rev().chain(above.flat_map(move |block| func.blocks[block.index()].insts.iter().rev())).copied().take(DEREF_SCAN)
+    }
+}
+
+/// Whether `v` is a non-null address where `at` reads it: by its definition, or because a load or store that ran before touched a byte range that holds or ends at `v`.
+pub(crate) fn non_null_at(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, known: &dyn Fn(Value) -> Option<i64>, at: Before, v: Value) -> bool {
+    if crate::algebra::is_non_null_addr(func, def_of, known, v, 0) {
+        return true;
+    }
+    if func.ty(v) != Type::I64 {
+        return false;
+    }
+    let (base, disp) = match def_of(v).map(|inst| &func.insts[inst.index()].op) {
+        Some(&Op::Binary(Binary::Iadd, a, b)) => known(b).map(|c| (a, c)).or_else(|| known(a).map(|c| (b, c))).unwrap_or((v, 0)),
+        Some(&Op::Binary(Binary::Isub, a, b)) => known(b).map_or((v, 0), |c| (a, c.wrapping_neg())),
+        _ => (v, 0),
+    };
+    at.insts(func).any(|inst| {
+        let data = &func.insts[inst.index()];
+        let (addr, off, bytes) = match data.op {
+            Op::Load(addr, off) => (addr, off, data.result.map_or(0, |result| func.ty(result).bytes())),
+            Op::Store(value, addr, off) => (addr, off, func.ty(value).bytes()),
+            _ => return false,
+        };
+        let touched = i64::from(off)..=i64::from(off) + i64::from(bytes);
+        bytes != 0 && ((addr == v && touched.contains(&0)) || (addr == base && touched.contains(&disp)))
+    })
+}
+
 pub(super) struct Fold {
     consts: Vec<Option<i64>>,
     subst: Vec<Value>,
@@ -175,10 +222,10 @@ impl Fold {
     fn def_inst(&self, value: Value) -> Option<Inst> { self.defs.get(self.find(value).index()).copied().flatten() }
     fn both(&self, x: Value, y: Value) -> Option<(i64, i64)> { Some((self.known(x)?, self.known(y)?)) }
 
-    fn evaluate(&self, func: &Function, op: &Op, ty: Type) -> Option<i64> {
+    fn evaluate(&self, func: &Function, at: Before, op: &Op, ty: Type) -> Option<i64> {
         evaluate_wrapped(func, op, ty, &|value| self.known(value)).or_else(|| match *op {
             Op::Binary(op, x, y) if ty.is_small_int() => self.absorbed(op, ty, x, y).map(|v| extend(v, ty, true)),
-            Op::Icmp(cc, x, y) => crate::algebra::non_null_cmp(func, &|v| self.def_inst(v), &|v| self.known(v), (cc, x, y)).map(i64::from),
+            Op::Icmp(cc, x, y) => crate::algebra::non_null_cmp(func, &|v| self.def_inst(v), &|v| self.known(v), at, (cc, x, y)).map(i64::from),
             Op::Load(addr, off) if !func.rodata_bytes.is_empty() && ty.is_small_int() => self.rodata_load(func, ty, addr, off),
             _ => None,
         })
@@ -205,8 +252,8 @@ impl Fold {
         None
     }
 
-    fn non_null(&self, func: &Function, value: Value) -> bool {
-        crate::algebra::is_non_null_addr(func, &|v| self.def_inst(v), &|v| self.known(v), value, 0)
+    fn non_null(&self, func: &Function, at: Before, value: Value) -> bool {
+        non_null_at(func, &|v| self.def_inst(v), &|v| self.known(v), at, value)
     }
 
     /// The constant `x op y` of type `ty` gives whatever one operand holds: a product, high product or mask with zero, or the difference or xor of a value with itself.
@@ -353,11 +400,12 @@ impl Fold {
 
     /// Finds, in one pass in block order, the small integers that are constants, wrapped to their type, and the results that equal an existing value.
     fn constants(&mut self, func: &Function) {
-        for inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        for (block, pos, inst) in func.blocks.iter().enumerate().flat_map(|(block, data)| data.insts.iter().enumerate().map(move |(pos, inst)| (block, pos, inst))) {
             let data = &func.insts[inst.index()];
             let Some(result) = data.result.filter(|result| self.subst[result.index()] == *result && self.consts[result.index()].is_none()) else { continue };
             let ty = func.ty(result);
-            if let Some(imm) = self.evaluate(func, &data.op, ty) {
+            let at = Before { prefix: &func.blocks[block].insts[..pos], block: Some(Block(block as u32)) };
+            if let Some(imm) = self.evaluate(func, at, &data.op, ty) {
                 self.consts[result.index()] = Some(imm);
             } else if let Some(value) = self.identity(func, &data.op, ty) {
                 self.subst[result.index()] = value;
@@ -365,8 +413,9 @@ impl Fold {
         }
     }
 
-    /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, drops traps that cannot fire, rewrites always-firing traps to `Op::Trap`, and truncates after `Op::Trap`.
+    /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, branches on the condition of a select between zero and a non-zero value, drops traps that cannot fire, rewrites always-firing traps to `Op::Trap`, and truncates after `Op::Trap`.
     fn branches(&self, func: &mut Function) -> bool {
+        func.bump_cfg();
         let mut changed = false;
         for block in 0..func.blocks.len() {
             let mut trapped = false;
@@ -379,7 +428,7 @@ impl Fold {
                             trapped = extend(k, func.types[x.index()], false) == 0;
                             func.insts[inst.index()].op = Op::Trap; changed = true; return trapped;
                         }
-                        if self.non_null(func, x) { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
+                        if self.non_null(func, Before { prefix: &[], block: None }, x) { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
                         true
                     }
                     Op::Trap => { trapped = true; true }
@@ -387,25 +436,33 @@ impl Fold {
                 }
             });
             func.blocks[block].insts = keep;
-            let Some(&last) = func.blocks[block].insts.last() else { continue };
-            let invert = match func.insts[last.index()].op {
+            let Some((&last, prefix)) = func.blocks[block].insts.split_last() else { continue };
+            let at = Before { prefix, block: Some(Block(block as u32)) };
+            let through = match func.insts[last.index()].op {
                 Op::Brif(cond, ..) if self.known(cond).is_none() => match self.def(func, cond) {
                     Some(&Op::Binary(Binary::Bxor, a, b)) => [(a, b), (b, a)].into_iter().find_map(|(inner, one)| {
-                        (func.ty(inner) == Type::I8 && self.boolean(func, inner) && self.known(one).is_some_and(|imm| extend(imm, Type::I8, false) == 1)).then_some(inner)
+                        (func.ty(inner) == Type::I8 && self.boolean(func, inner) && self.known(one).is_some_and(|imm| extend(imm, Type::I8, false) == 1)).then_some((inner, true))
                     }),
+                    Some(&Op::Select(inner, x, y)) if func.ty(inner).is_small_int() && func.ty(cond).is_small_int() => {
+                        let zero = |v: Value| self.known(v).is_some_and(|imm| extend(imm, func.ty(v), false) == 0);
+                        let set = |v: Value| self.known(v).map_or_else(|| self.non_null(func, at, v), |imm| extend(imm, func.ty(v), false) != 0);
+                        if zero(y) && set(x) { Some((inner, false)) } else if zero(x) && set(y) { Some((inner, true)) } else { None }
+                    }
                     _ => None,
                 },
                 _ => None,
             };
-            if let Some(inner) = invert
+            let non_null_br = through.is_none() && matches!(func.insts[last.index()].op, Op::Brif(cond, ..) if self.non_null(func, at, cond));
+            if let Some((inner, swap)) = through
                 && let Op::Brif(cond, then, then_args, otherwise, else_args) = &mut func.insts[last.index()].op
             {
                 *cond = inner;
-                std::mem::swap(then, otherwise);
-                std::mem::swap(then_args, else_args);
+                if swap {
+                    std::mem::swap(then, otherwise);
+                    std::mem::swap(then_args, else_args);
+                }
                 changed = true;
             }
-            let non_null_br = matches!(func.insts[last.index()].op, Op::Brif(cond, ..) if self.non_null(func, cond));
             changed |= self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op);
         }
         changed

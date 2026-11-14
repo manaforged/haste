@@ -427,10 +427,23 @@ impl Lower<'_, '_> {
         Ok(slot.map(|slot| self.read(Place::slot(slot, whole))).flatten())
     }
 
-    /// Lowers `&inner` to the address of `inner`'s place.
-    pub fn reference(&mut self, inner: ExprId) -> Result<Option<Value>> {
+    /// Lowers `&inner` to the address of `inner`'s place, and tells the optimizer that a reference made from a raw pointer is not null unless the borrow is `raw`.
+    pub fn reference(&mut self, inner: ExprId, raw: bool) -> Result<Option<Value>> {
         let place = self.place_or_temp(inner)?;
-        self.address_or_dangling(place, self.ty_of(inner)).map(Some)
+        let ty = self.ty_of(inner);
+        let address = self.address_or_dangling(place, ty)?;
+        if !raw && place.is_some() && self.derefs_raw(inner) {
+            let pointer = if self.cx.is_unsized(ty)? { self.ins().load(Type::I64, address, 0) } else { address };
+            self.ins().assume(pointer);
+        }
+        Ok(Some(address))
+    }
+
+    fn derefs_raw(&self, expr: ExprId) -> bool {
+        match *self.body.expr(expr) {
+            Expr::Unary(UnOp::Deref, operand) => self.typed.derefs.get(&(expr, 0)).is_none() && matches!(self.cx.types.kind(self.ty_of(operand)), Kind::Ptr(..)),
+            _ => self.transparent(expr).is_some_and(|inner| self.derefs_raw(inner)),
+        }
     }
 
     /// The address of `place`, or for a value with no bytes the alignment of `ty` as a dangling address.

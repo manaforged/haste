@@ -243,7 +243,7 @@ impl Lower<'_, '_> {
                 Some(addr) => Ok(Some(addr)),
                 None => self.promoted(inner),
             },
-            Expr::Ref { expr: inner, .. } => self.reference(inner),
+            Expr::Ref { expr: inner, raw, .. } => self.reference(inner, raw),
             Expr::TupleField(..) => self.field_value(expr),
             _ => self.flow(expr),
         }

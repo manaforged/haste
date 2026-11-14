@@ -1,5 +1,5 @@
 use crate::cse::flip_int_cc;
-use crate::fold::{extend, holds, known_bits};
+use crate::fold::{Before, extend, holds, known_bits, non_null_at};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
 use super::RewriteCx;
@@ -61,32 +61,33 @@ pub(crate) fn is_non_null_addr(
     }
 }
 
-/// Folds `Icmp(cc, x, y)` against `0` or `1` when one side is a non-null address.
+fn null_test(cc: IntCC, ty: Type, k: i64) -> Option<bool> {
+    match (cc, extend(k, ty, false) as u64) {
+        (IntCC::Equal, 0) | (IntCC::UnsignedLessThanOrEqual, 0) | (IntCC::UnsignedLessThan, 1) => Some(false),
+        (IntCC::NotEqual, 0) | (IntCC::UnsignedGreaterThan, 0) | (IntCC::UnsignedGreaterThanOrEqual, 1) => Some(true),
+        _ => None,
+    }
+}
+
+fn before<'a>(cx: &'a RewriteCx) -> Before<'a> {
+    Before { prefix: &cx.out, block: None }
+}
+
+/// Folds `Icmp(cc, x, y)` against `0` or `1` when one side is a non-null address where `at` reads it.
 pub(crate) fn non_null_cmp(
     func: &Function,
     def_of: &dyn Fn(Value) -> Option<Inst>,
     known: &dyn Fn(Value) -> Option<i64>,
+    at: Before,
     (cc, x, y): (IntCC, Value, Value),
 ) -> Option<bool> {
     let ty = func.ty(x);
     if !ty.is_small_int() || ty.bits() < 32 {
         return None;
     }
-    for (norm, val, rhs) in [(cc, x, y), (crate::cse::flip_int_cc(cc), y, x)] {
-        let Some(imm) = known(rhs) else { continue };
-        let u = extend(imm, ty, false) as u64;
-        if !is_non_null_addr(func, def_of, known, val, 0) {
-            continue;
-        }
-        match (norm, u) {
-            (IntCC::Equal, 0) | (IntCC::UnsignedLessThanOrEqual, 0) | (IntCC::UnsignedLessThan, 1) => return Some(false),
-            (IntCC::NotEqual, 0) | (IntCC::UnsignedGreaterThan, 0) | (IntCC::UnsignedGreaterThanOrEqual, 1) => {
-                return Some(true);
-            }
-            _ => {}
-        }
-    }
-    None
+    [(cc, x, y), (flip_int_cc(cc), y, x)].into_iter().find_map(|(norm, val, rhs)| {
+        null_test(norm, ty, known(rhs)?).filter(|_| non_null_at(func, def_of, known, at, val))
+    })
 }
 
 fn apply_step(c: i64, step: Step) -> i64 {
@@ -173,16 +174,10 @@ fn leaf_holds(cx: &RewriteCx, v: Value, steps: &[Step], cmp: Cmp) -> Option<bool
     }
     let ty = cx.func.ty(v);
     if steps_preserve_non_null(ty, steps)
-        && is_non_null_addr(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), v, 0)
+        && let Some(bit) = null_test(cmp.cc, cmp.ty, cmp.k)
+        && non_null_at(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), before(cx), v)
     {
-        let u = extend(cmp.k, cmp.ty, false) as u64;
-        match (cmp.cc, u) {
-            (IntCC::Equal, 0) | (IntCC::UnsignedLessThanOrEqual, 0) | (IntCC::UnsignedLessThan, 1) => return Some(false),
-            (IntCC::NotEqual, 0) | (IntCC::UnsignedGreaterThan, 0) | (IntCC::UnsignedGreaterThanOrEqual, 1) => {
-                return Some(true);
-            }
-            _ => {}
-        }
+        return Some(bit);
     }
     if matches!(cmp.cc, IntCC::Equal | IntCC::NotEqual) {
         let mut bits = known_bits(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), v, 0);
@@ -374,7 +369,7 @@ pub(super) fn eval_select(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: 
     if !cx.func.ty(x).is_small_int() || !res.is_some_and(|r| cx.func.ty(r) == Type::I8) {
         return None;
     }
-    if let Some(bit) = non_null_cmp(cx.func, &|v| cx.def(v), &|v| cx.sconst(v), (cc, x, y)) {
+    if let Some(bit) = non_null_cmp(cx.func, &|v| cx.def(v), &|v| cx.sconst(v), before(cx), (cc, x, y)) {
         return Some(Some(Op::Const(i64::from(bit))));
     }
     if let Some(op) = ord::eval_three_way(cx, cc, x, y).or_else(|| ord::eval_unary_cmp(cx, cc, x, y)) {
