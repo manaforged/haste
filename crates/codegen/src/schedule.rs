@@ -192,6 +192,24 @@ fn strip_assumes(func: &mut Function) -> bool {
     stripped
 }
 
+/// Moves each compare read only by the `Brif` of its own block to sit directly before that branch.
+pub(crate) fn sink_compares(func: &mut Function) {
+    let uses = func.use_counts();
+    for block in &mut func.blocks {
+        let len = block.insts.len();
+        if len < 2 { continue; }
+        let Op::Brif(cond, ..) = func.insts[block.insts[len - 1].index()].op else { continue };
+        if uses[cond.index()] != 1 { continue; }
+        if let Some(cpos) = block.insts[..len - 1].iter().rposition(|&inst| {
+            let d = &func.insts[inst.index()];
+            d.result == Some(cond) && matches!(d.op, Op::Icmp(..) | Op::Fcmp(..))
+        }) && cpos + 1 < len - 1 {
+            let cinst = block.insts.remove(cpos);
+            block.insts.insert(len - 2, cinst);
+        }
+    }
+}
+
 pub(crate) fn run(func: &mut Function, moves: promote::Moves, effort: Effort) {
     let plan = match effort {
         Effort::Quick => Plan {
@@ -219,4 +237,5 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, effort: Effort) {
     for &pass in plan.finish {
         run_pass(func, pass, plan.moves, plan.effort);
     }
+    sink_compares(func);
 }

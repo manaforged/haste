@@ -333,7 +333,7 @@ pub(crate) fn invert(func: &mut Function) {
         let res = func.insts[inst.index()].result;
         invert_inst(&mut func.insts[inst.index()].op, res, &facts, &func.types);
     }
-    sink_brif_cmp(func);
+    crate::schedule::sink_compares(func);
 }
 
 fn xor_ne_pair(func: &Function, facts: &BoolFacts, x: Value, y: Value, allow_const: bool) -> Option<(Value, Value)> {
@@ -393,23 +393,6 @@ pub(crate) fn fold_bxor_conds(func: &mut Function) -> bool {
         for inst in insts { changed |= fold_bxor_select(func, &facts, &mut out, inst) || fold_bxor_brif(func, &facts, &mut out, inst); out.push(inst); }
         func.blocks[b_idx].insts = out;
     }
-    if changed { sink_brif_cmp(func); }
+    if changed { crate::schedule::sink_compares(func); }
     changed
-}
-
-fn sink_brif_cmp(func: &mut Function) {
-    let uses = func.use_counts();
-    for block in &mut func.blocks {
-        let len = block.insts.len();
-        if len < 2 { continue; }
-        let Op::Brif(cond, ..) = func.insts[block.insts[len - 1].index()].op else { continue };
-        if uses[cond.index()] != 1 { continue; }
-        if let Some(cpos) = block.insts[..len - 1].iter().rposition(|&inst| {
-            let d = &func.insts[inst.index()];
-            d.result == Some(cond) && matches!(d.op, Op::Icmp(..) | Op::Fcmp(..))
-        }) && cpos + 1 < len - 1 {
-            let cinst = block.insts.remove(cpos);
-            block.insts.insert(len - 2, cinst);
-        }
-    }
 }
