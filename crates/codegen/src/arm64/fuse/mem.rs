@@ -75,8 +75,14 @@ pub(super) fn try_fuse_sib(
             && let Some((Binary::Ishl, mid, shift)) = shift_parts(&func.insts[sinst.index()].op, plan)
             && (1..=3).contains(&shift)
         {
-            let (idx, idx_pos, uext) = unwrap_uext(plan, mid, spos);
-            if try_sib(plan, base, idx, shift, idx_pos, [Some(rhs), uext]) {
+            let (idx, idx_pos, uext) = if uses[rhs.index()] == 1 && !plan.elided[rhs.index()] {
+                unwrap_uext(plan, mid, spos)
+            } else {
+                (mid, spos, None)
+            };
+            if try_sib(plan, base, idx, shift, idx_pos, [Some(rhs), uext])
+                || (uext.is_some() && try_sib(plan, base, mid, shift, spos, [Some(rhs), None]))
+            {
                 return true;
             }
         }

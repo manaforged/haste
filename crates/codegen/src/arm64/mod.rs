@@ -40,7 +40,7 @@ fn arm64_uses_scratch(func: &Function, op: &Op) -> bool {
         Op::Fits(Binary::Imul, _, x, _) => func.ty(*x) == Type::I64,
         Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, x, _) => func.ty(*x).bits() < 32,
         Op::Binary(Binary::AvgRound | Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat, ..) | Op::Convert(Convert::NarrowSat { .. }, _) | Op::Reduce(ReduceOp::Movemask, _) => true,
-        Op::Binary(Binary::Imul, x, _) => matches!(func.ty(*x), Type::Vec { lane: Lane::I64, count: 2 }),
+        Op::Binary(Binary::Imul, x, _) => matches!(func.ty(*x), Type::Vec { lane: Lane::I64, count: 2 | 4 }),
         _ => false,
     }
 }
@@ -504,7 +504,10 @@ impl Emit<'_> {
         let float_targets: Vec<(Value, u8)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Float(v) = loc { Some((val, v)) } else { None }).collect();
         for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
             match step {
-                ArgStep::Move(src, dst) => self.asm.vmov(Vreg(dst), Vreg(src)),
+                ArgStep::Move(src, dst) => {
+                    self.asm.vmov(Vreg(dst), Vreg(src));
+                    self.clobber_vreg(Vreg(dst));
+                }
                 ArgStep::Save(src) => {
                     self.asm.add_imm(true, false, Size::X, SP, SP, 16);
                     self.sp_bias += 16;
@@ -514,6 +517,7 @@ impl Emit<'_> {
                     self.asm.vload(16, Vreg(dst), Mem::new(SP, 0));
                     self.asm.add_imm(false, false, Size::X, SP, SP, 16);
                     self.sp_bias -= 16;
+                    self.clobber_vreg(Vreg(dst));
                 }
                 ArgStep::Load(val, dst) => self.fget(Vreg(dst), val),
             }
@@ -522,9 +526,18 @@ impl Emit<'_> {
         int_targets.extend(extra);
         for step in arg_steps(&int_targets, |v| self.plan.reg_of(v)) {
             match step {
-                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
-                ArgStep::Save(src) => self.asm.mov(A, src),
-                ArgStep::Restore(dst) => self.asm.mov(dst, A),
+                ArgStep::Move(src, dst) => {
+                    self.asm.mov(dst, src);
+                    self.clobber_reg(dst);
+                }
+                ArgStep::Save(src) => {
+                    self.asm.mov(A, src);
+                    self.clobber_reg(A);
+                }
+                ArgStep::Restore(dst) => {
+                    self.asm.mov(dst, A);
+                    self.clobber_reg(dst);
+                }
                 ArgStep::Load(val, dst) => self.raw(dst, val),
             }
         }
@@ -534,6 +547,7 @@ impl Emit<'_> {
                 self.high(high, val);
             }
         }
+        self.invalidate_spills();
     }
 
     fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {

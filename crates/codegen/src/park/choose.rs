@@ -21,7 +21,7 @@ fn pick_slot<F: Copy + PartialEq>(
         .filter(|&s| {
             pred(s)
                 && (allow_reserved || !reserved.contains(&pool.regs[s]))
-                && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, pool.regs[s], kept_reg)
+                && slot_free(pool, s, &holders[s], live, ranges, start, kept_reg)
         })
         .min_by_key(|&s| (tier(s), !free(s), holders[s].is_empty(), s))
 }
@@ -45,7 +45,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
     if let Some(reg) = kept_reg
         && let Some(s) = pool.regs.iter().position(|r| *r == reg)
         && suits_any(s)
-        && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, reg, kept_reg)
+        && slot_free(pool, s, &holders[s], live, ranges, start, kept_reg)
     {
         return Some(s);
     }
@@ -55,7 +55,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         }
         let s = pool.regs.iter().position(|r| *r == reg)?;
         let ok = if needs_saved { (pool.is_saved[s] || (can_park && !has_free_saved)) && !wide_val } else { !pool.is_saved[s] || (!wide_val && slot_used(s)) };
-        (ok && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, reg, kept_reg)).then_some(s)
+        (ok && slot_free(pool, s, &holders[s], live, ranges, start, kept_reg)).then_some(s)
     };
     let try_partner = |p: usize, check_reserved: bool| homes[p].and_then(|reg| can_use(reg, check_reserved));
     if let Some(s) = back_partners.iter().find_map(|&p| try_partner(p, false)) {
@@ -90,7 +90,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         .filter_map(unalloc_info)
         .collect();
     let p_fits = |&(p, p_saved, p_start): &(usize, bool, u32), s: usize| {
-        (!p_saved || wide_val || pool.is_saved[s]) && slot_free(&holders[s], live, live.ranges_of(p), pool.arrival_lock[s], p_start, pool.regs[s], pool.kept[p])
+        (!p_saved || wide_val || pool.is_saved[s]) && slot_free(pool, s, &holders[s], live, live.ranges_of(p), p_start, pool.kept[p])
     };
     let all_fit = |list: &[(usize, bool, u32)], s: usize| list.iter().all(|info| p_fits(info, s));
     let compat_back = |s: usize| all_fit(&unalloc_back, s);
@@ -100,7 +100,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         let Some(reg) = homes[op.index()] else { continue };
         let Some(s) = pool.regs.iter().position(|r| *r == reg) else { continue };
         let suits_reuse = if has_free_saved { suits_direct(s) } else { suits_any(s) };
-        if suits_reuse && (hints.two_address || compat_back(s)) && !reserved.contains(&reg) && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, reg, kept_reg) {
+        if suits_reuse && (hints.two_address || compat_back(s)) && !reserved.contains(&reg) && slot_free(pool, s, &holders[s], live, ranges, start, kept_reg) {
             return Some(s);
         }
     }
@@ -114,10 +114,11 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         let call_at = end + 1;
         let plain_call = live.calls.binary_search(&call_at).is_ok() && live.unwinds.binary_search(&call_at).is_err();
         if (!at_call_end || plain_call)
+            && !live.trapped[value]
             && !crosses_ranges(&live.calls, ranges)
             && !reserved.contains(&reg)
             && let Some(s) = pool.regs.iter().position(|r| *r == reg)
-            && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, reg, kept_reg)
+            && slot_free(pool, s, &holders[s], live, ranges, start, kept_reg)
         {
             return Some(s);
         }
