@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{IntCC, Type, Value};
+use haste_codegen::{IntCC, StackSlot, Type, Value};
 use rustc_abi::{FieldsShape, Primitive, TagEncoding, Variants};
 use rustc_index::Idx;
 
@@ -16,7 +16,7 @@ use crate::sema::ty::{Kind, Ty, int_info, mask};
 
 use super::ops::{Num, parse_float};
 use super::place::{Base, Place};
-use super::{Lower, Repr, repr};
+use super::{Lower, Parts, Repr, repr};
 
 const CONST_RODATA_MAX_BYTES: usize = 1 << 21;
 const CONST_RODATA_MAX_DEPTH: u32 = 16;
@@ -90,6 +90,9 @@ impl Lower<'_, '_> {
         let slice = self.cx.types.substs(args).to_vec();
         let all = field_types(self.cx, item, &slice)?;
         let types = &all[variant as usize];
+        if base.is_none() && self.try_construct_simd(slot, whole, &layout, types, &fields)? {
+            return Ok(self.read(place));
+        }
         for (index, value) in fields {
             let Some(&field_ty) = types.get(index as usize) else { bail!("variant {variant} of {} has no field {index}", self.cx.name(item)) };
             let field = repr(self.cx, field_ty)?;
@@ -99,6 +102,48 @@ impl Lower<'_, '_> {
         }
         self.set_tag(place, item, &layout, variant)?;
         Ok(self.read(place))
+    }
+
+    fn try_construct_simd(&mut self, slot: StackSlot, whole: Repr, layout: &Layout, types: &[Ty], fields: &[(u32, Option<Value>)]) -> Result<bool> {
+        let Repr::Mem { size, parts: Parts::One(vec_ty @ Type::Vec { lane, count }), .. } = whole else {
+            return Ok(false);
+        };
+        if !matches!(layout.variants, Variants::Single { .. }) {
+            return Ok(false);
+        }
+        let n = usize::from(count);
+        if types.len() == 1
+            && let [(0, Some(addr))] = fields
+            && matches!(*self.cx.types.kind(types[0]), Kind::Array(..))
+            && matches!(repr(self.cx, types[0])?, Repr::Mem { size: field_size, .. } if field_size == size)
+        {
+            let vec = self.ins().load(vec_ty, *addr, 0);
+            self.ins().stack_store(vec, slot, 0);
+            return Ok(true);
+        }
+        if types.len() == n && fields.len() == n {
+            let mut lanes = vec![None; n];
+            for &(index, value) in fields {
+                let Some(&field_ty) = types.get(index as usize) else { return Ok(false) };
+                if !matches!(repr(self.cx, field_ty)?, Repr::Scalar(ty) if ty == lane.to_type()) {
+                    return Ok(false);
+                }
+                lanes[index as usize] = value;
+            }
+            if let Some(first) = lanes.first().copied().flatten()
+                && lanes[1..].iter().all(Option::is_some)
+            {
+                let mut vec = self.ins().splat(vec_ty, first);
+                for (i, lane_val) in lanes.into_iter().enumerate().skip(1) {
+                    if let Some(val) = lane_val {
+                        vec = self.ins().insert(vec, val, i as u8);
+                    }
+                }
+                self.ins().stack_store(vec, slot, 0);
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn set_tag(&mut self, place: Place, item: ItemRef, layout: &Layout, variant: u32) -> Result<()> {

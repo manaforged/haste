@@ -47,15 +47,19 @@ pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
     Ok(sig)
 }
 
+fn sret_param(size: u32) -> AbiParam {
+    AbiParam::special(Type::I64, ArgumentPurpose::StructReturn).with_noalias().with_deref_size(size)
+}
+
 /// The native signature of a function that returns `ret` and takes `params`.
 pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIterator<Item = Ty>) -> Result<Signature> {
     let mut signature = Signature::new(CallConv::Internal);
     if let Some(ret) = ret {
         match repr(cx, ret)? {
             Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
-            Repr::Mem { .. } => match passed_parts(cx, ret)? {
+            Repr::Mem { size, .. } => match passed_parts(cx, ret)? {
                 Some(parts) => signature.returns.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
-                None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn).with_noalias()),
+                None => signature.params.push(sret_param(size)),
             },
             Repr::Zst => {}
         }
@@ -499,7 +503,12 @@ impl Lower<'_, '_> {
         let ret_repr = repr(self.cx, ret_ty)?;
         let slot = self.slot(ret_repr);
         if let Some(slot) = slot {
-            signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn).with_noalias());
+            let size = match ret_repr {
+                Repr::Mem { size, .. } => size,
+                Repr::Scalar(ty) => ty.bytes(),
+                Repr::Zst => 0,
+            };
+            signature.params.push(sret_param(size));
             args.push(self.ins().stack_addr(Type::I64, slot, 0));
         }
         Ok(slot)

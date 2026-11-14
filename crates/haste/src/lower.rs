@@ -190,7 +190,7 @@ pub fn passed_parts(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Parts>> {
         Repr::Mem { parts: parts @ Parts::One(_), .. } => Some(parts),
         Repr::Mem { parts: parts @ Parts::Pair(first, second, _), .. } if first != Type::I128 && second != Type::I128 => Some(parts),
         Repr::Mem { parts: parts @ Parts::Words(..), .. } if !is_repr_c(cx, ty) => Some(parts),
-        Repr::Mem { size, parts: Parts::Bytes, .. } if !is_repr_c(cx, ty) => match abi::packed_word_parts(size) {
+        Repr::Mem { size, parts: Parts::Bytes | Parts::Pair(..), .. } if !is_repr_c(cx, ty) => match abi::packed_word_parts(size) {
             Parts::Bytes => None,
             parts => Some(parts),
         },

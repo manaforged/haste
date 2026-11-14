@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
-use rustc_abi::{Align, Integer, IntegerType, LayoutCalculator, NicheOptimizations, ReprFlags, ReprOptions, TargetDataLayout};
-use rustc_index::IndexVec;
+use anyhow::{Result, anyhow, bail};
+use rustc_abi::{Align, FieldsShape, Integer, IntegerType, LayoutCalculator, NicheOptimizations, ReprFlags, ReprOptions, TargetDataLayout};
+use rustc_index::{Idx, IndexVec};
 
 use crate::names::{ItemRef, Primitive};
 use crate::outline::attr::{repr_words, split_commas};
@@ -12,6 +12,7 @@ use crate::outline::source::Source;
 use super::Context;
 use super::infer::field_types;
 use super::layout::{Field, Layout, Variant};
+use super::ty::Kind;
 
 const REPR_INTS: [(&str, Primitive); 12] = {
     use Primitive::*;
@@ -120,6 +121,23 @@ impl<'a> Context<'a> {
         let calc = LayoutCalculator::new(dl);
         let repr = self.repr(item);
         let kind = self.item(item).1.kind;
+        if repr.simd() && kind == ItemKind::Struct && fields.len() == 1 && !fields[0].is_empty() {
+            if fields[0].len() == 1
+                && let Kind::Array(elem_ty, len_ty) = *self.types.kind(fields[0][0])
+            {
+                let elt_layout = self.layout(elem_ty)?;
+                let Some(count) = self.types.len(len_ty) else { bail!("simd array {} has unknown length", self.name(item)) };
+                return calc.layout_of_simd_type(elt_layout, count, repr.packed()).map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)));
+            }
+            let k = fields[0].len();
+            let elt_layout = &layouts[0][0];
+            let mut out = calc.layout_of_simd_type(elt_layout, k as u64, repr.packed()).map_err(|error| anyhow!("layout of {}: {error:?}", self.name(item)))?;
+            out.fields = FieldsShape::Arbitrary {
+                offsets: (0..k).map(|i| elt_layout.size * (i as u64)).collect(),
+                in_memory_order: (0..k).map(Field::new).collect(),
+            };
+            return Ok(out);
+        }
         let result = match kind {
             ItemKind::Union => calc.layout_of_union(&repr, &variants),
             _ => {
@@ -139,6 +157,7 @@ fn read_repr_words(src: &Source, words: Vec<u32>, repr: &mut ReprOptions) {
     for from in words {
         match src.text(from) {
             "C" => repr.flags |= ReprFlags::IS_C,
+            "simd" => repr.flags |= ReprFlags::IS_SIMD,
             "transparent" => repr.flags |= ReprFlags::IS_TRANSPARENT,
             "packed" => repr.pack = Some(repr_align(src, from).unwrap_or(Align::ONE)),
             "align" => repr.align = repr_align(src, from).or(repr.align),
