@@ -103,8 +103,14 @@ pub(super) fn vec_identity(fold: &Fold, func: &Function, op: &Op) -> Option<Valu
     }
 }
 
-pub(super) fn vec_zero_fold(func: &Function, fold: &Fold, op: &Op) -> Option<Op> {
+pub(super) fn vec_zero_fold(func: &Function, fold: &Fold, op: &Op, res: Option<Value>) -> Option<Op> {
     match *op {
+        Op::Convert(Convert::Bitcast, x) => match (res.map(|r| func.ty(r)), fold.def(func, x)) {
+            (Some(ty), Some(&Op::Convert(Convert::Bitcast, v))) if func.ty(fold.find(v)) != ty => {
+                Some(Op::Convert(Convert::Bitcast, fold.find(v)))
+            }
+            _ => None,
+        },
         Op::Shuffle(a, b, ShuffleMask::Const(mask)) => {
             let count = func.ty(a).vec_shape()?.1;
             let (za, zb) = (is_zero_bits(func, fold, a), is_zero_bits(func, fold, b));

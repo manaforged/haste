@@ -4,9 +4,6 @@ use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
 
-/// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
-const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
-
 pub(super) fn cond(cc: IntCC) -> Cond {
     match cc {
         IntCC::Equal => Cond::E,
@@ -66,67 +63,79 @@ impl Emit<'_> {
             self.invalidate_spills();
             return res;
         }
-        self.int_unary(op, x, ty.bits() as u8)?;
-        self.put(result, Reg::Rax);
+        let dst = self.dst(result);
+        let reg = self.int_unary(op, x, ty.bits() as u8, dst)?;
+        self.put(result, reg);
         Ok(())
     }
 
-    fn int_unary(&mut self, op: Unary, x: Value, bits: u8) -> Result<(), String> {
+    fn int_unary(&mut self, op: Unary, x: Value, bits: u8, dst: Reg) -> Result<Reg, String> {
         match op {
             Unary::Ineg | Unary::Bnot => {
-                self.raw(Reg::Rax, x);
-                self.asm.group3(if op == Unary::Ineg { Group3::Neg } else { Group3::Not }, Reg::Rax);
+                self.raw(dst, x);
+                self.asm.group3(if op == Unary::Ineg { Group3::Neg } else { Group3::Not }, dst);
             }
-            Unary::Bswap => self.swap_bytes(x, bits),
+            Unary::Bswap => {
+                self.raw(dst, x);
+                match bits {
+                    16 => self.asm.shift_imm(Size::W, Shift::Rol, dst, 8),
+                    32 => self.asm.bswap(Size::D, dst),
+                    64 => self.asm.bswap(Size::Q, dst),
+                    _ => {}
+                }
+            }
             Unary::Bitrev => {
                 self.raw(Reg::Rax, x);
                 self.reverse_bits();
                 if bits < 64 {
                     self.asm.shift_imm(Size::Q, Shift::Shr, Reg::Rax, 64 - bits);
                 }
+                return Ok(Reg::Rax);
             }
-            Unary::Clz => {
-                self.get(Reg::Rax, x, Ext::Zero);
-                self.count(Count::Lzcnt, Reg::Rax, Reg::Rax);
-                if bits < 64 {
-                    self.asm.alu_imm(Alu::Sub, Reg::Rax, i32::from(64 - bits));
-                }
-            }
-            Unary::Ctz => {
-                self.raw(Reg::Rax, x);
-                if bits < 64 {
-                    self.asm.bts(Reg::Rax, bits);
-                }
-                self.count(Count::Tzcnt, Reg::Rax, Reg::Rax);
-            }
-            Unary::Popcnt => {
-                self.get(Reg::Rax, x, Ext::Zero);
-                self.count(Count::Popcnt, Reg::Rax, Reg::Rax);
+            Unary::Clz | Unary::Ctz | Unary::Popcnt => {
+                let (count, fast) = match op {
+                    Unary::Clz => (Count::Lzcnt, self.features.lzcnt),
+                    Unary::Ctz => (Count::Tzcnt, self.features.bmi1),
+                    _ => (Count::Popcnt, self.features.popcnt),
+                };
+                self.unary_count(count, fast, bits, x, dst);
             }
             other => return Err(format!("{other:?} of an integer")),
         }
-        Ok(())
+        Ok(dst)
     }
 
-    fn swap_bytes(&mut self, x: Value, bits: u8) {
-        self.raw(Reg::Rax, x);
-        match bits {
-            16 => self.asm.shift_imm(Size::W, Shift::Rol, Reg::Rax, 8),
-            32 => self.asm.bswap(Size::D, Reg::Rax),
-            64 => self.asm.bswap(Size::Q, Reg::Rax),
-            _ => {}
+    fn unary_count(&mut self, op: Count, fast: bool, bits: u8, x: Value, dst: Reg) {
+        if fast && bits >= 32 {
+            let src = self.operand(x);
+            return self.asm.count(op, if bits == 32 { Size::D } else { Size::Q }, dst, src);
+        }
+        if op == Count::Tzcnt && bits == 64 {
+            let src = self.operand(x);
+            return self.count(op, dst, src);
+        }
+        if op == Count::Tzcnt {
+            self.raw(dst, x);
+            self.asm.bts(dst, bits);
+        } else {
+            self.get(dst, x, Ext::Zero);
+        }
+        self.count(op, dst, dst);
+        if op == Count::Lzcnt && bits < 64 {
+            self.asm.alu_imm(Alu::Sub, dst, i32::from(64 - bits));
         }
     }
 
     /// `op` of the 64 bits of `src` into `dst`, with 64 leading or trailing zeros for zero; without the host instruction it uses r11 and rsi, where no value lives.
-    pub(super) fn count(&mut self, op: Count, dst: Reg, src: Reg) {
+    pub(super) fn count(&mut self, op: Count, dst: Reg, src: impl Into<Rm>) {
+        let src = src.into();
         let fast = match op {
             Count::Lzcnt => self.features.lzcnt,
             Count::Tzcnt => self.features.bmi1,
             Count::Popcnt => self.features.popcnt,
         };
         if fast {
-            return self.asm.count(op, dst, src);
+            return self.asm.count(op, Size::Q, dst, src);
         }
         let reverse = match op {
             Count::Popcnt => return self.popcount(dst, src),
@@ -140,41 +149,6 @@ impl Emit<'_> {
             self.asm.alu_imm(Alu::Xor, dst, 63);
         }
         self.clobber_regs(&[dst, Reg::R11]);
-    }
-
-    /// Counts the set bits of `src` into `dst` by summing ever wider fields, using r11 and rsi.
-    fn popcount(&mut self, dst: Reg, src: Reg) {
-        let (part, mask) = (Reg::R11, Reg::Rsi);
-        if dst != src {
-            self.asm.mov(dst, src);
-        }
-        for (bits, shift) in BIT_STEPS {
-            self.asm.mov_imm(mask, bits as i64);
-            self.asm.mov(part, dst);
-            self.asm.shift_imm(Size::Q, Shift::Shr, part, shift);
-            self.asm.alu(Alu::And, part, mask);
-            self.asm.alu(Alu::And, dst, mask);
-            self.asm.alu(Alu::Add, dst, part);
-        }
-        self.asm.mov_imm(mask, 0x0101_0101_0101_0101);
-        self.asm.imul(dst, mask);
-        self.asm.shift_imm(Size::Q, Shift::Shr, dst, 56);
-        self.clobber_regs(&[dst, Reg::R11, Reg::Rsi]);
-    }
-
-    /// Reverses the 64 bits of rax in place, using rcx and rdx.
-    pub(super) fn reverse_bits(&mut self) {
-        for (mask, shift) in BIT_STEPS {
-            self.asm.mov_imm(Reg::Rcx, mask as i64);
-            self.asm.mov(Reg::Rdx, Reg::Rax);
-            self.asm.shift_imm(Size::Q, Shift::Shr, Reg::Rdx, shift);
-            self.asm.alu(Alu::And, Reg::Rdx, Reg::Rcx);
-            self.asm.alu(Alu::And, Reg::Rax, Reg::Rcx);
-            self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift);
-            self.asm.alu(Alu::Or, Reg::Rax, Reg::Rdx);
-        }
-        self.asm.bswap(Size::Q, Reg::Rax);
-        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
     }
 
     pub(super) fn binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {

@@ -212,7 +212,21 @@ fn fixup_bits(kind: Fixup, bytes: i64) -> Option<u32> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PairKind { IntLoad, IntStore, FloatLoad, FloatStore }
+enum PairKind {
+    IntLoad(Size),
+    IntStore(Size),
+    FloatLoad(Size),
+    FloatStore(Size),
+}
+
+impl PairKind {
+    fn step(self) -> i32 {
+        match self {
+            Self::IntLoad(s) | Self::IntStore(s) | Self::FloatLoad(s) | Self::FloatStore(s) if s == Size::W => 4,
+            _ => 8,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct LastMem { end_pos: u32, binds: u32, kind: PairKind, reg: u8, base: Reg, disp: i32 }
@@ -514,16 +528,6 @@ impl Asm {
         self.bitfield_word(if signed { 0x9340_0000 } else { 0xD340_0000 }, dst, src, pair);
     }
 
-    pub fn bfx(&mut self, signed: bool, size: Size, dst: Reg, src: Reg, lsb: u8, width: u8) {
-        let base = match (signed, size == Size::X) {
-            (false, false) => 0x5300_0000,
-            (true, false) => 0x1300_0000,
-            (false, true) => 0xD340_0000,
-            (true, true) => 0x9340_0000,
-        };
-        self.bitfield_word(base, dst, src, (lsb, lsb + width - 1));
-    }
-
     pub fn lsl_imm(&mut self, dst: Reg, src: Reg, shift: u8) {
         self.bitfield(false, dst, src, ((64 - shift) % 64, 63 - shift));
     }
@@ -587,31 +591,35 @@ impl Asm {
     }
 
     fn access_pair(&mut self, pair: Option<(PairKind, u8)>, base: u32, scale: u32, rt: u32, mem: Mem) {
-        if let Some((kind, reg)) = pair
-            && let Some(prev) = self.last_mem
-            && prev.end_pos == self.pos()
-            && prev.binds == self.binds
-            && prev.kind == kind
-            && prev.base == mem.base
-            && let Some((r1, r2, min_disp)) = match mem.disp.checked_sub(prev.disp) {
-                Some(8) => Some((prev.reg, reg, prev.disp)),
-                Some(-8) => Some((reg, prev.reg, mem.disp)),
-                _ => None,
+        if let Some((kind, reg)) = pair {
+            let step = kind.step();
+            if let Some(prev) = self.last_mem
+                && prev.end_pos == self.pos()
+                && prev.binds == self.binds
+                && prev.kind == kind
+                && prev.base == mem.base
+                && let Some((r1, r2, min_disp)) = match mem.disp.checked_sub(prev.disp) {
+                    Some(d) if d == step => Some((prev.reg, reg, prev.disp)),
+                    Some(d) if d == -step => Some((reg, prev.reg, mem.disp)),
+                    _ => None,
+                }
+                && min_disp.rem_euclid(step) == 0
+                && (-64 * step..=63 * step).contains(&min_disp)
+                && !(matches!(kind, PairKind::IntLoad(_))
+                    && (r1 == r2 || r1 == ZR.0 || r2 == ZR.0 || (mem.base != SP && prev.reg == mem.base.0)))
+                && !(matches!(kind, PairKind::FloatLoad(_)) && r1 == r2)
+            {
+                self.code.truncate((prev.end_pos - 4) as usize);
+                let op = match kind {
+                    PairKind::IntLoad(s) => sized(0xA940_0000, s),
+                    PairKind::IntStore(s) => sized(0xA900_0000, s),
+                    PairKind::FloatLoad(s) => if s == Size::W { 0x2D40_0000 } else { 0x6D40_0000 },
+                    PairKind::FloatStore(s) => if s == Size::W { 0x2D00_0000 } else { 0x6D00_0000 },
+                };
+                self.pair_offset(op, step, r1, r2, mem.base, min_disp);
+                self.last_mem = None;
+                return;
             }
-            && min_disp % 8 == 0
-            && (-512..=504).contains(&min_disp)
-            && !(kind == PairKind::IntLoad && (r1 == r2 || r1 == ZR.0 || r2 == ZR.0 || (mem.base != SP && (prev.reg == mem.base.0 || reg == mem.base.0))))
-            && !(kind == PairKind::FloatLoad && r1 == r2)
-        {
-            self.code.truncate((prev.end_pos - 4) as usize);
-            match kind {
-                PairKind::IntLoad => self.ldp_offset(Reg(r1), Reg(r2), mem.base, min_disp),
-                PairKind::IntStore => self.stp_offset(Reg(r1), Reg(r2), mem.base, min_disp),
-                PairKind::FloatLoad => self.fldp_offset(Vreg(r1), Vreg(r2), mem.base, min_disp),
-                PairKind::FloatStore => self.fstp_offset(Vreg(r1), Vreg(r2), mem.base, min_disp),
-            }
-            self.last_mem = None;
-            return;
         }
         let single = self.access(base, scale, rt, mem);
         self.last_mem = pair.filter(|_| single).map(|(kind, reg)| LastMem { end_pos: self.pos(), binds: self.binds, kind, reg, base: mem.base, disp: mem.disp });
@@ -619,25 +627,33 @@ impl Asm {
 
     /// Loads `size` bytes at `mem` into `dst`, sign-extending to 64 bits when `signed`, else zero-extending.
     pub fn load(&mut self, size: Size, signed: bool, dst: Reg, mem: Mem) {
-        let pair = (size == Size::X).then_some((PairKind::IntLoad, dst.0));
+        let pair = (!signed && matches!(size, Size::W | Size::X)).then_some((PairKind::IntLoad(size), dst.0));
         self.access_pair(pair, Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
     }
 
     pub fn store(&mut self, size: Size, mem: Mem, src: Reg) {
-        let pair = (size == Size::X).then_some((PairKind::IntStore, src.0));
+        let pair = matches!(size, Size::W | Size::X).then_some((PairKind::IntStore(size), src.0));
         self.access_pair(pair, Self::store_base(size), size.log2(), u32::from(src.0), mem);
     }
 
     /// Loads a float or vector register of `bytes` 4, 8 or 16.
     pub fn vload(&mut self, bytes: u32, dst: Vreg, mem: Mem) {
         let (base, scale) = Self::vbase(bytes);
-        let pair = (bytes == 8).then_some((PairKind::FloatLoad, dst.0));
+        let pair = match bytes {
+            4 => Some((PairKind::FloatLoad(Size::W), dst.0)),
+            8 => Some((PairKind::FloatLoad(Size::X), dst.0)),
+            _ => None,
+        };
         self.access_pair(pair, base | 0x40_0000, scale, u32::from(dst.0), mem);
     }
 
     pub fn vstore(&mut self, bytes: u32, mem: Mem, src: Vreg) {
         let (base, scale) = Self::vbase(bytes);
-        let pair = (bytes == 8).then_some((PairKind::FloatStore, src.0));
+        let pair = match bytes {
+            4 => Some((PairKind::FloatStore(Size::W), src.0)),
+            8 => Some((PairKind::FloatStore(Size::X), src.0)),
+            _ => None,
+        };
         self.access_pair(pair, base, scale, u32::from(src.0), mem);
     }
 
@@ -698,24 +714,24 @@ impl Asm {
         }
     }
 
-    fn pair_offset(&mut self, base: u32, a: u8, b: u8, addr: Reg, offset: i32) {
-        self.word(base | (((offset / 8) as u32) & 0x7F) << 15 | u32::from(b) << 10 | u32::from(addr.0) << 5 | u32::from(a));
+    fn pair_offset(&mut self, base: u32, step: i32, a: u8, b: u8, addr: Reg, offset: i32) {
+        self.word(base | (((offset / step) as u32) & 0x7F) << 15 | u32::from(b) << 10 | u32::from(addr.0) << 5 | u32::from(a));
     }
 
     pub fn stp_offset(&mut self, a: Reg, b: Reg, base: Reg, offset: i32) {
-        self.pair_offset(0xA900_0000, a.0, b.0, base, offset);
+        self.pair_offset(0xA900_0000, 8, a.0, b.0, base, offset);
     }
 
     pub fn ldp_offset(&mut self, a: Reg, b: Reg, base: Reg, offset: i32) {
-        self.pair_offset(0xA940_0000, a.0, b.0, base, offset);
+        self.pair_offset(0xA940_0000, 8, a.0, b.0, base, offset);
     }
 
     pub fn fstp_offset(&mut self, a: Vreg, b: Vreg, base: Reg, offset: i32) {
-        self.pair_offset(0x6D00_0000, a.0, b.0, base, offset);
+        self.pair_offset(0x6D00_0000, 8, a.0, b.0, base, offset);
     }
 
     pub fn fldp_offset(&mut self, a: Vreg, b: Vreg, base: Reg, offset: i32) {
-        self.pair_offset(0x6D40_0000, a.0, b.0, base, offset);
+        self.pair_offset(0x6D40_0000, 8, a.0, b.0, base, offset);
     }
 
     pub fn stp_pre(&mut self, a: Reg, b: Reg, base: Reg, offset: i32) {

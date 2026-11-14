@@ -80,6 +80,15 @@ impl Emit<'_> {
 
     fn vector_shuffle_const(&mut self, lane: Lane, count: u8, a: Value, b: Value, indices: &[u8; 16], dst: Xmm) {
         let c = usize::from(count);
+        let mut norm = *indices;
+        if a == b {
+            for i in &mut norm[..c] {
+                if *i >= count && *i < 2 * count {
+                    *i -= count;
+                }
+            }
+        }
+        let indices = &norm;
         let all_a = indices[..c].iter().all(|&i| i < count);
         let all_b = indices[..c].iter().all(|&i| i >= count && i < 2 * count);
         if all_a || all_b {
@@ -188,22 +197,42 @@ impl Emit<'_> {
                 self.zero_xmm(dst);
                 return;
             }
-            if uses_a {
-                self.load_bytes16(X1, X2, mask_a);
+            if uses_a ^ uses_b {
+                let (src_val, mask) = if uses_a { (a, mask_a) } else { (b, mask_b) };
+                self.load_bytes16(X1, X0, mask);
+                if self.features.avx {
+                    let src = self.fin(src_val, dst);
+                    self.asm.vex_xmm(0b00010, 0b01, 0x00, (dst, src), X1);
+                } else {
+                    self.fget(dst, src_val);
+                    self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], dst.0, X1);
+                }
+                self.clobber_xmms(&[X0, X1, dst]);
+                return;
+            }
+            self.load_bytes16(X1, X2, mask_a);
+            if self.features.avx {
+                let sa = self.fin(a, X0);
+                self.asm.vex_xmm(0b00010, 0b01, 0x00, (X0, sa), X1);
+            } else {
                 self.fget(X0, a);
                 self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], X0.0, X1);
-            } else {
-                self.zero_xmm(X0);
             }
-            if uses_b {
-                self.load_bytes16(X1, X2, mask_b);
+            self.clobber_xmms(&[X0, X1, X2]);
+            self.load_bytes16(X1, X2, mask_b);
+            if self.features.avx {
+                let sb = self.fin(b, X2);
+                self.asm.vex_xmm(0b00010, 0b01, 0x00, (X2, sb), X1);
+                self.asm.vex_xmm(0b00001, 0b01, 0xEB, (dst, X0), X2);
+            } else {
                 self.fget(X2, b);
                 self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], X2.0, X1);
                 self.asm.sse(&[0x66], &[0x0F, 0xEB], X0.0, X2);
+                if dst != X0 {
+                    self.asm.movaps(dst, X0);
+                }
             }
-            if dst != X0 {
-                self.asm.movaps(dst, X0);
-            }
+            self.clobber_xmms(&[X0, X1, X2, dst]);
             return;
         }
         let bytes = lane.bytes() as i32;
@@ -229,10 +258,18 @@ impl Emit<'_> {
     }
 
     fn emit_two_vec_imm(&mut self, op: u8, dst: Xmm, stay: Value, src_val: Value, imm: u8) {
+        if self.features.avx {
+            let s_stay = self.fin(stay, dst);
+            let src = self.foperand(src_val, X0);
+            self.asm.vex_xmm_imm(0b00011, 0b01, op, (dst, s_stay), src, imm);
+            self.clobber_xmms(&[X0, dst]);
+            return;
+        }
         let scratch = if dst == X0 { X1 } else { X0 };
         let mut src = self.fin(src_val, scratch);
         if src == dst {
             self.asm.movaps(scratch, src);
+            self.clobber_xmm(scratch);
             src = scratch;
         }
         self.fget(dst, stay);
@@ -241,7 +278,51 @@ impl Emit<'_> {
 
     fn vector_shuffle_dyn_ssse3(&mut self, count: u8, a: Value, b: Value, mask_v: Value, dst: Xmm) {
         if a == b && count == 16 {
-            self.packed_regs(&[0x66], &[0x0F, 0x38, 0x00], (a, mask_v), dst);
+            if self.features.avx {
+                let src_a = self.fin(a, dst);
+                let src_m = self.foperand(mask_v, X0);
+                self.asm.vex_xmm(0b00010, 0b01, 0x00, (dst, src_a), src_m);
+                self.clobber_xmm(X0);
+            } else {
+                self.packed_regs(&[0x66], &[0x0F, 0x38, 0x00], (a, mask_v), dst);
+            }
+            return;
+        }
+        if a == b && count == 8 {
+            self.fget(X0, mask_v);
+            self.splat_imm(Lane::I8, X1, 15);
+            self.asm.sse(&[0x66], &[0x0F, 0x64], X0.0, X1);
+            self.clobber_xmm(X0);
+            self.splat_imm(Lane::I8, X1, -121);
+            let m = self.fin(mask_v, X2);
+            self.asm.sse(&[0x66], &[0x0F, 0xDB], X1.0, m);
+            self.asm.sse(&[0x66], &[0x0F, 0xEB], X0.0, X1);
+            if self.features.avx {
+                let sa = self.fin(a, dst);
+                self.asm.vex_xmm(0b00010, 0b01, 0x00, (dst, sa), X0);
+            } else {
+                self.fget(dst, a);
+                self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], dst.0, X0);
+            }
+            self.clobber_xmms(&[X0, X1, X2]);
+            return;
+        }
+        if self.features.avx && dst != X2 && self.xmm_of(mask_v) != Some(dst) && self.xmm_of(b) != Some(dst) {
+            self.splat_imm(Lane::I8, X1, i64::from(count - 1));
+            let m = self.fin(mask_v, X0);
+            self.asm.vex_xmm(0b00001, 0b01, 0x64, (X2, m), X1);
+            self.asm.vex_xmm(0b00001, 0b01, 0xEB, (X2, X2), m);
+            let sa = self.fin(a, dst);
+            self.asm.vex_xmm(0b00010, 0b01, 0x00, (dst, sa), X2);
+            self.splat_imm(Lane::I8, X2, i64::from(count));
+            self.asm.vex_xmm(0b00001, 0b01, 0xF8, (X2, m), X2);
+            self.asm.vex_xmm(0b00001, 0b01, 0x64, (X0, X2), X1);
+            self.clobber_xmm(X0);
+            self.asm.vex_xmm(0b00001, 0b01, 0xEB, (X2, X2), X0);
+            let sb = self.fin(b, X0);
+            self.asm.vex_xmm(0b00010, 0b01, 0x00, (X0, sb), X2);
+            self.asm.vex_xmm(0b00001, 0b01, 0xEB, (dst, dst), X0);
+            self.clobber_xmms(&[X0, X1, X2, dst]);
             return;
         }
         self.fget(X0, mask_v);
@@ -251,6 +332,7 @@ impl Emit<'_> {
         self.asm.sse(&[0x66], &[0x0F, 0xEB], X2.0, X0);
         self.fget(X0, a);
         self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], X0.0, X2);
+        self.clobber_xmm(X0);
         let save_stack = dst == X2 || self.xmm_of(mask_v) == Some(dst) || self.xmm_of(b) == Some(dst);
         if save_stack {
             self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
@@ -261,6 +343,7 @@ impl Emit<'_> {
         self.fget(X0, mask_v);
         self.splat_imm(Lane::I8, X1, i64::from(count));
         self.asm.sse(&[0x66], &[0x0F, 0xF8], X0.0, X1);
+        self.clobber_xmm(X0);
         self.splat_imm(Lane::I8, X1, i64::from(count - 1));
         self.asm.movaps(X2, X0);
         self.asm.sse(&[0x66], &[0x0F, 0x64], X2.0, X1);
@@ -275,6 +358,7 @@ impl Emit<'_> {
         } else {
             self.asm.sse(&[0x66], &[0x0F, 0xEB], dst.0, X1);
         }
+        self.clobber_xmms(&[X0, X1, X2]);
     }
 
     fn vector_shuffle_dyn_baseline(&mut self, lane: Lane, count: u8, a: Value, b: Value, mask_v: Value, dst: Xmm) {
@@ -561,10 +645,16 @@ impl Emit<'_> {
             TargetOpForm::Sha256Rnds2 => {
                 let [a, b, k] = *args else { return Err(format!("{id:?} expects 3 args")); };
                 let dst = self.xmm_of(result).unwrap_or(X2);
-                self.fget(X1, b);
+                let mut src_b = self.fin(b, X1);
+                if src_b == dst && a != b {
+                    self.asm.movaps(X1, src_b);
+                    self.clobber_xmm(X1);
+                    src_b = X1;
+                }
                 self.fget(X0, k);
                 self.fget(dst, a);
-                self.asm.sse(spec.prefix, spec.opcode, dst.0, X1);
+                self.asm.sse(spec.prefix, spec.opcode, dst.0, src_b);
+                self.clobber_xmm(dst);
                 self.fput(result, dst);
             }
         }
@@ -630,10 +720,14 @@ impl Emit<'_> {
         self.xmm_store(ty, Mem::new(Reg::Rsp, 0), X0);
         for i in 0..i32::from(count) {
             let slot = Mem::new(Reg::Rsp, i * stride);
-            self.asm.load(size, Reg::Rax, slot);
-            self.count(super::asm::Count::Lzcnt, Reg::Rax, Reg::Rax);
-            if lane.bits() < 64 {
-                self.asm.alu_imm(Alu::Sub, Reg::Rax, (64 - lane.bits()) as i32);
+            if self.features.lzcnt && lane.bits() >= 32 {
+                self.asm.count(super::asm::Count::Lzcnt, size, Reg::Rax, slot);
+            } else {
+                self.asm.load(size, Reg::Rax, slot);
+                self.count(super::asm::Count::Lzcnt, Reg::Rax, Reg::Rax);
+                if lane.bits() < 64 {
+                    self.asm.alu_imm(Alu::Sub, Reg::Rax, (64 - lane.bits()) as i32);
+                }
             }
             self.asm.store(size, slot, Reg::Rax);
         }

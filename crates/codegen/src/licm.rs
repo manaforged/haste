@@ -467,6 +467,48 @@ fn can_hoist_global_load(func: &Function, mem: &LoopMem, prov: &Provenance, head
     matches!(prov.loc(addr, i64::from(offset), width).root, MemRoot::Global(_))
 }
 
+const MAX_HOISTED_SYMBOLS: usize = 4;
+const MAX_LOOP_GP_LIVE: usize = 18;
+
+fn is_gp_value(func: &Function, v: Value) -> bool {
+    let ty = func.ty(v);
+    !ty.is_vector() && !ty.is_float()
+}
+
+fn loop_gp_live(func: &Function, each: &Loop, home: &[Option<Block>]) -> usize {
+    let n = func.types.len();
+    let mut is_const = vec![false; n];
+    for data in &func.insts {
+        if let (&Op::Const(_), Some(res)) = (&data.op, data.result) {
+            is_const[res.index()] = true;
+        }
+    }
+    let mut seen = vec![false; n];
+    let mut live = 0_usize;
+    for &p in &func.blocks[each.head.index()].params {
+        if is_gp_value(func, p) && !seen[p.index()] {
+            seen[p.index()] = true;
+            live += 1;
+        }
+    }
+    for b in (0..each.body.len()).filter(|&b| each.body[b]) {
+        for &inst in &func.blocks[b].insts {
+            func.insts[inst.index()].op.for_operands(|v| {
+                let vi = v.index();
+                if !seen[vi]
+                    && !is_const[vi]
+                    && is_gp_value(func, v)
+                    && home.get(vi).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false))
+                {
+                    seen[vi] = true;
+                    live += 1;
+                }
+            });
+        }
+    }
+    live
+}
+
 fn hoist(
     func: &mut Function,
     cfg: &Cfg,
@@ -476,6 +518,8 @@ fn hoist(
     home: &mut [Option<Block>],
 ) -> bool {
     let mem = LoopMem::analyze(func, each, prov);
+    let gp_live = loop_gp_live(func, each, home);
+    let mut hoisted_symbols = 0_usize;
     let mut moved: Vec<Inst> = Vec::new();
     for &blk in &cfg.rpo {
         let block = blk.index();
@@ -491,13 +535,18 @@ fn hoist(
             if matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::Trap | Op::Trapz(_) | Op::Brif(..)) {
                 head_prefix = false;
             }
-            let static_loc = matches!(op, Op::StackAddr(..) | Op::SlotAddr(_) | Op::Symbol(_));
-            let movable = (op.is_speculable() && !(mem.calls && static_loc))
+            let is_symbol = matches!(op, Op::Symbol(_));
+            let static_loc = matches!(op, Op::StackAddr(..) | Op::SlotAddr(_));
+            let sym_ok = !mem.calls || (hoisted_symbols < MAX_HOISTED_SYMBOLS && gp_live + hoisted_symbols < MAX_LOOP_GP_LIVE);
+            let movable = (op.is_speculable() && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
                 || mem.can_hoist_load(func, prov, head_prefix, inst)
                 || can_hoist_global_load(func, &mem, prov, head_prefix, inst);
             let mut operands_invariant = true;
             op.for_operands(|v| operands_invariant &= home.get(v.index()).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false)));
             if movable && operands_invariant && let Some(res) = func.insts[inst.index()].result {
+                if is_symbol {
+                    hoisted_symbols += 1;
+                }
                 home[res.index()] = Some(entry);
                 moved.push(inst);
             } else {

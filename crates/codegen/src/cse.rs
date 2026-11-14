@@ -270,6 +270,8 @@ struct Table {
     icmp_def: Vec<Option<(IntCC, Type, Value, Value)>>,
     def_block: Vec<Block>,
     local_flag_only: Vec<bool>,
+    affine: Vec<(Value, i64)>,
+    stack_addrs: Vec<Option<(StackSlot, i32)>>,
     drop_buf: Vec<Key>,
 }
 
@@ -282,6 +284,49 @@ impl Table {
         let &inv_c = self.known.get(&Key::Icmp(inv_cc, x_ty, ia, ib))?;
         let key = Key::Select(Operand::Val(inv_c), operand(&self.consts, types, subst, sy), operand(&self.consts, types, subst, sx));
         self.known.get(&key).copied()
+    }
+
+    fn normalized_key(&mut self, op: &Op, types: &[Type], ty: Type, result: Value, subst: &[Value]) -> Option<Result<Key, Value>> {
+        match *op {
+            Op::StackAddr(slot, offset) => {
+                self.stack_addrs[result.index()] = Some((slot, offset));
+                Some(Ok(Key::StackAddr(slot, offset)))
+            }
+            Op::Binary(bin @ (Binary::Iadd | Binary::Isub), x, y) if ty.is_small_int() => {
+                let ox = operand(&self.consts, types, subst, x);
+                let oy = operand(&self.consts, types, subst, y);
+                let val_imm = match (bin, ox, oy) {
+                    (Binary::Iadd, Operand::Val(base), Operand::Imm(_, imm))
+                    | (Binary::Iadd, Operand::Imm(_, imm), Operand::Val(base)) => Some((base, imm)),
+                    (Binary::Isub, Operand::Val(base), Operand::Imm(_, imm)) => Some((base, imm.wrapping_neg())),
+                    _ => None,
+                };
+                if let Some((base, delta)) = val_imm {
+                    if delta == 0 {
+                        return Some(Err(base));
+                    }
+                    if ty == Type::I64 {
+                        if let Some((slot, base_off)) = self.stack_addrs[base.index()]
+                            && let Some(total) = i32::try_from(delta).ok().and_then(|d| base_off.checked_add(d))
+                        {
+                            self.stack_addrs[result.index()] = Some((slot, total));
+                            return Some(Ok(Key::StackAddr(slot, total)));
+                        }
+                        let (root, base_off) = self.affine[base.index()];
+                        let root = find(subst, root);
+                        let total = base_off.wrapping_add(delta);
+                        self.affine[result.index()] = (root, total);
+                        if total == 0 {
+                            return Some(Err(root));
+                        }
+                        let (a, b) = order_pair(Operand::Val(root), Operand::Imm(Type::I64, total));
+                        return Some(Ok(Key::Binary(Binary::Iadd, a, b)));
+                    }
+                }
+                key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok)
+            }
+            _ => key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok),
+        }
     }
 
     /// Drops from `block` every pure instruction a dominating one already computed, recording its replacement in `subst`; true when it dropped any.
@@ -302,8 +347,15 @@ impl Table {
                     return true;
                 }
                 let Some(result) = data.result else { return true };
-                let Some(key) = key(&data.op, &self.consts, &self.bool_neg, &func.types, func.ty(result), subst) else {
+                let Some(norm) = self.normalized_key(&data.op, &func.types, func.ty(result), result, subst) else {
                     return true;
+                };
+                let key = match norm {
+                    Ok(key) => key,
+                    Err(alias) => {
+                        subst[result.index()] = alias;
+                        return false;
+                    }
                 };
                 if let Some(&earlier) = self.known.get(&key) {
                     if self.local_flag_only[result.index()] && self.def_block[earlier.index()] != block {
@@ -418,12 +470,16 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             }
         }
     }
+    let affine = identity(func.types.len()).into_iter().map(|v| (v, 0_i64)).collect();
+    let stack_addrs = vec![None; func.types.len()];
     let mut table = Table {
         consts,
         bool_neg,
         icmp_def,
         def_block,
         local_flag_only,
+        affine,
+        stack_addrs,
         ..Table::default()
     };
     let mut dropped = false;

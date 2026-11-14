@@ -416,6 +416,12 @@ fn scan(
                 bufs.pending_stores.retain(|&(ploc, _)| !may_alias(read_loc, ploc, state.prov));
                 bufs.const_stores.retain(|cs| !may_alias(read_loc, cs.loc, state.prov));
             }
+            Op::Copy(_, from, _) => {
+                let r = addr_loc(state.prov, state.subst, from, 0, u32::MAX);
+                let ok = |l: MemLoc| l.base != r.base && (l.root == MemRoot::Unknown || l.root != r.root) && !may_alias(r, l, state.prov);
+                bufs.pending_stores.retain(|&(p, _)| ok(p));
+                bufs.const_stores.retain(|cs| ok(cs.loc));
+            }
             Op::Trap | Op::Trapz(_) => {
                 bufs.pending_stores.retain(|&(ploc, _)| slot_unescaped(state.prov, ploc));
                 bufs.const_stores.retain(|cs| slot_unescaped(state.prov, cs.loc));

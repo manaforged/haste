@@ -9,7 +9,7 @@ mod vector;
 mod vector_lanes;
 mod wide;
 
-use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
+use asm::{Alu, Asm, Cond, Label, Mem, Reg, Rm, Shift, Size, Xmm};
 use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
@@ -42,6 +42,9 @@ const REGS_WIN64: Regs<Reg> = Regs {
     leaf: &[Reg::R9, Reg::R8, Reg::R10, Reg::Rdx],
     ..REGS
 };
+
+/// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
+const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let abi_kind = target.abi;
@@ -654,6 +657,40 @@ impl Emit<'_> {
             _ => {}
         }
         self.clobber_regs(&[dst, Reg::Rdx, Reg::R11]);
+    }
+
+    pub(super) fn popcount(&mut self, dst: Reg, src: Rm) {
+        let (part, mask) = (Reg::R11, Reg::Rsi);
+        match src {
+            Rm::Reg(r) if r == dst as u8 => {}
+            _ => self.asm.load(Size::Q, dst, src),
+        }
+        for (bits, shift) in BIT_STEPS {
+            self.asm.mov_imm(mask, bits as i64);
+            self.asm.mov(part, dst);
+            self.asm.shift_imm(Size::Q, Shift::Shr, part, shift);
+            self.asm.alu(Alu::And, part, mask);
+            self.asm.alu(Alu::And, dst, mask);
+            self.asm.alu(Alu::Add, dst, part);
+        }
+        self.asm.mov_imm(mask, 0x0101_0101_0101_0101);
+        self.asm.imul(dst, mask);
+        self.asm.shift_imm(Size::Q, Shift::Shr, dst, 56);
+        self.clobber_regs(&[dst, Reg::R11, Reg::Rsi]);
+    }
+
+    pub(super) fn reverse_bits(&mut self) {
+        for (mask, shift) in BIT_STEPS {
+            self.asm.mov_imm(Reg::Rcx, mask as i64);
+            self.asm.mov(Reg::Rdx, Reg::Rax);
+            self.asm.shift_imm(Size::Q, Shift::Shr, Reg::Rdx, shift);
+            self.asm.alu(Alu::And, Reg::Rdx, Reg::Rcx);
+            self.asm.alu(Alu::And, Reg::Rax, Reg::Rcx);
+            self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rax, shift);
+            self.asm.alu(Alu::Or, Reg::Rax, Reg::Rdx);
+        }
+        self.asm.bswap(Size::Q, Reg::Rax);
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
     }
 
     pub(super) fn clamp_signed(&mut self, reg: Reg, to: Type, signed: bool) {

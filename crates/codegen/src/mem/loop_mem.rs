@@ -102,11 +102,12 @@ impl LoopMem {
                     fx.copy_locs.push(dloc);
                     fx.copy_locs.push(prov.loc(src, 0, bytes));
                 }
-                Op::Copy(dst, _, _) => {
+                Op::Copy(dst, src, _) => {
                     fx.block_copies = true;
                     let dloc = prov.loc(dst, 0, u32::MAX);
                     fx.record_clobber_loc(dloc);
                     fx.copy_locs.push(dloc);
+                    fx.copy_locs.push(prov.loc(src, 0, u32::MAX));
                 }
                 _ => {}
             }

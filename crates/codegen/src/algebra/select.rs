@@ -66,10 +66,104 @@ pub(super) fn is_non_zero(cx: &RewriteCx, v: Value, depth: u8) -> bool {
     }
 }
 
+fn bool_cond(cx: &RewriteCx, raw: Value) -> Option<Value> {
+    let c = cx.unwrap_uextend(raw);
+    (cx.func.ty(c) == Type::I8 && cx.is_unit_bool(c)).then_some(c)
+}
+
+fn simplify_1_bool(cx: &mut RewriteCx, res: Option<Value>, c: Value, b1: bool, b2: bool) -> Option<Op> {
+    match (b1, b2) {
+        (true, true) => Some(Op::Const(1)),
+        (false, false) => Some(Op::Const(0)),
+        (true, false) => {
+            cx.alias(res, c);
+            None
+        }
+        (false, true) => {
+            let one = cx.emit(Type::I8, Op::Const(1));
+            Some(Op::Binary(Binary::Bxor, c, one))
+        }
+    }
+}
+
+fn eval_const_select_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Option<Op>> {
+    let ty = cx.func.ty(x);
+    for (norm, sel_val, c_val) in [(cc, x, y), (swap_cc(cc), y, x)] {
+        let Some(c) = cx.sconst(c_val) else { continue };
+        let Some(sel_inst) = cx.def(sel_val) else { continue };
+        let Op::Select(raw_c1, t1, f1) = cx.func.insts[sel_inst.index()].op else { continue };
+        let Some(c1) = bool_cond(cx, raw_c1) else { continue };
+        let eval = |k: i64| crate::fold::holds(norm, ty, k, c);
+        if let (Some(k1), Some(k2)) = (cx.sconst(t1), cx.sconst(f1)) {
+            return Some(simplify_1_bool(cx, res, c1, eval(k1), eval(k2)));
+        }
+        if let (Some(k1), Some(f_inst)) = (cx.sconst(t1), cx.def(f1))
+            && let Op::Select(raw_c2, t2, f2) = cx.func.insts[f_inst.index()].op
+            && let (Some(k2), Some(k3)) = (cx.sconst(t2), cx.sconst(f2))
+        {
+            let (b1, b2, b3) = (eval(k1), eval(k2), eval(k3));
+            if b2 == b3 {
+                return Some(simplify_1_bool(cx, res, c1, b1, b2));
+            }
+            let Some(c2) = bool_cond(cx, raw_c2) else { continue };
+            return Some(Some(match (b1, b2, b3) {
+                (false, false, true) => {
+                    let or = cx.emit(Type::I8, Op::Binary(Binary::Bor, c1, c2));
+                    let one = cx.emit(Type::I8, Op::Const(1));
+                    Op::Binary(Binary::Bxor, or, one)
+                }
+                (true, true, false) => Op::Binary(Binary::Bor, c1, c2),
+                (false, true, false) => {
+                    let one = cx.emit(Type::I8, Op::Const(1));
+                    let nc1 = cx.emit(Type::I8, Op::Binary(Binary::Bxor, c1, one));
+                    Op::Binary(Binary::Band, nc1, c2)
+                }
+                _ => {
+                    let one = cx.emit(Type::I8, Op::Const(1));
+                    let nc2 = cx.emit(Type::I8, Op::Binary(Binary::Bxor, c2, one));
+                    Op::Binary(Binary::Bor, c1, nc2)
+                }
+            }));
+        }
+        if let (Some(t_inst), Some(k3)) = (cx.def(t1), cx.sconst(f1))
+            && let Op::Select(raw_c2, t2, f2) = cx.func.insts[t_inst.index()].op
+            && let (Some(k1), Some(k2)) = (cx.sconst(t2), cx.sconst(f2))
+        {
+            let (b1, b2, b3) = (eval(k1), eval(k2), eval(k3));
+            if b1 == b2 {
+                return Some(simplify_1_bool(cx, res, c1, b1, b3));
+            }
+            let Some(c2) = bool_cond(cx, raw_c2) else { continue };
+            return Some(Some(match (b1, b2, b3) {
+                (true, false, false) => Op::Binary(Binary::Band, c1, c2),
+                (false, true, false) => {
+                    let one = cx.emit(Type::I8, Op::Const(1));
+                    let nc2 = cx.emit(Type::I8, Op::Binary(Binary::Bxor, c2, one));
+                    Op::Binary(Binary::Band, c1, nc2)
+                }
+                (true, false, true) => {
+                    let one = cx.emit(Type::I8, Op::Const(1));
+                    let nc1 = cx.emit(Type::I8, Op::Binary(Binary::Bxor, c1, one));
+                    Op::Binary(Binary::Bor, nc1, c2)
+                }
+                _ => {
+                    let and = cx.emit(Type::I8, Op::Binary(Binary::Band, c1, c2));
+                    let one = cx.emit(Type::I8, Op::Const(1));
+                    Op::Binary(Binary::Bxor, and, one)
+                }
+            }));
+        }
+    }
+    None
+}
+
 pub(super) fn eval_select_zero_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Option<Op>> {
     let ty = cx.func.ty(x);
     if !ty.is_small_int() || !res.is_some_and(|r| cx.func.ty(r) == Type::I8) {
         return None;
+    }
+    if let Some(folded) = eval_const_select_cmp(cx, res, cc, x, y) {
+        return Some(folded);
     }
     for (norm, sel_val, c_val) in [(cc, x, y), (swap_cc(cc), y, x)] {
         let Some(k) = cx.uconst(c_val, ty) else { continue };

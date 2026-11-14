@@ -118,7 +118,7 @@ pub(crate) enum Group3 {
     Idiv = 7,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Count {
     Popcnt = 0xB8,
     Tzcnt = 0xBC,
@@ -485,12 +485,12 @@ impl Asm {
         self.code.extend([0x0F, 0xC8 + (reg as u8 & 7)]);
     }
 
-    pub fn count(&mut self, op: Count, dst: Reg, src: Reg) {
-        self.encode(&[0xF3], true, &[0x0F, op as u8], dst as u8, src.into(), false);
+    pub fn count(&mut self, op: Count, size: Size, dst: Reg, src: impl Into<Rm>) {
+        self.encode(&[0xF3], size == Size::Q, &[0x0F, op as u8], dst as u8, src.into(), false);
     }
 
     /// `bsr` when `reverse`, else `bsf`: the opcodes of lzcnt and tzcnt without the F3 prefix; a zero `src` sets ZF and leaves `dst` undefined.
-    pub fn bit_scan(&mut self, reverse: bool, dst: Reg, src: Reg) {
+    pub fn bit_scan(&mut self, reverse: bool, dst: Reg, src: impl Into<Rm>) {
         let op = if reverse { Count::Lzcnt } else { Count::Tzcnt };
         self.encode(&[], true, &[0x0F, op as u8], dst as u8, src.into(), false);
     }
@@ -562,6 +562,17 @@ impl Asm {
     pub fn vex_scalar(&mut self, prefix: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>) {
         let pp = if prefix == 0xF2 { 0b11 } else { 0b10 };
         self.vex3(0b00001, false, pp, opcode, (dst.0, src.0), rm.into());
+    }
+
+    /// The three-operand VEX.128 form `dst = src op rm` with opcode map `map` and prefix class `pp`.
+    pub fn vex_xmm(&mut self, map: u8, pp: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>) {
+        self.vex3(map, false, pp, opcode, (dst.0, src.0), rm.into());
+    }
+
+    /// The three-operand VEX.128 immediate form `dst = src op rm, imm`.
+    pub fn vex_xmm_imm(&mut self, map: u8, pp: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>, imm: u8) {
+        self.vex3(map, false, pp, opcode, (dst.0, src.0), rm.into());
+        self.code.push(imm);
     }
 
     /// `vfmadd213{ss,sd,ps,pd}`: computes `dst = src * dst + rm`.

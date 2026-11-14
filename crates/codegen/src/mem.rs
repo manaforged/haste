@@ -142,81 +142,95 @@ fn count_safe_args(func: &Function, target: Block, args: &[Value], tracked: &[Tr
 
 fn classify_uses(
     func: &Function,
+    cfg: &Cfg,
     slots: &[Option<(StackSlot, i32)>],
     tracked: &[TrackRoot],
     is_spill: Option<&[bool]>,
 ) -> SlotEscapes {
     let n = func.types.len();
     let mut is_const = vec![false; n];
-    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        let data = &func.insts[inst.index()];
-        if let (&Op::Const(_), Some(res)) = (&data.op, data.result) {
-            is_const[res.index()] = true;
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            let data = &func.insts[inst.index()];
+            if let (&Op::Const(_), Some(res)) = (&data.op, data.result) {
+                is_const[res.index()] = true;
+            }
         }
     }
     let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], ro_calls: vec![0_u32; n] };
-    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        let data = &func.insts[inst.index()];
-        data.op.for_operands(|v| counts.total[v.index()] += 1);
-        match &data.op {
-            Op::Load(addr, _) => {
-                if slots[addr.index()].is_some() || matches!(tracked[addr.index()], TrackRoot::Set(_)) {
-                    counts.safe[addr.index()] += 1;
+    let mark_safe = |v: Value, safe: &mut [u32]| {
+        if slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(_)) {
+            safe[v.index()] += 1;
+        }
+    };
+    let mark_param_safe = |v: Value, safe: &mut [u32]| {
+        if slots[v.index()].is_none()
+            && matches!(tracked[v.index()], TrackRoot::Set(MemRoot::NoAliasParam(_) | MemRoot::ReadonlyParam(_)))
+        {
+            safe[v.index()] += 1;
+        }
+    };
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            let data = &func.insts[inst.index()];
+            data.op.for_operands(|v| counts.total[v.index()] += 1);
+            match &data.op {
+                Op::Load(addr, _) => mark_safe(*addr, &mut counts.safe),
+                Op::Trapz(addr) => mark_param_safe(*addr, &mut counts.safe),
+                Op::Store(val, addr, _) if val != addr => mark_safe(*addr, &mut counts.safe),
+                Op::Move(dst, src, _) | Op::Copy(dst, src, _) => {
+                    mark_param_safe(*dst, &mut counts.safe);
+                    mark_param_safe(*src, &mut counts.safe);
                 }
-            }
-            Op::Store(val, addr, _) if val != addr => {
-                if slots[addr.index()].is_some() || matches!(tracked[addr.index()], TrackRoot::Set(_)) {
-                    counts.safe[addr.index()] += 1;
+                Op::Binary(Binary::Iadd | Binary::Isub, a, b) => {
+                    if data.result.is_some_and(|r| slots[r.index()].is_some()) {
+                        let target = if slots[a.index()].is_some() { a } else { b };
+                        counts.safe[target.index()] += 1;
+                    } else if data.result.is_some_and(|r| matches!(tracked[r.index()], TrackRoot::Set(_))) {
+                        let target = if matches!(tracked[a.index()], TrackRoot::Set(_)) { a } else { b };
+                        counts.safe[target.index()] += 1;
+                    }
                 }
-            }
-            Op::Binary(Binary::Iadd | Binary::Isub, a, b) => {
-                if data.result.is_some_and(|r| slots[r.index()].is_some()) {
-                    let target = if slots[a.index()].is_some() { a } else { b };
-                    counts.safe[target.index()] += 1;
-                } else if data.result.is_some_and(|r| matches!(tracked[r.index()], TrackRoot::Set(_))) {
-                    let target = if matches!(tracked[a.index()], TrackRoot::Set(_)) { a } else { b };
-                    counts.safe[target.index()] += 1;
+                Op::Convert(Convert::Bitcast, x) if data.result.is_some_and(|r| matches!(tracked[r.index()], TrackRoot::Set(_))) => {
+                    counts.safe[x.index()] += 1;
                 }
-            }
-            Op::Convert(Convert::Bitcast, x) if data.result.is_some_and(|r| matches!(tracked[r.index()], TrackRoot::Set(_))) => {
-                counts.safe[x.index()] += 1;
-            }
-            Op::Select(_, a, b) => {
-                if let Some(r) = data.result
-                    && let TrackRoot::Set(root) = tracked[r.index()]
-                {
-                    for v in [a, b] {
-                        if tracked[v.index()] == TrackRoot::Set(root) {
+                Op::Select(_, a, b) => {
+                    if let Some(r) = data.result
+                        && let TrackRoot::Set(root) = tracked[r.index()]
+                    {
+                        for v in [a, b] {
+                            if tracked[v.index()] == TrackRoot::Set(root) {
+                                counts.safe[v.index()] += 1;
+                            }
+                        }
+                    }
+                }
+                Op::Icmp(_, a, b) => {
+                    for (v, other) in [(a, b), (b, a)] {
+                        let is_noalias = matches!(tracked[v.index()], TrackRoot::Set(MemRoot::NoAliasParam(_)));
+                        let same_or_const = (slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(_)))
+                            && (is_const[other.index()]
+                                || matches!((tracked[v.index()], tracked[other.index()]), (TrackRoot::Set(ra), TrackRoot::Set(rb)) if ra == rb));
+                        if is_noalias || same_or_const {
                             counts.safe[v.index()] += 1;
                         }
                     }
                 }
-            }
-            Op::Icmp(_, a, b) => {
-                for (v, other) in [(a, b), (b, a)] {
-                    let is_noalias = matches!(tracked[v.index()], TrackRoot::Set(MemRoot::NoAliasParam(_)));
-                    let same_or_const = (slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(_)))
-                        && (is_const[other.index()]
-                            || matches!((tracked[v.index()], tracked[other.index()]), (TrackRoot::Set(ra), TrackRoot::Set(rb)) if ra == rb));
-                    if is_noalias || same_or_const {
-                        counts.safe[v.index()] += 1;
+                Op::Jump(target, args) => count_safe_args(func, *target, args, tracked, &mut counts.safe),
+                Op::Brif(_, then_b, then_args, else_b, else_args) => {
+                    count_safe_args(func, *then_b, then_args, tracked, &mut counts.safe);
+                    count_safe_args(func, *else_b, else_args, tracked, &mut counts.safe);
+                }
+                Op::Call { sig, args, .. } | Op::TryCall { sig, args, .. } => {
+                    let params = &func.sigs[sig.index()].params;
+                    for (i, arg) in args.iter().enumerate() {
+                        if params.get(i).is_some_and(|p| p.readonly) {
+                            counts.ro_calls[arg.index()] += 1;
+                        }
                     }
                 }
+                _ => {}
             }
-            Op::Jump(target, args) => count_safe_args(func, *target, args, tracked, &mut counts.safe),
-            Op::Brif(_, then_b, then_args, else_b, else_args) => {
-                count_safe_args(func, *then_b, then_args, tracked, &mut counts.safe);
-                count_safe_args(func, *else_b, else_args, tracked, &mut counts.safe);
-            }
-            Op::Call { sig, args, .. } | Op::TryCall { sig, args, .. } => {
-                let params = &func.sigs[sig.index()].params;
-                for (i, arg) in args.iter().enumerate() {
-                    if params.get(i).is_some_and(|p| p.readonly) {
-                        counts.ro_calls[arg.index()] += 1;
-                    }
-                }
-            }
-            _ => {}
         }
     }
     finish_slot_escape(func, slots, tracked, &counts, is_spill)
@@ -373,7 +387,7 @@ impl Provenance {
     fn build(func: &Function, cfg: &Cfg, is_spill: Option<&[bool]>) -> Self {
         let slot_offsets = slot_addresses(func);
         let tracked = compute_tracked_roots(func, cfg);
-        let esc = classify_uses(func, &slot_offsets, &tracked, is_spill);
+        let esc = classify_uses(func, cfg, &slot_offsets, &tracked, is_spill);
         let mut param_roots = vec![MemRoot::Unknown; func.types.len()];
         for (i, t) in tracked.iter().enumerate() {
             if let TrackRoot::Set(root) = *t {

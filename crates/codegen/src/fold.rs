@@ -250,7 +250,7 @@ impl Fold {
     }
 
     /// The existing value the result of `op` always equals, when there is one.
-    fn identity(&self, func: &Function, op: &Op) -> Option<Value> {
+    fn identity(&self, func: &Function, op: &Op, ty: Type) -> Option<Value> {
         match *op {
             Op::Select(condition, x, y) => {
                 if self.find(x) == self.find(y) { return Some(x); }
@@ -285,10 +285,10 @@ impl Fold {
                 }
                 None
             }
-            Op::Convert(Convert::Bitcast, x) => match *self.def(func, x)? {
-                Op::Convert(Convert::Bitcast, value) if func.ty(value) != func.ty(x) => Some(value),
+            Op::Convert(Convert::Bitcast, x) => (func.ty(x) == ty).then_some(x).or_else(|| match *self.def(func, x)? {
+                Op::Convert(Convert::Bitcast, value) if func.ty(value) == ty => Some(value),
                 _ => None,
-            },
+            }),
             Op::Extract(..) | Op::Shuffle(..) => vector::vec_identity(self, func, op),
             Op::Binary(Binary::Fmin | Binary::Fmax, x, y) if self.find(x) == self.find(y) => Some(x),
             Op::Binary(kind, x, y) if func.ty(x).is_small_int() => self.neutral(func, kind, func.ty(x), x, y).or_else(|| self.cancel(func, kind, x, y)),
@@ -357,7 +357,7 @@ impl Fold {
             let ty = func.ty(result);
             if let Some(imm) = self.evaluate(func, &data.op, ty) {
                 self.consts[result.index()] = Some(imm);
-            } else if let Some(value) = self.identity(func, &data.op) {
+            } else if let Some(value) = self.identity(func, &data.op, ty) {
                 self.subst[result.index()] = value;
             }
         }
@@ -771,7 +771,7 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
                         && fold.known(y).is_some_and(|v| extend(v, func.ty(x), false) == 0) => Some(Op::Convert(Convert::Uextend, c)),
                     _ => None,
                 },
-                _ => vector::vec_zero_fold(func, &fold, &func.insts[inst.index()].op)
+                _ => vector::vec_zero_fold(func, &fold, &func.insts[inst.index()].op, func.insts[inst.index()].result)
                     .or_else(|| func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const)),
             };
             if let Some(op) = replacement && func.insts[inst.index()].op != op { func.insts[inst.index()].op = op; changed = true; }

@@ -4,6 +4,9 @@ use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, IntCC, Op, Typ
 
 const MAX_FULL_TRIPS: usize = 64;
 const MAX_FULL_INSTS: usize = 1024;
+const MAX_CHAIN_BLOCKS: usize = 8;
+const MAX_CHAIN_TRIPS: usize = 16;
+const MAX_CHAIN_UNROLLED_INSTS: usize = 96;
 
 fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
     map.iter().rev().find(|&&(old, _)| old == v).map_or(v, |&(_, new)| new)
@@ -49,12 +52,12 @@ fn clone_body(func: &mut Function, src_non_term: &[Inst], dst: Block, map: &mut 
     }
 }
 
-fn remap_other_blocks(func: &mut Function, skip_a: usize, skip_b: Option<usize>, map: &[(Value, Value)]) {
+fn remap_other_blocks(func: &mut Function, skip: &[usize], map: &[(Value, Value)]) {
     if map.is_empty() {
         return;
     }
     for ob in 0..func.blocks.len() {
-        if ob == skip_a || skip_b == Some(ob) {
+        if skip.contains(&ob) {
             continue;
         }
         for idx in 0..func.blocks[ob].insts.len() {
@@ -79,25 +82,45 @@ fn retire_block(func: &mut Function, blk_idx: usize) {
     func.blocks[blk_idx].params.clear();
 }
 
-fn single_outside_pred(func: &Function, head: Block, back_pred: Block) -> Option<Vec<Value>> {
-    let mut found = None;
+fn outside_const_params(
+    func: &Function,
+    cfg: &Cfg,
+    head: Block,
+    back_pred: Block,
+    global_consts: &[Option<i64>],
+) -> Option<Vec<Option<i64>>> {
+    let param_len = func.blocks[head.index()].params.len();
+    let mut acc: Option<Vec<Option<i64>>> = None;
     for (p, block) in func.blocks.iter().enumerate() {
-        if p == head.index() || p == back_pred.index() || !func.successors(Block(p as u32)).any(|t| t == head) {
+        if p == head.index()
+            || p == back_pred.index()
+            || !cfg.reachable.get(p).copied().unwrap_or(false)
+            || !func.successors(Block(p as u32)).any(|t| t == head)
+        {
             continue;
-        }
-        if found.is_some() {
-            return None;
         }
         let Some(&last) = block.insts.last() else { return None };
         let args = match &func.insts[last.index()].op {
-            Op::Jump(target, args) if *target == head => args.clone(),
-            Op::Brif(_, t_blk, t_args, f_blk, _) if *t_blk == head && *f_blk != head => t_args.clone(),
-            Op::Brif(_, t_blk, _, f_blk, f_args) if *f_blk == head && *t_blk != head => f_args.clone(),
+            Op::Jump(target, args) if *target == head => args,
+            Op::Brif(_, t_blk, t_args, f_blk, _) if *t_blk == head && *f_blk != head => t_args,
+            Op::Brif(_, t_blk, _, f_blk, f_args) if *f_blk == head && *t_blk != head => f_args,
             _ => return None,
         };
-        found = Some(args);
+        if args.len() != param_len {
+            return None;
+        }
+        match &mut acc {
+            None => {
+                acc = Some(args.iter().map(|v| global_consts[v.index()]).collect());
+            }
+            Some(cur) => {
+                for (slot, v) in cur.iter_mut().zip(args.iter()) {
+                    *slot = slot.filter(|&c| global_consts[v.index()] == Some(c));
+                }
+            }
+        }
     }
-    found
+    acc
 }
 
 fn unroll_self(
@@ -113,14 +136,15 @@ fn unroll_self(
 ) -> bool {
     let head = Block(b as u32);
     let inst_count = func.blocks[b].insts.len();
-    if inst_count > 64 {
+    if inst_count > MAX_CHAIN_UNROLLED_INSTS + 1 {
         return false;
     }
-    let Some(init_args) = single_outside_pred(func, head, head) else { return false };
-    if init_args.len() != func.blocks[b].params.len() || back_args.len() != func.blocks[b].params.len() {
+    let Some(mut cur_params) = outside_const_params(func, cfg, head, head, global_consts) else {
+        return unroll_self_dynamic(func, cfg, b, cond, back_on_true, &back_args, exit_blk, global_consts);
+    };
+    if back_args.len() != func.blocks[b].params.len() {
         return false;
     }
-    let mut cur_params: Vec<Option<i64>> = init_args.iter().map(|v| global_consts[v.index()]).collect();
     let mut proven = None;
     for step in 0..=MAX_FULL_TRIPS {
         let mut env = global_consts.to_vec();
@@ -141,7 +165,11 @@ fn unroll_self(
         func.insts[last.index()].op = Op::Jump(exit_blk, exit_args);
         return true;
     }
-    if (back_steps + 1) * inst_count > MAX_FULL_INSTS {
+    let trips = back_steps + 1;
+    let body_count = inst_count.saturating_sub(1);
+    let fits_legacy = inst_count <= 64 && trips * inst_count <= MAX_FULL_INSTS;
+    let fits_small = trips <= MAX_CHAIN_TRIPS && trips * body_count <= MAX_CHAIN_UNROLLED_INSTS;
+    if !fits_legacy && !fits_small {
         return unroll_self_dynamic(func, cfg, b, cond, back_on_true, &back_args, exit_blk, global_consts);
     }
     let body_insts = func.blocks[b].insts[..inst_count - 1].to_vec();
@@ -157,7 +185,7 @@ fn unroll_self(
     let final_exit_args: Vec<Value> = exit_args.iter().map(|&v| remap_val(&last_map, v)).collect();
     let jump = func.add(Op::Jump(exit_blk, final_exit_args), None);
     func.blocks[b].insts.push(jump);
-    remap_other_blocks(func, b, None, &last_map);
+    remap_other_blocks(func, &[b], &last_map);
     true
 }
 
@@ -345,96 +373,309 @@ fn unroll_self_dynamic(
     true
 }
 
-fn unroll_two_block(
-    func: &mut Function,
-    cfg: &Cfg,
-    each: &Loop,
-    cond: Value,
-    (t_blk, t_args, f_blk, f_args): (Block, Vec<Value>, Block, Vec<Value>),
-    global_consts: &[Option<i64>],
-) -> bool {
+struct ChainSeg {
+    blk: Block,
+    params: Vec<Value>,
+    non_term: Vec<Inst>,
+    edge_args: Vec<Value>,
+}
+
+enum LoopChainKind {
+    TopTested {
+        cond: Value,
+        body_on_true: bool,
+        exit_blk: Block,
+        exit_args: Vec<Value>,
+    },
+    BottomTested {
+        cond: Value,
+        back_on_true: bool,
+        exit_blk: Block,
+        exit_args: Vec<Value>,
+    },
+}
+
+struct LoopChain {
+    segs: Vec<ChainSeg>,
+    kind: LoopChainKind,
+}
+
+fn seg_from_block(func: &Function, blk: Block, edge_args: Vec<Value>) -> ChainSeg {
+    let data = &func.blocks[blk.index()];
+    ChainSeg {
+        blk,
+        params: data.params.clone(),
+        non_term: data.insts[..data.insts.len() - 1].to_vec(),
+        edge_args,
+    }
+}
+
+fn clean_chain_block(func: &Function, cfg: &Cfg, each: &Loop, blk: Block) -> bool {
+    let idx = blk.index();
+    cfg.reachable.get(idx).copied().unwrap_or(false)
+        && each.body.get(idx).copied().unwrap_or(false)
+        && func.entry != Some(blk)
+        && (blk == each.head || cfg.pred_count(blk) == 1)
+        && !func.blocks[idx].insts.is_empty()
+        && !has_bad_non_term(func, idx)
+}
+
+fn push_params_map(map: &mut Vec<(Value, Value)>, params: &[Value], args: &[Value]) {
+    for (&p, &a) in params.iter().zip(args.iter()) {
+        map.push((p, a));
+    }
+}
+
+fn collect_chain(func: &Function, cfg: &Cfg, each: &Loop) -> Option<LoopChain> {
     let head = each.head;
-    let b = head.index();
-    let body_blk = each.latches[0];
-    let (body_on_true, body_args, exit_blk, exit_args) = if t_blk == body_blk {
-        (true, t_args, f_blk, f_args)
-    } else if f_blk == body_blk {
-        (false, f_args, t_blk, t_args)
-    } else {
-        return false;
+    let latch = each.latches[0];
+    if head == latch || !clean_chain_block(func, cfg, each, head) {
+        return None;
+    }
+    let head_last = *func.blocks[head.index()].insts.last()?;
+    let (mut cur, mut cur_args, mut segs, is_top, top_meta) = match &func.insts[head_last.index()].op {
+        Op::Jump(next_blk, next_args) if *next_blk != head => (
+            *next_blk,
+            next_args.clone(),
+            vec![seg_from_block(func, head, next_args.clone())],
+            false,
+            None,
+        ),
+        Op::Brif(cond, t_blk, t_args, f_blk, f_args) if t_blk != f_blk => {
+            let t_in = each.body.get(t_blk.index()).copied().unwrap_or(false);
+            let f_in = each.body.get(f_blk.index()).copied().unwrap_or(false);
+            let (body_on_true, body_blk, body_args, exit_blk, exit_args) = if t_in && !f_in && *t_blk != head {
+                (true, *t_blk, t_args.clone(), *f_blk, f_args.clone())
+            } else if f_in && !t_in && *f_blk != head {
+                (false, *f_blk, f_args.clone(), *t_blk, t_args.clone())
+            } else {
+                return None;
+            };
+            (
+                body_blk,
+                body_args.clone(),
+                vec![seg_from_block(func, head, body_args)],
+                true,
+                Some((*cond, body_on_true, exit_blk, exit_args)),
+            )
+        }
+        _ => return None,
     };
-    if func.entry == Some(body_blk)
-        || each.body.get(exit_blk.index()).copied().unwrap_or(false)
-        || cfg.pred_count(body_blk) != 1
-        || func.blocks[body_blk.index()].insts.is_empty()
-        || func.blocks[b].insts.len() + func.blocks[body_blk.index()].insts.len() > 64
-        || body_args.len() != func.blocks[body_blk.index()].params.len()
-        || has_bad_non_term(func, body_blk.index())
+
+    loop {
+        if segs.len() >= each.size
+            || segs.iter().any(|s| s.blk == cur)
+            || !clean_chain_block(func, cfg, each, cur)
+            || cur_args.len() != func.blocks[cur.index()].params.len()
+        {
+            return None;
+        }
+        let last = *func.blocks[cur.index()].insts.last()?;
+        if cur != latch {
+            let Op::Jump(nxt, nxt_args) = &func.insts[last.index()].op else { return None };
+            let nxt_args = nxt_args.clone();
+            segs.push(seg_from_block(func, cur, nxt_args.clone()));
+            cur = *nxt;
+            cur_args = nxt_args;
+            continue;
+        }
+        if segs.len() + 1 != each.size {
+            return None;
+        }
+        if is_top {
+            let Op::Jump(target, back_args) = &func.insts[last.index()].op else { return None };
+            if *target != head || back_args.len() != func.blocks[head.index()].params.len() {
+                return None;
+            }
+            segs.push(seg_from_block(func, cur, back_args.clone()));
+            let (cond, body_on_true, exit_blk, exit_args) = top_meta?;
+            return Some(LoopChain {
+                segs,
+                kind: LoopChainKind::TopTested {
+                    cond,
+                    body_on_true,
+                    exit_blk,
+                    exit_args,
+                },
+            });
+        }
+        let Op::Brif(cond, t_blk, t_args, f_blk, f_args) = &func.insts[last.index()].op else { return None };
+        if t_blk == f_blk {
+            return None;
+        }
+        let (back_on_true, back_args, exit_blk, exit_args) = if *t_blk == head {
+            (true, t_args.clone(), *f_blk, f_args.clone())
+        } else if *f_blk == head {
+            (false, f_args.clone(), *t_blk, t_args.clone())
+        } else {
+            return None;
+        };
+        if each.body.get(exit_blk.index()).copied().unwrap_or(false)
+            || back_args.len() != func.blocks[head.index()].params.len()
+        {
+            return None;
+        }
+        segs.push(seg_from_block(func, cur, back_args));
+        return Some(LoopChain {
+            segs,
+            kind: LoopChainKind::BottomTested {
+                cond: *cond,
+                back_on_true,
+                exit_blk,
+                exit_args,
+            },
+        });
+    }
+}
+
+fn eval_chain(
+    func: &Function,
+    chain: &LoopChain,
+    init_params: Vec<Option<i64>>,
+    global_consts: &[Option<i64>],
+    max_trips: usize,
+) -> Option<usize> {
+    let mut cur_head_params = init_params;
+    match &chain.kind {
+        LoopChainKind::TopTested {
+            cond, body_on_true, ..
+        } => {
+            for step in 0..=max_trips {
+                let mut env = global_consts.to_vec();
+                eval_block(func, chain.segs[0].blk.index(), &cur_head_params, &mut env);
+                let cond_val = env[cond.index()]?;
+                if (cond_val != 0) != *body_on_true {
+                    return Some(step);
+                }
+                if step == max_trips {
+                    return None;
+                }
+                let mut cur_args: Vec<Option<i64>> = chain.segs[0].edge_args.iter().map(|v| env[v.index()]).collect();
+                for seg in &chain.segs[1..] {
+                    eval_block(func, seg.blk.index(), &cur_args, &mut env);
+                    cur_args = seg.edge_args.iter().map(|v| env[v.index()]).collect();
+                }
+                cur_head_params = cur_args;
+            }
+            None
+        }
+        LoopChainKind::BottomTested {
+            cond, back_on_true, ..
+        } => {
+            for step in 0..max_trips {
+                let mut env = global_consts.to_vec();
+                let mut cur_args = cur_head_params;
+                for seg in &chain.segs {
+                    eval_block(func, seg.blk.index(), &cur_args, &mut env);
+                    cur_args = seg.edge_args.iter().map(|v| env[v.index()]).collect();
+                }
+                let cond_val = env[cond.index()]?;
+                if (cond_val != 0) != *back_on_true {
+                    return Some(step);
+                }
+                cur_head_params = cur_args;
+            }
+            None
+        }
+    }
+}
+
+fn unroll_chain(func: &mut Function, cfg: &Cfg, each: &Loop, global_consts: &[Option<i64>]) -> bool {
+    let Some(chain) = collect_chain(func, cfg, each) else { return false };
+    let head = chain.segs[0].blk;
+    let b = head.index();
+    let latch = each.latches[0];
+    let body_insts: usize = chain.segs.iter().map(|s| s.non_term.len()).sum();
+    let total_insts = body_insts + chain.segs.len();
+    let is_legacy_two = chain.segs.len() == 2 && matches!(chain.kind, LoopChainKind::TopTested { .. });
+    if (is_legacy_two && total_insts > 64 && body_insts > MAX_CHAIN_UNROLLED_INSTS)
+        || (!is_legacy_two && body_insts > MAX_CHAIN_UNROLLED_INSTS)
     {
         return false;
     }
-    let Some(&body_last) = func.blocks[body_blk.index()].insts.last() else { return false };
-    let Op::Jump(back_target, back_args) = &func.insts[body_last.index()].op else { return false };
-    if *back_target != head || back_args.len() != func.blocks[b].params.len() {
+    let Some(init_params) = outside_const_params(func, cfg, head, latch, global_consts) else { return false };
+    let max_trips = if is_legacy_two { MAX_FULL_TRIPS } else { MAX_CHAIN_TRIPS };
+    let Some(proven) = eval_chain(func, &chain, init_params, global_consts, max_trips) else {
+        return false;
+    };
+    let trips = match &chain.kind {
+        LoopChainKind::TopTested { .. } => proven,
+        LoopChainKind::BottomTested { .. } => proven + 1,
+    };
+    let head_len = chain.segs[0].non_term.len() + 1;
+    let fits_legacy = is_legacy_two && total_insts <= 64 && head_len + trips * total_insts <= MAX_FULL_INSTS;
+    let fits_chain = trips <= MAX_CHAIN_TRIPS && trips * body_insts <= MAX_CHAIN_UNROLLED_INSTS;
+    if trips > 0 && !fits_legacy && !fits_chain {
         return false;
     }
-    let back_args = back_args.clone();
-    let Some(init_args) = single_outside_pred(func, head, body_blk) else { return false };
-    if init_args.len() != func.blocks[b].params.len() {
-        return false;
-    }
-    let mut cur_head_params: Vec<Option<i64>> = init_args.iter().map(|v| global_consts[v.index()]).collect();
-    let mut proven = None;
-    for step in 0..=MAX_FULL_TRIPS {
-        let mut env = global_consts.to_vec();
-        eval_block(func, b, &cur_head_params, &mut env);
-        let Some(cond_val) = env[cond.index()] else { break };
-        if (cond_val != 0) != body_on_true {
-            proven = Some(step);
-            break;
+    let skip: Vec<usize> = chain.segs.iter().map(|s| s.blk.index()).collect();
+    match chain.kind {
+        LoopChainKind::TopTested {
+            exit_blk, exit_args, ..
+        } => {
+            if trips == 0 {
+                let last = *func.blocks[b].insts.last().unwrap_or(&Inst(0));
+                func.insts[last.index()].op = Op::Jump(exit_blk, exit_args);
+                for seg in &chain.segs[1..] {
+                    retire_block(func, seg.blk.index());
+                }
+                return true;
+            }
+            pop_terminator(func, b);
+            let mut head_map = Vec::new();
+            let mut cur_body_args = chain.segs[0].edge_args.clone();
+            for _ in 0..trips {
+                let mut iter_map = head_map.clone();
+                for seg in &chain.segs[1..] {
+                    push_params_map(&mut iter_map, &seg.params, &cur_body_args);
+                    clone_body(func, &seg.non_term, head, &mut iter_map);
+                    cur_body_args = seg.edge_args.iter().map(|&v| remap_val(&iter_map, v)).collect();
+                }
+                let mut next_head_map = Vec::new();
+                push_params_map(&mut next_head_map, &chain.segs[0].params, &cur_body_args);
+                clone_body(func, &chain.segs[0].non_term, head, &mut next_head_map);
+                head_map = next_head_map;
+                cur_body_args = chain.segs[0].edge_args.iter().map(|&v| remap_val(&head_map, v)).collect();
+            }
+            let final_exit_args: Vec<Value> = exit_args.iter().map(|&v| remap_val(&head_map, v)).collect();
+            let jump = func.add(Op::Jump(exit_blk, final_exit_args), None);
+            func.blocks[b].insts.push(jump);
+            remap_other_blocks(func, &skip, &head_map);
+            for seg in &chain.segs[1..] {
+                retire_block(func, seg.blk.index());
+            }
+            true
         }
-        if step == MAX_FULL_TRIPS {
-            break;
+        LoopChainKind::BottomTested {
+            exit_blk, exit_args, ..
+        } => {
+            pop_terminator(func, b);
+            let mut last_map = Vec::new();
+            let mut cur_edge_args = chain.segs[0].edge_args.clone();
+            for seg in &chain.segs[1..] {
+                push_params_map(&mut last_map, &seg.params, &cur_edge_args);
+                clone_body(func, &seg.non_term, head, &mut last_map);
+                cur_edge_args = seg.edge_args.iter().map(|&v| remap_val(&last_map, v)).collect();
+            }
+            for _ in 0..proven {
+                let mut step_map = Vec::new();
+                for seg in &chain.segs {
+                    push_params_map(&mut step_map, &seg.params, &cur_edge_args);
+                    clone_body(func, &seg.non_term, head, &mut step_map);
+                    cur_edge_args = seg.edge_args.iter().map(|&v| remap_val(&step_map, v)).collect();
+                }
+                last_map = step_map;
+            }
+            let final_exit_args: Vec<Value> = exit_args.iter().map(|&v| remap_val(&last_map, v)).collect();
+            let jump = func.add(Op::Jump(exit_blk, final_exit_args), None);
+            func.blocks[b].insts.push(jump);
+            remap_other_blocks(func, &skip, &last_map);
+            for seg in &chain.segs[1..] {
+                retire_block(func, seg.blk.index());
+            }
+            true
         }
-        let body_params: Vec<Option<i64>> = body_args.iter().map(|v| env[v.index()]).collect();
-        eval_block(func, body_blk.index(), &body_params, &mut env);
-        cur_head_params = back_args.iter().map(|v| env[v.index()]).collect();
     }
-    let Some(trips) = proven else { return false };
-    let head_len = func.blocks[b].insts.len();
-    let body_len = func.blocks[body_blk.index()].insts.len();
-    if trips == 0 {
-        let last = *func.blocks[b].insts.last().unwrap_or(&Inst(0));
-        func.insts[last.index()].op = Op::Jump(exit_blk, exit_args);
-        retire_block(func, body_blk.index());
-        return true;
-    }
-    if head_len + trips * (head_len + body_len) > MAX_FULL_INSTS {
-        return false;
-    }
-    let head_non_term = func.blocks[b].insts[..head_len - 1].to_vec();
-    let body_non_term = func.blocks[body_blk.index()].insts[..body_len - 1].to_vec();
-    pop_terminator(func, b);
-    let mut cur_body_args = body_args.clone();
-    let mut head_map: Vec<(Value, Value)> = Vec::new();
-    for _ in 0..trips {
-        let mut body_map = head_map.clone();
-        for (bp, ca) in func.blocks[body_blk.index()].params.iter().copied().zip(cur_body_args.iter().copied()) {
-            body_map.push((bp, ca));
-        }
-        clone_body(func, &body_non_term, head, &mut body_map);
-        let cur_back_args: Vec<Value> = back_args.iter().map(|&v| remap_val(&body_map, v)).collect();
-        let mut next_head_map: Vec<(Value, Value)> = func.blocks[b].params.iter().copied().zip(cur_back_args).collect();
-        clone_body(func, &head_non_term, head, &mut next_head_map);
-        head_map = next_head_map;
-        cur_body_args = body_args.iter().map(|&v| remap_val(&head_map, v)).collect();
-    }
-    let final_exit_args: Vec<Value> = exit_args.iter().map(|&v| remap_val(&head_map, v)).collect();
-    let jump = func.add(Op::Jump(exit_blk, final_exit_args), None);
-    func.blocks[b].insts.push(jump);
-    remap_other_blocks(func, b, Some(body_blk.index()), &head_map);
-    retire_block(func, body_blk.index());
-    true
 }
 
 fn collect_global_consts(func: &Function, cfg: &Cfg) -> Vec<Option<i64>> {
@@ -451,7 +692,7 @@ fn collect_global_consts(func: &Function, cfg: &Cfg) -> Vec<Option<i64>> {
     global_consts
 }
 
-/// Unrolls 1-block and 2-block natural loops with a statically provable constant trip count (`0..=64`) or dynamic counted loops.
+/// Unrolls clean 1-block and straight-line inner loops with constant or dynamic trip counts.
 pub(crate) fn run(func: &mut Function) -> Domain {
     if func.coroutine.is_some() {
         return Domain::NONE;
@@ -465,7 +706,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     for each in &loops.list {
         let head = each.head;
         let b = head.index();
-        if head == entry || each.size > 2 || each.latches.len() != 1 || func.blocks[b].insts.is_empty() || has_bad_non_term(func, b) {
+        if head == entry || each.size > MAX_CHAIN_BLOCKS || each.latches.len() != 1 || func.blocks[b].insts.is_empty() {
             continue;
         }
         if dirty {
@@ -473,26 +714,30 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             cfg = func.cfg();
             dirty = false;
         }
-        if cfg.pred_count(head) != 2 {
+        if !cfg.reachable.get(b).copied().unwrap_or(false) || cfg.pred_count(head) < 2 {
             continue;
         }
-        let Some(&last) = func.blocks[b].insts.last() else { continue };
-        let Op::Brif(cond, t_blk, t_args, f_blk, f_args) = &func.insts[last.index()].op else { continue };
-        if t_blk == f_blk {
-            continue;
-        }
-        let (cond, t_blk, t_args, f_blk, f_args) = (*cond, *t_blk, t_args.clone(), *f_blk, f_args.clone());
         global_consts.resize(func.types.len(), None);
         let did = if each.size == 1 && each.latches[0] == head {
-            if t_blk == head {
-                unroll_self(func, &cfg, b, cond, true, t_args, f_blk, f_args, &global_consts)
-            } else if f_blk == head {
-                unroll_self(func, &cfg, b, cond, false, f_args, t_blk, t_args, &global_consts)
+            if has_bad_non_term(func, b) {
+                false
+            } else if let Some(&last) = func.blocks[b].insts.last()
+                && let Op::Brif(cond, t_blk, t_args, f_blk, f_args) = &func.insts[last.index()].op
+                && t_blk != f_blk
+            {
+                let (cond, t_blk, t_args, f_blk, f_args) = (*cond, *t_blk, t_args.clone(), *f_blk, f_args.clone());
+                if t_blk == head {
+                    unroll_self(func, &cfg, b, cond, true, t_args, f_blk, f_args, &global_consts)
+                } else if f_blk == head {
+                    unroll_self(func, &cfg, b, cond, false, f_args, t_blk, t_args, &global_consts)
+                } else {
+                    false
+                }
             } else {
                 false
             }
-        } else if each.size == 2 && each.latches[0] != head {
-            unroll_two_block(func, &cfg, each, cond, (t_blk, t_args, f_blk, f_args), &global_consts)
+        } else if each.size >= 2 && each.latches[0] != head {
+            unroll_chain(func, &cfg, each, &global_consts)
         } else {
             false
         };

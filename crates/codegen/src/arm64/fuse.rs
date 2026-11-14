@@ -1,7 +1,9 @@
+mod mem;
+
 use super::asm::{Alu, ExtOp, Reg, Shift};
 use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
-use crate::live::{Sib, SibBase};
+pub(super) use mem::madd_parts;
 
 pub(super) fn const_of(func: &Function, plan: &Plan<Reg>, val: Value, def: impl Fn(Value) -> Option<Inst>) -> Option<i64> {
     plan.const_of(val).or_else(|| match func.insts[def(val)?.index()].op {
@@ -681,45 +683,13 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                 } else if alu_op == Binary::Isub && plan.const_of(x) == Some(0) {
                     done = try_fuse_flag_operand(func, plan, (&uses, &pos_of), (b_idx, pos), y);
                 }
-                if !done && alu_op == Binary::Iadd && plan.sib[res.index()].is_none() && uses[res.index()] >= 2 {
-                    let try_sib = |plan: &mut Plan<Reg>, base: Value, idx: Value, shift: i64, spos: usize, shl_elide: Option<Value>| -> bool {
-                        if plan.reg_of(base).is_none() || plan.reg_of(idx).is_none() { return false; }
-                        let (mut seen_uses, mut last_pos) = (0_u32, pos);
-                        for (u_pos, &u_inst) in block.insts.iter().enumerate().skip(pos + 1) {
-                            let u_data = &func.insts[u_inst.index()];
-                            let ty = match (&u_data.op, u_data.result) {
-                                (&Op::Load(addr, 0), Some(r)) if addr == res => Some(func.ty(r)),
-                                (&Op::Store(val, addr, 0), _) if addr == res && val != res => Some(func.ty(val)),
-                                _ => None,
-                            };
-                            if ty.is_some_and(|t| t != Type::I128 && (shift == 0 || t.bytes() == (1 << shift))) {
-                                seen_uses += 1;
-                                last_pos = u_pos;
-                            }
-                        }
-                        if seen_uses == uses[res.index()] && preserved(func, plan, b_idx, pos, last_pos, None, base) && preserved(func, plan, b_idx, spos, last_pos, None, idx) {
-                            plan.sib[res.index()] = Some(Sib { base: SibBase::Value(base), index: idx, shift: shift as u8, disp: 0 });
-                            plan.elided[res.index()] = true;
-                            if let Some(shl) = shl_elide && uses[shl.index()] == 1 && !plan.elided[shl.index()] {
-                                plan.elided[shl.index()] = true;
-                            }
-                            return true;
-                        }
-                        false
-                    };
-                    for (base, shl) in [(x, y), (y, x)] {
-                        if let Some((sb, spos, sinst)) = pos_of[shl.index()]
-                            && sb == b_idx && spos < pos
-                            && let Some((Binary::Ishl, idx, shift)) = shift_parts(&func.insts[sinst.index()].op, plan)
-                            && (1..=3).contains(&shift) && try_sib(plan, base, idx, shift, spos, Some(shl))
-                        {
-                            done = true;
-                            break;
-                        }
-                    }
-                    if !done { done = try_sib(plan, x, y, 0, pos, None); }
+                if !done && alu_op == Binary::Iadd {
+                    done = mem::try_fuse_sib(func, plan, (&uses, &pos_of), (b_idx, pos, res), (x, y));
                 }
                 if !done { done = try_fuse_extr(func, plan, &uses, &pos_of, (b_idx, pos, res), (alu_op, x, y)); }
+                if !done && matches!(alu_op, Binary::Iadd | Binary::Isub) {
+                    done = mem::try_fuse_madd(func, plan, (&uses, &pos_of), (b_idx, pos, res), (alu_op, x, y));
+                }
                 if !done && alu_op == Binary::Band { done = try_fuse_bfx(func, plan, (&uses, &pos_of), (b_idx, pos, res), (alu_op, x, y)); }
                 if !done { done = try_fuse_bnot(func, plan, (&uses, &pos_of), (b_idx, pos, res), (alu_op, x, y)); }
                 if !done && matches!(alu_op, Binary::Iadd | Binary::Isub) {

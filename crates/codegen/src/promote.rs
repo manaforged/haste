@@ -2,6 +2,8 @@ use rustc_hash::FxHashMap as HashMap;
 
 #[path = "promote_subword.rs"]
 mod subword;
+#[path = "promote/vec_slot.rs"]
+mod vec_slot;
 
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, InstData, Op, StackSlot, Type, Value};
 use crate::split::{End, Layouts};
@@ -734,8 +736,12 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
         });
         scan = Scan::new(func);
     }
-    let split_changed = moves == Moves::Split && subword::split(func, &scan);
+    let mut split_changed = moves == Moves::Split && subword::split(func, &scan);
     if split_changed {
+        scan = Scan::new(func);
+    }
+    if moves != Moves::Words && vec_slot::split(func, &scan) {
+        split_changed = true;
         scan = Scan::new(func);
     }
     let changed = ((0..func.slots.len()).any(|slot| scan.promotable(slot)) && promote(func, entry, scan)) || split_changed || dropped_zero;
