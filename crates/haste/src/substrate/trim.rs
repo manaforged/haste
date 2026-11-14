@@ -9,7 +9,7 @@ use super::{HEADER_LEN, INSTANCE_REC_LEN, PendingStencil, STENCIL_REC_LEN, SUMMA
 
 impl PendingStencil {
     fn cost(&self) -> usize {
-        STENCIL_REC_LEN + aligned8(self.code_len as usize) + aligned8(self.sites_len as usize) + aligned8(self.relocs_len as usize) + aligned8(self.plan_len as usize)
+        STENCIL_REC_LEN + aligned8(self.code_len as usize) + aligned8(self.sites_len as usize) + aligned8(self.relocs_len as usize) + aligned8(self.plan_len as usize) + aligned8(self.loops_len as usize)
     }
 }
 
@@ -52,6 +52,7 @@ impl SubstrateBuilder {
             (s.sites_off, s.sites_len) = push_aligned_blob(&mut self.blob, &old[s.sites_off as usize..s.sites_off as usize + s.sites_len as usize])?;
             (s.relocs_off, s.relocs_len) = push_aligned_blob(&mut self.blob, &old[s.relocs_off as usize..s.relocs_off as usize + s.relocs_len as usize])?;
             (s.plan_off, s.plan_len) = push_aligned_blob(&mut self.blob, &old[s.plan_off as usize..s.plan_off as usize + s.plan_len as usize])?;
+            (s.loops_off, s.loops_len) = push_aligned_blob(&mut self.blob, &old[s.loops_off as usize..s.loops_off as usize + s.loops_len as usize])?;
         }
         for i in &mut self.instances {
             (i.off, i.len) = push_aligned_blob(&mut self.blob, &old[i.off as usize..i.off as usize + i.len as usize])?;

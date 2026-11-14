@@ -17,6 +17,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::ops::Range;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -26,13 +27,14 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use haste_codegen::{Code, RelocKind, Site, StencilReloc};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 17;
+const VERSION: u32 = 19;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
-const STENCIL_REC_LEN: usize = 56;
+const STENCIL_REC_LEN: usize = 64;
 const INSTANCE_REC_LEN: usize = 24;
 const SITE_WIRE_LEN: usize = 12;
 const RELOC_WIRE_LEN: usize = 12;
+const LOOP_WIRE_LEN: usize = 8;
 
 /// Zero-copy view of a pre-compiled `Effort::Full` stencil in a substrate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +43,7 @@ pub struct StencilSlice<'a> {
     sites: &'a [u8],
     relocs: &'a [u8],
     plan: &'a [u8],
+    loops: &'a [u8],
 }
 
 impl<'a> StencilSlice<'a> {
@@ -56,41 +59,36 @@ impl<'a> StencilSlice<'a> {
 
     /// Decodes the unwind site table into `Site` records.
     pub fn decode_sites(&self) -> Result<Vec<Site>> {
-        if self.sites.len() % SITE_WIRE_LEN != 0 {
-            bail!("misaligned site table");
-        }
-        let mut out = Vec::with_capacity(self.sites.len() / SITE_WIRE_LEN);
-        for at in (0..self.sites.len()).step_by(SITE_WIRE_LEN) {
-            out.push(Site {
-                ret: read_u32(self.sites, at),
-                handler: read_u32(self.sites, at + 4),
-                frame_offset: read_u32(self.sites, at + 8),
-            });
-        }
-        Ok(out)
+        let sites = self.sites;
+        decode_table(sites, SITE_WIRE_LEN, "site", |at| {
+            Ok(Site { ret: read_u32(sites, at), handler: read_u32(sites, at + 4), frame_offset: read_u32(sites, at + 8) })
+        })
     }
 
     /// Decodes the relocation descriptor table into `StencilReloc` records.
     pub fn decode_relocs(&self) -> Result<Vec<StencilReloc>> {
-        if self.relocs.len() % RELOC_WIRE_LEN != 0 {
-            bail!("misaligned reloc table");
-        }
-        let mut out = Vec::with_capacity(self.relocs.len() / RELOC_WIRE_LEN);
-        for at in (0..self.relocs.len()).step_by(RELOC_WIRE_LEN) {
-            let kind = decode_reloc_kind(self.relocs[at + 8])?;
-            out.push(StencilReloc {
-                offset: read_u32(self.relocs, at),
-                symbol: read_u32(self.relocs, at + 4),
-                kind,
-            });
-        }
-        Ok(out)
+        let relocs = self.relocs;
+        decode_table(relocs, RELOC_WIRE_LEN, "reloc", |at| {
+            Ok(StencilReloc { offset: read_u32(relocs, at), symbol: read_u32(relocs, at + 4), kind: decode_reloc_kind(relocs[at + 8])? })
+        })
+    }
+
+    fn decode_loops(&self) -> Result<Vec<Range<u32>>> {
+        let loops = self.loops;
+        decode_table(loops, LOOP_WIRE_LEN, "loop", |at| Ok(read_u32(loops, at)..read_u32(loops, at + 4)))
     }
 
     /// Decodes this slice into a `Code` stencil buffer.
     pub fn to_code(&self) -> Result<Code> {
-        Ok(Code::from_parts(self.code.to_vec(), self.decode_sites()?, self.decode_relocs()?, Vec::new()))
+        Ok(Code::from_parts(self.code.to_vec(), self.decode_sites()?, self.decode_relocs()?, self.decode_loops()?))
     }
+}
+
+fn decode_table<T>(bytes: &[u8], width: usize, name: &str, entry: impl FnMut(usize) -> Result<T>) -> Result<Vec<T>> {
+    if bytes.len() % width != 0 {
+        bail!("misaligned {name} table");
+    }
+    (0..bytes.len()).step_by(width).map(entry).collect()
 }
 
 enum Backing {
@@ -191,6 +189,14 @@ pub fn encode_relocs(relocs: &[StencilReloc], out: &mut Vec<u8>) {
         out.extend_from_slice(&reloc.symbol.to_le_bytes());
         out.push(encode_reloc_kind(reloc.kind));
         out.extend_from_slice(&[0u8; 3]);
+    }
+}
+
+fn encode_loops(loops: &[Range<u32>], out: &mut Vec<u8>) {
+    out.reserve(loops.len() * LOOP_WIRE_LEN);
+    for range in loops {
+        out.extend_from_slice(&range.start.to_le_bytes());
+        out.extend_from_slice(&range.end.to_le_bytes());
     }
 }
 
@@ -309,12 +315,13 @@ impl Substrate {
             let k_hi = read_u64(data, rec + 16);
             (k_item, k_hi, k_lo).cmp(&(item_hash, fp_hi, fp_lo))
         })?;
-        let rec = self.header.stencils_off + idx * STENCIL_REC_LEN;
-        let code = self.blob_slice(read_u32(data, rec + 24) as usize, read_u32(data, rec + 28) as usize)?;
-        let sites = self.blob_slice(read_u32(data, rec + 32) as usize, read_u32(data, rec + 36) as usize)?;
-        let relocs = self.blob_slice(read_u32(data, rec + 40) as usize, read_u32(data, rec + 44) as usize)?;
-        let plan = self.blob_slice(read_u32(data, rec + 48) as usize, read_u32(data, rec + 52) as usize)?;
-        Some(StencilSlice { code, sites, relocs, plan })
+        self.stencil_at(self.header.stencils_off + idx * STENCIL_REC_LEN)
+    }
+
+    fn stencil_at(&self, rec: usize) -> Option<StencilSlice<'_>> {
+        let data = self.backing.as_slice();
+        let blob = |at: usize| self.blob_slice(read_u32(data, rec + at) as usize, read_u32(data, rec + at + 4) as usize);
+        Some(StencilSlice { code: blob(24)?, sites: blob(32)?, relocs: blob(40)?, plan: blob(48)?, loops: blob(56)? })
     }
 
     /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its parent.
@@ -397,6 +404,8 @@ struct PendingStencil {
     relocs_len: u32,
     plan_off: u32,
     plan_len: u32,
+    loops_off: u32,
+    loops_len: u32,
 }
 
 struct PendingInstance {
@@ -466,11 +475,7 @@ impl SubstrateBuilder {
             let fp_lo = read_u64(data, rec + 8);
             let fp_hi = read_u64(data, rec + 16);
             let footprint = u128::from(fp_lo) | (u128::from(fp_hi) << 64);
-            let code = existing.blob_slice(read_u32(data, rec + 24) as usize, read_u32(data, rec + 28) as usize).context("corrupt existing stencil code")?;
-            let sites = existing.blob_slice(read_u32(data, rec + 32) as usize, read_u32(data, rec + 36) as usize).context("corrupt existing stencil sites")?;
-            let relocs = existing.blob_slice(read_u32(data, rec + 40) as usize, read_u32(data, rec + 44) as usize).context("corrupt existing stencil relocs")?;
-            let plan = existing.blob_slice(read_u32(data, rec + 48) as usize, read_u32(data, rec + 52) as usize).context("corrupt existing stencil plan")?;
-            self.add_stencil_with_plan(item_hash, footprint, code, sites, relocs, plan)?;
+            self.push_stencil(item_hash, footprint, existing.stencil_at(rec).context("corrupt existing stencil")?)?;
         }
         for i in 0..existing.header.instance_count {
             let rec = existing.header.instances_off + i * INSTANCE_REC_LEN;
@@ -505,10 +510,15 @@ impl SubstrateBuilder {
 
     /// Appends a pre-compiled stencil entry with an optional serialized portable `RelocPlan`.
     pub fn add_stencil_with_plan(&mut self, item_hash: u64, footprint: u128, code: &[u8], sites: &[u8], relocs: &[u8], plan: &[u8]) -> Result<()> {
-        let (code_off, code_len) = self.push_blob(code)?;
-        let (sites_off, sites_len) = self.push_blob(sites)?;
-        let (relocs_off, relocs_len) = self.push_blob(relocs)?;
-        let (plan_off, plan_len) = self.push_blob(plan)?;
+        self.push_stencil(item_hash, footprint, StencilSlice { code, sites, relocs, plan, loops: &[] })
+    }
+
+    fn push_stencil(&mut self, item_hash: u64, footprint: u128, slice: StencilSlice<'_>) -> Result<()> {
+        let (code_off, code_len) = self.push_blob(slice.code)?;
+        let (sites_off, sites_len) = self.push_blob(slice.sites)?;
+        let (relocs_off, relocs_len) = self.push_blob(slice.relocs)?;
+        let (plan_off, plan_len) = self.push_blob(slice.plan)?;
+        let (loops_off, loops_len) = self.push_blob(slice.loops)?;
         self.stencils.push(PendingStencil {
             item_hash,
             fp_lo: footprint as u64,
@@ -521,6 +531,8 @@ impl SubstrateBuilder {
             relocs_len,
             plan_off,
             plan_len,
+            loops_off,
+            loops_len,
         });
         Ok(())
     }
@@ -537,7 +549,9 @@ impl SubstrateBuilder {
         encode_sites(code.sites(), &mut sites);
         let mut relocs = Vec::new();
         encode_relocs(code.relocs(), &mut relocs);
-        self.add_stencil_with_plan(item_hash, footprint, code.bytes(), &sites, &relocs, plan)
+        let mut loops = Vec::new();
+        encode_loops(code.loops(), &mut loops);
+        self.push_stencil(item_hash, footprint, StencilSlice { code: code.bytes(), sites: &sites, relocs: &relocs, plan, loops: &loops })
     }
 
     fn push_blob(&mut self, bytes: &[u8]) -> Result<(u32, u32)> {
@@ -607,6 +621,8 @@ impl SubstrateBuilder {
             out.extend_from_slice(&entry.relocs_len.to_le_bytes());
             out.extend_from_slice(&entry.plan_off.to_le_bytes());
             out.extend_from_slice(&entry.plan_len.to_le_bytes());
+            out.extend_from_slice(&entry.loops_off.to_le_bytes());
+            out.extend_from_slice(&entry.loops_len.to_le_bytes());
         }
         for entry in &self.instances {
             out.extend_from_slice(&entry.item_hash.to_le_bytes());
