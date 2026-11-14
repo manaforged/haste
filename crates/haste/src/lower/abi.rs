@@ -278,27 +278,33 @@ pub(super) fn packed_word_parts(size: u32) -> Parts {
     }
 }
 
-fn simd_vec_type(element: &Scalar, count: BackendLaneCount) -> Option<Type> {
+fn simd_vec_type(element: &Scalar, count: impl FnOnce(Lane) -> u64) -> Option<Type> {
     let dl = target().ok()?;
     let scalar = scalar_type(dl, element).ok()?;
     let lane = Lane::from_type(scalar)?;
-    let count = u8::try_from(count.as_u64()).ok()?;
+    let count = u8::try_from(count(lane)).ok()?;
     let ty = Type::Vec { lane, count };
     ty.is_valid_vec().then_some(ty)
 }
 
-/// The parts that a typed copy of a value of `layout` moves: its scalars, or contiguous word chunks up to 32 bytes when both scalars are a union's or the layout names none.
+fn simd_parts(element: &Scalar, count: BackendLaneCount, size: u64) -> Parts {
+    let native = matches!(Target::host().arch, Arch::X64 | Arch::Arm64);
+    let half = || simd_vec_type(element, |lane| u64::from(16 / lane.bytes())).filter(|_| native);
+    match (simd_vec_type(element, |_| count.as_u64()).filter(|_| native), size) {
+        (Some(ty), _) => Parts::One(ty),
+        (None, 8) => Parts::One(Type::I64),
+        (None, 16) => Parts::Pair(Type::I64, Type::I64, 8),
+        (None, 32) => half().map_or(Parts::Bytes, |half| Parts::Pair(half, half, 16)),
+        (None, 64) => half().map_or(Parts::Bytes, |half| Parts::Words([(half, 0), (half, 16), (half, 32), (half, 48)], 4)),
+        _ => Parts::Bytes,
+    }
+}
+
+/// The parts that a typed copy of a value of `layout` moves: its scalars, the 16-byte halves of a wider vector, or contiguous word chunks up to 32 bytes when both scalars are a union's or the layout names none.
 pub(super) fn copied_parts(layout: &Layout) -> Parts {
     match &layout.backend_repr {
         BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => word_parts(layout.size.bytes()),
-        BackendRepr::SimdVector { element, count } => match simd_vec_type(element, *count) {
-            Some(ty) if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Parts::One(ty),
-            _ => match layout.size.bytes() {
-                8 => Parts::One(Type::I64),
-                16 => Parts::Pair(Type::I64, Type::I64, 8),
-                _ => Parts::Bytes,
-            },
-        },
+        BackendRepr::SimdVector { element, count } => simd_parts(element, *count, layout.size.bytes()),
         _ => match parts(layout).unwrap_or(Parts::Bytes) {
             Parts::Bytes => word_parts(layout.size.bytes()),
             found => found,
@@ -406,7 +412,7 @@ fn x64_eightbytes(leaves: Option<&[(Type, i32)]>, size: u32) -> Passed {
 
 fn simd_native_type(element: &Scalar, count: BackendLaneCount, size: u32, arch: Arch) -> Result<Type> {
     if matches!(arch, Arch::X64 | Arch::Arm64)
-        && let Some(vec_ty) = simd_vec_type(element, count)
+        && let Some(vec_ty) = simd_vec_type(element, |_| count.as_u64())
     {
         return Ok(vec_ty);
     }

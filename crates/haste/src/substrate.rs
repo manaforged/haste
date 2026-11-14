@@ -26,7 +26,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use haste_codegen::{Code, RelocKind, Site, StencilReloc};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 15;
+const VERSION: u32 = 16;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 56;
