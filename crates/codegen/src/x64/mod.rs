@@ -44,6 +44,8 @@ const REGS_WIN64: Regs<Reg> = Regs {
     ..REGS
 };
 
+const INTAKE_XMM: Xmm = Xmm(15);
+
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
 const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
 
@@ -352,7 +354,12 @@ impl Emit<'_> {
         self.asm.bytes(if self.framed { &[0xC9, 0xC3] } else { &[0xC3] });
     }
 
-    fn copy_to(&mut self, to: Mem, from: Mem, ty: Type) {
+    fn copy_to(&mut self, to: Mem, from: Mem, ty: Type, scratch: Xmm) {
+        if ty.is_vector() && ty.bytes() == 16 {
+            self.xmm_load(ty, scratch, from);
+            self.clobber_xmm(scratch);
+            return self.store_xmm_home(to, scratch, ty);
+        }
         self.asm.load(Size::Q, Reg::Rax, from);
         self.asm.store(Size::Q, to, Reg::Rax);
         if ty.bytes() == 16 {
@@ -392,7 +399,7 @@ impl Emit<'_> {
         }
     }
 
-    fn load_home(&mut self, value: Value, from: Mem) {
+    fn load_home(&mut self, value: Value, from: Mem, scratch: Xmm) {
         match self.plan.locations[value.index()] {
             Location::Reg(reg) => {
                 self.asm.load(Size::Q, reg, from);
@@ -402,7 +409,7 @@ impl Emit<'_> {
                 self.xmm_load(self.ty(value), Xmm(xmm), from);
                 self.clobber_xmm(Xmm(xmm));
             }
-            _ => self.copy_to(self.at(value), from, self.ty(value)),
+            _ => self.copy_to(self.at(value), from, self.ty(value), scratch),
         }
     }
 
@@ -417,7 +424,7 @@ impl Emit<'_> {
                 Step::Save(arg, EdgeScratch::Float(i)) => self.fget(float_scratch[i], arg),
                 Step::Restore(EdgeScratch::Float(i), param) => self.fput(param, float_scratch[i]),
                 Step::Save(arg, EdgeScratch::Stack(i)) => self.move_to(Mem::new(Reg::Rbp, self.frame.edge_slot(i)), arg),
-                Step::Restore(EdgeScratch::Stack(i), param) => self.load_home(param, Mem::new(Reg::Rbp, self.frame.edge_slot(i))),
+                Step::Restore(EdgeScratch::Stack(i), param) => self.load_home(param, Mem::new(Reg::Rbp, self.frame.edge_slot(i)), float::X2),
             }
         }
         Ok(())
@@ -724,7 +731,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
         self.invalidate_spills();
     }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
-    fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, Mem::new(Reg::Rbp, INCOMING + offset as i32)); }
+    fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, Mem::new(Reg::Rbp, INCOMING + offset as i32), INTAKE_XMM); }
     fn intake_struct(&mut self, value: Value, offset: u32) {
         self.asm.lea(Reg::Rax, Mem::new(Reg::Rbp, INCOMING + offset as i32));
         self.clobber_reg(Reg::Rax);

@@ -5,7 +5,7 @@ pub(super) use fuse::fuse;
 pub(super) use patterns::{LEAF, Root, adc_plan, bextr_parts, shld_parts, unwrap_shift_mask};
 
 use super::asm::{Alu, Mem, Reg, Rm, Shift, Size, Xmm};
-use super::float::scalar;
+use super::float::{X2, scalar};
 use super::Emit;
 use crate::alloc::Location;
 use crate::frame::{Emitter, Ext};
@@ -431,7 +431,8 @@ impl Emit<'_> {
         }
     }
 
-    fn store_xmm_home(&mut self, to: Mem, xmm: Xmm, ty: Type) {
+    /// Stores the float or vector of type `ty` in `xmm` to `to` in one store and caches it as the spill of a frame home.
+    pub(super) fn store_xmm_home(&mut self, to: Mem, xmm: Xmm, ty: Type) {
         self.xmm_store(ty, to, xmm);
         if to.base == Reg::Rbp && to.index.is_none() {
             self.invalidate_disp(to.disp);
@@ -439,16 +440,14 @@ impl Emit<'_> {
         }
     }
 
-    /// Writes the eight (or sixteen) bytes of `value` to `to`, using rax as scratch; a float in a register writes the bytes of its type.
+    /// Writes the eight (or sixteen) bytes of `value` to `to`, using rax as scratch; a float in a register writes the bytes of its type and a 16-byte vector goes through xmm2 in one store.
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
         let stack_home = to.base == Reg::Rbp && to.index.is_none();
         let ty = self.ty(value);
         match self.location(value) {
-            Location::Imm(0) if ty.is_vector() => {
-                self.asm.store_imm(to, 0);
-                if ty.bytes() == 16 {
-                    self.asm.store_imm(to.offset(8), 0);
-                }
+            Location::Imm(0) if ty.is_vector() && ty.bytes() == 16 => {
+                self.zero_xmm(X2);
+                return self.store_xmm_home(to, X2, ty);
             }
             Location::Imm(imm) => match i32::try_from(imm) {
                 Ok(small) => self.asm.store_imm(to, small),
@@ -478,7 +477,7 @@ impl Emit<'_> {
                 {
                     return self.store_xmm_home(to, cached_reg, cached_ty);
                 }
-                return self.copy_to(to, self.at(value), ty);
+                return self.copy_to(to, self.at(value), ty, X2);
             }
         }
         if stack_home {
