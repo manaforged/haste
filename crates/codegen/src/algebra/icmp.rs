@@ -377,7 +377,7 @@ pub(super) fn eval_select(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: 
     if let Some(bit) = non_null_cmp(cx.func, &|v| cx.def(v), &|v| cx.sconst(v), (cc, x, y)) {
         return Some(Some(Op::Const(i64::from(bit))));
     }
-    if let Some(op) = ord::eval_three_way(cx, cc, x, y) {
+    if let Some(op) = ord::eval_three_way(cx, cc, x, y).or_else(|| ord::eval_unary_cmp(cx, cc, x, y)) {
         return Some(Some(op));
     }
     for (norm, val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {

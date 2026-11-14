@@ -1,6 +1,6 @@
 use crate::cse::flip_int_cc;
 use crate::fold::{constant, extend, holds};
-use crate::ir::{Binary, Convert, IntCC, Op, Value};
+use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
 
 use crate::algebra::RewriteCx;
 
@@ -142,6 +142,155 @@ pub(super) fn eval_three_way(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> O
             (true, false, true) => Op::Icmp(IntCC::NotEqual, tw.a, tw.b),
         };
         return Some(op);
+    }
+    None
+}
+
+fn peel_lossless_convs(cx: &RewriteCx, mut v: Value) -> Value {
+    for _ in 0..2 {
+        let Some(inst) = cx.def(v) else { break };
+        if let Op::Convert(Convert::Uextend | Convert::Sextend | Convert::Ireduce, inner) = cx.func.insts[inst.index()].op
+            && cx.func.ty(inner).is_small_int()
+        {
+            v = inner;
+        } else {
+            break;
+        }
+    }
+    v
+}
+
+fn eval_count_cmp(cx: &mut RewriteCx, norm: IntCC, expr_val: Value, imm: i64) -> Option<Op> {
+    let cmp_ty = cx.func.ty(expr_val);
+    let core = peel_lossless_convs(cx, expr_val);
+    let inst = cx.def(core)?;
+    let Op::Unary(uop @ (Unary::Popcnt | Unary::Clz | Unary::Ctz), s) = cx.func.insts[inst.index()].op else {
+        return None;
+    };
+    let src_ty = cx.func.ty(s);
+    if !src_ty.is_small_int() {
+        return None;
+    }
+    let w = i64::from(src_ty.bits());
+    let mut sat_count = 0_i64;
+    let (mut sat_0, mut sat_w, mut sat_wm1) = (false, false, false);
+    for v in 0..=w {
+        if holds(norm, cmp_ty, v, imm) {
+            sat_count += 1;
+            if v == 0 {
+                sat_0 = true;
+            }
+            if v == w {
+                sat_w = true;
+            }
+            if v == w - 1 {
+                sat_wm1 = true;
+            }
+        }
+    }
+    if sat_count == 0 {
+        return Some(Op::Const(0));
+    }
+    if sat_count == w + 1 {
+        return Some(Op::Const(1));
+    }
+    let cmp_const = |cx: &mut RewriteCx, cc: IntCC, k: i64| {
+        let c = cx.emit(src_ty, Op::Const(k));
+        Op::Icmp(cc, s, c)
+    };
+    match uop {
+        Unary::Popcnt => {
+            if sat_count == 1 && sat_0 {
+                return Some(cmp_const(cx, IntCC::Equal, 0));
+            }
+            if sat_count == w && !sat_0 {
+                return Some(cmp_const(cx, IntCC::NotEqual, 0));
+            }
+            let all_ones = extend(-1, src_ty, true);
+            if sat_count == 1 && sat_w {
+                return Some(cmp_const(cx, IntCC::Equal, all_ones));
+            }
+            if sat_count == w && !sat_w {
+                return Some(cmp_const(cx, IntCC::NotEqual, all_ones));
+            }
+        }
+        Unary::Clz | Unary::Ctz => {
+            if sat_count == 1 && sat_w {
+                return Some(cmp_const(cx, IntCC::Equal, 0));
+            }
+            if sat_count == w && !sat_w {
+                return Some(cmp_const(cx, IntCC::NotEqual, 0));
+            }
+            if uop == Unary::Clz {
+                if sat_count == 1 && sat_wm1 {
+                    return Some(cmp_const(cx, IntCC::Equal, 1));
+                }
+                if sat_count == w && !sat_wm1 {
+                    return Some(cmp_const(cx, IntCC::NotEqual, 1));
+                }
+                if sat_count == 1 && sat_0 {
+                    return Some(cmp_const(cx, IntCC::SignedLessThan, 0));
+                }
+                if sat_count == w && !sat_0 {
+                    return Some(cmp_const(cx, IntCC::SignedGreaterThanOrEqual, 0));
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn is_involution(uop: Unary, ty: Type) -> bool {
+    match uop {
+        Unary::Bswap => ty.bits() >= 16,
+        Unary::Bitrev | Unary::Bnot | Unary::Ineg => true,
+        _ => false,
+    }
+}
+
+fn apply_involution(uop: Unary, ty: Type, a: i64) -> i64 {
+    let unused = 64 - ty.bits();
+    let u = extend(a, ty, false) as u64;
+    match uop {
+        Unary::Ineg => a.wrapping_neg(),
+        Unary::Bnot => !a,
+        Unary::Bswap => (u.swap_bytes() >> unused) as i64,
+        Unary::Bitrev => (u.reverse_bits() >> unused) as i64,
+        _ => a,
+    }
+}
+
+pub(super) fn eval_unary_cmp(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    for (norm, expr_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+        if let Some(imm) = cx.sconst(c_val)
+            && let Some(op) = eval_count_cmp(cx, norm, expr_val, imm)
+        {
+            return Some(op);
+        }
+    }
+    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) {
+        return None;
+    }
+    let ty = cx.func.ty(x);
+    if let (Some(xi), Some(yi)) = (cx.def(x), cx.def(y))
+        && let Op::Unary(ux, a) = cx.func.insts[xi.index()].op
+        && let Op::Unary(uy, b) = cx.func.insts[yi.index()].op
+        && ux == uy
+        && is_involution(ux, ty)
+    {
+        return Some(Op::Icmp(cc, a, b));
+    }
+    for (expr_val, c_val) in [(x, y), (y, x)] {
+        if let Some(imm) = cx.sconst(c_val)
+            && let Some(inst) = cx.def(expr_val)
+            && let Op::Unary(uop, a) = cx.func.insts[inst.index()].op
+            && is_involution(uop, ty)
+        {
+            let inv = apply_involution(uop, ty, imm);
+            let c2 = cx.emit(ty, Op::Const(inv));
+            return Some(Op::Icmp(cc, a, c2));
+        }
     }
     None
 }
