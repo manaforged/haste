@@ -262,27 +262,20 @@ impl Emit<'_> {
 
     fn emit_two_vec_imm(&mut self, op: u8, dst: Xmm, stay: Value, src_val: Value, imm: u8) {
         if self.features.avx {
-            let s_stay = self.fin(stay, dst);
+            let [s_stay] = self.fins(dst, false, [stay], &[src_val]);
             let src = self.foperand(src_val, X0);
             self.asm.vex_xmm_imm(0b00011, 0b01, op, (dst, s_stay), src, imm);
             self.clobber_xmms(&[X0, dst]);
             return;
         }
-        let scratch = if dst == X0 { X1 } else { X0 };
-        let mut src = self.fin(src_val, scratch);
-        if src == dst {
-            self.asm.movaps(scratch, src);
-            self.clobber_xmm(scratch);
-            src = scratch;
-        }
-        self.fget(dst, stay);
+        let [_, src] = self.fins(dst, true, [stay, src_val], &[]);
         self.asm.sse_imm(&[0x66], &[0x0F, 0x3A, op], dst.0, src, imm);
     }
 
     fn vector_shuffle_dyn_ssse3(&mut self, count: u8, a: Value, b: Value, mask_v: Value, dst: Xmm) {
         if a == b && count == 16 {
             if self.features.avx {
-                let src_a = self.fin(a, dst);
+                let [src_a] = self.fins(dst, false, [a], &[mask_v]);
                 let src_m = self.foperand(mask_v, X0);
                 self.asm.vex_xmm(0b00010, 0b01, 0x00, (dst, src_a), src_m);
                 self.clobber_xmm(X0);
@@ -310,7 +303,7 @@ impl Emit<'_> {
             self.clobber_xmms(&[X0, X1, X2]);
             return;
         }
-        if self.features.avx && dst != X2 && self.xmm_of(mask_v) != Some(dst) && self.xmm_of(b) != Some(dst) {
+        if self.features.avx && dst != X2 && !self.lives(dst, &[mask_v, b]) {
             self.splat_imm(Lane::I8, X1, i64::from(count - 1));
             let m = self.fin(mask_v, X0);
             self.asm.vex_xmm(0b00001, 0b01, 0x64, (X2, m), X1);
@@ -336,7 +329,7 @@ impl Emit<'_> {
         self.fget(X0, a);
         self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], X0.0, X2);
         self.clobber_xmm(X0);
-        let save_stack = dst == X2 || self.xmm_of(mask_v) == Some(dst) || self.xmm_of(b) == Some(dst);
+        let save_stack = dst == X2 || self.lives(dst, &[mask_v, b]);
         if save_stack {
             self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
             self.asm.sse(&[0xF3], &[0x0F, 0x7F], X0.0, Mem::new(Reg::Rsp, 0));
@@ -450,12 +443,7 @@ impl Emit<'_> {
         };
         let dst = self.xmm_of(result).unwrap_or(X2);
         if lane.is_float() {
-            let mut s = self.fin(x, X1);
-            if s == dst {
-                self.asm.movaps(X1, s);
-                s = X1;
-            }
-            self.fget(dst, v);
+            let [_, s] = self.fins(dst, true, [v, x], &[]);
             match (lane, idx) {
                 (Lane::F32, 0) => self.asm.sse(&[0xF3], &[0x0F, 0x10], dst.0, s),
                 (Lane::F32, _) if self.features.sse41 => {

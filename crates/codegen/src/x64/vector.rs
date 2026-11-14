@@ -64,12 +64,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn packed_regs(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), dst: Xmm) {
-        let mut source = self.fin(y, X1);
-        if source == dst && x != y {
-            self.asm.movaps(X1, source);
-            source = X1;
-        }
-        self.fget(dst, x);
+        let [_, source] = self.fins(dst, true, [x, y], &[]);
         self.asm.sse(prefix, opcode, dst.0, source);
     }
 
@@ -546,6 +541,7 @@ impl Emit<'_> {
             self.splat_imm(lane, dst, sign);
             self.asm.sse(&[0x66], &[0x0F, 0xEF], a.0, dst);
             self.asm.sse(&[0x66], &[0x0F, 0xEF], b.0, dst);
+            self.clobber_xmms(&[a, b]);
         }
         let eq_opc: &[u8] = match lane {
             Lane::I8 => &[0x0F, 0x74],
@@ -591,12 +587,7 @@ impl Emit<'_> {
             let pp = if lane == Lane::F64 { 0b01 } else { 0b00 };
             self.asm.vex_xmm_imm(0b00001, pp, 0xC2, (dst, sx), sy, imm);
         } else {
-            let mut src = self.fin(right, X1);
-            if src == dst && left != right {
-                self.asm.movaps(X1, src);
-                src = X1;
-            }
-            self.fget(dst, left);
+            let [_, src] = self.fins(dst, true, [left, right], &[]);
             self.asm.sse_imm(vec_prefix(lane), &[0x0F, 0xC2], dst.0, src, imm);
         }
         self.fput(result, dst);
@@ -615,18 +606,11 @@ impl Emit<'_> {
     pub(super) fn vector_select(&mut self, cond: Value, x: Value, y: Value, result: Value) {
         let dst = self.xmm_of(result).unwrap_or(X2);
         if self.features.avx {
-            let mask = self.fin(cond, X0);
-            let sy = self.fin(y, dst);
-            let sx = self.fin(x, X1);
+            let [sy, mask, sx] = self.fins(dst, false, [y, cond, x], &[]);
             self.asm.vex_xmm_imm(0b00011, 0b01, 0x4C, (dst, sy), sx, mask.0 << 4);
         } else if self.features.sse41 {
             self.fget(X0, cond);
-            let mut src = self.fin(x, X1);
-            if src == dst && x != y {
-                self.asm.movaps(X1, src);
-                src = X1;
-            }
-            self.fget(dst, y);
+            let [_, src] = self.fins(dst, true, [y, x], &[]);
             self.asm.sse(&[0x66], &[0x0F, 0x38, 0x10], dst.0, src);
         } else {
             self.fget(X1, cond);

@@ -27,6 +27,33 @@ impl Emit<'_> {
         self.asm.pshift_imm(ext, lane_bytes, dst, imm);
     }
 
+    pub(super) fn lives(&self, dst: Xmm, vals: &[Value]) -> bool {
+        vals.iter().any(|&v| self.xmm_of(v) == Some(dst))
+    }
+
+    pub(super) fn fins<const N: usize>(&mut self, dst: Xmm, tied: bool, vals: [Value; N], rest: &[Value]) -> [Xmm; N] {
+        debug_assert!(!tied || rest.is_empty(), "a tied operand overwrites dst before rest is read");
+        let mut free = (!tied && !self.lives(dst, &vals) && !self.lives(dst, rest)).then_some(dst);
+        let mut spare = [X1, X0, X2].into_iter().filter(|&xmm| xmm != dst);
+        let mut regs = [dst; N];
+        for i in usize::from(tied)..N {
+            let v = vals[i];
+            regs[i] = if let Some(first) = vals[..i].iter().position(|&u| u == v) {
+                regs[first]
+            } else if let Some(home) = self.xmm_of(v).filter(|&xmm| !tied || xmm != dst) {
+                home
+            } else {
+                let Some(to) = free.take().or_else(|| spare.next()) else { unreachable!() };
+                self.fget(to, v);
+                to
+            };
+        }
+        if tied {
+            self.fget(dst, vals[0]);
+        }
+        regs
+    }
+
     fn splat_const(&self, v: Value) -> Option<i64> {
         let (_, count) = self.ty(v).vec_shape()?;
         let scalar = self.splat_source(v, count)?;
