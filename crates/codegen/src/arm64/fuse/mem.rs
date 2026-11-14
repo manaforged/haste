@@ -46,7 +46,9 @@ pub(super) fn try_fuse_sib(
                 *slot = Some(ev);
             }
         }
-        if preserved(func, plan, b_idx, pos, last_pos, None, base)
+        let shift_clobbers_idx = elide[0].is_some_and(|kept| kept != idx && !plan.elided[kept.index()] && plan.reg_of(kept) == plan.reg_of(idx));
+        if !shift_clobbers_idx
+            && preserved(func, plan, b_idx, pos, last_pos, None, base)
             && preserved(func, plan, b_idx, idx_pos, last_pos, None, idx)
         {
             plan.sib[res.index()] = Some(Sib { base: SibBase::Value(base), index: idx, shift: shift as u8, disp: 0 });
