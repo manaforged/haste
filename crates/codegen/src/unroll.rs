@@ -1,3 +1,5 @@
+mod region;
+
 use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};
 use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, IntCC, Op, Type, Value};
@@ -8,7 +10,8 @@ const MAX_CHAIN_BLOCKS: usize = 8;
 const MAX_CHAIN_TRIPS: usize = 64;
 const MAX_CHAIN_UNROLLED_INSTS: usize = 384;
 
-fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
+/// The value the latest entry of `map` renames `v` to, or `v` when none does.
+pub(crate) fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
     map.iter().rev().find(|&&(old, _)| old == v).map_or(v, |&(_, new)| new)
 }
 
@@ -82,43 +85,48 @@ fn retire_block(func: &mut Function, blk_idx: usize) {
     func.blocks[blk_idx].params.clear();
 }
 
+fn edge_args(func: &Function, pred: Block, head: Block) -> Option<&[Value]> {
+    match func.last(pred)? {
+        Op::Jump(target, args) if *target == head => Some(args.as_slice()),
+        Op::Brif(_, t_blk, t_args, f_blk, _) if *t_blk == head && *f_blk != head => Some(t_args.as_slice()),
+        Op::Brif(_, t_blk, _, f_blk, f_args) if *f_blk == head && *t_blk != head => Some(f_args.as_slice()),
+        _ => None,
+    }
+}
+
+fn meet(known: &mut Option<Vec<Option<i64>>>, args: &[Value], env: &[Option<i64>]) {
+    match known {
+        None => *known = Some(args.iter().map(|arg| env[arg.index()]).collect()),
+        Some(known) => {
+            for (slot, arg) in known.iter_mut().zip(args) {
+                *slot = slot.filter(|&imm| env[arg.index()] == Some(imm));
+            }
+        }
+    }
+}
+
 fn outside_const_params(
     func: &Function,
     cfg: &Cfg,
     head: Block,
-    back_pred: Block,
+    latches: &[Block],
     global_consts: &[Option<i64>],
 ) -> Option<Vec<Option<i64>>> {
     let param_len = func.blocks[head.index()].params.len();
     let mut acc: Option<Vec<Option<i64>>> = None;
-    for (p, block) in func.blocks.iter().enumerate() {
+    for p in 0..func.blocks.len() {
         if p == head.index()
-            || p == back_pred.index()
+            || latches.contains(&Block(p as u32))
             || !cfg.reachable.get(p).copied().unwrap_or(false)
             || !func.successors(Block(p as u32)).any(|t| t == head)
         {
             continue;
         }
-        let Some(&last) = block.insts.last() else { return None };
-        let args = match &func.insts[last.index()].op {
-            Op::Jump(target, args) if *target == head => args,
-            Op::Brif(_, t_blk, t_args, f_blk, _) if *t_blk == head && *f_blk != head => t_args,
-            Op::Brif(_, t_blk, _, f_blk, f_args) if *f_blk == head && *t_blk != head => f_args,
-            _ => return None,
-        };
+        let args = edge_args(func, Block(p as u32), head)?;
         if args.len() != param_len {
             return None;
         }
-        match &mut acc {
-            None => {
-                acc = Some(args.iter().map(|v| global_consts[v.index()]).collect());
-            }
-            Some(cur) => {
-                for (slot, v) in cur.iter_mut().zip(args.iter()) {
-                    *slot = slot.filter(|&c| global_consts[v.index()] == Some(c));
-                }
-            }
-        }
+        meet(&mut acc, args, global_consts);
     }
     acc
 }
@@ -139,7 +147,7 @@ fn unroll_self(
     if inst_count > MAX_CHAIN_UNROLLED_INSTS + 1 {
         return false;
     }
-    let Some(mut cur_params) = outside_const_params(func, cfg, head, head, global_consts) else {
+    let Some(mut cur_params) = outside_const_params(func, cfg, head, &[head], global_consts) else {
         return unroll_self_dynamic(func, cfg, b, cond, back_on_true, &back_args, exit_blk, global_consts);
     };
     if back_args.len() != func.blocks[b].params.len() {
@@ -584,7 +592,6 @@ fn unroll_chain(func: &mut Function, cfg: &Cfg, each: &Loop, global_consts: &[Op
     let Some(chain) = collect_chain(func, cfg, each) else { return false };
     let head = chain.segs[0].blk;
     let b = head.index();
-    let latch = each.latches[0];
     let body_insts: usize = chain.segs.iter().map(|s| s.non_term.len()).sum();
     let total_insts = body_insts + chain.segs.len();
     let is_two_seg = chain.segs.len() == 2;
@@ -593,7 +600,7 @@ fn unroll_chain(func: &mut Function, cfg: &Cfg, each: &Loop, global_consts: &[Op
     {
         return false;
     }
-    let Some(init_params) = outside_const_params(func, cfg, head, latch, global_consts) else { return false };
+    let Some(init_params) = outside_const_params(func, cfg, head, &each.latches, global_consts) else { return false };
     let max_trips = if is_two_seg { MAX_FULL_TRIPS } else { MAX_CHAIN_TRIPS };
     let Some(proven) = eval_chain(func, &chain, init_params, global_consts, max_trips) else {
         return false;
@@ -692,7 +699,7 @@ fn collect_global_consts(func: &Function, cfg: &Cfg) -> Vec<Option<i64>> {
     global_consts
 }
 
-/// Unrolls clean 1-block and straight-line inner loops with constant or dynamic trip counts.
+/// Unrolls clean 1-block and straight-line inner loops with constant or dynamic trip counts, and constant-trip loops whose bodies branch or leave early.
 pub(crate) fn run(func: &mut Function) -> Domain {
     if func.coroutine.is_some() {
         return Domain::NONE;
@@ -707,7 +714,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     for each in &loops.list {
         let head = each.head;
         let b = head.index();
-        if head == entry || each.size > MAX_CHAIN_BLOCKS || each.latches.len() != 1 || func.blocks[b].insts.is_empty() {
+        if head == entry || each.size > MAX_CHAIN_BLOCKS || func.blocks[b].insts.is_empty() {
             continue;
         }
         if dirty {
@@ -719,7 +726,9 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             continue;
         }
         global_consts.resize(func.types.len(), None);
-        let did = if each.size == 1 && each.latches[0] == head {
+        let did = if each.latches.len() != 1 {
+            region::unroll(func, &cfg, each, &global_consts)
+        } else if each.size == 1 && each.latches[0] == head {
             if has_bad_non_term(func, b) {
                 false
             } else if let Some(&last) = func.blocks[b].insts.last()
@@ -738,7 +747,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 false
             }
         } else if each.size >= 2 && each.latches[0] != head {
-            unroll_chain(func, &cfg, each, &global_consts)
+            unroll_chain(func, &cfg, each, &global_consts) || region::unroll(func, &cfg, each, &global_consts)
         } else {
             false
         };

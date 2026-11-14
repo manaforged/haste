@@ -1,9 +1,6 @@
 use crate::cfg::{self, Cfg, Loop};
 use crate::ir::{Block, BlockData, Domain, Function, Inst, Op, Value};
-
-fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
-    map.iter().rev().find(|&&(old, _)| old == v).map_or(v, |&(_, new)| new)
-}
+use crate::unroll::remap_val;
 
 fn safe_head_inst(func: &Function, inst: Inst) -> bool {
     let op = &func.insts[inst.index()].op;
