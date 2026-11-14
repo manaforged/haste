@@ -1,5 +1,5 @@
 use crate::cfg::{self, Cfg, Loop};
-use crate::ir::{Block, BlockData, Domain, Function, Inst, Op, Value};
+use crate::ir::{Block, BlockData, Domain, Function, Inst, Op, Type, Value};
 use crate::mem::{LoopMem, MemLoc, MemRoot, PromoteBase, PromoteCand, Provenance};
 use crate::merge::{find, identity, rename};
 
@@ -469,13 +469,9 @@ fn can_hoist_global_load(func: &Function, mem: &LoopMem, prov: &Provenance, head
 
 const MAX_HOISTED_SYMBOLS: usize = 4;
 const MAX_LOOP_GP_LIVE: usize = 18;
+const MAX_LOOP_VEC_LIVE: usize = 11;
 
-fn is_gp_value(func: &Function, v: Value) -> bool {
-    let ty = func.ty(v);
-    !ty.is_vector() && !ty.is_float()
-}
-
-fn loop_gp_live(func: &Function, each: &Loop, home: &[Option<Block>]) -> usize {
+fn loop_live_counts(func: &Function, each: &Loop, home: &[Option<Block>]) -> (usize, usize) {
     let n = func.types.len();
     let mut is_const = vec![false; n];
     for data in &func.insts {
@@ -484,29 +480,34 @@ fn loop_gp_live(func: &Function, each: &Loop, home: &[Option<Block>]) -> usize {
         }
     }
     let mut seen = vec![false; n];
-    let mut live = 0_usize;
-    for &p in &func.blocks[each.head.index()].params {
-        if is_gp_value(func, p) && !seen[p.index()] {
-            seen[p.index()] = true;
-            live += 1;
+    let mut gp_live = 0_usize;
+    let mut vec_live = 0_usize;
+    let mut count = |v: Value| {
+        if !seen[v.index()] {
+            seen[v.index()] = true;
+            if func.ty(v).in_float_register() {
+                vec_live += 1;
+            } else {
+                gp_live += 1;
+            }
         }
+    };
+    for &p in &func.blocks[each.head.index()].params {
+        count(p);
     }
     for b in (0..each.body.len()).filter(|&b| each.body[b]) {
         for &inst in &func.blocks[b].insts {
             func.insts[inst.index()].op.for_operands(|v| {
                 let vi = v.index();
-                if !seen[vi]
-                    && !is_const[vi]
-                    && is_gp_value(func, v)
+                if !is_const[vi]
                     && home.get(vi).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false))
                 {
-                    seen[vi] = true;
-                    live += 1;
+                    count(v);
                 }
             });
         }
     }
-    live
+    (gp_live, vec_live)
 }
 
 fn hoist(
@@ -518,8 +519,11 @@ fn hoist(
     home: &mut [Option<Block>],
 ) -> bool {
     let mem = LoopMem::analyze(func, each, prov);
-    let gp_live = loop_gp_live(func, each, home);
+    let (gp_live, vec_live) = loop_live_counts(func, each, home);
+    let uses = func.use_counts();
+    let mut hoisted_vec = vec![false; func.types.len()];
     let mut hoisted_symbols = 0_usize;
+    let mut hoisted_vecs = 0_usize;
     let mut moved: Vec<Inst> = Vec::new();
     for &blk in &cfg.rpo {
         let block = blk.index();
@@ -538,14 +542,25 @@ fn hoist(
             let is_symbol = matches!(op, Op::Symbol(_));
             let static_loc = matches!(op, Op::StackAddr(..) | Op::SlotAddr(_));
             let sym_ok = !mem.calls || (hoisted_symbols < MAX_HOISTED_SYMBOLS && gp_live + hoisted_symbols < MAX_LOOP_GP_LIVE);
+            let res_ty = func.insts[inst.index()].result.map(|r| func.ty(r));
+            let is_vec_mat = res_ty.is_some_and(Type::in_float_register)
+                && matches!(op, Op::Insert(..) | Op::Shuffle(..) | Op::Const(_) | Op::Load(..) | Op::StackLoad(..));
+            let replaces_single_use = matches!(op, Op::Insert(prev, ..) if hoisted_vec[prev.index()] && uses[prev.index()] == 1);
+            let vec_ok = !is_vec_mat || replaces_single_use || vec_live + hoisted_vecs < MAX_LOOP_VEC_LIVE;
             let movable = (op.is_speculable() && !(mem.calls && static_loc) && (!is_symbol || sym_ok))
                 || mem.can_hoist_load(func, prov, head_prefix, inst)
                 || can_hoist_global_load(func, &mem, prov, head_prefix, inst);
             let mut operands_invariant = true;
             op.for_operands(|v| operands_invariant &= home.get(v.index()).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false)));
-            if movable && operands_invariant && let Some(res) = func.insts[inst.index()].result {
+            if movable && vec_ok && operands_invariant && let Some(res) = func.insts[inst.index()].result {
                 if is_symbol {
                     hoisted_symbols += 1;
+                }
+                if is_vec_mat {
+                    if !replaces_single_use {
+                        hoisted_vecs += 1;
+                    }
+                    hoisted_vec[res.index()] = true;
                 }
                 home[res.index()] = Some(entry);
                 moved.push(inst);

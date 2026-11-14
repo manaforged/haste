@@ -160,6 +160,7 @@ impl LoopMem {
                         .is_some_and(|e| e <= u64::from(prov.ro_bytes.get(addr.index()).copied().unwrap_or(0)));
                 let mut trap_ok = head_prefix || deref_ok;
                 let mut readonly_ok = false;
+                let mut call_safe = false;
                 let root_ok = match loc.root {
                     MemRoot::Slot(slot) => {
                         if loc.offset >= 0
@@ -167,8 +168,9 @@ impl LoopMem {
                         {
                             trap_ok = true;
                         }
-                        (prov.slot_unescaped(slot) || (prov.slot_call_readonly(slot) && !self.unknown_mem_writes))
-                            && !self.slot_writes.any(slot.index())
+                        let slot_safe = prov.slot_unescaped(slot) || (prov.slot_call_readonly(slot) && !self.unknown_mem_writes);
+                        call_safe = slot_safe && !self.slot_writes.any(slot.index());
+                        (slot_safe || (!self.calls && !self.unknown_mem_writes)) && !self.slot_writes.any(slot.index())
                     }
                     MemRoot::NoAliasParam(p) => {
                         let is_entry = entry_param(func, p).is_some_and(|ep| loc.base == MemBase::Addr(ep));
@@ -184,6 +186,7 @@ impl LoopMem {
                         if param_ro && no_param_write {
                             readonly_ok = true;
                         }
+                        call_safe = no_param_write && prov.noalias_unescaped(p);
                         no_param_write && (prov.noalias_unescaped(p) || !self.unknown_mem_writes)
                     }
                     MemRoot::ReadonlyParam(p) => {
@@ -198,7 +201,7 @@ impl LoopMem {
                 if self.atomics || !trap_ok {
                     return false;
                 }
-                if readonly_ok {
+                if readonly_ok || call_safe {
                     return true;
                 }
                 !self.calls && (!self.writes || root_ok)

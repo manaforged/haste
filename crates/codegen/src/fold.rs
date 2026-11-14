@@ -76,7 +76,7 @@ fn unary(op: Unary, ty: Type, a: i64) -> Option<i64> {
 
 /// The constant that leaves the left operand of `op` unchanged when it stands on the right.
 fn unit(op: Binary) -> Option<i64> {
-    match op { Binary::Iadd | Binary::Isub | Binary::Bor | Binary::Bxor => Some(0), Binary::Imul => Some(1), Binary::Band => Some(-1), _ => None }
+    match op { Binary::Iadd | Binary::Isub | Binary::Bor | Binary::Bxor => Some(0), Binary::Imul | Binary::Sdiv | Binary::Udiv => Some(1), Binary::Band => Some(-1), _ => None }
 }
 
 /// Whether `x op y` on constants of type `ty` fits that type, read as signed when `signed`.
@@ -214,6 +214,7 @@ impl Fold {
         match op {
             Binary::Imul | Binary::Umulhi | Binary::Smulhi | Binary::Band if zero(x) || zero(y) => Some(0),
             Binary::Isub | Binary::Bxor if self.find(x) == self.find(y) => Some(0),
+            Binary::Srem | Binary::Urem if self.known(y).is_some_and(|imm| extend(imm, ty, false) == 1 || (op == Binary::Srem && extend(imm, ty, true) == -1)) => Some(0),
             _ => None,
         }
     }
@@ -311,7 +312,7 @@ impl Fold {
             if is(y, unit) {
                 return Some(x);
             }
-            return (op != Binary::Isub && is(x, unit)).then_some(y);
+            return (!matches!(op, Binary::Isub | Binary::Sdiv | Binary::Udiv) && is(x, unit)).then_some(y);
         }
         let shift = matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr);
         if shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0) {

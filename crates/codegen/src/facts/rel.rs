@@ -285,6 +285,15 @@ impl Path {
         false
     }
 
+    fn known_ne(&self, ty: Type, a: Value, b: Value) -> bool {
+        self.rels.iter().any(|r| {
+            r.kind == RelKind::Ne
+                && r.ty == ty
+                && ((self.reaches(ty, a, r.lhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.rhs, (RelKind::Eq, RelKind::Eq), false))
+                    || (self.reaches(ty, a, r.rhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.lhs, (RelKind::Eq, RelKind::Eq), false)))
+        })
+    }
+
     fn proves(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> bool {
         if x == y {
             return holds(cc, ty, 0, 0);
@@ -294,6 +303,7 @@ impl Path {
             RelKind::Eq => self.reaches(ty, a, b, (RelKind::Eq, RelKind::Eq), false),
             RelKind::Ult => {
                 self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), true)
+                    || (self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), false) && self.known_ne(ty, a, b))
                     || self.proves_add_rel(func, ranges, ty, a, b, true)
                     || self.proves_sub_rel(func, ranges, ty, a, b, true)
             }
@@ -302,7 +312,10 @@ impl Path {
                     || self.proves_add_rel(func, ranges, ty, a, b, false)
                     || self.proves_sub_rel(func, ranges, ty, a, b, false)
             }
-            RelKind::Slt => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true),
+            RelKind::Slt => {
+                self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true)
+                    || (self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), false) && self.known_ne(ty, a, b))
+            }
             RelKind::Sle => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), false),
             RelKind::Ne => {
                 self.strictly_ordered(ty, a, b)
@@ -312,12 +325,7 @@ impl Path {
                         self.fact(ranges, zero).exact() == Some(0)
                             && matches!(ranges.op(func, sub), Some(&Op::Binary(Binary::Isub, lhs, rhs)) if self.strictly_ordered(ty, lhs, rhs))
                     })
-                    || self.rels.iter().any(|r| {
-                        r.kind == RelKind::Ne
-                            && r.ty == ty
-                            && ((self.reaches(ty, a, r.lhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.rhs, (RelKind::Eq, RelKind::Eq), false))
-                                || (self.reaches(ty, a, r.rhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.lhs, (RelKind::Eq, RelKind::Eq), false)))
-                    })
+                    || self.known_ne(ty, a, b)
             }
         }
     }

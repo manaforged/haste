@@ -67,7 +67,10 @@ impl Layouts {
         if found.is_empty() {
             return None;
         }
-        found.sort_unstable_by_key(|(at, ty)| (*at, ty.bytes()));
+        if let Some((_, ty)) = found.iter().copied().find(|&(at, ty)| at == 0 && ty.is_vector() && ty.bytes() == bytes) {
+            return Some(vec![(ty, 0)]);
+        }
+        found.sort_unstable_by_key(|(at, ty)| (*at, std::cmp::Reverse(ty.is_vector()), ty.bytes()));
         let mut pieces = Vec::with_capacity(found.len());
         let mut cursor = 0;
         for (at, ty) in found {

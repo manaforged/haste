@@ -88,7 +88,7 @@ pub(super) fn try_fuse_sib(
     try_sib(plan, x, y, 0, pos, [None, None])
 }
 
-fn trivial_mul_imm(func: &Function, plan: &Plan<Reg>, ty: Type, val: Value) -> bool {
+fn trivial_mul_imm(_func: &Function, plan: &Plan<Reg>, ty: Type, val: Value) -> bool {
     let Some(raw) = plan.const_of(val) else {
         return false;
     };
