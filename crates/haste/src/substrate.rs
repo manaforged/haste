@@ -4,7 +4,7 @@ mod keys;
 pub mod noop;
 
 pub use keys::{
-    CrateHashes, deps_key, deps_path, enabled, item_key_with_crates, sysroot_item_key, sysroot_only_item_key, target_hash, toolchain_key,
+    CrateHashes, deps_key, deps_path, enabled, sysroot_item_key, sysroot_only_item_key, target_hash, toolchain_key,
     toolchain_path, workspace_key, workspace_path,
 };
 

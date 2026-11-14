@@ -652,7 +652,7 @@ fn float_cc(cmp: Cmp) -> FloatCC {
     }
 }
 
-fn parse_float(ty: Type, text: &str) -> Result<i64> {
+pub(super) fn parse_float(ty: Type, text: &str) -> Result<i64> {
     let digits: String = text.chars().filter(|ch| *ch != '_').collect();
     let digits = ["f16", "f32", "f64", "f128"].iter().find_map(|suffix| digits.strip_suffix(suffix)).unwrap_or(&digits);
     match ty {

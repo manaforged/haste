@@ -284,7 +284,54 @@ impl Lower<'_, '_> {
 
     /// Lowers the tuple expression `expr` into a new frame slot and returns its address.
     pub fn tuple(&mut self, expr: ExprId, list: List) -> Result<Option<Value>> {
+        if let Some(addr) = self.const_rodata_expr(expr)? {
+            return Ok(Some(addr));
+        }
         self.tuple_of(self.ty_of(expr), list)
+    }
+
+    /// Whether the current body mutates, mutably lends, or `ref mut` binds `expr`.
+    pub(super) fn expr_lent_mutably(&self, expr: ExprId) -> bool {
+        if self.typed.ref_binds.values().any(|binding| *binding == crate::sema::ty::Mut::Mut) {
+            return true;
+        }
+        (0..self.body.exprs.len() as u32).map(ExprId).any(|at| match *self.body.expr(at) {
+            Expr::Assign(lhs, _) => self.place_reaches_assign(lhs, expr),
+            Expr::AssignOp(_, lhs, _) | Expr::Ref { mutable: true, expr: lhs, .. } => self.place_reaches(lhs, expr),
+            Expr::Method { receiver, .. } => {
+                self.typed.adjusts.get(&at).is_some_and(|adjust| adjust.autoref == Some(crate::sema::ty::Mut::Mut)) && self.place_reaches(receiver, expr)
+            }
+            _ => false,
+        })
+    }
+
+    fn place_reaches_assign(&self, lhs: ExprId, target: ExprId) -> bool {
+        match *self.body.expr(lhs) {
+            Expr::Paren(inner) => self.place_reaches_assign(inner, target),
+            Expr::Tuple(items) => self.body.list(items).iter().any(|&at| self.place_reaches_assign(ExprId(at), target)),
+            _ => self.place_reaches(lhs, target),
+        }
+    }
+
+    fn place_reaches(&self, root: ExprId, target: ExprId) -> bool {
+        let mut cur = root;
+        loop {
+            if cur == target {
+                return true;
+            }
+            if let Some(inner) = self.transparent(cur) {
+                cur = inner;
+                continue;
+            }
+            match *self.body.expr(cur) {
+                Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _) => cur = base,
+                Expr::Block { tail: Some(tail), label: None, .. } => cur = tail,
+                Expr::Block { label: Some(_), .. } | Expr::Loop { .. } => return true,
+                Expr::If(_, then, otherwise) => return self.place_reaches(then, target) || otherwise.is_some_and(|alt| self.place_reaches(alt, target)),
+                Expr::Match(_, arms) => return self.body.list(arms).iter().any(|&at| self.place_reaches(self.body.arms[at as usize].body, target)),
+                _ => return false,
+            }
+        }
     }
 
     /// Copies `addr` into a fresh frame slot when `repr` lives in memory, returning the snapshot address.

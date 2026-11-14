@@ -239,7 +239,10 @@ impl Lower<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Tuple(list) => self.tuple(expr, list),
             Expr::Closure { .. } => self.closure(expr),
-            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner) => self.promoted(inner),
+            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner) => match self.const_rodata_expr(inner)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.promoted(inner),
+            },
             Expr::Ref { expr: inner, .. } => self.reference(inner),
             Expr::TupleField(..) => self.field_value(expr),
             _ => self.flow(expr),
@@ -270,8 +273,14 @@ impl Lower<'_, '_> {
             Expr::Field(..) => self.field_value(expr),
             Expr::Match(scrutinee, arms) => self.match_expr(expr, scrutinee, arms),
             Expr::Let(pat, init) => self.let_expr(pat, init),
-            Expr::Array(items) => self.array(expr, items),
-            Expr::Repeat(value, _) => self.repeat(expr, value),
+            Expr::Array(items) => match self.const_rodata_expr(expr)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.array(expr, items),
+            },
+            Expr::Repeat(value, _) => match self.const_rodata_expr(expr)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.repeat(expr, value),
+            },
             Expr::Index(..) => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
             Expr::For { label, pat, iter, body } => self.for_expr(expr, pat, iter, (label, body)),
             Expr::Try(inner) => self.try_expr(expr, inner),
@@ -305,7 +314,10 @@ impl Lower<'_, '_> {
                 Ok(Some(self.int_const(machine, bits)))
             }
             Some(Res::Ctor(..)) if self.typed.coercions.contains_key(&expr) => Ok(None),
-            Some(&Res::Ctor(_, variant, _)) => self.construct(self.ty_of(expr), variant, Vec::new(), None),
+            Some(&Res::Ctor(_, variant, _)) => match self.const_rodata_expr(expr)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.construct(self.ty_of(expr), variant, Vec::new(), None),
+            },
             None => bail!("path has no resolution"),
         }
     }
@@ -313,7 +325,10 @@ impl Lower<'_, '_> {
     fn item_path(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
         match self.cx.item(item).1.kind {
             ItemKind::Static => Ok(self.place_of(expr)?.and_then(|place| self.read(place))),
-            ItemKind::Const => self.constant(expr, item, substs),
+            ItemKind::Const => match self.const_rodata_item(expr, item, substs)? {
+                Some(addr) => Ok(Some(addr)),
+                None => self.constant(expr, item, substs),
+            },
             _ => Ok(None),
         }
     }

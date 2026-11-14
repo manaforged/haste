@@ -187,6 +187,25 @@ fn eval_into(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, plan: &
     Ok(())
 }
 
+fn fmt_ty_brief(cx: &Context<'_>, ty: Ty) -> String {
+    match cx.types.kind(ty) {
+        Kind::Adt(def, args) => {
+            let inner: Vec<String> = cx.types.substs(*args).iter().map(|&t| fmt_ty_brief(cx, t)).collect();
+            if inner.is_empty() { cx.name(*def).to_owned() } else { format!("{}<{}>", cx.name(*def), inner.join(", ")) }
+        }
+        Kind::Closure(def, ..) => format!("closure({})", cx.name(*def)),
+        Kind::Slice(inner) => format!("[{}]", fmt_ty_brief(cx, *inner)),
+        Kind::Array(inner, _) => format!("[{}; _]", fmt_ty_brief(cx, *inner)),
+        Kind::Ref(_, inner) => format!("&{}", fmt_ty_brief(cx, *inner)),
+        Kind::Ptr(_, inner) => format!("*{}", fmt_ty_brief(cx, *inner)),
+        Kind::Tuple(args) => {
+            let inner: Vec<String> = cx.types.substs(*args).iter().map(|&t| fmt_ty_brief(cx, t)).collect();
+            format!("({})", inner.join(", "))
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 pub(super) fn reached_index_of(cx: &Context<'_>, reached: &Reached, slots: &dyn Slots, instance: (ItemRef, Substs)) -> Result<usize> {
     if let Some(&idx) = reached.index.get(&instance)
         && !reached.is_untyped(idx)
@@ -194,7 +213,12 @@ pub(super) fn reached_index_of(cx: &Context<'_>, reached: &Reached, slots: &dyn 
         return Ok(idx);
     }
     slots.want(instance);
-    bail!("a use of `{}` that was not reached", cx.name(instance.0))
+    let args: Vec<String> = cx.types.substs(instance.1).iter().map(|&ty| fmt_ty_brief(cx, ty)).collect();
+    let why = if reached.index.contains_key(&instance) { "untyped" } else { "not reached" };
+    if args.is_empty() {
+        bail!("a use of `{}` ({:?}) that was {why}", cx.name(instance.0), instance.0)
+    }
+    bail!("a use of `{}<{}>` ({:?}) that was {why}", cx.name(instance.0), args.join(", "), instance.0)
 }
 
 fn eval_vtable_at(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, typed: &Typed, expr: ExprId) -> Result<super::stencil::VtableId> {

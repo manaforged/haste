@@ -1,18 +1,33 @@
 use anyhow::{Result, bail};
 use haste_codegen::{IntCC, Type, Value};
-use rustc_abi::{Primitive, TagEncoding, Variants};
+use rustc_abi::{FieldsShape, Primitive, TagEncoding, Variants};
 use rustc_index::Idx;
 
-use crate::body::{ExprId, List};
-use crate::names::ItemRef;
+use crate::body::literal::{byte_value, char_value};
+use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, List, Lit, UnOp};
+use crate::names::{ItemRef, Primitive as PrimName};
+use crate::outline::item::ItemKind;
+use crate::outline::source::Source;
 use crate::sema::Context;
-use crate::sema::infer::{ALIGN_SLOT, field_types};
+use crate::sema::infer::{ALIGN_SLOT, Res, Shape, Typed, field_types, needs_drop, parse_int};
 use crate::sema::layout::{Layout, Variant, field_offset, target};
-use crate::sema::ty::{Kind, Ty};
+use crate::sema::substs::Substs;
+use crate::sema::ty::{Kind, Ty, int_info, mask};
 
-use super::ops::Num;
+use super::ops::{Num, parse_float};
 use super::place::{Base, Place};
 use super::{Lower, Repr, repr};
+
+const CONST_RODATA_MAX_BYTES: usize = 1 << 21;
+const CONST_RODATA_MAX_DEPTH: u32 = 16;
+
+#[derive(Clone, Copy)]
+struct ConstScope<'s> {
+    body: &'s Body,
+    src: &'s Source,
+    typed: &'s Typed,
+    in_const: bool,
+}
 
 pub(super) fn tag_type(bytes: u64) -> Result<Type> {
     Ok(match bytes {
@@ -197,7 +212,12 @@ impl Lower<'_, '_> {
 
     /// Lowers the struct literal `expr` with field initializers `fields`.
     pub fn struct_literal(&mut self, expr: ExprId, fields: List, base: Option<ExprId>) -> Result<Option<Value>> {
-        let Some(crate::sema::infer::Res::Ctor(_, variant, _)) = self.typed.res.get(&expr).cloned() else { bail!("struct literal has no constructor") };
+        if base.is_none()
+            && let Some(addr) = self.materialize_const_expr(expr, true)?
+        {
+            return Ok(Some(addr));
+        }
+        let Some(Res::Ctor(_, variant, _)) = self.typed.res.get(&expr).cloned() else { bail!("struct literal has no constructor") };
         let mut values = Vec::new();
         for at in self.body.list(fields).to_vec() {
             let init = self.body.fields[at as usize];
@@ -224,10 +244,510 @@ impl Lower<'_, '_> {
 
     /// Lowers a call of the tuple constructor of variant `variant` with `args`.
     pub fn ctor_call(&mut self, expr: ExprId, variant: u32, args: List) -> Result<Option<Value>> {
+        if let Some(addr) = self.materialize_const_expr(expr, true)? {
+            return Ok(Some(addr));
+        }
         let mut values = Vec::new();
         for (index, at) in self.body.list(args).to_vec().into_iter().enumerate() {
             values.push((index as u32, self.eval_operand(ExprId(at))?));
         }
         self.construct(self.ty_of(expr), variant, values, None)
     }
+}
+
+impl<'l, 'a> Lower<'l, 'a> {
+    /// Materializes a pure scalar aggregate expression of at least 8 bytes into `.rodata` when immutable.
+    pub(super) fn const_rodata_expr(&mut self, expr: ExprId) -> Result<Option<Value>> {
+        self.materialize_const_expr(expr, false)
+    }
+
+    fn materialize_const_expr(&mut self, expr: ExprId, allow_slot: bool) -> Result<Option<Value>> {
+        let lent_mut = self.expr_lent_mutably(expr);
+        if (!allow_slot && lent_mut) || !self.open {
+            return Ok(None);
+        }
+        let ty = self.ty_of(expr);
+        let Some(size) = self.rodata_aggregate_size(ty)? else {
+            return Ok(None);
+        };
+        let in_generic = !self.cx.types.substs(self.reached.list[self.index].0.1).is_empty();
+        let mut bytes = vec![0u8; size];
+        let scope = ConstScope { body: self.body, src: self.src, typed: self.typed, in_const: false };
+        if self.write_const_uncoerced(scope, (expr, ty), 0, &mut bytes, 0, in_generic).is_none() {
+            return Ok(None);
+        }
+        if allow_slot
+            && let whole @ Repr::Mem { parts: Parts::One(vec_ty @ Type::Vec { .. }), .. } = repr(self.cx, ty)?
+        {
+            let all_zero = bytes.iter().all(|&b| b == 0);
+            if all_zero || lent_mut {
+                let Some(slot) = self.slot(whole) else {
+                    return Ok(None);
+                };
+                let vec = if all_zero {
+                    self.ins().iconst(vec_ty, 0)
+                } else {
+                    let addr = self.emit_const_rodata(&bytes);
+                    self.ins().load(vec_ty, addr, 0)
+                };
+                self.ins().stack_store(vec, slot, 0);
+                return Ok(self.read(Place::slot(slot, whole)));
+            }
+        }
+        if lent_mut {
+            return Ok(None);
+        }
+        Ok(Some(self.emit_const_rodata(&bytes)))
+    }
+
+    /// Materializes a pure scalar aggregate `const` item of at least 8 bytes into `.rodata` when immutable.
+    pub(super) fn const_rodata_item(&mut self, expr: ExprId, item: ItemRef, substs: Substs) -> Result<Option<Value>> {
+        if !self.open || self.expr_lent_mutably(expr) {
+            return Ok(None);
+        }
+        let ty = self.ty_of(expr);
+        let Some(size) = self.rodata_aggregate_size(ty)? else {
+            return Ok(None);
+        };
+        let in_generic = !self.cx.types.substs(self.reached.list[self.index].0.1).is_empty();
+        let Some((body, src, item_typed, root)) = self.load_const_item(item, substs, ty, in_generic, true)? else {
+            return Ok(None);
+        };
+        let mut bytes = vec![0u8; size];
+        let scoped = item_typed.scoped(&self.cx.types);
+        if self.write_const_bytes(ConstScope { body: &body, src, typed: &scoped, in_const: true }, (root, ty), 0, &mut bytes, 1, in_generic).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.emit_const_rodata(&bytes)))
+    }
+
+    fn rodata_aggregate_size(&mut self, ty: Ty) -> Result<Option<usize>> {
+        if ty == Ty::NONE || self.cx.types.has_params(ty) {
+            return Ok(None);
+        }
+        let Repr::Mem { size, align, .. } = repr(self.cx, ty)? else {
+            return Ok(None);
+        };
+        let size = size as usize;
+        if size < 8 || align > 4 || size > CONST_RODATA_MAX_BYTES {
+            return Ok(None);
+        }
+        if !super::is_freeze_ty(self.cx, ty, 0) || needs_drop(self.cx, ty)? {
+            return Ok(None);
+        }
+        Ok(Some(size))
+    }
+
+    fn const_item_readable(&self, item: ItemRef) -> bool {
+        let env = &self.cx.outline.crates[item.krate as usize].env;
+        let owner = self.reached.list[self.index].0.0;
+        env.release || env.fixed || item.krate == owner.krate
+    }
+
+    fn load_const_item(&mut self, item: ItemRef, substs: Substs, ty: Ty, in_generic: bool, require_reached: bool) -> Result<Option<(std::sync::Arc<Body>, &'a Source, std::sync::Arc<Typed>, ExprId)>> {
+        if !self.const_item_readable(item) || (in_generic && !self.cx.types.substs(substs).is_empty()) {
+            return Ok(None);
+        }
+        let index = if require_reached {
+            self.reached_index(item, substs)?
+        } else {
+            let Some(&index) = self.reached.index.get(&(item, substs)) else {
+                return Ok(None);
+            };
+            index
+        };
+        let ((source, _), Ok(item_typed)) = &self.reached.list[index] else {
+            return Ok(None);
+        };
+        if !matches!(item_typed.shape, Shape::Body) {
+            return Ok(None);
+        }
+        let item_typed = item_typed.clone();
+        if item_typed.scoped(&self.cx.types).ret_ty() != ty {
+            return Ok(None);
+        }
+        let source = *source;
+        let body = self.cx.body(source)?;
+        let (Some(root), src) = (body.root, self.cx.body_src(source)) else {
+            return Ok(None);
+        };
+        Ok(Some((body, src, item_typed, root)))
+    }
+
+    fn write_const_bytes(&mut self, scope: ConstScope<'_>, (expr, ty): (ExprId, Ty), at: usize, out: &mut [u8], depth: u32, in_generic: bool) -> Option<()> {
+        if scope.typed.coercions.contains_key(&expr) {
+            return None;
+        }
+        self.write_const_uncoerced(scope, (expr, ty), at, out, depth, in_generic)
+    }
+
+    fn write_const_uncoerced(&mut self, scope: ConstScope<'_>, (expr, ty): (ExprId, Ty), at: usize, out: &mut [u8], depth: u32, in_generic: bool) -> Option<()> {
+        if depth > CONST_RODATA_MAX_DEPTH {
+            return None;
+        }
+        match *scope.body.expr(expr) {
+            Expr::Paren(inner) => return self.write_const_bytes(scope, (inner, ty), at, out, depth, in_generic),
+            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } if scope.body.list(stmts).is_empty() => {
+                return self.write_const_bytes(scope, (tail, ty), at, out, depth, in_generic);
+            }
+            Expr::Path(_) => {
+                if let Some(&Res::Fn(item, substs)) = scope.typed.res.get(&expr)
+                    && self.cx.item(item).1.kind == ItemKind::Const
+                {
+                    let (body, src, item_typed, root) = self.load_const_item(item, substs, ty, in_generic, false).ok()??;
+                    let scoped = item_typed.scoped(&self.cx.types);
+                    return self.write_const_bytes(ConstScope { body: &body, src, typed: &scoped, in_const: true }, (root, ty), at, out, depth + 1, in_generic);
+                }
+            }
+            _ => {}
+        }
+        let kind = self.cx.types.kind(ty).clone();
+        match (*scope.body.expr(expr), kind) {
+            (_, Kind::Pat(inner, ..)) => self.write_const_uncoerced(scope, (expr, inner), at, out, depth, in_generic),
+            (Expr::Array(list), Kind::Array(elem, _)) => {
+                let stride = usize::try_from(self.cx.layout(elem).ok()?.size.bytes()).ok()?;
+                let items: Vec<ExprId> = scope.body.list(list).iter().map(|&item| ExprId(item)).collect();
+                items.into_iter().enumerate().try_for_each(|(index, item)| self.write_const_bytes(scope, (item, elem), at + index * stride, out, depth, in_generic))
+            }
+            (Expr::Repeat(item, count_expr), Kind::Array(elem, count)) => {
+                if in_generic && !matches!(*scope.body.expr(count_expr), Expr::Lit(Lit::Int, _)) {
+                    return None;
+                }
+                let stride = usize::try_from(self.cx.layout(elem).ok()?.size.bytes()).ok()?;
+                let count = usize::try_from(self.cx.types.len(count)?).ok()?;
+                if count == 0 {
+                    let mut scratch = vec![0u8; stride];
+                    self.write_const_bytes(scope, (item, elem), 0, &mut scratch, depth, in_generic)?;
+                    return Some(());
+                }
+                if at.checked_add(count.checked_mul(stride)?)? > out.len() {
+                    return None;
+                }
+                self.write_const_bytes(scope, (item, elem), at, out, depth, in_generic)?;
+                for index in 1..count {
+                    out.copy_within(at..at + stride, at + index * stride);
+                }
+                Some(())
+            }
+            (Expr::Tuple(list), Kind::Tuple(items)) => {
+                let layout = self.cx.layout(ty).ok()?;
+                let items = self.cx.types.substs(items).to_vec();
+                let elems: Vec<ExprId> = scope.body.list(list).iter().map(|&item| ExprId(item)).collect();
+                if elems.len() != items.len() {
+                    return None;
+                }
+                elems.into_iter().enumerate().try_for_each(|(index, item)| {
+                    let offset = usize::try_from(field_offset(&layout, 0, index as u32)).ok()?;
+                    self.write_const_bytes(scope, (item, items[index]), at + offset, out, depth, in_generic)
+                })
+            }
+            (_, Kind::Adt(item, args)) => self.construct_const_bytes(scope, (expr, ty), (item, args), at, out, depth, in_generic),
+            (_, Kind::Prim(primitive)) => {
+                let (size, bits) = self.eval_const_scalar(scope, expr, primitive, depth, in_generic)?;
+                out.get_mut(at..at + size)?.copy_from_slice(&bits.to_le_bytes()[..size]);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    fn construct_const_bytes(&mut self, scope: ConstScope<'_>, (expr, ty): (ExprId, Ty), (item, args): (ItemRef, Substs), at: usize, out: &mut [u8], depth: u32, in_generic: bool) -> Option<()> {
+        if in_generic && !self.cx.types.substs(args).is_empty() {
+            return None;
+        }
+        let (variant, fields) = const_ctor(scope, expr)?;
+        let layout = self.cx.layout(ty).ok()?;
+        if matches!(layout.fields, FieldsShape::Union(_)) {
+            return None;
+        }
+        let args = self.cx.types.substs(args).to_vec();
+        let types = field_types(self.cx, item, &args).ok()?.get(variant as usize)?.clone();
+        for (index, value) in fields {
+            let &field_ty = types.get(index as usize)?;
+            let offset = usize::try_from(field_offset(&layout, variant, index)).ok()?;
+            self.write_const_bytes(scope, (value, field_ty), at + offset, out, depth, in_generic)?;
+        }
+        if let Some((offset, tag, bits)) = tag_bits(self.cx, item, &layout, variant).ok()? {
+            let size = tag.bytes() as usize;
+            let start = at + usize::try_from(offset).ok()?;
+            out.get_mut(start..start + size)?.copy_from_slice(&bits.to_le_bytes()[..size]);
+        }
+        Some(())
+    }
+
+    fn eval_const_scalar(&mut self, scope: ConstScope<'_>, expr: ExprId, primitive: PrimName, depth: u32, in_generic: bool) -> Option<(usize, u128)> {
+        if depth > CONST_RODATA_MAX_DEPTH {
+            return None;
+        }
+        let expr = unwrap_const_uncoerced(scope, expr)?;
+        match *scope.body.expr(expr) {
+            Expr::Path(_) => match scope.typed.res.get(&expr) {
+                Some(&Res::Const(val_ty)) if !in_generic => {
+                    let Kind::Value(bits) = *self.cx.types.kind(val_ty) else { return None };
+                    let (size, masked) = mask_const_scalar(primitive, bits)?;
+                    return Some((size, masked));
+                }
+                Some(&Res::Fn(item, substs)) if depth < CONST_RODATA_MAX_DEPTH && self.cx.item(item).1.kind == ItemKind::Const => {
+                    let prim_ty = self.cx.types.prim(primitive);
+                    let (body, src, item_typed, root) = self.load_const_item(item, substs, prim_ty, in_generic, false).ok()??;
+                    let scoped = item_typed.scoped(&self.cx.types);
+                    return self.eval_const_scalar(ConstScope { body: &body, src, typed: &scoped, in_const: true }, root, primitive, depth + 1, in_generic);
+                }
+                _ => return None,
+            },
+            Expr::Lit(Lit::Bool(value), _) if primitive == PrimName::Bool => Some((1, u128::from(value))),
+            Expr::Lit(Lit::Char, at) if primitive == PrimName::Char => Some((4, u128::from(u32::from(char_value(scope.src.text(at)).ok()?)))),
+            Expr::Lit(Lit::Byte, at) if primitive == PrimName::U8 => Some((1, u128::from(byte_value(scope.src.text(at)).ok()?))),
+            Expr::Lit(Lit::Int, at) => {
+                let (bits, _) = int_info(primitive)?;
+                Some((bits as usize / 8, parse_int(scope.src.text(at)).ok()?.0 & mask(bits)))
+            }
+            Expr::Lit(Lit::Float, at) => match primitive {
+                PrimName::F32 => Some((4, parse_float(Type::F32, scope.src.text(at)).ok()? as u64 as u128)),
+                PrimName::F64 => Some((8, parse_float(Type::F64, scope.src.text(at)).ok()? as u64 as u128)),
+                _ => None,
+            },
+            Expr::Unary(op, inner) if !scope.typed.operators.contains_key(&expr) => self.eval_const_unary(scope, op, inner, primitive, depth, in_generic),
+            Expr::Binary(op, lhs, rhs) if !scope.typed.operators.contains_key(&expr) => self.eval_const_binary(scope, op, lhs, rhs, primitive, depth, in_generic),
+            Expr::Index(arr, idx_expr) if !scope.typed.operators.contains_key(&expr) => self.eval_const_index(scope, arr, idx_expr, primitive, depth, in_generic),
+            Expr::Cast(inner, _) => {
+                let Kind::Prim(src_prim) = *self.cx.types.kind(scope.typed.expr_ty(&self.cx.types, inner)) else { return None };
+                let (_, src_val) = self.eval_const_scalar(scope, inner, src_prim, depth, in_generic)?;
+                cast_const_scalar(src_val, src_prim, primitive)
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_const_index(&mut self, scope: ConstScope<'_>, arr: ExprId, idx_expr: ExprId, primitive: PrimName, depth: u32, in_generic: bool) -> Option<(usize, u128)> {
+        if depth >= CONST_RODATA_MAX_DEPTH {
+            return None;
+        }
+        let idx = usize::try_from(self.eval_const_scalar(scope, idx_expr, PrimName::Usize, depth + 1, in_generic)?.1).ok()?;
+        let arr_ty = scope.typed.expr_ty(&self.cx.types, arr);
+        let Kind::Array(elem_ty, count) = *self.cx.types.kind(arr_ty) else { return None };
+        if !matches!(*self.cx.types.kind(elem_ty), Kind::Prim(p) if p == primitive) || idx >= usize::try_from(self.cx.types.len(count)?).ok()? {
+            return None;
+        }
+        self.eval_const_array_elem(scope, arr, arr_ty, primitive, idx, depth, in_generic)
+    }
+
+    fn eval_const_array_elem(&mut self, scope: ConstScope<'_>, arr: ExprId, arr_ty: Ty, primitive: PrimName, idx: usize, depth: u32, in_generic: bool) -> Option<(usize, u128)> {
+        let arr = unwrap_const_uncoerced(scope, arr)?;
+        match *scope.body.expr(arr) {
+            Expr::Path(_) => {
+                let Some(&Res::Fn(item, substs)) = scope.typed.res.get(&arr) else { return None };
+                if depth >= CONST_RODATA_MAX_DEPTH || self.cx.item(item).1.kind != ItemKind::Const {
+                    return None;
+                }
+                let (body, src, item_typed, root) = self.load_const_item(item, substs, arr_ty, in_generic, false).ok()??;
+                let scoped = item_typed.scoped(&self.cx.types);
+                self.eval_const_array_elem(ConstScope { body: &body, src, typed: &scoped, in_const: true }, root, arr_ty, primitive, idx, depth + 1, in_generic)
+            }
+            Expr::Repeat(elem, count_expr) if !in_generic || matches!(*scope.body.expr(count_expr), Expr::Lit(Lit::Int, _)) => {
+                self.eval_const_scalar(scope, elem, primitive, depth + 1, in_generic)
+            }
+            Expr::Array(list) => {
+                let items = scope.body.list(list);
+                if scope.in_const {
+                    return self.eval_const_scalar(scope, ExprId(*items.get(idx)?), primitive, depth + 1, in_generic);
+                }
+                if items.len() > 16 {
+                    return None;
+                }
+                items.to_vec().into_iter().enumerate().try_fold(None, |cur, (i, elem)| {
+                    let val = self.eval_const_scalar(scope, ExprId(elem), primitive, depth + 1, in_generic)?;
+                    Some(if i == idx { Some(val) } else { cur })
+                })?
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_const_binary(&mut self, scope: ConstScope<'_>, op: BinOp, lhs: ExprId, rhs: ExprId, primitive: PrimName, depth: u32, in_generic: bool) -> Option<(usize, u128)> {
+        if depth >= CONST_RODATA_MAX_DEPTH {
+            return None;
+        }
+        if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) && primitive == PrimName::Bool {
+            let Kind::Prim(cmp_prim) = *self.cx.types.kind(scope.typed.expr_ty(&self.cx.types, lhs)) else { return None };
+            let (bits, signed) = const_prim_info(cmp_prim)?;
+            let l = self.eval_const_scalar(scope, lhs, cmp_prim, depth + 1, in_generic)?.1;
+            let r = self.eval_const_scalar(scope, rhs, cmp_prim, depth + 1, in_generic)?.1;
+            return Some((1, u128::from(eval_const_cmp(op, bits, signed, l, r))));
+        }
+        if matches!(op, BinOp::And | BinOp::Or) && primitive == PrimName::Bool {
+            let (_, l) = self.eval_const_scalar(scope, lhs, PrimName::Bool, depth + 1, in_generic)?;
+            if (op == BinOp::And) == (l == 0) {
+                return Some((1, l));
+            }
+            return self.eval_const_scalar(scope, rhs, PrimName::Bool, depth + 1, in_generic);
+        }
+        if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) && primitive == PrimName::Bool {
+            let l = self.eval_const_scalar(scope, lhs, PrimName::Bool, depth + 1, in_generic)?.1;
+            let r = self.eval_const_scalar(scope, rhs, PrimName::Bool, depth + 1, in_generic)?.1;
+            return Some((1, (match op { BinOp::BitAnd => l & r, BinOp::BitOr => l | r, _ => l ^ r }) & 1));
+        }
+        let (bits, signed) = int_info(primitive)?;
+        let l = self.eval_const_scalar(scope, lhs, primitive, depth + 1, in_generic)?.1;
+        let rhs_prim = if matches!(op, BinOp::Shl | BinOp::Shr) {
+            let Kind::Prim(p) = *self.cx.types.kind(scope.typed.expr_ty(&self.cx.types, rhs)) else { return None };
+            p
+        } else {
+            primitive
+        };
+        let (rhs_bits, rhs_signed) = int_info(rhs_prim)?;
+        let r = self.eval_const_scalar(scope, rhs, rhs_prim, depth + 1, in_generic)?.1;
+        Some((bits as usize / 8, eval_const_int_bin(op, (bits, signed), l, (rhs_bits, rhs_signed), r, self.overflow_checks)?))
+    }
+
+    fn eval_const_unary(&mut self, scope: ConstScope<'_>, op: UnOp, inner: ExprId, primitive: PrimName, depth: u32, in_generic: bool) -> Option<(usize, u128)> {
+        match (op, primitive) {
+            (UnOp::Not, PrimName::Bool) => Some((1, u128::from(self.eval_const_scalar(scope, inner, PrimName::Bool, depth, in_generic)?.1 == 0))),
+            (UnOp::Not, _) => {
+                let (bits, _) = int_info(primitive)?;
+                let (size, val) = self.eval_const_scalar(scope, inner, primitive, depth, in_generic)?;
+                Some((size, (!val) & mask(bits)))
+            }
+            (UnOp::Neg, PrimName::F32) => {
+                let (_, bits) = self.eval_const_scalar(scope, inner, PrimName::F32, depth, in_generic)?;
+                Some((4, bits ^ (1u128 << 31)))
+            }
+            (UnOp::Neg, PrimName::F64) => {
+                let (_, bits) = self.eval_const_scalar(scope, inner, PrimName::F64, depth, in_generic)?;
+                Some((8, bits ^ (1u128 << 63)))
+            }
+            (UnOp::Neg, _) => {
+                let (bits, true) = int_info(primitive)? else { return None };
+                if let Some(at) = bare_int_lit(scope.body, inner) {
+                    let val = parse_int(scope.src.text(at)).ok()?.0;
+                    return Some((bits as usize / 8, val.wrapping_neg() & mask(bits)));
+                }
+                let (size, val) = self.eval_const_scalar(scope, inner, primitive, depth, in_generic)?;
+                if self.overflow_checks && val == (1u128 << (bits - 1)) {
+                    return None;
+                }
+                Some((size, val.wrapping_neg() & mask(bits)))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn const_ctor(scope: ConstScope<'_>, expr: ExprId) -> Option<(u32, Vec<(u32, ExprId)>)> {
+    let variant = |at: ExprId| match scope.typed.res.get(&at) {
+        Some(&Res::Ctor(_, variant, _)) => Some(variant),
+        _ => None,
+    };
+    match *scope.body.expr(expr) {
+        Expr::Path(_) => Some((variant(expr)?, Vec::new())),
+        Expr::Call(callee, args) => Some((variant(expr).or_else(|| variant(callee))?, scope.body.list(args).iter().enumerate().map(|(index, &at)| (index as u32, ExprId(at))).collect())),
+        Expr::Struct { fields, base: None, .. } => {
+            let fields = scope.body.list(fields).iter().map(|&at| scope.body.fields[at as usize].value).map(|value| Some((*scope.typed.inits.get(&value)?, value))).collect::<Option<Vec<_>>>()?;
+            Some((variant(expr)?, fields))
+        }
+        _ => None,
+    }
+}
+
+fn bare_int_lit(body: &Body, mut expr: ExprId) -> Option<u32> {
+    loop {
+        match *body.expr(expr) {
+            Expr::Paren(inner) => expr = inner,
+            Expr::Lit(Lit::Int, at) => return Some(at),
+            _ => return None,
+        }
+    }
+}
+
+fn const_prim_info(prim: PrimName) -> Option<(u32, bool)> {
+    match prim {
+        PrimName::Bool => Some((1, false)),
+        PrimName::Char => Some((32, false)),
+        _ => int_info(prim),
+    }
+}
+
+fn mask_const_scalar(primitive: PrimName, bits: u128) -> Option<(usize, u128)> {
+    let (width, _) = const_prim_info(primitive)?;
+    let size = if primitive == PrimName::Bool { 1 } else { width as usize / 8 };
+    Some((size, bits & mask(width)))
+}
+
+fn unwrap_const_uncoerced(scope: ConstScope<'_>, mut expr: ExprId) -> Option<ExprId> {
+    loop {
+        if scope.typed.coercions.contains_key(&expr) {
+            return None;
+        }
+        match *scope.body.expr(expr) {
+            Expr::Paren(inner) => expr = inner,
+            Expr::Block { stmts, tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const } if scope.body.list(stmts).is_empty() => expr = tail,
+            _ => return Some(expr),
+        }
+    }
+}
+
+fn sign_extend_u128(val: u128, bits: u32) -> i128 {
+    let shift = 128 - bits;
+    ((val << shift) as i128) >> shift
+}
+
+fn eval_const_cmp(op: BinOp, bits: u32, signed: bool, l: u128, r: u128) -> bool {
+    let ord = if signed { sign_extend_u128(l, bits).cmp(&sign_extend_u128(r, bits)) } else { l.cmp(&r) };
+    matches!((op, ord), (BinOp::Eq, std::cmp::Ordering::Equal) | (BinOp::Ne, std::cmp::Ordering::Less | std::cmp::Ordering::Greater) | (BinOp::Lt | BinOp::Le, std::cmp::Ordering::Less) | (BinOp::Gt | BinOp::Ge, std::cmp::Ordering::Greater) | (BinOp::Le | BinOp::Ge, std::cmp::Ordering::Equal))
+}
+
+fn eval_const_int_bin(op: BinOp, (bits, signed): (u32, bool), l: u128, (rhs_bits, rhs_signed): (u32, bool), r: u128, overflow_checks: bool) -> Option<u128> {
+    let m = mask(bits);
+    match op {
+        BinOp::BitAnd => Some((l & r) & m),
+        BinOp::BitOr => Some((l | r) & m),
+        BinOp::BitXor => Some((l ^ r) & m),
+        BinOp::Shl | BinOp::Shr => {
+            let bad = if rhs_signed { let s = sign_extend_u128(r, rhs_bits); s < 0 || s >= i128::from(bits) } else { r >= u128::from(bits) };
+            if overflow_checks && bad {
+                return None;
+            }
+            let sh = (r as u32) & (bits - 1);
+            let out = match (op, signed) {
+                (BinOp::Shl, _) => l.wrapping_shl(sh),
+                (BinOp::Shr, true) => sign_extend_u128(l, bits).wrapping_shr(sh) as u128,
+                _ => l >> sh,
+            };
+            Some(out & m)
+        }
+        BinOp::Div | BinOp::Rem if r == 0 => None,
+        BinOp::Div | BinOp::Rem if !signed => Some(if op == BinOp::Div { l / r } else { l % r }),
+        BinOp::Div | BinOp::Rem => {
+            let (ls, rs) = (sign_extend_u128(l, bits), sign_extend_u128(r, bits));
+            if ls == (-1_i128 << (bits - 1)) && rs == -1 {
+                return None;
+            }
+            Some((if op == BinOp::Div { ls.wrapping_div(rs) } else { ls.wrapping_rem(rs) } as u128) & m)
+        }
+        BinOp::Add | BinOp::Sub | BinOp::Mul if signed => {
+            let (ls, rs) = (sign_extend_u128(l, bits), sign_extend_u128(r, bits));
+            if overflow_checks {
+                let (min, max) = (-1_i128 << (bits - 1), (m >> 1) as i128);
+                return match op { BinOp::Add => ls.checked_add(rs), BinOp::Sub => ls.checked_sub(rs), _ => ls.checked_mul(rs) }.filter(|&v| v >= min && v <= max).map(|v| (v as u128) & m);
+            }
+            Some((match op { BinOp::Add => ls.wrapping_add(rs), BinOp::Sub => ls.wrapping_sub(rs), _ => ls.wrapping_mul(rs) } as u128) & m)
+        }
+        BinOp::Add | BinOp::Sub | BinOp::Mul => {
+            if overflow_checks {
+                return match op { BinOp::Add => l.checked_add(r), BinOp::Sub => l.checked_sub(r), _ => l.checked_mul(r) }.filter(|&v| v <= m);
+            }
+            Some(match op { BinOp::Add => l.wrapping_add(r), BinOp::Sub => l.wrapping_sub(r), _ => l.wrapping_mul(r) } & m)
+        }
+        _ => None,
+    }
+}
+
+fn cast_const_scalar(src_val: u128, src_prim: PrimName, dst_prim: PrimName) -> Option<(usize, u128)> {
+    if dst_prim == PrimName::Char {
+        return matches!(src_prim, PrimName::U8 | PrimName::Char).then_some((4, src_val & 0xFFFF_FFFF));
+    }
+    let (dst_bits, _) = int_info(dst_prim)?;
+    let (src_bits, src_signed) = const_prim_info(src_prim)?;
+    let bits = if src_signed { sign_extend_u128(src_val, src_bits) as u128 } else { src_val };
+    Some((dst_bits as usize / 8, bits & mask(dst_bits)))
 }

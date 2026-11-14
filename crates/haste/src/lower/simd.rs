@@ -9,7 +9,7 @@ use crate::sema::infer::{Res, SiteKey, Typed, parse_int};
 use crate::sema::intrinsic::Simd;
 use crate::sema::ty::{Kind, Ty, int_info, mask as int_mask};
 
-use super::ops::{Num, compare};
+use super::ops::{Num, compare, parse_float};
 use super::reloc::SiteOrigin;
 use super::{Lower, machine, repr};
 
@@ -167,7 +167,7 @@ impl Lower<'_, '_> {
         let Some(vec_ty) = vec_type(&lanes) else { return Ok(None) };
         match (op, args) {
             (Simd::Splat, &[x]) => {
-                let v = self.ins().splat(vec_ty, x);
+                let v = origin.and_then(|o| self.const_splat_vec(o, vec_ty)).unwrap_or_else(|| self.ins().splat(vec_ty, x));
                 Ok(Some(self.store_vec(v, vec_ty.bytes())))
             }
             (Simd::Bitmask, &[x]) if vec_ty.lane().is_some_and(Lane::is_int) => {
@@ -359,6 +359,30 @@ impl Lower<'_, '_> {
         let expr = self.call_arg_expr(origin, 2)?;
         let mut ctx = ConstEval { cx: self.cx, origin_body: self.body, typed: self.typed };
         ctx.shuffle_array(self.body, self.src, expr, count, 0)
+    }
+
+    fn const_splat_vec(&mut self, origin: &SiteOrigin, vec_ty: Type) -> Option<Value> {
+        let expr = self.call_arg_expr(origin, 0)?;
+        let lane = vec_ty.lane()?;
+        let bits = if lane.is_int() {
+            let mut ctx = ConstEval { cx: self.cx, origin_body: self.body, typed: self.typed };
+            ctx.int(self.body, self.src, expr, &mut Vec::new(), 0)?.val & int_mask(lane.bytes() * 8)
+        } else {
+            let lane_ty = match lane { Lane::F32 => Type::F32, Lane::F64 => Type::F64, _ => return None };
+            let inner = ConstEval { cx: self.cx, origin_body: self.body, typed: self.typed }.unwrap_expr(self.body, expr);
+            let Expr::Lit(Lit::Float, tok) = *self.body.expr(inner) else { return None };
+            parse_float(lane_ty, self.src.text(tok)).ok()? as u64 as u128
+        };
+        if bits == 0 {
+            return Some(self.ins().iconst(vec_ty, 0));
+        }
+        let lane_bytes = lane.bytes() as usize;
+        let mut bytes = vec![0u8; vec_ty.bytes() as usize];
+        for chunk in bytes.chunks_exact_mut(lane_bytes) {
+            chunk.copy_from_slice(&bits.to_le_bytes()[..lane_bytes]);
+        }
+        let addr = self.emit_const_rodata(&bytes);
+        Some(self.ins().load(vec_ty, addr, 0))
     }
 }
 
