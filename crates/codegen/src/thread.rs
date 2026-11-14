@@ -1,259 +1,17 @@
+mod eval;
 mod widen;
 
-use crate::facts::{Fact, Ranges, decide};
-use crate::fold::{evaluate_wrapped, extend};
-use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, InstData, IntCC, Op, SigRef, Type, Value};
+use crate::fold::extend;
+use crate::ir::{Block, Domain, Function, Inst, InstData, IntCC, Op, SigRef, Value};
+
+use self::eval::{
+    EdgeSeed, EvalState, ThreadCx, cmp_implies, eval_cmp_facts, eval_cond_truth, eval_op, fact_of, is_bool_val, lookup,
+    lookup_const, propagate_pure_op, seed_edge,
+};
 
 const MAX_DISP_INSTS: usize = 10;
 const MAX_CHAIN: usize = 8;
-const MAX_BRIF_SPEC_OPS: usize = 2;
-
-#[derive(Clone, Copy)]
-enum EdgeSeed {
-    None,
-    Brif(Value, bool),
-    Const(Value, i64),
-}
-
-struct ThreadCx<'a> {
-    defs: &'a [Option<Inst>],
-    consts: &'a mut Vec<Option<i64>>,
-    ranges: &'a Ranges<'a>,
-    ranges_len: usize,
-    pinned: &'a [bool],
-}
-
-fn lookup(map: &[(Value, Value)], value: Value) -> Value {
-    map.iter().find(|&&(k, _)| k == value).map_or(value, |&(_, v)| v)
-}
-
-fn lookup_const(local: &[(Value, i64)], global: &[Option<i64>], value: Value) -> Option<i64> {
-    local.iter().find(|&&(k, _)| k == value).map(|&(_, imm)| imm).or_else(|| global.get(value.index()).copied().flatten())
-}
-
-fn fact_of(local_facts: &[(Value, Fact)], ranges: &Ranges<'_>, ranges_len: usize, value: Value) -> Option<Fact> {
-    local_facts
-        .iter()
-        .rev()
-        .find(|&&(k, _)| k == value)
-        .map(|(_, f)| f.clone())
-        .or_else(|| (value.index() < ranges_len).then(|| ranges.of(value)))
-}
-
-fn swap_int_cc(cc: IntCC) -> IntCC {
-    match cc {
-        IntCC::Equal | IntCC::NotEqual => cc,
-        IntCC::SignedLessThan => IntCC::SignedGreaterThan,
-        IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThanOrEqual,
-        IntCC::SignedGreaterThan => IntCC::SignedLessThan,
-        IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThanOrEqual,
-        IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThan,
-        IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThanOrEqual,
-        IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThan,
-        IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
-    }
-}
-
-fn bounds_of_cmp(ty: Type, cc: IntCC, imm: i64) -> Option<(bool, i128, i128)> {
-    if !cc.is_signed() {
-        let (u_max, u) = (i128::from(ty.unsigned_max()), i128::from(extend(imm, ty, false) as u64));
-        let (lo, hi) = match cc {
-            IntCC::Equal => (u, u),
-            IntCC::NotEqual if u == 0 && u_max > 0 => (1, u_max),
-            IntCC::NotEqual if u == u_max && u_max > 0 => (0, u_max - 1),
-            IntCC::UnsignedLessThan if u > 0 => (0, u - 1),
-            IntCC::UnsignedLessThanOrEqual => (0, u),
-            IntCC::UnsignedGreaterThan if u < u_max => (u + 1, u_max),
-            IntCC::UnsignedGreaterThanOrEqual => (u, u_max),
-            _ => return None,
-        };
-        return Some((false, lo, hi));
-    }
-    let (s_min, s_max) = if ty == Type::I64 {
-        (i128::from(i64::MIN), i128::from(i64::MAX))
-    } else {
-        let h = 1_i128 << (ty.bits() - 1);
-        (-h, h - 1)
-    };
-    let s = i128::from(extend(imm, ty, true));
-    let (lo, hi) = match cc {
-        IntCC::SignedLessThan if s > s_min => (s_min, s - 1),
-        IntCC::SignedLessThanOrEqual => (s_min, s),
-        IntCC::SignedGreaterThan if s < s_max => (s + 1, s_max),
-        IntCC::SignedGreaterThanOrEqual => (s, s_max),
-        _ => return None,
-    };
-    Some((true, lo, hi))
-}
-
-fn cmp_implies(ty: Type, cc1: IntCC, imm1: i64, cc2: IntCC, imm2: i64) -> Option<bool> {
-    if cc1 == IntCC::NotEqual && matches!(cc2, IntCC::Equal | IntCC::NotEqual)
-        && extend(imm1, ty, false) == extend(imm2, ty, false)
-    {
-        return Some(cc2 == IntCC::NotEqual);
-    }
-    let (signed, lo, hi) = bounds_of_cmp(ty, cc1, imm1)?;
-    let c2 = if signed {
-        if !cc2.is_signed() && !matches!(cc2, IntCC::Equal | IntCC::NotEqual) {
-            return None;
-        }
-        i128::from(extend(imm2, ty, true))
-    } else {
-        let half = i128::from(ty.unsigned_max() >> 1);
-        let c = i128::from(extend(imm2, ty, false) as u64);
-        if cc2.is_signed() && (hi > half || c > half) {
-            return None;
-        }
-        c
-    };
-    match cc2 {
-        IntCC::Equal => (lo == hi).then_some(lo == c2).or_else(|| (c2 < lo || c2 > hi).then_some(false)),
-        IntCC::NotEqual => (lo == hi).then_some(lo != c2).or_else(|| (c2 < lo || c2 > hi).then_some(true)),
-        IntCC::UnsignedLessThan | IntCC::SignedLessThan => {
-            if hi < c2 { Some(true) } else if lo >= c2 { Some(false) } else { None }
-        }
-        IntCC::UnsignedLessThanOrEqual | IntCC::SignedLessThanOrEqual => {
-            if hi <= c2 { Some(true) } else if lo > c2 { Some(false) } else { None }
-        }
-        IntCC::UnsignedGreaterThan | IntCC::SignedGreaterThan => {
-            if lo > c2 { Some(true) } else if hi <= c2 { Some(false) } else { None }
-        }
-        IntCC::UnsignedGreaterThanOrEqual | IntCC::SignedGreaterThanOrEqual => {
-            if lo >= c2 { Some(true) } else if hi < c2 { Some(false) } else { None }
-        }
-    }
-}
-
-fn seed_edge(
-    func: &Function,
-    cx: &ThreadCx<'_>,
-    cond: Value,
-    taken: bool,
-    depth: u8,
-    (local_consts, edge_cmps): (&mut Vec<(Value, i64)>, &mut Vec<(Value, Type, IntCC, i64)>),
-) {
-    if depth > 4 {
-        return;
-    }
-    let Some(inst) = cx.defs.get(cond.index()).copied().flatten() else {
-        if !taken {
-            local_consts.push((cond, 0));
-        }
-        return;
-    };
-    let op = &func.insts[inst.index()].op;
-    if !taken {
-        local_consts.push((cond, 0));
-    } else if matches!(op, Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..)) {
-        local_consts.push((cond, 1));
-    }
-    match *op {
-        Op::Binary(Binary::Band, a, b) if taken => {
-            seed_edge(func, cx, a, true, depth + 1, (local_consts, edge_cmps));
-            seed_edge(func, cx, b, true, depth + 1, (local_consts, edge_cmps));
-        }
-        Op::Binary(Binary::Bor, a, b) if !taken => {
-            seed_edge(func, cx, a, false, depth + 1, (local_consts, edge_cmps));
-            seed_edge(func, cx, b, false, depth + 1, (local_consts, edge_cmps));
-        }
-        Op::Icmp(cc, x, y) if func.ty(x).is_small_int() => {
-            let eff = if taken { cc } else { cc.inverse() };
-            let (lhs, ord, imm) = match (lookup_const(local_consts, cx.consts, x), lookup_const(local_consts, cx.consts, y)) {
-                (None, Some(k)) => (x, eff, k),
-                (Some(k), None) => (y, swap_int_cc(eff), k),
-                _ => return,
-            };
-            if ord == IntCC::Equal {
-                local_consts.push((lhs, imm));
-            } else {
-                edge_cmps.push((lhs, func.ty(lhs), ord, imm));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn eval_op(func: &Function, op: &Op, ty: Type, known: &dyn Fn(Value) -> Option<i64>) -> Option<i64> {
-    if let Some(imm) = evaluate_wrapped(func, op, ty, known) {
-        return Some(imm);
-    }
-    if !ty.is_small_int() {
-        return None;
-    }
-    let is_zero = |v: Value| known(v).is_some_and(|imm| extend(imm, ty, false) == 0);
-    match *op {
-        Op::Convert(Convert::Bitcast, x) if func.ty(x).is_small_int() && func.ty(x).bits() == ty.bits() => {
-            known(x).map(|imm| extend(imm, ty, true))
-        }
-        Op::Select(c, x, y) => {
-            if x == y {
-                return known(x).map(|imm| extend(imm, ty, true));
-            }
-            let chosen = if extend(known(c)?, func.ty(c), false) != 0 { x } else { y };
-            known(chosen).map(|imm| extend(imm, ty, true))
-        }
-        Op::Binary(Binary::Imul | Binary::Umulhi | Binary::Smulhi | Binary::Band, x, y) if is_zero(x) || is_zero(y) => Some(0),
-        Op::Binary(Binary::Isub | Binary::Bxor, x, y) if x == y => Some(0),
-        Op::Icmp(cc, x, y) if x == y && func.ty(x).is_small_int() => Some(i64::from(matches!(
-            cc,
-            IntCC::Equal | IntCC::SignedGreaterThanOrEqual | IntCC::SignedLessThanOrEqual | IntCC::UnsignedGreaterThanOrEqual | IntCC::UnsignedLessThanOrEqual
-        ))),
-        _ => None,
-    }
-}
-
-fn eval_cond_truth(func: &Function, cx: &ThreadCx<'_>, state: &EvalState, cond_val: Value) -> Option<bool> {
-    if let Some(c) = lookup_const(&state.local_consts, cx.consts, cond_val) {
-        return Some(extend(c, func.ty(cond_val), false) != 0);
-    }
-    if let Some(u) = fact_of(&state.local_facts, cx.ranges, cx.ranges_len, cond_val).and_then(|f| f.exact()) {
-        return Some(u != 0);
-    }
-    state.edge_cmps.iter().find_map(|&(v, v_ty, cc1, imm1)| (v == cond_val).then(|| cmp_implies(v_ty, cc1, imm1, IntCC::NotEqual, 0)).flatten())
-}
-
-fn is_bool_val(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value) -> bool {
-    let Some(inst) = defs.get(v.index()).copied().flatten() else { return false };
-    let is_one = |u: Value| consts.get(u.index()).copied().flatten() == Some(1);
-    match func.insts[inst.index()].op {
-        Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => true,
-        Op::Convert(Convert::Uextend, inner) => is_bool_val(func, defs, consts, inner),
-        Op::Binary(Binary::Band, a, b) => is_one(a) || is_one(b) || is_bool_val(func, defs, consts, a) || is_bool_val(func, defs, consts, b),
-        Op::Binary(Binary::Bxor, a, b) => (is_one(b) && is_bool_val(func, defs, consts, a)) || (is_one(a) && is_bool_val(func, defs, consts, b)),
-        _ => false,
-    }
-}
-
-fn eval_cmp_facts(
-    func: &Function,
-    cx: &ThreadCx<'_>,
-    op: &Op,
-    (local_consts, local_facts, edge_cmps): (&[(Value, i64)], &[(Value, Fact)], &[(Value, Type, IntCC, i64)]),
-) -> Option<i64> {
-    let &Op::Icmp(cc, x, y) = op else { return None };
-    let ty = func.ty(x);
-    if !ty.is_small_int() {
-        return None;
-    }
-    if let (Some(fx), Some(fy)) = (
-        fact_of(local_facts, cx.ranges, cx.ranges_len, x),
-        fact_of(local_facts, cx.ranges, cx.ranges_len, y),
-    ) && let Some(res) = decide(cc, ty, &fx, &fy)
-    {
-        return Some(i64::from(res));
-    }
-    let (lhs, ord, imm2) = match (lookup_const(local_consts, cx.consts, x), lookup_const(local_consts, cx.consts, y)) {
-        (None, Some(k)) => (x, cc, k),
-        (Some(k), None) => (y, swap_int_cc(cc), k),
-        _ => return None,
-    };
-    for &(v, v_ty, cc1, imm1) in edge_cmps {
-        if v == lhs && v_ty == ty && let Some(res) = cmp_implies(ty, cc1, imm1, ord, imm2) {
-            return Some(i64::from(res));
-        }
-    }
-    None
-}
+const MAX_BRIF_SPEC_OPS: usize = 4;
 
 struct Eval {
     chosen_target: Block,
@@ -284,15 +42,6 @@ fn escapes_from(func: &Function, start: Block, def_block: Block, defs: &[Value])
         stack.extend(func.successors(b));
     }
     false
-}
-
-#[derive(Default)]
-struct EvalState {
-    map: Vec<(Value, Value)>,
-    local_ops: Vec<(Value, Op)>,
-    local_consts: Vec<(Value, i64)>,
-    local_facts: Vec<(Value, Fact)>,
-    edge_cmps: Vec<(Value, Type, IntCC, i64)>,
 }
 
 fn step_block(
@@ -328,7 +77,7 @@ fn step_block(
         let mut op = data.op.clone();
         op.map_operands(|v| lookup(&state.map, v));
         if let Some(imm) = eval_op(func, &op, func.ty(res), &|v| lookup_const(&state.local_consts, cx.consts, v))
-            .or_else(|| eval_cmp_facts(func, cx, &op, (&state.local_consts, &state.local_facts, &state.edge_cmps)))
+            .or_else(|| eval_cmp_facts(func, cx, &op, state))
         {
             state.local_consts.push((res, imm));
         } else if let Op::Select(c, x, y) = op
@@ -341,6 +90,17 @@ fn step_block(
                 state.local_consts.push((res, imm));
             }
             if let Some(f) = fact_of(&state.local_facts, cx.ranges, cx.ranges_len, chosen) {
+                state.local_facts.retain(|&(k, _)| k != res);
+                state.local_facts.push((res, f));
+            }
+            continue;
+        } else if let Some(alias) = propagate_pure_op(func, cx, res, &op, state) {
+            state.map.retain(|&(k, _)| k != res);
+            state.map.push((res, alias));
+            if let Some(imm) = lookup_const(&state.local_consts, cx.consts, alias) {
+                state.local_consts.push((res, imm));
+            }
+            if let Some(f) = fact_of(&state.local_facts, cx.ranges, cx.ranges_len, alias) {
                 state.local_facts.retain(|&(k, _)| k != res);
                 state.local_facts.push((res, f));
             }
@@ -360,6 +120,10 @@ fn step_block(
             let next_b = if let Some(c) = lookup_const(&state.local_consts, cx.consts, idx_val) {
                 let u = extend(c, func.ty(idx_val), false) as u64;
                 usize::try_from(u).ok().and_then(|at| targets.get(at).copied()).unwrap_or(*default)
+            } else if let Some(u) = fact_of(&state.local_facts, cx.ranges, cx.ranges_len, idx_val).and_then(|f| f.exact()) {
+                usize::try_from(u).ok().and_then(|at| targets.get(at).copied()).unwrap_or(*default)
+            } else if targets.iter().all(|&t| t == *default) {
+                *default
             } else {
                 let ty = func.ty(idx_val);
                 let fits_default = ty.is_small_int()
@@ -394,7 +158,7 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, disp: Block, incoming: &[
     let (mut next_b, mut next_args, first_defs) = step_block(func, cx, disp, incoming, &mut state)?;
     visited.push((disp, first_defs));
     while visited.len() < MAX_CHAIN && !cx.pinned[next_b.index()] && !visited.iter().any(|&(b, _)| b == next_b) {
-        let marks = (state.map.len(), state.local_ops.len(), state.local_consts.len(), state.local_facts.len());
+        let marks = (state.map.len(), state.local_ops.len(), state.local_consts.len(), state.local_facts.len(), state.edge_cmps.len());
         let cur = next_b;
         if let Some((nb, na, defs)) = step_block(func, cx, cur, &next_args, &mut state) {
             visited.push((cur, defs));
@@ -405,6 +169,7 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, disp: Block, incoming: &[
             state.local_ops.truncate(marks.1);
             state.local_consts.truncate(marks.2);
             state.local_facts.truncate(marks.3);
+            state.edge_cmps.truncate(marks.4);
             break;
         }
     }
@@ -447,6 +212,31 @@ fn non_const_needed(eval: &Eval) -> usize {
         .count()
 }
 
+fn resolve_emit_val(
+    func: &mut Function,
+    consts: &mut Vec<Option<i64>>,
+    local_consts: &[(Value, i64)],
+    emit_map: &mut Vec<(Value, Value)>,
+    inserted: &mut Vec<Inst>,
+    val: Value,
+) -> Value {
+    let mapped = lookup(emit_map, val);
+    if mapped != val {
+        return mapped;
+    }
+    let Some(&(_, imm)) = local_consts.iter().rev().find(|&&(r, _)| r == val) else {
+        return val;
+    };
+    let c_val = Value(func.types.len() as u32);
+    func.types.push(func.ty(val));
+    consts.push(Some(imm));
+    let c_inst = Inst(func.insts.len() as u32);
+    func.insts.push(InstData { op: Op::Const(imm), result: Some(c_val) });
+    inserted.push(c_inst);
+    emit_map.push((val, c_val));
+    c_val
+}
+
 fn emit_needed(func: &mut Function, pred: Block, consts: &mut Vec<Option<i64>>, eval: Eval) -> (Block, Vec<Value>) {
     let mut emit_map: Vec<(Value, Value)> = Vec::new();
     let mut inserted: Vec<Inst> = Vec::new();
@@ -454,23 +244,27 @@ fn emit_needed(func: &mut Function, pred: Block, consts: &mut Vec<Option<i64>>, 
         if !eval.needed[idx] {
             continue;
         }
-        let ty = func.ty(res);
-        let new_val = Value(func.types.len() as u32);
-        func.types.push(ty);
         let (new_op, imm_opt) = if let Some(&(_, imm)) = eval.local_consts.iter().find(|&&(r, _)| r == res) {
             (Op::Const(imm), Some(imm))
         } else {
             let mut mapped = op;
-            mapped.map_operands(|v| lookup(&emit_map, v));
+            mapped.map_operands(|v| resolve_emit_val(func, consts, &eval.local_consts, &mut emit_map, &mut inserted, v));
             (mapped, None)
         };
+        let ty = func.ty(res);
+        let new_val = Value(func.types.len() as u32);
+        func.types.push(ty);
         consts.push(imm_opt);
         let new_inst = Inst(func.insts.len() as u32);
         func.insts.push(InstData { op: new_op, result: Some(new_val) });
         inserted.push(new_inst);
         emit_map.push((res, new_val));
     }
-    let new_args: Vec<Value> = eval.chosen_args.into_iter().map(|v| lookup(&emit_map, v)).collect();
+    let new_args: Vec<Value> = eval
+        .chosen_args
+        .into_iter()
+        .map(|v| resolve_emit_val(func, consts, &eval.local_consts, &mut emit_map, &mut inserted, v))
+        .collect();
     if !inserted.is_empty() {
         let insts = &mut func.blocks[pred.index()].insts;
         let at = insts.len() - 1;
@@ -506,23 +300,30 @@ fn finish_split_branch(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, 
 }
 
 fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Block, term: Inst, args: &[Value]) -> bool {
-    for (k, &arg) in args.iter().enumerate() {
+    for &arg in args {
         let Some(def) = cx.defs.get(arg.index()).copied().flatten() else { continue };
         let Op::Select(sel_c, sel_t, sel_f) = func.insts[def.index()].op else { continue };
         if sel_t == sel_f {
             continue;
         }
         let mut args_t = args.to_vec();
-        args_t[k] = sel_t;
         let mut args_f = args.to_vec();
-        args_f[k] = sel_f;
+        for (j, &a) in args.iter().enumerate() {
+            if let Some(d2) = cx.defs.get(a.index()).copied().flatten()
+                && let Op::Select(c2, t2, f2) = func.insts[d2.index()].op
+                && c2 == sel_c
+            {
+                args_t[j] = t2;
+                args_f[j] = f2;
+            }
+        }
         let (Some(et), Some(ef)) = (
-            eval_dispatcher(func, cx, disp, &args_t, EdgeSeed::None),
-            eval_dispatcher(func, cx, disp, &args_f, EdgeSeed::None),
+            eval_dispatcher(func, cx, disp, &args_t, EdgeSeed::Brif(sel_c, true)),
+            eval_dispatcher(func, cx, disp, &args_f, EdgeSeed::Brif(sel_c, false)),
         ) else {
             continue;
         };
-        if non_const_needed(&et) + non_const_needed(&ef) > MAX_BRIF_SPEC_OPS {
+        if et.chosen_target == disp || ef.chosen_target == disp || non_const_needed(&et) + non_const_needed(&ef) > MAX_BRIF_SPEC_OPS {
             continue;
         }
         func.insts[term.index()].op = finish_split_branch(func, cx, pred, sel_c, et, ef);
@@ -547,7 +348,22 @@ fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, d
     false
 }
 
-fn thread_jump(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Block) -> bool {
+fn single_pred_brif_seed(func: &Function, single: &[Option<Block>], pred: Block) -> Option<(Value, bool)> {
+    let mut cur = pred;
+    for _ in 0..2 {
+        let parent = single[cur.index()]?;
+        match func.last(parent) {
+            Some(Op::Brif(cond, t_blk, _, e_blk, _)) if *t_blk != *e_blk && (*t_blk == cur || *e_blk == cur) => {
+                return Some((*cond, *t_blk == cur));
+            }
+            Some(Op::Jump(target, _)) if *target == cur => cur = parent,
+            _ => break,
+        }
+    }
+    None
+}
+
+fn thread_jump(func: &mut Function, cx: &mut ThreadCx<'_>, single: &[Option<Block>], pred: Block, disp: Block) -> bool {
     let Some(&term) = func.blocks[pred.index()].insts.last() else {
         return false;
     };
@@ -559,6 +375,15 @@ fn thread_jump(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Bl
     }
     let args = args.clone();
     if let Some(eval) = eval_dispatcher(func, cx, disp, &args, EdgeSeed::None) {
+        let (new_target, new_args) = emit_needed(func, pred, cx.consts, eval);
+        func.insts[term.index()].op = Op::Jump(new_target, new_args);
+        return true;
+    }
+    if let Some((cond, taken)) = single_pred_brif_seed(func, single, pred)
+        && let Some(eval) = eval_dispatcher(func, cx, disp, &args, EdgeSeed::Brif(cond, taken))
+        && eval.chosen_target != disp
+        && non_const_needed(&eval) <= MAX_BRIF_SPEC_OPS
+    {
         let (new_target, new_args) = emit_needed(func, pred, cx.consts, eval);
         func.insts[term.index()].op = Op::Jump(new_target, new_args);
         return true;
@@ -596,16 +421,17 @@ fn thread_brif(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Bl
     changed
 }
 
-fn thread_br_table(func: &mut Function, cx: &ThreadCx<'_>, pred: Block, disp: Block) -> bool {
+fn thread_br_table(func: &mut Function, cx: &ThreadCx<'_>, single: &[Option<Block>], pred: Block, disp: Block) -> bool {
     let Some(&term) = func.blocks[pred.index()].insts.last() else {
         return false;
     };
     let Op::BrTable(index, default, ref targets) = func.insts[term.index()].op else {
         return false;
     };
-    if !targets.contains(&disp) {
+    if default != disp && !targets.contains(&disp) {
         return false;
     }
+    let mut new_default = default;
     let mut new_targets = targets.clone();
     let mut changed = false;
     for (k, target) in new_targets.iter_mut().enumerate() {
@@ -620,8 +446,18 @@ fn thread_br_table(func: &mut Function, cx: &ThreadCx<'_>, pred: Block, disp: Bl
             changed = true;
         }
     }
+    if new_default == disp
+        && let Some((cond, taken)) = single_pred_brif_seed(func, single, pred)
+        && let Some(eval) = eval_dispatcher(func, cx, disp, &[], EdgeSeed::Brif(cond, taken))
+        && eval.chosen_args.is_empty()
+        && non_const_needed(&eval) == 0
+        && eval.chosen_target != new_default
+    {
+        new_default = eval.chosen_target;
+        changed = true;
+    }
     if changed {
-        func.insts[term.index()].op = Op::BrTable(index, default, new_targets);
+        func.insts[term.index()].op = Op::BrTable(index, new_default, new_targets);
     }
     changed
 }
@@ -657,7 +493,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         }
     }
     let mut any = false;
-    for _ in 0..8 {
+    for _ in 0..16 {
         let mut defs = vec![None; func.types.len()];
         for block in &func.blocks {
             for &inst in &block.insts {
@@ -674,10 +510,11 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         }
         let cfg = func.cfg();
         let single: Vec<Option<Block>> = (0..func.blocks.len()).map(|b| cfg.single_pred(Block(b as u32))).collect();
-        let ranges = Ranges::new(func, (&defs, &consts), (&cfg.rpo, &single, &cfg.idom));
+        let ranges = crate::facts::Ranges::new(func, (&defs, &consts), (&cfg.rpo, &single, &cfg.idom));
         let ranges_len = func.types.len();
         let mut cx = ThreadCx { defs: &defs, consts: &mut consts, ranges: &ranges, ranges_len, pinned: &pinned };
         let mut changed = false;
+        let mut stale = false;
         for disp_idx in 0..func.blocks.len() {
             if cx.pinned[disp_idx] {
                 continue;
@@ -700,9 +537,24 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                     continue;
                 }
                 let pred = Block(pred_idx as u32);
-                changed |= thread_jump(func, &mut cx, pred, disp);
-                changed |= thread_brif(func, &mut cx, pred, disp);
-                changed |= thread_br_table(func, &cx, pred, disp);
+                let mut pred_changed = false;
+                pred_changed |= thread_jump(func, &mut cx, &single, pred, disp);
+                pred_changed |= thread_brif(func, &mut cx, pred, disp);
+                pred_changed |= thread_br_table(func, &cx, &single, pred, disp);
+                if pred_changed {
+                    changed = true;
+                    if func.successors(pred).any(|s| {
+                        s != disp
+                            && (single[s.index()].is_some()
+                                || cfg.idom[s.index()].is_some_and(|d| d != s && !crate::cfg::dominates(&cfg.idom, d, pred)))
+                    }) {
+                        stale = true;
+                        break;
+                    }
+                }
+            }
+            if stale {
+                break;
             }
         }
         if !changed {
