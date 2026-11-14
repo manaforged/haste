@@ -277,9 +277,40 @@ fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slot
     Ok((tmpl, cycle, depth, quiet))
 }
 
-fn limit_flags(cx: &mut Context<'_>, reached: &Reached, index: usize, limit: usize) -> (bool, bool) {
-    let std_limit = super::expr::inline_limit(cx, reached, index);
-    (std_limit == Some(limit), std_limit.is_some_and(|sl| limit <= sl))
+fn limit_flags(cx: &mut Context<'_>, reached: &Reached, (bodies, inline): (&Bodies, &Inline), index: usize, limit: usize) -> Option<(usize, bool, bool)> {
+    let cap = if bodies.is_cyclic(cx, reached, index) {
+        let host = inline.stack.last().copied().filter(|&host| host >= index);
+        if host.is_some_and(|host| bodies.is_cyclic(cx, reached, host)) {
+            return None;
+        }
+        super::expr::cycle_limit(cx, reached, index)?
+    } else {
+        usize::MAX
+    };
+    let std_limit = super::expr::inline_limit(cx, reached, index).map(|standard| standard.min(cap));
+    let limit = limit.min(cap);
+    Some((limit, std_limit == Some(limit), std_limit.is_some_and(|sl| limit <= sl)))
+}
+
+fn cached_inline(bodies: &Bodies, inline: &Inline, index: usize, (neg_valid, shape_only): (bool, bool)) -> Option<(Option<Arc<InlinedCallee>>, Option<InlineMeta>, usize)> {
+    let whole = |callee: Option<Arc<InlinedCallee>>, cycle: usize| {
+        let meta = callee.as_deref().map(InlinedCallee::meta);
+        (callee, meta, cycle)
+    };
+    let usable = |meta: &Option<InlineMeta>| if meta.is_some() { shape_only } else { neg_valid };
+    if let Some(callee) = bodies.inlined.get(&index).filter(|callee| callee.is_some() || neg_valid) {
+        return Some(whole(callee, usize::MAX));
+    }
+    if let Some(meta) = bodies.inline_meta.get(&index).filter(usable) {
+        return Some((None, meta, usize::MAX));
+    }
+    if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
+        return Some((None, None, pos));
+    }
+    if let Some((callee, cycle)) = inline.local.get(&index).filter(|(callee, _)| callee.is_some() || neg_valid) {
+        return Some(whole(callee.clone(), *cycle));
+    }
+    inline.local_meta.get(&index).filter(|(meta, _)| usable(meta)).map(|&(meta, cycle)| (None, meta, cycle))
 }
 
 fn build_inlined(item: ItemRef, footprint: FootprintId, t: &InlineTemplate, relocs: RelocVec) -> Arc<InlinedCallee> {
@@ -297,25 +328,11 @@ fn build_inlined(item: ItemRef, footprint: FootprintId, t: &InlineTemplate, relo
 
 pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<(ItemRef, FootprintId, bool)>, usize)> {
     let bodies = slots.bodies();
-    if bodies.is_cyclic(cx, reached, index) {
+    let Some((limit, standard, neg_valid)) = limit_flags(cx, reached, (bodies, &*inline), index, limit) else {
         return Ok((None, usize::MAX));
-    }
-    let (standard, neg_valid) = limit_flags(cx, reached, index, limit);
-    if let Some(cached) = bodies.inlined.get(&index).filter(|c| c.is_some() || neg_valid) {
-        return Ok((record_meta_height(inline, cached.as_deref().map(InlinedCallee::meta)), usize::MAX));
-    }
-    if let Some(cached) = bodies.inline_meta.get(&index).filter(|c| c.is_some() || neg_valid) {
-        return Ok((record_meta_height(inline, cached), usize::MAX));
-    }
-    if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
-        return Ok((None, pos));
-    }
-    if let Some((cached, cycle)) = inline.local.get(&index).filter(|(c, _)| c.is_some() || neg_valid) {
-        let (meta, cyc) = (cached.as_deref().map(InlinedCallee::meta), *cycle);
-        return Ok((record_meta_height(inline, meta), cyc));
-    }
-    if let Some(&(meta, cyc)) = inline.local_meta.get(&index).filter(|(m, _)| m.is_some() || neg_valid) {
-        return Ok((record_meta_height(inline, meta), cyc));
+    };
+    if let Some((_, meta, cycle)) = cached_inline(bodies, inline, index, (neg_valid, true)) {
+        return Ok((record_meta_height(inline, meta), cycle));
     }
     let item = reached.list[index].0.0;
     let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, true))?;
@@ -349,25 +366,11 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
 
 pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
     let bodies = slots.bodies();
-    if bodies.is_cyclic(cx, reached, index) {
+    let Some((limit, standard, neg_valid)) = limit_flags(cx, reached, (bodies, &*inline), index, limit) else {
         return Ok((None, usize::MAX));
-    }
-    let (standard, neg_valid) = limit_flags(cx, reached, index, limit);
-    if let Some(cached) = bodies.inlined.get(&index).filter(|c| c.is_some() || neg_valid) {
-        return Ok((record_callee_height(inline, cached), usize::MAX));
-    }
-    if neg_valid && matches!(bodies.inline_meta.get(&index), Some(None)) {
-        return Ok((None, usize::MAX));
-    }
-    if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
-        return Ok((None, pos));
-    }
-    if let Some((cached, cycle)) = inline.local.get(&index).filter(|(c, _)| c.is_some() || neg_valid) {
-        let (hit, cyc) = (cached.clone(), *cycle);
-        return Ok((record_callee_height(inline, hit), cyc));
-    }
-    if neg_valid && let Some(&(None, cyc)) = inline.local_meta.get(&index) {
-        return Ok((None, cyc));
+    };
+    if let Some((callee, _, cycle)) = cached_inline(bodies, inline, index, (neg_valid, false)) {
+        return Ok((record_callee_height(inline, callee), cycle));
     }
     let item = reached.list[index].0.0;
     let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, false))?;

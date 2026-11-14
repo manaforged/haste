@@ -3,11 +3,11 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use haste_codegen::{Block, Signature, Type, Value};
 
-use crate::body::{Expr, ExprId, List, UnOp};
+use crate::body::{Body, Expr, ExprId, List, UnOp};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::Context;
-use crate::sema::infer::{Coercion, Res, Shape, SiteKey};
+use crate::sema::infer::{Coercion, Res, Shape, SiteKey, Typed};
 use crate::sema::reach::Reached;
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty};
@@ -34,6 +34,8 @@ const DEBUG_BUDGET: Budget = Budget { insts: 30, inline_insts: 30, always: 100, 
 
 /// The budget of the release profile.
 const RELEASE_BUDGET: Budget = Budget { insts: 500, inline_insts: 900, always: 1200, exprs: 500 };
+
+const CYCLE_BUDGET: usize = 12;
 
 /// The budget of the build profile.
 fn budget() -> &'static Budget {
@@ -106,6 +108,57 @@ fn is_cold_or_never(cx: &Context<'_>, reached: &Reached, item: ItemRef, substs: 
         .is_some_and(|ret| matches!(cx.types.kind(ret), Kind::Never))
 }
 
+fn cold_calls(cx: &Context<'_>, reached: &Reached, typed: &Typed, body: &Body, cap: usize) -> usize {
+    let cold = |&(item, substs): &(ItemRef, Substs)| is_cold_or_never(cx, reached, item, substs);
+    let found = typed.calls().filter(cold).take(cap).count();
+    if found < cap {
+        return found;
+    }
+    let untaken = untaken_cold_calls(cx, reached, typed, body);
+    typed.calls().filter(cold).take(cap + untaken).count().saturating_sub(untaken)
+}
+
+fn untaken_cold_calls(cx: &Context<'_>, reached: &Reached, typed: &Typed, body: &Body) -> usize {
+    let untaken = |expr: &Expr| match *expr {
+        Expr::If(cond, then, otherwise) => match (const_bool(body, cond)?, otherwise) {
+            (false, _) => Some((cond.0, then.0)),
+            (true, Some(otherwise)) => Some((then.0, otherwise.0)),
+            (true, None) => None,
+        },
+        _ => None,
+    };
+    let spans: Vec<(u32, u32)> = body.exprs.iter().filter_map(untaken).collect();
+    if spans.is_empty() {
+        return 0;
+    }
+    let scoped = typed.scoped(&cx.types);
+    let cold = |res: &Res| matches!(*res, Res::Fn(item, substs) if is_cold_or_never(cx, reached, item, substs));
+    scoped.res.iter().filter(|&(at, res)| spans.iter().any(|&(after, last)| after < at.0 && at.0 <= last) && cold(res)).count()
+}
+
+fn unwrap_expr(body: &Body, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
+    loop {
+        match *body.expr(expr) {
+            Expr::Paren(inner) => expr = inner,
+            Expr::Block { stmts, tail: Some(inner), label: None, kind }
+                if body.list(stmts).is_empty()
+                    && (matches!(kind, crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion)
+                        || (allow_unsafe && kind == crate::body::BlockKind::Unsafe)) =>
+            {
+                expr = inner;
+            }
+            _ => return expr,
+        }
+    }
+}
+
+fn const_bool(body: &Body, expr: ExprId) -> Option<bool> {
+    match *body.expr(unwrap_expr(body, expr, false)) {
+        Expr::Lit(crate::body::Lit::Bool(taken), _) => Some(taken),
+        _ => None,
+    }
+}
+
 /// The most instructions a call may copy inline of reached function `index`, or none when calls never inline it.
 pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
     let ((item, _), Ok(typed)) = &reached.list[index] else {
@@ -131,15 +184,11 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
         return None;
     };
     if hint != Hint::Always {
-        if release && hint == Hint::Inline {
-            if typed.calls().filter(|&(ci, cs)| is_cold_or_never(cx, reached, ci, cs)).take(7).count() > 6 {
-                return None;
-            }
-        } else {
-            let cold_calls = typed.calls().filter(|&(ci, cs)| is_cold_or_never(cx, reached, ci, cs)).take(3).count();
-            if cold_calls >= 3 || (cold_calls >= 2 && body.exprs.len() > 80) {
-                return None;
-            }
+        let lenient = release && hint == Hint::Inline;
+        let cap = if lenient { 7 } else { 3 };
+        let cold = cold_calls(cx, reached, typed, &body, cap);
+        if cold >= cap || (!lenient && cold >= 2 && body.exprs.len() > 80) {
+            return None;
         }
     }
     match hint {
@@ -155,6 +204,14 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
             (body.exprs.len() <= max_exprs).then_some(budget.insts)
         }
     }
+}
+
+pub(super) fn cycle_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
+    let ((item, _), Ok(typed)) = &reached.list[index] else {
+        return None;
+    };
+    let short = !matches!(typed.shape, Shape::Body) || cx.body(*item).is_ok_and(|body| body.exprs.len() <= CYCLE_BUDGET);
+    short.then_some(CYCLE_BUDGET)
 }
 
 impl Lower<'_, '_> {
@@ -590,31 +647,12 @@ impl Lower<'_, '_> {
         }
     }
 
-    pub(super) fn unwrap_expr(&self, mut expr: ExprId, allow_unsafe: bool) -> ExprId {
-        loop {
-            match *self.body.expr(expr) {
-                Expr::Paren(inner) => expr = inner,
-                Expr::Block { stmts, tail: Some(inner), label: None, kind }
-                    if self.body.list(stmts).is_empty()
-                        && (matches!(kind, crate::body::BlockKind::Plain | crate::body::BlockKind::Expansion)
-                            || (allow_unsafe && kind == crate::body::BlockKind::Unsafe)) =>
-                {
-                    expr = inner;
-                }
-                _ => return expr,
-            }
-        }
-    }
-
-    fn const_bool(&self, expr: ExprId) -> Option<bool> {
-        match *self.body.expr(self.unwrap_expr(expr, false)) {
-            Expr::Lit(crate::body::Lit::Bool(taken), _) => Some(taken),
-            _ => None,
-        }
+    pub(super) fn unwrap_expr(&self, expr: ExprId, allow_unsafe: bool) -> ExprId {
+        unwrap_expr(self.body, expr, allow_unsafe)
     }
 
     fn if_expr(&mut self, expr: ExprId, cond: ExprId, then: ExprId, otherwise: Option<ExprId>) -> Result<Option<Value>> {
-        if let Some(taken) = self.const_bool(cond) {
+        if let Some(taken) = const_bool(self.body, cond) {
             return if taken {
                 self.expr(then)
             } else {
