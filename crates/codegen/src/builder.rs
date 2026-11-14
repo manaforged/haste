@@ -1,16 +1,10 @@
-use crate::ir::{
-    AtomicRmwOp, Binary, Block, BlockData, Convert, FloatCC, Function, Inst, InstData, IntCC, Op, SigRef, Signature, SlotData,
-    StackSlot, Type, Unary, Value,
-};
+use crate::ir::{AtomicRmwOp, Binary, Block, BlockData, Convert, FloatCC, Function, Inst, InstData, IntCC, Op, SigRef, Signature, SlotData, StackSlot, Type, Unary, Value};
 use crate::reloc::RuntimeSymbol;
 
 mod vector;
 
 fn cmp_result_ty(ty: Type) -> Type {
-    match ty {
-        Type::Vec { lane, count } => Type::Vec { lane: lane.int_mask(), count },
-        _ => Type::I8,
-    }
+    if let Type::Vec { lane, count } = ty { Type::Vec { lane: lane.int_mask(), count } } else { Type::I8 }
 }
 
 /// Appends blocks, values and instructions to a function.
@@ -24,8 +18,7 @@ pub struct FunctionBuilder<'f> {
 impl<'f> FunctionBuilder<'f> {
     /// A builder that appends to `func`.
     pub fn new(func: &'f mut Function) -> Self {
-        let incoming = vec![0; func.blocks.len()];
-        Self { func, current: None, incoming }
+        Self { incoming: vec![0; func.blocks.len()], func, current: None }
     }
 
     /// Adds an empty block.
@@ -618,6 +611,11 @@ impl Ins<'_> {
     /// Float to unsigned integer, saturating, with NaN as zero.
     pub fn fcvt_to_uint_sat(self, ty: Type, x: Value) -> Value {
         self.convert(Convert::ToUintSat, ty, x)
+    }
+
+    /// Reinterprets the bits of `x` as `ty`.
+    pub fn bitcast(self, ty: Type, x: Value) -> Value {
+        self.convert(Convert::Bitcast, ty, x)
     }
 
     /// Float addition.

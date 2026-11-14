@@ -181,16 +181,11 @@ pub(crate) struct Asm {
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, Label)>,
     table_fixups: Vec<(u32, Label, Label)>,
-    binds: u32,
 }
 
 impl Asm {
     pub fn pos(&self) -> u32 {
         self.code.len() as u32
-    }
-
-    pub fn stamp(&self) -> (usize, u32) {
-        (self.code.len(), self.binds)
     }
 
     fn rex(&mut self, w: bool, r: u8, x: u8, b: u8, force: bool) {
@@ -399,7 +394,7 @@ impl Asm {
     }
 
     /// `test` of the low `size` bytes of `a` and `b`.
-    pub fn test_sized(&mut self, size: Size, a: Reg, b: Reg) {
+    pub fn test_sized(&mut self, size: Size, a: impl Into<Rm>, b: Reg) {
         self.sized(false, size, (&[0x84], &[0x85]), b as u8, a.into());
     }
 
@@ -408,14 +403,33 @@ impl Asm {
         self.code.push(imm);
     }
 
+    /// `test` of the low `size` bytes of `rm` with `imm`.
+    pub fn test_imm_sized(&mut self, size: Size, rm: impl Into<Rm>, imm: i32) {
+        self.sized(false, size, (&[0xF6], &[0xF7]), 0, rm.into());
+        match size {
+            Size::B => self.code.push(imm as u8),
+            Size::W => self.code.extend((imm as i16).to_le_bytes()),
+            _ => self.code.extend(imm.to_le_bytes()),
+        }
+    }
+
+    pub fn imul_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>) {
+        self.encode(&[], size == Size::Q, &[0x0F, 0xAF], dst as u8, src.into(), false);
+    }
+
     pub fn imul(&mut self, dst: Reg, src: impl Into<Rm>) {
-        self.encode(&[], true, &[0x0F, 0xAF], dst as u8, src.into(), false);
+        self.imul_sized(Size::Q, dst, src);
+    }
+
+    /// `dst = src * imm`.
+    pub fn imul_imm_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>, imm: i32) {
+        self.encode(&[], size == Size::Q, &[0x69], dst as u8, src.into(), false);
+        self.code.extend(imm.to_le_bytes());
     }
 
     /// `dst = src * imm`.
     pub fn imul_imm(&mut self, dst: Reg, src: impl Into<Rm>, imm: i32) {
-        self.encode(&[], true, &[0x69], dst as u8, src.into(), false);
-        self.code.extend(imm.to_le_bytes());
+        self.imul_imm_sized(Size::Q, dst, src, imm);
     }
 
     /// `op` on the low `size` bytes of `dst` and `src`.
@@ -532,28 +546,49 @@ impl Asm {
         self.encode(&[0x66], false, &[0x0F, 0x7E], xmm.0, reg.into(), false);
     }
 
-    fn vex3(&mut self, map: u8, w: bool, pp: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: Rm) {
+    fn vex3(&mut self, map: u8, w: bool, pp: u8, opcode: u8, (dst, src): (u8, u8), rm: Rm) {
         let (x, b) = match rm {
             Rm::Reg(reg) => (0, reg),
             Rm::Mem(mem) => (mem.index.map_or(0, |(idx, _)| idx as u8), mem.base as u8),
         };
         self.code.push(0xC4);
-        self.code.push((!dst.0 >> 3 & 1) << 7 | (!x >> 3 & 1) << 6 | (!b >> 3 & 1) << 5 | map);
-        self.code.push((u8::from(w) << 7) | ((!src.0 & 0xF) << 3) | pp);
+        self.code.push((!dst >> 3 & 1) << 7 | (!x >> 3 & 1) << 6 | (!b >> 3 & 1) << 5 | map);
+        self.code.push((u8::from(w) << 7) | ((!src & 0xF) << 3) | pp);
         self.code.push(opcode);
-        self.modrm(dst.0, rm);
+        self.modrm(dst, rm);
     }
 
     /// The three-operand VEX form `dst = src op rm` of the scalar SSE operation `opcode`, where `prefix` is 0xF2 for doubles and 0xF3 for singles.
     pub fn vex_scalar(&mut self, prefix: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>) {
         let pp = if prefix == 0xF2 { 0b11 } else { 0b10 };
-        self.vex3(0b00001, false, pp, opcode, (dst, src), rm.into());
+        self.vex3(0b00001, false, pp, opcode, (dst.0, src.0), rm.into());
     }
 
     /// `vfmadd213{ss,sd,ps,pd}`: computes `dst = src * dst + rm`.
     pub fn vex_fma(&mut self, vec: bool, f64: bool, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>) {
         let opcode = if vec { 0xA8 } else { 0xA9 };
-        self.vex3(0b00010, f64, 0b01, opcode, (dst, src), rm.into());
+        self.vex3(0b00010, f64, 0b01, opcode, (dst.0, src.0), rm.into());
+    }
+
+    /// `shlx`/`shrx`/`sarx`: non-destructive 3-operand variable shift `dst = src op cnt`.
+    pub fn shiftx(&mut self, size: Size, op: Shift, dst: Reg, src: impl Into<Rm>, cnt: Reg) {
+        let pp = match op {
+            Shift::Shl => 0b01,
+            Shift::Sar => 0b10,
+            _ => 0b11,
+        };
+        self.vex3(0b00010, size == Size::Q, pp, 0xF7, (dst as u8, cnt as u8), src.into());
+    }
+
+    /// `rorx`: non-destructive 3-operand rotate right `dst = ror(src, imm)`.
+    pub fn rorx(&mut self, size: Size, dst: Reg, src: impl Into<Rm>, imm: u8) {
+        self.vex3(0b00011, size == Size::Q, 0b11, 0xF0, (dst as u8, 0), src.into());
+        self.code.push(imm);
+    }
+
+    /// `andn`: non-destructive 3-operand `dst = !not_src & src`.
+    pub fn andn(&mut self, size: Size, dst: Reg, not_src: Reg, src: impl Into<Rm>) {
+        self.vex3(0b00010, size == Size::Q, 0b00, 0xF2, (dst as u8, not_src as u8), src.into());
     }
 
     /// `movaps dst, src`: copies the whole register, with no dependency on the old contents of `dst`.
@@ -615,7 +650,6 @@ impl Asm {
 
     pub fn bind(&mut self, label: Label) {
         self.labels[label.0 as usize] = Some(self.pos());
-        self.binds = self.binds.wrapping_add(1);
     }
 
     fn fixup(&mut self, label: Label) {

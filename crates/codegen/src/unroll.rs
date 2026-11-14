@@ -2,6 +2,9 @@ use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};
 use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, IntCC, Op, Type, Value};
 
+const MAX_FULL_TRIPS: usize = 64;
+const MAX_FULL_INSTS: usize = 1024;
+
 fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
     map.iter().rev().find(|&&(old, _)| old == v).map_or(v, |&(_, new)| new)
 }
@@ -119,7 +122,7 @@ fn unroll_self(
     }
     let mut cur_params: Vec<Option<i64>> = init_args.iter().map(|v| global_consts[v.index()]).collect();
     let mut proven = None;
-    for step in 0..=32_usize {
+    for step in 0..=MAX_FULL_TRIPS {
         let mut env = global_consts.to_vec();
         eval_block(func, b, &cur_params, &mut env);
         let Some(cond_val) = env[cond.index()] else { break };
@@ -138,8 +141,8 @@ fn unroll_self(
         func.insts[last.index()].op = Op::Jump(exit_blk, exit_args);
         return true;
     }
-    if (back_steps + 1) * inst_count > 512 {
-        return false;
+    if (back_steps + 1) * inst_count > MAX_FULL_INSTS {
+        return unroll_self_dynamic(func, cfg, b, cond, back_on_true, &back_args, exit_blk, global_consts);
     }
     let body_insts = func.blocks[b].insts[..inst_count - 1].to_vec();
     pop_terminator(func, b);
@@ -183,7 +186,7 @@ fn unroll_self_dynamic(
 ) -> bool {
     let head = Block(b as u32);
     let inst_count = func.blocks[b].insts.len();
-    if inst_count > 36
+    if inst_count > 48
         || func.blocks[b].params.len() > 8
         || back_args.len() != func.blocks[b].params.len()
         || func.successors(exit_blk).any(|t| t == exit_blk)
@@ -242,8 +245,9 @@ fn unroll_self_dynamic(
         return false;
     }
     let bias_cap = if iv_ty == Type::I32 { 1_i64 << 28 } else { 1_i64 << 30 };
+    let stride_const = |s: Value| global_consts[s.index()].filter(|&c| c > 0 && c <= (1_i64 << 24) && (!is_ne || c == 1));
     let mut matched = match_iv_step(func, b, &body_insts, back_args, iv_cmp)
-        .filter(|&(_, stride)| !head_defs[stride.index()])
+        .filter(|&(_, stride)| !head_defs[stride.index()] || stride_const(stride).is_some())
         .map(|(idx, stride)| (idx, stride, 0_i64));
     if matched.is_none()
         && let Some(cmp_add) = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(iv_cmp))
@@ -253,7 +257,7 @@ fn unroll_self_dynamic(
             if let Some(bias) = global_consts[cand_bias.index()]
                 && (0..bias_cap).contains(&bias)
                 && let Some((idx, stride)) = match_iv_step(func, b, &body_insts, back_args, cand_next)
-                && !head_defs[stride.index()]
+                && (!head_defs[stride.index()] || stride_const(stride).is_some())
             {
                 matched = Some((idx, stride, bias));
                 break;
@@ -261,7 +265,8 @@ fn unroll_self_dynamic(
         }
     }
     let Some((iv_idx, stride, bias)) = matched else { return false };
-    let factor = if inst_count <= 8 { 4_i64 } else { 2_i64 };
+    let const_stride = stride_const(stride);
+    let factor = if inst_count <= 16 { 4_i64 } else { 2_i64 };
     let param_tys: Vec<Type> = func.blocks[b].params.iter().map(|&p| func.ty(p)).collect();
     let guard_params: Vec<Value> = param_tys.iter().map(|&ty| func.value(ty)).collect();
     let guard = Block(func.blocks.len() as u32);
@@ -276,31 +281,38 @@ fn unroll_self_dynamic(
         func.blocks[guard.index()].insts.push(i);
         v
     };
-    let zero = emit_guard(Op::Const(0), iv_ty);
-    let sh = emit_guard(Op::Const(i64::from(iv_ty.bits() - 3)), iv_ty);
-    let cf = emit_guard(Op::Const(factor), iv_ty);
-    let stride_ok = if is_ne {
-        let one = emit_guard(Op::Const(1), iv_ty);
-        emit_guard(Op::Icmp(IntCC::Equal, stride, one), Type::I8)
+    let (s_need, g1) = if let Some(c) = const_stride {
+        (emit_guard(Op::Const(c * factor + bias), iv_ty), None)
     } else {
-        emit_guard(Op::Icmp(IntCC::UnsignedGreaterThan, stride, zero), Type::I8)
-    };
-    let or_lim = emit_guard(Op::Binary(Binary::Bor, limit, stride), iv_ty);
-    let hi_bits = emit_guard(Op::Binary(Binary::Ushr, or_lim, sh), iv_ty);
-    let no_wrap = emit_guard(Op::Icmp(IntCC::Equal, hi_bits, zero), Type::I8);
-    let sf = emit_guard(Op::Binary(Binary::Imul, stride, cf), iv_ty);
-    let s_need = if bias > 0 {
-        let b_val = emit_guard(Op::Const(bias), iv_ty);
-        emit_guard(Op::Binary(Binary::Iadd, sf, b_val), iv_ty)
-    } else {
-        sf
+        let zero = emit_guard(Op::Const(0), iv_ty);
+        let sh = emit_guard(Op::Const(i64::from(iv_ty.bits() - 3)), iv_ty);
+        let cf = emit_guard(Op::Const(factor), iv_ty);
+        let stride_ok = if is_ne {
+            let one = emit_guard(Op::Const(1), iv_ty);
+            emit_guard(Op::Icmp(IntCC::Equal, stride, one), Type::I8)
+        } else {
+            emit_guard(Op::Icmp(IntCC::UnsignedGreaterThan, stride, zero), Type::I8)
+        };
+        let or_lim = emit_guard(Op::Binary(Binary::Bor, limit, stride), iv_ty);
+        let hi_bits = emit_guard(Op::Binary(Binary::Ushr, or_lim, sh), iv_ty);
+        let no_wrap = emit_guard(Op::Icmp(IntCC::Equal, hi_bits, zero), Type::I8);
+        let sf = emit_guard(Op::Binary(Binary::Imul, stride, cf), iv_ty);
+        let need = if bias > 0 {
+            let b_val = emit_guard(Op::Const(bias), iv_ty);
+            emit_guard(Op::Binary(Binary::Iadd, sf, b_val), iv_ty)
+        } else {
+            sf
+        };
+        (need, Some(emit_guard(Op::Binary(Binary::Band, stride_ok, no_wrap), Type::I8)))
     };
     let lim_ok = emit_guard(Op::Icmp(IntCC::UnsignedLessThanOrEqual, s_need, limit), Type::I8);
     let safe_limit = emit_guard(Op::Binary(Binary::Isub, limit, s_need), iv_ty);
     let init_ok = emit_guard(Op::Icmp(cmp_cc, guard_params[iv_idx], safe_limit), Type::I8);
-    let g1 = emit_guard(Op::Binary(Binary::Band, stride_ok, no_wrap), Type::I8);
     let g2 = emit_guard(Op::Binary(Binary::Band, lim_ok, init_ok), Type::I8);
-    let guard_cond = emit_guard(Op::Binary(Binary::Band, g1, g2), Type::I8);
+    let guard_cond = match g1 {
+        Some(g1) => emit_guard(Op::Binary(Binary::Band, g1, g2), Type::I8),
+        None => g2,
+    };
     let guard_br = func.add(Op::Brif(guard_cond, unrolled, guard_params.clone(), head, guard_params), None);
     func.blocks[guard.index()].insts.push(guard_br);
 
@@ -373,7 +385,7 @@ fn unroll_two_block(
     }
     let mut cur_head_params: Vec<Option<i64>> = init_args.iter().map(|v| global_consts[v.index()]).collect();
     let mut proven = None;
-    for step in 0..=32_usize {
+    for step in 0..=MAX_FULL_TRIPS {
         let mut env = global_consts.to_vec();
         eval_block(func, b, &cur_head_params, &mut env);
         let Some(cond_val) = env[cond.index()] else { break };
@@ -381,7 +393,7 @@ fn unroll_two_block(
             proven = Some(step);
             break;
         }
-        if step == 32 {
+        if step == MAX_FULL_TRIPS {
             break;
         }
         let body_params: Vec<Option<i64>> = body_args.iter().map(|v| env[v.index()]).collect();
@@ -397,7 +409,7 @@ fn unroll_two_block(
         retire_block(func, body_blk.index());
         return true;
     }
-    if head_len + trips * (head_len + body_len) > 512 {
+    if head_len + trips * (head_len + body_len) > MAX_FULL_INSTS {
         return false;
     }
     let head_non_term = func.blocks[b].insts[..head_len - 1].to_vec();
@@ -439,8 +451,11 @@ fn collect_global_consts(func: &Function, cfg: &Cfg) -> Vec<Option<i64>> {
     global_consts
 }
 
-/// Unrolls 1-block and 2-block natural loops with a statically provable constant trip count (`0..=16` / `0..=8`) or dynamic counted loops.
+/// Unrolls 1-block and 2-block natural loops with a statically provable constant trip count (`0..=64`) or dynamic counted loops.
 pub(crate) fn run(func: &mut Function) -> Domain {
+    if func.coroutine.is_some() {
+        return Domain::NONE;
+    }
     let Some(entry) = func.entry else { return Domain::NONE };
     let mut cfg = func.cfg();
     let loops = cfg.loops();

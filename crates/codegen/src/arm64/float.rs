@@ -1,6 +1,6 @@
 use super::asm::{Alu, Cond, Fconv, Fop, Funary, Size, ZR};
 use super::vector::V2;
-use super::{A, C, D, Emit, V0, V1};
+use super::{A, C, Emit, IP, V0, V1};
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, FloatCC, Type, Unary, Value};
 
@@ -59,9 +59,9 @@ impl Emit<'_> {
     fn copysign(&mut self, ty: Type, x: Value, y: Value, result: Value) {
         self.raw(A, x);
         self.raw(C, y);
-        self.asm.mov_imm(D, ty.sign_bit());
-        self.asm.alu(Alu::And, Size::X, C, C, D);
-        self.asm.alu(Alu::Bic, Size::X, A, A, D);
+        self.asm.mov_imm(IP, ty.sign_bit());
+        self.asm.alu(Alu::And, Size::X, C, C, IP);
+        self.asm.alu(Alu::Bic, Size::X, A, A, IP);
         self.asm.alu(Alu::Orr, Size::X, A, A, C);
         self.put(result, A);
     }

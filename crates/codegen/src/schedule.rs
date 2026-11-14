@@ -1,5 +1,5 @@
 use crate::ir::{Domain, Function};
-use crate::{Effort, cse, fill, fold, ifconv, licm, loads, merge, promote, returns, switch, tailrec, thread, unroll};
+use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -12,11 +12,13 @@ pub(crate) enum Pass {
     Loads = 5,
     Thread = 6,
     IfConv = 7,
-    Unroll = 8,
-    Licm = 9,
-    Switch = 10,
-    Returns = 11,
-    TailRec = 12,
+    Rotate = 8,
+    Unroll = 9,
+    Licm = 10,
+    Switch = 11,
+    Returns = 12,
+    TailRec = 13,
+    Lsr = 14,
 }
 
 impl Pass {
@@ -29,11 +31,13 @@ impl Pass {
         Self::Loads,
         Self::Thread,
         Self::IfConv,
+        Self::Rotate,
         Self::Unroll,
         Self::Licm,
         Self::Switch,
         Self::Returns,
         Self::TailRec,
+        Self::Lsr,
     ];
 }
 
@@ -60,6 +64,7 @@ static QUICK_RULES: &[Rule] = &[
 static QUICK_FINISH: &[Pass] = &[Pass::Cse, Pass::Returns];
 
 static FULL_RULES: &[Rule] = &[
+    Rule { pass: Pass::Fill, reads: Domain::CFG.union(Domain::VALUES) },
     Rule { pass: Pass::Promote, reads: Domain::CFG.union(Domain::MEM).union(Domain::VALUES) },
     Rule { pass: Pass::Fold, reads: Domain::VALUES.union(Domain::CFG) },
     Rule { pass: Pass::Merge, reads: Domain::CFG.union(Domain::VALUES) },
@@ -67,8 +72,10 @@ static FULL_RULES: &[Rule] = &[
     Rule { pass: Pass::Cse, reads: Domain::CFG.union(Domain::VALUES) },
     Rule { pass: Pass::Thread, reads: Domain::CFG.union(Domain::VALUES) },
     Rule { pass: Pass::IfConv, reads: Domain::CFG.union(Domain::VALUES) },
+    Rule { pass: Pass::Rotate, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
     Rule { pass: Pass::Unroll, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
     Rule { pass: Pass::Licm, reads: Domain::CFG.union(Domain::VALUES).union(Domain::MEM) },
+    Rule { pass: Pass::Lsr, reads: Domain::CFG.union(Domain::VALUES) },
 ];
 static FULL_FINISH: &[Pass] = &[Pass::Switch, Pass::Returns, Pass::TailRec];
 
@@ -82,8 +89,10 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Loads => loads::run(func),
         Pass::Thread => thread::run(func),
         Pass::IfConv => ifconv::run(func),
+        Pass::Rotate => rotate::run(func),
         Pass::Unroll => unroll::run(func),
         Pass::Licm => licm::run(func),
+        Pass::Lsr => lsr::run(func),
         Pass::Switch => switch::run(func),
         Pass::Returns => returns::run(func),
         Pass::TailRec => {

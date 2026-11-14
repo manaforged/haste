@@ -69,29 +69,12 @@ fn stores(func: &mut Function, slots: &[Option<(StackSlot, i64)>], (to, byte, by
 
 fn expand_copy(func: &mut Function, defs: &[Option<Inst>], slots: &[Option<(StackSlot, i64)>], inst: Inst, out: &mut Vec<Inst>) -> bool {
     let Op::Copy(dst, src, len) = func.insts[inst.index()].op else { return false };
-    let Some(bytes) = known(func, defs, len, DEPTH) else { return false };
-    match bytes {
-        0 => true,
-        1 | 2 | 4 | 8 => {
-            let ty = match bytes {
-                1 => Type::I8,
-                2 => Type::I16,
-                4 => Type::I32,
-                _ => Type::I64,
-            };
-            let val = emit_load(func, slots, (src, 0), ty, out);
-            emit_store(func, slots, val, (dst, 0), out);
-            true
-        }
-        16 => {
-            let lo = emit_load(func, slots, (src, 0), Type::I64, out);
-            let hi = emit_load(func, slots, (src, 8), Type::I64, out);
-            emit_store(func, slots, lo, (dst, 0), out);
-            emit_store(func, slots, hi, (dst, 8), out);
-            true
-        }
-        _ => false,
+    let Some(pieces) = known(func, defs, len, DEPTH).and_then(crate::copy::copy_words) else { return false };
+    let loaded: Vec<_> = pieces.iter().map(|&(ty, at)| (emit_load(func, slots, (src, at as i32), ty, out), at as i32)).collect();
+    for (val, at) in loaded {
+        emit_store(func, slots, val, (dst, at), out);
     }
+    true
 }
 
 /// Replaces each `memset` of a constant byte and small constant size by stores, and scalarizes small constant-length `Copy` operations, so promotion sees the bytes they access.
@@ -117,5 +100,5 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         }
         func.blocks[block].insts = out;
     }
-    if changed { Domain::CFG | Domain::VALUES } else { Domain::NONE }
+    if changed { Domain::MEM | Domain::VALUES } else { Domain::NONE }
 }

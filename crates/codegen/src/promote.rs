@@ -121,6 +121,7 @@ struct Touch {
 
 #[derive(Default)]
 struct Scan {
+    consts: Vec<Option<i64>>,
     addrs: Vec<Option<(StackSlot, i64)>>,
     addr_insts: Vec<(Inst, StackSlot)>,
     escaped: Vec<bool>,
@@ -135,16 +136,18 @@ impl Scan {
     fn new(func: &Function) -> Self {
         let slots = func.slots.len();
         let prov = crate::mem::Provenance::compute(func);
+        let consts = subword::eval_consts(func);
         let escaped = prov.escaped_slots();
-        let open_slots = (0..slots).map(|s| prov.slot_open(StackSlot(s as u32))).collect();
         let mut scan = Scan {
+            consts,
             addrs: vec![None; func.types.len()],
             escaped,
-            open_slots,
+            open_slots: Vec::new(),
             slot_vars: vec![Vec::new(); slots],
             ..Scan::default()
         };
         scan.addresses(func);
+        scan.open_slots = subword::copy_open_slots(func, &scan.addrs, &scan.consts, &prov.param_roots);
         for (index, block) in func.blocks.iter().enumerate() {
             for inst in &block.insts {
                 let data = &func.insts[inst.index()];
@@ -162,7 +165,39 @@ impl Scan {
     }
 
     fn addresses(&mut self, func: &Function) {
-        (self.addrs, self.addr_insts) = func.slot_offsets(|_| None);
+        (self.addrs, self.addr_insts) = func.slot_offsets(|v| self.consts.get(v.index()).copied().flatten());
+        let mut ops: Vec<(Inst, Value, bool, Value, Value)> = Vec::new();
+        for inst in func.blocks.iter().flat_map(|b| &b.insts) {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            if self.addrs[res.index()].is_some() {
+                continue;
+            }
+            match data.op {
+                Op::Binary(Binary::Iadd, x, c) => ops.push((*inst, res, false, x, c)),
+                Op::Binary(Binary::Isub, x, c) => ops.push((*inst, res, true, x, c)),
+                _ => {}
+            }
+        }
+        loop {
+            let before = ops.len();
+            ops.retain(|&(inst, res, sub, x, c)| {
+                let imm_of = |v: Value| self.consts.get(v.index()).copied().flatten();
+                let found = if sub {
+                    self.addrs[x.index()].zip(imm_of(c).and_then(i64::checked_neg))
+                } else {
+                    self.addrs[x.index()].zip(imm_of(c)).or_else(|| self.addrs[c.index()].zip(imm_of(x)))
+                };
+                let Some(((slot, base), imm)) = found else { return true };
+                let Some(offset) = base.checked_add(imm) else { return true };
+                self.addrs[res.index()] = Some((slot, offset));
+                self.addr_insts.push((inst, slot));
+                false
+            });
+            if ops.len() == before {
+                break;
+            }
+        }
     }
 
     fn touch(&self, data: &InstData) -> Option<Touch> {
@@ -208,16 +243,26 @@ impl Scan {
         self.addrs[addr.index()].map(|(slot, offset)| (slot.index(), offset))
     }
 
-    /// The layouts the accesses give each slot, spread through the moves of `func`.
+    /// The layouts the accesses give each slot, spread through the moves and constant copies of `func`.
     fn layouts(&self, func: &Function) -> Layouts {
         let accesses = self.accesses.iter().map(|access| (self.vars[access.var].slot.index(), self.vars[access.var].offset, access.ty));
         let mut layouts = Layouts::new(func.slots.len(), accesses);
         let moves: Vec<(End, End, u32)> = func.blocks.iter().flat_map(|block| &block.insts).filter_map(|inst| match func.insts[inst.index()].op {
             Op::Move(to, from, bytes) => Some((self.end(to), self.end(from), bytes)),
+            Op::Copy(to, from, len) => self.copy_bytes(to, from, len).map(|bytes| (self.end(to), self.end(from), bytes)),
             _ => None,
         }).collect();
         layouts.spread(&moves);
         layouts
+    }
+
+    fn copy_bytes(&self, to: Value, from: Value, len: Value) -> Option<u32> {
+        let limit = if self.addrs[to.index()].is_some() && self.addrs[from.index()].is_some() {
+            subword::PROMOTE_BOTH_BYTES
+        } else {
+            subword::MAX_COPY_BYTES
+        };
+        subword::copy_bytes_limit(&self.consts, len, limit)
     }
 
     /// Whether `addr` is the address of a slot that nothing but moves lets escape.
@@ -432,7 +477,7 @@ impl Pass {
         if !self.cfg.reachable[block.index()] || preds.is_empty() {
             return Some(Step::Done(self.fresh.zero(&mut self.subst, ty)));
         }
-        if let [pred] = preds[..] {
+        if let Some(&pred) = preds.first().filter(|&p| preds[1..].iter().all(|q| q == p)) {
             return Some(match self.local.def(var.index, pred) {
                 Some(def) => Step::Done(def),
                 None => Step::Up(pred),
@@ -655,22 +700,48 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     };
     let mut scan = Scan::new(func);
     let mut splits = Vec::new();
-    if func.insts.iter().any(|data| matches!(data.op, Op::Move(to, from, _) if scan.open(to) || scan.open(from))) {
+    let mut copy_splits = Vec::new();
+    let mut dropped_zero = false;
+    let has_open_move = func.insts.iter().any(|data| match data.op {
+        Op::Move(to, from, _) => scan.open(to) || scan.open(from),
+        Op::Copy(to, from, len) => scan.copy_bytes(to, from, len).is_some() && (scan.open(to) || scan.open(from)),
+        _ => false,
+    });
+    if has_open_move {
         let layouts = (moves != Moves::Words).then(|| scan.layouts(func));
-        let pieces = |to: Value, from: Value, bytes: u32| match layouts.as_ref().and_then(|layouts| layouts.pieces(scan.end(to), scan.end(from), bytes)) {
-            None if moves != Moves::Guided => Some(crate::copy::words(bytes)),
-            guided => guided,
+        let pieces = |to: Value, from: Value, bytes: u32| {
+            if !(scan.open(to) || scan.open(from)) {
+                return None;
+            }
+            let (max_b, max_p) = if scan.open(to) && scan.open(from) {
+                (subword::PROMOTE_BOTH_BYTES, subword::PROMOTE_BOTH_PIECES)
+            } else {
+                (crate::copy::MOVE_INLINE * 2, crate::copy::EXPAND_WORDS)
+            };
+            if bytes > max_b {
+                return None;
+            }
+            let found = match layouts.as_ref().and_then(|layouts| layouts.pieces(scan.end(to), scan.end(from), bytes)) {
+                None if moves != Moves::Guided => Some(crate::copy::words(bytes)),
+                guided => guided,
+            };
+            found.filter(|p| p.len() <= max_p)
         };
-        splits = crate::copy::expand(func, |to, from, bytes| if scan.open(to) || scan.open(from) { pieces(to, from, bytes) } else { None });
+        splits = crate::copy::expand(func, pieces);
+        (copy_splits, dropped_zero) = subword::expand_copies(func, |to, from, len| {
+            let bytes = scan.copy_bytes(to, from, len)?;
+            pieces(to, from, bytes)
+        });
         scan = Scan::new(func);
     }
     let split_changed = moves == Moves::Split && subword::split(func, &scan);
     if split_changed {
         scan = Scan::new(func);
     }
-    let changed = ((0..func.slots.len()).any(|slot| scan.promotable(slot)) && promote(func, entry, scan)) || split_changed;
+    let changed = ((0..func.slots.len()).any(|slot| scan.promotable(slot)) && promote(func, entry, scan)) || split_changed || dropped_zero;
     crate::copy::rejoin(func, &splits);
-    if changed { Domain::MEM | Domain::VALUES } else { Domain::NONE }
+    let all_copies_rejoined = subword::rejoin_copies(func, &copy_splits);
+    if changed || !all_copies_rejoined { Domain::MEM | Domain::VALUES } else { Domain::NONE }
 }
 
 /// Promotes every promotable slot `scan` found.

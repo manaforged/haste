@@ -18,11 +18,15 @@ pub(crate) fn words(bytes: u32) -> Vec<(Type, u32)> {
     words
 }
 
+/// The integer types and offsets of the loads and stores that copy `bytes` bytes inline, widest first, up to `MOVE_INLINE`.
+pub(crate) fn copy_words(bytes: i64) -> Option<Vec<(Type, u32)>> {
+    u32::try_from(bytes).ok().filter(|&bytes| bytes <= MOVE_INLINE).map(words)
+}
+
 /// The widths and offsets of the loads that copy `bytes` bytes inline, widest first, when there are at most `CHUNKS` of them.
 pub(crate) fn chunks(bytes: i64) -> Option<Vec<(u32, u32)>> {
-    let bytes = u32::try_from(bytes).ok().filter(|bytes| *bytes <= 8 * CHUNKS as u32)?;
-    let words = words(bytes);
-    (words.len() <= CHUNKS).then(|| words.iter().map(|&(ty, at)| (ty.bytes(), at)).collect())
+    let words = copy_words(bytes).filter(|words| words.len() <= CHUNKS)?;
+    Some(words.into_iter().map(|(ty, at)| (ty.bytes(), at)).collect())
 }
 
 /// A move that `expand` split into the loads and stores in `pairs`, which `rejoin` can turn back into it.
@@ -31,6 +35,9 @@ pub(crate) struct Split {
     original: Inst,
     pairs: Vec<Inst>,
 }
+
+/// The most words a single-ended move is expanded into for scalar promotion.
+pub(crate) const EXPAND_WORDS: usize = 16;
 
 /// Replaces each move for which `split` gives pieces, from its target, source and size, with a load and a store per piece, in order, and returns what it split.
 pub(crate) fn expand(func: &mut Function, split: impl Fn(Value, Value, u32) -> Option<Vec<(Type, u32)>>) -> Vec<Split> {

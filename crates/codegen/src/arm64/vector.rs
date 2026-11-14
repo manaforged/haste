@@ -279,11 +279,11 @@ impl Emit<'_> {
             Binary::Imul => {
                 self.asm.fmov_out(true, A, a);
                 self.asm.fmov_out(true, C, b);
-                self.asm.madd(false, D, (A, C), ZR);
+                self.asm.madd(false, Size::X, D, (A, C), ZR);
                 if spec.count == 2 {
                     self.asm.umov_d1(A, a);
                     self.asm.umov_d1(C, b);
-                    self.asm.madd(false, S, (A, C), ZR);
+                    self.asm.madd(false, Size::X, S, (A, C), ZR);
                 }
                 self.asm.fmov_in(true, dst, D);
                 if spec.count == 2 {

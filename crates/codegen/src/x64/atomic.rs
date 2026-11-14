@@ -16,19 +16,120 @@ const VECTOR: u32 = 16;
 /// The opcodes of `movups` from memory into an xmm register, and from an xmm register into memory.
 const MOVUPS: ([u8; 2], [u8; 2]) = ([0x0F, 0x10], [0x0F, 0x11]);
 
-/// Whether `op` of `func` uses rsi as scratch: a copy of a constant size, a compare-exchange or read-modify-write, a population count, or a 128-bit shift or rotate.
-pub(super) fn uses_rsi(func: &Function, op: &Op) -> bool {
+/// Whether `op` of `func` uses rsi or rdx as scratch.
+pub(super) fn uses_scratch(func: &Function, op: &Op) -> bool {
     match op {
-        Op::Copy(..) | Op::AtomicCas(..) | Op::AtomicRmw(..) | Op::Unary(Unary::Popcnt, _) => true,
-        Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, x, _) => func.ty(*x) == Type::I128,
+        Op::Copy(..) | Op::AtomicCas(..) | Op::AtomicRmw(..) | Op::Fits(Binary::Imul, ..) => true,
+        Op::Unary(Unary::Popcnt | Unary::Bitrev, _) => true,
+        Op::Unary(Unary::Floor | Unary::Ceil | Unary::Trunc, x) if func.ty(*x).is_float() => true,
+        Op::Unary(_, x) | Op::Binary(_, x, _) | Op::Icmp(_, x, _) if func.ty(*x) == Type::I128 => true,
+        Op::Binary(
+            Binary::Sdiv
+            | Binary::Srem
+            | Binary::Udiv
+            | Binary::Urem
+            | Binary::Smulhi
+            | Binary::Umulhi
+            | Binary::AvgRound
+            | Binary::SaddSat
+            | Binary::UaddSat
+            | Binary::SsubSat
+            | Binary::UsubSat
+            | Binary::Fcopysign,
+            _,
+            _,
+        ) => true,
         _ => false,
     }
 }
 
 impl Emit<'_> {
+    pub(super) fn invalidate_spills(&mut self) {
+        self.last_spill = [None; 4];
+        self.last_fspill = None;
+    }
+
+    pub(super) fn clobber_reg(&mut self, reg: Reg) {
+        for slot in &mut self.last_spill {
+            if slot.is_some_and(|(_, r)| r == reg) {
+                *slot = None;
+            }
+        }
+    }
+
+    pub(super) fn clobber_regs(&mut self, regs: &[Reg]) {
+        for &reg in regs {
+            self.clobber_reg(reg);
+        }
+    }
+
+    pub(super) fn clobber_xmm(&mut self, xmm: Xmm) {
+        if self.last_fspill.is_some_and(|(_, r, _)| r == xmm) {
+            self.last_fspill = None;
+        }
+    }
+
+    pub(super) fn clobber_xmms(&mut self, xmms: &[Xmm]) {
+        for &xmm in xmms {
+            self.clobber_xmm(xmm);
+        }
+    }
+
+    pub(super) fn invalidate_disp(&mut self, disp: i32) {
+        for slot in &mut self.last_spill {
+            if slot.is_some_and(|(d, _)| d == disp) {
+                *slot = None;
+            }
+        }
+        if self.last_fspill.is_some_and(|(d, _, _)| d == disp) {
+            self.last_fspill = None;
+        }
+    }
+
+    pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {
+        if reg == Reg::R11 {
+            return;
+        }
+        self.clobber_reg(reg);
+        let mut out = [Some((disp, reg)), None, None, None];
+        let mut i = 1;
+        for entry in self.last_spill.into_iter().flatten() {
+            if entry != (disp, reg) && i < 4 {
+                out[i] = Some(entry);
+                i += 1;
+            }
+        }
+        self.last_spill = out;
+    }
+
+    pub(super) fn write_spill(&mut self, disp: i32, reg: Reg) {
+        self.invalidate_disp(disp);
+        self.record_spill(disp, reg);
+    }
+
+    pub(super) fn cached_spill_for(&self, disp: i32, preferred: Reg) -> Option<Reg> {
+        let mut fallback = None;
+        for (d, r) in self.last_spill.into_iter().flatten() {
+            if d == disp {
+                if r == preferred {
+                    return Some(r);
+                }
+                if fallback.is_none() {
+                    fallback = Some(r);
+                }
+            }
+        }
+        fallback
+    }
+
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
-            Op::Const(_) if result().is_ok_and(|result| self.ty(result).is_vector()) => self.vector_zero(result()?),
+            Op::Const(_) if result().is_ok_and(|result| self.ty(result).is_vector()) => {
+                let result = result()?;
+                self.invalidate_spills();
+                self.vector_zero(result);
+                self.invalidate_spills();
+            }
             Op::Const(imm) => {
                 let result = result()?;
                 if !self.is_static(result) {
@@ -53,10 +154,12 @@ impl Emit<'_> {
             }
             Op::Symbol(sym) => {
                 let result = result()?;
-                let dst = self.dst(result);
-                let at = self.asm.mov_abs64(dst);
-                self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs64));
-                self.put(result, dst);
+                if !self.is_static(result) {
+                    let dst = self.dst(result);
+                    let at = self.asm.mov_abs64(dst);
+                    self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Abs64));
+                    self.put(result, dst);
+                }
             }
             Op::Runtime(rt) => {
                 let result = result()?;
@@ -66,7 +169,12 @@ impl Emit<'_> {
                 self.put(result, dst);
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
-            Op::Shuffle(..) | Op::Extract(..) | Op::Insert(..) | Op::Reduce(..) | Op::TargetOp(..) => self.vector_op(op, result()?)?,
+            Op::Shuffle(..) | Op::Extract(..) | Op::Insert(..) | Op::Reduce(..) | Op::TargetOp(..) => {
+                let result = result()?;
+                self.invalidate_spills();
+                self.vector_op(op, result)?;
+                self.invalidate_spills();
+            }
             _ => return self.access(op, result),
         }
         Ok(())
@@ -113,6 +221,7 @@ impl Emit<'_> {
         for (&(width, offset), reg) in chunks.iter().zip(COPY_SCRATCH) {
             self.asm.load(Size::of(width), reg, source.offset(offset as i32));
         }
+        self.clobber_regs(&COPY_SCRATCH);
         let target = self.address(to, 0);
         for (&(width, offset), reg) in chunks.iter().zip(COPY_SCRATCH) {
             self.asm.store(Size::of(width), target.offset(offset as i32), reg);
@@ -134,6 +243,8 @@ impl Emit<'_> {
             self.asm.load(Size::of(ty.bytes()), Reg::Rax, source.offset(at));
             self.asm.store(Size::of(ty.bytes()), target.offset(at), Reg::Rax);
         }
+        self.clobber_regs(&[Reg::R11, Reg::Rcx, Reg::Rax]);
+        self.clobber_xmm(X1);
     }
 
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
@@ -154,9 +265,11 @@ impl Emit<'_> {
                 self.raw(Reg::Rcx, *addr);
                 self.raw(Reg::Rax, *value);
                 self.asm.xchg(size, Mem::new(Reg::Rcx, 0), Reg::Rax);
+                self.clobber_reg(Reg::Rax);
             }
             Op::AtomicRmw(rmw, addr, value) => {
                 self.rmw(*rmw, size, *addr, *value);
+                self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi]);
                 self.put(result()?, Reg::Rax);
             }
             Op::AtomicCas(addr, expected, replacement) => {
@@ -164,6 +277,7 @@ impl Emit<'_> {
                 self.raw(Reg::Rax, *expected);
                 self.raw(Reg::Rcx, *replacement);
                 self.asm.cmpxchg(size, Mem::new(Reg::Rsi, 0), Reg::Rcx);
+                self.clobber_reg(Reg::Rax);
                 self.put(result()?, Reg::Rax);
             }
             other => return Err(format!("unexpected {other:?}")),
@@ -188,6 +302,7 @@ impl Emit<'_> {
             self.put(result, Reg::Rax);
             self.asm.load(Size::Q, Reg::Rax, from.offset(8));
             self.put_high(result, Reg::Rax);
+            self.clobber_reg(Reg::Rax);
             return;
         }
         let dst = self.dst(result);
@@ -220,7 +335,9 @@ impl Emit<'_> {
 
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
         if self.ty(condition).is_vector() {
+            self.invalidate_spills();
             self.vector_select(condition, x, y, result);
+            self.invalidate_spills();
             return;
         }
         self.get(Reg::Rcx, condition, Ext::Zero);
@@ -232,21 +349,26 @@ impl Emit<'_> {
             self.asm.jcc(Cond::E, done);
             self.fget(Xmm(0), x);
             self.asm.bind(done);
+            self.clobber_reg(Reg::Rax);
+            self.last_fspill = None;
             self.fput(result, Xmm(0));
             return;
         }
         if ty == Type::I128 {
             self.asm.load(Size::Q, Reg::Rax, self.at(y));
             self.asm.cmov(Cond::Ne, Reg::Rax, self.at(x));
+            self.clobber_reg(Reg::Rax);
             self.put(result, Reg::Rax);
             self.asm.load(Size::Q, Reg::Rax, self.at(y).offset(8));
             self.asm.cmov(Cond::Ne, Reg::Rax, self.at(x).offset(8));
             self.put_high(result, Reg::Rax);
+            self.clobber_reg(Reg::Rax);
             return;
         }
         self.raw(Reg::Rax, y);
         let source = self.operand(x);
         self.asm.cmov(Cond::Ne, Reg::Rax, source);
+        self.clobber_reg(Reg::Rax);
         self.put(result, Reg::Rax);
     }
 

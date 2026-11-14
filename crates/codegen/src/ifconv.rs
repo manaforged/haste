@@ -1,38 +1,108 @@
 use crate::cfg::Cfg;
-use crate::ir::{Block, Domain, Function, Inst, InstData, Op, Type, Value};
+use crate::ir::{Block, Domain, Function, Inst, Op, Type, Value};
+use crate::mem::{MemBase, MemRoot, Provenance};
+
+const MAX_ARM_OPS: usize = 6;
+const MAX_ARM_INSTS: usize = 24;
+const MAX_SELECTS: usize = 4;
 
 fn scalar_select(ty: Type) -> bool {
     matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64)
 }
 
+enum JoinArgs {
+    Pair { t_args: Vec<Value>, e_args: Vec<Value> },
+    Nested { mid_cond: Value, mt_args: Vec<Value>, me_args: Vec<Value>, other_args: Vec<Value>, mid_is_then: bool },
+}
+
 struct ArmMatch {
     join: Block,
-    t_args: Vec<Value>,
-    e_args: Vec<Value>,
-    clear: [Option<Block>; 2],
+    args: JoinArgs,
+    arms: Vec<(Block, Vec<Value>)>,
 }
 
-fn real_op_count(func: &Function, body: &[Inst]) -> usize {
-    body.iter().filter(|inst| !matches!(func.insts[inst.index()].op, Op::Const(_))).count()
+fn remap_val(params: &[Value], args: &[Value], value: Value) -> Value {
+    params.iter().position(|&p| p == value).map_or(value, |idx| args[idx])
 }
 
-fn pure_arm(func: &Function, block: Block, join: Block) -> Option<(Vec<Value>, usize)> {
+fn pure_arm_ops(func: &Function, body: &[Inst]) -> bool {
+    let mut alu = 0usize;
+    let mut selects = 0usize;
+    for inst in body {
+        match func.insts[inst.index()].op {
+            Op::Const(_) => {}
+            Op::Select(..) => selects += 1,
+            _ => alu += 1,
+        }
+    }
+    alu <= MAX_ARM_OPS && alu + selects <= MAX_ARM_OPS + MAX_SELECTS
+}
+
+fn safe_arm_op(func: &Function, prov: &Provenance, params: &[Value], incoming: &[Value], inst: Inst) -> bool {
+    let op = &func.insts[inst.index()].op;
+    if op.is_speculable() {
+        return true;
+    }
+    let Some(bytes) = func.insts[inst.index()].result.map(|r| func.ty(r).bytes()) else { return false };
+    match *op {
+        Op::StackLoad(slot, off) => {
+            off >= 0 && (off as u64).checked_add(u64::from(bytes)).is_some_and(|e| e <= u64::from(func.slots[slot.index()].size))
+        }
+        Op::Load(addr, off) => {
+            let base_addr = remap_val(params, incoming, addr);
+            if off >= 0
+                && (off as u64)
+                    .checked_add(u64::from(bytes))
+                    .is_some_and(|e| e <= u64::from(prov.ro_bytes.get(base_addr.index()).copied().unwrap_or(0)))
+            {
+                return true;
+            }
+            let loc = prov.loc(base_addr, i64::from(off), bytes);
+            match (loc.root, loc.base) {
+                (_, MemBase::Slot(slot)) | (MemRoot::Slot(slot), _) => {
+                    loc.offset >= 0 && (loc.offset as u64).checked_add(u64::from(bytes)).is_some_and(|e| e <= u64::from(func.slots[slot.index()].size))
+                }
+                (MemRoot::NoAliasParam(p) | MemRoot::ReadonlyParam(p), MemBase::Addr(base_val)) => {
+                    let entry_match = func.entry.and_then(|e| func.blocks[e.index()].params.get(usize::from(p)).copied()) == Some(base_val);
+                    let deref_bytes = func.signature.params.get(usize::from(p)).map_or(0, |a| a.deref_bytes);
+                    entry_match && loc.offset >= 0 && (loc.offset as u64).checked_add(u64::from(bytes)).is_some_and(|e| e <= u64::from(deref_bytes))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn pure_arm(func: &Function, prov: &Provenance, block: Block, join: Block, incoming: &[Value]) -> Option<Vec<Value>> {
     let data = &func.blocks[block.index()];
-    if !data.params.is_empty() || data.insts.len() > 12 {
+    if data.params.len() != incoming.len() {
         return None;
     }
     let (&last, body) = data.insts.split_last()?;
+    if body.len() > MAX_ARM_INSTS {
+        return None;
+    }
     let Op::Jump(target, args) = &func.insts[last.index()].op else {
         return None;
     };
-    let ops = real_op_count(func, body);
-    if *target != join || ops > 6 || !body.iter().all(|inst| func.insts[inst.index()].op.is_speculable()) {
+    if *target != join
+        || !pure_arm_ops(func, body)
+        || !body.iter().all(|&inst| safe_arm_op(func, prov, &data.params, incoming, inst))
+    {
         return None;
     }
-    Some((args.clone(), ops))
+    Some(args.iter().map(|&v| remap_val(&data.params, incoming, v)).collect())
 }
 
-fn match_diamond(func: &Function, cfg: &Cfg, head: Block, (then_b, else_b): (Block, Block)) -> Option<ArmMatch> {
+fn match_diamond(
+    func: &Function,
+    cfg: &Cfg,
+    prov: &Provenance,
+    head: Block,
+    (then_b, then_args): (Block, &[Value]),
+    (else_b, else_args): (Block, &[Value]),
+) -> Option<ArmMatch> {
     if cfg.pred_count(then_b) != 1 || cfg.pred_count(else_b) != 1 {
         return None;
     }
@@ -40,77 +110,255 @@ fn match_diamond(func: &Function, cfg: &Cfg, head: Block, (then_b, else_b): (Blo
     if join_b == head || join_b == then_b || join_b == else_b || func.entry == Some(join_b) || cfg.pred_count(join_b) < 2 {
         return None;
     }
-    let ((t, t_ops), (e, e_ops)) = (pure_arm(func, then_b, join_b)?, pure_arm(func, else_b, join_b)?);
-    (t_ops + e_ops <= 8).then_some(ArmMatch { join: join_b, t_args: t, e_args: e, clear: [Some(then_b), Some(else_b)] })
+    let t_args = pure_arm(func, prov, then_b, join_b, then_args)?;
+    let e_args = pure_arm(func, prov, else_b, join_b, else_args)?;
+    Some(ArmMatch {
+        join: join_b,
+        args: JoinArgs::Pair { t_args, e_args },
+        arms: vec![(then_b, then_args.to_vec()), (else_b, else_args.to_vec())],
+    })
 }
 
-fn match_triangle(func: &Function, cfg: &Cfg, arm: Block, join: Block) -> Option<Vec<Value>> {
+fn match_triangle(func: &Function, cfg: &Cfg, prov: &Provenance, arm: Block, arm_args: &[Value], join: Block) -> Option<Vec<Value>> {
     (cfg.pred_count(arm) == 1 && cfg.pred_count(join) >= 2)
-        .then(|| pure_arm(func, arm, join).map(|(args, _)| args))
+        .then(|| pure_arm(func, prov, arm, join, arm_args))
         .flatten()
 }
 
-fn match_arms(func: &Function, cfg: &Cfg, head: Block) -> Option<(Value, ArmMatch)> {
+fn match_nested_side(
+    func: &Function,
+    cfg: &Cfg,
+    prov: &Provenance,
+    cleared: &[bool],
+    head: Block,
+    (mid, mid_in): (Block, &[Value]),
+    (other_b, other_args): (Block, &[Value]),
+    mid_is_then: bool,
+) -> Option<ArmMatch> {
+    if mid == head || mid == other_b || func.entry == Some(mid) || cleared[mid.index()] || cfg.pred_count(mid) != 1 {
+        return None;
+    }
+    let mid_data = &func.blocks[mid.index()];
+    if mid_data.params.len() != mid_in.len() {
+        return None;
+    }
+    let (&mid_last, mid_body) = mid_data.insts.split_last()?;
+    if mid_body.len() > MAX_ARM_INSTS
+        || !pure_arm_ops(func, mid_body)
+        || !mid_body.iter().all(|&inst| safe_arm_op(func, prov, &mid_data.params, mid_in, inst))
+    {
+        return None;
+    }
+    let Op::Brif(cond2, m_then, mt_raw, m_else, me_raw) = func.insts[mid_last.index()].op.clone() else {
+        return None;
+    };
+    if !func.ty(cond2).is_small_int()
+        || m_then == head
+        || m_then == mid
+        || m_else == head
+        || m_else == mid
+        || func.entry == Some(m_then)
+        || func.entry == Some(m_else)
+    {
+        return None;
+    }
+    let mid_cond = remap_val(&mid_data.params, mid_in, cond2);
+    let mt_args: Vec<Value> = mt_raw.iter().map(|&v| remap_val(&mid_data.params, mid_in, v)).collect();
+    let me_args: Vec<Value> = me_raw.iter().map(|&v| remap_val(&mid_data.params, mid_in, v)).collect();
+    if m_then == m_else {
+        let join = m_then;
+        if cfg.pred_count(join) < 2 {
+            return None;
+        }
+        if other_b == join {
+            return Some(ArmMatch {
+                join,
+                args: JoinArgs::Nested { mid_cond, mt_args, me_args, other_args: other_args.to_vec(), mid_is_then },
+                arms: vec![(mid, mid_in.to_vec())],
+            });
+        }
+        if cleared[other_b.index()] {
+            return None;
+        }
+        let o_out = match_triangle(func, cfg, prov, other_b, other_args, join)?;
+        return Some(ArmMatch {
+            join,
+            args: JoinArgs::Nested { mid_cond, mt_args, me_args, other_args: o_out, mid_is_then },
+            arms: vec![(mid, mid_in.to_vec()), (other_b, other_args.to_vec())],
+        });
+    }
+    let (rem_b, rem_in, shared_mid_args, shared_is_then) = if m_else == other_b {
+        (m_then, &mt_args, &me_args, false)
+    } else if m_then == other_b {
+        (m_else, &me_args, &mt_args, true)
+    } else {
+        return None;
+    };
+    if !cleared[rem_b.index()]
+        && cfg.pred_count(other_b) >= 2
+        && let Some(rem_out) = match_triangle(func, cfg, prov, rem_b, rem_in, other_b)
+    {
+        let (mt_final, me_final) = if shared_is_then { (shared_mid_args.clone(), rem_out) } else { (rem_out, shared_mid_args.clone()) };
+        return Some(ArmMatch {
+            join: other_b,
+            args: JoinArgs::Nested {
+                mid_cond,
+                mt_args: mt_final,
+                me_args: me_final,
+                other_args: other_args.to_vec(),
+                mid_is_then,
+            },
+            arms: vec![(mid, mid_in.to_vec()), (rem_b, rem_in.clone())],
+        });
+    }
+    if cleared[other_b.index()] || cfg.pred_count(other_b) != 2 || shared_mid_args.as_slice() != other_args {
+        return None;
+    }
+    let Some(Op::Jump(join, _)) = func.last(other_b).cloned() else { return None };
+    if join == head || join == mid || join == other_b || func.entry == Some(join) || cfg.pred_count(join) < 2 {
+        return None;
+    }
+    let shared_out = pure_arm(func, prov, other_b, join, other_args)?;
+    let mut arms = vec![(mid, mid_in.to_vec())];
+    let rem_out = if rem_b == join {
+        rem_in.clone()
+    } else {
+        if cleared[rem_b.index()] || cfg.pred_count(rem_b) != 1 {
+            return None;
+        }
+        let out = pure_arm(func, prov, rem_b, join, rem_in)?;
+        arms.push((rem_b, rem_in.clone()));
+        out
+    };
+    arms.push((other_b, other_args.to_vec()));
+    let (mt_final, me_final) = if shared_is_then { (shared_out.clone(), rem_out) } else { (rem_out, shared_out.clone()) };
+    Some(ArmMatch {
+        join,
+        args: JoinArgs::Nested {
+            mid_cond,
+            mt_args: mt_final,
+            me_args: me_final,
+            other_args: shared_out,
+            mid_is_then,
+        },
+        arms,
+    })
+}
+
+fn match_arms(func: &Function, cfg: &Cfg, prov: &Provenance, cleared: &[bool], head: Block) -> Option<(Value, ArmMatch)> {
     let &brif_inst = func.blocks[head.index()].insts.last()?;
     let Op::Brif(cond, then_b, then_args, else_b, else_args) = func.insts[brif_inst.index()].op.clone() else {
         return None;
     };
+    if !func.ty(cond).is_small_int() {
+        return None;
+    }
     if then_b == head || else_b == head || func.entry == Some(then_b) || func.entry == Some(else_b) {
         return None;
     }
     let matched = if then_b == else_b {
-        ArmMatch { join: then_b, t_args: then_args, e_args: else_args, clear: [None, None] }
-    } else if then_args.is_empty() && else_args.is_empty() && let Some(m) = match_diamond(func, cfg, head, (then_b, else_b)) {
+        ArmMatch { join: then_b, args: JoinArgs::Pair { t_args: then_args, e_args: else_args }, arms: Vec::new() }
+    } else if let Some(m) = match_diamond(func, cfg, prov, head, (then_b, &then_args), (else_b, &else_args)) {
         m
-    } else if then_args.is_empty() && let Some(t) = match_triangle(func, cfg, then_b, else_b) {
-        ArmMatch { join: else_b, t_args: t, e_args: else_args, clear: [Some(then_b), None] }
-    } else if else_args.is_empty() && let Some(e) = match_triangle(func, cfg, else_b, then_b) {
-        ArmMatch { join: then_b, t_args: then_args, e_args: e, clear: [Some(else_b), None] }
+    } else if let Some(t_args) = match_triangle(func, cfg, prov, then_b, &then_args, else_b) {
+        ArmMatch { join: else_b, args: JoinArgs::Pair { t_args, e_args: else_args }, arms: vec![(then_b, then_args)] }
+    } else if let Some(e_args) = match_triangle(func, cfg, prov, else_b, &else_args, then_b) {
+        ArmMatch { join: then_b, args: JoinArgs::Pair { t_args: then_args, e_args }, arms: vec![(else_b, else_args)] }
+    } else if let Some(m) = match_nested_side(func, cfg, prov, cleared, head, (then_b, &then_args), (else_b, &else_args), true) {
+        m
+    } else if let Some(m) = match_nested_side(func, cfg, prov, cleared, head, (else_b, &else_args), (then_b, &then_args), false) {
+        m
     } else {
         return None;
     };
     Some((cond, matched))
 }
 
-fn try_head(func: &mut Function, cfg: &Cfg, head: Block, cleared: &mut [bool]) -> bool {
-    let Some((cond, m)) = match_arms(func, cfg, head) else {
+fn emit_select(func: &mut Function, head: Block, ty: Type, cond: Value, t_val: Value, e_val: Value) -> Value {
+    if t_val == e_val {
+        return t_val;
+    }
+    let val = func.value(ty);
+    let inst = func.add(Op::Select(cond, t_val, e_val), Some(val));
+    func.blocks[head.index()].insts.push(inst);
+    val
+}
+
+fn try_head(func: &mut Function, cfg: &Cfg, prov: &Provenance, head: Block, cleared: &mut [bool]) -> bool {
+    let Some((cond, m)) = match_arms(func, cfg, prov, cleared, head) else {
         return false;
     };
     let join_params = &func.blocks[m.join.index()].params;
-    if !(1..=4).contains(&join_params.len())
-        || m.t_args.len() != join_params.len()
-        || m.e_args.len() != join_params.len()
-        || !join_params.iter().all(|p| scalar_select(func.ty(*p)))
-    {
+    let ok = match &m.args {
+        JoinArgs::Pair { t_args, e_args } => {
+            t_args.len() == join_params.len() && e_args.len() == join_params.len() && {
+                let mut selects = 0usize;
+                join_params.iter().zip(t_args.iter().zip(e_args)).all(|(p, (t, e))| {
+                    if t == e {
+                        return true;
+                    }
+                    selects += 1;
+                    selects <= MAX_SELECTS && scalar_select(func.ty(*p))
+                })
+            }
+        }
+        JoinArgs::Nested { mt_args, me_args, other_args, .. } => {
+            mt_args.len() == join_params.len() && me_args.len() == join_params.len() && other_args.len() == join_params.len() && {
+                let mut selects = 0usize;
+                join_params.iter().enumerate().all(|(i, p)| {
+                    let (mt, me, ov) = (mt_args[i], me_args[i], other_args[i]);
+                    if mt == me && mt == ov {
+                        return true;
+                    }
+                    selects += if mt != me { 2 } else { 1 };
+                    selects <= MAX_SELECTS && scalar_select(func.ty(*p))
+                })
+            }
+        }
+    };
+    if !ok {
         return false;
     }
     let param_tys: Vec<Type> = join_params.iter().map(|p| func.ty(*p)).collect();
     if let Some(old_brif) = func.blocks[head.index()].insts.pop() {
         func.insts[old_brif.index()].op = Op::Trap;
     }
-    for side in m.clear.into_iter().flatten() {
+    for (side, in_args) in m.arms {
+        let params = std::mem::take(&mut func.blocks[side.index()].params);
         let mut moved = std::mem::take(&mut func.blocks[side.index()].insts);
         if let Some(old_jump) = moved.pop() {
             func.insts[old_jump.index()].op = Op::Trap;
         }
-        func.blocks[head.index()].insts.extend(moved);
+        if param_tys.is_empty() {
+            for inst in moved {
+                func.insts[inst.index()].op = Op::Trap;
+            }
+        } else {
+            if !params.is_empty() {
+                for &inst in &moved {
+                    func.insts[inst.index()].op.map_operands(|v| remap_val(&params, &in_args, v));
+                }
+            }
+            func.blocks[head.index()].insts.extend(moved);
+        }
         cleared[side.index()] = true;
     }
     let mut selected = Vec::with_capacity(param_tys.len());
-    for ((ty, t_val), e_val) in param_tys.into_iter().zip(m.t_args).zip(m.e_args) {
-        if t_val == e_val {
-            selected.push(t_val);
-            continue;
+    match m.args {
+        JoinArgs::Pair { t_args, e_args } => {
+            for ((ty, t_val), e_val) in param_tys.into_iter().zip(t_args).zip(e_args) {
+                selected.push(emit_select(func, head, ty, cond, t_val, e_val));
+            }
         }
-        let val = Value(func.types.len() as u32);
-        func.types.push(ty);
-        let inst = Inst(func.insts.len() as u32);
-        func.insts.push(InstData { op: Op::Select(cond, t_val, e_val), result: Some(val) });
-        func.blocks[head.index()].insts.push(inst);
-        selected.push(val);
+        JoinArgs::Nested { mid_cond, mt_args, me_args, other_args, mid_is_then } => {
+            for (i, ty) in param_tys.into_iter().enumerate() {
+                let mid_val = emit_select(func, head, ty, mid_cond, mt_args[i], me_args[i]);
+                let (t_val, e_val) = if mid_is_then { (mid_val, other_args[i]) } else { (other_args[i], mid_val) };
+                selected.push(emit_select(func, head, ty, cond, t_val, e_val));
+            }
+        }
     }
-    let jump = Inst(func.insts.len() as u32);
-    func.insts.push(InstData { op: Op::Jump(m.join, selected), result: None });
+    let jump = func.add(Op::Jump(m.join, selected), None);
     func.blocks[head.index()].insts.push(jump);
     true
 }
@@ -123,11 +371,12 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let mut any = false;
     loop {
         let cfg = func.cfg();
+        let prov = Provenance::new(func, &cfg);
         let mut cleared = vec![false; func.blocks.len()];
         let mut changed = false;
         for &block in cfg.rpo.iter().rev() {
             if !cleared[block.index()] {
-                changed |= try_head(func, &cfg, block, &mut cleared);
+                changed |= try_head(func, &cfg, &prov, block, &mut cleared);
             }
         }
         if !changed {

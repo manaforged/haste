@@ -15,7 +15,7 @@ use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
-use crate::ir::{ArgumentPurpose, Block, Function, Inst, Lane, Op, SigRef, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, IntCC, Lane, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{CallAbi, Target};
@@ -24,10 +24,10 @@ use crate::{Code, Site};
 const REGS: Regs<Reg> = Regs {
     saved: &SAVED,
     saved_float: &[],
-    leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10],
+    leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10, Reg::Rdx],
     wide_scratch: &wide::WIDE_SCRATCH,
-    op_scratch: &[Reg::Rsi],
-    uses_scratch: atomic::uses_rsi,
+    op_scratch: &[Reg::Rsi, Reg::Rdx],
+    uses_scratch: atomic::uses_scratch,
     dict: Some(Reg::R10),
     float: &float::POOL,
     float_branches: &float::BRANCHES,
@@ -39,24 +39,25 @@ const REGS: Regs<Reg> = Regs {
 };
 
 const REGS_WIN64: Regs<Reg> = Regs {
-    leaf: &[Reg::R9, Reg::R8, Reg::R10],
+    leaf: &[Reg::R9, Reg::R8, Reg::R10, Reg::Rdx],
     ..REGS
 };
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
     let abi_kind = target.abi;
     let regs = if abi_kind == CallAbi::Win64 { &REGS_WIN64 } else { &REGS };
-    let Prepared { order, copied, abi, plan, frame, framed } = prepare(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
+    let Prepared { order, copied, abi, mut plan, mut frame, mut framed } = prepare(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
+    let features = Features::host();
+    let elided_before = plan.elided.iter().filter(|&&e| e).count();
+    location::fuse(func, &mut plan, &features);
+    if plan.elided.iter().filter(|&&e| e).count() != elided_before {
+        crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
+    }
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[Reg::Rbp, Reg::Rsp, Reg::R11]);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let slow_thunk = asm.label();
-    let mut defs = vec![None; func.types.len()];
-    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
-        if let Some(res) = func.insts[inst.index()].result {
-            defs[res.index()] = Some(inst);
-        }
-    }
+    let defs = crate::fold::defs(func);
     let last_block = order.last().copied();
     let emit = Emit {
         func,
@@ -71,13 +72,13 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         plan,
         defs,
         flags: None,
-        last_spill: None,
+        last_spill: [None; 4],
         last_fspill: None,
         next: None,
         last_block,
         at_end: false,
         trap_label: None,
-        features: Features::host(),
+        features,
         copied,
         direct_calls: target.direct_calls,
         shrink,
@@ -128,8 +129,8 @@ pub(super) struct Emit<'a> {
     plan: Plan<Reg>,
     defs: Vec<Option<Inst>>,
     flags: Option<(Value, Cond)>,
-    last_spill: Option<(i32, Reg, (usize, u32))>,
-    last_fspill: Option<(i32, Xmm, Type, (usize, u32))>,
+    last_spill: [Option<(i32, Reg)>; 4],
+    last_fspill: Option<(i32, Xmm, Type)>,
     next: Option<Block>,
     last_block: Option<Block>,
     at_end: bool,
@@ -178,8 +179,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     }
 
     fn bind_block(&mut self, block: Block) {
-        self.last_spill = None;
-        self.last_fspill = None;
+        self.invalidate_spills();
         self.at_end = self.last_block == Some(block);
         self.asm.bind(self.blocks[block.index()]);
     }
@@ -225,30 +225,48 @@ impl<'a> Emitter<'a> for Emit<'a> {
         let result = data.result;
         let value = || result.ok_or_else(|| "a value instruction without a result".to_owned());
         match &data.op {
-            Op::Call { sig, callee, args, results } => emit_call(self, inst, (*sig, *callee), args, results),
-            Op::TryCall { sig, callee, args, normal, handler } => emit_try_call(self, (*sig, *callee), args, (*normal, *handler)),
+            Op::Call { sig, callee, args, results } => {
+                let res = emit_call(self, inst, (*sig, *callee), args, results);
+                self.invalidate_spills();
+                res
+            }
+            Op::TryCall { sig, callee, args, normal, handler } => {
+                let res = emit_try_call(self, (*sig, *callee), args, (*normal, *handler));
+                self.invalidate_spills();
+                res
+            }
             Op::Jump(block, args) => {
                 self.edge(*block, args)?;
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
                 }
+                self.invalidate_spills();
                 emit_goto(self, *block, true);
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
-                emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args))
+                let res = emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args));
+                self.invalidate_spills();
+                res
             }
             Op::BrTable(index, default, targets) => {
                 self.br_table(*index, *default, targets);
+                self.invalidate_spills();
                 Ok(())
             }
-            Op::Return(values) => self.ret(values),
+            Op::Return(values) => {
+                let res = self.ret(values);
+                self.invalidate_spills();
+                res
+            }
             Op::Trap => {
                 self.emit_trap(self.at_end);
+                self.invalidate_spills();
                 Ok(())
             }
             Op::Trapz(condition) => {
                 self.trapz(*condition);
+                self.invalidate_spills();
                 Ok(())
             }
             op => self.value_op(op, value),
@@ -282,11 +300,13 @@ impl Emit<'_> {
     fn high(&mut self, reg: Reg, value: Value) {
         let at = self.at(value).offset(8);
         self.asm.load(Size::Q, reg, at);
+        self.clobber_reg(reg);
     }
 
     fn put_high(&mut self, value: Value, reg: Reg) {
         let at = self.at(value).offset(8);
         self.asm.store(Size::Q, at, reg);
+        self.invalidate_disp(at.disp);
     }
 
     fn ud2(&mut self) {
@@ -330,8 +350,15 @@ impl Emit<'_> {
         if ty.bytes() == 16 {
             self.asm.load(Size::Q, Reg::Rax, from.offset(8));
             self.asm.store(Size::Q, to.offset(8), Reg::Rax);
+            self.clobber_reg(Reg::Rax);
+            if to.base == Reg::Rbp && to.index.is_none() {
+                self.invalidate_disp(to.disp);
+                self.invalidate_disp(to.disp + 8);
+            }
         } else if to.base == Reg::Rbp && to.index.is_none() {
-            self.last_spill = Some((to.disp, Reg::Rax, self.asm.stamp()));
+            self.write_spill(to.disp, Reg::Rax);
+        } else {
+            self.clobber_reg(Reg::Rax);
         }
     }
 
@@ -347,12 +374,31 @@ impl Emit<'_> {
         let trap = self.trap_label();
         let cond = match self.flags.take() {
             Some((value, cond)) if value == condition => cond.invert(),
-            _ => {
-                self.test_value(condition);
-                Cond::E
-            }
+            _ => self.test_cond(condition).invert(),
         };
         self.asm.jcc(cond, trap);
+    }
+
+    fn test_cond(&mut self, condition: Value) -> Cond {
+        if self.plan.elided[condition.index()]
+            && let Some(inst) = self.defs[condition.index()]
+        {
+            match self.func.insts[inst.index()].op {
+                Op::Binary(Binary::Band, x, y) => {
+                    self.emit_test_band(x, y);
+                    return Cond::Ne;
+                }
+                Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), lhs, rhs) => {
+                    if let Some((x, y)) = self.elided_band_cmp(lhs, rhs) {
+                        self.emit_test_band(x, y);
+                        return int::cond(cc);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.test_value(condition);
+        Cond::Ne
     }
 
     fn test_value(&mut self, value: Value) {
@@ -373,14 +419,20 @@ impl Emit<'_> {
 
     fn load_home(&mut self, value: Value, from: Mem) {
         match self.plan.locations[value.index()] {
-            Location::Reg(reg) => self.asm.load(Size::Q, reg, from),
-            Location::Float(xmm) => self.xmm_load(self.ty(value), Xmm(xmm), from),
+            Location::Reg(reg) => {
+                self.asm.load(Size::Q, reg, from);
+                self.clobber_reg(reg);
+            }
+            Location::Float(xmm) => {
+                self.xmm_load(self.ty(value), Xmm(xmm), from);
+                self.clobber_xmm(Xmm(xmm));
+            }
             _ => self.copy_to(self.at(value), from, self.ty(value)),
         }
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
-        let int_scratch = [Reg::Rdx, Reg::Rcx];
+        let int_scratch = [Reg::R11, Reg::Rcx];
         let float_scratch = [Xmm(0), Xmm(1)];
         for step in edge_steps(self.func, &self.plan.locations, &self.frame.values, args, &self.func.blocks[block.index()].params) {
             match step {
@@ -468,6 +520,7 @@ impl Emit<'_> {
                 self.high(high, val);
             }
         }
+        self.invalidate_spills();
         float_targets.len()
     }
 
@@ -527,9 +580,11 @@ impl Emit<'_> {
                 done += bytes;
             }
         }
+        self.clobber_reg(Reg::Rcx);
     }
 
     fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> {
+        self.invalidate_spills();
         let abi = classify(&self.func.sigs[sig.index()], self.abi_kind)?;
         for (arg, loc) in args.iter().zip(&abi.params) {
             match *loc {
@@ -566,7 +621,58 @@ impl Emit<'_> {
             }
             None => self.asm.call(target),
         }
+        self.invalidate_spills();
         Ok(abi)
+    }
+
+    pub(super) fn emit_sat_op(&mut self, op: Binary, size: Size, dst: Reg, src: Reg) {
+        let (umax, smin, smax) = match size {
+            Size::B => (0xFF_i64, 0x80_i64, 0x7F_i64),
+            Size::W => (0xFFFF_i64, 0x8000_i64, 0x7FFF_i64),
+            Size::D => (0xFFFF_FFFF_i64, 0x8000_0000_i64, 0x7FFF_FFFF_i64),
+            Size::Q => (-1_i64, i64::MIN, i64::MAX),
+        };
+        match op {
+            Binary::UaddSat => {
+                self.asm.alu_sized(size, Alu::Add, dst, src);
+                self.asm.mov_imm(Reg::Rdx, umax);
+                self.asm.cmov(Cond::B, dst, Reg::Rdx);
+            }
+            Binary::UsubSat => {
+                self.asm.alu32(Alu::Xor, Reg::Rdx, Reg::Rdx);
+                self.asm.alu_sized(size, Alu::Sub, dst, src);
+                self.asm.cmov(Cond::B, dst, Reg::Rdx);
+            }
+            Binary::SaddSat | Binary::SsubSat => {
+                let alu = if op == Binary::SaddSat { Alu::Add } else { Alu::Sub };
+                self.asm.alu_sized(size, alu, dst, src);
+                self.asm.mov_imm(Reg::Rdx, smin);
+                self.asm.mov_imm(Reg::R11, smax);
+                self.asm.cmov(Cond::S, Reg::Rdx, Reg::R11);
+                self.asm.cmov(Cond::O, dst, Reg::Rdx);
+            }
+            _ => {}
+        }
+        self.clobber_regs(&[dst, Reg::Rdx, Reg::R11]);
+    }
+
+    pub(super) fn clamp_signed(&mut self, reg: Reg, to: Type, signed: bool) {
+        let bits = to.bits();
+        if bits >= 64 {
+            return;
+        }
+        let (lo, hi) = if signed {
+            (-(1_i64 << (bits - 1)), (1_i64 << (bits - 1)) - 1)
+        } else {
+            (0, (1_i64 << bits) - 1)
+        };
+        self.asm.mov_imm(Reg::Rcx, lo);
+        self.asm.alu(Alu::Cmp, reg, Reg::Rcx);
+        self.asm.cmov(Cond::L, reg, Reg::Rcx);
+        self.asm.mov_imm(Reg::Rcx, hi);
+        self.asm.alu(Alu::Cmp, reg, Reg::Rcx);
+        self.asm.cmov(Cond::G, reg, Reg::Rcx);
+        self.clobber_regs(&[reg, Reg::Rcx]);
     }
 }
 
@@ -583,44 +689,64 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn pos(&self) -> u32 { self.asm.pos() }
     fn new_label(&mut self) -> Label { self.asm.label() }
     fn bind_label(&mut self, label: Label) {
-        self.last_spill = None;
-        self.last_fspill = None;
+        self.invalidate_spills();
         self.asm.bind(label);
     }
-    fn jump_label(&mut self, label: Label) { self.asm.jmp(label); }
+    fn jump_label(&mut self, label: Label) {
+        self.invalidate_spills();
+        self.asm.jmp(label);
+    }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {
         let cond = match self.flags.take() {
             Some((value, cond)) if value == condition => cond,
-            _ => {
-                self.test_value(condition);
-                Cond::Ne
-            }
+            _ => self.test_cond(condition),
         };
         self.asm.jcc(if invert { cond.invert() } else { cond }, label);
     }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }
     fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> { self.arguments(sig, callee, args) }
-    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) { self.store_locs(values, locs); }
+    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
+        self.store_locs(values, locs);
+        self.invalidate_spills();
+    }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
     fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, Mem::new(Reg::Rbp, INCOMING + offset as i32)); }
     fn intake_struct(&mut self, value: Value, offset: u32) {
         self.asm.lea(Reg::Rax, Mem::new(Reg::Rbp, INCOMING + offset as i32));
+        self.clobber_reg(Reg::Rax);
         self.put(value, Reg::Rax);
     }
     fn park_spill(&mut self, value: Value, reg: ParkReg<Reg>) {
         let home = self.at(value);
+        let disp = self.frame.values[value.index()];
         match reg {
-            ParkReg::Int(r) => self.asm.store(Size::Q, home, r),
-            ParkReg::Float(xmm) => self.xmm_store(self.ty(value), home, Xmm(xmm)),
+            ParkReg::Int(r) => {
+                self.asm.store(Size::Q, home, r);
+                self.write_spill(disp, r);
+            }
+            ParkReg::Float(xmm) => {
+                self.xmm_store(self.ty(value), home, Xmm(xmm));
+                self.invalidate_disp(disp);
+                self.last_fspill = Some((disp, Xmm(xmm), self.ty(value)));
+            }
         }
     }
     fn park_reload(&mut self, value: Value, reg: ParkReg<Reg>) {
         let home = self.at(value);
+        let disp = self.frame.values[value.index()];
         match reg {
-            ParkReg::Int(r) => self.asm.load(Size::Q, r, home),
-            ParkReg::Float(xmm) => self.xmm_load(self.ty(value), Xmm(xmm), home),
+            ParkReg::Int(r) => {
+                self.asm.load(Size::Q, r, home);
+                self.record_spill(disp, r);
+            }
+            ParkReg::Float(xmm) => {
+                self.xmm_load(self.ty(value), Xmm(xmm), home);
+                self.clobber_xmm(Xmm(xmm));
+                self.last_fspill = Some((disp, Xmm(xmm), self.ty(value)));
+            }
         }
     }
     fn put_exception(&mut self, value: Value) { self.put(value, Reg::Rax); }
     fn push_site(&mut self, site: Site) { self.sites.push(site); }
 }
+

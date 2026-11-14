@@ -312,7 +312,7 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     ));
     for value in value_order {
         let ty = func.types[value];
-        let static_loc = matches!(locations[value], Location::Imm(_) | Location::SlotAddr(_) | Location::Frame(..));
+        let static_loc = locations[value].is_static();
         let reg_unhomed = matches!(locations[value], Location::Reg(_) | Location::Float(_)) && homed.get(value) != Some(&true);
         if !present[value] || elided.get(value) == Some(&true) || static_loc || reg_unhomed {
             continue;
@@ -426,7 +426,7 @@ fn pure_value<R: Copy + PartialEq>(value: Value, plan: &Plan<R>, frame: &Frame<R
         Location::Imm(_) => true,
         Location::Reg(r) => !frame.saves.contains(&r) && !clobbers.contains(&r),
         Location::Float(f) => !frame.float_saves.contains(&f),
-        Location::Slot | Location::SlotAddr(_) | Location::Frame(..) => false,
+        Location::Slot | Location::SlotAddr(_) | Location::Symbol(_) | Location::Frame(..) => false,
     }
 }
 

@@ -63,35 +63,79 @@ impl Emit<'_> {
     fn vec_shuffle_const(&mut self, spec: VecSpec, a: Value, b: Value, m: [u8; 16], result: Value) -> Result<(), String> {
         let n = usize::from(spec.count);
         let eb = spec.lane.bytes() as usize;
-        let only_a = m[..n].iter().all(|&x| usize::from(x) < n);
-        let only_b = m[..n].iter().all(|&x| usize::from(x) >= n);
-        if only_a || only_b {
-            let src_val = if only_a { a } else { b };
-            let off = if only_a { 0 } else { spec.count };
+        let total = n * eb;
+        let mut bidx = [0x80_u8; 16];
+        let mut uses_a = false;
+        let mut uses_b = false;
+        let mut has_zero = false;
+        for (i, &lane) in m[..n].iter().enumerate() {
+            let x = usize::from(lane);
+            if x < n {
+                uses_a = true;
+                for k in 0..eb {
+                    bidx[i * eb + k] = (x * eb + k) as u8;
+                }
+            } else if x < 2 * n {
+                uses_b = true;
+                let base = total + (x - n) * eb;
+                for k in 0..eb {
+                    bidx[i * eb + k] = (base + k) as u8;
+                }
+            } else {
+                has_zero = true;
+            }
+        }
+        if !uses_a && !uses_b {
+            let dst = self.fdst(result);
+            self.asm.veor_zero(dst);
+            self.fput(result, dst);
+            return Ok(());
+        }
+        if uses_a ^ uses_b {
+            let src_val = if uses_a { a } else { b };
+            let src_off = if uses_a { 0_u8 } else { total as u8 };
+            let mut ridx = [0x80_u8; 16];
+            for j in 0..total {
+                if bidx[j] != 0x80 {
+                    ridx[j] = bidx[j] - src_off;
+                }
+            }
+            if !has_zero && self.shuffle_single_fast(spec, eb, total, src_val, &ridx, result) {
+                return Ok(());
+            }
+            self.load_bytes_v2(&ridx, total == 16);
             let dst = self.fdst(result);
             let src = self.fin(src_val, V0);
-            if m[..n].iter().enumerate().all(|(i, &x)| usize::from(x - off) == i) {
-                self.asm.vmov(dst, src);
-            } else if m[..n].iter().all(|&x| x == m[0]) {
-                self.dup_vec_elem(spec.q, spec.size, m[0] - off, dst, src);
-            } else {
-                self.load_byte_mask(n, eb, off, &m);
-                self.asm.vbit(0x0E00_0000 | (spec.q << 30), dst, src, V2);
-            }
+            self.asm.vbit(0x0E00_0000 | (spec.q << 30), dst, src, V2);
             self.fput(result, dst);
             return Ok(());
         }
         let va = self.fin(a, V0);
         let vb = self.fin(b, V1);
-        let k = usize::from(m[0]);
-        if k < n && m[..n].iter().enumerate().all(|(i, &x)| usize::from(x) == k + i) {
-            let dst = self.fdst(result);
-            let byte_off = (k * eb) as u32;
-            self.asm.vbit(0x2E00_0000 | (spec.q << 30) | (byte_off << 11), dst, va, vb);
-            self.fput(result, dst);
-            return Ok(());
+        if !has_zero {
+            let s = usize::from(bidx[0]);
+            let ext_pair = if s < total && (0..total).all(|j| usize::from(bidx[j]) == s + j) {
+                Some((va, vb, s))
+            } else if (total..2 * total).contains(&s) && (0..total).all(|j| usize::from(bidx[j]) == (s + j) % (2 * total)) {
+                Some((vb, va, s - total))
+            } else {
+                None
+            };
+            if let Some((vn, vm, byte_off)) = ext_pair {
+                let dst = self.fdst(result);
+                self.asm.vbit(0x2E00_0000 | (spec.q << 30) | ((byte_off as u32) << 11), dst, vn, vm);
+                self.fput(result, dst);
+                return Ok(());
+            }
+            if let Some((base, size, swap)) = match_permute(total, eb, &bidx, false) {
+                let dst = self.fdst(result);
+                let (vn, vm) = if swap { (vb, va) } else { (va, vb) };
+                self.asm.vbit(base | (spec.q << 30) | (size << 22), dst, vn, vm);
+                self.fput(result, dst);
+                return Ok(());
+            }
         }
-        self.load_byte_mask(n, eb, 0, &m);
+        self.load_bytes_v2(&bidx, total == 16);
         if spec.q == 0 {
             self.asm.vmov(V0, va);
             self.ins_elem(V0, 3, 1, vb, 0);
@@ -108,19 +152,79 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn load_byte_mask(&mut self, n: usize, eb: usize, sub_lanes: u8, m: &[u8; 16]) {
-        let mut bytes = [0u8; 16];
-        for (i, &lane_idx) in m[..n].iter().enumerate() {
-            let base = usize::from(lane_idx - sub_lanes) * eb;
-            for k in 0..eb {
-                bytes[i * eb + k] = (base + k) as u8;
+    fn shuffle_single_fast(&mut self, spec: VecSpec, eb: usize, total: usize, src_val: Value, ridx: &[u8; 16], result: Value) -> bool {
+        if (0..total).all(|j| usize::from(ridx[j]) == j) {
+            let dst = self.fdst(result);
+            let src = self.fin(src_val, V0);
+            self.asm.vmov(dst, src);
+            self.fput(result, dst);
+            return true;
+        }
+        let r = usize::from(ridx[0]);
+        if r < total && (0..total).all(|j| usize::from(ridx[j]) == (r + j) % total) {
+            let dst = self.fdst(result);
+            let src = self.fin(src_val, V0);
+            self.asm.vbit(0x2E00_0000 | (spec.q << 30) | ((r as u32) << 11), dst, src, src);
+            self.fput(result, dst);
+            return true;
+        }
+        for unit in [8_usize, 4, 2, 1] {
+            if unit >= eb && unit <= total / 2 && usize::from(ridx[0]) % unit == 0 {
+                let elem_idx = usize::from(ridx[0]) / unit;
+                if (0..total).all(|j| usize::from(ridx[j]) == elem_idx * unit + (j % unit)) {
+                    let dst = self.fdst(result);
+                    let src = self.fin(src_val, V0);
+                    self.dup_vec_elem(spec.q, unit.trailing_zeros(), elem_idx as u8, dst, src);
+                    self.fput(result, dst);
+                    return true;
+                }
             }
         }
-        let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = bytes;
+        const REVS: &[(usize, usize, u32)] = &[
+            (8, 4, 0x0EA0_0800),
+            (8, 2, 0x0E60_0800),
+            (8, 1, 0x0E20_0800),
+            (4, 2, 0x2E60_0800),
+            (4, 1, 0x2E20_0800),
+            (2, 1, 0x0E20_1800),
+        ];
+        for &(container, elem, base) in REVS {
+            if elem >= eb && container <= total && (0..total).all(|j| usize::from(ridx[j]) == rev_byte(container, elem, j)) {
+                let dst = self.fdst(result);
+                let src = self.fin(src_val, V0);
+                self.v_two(base | (spec.q << 30), dst, src);
+                self.fput(result, dst);
+                return true;
+            }
+        }
+        if total == 16 {
+            for elem in [4_usize, 2, 1] {
+                if elem >= eb && (0..16).all(|j| usize::from(ridx[j]) == rev_byte(16, elem, j)) {
+                    let dst = self.fdst(result);
+                    let src = self.fin(src_val, V0);
+                    self.v_two(0x0E20_0800 | (elem.trailing_zeros() << 22) | (spec.q << 30), dst, src);
+                    self.asm.vbit(0x6E00_0000 | (8 << 11), dst, dst, dst);
+                    self.fput(result, dst);
+                    return true;
+                }
+            }
+        }
+        if let Some((base, size, _)) = match_permute(total, eb, ridx, true) {
+            let dst = self.fdst(result);
+            let src = self.fin(src_val, V0);
+            self.asm.vbit(base | (spec.q << 30) | (size << 22), dst, src, src);
+            self.fput(result, dst);
+            return true;
+        }
+        false
+    }
+
+    fn load_bytes_v2(&mut self, bytes: &[u8; 16], full: bool) {
+        let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = *bytes;
         let lo = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
         self.asm.mov_imm(A, lo as i64);
         self.asm.fmov_in(true, V2, A);
-        if n * eb == 16 {
+        if full {
             let hi = u64::from_le_bytes([b8, b9, b10, b11, b12, b13, b14, b15]);
             self.asm.mov_imm(C, hi as i64);
             self.ins_gpr(V2, 3, 1, C);
@@ -274,7 +378,7 @@ impl Emit<'_> {
             if spec.count == 8 {
                 self.asm.lsr_imm(A, A, 7);
                 self.asm.alu(Alu::And, Size::X, A, A, D);
-                self.asm.madd(false, A, (A, IP), ZR);
+                self.asm.madd(false, Size::X, A, (A, IP), ZR);
                 self.asm.lsr_imm(dst, A, 56);
                 return;
             }
@@ -282,7 +386,7 @@ impl Emit<'_> {
             for reg in [A, C] {
                 self.asm.lsr_imm(reg, reg, 7);
                 self.asm.alu(Alu::And, Size::X, reg, reg, D);
-                self.asm.madd(false, reg, (reg, IP), ZR);
+                self.asm.madd(false, Size::X, reg, (reg, IP), ZR);
                 self.asm.lsr_imm(reg, reg, 56);
             }
             self.asm.lsl_imm(C, C, 8);
@@ -356,4 +460,57 @@ impl Emit<'_> {
         self.fput(result, dst);
         Ok(())
     }
+}
+
+fn rev_byte(container: usize, elem: usize, j: usize) -> usize {
+    let chunk_base = j & !(container - 1);
+    let in_chunk = j & (container - 1);
+    let reversed_elem = container - elem - (in_chunk & !(elem - 1));
+    chunk_base + reversed_elem + (in_chunk & (elem - 1))
+}
+
+fn match_permute(total: usize, eb: usize, bidx: &[u8; 16], single: bool) -> Option<(u32, u32, bool)> {
+    const OPS: &[(u32, fn(usize, usize) -> usize)] = &[
+        (0x0E00_3800, |i, m| if i & 1 == 0 { i / 2 } else { m + i / 2 }),
+        (0x0E00_7800, |i, m| if i & 1 == 0 { m / 2 + i / 2 } else { m + m / 2 + i / 2 }),
+        (0x0E00_1800, |i, _| 2 * i),
+        (0x0E00_5800, |i, _| 2 * i + 1),
+        (0x0E00_2800, |i, m| if i & 1 == 0 { i } else { m + i - 1 }),
+        (0x0E00_6800, |i, m| if i & 1 == 0 { i + 1 } else { m + i }),
+    ];
+    for unit in [8_usize, 4, 2, 1] {
+        if unit < eb || unit > total / 2 {
+            continue;
+        }
+        let m = total / unit;
+        let mut elems = [0_usize; 16];
+        let mut aligned = true;
+        for i in 0..m {
+            let base = usize::from(bidx[i * unit]);
+            if base % unit != 0 || base >= 2 * total || !(1..unit).all(|k| usize::from(bidx[i * unit + k]) == base + k) {
+                aligned = false;
+                break;
+            }
+            elems[i] = base / unit;
+        }
+        if !aligned {
+            continue;
+        }
+        let size = unit.trailing_zeros();
+        for &(base, pat) in OPS {
+            if single {
+                if (0..m).all(|i| elems[i] == pat(i, m) % m) {
+                    return Some((base, size, false));
+                }
+            } else if (0..m).all(|i| elems[i] == pat(i, m)) {
+                return Some((base, size, false));
+            } else if (0..m).all(|i| {
+                let p = pat(i, m);
+                elems[i] == if p < m { p + m } else { p - m }
+            }) {
+                return Some((base, size, true));
+            }
+        }
+    }
+    None
 }

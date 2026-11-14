@@ -170,11 +170,15 @@ impl AbiParam {
         self
     }
 
-    /// Marks this parameter as pointing to `bytes` bytes of dereferenceable, immutable memory.
-    pub const fn with_deref_bytes(mut self, bytes: u32) -> Self {
-        self.readonly = true;
+    /// Marks this parameter as pointing to `bytes` bytes of dereferenceable memory.
+    pub const fn with_deref_size(mut self, bytes: u32) -> Self {
         self.deref_bytes = bytes;
         self
+    }
+
+    /// Marks this parameter as pointing to `bytes` bytes of dereferenceable, immutable memory.
+    pub const fn with_deref_bytes(self, bytes: u32) -> Self {
+        self.with_readonly().with_deref_size(bytes)
     }
 }
 
@@ -695,25 +699,25 @@ impl Function {
         self.blocks.iter().map(|block| block.insts.len()).sum()
     }
 
+    /// The number of non-trivial instructions in the body, discounting constant and address-materialization ops.
+    pub fn inline_size(&self) -> usize {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| !matches!(self.insts[i.index()].op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::SlotAddr(_)))
+            .count()
+    }
+
     /// Whether `FunctionBuilder::inline` can copy this function into a caller: it is no coroutine, catches no unwind and reads no frame pointer.
     pub fn can_inline(&self) -> bool {
         self.coroutine.is_none()
             && self.entry.is_some()
-            && !self
-                .blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .map(|i| &self.insts[i.index()])
-                .any(|data| matches!(data.op, Op::TryCall { .. } | Op::FramePointer))
+            && !self.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(self.insts[i.index()].op, Op::TryCall { .. } | Op::FramePointer))
     }
 
     /// Whether any instruction in this body returns to its caller.
     pub fn has_return(&self) -> bool {
-        self.blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .map(|i| &self.insts[i.index()])
-            .any(|data| matches!(data.op, Op::Return(_)))
+        self.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(self.insts[i.index()].op, Op::Return(_)))
     }
 
     /// For each value, the block that defines it.

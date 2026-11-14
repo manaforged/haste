@@ -1,57 +1,60 @@
+mod bitmask;
+
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cfg::Cfg;
 use crate::fold::extend;
 use crate::ir::{Binary, Block, BlockData, Convert, Domain, Function, Inst, IntCC, Op, Type, Value};
+use bitmask::{build_runs, can_bitmask_runs, try_emit_bitmask_runs, try_rewrite_expr};
 
-struct Info {
+pub(super) struct Info {
     cfg: std::sync::Arc<Cfg>,
-    uses: Vec<u32>,
+    pub(super) uses: Vec<u32>,
     consts: Vec<Option<i64>>,
-    def_block: Vec<Option<usize>>,
-    def_inst: Vec<Option<Inst>>,
+    pub(super) def_block: Vec<Option<usize>>,
+    pub(super) def_inst: Vec<Option<Inst>>,
 }
 
 #[derive(Clone, Copy)]
-enum TestKind {
+pub(super) enum TestKind {
     Cmp(IntCC, i64),
     SubCmp { lo: u64, cc: IntCC, bound: u64 },
 }
 
-struct BlockTest {
-    val: Value,
-    kind: TestKind,
-    used: [Option<Inst>; 2],
+pub(super) struct BlockTest {
+    pub(super) val: Value,
+    pub(super) kind: TestKind,
+    pub(super) used: [Option<Inst>; 2],
 }
 
 #[derive(Clone, Copy)]
-struct Range {
-    lo: u64,
-    hi: u64,
+pub(super) struct Range {
+    pub(super) lo: u64,
+    pub(super) hi: u64,
     s_lo: i64,
     s_hi: i64,
     signed_ok: bool,
 }
 
 #[derive(Clone)]
-struct Edge {
-    raw: Block,
-    block: Block,
-    args: Vec<Value>,
-    synth_bool: Option<bool>,
+pub(super) struct Edge {
+    pub(super) raw: Block,
+    pub(super) block: Block,
+    pub(super) args: Vec<Value>,
+    pub(super) synth_bool: Option<bool>,
 }
 
 #[derive(Clone)]
-struct Arm {
-    range: Range,
-    hit: Edge,
+pub(super) struct Arm {
+    pub(super) range: Range,
+    pub(super) hit: Edge,
 }
 
 #[derive(Clone)]
-struct Run {
-    lo: u64,
-    hi: u64,
-    hit: Edge,
+pub(super) struct Run {
+    pub(super) lo: u64,
+    pub(super) hi: u64,
+    pub(super) hit: Edge,
 }
 
 struct ArmMatch {
@@ -130,7 +133,7 @@ fn match_sub_offset(func: &Function, info: &Info, val: Value, expected_block: Op
     ty.is_small_int().then(|| (src, extend(lo_raw, ty, false) as u64, inst))
 }
 
-fn match_test(func: &Function, info: &Info, cond: Value, expected_val: Option<Value>, expected_block: Option<usize>) -> Option<BlockTest> {
+pub(super) fn match_test(func: &Function, info: &Info, cond: Value, expected_val: Option<Value>, expected_block: Option<usize>) -> Option<BlockTest> {
     if expected_block.is_some_and(|b| info.def_block[cond.index()] != Some(b) || info.uses.get(cond.index()).copied() != Some(1)) {
         return None;
     }
@@ -155,7 +158,7 @@ fn match_test(func: &Function, info: &Info, cond: Value, expected_val: Option<Va
     None
 }
 
-fn range_of_test(ty: Type, kind: TestKind, want_true: bool) -> Option<Range> {
+pub(super) fn range_of_test(ty: Type, kind: TestKind, want_true: bool) -> Option<Range> {
     let u_max = ty.unsigned_max();
     match kind {
         TestKind::SubCmp { lo, cc, bound } => {
@@ -199,7 +202,7 @@ fn range_of_test(ty: Type, kind: TestKind, want_true: bool) -> Option<Range> {
     }
 }
 
-fn intersect_ranges(ty: Type, r1: Range, r2: Range) -> Option<Range> {
+pub(super) fn intersect_ranges(ty: Type, r1: Range, r2: Range) -> Option<Range> {
     if r1.lo <= r1.hi && r2.lo <= r2.hi {
         let (lo, hi) = (r1.lo.max(r2.lo), r1.hi.min(r2.hi));
         return (lo <= hi).then(|| make_range(ty, lo, hi));
@@ -257,7 +260,7 @@ fn const_bool(func: &Function, info: &Info, val: Value) -> Option<bool> {
     })
 }
 
-fn same_edge(func: &Function, info: &Info, a: &Edge, b: &Edge) -> bool {
+pub(super) fn same_edge(func: &Function, info: &Info, a: &Edge, b: &Edge) -> bool {
     let len = |e: &Edge| if e.synth_bool.is_some() { 1 } else { e.args.len() };
     if a.block != b.block || len(a) != len(b) {
         return false;
@@ -340,7 +343,7 @@ fn match_two_block_range(
     Some((arm, extra))
 }
 
-fn range_fits(r: Range) -> bool {
+pub(super) fn range_fits(r: Range) -> bool {
     r.lo <= r.hi || (r.signed_ok && r.s_hi.abs_diff(r.s_lo) < 256)
 }
 
@@ -485,46 +488,7 @@ fn forward_cached(func: &mut Function, cache: &mut Vec<((Block, Vec<Value>), Blo
     block
 }
 
-fn insert_interval(runs: &mut Vec<Run>, mut cur: u64, hi: u64, hit: Edge) {
-    let (mut added, mut done) = (Vec::new(), false);
-    for r in runs.iter() {
-        if r.hi < cur { continue; }
-        if r.lo > hi { break; }
-        if cur < r.lo { added.push(Run { lo: cur, hi: r.lo - 1, hit: hit.clone() }); }
-        if r.hi >= hi { done = true; break; }
-        cur = r.hi + 1;
-    }
-    if !done && cur <= hi {
-        added.push(Run { lo: cur, hi, hit });
-    }
-    if !added.is_empty() {
-        runs.extend(added);
-        runs.sort_unstable_by_key(|r| r.lo);
-    }
-}
-
-fn build_runs(func: &Function, info: &Info, ty: Type, arms: &[Arm]) -> Vec<Run> {
-    let (mut runs, u_max) = (Vec::new(), ty.unsigned_max());
-    for arm in arms {
-        if arm.range.lo <= arm.range.hi {
-            insert_interval(&mut runs, arm.range.lo, arm.range.hi, arm.hit.clone());
-        } else {
-            insert_interval(&mut runs, arm.range.lo, u_max, arm.hit.clone());
-            insert_interval(&mut runs, 0, arm.range.hi, arm.hit.clone());
-        }
-    }
-    let mut merged: Vec<Run> = Vec::with_capacity(runs.len());
-    for r in runs {
-        if let Some(prev) = merged.last_mut() && prev.hi < u64::MAX && prev.hi + 1 == r.lo && same_edge(func, info, &prev.hit, &r.hit) {
-            prev.hi = r.hi;
-        } else {
-            merged.push(r);
-        }
-    }
-    merged
-}
-
-fn push_node(func: &mut Function, at: Option<(usize, Inst)>, insts: Vec<Inst>) -> Block {
+pub(super) fn push_node(func: &mut Function, at: Option<(usize, Inst)>, insts: Vec<Inst>) -> Block {
     match at {
         Some((b, last)) => {
             func.insts[last.index()].op = Op::Trap;
@@ -608,7 +572,7 @@ fn try_signed_br_table(
     true
 }
 
-fn can_br_table(runs: &[Run]) -> Option<(u64, usize)> {
+pub(super) fn can_br_table(runs: &[Run]) -> Option<(u64, usize)> {
     if runs.len() < 3 {
         return None;
     }
@@ -672,7 +636,10 @@ fn emit_run_check(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Valu
     push_node(func, at, insts)
 }
 
-fn emit_node(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Type), runs: &[Run], (default_blk, cache): (Block, &mut Vec<((Block, Vec<Value>), Block)>)) -> Block {
+pub(super) fn emit_node(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, ty): (Value, Type), runs: &[Run], (default_blk, cache): (Block, &mut Vec<((Block, Vec<Value>), Block)>)) -> Block {
+    if let Some(blk) = try_emit_bitmask_runs(func, info, at, (v, ty), runs, (default_blk, cache)) {
+        return blk;
+    }
     if let Some((min, table_len)) = can_br_table(runs) {
         let mut table = vec![default_blk; table_len];
         for r in runs {
@@ -682,7 +649,7 @@ fn emit_node(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Ty
         return finish_br_table(func, at, (v, ty), (min as i64, false), (default_blk, table));
     }
     if runs.len() <= 2 {
-        let otherwise = if runs.len() == 2 { emit_node(func, None, (v, ty), &runs[1..], (default_blk, cache)) } else { default_blk };
+        let otherwise = if runs.len() == 2 { emit_node(func, info, None, (v, ty), &runs[1..], (default_blk, cache)) } else { default_blk };
         return emit_run_check(func, at, (v, ty), &runs[0], otherwise);
     }
     let mid = match find_cluster(runs) {
@@ -690,8 +657,8 @@ fn emit_node(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Ty
         Some((_, end)) => end,
         None => runs.len() / 2,
     };
-    let left = emit_node(func, None, (v, ty), &runs[..mid], (default_blk, cache));
-    let right = emit_node(func, None, (v, ty), &runs[mid..], (default_blk, cache));
+    let left = emit_node(func, info, None, (v, ty), &runs[..mid], (default_blk, cache));
+    let right = emit_node(func, info, None, (v, ty), &runs[mid..], (default_blk, cache));
     let (pivot, lt) = (func.value(ty), func.value(Type::I8));
     let insts = vec![
         func.add(Op::Const(extend(runs[mid].lo as i64, ty, true)), Some(pivot)),
@@ -741,7 +708,7 @@ fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), m
     let mut runs = if single_mod { Vec::new() } else { build_runs(func, info, ty, &ch.arms) };
     if !single_mod {
         let covered: u64 = runs.iter().map(|r| r.hi.saturating_sub(r.lo).saturating_add(1)).sum();
-        if covered < 4 && ch.two_block_arms == 0 && runs.len() >= ch.arms.len() {
+        if covered < 4 && ch.two_block_arms == 0 && runs.len() >= ch.arms.len() && !can_bitmask_runs(func, info, ty, &runs) {
             return false;
         }
     }
@@ -758,7 +725,7 @@ fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), m
         let r = ch.arms[0].range;
         emit_sub_range(func, Some((b0, last0)), (ch.val, ty), (r.s_lo, r.s_hi.abs_diff(r.s_lo)), (&ch.arms[0].hit, default_blk));
     } else if !try_signed_br_table(func, (b0, last0), (ch.val, ty), &ch.arms, (default_blk, &mut cache)) {
-        emit_node(func, Some((b0, last0)), (ch.val, ty), &runs, (default_blk, &mut cache));
+        emit_node(func, info, Some((b0, last0)), (ch.val, ty), &runs, (default_blk, &mut cache));
     }
     for b in ch.chain_blocks {
         for inst in func.blocks[b].insts.drain(..) {
@@ -772,7 +739,41 @@ fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), m
     true
 }
 
+fn try_rewrite_br_table(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), cleared: &mut [bool]) -> bool {
+    let Op::BrTable(idx, default_blk, ref targets) = func.insts[last0.index()].op else {
+        return false;
+    };
+    let ty = func.ty(idx);
+    let default_edge = edge_of(func, default_blk, &[]);
+    let u_max = ty.unsigned_max();
+    let mut arms = Vec::new();
+    for (i, &t) in targets.iter().enumerate() {
+        let u = i as u64;
+        if u > u_max {
+            break;
+        }
+        let hit = edge_of(func, t, &[]);
+        if !same_edge(func, info, &hit, &default_edge) {
+            arms.push(Arm { range: make_range(ty, u, u), hit });
+        }
+    }
+    let runs = build_runs(func, info, ty, &arms);
+    if runs.is_empty() {
+        func.insts[last0.index()].op = Op::Jump(default_edge.block, default_edge.args);
+        cleared[b0] = true;
+        return true;
+    }
+    if runs.len() > 2 && !can_bitmask_runs(func, info, ty, &runs) {
+        return false;
+    }
+    let mut cache = Vec::new();
+    emit_node(func, info, Some((b0, last0)), (idx, ty), &runs, (default_edge.block, &mut cache));
+    cleared[b0] = true;
+    true
+}
+
 pub(crate) fn run(func: &mut Function) -> Domain {
+    if func.coroutine.is_some() { return Domain::NONE; }
     let info = analyze(func);
     let initial_blocks = func.blocks.len();
     let mut cleared = vec![false; initial_blocks];
@@ -782,8 +783,11 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             continue;
         }
         let Some(&last0) = func.blocks[b0].insts.last() else { continue };
-        let Some(ch) = collect_chain(func, &info, b0, &cleared) else { continue };
-        changed |= rewrite_chain(func, &info, (b0, last0), ch, &mut cleared);
+        if let Some(ch) = collect_chain(func, &info, b0, &cleared) {
+            changed |= rewrite_chain(func, &info, (b0, last0), ch, &mut cleared);
+        } else if try_rewrite_expr(func, &info, (b0, last0), &mut cleared) || try_rewrite_br_table(func, &info, (b0, last0), &mut cleared) {
+            changed = true;
+        }
     }
     if changed {
         func.bump_cfg();

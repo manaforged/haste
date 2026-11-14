@@ -85,6 +85,13 @@ impl Emit<'_> {
         if all_a || all_b {
             let src_val = if all_a { a } else { b };
             let off = if all_a { 0 } else { count };
+            if (0..c).all(|l| usize::from(indices[l] - off) == l) {
+                let src = self.fin(src_val, dst);
+                if src != dst {
+                    self.asm.movaps(dst, src);
+                }
+                return;
+            }
             let imm = match (lane.bytes(), count) {
                 (4, 4) => Some(
                     ((indices[0] - off) & 3)
@@ -114,8 +121,50 @@ impl Emit<'_> {
                 return;
             }
         }
+        let bytes = lane.bytes() as usize;
+        if bytes * c == 16 {
+            let mut bidx = [0x80_u8; 16];
+            for l in 0..c {
+                let idx = indices[l];
+                if idx < 2 * count {
+                    let base = if idx < count {
+                        idx * bytes as u8
+                    } else {
+                        16 + (idx - count) * bytes as u8
+                    };
+                    for k in 0..bytes {
+                        bidx[l * bytes + k] = base + k as u8;
+                    }
+                }
+            }
+            if self.features.ssse3 {
+                let s = bidx[0];
+                if (1..16).contains(&s) && (0..16_u8).all(|k| bidx[k as usize] == s + k) {
+                    self.emit_two_vec_imm(0x0F, dst, b, a, s);
+                    return;
+                }
+            }
+            if self.features.sse41 {
+                let mut imm = 0_u8;
+                let mut ok = true;
+                for w in 0..8_u8 {
+                    let lo = bidx[usize::from(2 * w)];
+                    let hi = bidx[usize::from(2 * w + 1)];
+                    if lo == 2 * w && hi == 2 * w + 1 {
+                    } else if lo == 16 + 2 * w && hi == 17 + 2 * w {
+                        imm |= 1 << w;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    self.emit_two_vec_imm(0x0E, dst, a, b, imm);
+                    return;
+                }
+            }
+        }
         if self.features.ssse3 {
-            let bytes = lane.bytes() as usize;
             let mut mask_a = [0x80_u8; 16];
             let mut mask_b = [0x80_u8; 16];
             let mut uses_a = false;
@@ -179,7 +228,22 @@ impl Emit<'_> {
         self.asm.alu_imm(Alu::Add, Reg::Rsp, 48);
     }
 
+    fn emit_two_vec_imm(&mut self, op: u8, dst: Xmm, stay: Value, src_val: Value, imm: u8) {
+        let scratch = if dst == X0 { X1 } else { X0 };
+        let mut src = self.fin(src_val, scratch);
+        if src == dst {
+            self.asm.movaps(scratch, src);
+            src = scratch;
+        }
+        self.fget(dst, stay);
+        self.asm.sse_imm(&[0x66], &[0x0F, 0x3A, op], dst.0, src, imm);
+    }
+
     fn vector_shuffle_dyn_ssse3(&mut self, count: u8, a: Value, b: Value, mask_v: Value, dst: Xmm) {
+        if a == b && count == 16 {
+            self.packed_regs(&[0x66], &[0x0F, 0x38, 0x00], (a, mask_v), dst);
+            return;
+        }
         self.fget(X0, mask_v);
         self.splat_imm(Lane::I8, X1, i64::from(count - 1));
         self.asm.movaps(X2, X0);

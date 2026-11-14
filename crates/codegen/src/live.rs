@@ -98,13 +98,18 @@ pub(crate) fn for_effective_operands(data: &InstData, sib: &[Option<Sib>], elide
     if data.result.is_some_and(|res| elided.get(res.index()) == Some(&true)) {
         return;
     }
-    let visit_addr = |addr: Value, f: &mut dyn FnMut(Value)| match sib.get(addr.index()).copied().flatten() {
-        Some(mode) => {
-            if let SibBase::Value(base) = mode.base {
-                f(base);
-            }
-            f(mode.index);
+    let visit_mode = |mode: Sib, f: &mut dyn FnMut(Value)| {
+        if let SibBase::Value(base) = mode.base {
+            f(base);
         }
+        f(mode.index);
+    };
+    if let Some(mode) = data.result.and_then(|res| sib.get(res.index()).copied().flatten()) {
+        visit_mode(mode, &mut f);
+        return;
+    }
+    let visit_addr = |addr: Value, f: &mut dyn FnMut(Value)| match sib.get(addr.index()).copied().flatten() {
+        Some(mode) => visit_mode(mode, f),
         None => f(addr),
     };
     match &data.op {

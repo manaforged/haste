@@ -1,11 +1,12 @@
 //! Reuses what memory holds along straight-line code: a load of the bytes an earlier load or store on the same path read or wrote, with no write of unknown reach between them, takes that value.
 
 mod coalesce;
+mod dom;
 mod pack;
 
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
+use dom::{BlockWrites, record_base};
 
-use crate::cfg::Cfg;
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, compute_affine, may_alias};
 use crate::merge::{find, identity, rename};
@@ -189,21 +190,41 @@ fn forward_subword(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Op
     false
 }
 
+enum ConcatHalf {
+    Val(Value, bool),
+    Const(i64),
+}
+
+fn resolve_concat_half(known: &KnownLoads, loc: MemLoc, offset: i64, consts: &[Option<i64>]) -> Option<ConcatHalf> {
+    if let Some(v) = known.get(loc.base, offset, Type::I32) {
+        return Some(ConcatHalf::Val(v, false));
+    }
+    if let Some(v) = known.get(loc.base, offset, Type::F32) {
+        return Some(ConcatHalf::Val(v, true));
+    }
+    match assemble_const(known, MemLoc { offset, size: 4, ..loc }, Type::I32, consts) {
+        Some(Assembled::Int(imm)) => Some(ConcatHalf::Const(imm)),
+        _ => None,
+    }
+}
+
+fn materialize_concat_half(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, half: ConcatHalf) -> Value {
+    match half {
+        ConcatHalf::Val(v, true) => emit_op(func, state, kept, Type::I32, Op::Convert(Convert::Bitcast, v)),
+        ConcatHalf::Val(v, false) => v,
+        ConcatHalf::Const(imm) => emit_op(func, state, kept, Type::I32, Op::Const(imm)),
+    }
+}
+
 fn forward_concat(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, known: &KnownLoads, inst: Inst, loc: MemLoc, ty: Type) -> bool {
     if !matches!(ty, Type::I64 | Type::F64) {
         return false;
     }
     let Some(hi_off) = loc.offset.checked_add(4) else { return false };
-    let half_at = |offset: i64| {
-        known
-            .get(loc.base, offset, Type::I32)
-            .map(|v| (v, false))
-            .or_else(|| known.get(loc.base, offset, Type::F32).map(|v| (v, true)))
-    };
-    let Some((lo, lo_float)) = half_at(loc.offset) else { return false };
-    let Some((hi, hi_float)) = half_at(hi_off) else { return false };
-    let lo32 = if lo_float { emit_op(func, state, kept, Type::I32, Op::Convert(Convert::Bitcast, lo)) } else { lo };
-    let hi32 = if hi_float { emit_op(func, state, kept, Type::I32, Op::Convert(Convert::Bitcast, hi)) } else { hi };
+    let Some(lo_half) = resolve_concat_half(known, loc, loc.offset, state.consts) else { return false };
+    let Some(hi_half) = resolve_concat_half(known, loc, hi_off, state.consts) else { return false };
+    let lo32 = materialize_concat_half(func, state, kept, lo_half);
+    let hi32 = materialize_concat_half(func, state, kept, hi_half);
     let lo64 = emit_op(func, state, kept, Type::I64, Op::Convert(Convert::Uextend, lo32));
     let hi64 = emit_op(func, state, kept, Type::I64, Op::Convert(Convert::Uextend, hi32));
     let c32 = emit_op(func, state, kept, Type::I64, Op::Const(32));
@@ -218,8 +239,27 @@ fn forward_concat(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Opt
     true
 }
 
+fn const_eq_for_ty(consts: &[Option<i64>], ty: Type, a: Value, b: Value) -> bool {
+    let (Some(ca), Some(cb)) = (
+        consts.get(a.index()).copied().flatten(),
+        consts.get(b.index()).copied().flatten(),
+    ) else {
+        return false;
+    };
+    if ty.is_small_int() {
+        let mask = ty.unsigned_max();
+        (ca as u64 & mask) == (cb as u64 & mask)
+    } else if ty == Type::F32 {
+        (ca as u32) == (cb as u32)
+    } else if ty == Type::F64 {
+        ca == cb
+    } else {
+        false
+    }
+}
+
 /// Drops from `block` each load whose bytes `known` holds, recording its replacement in `subst`, eliminates dead overwritten stores, and leaves in `known` what memory holds at the block's end; returns `(changed, renamed)`.
-fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut KnownLoads) -> (bool, bool) {
+fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut KnownLoads, bases: &mut Vec<(MemBase, MemRoot)>) -> (bool, bool) {
     let insts = std::mem::take(&mut func.blocks[block.index()].insts);
     let mut bufs = ScanBuf {
         kept: Vec::with_capacity(insts.len()),
@@ -248,6 +288,9 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
             Effect::Read(loc, ty, result) => match known.get(loc.base, loc.offset, ty) {
                 Some(value) => {
                     state.subst[result.index()] = value;
+                    if let Some(imm) = state.consts.get(value.index()).copied().flatten() {
+                        state.consts[result.index()] = Some(imm);
+                    }
                     renamed = true;
                     changed = true;
                     continue;
@@ -302,10 +345,18 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                                 && (slot_unescaped(state.prov, cs.loc) || safe_read || cs.loc.base == loc.base)
                         });
                     }
+                    record_base(bases, loc);
                 }
             },
             Effect::Write(loc, ty, value) => {
+                if let Some(prev) = known.get(loc.base, loc.offset, ty)
+                    && (prev == value || const_eq_for_ty(state.consts, ty, prev, value))
+                {
+                    changed = true;
+                    continue;
+                }
                 known.write(loc, ty, value, state.prov);
+                record_base(bases, loc);
                 let safe_write = slot_unescaped(state.prov, loc);
                 bufs.const_stores.retain(|cs| {
                     !may_alias(loc, cs.loc, state.prov)
@@ -352,6 +403,7 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
         }
         bufs.kept.push(Some(inst));
     }
+    bases.retain(|&(base, _)| !known.entries_for(base).is_empty());
     func.blocks[block.index()].insts = bufs.kept.into_iter().flatten().collect();
     (changed, renamed)
 }
@@ -582,85 +634,6 @@ fn sink_terminator_defs(func: &mut Function) -> bool {
     changed
 }
 
-struct BlockWrites<'a> {
-    cfg: &'a Cfg,
-    prov: &'a Provenance,
-    writes: &'a [Vec<Inst>],
-    trycall: &'a [bool],
-}
-
-fn collect_block_writes(func: &Function) -> (Vec<Vec<Inst>>, Vec<bool>) {
-    let mut writes = vec![Vec::new(); func.blocks.len()];
-    let mut trycall = vec![false; func.blocks.len()];
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        trycall[b_idx] = func.last(Block(b_idx as u32)).is_some_and(|op| matches!(op, Op::TryCall { .. }));
-        for &inst in &block.insts {
-            if matches!(
-                func.insts[inst.index()].op,
-                Op::Store(..)
-                    | Op::StackStore(..)
-                    | Op::Copy(..)
-                    | Op::Move(..)
-                    | Op::AtomicLoad(_)
-                    | Op::AtomicStore(..)
-                    | Op::AtomicRmw(..)
-                    | Op::AtomicCas(..)
-                    | Op::Fence
-                    | Op::Call { .. }
-                    | Op::TryCall { .. }
-            ) {
-                writes[b_idx].push(inst);
-            }
-        }
-    }
-    (writes, trycall)
-}
-
-fn entry_known(func: &Function, bw: &BlockWrites<'_>, known_out: &[KnownLoads], block: Block) -> KnownLoads {
-    if Some(block) == bw.cfg.entry {
-        return KnownLoads::new();
-    }
-    if let Some(pred) = bw.cfg.single_pred(block) {
-        return if bw.trycall[pred.index()] { KnownLoads::new() } else { known_out[pred.index()].clone() };
-    }
-    let Some(dom) = bw.cfg.idom[block.index()] else {
-        return KnownLoads::new();
-    };
-    if bw.trycall[dom.index()] {
-        return KnownLoads::new();
-    }
-    let mut known = known_out[dom.index()].clone();
-    if known.is_empty() {
-        return known;
-    }
-    let mut in_region = vec![false; func.blocks.len()];
-    let mut work = Vec::new();
-    for &pred in bw.cfg.preds_of(block) {
-        if bw.cfg.reachable[pred.index()] && pred != dom && !in_region[pred.index()] {
-            in_region[pred.index()] = true;
-            work.push(pred);
-        }
-    }
-    while let Some(m) = work.pop() {
-        if bw.trycall[m.index()] {
-            return KnownLoads::new();
-        }
-        for &w in &bw.writes[m.index()] {
-            known.invalidate(func, &func.insts[w.index()].op, bw.prov);
-            if known.is_empty() {
-                return known;
-            }
-        }
-        for &pred in bw.cfg.preds_of(m) {
-            if bw.cfg.reachable[pred.index()] && pred != dom && !in_region[pred.index()] {
-                in_region[pred.index()] = true;
-                work.push(pred);
-            }
-        }
-    }
-    known
-}
-
 /// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between; returns the effect domains modified.
 pub(crate) fn run(func: &mut Function) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
@@ -681,18 +654,19 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             _ => {}
         }
     }
-    let (writes, trycall) = collect_block_writes(func);
-    let bw = BlockWrites { cfg: &cfg, prov: &prov, writes: &writes, trycall: &trycall };
+    let mut bw = BlockWrites::new(func, &cfg, &prov);
     let mut subst = identity(func.types.len());
     let mut state = State { prov: &prov, selects: &selects, consts: &mut consts, subst: &mut subst };
     let mut renamed = false;
     let mut known_out: Vec<KnownLoads> = (0..func.blocks.len()).map(|_| KnownLoads::new()).collect();
+    let mut block_bases: Vec<Vec<(MemBase, MemRoot)>> = vec![Vec::new(); func.blocks.len()];
     for &block in &cfg.rpo {
-        let mut known = entry_known(func, &bw, &known_out, block);
-        let (block_changed, block_renamed) = scan(func, block, &mut state, &mut known);
+        let (mut known, mut bases) = bw.entry_known(func, state.subst, &known_out, &block_bases, block);
+        let (block_changed, block_renamed) = scan(func, block, &mut state, &mut known, &mut bases);
         changed |= block_changed;
         renamed |= block_renamed;
         known_out[block.index()] = known;
+        block_bases[block.index()] = bases;
     }
     if renamed {
         rename(func, state.subst);

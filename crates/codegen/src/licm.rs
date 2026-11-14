@@ -210,6 +210,11 @@ fn check_cand_flow(
     if shape.rpo.iter().any(|b| out_state[b.index()].is_none()) {
         return None;
     }
+    if shape.rpo.iter().any(|b| {
+        !matches!(func.last(*b), Some(Op::Jump(..) | Op::Brif(..) | Op::Return(_) | Op::Trap))
+    }) {
+        return None;
+    }
     let dirty_out = out_state.iter().map(|st| st.is_some_and(|(_, d)| d)).collect();
     Some((in_state, dirty_out))
 }
@@ -360,6 +365,15 @@ fn rewrite_cand(
         }
         state.func.blocks[b.index()].insts = kept;
         if let Some(&term) = state.func.blocks[b.index()].insts.last() {
+            if dirty_out[b.index()]
+                && matches!(cand.base, PromoteBase::Addr(_))
+                && matches!(state.func.insts[term.index()].op, Op::Return(_))
+            {
+                let store_inst = state.func.add(base_mem_op(cand, Some(cur)), None);
+                let blk = &mut state.func.blocks[b.index()].insts;
+                let at = blk.len() - 1;
+                blk.insert(at, store_inst);
+            }
             record_term_edges(state.func, state.each, &dirty_out, &merge_phis, (b, term, cur), &mut exits);
         }
     }

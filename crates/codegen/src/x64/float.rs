@@ -34,6 +34,7 @@ impl Emit<'_> {
 
     pub(super) fn zero_xmm(&mut self, xmm: Xmm) {
         self.asm.sse(&[0x66], &[0x0F, 0x57], xmm.0, xmm);
+        self.clobber_xmm(xmm);
     }
 
     pub(super) fn float_unary(&mut self, op: Unary, x: Value, result: Value) -> Result<(), String> {
@@ -45,6 +46,7 @@ impl Emit<'_> {
                 let sign = ty.sign_bit();
                 self.asm.mov_imm(Reg::Rcx, if neg { sign } else { !sign });
                 self.asm.alu(if neg { Alu::Xor } else { Alu::And }, Reg::Rax, Reg::Rcx);
+                self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
                 self.put(result, Reg::Rax);
                 return Ok(());
             }
@@ -65,6 +67,7 @@ impl Emit<'_> {
             }
             Some(_) => self.round_baseline(op, ty, dst),
         }
+        self.clobber_xmm(dst);
         self.fput(result, dst);
         Ok(())
     }
@@ -90,6 +93,8 @@ impl Emit<'_> {
         self.asm.alu_sized(size, Alu::Or, Reg::Rcx, Reg::Rax);
         self.asm.movq_in(dst, Reg::Rcx);
         self.asm.bind(done);
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
+        self.clobber_xmms(&[X1, X2, dst]);
     }
 
     /// Moves the truncated xmm1 one down for a floor, or up for a ceiling, when truncating `x` moved it the other way; `one` holds the bits of 1.0.
@@ -123,6 +128,7 @@ impl Emit<'_> {
                 self.asm.jcc(Cond::Np, done);
                 self.asm.movaps(dst, X0);
                 self.asm.bind(done);
+                self.clobber_xmms(&[X0, X1, dst]);
                 self.fput(result, dst);
                 return Ok(());
             }
@@ -141,6 +147,7 @@ impl Emit<'_> {
             None => {
                 let source = if self.xmm_of(y) == Some(dst) && x != y {
                     self.asm.movaps(X1, dst);
+                    self.clobber_xmm(X1);
                     X1.into()
                 } else {
                     self.foperand(y, X1)
@@ -149,6 +156,7 @@ impl Emit<'_> {
                 self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, source);
             }
         }
+        self.clobber_xmm(dst);
         self.fput(result, dst);
         Ok(())
     }
@@ -184,6 +192,7 @@ impl Emit<'_> {
             };
             self.fget(dst, a);
             self.asm.vex_fma(is_vec, is_f64, (dst, src_b), src_c);
+            self.clobber_xmms(&[X1, X2, dst]);
             self.fput(result, dst);
             return Ok(());
         }
@@ -193,6 +202,7 @@ impl Emit<'_> {
         self.asm.sse(prefix, &[0x0F, 0x59], X0.0, mul_src);
         let add_src: Rm = if is_vec { self.fin(c, X1).into() } else { self.foperand(c, X1) };
         self.asm.sse(prefix, &[0x0F, 0x58], X0.0, add_src);
+        self.clobber_xmms(&[X0, X1]);
         self.fput(result, X0);
         Ok(())
     }
@@ -205,13 +215,16 @@ impl Emit<'_> {
         self.asm.group3(Group3::Not, Reg::Rdx);
         self.asm.alu(Alu::And, Reg::Rax, Reg::Rdx);
         self.asm.alu(Alu::Or, Reg::Rax, Reg::Rcx);
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
         self.put(result, Reg::Rax);
     }
 
     /// Compares by `ucomis`, the less-than forms with swapped operands; a compare fused with the next branch leaves its one condition in the flags.
     pub(super) fn fcmp(&mut self, cc: FloatCC, x: Value, y: Value, result: Value) {
         if self.ty(x).is_vector() {
+            self.invalidate_spills();
             self.vector_fcmp(cc, x, y, result);
+            self.invalidate_spills();
             return;
         }
         let (a, b, cond) = match cc {
@@ -236,6 +249,7 @@ impl Emit<'_> {
             self.asm.alu32(if equal { Alu::And } else { Alu::Or }, Reg::Rax, Reg::Rcx);
         }
         self.asm.load(Size::B, Reg::Rax, Reg::Rax);
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
         self.put(result, Reg::Rax);
     }
 
@@ -245,6 +259,7 @@ impl Emit<'_> {
             Convert::Fpromote | Convert::Fdemote => {
                 let (dst, source) = (self.fdst(result), self.foperand(x, X1));
                 self.asm.sse(&[scalar(self.ty(x))], &[0x0F, 0x5A], dst.0, source);
+                self.clobber_xmm(dst);
                 self.fput(result, dst);
             }
             Convert::FromSint | Convert::FromUint if self.ty(x) == Type::I128 => {
@@ -254,11 +269,14 @@ impl Emit<'_> {
                 self.get(Reg::Rax, x, Ext::Sign);
                 let dst = self.fdst(result);
                 self.asm.sse_wide(scalar(to), 0x2A, dst.0, Reg::Rax);
+                self.clobber_xmm(dst);
                 self.fput(result, dst);
             }
             Convert::FromUint => {
                 let dst = self.fdst(result);
                 self.from_unsigned(x, to, dst);
+                self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
+                self.clobber_xmm(dst);
                 self.fput(result, dst);
             }
             Convert::ToSintSat | Convert::ToUintSat if to != Type::I128 => {
@@ -266,6 +284,8 @@ impl Emit<'_> {
                 let signed = op == Convert::ToSintSat;
                 if signed { self.to_signed() } else { self.to_unsigned() }
                 self.clamp(to, signed);
+                self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
+                self.clobber_xmms(&[X0, X1, X2]);
                 self.put(result, Reg::Rax);
             }
             Convert::Bitcast if to.in_float_register() && self.ty(x).in_float_register() => {

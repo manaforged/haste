@@ -5,42 +5,29 @@ mod vector;
 /// `imm` of type `ty` extended to 64 bits, by its sign when `signed`.
 pub(crate) fn extend(imm: i64, ty: Type, signed: bool) -> i64 {
     let bits = ty.bits();
-    if bits >= 64 {
-        return imm;
-    }
+    if bits >= 64 { return imm; }
     let shift = 64 - bits;
-    match signed {
-        true => imm << shift >> shift,
-        false => ((imm as u64) << shift >> shift) as i64,
-    }
+    if signed { imm << shift >> shift } else { ((imm as u64) << shift >> shift) as i64 }
 }
 
 /// Whether `cc` holds between the constants `x` and `y` of type `ty`.
 pub(crate) fn holds(cc: IntCC, ty: Type, x: i64, y: i64) -> bool {
     let (x, y) = (extend(x, ty, cc.is_signed()), extend(y, ty, cc.is_signed()));
     match cc {
-        IntCC::Equal => x == y,
-        IntCC::NotEqual => x != y,
-        IntCC::SignedLessThan => x < y,
-        IntCC::SignedGreaterThanOrEqual => x >= y,
-        IntCC::SignedGreaterThan => x > y,
-        IntCC::SignedLessThanOrEqual => x <= y,
-        IntCC::UnsignedLessThan => (x as u64) < y as u64,
-        IntCC::UnsignedGreaterThanOrEqual => x as u64 >= y as u64,
-        IntCC::UnsignedGreaterThan => x as u64 > y as u64,
-        IntCC::UnsignedLessThanOrEqual => x as u64 <= y as u64,
+        IntCC::Equal => x == y, IntCC::NotEqual => x != y,
+        IntCC::SignedLessThan => x < y, IntCC::SignedGreaterThanOrEqual => x >= y,
+        IntCC::SignedGreaterThan => x > y, IntCC::SignedLessThanOrEqual => x <= y,
+        IntCC::UnsignedLessThan => (x as u64) < y as u64, IntCC::UnsignedGreaterThanOrEqual => x as u64 >= y as u64,
+        IntCC::UnsignedGreaterThan => (x as u64) > y as u64, IntCC::UnsignedLessThanOrEqual => (x as u64) <= y as u64,
     }
 }
 
 /// `a op b` on two constants, for the operations that wrap the same at every width.
 pub(crate) fn constant(op: Binary, a: i64, b: i64) -> Option<i64> {
     match op {
-        Binary::Iadd => Some(a.wrapping_add(b)),
-        Binary::Isub => Some(a.wrapping_sub(b)),
-        Binary::Imul => Some(a.wrapping_mul(b)),
-        Binary::Band => Some(a & b),
-        Binary::Bor => Some(a | b),
-        Binary::Bxor => Some(a ^ b),
+        Binary::Iadd => Some(a.wrapping_add(b)), Binary::Isub => Some(a.wrapping_sub(b)),
+        Binary::Imul => Some(a.wrapping_mul(b)), Binary::Band => Some(a & b),
+        Binary::Bor => Some(a | b), Binary::Bxor => Some(a ^ b),
         _ => None,
     }
 }
@@ -89,24 +76,14 @@ fn unary(op: Unary, ty: Type, a: i64) -> Option<i64> {
 
 /// The constant that leaves the left operand of `op` unchanged when it stands on the right.
 fn unit(op: Binary) -> Option<i64> {
-    match op {
-        Binary::Iadd | Binary::Isub | Binary::Bor | Binary::Bxor => Some(0),
-        Binary::Imul => Some(1),
-        Binary::Band => Some(-1),
-        _ => None,
-    }
+    match op { Binary::Iadd | Binary::Isub | Binary::Bor | Binary::Bxor => Some(0), Binary::Imul => Some(1), Binary::Band => Some(-1), _ => None }
 }
 
 /// Whether `x op y` on constants of type `ty` fits that type, read as signed when `signed`.
 pub(crate) fn fits(op: Binary, signed: bool, ty: Type, (x, y): (i64, i64)) -> Option<bool> {
     let widen = |value: i64| if signed { i128::from(extend(value, ty, true)) } else { i128::from(extend(value, ty, false) as u64) };
     let (x, y) = (widen(x), widen(y));
-    let result = match op {
-        Binary::Iadd => x + y,
-        Binary::Isub => x - y,
-        Binary::Imul => x * y,
-        _ => return None,
-    };
+    let result = match op { Binary::Iadd => x + y, Binary::Isub => x - y, Binary::Imul => x * y, _ => return None };
     let bits = ty.bits();
     let (low, high) = if signed { (-(1_i128 << (bits - 1)), (1_i128 << (bits - 1)) - 1) } else { (0, (1_i128 << bits) - 1) };
     Some((low..=high).contains(&result))
@@ -173,15 +150,9 @@ pub(crate) fn known_bits(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>
         Op::Unary(Unary::Bnot, a) => { let (z, o) = rec(a); (o & w, z & w) }
         Op::Binary(Binary::Band, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); ((za | zb) & w, oa & ob & w) }
         Op::Binary(Binary::Bor, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); (za & zb & w, (oa | ob) & w) }
-        Op::Binary(Binary::Bxor, a, b) => {
-            let ((za, oa), (zb, ob)) = (rec(a), rec(b));
-            (((za & zb) | (oa & ob)) & w, ((za & ob) | (oa & zb)) & w)
-        }
+        Op::Binary(Binary::Bxor, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); (((za & zb) | (oa & ob)) & w, ((za & ob) | (oa & zb)) & w) }
         Op::Binary(op @ (Binary::Ushr | Binary::Ishl), a, sh) => known(sh).map_or((0, 0), |c| known_shift_bits(op, ty, rec(a), c)),
-        Op::Convert(Convert::Uextend, a) if func.ty(a).is_small_int() => {
-            let ((za, oa), aw) = (rec(a), func.ty(a).unsigned_max());
-            ((za | !aw) & w, oa & aw)
-        }
+        Op::Convert(Convert::Uextend, a) if func.ty(a).is_small_int() => { let ((za, oa), aw) = (rec(a), func.ty(a).unsigned_max()); ((za | !aw) & w, oa & aw) }
         Op::Convert(Convert::Ireduce, a) if func.ty(a).is_small_int() => { let (za, oa) = rec(a); (za & w, oa & w) }
         Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => (w & !1, 0),
         Op::Select(_, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); (za & zb & w, oa & ob & w) }
@@ -198,28 +169,39 @@ pub(super) struct Fold {
 }
 
 impl Fold {
-    pub(super) fn find(&self, value: Value) -> Value {
-        if value.index() < self.subst.len() { crate::merge::find(&self.subst, value) } else { value }
-    }
-
-    pub(super) fn known(&self, value: Value) -> Option<i64> {
-        self.consts.get(self.find(value).index()).copied().flatten()
-    }
-
-    fn def_inst(&self, value: Value) -> Option<Inst> {
-        self.defs.get(self.find(value).index()).copied().flatten()
-    }
-
-    fn both(&self, x: Value, y: Value) -> Option<(i64, i64)> {
-        Some((self.known(x)?, self.known(y)?))
-    }
+    pub(super) fn find(&self, value: Value) -> Value { if value.index() < self.subst.len() { crate::merge::find(&self.subst, value) } else { value } }
+    pub(super) fn known(&self, value: Value) -> Option<i64> { self.consts.get(self.find(value).index()).copied().flatten() }
+    fn def_inst(&self, value: Value) -> Option<Inst> { self.defs.get(self.find(value).index()).copied().flatten() }
+    fn both(&self, x: Value, y: Value) -> Option<(i64, i64)> { Some((self.known(x)?, self.known(y)?)) }
 
     fn evaluate(&self, func: &Function, op: &Op, ty: Type) -> Option<i64> {
         evaluate_wrapped(func, op, ty, &|value| self.known(value)).or_else(|| match *op {
             Op::Binary(op, x, y) if ty.is_small_int() => self.absorbed(op, ty, x, y).map(|v| extend(v, ty, true)),
             Op::Icmp(cc, x, y) => crate::algebra::non_null_cmp(func, &|v| self.def_inst(v), &|v| self.known(v), (cc, x, y)).map(i64::from),
+            Op::Load(addr, off) if !func.rodata_bytes.is_empty() && ty.is_small_int() => self.rodata_load(func, ty, addr, off),
             _ => None,
         })
+    }
+
+    fn rodata_load(&self, func: &Function, ty: Type, mut addr: Value, off: i32) -> Option<i64> {
+        let mut total = i64::from(off);
+        for _ in 0..4 {
+            match *self.def(func, addr)? {
+                Op::Symbol(sym) => {
+                    let (start, size) = (usize::try_from(total).ok()?, usize::try_from(ty.bytes()).ok()?);
+                    let (_, bytes) = func.rodata_bytes.iter().find(|&&(s, _)| s == sym)?;
+                    let mut raw = [0_u8; 8];
+                    raw[..size].copy_from_slice(bytes.get(start..start.checked_add(size)?)?);
+                    return Some(extend(u64::from_le_bytes(raw) as i64, ty, true));
+                }
+                Op::Binary(Binary::Iadd, a, b) => {
+                    let (base, c) = if let Some(k) = self.known(b) { (a, k) } else { (b, self.known(a)?) };
+                    (total, addr) = (total.checked_add(c)?, base);
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     fn non_null(&self, func: &Function, value: Value) -> bool {
@@ -271,23 +253,12 @@ impl Fold {
     fn identity(&self, func: &Function, op: &Op) -> Option<Value> {
         match *op {
             Op::Select(condition, x, y) => {
-                if self.find(x) == self.find(y) {
-                    return Some(x);
-                }
-                if let Some(known) = self.known(condition) {
-                    return Some(if known != 0 { x } else { y });
-                }
-                if func.ty(condition) == func.ty(x)
-                    && self.boolean(func, condition)
-                    && self.known(x) == Some(1)
-                    && self.known(y) == Some(0)
-                {
+                if self.find(x) == self.find(y) { return Some(x); }
+                if let Some(known) = self.known(condition) { return Some(if known != 0 { x } else { y }); }
+                if func.ty(condition) == func.ty(x) && self.boolean(func, condition) && self.known(x) == Some(1) && self.known(y) == Some(0) {
                     return Some(condition);
                 }
-                if func.ty(condition) == func.ty(x)
-                    && self.find(condition) == self.find(x)
-                    && self.known(y).is_some_and(|imm| extend(imm, func.ty(x), false) == 0)
-                {
+                if func.ty(condition) == func.ty(x) && self.find(condition) == self.find(x) && self.known(y).is_some_and(|imm| extend(imm, func.ty(x), false) == 0) {
                     return Some(x);
                 }
                 if let Some(&Op::Icmp(cc, lhs, rhs)) = self.def(func, condition) {
@@ -307,9 +278,7 @@ impl Fold {
                             if let Some((eq_cc, eq_c)) = norm {
                                 let is_c = |v: Value| self.known(v).is_some_and(|v_imm| extend(v_imm, ty, false) == eq_c);
                                 let is_var = |v: Value| self.find(v) == self.find(var);
-                                if (eq_cc == IntCC::Equal && is_c(x) && is_var(y)) || (eq_cc == IntCC::NotEqual && is_var(x) && is_c(y)) {
-                                    return Some(var);
-                                }
+                                if (eq_cc == IntCC::Equal && is_c(x) && is_var(y)) || (eq_cc == IntCC::NotEqual && is_var(x) && is_c(y)) { return Some(var); }
                             }
                         }
                     }
@@ -372,9 +341,7 @@ impl Fold {
                 _ => None,
             };
         }
-        if op != Binary::Bxor {
-            return None;
-        }
+        if op != Binary::Bxor { return None; }
         [(x, y), (y, x)].into_iter().find_map(|(inner, other)| match *self.def(func, inner)? {
             Op::Binary(Binary::Bxor, a, b) if self.same(ty, b, other) => Some(a),
             Op::Binary(Binary::Bxor, a, b) if self.same(ty, a, other) => Some(b),
@@ -458,13 +425,8 @@ impl Fold {
             }
             Op::BrTable(index, default, targets) => {
                 let target = if let Some(known) = self.known(*index) {
-                    let i = extend(known, types[index.index()], false) as u64;
-                    usize::try_from(i).ok().and_then(|at| targets.get(at).copied()).unwrap_or(*default)
-                } else if targets.iter().all(|target| target == default) {
-                    *default
-                } else {
-                    return false;
-                };
+                    usize::try_from(extend(known, types[index.index()], false) as u64).ok().and_then(|at| targets.get(at).copied()).unwrap_or(*default)
+                } else if targets.iter().all(|target| target == default) { *default } else { return false };
                 *op = Op::Jump(target, Vec::new());
                 true
             }
@@ -495,20 +457,14 @@ impl Fold {
     /// Moves the edge to `target` with `args` along the blocks that only jump on, or only branch on a parameter the edge makes a constant, to the first block that does more, keeping `uses` counting the edge's new arguments.
     fn retarget(&self, func: &Function, (uses, pinned): (&mut [u32], &[bool]), target: &mut Block, args: &mut Vec<Value>) -> bool {
         let Some((first, first_values)) = self.step(func, (uses, pinned), *target, args) else { return false };
-        if first == *target {
-            return false;
-        }
+        if first == *target { return false; }
         let (mut at, mut values, mut seen) = (first, first_values, vec![*target, first]);
         while let Some((next, next_values)) = self.step(func, (uses, pinned), at, &values) {
-            if seen.contains(&next) {
-                return false;
-            }
+            if seen.contains(&next) { return false; }
             seen.push(next);
             (at, values) = (next, next_values);
         }
-        if !self.agrees(func, at, &values) {
-            return false;
-        }
+        if !self.agrees(func, at, &values) { return false; }
         args.iter().for_each(|value| uses[value.index()] -= 1);
         values.iter().for_each(|value| uses[value.index()] += 1);
         (*target, *args) = (at, values);
@@ -523,14 +479,8 @@ impl Fold {
     /// Where an edge into `block` with `args` goes next when `block` holds only a jump, or a branch on a parameter `args` makes a constant or on a comparison of such a parameter with a constant, and reads its parameters nowhere else.
     fn step(&self, func: &Function, (uses, pinned): (&[u32], &[bool]), block: Block, args: &[Value]) -> Option<(Block, Vec<Value>)> {
         let data = &func.blocks[block.index()];
-        let (compare, last) = match data.insts[..] {
-            [only] => (None, only),
-            [compare, last] => (Some(compare), last),
-            _ => return None,
-        };
-        if !self.agrees(func, block, args) {
-            return None;
-        }
+        let (compare, last) = match data.insts[..] { [only] => (None, only), [compare, last] => (Some(compare), last), _ => return None };
+        if !self.agrees(func, block, args) { return None; }
         let op = &func.insts[last.index()].op;
         let param = |value: &Value| data.params.iter().position(|param| param == value);
         let (next, next_args) = match op {
@@ -546,9 +496,7 @@ impl Fold {
             compare.iter().map(|inst| &func.insts[inst.index()].op).chain([op]).for_each(|op| op.for_operands(|value| count += u32::from(value == param)));
             count
         };
-        if pinned[next.index()] || data.params.iter().any(|param| uses[param.index()] != reads(*param)) {
-            return None;
-        }
+        if pinned[next.index()] || data.params.iter().any(|param| uses[param.index()] != reads(*param)) { return None; }
         Some((next, next_args.iter().map(|value| param(value).map_or(*value, |at| args[at])).collect()))
     }
 
@@ -586,9 +534,7 @@ impl Fold {
         let mut changed = false;
         for (_, data) in func.blocks.iter().enumerate().filter(|(block, _)| reachable[*block] && !pinned[*block]) {
             for param in &data.params {
-                if let (Some(value), false) = (self.incoming[param.index()], self.mixed[param.index()])
-                    && self.subst[param.index()] == *param
-                {
+                if let (Some(value), false) = (self.incoming[param.index()], self.mixed[param.index()]) && self.subst[param.index()] == *param {
                     self.subst[param.index()] = value;
                     changed = true;
                 }
@@ -617,14 +563,8 @@ fn pinned(func: &Function, entry: Block) -> Vec<bool> {
     pinned[entry.index()] = true;
     for block in 0..func.blocks.len() as u32 {
         match func.last(Block(block)) {
-            Some(Op::TryCall { normal, handler, .. }) => {
-                pinned[normal.index()] = true;
-                pinned[handler.index()] = true;
-            }
-            Some(Op::BrTable(_, default, targets)) => {
-                pinned[default.index()] = true;
-                targets.iter().for_each(|target| pinned[target.index()] = true);
-            }
+            Some(Op::TryCall { normal, handler, .. }) => { pinned[normal.index()] = true; pinned[handler.index()] = true; }
+            Some(Op::BrTable(_, default, targets)) => { pinned[default.index()] = true; targets.iter().for_each(|t| pinned[t.index()] = true); }
             _ => {}
         }
     }
@@ -638,25 +578,17 @@ fn drop_params(func: &mut Function, fold: &Fold) {
     let keep = |args: &mut Vec<Value>, target: Block| {
         let params = &blocks[target.index()].params;
         let mut index = 0;
-        args.retain(|_| {
-            index += 1;
-            !params.get(index - 1).is_some_and(gone)
-        });
+        args.retain(|_| { index += 1; !params.get(index - 1).is_some_and(gone) });
     };
     for block in blocks {
         let Some(&last) = block.insts.last() else { continue };
         match &mut func.insts[last.index()].op {
             Op::Jump(target, args) => keep(args, *target),
-            Op::Brif(_, then, then_args, otherwise, else_args) => {
-                keep(then_args, *then);
-                keep(else_args, *otherwise);
-            }
+            Op::Brif(_, then, then_args, otherwise, else_args) => { keep(then_args, *then); keep(else_args, *otherwise); }
             _ => {}
         }
     }
-    for block in &mut func.blocks {
-        block.params.retain(|param| !gone(param));
-    }
+    for block in &mut func.blocks { block.params.retain(|param| !gone(param)); }
 }
 
 /// The instruction in a block that defines each value.
@@ -671,11 +603,7 @@ pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
 }
 
 fn prune_changed(func: &mut Function, entry: Block) -> (Vec<bool>, bool) {
-    let reachable = if Some(entry) == func.entry {
-        func.cfg().reachable.clone()
-    } else {
-        crate::cfg::Cfg::from_entry(func, entry).reachable
-    };
+    let reachable = if Some(entry) == func.entry { func.cfg().reachable.clone() } else { crate::cfg::Cfg::from_entry(func, entry).reachable };
     let mut changed = false;
     for (block, live) in func.blocks.iter_mut().zip(&reachable) {
         if !live && !block.insts.is_empty() {
@@ -683,9 +611,7 @@ fn prune_changed(func: &mut Function, entry: Block) -> (Vec<bool>, bool) {
             changed = true;
         }
     }
-    if changed {
-        func.bump_cfg();
-    }
+    if changed { func.bump_cfg(); }
     (reachable, changed)
 }
 
@@ -716,6 +642,95 @@ fn dead(func: &mut Function) -> bool {
     dropped
 }
 
+fn cmp_const(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value) -> Option<(IntCC, Value, i64)> {
+    let Op::Icmp(cc, l, r) = func.insts[defs.get(v.index()).copied().flatten()?.index()].op else { return None };
+    if !func.ty(l).is_small_int() { return None; }
+    consts.get(r.index()).copied().flatten().map(|c| (cc, l, c)).or_else(|| consts.get(l.index()).copied().flatten().map(|c| (crate::cse::flip_int_cc(cc), r, c)))
+}
+
+fn fuse_cmp_pair(is_and: bool, ty: Type, (cc1, c1): (IntCC, i64), (cc2, c2): (IntCC, i64)) -> Option<(Option<(Binary, i64)>, IntCC, i64)> {
+    let umax = ty.unsigned_max();
+    let eq_cc = if is_and { IntCC::NotEqual } else { IntCC::Equal };
+    if cc1 == eq_cc && cc2 == eq_cc {
+        let (u1, u2) = (extend(c1, ty, false) as u64, extend(c2, ty, false) as u64);
+        let (lo, hi) = if u1 <= u2 { (u1, u2) } else { (u2, u1) };
+        let diff = hi - lo;
+        return (diff != 0 && diff.is_power_of_two() && (lo & diff) == 0).then_some((Some((Binary::Bor, diff as i64)), eq_cc, hi as i64));
+    }
+    let out_cc = if is_and { IntCC::UnsignedLessThanOrEqual } else { IntCC::UnsignedGreaterThan };
+    let (smin, smax) = if ty.bits() == 64 { (i64::MIN, i64::MAX) } else { (-(1_i64 << (ty.bits() - 1)), (1_i64 << (ty.bits() - 1)) - 1) };
+    for ((l_cc, lc), (h_cc, hc)) in [((cc1, c1), (cc2, c2)), ((cc2, c2), (cc1, c1))] {
+        let u_lo = match (is_and, l_cc, extend(lc, ty, false) as u64) {
+            (true, IntCC::UnsignedGreaterThanOrEqual, u) | (false, IntCC::UnsignedLessThan, u) => Some(u),
+            (true, IntCC::UnsignedGreaterThan, u) | (false, IntCC::UnsignedLessThanOrEqual, u) if u < umax => Some(u + 1),
+            _ => None,
+        };
+        let u_hi = match (is_and, h_cc, extend(hc, ty, false) as u64) {
+            (true, IntCC::UnsignedLessThanOrEqual, u) | (false, IntCC::UnsignedGreaterThan, u) => Some(u),
+            (true, IntCC::UnsignedLessThan, u) | (false, IntCC::UnsignedGreaterThanOrEqual, u) if u > 0 => Some(u - 1),
+            _ => None,
+        };
+        if let (Some(lo), Some(hi)) = (u_lo, u_hi) && lo <= hi && hi - lo < umax {
+            return Some(((lo != 0).then_some((Binary::Isub, lo as i64)), out_cc, (hi - lo) as i64));
+        }
+        let s_lo = match (is_and, l_cc, extend(lc, ty, true)) {
+            (true, IntCC::SignedGreaterThanOrEqual, s) | (false, IntCC::SignedLessThan, s) => Some(s),
+            (true, IntCC::SignedGreaterThan, s) | (false, IntCC::SignedLessThanOrEqual, s) if s < smax => Some(s + 1),
+            _ => None,
+        };
+        let s_hi = match (is_and, h_cc, extend(hc, ty, true)) {
+            (true, IntCC::SignedLessThanOrEqual, s) | (false, IntCC::SignedGreaterThan, s) => Some(s),
+            (true, IntCC::SignedLessThan, s) | (false, IntCC::SignedGreaterThanOrEqual, s) if s > smin => Some(s - 1),
+            _ => None,
+        };
+        if let (Some(lo), Some(hi)) = (s_lo, s_hi) && lo <= hi {
+            let (span, lo_u) = ((hi as u64).wrapping_sub(lo as u64) & umax, (lo as u64) & umax);
+            if span < umax { return Some(((lo_u != 0).then_some((Binary::Isub, lo_u as i64)), out_cc, span as i64)); }
+        }
+    }
+    None
+}
+
+fn fold_range_checks(func: &mut Function) -> bool {
+    let (defs, uses) = (defs(func), func.use_counts());
+    let mut consts = vec![None; func.types.len()];
+    for data in &func.insts {
+        if let (&Op::Const(imm), Some(res)) = (&data.op, data.result) && func.ty(res).is_small_int() {
+            consts[res.index()] = Some(extend(imm, func.ty(res), false));
+        }
+    }
+    let mut changed = false;
+    for b_idx in 0..func.blocks.len() {
+        let orig = std::mem::take(&mut func.blocks[b_idx].insts);
+        let mut next = Vec::with_capacity(orig.len());
+        for inst in orig {
+            if let Op::Binary(op @ (Binary::Band | Binary::Bor), a, b) = func.insts[inst.index()].op
+                && uses[a.index()] == 1 && uses[b.index()] == 1
+                && let (Some((cc1, x1, c1)), Some((cc2, x2, c2))) = (cmp_const(func, &defs, &consts, a), cmp_const(func, &defs, &consts, b))
+                && x1 == x2
+                && let Some((pre, out_cc, out_imm)) = fuse_cmp_pair(op == Binary::Band, func.ty(x1), (cc1, c1), (cc2, c2))
+            {
+                let x_ty = func.ty(x1);
+                let lhs = if let Some((pre_op, pre_imm)) = pre {
+                    let (c_pre, r_pre) = (func.value(x_ty), func.value(x_ty));
+                    consts.extend([Some(extend(pre_imm, x_ty, false)), None]);
+                    next.push(func.add(Op::Const(pre_imm), Some(c_pre)));
+                    next.push(func.add(Op::Binary(pre_op, x1, c_pre), Some(r_pre)));
+                    r_pre
+                } else { x1 };
+                let c_out = func.value(x_ty);
+                consts.push(Some(extend(out_imm, x_ty, false)));
+                next.push(func.add(Op::Const(out_imm), Some(c_out)));
+                func.insts[inst.index()].op = Op::Icmp(out_cc, lhs, c_out);
+                changed = true;
+            }
+            next.push(inst);
+        }
+        func.blocks[b_idx].insts = next;
+    }
+    changed
+}
+
 /// Folds constants, identities and branches on them, settles the compares, traps and branches the facts on each path decide when `effort` is full, empties blocks no path reaches, replaces block parameters every edge agrees on, drops dead pure instructions, and threads the edges through the blocks that leaves holding only a jump; returns the invalidated IR domain.
 pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     let Some(entry) = func.entry else { return Domain::NONE };
@@ -728,23 +743,17 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
         fold.constants(func);
         let settled = effort == crate::Effort::Full && reachable.is_empty() && crate::facts::settle(func, &fold.defs, &mut fold.consts);
         let branched = settled | fold.branches(func) | fold.thread(func, &pinned);
-        if branched {
-            func.bump_cfg();
-        }
+        if branched { func.bump_cfg(); }
         if branched || reachable.is_empty() {
             let (r, pruned) = prune_changed(func, entry);
-            if pruned {
-                func.bump_cfg();
-            }
+            if pruned { func.bump_cfg(); }
             reachable = r;
             cfg_changed |= branched | pruned;
             changed |= pruned;
         }
         let replaced = fold.params(func, &reachable, &pinned);
         changed |= branched | replaced;
-        if !branched && !replaced {
-            break;
-        }
+        if !branched && !replaced { break; }
     }
     drop_params(func, &fold);
     for block in &func.blocks {
@@ -754,13 +763,18 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
                 Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, y) => Some(Op::Binary(Binary::Fadd, x, x)),
                 Op::Binary(Binary::Fmul, x, y) if crate::algebra::is_float_two(func, &fold.defs, x) => Some(Op::Binary(Binary::Fadd, y, y)),
                 Op::Binary(Binary::Isub, x, y) if func.ty(x).is_small_int() && fold.known(x).is_some_and(|imm| extend(imm, func.ty(x), false) == 0) => Some(Op::Unary(Unary::Ineg, y)),
+                Op::Select(c, x, y) => match (fold.def(func, x), fold.def(func, y)) {
+                    (_, Some(&Op::Select(c2, _, z))) if fold.find(c2) == c => Some(Op::Select(c, x, fold.find(z))),
+                    (Some(&Op::Select(c2, x2, _)), _) if fold.find(c2) == c => Some(Op::Select(c, fold.find(x2), y)),
+                    _ if func.ty(c) == Type::I8 && fold.boolean(func, c) && func.ty(x).is_small_int() && func.ty(x) != Type::I8
+                        && fold.known(x).is_some_and(|v| extend(v, func.ty(x), false) == 1)
+                        && fold.known(y).is_some_and(|v| extend(v, func.ty(x), false) == 0) => Some(Op::Convert(Convert::Uextend, c)),
+                    _ => None,
+                },
                 _ => vector::vec_zero_fold(func, &fold, &func.insts[inst.index()].op)
                     .or_else(|| func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const)),
             };
-            if let Some(op) = replacement && func.insts[inst.index()].op != op {
-                func.insts[inst.index()].op = op;
-                changed = true;
-            }
+            if let Some(op) = replacement && func.insts[inst.index()].op != op { func.insts[inst.index()].op = op; changed = true; }
         }
     }
     let snap = (!changed).then(|| (func.blocks.iter().map(|b| b.insts.clone()).collect::<Vec<_>>(), func.insts.iter().map(|d| d.op.clone()).collect::<Vec<_>>()));
@@ -774,18 +788,10 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
         func.bump_cfg();
         prune(func, entry);
         dead(func);
-        changed = true;
-        cfg_changed = true;
+        (changed, cfg_changed) = (true, true);
     }
-    if crate::algebra::devirt_vtables(func, &fold.defs) { dead(func); changed = true; }
-    if crate::algebra::fold_bxor_conds(func) { dead(func); changed = true; }
-    if !changed {
-        Domain::NONE
-    } else if cfg_changed {
-        Domain::VALUES | Domain::CFG
-    } else {
-        Domain::VALUES
-    }
+    if crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | fold_range_checks(func) { dead(func); changed = true; }
+    if !changed { Domain::NONE } else if cfg_changed { Domain::VALUES | Domain::CFG } else { Domain::VALUES }
 }
 
 pub(crate) use crate::thread::compact;

@@ -1,0 +1,308 @@
+use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
+
+use super::{Arm, Edge, Info, Range, Run, emit_node, intersect_ranges, match_test, push_node, range_fits, range_of_test, same_edge};
+
+#[derive(Clone, Copy)]
+pub(super) struct BitmaskPlan {
+    base: i64,
+    span: u64,
+    mask: u64,
+    signed: bool,
+}
+
+fn insert_interval(runs: &mut Vec<Run>, mut cur: u64, hi: u64, hit: Edge) {
+    let (mut added, mut done) = (Vec::new(), false);
+    for r in runs.iter() {
+        if r.hi < cur {
+            continue;
+        }
+        if r.lo > hi {
+            break;
+        }
+        if cur < r.lo {
+            added.push(Run { lo: cur, hi: r.lo - 1, hit: hit.clone() });
+        }
+        if r.hi >= hi {
+            done = true;
+            break;
+        }
+        cur = r.hi + 1;
+    }
+    if !done && cur <= hi {
+        added.push(Run { lo: cur, hi, hit });
+    }
+    if !added.is_empty() {
+        runs.extend(added);
+        runs.sort_unstable_by_key(|r| r.lo);
+    }
+}
+
+pub(super) fn build_runs(func: &Function, info: &Info, ty: Type, arms: &[Arm]) -> Vec<Run> {
+    let (mut runs, u_max) = (Vec::new(), ty.unsigned_max());
+    for arm in arms {
+        if arm.range.lo <= arm.range.hi {
+            insert_interval(&mut runs, arm.range.lo, arm.range.hi, arm.hit.clone());
+        } else {
+            insert_interval(&mut runs, arm.range.lo, u_max, arm.hit.clone());
+            insert_interval(&mut runs, 0, arm.range.hi, arm.hit.clone());
+        }
+    }
+    let mut merged: Vec<Run> = Vec::with_capacity(runs.len());
+    for r in runs {
+        if let Some(prev) = merged.last_mut()
+            && prev.hi < u64::MAX
+            && prev.hi + 1 == r.lo
+            && same_edge(func, info, &prev.hit, &r.hit)
+        {
+            prev.hi = r.hi;
+        } else {
+            merged.push(r);
+        }
+    }
+    merged
+}
+
+fn set_mask_range(mask: &mut u64, start: u64, end: u64) {
+    for bit in start..=end {
+        *mask |= 1_u64 << bit;
+    }
+}
+
+fn plan_unsigned(runs: &[Run]) -> Option<BitmaskPlan> {
+    let (min_lo, max_hi) = (runs.first()?.lo, runs.last()?.hi);
+    if max_hi - min_lo >= 64 {
+        return None;
+    }
+    let base = if max_hi < 64 { 0 } else { min_lo };
+    let span = max_hi - base;
+    let mut mask = 0_u64;
+    for r in runs {
+        set_mask_range(&mut mask, r.lo - base, r.hi - base);
+    }
+    Some(BitmaskPlan { base: base as i64, span, mask, signed: false })
+}
+
+fn plan_signed(ty: Type, runs: &[Run]) -> Option<BitmaskPlan> {
+    let sign_bit = 1_u64 << (ty.bits() - 1);
+    let mut segs: Vec<(i64, i64)> = Vec::with_capacity(runs.len() + 1);
+    for r in runs {
+        if r.lo < sign_bit && r.hi >= sign_bit {
+            segs.push((crate::fold::extend(r.lo as i64, ty, true), crate::fold::extend((sign_bit - 1) as i64, ty, true)));
+            segs.push((crate::fold::extend(sign_bit as i64, ty, true), crate::fold::extend(r.hi as i64, ty, true)));
+        } else {
+            segs.push((crate::fold::extend(r.lo as i64, ty, true), crate::fold::extend(r.hi as i64, ty, true)));
+        }
+    }
+    let s_min = segs.iter().map(|&(lo, _)| lo).min()?;
+    let s_max = segs.iter().map(|&(_, hi)| hi).max()?;
+    let span = s_max.abs_diff(s_min);
+    if span >= 64 {
+        return None;
+    }
+    let mut mask = 0_u64;
+    for (lo, hi) in segs {
+        set_mask_range(&mut mask, lo.abs_diff(s_min), hi.abs_diff(s_min));
+    }
+    Some(BitmaskPlan { base: s_min, span, mask, signed: true })
+}
+
+fn build_bitmask_plan(ty: Type, runs: &[Run]) -> Option<BitmaskPlan> {
+    if runs.len() < 3 {
+        return None;
+    }
+    plan_unsigned(runs).or_else(|| plan_signed(ty, runs))
+}
+
+fn best_bitmask_window(ty: Type, subset: &[Run]) -> Option<(BitmaskPlan, usize, usize)> {
+    if let Some(plan) = build_bitmask_plan(ty, subset) {
+        return Some((plan, 0, subset.len()));
+    }
+    if subset.len() < 4 {
+        return None;
+    }
+    let mut best: Option<(BitmaskPlan, usize, usize)> = None;
+    for i in 0..subset.len() {
+        for j in (i + 3..=subset.len()).rev() {
+            if best.as_ref().is_some_and(|&(_, bi, bj)| j - i <= bj - bi) {
+                break;
+            }
+            if let Some(plan) = build_bitmask_plan(ty, &subset[i..j]) {
+                best = Some((plan, i, j));
+                break;
+            }
+        }
+    }
+    best
+}
+
+fn find_bitmask_target(func: &Function, info: &Info, ty: Type, runs: &[Run]) -> Option<(BitmaskPlan, Edge, Vec<Run>)> {
+    if runs.len() < 3 {
+        return None;
+    }
+    let mut groups: Vec<(Edge, Vec<Run>)> = Vec::new();
+    for r in runs {
+        if let Some((_, list)) = groups.iter_mut().find(|(edge, _)| same_edge(func, info, edge, &r.hit)) {
+            list.push(r.clone());
+        } else {
+            groups.push((r.hit.clone(), vec![r.clone()]));
+        }
+    }
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let can_tbl = groups.len() > 1 && super::can_br_table(runs).is_some();
+    for (hit, subset) in groups {
+        if subset.len() < 3 {
+            break;
+        }
+        let Some((plan, wi, wj)) = best_bitmask_window(ty, &subset) else { continue };
+        let (w_lo, w_hi) = (subset[wi].lo, subset[wj - 1].hi);
+        let rest: Vec<Run> = runs
+            .iter()
+            .filter(|r| !(same_edge(func, info, &hit, &r.hit) && r.lo >= w_lo && r.hi <= w_hi))
+            .cloned()
+            .collect();
+        if can_tbl && rest.len() > 2 {
+            continue;
+        }
+        return Some((plan, hit, rest));
+    }
+    None
+}
+
+pub(super) fn can_bitmask_runs(func: &Function, info: &Info, ty: Type, runs: &[Run]) -> bool {
+    find_bitmask_target(func, info, ty, runs).is_some()
+}
+
+fn emit_bitmask_test(func: &mut Function, (v, ty): (Value, Type), plan: BitmaskPlan, insts: &mut Vec<Inst>) -> Value {
+    let v64 = if ty == Type::I64 {
+        v
+    } else {
+        let conv = if plan.signed { Convert::Sextend } else { Convert::Uextend };
+        let res = func.value(Type::I64);
+        insts.push(func.add(Op::Convert(conv, v), Some(res)));
+        res
+    };
+    let diff = if plan.base == 0 {
+        v64
+    } else {
+        let (base_c, sub) = (func.value(Type::I64), func.value(Type::I64));
+        insts.push(func.add(Op::Const(plan.base), Some(base_c)));
+        insts.push(func.add(Op::Binary(Binary::Isub, v64, base_c), Some(sub)));
+        sub
+    };
+    let (span_c, in_range) = (func.value(Type::I64), func.value(Type::I8));
+    insts.push(func.add(Op::Const(plan.span as i64), Some(span_c)));
+    insts.push(func.add(Op::Icmp(IntCC::UnsignedLessThanOrEqual, diff, span_c), Some(in_range)));
+    let (mask_c, shifted) = (func.value(Type::I64), func.value(Type::I64));
+    insts.push(func.add(Op::Const(plan.mask as i64), Some(mask_c)));
+    insts.push(func.add(Op::Binary(Binary::Ushr, mask_c, diff), Some(shifted)));
+    let (one, bit, bit8, cond) = (func.value(Type::I64), func.value(Type::I64), func.value(Type::I8), func.value(Type::I8));
+    insts.push(func.add(Op::Const(1), Some(one)));
+    insts.push(func.add(Op::Binary(Binary::Band, shifted, one), Some(bit)));
+    insts.push(func.add(Op::Convert(Convert::Ireduce, bit), Some(bit8)));
+    insts.push(func.add(Op::Binary(Binary::Band, in_range, bit8), Some(cond)));
+    cond
+}
+
+pub(super) fn try_emit_bitmask_runs(
+    func: &mut Function,
+    info: &Info,
+    at: Option<(usize, Inst)>,
+    (v, ty): (Value, Type),
+    runs: &[Run],
+    (default_blk, cache): (Block, &mut Vec<((Block, Vec<Value>), Block)>),
+) -> Option<Block> {
+    let (plan, hit, rest) = find_bitmask_target(func, info, ty, runs)?;
+    let otherwise = if rest.is_empty() {
+        default_blk
+    } else {
+        emit_node(func, info, None, (v, ty), &rest, (default_blk, cache))
+    };
+    let mut insts = Vec::with_capacity(11);
+    let cond = emit_bitmask_test(func, (v, ty), plan, &mut insts);
+    insts.push(func.add(Op::Brif(cond, hit.block, hit.args, otherwise, Vec::new()), None));
+    Some(push_node(func, at, insts))
+}
+
+fn collect_expr_leaf(
+    func: &Function,
+    info: &Info,
+    b0: usize,
+    node: Value,
+    want_true: bool,
+    (val, ranges, dead): (&mut Option<Value>, &mut Vec<Range>, &mut Vec<Inst>),
+) -> bool {
+    let Some(test) = match_test(func, info, node, *val, Some(b0)) else { return false };
+    let ty = func.ty(test.val);
+    let Some(r) = range_of_test(ty, test.kind, want_true).filter(|&r| range_fits(r)) else { return false };
+    *val = Some(test.val);
+    ranges.push(r);
+    dead.extend(test.used.into_iter().flatten());
+    true
+}
+
+fn collect_expr_tree(
+    func: &Function,
+    info: &Info,
+    b0: usize,
+    (node, want_or, depth): (Value, bool, u8),
+    (val, ranges, dead): (&mut Option<Value>, &mut Vec<Range>, &mut Vec<Inst>),
+) -> bool {
+    if depth > 16 || info.def_block.get(node.index()).copied().flatten() != Some(b0) || info.uses.get(node.index()).copied() != Some(1) {
+        return false;
+    }
+    let Some(inst) = info.def_inst.get(node.index()).copied().flatten() else { return false };
+    match func.insts[inst.index()].op {
+        Op::Binary(bin, a, b) if (want_or && bin == Binary::Bor) || (!want_or && bin == Binary::Band) => {
+            dead.push(inst);
+            collect_expr_tree(func, info, b0, (a, want_or, depth + 1), (val, ranges, dead))
+                && collect_expr_tree(func, info, b0, (b, want_or, depth + 1), (val, ranges, dead))
+        }
+        Op::Binary(Binary::Band, a, b) if want_or => {
+            let mut sub_ranges = Vec::with_capacity(2);
+            if !collect_expr_leaf(func, info, b0, a, true, (val, &mut sub_ranges, dead))
+                || !collect_expr_leaf(func, info, b0, b, true, (val, &mut sub_ranges, dead))
+            {
+                return false;
+            }
+            let Some(v) = *val else { return false };
+            let ty = func.ty(v);
+            let Some(merged) = intersect_ranges(ty, sub_ranges[0], sub_ranges[1]).filter(|&r| range_fits(r)) else {
+                return false;
+            };
+            dead.push(inst);
+            ranges.push(merged);
+            true
+        }
+        _ => collect_expr_leaf(func, info, b0, node, want_or, (val, ranges, dead)),
+    }
+}
+
+pub(super) fn try_rewrite_expr(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), cleared: &mut [bool]) -> bool {
+    let Op::Brif(cond, t_blk, t_args, f_blk, f_args) = func.insts[last0.index()].op.clone() else {
+        return false;
+    };
+    for want_or in [true, false] {
+        let (mut val, mut ranges, mut dead) = (None, Vec::new(), Vec::new());
+        if !collect_expr_tree(func, info, b0, (cond, want_or, 0), (&mut val, &mut ranges, &mut dead)) || ranges.len() < 3 {
+            continue;
+        }
+        let Some(v) = val else { continue };
+        let ty = func.ty(v);
+        let dummy = Edge { raw: t_blk, block: t_blk, args: Vec::new(), synth_bool: None };
+        let arms: Vec<Arm> = ranges.into_iter().map(|range| Arm { range, hit: dummy.clone() }).collect();
+        let runs = build_runs(func, info, ty, &arms);
+        let Some(plan) = build_bitmask_plan(ty, &runs) else { continue };
+        func.blocks[b0].insts.retain(|i| !dead.contains(i));
+        for inst in dead {
+            func.insts[inst.index()].op = Op::Trap;
+        }
+        let mut insts = Vec::with_capacity(11);
+        let new_cond = emit_bitmask_test(func, (v, ty), plan, &mut insts);
+        let (hit_b, hit_a, miss_b, miss_a) = if want_or { (t_blk, t_args, f_blk, f_args) } else { (f_blk, f_args, t_blk, t_args) };
+        insts.push(func.add(Op::Brif(new_cond, hit_b, hit_a, miss_b, miss_a), None));
+        push_node(func, Some((b0, last0)), insts);
+        cleared[b0] = true;
+        return true;
+    }
+    false
+}

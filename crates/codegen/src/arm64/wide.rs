@@ -84,9 +84,9 @@ impl Emit<'_> {
                 self.halves(x, (A, D));
                 self.halves(y, (C, S));
                 self.asm.alu(Alu::Umulh, Size::X, T, A, C);
-                self.asm.madd(false, T, (A, S), T);
-                self.asm.madd(false, T, (D, C), T);
-                self.asm.madd(false, A, (A, C), ZR);
+                self.asm.madd(false, Size::X, T, (A, S), T);
+                self.asm.madd(false, Size::X, T, (D, C), T);
+                self.asm.madd(false, Size::X, A, (A, C), ZR);
                 self.put_halves(result, (A, T));
             }
             Binary::Ishl | Binary::Ushr | Binary::Sshr => {
