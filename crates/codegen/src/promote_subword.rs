@@ -56,6 +56,7 @@ pub(super) fn eval_consts(func: &Function) -> Vec<Option<i64>> {
 pub(super) const MAX_COPY_BYTES: u32 = crate::copy::MOVE_INLINE * 2;
 pub(super) const PROMOTE_BOTH_BYTES: u32 = 1024;
 pub(super) const PROMOTE_BOTH_PIECES: usize = 256;
+pub(super) const PROMOTE_ONE_PIECES: usize = 32;
 
 pub(super) fn copy_bytes_limit(consts: &[Option<i64>], len: Value, limit: u32) -> Option<u32> {
     consts.get(len.index()).copied().flatten().and_then(|n| u32::try_from(n).ok()).filter(|&n| n <= limit)
@@ -130,6 +131,8 @@ pub(super) fn copy_open_slots(
                     close_addr(&mut open, b);
                 }
             }
+            Op::Convert(Convert::Bitcast, _) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => {}
+            Op::Select(c, ..) if data.result.is_some_and(|r| addrs[r.index()].is_some()) => close_addr(&mut open, c),
             _ => data.op.for_operands(|v| {
                 if let Some((s, _)) = addrs[v.index()] {
                     open[s.index()] = false;
