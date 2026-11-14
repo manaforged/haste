@@ -86,12 +86,16 @@ impl Lower<'_, '_> {
     /// Emits the SIMD intrinsic `op` using native `Type::Vec` operations, recursive half-splits, or SSA loops.
     pub(super) fn simd(&mut self, origin: &SiteOrigin, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         let (Some(&vector), Some(&first)) = (substs.first(), args.first()) else { bail!("a SIMD intrinsic with no vector") };
-        let out = substs.get(1).copied();
+        let out = if op == Simd::Shuffle { substs.get(2) } else { substs.get(1) }.copied();
         if op == Simd::SelectBitmask {
             let &[mask, yes, no] = args else { bail!("SIMD intrinsic {op:?} takes other arguments") };
             return self.bitmask_select((vector, out.unwrap_or(vector)), mask, (yes, no)).map(Some);
         }
-        if let Some(value) = self.vec_simd(origin, op, (vector, out.unwrap_or(vector)), substs, args)? {
+        let from = self.lanes(vector)?;
+        let Some(to) = self.simd_out_lanes(op, from, out)? else {
+            return Ok(None);
+        };
+        if let Some(value) = self.vec_simd_lanes(Some(origin), op, (from, to), substs, args)? {
             return Ok(Some(value));
         }
         if matches!(op, Simd::Unary(_) | Simd::Pair(_) | Simd::Fma | Simd::Sum { .. } | Simd::MaskedLoad | Simd::MaskedStore) {
@@ -100,20 +104,11 @@ impl Lower<'_, '_> {
         if let Some(value) = self.packed_swar64(op, (vector, out.unwrap_or(vector)), args)? {
             return Ok(Some(value));
         }
-        if !matches!(op, Simd::Extract | Simd::Insert | Simd::Shuffle) {
-            let from = self.lanes(vector)?;
-            let to = match op {
-                Simd::Bitmask => {
-                    let Some(out_ty) = out else { bail!("`simd_bitmask` has no output type") };
-                    let Some(target) = machine(self.cx, out_ty)? else { bail!("a SIMD bitmask into an array is not supported yet") };
-                    Lanes { num: Num::Int { ty: target, signed: false }, machine: target, size: target.bytes() as i32, count: 1 }
-                }
-                Simd::Lanewise(_) | Simd::Cast | Simd::Select => self.lanes(out.unwrap_or(vector))?,
-                _ => from,
-            };
-            if let Some(value) = self.wide_simd(op, (&from, &to), args)? {
-                return Ok(Some(value));
-            }
+        if let Some(value) = self.wide_lane_op(origin, op, (&from, &to), args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.wide_simd(op, (&from, &to), args)? {
+            return Ok(Some(value));
         }
         let value = match (op, out) {
             (Simd::Splat, _) => self.splat(vector, first)?,
@@ -147,20 +142,22 @@ impl Lower<'_, '_> {
         (slot, addr)
     }
 
-    fn vec_simd(&mut self, origin: &SiteOrigin, op: Simd, (input, output): (Ty, Ty), substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
-        let lanes = self.lanes(input)?;
-        let out_lanes = match op {
+    fn simd_out_lanes(&mut self, op: Simd, from: Lanes, out: Option<Ty>) -> Result<Option<Lanes>> {
+        Ok(Some(match op {
             Simd::Bitmask => {
-                let Some(target) = machine(self.cx, output)? else { return Ok(None) };
+                let Some(out_ty) = out else { bail!("`simd_bitmask` has no output type") };
+                let Some(target) = machine(self.cx, out_ty)? else { bail!("a SIMD bitmask into an array is not supported yet") };
                 Lanes { num: Num::Int { ty: target, signed: false }, machine: target, size: target.bytes() as i32, count: 1 }
             }
-            Simd::Lanewise(_) | Simd::Cast | Simd::Select => self.lanes(output)?,
-            _ => lanes,
-        };
-        self.vec_simd_lanes(Some(origin), op, (lanes, out_lanes), substs, args)
+            Simd::Lanewise(_) | Simd::Cast | Simd::Select | Simd::Shuffle => {
+                let Some(out_ty) = out else { return Ok(Some(from)) };
+                self.lanes(out_ty)?
+            }
+            _ => from,
+        }))
     }
 
-    pub(super) fn vec_simd_lanes(&mut self, origin: Option<&SiteOrigin>, op: Simd, (lanes, out_lanes): (Lanes, Lanes), substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+    pub(super) fn vec_simd_lanes(&mut self, origin: Option<&SiteOrigin>, op: Simd, (lanes, out_lanes): (Lanes, Lanes), _substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
         if op == Simd::Select {
             return self.vec_select((&lanes, &out_lanes), args);
         }
@@ -233,9 +230,8 @@ impl Lower<'_, '_> {
                 Ok(Some(self.store_vec(out, vec_ty.bytes())))
             }
             (Simd::Shuffle, &[x, y, _]) => {
-                let (Some(origin), Some(&out_ty)) = (origin, substs.get(2)) else { return Ok(None) };
-                let out_sh = self.lanes(out_ty)?;
-                if vec_type(&out_sh) != Some(vec_ty) {
+                let Some(origin) = origin else { return Ok(None) };
+                if vec_type(&out_lanes) != Some(vec_ty) {
                     return Ok(None);
                 }
                 let Some(mask) = self.shuffle_const_mask(origin, lanes.count as usize) else { return Ok(None) };
@@ -284,42 +280,6 @@ impl Lower<'_, '_> {
         Ok(Some(self.store_vec(out, vec_ty.bytes())))
     }
 
-    fn vec_cast(&mut self, (from, from_vec): (&Lanes, Type), to: &Lanes, x: Value) -> Result<Option<Value>> {
-        let Some(to_vec) = vec_type(to) else { return Ok(None) };
-        if from.count != to.count {
-            return Ok(None);
-        }
-        let v = self.ins().load(from_vec, x, 0);
-        let out = match (from.num, to.num) {
-            (Num::Int { ty: a, signed }, Num::Int { ty: b, .. }) => {
-                if a == b {
-                    v
-                } else if a.bytes() < b.bytes() {
-                    if signed { self.ins().sextend(to_vec, v) } else { self.ins().uextend(to_vec, v) }
-                } else {
-                    self.ins().ireduce(to_vec, v)
-                }
-            }
-            (Num::Float(a), Num::Float(b)) => {
-                if a == b {
-                    v
-                } else if a == Type::F32 {
-                    self.ins().fpromote(to_vec, v)
-                } else {
-                    self.ins().fdemote(to_vec, v)
-                }
-            }
-            (Num::Int { ty: a, signed }, Num::Float(b)) if a.bytes() == b.bytes() || a.bytes() * 2 == b.bytes() => {
-                if signed { self.ins().fcvt_from_sint(to_vec, v) } else { self.ins().fcvt_from_uint(to_vec, v) }
-            }
-            (Num::Float(a), Num::Int { ty: b, signed }) if a.bytes() == b.bytes() => {
-                if signed { self.ins().fcvt_to_sint_sat(to_vec, v) } else { self.ins().fcvt_to_uint_sat(to_vec, v) }
-            }
-            _ => return Ok(None),
-        };
-        Ok(Some(self.store_vec(out, to_vec.bytes())))
-    }
-
     fn vec_select(&mut self, (from, to): (&Lanes, &Lanes), args: &[Value]) -> Result<Option<Value>> {
         let &[mask, yes, no] = args else { return Ok(None) };
         let (Some(mask_vec), Some(out_vec)) = (vec_type(from), vec_type(to)) else { return Ok(None) };
@@ -345,7 +305,7 @@ impl Lower<'_, '_> {
         self.body.list(list).iter().copied().map(ExprId).filter(|id| !self.typed.const_args.contains(id)).nth(index)
     }
 
-    fn const_arg_u8(&mut self, origin: &SiteOrigin, index: usize, limit: u8) -> Option<u8> {
+    pub(super) fn const_arg_u8(&mut self, origin: &SiteOrigin, index: usize, limit: u8) -> Option<u8> {
         let expr = self.call_arg_expr(origin, index)?;
         let mut ctx = ConstEval { cx: self.cx, origin_body: self.body, typed: self.typed };
         let val = ctx.int(self.body, self.src, expr, &mut Vec::new(), 0)?;
@@ -356,9 +316,19 @@ impl Lower<'_, '_> {
         if count > 16 {
             return None;
         }
+        let wide = self.shuffle_const_mask_wide(origin, count, count)?;
+        let mut mask = [0u8; 16];
+        mask[..count].copy_from_slice(&wide[..count]);
+        Some(mask)
+    }
+
+    pub(super) fn shuffle_const_mask_wide(&mut self, origin: &SiteOrigin, in_count: usize, out_count: usize) -> Option<[u8; 64]> {
+        if out_count == 0 || out_count > 64 || in_count == 0 {
+            return None;
+        }
         let expr = self.call_arg_expr(origin, 2)?;
         let mut ctx = ConstEval { cx: self.cx, origin_body: self.body, typed: self.typed };
-        ctx.shuffle_array(self.body, self.src, expr, count, 0)
+        ctx.shuffle_array(self.body, self.src, expr, (in_count, out_count), &mut Vec::new(), 0)
     }
 
     fn const_splat_vec(&mut self, origin: &SiteOrigin, vec_ty: Type) -> Option<Value> {
@@ -515,33 +485,7 @@ impl<'a, 'b> ConstEval<'a, 'b> {
                 self.int(body, src, if flag.val != 0 { then } else { otherwise }, env, depth + 1)
             }
             Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const | BlockKind::Expansion, .. } => {
-                let mark = env.len();
-                for &stmt_id in body.list(stmts) {
-                    match body.stmts[stmt_id as usize] {
-                        Stmt::Empty | Stmt::Item(..) => {}
-                        Stmt::Let { mut pat, ty, init: Some(init), otherwise: None, .. } => {
-                            while let Pat::Paren(inner) = *body.pat(pat) {
-                                pat = inner;
-                            }
-                            let Pat::Bind { name, sub: None, .. } = *body.pat(pat) else {
-                                env.truncate(mark);
-                                return None;
-                            };
-                            let Some(mut val) = self.int(body, src, init, env, depth + 1) else {
-                                env.truncate(mark);
-                                return None;
-                            };
-                            if let Some(target) = ty.and_then(|t| self.body_ty_int(body, src, t)) {
-                                val = val.cast(target);
-                            }
-                            env.push((plain(src.text(name)).to_owned(), val));
-                        }
-                        _ => {
-                            env.truncate(mark);
-                            return None;
-                        }
-                    }
-                }
+                let mark = self.eval_stmts(body, src, stmts, env, depth + 1)?;
                 let out = self.int(body, src, tail, env, depth + 1);
                 env.truncate(mark);
                 out
@@ -697,32 +641,69 @@ impl<'a, 'b> ConstEval<'a, 'b> {
         }
     }
 
-    fn shuffle_array(&mut self, body: &Body, src: &Source, expr: ExprId, count: usize, depth: u8) -> Option<[u8; 16]> {
+    fn eval_stmts(&mut self, body: &Body, src: &Source, stmts: crate::body::List, env: &mut Vec<(String, ConstVal)>, depth: u8) -> Option<usize> {
+        let mark = env.len();
+        for &stmt_id in body.list(stmts) {
+            match body.stmts[stmt_id as usize] {
+                Stmt::Empty | Stmt::Item(..) => {}
+                Stmt::Let { mut pat, ty, init: Some(init), otherwise: None, .. } => {
+                    while let Pat::Paren(inner) = *body.pat(pat) {
+                        pat = inner;
+                    }
+                    let Pat::Bind { name, sub: None, .. } = *body.pat(pat) else {
+                        env.truncate(mark);
+                        return None;
+                    };
+                    let Some(mut val) = self.int(body, src, init, env, depth) else {
+                        env.truncate(mark);
+                        return None;
+                    };
+                    if let Some(target) = ty.and_then(|t| self.body_ty_int(body, src, t)) {
+                        val = val.cast(target);
+                    }
+                    env.push((plain(src.text(name)).to_owned(), val));
+                }
+                _ => {
+                    env.truncate(mark);
+                    return None;
+                }
+            }
+        }
+        Some(mark)
+    }
+
+    fn shuffle_array(&mut self, body: &Body, src: &Source, expr: ExprId, (in_count, out_count): (usize, usize), env: &mut Vec<(String, ConstVal)>, depth: u8) -> Option<[u8; 64]> {
         if depth > 4 {
             return None;
         }
         let expr = self.unwrap_shuffle(body, src, expr);
-        let limit = u128::try_from(2 * count).ok()?;
-        let mut mask = [0u8; 16];
+        let limit = u128::try_from(2 * in_count).ok()?;
+        let mut mask = [0u8; 64];
         match *body.expr(expr) {
             Expr::Array(list) => {
                 let ids = body.list(list);
-                if ids.len() != count {
+                if ids.len() != out_count {
                     return None;
                 }
-                mask[..count].iter_mut().zip(ids).try_for_each(|(slot, &id)| {
-                    let v = self.int(body, src, ExprId(id), &mut Vec::new(), depth + 1)?;
+                mask[..out_count].iter_mut().zip(ids).try_for_each(|(slot, &id)| {
+                    let v = self.int(body, src, ExprId(id), env, depth + 1)?;
                     ((!v.signed || v.to_signed() >= 0) && v.val < limit).then(|| *slot = v.val as u8)
                 })?;
                 Some(mask)
             }
             Expr::Repeat(elem, _) => {
-                let v = self.int(body, src, elem, &mut Vec::new(), depth + 1)?;
+                let v = self.int(body, src, elem, env, depth + 1)?;
                 if (v.signed && v.to_signed() < 0) || v.val >= limit {
                     return None;
                 }
-                mask[..count].fill(v.val as u8);
+                mask[..out_count].fill(v.val as u8);
                 Some(mask)
+            }
+            Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const | BlockKind::Expansion, .. } => {
+                let mark = self.eval_stmts(body, src, stmts, env, depth + 1)?;
+                let out = self.shuffle_array(body, src, tail, (in_count, out_count), env, depth + 1);
+                env.truncate(mark);
+                out
             }
             Expr::Path(_) if std::ptr::eq(body, self.origin_body) => {
                 let Res::Fn(item, substs) = self.typed.res.get(&expr).copied()? else { return None };
@@ -732,7 +713,7 @@ impl<'a, 'b> ConstEval<'a, 'b> {
                 let item_body = self.cx.body(item).ok()?;
                 let root = item_body.root?;
                 let item_src = self.cx.body_src(item);
-                self.shuffle_array(&item_body, item_src, root, count, depth + 1)
+                self.shuffle_array(&item_body, item_src, root, (in_count, out_count), &mut Vec::new(), depth + 1)
             }
             _ => None,
         }

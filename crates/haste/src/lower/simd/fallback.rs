@@ -6,6 +6,7 @@ use crate::sema::intrinsic::Simd;
 
 use super::super::Lower;
 use super::super::ops::Num;
+use super::super::reloc::SiteOrigin;
 use super::super::stencil::SymbolSource;
 use super::{Lanes, int_for_bytes, vec_for_bytes, vec_type};
 
@@ -159,13 +160,276 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn wide_simd(&mut self, op: Simd, (from, to): (&Lanes, &Lanes), args: &[Value]) -> Result<Option<Value>> {
-        if from.bytes() > 16 || to.bytes() > 16 {
-            return self.wide_split_simd(op, (from, to), args);
+        if (from.bytes() > 16 || to.bytes() > 16)
+            && let Some(res) = self.wide_split_simd(op, (from, to), args)?
+        {
+            return Ok(Some(res));
+        }
+        if op == Simd::Cast
+            && let &[x] = args
+            && let Some(res) = self.eval_cast((*from, *to), x)?
+        {
+            return Ok(Some(res));
         }
         if from.bytes() < 8 && to.bytes() < 8 {
             return self.sub8_simd(op, (from, to), args);
         }
         Ok(None)
+    }
+
+    pub(super) fn wide_lane_op(&mut self, origin: &SiteOrigin, op: Simd, (from, to): (&Lanes, &Lanes), args: &[Value]) -> Result<Option<Value>> {
+        match (op, args) {
+            (Simd::Extract, &[x, _]) => {
+                let Some(limit) = u8::try_from(from.count).ok() else { return Ok(None) };
+                let Some(idx) = self.const_arg_u8(origin, 1, limit) else { return Ok(None) };
+                if from.bytes() > 16 && (from.count as u32).is_power_of_two() && matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+                    let Some(lane) = Lane::from_type(from.machine) else { return Ok(None) };
+                    let chunk_lanes = 16 / from.size;
+                    let chunk_vec = Type::Vec { lane, count: chunk_lanes as u8 };
+                    let chunk_off = (i32::from(idx) / chunk_lanes) * 16;
+                    let sub_idx = (i32::from(idx) % chunk_lanes) as u8;
+                    let v = self.ins().load(chunk_vec, x, chunk_off);
+                    return Ok(Some(self.ins().extract(v, sub_idx)));
+                }
+                Ok(Some(self.ins().load(from.machine, x, i32::from(idx) * from.size)))
+            }
+            (Simd::Insert, &[x, _, val]) => {
+                let Some(limit) = u8::try_from(from.count).ok() else { return Ok(None) };
+                let Some(idx) = self.const_arg_u8(origin, 1, limit) else { return Ok(None) };
+                let (slot, addr) = self.lanes_slot(*from);
+                if from.bytes() > 16 && (from.count as u32).is_power_of_two() && matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+                    let Some(lane) = Lane::from_type(from.machine) else { return Ok(None) };
+                    let chunk_lanes = 16 / from.size;
+                    let chunk_vec = Type::Vec { lane, count: chunk_lanes as u8 };
+                    let chunk_off = (i32::from(idx) / chunk_lanes) * 16;
+                    let sub_idx = (i32::from(idx) % chunk_lanes) as u8;
+                    self.copy_bytes(addr, 0, x, 0, chunk_off);
+                    let chunk = self.ins().load(chunk_vec, x, chunk_off);
+                    let updated = self.ins().insert(chunk, val, sub_idx);
+                    self.ins().stack_store(updated, slot, chunk_off);
+                    self.copy_bytes(addr, chunk_off + 16, x, chunk_off + 16, from.bytes() - (chunk_off + 16));
+                    return Ok(Some(addr));
+                }
+                self.copy_bytes(addr, 0, x, 0, from.bytes());
+                self.ins().stack_store(val, slot, i32::from(idx) * from.size);
+                Ok(Some(addr))
+            }
+            (Simd::Shuffle, &[x, y, _]) => self.wide_shuffle(origin, (*from, *to), (x, y)),
+            _ => Ok(None),
+        }
+    }
+
+    fn wide_shuffle(&mut self, origin: &SiteOrigin, (from, to): (Lanes, Lanes), (x, y): (Value, Value)) -> Result<Option<Value>> {
+        if from.count <= 0
+            || to.count <= 0
+            || !(from.count as u32).is_power_of_two()
+            || !(to.count as u32).is_power_of_two()
+            || from.size != to.size
+            || to.count > 64
+            || !matches!(Target::host().arch, Arch::X64 | Arch::Arm64)
+        {
+            return Ok(None);
+        }
+        let Some(mut mask) = self.shuffle_const_mask_wide(origin, from.count as usize, to.count as usize) else { return Ok(None) };
+        let (in_lanes, in_x, in_y) = if from.bytes() < 8 {
+            let Some((wf, wf_ty)) = from.widened() else { return Ok(None) };
+            let wx_val = self.widen_sub8(from.bytes(), wf_ty, x);
+            let wy_val = self.widen_sub8(from.bytes(), wf_ty, y);
+            let wx = self.store_vec(wx_val, 8);
+            let wy = self.store_vec(wy_val, 8);
+            for slot in &mut mask[..to.count as usize] {
+                if *slot >= from.count as u8 {
+                    *slot = wf.count as u8 + (*slot - from.count as u8);
+                }
+            }
+            (wf, wx, wy)
+        } else {
+            (from, x, y)
+        };
+        let (out_lanes, narrow_bytes) = if to.bytes() < 8 {
+            let Some((wt, _)) = to.widened() else { return Ok(None) };
+            (wt, Some(to.bytes()))
+        } else {
+            (to, None)
+        };
+        let chunk_bytes = if in_lanes.bytes() >= 16 && out_lanes.bytes() >= 16 { 16 } else { 8 };
+        let chunk_lanes = (chunk_bytes / out_lanes.size) as usize;
+        let Some(chunk_lane) = Lane::from_type(out_lanes.machine) else { return Ok(None) };
+        let chunk_vec = Type::Vec { lane: chunk_lane, count: chunk_lanes as u8 };
+        let int_vec = Type::Vec { lane: chunk_lane.int_mask(), count: chunk_lanes as u8 };
+        let in_chunks = (in_lanes.bytes() / chunk_bytes) as usize;
+        let out_chunks = (out_lanes.bytes() / chunk_bytes) as usize;
+        let (slot, addr) = self.lanes_slot(out_lanes);
+        for oc in 0..out_chunks {
+            let sub = &mask[oc * chunk_lanes..(oc + 1) * chunk_lanes];
+            let chunk = self.shuffle_chunk((chunk_vec, int_vec), (chunk_bytes, chunk_lanes), in_chunks, (in_x, in_y), sub);
+            self.ins().stack_store(chunk, slot, oc as i32 * chunk_bytes);
+        }
+        if let Some(bytes) = narrow_bytes {
+            let (_, out_addr) = self.lanes_slot(to);
+            self.copy_bytes(out_addr, 0, addr, 0, bytes);
+            return Ok(Some(out_addr));
+        }
+        Ok(Some(addr))
+    }
+
+    fn shuffle_chunk(&mut self, (chunk_vec, int_vec): (Type, Type), (chunk_bytes, chunk_lanes): (i32, usize), in_chunks: usize, (in_x, in_y): (Value, Value), sub: &[u8]) -> Value {
+        let mut cids = Vec::with_capacity(4);
+        let mut items = [(0usize, 0u8); 16];
+        for (j, &m) in sub.iter().enumerate() {
+            let cid = usize::from(m) / chunk_lanes;
+            let lane = (usize::from(m) % chunk_lanes) as u8;
+            items[j] = (cid, lane);
+            if !cids.contains(&cid) {
+                cids.push(cid);
+            }
+        }
+        let load_chunk = |lower: &mut Self, cid: usize| {
+            let ptr = if cid < in_chunks { in_x } else { in_y };
+            let off = ((cid % in_chunks) as i32) * chunk_bytes;
+            lower.ins().load(chunk_vec, ptr, off)
+        };
+        if cids.len() == 1 {
+            let v = load_chunk(self, cids[0]);
+            if (0..chunk_lanes).all(|j| items[j].1 == j as u8) {
+                return v;
+            }
+            let mut m = [0u8; 16];
+            for j in 0..chunk_lanes {
+                m[j] = items[j].1;
+            }
+            return self.ins().shuffle(v, v, m);
+        }
+        if cids.len() == 2 {
+            let (v0, v1) = (load_chunk(self, cids[0]), load_chunk(self, cids[1]));
+            let mut m = [0u8; 16];
+            for j in 0..chunk_lanes {
+                m[j] = if items[j].0 == cids[0] { items[j].1 } else { chunk_lanes as u8 + items[j].1 };
+            }
+            return self.ins().shuffle(v0, v1, m);
+        }
+        let zero = (2 * chunk_lanes) as u8;
+        let mut acc = None;
+        for pair in cids.chunks(2) {
+            let ca = pair[0];
+            let opt_cb = pair.get(1).copied();
+            let va = load_chunk(self, ca);
+            let vb = opt_cb.map_or(va, |cb| load_chunk(self, cb));
+            let mut m = [zero; 16];
+            for j in 0..chunk_lanes {
+                if items[j].0 == ca {
+                    m[j] = items[j].1;
+                } else if Some(items[j].0) == opt_cb {
+                    m[j] = chunk_lanes as u8 + items[j].1;
+                }
+            }
+            let shuf = self.ins().shuffle(va, vb, m);
+            let part = self.bitcast_vec(int_vec, shuf);
+            acc = Some(match acc {
+                Some(prev) => self.ins().bor(prev, part),
+                None => part,
+            });
+        }
+        let res = match acc {
+            Some(v) => v,
+            None => self.ins().iconst(int_vec, 0),
+        };
+        self.bitcast_vec(chunk_vec, res)
+    }
+
+    pub(super) fn vec_cast(&mut self, (from, from_vec): (&Lanes, Type), to: &Lanes, x: Value) -> Result<Option<Value>> {
+        let Some(to_vec) = vec_type(to) else { return Ok(None) };
+        if from.count != to.count {
+            return Ok(None);
+        }
+        let v = self.ins().load(from_vec, x, 0);
+        let out = match (from.num, to.num) {
+            (Num::Int { ty: a, signed }, Num::Int { ty: b, .. }) => {
+                if a == b {
+                    v
+                } else if a.bytes() < b.bytes() {
+                    if signed { self.ins().sextend(to_vec, v) } else { self.ins().uextend(to_vec, v) }
+                } else {
+                    self.ins().ireduce(to_vec, v)
+                }
+            }
+            (Num::Float(a), Num::Float(b)) => {
+                if a == b {
+                    v
+                } else if a == Type::F32 {
+                    self.ins().fpromote(to_vec, v)
+                } else {
+                    self.ins().fdemote(to_vec, v)
+                }
+            }
+            (Num::Int { ty: a, signed }, Num::Float(b)) if a.bytes() == b.bytes() || a.bytes() * 2 == b.bytes() => {
+                if signed { self.ins().fcvt_from_sint(to_vec, v) } else { self.ins().fcvt_from_uint(to_vec, v) }
+            }
+            (Num::Float(a), Num::Int { ty: b, signed }) if a.bytes() == b.bytes() => {
+                if signed { self.ins().fcvt_to_sint_sat(to_vec, v) } else { self.ins().fcvt_to_uint_sat(to_vec, v) }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(self.store_vec(out, to_vec.bytes())))
+    }
+
+    fn eval_cast(&mut self, (from, to): (Lanes, Lanes), x: Value) -> Result<Option<Value>> {
+        if from.count != to.count || from.count <= 0 || !(from.count as u32).is_power_of_two() || !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+            return Ok(None);
+        }
+        if let Some(vec_ty) = vec_type(&from)
+            && let Some(res) = self.vec_cast((&from, vec_ty), &to, x)?
+        {
+            return Ok(Some(res));
+        }
+        if let Some(mid) = cast_step_lanes(from, to) {
+            let Some(m_val) = self.eval_core_half(Simd::Cast, (&from, &mid), &[x])? else { return Ok(None) };
+            return self.eval_core_half(Simd::Cast, (&mid, &to), &[m_val]);
+        }
+        if from.bytes() <= 16 && to.bytes() <= 16 && (from.bytes() < 8 || to.bytes() < 8) {
+            return self.sub8_cast((from, to), x);
+        }
+        Ok(None)
+    }
+
+    fn sub8_cast(&mut self, (from, to): (Lanes, Lanes), x: Value) -> Result<Option<Value>> {
+        match (from.num, to.num) {
+            (Num::Int { .. }, Num::Int { .. }) if from.size == to.size => {
+                let (_, addr) = self.lanes_slot(to);
+                self.copy_bytes(addr, 0, x, 0, from.bytes());
+                Ok(Some(addr))
+            }
+            (Num::Int { signed, .. }, Num::Int { .. }) if to.size == from.size * 2 => {
+                let Some((wf, wf_ty)) = from.widened() else { return Ok(None) };
+                let w = self.widen_sub8(from.bytes(), wf_ty, x);
+                let Some(lane) = Lane::from_type(to.machine) else { return Ok(None) };
+                let wide_to = Type::Vec { lane, count: wf.count as u8 };
+                let out = if signed { self.ins().sextend(wide_to, w) } else { self.ins().uextend(wide_to, w) };
+                let tmp = self.store_vec(out, wide_to.bytes());
+                let (_, addr) = self.lanes_slot(to);
+                self.copy_bytes(addr, 0, tmp, 0, to.bytes());
+                Ok(Some(addr))
+            }
+            (Num::Int { .. }, Num::Int { .. }) if from.size == to.size * 2 => {
+                let Some(fl) = Lane::from_type(from.machine) else { return Ok(None) };
+                let Some(tl) = Lane::from_type(to.machine) else { return Ok(None) };
+                let wf_ty = Type::Vec { lane: fl, count: (16 / from.size) as u8 };
+                let wt_ty = Type::Vec { lane: tl, count: (8 / to.size) as u8 };
+                let slot16 = self.b.create_stack_slot(16, 4);
+                let addr16 = self.ins().stack_addr(Type::I64, slot16, 0);
+                let z = self.ins().iconst(Type::I64, 0);
+                self.ins().stack_store(z, slot16, 0);
+                self.ins().stack_store(z, slot16, 8);
+                self.copy_bytes(addr16, 0, x, 0, from.bytes());
+                let wf = self.ins().stack_load(wf_ty, slot16, 0);
+                let out = self.ins().ireduce(wt_ty, wf);
+                let tmp = self.store_vec(out, 8);
+                let (_, addr) = self.lanes_slot(to);
+                self.copy_bytes(addr, 0, tmp, 0, to.bytes());
+                Ok(Some(addr))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn wide_split_simd(&mut self, op: Simd, (from, to): (&Lanes, &Lanes), args: &[Value]) -> Result<Option<Value>> {
@@ -456,5 +720,26 @@ impl Lower<'_, '_> {
         let id = self.slots.rodata(&raw, &[]);
         let addr = self.emit_symbol(SymbolSource::Rodata(id));
         self.ins().load(mask_vec, addr, 0)
+    }
+}
+
+fn cast_step_lanes(from: Lanes, to: Lanes) -> Option<Lanes> {
+    match (from.num, to.num) {
+        (Num::Int { signed, .. }, Num::Int { .. }) if to.size > from.size * 2 => {
+            let size = from.size * 2;
+            let ty = int_for_bytes(size)?;
+            Some(Lanes { num: Num::Int { ty, signed }, machine: ty, size, count: from.count })
+        }
+        (Num::Int { signed, .. }, Num::Int { .. }) if from.size > to.size * 2 => {
+            let size = from.size / 2;
+            let ty = int_for_bytes(size)?;
+            Some(Lanes { num: Num::Int { ty, signed }, machine: ty, size, count: from.count })
+        }
+        (Num::Int { ty: a, signed }, Num::Float(b)) if a.bytes() < b.bytes() && (from.bytes() < 8 || b.bytes() > a.bytes() * 2) => {
+            let size = from.size * 2;
+            let ty = int_for_bytes(size)?;
+            Some(Lanes { num: Num::Int { ty, signed }, machine: ty, size, count: from.count })
+        }
+        _ => None,
     }
 }

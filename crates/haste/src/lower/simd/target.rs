@@ -5,6 +5,13 @@ use crate::host::{HostSymbol, X86Symbol};
 
 use super::super::Lower;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PtestMode {
+    Z,
+    C,
+    Nzc,
+}
+
 impl Lower<'_, '_> {
     pub(in crate::lower) fn shuffle_dyn(&mut self, args: &[Value], tbl: bool) -> Result<Value> {
         let &[table, index] = args else { bail!("byte shuffle takes two vectors") };
@@ -274,6 +281,46 @@ impl Lower<'_, '_> {
                     Ok(Some(self.store_vec(v, 16)))
                 }
             }
+            (X86Symbol::Minss | X86Symbol::Maxss, &[a, b]) => {
+                let va = self.ins().load(f32x4, a, 0);
+                let mm = self.fminmax_128(f32x4, x86 == X86Symbol::Maxss, a, b, 0);
+                let res = self.ins().shuffle(mm, va, [0, 5, 6, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                Ok(Some(self.store_vec(res, 16)))
+            }
+            (X86Symbol::Minsd | X86Symbol::Maxsd, &[a, b]) => {
+                let va = self.ins().load(f64x2, a, 0);
+                let mm = self.fminmax_128(f64x2, x86 == X86Symbol::Maxsd, a, b, 0);
+                let res = self.ins().shuffle(mm, va, [0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                Ok(Some(self.store_vec(res, 16)))
+            }
+            (
+                X86Symbol::Ptestnzc
+                | X86Symbol::Ptestnzc256
+                | X86Symbol::Vtestnzcps
+                | X86Symbol::Vtestnzcpd
+                | X86Symbol::Vtestzps256
+                | X86Symbol::Vtestcps256
+                | X86Symbol::Vtestnzcps256
+                | X86Symbol::Vtestzpd256
+                | X86Symbol::Vtestcpd256
+                | X86Symbol::Vtestnzcpd256,
+                &[a, b],
+            ) => {
+                let i64x2 = Type::Vec { lane: Lane::I64, count: 2 };
+                let (ty, wide, mask_lane, mode) = match x86 {
+                    X86Symbol::Ptestnzc => (i64x2, false, None, PtestMode::Nzc),
+                    X86Symbol::Ptestnzc256 => (i64x2, true, None, PtestMode::Nzc),
+                    X86Symbol::Vtestnzcps => (i32x4, false, Some(Lane::I32), PtestMode::Nzc),
+                    X86Symbol::Vtestnzcpd => (i64x2, false, Some(Lane::I64), PtestMode::Nzc),
+                    X86Symbol::Vtestzps256 => (i32x4, true, Some(Lane::I32), PtestMode::Z),
+                    X86Symbol::Vtestcps256 => (i32x4, true, Some(Lane::I32), PtestMode::C),
+                    X86Symbol::Vtestnzcps256 => (i32x4, true, Some(Lane::I32), PtestMode::Nzc),
+                    X86Symbol::Vtestzpd256 => (i64x2, true, Some(Lane::I64), PtestMode::Z),
+                    X86Symbol::Vtestcpd256 => (i64x2, true, Some(Lane::I64), PtestMode::C),
+                    _ => (i64x2, true, Some(Lane::I64), PtestMode::Nzc),
+                };
+                Ok(Some(self.vec_ptest(ty, wide, mask_lane, mode, (a, b))))
+            }
             (X86Symbol::Pmulhrsw128 | X86Symbol::Pmulhrsw256, &[a, b]) => {
                 let wide = x86 == X86Symbol::Pmulhrsw256;
                 let slot = self.b.create_stack_slot(if wide { 32 } else { 16 }, if wide { 5 } else { 4 });
@@ -367,6 +414,49 @@ impl Lower<'_, '_> {
     fn fminmax_128(&mut self, ty: Type, max: bool, a: Value, b: Value, off: i32) -> Value {
         let (va, vb) = (self.ins().load(ty, a, off), self.ins().load(ty, b, off));
         if max { self.ins().fmax(va, vb) } else { self.ins().fmin(va, vb) }
+    }
+
+    fn vec_ptest(&mut self, ty: Type, wide: bool, mask_lane: Option<Lane>, mode: PtestMode, (a, b): (Value, Value)) -> Value {
+        let mask = match mask_lane {
+            Some(Lane::I32) => {
+                let s = self.ins().iconst(Type::I32, 0x8000_0000_u32 as i64);
+                Some(self.ins().splat(ty, s))
+            }
+            Some(Lane::I64) => {
+                let s = self.ins().iconst(Type::I64, i64::MIN);
+                Some(self.ins().splat(ty, s))
+            }
+            _ => None,
+        };
+        let mut combine = |invert_a: bool| {
+            let mut eval = |off: i32| {
+                let (va, vb) = (self.ins().load(ty, a, off), self.ins().load(ty, b, off));
+                let lhs = if invert_a { self.ins().bnot(va) } else { va };
+                let r = self.ins().band(lhs, vb);
+                mask.map_or(r, |m| self.ins().band(r, m))
+            };
+            let lo = eval(0);
+            if wide {
+                let hi = eval(16);
+                self.ins().bor(lo, hi)
+            } else {
+                lo
+            }
+        };
+        let flag = match mode {
+            PtestMode::Z | PtestMode::C => {
+                let acc = combine(mode == PtestMode::C);
+                let red = self.ins().reduce(ReduceOp::Or, acc);
+                self.ins().icmp_imm(IntCC::Equal, red, 0)
+            }
+            PtestMode::Nzc => {
+                let (ab, nab) = (combine(false), combine(true));
+                let (r1, r2) = (self.ins().reduce(ReduceOp::Or, ab), self.ins().reduce(ReduceOp::Or, nab));
+                let (nz1, nz2) = (self.ins().icmp_imm(IntCC::NotEqual, r1, 0), self.ins().icmp_imm(IntCC::NotEqual, r2, 0));
+                self.ins().band(nz1, nz2)
+            }
+        };
+        self.resize(flag, (Type::I8, false), Type::I32)
     }
 
     fn psign_128(&mut self, ty: Type, a: Value, b: Value, off: i32) -> Value {
