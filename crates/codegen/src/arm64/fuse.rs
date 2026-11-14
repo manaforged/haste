@@ -354,6 +354,11 @@ fn bfx_match(
                     let top = (const_of(func, plan, l_amt_val, &def)? as u32) & (bits - 1);
                     (shr_amt >= top).then(|| (false, op == Binary::Sshr, x, src, (shr_amt - top) as u8, (bits - shr_amt) as u8))
                 }
+                Op::Convert(Convert::Sextend, inner) if op == Binary::Sshr && func.ty(inner).is_small_int() && func.ty(inner).bits() < bits => {
+                    let ib = func.ty(inner).bits();
+                    let lsb = shr_amt.min(ib - 1);
+                    Some((false, true, x, inner, lsb as u8, (ib - lsb) as u8))
+                }
                 _ => None,
             }
         }
@@ -478,19 +483,37 @@ fn try_fuse_bnot(
     false
 }
 
+pub(super) fn elided_use_end(func: &Function, plan: &Plan<Reg>, insts: &[Inst], pos: usize, mut target: Value) -> Option<usize> {
+    let mut last = None;
+    for (u_pos, &ui) in insts.iter().enumerate().skip(pos + 1) {
+        let ud = &func.insts[ui.index()];
+        let mut used = false;
+        ud.op.for_operands(|v| used |= v == target);
+        if !used { continue; }
+        if matches!(ud.op, Op::Convert(Convert::Uextend, _)) && let Some(ur) = ud.result && plan.elided[ur.index()] { target = ur; } else { last = Some(u_pos); }
+    }
+    last
+}
+
 pub(super) fn eon_inner(func: &Function, plan: &Plan<Reg>, x: Value, def: impl Fn(Value) -> Option<Inst>) -> Option<(Value, Value)> {
     if !plan.elided[x.index()] { return None; }
     let Op::Binary(Binary::Bxor, a, b) = func.insts[def(x)?.index()].op else { return None };
     Some((a, b))
 }
 
-fn try_fuse_eon(func: &Function, plan: &mut Plan<Reg>, info: (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, res): (usize, usize, Value), inner: Value) -> bool {
-    if !matches!(func.ty(res), Type::I32 | Type::I64) { return false; }
+fn try_fuse_eon(func: &Function, plan: &mut Plan<Reg>, info @ (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, res): (usize, usize, Value), inner: Value) -> bool {
+    let ty = func.ty(res);
+    if !matches!(ty, Type::I32 | Type::I64) { return false; }
     let Some((ipos, iinst)) = local_single(plan, info, b_idx, pos, inner) else { return false };
     let Op::Binary(Binary::Bxor, a, b) = func.insts[iinst.index()].op else { return false };
-    if !preserved(func, plan, b_idx, ipos, pos, None, a) || !preserved(func, plan, b_idx, ipos, pos, None, b) {
-        return false;
-    }
+    let shift_ok = [(a, b), (b, a)].into_iter().any(|(other, cand)| {
+        plan.elided[cand.index()] && uses[cand.index()] == 1 && preserved(func, plan, b_idx, ipos, pos, None, other)
+            && pos_of[cand.index()].is_some_and(|(sb, spos, sinst)| {
+                sb == b_idx && spos < ipos && shift_parts(&func.insts[sinst.index()].op, plan)
+                    .is_some_and(|(sop, src, imm)| alu_shift(true, ty, sop, imm).is_some() && preserved(func, plan, b_idx, spos, pos, Some(ipos), src))
+            })
+    });
+    if (!preserved(func, plan, b_idx, ipos, pos, None, a) || !preserved(func, plan, b_idx, ipos, pos, None, b)) && !shift_ok { return false; }
     plan.elided[inner.index()] = true;
     true
 }
@@ -615,13 +638,19 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                 fuse_shift_mask(func, plan, (&uses, &pos_of), (b_idx, pos), x, y);
             }
             if let Op::Unary(Unary::Bnot, inner) = data.op {
-                try_fuse_eon(func, plan, (&uses, &pos_of), (b_idx, pos, res), inner);
+                if !try_fuse_eon(func, plan, (&uses, &pos_of), (b_idx, pos, res), inner)
+                    && matches!(func.ty(res), Type::I32 | Type::I64)
+                {
+                    try_fuse_shift(func, plan, (&uses, &pos_of), (b_idx, pos, res, Binary::Bxor), (inner, res));
+                }
                 continue;
             }
             if let Op::Unary(Unary::Ineg, inner) = data.op
                 && matches!(func.ty(res), Type::I32 | Type::I64)
             {
-                try_fuse_flag_operand(func, plan, (&uses, &pos_of), (b_idx, pos), inner);
+                if !try_fuse_flag_operand(func, plan, (&uses, &pos_of), (b_idx, pos), inner) {
+                    try_fuse_shift(func, plan, (&uses, &pos_of), (b_idx, pos, res, Binary::Isub), (inner, res));
+                }
                 continue;
             }
             if let Op::Binary(op @ (Binary::Ishl | Binary::Ushr | Binary::Sshr), x, y) = data.op
@@ -720,8 +749,10 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                         }
                     }
                     Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
-                        if let Some(res) = func.insts[inst.index()].result && !plan.elided[res.index()] {
-                            cmp_tst.push((b_idx, pos, res, lhs, rhs));
+                        if let Some(res) = func.insts[inst.index()].result
+                            && let Some(end_pos) = if !plan.elided[res.index()] { Some(pos) } else { elided_use_end(func, plan, &block.insts, pos, res) }
+                        {
+                            cmp_tst.push((b_idx, pos, end_pos, lhs, rhs));
                         }
                     }
                     _ => {}
@@ -732,10 +763,9 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
             plan.elided[cond_val.index()] = true;
             if let Some(m) = m { plan.elided[m.index()] = true; }
         }
-        for (b_idx, cpos, res, lhs, rhs) in cmp_tst {
-            if !plan.elided[res.index()]
-                && let Some((m, mpos, x, y)) = zero_cmp_band(func, plan, &uses, &pos_of, b_idx, lhs, rhs)
-                && mpos < cpos && can_elide_band(func, plan, b_idx, (mpos, cpos, None), (x, y))
+        for (b_idx, cpos, end_pos, lhs, rhs) in cmp_tst {
+            if let Some((m, mpos, x, y)) = zero_cmp_band(func, plan, &uses, &pos_of, b_idx, lhs, rhs)
+                && mpos < cpos && can_elide_band(func, plan, b_idx, (mpos, end_pos, None), (x, y))
             {
                 plan.elided[m.index()] = true;
             }
