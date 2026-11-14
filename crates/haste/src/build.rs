@@ -199,7 +199,7 @@ fn finish_batch(
         Image::build(&mut cx, &reached, mode)?
     };
     let codegen_span = codegen_clock.elapsed();
-    save_batch_substrate(&cx, &image, drop_finals, substrate, pre_builder);
+    save_batch_substrate(&cx, &image, (drop_finals, kind), substrate, pre_builder);
     let labels = valid.iter().map(|item| cx.name(*item).to_owned()).collect();
     Ok(Batch { kind, store: Some(cx.release().0), labels, roots, reached, image, broken, reach_span, codegen_span })
 }
@@ -223,21 +223,20 @@ fn export_pre_summaries(cx: &mut sema::Context<'_>, drop_finals: bool, slot: Opt
     Some(builders)
 }
 
-const MAX_TOOLCHAIN_SUBSTRATE_BYTES: usize = 8 * 1024 * 1024 - 1;
-
 fn save_substrate_layer(
-    mut builder: crate::substrate::SubstrateBuilder,
+    builder: crate::substrate::SubstrateBuilder,
+    (workspace, kind): (u64, BatchKind),
     existing: Option<&crate::substrate::Substrate>,
-    max_bytes: Option<usize>,
     save: impl FnOnce(&crate::substrate::Substrate) -> Result<PathBuf>,
 ) -> Result<()> {
     if builder.is_empty() {
         return Ok(());
     }
+    let mut builder = builder.consumer(workspace, kind as u32);
     if let Some(ex) = existing {
         builder.merge_from(ex)?;
     }
-    let sub = builder.build_within(max_bytes)?;
+    let sub = builder.build()?;
     if sub.has_entries() {
         save(&sub)?;
     }
@@ -247,7 +246,7 @@ fn save_substrate_layer(
 fn save_batch_substrate(
     cx: &sema::Context<'_>,
     image: &Image,
-    drop_finals: bool,
+    (drop_finals, kind): (bool, BatchKind),
     slot: Option<&SubstrateSlot>,
     pre_builder: Option<PreBuilders>,
 ) {
@@ -264,12 +263,13 @@ fn save_batch_substrate(
             image.export_sysroot_stencils(Some(&mut builders.toolchain), builders.deps.as_mut())?;
         }
         image.export_inline_meta(Some(&mut builders.toolchain), builders.deps.as_mut())?;
-        save_substrate_layer(builders.toolchain, slot.toolchain.as_deref(), Some(MAX_TOOLCHAIN_SUBSTRATE_BYTES), crate::substrate::Substrate::save_toolchain)?;
+        let workspace = slot.workspace_key.or(slot.deps_key).unwrap_or(slot.toolchain_key);
+        save_substrate_layer(builders.toolchain, (workspace, kind), slot.toolchain.as_deref(), crate::substrate::Substrate::save_toolchain)?;
         if let Some(deps_builder) = builders.deps {
-            save_substrate_layer(deps_builder, slot.deps.as_deref(), None, crate::substrate::Substrate::save_deps)?;
+            save_substrate_layer(deps_builder, (workspace, kind), slot.deps.as_deref(), crate::substrate::Substrate::save_deps)?;
         }
         if let Some(ws_builder) = builders.workspace {
-            save_substrate_layer(ws_builder, slot.workspace.as_deref(), None, crate::substrate::Substrate::save_workspace)?;
+            save_substrate_layer(ws_builder, (workspace, kind), slot.workspace.as_deref(), crate::substrate::Substrate::save_workspace)?;
         }
         Ok(())
     })();

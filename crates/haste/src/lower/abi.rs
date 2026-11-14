@@ -254,8 +254,8 @@ fn table(chunks: impl IntoIterator<Item = (Type, i32)>) -> Parts {
     }
     match len {
         0 => Parts::Bytes,
-        1 => Parts::One(words[0].0),
-        2 => Parts::Pair(words[0].0, words[1].0, words[1].1),
+        1 if words[0].1 == 0 => Parts::One(words[0].0),
+        2 if words[0].1 == 0 => Parts::Pair(words[0].0, words[1].0, words[1].1),
         _ => Parts::Words(words, len as u8),
     }
 }
@@ -286,26 +286,68 @@ pub(super) fn packed_word_parts(size: u32) -> Parts {
     }
 }
 
-/// The integer chunks of a memory value of at most two words, cut at each field, variant field and tag boundary so each field is its own part.
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        match merged.last_mut() {
+            Some(prev) if lo <= prev.1 => prev.1 = prev.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
+fn enum_occupied(layout: &Layout, size: u64, dl: &TargetDataLayout, cuts: &mut Vec<u64>) -> Vec<(u64, u64)> {
+    let Variants::Multiple { tag, tag_field, variants, .. } = &layout.variants else {
+        cuts.extend([0, size]);
+        return vec![(0, size)];
+    };
+    let at = layout.fields.offset(tag_field.index()).bytes();
+    let tag_end = at.saturating_add(tag.primitive().size(dl).bytes()).min(size);
+    cuts.extend([at, tag_end]);
+    let mut ranges = Vec::with_capacity(variants.len() + 1);
+    if at < tag_end {
+        ranges.push((at, tag_end));
+    }
+    for variant in variants.iter().filter(|variant| !variant.is_uninhabited()) {
+        cuts.extend(variant.field_offsets.iter().map(|offset| offset.bytes()));
+        let Some(start) = variant.field_offsets.iter().map(|offset| offset.bytes()).min() else {
+            continue;
+        };
+        let end = variant.size.bytes().min(size);
+        if start < end {
+            ranges.push((start, end));
+        }
+    }
+    if layout.fields.count() > 1 {
+        cuts.extend([0, size]);
+        return vec![(0, size)];
+    }
+    let occupied = merge_ranges(ranges);
+    for &(lo, hi) in &occupied {
+        cuts.extend([lo, hi]);
+    }
+    occupied
+}
+
+/// The integer chunks of a memory value of at most two words, cut at each field, variant field and tag boundary, skipping padding gaps between enum variants.
 fn field_parts(layout: &Layout) -> Parts {
     let size = layout.size.bytes();
     let Ok(dl) = target() else { return word_parts(size) };
     if !(1..=16).contains(&size) || matches!(layout.fields, FieldsShape::Union(_)) {
         return word_parts(size);
     }
-    let mut cuts = vec![0, size];
+    let mut cuts = Vec::new();
+    let occupied = enum_occupied(layout, size, dl, &mut cuts);
     if let FieldsShape::Arbitrary { offsets, .. } = &layout.fields {
         cuts.extend(offsets.iter().map(|offset| offset.bytes()));
-    }
-    if let Variants::Multiple { tag, tag_field, variants, .. } = &layout.variants {
-        let at = layout.fields.offset(tag_field.index()).bytes();
-        cuts.extend([at, at + tag.primitive().size(dl).bytes()]);
-        cuts.extend(variants.iter().flat_map(|variant| variant.field_offsets.iter().map(|offset| offset.bytes())));
     }
     cuts.retain(|&cut| cut <= size);
     cuts.sort_unstable();
     cuts.dedup();
-    match table(cuts.windows(2).flat_map(|span| span_chunks(span[0], span[1]))) {
+    let spans = cuts.windows(2).filter(|span| occupied.iter().any(|&(lo, hi)| span[0] >= lo && span[1] <= hi));
+    match table(spans.flat_map(|span| span_chunks(span[0], span[1]))) {
         Parts::Bytes => word_parts(size),
         found => found,
     }
