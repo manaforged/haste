@@ -616,7 +616,7 @@ pub fn untuple_typed(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Res
             (res, ret)
         }
         _ => {
-            let Some(info) = cx.ensure_closure(callee) else { bail!("a closure whose defining body was not inferred") };
+            let info = cx.ensure_closure_res(callee, false)?;
             let Some(call_once) = cx.call_once() else { bail!("core has no `FnOnce::call_once`") };
             (Res::fn_of(&cx.types, call_once, &[callee, tuple]), info.closure.ret)
         }
@@ -667,7 +667,7 @@ fn finish_closure(cx: &mut Context<'_>, mut typed: Typed, info: &ClosureInfo, en
 
 /// The typed form of `Future::poll` at the coroutine type `ty`: its defining body, resumed with the pinned coroutine and the task context, returning `Poll` of its output.
 pub fn coroutine_typed(cx: &mut Context<'_>, poll: ItemRef, ty: Ty) -> Result<Typed> {
-    let Some(info) = cx.ensure_full_closure(ty) else { bail!("a coroutine whose defining body was not inferred") };
+    let info = cx.ensure_closure_res(ty, true)?;
     let (params, ret) = super::detached(cx, poll, |infer| infer.fn_types(poll, &[ty]))?;
     let mut typed = (*info.typed).clone();
     let first = typed.locals.len() as u32;
@@ -678,7 +678,7 @@ pub fn coroutine_typed(cx: &mut Context<'_>, poll: ItemRef, ty: Ty) -> Result<Ty
 
 /// The typed form of the function that the closure type `ty` runs: its defining body, with an environment parameter and the closure's own parameters.
 pub fn closure_typed(cx: &mut Context<'_>, ty: Ty) -> Result<Typed> {
-    let Some(info) = cx.ensure_full_closure(ty) else { bail!("a closure whose defining body was not inferred") };
+    let info = cx.ensure_closure_res(ty, true)?;
     let mut typed = (*info.typed).clone();
     let env = cx.closure_takes_env(ty).then(|| {
         typed.locals.push(Local { ty: cx.types.intern(Kind::Ref(Mut::Mut, info.env)) });
@@ -691,37 +691,97 @@ pub fn closure_typed(cx: &mut Context<'_>, ty: Ty) -> Result<Typed> {
 impl<'a> Context<'a> {
     /// Returns the recorded closure info for `ty`, lazily inferring its defining body once when needed.
     pub fn ensure_closure(&mut self, ty: Ty) -> Option<Arc<ClosureInfo>> {
-        if let Some(info) = self.store.closures.get(&ty) {
-            return Some(info);
-        }
-        self.infer_closure_owner(ty)?;
-        self.store.closures.get(&ty)
+        self.ensure_closure_res(ty, false).ok()
     }
 
     /// Returns the finished closure info for `ty` with complete body tables, inferring its defining body if only a signature stub is present.
     pub fn ensure_full_closure(&mut self, ty: Ty) -> Option<Arc<ClosureInfo>> {
-        if let Some(info) = self.store.closures.get(&ty).filter(|info| !info.typed.exprs.is_empty()) {
-            return Some(info);
-        }
-        self.infer_closure_owner(ty)?;
-        self.store.closures.get(&ty).filter(|info| !info.typed.exprs.is_empty())
+        self.ensure_closure_res(ty, true).ok()
     }
 
-    fn infer_closure_owner(&mut self, ty: Ty) -> Option<()> {
-        let Kind::Closure(parent, substs, _) = *self.types.kind(ty) else { return None };
+    pub(in crate::sema) fn ensure_closure_env(&mut self, ty: Ty) -> Result<Ty> {
+        if let Some(info) = self.closure_ready(ty, false) {
+            return Ok(info.env);
+        }
+        match self.load_closure_owner(ty, false)? {
+            Some(info) => Ok(info.env),
+            None => self.async_coroutine_env(ty)?.ok_or_else(|| anyhow::anyhow!("layout of a closure whose defining body was not inferred")),
+        }
+    }
+
+    fn closure_ready(&self, ty: Ty, full: bool) -> Option<Arc<ClosureInfo>> {
+        self.store.closures.get(&ty).filter(|info| !full || !info.typed.exprs.is_empty())
+    }
+
+    fn ensure_closure_res(&mut self, ty: Ty, full: bool) -> Result<Arc<ClosureInfo>> {
+        if let Some(info) = self.closure_ready(ty, full) {
+            return Ok(info);
+        }
+        self.load_closure_owner(ty, full)?.ok_or_else(|| anyhow::anyhow!("a closure whose defining body was not inferred"))
+    }
+
+    fn load_closure_owner(&mut self, ty: Ty, full: bool) -> Result<Option<Arc<ClosureInfo>>> {
+        let Kind::Closure(parent, substs, _) = *self.types.kind(ty) else { bail!("not a closure") };
+        if let Some(info) = self.register_final_closure((parent, substs), ty, full) {
+            return Ok(Some(info));
+        }
+        if crate::sema::reach::is_inferring((parent, substs)) {
+            return Ok(None);
+        }
+        let mut cycled = false;
         let reveals = self.store.lookups.reveals.clone();
-        reveals
-            .run(
-                self,
-                (parent, substs),
-                |cx| {
-                    let mut unlaid = Vec::new();
-                    let typed = crate::sema::reach::typed_once(cx, &(parent, substs), &mut unlaid).map_err(|msg| anyhow::anyhow!("{msg}"))?;
-                    Ok(typed.ret.unwrap_or(Ty::NONE))
-                },
-                |_| Ok(Ty::NONE),
-            )
-            .ok()
-            .map(|_| ())
+        reveals.run(
+            self,
+            (parent, substs),
+            |cx| {
+                let mut unlaid = Vec::new();
+                let typed = crate::sema::reach::typed_once(cx, &(parent, substs), &mut unlaid).map_err(|msg| anyhow::anyhow!("{msg}"))?;
+                Ok(typed.ret.unwrap_or(Ty::NONE))
+            },
+            |_| {
+                cycled = true;
+                Ok(Ty::NONE)
+            },
+        )?;
+        if let Some(info) = self.closure_ready(ty, full) {
+            return Ok(Some(info));
+        }
+        if cycled {
+            return Ok(None);
+        }
+        if let Some(info) = self.register_final_closure((parent, substs), ty, full) {
+            return Ok(Some(info));
+        }
+        let mut unlaid = Vec::new();
+        let typed = crate::sema::reach::typed_once(self, &(parent, substs), &mut unlaid).map_err(|msg| anyhow::anyhow!("{msg}"))?;
+        register(self, (parent, substs), &typed);
+        Ok(Some(self.closure_ready(ty, full).ok_or_else(|| anyhow::anyhow!("closure owner `{}` did not record closure", self.name(parent)))?))
+    }
+
+    fn register_final_closure(&mut self, instance: (ItemRef, Substs), ty: Ty, full: bool) -> Option<Arc<ClosureInfo>> {
+        let typed = self.store.finals.get(&instance)?;
+        register(self, instance, &typed);
+        self.closure_ready(ty, full)
+    }
+
+    fn async_coroutine_env(&mut self, ty: Ty) -> Result<Option<Ty>> {
+        let Kind::Closure(parent, substs, at) = *self.types.kind(ty) else { return Ok(None) };
+        let sig = self.signature(parent)?;
+        if !sig.is_async || self.body(parent)?.root.is_none_or(|root| root.0 != at) {
+            return Ok(None);
+        }
+        if sig.params.iter().any(|&(pat, _)| !matches!(*sig.body.pat(pat), crate::body::Pat::Bind { sub: None, by_ref: false, .. } | crate::body::Pat::Wild)) {
+            return Ok(None);
+        }
+        let slice = self.types.substs(substs).to_vec();
+        let params = super::detached(self, parent, |infer| {
+            let frame = infer.frame(parent, &slice)?;
+            let (params, _) = infer.with_frame(frame, |infer| infer.sig_types(&sig))?;
+            infer.settle_projections()?;
+            Ok(params.into_iter().map(|p| infer.zonk(p)).collect::<Vec<_>>())
+        })?;
+        let captures = self.types.tuple(&params);
+        let word = self.types.prim(crate::names::Primitive::Usize);
+        Ok(Some(self.types.tuple(&[word, word, captures])))
     }
 }

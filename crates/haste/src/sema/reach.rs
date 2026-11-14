@@ -708,12 +708,40 @@ fn infer_entry(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<Strin
     typed_once(cx, instance, unlaid)
 }
 
+std::thread_local! {
+    static INFERRING: std::cell::RefCell<Vec<Instance>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct InferGuard(bool);
+
+impl InferGuard {
+    fn enter(instance: Instance) -> Self {
+        INFERRING.with(|active| active.borrow_mut().push(instance));
+        Self(true)
+    }
+}
+
+impl Drop for InferGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            INFERRING.with(|active| {
+                active.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+pub(super) fn is_inferring(instance: Instance) -> bool {
+    INFERRING.with(|active| active.borrow().contains(&instance))
+}
+
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
 pub(super) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
     if let Some(typed) = cx.store.finals.get(instance).filter(|t| cx.store.lookups.skip_warm_sysroot_bodies || !matches!(&t.tables, super::infer::LazyTables::CheckOnly(_))) {
         register(cx, *instance, &typed);
         return Ok(typed);
     }
+    let _guard = InferGuard::enter(*instance);
     if let Some(result) = super::summary::typed_once_poly(cx, instance, unlaid) {
         return result;
     }
@@ -748,7 +776,7 @@ pub(super) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()>
         {
             cx.discriminants(item)?;
         }
-        if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
+        if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..) | Kind::Closure(..)) {
             cx.layout(ty)?;
         }
     }
