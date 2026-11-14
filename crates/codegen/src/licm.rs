@@ -478,8 +478,9 @@ struct Invariants<'a> {
     is_const: &'a [bool],
 }
 
-fn loop_live_counts(func: &Function, each: &Loop, is_const: &[bool], home: &[Option<Block>]) -> (usize, usize) {
+fn loop_live_counts(func: &Function, each: &Loop, is_const: &[bool], home: &[Option<Block>]) -> (usize, usize, Vec<u32>) {
     let mut seen = vec![false; func.types.len()];
+    let mut uses = vec![0_u32; func.types.len()];
     let mut gp_live = 0_usize;
     let mut vec_live = 0_usize;
     let mut count = |v: Value| {
@@ -499,15 +500,17 @@ fn loop_live_counts(func: &Function, each: &Loop, is_const: &[bool], home: &[Opt
         for &inst in &func.blocks[b].insts {
             func.insts[inst.index()].op.for_operands(|v| {
                 let vi = v.index();
-                if !is_const.get(vi).copied().unwrap_or(false)
-                    && home.get(vi).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false))
-                {
+                if is_const.get(vi).copied().unwrap_or(false) {
+                    return;
+                }
+                uses[vi] += 1;
+                if home.get(vi).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false)) {
                     count(v);
                 }
             });
         }
     }
-    (gp_live, vec_live)
+    (gp_live, vec_live, uses)
 }
 
 fn hoist(
@@ -520,7 +523,7 @@ fn hoist(
     home: &mut [Option<Block>],
 ) -> bool {
     let prov = inv.prov;
-    let (gp_live, vec_live) = loop_live_counts(func, each, inv.is_const, home);
+    let (gp_live, vec_live, loop_uses) = loop_live_counts(func, each, inv.is_const, home);
     let has_insert = (0..each.body.len())
         .filter(|&b| each.body[b])
         .flat_map(|b| &func.blocks[b].insts)
@@ -528,6 +531,7 @@ fn hoist(
     let uses = has_insert.then(|| func.use_counts());
     let mut hoisted_vec: Vec<Value> = Vec::new();
     let mut hoisted_symbols = 0_usize;
+    let mut hoisted_gp = 0_usize;
     let mut hoisted_vecs = 0_usize;
     let mut moved: Vec<Inst> = Vec::new();
     for &blk in &cfg.rpo {
@@ -546,7 +550,7 @@ fn hoist(
             }
             let is_symbol = matches!(op, Op::Symbol(_));
             let static_loc = matches!(op, Op::StackAddr(..) | Op::SlotAddr(_));
-            let sym_ok = !mem.calls || (hoisted_symbols < MAX_HOISTED_SYMBOLS && gp_live + hoisted_symbols < MAX_LOOP_GP_LIVE);
+            let sym_ok = !mem.calls || hoisted_symbols < MAX_HOISTED_SYMBOLS;
             let res_ty = func.insts[inst.index()].result.map(|r| func.ty(r));
             let is_vec_mat = res_ty.is_some_and(Type::in_float_register)
                 && matches!(op, Op::Insert(..) | Op::Shuffle(..) | Op::Const(_) | Op::Load(..) | Op::StackLoad(..));
@@ -556,8 +560,15 @@ fn hoist(
                 || mem.can_hoist_load(func, prov, head_prefix, inst)
                 || can_hoist_global_load(func, mem, prov, head_prefix, inst);
             let mut operands_invariant = true;
-            op.for_operands(|v| operands_invariant &= home.get(v.index()).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false)));
-            if movable && vec_ok && operands_invariant && let Some(res) = func.insts[inst.index()].result {
+            let mut frees_operand = false;
+            op.for_operands(|v| {
+                operands_invariant &= home.get(v.index()).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false));
+                frees_operand |= loop_uses[v.index()] == 1 && !func.ty(v).in_float_register();
+            });
+            let adds_gp = !frees_operand && !matches!(op, Op::Const(_)) && res_ty.is_some_and(|ty| !ty.in_float_register());
+            let gp_ok = !(adds_gp && op.is_speculable()) || gp_live + hoisted_gp < MAX_LOOP_GP_LIVE;
+            if movable && vec_ok && gp_ok && operands_invariant && let Some(res) = func.insts[inst.index()].result {
+                hoisted_gp += usize::from(adds_gp);
                 if is_symbol {
                     hoisted_symbols += 1;
                 }
