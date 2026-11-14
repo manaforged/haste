@@ -1,7 +1,107 @@
+use super::fuse::FuseCtx;
 use super::super::asm::Reg;
 use crate::alloc::Plan;
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 use crate::live::{Sib, SibBase};
+
+/// A condition read from compare flags: its compare, a second compare when a select reads two, and its truth table over them.
+pub(in super::super) type Root = (Value, Option<Value>, u8);
+
+/// The truth tables of the first and the second compare of a condition.
+pub(in super::super) const LEAF: [u8; 2] = [0b1010, 0b1100];
+
+pub(super) fn flag_cmp(func: &Function, op: &Op) -> bool {
+    match *op {
+        Op::Icmp(_, a, _) | Op::Fits(_, _, a, _) => !func.ty(a).is_vector() && func.ty(a) != Type::I128,
+        Op::Fcmp(cc, a, _) => !func.ty(a).is_vector() && super::super::float::BRANCHES.contains(&cc),
+        _ => false,
+    }
+}
+
+pub(super) fn parked(plan: &Plan<Reg>, v: Value) -> bool {
+    plan.homed.get(v.index()) == Some(&true)
+}
+
+pub(super) struct Tree {
+    pub(super) nodes: Vec<(Value, usize, bool, u8)>,
+    pub(super) leaves: Vec<Value>,
+    visits: u8,
+    pub(super) table: u8,
+}
+
+impl FuseCtx<'_> {
+    fn truth(&self, v: Value, max_pos: usize, tree: &mut Tree) -> Option<u8> {
+        if let Some(imm) = self.plan.const_of(v) {
+            return match crate::fold::extend(imm, self.func.ty(v), false) {
+                0 => Some(0),
+                1 => Some(0xF),
+                _ => None,
+            };
+        }
+        if let Some(&(.., table)) = tree.nodes.iter().find(|node| node.0 == v) {
+            return Some(table);
+        }
+        tree.visits += 1;
+        let (vb, pos, inst) = self.pos_of[v.index()]?;
+        let taken = self.plan.is_static(v) || self.plan.fused[v.index()] || self.plan.deferred[v.index()] || parked(self.plan, v);
+        if tree.visits > 32 || vb != self.b_idx || pos >= max_pos || taken {
+            return None;
+        }
+        let mark = (tree.nodes.len(), tree.leaves.len());
+        let op = &self.func.insts[inst.index()].op;
+        let logic = match *op {
+            Op::Convert(Convert::Uextend | Convert::Ireduce, x) => self.truth(x, pos, tree),
+            Op::Binary(Binary::Band, x, y) => self.truths(x, y, pos, tree).map(|(a, b)| a & b),
+            Op::Binary(Binary::Bor, x, y) => self.truths(x, y, pos, tree).map(|(a, b)| a | b),
+            Op::Binary(Binary::Bxor, x, y) | Op::Icmp(IntCC::NotEqual, x, y) => self.truths(x, y, pos, tree).map(|(a, b)| a ^ b),
+            Op::Icmp(IntCC::Equal, x, y) => self.truths(x, y, pos, tree).map(|(a, b)| !(a ^ b) & 0xF),
+            _ => None,
+        };
+        let (table, leaf) = match logic {
+            Some(table) => (table, false),
+            None => {
+                tree.nodes.truncate(mark.0);
+                tree.leaves.truncate(mark.1);
+                if !flag_cmp(self.func, op) || tree.leaves.len() == LEAF.len() {
+                    return None;
+                }
+                tree.leaves.push(v);
+                (LEAF[tree.leaves.len() - 1], true)
+            }
+        };
+        tree.nodes.push((v, pos, leaf, table));
+        Some(table)
+    }
+
+    fn truths(&self, x: Value, y: Value, max_pos: usize, tree: &mut Tree) -> Option<(u8, u8)> {
+        Some((self.truth(x, max_pos, tree)?, self.truth(y, max_pos, tree)?))
+    }
+
+    pub(super) fn cond_tree(&self, cond: Value, pos: usize) -> Option<Tree> {
+        let mut tree = Tree { nodes: Vec::new(), leaves: Vec::new(), visits: 0, table: 0 };
+        tree.table = self.truth(cond, pos, &mut tree)?;
+        let reads = match tree.leaves.len() {
+            1 => tree.nodes.len() > 1 && (tree.table == LEAF[0] || tree.table == !LEAF[0] & 0xF),
+            2 => matches!(tree.table.count_ones(), 1 | 3),
+            _ => false,
+        };
+        let mut refs = vec![0_u32; tree.nodes.len()];
+        *refs.last_mut()? += 1;
+        for &(v, _, leaf, _) in &tree.nodes {
+            if leaf {
+                continue;
+            }
+            let (_, _, inst) = self.pos_of[v.index()]?;
+            self.func.insts[inst.index()].op.for_operands(|o| {
+                if let Some(at) = tree.nodes.iter().position(|node| node.0 == o) {
+                    refs[at] += 1;
+                }
+            });
+        }
+        let owned = tree.nodes.iter().zip(&refs).all(|(node, &count)| self.uses[node.0.index()] == count);
+        (reads && owned).then_some(tree)
+    }
+}
 
 pub(super) fn is_zero_const(func: &Function, plan: &Plan<Reg>, v: Value) -> bool {
     plan.const_of(v).is_some_and(|imm| crate::fold::extend(imm, func.ty(v), false) == 0)
@@ -242,6 +342,7 @@ pub(super) fn mid_preserves_flags(
     func: &Function,
     plan: &Plan<Reg>,
     defs: &[Option<Inst>],
+    roots: &[Option<Root>],
     cmp_res: Value,
     inst: Inst,
     is_last: bool,
@@ -281,7 +382,7 @@ pub(super) fn mid_preserves_flags(
                 })
         }),
         Op::Select(cond_v, x, y) => {
-            (cond_v == cmp_res || x == y || plan.const_of(cond_v).is_some())
+            (cond_v == cmp_res || matches!(roots[cond_v.index()], Some((leaf, None, _)) if leaf == cmp_res) || x == y || plan.const_of(cond_v).is_some())
                 && !func.ty(x).is_vector()
                 && !operand_clobbers_flags(func, plan, defs, x)
                 && !operand_clobbers_flags(func, plan, defs, y)

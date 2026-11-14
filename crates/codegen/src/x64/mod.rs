@@ -15,7 +15,7 @@ use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
-use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, IntCC, Lane, Op, SigRef, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Lane, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{CallAbi, Target};
@@ -52,7 +52,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let Prepared { order, copied, abi, mut plan, mut frame, mut framed } = prepare(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
     let features = Features::host();
     let elided_before = plan.elided.iter().filter(|&&e| e).count();
-    location::fuse(func, &mut plan, &features);
+    let roots = location::fuse(func, &mut plan, &features);
     if plan.elided.iter().filter(|&&e| e).count() != elided_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
@@ -75,6 +75,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         relocs: Vec::new(),
         plan,
         defs,
+        roots,
         flags: None,
         last_spill: [None; 4],
         last_fspill: None,
@@ -132,6 +133,7 @@ pub(super) struct Emit<'a> {
     relocs: Vec<StencilReloc>,
     plan: Plan<Reg>,
     defs: Vec<Option<Inst>>,
+    roots: Vec<Option<location::Root>>,
     flags: Option<(Value, Cond)>,
     last_spill: [Option<(i32, Reg)>; 4],
     last_fspill: Option<(i32, Xmm, Type)>,
@@ -377,41 +379,8 @@ impl Emit<'_> {
             return;
         }
         let trap = self.trap_label();
-        let cond = match self.flags.take() {
-            Some((value, cond)) if value == condition => cond.invert(),
-            _ => self.test_cond(condition).invert(),
-        };
+        let cond = self.truth(condition).invert();
         self.asm.jcc(cond, trap);
-    }
-
-    fn test_cond(&mut self, condition: Value) -> Cond {
-        if self.plan.elided[condition.index()]
-            && let Some(inst) = self.defs[condition.index()]
-        {
-            match self.func.insts[inst.index()].op {
-                Op::Binary(Binary::Band, x, y) => {
-                    self.emit_test_band(x, y);
-                    return Cond::Ne;
-                }
-                Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), lhs, rhs) => {
-                    if let Some((x, y)) = self.elided_band_cmp(lhs, rhs) {
-                        self.emit_test_band(x, y);
-                        return int::cond(cc);
-                    }
-                }
-                _ => {}
-            }
-        }
-        self.test_value(condition);
-        Cond::Ne
-    }
-
-    fn test_value(&mut self, value: Value) {
-        let reg = self.reg_of(value).or_else(|| self.cached_spill(value)).unwrap_or_else(|| {
-            self.get(Reg::Rax, value, Ext::Zero);
-            Reg::Rax
-        });
-        self.asm.test_sized(Size::of(self.ty(value).bytes()), reg, reg);
     }
 
     fn assign(&mut self, param: Value, value: Value) {
@@ -744,10 +713,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
         self.asm.jmp(label);
     }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {
-        let cond = match self.flags.take() {
-            Some((value, cond)) if value == condition => cond,
-            _ => self.test_cond(condition),
-        };
+        let cond = self.truth(condition);
         self.asm.jcc(if invert { cond.invert() } else { cond }, label);
     }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }

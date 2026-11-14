@@ -2,7 +2,7 @@ mod fuse;
 mod patterns;
 
 pub(super) use fuse::fuse;
-pub(super) use patterns::{adc_plan, bextr_parts, shld_parts, unwrap_shift_mask};
+pub(super) use patterns::{LEAF, Root, adc_plan, bextr_parts, shld_parts, unwrap_shift_mask};
 
 use super::asm::{Alu, Mem, Reg, Rm, Shift, Size, Xmm};
 use super::float::scalar;

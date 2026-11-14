@@ -604,7 +604,7 @@ impl Emit<'_> {
         }
     }
 
-    fn emit_cmp_pair(&mut self, size: Size, x: Value, y: Option<Value>, zero_test: bool) {
+    pub(super) fn emit_cmp_pair(&mut self, size: Size, x: Value, y: Option<Value>, zero_test: bool) {
         let imm = match y {
             Some(yv) => self.imm_sized(yv, size),
             None => Some(1),
@@ -640,31 +640,7 @@ impl Emit<'_> {
             self.invalidate_spills();
             return res;
         }
-        let is_zero = |v: Value| self.const_of(v).is_some_and(|imm| crate::fold::extend(imm, self.ty(v), false) == 0);
-        let flags = if self.ty(x) == Type::I128 {
-            self.invalidate_spills();
-            let cond = self.wide_icmp(cc, x, y);
-            self.invalidate_spills();
-            cond
-        } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
-            && live_flags.is_some_and(|(val, fcc)| fcc == Cond::Ne && ((val == x && is_zero(y)) || (val == y && is_zero(x))))
-        {
-            cond(cc)
-        } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
-            && let Some((a, b)) = self.elided_band_cmp(x, y)
-        {
-            self.emit_test_band(a, b);
-            cond(cc)
-        } else {
-            let size = Size::of(self.ty(x).bytes());
-            let (cc, x, y) = if self.reg_of(x).is_none() && (self.reg_of(y).is_some() || self.imm_sized(x, size).is_some()) {
-                (crate::cse::flip_int_cc(cc), y, x)
-            } else {
-                (cc, x, y)
-            };
-            self.emit_cmp_pair(size, x, Some(y), matches!(cc, IntCC::Equal | IntCC::NotEqual));
-            cond(cc)
-        };
+        let flags = self.cmp_flags(cc, x, y, live_flags);
         if self.plan.fused[result.index()] {
             self.flags = Some((result, flags));
             return Ok(());

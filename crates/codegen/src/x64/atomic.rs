@@ -1,9 +1,10 @@
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
 use super::float::X1;
-use super::Emit;
+use super::location::LEAF;
+use super::{Emit, int};
 use crate::alloc::Location;
 use crate::frame::{Emitter, Ext};
-use crate::ir::{AtomicRmwOp, Binary, Function, Op, StackSlot, Type, Unary, Value};
+use crate::ir::{AtomicRmwOp, Binary, Function, IntCC, Op, StackSlot, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
@@ -336,6 +337,92 @@ impl Emit<'_> {
         self.asm.store(size, to, source);
     }
 
+    fn root(&self, condition: Value) -> (Value, bool) {
+        match self.roots[condition.index()] {
+            Some((leaf, None, table)) => (leaf, table != LEAF[0]),
+            _ => (condition, false),
+        }
+    }
+
+    /// The flags condition that holds when `condition` is not zero, from the live flags of its compare or a new test.
+    pub(super) fn truth(&mut self, condition: Value) -> Cond {
+        let (root, flip) = self.root(condition);
+        let cond = match self.flags.take() {
+            Some((value, cond)) if value == root => cond,
+            _ => self.test_cond(root),
+        };
+        if flip { cond.invert() } else { cond }
+    }
+
+    fn test_cond(&mut self, condition: Value) -> Cond {
+        if self.plan.elided[condition.index()]
+            && let Some(inst) = self.defs[condition.index()]
+        {
+            match self.func.insts[inst.index()].op {
+                Op::Binary(Binary::Band, x, y) => {
+                    self.emit_test_band(x, y);
+                    return Cond::Ne;
+                }
+                Op::Icmp(cc, lhs, rhs) => return self.cmp_flags(cc, lhs, rhs, None),
+                _ => {}
+            }
+        }
+        self.test_value(condition);
+        Cond::Ne
+    }
+
+    fn test_value(&mut self, value: Value) {
+        let reg = self.reg_of(value).or_else(|| self.cached_spill(value)).unwrap_or_else(|| {
+            self.get(Reg::Rax, value, Ext::Zero);
+            Reg::Rax
+        });
+        self.asm.test_sized(Size::of(self.ty(value).bytes()), reg, reg);
+    }
+
+    /// Compares `x` with `y` and returns the flags condition under which `cc` holds.
+    pub(super) fn cmp_flags(&mut self, cc: IntCC, x: Value, y: Value, live_flags: Option<(Value, Cond)>) -> Cond {
+        let is_zero = |v: Value| self.const_of(v).is_some_and(|imm| crate::fold::extend(imm, self.ty(v), false) == 0);
+        if self.ty(x) == Type::I128 {
+            self.invalidate_spills();
+            let cond = self.wide_icmp(cc, x, y);
+            self.invalidate_spills();
+            cond
+        } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && live_flags.is_some_and(|(val, fcc)| fcc == Cond::Ne && ((val == x && is_zero(y)) || (val == y && is_zero(x))))
+        {
+            int::cond(cc)
+        } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && let Some((a, b)) = self.elided_band_cmp(x, y)
+        {
+            self.emit_test_band(a, b);
+            int::cond(cc)
+        } else {
+            let size = Size::of(self.ty(x).bytes());
+            let (cc, x, y) = if self.reg_of(x).is_none() && (self.reg_of(y).is_some() || self.imm_sized(x, size).is_some()) {
+                (crate::cse::flip_int_cc(cc), y, x)
+            } else {
+                (cc, x, y)
+            };
+            self.emit_cmp_pair(size, x, Some(y), matches!(cc, IntCC::Equal | IntCC::NotEqual));
+            int::cond(cc)
+        }
+    }
+
+    fn select_chain(&mut self, leaves: [Value; 2], table: u8, (x, y): (Value, Value), result: Value) {
+        let (key, first, other) = if table.count_ones() == 1 { (table.trailing_zeros(), x, y) } else { (table.trailing_ones(), y, x) };
+        let dst = self.dst(result);
+        for (at, leaf) in leaves.into_iter().enumerate() {
+            let cond = self.test_cond(leaf);
+            if at == 0 {
+                self.raw(dst, first);
+            }
+            let source = self.operand(other);
+            self.asm.cmov(if key >> at & 1 == 1 { cond.invert() } else { cond }, dst, source);
+            self.clobber_reg(dst);
+        }
+        self.put(result, dst);
+    }
+
     fn select_cond(&mut self, condition: Value, live_flags: Option<(Value, Cond)>) -> Cond {
         if let Some((value, cond)) = live_flags
             && value == condition
@@ -402,8 +489,12 @@ impl Emit<'_> {
             self.select_copy(if known != 0 { x } else { y }, result);
             return;
         }
-        let mut cond = self.select_cond(condition, live_flags);
-        let orig_cond = cond;
+        if let Some((first, Some(second), table)) = self.roots[condition.index()] {
+            return self.select_chain([first, second], table, (x, y), result);
+        }
+        let (condition, flip) = self.root(condition);
+        let orig_cond = self.select_cond(condition, live_flags);
+        let mut cond = if flip { orig_cond.invert() } else { orig_cond };
         let ty = self.ty(x);
         if ty.in_float_register() {
             let dst = self.fdst(result);
