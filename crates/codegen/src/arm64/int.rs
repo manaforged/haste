@@ -48,14 +48,15 @@ impl Emit<'_> {
     }
 
     fn int_unary(&mut self, op: Unary, x: Value, bits: u8, dst: Reg) -> Result<(), String> {
+        let size = if bits == 32 { Size::W } else { Size::X };
         match op {
             Unary::Ineg => {
                 let reg = self.bits(x, A);
-                self.asm.alu(Alu::Sub, Size::X, dst, ZR, reg);
+                self.asm.alu(Alu::Sub, size, dst, ZR, reg);
             }
             Unary::Bnot => {
                 let reg = self.bits(x, A);
-                self.asm.alu(Alu::Orn, Size::X, dst, ZR, reg);
+                self.asm.alu(Alu::Orn, size, dst, ZR, reg);
             }
             Unary::Bswap => {
                 let reg = self.bits(x, A);
@@ -239,14 +240,15 @@ impl Emit<'_> {
                     return Ok(());
                 }
             }
+            let size = if ty == Type::I64 { Size::X } else { Size::W };
             let left = self.bits(x, A);
             if matches!(alu, Alu::Add | Alu::Sub)
                 && let Some((sub, imm)) = self.add_imm_args(alu == Alu::Sub, y, ty)
             {
-                self.asm.add_imm(sub, false, Size::X, dst, left, imm);
+                self.asm.add_imm(sub, false, size, dst, left, imm);
             } else {
                 let right = self.bits(y, C);
-                self.asm.alu(alu, Size::X, dst, left, right);
+                self.asm.alu(alu, size, dst, left, right);
             }
             return Ok(());
         }
@@ -394,14 +396,31 @@ impl Emit<'_> {
         }
     }
 
+    fn unwrap_shift_mask(&self, y: Value, bits: u8) -> Value {
+        if bits < 32 || !self.plan.elided[y.index()] {
+            return y;
+        }
+        let Some(inst) = self.defs[y.index()] else { return y };
+        let Op::Binary(Binary::Band, a, b) = self.func.insts[inst.index()].op else { return y };
+        let mask = u64::from(bits - 1);
+        for (raw, m) in [(a, b), (b, a)] {
+            if let Some(imm) = self.const_imm(m)
+                && (imm as u64 & mask) == mask
+            {
+                return raw;
+            }
+        }
+        y
+    }
+
     fn shift_by(&mut self, op: Binary, (x, y): (Value, Value), bits: u8, dst: Reg) {
         let (ext, alu) = match op {
             Binary::Ishl => (Ext::Zero, Alu::Lslv),
             Binary::Ushr => (Ext::Zero, Alu::Lsrv),
             _ => (Ext::Sign, Alu::Asrv),
         };
-        let value = if op == Binary::Ishl { self.bits(x, A) } else { self.src(x, A, ext) };
         if let Some(count) = self.plan.const_of(y) {
+            let value = if op == Binary::Ishl { self.bits(x, A) } else { self.src(x, A, ext) };
             let count = (count as u8) & (bits - 1);
             if count == 0 {
                 self.asm.mov(dst, value);
@@ -414,13 +433,18 @@ impl Emit<'_> {
             }
             return;
         }
-        let mut count = self.bits(y, C);
-        if bits < 64 {
-            self.asm.mov_imm(D, i64::from(bits - 1));
-            self.asm.alu(Alu::And, Size::X, C, count, D);
-            count = C;
+        let y = self.unwrap_shift_mask(y, bits);
+        if bits >= 32 {
+            let value = self.bits(x, A);
+            let count = self.bits(y, C);
+            self.asm.alu(alu, if bits == 32 { Size::W } else { Size::X }, dst, value, count);
+            return;
         }
-        self.asm.alu(alu, Size::X, dst, value, count);
+        let value = if op == Binary::Ishl { self.bits(x, A) } else { self.src(x, A, ext) };
+        let count = self.bits(y, C);
+        self.asm.mov_imm(D, i64::from(bits - 1));
+        self.asm.alu(Alu::And, Size::X, C, count, D);
+        self.asm.alu(alu, Size::X, dst, value, C);
     }
 
     fn rotate(&mut self, left: bool, (x, y): (Value, Value), bits: u8, dst: Reg) {
@@ -432,6 +456,7 @@ impl Emit<'_> {
             self.asm.ror_imm(Size::of(u32::from(bits) / 8), dst, value, imm);
             return;
         }
+        let y = self.unwrap_shift_mask(y, bits);
         let count = self.bits(y, C);
         if left {
             self.asm.alu(Alu::Sub, Size::X, C, ZR, count);

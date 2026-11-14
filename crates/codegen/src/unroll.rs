@@ -110,7 +110,7 @@ fn unroll_self(
 ) -> bool {
     let head = Block(b as u32);
     let inst_count = func.blocks[b].insts.len();
-    if inst_count > 48 {
+    if inst_count > 64 {
         return false;
     }
     let Some(init_args) = single_outside_pred(func, head, head) else { return false };
@@ -119,7 +119,7 @@ fn unroll_self(
     }
     let mut cur_params: Vec<Option<i64>> = init_args.iter().map(|v| global_consts[v.index()]).collect();
     let mut proven = None;
-    for step in 0..=16_usize {
+    for step in 0..=32_usize {
         let mut env = global_consts.to_vec();
         eval_block(func, b, &cur_params, &mut env);
         let Some(cond_val) = env[cond.index()] else { break };
@@ -138,7 +138,7 @@ fn unroll_self(
         func.insts[last.index()].op = Op::Jump(exit_blk, exit_args);
         return true;
     }
-    if (back_steps + 1) * inst_count > 192 {
+    if (back_steps + 1) * inst_count > 512 {
         return false;
     }
     let body_insts = func.blocks[b].insts[..inst_count - 1].to_vec();
@@ -229,15 +229,19 @@ fn unroll_self_dynamic(
     let Some(cond_inst) = cond_inst else { return false };
     let Op::Icmp(cc, lhs, rhs) = func.insts[cond_inst.index()].op else { return false };
     let eff_cc = if back_on_true { cc } else { cc.inverse() };
-    let (cmp_cc, iv_cmp, limit) = match eff_cc {
-        IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => (eff_cc, lhs, rhs),
-        IntCC::UnsignedGreaterThan => (IntCC::UnsignedLessThan, rhs, lhs),
-        IntCC::UnsignedGreaterThanOrEqual => (IntCC::UnsignedLessThanOrEqual, rhs, lhs),
+    let (cmp_cc, is_ne, iv_cmp, limit) = match eff_cc {
+        IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => (eff_cc, false, lhs, rhs),
+        IntCC::UnsignedGreaterThan => (IntCC::UnsignedLessThan, false, rhs, lhs),
+        IntCC::UnsignedGreaterThanOrEqual => (IntCC::UnsignedLessThanOrEqual, false, rhs, lhs),
+        IntCC::NotEqual if !head_defs[rhs.index()] => (IntCC::UnsignedLessThan, true, lhs, rhs),
+        IntCC::NotEqual if !head_defs[lhs.index()] => (IntCC::UnsignedLessThan, true, rhs, lhs),
         _ => return false,
     };
-    if func.ty(iv_cmp) != Type::I64 || head_defs[limit.index()] {
+    let iv_ty = func.ty(iv_cmp);
+    if !matches!(iv_ty, Type::I32 | Type::I64) || head_defs[limit.index()] {
         return false;
     }
+    let bias_cap = if iv_ty == Type::I32 { 1_i64 << 28 } else { 1_i64 << 30 };
     let mut matched = match_iv_step(func, b, &body_insts, back_args, iv_cmp)
         .filter(|&(_, stride)| !head_defs[stride.index()])
         .map(|(idx, stride)| (idx, stride, 0_i64));
@@ -247,7 +251,7 @@ fn unroll_self_dynamic(
     {
         for (cand_next, cand_bias) in [(p, q), (q, p)] {
             if let Some(bias) = global_consts[cand_bias.index()]
-                && (0..(1_i64 << 30)).contains(&bias)
+                && (0..bias_cap).contains(&bias)
                 && let Some((idx, stride)) = match_iv_step(func, b, &body_insts, back_args, cand_next)
                 && !head_defs[stride.index()]
             {
@@ -272,24 +276,29 @@ fn unroll_self_dynamic(
         func.blocks[guard.index()].insts.push(i);
         v
     };
-    let zero = emit_guard(Op::Const(0), Type::I64);
-    let sh61 = emit_guard(Op::Const(61), Type::I64);
-    let cf = emit_guard(Op::Const(factor), Type::I64);
-    let stride_pos = emit_guard(Op::Icmp(IntCC::UnsignedGreaterThan, stride, zero), Type::I8);
-    let or_lim = emit_guard(Op::Binary(Binary::Bor, limit, stride), Type::I64);
-    let hi_bits = emit_guard(Op::Binary(Binary::Ushr, or_lim, sh61), Type::I64);
+    let zero = emit_guard(Op::Const(0), iv_ty);
+    let sh = emit_guard(Op::Const(i64::from(iv_ty.bits() - 3)), iv_ty);
+    let cf = emit_guard(Op::Const(factor), iv_ty);
+    let stride_ok = if is_ne {
+        let one = emit_guard(Op::Const(1), iv_ty);
+        emit_guard(Op::Icmp(IntCC::Equal, stride, one), Type::I8)
+    } else {
+        emit_guard(Op::Icmp(IntCC::UnsignedGreaterThan, stride, zero), Type::I8)
+    };
+    let or_lim = emit_guard(Op::Binary(Binary::Bor, limit, stride), iv_ty);
+    let hi_bits = emit_guard(Op::Binary(Binary::Ushr, or_lim, sh), iv_ty);
     let no_wrap = emit_guard(Op::Icmp(IntCC::Equal, hi_bits, zero), Type::I8);
-    let sf = emit_guard(Op::Binary(Binary::Imul, stride, cf), Type::I64);
+    let sf = emit_guard(Op::Binary(Binary::Imul, stride, cf), iv_ty);
     let s_need = if bias > 0 {
-        let b_val = emit_guard(Op::Const(bias), Type::I64);
-        emit_guard(Op::Binary(Binary::Iadd, sf, b_val), Type::I64)
+        let b_val = emit_guard(Op::Const(bias), iv_ty);
+        emit_guard(Op::Binary(Binary::Iadd, sf, b_val), iv_ty)
     } else {
         sf
     };
     let lim_ok = emit_guard(Op::Icmp(IntCC::UnsignedLessThanOrEqual, s_need, limit), Type::I8);
-    let safe_limit = emit_guard(Op::Binary(Binary::Isub, limit, s_need), Type::I64);
+    let safe_limit = emit_guard(Op::Binary(Binary::Isub, limit, s_need), iv_ty);
     let init_ok = emit_guard(Op::Icmp(cmp_cc, guard_params[iv_idx], safe_limit), Type::I8);
-    let g1 = emit_guard(Op::Binary(Binary::Band, stride_pos, no_wrap), Type::I8);
+    let g1 = emit_guard(Op::Binary(Binary::Band, stride_ok, no_wrap), Type::I8);
     let g2 = emit_guard(Op::Binary(Binary::Band, lim_ok, init_ok), Type::I8);
     let guard_cond = emit_guard(Op::Binary(Binary::Band, g1, g2), Type::I8);
     let guard_br = func.add(Op::Brif(guard_cond, unrolled, guard_params.clone(), head, guard_params), None);
@@ -346,7 +355,7 @@ fn unroll_two_block(
         || each.body.get(exit_blk.index()).copied().unwrap_or(false)
         || cfg.pred_count(body_blk) != 1
         || func.blocks[body_blk.index()].insts.is_empty()
-        || func.blocks[b].insts.len() + func.blocks[body_blk.index()].insts.len() > 48
+        || func.blocks[b].insts.len() + func.blocks[body_blk.index()].insts.len() > 64
         || body_args.len() != func.blocks[body_blk.index()].params.len()
         || has_bad_non_term(func, body_blk.index())
     {
@@ -364,7 +373,7 @@ fn unroll_two_block(
     }
     let mut cur_head_params: Vec<Option<i64>> = init_args.iter().map(|v| global_consts[v.index()]).collect();
     let mut proven = None;
-    for step in 0..=8_usize {
+    for step in 0..=32_usize {
         let mut env = global_consts.to_vec();
         eval_block(func, b, &cur_head_params, &mut env);
         let Some(cond_val) = env[cond.index()] else { break };
@@ -372,7 +381,7 @@ fn unroll_two_block(
             proven = Some(step);
             break;
         }
-        if step == 8 {
+        if step == 32 {
             break;
         }
         let body_params: Vec<Option<i64>> = body_args.iter().map(|v| env[v.index()]).collect();
@@ -388,7 +397,7 @@ fn unroll_two_block(
         retire_block(func, body_blk.index());
         return true;
     }
-    if head_len + trips * (head_len + body_len) > 192 {
+    if head_len + trips * (head_len + body_len) > 512 {
         return false;
     }
     let head_non_term = func.blocks[b].insts[..head_len - 1].to_vec();

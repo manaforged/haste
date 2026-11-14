@@ -147,8 +147,14 @@ impl Scan {
         scan.addresses(func);
         for (index, block) in func.blocks.iter().enumerate() {
             for inst in &block.insts {
-                if let Some(touch) = scan.touch(&func.insts[inst.index()]) {
+                let data = &func.insts[inst.index()];
+                if let Some(touch) = scan.touch(data) {
                     scan.access(func, (Block(index as u32), *inst), (touch.slot, touch.offset), touch.kind);
+                } else if let Op::Load(addr, _) | Op::Store(_, addr, _) = data.op
+                    && let Some(&crate::mem::MemRoot::Slot(s)) = prov.param_roots.get(addr.index())
+                {
+                    scan.escaped[s.index()] = true;
+                    scan.open_slots[s.index()] = false;
                 }
             }
         }

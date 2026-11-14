@@ -497,9 +497,9 @@ impl Emit<'_> {
             TargetOpForm::Sha256Rnds2 => {
                 let [a, b, k] = *args else { return Err(format!("{id:?} expects 3 args")); };
                 let dst = self.xmm_of(result).unwrap_or(X2);
-                self.fget(dst, a);
                 self.fget(X1, b);
                 self.fget(X0, k);
+                self.fget(dst, a);
                 self.asm.sse(spec.prefix, spec.opcode, dst.0, X1);
                 self.fput(result, dst);
             }

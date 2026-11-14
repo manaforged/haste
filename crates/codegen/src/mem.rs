@@ -147,24 +147,28 @@ fn classify_uses(
         data.op.for_operands(|v| counts.total[v.index()] += 1);
         match &data.op {
             Op::Load(addr, _) => {
-                if slots[addr.index()].is_some() || !matches!(tracked[addr.index()], TrackRoot::Set(MemRoot::Slot(_))) {
+                if slots[addr.index()].is_some() || matches!(tracked[addr.index()], TrackRoot::Set(_)) {
                     counts.safe[addr.index()] += 1;
                 }
             }
             Op::Store(val, addr, _) if val != addr => {
-                if slots[addr.index()].is_some() || !matches!(tracked[addr.index()], TrackRoot::Set(MemRoot::Slot(_))) {
+                if slots[addr.index()].is_some() || matches!(tracked[addr.index()], TrackRoot::Set(_)) {
                     counts.safe[addr.index()] += 1;
                 }
             }
             Op::Move(to, from, _) => {
-                counts.moves[to.index()] += 1;
-                counts.moves[from.index()] += 1;
+                if slots[to.index()].is_some() {
+                    counts.moves[to.index()] += 1;
+                }
+                if slots[from.index()].is_some() {
+                    counts.moves[from.index()] += 1;
+                }
             }
             Op::Binary(Binary::Iadd | Binary::Isub, a, b) => {
                 if data.result.is_some_and(|r| slots[r.index()].is_some()) {
                     let target = if slots[a.index()].is_some() { a } else { b };
                     counts.safe[target.index()] += 1;
-                } else if data.result.is_some_and(|r| matches!(tracked[r.index()], TrackRoot::Set(root) if !matches!(root, MemRoot::Slot(_)))) {
+                } else if data.result.is_some_and(|r| matches!(tracked[r.index()], TrackRoot::Set(_))) {
                     let target = if matches!(tracked[a.index()], TrackRoot::Set(_)) { a } else { b };
                     counts.safe[target.index()] += 1;
                 }
@@ -505,6 +509,8 @@ pub(crate) struct LoopMem {
     pub writes: bool,
     pub unknown_mem_writes: bool,
     pub calls: bool,
+    pub(crate) atomics: bool,
+    pub(crate) block_copies: bool,
     pub param_writes: Vec<bool>,
     pub slot_clobbered: Vec<bool>,
     pub slot_write_ranges: Vec<Vec<(i64, i64)>>,
@@ -516,39 +522,34 @@ impl LoopMem {
             writes: false,
             unknown_mem_writes: false,
             calls: false,
+            atomics: false,
+            block_copies: false,
             param_writes: vec![false; func.signature.params.len()],
             slot_clobbered: vec![false; func.slots.len()],
             slot_write_ranges: vec![Vec::new(); func.slots.len()],
         };
         for inst in (0..each.body.len()).filter(|b| each.body[*b]).flat_map(|b| &func.blocks[b].insts) {
             let op = &func.insts[inst.index()].op;
-            let is_write = matches!(
-                op,
-                Op::Store(..)
-                    | Op::StackStore(..)
-                    | Op::Copy(..)
-                    | Op::Move(..)
-                    | Op::AtomicLoad(_)
-                    | Op::AtomicStore(..)
-                    | Op::AtomicRmw(..)
-                    | Op::AtomicCas(..)
-                    | Op::Fence
-                    | Op::Call { .. }
-                    | Op::TryCall { .. }
-            );
-            if is_write {
+            let is_atomic = matches!(op, Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence);
+            let is_call = matches!(op, Op::Call { .. } | Op::TryCall { .. });
+            if is_atomic || is_call || matches!(op, Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..)) {
                 fx.writes = true;
             }
-            if matches!(op, Op::Call { .. } | Op::TryCall { .. }) {
-                fx.calls = true;
+            fx.calls |= is_call;
+            fx.atomics |= is_atomic;
+            if is_atomic || is_call {
+                fx.unknown_mem_writes = true;
             }
             match *op {
                 Op::StackStore(val, slot, off) => fx.record_slot(slot, i64::from(off), func.ty(val).bytes()),
                 Op::Store(val, addr, off) => fx.record_loc(prov.loc(addr, i64::from(off), func.ty(val).bytes())),
-                Op::Move(addr, _, bytes) => fx.record_clobber_loc(prov.loc(addr, 0, bytes)),
-                Op::Copy(addr, _, _) => fx.record_clobber_loc(prov.loc(addr, 0, u32::MAX)),
-                Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence | Op::Call { .. } | Op::TryCall { .. } => {
-                    fx.unknown_mem_writes = true;
+                Op::Move(addr, _, bytes) => {
+                    fx.block_copies = true;
+                    fx.record_clobber_loc(prov.loc(addr, 0, bytes));
+                }
+                Op::Copy(addr, _, _) => {
+                    fx.block_copies = true;
+                    fx.record_clobber_loc(prov.loc(addr, 0, u32::MAX));
                 }
                 _ => {}
             }
@@ -567,12 +568,8 @@ impl LoopMem {
     fn record_loc(&mut self, loc: MemLoc) {
         if let MemBase::Slot(s) = loc.base {
             self.record_slot(s, loc.offset, loc.size);
-            return;
-        }
-        match loc.root {
-            MemRoot::Slot(s) => self.slot_clobbered[s.index()] = true,
-            MemRoot::NoAliasParam(p) => self.param_writes[usize::from(p)] = true,
-            _ => self.unknown_mem_writes = true,
+        } else {
+            self.record_clobber_loc(loc);
         }
     }
 
@@ -586,7 +583,9 @@ impl LoopMem {
 
     fn slot_load_ok(&self, func: &Function, prov: &Provenance, slot: StackSlot, total: i64, width: u32) -> bool {
         let end_ok = total >= 0 && (total as u64).checked_add(u64::from(width)).is_some_and(|end| end <= u64::from(func.slots[slot.index()].size));
-        let mut_ok = prov.slot_call_readonly(slot) || (!self.calls && !self.unknown_mem_writes);
+        let mut_ok = prov.slot_unescaped(slot)
+            || (prov.slot_call_readonly(slot) && !self.unknown_mem_writes)
+            || (!self.calls && !self.unknown_mem_writes);
         let written = self.slot_clobbered[slot.index()]
             || self.slot_write_ranges[slot.index()].iter().any(|&(wlo, whi)| total < whi && wlo < total + i64::from(width));
         end_ok && mut_ok && !written
@@ -603,20 +602,38 @@ impl LoopMem {
                 if let MemBase::Slot(slot) = loc.base {
                     return self.slot_load_ok(func, prov, slot, loc.offset, width);
                 }
-                let deref_ok = !self.unknown_mem_writes
-                    && offset >= 0
+                let deref_ok = offset >= 0
                     && (offset as u64) + u64::from(width) <= u64::from(prov.ro_bytes.get(addr.index()).copied().unwrap_or(0));
+                let mut trap_ok = head_prefix || deref_ok;
                 let root_ok = match loc.root {
                     MemRoot::Slot(slot) => {
-                        prov.slot_call_readonly(slot)
+                        if loc.offset >= 0
+                            && (loc.offset as u64).checked_add(u64::from(width)).is_some_and(|e| e <= u64::from(func.slots[slot.index()].size))
+                        {
+                            trap_ok = true;
+                        }
+                        (prov.slot_unescaped(slot) || (prov.slot_call_readonly(slot) && !self.unknown_mem_writes))
                             && !self.slot_clobbered[slot.index()]
                             && self.slot_write_ranges[slot.index()].is_empty()
                     }
-                    MemRoot::NoAliasParam(p) => !self.unknown_mem_writes && !self.param_writes.get(usize::from(p)).copied().unwrap_or(true),
-                    MemRoot::ReadonlyParam(_) => !self.unknown_mem_writes,
+                    MemRoot::NoAliasParam(p) => {
+                        let param_ro = func.signature.params.get(usize::from(p)).map_or(0, |a| a.deref_bytes);
+                        if loc.offset >= 0 && (loc.offset as u64).checked_add(u64::from(width)).is_some_and(|e| e <= u64::from(param_ro)) {
+                            trap_ok = true;
+                        }
+                        !self.param_writes.get(usize::from(p)).copied().unwrap_or(true)
+                            && (prov.noalias_unescaped(p) || !self.unknown_mem_writes)
+                    }
+                    MemRoot::ReadonlyParam(p) => {
+                        let param_ro = func.signature.params.get(usize::from(p)).map_or(0, |a| a.deref_bytes);
+                        if loc.offset >= 0 && (loc.offset as u64).checked_add(u64::from(width)).is_some_and(|e| e <= u64::from(param_ro)) {
+                            trap_ok = true;
+                        }
+                        true
+                    }
                     _ => false,
                 };
-                !self.calls && head_prefix && (!self.writes || root_ok || deref_ok)
+                !self.calls && !self.atomics && trap_ok && (!self.writes || root_ok)
             }
             _ => false,
         }
@@ -629,7 +646,7 @@ impl LoopMem {
         prov: &Provenance,
         home: &[Option<Block>],
     ) -> Vec<PromoteCand> {
-        if self.calls || self.unknown_mem_writes {
+        if self.calls || self.atomics || self.block_copies {
             return Vec::new();
         }
         let cx = PromoteCx { func, each, prov, home };
@@ -756,7 +773,7 @@ fn promote_base_eligible(cx: &PromoteCx<'_>, loc: MemLoc, ty: Type, head_accesse
     }
     match loc.base {
         MemBase::Slot(slot) => {
-            (end as u64 <= u64::from(cx.func.slots[slot.index()].size)).then_some(PromoteBase::Slot(slot))
+            (cx.prov.slot_unescaped(slot) && end as u64 <= u64::from(cx.func.slots[slot.index()].size)).then_some(PromoteBase::Slot(slot))
         }
         MemBase::Addr(addr) => {
             let MemRoot::NoAliasParam(p) = loc.root else { return None };

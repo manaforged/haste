@@ -1,6 +1,7 @@
 //! Reuses what memory holds along straight-line code: a load of the bytes an earlier load or store on the same path read or wrote, with no write of unknown reach between them, takes that value.
 
 mod coalesce;
+mod pack;
 
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 
@@ -669,6 +670,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let cfg = func.cfg();
     let prov = Provenance::new(func, &cfg);
     changed |= fold_affine_mem(func, &prov.slot_offsets, &prov.affine);
+    changed |= pack::coalesce_loads(func, &prov);
     changed |= sink_terminator_defs(func);
     let mut consts = vec![None; func.types.len()];
     let mut selects = vec![None; func.types.len()];

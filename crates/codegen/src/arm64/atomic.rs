@@ -27,8 +27,13 @@ impl Emit<'_> {
                 let result = result()?;
                 if !self.plan.is_static(result) {
                     let dst = self.dst(result);
-                    let at = self.asm.mov_symbol(dst);
-                    self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Arm64Movw64));
+                    if self.direct_calls {
+                        let at = self.asm.adrp_add_reloc(dst);
+                        self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Arm64AdrpAdd));
+                    } else {
+                        let at = self.asm.mov_symbol(dst);
+                        self.relocs.push(StencilReloc::symbol(at, *sym, RelocKind::Arm64Movw64));
+                    }
                     self.put(result, dst);
                 }
             }

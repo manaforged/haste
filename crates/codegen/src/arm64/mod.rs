@@ -13,7 +13,7 @@ use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_try_call, intake_params};
-use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
+use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, IntCC, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
@@ -213,6 +213,8 @@ impl<'a> Emitter<'a> for Emit<'a> {
     }
 
     fn bind_block(&mut self, block: Block) {
+        self.last_spill = None;
+        self.last_fspill = None;
         self.asm.bind(self.blocks[block.index()]);
     }
 
@@ -386,28 +388,17 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
-        let steps = edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.plan.same_home(&self.frame, a, b));
-        let reg_only = steps.iter().all(|step| match *step {
-            Step::Move(arg, param) => self.plan.reg_of(arg).is_some() && self.plan.reg_of(param).is_some(),
-            Step::Save(arg, index) => index < 2 && self.plan.reg_of(arg).is_some(),
-            Step::Restore(index, param) => index < 2 && self.plan.reg_of(param).is_some(),
-        });
-        let scratch = [A, C];
-        for step in steps {
+        let int_scratch = [A, C];
+        let float_scratch = [V0, V1];
+        for step in edge_steps(self.func, &self.plan.locations, &self.frame.values, args, &self.func.blocks[block.index()].params) {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
-                Step::Save(arg, index) if reg_only => {
-                    if let Some(reg) = self.plan.reg_of(arg) {
-                        self.asm.mov(scratch[index], reg);
-                    }
-                }
-                Step::Restore(index, param) if reg_only => {
-                    if let Some(reg) = self.plan.reg_of(param) {
-                        self.asm.mov(reg, scratch[index]);
-                    }
-                }
-                Step::Save(arg, index) => self.move_to(self.frame_mem(self.frame.edge_slot(index)), arg),
-                Step::Restore(index, param) => self.load_home(param, self.frame_mem(self.frame.edge_slot(index))),
+                Step::Save(arg, EdgeScratch::Int(i)) => self.raw(int_scratch[i], arg),
+                Step::Restore(EdgeScratch::Int(i), param) => self.put(param, int_scratch[i]),
+                Step::Save(arg, EdgeScratch::Float(i)) => self.fget(float_scratch[i], arg),
+                Step::Restore(EdgeScratch::Float(i), param) => self.fput(param, float_scratch[i]),
+                Step::Save(arg, EdgeScratch::Stack(i)) => self.move_to(self.frame_mem(self.frame.edge_slot(i)), arg),
+                Step::Restore(EdgeScratch::Stack(i), param) => self.load_home(param, self.frame_mem(self.frame.edge_slot(i))),
             }
         }
         Ok(())
@@ -631,7 +622,11 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
     fn pos(&self) -> u32 { self.asm.pos() }
     fn new_label(&mut self) -> Label { self.asm.label() }
-    fn bind_label(&mut self, label: Label) { self.asm.bind(label); }
+    fn bind_label(&mut self, label: Label) {
+        self.last_spill = None;
+        self.last_fspill = None;
+        self.asm.bind(label);
+    }
     fn jump_label(&mut self, label: Label) { self.asm.b(label); }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) { self.branch_cond(condition, invert, label); }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }

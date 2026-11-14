@@ -120,7 +120,7 @@ impl CycleState {
     }
 }
 
-const TRANSIENT_CAP: usize = 2_048;
+const TRANSIENT_CAP: usize = 32_768;
 const TRIM_SHARDS: usize = 8;
 const MAX_INLINE_HEIGHT: u8 = 10;
 
@@ -576,9 +576,12 @@ fn simplify_inline(mut func: Function, limit: usize, leaf: bool) -> Option<(Arc<
     if func.is_coroutine() {
         return None;
     }
-    haste_codegen::simplify(&mut func, crate::profile().into());
     let release = crate::profile() == crate::outline::tree::Profile::Release;
     let effective_limit = if release && leaf { limit.saturating_add(limit / 2).min(600).max(limit) } else { limit };
+    if func.size() > effective_limit.saturating_mul(6).max(1600) {
+        return None;
+    }
+    haste_codegen::simplify(&mut func, crate::profile().into());
     (func.can_inline() && func.size() <= effective_limit).then(|| {
         let returns = func.has_return();
         (Arc::new(func), returns)

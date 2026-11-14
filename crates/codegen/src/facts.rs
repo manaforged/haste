@@ -139,18 +139,18 @@ fn order(always: bool, never: bool) -> Option<bool> {
     if always { Some(true) } else if never { Some(false) } else { None }
 }
 
-/// The fact on `x` that `x cc k` being `taken` gives, for an equality or unsigned `cc`.
-fn compared(cc: IntCC, ty: Type, k: u64, taken: bool) -> Option<Fact> {
+/// The fact on `x` that `x cc y` being `taken` gives, for an equality or unsigned `cc`.
+fn compared_range(cc: IntCC, ty: Type, rhs: &Fact, taken: bool) -> Option<Fact> {
     let cc = if taken { cc } else { cc.inverse() };
     let max = ty.unsigned_max();
     let mut fact = Fact::full(ty);
     match cc {
-        IntCC::Equal => fact = Fact::range(k, k),
-        IntCC::NotEqual => fact.exclude(k),
-        IntCC::UnsignedLessThan if k > 0 => fact.hi = k - 1,
-        IntCC::UnsignedLessThanOrEqual => fact.hi = k,
-        IntCC::UnsignedGreaterThan if k < max => fact.lo = k + 1,
-        IntCC::UnsignedGreaterThanOrEqual => fact.lo = k,
+        IntCC::Equal => fact = rhs.clone(),
+        IntCC::NotEqual => fact.exclude(rhs.exact()?),
+        IntCC::UnsignedLessThan if rhs.hi > 0 => fact.hi = rhs.hi - 1,
+        IntCC::UnsignedLessThanOrEqual => fact.hi = rhs.hi,
+        IntCC::UnsignedGreaterThan if rhs.lo < max => fact.lo = rhs.lo + 1,
+        IntCC::UnsignedGreaterThanOrEqual => fact.lo = rhs.lo,
         _ => return None,
     }
     Some(fact)
@@ -177,6 +177,14 @@ pub(crate) struct Ranges<'a> {
     table: Vec<(u64, u64)>,
 }
 
+struct CfgInfo<'a> {
+    consts: &'a [Option<i64>],
+    incoming: &'a [Vec<(Block, &'a [Value])>],
+    complete: &'a [bool],
+    single: &'a [Option<Block>],
+    idom: &'a [Option<Block>],
+}
+
 impl<'a> Ranges<'a> {
     /// The ranges of `func`'s values over the blocks of `order`, with the constants `consts` an earlier fold found.
     pub(crate) fn new(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>])) -> Self {
@@ -199,110 +207,177 @@ impl<'a> Ranges<'a> {
                 }
             }
         }
-        for &block in order {
-            ranges.refine_params(func, consts, (&incoming, &complete, single, idom), block);
-            for inst in &func.blocks[block.index()].insts {
-                let data = &func.insts[inst.index()];
-                let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
-                let fact = match consts.get(result.index()).copied().flatten() {
-                    Some(imm) => Fact::constant(func.ty(result), imm),
-                    None => ranges.derive(func, &data.op, func.ty(result)),
-                };
-                ranges.table[result.index()] = (fact.lo, fact.hi);
-            }
+        let info = CfgInfo { consts, incoming: &incoming, complete: &complete, single, idom };
+        if ranges.propagate(func, &info, order) {
+            ranges.propagate(func, &info, order);
         }
         ranges
     }
 
-    fn refine_params(&mut self, func: &Function, consts: &[Option<i64>], (incoming, complete, single, idom): (&[Vec<(Block, &[Value])>], &[bool], &[Option<Block>], &[Option<Block>]), block: Block) {
-        if !complete[block.index()] || incoming[block.index()].is_empty() {
-            return;
-        }
-        for (k, &p) in func.blocks[block.index()].params.iter().enumerate() {
-            let ty = func.ty(p);
-            if !ty.is_small_int() {
-                continue;
+    fn propagate(&mut self, func: &Function, info: &CfgInfo, order: &[Block]) -> bool {
+        let mut narrowed = false;
+        for &block in order {
+            narrowed |= self.refine_params(func, info, block);
+            for inst in &func.blocks[block.index()].insts {
+                let data = &func.insts[inst.index()];
+                let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
+                let fact = match info.consts.get(result.index()).copied().flatten() {
+                    Some(imm) => Fact::constant(func.ty(result), imm),
+                    None => self.derive(func, &data.op, func.ty(result)),
+                };
+                self.table[result.index()] = (fact.lo, fact.hi);
             }
-            let (mut min_lo, mut has_outside, mut valid) = (u64::MAX, false, true);
-            for &(pred, args) in &incoming[block.index()] {
-                let Some(&arg) = args.get(k) else {
+        }
+        narrowed
+    }
+
+    fn refine_params(&mut self, func: &Function, info: &CfgInfo, block: Block) -> bool {
+        if !info.complete[block.index()] || info.incoming[block.index()].is_empty() {
+            return false;
+        }
+        let mut narrowed = false;
+        for (k, &p) in func.blocks[block.index()].params.iter().enumerate() {
+            if func.ty(p).is_small_int() {
+                narrowed |= self.refine_param_lo(func, info, (block, p, k));
+                narrowed |= self.refine_param_hi(func, info, (block, p, k));
+            }
+        }
+        narrowed
+    }
+
+    fn refine_param_lo(&mut self, func: &Function, info: &CfgInfo, (block, p, k): (Block, Value, usize)) -> bool {
+        let ty = func.ty(p);
+        let (mut min_lo, mut has_outside, mut valid) = (u64::MAX, false, true);
+        for &(pred, args) in &info.incoming[block.index()] {
+            let Some(&arg) = args.get(k) else { valid = false; break };
+            if let Some(step) = self.add_step(func, info.consts, arg, p, ty) {
+                let Some(max_p) = ty.unsigned_max().checked_sub(step) else { valid = false; break };
+                if !self.edge_bound(func, info, (block, pred), (p, true)).is_some_and(|ub| ub <= max_p) {
                     valid = false;
                     break;
-                };
-                if let Some(step) = self.add_step(func, consts, arg, p, ty) {
-                    if !self.edge_proves_no_wrap(func, single, idom, (block, pred), (p, ty, step)) {
-                        valid = false;
-                        break;
-                    }
-                } else {
-                    has_outside = true;
-                    min_lo = min_lo.min(self.of(arg).lo);
                 }
-            }
-            if valid && has_outside && min_lo > 0 && min_lo <= ty.unsigned_max() {
-                self.table[p.index()].0 = min_lo;
+            } else {
+                has_outside = true;
+                min_lo = min_lo.min(self.of(arg).lo);
             }
         }
-    }
-
-    fn add_step(&self, func: &Function, consts: &[Option<i64>], arg: Value, p: Value, ty: Type) -> Option<u64> {
-        let &Op::Binary(Binary::Iadd, x, y) = self.op(func, arg)? else {
-            return None;
-        };
-        let other = if x == p { y } else if y == p { x } else { return None };
-        let k = consts.get(other.index()).copied().flatten().map(|imm| unsigned(imm, ty)).or_else(|| match self.op(func, other) {
-            Some(&Op::Const(imm)) => Some(unsigned(imm, ty)),
-            _ => self.constant(other),
-        })?;
-        (k > 0).then_some(k)
-    }
-
-    fn edge_proves_no_wrap(&self, func: &Function, single: &[Option<Block>], idom: &[Option<Block>], (block, pred): (Block, Block), (p, ty, step): (Value, Type, u64)) -> bool {
-        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(pred)
-            && then != otherwise
-            && (then == block || otherwise == block)
-            && self.proves_no_wrap(func, cond, then == block, p, ty, step, 0)
-        {
+        if valid && has_outside && min_lo > self.table[p.index()].0 && min_lo <= ty.unsigned_max() {
+            self.table[p.index()].0 = min_lo;
             return true;
-        }
-        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(block)
-            && then != otherwise
-        {
-            let via_then = single[then.index()] == Some(block) && dominates(idom, then, pred) && self.proves_no_wrap(func, cond, true, p, ty, step, 0);
-            let via_else = single[otherwise.index()] == Some(block) && dominates(idom, otherwise, pred) && self.proves_no_wrap(func, cond, false, p, ty, step, 0);
-            return via_then || via_else;
         }
         false
     }
 
-    fn proves_no_wrap(&self, func: &Function, cond: Value, taken: bool, p: Value, ty: Type, step: u64, depth: u8) -> bool {
-        if depth > 4 {
-            return false;
+    fn refine_param_hi(&mut self, func: &Function, info: &CfgInfo, (block, p, k): (Block, Value, usize)) -> bool {
+        let (mut max_hi, mut has_bound) = (0_u64, false);
+        for &(pred, args) in &info.incoming[block.index()] {
+            let Some(&arg) = args.get(k) else { return false };
+            let Some(edge_hi) = self.edge_arm_hi(func, info, (block, pred), (p, arg, 0)) else { return false };
+            if let Some(hi) = edge_hi {
+                max_hi = max_hi.max(hi);
+                has_bound = true;
+            }
         }
-        let Some(max_p) = ty.unsigned_max().checked_sub(step) else {
-            return false;
+        if has_bound && max_hi < self.table[p.index()].1 {
+            self.table[p.index()].1 = max_hi;
+            return true;
+        }
+        false
+    }
+
+    fn edge_arm_hi(&self, func: &Function, info: &CfgInfo, edge: (Block, Block), (p, arg, depth): (Value, Value, u8)) -> Option<Option<u64>> {
+        if arg == p { return Some(None); }
+        let ty = func.ty(p);
+        if let Some(ub) = self.edge_bound(func, info, edge, (arg, true)) { return Some(Some(ub)); }
+        if let Some(step) = self.add_step(func, info.consts, arg, p, ty)
+            && let Some(ub) = self.edge_bound(func, info, edge, (p, true))
+            && let Some(next_hi) = ub.checked_add(step).filter(|&hi| hi <= ty.unsigned_max())
+        {
+            return Some(Some(next_hi));
+        }
+        match self.op(func, arg) {
+            Some(&Op::Binary(Binary::Ushr, base, _)) if base == p => return Some(None),
+            Some(&Op::Binary(Binary::Band, a, b)) if a == p || b == p => return Some(None),
+            Some(&Op::Binary(Binary::Isub, base, delta)) if base == p => {
+                let sub_shr = matches!(self.op(func, delta), Some(&Op::Binary(Binary::Ushr, inner, _)) if inner == p);
+                if sub_shr || self.const_val(func, info.consts, delta, ty).is_some_and(|k| self.edge_bound(func, info, edge, (p, false)).is_some_and(|lb| lb >= k)) {
+                    return Some(None);
+                }
+            }
+            Some(&Op::Select(_, a, b)) if depth < 2 => {
+                return match (self.edge_arm_hi(func, info, edge, (p, a, depth + 1))?, self.edge_arm_hi(func, info, edge, (p, b, depth + 1))?) {
+                    (None, None) => Some(None),
+                    (Some(x), None) | (None, Some(x)) => Some(Some(x)),
+                    (Some(x), Some(y)) => Some(Some(x.max(y))),
+                };
+            }
+            _ => {}
+        }
+        let outside = self.const_val(func, info.consts, arg, ty).unwrap_or_else(|| self.of(arg).hi);
+        (outside < ty.unsigned_max()).then_some(Some(outside))
+    }
+
+    fn const_val(&self, func: &Function, consts: &[Option<i64>], v: Value, ty: Type) -> Option<u64> {
+        consts.get(v.index()).copied().flatten().map(|imm| unsigned(imm, ty)).or_else(|| match self.op(func, v) {
+            Some(&Op::Const(imm)) => Some(unsigned(imm, ty)),
+            _ => self.constant(v),
+        })
+    }
+
+    fn add_step(&self, func: &Function, consts: &[Option<i64>], arg: Value, p: Value, ty: Type) -> Option<u64> {
+        let &Op::Binary(Binary::Iadd, x, y) = self.op(func, arg)? else { return None };
+        let other = if x == p { y } else if y == p { x } else { return None };
+        self.const_val(func, consts, other, ty).filter(|&k| k > 0)
+    }
+
+    fn edge_bound(&self, func: &Function, info: &CfgInfo, (block, pred): (Block, Block), (val, upper): (Value, bool)) -> Option<u64> {
+        let pick = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(x), Some(y)) => Some(if upper { x.min(y) } else { x.max(y) }),
+            _ => a.or(b),
+        };
+        let mut best = None;
+        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(pred) && then != otherwise && (then == block || otherwise == block) {
+            best = pick(best, self.proves_bound(func, cond, then == block, (val, upper), 0));
+        }
+        if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(block) && then != otherwise {
+            if info.single[then.index()] == Some(block) && dominates(info.idom, then, pred) {
+                best = pick(best, self.proves_bound(func, cond, true, (val, upper), 0));
+            } else if info.single[otherwise.index()] == Some(block) && dominates(info.idom, otherwise, pred) {
+                best = pick(best, self.proves_bound(func, cond, false, (val, upper), 0));
+            }
+        }
+        best
+    }
+
+    fn proves_bound(&self, func: &Function, cond: Value, taken: bool, (val, upper): (Value, bool), depth: u8) -> Option<u64> {
+        if depth > 4 { return None; }
+        let ty = func.ty(val);
+        let combine = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(x), Some(y)) => Some(if upper { x.min(y) } else { x.max(y) }),
+            _ => a.or(b),
         };
         match self.op(func, cond) {
-            Some(&Op::Binary(Binary::Band, a, b)) if taken => {
-                self.proves_no_wrap(func, a, true, p, ty, step, depth + 1) || self.proves_no_wrap(func, b, true, p, ty, step, depth + 1)
-            }
-            Some(&Op::Binary(Binary::Bor, a, b)) if !taken => {
-                self.proves_no_wrap(func, a, false, p, ty, step, depth + 1) || self.proves_no_wrap(func, b, false, p, ty, step, depth + 1)
-            }
-            Some(&Op::Icmp(cc, x, y)) => {
-                let eff = if taken { cc } else { cc.inverse() };
+            Some(&Op::Binary(Binary::Band, a, b)) if taken => combine(self.proves_bound(func, a, true, (val, upper), depth + 1), self.proves_bound(func, b, true, (val, upper), depth + 1)),
+            Some(&Op::Binary(Binary::Bor, a, b)) if !taken => combine(self.proves_bound(func, a, false, (val, upper), depth + 1), self.proves_bound(func, b, false, (val, upper), depth + 1)),
+            Some(&Op::Icmp(cc, x, y)) if func.ty(x) == ty => {
+                let raw = if taken { cc } else { cc.inverse() };
+                let eff = match raw.is_signed() {
+                    true if self.of(x).non_negative(ty) && self.of(y).non_negative(ty) => as_unsigned(raw),
+                    true => return None,
+                    false => raw,
+                };
                 let (kind, lhs, rhs) = rel_of(eff, x, y);
-                if lhs != p {
-                    return false;
-                }
-                let rhs_hi = self.of(rhs).hi;
-                match kind {
-                    RelKind::Ult => rhs_hi > 0 && rhs_hi - 1 <= max_p,
-                    RelKind::Ule => rhs_hi <= max_p,
-                    _ => false,
+                match (upper, kind) {
+                    (true, RelKind::Eq | RelKind::Ule) if lhs == val => Some(self.of(rhs).hi),
+                    (true, RelKind::Ult) if lhs == val => self.of(rhs).hi.checked_sub(1),
+                    (false, RelKind::Eq | RelKind::Ule) if rhs == val => Some(self.of(lhs).lo),
+                    (false, RelKind::Ult) if rhs == val => (self.of(lhs).lo < ty.unsigned_max()).then(|| self.of(lhs).lo + 1),
+                    (true, RelKind::Eq) if rhs == val => Some(self.of(lhs).hi),
+                    (false, RelKind::Eq) if lhs == val => Some(self.of(rhs).lo),
+                    _ => None,
                 }
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -326,6 +401,8 @@ impl<'a> Ranges<'a> {
         match *op {
             Op::Const(imm) => Fact::constant(ty, imm),
             Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => Fact::range(0, 1),
+            Op::StackAddr(..) if ty == Type::I64 => Fact::range(1, u64::MAX - 0x1000_0000),
+            Op::Symbol(_) | Op::SlotAddr(_) => Fact::range(1, ty.unsigned_max()),
             Op::Convert(Convert::Uextend, x) => self.of(x),
             Op::Convert(Convert::Ireduce, x) => Some(self.of(x)).filter(|inner| inner.hi <= ty.unsigned_max()).unwrap_or_else(|| Fact::full(ty)),
             Op::Binary(op, x, y) if func.ty(x).is_small_int() => self.binary(func, op, (x, y)),
@@ -341,10 +418,7 @@ impl<'a> Ranges<'a> {
     fn binary(&self, func: &Function, op: Binary, (x, y): (Value, Value)) -> Fact {
         let ty = func.ty(x);
         match op {
-            Binary::Band => match self.constant(y).or_else(|| self.constant(x)) {
-                Some(mask) => Fact::range(0, mask),
-                None => Fact::full(ty),
-            },
+            Binary::Band => Fact::range(0, self.of(x).hi.min(self.of(y).hi)),
             Binary::Ushr => match self.constant(y) {
                 Some(count) => {
                     let (inner, shift) = (self.of(x), (count & u64::from(ty.bits() - 1)) as u32);
@@ -357,18 +431,27 @@ impl<'a> Ranges<'a> {
                 _ => Fact::full(ty),
             },
             Binary::Iadd => self.shifted(ty, (x, y), false),
-            Binary::Isub => self.shifted(ty, (x, y), true),
+            Binary::Isub => {
+                if let Some(&Op::Binary(Binary::Ushr, base, sh)) = self.op(func, y)
+                    && base == x
+                {
+                    let inner = self.of(x);
+                    let s = self.constant(sh).map(|c| (c & u64::from(ty.bits() - 1)) as u32);
+                    let (lo, hi) = s.map_or((0, inner.hi), |k| (inner.lo - (inner.lo >> k), inner.hi - (inner.hi >> k)));
+                    return Fact::range(lo, hi);
+                }
+                self.shifted(ty, (x, y), true)
+            }
             _ => Fact::full(ty),
         }
     }
 
-    /// The range of `x + k` or `x - k` for a constant `k`, when no value of `x`'s range wraps at the width of `ty`.
+    /// The range of `x + y` or `x - y`, when no values in their ranges wrap at the width of `ty`.
     fn shifted(&self, ty: Type, (x, y): (Value, Value), subtract: bool) -> Fact {
-        let Some(k) = self.constant(y) else { return Fact::full(ty) };
-        let inner = self.of(x);
+        let (a, b) = (self.of(x), self.of(y));
         let moved = match subtract {
-            false => inner.lo.checked_add(k).zip(inner.hi.checked_add(k)).filter(|(_, hi)| *hi <= ty.unsigned_max()),
-            true => inner.lo.checked_sub(k).zip(inner.hi.checked_sub(k)),
+            false => a.hi.checked_add(b.hi).filter(|&hi| hi <= ty.unsigned_max()).map(|hi| (a.lo + b.lo, hi)),
+            true => (a.lo >= b.hi).then(|| (a.lo - b.hi, a.hi - b.lo)),
         };
         moved.map_or_else(|| Fact::full(ty), |(lo, hi)| Fact::range(lo, hi))
     }
@@ -433,7 +516,7 @@ impl Path {
         if !ty.is_small_int() {
             return;
         }
-        if let Some(truth) = compared(IntCC::NotEqual, ty, 0, taken) {
+        if let Some(truth) = compared_range(IntCC::NotEqual, ty, &Fact::range(0, 0), taken) {
             self.add(ranges, condition, truth);
         }
         match ranges.op(func, condition) {
@@ -456,10 +539,10 @@ impl Path {
                     _ => cc,
                 };
                 if !order.is_signed() {
-                    if let Some(fact) = right.exact().and_then(|k| compared(order, operand_ty, k, taken)) {
+                    if let Some(fact) = compared_range(order, operand_ty, &right, taken) {
                         self.add(ranges, x, fact);
                     }
-                    if let Some(fact) = left.exact().and_then(|k| compared(swapped(order), operand_ty, k, taken)) {
+                    if let Some(fact) = compared_range(swapped(order), operand_ty, &left, taken) {
                         self.add(ranges, y, fact);
                     }
                 }

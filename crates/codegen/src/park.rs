@@ -1,3 +1,6 @@
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use crate::alloc::Location;
 use crate::frame::{Abi, Loc};
 use crate::ir::{Function, Inst, Op, Signature, Value};
@@ -72,14 +75,14 @@ fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, poo
     }
     let regs: Vec<F> = class.saved.iter().chain(&class.leaf).copied().collect();
     let is_saved: Vec<bool> = regs.iter().map(|r| class.saved.contains(r)).collect();
-    let locked_arrivals: Vec<F> = class.arrivals.iter().flatten().copied().filter(|reg| class.leaf.contains(reg) && !kept.contains(&Some(*reg))).collect();
+    let locked_arrivals: Vec<F> = class.arrivals.iter().flatten().copied().filter(|reg| class.leaf.contains(reg)).collect();
     let arrival_lock: Vec<bool> = regs.iter().map(|r| locked_arrivals.contains(r)).collect();
     let passed = class.passed.iter().map(|entry| entry.filter(|(reg, _)| class.leaf.contains(reg))).collect();
     Pool { regs, is_saved, kept, arrival_lock, passed }
 }
 
-fn slot_free(holders: &[usize], live: &Live, ranges: &[Range], locked_entry: bool, start: u32) -> bool {
-    !(start == 0 && locked_entry) && holders.iter().all(|&other| !overlaps(live.ranges_of(other), ranges))
+fn slot_free<F: Copy + PartialEq>(holders: &[usize], live: &Live, ranges: &[Range], locked_entry: bool, start: u32, slot_reg: F, kept_reg: Option<F>) -> bool {
+    !(start == 0 && locked_entry && kept_reg != Some(slot_reg)) && holders.iter().all(|&other| !overlaps(live.ranges_of(other), ranges))
 }
 
 fn pick_slot<F: Copy + PartialEq>(
@@ -88,15 +91,20 @@ fn pick_slot<F: Copy + PartialEq>(
     live: &Live,
     ranges: &[Range],
     start: u32,
-    used: &[F],
+    kept_reg: Option<F>,
     reserved: &[F],
     allow_reserved: bool,
+    slot_used: impl Fn(usize) -> bool,
     pred: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    let valid = |slot: usize| pred(slot) && (allow_reserved || !reserved.contains(&pool.regs[slot])) && slot_free(&holders[slot], live, ranges, pool.arrival_lock[slot], start);
+    let valid = |slot: usize| {
+        pred(slot)
+            && (allow_reserved || !reserved.contains(&pool.regs[slot]))
+            && slot_free(&holders[slot], live, ranges, pool.arrival_lock[slot], start, pool.regs[slot], kept_reg)
+    };
     (0..pool.regs.len())
-        .find(|&s| valid(s) && holders[s].is_empty() && (!pool.is_saved[s] || used.contains(&pool.regs[s])))
-        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && (!pool.is_saved[s] || used.contains(&pool.regs[s]))))
+        .find(|&s| valid(s) && holders[s].is_empty() && (!pool.is_saved[s] || slot_used(s)))
+        .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && (!pool.is_saved[s] || slot_used(s))))
         .or_else(|| (0..pool.regs.len()).find(|&s| valid(s) && holders[s].is_empty()))
         .or_else(|| (0..pool.regs.len()).find(|&s| valid(s)))
 }
@@ -139,6 +147,24 @@ struct Victim {
     penalty: u64,
 }
 
+struct Demote {
+    slot: usize,
+    cost: u64,
+    moves: Vec<(usize, usize)>,
+    evicts: Vec<(usize, usize)>,
+}
+
+fn holder_leaf_cost<F: Copy + PartialEq>(pool: &Pool<F>, live: &Live, hints: &Hints, cost: &[u64], slot: usize, h: usize) -> u64 {
+    let h_park = if crosses_ranges(&live.calls, live.ranges_of(h)) {
+        leaf_park_cost(live, hints, h).unwrap_or(0)
+    } else {
+        0
+    };
+    cost[h]
+        .saturating_add(u64::from(pool.kept[h] == Some(pool.regs[slot])))
+        .saturating_sub(h_park)
+}
+
 fn find_demote<F: Copy + PartialEq>(
     pool: &Pool<F>,
     holders: &[Vec<usize>],
@@ -147,18 +173,19 @@ fn find_demote<F: Copy + PartialEq>(
     hints: &Hints,
     reserved: &[F],
     (ranges, start, value): (&[Range], u32, usize),
-) -> Option<(usize, u64, Vec<(usize, usize)>)> {
+) -> Option<Demote> {
     let val_cost = hints.weights.map(|w| w[value]);
-    let mut best: Option<(u64, bool, usize, Vec<(usize, usize)>)> = None;
-    for s in (0..pool.regs.len()).filter(|&s| pool.is_saved[s] && !(start == 0 && pool.arrival_lock[s])) {
+    let mut best: Option<(u64, bool, Demote)> = None;
+    for s in (0..pool.regs.len()).filter(|&s| pool.is_saved[s] && !(start == 0 && pool.arrival_lock[s] && pool.kept[value] != Some(pool.regs[s]))) {
         let mut moves: Vec<(usize, usize)> = Vec::new();
-        let mut total_park = 0_u64;
+        let mut evicts: Vec<(usize, usize)> = Vec::new();
+        let mut total_cost = 0_u64;
         let mut ok = true;
         for &h in &holders[s] {
             if !overlaps(live.ranges_of(h), ranges) {
                 continue;
             }
-            if pool.kept[h].is_some() {
+            if hints.weights.is_none() && pool.kept[h].is_some() {
                 ok = false;
                 break;
             }
@@ -171,36 +198,73 @@ fn find_demote<F: Copy + PartialEq>(
                 ok = false;
                 break;
             };
-            let pick_leaf = |avoid_reserved: bool| {
+            let pick_free = |avoid_reserved: bool| {
                 (0..pool.regs.len()).find(|&l| {
                     !pool.is_saved[l]
                         && (!avoid_reserved || !reserved.contains(&pool.regs[l]))
-                        && slot_free(&assigned[l], live, h_ranges, pool.arrival_lock[l], h_start)
+                        && slot_free(&assigned[l], live, h_ranges, pool.arrival_lock[l], h_start, pool.regs[l], pool.kept[h])
                         && moves.iter().all(|&(mh, ml)| ml != l || !overlaps(live.ranges_of(mh), h_ranges))
                 })
             };
-            let Some(leaf_slot) = pick_leaf(true).or_else(|| pick_leaf(false)) else {
+            if let Some(leaf_slot) = pick_free(true).or_else(|| pick_free(false)) {
+                total_cost = total_cost.saturating_add(h_park);
+                moves.push((h, leaf_slot));
+                continue;
+            }
+            let Some(cost) = hints.weights else {
                 ok = false;
                 break;
             };
-            total_park = total_park.saturating_add(h_park);
+            let mut best_leaf: Option<(u64, bool, usize, Vec<(usize, usize)>)> = None;
+            for l in (0..pool.regs.len()).filter(|&l| !pool.is_saved[l]) {
+                if !slot_free(&[], live, h_ranges, pool.arrival_lock[l], h_start, pool.regs[l], pool.kept[h]) {
+                    continue;
+                }
+                if moves.iter().any(|&(mh, ml)| ml == l && overlaps(live.ranges_of(mh), h_ranges)) {
+                    continue;
+                }
+                let mut add_evict = 0_u64;
+                let mut slot_evicts = Vec::new();
+                for &eh in &assigned[l] {
+                    if overlaps(live.ranges_of(eh), h_ranges) {
+                        if !evicts.iter().any(|&(_, prev)| prev == eh) {
+                            add_evict = add_evict.saturating_add(holder_leaf_cost(pool, live, hints, cost, l, eh));
+                        }
+                        slot_evicts.push((l, eh));
+                    }
+                }
+                let is_res = reserved.contains(&pool.regs[l]);
+                if best_leaf.as_ref().is_none_or(|&(bc, br, _, _)| (add_evict, is_res) < (bc, br)) {
+                    best_leaf = Some((add_evict, is_res, l, slot_evicts));
+                }
+            }
+            let Some((add_evict, _, leaf_slot, slot_evicts)) = best_leaf else {
+                ok = false;
+                break;
+            };
+            total_cost = total_cost.saturating_add(h_park).saturating_add(add_evict);
             moves.push((h, leaf_slot));
+            for item in slot_evicts {
+                if !evicts.contains(&item) {
+                    evicts.push(item);
+                }
+            }
         }
         if !ok || moves.is_empty() {
             continue;
         }
-        if total_park > 0 && !val_cost.is_some_and(|vc| total_park < vc) {
+        if total_cost > 0 && !val_cost.is_some_and(|vc| total_cost < vc) {
             continue;
         }
         let is_res = reserved.contains(&pool.regs[s]);
-        if best.as_ref().is_none_or(|&(bp, br, _, _)| (total_park, is_res) < (bp, br)) {
-            best = Some((total_park, is_res, s, moves));
-            if total_park == 0 && !is_res {
+        if best.as_ref().is_none_or(|(bc, br, _)| (total_cost, is_res) < (*bc, *br)) {
+            best = Some((total_cost, is_res, Demote { slot: s, cost: total_cost, moves, evicts }));
+            if total_cost == 0 && !is_res {
                 break;
             }
         }
     }
-    best.map(|(cost, _, s, moves)| (s, cost, moves))
+    best.map(|(_, _, demote)| demote)
 }
 
 fn apply_demote<F: Copy>(
@@ -208,16 +272,24 @@ fn apply_demote<F: Copy>(
     holders: &mut [Vec<usize>],
     assigned: &mut [Vec<usize>],
     homes: &mut [Option<F>],
-    slot: usize,
-    moves: &[(usize, usize)],
-) {
-    for &(other, leaf_slot) in moves {
-        holders[slot].retain(|&h| h != other);
+    demote: &Demote,
+) -> Vec<usize> {
+    let mut dropped = Vec::new();
+    for &(leaf_slot, eh) in &demote.evicts {
+        holders[leaf_slot].retain(|&x| x != eh);
+        assigned[leaf_slot].retain(|&x| x != eh);
+        if homes[eh].take().is_some() {
+            dropped.push(eh);
+        }
+    }
+    for &(other, leaf_slot) in &demote.moves {
+        holders[demote.slot].retain(|&h| h != other);
         holders[leaf_slot].push(other);
-        assigned[slot].retain(|&h| h != other);
+        assigned[demote.slot].retain(|&h| h != other);
         assigned[leaf_slot].push(other);
         homes[other] = Some(pool.regs[leaf_slot]);
     }
+    dropped
 }
 
 fn evict_slot<F: Copy>(
@@ -226,16 +298,20 @@ fn evict_slot<F: Copy>(
     homes: &mut [Option<F>],
     live: &Live,
     ranges: &[Range],
-) {
+) -> Vec<usize> {
+    let mut dropped = Vec::new();
     holders.retain(|&other| {
         if overlaps(live.ranges_of(other), ranges) {
             assigned.retain(|&h| h != other);
-            homes[other] = None;
+            if homes[other].take().is_some() {
+                dropped.push(other);
+            }
             false
         } else {
             true
         }
     });
+    dropped
 }
 
 fn victim_slot<F: Copy + PartialEq>(
@@ -243,13 +319,15 @@ fn victim_slot<F: Copy + PartialEq>(
     holders: &[Vec<usize>],
     live: &Live,
     hints: &Hints,
+    remat: &[bool],
     (start, end, value): (u32, u32, usize),
     (needs_saved, can_park): (bool, bool),
-    (used, reserved): (&[F], &[F]),
+    reserved: &[F],
+    slot_used: impl Fn(usize) -> bool,
     suits: impl Fn(usize) -> bool,
 ) -> Option<Victim> {
     let ranges = live.ranges_of(value);
-    let candidates = (0..pool.regs.len()).filter(|&s| suits(s) && !(start == 0 && pool.arrival_lock[s]));
+    let candidates = (0..pool.regs.len()).filter(|&s| suits(s) && !(start == 0 && pool.arrival_lock[s] && pool.kept[value] != Some(pool.regs[s])));
     let Some(cost) = hints.weights else {
         return candidates
             .filter_map(|s| {
@@ -271,52 +349,34 @@ fn victim_slot<F: Copy + PartialEq>(
             .map(|(_, slot)| Victim { slot, penalty: 0 });
     };
     let val_park = if needs_saved && can_park { leaf_park_cost(live, hints, value).unwrap_or(0) } else { 0 };
-    let mut best: Option<(u64, u8, bool, std::cmp::Reverse<u64>, usize)> = None;
+    let mut best: Option<(u64, u8, bool, bool, Reverse<u64>, usize)> = None;
     for s in candidates {
         let val_parks_here = !pool.is_saved[s] && needs_saved;
         let added_park = if val_parks_here { val_park } else { 0 };
-        let cand_gain = cost[value].saturating_sub(added_park);
+        let cand_gain = cost[value]
+            .saturating_add(u64::from(pool.kept[value] == Some(pool.regs[s])))
+            .saturating_sub(added_park);
         if cand_gain == 0 {
             continue;
         }
         let mut evict_cost = 0_u64;
         let mut max_len = 0_u64;
         let mut count = 0_usize;
-        let mut single = 0_usize;
-        let mut ok = true;
+        let mut has_non_remat = false;
         for &h in &holders[s] {
             if overlaps(live.ranges_of(h), ranges) {
-                if pool.kept[h].is_some() {
-                    ok = false;
-                    break;
-                }
-                let h_park = if !pool.is_saved[s] && crosses_ranges(&live.calls, live.ranges_of(h)) {
-                    leaf_park_cost(live, hints, h).unwrap_or(0)
+                let h_gain = if !pool.is_saved[s] {
+                    holder_leaf_cost(pool, live, hints, cost, s, h)
                 } else {
-                    0
+                    cost[h].saturating_add(u64::from(pool.kept[h] == Some(pool.regs[s])))
                 };
-                evict_cost = evict_cost.saturating_add(cost[h].saturating_sub(h_park));
+                evict_cost = evict_cost.saturating_add(h_gain);
+                has_non_remat |= !remat[h];
                 max_len = max_len.max(live.total_len(h));
-                single = h;
                 count += 1;
             }
         }
-        if !ok || count == 0 {
-            continue;
-        }
-        let cheaper = if count == 1 {
-            if val_parks_here {
-                evict_cost < cand_gain
-            } else {
-                let (len_single, len_val) = (live.total_len(single), live.total_len(value));
-                evict_cost < cand_gain
-                    || (evict_cost == cand_gain && len_single > len_val)
-                    || (len_single >= len_val.max(2).saturating_mul(4) && u128::from(evict_cost) * u128::from(len_val.max(2)) < u128::from(cand_gain) * u128::from(len_single))
-            }
-        } else {
-            evict_cost.saturating_mul(2) < cand_gain
-        };
-        if !cheaper {
+        if count == 0 || evict_cost >= cand_gain {
             continue;
         }
         let penalty = evict_cost.saturating_add(added_park);
@@ -324,21 +384,228 @@ fn victim_slot<F: Copy + PartialEq>(
             u8::from(!pool.is_saved[s])
         } else if !pool.is_saved[s] {
             0
-        } else if used.contains(&pool.regs[s]) {
+        } else if slot_used(s) {
             1
         } else {
             2
         };
-        let key = (penalty, tier, reserved.contains(&pool.regs[s]), std::cmp::Reverse(max_len), s);
+        let key = (penalty, tier, reserved.contains(&pool.regs[s]), has_non_remat, Reverse(max_len), s);
         if best.is_none_or(|b| key < b) {
             best = Some(key);
         }
     }
-    best.map(|(penalty, _, _, _, slot)| Victim { slot, penalty })
+    best.map(|(penalty, _, _, _, _, slot)| Victim { slot, penalty })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Priority {
+    density: u128,
+    weight: u64,
+    non_remat: bool,
+    start: Reverse<u32>,
+    tie: Reverse<usize>,
+    value: usize,
+}
+
+fn value_priority(weights: &[u64], live: &Live, remat: &[bool], start: u32, value: usize) -> Priority {
+    let weight = weights[value];
+    let len = live.total_len(value).max(1);
+    let density = (u128::from(weight) << 24) / u128::from(len);
+    Priority { density, weight, non_remat: !remat[value], start: Reverse(start), tie: Reverse(value), value }
+}
+
+const MAX_REQUEUE: u8 = 4;
+
+fn choose_free<F: Copy + PartialEq>(
+    pool: &Pool<F>,
+    holders: &[Vec<usize>],
+    homes: &[Option<F>],
+    live: &Live,
+    hints: &Hints,
+    reverse_reuse: &[Option<Value>],
+    reserved: &[F],
+    slot_used: impl Fn(usize) -> bool,
+    (value, start, end, wide_val, needs_saved, can_park, has_free_saved): (usize, u32, u32, bool, bool, bool, bool),
+) -> Option<usize> {
+    let ranges = live.ranges_of(value);
+    let kept_reg = pool.kept[value];
+    let suits_direct = |s: usize| if needs_saved { pool.is_saved[s] && !wide_val } else { !wide_val || !pool.is_saved[s] };
+    let suits_any = |s: usize| suits_direct(s) || (can_park && !pool.is_saved[s]);
+    if let Some(reg) = kept_reg
+        && let Some(s) = pool.regs.iter().position(|r| *r == reg)
+        && suits_any(s)
+        && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, reg, kept_reg)
+    {
+        return Some(s);
+    }
+    for op in [hints.reuse[value], reverse_reuse.get(value).copied().flatten()].into_iter().flatten() {
+        let Some(reg) = homes[op.index()] else { continue };
+        let Some(s) = pool.regs.iter().position(|r| *r == reg) else { continue };
+        let suits_reuse = if has_free_saved { suits_direct(s) } else { suits_any(s) };
+        if suits_reuse && !reserved.contains(&reg) && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, reg, kept_reg) {
+            return Some(s);
+        }
+    }
+    if let Some(partners) = hints.partners {
+        for partner in &partners[value] {
+            let Some(reg) = homes[partner.index()] else { continue };
+            let Some(s) = pool.regs.iter().position(|r| *r == reg) else { continue };
+            let ok = if needs_saved { (pool.is_saved[s] || (can_park && !has_free_saved)) && !wide_val } else { !pool.is_saved[s] || (!wide_val && slot_used(s)) };
+            if ok && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, reg, kept_reg) {
+                return Some(s);
+            }
+        }
+    }
+    if let Some((reg, at_call_end)) = pool.passed.get(value).copied().flatten() {
+        let call_at = end + 1;
+        let plain_call = live.calls.binary_search(&call_at).is_ok() && live.unwinds.binary_search(&call_at).is_err();
+        if (!at_call_end || plain_call)
+            && !crosses_ranges(&live.calls, ranges)
+            && let Some(s) = pool.regs.iter().position(|r| *r == reg)
+            && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, reg, kept_reg)
+        {
+            return Some(s);
+        }
+    }
+    if needs_saved {
+        pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, false, &slot_used, |s| pool.is_saved[s] && !wide_val)
+            .or_else(|| can_park.then(|| pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, false, &slot_used, |s| !pool.is_saved[s])).flatten())
+            .or_else(|| pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, true, &slot_used, |s| pool.is_saved[s] && !wide_val))
+            .or_else(|| can_park.then(|| pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, true, &slot_used, |s| !pool.is_saved[s])).flatten())
+    } else {
+        pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, false, &slot_used, |s| !pool.is_saved[s])
+            .or_else(|| (!wide_val).then(|| pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, false, &slot_used, |s| pool.is_saved[s] && slot_used(s))).flatten())
+            .or_else(|| (!wide_val).then(|| pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, false, &slot_used, |s| pool.is_saved[s])).flatten())
+            .or_else(|| pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, true, &slot_used, |s| !pool.is_saved[s]))
+            .or_else(|| (!wide_val).then(|| pick_slot(pool, holders, live, ranges, start, kept_reg, reserved, true, &slot_used, |s| pool.is_saved[s])).flatten())
+    }
+}
+
+fn fill_reserved<F: Copy + PartialEq>(back_args: &[(usize, usize)], homes: &[Option<F>], live: &Live, value: usize, start: u32, check_order: bool, reserved: &mut Vec<F>) {
+    reserved.clear();
+    for &(param, arg) in back_args {
+        if arg != value
+            && let Some(reg) = homes[param]
+            && homes[arg].is_none()
+            && (!check_order || live.bounds(arg).is_some_and(|(arg_start, _)| arg_start >= start))
+            && !reserved.contains(&reg)
+        {
+            reserved.push(reg);
+        }
+        if !check_order
+            && param != value
+            && let Some(reg) = homes[arg]
+            && homes[param].is_none()
+            && !reserved.contains(&reg)
+        {
+            reserved.push(reg);
+        }
+    }
+}
+
+fn allocate_weighted<F: Copy + PartialEq>(func: &Function, live: &Live, pool: &Pool<F>, pooled: &[bool], hints: &Hints, weights: &[u64]) -> (Vec<Option<F>>, Vec<F>) {
+    let mut homes = vec![None; pooled.len()];
+    let mut assigned: Vec<Vec<usize>> = vec![Vec::new(); pool.regs.len()];
+    let mut remat = vec![false; pooled.len()];
+    for data in &func.insts {
+        if matches!(data.op, Op::Const(_) | Op::SlotAddr(_))
+            && let Some(res) = data.result
+            && res.index() < remat.len()
+        {
+            remat[res.index()] = true;
+        }
+    }
+    let mut reverse_reuse = vec![None; pooled.len()];
+    for (dst, &src) in hints.reuse.iter().enumerate() {
+        if let Some(src) = src
+            && reverse_reuse[src.index()].is_none()
+        {
+            reverse_reuse[src.index()] = Some(Value(dst as u32));
+        }
+    }
+    let mut heap = BinaryHeap::new();
+    for (v, &is_pooled) in pooled.iter().enumerate() {
+        if is_pooled && let Some((start, _)) = live.bounds(v) {
+            heap.push(value_priority(weights, live, &remat, start, v));
+        }
+    }
+    let back_args = loop_back_args(func);
+    let mut reserved: Vec<F> = Vec::new();
+    let mut requeues = vec![0_u8; pooled.len()];
+    while let Some(item) = heap.pop() {
+        let value = item.value;
+        if homes[value].is_some() {
+            continue;
+        }
+        let Some((start, end)) = live.bounds(value) else { continue };
+        let ranges = live.ranges_of(value);
+        let wide_val = func.types[value].bytes() > 8;
+        let needs_saved = live.trapped[value] || crosses_ranges(&live.calls, ranges);
+        let can_park = needs_saved && parks(live, hints, value);
+        if needs_saved && wide_val && !can_park {
+            continue;
+        }
+        let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slot_free(&assigned[s], live, ranges, pool.arrival_lock[s], start, pool.regs[s], pool.kept[value]));
+        fill_reserved(&back_args, &homes, live, value, start, false, &mut reserved);
+        let mut chosen = choose_free(
+            pool,
+            &assigned,
+            &homes,
+            live,
+            hints,
+            &reverse_reuse,
+            &reserved,
+            |s| !assigned[s].is_empty(),
+            (value, start, end, wide_val, needs_saved, can_park, has_free_saved),
+        );
+        if chosen.is_none() {
+            let demote = (!wide_val)
+                .then(|| find_demote(pool, &assigned, &assigned, live, hints, &reserved, (ranges, start, value)))
+                .flatten();
+            let suits_any = |s: usize| if needs_saved { (pool.is_saved[s] && !wide_val) || (can_park && !pool.is_saved[s]) } else { !wide_val || !pool.is_saved[s] };
+            let victim = if demote.as_ref().is_some_and(|d| d.cost == 0) {
+                None
+            } else {
+                victim_slot(pool, &assigned, live, hints, &remat, (start, end, value), (needs_saved, can_park), &reserved, |s| !assigned[s].is_empty(), suits_any)
+            };
+            let dropped = if let Some(demote) = demote
+                && victim.is_none_or(|v| demote.cost <= v.penalty)
+            {
+                chosen = Some(demote.slot);
+                let mut unused_holders = vec![Vec::new(); pool.regs.len()];
+                apply_demote(pool, &mut unused_holders, &mut assigned, &mut homes, &demote)
+            } else if let Some(v) = victim {
+                chosen = Some(v.slot);
+                let mut slot_assigned = std::mem::take(&mut assigned[v.slot]);
+                let mut shadow = slot_assigned.clone();
+                let out = evict_slot(&mut shadow, &mut slot_assigned, &mut homes, live, ranges);
+                assigned[v.slot] = slot_assigned;
+                out
+            } else {
+                Vec::new()
+            };
+            for eh in dropped {
+                if requeues[eh] < MAX_REQUEUE
+                    && let Some((eh_start, _)) = live.bounds(eh)
+                {
+                    requeues[eh] += 1;
+                    heap.push(value_priority(weights, live, &remat, eh_start, eh));
+                }
+            }
+        }
+        let Some(slot) = chosen else { continue };
+        homes[value] = Some(pool.regs[slot]);
+        assigned[slot].push(value);
+    }
+    let used = (0..pool.regs.len()).filter(|&s| pool.is_saved[s] && !assigned[s].is_empty()).map(|s| pool.regs[s]).collect();
+    (homes, used)
 }
 
 pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class: &Class<F>, pooled: &[bool], hints: &Hints) -> (Vec<Option<F>>, Vec<F>) {
     let pool = pool(func, class, live, pooled);
+    if let Some(weights) = hints.weights {
+        return allocate_weighted(func, live, &pool, pooled, hints, weights);
+    }
     let mut homes = vec![None; pooled.len()];
     let mut holders: Vec<Vec<usize>> = vec![Vec::new(); pool.regs.len()];
     let mut assigned: Vec<Vec<usize>> = vec![Vec::new(); pool.regs.len()];
@@ -359,6 +626,7 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
     let back_args = loop_back_args(func);
     let mut used: Vec<F> = Vec::new();
     let mut reserved: Vec<F> = Vec::new();
+    let remat = vec![false; pooled.len()];
     for (start, end, value) in values {
         for list in &mut holders {
             list.retain(|&other| live.last_end(other).is_some_and(|u| u >= start));
@@ -372,82 +640,33 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         }
         let suits_direct = |s: usize| if needs_saved { pool.is_saved[s] && !wide_val } else { !wide_val || !pool.is_saved[s] };
         let suits_any = |s: usize| suits_direct(s) || (can_park && !pool.is_saved[s]);
-        let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start));
-        reserved.clear();
-        for &(param, arg) in &back_args {
-            if arg != value
-                && let Some(reg) = homes[param]
-                && homes[arg].is_none()
-                && live.bounds(arg).is_some_and(|(arg_start, _)| arg_start >= start)
-                && !reserved.contains(&reg)
-            {
-                reserved.push(reg);
-            }
-        }
-        let mut chosen = hints.reuse[value].and_then(|op| {
-            let op_idx = op.index();
-            let reg = homes[op_idx]?;
-            let s = pool.regs.iter().position(|r| *r == reg)?;
-            let suits_reuse = if has_free_saved { suits_direct(s) } else { suits_any(s) };
-            if !suits_reuse || (start == 0 && pool.arrival_lock[s]) || reserved.contains(&reg) {
-                return None;
-            }
-            if !holders[s].iter().all(|&h| h == op_idx || !overlaps(live.ranges_of(h), ranges)) {
-                return None;
-            }
-            holders[s].retain(|&h| h != op_idx);
-            Some(s)
-        });
-        if chosen.is_none()
-            && let Some(partners) = hints.partners
-        {
-            chosen = partners[value].iter().filter_map(|p| homes[p.index()]).find_map(|reg| {
-                let s = pool.regs.iter().position(|r| *r == reg)?;
-                let ok = if needs_saved { (pool.is_saved[s] || (can_park && !has_free_saved)) && !wide_val } else { !pool.is_saved[s] || (!wide_val && used.contains(&reg)) };
-                (ok && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start)).then_some(s)
-            });
-        }
-        if chosen.is_none()
-            && let Some((reg, at_call_end)) = pool.passed.get(value).copied().flatten()
-        {
-            let call_at = end + 1;
-            let plain_call = live.calls.binary_search(&call_at).is_ok() && live.unwinds.binary_search(&call_at).is_err();
-            if (!at_call_end || plain_call)
-                && !crosses_ranges(&live.calls, ranges)
-                && let Some(s) = pool.regs.iter().position(|r| *r == reg)
-                && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start)
-            {
-                chosen = Some(s);
-            }
-        }
-        if chosen.is_none() {
-            chosen = if needs_saved {
-                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s] && !wide_val)
-                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| !pool.is_saved[s])).flatten())
-                    .or_else(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| pool.is_saved[s] && !wide_val))
-                    .or_else(|| can_park.then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| !pool.is_saved[s])).flatten())
-            } else {
-                pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| !pool.is_saved[s])
-                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s] && used.contains(&pool.regs[s]))).flatten())
-                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, false, |s| pool.is_saved[s])).flatten())
-                    .or_else(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| !pool.is_saved[s]))
-                    .or_else(|| (!wide_val).then(|| pick_slot(&pool, &holders, live, ranges, start, &used, &reserved, true, |s| pool.is_saved[s])).flatten())
-            };
-        }
+        let has_free_saved = needs_saved && !wide_val && (0..pool.regs.len()).any(|s| pool.is_saved[s] && slot_free(&holders[s], live, ranges, pool.arrival_lock[s], start, pool.regs[s], None));
+        fill_reserved(&back_args, &homes, live, value, start, true, &mut reserved);
+        let mut chosen = choose_free(
+            &pool,
+            &holders,
+            &homes,
+            live,
+            hints,
+            &[],
+            &reserved,
+            |s| used.contains(&pool.regs[s]),
+            (value, start, end, wide_val, needs_saved, can_park, has_free_saved),
+        );
         if chosen.is_none() {
             let demote = (!wide_val)
                 .then(|| find_demote(&pool, &holders, &assigned, live, hints, &reserved, (ranges, start, value)))
                 .flatten();
-            let victim = if demote.as_ref().is_some_and(|(_, cost, _)| *cost == 0) {
+            let victim = if demote.as_ref().is_some_and(|d| d.cost == 0) {
                 None
             } else {
-                victim_slot(&pool, &holders, live, hints, (start, end, value), (needs_saved, can_park), (&used, &reserved), suits_any)
+                victim_slot(&pool, &holders, live, hints, &remat, (start, end, value), (needs_saved, can_park), &reserved, |s| used.contains(&pool.regs[s]), suits_any)
             };
-            if let Some((s, d_cost, moves)) = demote
-                && victim.is_none_or(|v| d_cost <= v.penalty)
+            if let Some(demote) = demote
+                && victim.is_none_or(|v| demote.cost <= v.penalty)
             {
-                apply_demote(&pool, &mut holders, &mut assigned, &mut homes, s, &moves);
-                chosen = Some(s);
+                apply_demote(&pool, &mut holders, &mut assigned, &mut homes, &demote);
+                chosen = Some(demote.slot);
             } else if let Some(v) = victim {
                 evict_slot(&mut holders[v.slot], &mut assigned[v.slot], &mut homes, live, ranges);
                 chosen = Some(v.slot);

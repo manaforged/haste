@@ -20,6 +20,9 @@ pub(super) fn shift_parts(op: &Op, plan: &Plan<Reg>) -> Option<(Binary, Value, i
 }
 
 fn preserved(func: &Function, plan: &Plan<Reg>, block_idx: usize, start: usize, end: usize, skip_pos: Option<usize>, val: Value) -> bool {
+    if plan.elided[val.index()] {
+        return false;
+    }
     if start + 1 >= end || matches!(plan.location(val), Location::Imm(_) | Location::SlotAddr(_) | Location::Frame(..)) {
         return true;
     }
@@ -136,6 +139,36 @@ fn fuse_shifted_alu(func: &Function, plan: &mut Plan<Reg>, info: (&[u32], &[Opti
     }
 }
 
+fn fuse_shift_mask(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos): (usize, usize), x: Value, y: Value) {
+    let ty = func.ty(x);
+    if !matches!(ty, Type::I32 | Type::I64) || uses[y.index()] != 1 || plan.elided[y.index()] {
+        return;
+    }
+    let Some((yb, ypos, yinst)) = pos_of[y.index()] else { return };
+    if yb != b_idx || ypos >= pos {
+        return;
+    }
+    let Op::Binary(Binary::Band, a, b) = func.insts[yinst.index()].op else { return };
+    let mask = u64::from(ty.bits() - 1);
+    let const_of = |v: Value| {
+        plan.const_of(v).or_else(|| {
+            pos_of[v.index()].and_then(|(_, _, i)| match func.insts[i.index()].op {
+                Op::Const(imm) => Some(imm),
+                _ => None,
+            })
+        })
+    };
+    for (raw, m) in [(a, b), (b, a)] {
+        if let Some(imm) = const_of(m)
+            && (imm as u64 & mask) == mask
+            && preserved(func, plan, b_idx, ypos, pos, None, raw)
+        {
+            plan.elided[y.index()] = true;
+            return;
+        }
+    }
+}
+
 pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
     let mut uses = vec![0_u32; func.types.len()];
     let mut pos_of = vec![None; func.types.len()];
@@ -155,19 +188,35 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
             if plan.elided[res.index()] {
                 continue;
             }
+            if let Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, x, y) = data.op {
+                fuse_shift_mask(func, plan, (&uses, &pos_of), (b_idx, pos), x, y);
+            }
             if let Op::Convert(Convert::Ireduce, shr) = data.op {
                 fuse_ireduce_ushr(func, plan, (&uses, &pos_of), (b_idx, pos, res), shr);
                 continue;
             }
-            if let Op::Icmp(_, a, _) = data.op
+            if let Op::Icmp(_, a, b) = data.op
                 && func.ty(a).is_small_int()
                 && (1..=2).contains(&uses[res.index()])
-                && (1..=uses[res.index()] as usize).all(|k| {
-                    block.insts.get(pos + k).is_some_and(|&ni| matches!(func.insts[ni.index()].op, Op::Select(c, x, y) if c == res && x != res && y != res))
-                })
             {
-                plan.elided[res.index()] = true;
-                continue;
+                let mut found = 0_u32;
+                let mut last_sel = pos;
+                for (s_pos, &ni) in block.insts.iter().enumerate().skip(pos + 1) {
+                    if matches!(func.insts[ni.index()].op, Op::Select(c, x, y) if c == res && x != res && y != res) {
+                        found += 1;
+                        last_sel = s_pos;
+                        if found == uses[res.index()] {
+                            break;
+                        }
+                    }
+                }
+                if found == uses[res.index()]
+                    && preserved(func, plan, b_idx, pos, last_sel, None, a)
+                    && preserved(func, plan, b_idx, pos, last_sel, None, b)
+                {
+                    plan.elided[res.index()] = true;
+                    continue;
+                }
             }
             if let Op::Binary(alu_op @ (Binary::Band | Binary::Bor | Binary::Bxor | Binary::Iadd | Binary::Isub), x, y) = data.op
                 && matches!(func.ty(res), Type::I32 | Type::I64)
@@ -291,8 +340,10 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                 continue;
             }
             match func.insts[cinst.index()].op {
-                Op::Binary(Binary::Band, x, y) if cpos + 1 == pos => {
-                    if single_bit_mask(func, plan, x, y).is_some() {
+                Op::Binary(Binary::Band, x, y) if cpos < pos => {
+                    if let Some((val, _)) = single_bit_mask(func, plan, x, y)
+                        && preserved(func, plan, b_idx, cpos, pos, None, val)
+                    {
                         plan.elided[cond_val.index()] = true;
                     }
                 }
@@ -309,10 +360,11 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                         && !plan.elided[m.index()]
                         && let Some((mb, mpos, minst)) = pos_of[m.index()]
                         && mb == b_idx
-                        && mpos + 1 == cpos
-                        && cpos + 1 == pos
+                        && mpos < cpos
+                        && cpos < pos
                         && let Op::Binary(Binary::Band, x, y) = func.insts[minst.index()].op
-                        && single_bit_mask(func, plan, x, y).is_some()
+                        && let Some((val, _)) = single_bit_mask(func, plan, x, y)
+                        && preserved(func, plan, b_idx, mpos, pos, None, val)
                     {
                         plan.elided[cond_val.index()] = true;
                         plan.elided[m.index()] = true;

@@ -296,7 +296,7 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    fn call_libc(&mut self, symbol: RuntimeSymbol, args: Vec<Value>, ret: Option<Ty>) -> Result<Option<Value>> {
+    pub(super) fn call_libc(&mut self, symbol: RuntimeSymbol, args: Vec<Value>, ret: Option<Ty>) -> Result<Option<Value>> {
         let usize_ty = self.cx.types.prim(Primitive::Usize);
         let code = self.ins().runtime(symbol);
         self.call_code(code, (vec![usize_ty; args.len()], ret), args)

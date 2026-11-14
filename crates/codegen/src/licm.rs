@@ -6,6 +6,7 @@ use crate::merge::{find, identity, rename};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SymVal {
     Phi,
+    Merge(Block),
     Inst(Value),
 }
 
@@ -90,21 +91,63 @@ fn inst_matches_cand(func: &Function, prov: &Provenance, op: &Op, res: Option<Va
     ((loc.base, loc.offset, ty) == (cand.loc.base, cand.loc.offset, cand.ty)).then_some((is_write, stored))
 }
 
-fn join_loop_preds(out_state: &[Option<(SymVal, bool)>], preds: &[Block]) -> Option<(SymVal, bool)> {
+fn can_zero_trip_store(prov: &Provenance, cand: PromoteCand) -> bool {
+    match cand.base {
+        PromoteBase::Slot(_) => true,
+        PromoteBase::Addr(addr) => {
+            let end = i64::from(cand.offset).checked_add(i64::from(cand.ty.bytes()));
+            let deref = prov.ro_bytes.get(addr.index()).copied().unwrap_or(0);
+            end.is_some_and(|e| e >= 0 && e as u64 <= u64::from(deref))
+        }
+    }
+}
+
+fn can_merge_block(func: &Function, cfg: &Cfg, each: &Loop, b: Block) -> bool {
+    let preds = cfg.preds_of(b);
+    !preds.is_empty()
+        && preds.iter().all(|p| {
+            each.body.get(p.index()).copied().unwrap_or(false)
+                && matches!(func.last(*p), Some(Op::Jump(..) | Op::Brif(..)))
+        })
+}
+
+fn join_block_preds(
+    out_state: &[Option<(SymVal, bool)>],
+    preds: &[Block],
+    block: Block,
+    mergeable: bool,
+) -> Result<Option<(SymVal, bool)>, ()> {
     let mut joined: Option<(SymVal, bool)> = None;
+    let mut all_ready = !preds.is_empty();
+    let mut any_dirty = false;
+    let mut same = true;
     for &p in preds {
-        let Some(st) = out_state[p.index()] else { continue };
+        let Some(st) = out_state[p.index()] else {
+            all_ready = false;
+            continue;
+        };
+        any_dirty |= st.1;
         match joined {
             None => joined = Some(st),
-            Some(prev) if prev != st => return None,
+            Some(prev) if prev != st => same = false,
             Some(_) => {}
         }
     }
-    joined
+    let Some(first) = joined else {
+        return Ok(None);
+    };
+    if all_ready && same {
+        return Ok(Some(first));
+    }
+    if mergeable {
+        return Ok(Some((SymVal::Merge(block), any_dirty)));
+    }
+    Err(())
 }
 
 fn check_cand_flow(
     func: &Function,
+    cfg: &Cfg,
     prov: &Provenance,
     each: &Loop,
     shape: &LoopShape,
@@ -113,15 +156,33 @@ fn check_cand_flow(
     let n = func.blocks.len();
     let mut in_state = vec![None; n];
     let mut out_state = vec![None; n];
+    let head_in_preds: Vec<Block> = cfg
+        .preds_of(each.head)
+        .iter()
+        .copied()
+        .filter(|p| each.body.get(p.index()).copied().unwrap_or(false))
+        .collect();
+    let mergeable: Vec<bool> = (0..n).map(|i| can_merge_block(func, cfg, each, Block(i as u32))).collect();
+    let zero_trip_ok = can_zero_trip_store(prov, cand);
     in_state[each.head.index()] = Some((SymVal::Phi, false));
-    for _ in 0..=shape.rpo.len() {
+    for _ in 0..=shape.rpo.len() + 2 {
         let mut changed = false;
+        if in_state[each.head.index()].is_some_and(|(_, d)| !d)
+            && head_in_preds.iter().any(|p| out_state[p.index()].is_some_and(|(_, d)| d))
+        {
+            let head_writes = out_state[each.head.index()].is_some_and(|(_, d)| d);
+            if !zero_trip_ok && !head_writes {
+                return None;
+            }
+            in_state[each.head.index()] = Some((SymVal::Phi, true));
+            changed = true;
+        }
         for &b in &shape.rpo {
             if b != each.head {
-                let Some(st) = join_loop_preds(&out_state, &shape.in_preds[b.index()]) else {
-                    if shape.in_preds[b.index()].iter().any(|p| out_state[p.index()].is_some()) {
-                        return None;
-                    }
+                let Ok(maybe_st) = join_block_preds(&out_state, &shape.in_preds[b.index()], b, mergeable[b.index()]) else {
+                    return None;
+                };
+                let Some(st) = maybe_st else {
                     continue;
                 };
                 if in_state[b.index()] != Some(st) {
@@ -251,10 +312,22 @@ fn rewrite_cand(
     shape: &LoopShape,
     cand: PromoteCand,
 ) -> bool {
-    let Some((in_state, dirty_out)) = check_cand_flow(state.func, prov, state.each, shape, cand) else {
+    let Some((in_state, dirty_out)) = check_cand_flow(state.func, state.cfg, prov, state.each, shape, cand) else {
         return false;
     };
     let phi = setup_preheader_phi(state, pre, cand);
+    let mut merge_phis = vec![None; state.func.blocks.len()];
+    for &b in &shape.rpo {
+        if let Some((SymVal::Merge(mb), _)) = in_state[b.index()]
+            && mb == b
+        {
+            let m_phi = state.func.value(cand.ty);
+            state.func.blocks[b.index()].params.push(m_phi);
+            state.home.resize(state.func.types.len(), None);
+            state.home[m_phi.index()] = Some(b);
+            merge_phis[b.index()] = Some(m_phi);
+        }
+    }
     let mut subst = identity(state.func.types.len());
     let mut renamed = false;
     let mut exits = Vec::new();
@@ -262,6 +335,10 @@ fn rewrite_cand(
         let Some((sym_in, _)) = in_state[b.index()] else { continue };
         let mut cur = match sym_in {
             SymVal::Phi => phi,
+            SymVal::Merge(mb) => match merge_phis[mb.index()] {
+                Some(m_phi) => m_phi,
+                None => continue,
+            },
             SymVal::Inst(v) => find(&subst, v),
         };
         let insts = std::mem::take(&mut state.func.blocks[b.index()].insts);
@@ -283,7 +360,7 @@ fn rewrite_cand(
         }
         state.func.blocks[b.index()].insts = kept;
         if let Some(&term) = state.func.blocks[b.index()].insts.last() {
-            record_term_edges(state.func, state.each, &dirty_out, (b, term, cur), &mut exits);
+            record_term_edges(state.func, state.each, &dirty_out, &merge_phis, (b, term, cur), &mut exits);
         }
     }
     emit_exit_stores(state, cand, exits);
@@ -293,29 +370,34 @@ fn rewrite_cand(
     true
 }
 
+fn needs_phi_arg(each: &Loop, merge_phis: &[Option<Value>], target: Block) -> bool {
+    target == each.head || merge_phis.get(target.index()).copied().flatten().is_some()
+}
+
 fn record_term_edges(
     func: &mut Function,
     each: &Loop,
     dirty_out: &[bool],
+    merge_phis: &[Option<Value>],
     (b, term, cur): (Block, Inst, Value),
     exits: &mut Vec<ExitEdge>,
 ) {
     let dirty = dirty_out[b.index()];
     match &mut func.insts[term.index()].op {
         Op::Jump(t, args) => {
-            if *t == each.head {
+            if needs_phi_arg(each, merge_phis, *t) {
                 args.push(cur);
             } else if dirty && !each.body.get(t.index()).copied().unwrap_or(false) {
                 exits.push(ExitEdge { src: b, branch: BranchKind::Jump, target: *t, val: cur });
             }
         }
         Op::Brif(_, t1, a1, t2, a2) => {
-            if *t1 == each.head {
+            if needs_phi_arg(each, merge_phis, *t1) {
                 a1.push(cur);
             } else if dirty && !each.body.get(t1.index()).copied().unwrap_or(false) {
                 exits.push(ExitEdge { src: b, branch: BranchKind::Then, target: *t1, val: cur });
             }
-            if *t2 == each.head {
+            if needs_phi_arg(each, merge_phis, *t2) {
                 a2.push(cur);
             } else if dirty && !each.body.get(t2.index()).copied().unwrap_or(false) {
                 exits.push(ExitEdge { src: b, branch: BranchKind::Else, target: *t2, val: cur });
@@ -343,6 +425,7 @@ fn promote_mem(state: &mut PromoteState<'_>, prov: &Provenance, pre: Block) -> b
 
 fn hoist(
     func: &mut Function,
+    cfg: &Cfg,
     each: &Loop,
     entry: Block,
     prov: &Provenance,
@@ -350,7 +433,11 @@ fn hoist(
 ) -> bool {
     let mem = LoopMem::analyze(func, each, prov);
     let mut moved: Vec<Inst> = Vec::new();
-    for block in (0..each.body.len()).filter(|block| each.body[*block]) {
+    for &blk in &cfg.rpo {
+        let block = blk.index();
+        if !each.body.get(block).copied().unwrap_or(false) {
+            continue;
+        }
         let head = block == each.head.index();
         let insts = std::mem::take(&mut func.blocks[block].insts);
         let mut kept = Vec::with_capacity(insts.len());
@@ -435,7 +522,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                 dirty |= Domain::CFG;
             }
         }
-        if hoist(func, &found.list[idx], pre, &prov, &mut home) {
+        if hoist(func, &cfg, &found.list[idx], pre, &prov, &mut home) {
             dirty |= Domain::VALUES;
         }
     }

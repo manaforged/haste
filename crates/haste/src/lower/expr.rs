@@ -21,6 +21,8 @@ use super::{Loop, Lower, Parts, Repr, repr};
 struct Budget {
     /// The most instructions a body may have, after slot promotion, for a call to copy it inline.
     insts: usize,
+    /// The most instructions an `#[inline]` body may have, after slot promotion, for a call to copy it inline.
+    inline_insts: usize,
     /// The most instructions an `#[inline(always)]` body may have for a call to copy it inline.
     always: usize,
     /// The most source expressions a function body may have for lowering it to try `insts`.
@@ -28,10 +30,10 @@ struct Budget {
 }
 
 /// The budget of the dev profile.
-const DEBUG_BUDGET: Budget = Budget { insts: 30, always: 100, exprs: 20 };
+const DEBUG_BUDGET: Budget = Budget { insts: 30, inline_insts: 30, always: 100, exprs: 20 };
 
 /// The budget of the release profile.
-const RELEASE_BUDGET: Budget = Budget { insts: 400, always: 1000, exprs: 400 };
+const RELEASE_BUDGET: Budget = Budget { insts: 400, inline_insts: 400, always: 1000, exprs: 400 };
 
 /// The budget of the build profile.
 fn budget() -> &'static Budget {
@@ -138,8 +140,9 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
         Hint::Never => None,
         Hint::Always => Some(budget.always),
         Hint::Inline => {
-            let max_exprs = if release || env.release { 800 } else { 200 };
-            (body.exprs.len() <= max_exprs).then_some(budget.insts)
+            let max_exprs = if release || env.release { 400 } else { 200 };
+            let inst_limit = if release || env.release { budget.inline_insts } else { budget.insts };
+            (body.exprs.len() <= max_exprs).then_some(inst_limit)
         }
         Hint::Default => {
             let max_exprs = if release && is_leaf_body(&body) { budget.exprs * 2 } else { budget.exprs };

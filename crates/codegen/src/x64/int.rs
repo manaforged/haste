@@ -2,7 +2,7 @@ use super::asm::{Alu, Cond, Count, Group3, Mem, Reg, Shift, Size};
 use super::Emit;
 use crate::alloc::Location;
 use crate::frame::Ext;
-use crate::ir::{Binary, Convert, IntCC, Type, Unary, Value};
+use crate::ir::{Binary, Convert, IntCC, Op, Type, Unary, Value};
 
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
 const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
@@ -190,13 +190,13 @@ impl Emit<'_> {
             return self.wide_binary(op, x, y, result);
         }
         let dst = self.dst(result);
-        let reg = self.int_binary(op, (x, y), ty, dst)?;
+        let reg = self.int_binary(op, (x, y), ty, dst, result)?;
         self.put(result, reg);
         Ok(())
     }
 
     /// Computes `x op y` into `dst` for the operations that can, or into rax, and returns the register that holds it.
-    fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<Reg, String> {
+    fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg, result: Value) -> Result<Reg, String> {
         if let Some(alu) = alu_of(op) {
             let size = if ty == Type::I32 { Size::D } else { Size::Q };
             let (x, y) = if !matches!(alu, Alu::Sub)
@@ -221,7 +221,7 @@ impl Emit<'_> {
                 self.asm.load(narrow, dst, source);
                 return Ok(dst);
             }
-            if matches!(alu, Alu::Add) {
+            if matches!(alu, Alu::Add) && size == Size::Q {
                 if let Some(rx) = self.reg_of(x).filter(|&rx| rx != dst) {
                     if let Some(imm) = self.imm_sized(y, size) {
                         self.asm.lea(dst, Mem::new(rx, imm));
@@ -261,11 +261,18 @@ impl Emit<'_> {
             Binary::Udiv | Binary::Urem if self.divide_by_power(op, (x, y), dst) => return Ok(dst),
             Binary::Sdiv | Binary::Srem | Binary::Udiv | Binary::Urem => self.divide(op, x, y),
             Binary::Umulhi | Binary::Smulhi => self.multiply_high(op == Binary::Smulhi, x, y, ty.bits() as u8),
-            Binary::Smin | Binary::Smax => {
-                self.get(Reg::Rax, x, Ext::Sign);
-                self.get(Reg::Rcx, y, Ext::Sign);
+            Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax => {
+                let signed = matches!(op, Binary::Smin | Binary::Smax);
+                self.get(Reg::Rax, x, Ext::of(signed));
+                self.get(Reg::Rcx, y, Ext::of(signed));
                 self.asm.alu(Alu::Cmp, Reg::Rax, Reg::Rcx);
-                self.asm.cmov(if op == Binary::Smin { Cond::G } else { Cond::L }, Reg::Rax, Reg::Rcx);
+                let take_y = match op {
+                    Binary::Smin => Cond::G,
+                    Binary::Smax => Cond::L,
+                    Binary::Umin => Cond::A,
+                    _ => Cond::B,
+                };
+                self.asm.cmov(take_y, Reg::Rax, Reg::Rcx);
             }
             Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat => {
                 self.raw(Reg::Rcx, y);
@@ -283,7 +290,7 @@ impl Emit<'_> {
                 self.asm.alu(Alu::Sub, dst, Reg::Rdx);
                 return Ok(dst);
             }
-            Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr => return Ok(self.shift_by(op, (x, y), ty, dst)),
+            Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr => return Ok(self.shift_by(op, (x, y), ty, dst, result)),
             other => return Err(format!("{other:?} of an integer")),
         }
         Ok(Reg::Rax)
@@ -371,8 +378,57 @@ impl Emit<'_> {
         }
     }
 
+    fn unwrap_shift_mask(&self, y: Value, shift_res: Value, bits: u32) -> Value {
+        if !matches!(bits, 32 | 64) {
+            return y;
+        }
+        let Some(y_inst) = self.defs[y.index()] else { return y };
+        let Op::Binary(Binary::Band, a, b) = self.func.insts[y_inst.index()].op else { return y };
+        let mask = u64::from(bits - 1);
+        let const_val = |v: Value| {
+            self.const_of(v).or_else(|| {
+                self.defs[v.index()].and_then(|i| match self.func.insts[i.index()].op {
+                    Op::Const(imm) => Some(imm),
+                    _ => None,
+                })
+            })
+        };
+        let Some(raw) = [(a, b), (b, a)].into_iter().find_map(|(raw, m)| {
+            let imm = const_val(m)?;
+            ((imm as u64 & mask) == mask).then_some(raw)
+        }) else {
+            return y;
+        };
+        if self.plan.elided[y.index()] {
+            return raw;
+        }
+        let Some(r_raw) = self.reg_of(raw) else { return y };
+        if self.plan.elided[raw.index()] || self.reg_of(y) == Some(r_raw) {
+            return y;
+        }
+        let Some(shift_inst) = self.defs[shift_res.index()] else { return y };
+        for block in &self.func.blocks {
+            let Some(ypos) = block.insts.iter().position(|&i| i == y_inst) else { continue };
+            let Some(spos) = block.insts.iter().position(|&i| i == shift_inst) else { return y };
+            if ypos >= spos {
+                return y;
+            }
+            let ok = block.insts[ypos + 1..spos].iter().all(|&inst| {
+                let data = &self.func.insts[inst.index()];
+                if data.result.is_some_and(|r| self.plan.elided[r.index()] || self.plan.deferred[r.index()]) {
+                    return true;
+                }
+                !matches!(data.op, Op::Call { .. } | Op::TryCall { .. })
+                    && !data.result.and_then(|r| self.plan.pairs[r.index()]).is_some_and(|p| self.reg_of(p) == Some(r_raw))
+                    && !crate::live::results(data).any(|r| self.reg_of(r) == Some(r_raw))
+            });
+            return if ok { raw } else { y };
+        }
+        y
+    }
+
     /// Shifts or rotates `x` by `y`: into `dst` by an immediate when `y` is a constant, else into rax by cl; returns the register that holds the result.
-    fn shift_by(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Reg {
+    fn shift_by(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg, result: Value) -> Reg {
         let (ext, shift) = match op {
             Binary::Ishl => (Ext::Zero, Shift::Shl),
             Binary::Ushr => (Ext::Zero, Shift::Shr),
@@ -388,7 +444,7 @@ impl Emit<'_> {
         let need_ext = op != Binary::Ishl && ty != Type::I32;
         if let Some(imm) = self.const_of(y) {
             let count = (imm & i64::from(ty.bits() - 1)) as u8;
-            if need_ext {
+            if need_ext || (count == 0 && ty == Type::I32 && matches!(op, Binary::Ushr | Binary::Rotl | Binary::Rotr) && !self.plan.zero_ext[x.index()]) {
                 self.get(dst, x, ext);
             } else {
                 self.raw(dst, x);
@@ -398,6 +454,7 @@ impl Emit<'_> {
             }
             return dst;
         }
+        let y = self.unwrap_shift_mask(y, result, ty.bits());
         if need_ext {
             self.get(Reg::Rax, x, ext);
         } else {

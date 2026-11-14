@@ -199,11 +199,15 @@ pub(super) struct Fold {
 
 impl Fold {
     pub(super) fn find(&self, value: Value) -> Value {
-        crate::merge::find(&self.subst, value)
+        if value.index() < self.subst.len() { crate::merge::find(&self.subst, value) } else { value }
     }
 
     pub(super) fn known(&self, value: Value) -> Option<i64> {
-        self.consts[self.find(value).index()]
+        self.consts.get(self.find(value).index()).copied().flatten()
+    }
+
+    fn def_inst(&self, value: Value) -> Option<Inst> {
+        self.defs.get(self.find(value).index()).copied().flatten()
     }
 
     fn both(&self, x: Value, y: Value) -> Option<(i64, i64)> {
@@ -213,8 +217,13 @@ impl Fold {
     fn evaluate(&self, func: &Function, op: &Op, ty: Type) -> Option<i64> {
         evaluate_wrapped(func, op, ty, &|value| self.known(value)).or_else(|| match *op {
             Op::Binary(op, x, y) if ty.is_small_int() => self.absorbed(op, ty, x, y).map(|v| extend(v, ty, true)),
+            Op::Icmp(cc, x, y) => crate::algebra::non_null_cmp(func, &|v| self.def_inst(v), &|v| self.known(v), (cc, x, y)).map(i64::from),
             _ => None,
         })
+    }
+
+    fn non_null(&self, func: &Function, value: Value) -> bool {
+        crate::algebra::is_non_null_addr(func, &|v| self.def_inst(v), &|v| self.known(v), value, 0)
     }
 
     /// The constant `x op y` of type `ty` gives whatever one operand holds: a product, high product or mask with zero, or the difference or xor of a value with itself.
@@ -229,7 +238,7 @@ impl Fold {
 
     /// The operation of the instruction that defines `value`, when one in a block does.
     pub(super) fn def<'a>(&self, func: &'a Function, value: Value) -> Option<&'a Op> {
-        self.defs[self.find(value).index()].map(|inst| &func.insts[inst.index()].op)
+        self.def_inst(value).map(|inst| &func.insts[inst.index()].op)
     }
 
     /// Whether `value` is 0 or 1 in its low byte because a comparison, overflow check, or boolean op defines it.
@@ -342,7 +351,7 @@ impl Fold {
         if op == Binary::Band {
             for (val, other) in [(x, y), (y, x)] {
                 if let Some(mask) = self.known(other) {
-                    let (kz, _) = known_bits(func, &|v| self.defs[self.find(v).index()], &|v| self.known(v), val, 0);
+                    let (kz, _) = known_bits(func, &|v| self.def_inst(v), &|v| self.known(v), val, 0);
                     let active = !kz & ty.unsigned_max();
                     if (active & (extend(mask, ty, false) as u64)) == active {
                         return Some(val);
@@ -392,16 +401,23 @@ impl Fold {
         let mut changed = false;
         for block in 0..func.blocks.len() {
             let mut trapped = false;
-            let Function { blocks, insts, types, .. } = func;
-            blocks[block].insts.retain(|&inst| {
-                let op = &mut insts[inst.index()].op;
-                if trapped { *op = Op::Trap; changed = true; return false; }
-                if let Op::Trapz(x) = *op && let Some(k) = self.known(x) {
-                    *op = Op::Trap; changed = true; trapped = extend(k, types[x.index()], false) == 0; return trapped;
+            let mut keep = std::mem::take(&mut func.blocks[block].insts);
+            keep.retain(|&inst| {
+                if trapped { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
+                match func.insts[inst.index()].op {
+                    Op::Trapz(x) => {
+                        if let Some(k) = self.known(x) {
+                            trapped = extend(k, func.types[x.index()], false) == 0;
+                            func.insts[inst.index()].op = Op::Trap; changed = true; return trapped;
+                        }
+                        if self.non_null(func, x) { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
+                        true
+                    }
+                    Op::Trap => { trapped = true; true }
+                    _ => true,
                 }
-                trapped = *op == Op::Trap;
-                true
             });
+            func.blocks[block].insts = keep;
             let Some(&last) = func.blocks[block].insts.last() else { continue };
             let invert = match func.insts[last.index()].op {
                 Op::Brif(cond, ..) if self.known(cond).is_none() => match self.def(func, cond) {
@@ -420,19 +436,20 @@ impl Fold {
                 std::mem::swap(then_args, else_args);
                 changed = true;
             }
-            changed |= self.decide(&func.types, &mut func.insts[last.index()].op);
+            let non_null_br = matches!(func.insts[last.index()].op, Op::Brif(cond, ..) if self.non_null(func, cond));
+            changed |= self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op);
         }
         changed
     }
 
     /// Turns `op` into a jump when it branches on a constant or sends both edges to the same block with the same arguments.
-    fn decide(&self, types: &[Type], op: &mut Op) -> bool {
+    fn decide(&self, types: &[Type], non_null_br: bool, op: &mut Op) -> bool {
         match op {
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
                 let same = then == otherwise && then_args.len() == else_args.len() && then_args.iter().zip(else_args.iter()).all(|(a, b)| self.find(*a) == self.find(*b));
                 let taken = match self.known(*condition) {
                     Some(known) => known != 0,
-                    None if same => true,
+                    None if same || non_null_br => true,
                     None => return false,
                 };
                 let (target, args) = if taken { (*then, std::mem::take(then_args)) } else { (*otherwise, std::mem::take(else_args)) };
@@ -500,7 +517,7 @@ impl Fold {
 
     /// Whether the parameters of `block` that an earlier round replaced stand for the values `args` gives them.
     fn agrees(&self, func: &Function, block: Block, args: &[Value]) -> bool {
-        func.blocks[block.index()].params.iter().zip(args).all(|(param, arg)| self.subst[param.index()] == *param || self.find(*arg) == self.find(*param))
+        func.blocks[block.index()].params.iter().zip(args).all(|(param, arg)| self.subst.get(param.index()).is_none_or(|&s| s == *param) || self.find(*arg) == self.find(*param))
     }
 
     /// Where an edge into `block` with `args` goes next when `block` holds only a jump, or a branch on a parameter `args` makes a constant or on a comparison of such a parameter with a constant, and reads its parameters nowhere else.

@@ -141,9 +141,6 @@ fn match_test(func: &Function, info: &Info, cond: Value, expected_val: Option<Va
         (Some(imm), None) => (b, swap_cc(cc), imm),
         _ => return None,
     };
-    if func.ty(lhs).is_small_int() && expected_val.is_none_or(|ev| ev == lhs) {
-        return Some(BlockTest { val: lhs, kind: TestKind::Cmp(cc, imm), used: [Some(cond_inst), None] });
-    }
     if !cc.is_signed()
         && !matches!(cc, IntCC::Equal | IntCC::NotEqual)
         && let Some((src, lo, diff_inst)) = match_sub_offset(func, info, lhs, expected_block)
@@ -151,6 +148,9 @@ fn match_test(func: &Function, info: &Info, cond: Value, expected_val: Option<Va
     {
         let bound = extend(imm, func.ty(src), false) as u64;
         return Some(BlockTest { val: src, kind: TestKind::SubCmp { lo, cc, bound }, used: [Some(cond_inst), Some(diff_inst)] });
+    }
+    if func.ty(lhs).is_small_int() && expected_val.is_none_or(|ev| ev == lhs) {
+        return Some(BlockTest { val: lhs, kind: TestKind::Cmp(cc, imm), used: [Some(cond_inst), None] });
     }
     None
 }

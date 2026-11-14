@@ -2,6 +2,7 @@ use crate::fold::extend;
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
 mod icmp;
+pub(crate) use icmp::{is_non_null_addr, non_null_cmp};
 
 struct RewriteCx<'a> {
     func: &'a mut Function,
@@ -587,7 +588,7 @@ pub(crate) fn devirt_vtables(func: &mut Function, defs: &[Option<Inst>]) -> bool
 
 /// Whether `value` is the floating-point constant `2.0`.
 pub(crate) fn is_float_two(func: &Function, defs: &[Option<Inst>], value: Value) -> bool {
-    let Some(inst) = defs[value.index()] else { return false };
+    let Some(inst) = defs.get(value.index()).copied().flatten() else { return false };
     let Op::Const(imm) = func.insts[inst.index()].op else { return false };
     match func.ty(value) {
         Type::F64 => imm as u64 == 0x4000_0000_0000_0000,

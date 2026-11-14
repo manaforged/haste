@@ -223,8 +223,8 @@ impl Emit<'_> {
             Binary::Fmin | Binary::Fmax if lane.is_float() => self.vector_fminmax(op, lane, x, y, result),
             Binary::Fcopysign if lane.is_float() => {
                 let dst = self.xmm_of(result).unwrap_or(X2);
-                self.fget(dst, x);
                 self.fget(X0, y);
+                self.fget(dst, x);
                 let sign = if lane == Lane::F64 { i64::MIN } else { 0x8000_0000_u32 as i64 };
                 self.splat_imm(lane, X1, sign);
                 self.asm.sse(&[0x66], &[0x0F, 0xDB], X0.0, X1);
@@ -386,10 +386,10 @@ impl Emit<'_> {
         if lane == Lane::I64 && !self.features.sse41 {
             self.scalarize_int_binary(op, lane, count, x, y, dst);
         } else {
-            self.emit_icmp_regs(cc, lane, X0, X1, dst);
+            self.emit_icmp_regs(cc, lane, X0, X1, X2);
             self.fget(X0, x);
             self.fget(X1, y);
-            self.blend_regs(dst, X0, X1, dst);
+            self.blend_regs(X2, X0, X1, dst);
         }
         self.fput(result, dst);
         Ok(())
@@ -562,13 +562,17 @@ impl Emit<'_> {
         let dst = self.xmm_of(result).unwrap_or(X2);
         if self.features.sse41 {
             self.fget(X0, cond);
+            let mut src = self.fin(x, X1);
+            if src == dst && x != y {
+                self.asm.movaps(X1, src);
+                src = X1;
+            }
             self.fget(dst, y);
-            let src = self.fin(x, X1);
             self.asm.sse(&[0x66], &[0x0F, 0x38, 0x10], dst.0, src);
         } else {
             self.fget(X1, cond);
-            self.fget(dst, y);
             self.fget(X0, x);
+            self.fget(dst, y);
             self.asm.sse(&[0x66], &[0x0F, 0xDB], X0.0, X1);
             self.asm.sse(&[0x66], &[0x0F, 0xDF], X1.0, dst);
             self.asm.sse(&[0x66], &[0x0F, 0xEB], X1.0, X0);

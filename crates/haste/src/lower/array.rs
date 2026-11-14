@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{IntCC, Type, Value};
+use haste_codegen::{IntCC, RuntimeSymbol, Type, Value};
 
 use crate::body::{BlockKind, Body, Expr, ExprId, List};
 use crate::sema::Context;
@@ -7,7 +7,7 @@ use crate::sema::infer::{Res, SiteKey, Typed};
 use crate::sema::ty::{Kind, Ty};
 
 use super::place::{Base, Place};
-use super::{Lower, repr};
+use super::{Lower, Repr, repr};
 
 /// Whether `expr` (or `callee`) resolves to `MaybeUninit::uninit()`.
 pub(super) fn is_maybe_uninit_fn(cx: &Context<'_>, typed: &Typed, expr: ExprId, callee: ExprId) -> bool {
@@ -54,16 +54,49 @@ impl Lower<'_, '_> {
         let whole = repr(self.cx, ty)?;
         let Kind::Array(element, count) = *self.cx.types.kind(ty) else { bail!("repeat of a type that is not an array") };
         let (stride, part) = (self.cx.layout(element)?.size.bytes() as i32, repr(self.cx, element)?);
+        let n = self.len(count)?;
+        let total_bytes = n * i64::from(stride);
+        if n > 16 && part != Repr::Scalar(Type::I8) && total_bytes >= 32 && self.literal_is_zero(value)? {
+            let Some(slot) = self.slot(whole) else {
+                return Ok(None);
+            };
+            let base = Place::slot(slot, whole);
+            if self.open {
+                let dst = self.address(base);
+                let byte = self.ins().iconst(Type::I64, 0);
+                let len = self.ins().iconst(Type::I64, total_bytes);
+                self.call_libc(RuntimeSymbol::Memset, vec![dst, byte, len], None)?;
+            }
+            return Ok(self.read(base));
+        }
         let value = if self.uninit_call(value) { None } else { self.expr(value)? };
         let Some(slot) = self.slot(whole) else {
             return Ok(None);
         };
-        if let Some(value) = value {
-            for at in 0..self.len(count)? as i32 {
-                self.write(Place::slot(slot, whole).at(at * stride, part), value);
+        let base = Place::slot(slot, whole);
+        if let Some(val) = value
+            && self.open
+        {
+            if n <= 16 {
+                for at in 0..n as i32 {
+                    self.write(base.at(at * stride, part), val);
+                }
+            } else if part == Repr::Scalar(Type::I8) {
+                let dst = self.address(base);
+                let byte = self.ins().uextend(Type::I64, val);
+                let len = self.ins().iconst(Type::I64, total_bytes);
+                self.call_libc(RuntimeSymbol::Memset, vec![dst, byte, len], None)?;
+            } else {
+                let dst = self.address(base);
+                let count_val = self.ins().iconst(Type::I64, n);
+                self.each(count_val, |lower, idx| {
+                    let off = lower.ins().imul_imm(idx, i64::from(stride));
+                    let elem_addr = lower.ins().iadd(dst, off);
+                    lower.write(Place { base: Base::Addr(elem_addr), offset: 0, repr: part }, val);
+                });
             }
         }
-        Ok(self.read(Place::slot(slot, whole)))
+        Ok(self.read(base))
     }
 
     /// Whether `expr` is `MaybeUninit::uninit()`, whose bytes are undefined, so a repeat or binding of it need not store them.

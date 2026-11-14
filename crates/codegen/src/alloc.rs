@@ -145,54 +145,53 @@ fn statics<R: Copy>(func: &Function, locations: &mut [Location<R>]) {
     }
 }
 
-fn sib_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> (Vec<Option<Sib>>, Vec<bool>) {
+fn sib_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses, zero_ext: &[bool], two_address: bool) -> (Vec<Option<Sib>>, Vec<bool>) {
     let count = func.types.len();
     let (mut sib, mut elided) = (vec![None; count], vec![false; count]);
-    let single_i64 = |v: Value, block: usize| {
-        func.ty(v) == Type::I64
-            && matches!(locations[v.index()], Location::Slot)
-            && census.uses[v.index()] == 1
-            && census.def[v.index()].is_some_and(|(b, _)| b == block)
+    let slot_i64 = |v: Value| func.ty(v) == Type::I64 && matches!(locations[v.index()], Location::Slot);
+    let single_i64 = |v: Value, block: usize| slot_i64(v) && census.uses[v.index()] == 1 && census.def[v.index()].is_some_and(|(b, _)| b == block);
+    let unwrap_idx = |v: Value, block: usize| -> Option<(Value, Option<Value>)> {
+        let inner = single_i64(v, block)
+            .then(|| census.def_inst[v.index()])
+            .flatten()
+            .and_then(|def| match func.insts[def.index()].op {
+                Op::Convert(Convert::Uextend, inner) if func.ty(inner) == Type::I32 && zero_ext[inner.index()] && matches!(locations[inner.index()], Location::Slot) => Some(inner),
+                _ => None,
+            });
+        inner.map(|i| (i, Some(v))).or_else(|| slot_i64(v).then_some((v, None)))
     };
     let parse_base = |v: Value| match locations[v.index()] {
         Location::Frame(slot, off) => Some((SibBase::Frame(slot), off)),
         Location::Slot if func.ty(v) == Type::I64 => Some((SibBase::Value(v), 0)),
         _ => None,
     };
-    let parse_scaled = |v: Value, block: usize| -> Option<(Value, u8, Value)> {
-        if !single_i64(v, block) {
-            return None;
-        }
-        let op = &func.insts[census.def_inst[v.index()]?.index()].op;
-        match *op {
-            Op::Binary(Binary::Ishl, idx, sh) if func.ty(idx) == Type::I64 && matches!(locations[idx.index()], Location::Slot) => {
+    let parse_scaled = |v: Value, block: usize| -> Option<(Value, u8, Value, Option<Value>)> {
+        let def = single_i64(v, block).then(|| census.def_inst[v.index()])??;
+        match func.insts[def.index()].op {
+            Op::Binary(Binary::Ishl, idx, sh) => {
                 let Location::Imm(s @ 1..=3) = locations[sh.index()] else { return None };
-                Some((idx, s as u8, v))
+                unwrap_idx(idx, block).map(|(b, e)| (b, s as u8, v, e))
             }
             Op::Binary(Binary::Imul, a, b) => [(a, b), (b, a)].into_iter().find_map(|(idx, sc)| {
-                if func.ty(idx) != Type::I64 || !matches!(locations[idx.index()], Location::Slot) {
-                    return None;
-                }
                 let Location::Imm(m @ (2 | 4 | 8)) = locations[sc.index()] else { return None };
-                Some((idx, m.trailing_zeros() as u8, v))
+                unwrap_idx(idx, block).map(|(b, e)| (b, m.trailing_zeros() as u8, v, e))
             }),
             _ => None,
         }
     };
     for (block, data) in func.blocks.iter().enumerate() {
         for &inst in &data.insts {
-            let (addr, inst_off) = match func.insts[inst.index()].op {
-                Op::Load(addr, off) => (addr, off),
-                Op::Store(val, addr, off) if val != addr => (addr, off),
+            let addr = match func.insts[inst.index()].op {
+                Op::Load(addr, _) => addr,
+                Op::Store(val, addr, _) if val != addr => addr,
                 _ => continue,
             };
-            if !single_i64(addr, block) || census.last_use[addr.index()].is_none_or(|(ub, _)| ub != block) {
+            if sib[addr.index()].is_some() || !slot_i64(addr) || census.uses[addr.index()] == 0 || !census.def[addr.index()].is_some_and(|(b, _)| b == block) {
                 continue;
             }
             let Some(def_inst) = census.def_inst[addr.index()] else { continue };
             let Op::Binary(Binary::Iadd, mut left, mut right) = func.insts[def_inst.index()].op else { continue };
-            let mut outer_disp = 0_i64;
-            let mut peeled_add = None;
+            let (mut outer_disp, mut peeled_add) = (0_i64, None);
             for (inner, imm_v) in [(left, right), (right, left)] {
                 if let Location::Imm(imm) = locations[imm_v.index()]
                     && (-FOLD_LIMIT..=FOLD_LIMIT).contains(&imm)
@@ -200,60 +199,62 @@ fn sib_addrs<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> (V
                     && let Some(inner_inst) = census.def_inst[inner.index()]
                     && let Op::Binary(Binary::Iadd, l2, r2) = func.insts[inner_inst.index()].op
                 {
-                    outer_disp = imm;
-                    peeled_add = Some(inner);
-                    (left, right) = (l2, r2);
+                    (outer_disp, peeled_add, left, right) = (imm, Some(inner), l2, r2);
                     break;
                 }
             }
-            let matched = parse_base(left)
-                .and_then(|(b, bd)| parse_scaled(right, block).map(|(idx, sh, sv)| (b, bd, idx, sh, Some(sv))))
-                .or_else(|| parse_base(right).and_then(|(b, bd)| parse_scaled(left, block).map(|(idx, sh, sv)| (b, bd, idx, sh, Some(sv)))))
-                .or_else(|| parse_base(left).filter(|_| func.ty(right) == Type::I64 && matches!(locations[right.index()], Location::Slot)).map(|(b, bd)| (b, bd, right, 0, None)))
-                .or_else(|| parse_base(right).filter(|_| func.ty(left) == Type::I64 && matches!(locations[left.index()], Location::Slot)).map(|(b, bd)| (b, bd, left, 0, None)));
-            let Some((base, base_disp, index, shift, scaled_val)) = matched else { continue };
+            let matched = [(left, right), (right, left)]
+                .into_iter()
+                .find_map(|(b, i)| parse_base(b).zip(parse_scaled(i, block)).map(|((base, bd), (idx, sh, sv, ev))| (base, bd, idx, sh, Some(sv), ev)))
+                .or_else(|| [(left, right), (right, left)].into_iter().find_map(|(b, i)| parse_base(b).zip(unwrap_idx(i, block)).map(|((base, bd), (idx, ev))| (base, bd, idx, 0, None, ev))));
+            let Some((base, base_disp, index, shift, scaled_val, ext_val)) = matched else { continue };
             let total = outer_disp + i64::from(base_disp);
             if !(-FOLD_LIMIT..=FOLD_LIMIT).contains(&total) {
                 continue;
             }
-            let disp = total as i32;
-            let fits = match base {
-                SibBase::Frame(_) => (-FOLD_LIMIT..=FOLD_LIMIT).contains(&(total + i64::from(inst_off))),
-                SibBase::Value(_) => disp.checked_add(inst_off).and_then(|d| d.checked_add(16)).is_some(),
-            };
-            if !fits {
+            let (disp, multi, mut uses) = (total as i32, census.uses[addr.index()] > 1, 0_u32);
+            let ok = data.insts.iter().all(|&u| {
+                let (off, bytes) = match (&func.insts[u.index()].op, func.insts[u.index()].result) {
+                    (&Op::Load(a, off), Some(r)) if a == addr => (off, func.ty(r).bytes()),
+                    (&Op::Store(val, a, off), _) if a == addr && val != addr => (off, func.ty(val).bytes()),
+                    _ => return true,
+                };
+                uses += 1;
+                let fits = match base {
+                    SibBase::Frame(_) => (-FOLD_LIMIT..=FOLD_LIMIT).contains(&(total + i64::from(off))),
+                    SibBase::Value(_) => disp.checked_add(off).and_then(|d| d.checked_add(16)).is_some(),
+                };
+                fits && (two_address || !multi || (total + i64::from(off) == 0 && bytes <= 8 && (shift == 0 || bytes == (1 << shift)) && !matches!(base, SibBase::Frame(_))))
+            });
+            if !ok || uses != census.uses[addr.index()] {
                 continue;
             }
             sib[addr.index()] = Some(Sib { base, index, shift, disp });
             elided[addr.index()] = true;
-            if let Some(p) = peeled_add {
-                elided[p.index()] = true;
-            }
-            if let Some(s) = scaled_val {
-                elided[s.index()] = true;
-            }
+            [peeled_add, scaled_val, ext_val].into_iter().flatten().for_each(|e| elided[e.index()] = true);
         }
     }
     (sib, elided)
 }
 
-fn fuses(func: &Function, census: &Uses, value: usize, float_branches: &[FloatCC]) -> bool {
+fn fuses(func: &Function, census: &Uses, value: usize, float_branches: &[FloatCC], two_address: bool) -> bool {
     let (Some((block, at)), Some((use_block, last))) = (census.def[value], census.last_use[value]) else { return false };
-    if block != use_block {
+    if block != use_block || census.uses[value] != 1 || at >= last {
         return false;
     }
     let insts = &func.blocks[block].insts;
-    let op = &func.insts[insts[at].index()].op;
-    let next = insts.get(at + 1).map(|inst| &func.insts[inst.index()].op);
-    let flags = match op {
+    let flags = match &func.insts[insts[at].index()].op {
         Op::Icmp(_, a, _) | Op::Fits(_, _, a, _) => !func.ty(*a).is_vector(),
         Op::Fcmp(cc, a, _) => !func.ty(*a).is_vector() && float_branches.contains(cc),
         _ => false,
     };
-    census.uses[value] == 1
-        && last == at + 1
-        && flags
-        && matches!(next, Some(Op::Brif(condition, ..) | Op::Trapz(condition)) if condition.index() == value)
+    let pure = insts[at + 1..last].iter().all(|&mid| {
+        let d = &func.insts[mid.index()];
+        !d.result.is_some_and(|r| func.ty(r).is_vector())
+            && matches!(d.op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer)
+            || (two_address && !d.result.is_some_and(|r| func.ty(r).is_vector()) && matches!(d.op, Op::Symbol(_) | Op::SlotAddr(_)))
+    });
+    flags && pure && matches!(func.insts[insts[last].index()].op, Op::Brif(condition, ..) | Op::Trapz(condition) if condition.index() == value)
 }
 
 fn pairs<R>(func: &Function, locations: &[Location<R>], elided: &[bool]) -> (Vec<Option<Value>>, Vec<bool>) {
@@ -585,39 +586,95 @@ fn promote_loop_consts<R>(func: &Function, census: &Uses, depths: &[u32], elided
     promoted
 }
 
-fn zero_ext<R>(func: &Function, order: &[Block], locations: &[Location<R>], census: &Uses) -> Vec<bool> {
-    let mut out = vec![false; func.types.len()];
-    let fits_mask = |v: Value, mask: i64| matches!(locations[v.index()], Location::Imm(m) if (0..=mask).contains(&m));
-    for block in order {
-        for &inst in &func.blocks[block.index()].insts {
-            let data = &func.insts[inst.index()];
-            let Some(res) = data.result else { continue };
-            let z = match data.op {
+fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> Vec<bool> {
+    let count = func.types.len();
+    let (mut out, mut incoming) = (vec![false; count], vec![Some(Vec::new()); count]);
+    if let Some(entry) = func.entry {
+        func.blocks[entry.index()].params.iter().for_each(|p| incoming[p.index()] = None);
+    }
+    for &inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let op = &func.insts[inst.index()].op;
+        if let Op::TryCall { handler, .. } = *op {
+            func.blocks[handler.index()].params.iter().for_each(|p| incoming[p.index()] = None);
+        }
+        crate::frame::terminator_edges(op, &mut |target: Block, args: &[Value]| {
+            for (p, &a) in func.blocks[target.index()].params.iter().zip(args) {
+                if a != *p && let Some(list) = &mut incoming[p.index()] {
+                    list.push(a);
+                }
+            }
+        });
+    }
+    for (v, ty) in func.types.iter().enumerate() {
+        let single_def = census.def_inst[v].is_some_and(|d| func.insts[d.index()].result == Some(Value(v as u32)));
+        out[v] = ty.is_small_int() && (single_def || incoming[v].as_ref().is_some_and(|l| !l.is_empty()));
+    }
+    let const_val = |v: Value| match locations[v.index()] {
+        Location::Imm(imm) => Some(imm),
+        _ => census.def_inst[v.index()].and_then(|d| match func.insts[d.index()].op { Op::Const(imm) => Some(imm), _ => None }),
+    };
+    let ty_mask = |ty: Type| if ty == Type::I64 { i64::MAX } else { (1_i64 << ty.bits()) - 1 };
+    let fits_mask = |v: Value, mask: i64| const_val(v).is_some_and(|m| (0..=mask).contains(&m));
+    let is_icmp = |v: Value| census.def_inst[v.index()].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Icmp(..)));
+    let is_cmp = |v: Value| is_icmp(v) || census.def_inst[v.index()].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Convert(Convert::Uextend, inner) if is_icmp(inner)));
+    let clean_bits = |out: &[bool], v: Value| -> Option<u32> {
+        let imm_bits = |x: i64| (x >= 0).then(|| 64 - (x as u64).leading_zeros());
+        if let Some(w) = const_val(v).and_then(imm_bits) {
+            return Some(w);
+        }
+        match census.def_inst[v.index()].map(|d| &func.insts[d.index()].op) {
+            Some(&Op::Convert(Convert::Uextend, inner)) => Some(func.types[inner.index()].bits()),
+            Some(&Op::Binary(Binary::Band, a, b)) => const_val(a)
+                .and_then(imm_bits)
+                .or_else(|| const_val(b).and_then(imm_bits))
+                .map(|w| w.min(func.types[v.index()].bits()))
+                .or_else(|| out[v.index()].then(|| func.types[v.index()].bits())),
+            _ => out[v.index()].then(|| func.types[v.index()].bits()),
+        }
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &inst in func.blocks.iter().flat_map(|b| &b.insts) {
+            let Some(res) = func.insts[inst.index()].result else { continue };
+            let ty = func.types[res.index()];
+            if !ty.is_small_int() {
+                continue;
+            }
+            let z = match func.insts[inst.index()].op {
+                Op::Const(imm) => (0..=ty_mask(ty)).contains(&imm),
                 Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(_) | Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(Convert::Uextend, _) | Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => true,
-                Op::Binary(Binary::Band, a, b) => match func.types[res.index()] {
-                    Type::I8 => out[a.index()] || out[b.index()] || fits_mask(a, 0xff) || fits_mask(b, 0xff),
-                    Type::I16 => out[a.index()] || out[b.index()] || fits_mask(a, 0xffff) || fits_mask(b, 0xffff),
-                    _ => false,
-                },
+                Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Unary(Unary::Bitrev, _) => ty == Type::I32,
+                Op::Unary(Unary::Bswap, a) => ty == Type::I32 && out[a.index()],
+                Op::Select(_, a, b) => out[a.index()] && out[b.index()],
+                Op::Binary(Binary::Bor | Binary::Bxor, a, b) => ty == Type::I32 || (out[a.index()] && out[b.index()]),
+                Op::Binary(Binary::Iadd, a, b) => ty == Type::I32 && !is_cmp(a) && !is_cmp(b),
+                Op::Binary(Binary::Isub | Binary::Rotl | Binary::Rotr | Binary::Udiv | Binary::Urem | Binary::Umulhi | Binary::Umin | Binary::Umax | Binary::UaddSat | Binary::UsubSat | Binary::AvgRound, _, _) => ty == Type::I32,
+                Op::Binary(Binary::Ushr, a, _) => ty == Type::I32 || out[a.index()],
+                Op::Binary(Binary::Ishl, a, amt) => const_val(amt).is_some_and(|s| clean_bits(&out, a).is_some_and(|w| w + ((s as u32) & (ty.bits() - 1)) <= ty.bits())),
+                Op::Binary(Binary::Band, a, b) => ty == Type::I32 || (matches!(ty, Type::I8 | Type::I16) && (out[a.index()] || out[b.index()] || fits_mask(a, ty_mask(ty)) || fits_mask(b, ty_mask(ty)))),
                 Op::Convert(Convert::Ireduce, shifted) => {
-                    let src_ty = func.types[shifted.index()];
-                    let dst_bits = func.types[res.index()].bits();
-                    matches!(src_ty, Type::I64 | Type::I32)
-                        && census.def_inst[shifted.index()].is_some_and(|def| match func.insts[def.index()].op {
-                            Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => dst_bits >= 8,
-                            Op::Binary(Binary::Ushr, _, c) => {
-                                matches!(locations[c.index()], Location::Imm(shift) if (0..i64::from(src_ty.bits())).contains(&shift) && src_ty.bits() - (shift as u32) <= dst_bits)
-                            }
-                            Op::Binary(Binary::Band, a, b) if dst_bits <= 32 => {
-                                let mask = (1_i64 << dst_bits) - 1;
-                                fits_mask(a, mask) || fits_mask(b, mask)
-                            }
-                            _ => false,
-                        })
+                    let (src_ty, dst_bits) = (func.types[shifted.index()], ty.bits());
+                    clean_bits(&out, shifted).is_some_and(|w| w <= dst_bits)
+                        || (matches!(src_ty, Type::I64 | Type::I32)
+                            && census.def_inst[shifted.index()].is_some_and(|def| match func.insts[def.index()].op {
+                                Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => dst_bits >= 8,
+                                Op::Binary(Binary::Ushr, _, c) => const_val(c).is_some_and(|s| (0..i64::from(src_ty.bits())).contains(&s) && src_ty.bits() - (s as u32) <= dst_bits),
+                                _ => false,
+                            }))
                 }
                 _ => false,
             };
-            out[res.index()] = z;
+            if out[res.index()] != z {
+                out[res.index()] = z;
+                changed = true;
+            }
+        }
+        for (p, list) in incoming.iter().enumerate() {
+            if out[p] && let Some(list) = list && !list.iter().all(|a| out[a.index()]) {
+                out[p] = false;
+                changed = true;
+            }
         }
     }
     out
@@ -635,7 +692,8 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     consts(func, regs.absolute_calls, &mut locations);
     statics(func, &mut locations);
     let census = census(func);
-    let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census) } else { (vec![None; count], vec![false; count]) };
+    let zero_ext = zero_ext(func, &locations, &census);
+    let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
     let loop_depths = weighed.then(|| func.cfg().loops().depths);
     let promoted_consts = loop_depths.as_deref().map(|depths| promote_loop_consts(func, &census, depths, &elided, regs.two_address, &mut locations)).unwrap_or_default();
@@ -655,7 +713,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let tracked: Vec<bool> = (0..count).map(|value| !elided[value] && (wanted[value] || (weighed && matches!(locations[value], Location::Slot)))).collect();
     let live = live(func, order, copied, &tracked, &sib, &elided);
     let candidates: Vec<bool> = (0..count).map(|value| eligible(&live, &wanted, value)).collect();
-    let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches)).collect();
+    let fused: Vec<bool> = (0..count).map(|value| candidates[value] && fuses(func, &census, value, regs.float_branches, regs.two_address)).collect();
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
     let reuse = if regs.two_address { reusable(func, &live, &elided) } else { vec![None; count] };
@@ -667,14 +725,9 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let (passed_ints, passed_floats) = passed(func, classify);
     let (homes, used) = allocate(func, &live, &int_class(func, regs, order, params, passed_ints), &ints, &hints);
     place(&mut locations, homes, Location::Reg);
-    for (v, imm) in promoted_consts {
+    for (v, loc) in promoted_consts.into_iter().map(|(v, i)| (v, Location::Imm(i))).chain(promoted_syms.into_iter().map(|(v, s)| (v, Location::SlotAddr(s)))) {
         if !matches!(locations[v], Location::Reg(_)) {
-            locations[v] = Location::Imm(imm);
-        }
-    }
-    for (v, sym) in promoted_syms {
-        if !matches!(locations[v], Location::Reg(_)) {
-            locations[v] = Location::SlotAddr(sym);
+            locations[v] = loc;
         }
     }
     let (float_homes, used_floats) = allocate(func, &live, &float_class(regs, params, passed_floats), &floats, &hints);
@@ -692,7 +745,6 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     parked.iter().flat_map(|(_, values)| values).for_each(|(value, _, _)| homed[value.index()] = true);
     let (pairs, deferred) = pairs(func, &locations, &elided);
     let shared = if weighed { crate::color::share(func, &live, &locations, &deferred) } else { Vec::new() };
-    let zero_ext = zero_ext(func, order, &locations, &census);
     Plan { locations, fused, used, used_floats, pairs, deferred, through, shared, parked, homed, sib, elided, zero_ext }
 }
 
@@ -706,17 +758,11 @@ impl<R: Copy> Plan<R> {
     }
 
     pub(crate) fn const_of(&self, value: Value) -> Option<i64> {
-        match self.location(value) {
-            Location::Imm(imm) => Some(imm),
-            _ => None,
-        }
+        if let Location::Imm(imm) = self.location(value) { Some(imm) } else { None }
     }
 
     pub(crate) fn reg_of(&self, value: Value) -> Option<R> {
-        match self.location(value) {
-            Location::Reg(reg) => Some(reg),
-            _ => None,
-        }
+        if let Location::Reg(reg) = self.location(value) { Some(reg) } else { None }
     }
 
     pub(crate) fn parked_at(&self, inst: Inst) -> &[(Value, ParkReg<R>, bool)] {
@@ -724,10 +770,7 @@ impl<R: Copy> Plan<R> {
     }
 
     pub(crate) fn float_of(&self, value: Value) -> Option<u8> {
-        match self.location(value) {
-            Location::Float(reg) => Some(reg),
-            _ => None,
-        }
+        if let Location::Float(reg) = self.location(value) { Some(reg) } else { None }
     }
 }
 

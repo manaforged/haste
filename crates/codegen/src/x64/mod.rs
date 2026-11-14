@@ -14,7 +14,7 @@ use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_try_call, intake_params};
-use crate::frame::{ArgStep, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
+use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Block, Function, Inst, Lane, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
@@ -380,11 +380,17 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
-        for step in edge_steps(args, &self.func.blocks[block.index()].params, |a, b| self.plan.same_home(&self.frame, a, b)) {
+        let int_scratch = [Reg::Rdx, Reg::Rcx];
+        let float_scratch = [Xmm(0), Xmm(1)];
+        for step in edge_steps(self.func, &self.plan.locations, &self.frame.values, args, &self.func.blocks[block.index()].params) {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
-                Step::Save(arg, index) => self.move_to(Mem::new(Reg::Rbp, self.frame.edge_slot(index)), arg),
-                Step::Restore(index, param) => self.load_home(param, Mem::new(Reg::Rbp, self.frame.edge_slot(index))),
+                Step::Save(arg, EdgeScratch::Int(i)) => self.raw(int_scratch[i], arg),
+                Step::Restore(EdgeScratch::Int(i), param) => self.put(param, int_scratch[i]),
+                Step::Save(arg, EdgeScratch::Float(i)) => self.fget(float_scratch[i], arg),
+                Step::Restore(EdgeScratch::Float(i), param) => self.fput(param, float_scratch[i]),
+                Step::Save(arg, EdgeScratch::Stack(i)) => self.move_to(Mem::new(Reg::Rbp, self.frame.edge_slot(i)), arg),
+                Step::Restore(EdgeScratch::Stack(i), param) => self.load_home(param, Mem::new(Reg::Rbp, self.frame.edge_slot(i))),
             }
         }
         Ok(())
@@ -576,7 +582,11 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
     fn pos(&self) -> u32 { self.asm.pos() }
     fn new_label(&mut self) -> Label { self.asm.label() }
-    fn bind_label(&mut self, label: Label) { self.asm.bind(label); }
+    fn bind_label(&mut self, label: Label) {
+        self.last_spill = None;
+        self.last_fspill = None;
+        self.asm.bind(label);
+    }
     fn jump_label(&mut self, label: Label) { self.asm.jmp(label); }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) {
         let cond = match self.flags.take() {
