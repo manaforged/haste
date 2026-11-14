@@ -437,6 +437,19 @@ fn fold_rodata_load(cx: &RewriteCx, ty: Type, addr: Value, off: i32) -> Option<O
     Some(Op::Const(if ty.is_small_int() { extend(u as i64, ty, true) } else { u as i64 }))
 }
 
+fn const_addend(cx: &RewriteCx, x: Value, y: Value) -> Option<(Value, i64)> {
+    [(x, y), (y, x)].into_iter().find_map(|(v, cv)| cx.sconst(cv).map(|c| (v, c)))
+}
+
+fn fold_disp(cx: &RewriteCx, addr: Value, off: i32, bytes: u32) -> Option<(Value, i32)> {
+    let &Op::Binary(Binary::Iadd, x, y) = cx.op(addr)? else { return None };
+    let (base, c) = const_addend(cx, x, y)?;
+    if cx.func.ty(base) != Type::I64 || matches!(cx.op(base), Some(Op::StackAddr(..))) { return None; }
+    let disp = i64::from(off).checked_add(c)?;
+    i32::try_from(disp.checked_add(i64::from(bytes))?).ok()?;
+    i32::try_from(disp).ok().map(|disp| (base, disp))
+}
+
 fn reassociate_add(cx: &mut RewriteCx, fits_used: &[bool], a: Value, b: Value) -> Option<Op> {
     let ty = cx.func.ty(a);
     if !ty.is_small_int() { return None; }
@@ -444,7 +457,7 @@ fn reassociate_add(cx: &mut RewriteCx, fits_used: &[bool], a: Value, b: Value) -
         let Some(c2) = cx.sconst(c2_v).filter(|_| !fits_used.get(lhs.index()).copied().unwrap_or(false)) else { continue };
         let Some(inst) = cx.def(lhs) else { continue };
         match cx.func.insts[inst.index()].op {
-            Op::Binary(Binary::Iadd, x, y) => if let Some((base, c1)) = [(x, y), (y, x)].into_iter().find_map(|(v, cv)| cx.sconst(cv).map(|c| (v, c))) {
+            Op::Binary(Binary::Iadd, x, y) => if let Some((base, c1)) = const_addend(cx, x, y) {
                 let c = cx.emit(ty, Op::Const(extend(c1.wrapping_add(c2), ty, true)));
                 return Some(Op::Binary(Binary::Iadd, base, c));
             },
@@ -463,7 +476,7 @@ fn reassociate_sub(cx: &mut RewriteCx, fits_used: &[bool], a: Value, b: Value) -
     let c2 = cx.sconst(b).filter(|_| ty.is_small_int() && !fits_used.get(a.index()).copied().unwrap_or(false))?;
     match cx.func.insts[cx.def(a)?.index()].op {
         Op::Binary(Binary::Iadd, x, y) => {
-            let (base, c1) = [(x, y), (y, x)].into_iter().find_map(|(v, cv)| cx.sconst(cv).map(|c| (v, c)))?;
+            let (base, c1) = const_addend(cx, x, y)?;
             let c = cx.emit(ty, Op::Const(extend(c1.wrapping_sub(c2), ty, true)));
             Some(Op::Binary(Binary::Iadd, base, c))
         }
@@ -647,7 +660,11 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
         Op::Shuffle(a, b, ShuffleMask::Const(m)) => vec::simplify_shuffle(cx, res, a, b, m),
         Op::Select(cond, t, f) => select::simplify_select(cx, res, cond, t, f),
         Op::Brif(cond, tb, ta, eb, ea) => known_cond(cx, cond).or_else(|| match_swar_msb_broadcast(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
-        Op::Load(addr, off) if !cx.func.rodata_bytes.is_empty() && off >= 0 => res.and_then(|r| fold_rodata_load(cx, cx.func.ty(r), addr, off)),
+        Op::Load(addr, off) => {
+            let ty = cx.func.ty(res?);
+            fold_rodata_load(cx, ty, addr, off).or_else(|| fold_disp(cx, addr, off, ty.bytes()).map(|(base, disp)| Op::Load(base, disp)))
+        }
+        Op::Store(value, addr, off) => fold_disp(cx, addr, off, cx.func.ty(value).bytes()).map(|(base, disp)| Op::Store(value, base, disp)),
         _ => None,
     }
 }
