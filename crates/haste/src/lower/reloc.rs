@@ -18,7 +18,7 @@ use super::Slots;
 pub(super) const CLOSURE_ENV_STEP: u32 = u32::MAX - 1;
 
 #[derive(Clone, Debug)]
-pub(super) enum TyOrigin {
+pub(crate) enum TyOrigin {
     Subst(u16),
     Local(u32),
     Expr(ExprId),
@@ -56,7 +56,7 @@ impl TyOrigin {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum SiteOrigin {
+pub(crate) enum SiteOrigin {
     Table(SiteKey),
     PointerFnDef { expr: ExprId, callee: ExprId },
     DropGlue(TyOrigin),
@@ -71,7 +71,7 @@ pub(super) enum SiteOrigin {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum RelocStep {
+pub(crate) enum RelocStep {
     Const(SymbolSource),
     Promoted { seq: u32, size: u32 },
     VtableAt(ExprId),
@@ -85,15 +85,15 @@ pub(super) enum RelocStep {
 /// Parametric relocation plan recorded on a stencil leader and evaluated in `O(|relocs|)` per follower.
 #[derive(Clone, Debug, Default)]
 pub struct RelocPlan {
-    pub(super) steps: Box<[RelocStep]>,
+    pub(crate) steps: Box<[RelocStep]>,
 }
 
 impl RelocPlan {
-    pub(super) fn from_vec(steps: Vec<RelocStep>) -> Self {
+    pub(crate) fn from_vec(steps: Vec<RelocStep>) -> Self {
         Self { steps: steps.into_boxed_slice() }
     }
 
-    pub(super) fn reloc_len(&self) -> usize {
+    pub(crate) fn reloc_len(&self) -> usize {
         self.steps
             .iter()
             .map(|step| match step {
@@ -206,7 +206,7 @@ fn fmt_ty_brief(cx: &Context<'_>, ty: Ty) -> String {
     }
 }
 
-pub(super) fn reached_index_of(cx: &Context<'_>, reached: &Reached, slots: &dyn Slots, instance: (ItemRef, Substs)) -> Result<usize> {
+pub(crate) fn reached_index_of(cx: &Context<'_>, reached: &Reached, slots: &dyn Slots, instance: (ItemRef, Substs)) -> Result<usize> {
     if let Some(&idx) = reached.index.get(&instance)
         && !reached.is_untyped(idx)
     {

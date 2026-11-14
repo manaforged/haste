@@ -135,6 +135,16 @@ pub struct Image {
     wanted: Mutex<Vec<Instance>>,
     bodies: lower::Bodies,
     backend: ImageBackend,
+    sysroot_index: std::sync::OnceLock<crate::sema::summary::codec::SysrootIndex>,
+    fixed_index: std::sync::OnceLock<crate::sema::summary::codec::SysrootIndex>,
+}
+
+pub(super) struct FrozenStencil {
+    pub is_sysroot: bool,
+    pub key: u64,
+    pub fp: u128,
+    pub code: std::sync::Arc<haste_codegen::Code>,
+    pub plan: Vec<u8>,
 }
 
 /// What one compile pass writes: its code memory, its stencil cache, and sparse `(index, size, ns)` records.
@@ -143,7 +153,7 @@ pub(super) struct Pass {
     memory: Memory,
     stencils: stencil::StencilState,
     records: Vec<(usize, u32, u64)>,
-    frozen_stencils: Vec<(u64, u128, std::sync::Arc<haste_codegen::Code>)>,
+    frozen_stencils: Vec<FrozenStencil>,
 }
 
 impl Pass {
@@ -174,12 +184,47 @@ impl Image {
         !self.pass.frozen_stencils.is_empty()
     }
 
-    /// Appends all newly compiled sysroot `Effort::Full` stencils from this image into `builder`.
-    pub(crate) fn export_sysroot_stencils(&self, builder: &mut crate::substrate::SubstrateBuilder) -> Result<()> {
-        for (item_key, fp, code) in &self.pass.frozen_stencils {
-            builder.add_code_stencil(*item_key, *fp, code)?;
+    /// Appends all newly compiled sysroot `Effort::Full` stencils from this image into `toolchain` and dependency stencils into `deps`.
+    pub(crate) fn export_sysroot_stencils(
+        &self,
+        mut toolchain: Option<&mut crate::substrate::SubstrateBuilder>,
+        mut deps: Option<&mut crate::substrate::SubstrateBuilder>,
+    ) -> Result<()> {
+        for stencil in &self.pass.frozen_stencils {
+            let target = if stencil.is_sysroot { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
+            if let Some(builder) = target {
+                builder.add_code_stencil_with_plan(stencil.key, stencil.fp, &stencil.code, &stencil.plan)?;
+            }
         }
         Ok(())
+    }
+
+    pub(super) fn aot_rodata_entry(&self, id: lower::RodataId) -> Option<(Vec<u8>, Vec<lower::RodataReloc>)> {
+        let aot = self.aot()?;
+        lock(aot).rodata.get(id.0 as usize).cloned()
+    }
+
+    pub(super) fn sysroot_index_for(&self, outline: &crate::outline::Outline, include_deps: bool) -> &crate::sema::summary::codec::SysrootIndex {
+        if include_deps {
+            self.fixed_index.get_or_init(|| crate::sema::summary::codec::SysrootIndex::build(outline, crate::substrate::sysroot_item_key))
+        } else {
+            self.sysroot_index.get_or_init(|| crate::sema::summary::codec::SysrootIndex::build(outline, crate::substrate::sysroot_only_item_key))
+        }
+    }
+
+    pub(super) fn encode_aot_reloc_plan(&self, outline: &crate::outline::Outline, types: &crate::sema::ty::Types, reached: &Reached, is_sysroot: bool, plan: &lower::RelocPlan) -> Option<Vec<u8>> {
+        if !self.backend.is_aot() {
+            return None;
+        }
+        let key_of = if is_sysroot { crate::substrate::sysroot_only_item_key } else { crate::substrate::sysroot_item_key };
+        crate::substrate::relocs::encode_reloc_plan(outline, types, reached, plan, !is_sysroot, key_of, |id| self.aot_rodata_entry(id), |id| self.vtable_entries(id))
+    }
+
+    pub(super) fn decode_aot_reloc_plan(&self, outline: &crate::outline::Outline, types: &crate::sema::ty::Types, reached: &Reached, is_sysroot: bool, bytes: &[u8]) -> Option<lower::RelocPlan> {
+        if !self.backend.is_aot() || bytes.is_empty() {
+            return None;
+        }
+        crate::substrate::relocs::decode_reloc_plan(types, reached, self, |inc| self.sysroot_index_for(outline, inc), is_sysroot, bytes).ok().flatten()
     }
 }
 
@@ -358,6 +403,8 @@ impl Image {
             wanted: Mutex::default(),
             bodies: lower::Bodies::default(),
             backend: ImageBackend::from_mode(mode, reached.list.len()),
+            sysroot_index: std::sync::OnceLock::new(),
+            fixed_index: std::sync::OnceLock::new(),
         })
     }
 

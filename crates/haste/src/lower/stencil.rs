@@ -502,7 +502,46 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
     } else {
         cycle
     };
+    if mode == LowerMode::Stencil {
+        canonicalize_const_symbols(&mut func, &reloc_plan);
+    }
     Ok((func, relocs, Arc::new(RelocPlan::from_vec(reloc_plan)), cycle))
+}
+
+fn collect_const_remaps(steps: &[RelocStep], self_slots: &[u32], offset: &mut usize, canon: &mut FxHashMap<SymbolSource, u32>, pairs: &mut Vec<(u32, u32)>) {
+    for step in steps {
+        match step {
+            RelocStep::Const(src) => {
+                let idx = *offset as u32;
+                *offset += 1;
+                if !self_slots.contains(&idx) {
+                    if let Some(&first) = canon.get(src) {
+                        pairs.push((idx, first));
+                    } else {
+                        canon.insert(src.clone(), idx);
+                    }
+                }
+            }
+            RelocStep::SiteInline { plan, .. } => collect_const_remaps(&plan.steps, self_slots, offset, canon, pairs),
+            RelocStep::TypeName(_) => *offset += 2,
+            RelocStep::Promoted { .. } | RelocStep::VtableAt(_) | RelocStep::VtableSlot { .. } | RelocStep::SiteSlot(_) | RelocStep::TypeId(_) => *offset += 1,
+        }
+    }
+}
+
+fn canonicalize_const_symbols(func: &mut Function, steps: &[RelocStep]) {
+    func.remap_symbols(|self_slots| {
+        let (mut offset, mut canon, mut pairs) = (0usize, FxHashMap::default(), Vec::new());
+        collect_const_remaps(steps, self_slots, &mut offset, &mut canon, &mut pairs);
+        if pairs.is_empty() {
+            return None;
+        }
+        let mut remap: Vec<u32> = (0..offset as u32).collect();
+        for (from, to) in pairs {
+            remap[from as usize] = to;
+        }
+        Some(remap)
+    });
 }
 
 fn splice_devirt_vtable_calls(
@@ -541,6 +580,7 @@ fn splice_devirt_vtable_calls(
         }
     }
     if any {
+        canonicalize_const_symbols(func, reloc_plan);
         haste_codegen::simplify(func, crate::profile().into());
     }
     Ok(cycle_root)

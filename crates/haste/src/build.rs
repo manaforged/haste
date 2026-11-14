@@ -223,9 +223,12 @@ fn export_pre_summaries(cx: &mut sema::Context<'_>, drop_finals: bool, slot: Opt
     Some(builders)
 }
 
+const MAX_TOOLCHAIN_SUBSTRATE_BYTES: usize = 8 * 1024 * 1024 - 1;
+
 fn save_substrate_layer(
     mut builder: crate::substrate::SubstrateBuilder,
     existing: Option<&crate::substrate::Substrate>,
+    max_bytes: Option<usize>,
     save: impl FnOnce(&crate::substrate::Substrate) -> Result<PathBuf>,
 ) -> Result<()> {
     if builder.is_empty() {
@@ -234,7 +237,7 @@ fn save_substrate_layer(
     if let Some(ex) = existing {
         builder.merge_from(ex)?;
     }
-    let sub = builder.build()?;
+    let sub = builder.build_within(max_bytes)?;
     if sub.has_entries() {
         save(&sub)?;
     }
@@ -258,17 +261,14 @@ fn save_batch_substrate(
             cx.store().export_sysroot_summaries(cx.outline, Some(&mut builders.toolchain), builders.deps.as_mut())?;
         }
         if image.has_new_frozen_stencils() {
-            match builders.deps.as_mut() {
-                Some(deps_builder) => image.export_sysroot_stencils(deps_builder)?,
-                None => image.export_sysroot_stencils(&mut builders.toolchain)?,
-            }
+            image.export_sysroot_stencils(Some(&mut builders.toolchain), builders.deps.as_mut())?;
         }
-        save_substrate_layer(builders.toolchain, slot.toolchain.as_deref(), crate::substrate::Substrate::save_toolchain)?;
+        save_substrate_layer(builders.toolchain, slot.toolchain.as_deref(), Some(MAX_TOOLCHAIN_SUBSTRATE_BYTES), crate::substrate::Substrate::save_toolchain)?;
         if let Some(deps_builder) = builders.deps {
-            save_substrate_layer(deps_builder, slot.deps.as_deref(), crate::substrate::Substrate::save_deps)?;
+            save_substrate_layer(deps_builder, slot.deps.as_deref(), None, crate::substrate::Substrate::save_deps)?;
         }
         if let Some(ws_builder) = builders.workspace {
-            save_substrate_layer(ws_builder, slot.workspace.as_deref(), crate::substrate::Substrate::save_workspace)?;
+            save_substrate_layer(ws_builder, slot.workspace.as_deref(), None, crate::substrate::Substrate::save_workspace)?;
         }
         Ok(())
     })();

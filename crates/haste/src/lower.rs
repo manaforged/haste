@@ -20,7 +20,7 @@ mod ops;
 mod place;
 mod plan;
 mod promote;
-mod reloc;
+pub(crate) mod reloc;
 mod simd;
 mod slice_pat;
 mod stencil;

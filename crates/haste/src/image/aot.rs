@@ -9,7 +9,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 
 use crate::aot::{Executable, Symbol};
 use crate::host::HostSymbol;
-use crate::lower::{RodataId, RodataReloc, RodataTarget, SymbolSource, VtableEntry, VtableId, Word};
+use crate::lower::{FootprintId, RelocPlan, RodataId, RodataReloc, RodataTarget, SymbolSource, VtableEntry, VtableId, Word};
 use crate::names::ItemRef;
 use crate::sync::lock;
 
@@ -40,6 +40,20 @@ pub(super) enum AotFn {
     Direct { code: Arc<AotCode>, relocs: Vec<SymbolSource> },
     Dict { body: Arc<AotCode>, relocs: Vec<SymbolSource> },
     Alias(usize),
+}
+
+#[derive(Clone)]
+pub(super) enum CachedAotTemplate {
+    Direct { code: Arc<AotCode>, reloc_plan: Arc<RelocPlan> },
+    Dict { body: Arc<AotCode>, reloc_plan: Arc<RelocPlan> },
+}
+
+impl CachedAotTemplate {
+    pub(super) fn reloc_plan(&self) -> &Arc<RelocPlan> {
+        match self {
+            Self::Direct { reloc_plan, .. } | Self::Dict { reloc_plan, .. } => reloc_plan,
+        }
+    }
 }
 
 pub(super) enum AotStatic {
@@ -185,6 +199,7 @@ pub(crate) struct AotState {
     pub(super) promoted_seen: HashMap<(usize, u32), usize>,
     pub(super) foreign_fns: HashMap<usize, HostSymbol>,
     pub(super) functions: Vec<Option<AotFn>>,
+    pub(super) stencils: HashMap<(ItemRef, FootprintId), CachedAotTemplate>,
     pub(super) frontier: Option<Arc<AotQueue>>,
     frontier_vtables: Vec<bool>,
 }
@@ -201,6 +216,7 @@ impl AotState {
             promoted_seen: HashMap::default(),
             foreign_fns: HashMap::default(),
             functions: vec![None; len],
+            stencils: HashMap::default(),
             frontier: None,
             frontier_vtables: Vec::new(),
         })

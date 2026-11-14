@@ -2,13 +2,14 @@
 
 mod keys;
 pub mod noop;
+pub mod relocs;
 
 pub use keys::{
     CrateHashes, deps_key, deps_path, enabled, sysroot_item_key, sysroot_only_item_key, target_hash, toolchain_key,
     toolchain_path, workspace_key, workspace_path,
 };
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -21,10 +22,10 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use haste_codegen::{Code, RelocKind, Site, StencilReloc};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 13;
+const VERSION: u32 = 14;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
-const STENCIL_REC_LEN: usize = 48;
+const STENCIL_REC_LEN: usize = 56;
 const INSTANCE_REC_LEN: usize = 24;
 const SITE_WIRE_LEN: usize = 12;
 const RELOC_WIRE_LEN: usize = 12;
@@ -35,12 +36,18 @@ pub struct StencilSlice<'a> {
     code: &'a [u8],
     sites: &'a [u8],
     relocs: &'a [u8],
+    plan: &'a [u8],
 }
 
 impl<'a> StencilSlice<'a> {
     /// Encoded machine code bytes.
     pub fn code(&self) -> &'a [u8] {
         self.code
+    }
+
+    /// Serialized portable relocation plan bytes, empty when absent.
+    pub fn plan(&self) -> &'a [u8] {
+        self.plan
     }
 
     /// Decodes the unwind site table into `Site` records.
@@ -302,7 +309,8 @@ impl Substrate {
         let code = self.blob_slice(read_u32(data, rec + 24) as usize, read_u32(data, rec + 28) as usize)?;
         let sites = self.blob_slice(read_u32(data, rec + 32) as usize, read_u32(data, rec + 36) as usize)?;
         let relocs = self.blob_slice(read_u32(data, rec + 40) as usize, read_u32(data, rec + 44) as usize)?;
-        Some(StencilSlice { code, sites, relocs })
+        let plan = self.blob_slice(read_u32(data, rec + 48) as usize, read_u32(data, rec + 52) as usize)?;
+        Some(StencilSlice { code, sites, relocs, plan })
     }
 
     /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its parent.
@@ -383,6 +391,8 @@ struct PendingStencil {
     sites_len: u32,
     relocs_off: u32,
     relocs_len: u32,
+    plan_off: u32,
+    plan_len: u32,
 }
 
 struct PendingInstance {
@@ -455,7 +465,8 @@ impl SubstrateBuilder {
             let code = existing.blob_slice(read_u32(data, rec + 24) as usize, read_u32(data, rec + 28) as usize).context("corrupt existing stencil code")?;
             let sites = existing.blob_slice(read_u32(data, rec + 32) as usize, read_u32(data, rec + 36) as usize).context("corrupt existing stencil sites")?;
             let relocs = existing.blob_slice(read_u32(data, rec + 40) as usize, read_u32(data, rec + 44) as usize).context("corrupt existing stencil relocs")?;
-            self.add_stencil(item_hash, footprint, code, sites, relocs)?;
+            let plan = existing.blob_slice(read_u32(data, rec + 48) as usize, read_u32(data, rec + 52) as usize).context("corrupt existing stencil plan")?;
+            self.add_stencil_with_plan(item_hash, footprint, code, sites, relocs, plan)?;
         }
         for i in 0..existing.header.instance_count {
             let rec = existing.header.instances_off + i * INSTANCE_REC_LEN;
@@ -485,9 +496,15 @@ impl SubstrateBuilder {
 
     /// Appends a pre-compiled `Effort::Full` stencil entry.
     pub fn add_stencil(&mut self, item_hash: u64, footprint: u128, code: &[u8], sites: &[u8], relocs: &[u8]) -> Result<()> {
+        self.add_stencil_with_plan(item_hash, footprint, code, sites, relocs, &[])
+    }
+
+    /// Appends a pre-compiled stencil entry with an optional serialized portable `RelocPlan`.
+    pub fn add_stencil_with_plan(&mut self, item_hash: u64, footprint: u128, code: &[u8], sites: &[u8], relocs: &[u8], plan: &[u8]) -> Result<()> {
         let (code_off, code_len) = self.push_blob(code)?;
         let (sites_off, sites_len) = self.push_blob(sites)?;
         let (relocs_off, relocs_len) = self.push_blob(relocs)?;
+        let (plan_off, plan_len) = self.push_blob(plan)?;
         self.stencils.push(PendingStencil {
             item_hash,
             fp_lo: footprint as u64,
@@ -498,30 +515,37 @@ impl SubstrateBuilder {
             sites_len,
             relocs_off,
             relocs_len,
+            plan_off,
+            plan_len,
         });
         Ok(())
     }
 
     /// Appends a compiled `haste_codegen::Code` stencil by encoding its bytes, sites, and relocations.
     pub fn add_code_stencil(&mut self, item_hash: u64, footprint: u128, code: &Code) -> Result<()> {
+        self.add_code_stencil_with_plan(item_hash, footprint, code, &[])
+    }
+
+    /// Appends a compiled `haste_codegen::Code` stencil together with serialized portable `RelocPlan` bytes.
+    pub fn add_code_stencil_with_plan(&mut self, item_hash: u64, footprint: u128, code: &Code, plan: &[u8]) -> Result<()> {
         let mut sites = Vec::new();
         encode_sites(code.sites(), &mut sites);
         let mut relocs = Vec::new();
         encode_relocs(code.relocs(), &mut relocs);
-        self.add_stencil(item_hash, footprint, code.bytes(), &sites, &relocs)
+        self.add_stencil_with_plan(item_hash, footprint, code.bytes(), &sites, &relocs, plan)
     }
 
     fn push_blob(&mut self, bytes: &[u8]) -> Result<(u32, u32)> {
-        let off = u32::try_from(self.blob.len()).context("substrate blob exceeds 4 GiB")?;
-        let len = u32::try_from(bytes.len()).context("substrate entry exceeds 4 GiB")?;
-        self.blob.extend_from_slice(bytes);
-        let pad = (8 - (self.blob.len() & 7)) & 7;
-        self.blob.resize(self.blob.len() + pad, 0);
-        Ok((off, len))
+        push_aligned_blob(&mut self.blob, bytes)
     }
 
     /// Sorts all index tables, serializes the binary image, and returns a validated `Substrate`.
-    pub fn build(mut self) -> Result<Substrate> {
+    pub fn build(self) -> Result<Substrate> {
+        self.build_within(None)
+    }
+
+    /// Builds the substrate while evicting smaller stencils if needed to keep the total file within `max_bytes`.
+    pub fn build_within(mut self, max_bytes: Option<usize>) -> Result<Substrate> {
         self.summaries.sort_by_key(|entry| entry.item_hash);
         self.summaries.dedup_by_key(|entry| entry.item_hash);
         self.stencils.sort_by_key(|entry| (entry.item_hash, entry.fp_hi, entry.fp_lo));
@@ -540,6 +564,9 @@ impl SubstrateBuilder {
                 && a.substs_hash == b.substs_hash
                 && self.blob[a.off as usize..a.off as usize + a.len as usize] == self.blob[b.off as usize..b.off as usize + b.len as usize]
         });
+        if let Some(limit) = max_bytes {
+            self.trim_stencils_to_limit(limit)?;
+        }
 
         let summaries_off = HEADER_LEN;
         let stencils_off = summaries_off + self.summaries.len() * SUMMARY_REC_LEN;
@@ -573,6 +600,8 @@ impl SubstrateBuilder {
             out.extend_from_slice(&entry.sites_len.to_le_bytes());
             out.extend_from_slice(&entry.relocs_off.to_le_bytes());
             out.extend_from_slice(&entry.relocs_len.to_le_bytes());
+            out.extend_from_slice(&entry.plan_off.to_le_bytes());
+            out.extend_from_slice(&entry.plan_len.to_le_bytes());
         }
         for entry in &self.instances {
             out.extend_from_slice(&entry.item_hash.to_le_bytes());
@@ -583,6 +612,59 @@ impl SubstrateBuilder {
         out.extend_from_slice(&self.blob);
         Substrate::from_bytes(out)
     }
+
+    fn trim_stencils_to_limit(&mut self, limit: usize) -> Result<()> {
+        let base_table = HEADER_LEN + self.summaries.len() * SUMMARY_REC_LEN + self.instances.len() * INSTANCE_REC_LEN;
+        let current = base_table + self.stencils.len() * STENCIL_REC_LEN + self.blob.len();
+        if current <= limit {
+            return Ok(());
+        }
+        let mut used = base_table
+            + self.summaries.iter().map(|s| aligned8(s.len as usize)).sum::<usize>()
+            + self.instances.iter().map(|i| aligned8(i.len as usize)).sum::<usize>();
+        self.stencils.sort_by_key(|s| (Reverse(s.code_len), Reverse(s.plan_len), s.item_hash));
+        let mut kept = Vec::with_capacity(self.stencils.len());
+        for s in self.stencils.drain(..) {
+            let cost = STENCIL_REC_LEN
+                + aligned8(s.code_len as usize)
+                + aligned8(s.sites_len as usize)
+                + aligned8(s.relocs_len as usize)
+                + aligned8(s.plan_len as usize);
+            if used.saturating_add(cost) > limit {
+                continue;
+            }
+            used += cost;
+            kept.push(s);
+        }
+        kept.sort_by_key(|entry| (entry.item_hash, entry.fp_hi, entry.fp_lo));
+        self.stencils = kept;
+        let old = std::mem::take(&mut self.blob);
+        for s in &mut self.summaries {
+            (s.off, s.len) = push_aligned_blob(&mut self.blob, &old[s.off as usize..s.off as usize + s.len as usize])?;
+        }
+        for s in &mut self.stencils {
+            (s.code_off, s.code_len) = push_aligned_blob(&mut self.blob, &old[s.code_off as usize..s.code_off as usize + s.code_len as usize])?;
+            (s.sites_off, s.sites_len) = push_aligned_blob(&mut self.blob, &old[s.sites_off as usize..s.sites_off as usize + s.sites_len as usize])?;
+            (s.relocs_off, s.relocs_len) = push_aligned_blob(&mut self.blob, &old[s.relocs_off as usize..s.relocs_off as usize + s.relocs_len as usize])?;
+            (s.plan_off, s.plan_len) = push_aligned_blob(&mut self.blob, &old[s.plan_off as usize..s.plan_off as usize + s.plan_len as usize])?;
+        }
+        for i in &mut self.instances {
+            (i.off, i.len) = push_aligned_blob(&mut self.blob, &old[i.off as usize..i.off as usize + i.len as usize])?;
+        }
+        Ok(())
+    }
+}
+
+fn aligned8(len: usize) -> usize {
+    (len + 7) & !7
+}
+
+fn push_aligned_blob(blob: &mut Vec<u8>, bytes: &[u8]) -> Result<(u32, u32)> {
+    let off = u32::try_from(blob.len()).context("substrate blob exceeds 4 GiB")?;
+    let len = u32::try_from(bytes.len()).context("substrate entry exceeds 4 GiB")?;
+    blob.extend_from_slice(bytes);
+    blob.resize(aligned8(blob.len()), 0);
+    Ok((off, len))
 }
 
 fn parse_and_validate(data: &[u8]) -> Result<Header> {
@@ -688,12 +770,6 @@ fn prune_dir_by_hash(dir: &Path, active_toolchain_hash: u64) {
 
 fn prune_superseded(toolchain_hash: u64) {
     if let Some(dir) = toolchain_path(toolchain_hash).parent() {
-        prune_dir_by_hash(dir, toolchain_hash);
-    }
-    if let Some(dir) = deps_path(0).parent() {
-        prune_dir_by_hash(dir, toolchain_hash);
-    }
-    if let Some(dir) = workspace_path(0).parent() {
         prune_dir_by_hash(dir, toolchain_hash);
     }
 }
