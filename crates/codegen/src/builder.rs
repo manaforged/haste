@@ -220,6 +220,12 @@ impl Function {
         let jump = self.add(Op::Jump(entry, args), None);
         self.blocks[block.index()].insts.push(jump);
     }
+    /// Rewrites non-self symbol operands and rodata metadata using `build(self_slots)`.
+    pub fn remap_symbols(&mut self, build: impl FnOnce(&[u32]) -> Option<Vec<u32>>) {
+        let Some(remap) = build(&self.self_slots) else { return };
+        for d in &mut self.insts { if let Op::Symbol(s) | Op::SlotAddr(s) = &mut d.op { *s = remap.get(*s as usize).copied().unwrap_or(*s); } }
+        for (s, _) in &mut self.rodata_bytes { *s = remap.get(*s as usize).copied().unwrap_or(*s); }
+    }
 }
 
 /// The sizes of a function's parts at one point of building.

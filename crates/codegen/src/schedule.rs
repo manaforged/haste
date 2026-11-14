@@ -22,7 +22,7 @@ pub(crate) enum Pass {
 }
 
 impl Pass {
-    const ALL: &[Self] = &[
+    pub(crate) const ALL: &[Self] = &[
         Self::Fill,
         Self::Fold,
         Self::Merge,
@@ -39,6 +39,28 @@ impl Pass {
         Self::TailRec,
         Self::Lsr,
     ];
+
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Fill => "fill",
+            Self::Fold => "fold",
+            Self::Merge => "merge",
+            Self::Promote => "promote",
+            Self::Cse => "cse",
+            Self::Loads => "loads",
+            Self::Thread => "thread",
+            Self::IfConv => "ifconv",
+            Self::Rotate => "rotate",
+            Self::Unroll => "unroll",
+            Self::Licm => "licm",
+            Self::Switch => "switch",
+            Self::Returns => "returns",
+            Self::TailRec => "tailrec",
+            Self::Lsr => "lsr",
+        }
+    }
 }
 
 struct Rule {
@@ -80,6 +102,8 @@ static FULL_RULES: &[Rule] = &[
 static FULL_FINISH: &[Pass] = &[Pass::Switch, Pass::Returns, Pass::TailRec];
 
 fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort) -> Domain {
+    let tracing = crate::trace::enabled();
+    let (before_blocks, before_insts) = if tracing { (func.blocks.len(), func.size()) } else { (0, 0) };
     let changed = match pass {
         Pass::Fill => fill::run(func),
         Pass::Fold => fold::run(func, effort),
@@ -105,6 +129,9 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
     };
     if changed.contains(Domain::CFG) {
         func.bump_cfg();
+    }
+    if tracing {
+        crate::trace::after_pass(pass, before_blocks, before_insts, changed, func);
     }
     changed
 }

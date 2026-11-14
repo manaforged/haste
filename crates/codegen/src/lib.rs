@@ -35,6 +35,7 @@ mod switch;
 mod tailrec;
 mod target;
 mod thread;
+pub mod trace;
 mod unroll;
 mod verify;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
@@ -68,6 +69,7 @@ pub use error::{Error, ErrorKind};
 pub use memory::{Arena, Memory};
 pub use reloc::{DictTierUp, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc};
 pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
+pub use trace::{missed_report, with_label as with_trace_label};
 
 /// A call site that has an exception handler, as offsets into its function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,7 +147,14 @@ pub fn simplify(func: &mut Function, effort: Effort) {
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
     verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, message))?;
+    let tracing = trace::enabled();
+    if tracing {
+        trace::on_compile_start(&func);
+    }
     schedule::run(&mut func, promote::Moves::Split, target.effort);
+    if tracing {
+        trace::on_compile_end(&func);
+    }
     if !matches!(target.arch, Arch::X64 | Arch::Arm64) {
         copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
     }
