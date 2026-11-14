@@ -462,7 +462,26 @@ fn simplify_div_rem(cx: &mut RewriteCx, block_udivs: &mut Vec<(Value, Value, Val
     Some(Op::Binary(Binary::Isub, x, prod))
 }
 
-fn simplify_rotate(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
+fn unmask_shift(cx: &RewriteCx, ty: Type, v: Value, bits: u32) -> Value {
+    let Some(inst) = cx.def(v) else { return v };
+    let Op::Binary(Binary::Band, x, y) = cx.func.insts[inst.index()].op else { return v };
+    let m = u64::from(bits - 1);
+    if cx.uconst(y, ty).is_some_and(|c| (c & m) == m) { x } else if cx.uconst(x, ty).is_some_and(|c| (c & m) == m) { y } else { v }
+}
+
+fn unwrap_shift_arg(cx: &RewriteCx, ty: Type, v: Value, bits: u32) -> (Value, bool) {
+    let v = unmask_shift(cx, ty, v, bits);
+    if let Some(inst) = cx.def(v) {
+        match cx.func.insts[inst.index()].op {
+            Op::Unary(Unary::Ineg, inner) => return (unmask_shift(cx, ty, inner, bits), true),
+            Op::Binary(Binary::Isub, c, inner) if cx.uconst(c, ty).is_some_and(|k| (k & u64::from(bits - 1)) == 0) => return (unmask_shift(cx, ty, inner, bits), true),
+            _ => {}
+        }
+    }
+    (v, false)
+}
+
+fn simplify_rotate(cx: &mut RewriteCx, bin: Binary, a: Value, b: Value) -> Option<Op> {
     let ty = cx.func.ty(a);
     if !matches!(ty, Type::I32 | Type::I64) { return None; }
     let bits = ty.bits();
@@ -470,11 +489,18 @@ fn simplify_rotate(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
     for (l, r) in [(ia, ib), (ib, ia)] {
         if let (Op::Binary(Binary::Ishl, x1, sh1), Op::Binary(Binary::Ushr, x2, sh2)) = (&cx.func.insts[l.index()].op, &cx.func.insts[r.index()].op) {
             let (x1, sh1, x2, sh2) = (*x1, *sh1, *x2, *sh2);
-            if x1 == x2 && let (Some(c1), Some(c2)) = (cx.sconst(sh1), cx.sconst(sh2))
+            if x1 != x2 { continue; }
+            if let (Some(c1), Some(c2)) = (cx.sconst(sh1), cx.sconst(sh2))
                 && let (k1, k2) = ((c1 as u32) & (bits - 1), (c2 as u32) & (bits - 1)) && k1 > 0 && k2 > 0 && k1 + k2 == bits
             {
                 let sh_val = if c2 as u32 == k2 { sh2 } else { cx.emit(ty, Op::Const(i64::from(k2))) };
                 return Some(Op::Binary(Binary::Rotr, x1, sh_val));
+            }
+            if bin == Binary::Bor {
+                let ((b1, n1), (b2, n2)) = (unwrap_shift_arg(cx, ty, sh1, bits), unwrap_shift_arg(cx, ty, sh2, bits));
+                if b1 == b2 && n1 != n2 {
+                    return Some(Op::Binary(if n1 { Binary::Rotr } else { Binary::Rotl }, x1, if n1 { sh2 } else { sh1 }));
+                }
             }
         }
     }
@@ -487,11 +513,11 @@ fn simplify_binary(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec
             let ty = cx.func.ty(base);
             let k = cx.emit(ty, Op::Const(shift));
             Op::Binary(Binary::Isub, base, cx.emit(ty, Op::Binary(Binary::Ishl, idx, k)))
-        }).or_else(|| reassociate_add(cx, fits_used, a, b)).or_else(|| simplify_rotate(cx, a, b)),
+        }).or_else(|| reassociate_add(cx, fits_used, a, b)).or_else(|| simplify_rotate(cx, bin, a, b)),
         Binary::Isub => reassociate_sub(cx, fits_used, a, b),
         Binary::Band => simplify_band(cx, res, a, b),
-        Binary::Bor => simplify_rotate(cx, a, b),
-        Binary::Bxor => simplify_bxor(cx, a, b).or_else(|| simplify_rotate(cx, a, b)),
+        Binary::Bor => simplify_rotate(cx, bin, a, b),
+        Binary::Bxor => simplify_bxor(cx, a, b).or_else(|| simplify_rotate(cx, bin, a, b)),
         Binary::Ushr | Binary::Ishl => simplify_shift(cx, res, bin, a, b),
         Binary::Udiv | Binary::Urem => simplify_div_rem(cx, block_udivs, res, (bin, a, b)),
         _ => None,
@@ -554,9 +580,7 @@ pub(crate) fn rewrite(func: &mut Function, initial_defs: &[Option<Inst>]) {
 
 /// Devirtualizes loads of static vtable slots into direct slot/symbol loads.
 pub(crate) fn devirt_vtables(func: &mut Function, defs: &[Option<Inst>]) -> bool {
-    if func.vtable_slots.is_empty() {
-        return false;
-    }
+    if func.vtable_slots.is_empty() { return false; }
     let mut changed = false;
     for b in 0..func.blocks.len() {
         let mut i = 0;
@@ -569,8 +593,7 @@ pub(crate) fn devirt_vtables(func: &mut Function, defs: &[Option<Inst>]) -> bool
                 && let Some(&(_, _, slot_sym, low)) = func.vtable_slots.iter().find(|&&(v, o, _, _)| v == vt_sym && o == off)
             {
                 let slot_val = func.value(Type::I64);
-                let slot_op = if low { Op::SlotAddr(slot_sym) } else { Op::Symbol(slot_sym) };
-                let slot_inst = func.add(slot_op, Some(slot_val));
+                let slot_inst = func.add(if low { Op::SlotAddr(slot_sym) } else { Op::Symbol(slot_sym) }, Some(slot_val));
                 func.blocks[b].insts.insert(i, slot_inst);
                 func.insts[inst.index()].op = Op::Load(slot_val, 0);
                 changed = true;
@@ -587,11 +610,7 @@ pub(crate) fn devirt_vtables(func: &mut Function, defs: &[Option<Inst>]) -> bool
 pub(crate) fn is_float_two(func: &Function, defs: &[Option<Inst>], value: Value) -> bool {
     let Some(inst) = defs.get(value.index()).copied().flatten() else { return false };
     let Op::Const(imm) = func.insts[inst.index()].op else { return false };
-    match func.ty(value) {
-        Type::F64 => imm as u64 == 0x4000_0000_0000_0000,
-        Type::F32 => imm as u32 == 0x4000_0000,
-        _ => false,
-    }
+    match func.ty(value) { Type::F64 => imm as u64 == 0x4000_0000_0000_0000, Type::F32 => imm as u32 == 0x4000_0000, _ => false }
 }
 
 struct BoolFacts {
@@ -764,18 +783,13 @@ fn sink_brif_cmp(func: &mut Function) {
     }
     for block in &mut func.blocks {
         let len = block.insts.len();
-        if len < 2 {
-            continue;
-        }
+        if len < 2 { continue; }
         let Op::Brif(cond, ..) = func.insts[block.insts[len - 1].index()].op else { continue };
-        if uses[cond.index()] != 1 {
-            continue;
-        }
+        if uses[cond.index()] != 1 { continue; }
         if let Some(cpos) = block.insts[..len - 1].iter().rposition(|&inst| {
-            let data = &func.insts[inst.index()];
-            data.result == Some(cond) && matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))
-        }) && cpos + 1 < len - 1
-        {
+            let d = &func.insts[inst.index()];
+            d.result == Some(cond) && matches!(d.op, Op::Icmp(..) | Op::Fcmp(..))
+        }) && cpos + 1 < len - 1 {
             let cinst = block.insts.remove(cpos);
             block.insts.insert(len - 2, cinst);
         }

@@ -188,14 +188,16 @@ impl Emit<'_> {
 
     fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<(), String> {
         let size = if ty == Type::I64 { Size::X } else { Size::W };
-        if matches!(op, Binary::Band | Binary::Ushr | Binary::Sshr)
-            && let Some((signed, src, lsb, width)) = super::fuse::bfx_parts(self.func, &self.plan, ty, op, x, y, |v| self.defs[v.index()])
+        if matches!(op, Binary::Band | Binary::Ishl | Binary::Ushr | Binary::Sshr)
+            && let Some((insert, signed, src, lsb, width)) = super::fuse::bfx_parts(self.func, &self.plan, ty, op, x, y, |v| self.defs[v.index()])
         {
             let reg = self.bits(self.peel_uextend(src), A);
-            if lsb == 0 && u32::from(width) == ty.bits() {
+            if !insert && lsb == 0 && u32::from(width) == ty.bits() {
                 if size == Size::W { self.asm.extend(false, 4, dst, reg); } else { self.asm.mov(dst, reg); }
             } else {
-                self.asm.bfx(signed, size, dst, reg, lsb, width);
+                let (immr, imms) = if insert { (ty.bits() as u8 - lsb, width - 1) } else { (lsb, lsb + width - 1) };
+                let base = match (signed, size == Size::X) { (false, false) => 0x5300_0000, (true, false) => 0x1300_0000, (false, true) => 0xD340_0000, (true, true) => 0x9340_0000 };
+                self.asm.word(base | u32::from(immr) << 16 | u32::from(imms) << 10 | u32::from(reg.0) << 5 | u32::from(dst.0));
             }
             return Ok(());
         }
@@ -205,7 +207,7 @@ impl Emit<'_> {
                 && self.plan.elided[y.index()]
                 && let Some((hi, lo, kr)) = super::fuse::extr_parts(self.func, &self.plan, ty, x, y, |v| self.defs[v.index()])
             {
-                let left = self.bits(hi, A);
+                let left = self.bits(self.peel_uextend(hi), A);
                 let right = self.bits(lo, C);
                 self.asm.extr(size, dst, left, right, kr);
                 return Ok(());

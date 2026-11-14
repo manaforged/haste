@@ -142,7 +142,7 @@ fn try_fuse_extr(
         return false;
     }
     let def = |v: Value| if v == x { Some(xinst) } else if v == y { Some(yinst) } else { None };
-    let Some((hi, lo, _)) = extr_parts(func, plan, func.ty(res), x, y, def) else {
+    let Some((hi, lo, kr)) = extr_parts(func, plan, func.ty(res), x, y, def) else {
         return false;
     };
     let (lpos, rpos) = if matches!(shift_parts(&func.insts[xinst.index()].op, plan), Some((Binary::Ishl, ..))) {
@@ -150,7 +150,17 @@ fn try_fuse_extr(
     } else {
         (ypos, xpos)
     };
-    if !preserved(func, plan, b_idx, lpos, pos, Some(rpos), hi) || !preserved(func, plan, b_idx, rpos, pos, Some(lpos), lo) {
+    let hi_ok = if plan.elided[hi.index()]
+        && let Some((hb, hpos, hinst)) = pos_of[hi.index()]
+        && hb == b_idx && uses[hi.index()] == 1
+        && let Op::Convert(Convert::Uextend, inner) = func.insts[hinst.index()].op
+        && u32::from(kr) <= func.ty(inner).bits()
+    {
+        preserved(func, plan, b_idx, hpos, pos, Some(rpos), inner)
+    } else {
+        preserved(func, plan, b_idx, lpos, pos, Some(rpos), hi)
+    };
+    if !hi_ok || !preserved(func, plan, b_idx, rpos, pos, Some(lpos), lo) {
         return false;
     }
     plan.elided[x.index()] = true;
@@ -254,7 +264,7 @@ fn can_peel_uextend(
     (b_idx, limit, end, skip, res): (usize, usize, usize, Option<usize>, Value),
     (val, ok): (Value, &dyn Fn(Value) -> bool),
 ) -> bool {
-    if uses[val.index()] != 1 || plan.elided[val.index()] {
+    if uses[val.index()] != 1 || (plan.elided[val.index()] && skip.is_none()) {
         return false;
     }
     let Some((ub, upos, uinst)) = pos_of[val.index()] else { return false };
@@ -295,48 +305,68 @@ fn bfx_match(
     (x, y): (Value, Value),
     def: impl Fn(Value) -> Option<Inst>,
     mid_ok: impl Fn(Value) -> bool,
-) -> Option<(bool, Value, Value, u8, u8)> {
-    if !matches!(ty, Type::I32 | Type::I64) {
-        return None;
-    }
+) -> Option<(bool, bool, Value, Value, u8, u8)> {
+    if !matches!(ty, Type::I32 | Type::I64) { return None; }
     let bits = ty.bits();
     let ty_mask = if bits == 64 { u64::MAX } else { (1_u64 << bits) - 1 };
     let low_mask_width = |m: u64| (m != 0 && m != ty_mask && (m & (m + 1)) == 0).then(|| m.trailing_ones());
     match op {
         Binary::Band => {
-            for (shr, m_val) in [(x, y), (y, x)] {
-                if mid_ok(shr)
-                    && let Some(imm) = const_of(func, plan, m_val, &def)
-                    && let Some(width) = low_mask_width((imm as u64) & ty_mask)
-                    && let Some(sinst) = def(shr)
-                    && let Op::Binary(Binary::Ushr, src, amt_val) = func.insts[sinst.index()].op
-                    && let Some(amt) = const_of(func, plan, amt_val, &def)
-                {
-                    let lsb = (amt as u32) & (bits - 1);
-                    return Some((false, shr, src, lsb as u8, width.min(bits - lsb) as u8));
+            for (mid, m_val) in [(x, y), (y, x)] {
+                if !mid_ok(mid) { continue; }
+                let Some(m) = const_of(func, plan, m_val, &def).map(|imm| (imm as u64) & ty_mask) else { continue };
+                match func.insts[def(mid)?.index()].op {
+                    Op::Binary(sop @ (Binary::Ushr | Binary::Sshr), src, amt_val) => {
+                        if let Some(w) = low_mask_width(m) && let Some(amt) = const_of(func, plan, amt_val, &def) {
+                            let lsb = (amt as u32) & (bits - 1);
+                            if sop == Binary::Ushr || w <= bits - lsb {
+                                return Some((false, false, mid, src, lsb as u8, w.min(bits - lsb) as u8));
+                            }
+                        }
+                    }
+                    Op::Binary(Binary::Ishl, src, amt_val) => {
+                        if let Some(amt) = const_of(func, plan, amt_val, &def) {
+                            let lsb = (amt as u32) & (bits - 1);
+                            let eff = (m | ((1_u64 << lsb) - 1)) & ty_mask;
+                            let top = if eff == ty_mask { Some(bits) } else { low_mask_width(eff) };
+                            if lsb > 0 && let Some(top) = top && top > lsb {
+                                return Some((true, false, mid, src, lsb as u8, (top - lsb) as u8));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             None
         }
         Binary::Ushr | Binary::Sshr => {
-            if !mid_ok(x) {
-                return None;
-            }
+            if !mid_ok(x) { return None; }
             let shr_amt = (const_of(func, plan, y, &def)? as u32) & (bits - 1);
             match func.insts[def(x)?.index()].op {
-                Op::Binary(Binary::Band, a, b) if op == Binary::Ushr => {
-                    for (src, m_val) in [(a, b), (b, a)] {
-                        if let Some(imm) = const_of(func, plan, m_val, &def)
-                            && let Some(width) = low_mask_width(((imm as u64) & ty_mask) >> shr_amt)
-                        {
-                            return Some((false, x, src, shr_amt as u8, width as u8));
-                        }
-                    }
-                    None
-                }
+                Op::Binary(Binary::Band, a, b) if op == Binary::Ushr => [(a, b), (b, a)].into_iter().find_map(|(src, m_val)| {
+                    let imm = const_of(func, plan, m_val, &def)?;
+                    let width = low_mask_width(((imm as u64) & ty_mask) >> shr_amt)?;
+                    Some((false, false, x, src, shr_amt as u8, width as u8))
+                }),
                 Op::Binary(Binary::Ishl, src, l_amt_val) => {
                     let top = (const_of(func, plan, l_amt_val, &def)? as u32) & (bits - 1);
-                    (shr_amt >= top).then(|| (op == Binary::Sshr, x, src, (shr_amt - top) as u8, (bits - shr_amt) as u8))
+                    (shr_amt >= top).then(|| (false, op == Binary::Sshr, x, src, (shr_amt - top) as u8, (bits - shr_amt) as u8))
+                }
+                _ => None,
+            }
+        }
+        Binary::Ishl => {
+            if !mid_ok(x) { return None; }
+            let shl_amt = (const_of(func, plan, y, &def)? as u32) & (bits - 1);
+            if shl_amt == 0 { return None; }
+            match func.insts[def(x)?.index()].op {
+                Op::Binary(Binary::Band, a, b) => [(a, b), (b, a)].into_iter().find_map(|(src, m_val)| {
+                    let imm = const_of(func, plan, m_val, &def)?;
+                    let w = low_mask_width((imm as u64) & ty_mask)?;
+                    Some((true, false, x, src, shl_amt as u8, w.min(bits - shl_amt) as u8))
+                }),
+                Op::Convert(conv @ (Convert::Uextend | Convert::Sextend), inner) if func.ty(inner).is_small_int() && func.ty(inner).bits() < bits => {
+                    Some((true, conv == Convert::Sextend, x, inner, shl_amt as u8, func.ty(inner).bits().min(bits - shl_amt) as u8))
                 }
                 _ => None,
             }
@@ -345,45 +375,27 @@ fn bfx_match(
     }
 }
 
-pub(super) fn bfx_parts(
-    func: &Function,
-    plan: &Plan<Reg>,
-    ty: Type,
-    op: Binary,
-    x: Value,
-    y: Value,
-    def: impl Fn(Value) -> Option<Inst>,
-) -> Option<(bool, Value, u8, u8)> {
-    let (signed, _, src, lsb, width) = bfx_match(func, plan, ty, op, (x, y), def, |v| plan.elided[v.index()])?;
-    Some((signed, src, lsb, width))
+pub(super) fn bfx_parts(func: &Function, plan: &Plan<Reg>, ty: Type, op: Binary, x: Value, y: Value, def: impl Fn(Value) -> Option<Inst>) -> Option<(bool, bool, Value, u8, u8)> {
+    let (insert, signed, _, src, lsb, width) = bfx_match(func, plan, ty, op, (x, y), def, |v| plan.elided[v.index()])?;
+    Some((insert, signed, src, lsb, width))
 }
 
-fn try_fuse_bfx(
-    func: &Function,
-    plan: &mut Plan<Reg>,
-    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
-    (b_idx, pos, res): (usize, usize, Value),
-    (op, x, y): (Binary, Value, Value),
-) -> bool {
+fn try_fuse_bfx(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, res): (usize, usize, Value), (op, x, y): (Binary, Value, Value)) -> bool {
     let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
-    let mid_ok = |v: Value| {
-        uses[v.index()] == 1
-            && !plan.elided[v.index()]
-            && pos_of[v.index()].is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos)
-    };
-    let Some((_, mid, src, lsb, width)) = bfx_match(func, plan, func.ty(res), op, (x, y), def, mid_ok) else {
+    let mid_ok = |v: Value| uses[v.index()] == 1 && !plan.elided[v.index()] && pos_of[v.index()].is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos);
+    let Some((insert, _, mid, src, lsb, width)) = bfx_match(func, plan, func.ty(res), op, (x, y), def, mid_ok) else {
         return false;
     };
-    let Some((_, spos, _)) = pos_of[mid.index()] else { return false };
-    let ext_ok = |inner: Value| u32::from(lsb) + u32::from(width) <= func.ty(inner).bits() || zero_ext_loc(plan, inner);
-    let peeled = can_peel_uextend(func, plan, (uses, pos_of), (b_idx, spos, pos, Some(spos), res), (src, &ext_ok));
+    let Some((_, spos, min_inst)) = pos_of[mid.index()] else { return false };
+    let is_conv = matches!(func.insts[min_inst.index()].op, Op::Convert(..));
+    let need = if insert { u32::from(width) } else { u32::from(lsb) + u32::from(width) };
+    let ext_ok = |inner: Value| need <= func.ty(inner).bits() || zero_ext_loc(plan, inner);
+    let peeled = !is_conv && can_peel_uextend(func, plan, (uses, pos_of), (b_idx, spos, pos, Some(spos), res), (src, &ext_ok));
     if !peeled && !preserved(func, plan, b_idx, spos, pos, None, src) {
         return false;
     }
     plan.elided[mid.index()] = true;
-    if peeled {
-        plan.elided[src.index()] = true;
-    }
+    if peeled { plan.elided[src.index()] = true; }
     true
 }
 
@@ -610,7 +622,7 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
                 try_fuse_flag_operand(func, plan, (&uses, &pos_of), (b_idx, pos), inner);
                 continue;
             }
-            if let Op::Binary(op @ (Binary::Ushr | Binary::Sshr), x, y) = data.op
+            if let Op::Binary(op @ (Binary::Ishl | Binary::Ushr | Binary::Sshr), x, y) = data.op
                 && matches!(func.ty(res), Type::I32 | Type::I64)
             {
                 try_fuse_bfx(func, plan, (&uses, &pos_of), (b_idx, pos, res), (op, x, y));

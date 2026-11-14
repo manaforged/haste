@@ -7,6 +7,7 @@ mod pack;
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 use dom::{BlockWrites, record_base};
 
+use crate::cfg::Cfg;
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, compute_affine, may_alias};
 use crate::merge::{find, identity, rename};
@@ -239,33 +240,174 @@ fn forward_concat(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Opt
     true
 }
 
-fn const_eq_for_ty(consts: &[Option<i64>], ty: Type, a: Value, b: Value) -> bool {
-    let (Some(ca), Some(cb)) = (
-        consts.get(a.index()).copied().flatten(),
-        consts.get(b.index()).copied().flatten(),
-    ) else {
-        return false;
-    };
-    if ty.is_small_int() {
-        let mask = ty.unsigned_max();
-        (ca as u64 & mask) == (cb as u64 & mask)
-    } else if ty == Type::F32 {
-        (ca as u32) == (cb as u32)
-    } else if ty == Type::F64 {
-        ca == cb
-    } else {
-        false
+const MAX_JOIN_PHIS_PER_BLOCK: usize = 4;
+
+enum BlockClobber {
+    Loc(MemLoc),
+    CopyLoc(MemLoc),
+    Op(Inst),
+}
+
+struct JoinCtx<'a> {
+    cfg: &'a Cfg,
+    known_out: &'a [KnownLoads],
+    def_blocks: &'a mut Vec<Option<Block>>,
+    preds: Option<Vec<Block>>,
+    added_phis: usize,
+}
+
+fn const_bits_eq(ty: Type, ca: i64, cb: i64) -> bool {
+    match ty {
+        t if t.is_small_int() => (ca as u64 & t.unsigned_max()) == (cb as u64 & t.unsigned_max()),
+        Type::F32 => (ca as u32) == (cb as u32),
+        Type::F64 => ca == cb,
+        _ => false,
     }
 }
 
+fn const_eq_for_ty(consts: &[Option<i64>], ty: Type, a: Value, b: Value) -> bool {
+    consts.get(a.index()).copied().flatten().zip(consts.get(b.index()).copied().flatten()).is_some_and(|(ca, cb)| const_bits_eq(ty, ca, cb))
+}
+
+fn is_silent_store(known: &KnownLoads, loc: MemLoc, ty: Type, value: Value, consts: &[Option<i64>]) -> bool {
+    if let Some(prev) = known.get(loc.base, loc.offset, ty)
+        && (prev == value || const_eq_for_ty(consts, ty, prev, value))
+    {
+        return true;
+    }
+    let Some(imm) = consts.get(value.index()).copied().flatten() else { return false };
+    match assemble_const(known, loc, ty, consts) {
+        Some(Assembled::Int(kimm) | Assembled::FloatBits(kimm)) => const_bits_eq(ty, kimm, imm),
+        Some(Assembled::VecZero) => ty.is_vector() && imm == 0,
+        _ => false,
+    }
+}
+
+fn for_edge_args(op: &Op, target: Block, mut f: impl FnMut(&[Value])) -> bool {
+    match op {
+        Op::Jump(b, args) if *b == target => f(args),
+        Op::Brif(_, t, ta, e, ea) => {
+            if *t == target {
+                f(ta);
+            }
+            if *e == target {
+                f(ea);
+            }
+        }
+        _ if op.targets().any(|t| t == target) => return false,
+        _ => {}
+    }
+    true
+}
+
+fn eligible_join_preds(func: &Function, cfg: &Cfg, visited: &[bool], block: Block) -> Option<Vec<Block>> {
+    if Some(block) == func.entry {
+        return None;
+    }
+    let param_len = func.blocks[block.index()].params.len();
+    let mut unique = Vec::new();
+    for &pred in cfg.preds_of(block) {
+        if !cfg.reachable[pred.index()] || !visited[pred.index()] {
+            return None;
+        }
+        if !unique.contains(&pred) {
+            let (mut seen, mut ok) = (false, true);
+            if !func.last(pred).is_some_and(|op| for_edge_args(op, block, |a| { seen = true; ok &= a.len() == param_len; }))
+                || !seen
+                || !ok
+            {
+                return None;
+            }
+            unique.push(pred);
+        }
+    }
+    (2..=4).contains(&unique.len()).then_some(unique)
+}
+
+fn for_edge_args_mut(func: &mut Function, pred: Block, target: Block, mut f: impl FnMut(&mut Vec<Value>)) {
+    let Some(&last) = func.blocks[pred.index()].insts.last() else { return };
+    match &mut func.insts[last.index()].op {
+        Op::Jump(b, args) if *b == target => f(args),
+        Op::Brif(_, t, ta, e, ea) => {
+            if *t == target {
+                f(ta);
+            }
+            if *e == target {
+                f(ea);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn try_join_phi_forward(
+    func: &mut Function,
+    (block, inst, loc, ty, result): (Block, Inst, MemLoc, Type, Value),
+    state: &mut State<'_>,
+    known: &mut KnownLoads,
+    join: &mut JoinCtx<'_>,
+    clobbers_seen: &[BlockClobber],
+) -> Option<Option<Value>> {
+    let preds = join.preds.as_ref()?;
+    if matches!(loc.base, MemBase::Addr(b) if !join.def_blocks.get(b.index()).copied().flatten().is_some_and(|d| d != block && join.cfg.dominates(d, block)))
+        || clobbers_seen.iter().any(|c| match *c {
+            BlockClobber::Loc(w) => may_alias(w, loc, state.prov),
+            BlockClobber::CopyLoc(w) => w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias(w, loc, state.prov),
+            BlockClobber::Op(c_inst) => clobbers(func, &func.insts[c_inst.index()].op, loc, state.prov),
+        })
+    {
+        return None;
+    }
+    let mut vals: Vec<(Block, Value)> = Vec::with_capacity(preds.len());
+    for &p in preds {
+        let v = find(state.subst, join.known_out[p.index()].get(loc.base, loc.offset, ty)?);
+        if !join.def_blocks.get(v.index()).copied().flatten().is_some_and(|d| join.cfg.dominates(d, p)) {
+            return None;
+        }
+        vals.push((p, v));
+    }
+    if vals.iter().all(|&(_, v)| v == vals[0].1) {
+        known.remember(loc, ty, vals[0].1);
+        return Some(Some(vals[0].1));
+    }
+    if let Some(imm0) = state.consts.get(vals[0].1.index()).copied().flatten()
+        && vals.iter().all(|&(_, v)| const_eq_for_ty(state.consts, ty, vals[0].1, v))
+    {
+        func.insts[inst.index()].op = Op::Const(imm0);
+        state.consts[result.index()] = Some(imm0);
+        known.remember(loc, ty, result);
+        return Some(None);
+    }
+    if join.added_phis >= MAX_JOIN_PHIS_PER_BLOCK {
+        return None;
+    }
+    let phi = func.value(ty);
+    func.blocks[block.index()].params.push(phi);
+    state.subst.push(phi);
+    state.consts.push(None);
+    join.def_blocks.resize(func.types.len(), Some(block));
+    join.added_phis += 1;
+    vals.into_iter().for_each(|(p, v)| for_edge_args_mut(func, p, block, |a| a.push(v)));
+    known.remember(loc, ty, phi);
+    Some(Some(phi))
+}
+
 /// Drops from `block` each load whose bytes `known` holds, recording its replacement in `subst`, eliminates dead overwritten stores, and leaves in `known` what memory holds at the block's end; returns `(changed, renamed)`.
-fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut KnownLoads, bases: &mut Vec<(MemBase, MemRoot)>) -> (bool, bool) {
+fn scan(
+    func: &mut Function,
+    block: Block,
+    state: &mut State<'_>,
+    known: &mut KnownLoads,
+    bases: &mut Vec<(MemBase, MemRoot)>,
+    join: &mut JoinCtx<'_>,
+) -> (bool, bool) {
     let insts = std::mem::take(&mut func.blocks[block.index()].insts);
     let mut bufs = ScanBuf {
         kept: Vec::with_capacity(insts.len()),
         pending_stores: Vec::new(),
         const_stores: Vec::new(),
     };
+    let mut clobbers_seen = Vec::new();
     let (mut changed, mut renamed) = (false, false);
     for inst in insts {
         match func.insts[inst.index()].op {
@@ -285,17 +427,9 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
             _ => {}
         }
         match effect(func, state, inst) {
-            Effect::Read(loc, ty, result) => match known.get(loc.base, loc.offset, ty) {
-                Some(value) => {
-                    state.subst[result.index()] = value;
-                    if let Some(imm) = state.consts.get(value.index()).copied().flatten() {
-                        state.consts[result.index()] = Some(imm);
-                    }
-                    renamed = true;
-                    changed = true;
-                    continue;
-                }
-                None => {
+            Effect::Read(loc, ty, result) => {
+                let mut forwarded = known.get(loc.base, loc.offset, ty);
+                if forwarded.is_none() {
                     if let Some(assembled) = assemble_const(known, loc, ty, state.consts) {
                         match assembled {
                             Assembled::Int(imm) => {
@@ -336,6 +470,9 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                         func.insts[inst.index()].op = Op::Select(find(state.subst, c), val_a, val_b);
                         known.remember(loc, ty, result);
                         changed = true;
+                    } else if let Some(fwd) = try_join_phi_forward(func, (block, inst, loc, ty, result), state, known, join, &clobbers_seen) {
+                        forwarded = fwd;
+                        changed = true;
                     } else {
                         known.remember(loc, ty, result);
                         bufs.pending_stores.retain(|&(ploc, _)| !may_alias(loc, ploc, state.prov));
@@ -347,14 +484,23 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                     }
                     record_base(bases, loc);
                 }
-            },
-            Effect::Write(loc, ty, value) => {
-                if let Some(prev) = known.get(loc.base, loc.offset, ty)
-                    && (prev == value || const_eq_for_ty(state.consts, ty, prev, value))
-                {
+                if let Some(value) = forwarded {
+                    state.subst[result.index()] = value;
+                    if let Some(imm) = state.consts.get(value.index()).copied().flatten() {
+                        state.consts[result.index()] = Some(imm);
+                    }
+                    renamed = true;
                     changed = true;
                     continue;
                 }
+            }
+            Effect::Write(loc, ty, value) => {
+                if is_silent_store(known, loc, ty, value, state.consts) {
+                    func.insts[inst.index()].op = Op::Trap;
+                    changed = true;
+                    continue;
+                }
+                clobbers_seen.push(BlockClobber::Loc(loc));
                 known.write(loc, ty, value, state.prov);
                 record_base(bases, loc);
                 let safe_write = slot_unescaped(state.prov, loc);
@@ -362,10 +508,7 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                     !may_alias(loc, cs.loc, state.prov)
                         && (slot_unescaped(state.prov, cs.loc) || safe_write || cs.loc.base == loc.base)
                 });
-                let track = match loc.root {
-                    MemRoot::Slot(s) => state.prov.slot_unescaped(s),
-                    _ => true,
-                };
+                let track = !matches!(loc.root, MemRoot::Slot(s) if !state.prov.slot_unescaped(s));
                 let mut push_loc = loc;
                 if track {
                     let end = i128::from(loc.offset) + i128::from(loc.size);
@@ -389,6 +532,11 @@ fn scan(func: &mut Function, block: Block, state: &mut State<'_>, known: &mut Kn
                 }
             }
             Effect::Unknown => {
+                clobbers_seen.push(match func.insts[inst.index()].op {
+                    Op::Move(dst, _, bytes) => BlockClobber::Loc(addr_loc(state.prov, state.subst, dst, 0, bytes)),
+                    Op::Copy(dst, _, _) => BlockClobber::CopyLoc(addr_loc(state.prov, state.subst, dst, 0, u32::MAX)),
+                    _ => BlockClobber::Op(inst),
+                });
                 let op = &func.insts[inst.index()].op;
                 known.invalidate(func, op, state.prov);
                 let keep_fn = |ploc: MemLoc| match ploc.root {
@@ -422,22 +570,9 @@ fn eliminate_affine_block_params(func: &mut Function) -> bool {
         let mut non_branch_pred = false;
         for pred in &func.blocks {
             let Some(&last) = pred.insts.last() else { continue };
-            let op = &func.insts[last.index()].op;
-            match op {
-                Op::Jump(b, args) if *b == target => incoming.push(args.clone()),
-                Op::Brif(_, t, t_args, e, e_args) => {
-                    if *t == target {
-                        incoming.push(t_args.clone());
-                    }
-                    if *e == target {
-                        incoming.push(e_args.clone());
-                    }
-                }
-                _ if op.targets().any(|t| t == target) => {
-                    non_branch_pred = true;
-                    break;
-                }
-                _ => {}
+            if !for_edge_args(&func.insts[last.index()].op, target, |a| incoming.push(a.to_vec())) {
+                non_branch_pred = true;
+                break;
             }
         }
         let params = func.blocks[b_idx].params.clone();
@@ -493,34 +628,16 @@ fn eliminate_affine_block_params(func: &mut Function) -> bool {
             prepended.append(&mut func.blocks[b_idx].insts);
             func.blocks[b_idx].insts = prepended;
         }
-        let mut idx = 0;
-        func.blocks[b_idx].params.retain(|_| {
-            let keep = !eliminated[idx];
-            idx += 1;
-            keep
-        });
+        let retain_mask = |args: &mut Vec<Value>| {
+            let mut k = 0;
+            args.retain(|_| {
+                k += 1;
+                !eliminated[k - 1]
+            });
+        };
+        retain_mask(&mut func.blocks[b_idx].params);
         for pred_idx in 0..func.blocks.len() {
-            let Some(&last) = func.blocks[pred_idx].insts.last() else { continue };
-            let retain_args = |args: &mut Vec<Value>| {
-                let mut k = 0;
-                args.retain(|_| {
-                    let keep = !eliminated[k];
-                    k += 1;
-                    keep
-                });
-            };
-            match &mut func.insts[last.index()].op {
-                Op::Jump(b, args) if *b == target => retain_args(args),
-                Op::Brif(_, t, t_args, e, e_args) => {
-                    if *t == target {
-                        retain_args(t_args);
-                    }
-                    if *e == target {
-                        retain_args(e_args);
-                    }
-                }
-                _ => {}
-            }
+            for_edge_args_mut(func, Block(pred_idx as u32), target, retain_mask);
         }
     }
     if any_changed {
@@ -546,33 +663,40 @@ fn fold_affine_mem(func: &mut Function, slots: &[Option<(StackSlot, i32)>], affi
         }
     }
     let mut changed = false;
-    for block in &func.blocks {
-        for &inst in &block.insts {
-            let res_ty = func.insts[inst.index()].result.map(|r| func.ty(r));
-            let val_ty = match func.insts[inst.index()].op {
-                Op::Load(..) => res_ty,
-                Op::Store(val, ..) => Some(func.ty(val)),
-                _ => None,
-            };
-            let Some(ty) = val_ty else { continue };
-            let (Op::Load(addr, off) | Op::Store(_, addr, off)) = &mut func.insts[inst.index()].op else { continue };
-            if slots[addr.index()].is_some() {
-                continue;
-            }
-            let (root, base_off) = affine[addr.index()];
-            if root != *addr
-                && func.types[root.index()] == Type::I64
-                && !is_stack_addr[root.index()]
-                && let Some(new_off) = i64::from(*off).checked_add(base_off)
-                && fits_mem_imm(ty, new_off)
-            {
-                *addr = root;
-                *off = new_off as i32;
-                changed = true;
-            }
+    for &inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let Some(ty) = (match func.insts[inst.index()].op {
+            Op::Load(..) => func.insts[inst.index()].result.map(|r| func.ty(r)),
+            Op::Store(val, ..) => Some(func.ty(val)),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let (Op::Load(addr, off) | Op::Store(_, addr, off)) = &mut func.insts[inst.index()].op else { continue };
+        if slots[addr.index()].is_some() {
+            continue;
+        }
+        let (root, base_off) = affine[addr.index()];
+        if root != *addr
+            && func.types[root.index()] == Type::I64
+            && !is_stack_addr[root.index()]
+            && let Some(new_off) = i64::from(*off).checked_add(base_off)
+            && fits_mem_imm(ty, new_off)
+        {
+            *addr = root;
+            *off = new_off as i32;
+            changed = true;
         }
     }
     changed
+}
+
+fn for_term_args(op: &Op, mut f: impl FnMut(Value)) -> bool {
+    match op {
+        Op::Jump(_, args) => args.iter().for_each(|&v| f(v)),
+        Op::Brif(_, _, t_args, _, e_args) => t_args.iter().chain(e_args).for_each(|&v| f(v)),
+        _ => return false,
+    }
+    true
 }
 
 fn sink_terminator_defs(func: &mut Function) -> bool {
@@ -591,13 +715,8 @@ fn sink_terminator_defs(func: &mut Function) -> bool {
             continue;
         }
         let Some(&last) = func.blocks[b].insts.last() else { continue };
-        match &func.insts[last.index()].op {
-            Op::Jump(_, args) => args.iter().for_each(|v| term_uses[v.index()] += 1),
-            Op::Brif(_, _, t_args, _, e_args) => {
-                t_args.iter().for_each(|v| term_uses[v.index()] += 1);
-                e_args.iter().for_each(|v| term_uses[v.index()] += 1);
-            }
-            _ => continue,
+        if !for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] += 1) {
+            continue;
         }
         let insts = std::mem::take(&mut func.blocks[b].insts);
         let len = insts.len();
@@ -622,14 +741,7 @@ fn sink_terminator_defs(func: &mut Function) -> bool {
         kept.extend(sunk);
         kept.push(last);
         func.blocks[b].insts = kept;
-        match &func.insts[last.index()].op {
-            Op::Jump(_, args) => args.iter().for_each(|v| term_uses[v.index()] = 0),
-            Op::Brif(_, _, t_args, _, e_args) => {
-                t_args.iter().for_each(|v| term_uses[v.index()] = 0);
-                e_args.iter().for_each(|v| term_uses[v.index()] = 0);
-            }
-            _ => {}
-        }
+        for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0);
     }
     changed
 }
@@ -658,11 +770,17 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let mut subst = identity(func.types.len());
     let mut state = State { prov: &prov, selects: &selects, consts: &mut consts, subst: &mut subst };
     let mut renamed = false;
+    let mut def_blocks = func.def_blocks();
+    let mut visited = vec![false; func.blocks.len()];
     let mut known_out: Vec<KnownLoads> = (0..func.blocks.len()).map(|_| KnownLoads::new()).collect();
     let mut block_bases: Vec<Vec<(MemBase, MemRoot)>> = vec![Vec::new(); func.blocks.len()];
     for &block in &cfg.rpo {
         let (mut known, mut bases) = bw.entry_known(func, state.subst, &known_out, &block_bases, block);
-        let (block_changed, block_renamed) = scan(func, block, &mut state, &mut known, &mut bases);
+        let preds = eligible_join_preds(func, &cfg, &visited, block);
+        let mut join = JoinCtx { cfg: &cfg, known_out: &known_out, def_blocks: &mut def_blocks, preds, added_phis: 0 };
+        let (block_changed, block_renamed) = scan(func, block, &mut state, &mut known, &mut bases, &mut join);
+        def_blocks.resize(func.types.len(), Some(block));
+        visited[block.index()] = true;
         changed |= block_changed;
         renamed |= block_renamed;
         known_out[block.index()] = known;

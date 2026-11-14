@@ -1,6 +1,6 @@
 use crate::cfg::{self, Cfg, Loop};
 use crate::ir::{Block, BlockData, Domain, Function, Inst, Op, Value};
-use crate::mem::{LoopMem, MemLoc, PromoteBase, PromoteCand, Provenance};
+use crate::mem::{LoopMem, MemLoc, MemRoot, PromoteBase, PromoteCand, Provenance};
 use crate::merge::{find, identity, rename};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -281,6 +281,7 @@ fn emit_exit_stores(state: &mut PromoteState<'_>, cand: PromoteCand, exits: Vec<
         state.cfg.preds.push(vec![edge.src]);
         state.cfg.reachable.push(true);
         state.cfg.idom.push(Some(edge.src));
+        insert_rpo(&mut state.cfg.rpo, edge.src, pad, true);
         for outer in state.later.iter_mut() {
             let inside = outer.body.get(edge.src.index()).copied().unwrap_or(false)
                 && outer.body.get(edge.target.index()).copied().unwrap_or(false);
@@ -437,6 +438,35 @@ fn promote_mem(state: &mut PromoteState<'_>, prov: &Provenance, pre: Block) -> b
     changed
 }
 
+fn insert_rpo(rpo: &mut Vec<Block>, anchor: Block, block: Block, after: bool) {
+    if rpo.contains(&block) {
+        return;
+    }
+    if let Some(pos) = rpo.iter().position(|&b| b == anchor) {
+        rpo.insert(pos + usize::from(after), block);
+    } else {
+        rpo.push(block);
+    }
+}
+
+fn can_hoist_global_load(func: &Function, mem: &LoopMem, prov: &Provenance, head_prefix: bool, inst: Inst) -> bool {
+    let data = &func.insts[inst.index()];
+    let Some(res) = data.result else { return false };
+    let Op::Load(addr, offset) = data.op else { return false };
+    if mem.calls || mem.atomics || mem.unknown_mem_writes {
+        return false;
+    }
+    let width = func.ty(res).bytes();
+    let deref_ok = offset >= 0
+        && (offset as u64)
+            .checked_add(u64::from(width))
+            .is_some_and(|end| end <= u64::from(prov.ro_bytes.get(addr.index()).copied().unwrap_or(0)));
+    if !head_prefix && !deref_ok {
+        return false;
+    }
+    matches!(prov.loc(addr, i64::from(offset), width).root, MemRoot::Global(_))
+}
+
 fn hoist(
     func: &mut Function,
     cfg: &Cfg,
@@ -461,9 +491,10 @@ fn hoist(
             if matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::Trap | Op::Trapz(_) | Op::Brif(..)) {
                 head_prefix = false;
             }
-            let static_loc = matches!(op, Op::StackAddr(..) | Op::SlotAddr(_));
+            let static_loc = matches!(op, Op::StackAddr(..) | Op::SlotAddr(_) | Op::Symbol(_));
             let movable = (op.is_speculable() && !(mem.calls && static_loc))
-                || mem.can_hoist_load(func, prov, head_prefix, inst);
+                || mem.can_hoist_load(func, prov, head_prefix, inst)
+                || can_hoist_global_load(func, &mem, prov, head_prefix, inst);
             let mut operands_invariant = true;
             op.for_operands(|v| operands_invariant &= home.get(v.index()).copied().flatten().is_none_or(|at| !each.body.get(at.index()).copied().unwrap_or(false)));
             if movable && operands_invariant && let Some(res) = func.insts[inst.index()].result {
@@ -519,6 +550,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             cfg.reachable.push(true);
             cfg.idom.push(cfg.idom[head_idx]);
             cfg.idom[head_idx] = Some(pre);
+            insert_rpo(&mut cfg.rpo, found.list[idx].head, pre, false);
             found.list[idx].body.resize(pre.index() + 1, false);
             for later in &mut found.list[idx + 1..] {
                 let inside = later.body.get(head_idx).copied().unwrap_or(false);
