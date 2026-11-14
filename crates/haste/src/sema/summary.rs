@@ -345,23 +345,27 @@ fn extract_op_holes(types: &Types, body: &Body, tpl: &BodyTables) -> Box<[(ExprI
 }
 
 fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Result<()> {
-    let mut seen_drop = HashSet::default();
-    let mut fixed_drops = Vec::new();
-    let mut drop_tys = Vec::new();
-    for ty in summary.locals.iter().map(|l| l.ty).chain(summary.template.owned_tys()) {
-        if ty == Ty::NONE || !seen_drop.insert(ty) {
-            continue;
-        }
-        if !cx.types.has_params(ty) {
-            if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
-                drop(cx.layout(ty));
+    if summary.template.closures.is_empty() {
+        let mut seen_drop = HashSet::default();
+        let mut fixed_drops = Vec::new();
+        let mut drop_tys = Vec::new();
+        for ty in summary.locals.iter().map(|l| l.ty).chain(summary.template.owned_tys()) {
+            if ty == Ty::NONE || !seen_drop.insert(ty) {
+                continue;
             }
-            if let Some(call) = super::infer::glue_call(cx, ty)? {
-                fixed_drops.push(call);
+            if !cx.types.has_params(ty) {
+                if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
+                    drop(cx.layout(ty));
+                }
+                if let Some(call) = super::infer::glue_call(cx, ty)? {
+                    fixed_drops.push(call);
+                }
+            } else if !matches!(cx.types.kind(ty), Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_)) {
+                drop_tys.push(ty);
             }
-        } else if !matches!(cx.types.kind(ty), Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_)) {
-            drop_tys.push(ty);
         }
+        summary.fixed_drops = fixed_drops.into_boxed_slice();
+        summary.drop_tys = drop_tys.into_boxed_slice();
     }
     let mut seen_param = HashSet::default();
     let mut parametric_tys = Vec::new();
@@ -373,8 +377,6 @@ fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Res
             parametric_tys.push(ty);
         }
     }
-    summary.fixed_drops = fixed_drops.into_boxed_slice();
-    summary.drop_tys = drop_tys.into_boxed_slice();
     summary.parametric_tys = parametric_tys.into_boxed_slice();
     Ok(())
 }

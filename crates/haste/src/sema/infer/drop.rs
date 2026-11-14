@@ -27,7 +27,7 @@ impl Infer<'_, '_> {
         let result = self.parts_need_drop(ty);
         self.cx.drop_stack.pop();
         let needs = result?;
-        if self.cx.quiet_mark() == before && !self.has_vars(ty) {
+        if self.cx.quiet_mark() == before && !self.has_vars(ty) && (needs || self.cx.drop_stack.is_empty()) {
             self.cx.store.lookups.drops.insert(ty, needs);
         }
         Ok(needs)
@@ -53,11 +53,21 @@ impl Infer<'_, '_> {
         })
     }
 
+    fn closure_env(&mut self, ty: Ty) -> Option<Ty> {
+        if let Some(env) = self.cx.closure_env(ty) {
+            return Some(env);
+        }
+        let saved = std::mem::take(&mut self.cx.drop_stack);
+        let env = self.cx.ensure_closure(ty).map(|info| info.env);
+        self.cx.drop_stack = saved;
+        env
+    }
+
     fn closure_is_copy(&mut self, ty: Ty) -> Result<bool> {
         if self.coroutine_output(ty).is_some() {
             return Ok(false);
         }
-        match self.cx.ensure_closure(ty).map(|info| info.env) {
+        match self.closure_env(ty) {
             Some(env) => self.is_copy(env),
             None => Ok(true),
         }
@@ -120,7 +130,7 @@ pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
     } else {
         None
     };
-    if cx.quiet_mark() == before && !cx.types.has_params(ty) {
+    if cx.quiet_mark() == before && !cx.types.has_params(ty) && (call.is_some() || cx.drop_stack.is_empty()) {
         cx.store.lookups.glues.insert(ty, call);
     }
     Ok(call)
@@ -182,7 +192,7 @@ impl Infer<'_, '_> {
     }
 
     fn closure_drop_parts(&mut self, ty: Ty) -> Result<Vec<Ty>> {
-        let Some(&Kind::Tuple(items)) = self.cx.ensure_closure(ty).map(|info| self.cx.types.kind(info.env)) else {
+        let Some(&Kind::Tuple(items)) = self.closure_env(ty).map(|env| self.cx.types.kind(env)) else {
             bail!("drop of a closure whose defining body was not inferred");
         };
         if self.coroutine_output(ty).is_none() {
