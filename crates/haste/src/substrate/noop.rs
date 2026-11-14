@@ -14,7 +14,7 @@ const HEADER_LEN: usize = 32;
 pub fn active(stats: Option<&Path>) -> bool {
     super::enabled()
         && stats.is_none()
-        && std::env::var_os("HASTE_VERIFY_STENCIL").is_none_or(|v| v.is_empty())
+        && !crate::image::verify_stencil()
         && std::env::var_os("HASTE_NO_NOOP").is_none_or(|v| v != "1")
 }
 

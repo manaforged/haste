@@ -21,6 +21,11 @@ pub const DICT_MIN_BYTES: usize = 512;
 /// Minimum distinct relocation vectors before sharing a dictionary body.
 pub const DICT_MIN_FANOUT: usize = 8;
 
+/// Whether `HASTE_VERIFY_STENCIL=1` asks for stencil instantiations to be checked against concrete lowering.
+pub fn verify_stencil() -> bool {
+    std::env::var_os("HASTE_VERIFY_STENCIL").is_some_and(|v| v == "1")
+}
+
 const DEFAULT_TIER_UP: u32 = 64;
 const DICT_STUB_SPACE: usize = 48;
 
@@ -38,8 +43,7 @@ impl DictConfig {
         let default_fanout = if min_bytes == 0 { 1 } else { DICT_MIN_FANOUT };
         let min_fanout = env_usize("HASTE_DICT_MIN_FANOUT").unwrap_or(default_fanout).max(1);
         let tier_up = env_usize("HASTE_JIT_TIER_UP").map_or(DEFAULT_TIER_UP, |v| v as u32);
-        let verify = std::env::var_os("HASTE_VERIFY_STENCIL").is_some_and(|v| v == "1");
-        Self { min_bytes, min_fanout, tier_up, verify }
+        Self { min_bytes, min_fanout, tier_up, verify: verify_stencil() }
     }
 }
 

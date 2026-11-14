@@ -7,6 +7,7 @@ pub mod perf;
 mod script;
 mod stencil;
 mod stencil_jit;
+pub(crate) use stencil::{DICT_MIN_BYTES, DICT_MIN_FANOUT, verify_stencil};
 mod stub;
 mod workers;
 
