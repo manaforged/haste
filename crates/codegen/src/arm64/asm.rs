@@ -48,8 +48,6 @@ pub enum ExtOp {
     Sxtb = 4,
     Sxth = 5,
     Sxtw = 6,
-    #[allow(dead_code)]
-    Sxtx = 7,
 }
 
 /// The width of a memory access or of an integer operation: 1, 2, 4 or 8 bytes.

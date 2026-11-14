@@ -472,7 +472,7 @@ pub struct Files {
 const PER_WORKER: usize = 4;
 
 fn slot(slots: &Mutex<HashMap<PathBuf, Slot>>, path: &Path) -> Result<Slot> {
-    Ok(slots.lock().map_err(|_| anyhow!("file cache poisoned"))?.entry(path.to_owned()).or_default().clone())
+    Ok(crate::sync::lock(slots).entry(path.to_owned()).or_default().clone())
 }
 
 fn fill(slot: &Slot, path: &Path) -> Result<Arc<File>, String> {

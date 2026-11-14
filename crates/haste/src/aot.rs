@@ -375,11 +375,11 @@ impl<'a> Plan<'a> {
                 .collect();
             let r = reloc_handles
                 .into_iter()
-                .map(|h| h.join().map_err(|_| anyhow::anyhow!("AOT plan worker panicked"))?)
+                .map(|h| h.join().map_err(|panic| anyhow::anyhow!("AOT plan worker panicked: {}", crate::sync::panic_text(&*panic)))?)
                 .collect();
             let p = ptr_handles
                 .into_iter()
-                .map(|h| h.join().map_err(|_| anyhow::anyhow!("AOT plan worker panicked"))?)
+                .map(|h| h.join().map_err(|panic| anyhow::anyhow!("AOT plan worker panicked: {}", crate::sync::panic_text(&*panic)))?)
                 .collect();
             (r, p)
         });
@@ -677,7 +677,7 @@ pub(super) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().map_err(|_| anyhow::anyhow!("AOT patch worker panicked"))?)
+            .map(|h| h.join().map_err(|panic| anyhow::anyhow!("AOT patch worker panicked: {}", crate::sync::panic_text(&*panic)))?)
             .collect()
     });
     for res in results {

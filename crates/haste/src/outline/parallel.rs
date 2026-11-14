@@ -44,7 +44,7 @@ pub(super) fn load_selected(outline: &mut Outline, workers: usize, selected: &[b
         }
         work(&lock, &shared);
     });
-    let board = lock.0.into_inner().map_err(|_| anyhow!("crate loading poisoned"))?;
+    let board = crate::sync::into_inner(lock.0);
     outline.crates = board.crates.into_iter().map(Option::unwrap_or_default).collect();
     board.failed.map_or(Ok(()), |(_, error)| Err(error))
 }

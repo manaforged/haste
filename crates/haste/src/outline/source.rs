@@ -99,14 +99,14 @@ pub struct Outputs(Mutex<FxHashMap<(u32, u32, u32), Box<Source>>>);
 impl Outputs {
     /// The output kept for the call `key`.
     pub fn get(&self, key: (u32, u32, u32)) -> Result<Option<&Source>> {
-        let kept = self.0.lock().map_err(|_| anyhow::anyhow!("macro outputs poisoned"))?;
+        let kept = crate::sync::lock(&self.0);
         // SAFETY: entries are never removed or replaced while self lives, and a box keeps its heap address when the map grows.
         Ok(kept.get(&key).map(|found| unsafe { &*std::ptr::from_ref::<Source>(found) }))
     }
 
     /// Keeps `output` for the call `key`, or the output another caller kept first.
     pub fn keep(&self, key: (u32, u32, u32), output: Source) -> Result<&Source> {
-        let mut kept = self.0.lock().map_err(|_| anyhow::anyhow!("macro outputs poisoned"))?;
+        let mut kept = crate::sync::lock(&self.0);
         let found = kept.entry(key).or_insert_with(|| Box::new(output));
         // SAFETY: entries are never removed or replaced while self lives, and a box keeps its heap address when the map grows.
         Ok(unsafe { &*std::ptr::from_ref::<Source>(found) })
