@@ -345,7 +345,7 @@ impl Infer<'_, '_> {
         let full: Vec<Ty> = std::iter::once(ty).chain(args.iter().copied()).collect();
         self.push_assumption((of, full));
         if self.is_callable_trait(of)
-            && let Some(sig) = self.fn_bound(arena, home, bound)?
+            && let Some((_, sig)) = self.callable_bound(arena, home, bound)?
         {
             self.push_fn_bound(ty, of, sig);
         }
@@ -433,7 +433,7 @@ impl Infer<'_, '_> {
 
     fn push_fn_bound(&mut self, ty: Ty, of: ItemRef, sig: Ty) {
         if let Kind::FnPtr(inputs, output) = *self.cx.types.kind(sig)
-            && let Some(once) = self.cx.lang_item("fn_once")
+            && let Some(once) = self.callable_output_trait(of)
         {
             let tuple = self.cx.types.intern(Kind::Tuple(inputs));
             let trait_args = self.cx.types.intern_substs(&[tuple]);
@@ -508,7 +508,7 @@ impl Infer<'_, '_> {
     pub(super) fn poly_fn_sig(&self, ty: Ty) -> Option<(Vec<Ty>, Ty)> {
         let ty = self.resolve(ty);
         let poly = self.poly.as_ref()?;
-        let &(_, _, sig) = poly.fn_bounds.iter().find(|&&(bound_ty, _, _)| self.resolve(bound_ty) == ty)?;
+        let &(_, _, sig) = poly.fn_bounds.iter().find(|&&(bound_ty, of, _)| self.resolve(bound_ty) == ty && self.is_sync_callable_trait(of))?;
         let Kind::FnPtr(params, ret) = *self.cx.types.kind(sig) else { return None };
         Some((self.cx.types.substs(params).to_vec(), ret))
     }
@@ -571,20 +571,6 @@ impl Infer<'_, '_> {
             return Ok(false);
         }
         self.assoc_bounds_hold((arena, home, path), (of, ty, args), depth)
-    }
-
-    pub(super) fn poly_callable_bound_holds(&mut self, (arena, home, bound): (&Body, ModRef, u32), (of, path, ty): (ItemRef, PathId, Ty), depth: u32) -> Result<bool> {
-        let ty = self.resolve(ty);
-        let found = self
-            .poly
-            .as_ref()
-            .and_then(|p| p.fn_bounds.iter().find(|&&(t, o, _)| self.resolve(t) == ty && o == of).map(|&(_, _, s)| s));
-        if let Some(sig) = found {
-            let Some(wanted) = self.fn_bound(arena, home, bound)? else { return Ok(true) };
-            return Ok(self.unifies(sig, wanted));
-        }
-        let args = self.bound_args(of, arena, path, ty)?;
-        self.poly_env_holds((arena, home, path), (of, ty, &args), depth)
     }
 
     pub(super) fn poly_picked_alias(&mut self, of: ItemRef, ty: Ty, args: &[Ty], (name, own): (&str, &[Ty])) -> Result<Option<Ty>> {
@@ -759,19 +745,6 @@ impl Infer<'_, '_> {
             poly.obligations.push(PolyObligation::Call { expr, found, tuple });
         }
         Ok(ret)
-    }
-
-    fn poly_callable_target(&mut self, callee_ty: Ty) -> Option<(ItemRef, Vec<Ty>, Ty)> {
-        let callee_ty = self.resolve(callee_ty);
-        let bounds = self.poly.as_ref()?.fn_bounds.clone();
-        for (lang, name) in [("fn", "call"), ("fn_mut", "call_mut"), ("fn_once", "call_once")] {
-            let Some(of) = self.cx.lang_item(lang) else { continue };
-            let Some(&(_, _, sig)) = bounds.iter().find(|&&(t, o, _)| o == of && self.resolve(t) == callee_ty) else { continue };
-            let Kind::FnPtr(params, ret) = *self.cx.types.kind(sig) else { continue };
-            let method = self.cx.trait_member(of, name)?;
-            return Some((method, self.cx.types.substs(params).to_vec(), ret));
-        }
-        None
     }
 
     pub(super) fn poly_offset_of(&mut self, expr: ExprId, mut current: Ty, fields: List) -> Result<Ty> {

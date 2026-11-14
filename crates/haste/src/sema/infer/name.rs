@@ -5,7 +5,7 @@ use super::super::Context;
 use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty, object_parts};
 use super::detached;
-use super::select::CALLABLE;
+use super::callable::{ASYNC_CALLABLE, CALLABLE};
 
 /// The name that `std::any::type_name` gives `ty`, spelled as rustc spells it: each item by its full path, lifetimes as `'_`, and trailing type arguments that equal their defaults left out.
 pub fn type_name(cx: &mut Context<'_>, ty: Ty) -> String {
@@ -99,7 +99,7 @@ fn dyn_name(cx: &mut Context<'_>, (of, args): (ItemRef, Substs), members: &[Item
     let (trait_args, bound) = object_parts(&all, members);
     let bound: Vec<(ItemRef, Ty)> = bound.collect();
     let mut text = format!("dyn {}", def_path(cx, of));
-    if cx.lang(of).is_some_and(|lang| CALLABLE.contains(&lang)) {
+    if cx.lang(of).is_some_and(|lang| CALLABLE.contains(&lang) || ASYNC_CALLABLE.contains(&lang)) {
         let inputs = match trait_args.first().map(|&tuple| cx.types.kind(tuple).clone()) {
             Some(Kind::Tuple(items)) => names(cx, cx.types.substs(items).to_vec()),
             _ => Vec::new(),

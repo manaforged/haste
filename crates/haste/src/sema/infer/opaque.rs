@@ -126,7 +126,7 @@ impl<'a> Infer<'_, 'a> {
                 let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else {
                     continue;
                 };
-                if self.is_callable_trait(of) {
+                if self.is_sync_callable_trait(of) {
                     continue;
                 }
                 let args = self.bound_args(of, &sig.body, path, hidden)?;
@@ -181,7 +181,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// Unifies the parameter types of a callable `impl Trait` return signature `sig` with the `Args` tuple in `args` when `of` is a callable trait.
     pub(super) fn tie_callable_opaque(&mut self, of: ItemRef, sig: Ty, args: &[Ty]) -> Result<Option<bool>> {
-        if !self.is_callable_trait(of) {
+        if !self.is_sync_callable_trait(of) {
             return Ok(None);
         }
         let Kind::FnPtr(params, _) = *self.cx.types.kind(sig) else { return Ok(None) };
@@ -208,12 +208,12 @@ impl<'a> Infer<'_, 'a> {
         Ok(true)
     }
 
-    /// The function pointer type that the first `Fn` bound among `bounds` in `arena` spells, read through `frame`.
-    pub(super) fn first_fn_bound(&mut self, frame: Frame<'a>, arena: &Body, bounds: Vec<u32>) -> Result<Option<Ty>> {
+    /// The callable trait and function pointer type that the first callable bound among `bounds` in `arena` spells, read through `frame`.
+    pub(super) fn first_callable_bound(&mut self, frame: Frame<'a>, arena: &Body, bounds: Vec<u32>) -> Result<Option<(ItemRef, Ty)>> {
         let home = frame.home;
         self.with_frame(frame, |infer| {
             for bound in bounds {
-                if let Some(hint) = infer.fn_bound(arena, home, bound)? {
+                if let Some(hint) = infer.callable_bound(arena, home, bound)? {
                     return Ok(Some(hint));
                 }
             }
@@ -221,12 +221,12 @@ impl<'a> Infer<'_, 'a> {
         })
     }
 
-    /// The function pointer type that an `Fn` bound on the outer parameter `name` spells in a header of the frame: the function's own, or its impl's or trait's.
-    pub(super) fn header_fn_bound(&mut self, name: &str, home: ModRef) -> Result<Option<Ty>> {
+    /// The callable trait and function pointer type that a callable bound on the outer parameter `name` spells in a header of the frame.
+    pub(super) fn header_callable_bound(&mut self, name: &str, home: ModRef) -> Result<Option<(ItemRef, Ty)>> {
         for (header, src) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
             for bound in super::scope::named_bounds(arena, src, (generics, predicates), name) {
-                if let Some(hint) = self.in_source(src, |infer| infer.fn_bound(arena, home, bound))? {
+                if let Some(hint) = self.in_source(src, |infer| infer.callable_bound(arena, home, bound))? {
                     return Ok(Some(hint));
                 }
             }
@@ -245,14 +245,16 @@ impl<'a> Infer<'_, 'a> {
             return Ok(None);
         };
         for &bound in sig.body.list(bounds) {
-            if let Some(found) = self.fn_bound(&sig.body, self.home, bound)? {
+            if let Some((of, found)) = self.callable_bound(&sig.body, self.home, bound)?
+                && self.is_sync_callable_trait(of)
+            {
                 return Ok(Some(found));
             }
         }
         Ok(None)
     }
 
-    /// The trait bounds other than `Fn` that an `impl Trait` return type of `sig` spells in the current frame, each with `ret` as `Self`.
+    /// The trait bounds other than sync `Fn` that an `impl Trait` return type of `sig` spells in the current frame, each with `ret` as `Self`.
     pub(super) fn ret_bounds(&mut self, sig: &Signature, ret: Ty) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let Some(crate::body::Ty::ImplTrait(_, bounds)) = sig.ret.map(|ret| *sig.body.ty(ret)) else {
             return Ok(Vec::new());
@@ -262,7 +264,7 @@ impl<'a> Infer<'_, 'a> {
             let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else {
                 continue;
             };
-            if !self.is_callable_trait(of)
+            if !self.is_sync_callable_trait(of)
                 && let Ok(args) = self.bound_args(of, &sig.body, path, ret)
             {
                 found.push((of, std::iter::once(ret).chain(args).collect()));
@@ -281,7 +283,7 @@ impl<'a> Infer<'_, 'a> {
             let Some((of, path)) = self.bound_trait_at(&sig.body, bound, self.home) else {
                 continue;
             };
-            if !self.is_callable_trait(of) {
+            if !self.is_sync_callable_trait(of) {
                 for (name, ty) in self.path_bindings(&sig.body, path)? {
                     found.push((of, name, ty));
                 }
@@ -290,7 +292,8 @@ impl<'a> Infer<'_, 'a> {
         Ok(found)
     }
 
-    pub(super) fn fn_bound(&mut self, arena: &Body, home: ModRef, bound: u32) -> Result<Option<Ty>> {
+    /// The callable trait and `FnPtr` signature that `bound` in `arena` spells from `home`.
+    pub(super) fn callable_bound(&mut self, arena: &Body, home: ModRef, bound: u32) -> Result<Option<(ItemRef, Ty)>> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
             return Ok(None);
         };
@@ -308,7 +311,7 @@ impl<'a> Infer<'_, 'a> {
             },
             _ => return Ok(None),
         };
-        Ok(Some(self.cx.types.fn_ptr(&inputs, output)))
+        Ok(Some((of, self.cx.types.fn_ptr(&inputs, output))))
     }
 
     /// The inputs and output that the angle form `FnOnce<(A, B), Output = R>` of callable trait `of` names, once its argument tuple is known.

@@ -41,7 +41,7 @@ impl Infer<'_, '_> {
         let target = self.lower_ty(self.body, ty)?;
         let hint = matches!(self.cx.types.kind(self.resolve(target)), Kind::FnPtr(..)).then_some(target);
         let found = self.expr(inner, hint)?;
-        self.note_cast_pointee(found, target);
+        self.note_cast_pointee(inner, found, target);
         let address = matches!(self.cx.types.kind(self.resolve(target)), Kind::Ptr(..) | Kind::Prim(Primitive::Usize | Primitive::Isize));
         let coercion = match self.cx.types.kind(self.resolve(found)).clone() {
             Kind::FnDef(item, substs) if address => Some(super::coerce::Coercion::Reify(Res::Fn(item, substs))),
@@ -53,24 +53,12 @@ impl Infer<'_, '_> {
         Ok(target)
     }
 
-    /// Notes a cast to `*const _` or `*mut _` from the reference or pointer `found`, whose open pointee takes the pointee of `found` when nothing else fixes it, as the coercion to a raw pointer gives it.
-    fn note_cast_pointee(&mut self, found: Ty, target: Ty) {
+    /// Notes a cast to a raw pointer whose pointee has unresolved inference variables.
+    fn note_cast_pointee(&mut self, inner: ExprId, found: Ty, target: Ty) {
         let Kind::Ptr(_, open) = *self.cx.types.kind(self.resolve(target)) else { return };
-        if let Kind::Var(_) = self.cx.types.kind(self.resolve(open))
-            && let Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) = *self.cx.types.kind(self.resolve(found))
-        {
-            self.casts.push((open, pointee));
+        if self.has_vars(open) {
+            self.casts.push((inner, found, target));
         }
-    }
-
-    /// Gives each cast pointee that is still open the pointee of the value cast.
-    pub(super) fn settle_casts(&mut self) -> Result<()> {
-        for (open, pointee) in std::mem::take(&mut self.casts) {
-            if matches!(self.cx.types.kind(self.resolve(open)), Kind::Var(_)) {
-                self.unify(open, pointee)?;
-            }
-        }
-        Ok(())
     }
 
     fn tuple(&mut self, list: List, expected: Option<Ty>) -> Result<Ty> {

@@ -19,14 +19,11 @@ impl Infer<'_, '_> {
         let Kind::Tuple(params) = *self.cx.types.kind(self.resolve(tuple)) else { bail!("a callable trait object whose arguments are not a tuple") };
         let params = self.cx.types.substs(params).to_vec();
         self.infer_call_args(args, &params, None)?;
-        let name = match self.cx.lang(of) {
-            Some("fn") => "call",
-            Some("fn_mut") => "call_mut",
-            _ => {
-                self.free_box(expr, found)?;
-                "call_once"
-            }
-        };
+        let lang = self.cx.lang(of);
+        let name = super::callable::callable_method_name(lang);
+        if matches!(name, "call_once" | "async_call_once") {
+            self.free_box(expr, found)?;
+        }
         let Some(method) = self.cx.trait_member(of, name) else { bail!("`{}` has no `{name}`", self.cx.name(of)) };
         self.out.res.insert(expr, Res::fn_of(&self.cx.types, method, &[ty, tuple]));
         Ok(ret)
@@ -68,7 +65,7 @@ impl Infer<'_, '_> {
     fn step_target_call(&mut self, step: (ExprId, Ty, u32), ty: Ty, args: List) -> Result<Option<Ty>> {
         match self.cx.types.kind(ty).clone() {
             Kind::Dyn(of, ..) if self.is_callable_trait(of) => {
-                self.record_call_steps(step, self.cx.lang(of) == Some("fn_mut"))?;
+                self.record_call_steps(step, matches!(self.cx.lang(of), Some("fn_mut" | "async_fn_mut")))?;
                 self.object_call((step.0, step.1), ty, args).map(Some)
             }
             Kind::Closure(..) => {
@@ -126,9 +123,9 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    /// `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once`, the first that an impl gives `ty` at the argument tuple `tuple`.
+    /// `Fn::call`, `FnMut::call_mut`, `FnOnce::call_once`, or their `AsyncFn*` counterparts, the first that an impl gives `ty` at the argument tuple `tuple`.
     pub(in crate::sema) fn callable_impl(&mut self, ty: Ty, tuple: Ty) -> Result<Option<ItemRef>> {
-        for (lang, name) in [("fn", "call"), ("fn_mut", "call_mut"), ("fn_once", "call_once")] {
+        for (lang, name) in super::callable::CALLABLE_METHODS {
             let Some(of) = self.cx.lang_item(lang) else {
                 continue;
             };

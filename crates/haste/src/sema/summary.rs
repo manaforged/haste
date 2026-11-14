@@ -678,7 +678,7 @@ fn concrete_holds(infer: &mut Infer<'_, '_>, of: ItemRef, self_ty: Ty, args: &[T
         return Ok(true);
     }
     if infer.is_callable_trait(of) && matches!(infer.cx.types.kind(self_ty), Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
-        return Ok(true);
+        return infer.check_callable_obligation(of, self_ty, args);
     }
     Ok(infer.select(of, self_ty, args)?.is_some())
 }
@@ -710,11 +710,10 @@ fn resolve_call_override(infer: &mut Infer<'_, '_>, expr: ExprId, found: Ty, tup
 
 fn resolve_dyn_call(infer: &mut Infer<'_, '_>, (expr, found, ty): (ExprId, Ty, Ty), (of, parts, members): (ItemRef, Substs, &[ItemRef]), autoderefs: Option<u32>) -> Result<CallOverride> {
     let dyn_tuple = *object_parts(infer.cx.types.substs(parts), members).0.first().ok_or_else(|| anyhow::anyhow!("callable trait object without tuple"))?;
-    let (name, box_free) = match infer.cx.lang(of) {
-        Some("fn") => ("call", None),
-        Some("fn_mut") => ("call_mut", None),
-        _ => ("call_once", Some(resolve_box_free(infer, found, autoderefs)?)),
-    };
+    let name = super::infer::callable_method_name(infer.cx.lang(of));
+    let box_free = matches!(name, "call_once" | "async_call_once")
+        .then(|| resolve_box_free(infer, found, autoderefs))
+        .transpose()?;
     let Some(method) = infer.cx.trait_member(of, name) else { bail!("missing `{name}`") };
     let res = Some(Res::fn_of(&infer.cx.types, method, &[ty, dyn_tuple]));
     Ok(CallOverride { expr, res, autoderefs, overloaded: false, box_free })

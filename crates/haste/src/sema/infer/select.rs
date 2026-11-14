@@ -24,9 +24,6 @@ pub(super) struct Vars {
     obligations: Vec<(ItemRef, Vec<Ty>)>,
 }
 
-/// The traits that closures, function items and function pointers implement by the compiler, with no impl to select.
-pub(super) const CALLABLE: [&str; 3] = ["fn", "fn_mut", "fn_once"];
-
 const BUILTIN: [&str; 12] = ["sized", "meta_sized", "pointee_sized", "copy", "clone", "destruct", "tuple_trait", "freeze", "pointee_trait", "unsize", "sync", "unpin"];
 
 /// The sizedness traits weaker than `Sized`, whose bound on a parameter drops its implicit `Sized` bound.
@@ -449,10 +446,7 @@ impl<'a> Infer<'_, 'a> {
             return self.assoc_bounds_hold((arena, home, path), (of, ty, &args), depth);
         }
         if self.is_callable_trait(of) && matches!(kind, Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
-            let Some(sig) = self.fn_bound(arena, home, bound)? else {
-                return Ok(true);
-            };
-            return Ok(self.tie_callable(ty, sig).is_ok());
+            return self.callable_bound_holds((arena, home, bound), (of, path, ty), depth);
         }
         if self.poly.is_some()
             && let Some(held) = self.poly_bound_check((arena, home, bound), (of, path, ty), depth)?
@@ -637,7 +631,9 @@ impl<'a> Infer<'_, 'a> {
     pub(in crate::sema) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
         let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
         let given = super::super::ty::object_parts(self.cx.types.substs(parts), &members).0.to_vec();
-        if object != of && self.is_callable_trait(object) && self.is_callable_trait(of) {
+        let same_family = (self.is_sync_callable_trait(object) && self.is_sync_callable_trait(of))
+            || (self.is_async_callable_trait(object) && self.is_async_callable_trait(of));
+        if object != of && same_family {
             if !self.implied_traits(vec![object]).is_ok_and(|traits| traits.contains(&of)) || given.len() != args.len() {
                 return Some(false);
             }
@@ -722,11 +718,6 @@ impl<'a> Infer<'_, 'a> {
         }
         seen.push(ty);
         self.parts(ty).into_iter().all(|part| self.unpin_holds(of, part, seen))
-    }
-
-    /// Whether trait `of` is `Fn`, `FnMut` or `FnOnce`, which callables implement with no impl to select.
-    pub(in crate::sema) fn is_callable_trait(&self, of: ItemRef) -> bool {
-        self.cx.lang(of).is_some_and(|lang| CALLABLE.contains(&lang))
     }
 
     /// The trait that bound `bound` in `arena` requires from module `home`, with its path, or none for a lifetime, a `?Sized` or a name that is not a trait.

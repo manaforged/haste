@@ -407,8 +407,8 @@ impl Infer<'_, '_> {
             };
             return self.object_super_alias(of, ty, (*principal, trait_args), name);
         }
-        if self.cx.lang(of) == Some("fn_once") && name == "Output" {
-            return Ok(self.callable_sig(ty)?.map(|(_, ret)| ret));
+        if let Some(found) = self.callable_assoc_alias(of, ty, name)? {
+            return Ok(Some(found));
         }
         if self.cx.lang(of) == Some("future_trait")
             && name == "Output"

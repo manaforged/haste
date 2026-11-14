@@ -147,7 +147,31 @@ impl Infer<'_, '_> {
         self.settle_awaits()?;
         self.settle_operators(false)?;
         self.settle_obligations()?;
-        self.settle_casts()
+        self.settle_casts(false)
+    }
+
+    /// Gives each cast pointee that still has unresolved variables the pointee of the value cast, or records a widening coercion when the target unsizes it.
+    fn settle_casts(&mut self, final_pass: bool) -> Result<()> {
+        for (inner, found, target) in std::mem::take(&mut self.casts) {
+            let Kind::Ptr(_, open) = *self.cx.types.kind(self.resolve(target)) else { continue };
+            if !self.has_vars(open) {
+                continue;
+            }
+            match *self.cx.types.kind(self.resolve(found)) {
+                Kind::Var(_) if !final_pass => self.casts.push((inner, found, target)),
+                Kind::Ref(_, pointee) | Kind::Ptr(_, pointee) => {
+                    if matches!(self.cx.types.kind(self.resolve(open)), Kind::Var(_)) || self.probe(|infer| infer.unifies(open, pointee)) {
+                        self.unify(open, pointee)?;
+                    } else if !self.out.coercions.contains_key(&inner)
+                        && let Some(coercion) = self.coercion(found, target)?
+                    {
+                        self.out.coercions.insert(inner, coercion);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn settle_final_passes(&mut self) -> Result<()> {
@@ -167,6 +191,7 @@ impl Infer<'_, '_> {
                 break;
             }
         }
+        self.settle_casts(true)?;
         self.settle_captures()
     }
 
@@ -431,22 +456,7 @@ impl Infer<'_, '_> {
     }
 
     fn callable_obligation_holds(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<bool> {
-        if !self.is_callable_trait(of) {
-            return Ok(false);
-        }
-        if !matches!(self.cx.types.kind(self.resolve(self_ty)), Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..)) {
-            return Ok(false);
-        }
-        let Some((params, _)) = self.callable_sig(self_ty)? else { return Ok(false) };
-        let expected = self.cx.types.tuple(&params);
-        let Some(&actual) = args.first() else { return Ok(false) };
-        let mark = self.mark_vars();
-        if self.unifies(expected, actual) {
-            self.commit_vars(mark);
-            return Ok(true);
-        }
-        self.rollback_vars(mark);
-        Ok(false)
+        self.check_callable_obligation(of, self_ty, args)
     }
 
     fn fall_back_diverging(&mut self) -> Result<()> {

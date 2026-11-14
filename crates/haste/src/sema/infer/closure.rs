@@ -416,7 +416,12 @@ impl<'a> Infer<'_, 'a> {
                 };
                 let Kind::Tuple(inputs) = *self.cx.types.kind(self.resolve(first)) else { return None };
                 let inputs = self.cx.types.substs(inputs).to_vec();
-                Some((inputs, output.unwrap_or_else(|| self.cx.types.unit())))
+                let output = if self.is_async_callable_trait(of) {
+                    self.fresh(Kind::Var)
+                } else {
+                    output.unwrap_or_else(|| self.cx.types.unit())
+                };
+                Some((inputs, output))
             }
             _ => None,
         }
@@ -439,7 +444,7 @@ impl<'a> Infer<'_, 'a> {
         self.release_if_fits(held, found, param)?;
         self.coerce_arg((arg, found, closure), param, expectation)?;
         match bound {
-            Some(bound) => self.tie_callable(callable, bound),
+            Some((of, bound)) => self.tie_callable_bound(of, callable, bound),
             None => Ok(()),
         }
     }
@@ -478,27 +483,6 @@ impl<'a> Infer<'_, 'a> {
     pub(super) fn coerces_to(&mut self, found: Ty, wanted: Ty) -> bool {
         let shared = self.weakened(found, wanted);
         self.probe(|infer| matches!(infer.coercion(found, wanted), Ok(Some(_))) || shared.is_some_and(|(a, b)| infer.unifies(a, b)))
-    }
-
-    /// Unifies the signature of the callable `ty`, a closure, function item or function pointer, with `bound`, the function pointer type that an `Fn(A) -> B` bound on it spells.
-    pub(super) fn tie_callable(&mut self, ty: Ty, bound: Ty) -> Result<()> {
-        let Kind::FnPtr(inputs, output) = *self.cx.types.kind(bound) else { return Ok(()) };
-        let inputs = self.cx.types.substs(inputs).to_vec();
-        let Some((params, ret)) = self.callable_sig(ty)? else { return self.tie_output(ty, inputs, output) };
-        if params.len() != inputs.len() {
-            bail!("a callable of {} arguments where its bound takes {}", params.len(), inputs.len());
-        }
-        params.into_iter().zip(inputs).try_for_each(|(param, input)| self.unify(param, input))?;
-        self.unify(ret, output)
-    }
-
-    /// Unifies `output` with the `FnOnce::Output` at `inputs` of `ty`, a known type that is callable through its own `Fn` impls.
-    fn tie_output(&mut self, ty: Ty, inputs: Vec<Ty>, output: Ty) -> Result<()> {
-        let once = self.cx.lang_item("fn_once");
-        let (Some(once), false) = (once, matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_))) else { return Ok(()) };
-        let tuple = self.cx.types.tuple(&inputs);
-        let found = self.project(once, ty, vec![tuple], "Output")?;
-        self.unify(found, output)
     }
 
     /// The parameters and return type of the closure, function item or function pointer `ty`, or the one a reference to it calls.
@@ -542,7 +526,7 @@ impl<'a> Infer<'_, 'a> {
     fn closure_hint(&mut self, callee: (ItemRef, &[Ty]), arg: ExprId, param: Ty) -> Result<Option<Ty>> {
         let arg = self.wrapped(arg);
         match *self.body.expr(arg) {
-            Expr::Closure { .. } => self.callable_hint(callee, param),
+            Expr::Closure { .. } => Ok(self.callable_hint(callee, param)?.map(|(of, sig)| self.closure_hint_sig(of, sig))),
             Expr::Ref { raw: false, expr: inner, .. } => {
                 let Kind::Ref(mutability, pointee) = *self.cx.types.kind(self.resolve(param)) else {
                     return Ok(None);
@@ -554,7 +538,7 @@ impl<'a> Infer<'_, 'a> {
         }
     }
 
-    fn callable_hint(&mut self, (item, substs): (ItemRef, &[Ty]), param: Ty) -> Result<Option<Ty>> {
+    fn callable_hint(&mut self, (item, substs): (ItemRef, &[Ty]), param: Ty) -> Result<Option<(ItemRef, Ty)>> {
         let param = self.resolve(param);
         if !matches!(self.cx.types.kind(param), Kind::Var(_)) {
             return Ok(None);
@@ -571,14 +555,14 @@ impl<'a> Infer<'_, 'a> {
         let own: Vec<_> = super::scope::type_params(&sig.generics).collect();
         let (home, name) = (frame.home, frame.generics[at].0);
         let Some(index) = at.checked_sub(frame.generics.len() - own.len()) else {
-            return self.with_frame(frame, |infer| infer.header_fn_bound(name, home));
+            return self.with_frame(frame, |infer| infer.header_callable_bound(name, home));
         };
         let bounds = super::scope::generic_bounds(&sig.body, src, &sig.predicates, own[index]);
-        self.first_fn_bound(frame, &sig.body, bounds)
+        self.first_callable_bound(frame, &sig.body, bounds)
     }
 
-    /// The function pointer type that an `Fn` bound declared on the struct, enum or union `item` spells for its type parameter that `param` fills in `args`.
-    fn field_hint(&mut self, (item, args): (ItemRef, &[Ty]), param: Ty) -> Result<Option<Ty>> {
+    /// The callable trait and function pointer type that a callable bound declared on the struct, enum or union `item` spells for its type parameter that `param` fills in `args`.
+    fn field_hint(&mut self, (item, args): (ItemRef, &[Ty]), param: Ty) -> Result<Option<(ItemRef, Ty)>> {
         let def = self.cx.adt_def(item)?;
         let Some(at) = args.iter().position(|&arg| self.resolve(arg) == param) else {
             return Ok(None);
@@ -591,15 +575,15 @@ impl<'a> Infer<'_, 'a> {
             return Ok(None);
         }
         let frame = self.adt_frame(item, &def.generics.params, args)?;
-        self.first_fn_bound(frame, &def.body, bounds)
+        self.first_callable_bound(frame, &def.body, bounds)
     }
 }
 
-/// Whether `item` is `Fn::call` or `FnMut::call_mut`, and how each takes the closure.
+/// Whether `item` is `Fn::call`, `AsyncFn::async_call`, `FnMut::call_mut` or `AsyncFnMut::async_call_mut`, and how each takes the closure.
 pub fn by_reference(cx: &Context<'_>, item: ItemRef) -> Option<Mut> {
     match cx.owner_trait(item).and_then(|of| cx.lang(of)) {
-        Some("fn") => Some(Mut::Not),
-        Some("fn_mut") => Some(Mut::Mut),
+        Some("fn" | "async_fn") => Some(Mut::Not),
+        Some("fn_mut" | "async_fn_mut") => Some(Mut::Mut),
         _ => None,
     }
 }

@@ -367,7 +367,10 @@ impl<'a> Infer<'_, 'a> {
         if use_bounds && (candidate.bound.is_some() || !args.is_empty()) {
             self.assume(candidate.of, &std::iter::once(self_ty).chain(args.iter().copied()).collect::<Vec<_>>())?;
         }
-        if self.compiler_impl(candidate.of, self_ty) || self.object_holds(candidate.of, self_ty, &args) == Some(true) {
+        if self.compiler_impl(candidate.of, self_ty)
+            || self.object_holds(candidate.of, self_ty, &args) == Some(true)
+            || self.check_callable_obligation(candidate.of, self_ty, &args)?
+        {
             return Ok(Some((candidate.item, std::iter::once(self_ty).chain(args).collect())));
         }
         if candidate.kind == SelfKind::Value && matches!(self.cx.types.kind(self_ty), Kind::Dyn(..)) {

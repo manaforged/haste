@@ -3,6 +3,7 @@ mod array;
 mod assign;
 mod assoc;
 mod call;
+mod callable;
 mod clone;
 mod closure;
 mod coerce;
@@ -28,6 +29,7 @@ mod tables;
 mod zonk;
 
 pub use adt::{Fields, field_types, maybe_unsized};
+pub(in crate::sema) use callable::callable_method_name;
 pub(in crate::sema) use adt::{body_relaxes_sized, param_relaxes_sized};
 pub use clone::cloned_tuple;
 pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, register};
@@ -118,7 +120,7 @@ pub struct Infer<'c, 'a> {
     projections: Vec<project::Projection>,
     opaques: Vec<opaque::Opaque>,
     operands: Vec<(ExprId, crate::body::BinOp, (Ty, Ty), Ty)>,
-    casts: Vec<(Ty, Ty)>,
+    casts: Vec<(ExprId, Ty, Ty)>,
     param_origins: Vec<(u32, &'a str)>,
     receiver_param: Option<&'a str>,
     try_blocks: Vec<(ExprId, Ty)>,
@@ -235,10 +237,14 @@ pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs)
     if cx.lang(item) == Some("poll") && cx.ensure_closure(ty).is_some_and(|info| info.closure.coroutine) {
         return closure::coroutine_typed(cx, item, ty).map(Some);
     }
-    let (once, by_ref) = (cx.call_once() == Some(item), closure::by_reference(cx, item).is_some());
+    let (once, by_ref, async_once) = (
+        cx.call_once() == Some(item),
+        closure::by_reference(cx, item).is_some(),
+        callable::is_async_call_once(cx, item),
+    );
     match cx.types.kind(ty) {
         Kind::Closure(..) if once => closure::closure_typed(cx, ty).map(Some),
-        Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) if once || by_ref => closure::untuple_typed(cx, item, substs).map(Some),
+        Kind::Closure(..) | Kind::FnDef(..) | Kind::FnPtr(..) if once || by_ref || async_once => closure::untuple_typed(cx, item, substs).map(Some),
         _ => Ok(None),
     }
 }
