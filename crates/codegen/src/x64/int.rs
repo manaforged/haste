@@ -195,7 +195,7 @@ impl Emit<'_> {
             let size = if ty == Type::I32 { Size::D } else { Size::Q };
             let is_shrd = self.reg_of(lo) == Some(dst);
             let src = if is_shrd { hi } else { lo };
-            let src_reg = self.reg_of(src).or_else(|| self.cached_spill(src)).filter(|&reg| reg != dst).unwrap_or_else(|| {
+            let src_reg = self.reg_of(src).or_else(|| self.cached_beside(src, hi)).filter(|&reg| reg != dst).unwrap_or_else(|| {
                 self.raw(Reg::R11, src);
                 Reg::R11
             });
@@ -530,7 +530,7 @@ impl Emit<'_> {
     }
 
     fn vex_gpr(&mut self, vvvv: Value, rm_val: Value, dst: Reg, emit: impl FnOnce(&mut Asm, Reg, Rm)) {
-        if let Some(reg) = self.reg_of(vvvv).or_else(|| self.cached_spill(vvvv)) {
+        if let Some(reg) = self.reg_of(vvvv).or_else(|| self.cached_beside(vvvv, rm_val)) {
             let source = self.operand(rm_val);
             emit(&mut self.asm, reg, source);
         } else if self.has_elided_mem(rm_val) {
@@ -546,6 +546,11 @@ impl Emit<'_> {
             let source = self.operand(rm_val);
             emit(&mut self.asm, Reg::R11, source);
         }
+    }
+
+    /// The cached spill register of `value` when it survives reading `other`: not the rcx or r11 scratch an elided load of `other` builds its address in.
+    fn cached_beside(&self, value: Value, other: Value) -> Option<Reg> {
+        self.cached_spill(value).filter(|&reg| !(self.has_elided_mem(other) && matches!(reg, Reg::Rcx | Reg::R11)))
     }
 
     pub(super) fn elided_band_cmp(&self, x: Value, y: Value) -> Option<(Value, Value)> {
@@ -591,10 +596,10 @@ impl Emit<'_> {
             }
             return;
         }
-        if let Some(ry) = self.reg_of(y).or_else(|| self.cached_spill(y)) {
+        if let Some(ry) = self.reg_of(y).or_else(|| self.cached_beside(y, x)) {
             let sx = self.operand(x);
             self.asm.test_sized(size, sx, ry);
-        } else if let Some(rx) = self.reg_of(x).or_else(|| self.cached_spill(x)) {
+        } else if let Some(rx) = self.reg_of(x).or_else(|| self.cached_beside(x, y)) {
             let sy = self.operand(y);
             self.asm.test_sized(size, sy, rx);
         } else {
@@ -616,7 +621,7 @@ impl Emit<'_> {
             self.asm.alu_imm_sized(size, Alu::Cmp, rm, imm);
             return;
         }
-        let left = self.reg_of(x).or_else(|| self.cached_spill(x)).unwrap_or_else(|| {
+        let left = self.reg_of(x).or_else(|| y.map_or_else(|| self.cached_spill(x), |yv| self.cached_beside(x, yv))).unwrap_or_else(|| {
             self.raw(Reg::Rax, x);
             Reg::Rax
         });
