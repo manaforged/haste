@@ -29,7 +29,7 @@ impl SysrootIndex {
     pub fn build(outline: &Outline, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Self {
         let mut items = HashMap::default();
         for (krate, tree) in outline.crates.iter().enumerate() {
-            if !tree.env.release || !tree.env.fixed {
+            if !tree.env.fixed {
                 continue;
             }
             for (file_idx, file) in tree.files.iter().enumerate() {

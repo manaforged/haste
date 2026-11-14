@@ -77,10 +77,11 @@ impl Lower<'_, '_> {
                 };
                 Ok(Some(self.store_vec(out, vec_ty.bytes())))
             }
-            (Simd::Fma, &[a, b, c]) if matches!(vec_ty, Type::Vec { lane: Lane::F32, count: 2 | 4 } | Type::Vec { lane: Lane::F64, count: 2 }) => {
-                let (va, vb, vc) = (self.ins().load(vec_ty, a, 0), self.ins().load(vec_ty, b, 0), self.ins().load(vec_ty, c, 0));
+            (Simd::Fma, &[a, b, c]) if matches!(vec_ty, Type::Vec { lane: Lane::F32, count: 2 | 4 } | Type::Vec { lane: Lane::F64, count: 1 | 2 }) => {
+                let op_ty = if vec_ty == (Type::Vec { lane: Lane::F64, count: 1 }) { Type::F64 } else { vec_ty };
+                let (va, vb, vc) = (self.ins().load(op_ty, a, 0), self.ins().load(op_ty, b, 0), self.ins().load(op_ty, c, 0));
                 let out = self.ins().fma(va, vb, vc);
-                Ok(Some(self.store_vec(out, vec_ty.bytes())))
+                Ok(Some(self.store_vec(out, op_ty.bytes())))
             }
             (Simd::Sum { mul }, &[x, ref start @ ..]) => {
                 let v = self.ins().load(vec_ty, x, 0);

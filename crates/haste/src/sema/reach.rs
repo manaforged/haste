@@ -174,7 +174,7 @@ fn collect_link_callees(typed: &Typed, index: &HashMap<Instance, usize>) -> Vec<
     out
 }
 
-fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
+pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
     for r in &typed.drops {
         if let Res::Fn(item, substs) = *r { push((item, substs)); }
     }

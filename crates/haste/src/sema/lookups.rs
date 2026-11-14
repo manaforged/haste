@@ -133,7 +133,7 @@ impl Lookups {
                 fields: std::mem::take(&mut self.fields),
                 forms: self.forms.retained(|_, found| found.is_some()),
                 futures: std::mem::take(&mut self.futures),
-                scope_traits: self.scope_traits.retained(|home, _| outline.is_sysroot(home.krate)),
+                scope_traits: self.scope_traits.retained(|home, _| outline.is_fixed(home.krate)),
                 impl_traits: std::mem::take(&mut self.impl_traits),
                 selections,
                 projections,
@@ -152,12 +152,16 @@ impl Lookups {
             return;
         }
         let same_len = guard.len() == loaded.len();
-        let reset_sysroot = !same_len
-            || guard
-                .iter()
-                .zip(&loaded)
-                .enumerate()
-                .any(|(k, (a, b))| a != b && outline.is_sysroot(k as u32));
+        let extent_changed = |pred: fn(&Outline, u32) -> bool| {
+            !same_len
+                || guard
+                    .iter()
+                    .zip(&loaded)
+                    .enumerate()
+                    .any(|(k, (a, b))| a != b && pred(outline, k as u32))
+        };
+        let reset_sysroot = extent_changed(Outline::is_sysroot);
+        let reset_fixed = reset_sysroot || extent_changed(Outline::is_fixed);
         if same_len {
             self.modules.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
             self.owners.retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
@@ -183,6 +187,8 @@ impl Lookups {
         if reset_sysroot {
             *write_lock(&self.state.langs) = None;
             *write_lock(&self.state.primitives) = None;
+        }
+        if reset_fixed {
             self.sysroot_index = Arc::new(std::sync::OnceLock::new());
         }
         self.trait_calls.clear();
@@ -215,17 +221,21 @@ impl Cache {
         self.lookups.substrate.as_ref()
     }
 
-    /// Encodes all settled sysroot `PolySummary` and concrete sysroot instance entries into `builder`.
-    pub fn export_sysroot_summaries(&self, outline: &Outline, builder: &mut crate::substrate::SubstrateBuilder) -> Result<()> {
+    /// Encodes all settled fixed `PolySummary` and concrete instance entries into `toolchain` and `deps` builders.
+    pub fn export_sysroot_summaries(
+        &self,
+        outline: &Outline,
+        mut toolchain: Option<&mut crate::substrate::SubstrateBuilder>,
+        mut deps: Option<&mut crate::substrate::SubstrateBuilder>,
+    ) -> Result<()> {
         let mut err = None;
         self.lookups.summaries.for_each_ready(|&item, kind| {
-            if err.is_some() {
+            if err.is_some() || !outline.is_fixed(item.krate) {
                 return;
             }
-            if !outline.is_sysroot(item.krate) {
-                return;
-            }
-            if let summary::SummaryKind::Poly(summary) = kind
+            let target_builder = if outline.is_sysroot(item.krate) { toolchain.as_deref_mut() } else { deps.as_deref_mut() };
+            if let Some(builder) = target_builder
+                && let summary::SummaryKind::Poly(summary) = kind
                 && let Some(key) = crate::substrate::sysroot_item_key(outline, item)
                 && let Ok(Some(bytes)) = summary::codec::encode_summary(outline, &self.types, summary, crate::substrate::sysroot_item_key)
                 && let Err(e) = builder.add_summary(key, &bytes)
@@ -236,7 +246,7 @@ impl Cache {
         if let Some(e) = err {
             return Err(e);
         }
-        summary::frozen::export_sysroot_instances(outline, &self.types, &self.finals, builder)
+        summary::frozen::export_sysroot_instances(outline, &self.types, &self.finals, toolchain, deps)
     }
 
     /// Drops the cached lookups, which no longer hold once the outline loads more files or resolves more names.

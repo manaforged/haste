@@ -49,7 +49,7 @@ pub(super) enum InstOutcome {
 }
 
 pub(super) fn instantiate_pure(types: &Types, args: Substs, summary: &Arc<PolySummary>, check_only: bool) -> InstOutcome {
-    let mut inst = PolyInst {
+    let inst = PolyInst {
         args,
         summary: Arc::clone(summary),
         projs: Box::new([]),
@@ -59,22 +59,16 @@ pub(super) fn instantiate_pure(types: &Types, args: Substs, summary: &Arc<PolySu
         offset_overrides: Box::new([]),
         materialized: OnceLock::new(),
     };
-    if !summary.direct_calls.is_empty() {
+    let resolved_calls = if summary.direct_calls.is_empty() {
+        Box::new([])
+    } else {
         let mut resolved: Vec<_> = summary.direct_calls.iter().map(|&(key, item, substs)| (key, item, inst.sub_substs(types, substs))).collect();
         if !check_only {
             resolved.sort_unstable_by_key(|&(key, ..)| key);
         }
-        inst.resolved_calls = resolved.into_boxed_slice();
-    }
-    let ret = summary.ret.map(|ty| inst.sub_ty(types, ty));
-    let layouts = summary.layout_tys.iter().map(|&ty| inst.sub_ty(types, ty)).collect();
-    let drop_tys = summary.drop_tys.iter().map(|&ty| inst.sub_ty(types, ty)).collect();
-    if check_only {
-        InstOutcome::CheckOnly(PolyCheck { summary: inst.summary, resolved_calls: inst.resolved_calls }, ret, layouts, drop_tys)
-    } else {
-        let locals = summary.locals.iter().map(|local| Local { ty: inst.sub_ty(types, local.ty) }).collect();
-        InstOutcome::Full(inst, locals, ret, layouts, drop_tys)
-    }
+        resolved.into_boxed_slice()
+    };
+    inst.into_outcome(types, resolved_calls, check_only)
 }
 
 /// Generic parameter and projection substitution policy for [`fold_ty`] and [`fold_substs`].
@@ -184,6 +178,21 @@ impl PolyInst {
     /// Materializes concrete body tables without pinning them in `OnceLock` unless already cached.
     pub fn ephemeral_tables(&self, types: &Types) -> Option<Arc<BodyTables>> {
         self.materialized.get().is_none().then(|| Arc::new(self.materialize(types)))
+    }
+
+    /// Finalizes `self` with `resolved_calls` into a check-only or full instantiation outcome.
+    pub(super) fn into_outcome(mut self, types: &Types, resolved_calls: Box<[(SiteKey, ItemRef, Substs)]>, check_only: bool) -> InstOutcome {
+        let summary = &self.summary;
+        let ret = summary.ret.map(|ty| self.sub_ty(types, ty));
+        let layouts = summary.layout_tys.iter().map(|&ty| self.sub_ty(types, ty)).collect();
+        let drop_tys = summary.drop_tys.iter().map(|&ty| self.sub_ty(types, ty)).collect();
+        if check_only {
+            InstOutcome::CheckOnly(PolyCheck { summary: self.summary, resolved_calls }, ret, layouts, drop_tys)
+        } else {
+            self.resolved_calls = resolved_calls;
+            let locals = summary.locals.iter().map(|local| Local { ty: self.sub_ty(types, local.ty) }).collect();
+            InstOutcome::Full(self, locals, ret, layouts, drop_tys)
+        }
     }
 
     /// Iterates every concrete and resolved call edge without materializing `BodyTables`.

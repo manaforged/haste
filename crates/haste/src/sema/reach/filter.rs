@@ -7,7 +7,7 @@ use crate::names::{ItemRef, Primitive};
 
 use super::super::Context;
 use super::super::impls::head;
-use super::super::infer::{LazyTables, Res, Shape, Typed, body_relaxes_sized, maybe_unsized, param_relaxes_sized, type_params};
+use super::super::infer::{LazyTables, Typed, body_relaxes_sized, maybe_unsized, param_relaxes_sized, type_params};
 use super::super::intrinsic::Intrinsic;
 use super::super::substs::Substs;
 use super::super::summary::{ConstHole, PolyObligation, PolySummary, poly_summary};
@@ -412,19 +412,7 @@ fn push_poly_callees(
     } else {
         for (item, substs) in dynamic { push(item, substs); }
     }
-    for r in &typed.drops {
-        if let Res::Fn(item, substs) = *r { push(item, substs); }
-    }
-    match &typed.shape {
-        Shape::Glue(g) => for r in g.drop.iter().chain(&g.parts).chain(&g.resume) {
-            if let Res::Fn(item, substs) = *r { push(item, substs); }
-        },
-        Shape::Untuple(r) => if let Res::Fn(item, substs) = *r { push(item, substs); },
-        Shape::Clone(calls) => for r in calls {
-            if let Res::Fn(item, substs) = *r { push(item, substs); }
-        },
-        _ => {}
-    }
+    super::push_tail_calls(typed, &mut |(item, substs)| push(item, substs));
 }
 
 pub(super) fn commit_filter_caller(cx: &Context<'_>, filter: &mut ReachFilter, caller: Instance, typed: &Result<Arc<Typed>, String>) {

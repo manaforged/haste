@@ -4,13 +4,14 @@ use rustc_abi::{BackendLaneCount, BackendRepr, FieldsShape, Float, Primitive, Sc
 use rustc_index::Idx;
 
 use crate::sema::Context;
-use crate::sema::infer::field_types;
+use crate::sema::impls::Head;
+use crate::sema::infer::{Shape, Typed, field_types};
 use crate::sema::layout::{Layout, field_offset, target};
-use crate::sema::ty::{Kind, Ty};
+use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::adt::tag_type;
 use super::place::Place;
-use super::{Lower, Parts, Repr, repr};
+use super::{Lower, Parts, Repr, indirect, passed_parts, repr};
 
 /// The machine values that a value of one type travels as in the platform convention, each with its byte offset inside the value.
 type Passed = Vec<(Type, i32)>;
@@ -29,6 +30,189 @@ pub(crate) fn purpose_tag(purpose: ArgumentPurpose) -> (u8, Option<u32>) {
         ArgumentPurpose::StructArgument(n) => (2, Some(n)),
         ArgumentPurpose::Dict => (3, None),
         ArgumentPurpose::Variadic => (4, None),
+    }
+}
+
+/// The native signature of a reached function: memory values travel by address unless `passed_parts` splits them into up to four scalar registers, and a memory result returns in those registers or through a first `StructReturn` pointer.
+pub fn signature(cx: &mut Context<'_>, typed: &Typed) -> Result<Signature> {
+    let mut sig = signature_of(cx, typed.ret, typed.params.iter().map(|&local| typed.locals[local as usize].ty))?;
+    if matches!(&typed.shape, Shape::Closure(closure) if closure.closure.coroutine) {
+        let object = usize::from(indirect(&sig));
+        if let Some(cx_param) = sig.params.get_mut(object + 1) {
+            cx_param.deref_bytes = 0;
+            cx_param.noalias = false;
+            cx_param.readonly = false;
+        }
+    }
+    Ok(sig)
+}
+
+/// The native signature of a function that returns `ret` and takes `params`.
+pub fn signature_of(cx: &mut Context<'_>, ret: Option<Ty>, params: impl IntoIterator<Item = Ty>) -> Result<Signature> {
+    let mut signature = Signature::new(CallConv::Internal);
+    if let Some(ret) = ret {
+        match repr(cx, ret)? {
+            Repr::Scalar(ty) => signature.returns.push(AbiParam::new(ty)),
+            Repr::Mem { .. } => match passed_parts(cx, ret)? {
+                Some(parts) => signature.returns.extend(parts.scalars().map(|(machine, _)| AbiParam::new(machine))),
+                None => signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn).with_noalias()),
+            },
+            Repr::Zst => {}
+        }
+    }
+    for param in params {
+        match repr(cx, param)? {
+            Repr::Scalar(ty) => signature.params.push(apply_param_provenance(cx, AbiParam::new(ty), param, 0)),
+            Repr::Mem { size, .. } => match passed_parts(cx, param)? {
+                Some(parts) => signature.params.extend(parts.scalars().map(|(machine, off)| apply_param_provenance(cx, AbiParam::new(machine), param, off))),
+                None => signature.params.push(AbiParam::new(Type::I64).with_noalias().with_deref_bytes(size)),
+            },
+            Repr::Zst => {}
+        }
+    }
+    Ok(signature)
+}
+
+fn apply_param_provenance(cx: &mut Context<'_>, abi: AbiParam, param: Ty, offset: i32) -> AbiParam {
+    if abi.value_type != Type::I64 {
+        return abi;
+    }
+    let Some(core_ty) = field_ty_at_offset(cx, param, offset, 0) else {
+        return abi;
+    };
+    let exclusive_inner = cx.boxed(core_ty).or_else(|| match *cx.types.kind(core_ty) {
+        Kind::Ref(Mut::Mut, inner) => Some(inner),
+        _ => None,
+    });
+    if let Some(inner) = exclusive_inner {
+        let abi = if is_unpin_like(cx, inner, 0) { abi.with_noalias() } else { abi };
+        return match pointee_bytes(cx, inner) {
+            Some(bytes) => abi.with_deref_size(bytes),
+            None => abi,
+        };
+    }
+    let Kind::Ref(Mut::Not, inner) = *cx.types.kind(core_ty) else {
+        return abi;
+    };
+    if !is_freeze_ty(cx, inner, 0) {
+        return abi;
+    }
+    match pointee_bytes(cx, inner) {
+        Some(bytes) => abi.with_deref_bytes(bytes),
+        None => abi.with_readonly(),
+    }
+}
+
+fn field_ty_at_offset(cx: &mut Context<'_>, ty: Ty, off: i32, depth: u32) -> Option<Ty> {
+    if depth > 8 || off < 0 || ty == Ty::NONE || cx.types.has_params(ty) {
+        return None;
+    }
+    if off == 0 && (matches!(cx.types.kind(ty), Kind::Ref(..)) || cx.boxed(ty).is_some()) {
+        return Some(ty);
+    }
+    match cx.types.kind(ty).clone() {
+        Kind::Pat(inner, ..) => field_ty_at_offset(cx, inner, off, depth + 1),
+        Kind::Array(elem, _) => {
+            if cx.is_unsized(elem).unwrap_or(true) || cx.layout(ty).ok()?.align.bytes() < 8 {
+                return None;
+            }
+            let stride = i32::try_from(cx.layout(elem).ok()?.size.bytes()).ok().filter(|&s| s > 0)?;
+            field_ty_at_offset(cx, elem, off % stride, depth + 1)
+        }
+        Kind::Tuple(items) => {
+            let fields = cx.types.substs(items).to_vec();
+            find_field_at_offset(cx, ty, 0, &fields, off, depth)
+        }
+        Kind::Adt(item, args) => {
+            if cx.boxed(ty).is_some() || cx.types.substs_have_params(args) || cx.is_unsized(ty).unwrap_or(true) {
+                return None;
+            }
+            let layout = cx.layout(ty).ok()?;
+            let Variants::Single { index } = layout.variants else { return None };
+            let slice = cx.types.substs(args).to_vec();
+            let fields = field_types(cx, item, &slice).ok()?.get(index.index())?.clone();
+            find_field_at_offset(cx, ty, index.index() as u32, &fields, off, depth)
+        }
+        _ => None,
+    }
+}
+
+fn find_field_at_offset(cx: &mut Context<'_>, ty: Ty, variant: u32, fields: &[Ty], off: i32, depth: u32) -> Option<Ty> {
+    if cx.is_unsized(ty).unwrap_or(true) {
+        return None;
+    }
+    let layout = cx.layout(ty).ok()?;
+    if matches!(layout.fields, FieldsShape::Union(_)) || !matches!(layout.variants, Variants::Single { .. }) || layout.align.bytes() < 8 {
+        return None;
+    }
+    for (idx, &fty) in fields.iter().enumerate() {
+        let size = i32::try_from(cx.layout(fty).ok()?.size.bytes()).ok()?;
+        if size == 0 {
+            continue;
+        }
+        let f_off = field_offset(&layout, variant, idx as u32);
+        if f_off >= 0 && off >= f_off && off - f_off < size {
+            return field_ty_at_offset(cx, fty, off - f_off, depth + 1);
+        }
+    }
+    None
+}
+
+fn pointee_bytes(cx: &mut Context<'_>, ty: Ty) -> Option<u32> {
+    if !cx.is_unsized(ty).is_ok_and(|u| !u) {
+        return None;
+    }
+    let bytes = cx.layout(ty).ok()?.size.bytes();
+    u32::try_from(bytes).ok().filter(|&b| b > 0)
+}
+
+fn is_unpin_like(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
+    if depth > 8 || ty == Ty::NONE || cx.types.has_params(ty) {
+        return false;
+    }
+    match *cx.types.kind(ty) {
+        Kind::Closure(..) => cx.ensure_closure(ty).is_none_or(|info| !info.closure.coroutine),
+        Kind::Adt(item, args) => {
+            if cx.types.substs_have_params(args) || cx.lang(item) == Some("unsafe_pinned") {
+                return false;
+            }
+            if let Some(unpin) = cx.lang_item("unpin")
+                && cx.negative_impl(unpin, Head::Adt(item), &[item.krate, unpin.krate])
+            {
+                return false;
+            }
+            let slice = cx.types.substs(args).to_vec();
+            let Ok(variants) = field_types(cx, item, &slice) else {
+                return false;
+            };
+            variants.iter().flatten().all(|&field| is_unpin_like(cx, field, depth + 1))
+        }
+        Kind::Pat(inner, ..) | Kind::Array(inner, _) => is_unpin_like(cx, inner, depth + 1),
+        Kind::Tuple(items) => cx.types.substs(items).to_vec().into_iter().all(|t| is_unpin_like(cx, t, depth + 1)),
+        Kind::Param(_) | Kind::Proj(_) | Kind::Dyn(..) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
+        _ => true,
+    }
+}
+
+pub(crate) fn is_freeze_ty(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
+    if depth > 16 || ty == Ty::NONE || cx.types.has_params(ty) {
+        return false;
+    }
+    match *cx.types.kind(ty) {
+        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => true,
+        Kind::Pat(base, ..) | Kind::Array(base, _) | Kind::Slice(base) => is_freeze_ty(cx, base, depth + 1),
+        Kind::Tuple(substs) => cx.types.substs(substs).to_vec().into_iter().all(|t| is_freeze_ty(cx, t, depth + 1)),
+        Kind::Adt(item, substs) => {
+            if cx.types.substs_have_params(substs) || matches!(cx.lang(item), Some("unsafe_cell" | "unsafe_pinned")) {
+                return false;
+            }
+            let args = cx.types.substs(substs).to_vec();
+            let Ok(variants) = field_types(cx, item, &args) else {
+                return false;
+            };
+            variants.iter().flatten().all(|&field| is_freeze_ty(cx, field, depth + 1))
+        }
+        Kind::Closure(..) | Kind::Dyn(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
     }
 }
 
@@ -288,12 +472,17 @@ impl Lower<'_, '_> {
                 } else {
                     args.push(value);
                 }
-                signature.params.extend(parts.iter().map(|&(ty, _)| AbiParam::new(ty)));
+                signature.params.extend(parts.iter().map(|&(ty, off)| apply_param_provenance(self.cx, AbiParam::new(ty), param, off)));
             }
             NativePass::Indirect => {
                 let whole = repr(self.cx, param)?;
+                let size = match whole {
+                    Repr::Mem { size, .. } => size,
+                    _ => 0,
+                };
                 args.push(self.snapshot_repr(whole, value));
-                signature.params.push(AbiParam::new(Type::I64));
+                let abi = AbiParam::new(Type::I64).with_noalias();
+                signature.params.push(if size > 0 { abi.with_deref_size(size) } else { abi });
             }
             NativePass::ByVal(size) => {
                 args.push(value);
@@ -310,7 +499,7 @@ impl Lower<'_, '_> {
         let ret_repr = repr(self.cx, ret_ty)?;
         let slot = self.slot(ret_repr);
         if let Some(slot) = slot {
-            signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn));
+            signature.params.push(AbiParam::special(Type::I64, ArgumentPurpose::StructReturn).with_noalias());
             args.push(self.ins().stack_addr(Type::I64, slot, 0));
         }
         Ok(slot)

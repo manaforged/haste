@@ -1,12 +1,13 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Arch, FloatCC, IntCC, Lane, ReduceOp, StackSlot, Target, Type, Value};
 
-use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Lit};
+use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Lit, Pat, Stmt, Ty as BodyTy, UnOp};
+use crate::names::{Primitive, plain};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
-use crate::sema::infer::{Res, SiteKey, parse_int};
+use crate::sema::infer::{Res, SiteKey, Typed, parse_int};
 use crate::sema::intrinsic::Simd;
-use crate::sema::ty::{Kind, Ty};
+use crate::sema::ty::{Kind, Ty, int_info, mask as int_mask};
 
 use super::ops::{Num, compare};
 use super::reloc::SiteOrigin;
@@ -137,10 +138,7 @@ impl Lower<'_, '_> {
         if self.b.func.ty(val) == to {
             return val;
         }
-        let bytes = to.bytes();
-        let slot = self.b.create_stack_slot(bytes, bytes.trailing_zeros() as u8);
-        self.ins().stack_store(val, slot, 0);
-        self.ins().stack_load(to, slot, 0)
+        self.ins().bitcast(to, val)
     }
 
     pub(super) fn lanes_slot(&mut self, lanes: Lanes) -> (StackSlot, Value) {
@@ -349,8 +347,9 @@ impl Lower<'_, '_> {
 
     fn const_arg_u8(&mut self, origin: &SiteOrigin, index: usize, limit: u8) -> Option<u8> {
         let expr = self.call_arg_expr(origin, index)?;
-        let val = eval_const_int(self.cx, self.body, self.typed, self.body, self.src, expr, 0)?;
-        u8::try_from(val).ok().filter(|&n| n < limit)
+        let mut ctx = ConstEval { cx: self.cx, origin_body: self.body, typed: self.typed };
+        let val = ctx.int(self.body, self.src, expr, &mut Vec::new(), 0)?;
+        u8::try_from(val.val).ok().filter(|&n| (!val.signed || val.to_signed() >= 0) && n < limit)
     }
 
     fn shuffle_const_mask(&mut self, origin: &SiteOrigin, count: usize) -> Option<[u8; 16]> {
@@ -358,82 +357,361 @@ impl Lower<'_, '_> {
             return None;
         }
         let expr = self.call_arg_expr(origin, 2)?;
-        eval_shuffle_array(self.cx, self.body, self.typed, self.body, self.src, expr, count, 0)
+        let mut ctx = ConstEval { cx: self.cx, origin_body: self.body, typed: self.typed };
+        ctx.shuffle_array(self.body, self.src, expr, count, 0)
     }
 }
 
-fn unwrap_const_expr(body: &Body, mut expr: ExprId) -> ExprId {
-    loop {
-        match *body.expr(expr) {
-            Expr::Paren(inner) | Expr::Cast(inner, _) => expr = inner,
-            Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const, .. } if stmts.len == 0 => expr = tail,
-            _ => return expr,
+#[derive(Clone, Copy)]
+struct ConstVal {
+    val: u128,
+    bits: u32,
+    signed: bool,
+    typed: bool,
+}
+
+impl ConstVal {
+    fn to_signed(self) -> i128 {
+        let shift = 128 - self.bits;
+        ((self.val << shift) as i128) >> shift
+    }
+
+    fn cast(self, (bits, signed): (u32, bool)) -> Self {
+        let extended = if self.signed { self.to_signed() as u128 } else { self.val };
+        Self { val: extended & int_mask(bits), bits, signed, typed: true }
+    }
+}
+
+struct ConstEval<'a, 'b> {
+    cx: &'b mut crate::sema::Context<'a>,
+    origin_body: &'b Body,
+    typed: &'b Typed,
+}
+
+impl<'a, 'b> ConstEval<'a, 'b> {
+    fn unwrap_expr(&self, body: &Body, mut expr: ExprId) -> ExprId {
+        loop {
+            match *body.expr(expr) {
+                Expr::Paren(inner) => expr = inner,
+                Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const | BlockKind::Expansion, .. }
+                    if body.list(stmts).is_empty() =>
+                {
+                    expr = tail;
+                }
+                _ => return expr,
+            }
         }
     }
-}
 
-fn eval_const_int<'a>(cx: &mut crate::sema::Context<'a>, origin_body: &Body, typed: &crate::sema::infer::Typed, body: &Body, src: &Source, expr: ExprId, depth: u8) -> Option<u128> {
-    if depth > 4 {
-        return None;
+    fn unwrap_shuffle(&self, body: &Body, src: &Source, mut expr: ExprId) -> ExprId {
+        loop {
+            expr = self.unwrap_expr(body, expr);
+            match *body.expr(expr) {
+                Expr::Call(callee, list) => {
+                    let &[arg] = body.list(list) else { return expr };
+                    let is_ctor = std::ptr::eq(body, self.origin_body)
+                        && matches!(self.typed.res.get(&callee).or_else(|| self.typed.res.get(&expr)), Some(Res::Ctor(..)));
+                    let is_idx = matches!(*body.expr(callee), Expr::Path(path) if body.list(body.path(path).segments).last().is_some_and(|&s| plain(src.text(body.segments[s as usize].name)) == "SimdShuffleIdx"));
+                    if is_ctor || is_idx {
+                        expr = ExprId(arg);
+                    } else {
+                        return expr;
+                    }
+                }
+                Expr::Struct { path, fields, base: None, .. } => {
+                    let &[field] = body.list(fields) else { return expr };
+                    let is_idx = body.list(body.path(path).segments).last().is_some_and(|&s| plain(src.text(body.segments[s as usize].name)) == "SimdShuffleIdx");
+                    if is_idx {
+                        expr = body.fields[field as usize].value;
+                    } else {
+                        return expr;
+                    }
+                }
+                _ => return expr,
+            }
+        }
     }
-    let expr = unwrap_const_expr(body, expr);
-    match *body.expr(expr) {
-        Expr::Lit(Lit::Int, tok) => parse_int(src.text(tok)).ok().map(|(n, _)| n),
-        Expr::Path(_) if std::ptr::eq(body, origin_body) => match typed.res.get(&expr).copied()? {
-            Res::Const(val) => match *cx.types.kind(val) {
-                Kind::Value(n) => Some(n),
-                _ => None,
-            },
-            Res::Fn(item, substs) if cx.item(item).1.kind == ItemKind::Const && cx.types.substs(substs).is_empty() => {
-                let item_body = cx.body(item).ok()?;
+
+    fn body_ty_int(&self, body: &Body, src: &Source, mut ty: crate::body::TyId) -> Option<(u32, bool)> {
+        loop {
+            match *body.ty(ty) {
+                BodyTy::Paren(inner) => ty = inner,
+                BodyTy::Path(path) => {
+                    let entry = body.path(path);
+                    if entry.global || entry.qself.is_some() {
+                        return None;
+                    }
+                    let &[seg] = body.list(entry.segments) else { return None };
+                    return Primitive::named(plain(src.text(body.segments[seg as usize].name))).and_then(int_info);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn origin_int(&self, expr: ExprId) -> Option<(u32, bool)> {
+        match *self.cx.types.kind(self.typed.exprs[expr.0 as usize]) {
+            Kind::Prim(prim) => int_info(prim),
+            _ => None,
+        }
+    }
+
+    fn int(&mut self, body: &Body, src: &Source, expr: ExprId, env: &mut Vec<(String, ConstVal)>, depth: u8) -> Option<ConstVal> {
+        if depth > 8 {
+            return None;
+        }
+        let expr = self.unwrap_expr(body, expr);
+        match *body.expr(expr) {
+            Expr::Lit(Lit::Int, tok) => {
+                let (val, suffix) = parse_int(src.text(tok)).ok()?;
+                let info = suffix.and_then(int_info).or_else(|| std::ptr::eq(body, self.origin_body).then(|| self.origin_int(expr)).flatten());
+                let (bits, signed, typed) = match info {
+                    Some((b, s)) => (b, s, true),
+                    None => (64, false, false),
+                };
+                Some(ConstVal { val: val & int_mask(bits), bits, signed, typed })
+            }
+            Expr::Lit(Lit::Bool(flag), _) => Some(ConstVal { val: u128::from(flag), bits: 1, signed: false, typed: true }),
+            Expr::Unary(UnOp::Neg, inner) => {
+                let v = self.int(body, src, inner, env, depth + 1)?;
+                Some(ConstVal { val: v.val.wrapping_neg() & int_mask(v.bits), ..v })
+            }
+            Expr::Unary(UnOp::Not, inner) => {
+                let v = self.int(body, src, inner, env, depth + 1)?;
+                Some(ConstVal { val: (!v.val) & int_mask(v.bits), ..v })
+            }
+            Expr::Cast(inner, ty) => {
+                let v = self.int(body, src, inner, env, depth + 1)?;
+                let target = self.body_ty_int(body, src, ty)?;
+                Some(v.cast(target))
+            }
+            Expr::Binary(op, lhs, rhs) => self.binary(body, src, (op, lhs, rhs), env, depth + 1),
+            Expr::If(cond, then, Some(otherwise)) => {
+                let flag = self.int(body, src, cond, env, depth + 1)?;
+                self.int(body, src, if flag.val != 0 { then } else { otherwise }, env, depth + 1)
+            }
+            Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const | BlockKind::Expansion, .. } => {
+                let mark = env.len();
+                for &stmt_id in body.list(stmts) {
+                    match body.stmts[stmt_id as usize] {
+                        Stmt::Empty | Stmt::Item(..) => {}
+                        Stmt::Let { mut pat, ty, init: Some(init), otherwise: None, .. } => {
+                            while let Pat::Paren(inner) = *body.pat(pat) {
+                                pat = inner;
+                            }
+                            let Pat::Bind { name, sub: None, .. } = *body.pat(pat) else {
+                                env.truncate(mark);
+                                return None;
+                            };
+                            let Some(mut val) = self.int(body, src, init, env, depth + 1) else {
+                                env.truncate(mark);
+                                return None;
+                            };
+                            if let Some(target) = ty.and_then(|t| self.body_ty_int(body, src, t)) {
+                                val = val.cast(target);
+                            }
+                            env.push((plain(src.text(name)).to_owned(), val));
+                        }
+                        _ => {
+                            env.truncate(mark);
+                            return None;
+                        }
+                    }
+                }
+                let out = self.int(body, src, tail, env, depth + 1);
+                env.truncate(mark);
+                out
+            }
+            Expr::Index(arr, idx_expr) => {
+                let idx_val = self.int(body, src, idx_expr, env, depth + 1)?;
+                let idx = usize::try_from(idx_val.val).ok()?;
+                self.index_array(body, src, arr, idx, env, depth + 1)
+            }
+            Expr::Call(callee, list) if std::ptr::eq(body, self.origin_body) => {
+                let Res::Fn(item, substs) = self.typed.res.get(&callee).or_else(|| self.typed.res.get(&expr)).copied()? else { return None };
+                if self.cx.item(item).1.kind != ItemKind::Fn || !self.cx.types.substs(substs).is_empty() || self.cx.intrinsic(item).is_some() {
+                    return None;
+                }
+                let sig = self.cx.signature(item).ok()?;
+                let arg_ids = body.list(list);
+                if sig.params.len() != arg_ids.len() {
+                    return None;
+                }
+                let item_body = self.cx.body(item).ok()?;
                 let root = item_body.root?;
-                let item_src = cx.body_src(item);
-                eval_const_int(cx, origin_body, typed, &item_body, item_src, root, depth + 1)
+                let item_src = self.cx.body_src(item);
+                let mut sub_env = Vec::with_capacity(arg_ids.len());
+                for (&(mut pat, pty), &arg_id) in sig.params.iter().zip(arg_ids) {
+                    while let Pat::Paren(inner) = *sig.body.pat(pat) {
+                        pat = inner;
+                    }
+                    let Pat::Bind { name, sub: None, .. } = *sig.body.pat(pat) else { return None };
+                    let mut val = self.int(body, src, ExprId(arg_id), env, depth + 1)?;
+                    if let Some(target) = self.body_ty_int(&sig.body, item_src, pty) {
+                        val = val.cast(target);
+                    }
+                    sub_env.push((plain(item_src.text(name)).to_owned(), val));
+                }
+                let mut res = self.int(&item_body, item_src, root, &mut sub_env, depth + 1)?;
+                if let Some(target) = sig.ret.and_then(|rt| self.body_ty_int(&sig.body, item_src, rt)) {
+                    res = res.cast(target);
+                }
+                Some(res)
+            }
+            Expr::Path(path) => {
+                let entry = body.path(path);
+                if !entry.global
+                    && entry.qself.is_none()
+                    && let &[seg] = body.list(entry.segments)
+                {
+                    let name = plain(src.text(body.segments[seg as usize].name));
+                    if let Some((_, val)) = env.iter().rev().find(|(bound, _)| bound == name) {
+                        return Some(*val);
+                    }
+                }
+                if !std::ptr::eq(body, self.origin_body) {
+                    return None;
+                }
+                match self.typed.res.get(&expr).copied()? {
+                    Res::Const(val) => match *self.cx.types.kind(val) {
+                        Kind::Value(n) => {
+                            let (bits, signed) = self.origin_int(expr).unwrap_or((64, false));
+                            Some(ConstVal { val: n & int_mask(bits), bits, signed, typed: true })
+                        }
+                        _ => None,
+                    },
+                    Res::Fn(item, substs) if self.cx.item(item).1.kind == ItemKind::Const && self.cx.types.substs(substs).is_empty() => {
+                        let item_body = self.cx.body(item).ok()?;
+                        let root = item_body.root?;
+                        let item_src = self.cx.body_src(item);
+                        self.int(&item_body, item_src, root, &mut Vec::new(), depth + 1)
+                    }
+                    _ => None,
+                }
             }
             _ => None,
-        },
-        _ => None,
+        }
     }
-}
 
-fn eval_shuffle_array<'a>(cx: &mut crate::sema::Context<'a>, origin_body: &Body, typed: &crate::sema::infer::Typed, body: &Body, src: &Source, expr: ExprId, count: usize, depth: u8) -> Option<[u8; 16]> {
-    if depth > 4 {
-        return None;
+    fn binary(&mut self, body: &Body, src: &Source, (op, lhs, rhs): (BinOp, ExprId, ExprId), env: &mut Vec<(String, ConstVal)>, depth: u8) -> Option<ConstVal> {
+        let mut l = self.int(body, src, lhs, env, depth)?;
+        if matches!(op, BinOp::And | BinOp::Or) {
+            let short = (l.val != 0) == (op == BinOp::Or);
+            let out = if short { l.val != 0 } else { self.int(body, src, rhs, env, depth)?.val != 0 };
+            return Some(ConstVal { val: u128::from(out), bits: 1, signed: false, typed: true });
+        }
+        let mut r = self.int(body, src, rhs, env, depth)?;
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            let sh = u32::try_from(r.val).ok()?;
+            let val = match op {
+                BinOp::Shl => l.val.checked_shl(sh).unwrap_or(0) & int_mask(l.bits),
+                _ if l.signed => ((l.to_signed() >> sh.min(127)) as u128) & int_mask(l.bits),
+                _ => l.val.checked_shr(sh).unwrap_or(0),
+            };
+            return Some(ConstVal { val, ..l });
+        }
+        let (bits, signed, typed) = match (l.typed, r.typed) {
+            (true, _) => (l.bits, l.signed, true),
+            (false, true) => (r.bits, r.signed, true),
+            (false, false) => (64, false, false),
+        };
+        l = l.cast((bits, signed));
+        r = r.cast((bits, signed));
+        if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+            let ord = if signed { l.to_signed().cmp(&r.to_signed()) } else { l.val.cmp(&r.val) };
+            let holds = match op {
+                BinOp::Eq => ord.is_eq(),
+                BinOp::Ne => ord.is_ne(),
+                BinOp::Lt => ord.is_lt(),
+                BinOp::Le => ord.is_le(),
+                BinOp::Gt => ord.is_gt(),
+                _ => ord.is_ge(),
+            };
+            return Some(ConstVal { val: u128::from(holds), bits: 1, signed: false, typed: true });
+        }
+        if matches!(op, BinOp::Div | BinOp::Rem) && r.val == 0 {
+            return None;
+        }
+        let val = match op {
+            BinOp::Add => l.val.wrapping_add(r.val),
+            BinOp::Sub => l.val.wrapping_sub(r.val),
+            BinOp::Mul => l.val.wrapping_mul(r.val),
+            BinOp::Div if signed => l.to_signed().wrapping_div(r.to_signed()) as u128,
+            BinOp::Rem if signed => l.to_signed().wrapping_rem(r.to_signed()) as u128,
+            BinOp::Div => l.val / r.val,
+            BinOp::Rem => l.val % r.val,
+            BinOp::BitAnd => l.val & r.val,
+            BinOp::BitOr => l.val | r.val,
+            BinOp::BitXor => l.val ^ r.val,
+            _ => return None,
+        };
+        Some(ConstVal { val: val & int_mask(bits), bits, signed, typed })
     }
-    let expr = unwrap_const_expr(body, expr);
-    let limit = u128::try_from(2 * count).ok()?;
-    let mut mask = [0u8; 16];
-    match *body.expr(expr) {
-        Expr::Array(list) => {
-            let ids = body.list(list);
-            if ids.len() != count {
-                return None;
+
+    fn index_array(&mut self, body: &Body, src: &Source, arr: ExprId, idx: usize, env: &mut Vec<(String, ConstVal)>, depth: u8) -> Option<ConstVal> {
+        let arr = self.unwrap_expr(body, arr);
+        match *body.expr(arr) {
+            Expr::Array(list) => {
+                let &elem = body.list(list).get(idx)?;
+                self.int(body, src, ExprId(elem), env, depth)
             }
-            mask[..count].iter_mut().zip(ids).try_for_each(|(slot, &id)| {
-                let n = eval_const_int(cx, origin_body, typed, body, src, ExprId(id), depth + 1)?;
-                (n < limit).then(|| *slot = n as u8)
-            })?;
-            Some(mask)
-        }
-        Expr::Repeat(elem, _) => {
-            let n = eval_const_int(cx, origin_body, typed, body, src, elem, depth + 1)?;
-            if n >= limit {
-                return None;
+            Expr::Repeat(elem, count_expr) => {
+                let count = self.int(body, src, count_expr, env, depth)?;
+                (u128::from(idx as u64) < count.val).then(|| self.int(body, src, elem, env, depth)).flatten()
             }
-            mask[..count].fill(n as u8);
-            Some(mask)
-        }
-        Expr::Path(_) if std::ptr::eq(body, origin_body) => {
-            let Res::Fn(item, substs) = typed.res.get(&expr).copied()? else { return None };
-            if cx.item(item).1.kind != ItemKind::Const || !cx.types.substs(substs).is_empty() {
-                return None;
+            Expr::Path(_) if std::ptr::eq(body, self.origin_body) => {
+                let Res::Fn(item, substs) = self.typed.res.get(&arr).copied()? else { return None };
+                if self.cx.item(item).1.kind != ItemKind::Const || !self.cx.types.substs(substs).is_empty() {
+                    return None;
+                }
+                let item_body = self.cx.body(item).ok()?;
+                let root = item_body.root?;
+                let item_src = self.cx.body_src(item);
+                self.index_array(&item_body, item_src, root, idx, &mut Vec::new(), depth)
             }
-            let item_body = cx.body(item).ok()?;
-            let root = item_body.root?;
-            let item_src = cx.body_src(item);
-            eval_shuffle_array(cx, origin_body, typed, &item_body, item_src, root, count, depth + 1)
+            _ => None,
         }
-        _ => None,
+    }
+
+    fn shuffle_array(&mut self, body: &Body, src: &Source, expr: ExprId, count: usize, depth: u8) -> Option<[u8; 16]> {
+        if depth > 4 {
+            return None;
+        }
+        let expr = self.unwrap_shuffle(body, src, expr);
+        let limit = u128::try_from(2 * count).ok()?;
+        let mut mask = [0u8; 16];
+        match *body.expr(expr) {
+            Expr::Array(list) => {
+                let ids = body.list(list);
+                if ids.len() != count {
+                    return None;
+                }
+                mask[..count].iter_mut().zip(ids).try_for_each(|(slot, &id)| {
+                    let v = self.int(body, src, ExprId(id), &mut Vec::new(), depth + 1)?;
+                    ((!v.signed || v.to_signed() >= 0) && v.val < limit).then(|| *slot = v.val as u8)
+                })?;
+                Some(mask)
+            }
+            Expr::Repeat(elem, _) => {
+                let v = self.int(body, src, elem, &mut Vec::new(), depth + 1)?;
+                if (v.signed && v.to_signed() < 0) || v.val >= limit {
+                    return None;
+                }
+                mask[..count].fill(v.val as u8);
+                Some(mask)
+            }
+            Expr::Path(_) if std::ptr::eq(body, self.origin_body) => {
+                let Res::Fn(item, substs) = self.typed.res.get(&expr).copied()? else { return None };
+                if self.cx.item(item).1.kind != ItemKind::Const || !self.cx.types.substs(substs).is_empty() {
+                    return None;
+                }
+                let item_body = self.cx.body(item).ok()?;
+                let root = item_body.root?;
+                let item_src = self.cx.body_src(item);
+                self.shuffle_array(&item_body, item_src, root, count, depth + 1)
+            }
+            _ => None,
+        }
     }
 }
 

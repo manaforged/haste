@@ -120,14 +120,6 @@ impl RelocPlan {
         }
         None
     }
-
-    pub(super) fn has_promoted(&self) -> bool {
-        self.steps.iter().any(|step| match step {
-            RelocStep::Promoted { .. } => true,
-            RelocStep::SiteInline { plan, .. } => plan.has_promoted(),
-            _ => false,
-        })
-    }
 }
 
 /// Evaluates `plan` against reached concrete instance `index` to produce its exact relocation vector.

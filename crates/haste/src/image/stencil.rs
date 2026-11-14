@@ -395,7 +395,7 @@ impl Image {
     fn compile_singleton(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<(), String> {
         let started = std::time::Instant::now();
         let item = reached.list[index].0.0;
-        let footprint = if !self.backend.is_lazy_jit() && cx.outline.is_sysroot(item.krate) {
+        let footprint = if !self.backend.is_lazy_jit() && cx.outline.is_fixed(item.krate) {
             Some(lower::eval_footprint(cx, reached, self, index).map_err(|e| item_err(cx, item, e))?)
         } else {
             None
@@ -682,7 +682,7 @@ impl Image {
             return None;
         }
         let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
-        if !matches!(typed.shape, crate::sema::infer::Shape::Body) || typed.has_awaits() || !cx.outline.is_sysroot(item.krate) {
+        if !matches!(typed.shape, crate::sema::infer::Shape::Body) || typed.has_awaits() || !cx.outline.is_fixed(item.krate) {
             return None;
         }
         let item_key = crate::substrate::sysroot_item_key(cx.outline, *item)?;

@@ -29,6 +29,12 @@ impl Lower<'_, '_> {
         let fields = match kind {
             Kind::Array(element, count) => {
                 let count = self.len(count)?;
+                if self.is_bitwise_int(element) {
+                    let total = (count as u64).saturating_mul(self.cx.layout(element)?.size.bytes());
+                    if total <= 16 {
+                        return Ok(self.equal_bytes_const((x, y), total));
+                    }
+                }
                 let count = self.ins().iconst(Type::I64, count);
                 return self.equal_items(element, (x, y), count);
             }
@@ -113,38 +119,159 @@ impl Lower<'_, '_> {
         let (data_x, len_x) = (self.ins().load(Type::I64, x, 0), self.ins().load(Type::I64, x, 8));
         let (data_y, len_y) = (self.ins().load(Type::I64, y, 0), self.ins().load(Type::I64, y, 8));
         let same_len = self.ins().icmp(IntCC::Equal, len_x, len_y);
-        let zero = self.ins().iconst(Type::I64, 0);
-        let count = self.ins().select(same_len, len_x, zero);
-        let items = self.equal_items(element, (data_x, data_y), count)?;
-        Ok(self.ins().band(same_len, items))
+        let (check, done) = (self.b.create_block(), self.b.create_block());
+        let res = self.b.append_block_param(done, Type::I8);
+        let zero = self.ins().iconst(Type::I8, 0);
+        self.brif(same_len, (check, &[]), (done, &[zero]));
+        self.enter(check);
+        let items = self.equal_items(element, (data_x, data_y), len_y)?;
+        self.jump(done, &[items]);
+        self.enter(done);
+        Ok(res)
+    }
+
+    fn is_byte(&self, ty: Ty) -> bool {
+        matches!(self.cx.types.kind(ty), Kind::Prim(Primitive::U8 | Primitive::I8 | Primitive::Bool))
+    }
+
+    fn is_bitwise_int(&self, ty: Ty) -> bool {
+        self.is_byte(ty)
+            || matches!(
+                self.cx.types.kind(ty),
+                Kind::Prim(Primitive::U16 | Primitive::I16 | Primitive::U32 | Primitive::I32 | Primitive::U64 | Primitive::I64 | Primitive::Char)
+            )
+    }
+
+    fn equal_load(&mut self, ty: Type, (x, y): (Value, Value), off: i32) -> Value {
+        let (a, b) = (self.ins().load(ty, x, off), self.ins().load(ty, y, off));
+        self.ins().icmp(IntCC::Equal, a, b)
+    }
+
+    fn xor_load(&mut self, ty: Type, (x, y): (Value, Value), off: i32) -> Value {
+        let (a, b) = (self.ins().load(ty, x, off), self.ins().load(ty, y, off));
+        self.ins().bxor(a, b)
+    }
+
+    fn equal_pair_xor(&mut self, ty: Type, (x0, y0): (Value, Value), off0: i32, (x1, y1): (Value, Value), off1: i32) -> Value {
+        let d0 = self.xor_load(ty, (x0, y0), off0);
+        let d1 = self.xor_load(ty, (x1, y1), off1);
+        let any = self.ins().bor(d0, d1);
+        let zero = self.ins().iconst(ty, 0);
+        self.ins().icmp(IntCC::Equal, any, zero)
+    }
+
+    fn equal_tail_pair(&mut self, ty: Type, bytes: i64, (x, y): (Value, Value), (off, len): (Value, Value)) -> Value {
+        let (px, py) = (self.ins().iadd(x, off), self.ins().iadd(y, off));
+        let end_off = self.ins().iadd_imm(len, -bytes);
+        let (ex, ey) = (self.ins().iadd(x, end_off), self.ins().iadd(y, end_off));
+        self.equal_pair_xor(ty, (px, py), 0, (ex, ey), 0)
+    }
+
+    fn equal_bytes_const(&mut self, (x, y): (Value, Value), len: u64) -> Value {
+        match len {
+            0 => self.ins().iconst(Type::I8, 1),
+            1 => self.equal_load(Type::I8, (x, y), 0),
+            2 => self.equal_load(Type::I16, (x, y), 0),
+            3 => self.equal_pair_xor(Type::I16, (x, y), 0, (x, y), 1),
+            4 => self.equal_load(Type::I32, (x, y), 0),
+            5..=7 => self.equal_pair_xor(Type::I32, (x, y), 0, (x, y), (len - 4) as i32),
+            8 => self.equal_load(Type::I64, (x, y), 0),
+            9..=16 => self.equal_pair_xor(Type::I64, (x, y), 0, (x, y), (len - 8) as i32),
+            _ => {
+                let count = self.ins().iconst(Type::I64, len as i64);
+                self.equal_bytes_runtime((x, y), count)
+            }
+        }
+    }
+
+    fn equal_bytes_runtime(&mut self, (x, y): (Value, Value), len: Value) -> Value {
+        let (head, body, tail) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let (ge4, lt4, ge2, lt2, one_byte, done) = (
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+        );
+        let off = self.b.append_block_param(head, Type::I64);
+        let res = self.b.append_block_param(done, Type::I8);
+        let zero64 = self.ins().iconst(Type::I64, 0);
+        let zero8 = self.ins().iconst(Type::I8, 0);
+        let one8 = self.ins().iconst(Type::I8, 1);
+        self.jump(head, &[zero64]);
+
+        self.enter(head);
+        let rem = self.ins().isub(len, off);
+        let has8 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, rem, 8);
+        self.brif(has8, (body, &[]), (tail, &[]));
+
+        self.enter(body);
+        let (px, py) = (self.ins().iadd(x, off), self.ins().iadd(y, off));
+        let eq8 = self.equal_load(Type::I64, (px, py), 0);
+        let next = self.ins().iadd_imm(off, 8);
+        self.brif(eq8, (head, &[next]), (done, &[zero8]));
+
+        self.enter(tail);
+        let has4 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, rem, 4);
+        self.brif(has4, (ge4, &[]), (lt4, &[]));
+
+        self.enter(ge4);
+        let eq4 = self.equal_tail_pair(Type::I32, 4, (x, y), (off, len));
+        self.jump(done, &[eq4]);
+
+        self.enter(lt4);
+        let has2 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, rem, 2);
+        self.brif(has2, (ge2, &[]), (lt2, &[]));
+
+        self.enter(ge2);
+        let eq2 = self.equal_tail_pair(Type::I16, 2, (x, y), (off, len));
+        self.jump(done, &[eq2]);
+
+        self.enter(lt2);
+        let is_zero = self.ins().icmp_imm(IntCC::Equal, rem, 0);
+        self.brif(is_zero, (done, &[one8]), (one_byte, &[]));
+
+        self.enter(one_byte);
+        let (px, py) = (self.ins().iadd(x, off), self.ins().iadd(y, off));
+        let eq1 = self.equal_load(Type::I8, (px, py), 0);
+        self.jump(done, &[eq1]);
+
+        self.enter(done);
+        res
     }
 
     fn equal_items(&mut self, element: Ty, (x, y): (Value, Value), count: Value) -> Result<Value> {
+        if self.is_byte(element) {
+            return Ok(self.equal_bytes_runtime((x, y), count));
+        }
         let size = self.cx.layout(element)?.size.bytes() as i64;
         let part = repr(self.cx, element)?;
-        let all = self.b.create_stack_slot(1, 0);
-        let one = self.ins().iconst(Type::I8, 1);
-        self.ins().stack_store(one, all, 0);
-        let mut failed = None;
-        self.each(count, |lower, index| {
-            let offset = lower.ins().imul_imm(index, size);
-            let (left, right) = (lower.ins().iadd(x, offset), lower.ins().iadd(y, offset));
-            let at = |base| Place { base: Base::Addr(base), offset: 0, repr: part };
-            let (Some(left), Some(right)) = (lower.read(at(left)), lower.read(at(right))) else {
-                return;
-            };
-            match lower.equal(element, left, right) {
-                Ok(same) => {
-                    let so_far = lower.ins().stack_load(Type::I8, all, 0);
-                    let both = lower.ins().band(so_far, same);
-                    lower.ins().stack_store(both, all, 0);
-                }
-                Err(error) => failed = Some(error),
-            }
-        });
-        if let Some(error) = failed {
-            return Err(error);
+        let (head, body, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let index = self.b.append_block_param(head, Type::I64);
+        let res = self.b.append_block_param(done, Type::I8);
+        let zero64 = self.ins().iconst(Type::I64, 0);
+        let zero8 = self.ins().iconst(Type::I8, 0);
+        let one8 = self.ins().iconst(Type::I8, 1);
+        self.jump(head, &[zero64]);
+
+        self.enter(head);
+        let more = self.ins().icmp(IntCC::UnsignedLessThan, index, count);
+        self.brif(more, (body, &[]), (done, &[one8]));
+
+        self.enter(body);
+        let offset = self.ins().imul_imm(index, size);
+        let (left, right) = (self.ins().iadd(x, offset), self.ins().iadd(y, offset));
+        let at = |base| Place { base: Base::Addr(base), offset: 0, repr: part };
+        let next = self.ins().iadd_imm(index, 1);
+        if let (Some(left), Some(right)) = (self.read(at(left)), self.read(at(right))) {
+            let same = self.equal(element, left, right)?;
+            self.brif(same, (head, &[next]), (done, &[zero8]));
+        } else {
+            self.jump(head, &[next]);
         }
-        Ok(self.ins().stack_load(Type::I8, all, 0))
+
+        self.enter(done);
+        Ok(res)
     }
 }

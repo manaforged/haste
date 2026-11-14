@@ -164,8 +164,19 @@ impl Lower<'_, '_> {
     /// The place of element `index` of type `element` in the array data at `data`.
     pub(super) fn element_place(&mut self, data: Value, index: Value, element: Ty) -> Result<Place> {
         let stride = self.cx.layout(element)?.size.bytes() as i64;
-        let offset = self.ins().imul_imm(index, stride);
-        let address = self.ins().iadd(data, offset);
+        let address = match stride {
+            0 => data,
+            1 => self.ins().iadd(data, index),
+            s if s > 1 && (s as u64).is_power_of_two() => {
+                let shift = self.ins().iconst(Type::I64, i64::from((s as u64).trailing_zeros()));
+                let offset = self.ins().ishl(index, shift);
+                self.ins().iadd(data, offset)
+            }
+            _ => {
+                let offset = self.ins().imul_imm(index, stride);
+                self.ins().iadd(data, offset)
+            }
+        };
         Ok(Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, element)? })
     }
 }

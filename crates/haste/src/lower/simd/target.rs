@@ -250,6 +250,39 @@ impl Lower<'_, '_> {
                 };
                 Ok(Some(self.vec_shift_sat(lane, n, left, signed, wide, a, count)))
             }
+            (
+                X86Symbol::Psignb128
+                | X86Symbol::Psignw128
+                | X86Symbol::Psignd128
+                | X86Symbol::Psignb256
+                | X86Symbol::Psignw256
+                | X86Symbol::Psignd256,
+                &[a, b],
+            ) => {
+                let (ty, wide) = match x86 {
+                    X86Symbol::Psignb128 => (i8x16, false),
+                    X86Symbol::Psignw128 => (i16x8, false),
+                    X86Symbol::Psignd128 => (i32x4, false),
+                    X86Symbol::Psignb256 => (i8x16, true),
+                    X86Symbol::Psignw256 => (i16x8, true),
+                    _ => (i32x4, true),
+                };
+                if wide {
+                    Ok(Some(self.emit_256(|lower, off| lower.psign_128(ty, a, b, off))))
+                } else {
+                    let v = self.psign_128(ty, a, b, 0);
+                    Ok(Some(self.store_vec(v, 16)))
+                }
+            }
+            (X86Symbol::Pmulhrsw128 | X86Symbol::Pmulhrsw256, &[a, b]) => {
+                let wide = x86 == X86Symbol::Pmulhrsw256;
+                let slot = self.b.create_stack_slot(if wide { 32 } else { 16 }, if wide { 5 } else { 4 });
+                self.pmulhrsw_128(a, b, slot, 0);
+                if wide {
+                    self.pmulhrsw_128(a, b, slot, 16);
+                }
+                Ok(Some(self.ins().stack_addr(Type::I64, slot, 0)))
+            }
             _ => Ok(None),
         }
     }
@@ -334,6 +367,33 @@ impl Lower<'_, '_> {
     fn fminmax_128(&mut self, ty: Type, max: bool, a: Value, b: Value, off: i32) -> Value {
         let (va, vb) = (self.ins().load(ty, a, off), self.ins().load(ty, b, off));
         if max { self.ins().fmax(va, vb) } else { self.ins().fmin(va, vb) }
+    }
+
+    fn psign_128(&mut self, ty: Type, a: Value, b: Value, off: i32) -> Value {
+        let (va, vb) = (self.ins().load(ty, a, off), self.ins().load(ty, b, off));
+        let zero = self.ins().iconst(ty, 0);
+        let neg = self.ins().ineg(va);
+        let lt0 = self.ins().icmp(IntCC::SignedLessThan, vb, zero);
+        let eq0 = self.ins().icmp(IntCC::Equal, vb, zero);
+        let signed = self.ins().select(lt0, neg, va);
+        self.ins().select(eq0, zero, signed)
+    }
+
+    fn pmulhrsw_128(&mut self, a: Value, b: Value, slot: StackSlot, off: i32) {
+        let i16x4 = Type::Vec { lane: Lane::I16, count: 4 };
+        let i32x4 = Type::Vec { lane: Lane::I32, count: 4 };
+        let bias_s = self.ins().iconst(Type::I32, 0x4000);
+        let sh_s = self.ins().iconst(Type::I32, 15);
+        let (bias, sh) = (self.ins().splat(i32x4, bias_s), self.ins().splat(i32x4, sh_s));
+        for delta in [0, 8] {
+            let (xa, xb) = (self.ins().load(i16x4, a, off + delta), self.ins().load(i16x4, b, off + delta));
+            let (ea, eb) = (self.ins().sextend(i32x4, xa), self.ins().sextend(i32x4, xb));
+            let prod = self.ins().imul(ea, eb);
+            let sum = self.ins().iadd(prod, bias);
+            let shifted = self.ins().sshr(sum, sh);
+            let out = self.ins().ireduce(i16x4, shifted);
+            self.ins().stack_store(out, slot, off + delta);
+        }
     }
 
     fn vec_shift_sat(&mut self, lane: Lane, count_lanes: u8, left: bool, signed: bool, wide: bool, a: Value, count: Value) -> Value {

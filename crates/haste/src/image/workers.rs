@@ -1,6 +1,5 @@
 //! Compile workers: scoped threads that each encode a fixed share of the reached functions, grouped by footprint into stencils, into thread-local code chunks merged into the image.
 
-use std::cmp::Reverse;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13,7 +12,7 @@ use crate::sema::Context;
 use crate::sema::reach::{Instance, Reached};
 use crate::sync::lock;
 
-use super::aot::{self, AotCode, AotFn, AotQueue};
+use super::aot::{self, AotCode, AotFn, AotQueue, bucket_by_item, lpt_chunks};
 use super::stencil::{DictConfig, DistinctInst, GroupWork, item_err};
 use super::{Image, ImageMode, Pass, resolve_host_symbol, weak};
 
@@ -30,24 +29,7 @@ type WorkerOutput = (Pass, Vec<(usize, String)>, Vec<usize>, Vec<(Instance, u32)
 type Plan = (DictConfig, bool);
 
 fn bucket_work(reached: &Reached, work: &[usize]) -> Vec<Vec<usize>> {
-    let mut pos_map: FxHashMap<ItemRef, usize> = FxHashMap::default();
-    let mut buckets: Vec<Vec<usize>> = Vec::new();
-    for &index in work {
-        let item = reached.list[index].0.0;
-        if let Some(&pos) = pos_map.get(&item) {
-            buckets[pos].push(index);
-        } else {
-            pos_map.insert(item, buckets.len());
-            buckets.push(vec![index]);
-        }
-    }
-    buckets
-}
-
-fn lpt_chunks(buckets: Vec<Vec<usize>>, max_bucket: usize) -> Vec<Vec<usize>> {
-    let mut chunks: Vec<Vec<usize>> = buckets.into_iter().flat_map(|b| if b.len() <= max_bucket { vec![b] } else { b.chunks(max_bucket).map(|c| c.to_vec()).collect() }).collect();
-    chunks.sort_by_key(|b| Reverse(b.len()));
-    chunks
+    bucket_by_item(work, |index| reached.list[index].0.0)
 }
 
 fn lpt_shards(buckets: Vec<Vec<usize>>, jobs: usize) -> Vec<Vec<Vec<usize>>> {
@@ -63,32 +45,12 @@ fn lpt_shards(buckets: Vec<Vec<usize>>, jobs: usize) -> Vec<Vec<Vec<usize>>> {
     shards
 }
 
-fn seed_aot_closure(reached: &Reached, roots: [usize; 2]) -> (Vec<AtomicBool>, Vec<usize>) {
+fn seed_aot_roots(reached: &Reached, roots: [usize; 2]) -> (Vec<AtomicBool>, Vec<usize>) {
     let claimed: Vec<AtomicBool> = (0..reached.list.len()).map(|_| AtomicBool::new(false)).collect();
     let mut seed = Vec::new();
-    let mut stack = Vec::new();
     for root in roots {
         if root < claimed.len() && !claimed[root].swap(true, Ordering::AcqRel) {
-            stack.push(root);
-        }
-    }
-    while let Some(u) = stack.pop() {
-        seed.push(u);
-        if let Some(callees) = reached.direct_calls(u) {
-            for &v in callees {
-                if v < claimed.len() && !claimed[v].swap(true, Ordering::AcqRel) {
-                    stack.push(v);
-                }
-            }
-        } else if let Ok(typed) = &reached.list[u].1 {
-            for callee in typed.calls() {
-                if let Some(&v) = reached.index.get(&callee)
-                    && v < claimed.len()
-                    && !claimed[v].swap(true, Ordering::AcqRel)
-                {
-                    stack.push(v);
-                }
-            }
+            seed.push(root);
         }
     }
     seed.sort_unstable();
@@ -241,14 +203,15 @@ impl Image {
         let cfg = DictConfig::from_env();
         image.pass.stencils.cfg = cfg;
         let plan = (cfg, !cfg.verify && cfg.min_fanout > 1);
-        let (claimed, seed) = seed_aot_closure(reached, roots);
+        let (claimed, seed) = seed_aot_roots(reached, roots);
         let mut broken = FxHashMap::default();
         let mut init_errors = Vec::new();
         let work = image.prepare_work(cx, reached, &seed, &mut init_errors);
         for (idx, err) in init_errors {
             broken.insert(idx, err);
         }
-        let queue = AotQueue::new(claimed, lpt_chunks(bucket_work(reached, &work), AOT_MAX_BUCKET));
+        let items: Box<[ItemRef]> = reached.list.iter().map(|((item, _), _)| *item).collect();
+        let queue = AotQueue::new(claimed, items, AOT_MAX_BUCKET, lpt_chunks(bucket_work(reached, &work), AOT_MAX_BUCKET));
         if let Some(aot) = image.aot() {
             lock(aot).frontier = Some(Arc::clone(&queue));
         }
@@ -324,21 +287,21 @@ impl Image {
     fn run_aot_workers(&self, cx: &Context<'_>, reached: &Reached, queue: &AotQueue, jobs: usize, plan: Plan) -> Vec<Option<WorkerOutput>> {
         let forks: Vec<Context<'_>> = (0..jobs).map(|_| cx.fork()).collect();
         std::thread::scope(|scope| {
-            let handles: Vec<_> = forks.into_iter().map(|fork| scope.spawn(move || self.aot_worker_loop(fork, reached, queue, jobs, plan))).collect();
+            let handles: Vec<_> = forks.into_iter().map(|fork| scope.spawn(move || self.aot_worker_loop(fork, reached, queue, plan))).collect();
             handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect()
         })
     }
 
-    fn aot_worker_loop(&self, mut cx: Context<'_>, reached: &Reached, queue: &AotQueue, jobs: usize, (cfg, allow_singleton): Plan) -> WorkerOutput {
+    fn aot_worker_loop(&self, mut cx: Context<'_>, reached: &Reached, queue: &AotQueue, (cfg, allow_singleton): Plan) -> WorkerOutput {
         let mut pass = Pass::default();
         pass.stencils.cfg = cfg;
         let (mut errors, mut deferred, mut eval_requests) = (Vec::new(), Vec::new(), Vec::new());
-        while let Some((batch, _guard)) = queue.pop(jobs) {
+        while let Some((batch, _guard)) = queue.pop() {
             let mut batch_errors = Vec::new();
             let work = self.prepare_work(&mut cx, reached, &batch, &mut batch_errors);
             errors.extend(batch_errors);
-            for bucket in lpt_chunks(bucket_work(reached, &work), AOT_MAX_BUCKET) {
-                self.compile_worker_bucket(&mut cx, reached, &bucket, (cfg, allow_singleton), &mut pass, (&mut errors, &mut deferred, &mut eval_requests));
+            if !work.is_empty() {
+                self.compile_worker_bucket(&mut cx, reached, &work, (cfg, allow_singleton), &mut pass, (&mut errors, &mut deferred, &mut eval_requests));
             }
         }
         (pass, errors, deferred, eval_requests)

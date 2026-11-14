@@ -33,7 +33,7 @@ struct Budget {
 const DEBUG_BUDGET: Budget = Budget { insts: 30, inline_insts: 30, always: 100, exprs: 20 };
 
 /// The budget of the release profile.
-const RELEASE_BUDGET: Budget = Budget { insts: 400, inline_insts: 400, always: 1000, exprs: 400 };
+const RELEASE_BUDGET: Budget = Budget { insts: 500, inline_insts: 900, always: 1200, exprs: 500 };
 
 /// The budget of the build profile.
 fn budget() -> &'static Budget {
@@ -131,16 +131,22 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
         return None;
     };
     if hint != Hint::Always {
-        let cold_calls = typed.calls().filter(|&(ci, cs)| is_cold_or_never(cx, reached, ci, cs)).take(3).count();
-        if cold_calls >= 3 || (cold_calls >= 2 && body.exprs.len() > 80) {
-            return None;
+        if release && hint == Hint::Inline {
+            if typed.calls().filter(|&(ci, cs)| is_cold_or_never(cx, reached, ci, cs)).take(7).count() > 6 {
+                return None;
+            }
+        } else {
+            let cold_calls = typed.calls().filter(|&(ci, cs)| is_cold_or_never(cx, reached, ci, cs)).take(3).count();
+            if cold_calls >= 3 || (cold_calls >= 2 && body.exprs.len() > 80) {
+                return None;
+            }
         }
     }
     match hint {
         Hint::Never => None,
         Hint::Always => Some(budget.always),
         Hint::Inline => {
-            let max_exprs = if release || env.release { 400 } else { 200 };
+            let max_exprs = if release { 1200 } else if env.release { 400 } else { 200 };
             let inst_limit = if release || env.release { budget.inline_insts } else { budget.insts };
             (body.exprs.len() <= max_exprs).then_some(inst_limit)
         }

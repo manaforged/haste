@@ -1,20 +1,27 @@
-//! Toolchain-scoped mmap-able substrate for frozen sysroot summaries, stencils, and symbols.
+//! Toolchain- and dependency-scoped mmap-able substrate for frozen summaries, stencils, and symbols.
+
+mod keys;
+pub mod noop;
+
+pub use keys::{
+    CrateHashes, deps_key, deps_path, enabled, item_key_with_crates, sysroot_item_key, sysroot_only_item_key, target_hash, toolchain_key,
+    toolchain_path, workspace_key, workspace_path,
+};
 
 use std::cmp::Ordering;
 use std::fmt;
 use std::fs::File;
-use std::hash::{Hash as _, Hasher as _};
 use std::io;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use haste_codegen::{Code, RelocKind, Site, StencilReloc, Target};
-use rustc_hash::FxHasher;
+use haste_codegen::{Code, RelocKind, Site, StencilReloc};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 12;
+const VERSION: u32 = 13;
 const HEADER_LEN: usize = 64;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 48;
@@ -120,10 +127,11 @@ struct Header {
     blob_len: usize,
 }
 
-/// Mmap-backed frozen sysroot substrate storing summaries, stencils, and concrete instances.
+/// Mmap-backed frozen substrate storing summaries, stencils, and concrete instances.
 pub struct Substrate {
     backing: Backing,
     header: Header,
+    parent: Option<Arc<Substrate>>,
 }
 
 impl fmt::Debug for Substrate {
@@ -134,67 +142,9 @@ impl fmt::Debug for Substrate {
             .field("summaries", &self.header.summary_count)
             .field("stencils", &self.header.stencil_count)
             .field("instances", &self.header.instance_count)
+            .field("has_parent", &self.parent.is_some())
             .finish()
     }
-}
-
-/// Returns the toolchain-scoped substrate path under `$HASTE_HOME` / `$XDG_CACHE_HOME/haste` / `$HOME/.cache/haste`.
-pub fn toolchain_path(toolchain_hash: u64) -> PathBuf {
-    crate::graph::store::home().join("toolchain").join(format!("{toolchain_hash:016x}.substrate"))
-}
-
-/// Computes a workspace-invariant key for a sysroot item, or `None` for non-sysroot items.
-pub fn sysroot_item_key(outline: &crate::outline::Outline, item: crate::names::ItemRef) -> Option<u64> {
-    let krate = outline.crates.get(item.krate as usize)?;
-    if !krate.env.release || !krate.env.fixed {
-        return None;
-    }
-    let root = outline.roots.get(item.krate as usize)?;
-    let file = krate.files.get(item.file as usize)?;
-    if file.expanded && file.expand_origin == 0 {
-        return None;
-    }
-    let (base_item, sub_idx) = match item.outer() {
-        Some((outer, sub)) => (outer.item, Some(sub)),
-        None => (item.item, None),
-    };
-    let entry = file.items.items.get(base_item as usize)?;
-    let base_dir = root.path.parent().unwrap_or(Path::new(""));
-    let rel_path = file.source.path.strip_prefix(base_dir).unwrap_or(&file.source.path);
-    let mut hasher = FxHasher::default();
-    root.name.hash(&mut hasher);
-    krate.env.target.triple.hash(&mut hasher);
-    rel_path.hash(&mut hasher);
-    file.expanded.hash(&mut hasher);
-    if file.expanded {
-        file.expand_origin.hash(&mut hasher);
-        file.source.offset.hash(&mut hasher);
-        file.source.text.hash(&mut hasher);
-    }
-    item.item.hash(&mut hasher);
-    sub_idx.hash(&mut hasher);
-    entry.start.hash(&mut hasher);
-    entry.kind.hash(&mut hasher);
-    if let Some(name_tok) = entry.name {
-        file.source.text(name_tok).hash(&mut hasher);
-    }
-    Some(hasher.finish())
-}
-
-/// Returns whether substrate caching is enabled (disabled when `HASTE_NO_SUBSTRATE=1`).
-pub fn enabled() -> bool {
-    std::env::var_os("HASTE_NO_SUBSTRATE").is_none_or(|v| v != "1")
-}
-
-/// Computes a 64-bit fingerprint for `target` and the running compiler binary.
-pub fn target_hash(target: &Target) -> u64 {
-    let mut hasher = FxHasher::default();
-    target.triple.hash(&mut hasher);
-    target.effort.hash(&mut hasher);
-    if let Ok(exe) = std::env::current_exe() {
-        hash_file_meta(&exe, &mut hasher);
-    }
-    hasher.finish()
 }
 
 /// Patches a frozen `StencilSlice` against `symbols` into a fresh byte buffer, or fails if any relocation is runtime-only.
@@ -210,113 +160,6 @@ pub fn patch_stencil(slice: &StencilSlice<'_>, symbols: &[u64]) -> Result<Vec<u8
             .map_err(|err| anyhow!("{err}"))?;
     }
     Ok(buf)
-}
-
-fn hash_file_meta(path: &Path, hasher: &mut FxHasher) {
-    (path, crate::graph::store::file_stamp(path)).hash(hasher);
-}
-
-fn sysroot_library_roots(workspace: &crate::graph::Workspace, units: &[usize]) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = units
-        .iter()
-        .map(|&idx| {
-            let dir = &workspace.packages[workspace.graph.units[idx].package].manifest.dir;
-            dir.ancestors().find(|a| a.file_name().is_some_and(|n| n == "library")).unwrap_or(dir.as_path()).to_owned()
-        })
-        .collect();
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-type Stamp = (u64, i128);
-
-fn scan_sysroot_dir(dir: &Path) -> Vec<(PathBuf, Option<Stamp>)> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut out: Vec<_> = entries.filter_map(Result::ok).filter_map(|entry| {
-        let path = entry.path();
-        if matches!(path.file_name().and_then(|n| n.to_str()), Some("target" | ".git")) { return None; }
-        let ft = entry.file_type().ok();
-        if ft.is_some_and(|ft| ft.is_dir()) { return Some((path, None)); }
-        let is_rs = path.extension().and_then(|e| e.to_str()) == Some("rs");
-        let meta = if ft.is_some_and(|ft| ft.is_file()) { is_rs.then(|| entry.metadata().ok()).flatten()? } else { std::fs::metadata(&path).ok()? };
-        if meta.is_dir() { Some((path, None)) } else if is_rs { Some((path, Some(crate::graph::store::meta_stamp(&meta)))) } else { None }
-    }).collect();
-    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-fn walk_sysroot_dir(dir: &Path, out: &mut Vec<(PathBuf, Stamp)>) {
-    for (path, stamp) in scan_sysroot_dir(dir) {
-        match stamp { Some(s) => out.push((path, s)), None => walk_sysroot_dir(&path, out) }
-    }
-}
-
-fn hash_sysroot_roots(roots: Vec<PathBuf>, hasher: &mut FxHasher) {
-    let mut work = Vec::new();
-    for root in roots {
-        for (p, s) in scan_sysroot_dir(&root) {
-            if s.is_some() { work.push((p, s)); } else { work.extend(scan_sysroot_dir(&p)); }
-        }
-    }
-    let dirs: Vec<_> = work.iter().enumerate().filter(|(_, (_, s))| s.is_none()).map(|(i, (p, _))| (i, p.as_path())).collect();
-    let (workers, next) = (crate::jobs().min(dirs.len()), std::sync::atomic::AtomicUsize::new(0));
-    let mut chunks = vec![Vec::new(); work.len()];
-    let drain = || {
-        let mut local = Vec::new();
-        while let Some(&(slot, dir)) = dirs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-            let mut items = Vec::new();
-            walk_sysroot_dir(dir, &mut items);
-            local.push((slot, items));
-        }
-        local
-    };
-    let done = if workers > 1 { std::thread::scope(|s| (0..workers).map(|_| s.spawn(drain)).collect::<Vec<_>>().into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()) } else { drain() };
-    for (slot, items) in done { chunks[slot] = items; }
-    for (i, (path, stamp)) in work.into_iter().enumerate() {
-        match stamp { Some(s) => (path, s).hash(hasher), None => chunks[i].iter().for_each(|e| e.hash(hasher)) }
-    }
-}
-
-/// Computes a workspace-invariant toolchain key from sysroot packages, target, and compiler binary.
-pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u64 {
-    let mut sysroot_units: Vec<(&str, crate::graph::Side, usize)> = workspace
-        .graph
-        .units
-        .iter()
-        .enumerate()
-        .filter(|(_, unit)| workspace.packages[unit.package].sysroot)
-        .map(|(idx, unit)| (workspace.packages[unit.package].locked.name.as_str(), unit.side, idx))
-        .collect();
-    sysroot_units.sort_unstable_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
-    let mut hasher = FxHasher::default();
-    target.triple.hash(&mut hasher);
-    target.effort.hash(&mut hasher);
-    crate::graph::store::program().hash(&mut hasher);
-    if let Ok(exe) = std::env::current_exe() {
-        hash_file_meta(&exe, &mut hasher);
-    }
-    MAGIC.hash(&mut hasher);
-    VERSION.hash(&mut hasher);
-    let mut unit_indices = Vec::with_capacity(sysroot_units.len());
-    for (_, _, idx) in sysroot_units {
-        unit_indices.push(idx);
-        let unit = &workspace.graph.units[idx];
-        let pkg = &workspace.packages[unit.package];
-        let locked = &pkg.locked;
-        locked.name.hash(&mut hasher);
-        locked.version.to_string().hash(&mut hasher);
-        locked.source.hash(&mut hasher);
-        matches!(unit.side, crate::graph::Side::Host).hash(&mut hasher);
-        if let Some(lib) = &pkg.manifest.lib {
-            hash_file_meta(lib, &mut hasher);
-        }
-        for feat in &unit.features {
-            feat.hash(&mut hasher);
-        }
-    }
-    hash_sysroot_roots(sysroot_library_roots(workspace, &unit_indices), &mut hasher);
-    hasher.finish()
 }
 
 /// Encodes `sites` into compact fixed-width little-endian bytes.
@@ -356,8 +199,7 @@ impl Substrate {
             return Err(io::Error::last_os_error()).with_context(|| format!("mmap {}", path.display()));
         }
         let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(|| anyhow!("mmap returned null pointer"))?;
-        let backing = Backing::Mmap { ptr, len };
-        Self::from_backing(backing)
+        Self::from_backing(Backing::Mmap { ptr, len })
     }
 
     /// Opens the substrate for `toolchain_hash` from the toolchain cache directory.
@@ -369,6 +211,30 @@ impl Substrate {
         Ok(substrate)
     }
 
+    fn open_scoped(path: &Path, scope_hash: u64, target_hash: u64) -> Result<Self> {
+        let substrate = Self::open(path)?;
+        if substrate.header.toolchain_hash != scope_hash || substrate.header.target_hash != target_hash {
+            bail!("scoped substrate hash mismatch");
+        }
+        Ok(substrate)
+    }
+
+    /// Opens the dependency substrate for `(deps_hash, target_hash)` from the dependency cache directory.
+    pub fn open_deps(deps_hash: u64, target_hash: u64) -> Result<Self> {
+        Self::open_scoped(&deps_path(deps_hash), deps_hash, target_hash)
+    }
+
+    /// Opens the local workspace substrate for `(ws_hash, target_hash)` from the workspace cache directory.
+    pub fn open_workspace(ws_hash: u64, target_hash: u64) -> Result<Self> {
+        Self::open_scoped(&workspace_path(ws_hash), ws_hash, target_hash)
+    }
+
+    /// Chains `parent` as a fallback layer consulted after this substrate.
+    pub fn with_parent(mut self, parent: Arc<Substrate>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
     /// Constructs a substrate from an in-memory byte buffer.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         Self::from_backing(Backing::Owned(bytes))
@@ -376,7 +242,7 @@ impl Substrate {
 
     fn from_backing(backing: Backing) -> Result<Self> {
         let header = parse_and_validate(backing.as_slice())?;
-        Ok(Self { backing, header })
+        Ok(Self { backing, header, parent: None })
     }
 
     /// Starts building a new frozen substrate.
@@ -384,7 +250,7 @@ impl Substrate {
         SubstrateBuilder::default()
     }
 
-    /// Toolchain fingerprint this substrate was compiled for.
+    /// Toolchain or dependency scope fingerprint this substrate was compiled for.
     pub fn toolchain_hash(&self) -> u64 {
         self.header.toolchain_hash
     }
@@ -394,18 +260,17 @@ impl Substrate {
         self.header.target_hash
     }
 
-    /// Number of frozen `PolySummary` entries.
-    pub fn summary_count(&self) -> usize {
-        self.header.summary_count
-    }
-
-    /// Number of frozen `Effort::Full` stencil entries.
-    pub fn stencil_count(&self) -> usize {
-        self.header.stencil_count
+    /// Returns whether this substrate layer holds any summaries, stencils, or concrete instances.
+    pub fn has_entries(&self) -> bool {
+        self.header.summary_count > 0 || self.header.stencil_count > 0 || self.header.instance_count > 0
     }
 
     /// Looks up a frozen `PolySummary` payload by `item_hash` in `O(log N)`.
     pub fn summary(&self, item_hash: u64) -> Option<&[u8]> {
+        self.local_summary(item_hash).or_else(|| self.parent.as_deref().and_then(|p| p.summary(item_hash)))
+    }
+
+    fn local_summary(&self, item_hash: u64) -> Option<&[u8]> {
         let data = self.backing.as_slice();
         let idx = binary_search_index(self.header.summary_count, |i| {
             let rec = self.header.summaries_off + i * SUMMARY_REC_LEN;
@@ -419,6 +284,10 @@ impl Substrate {
 
     /// Looks up a frozen `Effort::Full` stencil by `(item_hash, footprint)` in `O(log N)`.
     pub fn stencil(&self, item_hash: u64, footprint: u128) -> Option<StencilSlice<'_>> {
+        self.local_stencil(item_hash, footprint).or_else(|| self.parent.as_deref().and_then(|p| p.stencil(item_hash, footprint)))
+    }
+
+    fn local_stencil(&self, item_hash: u64, footprint: u128) -> Option<StencilSlice<'_>> {
         let data = self.backing.as_slice();
         let fp_lo = footprint as u64;
         let fp_hi = (footprint >> 64) as u64;
@@ -436,8 +305,13 @@ impl Substrate {
         Some(StencilSlice { code, sites, relocs })
     }
 
-    /// Iterates frozen concrete sysroot instance payloads matching `(item_hash, substs_hash)` in `O(log N)`.
+    /// Iterates frozen concrete instance payloads matching `(item_hash, substs_hash)` across this layer and its parent.
     pub fn instance_candidates(&self, item_hash: u64, substs_hash: u64) -> impl Iterator<Item = &[u8]> + '_ {
+        self.local_instance_candidates(item_hash, substs_hash)
+            .chain(self.parent.as_deref().into_iter().flat_map(move |p| p.local_instance_candidates(item_hash, substs_hash)))
+    }
+
+    fn local_instance_candidates(&self, item_hash: u64, substs_hash: u64) -> impl Iterator<Item = &[u8]> + '_ {
         let data = self.backing.as_slice();
         let count = self.header.instance_count;
         let base = self.header.instances_off;
@@ -453,15 +327,31 @@ impl Substrate {
 
     /// Atomically writes the substrate to `path` via a sibling temporary file and rename.
     pub fn save(&self, path: &Path) -> Result<()> {
-        crate::graph::store::write_new_durable(path, self.backing.as_slice()).with_context(|| format!("writing {}", path.display()))
+        crate::graph::store::write_new_bytes(path, self.backing.as_slice()).with_context(|| format!("writing {}", path.display()))
     }
 
-    /// Atomically saves the substrate into the toolchain cache directory.
+    /// Atomically saves the substrate into the toolchain cache directory and prunes superseded toolchain/deps substrates.
     pub fn save_toolchain(&self) -> Result<PathBuf> {
         let path = toolchain_path(self.header.toolchain_hash);
         self.save(&path)?;
+        prune_superseded(self.header.toolchain_hash);
+        Ok(path)
+    }
+
+    /// Atomically saves the substrate into the dependency cache directory.
+    pub fn save_deps(&self) -> Result<PathBuf> {
+        self.save_scoped(deps_path(self.header.toolchain_hash), 16)
+    }
+
+    /// Atomically saves the substrate into the workspace cache directory (bounded LRU <= 8 workspaces).
+    pub fn save_workspace(&self) -> Result<PathBuf> {
+        self.save_scoped(workspace_path(self.header.toolchain_hash), 7)
+    }
+
+    fn save_scoped(&self, path: PathBuf, keep_others: usize) -> Result<PathBuf> {
+        self.save(&path)?;
         if let Some(dir) = path.parent() {
-            prune_stale_substrates(dir, &path);
+            prune_stale_substrates(dir, &path, keep_others);
         }
         Ok(path)
     }
@@ -502,7 +392,7 @@ struct PendingInstance {
     len: u32,
 }
 
-/// Builder that packs sorted sysroot summaries, stencils, and concrete instances into a `Substrate`.
+/// Builder that packs sorted summaries, stencils, and concrete instances into a `Substrate`.
 #[derive(Default)]
 #[must_use]
 pub struct SubstrateBuilder {
@@ -528,7 +418,7 @@ impl fmt::Debug for SubstrateBuilder {
 }
 
 impl SubstrateBuilder {
-    /// Sets the toolchain fingerprint.
+    /// Sets the toolchain or dependency scope fingerprint.
     pub fn toolchain_hash(mut self, hash: u64) -> Self {
         self.toolchain_hash = hash;
         self
@@ -540,7 +430,12 @@ impl SubstrateBuilder {
         self
     }
 
-    /// Appends all summaries and stencils from an existing `Substrate` into this builder.
+    /// Returns whether no summaries, stencils, or concrete instances have been added yet.
+    pub fn is_empty(&self) -> bool {
+        self.summaries.is_empty() && self.stencils.is_empty() && self.instances.is_empty()
+    }
+
+    /// Appends all summaries, stencils, and instances from `existing`'s own backing into this builder.
     pub fn merge_from(&mut self, existing: &Substrate) -> Result<()> {
         let data = existing.backing.as_slice();
         for i in 0..existing.header.summary_count {
@@ -581,7 +476,7 @@ impl SubstrateBuilder {
         Ok(())
     }
 
-    /// Appends a serialized concrete sysroot instance entry.
+    /// Appends a serialized concrete instance entry.
     pub fn add_instance(&mut self, item_hash: u64, substs_hash: u64, bytes: &[u8]) -> Result<()> {
         let (off, len) = self.push_blob(bytes)?;
         self.instances.push(PendingInstance { item_hash, substs_hash, off, len });
@@ -750,13 +645,13 @@ fn binary_search_index(len: usize, mut cmp: impl FnMut(usize) -> Ordering) -> Op
     None
 }
 
-fn read_u32(data: &[u8], at: usize) -> u32 {
+pub(super) fn read_u32(data: &[u8], at: usize) -> u32 {
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&data[at..at + 4]);
     u32::from_le_bytes(bytes)
 }
 
-fn read_u64(data: &[u8], at: usize) -> u64 {
+pub(super) fn read_u64(data: &[u8], at: usize) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&data[at..at + 8]);
     u64::from_le_bytes(bytes)
@@ -772,15 +667,50 @@ fn decode_reloc_kind(raw: u8) -> Result<RelocKind> {
     RELOC_KINDS.get(raw as usize).copied().ok_or_else(|| anyhow!("unknown relocation kind"))
 }
 
-fn prune_stale_substrates(dir: &Path, keep: &Path) {
+fn read_substrate_toolchain_hash(path: &Path) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let mut buf = [0u8; HEADER_LEN];
+    io::Read::read_exact(&mut file, &mut buf).ok()?;
+    (buf[0..8] == MAGIC).then(|| read_u64(&buf, 16))
+}
+
+fn prune_dir_by_hash(dir: &Path, active_toolchain_hash: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut others: Vec<_> = entries.filter_map(|entry| {
-        let entry = entry.ok()?;
+    for entry in entries.flatten() {
         let path = entry.path();
-        if path == keep || path.extension().and_then(|e| e.to_str()) != Some("substrate") { return None; }
-        let meta = entry.metadata().ok()?;
-        meta.is_file().then(|| (meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), path))
-    }).collect();
+        if path.extension().and_then(|e| e.to_str()) == Some("substrate")
+            && read_substrate_toolchain_hash(&path).is_some_and(|h| h != active_toolchain_hash)
+        {
+            drop(std::fs::remove_file(path));
+        }
+    }
+}
+
+fn prune_superseded(toolchain_hash: u64) {
+    if let Some(dir) = toolchain_path(toolchain_hash).parent() {
+        prune_dir_by_hash(dir, toolchain_hash);
+    }
+    if let Some(dir) = deps_path(0).parent() {
+        prune_dir_by_hash(dir, toolchain_hash);
+    }
+    if let Some(dir) = workspace_path(0).parent() {
+        prune_dir_by_hash(dir, toolchain_hash);
+    }
+}
+
+fn prune_stale_substrates(dir: &Path, keep: &Path, keep_others: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut others: Vec<_> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path == keep || path.extension().and_then(|e| e.to_str()) != Some("substrate") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            meta.is_file().then(|| (meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), path))
+        })
+        .collect();
     others.sort_by(|a, b| b.0.cmp(&a.0));
-    others.into_iter().skip(7).for_each(|(_, p)| drop(std::fs::remove_file(p)));
+    others.into_iter().skip(keep_others).for_each(|(_, p)| drop(std::fs::remove_file(p)));
 }

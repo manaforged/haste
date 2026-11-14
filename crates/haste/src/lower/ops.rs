@@ -10,7 +10,6 @@ use crate::sema::infer::{Adjust, Res};
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty, int_info};
 
-use super::stencil::SymbolSource;
 use super::{Lower, Parts, Repr};
 
 /// What arithmetic means for one operand type.
@@ -59,8 +58,7 @@ impl Lower<'_, '_> {
             bytes.push(0);
         }
         let wide = lit != Lit::ByteStr;
-        let id = self.slots.rodata(&bytes, &[]);
-        let data = self.emit_symbol(SymbolSource::Rodata(id));
+        let data = self.emit_const_rodata(&bytes);
         Ok(if wide { self.wide_pointer(data, bytes.len() as i64) } else { data })
     }
 
