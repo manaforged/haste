@@ -1,7 +1,7 @@
 use crate::cse::flip_int_cc;
 use crate::facts::{Fact, Ranges, decide};
 use crate::fold::{evaluate_wrapped, extend};
-use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
 #[derive(Clone, Copy)]
 pub(super) enum EdgeSeed {
@@ -16,6 +16,7 @@ pub(super) struct ThreadCx<'a> {
     pub(super) ranges: &'a Ranges<'a>,
     pub(super) ranges_len: usize,
     pub(super) pinned: &'a [bool],
+    pub(super) idom: &'a [Option<Block>],
 }
 
 #[derive(Default)]

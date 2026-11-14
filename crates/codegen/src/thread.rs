@@ -19,6 +19,7 @@ struct Eval {
     local_ops: Vec<(Value, Op)>,
     local_consts: Vec<(Value, i64)>,
     needed: Vec<bool>,
+    resolved_branch: bool,
 }
 
 fn escapes_from(func: &Function, start: Block, def_block: Block, defs: &[Value]) -> bool {
@@ -50,7 +51,7 @@ fn step_block(
     cur: Block,
     cur_args: &[Value],
     state: &mut EvalState,
-) -> Option<(Block, Vec<Value>, Vec<Value>)> {
+) -> Option<(Block, Vec<Value>, Vec<Value>, bool)> {
     let block = &func.blocks[cur.index()];
     if cur_args.len() != block.params.len() || !(1..=MAX_DISP_INSTS).contains(&block.insts.len()) {
         return None;
@@ -109,12 +110,13 @@ fn step_block(
         state.local_ops.push((res, op));
         state.map.retain(|&(k, _)| k != res);
     }
-    let (next_b, raw_args): (Block, &[Value]) = match &func.insts[last.index()].op {
+    let (next_b, raw_args, resolved_branch): (Block, &[Value], bool) = match &func.insts[last.index()].op {
         Op::Brif(cond, then_b, then_args, else_b, else_args) => {
             let cond_val = lookup(&state.map, *cond);
-            if eval_cond_truth(func, cx, state, cond_val)? { (*then_b, then_args) } else { (*else_b, else_args) }
+            let (nb, args) = if eval_cond_truth(func, cx, state, cond_val)? { (*then_b, then_args) } else { (*else_b, else_args) };
+            (nb, args, true)
         }
-        Op::Jump(target, args) => (*target, args),
+        Op::Jump(target, args) => (*target, args, false),
         Op::BrTable(index, default, targets) => {
             let idx_val = lookup(&state.map, *index);
             let next_b = if let Some(c) = lookup_const(&state.local_consts, cx.consts, idx_val) {
@@ -133,7 +135,7 @@ fn step_block(
                     });
                 if fits_default { *default } else { return None }
             };
-            (next_b, &[])
+            (next_b, &[], true)
         }
         _ => return None,
     };
@@ -141,7 +143,7 @@ fn step_block(
         return None;
     }
     let next_args: Vec<Value> = raw_args.iter().map(|&v| lookup(&state.map, v)).collect();
-    Some((next_b, next_args, defs_here))
+    Some((next_b, next_args, defs_here, resolved_branch))
 }
 
 fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, disp: Block, incoming: &[Value], seed: EdgeSeed) -> Option<Eval> {
@@ -155,15 +157,18 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, disp: Block, incoming: &[
         EdgeSeed::Const(val, imm) => state.local_consts.push((val, imm)),
     }
     let mut visited: Vec<(Block, Vec<Value>)> = Vec::new();
-    let (mut next_b, mut next_args, first_defs) = step_block(func, cx, disp, incoming, &mut state)?;
+    let (mut next_b, mut next_args, first_defs, mut resolved_branch) = step_block(func, cx, disp, incoming, &mut state)?;
     visited.push((disp, first_defs));
+    let mut last_block = disp;
     while visited.len() < MAX_CHAIN && !cx.pinned[next_b.index()] && !visited.iter().any(|&(b, _)| b == next_b) {
         let marks = (state.map.len(), state.local_ops.len(), state.local_consts.len(), state.local_facts.len(), state.edge_cmps.len());
         let cur = next_b;
-        if let Some((nb, na, defs)) = step_block(func, cx, cur, &next_args, &mut state) {
+        if let Some((nb, na, defs, step_resolved)) = step_block(func, cx, cur, &next_args, &mut state) {
             visited.push((cur, defs));
+            last_block = cur;
             next_b = nb;
             next_args = na;
+            resolved_branch |= step_resolved;
         } else {
             state.map.truncate(marks.0);
             state.local_ops.truncate(marks.1);
@@ -173,7 +178,7 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, disp: Block, incoming: &[
             break;
         }
     }
-    if visited.len() == 1 && func.last(disp).is_some_and(|op| matches!(op, Op::Jump(..))) {
+    if !resolved_branch && (visited.len() == 1 || crate::cfg::dominates(cx.idom, next_b, last_block)) {
         return None;
     }
     let (chosen_target, chosen_args) = (next_b, next_args);
@@ -201,7 +206,7 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, disp: Block, incoming: &[
             }
         }
     }
-    Some(Eval { chosen_target, chosen_args, local_ops: state.local_ops, local_consts: state.local_consts, needed })
+    Some(Eval { chosen_target, chosen_args, local_ops: state.local_ops, local_consts: state.local_consts, needed, resolved_branch })
 }
 
 fn non_const_needed(eval: &Eval) -> usize {
@@ -299,6 +304,24 @@ fn finish_split_branch(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, 
     Op::Brif(cond, t_b, t_a, f_b, f_a)
 }
 
+fn eval_pair_ok(func: &Function, disp: Block, et: &Eval, ef: &Eval) -> bool {
+    if et.chosen_target == disp || ef.chosen_target == disp || non_const_needed(et) + non_const_needed(ef) > MAX_BRIF_SPEC_OPS {
+        return false;
+    }
+    if et.resolved_branch || ef.resolved_branch {
+        return true;
+    }
+    if et.chosen_target != ef.chosen_target || et.chosen_args.len() != ef.chosen_args.len() {
+        return false;
+    }
+    let mut diffs = et.chosen_args.iter().zip(&ef.chosen_args).filter(|(a, b)| a != b);
+    match (diffs.next(), diffs.next()) {
+        (None, _) => true,
+        (Some((a, b)), None) => func.ty(*a) == func.ty(*b),
+        _ => false,
+    }
+}
+
 fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Block, term: Inst, args: &[Value]) -> bool {
     for &arg in args {
         let Some(def) = cx.defs.get(arg.index()).copied().flatten() else { continue };
@@ -323,7 +346,7 @@ fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, d
         ) else {
             continue;
         };
-        if et.chosen_target == disp || ef.chosen_target == disp || non_const_needed(&et) + non_const_needed(&ef) > MAX_BRIF_SPEC_OPS {
+        if !eval_pair_ok(func, disp, &et, &ef) {
             continue;
         }
         func.insts[term.index()].op = finish_split_branch(func, cx, pred, sel_c, et, ef);
@@ -339,7 +362,7 @@ fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, d
         ) else {
             continue;
         };
-        if et.chosen_target == disp || ef.chosen_target == disp || non_const_needed(&et) + non_const_needed(&ef) > MAX_BRIF_SPEC_OPS {
+        if !eval_pair_ok(func, disp, &et, &ef) {
             continue;
         }
         func.insts[term.index()].op = finish_split_branch(func, cx, pred, arg, et, ef);
@@ -406,7 +429,10 @@ fn thread_brif(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Bl
         let Some(eval) = eval_dispatcher(func, cx, disp, args, EdgeSeed::Brif(cond, taken)) else {
             return;
         };
-        if eval.chosen_target == *target || non_const_needed(&eval) > MAX_BRIF_SPEC_OPS {
+        if eval.chosen_target == *target
+            || non_const_needed(&eval) > MAX_BRIF_SPEC_OPS
+            || (!eval.resolved_branch && non_const_needed(&eval) > 0)
+        {
             return;
         }
         (*target, *args) = emit_needed(func, pred, cx.consts, eval);
@@ -512,7 +538,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         let single: Vec<Option<Block>> = (0..func.blocks.len()).map(|b| cfg.single_pred(Block(b as u32))).collect();
         let ranges = crate::facts::Ranges::new(func, (&defs, &consts), (&cfg.rpo, &single, &cfg.idom));
         let ranges_len = func.types.len();
-        let mut cx = ThreadCx { defs: &defs, consts: &mut consts, ranges: &ranges, ranges_len, pinned: &pinned };
+        let mut cx = ThreadCx { defs: &defs, consts: &mut consts, ranges: &ranges, ranges_len, pinned: &pinned, idom: &cfg.idom };
         let mut changed = false;
         let mut stale = false;
         for disp_idx in 0..func.blocks.len() {
