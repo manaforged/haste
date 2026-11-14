@@ -1,4 +1,4 @@
-use super::patterns::{adc_parts, bextr_parts, is_zero_const, shld_parts};
+use super::patterns::{adc_parts, bextr_parts, is_zero_const, mid_preserves_flags, shld_parts};
 use super::super::asm::Reg;
 use super::super::features::Features;
 use super::super::frame::SAVED;
@@ -279,12 +279,25 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
     }
     let n = func.types.len();
     let (mut uses, mut pos_of, mut ls_uses, mut use_of) = (vec![0_u32; n], vec![None; n], vec![Vec::new(); n], vec![None; n]);
+    let (mut last_flag_use, mut non_flag_use) = (vec![None; n], vec![false; n]);
     for (b_idx, block) in func.blocks.iter().enumerate() {
         for (pos, &inst) in block.insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
+            let flag_cond = match &data.op {
+                Op::Select(c, ..) | Op::Brif(c, ..) | Op::Trapz(c) => Some(*c),
+                _ => None,
+            };
             data.op.for_operands(|v| {
                 uses[v.index()] += 1;
                 use_of[v.index()] = Some((b_idx, pos, inst));
+                if flag_cond == Some(v) && !non_flag_use[v.index()] {
+                    match last_flag_use[v.index()] {
+                        Some((pb, ppos)) if pb != b_idx || ppos == pos => non_flag_use[v.index()] = true,
+                        _ => last_flag_use[v.index()] = Some((b_idx, pos)),
+                    }
+                } else {
+                    non_flag_use[v.index()] = true;
+                }
             });
             match data.op {
                 Op::Load(addr, off) => ls_uses[addr.index()].push((b_idx, pos, off)),
@@ -599,6 +612,31 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
                 plan.fused[res.index()] = true;
             }
             break;
+        }
+    }
+    let defs = crate::fold::defs(func);
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (cpos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            let Some(cmp_res) = data.result else { continue };
+            if plan.elided[cmp_res.index()] || plan.fused[cmp_res.index()] || uses[cmp_res.index()] == 0 || non_flag_use[cmp_res.index()] {
+                continue;
+            }
+            let cmp_ok = match data.op {
+                Op::Icmp(_, a, _) | Op::Fits(_, _, a, _) => !func.ty(a).is_vector() && func.ty(a) != Type::I128,
+                Op::Fcmp(cc, a, _) => !func.ty(a).is_vector() && super::super::float::BRANCHES.contains(&cc),
+                _ => false,
+            };
+            if !cmp_ok {
+                continue;
+            }
+            let Some((ub, last_pos)) = last_flag_use[cmp_res.index()] else { continue };
+            if ub != b_idx || last_pos <= cpos {
+                continue;
+            }
+            if (cpos + 1..=last_pos).all(|pos| mid_preserves_flags(func, plan, &defs, cmp_res, block.insts[pos], pos == last_pos)) {
+                plan.fused[cmp_res.index()] = true;
+            }
         }
     }
 }

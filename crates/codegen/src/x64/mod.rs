@@ -58,6 +58,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     }
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[Reg::Rbp, Reg::Rsp, Reg::R11]);
     let mut asm = Asm::default();
+    asm.avx = features.avx;
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let slow_thunk = asm.label();
     let defs = crate::fold::defs(func);
@@ -230,6 +231,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
         match &data.op {
             Op::Call { sig, callee, args, results } => {
                 let res = emit_call(self, inst, (*sig, *callee), args, results);
+                self.clear_flags();
                 self.invalidate_spills();
                 res
             }
@@ -507,6 +509,9 @@ impl Emit<'_> {
                 }
                 ArgStep::Load(val, dst) => self.fget(Xmm(dst), val),
             }
+            if let ArgStep::Move(_, dst) | ArgStep::Restore(dst) = step {
+                self.clobber_xmm(Xmm(dst));
+            }
         }
         let int_targets: Vec<(Value, Reg)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Int(reg) = loc { Some((val, reg)) } else { None }).collect();
         for step in arg_steps(&int_targets, |v| self.reg_of(v)) {
@@ -515,6 +520,11 @@ impl Emit<'_> {
                 ArgStep::Save(src) => self.asm.mov(scratch, src),
                 ArgStep::Restore(dst) => self.asm.mov(dst, scratch),
                 ArgStep::Load(val, dst) => self.raw(dst, val),
+            }
+            match step {
+                ArgStep::Move(_, reg) | ArgStep::Restore(reg) => self.clobber_reg(reg),
+                ArgStep::Save(_) => self.clobber_reg(scratch),
+                ArgStep::Load(..) => {}
             }
         }
         for (&val, &loc) in values.iter().zip(locs) {

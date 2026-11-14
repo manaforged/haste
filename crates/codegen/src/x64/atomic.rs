@@ -2,7 +2,7 @@ use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
 use super::float::X1;
 use super::Emit;
 use crate::alloc::Location;
-use crate::frame::Ext;
+use crate::frame::{Emitter, Ext};
 use crate::ir::{AtomicRmwOp, Binary, Function, Op, StackSlot, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -171,6 +171,7 @@ impl Emit<'_> {
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
             Op::Shuffle(..) | Op::Extract(..) | Op::Insert(..) | Op::Reduce(..) | Op::TargetOp(..) => {
+                self.clear_flags();
                 let result = result()?;
                 self.invalidate_spills();
                 self.vector_op(op, result)?;
@@ -249,6 +250,7 @@ impl Emit<'_> {
     }
 
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
+        self.clear_flags();
         let ty = match op {
             Op::AtomicStore(value, _) => self.ty(*value),
             _ => self.ty(result()?),
@@ -390,15 +392,18 @@ impl Emit<'_> {
             return;
         }
         if x == y {
+            self.flags = live_flags;
             self.select_copy(x, result);
             return;
         }
         if let Some(imm) = self.const_of(condition) {
             let known = crate::fold::extend(imm, self.ty(condition), false);
+            self.flags = live_flags;
             self.select_copy(if known != 0 { x } else { y }, result);
             return;
         }
         let mut cond = self.select_cond(condition, live_flags);
+        let orig_cond = cond;
         let ty = self.ty(x);
         if ty.in_float_register() {
             let dst = self.fdst(result);
@@ -408,6 +413,7 @@ impl Emit<'_> {
                 cond = cond.invert();
             }
             let done = self.asm.label();
+            self.flags = Some((condition, orig_cond));
             self.fget(dst, y);
             self.asm.jcc(cond.invert(), done);
             self.fget(dst, x);
@@ -426,6 +432,7 @@ impl Emit<'_> {
             self.asm.cmov(cond, Reg::Rax, self.at(x).offset(8));
             self.put_high(result, Reg::Rax);
             self.clobber_reg(Reg::Rax);
+            self.flags = Some((condition, orig_cond));
             return;
         }
         let dst = self.dst(result);
@@ -437,6 +444,7 @@ impl Emit<'_> {
             self.asm.load(Size::B, dst, dst);
             self.clobber_reg(dst);
             self.put(result, dst);
+            self.flags = Some((condition, orig_cond));
             return;
         }
         let (mut x, mut y) = (x, y);
@@ -444,6 +452,7 @@ impl Emit<'_> {
             (x, y) = (y, x);
             cond = cond.invert();
         }
+        self.flags = Some((condition, orig_cond));
         self.raw(dst, y);
         let source = self.operand(x);
         self.asm.cmov(cond, dst, source);

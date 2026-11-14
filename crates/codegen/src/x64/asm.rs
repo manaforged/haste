@@ -178,6 +178,7 @@ pub(crate) struct Label(u32);
 #[derive(Default)]
 pub(crate) struct Asm {
     pub code: Vec<u8>,
+    pub avx: bool,
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, Label)>,
     table_fixups: Vec<(u32, Label, Label)>,
@@ -628,9 +629,13 @@ impl Asm {
         self.vex3(0b00010, size == Size::Q, 0b00, 0xF7, (dst as u8, ctrl as u8), src.into());
     }
 
-    /// `movaps dst, src`: copies the whole register, with no dependency on the old contents of `dst`.
+    /// `movaps`/`vmovaps dst, src`: copies the whole register, with no dependency on the old contents of `dst`.
     pub fn movaps(&mut self, dst: Xmm, src: Xmm) {
-        self.sse(&[], &[0x0F, 0x28], dst.0, src);
+        if self.avx {
+            self.vex_xmm(0b00001, 0b00, 0x28, (dst, Xmm(0)), src);
+        } else {
+            self.sse(&[], &[0x0F, 0x28], dst.0, src);
+        }
     }
 
     /// `movq xmm, reg`.

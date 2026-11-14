@@ -8,7 +8,7 @@ use super::asm::{Alu, Mem, Reg, Rm, Shift, Size, Xmm};
 use super::float::scalar;
 use super::Emit;
 use crate::alloc::Location;
-use crate::frame::Ext;
+use crate::frame::{Emitter, Ext};
 use crate::ir::{Op, Type, Value};
 use crate::live::{Sib, SibBase};
 use crate::reloc::{RelocKind, StencilReloc};
@@ -136,6 +136,7 @@ impl Emit<'_> {
                         Mem::sib(scratch, idx, mode.shift, disp)
                     }
                     (None, None) => {
+                        self.clear_flags();
                         self.get(scratch, mode.index, Ext::Zero);
                         if mode.shift > 0 {
                             self.asm.shift_imm(Size::Q, Shift::Shl, scratch, mode.shift);
@@ -301,6 +302,14 @@ impl Emit<'_> {
 
     /// Loads the float or vector of type `ty` at `from` into `xmm`; an 8-byte vector by `movq` and a 16-byte vector by `movdqu`, which needs no alignment.
     pub(super) fn xmm_load(&mut self, ty: Type, xmm: Xmm, from: Mem) {
+        if self.features.avx {
+            let (pp, opcode) = if ty.is_vector() {
+                (0b10, if ty.bytes() == 16 { 0x6F } else { 0x7E })
+            } else {
+                (if ty == Type::F64 { 0b11 } else { 0b10 }, 0x10)
+            };
+            return self.asm.vex_xmm(0b00001, pp, opcode, (xmm, Xmm(0)), from);
+        }
         if ty.is_vector() {
             let (prefix, opcode) = if ty.bytes() == 16 { (0xF3, 0x6F) } else { (0xF3, 0x7E) };
             self.asm.sse(&[prefix], &[0x0F, opcode], xmm.0, from);
@@ -311,6 +320,14 @@ impl Emit<'_> {
 
     /// Stores the float or vector of type `ty` in `xmm` to `to`.
     pub(super) fn xmm_store(&mut self, ty: Type, to: Mem, xmm: Xmm) {
+        if self.features.avx {
+            let (pp, opcode) = if ty.is_vector() {
+                if ty.bytes() == 16 { (0b10, 0x7F) } else { (0b01, 0xD6) }
+            } else {
+                (if ty == Type::F64 { 0b11 } else { 0b10 }, 0x11)
+            };
+            return self.asm.vex_xmm(0b00001, pp, opcode, (xmm, Xmm(0)), to);
+        }
         if ty.is_vector() {
             let (prefix, opcode) = if ty.bytes() == 16 { (0xF3, 0x7F) } else { (0x66, 0xD6) };
             self.asm.sse(&[prefix], &[0x0F, opcode], xmm.0, to);

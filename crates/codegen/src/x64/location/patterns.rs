@@ -1,6 +1,7 @@
 use super::super::asm::Reg;
 use crate::alloc::Plan;
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
+use crate::live::{Sib, SibBase};
 
 pub(super) fn is_zero_const(func: &Function, plan: &Plan<Reg>, v: Value) -> bool {
     plan.const_of(v).is_some_and(|imm| crate::fold::extend(imm, func.ty(v), false) == 0)
@@ -215,4 +216,76 @@ pub(super) fn adc_parts(
         }
     }
     None
+}
+
+fn sib_clobbers_flags(func: &Function, plan: &Plan<Reg>, mode: Sib) -> bool {
+    let idx_ok = plan.reg_of(mode.index).is_some_and(|_| func.ty(mode.index).bytes() >= 8 || plan.zero_ext[mode.index.index()]);
+    match mode.base {
+        SibBase::Frame(_) => false,
+        SibBase::Value(base) => plan.reg_of(base).is_none() && !idx_ok,
+    }
+}
+
+fn addr_clobbers_flags(func: &Function, plan: &Plan<Reg>, addr: Value) -> bool {
+    plan.elided[addr.index()] && plan.sib[addr.index()].is_some_and(|m| sib_clobbers_flags(func, plan, m))
+}
+
+fn operand_clobbers_flags(func: &Function, plan: &Plan<Reg>, defs: &[Option<Inst>], v: Value) -> bool {
+    if !plan.elided[v.index()] {
+        return false;
+    }
+    let Some(inst) = defs[v.index()] else { return false };
+    matches!(func.insts[inst.index()].op, Op::Load(addr, _) if addr_clobbers_flags(func, plan, addr))
+}
+
+pub(super) fn mid_preserves_flags(
+    func: &Function,
+    plan: &Plan<Reg>,
+    defs: &[Option<Inst>],
+    cmp_res: Value,
+    inst: Inst,
+    is_last: bool,
+) -> bool {
+    let data = &func.insts[inst.index()];
+    if is_last && matches!(data.op, Op::Brif(..) | Op::Trapz(..)) {
+        return true;
+    }
+    if data.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()] || plan.is_static(r))
+        && !matches!(data.op, Op::Call { .. } | Op::TryCall { .. })
+    {
+        return true;
+    }
+    let res_ok = data.result.is_some_and(|r| {
+        let ty = func.ty(r);
+        !ty.is_vector() && ty != Type::I128
+    });
+    match data.op {
+        Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Symbol(_) | Op::SlotAddr(_) => res_ok,
+        Op::Load(addr, _) => res_ok && !addr_clobbers_flags(func, plan, addr),
+        Op::StackLoad(..) => res_ok,
+        Op::Store(val, addr, _) => !func.ty(val).is_vector() && func.ty(val) != Type::I128 && !addr_clobbers_flags(func, plan, addr),
+        Op::StackStore(val, ..) => !func.ty(val).is_vector() && func.ty(val) != Type::I128,
+        Op::Convert(Convert::Uextend | Convert::Sextend | Convert::Ireduce, src) => {
+            res_ok && !func.ty(src).is_vector() && !operand_clobbers_flags(func, plan, defs, src)
+        }
+        Op::Binary(Binary::Iadd | Binary::Isub, ..) => data.result.is_some_and(|r| {
+            func.ty(r) == Type::I64
+                && !plan.fused[r.index()]
+                && plan.sib[r.index()].is_some_and(|m| !sib_clobbers_flags(func, plan, m))
+        }),
+        Op::Binary(Binary::Imul, a, b) => data.result.is_some_and(|r| {
+            matches!(func.ty(r), Type::I32 | Type::I64)
+                && [(a, b), (b, a)].into_iter().any(|(x, c)| {
+                    !operand_clobbers_flags(func, plan, defs, x)
+                        && plan.const_of(c).is_some_and(|imm| matches!(imm, 0 | 1 | 3 | 5 | 9))
+                })
+        }),
+        Op::Select(cond_v, x, y) => {
+            (cond_v == cmp_res || x == y || plan.const_of(cond_v).is_some())
+                && !func.ty(x).is_vector()
+                && !operand_clobbers_flags(func, plan, defs, x)
+                && !operand_clobbers_flags(func, plan, defs, y)
+        }
+        _ => false,
+    }
 }

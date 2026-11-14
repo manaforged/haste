@@ -33,7 +33,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn zero_xmm(&mut self, xmm: Xmm) {
-        self.asm.sse(&[0x66], &[0x0F, 0x57], xmm.0, xmm);
+        self.sse_or_vex(&[0x66], &[0x0F, 0x57], (xmm, xmm, xmm));
         self.clobber_xmm(xmm);
     }
 
@@ -221,6 +221,7 @@ impl Emit<'_> {
 
     /// Compares by `ucomis`, the less-than forms with swapped operands; a compare fused with the next branch leaves its one condition in the flags.
     pub(super) fn fcmp(&mut self, cc: FloatCC, x: Value, y: Value, result: Value) {
+        self.flags = None;
         if self.ty(x).is_vector() {
             self.invalidate_spills();
             self.vector_fcmp(cc, x, y, result);

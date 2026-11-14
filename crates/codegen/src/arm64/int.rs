@@ -447,6 +447,12 @@ impl Emit<'_> {
             {
                 return self.asm.alu_shifted(Alu::Sub, size, Shift::Lsl, next.trailing_zeros() as u8, dst, reg, reg);
             }
+            let shift = uimm.trailing_zeros() as u8;
+            let odd = uimm >> shift;
+            if shift > 0 && matches!(odd, 3 | 5 | 9) {
+                self.asm.alu_shifted(Alu::Add, size, Shift::Lsl, (odd - 1).trailing_zeros() as u8, dst, reg, reg);
+                return lsl(&mut self.asm, dst, dst, shift);
+            }
         }
         let left = self.bits(x, A);
         let right = self.bits(y, C);
