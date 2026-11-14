@@ -610,7 +610,7 @@ impl Fold {
 }
 
 /// Calls `f` with each block the terminator of `block` jumps to with arguments, and those arguments.
-fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(Block, &'a [Value])) {
+pub(crate) fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(Block, &'a [Value])) {
     let Some(last) = func.blocks[block].insts.last() else { return };
     match &func.insts[last.index()].op {
         Op::Jump(target, args) => f(*target, args),

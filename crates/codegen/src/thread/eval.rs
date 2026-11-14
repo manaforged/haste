@@ -29,6 +29,60 @@ pub(super) struct EvalState {
     pub(super) edge_cmps: Vec<(Value, Type, IntCC, i64)>,
 }
 
+impl EvalState {
+    pub(super) fn seeded(&self) -> Vec<Value> {
+        self.local_consts.iter().map(|&(value, _)| value).chain(self.edge_cmps.iter().map(|&(value, ..)| value)).collect()
+    }
+
+    fn rename(&mut self, cx: &ThreadCx<'_>, from: Value, to: Value) {
+        self.map.retain(|&(k, _)| k != from);
+        self.map.push((from, to));
+        if let Some(f) = fact_of(&self.local_facts, cx.ranges, cx.ranges_len, to) {
+            self.local_facts.retain(|&(k, _)| k != from);
+            self.local_facts.push((from, f));
+        }
+    }
+
+    fn alias(&mut self, cx: &ThreadCx<'_>, res: Value, to: Value) {
+        self.rename(cx, res, to);
+        if let Some(imm) = lookup_const(&self.local_consts, cx.consts, to) {
+            self.local_consts.push((res, imm));
+        }
+    }
+}
+
+pub(super) fn bind(cx: &ThreadCx<'_>, state: &mut EvalState, params: &[Value], args: &[Value]) {
+    for (&param, &arg) in params.iter().zip(args) {
+        state.rename(cx, param, arg);
+    }
+}
+
+pub(super) fn step_inst(func: &Function, cx: &ThreadCx<'_>, inst: Inst, state: &mut EvalState) -> Option<()> {
+    let data = &func.insts[inst.index()];
+    let res = data.result?;
+    if !data.op.is_speculable() {
+        return None;
+    }
+    let mut op = data.op.clone();
+    op.map_operands(|v| lookup(&state.map, v));
+    if let Some(imm) = eval_op(func, &op, func.ty(res), &|v| lookup_const(&state.local_consts, cx.consts, v))
+        .or_else(|| eval_cmp_facts(func, cx, &op, state))
+    {
+        state.local_consts.push((res, imm));
+    } else if let Op::Select(c, x, y) = op
+        && let Some(taken) = eval_cond_truth(func, cx, state, c)
+    {
+        state.alias(cx, res, if taken { x } else { y });
+        return Some(());
+    } else if let Some(to) = propagate_pure_op(func, cx, res, &op, state) {
+        state.alias(cx, res, to);
+        return Some(());
+    }
+    state.local_ops.push((res, op));
+    state.map.retain(|&(k, _)| k != res);
+    Some(())
+}
+
 pub(super) fn lookup(map: &[(Value, Value)], value: Value) -> Value {
     map.iter().find(|&&(k, _)| k == value).map_or(value, |&(_, v)| v)
 }
@@ -252,7 +306,7 @@ pub(super) fn is_bool_val(func: &Function, defs: &[Option<Inst>], consts: &[Opti
     }
 }
 
-pub(super) fn eval_cmp_facts(func: &Function, cx: &ThreadCx<'_>, op: &Op, state: &EvalState) -> Option<i64> {
+fn eval_cmp_facts(func: &Function, cx: &ThreadCx<'_>, op: &Op, state: &EvalState) -> Option<i64> {
     let &Op::Icmp(cc, x, y) = op else { return None };
     let ty = func.ty(x);
     if !ty.is_small_int() {
@@ -278,7 +332,7 @@ pub(super) fn eval_cmp_facts(func: &Function, cx: &ThreadCx<'_>, op: &Op, state:
     None
 }
 
-pub(super) fn propagate_pure_op(func: &Function, cx: &ThreadCx<'_>, res: Value, op: &Op, state: &mut EvalState) -> Option<Value> {
+fn propagate_pure_op(func: &Function, cx: &ThreadCx<'_>, res: Value, op: &Op, state: &mut EvalState) -> Option<Value> {
     let res_ty = func.ty(res);
     if !res_ty.is_small_int() {
         return None;

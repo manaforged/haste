@@ -1,7 +1,7 @@
 use crate::ir::{Block, Function, Op, Value};
 
 use super::eval::{ThreadCx, lookup};
-use super::{Eval, block_bit, emit_needed, note_use, redefines};
+use super::{Eval, block_bit, body, emit_needed, note_use, redefines};
 
 const MAX_CARRY: usize = 8;
 
@@ -12,9 +12,7 @@ pub(super) struct Carry {
 }
 
 fn block_defs(func: &Function, block: Block) -> impl Iterator<Item = Value> + '_ {
-    let data = &func.blocks[block.index()];
-    let body = data.insts.split_last().map_or(&[][..], |(_, body)| body);
-    data.params.iter().copied().chain(body.iter().filter_map(move |&inst| func.insts[inst.index()].result))
+    func.blocks[block.index()].params.iter().copied().chain(body(func, block).iter().filter_map(move |&inst| func.insts[inst.index()].result))
 }
 
 fn flood(func: &Function, start: Block, wall: Block, mut visit: impl FnMut(Block) -> bool) -> Vec<bool> {
