@@ -50,6 +50,18 @@ impl Emit<'_> {
         }
     }
 
+    pub(super) fn is_zero_vec(&self, mut v: Value) -> bool {
+        for _ in 0..4 {
+            let Some(inst) = self.defs.get(v.index()).copied().flatten() else { return false };
+            match self.func.insts[inst.index()].op {
+                Op::Const(0) => return true,
+                Op::Convert(Convert::Bitcast, inner) => v = inner,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     pub(super) fn packed_regs(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), dst: Xmm) {
         let mut source = self.fin(y, X1);
         if source == dst && x != y {
@@ -60,7 +72,7 @@ impl Emit<'_> {
         self.asm.sse(prefix, opcode, dst.0, source);
     }
 
-    fn sse_or_vex(&mut self, prefix: &[u8], opcode: &[u8], (dst, sx, sy): (Xmm, Xmm, impl Into<Rm>)) {
+    pub(super) fn sse_or_vex(&mut self, prefix: &[u8], opcode: &[u8], (dst, sx, sy): (Xmm, Xmm, impl Into<Rm>)) {
         let sy = sy.into();
         let pp = match prefix { [] => Some(0), [0x66] => Some(1), [0xF3] => Some(2), [0xF2] => Some(3), _ => None };
         let map_opc = match opcode { [0x0F, o] => Some((1, *o)), [0x0F, 0x38, o] => Some((2, *o)), _ => None };
@@ -82,10 +94,12 @@ impl Emit<'_> {
 
     pub(super) fn vex_packed_regs(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), dst: Xmm, commute: bool) {
         if self.features.avx {
-            let (x, y) = if commute && self.xmm_of(x).is_none() && self.xmm_of(y).is_some() { (y, x) } else { (x, y) };
+            let (x, y) = if commute && self.xmm_of(x).is_none() && (self.xmm_of(y).is_some() || (self.ty(x).bytes() == 16 && self.elided_mem(x).is_some() && self.elided_mem(y).is_none())) { (y, x) } else { (x, y) };
             let sx = self.fin(x, X0);
             let cached_y = self.last_fspill.is_some_and(|(d, _, t)| d == self.frame.values[y.index()] && t == self.ty(y));
-            let sy: Rm = if self.ty(y).bytes() == 16 && matches!(self.location(y), Location::Slot) && !cached_y {
+            let sy: Rm = if let Some(mem) = (self.ty(y).bytes() == 16).then(|| self.elided_mem(y)).flatten() {
+                mem.into()
+            } else if self.ty(y).bytes() == 16 && matches!(self.location(y), Location::Slot) && !cached_y {
                 self.at(y).into()
             } else {
                 self.fin(y, X1).into()
@@ -727,12 +741,9 @@ impl Emit<'_> {
             let src_slot = Mem::new(Reg::Rsp, 16 + i32::from(i) * fl.bytes() as i32);
             let dst_slot = Mem::new(Reg::Rsp, i32::from(i) * tl.bytes() as i32);
             match op {
-                Convert::Uextend | Convert::Ireduce => {
-                    self.asm.load(Size::of(fl.bytes()), Reg::Rax, src_slot);
-                    self.asm.store(Size::of(tl.bytes()), dst_slot, Reg::Rax);
-                }
-                Convert::Sextend => {
-                    self.asm.load_signed(Size::of(fl.bytes()), Reg::Rax, src_slot);
+                Convert::Uextend | Convert::Ireduce | Convert::Sextend => {
+                    let sz = Size::of(fl.bytes());
+                    if matches!(op, Convert::Sextend) { self.asm.load_signed(sz, Reg::Rax, src_slot); } else { self.asm.load(sz, Reg::Rax, src_slot); }
                     self.asm.store(Size::of(tl.bytes()), dst_slot, Reg::Rax);
                 }
                 Convert::FromSint => {
@@ -761,12 +772,8 @@ impl Emit<'_> {
                 }
                 Convert::ToSintSat | Convert::ToUintSat => {
                     let fl_t = fl.to_type();
-                    if fl_t == Type::F32 {
-                        self.xmm_load(Type::F32, X0, src_slot);
-                        self.asm.sse(&[0xF3], &[0x0F, 0x5A], X0.0, X0);
-                    } else {
-                        self.xmm_load(Type::F64, X0, src_slot);
-                    }
+                    self.xmm_load(fl_t, X0, src_slot);
+                    if fl_t == Type::F32 { self.asm.sse(&[0xF3], &[0x0F, 0x5A], X0.0, X0); }
                     let signed = op == Convert::ToSintSat;
                     if signed { self.to_signed() } else { self.to_unsigned() }
                     self.clamp(tl.to_type(), signed);

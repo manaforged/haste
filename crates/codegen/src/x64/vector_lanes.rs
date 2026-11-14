@@ -47,15 +47,39 @@ impl Emit<'_> {
         }
     }
 
+    fn emit_mov_xmm_gpr(&mut self, dst: Xmm, reg: Reg, wide: bool) {
+        if self.features.avx && wide {
+            let r = reg as u8;
+            self.asm.bytes(&[0xC4, ((!dst.0 >> 3 & 1) << 7) | 0x41 | ((!r >> 3 & 1) << 5), 0xF9, 0x6E, 0xC0 | ((dst.0 & 7) << 3) | (r & 7)]);
+        } else if self.features.avx {
+            self.asm.vex_xmm(0b00001, 0b01, 0x6E, (dst, Xmm(0)), reg);
+        } else if wide {
+            self.asm.movq_in(dst, reg);
+        } else {
+            self.asm.movd_in(dst, reg);
+        }
+    }
+
+    fn emit_vpinsrq(&mut self, dst: Xmm, src: Xmm, reg: Reg, idx: u8) {
+        let r = reg as u8;
+        self.asm.bytes(&[0xC4, ((!dst.0 >> 3 & 1) << 7) | 0x43 | ((!r >> 3 & 1) << 5), 0x81 | ((!src.0 & 0xF) << 3), 0x22, 0xC0 | ((dst.0 & 7) << 3) | (r & 7), idx]);
+    }
+
     fn load_bytes16(&mut self, dst: Xmm, scratch: Xmm, bytes: [u8; 16]) {
         let lo = u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]) as i64;
         let hi = u64::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]]) as i64;
+        if lo == 0 && hi == 0 {
+            self.zero_xmm(dst);
+            return;
+        }
         self.asm.mov_imm(Reg::Rax, lo);
-        self.asm.movq_in(dst, Reg::Rax);
-        if hi != 0 {
+        self.emit_mov_xmm_gpr(dst, Reg::Rax, true);
+        if hi == lo {
+            self.sse_or_vex(&[0x66], &[0x0F, 0x6C], (dst, dst, dst));
+        } else if hi != 0 {
             self.asm.mov_imm(Reg::Rax, hi);
-            self.asm.movq_in(scratch, Reg::Rax);
-            self.asm.sse(&[0x66], &[0x0F, 0x6C], dst.0, scratch);
+            self.emit_mov_xmm_gpr(scratch, Reg::Rax, true);
+            self.sse_or_vex(&[0x66], &[0x0F, 0x6C], (dst, dst, scratch));
         }
     }
 
@@ -103,33 +127,28 @@ impl Emit<'_> {
                 return;
             }
             let imm = match (lane.bytes(), count) {
-                (4, 4) => Some(
-                    ((indices[0] - off) & 3)
-                        | (((indices[1] - off) & 3) << 2)
-                        | (((indices[2] - off) & 3) << 4)
-                        | (((indices[3] - off) & 3) << 6),
-                ),
+                (4, 4) => Some(((indices[0] - off) & 3) | (((indices[1] - off) & 3) << 2) | (((indices[2] - off) & 3) << 4) | (((indices[3] - off) & 3) << 6)),
                 (8, 2) => {
-                    let l0 = (indices[0] - off) * 2;
-                    let l1 = (indices[1] - off) * 2;
+                    let (l0, l1) = ((indices[0] - off) * 2, (indices[1] - off) * 2);
                     Some(l0 | ((l0 + 1) << 2) | (l1 << 4) | ((l1 + 1) << 6))
                 }
+                (2, 4) => Some(((indices[0] - off) & 3) | (((indices[1] - off) & 3) << 2) | (((indices[2] - off) & 3) << 4) | (((indices[3] - off) & 3) << 6)),
                 _ => None,
             };
             if let Some(imm) = imm {
+                let (pp_byte, pp_vex) = if lane.bytes() == 2 { (0xF2, 0b11) } else { (0x66, 0b01) };
                 let src = self.fin(src_val, X0);
-                self.asm.sse_imm(&[0x66], &[0x0F, 0x70], dst.0, src, imm);
+                if self.features.avx {
+                    self.asm.vex_xmm_imm(0b00001, pp_vex, 0x70, (dst, Xmm(0)), src, imm);
+                } else {
+                    self.asm.sse_imm(&[pp_byte], &[0x0F, 0x70], dst.0, src, imm);
+                }
                 return;
             }
-            if lane.bytes() == 2 && count == 4 {
-                let imm = ((indices[0] - off) & 3)
-                    | (((indices[1] - off) & 3) << 2)
-                    | (((indices[2] - off) & 3) << 4)
-                    | (((indices[3] - off) & 3) << 6);
-                let src = self.fin(src_val, X0);
-                self.asm.sse_imm(&[0xF2], &[0x0F, 0x70], dst.0, src, imm);
-                return;
-            }
+        }
+        if lane.bytes() == 8 && count == 2 && matches!((indices[0], indices[1]), (0, 2) | (1, 3)) {
+            self.vex_packed_regs(&[0x66], &[0x0F, if indices[0] == 0 { 0x6C } else { 0x6D }], (a, b), dst, false);
+            return;
         }
         let bytes = lane.bytes() as usize;
         if bytes * c == 16 {
@@ -137,11 +156,7 @@ impl Emit<'_> {
             for l in 0..c {
                 let idx = indices[l];
                 if idx < 2 * count {
-                    let base = if idx < count {
-                        idx * bytes as u8
-                    } else {
-                        16 + (idx - count) * bytes as u8
-                    };
+                    let base = if idx < count { idx * bytes as u8 } else { 16 + (idx - count) * bytes as u8 };
                     for k in 0..bytes {
                         bidx[l * bytes + k] = base + k as u8;
                     }
@@ -158,12 +173,10 @@ impl Emit<'_> {
                 let mut imm = 0_u8;
                 let mut ok = true;
                 for w in 0..8_u8 {
-                    let lo = bidx[usize::from(2 * w)];
-                    let hi = bidx[usize::from(2 * w + 1)];
-                    if lo == 2 * w && hi == 2 * w + 1 {
-                    } else if lo == 16 + 2 * w && hi == 17 + 2 * w {
+                    let (lo, hi) = (bidx[usize::from(2 * w)], bidx[usize::from(2 * w + 1)]);
+                    if lo == 16 + 2 * w && hi == 17 + 2 * w {
                         imm |= 1 << w;
-                    } else {
+                    } else if lo != 2 * w || hi != 2 * w + 1 {
                         ok = false;
                         break;
                     }
@@ -177,8 +190,7 @@ impl Emit<'_> {
         if self.features.ssse3 {
             let mut mask_a = [0x80_u8; 16];
             let mut mask_b = [0x80_u8; 16];
-            let mut uses_a = false;
-            let mut uses_b = false;
+            let (mut uses_a, mut uses_b) = (false, false);
             for l in 0..c {
                 let idx = indices[l];
                 if idx < count {
@@ -201,24 +213,14 @@ impl Emit<'_> {
             if uses_a ^ uses_b {
                 let (src_val, mask) = if uses_a { (a, mask_a) } else { (b, mask_b) };
                 self.load_bytes16(X1, X0, mask);
-                if self.features.avx {
-                    let src = self.fin(src_val, dst);
-                    self.asm.vex_xmm(0b00010, 0b01, 0x00, (dst, src), X1);
-                } else {
-                    self.fget(dst, src_val);
-                    self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], dst.0, X1);
-                }
+                let src = self.fin(src_val, dst);
+                self.sse_or_vex(&[0x66], &[0x0F, 0x38, 0x00], (dst, src, X1));
                 self.clobber_xmms(&[X0, X1, dst]);
                 return;
             }
             self.load_bytes16(X1, X2, mask_a);
-            if self.features.avx {
-                let sa = self.fin(a, X0);
-                self.asm.vex_xmm(0b00010, 0b01, 0x00, (X0, sa), X1);
-            } else {
-                self.fget(X0, a);
-                self.asm.sse(&[0x66], &[0x0F, 0x38, 0x00], X0.0, X1);
-            }
+            let sa = self.fin(a, X0);
+            self.sse_or_vex(&[0x66], &[0x0F, 0x38, 0x00], (X0, sa, X1));
             self.clobber_xmms(&[X0, X1, X2]);
             self.load_bytes16(X1, X2, mask_b);
             if self.features.avx {
@@ -402,8 +404,7 @@ impl Emit<'_> {
             let dst = self.fdst(result);
             let src = self.fin(v, if idx == 0 { dst } else { X0 });
             match (lane, idx) {
-                (_, 0) if dst != src => self.asm.movaps(dst, src),
-                (_, 0) => {}
+                (_, 0) => if dst != src { self.asm.movaps(dst, src); },
                 (Lane::F32, _) => self.asm.sse_imm(&[0x66], &[0x0F, 0x70], dst.0, src, idx),
                 (Lane::F64, _) => self.asm.sse_imm(&[0x66], &[0x0F, 0x70], dst.0, src, 0xEE),
                 _ => {}
@@ -421,26 +422,18 @@ impl Emit<'_> {
             }
             (Lane::I32, 0) => self.asm.movd_out(dst, src),
             (Lane::I64, 0) => self.asm.movq_out(dst, src),
-            (Lane::I8, _) if self.features.sse41 => {
-                self.asm.sse_imm(&[0x66], &[0x0F, 0x3A, 0x14], src.0, dst, idx);
-            }
+            (Lane::I8, _) if self.features.sse41 => self.asm.sse_imm(&[0x66], &[0x0F, 0x3A, 0x14], src.0, dst, idx),
             (Lane::I8, _) => {
                 self.asm.sse_imm(&[0x66], &[0x0F, 0xC5], dst as u8, src, idx / 2);
-                if idx & 1 != 0 {
-                    self.asm.shift_imm(Size::D, Shift::Shr, dst, 8);
-                }
+                if idx & 1 != 0 { self.asm.shift_imm(Size::D, Shift::Shr, dst, 8); }
                 self.asm.load(Size::B, dst, dst);
             }
-            (Lane::I32, _) if self.features.sse41 => {
-                self.asm.sse_imm(&[0x66], &[0x0F, 0x3A, 0x16], src.0, dst, idx);
-            }
+            (Lane::I32, _) if self.features.sse41 => self.asm.sse_imm(&[0x66], &[0x0F, 0x3A, 0x16], src.0, dst, idx),
             (Lane::I32, _) => {
                 self.asm.sse_imm(&[0x66], &[0x0F, 0x70], X1.0, src, idx);
                 self.asm.movd_out(dst, X1);
             }
-            (Lane::I64, _) if self.features.sse41 => {
-                self.asm.sse_wide_imm(&[0x66], &[0x0F, 0x3A, 0x16], src.0, dst, idx);
-            }
+            (Lane::I64, _) if self.features.sse41 => self.asm.sse_wide_imm(&[0x66], &[0x0F, 0x3A, 0x16], src.0, dst, idx),
             (Lane::I64, _) => {
                 self.asm.sse_imm(&[0x66], &[0x0F, 0x70], X1.0, src, 0xEE);
                 self.asm.movq_out(dst, X1);
@@ -479,6 +472,37 @@ impl Emit<'_> {
             self.fput(result, dst);
             return Ok(());
         }
+        if matches!(lane, Lane::I8 | Lane::I16 | Lane::I32 | Lane::I64) && idx == 0 && self.is_zero_vec(v) {
+            if self.const_of(x) == Some(0) {
+                self.zero_xmm(dst);
+            } else {
+                let reg = match self.reg_of(x) {
+                    Some(r) if self.ty(x).bytes() >= 4 => r,
+                    _ => {
+                        self.get(Reg::Rax, x, Ext::Zero);
+                        Reg::Rax
+                    }
+                };
+                self.emit_mov_xmm_gpr(dst, reg, lane == Lane::I64);
+            }
+            self.fput(result, dst);
+            return Ok(());
+        }
+        if self.features.avx && (lane == Lane::I16 || self.features.sse41) {
+            let reg = self.reg_of(x).unwrap_or_else(|| {
+                self.get(Reg::Rax, x, Ext::Zero);
+                Reg::Rax
+            });
+            let sv = self.fin(v, dst);
+            match lane {
+                Lane::I8 => self.asm.vex_xmm_imm(0b00011, 0b01, 0x20, (dst, sv), reg, idx),
+                Lane::I16 => self.asm.vex_xmm_imm(0b00001, 0b01, 0xC4, (dst, sv), reg, idx),
+                Lane::I32 => self.asm.vex_xmm_imm(0b00011, 0b01, 0x22, (dst, sv), reg, idx),
+                _ => self.emit_vpinsrq(dst, sv, reg, idx),
+            }
+            self.fput(result, dst);
+            return Ok(());
+        }
         self.fget(dst, v);
         self.get(Reg::Rax, x, Ext::Zero);
         match lane {
@@ -507,31 +531,19 @@ impl Emit<'_> {
         if op == ReduceOp::Movemask {
             let dst = self.dst(result);
             let src = self.fin(v, X0);
-            match lane {
-                Lane::I8 => {
-                    self.asm.sse(&[0x66], &[0x0F, 0xD7], dst as u8, src);
-                    if count < 16 {
-                        self.asm.alu_imm32(Alu::And, dst, (1_i32 << count) - 1);
-                    }
-                }
+            let full = match lane {
+                Lane::I8 => { self.asm.sse(&[0x66], &[0x0F, 0xD7], dst as u8, src); 16 }
                 Lane::I16 => {
                     self.asm.movaps(X0, src);
                     self.asm.sse(&[0x66], &[0x0F, 0x63], X0.0, X0);
                     self.asm.sse(&[0x66], &[0x0F, 0xD7], dst as u8, X0);
-                    self.asm.alu_imm32(Alu::And, dst, (1_i32 << count) - 1);
+                    0
                 }
-                Lane::I32 | Lane::F32 => {
-                    self.asm.sse(&[], &[0x0F, 0x50], dst as u8, src);
-                    if count < 4 {
-                        self.asm.alu_imm32(Alu::And, dst, (1_i32 << count) - 1);
-                    }
-                }
-                Lane::I64 | Lane::F64 => {
-                    self.asm.sse(&[0x66], &[0x0F, 0x50], dst as u8, src);
-                    if count < 2 {
-                        self.asm.alu_imm32(Alu::And, dst, (1_i32 << count) - 1);
-                    }
-                }
+                Lane::I32 | Lane::F32 => { self.asm.sse(&[], &[0x0F, 0x50], dst as u8, src); 4 }
+                Lane::I64 | Lane::F64 => { self.asm.sse(&[0x66], &[0x0F, 0x50], dst as u8, src); 2 }
+            };
+            if count < full || full == 0 {
+                self.asm.alu_imm32(Alu::And, dst, (1_i32 << count) - 1);
             }
             self.put(result, dst);
             return Ok(());
@@ -565,20 +577,14 @@ impl Emit<'_> {
         }
         if lane.is_float() {
             let dst = self.fdst(result);
-            if dst != X0 {
-                self.asm.movaps(dst, X0);
-            }
+            if dst != X0 { self.asm.movaps(dst, X0); }
             self.fput(result, dst);
         } else {
             let dst = self.dst(result);
             match lane {
-                Lane::I8 => {
+                Lane::I8 | Lane::I16 => {
                     self.asm.movd_out(dst, X0);
-                    self.asm.load(Size::B, dst, dst);
-                }
-                Lane::I16 => {
-                    self.asm.movd_out(dst, X0);
-                    self.asm.load(Size::W, dst, dst);
+                    self.asm.load(Size::of(lane.bytes()), dst, dst);
                 }
                 Lane::I32 => self.asm.movd_out(dst, X0),
                 Lane::I64 => self.asm.movq_out(dst, X0),
@@ -658,12 +664,8 @@ impl Emit<'_> {
             self.clobber_xmm(X1);
             src_b = X1;
         }
-        if let Some(kv) = k && !got_k {
-            self.fget(X0, kv);
-        }
-        if !got_a {
-            self.fget(dst, a);
-        }
+        if let Some(kv) = k && !got_k { self.fget(X0, kv); }
+        if !got_a { self.fget(dst, a); }
         self.asm.sse(spec.prefix, spec.opcode, dst.0, src_b);
         self.clobber_xmm(dst);
         self.fput(result, dst);
@@ -692,16 +694,20 @@ impl Emit<'_> {
         Ok(())
     }
 
-    pub(super) fn scalarize_int_binary(&mut self, op: Binary, lane: Lane, count: u8, x: Value, y: Value, dst: Xmm) {
-        let ty = Type::Vec { lane, count };
-        let stride = lane.bytes() as i32;
-        let size = Size::of(lane.bytes());
-        let signed_load = matches!(op, Binary::Smin | Binary::Smax | Binary::Sshr);
+    fn spill_vec_pair(&mut self, ty: Type, x: Value, y: Value) {
         self.asm.alu_imm(Alu::Sub, Reg::Rsp, 32);
         self.fget(X0, x);
         self.xmm_store(ty, Mem::new(Reg::Rsp, 0), X0);
         self.fget(X0, y);
         self.xmm_store(ty, Mem::new(Reg::Rsp, 16), X0);
+    }
+
+    pub(super) fn scalarize_int_binary(&mut self, op: Binary, lane: Lane, count: u8, x: Value, y: Value, dst: Xmm) {
+        let ty = Type::Vec { lane, count };
+        let stride = lane.bytes() as i32;
+        let size = Size::of(lane.bytes());
+        let signed_load = matches!(op, Binary::Smin | Binary::Smax | Binary::Sshr);
+        self.spill_vec_pair(ty, x, y);
         for i in 0..i32::from(count) {
             let sx = Mem::new(Reg::Rsp, i * stride);
             let sy = Mem::new(Reg::Rsp, 16 + i * stride);
@@ -756,9 +762,7 @@ impl Emit<'_> {
             } else {
                 self.asm.load(size, Reg::Rax, slot);
                 self.count(super::asm::Count::Lzcnt, Reg::Rax, Reg::Rax);
-                if lane.bits() < 64 {
-                    self.asm.alu_imm(Alu::Sub, Reg::Rax, (64 - lane.bits()) as i32);
-                }
+                if lane.bits() < 64 { self.asm.alu_imm(Alu::Sub, Reg::Rax, (64 - lane.bits()) as i32); }
             }
             self.asm.store(size, slot, Reg::Rax);
         }
@@ -769,11 +773,7 @@ impl Emit<'_> {
     pub(super) fn scalarize_int_icmp(&mut self, cc: IntCC, lane: Lane, count: u8, x: Value, y: Value, dst: Xmm) {
         let ty = Type::Vec { lane, count };
         let stride = lane.bytes() as i32;
-        self.asm.alu_imm(Alu::Sub, Reg::Rsp, 32);
-        self.fget(X0, x);
-        self.xmm_store(ty, Mem::new(Reg::Rsp, 0), X0);
-        self.fget(X0, y);
-        self.xmm_store(ty, Mem::new(Reg::Rsp, 16), X0);
+        self.spill_vec_pair(ty, x, y);
         for i in 0..i32::from(count) {
             let sx = Mem::new(Reg::Rsp, i * stride);
             let sy = Mem::new(Reg::Rsp, 16 + i * stride);

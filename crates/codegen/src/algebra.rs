@@ -1,8 +1,9 @@
 use crate::fold::extend;
-use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
+use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, ShuffleMask, Type, Unary, Value};
 
 mod icmp;
 mod select;
+mod vec;
 pub(crate) use icmp::{is_non_null_addr, non_null_cmp};
 pub(crate) use select::{fold_bxor_conds, invert};
 
@@ -581,8 +582,18 @@ fn simplify_binary(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec
 fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(Value, Value, Value)>, res: Option<Value>, op: Op) -> Option<Op> {
     match op {
         Op::Icmp(cc, x, y) => simplify_icmp(cx, res, cc, x, y),
-        Op::Binary(bin, a, b) => simplify_binary(cx, fits_used, block_udivs, res, (bin, a, b)),
+        Op::Binary(bin, a, b) => {
+            if res.is_some_and(|r| cx.func.ty(r).is_vector()) {
+                vec::simplify_vec_binary(cx, res, bin, a, b)
+            } else {
+                simplify_binary(cx, fits_used, block_udivs, res, (bin, a, b))
+            }
+        }
+        Op::Convert(Convert::Bitcast, x) => vec::simplify_bitcast(cx, res, x),
         Op::Convert(kind, x) => simplify_convert(cx, res, kind, x),
+        Op::Insert(v, x, lane) => vec::simplify_insert(cx, res, v, x, lane),
+        Op::Extract(v, lane) => vec::simplify_extract(cx, res, v, lane),
+        Op::Shuffle(a, b, ShuffleMask::Const(m)) => vec::simplify_shuffle(cx, res, a, b, m),
         Op::Select(cond, t, f) => select::simplify_select(cx, res, cond, t, f),
         Op::Brif(cond, tb, ta, eb, ea) => match_swar_msb_broadcast(cx, cond).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
         Op::Load(addr, off) if !cx.func.rodata_bytes.is_empty() && off >= 0 => res.and_then(|r| fold_rodata_load(cx, cx.func.ty(r), addr, off)),
