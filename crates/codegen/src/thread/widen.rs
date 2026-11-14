@@ -40,9 +40,10 @@ enum EdgePlan {
 /// Widens narrow `I8` and `I16` loop and block parameters to `I32` or `I64` when their upper bits are provably zero or cheaply preserved, eliminating repeated `Uextend` operations inside loops.
 pub(super) fn run(func: &mut Function) -> bool {
     let Some(entry) = func.entry else { return false };
+    if !func.blocks.iter().any(|block| block.params.iter().any(|&param| is_narrow(func.ty(param)))) {
+        return false;
+    }
     let cfg = func.cfg();
-    let defs = collect_defs(func);
-    let consts = fold_consts(func, &cfg);
     let mut blocked = vec![false; func.blocks.len()];
     blocked[entry.index()] = true;
     for data in &func.insts {
@@ -65,6 +66,8 @@ pub(super) fn run(func: &mut Function) -> bool {
     if cands.is_empty() {
         return false;
     }
+    let defs = collect_defs(func);
+    let consts = fold_consts(func, &cfg);
     let mut val_to_cand = vec![None; func.types.len()];
     for (idx, c) in cands.iter().enumerate() {
         val_to_cand[c.param.index()] = Some(idx);
@@ -78,6 +81,10 @@ pub(super) fn run(func: &mut Function) -> bool {
     }
     apply_widening(func, &defs, &consts, &cands, &val_to_cand, &kept);
     true
+}
+
+fn is_narrow(ty: Type) -> bool {
+    matches!(ty, Type::I8 | Type::I16)
 }
 
 fn fold_consts(func: &Function, cfg: &Cfg) -> Vec<Option<i64>> {
@@ -121,7 +128,7 @@ fn collect_candidates(func: &Function, cfg: &Cfg, blocked: &[bool]) -> Vec<Candi
         }
         for (p_idx, &param) in block.params.iter().enumerate() {
             let ty = func.ty(param);
-            if !matches!(ty, Type::I8 | Type::I16) || uext_counts[param.index()] == 0 || bad_use[param.index()] {
+            if !is_narrow(ty) || uext_counts[param.index()] == 0 || bad_use[param.index()] {
                 continue;
             }
             let wide_ty = if uext_has_64[param.index()] { Type::I64 } else { Type::I32 };

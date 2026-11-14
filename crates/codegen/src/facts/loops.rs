@@ -318,7 +318,7 @@ fn ptr_end_parts(func: &Function, ranges: &Ranges, end: Value, base: Value) -> O
 }
 
 impl Env {
-    pub(super) fn collect_loop(&mut self, func: &Function, (cfg, ranges, incoming, complete, exits): (&Cfg, &Ranges, &[Vec<(Block, &[Value])>], &[bool], &[Option<Path>]), each: &Loop) {
+    pub(super) fn collect_loop(&mut self, func: &Function, (cfg, ranges, incoming, complete, exits, def_blocks): (&Cfg, &Ranges, &[Vec<(Block, &[Value])>], &[bool], &[Option<Path>], &std::cell::OnceCell<Vec<Option<Block>>>), each: &Loop) {
         if !complete[each.head.index()] || func.blocks[each.head.index()].params.is_empty() {
             return;
         }
@@ -363,7 +363,7 @@ impl Env {
                 self.param_lo.push((each.head, p, min_lo));
             }
         }
-        let def_blocks = func.def_blocks();
+        let def_blocks = def_blocks.get_or_init(|| func.def_blocks());
         let push_inv = |v: Value, list: &mut Vec<Value>| {
             if def_blocks.get(v.index()).copied().flatten().is_some_and(|db| !each.body[db.index()] && cfg.dominates(db, each.head))
                 && !list.contains(&v)
@@ -414,6 +414,7 @@ impl Env {
                 if func.ty(q) != ty {
                     continue;
                 }
+                let mut ordered = [None; 2];
                 for &bound in &bounds {
                     if func.ty(bound) != ty {
                         continue;
@@ -428,8 +429,9 @@ impl Env {
                     if sum_step {
                         self.sums.push(SumInv { head: each.head, p, q, bound, ty });
                     }
-                    for (kl, kh, lo, hi) in [(k1, k2, p, q), (k2, k1, q, p)] {
-                        let ord_base = outside.iter().all(|(path, args)| edge_ule(func, ranges, path, ty, args[kl], args[kh]) && edge_ule(func, ranges, path, ty, args[kh], bound));
+                    for (dir, (kl, kh, lo, hi)) in [(k1, k2, p, q), (k2, k1, q, p)].into_iter().enumerate() {
+                        let ord_base = *ordered[dir].get_or_insert_with(|| outside.iter().all(|(path, args)| edge_ule(func, ranges, path, ty, args[kl], args[kh])))
+                            && outside.iter().all(|(path, args)| edge_ule(func, ranges, path, ty, args[kh], bound));
                         let ord_step = ord_base
                             && inside.iter().all(|&(_, ref gp, _, args)| {
                                 arms.clear();
@@ -502,10 +504,10 @@ impl Env {
             let Some(step) = step.filter(|_| step_ok) else { continue };
             for (end_idx, db) in def_blocks.iter().enumerate() {
                 let end = Value(end_idx as u32);
+                let Some((len, shift, stride)) = ptr_end_parts(func, ranges, end, base) else { continue };
                 if db.is_none_or(|b| each.body[b.index()] || !cfg.dominates(b, each.head)) {
                     continue;
                 }
-                let Some((len, shift, stride)) = ptr_end_parts(func, ranges, end, base) else { continue };
                 let guarded = inside.iter().all(|&(_, ref gp, ref ge, _)| {
                     ge.diffs.iter().any(|&(de, dp, md)| de == end && dp == ptr && md >= step)
                         || (step == 1 && gp.decide_rel(func, ranges, IntCC::NotEqual, Type::I64, end, ptr) == Some(true))
@@ -598,13 +600,14 @@ impl ExtraPath {
             return false;
         }
         self.proves_ult(func, (cfg, ranges, env, path, block), ty, a, b, depth + 1)
-            || env.sums.iter().any(|s| s.ty == ty && cfg.dominates(s.head, block) && (a == s.p || a == s.q) && edge_ule(func, ranges, path, ty, s.bound, b))
+            || env.sums.iter().any(|s| s.ty == ty && (a == s.p || a == s.q) && cfg.dominates(s.head, block) && edge_ule(func, ranges, path, ty, s.bound, b))
             || env.orders.iter().any(|o| {
                 o.ty == ty
+                    && (a == o.lo || a == o.hi)
                     && cfg.dominates(o.head, block)
                     && ((a == o.lo && edge_ule(func, ranges, path, ty, o.hi, b)) || (a == o.hi && edge_ule(func, ranges, path, ty, o.bound, b)))
             })
-            || env.rel_invs.iter().any(|r| r.ty == ty && cfg.dominates(r.head, block) && a == r.param && edge_ule(func, ranges, path, ty, r.bound, b))
+            || env.rel_invs.iter().any(|r| r.ty == ty && a == r.param && cfg.dominates(r.head, block) && edge_ule(func, ranges, path, ty, r.bound, b))
             || self.subs.iter().any(|sb| sb.ty == ty && a == sb.idx && edge_ule(func, ranges, path, ty, sb.end, b))
     }
 
@@ -617,8 +620,8 @@ impl ExtraPath {
         }
         for r in &env.rel_invs {
             if r.ty == ty
-                && cfg.dominates(r.head, block)
                 && a == r.param
+                && cfg.dominates(r.head, block)
                 && if r.strict {
                     self.proves_ule(func, (cfg, ranges, env, path, block), ty, r.bound, b, depth + 1)
                 } else {

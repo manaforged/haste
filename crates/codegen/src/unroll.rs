@@ -698,8 +698,9 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         return Domain::NONE;
     }
     let Some(entry) = func.entry else { return Domain::NONE };
-    let mut cfg = func.cfg();
-    let loops = cfg.loops();
+    let initial = func.cfg();
+    let loops = initial.loops();
+    let mut cfg = std::sync::Arc::clone(&initial);
     let mut global_consts = collect_global_consts(func, &cfg);
     let mut changed = false;
     let mut dirty = false;

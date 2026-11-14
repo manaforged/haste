@@ -586,7 +586,8 @@ impl Function {
 
     pub(crate) fn cfg(&self) -> std::sync::Arc<crate::cfg::Cfg> {
         let mut guard = self.cfg_cache.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((rev, cfg)) = &*guard && *rev == self.cfg_rev {
+        if let Some((rev, cfg)) = &mut *guard && (*rev == self.cfg_rev || cfg.matches(self)) {
+            *rev = self.cfg_rev;
             return std::sync::Arc::clone(cfg);
         }
         let cfg = std::sync::Arc::new(crate::cfg::Cfg::new(self));

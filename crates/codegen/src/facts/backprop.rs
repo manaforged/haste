@@ -1,7 +1,9 @@
 use crate::ir::{Binary, Convert, Function, Op, Type, Value};
 
-use super::rel::{Path, RelKind, rel_step};
+use super::rel::{Path, RelKind, UNSIGNED};
 use super::{Fact, Ranges};
+
+const CHAIN_STEPS: usize = 4;
 
 impl Path {
     pub(super) fn is_no_wrap_pair(&self, ranges: &Ranges, ty: Type, base: Value, c: Value, k: u64) -> bool {
@@ -116,28 +118,30 @@ impl Path {
         fact
     }
 
-    fn add_const_chain(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> Vec<(Value, u64)> {
+    fn add_const_chain(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> ([(Value, u64); CHAIN_STEPS + 1], usize) {
         let max = ty.unsigned_max();
-        let mut out = vec![(val, 0_u64)];
+        let mut out = [(val, 0_u64); CHAIN_STEPS + 1];
+        let mut len = 1;
         let (mut cur, mut acc) = (val, 0_u64);
-        for _ in 0..4 {
+        for _ in 0..CHAIN_STEPS {
             let Some(&Op::Binary(Binary::Iadd, p, q)) = ranges.op(func, cur) else { break };
             let Some((base, k)) = [(p, q), (q, p)].into_iter().find_map(|(b, c)| self.fact(ranges, c).exact().map(|k| (b, k))) else {
                 break;
             };
             let Some(next_acc) = acc.checked_add(k).filter(|&s| s <= max) else { break };
-            out.push((base, next_acc));
+            out[len] = (base, next_acc);
+            len += 1;
             cur = base;
             acc = next_acc;
         }
-        out
+        (out, len)
     }
 
     fn non_wrap_iadd_chain(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> Vec<(Value, u64)> {
         let max = ty.unsigned_max();
         let mut out = Vec::new();
         let (mut cur, mut acc, mut all_steps) = (val, 0_u64, true);
-        for step in 0..4 {
+        for step in 0..CHAIN_STEPS {
             let Some(&Op::Binary(Binary::Iadd, p, q)) = ranges.op(func, cur) else { break };
             let Some((base, c_val, k)) = [(p, q), (q, p)]
                 .into_iter()
@@ -167,30 +171,11 @@ impl Path {
         if self.rels.is_empty() {
             return best;
         }
-        let mut seen: Vec<(Value, bool)> = vec![(start, false)];
-        let mut idx = 0;
-        while idx < seen.len() {
-            let (cur, cur_strict) = seen[idx];
-            idx += 1;
-            for &r in &self.rels {
-                let Some((next, step_strict)) = rel_step(r, cur, ty, (RelKind::Ult, RelKind::Ule)) else {
-                    continue;
-                };
-                let next_strict = cur_strict || step_strict;
-                let nhi = self.fact(ranges, next).hi;
-                best = best.min(if next_strict { nhi.saturating_sub(1) } else { nhi });
-                if seen.len() < 16 {
-                    if let Some(entry) = seen.iter_mut().find(|(v, _)| *v == next) {
-                        if next_strict && !entry.1 {
-                            entry.1 = true;
-                            seen.push((next, true));
-                        }
-                    } else {
-                        seen.push((next, next_strict));
-                    }
-                }
-            }
-        }
+        self.walk(ty, start, UNSIGNED, |next, next_strict| {
+            let nhi = self.fact(ranges, next).hi;
+            best = best.min(if next_strict { nhi.saturating_sub(1) } else { nhi });
+            false
+        });
         best
     }
 
@@ -215,6 +200,7 @@ impl Path {
                 }
             }
         }
+        let mut linked = None;
         for &r in &self.rels {
             if r.ty != ty {
                 continue;
@@ -231,7 +217,7 @@ impl Path {
                 }
                 let mut rhs_hi = None;
                 for (s_base, k) in self.non_wrap_iadd_chain(func, ranges, lhs, ty) {
-                    if self.reaches(ty, x, s_base, (RelKind::Ult, RelKind::Ule), false) {
+                    if self.linked_reach(ty, *linked.get_or_insert_with(|| self.steps_from(ty, x, UNSIGNED)), x, s_base, UNSIGNED) {
                         let rhi = *rhs_hi.get_or_insert_with(|| self.min_reachable_hi(ranges, ty, rhs));
                         if let Some(bound) = k.checked_add(extra).and_then(|d| rhi.checked_sub(d)) {
                             hi = hi.min(bound);
@@ -244,12 +230,16 @@ impl Path {
     }
 
     pub(super) fn proves_add_rel(&self, func: &Function, ranges: &Ranges, ty: Type, a: Value, b: Value, strict: bool) -> bool {
-        if self.rels.is_empty() && !matches!(ranges.op(func, b), Some(Op::Binary(Binary::Iadd, ..))) {
+        let is_add = |v: Value| matches!(ranges.op(func, v), Some(Op::Binary(Binary::Iadd, ..)));
+        if self.rels.is_empty() && !is_add(b) {
             return false;
         }
-        let a_forms = self.add_const_chain(func, ranges, a, ty);
+        let (forms, len) = self.add_const_chain(func, ranges, a, ty);
+        let a_forms = &forms[..len];
+        let into_b = self.steps_into(ty, b, UNSIGNED);
+        let prune = !into_b && (strict || a_forms.len() > 1);
         let mut upper_terms: Vec<(Value, Value, u64)> = Vec::new();
-        if matches!(ranges.op(func, b), Some(Op::Binary(Binary::Iadd, ..))) {
+        if is_add(b) {
             for (b_base, k) in self.non_wrap_iadd_chain(func, ranges, b, ty) {
                 upper_terms.push((b, b_base, k));
             }
@@ -264,10 +254,13 @@ impl Path {
                 _ => [None, None],
             };
             for s in candidates.into_iter().flatten() {
+                if prune && s != b {
+                    continue;
+                }
                 if a_forms.len() > 1 {
                     upper_terms.push((s, s, 0));
                 }
-                if matches!(ranges.op(func, s), Some(Op::Binary(Binary::Iadd, ..))) {
+                if is_add(s) {
                     for (s_base, k) in self.non_wrap_iadd_chain(func, ranges, s, ty) {
                         upper_terms.push((s, s_base, k));
                     }
@@ -277,19 +270,19 @@ impl Path {
         if upper_terms.is_empty() || (a_forms.len() == 1 && !upper_terms.iter().any(|&(_, _, k)| k > 0)) {
             return false;
         }
-        for &(a_base, c) in &a_forms {
+        for &(a_base, c) in a_forms {
+            let linked = self.steps_from(ty, a_base, UNSIGNED);
             for &(s, s_base, k) in &upper_terms {
-                if !self.reaches(ty, a_base, s_base, (RelKind::Ult, RelKind::Ule), false) {
+                let require_strict = if c <= k {
+                    strict && c == k
+                } else if !strict && k.checked_add(1) == Some(c) {
+                    true
+                } else {
                     continue;
-                }
-                if strict {
-                    if (c < k && self.reaches(ty, s, b, (RelKind::Ult, RelKind::Ule), false))
-                        || (c <= k && self.reaches(ty, s, b, (RelKind::Ult, RelKind::Ule), true))
-                    {
-                        return true;
-                    }
-                } else if (c <= k && self.reaches(ty, s, b, (RelKind::Ult, RelKind::Ule), false))
-                    || (k.checked_add(1) == Some(c) && self.reaches(ty, s, b, (RelKind::Ult, RelKind::Ule), true))
+                };
+                if (s == b || into_b)
+                    && self.linked_reach(ty, linked, a_base, s_base, UNSIGNED)
+                    && self.reaches(ty, s, b, UNSIGNED, require_strict)
                 {
                     return true;
                 }

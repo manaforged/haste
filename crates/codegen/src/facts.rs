@@ -1,4 +1,5 @@
 mod backprop;
+mod live;
 mod loops;
 mod rel;
 
@@ -178,11 +179,16 @@ fn collect_incoming(func: &Function) -> (Vec<Vec<(Block, &[Value])>>, Vec<bool>)
     let mut complete = vec![true; func.blocks.len()];
     for pred_idx in 0..func.blocks.len() {
         let pred = Block(pred_idx as u32);
+        let mut edge = |target: Block, args| {
+            if !func.blocks[target.index()].params.is_empty() {
+                incoming[target.index()].push((pred, args));
+            }
+        };
         match func.last(pred) {
-            Some(Op::Jump(target, args)) => incoming[target.index()].push((pred, args.as_slice())),
+            Some(Op::Jump(target, args)) => edge(*target, args.as_slice()),
             Some(Op::Brif(_, then, then_args, otherwise, else_args)) => {
-                incoming[then.index()].push((pred, then_args.as_slice()));
-                incoming[otherwise.index()].push((pred, else_args.as_slice()));
+                edge(*then, then_args.as_slice());
+                edge(*otherwise, else_args.as_slice());
             }
             _ => {
                 for target in func.successors(pred) {
@@ -196,7 +202,12 @@ fn collect_incoming(func: &Function) -> (Vec<Vec<(Block, &[Value])>>, Vec<bool>)
 
 impl<'a> Ranges<'a> {
     /// The ranges of `func`'s values over the blocks of `order`, with the constants `consts` an earlier fold found.
-    pub(crate) fn new(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>])) -> Self {
+    pub(crate) fn new(func: &Function, parts: (&'a [Option<Inst>], &[Option<i64>]), blocks: (&[Block], &[Option<Block>], &[Option<Block>])) -> Self {
+        let (incoming, complete) = collect_incoming(func);
+        Self::over(func, parts, blocks, (&incoming, &complete))
+    }
+
+    fn over(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>]), (incoming, complete): (&[Vec<(Block, &[Value])>], &[bool])) -> Self {
         let mut table: Vec<(u64, u64)> = func.types.iter().map(|ty| (0, ty.unsigned_max())).collect();
         if let Some(entry) = func.entry {
             for (&param, abi) in func.blocks[entry.index()].params.iter().zip(&func.signature.params) {
@@ -206,8 +217,7 @@ impl<'a> Ranges<'a> {
             }
         }
         let mut ranges = Self { defs, table };
-        let (incoming, complete) = collect_incoming(func);
-        let info = CfgInfo { consts, incoming: &incoming, complete: &complete, single, idom };
+        let info = CfgInfo { consts, incoming, complete, single, idom };
         if ranges.propagate(func, &info, order) {
             ranges.propagate(func, &info, order);
         }
@@ -527,7 +537,7 @@ impl DomState {
         for _ in 0..3 {
             let mut progress = false;
             for &rec in selects {
-                if !(seen[rec.res.index()] && cfg.dominates(rec.block, block)) || self.resolve(rec.res) != rec.res {
+                if !seen[rec.res.index()] || self.resolve(rec.res) != rec.res {
                     continue;
                 }
                 let cond = self.resolve(rec.cond);
@@ -569,11 +579,12 @@ impl DomState {
     }
 }
 
-fn collect_selects(func: &Function) -> Vec<SelectRec> {
-    let mut selects = Vec::new();
+fn collect_selects(func: &Function) -> Option<Vec<SelectRec>> {
+    let (mut selects, mut open) = (Vec::new(), false);
     for (b_idx, block) in func.blocks.iter().enumerate() {
         for &inst in &block.insts {
             let data = &func.insts[inst.index()];
+            open |= matches!(data.op, Op::Icmp(..) | Op::Fits(..) | Op::Trapz(_) | Op::Brif(..));
             if let (Op::Select(cond, t_val, f_val), Some(res)) = (&data.op, data.result)
                 && func.ty(res).is_small_int()
             {
@@ -581,7 +592,7 @@ fn collect_selects(func: &Function) -> Vec<SelectRec> {
             }
         }
     }
-    selects
+    (open || !selects.is_empty()).then_some(selects)
 }
 
 /// Settles the compares, traps and branches that the facts on entry to each block and its earlier instructions decide: a settled compare's result becomes a constant in `consts`, a trap that cannot fire goes, and a settled branch becomes a jump. A block's facts on entry are its only predecessor's facts on exit plus that edge's branch. Returns whether anything changed.
@@ -590,13 +601,15 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
         return false;
     }
     let Some(entry) = func.entry else { return false };
+    let Some(selects) = collect_selects(func) else { return false };
     let cfg = func.cfg();
     let single: Vec<Option<Block>> = (0..func.blocks.len()).map(|b| cfg.single_pred(Block(b as u32))).collect();
-    let selects = collect_selects(func);
     let (mut decided, mut compares, mut rewrites) = (Vec::new(), Vec::new(), Vec::new());
     {
-        let ranges = Ranges::new(func, (defs, consts), (&cfg.rpo, &single, &cfg.idom));
         let (incoming, complete) = collect_incoming(func);
+        let ranges = Ranges::over(func, (defs, consts), (&cfg.rpo, &single, &cfg.idom), (&incoming, &complete));
+        let def_blocks = std::cell::OnceCell::new();
+        let mut live = live::Live::default();
         let loops = cfg.loops();
         let mut env = Env::default();
         let mut exits: Vec<Option<Path>> = vec![None; func.blocks.len()];
@@ -607,9 +620,10 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
             for &param in &func.blocks[block.index()].params {
                 seen[param.index()] = true;
             }
+            live.enter(&cfg, &selects, block);
             for each in &loops.list {
                 if each.head == block {
-                    env.collect_loop(func, (&cfg, &ranges, &incoming, &complete, &exits), each);
+                    env.collect_loop(func, (&cfg, &ranges, &incoming, &complete, &exits, &def_blocks), each);
                 }
             }
             let follow_pred = single[block.index()].or_else(|| {
@@ -634,7 +648,7 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
                 Some((pred, mut path, mut extra, mut dom)) => {
                     path.follow(func, &ranges, pred, block);
                     extra.follow(func, (&cfg, &ranges, &env, &path), pred, block);
-                    dom.propagate_selects(func, (&cfg, &ranges, &env, &mut path, &extra), &selects, block, &seen);
+                    dom.propagate_selects(func, (&cfg, &ranges, &env, &mut path, &extra), &live.recs, block, &seen);
                     (path, extra, dom)
                 }
                 None if block != entry => (
@@ -651,7 +665,7 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
                 }
             }
             for &inst in &func.blocks[block.index()].insts {
-                settle_one(func, (&cfg, &ranges, &env, &mut path, &mut extra, &mut dom, &selects, block, &seen), inst, (&mut decided, &mut compares, &mut rewrites));
+                settle_one(func, (&cfg, &ranges, &env, &mut path, &mut extra, &mut dom, &live.recs, block, &seen), inst, (&mut decided, &mut compares, &mut rewrites));
                 let data = &func.insts[inst.index()];
                 if let Some(res) = data.result {
                     seen[res.index()] = true;
@@ -750,6 +764,7 @@ pub(super) fn truth(fact: &Fact) -> Option<bool> {
 
 /// Drops each trap in `decided`, turns each branch into a jump the way it goes, and rewrites dominated operands.
 fn apply(func: &mut Function, decided: &[(Inst, Option<bool>)], rewrites: &[(Inst, Value, Value)]) -> bool {
+    if decided.is_empty() && rewrites.is_empty() { return false; }
     let mut dropped = vec![false; func.insts.len()];
     for &(inst, taken) in decided {
         let op = &mut func.insts[inst.index()].op;

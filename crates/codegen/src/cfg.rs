@@ -1,5 +1,7 @@
 use crate::ir::{Block, BlockData, Function, Op, Value};
+use std::sync::OnceLock;
 
+#[derive(Clone)]
 pub(crate) struct Loop {
     pub head: Block,
     pub latches: Vec<Block>,
@@ -8,6 +10,7 @@ pub(crate) struct Loop {
     pub depth: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct Loops {
     pub list: Vec<Loop>,
     pub depths: Vec<u32>,
@@ -19,49 +22,90 @@ impl Loops {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct Cfg {
     pub entry: Option<Block>,
     pub reachable: Vec<bool>,
     pub rpo: Vec<Block>,
     pub preds: Vec<Vec<Block>>,
     pub idom: Vec<Option<Block>>,
+    edges: Edges,
+    loops: OnceLock<Loops>,
 }
 
-fn all_preds(func: &Function) -> Vec<Vec<Block>> {
-    let mut preds = vec![Vec::new(); func.blocks.len()];
-    for b in 0..func.blocks.len() {
-        let block = Block(b as u32);
-        func.successors(block).for_each(|target| preds[target.index()].push(block));
+impl Clone for Cfg {
+    fn clone(&self) -> Self {
+        Self { entry: self.entry, reachable: self.reachable.clone(), rpo: self.rpo.clone(), preds: self.preds.clone(), idom: self.idom.clone(), edges: self.edges.clone(), loops: OnceLock::new() }
     }
-    preds
 }
 
-fn reverse_postorder(func: &Function, entry: Block) -> (Vec<Block>, Vec<bool>) {
-    let mut seen = vec![false; func.blocks.len()];
-    if entry.index() >= func.blocks.len() {
+#[derive(Clone)]
+struct Edges {
+    targets: Vec<Block>,
+    ends: Vec<u32>,
+}
+
+impl Edges {
+    fn new(func: &Function) -> Self {
+        let blocks = func.blocks.len();
+        let mut edges = Self { targets: Vec::with_capacity(blocks * 2), ends: Vec::with_capacity(blocks) };
+        for b in 0..blocks {
+            edges.targets.extend(func.successors(Block(b as u32)));
+            edges.ends.push(edges.targets.len() as u32);
+        }
+        edges
+    }
+
+    fn of(&self, block: Block) -> &[Block] {
+        let at = block.index();
+        let start = at.checked_sub(1).map_or(0, |prev| self.ends[prev] as usize);
+        &self.targets[start..self.ends[at] as usize]
+    }
+
+    fn matches(&self, func: &Function) -> bool {
+        self.ends.len() == func.blocks.len()
+            && (0..self.ends.len()).all(|b| {
+                let block = Block(b as u32);
+                func.successors(block).eq(self.of(block).iter().copied())
+            })
+    }
+
+    fn preds(&self) -> Vec<Vec<Block>> {
+        let mut preds = vec![Vec::new(); self.ends.len()];
+        for b in 0..self.ends.len() {
+            let block = Block(b as u32);
+            self.of(block).iter().for_each(|target| preds[target.index()].push(block));
+        }
+        preds
+    }
+}
+
+fn order<I: Iterator<Item = Block>>(blocks: usize, entry: Block, successors: impl Fn(Block) -> I) -> (Vec<Block>, Vec<bool>) {
+    let mut seen = vec![false; blocks];
+    if entry.index() >= blocks {
         return (Vec::new(), seen);
     }
-    let mut post = Vec::with_capacity(func.blocks.len());
-    let mut stack = vec![(entry, 0_usize)];
+    let mut post = Vec::with_capacity(blocks);
+    let mut stack = vec![(entry, successors(entry))];
     seen[entry.index()] = true;
-    while let Some(top) = stack.last_mut() {
-        let (block, next) = (top.0, top.1);
-        top.1 += 1;
-        match func.successors(block).nth(next) {
+    while let Some((block, targets)) = stack.last_mut() {
+        match targets.next() {
             Some(target) if !seen[target.index()] => {
                 seen[target.index()] = true;
-                stack.push((target, 0));
+                stack.push((target, successors(target)));
             }
             Some(_) => {}
             None => {
-                post.push(block);
+                post.push(*block);
                 stack.pop();
             }
         }
     }
     post.reverse();
     (post, seen)
+}
+
+pub(crate) fn reverse_postorder(func: &Function, entry: Block) -> (Vec<Block>, Vec<bool>) {
+    order(func.blocks.len(), entry, |block| func.successors(block))
 }
 
 fn intersect(idom: &[Option<Block>], rank: &[usize], mut a: Block, mut b: Block) -> Block {
@@ -124,24 +168,21 @@ fn natural_loop(cfg: &Cfg, head: Block, latches: Vec<Block>) -> Loop {
 
 impl Cfg {
     pub(crate) fn new(func: &Function) -> Self {
-        match func.entry {
-            Some(entry) => Self::from_entry(func, entry),
-            None => Self {
-                entry: None,
-                reachable: vec![false; func.blocks.len()],
-                rpo: Vec::new(),
-                preds: all_preds(func),
-                idom: vec![None; func.blocks.len()],
-            },
-        }
+        let blocks = func.blocks.len();
+        let edges = Edges::new(func);
+        let preds = edges.preds();
+        let (rpo, reachable) = match func.entry {
+            Some(entry) => order(blocks, entry, |block| edges.of(block).iter().copied()),
+            None => (Vec::new(), vec![false; blocks]),
+        };
+        let rank = Self::ranks(&rpo, blocks);
+        let idom = immediate(&rpo, &rank, &preds, blocks);
+        Self { entry: func.entry, reachable, rpo, preds, idom, edges, loops: OnceLock::new() }
     }
 
-    pub(crate) fn from_entry(func: &Function, entry: Block) -> Self {
-        let preds = all_preds(func);
-        let (rpo, reachable) = reverse_postorder(func, entry);
-        let rank = Self::ranks(&rpo, func.blocks.len());
-        let idom = immediate(&rpo, &rank, &preds, func.blocks.len());
-        Self { entry: Some(entry), reachable, rpo, preds, idom }
+    /// Whether this graph is what `Cfg::new` builds for `func` now.
+    pub(crate) fn matches(&self, func: &Function) -> bool {
+        self.entry == func.entry && self.edges.matches(func)
     }
 
     pub(crate) fn ranks(order: &[Block], blocks: usize) -> Vec<usize> {
@@ -184,17 +225,23 @@ impl Cfg {
         children
     }
 
-    pub(crate) fn loops(&self) -> Loops {
+    pub(crate) fn loops(&self) -> &Loops {
+        self.loops.get_or_init(|| self.find_loops())
+    }
+
+    fn find_loops(&self) -> Loops {
+        let mut earlier = vec![false; self.preds.len()];
         let mut list: Vec<Loop> = self
             .rpo
             .iter()
             .filter_map(|&head| {
                 let mut latches = Vec::new();
                 for &pred in &self.preds[head.index()] {
-                    if self.reachable[pred.index()] && self.dominates(head, pred) && !latches.contains(&pred) {
+                    if self.reachable[pred.index()] && !earlier[pred.index()] && self.dominates(head, pred) && !latches.contains(&pred) {
                         latches.push(pred);
                     }
                 }
+                earlier[head.index()] = true;
                 (!latches.is_empty()).then(|| natural_loop(self, head, latches))
             })
             .collect();

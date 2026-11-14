@@ -503,14 +503,18 @@ fn scan(
     (changed, renamed)
 }
 
-fn eliminate_affine_block_params(func: &mut Function) -> bool {
-    let Some(entry) = func.entry else { return false };
+fn eliminate_affine_block_params(func: &mut Function) -> (bool, Option<Vec<(Value, i64)>>) {
+    let Some(entry) = func.entry else { return (false, None) };
+    let mergeable = |func: &Function, b_idx: usize| Block(b_idx as u32) != entry && func.blocks[b_idx].params.len() >= 2;
+    if !(0..func.blocks.len()).any(|b_idx| mergeable(func, b_idx)) {
+        return (false, None);
+    }
     let affine = compute_affine(func);
     let mut subst = identity(func.types.len());
     let mut any_changed = false;
     for b_idx in 0..func.blocks.len() {
         let target = Block(b_idx as u32);
-        if target == entry || func.blocks[b_idx].params.len() < 2 {
+        if !mergeable(func, b_idx) {
             continue;
         }
         let mut incoming: Vec<Vec<Value>> = Vec::new();
@@ -590,7 +594,7 @@ fn eliminate_affine_block_params(func: &mut Function) -> bool {
     if any_changed {
         rename(func, &subst);
     }
-    any_changed
+    (any_changed, (!any_changed).then_some(affine))
 }
 
 fn fits_mem_imm(ty: Type, off: i64) -> bool {
@@ -698,20 +702,31 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
         return Domain::NONE;
     }
-    let mut changed = eliminate_affine_block_params(func);
+    let domain = |changed: bool| if changed { Domain::MEM | Domain::VALUES } else { Domain::NONE };
+    let (mut changed, affine) = eliminate_affine_block_params(func);
+    let is_access = |op: &Op| matches!(op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..));
+    if !func.insts.iter().any(|data| is_access(&data.op)) {
+        changed |= sink_terminator_defs(func);
+        return domain(changed);
+    }
     let cfg = func.cfg();
-    let prov = Provenance::new(func, &cfg);
+    let prov = Provenance::with_affine(func, &cfg, affine);
     changed |= fold_affine_mem(func, &prov.slot_offsets, &prov.affine);
     changed |= pack::coalesce_loads(func, &prov);
     changed |= sink_terminator_defs(func);
     let mut consts = vec![None; func.types.len()];
     let mut selects = vec![None; func.types.len()];
+    let mut accesses = false;
     for data in &func.insts {
         match (&data.op, data.result) {
             (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
             (&Op::Select(c, a, b), Some(result)) => selects[result.index()] = Some((c, a, b)),
+            (op, _) if is_access(op) => accesses = true,
             _ => {}
         }
+    }
+    if !accesses {
+        return domain(changed);
     }
     let mut bw = BlockWrites::new(func, &cfg, &prov);
     let mut subst = identity(func.types.len());
@@ -736,5 +751,5 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if renamed {
         rename(func, state.subst);
     }
-    if changed { Domain::MEM | Domain::VALUES } else { Domain::NONE }
+    domain(changed)
 }

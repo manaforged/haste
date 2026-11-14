@@ -56,22 +56,27 @@ pub(super) fn narrow_sat(func: &Function, dst: Type, signed: bool, x: Value, kno
     Some(clamp_narrow(src, dst, signed, known(x)?))
 }
 
+fn recast(func: &Function, inst: Inst) -> Option<(Value, Value)> {
+    match (&func.insts[inst.index()].op, func.insts[inst.index()].result) {
+        (&Op::Convert(Convert::Bitcast, src), Some(res)) if func.ty(src).bytes() == func.ty(res).bytes() && func.ty(src) != func.ty(res) => Some((src, res)),
+        _ => None,
+    }
+}
+
 pub(super) fn fold_bitcast_loads(func: &mut Function) -> bool {
+    if !func.blocks.iter().flat_map(|b| &b.insts).any(|&inst| recast(func, inst).is_some()) { return fold_const_vectors(func); }
     let uses = func.use_counts();
     let defs = defs(func);
     let mut remap: Vec<Option<Value>> = vec![None; func.types.len()];
     let mut dropped = vec![false; func.insts.len()];
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        let data = &func.insts[inst.index()];
-        if let (Op::Convert(Convert::Bitcast, src), Some(res)) = (&data.op, data.result)
+        if let Some((src, res)) = recast(func, *inst)
             && uses[src.index()] == 1
-            && func.ty(*src).bytes() == func.ty(res).bytes()
-            && func.ty(*src) != func.ty(res)
             && let Some(src_inst) = defs[src.index()]
             && matches!(func.insts[src_inst.index()].op, Op::Load(..))
         {
             func.types[src.index()] = func.ty(res);
-            remap[res.index()] = Some(*src);
+            remap[res.index()] = Some(src);
             dropped[inst.index()] = true;
         }
     }
@@ -596,6 +601,8 @@ fn emit_canonical(func: &mut Function, inst: Inst, vec_ty: Type, bytes: &[u8; 16
 }
 
 fn fold_const_vectors(func: &mut Function) -> bool {
+    let vector = |inst: &Inst| matches!(func.insts[inst.index()].op, Op::Extract(..)) || func.insts[inst.index()].result.is_some_and(|res| func.ty(res).is_valid_vec());
+    if !func.blocks.iter().flat_map(|b| &b.insts).any(vector) { return false; }
     let defs = defs(func);
     let mut eval = ByteEval::new(func, &defs);
     let mut changed = false;

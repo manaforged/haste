@@ -116,10 +116,10 @@ fn find_plan(func: &Function, cfg: &Cfg, each: &Loop) -> Option<RotatePlan> {
                     }
                 }
             });
+            if !exit_uses_ok {
+                return None;
+            }
         }
-    }
-    if !exit_uses_ok {
-        return None;
     }
     Some(RotatePlan {
         head,
@@ -256,7 +256,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     }
     let mut changed = false;
     for _ in 0..64 {
-        let cfg = (*func.cfg()).clone();
+        let cfg = func.cfg();
         let loops = cfg.loops();
         let mut step = false;
         for each in &loops.list {

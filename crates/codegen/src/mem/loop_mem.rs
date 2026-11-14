@@ -4,19 +4,35 @@ use crate::ir::{Binary, Block, Function, Inst, Op, StackSlot, Type, Value};
 use super::{MemBase, MemLoc, MemRoot, Provenance, may_alias};
 
 struct WriteRanges {
-    clobbered: Vec<bool>,
-    ranges: Vec<Vec<(i64, i64)>>,
+    len: usize,
+    clobbered: Vec<usize>,
+    ranges: Vec<(usize, i64, i64)>,
 }
 
 impl WriteRanges {
     fn new(len: usize) -> Self {
-        Self { clobbered: vec![false; len], ranges: vec![Vec::new(); len] }
+        Self { len, clobbered: Vec::new(), ranges: Vec::new() }
     }
 
     fn clobber(&mut self, idx: usize) {
-        if let Some(slot) = self.clobbered.get_mut(idx) {
-            *slot = true;
+        if idx < self.len {
+            self.clobbered.push(idx);
         }
+    }
+
+    fn sort(&mut self) {
+        self.clobbered.sort_unstable();
+        self.ranges.sort_unstable();
+    }
+
+    fn is_clobbered(&self, idx: usize) -> bool {
+        idx >= self.len || self.clobbered.binary_search(&idx).is_ok()
+    }
+
+    fn of(&self, idx: usize) -> &[(usize, i64, i64)] {
+        let start = self.ranges.partition_point(|range| range.0 < idx);
+        let count = self.ranges[start..].partition_point(|range| range.0 == idx);
+        &self.ranges[start..start + count]
     }
 
     fn record(&mut self, idx: usize, lo: i64, bytes: u32) {
@@ -24,8 +40,8 @@ impl WriteRanges {
             self.clobber(idx);
             return;
         };
-        if let Some(list) = self.ranges.get_mut(idx) {
-            list.push((lo, hi));
+        if idx < self.len {
+            self.ranges.push((idx, lo, hi));
         }
     }
 
@@ -33,13 +49,11 @@ impl WriteRanges {
         let Some(hi) = (lo >= 0).then(|| lo.checked_add(i64::from(bytes))).flatten() else {
             return true;
         };
-        self.clobbered.get(idx).copied().unwrap_or(true)
-            || self.ranges.get(idx).is_none_or(|list| list.iter().any(|&(wlo, whi)| lo < whi && wlo < hi))
+        self.is_clobbered(idx) || self.of(idx).iter().any(|&(_, wlo, whi)| lo < whi && wlo < hi)
     }
 
     fn any(&self, idx: usize) -> bool {
-        self.clobbered.get(idx).copied().unwrap_or(true)
-            || self.ranges.get(idx).is_none_or(|list| !list.is_empty())
+        self.is_clobbered(idx) || !self.of(idx).is_empty()
     }
 }
 
@@ -112,6 +126,8 @@ impl LoopMem {
                 _ => {}
             }
         }
+        fx.slot_writes.sort();
+        fx.param_writes.sort();
         fx
     }
 

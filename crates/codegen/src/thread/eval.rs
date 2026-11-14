@@ -13,6 +13,7 @@ pub(super) enum EdgeSeed {
 pub(super) struct ThreadCx<'a> {
     pub(super) defs: &'a [Option<Inst>],
     pub(super) consts: &'a mut Vec<Option<i64>>,
+    pub(super) uses: &'a mut Vec<u64>,
     pub(super) ranges: &'a Ranges<'a>,
     pub(super) ranges_len: usize,
     pub(super) pinned: &'a [bool],

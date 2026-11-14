@@ -142,8 +142,7 @@ struct SelectEdit {
     loads: Vec<(Inst, Value, i32, i32)>,
 }
 
-fn fold_slot_selects(func: &mut Function, consts: &[Option<i64>]) -> bool {
-    let (addrs, _) = resolve_addrs(func, consts);
+fn fold_slot_selects(func: &mut Function, addrs: &[Option<(StackSlot, i64)>]) -> bool {
     let mut uses = vec![0_u32; func.types.len()];
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         func.insts[inst.index()].op.for_operands(|v| uses[v.index()] += 1);
@@ -536,12 +535,42 @@ fn try_coalesce_param(func: &mut Function, cfg: &Cfg, addrs: &[Option<(StackSlot
     true
 }
 
-fn coalesce_block_params(func: &mut Function, consts: &[Option<i64>]) -> bool {
+fn unresolved_params(func: &Function, addrs: &[Option<(StackSlot, i64)>]) -> (Vec<usize>, Vec<bool>) {
+    let mut starts = Vec::with_capacity(func.blocks.len());
+    let mut total = 0;
+    for block in &func.blocks {
+        starts.push(total);
+        total += block.params.len();
+    }
+    let mut unresolved = vec![false; total];
+    let mut mark = |target: Block, args: &[Value]| {
+        let count = func.blocks[target.index()].params.len();
+        for (idx, v) in args.iter().enumerate().take(count) {
+            unresolved[starts[target.index()] + idx] |= addrs[v.index()].is_none();
+        }
+    };
+    for b in 0..func.blocks.len() {
+        match func.last(Block(b as u32)) {
+            Some(Op::Jump(target, args)) => mark(*target, args),
+            Some(Op::Brif(_, then, then_args, else_b, else_args)) => {
+                mark(*then, then_args);
+                mark(*else_b, else_args);
+            }
+            _ => {}
+        }
+    }
+    (starts, unresolved)
+}
+
+fn coalesce_block_params(func: &mut Function, addrs: &[Option<(StackSlot, i64)>]) -> bool {
+    let (starts, unresolved) = unresolved_params(func, addrs);
+    if unresolved.iter().all(|&u| u) {
+        return false;
+    }
     let cfg = func.cfg();
-    let (addrs, _) = resolve_addrs(func, consts);
     for b in 0..func.blocks.len() {
         for pi in 0..func.blocks[b].params.len() {
-            if try_coalesce_param(func, &cfg, &addrs, b, pi) {
+            if !unresolved[starts[b] + pi] && try_coalesce_param(func, &cfg, addrs, b, pi) {
                 return true;
             }
         }
@@ -606,8 +635,15 @@ pub(super) fn run(func: &mut Function) -> bool {
     let mut changed = false;
     loop {
         let consts = super::subword::eval_consts(func);
-        let step = fold_slot_selects(func, &consts) | coalesce_block_params(func, &consts);
-        if !step {
+        let (mut addrs, addr_insts) = resolve_addrs(func, &consts);
+        if addr_insts.is_empty() {
+            break;
+        }
+        let folded = fold_slot_selects(func, &addrs);
+        if folded {
+            addrs = resolve_addrs(func, &consts).0;
+        }
+        if !(folded | coalesce_block_params(func, &addrs)) {
             break;
         }
         changed = true;

@@ -21,6 +21,10 @@ pub(super) struct Rel {
     pub(super) ty: Type,
 }
 
+pub(super) const UNSIGNED: (RelKind, RelKind) = (RelKind::Ult, RelKind::Ule);
+const SIGNED: (RelKind, RelKind) = (RelKind::Slt, RelKind::Sle);
+const EQUAL: (RelKind, RelKind) = (RelKind::Eq, RelKind::Eq);
+
 pub(super) fn rel_step(r: Rel, cur: Value, ty: Type, (strict_k, weak_k): (RelKind, RelKind)) -> Option<(Value, bool)> {
     if r.ty != ty {
         return None;
@@ -198,13 +202,43 @@ impl Path {
         }
     }
 
+    pub(super) fn steps_from(&self, ty: Type, start: Value, kinds: (RelKind, RelKind)) -> bool {
+        self.rels.iter().any(|&r| rel_step(r, start, ty, kinds).is_some())
+    }
+
+    pub(super) fn steps_into(&self, ty: Type, target: Value, kinds: (RelKind, RelKind)) -> bool {
+        self.rels.iter().any(|&r| [r.lhs, r.rhs].into_iter().any(|cur| rel_step(r, cur, ty, kinds).is_some_and(|(next, _)| next == target)))
+    }
+
     pub(super) fn reaches(&self, ty: Type, start: Value, target: Value, kinds: (RelKind, RelKind), require_strict: bool) -> bool {
+        self.reach(ty, start, target, kinds, require_strict) == Some(true)
+    }
+
+    fn reach(&self, ty: Type, start: Value, target: Value, kinds: (RelKind, RelKind), require_strict: bool) -> Option<bool> {
         if start == target {
-            return !require_strict;
+            return Some(!require_strict);
         }
-        if self.rels.is_empty() {
-            return false;
+        if !self.steps_from(ty, start, kinds) || !self.steps_into(ty, target, kinds) {
+            return None;
         }
+        let mut hit = None;
+        let found = self.walk(ty, start, kinds, |next, next_strict| {
+            if next == target {
+                if !require_strict || next_strict {
+                    return true;
+                }
+                hit = Some(false);
+            }
+            false
+        });
+        if found { Some(true) } else { hit }
+    }
+
+    pub(super) fn linked_reach(&self, ty: Type, linked: bool, start: Value, target: Value, kinds: (RelKind, RelKind)) -> bool {
+        start == target || (linked && self.steps_into(ty, target, kinds) && self.walk(ty, start, kinds, |next, _| next == target))
+    }
+
+    pub(super) fn walk(&self, ty: Type, start: Value, kinds: (RelKind, RelKind), mut visit: impl FnMut(Value, bool) -> bool) -> bool {
         let mut seen: Vec<(Value, bool)> = vec![(start, false)];
         let mut idx = 0;
         while idx < seen.len() {
@@ -215,7 +249,7 @@ impl Path {
                     continue;
                 };
                 let next_strict = cur_strict || step_strict;
-                if next == target && (!require_strict || next_strict) {
+                if visit(next, next_strict) {
                     return true;
                 }
                 if seen.len() < 16 {
@@ -237,22 +271,22 @@ impl Path {
         let Some(&Op::Binary(Binary::Isub, base, c)) = ranges.op(func, a) else { return false };
         if let Some(k) = ranges.constant(c)
             && self.fact(ranges, base).lo >= k
-            && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), strict && k == 0)
+            && self.reaches(ty, base, b, UNSIGNED, strict && k == 0)
         {
             return true;
         }
         if !strict {
             return false;
         }
-        if self.reaches(ty, c, base, (RelKind::Ult, RelKind::Ule), false)
-            && self.reaches(ty, base, b, (RelKind::Ult, RelKind::Ule), self.fact(ranges, c).lo == 0)
+        if self.reaches(ty, c, base, UNSIGNED, false)
+            && self.reaches(ty, base, b, UNSIGNED, self.fact(ranges, c).lo == 0)
         {
             return true;
         }
         if let Some(&Op::Binary(Binary::Isub, outer, k_val)) = ranges.op(func, base)
             && ranges.constant(k_val) == Some(1)
-            && self.reaches(ty, c, outer, (RelKind::Ult, RelKind::Ule), true)
-            && self.reaches(ty, outer, b, (RelKind::Ult, RelKind::Ule), false)
+            && self.reaches(ty, c, outer, UNSIGNED, true)
+            && self.reaches(ty, outer, b, UNSIGNED, false)
         {
             return true;
         }
@@ -260,17 +294,17 @@ impl Path {
     }
 
     fn known_ne(&self, ty: Type, a: Value, b: Value) -> bool {
-        self.rels.iter().any(|r| {
-            r.kind == RelKind::Ne
-                && r.ty == ty
-                && ((self.reaches(ty, a, r.lhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.rhs, (RelKind::Eq, RelKind::Eq), false))
-                    || (self.reaches(ty, a, r.rhs, (RelKind::Eq, RelKind::Eq), false) && self.reaches(ty, b, r.lhs, (RelKind::Eq, RelKind::Eq), false)))
+        let mut linked = None;
+        self.rels.iter().filter(|r| r.kind == RelKind::Ne && r.ty == ty).any(|r| {
+            let (from_a, from_b) = *linked.get_or_insert_with(|| (self.steps_from(ty, a, EQUAL), self.steps_from(ty, b, EQUAL)));
+            (self.linked_reach(ty, from_a, a, r.lhs, EQUAL) && self.linked_reach(ty, from_b, b, r.rhs, EQUAL))
+                || (self.linked_reach(ty, from_a, a, r.rhs, EQUAL) && self.linked_reach(ty, from_b, b, r.lhs, EQUAL))
         })
     }
 
     fn has_strict_upper_expr(&self, func: &Function, ranges: &Ranges, ty: Type, val: Value, depth: u8) -> bool {
-        if self.rels.iter().any(|r| {
-            r.ty == ty && r.kind == RelKind::Ult && self.reaches(ty, val, r.rhs, (RelKind::Ult, RelKind::Ule), true)
+        if self.steps_from(ty, val, UNSIGNED) && self.rels.iter().any(|r| {
+            r.ty == ty && r.kind == RelKind::Ult && self.reaches(ty, val, r.rhs, UNSIGNED, true)
         }) {
             return true;
         }
@@ -300,8 +334,9 @@ impl Path {
         if a == b {
             return !strict;
         }
-        if self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), strict)
-            || (strict && self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), false) && self.known_ne(ty, a, b))
+        let reach = self.reach(ty, a, b, UNSIGNED, strict);
+        if reach == Some(true)
+            || (reach.is_some() && self.known_ne(ty, a, b))
             || self.proves_add_rel(func, ranges, ty, a, b, strict)
             || self.proves_sub_rel(func, ranges, ty, a, b, strict)
         {
@@ -335,14 +370,14 @@ impl Path {
         }
         let (kind, a, b) = rel_of(cc, x, y);
         match kind {
-            RelKind::Eq => self.reaches(ty, a, b, (RelKind::Eq, RelKind::Eq), false),
+            RelKind::Eq => self.reaches(ty, a, b, EQUAL, false),
             RelKind::Ult => self.proves_unsigned(func, ranges, ty, a, b, true, 0),
             RelKind::Ule => self.proves_unsigned(func, ranges, ty, a, b, false, 0),
             RelKind::Slt => {
-                self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true)
-                    || (self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), false) && self.known_ne(ty, a, b))
+                let reach = self.reach(ty, a, b, SIGNED, true);
+                reach == Some(true) || (reach.is_some() && self.known_ne(ty, a, b))
             }
-            RelKind::Sle => self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), false),
+            RelKind::Sle => self.reaches(ty, a, b, SIGNED, false),
             RelKind::Ne => {
                 self.strictly_ordered(ty, a, b)
                     || self.proves_add_rel(func, ranges, ty, a, b, true)
@@ -357,10 +392,10 @@ impl Path {
     }
 
     fn strictly_ordered(&self, ty: Type, a: Value, b: Value) -> bool {
-        self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), true)
-            || self.reaches(ty, b, a, (RelKind::Ult, RelKind::Ule), true)
-            || self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true)
-            || self.reaches(ty, b, a, (RelKind::Slt, RelKind::Sle), true)
+        self.reaches(ty, a, b, UNSIGNED, true)
+            || self.reaches(ty, b, a, UNSIGNED, true)
+            || self.reaches(ty, a, b, SIGNED, true)
+            || self.reaches(ty, b, a, SIGNED, true)
     }
 
     pub(super) fn decide_rel(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> Option<bool> {
