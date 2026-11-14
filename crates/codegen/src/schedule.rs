@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::ir::{Domain, Function};
 use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
@@ -104,6 +106,7 @@ static FULL_FINISH: &[Pass] = &[Pass::Switch, Pass::Returns, Pass::TailRec];
 fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort) -> Domain {
     let tracing = crate::trace::enabled();
     let (before_blocks, before_insts) = if tracing { (func.blocks.len(), func.size()) } else { (0, 0) };
+    let start = tracing.then(Instant::now);
     let changed = match pass {
         Pass::Fill => fill::run(func),
         Pass::Fold => fold::run(func, effort),
@@ -130,8 +133,8 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
     if changed.contains(Domain::CFG) {
         func.bump_cfg();
     }
-    if tracing {
-        crate::trace::after_pass(pass, before_blocks, before_insts, changed, func);
+    if let Some(start) = start {
+        crate::trace::after_pass(pass, before_blocks, before_insts, changed, start.elapsed(), func);
     }
     changed
 }

@@ -159,6 +159,7 @@ fn report_cases(
     if let Some((path, graph_span)) = stats {
         build.write_stats(workspace, graph_span, path)?;
     }
+    eprint!("{}", haste_codegen::missed_report());
     if request == Request::Build && crate::substrate::noop::active(stats.map(|(p, _)| p)) {
         match &result {
             Ok(0) => {

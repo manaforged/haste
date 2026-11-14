@@ -3,7 +3,8 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::ir::{Domain, Function};
 use crate::schedule::Pass;
@@ -33,11 +34,13 @@ struct Counters {
     slots_after_schedule: AtomicUsize,
     pass_runs: [AtomicUsize; Pass::COUNT],
     pass_changes: [AtomicUsize; Pass::COUNT],
+    pass_nanos: [AtomicU64; Pass::COUNT],
 }
 
 impl Counters {
     const fn new() -> Self {
         const ZERO: AtomicUsize = AtomicUsize::new(0);
+        const ZERO_NANOS: AtomicU64 = AtomicU64::new(0);
         Self {
             functions: ZERO,
             insts_before: ZERO,
@@ -46,6 +49,7 @@ impl Counters {
             slots_after_schedule: ZERO,
             pass_runs: [ZERO; Pass::COUNT],
             pass_changes: [ZERO; Pass::COUNT],
+            pass_nanos: [ZERO_NANOS; Pass::COUNT],
         }
     }
 }
@@ -155,11 +159,12 @@ pub(crate) fn on_compile_end(func: &Function) {
     }
 }
 
-pub(crate) fn after_pass(pass: Pass, before_blocks: usize, before_insts: usize, changed: Domain, func: &Function) {
+pub(crate) fn after_pass(pass: Pass, before_blocks: usize, before_insts: usize, changed: Domain, elapsed: Duration, func: &Function) {
     let cfg = config();
     if cfg.missed {
         let idx = pass as usize;
         COUNTERS.pass_runs[idx].fetch_add(1, Ordering::Relaxed);
+        COUNTERS.pass_nanos[idx].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
         if !changed.is_empty() {
             COUNTERS.pass_changes[idx].fetch_add(1, Ordering::Relaxed);
         }
@@ -181,22 +186,32 @@ pub(crate) fn after_pass(pass: Pass, before_blocks: usize, before_insts: usize, 
     }
 }
 
-/// Formats aggregated pass-change and stack-slot counters collected while `HASTE_MISSED=1`.
+/// Formats aggregated per-pass run, change and wall-time totals (slowest first) and stack-slot counters collected while `HASTE_MISSED=1`.
 pub fn missed_report() -> String {
     let mut out = String::new();
+    if !config().missed {
+        return out;
+    }
     let fns = COUNTERS.functions.load(Ordering::Relaxed);
     let ib = COUNTERS.insts_before.load(Ordering::Relaxed);
     let ia = COUNTERS.insts_after.load(Ordering::Relaxed);
     let sp = COUNTERS.slots_after_promote.load(Ordering::Relaxed);
     let sf = COUNTERS.slots_after_schedule.load(Ordering::Relaxed);
     let _ = writeln!(out, "functions={fns} insts={ib}->{ia} slots_after_promote={sp} slots_after_schedule={sf}");
-    for &pass in Pass::ALL {
-        let idx = pass as usize;
-        let runs = COUNTERS.pass_runs[idx].load(Ordering::Relaxed);
-        let changes = COUNTERS.pass_changes[idx].load(Ordering::Relaxed);
-        if runs > 0 || changes > 0 {
-            let _ = writeln!(out, "  pass={:<8} runs={runs} changes={changes}", pass.name());
-        }
+    let mut rows: Vec<(&str, usize, usize, u64)> = Pass::ALL
+        .iter()
+        .map(|&pass| {
+            let idx = pass as usize;
+            let runs = COUNTERS.pass_runs[idx].load(Ordering::Relaxed);
+            let changes = COUNTERS.pass_changes[idx].load(Ordering::Relaxed);
+            (pass.name(), runs, changes, COUNTERS.pass_nanos[idx].load(Ordering::Relaxed))
+        })
+        .filter(|row| row.1 > 0)
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.3));
+    let total = rows.iter().fold(("total", 0, 0, 0), |sum, row| (sum.0, sum.1 + row.1, sum.2 + row.2, sum.3 + row.3));
+    for (name, runs, changes, nanos) in rows.into_iter().chain([total]) {
+        let _ = writeln!(out, "  pass={name:<8} runs={runs} changes={changes} ms={:.3}", nanos as f64 / 1e6);
     }
     out
 }
