@@ -25,12 +25,13 @@ struct TraitCandidate {
     bound: Option<Ty>,
 }
 
-/// The method a call picked: its item, the arguments of its impl or trait, the arguments of its own type parameters when its receiver type named them, and how it borrows the receiver.
+/// The method a call picked: its item, the arguments of its impl or trait, the arguments of its own type parameters when its receiver type named them, how it borrows the receiver, and the bounded trait that selected it when any.
 struct Pick {
     item: ItemRef,
     args: Vec<Ty>,
     own: Vec<Ty>,
     autoref: Option<Mut>,
+    bound_trait: Option<ItemRef>,
 }
 
 /// One method a call may pick: its impl, its item and how it takes `self`.
@@ -84,7 +85,7 @@ impl<'a> Infer<'_, 'a> {
     fn finish_method_call(&mut self, (expr, found): (ExprId, Ty), (name, at): (&str, u32), steps: &[Ty], probed: Option<(Pick, u32)>, params: (Option<List>, List), expected: Option<Ty>) -> Result<Ty> {
         match probed {
             Some((pick, derefs)) => {
-                self.prune_method_steps(expr, steps, derefs);
+                self.prune_method_steps(expr, steps, derefs, pick.bound_trait.is_some());
                 self.picked(expr, (pick, derefs), params, expected)
             }
             None => {
@@ -96,9 +97,12 @@ impl<'a> Infer<'_, 'a> {
         }
     }
 
-    fn prune_method_steps(&mut self, expr: ExprId, steps: &[Ty], derefs: u32) {
+    fn prune_method_steps(&mut self, expr: ExprId, steps: &[Ty], derefs: u32, from_bound: bool) {
         self.out.derefs.retain(|&(e, s), _| e != expr || s < derefs);
-        if self.poly.is_some() && steps[..=derefs as usize].iter().any(|&s| matches!(self.cx.types.kind(s), Kind::Proj(_))) {
+        if self.poly.is_some()
+            && (steps[..derefs as usize].iter().any(|&s| matches!(self.cx.types.kind(s), Kind::Proj(_)))
+                || (!from_bound && matches!(self.cx.types.kind(steps[derefs as usize]), Kind::Proj(_))))
+        {
             self.poly_fallback();
         }
     }
@@ -108,8 +112,14 @@ impl<'a> Infer<'_, 'a> {
         let mut traits = self.trait_candidates(name, steps)?;
         self.keep_fitting_bounds(&mut traits, count)?;
         let mut candidates = Vec::new();
-        for &step in steps {
-            self.candidates(step, name, &mut candidates)?;
+        if let Some(hinted_of) = self.method_hints.as_ref().and_then(|m| m.get(&expr).copied())
+            && traits.iter().any(|c| c.of == hinted_of)
+        {
+            traits.retain(|c| c.of == hinted_of);
+        } else {
+            for &step in steps {
+                self.candidates(step, name, &mut candidates)?;
+            }
         }
         for (derefs, &step) in steps.iter().enumerate() {
             if let Some(pick) = self.probe_step(step, (&candidates, &traits), expected)? {
@@ -138,7 +148,7 @@ impl<'a> Infer<'_, 'a> {
                 && let Some(autoref) = borrow_of(self.cx.signature(item)?.receiver.map(|(kind, _)| kind))
             {
                 self.obligations.push((of, substs.clone()));
-                return Ok(Some(Pick { item, args: substs, own: Vec::new(), autoref }));
+                return Ok(Some(Pick { item, args: substs, own: Vec::new(), autoref, bound_trait: None }));
             }
         }
         Ok(None)
@@ -182,7 +192,7 @@ impl<'a> Infer<'_, 'a> {
         }
         for &candidate in candidates {
             if let Some((args, own)) = self.try_receiver(candidate, adjusted)? {
-                return Ok(Some(Pick { item: candidate.item, args, own, autoref }));
+                return Ok(Some(Pick { item: candidate.item, args, own, autoref, bound_trait: None }));
             }
         }
         let pool = if bypassed { all_unbounded } else { unshadowed };
@@ -192,7 +202,7 @@ impl<'a> Infer<'_, 'a> {
     fn probe_traits(&mut self, traits: &[TraitCandidate], (adjusted, autoref): (Ty, Option<Mut>), use_bounds: bool) -> Result<Option<Pick>> {
         for &candidate in traits {
             if let Some((item, args)) = self.try_trait(candidate, adjusted, use_bounds)? {
-                return Ok(Some(Pick { item, args, own: Vec::new(), autoref }));
+                return Ok(Some(Pick { item, args, own: Vec::new(), autoref, bound_trait: candidate.bound.map(|_| candidate.of) }));
             }
         }
         Ok(None)
@@ -217,7 +227,7 @@ impl<'a> Infer<'_, 'a> {
             Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Ptr(..) | Kind::Slice(_) => None,
             _ => match self.builtin_deref(step) {
                 Some(inner) => Some(inner),
-                None => self.deref_step(expr, derefs, step)?,
+                None => self.deref_step_raw(expr, derefs, step)?,
             },
         };
         Ok(next.map(|next| self.resolve(next)))
@@ -307,19 +317,15 @@ impl<'a> Infer<'_, 'a> {
                 found.extend(self.implied_traits(vec![of])?.into_iter().map(|of| (of, ty)));
             }
         }
-        let mut bounds = self.type_bounds()?;
-        bounds.extend(self.param_alias_bounds()?);
-        for (of, substs) in bounds {
+        for (of, substs) in self.assumptions()? {
             let ty = self.substitute(substs[0]);
             if steps.contains(&ty) && self.reaches_member(of, name)? {
-                found.extend(self.implied_traits(vec![of])?.into_iter().map(|of| (of, ty)));
+                for implied in self.implied_traits(vec![of])? {
+                    if !found.contains(&(implied, ty)) {
+                        found.push((implied, ty));
+                    }
+                }
             }
-        }
-        let owner = self.instance.as_ref().and_then(|(item, _)| self.cx.owner_trait(*item)).filter(|_| self.block.is_none());
-        if let (Some(of), Some(ty)) = (owner, self.self_ty.map(|ty| self.substitute(ty)))
-            && steps.contains(&ty)
-        {
-            found.extend(self.implied_traits(vec![of])?.into_iter().map(|of| (of, ty)));
         }
         Ok(found)
     }
@@ -468,7 +474,10 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn picked(&mut self, expr: ExprId, (pick, derefs): (Pick, u32), (explicit, params): (Option<List>, List), expected: Option<Ty>) -> Result<Ty> {
-        let Pick { item, args: mut substs, own, autoref } = pick;
+        let Pick { item, args: mut substs, own, autoref, bound_trait } = pick;
+        if let (Some(of), Some(poly)) = (bound_trait, &mut self.poly) {
+            poly.method_traits.insert(expr, of);
+        }
         let adjust = Adjust { derefs, autoref };
         let body = self.body;
         let given = match explicit {

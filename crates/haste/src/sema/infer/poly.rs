@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::body::{Body, Bound, ExprId, List, PathId};
 use crate::names::{ItemRef, ModRef, Primitive, plain};
@@ -38,6 +38,7 @@ pub(in crate::sema) struct PolyState {
     pub projections: Vec<ProjId>,
     pub proj_set: HashSet<ProjId>,
     pub offset_holes: Vec<ConstHole>,
+    pub method_traits: HashMap<ExprId, ItemRef>,
 }
 
 pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
@@ -66,13 +67,18 @@ pub(in crate::sema) fn build_poly_summary(cx: &mut Context<'_>, item: ItemRef, p
     }
     infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
     if infer.run(false).is_err() {
-        return SummaryKind::MonomorphicFallback;
+        return fallback_kind(infer.poly.take().map(|poly| poly.method_traits).unwrap_or_default());
     }
-    let Ok((mut typed, poly, clean)) = infer.finish_poly() else { return SummaryKind::MonomorphicFallback };
+    let pre_hints = infer.poly.as_ref().map(|poly| poly.method_traits.clone()).unwrap_or_default();
+    let Ok((mut typed, poly, clean)) = infer.finish_poly() else { return fallback_kind(pre_hints) };
     if cx.quiet_mark() != before || (!typed.coercions.is_empty() && super::object::fill_drops(cx, &mut typed).is_err()) {
-        return SummaryKind::MonomorphicFallback;
+        return fallback_kind(poly.map(|poly| poly.method_traits).unwrap_or(pre_hints));
     }
     finalize_summary(cx, typed, poly, clean, param_count)
+}
+
+fn fallback_kind(hints: HashMap<ExprId, ItemRef>) -> SummaryKind {
+    if hints.is_empty() { SummaryKind::MonomorphicFallback } else { SummaryKind::MonomorphicHints(Arc::new(hints)) }
 }
 
 pub(super) fn zonk_poly_state(infer: &mut Infer<'_, '_>, poly: &mut PolyState) {
@@ -84,14 +90,14 @@ pub(super) fn zonk_poly_state(infer: &mut Infer<'_, '_>, poly: &mut PolyState) {
 fn finalize_summary(cx: &Context<'_>, typed: Typed, poly: Option<Box<PolyState>>, clean: bool, param_count: u16) -> SummaryKind {
     let Some(mut poly) = poly else { return SummaryKind::MonomorphicFallback };
     if poly.phase == PolyPhase::Fallback || !clean || has_param_closure(cx, &typed) {
-        return SummaryKind::MonomorphicFallback;
+        return fallback_kind(poly.method_traits);
     }
     collect_remaining_projs(&cx.types, &mut poly, &typed);
     let mut const_holes = poly.offset_holes;
     let mut layout_tys = Vec::new();
     let mut layout_seen = HashSet::default();
     collect_layouts_and_consts(cx, &typed, &mut layout_tys, &mut layout_seen, &mut const_holes);
-    let super::LazyTables::Eager(template) = typed.tables else { return SummaryKind::MonomorphicFallback };
+    let super::LazyTables::Eager(template) = typed.tables else { return fallback_kind(poly.method_traits) };
     SummaryKind::Poly(Arc::new(PolySummary {
         param_count,
         template,
@@ -113,11 +119,7 @@ fn finalize_summary(cx: &Context<'_>, typed: Typed, poly: Option<Box<PolyState>>
 }
 
 fn has_param_closure(cx: &Context<'_>, typed: &Typed) -> bool {
-    typed
-        .closures
-        .as_slice()
-        .iter()
-        .any(|(_, c)| c.captures.iter().any(|cap| cx.types.has_params(typed.locals[cap.local as usize].ty)))
+    typed.closures.as_slice().iter().any(|(_, c)| c.captures.iter().any(|cap| cx.types.has_params(typed.locals[cap.local as usize].ty)))
 }
 
 fn zonk_obligations(infer: &mut Infer<'_, '_>, raw: &mut Vec<PolyObligation>) -> Vec<PolyObligation> {
@@ -394,7 +396,7 @@ impl Infer<'_, '_> {
             }
             let member_name = self.cx.name(member).to_string();
             let Some(value) = self.picked_alias(of, substs[0], &substs[1..], (&member_name, &[]))? else { continue };
-            let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), None))?;
+            let frame = self.item_frame(of, (&params, &substs[1..]), (Some(substs[0]), Some(of)))?;
             let (home, src) = (frame.home, frame.src);
             self.with_frame(frame, |infer| {
                 infer.in_source(src, |infer| {

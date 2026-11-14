@@ -87,6 +87,10 @@ impl Infer<'_, '_> {
         if matches!(self.cx.types.kind(ty), Kind::Proj(_)) {
             self.poly_fallback();
         }
+        self.deref_step_raw(expr, step, ty)
+    }
+
+    pub(super) fn deref_step_raw(&mut self, expr: ExprId, step: u32, ty: Ty) -> Result<Option<Ty>> {
         let Some((res, target)) = self.overloaded_deref(ty, Mut::Not)? else { return Ok(None) };
         self.out.derefs.insert((expr, step), res);
         Ok(Some(target))

@@ -140,6 +140,7 @@ pub struct Infer<'c, 'a> {
     evaluating: Vec<ItemRef>,
     proved: rustc_hash::FxHashSet<(ItemRef, Substs)>,
     imports: HashMap<(ItemRef, Option<crate::names::Sym>, Vec<u32>), Vec<crate::names::PerNs>>,
+    method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
 }
 
@@ -166,6 +167,15 @@ struct Clash {
 
 /// Infers the body of the function `item` with its generic parameters set to `substs`.
 pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Typed> {
+    infer_with_hints(cx, item, substs, None)
+}
+
+pub(super) fn infer_with_hints(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    substs: Substs,
+    method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
+) -> Result<Typed> {
     if let Some(typed) = compiler_made(cx, item, substs)? {
         return Ok(typed);
     }
@@ -178,7 +188,7 @@ pub fn infer(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Type
     let root = Some(item.body_owner());
     let args = cx.types.substs(substs).to_vec();
     let mut infer = Infer::start(cx, (&body, &sig, src), home);
-    (infer.root, infer.instance) = (root, Some((item, substs)));
+    (infer.root, infer.instance, infer.method_hints) = (root, Some((item, substs)), method_hints);
     let mut frame = infer.frame(item, &args)?;
     (frame.src, frame.root) = (src, root);
     infer.swap_frame(frame);
@@ -281,6 +291,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             evaluating: Vec::new(),
             proved: rustc_hash::FxHashSet::default(),
             imports: HashMap::default(),
+            method_hints: None,
             poly: None,
         }
     }

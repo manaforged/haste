@@ -20,10 +20,11 @@ use super::substs::{ProjId, Substs};
 use super::ty::{Kind, Ty, Types, object_parts};
 use inst::{InstOutcome, TyFolder, fold_substs, fold_ty, instantiate_pure};
 
-/// How generic sema summarizes one function item: a reusable polymorphic summary or monomorphic fallback.
+/// How generic sema summarizes one function item: a reusable polymorphic summary, monomorphic inference with bounded-trait method hints, or plain monomorphic fallback.
 #[derive(Clone, Debug)]
 pub enum SummaryKind {
     Poly(Arc<PolySummary>),
+    MonomorphicHints(Arc<HashMap<ExprId, ItemRef>>),
     MonomorphicFallback,
 }
 
@@ -99,47 +100,36 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
     let before = cx.quiet_mark();
     let (item, substs) = *instance;
     let is_fixed = cx.outline.is_fixed(item.krate);
+    if !eligible(cx, item, substs) {
+        return None;
+    }
+    let expected = expected_param_count(cx, item)?;
+    if cx.types.substs(substs).len() != expected || expected > u16::MAX as usize {
+        return None;
+    }
     let summaries = cx.store.lookups.summaries.clone();
-    let built = if substs.is_empty() && is_fixed {
-        let (_, entry) = cx.item(item);
-        if entry.kind != ItemKind::Fn || entry.body.is_none() || cx.foreign(item) {
-            return None;
+    let built = summaries.run(
+        cx,
+        item,
+        |cx| Ok(frozen::frozen_summary(cx, item).map_or_else(|| build_summary(cx, item, expected as u16), SummaryKind::Poly)),
+        |_| Ok(SummaryKind::MonomorphicFallback),
+    );
+    let summary = match built {
+        Ok(SummaryKind::Poly(summary)) => summary,
+        Ok(SummaryKind::MonomorphicHints(hints)) => {
+            let m_before = cx.quiet_mark();
+            let typed = match super::infer::infer_with_hints(cx, instance.0, instance.1, Some(hints)) {
+                Ok(typed) => Arc::new(typed),
+                Err(error) => return Some(Err(format!("{}: {error:#}", cx.name(instance.0)))),
+            };
+            let laid = super::reach::lay_out(cx, &typed).map_err(|error| unlaid.push(format!("{}: {error:#}", cx.name(instance.0))));
+            if laid.is_ok() && cx.quiet_mark() == m_before {
+                cx.store.finals.insert(*instance, Arc::clone(&typed));
+            }
+            return Some(Ok(typed));
         }
-        summaries.run(
-            cx,
-            item,
-            |cx| {
-                if let Some(poly) = frozen::frozen_summary(cx, item) {
-                    return Ok(SummaryKind::Poly(poly));
-                }
-                if !eligible(cx, item, substs) || expected_param_count(cx, item) != Some(0) {
-                    return Ok(SummaryKind::MonomorphicFallback);
-                }
-                Ok(build_summary(cx, item, 0))
-            },
-            |_| Ok(SummaryKind::MonomorphicFallback),
-        )
-    } else {
-        if !eligible(cx, item, substs) {
-            return None;
-        }
-        let expected = expected_param_count(cx, item)?;
-        if cx.types.substs(substs).len() != expected || expected > u16::MAX as usize {
-            return None;
-        }
-        summaries.run(
-            cx,
-            item,
-            |cx| {
-                if let Some(poly) = frozen::frozen_summary(cx, item) {
-                    return Ok(SummaryKind::Poly(poly));
-                }
-                Ok(build_summary(cx, item, expected as u16))
-            },
-            |_| Ok(SummaryKind::MonomorphicFallback),
-        )
+        _ => return None,
     };
-    let Ok(SummaryKind::Poly(summary)) = built else { return None };
     if is_fixed
         && !cx.store.lookups.skip_warm_sysroot_bodies
         && cx.store.bodies.get(&item).is_none()
@@ -159,7 +149,7 @@ fn cached_poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySu
     if let Some(kind) = cx.store.lookups.summaries.get_ready(&item) {
         return match kind {
             SummaryKind::Poly(summary) => Some(summary),
-            SummaryKind::MonomorphicFallback => None,
+            SummaryKind::MonomorphicHints(_) | SummaryKind::MonomorphicFallback => None,
         };
     }
     frozen::frozen_summary(cx, item)
@@ -221,8 +211,9 @@ fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
 }
 
 fn build_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
-    let SummaryKind::Poly(mut arc) = super::infer::poly::build_poly_summary(cx, item, param_count) else {
-        return SummaryKind::MonomorphicFallback;
+    let built = super::infer::poly::build_poly_summary(cx, item, param_count);
+    let SummaryKind::Poly(mut arc) = built else {
+        return built;
     };
     if cx.outline.is_fixed(item.krate) {
         cx.store.lookups.has_new_sysroot_summaries.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -381,6 +372,15 @@ fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Res
     Ok(())
 }
 
+fn record_instantiated(cx: &mut Context<'_>, instance: Instance, layouts: &[Ty], typed: &Arc<Typed>, unlaid: &mut Vec<String>, before: (usize, usize)) -> bool {
+    let laid = lay_out_instantiated(cx, layouts, typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
+    let clean = laid.is_ok() && cx.quiet_mark() == before;
+    if clean {
+        cx.store.finals.insert(instance, Arc::clone(typed));
+    }
+    clean
+}
+
 fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<PolySummary>, unlaid: &mut Vec<String>, before: (usize, usize)) -> Option<Result<Arc<Typed>, String>> {
     if summary.param_count == 0
         && summary.projections.is_empty()
@@ -401,10 +401,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
             drops: summary.fixed_drops.to_vec(),
             shape: Shape::Body,
         });
-        let laid = lay_out_instantiated(cx, &summary.layout_tys, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
-        if laid.is_ok() && cx.quiet_mark() == before {
-            cx.store.finals.insert(instance, Arc::clone(&typed));
-        }
+        record_instantiated(cx, instance, &summary.layout_tys, &typed, unlaid, before);
         return Some(Ok(typed));
     }
     let concrete_args = cx.types.substs(instance.1).to_vec();
@@ -413,10 +410,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
     }
     if let Some((poly_inst, locals, ret, concrete_layouts, drops)) = frozen::frozen_instance(cx, instance, summary) {
         let typed = Arc::new(Typed { tables: LazyTables::Poly(Box::new(poly_inst)), locals, params: summary.params.to_vec(), ret, drops, shape: Shape::Body });
-        let laid = lay_out_instantiated(cx, &concrete_layouts, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
-        if laid.is_ok() && cx.quiet_mark() == before {
-            cx.store.finals.insert(instance, Arc::clone(&typed));
-        }
+        record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before);
         return Some(Ok(typed));
     }
     let check_only = cx.store.lookups.skip_warm_sysroot_bodies && cx.outline.is_fixed(instance.0.krate) && summary.template.closures.is_empty();
@@ -478,12 +472,11 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
             (typed, concrete_layouts)
         }
     };
-    let laid = lay_out_instantiated(cx, &concrete_layouts, &typed).map_err(|err| unlaid.push(format!("{}: {err:#}", cx.name(instance.0))));
-    if laid.is_ok() && cx.quiet_mark() == before {
-        if matches!(&typed.tables, LazyTables::Poly(inst) if inst.summary.template.closures.is_empty()) && cx.outline.is_fixed(instance.0.krate) {
-            cx.store.lookups.has_new_sysroot_instances.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        cx.store.finals.insert(instance, Arc::clone(&typed));
+    if record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before)
+        && matches!(&typed.tables, LazyTables::Poly(inst) if inst.summary.template.closures.is_empty())
+        && cx.outline.is_fixed(instance.0.krate)
+    {
+        cx.store.lookups.has_new_sysroot_instances.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Some(Ok(typed))
 }
