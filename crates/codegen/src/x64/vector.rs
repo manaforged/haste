@@ -1,6 +1,7 @@
-use super::asm::{Alu, Cond, Mem, Reg, Shift, Size, Xmm};
+use super::asm::{Alu, Cond, Mem, Reg, Rm, Shift, Size, Xmm};
 use super::Emit;
 use super::float::{X0, X1, X2, scalar};
+use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, FloatCC, IntCC, Lane, Op, ShuffleMask, Type, Unary, Value};
 
@@ -49,12 +50,6 @@ impl Emit<'_> {
         }
     }
 
-    pub(super) fn packed_op(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), result: Value) {
-        let dst = self.fdst(result);
-        self.packed_regs(prefix, opcode, (x, y), dst);
-        self.fput(result, dst);
-    }
-
     pub(super) fn packed_regs(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), dst: Xmm) {
         let mut source = self.fin(y, X1);
         if source == dst && x != y {
@@ -65,7 +60,8 @@ impl Emit<'_> {
         self.asm.sse(prefix, opcode, dst.0, source);
     }
 
-    fn sse_or_vex(&mut self, prefix: &[u8], opcode: &[u8], (dst, sx, sy): (Xmm, Xmm, Xmm)) {
+    fn sse_or_vex(&mut self, prefix: &[u8], opcode: &[u8], (dst, sx, sy): (Xmm, Xmm, impl Into<Rm>)) {
+        let sy = sy.into();
         let pp = match prefix { [] => Some(0), [0x66] => Some(1), [0xF3] => Some(2), [0xF2] => Some(3), _ => None };
         let map_opc = match opcode { [0x0F, o] => Some((1, *o)), [0x0F, 0x38, o] => Some((2, *o)), _ => None };
         if self.features.avx && let (Some(pp), Some((map, opc))) = (pp, map_opc) {
@@ -86,8 +82,14 @@ impl Emit<'_> {
 
     pub(super) fn vex_packed_regs(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), dst: Xmm, commute: bool) {
         if self.features.avx {
+            let (x, y) = if commute && self.xmm_of(x).is_none() && self.xmm_of(y).is_some() { (y, x) } else { (x, y) };
             let sx = self.fin(x, X0);
-            let sy = self.fin(y, X1);
+            let cached_y = self.last_fspill.is_some_and(|(d, _, t)| d == self.frame.values[y.index()] && t == self.ty(y));
+            let sy: Rm = if self.ty(y).bytes() == 16 && matches!(self.location(y), Location::Slot) && !cached_y {
+                self.at(y).into()
+            } else {
+                self.fin(y, X1).into()
+            };
             self.sse_or_vex(prefix, opcode, (dst, sx, sy));
             return;
         }
@@ -124,6 +126,10 @@ impl Emit<'_> {
             self.zero_xmm(dst);
             return;
         }
+        if imm == -1 || (lane.bytes() < 8 && (imm as u64 & ((1_u64 << lane.bits()) - 1)) == ((1_u64 << lane.bits()) - 1)) {
+            self.sse_or_vex(&[0x66], &[0x0F, 0x76], (dst, dst, dst));
+            return;
+        }
         self.asm.mov_imm(Reg::Rax, imm);
         self.splat_scalar(lane, dst, Reg::Rax);
     }
@@ -147,10 +153,10 @@ impl Emit<'_> {
             }
             Unary::Fneg | Unary::Fabs if lane.is_float() => {
                 self.fget(dst, x);
-                let sign = if lane == Lane::F64 { i64::MIN } else { 0x8000_0000_u32 as i64 };
-                self.splat_imm(lane, X1, if op == Unary::Fneg { sign } else { !sign });
-                let bitwise = if op == Unary::Fneg { 0xEF } else { 0xDB };
-                self.asm.sse(&[0x66], &[0x0F, bitwise], dst.0, X1);
+                self.sse_or_vex(&[0x66], &[0x0F, 0x76], (X1, X1, X1));
+                let (ext, shift) = if op == Unary::Fneg { (6, lane.bits() as u8 - 1) } else { (2, 1) };
+                self.asm.pshift_imm(ext, lane.bytes(), X1, shift);
+                self.asm.sse(&[0x66], &[0x0F, if op == Unary::Fneg { 0xEF } else { 0xDB }], dst.0, X1);
             }
             Unary::Sqrt if lane.is_float() => {
                 let src = self.fin(x, dst);
@@ -260,8 +266,8 @@ impl Emit<'_> {
                 let dst = self.xmm_of(result).unwrap_or(X2);
                 self.fget(X0, y);
                 self.fget(dst, x);
-                let sign = if lane == Lane::F64 { i64::MIN } else { 0x8000_0000_u32 as i64 };
-                self.splat_imm(lane, X1, sign);
+                self.sse_or_vex(&[0x66], &[0x0F, 0x76], (X1, X1, X1));
+                self.asm.pshift_imm(6, lane.bytes(), X1, lane.bits() as u8 - 1);
                 self.asm.sse(&[0x66], &[0x0F, 0xDB], X0.0, X1);
                 self.asm.sse(&[0x66], &[0x0F, 0xDF], X1.0, dst);
                 self.asm.sse(&[0x66], &[0x0F, 0xEB], X1.0, X0);

@@ -3,6 +3,7 @@ use super::float::{X0, X1, X2};
 use super::int::cond;
 use super::vector::{vec_alu_opcode, vec_prefix};
 use super::Emit;
+use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{Binary, IntCC, Lane, Op, ReduceOp, ShuffleMask, TargetOpId, Type, Value};
 
@@ -628,6 +629,46 @@ impl Emit<'_> {
         Ok(())
     }
 
+    fn cached_fspill(&self, value: Value) -> Option<Xmm> {
+        if !matches!(self.location(value), Location::Slot) {
+            return None;
+        }
+        let disp = self.frame.values[value.index()];
+        let ty = self.ty(value);
+        self.last_fspill.and_then(|(d, r, t)| (d == disp && t == ty).then_some(r))
+    }
+
+    fn emit_target_binary(&mut self, spec: &TargetOpSpec, a: Value, b: Value, k: Option<Value>, result: Value) {
+        let dst = if k.is_some() { self.xmm_of(result).unwrap_or(X2) } else { self.fdst(result) };
+        let mut got_k = k.is_none();
+        let mut got_a = false;
+        if let Some(kv) = k && self.cached_fspill(kv).is_some() {
+            self.fget(X0, kv);
+            got_k = true;
+        } else if self.cached_fspill(a).is_some() && (self.xmm_of(b) != Some(dst) || a == b) {
+            self.fget(dst, a);
+            got_a = true;
+        }
+        let mut src_b = match self.cached_fspill(b) {
+            Some(cached) if cached != dst && (k.is_none() || cached != X0) => cached,
+            _ => self.fin(b, X1),
+        };
+        if src_b == dst && a != b {
+            self.asm.movaps(X1, src_b);
+            self.clobber_xmm(X1);
+            src_b = X1;
+        }
+        if let Some(kv) = k && !got_k {
+            self.fget(X0, kv);
+        }
+        if !got_a {
+            self.fget(dst, a);
+        }
+        self.asm.sse(spec.prefix, spec.opcode, dst.0, src_b);
+        self.clobber_xmm(dst);
+        self.fput(result, dst);
+    }
+
     fn vector_target_op(&mut self, id: TargetOpId, args: &[Value], result: Value) -> Result<(), String> {
         let spec = X64_TARGET_OPS.iter().find(|s| s.id == id).ok_or_else(|| format!("unsupported target op {id:?}"))?;
         match spec.form {
@@ -636,26 +677,16 @@ impl Emit<'_> {
                 let dst = self.fdst(result);
                 let src = self.fin(x, X0);
                 self.asm.sse(spec.prefix, spec.opcode, dst.0, src);
+                self.clobber_xmm(dst);
                 self.fput(result, dst);
             }
             TargetOpForm::Binary => {
                 let [x, y] = *args else { return Err(format!("{id:?} expects 2 args")); };
-                self.packed_op(spec.prefix, spec.opcode, (x, y), result);
+                self.emit_target_binary(spec, x, y, None, result);
             }
             TargetOpForm::Sha256Rnds2 => {
                 let [a, b, k] = *args else { return Err(format!("{id:?} expects 3 args")); };
-                let dst = self.xmm_of(result).unwrap_or(X2);
-                let mut src_b = self.fin(b, X1);
-                if src_b == dst && a != b {
-                    self.asm.movaps(X1, src_b);
-                    self.clobber_xmm(X1);
-                    src_b = X1;
-                }
-                self.fget(X0, k);
-                self.fget(dst, a);
-                self.asm.sse(spec.prefix, spec.opcode, dst.0, src_b);
-                self.clobber_xmm(dst);
-                self.fput(result, dst);
+                self.emit_target_binary(spec, a, b, Some(k), result);
             }
         }
         Ok(())

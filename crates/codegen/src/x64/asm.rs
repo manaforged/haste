@@ -463,8 +463,18 @@ impl Asm {
         self.encode(&[], true, &[0x0F, 0xA5], src as u8, dst.into(), false);
     }
 
+    pub fn shld_imm(&mut self, size: Size, dst: impl Into<Rm>, src: Reg, imm: u8) {
+        self.encode(&[], size == Size::Q, &[0x0F, 0xA4], src as u8, dst.into(), false);
+        self.code.push(imm);
+    }
+
     pub fn shrd(&mut self, dst: Reg, src: Reg) {
         self.encode(&[], true, &[0x0F, 0xAD], src as u8, dst.into(), false);
+    }
+
+    pub fn shrd_imm(&mut self, size: Size, dst: impl Into<Rm>, src: Reg, imm: u8) {
+        self.encode(&[], size == Size::Q, &[0x0F, 0xAC], src as u8, dst.into(), false);
+        self.code.push(imm);
     }
 
     pub fn bts(&mut self, reg: Reg, bit: u8) {
@@ -611,6 +621,11 @@ impl Asm {
     /// `andn`: non-destructive 3-operand `dst = !not_src & src`.
     pub fn andn(&mut self, size: Size, dst: Reg, not_src: Reg, src: impl Into<Rm>) {
         self.vex3(0b00010, size == Size::Q, 0b00, 0xF2, (dst as u8, not_src as u8), src.into());
+    }
+
+    /// `bextr`: non-destructive 3-operand bitfield extract `dst = (src >> ctrl[7:0]) & ((1 << ctrl[15:8]) - 1)`.
+    pub fn bextr(&mut self, size: Size, dst: Reg, src: impl Into<Rm>, ctrl: Reg) {
+        self.vex3(0b00010, size == Size::Q, 0b00, 0xF7, (dst as u8, ctrl as u8), src.into());
     }
 
     /// `movaps dst, src`: copies the whole register, with no dependency on the old contents of `dst`.
