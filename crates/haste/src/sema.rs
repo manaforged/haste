@@ -372,6 +372,16 @@ impl<'a> Context<'a> {
         Paths { demands: Some(&self.asks), ..self.names.paths(self.outline, krate) }
     }
 
+    /// The path of the module that holds `item`, or its crate's name when no module is found.
+    pub fn module_text(&mut self, item: ItemRef) -> String {
+        self.module_of(item).map_or_else(|_| self.outline.roots[item.krate as usize].name.clone(), |at| self.outline.module_path(at))
+    }
+
+    /// The name of `item` under the path of the module that holds it.
+    pub fn qualified(&mut self, item: ItemRef) -> String {
+        format!("{}::{}", self.module_text(item), self.name(item))
+    }
+
     /// The module that holds `item`, through any impl, trait or extern block around it.
     pub fn module_of(&mut self, item: ItemRef) -> Result<ModRef> {
         if let Some((outer, _)) = item.outer() {

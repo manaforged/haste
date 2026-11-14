@@ -683,8 +683,8 @@ impl Image {
         }
     }
 
-    /// Freezes a compiled AOT image into a standalone executable starting at `(lang_start, user_main)`.
-    pub(crate) fn to_aot(&self, target: &Target, (lang_start, user_main): (usize, usize)) -> Result<Executable> {
+    /// Freezes a compiled AOT image into a standalone executable starting at `(lang_start, user_main)`, naming each function's code with `label`.
+    pub(crate) fn to_aot(&self, target: &Target, (lang_start, user_main): (usize, usize), label: &mut dyn FnMut(usize) -> String) -> Result<Executable> {
         let state = lock(self.aot().context("image has no AOT recording")?);
         let thread_slots = lock(&self.thread_slots);
         let live = AotReach::collect(&state, [lang_start, user_main]);
@@ -763,6 +763,13 @@ impl Image {
             bail!("`main` failed to compile");
         };
         exe.entry(start_off, main_off);
+        let mut named: HashMap<u32, usize> = HashMap::default();
+        for (index, off) in fn_offs.iter().enumerate() {
+            if let Some(off) = off {
+                named.entry(*off).or_insert(index);
+            }
+        }
+        exe.symbols(named.into_iter().map(|(off, index)| (off, label(index))).collect());
         Ok(exe)
     }
 }

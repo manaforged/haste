@@ -57,6 +57,7 @@ pub(crate) struct Executable {
     pub(super) entry: Option<(u32, u32)>,
     pub(super) relocs: Vec<CodeReloc>,
     pub(super) pointers: Vec<PtrReloc>,
+    pub(super) symbols: Vec<(u32, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -80,7 +81,27 @@ impl Executable {
             entry: None,
             relocs: Vec::new(),
             pointers: Vec::new(),
+            symbols: Vec::new(),
         }
+    }
+
+    /// Names the function at each `.text` offset in the executable's symbol table.
+    pub(crate) fn symbols(&mut self, mut named: Vec<(u32, String)>) {
+        named.sort_unstable_by_key(|&(offset, _)| offset);
+        self.symbols = named;
+    }
+
+    fn symbol_names(&self, prefix: &str, strtab: &mut Vec<u8>) -> Vec<u32> {
+        self.symbols
+            .iter()
+            .map(|(_, name)| {
+                let at = strtab.len() as u32;
+                strtab.extend_from_slice(prefix.as_bytes());
+                strtab.extend_from_slice(name.as_bytes());
+                strtab.push(0);
+                at
+            })
+            .collect()
     }
 
     /// Appends 16-byte-aligned machine code to `.text` and returns its section offset.

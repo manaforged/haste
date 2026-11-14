@@ -35,9 +35,8 @@ pub(super) fn note(cx: &mut Context<'_>, reached: &Reached, (index, address): (u
     let Some(file) = FILE.get_or_init(open) else { return };
     let ((item, substs), _) = reached.list[index];
     let args: Vec<String> = cx.types.substs(substs).to_vec().into_iter().map(|ty| cx.type_text(ty, &|ty| ty)).collect();
-    let module = cx.module_of(item).map_or_else(|_| cx.outline.roots[item.krate as usize].name.clone(), |at| cx.outline.module_path(at));
     let why = crate::prep::why(reached, index).unwrap_or_default();
-    let line = format!("{address:x}\t{index}\t{origin:?}\t{why}\t{module}::{}<{}>\n", cx.name(item), args.join(","));
+    let line = format!("{address:x}\t{index}\t{origin:?}\t{why}\t{}<{}>\n", cx.qualified(item), args.join(","));
     if let Ok(mut file) = file.lock()
         && let Err(error) = file.write_all(line.as_bytes())
     {

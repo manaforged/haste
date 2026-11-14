@@ -546,7 +546,7 @@ impl Build {
         if self.binary.is_none() {
             self.binary = Some(Batch::new(workspace, &mut self.compilation, BatchKind::MainAot, false)?);
         }
-        let bin = self.binary.as_ref().context("the binary is not compiled")?;
+        let bin = self.binary.as_mut().context("the binary is not compiled")?;
         if !bin.broken.is_empty() {
             for (idx, err) in &bin.broken {
                 eprintln!("broken [{idx}]: {err}");
@@ -554,7 +554,12 @@ impl Build {
             bail!("{} functions failed to compile", bin.broken.len());
         }
         let target = crate::host_target();
-        bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]))?.write(path)?;
+        let store = bin.store.take().context("the binary's inference store is in use")?;
+        let mut cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
+        let reached = &bin.reached;
+        let exe = bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]), &mut |index| reached.list.get(index).map_or_else(|| format!("fn{index}"), |((item, _), _)| cx.qualified(*item)));
+        bin.store = Some(cx.release().0);
+        exe?.write(path)?;
         eprintln!("built {} ({} functions reached, {:.1} ms)", path.display(), bin.reached.list.len(), started.elapsed().as_secs_f64() * 1e3);
         Ok(0)
     }
