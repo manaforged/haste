@@ -1,3 +1,4 @@
+mod carry;
 mod eval;
 mod widen;
 
@@ -21,6 +22,7 @@ struct Eval {
     local_consts: Vec<(Value, i64)>,
     needed: Vec<bool>,
     resolved_branch: bool,
+    carry: carry::Carry,
 }
 
 fn block_bit(block: Block) -> u64 {
@@ -53,39 +55,6 @@ fn outside_uses(func: &Function) -> Vec<u64> {
         }
     }
     uses
-}
-
-fn block_defs(func: &Function, block: Block) -> impl Iterator<Item = Value> + '_ {
-    let data = &func.blocks[block.index()];
-    let body = data.insts.split_last().map_or(&[][..], |(_, body)| body);
-    data.params.iter().copied().chain(body.iter().filter_map(move |&inst| func.insts[inst.index()].result))
-}
-
-fn escapes_from(func: &Function, uses: &[u64], start: Block, def_block: Block) -> bool {
-    let users = block_defs(func, def_block).fold(0, |all, v| all | uses.get(v.index()).copied().unwrap_or(0));
-    if users == 0 || start == def_block {
-        return false;
-    }
-    let defs: Vec<Value> = block_defs(func, def_block).collect();
-    let mut seen = vec![false; func.blocks.len()];
-    seen[def_block.index()] = true;
-    let mut stack = vec![start];
-    while let Some(b) = stack.pop() {
-        if std::mem::replace(&mut seen[b.index()], true) {
-            continue;
-        }
-        if users & block_bit(b) != 0 {
-            for &inst in &func.blocks[b.index()].insts {
-                let mut hit = false;
-                func.insts[inst.index()].op.for_operands(|v| hit |= defs.contains(&v));
-                if hit {
-                    return true;
-                }
-            }
-        }
-        stack.extend(func.successors(b));
-    }
-    false
 }
 
 fn step_block(
@@ -188,7 +157,15 @@ fn step_block(
     Some((next_b, next_args, resolved_branch))
 }
 
-fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, disp: Block, incoming: &[Value], seed: EdgeSeed) -> Option<Eval> {
+fn redefines(func: &Function, block: Block, held: &[Value]) -> bool {
+    !held.is_empty() && func.blocks[block.index()].insts.iter().filter_map(|inst| func.insts[inst.index()].result).any(|result| held.contains(&result))
+}
+
+fn marks(state: &EvalState) -> (usize, usize, usize) {
+    (state.map.len(), state.local_ops.len(), state.local_consts.len())
+}
+
+fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, single: &[Option<Block>], disp: Block, incoming: &[Value], seed: EdgeSeed) -> Option<Eval> {
     if func.blocks[disp.index()].params.is_empty() && matches!(seed, EdgeSeed::None) {
         return None;
     }
@@ -198,52 +175,56 @@ fn eval_dispatcher(func: &Function, cx: &ThreadCx<'_>, disp: Block, incoming: &[
         EdgeSeed::Brif(cond, taken) => seed_edge(func, cx, cond, taken, 0, (&mut state.local_consts, &mut state.edge_cmps)),
         EdgeSeed::Const(val, imm) => state.local_consts.push((val, imm)),
     }
-    let mut visited: Vec<Block> = Vec::new();
-    let (mut next_b, mut next_args, mut resolved_branch) = step_block(func, cx, disp, incoming, &mut state)?;
-    visited.push(disp);
-    let mut last_block = disp;
-    while visited.len() < MAX_CHAIN && !cx.pinned[next_b.index()] && !visited.contains(&next_b) {
-        let marks = (state.map.len(), state.local_ops.len(), state.local_consts.len(), state.local_facts.len(), state.edge_cmps.len());
-        let cur = next_b;
-        if let Some((nb, na, step_resolved)) = step_block(func, cx, cur, &next_args, &mut state) {
-            visited.push(cur);
-            last_block = cur;
-            next_b = nb;
-            next_args = na;
-            resolved_branch |= step_resolved;
-        } else {
-            state.map.truncate(marks.0);
-            state.local_ops.truncate(marks.1);
-            state.local_consts.truncate(marks.2);
-            state.local_facts.truncate(marks.3);
-            state.edge_cmps.truncate(marks.4);
+    let seeded: Vec<Value> = state.local_consts.iter().map(|&(value, _)| value).chain(state.edge_cmps.iter().map(|&(value, ..)| value)).collect();
+    if redefines(func, disp, &seeded) {
+        return None;
+    }
+    let first = step_block(func, cx, disp, incoming, &mut state)?;
+    let mut visited = vec![disp];
+    let mut stops = vec![(first, marks(&state))];
+    while let Some(((next_b, next_args, resolved), _)) = stops.last() {
+        if visited.len() >= MAX_CHAIN || cx.pinned[next_b.index()] || visited.contains(next_b) || redefines(func, *next_b, &seeded) {
             break;
         }
+        let cur = *next_b;
+        let Some((nb, na, step_resolved)) = step_block(func, cx, cur, next_args, &mut state) else {
+            break;
+        };
+        let resolved = *resolved | step_resolved;
+        visited.push(cur);
+        stops.push(((nb, na, resolved), marks(&state)));
     }
-    if !resolved_branch && (visited.len() == 1 || crate::cfg::dominates(cx.idom, next_b, last_block)) {
-        return None;
-    }
-    let (chosen_target, chosen_args) = (next_b, next_args);
-    if visited.iter().any(|&def_block| escapes_from(func, cx.uses, chosen_target, def_block)) {
-        return None;
-    }
-    let mut needed = vec![false; state.local_ops.len()];
-    for &arg in &chosen_args {
-        if let Some(idx) = state.local_ops.iter().position(|&(r, _)| r == arg) {
-            needed[idx] = true;
-        }
-    }
-    for i in (0..state.local_ops.len()).rev() {
-        if !needed[i] || state.local_consts.iter().any(|&(r, _)| r == state.local_ops[i].0) {
+    while let Some(((chosen_target, mut chosen_args, resolved_branch), kept)) = stops.pop() {
+        let chain = &visited[..=stops.len()];
+        if !resolved_branch && (chain.len() == 1 || crate::cfg::dominates(cx.idom, chosen_target, chain[chain.len() - 1])) {
             continue;
         }
-        state.local_ops[i].1.for_operands(|v| {
-            if let Some(idx) = state.local_ops.iter().position(|&(r, _)| r == v) {
+        let Some(carry) = carry::plan(func, cx, single, (chain, incoming), chosen_target) else {
+            continue;
+        };
+        state.map.truncate(kept.0);
+        state.local_ops.truncate(kept.1);
+        state.local_consts.truncate(kept.2);
+        chosen_args.extend(carry.values.iter().map(|&v| lookup(&state.map, v)));
+        let mut needed = vec![false; state.local_ops.len()];
+        for &arg in &chosen_args {
+            if let Some(idx) = state.local_ops.iter().position(|&(r, _)| r == arg) {
                 needed[idx] = true;
             }
-        });
+        }
+        for i in (0..state.local_ops.len()).rev() {
+            if !needed[i] || state.local_consts.iter().any(|&(r, _)| r == state.local_ops[i].0) {
+                continue;
+            }
+            state.local_ops[i].1.for_operands(|v| {
+                if let Some(idx) = state.local_ops.iter().position(|&(r, _)| r == v) {
+                    needed[idx] = true;
+                }
+            });
+        }
+        return Some(Eval { chosen_target, chosen_args, local_ops: state.local_ops, local_consts: state.local_consts, needed, resolved_branch, carry });
     }
-    Some(Eval { chosen_target, chosen_args, local_ops: state.local_ops, local_consts: state.local_consts, needed, resolved_branch })
+    None
 }
 
 fn non_const_needed(eval: &Eval) -> usize {
@@ -388,8 +369,8 @@ fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, d
             }
         }
         let (Some(et), Some(ef)) = (
-            eval_dispatcher(func, cx, disp, &args_t, EdgeSeed::Brif(sel_c, true)),
-            eval_dispatcher(func, cx, disp, &args_f, EdgeSeed::Brif(sel_c, false)),
+            eval_dispatcher(func, cx, &[], disp, &args_t, EdgeSeed::Brif(sel_c, true)),
+            eval_dispatcher(func, cx, &[], disp, &args_f, EdgeSeed::Brif(sel_c, false)),
         ) else {
             continue;
         };
@@ -404,8 +385,8 @@ fn thread_jump_select(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, d
             continue;
         }
         let (Some(et), Some(ef)) = (
-            eval_dispatcher(func, cx, disp, args, EdgeSeed::Const(arg, 1)),
-            eval_dispatcher(func, cx, disp, args, EdgeSeed::Const(arg, 0)),
+            eval_dispatcher(func, cx, &[], disp, args, EdgeSeed::Const(arg, 1)),
+            eval_dispatcher(func, cx, &[], disp, args, EdgeSeed::Const(arg, 0)),
         ) else {
             continue;
         };
@@ -433,7 +414,7 @@ fn single_pred_brif_seed(func: &Function, single: &[Option<Block>], pred: Block)
     None
 }
 
-fn thread_jump(func: &mut Function, cx: &mut ThreadCx<'_>, single: &[Option<Block>], pred: Block, disp: Block) -> bool {
+fn thread_jump(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>], pred: Block, disp: Block) -> bool {
     let Some(&term) = func.blocks[pred.index()].insts.last() else {
         return false;
     };
@@ -444,24 +425,24 @@ fn thread_jump(func: &mut Function, cx: &mut ThreadCx<'_>, single: &[Option<Bloc
         return false;
     }
     let args = args.clone();
-    if let Some(eval) = eval_dispatcher(func, cx, disp, &args, EdgeSeed::None) {
-        let (new_target, new_args) = emit_needed(func, pred, (&mut *cx.consts, &mut *cx.uses), eval);
+    if let Some(eval) = eval_dispatcher(func, cx, single, disp, &args, EdgeSeed::None) {
+        let (new_target, new_args) = carry::commit(func, cx, single, pred, eval);
         func.insts[term.index()].op = Op::Jump(new_target, new_args);
         return true;
     }
     if let Some((cond, taken)) = single_pred_brif_seed(func, single, pred)
-        && let Some(eval) = eval_dispatcher(func, cx, disp, &args, EdgeSeed::Brif(cond, taken))
+        && let Some(eval) = eval_dispatcher(func, cx, single, disp, &args, EdgeSeed::Brif(cond, taken))
         && eval.chosen_target != disp
         && non_const_needed(&eval) <= MAX_BRIF_SPEC_OPS
     {
-        let (new_target, new_args) = emit_needed(func, pred, (&mut *cx.consts, &mut *cx.uses), eval);
+        let (new_target, new_args) = carry::commit(func, cx, single, pred, eval);
         func.insts[term.index()].op = Op::Jump(new_target, new_args);
         return true;
     }
     thread_jump_select(func, cx, pred, disp, term, &args)
 }
 
-fn brif_arm(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Block, taken: bool) -> Option<(Block, Vec<Value>)> {
+fn brif_arm(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>], pred: Block, disp: Block, taken: bool) -> Option<(Block, Vec<Value>)> {
     let Some(Op::Brif(cond, then_b, then_args, else_b, else_args)) = func.last(pred) else {
         return None;
     };
@@ -469,31 +450,35 @@ fn brif_arm(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Block
     if target != disp {
         return None;
     }
-    let eval = eval_dispatcher(func, cx, disp, args, EdgeSeed::Brif(*cond, taken))?;
+    let eval = eval_dispatcher(func, cx, single, disp, args, EdgeSeed::Brif(*cond, taken))?;
     if eval.chosen_target == target
         || non_const_needed(&eval) > MAX_BRIF_SPEC_OPS
         || (!eval.resolved_branch && non_const_needed(&eval) > 0)
+        || (!eval.carry.values.is_empty() && func.successors(pred).any(|s| s == eval.chosen_target))
     {
         return None;
     }
-    Some(emit_needed(func, pred, (&mut *cx.consts, &mut *cx.uses), eval))
+    Some(carry::commit(func, cx, single, pred, eval))
 }
 
-fn thread_brif(func: &mut Function, cx: &mut ThreadCx<'_>, pred: Block, disp: Block) -> bool {
-    let then_arm = brif_arm(func, cx, pred, disp, true);
-    let else_arm = brif_arm(func, cx, pred, disp, false);
-    let Some(&term) = func.blocks[pred.index()].insts.last() else {
-        return false;
-    };
-    let Op::Brif(_, then_b, then_args, else_b, else_args) = &mut func.insts[term.index()].op else {
-        return false;
-    };
-    let changed = then_arm.is_some() || else_arm.is_some();
-    if let Some(arm) = then_arm {
-        (*then_b, *then_args) = arm;
-    }
-    if let Some(arm) = else_arm {
-        (*else_b, *else_args) = arm;
+fn thread_brif(func: &mut Function, cx: &mut ThreadCx<'_>, single: &mut [Option<Block>], pred: Block, disp: Block) -> bool {
+    let mut changed = false;
+    for taken in [true, false] {
+        let Some(arm) = brif_arm(func, cx, single, pred, disp, taken) else {
+            continue;
+        };
+        let Some(&term) = func.blocks[pred.index()].insts.last() else {
+            continue;
+        };
+        let Op::Brif(_, then_b, then_args, else_b, else_args) = &mut func.insts[term.index()].op else {
+            continue;
+        };
+        if taken {
+            (*then_b, *then_args) = arm;
+        } else {
+            (*else_b, *else_args) = arm;
+        }
+        changed = true;
     }
     changed
 }
@@ -515,7 +500,7 @@ fn thread_br_table(func: &mut Function, cx: &ThreadCx<'_>, single: &[Option<Bloc
         if *target != disp {
             continue;
         }
-        let Some(eval) = eval_dispatcher(func, cx, disp, &[], EdgeSeed::Const(index, k as i64)) else {
+        let Some(eval) = eval_dispatcher(func, cx, &[], disp, &[], EdgeSeed::Const(index, k as i64)) else {
             continue;
         };
         if eval.chosen_args.is_empty() && non_const_needed(&eval) == 0 && eval.chosen_target != *target {
@@ -525,7 +510,7 @@ fn thread_br_table(func: &mut Function, cx: &ThreadCx<'_>, single: &[Option<Bloc
     }
     if new_default == disp
         && let Some((cond, taken)) = single_pred_brif_seed(func, single, pred)
-        && let Some(eval) = eval_dispatcher(func, cx, disp, &[], EdgeSeed::Brif(cond, taken))
+        && let Some(eval) = eval_dispatcher(func, cx, &[], disp, &[], EdgeSeed::Brif(cond, taken))
         && eval.chosen_args.is_empty()
         && non_const_needed(&eval) == 0
         && eval.chosen_target != new_default
@@ -631,6 +616,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         let mut changed = false;
         let mut stale = false;
         let mut preds = cfg.preds.clone();
+        let mut live = single.clone();
         for disp_idx in 0..func.blocks.len() {
             let disp = Block(disp_idx as u32);
             if !dispatches(func, cx.pinned, disp) {
@@ -644,14 +630,15 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                     continue;
                 }
                 let mut pred_changed = false;
-                pred_changed |= thread_jump(func, &mut cx, &single, pred, disp);
-                pred_changed |= thread_brif(func, &mut cx, pred, disp);
-                pred_changed |= thread_br_table(func, &cx, &single, pred, disp);
+                pred_changed |= thread_jump(func, &mut cx, &mut live, pred, disp);
+                pred_changed |= thread_brif(func, &mut cx, &mut live, pred, disp);
+                pred_changed |= thread_br_table(func, &cx, &live, pred, disp);
                 if pred_changed {
                     changed = true;
                     func.successors(pred).for_each(|s| preds[s.index()].push(pred));
                     if func.successors(pred).any(|s| {
                         s != disp
+                            && single[s.index()] == live[s.index()]
                             && (single[s.index()].is_some()
                                 || cfg.idom[s.index()].is_some_and(|d| d != s && !crate::cfg::dominates(&cfg.idom, d, pred)))
                     }) {
