@@ -161,6 +161,7 @@ fn report_cases(
     }
     eprint!("{}", haste_codegen::missed_report());
     eprint!("{}", crate::lower::Bodies::inline_report());
+    eprint!("{}", crate::substrate::tally::report());
     if request == Request::Build && crate::substrate::noop::active(stats.map(|(p, _)| p)) {
         match &result {
             Ok(0) => {

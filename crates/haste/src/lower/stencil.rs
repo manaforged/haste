@@ -15,6 +15,7 @@ use crate::sema::table::Table;
 use crate::sync::write_lock;
 
 mod cycles;
+mod persist;
 
 use super::plan::{BodyFootprintPlan, eval_footprint_with_cycle};
 use super::reloc::{RelocPlan, RelocStep, SiteOrigin, eval_relocs};
@@ -116,6 +117,12 @@ struct InlineTemplate {
     size: u16,
 }
 
+impl InlineTemplate {
+    fn shape(&self) -> (bool, u8, u16) {
+        (self.returns, self.height, self.size)
+    }
+}
+
 const TRANSIENT_CAP: usize = 32_768;
 const TRIM_SHARDS: usize = 8;
 const MAX_INLINE_HEIGHT: u8 = 10;
@@ -155,6 +162,7 @@ pub struct Bodies {
     inline_meta: Table<usize, Option<InlineMeta>>,
     templates: Table<TemplateKey, Option<Arc<InlineTemplate>>>,
     cyclic: RwLock<FxHashMap<usize, cycles::CycleState>>,
+    persist: std::sync::OnceLock<persist::Persist>,
     transient_entries: AtomicUsize,
     evict_cursor: AtomicUsize,
 }
@@ -260,10 +268,10 @@ fn record_callee_height(inline: &mut Inline, callee: Option<Arc<InlinedCallee>>)
     callee
 }
 
-fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<InlineHit>, usize, usize, Quiet)> {
+fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, shape_only): (usize, bool)) -> Result<(Option<InlineHit>, usize, usize, Quiet)> {
     let (depth, quiet) = (inline.stack.len(), Quiet::mark(cx, slots));
     inline.stack.push(index);
-    let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, &quiet));
+    let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, shape_only, &quiet));
     inline.pop(depth);
     let (tmpl, cycle) = outcome?;
     Ok((tmpl, cycle, depth, quiet))
@@ -310,12 +318,13 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
         return Ok((record_meta_height(inline, meta), cyc));
     }
     let item = reached.list[index].0.0;
-    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, limit)?;
+    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, true))?;
     let (meta, inlined) = match tmpl {
-        Some((footprint, t, relocs)) => (
+        Some((footprint, Found::Body(t, relocs))) => (
             Some((item, footprint, t.returns, t.height, t.size)),
             relocs.map(|r| Some(build_inlined(item, footprint, &t, r))),
         ),
+        Some((footprint, Found::Shape(returns, height, size))) => (Some((item, footprint, returns, height, size)), None),
         None => (None, Some(None)),
     };
     if standard {
@@ -361,13 +370,14 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         return Ok((None, cyc));
     }
     let item = reached.list[index].0.0;
-    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, limit)?;
+    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, false))?;
     let result = match tmpl {
-        Some((footprint, t, Some(relocs))) => Some(build_inlined(item, footprint, &t, relocs)),
-        Some((footprint, t, None)) => {
+        Some((footprint, Found::Body(t, Some(relocs)))) => Some(build_inlined(item, footprint, &t, relocs)),
+        Some((footprint, Found::Body(t, None))) => {
             let evaluated = quiet.lowered(slots, eval_relocs(cx, reached, slots, &t.reloc_plan, index))?;
             evaluated.map(|relocs| build_inlined(item, footprint, &t, relocs))
         }
+        Some((_, Found::Shape(..))) => unreachable!("a body probe never answers from recorded metadata"),
         None => None,
     };
     if standard {
@@ -404,18 +414,23 @@ impl Quiet {
     }
 }
 
-type InlineHit = (FootprintId, Arc<InlineTemplate>, Option<RelocVec>);
+enum Found {
+    Body(Arc<InlineTemplate>, Option<RelocVec>),
+    Shape(bool, u8, u16),
+}
 
-fn ensure_inline_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<(Option<InlineHit>, usize)> {
+type InlineHit = (FootprintId, Found);
+
+fn ensure_inline_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, probe: (usize, bool, &Quiet)) -> Result<(Option<InlineHit>, usize)> {
     let saved_h = std::mem::replace(&mut inline.max_callee_height, 0);
     let saved_sz = std::mem::replace(&mut inline.max_callee_size, 0);
-    let res = ensure_inline_template_inner(cx, (reached, slots), inline, index, (limit, quiet));
+    let res = ensure_inline_template_inner(cx, (reached, slots), inline, index, probe);
     inline.max_callee_height = saved_h;
     inline.max_callee_size = saved_sz;
     res
 }
 
-fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<(Option<InlineHit>, usize)> {
+fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, shape_only, quiet): (usize, bool, &Quiet)) -> Result<(Option<InlineHit>, usize)> {
     let item = reached.list[index].0.0;
     let fp_res = eval_footprint_with_cycle(cx, (reached, slots), inline, index);
     let fp_h = std::mem::replace(&mut inline.max_callee_height, 0);
@@ -424,13 +439,24 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     let key = TemplateKey { item, footprint, limit, low: slots.low_entries() };
     if let Some(template) = slots.bodies().templates.get(&key) {
         tally(Tally::Hit);
-        return Ok((template.map(|t| (footprint, t, None)), fp_cycle));
+        return Ok((template.map(|t| (footprint, Found::Body(t, None))), fp_cycle));
     }
     tally(Tally::Miss);
+    let depth = inline.stack.len().saturating_sub(1);
+    let disk = slots.bodies().disk(cx, &key);
+    let servable = shape_only && fp_cycle > depth;
+    if servable && let Some(shape) = disk.as_ref().and_then(persist::Disk::hit) {
+        return Ok((shape.map(|(returns, height, size)| (footprint, Found::Shape(returns, height, size))), fp_cycle));
+    }
     let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
     let ir_h = inline.max_callee_height;
     let ir_sz = inline.max_callee_size;
-    let Some((func, relocs, reloc_plan, ir_cycle)) = quiet.lowered(slots, lowered)? else { return Ok((None, fp_cycle)) };
+    let Some((func, relocs, reloc_plan, ir_cycle)) = quiet.lowered(slots, lowered)? else {
+        if let Some(disk) = disk {
+            disk.settle(None, false, servable && quiet.holds(cx, slots));
+        }
+        return Ok((None, fp_cycle));
+    };
     let cycle = fp_cycle.min(ir_cycle);
     let base_h = fp_h.max(ir_h);
     let base_size = fp_sz.max(ir_sz) as usize;
@@ -442,10 +468,11 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
         let size = body_size.min(u16::MAX as usize) as u16;
         (height <= MAX_INLINE_HEIGHT).then(|| Arc::new(InlineTemplate { body, returns, reloc_plan, height, size }))
     });
-    let depth = inline.stack.len().saturating_sub(1);
+    let calm = quiet.holds(cx, slots);
+    let stored = calm && cycle > depth;
     if cycle <= depth {
         tally(Tally::OpenCycle);
-    } else if quiet.holds(cx, slots) {
+    } else if calm {
         slots.bodies().bump_transient();
         let built = template.as_ref().map(Arc::as_ptr);
         template = slots.bodies().templates.get_or_insert_with(key, || template);
@@ -455,7 +482,10 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     } else {
         tally(Tally::Deferred);
     }
-    Ok((template.map(|t| (footprint, t, Some(relocs))), cycle))
+    if let Some(disk) = disk {
+        disk.settle(template.as_deref().map(InlineTemplate::shape), stored, servable && calm);
+    }
+    Ok((template.map(|t| (footprint, Found::Body(t, Some(relocs)))), cycle))
 }
 
 fn plan_has_calls(plan: &RelocPlan) -> bool {

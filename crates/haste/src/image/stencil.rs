@@ -9,6 +9,7 @@ use crate::names::ItemRef;
 use crate::outline::tree::Profile;
 use crate::sema::Context;
 use crate::sema::reach::Reached;
+use crate::substrate::tally::{Tally, tally};
 use crate::sync::lock;
 
 use super::aot::{AotCode, AotFn, CachedAotTemplate};
@@ -573,6 +574,7 @@ impl Image {
                 }
                 pass.record_size(inst.leader, code_len, 0);
             }
+            tally(Tally::HitLowered);
             return Some(Ok(()));
         }
         let sites = cfg.verify.then(|| slice.decode_sites()).transpose().ok()?;
@@ -592,6 +594,7 @@ impl Image {
                 }
             }
         }
+        tally(Tally::HitLowered);
         Some(self.finish_verify(cx, reached, &records))
     }
 
@@ -726,15 +729,10 @@ impl Image {
             return None;
         }
         let ((item, _), Ok(typed)) = &reached.list[index] else { return None };
-        if matches!(typed.shape, crate::sema::infer::Shape::Anon(_)) || typed.has_awaits() || !cx.outline.is_fixed(item.krate) {
+        if matches!(typed.shape, crate::sema::infer::Shape::Anon(_)) || typed.has_awaits() {
             return None;
         }
-        let is_sysroot = cx.outline.is_sysroot(item.krate);
-        let item_key = if is_sysroot {
-            crate::substrate::sysroot_only_item_key(cx.outline, *item)?
-        } else {
-            crate::substrate::sysroot_item_key(cx.outline, *item)?
-        };
+        let (is_sysroot, item_key) = crate::substrate::layer_item_key(cx.outline, *item)?;
         Some((is_sysroot, mode_stencil_key(self.backend.mode(), item_key), fp.0))
     }
 
@@ -764,6 +762,6 @@ pub(super) fn mode_dict_key(direct_key: u64) -> u64 {
     direct_key ^ 0xD1C7_A070_D1C7_A070
 }
 
-fn mode_stencil_key(mode: ImageMode, item_key: u64) -> u64 {
+pub(super) fn mode_stencil_key(mode: ImageMode, item_key: u64) -> u64 {
     if mode == ImageMode::Aot { item_key ^ 0xA070_A070_A070_A070 } else { item_key }
 }

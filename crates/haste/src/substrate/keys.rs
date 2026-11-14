@@ -196,6 +196,16 @@ pub fn item_key_with_crates(
     Some(hasher.finish())
 }
 
+/// Computes whether a fixed item belongs to the toolchain layer, and its key in that layer or the dependency layer, or `None` for local items.
+pub fn layer_item_key(outline: &crate::outline::Outline, item: crate::names::ItemRef) -> Option<(bool, u64)> {
+    if !outline.is_fixed(item.krate) {
+        return None;
+    }
+    let is_sysroot = outline.is_sysroot(item.krate);
+    let key = if is_sysroot { sysroot_only_item_key(outline, item)? } else { sysroot_item_key(outline, item)? };
+    Some((is_sysroot, key))
+}
+
 fn hash_file_meta(path: &Path, hasher: &mut FxHasher) {
     (path, crate::graph::store::file_stamp(path)).hash(hasher);
 }

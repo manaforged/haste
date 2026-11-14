@@ -252,7 +252,7 @@ fn save_batch_substrate(
     pre_builder: Option<PreBuilders>,
 ) {
     let Some(slot) = slot else { return };
-    if !image.has_new_frozen_stencils() && pre_builder.is_none() && (drop_finals || !cx.store().has_new_sysroot_summaries()) {
+    if !image.has_new_frozen_stencils() && !image.has_new_inline_meta() && pre_builder.is_none() && (drop_finals || !cx.store().has_new_sysroot_summaries()) {
         return;
     }
     let mut builders = pre_builder.unwrap_or_else(|| make_builders(slot));
@@ -263,6 +263,7 @@ fn save_batch_substrate(
         if image.has_new_frozen_stencils() {
             image.export_sysroot_stencils(Some(&mut builders.toolchain), builders.deps.as_mut())?;
         }
+        image.export_inline_meta(Some(&mut builders.toolchain), builders.deps.as_mut())?;
         save_substrate_layer(builders.toolchain, slot.toolchain.as_deref(), Some(MAX_TOOLCHAIN_SUBSTRATE_BYTES), crate::substrate::Substrate::save_toolchain)?;
         if let Some(deps_builder) = builders.deps {
             save_substrate_layer(deps_builder, slot.deps.as_deref(), None, crate::substrate::Substrate::save_deps)?;
