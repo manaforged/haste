@@ -1,27 +1,36 @@
 use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, InstData, Op, StackSlot, Value};
 
-pub(crate) fn order(func: &Function) -> Vec<Block> {
-    let Some(entry) = func.entry else { return Vec::new() };
+pub(crate) fn cold(func: &Function) -> Vec<bool> {
     let cfg = func.cfg();
-    let loops = cfg.loops();
-    let mut can_exit = vec![false; func.blocks.len()];
+    let mut cold = vec![true; func.blocks.len()];
     let mut work = Vec::new();
     for b in 0..func.blocks.len() {
         let block = Block(b as u32);
         if matches!(func.last(block), Some(Op::Return(_))) {
-            can_exit[b] = true;
+            cold[b] = false;
             work.push(block);
         }
     }
     while let Some(block) = work.pop() {
         for &pred in cfg.preds_of(block) {
-            if !std::mem::replace(&mut can_exit[pred.index()], true) {
+            if std::mem::replace(&mut cold[pred.index()], false) {
                 work.push(pred);
             }
         }
     }
-    let is_cold = |block: Block| block != entry && !can_exit[block.index()];
+    if let Some(entry) = func.entry {
+        cold[entry.index()] = false;
+    }
+    cold
+}
+
+pub(crate) fn order(func: &Function) -> Vec<Block> {
+    let Some(entry) = func.entry else { return Vec::new() };
+    let cfg = func.cfg();
+    let loops = cfg.loops();
+    let cold = cold(func);
+    let is_cold = |block: Block| cold[block.index()];
     let mut visited = vec![false; func.blocks.len()];
     let mut post = Vec::with_capacity(func.blocks.len());
     let mut stack = vec![(entry, false)];

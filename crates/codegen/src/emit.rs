@@ -31,6 +31,39 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn park_reload(&mut self, value: Value, reg: ParkReg<R>);
     fn put_exception(&mut self, value: Value);
     fn push_site(&mut self, site: Site);
+    fn tails(&mut self) -> &mut Tails<'a, L>;
+}
+
+struct Stub<'a, L> {
+    label: L,
+    block: Block,
+    args: &'a [Value],
+}
+
+pub(crate) struct Tails<'a, L> {
+    stubs: Vec<Stub<'a, L>>,
+    cold: Option<Vec<bool>>,
+}
+
+impl<L> Tails<'_, L> {
+    pub(crate) fn new() -> Self {
+        Self { stubs: Vec::new(), cold: None }
+    }
+
+    fn colder(&mut self, func: &Function, condition: Value, edge: Block, other: Block) -> bool {
+        let cold = self.cold.get_or_insert_with(|| crate::live::cold(func));
+        if cold[edge.index()] != cold[other.index()] {
+            return cold[edge.index()];
+        }
+        let cfg = func.cfg();
+        let loops = cfg.loops();
+        let branches = |from: &&Block| {
+            matches!(func.last(**from), Some(Op::Brif(test, a, _, b, _)) if *test == condition && ((*a == edge && *b == other) || (*a == other && *b == edge)))
+        };
+        let leaves = |from: &Block| loops.list.iter().any(|each| each.body[from.index()] && each.body[other.index()] && !each.body[edge.index()]);
+        let mut froms = cfg.preds_of(other).iter().filter(branches).peekable();
+        froms.peek().is_some() && froms.all(leaves)
+    }
 }
 
 pub(crate) fn loop_spans(func: &Function, order: &[Block], starts: &[u32]) -> Vec<Range<u32>> {
@@ -122,11 +155,54 @@ fn shrink_edges<'a, 'b, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     )
 }
 
+fn falls<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &E, block: Block) -> bool {
+    emit.next_block().is_some_and(|next| next == block || next == emit.func().jump_target(block))
+}
+
+fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
+    emit: &mut E,
+    condition: Value,
+    (then, then_moves): ((Block, &'a [Value]), bool),
+    (otherwise, else_moves): ((Block, &'a [Value]), bool),
+) -> Result<bool, String> {
+    if emit.in_shrink_entry() || !(then_moves || else_moves) {
+        return Ok(false);
+    }
+    let func = emit.func();
+    let (cold, hot, hot_moves, invert) = if then_moves && emit.tails().colder(func, condition, then.0, otherwise.0) {
+        (then, otherwise, else_moves, false)
+    } else if else_moves && emit.tails().colder(func, condition, otherwise.0, then.0) {
+        (otherwise, then, then_moves, true)
+    } else {
+        return Ok(false);
+    };
+    if !hot_moves && !falls(emit, hot.0) {
+        return Ok(false);
+    }
+    let label = emit.new_label();
+    emit.branch_cond(condition, invert, label);
+    emit.tails().stubs.push(Stub { label, block: cold.0, args: cold.1 });
+    emit.edge(hot.0, hot.1)?;
+    goto_branch(emit, hot.0, true);
+    Ok(true)
+}
+
+pub(crate) fn emit_stubs<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &mut E) -> Result<(), String> {
+    for stub in std::mem::take(&mut emit.tails().stubs) {
+        emit.clear_flags();
+        emit.bind_label(stub.label);
+        emit.edge(stub.block, stub.args)?;
+        let target = emit.block_label(emit.func().jump_target(stub.block));
+        emit.jump_label(target);
+    }
+    Ok(())
+}
+
 pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit: &mut E,
     condition: Value,
-    then: (Block, &[Value]),
-    otherwise: (Block, &[Value]),
+    then: (Block, &'a [Value]),
+    otherwise: (Block, &'a [Value]),
 ) -> Result<(), String> {
     let (then, otherwise) = shrink_edges(emit, then, otherwise);
     if let Some(known) = emit.plan().const_of(condition) {
@@ -137,8 +213,10 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     }
     let then_moves = emit.plan().moves(emit.func(), emit.frame(), then.0, then.1);
     let else_moves = emit.plan().moves(emit.func(), emit.frame(), otherwise.0, otherwise.1);
-    let falls = emit.next_block().is_some_and(|next| next == then.0 || next == emit.func().jump_target(then.0));
-    if !else_moves && (then_moves || falls) {
+    if set_aside(emit, condition, (then, then_moves), (otherwise, else_moves))? {
+        return Ok(());
+    }
+    if !else_moves && (then_moves || falls(emit, then.0)) {
         let target = target_label(emit, otherwise.0);
         emit.branch_cond(condition, true, target);
         emit.edge(then.0, then.1)?;

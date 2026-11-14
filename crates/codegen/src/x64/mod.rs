@@ -14,7 +14,7 @@ use asm::{Alu, Asm, Cond, Label, Mem, Reg, Rm, Shift, Size, Xmm};
 use features::Features;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
-use crate::emit::{Backend, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_try_call, intake_params};
+use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Lane, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
@@ -93,6 +93,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         slow_thunk,
         in_shrink_entry: false,
         in_fast_ret: false,
+        tails: Tails::new(),
     };
     drive(emit, &order)
 }
@@ -151,6 +152,7 @@ pub(super) struct Emit<'a> {
     slow_thunk: Label,
     in_shrink_entry: bool,
     in_fast_ret: bool,
+    tails: Tails<'a, Label>,
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
@@ -294,6 +296,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
             self.asm.bind(label);
             self.ud2();
         }
+        emit_stubs(&mut self)?;
         Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new() })
     }
 }
@@ -713,6 +716,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn next_block(&self) -> Option<Block> { self.next }
     fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
     fn new_label(&mut self) -> Label { self.asm.label() }
+    fn tails(&mut self) -> &mut Tails<'a, Label> { &mut self.tails }
     fn bind_label(&mut self, label: Label) {
         self.invalidate_spills();
         self.asm.bind(label);
