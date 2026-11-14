@@ -1,6 +1,7 @@
 use super::asm::{Alu, Cond, Mem, Reg, Rm, Shift, Size, Xmm};
 use super::Emit;
 use super::float::{X0, X1, X2, scalar};
+use super::vector_narrow::PMULUDQ;
 use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, FloatCC, IntCC, Lane, Op, ShuffleMask, Type, Unary, Value};
@@ -374,31 +375,15 @@ impl Emit<'_> {
                 self.fget(X0, x);
                 self.fget(X1, y);
                 self.asm.movaps(dst, X0);
-                self.asm.sse(&[0x66], &[0x0F, 0xF4], dst.0, X1);
+                self.asm.sse(&[0x66], PMULUDQ, dst.0, X1);
                 self.asm.pshift_imm(2, 8, X0, 32);
                 self.asm.pshift_imm(2, 8, X1, 32);
-                self.asm.sse(&[0x66], &[0x0F, 0xF4], X0.0, X1);
+                self.asm.sse(&[0x66], PMULUDQ, X0.0, X1);
                 self.asm.sse_imm(&[0x66], &[0x0F, 0x70], dst.0, dst, 0x08);
                 self.asm.sse_imm(&[0x66], &[0x0F, 0x70], X0.0, X0, 0x08);
                 self.asm.sse(&[0x66], &[0x0F, 0x62], dst.0, X0);
             }
-            Lane::I64 => {
-                self.fget(X0, x);
-                self.fget(X1, y);
-                self.asm.movq_out(Reg::Rax, X0);
-                self.asm.movq_out(Reg::Rcx, X1);
-                self.asm.imul(Reg::Rax, Reg::Rcx);
-                self.asm.movq_in(dst, Reg::Rax);
-                if count == 2 {
-                    self.asm.sse_imm(&[0x66], &[0x0F, 0x70], X0.0, X0, 0xEE);
-                    self.asm.sse_imm(&[0x66], &[0x0F, 0x70], X1.0, X1, 0xEE);
-                    self.asm.movq_out(Reg::Rax, X0);
-                    self.asm.movq_out(Reg::Rcx, X1);
-                    self.asm.imul(Reg::Rax, Reg::Rcx);
-                    self.asm.movq_in(X0, Reg::Rax);
-                    self.asm.sse(&[0x66], &[0x0F, 0x6C], dst.0, X0);
-                }
-            }
+            Lane::I64 => self.imul_quads((x, y), dst),
             Lane::I8 => self.scalarize_int_binary(Binary::Imul, lane, count, x, y, dst),
             _ => return Err(format!("Imul of {lane:?}")),
         }
@@ -450,7 +435,7 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn splat_source(&self, v: Value, count: u8) -> Option<Value> {
+    pub(super) fn splat_source(&self, v: Value, count: u8) -> Option<Value> {
         let inst = self.defs.get(v.index()).copied().flatten()?;
         let Op::Shuffle(a, _, ShuffleMask::Const(m)) = &self.func.insts[inst.index()].op else {
             return None;
@@ -485,16 +470,8 @@ impl Emit<'_> {
                         Binary::Sshr => 4,
                         _ => 6,
                     };
-                    if self.features.avx {
-                        let sx = self.fin(x, X0);
-                        self.asm.vex_pshift_imm(ext, lane.bytes(), dst, sx, k);
-                    } else {
-                        let src = self.fin(x, dst);
-                        if dst != src {
-                            self.asm.movaps(dst, src);
-                        }
-                        self.asm.pshift_imm(ext, lane.bytes(), dst, k);
-                    }
+                    let sx = self.fin(x, if self.features.avx { X0 } else { dst });
+                    self.pshift_into(ext, lane.bytes(), dst, sx, k);
                     self.fput(result, dst);
                     return Ok(());
                 }
@@ -727,6 +704,7 @@ impl Emit<'_> {
                 self.splat_imm(Lane::I16, X1, 0x8000);
                 self.asm.sse(&[0x66], &[0x0F, 0xEF], dst.0, X1);
             }
+            (Convert::Ireduce, Lane::I16 | Lane::I32 | Lane::I64, _) if fl.bytes() == 2 * tl.bytes() => self.narrow(fl, x, dst),
             _ => self.scalarize_convert(op, (fl, tl, fc), (from_ty, to_ty), x, dst)?,
         }
         self.fput(result, dst);

@@ -7,6 +7,7 @@ mod int;
 mod location;
 mod vector;
 mod vector_lanes;
+mod vector_narrow;
 mod wide;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Rm, Shift, Size, Xmm};
