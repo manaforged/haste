@@ -28,6 +28,10 @@ fn find_plan(func: &Function, cfg: &Cfg, each: &Loop) -> Option<RotatePlan> {
     if Some(head) == func.entry || each.latches.is_empty() || each.latches.contains(&head) {
         return None;
     }
+    let inside = |block: Block| each.body.get(block.index()).copied().unwrap_or(false);
+    if each.latches.iter().any(|&latch| matches!(func.last(latch), Some(&Op::Brif(_, t, _, f, _)) if inside(t) != inside(f))) {
+        return None;
+    }
     let head_insts = &func.blocks[head.index()].insts;
     let (&last, head_body) = head_insts.split_last()?;
     if head_body.len() > 32 {
@@ -36,8 +40,7 @@ fn find_plan(func: &Function, cfg: &Cfg, each: &Loop) -> Option<RotatePlan> {
     let Op::Brif(cond, t_blk, ref t_args, f_blk, ref f_args) = func.insts[last.index()].op else {
         return None;
     };
-    let t_in = each.body.get(t_blk.index()).copied().unwrap_or(false);
-    let f_in = each.body.get(f_blk.index()).copied().unwrap_or(false);
+    let (t_in, f_in) = (inside(t_blk), inside(f_blk));
     if t_in == f_in {
         return None;
     }
