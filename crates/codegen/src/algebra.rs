@@ -1,4 +1,4 @@
-use crate::fold::extend;
+use crate::fold::{extend, holds};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, ShuffleMask, Type, Unary, Value};
 
 mod icmp;
@@ -21,6 +21,8 @@ impl<'a> RewriteCx<'a> {
     fn sconst(&self, v: Value) -> Option<i64> { self.consts.get(v.index()).copied().flatten() }
     fn uconst(&self, v: Value, ty: Type) -> Option<u64> { self.sconst(v).map(|c| extend(c, ty, false) as u64) }
     fn known(&self, v: Value) -> (u64, u64) { crate::fold::known_bits(self.func, &|x| self.def(x), &|x| self.sconst(x), v, 0) }
+    fn op(&self, v: Value) -> Option<&Op> { self.def(v).map(|inst| &self.func.insts[inst.index()].op) }
+    fn count(&self, sh: Value, ty: Type) -> Option<u32> { self.sconst(sh).map(|imm| (imm as u32) & (ty.bits() - 1)) }
     fn single_use(&self, v: Value) -> bool { self.uses.get(v.index()).copied().unwrap_or(1) <= 1 }
     fn is_unit_bool(&self, v: Value) -> bool { let t = self.func.ty(v); t.is_small_int() && (self.known(v).0 & (t.unsigned_max() & !1)) == (t.unsigned_max() & !1) }
 
@@ -84,42 +86,93 @@ fn magic_udiv(cx: &mut RewriteCx, ty: Type, x: Value, d: u64) -> Op {
     Op::Binary(Binary::Ushr, t2, sh)
 }
 
-enum Masked {
+enum Demand {
     Const(u64),
-    And(Value, u64),
+    Bits(Value),
 }
 
-fn simplify_masked(cx: &RewriteCx, v: Value, mask: u64, depth: u8) -> Option<Masked> {
-    if mask == 0 {
-        return Some(Masked::Const(0));
-    }
+fn shift_demand(op: Binary, w: u64, k: u32, mask: u64) -> u64 {
+    if op == Binary::Ushr { (mask << k) & w } else { mask >> k }
+}
+
+fn demanded(cx: &RewriteCx, v: Value, mask: u64, depth: u8) -> Demand {
     let (kz, ko) = cx.known(v);
-    if (kz & mask) == mask {
-        return Some(Masked::Const(0));
+    if ((kz | ko) & mask) == mask {
+        return Demand::Const(ko & mask);
     }
-    if (ko & mask) == mask {
-        return Some(Masked::Const(mask));
-    }
-    if depth >= 6 {
-        return None;
-    }
-    let inst = cx.def(v)?;
+    let Some(inst) = cx.def(v).filter(|_| depth < 6) else { return Demand::Bits(v) };
+    let ty = cx.func.ty(v);
+    let next = |u: Value, m: u64| demanded(cx, u, m, depth + 1);
     match cx.func.insts[inst.index()].op {
-        Op::Binary(bin @ (Binary::Bor | Binary::Bxor | Binary::Band), a, b) => {
-            [(a, b), (b, a)].into_iter().find_map(|(keep, drop)| {
-                let bits = if bin == Binary::Band { cx.known(drop).1 } else { cx.known(drop).0 };
-                ((bits & mask) == mask).then(|| simplify_masked(cx, keep, mask, depth + 1).unwrap_or(Masked::And(keep, mask)))
-            })
+        Op::Binary(bin @ (Binary::Bor | Binary::Bxor | Binary::Band), a, b) => [(a, b), (b, a)].into_iter().find_map(|(keep, drop)| {
+            let bits = if bin == Binary::Band { cx.known(drop).1 } else { cx.known(drop).0 };
+            ((bits & mask) == mask).then(|| next(keep, mask))
+        }).unwrap_or(Demand::Bits(v)),
+        Op::Unary(Unary::Bnot, inner) => match cx.op(inner) {
+            Some(&Op::Binary(Binary::Bxor, x, y)) => [(x, y), (y, x)].into_iter().find_map(|(src, cv)| {
+                cx.uconst(cv, ty).filter(|c| (c & mask) == mask).map(|_| next(src, mask))
+            }).unwrap_or(Demand::Bits(v)),
+            _ => Demand::Bits(v),
+        },
+        Op::Binary(op @ (Binary::Ishl | Binary::Ushr), a, sh) => {
+            let Some(k) = cx.count(sh, ty) else { return Demand::Bits(v) };
+            let (w, inner) = (ty.unsigned_max(), shift_demand(op, ty.unsigned_max(), k, mask));
+            match next(a, inner) {
+                Demand::Const(c) => Demand::Const(if op == Binary::Ushr { c >> k } else { (c << k) & mask }),
+                Demand::Bits(s) => match cx.op(s) {
+                    _ if k == 0 => Demand::Bits(s),
+                    Some(&Op::Binary(inv @ (Binary::Ishl | Binary::Ushr), t, sh2)) if inv != op && cx.count(sh2, ty) == Some(k) && shift_demand(inv, w, k, inner) == mask => next(t, mask),
+                    _ => Demand::Bits(v),
+                },
+            }
         }
-        Op::Unary(Unary::Bnot, inner) => {
-            let Op::Binary(Binary::Bxor, x, y) = cx.func.insts[cx.def(inner)?.index()].op else { return None };
-            [(x, y), (y, x)].into_iter().find_map(|(src, cv)| {
-                let c = cx.uconst(cv, cx.func.ty(v))?;
-                ((c & mask) == mask).then(|| simplify_masked(cx, src, mask, depth + 1).unwrap_or(Masked::And(src, mask)))
-            })
+        Op::Convert(kind @ (Convert::Uextend | Convert::Ireduce), a) if cx.func.ty(a).is_small_int() => {
+            let inner = mask & cx.func.ty(a).unsigned_max();
+            match next(a, inner) {
+                Demand::Const(c) => Demand::Const(c),
+                Demand::Bits(s) => match cx.op(s) {
+                    Some(&Op::Convert(back @ (Convert::Uextend | Convert::Ireduce), t)) if back != kind && inner == mask && cx.func.ty(t) == ty => next(t, mask),
+                    _ => Demand::Bits(v),
+                },
+            }
         }
-        _ => None,
+        _ => Demand::Bits(v),
     }
+}
+
+fn field_of(cx: &RewriteCx, v: Value, depth: u8) -> (Value, u64) {
+    let ty = cx.func.ty(v);
+    let w = ty.unsigned_max();
+    let part = |s: Value, m: u64| { let (src, sm) = field_of(cx, s, depth + 1); (src, sm & m) };
+    match cx.op(v).filter(|_| depth < 6 && ty.is_small_int()) {
+        Some(&Op::Binary(Binary::Band, a, b)) => [(a, b), (b, a)].into_iter().find_map(|(s, c)| cx.uconst(c, ty).map(|m| part(s, m))).unwrap_or((v, w)),
+        Some(&Op::Convert(Convert::Uextend, n)) => match cx.op(n) {
+            Some(&Op::Convert(Convert::Ireduce, s)) if cx.func.ty(s) == ty => part(s, cx.func.ty(n).unsigned_max()),
+            _ => (v, w),
+        },
+        Some(&Op::Binary(op @ (Binary::Ishl | Binary::Ushr), f, sh)) => {
+            let (s1, m1) = field_of(cx, f, depth + 1);
+            match (cx.count(sh, ty), cx.op(s1)) {
+                (Some(k), Some(&Op::Binary(inv @ (Binary::Ishl | Binary::Ushr), s, sh2))) if inv != op && cx.count(sh2, ty) == Some(k) => part(s, shift_demand(inv, w, k, m1)),
+                _ => (v, w),
+            }
+        }
+        _ => (v, w),
+    }
+}
+
+fn merge_fields(cx: &mut RewriteCx, res: Option<Value>, a: Value, b: Value) -> Option<Op> {
+    let ty = cx.func.ty(a);
+    let ((src, ma), (other, mb)) = (field_of(cx, a, 0), field_of(cx, b, 0));
+    if src != other || !ty.is_small_int() { return None; }
+    if cx.redundant_mask(src, ty, ma | mb) { cx.alias(res, src); return None; }
+    let mask = cx.emit(ty, Op::Const(extend((ma | mb) as i64, ty, true)));
+    Some(Op::Binary(Binary::Band, src, mask))
+}
+
+fn known_cond(cx: &mut RewriteCx, cond: Value) -> Option<Value> {
+    let (ty, (kz, ko)) = (cx.func.ty(cond), cx.known(cond));
+    (cx.sconst(cond).is_none() && ty.is_small_int() && (ko != 0 || kz == ty.unsigned_max())).then(|| cx.emit(ty, Op::Const(i64::from(ko != 0))))
 }
 
 fn match_swar_msb_broadcast(cx: &RewriteCx, v: Value) -> Option<Value> {
@@ -173,6 +226,11 @@ fn narrow_const_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value
     let ty = cx.func.ty(x);
     for (norm, ext_v, c_v) in [(cc, x, y), (crate::cse::flip_int_cc(cc), y, x)] {
         let Some(c_imm) = cx.sconst(c_v) else { continue };
+        match demanded(cx, ext_v, ty.unsigned_max(), 0) {
+            Demand::Const(k) if res.is_some_and(|r| cx.func.ty(r) == Type::I8) => return Some(Op::Const(i64::from(holds(norm, ty, k as i64, c_imm)))),
+            Demand::Bits(v) if v != ext_v => return Some(Op::Icmp(norm, v, c_v)),
+            _ => {}
+        }
         let Some(inst) = cx.def(ext_v) else { continue };
         let Op::Convert(kind @ (Convert::Uextend | Convert::Sextend), a) = cx.func.insts[inst.index()].op else { continue };
         let sub_ty = cx.func.ty(a);
@@ -254,12 +312,11 @@ fn simplify_band(cx: &mut RewriteCx, res: Option<Value>, a: Value, b: Value) -> 
         let Some(mask) = cx.uconst(mask_v, ty) else { continue };
         if cx.redundant_mask(lhs, ty, mask) { cx.alias(res, lhs); return None; }
         if mask == 0x8080_8080_8080_8080 && let Some(x) = match_swar_msb_broadcast(cx, lhs) { return Some(Op::Binary(Binary::Band, x, mask_v)); }
-        if let Some(m) = simplify_masked(cx, lhs, mask, 0) {
-            return match m {
-                Masked::Const(c) => Some(Op::Const(extend(c as i64, ty, true))),
-                Masked::And(src, nm) if cx.redundant_mask(src, ty, nm) => { cx.alias(res, src); None }
-                Masked::And(src, nm) => Some(Op::Binary(Binary::Band, src, if nm == mask { mask_v } else { cx.emit(ty, Op::Const(extend(nm as i64, ty, true))) })),
-            };
+        match demanded(cx, lhs, mask, 0) {
+            Demand::Const(c) => return Some(Op::Const(extend(c as i64, ty, true))),
+            Demand::Bits(src) if src == lhs => {}
+            Demand::Bits(src) if cx.redundant_mask(src, ty, mask) => { cx.alias(res, src); return None; }
+            Demand::Bits(src) => return Some(Op::Binary(Binary::Band, src, mask_v)),
         }
     }
     icmp::fuse_cmp_ops(cx, res, true, a, b)
@@ -284,23 +341,11 @@ fn simplify_bxor(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
     None
 }
 
-fn strip_dead_bits(cx: &RewriteCx, mut cur: Value, mask: u64) -> Value {
-    for _ in 0..4 {
-        let Some(inst) = cx.def(cur) else { break };
-        cur = match cx.func.insts[inst.index()].op {
-            Op::Binary(Binary::Bor | Binary::Bxor, a, b) if (cx.known(b).0 & mask) == mask => a,
-            Op::Binary(Binary::Bor | Binary::Bxor, a, b) if (cx.known(a).0 & mask) == mask => b,
-            Op::Binary(Binary::Band, a, b) if (cx.known(b).1 & mask) == mask => a,
-            Op::Binary(Binary::Band, a, b) if (cx.known(a).1 & mask) == mask => b,
-            _ => break,
-        };
-    }
-    cur
-}
-
 fn simplify_ireduce(cx: &mut RewriteCx, res: Option<Value>, dst: Type, x: Value) -> Option<Op> {
-    let cur = strip_dead_bits(cx, x, dst.unsigned_max());
-    if let Some(imm) = cx.sconst(cur) { return Some(Op::Const(extend(imm, dst, true))); }
+    let cur = match demanded(cx, x, dst.unsigned_max(), 0) {
+        Demand::Const(c) => return Some(Op::Const(extend(c as i64, dst, true))),
+        Demand::Bits(v) => v,
+    };
     if let Some(inst) = cx.def(cur) {
         match cx.func.insts[inst.index()].op {
             Op::Convert(k @ (Convert::Uextend | Convert::Sextend), inner) => {
@@ -334,7 +379,7 @@ fn simplify_convert(cx: &mut RewriteCx, res: Option<Value>, kind: Convert, x: Va
 
 fn fold_nested_shift(cx: &mut RewriteCx, res: Option<Value>, (op, ty): (Binary, Type), (cur, sh): (Value, Value), k: u32) -> Option<Op> {
     let Op::Binary(inner_op, inner, sh1) = cx.func.insts[cx.def(cur)?.index()].op else { return None };
-    let k1 = (cx.sconst(sh1)? as u32) & (ty.bits() - 1);
+    let k1 = cx.count(sh1, ty)?;
     let inv_op = if op == Binary::Ushr { Binary::Ishl } else { Binary::Ushr };
     if inner_op == op {
         if k1 == 0 { return Some(Op::Binary(op, inner, sh)); }
@@ -361,12 +406,18 @@ fn simplify_shift(cx: &mut RewriteCx, res: Option<Value>, op: Binary, x: Value, 
         return Some(Op::Binary(Binary::Ushr, cx.emit(Type::I64, Op::Unary(Unary::Ctz, word)), sh));
     }
     let ty = cx.func.ty(x);
+    if matches!(ty, Type::I32 | Type::I64) && cx.sconst(sh).is_none()
+        && let count = strip_rot_mask(cx, cx.func.ty(sh), sh, u64::from(ty.bits() - 1)) && count != sh
+    {
+        return Some(Op::Binary(op, x, count));
+    }
     let raw_k = cx.sconst(sh).filter(|_| ty.is_small_int())?;
     let k = (raw_k as u32) & (ty.bits() - 1);
     if k == 0 { cx.alias(res, x); return None; }
-    let w = ty.unsigned_max();
-    let cur = strip_dead_bits(cx, x, if op == Binary::Ushr { w & !((1_u64 << k) - 1) } else { w >> k });
-    if let Some(imm) = cx.sconst(cur) { return crate::fold::binary(op, ty, imm, raw_k).map(|v| Op::Const(extend(v, ty, true))); }
+    let cur = match demanded(cx, x, shift_demand(op, ty.unsigned_max(), k, ty.unsigned_max()), 0) {
+        Demand::Const(c) => return crate::fold::binary(op, ty, c as i64, raw_k).map(|v| Op::Const(extend(v, ty, true))),
+        Demand::Bits(v) => v,
+    };
     fold_nested_shift(cx, res, (op, ty), (cur, sh), k).or_else(|| (cur != x).then_some(Op::Binary(op, cur, sh)))
 }
 
@@ -571,7 +622,7 @@ fn simplify_binary(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec
         }).or_else(|| reassociate_add(cx, fits_used, a, b)).or_else(|| simplify_rotate(cx, bin, a, b)),
         Binary::Isub => reassociate_sub(cx, fits_used, a, b),
         Binary::Band => simplify_band(cx, res, a, b),
-        Binary::Bor => simplify_rotate(cx, bin, a, b).or_else(|| icmp::fuse_cmp_ops(cx, res, false, a, b)),
+        Binary::Bor => simplify_rotate(cx, bin, a, b).or_else(|| icmp::fuse_cmp_ops(cx, res, false, a, b)).or_else(|| merge_fields(cx, res, a, b)),
         Binary::Bxor => simplify_bxor(cx, a, b).or_else(|| simplify_rotate(cx, bin, a, b)),
         Binary::Ushr | Binary::Ishl => simplify_shift(cx, res, bin, a, b),
         Binary::Udiv | Binary::Urem => simplify_div_rem(cx, block_udivs, res, (bin, a, b)),
@@ -595,7 +646,7 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
         Op::Extract(v, lane) => vec::simplify_extract(cx, res, v, lane),
         Op::Shuffle(a, b, ShuffleMask::Const(m)) => vec::simplify_shuffle(cx, res, a, b, m),
         Op::Select(cond, t, f) => select::simplify_select(cx, res, cond, t, f),
-        Op::Brif(cond, tb, ta, eb, ea) => match_swar_msb_broadcast(cx, cond).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
+        Op::Brif(cond, tb, ta, eb, ea) => known_cond(cx, cond).or_else(|| match_swar_msb_broadcast(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
         Op::Load(addr, off) if !cx.func.rodata_bytes.is_empty() && off >= 0 => res.and_then(|r| fold_rodata_load(cx, cx.func.ty(r), addr, off)),
         _ => None,
     }
