@@ -317,6 +317,11 @@ impl<'a> Infer<'_, 'a> {
 
     /// The parameter and return types of the function `item` at `substs`, its receiver first.
     pub fn fn_types(&mut self, item: ItemRef, substs: &[Ty]) -> Result<(Vec<Ty>, Ty)> {
+        if super::adt::is_ctor(self.cx, item) {
+            let (variant, args) = super::adt::ctor_parts(self.cx, substs)?;
+            let fields = self.adt_fields(item, args)?[variant as usize].clone();
+            return Ok((fields, self.cx.types.adt(item, args)));
+        }
         let sig = self.cx.signature(item)?;
         if !sig.opaque
             && let Some(types) = self.fn_form(item, &sig, substs)

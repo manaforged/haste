@@ -212,12 +212,6 @@ impl<'a> Infer<'_, 'a> {
         if let Res::Local(local) = res {
             self.note_read(expr, local);
         }
-        if let Res::Ctor(item, variant, args) = res
-            && matches!(self.cx.types.kind(ty), Kind::FnPtr(..))
-        {
-            let reify = super::adt::ctor_fn(self.cx, (item, variant, args));
-            self.out.coercions.insert(expr, super::coerce::Coercion::Reify(reify));
-        }
         self.out.res.insert(expr, res);
         Ok(ty)
     }

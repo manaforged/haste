@@ -220,17 +220,12 @@ impl<'a> Infer<'_, 'a> {
         })
     }
 
-    /// The type of a path that names the constructor `ctor`: the value of a unit variant, or a function from the fields of a tuple variant.
+    /// The type of a path that names the constructor `ctor`: the value of a unit variant, or the function item of a tuple variant.
     pub fn ctor_value(&mut self, (item, variant, args): Ctor) -> Result<(Ty, Res)> {
         let shape = self.cx.adt_def(item)?.variants[variant as usize].shape;
-        let adt = self.cx.types.intern(Kind::Adt(item, args));
         let ty = match shape {
-            Shape::Unit => adt,
-            Shape::Tuple => {
-                let slice = self.cx.types.substs(args).to_vec();
-                let fields = self.adt_fields(item, &slice)?[variant as usize].clone();
-                self.cx.types.fn_ptr(&fields, adt)
-            }
+            Shape::Unit => self.cx.types.intern(Kind::Adt(item, args)),
+            Shape::Tuple => ctor_fn(self.cx, (item, variant, args)),
             Shape::Named => bail!("`{}` needs its fields named", self.cx.name(item)),
         };
         Ok((ty, Res::Ctor(item, variant, args)))
@@ -311,20 +306,31 @@ impl<'a> Infer<'_, 'a> {
     }
 }
 
-/// The function that the tuple constructor of variant `variant` of `item` at `args` is when a path uses it as a value: `item` at `args` and then the variant.
-pub fn ctor_fn(cx: &mut super::super::Context<'_>, (item, variant, args): Ctor) -> Res {
+/// The function item type that the tuple constructor of variant `variant` of `item` at `args` has when a path uses it as a value: `item` at `args` and then the variant.
+pub fn ctor_fn(cx: &mut super::super::Context<'_>, (item, variant, args): Ctor) -> Ty {
     let marker = cx.types.intern(Kind::Value(u128::from(variant)));
     let mut full = cx.types.substs(args).to_vec();
     full.push(marker);
-    Res::fn_of(&cx.types, item, &full)
+    let substs = cx.types.intern_substs(&full);
+    cx.types.intern(Kind::FnDef(item, substs))
+}
+
+/// Whether `item` is a struct or an enum, whose functions are its tuple constructors.
+pub fn is_ctor(cx: &super::super::Context<'_>, item: ItemRef) -> bool {
+    matches!(cx.item(item).1.kind, ItemKind::Struct | ItemKind::Enum)
+}
+
+/// The variant and the type arguments of the constructor function at `substs`.
+pub fn ctor_parts<'a>(cx: &super::super::Context<'_>, substs: &'a [Ty]) -> Result<(u32, &'a [Ty])> {
+    let Some((&marker, args)) = substs.split_last() else { bail!("a constructor function with no variant") };
+    let Kind::Value(variant) = *cx.types.kind(marker) else { bail!("a constructor function with no variant") };
+    Ok((u32::try_from(variant)?, args))
 }
 
 /// The typed form of the constructor function that `ctor_fn` names, which builds the variant from its parameters.
 pub fn ctor_typed(cx: &mut super::super::Context<'_>, item: ItemRef, substs: Substs) -> Result<super::Typed> {
     let slice = cx.types.substs(substs).to_vec();
-    let Some((&marker, args)) = slice.split_last() else { bail!("a constructor function with no variant") };
-    let Kind::Value(variant) = *cx.types.kind(marker) else { bail!("a constructor function with no variant") };
-    let variant = u32::try_from(variant)?;
+    let (variant, args) = ctor_parts(cx, &slice)?;
     let all = super::field_types(cx, item, args)?;
     let fields = &all[variant as usize];
     let locals = fields.iter().map(|&ty| super::Local { ty }).collect();

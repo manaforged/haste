@@ -222,7 +222,7 @@ pub struct Awaited {
 }
 
 pub(super) fn compiler_made(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> Result<Option<Typed>> {
-    if matches!(cx.item(item).1.kind, crate::outline::item::ItemKind::Struct | crate::outline::item::ItemKind::Enum) {
+    if adt::is_ctor(cx, item) {
         return adt::ctor_typed(cx, item, substs).map(Some);
     }
     let slice = cx.types.substs(substs);

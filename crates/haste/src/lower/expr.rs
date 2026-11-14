@@ -371,7 +371,7 @@ impl Lower<'_, '_> {
                 let (Kind::Value(bits), Repr::Scalar(machine)) = (self.cx.types.kind(value).clone(), self.repr_of(expr)?) else { bail!("a const parameter whose value is not known") };
                 Ok(Some(self.int_const(machine, bits)))
             }
-            Some(Res::Ctor(..)) if self.typed.coercions.contains_key(&expr) => Ok(None),
+            Some(Res::Ctor(..)) if matches!(self.cx.types.kind(self.ty_of(expr)), Kind::FnDef(..)) => Ok(None),
             Some(&Res::Ctor(_, variant, _)) => match self.const_rodata_expr(expr)? {
                 Some(addr) => Ok(Some(addr)),
                 None => self.construct(self.ty_of(expr), variant, Vec::new(), None),

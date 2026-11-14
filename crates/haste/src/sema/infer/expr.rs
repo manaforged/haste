@@ -413,7 +413,7 @@ impl Infer<'_, '_> {
     }
 
     fn call(&mut self, expr: ExprId, (callee, args): (ExprId, List), expected: Option<Ty>) -> Result<Ty> {
-        let found = self.callee(callee)?;
+        let found = self.expr(callee, None)?;
         let callee_ty = self.callee_base(expr, found);
         let (params, ret, def) = match self.cx.types.kind(callee_ty).clone() {
             Kind::Closure(..) => return self.closure_call(expr, callee_ty, args),
@@ -421,12 +421,12 @@ impl Infer<'_, '_> {
                 return self.object_call((expr, found), callee_ty, args);
             }
             Kind::FnDef(item, substs) => {
-                if !self.body.names_callee(callee) || !matches!(self.out.res.get(&callee), Some(Res::Fn(..))) {
+                if !self.body.names_callee(callee) || !matches!(self.out.res.get(&callee), Some(Res::Fn(..) | Res::Ctor(..))) {
                     self.out.res.insert(expr, Res::Fn(item, substs));
                 }
                 let slice = self.cx.types.substs(substs).to_vec();
                 let (params, ret) = self.fn_types(item, &slice)?;
-                (params, ret, Some((item, slice)))
+                (params, ret, (!super::adt::is_ctor(self.cx, item)).then_some((item, slice)))
             }
             Kind::FnPtr(params, ret) => (self.cx.types.substs(params).to_vec(), ret, None),
             Kind::Adt(..) => return self.overloaded_call(expr, found, args),
@@ -502,14 +502,6 @@ impl Infer<'_, '_> {
         }
         self.release_obligation(&mut held)?;
         Ok(ret)
-    }
-
-    fn callee(&mut self, callee: ExprId) -> Result<Ty> {
-        let found = self.expr(callee, None)?;
-        if matches!(self.out.res.get(&callee), Some(Res::Ctor(..))) {
-            self.out.coercions.remove(&callee);
-        }
-        Ok(found)
     }
 
     /// How many arguments past its `params` a call of `callee` with `given` arguments passes, which only a C-variadic foreign function takes.
