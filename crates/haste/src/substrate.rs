@@ -89,7 +89,7 @@ impl<'a> StencilSlice<'a> {
 
     /// Decodes this slice into a `Code` stencil buffer.
     pub fn to_code(&self) -> Result<Code> {
-        Ok(Code::from_parts(self.code.to_vec(), self.decode_sites()?, self.decode_relocs()?))
+        Ok(Code::from_parts(self.code.to_vec(), self.decode_sites()?, self.decode_relocs()?, Vec::new()))
     }
 }
 

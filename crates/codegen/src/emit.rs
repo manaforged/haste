@@ -1,8 +1,11 @@
 use crate::alloc::{Location, Plan};
 use crate::frame::{Abi, Emitter, Frame, Loc, ShrinkWrap};
-use crate::ir::{Block, Op, SigRef, Value};
+use crate::ir::{Block, Function, Op, SigRef, Value};
 use crate::park::ParkReg;
 use crate::Site;
+use std::ops::Range;
+
+const LOOP_SPAN: u32 = 256;
 
 pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn plan(&self) -> &Plan<R>;
@@ -14,7 +17,6 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn in_shrink_entry(&self) -> bool;
     fn next_block(&self) -> Option<Block>;
     fn block_label(&self, block: Block) -> L;
-    fn pos(&self) -> u32;
     fn new_label(&mut self) -> L;
     fn bind_label(&mut self, label: L);
     fn jump_label(&mut self, label: L);
@@ -29,6 +31,26 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn park_reload(&mut self, value: Value, reg: ParkReg<R>);
     fn put_exception(&mut self, value: Value);
     fn push_site(&mut self, site: Site);
+}
+
+pub(crate) fn loop_spans(func: &Function, order: &[Block], starts: &[u32]) -> Vec<Range<u32>> {
+    let cfg = func.cfg();
+    let loops = cfg.loops();
+    let mut placed = vec![None; func.blocks.len()];
+    for (block, span) in order.iter().zip(starts.windows(2)) {
+        placed[block.index()] = Some(span[0]..span[1]);
+    }
+    loops
+        .list
+        .iter()
+        .filter(|each| each.body.iter().zip(&loops.depths).all(|(inside, depth)| !inside || *depth <= each.depth))
+        .filter_map(|each| {
+            let spans = || each.body.iter().zip(&placed).filter(|(inside, _)| **inside).filter_map(|(_, span)| span.clone());
+            let start = spans().map(|span| span.start).min()?;
+            let end = spans().map(|span| span.end).max()?;
+            (end - start <= LOOP_SPAN).then_some(start..end)
+        })
+        .collect()
 }
 
 pub(crate) fn intake_params<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &mut E, entry: Block) -> Result<(), String> {

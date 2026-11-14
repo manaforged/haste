@@ -23,21 +23,24 @@ fn fn_align() -> u32 {
     *ALIGN.get_or_init(|| std::env::var(FN_ALIGN_ENV).ok().and_then(|v| v.parse().ok()).filter(|a: &u32| a.is_power_of_two() && *a >= 16).unwrap_or(FN_ALIGN))
 }
 
-fn place(exe: &mut Executable, bytes: &[u8]) -> u32 {
-    let end = exe.text(&[]);
-    exe.text(&vec![0u8; (end.next_multiple_of(fn_align()) - end) as usize]);
-    exe.text(bytes)
+fn place(exe: &mut Executable, code: &AotCode) -> u32 {
+    exe.function(code.bytes(), fn_align(), code.loops())
 }
 
 #[derive(Clone)]
 pub(super) struct AotCode {
     bytes: Vec<u8>,
     relocs: Vec<StencilReloc>,
+    loops: Vec<std::ops::Range<u32>>,
 }
 
 impl AotCode {
     pub(super) fn from_code(code: &Code) -> Arc<Self> {
-        Arc::new(Self { bytes: code.bytes().to_vec(), relocs: code.relocs().to_vec() })
+        Arc::new(Self { bytes: code.bytes().to_vec(), relocs: code.relocs().to_vec(), loops: code.loops().to_vec() })
+    }
+
+    pub(super) fn loops(&self) -> &[std::ops::Range<u32>] {
+        &self.loops
     }
 
     pub(super) fn bytes(&self) -> &[u8] {
@@ -525,7 +528,7 @@ fn emit_dict_bodies(state: &AotState, order: &[usize], exe: &mut Executable) -> 
         if dict_bodies.contains_key(&key) {
             continue;
         }
-        let off = place(exe, body.bytes());
+        let off = place(exe, body);
         for reloc in body.relocs() {
             let rt = reloc.as_runtime().context("dict body contains non-runtime relocation")?;
             exe.patch(off + reloc.offset, reloc.kind, Symbol::Runtime(rt));
@@ -630,7 +633,7 @@ fn emit_functions(state: &AotState, live: &AotReach, target: &Target, syms: &Sym
         if fn_offs[leader].is_none() {
             match &state.functions[leader] {
                 Some(AotFn::Direct { code, relocs }) => {
-                    let off = place(exe, code.bytes());
+                    let off = place(exe, code);
                     fn_offs[leader] = Some(off);
                     pending.push((off, code, relocs));
                 }

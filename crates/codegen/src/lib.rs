@@ -71,6 +71,8 @@ pub use reloc::{DictTierUp, RelocKind, RuntimeSymbol, StencilReloc, patch_reloc}
 pub use target::{Arch, CallAbi, Effort, Format, Os, TARGETS, Target};
 pub use trace::{missed_report, with_label as with_trace_label};
 
+use std::ops::Range;
+
 /// A call site that has an exception handler, as offsets into its function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Site {
@@ -79,19 +81,20 @@ pub struct Site {
     pub frame_offset: u32,
 }
 
-/// Machine code for one function, its exception call sites, and its stencil relocations.
+/// Machine code for one function, its exception call sites, its stencil relocations, and its small loops.
 #[must_use]
 #[derive(Clone, Debug)]
 pub struct Code {
     bytes: Vec<u8>,
     sites: Vec<Site>,
     relocs: Vec<StencilReloc>,
+    loops: Vec<Range<u32>>,
 }
 
 impl Code {
-    /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, and relocations.
-    pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>) -> Self {
-        Self { bytes, sites, relocs }
+    /// Builds a `Code` buffer from pre-encoded machine code, unwind sites, relocations, and small loop ranges.
+    pub fn from_parts(bytes: Vec<u8>, sites: Vec<Site>, relocs: Vec<StencilReloc>, loops: Vec<Range<u32>>) -> Self {
+        Self { bytes, sites, relocs, loops }
     }
 
     /// The machine code.
@@ -107,6 +110,11 @@ impl Code {
     /// The relocations inside `bytes`.
     pub fn relocs(&self) -> &[StencilReloc] {
         &self.relocs
+    }
+
+    /// The byte ranges of the small innermost loops, which run slower when they cross a page boundary.
+    pub fn loops(&self) -> &[Range<u32>] {
+        &self.loops
     }
 
     /// Copies `bytes` into `out` and patches every relocation against `symbols`.

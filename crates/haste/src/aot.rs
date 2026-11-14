@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +19,8 @@ use wide::WideShim;
 pub(super) const ELF_BASE: u64 = 0x0040_0000;
 pub(super) const MACH_BASE: u64 = 0x1_0000_0000;
 pub(super) const MACH_PAGE: u64 = 0x4000;
+const LOOP_PAGE: u32 = 0x1000;
+const LOOP_SHIFT: u32 = 256;
 
 /// A relocation target inside a standalone AOT executable.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -107,6 +110,15 @@ impl Executable {
     /// Appends 16-byte-aligned machine code to `.text` and returns its section offset.
     pub(crate) fn text(&mut self, bytes: &[u8]) -> u32 {
         append_aligned(&mut self.text, bytes, 16)
+    }
+
+    /// Appends a function to `.text` at `align` bytes, shifted until the fewest of its `loops` cross a 4 KiB address, and returns its section offset.
+    pub(crate) fn function(&mut self, bytes: &[u8], align: u32, loops: &[Range<u32>]) -> u32 {
+        let base = (self.text.len() as u32).next_multiple_of(align);
+        let split = |at: u32| loops.iter().filter(|each| each.end > each.start && (at + each.start) / LOOP_PAGE != (at + each.end - 1) / LOOP_PAGE).count();
+        let at = (0..=LOOP_SHIFT / align).map(|step| base + step * align).min_by_key(|&at| split(at)).unwrap_or(base);
+        self.text.resize(at as usize, 0);
+        append_aligned(&mut self.text, bytes, align)
     }
 
     /// Appends `align`-byte-aligned constant bytes to `.rodata` and returns its section offset.
@@ -494,8 +506,9 @@ fn emit_veneer_list(list: &[(Symbol, u64)], total_len: usize, resolve: &dyn Fn(&
 }
 
 pub(super) fn plan_veneers(exe: &Executable, plan: &Plan<'_>, base_va: u64, head_off: usize, shim_offs: &[usize], calc_stubs_off: impl Fn(usize, usize) -> usize) -> Result<Veneers> {
+    let lead = |veneers: usize| (head_off + veneers * 12).next_multiple_of(LOOP_PAGE as usize) - head_off;
     if exe.target.arch != Arch::Arm64 || (head_off + exe.text.len() + plan.imports.len() * 12) < 0x700_0000 {
-        return Ok(Veneers::default());
+        return Ok(Veneers { pre_len: lead(0), ..Veneers::default() });
     }
     let post_rel = exe.text.len().next_multiple_of(16);
     let mut pre_syms = Vec::new();
@@ -503,7 +516,7 @@ pub(super) fn plan_veneers(exe: &Executable, plan: &Plan<'_>, base_va: u64, head
     let mut pre_seen = FxHashSet::default();
     let mut post_seen = FxHashSet::default();
     loop {
-        let pre_len = (pre_syms.len() * 12).next_multiple_of(16);
+        let pre_len = lead(pre_syms.len());
         let post_len = (post_syms.len() * 12).next_multiple_of(16);
         let text_off = head_off + pre_len;
         let stubs_off = calc_stubs_off(pre_len, post_len);

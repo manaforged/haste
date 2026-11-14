@@ -532,6 +532,7 @@ pub(crate) trait Emitter<'a>: Sized {
     fn is_elided(&self, value: Value) -> bool;
     fn inst(&mut self, inst: Inst) -> Result<(), String>;
     fn trap(&mut self);
+    fn pos(&self) -> u32;
     fn finish(self) -> Result<crate::Code, String>;
 
     fn deferred_prologue(&self) -> bool {
@@ -569,7 +570,9 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
 }
 
 pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<crate::Code, String> {
-    let entry = emit.func().entry.ok_or("the function has no entry block")?;
+    let func = emit.func();
+    let entry = func.entry.ok_or("the function has no entry block")?;
+    let mut starts = Vec::with_capacity(order.len() + 1);
     if !emit.deferred_prologue() {
         emit.prologue();
     }
@@ -578,9 +581,13 @@ pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<
         let next_blk = order.get(index + 1).copied().filter(|&nb| !emit.blocks_fallthrough_to(nb));
         emit.set_next(next_blk);
         emit.before_block_bind(block)?;
+        starts.push(emit.pos());
         emit.bind_block(block);
         emit.on_block_bound(block)?;
         emit_body(&mut emit, block)?;
     }
-    emit.finish()
+    starts.push(emit.pos());
+    let mut code = emit.finish()?;
+    code.loops = crate::emit::loop_spans(func, order, &starts);
+    Ok(code)
 }

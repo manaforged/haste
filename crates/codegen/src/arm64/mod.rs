@@ -347,12 +347,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.asm.b(target);
     }
 
+    fn pos(&self) -> u32 { self.asm.pos() }
+
     fn finish(mut self) -> Result<Code, String> {
         if let Some(label) = self.trap_label.take() {
             self.asm.bind(label);
             self.asm.brk();
         }
-        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs })
+        Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new() })
     }
 }
 
@@ -659,7 +661,6 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn in_shrink_entry(&self) -> bool { self.in_shrink_entry }
     fn next_block(&self) -> Option<Block> { self.next }
     fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
-    fn pos(&self) -> u32 { self.asm.pos() }
     fn new_label(&mut self) -> Label { self.asm.label() }
     fn bind_label(&mut self, label: Label) {
         self.invalidate_spills();
