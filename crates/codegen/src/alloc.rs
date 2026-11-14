@@ -1,6 +1,6 @@
 mod hints;
 
-use crate::cfg::Cfg;
+use crate::cfg::{Cfg, Loops};
 use crate::fold::{constant, holds};
 use crate::frame::{Abi, Loc};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, Op, Signature, StackSlot, Type, Value};
@@ -388,9 +388,39 @@ fn float_class<R>(regs: &Regs<R>, params: &[Loc<R>], passed: Vec<Option<(u8, boo
 
 const LOOP_WEIGHT: u64 = 16;
 const MAX_DEPTH: u32 = 4;
+const SLOW_SHARE: u64 = 16;
 
-fn block_weights(depths: &[u32]) -> Vec<u64> {
-    depths.iter().map(|&depth| LOOP_WEIGHT.pow(depth.min(MAX_DEPTH))).collect()
+fn slow_blocks(func: &Function, cfg: &Cfg, loops: &Loops) -> Vec<bool> {
+    let count = func.blocks.len();
+    let calls: Vec<bool> = func.blocks.iter().map(|data| data.insts.iter().any(|inst| matches!(func.insts[inst.index()].op, Op::Call { .. } | Op::TryCall { .. } | Op::Copy(..)))).collect();
+    let mut slow = vec![false; count];
+    for each in &loops.list {
+        let mut spine = vec![0_usize; count];
+        for &latch in &each.latches {
+            let mut block = latch;
+            loop {
+                spine[block.index()] += 1;
+                match cfg.idom[block.index()] {
+                    Some(parent) if block != each.head && parent != block => block = parent,
+                    _ => break,
+                }
+            }
+        }
+        let mut guarded = vec![false; count];
+        for &block in &cfg.rpo {
+            let at = block.index();
+            let under = cfg.idom[at].is_some_and(|parent| guarded[parent.index()]);
+            if each.body[at] && (under || (calls[at] && spine[at] != each.latches.len())) {
+                guarded[at] = true;
+                slow[at] = true;
+            }
+        }
+    }
+    slow
+}
+
+fn block_weights(depths: &[u32], slow: &[bool]) -> Vec<u64> {
+    depths.iter().zip(slow).map(|(&depth, &slow)| (LOOP_WEIGHT.pow(depth.min(MAX_DEPTH)) / if slow { SLOW_SHARE } else { 1 }).max(1)).collect()
 }
 
 fn weights(func: &Function, blocks: &[u64], sib: &[Option<Sib>], elided: &[bool]) -> Vec<u64> {
@@ -622,7 +652,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let ints: Vec<bool> = (0..count).map(|value| candidates[value] && func.types[value].is_small_int() && !fused[value] && through[value].is_none()).collect();
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
     let reuse = hints::reusable(func, regs, &locations, &live, &elided);
-    let blocks = loop_depths.map(block_weights);
+    let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| block_weights(&loops.depths, &slow_blocks(func, cfg, loops)));
     let weights = blocks.as_deref().map(|blocks| weights(func, blocks, &sib, &elided));
     let (partners, back_args) = edge_hints(func, cfg.as_deref(), order, blocks.as_deref());
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
