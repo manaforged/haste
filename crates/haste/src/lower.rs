@@ -4,6 +4,7 @@ mod abi;
 mod adt;
 mod array;
 mod atomic;
+mod budget;
 mod closure;
 mod coroutine;
 mod drop;
@@ -213,7 +214,7 @@ struct Loop {
     block: bool,
 }
 
-/// The inline state of one top-level lowering: the reached indexes being lowered, and the callees whose inline decision rests on an open cycle, each with the stack depth that cycle reaches.
+/// The inline state of one top-level lowering: the reached indexes being lowered, the callees whose inline decision rests on an open cycle, each with the stack depth that cycle reaches, and what the body being lowered copies.
 #[derive(Default)]
 pub(super) struct Inline {
     pub stack: Vec<usize>,
@@ -221,6 +222,7 @@ pub(super) struct Inline {
     pub local_meta: rustc_hash::FxHashMap<usize, (Option<stencil::InlineMeta>, usize)>,
     pub max_callee_height: u8,
     pub max_callee_size: u16,
+    pub host: budget::Copies,
 }
 
 impl Inline {

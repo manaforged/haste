@@ -87,6 +87,17 @@ pub struct InlinedCallee {
     pub returns: bool,
     pub height: u8,
     pub size: u16,
+    pub form: Form,
+}
+
+/// What an inline body holds: no loop, a loop, bulky callees left out of line, or copies of bulky callees.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Form {
+    #[default]
+    Lean,
+    Loop,
+    Compact,
+    Dense,
 }
 
 impl InlinedCallee {
@@ -107,6 +118,7 @@ struct TemplateKey {
     footprint: FootprintId,
     limit: usize,
     low: bool,
+    compact: bool,
 }
 
 struct InlineTemplate {
@@ -115,7 +127,15 @@ struct InlineTemplate {
     reloc_plan: Arc<RelocPlan>,
     height: u8,
     size: u16,
+    form: Form,
 }
+
+enum Miss {
+    Shape,
+    Over,
+}
+
+type Lowered = (std::result::Result<(Arc<Function>, bool), Miss>, RelocVec, Arc<RelocPlan>, usize);
 
 impl InlineTemplate {
     fn shape(&self) -> (bool, u8, u16) {
@@ -140,9 +160,11 @@ enum Tally {
     Devirt,
     Trim,
     Flush,
+    Retry,
+    Compact,
 }
 
-const TALLY_NAMES: [&str; 9] = ["template_hit", "template_miss", "template_simplify", "template_raced", "unstored_cycle", "unstored_deferred", "devirt_simplify", "trim_partial", "trim_full"];
+const TALLY_NAMES: [&str; 11] = ["template_hit", "template_miss", "template_simplify", "template_raced", "unstored_cycle", "unstored_deferred", "devirt_simplify", "trim_partial", "trim_full", "compact_retry", "compact_fit"];
 static TALLIES: [AtomicUsize; TALLY_NAMES.len()] = [const { AtomicUsize::new(0) }; TALLY_NAMES.len()];
 
 fn tally(kind: Tally) {
@@ -268,10 +290,13 @@ fn record_callee_height(inline: &mut Inline, callee: Option<Arc<InlinedCallee>>)
     callee
 }
 
-fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, shape_only): (usize, bool)) -> Result<(Option<InlineHit>, usize, usize, Quiet)> {
+fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, shape_only, compact): (usize, bool, bool)) -> Result<(Option<InlineHit>, usize, usize, Quiet)> {
     let (depth, quiet) = (inline.stack.len(), Quiet::mark(cx, slots));
     inline.stack.push(index);
+    let saved = std::mem::take(&mut inline.host);
+    inline.host.compact = compact;
     let outcome = ensure_inline_template(cx, (reached, slots), inline, index, (limit, shape_only, &quiet));
+    inline.host = saved;
     inline.pop(depth);
     let (tmpl, cycle) = outcome?;
     Ok((tmpl, cycle, depth, quiet))
@@ -283,11 +308,11 @@ fn limit_flags(cx: &mut Context<'_>, reached: &Reached, (bodies, inline): (&Bodi
         if host.is_some_and(|host| bodies.is_cyclic(cx, reached, host)) {
             return None;
         }
-        super::expr::cycle_limit(cx, reached, index)?
+        super::budget::cycle_limit(cx, reached, index)?
     } else {
         usize::MAX
     };
-    let std_limit = super::expr::inline_limit(cx, reached, index).map(|standard| standard.min(cap));
+    let std_limit = super::budget::inline_limit(cx, reached, index).map(|standard| standard.min(cap));
     let limit = limit.min(cap);
     Some((limit, std_limit == Some(limit), std_limit.is_some_and(|sl| limit <= sl)))
 }
@@ -323,6 +348,7 @@ fn build_inlined(item: ItemRef, footprint: FootprintId, t: &InlineTemplate, relo
         returns: t.returns,
         height: t.height,
         size: t.size,
+        form: t.form,
     })
 }
 
@@ -335,7 +361,7 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
         return Ok((record_meta_height(inline, meta), cycle));
     }
     let item = reached.list[index].0.0;
-    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, true))?;
+    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, true, false))?;
     let (meta, inlined) = match tmpl {
         Some((footprint, Found::Body(t, relocs))) => (
             Some((item, footprint, t.returns, t.height, t.size)),
@@ -364,16 +390,16 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
     Ok((record_meta_height(inline, meta), cycle))
 }
 
-pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, limit: usize) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
+pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, compact): (usize, bool)) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
     let bodies = slots.bodies();
     let Some((limit, standard, neg_valid)) = limit_flags(cx, reached, (bodies, &*inline), index, limit) else {
         return Ok((None, usize::MAX));
     };
-    if let Some((callee, _, cycle)) = cached_inline(bodies, inline, index, (neg_valid, false)) {
+    if !compact && let Some((callee, _, cycle)) = cached_inline(bodies, inline, index, (neg_valid, false)) {
         return Ok((record_callee_height(inline, callee), cycle));
     }
     let item = reached.list[index].0.0;
-    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, false))?;
+    let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, false, compact))?;
     let result = match tmpl {
         Some((footprint, Found::Body(t, Some(relocs)))) => Some(build_inlined(item, footprint, &t, relocs)),
         Some((footprint, Found::Body(t, None))) => {
@@ -383,7 +409,7 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         Some((_, Found::Shape(..))) => unreachable!("a body probe never answers from recorded metadata"),
         None => None,
     };
-    if standard {
+    if standard && !compact {
         if cycle > depth && quiet.holds(cx, slots) {
             bodies.bump_transient();
             let stored = bodies.inlined.get_or_insert_with(index, || result);
@@ -439,22 +465,30 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     let fp_h = std::mem::replace(&mut inline.max_callee_height, 0);
     let fp_sz = std::mem::replace(&mut inline.max_callee_size, 0);
     let Some((footprint, fp_cycle)) = quiet.lowered(slots, fp_res)? else { return Ok((None, usize::MAX)) };
-    let key = TemplateKey { item, footprint, limit, low: slots.low_entries() };
+    let key = TemplateKey { item, footprint, limit, low: slots.low_entries(), compact: inline.host.compact };
     if let Some(template) = slots.bodies().templates.get(&key) {
         tally(Tally::Hit);
         return Ok((template.map(|t| (footprint, Found::Body(t, None))), fp_cycle));
     }
     tally(Tally::Miss);
     let depth = inline.stack.len().saturating_sub(1);
-    let disk = slots.bodies().disk(cx, &key);
+    let disk = if key.compact { None } else { slots.bodies().disk(cx, &key) };
     let servable = shape_only && fp_cycle > depth;
     if servable && let Some(shape) = disk.as_ref().and_then(persist::Disk::hit) {
         return Ok((shape.map(|(returns, height, size)| (footprint, Found::Shape(returns, height, size))), fp_cycle));
     }
-    let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
+    let mut lowered = lower_template(cx, (reached, slots), inline, index, (limit, quiet))?;
+    let over = !key.compact && inline.host.retry && matches!(lowered, Some((Err(Miss::Over), ..)));
+    let roomy = if over { super::budget::compact_limit(cx, reached, index, limit) } else { None };
+    if let (Some(roomy), Some(first)) = (roomy, lowered.as_ref().map(|found| found.3)) {
+        tally(Tally::Retry);
+        inline.host.compact = true;
+        lowered = lower_template(cx, (reached, slots), inline, index, (roomy, quiet))?.map(|(fit, relocs, plan, cycle)| (fit, relocs, plan, cycle.min(first)));
+    }
+    let form = if inline.host.compact { Form::Compact } else { inline.host.seen.max(super::budget::own_form(cx, reached, index)) };
     let ir_h = inline.max_callee_height;
     let ir_sz = inline.max_callee_size;
-    let Some((func, relocs, reloc_plan, ir_cycle)) = quiet.lowered(slots, lowered)? else {
+    let Some((fit, relocs, reloc_plan, ir_cycle)) = lowered else {
         if let Some(disk) = disk {
             disk.settle(None, false, servable && quiet.holds(cx, slots));
         }
@@ -463,14 +497,16 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     let cycle = fp_cycle.min(ir_cycle);
     let base_h = fp_h.max(ir_h);
     let base_size = fp_sz.max(ir_sz) as usize;
-    let leaf = !plan_has_calls(&reloc_plan);
-    let mut template = simplify_inline(func, limit, leaf).and_then(|(body, returns)| {
+    let mut template = fit.ok().and_then(|(body, returns)| {
         let body_size = body.size();
         let grew = (base_size == 0 && body_size > 32) || (base_size > 0 && body_size.saturating_sub(base_size) > 16);
         let height = if grew { base_h.saturating_add(1) } else { base_h };
         let size = body_size.min(u16::MAX as usize) as u16;
-        (height <= MAX_INLINE_HEIGHT).then(|| Arc::new(InlineTemplate { body, returns, reloc_plan, height, size }))
+        (height <= MAX_INLINE_HEIGHT).then(|| Arc::new(InlineTemplate { body, returns, reloc_plan, height, size, form }))
     });
+    if roomy.is_some() && template.is_some() {
+        tally(Tally::Compact);
+    }
     let calm = quiet.holds(cx, slots);
     let stored = calm && cycle > depth;
     if cycle <= depth {
@@ -501,20 +537,28 @@ fn plan_has_calls(plan: &RelocPlan) -> bool {
     })
 }
 
-fn simplify_inline(mut func: Function, limit: usize, leaf: bool) -> Option<(Arc<Function>, bool)> {
-    if func.is_coroutine() {
-        return None;
-    }
-    let release = crate::profile() == crate::outline::tree::Profile::Release;
-    let effective_limit = if release && leaf { limit.saturating_add(limit / 2).min(900).max(limit) } else { limit };
-    if func.size() > effective_limit.saturating_mul(6).max(1600) {
-        return None;
+fn lower_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<Option<Lowered>> {
+    let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
+    Ok(quiet.lowered(slots, lowered)?.map(|(func, relocs, plan, cycle)| {
+        let leaf = !plan_has_calls(&plan);
+        (simplify_inline(func, limit, leaf), relocs, plan, cycle)
+    }))
+}
+
+fn simplify_inline(mut func: Function, limit: usize, leaf: bool) -> std::result::Result<(Arc<Function>, bool), Miss> {
+    let effective_limit = if leaf { super::budget::leaf_limit(limit) } else { limit };
+    if func.is_coroutine() || func.size() > effective_limit.saturating_mul(6).max(1600) {
+        return Err(Miss::Shape);
     }
     simplify_tallied(&mut func, Tally::Built);
-    (func.can_inline() && func.inline_size() <= effective_limit).then(|| {
-        let returns = func.has_return();
-        (Arc::new(func), returns)
-    })
+    if !func.can_inline() {
+        return Err(Miss::Shape);
+    }
+    if func.inline_size() > effective_limit {
+        return Err(Miss::Over);
+    }
+    let returns = func.has_return();
+    Ok((Arc::new(func), returns))
 }
 
 fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode) -> Result<(Function, RelocVec, Arc<RelocPlan>, usize)> {
@@ -642,8 +686,8 @@ fn splice_devirt_vtable_calls(
         for (block, pos, callee_sym) in func.devirt_call_sites() {
             let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(callee_sym as usize) else { continue };
             let Some((expr, slot)) = current_plan.vtable_slot_at(callee_sym as usize) else { continue };
-            let Some(limit) = super::expr::inline_limit(cx, reached, callee_idx) else { continue };
-            let (hit, cycle) = resolve_inline(cx, (reached, slots), inline, callee_idx, limit)?;
+            let Some(limit) = super::budget::inline_limit(cx, reached, callee_idx) else { continue };
+            let (hit, cycle) = resolve_inline(cx, (reached, slots), inline, callee_idx, (limit, false))?;
             cycle_root = cycle_root.min(cycle);
             let Some(inlined) = hit else { continue };
             if !inlined.body.can_inline() {
