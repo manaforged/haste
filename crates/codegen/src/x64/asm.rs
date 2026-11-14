@@ -22,6 +22,34 @@ pub(crate) enum Reg {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Xmm(pub u8);
 
+/// The vector length of a VEX instruction: the xmm or the ymm view of its registers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Vl {
+    X = 0,
+    Y = 0b100,
+}
+
+/// One VEX opcode: its opcode map, prefix class, W bit and opcode byte.
+#[derive(Clone, Copy)]
+pub(crate) struct VexOp {
+    pub map: u8,
+    pub pp: u8,
+    pub w: bool,
+    pub op: u8,
+}
+
+impl VexOp {
+    /// The opcode `op` of map `map` and prefix class `pp`, with W clear.
+    pub const fn new(map: u8, pp: u8, op: u8) -> Self {
+        Self { map, pp, w: false, op }
+    }
+
+    /// The opcode `op` of map `map` and prefix class `pp`, with W set.
+    pub const fn wide(map: u8, pp: u8, op: u8) -> Self {
+        Self { map, pp, w: true, op }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Mem {
     pub base: Reg,
@@ -556,8 +584,8 @@ impl Asm {
         self.sse_imm(&[0x66], &[0x0F, Self::pshift_opc(lane_bytes)], ext, dst, imm);
     }
 
-    pub fn vex_pshift_imm(&mut self, ext: u8, lane_bytes: u32, dst: Xmm, src: Xmm, imm: u8) {
-        self.vex_xmm_imm(0b00001, 0b01, Self::pshift_opc(lane_bytes), (Xmm(ext), dst), src, imm);
+    pub fn vex_pshift_imm(&mut self, vl: Vl, ext: u8, lane_bytes: u32, dst: Xmm, src: Xmm, imm: u8) {
+        self.vex_imm(vl, VexOp::new(0b00001, 0b01, Self::pshift_opc(lane_bytes)), (Xmm(ext), dst), src, imm);
     }
 
     pub fn movd_in(&mut self, xmm: Xmm, reg: Reg) {
@@ -586,15 +614,25 @@ impl Asm {
         self.vex3(0b00001, false, pp, opcode, (dst.0, src.0), rm.into());
     }
 
+    /// The three-operand VEX form `dst = src op rm` of `op` at vector length `vl`.
+    pub fn vex(&mut self, vl: Vl, op: VexOp, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>) {
+        self.vex3(op.map, op.w, op.pp | vl as u8, op.op, (dst.0, src.0), rm.into());
+    }
+
+    /// The three-operand VEX immediate form `dst = src op rm, imm` of `op` at vector length `vl`.
+    pub fn vex_imm(&mut self, vl: Vl, op: VexOp, regs: (Xmm, Xmm), rm: impl Into<Rm>, imm: u8) {
+        self.vex(vl, op, regs, rm);
+        self.code.push(imm);
+    }
+
     /// The three-operand VEX.128 form `dst = src op rm` with opcode map `map` and prefix class `pp`.
-    pub fn vex_xmm(&mut self, map: u8, pp: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>) {
-        self.vex3(map, false, pp, opcode, (dst.0, src.0), rm.into());
+    pub fn vex_xmm(&mut self, map: u8, pp: u8, opcode: u8, regs: (Xmm, Xmm), rm: impl Into<Rm>) {
+        self.vex(Vl::X, VexOp::new(map, pp, opcode), regs, rm);
     }
 
     /// The three-operand VEX.128 immediate form `dst = src op rm, imm`.
-    pub fn vex_xmm_imm(&mut self, map: u8, pp: u8, opcode: u8, (dst, src): (Xmm, Xmm), rm: impl Into<Rm>, imm: u8) {
-        self.vex3(map, false, pp, opcode, (dst.0, src.0), rm.into());
-        self.code.push(imm);
+    pub fn vex_xmm_imm(&mut self, map: u8, pp: u8, opcode: u8, regs: (Xmm, Xmm), rm: impl Into<Rm>, imm: u8) {
+        self.vex_imm(Vl::X, VexOp::new(map, pp, opcode), regs, rm, imm);
     }
 
     /// `vfmadd213{ss,sd,ps,pd}`: computes `dst = src * dst + rm`.

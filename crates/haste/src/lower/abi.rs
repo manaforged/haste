@@ -294,13 +294,16 @@ fn simd_parts(element: &Scalar, count: BackendLaneCount, size: u64) -> Parts {
         (Some(ty), _) => Parts::One(ty),
         (None, 8) => Parts::One(Type::I64),
         (None, 16) => Parts::Pair(Type::I64, Type::I64, 8),
-        (None, 32) => half().map_or(Parts::Bytes, |half| Parts::Pair(half, half, 16)),
+        (None, 32) => half().map_or(Parts::Bytes, |half| match half.double_vec().filter(|wide| wide.is_register_vec(Target::host())) {
+            Some(wide) => Parts::One(wide),
+            None => Parts::Pair(half, half, 16),
+        }),
         (None, 64) => half().map_or(Parts::Bytes, |half| Parts::Words([(half, 0), (half, 16), (half, 32), (half, 48)], 4)),
         _ => Parts::Bytes,
     }
 }
 
-/// The parts that a typed copy of a value of `layout` moves: its scalars, the 16-byte halves of a wider vector, or contiguous word chunks up to 32 bytes when both scalars are a union's or the layout names none.
+/// The parts that a typed copy of a value of `layout` moves: its scalars, the whole of a vector that fills one register, the 16-byte halves of a wider one, or contiguous word chunks up to 32 bytes when both scalars are a union's or the layout names none.
 pub(super) fn copied_parts(layout: &Layout) -> Parts {
     match &layout.backend_repr {
         BackendRepr::ScalarPair { a: Scalar::Union { .. }, b: Scalar::Union { .. }, .. } => word_parts(layout.size.bytes()),

@@ -114,7 +114,7 @@ fn select_check(func: &Function, cond: Value, x: Value, y: Value, result: Option
 
 fn target_arity(id: TargetOpId) -> usize {
     match id {
-        TargetOpId::Arm64AesMc | TargetOpId::Arm64AesImc | TargetOpId::X64AesImc => 1,
+        TargetOpId::Arm64AesMc | TargetOpId::Arm64AesImc | TargetOpId::X64AesImc | TargetOpId::X64Low128 | TargetOpId::X64High128 | TargetOpId::X64Pmovmskb256 => 1,
         TargetOpId::Arm64Sha256H | TargetOpId::Arm64Sha256H2 | TargetOpId::Arm64Sha256Su1 | TargetOpId::X64Sha256Rnds2 => 3,
         _ => 2,
     }
@@ -290,13 +290,13 @@ fn returned(func: &Function, values: &[Value]) -> Result<(), String> {
 }
 
 /// Checks that every instruction agrees with the types of its operands, blocks and signatures, and every block ends with one terminator.
-pub(crate) fn verify(func: &Function) -> Result<(), String> {
+pub(crate) fn verify(func: &Function, target: &crate::Target) -> Result<(), String> {
     let entry = func.entry.ok_or("the function has no entry block")?;
     if !typed(func, &func.blocks[entry.index()].params, &func.signature.params) {
         return Err("the entry block parameters do not match the signature".to_owned());
     }
     for &ty in &func.types {
-        if ty.is_vector() && !ty.is_valid_vec() {
+        if ty.is_vector() && !ty.is_register_vec(target) {
             return Err(format!("invalid vector type {ty:?}"));
         }
     }

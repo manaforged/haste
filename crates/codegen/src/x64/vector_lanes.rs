@@ -37,6 +37,9 @@ const X64_TARGET_OPS: &[TargetOpSpec] = &[
 
 impl Emit<'_> {
     pub(super) fn vector_op(&mut self, op: &Op, result: Value) -> Result<(), String> {
+        if let Some(done) = self.wide_op(op, result) {
+            return done;
+        }
         match op {
             Op::Shuffle(a, b, mask) => self.vector_shuffle(*a, *b, mask, result),
             Op::Extract(v, lane) => self.vector_extract(*v, *lane, result),
@@ -47,7 +50,7 @@ impl Emit<'_> {
         }
     }
 
-    fn emit_mov_xmm_gpr(&mut self, dst: Xmm, reg: Reg, wide: bool) {
+    pub(super) fn emit_mov_xmm_gpr(&mut self, dst: Xmm, reg: Reg, wide: bool) {
         if self.features.avx && wide {
             let r = reg as u8;
             self.asm.bytes(&[0xC4, ((!dst.0 >> 3 & 1) << 7) | 0x41 | ((!r >> 3 & 1) << 5), 0xF9, 0x6E, 0xC0 | ((dst.0 & 7) << 3) | (r & 7)]);
@@ -63,6 +66,16 @@ impl Emit<'_> {
     fn emit_vpinsrq(&mut self, dst: Xmm, src: Xmm, reg: Reg, idx: u8) {
         let r = reg as u8;
         self.asm.bytes(&[0xC4, ((!dst.0 >> 3 & 1) << 7) | 0x43 | ((!r >> 3 & 1) << 5), 0x81 | ((!src.0 & 0xF) << 3), 0x22, 0xC0 | ((dst.0 & 7) << 3) | (r & 7), idx]);
+    }
+
+    /// `vpinsr{b,w,d,q}`: `src` with integer lane `idx` replaced by `reg`, into `dst`.
+    pub(super) fn vpinsr(&mut self, lane: Lane, (dst, src): (Xmm, Xmm), reg: Reg, idx: u8) {
+        match lane {
+            Lane::I8 => self.asm.vex_xmm_imm(0b00011, 0b01, 0x20, (dst, src), reg, idx),
+            Lane::I16 => self.asm.vex_xmm_imm(0b00001, 0b01, 0xC4, (dst, src), reg, idx),
+            Lane::I32 => self.asm.vex_xmm_imm(0b00011, 0b01, 0x22, (dst, src), reg, idx),
+            _ => self.emit_vpinsrq(dst, src, reg, idx),
+        }
     }
 
     fn load_bytes16(&mut self, dst: Xmm, scratch: Xmm, bytes: [u8; 16]) {
@@ -482,12 +495,7 @@ impl Emit<'_> {
                 Reg::Rax
             });
             let sv = self.fin(v, dst);
-            match lane {
-                Lane::I8 => self.asm.vex_xmm_imm(0b00011, 0b01, 0x20, (dst, sv), reg, idx),
-                Lane::I16 => self.asm.vex_xmm_imm(0b00001, 0b01, 0xC4, (dst, sv), reg, idx),
-                Lane::I32 => self.asm.vex_xmm_imm(0b00011, 0b01, 0x22, (dst, sv), reg, idx),
-                _ => self.emit_vpinsrq(dst, sv, reg, idx),
-            }
+            self.vpinsr(lane, (dst, sv), reg, idx);
             self.fput(result, dst);
             return Ok(());
         }

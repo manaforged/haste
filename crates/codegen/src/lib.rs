@@ -147,19 +147,19 @@ impl Target {
 
 /// Promotes `func`'s frame slots to values, folds constants and branches on them, merges straight-line blocks, reuses values a dominating instruction computed and returns in place of jumps to a return, as `compile` does before encoding, and drops the dead entries of a body kept for copying.
 pub fn simplify(func: &mut Function, effort: Effort) {
-    schedule::run(func, promote::Moves::Guided, effort);
+    schedule::run(func, promote::Moves::Guided, &Target::host().effort(effort));
     fold::compact(func);
 }
 
 /// Encodes `func` for `target`.
 pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
     coroutine::split(&mut func);
-    verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, message))?;
+    verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, message))?;
     let tracing = trace::enabled();
     if tracing {
         trace::on_compile_start(&func);
     }
-    schedule::run(&mut func, promote::Moves::Split, target.effort);
+    schedule::run(&mut func, promote::Moves::Split, target);
     if tracing {
         trace::on_compile_end(&func);
     }
@@ -167,7 +167,7 @@ pub fn compile(mut func: Function, target: &Target) -> Result<Code, Error> {
         copy::expand(&mut func, |_, _, bytes| Some(copy::words(bytes)));
     }
     native::lower(&mut func);
-    verify::verify(&func).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
+    verify::verify(&func, target).map_err(|message| Error::new(ErrorKind::Verify, format!("after simplification: {message}")))?;
     let code = match target.arch {
         Arch::X64 => x64::compile(&func, target),
         Arch::Arm64 => arm64::compile(&func, target),

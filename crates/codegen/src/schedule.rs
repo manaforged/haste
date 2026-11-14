@@ -70,9 +70,10 @@ struct Rule {
     reads: Domain,
 }
 
-struct Plan {
+struct Plan<'t> {
     moves: promote::Moves,
     effort: Effort,
+    target: &'t crate::Target,
     rules: &'static [Rule],
     budget: usize,
     finish: &'static [Pass],
@@ -103,7 +104,7 @@ static FULL_RULES: &[Rule] = &[
 ];
 static FULL_FINISH: &[Pass] = &[Pass::Switch, Pass::Returns, Pass::TailRec];
 
-fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort) -> Domain {
+fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort, target: &crate::Target) -> Domain {
     let tracing = crate::trace::enabled();
     let (before_blocks, before_insts) = if tracing { (func.blocks.len(), func.size()) } else { (0, 0) };
     let start = tracing.then(Instant::now);
@@ -113,7 +114,7 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Merge => merge::run(func),
         Pass::Promote => promote::step(func, moves),
         Pass::Cse => cse::run(func),
-        Pass::Loads => loads::run(func),
+        Pass::Loads => loads::run(func, target),
         Pass::Thread => thread::run(func),
         Pass::IfConv => ifconv::run(func),
         Pass::Rotate => rotate::run(func),
@@ -158,7 +159,7 @@ fn run_fixpoint(func: &mut Function, plan: &Plan) {
             dirty[idx] = Domain::NONE;
             remaining -= 1;
             ran = true;
-            let changed = run_pass(func, rule.pass, plan.moves, plan.effort);
+            let changed = run_pass(func, rule.pass, plan.moves, plan.effort, plan.target);
             if !changed.is_empty() {
                 for other in plan.rules {
                     if other.pass != rule.pass {
@@ -210,11 +211,13 @@ pub(crate) fn sink_compares(func: &mut Function) {
     }
 }
 
-pub(crate) fn run(func: &mut Function, moves: promote::Moves, effort: Effort) {
+pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Target) {
+    let effort = target.effort;
     let plan = match effort {
         Effort::Quick => Plan {
             moves: promote::Moves::Words,
             effort,
+            target,
             rules: QUICK_RULES,
             budget: 6,
             finish: QUICK_FINISH,
@@ -222,20 +225,21 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, effort: Effort) {
         Effort::Full => Plan {
             moves,
             effort,
+            target,
             rules: FULL_RULES,
             budget: 32,
             finish: FULL_FINISH,
         },
     };
     for &pass in INIT {
-        run_pass(func, pass, plan.moves, plan.effort);
+        run_pass(func, pass, plan.moves, plan.effort, plan.target);
     }
     run_fixpoint(func, &plan);
     if moves != promote::Moves::Guided && strip_assumes(func) {
         run_fixpoint(func, &plan);
     }
     for &pass in plan.finish {
-        run_pass(func, pass, plan.moves, plan.effort);
+        run_pass(func, pass, plan.moves, plan.effort, plan.target);
     }
     sink_compares(func);
 }

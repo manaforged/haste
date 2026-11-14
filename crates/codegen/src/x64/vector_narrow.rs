@@ -1,4 +1,4 @@
-use super::asm::Xmm;
+use super::asm::{Vl, Xmm};
 use super::float::{X0, X1, X2};
 use super::Emit;
 use crate::ir::{Binary, Convert, Lane, Op, Value};
@@ -7,9 +7,9 @@ use crate::ir::{Binary, Convert, Lane, Op, Value};
 pub(super) const PMULUDQ: &[u8] = &[0x0F, 0xF4];
 const PADDQ: &[u8] = &[0x0F, 0xD4];
 const PSHUFD: u8 = 0x70;
-const SRL: u8 = 2;
-const SRA: u8 = 4;
-const SLL: u8 = 6;
+pub(super) const SRL: u8 = 2;
+pub(super) const SRA: u8 = 4;
+pub(super) const SLL: u8 = 6;
 const HALF: u8 = 32;
 const EVEN_DWORDS: u8 = 0xE8;
 const FACT_DEPTH: u8 = 2;
@@ -18,7 +18,7 @@ impl Emit<'_> {
     /// Shifts every lane of `src` by `imm` into `dst`, where `ext` selects the shift.
     pub(super) fn pshift_into(&mut self, ext: u8, lane_bytes: u32, dst: Xmm, src: Xmm, imm: u8) {
         if self.features.avx {
-            self.asm.vex_pshift_imm(ext, lane_bytes, dst, src, imm);
+            self.asm.vex_pshift_imm(Vl::X, ext, lane_bytes, dst, src, imm);
             return;
         }
         if dst != src {

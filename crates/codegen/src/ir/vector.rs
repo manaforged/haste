@@ -1,4 +1,4 @@
-use super::{Type, Value};
+use super::{IntCC, Type, Value};
 
 /// One scalar lane type of a SIMD register vector.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -67,11 +67,46 @@ impl Lane {
     }
 }
 
+impl Type {
+    /// Whether `self` is a 32-byte power-of-two vector type of at most 16 lanes, which only a host with 256-bit registers holds in one register.
+    pub const fn is_wide_vec(self) -> bool {
+        match self {
+            Type::Vec { lane, count } => count.is_power_of_two() && count as usize <= MASK_LANES && lane.bytes() * (count as u32) == 32,
+            _ => false,
+        }
+    }
+
+    /// The 32-byte vector type that holds two 16-byte vectors of type `self`: twice its lanes, or four `I64` lanes in place of 32 byte lanes.
+    pub const fn double_vec(self) -> Option<Type> {
+        match self {
+            Type::Vec { lane, count } if lane.bytes() * (count as u32) == 16 && count.is_power_of_two() => {
+                Some(if count as usize * 2 <= MASK_LANES { Type::Vec { lane, count: count * 2 } } else { Type::Vec { lane: Lane::I64, count: 4 } })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `target` holds a value of vector type `self` in one register.
+    pub fn is_register_vec(self, target: &crate::Target) -> bool {
+        self.is_valid_vec() || (self.is_wide_vec() && target.wide_vectors())
+    }
+
+    /// The 16-byte vector type with the lanes of the 32-byte vector type `self`.
+    pub const fn half_vec(self) -> Option<Type> {
+        match self {
+            Type::Vec { lane, count } if self.is_wide_vec() => Some(Type::Vec { lane, count: count / 2 }),
+            _ => None,
+        }
+    }
+}
+
+const MASK_LANES: usize = 16;
+
 /// Lane selection mask for `Op::Shuffle(Value, Value, ShuffleMask)`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ShuffleMask {
     /// Static indices in `0..2*count` (`0..count` from `a`, `count..2*count` from `b`), trailing `count..16` = `0`.
-    Const([u8; 16]),
+    Const([u8; MASK_LANES]),
     /// Dynamic byte-index vector (`Vec { lane: I8, count: 8 | 16 }`).
     Dyn(Value),
 }
@@ -116,6 +151,34 @@ pub enum TargetOpId {
     X64AesDec,
     X64AesDecLast,
     X64AesImc,
+    /// The low 16 bytes of a 32-byte vector.
+    X64Low128,
+    /// The high 16 bytes of a 32-byte vector.
+    X64High128,
+    /// The 32-byte vector whose low half is the first operand and whose high half is the second.
+    X64Concat128,
+    /// `vpshufb` on a 32-byte vector: each 16-byte half of the first operand permuted by the bytes of the same half of the second.
+    X64Pshufb256,
+    /// `vpcmpeqb` on two 32-byte vectors: all ones in each byte where the operands' bytes are equal.
+    X64Pcmpeqb256,
+    /// `vpcmpgtb` on two 32-byte vectors: all ones in each byte where the first operand's signed byte is greater.
+    X64Pcmpgtb256,
+    /// `vpmovmskb` of a 32-byte vector: an `I32` of the top bit of each byte.
+    X64Pmovmskb256,
+}
+
+impl IntCC {
+    /// How packed compares, which test only equality and greater-than, compute this one: `(equal, swap, invert)`.
+    pub const fn packed(self) -> (bool, bool, bool) {
+        match self {
+            IntCC::Equal => (true, false, false),
+            IntCC::NotEqual => (true, false, true),
+            IntCC::SignedGreaterThan | IntCC::UnsignedGreaterThan => (false, false, false),
+            IntCC::SignedLessThan | IntCC::UnsignedLessThan => (false, true, false),
+            IntCC::SignedLessThanOrEqual | IntCC::UnsignedLessThanOrEqual => (false, false, true),
+            IntCC::SignedGreaterThanOrEqual | IntCC::UnsignedGreaterThanOrEqual => (false, true, true),
+        }
+    }
 }
 
 /// Inline 1-to-3 operand list for `Op::TargetOp` (unused slots canonicalized to `Value(0)`).

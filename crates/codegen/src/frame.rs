@@ -7,6 +7,10 @@ pub(crate) const PAGE: u32 = 4096;
 pub(crate) const INCOMING: i32 = 16;
 const EDGE_SLOT: u32 = 16;
 
+const fn edge_bytes(wide: bool) -> u32 {
+    if wide { 2 * EDGE_SLOT } else { EDGE_SLOT }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Ext {
     Zero,
@@ -228,11 +232,12 @@ pub(crate) struct Frame<R> {
     pub size: u32,
     pub saves: Vec<R>,
     pub float_saves: Vec<u8>,
+    pub wide: bool,
 }
 
 impl<R> Frame<R> {
     pub(crate) fn edge_slot(&self, index: usize) -> i32 {
-        self.scratch + (EDGE_SLOT as usize * index) as i32
+        self.scratch + (edge_bytes(self.wide) as usize * index) as i32
     }
 }
 
@@ -342,7 +347,8 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     for op in live_ops(func) {
         terminator_edges(op, &mut check_edge);
     }
-    let scratch = max_saved as u32 * EDGE_SLOT;
+    let wide = func.types.iter().any(|ty| ty.is_wide_vec());
+    let scratch = max_saved as u32 * edge_bytes(wide);
     let mut slots = vec![0; func.slots.len()];
     let mut order: Vec<usize> = (0..func.slots.len()).filter(|&slot| addressed[slot]).collect();
     order.sort_by_key(|&slot| (func.slots[slot].size, slot));
@@ -356,7 +362,7 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     cursor = round(cursor + scratch, 16);
     let scratch = -(cursor as i32);
     let size = round(cursor + outgoing, 16);
-    Ok(Frame { values, slots, scratch, size, saves, float_saves })
+    Ok(Frame { values, slots, scratch, size, saves, float_saves, wide })
 }
 
 pub(crate) struct Prepared<R> {

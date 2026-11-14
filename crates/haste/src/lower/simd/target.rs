@@ -4,6 +4,7 @@ use haste_codegen::{Arch, IntCC, Lane, ReduceOp, StackSlot, Target, TargetOpId, 
 use crate::host::{HostSymbol, X86Symbol};
 
 use super::super::Lower;
+use super::wide::wide_quads;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PtestMode {
@@ -44,6 +45,9 @@ impl Lower<'_, '_> {
 
     pub(in crate::lower) fn byte_permute_32(&mut self, args: &[Value]) -> Result<Value> {
         let &[table, index] = args else { bail!("`pshufb` takes two vectors") };
+        if let Some(value) = self.wide_byte_permute(table, index) {
+            return Ok(value);
+        }
         let slot = self.b.create_stack_slot(32, 5);
         let lo = self.shuffle_dyn_16(table, index, false, 0);
         let hi = self.shuffle_dyn_16(table, index, false, 16);
@@ -122,7 +126,10 @@ impl Lower<'_, '_> {
 
     pub(in crate::lower) fn host_vector(&mut self, x86: X86Symbol, args: &[Value]) -> Result<Value> {
         if let Some(value) = self.x86_inline(x86, args)? {
-            return Ok(value);
+            return Ok(match wide_quads().filter(|wide| x86.out_bytes() == wide.bytes() && x86.scalar_bytes().is_none()) {
+                Some(wide) => self.join_wide(wide, value),
+                None => value,
+            });
         }
         if Target::host().arch == Arch::X64
             && let Some((id, ty)) = x86_target_op(x86)

@@ -9,7 +9,7 @@ use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 use dom::{BlockWrites, invalidate_preserving, record_base, write_preserving};
 use join::{BlockClobber, JoinCtx, SubwordPlan, const_eq_for_ty, eligible_join_preds, find_subword_source, for_edge_args, for_edge_args_mut, resolve_select_load, rodata_const, try_join_phi_forward};
 
-use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
+use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, TargetOpId, TinyArgs, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, compute_affine, may_alias};
 use crate::merge::{find, identity, rename};
 
@@ -39,6 +39,9 @@ fn assemble_const(known: &KnownLoads, loc: MemLoc, ty: Type, consts: &[Option<i6
                 return None;
             }
         }
+        if ty.bytes() > 16 && first != 0 {
+            return None;
+        }
         return Some(if first == 0 { Assembled::VecZero } else { Assembled::VecByteSplat(first) });
     }
     let width = i64::from(ty.bytes());
@@ -65,6 +68,7 @@ struct State<'a> {
     selects: &'a [Option<(Value, Value, Value)>],
     consts: &'a mut Vec<Option<i64>>,
     subst: &'a mut Vec<Value>,
+    target: &'a crate::Target,
 }
 
 fn addr_loc(prov: &Provenance, subst: &[Value], addr: Value, offset: i32, size: u32) -> MemLoc {
@@ -217,23 +221,42 @@ fn materialize_word64(func: &mut Function, state: &mut State<'_>, kept: &mut Vec
     }
 }
 
+const QUAD: Type = Type::Vec { lane: Lane::I64, count: 2 };
+const WIDE_QUADS: Type = Type::Vec { lane: Lane::I64, count: 4 };
+
+fn quad_op(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, (lo, hi): (Word64Plan, Word64Plan)) -> Op {
+    let lo64 = materialize_word64(func, state, kept, lo);
+    let hi64 = materialize_word64(func, state, kept, hi);
+    let zero = emit_op(func, state, kept, QUAD, Op::Const(0));
+    let half = emit_op(func, state, kept, QUAD, Op::Insert(zero, lo64, 0));
+    Op::Insert(half, hi64, 1)
+}
+
+fn set_load(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, (inst, ty): (Inst, Type), (built, op): (Type, Op)) {
+    if ty == built {
+        func.insts[inst.index()].op = op;
+    } else {
+        let value = emit_op(func, state, kept, built, op);
+        func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, value);
+    }
+}
+
 fn forward_concat(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, known: &KnownLoads, inst: Inst, loc: MemLoc, ty: Type) -> bool {
-    if ty.is_vector() && ty.bytes() == 16 {
-        let Some(hi_off) = loc.offset.checked_add(8) else { return false };
-        let Some(lo_plan) = plan_word64(func, known, loc, loc.offset, state.consts) else { return false };
-        let Some(hi_plan) = plan_word64(func, known, loc, hi_off, state.consts) else { return false };
-        let lo64 = materialize_word64(func, state, kept, lo_plan);
-        let hi64 = materialize_word64(func, state, kept, hi_plan);
-        let vec64 = Type::Vec { lane: Lane::I64, count: 2 };
-        let zero = emit_op(func, state, kept, vec64, Op::Const(0));
-        let half = emit_op(func, state, kept, vec64, Op::Insert(zero, lo64, 0));
-        let insert = Op::Insert(half, hi64, 1);
-        if ty == vec64 {
-            func.insts[inst.index()].op = insert;
-        } else {
-            let full = emit_op(func, state, kept, vec64, insert);
-            func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, full);
-        }
+    if ty.is_vector() && (ty.bytes() == 16 || (ty.bytes() == 32 && ty.is_register_vec(state.target))) {
+        let Some(plans) = (0..i64::from(ty.bytes()) / 8).map(|word| plan_word64(func, known, loc, loc.offset.checked_add(8 * word)?, state.consts)).collect::<Option<Vec<_>>>() else { return false };
+        let mut plans = plans.into_iter();
+        let (Some(lo), Some(hi)) = (plans.next(), plans.next()) else { return false };
+        let low = quad_op(func, state, kept, (lo, hi));
+        let built = match (plans.next(), plans.next()) {
+            (Some(lo), Some(hi)) => {
+                let low = emit_op(func, state, kept, QUAD, low);
+                let high = quad_op(func, state, kept, (lo, hi));
+                let high = emit_op(func, state, kept, QUAD, high);
+                (WIDE_QUADS, Op::TargetOp(TargetOpId::X64Concat128, TinyArgs::two(low, high)))
+            }
+            _ => (QUAD, low),
+        };
+        set_load(func, state, kept, (inst, ty), built);
         return true;
     }
     if !(matches!(ty, Type::I64 | Type::F64) || (ty.is_vector() && ty.bytes() == 8)) {
@@ -243,12 +266,7 @@ fn forward_concat(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Opt
     let Some(lo_half) = resolve_concat_half(known, loc, loc.offset, state.consts) else { return false };
     let Some(hi_half) = resolve_concat_half(known, loc, hi_off, state.consts) else { return false };
     let combined = emit_pack32_op(func, state, kept, lo_half, hi_half);
-    if ty == Type::I64 {
-        func.insts[inst.index()].op = combined;
-    } else {
-        let word = emit_op(func, state, kept, Type::I64, combined);
-        func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, word);
-    }
+    set_load(func, state, kept, (inst, ty), (Type::I64, combined));
     true
 }
 
@@ -698,7 +716,7 @@ fn sink_terminator_defs(func: &mut Function) -> bool {
 }
 
 /// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between; returns the effect domains modified.
-pub(crate) fn run(func: &mut Function) -> Domain {
+pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
         return Domain::NONE;
     }
@@ -730,7 +748,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     }
     let mut bw = BlockWrites::new(func, &cfg, &prov);
     let mut subst = identity(func.types.len());
-    let mut state = State { prov: &prov, selects: &selects, consts: &mut consts, subst: &mut subst };
+    let mut state = State { prov: &prov, selects: &selects, consts: &mut consts, subst: &mut subst, target };
     let mut renamed = false;
     let mut def_blocks = func.def_blocks();
     let mut visited = vec![false; func.blocks.len()];

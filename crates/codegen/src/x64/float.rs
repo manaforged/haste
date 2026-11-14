@@ -293,7 +293,7 @@ impl Emit<'_> {
                 let dst = self.fdst(result);
                 let src = self.fin(x, dst);
                 if dst != src {
-                    self.asm.movaps(dst, src);
+                    self.fmov(to, dst, src);
                 }
                 self.fput(result, dst);
             }

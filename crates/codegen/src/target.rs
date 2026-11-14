@@ -125,6 +125,11 @@ impl Target {
         &TARGETS[HOST]
     }
 
+    /// Whether this target holds a 32-byte vector in one register: x86-64 with AVX2, known only for the host CPU.
+    pub fn wide_vectors(&self) -> bool {
+        self.arch == Arch::X64 && self.triple == Target::host().triple && crate::x64::host_avx2()
+    }
+
     /// This target with the code generator spending `effort` on each function.
     #[must_use]
     pub const fn effort(mut self, effort: Effort) -> Self {

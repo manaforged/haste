@@ -67,6 +67,9 @@ impl SubwordPlan {
             return ok.then_some(Self::VecBitcast { kval });
         }
         if kty.is_vector() {
+            if kty.bytes() > 16 {
+                return None;
+            }
             let ty_end = loc_offset.checked_add(i64::from(ty.bytes()))?;
             let k_end = koff.checked_add(i64::from(kty.bytes()))?;
             if loc_offset < koff || ty_end > k_end {

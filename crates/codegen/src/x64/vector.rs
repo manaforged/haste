@@ -23,7 +23,21 @@ pub(super) fn vec_alu_opcode(op: Binary, lane: Lane) -> Option<u8> {
     }
 }
 
-fn float_vec_opcode(op: Binary) -> Option<u8> {
+/// The `0F` opcode that shifts every lane of a `lane` vector by the count in the low quadword of its second operand.
+pub(super) fn shift_count_opcode(op: Binary, lane: Lane) -> u8 {
+    match (op, lane) {
+        (Binary::Ishl, Lane::I16) => 0xF1,
+        (Binary::Ishl, Lane::I32) => 0xF2,
+        (Binary::Ishl, Lane::I64) => 0xF3,
+        (Binary::Ushr, Lane::I16) => 0xD1,
+        (Binary::Ushr, Lane::I32) => 0xD2,
+        (Binary::Ushr, Lane::I64) => 0xD3,
+        (Binary::Sshr, Lane::I16) => 0xE1,
+        _ => 0xE2,
+    }
+}
+
+pub(super) fn float_vec_opcode(op: Binary) -> Option<u8> {
     match op {
         Binary::Fadd => Some(0x58),
         Binary::Fmul => Some(0x59),
@@ -37,7 +51,7 @@ pub(super) fn vec_prefix(lane: Lane) -> &'static [u8] {
     if lane == Lane::F64 { &[0x66] } else { &[] }
 }
 
-fn is_commutative(op: Binary) -> bool {
+pub(super) fn is_commutative(op: Binary) -> bool {
     matches!(op, Binary::Iadd | Binary::Imul | Binary::Band | Binary::Bor | Binary::Bxor | Binary::Fadd | Binary::Fmul
         | Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax | Binary::SaddSat | Binary::UaddSat | Binary::AvgRound)
 }
@@ -148,6 +162,9 @@ impl Emit<'_> {
         let Some((lane, count)) = self.ty(x).vec_shape() else {
             return Err(format!("non-vector type {:?} in vector_unary", self.ty(x)));
         };
+        if self.ty(x).is_wide_vec() {
+            return self.ymm_unary(op, x, result);
+        }
         let dst = self.xmm_of(result).unwrap_or(X2);
         match op {
             Unary::Bnot => {
@@ -259,6 +276,9 @@ impl Emit<'_> {
         let Some((lane, count)) = self.ty(x).vec_shape() else {
             return Err(format!("non-vector type {:?} in vector_binary", self.ty(x)));
         };
+        if self.ty(x).is_wide_vec() {
+            return self.ymm_binary(op, (x, y), result);
+        }
         if let Some(opcode) = vec_alu_opcode(op, lane) {
             self.vex_packed_op(&[0x66], &[0x0F, opcode], (x, y), result, is_commutative(op));
             return Ok(());
@@ -482,17 +502,7 @@ impl Emit<'_> {
                 self.get(Reg::Rax, scalar_v, Ext::Zero);
                 self.asm.alu_imm32(Alu::And, Reg::Rax, (lane.bits() - 1) as i32);
                 self.asm.movd_in(X1, Reg::Rax);
-                let opc = match (op, lane) {
-                    (Binary::Ishl, Lane::I16) => 0xF1,
-                    (Binary::Ishl, Lane::I32) => 0xF2,
-                    (Binary::Ishl, Lane::I64) => 0xF3,
-                    (Binary::Ushr, Lane::I16) => 0xD1,
-                    (Binary::Ushr, Lane::I32) => 0xD2,
-                    (Binary::Ushr, Lane::I64) => 0xD3,
-                    (Binary::Sshr, Lane::I16) => 0xE1,
-                    _ => 0xE2,
-                };
-                self.sse_or_vex(&[0x66], &[0x0F, opc], (dst, sx, X1));
+                self.sse_or_vex(&[0x66], &[0x0F, shift_count_opcode(op, lane)], (dst, sx, X1));
                 self.fput(result, dst);
                 return Ok(());
             }
@@ -506,6 +516,9 @@ impl Emit<'_> {
         let Some((lane, count)) = self.ty(x).vec_shape() else {
             return Err(format!("non-vector type {:?} in vector_icmp", self.ty(x)));
         };
+        if self.ty(x).is_wide_vec() {
+            return Err(format!("{cc:?} of 256-bit vector {lane:?}"));
+        }
         let dst = self.xmm_of(result).unwrap_or(X2);
         let unsigned = matches!(
             cc,
@@ -555,14 +568,9 @@ impl Emit<'_> {
             Lane::I32 => &[0x0F, 0x66],
             _ => &[0x0F, 0x38, 0x37],
         };
-        let (opc, left, right, invert) = match cc {
-            IntCC::Equal => (eq_opc, a, b, false),
-            IntCC::NotEqual => (eq_opc, a, b, true),
-            IntCC::SignedGreaterThan | IntCC::UnsignedGreaterThan => (gt_opc, a, b, false),
-            IntCC::SignedLessThan | IntCC::UnsignedLessThan => (gt_opc, b, a, false),
-            IntCC::SignedLessThanOrEqual | IntCC::UnsignedLessThanOrEqual => (gt_opc, a, b, true),
-            IntCC::SignedGreaterThanOrEqual | IntCC::UnsignedGreaterThanOrEqual => (gt_opc, b, a, true),
-        };
+        let (equal, swap, invert) = cc.packed();
+        let opc = if equal { eq_opc } else { gt_opc };
+        let (left, right) = if swap { (b, a) } else { (a, b) };
         self.sse_or_vex(&[0x66], opc, (dst, left, right));
         if invert {
             self.sse_or_vex(&[0x66], &[0x0F, 0x76], (X1, X1, X1));
@@ -629,6 +637,9 @@ impl Emit<'_> {
         let to_ty = self.ty(result);
         if op == Convert::Bitcast {
             return self.float_convert(op, x, result);
+        }
+        if from_ty.is_wide_vec() || to_ty.is_wide_vec() {
+            return Err(format!("{op:?} between {from_ty:?} and {to_ty:?}"));
         }
         let (Some((fl, fc)), Some((tl, tc))) = (from_ty.vec_shape(), to_ty.vec_shape()) else {
             return Err(format!("{op:?} between {from_ty:?} and {to_ty:?}"));

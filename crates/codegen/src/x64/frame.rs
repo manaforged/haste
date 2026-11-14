@@ -46,7 +46,7 @@ impl Counter {
                 Type::Vec { .. } if ty.bytes() == 8 && slot < WIN64_INT_ARGS.len() => Loc::Float(slot as u8),
                 Type::F32 | Type::F64 => self.stack(WORD, WORD),
                 Type::Vec { .. } if ty.bytes() == 8 => self.stack(WORD, WORD),
-                Type::I128 | Type::Vec { .. } => self.stack(16, 16),
+                Type::I128 | Type::Vec { .. } => self.stack(ty.bytes(), 16),
                 _ if slot < WIN64_INT_ARGS.len() => Loc::Int(WIN64_INT_ARGS[slot]),
                 _ => self.stack(WORD, WORD),
             };

@@ -17,6 +17,7 @@ mod fallback;
 mod lanes;
 mod scalar;
 mod target;
+mod wide;
 
 #[derive(Clone, Copy)]
 pub(super) struct Lanes {
@@ -85,7 +86,7 @@ pub(super) fn int_for_bytes(bytes: i32) -> Option<Type> {
 impl Lower<'_, '_> {
     /// Emits the SIMD intrinsic `op` using native `Type::Vec` operations, recursive half-splits, or SSA loops.
     pub(super) fn simd(&mut self, origin: &SiteOrigin, op: Simd, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
-        let (Some(&vector), Some(&first)) = (substs.first(), args.first()) else { bail!("a SIMD intrinsic with no vector") };
+        let (Some(&vector), Some(_)) = (substs.first(), args.first()) else { bail!("a SIMD intrinsic with no vector") };
         let out = if op == Simd::Shuffle { substs.get(2) } else { substs.get(1) }.copied();
         if op == Simd::SelectBitmask {
             let &[mask, yes, no] = args else { bail!("SIMD intrinsic {op:?} takes other arguments") };
@@ -95,6 +96,15 @@ impl Lower<'_, '_> {
         let Some(to) = self.simd_out_lanes(op, from, out)? else {
             return Ok(None);
         };
+        match self.simd_wide(origin, op, (vector, out), (from, to), substs, args)? {
+            Some(done) => Ok(done),
+            None => self.simd_halves(origin, op, (vector, out), (from, to), substs, args),
+        }
+    }
+
+    /// Emits the SIMD intrinsic `op` on vectors of at most 16 bytes, with a wider vector as 16-byte halves in memory.
+    fn simd_halves(&mut self, origin: &SiteOrigin, op: Simd, (vector, out): (Ty, Option<Ty>), (from, to): (Lanes, Lanes), substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+        let Some(&first) = args.first() else { return Ok(None) };
         if let Some(value) = self.vec_simd_lanes(Some(origin), op, (from, to), substs, args)? {
             return Ok(Some(value));
         }
@@ -261,7 +271,13 @@ impl Lower<'_, '_> {
             return Ok(None);
         }
         let (a, b) = (self.ins().load(vec_ty, x, 0), self.ins().load(vec_ty, y, 0));
-        let out = match (bin, from.num) {
+        let Some(out) = self.lanewise_value(bin, from.num, (a, b)) else { return Ok(None) };
+        Ok(Some(self.store_vec(out, vec_ty.bytes())))
+    }
+
+    /// The lanewise `bin` of the vectors `a` and `b` of `num` lanes, when one instruction computes it.
+    fn lanewise_value(&mut self, bin: BinOp, num: Num, (a, b): (Value, Value)) -> Option<Value> {
+        Some(match (bin, num) {
             (BinOp::Add, Num::Int { .. }) => self.ins().iadd(a, b),
             (BinOp::Sub, Num::Int { .. }) => self.ins().isub(a, b),
             (BinOp::Mul, Num::Int { .. }) => self.ins().imul(a, b),
@@ -275,9 +291,8 @@ impl Lower<'_, '_> {
             (BinOp::Sub, Num::Float(_)) => self.ins().fsub(a, b),
             (BinOp::Mul, Num::Float(_)) => self.ins().fmul(a, b),
             (BinOp::Div, Num::Float(_)) => self.ins().fdiv(a, b),
-            _ => return Ok(None),
-        };
-        Ok(Some(self.store_vec(out, vec_ty.bytes())))
+            _ => return None,
+        })
     }
 
     fn vec_select(&mut self, (from, to): (&Lanes, &Lanes), args: &[Value]) -> Result<Option<Value>> {
@@ -331,7 +346,7 @@ impl Lower<'_, '_> {
         ctx.shuffle_array(self.body, self.src, expr, (in_count, out_count), &mut Vec::new(), 0)
     }
 
-    fn const_splat_vec(&mut self, origin: &SiteOrigin, vec_ty: Type) -> Option<Value> {
+    pub(super) fn const_splat_vec(&mut self, origin: &SiteOrigin, vec_ty: Type) -> Option<Value> {
         let expr = self.call_arg_expr(origin, 0)?;
         let lane = vec_ty.lane()?;
         let bits = if lane.is_int() {

@@ -302,6 +302,9 @@ impl Emit<'_> {
 
     /// Loads the float or vector of type `ty` at `from` into `xmm`; an 8-byte vector by `movq` and a 16-byte vector by `movdqu`, which needs no alignment.
     pub(super) fn xmm_load(&mut self, ty: Type, xmm: Xmm, from: Mem) {
+        if ty.is_wide_vec() {
+            return self.ymm_load(xmm, from);
+        }
         if self.features.avx {
             let (pp, opcode) = if ty.is_vector() {
                 (0b10, if ty.bytes() == 16 { 0x6F } else { 0x7E })
@@ -320,6 +323,9 @@ impl Emit<'_> {
 
     /// Stores the float or vector of type `ty` in `xmm` to `to`.
     pub(super) fn xmm_store(&mut self, ty: Type, to: Mem, xmm: Xmm) {
+        if ty.is_wide_vec() {
+            return self.ymm_store(to, xmm);
+        }
         if self.features.avx {
             let (pp, opcode) = if ty.is_vector() {
                 if ty.bytes() == 16 { (0b10, 0x7F) } else { (0b01, 0xD6) }
@@ -342,7 +348,7 @@ impl Emit<'_> {
         match self.location(value) {
             Location::Float(from) if Xmm(from) == xmm => {}
             Location::Float(from) => {
-                self.asm.movaps(xmm, Xmm(from));
+                self.fmov(ty, xmm, Xmm(from));
                 self.clobber_xmm(xmm);
             }
             Location::Imm(0) if ty.is_vector() => self.zero_xmm(xmm),
@@ -354,7 +360,7 @@ impl Emit<'_> {
                     && cached_ty == ty
                 {
                     if cached_reg != xmm {
-                        self.asm.movaps(xmm, cached_reg);
+                        self.fmov(ty, xmm, cached_reg);
                         self.clobber_xmm(xmm);
                     }
                 } else {
@@ -377,7 +383,7 @@ impl Emit<'_> {
         match self.location(value) {
             Location::Float(to) => {
                 if Xmm(to) != xmm {
-                    self.asm.movaps(Xmm(to), xmm);
+                    self.fmov(ty, Xmm(to), xmm);
                 }
                 self.clobber_xmm(Xmm(to));
             }
@@ -445,7 +451,7 @@ impl Emit<'_> {
         let stack_home = to.base == Reg::Rbp && to.index.is_none();
         let ty = self.ty(value);
         match self.location(value) {
-            Location::Imm(0) if ty.is_vector() && ty.bytes() == 16 => {
+            Location::Imm(0) if ty.is_vector() && ty.bytes() >= 16 => {
                 self.zero_xmm(X2);
                 return self.store_xmm_home(to, X2, ty);
             }

@@ -9,14 +9,16 @@ mod vector;
 mod vector_lanes;
 mod vector_narrow;
 mod wide;
+mod ymm;
 
 use asm::{Alu, Asm, Cond, Label, Mem, Reg, Rm, Shift, Size, Xmm};
 use features::Features;
+pub(crate) use ymm::host_avx2;
 use frame::{Abi, Loc, SAVED, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare, reg_steps, save_offset, shrink_wrap};
-use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Lane, Op, SigRef, Type, Value};
+use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
 use crate::reloc::{DictTierUp, RelocKind, StencilReloc};
 use crate::target::{CallAbi, Target};
@@ -360,7 +362,7 @@ impl Emit<'_> {
     }
 
     fn copy_to(&mut self, to: Mem, from: Mem, ty: Type, scratch: Xmm) {
-        if ty.is_vector() && ty.bytes() == 16 {
+        if ty.is_vector() && ty.bytes() >= 16 {
             self.xmm_load(ty, scratch, from);
             self.clobber_xmm(scratch);
             return self.store_xmm_home(to, scratch, ty);
@@ -468,6 +470,7 @@ impl Emit<'_> {
             let pointer = params[index];
             self.raw(Reg::Rax, pointer);
         }
+        self.leave_wide(&func.signature.returns);
         if self.in_fast_ret {
             self.asm.bytes(&[0xC3]);
         } else {
@@ -479,18 +482,7 @@ impl Emit<'_> {
     fn move_locs(&mut self, values: &[Value], locs: &[Loc], scratch: Reg) -> usize {
         let float_targets: Vec<(Value, u8)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Float(xmm) = loc { Some((val, xmm)) } else { None }).collect();
         for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
-            match step {
-                ArgStep::Move(src, dst) => self.asm.movaps(Xmm(dst), Xmm(src)),
-                ArgStep::Save(src) => {
-                    self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
-                    self.xmm_store(Type::Vec { lane: Lane::I64, count: 2 }, Mem::new(Reg::Rsp, 0), Xmm(src));
-                }
-                ArgStep::Restore(dst) => {
-                    self.xmm_load(Type::Vec { lane: Lane::I64, count: 2 }, Xmm(dst), Mem::new(Reg::Rsp, 0));
-                    self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
-                }
-                ArgStep::Load(val, dst) => self.fget(Xmm(dst), val),
-            }
+            self.float_step(step);
             if let ArgStep::Move(_, dst) | ArgStep::Restore(dst) = step {
                 self.clobber_xmm(Xmm(dst));
             }
@@ -530,18 +522,7 @@ impl Emit<'_> {
             }
         }
         for step in reg_steps(float_pairs) {
-            match step {
-                ArgStep::Move(src, dst) => self.asm.movaps(Xmm(dst), Xmm(src)),
-                ArgStep::Save(src) => {
-                    self.asm.alu_imm(Alu::Sub, Reg::Rsp, 16);
-                    self.xmm_store(Type::Vec { lane: Lane::I64, count: 2 }, Mem::new(Reg::Rsp, 0), Xmm(src));
-                }
-                ArgStep::Restore(dst) => {
-                    self.xmm_load(Type::Vec { lane: Lane::I64, count: 2 }, Xmm(dst), Mem::new(Reg::Rsp, 0));
-                    self.asm.alu_imm(Alu::Add, Reg::Rsp, 16);
-                }
-                ArgStep::Load(..) => {}
-            }
+            self.float_step(step);
         }
         for step in reg_steps(int_pairs) {
             match step {
@@ -601,6 +582,8 @@ impl Emit<'_> {
             Reg::R11
         };
         let float_count = self.move_locs(args, &abi.params, Reg::Rax);
+        let func = self.func;
+        self.leave_wide(&func.sigs[sig.index()].params);
         if self.abi_kind == CallAbi::SysV && self.func.sigs[sig.index()].params.iter().any(|param| param.purpose == ArgumentPurpose::Variadic) {
             self.asm.mov_imm(Reg::Rax, float_count as i64);
         }

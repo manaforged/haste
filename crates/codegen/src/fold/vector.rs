@@ -193,6 +193,9 @@ impl<'a> ByteEval<'a> {
     }
 
     fn eval(&mut self, val: Value, depth: u8) -> [Option<u8>; 16] {
+        if self.func.ty(val).bytes() > 16 {
+            return [None; 16];
+        }
         let idx = val.index();
         if let Some(cached) = self.cache[idx] {
             return cached;
@@ -265,6 +268,9 @@ impl<'a> ByteEval<'a> {
             }
             Op::Extract(vec, lane_idx) => {
                 let Some((lane, count)) = self.func.ty(vec).vec_shape() else { return [None; 16] };
+                if self.func.ty(vec).bytes() > 16 {
+                    return [None; 16];
+                }
                 if lane_idx >= count {
                     return [None; 16];
                 }
@@ -612,6 +618,7 @@ fn fold_const_vectors(func: &mut Function) -> bool {
         if let (Op::Extract(vec, lane_idx), Some(res)) = (&data.op, data.result)
             && let Some((lane, count)) = func.ty(*vec).vec_shape()
             && *lane_idx < count
+            && func.ty(*vec).bytes() <= 16
             && (func.ty(res).is_small_int() || func.ty(res).is_float())
         {
             let vb = eval.eval(*vec, 0);
