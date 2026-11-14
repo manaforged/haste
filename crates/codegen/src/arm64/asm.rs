@@ -358,20 +358,6 @@ impl Asm {
     }
 
     pub fn finish(mut self) -> Result<Vec<u8>, String> {
-        let mut veneers = Vec::new();
-        for (at, label, kind) in std::mem::take(&mut self.fixups) {
-            let target = self.labels[label].ok_or("a jump to a label that was never bound")?;
-            if self.try_patch(at, kind, target) {
-                continue;
-            }
-            if !matches!(kind, Fixup::Cond | Fixup::Tbz) {
-                return Err("a branch out of range".to_owned());
-            }
-            let veneer = self.emit_veneer(&mut veneers, label);
-            if !self.try_patch(at, kind, veneer) {
-                return Err("a branch out of range".to_owned());
-            }
-        }
         for (at, label, kind) in std::mem::take(&mut self.fixups) {
             let target = self.labels[label].ok_or("a jump to a label that was never bound")?;
             if !self.try_patch(at, kind, target) {

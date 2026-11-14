@@ -32,6 +32,8 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn put_exception(&mut self, value: Value);
     fn push_site(&mut self, site: Site);
     fn tails(&mut self) -> &mut Tails<'a, L>;
+    /// Places a branch island here when pending short branches near their range.
+    fn island(&mut self) -> Result<(), String> { Ok(()) }
 }
 
 struct Stub<'a, L> {
@@ -189,6 +191,7 @@ fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
 
 pub(crate) fn emit_stubs<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(emit: &mut E) -> Result<(), String> {
     for stub in std::mem::take(&mut emit.tails().stubs) {
+        emit.island()?;
         emit.clear_flags();
         emit.bind_label(stub.label);
         emit.edge(stub.block, stub.args)?;

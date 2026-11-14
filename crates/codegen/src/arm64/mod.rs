@@ -352,6 +352,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn pos(&self) -> u32 { self.asm.pos() }
 
     fn finish(mut self) -> Result<Code, String> {
+        self.asm.maybe_island()?;
         if let Some(label) = self.trap_label.take() {
             self.asm.bind(label);
             self.asm.brk();
@@ -666,6 +667,10 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
     fn new_label(&mut self) -> Label { self.asm.label() }
     fn tails(&mut self) -> &mut Tails<'a, Label> { &mut self.tails }
+    fn island(&mut self) -> Result<(), String> {
+        self.asm.maybe_island()
+    }
+
     fn bind_label(&mut self, label: Label) {
         self.invalidate_spills();
         self.asm.bind(label);
