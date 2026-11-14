@@ -111,7 +111,7 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
     let built = summaries.run(
         cx,
         item,
-        |cx| Ok(frozen::frozen_summary(cx, item).map_or_else(|| build_summary(cx, item, expected as u16), SummaryKind::Poly)),
+        |cx| Ok(load_summary(cx, item, expected as u16)),
         |_| Ok(SummaryKind::MonomorphicFallback),
     );
     let summary = match built {
@@ -171,7 +171,7 @@ pub(super) fn poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<Po
     let built = summaries.run(
         cx,
         item,
-        |cx| Ok(frozen::frozen_summary(cx, item).map_or_else(|| build_summary(cx, item, expected as u16), SummaryKind::Poly)),
+        |cx| Ok(load_summary(cx, item, expected as u16)),
         |_| Ok(SummaryKind::MonomorphicFallback),
     );
     match built {
@@ -208,6 +208,12 @@ fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
         return Some(outer + own);
     }
     Some(own)
+}
+
+fn load_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
+    let Some(summary) = frozen::frozen_summary(cx, item) else { return build_summary(cx, item, param_count) };
+    lay_out_fixed(cx, &summary);
+    SummaryKind::Poly(summary)
 }
 
 fn build_summary(cx: &mut Context<'_>, item: ItemRef, param_count: u16) -> SummaryKind {
@@ -335,17 +341,34 @@ fn extract_op_holes(types: &Types, body: &Body, tpl: &BodyTables) -> Box<[(ExprI
         .collect()
 }
 
+fn is_aggregate(cx: &Context<'_>, ty: Ty) -> bool {
+    ty != Ty::NONE && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..))
+}
+
+fn owned_tys(summary: &PolySummary) -> impl Iterator<Item = Ty> + '_ {
+    summary.locals.iter().map(|l| l.ty).chain(summary.template.owned_tys())
+}
+
+fn lay_out_fixed(cx: &mut Context<'_>, summary: &PolySummary) {
+    let fixed = summary.template.closures.is_empty().then(|| owned_tys(summary));
+    for ty in fixed.into_iter().flatten() {
+        if is_aggregate(cx, ty) && !cx.types.has_params(ty) {
+            drop(cx.layout(ty));
+        }
+    }
+}
+
 fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Result<()> {
     if summary.template.closures.is_empty() {
         let mut seen_drop = HashSet::default();
         let mut fixed_drops = Vec::new();
         let mut drop_tys = Vec::new();
-        for ty in summary.locals.iter().map(|l| l.ty).chain(summary.template.owned_tys()) {
+        for ty in owned_tys(summary) {
             if ty == Ty::NONE || !seen_drop.insert(ty) {
                 continue;
             }
             if !cx.types.has_params(ty) {
-                if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
+                if is_aggregate(cx, ty) {
                     drop(cx.layout(ty));
                 }
                 if let Some(call) = super::infer::glue_call(cx, ty)? {
@@ -544,7 +567,7 @@ fn sub_op_check(infer: &mut Infer<'_, '_>, sub: &mut SubState<'_>, check: OpChec
 
 fn lay_out_instantiated(cx: &mut Context<'_>, layouts: &[Ty], typed: &Typed) -> Result<()> {
     for &ty in layouts {
-        if ty != Ty::NONE && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)) {
+        if is_aggregate(cx, ty) {
             cx.layout(ty)?;
         }
     }
