@@ -14,11 +14,28 @@ pub(super) enum RelKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Rel {
-    kind: RelKind,
-    lhs: Value,
-    rhs: Value,
-    ty: Type,
+pub(super) struct Rel {
+    pub(super) kind: RelKind,
+    pub(super) lhs: Value,
+    pub(super) rhs: Value,
+    pub(super) ty: Type,
+}
+
+pub(super) fn rel_step(r: Rel, cur: Value, ty: Type, (strict_k, weak_k): (RelKind, RelKind)) -> Option<(Value, bool)> {
+    if r.ty != ty {
+        return None;
+    }
+    if r.kind == RelKind::Eq && r.lhs == cur {
+        Some((r.rhs, false))
+    } else if r.kind == RelKind::Eq && r.rhs == cur {
+        Some((r.lhs, false))
+    } else if r.lhs == cur && r.kind == strict_k {
+        Some((r.rhs, true))
+    } else if r.lhs == cur && r.kind == weak_k {
+        Some((r.rhs, false))
+    } else {
+        None
+    }
 }
 
 pub(super) fn rel_of(cc: IntCC, x: Value, y: Value) -> (RelKind, Value, Value) {
@@ -39,9 +56,9 @@ pub(super) fn rel_of(cc: IntCC, x: Value, y: Value) -> (RelKind, Value, Value) {
 /// The conditions known to hold at one point of a function: facts on values that the branches taken to get there give.
 #[derive(Clone, Default)]
 pub(super) struct Path {
-    facts: Vec<(Value, Fact)>,
-    rels: Vec<Rel>,
-    no_wrap_adds: Vec<(Value, Value)>,
+    pub(super) facts: Vec<(Value, Fact)>,
+    pub(super) rels: Vec<Rel>,
+    pub(super) no_wrap_adds: Vec<(Value, Value)>,
 }
 
 impl Path {
@@ -59,7 +76,7 @@ impl Path {
     }
 
     /// Records `fact` on `value`, forgetting the oldest fact past `MAX_FACTS`.
-    fn add(&mut self, ranges: &Ranges, value: Value, fact: Fact) {
+    pub(super) fn add(&mut self, ranges: &Ranges, value: Value, fact: Fact) {
         let merged = self.fact(ranges, value).meet(&fact);
         if let Some(pos) = self.facts.iter().position(|(at, _)| *at == value) {
             self.facts.remove(pos);
@@ -78,43 +95,17 @@ impl Path {
         }
     }
 
-    pub(super) fn refined_fact(&self, func: &Function, ranges: &Ranges, value: Value, depth: u8) -> Fact {
-        let mut fact = self.fact(ranges, value);
-        if depth >= 3 {
-            return fact;
-        }
-        match ranges.op(func, value) {
-            Some(&Op::Convert(crate::ir::Convert::Uextend, inner)) if func.ty(inner).is_small_int() => {
-                fact = fact.meet(&self.refined_fact(func, ranges, inner, depth + 1));
-            }
-            Some(&Op::Binary(Binary::Band, a, b)) => {
-                let hi = self.refined_fact(func, ranges, a, depth + 1).hi.min(self.refined_fact(func, ranges, b, depth + 1).hi);
-                fact = fact.meet(&Fact::range(0, hi));
-            }
-            Some(&Op::Binary(Binary::Ushr, a, sh)) => {
-                if let Some(c) = self.fact(ranges, sh).exact() {
-                    let inner = self.refined_fact(func, ranges, a, depth + 1);
-                    let k = (c & u64::from(func.ty(value).bits() - 1)) as u32;
-                    fact = fact.meet(&Fact::range(inner.lo >> k, inner.hi >> k));
-                }
-            }
-            Some(&Op::Binary(Binary::Isub, a, b)) => {
-                let (fa, fb) = (self.refined_fact(func, ranges, a, depth + 1), self.refined_fact(func, ranges, b, depth + 1));
-                if fa.lo >= fb.hi {
-                    fact = fact.meet(&Fact::range(fa.lo - fb.hi, fa.hi - fb.lo));
-                }
-            }
-            Some(&Op::Binary(Binary::Iadd, a, b)) => {
-                let ty = func.ty(value);
-                let (fa, fb) = (self.refined_fact(func, ranges, a, depth + 1), self.refined_fact(func, ranges, b, depth + 1));
-                if let Some(hi) = fa.hi.checked_add(fb.hi).filter(|&h| h <= ty.unsigned_max()) {
-                    fact = fact.meet(&Fact::range(fa.lo + fb.lo, hi));
-                }
-            }
-            _ => {}
-        }
-        fact
+    /// Records a symbolic `kind(lhs, rhs)` relation on `ty`.
+    pub(super) fn push_rel_kind(&mut self, kind: RelKind, lhs: Value, rhs: Value, ty: Type) {
+        self.push_rel(Rel { kind, lhs, rhs, ty });
     }
+
+    /// Returns whether `x + y` was previously proven not to wrap.
+    pub(super) fn has_no_wrap_add(&self, x: Value, y: Value) -> bool {
+        let pair = if x.index() <= y.index() { (x, y) } else { (y, x) };
+        self.no_wrap_adds.contains(&pair)
+    }
+
 
     /// Records that the branch on `condition` went the `taken` way: the condition is nonzero or zero, and the integer compare or boolean op that defines it held or failed.
     pub(super) fn assume(&mut self, func: &Function, ranges: &Ranges, condition: Value, taken: bool) {
@@ -130,7 +121,7 @@ impl Path {
             return;
         }
         if let Some(truth) = compared_range(IntCC::NotEqual, ty, &Fact::range(0, 0), taken) {
-            self.add(ranges, condition, truth);
+            self.add_with_backprop(func, ranges, condition, truth, 0);
         }
         match ranges.op(func, condition) {
             Some(&Op::Binary(Binary::Band, a, b)) if taken => {
@@ -160,10 +151,10 @@ impl Path {
                         self.no_wrap_adds.push(pair);
                     }
                     if let Some(k) = self.fact(ranges, y).exact() {
-                        self.add(ranges, x, Fact::range(0, op_ty.unsigned_max() - k));
+                        self.add_with_backprop(func, ranges, x, Fact::range(0, op_ty.unsigned_max() - k), 0);
                     }
                     if let Some(k) = self.fact(ranges, x).exact() {
-                        self.add(ranges, y, Fact::range(0, op_ty.unsigned_max() - k));
+                        self.add_with_backprop(func, ranges, y, Fact::range(0, op_ty.unsigned_max() - k), 0);
                     }
                 }
             }
@@ -174,9 +165,9 @@ impl Path {
                         self.push_rel(Rel { kind: RelKind::Ule, lhs: y, rhs: x, ty: op_ty });
                     }
                     let fy = self.fact(ranges, y);
-                    self.add(ranges, x, Fact::range(fy.lo, op_ty.unsigned_max()));
+                    self.add_with_backprop(func, ranges, x, Fact::range(fy.lo, op_ty.unsigned_max()), 0);
                     let fx = self.fact(ranges, x);
-                    self.add(ranges, y, Fact::range(0, fx.hi));
+                    self.add_with_backprop(func, ranges, y, Fact::range(0, fx.hi), 0);
                 }
             }
             Some(&Op::Icmp(cc, x, y)) => {
@@ -191,10 +182,10 @@ impl Path {
                 };
                 if !order.is_signed() {
                     if let Some(fact) = compared_range(order, operand_ty, &right, taken) {
-                        self.add(ranges, x, fact);
+                        self.add_with_backprop(func, ranges, x, fact, 0);
                     }
                     if let Some(fact) = compared_range(swapped(order), operand_ty, &left, taken) {
-                        self.add(ranges, y, fact);
+                        self.add_with_backprop(func, ranges, y, fact, 0);
                     }
                 }
                 if x != y {
@@ -207,9 +198,12 @@ impl Path {
         }
     }
 
-    fn reaches(&self, ty: Type, start: Value, target: Value, (strict_k, weak_k): (RelKind, RelKind), require_strict: bool) -> bool {
+    pub(super) fn reaches(&self, ty: Type, start: Value, target: Value, kinds: (RelKind, RelKind), require_strict: bool) -> bool {
         if start == target {
             return !require_strict;
+        }
+        if self.rels.is_empty() {
+            return false;
         }
         let mut seen: Vec<(Value, bool)> = vec![(start, false)];
         let mut idx = 0;
@@ -217,97 +211,22 @@ impl Path {
             let (cur, cur_strict) = seen[idx];
             idx += 1;
             for &r in &self.rels {
-                if r.ty != ty {
-                    continue;
-                }
-                let (next, step_strict) = if r.kind == RelKind::Eq && r.lhs == cur {
-                    (r.rhs, false)
-                } else if r.kind == RelKind::Eq && r.rhs == cur {
-                    (r.lhs, false)
-                } else if r.lhs == cur && r.kind == strict_k {
-                    (r.rhs, true)
-                } else if r.lhs == cur && r.kind == weak_k {
-                    (r.rhs, false)
-                } else {
+                let Some((next, step_strict)) = rel_step(r, cur, ty, kinds) else {
                     continue;
                 };
                 let next_strict = cur_strict || step_strict;
                 if next == target && (!require_strict || next_strict) {
                     return true;
                 }
-                if let Some(entry) = seen.iter_mut().find(|(v, _)| *v == next) {
-                    if next_strict && !entry.1 {
-                        entry.1 = true;
-                        seen.push((next, true));
+                if seen.len() < 16 {
+                    if let Some(entry) = seen.iter_mut().find(|(v, _)| *v == next) {
+                        if next_strict && !entry.1 {
+                            entry.1 = true;
+                            seen.push((next, true));
+                        }
+                    } else {
+                        seen.push((next, next_strict));
                     }
-                } else {
-                    seen.push((next, next_strict));
-                }
-            }
-        }
-        false
-    }
-
-    fn add_const(&self, func: &Function, ranges: &Ranges, val: Value) -> Option<(Value, u64)> {
-        let &Op::Binary(Binary::Iadd, p, q) = ranges.op(func, val)? else { return None };
-        [(p, q), (q, p)].into_iter().find_map(|(base, c)| self.fact(ranges, c).exact().map(|k| (base, k)))
-    }
-
-    fn is_no_wrap_pair(&self, ranges: &Ranges, ty: Type, base: Value, c: Value, k: u64) -> bool {
-        let pair = if base.index() <= c.index() { (base, c) } else { (c, base) };
-        self.no_wrap_adds.contains(&pair)
-            || self.fact(ranges, base).hi.checked_add(k).is_some_and(|hi| hi <= ty.unsigned_max())
-    }
-
-    fn non_wrap_iadd(&self, func: &Function, ranges: &Ranges, val: Value, ty: Type) -> Option<(Value, u64)> {
-        let &Op::Binary(Binary::Iadd, p, q) = ranges.op(func, val)? else { return None };
-        for (base, c) in [(p, q), (q, p)] {
-            if let Some(k) = self.fact(ranges, c).exact()
-                && self.is_no_wrap_pair(ranges, ty, base, c, k)
-            {
-                return Some((base, k));
-            }
-        }
-        None
-    }
-
-    fn proves_add_rel(&self, func: &Function, ranges: &Ranges, ty: Type, a: Value, b: Value, strict: bool) -> bool {
-        let a_forms = [Some((a, 0_u64)), self.add_const(func, ranges, a)];
-        let mut upper_terms: Vec<(Value, Value, u64)> = Vec::new();
-        if let Some((b_base, k)) = self.non_wrap_iadd(func, ranges, b, ty) {
-            upper_terms.push((b, b_base, k));
-        }
-        for &r in &self.rels {
-            if r.ty != ty {
-                continue;
-            }
-            let candidates = match r.kind {
-                RelKind::Ult | RelKind::Ule => [Some(r.lhs), None],
-                RelKind::Eq => [Some(r.lhs), Some(r.rhs)],
-                _ => [None, None],
-            };
-            for s in candidates.into_iter().flatten() {
-                upper_terms.push((s, s, 0));
-                if let Some((s_base, k)) = self.non_wrap_iadd(func, ranges, s, ty) {
-                    upper_terms.push((s, s_base, k));
-                }
-            }
-        }
-        for (a_base, c) in a_forms.into_iter().flatten() {
-            for &(s, s_base, k) in &upper_terms {
-                if !self.reaches(ty, a_base, s_base, (RelKind::Ult, RelKind::Ule), false) {
-                    continue;
-                }
-                if strict {
-                    if (c < k && self.reaches(ty, s, b, (RelKind::Ult, RelKind::Ule), false))
-                        || (c <= k && self.reaches(ty, s, b, (RelKind::Ult, RelKind::Ule), true))
-                    {
-                        return true;
-                    }
-                } else if (c <= k && self.reaches(ty, s, b, (RelKind::Ult, RelKind::Ule), false))
-                    || (k.checked_add(1) == Some(c) && self.reaches(ty, s, b, (RelKind::Ult, RelKind::Ule), true))
-                {
-                    return true;
                 }
             }
         }
@@ -484,14 +403,19 @@ pub(super) fn fits_truth(func: &Function, ranges: &Ranges, path: &Path, op: Bina
     let (fx, fy) = (path.refined_fact(func, ranges, x, 0), path.refined_fact(func, ranges, y, 0));
     if !signed {
         let max = ty.unsigned_max();
-        let x_hi = if fx.hi == max && path.has_strict_upper_expr(func, ranges, ty, x, 0) { max - 1 } else { fx.hi };
-        let y_hi = if fy.hi == max && path.has_strict_upper_expr(func, ranges, ty, y, 0) { max - 1 } else { fy.hi };
+        let strict_upper = |v, f: &Fact| {
+            if f.hi == max && path.has_strict_upper_expr(func, ranges, ty, v, 0) { max - 1 } else { f.hi }
+        };
+        let (x_hi, y_hi) = (strict_upper(x, &fx), strict_upper(y, &fy));
+        let tight = |v, hi: u64| if path.rels.is_empty() { hi } else { hi.min(path.upper_bound(func, ranges, ty, v, 0)) };
         return match op {
             Binary::Iadd => {
-                if x_hi.checked_add(y_hi).is_some_and(|sum| sum <= max) {
+                if path.has_no_wrap_add(x, y) || x_hi.checked_add(y_hi).is_some_and(|sum| sum <= max) {
                     Some(true)
                 } else if fx.lo.checked_add(fy.lo).is_none_or(|sum| sum > max) {
                     Some(false)
+                } else if !path.rels.is_empty() && tight(x, x_hi).checked_add(tight(y, y_hi)).is_some_and(|sum| sum <= max) {
+                    Some(true)
                 } else {
                     None
                 }
@@ -501,12 +425,18 @@ pub(super) fn fits_truth(func: &Function, ranges: &Ranges, path: &Path, op: Bina
                     Some(true)
                 } else if x_hi < fy.lo || path.proves(func, ranges, IntCC::UnsignedLessThan, ty, x, y) {
                     Some(false)
+                } else if !path.rels.is_empty() && fx.lo >= tight(y, y_hi) {
+                    Some(true)
+                } else if !path.rels.is_empty() && tight(x, x_hi) < fy.lo {
+                    Some(false)
                 } else {
                     None
                 }
             }
             Binary::Imul => {
-                if x_hi.checked_mul(y_hi).is_some_and(|prod| prod <= max) {
+                if x_hi.checked_mul(y_hi).is_some_and(|prod| prod <= max)
+                    || (!path.rels.is_empty() && tight(x, x_hi).checked_mul(tight(y, y_hi)).is_some_and(|prod| prod <= max))
+                {
                     Some(true)
                 } else if fx.lo.checked_mul(fy.lo).is_none_or(|prod| prod > max) {
                     Some(false)

@@ -1,3 +1,4 @@
+mod backprop;
 mod loops;
 mod rel;
 
@@ -643,6 +644,12 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
                 ),
                 None => (Path::default(), ExtraPath::default(), DomState::default()),
             };
+            for inv in &env.rel_invs {
+                if inv.head == block {
+                    let kind = if inv.strict { RelKind::Ult } else { RelKind::Ule };
+                    path.push_rel_kind(kind, inv.param, inv.bound, inv.ty);
+                }
+            }
             for &inst in &func.blocks[block.index()].insts {
                 settle_one(func, (&cfg, &ranges, &env, &mut path, &mut extra, &mut dom, &selects, block, &seen), inst, (&mut decided, &mut compares, &mut rewrites));
                 let data = &func.insts[inst.index()];
