@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use haste_codegen::{Code, RelocKind, StencilReloc, Target};
@@ -14,6 +14,20 @@ use crate::names::ItemRef;
 use crate::sync::lock;
 
 use super::Image;
+
+const FN_ALIGN: u32 = 64;
+const FN_ALIGN_ENV: &str = "HASTE_FN_ALIGN";
+
+fn fn_align() -> u32 {
+    static ALIGN: OnceLock<u32> = OnceLock::new();
+    *ALIGN.get_or_init(|| std::env::var(FN_ALIGN_ENV).ok().and_then(|v| v.parse().ok()).filter(|a: &u32| a.is_power_of_two() && *a >= 16).unwrap_or(FN_ALIGN))
+}
+
+fn place(exe: &mut Executable, bytes: &[u8]) -> u32 {
+    let end = exe.text(&[]);
+    exe.text(&vec![0u8; (end.next_multiple_of(fn_align()) - end) as usize]);
+    exe.text(bytes)
+}
 
 #[derive(Clone)]
 pub(super) struct AotCode {
@@ -340,6 +354,7 @@ fn for_each_fn_edge(entry: &AotFn, mut on_edge: impl FnMut(FnEdge<'_>)) {
 
 pub(super) struct AotReach {
     fns: Vec<bool>,
+    order: Vec<usize>,
     rodata: Vec<bool>,
     vtables: Vec<bool>,
     slots: HashSet<usize>,
@@ -355,6 +370,7 @@ impl AotReach {
     pub(super) fn new(len: usize, roots: [usize; 2]) -> Self {
         let mut this = Self {
             fns: vec![false; len],
+            order: Vec::new(),
             rodata: Vec::new(),
             vtables: Vec::new(),
             slots: HashSet::default(),
@@ -383,6 +399,7 @@ impl AotReach {
     fn mark_fn(&mut self, idx: usize) {
         if idx < self.fns.len() && !self.fns[idx] {
             self.fns[idx] = true;
+            self.order.push(idx);
             self.work_fns.push(idx);
         }
     }
@@ -500,18 +517,15 @@ impl SymTable<'_> {
     }
 }
 
-fn emit_dict_bodies(state: &AotState, live_fns: &[bool], exe: &mut Executable) -> Result<HashMap<usize, u32>> {
+fn emit_dict_bodies(state: &AotState, order: &[usize], exe: &mut Executable) -> Result<HashMap<usize, u32>> {
     let mut dict_bodies: HashMap<usize, u32> = HashMap::default();
-    for (idx, item) in state.functions.iter().enumerate() {
-        if !live_fns[idx] {
-            continue;
-        }
-        let Some(AotFn::Dict { body, .. }) = item else { continue };
+    for &idx in order {
+        let Some(AotFn::Dict { body, .. }) = &state.functions[idx] else { continue };
         let key = Arc::as_ptr(body) as usize;
         if dict_bodies.contains_key(&key) {
             continue;
         }
-        let off = exe.text(body.bytes());
+        let off = place(exe, body.bytes());
         for reloc in body.relocs() {
             let rt = reloc.as_runtime().context("dict body contains non-runtime relocation")?;
             exe.patch(off + reloc.offset, reloc.kind, Symbol::Runtime(rt));
@@ -606,44 +620,36 @@ fn fold_direct_functions(state: &AotState, live_fns: &[bool], syms: &SymTable<'_
     Ok(canon)
 }
 
-fn emit_functions(state: &AotState, live_fns: &[bool], target: &Target, syms: &SymTable<'_>, dict_bodies: &HashMap<usize, u32>, exe: &mut Executable) -> Result<Vec<Option<u32>>> {
+fn emit_functions(state: &AotState, live: &AotReach, target: &Target, syms: &SymTable<'_>, dict_bodies: &HashMap<usize, u32>, exe: &mut Executable) -> Result<Vec<Option<u32>>> {
     let roots = alias_roots(&state.functions);
-    let canon = fold_direct_functions(state, live_fns, syms, &roots)?;
+    let canon = fold_direct_functions(state, &live.fns, syms, &roots)?;
     let mut fn_offs = vec![None; state.functions.len()];
-    let mut folded = Vec::new();
     let mut pending = Vec::new();
-    for (idx, item) in state.functions.iter().enumerate() {
-        if !live_fns[idx] {
-            continue;
-        }
-        match item {
-            Some(AotFn::Direct { code, relocs }) => {
-                if canon[idx] != idx {
-                    folded.push((idx, canon[idx]));
-                    continue;
+    for &idx in &live.order {
+        let leader = canon[roots[idx]];
+        if fn_offs[leader].is_none() {
+            match &state.functions[leader] {
+                Some(AotFn::Direct { code, relocs }) => {
+                    let off = place(exe, code.bytes());
+                    fn_offs[leader] = Some(off);
+                    pending.push((off, code, relocs));
                 }
-                let off = exe.text(code.bytes());
-                fn_offs[idx] = Some(off);
-                pending.push((off, code, relocs));
-            }
-            Some(AotFn::Dict { body, relocs }) => {
-                let dict_off = exe.rodata(&vec![0u8; relocs.len() * 8], 8);
-                for (i, reloc) in relocs.iter().enumerate() {
-                    exe.pointer(true, dict_off + (i * 8) as u32, syms.translate(reloc)?);
+                Some(AotFn::Dict { body, relocs }) => {
+                    let dict_off = exe.rodata(&vec![0u8; relocs.len() * 8], 8);
+                    for (i, reloc) in relocs.iter().enumerate() {
+                        exe.pointer(true, dict_off + (i * 8) as u32, syms.translate(reloc)?);
+                    }
+                    let stub = target.dict_entry_stub(0, 1usize << 40, 0, None)?;
+                    let [(dict_rel, dict_kind), (body_rel, body_kind)] = target.dict_stub_relocs()?;
+                    let off = exe.text(&stub);
+                    fn_offs[leader] = Some(off);
+                    let body_off = dict_bodies[&(Arc::as_ptr(body) as usize)];
+                    exe.patch(off + dict_rel, dict_kind, Symbol::Rodata(dict_off));
+                    exe.patch(off + body_rel, body_kind, Symbol::Text(body_off));
                 }
-                let stub = target.dict_entry_stub(0, 1usize << 40, 0, None)?;
-                let [(dict_rel, dict_kind), (body_rel, body_kind)] = target.dict_stub_relocs()?;
-                let off = exe.text(&stub);
-                fn_offs[idx] = Some(off);
-                let body_off = dict_bodies[&(Arc::as_ptr(body) as usize)];
-                exe.patch(off + dict_rel, dict_kind, Symbol::Rodata(dict_off));
-                exe.patch(off + body_rel, body_kind, Symbol::Text(body_off));
+                Some(AotFn::Alias(_)) | None => {}
             }
-            Some(AotFn::Alias(_)) => folded.push((idx, canon[roots[idx]])),
-            None => {}
         }
-    }
-    for (idx, leader) in folded {
         fn_offs[idx] = fn_offs[leader];
     }
     for (off, code, relocs) in pending {
@@ -738,8 +744,8 @@ impl Image {
             promoted_syms: &promoted_syms,
             thread_slots: &thread_slots,
         };
-        let dict_bodies = emit_dict_bodies(&state, &live.fns, &mut exe)?;
-        let fn_offs = emit_functions(&state, &live.fns, target, &syms, &dict_bodies, &mut exe)?;
+        let dict_bodies = emit_dict_bodies(&state, &live.order, &mut exe)?;
+        let fn_offs = emit_functions(&state, &live, target, &syms, &dict_bodies, &mut exe)?;
 
         for (id, entries) in state.vtables.iter().enumerate() {
             let Some(base) = vtable_offs[id] else { continue };
@@ -764,9 +770,9 @@ impl Image {
         };
         exe.entry(start_off, main_off);
         let mut named: HashMap<u32, usize> = HashMap::default();
-        for (index, off) in fn_offs.iter().enumerate() {
-            if let Some(off) = off {
-                named.entry(*off).or_insert(index);
+        for &index in &live.order {
+            if let Some(off) = fn_offs[index] {
+                named.entry(off).or_insert(index);
             }
         }
         exe.symbols(named.into_iter().map(|(off, index)| (off, label(index))).collect());
