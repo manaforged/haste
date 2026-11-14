@@ -165,20 +165,84 @@ fn materialize_concat_half(func: &mut Function, state: &mut State<'_>, kept: &mu
     }
 }
 
-fn forward_concat(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, known: &KnownLoads, inst: Inst, loc: MemLoc, ty: Type) -> bool {
-    if !matches!(ty, Type::I64 | Type::F64) {
-        return false;
+enum Word64Plan {
+    Val(Value),
+    Bitcast(Value),
+    Const(i64),
+    Pair32(ConcatHalf, ConcatHalf),
+}
+
+fn plan_word64(func: &Function, known: &KnownLoads, loc: MemLoc, offset: i64, consts: &[Option<i64>]) -> Option<Word64Plan> {
+    if let Some(v) = known.get(loc.base, offset, Type::I64) {
+        return Some(Word64Plan::Val(v));
     }
-    let Some(hi_off) = loc.offset.checked_add(4) else { return false };
-    let Some(lo_half) = resolve_concat_half(known, loc, loc.offset, state.consts) else { return false };
-    let Some(hi_half) = resolve_concat_half(known, loc, hi_off, state.consts) else { return false };
+    if let Some(v) = known.get(loc.base, offset, Type::F64) {
+        return Some(Word64Plan::Bitcast(v));
+    }
+    if let Some(&(_, _, v)) = known.entries_for(loc.base).iter().find(|&&(off, kty, _)| off == offset && kty.is_vector() && kty.bytes() == 8) {
+        return Some(Word64Plan::Bitcast(v));
+    }
+    let slice = MemLoc { offset, size: 8, ..loc };
+    if let Some(imm) = rodata_const(func, slice, Type::I64) {
+        return Some(Word64Plan::Const(imm));
+    }
+    if let Some(Assembled::Int(imm)) = assemble_const(known, slice, Type::I64, consts) {
+        return Some(Word64Plan::Const(imm));
+    }
+    let hi_off = offset.checked_add(4)?;
+    let lo_half = resolve_concat_half(known, loc, offset, consts)?;
+    let hi_half = resolve_concat_half(known, loc, hi_off, consts)?;
+    Some(Word64Plan::Pair32(lo_half, hi_half))
+}
+
+fn emit_pack32_op(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, lo_half: ConcatHalf, hi_half: ConcatHalf) -> Op {
     let lo32 = materialize_concat_half(func, state, kept, lo_half);
     let hi32 = materialize_concat_half(func, state, kept, hi_half);
     let lo64 = emit_op(func, state, kept, Type::I64, Op::Convert(Convert::Uextend, lo32));
     let hi64 = emit_op(func, state, kept, Type::I64, Op::Convert(Convert::Uextend, hi32));
     let c32 = emit_op(func, state, kept, Type::I64, Op::Const(32));
     let hi_shifted = emit_op(func, state, kept, Type::I64, Op::Binary(Binary::Ishl, hi64, c32));
-    let combined = Op::Binary(Binary::Bor, lo64, hi_shifted);
+    Op::Binary(Binary::Bor, lo64, hi_shifted)
+}
+
+fn materialize_word64(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, plan: Word64Plan) -> Value {
+    match plan {
+        Word64Plan::Val(v) => find(state.subst, v),
+        Word64Plan::Bitcast(v) => emit_op(func, state, kept, Type::I64, Op::Convert(Convert::Bitcast, find(state.subst, v))),
+        Word64Plan::Const(imm) => emit_op(func, state, kept, Type::I64, Op::Const(imm)),
+        Word64Plan::Pair32(lo, hi) => {
+            let op = emit_pack32_op(func, state, kept, lo, hi);
+            emit_op(func, state, kept, Type::I64, op)
+        }
+    }
+}
+
+fn forward_concat(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, known: &KnownLoads, inst: Inst, loc: MemLoc, ty: Type) -> bool {
+    if ty.is_vector() && ty.bytes() == 16 {
+        let Some(hi_off) = loc.offset.checked_add(8) else { return false };
+        let Some(lo_plan) = plan_word64(func, known, loc, loc.offset, state.consts) else { return false };
+        let Some(hi_plan) = plan_word64(func, known, loc, hi_off, state.consts) else { return false };
+        let lo64 = materialize_word64(func, state, kept, lo_plan);
+        let hi64 = materialize_word64(func, state, kept, hi_plan);
+        let vec64 = Type::Vec { lane: Lane::I64, count: 2 };
+        let zero = emit_op(func, state, kept, vec64, Op::Const(0));
+        let half = emit_op(func, state, kept, vec64, Op::Insert(zero, lo64, 0));
+        let insert = Op::Insert(half, hi64, 1);
+        if ty == vec64 {
+            func.insts[inst.index()].op = insert;
+        } else {
+            let full = emit_op(func, state, kept, vec64, insert);
+            func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, full);
+        }
+        return true;
+    }
+    if !(matches!(ty, Type::I64 | Type::F64) || (ty.is_vector() && ty.bytes() == 8)) {
+        return false;
+    }
+    let Some(hi_off) = loc.offset.checked_add(4) else { return false };
+    let Some(lo_half) = resolve_concat_half(known, loc, loc.offset, state.consts) else { return false };
+    let Some(hi_half) = resolve_concat_half(known, loc, hi_off, state.consts) else { return false };
+    let combined = emit_pack32_op(func, state, kept, lo_half, hi_half);
     if ty == Type::I64 {
         func.insts[inst.index()].op = combined;
     } else {
@@ -186,6 +250,14 @@ fn forward_concat(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Opt
         func.insts[inst.index()].op = Op::Convert(Convert::Bitcast, word);
     }
     true
+}
+
+fn copy_len(op: &Op, consts: &[Option<i64>]) -> Option<(Value, Value, u32)> {
+    match *op {
+        Op::Move(dst, src, bytes) => Some((dst, src, bytes)),
+        Op::Copy(dst, src, len) => consts.get(len.index()).copied().flatten().and_then(|n| u32::try_from(n).ok()).map(|b| (dst, src, b)),
+        _ => None,
+    }
 }
 
 fn is_silent_store(known: &KnownLoads, loc: MemLoc, ty: Type, value: Value, consts: &[Option<i64>]) -> bool {
@@ -220,27 +292,30 @@ fn scan(
     let mut clobbers_seen = Vec::new();
     let (mut changed, mut renamed) = (false, false);
     for inst in insts {
-        match func.insts[inst.index()].op {
-            Op::Move(_, from, bytes) => {
+        if let Some((_, from, bytes)) = copy_len(&func.insts[inst.index()].op, state.consts) {
+            if bytes > 0 {
                 let read_loc = addr_loc(state.prov, state.subst, from, 0, bytes);
                 bufs.pending_stores.retain(|&(ploc, _)| !may_alias(read_loc, ploc, state.prov));
                 bufs.const_stores.retain(|cs| !may_alias(read_loc, cs.loc, state.prov));
             }
-            Op::Copy(_, from, _) => {
-                let r = addr_loc(state.prov, state.subst, from, 0, u32::MAX);
-                let ok = |l: MemLoc| l.base != r.base && (l.root == MemRoot::Unknown || l.root != r.root) && !may_alias(r, l, state.prov);
-                bufs.pending_stores.retain(|&(p, _)| ok(p));
-                bufs.const_stores.retain(|cs| ok(cs.loc));
+        } else {
+            match func.insts[inst.index()].op {
+                Op::Copy(_, from, _) => {
+                    let r = addr_loc(state.prov, state.subst, from, 0, u32::MAX);
+                    let ok = |l: MemLoc| l.base != r.base && (l.root == MemRoot::Unknown || l.root != r.root) && !may_alias(r, l, state.prov);
+                    bufs.pending_stores.retain(|&(p, _)| ok(p));
+                    bufs.const_stores.retain(|cs| ok(cs.loc));
+                }
+                Op::Trap | Op::Trapz(_) => {
+                    bufs.pending_stores.retain(|&(ploc, _)| slot_unescaped(state.prov, ploc));
+                    bufs.const_stores.retain(|cs| slot_unescaped(state.prov, cs.loc));
+                }
+                Op::TryCall { .. } => {
+                    bufs.pending_stores.clear();
+                    bufs.const_stores.clear();
+                }
+                _ => {}
             }
-            Op::Trap | Op::Trapz(_) => {
-                bufs.pending_stores.retain(|&(ploc, _)| slot_unescaped(state.prov, ploc));
-                bufs.const_stores.retain(|cs| slot_unescaped(state.prov, cs.loc));
-            }
-            Op::TryCall { .. } => {
-                bufs.pending_stores.clear();
-                bufs.const_stores.clear();
-            }
-            _ => {}
         }
         match effect(func, state, inst) {
             Effect::Read(loc, ty, result) => {
@@ -281,7 +356,6 @@ fn scan(
                         known.remember(loc, ty, result);
                         changed = true;
                     } else if let Op::Load(addr, offset) = func.insts[inst.index()].op
-                        && !ty.is_vector()
                         && ty != Type::I128
                         && let Some(&(c, ptr_a, ptr_b)) = state.selects.get(find(state.subst, addr).index()).and_then(Option::as_ref)
                         && !func.ty(c).is_vector()
@@ -360,16 +434,61 @@ fn scan(
                 }
             }
             Effect::Unknown => {
-                clobbers_seen.push(match func.insts[inst.index()].op {
-                    Op::Move(dst, _, bytes) => BlockClobber::Loc(addr_loc(state.prov, state.subst, dst, 0, bytes)),
-                    Op::Copy(dst, _, _) => BlockClobber::CopyLoc(addr_loc(state.prov, state.subst, dst, 0, u32::MAX)),
-                    _ => BlockClobber::Op(inst),
+                let mut copy_remaps: Option<(MemLoc, Vec<(i64, Type, Value)>)> = None;
+                let canon_move = copy_len(&func.insts[inst.index()].op, state.consts).map(|(dst, src, bytes)| {
+                    let dst_loc = addr_loc(state.prov, state.subst, dst, 0, bytes);
+                    if bytes > 0 {
+                        clobbers_seen.push(BlockClobber::Loc(dst_loc));
+                        let src_loc = addr_loc(state.prov, state.subst, src, 0, bytes);
+                        if !may_alias(dst_loc, src_loc, state.prov)
+                            && let Some(src_end) = src_loc.offset.checked_add(i64::from(bytes))
+                        {
+                            let copied = known
+                                .entries_for(src_loc.base)
+                                .iter()
+                                .filter_map(|&(off, kty, kval)| {
+                                    (off >= src_loc.offset && off.checked_add(i64::from(kty.bytes())).is_some_and(|e| e <= src_end))
+                                        .then(|| dst_loc.offset.checked_add(off - src_loc.offset).map(|d_off| (d_off, kty, find(state.subst, kval))))
+                                        .flatten()
+                                })
+                                .collect::<Vec<_>>();
+                            if !copied.is_empty() {
+                                copy_remaps = Some((dst_loc, copied));
+                            }
+                        }
+                    }
+                    (bytes, Op::Move(find(state.subst, dst), find(state.subst, src), bytes))
                 });
-                let op = &func.insts[inst.index()].op;
-                invalidate_preserving(func, known, bases, op, state.prov);
+                if let Some((0, _)) = canon_move {
+                    bufs.kept.push(Some(inst));
+                    continue;
+                }
+                let clobber_op = match canon_move {
+                    Some((_, ref m)) => m,
+                    None => {
+                        clobbers_seen.push(match func.insts[inst.index()].op {
+                            Op::Copy(dst, _, _) => BlockClobber::CopyLoc(addr_loc(state.prov, state.subst, dst, 0, u32::MAX)),
+                            _ => BlockClobber::Op(inst),
+                        });
+                        &func.insts[inst.index()].op
+                    }
+                };
+                invalidate_preserving(func, known, bases, clobber_op, state.prov);
+                if let Some((bytes, _)) = canon_move
+                    && let Some((dst_loc, copied)) = copy_remaps
+                    && let Some(dst_end) = dst_loc.offset.checked_add(i64::from(bytes))
+                    && known.entries_for(dst_loc.base).iter().all(|&(o, t, _)| {
+                        o.checked_add(i64::from(t.bytes())).is_some_and(|e| e <= dst_loc.offset) || o >= dst_end
+                    })
+                {
+                    for (dst_off, kty, kval) in copied {
+                        known.remember(MemLoc::new(dst_loc.root, dst_loc.base, dst_off, kty.bytes()), kty, kval);
+                    }
+                    record_base(bases, dst_loc);
+                }
                 let keep_fn = |ploc: MemLoc| match ploc.root {
                     MemRoot::Slot(s) => state.prov.slot_unescaped(s),
-                    MemRoot::NoAliasParam(p) => !dom::clobbers_loc(func, op, ploc, state.prov) && state.prov.noalias_unescaped(p),
+                    MemRoot::NoAliasParam(p) => !dom::clobbers_loc(func, clobber_op, ploc, state.prov) && state.prov.noalias_unescaped(p),
                     _ => false,
                 };
                 bufs.pending_stores.retain(|&(ploc, _)| keep_fn(ploc));

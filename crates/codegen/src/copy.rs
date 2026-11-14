@@ -1,4 +1,4 @@
-use crate::ir::{Function, Inst, Op, Type, Value};
+use crate::ir::{Function, Inst, Lane, Op, Type, Value};
 
 /// The most bytes a move is emitted inline with; a larger one calls `memmove`.
 pub(crate) const MOVE_INLINE: u32 = 64;
@@ -16,6 +16,21 @@ pub(crate) fn words(bytes: u32) -> Vec<(Type, u32)> {
         at += ty.bytes();
     }
     words
+}
+
+/// The vector-first types and offsets of each load and store that copy `bytes` bytes, using 16-byte vectors before `words`.
+pub(crate) fn vec_words(bytes: u32) -> Vec<(Type, u32)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    let vec_ty = Type::Vec { lane: Lane::I8, count: 16 };
+    while bytes - at >= 16 {
+        out.push((vec_ty, at));
+        at += 16;
+    }
+    if at < bytes {
+        out.extend(words(bytes - at).into_iter().map(|(ty, off)| (ty, at + off)));
+    }
+    out
 }
 
 /// The integer types and offsets of the loads and stores that copy `bytes` bytes inline, widest first, up to `MOVE_INLINE`.

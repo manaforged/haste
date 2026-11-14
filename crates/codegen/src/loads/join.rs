@@ -1,7 +1,7 @@
 use super::dom::{clobbers_loc, loc_immutable};
 use super::{Assembled, State, assemble_const, emit_op};
 use crate::cfg::Cfg;
-use crate::ir::{Binary, Block, Convert, Function, Inst, Op, Type, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, Lane, Op, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, may_alias};
 use crate::merge::find;
 
@@ -31,18 +31,63 @@ pub(super) fn int_of(ty: Type) -> Option<Type> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct SubwordPlan {
-    kty: Type,
-    kval: Value,
-    target_int: Type,
-    k_int: Type,
-    shift: i64,
-    need_reduce: bool,
-    bitcast_out: bool,
+pub(super) enum SubwordPlan {
+    Int {
+        kty: Type,
+        kval: Value,
+        target_int: Type,
+        k_int: Type,
+        shift: i64,
+        need_reduce: bool,
+        bitcast_out: bool,
+    },
+    VecBitcast {
+        kval: Value,
+    },
+    VecExtract {
+        kty: Type,
+        kval: Value,
+        lane_vec: Type,
+        lane_idx: u8,
+        out_vec: Option<Type>,
+    },
 }
 
 impl SubwordPlan {
+    pub(super) fn kval(self) -> Value {
+        match self {
+            Self::Int { kval, .. } | Self::VecBitcast { kval } | Self::VecExtract { kval, .. } => kval,
+        }
+    }
+
     pub(super) fn new(loc_offset: i64, ty: Type, koff: i64, kty: Type, kval: Value) -> Option<Self> {
+        if koff == loc_offset && kty.bytes() == ty.bytes() && ty != kty && (ty.is_vector() || kty.is_vector()) {
+            let ok = (ty.is_vector() && kty.is_vector())
+                || (ty.bytes() == 8 && (matches!(ty, Type::I64 | Type::F64) || matches!(kty, Type::I64 | Type::F64)));
+            return ok.then_some(Self::VecBitcast { kval });
+        }
+        if kty.is_vector() {
+            let ty_end = loc_offset.checked_add(i64::from(ty.bytes()))?;
+            let k_end = koff.checked_add(i64::from(kty.bytes()))?;
+            if loc_offset < koff || ty_end > k_end {
+                return None;
+            }
+            if let Some(lane) = Lane::from_type(ty) {
+                let lbytes = i64::from(lane.bytes());
+                if (loc_offset - koff) % lbytes != 0 {
+                    return None;
+                }
+                let lane_vec = Type::Vec { lane, count: (kty.bytes() / lane.bytes()) as u8 };
+                let lane_idx = ((loc_offset - koff) / lbytes) as u8;
+                return Some(Self::VecExtract { kty, kval, lane_vec, lane_idx, out_vec: None });
+            }
+            if ty.is_vector() && ty.bytes() == 8 && kty.bytes() == 16 && (loc_offset - koff) % 8 == 0 {
+                let lane_vec = Type::Vec { lane: Lane::I64, count: 2 };
+                let lane_idx = ((loc_offset - koff) / 8) as u8;
+                return Some(Self::VecExtract { kty, kval, lane_vec, lane_idx, out_vec: Some(ty) });
+            }
+            return None;
+        }
         let target_int = int_of(ty)?;
         let k_int = int_of(kty)?;
         let shift = (loc_offset - koff) * 8;
@@ -52,48 +97,65 @@ impl SubwordPlan {
         if !(kty.is_float() || need_shift || need_reduce || bitcast_out) {
             return None;
         }
-        Some(Self { kty, kval, target_int, k_int, shift, need_reduce, bitcast_out })
+        Some(Self::Int { kty, kval, target_int, k_int, shift, need_reduce, bitcast_out })
     }
 
     pub(super) fn build_op(self, mut emit: impl FnMut(Type, Op) -> Value) -> Op {
-        let mut cur = self.kval;
-        let need_shift = self.shift > 0;
-        if self.kty.is_float() {
-            let op = Op::Convert(Convert::Bitcast, cur);
-            if !need_shift && !self.need_reduce && !self.bitcast_out {
-                return op;
+        match self {
+            Self::VecBitcast { kval } => Op::Convert(Convert::Bitcast, kval),
+            Self::VecExtract { kty, kval, lane_vec, lane_idx, out_vec } => {
+                let src = if kty == lane_vec { kval } else { emit(lane_vec, Op::Convert(Convert::Bitcast, kval)) };
+                let extract = Op::Extract(src, lane_idx);
+                if out_vec.is_some() {
+                    let raw = emit(Type::I64, extract);
+                    Op::Convert(Convert::Bitcast, raw)
+                } else {
+                    extract
+                }
             }
-            cur = emit(self.k_int, op);
-        }
-        if need_shift {
-            let sh = emit(self.k_int, Op::Const(self.shift));
-            let op = Op::Binary(Binary::Ushr, cur, sh);
-            if !self.need_reduce && !self.bitcast_out {
-                return op;
+            Self::Int { kty, kval, target_int, k_int, shift, need_reduce, bitcast_out } => {
+                let mut cur = kval;
+                let need_shift = shift > 0;
+                if kty.is_float() {
+                    let op = Op::Convert(Convert::Bitcast, cur);
+                    if !need_shift && !need_reduce && !bitcast_out {
+                        return op;
+                    }
+                    cur = emit(k_int, op);
+                }
+                if need_shift {
+                    let sh = emit(k_int, Op::Const(shift));
+                    let op = Op::Binary(Binary::Ushr, cur, sh);
+                    if !need_reduce && !bitcast_out {
+                        return op;
+                    }
+                    cur = emit(k_int, op);
+                }
+                if need_reduce {
+                    let op = Op::Convert(Convert::Ireduce, cur);
+                    if !bitcast_out {
+                        return op;
+                    }
+                    cur = emit(target_int, op);
+                }
+                Op::Convert(Convert::Bitcast, cur)
             }
-            cur = emit(self.k_int, op);
         }
-        if self.need_reduce {
-            let op = Op::Convert(Convert::Ireduce, cur);
-            if !self.bitcast_out {
-                return op;
-            }
-            cur = emit(self.target_int, op);
-        }
-        Op::Convert(Convert::Bitcast, cur)
     }
 }
 
 pub(super) fn find_subword_source(known: &KnownLoads, loc: MemLoc, ty: Type) -> Option<(i64, Type, Value)> {
-    int_of(ty)?;
+    if !(int_of(ty).is_some() || ty.is_vector()) {
+        return None;
+    }
     let cell_end = loc.offset.checked_add(i64::from(ty.bytes()))?;
     known
         .entries_for(loc.base)
         .iter()
-        .filter(|&&(off, kty, _)| {
-            int_of(kty).is_some()
-                && off <= loc.offset
+        .filter(|&&(off, kty, kval)| {
+            off <= loc.offset
                 && off.checked_add(i64::from(kty.bytes())).is_some_and(|end| cell_end <= end)
+                && SubwordPlan::new(loc.offset, ty, off, kty, kval).is_some()
         })
         .min_by_key(|&&(off, kty, _)| (kty.bytes(), !kty.is_small_int(), loc.offset - off))
         .copied()
@@ -299,7 +361,7 @@ pub(super) fn try_join_phi_forward(
                 LocPlan::Exact(v)
             }
             LocPlan::Subword(sub) => {
-                if !join.def_blocks.get(sub.kval.index()).copied().flatten().is_some_and(|d| join.cfg.dominates(d, p)) {
+                if !join.def_blocks.get(sub.kval().index()).copied().flatten().is_some_and(|d| join.cfg.dominates(d, p)) {
                     return None;
                 }
                 LocPlan::Subword(sub)

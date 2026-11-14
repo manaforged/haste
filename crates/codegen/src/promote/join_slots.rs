@@ -183,7 +183,7 @@ fn fold_slot_selects(func: &mut Function, consts: &[Option<i64>]) -> bool {
                     break;
                 };
                 let ty = func.ty(lres);
-                if !(ty.is_small_int() || ty.is_float()) {
+                if !(ty.is_small_int() || ty.is_float() || ty.is_vector() || ty == Type::I128) {
                     valid = false;
                     break;
                 }

@@ -20,7 +20,8 @@ enum VarMode {
 
 fn same_bitcast_family(a: Type, b: Type) -> bool {
     a.bytes() == b.bytes()
-        && (matches!((a, b), (Type::F64 | Type::I64, Type::F64 | Type::I64) | (Type::F32 | Type::I32, Type::F32 | Type::I32))
+        && ((a.bytes() == 8 && (a.is_vector() || matches!(a, Type::F64 | Type::I64)) && (b.is_vector() || matches!(b, Type::F64 | Type::I64)))
+            || matches!((a, b), (Type::F32 | Type::I32, Type::F32 | Type::I32))
             || (a.is_vector() && b.is_vector()))
 }
 
@@ -697,7 +698,7 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
             }
             let word_limit = if both_open { max_p } else { crate::copy::EXPAND_WORDS };
             let (found, limit) = match layouts.as_ref().and_then(|layouts| layouts.pieces(scan.end(to), scan.end(from), bytes)) {
-                None if moves != Moves::Guided => (Some(crate::copy::words(bytes)), word_limit),
+                None if moves != Moves::Guided => (Some(crate::copy::vec_words(bytes)), word_limit),
                 guided => (guided, max_p),
             };
             found.filter(|p| p.len() <= limit)
