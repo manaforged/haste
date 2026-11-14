@@ -255,6 +255,7 @@ impl Lower<'_, '_> {
             Expr::Block { kind: crate::body::BlockKind::Async | crate::body::BlockKind::AsyncMove, .. } => self.closure(expr),
             Expr::Await(inner) => self.await_expr(expr, inner),
             Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Expansion } => self.expansion(stmts, tail),
+            Expr::Block { stmts, tail, label: None, kind: crate::body::BlockKind::Const } => self.const_block(expr, stmts, tail),
             Expr::Block { stmts, tail, label: None, .. } => self.block(stmts, tail),
             Expr::Block { stmts, tail, label: Some(label), .. } => self.labeled_block(expr, (stmts, tail), label),
             Expr::If(cond, then, otherwise) => self.if_expr(expr, cond, then, otherwise),

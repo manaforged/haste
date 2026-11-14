@@ -1,7 +1,7 @@
 use anyhow::Result;
 use haste_codegen::{IntCC, Type, Value};
 
-use crate::body::{BlockKind, Expr, ExprId, UnOp};
+use crate::body::{BlockKind, Expr, ExprId, List, Stmt, UnOp};
 use crate::host::HostSymbol;
 use crate::names::{ItemRef, Primitive};
 use crate::outline::item::ItemKind;
@@ -62,25 +62,60 @@ impl Lower<'_, '_> {
         if let Some(address) = self.literal_place(expr)? {
             return Ok(Some(address));
         }
-        let ty = self.ty_of(expr);
+        self.once(self.ty_of(expr), |lower| lower.expr(expr)).map(Some)
+    }
+
+    /// The address of a new program-lifetime cell of this function for a value of `ty`, which `fill` computes on the first use.
+    fn once(&mut self, ty: Ty, fill: impl FnOnce(&mut Self) -> Result<Option<Value>>) -> Result<Value> {
         let size = self.cx.layout(ty)?.size.bytes() as usize;
         let seq = self.promoted_seq;
         self.promoted_seq += 1;
         let cell_size = (size + 1) as u32;
         let address = self.emit_symbol_with(SymbolSource::PromotedCell { owner: self.index, seq, size: cell_size }, super::reloc::RelocStep::Promoted { seq, size: cell_size });
         let filled = self.ins().load(Type::I8, address, size as i32);
-        let (fill, done) = (self.b.create_block(), self.b.create_block());
-        self.brif(filled, (done, &[]), (fill, &[]));
-        self.enter(fill);
-        let whole = repr(self.cx, ty)?;
-        if let Some(value) = self.expr(expr)? {
-            self.write(Place { base: Base::Addr(address), offset: 0, repr: whole }, value);
-        }
-        let one = self.ins().iconst(Type::I8, 1);
-        self.ins().store(one, address, size as i32);
+        self.unless(filled, |lower| {
+            let whole = repr(lower.cx, ty)?;
+            if let Some(value) = fill(lower)? {
+                lower.write(Place { base: Base::Addr(address), offset: 0, repr: whole }, value);
+            }
+            let one = lower.ins().iconst(Type::I8, 1);
+            lower.ins().store(one, address, size as i32);
+            Ok(())
+        })?;
+        Ok(address)
+    }
+
+    /// Runs `fill` on the path where `filled` is zero, then joins the path where it is not.
+    fn unless(&mut self, filled: Value, fill: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let (empty, done) = (self.b.create_block(), self.b.create_block());
+        self.brif(filled, (done, &[]), (empty, &[]));
+        self.enter(empty);
+        fill(self)?;
         self.jump(done, &[]);
         self.enter(done);
-        Ok(Some(address))
+        Ok(())
+    }
+
+    /// The value of the `const` block `expr`: computed on the first use into a cell of this function when it loops and its value holds no address, else computed in place.
+    pub(super) fn const_block(&mut self, expr: ExprId, stmts: List, tail: Option<ExprId>) -> Result<Option<Value>> {
+        let ty = self.ty_of(expr);
+        let whole = repr(self.cx, ty)?;
+        let plain = match whole {
+            Repr::Zst => true,
+            Repr::Scalar(_) => matches!(*self.cx.types.kind(ty), Kind::Prim(_)),
+            Repr::Mem { .. } => false,
+        };
+        if !plain || !self.loops(stmts, tail) {
+            return self.block(stmts, tail);
+        }
+        let address = self.once(ty, |lower| lower.block(stmts, tail))?;
+        Ok(self.read(Place { base: Base::Addr(address), offset: 0, repr: whole }))
+    }
+
+    /// Whether a statement or the tail of a block is a loop.
+    fn loops(&self, stmts: List, tail: Option<ExprId>) -> bool {
+        let looping = |expr: ExprId| matches!(*self.body.expr(expr), Expr::While { .. } | Expr::Loop { .. } | Expr::For { .. });
+        tail.is_some_and(looping) || self.body.list(stmts).iter().any(|&stmt| matches!(self.body.stmts[stmt as usize], Stmt::Expr(expr, _) if looping(expr)))
     }
 
     fn is_mutable_static(&self, item: ItemRef) -> bool {
@@ -140,16 +175,14 @@ impl Lower<'_, '_> {
             let flag = self.ins().iadd_imm(address, i64::from(size));
             let state = self.ins().atomic_load(Type::I8, flag);
             let filled = self.ins().icmp_imm(IntCC::Equal, state, i64::from(crate::image::StaticInit::Filled as u8));
-            let (fill, done) = (self.b.create_block(), self.b.create_block());
-            self.brif(filled, (done, &[]), (fill, &[]));
-            self.enter(fill);
-            let usize_ty = self.cx.types.prim(Primitive::Usize);
-            let table = self.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index)));
-            let code = self.ins().load(Type::I64, table, 0);
-            let once = self.emit_symbol(SymbolSource::Host(HostSymbol::FillOnce));
-            self.call_code(once, (vec![usize_ty, usize_ty], None), vec![flag, code])?;
-            self.jump(done, &[]);
-            self.enter(done);
+            self.unless(filled, |lower| {
+                let usize_ty = lower.cx.types.prim(Primitive::Usize);
+                let table = lower.emit_slot_with(SymbolSource::Slot(index), super::reloc::RelocStep::Const(SymbolSource::Slot(index)));
+                let code = lower.ins().load(Type::I64, table, 0);
+                let once = lower.emit_symbol(SymbolSource::Host(HostSymbol::FillOnce));
+                lower.call_code(once, (vec![usize_ty, usize_ty], None), vec![flag, code])?;
+                Ok(())
+            })?;
         }
         Ok(Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? })
     }
@@ -232,6 +265,12 @@ impl Lower<'_, '_> {
                 } else {
                     Ok(None)
                 }
+            }
+            Repr::Mem { .. } if bytes.len() == 16 && matches!(relocs.as_slice(), [RodataReloc { offset: 0, .. }]) && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) => {
+                let RodataTarget::Rodata(child_id) = relocs[0].target;
+                let data = self.emit_symbol(SymbolSource::Rodata(child_id));
+                let len = u64::from_le_bytes(bytes[8..].try_into()?);
+                Ok(Some(self.wide_pointer(data, len as i64)))
             }
             Repr::Mem { .. } if !self.lent_mutably(expr) => Ok(Some(self.emit_rodata_blob(&bytes, &relocs))),
             _ => Ok(None),
