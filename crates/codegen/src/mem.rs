@@ -3,7 +3,7 @@ mod loop_mem;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cfg::Cfg;
-use crate::ir::{Binary, Block, BlockData, Convert, Function, Op, StackSlot, Type, Value};
+use crate::ir::{AbiParam, ArgumentPurpose, Binary, Block, BlockData, Convert, Function, Op, StackSlot, Type, Value};
 pub(crate) use loop_mem::{LoopMem, PromoteBase, PromoteCand};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -140,6 +140,124 @@ fn count_safe_args(func: &Function, target: Block, args: &[Value], tracked: &[Tr
     }
 }
 
+fn is_ptr_capable(ty: Type) -> bool {
+    matches!(ty, Type::I64 | Type::I128 | Type::Vec { .. })
+}
+
+fn non_ptr_values(func: &Function, cfg: &Cfg) -> Vec<bool> {
+    let n = func.types.len();
+    let mut non_ptr = vec![true; n];
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            let op = &func.insts[inst.index()].op;
+            if matches!(op, Op::Icmp(..) | Op::Trapz(_)) {
+                continue;
+            }
+            op.for_operands(|v| non_ptr[v.index()] = false);
+        }
+    }
+    non_ptr
+}
+
+fn is_unknown_mem_op(op: &Op, slots: &[Option<(StackSlot, i32)>], tracked: &[TrackRoot]) -> bool {
+    let known = |v: Value| {
+        slots[v.index()].is_some()
+            || matches!(
+                tracked[v.index()],
+                TrackRoot::Set(MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::ReadonlyParam(_))
+            )
+    };
+    match *op {
+        Op::Load(addr, _) | Op::Store(_, addr, _) => !known(addr),
+        Op::Move(dst, src, _) | Op::Copy(dst, src, _) => !known(dst) || !known(src),
+        Op::Call { .. }
+        | Op::TryCall { .. }
+        | Op::AtomicLoad(_)
+        | Op::AtomicStore(..)
+        | Op::AtomicRmw(..)
+        | Op::AtomicCas(..)
+        | Op::Fence => true,
+        _ => false,
+    }
+}
+
+fn compute_block_danger(func: &Function, cfg: &Cfg, slots: &[Option<(StackSlot, i32)>], tracked: &[TrackRoot]) -> (Vec<bool>, Vec<bool>) {
+    let n = func.blocks.len();
+    let loops = cfg.loops();
+    let mut in_loop = vec![false; n];
+    for (i, &depth) in loops.depths.iter().enumerate() {
+        in_loop[i] = depth > 0;
+    }
+    let mut danger = vec![false; n];
+    let mut queue = Vec::new();
+    for &b in &cfg.rpo {
+        let bi = b.index();
+        let has_unknown = func.blocks[bi].insts.iter().any(|&inst| is_unknown_mem_op(&func.insts[inst.index()].op, slots, tracked));
+        if in_loop[bi] || has_unknown {
+            danger[bi] = true;
+            queue.push(b);
+        }
+    }
+    while let Some(b) = queue.pop() {
+        for &pred in cfg.preds_of(b) {
+            let pi = pred.index();
+            if !danger[pi] {
+                danger[pi] = true;
+                queue.push(pred);
+            }
+        }
+    }
+    (in_loop, danger)
+}
+
+fn post_call_safe(
+    func: &Function,
+    block: Block,
+    pos: usize,
+    in_loop: &[bool],
+    danger: &[bool],
+    slots: &[Option<(StackSlot, i32)>],
+    tracked: &[TrackRoot],
+) -> bool {
+    if in_loop[block.index()] {
+        return false;
+    }
+    let insts = &func.blocks[block.index()].insts;
+    let Some(term) = insts.last() else { return false };
+    if func.insts[term.index()].op.targets().any(|t| danger[t.index()]) {
+        return false;
+    }
+    insts[pos + 1..].iter().all(|&inst| !is_unknown_mem_op(&func.insts[inst.index()].op, slots, tracked))
+}
+
+fn non_capturing_call_arg(
+    func: &Function,
+    in_loop: bool,
+    (is_const, non_ptr, tracked): (&[bool], &[bool], &[TrackRoot]),
+    (params, args, res_vals): (&[AbiParam], &[Value], &[Option<Value>]),
+    (arg_idx, p): (usize, u16),
+) -> bool {
+    let Some(pa) = params.get(arg_idx) else { return false };
+    if !pa.readonly && (in_loop || !pa.noalias) {
+        return false;
+    }
+    if params.iter().any(|param| param.purpose == ArgumentPurpose::StructReturn) {
+        return false;
+    }
+    for r in res_vals.iter().flatten().copied() {
+        if is_ptr_capable(func.ty(r)) && !non_ptr[r.index()] {
+            return false;
+        }
+    }
+    args.iter().enumerate().all(|(j, &other)| {
+        j == arg_idx
+            || is_const[other.index()]
+            || !is_ptr_capable(func.ty(other))
+            || params.get(j).is_some_and(|q| q.readonly && q.purpose == ArgumentPurpose::Normal)
+            || tracked[other.index()] == TrackRoot::Set(MemRoot::NoAliasParam(p))
+    })
+}
+
 fn classify_uses(
     func: &Function,
     cfg: &Cfg,
@@ -157,6 +275,8 @@ fn classify_uses(
             }
         }
     }
+    let non_ptr = non_ptr_values(func, cfg);
+    let (in_loop, danger) = compute_block_danger(func, cfg, slots, tracked);
     let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], ro_calls: vec![0_u32; n] };
     let mark_safe = |v: Value, safe: &mut [u32]| {
         if slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(_)) {
@@ -171,7 +291,7 @@ fn classify_uses(
         }
     };
     for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
+        for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
             data.op.for_operands(|v| counts.total[v.index()] += 1);
             match &data.op {
@@ -221,11 +341,36 @@ fn classify_uses(
                     count_safe_args(func, *then_b, then_args, tracked, &mut counts.safe);
                     count_safe_args(func, *else_b, else_args, tracked, &mut counts.safe);
                 }
-                Op::Call { sig, args, .. } | Op::TryCall { sig, args, .. } => {
+                Op::Call { sig, args, results, .. } => {
                     let params = &func.sigs[sig.index()].params;
-                    for (i, arg) in args.iter().enumerate() {
+                    let post_safe = post_call_safe(func, b, pos, &in_loop, &danger, slots, tracked);
+                    let mut res_vals = Vec::with_capacity(1 + results.len());
+                    res_vals.push(data.result);
+                    res_vals.extend(results.iter().copied().map(Some));
+                    for (i, &arg) in args.iter().enumerate() {
                         if params.get(i).is_some_and(|p| p.readonly) {
                             counts.ro_calls[arg.index()] += 1;
+                        }
+                        if slots[arg.index()].is_none()
+                            && let TrackRoot::Set(MemRoot::NoAliasParam(p)) = tracked[arg.index()]
+                            && (post_safe || non_capturing_call_arg(func, in_loop[b.index()], (&is_const, &non_ptr, tracked), (params, args, &res_vals), (i, p)))
+                        {
+                            counts.safe[arg.index()] += 1;
+                        }
+                    }
+                }
+                Op::TryCall { sig, args, .. } => {
+                    let params = &func.sigs[sig.index()].params;
+                    let post_safe = post_call_safe(func, b, pos, &in_loop, &danger, slots, tracked);
+                    for (i, &arg) in args.iter().enumerate() {
+                        if params.get(i).is_some_and(|p| p.readonly) {
+                            counts.ro_calls[arg.index()] += 1;
+                        }
+                        if slots[arg.index()].is_none()
+                            && let TrackRoot::Set(MemRoot::NoAliasParam(_)) = tracked[arg.index()]
+                            && post_safe
+                        {
+                            counts.safe[arg.index()] += 1;
                         }
                     }
                 }
@@ -491,6 +636,13 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
     }
 }
 
+fn call_writes_noalias(params: &[AbiParam], args: &[Value], prov: &Provenance, p: u16) -> bool {
+    args.iter().enumerate().any(|(i, arg)| {
+        prov.param_roots.get(arg.index()).copied() == Some(MemRoot::NoAliasParam(p))
+            && !params.get(i).is_some_and(|pa| pa.readonly)
+    })
+}
+
 pub(crate) fn clobbers(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance) -> bool {
     match *op {
         Op::StackStore(val, slot, off) => may_alias(MemLoc::slot(slot, i64::from(off), func.ty(val).bytes()), loc, prov),
@@ -500,9 +652,11 @@ pub(crate) fn clobbers(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance)
             let w = prov.loc(dst, 0, u32::MAX);
             w.base == loc.base || (w.root != MemRoot::Unknown && w.root == loc.root) || may_alias(w, loc, prov)
         }
-        Op::Call { .. } | Op::TryCall { .. } => match loc.root {
+        Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => match loc.root {
             MemRoot::Slot(s) => !prov.slot_unescaped(s) && !prov.slot_call_readonly(s),
-            MemRoot::NoAliasParam(p) => !prov.noalias_unescaped(p),
+            MemRoot::NoAliasParam(p) => {
+                !prov.noalias_unescaped(p) || call_writes_noalias(&func.sigs[sig.index()].params, args, prov, p)
+            }
             _ => true,
         },
         Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence => true,

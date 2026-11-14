@@ -1,4 +1,4 @@
-use crate::fold::holds;
+use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Function, IntCC, Op, Type, Value};
 
 use super::{Fact, MAX_FACTS, MAX_RELS, Ranges, as_unsigned, compared_range, decide, swapped, truth};
@@ -61,10 +61,59 @@ impl Path {
     /// Records `fact` on `value`, forgetting the oldest fact past `MAX_FACTS`.
     fn add(&mut self, ranges: &Ranges, value: Value, fact: Fact) {
         let merged = self.fact(ranges, value).meet(&fact);
-        if self.facts.len() >= MAX_FACTS {
+        if let Some(pos) = self.facts.iter().position(|(at, _)| *at == value) {
+            self.facts.remove(pos);
+        } else if self.facts.len() >= MAX_FACTS {
             self.facts.remove(0);
         }
         self.facts.push((value, merged));
+    }
+
+    fn push_rel(&mut self, rel: Rel) {
+        if !self.rels.contains(&rel) {
+            if self.rels.len() >= MAX_RELS {
+                self.rels.remove(0);
+            }
+            self.rels.push(rel);
+        }
+    }
+
+    pub(super) fn refined_fact(&self, func: &Function, ranges: &Ranges, value: Value, depth: u8) -> Fact {
+        let mut fact = self.fact(ranges, value);
+        if depth >= 3 {
+            return fact;
+        }
+        match ranges.op(func, value) {
+            Some(&Op::Convert(crate::ir::Convert::Uextend, inner)) if func.ty(inner).is_small_int() => {
+                fact = fact.meet(&self.refined_fact(func, ranges, inner, depth + 1));
+            }
+            Some(&Op::Binary(Binary::Band, a, b)) => {
+                let hi = self.refined_fact(func, ranges, a, depth + 1).hi.min(self.refined_fact(func, ranges, b, depth + 1).hi);
+                fact = fact.meet(&Fact::range(0, hi));
+            }
+            Some(&Op::Binary(Binary::Ushr, a, sh)) => {
+                if let Some(c) = self.fact(ranges, sh).exact() {
+                    let inner = self.refined_fact(func, ranges, a, depth + 1);
+                    let k = (c & u64::from(func.ty(value).bits() - 1)) as u32;
+                    fact = fact.meet(&Fact::range(inner.lo >> k, inner.hi >> k));
+                }
+            }
+            Some(&Op::Binary(Binary::Isub, a, b)) => {
+                let (fa, fb) = (self.refined_fact(func, ranges, a, depth + 1), self.refined_fact(func, ranges, b, depth + 1));
+                if fa.lo >= fb.hi {
+                    fact = fact.meet(&Fact::range(fa.lo - fb.hi, fa.hi - fb.lo));
+                }
+            }
+            Some(&Op::Binary(Binary::Iadd, a, b)) => {
+                let ty = func.ty(value);
+                let (fa, fb) = (self.refined_fact(func, ranges, a, depth + 1), self.refined_fact(func, ranges, b, depth + 1));
+                if let Some(hi) = fa.hi.checked_add(fb.hi).filter(|&h| h <= ty.unsigned_max()) {
+                    fact = fact.meet(&Fact::range(fa.lo + fb.lo, hi));
+                }
+            }
+            _ => {}
+        }
+        fact
     }
 
     /// Records that the branch on `condition` went the `taken` way: the condition is nonzero or zero, and the integer compare or boolean op that defines it held or failed.
@@ -118,6 +167,18 @@ impl Path {
                     }
                 }
             }
+            Some(&Op::Fits(Binary::Isub, false, x, y)) if taken => {
+                let op_ty = func.ty(x);
+                if op_ty.is_small_int() {
+                    if x != y {
+                        self.push_rel(Rel { kind: RelKind::Ule, lhs: y, rhs: x, ty: op_ty });
+                    }
+                    let fy = self.fact(ranges, y);
+                    self.add(ranges, x, Fact::range(fy.lo, op_ty.unsigned_max()));
+                    let fx = self.fact(ranges, x);
+                    self.add(ranges, y, Fact::range(0, fx.hi));
+                }
+            }
             Some(&Op::Icmp(cc, x, y)) => {
                 let operand_ty = func.ty(x);
                 if !operand_ty.is_small_int() {
@@ -139,13 +200,7 @@ impl Path {
                 if x != y {
                     let eff = if taken { order } else { order.inverse() };
                     let (kind, lhs, rhs) = rel_of(eff, x, y);
-                    let rel = Rel { kind, lhs, rhs, ty: operand_ty };
-                    if !self.rels.contains(&rel) {
-                        if self.rels.len() >= MAX_RELS {
-                            self.rels.remove(0);
-                        }
-                        self.rels.push(rel);
-                    }
+                    self.push_rel(Rel { kind, lhs, rhs, ty: operand_ty });
                 }
             }
             _ => {}
@@ -294,6 +349,67 @@ impl Path {
         })
     }
 
+    fn has_strict_upper_expr(&self, func: &Function, ranges: &Ranges, ty: Type, val: Value, depth: u8) -> bool {
+        if self.rels.iter().any(|r| {
+            r.ty == ty && r.kind == RelKind::Ult && self.reaches(ty, val, r.rhs, (RelKind::Ult, RelKind::Ule), true)
+        }) {
+            return true;
+        }
+        if depth >= 2 {
+            return false;
+        }
+        match ranges.op(func, val) {
+            Some(&Op::Binary(Binary::Band, x, y)) => {
+                self.has_strict_upper_expr(func, ranges, ty, x, depth + 1)
+                    || self.has_strict_upper_expr(func, ranges, ty, y, depth + 1)
+            }
+            Some(&Op::Binary(Binary::Ushr, x, _)) => self.has_strict_upper_expr(func, ranges, ty, x, depth + 1),
+            Some(&Op::Select(_, t, f)) => {
+                self.has_strict_upper_expr(func, ranges, ty, t, depth + 1)
+                    && self.has_strict_upper_expr(func, ranges, ty, f, depth + 1)
+            }
+            Some(&Op::Binary(Binary::Isub, x, d)) => {
+                self.refined_fact(func, ranges, d, 0).lo >= 1
+                    && self.proves_unsigned(func, ranges, ty, d, x, false, 0)
+            }
+            Some(&Op::Binary(Binary::Urem, _, y)) => !self.refined_fact(func, ranges, y, 0).admits(0),
+            _ => false,
+        }
+    }
+
+    fn proves_unsigned(&self, func: &Function, ranges: &Ranges, ty: Type, a: Value, b: Value, strict: bool, depth: u8) -> bool {
+        if a == b {
+            return !strict;
+        }
+        if self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), strict)
+            || (strict && self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), false) && self.known_ne(ty, a, b))
+            || self.proves_add_rel(func, ranges, ty, a, b, strict)
+            || self.proves_sub_rel(func, ranges, ty, a, b, strict)
+        {
+            return true;
+        }
+        if depth >= 2 {
+            return false;
+        }
+        match ranges.op(func, a) {
+            Some(&Op::Binary(Binary::Band, x, y)) => {
+                self.proves_unsigned(func, ranges, ty, x, b, strict, depth + 1)
+                    || self.proves_unsigned(func, ranges, ty, y, b, strict, depth + 1)
+            }
+            Some(&Op::Binary(Binary::Ushr, x, _)) => self.proves_unsigned(func, ranges, ty, x, b, strict, depth + 1),
+            Some(&Op::Binary(Binary::Urem, x, y)) => {
+                self.proves_unsigned(func, ranges, ty, x, b, strict, depth + 1)
+                    || (!self.refined_fact(func, ranges, y, 0).admits(0)
+                        && self.proves_unsigned(func, ranges, ty, y, b, false, depth + 1))
+            }
+            Some(&Op::Select(_, t, f)) => {
+                self.proves_unsigned(func, ranges, ty, t, b, strict, depth + 1)
+                    && self.proves_unsigned(func, ranges, ty, f, b, strict, depth + 1)
+            }
+            _ => false,
+        }
+    }
+
     fn proves(&self, func: &Function, ranges: &Ranges, cc: IntCC, ty: Type, x: Value, y: Value) -> bool {
         if x == y {
             return holds(cc, ty, 0, 0);
@@ -301,17 +417,8 @@ impl Path {
         let (kind, a, b) = rel_of(cc, x, y);
         match kind {
             RelKind::Eq => self.reaches(ty, a, b, (RelKind::Eq, RelKind::Eq), false),
-            RelKind::Ult => {
-                self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), true)
-                    || (self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), false) && self.known_ne(ty, a, b))
-                    || self.proves_add_rel(func, ranges, ty, a, b, true)
-                    || self.proves_sub_rel(func, ranges, ty, a, b, true)
-            }
-            RelKind::Ule => {
-                self.reaches(ty, a, b, (RelKind::Ult, RelKind::Ule), false)
-                    || self.proves_add_rel(func, ranges, ty, a, b, false)
-                    || self.proves_sub_rel(func, ranges, ty, a, b, false)
-            }
+            RelKind::Ult => self.proves_unsigned(func, ranges, ty, a, b, true, 0),
+            RelKind::Ule => self.proves_unsigned(func, ranges, ty, a, b, false, 0),
             RelKind::Slt => {
                 self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), true)
                     || (self.reaches(ty, a, b, (RelKind::Slt, RelKind::Sle), false) && self.known_ne(ty, a, b))
@@ -357,6 +464,79 @@ impl Path {
     }
 }
 
+fn signed_bounds(fact: &Fact, ty: Type) -> (i128, i128) {
+    let sign_max = ty.unsigned_max() >> 1;
+    if fact.hi <= sign_max {
+        (i128::from(fact.lo), i128::from(fact.hi))
+    } else if fact.lo > sign_max {
+        (i128::from(extend(fact.lo as i64, ty, true)), i128::from(extend(fact.hi as i64, ty, true)))
+    } else {
+        (-(1_i128 << (ty.bits() - 1)), (1_i128 << (ty.bits() - 1)) - 1)
+    }
+}
+
+/// Decides `Op::Fits(op, signed, x, y)` when path ranges or unsigned relations settle whether the result fits `ty`.
+pub(super) fn fits_truth(func: &Function, ranges: &Ranges, path: &Path, op: Binary, signed: bool, x: Value, y: Value) -> Option<bool> {
+    let ty = func.ty(x);
+    if !ty.is_small_int() {
+        return None;
+    }
+    let (fx, fy) = (path.refined_fact(func, ranges, x, 0), path.refined_fact(func, ranges, y, 0));
+    if !signed {
+        let max = ty.unsigned_max();
+        let x_hi = if fx.hi == max && path.has_strict_upper_expr(func, ranges, ty, x, 0) { max - 1 } else { fx.hi };
+        let y_hi = if fy.hi == max && path.has_strict_upper_expr(func, ranges, ty, y, 0) { max - 1 } else { fy.hi };
+        return match op {
+            Binary::Iadd => {
+                if x_hi.checked_add(y_hi).is_some_and(|sum| sum <= max) {
+                    Some(true)
+                } else if fx.lo.checked_add(fy.lo).is_none_or(|sum| sum > max) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            Binary::Isub => {
+                if fx.lo >= y_hi || path.proves(func, ranges, IntCC::UnsignedGreaterThanOrEqual, ty, x, y) {
+                    Some(true)
+                } else if x_hi < fy.lo || path.proves(func, ranges, IntCC::UnsignedLessThan, ty, x, y) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            Binary::Imul => {
+                if x_hi.checked_mul(y_hi).is_some_and(|prod| prod <= max) {
+                    Some(true)
+                } else if fx.lo.checked_mul(fy.lo).is_none_or(|prod| prod > max) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+    }
+    let (s_lo, s_hi) = (-(1_i128 << (ty.bits() - 1)), (1_i128 << (ty.bits() - 1)) - 1);
+    let ((ax, bx), (ay, by)) = (signed_bounds(&fx, ty), signed_bounds(&fy, ty));
+    let (min, max) = match op {
+        Binary::Iadd => (ax + ay, bx + by),
+        Binary::Isub => (ax - by, bx - ay),
+        Binary::Imul => {
+            let (p0, p1, p2, p3) = (ax * ay, ax * by, bx * ay, bx * by);
+            (p0.min(p1).min(p2).min(p3), p0.max(p1).max(p2).max(p3))
+        }
+        _ => return None,
+    };
+    if min >= s_lo && max <= s_hi {
+        Some(true)
+    } else if max < s_lo || min > s_hi {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 pub(super) fn cond_truth(func: &Function, ranges: &Ranges, path: &Path, condition: Value) -> Option<bool> {
     cond_truth_depth(func, ranges, path, condition, 0)
 }
@@ -369,10 +549,21 @@ fn cond_truth_depth(func: &Function, ranges: &Ranges, path: &Path, condition: Va
         return None;
     }
     match ranges.op(func, condition) {
+        Some(&Op::Fits(op, signed, x, y)) => fits_truth(func, ranges, path, op, signed, x, y),
         Some(&Op::Icmp(cc, x, y)) if func.ty(x).is_small_int() => {
             let ty = func.ty(x);
-            decide(cc, ty, &path.fact(ranges, x), &path.fact(ranges, y))
+            decide(cc, ty, &path.refined_fact(func, ranges, x, 0), &path.refined_fact(func, ranges, y, 0))
                 .or_else(|| path.decide_rel(func, ranges, cc, ty, x, y))
+                .or_else(|| {
+                    matches!(cc, IntCC::Equal | IntCC::NotEqual).then(|| {
+                        [(x, y), (y, x)].into_iter().find_map(|(expr, imm)| {
+                            let k = path.fact(ranges, imm).exact()?;
+                            ((k == 0 || k == 1) && path.fact(ranges, expr).hi <= 1).then(|| {
+                                cond_truth_depth(func, ranges, path, expr, depth + 1).map(|t| (t == (k == 1)) ^ (cc == IntCC::NotEqual))
+                            }).flatten()
+                        })
+                    }).flatten()
+                })
         }
         Some(&Op::Binary(Binary::Bxor, a, b)) => [(a, b), (b, a)].into_iter().find_map(|(inner, mask)| {
             (path.fact(ranges, mask).exact() == Some(1) && path.fact(ranges, inner).hi <= 1)

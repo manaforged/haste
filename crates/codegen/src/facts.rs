@@ -5,16 +5,16 @@ use crate::cfg::{Cfg, dominates};
 use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 use loops::{Env, ExtraPath};
-use rel::{Path, RelKind, cond_truth, rel_of};
+use rel::{Path, RelKind, cond_truth, fits_truth, rel_of};
 
 /// The most facts a path keeps; past it the oldest goes.
-pub(super) const MAX_FACTS: usize = 16;
+pub(super) const MAX_FACTS: usize = 64;
 
 /// The most constants one fact records a value as differing from.
 const MAX_NOT: usize = 32;
 
 /// The most symbolic relations a path keeps; past it the oldest goes.
-pub(super) const MAX_RELS: usize = 32;
+pub(super) const MAX_RELS: usize = 64;
 
 /// What is known about an integer value: its unsigned range at its type's width, and constants it differs from.
 #[derive(Clone, PartialEq, Debug)]
@@ -611,7 +611,25 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
                     env.collect_loop(func, (&cfg, &ranges, &incoming, &complete, &exits), each);
                 }
             }
-            let (mut path, mut extra, mut dom) = match single[block.index()].and_then(|pred| exits[pred.index()].as_ref().map(|exit| (pred, exit.clone(), extra_exits[pred.index()].clone().unwrap_or_default(), dom_exits[pred.index()].clone().unwrap_or_default()))) {
+            let follow_pred = single[block.index()].or_else(|| {
+                (block != entry)
+                    .then(|| {
+                        let mut outside = cfg.preds_of(block).iter().copied().filter(|&p| cfg.reachable[p.index()] && !cfg.dominates(block, p));
+                        let first = outside.next()?;
+                        (outside.next().is_none() && cfg.idom[block.index()] == Some(first)).then_some(first)
+                    })
+                    .flatten()
+            });
+            let (mut path, mut extra, mut dom) = match follow_pred.and_then(|pred| {
+                exits[pred.index()].as_ref().map(|exit| {
+                    (
+                        pred,
+                        exit.clone(),
+                        extra_exits[pred.index()].clone().unwrap_or_default(),
+                        dom_exits[pred.index()].clone().unwrap_or_default(),
+                    )
+                })
+            }) {
                 Some((pred, mut path, mut extra, mut dom)) => {
                     path.follow(func, &ranges, pred, block);
                     extra.follow(func, (&cfg, &ranges, &env, &path), pred, block);
@@ -669,10 +687,16 @@ fn settle_one(
         (&Op::Icmp(cc, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => {
             let (x, y) = (dom.resolve(raw_x), dom.resolve(raw_y));
             let ty = func.ty(x);
-            if let Some(known) = decide(cc, ty, &path.fact(ranges, x), &path.fact(ranges, y))
+            if let Some(known) = decide(cc, ty, &path.refined_fact(func, ranges, x, 0), &path.refined_fact(func, ranges, y, 0))
                 .or_else(|| path.decide_rel(func, ranges, cc, ty, x, y))
                 .or_else(|| extra.decide(func, (cfg, ranges, env, path, block), cc, x, y))
             {
+                compares.push((result, known));
+            }
+        }
+        (&Op::Fits(op, signed, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => {
+            let (x, y) = (dom.resolve(raw_x), dom.resolve(raw_y));
+            if let Some(known) = fits_truth(func, ranges, path, op, signed, x, y) {
                 compares.push((result, known));
             }
         }
