@@ -1,7 +1,7 @@
 use super::fits_mem_imm;
 use crate::cfg::Cfg;
 use crate::ir::{Binary, Block, Convert, Function, Inst, Op, StackSlot, Type, Unary, Value};
-use crate::mem::{MemBase, MemLoc, Provenance, clobbers};
+use crate::mem::{MemBase, MemLoc, Provenance};
 
 const MAX_PRED_CHAIN: usize = 4;
 const MAX_ADDR_STEPS: usize = 16;
@@ -222,7 +222,7 @@ fn has_clobber(
     let last_chain = chain.len() - 1;
     let check_inst = |inst: Inst| {
         let op = &func.insts[inst.index()].op;
-        clobbers(func, op, wide_loc, prov) || leaves.iter().any(|l| clobbers(func, op, l.loc, prov))
+        super::dom::clobbers_loc(func, op, wide_loc, prov) || leaves.iter().any(|l| super::dom::clobbers_loc(func, op, l.loc, prov))
     };
     for ci in min_leaf.blk_idx..=last_chain {
         let insts = &func.blocks[chain[ci].index()].insts;

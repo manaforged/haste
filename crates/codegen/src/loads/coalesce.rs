@@ -140,6 +140,7 @@ pub(super) fn try_coalesce_store(
     func: &mut Function,
     state: &mut State<'_>,
     known: &mut KnownLoads,
+    bases: &[(MemBase, MemRoot)],
     bufs: &mut ScanBuf,
     (inst, loc, ty, value): (Inst, MemLoc, Type, Value),
 ) -> Option<MemLoc> {
@@ -157,7 +158,7 @@ pub(super) fn try_coalesce_store(
         StoreBase::Addr(a) => Op::Store(c_val, a, lo_i32),
     };
     let wide_loc = MemLoc::new(loc.root, loc.base, lo, wide_ty.bytes());
-    known.write(wide_loc, wide_ty, c_val, state.prov);
+    super::dom::write_preserving(func, known, bases, wide_loc, wide_ty, c_val, state.prov);
     if wide_ty.bytes() < 8 {
         bufs.const_stores.push(ConstStore { loc: wide_loc, imm: wide_imm, kept_idx: bufs.kept.len(), base: chosen });
     }

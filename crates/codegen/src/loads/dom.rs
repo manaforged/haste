@@ -1,6 +1,6 @@
 use crate::cfg::Cfg;
-use crate::ir::{Block, Function, Inst, Op, Value};
-use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance};
+use crate::ir::{Block, Function, Inst, Op, Type, Value};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, may_alias};
 use crate::merge::find;
 
 const MAX_MERGE_WALK: usize = 32;
@@ -36,6 +36,85 @@ fn canonical_write(op: &Op, subst: &[Value]) -> Option<Op> {
 pub(super) fn record_base(bases: &mut Vec<(MemBase, MemRoot)>, loc: MemLoc) {
     if !bases.iter().any(|&(b, _)| b == loc.base) {
         bases.push((loc.base, loc.root));
+    }
+}
+
+/// Whether `loc` lies in guaranteed-immutable read-only memory (`.rodata` or a `Freeze` `&T` param).
+pub(super) fn loc_immutable(func: &Function, loc: MemLoc) -> bool {
+    match loc.root {
+        MemRoot::ReadonlyParam(_) => true,
+        MemRoot::Global(sym) => func.rodata_bytes.iter().any(|&(s, _)| s == sym),
+        _ => false,
+    }
+}
+
+/// Whether `op` may overwrite `loc`, treating immutable `.rodata` and non-atomic `ReadonlyParam` accesses as un-clobbered by calls or alien stores.
+pub(super) fn clobbers_loc(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance) -> bool {
+    if matches!(loc.root, MemRoot::Global(sym) if func.rodata_bytes.iter().any(|&(s, _)| s == sym)) {
+        return false;
+    }
+    if matches!(loc.root, MemRoot::ReadonlyParam(_)) {
+        return match *op {
+            Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence => true,
+            Op::Store(val, addr, off) => {
+                let w = prov.loc(addr, i64::from(off), func.ty(val).bytes());
+                w.root == loc.root && may_alias(w, loc, prov)
+            }
+            Op::Move(dst, _, bytes) => {
+                let w = prov.loc(dst, 0, bytes);
+                w.root == loc.root && may_alias(w, loc, prov)
+            }
+            Op::Copy(dst, ..) => prov.loc(dst, 0, u32::MAX).root == loc.root,
+            _ => false,
+        };
+    }
+    clobbers(func, op, loc, prov)
+}
+
+fn save_immutable_entries(
+    func: &Function,
+    known: &KnownLoads,
+    bases: &[(MemBase, MemRoot)],
+    keep: impl Fn(MemLoc) -> bool,
+) -> Vec<(MemLoc, Type, Value)> {
+    let mut saved = Vec::new();
+    for &(base, root) in bases {
+        if !loc_immutable(func, MemLoc::new(root, base, 0, 1)) {
+            continue;
+        }
+        for &(off, ty, val) in known.entries_for(base) {
+            let loc = MemLoc::new(root, base, off, ty.bytes());
+            if keep(loc) {
+                saved.push((loc, ty, val));
+            }
+        }
+    }
+    saved
+}
+
+pub(super) fn invalidate_preserving(func: &Function, known: &mut KnownLoads, bases: &[(MemBase, MemRoot)], op: &Op, prov: &Provenance) {
+    let saved = save_immutable_entries(func, known, bases, |loc| !clobbers_loc(func, op, loc, prov));
+    known.invalidate(func, op, prov);
+    for (loc, ty, val) in saved {
+        known.remember(loc, ty, val);
+    }
+}
+
+pub(super) fn write_preserving(
+    func: &Function,
+    known: &mut KnownLoads,
+    bases: &[(MemBase, MemRoot)],
+    wloc: MemLoc,
+    ty: Type,
+    value: Value,
+    prov: &Provenance,
+) {
+    let saved = save_immutable_entries(func, known, bases, |loc| {
+        matches!(loc.root, MemRoot::Global(_)) || wloc.root != loc.root || !may_alias(wloc, loc, prov)
+    });
+    known.write(wloc, ty, value, prov);
+    for (loc, ety, eval) in saved {
+        known.remember(loc, ety, eval);
     }
 }
 
@@ -160,11 +239,12 @@ impl<'a> BlockWrites<'a> {
                 work.push(pred);
             }
         }
+        let dom_bases = &block_bases[dom.index()];
         while let Some(m) = work.pop() {
             for &w in &self.writes[m.index()] {
                 let raw_op = &func.insts[w.index()].op;
                 let canon = canonical_write(raw_op, subst);
-                known.invalidate(func, canon.as_ref().unwrap_or(raw_op), self.prov);
+                invalidate_preserving(func, &mut known, dom_bases, canon.as_ref().unwrap_or(raw_op), self.prov);
                 if known.is_empty() {
                     return (known, Vec::new());
                 }

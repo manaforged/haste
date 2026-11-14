@@ -270,8 +270,13 @@ struct Table {
     icmp_def: Vec<Option<(IntCC, Type, Value, Value)>>,
     def_block: Vec<Block>,
     local_flag_only: Vec<bool>,
+    bool_val: Vec<bool>,
     affine: Vec<(Value, i64)>,
     stack_addrs: Vec<Option<(StackSlot, i32)>>,
+    assoc: Vec<Option<(Binary, Value, i64)>>,
+    unary_src: Vec<Option<(Unary, Value)>>,
+    conv_src: Vec<Option<(Convert, Value, Type)>>,
+    select_def: Vec<Option<(Value, Value, Value)>>,
     drop_buf: Vec<Key>,
 }
 
@@ -286,11 +291,49 @@ impl Table {
         self.known.get(&key).copied()
     }
 
+    fn simplify_select(&mut self, c: Value, x: Value, y: Value, types: &[Type], result: Value, subst: &[Value]) -> (Value, Value, Value, bool) {
+        let (cond, raw_x, raw_y) = unwrap_bool_neg(&self.bool_neg, subst, c, x, y);
+        let (mut sx, mut sy) = (find(subst, raw_x), find(subst, raw_y));
+        let mut flat = false;
+        if !types[cond.index()].is_vector() {
+            if let Some((c2, a, _)) = self.select_def[sx.index()]
+                && find(subst, c2) == cond
+            {
+                sx = find(subst, a);
+                flat = true;
+            }
+            if let Some((c2, _, b)) = self.select_def[sy.index()]
+                && find(subst, c2) == cond
+            {
+                sy = find(subst, b);
+                flat = true;
+            }
+            self.select_def[result.index()] = Some((cond, sx, sy));
+        }
+        (cond, sx, sy, flat)
+    }
+
     fn normalized_key(&mut self, op: &Op, types: &[Type], ty: Type, result: Value, subst: &[Value]) -> Option<Result<Key, Value>> {
         match *op {
             Op::StackAddr(slot, offset) => {
                 self.stack_addrs[result.index()] = Some((slot, offset));
                 Some(Ok(Key::StackAddr(slot, offset)))
+            }
+            Op::Unary(u @ (Unary::Ineg | Unary::Bnot | Unary::Bswap), x) => {
+                let xv = find(subst, x);
+                if let Some((prev_u, inner)) = self.unary_src[xv.index()]
+                    && prev_u == u
+                {
+                    return Some(Err(find(subst, inner)));
+                }
+                self.unary_src[result.index()] = Some((u, xv));
+                Some(Ok(Key::Unary(u, operand(&self.consts, types, subst, xv))))
+            }
+            Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr, x, y) => {
+                if let Operand::Imm(_, 0) = operand(&self.consts, types, subst, y) {
+                    return Some(Err(find(subst, x)));
+                }
+                key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok)
             }
             Op::Binary(bin @ (Binary::Iadd | Binary::Isub), x, y) if ty.is_small_int() => {
                 let ox = operand(&self.consts, types, subst, x);
@@ -299,40 +342,192 @@ impl Table {
                     (Binary::Iadd, Operand::Val(base), Operand::Imm(_, imm))
                     | (Binary::Iadd, Operand::Imm(_, imm), Operand::Val(base)) => Some((base, imm)),
                     (Binary::Isub, Operand::Val(base), Operand::Imm(_, imm)) => Some((base, imm.wrapping_neg())),
+                    (Binary::Isub, Operand::Imm(_, 1), Operand::Val(v)) if self.bool_val[v.index()] => {
+                        let (a, b) = order_pair(Operand::Val(v), Operand::Imm(ty, 1));
+                        return Some(Ok(Key::Binary(Binary::Bxor, a, b)));
+                    }
                     _ => None,
                 };
                 if let Some((base, delta)) = val_imm {
+                    let delta = extend(delta, ty, false);
                     if delta == 0 {
                         return Some(Err(base));
                     }
-                    if ty == Type::I64 {
-                        if let Some((slot, base_off)) = self.stack_addrs[base.index()]
-                            && let Some(total) = i32::try_from(delta).ok().and_then(|d| base_off.checked_add(d))
-                        {
-                            self.stack_addrs[result.index()] = Some((slot, total));
-                            return Some(Ok(Key::StackAddr(slot, total)));
-                        }
-                        let (root, base_off) = self.affine[base.index()];
-                        let root = find(subst, root);
-                        let total = base_off.wrapping_add(delta);
-                        self.affine[result.index()] = (root, total);
-                        if total == 0 {
-                            return Some(Err(root));
-                        }
-                        let (a, b) = order_pair(Operand::Val(root), Operand::Imm(Type::I64, total));
-                        return Some(Ok(Key::Binary(Binary::Iadd, a, b)));
+                    if ty == Type::I64
+                        && let Some((slot, base_off)) = self.stack_addrs[base.index()]
+                        && let Some(total) = i32::try_from(delta as i64).ok().and_then(|d| base_off.checked_add(d))
+                    {
+                        self.stack_addrs[result.index()] = Some((slot, total));
+                        return Some(Ok(Key::StackAddr(slot, total)));
                     }
+                    let (root, base_off) = self.affine[base.index()];
+                    let root = find(subst, root);
+                    let total = extend(base_off.wrapping_add(delta), ty, false);
+                    self.affine[result.index()] = (root, total);
+                    if total == 0 {
+                        return Some(Err(root));
+                    }
+                    let (a, b) = order_pair(Operand::Val(root), Operand::Imm(ty, total));
+                    return Some(Ok(Key::Binary(Binary::Iadd, a, b)));
                 }
                 key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok)
+            }
+            Op::Binary(bin @ (Binary::Band | Binary::Bor | Binary::Bxor | Binary::Imul), x, y) if ty.is_small_int() => {
+                let ox = operand(&self.consts, types, subst, x);
+                let oy = operand(&self.consts, types, subst, y);
+                let val_imm = match (ox, oy) {
+                    (Operand::Val(v), Operand::Imm(_, imm)) | (Operand::Imm(_, imm), Operand::Val(v)) => Some((v, imm)),
+                    _ => None,
+                };
+                if let Some((v, raw_imm)) = val_imm {
+                    let imm = extend(raw_imm, ty, false);
+                    let all_ones = extend(-1, ty, false);
+                    let (root, cur_imm) = match self.assoc[v.index()] {
+                        Some((prev_bin, r, c)) if prev_bin == bin => (find(subst, r), c),
+                        _ => (
+                            v,
+                            match bin {
+                                Binary::Band => all_ones,
+                                Binary::Imul => 1,
+                                _ => 0,
+                            },
+                        ),
+                    };
+                    let combined = match bin {
+                        Binary::Band => extend(cur_imm & imm, ty, false),
+                        Binary::Bor => extend(cur_imm | imm, ty, false),
+                        Binary::Bxor => extend(cur_imm ^ imm, ty, false),
+                        _ => extend(cur_imm.wrapping_mul(imm), ty, false),
+                    };
+                    let identity_val = match bin {
+                        Binary::Band => all_ones,
+                        Binary::Imul => 1,
+                        _ => 0,
+                    };
+                    if combined == identity_val || (bin == Binary::Band && self.bool_val[root.index()] && (combined & 1) == 1) {
+                        return Some(Err(root));
+                    }
+                    let known_const = if combined == 0 && matches!(bin, Binary::Band | Binary::Imul) {
+                        Some(0)
+                    } else if bin == Binary::Band && self.bool_val[root.index()] && (combined & 1) == 0 {
+                        Some(0)
+                    } else if bin == Binary::Bor && combined == all_ones {
+                        Some(all_ones)
+                    } else {
+                        None
+                    };
+                    if let Some(cval) = known_const
+                        && let Some(&existing) = self.known.get(&Key::Const(ty, cval))
+                    {
+                        return Some(Err(existing));
+                    }
+                    self.assoc[result.index()] = Some((bin, root, combined));
+                    let (a, b) = order_pair(Operand::Val(root), Operand::Imm(ty, combined));
+                    return Some(Ok(Key::Binary(bin, a, b)));
+                }
+                key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok)
+            }
+            Op::Convert(conv, x) => {
+                let xv = find(subst, x);
+                let x_ty = types[xv.index()];
+                if matches!(conv, Convert::Bitcast | Convert::Uextend | Convert::Sextend | Convert::Ireduce) && ty == x_ty {
+                    return Some(Err(xv));
+                }
+                if let Some((prev_conv, inner, inner_ty)) = self.conv_src[xv.index()] {
+                    let inner = find(subst, inner);
+                    match (prev_conv, conv) {
+                        (Convert::Bitcast, Convert::Bitcast) if ty == inner_ty => return Some(Err(inner)),
+                        (Convert::Bitcast, Convert::Bitcast) => {
+                            self.conv_src[result.index()] = Some((Convert::Bitcast, inner, inner_ty));
+                            return Some(Ok(Key::Convert(Convert::Bitcast, ty, operand(&self.consts, types, subst, inner))));
+                        }
+                        (Convert::Uextend, Convert::Uextend | Convert::Sextend) => {
+                            self.conv_src[result.index()] = Some((Convert::Uextend, inner, inner_ty));
+                            return Some(Ok(Key::Convert(Convert::Uextend, ty, operand(&self.consts, types, subst, inner))));
+                        }
+                        (Convert::Sextend, Convert::Sextend) => {
+                            self.conv_src[result.index()] = Some((Convert::Sextend, inner, inner_ty));
+                            return Some(Ok(Key::Convert(Convert::Sextend, ty, operand(&self.consts, types, subst, inner))));
+                        }
+                        (Convert::Ireduce, Convert::Ireduce) => {
+                            self.conv_src[result.index()] = Some((Convert::Ireduce, inner, inner_ty));
+                            return Some(Ok(Key::Convert(Convert::Ireduce, ty, operand(&self.consts, types, subst, inner))));
+                        }
+                        (Convert::Uextend | Convert::Sextend, Convert::Ireduce) => {
+                            if ty == inner_ty {
+                                return Some(Err(inner));
+                            }
+                            let eff = if ty.bytes() < inner_ty.bytes() { Convert::Ireduce } else { prev_conv };
+                            self.conv_src[result.index()] = Some((eff, inner, inner_ty));
+                            return Some(Ok(Key::Convert(eff, ty, operand(&self.consts, types, subst, inner))));
+                        }
+                        (Convert::Ireduce, Convert::Uextend) if ty == inner_ty && matches!(x_ty, Type::I8 | Type::I16 | Type::I32) => {
+                            let mask = x_ty.unsigned_max() as i64;
+                            self.assoc[result.index()] = Some((Binary::Band, inner, mask));
+                            let (a, b) = order_pair(operand(&self.consts, types, subst, inner), Operand::Imm(ty, mask));
+                            return Some(Ok(Key::Binary(Binary::Band, a, b)));
+                        }
+                        _ => {}
+                    }
+                }
+                self.conv_src[result.index()] = Some((conv, xv, x_ty));
+                let eff_conv = if conv == Convert::Sextend && self.bool_val[xv.index()] {
+                    Convert::Uextend
+                } else {
+                    conv
+                };
+                Some(Ok(Key::Convert(eff_conv, ty, operand(&self.consts, types, subst, xv))))
+            }
+            Op::Icmp(cc, x, y) => {
+                let x_ty = types[find(subst, x).index()];
+                let (cc, a, b) = canonical_icmp(cc, operand(&self.consts, types, subst, x), operand(&self.consts, types, subst, y));
+                if a == b {
+                    let cval = match cc {
+                        IntCC::Equal | IntCC::SignedLessThanOrEqual | IntCC::UnsignedLessThanOrEqual => 1,
+                        _ => 0,
+                    };
+                    if let Some(&existing) = self.known.get(&Key::Const(ty, cval)) {
+                        return Some(Err(existing));
+                    }
+                }
+                if let (Operand::Val(v), Operand::Imm(ity, imm)) = (a, b)
+                    && self.bool_val[v.index()]
+                {
+                    if (cc == IntCC::NotEqual && imm == 0) || (cc == IntCC::Equal && imm == 1) {
+                        if ity == Type::I8 {
+                            return Some(Err(v));
+                        }
+                        if let Some((Convert::Uextend, inner, Type::I8)) = self.conv_src[v.index()] {
+                            return Some(Err(find(subst, inner)));
+                        }
+                    }
+                    if ity == Type::I8 && ((cc == IntCC::Equal && imm == 0) || (cc == IntCC::NotEqual && imm == 1)) {
+                        let (pa, pb) = order_pair(Operand::Val(v), Operand::Imm(Type::I8, 1));
+                        return Some(Ok(Key::Binary(Binary::Bxor, pa, pb)));
+                    }
+                }
+                Some(Ok(Key::Icmp(cc, x_ty, a, b)))
+            }
+            Op::Select(c, x, y) => {
+                let (cond, sx, sy, _) = self.simplify_select(c, x, y, types, result, subst);
+                if sx == sy {
+                    return Some(Err(sx));
+                }
+                if !types[cond.index()].is_vector()
+                    && let Some(imm) = self.consts[cond.index()]
+                {
+                    return Some(Err(if imm == 0 { sy } else { sx }));
+                }
+                Some(Ok(Key::Select(operand(&self.consts, types, subst, cond), operand(&self.consts, types, subst, sx), operand(&self.consts, types, subst, sy))))
             }
             _ => key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok),
         }
     }
 
-    /// Drops from `block` every pure instruction a dominating one already computed, recording its replacement in `subst`; true when it dropped any.
+    /// Drops from `block` every pure instruction a dominating one already computed, recording its replacement in `subst`; true when it dropped or simplified any.
     fn scan(&mut self, func: &mut Function, block: Block, subst: &mut [Value]) -> bool {
         let insts = std::mem::take(&mut func.blocks[block.index()].insts);
-        let before = insts.len();
+        let mut mutated = false;
         let kept: Vec<Inst> = insts
             .into_iter()
             .filter(|inst| {
@@ -354,6 +549,7 @@ impl Table {
                     Ok(key) => key,
                     Err(alias) => {
                         subst[result.index()] = alias;
+                        mutated = true;
                         return false;
                     }
                 };
@@ -362,20 +558,28 @@ impl Table {
                         return true;
                     }
                     subst[result.index()] = earlier;
+                    mutated = true;
                     false
-                } else if let Some(earlier) = self.alt_select(&data.op, &func.types, subst) {
+                } else if let Some(earlier) = self.alt_select(&func.insts[inst.index()].op, &func.types, subst) {
                     subst[result.index()] = earlier;
+                    mutated = true;
                     false
                 } else {
+                    if let Op::Select(c, x, y) = func.insts[inst.index()].op {
+                        let (cond, sx, sy, flat) = self.simplify_select(c, x, y, &func.types, result, subst);
+                        if flat {
+                            func.insts[inst.index()].op = Op::Select(cond, sx, sy);
+                            mutated = true;
+                        }
+                    }
                     let prev = self.known.insert(key, result);
                     self.added.push((key, prev));
                     true
                 }
             })
             .collect();
-        let dropped = kept.len() != before;
         func.blocks[block.index()].insts = kept;
-        dropped
+        mutated
     }
 
     fn forget(&mut self, mark: usize) {
@@ -472,14 +676,20 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     }
     let affine = identity(func.types.len()).into_iter().map(|v| (v, 0_i64)).collect();
     let stack_addrs = vec![None; func.types.len()];
+    let nvals = func.types.len();
     let mut table = Table {
         consts,
         bool_neg,
         icmp_def,
         def_block,
         local_flag_only,
+        bool_val,
         affine,
         stack_addrs,
+        assoc: vec![None; nvals],
+        unary_src: vec![None; nvals],
+        conv_src: vec![None; nvals],
+        select_def: vec![None; nvals],
         ..Table::default()
     };
     let mut dropped = false;
