@@ -4,6 +4,9 @@ use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
 use super::RewriteCx;
 
+#[path = "ord.rs"]
+mod ord;
+
 const MAX_DEPTH: u8 = 4;
 
 #[derive(Clone, Copy)]
@@ -373,6 +376,9 @@ pub(super) fn eval_select(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: 
     }
     if let Some(bit) = non_null_cmp(cx.func, &|v| cx.def(v), &|v| cx.sconst(v), (cc, x, y)) {
         return Some(Some(Op::Const(i64::from(bit))));
+    }
+    if let Some(op) = ord::eval_three_way(cx, cc, x, y) {
+        return Some(Some(op));
     }
     for (norm, val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
         if let Some(k) = cx.sconst(c_val)
