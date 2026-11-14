@@ -66,6 +66,10 @@ pub(crate) fn crosses_ranges(calls: &[u32], ranges: &[Range]) -> bool {
     ranges.iter().any(|r| crosses_span(calls, (r.start, r.end)))
 }
 
+pub(super) fn crosses_call(live: &Live, value: usize) -> bool {
+    crosses_ranges(&live.calls, live.ranges_of(value))
+}
+
 pub(crate) fn parks(live: &Live, hints: &Hints, value: usize) -> bool {
     hints.park.is_some() && hints.weights.is_some_and(|w| leaf_park_cost(live, hints, value).is_some_and(|c| c < w[value]))
 }
@@ -106,10 +110,9 @@ fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, poo
             && let Some(slot) = out.regs.iter().position(|r| *r == reg)
             && !out.is_saved[slot]
             && pooled[value.index()]
-            && !live.trapped[value.index()]
         {
             let ranges = live.ranges_of(value.index());
-            if !ranges.is_empty() && !crosses_ranges(&live.calls, ranges) && !out.slot_clobbered(slot, ranges) {
+            if !ranges.is_empty() && !crosses_call(live, value.index()) && !out.slot_clobbered(slot, ranges) {
                 out.kept[value.index()] = Some(reg);
             }
         }
@@ -365,7 +368,7 @@ fn try_place_weighted<'a, F: Copy + PartialEq>(
     let Some((start, end)) = live.bounds(value) else { return (false, Vec::new()) };
     let ranges = live.ranges_of(value);
     let wide_val = func.types[value].bytes() > 8;
-    let needs_saved = live.trapped[value] || crosses_ranges(&live.calls, ranges);
+    let needs_saved = crosses_call(live, value);
     let can_park = needs_saved && parks(live, hints, value);
     if needs_saved && wide_val && !can_park {
         return (false, Vec::new());
@@ -521,7 +524,7 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
         }
         let ranges = live.ranges_of(value);
         let wide_val = func.types[value].bytes() > 8;
-        let needs_saved = live.trapped[value] || crosses_ranges(&live.calls, ranges);
+        let needs_saved = crosses_call(live, value);
         let can_park = needs_saved && parks(live, hints, value);
         if needs_saved && wide_val && !can_park {
             continue;

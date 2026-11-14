@@ -1,7 +1,7 @@
 use crate::ir::{Block, Function, Op, Type};
 use crate::live::{Live, Range, overlaps};
 
-use super::{Hints, Pool, SlotSet, crosses_ranges};
+use super::{Hints, Pool, SlotSet, crosses_call, crosses_ranges};
 
 pub(super) struct Victim {
     pub(super) slot: usize,
@@ -98,10 +98,10 @@ pub(super) fn park_cost(calls: &[u32], weights: &[u64], ranges: &[Range]) -> u64
 
 pub(super) fn leaf_park_cost(live: &Live, hints: &Hints, value: usize) -> Option<u64> {
     let ranges = live.ranges_of(value);
-    if ranges.is_empty() || live.trapped[value] || crosses_ranges(&live.unwinds, ranges) {
+    if ranges.is_empty() || crosses_ranges(&live.unwinds, ranges) {
         return None;
     }
-    if !crosses_ranges(&live.calls, ranges) {
+    if !crosses_call(live, value) {
         return Some(0);
     }
     let (call_weights, val_weights) = hints.park.zip(hints.weights)?;
@@ -110,7 +110,7 @@ pub(super) fn leaf_park_cost(live: &Live, hints: &Hints, value: usize) -> Option
 }
 
 pub(super) fn holder_leaf_cost<F: Copy + PartialEq>(pool: &Pool<F>, live: &Live, hints: &Hints, cost: &[u64], slot: usize, h: usize) -> u64 {
-    let h_park = if crosses_ranges(&live.calls, live.ranges_of(h)) {
+    let h_park = if crosses_call(live, h) {
         leaf_park_cost(live, hints, h).unwrap_or(0)
     } else {
         0
@@ -243,12 +243,12 @@ pub(super) fn find_relocate<F: Copy + PartialEq>(
                 break;
             };
             let h_wide = func.types[h].bytes() > 8;
-            let h_needs_saved = live.trapped[h] || crosses_ranges(&live.calls, h_ranges);
+            let h_needs_saved = crosses_call(live, h);
             let h_leaf_park = if !h_needs_saved {
                 Some(0)
             } else if pool.is_saved[s] {
                 leaf_park_cost(live, hints, h)
-            } else if !live.trapped[h] && !crosses_ranges(&live.unwinds, h_ranges) {
+            } else if !crosses_ranges(&live.unwinds, h_ranges) {
                 Some(0)
             } else {
                 None

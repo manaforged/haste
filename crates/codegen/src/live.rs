@@ -129,7 +129,6 @@ pub(crate) struct Live {
     pub unwinds: Vec<u32>,
     pub calls: Vec<u32>,
     pub sites: Vec<(Inst, Block)>,
-    pub trapped: Vec<bool>,
 }
 
 impl Live {
@@ -296,7 +295,6 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
     let mut touched: Vec<usize> = Vec::new();
     let mut defs = vec![0; count];
     let (mut unwinds, mut calls, mut sites) = (Vec::new(), Vec::new(), Vec::new());
-    let mut trapped = vec![false; count];
     let mut at = 0_u32;
     for &block in order {
         let index = block.index();
@@ -387,9 +385,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
                     unwinds.push(at);
                 }
                 let traps = insts.get(place + 1).is_some_and(|next| matches!(func.insts[next.index()].op, Op::Trap));
-                if matches!(data.op, Op::Call { .. }) && traps {
-                    for_effective_operands(data, sib, elided, |v| trapped[v.index()] = true);
-                } else {
+                if !(traps && matches!(data.op, Op::Call { .. })) {
                     calls.push(at);
                     sites.push((inst, block));
                 }
@@ -430,7 +426,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
         ranges.extend(list);
         slice.push((off, len));
     }
-    Live { ranges, slice, defs, unwinds, calls, sites, trapped }
+    Live { ranges, slice, defs, unwinds, calls, sites }
 }
 
 pub(crate) fn results(data: &InstData) -> impl Iterator<Item = Value> + '_ {

@@ -1,7 +1,7 @@
 use crate::ir::Value;
 use crate::live::{Live, Range, overlaps};
 
-use super::{Hints, Pool, crosses_ranges, parks, slot_free};
+use super::{Hints, Pool, crosses_call, crosses_ranges, parks, slot_free};
 
 fn pick_slot<F: Copy + PartialEq>(
     pool: &Pool<F>,
@@ -72,7 +72,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
             return None;
         }
         let pr = live.ranges_of(p);
-        (!crosses_ranges(&live.unwinds, pr)).then(|| Some((p, live.trapped[p] || crosses_ranges(&live.calls, pr), pr.first()?.start))).flatten()
+        (!crosses_ranges(&live.unwinds, pr)).then(|| Some((p, crosses_call(live, p), pr.first()?.start))).flatten()
     };
     let partners = hints.partners.map_or(&[][..], |m| &m[value][..]);
     let unalloc_back: Vec<(usize, bool, u32)> = back_partners.iter().copied().filter_map(unalloc_info).collect();
@@ -114,8 +114,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         let call_at = end + 1;
         let plain_call = live.calls.binary_search(&call_at).is_ok() && live.unwinds.binary_search(&call_at).is_err();
         if (!at_call_end || plain_call)
-            && !live.trapped[value]
-            && !crosses_ranges(&live.calls, ranges)
+            && !crosses_call(live, value)
             && !reserved.contains(&reg)
             && let Some(s) = pool.regs.iter().position(|r| *r == reg)
             && slot_free(pool, s, &holders[s], live, ranges, start, kept_reg)
