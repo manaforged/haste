@@ -233,20 +233,23 @@ impl Emit<'_> {
                 self.asm.load(narrow, dst, source);
                 return Ok(dst);
             }
-            if size == Size::Q
+            if matches!(size, Size::D | Size::Q)
                 && matches!(alu, Alu::Add | Alu::Sub)
-                && let Some(rx) = self.reg_of(x).filter(|&rx| rx != dst)
+                && let Some(rx) = self.reg_of(x).or_else(|| self.cached_spill(x)).filter(|&rx| rx != dst && rx != Reg::Rsp)
             {
                 let disp = match alu {
                     Alu::Add => self.imm_sized(y, size),
+                    _ if size == Size::D => self.const_of(y).map(|c| (c as i32).wrapping_neg()),
                     _ => self.const_of(y).and_then(|c| c.checked_neg()).and_then(|c| i32::try_from(c).ok()),
                 };
                 if let Some(imm) = disp {
-                    self.asm.lea(dst, Mem::new(rx, imm));
+                    self.asm.lea_sized(size, dst, Mem::new(rx, imm));
                     return Ok(dst);
                 }
-                if matches!(alu, Alu::Add) && let Some(ry) = self.reg_of(y) {
-                    self.asm.lea(dst, Mem::sib(rx, ry, 0, 0));
+                if matches!(alu, Alu::Add)
+                    && let Some(ry) = self.reg_of(y).or_else(|| self.cached_spill(y)).filter(|&ry| ry != Reg::Rsp)
+                {
+                    self.asm.lea_sized(size, dst, Mem::sib(rx, ry, 0, 0));
                     return Ok(dst);
                 }
             }
@@ -329,12 +332,12 @@ impl Emit<'_> {
             self.asm.mov_imm(dst, 0);
             return;
         }
-        if size == Size::Q && matches!(imm, 3 | 5 | 9) {
+        if matches!(size, Size::D | Size::Q) && matches!(imm, 3 | 5 | 9) {
             let rx = match self.reg_of(x).or_else(|| self.cached_spill(x)) {
-                Some(r) => r,
-                None => { self.raw(dst, x); dst }
+                Some(r) if r != Reg::Rsp => r,
+                _ => { self.raw(dst, x); dst }
             };
-            self.asm.lea(dst, Mem::sib(rx, rx, (imm - 1).trailing_zeros() as u8, 0));
+            self.asm.lea_sized(size, dst, Mem::sib(rx, rx, (imm - 1).trailing_zeros() as u8, 0));
             return;
         }
         if imm > 0 && imm.count_ones() == 1 {

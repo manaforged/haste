@@ -5,8 +5,8 @@ use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, IntCC, Op, Typ
 const MAX_FULL_TRIPS: usize = 64;
 const MAX_FULL_INSTS: usize = 1024;
 const MAX_CHAIN_BLOCKS: usize = 8;
-const MAX_CHAIN_TRIPS: usize = 16;
-const MAX_CHAIN_UNROLLED_INSTS: usize = 96;
+const MAX_CHAIN_TRIPS: usize = 64;
+const MAX_CHAIN_UNROLLED_INSTS: usize = 384;
 
 fn remap_val(map: &[(Value, Value)], v: Value) -> Value {
     map.iter().rev().find(|&&(old, _)| old == v).map_or(v, |&(_, new)| new)
@@ -587,14 +587,14 @@ fn unroll_chain(func: &mut Function, cfg: &Cfg, each: &Loop, global_consts: &[Op
     let latch = each.latches[0];
     let body_insts: usize = chain.segs.iter().map(|s| s.non_term.len()).sum();
     let total_insts = body_insts + chain.segs.len();
-    let is_legacy_two = chain.segs.len() == 2 && matches!(chain.kind, LoopChainKind::TopTested { .. });
-    if (is_legacy_two && total_insts > 64 && body_insts > MAX_CHAIN_UNROLLED_INSTS)
-        || (!is_legacy_two && body_insts > MAX_CHAIN_UNROLLED_INSTS)
+    let is_two_seg = chain.segs.len() == 2;
+    if (is_two_seg && total_insts > 64 && body_insts > MAX_CHAIN_UNROLLED_INSTS)
+        || (!is_two_seg && body_insts > MAX_CHAIN_UNROLLED_INSTS)
     {
         return false;
     }
     let Some(init_params) = outside_const_params(func, cfg, head, latch, global_consts) else { return false };
-    let max_trips = if is_legacy_two { MAX_FULL_TRIPS } else { MAX_CHAIN_TRIPS };
+    let max_trips = if is_two_seg { MAX_FULL_TRIPS } else { MAX_CHAIN_TRIPS };
     let Some(proven) = eval_chain(func, &chain, init_params, global_consts, max_trips) else {
         return false;
     };
@@ -603,7 +603,7 @@ fn unroll_chain(func: &mut Function, cfg: &Cfg, each: &Loop, global_consts: &[Op
         LoopChainKind::BottomTested { .. } => proven + 1,
     };
     let head_len = chain.segs[0].non_term.len() + 1;
-    let fits_legacy = is_legacy_two && total_insts <= 64 && head_len + trips * total_insts <= MAX_FULL_INSTS;
+    let fits_legacy = is_two_seg && total_insts <= 64 && head_len + trips * total_insts <= MAX_FULL_INSTS;
     let fits_chain = trips <= MAX_CHAIN_TRIPS && trips * body_insts <= MAX_CHAIN_UNROLLED_INSTS;
     if trips > 0 && !fits_legacy && !fits_chain {
         return false;

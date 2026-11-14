@@ -460,6 +460,9 @@ fn preserved(func: &Function, plan: &Plan<Reg>, b_idx: usize, start: usize, end:
     if start + 1 >= end || plan.location(val).is_static() {
         return true;
     }
+    if end - start > 128 {
+        return false;
+    }
     let (reg, slot_id) = match plan.location(val) {
         Location::Reg(reg) => (Some(reg), None),
         Location::Slot => {
@@ -657,7 +660,7 @@ fn sib_ok(func: &Function, plan: &Plan<Reg>, b_idx: usize, m: &SibMatch, extra_s
 }
 
 pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &Features) {
-    if func.size() > 2000 {
+    if func.size() > 8192 {
         return;
     }
     let n = func.types.len();

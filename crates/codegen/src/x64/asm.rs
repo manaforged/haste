@@ -496,7 +496,11 @@ impl Asm {
     }
 
     pub fn lea(&mut self, dst: Reg, src: Mem) {
-        self.encode(&[], true, &[0x8D], dst as u8, src.into(), false);
+        self.lea_sized(Size::Q, dst, src);
+    }
+
+    pub fn lea_sized(&mut self, size: Size, dst: Reg, src: Mem) {
+        self.encode(&[], size == Size::Q, &[0x8D], dst as u8, src.into(), false);
     }
 
     pub fn xchg(&mut self, size: Size, dst: Mem, src: Reg) {
@@ -529,13 +533,20 @@ impl Asm {
         self.code.push(imm);
     }
 
-    pub fn pshift_imm(&mut self, ext: u8, lane_bytes: u32, dst: Xmm, imm: u8) {
-        let opcode = match lane_bytes {
+    fn pshift_opc(lane_bytes: u32) -> u8 {
+        match lane_bytes {
             2 => 0x71,
             4 => 0x72,
             _ => 0x73,
-        };
-        self.sse_imm(&[0x66], &[0x0F, opcode], ext, dst, imm);
+        }
+    }
+
+    pub fn pshift_imm(&mut self, ext: u8, lane_bytes: u32, dst: Xmm, imm: u8) {
+        self.sse_imm(&[0x66], &[0x0F, Self::pshift_opc(lane_bytes)], ext, dst, imm);
+    }
+
+    pub fn vex_pshift_imm(&mut self, ext: u8, lane_bytes: u32, dst: Xmm, src: Xmm, imm: u8) {
+        self.vex_xmm_imm(0b00001, 0b01, Self::pshift_opc(lane_bytes), (Xmm(ext), dst), src, imm);
     }
 
     pub fn movd_in(&mut self, xmm: Xmm, reg: Reg) {

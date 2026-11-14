@@ -35,6 +35,11 @@ pub(super) fn vec_prefix(lane: Lane) -> &'static [u8] {
     if lane == Lane::F64 { &[0x66] } else { &[] }
 }
 
+fn is_commutative(op: Binary) -> bool {
+    matches!(op, Binary::Iadd | Binary::Imul | Binary::Band | Binary::Bor | Binary::Bxor | Binary::Fadd | Binary::Fmul
+        | Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax | Binary::SaddSat | Binary::UaddSat | Binary::AvgRound)
+}
+
 impl Emit<'_> {
     pub(super) fn vector_zero(&mut self, result: Value) {
         if !self.is_static(result) {
@@ -58,6 +63,36 @@ impl Emit<'_> {
         }
         self.fget(dst, x);
         self.asm.sse(prefix, opcode, dst.0, source);
+    }
+
+    fn sse_or_vex(&mut self, prefix: &[u8], opcode: &[u8], (dst, sx, sy): (Xmm, Xmm, Xmm)) {
+        let pp = match prefix { [] => Some(0), [0x66] => Some(1), [0xF3] => Some(2), [0xF2] => Some(3), _ => None };
+        let map_opc = match opcode { [0x0F, o] => Some((1, *o)), [0x0F, 0x38, o] => Some((2, *o)), _ => None };
+        if self.features.avx && let (Some(pp), Some((map, opc))) = (pp, map_opc) {
+            self.asm.vex_xmm(map, pp, opc, (dst, sx), sy);
+            return;
+        }
+        if dst != sx {
+            self.asm.movaps(dst, sx);
+        }
+        self.asm.sse(prefix, opcode, dst.0, sy);
+    }
+
+    pub(super) fn vex_packed_op(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), result: Value, commute: bool) {
+        let dst = self.fdst(result);
+        self.vex_packed_regs(prefix, opcode, (x, y), dst, commute);
+        self.fput(result, dst);
+    }
+
+    pub(super) fn vex_packed_regs(&mut self, prefix: &[u8], opcode: &[u8], (x, y): (Value, Value), dst: Xmm, commute: bool) {
+        if self.features.avx {
+            let sx = self.fin(x, X0);
+            let sy = self.fin(y, X1);
+            self.sse_or_vex(prefix, opcode, (dst, sx, sy));
+            return;
+        }
+        let pair = if commute && self.xmm_of(x) != Some(dst) && self.xmm_of(y) == Some(dst) { (y, x) } else { (x, y) };
+        self.packed_regs(prefix, opcode, pair, dst);
     }
 
     pub(super) fn splat_scalar(&mut self, lane: Lane, dst: Xmm, reg: Reg) {
@@ -100,15 +135,15 @@ impl Emit<'_> {
         let dst = self.xmm_of(result).unwrap_or(X2);
         match op {
             Unary::Bnot => {
-                self.fget(dst, x);
-                self.asm.sse(&[0x66], &[0x0F, 0x76], X1.0, X1);
-                self.asm.sse(&[0x66], &[0x0F, 0xEF], dst.0, X1);
+                let sx = if self.features.avx { self.fin(x, X0) } else { self.fget(dst, x); dst };
+                self.sse_or_vex(&[0x66], &[0x0F, 0x76], (X1, X1, X1));
+                self.sse_or_vex(&[0x66], &[0x0F, 0xEF], (dst, sx, X1));
             }
             Unary::Ineg if lane.is_int() => {
-                self.fget(X0, x);
+                let sx = if self.xmm_of(x) != Some(dst) { self.fin(x, X0) } else { self.fget(X0, x); X0 };
                 self.zero_xmm(dst);
                 let sub = vec_alu_opcode(Binary::Isub, lane).ok_or_else(|| format!("{op:?} of {lane:?}"))?;
-                self.asm.sse(&[0x66], &[0x0F, sub], dst.0, X0);
+                self.sse_or_vex(&[0x66], &[0x0F, sub], (dst, dst, sx));
             }
             Unary::Fneg | Unary::Fabs if lane.is_float() => {
                 self.fget(dst, x);
@@ -209,14 +244,14 @@ impl Emit<'_> {
             return Err(format!("non-vector type {:?} in vector_binary", self.ty(x)));
         };
         if let Some(opcode) = vec_alu_opcode(op, lane) {
-            self.packed_op(&[0x66], &[0x0F, opcode], (x, y), result);
+            self.vex_packed_op(&[0x66], &[0x0F, opcode], (x, y), result, is_commutative(op));
             return Ok(());
         }
         if let Some(opcode) = float_vec_opcode(op) {
             if !lane.is_float() {
                 return Err(format!("{op:?} of integer vector {lane:?}"));
             }
-            self.packed_op(vec_prefix(lane), &[0x0F, opcode], (x, y), result);
+            self.vex_packed_op(vec_prefix(lane), &[0x0F, opcode], (x, y), result, is_commutative(op));
             return Ok(());
         }
         match op {
@@ -257,7 +292,7 @@ impl Emit<'_> {
             _ => None,
         };
         if let Some(opc) = sse_opc {
-            self.packed_op(&[0x66], &[0x0F, opc], (x, y), result);
+            self.vex_packed_op(&[0x66], &[0x0F, opc], (x, y), result, is_commutative(op));
             return Ok(());
         }
         let dst = self.xmm_of(result).unwrap_or(X2);
@@ -313,8 +348,8 @@ impl Emit<'_> {
     fn vector_imul(&mut self, lane: Lane, count: u8, x: Value, y: Value, result: Value) -> Result<(), String> {
         let dst = self.xmm_of(result).unwrap_or(X2);
         match lane {
-            Lane::I16 => self.packed_regs(&[0x66], &[0x0F, 0xD5], (x, y), dst),
-            Lane::I32 if self.features.sse41 => self.packed_regs(&[0x66], &[0x0F, 0x38, 0x40], (x, y), dst),
+            Lane::I16 => self.vex_packed_regs(&[0x66], &[0x0F, 0xD5], (x, y), dst, true),
+            Lane::I32 if self.features.sse41 => self.vex_packed_regs(&[0x66], &[0x0F, 0x38, 0x40], (x, y), dst, true),
             Lane::I32 => {
                 self.fget(X0, x);
                 self.fget(X1, y);
@@ -371,7 +406,7 @@ impl Emit<'_> {
 
     fn vector_iminmax(&mut self, op: Binary, lane: Lane, count: u8, x: Value, y: Value, result: Value) -> Result<(), String> {
         if let Some(bytes) = self.iminmax_opc(op, lane) {
-            self.packed_op(&[0x66], bytes, (x, y), result);
+            self.vex_packed_op(&[0x66], bytes, (x, y), result, true);
             return Ok(());
         }
         let cc = match op {
@@ -430,18 +465,28 @@ impl Emit<'_> {
                         Binary::Sshr => 4,
                         _ => 6,
                     };
+                    if self.features.avx {
+                        let sx = self.fin(x, X0);
+                        self.asm.vex_pshift_imm(ext, lane.bytes(), dst, sx, k);
+                    } else {
+                        let src = self.fin(x, dst);
+                        if dst != src {
+                            self.asm.movaps(dst, src);
+                        }
+                        self.asm.pshift_imm(ext, lane.bytes(), dst, k);
+                    }
+                    self.fput(result, dst);
+                    return Ok(());
+                }
+                let sx = if self.features.avx {
+                    self.fin(x, X0)
+                } else {
                     let src = self.fin(x, dst);
                     if dst != src {
                         self.asm.movaps(dst, src);
                     }
-                    self.asm.pshift_imm(ext, lane.bytes(), dst, k);
-                    self.fput(result, dst);
-                    return Ok(());
-                }
-                let src = self.fin(x, dst);
-                if dst != src {
-                    self.asm.movaps(dst, src);
-                }
+                    dst
+                };
                 self.get(Reg::Rax, scalar_v, Ext::Zero);
                 self.asm.alu_imm32(Alu::And, Reg::Rax, (lane.bits() - 1) as i32);
                 self.asm.movd_in(X1, Reg::Rax);
@@ -455,7 +500,7 @@ impl Emit<'_> {
                     (Binary::Sshr, Lane::I16) => 0xE1,
                     _ => 0xE2,
                 };
-                self.asm.sse(&[0x66], &[0x0F, opc], dst.0, X1);
+                self.sse_or_vex(&[0x66], &[0x0F, opc], (dst, sx, X1));
                 self.fput(result, dst);
                 return Ok(());
             }
@@ -470,8 +515,16 @@ impl Emit<'_> {
             return Err(format!("non-vector type {:?} in vector_icmp", self.ty(x)));
         };
         let dst = self.xmm_of(result).unwrap_or(X2);
+        let unsigned = matches!(
+            cc,
+            IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual | IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual
+        );
         if lane == Lane::I64 && !self.features.sse41 {
             self.scalarize_int_icmp(cc, lane, count, x, y, dst);
+        } else if self.features.avx && !unsigned {
+            let ax = self.fin(x, X0);
+            let bx = self.fin(y, X1);
+            self.emit_icmp_regs(cc, lane, ax, bx, dst);
         } else {
             self.fget(X0, x);
             self.fget(X1, y);
@@ -517,13 +570,10 @@ impl Emit<'_> {
             IntCC::SignedLessThanOrEqual | IntCC::UnsignedLessThanOrEqual => (gt_opc, a, b, true),
             IntCC::SignedGreaterThanOrEqual | IntCC::UnsignedGreaterThanOrEqual => (gt_opc, b, a, true),
         };
-        if dst != left {
-            self.asm.movaps(dst, left);
-        }
-        self.asm.sse(&[0x66], opc, dst.0, right);
+        self.sse_or_vex(&[0x66], opc, (dst, left, right));
         if invert {
-            self.asm.sse(&[0x66], &[0x0F, 0x76], X1.0, X1);
-            self.asm.sse(&[0x66], &[0x0F, 0xEF], dst.0, X1);
+            self.sse_or_vex(&[0x66], &[0x0F, 0x76], (X1, X1, X1));
+            self.sse_or_vex(&[0x66], &[0x0F, 0xEF], (dst, dst, X1));
         }
     }
 
@@ -538,13 +588,20 @@ impl Emit<'_> {
             FloatCC::GreaterThanOrEqual => (y, x, 2),
         };
         let dst = self.fdst(result);
-        let mut src = self.fin(right, X1);
-        if src == dst && left != right {
-            self.asm.movaps(X1, src);
-            src = X1;
+        if self.features.avx {
+            let sx = self.fin(left, X0);
+            let sy = self.fin(right, X1);
+            let pp = if lane == Lane::F64 { 0b01 } else { 0b00 };
+            self.asm.vex_xmm_imm(0b00001, pp, 0xC2, (dst, sx), sy, imm);
+        } else {
+            let mut src = self.fin(right, X1);
+            if src == dst && left != right {
+                self.asm.movaps(X1, src);
+                src = X1;
+            }
+            self.fget(dst, left);
+            self.asm.sse_imm(vec_prefix(lane), &[0x0F, 0xC2], dst.0, src, imm);
         }
-        self.fget(dst, left);
-        self.asm.sse_imm(vec_prefix(lane), &[0x0F, 0xC2], dst.0, src, imm);
         self.fput(result, dst);
     }
 
@@ -560,7 +617,12 @@ impl Emit<'_> {
 
     pub(super) fn vector_select(&mut self, cond: Value, x: Value, y: Value, result: Value) {
         let dst = self.xmm_of(result).unwrap_or(X2);
-        if self.features.sse41 {
+        if self.features.avx {
+            let mask = self.fin(cond, X0);
+            let sy = self.fin(y, dst);
+            let sx = self.fin(x, X1);
+            self.asm.vex_xmm_imm(0b00011, 0b01, 0x4C, (dst, sy), sx, mask.0 << 4);
+        } else if self.features.sse41 {
             self.fget(X0, cond);
             let mut src = self.fin(x, X1);
             if src == dst && x != y {
