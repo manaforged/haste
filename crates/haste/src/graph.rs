@@ -291,7 +291,7 @@ pub fn library() -> Result<PathBuf> {
 
 /// Loads the standard library graph rooted at the `sysroot` package of `library`.
 pub fn load_sysroot(library: &Path, targets: &Targets) -> Result<Workspace> {
-    let mut sysroot = load_with(&library.join("sysroot"), targets, &["backtrace"])?;
+    let mut sysroot = load_with(&library.join("sysroot"), targets, &[])?;
     sysroot.packages.iter_mut().for_each(|package| package.sysroot = true);
     Ok(sysroot)
 }
