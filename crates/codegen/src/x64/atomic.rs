@@ -290,7 +290,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn slot(&self, slot: StackSlot, offset: i32) -> Mem {
-        Mem::new(Reg::Rbp, self.frame.slots[slot.index()] + offset)
+        self.frame_mem(self.frame.slots[slot.index()] + offset)
     }
 
     fn read(&mut self, result: Value, from: Mem) {

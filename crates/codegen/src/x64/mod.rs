@@ -48,6 +48,9 @@ const REGS_WIN64: Regs<Reg> = Regs {
 
 const INTAKE_XMM: Xmm = Xmm(15);
 
+/// The registers that frame setup and the probe use, which no shrink-wrapped entry may hold a value in.
+const FRAME_REGS: [Reg; 3] = [Reg::Rbp, Reg::Rsp, Reg::R11];
+
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
 const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
 
@@ -61,7 +64,8 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     if plan.elided.iter().filter(|&&e| e).count() != elided_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
-    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[Reg::Rbp, Reg::Rsp, Reg::R11]);
+    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS);
+    let (base, bias) = if omits_frame_pointer(func, framed) { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
     let mut asm = Asm::default();
     asm.avx = features.avx;
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -72,6 +76,8 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         func,
         frame,
         framed,
+        base,
+        bias,
         abi,
         abi_kind,
         asm,
@@ -98,6 +104,13 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         tails: Tails::new(),
     };
     drive(emit, &order)
+}
+
+/// Whether a framed function addresses its frame from rsp: it reads no frame pointer, catches no unwind and holds no float or vector, whose lowering moves rsp inside the body.
+fn omits_frame_pointer(func: &Function, framed: bool) -> bool {
+    framed
+        && !func.types.iter().any(|ty| ty.in_float_register())
+        && !func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
 }
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
@@ -131,6 +144,8 @@ pub(super) struct Emit<'a> {
     func: &'a Function,
     frame: Frame<Reg>,
     framed: bool,
+    base: Reg,
+    bias: i32,
     abi: Abi,
     abi_kind: CallAbi,
     asm: Asm,
@@ -170,16 +185,20 @@ impl<'a> Emitter<'a> for Emit<'a> {
         if !self.framed {
             return;
         }
-        self.asm.push(Reg::Rbp);
-        self.asm.mov(Reg::Rbp, Reg::Rsp);
-        let size = self.frame.size;
+        let size = if self.base == Reg::Rsp {
+            self.frame.size + 8
+        } else {
+            self.asm.push(Reg::Rbp);
+            self.asm.mov(Reg::Rbp, Reg::Rsp);
+            self.frame.size
+        };
         if size > PAGE {
             self.probe(size);
         } else if size > 0 {
             self.asm.alu_imm(Alu::Sub, Reg::Rsp, size as i32);
         }
         for (index, &reg) in self.frame.saves.iter().enumerate() {
-            self.asm.store(Size::Q, Mem::new(Reg::Rbp, save_offset(index)), reg);
+            self.asm.store(Size::Q, self.frame_mem(save_offset(index)), reg);
         }
     }
 
@@ -307,7 +326,7 @@ impl Emit<'_> {
     fn at(&self, value: Value) -> Mem {
         let disp = self.frame.values[value.index()];
         debug_assert_ne!(disp, 0, "unhomed value {value:?} in at()");
-        Mem::new(Reg::Rbp, disp)
+        self.frame_mem(disp)
     }
 
     fn ty(&self, value: Value) -> Type {
@@ -356,9 +375,12 @@ impl Emit<'_> {
 
     fn epilogue(&mut self) {
         for (index, &reg) in self.frame.saves.iter().enumerate() {
-            self.asm.load(Size::Q, reg, Mem::new(Reg::Rbp, save_offset(index)));
+            self.asm.load(Size::Q, reg, self.frame_mem(save_offset(index)));
         }
-        self.asm.bytes(if self.framed { &[0xC9, 0xC3] } else { &[0xC3] });
+        if self.framed && self.base == Reg::Rsp {
+            self.asm.alu_imm(Alu::Add, Reg::Rsp, self.bias + 8);
+        }
+        self.asm.bytes(if self.framed && self.base == Reg::Rbp { &[0xC9, 0xC3] } else { &[0xC3] });
     }
 
     fn copy_to(&mut self, to: Mem, from: Mem, ty: Type, scratch: Xmm) {
@@ -373,12 +395,12 @@ impl Emit<'_> {
             self.asm.load(Size::Q, Reg::Rax, from.offset(8));
             self.asm.store(Size::Q, to.offset(8), Reg::Rax);
             self.clobber_reg(Reg::Rax);
-            if to.base == Reg::Rbp && to.index.is_none() {
-                self.invalidate_disp(to.disp);
-                self.invalidate_disp(to.disp + 8);
+            if let Some(disp) = self.frame_disp(to) {
+                self.invalidate_disp(disp);
+                self.invalidate_disp(disp + 8);
             }
-        } else if to.base == Reg::Rbp && to.index.is_none() {
-            self.write_spill(to.disp, Reg::Rax);
+        } else if let Some(disp) = self.frame_disp(to) {
+            self.write_spill(disp, Reg::Rax);
         } else {
             self.clobber_reg(Reg::Rax);
         }
@@ -430,8 +452,8 @@ impl Emit<'_> {
                 Step::Restore(EdgeScratch::Int(i), param) => self.put(param, int_scratch[i]),
                 Step::Save(arg, EdgeScratch::Float(i)) => self.fget(float_scratch[i], arg),
                 Step::Restore(EdgeScratch::Float(i), param) => self.fput(param, float_scratch[i]),
-                Step::Save(arg, EdgeScratch::Stack(i)) => self.move_to(Mem::new(Reg::Rbp, self.frame.edge_slot(i)), arg),
-                Step::Restore(EdgeScratch::Stack(i), param) => self.load_home(param, Mem::new(Reg::Rbp, self.frame.edge_slot(i)), float::X2),
+                Step::Save(arg, EdgeScratch::Stack(i)) => self.move_to(self.frame_mem(self.frame.edge_slot(i)), arg),
+                Step::Restore(EdgeScratch::Stack(i), param) => self.load_home(param, self.frame_mem(self.frame.edge_slot(i)), float::X2),
             }
         }
         Ok(())
@@ -719,9 +741,9 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
         self.invalidate_spills();
     }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
-    fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, Mem::new(Reg::Rbp, INCOMING + offset as i32), INTAKE_XMM); }
+    fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, self.frame_mem(INCOMING + offset as i32), INTAKE_XMM); }
     fn intake_struct(&mut self, value: Value, offset: u32) {
-        self.asm.lea(Reg::Rax, Mem::new(Reg::Rbp, INCOMING + offset as i32));
+        self.asm.lea(Reg::Rax, self.frame_mem(INCOMING + offset as i32));
         self.clobber_reg(Reg::Rax);
         self.put(value, Reg::Rax);
     }

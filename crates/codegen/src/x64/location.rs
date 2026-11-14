@@ -105,7 +105,17 @@ impl Emit<'_> {
         self.xmm_of(value).unwrap_or(Xmm(0))
     }
 
-    /// The memory at `addr + offset`: relative to rbp for a frame address, to the location register of `addr`, or through rcx.
+    /// The frame memory at `disp` from where rbp would point, addressed from the frame base.
+    pub(super) fn frame_mem(&self, disp: i32) -> Mem {
+        Mem::new(self.base, disp + self.bias)
+    }
+
+    /// The displacement of `mem` from where rbp would point when it is a plain frame address.
+    pub(super) fn frame_disp(&self, mem: Mem) -> Option<i32> {
+        (mem.base == self.base && mem.index.is_none()).then(|| mem.disp - self.bias)
+    }
+
+    /// The memory at `addr + offset`: relative to the frame base for a frame address, to the location register of `addr`, or through rcx.
     pub(super) fn address(&mut self, addr: Value, offset: i32) -> Mem {
         self.address_in(addr, offset, Reg::Rcx, Reg::R11)
     }
@@ -116,10 +126,10 @@ impl Emit<'_> {
             SibBase::Frame(slot) => {
                 let disp = self.frame.slots[slot.index()] + mode.disp + offset;
                 match idx_reg {
-                    Some(idx) => Mem::sib(Reg::Rbp, idx, mode.shift, disp),
+                    Some(idx) => Mem::sib(self.base, idx, mode.shift, disp + self.bias),
                     None => {
                         self.get(scratch, mode.index, Ext::Zero);
-                        Mem::sib(Reg::Rbp, scratch, mode.shift, disp)
+                        Mem::sib(self.base, scratch, mode.shift, disp + self.bias)
                     }
                 }
             }
@@ -145,8 +155,8 @@ impl Emit<'_> {
                             Location::Slot => self.asm.alu(Alu::Add, scratch, self.at(base)),
                             Location::Imm(imm) if i32::try_from(imm).is_ok() => self.asm.alu_imm(Alu::Add, scratch, imm as i32),
                             Location::Frame(slot, off) => {
-                                self.asm.alu(Alu::Add, scratch, Reg::Rbp);
-                                self.asm.alu_imm(Alu::Add, scratch, self.frame.slots[slot.index()] + off);
+                                self.asm.alu(Alu::Add, scratch, self.base);
+                                self.asm.alu_imm(Alu::Add, scratch, self.frame.slots[slot.index()] + off + self.bias);
                             }
                             _ => {
                                 self.raw(temp, base);
@@ -173,7 +183,7 @@ impl Emit<'_> {
         if let Location::Frame(slot, base) = self.location(addr)
             && let Some(disp) = self.frame.slots[slot.index()].checked_add(base).and_then(|disp| disp.checked_add(offset))
         {
-            return Mem::new(Reg::Rbp, disp);
+            return self.frame_mem(disp);
         }
         self.raw(scratch, addr);
         Mem::new(scratch, offset)
@@ -231,7 +241,7 @@ impl Emit<'_> {
                     }
                     return;
                 }
-                self.load_ext(reg, Mem::new(Reg::Rbp, disp), bytes, ext);
+                self.load_ext(reg, self.frame_mem(disp), bytes, ext);
                 if bytes >= 8 {
                     self.record_spill(disp, reg);
                 }
@@ -274,7 +284,7 @@ impl Emit<'_> {
                         self.asm.mov(reg, cached_reg);
                     }
                 } else {
-                    self.asm.load(Size::Q, reg, Mem::new(Reg::Rbp, disp));
+                    self.asm.load(Size::Q, reg, self.frame_mem(disp));
                 }
                 self.record_spill(disp, reg);
                 return;
@@ -364,7 +374,7 @@ impl Emit<'_> {
                         self.clobber_xmm(xmm);
                     }
                 } else {
-                    self.xmm_load(ty, xmm, Mem::new(Reg::Rbp, disp));
+                    self.xmm_load(ty, xmm, self.frame_mem(disp));
                     self.clobber_xmm(xmm);
                     self.last_fspill = Some((disp, xmm, ty));
                 }
@@ -428,11 +438,11 @@ impl Emit<'_> {
 
     fn store_reg_home(&mut self, to: Mem, reg: Reg, bytes: u32) {
         self.asm.store(Size::Q, to, reg);
-        if to.base == Reg::Rbp && to.index.is_none() {
+        if let Some(disp) = self.frame_disp(to) {
             if bytes <= 8 {
-                self.write_spill(to.disp, reg);
+                self.write_spill(disp, reg);
             } else {
-                self.invalidate_disp(to.disp);
+                self.invalidate_disp(disp);
             }
         }
     }
@@ -440,15 +450,15 @@ impl Emit<'_> {
     /// Stores the float or vector of type `ty` in `xmm` to `to` in one store and caches it as the spill of a frame home.
     pub(super) fn store_xmm_home(&mut self, to: Mem, xmm: Xmm, ty: Type) {
         self.xmm_store(ty, to, xmm);
-        if to.base == Reg::Rbp && to.index.is_none() {
-            self.invalidate_disp(to.disp);
-            self.last_fspill = Some((to.disp, xmm, ty));
+        if let Some(disp) = self.frame_disp(to) {
+            self.invalidate_disp(disp);
+            self.last_fspill = Some((disp, xmm, ty));
         }
     }
 
     /// Writes the eight (or sixteen) bytes of `value` to `to`, using rax as scratch; a float in a register writes the bytes of its type and a 16-byte vector goes through xmm2 in one store.
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
-        let stack_home = to.base == Reg::Rbp && to.index.is_none();
+        let stack_home = self.frame_disp(to);
         let ty = self.ty(value);
         match self.location(value) {
             Location::Imm(0) if ty.is_vector() && ty.bytes() >= 16 => {
@@ -486,10 +496,10 @@ impl Emit<'_> {
                 return self.copy_to(to, self.at(value), ty, X2);
             }
         }
-        if stack_home {
-            self.invalidate_disp(to.disp);
+        if let Some(disp) = stack_home {
+            self.invalidate_disp(disp);
             if ty.bytes() == 16 {
-                self.invalidate_disp(to.disp + 8);
+                self.invalidate_disp(disp + 8);
             }
         }
     }

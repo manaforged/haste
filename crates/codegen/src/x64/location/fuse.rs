@@ -1,5 +1,5 @@
 use super::patterns::{Root, adc_parts, bextr_parts, flag_cmp, is_zero_const, mid_preserves_flags, parked, shld_parts};
-use super::super::REGS;
+use super::super::{FRAME_REGS, REGS};
 use super::super::asm::Reg;
 use super::super::atomic::uses_scratch;
 use super::super::features::Features;
@@ -656,7 +656,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         if op == Binary::Band && [x, y].into_iter().any(|v| plan.const_of(v).is_some_and(|m| matches!(m, 0xFF | 0xFFFF | 0xFFFF_FFFF))) {
             continue;
         }
-        let shrink_safe = matches!(plan.location(res), Location::Reg(r) if !SAVED.contains(&r) && !matches!(r, Reg::Rbp | Reg::Rsp | Reg::R11))
+        let shrink_safe = matches!(plan.location(res), Location::Reg(r) if !SAVED.contains(&r) && !FRAME_REGS.contains(&r))
             || (func.entry != Some(Block(b_idx as u32))
                 && !matches!(func.blocks[b_idx].insts.last().map(|i| &func.insts[i.index()].op), Some(Op::Return(_))));
         if !shrink_safe {
