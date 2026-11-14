@@ -76,6 +76,11 @@ fn forward_edge(
     changed
 }
 
+/// Whether block `b` is not the entry and holds only a jump to another block.
+fn jumps_onward(func: &Function, entry: Option<usize>, b: usize) -> bool {
+    Some(b) != entry && matches!(func.blocks[b].insts[..], [inst] if matches!(func.insts[inst.index()].op, Op::Jump(t, _) if t.index() != b))
+}
+
 fn forward_trampolines(func: &mut Function) -> bool {
     if func.coroutine.is_some() {
         return false;
@@ -83,8 +88,7 @@ fn forward_trampolines(func: &mut Function) -> bool {
     let entry = func.entry.map(Block::index);
     let n = func.blocks.len();
     let has_cand = (0..n).any(|b| {
-        Some(b) != entry
-            && matches!(func.blocks[b].insts[..], [inst] if matches!(func.insts[inst.index()].op, Op::Jump(t, _) if t.index() != b))
+        jumps_onward(func, entry, b)
     });
     if !has_cand {
         return false;
@@ -111,8 +115,7 @@ fn forward_trampolines(func: &mut Function) -> bool {
     }
     let is_trampoline: Vec<bool> = (0..n)
         .map(|b| {
-            Some(b) != entry
-                && matches!(func.blocks[b].insts[..], [inst] if matches!(func.insts[inst.index()].op, Op::Jump(t, _) if t.index() != b))
+            jumps_onward(func, entry, b)
                 && func.blocks[b].params.iter().all(|p| !used_outside[p.index()])
         })
         .collect();

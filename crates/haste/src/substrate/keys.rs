@@ -33,9 +33,7 @@ pub fn target_hash(target: &Target) -> u64 {
     let mut hasher = FxHasher::default();
     target.triple.hash(&mut hasher);
     target.effort.hash(&mut hasher);
-    if let Ok(exe) = std::env::current_exe() {
-        hash_file_meta(&exe, &mut hasher);
-    }
+    hash_program(&mut hasher);
     hasher.finish()
 }
 
@@ -206,6 +204,13 @@ pub fn layer_item_key(outline: &crate::outline::Outline, item: crate::names::Ite
     Some((is_sysroot, key))
 }
 
+/// Hashes the running compiler binary's path and file stamp into `hasher`.
+fn hash_program(hasher: &mut FxHasher) {
+    if let Ok(exe) = std::env::current_exe() {
+        hash_file_meta(&exe, hasher);
+    }
+}
+
 fn hash_file_meta(path: &Path, hasher: &mut FxHasher) {
     (path, crate::graph::store::file_stamp(path)).hash(hasher);
 }
@@ -318,9 +323,7 @@ pub fn toolchain_key(workspace: &crate::graph::Workspace, target: &Target) -> u6
     target.triple.hash(&mut hasher);
     target.effort.hash(&mut hasher);
     crate::graph::store::program().hash(&mut hasher);
-    if let Ok(exe) = std::env::current_exe() {
-        hash_file_meta(&exe, &mut hasher);
-    }
+    hash_program(&mut hasher);
     super::MAGIC.hash(&mut hasher);
     super::VERSION.hash(&mut hasher);
     let mut unit_indices = Vec::with_capacity(sysroot_units.len());
