@@ -271,14 +271,14 @@ pub(crate) fn lower_binary_br_tables(func: &mut Function) -> bool {
     changed
 }
 
-fn trampoline_target<'a>(func: &'a Function, block: Block, is_trampoline: &[bool]) -> Option<(Block, &'a [Value])> {
-    if !is_trampoline[block.index()] {
-        return None;
-    }
-    let data = &func.blocks[block.index()];
-    let [inst] = data.insts[..] else { return None };
+fn jump_only_target(func: &Function, block: Block) -> Option<(Block, &[Value])> {
+    let [inst] = func.blocks[block.index()].insts[..] else { return None };
     let Op::Jump(target, ref args) = func.insts[inst.index()].op else { return None };
     (target != block).then_some((target, args.as_slice()))
+}
+
+fn trampoline_target<'a>(func: &'a Function, block: Block, is_trampoline: &[bool]) -> Option<(Block, &'a [Value])> {
+    is_trampoline[block.index()].then(|| jump_only_target(func, block)).flatten()
 }
 
 fn forward_edge(
@@ -321,20 +321,13 @@ fn forward_edge(
 
 /// Whether block `b` is not the entry and holds only a jump to another block.
 fn jumps_onward(func: &Function, entry: Option<usize>, b: usize) -> bool {
-    Some(b) != entry && matches!(func.blocks[b].insts[..], [inst] if matches!(func.insts[inst.index()].op, Op::Jump(t, _) if t.index() != b))
+    Some(b) != entry && jump_only_target(func, Block(b as u32)).is_some()
 }
 
-fn forward_trampolines(func: &mut Function) -> bool {
-    if func.coroutine.is_some() {
-        return false;
-    }
-    let entry = func.entry.map(Block::index);
+fn compute_trampoline_mask(func: &Function, entry: Option<usize>) -> Option<Vec<bool>> {
     let n = func.blocks.len();
-    let has_cand = (0..n).any(|b| {
-        jumps_onward(func, entry, b)
-    });
-    if !has_cand {
-        return false;
+    if !(0..n).any(|b| jumps_onward(func, entry, b)) {
+        return None;
     }
     let mut param_owner = vec![usize::MAX; func.types.len()];
     let mut has_params = false;
@@ -356,60 +349,63 @@ fn forward_trampolines(func: &mut Function) -> bool {
             }
         }
     }
-    let is_trampoline: Vec<bool> = (0..n)
-        .map(|b| {
-            jumps_onward(func, entry, b)
-                && func.blocks[b].params.iter().all(|p| !used_outside[p.index()])
-        })
-        .collect();
-    if !is_trampoline.iter().any(|&t| t) {
+    let mask: Vec<bool> = (0..n).map(|b| jumps_onward(func, entry, b) && func.blocks[b].params.iter().all(|p| !used_outside[p.index()])).collect();
+    mask.iter().any(|&t| t).then_some(mask)
+}
+
+fn forward_term_op(func: &Function, is_trampoline: &[bool], op: &mut Op) -> bool {
+    match op {
+        Op::Jump(target, args) => forward_edge(func, is_trampoline, target, args, false),
+        Op::Brif(_, then, then_args, otherwise, else_args) => {
+            let mut did = forward_edge(func, is_trampoline, then, then_args, false);
+            did |= forward_edge(func, is_trampoline, otherwise, else_args, false);
+            if then == otherwise && then_args == else_args {
+                *op = Op::Jump(*then, std::mem::take(then_args));
+                did = true;
+            }
+            did
+        }
+        Op::BrTable(_, default, targets) => {
+            let mut empty = Vec::new();
+            let mut did = forward_edge(func, is_trampoline, default, &mut empty, true);
+            for target in targets {
+                let mut empty = Vec::new();
+                did |= forward_edge(func, is_trampoline, target, &mut empty, true);
+            }
+            did
+        }
+        Op::TryCall { normal, .. } => {
+            let mut empty = Vec::new();
+            forward_edge(func, is_trampoline, normal, &mut empty, true)
+        }
+        _ => false,
+    }
+}
+
+fn forward_trampolines(func: &mut Function) -> bool {
+    if func.coroutine.is_some() {
         return false;
     }
+    let Some(is_trampoline) = compute_trampoline_mask(func, func.entry.map(Block::index)) else {
+        return false;
+    };
     let cfg = func.cfg();
+    let terms: Vec<Option<(usize, Inst)>> = func.blocks.iter().enumerate().map(|(b, data)| data.insts.last().copied().map(|i| (b, i))).collect();
     let mut changed = false;
-    let terms: Vec<Option<(usize, crate::ir::Inst)>> = func
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(b, data)| data.insts.last().copied().map(|i| (b, i)))
-        .collect();
     for &(b, term) in terms.iter().flatten() {
         if !cfg.reachable[b] {
             continue;
         }
         let mut op = func.insts[term.index()].op.clone();
-        match &mut op {
-            Op::Jump(target, args) => {
-                changed |= forward_edge(func, &is_trampoline, target, args, false);
-            }
-            Op::Brif(_, then, then_args, otherwise, else_args) => {
-                changed |= forward_edge(func, &is_trampoline, then, then_args, false);
-                changed |= forward_edge(func, &is_trampoline, otherwise, else_args, false);
-                if then == otherwise && then_args == else_args {
-                    op = Op::Jump(*then, std::mem::take(then_args));
-                    changed = true;
-                }
-            }
-            Op::BrTable(_, default, targets) => {
-                let mut empty = Vec::new();
-                changed |= forward_edge(func, &is_trampoline, default, &mut empty, true);
-                for target in targets {
-                    let mut empty = Vec::new();
-                    changed |= forward_edge(func, &is_trampoline, target, &mut empty, true);
-                }
-            }
-            Op::TryCall { normal, .. } => {
-                let mut empty = Vec::new();
-                changed |= forward_edge(func, &is_trampoline, normal, &mut empty, true);
-            }
-            _ => {}
+        if forward_term_op(func, &is_trampoline, &mut op) {
+            func.insts[term.index()].op = op;
+            changed = true;
         }
-        func.insts[term.index()].op = op;
     }
     if !changed {
         return false;
     }
-    let mut referenced = vec![false; n];
+    let mut referenced = vec![false; func.blocks.len()];
     for (_, term) in terms.into_iter().flatten() {
         func.insts[term.index()].op.targets().for_each(|b| referenced[b.index()] = true);
     }
@@ -427,6 +423,39 @@ fn forward_trampolines(func: &mut Function) -> bool {
 fn is_trap_block(func: &Function, block: usize) -> bool {
     let data = &func.blocks[block];
     data.params.is_empty() && matches!(data.insts[..], [inst] if func.insts[inst.index()].op == Op::Trap)
+}
+
+fn redirect_trap_target(target: &mut Block, empty_args: bool, is_dup: &[bool], canon: Block, kept_dup: &mut [bool]) -> bool {
+    let idx = target.index();
+    if !is_dup[idx] || *target == canon {
+        return false;
+    }
+    if empty_args {
+        *target = canon;
+        return true;
+    }
+    kept_dup[idx] = true;
+    false
+}
+
+fn redirect_trap_op(op: &mut Op, is_dup: &[bool], canon: Block, kept_dup: &mut [bool]) -> bool {
+    match op {
+        Op::Jump(target, args) => redirect_trap_target(target, args.is_empty(), is_dup, canon, kept_dup),
+        Op::Brif(_, then, then_args, otherwise, else_args) => {
+            let a = redirect_trap_target(then, then_args.is_empty(), is_dup, canon, kept_dup);
+            let b = redirect_trap_target(otherwise, else_args.is_empty(), is_dup, canon, kept_dup);
+            a || b
+        }
+        Op::BrTable(_, default, targets) => {
+            let mut did = redirect_trap_target(default, true, is_dup, canon, kept_dup);
+            for target in targets {
+                did |= redirect_trap_target(target, true, is_dup, canon, kept_dup);
+            }
+            did
+        }
+        Op::TryCall { normal, .. } => redirect_trap_target(normal, true, is_dup, canon, kept_dup),
+        _ => false,
+    }
 }
 
 fn merge_traps(func: &mut Function) -> bool {
@@ -450,32 +479,7 @@ fn merge_traps(func: &mut Function) -> bool {
     let mut changed = false;
     let mut kept_dup = vec![false; func.blocks.len()];
     for inst in &mut func.insts {
-        let mut redirect = |target: &mut Block, empty_args: bool| {
-            let idx = target.index();
-            if is_dup[idx] && *target != canon {
-                if empty_args {
-                    *target = canon;
-                    changed = true;
-                } else {
-                    kept_dup[idx] = true;
-                }
-            }
-        };
-        match &mut inst.op {
-            Op::Jump(target, args) => redirect(target, args.is_empty()),
-            Op::Brif(_, then, then_args, otherwise, else_args) => {
-                redirect(then, then_args.is_empty());
-                redirect(otherwise, else_args.is_empty());
-            }
-            Op::BrTable(_, default, targets) => {
-                redirect(default, true);
-                for target in targets {
-                    redirect(target, true);
-                }
-            }
-            Op::TryCall { normal, .. } => redirect(normal, true),
-            _ => {}
-        }
+        changed |= redirect_trap_op(&mut inst.op, &is_dup, canon, &mut kept_dup);
     }
     for (block, dup) in is_dup.into_iter().enumerate() {
         if dup && !kept_dup[block] {

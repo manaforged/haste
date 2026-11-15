@@ -1,19 +1,44 @@
-use crate::ir::{ArgumentPurpose, Block, BlockData, Domain, Function, Inst, Op, SigRef, Signature, Type, Value};
+use crate::cfg::Cfg;
+use crate::ir::{ArgumentPurpose, Binary, Block, BlockData, Convert, Domain, Function, Inst, IntCC, Op, SigRef, Signature, Type, Unary, Value};
 use crate::reloc::RuntimeSymbol;
 use rustc_hash::FxHashMap;
 
 const MAX_RETURN_PREFIX: usize = 3;
 const MIN_TAIL_GROUP: usize = 3;
 const MAX_TAIL_PARAMS: usize = 4;
+const MAX_SINK_PARAMS: usize = 2;
+const MAX_SINK_DEPTH: usize = 3;
 
-/// Turns every jump into a tiny return block into that return, then factors identical tail calls across arms.
+/// Turns every jump into a tiny return block into that return, then factors identical tail calls and common trailing ops across arms.
 pub(crate) fn run(func: &mut Function) -> Domain {
     if func.coroutine.is_some() {
         return Domain::NONE;
     }
     let mut changed = crate::merge::lower_binary_br_tables(func);
+    changed |= inline_returns(func);
+    if factor_tail_calls(func, changed) {
+        changed = true;
+    }
+    for _ in 0..MAX_SINK_DEPTH {
+        let round = factor_common_returns(func, changed);
+        let sunk = sink_common_jump_tails(func, changed || round);
+        if !round && !sunk {
+            break;
+        }
+        changed = true;
+    }
+    if changed {
+        func.bump_cfg();
+        Domain::CFG | Domain::VALUES
+    } else {
+        Domain::NONE
+    }
+}
+
+fn inline_returns(func: &mut Function) -> bool {
     let cfg = func.cfg();
     let mut threaded = vec![0_u32; func.blocks.len()];
+    let mut changed = false;
     loop {
         let mut progress = false;
         for block in 0..func.blocks.len() {
@@ -46,15 +71,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             changed = true;
         }
     }
-    if factor_tail_calls(func, changed) {
-        changed = true;
-    }
-    if changed {
-        func.bump_cfg();
-        Domain::CFG | Domain::VALUES
-    } else {
-        Domain::NONE
-    }
+    changed
 }
 
 /// The duplicated prefix instructions and returned values for jumping into `target` with `args`.
@@ -276,4 +293,358 @@ fn rewrite_tail_site(func: &mut Function, site: &TailSite, (shared, varying): (B
         blk_insts.retain(|&inst| inst != def_inst);
     }
     blk_insts.push(jump);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TailKind {
+    Const(i64),
+    Unary(Unary),
+    Convert(Convert),
+    Binary(Binary),
+    Icmp(IntCC),
+    Select,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TailOpSig {
+    kind: TailKind,
+    res_ty: Type,
+    arity: u8,
+    arg_tys: [Type; 3],
+    const_args: [Option<i64>; 3],
+}
+
+enum SharedInput {
+    Const(Type, i64),
+    Common(Value),
+    Param(usize),
+}
+
+struct ReturnTailSite {
+    block: usize,
+    args: [Value; 3],
+    ret_vals: Vec<Value>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ReturnGroupKey {
+    sig: TailOpSig,
+    ret_slot: usize,
+    ret_types: Vec<Type>,
+    const_rets: Vec<Option<i64>>,
+}
+
+fn collect_consts(func: &Function) -> Vec<Option<i64>> {
+    let mut consts = vec![None; func.types.len()];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let item = &func.insts[inst.index()];
+            if let (Op::Const(imm), Some(res)) = (&item.op, item.result) {
+                consts[res.index()] = Some(*imm);
+            }
+        }
+    }
+    consts
+}
+
+fn tail_op_sig(func: &Function, consts: &[Option<i64>], inst: Inst) -> Option<(TailOpSig, Value, [Value; 3])> {
+    let item = &func.insts[inst.index()];
+    let res = item.result?;
+    if !item.op.is_speculable() {
+        return None;
+    }
+    let (kind, arity, args) = match item.op {
+        Op::Const(imm) => (TailKind::Const(imm), 0_u8, [Value(0); 3]),
+        Op::Unary(u, x) => (TailKind::Unary(u), 1, [x, Value(0), Value(0)]),
+        Op::Convert(c, x) => (TailKind::Convert(c), 1, [x, Value(0), Value(0)]),
+        Op::Binary(b, x, y) => (TailKind::Binary(b), 2, [x, y, Value(0)]),
+        Op::Icmp(cc, x, y) => (TailKind::Icmp(cc), 2, [x, y, Value(0)]),
+        Op::Select(c, x, y) => (TailKind::Select, 3, [c, x, y]),
+        _ => return None,
+    };
+    let mut arg_tys = [Type::I8; 3];
+    let mut const_args = [None; 3];
+    for slot in 0..arity as usize {
+        arg_tys[slot] = func.ty(args[slot]);
+        const_args[slot] = consts[args[slot].index()];
+    }
+    Some((TailOpSig { kind, res_ty: func.ty(res), arity, arg_tys, const_args }, res, args))
+}
+
+fn plan_shared_columns(columns: Vec<(Type, Option<i64>, Vec<Value>)>, max_params: usize) -> Option<(Vec<SharedInput>, Vec<(Type, Vec<Value>)>)> {
+    let mut inputs = Vec::with_capacity(columns.len());
+    let mut param_cols: Vec<(Type, Vec<Value>)> = Vec::new();
+    for (ty, const_val, vals) in columns {
+        if let Some(imm) = const_val {
+            inputs.push(SharedInput::Const(ty, imm));
+        } else if vals.iter().all(|&v| v == vals[0]) {
+            inputs.push(SharedInput::Common(vals[0]));
+        } else if let Some(existing) = param_cols.iter().position(|(p_ty, col)| *p_ty == ty && *col == vals) {
+            inputs.push(SharedInput::Param(existing));
+        } else {
+            if param_cols.len() >= max_params {
+                return None;
+            }
+            inputs.push(SharedInput::Param(param_cols.len()));
+            param_cols.push((ty, vals));
+        }
+    }
+    Some((inputs, param_cols))
+}
+
+fn emit_tail_op(kind: TailKind, args: &[Value]) -> Op {
+    match kind {
+        TailKind::Const(imm) => Op::Const(imm),
+        TailKind::Unary(u) => Op::Unary(u, args[0]),
+        TailKind::Convert(c) => Op::Convert(c, args[0]),
+        TailKind::Binary(b) => Op::Binary(b, args[0], args[1]),
+        TailKind::Icmp(cc) => Op::Icmp(cc, args[0], args[1]),
+        TailKind::Select => Op::Select(args[0], args[1], args[2]),
+    }
+}
+
+fn materialize_inputs(
+    func: &mut Function,
+    insts: &mut Vec<Inst>,
+    inputs: &[SharedInput],
+    params: &[Value],
+) -> Vec<Value> {
+    let mut emitted_consts: Vec<(Type, i64, Value)> = Vec::new();
+    inputs
+        .iter()
+        .map(|input| match *input {
+            SharedInput::Const(ty, imm) => {
+                if let Some(&(_, _, existing)) = emitted_consts.iter().find(|&&(cty, cimm, _)| cty == ty && cimm == imm) {
+                    return existing;
+                }
+                let val = func.value(ty);
+                insts.push(func.add(Op::Const(imm), Some(val)));
+                emitted_consts.push((ty, imm, val));
+                val
+            }
+            SharedInput::Common(v) => v,
+            SharedInput::Param(idx) => params[idx],
+        })
+        .collect()
+}
+
+fn prune_dead_consts(func: &mut Function, blocks: &[usize]) {
+    let uses = func.use_counts();
+    for &b in blocks {
+        func.blocks[b].insts.retain(|&inst| {
+            let item = &func.insts[inst.index()];
+            !matches!(item.op, Op::Const(_)) || item.result.is_some_and(|r| uses[r.index()] > 0)
+        });
+    }
+}
+
+fn return_site_entry(func: &Function, consts: &[Option<i64>], uses: &[u32], block: usize) -> Option<(ReturnGroupKey, ReturnTailSite)> {
+    let insts = &func.blocks[block].insts;
+    let len = insts.len();
+    if len < 2 {
+        return None;
+    }
+    let Op::Return(ret_vals) = &func.insts[insts[len - 1].index()].op else { return None };
+    let (sig, res, args) = tail_op_sig(func, consts, insts[len - 2])?;
+    if uses[res.index()] != 1 {
+        return None;
+    }
+    if matches!(sig.kind, TailKind::Const(imm) if ret_vals.len() == 1 && (-1..=0xffff).contains(&imm)) {
+        return None;
+    }
+    let ret_slot = ret_vals.iter().position(|&v| v == res)?;
+    let ret_types: Vec<Type> = ret_vals.iter().map(|&v| func.ty(v)).collect();
+    let const_rets: Vec<Option<i64>> = ret_vals.iter().enumerate().map(|(r, &v)| (r != ret_slot).then(|| consts[v.index()]).flatten()).collect();
+    let key = ReturnGroupKey { sig, ret_slot, ret_types, const_rets };
+    let site = ReturnTailSite { block, args, ret_vals: ret_vals.clone() };
+    Some((key, site))
+}
+
+fn factor_return_group(func: &mut Function, key: &ReturnGroupKey, group: &[ReturnTailSite]) -> bool {
+    let arity = key.sig.arity as usize;
+    let mut columns = Vec::with_capacity(arity + key.ret_types.len());
+    for slot in 0..arity {
+        let vals = group.iter().map(|s| s.args[slot]).collect();
+        columns.push((key.sig.arg_tys[slot], key.sig.const_args[slot], vals));
+    }
+    for (r, &ty) in key.ret_types.iter().enumerate() {
+        if r != key.ret_slot {
+            let vals = group.iter().map(|s| s.ret_vals[r]).collect();
+            columns.push((ty, key.const_rets[r], vals));
+        }
+    }
+    let Some((inputs, param_cols)) = plan_shared_columns(columns, MAX_SINK_PARAMS) else { return false };
+    let shared = Block(func.blocks.len() as u32);
+    let params: Vec<Value> = param_cols.iter().map(|(ty, _)| func.value(*ty)).collect();
+    let mut insts = Vec::with_capacity(4);
+    let resolved = materialize_inputs(func, &mut insts, &inputs, &params);
+    let shared_res = func.value(key.sig.res_ty);
+    insts.push(func.add(emit_tail_op(key.sig.kind, &resolved[..arity]), Some(shared_res)));
+    let mut ret_vals = Vec::with_capacity(key.ret_types.len());
+    let mut extra_at = arity;
+    for r in 0..key.ret_types.len() {
+        if r == key.ret_slot {
+            ret_vals.push(shared_res);
+        } else {
+            ret_vals.push(resolved[extra_at]);
+            extra_at += 1;
+        }
+    }
+    insts.push(func.add(Op::Return(ret_vals), None));
+    func.blocks.push(BlockData { params, insts });
+    let mut touched = Vec::with_capacity(group.len());
+    for (site_idx, site) in group.iter().enumerate() {
+        let jump_args: Vec<Value> = param_cols.iter().map(|(_, col)| col[site_idx]).collect();
+        let jump = func.add(Op::Jump(shared, jump_args), None);
+        let blk_insts = &mut func.blocks[site.block].insts;
+        let len = blk_insts.len();
+        blk_insts.truncate(len - 2);
+        blk_insts.push(jump);
+        touched.push(site.block);
+    }
+    prune_dead_consts(func, &touched);
+    true
+}
+
+fn factor_common_returns(func: &mut Function, cfg_dirty: bool) -> bool {
+    if cfg_dirty {
+        func.bump_cfg();
+    }
+    let cfg = func.cfg();
+    let consts = collect_consts(func);
+    let uses = func.use_counts();
+    let mut index: FxHashMap<ReturnGroupKey, usize> = FxHashMap::default();
+    let mut groups: Vec<(ReturnGroupKey, Vec<ReturnTailSite>)> = Vec::new();
+    for block in 0..func.blocks.len() {
+        if !cfg.reachable[block] || func.entry == Some(Block(block as u32)) {
+            continue;
+        }
+        let Some((key, site)) = return_site_entry(func, &consts, &uses, block) else { continue };
+        match index.get(&key).copied() {
+            Some(at) => groups[at].1.push(site),
+            None => {
+                index.insert(key.clone(), groups.len());
+                groups.push((key, vec![site]));
+            }
+        }
+    }
+    let mut changed = false;
+    for (key, group) in &groups {
+        if group.len() >= MIN_TAIL_GROUP && factor_return_group(func, key, group) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn rename_value(func: &mut Function, from: Value, to: Value) {
+    for data in &mut func.insts {
+        data.op.map_operands(|v| if v == from { to } else { v });
+    }
+}
+
+struct JumpTailPlan {
+    param_idx: usize,
+    sig: TailOpSig,
+    inputs: Vec<SharedInput>,
+    param_cols: Vec<(Type, Vec<Value>)>,
+}
+
+fn collect_jump_preds(func: &Function, cfg: &Cfg, target: Block) -> Option<Vec<usize>> {
+    let preds = cfg.preds_of(target);
+    if preds.len() < 2 || preds.len() != cfg.pred_count(target) as usize {
+        return None;
+    }
+    let param_len = func.blocks[target.index()].params.len();
+    let mut out = Vec::with_capacity(preds.len());
+    for (idx, &pred) in preds.iter().enumerate() {
+        if pred == target || cfg.dominates(target, pred) || preds[..idx].contains(&pred) {
+            return None;
+        }
+        let insts = &func.blocks[pred.index()].insts;
+        if insts.len() < 2 {
+            return None;
+        }
+        let Op::Jump(t, ref args) = func.insts[insts[insts.len() - 1].index()].op else { return None };
+        if t != target || args.len() != param_len {
+            return None;
+        }
+        out.push(pred.index());
+    }
+    Some(out)
+}
+
+fn find_jump_tail_plan(func: &Function, consts: &[Option<i64>], uses: &[u32], preds: &[usize], param_len: usize) -> Option<JumpTailPlan> {
+    let mut pred_tails = Vec::with_capacity(preds.len());
+    for &p in preds {
+        let insts = &func.blocks[p].insts;
+        let tail = insts[insts.len() - 2];
+        let (sig, res, args) = tail_op_sig(func, consts, tail)?;
+        if uses[res.index()] != 1 {
+            return None;
+        }
+        let Op::Jump(_, ref j_args) = func.insts[insts[insts.len() - 1].index()].op else { return None };
+        pred_tails.push((sig, res, args, j_args.as_slice()));
+    }
+    let first_sig = &pred_tails[0].0;
+    if !pred_tails[1..].iter().all(|(sig, ..)| sig == first_sig) {
+        return None;
+    }
+    let param_idx = (0..param_len).find(|&idx| pred_tails.iter().all(|(_, res, _, j_args)| j_args[idx] == *res))?;
+    let arity = first_sig.arity as usize;
+    let columns = (0..arity)
+        .map(|slot| {
+            let vals = pred_tails.iter().map(|(_, _, args, _)| args[slot]).collect();
+            (first_sig.arg_tys[slot], first_sig.const_args[slot], vals)
+        })
+        .collect();
+    let (inputs, param_cols) = plan_shared_columns(columns, 1)?;
+    Some(JumpTailPlan { param_idx, sig: first_sig.clone(), inputs, param_cols })
+}
+
+fn apply_jump_tail_plan(func: &mut Function, target_idx: usize, preds: &[usize], plan: JumpTailPlan) {
+    let new_params: Vec<Value> = plan.param_cols.iter().map(|(ty, _)| func.value(*ty)).collect();
+    let mut prepended = Vec::with_capacity(4);
+    let resolved = materialize_inputs(func, &mut prepended, &plan.inputs, &new_params);
+    let new_res = func.value(plan.sig.res_ty);
+    prepended.push(func.add(emit_tail_op(plan.sig.kind, &resolved), Some(new_res)));
+    prepended.append(&mut func.blocks[target_idx].insts);
+    func.blocks[target_idx].insts = prepended;
+    let old_param = func.blocks[target_idx].params.remove(plan.param_idx);
+    func.blocks[target_idx].params.extend(new_params);
+    for (pred_pos, &pred_idx) in preds.iter().enumerate() {
+        let len = func.blocks[pred_idx].insts.len();
+        let term = func.blocks[pred_idx].insts[len - 1];
+        func.blocks[pred_idx].insts.remove(len - 2);
+        if let Op::Jump(_, ref mut args) = func.insts[term.index()].op {
+            args.remove(plan.param_idx);
+            args.extend(plan.param_cols.iter().map(|(_, col)| col[pred_pos]));
+        }
+    }
+    rename_value(func, old_param, new_res);
+    prune_dead_consts(func, preds);
+}
+
+fn sink_common_jump_tails(func: &mut Function, cfg_dirty: bool) -> bool {
+    if cfg_dirty {
+        func.bump_cfg();
+    }
+    let cfg = func.cfg();
+    let mut consts = collect_consts(func);
+    let mut uses = func.use_counts();
+    let mut changed = false;
+    for j_idx in 0..func.blocks.len() {
+        let target = Block(j_idx as u32);
+        let param_len = func.blocks[j_idx].params.len();
+        if !cfg.reachable[j_idx] || func.entry == Some(target) || param_len == 0 {
+            continue;
+        }
+        let Some(preds) = collect_jump_preds(func, &cfg, target) else { continue };
+        let Some(plan) = find_jump_tail_plan(func, &consts, &uses, &preds, param_len) else { continue };
+        apply_jump_tail_plan(func, j_idx, &preds, plan);
+        consts = collect_consts(func);
+        uses = func.use_counts();
+        changed = true;
+    }
+    changed
 }
