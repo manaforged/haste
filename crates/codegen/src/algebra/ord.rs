@@ -165,6 +165,94 @@ fn peel_lossless_convs(cx: &RewriteCx, mut v: Value) -> Value {
     v
 }
 
+fn cmp_const_op(cx: &mut RewriteCx, ty: Type, cc: IntCC, s: Value, k: i64) -> Op {
+    let c = cx.emit(ty, Op::Const(k));
+    Op::Icmp(cc, s, c)
+}
+
+fn eval_popcnt_cmp(cx: &mut RewriteCx, s: Value, src_ty: Type, w: u32, sat_mask: u128) -> Option<Op> {
+    let sat_count = sat_mask.count_ones();
+    let sat_0 = (sat_mask & 1) != 0;
+    let sat_w = ((sat_mask >> w) & 1) != 0;
+    if sat_count == 1 && sat_0 {
+        return Some(cmp_const_op(cx, src_ty, IntCC::Equal, s, 0));
+    }
+    if sat_count == w && !sat_0 {
+        return Some(cmp_const_op(cx, src_ty, IntCC::NotEqual, s, 0));
+    }
+    let all_ones = extend(-1, src_ty, true);
+    if sat_count == 1 && sat_w {
+        return Some(cmp_const_op(cx, src_ty, IntCC::Equal, s, all_ones));
+    }
+    if sat_count == w && !sat_w {
+        return Some(cmp_const_op(cx, src_ty, IntCC::NotEqual, s, all_ones));
+    }
+    None
+}
+
+fn eval_clz_ctz_range(
+    cx: &mut RewriteCx,
+    uop: Unary,
+    s: Value,
+    w: u32,
+    sat_mask: u128,
+) -> Option<Op> {
+    let src_ty = cx.func.ty(s);
+    let all_mask = (1_u128 << (w + 1)) - 1;
+    let sat_w = ((sat_mask >> w) & 1) != 0;
+    let k = if sat_w { sat_mask.trailing_zeros() } else { (all_mask ^ sat_mask).trailing_zeros() };
+    if k == 0 || k >= w {
+        return None;
+    }
+    let suffix = all_mask ^ ((1_u128 << k) - 1);
+    let is_suffix = sat_mask == suffix;
+    if !is_suffix && sat_mask != (all_mask ^ suffix) {
+        return None;
+    }
+    match uop {
+        Unary::Clz if k >= 2 && w - k <= 30 => {
+            let cc = if is_suffix { IntCC::UnsignedLessThan } else { IntCC::UnsignedGreaterThanOrEqual };
+            Some(cmp_const_op(cx, src_ty, cc, s, 1_i64 << (w - k)))
+        }
+        Unary::Ctz if k <= 31 => {
+            let mask_val = cx.emit(src_ty, Op::Const((1_i64 << k) - 1));
+            let masked = cx.emit(src_ty, Op::Binary(Binary::Band, s, mask_val));
+            let cc = if is_suffix { IntCC::Equal } else { IntCC::NotEqual };
+            Some(cmp_const_op(cx, src_ty, cc, masked, 0))
+        }
+        _ => None,
+    }
+}
+
+fn eval_clz_ctz(cx: &mut RewriteCx, uop: Unary, s: Value, w: u32, sat_mask: u128) -> Option<Op> {
+    let src_ty = cx.func.ty(s);
+    let sat_count = sat_mask.count_ones();
+    let sat_w = ((sat_mask >> w) & 1) != 0;
+    if sat_count == 1 && sat_w {
+        return Some(cmp_const_op(cx, src_ty, IntCC::Equal, s, 0));
+    }
+    if sat_count == w && !sat_w {
+        return Some(cmp_const_op(cx, src_ty, IntCC::NotEqual, s, 0));
+    }
+    if uop == Unary::Clz {
+        let sat_0 = (sat_mask & 1) != 0;
+        let sat_wm1 = w > 0 && ((sat_mask >> (w - 1)) & 1) != 0;
+        if sat_count == 1 && sat_wm1 {
+            return Some(cmp_const_op(cx, src_ty, IntCC::Equal, s, 1));
+        }
+        if sat_count == w && !sat_wm1 {
+            return Some(cmp_const_op(cx, src_ty, IntCC::NotEqual, s, 1));
+        }
+        if sat_count == 1 && sat_0 {
+            return Some(cmp_const_op(cx, src_ty, IntCC::SignedLessThan, s, 0));
+        }
+        if sat_count == w && !sat_0 {
+            return Some(cmp_const_op(cx, src_ty, IntCC::SignedGreaterThanOrEqual, s, 0));
+        }
+    }
+    None
+}
+
 fn eval_count_cmp(cx: &mut RewriteCx, norm: IntCC, expr_val: Value, imm: i64) -> Option<Op> {
     let cmp_ty = cx.func.ty(expr_val);
     let core = peel_lossless_convs(cx, expr_val);
@@ -173,77 +261,30 @@ fn eval_count_cmp(cx: &mut RewriteCx, norm: IntCC, expr_val: Value, imm: i64) ->
         return None;
     };
     let src_ty = cx.func.ty(s);
-    if !src_ty.is_small_int() {
+    let w = src_ty.bits();
+    if !src_ty.is_small_int() || w > 64 {
         return None;
     }
-    let w = i64::from(src_ty.bits());
-    let mut sat_count = 0_i64;
-    let (mut sat_0, mut sat_w, mut sat_wm1) = (false, false, false);
+    let mut sat_mask = 0_u128;
     for v in 0..=w {
-        if holds(norm, cmp_ty, v, imm) {
-            sat_count += 1;
-            if v == 0 {
-                sat_0 = true;
-            }
-            if v == w {
-                sat_w = true;
-            }
-            if v == w - 1 {
-                sat_wm1 = true;
-            }
+        if holds(norm, cmp_ty, i64::from(v), imm) {
+            sat_mask |= 1_u128 << v;
         }
     }
+    let sat_count = sat_mask.count_ones();
     if sat_count == 0 {
         return Some(Op::Const(0));
     }
     if sat_count == w + 1 {
         return Some(Op::Const(1));
     }
-    let cmp_const = |cx: &mut RewriteCx, cc: IntCC, k: i64| {
-        let c = cx.emit(src_ty, Op::Const(k));
-        Op::Icmp(cc, s, c)
-    };
-    match uop {
-        Unary::Popcnt => {
-            if sat_count == 1 && sat_0 {
-                return Some(cmp_const(cx, IntCC::Equal, 0));
-            }
-            if sat_count == w && !sat_0 {
-                return Some(cmp_const(cx, IntCC::NotEqual, 0));
-            }
-            let all_ones = extend(-1, src_ty, true);
-            if sat_count == 1 && sat_w {
-                return Some(cmp_const(cx, IntCC::Equal, all_ones));
-            }
-            if sat_count == w && !sat_w {
-                return Some(cmp_const(cx, IntCC::NotEqual, all_ones));
-            }
-        }
-        Unary::Clz | Unary::Ctz => {
-            if sat_count == 1 && sat_w {
-                return Some(cmp_const(cx, IntCC::Equal, 0));
-            }
-            if sat_count == w && !sat_w {
-                return Some(cmp_const(cx, IntCC::NotEqual, 0));
-            }
-            if uop == Unary::Clz {
-                if sat_count == 1 && sat_wm1 {
-                    return Some(cmp_const(cx, IntCC::Equal, 1));
-                }
-                if sat_count == w && !sat_wm1 {
-                    return Some(cmp_const(cx, IntCC::NotEqual, 1));
-                }
-                if sat_count == 1 && sat_0 {
-                    return Some(cmp_const(cx, IntCC::SignedLessThan, 0));
-                }
-                if sat_count == w && !sat_0 {
-                    return Some(cmp_const(cx, IntCC::SignedGreaterThanOrEqual, 0));
-                }
-            }
-        }
-        _ => {}
+    if uop == Unary::Popcnt {
+        return eval_popcnt_cmp(cx, s, src_ty, w, sat_mask);
     }
-    None
+    eval_clz_ctz(cx, uop, s, w, sat_mask).or_else(|| {
+        let can_elide = uop == Unary::Clz || (cx.single_use(core) && (core == expr_val || cx.single_use(expr_val)));
+        can_elide.then(|| eval_clz_ctz_range(cx, uop, s, w, sat_mask)).flatten()
+    })
 }
 
 fn is_involution(uop: Unary, ty: Type) -> bool {
@@ -266,6 +307,46 @@ fn apply_involution(uop: Unary, ty: Type, a: i64) -> i64 {
     }
 }
 
+fn eval_involution_pair(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    let ty = cx.func.ty(x);
+    let (xi, yi) = (cx.def(x)?, cx.def(y)?);
+    let Op::Unary(ux, a) = cx.func.insts[xi.index()].op else {
+        return None;
+    };
+    let Op::Unary(uy, b) = cx.func.insts[yi.index()].op else {
+        return None;
+    };
+    if ux != uy || !is_involution(ux, ty) {
+        return None;
+    }
+    if ux == Unary::Bnot {
+        return Some(Op::Icmp(flip_int_cc(cc), a, b));
+    }
+    matches!(cc, IntCC::Equal | IntCC::NotEqual).then_some(Op::Icmp(cc, a, b))
+}
+
+fn eval_involution_const(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    let ty = cx.func.ty(x);
+    let eq_only = matches!(cc, IntCC::Equal | IntCC::NotEqual);
+    for (norm, expr_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
+        let Some(imm) = cx.sconst(c_val) else {
+            continue;
+        };
+        let Some(inst) = cx.def(expr_val) else {
+            continue;
+        };
+        if let Op::Unary(uop, a) = cx.func.insts[inst.index()].op
+            && is_involution(uop, ty)
+            && (eq_only || uop == Unary::Bnot)
+        {
+            let inv = apply_involution(uop, ty, imm);
+            let out_cc = if uop == Unary::Bnot { flip_int_cc(norm) } else { norm };
+            return Some(cmp_const_op(cx, ty, out_cc, a, inv));
+        }
+    }
+    None
+}
+
 pub(super) fn eval_unary_cmp(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     for (norm, expr_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
         if let Some(imm) = cx.sconst(c_val)
@@ -274,28 +355,5 @@ pub(super) fn eval_unary_cmp(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) 
             return Some(op);
         }
     }
-    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) {
-        return None;
-    }
-    let ty = cx.func.ty(x);
-    if let (Some(xi), Some(yi)) = (cx.def(x), cx.def(y))
-        && let Op::Unary(ux, a) = cx.func.insts[xi.index()].op
-        && let Op::Unary(uy, b) = cx.func.insts[yi.index()].op
-        && ux == uy
-        && is_involution(ux, ty)
-    {
-        return Some(Op::Icmp(cc, a, b));
-    }
-    for (expr_val, c_val) in [(x, y), (y, x)] {
-        if let Some(imm) = cx.sconst(c_val)
-            && let Some(inst) = cx.def(expr_val)
-            && let Op::Unary(uop, a) = cx.func.insts[inst.index()].op
-            && is_involution(uop, ty)
-        {
-            let inv = apply_involution(uop, ty, imm);
-            let c2 = cx.emit(ty, Op::Const(inv));
-            return Some(Op::Icmp(cc, a, c2));
-        }
-    }
-    None
+    eval_involution_pair(cx, cc, x, y).or_else(|| eval_involution_const(cx, cc, x, y))
 }
