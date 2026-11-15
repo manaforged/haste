@@ -208,8 +208,9 @@ pub(crate) struct Asm {
     pub code: Vec<u8>,
     pub avx: bool,
     labels: Vec<Option<u32>>,
-    fixups: Vec<(u32, Label)>,
-    table_fixups: Vec<(u32, Label, Label)>,
+    pub(super) fixups: Vec<(u32, Label)>,
+    pub(super) table_fixups: Vec<(u32, Label, Label)>,
+    pub(super) tail: Option<super::imm::Tail>,
 }
 
 impl Asm {
@@ -217,7 +218,7 @@ impl Asm {
         self.code.len() as u32
     }
 
-    fn rex(&mut self, w: bool, r: u8, x: u8, b: u8, force: bool) {
+    pub(super) fn rex(&mut self, w: bool, r: u8, x: u8, b: u8, force: bool) {
         let rex = 0x40 | (u8::from(w) << 3) | ((r >> 3 & 1) << 2) | ((x >> 3 & 1) << 1) | (b >> 3 & 1);
         if rex != 0x40 || force {
             self.code.push(rex);
@@ -267,7 +268,7 @@ impl Asm {
         self.modrm(r, rm);
     }
 
-    fn sized(&mut self, lock: bool, size: Size, (byte, wide): (&[u8], &[u8]), r: u8, rm: Rm) {
+    pub(super) fn sized(&mut self, lock: bool, size: Size, (byte, wide): (&[u8], &[u8]), r: u8, rm: Rm) {
         let prefix: &[u8] = match (lock, size == Size::W) {
             (true, true) => &[0xF0, 0x66],
             (true, false) => &[0xF0],
@@ -300,21 +301,6 @@ impl Asm {
 
     pub fn store(&mut self, size: Size, dst: Mem, src: Reg) {
         self.sized(false, size, (&[0x88], &[0x89]), src as u8, dst.into());
-    }
-
-    pub fn store_imm(&mut self, dst: Mem, imm: i32) {
-        self.encode(&[], true, &[0xC7], 0, dst.into(), false);
-        self.code.extend(imm.to_le_bytes());
-    }
-
-    /// Stores the low `size` bytes of `imm` to `dst`; a quadword takes `imm` sign-extended.
-    pub fn store_imm_sized(&mut self, size: Size, dst: Mem, imm: i32) {
-        self.sized(false, size, (&[0xC6], &[0xC7]), 0, dst.into());
-        match size {
-            Size::B => self.code.push(imm as u8),
-            Size::W => self.code.extend((imm as i16).to_le_bytes()),
-            _ => self.code.extend(imm.to_le_bytes()),
-        }
     }
 
     pub fn store_slot_reloc(&mut self, dst: Mem) -> u32 {
@@ -353,31 +339,18 @@ impl Asm {
         self.code.extend(val.to_le_bytes());
     }
 
-    pub fn mov_imm(&mut self, dst: Reg, imm: i64) {
-        let reg = dst as u8;
-        if let Ok(small) = u32::try_from(imm) {
-            self.rex(false, 0, 0, reg, false);
-            self.code.push(0xB8 + (reg & 7));
-            self.code.extend(small.to_le_bytes());
-        } else if let Ok(signed) = i32::try_from(imm) {
-            self.encode(&[], true, &[0xC7], 0, dst.into(), false);
-            self.code.extend(signed.to_le_bytes());
-        } else {
-            self.rex(true, 0, 0, reg, false);
-            self.code.push(0xB8 + (reg & 7));
-            self.code.extend(imm.to_le_bytes());
-        }
-    }
-
     pub fn alu(&mut self, op: Alu, dst: Reg, src: impl Into<Rm>) {
+        self.alu_flags(op);
         self.encode(&[], true, &[op as u8 * 8 + 3], dst as u8, src.into(), false);
     }
 
     pub fn alu32(&mut self, op: Alu, dst: Reg, src: impl Into<Rm>) {
+        self.alu_flags(op);
         self.encode(&[], false, &[op as u8 * 8 + 3], dst as u8, src.into(), false);
     }
 
     fn alu_imm_width(&mut self, w: bool, op: Alu, dst: Rm, imm: i32) {
+        self.alu_flags(op);
         if let Ok(small) = i8::try_from(imm) {
             self.encode(&[], w, &[0x83], op as u8, dst, false);
             self.code.push(small as u8);
@@ -398,6 +371,7 @@ impl Asm {
     /// `dst op= imm` on the low `size` bytes of `dst`, with `imm` cut to that width.
     pub fn alu_imm_sized(&mut self, size: Size, op: Alu, dst: impl Into<Rm>, imm: i32) {
         let dst = dst.into();
+        self.alu_flags(op);
         match size {
             Size::B => {
                 self.encode(&[], false, &[0x80], op as u8, dst, matches!(dst, Rm::Reg(_)));
@@ -419,21 +393,25 @@ impl Asm {
     }
 
     pub fn test(&mut self, a: Reg, b: Reg) {
+        self.flags_overwritten();
         self.encode(&[], true, &[0x85], b as u8, a.into(), false);
     }
 
     /// `test` of the low `size` bytes of `a` and `b`.
     pub fn test_sized(&mut self, size: Size, a: impl Into<Rm>, b: Reg) {
+        self.flags_overwritten();
         self.sized(false, size, (&[0x84], &[0x85]), b as u8, a.into());
     }
 
     pub fn test_imm8(&mut self, reg: Reg, imm: u8) {
+        self.flags_overwritten();
         self.encode(&[], false, &[0xF6], 0, reg.into(), true);
         self.code.push(imm);
     }
 
     /// `test` of the low `size` bytes of `rm` with `imm`.
     pub fn test_imm_sized(&mut self, size: Size, rm: impl Into<Rm>, imm: i32) {
+        self.flags_overwritten();
         self.sized(false, size, (&[0xF6], &[0xF7]), 0, rm.into());
         match size {
             Size::B => self.code.push(imm as u8),
@@ -463,6 +441,7 @@ impl Asm {
 
     /// `op` on the low `size` bytes of `dst` and `src`.
     pub fn alu_sized(&mut self, size: Size, op: Alu, dst: Reg, src: impl Into<Rm>) {
+        self.alu_flags(op);
         self.sized(false, size, (&[op as u8 * 8 + 2], &[op as u8 * 8 + 3]), dst as u8, src.into());
     }
 
@@ -729,6 +708,7 @@ impl Asm {
     }
 
     pub fn bind(&mut self, label: Label) {
+        self.tail = None;
         self.labels[label.0 as usize] = Some(self.pos());
     }
 

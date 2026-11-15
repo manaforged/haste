@@ -3,6 +3,7 @@ mod atomic;
 mod features;
 mod float;
 mod frame;
+mod imm;
 mod int;
 mod location;
 mod vector;
@@ -389,11 +390,9 @@ impl Emit<'_> {
             self.clobber_xmm(scratch);
             return self.store_xmm_home(to, scratch, ty);
         }
-        self.asm.load(Size::Q, Reg::Rax, from);
-        self.asm.store(Size::Q, to, Reg::Rax);
+        self.copy_word(to, from);
         if ty.bytes() == 16 {
-            self.asm.load(Size::Q, Reg::Rax, from.offset(8));
-            self.asm.store(Size::Q, to.offset(8), Reg::Rax);
+            self.copy_word(to.offset(8), from.offset(8));
             self.clobber_reg(Reg::Rax);
             if let Some(disp) = self.frame_disp(to) {
                 self.invalidate_disp(disp);

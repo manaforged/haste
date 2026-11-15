@@ -323,6 +323,9 @@ impl Emit<'_> {
         }
         let size = Size::of(ty.bytes());
         if let Some(imm) = self.const_of(value).and_then(|imm| if ty.bytes() < 8 { Some(imm as i32) } else { i32::try_from(imm).ok() }) {
+            if imm == 0 && size == Size::Q {
+                return self.zero_to(to);
+            }
             self.asm.store_imm_sized(size, to, imm);
             return;
         }
