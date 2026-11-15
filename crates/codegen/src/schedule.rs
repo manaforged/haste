@@ -126,7 +126,7 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Switch => switch::run(func),
         Pass::Returns => returns::run(func),
         Pass::TailRec => {
-            let did = tailrec::run(func);
+            let did = tailrec::run(func, target);
             if !did.is_empty() {
                 fold::compact(func);
             }
