@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use haste_codegen::{Coroutine, Type, Value};
 
-use crate::body::{ExprId, List};
+use crate::body::{Expr, ExprId, List};
 use crate::names::ItemRef;
 use crate::sema::infer::{By, Capture, ClosureBody, Res, Shape, needs_drop};
 use crate::sema::substs::Substs;
@@ -9,7 +9,7 @@ use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::moves::Root;
 use super::place::{Base, Place};
-use super::{Lower, repr};
+use super::{Lower, Repr, repr};
 
 impl Lower<'_, '_> {
     /// Lowers the closure expression `expr` to its environment: each capture's value or address, in a new frame slot.
@@ -27,9 +27,8 @@ impl Lower<'_, '_> {
             false => (object, env),
         };
         for (index, capture) in closure.captures.iter().enumerate() {
-            let value = self.capture_value(capture)?;
-            let part = self.part_place(whole, env, (0, index as u32))?;
-            if let Some(value) = value {
+            if let Some(value) = self.capture_value(capture)? {
+                let part = self.part_place(whole, env, (0, index as u32))?;
                 self.write(part, value);
             }
         }
@@ -126,34 +125,59 @@ impl Lower<'_, '_> {
             let values = self.args(args, values)?;
             return self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values);
         }
-        let values = self.callee_env(callee)?;
+        let callee_ty = self.ty_of(callee);
+        let by_value = self.cx.closure_consumes(callee_ty);
+        let values = self.callee_env(callee, by_value)?;
         let values = self.args(args, values)?;
         self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)
     }
 
-    pub(super) fn callee_env(&mut self, callee: ExprId) -> Result<Vec<Value>> {
+    pub(super) fn callee_env(&mut self, callee: ExprId, by_value: bool) -> Result<Vec<Value>> {
         let callee_ty = self.ty_of(callee);
         if !self.cx.closure_takes_env(callee_ty) {
             self.expr(callee)?;
             return Ok(Vec::new());
         }
         let place = self.place_or_temp(callee)?;
+        if !self.open {
+            return Ok(Vec::new());
+        }
         let env = self.address_or_dangling(place, callee_ty)?;
-        if self.cx.closure_consumes(callee_ty)
-            && let Some((root, path)) = self.scrutinee_path(callee)
-        {
+        if self.cx.closure_consumes(callee_ty) && let Some((root, path)) = self.scrutinee_path(callee) {
             self.moved_out(root, &path)?;
         }
-        let env = if self.cx.closure_consumes(callee_ty)
-            && self.may_alias_place(callee)
-            && let Some(place) = place
-            && matches!(place.repr, super::Repr::Mem { .. })
-        {
-            self.snapshot_repr(place.repr, env)
-        } else {
-            env
+        let env = match (place, self.needs_callee_snapshot(callee, by_value, place)) {
+            (Some(place), true) => self.snapshot_repr(place.repr, env),
+            _ => env,
         };
         Ok(vec![env])
+    }
+
+    fn needs_callee_snapshot(&self, callee: ExprId, by_value: bool, place: Option<Place>) -> bool {
+        let Some(place) = place else {
+            return false;
+        };
+        if !by_value || !matches!(place.repr, Repr::Mem { .. }) || !self.may_alias_place(callee) {
+            return false;
+        }
+        !self.unaliased_once_local(callee)
+    }
+
+    fn unaliased_once_local(&self, mut callee: ExprId) -> bool {
+        while let Some(inner) = self.transparent(callee) {
+            callee = inner;
+        }
+        let Some(&Res::Local(local)) = self.typed.res.get(&callee).filter(|_| matches!(*self.body.expr(callee), Expr::Path(_))) else {
+            return false;
+        };
+        if !self.loops.is_empty() {
+            return false;
+        }
+        if self.typed.closures.values().any(|closure| closure.captures.iter().any(|cap| cap.local == local)) {
+            return false;
+        }
+        let uses = self.typed.res.iter().filter(|(_, res)| matches!(res, Res::Local(id) if *id == local)).count();
+        uses == 1
     }
 
     /// Lowers the body of `Fn::call` or `FnMut::call_mut` at a closure: the call `res` of the closure's body with the fields of the argument tuple.
@@ -302,17 +326,32 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn untuple_arg(&mut self, tuple_expr: ExprId, values: &mut Vec<Value>) -> Result<()> {
+        let mut cur = tuple_expr;
+        while !self.typed.coercions.contains_key(&cur)
+            && let Some(inner) = self.transparent(cur)
+        {
+            cur = inner;
+        }
+        if !self.typed.coercions.contains_key(&cur)
+            && let Expr::Tuple(list) = *self.body.expr(cur)
+        {
+            for item in self.body.list(list).to_vec() {
+                values.extend(self.eval_operand(ExprId(item))?);
+            }
+            return Ok(());
+        }
+        let val = self.eval_operand(tuple_expr)?;
+        if !self.open {
+            return Ok(());
+        }
         let tuple_ty = self.ty_of(tuple_expr);
         let Kind::Tuple(items) = *self.cx.types.kind(tuple_ty) else { bail!("closure arguments that are not a tuple") };
         let count = self.cx.types.substs(items).len() as u32;
-        if let Some(place) = self.place_or_temp(tuple_expr)? {
+        if let Some(place) = self.spill(val, tuple_ty)? {
             for index in 0..count {
                 let part = self.part_place(place, tuple_ty, (0, index))?;
                 values.extend(self.read(part));
             }
-        }
-        if let Some((root, path)) = self.scrutinee_path(tuple_expr) {
-            self.moved_out(root, &path)?;
         }
         Ok(())
     }

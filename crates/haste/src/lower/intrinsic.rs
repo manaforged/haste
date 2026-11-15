@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{AbiParam, Arch, CallConv, FloatCC, IntCC, Signature, Target, Type, Value};
+use haste_codegen::{AbiParam, CallConv, FloatCC, IntCC, Signature, Type, Value};
 
 use crate::body::BinOp;
 use crate::host::HostSymbol;
@@ -11,7 +11,7 @@ use super::ops::Num;
 use super::place::{Base, Place};
 use super::reloc::SiteOrigin;
 use super::stencil::{RodataReloc, RodataTarget, SymbolSource};
-use super::{Lower, Repr, repr};
+use super::{Lower, Repr, host_is_x64_or_arm64, repr};
 
 impl Lower<'_, '_> {
     /// Emits intrinsic `which` at type arguments `substs` on `args` inline.
@@ -299,9 +299,9 @@ impl Lower<'_, '_> {
             return self.memory_intrinsic(origin, Intrinsic::CompareBytes, substs, args);
         };
         let ty = match self.b.const_int(count) {
-            Some(2) if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Type::I16,
-            Some(4) if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Type::I32,
-            Some(8) if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Type::I64,
+            Some(2) if host_is_x64_or_arm64() => Type::I16,
+            Some(4) if host_is_x64_or_arm64() => Type::I32,
+            Some(8) if host_is_x64_or_arm64() => Type::I64,
             _ => return self.memory_intrinsic(origin, Intrinsic::CompareBytes, substs, args),
         };
         let (a, b) = (self.ins().load(ty, x, 0), self.ins().load(ty, y, 0));

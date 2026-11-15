@@ -123,7 +123,6 @@ impl Emit<'_> {
     }
 
     fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
-        self.invalidate_spills();
         let source = self.address_in(from, 0, S);
         let target = self.address_in(to, 0, C);
         let whole = bytes / 16 * 16;
@@ -136,15 +135,22 @@ impl Emit<'_> {
             self.asm.load(Size::of(ty.bytes()), false, A, source.offset(at));
             self.asm.store(Size::of(ty.bytes()), target.offset(at), A);
         }
+        if whole > 0 {
+            self.clobber_vreg(super::V1);
+        }
+        self.clobber_regs(&[A, C, S]);
     }
 
     fn copy(&mut self, to: Value, from: Value, bytes: Value) -> Result<(), String> {
         let chunks = self.plan.const_of(bytes).and_then(crate::copy::chunks).ok_or("a copy of a size that is not a small constant")?;
-        self.invalidate_spills();
+        if chunks.is_empty() {
+            return Ok(());
+        }
         let source = self.address(from, 0);
         for (&(width, offset), reg) in chunks.iter().zip(COPY_SCRATCH) {
             self.asm.load(Size::of(width), false, reg, source.offset(offset as i32));
         }
+        self.clobber_regs(&COPY_SCRATCH[..chunks.len()]);
         let target = self.address(to, 0);
         for (&(width, offset), reg) in chunks.iter().zip(COPY_SCRATCH) {
             self.asm.store(Size::of(width), target.offset(offset as i32), reg);
@@ -161,11 +167,12 @@ impl Emit<'_> {
             return;
         }
         if ty == Type::I128 {
-            self.invalidate_spills();
+            let hi = if from.base == C { super::IP } else { C };
             self.asm.load(Size::X, false, A, from);
+            self.asm.load(Size::X, false, hi, from.offset(8));
+            self.clobber_regs(&[A, hi]);
             self.put(result, A);
-            self.asm.load(Size::X, false, A, from.offset(8));
-            self.put_high(result, A);
+            self.put_high(result, hi);
             return;
         }
         let dst = self.dst(result);
@@ -184,10 +191,11 @@ impl Emit<'_> {
             return;
         }
         if ty == Type::I128 {
+            let hi = if to.base == C { super::IP } else { C };
             self.raw(A, value);
+            self.high(hi, value);
             self.asm.store(Size::X, to, A);
-            self.high(A, value);
-            self.asm.store(Size::X, to.offset(8), A);
+            self.asm.store(Size::X, to.offset(8), hi);
             return;
         }
         let source = self.store_src(value);

@@ -35,46 +35,55 @@ fn stack_base(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, mut v: Va
     false
 }
 
-fn sym_offset_bound(
+pub(super) fn offset_bound(
     func: &Function,
     def_of: &dyn Fn(Value) -> Option<Inst>,
     known: &dyn Fn(Value) -> Option<i64>,
     v: Value,
-    depth: u8,
+    (bound, depth): (Option<(Value, u64)>, u8),
 ) -> u64 {
     let ty = func.ty(v);
     if !ty.is_small_int() {
         return u64::MAX;
     }
-    if let Some(c) = known(v) {
-        return extend(c, ty, false) as u64;
-    }
     let w = ty.unsigned_max();
-    let bits_bound = w & !known_bits(func, def_of, known, v, 0).0;
-    if depth >= MAX_DEPTH {
-        return bits_bound;
+    let mut hi = match known(v) {
+        Some(c) => extend(c, ty, false) as u64,
+        None => w & !known_bits(func, def_of, known, v, 0).0,
+    };
+    if let Some((bv, bmax)) = bound
+        && bv == v
+    {
+        hi = hi.min(bmax);
     }
+    if depth >= MAX_DEPTH || known(v).is_some() {
+        return hi;
+    }
+    let next = (bound, depth + 1);
     let sub = match def_of(v).map(|inst| &func.insts[inst.index()].op) {
-        Some(&Op::Convert(Convert::Uextend, a)) => sym_offset_bound(func, def_of, known, a, depth + 1),
+        Some(&Op::Convert(Convert::Uextend, a)) => offset_bound(func, def_of, known, a, next),
+        Some(&Op::Binary(Binary::Band, a, b)) => {
+            offset_bound(func, def_of, known, a, next).min(offset_bound(func, def_of, known, b, next))
+        }
         Some(&Op::Binary(Binary::Ishl, a, sh)) => known(sh)
             .filter(|&k| (0..i64::from(ty.bits())).contains(&k))
-            .and_then(|k| sym_offset_bound(func, def_of, known, a, depth + 1).checked_mul(1_u64 << (k as u32)))
+            .and_then(|k| offset_bound(func, def_of, known, a, next).checked_mul(1_u64 << (k as u32)))
             .filter(|&n| n <= w)
             .unwrap_or(u64::MAX),
         Some(&Op::Binary(Binary::Imul, a, b)) => [(a, b), (b, a)]
             .into_iter()
             .find_map(|(x, k)| {
                 let c = known(k).map(|imm| extend(imm, ty, false) as u64)?;
-                sym_offset_bound(func, def_of, known, x, depth + 1).checked_mul(c).filter(|&n| n <= w)
+                offset_bound(func, def_of, known, x, next).checked_mul(c).filter(|&n| n <= w)
             })
             .unwrap_or(u64::MAX),
-        Some(&Op::Binary(Binary::Iadd, a, b)) => sym_offset_bound(func, def_of, known, a, depth + 1)
-            .checked_add(sym_offset_bound(func, def_of, known, b, depth + 1))
+        Some(&Op::Binary(Binary::Iadd, a, b)) => offset_bound(func, def_of, known, a, next)
+            .checked_add(offset_bound(func, def_of, known, b, next))
             .filter(|&n| n <= w)
             .unwrap_or(u64::MAX),
         _ => u64::MAX,
     };
-    bits_bound.min(sub)
+    hi.min(sub)
 }
 
 fn sym_base_disp(
@@ -94,7 +103,7 @@ fn sym_base_disp(
         }
         Some(&Op::Binary(Binary::Iadd, a, b)) => [(a, b), (b, a)].into_iter().find_map(|(base, off)| {
             sym_base_disp(func, def_of, known, base, depth + 1)?
-                .checked_add(sym_offset_bound(func, def_of, known, off, depth + 1))
+                .checked_add(offset_bound(func, def_of, known, off, (None, depth + 1)))
                 .filter(|&sum| sum <= ADDR_SPAN as u64)
         }),
         _ => None,

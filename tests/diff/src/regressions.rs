@@ -278,6 +278,177 @@ pub fn case_reg_large_branch_relax(n: i64) -> i64 {
     acc.wrapping_add(7)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn simd_self_f32_lanes(base: f32) -> [f32; 4] {
+    use core::arch::x86_64::{_mm_add_ps, _mm_div_ps, _mm_mul_ps, _mm_setr_ps, _mm_storeu_ps, _mm_sub_ps};
+    let mut out_add = [0.0_f32; 4];
+    let mut out_sub = [0.0_f32; 4];
+    let mut out_mul = [0.0_f32; 4];
+    let mut out_div = [0.0_f32; 4];
+    // SAFETY: SSE baseline is always available on x86_64 and stack arrays are valid for 4 f32s.
+    unsafe {
+        let v = _mm_setr_ps(base, base + 1.0, base + 2.0, base + 3.0);
+        _mm_storeu_ps(out_add.as_mut_ptr(), _mm_add_ps(v, v));
+        _mm_storeu_ps(out_sub.as_mut_ptr(), _mm_sub_ps(v, v));
+        _mm_storeu_ps(out_mul.as_mut_ptr(), _mm_mul_ps(v, v));
+        _mm_storeu_ps(out_div.as_mut_ptr(), _mm_div_ps(v, v));
+    }
+    [
+        out_add[0] + out_add[3],
+        out_sub[1] + out_sub[2],
+        out_mul[0] + out_mul[2],
+        out_div[0] + out_div[3],
+    ]
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn simd_self_f32_lanes(base: f32) -> [f32; 4] {
+    use core::arch::aarch64::{vaddq_f32, vdivq_f32, vld1q_f32, vmulq_f32, vst1q_f32, vsubq_f32};
+    let src = [base, base + 1.0, base + 2.0, base + 3.0];
+    let mut out_add = [0.0_f32; 4];
+    let mut out_sub = [0.0_f32; 4];
+    let mut out_mul = [0.0_f32; 4];
+    let mut out_div = [0.0_f32; 4];
+    // SAFETY: NEON is baseline on aarch64 and stack arrays hold 4 contiguous f32 values.
+    unsafe {
+        let v = vld1q_f32(src.as_ptr());
+        vst1q_f32(out_add.as_mut_ptr(), vaddq_f32(v, v));
+        vst1q_f32(out_sub.as_mut_ptr(), vsubq_f32(v, v));
+        vst1q_f32(out_mul.as_mut_ptr(), vmulq_f32(v, v));
+        vst1q_f32(out_div.as_mut_ptr(), vdivq_f32(v, v));
+    }
+    [
+        out_add[0] + out_add[3],
+        out_sub[1] + out_sub[2],
+        out_mul[0] + out_mul[2],
+        out_div[0] + out_div[3],
+    ]
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn simd_self_f32_lanes(base: f32) -> [f32; 4] {
+    [
+        (base * 2.0) + ((base + 3.0) * 2.0),
+        0.0,
+        (base * base) + ((base + 2.0) * (base + 2.0)),
+        2.0,
+    ]
+}
+
+pub fn case_reg_vec_self_ops(n: i64) -> i64 {
+    let base = black_box(((n.unsigned_abs() % 7) + 2) as f32);
+    let lanes = simd_self_f32_lanes(base);
+    (lanes[0] as i64) * 1000 + (lanes[1] as i64) * 100 + (lanes[2] as i64) * 10 + (lanes[3] as i64)
+}
+
+#[inline(never)]
+fn peeled_sextend_zero(flag: bool, y: i8) -> i64 {
+    let t = ((y | 1) as i64).wrapping_add(1);
+    let sel = if flag { t } else { 0 };
+    if sel != 0 { 100 } else { 200 }
+}
+
+#[inline(never)]
+fn peeled_uextend_zero(flag: bool, y: u8) -> i64 {
+    let t = ((y | 1) as u64).wrapping_sub(1);
+    let sel = if flag { t } else { 0 };
+    if sel != 0 { 30 } else { 40 }
+}
+
+#[inline(never)]
+fn peeled_select_zero(flag: bool, inner: bool, a: i64, b: i64) -> i64 {
+    let nz = if inner { a | 1 } else { b | 2 };
+    let shifted = nz.wrapping_sub(1);
+    let sel = if flag { shifted } else { 0 };
+    if sel != 0 { 5 } else { 9 }
+}
+
+#[inline(never)]
+fn peeled_bitcast_zero(flag: bool, bits: u32) -> i64 {
+    let f = f32::from_bits(bits | 1);
+    let back = (f.to_bits() as i32).wrapping_sub(1);
+    let sel = if flag { back } else { 0 };
+    if sel != 0 { 1 } else { 2 }
+}
+
+pub fn case_reg_peeled_nonzero_offset(n: i64) -> i64 {
+    let a = peeled_sextend_zero(black_box(true), black_box(-1_i8));
+    let b = peeled_sextend_zero(black_box(true), black_box(n as i8));
+    let c = peeled_uextend_zero(black_box(true), black_box(0_u8));
+    let d = peeled_select_zero(black_box(true), black_box(true), black_box(0), black_box(n));
+    let e = peeled_bitcast_zero(black_box(true), black_box(0_u32));
+    a + b + c + d + e
+}
+
+struct CountDrop<'a>(&'a mut i64, i64);
+
+impl Drop for CountDrop<'_> {
+    fn drop(&mut self) {
+        *self.0 += self.1;
+    }
+}
+
+#[inline(never)]
+fn pin_branch_probe(cond: bool, drops: &mut i64, n: i64) -> i64 {
+    let text_len = if cond {
+        core::pin::pin!(format!("pin_{n}")).len() as i64
+    } else {
+        17
+    };
+    let guard_val = if cond {
+        let p = core::pin::pin!(CountDrop(drops, 100));
+        p.1 + 3
+    } else {
+        29
+    };
+    text_len + guard_val
+}
+
+pub fn case_reg_pin_cond_drop(n: i64) -> i64 {
+    let mut drops = 0_i64;
+    let t = pin_branch_probe(black_box(true), &mut drops, n);
+    let f = pin_branch_probe(black_box(false), &mut drops, n);
+    t * 100 + f * 10 + drops
+}
+
+pub fn case_reg_closure_scalar_env(n: i64) -> i64 {
+    let mut acc = black_box(n + 5);
+    let zst = core::marker::PhantomData::<u64>;
+    let step = {
+        let mut cur = acc;
+        let mut f = move |delta: i64| {
+            let core::marker::PhantomData = zst;
+            cur += delta;
+            cur
+        };
+        f(3) + f(7)
+    };
+    let mut bump = |k: i64| {
+        acc += k;
+        acc
+    };
+    let r1 = bump(4);
+    let r2 = bump(6);
+    let pair_fn = |(x, y): (i64, i64)| x * 10 + y + step;
+    r1 + r2 + pair_fn((acc, 2))
+}
+
+#[inline(never)]
+fn invoke_once_pair<G: FnOnce(String, CountDrop<'_>) -> i64>(g: G, s: String, d: CountDrop<'_>) -> i64 {
+    g(s, d)
+}
+
+pub fn case_reg_boxed_fnonce_tuple(n: i64) -> i64 {
+    let mut drops = 0_i64;
+    let out = {
+        let g = Box::new(move |s: String, guard: CountDrop<'_>| (s.len() as i64) + guard.1 + n);
+        invoke_once_pair(g, format!("val_{n}"), CountDrop(&mut drops, 100))
+    };
+    out * 1000 + drops
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_byval_pair", case_reg_byval_pair),
     ("case_reg_byval_string", case_reg_byval_string),
@@ -293,4 +464,9 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_overloaded_lhs_lit", case_reg_overloaded_lhs_lit),
     ("case_reg_wide_rot_bitrev", case_reg_wide_rot_bitrev),
     ("case_reg_large_branch_relax", case_reg_large_branch_relax),
+    ("case_reg_vec_self_ops", case_reg_vec_self_ops),
+    ("case_reg_peeled_nonzero_offset", case_reg_peeled_nonzero_offset),
+    ("case_reg_pin_cond_drop", case_reg_pin_cond_drop),
+    ("case_reg_closure_scalar_env", case_reg_closure_scalar_env),
+    ("case_reg_boxed_fnonce_tuple", case_reg_boxed_fnonce_tuple),
 ];

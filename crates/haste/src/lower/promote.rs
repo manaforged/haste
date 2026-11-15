@@ -13,6 +13,10 @@ use super::place::{Base, Place};
 use super::stencil::{RodataReloc, RodataTarget, SymbolSource};
 use super::{Lower, Repr, repr};
 
+mod const_fn;
+mod const_ops;
+mod const_pat;
+mod const_val;
 mod literal;
 use literal::Scope;
 
@@ -96,7 +100,7 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    /// The value of the `const` block `expr`: computed on the first use into a cell of this function when it loops and its value holds no address, else computed in place.
+    /// The value of the `const` block `expr`: evaluated at compile time when possible, computed on the first use into a cell of this function when it loops and its value holds no address, else computed in place.
     pub(super) fn const_block(&mut self, expr: ExprId, stmts: List, tail: Option<ExprId>) -> Result<Option<Value>> {
         let ty = self.ty_of(expr);
         let whole = repr(self.cx, ty)?;
@@ -105,6 +109,16 @@ impl Lower<'_, '_> {
             Repr::Scalar(_) => matches!(*self.cx.types.kind(ty), Kind::Prim(_)),
             Repr::Mem { .. } => false,
         };
+        if self.cx.types.substs(self.reached.list[self.index].0.1).is_empty()
+            && let Some(blob) = self.eval_const_block(expr, ty)
+        {
+            if whole == Repr::Zst {
+                return Ok(None);
+            }
+            if let Some(val) = self.materialize_blob(expr, ty, blob)? {
+                return Ok(Some(val));
+            }
+        }
         if !plain || !self.loops(stmts, tail) {
             return self.block(stmts, tail);
         }
@@ -118,12 +132,12 @@ impl Lower<'_, '_> {
         tail.is_some_and(looping) || self.body.list(stmts).iter().any(|&stmt| matches!(self.body.stmts[stmt as usize], Stmt::Expr(expr, _) if looping(expr)))
     }
 
-    fn is_mutable_static(&self, item: ItemRef) -> bool {
+    pub(super) fn is_mutable_static(&self, item: ItemRef) -> bool {
         let (src, entry) = self.cx.item(item);
         entry.name.is_none_or(|name| name == 0 || src.text(name - 1) == "mut")
     }
 
-    fn static_rodata_blob(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
+    pub(super) fn static_rodata_blob(&mut self, item: ItemRef, substs: Substs, ty: Ty) -> Result<Option<(Vec<u8>, Vec<RodataReloc>)>> {
         if self.cx.foreign(item) || self.cx.thread_local(item) || self.is_mutable_static(item) || !super::is_freeze_ty(self.cx, ty, 0) {
             return Ok(None);
         }
@@ -138,7 +152,7 @@ impl Lower<'_, '_> {
         }
         let body = self.cx.body(source)?;
         let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
-        Ok(self.literal_blob(Scope { body: &body, src, typed: &typed }, (root, static_ty), 0))
+        Ok(self.literal_blob(Scope { body: &body, src, typed: &typed, in_const: true }, (root, static_ty), 0))
     }
 
     fn emit_rodata_blob(&mut self, bytes: &[u8], relocs: &[RodataReloc]) -> Value {
@@ -222,8 +236,9 @@ impl Lower<'_, '_> {
             return Ok(false);
         }
         let ty = self.ty_of(expr);
+        let in_const = matches!(self.cx.item(self.reached.list[self.index].0.0).1.kind, ItemKind::Const | ItemKind::Static);
         let (body, src, typed) = (self.body, self.src, self.typed);
-        Ok(self.literal_blob(Scope { body, src, typed }, (expr, ty), 0).is_some_and(|(bytes, relocs)| relocs.is_empty() && bytes.iter().all(|&b| b == 0)))
+        Ok(self.literal_blob(Scope { body, src, typed, in_const }, (expr, ty), 0).is_some_and(|(bytes, relocs)| relocs.is_empty() && bytes.iter().all(|&b| b == 0)))
     }
 
     /// The value of the constant `item` at `substs` that `expr` reads: an immediate, or bytes laid out once, when its body is literals of a crate that cannot change while haste runs; else a call of its body.
@@ -252,7 +267,11 @@ impl Lower<'_, '_> {
         let ty = typed.ret_ty();
         let body = self.cx.body(source)?;
         let (Some(root), src) = (body.root, self.cx.body_src(source)) else { return Ok(None) };
-        let Some((bytes, relocs)) = self.literal_blob(Scope { body: &body, src, typed: &typed }, (root, ty), 0) else { return Ok(None) };
+        let Some(blob) = self.literal_blob(Scope { body: &body, src, typed: &typed, in_const: true }, (root, ty), 0) else { return Ok(None) };
+        self.materialize_blob(expr, ty, blob)
+    }
+
+    fn materialize_blob(&mut self, expr: ExprId, ty: Ty, (bytes, relocs): (Vec<u8>, Vec<RodataReloc>)) -> Result<Option<Value>> {
         match repr(self.cx, ty)? {
             Repr::Scalar(machine) if relocs.is_empty() => {
                 let mut word = [0; 16];
@@ -291,7 +310,7 @@ impl Lower<'_, '_> {
         }
         let Expr::Ref { mutable: false, raw: false, expr: inner } = *body.expr(root) else { return Ok(None) };
         let inner_ty = typed.expr_ty(&self.cx.types, inner);
-        let Some((bytes, relocs)) = self.literal_blob(Scope { body: &body, src, typed: &typed }, (inner, inner_ty), 0) else { return Ok(None) };
+        let Some((bytes, relocs)) = self.literal_blob(Scope { body: &body, src, typed: &typed, in_const: true }, (inner, inner_ty), 0) else { return Ok(None) };
         let data = self.emit_rodata_blob(&bytes, &relocs);
         Ok(match (self.cx.types.kind(pointee).clone(), self.cx.types.kind(inner_ty).clone()) {
             (Kind::Slice(_), Kind::Array(_, len)) => self.cx.types.len(len).map(|len| self.wide_pointer(data, len as i64)),
@@ -314,7 +333,7 @@ impl Lower<'_, '_> {
             let ty = typed.ret_ty();
             let body = self.cx.body(source)?;
             if let (Some(root), src) = (body.root, self.cx.body_src(source))
-                && let Some((bytes, relocs)) = self.literal_blob(Scope { body: &body, src, typed: &typed }, (root, ty), 0)
+                && let Some((bytes, relocs)) = self.literal_blob(Scope { body: &body, src, typed: &typed, in_const: true }, (root, ty), 0)
             {
                 return Ok(Some(self.emit_rodata_blob(&bytes, &relocs)));
             }
@@ -322,7 +341,7 @@ impl Lower<'_, '_> {
         if !self.lent_mutably(expr) && self.cx.types.substs(self.reached.list[self.index].0.1).is_empty() {
             let ty = self.ty_of(expr);
             let (body, src, typed) = (self.body, self.src, self.typed);
-            if let Some((bytes, relocs)) = self.literal_blob(Scope { body, src, typed }, (expr, ty), 0) {
+            if let Some((bytes, relocs)) = self.literal_blob(Scope { body, src, typed, in_const: true }, (expr, ty), 0) {
                 return Ok(Some(self.emit_rodata_blob(&bytes, &relocs)));
             }
         }

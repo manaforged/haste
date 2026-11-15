@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, Block, IntCC, Target, Type, Value};
+use haste_codegen::{Block, IntCC, Type, Value};
 
 use crate::body::{BlockKind, Body, Expr, ExprId, List, Lit, Pat, PatId, UnOp};
 use crate::body::literal::{byte_value, char_value};
@@ -10,18 +10,14 @@ use crate::sema::Context;
 use crate::sema::infer::{Res, Typed, parse_int, position, rest_split};
 use crate::sema::ty::{Kind, Ty, int_info, mask};
 
+use super::equal::bitwise_prim_bytes;
 use super::ops::WIDE;
 use super::place::{Base, Place};
-use super::{Lower, Repr, repr};
+use super::{Lower, Repr, host_is_x64_or_arm64, repr};
 
 fn bitwise_elem(cx: &mut Context<'_>, ty: Ty) -> Option<(Primitive, usize)> {
     let Kind::Prim(prim) = *cx.types.kind(ty) else { return None };
-    let bytes = match prim {
-        Primitive::U8 | Primitive::I8 | Primitive::Bool => 1,
-        Primitive::U16 | Primitive::I16 => 2,
-        Primitive::U32 | Primitive::I32 | Primitive::Char => 4,
-        _ => return None,
-    };
+    let bytes = bitwise_prim_bytes(prim).filter(|&b| b <= 4)?;
     (cx.layout(ty).ok()?.size.bytes() == bytes as u64).then_some((prim, bytes))
 }
 
@@ -134,7 +130,7 @@ impl Lower<'_, '_> {
         (tested, fail): (&mut [bool], Block),
     ) -> Result<Option<Place>> {
         let Some((prim, elem_bytes)) = bitwise_elem(self.cx, element) else { return Ok(None) };
-        if !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) || stride != elem_bytes as u64 {
+        if !host_is_x64_or_arm64() || stride != elem_bytes as u64 {
             return Ok(None);
         }
         let pre_end = rest.unwrap_or(pats.len());
@@ -188,7 +184,7 @@ impl Lower<'_, '_> {
 
     fn pat_scalar_bits(&mut self, mut pat: PatId, prim: Primitive) -> Option<u64> {
         loop {
-            if self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) != 0 {
+            if self.typed.pat_derefs(pat) != 0 {
                 return None;
             }
             match *self.body.pat(pat) {
@@ -219,7 +215,7 @@ impl Lower<'_, '_> {
         if !testing {
             return matches!(*self.body.pat(sub), Pat::Wild | Pat::Lit(..) | Pat::Range { .. });
         }
-        if self.typed.pat_derefs.get(&sub).copied().unwrap_or(0) != 0 || self.typed.pat_res.contains_key(&sub) {
+        if self.typed.pat_derefs(sub) != 0 || self.typed.pat_res.contains_key(&sub) {
             return false;
         }
         match *self.body.pat(sub) {

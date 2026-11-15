@@ -30,6 +30,7 @@ pub use expr::{can_inline_body, may_inline};
 pub use abi::{signature, signature_of};
 pub(crate) use abi::purpose_tag;
 pub(super) use abi::is_freeze_ty;
+pub(crate) use object::VTABLE_HEADER;
 pub use plan::eval_footprint;
 pub use reloc::{RelocPlan, eval_relocs};
 pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil};
@@ -37,7 +38,17 @@ pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTa
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use haste_codegen::{ArgumentPurpose, Block, FunctionBuilder, Ins, Signature, StackSlot, Type, Value};
+use haste_codegen::{Arch, ArgumentPurpose, Block, FunctionBuilder, Ins, Signature, StackSlot, Target, Type, Value};
+
+/// Whether `arch` is x86-64 or AArch64.
+pub(crate) fn arch_is_x64_or_arm64(arch: Arch) -> bool {
+    matches!(arch, Arch::X64 | Arch::Arm64)
+}
+
+/// Whether the host target architecture is x86-64 or AArch64.
+pub(crate) fn host_is_x64_or_arm64() -> bool {
+    arch_is_x64_or_arm64(Target::host().arch)
+}
 
 use crate::body::{Body, Expr, ExprId, List, Pat, PatId, Stmt};
 use crate::names::{ItemRef, Primitive};

@@ -17,6 +17,11 @@ pub(super) const CALLABLE_METHODS: [(&str, &str); 6] = [
     ("async_fn_once", "async_call_once"),
 ];
 
+/// Whether `lang` names any sync or async callable trait.
+pub(crate) fn is_callable_lang(lang: &str) -> bool {
+    CALLABLE.contains(&lang) || ASYNC_CALLABLE.contains(&lang)
+}
+
 /// Whether `item` is `AsyncFnOnce::async_call_once`.
 pub(in crate::sema) fn is_async_call_once(cx: &Context<'_>, item: ItemRef) -> bool {
     cx.owner_trait(item).and_then(|of| cx.lang(of)) == Some("async_fn_once")

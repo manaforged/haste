@@ -150,7 +150,7 @@ impl Lower<'_, '_> {
         let Some(at) = at.filter(|_| self.typed.pats.contains_key(&pat)) else {
             return Ok(());
         };
-        if self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) > 0 {
+        if self.typed.pat_derefs(pat) > 0 {
             return Ok(());
         }
         match *self.body.pat(pat) {

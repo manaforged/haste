@@ -1,6 +1,6 @@
 use super::fits_mem_imm;
 use crate::cfg::Cfg;
-use crate::ir::{Binary, Block, Convert, Function, Inst, Op, StackSlot, TargetOpId, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, StackSlot, TargetOpId, Type, Unary, Value};
 use crate::mem::{MemBase, MemLoc, Provenance};
 
 struct PackCtx<'a> {
@@ -36,83 +36,50 @@ struct Leaf {
     raw: RawLoad,
     shift_byte: i64,
     bytes: i64,
+    bswapped: bool,
+}
+
+enum PackOut {
+    Load { big_endian: bool },
+    Cmp { cc: IntCC, mask: Option<i64>, rhs_const: Option<i64>, rhs_op: Option<Op> },
 }
 
 struct PackPlan {
     wide_op: Op,
     wide_ty: Type,
-    big_endian: bool,
+    out: PackOut,
     touched: Vec<Value>,
 }
 
 type DefInfo = Option<(Block, usize, Inst)>;
 
-fn canonical_addr(
+fn canon_addr_step(
     func: &Function,
-    prov: &Provenance,
     consts: &[Option<i64>],
     def_info: &[DefInfo],
-    addr: Value,
-    off: i32,
-) -> Option<(AddrKey, i64)> {
-    let loc = prov.loc(addr, i64::from(off), 1);
-    match loc.base {
-        MemBase::Slot(slot) => return Some((AddrKey::Slot(slot), loc.offset)),
-        MemBase::Global(sym) => return Some((AddrKey::Global(sym), loc.offset)),
-        MemBase::Addr(_) => {}
-    }
-    let mut const_off = i64::from(off);
-    let mut terms: Vec<(u32, i64)> = Vec::new();
-    let mut work = vec![(addr, 1_i64)];
-    let mut steps = 0_usize;
-    while let Some((v, sc)) = work.pop() {
-        if let Some(imm) = consts.get(v.index()).copied().flatten() {
-            const_off = const_off.checked_add(sc.checked_mul(imm)?)?;
-            continue;
+    (v, sc): (Value, i64),
+    work: &mut Vec<(Value, i64)>,
+) -> Result<bool, ()> {
+    let Some((_, _, inst)) = def_info.get(v.index()).copied().flatten() else { return Ok(false) };
+    match func.insts[inst.index()].op {
+        Op::Convert(Convert::Bitcast, x) if func.ty(x) == Type::I64 => work.push((x, sc)),
+        Op::Binary(Binary::Iadd, a, b) => work.extend([(a, sc), (b, sc)]),
+        Op::Binary(Binary::Isub, a, b) => work.extend([(a, sc), (b, sc.checked_neg().ok_or(())?)]),
+        Op::Binary(Binary::Ishl, a, amt) => {
+            let Some(sh) = consts.get(amt.index()).copied().flatten().filter(|&s| (0..63).contains(&s)) else { return Ok(false) };
+            work.push((a, sc.checked_mul(1_i64 << sh).ok_or(())?));
         }
-        if steps < MAX_ADDR_STEPS
-            && func.ty(v) == Type::I64
-            && let Some((_, _, inst)) = def_info.get(v.index()).copied().flatten()
-        {
-            steps += 1;
-            match func.insts[inst.index()].op {
-                Op::Convert(Convert::Bitcast, x) if func.ty(x) == Type::I64 => {
-                    work.push((x, sc));
-                    continue;
-                }
-                Op::Binary(Binary::Iadd, a, b) => {
-                    work.push((a, sc));
-                    work.push((b, sc));
-                    continue;
-                }
-                Op::Binary(Binary::Isub, a, b) => {
-                    work.push((a, sc));
-                    work.push((b, sc.checked_neg()?));
-                    continue;
-                }
-                Op::Binary(Binary::Ishl, a, amt) => {
-                    if let Some(sh) = consts.get(amt.index()).copied().flatten()
-                        && (0..63).contains(&sh)
-                    {
-                        work.push((a, sc.checked_mul(1_i64 << sh)?));
-                        continue;
-                    }
-                }
-                Op::Binary(Binary::Imul, a, b) => {
-                    if let Some(k) = consts.get(b.index()).copied().flatten() {
-                        work.push((a, sc.checked_mul(k)?));
-                        continue;
-                    }
-                    if let Some(k) = consts.get(a.index()).copied().flatten() {
-                        work.push((b, sc.checked_mul(k)?));
-                        continue;
-                    }
-                }
-                _ => {}
-            }
+        Op::Binary(Binary::Imul, a, b) => {
+            let Some((inner, k)) = consts.get(b.index()).copied().flatten().map(|k| (a, k))
+                .or_else(|| consts.get(a.index()).copied().flatten().map(|k| (b, k))) else { return Ok(false) };
+            work.push((inner, sc.checked_mul(k).ok_or(())?));
         }
-        terms.push((v.index() as u32, sc));
+        _ => return Ok(false),
     }
+    Ok(true)
+}
+
+fn merge_canon_terms(mut terms: Vec<(u32, i64)>) -> Option<AddrKey> {
     terms.sort_unstable_by_key(|&(id, _)| id);
     let mut merged: Vec<(u32, i64)> = Vec::with_capacity(terms.len());
     for (id, sc) in terms {
@@ -125,7 +92,29 @@ fn canonical_addr(
             merged.push((id, sc));
         }
     }
-    Some((AddrKey::Expr(merged), const_off))
+    Some(AddrKey::Expr(merged))
+}
+
+fn canonical_addr(func: &Function, prov: &Provenance, consts: &[Option<i64>], def_info: &[DefInfo], addr: Value, off: i32) -> Option<(AddrKey, i64)> {
+    let loc = prov.loc(addr, i64::from(off), 1);
+    match loc.base {
+        MemBase::Slot(slot) => return Some((AddrKey::Slot(slot), loc.offset)),
+        MemBase::Global(sym) => return Some((AddrKey::Global(sym), loc.offset)),
+        MemBase::Addr(_) => {}
+    }
+    let (mut const_off, mut terms, mut work, mut steps) = (i64::from(off), Vec::new(), vec![(addr, 1_i64)], 0_usize);
+    while let Some((v, sc)) = work.pop() {
+        if let Some(imm) = consts.get(v.index()).copied().flatten() {
+            const_off = const_off.checked_add(sc.checked_mul(imm)?)?;
+            continue;
+        }
+        if steps < MAX_ADDR_STEPS && func.ty(v) == Type::I64 && canon_addr_step(func, consts, def_info, (v, sc), &mut work).ok()? {
+            steps += 1;
+            continue;
+        }
+        terms.push((v.index() as u32, sc));
+    }
+    Some((merge_canon_terms(terms)?, const_off))
 }
 
 fn pred_chain(cfg: &Cfg, blk: Block) -> Vec<Block> {
@@ -143,13 +132,7 @@ fn pred_chain(cfg: &Cfg, blk: Block) -> Vec<Block> {
     chain
 }
 
-fn push_leaf_load(
-    ctx: &PackCtx<'_>,
-    chain: &[Block],
-    val: Value,
-    (shift_byte, expect_bytes): (i64, u32),
-    (leaves, touched, key): (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>),
-) -> Option<()> {
+fn push_leaf_load(ctx: &PackCtx<'_>, chain: &[Block], val: Value, (shift_byte, expect_bytes): (i64, u32), (leaves, touched, key): (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>)) -> Option<()> {
     let (lblk, lpos, linst) = ctx.def_info.get(val.index()).copied().flatten()?;
     let blk_idx = chain.iter().position(|&b| b == lblk)?;
     let ty = ctx.func.ty(val);
@@ -173,64 +156,73 @@ fn push_leaf_load(
         _ => {}
     }
     touched.push(val);
-    leaves.push(Leaf { blk_idx, pos: lpos, loc, canon_off, raw, shift_byte, bytes: i64::from(expect_bytes) });
+    leaves.push(Leaf { blk_idx, pos: lpos, loc, canon_off, raw, shift_byte, bytes: i64::from(expect_bytes), bswapped: false });
     Some(())
+}
+
+fn def_op<'a>(ctx: &'a PackCtx<'_>, v: Value) -> Option<&'a Op> {
+    let (_, _, inst) = ctx.def_info.get(v.index()).copied().flatten()?;
+    Some(&ctx.func.insts[inst.index()].op)
+}
+
+fn peel_shift_ext(ctx: &PackCtx<'_>, mut val: Value, (mut shift, mut avail): (i64, i64), touched: &mut Vec<Value>) -> Option<(Value, i64, i64, bool)> {
+    while let Some(op) = def_op(ctx, val) {
+        match *op {
+            Op::Convert(Convert::Uextend, inner) => {
+                touched.push(val);
+                avail = avail.min(i64::from(ctx.func.ty(inner).bytes()));
+                val = inner;
+            }
+            Op::Binary(Binary::Ishl, inner, amt) => {
+                let imm = ctx.consts.get(amt.index()).copied().flatten()?;
+                let cur_bytes = i64::from(ctx.func.ty(val).bytes());
+                if imm < 0 || imm >= cur_bytes * 8 || imm % 8 != 0 || imm / 8 >= avail {
+                    return None;
+                }
+                touched.push(val);
+                shift += imm / 8;
+                avail = avail.min(cur_bytes) - imm / 8;
+                val = inner;
+            }
+            Op::Unary(Unary::Bswap, inner) => {
+                touched.push(val);
+                avail = avail.min(i64::from(ctx.func.ty(inner).bytes()));
+                return Some((inner, shift, avail, true));
+            }
+            _ => break,
+        }
+    }
+    Some((val, shift, avail, false))
 }
 
 fn collect_leaves(
     ctx: &PackCtx<'_>,
     chain: &[Block],
-    val: Value,
+    (val, shift, avail): (Value, i64, i64),
     (leaves, touched, key): (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>),
 ) -> Option<()> {
-    let (_, _, inst) = ctx.def_info.get(val.index()).copied().flatten()?;
-    match ctx.func.insts[inst.index()].op {
-        Op::Binary(Binary::Bor | Binary::Iadd, a, b) => {
-            touched.push(val);
-            collect_leaves(ctx, chain, a, (leaves, touched, key))?;
-            collect_leaves(ctx, chain, b, (leaves, touched, key))
-        }
-        _ => {
-            let mut cur = val;
-            let mut shift_byte = 0_i64;
-            let mut shift_ty_bytes: Option<i64> = None;
-            loop {
-                let Some((_, _, linst)) = ctx.def_info.get(cur.index()).copied().flatten() else { return None };
-                match ctx.func.insts[linst.index()].op {
-                    Op::Convert(Convert::Uextend, inner) => {
-                        touched.push(cur);
-                        cur = inner;
-                    }
-                    Op::Binary(Binary::Ishl, inner, amt) if shift_ty_bytes.is_none() => {
-                        let imm = ctx.consts.get(amt.index()).copied().flatten()?;
-                        if !(0..64).contains(&imm) || imm % 8 != 0 {
-                            return None;
-                        }
-                        touched.push(cur);
-                        shift_byte = imm / 8;
-                        shift_ty_bytes = Some(i64::from(ctx.func.ty(cur).bytes()));
-                        cur = inner;
-                    }
-                    _ => break,
-                }
-            }
-            let load_ty = ctx.func.ty(cur);
-            if !matches!(load_ty, Type::I8 | Type::I16 | Type::I32) || shift_ty_bytes.is_some_and(|st| shift_byte + i64::from(load_ty.bytes()) > st) {
-                return None;
-            }
-            push_leaf_load(ctx, chain, cur, (shift_byte, load_ty.bytes()), (leaves, touched, key))
-        }
+    if leaves.len() >= 8 || touched.len() >= 64 {
+        return None;
     }
+    let (cur, shift, avail, bswapped) = peel_shift_ext(ctx, val, (shift, avail), touched)?;
+    if !bswapped && let Some(&Op::Binary(Binary::Bor | Binary::Iadd, a, b)) = def_op(ctx, cur) {
+        touched.push(cur);
+        collect_leaves(ctx, chain, (a, shift, avail), (leaves, touched, key))?;
+        return collect_leaves(ctx, chain, (b, shift, avail), (leaves, touched, key));
+    }
+    let load_ty = ctx.func.ty(cur);
+    let min_bytes = if bswapped { 2 } else { 1 };
+    if !load_ty.is_small_int() || !(min_bytes..=4).contains(&load_ty.bytes()) || i64::from(load_ty.bytes()) > avail {
+        return None;
+    }
+    push_leaf_load(ctx, chain, cur, (shift, load_ty.bytes()), (leaves, touched, key))?;
+    if bswapped {
+        leaves.last_mut()?.bswapped = true;
+    }
+    Some(())
 }
 
-fn has_clobber(
-    func: &Function,
-    prov: &Provenance,
-    chain: &[Block],
-    leaves: &[Leaf],
-    root_pos: usize,
-    wide_loc: MemLoc,
-) -> bool {
+fn has_clobber(func: &Function, prov: &Provenance, chain: &[Block], leaves: &[Leaf], root_pos: usize, wide_loc: MemLoc) -> bool {
     let Some(min_leaf) = leaves.iter().min_by_key(|l| (l.blk_idx, l.pos)) else {
         return true;
     };
@@ -283,67 +275,234 @@ fn contiguous_leaves(leaves: &mut [Leaf], expected_bytes: Option<i64>) -> Option
     Some(min_off)
 }
 
-fn finish_pack_plan(
-    ctx: &PackCtx<'_>,
-    chain: &[Block],
-    (root_pos, wide_ty, big_endian): (usize, Type, bool),
-    leaves: &[Leaf],
-    touched: Vec<Value>,
-) -> Option<PackPlan> {
+fn wide_mem_ty(total_w: i64) -> Type {
+    if total_w == 2 { Type::I16 } else if total_w == 4 { Type::I32 } else { Type::I64 }
+}
+
+fn checked_wide_load(ctx: &PackCtx<'_>, chain: &[Block], root_pos: usize, leaves: &[Leaf], wide_ty: Type) -> Option<Op> {
     let first = leaves[0];
     let wide_op = build_wide_load(ctx, *chain.last()?, root_pos, first, wide_ty)?;
     let wide_loc = MemLoc::new(first.loc.root, first.loc.base, first.loc.offset, wide_ty.bytes());
-    if has_clobber(ctx.func, ctx.prov, chain, leaves, root_pos, wide_loc) {
-        return None;
-    }
-    Some(PackPlan { wide_op, wide_ty, big_endian, touched })
+    (!has_clobber(ctx.func, ctx.prov, chain, leaves, root_pos, wide_loc)).then_some(wide_op)
+}
+
+fn finish_pack_plan(ctx: &PackCtx<'_>, chain: &[Block], (root_pos, wide_ty, big_endian): (usize, Type, bool), leaves: &[Leaf], touched: Vec<Value>) -> Option<PackPlan> {
+    let wide_op = checked_wide_load(ctx, chain, root_pos, leaves, wide_ty)?;
+    Some(PackPlan { wide_op, wide_ty, out: PackOut::Load { big_endian }, touched })
 }
 
 fn build_pack(ctx: &PackCtx<'_>, chain: &[Block], (root_pos, root_val, res_ty): (usize, Value, Type)) -> Option<PackPlan> {
     let (mut leaves, mut touched, mut addr_key) = (Vec::new(), Vec::new(), None);
-    collect_leaves(ctx, chain, root_val, (&mut leaves, &mut touched, &mut addr_key))?;
+    let avail = i64::from(res_ty.bytes());
+    collect_leaves(ctx, chain, (root_val, 0, avail), (&mut leaves, &mut touched, &mut addr_key))?;
     if !(2..=8).contains(&leaves.len()) {
         return None;
     }
     let min_off = contiguous_leaves(&mut leaves, None)?;
     let total_w: i64 = leaves.iter().map(|l| l.bytes).sum();
-    if !matches!(total_w, 2 | 4 | 8) || total_w > i64::from(res_ty.bytes()) || leaves.iter().any(|l| l.shift_byte + l.bytes > total_w) {
+    if !matches!(total_w, 2 | 4 | 8) || total_w > avail || leaves.iter().any(|l| l.shift_byte + l.bytes > total_w) {
         return None;
     }
-    let little = leaves.iter().all(|l| l.shift_byte == l.canon_off - min_off);
-    let big = !little && leaves.iter().all(|l| l.bytes == 1 && l.shift_byte == total_w - (l.canon_off - min_off) - 1);
+    let little = leaves.iter().all(|l| !l.bswapped && l.shift_byte == l.canon_off - min_off);
+    let big = !little && leaves.iter().all(|l| (l.bytes == 1 || l.bswapped) && l.shift_byte == total_w - (l.canon_off - min_off) - l.bytes);
     if !little && !big {
         return None;
     }
-    let wide_ty = match total_w {
-        2 => Type::I16,
-        4 => Type::I32,
-        _ => Type::I64,
+    finish_pack_plan(ctx, chain, (root_pos, wide_mem_ty(total_w), big), &leaves, touched)
+}
+
+#[derive(Default)]
+struct CmpAcc {
+    leaves_a: Vec<Leaf>,
+    leaves_b: Vec<Leaf>,
+    masks: Vec<(u64, u64)>,
+    touched: Vec<Value>,
+    key_a: Option<AddrKey>,
+    key_b: Option<AddrKey>,
+    two_ptr: Option<bool>,
+}
+
+fn const_pair(ctx: &PackCtx<'_>, a: Value, b: Value) -> Option<(Value, i64)> {
+    let c = |v: Value| ctx.consts.get(v.index()).copied().flatten();
+    c(b).map(|imm| (a, imm)).or_else(|| c(a).map(|imm| (b, imm)))
+}
+
+fn canon_const(raw: u64, ty: Type) -> i64 {
+    if ty == Type::I16 { (raw as i16) as i64 } else if ty == Type::I32 { (raw as i32) as i64 } else { raw as i64 }
+}
+
+fn peel_uext(ctx: &PackCtx<'_>, mut v: Value, touched: &mut Vec<Value>) -> Value {
+    while let Some(&Op::Convert(Convert::Uextend, inner)) = def_op(ctx, v) {
+        touched.push(v);
+        v = inner;
+    }
+    v
+}
+
+fn peel_masked_load(ctx: &PackCtx<'_>, mut v: Value, mut mask: u64, touched: &mut Vec<Value>) -> Option<(Value, u64)> {
+    loop {
+        v = peel_uext(ctx, v, touched);
+        let Some(&Op::Binary(Binary::Band, a, b)) = def_op(ctx, v) else { break };
+        let (inner, imm) = const_pair(ctx, a, b)?;
+        touched.push(v);
+        mask &= imm as u64;
+        v = inner;
+    }
+    let ty = ctx.func.ty(v);
+    (ty.is_small_int() && ty.bytes() <= 4).then_some((v, mask & (!0_u64 >> (64 - ty.bytes() * 8))))
+}
+
+fn push_cmp_masked(ctx: &PackCtx<'_>, chain: &[Block], val: Value, (init_m, c_bits): (u64, u64), acc: &mut CmpAcc) -> Option<()> {
+    if acc.two_ptr == Some(true) {
+        return None;
+    }
+    acc.two_ptr = Some(false);
+    let (load_v, mask) = peel_masked_load(ctx, val, init_m, &mut acc.touched)?;
+    if mask == 0 || (c_bits & !mask) != 0 {
+        return None;
+    }
+    let idx = acc.masks.len() as i64;
+    push_leaf_load(ctx, chain, load_v, (idx, ctx.func.ty(load_v).bytes()), (&mut acc.leaves_a, &mut acc.touched, &mut acc.key_a))?;
+    acc.masks.push((mask, c_bits));
+    Some(())
+}
+
+fn push_cmp_eq(ctx: &PackCtx<'_>, chain: &[Block], (a, b): (Value, Value), acc: &mut CmpAcc) -> Option<()> {
+    let cmp_ty = ctx.func.ty(a);
+    if !cmp_ty.is_small_int() {
+        return None;
+    }
+    let cmp_mask = !0_u64 >> (64 - cmp_ty.bytes() * 8);
+    if let Some((other, imm)) = const_pair(ctx, a, b) {
+        return push_cmp_masked(ctx, chain, other, (cmp_mask, (imm as u64) & cmp_mask), acc);
+    }
+    if acc.two_ptr == Some(false) {
+        return None;
+    }
+    acc.two_ptr = Some(true);
+    let (la, lb) = (peel_uext(ctx, a, &mut acc.touched), peel_uext(ctx, b, &mut acc.touched));
+    let ty = ctx.func.ty(la);
+    if ty != ctx.func.ty(lb) || !ty.is_small_int() || ty.bytes() > 4 {
+        return None;
+    }
+    let idx = acc.leaves_a.len() as i64;
+    push_leaf_load(ctx, chain, la, (idx, ty.bytes()), (&mut acc.leaves_a, &mut acc.touched, &mut acc.key_a))?;
+    push_leaf_load(ctx, chain, lb, (idx, ty.bytes()), (&mut acc.leaves_b, &mut acc.touched, &mut acc.key_b))
+}
+
+fn parse_bor_zero_leaf(ctx: &PackCtx<'_>, chain: &[Block], val: Value, acc: &mut CmpAcc) -> Option<()> {
+    let cur = peel_uext(ctx, val, &mut acc.touched);
+    match *def_op(ctx, cur)? {
+        Op::Binary(Binary::Bxor, a, b) => {
+            acc.touched.push(cur);
+            push_cmp_eq(ctx, chain, (a, b), acc)
+        }
+        Op::Binary(Binary::Band, x, y) => {
+            let (inner, m) = const_pair(ctx, x, y)?;
+            let inner = peel_uext(ctx, inner, &mut acc.touched);
+            if let Some(&Op::Binary(Binary::Bxor, a, b)) = def_op(ctx, inner) {
+                let (load_side, c_imm) = const_pair(ctx, a, b)?;
+                acc.touched.extend([cur, inner]);
+                return push_cmp_masked(ctx, chain, load_side, (m as u64, (c_imm & m) as u64), acc);
+            }
+            push_cmp_masked(ctx, chain, cur, (!0_u64, 0), acc)
+        }
+        _ => push_cmp_masked(ctx, chain, cur, (!0_u64, 0), acc),
+    }
+}
+
+fn collect_cmp_leaves(ctx: &PackCtx<'_>, chain: &[Block], val: Value, (join_op, leaf_cc): (Binary, Option<IntCC>), acc: &mut CmpAcc) -> Option<()> {
+    if acc.leaves_a.len() >= 8 || acc.touched.len() >= 64 {
+        return None;
+    }
+    let cur = peel_uext(ctx, val, &mut acc.touched);
+    match *def_op(ctx, cur)? {
+        Op::Binary(op, a, b) if op == join_op => {
+            acc.touched.push(cur);
+            collect_cmp_leaves(ctx, chain, a, (join_op, leaf_cc), acc)?;
+            collect_cmp_leaves(ctx, chain, b, (join_op, leaf_cc), acc)
+        }
+        Op::Icmp(cc, a, b) if leaf_cc == Some(cc) => {
+            acc.touched.push(cur);
+            push_cmp_eq(ctx, chain, (a, b), acc)
+        }
+        _ if leaf_cc.is_none() => parse_bor_zero_leaf(ctx, chain, cur, acc),
+        _ => None,
+    }
+}
+
+fn finish_two_ptr_cmp(ctx: &PackCtx<'_>, chain: &[Block], (root_pos, cc, wide_ty, min_off): (usize, IntCC, Type, i64), (wide_op, acc): (Op, CmpAcc)) -> Option<PackPlan> {
+    if acc.leaves_b.len() != acc.leaves_a.len() {
+        return None;
+    }
+    let pairs_b: Vec<Leaf> = acc.leaves_a.iter().map(|la| acc.leaves_b[la.shift_byte as usize]).collect();
+    let min_b = pairs_b[0].canon_off;
+    if !acc.leaves_a.iter().zip(&pairs_b).all(|(la, lb)| la.bytes == lb.bytes && lb.canon_off - min_b == la.canon_off - min_off) {
+        return None;
+    }
+    let rhs_op = checked_wide_load(ctx, chain, root_pos, &pairs_b, wide_ty)?;
+    Some(PackPlan { wide_op, wide_ty, out: PackOut::Cmp { cc, mask: None, rhs_const: None, rhs_op: Some(rhs_op) }, touched: acc.touched })
+}
+
+fn finish_cmp_pack(ctx: &PackCtx<'_>, chain: &[Block], (root_pos, cc): (usize, IntCC), mut acc: CmpAcc) -> Option<PackPlan> {
+    let min_off = contiguous_leaves(&mut acc.leaves_a, None)?;
+    let total_w: i64 = acc.leaves_a.iter().map(|l| l.bytes).sum();
+    if !matches!(total_w, 2 | 4 | 8) {
+        return None;
+    }
+    let wide_ty = wide_mem_ty(total_w);
+    let wide_op = checked_wide_load(ctx, chain, root_pos, &acc.leaves_a, wide_ty)?;
+    if acc.two_ptr == Some(true) {
+        return finish_two_ptr_cmp(ctx, chain, (root_pos, cc, wide_ty, min_off), (wide_op, acc));
+    }
+    let (mut wide_mask, mut wide_val) = (0_u64, 0_u64);
+    for la in &acc.leaves_a {
+        let (m, c) = acc.masks[la.shift_byte as usize];
+        let sh = (la.canon_off - min_off) * 8;
+        wide_mask |= m << sh;
+        wide_val |= c << sh;
+    }
+    let all_ones = !0_u64 >> (64 - total_w * 8);
+    let mask = (wide_mask != all_ones).then(|| canon_const(wide_mask, wide_ty));
+    let out = PackOut::Cmp { cc, mask, rhs_const: Some(canon_const(wide_val, wide_ty)), rhs_op: None };
+    Some(PackPlan { wide_op, wide_ty, out, touched: acc.touched })
+}
+
+fn build_cmp_pack(ctx: &PackCtx<'_>, chain: &[Block], (root_pos, inst, res_ty): (usize, Inst, Type)) -> Option<PackPlan> {
+    if !res_ty.is_small_int() {
+        return None;
+    }
+    let res = ctx.func.insts[inst.index()].result?;
+    let (join, leaf_cc, out_cc, root) = match ctx.func.insts[inst.index()].op {
+        Op::Binary(Binary::Band, ..) => (Binary::Band, Some(IntCC::Equal), IntCC::Equal, res),
+        Op::Binary(Binary::Bor, ..) => (Binary::Bor, Some(IntCC::NotEqual), IntCC::NotEqual, res),
+        Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), a, b) => {
+            let (bor, imm) = const_pair(ctx, a, b)?;
+            if imm != 0 || !matches!(def_op(ctx, bor), Some(&Op::Binary(Binary::Bor, ..))) {
+                return None;
+            }
+            (Binary::Bor, None, cc, bor)
+        }
+        _ => return None,
     };
-    finish_pack_plan(ctx, chain, (root_pos, wide_ty, big), &leaves, touched)
+    let mut acc = CmpAcc::default();
+    collect_cmp_leaves(ctx, chain, root, (join, leaf_cc), &mut acc)?;
+    (acc.leaves_a.len() >= 2).then(|| finish_cmp_pack(ctx, chain, (root_pos, out_cc), acc)).flatten()
 }
 
 fn unwrap_bitcast_leaf(ctx: &PackCtx<'_>, mut val: Value, expect_bytes: u32, touched: &mut Vec<Value>) -> Value {
     for _ in 0..4 {
-        let Some((_, _, inst)) = ctx.def_info.get(val.index()).copied().flatten() else { break };
-        if let Op::Convert(Convert::Bitcast, inner) = ctx.func.insts[inst.index()].op
-            && ctx.func.ty(inner).bytes() == expect_bytes
-        {
-            touched.push(val);
-            val = inner;
-            continue;
+        let Some(&Op::Convert(Convert::Bitcast, inner)) = def_op(ctx, val) else { break };
+        if ctx.func.ty(inner).bytes() != expect_bytes {
+            break;
         }
-        break;
+        touched.push(val);
+        val = inner;
     }
     val
 }
 
-fn collect_insert_leaves(
-    ctx: &PackCtx<'_>,
-    chain: &[Block],
-    (val, vec_ty, byte_base): (Value, Type, i64),
-    (leaves, touched, key): (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>),
-) -> Option<()> {
+fn collect_insert_leaves(ctx: &PackCtx<'_>, chain: &[Block], (val, vec_ty, byte_base): (Value, Type, i64), (leaves, touched, key): (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>)) -> Option<()> {
     let (lane, count) = vec_ty.vec_shape()?;
     let mut lanes = [None; 16];
     let (mut cur, mut filled) = (val, 0_u8);
@@ -373,12 +532,7 @@ fn collect_insert_leaves(
     Some(())
 }
 
-fn collect_vec_source(
-    ctx: &PackCtx<'_>,
-    chain: &[Block],
-    (val, byte_base, expect_bytes): (Value, i64, u32),
-    out: (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>),
-) -> Option<()> {
+fn collect_vec_source(ctx: &PackCtx<'_>, chain: &[Block], (val, byte_base, expect_bytes): (Value, i64, u32), out: (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>)) -> Option<()> {
     let (leaves, touched, key) = out;
     let cur = unwrap_bitcast_leaf(ctx, val, expect_bytes, touched);
     if push_leaf_load(ctx, chain, cur, (byte_base, expect_bytes), (leaves, touched, key)).is_some() {
@@ -471,19 +625,23 @@ fn build_pack_tables(func: &Function, cfg: &Cfg) -> PackTables {
     PackTables { consts, def_info, uses: func.use_counts(), dead_pool: vec![false; n], touched_blk: vec![false; func.blocks.len()] }
 }
 
-fn plan_one_pack(
-    ctx: &PackCtx<'_>,
-    target: Option<&crate::Target>,
-    chain: &[Block],
-    uses: &[u32],
-    (pos, inst): (usize, Inst),
-) -> Option<(Value, Type, PackPlan)> {
+fn build_scalar_pack(ctx: &PackCtx<'_>, chain: &[Block], (pos, inst, res, res_ty): (usize, Inst, Value, Type)) -> Option<PackPlan> {
+    if matches!(ctx.func.insts[inst.index()].op, Op::Binary(Binary::Bor | Binary::Iadd, ..))
+        && matches!(res_ty, Type::I16 | Type::I32 | Type::I64)
+        && let Some(plan) = build_pack(ctx, chain, (pos, res, res_ty))
+    {
+        return Some(plan);
+    }
+    build_cmp_pack(ctx, chain, (pos, inst, res_ty))
+}
+
+fn plan_one_pack(ctx: &PackCtx<'_>, target: Option<&crate::Target>, chain: &[Block], uses: &[u32], (pos, inst): (usize, Inst)) -> Option<(Value, Type, PackPlan)> {
     let data = &ctx.func.insts[inst.index()];
     let res = data.result?;
     let res_ty = ctx.func.ty(res);
     let plan = match target {
-        None if matches!(data.op, Op::Binary(Binary::Bor | Binary::Iadd, ..)) && matches!(res_ty, Type::I16 | Type::I32 | Type::I64) => {
-            build_pack(ctx, chain, (pos, res, res_ty))
+        None if matches!(data.op, Op::Binary(Binary::Bor | Binary::Iadd | Binary::Band, ..) | Op::Icmp(..)) => {
+            build_scalar_pack(ctx, chain, (pos, inst, res, res_ty))
         }
         Some(tgt)
             if matches!(data.op, Op::Insert(..) | Op::TargetOp(TargetOpId::X64Concat128, _))
@@ -496,12 +654,7 @@ fn plan_one_pack(
     Some((res, res_ty, plan))
 }
 
-fn plan_block_packs(
-    ctx: &PackCtx<'_>,
-    target: Option<&crate::Target>,
-    blk: Block,
-    uses: &[u32],
-) -> (Vec<Option<(Value, Type, PackPlan)>>, bool) {
+fn plan_block_packs(ctx: &PackCtx<'_>, target: Option<&crate::Target>, blk: Block, uses: &[u32]) -> (Vec<Option<(Value, Type, PackPlan)>>, bool) {
     let chain = pred_chain(ctx.cfg, blk);
     let insts = &ctx.func.blocks[blk.index()].insts;
     let mut consumed = vec![false; ctx.func.types.len()];
@@ -531,21 +684,41 @@ fn push_fresh_val(func: &mut Function, op: Op, ty: Type, out: &mut Vec<Inst>, t:
     val
 }
 
+fn emit_cmp_inst(func: &mut Function, inst: Inst, res_ty: Type, plan: PackPlan, (out, t): (&mut Vec<Inst>, &mut PackTables)) {
+    let PackOut::Cmp { cc, mask, rhs_const, rhs_op } = plan.out else { return };
+    let mut lhs = push_fresh_val(func, plan.wide_op, plan.wide_ty, out, t);
+    if let Some(m) = mask {
+        let mv = push_fresh_val(func, Op::Const(m), plan.wide_ty, out, t);
+        lhs = push_fresh_val(func, Op::Binary(Binary::Band, lhs, mv), plan.wide_ty, out, t);
+    }
+    let rhs = push_fresh_val(func, rhs_const.map(Op::Const).or(rhs_op).unwrap_or(Op::Const(0)), plan.wide_ty, out, t);
+    let cmp = Op::Icmp(cc, lhs, rhs);
+    func.insts[inst.index()].op = if res_ty == Type::I8 {
+        cmp
+    } else {
+        let cv = push_fresh_val(func, cmp, Type::I8, out, t);
+        Op::Convert(Convert::Uextend, cv)
+    };
+}
+
 fn emit_packed_inst(func: &mut Function, inst: Inst, res_ty: Type, plan: PackPlan, (out, t): (&mut Vec<Inst>, &mut PackTables)) {
-    if !plan.big_endian && plan.wide_ty == res_ty {
+    let PackOut::Load { big_endian } = plan.out else {
+        emit_cmp_inst(func, inst, res_ty, plan, (out, t));
+        return;
+    };
+    if !big_endian && plan.wide_ty == res_ty {
         func.insts[inst.index()].op = plan.wide_op;
         return;
     }
     let wide_val = push_fresh_val(func, plan.wide_op, plan.wide_ty, out, t);
-    let swapped = if plan.big_endian && plan.wide_ty == res_ty {
+    func.insts[inst.index()].op = if big_endian && plan.wide_ty == res_ty {
         Op::Unary(Unary::Bswap, wide_val)
-    } else if plan.big_endian {
-        let bswapped = push_fresh_val(func, Op::Unary(Unary::Bswap, wide_val), plan.wide_ty, out, t);
-        Op::Convert(Convert::Uextend, bswapped)
+    } else if big_endian {
+        let sw = push_fresh_val(func, Op::Unary(Unary::Bswap, wide_val), plan.wide_ty, out, t);
+        Op::Convert(Convert::Uextend, sw)
     } else {
         Op::Convert(Convert::Uextend, wide_val)
     };
-    func.insts[inst.index()].op = swapped;
 }
 
 fn mark_dead_touched(touched: &[Value], res: Value, t: &mut PackTables) {
@@ -560,12 +733,7 @@ fn mark_dead_touched(touched: &[Value], res: Value, t: &mut PackTables) {
     }
 }
 
-fn apply_block_packs(
-    func: &mut Function,
-    b_idx: usize,
-    mut plans: Vec<Option<(Value, Type, PackPlan)>>,
-    t: &mut PackTables,
-) -> bool {
+fn apply_block_packs(func: &mut Function, b_idx: usize, mut plans: Vec<Option<(Value, Type, PackPlan)>>, t: &mut PackTables) -> bool {
     let insts = std::mem::take(&mut func.blocks[b_idx].insts);
     let mut out = Vec::with_capacity(insts.len());
     let mut changed = false;

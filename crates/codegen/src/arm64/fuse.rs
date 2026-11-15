@@ -10,6 +10,14 @@ use flag::{fuse_fits, fuse_icmp_selects, try_fuse_flag_operand, try_fuse_icmp_se
 pub(super) use mem::{encode_neon_movi, madd_parts, splat_pattern64};
 use mem::try_fuse_vec_op;
 
+pub(super) fn def_entry(pos_of: &[Option<(usize, usize, Inst)>], val: Value) -> Option<(usize, usize, Inst)> {
+    pos_of.get(val.index()).and_then(|&entry| entry)
+}
+
+pub(super) fn def_inst(pos_of: &[Option<(usize, usize, Inst)>], val: Value) -> Option<Inst> {
+    def_entry(pos_of, val).map(|(_, _, inst)| inst)
+}
+
 pub(super) fn const_of(func: &Function, plan: &Plan<Reg>, val: Value, def: impl Fn(Value) -> Option<Inst>) -> Option<i64> {
     plan.const_of(val).or_else(|| match func.insts[def(val)?.index()].op {
         Op::Const(imm) => Some(imm),
@@ -29,7 +37,7 @@ pub(super) fn local_single(
     val: Value,
 ) -> Option<(usize, Inst)> {
     (uses[val.index()] == 1 && !plan.elided[val.index()])
-        .then(|| pos_of[val.index()].filter(|&(b, p, _)| b == b_idx && p < limit).map(|(_, p, i)| (p, i)))
+        .then(|| def_entry(pos_of, val).filter(|&(b, p, _)| b == b_idx && p < limit).map(|(_, p, i)| (p, i)))
         .flatten()
 }
 
@@ -160,7 +168,7 @@ pub(super) fn zero_cmp_band(
     if uses[masked.index()] != 1 || plan.elided[masked.index()] {
         return None;
     }
-    let (mb, mpos, minst) = pos_of[masked.index()]?;
+    let (mb, mpos, minst) = def_entry(pos_of, masked)?;
     if mb != b_idx {
         return None;
     }
@@ -214,7 +222,7 @@ fn fuse_ireduce_ushr(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u
     if !matches!(src_ty, Type::I32 | Type::I64) || uses[shr.index()] != 1 || plan.elided[shr.index()] {
         return;
     }
-    let Some((sb, spos, sinst)) = pos_of[shr.index()] else { return };
+    let Some((sb, spos, sinst)) = def_entry(pos_of, shr) else { return };
     if sb != b_idx || spos >= pos {
         return;
     }
@@ -237,7 +245,7 @@ pub(super) fn can_peel_uextend(
     if uses[val.index()] != 1 || (plan.elided[val.index()] && skip.is_none()) {
         return false;
     }
-    let Some((ub, upos, uinst)) = pos_of[val.index()] else { return false };
+    let Some((ub, upos, uinst)) = def_entry(pos_of, val) else { return false };
     if ub != b_idx || upos >= limit {
         return false;
     }
@@ -372,7 +380,7 @@ fn eon_arg_preserved(
     if !plan.elided[val.index()] {
         return preserved(func, plan, b_idx, ipos, pos, None, val);
     }
-    pos_of[val.index()].is_some_and(|(ub, upos, uinst)| {
+    def_entry(pos_of, val).is_some_and(|(ub, upos, uinst)| {
         ub == b_idx && upos < ipos
             && matches!(func.insts[uinst.index()].op, Op::Convert(Convert::Uextend, inner) if preserved(func, plan, b_idx, upos, pos, Some(ipos), inner))
     })
@@ -385,7 +393,7 @@ fn try_fuse_eon(func: &Function, plan: &mut Plan<Reg>, info @ (uses, pos_of): (&
     let Op::Binary(Binary::Bxor, a, b) = func.insts[iinst.index()].op else { return false };
     let shift_ok = [(a, b), (b, a)].into_iter().any(|(other, cand)| {
         plan.elided[cand.index()] && uses[cand.index()] == 1 && eon_arg_preserved(func, plan, pos_of, (b_idx, ipos, pos), other)
-            && pos_of[cand.index()].is_some_and(|(sb, spos, sinst)| {
+            && def_entry(pos_of, cand).is_some_and(|(sb, spos, sinst)| {
                 sb == b_idx && spos < ipos && shift_parts(&func.insts[sinst.index()].op, plan)
                     .is_some_and(|(sop, src, imm)| alu_shift(true, ty, sop, imm).is_some() && eon_arg_preserved(func, plan, pos_of, (b_idx, spos, pos), src))
             })
@@ -435,7 +443,7 @@ fn fuse_shift_mask(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (&
     if !matches!(ty, Type::I32 | Type::I64) { return; }
     let Some((ypos, yinst)) = local_single(plan, info, b_idx, pos, y) else { return };
     let Op::Binary(Binary::Band, a, b) = func.insts[yinst.index()].op else { return };
-    let (mask, def) = (u64::from(ty.bits() - 1), |v: Value| pos_of[v.index()].map(|(_, _, i)| i));
+    let (mask, def) = (u64::from(ty.bits() - 1), |v| def_inst(pos_of, v));
     for (raw, m) in [(a, b), (b, a)] {
         if const_of(func, plan, m, def).is_some_and(|imm| (imm as u64 & mask) == mask) && preserved(func, plan, b_idx, ypos, pos, None, raw) {
             plan.elided[y.index()] = true;
@@ -446,7 +454,7 @@ fn fuse_shift_mask(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (&
 
 fn try_fuse_ext_operand(func: &Function, plan: &mut Plan<Reg>, info @ (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, dst_ty): (usize, usize, Type), ext_val: Value) -> bool {
     let Some((epos, einst)) = local_single(plan, info, b_idx, pos, ext_val) else { return false };
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     let (mid, spos, ext_pos, inner) = if let Some((_, inner)) = ext_from_op(func, plan, dst_ty, &func.insts[einst.index()].op, &def) {
         (None, None, epos, inner)
     } else {
@@ -454,7 +462,7 @@ fn try_fuse_ext_operand(func: &Function, plan: &mut Plan<Reg>, info @ (uses, pos
         if ((imm as u32) & (dst_ty.bits() - 1)) > 4 || uses[mid.index()] != 1 {
             return false;
         }
-        let Some((mb, upos, uinst)) = pos_of[mid.index()] else { return false };
+        let Some((mb, upos, uinst)) = def_entry(pos_of, mid) else { return false };
         if mb != b_idx || upos >= epos {
             return false;
         }
@@ -529,14 +537,14 @@ pub(super) fn bfi_parts(func: &Function, plan: &Plan<Reg>, ty: Type, (x, y): (Va
 
 fn bfi_root(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], (b_idx, bpos, pos, skip, width): (usize, usize, usize, usize, u8), val: Value) -> Option<Value> {
     let root = if plan.elided[val.index()] {
-        let (_, _, uinst) = pos_of[val.index()]?;
+        let (_, _, uinst) = def_entry(pos_of, val)?;
         let Op::Convert(Convert::Uextend, inner) = func.insts[uinst.index()].op else { return None };
         if plan.elided[inner.index()] || (u32::from(width) > func.ty(inner).bits() && !zero_ext_loc(plan, inner)) { return None; }
         inner
     } else {
         val
     };
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     (const_of(func, plan, root, def).is_none() && preserved(func, plan, b_idx, bpos, pos, Some(skip), root)).then_some(root)
 }
 
@@ -544,7 +552,7 @@ fn try_fuse_bfi(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (&[u3
     if !matches!(op, Binary::Bor | Binary::Bxor | Binary::Iadd) || !matches!(func.ty(res), Type::I32 | Type::I64) { return false; }
     let Some((xpos, _)) = local_single(plan, info, b_idx, pos, x) else { return false };
     let Some((ypos, _)) = local_single(plan, info, b_idx, pos, y) else { return false };
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     for (ca, cb, apos, bpos) in [(x, y, xpos, ypos), (y, x, ypos, xpos)] {
         let Some((a, b, _, width)) = bfi_pair(func, plan, func.ty(res), (ca, cb), &def) else { continue };
         if a != res && preserved(func, plan, b_idx, apos, pos, Some(bpos), a)
@@ -588,13 +596,13 @@ pub(super) fn cmn_sum_parts(func: &Function, plan: &Plan<Reg>, (x, y): (Value, V
 
 fn try_fuse_cmn_neg(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, cmp_ty): (usize, usize, Type), cand: Value) -> bool {
     let Some((npos, ninst)) = local_single(plan, info, b_idx, pos, cand) else { return false };
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     let Some(inner) = neg_inner(func, plan, &func.insts[ninst.index()].op, &def) else { return false };
     if !plan.elided[inner.index()] {
         if preserved(func, plan, b_idx, npos, pos, None, inner) { plan.elided[cand.index()] = true; return true; }
         return false;
     }
-    if let Some((sb, spos, sinst)) = pos_of[inner.index()]
+    if let Some((sb, spos, sinst)) = def_entry(pos_of, inner)
         && sb == b_idx && spos < npos
         && let Some((sop, root, imm)) = shift_parts(&func.insts[sinst.index()].op, plan)
         && alu_shift(false, cmp_ty, sop, imm).is_some()
@@ -607,7 +615,7 @@ fn try_fuse_cmn_neg(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (
 }
 
 fn try_fuse_cmn_sum(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos): (usize, usize), (lhs, rhs): (Value, Value)) -> bool {
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     let Some(sum) = (const_of(func, plan, rhs, &def) == Some(0)).then_some(lhs).or_else(|| (const_of(func, plan, lhs, &def) == Some(0)).then_some(rhs)) else { return false };
     let Some((spos, sinst)) = local_single(plan, info, b_idx, pos, sum) else { return false };
     let Op::Binary(Binary::Iadd, a, b) = func.insts[sinst.index()].op else { return false };
@@ -636,17 +644,24 @@ fn fuse_icmp_operands(func: &Function, plan: &mut Plan<Reg>, info: (&[u32], &[Op
     }
 }
 
+pub(super) fn consumes_flag_only(op: &Op, res: Value) -> bool {
+    match op {
+        Op::Select(c, x, y) => *c == res && *x != res && *y != res,
+        Op::Brif(c, _, ta, _, ea) => *c == res && !ta.contains(&res) && !ea.contains(&res),
+        Op::Trapz(c) => *c == res,
+        _ => false,
+    }
+}
+
+pub(super) fn preserves_flags(op: &Op) -> bool {
+    matches!(op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Load(..) | Op::Store(..) | Op::StackLoad(..) | Op::StackStore(..))
+}
+
 fn icmp_consumer(func: &Function, tail: &[Inst], res: Value) -> bool {
     for &ni in tail {
         let nd = &func.insts[ni.index()];
-        let is_use = match &nd.op {
-            Op::Select(c, x, y) => *c == res && *x != res && *y != res,
-            Op::Brif(c, _, ta, _, ea) => *c == res && !ta.contains(&res) && !ea.contains(&res),
-            Op::Trapz(c) => *c == res,
-            _ => false,
-        };
-        if is_use { return true; }
-        if !matches!(nd.op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Load(..) | Op::Store(..) | Op::StackLoad(..) | Op::StackStore(..)) { return false; }
+        if consumes_flag_only(&nd.op, res) { return true; }
+        if !preserves_flags(&nd.op) { return false; }
     }
     false
 }

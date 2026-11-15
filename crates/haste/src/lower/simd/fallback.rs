@@ -1,13 +1,13 @@
 use anyhow::Result;
-use haste_codegen::{Arch, IntCC, Lane, ReduceOp, Target, Type, Value};
+use haste_codegen::{IntCC, Lane, ReduceOp, Type, Value};
 
 use crate::body::BinOp;
 use crate::sema::intrinsic::Simd;
 
-use super::super::Lower;
 use super::super::ops::Num;
 use super::super::reloc::SiteOrigin;
 use super::super::stencil::SymbolSource;
+use super::super::{Lower, host_is_x64_or_arm64};
 use super::{Lanes, int_for_bytes, vec_for_bytes, vec_type};
 
 impl Lower<'_, '_> {
@@ -59,7 +59,7 @@ impl Lower<'_, '_> {
             self.copy_bytes(dst, dst_off + half, src, src_off + half, bytes - half);
             return;
         }
-        if let Some(vt) = vec_for_bytes(bytes).filter(|_| matches!(Target::host().arch, Arch::X64 | Arch::Arm64)) {
+        if let Some(vt) = vec_for_bytes(bytes).filter(|_| host_is_x64_or_arm64()) {
             let v = self.ins().load(vt, src, src_off);
             self.ins().store(v, dst, dst_off);
             return;
@@ -75,7 +75,7 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn wide_lane_intrinsic(&mut self, op: Simd, lanes: &Lanes, args: &[Value]) -> Result<Option<Value>> {
-        if lanes.bytes() <= 16 || lanes.count <= 0 || !(lanes.count as u32).is_power_of_two() || !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+        if lanes.bytes() <= 16 || lanes.count <= 0 || !(lanes.count as u32).is_power_of_two() || !host_is_x64_or_arm64() {
             return Ok(None);
         }
         if matches!(op, Simd::MaskedLoad | Simd::MaskedStore) {
@@ -182,7 +182,7 @@ impl Lower<'_, '_> {
             (Simd::Extract, &[x, _]) => {
                 let Some(limit) = u8::try_from(from.count).ok() else { return Ok(None) };
                 let Some(idx) = self.const_arg_u8(origin, 1, limit) else { return Ok(None) };
-                if from.bytes() > 16 && (from.count as u32).is_power_of_two() && matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+                if from.bytes() > 16 && (from.count as u32).is_power_of_two() && host_is_x64_or_arm64() {
                     let Some(lane) = Lane::from_type(from.machine) else { return Ok(None) };
                     let chunk_lanes = 16 / from.size;
                     let chunk_vec = Type::Vec { lane, count: chunk_lanes as u8 };
@@ -197,7 +197,7 @@ impl Lower<'_, '_> {
                 let Some(limit) = u8::try_from(from.count).ok() else { return Ok(None) };
                 let Some(idx) = self.const_arg_u8(origin, 1, limit) else { return Ok(None) };
                 let (slot, addr) = self.lanes_slot(*from);
-                if from.bytes() > 16 && (from.count as u32).is_power_of_two() && matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+                if from.bytes() > 16 && (from.count as u32).is_power_of_two() && host_is_x64_or_arm64() {
                     let Some(lane) = Lane::from_type(from.machine) else { return Ok(None) };
                     let chunk_lanes = 16 / from.size;
                     let chunk_vec = Type::Vec { lane, count: chunk_lanes as u8 };
@@ -226,7 +226,7 @@ impl Lower<'_, '_> {
             || !(to.count as u32).is_power_of_two()
             || from.size != to.size
             || to.count > 64
-            || !matches!(Target::host().arch, Arch::X64 | Arch::Arm64)
+            || !host_is_x64_or_arm64()
         {
             return Ok(None);
         }
@@ -374,7 +374,7 @@ impl Lower<'_, '_> {
     }
 
     fn eval_cast(&mut self, (from, to): (Lanes, Lanes), x: Value) -> Result<Option<Value>> {
-        if from.count != to.count || from.count <= 0 || !(from.count as u32).is_power_of_two() || !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+        if from.count != to.count || from.count <= 0 || !(from.count as u32).is_power_of_two() || !host_is_x64_or_arm64() {
             return Ok(None);
         }
         if let Some(vec_ty) = vec_type(&from)
@@ -433,7 +433,7 @@ impl Lower<'_, '_> {
     }
 
     fn wide_split_simd(&mut self, op: Simd, (from, to): (&Lanes, &Lanes), args: &[Value]) -> Result<Option<Value>> {
-        if from.count <= 0 || !(from.count as u32).is_power_of_two() || !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+        if from.count <= 0 || !(from.count as u32).is_power_of_two() || !host_is_x64_or_arm64() {
             return Ok(None);
         }
         let (hf, ht) = (from.half(), to.half());
@@ -662,7 +662,7 @@ impl Lower<'_, '_> {
     }
 
     pub(super) fn select_bitmask_vec(&mut self, to: &Lanes, bits: Value, (yes, no): (Value, Value)) -> Result<Option<Value>> {
-        if to.count <= 0 || !(to.count as u32).is_power_of_two() || to.count > 64 || !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+        if to.count <= 0 || !(to.count as u32).is_power_of_two() || to.count > 64 || !host_is_x64_or_arm64() {
             return Ok(None);
         }
         if to.bytes() > 16 {

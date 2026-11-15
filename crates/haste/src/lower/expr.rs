@@ -276,7 +276,7 @@ impl Lower<'_, '_> {
         if self.tupled_closure_call(item, substs) {
             let arg_list = self.body.list(args).to_vec();
             let [f_expr, tuple_expr] = arg_list.as_slice() else { bail!("tupled closure call expects 2 arguments") };
-            let mut values = self.callee_env(ExprId(*f_expr))?;
+            let mut values = self.callee_env(ExprId(*f_expr), true)?;
             self.untuple_arg(ExprId(*tuple_expr), &mut values)?;
             return self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values);
         }

@@ -10,6 +10,16 @@ use super::{Lower, Repr, repr};
 
 const INLINE_EQ_BYTES: u64 = 32;
 
+pub(super) fn bitwise_prim_bytes(prim: Primitive) -> Option<usize> {
+    match prim {
+        Primitive::U8 | Primitive::I8 | Primitive::Bool => Some(1),
+        Primitive::U16 | Primitive::I16 => Some(2),
+        Primitive::U32 | Primitive::I32 | Primitive::Char => Some(4),
+        Primitive::U64 | Primitive::I64 => Some(8),
+        _ => None,
+    }
+}
+
 impl Lower<'_, '_> {
     /// Whether the values `x` and `y` of `ty` are equal part by part, the way a literal or constant pattern compares them, as an 8-bit flag.
     pub(super) fn equal(&mut self, ty: Ty, x: Value, y: Value) -> Result<Value> {
@@ -148,16 +158,8 @@ impl Lower<'_, '_> {
         Ok(res)
     }
 
-    fn is_byte(&self, ty: Ty) -> bool {
-        matches!(self.cx.types.kind(ty), Kind::Prim(Primitive::U8 | Primitive::I8 | Primitive::Bool))
-    }
-
     fn is_bitwise_int(&self, ty: Ty) -> bool {
-        self.is_byte(ty)
-            || matches!(
-                self.cx.types.kind(ty),
-                Kind::Prim(Primitive::U16 | Primitive::I16 | Primitive::U32 | Primitive::I32 | Primitive::U64 | Primitive::I64 | Primitive::Char)
-            )
+        matches!(*self.cx.types.kind(ty), Kind::Prim(prim) if bitwise_prim_bytes(prim).is_some())
     }
 
     fn equal_load(&mut self, ty: Type, (x, y): (Value, Value), off: i32) -> Value {
