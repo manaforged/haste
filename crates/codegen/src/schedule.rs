@@ -1,3 +1,5 @@
+mod sink;
+
 use std::time::Instant;
 
 use crate::ir::{Binary, Block, Domain, Function, Op};
@@ -386,6 +388,9 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     }
     if moves != promote::Moves::Guided && has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
         crate::algebra::compare_offsets(func);
+    }
+    if moves != promote::Moves::Guided {
+        sink::run(func);
     }
     sink_compares(func);
 }
