@@ -631,12 +631,14 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         any = true;
     }
     let widened = widen::run(func);
-    if any || widened {
+    let mut dirty = if any || widened {
         crate::fold::prune(func, entry);
         Domain::CFG | Domain::VALUES
     } else {
         Domain::NONE
-    }
+    };
+    dirty |= sink::sink_cold(func);
+    dirty
 }
 
 /// Renumbers the instructions and values the blocks hold and drops the rest, so a body kept or copied whole carries no dead entries.

@@ -1,6 +1,4 @@
-use rustc_hash::FxHashMap as HashMap;
-
-use super::{MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, clone_body, edge_args, eval_block, has_bad_non_term, meet, outside_const_params, push_params_map, remap_val};
+use super::{MAX_CHAIN_BLOCKS, MAX_CHAIN_TRIPS, MAX_CHAIN_UNROLLED_INSTS, edge_args, eval_block, has_bad_non_term, meet, outside_const_params, push_params_map, remap_val};
 use crate::cfg::{Cfg, Loop};
 use crate::ir::{Block, BlockData, Function, Op, Value};
 
@@ -16,13 +14,16 @@ impl Region {
 }
 
 struct Step {
-    decided: Vec<(usize, bool)>,
+    reached: Vec<bool>,
+    decided: Vec<Option<bool>>,
+    consts: Vec<Vec<Option<i64>>>,
+    residual: usize,
     next: Option<Vec<Option<i64>>>,
 }
 
 struct Proof {
     heads: Vec<Vec<Option<i64>>>,
-    decided: Vec<(usize, bool)>,
+    steps: Vec<Step>,
 }
 
 struct Rounds<'a> {
@@ -30,6 +31,7 @@ struct Rounds<'a> {
     base: usize,
     backs: usize,
     heads: &'a [Vec<Option<i64>>],
+    steps: &'a [Step],
 }
 
 impl Rounds<'_> {
@@ -45,19 +47,16 @@ impl Rounds<'_> {
         let round = round + usize::from(at == 0);
         if round > self.backs { target } else { self.block(round, at) }
     }
+
+    fn contains(&self, block: Block) -> bool {
+        self.region.at(block).is_some() || block.index() >= self.base
+    }
 }
 
 struct LiveOut {
     value: Value,
     def: Block,
     users: Vec<Block>,
-}
-
-#[derive(Default)]
-struct Repair {
-    ends: HashMap<(Value, Block), Value>,
-    starts: HashMap<(Value, Block), Value>,
-    queue: Vec<(Value, Block)>,
 }
 
 fn inside(each: &Loop, block: Block) -> bool {
@@ -95,47 +94,103 @@ fn shape(func: &Function, cfg: &Cfg, each: &Loop) -> Option<Region> {
     Some(Region { blocks, open })
 }
 
-fn step(func: &Function, region: &Region, params: &[Option<i64>], env: &mut [Option<i64>]) -> Step {
-    let mut incoming: Vec<Option<Vec<Option<i64>>>> = vec![None; region.blocks.len()];
-    incoming[0] = Some(params.to_vec());
-    let mut step = Step { decided: Vec::new(), next: None };
-    for (at, &block) in region.blocks.iter().enumerate() {
-        let given = match incoming[at].take() {
-            _ if region.open[at] => vec![None; func.blocks[block.index()].params.len()],
-            Some(given) => given,
-            None => continue,
-        };
-        eval_block(func, block.index(), &given, env);
-        let mut edge = |target: Block, args: &[Value]| match region.at(target) {
-            Some(0) => meet(&mut step.next, args, env),
-            Some(to) => meet(&mut incoming[to], args, env),
-            None => {}
-        };
-        match func.last(block) {
-            Some(Op::Jump(target, args)) => edge(*target, args),
-            Some(Op::Brif(cond, then, then_args, otherwise, else_args)) => {
-                let taken = env[cond.index()].map(|known| known != 0);
-                if taken != Some(false) {
-                    edge(*then, then_args);
-                }
-                if taken != Some(true) {
-                    edge(*otherwise, else_args);
-                }
-                step.decided.extend(taken.map(|taken| (at, taken)));
+fn meet_known(acc: &mut Option<Vec<Option<i64>>>, vals: &[Option<i64>]) {
+    match acc {
+        None => *acc = Some(vals.to_vec()),
+        Some(acc) => {
+            for (slot, &val) in acc.iter_mut().zip(vals) {
+                *slot = slot.filter(|&imm| val == Some(imm));
             }
-            _ => {}
         }
     }
-    step
+}
+
+fn record_block_consts(func: &Function, block: Block, step: &mut Step, at: usize, env: &[Option<i64>]) {
+    let Some((_, body)) = func.blocks[block.index()].insts.split_last() else { return };
+    let mut row = Vec::with_capacity(body.len());
+    for &inst in body {
+        let data = &func.insts[inst.index()];
+        let imm = data.result.and_then(|res| env[res.index()]);
+        if imm.is_none() && !matches!(data.op, Op::Const(_)) {
+            step.residual += 1;
+        }
+        row.push(imm);
+    }
+    step.consts[at] = row;
+}
+
+fn step_edges(
+    func: &Function,
+    region: &Region,
+    at: usize,
+    env: &[Option<i64>],
+    incoming: &mut [Option<Vec<Option<i64>>>],
+) -> (Option<bool>, Option<Vec<Option<i64>>>) {
+    let mut next = None;
+    let mut edge = |target: Block, args: &[Value]| match region.at(target) {
+        Some(0) => meet(&mut next, args, env),
+        Some(to) => meet(&mut incoming[to], args, env),
+        None => {}
+    };
+    let mut decided = None;
+    match func.last(region.blocks[at]) {
+        Some(Op::Jump(target, args)) => edge(*target, args),
+        Some(Op::Brif(cond, then, then_args, otherwise, else_args)) => {
+            let taken = env[cond.index()].map(|known| known != 0);
+            if taken != Some(false) {
+                edge(*then, then_args);
+            }
+            if taken != Some(true) {
+                edge(*otherwise, else_args);
+            }
+            decided = taken;
+        }
+        _ => {}
+    }
+    (decided, next)
+}
+
+fn step(func: &Function, region: &Region, params: &[Option<i64>], env: &mut [Option<i64>]) -> Step {
+    let n = region.blocks.len();
+    let mut incoming: Vec<Option<Vec<Option<i64>>>> = vec![None; n];
+    incoming[0] = Some(params.to_vec());
+    let mut out = Step {
+        reached: vec![false; n],
+        decided: vec![None; n],
+        consts: vec![Vec::new(); n],
+        residual: 0,
+        next: None,
+    };
+    for (at, &block) in region.blocks.iter().enumerate() {
+        let Some(given) = incoming[at].take() else { continue };
+        let given = if region.open[at] { vec![None; func.blocks[block.index()].params.len()] } else { given };
+        out.reached[at] = true;
+        eval_block(func, block.index(), &given, env);
+        record_block_consts(func, block, &mut out, at, env);
+        let (decided, next) = step_edges(func, region, at, env, &mut incoming);
+        out.decided[at] = decided;
+        if let Some(vals) = next {
+            meet_known(&mut out.next, &vals);
+        }
+    }
+    out
 }
 
 fn prove(func: &Function, region: &Region, init: Vec<Option<i64>>, global_consts: &[Option<i64>]) -> Option<Proof> {
     let mut heads = vec![init];
+    let mut steps = Vec::new();
+    let mut total_residual = 0_usize;
     while heads.len() <= MAX_CHAIN_TRIPS {
         let mut env = global_consts.to_vec();
         let params = heads.last()?;
-        let Step { decided, next } = step(func, region, params, &mut env);
-        let Some(next) = next else { return Some(Proof { heads, decided }) };
+        let cur = step(func, region, params, &mut env);
+        total_residual += cur.residual;
+        if total_residual > MAX_CHAIN_UNROLLED_INSTS {
+            return None;
+        }
+        let next = cur.next.clone();
+        steps.push(cur);
+        let Some(next) = next else { return Some(Proof { heads, steps }) };
         if next == *params {
             return None;
         }
@@ -144,12 +199,12 @@ fn prove(func: &Function, region: &Region, init: Vec<Option<i64>>, global_consts
     None
 }
 
-fn live_outs(func: &Function, each: &Loop) -> Vec<LiveOut> {
+fn live_outs(func: &Function, cfg: &Cfg, each: &Loop) -> Vec<LiveOut> {
     let defs = func.def_blocks();
     let mut live: Vec<LiveOut> = Vec::new();
     for (index, data) in func.blocks.iter().enumerate() {
         let user = Block(index as u32);
-        if inside(each, user) {
+        if inside(each, user) || !cfg.reachable.get(index).copied().unwrap_or(false) {
             continue;
         }
         for inst in &data.insts {
@@ -166,19 +221,111 @@ fn live_outs(func: &Function, each: &Loop) -> Vec<LiveOut> {
     live
 }
 
-fn repairable(func: &Function, cfg: &Cfg, out: &LiveOut) -> bool {
-    let mut seen = vec![false; func.blocks.len()];
-    seen[out.def.index()] = true;
-    let mut stack = out.users.clone();
-    while let Some(block) = stack.pop() {
-        if std::mem::replace(&mut seen[block.index()], true) {
+fn multi_pred(cfg: &Cfg, block: Block) -> bool {
+    let mut first = None;
+    for &pred in cfg.preds_of(block) {
+        if !cfg.reachable.get(pred.index()).copied().unwrap_or(false) {
             continue;
         }
-        let preds = cfg.preds_of(block);
-        if preds.is_empty() || (preds.len() > 1 && !preds.iter().all(|&pred| takes_args(func, pred))) {
+        match first {
+            None => first = Some(pred),
+            Some(prev) if prev != pred => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn collect_post(cfg: &Cfg, users: &[Block], in_region: &dyn Fn(Block) -> bool) -> (Vec<bool>, Vec<bool>) {
+    let n = cfg.reachable.len();
+    let mut post = vec![false; n];
+    let mut exits = vec![false; n];
+    let mut stack: Vec<Block> = users
+        .iter()
+        .copied()
+        .filter(|&u| cfg.reachable.get(u.index()).copied().unwrap_or(false) && !in_region(u))
+        .collect();
+    while let Some(block) = stack.pop() {
+        let idx = block.index();
+        if post[idx] {
+            continue;
+        }
+        post[idx] = true;
+        for &pred in cfg.preds_of(block) {
+            if !cfg.reachable.get(pred.index()).copied().unwrap_or(false) {
+                continue;
+            }
+            if in_region(pred) {
+                exits[idx] = true;
+            } else if !post[pred.index()] {
+                stack.push(pred);
+            }
+        }
+    }
+    (post, exits)
+}
+
+fn idf_hits_set(cfg: &Cfg, block: Block, in_s: &[bool], in_region: &dyn Fn(Block) -> bool) -> bool {
+    let idom = cfg.idom[block.index()];
+    for &pred in cfg.preds_of(block) {
+        if !cfg.reachable.get(pred.index()).copied().unwrap_or(false) {
+            continue;
+        }
+        let mut cur = Some(pred);
+        while let Some(node) = cur {
+            if Some(node) == idom || in_region(node) {
+                break;
+            }
+            if in_s[node.index()] {
+                return true;
+            }
+            cur = cfg.idom[node.index()].filter(|&p| p != node);
+        }
+    }
+    false
+}
+
+fn post_exit_phis(cfg: &Cfg, users: &[Block], force_exits: bool, in_region: &dyn Fn(Block) -> bool) -> Vec<bool> {
+    let (post, exits) = collect_post(cfg, users, in_region);
+    let n = post.len();
+    let mut in_s = exits.clone();
+    let mut phi = vec![false; n];
+    for idx in 0..n {
+        if exits[idx] && (force_exits || multi_pred(cfg, Block(idx as u32))) {
+            phi[idx] = true;
+        }
+    }
+    let candidates: Vec<usize> = (0..n).filter(|&i| post[i] && !phi[i] && multi_pred(cfg, Block(i as u32))).collect();
+    if candidates.is_empty() {
+        return phi;
+    }
+    loop {
+        let mut changed = false;
+        for &idx in &candidates {
+            if !phi[idx] && idf_hits_set(cfg, Block(idx as u32), &in_s, in_region) {
+                phi[idx] = true;
+                in_s[idx] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return phi;
+        }
+    }
+}
+
+fn repairable(func: &Function, cfg: &Cfg, each: &Loop, out: &LiveOut) -> bool {
+    let phi = post_exit_phis(cfg, &out.users, true, &|block| inside(each, block));
+    for (idx, &need) in phi.iter().enumerate() {
+        if !need {
+            continue;
+        }
+        let preds = cfg.preds_of(Block(idx as u32));
+        let has_pred = preds.iter().any(|&p| cfg.reachable.get(p.index()).copied().unwrap_or(false));
+        let all_ok = preds.iter().all(|&p| !cfg.reachable.get(p.index()).copied().unwrap_or(false) || takes_args(func, p));
+        if !has_pred || !all_ok {
             return false;
         }
-        stack.extend_from_slice(preds);
     }
     true
 }
@@ -191,6 +338,57 @@ fn pin(func: &mut Function, head: Block, params: &[Value], known: &[Option<i64>]
         func.blocks[head.index()].insts.push(inst);
         map.push((param, value));
     }
+}
+
+fn clone_body_consts(
+    func: &mut Function,
+    block: Block,
+    to: Block,
+    consts: &[Option<i64>],
+    map: &mut Vec<(Value, Value)>,
+) {
+    let Some((_, body)) = func.blocks[block.index()].insts.split_last() else { return };
+    let body = body.to_vec();
+    for (pos, orig) in body.into_iter().enumerate() {
+        let mut op = match consts.get(pos).copied().flatten() {
+            Some(imm) if !matches!(func.insts[orig.index()].op, Op::Const(_)) => Op::Const(imm),
+            _ => func.insts[orig.index()].op.clone(),
+        };
+        op.map_operands(|value| remap_val(map, value));
+        let new_res = func.insts[orig.index()].result.map(|res| {
+            let fresh = func.value(func.ty(res));
+            map.push((res, fresh));
+            fresh
+        });
+        let inst = func.add(op, new_res);
+        func.blocks[to.index()].insts.push(inst);
+    }
+}
+
+fn decide_term(op: Op, decided: Option<bool>) -> Op {
+    match (decided, op) {
+        (Some(true), Op::Brif(_, then, then_args, _, _)) => Op::Jump(then, then_args),
+        (Some(false), Op::Brif(_, _, _, otherwise, else_args)) => Op::Jump(otherwise, else_args),
+        (_, op) => op,
+    }
+}
+
+fn clone_round_block(func: &mut Function, rounds: &Rounds<'_>, round: usize, at: usize, map: &mut Vec<(Value, Value)>) {
+    let to = rounds.block(round, at);
+    let step = &rounds.steps[round];
+    if !step.reached[at] {
+        let trap = func.add(Op::Trap, None);
+        func.blocks[to.index()].insts.push(trap);
+        return;
+    }
+    let block = rounds.region.blocks[at];
+    clone_body_consts(func, block, to, &step.consts[at], map);
+    let Some(&term) = func.blocks[block.index()].insts.last() else { return };
+    let mut op = decide_term(func.insts[term.index()].op.clone(), step.decided[at]);
+    op.map_operands(|value| remap_val(map, value));
+    op.map_targets(|target| rounds.image(round, target));
+    let inst = func.add(op, None);
+    func.blocks[to.index()].insts.push(inst);
 }
 
 fn clone_rounds(func: &mut Function, rounds: &Rounds<'_>) -> Vec<Vec<(Value, Value)>> {
@@ -211,44 +409,33 @@ fn clone_rounds(func: &mut Function, rounds: &Rounds<'_>) -> Vec<Vec<(Value, Val
     }
     for (index, map) in maps.iter_mut().enumerate() {
         let round = index + 1;
-        for (at, &block) in blocks.iter().enumerate() {
-            let Some((&term, body)) = func.blocks[block.index()].insts.split_last() else { continue };
-            let body = body.to_vec();
-            let to = rounds.block(round, at);
-            clone_body(func, &body, to, map);
-            let mut op = func.insts[term.index()].op.clone();
-            op.map_operands(|value| remap_val(map, value));
-            op.map_targets(|target| rounds.image(round, target));
-            let inst = func.add(op, None);
-            func.blocks[to.index()].insts.push(inst);
+        for at in 0..blocks.len() {
+            clone_round_block(func, rounds, round, at, map);
         }
     }
     maps
 }
 
-fn reach(func: &mut Function, cfg: &Cfg, repair: &mut Repair, var: Value, mut block: Block) -> Value {
-    for _ in 0..cfg.preds.len() {
-        if let Some(&known) = repair.starts.get(&(var, block)) {
-            return known;
+fn specialize_round_zero(func: &mut Function, rounds: &Rounds<'_>) {
+    let step = &rounds.steps[0];
+    for (at, &block) in rounds.region.blocks.iter().enumerate() {
+        if let Some(&term) = func.blocks[block.index()].insts.last() {
+            let decided = if step.reached[at] { step.decided[at] } else { None };
+            let mut op = decide_term(func.insts[term.index()].op.clone(), decided);
+            op.map_targets(|target| rounds.image(0, target));
+            func.insts[term.index()].op = op;
         }
-        match *cfg.preds_of(block) {
-            [] => return var,
-            [pred] => {
-                if let Some(&def) = repair.ends.get(&(var, pred)) {
-                    return def;
-                }
-                block = pred;
-            }
-            _ => {
-                let param = func.value(func.ty(var));
-                func.blocks[block.index()].params.push(param);
-                repair.starts.insert((var, block), param);
-                repair.queue.push((var, block));
-                return param;
+        if !step.reached[at] {
+            continue;
+        }
+        for (pos, &imm) in step.consts[at].iter().enumerate() {
+            let Some(imm) = imm else { continue };
+            let inst = func.blocks[block.index()].insts[pos];
+            if !matches!(func.insts[inst.index()].op, Op::Const(_)) {
+                func.insts[inst.index()].op = Op::Const(imm);
             }
         }
     }
-    var
 }
 
 fn push_edge(func: &mut Function, pred: Block, target: Block, arg: Value) {
@@ -267,37 +454,107 @@ fn push_edge(func: &mut Function, pred: Block, target: Block, arg: Value) {
     }
 }
 
-fn rebind(func: &mut Function, cfg: &Cfg, rounds: &Rounds<'_>, live: &[LiveOut], maps: &[Vec<(Value, Value)>]) {
-    let mut repair = Repair::default();
-    for out in live {
-        let Some(at) = rounds.region.at(out.def) else { continue };
-        repair.ends.insert((out.value, out.def), out.value);
-        for (index, map) in maps.iter().enumerate() {
-            repair.ends.insert((out.value, rounds.block(index + 1, at)), remap_val(map, out.value));
+fn resolve_idom(cfg: &Cfg, starts: &[Option<Value>], ends: &[Option<Value>], fallback: Value, mut cur: Block) -> Value {
+    for _ in 0..cfg.idom.len() {
+        if let Some(param) = starts[cur.index()] {
+            return param;
+        }
+        if let Some(def) = ends[cur.index()] {
+            return def;
+        }
+        let Some(parent) = cfg.idom[cur.index()].filter(|&p| p != cur) else { break };
+        cur = parent;
+    }
+    fallback
+}
+
+fn rewrite_users(func: &mut Function, cfg: &Cfg, out: &LiveOut, resolve: &dyn Fn(Block) -> Value) {
+    for &user in &out.users {
+        if !cfg.reachable.get(user.index()).copied().unwrap_or(false) {
+            continue;
+        }
+        let new = resolve(user);
+        if new == out.value {
+            continue;
+        }
+        for at in 0..func.blocks[user.index()].insts.len() {
+            let inst = func.blocks[user.index()].insts[at];
+            func.insts[inst.index()].op.map_operands(|value| if value == out.value { new } else { value });
         }
     }
-    for out in live {
-        for &user in &out.users {
-            let new = reach(func, cfg, &mut repair, out.value, user);
-            for at in 0..func.blocks[user.index()].insts.len() {
-                let inst = func.blocks[user.index()].insts[at];
-                func.insts[inst.index()].op.map_operands(|value| if value == out.value { new } else { value });
-            }
+}
+
+fn collect_active_ends(
+    after: &Cfg,
+    rounds: &Rounds<'_>,
+    out: &LiveOut,
+    maps: &[Vec<(Value, Value)>],
+) -> (Vec<Option<Value>>, usize, Value) {
+    let mut ends = vec![None; after.reachable.len()];
+    let mut active = 0_usize;
+    let mut only = out.value;
+    let Some(at) = rounds.region.at(out.def) else { return (ends, 0, out.value) };
+    if after.reachable.get(out.def.index()).copied().unwrap_or(false) {
+        ends[out.def.index()] = Some(out.value);
+        active += 1;
+    }
+    for (index, map) in maps.iter().enumerate() {
+        let block = rounds.block(index + 1, at);
+        if after.reachable.get(block.index()).copied().unwrap_or(false) {
+            let val = remap_val(map, out.value);
+            ends[block.index()] = Some(val);
+            only = val;
+            active += 1;
         }
     }
-    let mut next = 0;
-    while let Some(&(var, block)) = repair.queue.get(next) {
-        next += 1;
-        let mut preds = cfg.preds_of(block).to_vec();
+    (ends, active, only)
+}
+
+fn fill_phi_edges(func: &mut Function, after: &Cfg, phi: &[bool], resolve: &dyn Fn(Block) -> Value) {
+    for (idx, &need) in phi.iter().enumerate() {
+        if !need {
+            continue;
+        }
+        let target = Block(idx as u32);
+        let mut preds: Vec<Block> = after
+            .preds_of(target)
+            .iter()
+            .copied()
+            .filter(|p| after.reachable.get(p.index()).copied().unwrap_or(false))
+            .collect();
         preds.sort_unstable();
         preds.dedup();
         for pred in preds {
-            let arg = match repair.ends.get(&(var, pred)).copied() {
-                Some(def) => def,
-                None => reach(func, cfg, &mut repair, var, pred),
-            };
-            push_edge(func, pred, block, arg);
+            push_edge(func, pred, target, resolve(pred));
         }
+    }
+}
+
+fn repair_one(func: &mut Function, after: &Cfg, rounds: &Rounds<'_>, out: &LiveOut, maps: &[Vec<(Value, Value)>]) {
+    let (ends, active, only) = collect_active_ends(after, rounds, out, maps);
+    if active == 0 {
+        return;
+    }
+    if active == 1 {
+        rewrite_users(func, after, out, &|_| only);
+        return;
+    }
+    let phi = post_exit_phis(after, &out.users, false, &|block| rounds.contains(block));
+    let mut starts = vec![None; func.blocks.len()];
+    for (idx, &need) in phi.iter().enumerate() {
+        if need {
+            let param = func.value(func.ty(out.value));
+            func.blocks[idx].params.push(param);
+            starts[idx] = Some(param);
+        }
+    }
+    rewrite_users(func, after, out, &|user| resolve_idom(after, &starts, &ends, out.value, user));
+    fill_phi_edges(func, after, &phi, &|pred| resolve_idom(after, &starts, &ends, out.value, pred));
+}
+
+fn rebind(func: &mut Function, after: &Cfg, rounds: &Rounds<'_>, live: &[LiveOut], maps: &[Vec<(Value, Value)>]) {
+    for out in live {
+        repair_one(func, after, rounds, out, maps);
     }
 }
 
@@ -307,29 +564,13 @@ pub(super) fn unroll(func: &mut Function, cfg: &Cfg, each: &Loop, global_consts:
     let Some(init) = outside_const_params(func, cfg, each.head, &each.latches, global_consts) else { return false };
     let Some(proof) = prove(func, &region, init, global_consts) else { return false };
     let backs = proof.heads.len() - 1;
-    let body_insts: usize = region.blocks.iter().map(|block| func.blocks[block.index()].insts.len() - 1).sum();
-    if (backs + 1) * body_insts > MAX_CHAIN_UNROLLED_INSTS {
+    let live = if backs == 0 { Vec::new() } else { live_outs(func, cfg, each) };
+    if !live.iter().all(|out| repairable(func, cfg, each, out)) {
         return false;
     }
-    let live = if backs == 0 { Vec::new() } else { live_outs(func, each) };
-    if !live.iter().all(|out| repairable(func, cfg, out)) {
-        return false;
-    }
-    let rounds = Rounds { region: &region, base: func.blocks.len(), backs, heads: &proof.heads };
+    let rounds = Rounds { region: &region, base: func.blocks.len(), backs, heads: &proof.heads, steps: &proof.steps };
     let maps = clone_rounds(func, &rounds);
-    for &latch in &each.latches {
-        if let Some(&term) = func.blocks[latch.index()].insts.last() {
-            func.insts[term.index()].op.map_targets(|target| rounds.image(0, target));
-        }
-    }
-    for &(at, taken) in &proof.decided {
-        let last = rounds.block(backs, at);
-        if let Some(&term) = func.blocks[last.index()].insts.last()
-            && let Op::Brif(_, then, then_args, otherwise, else_args) = func.insts[term.index()].op.clone()
-        {
-            func.insts[term.index()].op = if taken { Op::Jump(then, then_args) } else { Op::Jump(otherwise, else_args) };
-        }
-    }
+    specialize_round_zero(func, &rounds);
     func.bump_cfg();
     crate::fold::prune(func, entry);
     if !live.is_empty() {
