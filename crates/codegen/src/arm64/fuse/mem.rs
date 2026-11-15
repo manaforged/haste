@@ -1,99 +1,152 @@
+use super::super::asm::{ExtOp, Reg, encode_sib};
 use super::{const_of, local_single, preserved, shift_parts, zero_ext_loc};
 use crate::alloc::Plan;
 use crate::ir::{Binary, Convert, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
 use crate::live::{Sib, SibBase};
-use super::super::asm::Reg;
+
+struct SibCand {
+    base: Value,
+    idx: Value,
+    ext: ExtOp,
+    shift: i64,
+    idx_pos: usize,
+    elide: [Option<Value>; 2],
+}
+
+fn sib_uses_span(func: &Function, (b_idx, pos, res): (usize, usize, Value), shift: i64, expected: u32) -> Option<usize> {
+    let (mut seen, mut last_pos) = (0_u32, pos);
+    for (u_pos, &u_inst) in func.blocks[b_idx].insts.iter().enumerate().skip(pos + 1) {
+        let u_data = &func.insts[u_inst.index()];
+        let ty = match (&u_data.op, u_data.result) {
+            (&Op::Load(addr, 0), Some(r)) if addr == res => Some(func.ty(r)),
+            (&Op::Store(val, addr, 0), _) if addr == res && val != res => Some(func.ty(val)),
+            _ => None,
+        };
+        if ty.is_some_and(|t| t != Type::I128 && (shift == 0 || t.bytes() == (1 << shift))) {
+            seen += 1;
+            last_pos = u_pos;
+        }
+    }
+    (seen == expected).then_some(last_pos)
+}
+
+fn try_commit_sib(func: &Function, plan: &mut Plan<Reg>, uses: &[u32], (b_idx, pos, res): (usize, usize, Value), cand: SibCand) -> bool {
+    if plan.reg_of(cand.base).is_none() || plan.reg_of(cand.idx).is_none() {
+        return false;
+    }
+    let Some(last_pos) = sib_uses_span(func, (b_idx, pos, res), cand.shift, uses[res.index()]) else {
+        return false;
+    };
+    plan.elided[res.index()] = true;
+    let mut extra = [None; 2];
+    for (slot, v) in extra.iter_mut().zip(cand.elide) {
+        if let Some(ev) = v
+            && uses[ev.index()] == 1
+            && !plan.elided[ev.index()]
+        {
+            plan.elided[ev.index()] = true;
+            *slot = Some(ev);
+        }
+    }
+    let shift_clobbers = cand.elide[0].is_some_and(|kept| kept != cand.idx && !plan.elided[kept.index()] && plan.reg_of(kept) == plan.reg_of(cand.idx));
+    if !shift_clobbers && preserved(func, plan, b_idx, pos, last_pos, None, cand.base) && preserved(func, plan, b_idx, cand.idx_pos, last_pos, None, cand.idx) {
+        plan.sib[res.index()] = Some(Sib { base: SibBase::Value(cand.base), index: cand.idx, shift: encode_sib(cand.ext, cand.shift as u8), disp: 0 });
+        return true;
+    }
+    plan.elided[res.index()] = false;
+    for ev in extra.into_iter().flatten() {
+        plan.elided[ev.index()] = false;
+    }
+    false
+}
+
+fn unwrap_sib_op(
+    func: &Function,
+    plan: &Plan<Reg>,
+    pos_of: &[Option<(usize, usize, Inst)>],
+    op: &Op,
+) -> Option<(Value, ExtOp)> {
+    match *op {
+        Op::Convert(Convert::Sextend, inner) if func.ty(inner) == Type::I32 && !plan.elided[inner.index()] => Some((inner, ExtOp::Sxtw)),
+        Op::Convert(Convert::Uextend, inner) if !plan.elided[inner.index()] && func.ty(inner).is_small_int() => {
+            if func.ty(inner) == Type::I32 {
+                Some((inner, if zero_ext_loc(plan, inner) { ExtOp::Uxtx } else { ExtOp::Uxtw }))
+            } else {
+                zero_ext_loc(plan, inner).then_some((inner, ExtOp::Uxtx))
+            }
+        }
+        Op::Binary(Binary::Band, a, b) => {
+            let def = |u: Value| pos_of[u.index()].map(|(_, _, i)| i);
+            let (ext, inner) = super::ext_band_of(func, plan, Type::I64, (a, b), &def)?;
+            (ext == ExtOp::Uxtw).then_some((inner, ExtOp::Uxtw))
+        }
+        _ => None,
+    }
+}
+
+fn unwrap_sib_ext(
+    func: &Function,
+    plan: &Plan<Reg>,
+    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, limit): (usize, usize),
+    (v, allow_elided): (Value, bool),
+) -> Option<(Value, usize, ExtOp, Option<Value>)> {
+    if uses[v.index()] != 1 || (!allow_elided && plan.elided[v.index()]) {
+        return None;
+    }
+    let (sb, epos, einst) = pos_of[v.index()]?;
+    if sb != b_idx || epos >= limit {
+        return None;
+    }
+    let (inner, ext) = unwrap_sib_op(func, plan, pos_of, &func.insts[einst.index()].op)?;
+    Some((inner, epos, ext, Some(v)))
+}
+
+fn try_sib_arm(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    info @ (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, res): (usize, usize, Value),
+    (base, rhs): (Value, Value),
+) -> bool {
+    if let Some((sb, spos, sinst)) = pos_of[rhs.index()]
+        && sb == b_idx
+        && spos < pos
+        && let Some((Binary::Ishl, mid, shift)) = shift_parts(&func.insts[sinst.index()].op, plan)
+        && (1..=3).contains(&shift)
+    {
+        let unwrapped = (uses[rhs.index()] == 1 && !plan.elided[rhs.index()])
+            .then(|| unwrap_sib_ext(func, plan, info, (b_idx, spos), (mid, true)))
+            .flatten();
+        if let Some((idx, idx_pos, ext, uext)) = unwrapped
+            && try_commit_sib(func, plan, uses, (b_idx, pos, res), SibCand { base, idx, ext, shift, idx_pos, elide: [Some(rhs), uext] })
+        {
+            return true;
+        }
+        if !plan.elided[mid.index()]
+            && try_commit_sib(func, plan, uses, (b_idx, pos, res), SibCand { base, idx: mid, ext: ExtOp::Uxtx, shift, idx_pos: spos, elide: [Some(rhs), None] })
+        {
+            return true;
+        }
+    }
+    unwrap_sib_ext(func, plan, info, (b_idx, pos), (rhs, false))
+        .is_some_and(|(idx, idx_pos, ext, uext)| try_commit_sib(func, plan, uses, (b_idx, pos, res), SibCand { base, idx, ext, shift: 0, idx_pos, elide: [uext, None] }))
+}
 
 pub(super) fn try_fuse_sib(
     func: &Function,
     plan: &mut Plan<Reg>,
-    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    info @ (uses, _): (&[u32], &[Option<(usize, usize, Inst)>]),
     (b_idx, pos, res): (usize, usize, Value),
     (x, y): (Value, Value),
 ) -> bool {
     if func.ty(res) != Type::I64 || plan.sib[res.index()].is_some() || uses[res.index()] == 0 {
         return false;
     }
-    let block = &func.blocks[b_idx];
-    let try_sib = |plan: &mut Plan<Reg>, base: Value, idx: Value, shift: i64, idx_pos: usize, elide: [Option<Value>; 2]| -> bool {
-        if plan.reg_of(base).is_none() || plan.reg_of(idx).is_none() {
-            return false;
-        }
-        let (mut seen_uses, mut last_pos) = (0_u32, pos);
-        for (u_pos, &u_inst) in block.insts.iter().enumerate().skip(pos + 1) {
-            let u_data = &func.insts[u_inst.index()];
-            let ty = match (&u_data.op, u_data.result) {
-                (&Op::Load(addr, 0), Some(r)) if addr == res => Some(func.ty(r)),
-                (&Op::Store(val, addr, 0), _) if addr == res && val != res => Some(func.ty(val)),
-                _ => None,
-            };
-            if ty.is_some_and(|t| t != Type::I128 && (shift == 0 || t.bytes() == (1 << shift))) {
-                seen_uses += 1;
-                last_pos = u_pos;
-            }
-        }
-        if seen_uses != uses[res.index()] {
-            return false;
-        }
-        plan.elided[res.index()] = true;
-        let mut extra = [None; 2];
-        for (slot, v) in extra.iter_mut().zip(elide) {
-            if let Some(ev) = v
-                && uses[ev.index()] == 1
-                && !plan.elided[ev.index()]
-            {
-                plan.elided[ev.index()] = true;
-                *slot = Some(ev);
-            }
-        }
-        let shift_clobbers_idx = elide[0].is_some_and(|kept| kept != idx && !plan.elided[kept.index()] && plan.reg_of(kept) == plan.reg_of(idx));
-        if !shift_clobbers_idx
-            && preserved(func, plan, b_idx, pos, last_pos, None, base)
-            && preserved(func, plan, b_idx, idx_pos, last_pos, None, idx)
-        {
-            plan.sib[res.index()] = Some(Sib { base: SibBase::Value(base), index: idx, shift: shift as u8, disp: 0 });
-            return true;
-        }
-        plan.elided[res.index()] = false;
-        for ev in extra.into_iter().flatten() {
-            plan.elided[ev.index()] = false;
-        }
-        false
-    };
-    let unwrap_uext = |plan: &Plan<Reg>, v: Value, limit: usize| match local_single(plan, (uses, pos_of), b_idx, limit, v) {
-        Some((epos, einst))
-            if let Op::Convert(Convert::Uextend, inner) = func.insts[einst.index()].op
-                && func.ty(inner).is_small_int()
-                && zero_ext_loc(plan, inner) =>
-        {
-            (inner, epos, Some(v))
-        }
-        _ => (v, limit, None),
-    };
-    for (base, rhs) in [(x, y), (y, x)] {
-        if let Some((sb, spos, sinst)) = pos_of[rhs.index()]
-            && sb == b_idx
-            && spos < pos
-            && let Some((Binary::Ishl, mid, shift)) = shift_parts(&func.insts[sinst.index()].op, plan)
-            && (1..=3).contains(&shift)
-        {
-            let (idx, idx_pos, uext) = if uses[rhs.index()] == 1 && !plan.elided[rhs.index()] {
-                unwrap_uext(plan, mid, spos)
-            } else {
-                (mid, spos, None)
-            };
-            if try_sib(plan, base, idx, shift, idx_pos, [Some(rhs), uext])
-                || (uext.is_some() && try_sib(plan, base, mid, shift, spos, [Some(rhs), None]))
-            {
-                return true;
-            }
-        }
-        let (idx, idx_pos, uext) = unwrap_uext(plan, rhs, pos);
-        if uext.is_some() && try_sib(plan, base, idx, 0, idx_pos, [uext, None]) {
-            return true;
-        }
+    if try_sib_arm(func, plan, info, (b_idx, pos, res), (x, y)) || try_sib_arm(func, plan, info, (b_idx, pos, res), (y, x)) {
+        return true;
     }
-    try_sib(plan, x, y, 0, pos, [None, None])
+    try_commit_sib(func, plan, uses, (b_idx, pos, res), SibCand { base: x, idx: y, ext: ExtOp::Uxtx, shift: 0, idx_pos: pos, elide: [None, None] })
 }
 
 fn trivial_mul_imm(_func: &Function, plan: &Plan<Reg>, ty: Type, val: Value) -> bool {

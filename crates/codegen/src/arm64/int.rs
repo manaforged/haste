@@ -46,7 +46,7 @@ impl Emit<'_> {
     }
 
     fn bits32(&mut self, op: Bits, dst: Reg, src: Reg) {
-        self.asm.word((op as u32 & !(1 << 31)) | u32::from(src.0) << 5 | u32::from(dst.0));
+        self.asm.emit_gp(dst, (op as u32 & !(1 << 31)) | u32::from(src.0) << 5 | u32::from(dst.0));
     }
 
     fn emit_shifted(&mut self, alu: Alu, size: Size, dst: Reg, lhs: Reg, (rhs, shift, imm): (Reg, Shift, u8)) {
