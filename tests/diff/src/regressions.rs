@@ -494,6 +494,129 @@ pub fn case_reg_tailrec_escape_helper(n: i64) -> i64 {
     tailrec_escape_walk(0, black_box(n % 5))
 }
 
+#[inline(never)]
+fn se_i8_ptr(p: *const i8) -> i64 {
+    // SAFETY: caller passes a pointer at least 3 bytes into a >= 20-byte i8 array.
+    unsafe { (*p as i64) * 3 + (*p.add(16) as i64) * 5 + (*p.offset(-3) as i64) * 7 }
+}
+
+#[inline(never)]
+fn se_i16_ptr(p: *const i16) -> i64 {
+    // SAFETY: caller passes a pointer at least 3 elements into a >= 12-element i16 array.
+    unsafe { (*p as i64) * 3 + (*p.add(8) as i64) * 5 + (*p.offset(-3) as i64) * 7 }
+}
+
+#[inline(never)]
+fn se_i32_ptr(p: *const i32) -> i64 {
+    // SAFETY: caller passes a pointer at least 3 elements into a >= 8-element i32 array.
+    unsafe { (*p as i64) * 3 + (*p.add(4) as i64) * 5 + (*p.offset(-3) as i64) * 7 }
+}
+
+#[inline(never)]
+fn se_stack_large(seed: i64) -> i64 {
+    let mut a8 = [0i8; 640];
+    let mut a16 = [0i16; 320];
+    let mut a32 = [0i32; 160];
+    a8[0] = -128;
+    a8[300] = -1;
+    a8[600] = if (seed & 1) == 0 { -5 } else { 4 };
+    a16[0] = -32768;
+    a16[150] = -1;
+    a16[300] = if (seed & 2) == 0 { -5 } else { 7 };
+    a32[0] = i32::MIN + 7;
+    a32[75] = -1;
+    a32[150] = -128;
+    black_box(&mut a8);
+    black_box(&mut a16);
+    black_box(&mut a32);
+    (a8[0] as i64)
+        + (a8[300] as i64) * 2
+        + (a8[600] as i64) * 3
+        + (a16[0] as i64) * 5
+        + (a16[150] as i64) * 7
+        + (a16[300] as i64) * 11
+        + (a32[0] as i64)
+        + (a32[75] as i64) * 13
+        + (a32[150] as i64) * 17
+}
+
+#[inline(never)]
+fn cmp_sload_i8(a: &[i8; 24], idx: usize, x: i64, y: i64) -> i64 {
+    let b1 = if a[idx] < 0 { x + 11 } else { y + 23 };
+    let b2 = if a[idx + 1] >= -5 { x + 31 } else { y + 43 };
+    let mut acc = b1 + b2;
+    if a[idx + 2] == -1i8 {
+        acc += black_box(53);
+    } else {
+        acc += black_box(67);
+    }
+    if a[idx + 3] < 0 {
+        acc += black_box(79);
+    } else {
+        acc += black_box(89);
+    }
+    acc
+}
+
+#[inline(never)]
+fn cmp_sload_i16(a: &[i16; 16], idx: usize, x: i64, y: i64) -> i64 {
+    let b1 = if a[idx] < 0 { x + 13 } else { y + 29 };
+    let b2 = if a[idx + 1] >= -5 { x + 37 } else { y + 47 };
+    let mut acc = b1 + b2;
+    if a[idx + 2] == -1i16 {
+        acc += black_box(59);
+    } else {
+        acc += black_box(71);
+    }
+    if a[idx + 3] >= -5 {
+        acc += black_box(83);
+    } else {
+        acc += black_box(97);
+    }
+    acc
+}
+
+/// Exercises ARM64 signed narrow loads and signed icmp fusion.
+pub fn case_reg_arm64_signed_load_icmp(seed: i64) -> i64 {
+    let mut a8 = [
+        -128i8, -5, -1, 12, -1, -128, -6, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -128, -5, 4,
+        127,
+    ];
+    let mut a16 = [
+        -32768i16, -6, -1, 17, -1, -32768, -5, 0, 1, 2, 3, -1, -32768, -5, -6, 32767,
+    ];
+    let mut a32 = [
+        i32::MIN + 7,
+        -1,
+        -128,
+        -32768,
+        -1,
+        0,
+        1,
+        i32::MIN + 7,
+    ];
+    if (seed & 1) != 0 {
+        a8[3] = -1;
+        a8[6] = -5;
+        a16[3] = -5;
+        a16[6] = -6;
+    }
+    let a8 = black_box(a8);
+    let a16 = black_box(a16);
+    let a32 = black_box(a32);
+    // SAFETY: indices 3, 3, and 3 are within bounds with +16 bytes and -3 elements headroom.
+    let se_sum = unsafe {
+        se_i8_ptr(a8.as_ptr().add(3))
+            + se_i16_ptr(a16.as_ptr().add(3))
+            + se_i32_ptr(a32.as_ptr().add(3))
+    };
+    let idx8 = ((seed.unsigned_abs() as usize) % 2) * 3;
+    let idx16 = ((seed.unsigned_abs() as usize) % 2) * 3;
+    let cmp_sum = cmp_sload_i8(&a8, idx8, seed, seed + 10)
+        + cmp_sload_i16(&a16, idx16, seed + 20, seed + 30);
+    se_sum + se_stack_large(seed) + cmp_sum
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_byval_pair", case_reg_byval_pair),
     ("case_reg_byval_string", case_reg_byval_string),
@@ -515,4 +638,5 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_closure_scalar_env", case_reg_closure_scalar_env),
     ("case_reg_boxed_fnonce_tuple", case_reg_boxed_fnonce_tuple),
     ("case_reg_tailrec_escape_helper", case_reg_tailrec_escape_helper),
+    ("case_reg_arm64_signed_load_icmp", case_reg_arm64_signed_load_icmp),
 ];
