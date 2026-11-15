@@ -166,6 +166,45 @@ impl Emit<'_> {
         add_imm_parts(sub, crate::fold::extend(self.plan.const_of(value)?, ty, true))
     }
 
+    fn add_imm_split(&self, sub: bool, value: Value, ty: Type) -> Option<(bool, u32, u32)> {
+        let raw = self.plan.const_of(value)?;
+        if super::asm::Asm::mov_imm_is_single(raw) {
+            return None;
+        }
+        let simm = crate::fold::extend(raw, ty, true);
+        let abs = simm.unsigned_abs();
+        let (hi, lo) = ((abs & 0xFFF_000) as u32, (abs & 0xFFF) as u32);
+        (abs < (1 << 24) && hi != 0 && lo != 0).then(|| (if simm < 0 { !sub } else { sub }, hi, lo))
+    }
+
+    fn emit_add_sub_imm(&mut self, sub: bool, (x, y): (Value, Value), (ty, size): (Type, Size), dst: Reg) -> bool {
+        if let Some((eff_sub, imm)) = self.add_imm_args(sub, y, ty) {
+            let left = self.bits(x, A);
+            self.asm.add_imm(eff_sub, false, size, dst, left, imm);
+            return true;
+        }
+        if !sub && let Some((eff_sub, imm)) = self.add_imm_args(false, x, ty) {
+            let left = self.bits(y, A);
+            self.asm.add_imm(eff_sub, false, size, dst, left, imm);
+            return true;
+        }
+        if dst == ZR {
+            return false;
+        }
+        let split = self.add_imm_split(sub, y, ty).map(|p| (x, p))
+            .or_else(|| (!sub).then(|| self.add_imm_split(false, x, ty).map(|p| (y, p))).flatten());
+        let Some((other, (eff_sub, hi, lo))) = split else {
+            return false;
+        };
+        let left = self.bits(other, A);
+        if left == ZR {
+            return false;
+        }
+        self.asm.add_imm(eff_sub, false, size, dst, left, hi);
+        self.asm.add_imm(eff_sub, false, size, dst, dst, lo);
+        true
+    }
+
     fn peel_uextend(&self, val: Value) -> Value {
         if self.plan.elided[val.index()]
             && let Some(inst) = self.defs[val.index()]
@@ -307,15 +346,11 @@ impl Emit<'_> {
                     return Ok(());
                 }
             }
-            let left = self.bits(x, A);
-            if matches!(alu, Alu::Add | Alu::Sub)
-                && let Some((sub, imm)) = self.add_imm_args(alu == Alu::Sub, y, ty)
-            {
-                self.asm.add_imm(sub, false, size, dst, left, imm);
-            } else {
-                let right = self.bits(y, C);
-                self.asm.alu(alu, size, dst, left, right);
+            if matches!(alu, Alu::Add | Alu::Sub) && self.emit_add_sub_imm(alu == Alu::Sub, (x, y), (ty, size), dst) {
+                return Ok(());
             }
+            let (left, right) = (self.bits(x, A), self.bits(y, C));
+            self.asm.alu(alu, size, dst, left, right);
             return Ok(());
         }
         let bits = ty.bits() as u8;

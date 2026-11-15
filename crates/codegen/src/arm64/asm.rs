@@ -419,31 +419,65 @@ impl Asm {
         self.add_imm(false, false, Size::X, dst, src, 0);
     }
 
+    fn half_counts(value: u64) -> (usize, usize) {
+        let count = |target: u16| (0..4).filter(|&h| ((value >> (16 * h)) as u16) == target).count();
+        (count(0xFFFF), count(0))
+    }
+
+    fn single_bitmask_imm(value: u64) -> Option<(Size, (u32, u32, u32))> {
+        encode_bitmask_imm(value, true).map(|b| (Size::X, b)).or_else(|| {
+            ((value >> 32) == 0).then(|| encode_bitmask_imm(value, false).map(|b| (Size::W, b))).flatten()
+        })
+    }
+
+    pub(super) fn mov_imm_is_single(imm: i64) -> bool {
+        let value = imm as u64;
+        let (ones, zeros) = Self::half_counts(value);
+        ones >= 3 || zeros >= 3 || Self::single_bitmask_imm(value).is_some()
+    }
+
+    fn try_bitmask_half(value: u64, k: usize, cand: u16) -> Option<((u32, u32, u32), usize, u16)> {
+        let (shift, mask) = (16 * k, 0xFFFF_u64 << (16 * k));
+        let base = (value & !mask) | (u64::from(cand) << shift);
+        let bitmask = encode_bitmask_imm(base, true)?;
+        let hw = ((value >> shift) & 0xFFFF) as u16;
+        (((base & !mask) | (u64::from(hw) << shift)) == value).then_some((bitmask, k, hw))
+    }
+
+    fn bitmask_movk_at(value: u64, h: [u16; 4], k: usize) -> Option<((u32, u32, u32), usize, u16)> {
+        let fixed = [0, 0xFFFF, h[(k + 2) & 3], h[(k + 1) & 3]];
+        if let Some(hit) = fixed.into_iter().find_map(|c| Self::try_bitmask_half(value, k, c)) { return Some(hit); }
+        let (prev_top, next_bot) = (h[(k + 3) & 3] >> 15, h[(k + 1) & 3] & 1);
+        (prev_top != next_bot).then(|| (1..16_u32).find_map(|w| {
+            let pat = (1_u16 << w) - 1;
+            Self::try_bitmask_half(value, k, if prev_top == 1 { pat } else { !pat })
+        })).flatten()
+    }
+
+    fn try_emit_bitmask_imm(&mut self, dst: Reg, value: u64, ones: usize, zeros: usize) -> bool {
+        if dst == ZR || ones >= 3 || zeros >= 3 { return false; }
+        if let Some((size, bitmask)) = Self::single_bitmask_imm(value) {
+            self.alu_bitmask(Alu::Orr, size, bitmask, dst, ZR);
+            return true;
+        }
+        let h = [value as u16, (value >> 16) as u16, (value >> 32) as u16, (value >> 48) as u16];
+        if ones < 2 && zeros < 2 && let Some((bitmask, k, hw)) = (0..4).find_map(|k| Self::bitmask_movk_at(value, h, k)) {
+            self.alu_bitmask(Alu::Orr, Size::X, bitmask, dst, ZR);
+            self.word(0xF280_0000 | ((k as u32) << 21) | (u32::from(hw) << 5) | u32::from(dst.0));
+            return true;
+        }
+        false
+    }
+
     pub fn mov_imm(&mut self, dst: Reg, imm: i64) {
         self.clobber_anchor(dst);
         let value = imm as u64;
-        let halves = |word: u64| (0..4).map(move |half| (word >> (16 * half)) as u16);
-        let ones = halves(value).filter(|half| *half == 0xFFFF).count();
-        let zeros = halves(value).filter(|half| *half == 0).count();
-        if zeros < 3 && ones < 3 && dst != ZR {
-            if let Some(bitmask) = encode_bitmask_imm(value, true) {
-                self.alu_bitmask(Alu::Orr, Size::X, bitmask, dst, ZR);
-                return;
-            }
-            if (value >> 32) == 0
-                && let Some(bitmask) = encode_bitmask_imm(value, false)
-            {
-                self.alu_bitmask(Alu::Orr, Size::W, bitmask, dst, ZR);
-                return;
-            }
-        }
-        let inverted = ones > zeros;
-        let skip = if inverted { 0xFFFF } else { 0 };
-        let mut first = true;
-        for (half, bits) in halves(value).enumerate() {
-            if bits == skip && !(first && half == 3) {
-                continue;
-            }
+        let (ones, zeros) = Self::half_counts(value);
+        if self.try_emit_bitmask_imm(dst, value, ones, zeros) { return; }
+        let (inverted, skip, mut first) = (ones > zeros, if ones > zeros { 0xFFFF } else { 0 }, true);
+        for half in 0..4 {
+            let bits = (value >> (16 * half)) as u16;
+            if bits == skip && !(first && half == 3) { continue; }
             let shift = (half as u32) << 21;
             let word = match (first, inverted) {
                 (true, true) => 0x9280_0000 | shift | u32::from(!bits) << 5,
