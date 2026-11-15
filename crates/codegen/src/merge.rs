@@ -16,13 +16,17 @@ enum BinaryPlan {
 
 /// Folds every block that only one jump enters into the block that jumps, so its values stay block-local.
 pub(crate) fn run(func: &mut Function) -> Domain {
-    let forwarded = forward_trampolines(func);
-    if forwarded {
+    let mut changed = merge_leaves(func);
+    if changed {
         func.bump_cfg();
     }
-    let lowered = lower_binary_br_tables(func);
-    if lowered {
+    if forward_trampolines(func) {
         func.bump_cfg();
+        changed = true;
+    }
+    if lower_binary_br_tables(func) {
+        func.bump_cfg();
+        changed = true;
     }
     let cfg = func.cfg();
     let mut subst = identity(func.types.len());
@@ -35,9 +39,9 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     }
     if merged {
         rename(func, &subst);
+        changed = true;
     }
-    let traps = merge_traps(func);
-    if forwarded || lowered || merged || traps {
+    if changed {
         func.bump_cfg();
         Domain::CFG | Domain::VALUES
     } else {
@@ -324,33 +328,63 @@ fn jumps_onward(func: &Function, entry: Option<usize>, b: usize) -> bool {
     Some(b) != entry && jump_only_target(func, Block(b as u32)).is_some()
 }
 
-fn compute_trampoline_mask(func: &Function, entry: Option<usize>) -> Option<Vec<bool>> {
+fn outside_param_uses(func: &Function, cfg: &Cfg, param_owner: &[usize]) -> Vec<bool> {
+    let mut used_outside = vec![false; func.types.len()];
+    for (b, data) in func.blocks.iter().enumerate() {
+        if !cfg.reachable[b] {
+            continue;
+        }
+        for &inst in &data.insts {
+            func.insts[inst.index()].op.for_operands(|v| {
+                let owner = param_owner[v.index()];
+                if owner != usize::MAX && owner != b {
+                    used_outside[v.index()] = true;
+                }
+            });
+        }
+    }
+    used_outside
+}
+
+fn compute_trampoline_mask(func: &Function, cfg: &Cfg, entry: Option<usize>) -> Option<Vec<bool>> {
     let n = func.blocks.len();
-    if !(0..n).any(|b| jumps_onward(func, entry, b)) {
+    if !(0..n).any(|b| cfg.reachable[b] && jumps_onward(func, entry, b)) {
         return None;
     }
     let mut param_owner = vec![usize::MAX; func.types.len()];
     let mut has_params = false;
     for (b, data) in func.blocks.iter().enumerate() {
-        for &p in &data.params {
-            param_owner[p.index()] = b;
-            has_params = true;
-        }
-    }
-    let mut used_outside = vec![false; if has_params { func.types.len() } else { 0 }];
-    if has_params {
-        for (b, data) in func.blocks.iter().enumerate() {
-            for &inst in &data.insts {
-                func.insts[inst.index()].op.for_operands(|v| {
-                    if param_owner[v.index()] != usize::MAX && param_owner[v.index()] != b {
-                        used_outside[v.index()] = true;
-                    }
-                });
+        if cfg.reachable[b] {
+            for &p in &data.params {
+                param_owner[p.index()] = b;
+                has_params = true;
             }
         }
     }
-    let mask: Vec<bool> = (0..n).map(|b| jumps_onward(func, entry, b) && func.blocks[b].params.iter().all(|p| !used_outside[p.index()])).collect();
+    let used_outside = if has_params { outside_param_uses(func, cfg, &param_owner) } else { Vec::new() };
+    let mask: Vec<bool> = (0..n)
+        .map(|b| cfg.reachable[b] && jumps_onward(func, entry, b) && func.blocks[b].params.iter().all(|p| !used_outside[p.index()]))
+        .collect();
     mask.iter().any(|&t| t).then_some(mask)
+}
+
+fn collapse_identical_brifs(func: &mut Function, cfg: &Cfg) -> bool {
+    let mut changed = false;
+    for b in 0..func.blocks.len() {
+        if !cfg.reachable[b] {
+            continue;
+        }
+        let Some(&term) = func.blocks[b].insts.last() else { continue };
+        if let Op::Brif(_, then, ref then_args, otherwise, ref else_args) = func.insts[term.index()].op
+            && then == otherwise
+            && then_args == else_args
+        {
+            let args = then_args.clone();
+            func.insts[term.index()].op = Op::Jump(then, args);
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn forward_term_op(func: &Function, is_trampoline: &[bool], op: &mut Op) -> bool {
@@ -386,12 +420,13 @@ fn forward_trampolines(func: &mut Function) -> bool {
     if func.coroutine.is_some() {
         return false;
     }
-    let Some(is_trampoline) = compute_trampoline_mask(func, func.entry.map(Block::index)) else {
-        return false;
-    };
     let cfg = func.cfg();
+    let collapsed = collapse_identical_brifs(func, &cfg);
+    let Some(is_trampoline) = compute_trampoline_mask(func, &cfg, func.entry.map(Block::index)) else {
+        return collapsed;
+    };
     let terms: Vec<Option<(usize, Inst)>> = func.blocks.iter().enumerate().map(|(b, data)| data.insts.last().copied().map(|i| (b, i))).collect();
-    let mut changed = false;
+    let mut forwarded = false;
     for &(b, term) in terms.iter().flatten() {
         if !cfg.reachable[b] {
             continue;
@@ -399,11 +434,11 @@ fn forward_trampolines(func: &mut Function) -> bool {
         let mut op = func.insts[term.index()].op.clone();
         if forward_term_op(func, &is_trampoline, &mut op) {
             func.insts[term.index()].op = op;
-            changed = true;
+            forwarded = true;
         }
     }
-    if !changed {
-        return false;
+    if !forwarded {
+        return collapsed;
     }
     let mut referenced = vec![false; func.blocks.len()];
     for (_, term) in terms.into_iter().flatten() {
@@ -420,16 +455,28 @@ fn forward_trampolines(func: &mut Function) -> bool {
     true
 }
 
-fn is_trap_block(func: &Function, block: usize) -> bool {
-    let data = &func.blocks[block];
-    data.params.is_empty() && matches!(data.insts[..], [inst] if func.insts[inst.index()].op == Op::Trap)
+#[derive(Clone, Copy)]
+enum LeafKind {
+    Trap = 0,
+    EmptyReturn = 1,
 }
 
-fn redirect_trap_target(target: &mut Block, empty_args: bool, is_dup: &[bool], canon: Block, kept_dup: &mut [bool]) -> bool {
-    let idx = target.index();
-    if !is_dup[idx] || *target == canon {
-        return false;
+fn leaf_kind(func: &Function, block: usize) -> Option<LeafKind> {
+    let data = &func.blocks[block];
+    if !data.params.is_empty() {
+        return None;
     }
+    let [inst] = data.insts[..] else { return None };
+    match &func.insts[inst.index()].op {
+        Op::Trap => Some(LeafKind::Trap),
+        Op::Return(vals) if vals.is_empty() => Some(LeafKind::EmptyReturn),
+        _ => None,
+    }
+}
+
+fn redirect_leaf_target(target: &mut Block, empty_args: bool, dup_canon: &[Option<Block>], kept_dup: &mut [bool]) -> bool {
+    let idx = target.index();
+    let Some(canon) = dup_canon[idx] else { return false };
     if empty_args {
         *target = canon;
         return true;
@@ -438,51 +485,55 @@ fn redirect_trap_target(target: &mut Block, empty_args: bool, is_dup: &[bool], c
     false
 }
 
-fn redirect_trap_op(op: &mut Op, is_dup: &[bool], canon: Block, kept_dup: &mut [bool]) -> bool {
+fn redirect_leaf_op(op: &mut Op, dup_canon: &[Option<Block>], kept_dup: &mut [bool]) -> bool {
     match op {
-        Op::Jump(target, args) => redirect_trap_target(target, args.is_empty(), is_dup, canon, kept_dup),
+        Op::Jump(target, args) => redirect_leaf_target(target, args.is_empty(), dup_canon, kept_dup),
         Op::Brif(_, then, then_args, otherwise, else_args) => {
-            let a = redirect_trap_target(then, then_args.is_empty(), is_dup, canon, kept_dup);
-            let b = redirect_trap_target(otherwise, else_args.is_empty(), is_dup, canon, kept_dup);
+            let a = redirect_leaf_target(then, then_args.is_empty(), dup_canon, kept_dup);
+            let b = redirect_leaf_target(otherwise, else_args.is_empty(), dup_canon, kept_dup);
             a || b
         }
         Op::BrTable(_, default, targets) => {
-            let mut did = redirect_trap_target(default, true, is_dup, canon, kept_dup);
+            let mut did = redirect_leaf_target(default, true, dup_canon, kept_dup);
             for target in targets {
-                did |= redirect_trap_target(target, true, is_dup, canon, kept_dup);
+                did |= redirect_leaf_target(target, true, dup_canon, kept_dup);
             }
             did
         }
-        Op::TryCall { normal, .. } => redirect_trap_target(normal, true, is_dup, canon, kept_dup),
+        Op::TryCall { normal, .. } => redirect_leaf_target(normal, true, dup_canon, kept_dup),
         _ => false,
     }
 }
 
-fn merge_traps(func: &mut Function) -> bool {
+fn merge_leaves(func: &mut Function) -> bool {
     let entry = func.entry.map(Block::index);
-    let mut canonical = None;
-    let mut is_dup = vec![false; func.blocks.len()];
+    let mut canonical = [None; 2];
+    let mut dup_canon = vec![None; func.blocks.len()];
     let mut has_dup = false;
     for block in 0..func.blocks.len() {
-        if Some(block) != entry && is_trap_block(func, block) {
-            if canonical.is_none() {
-                canonical = Some(Block(block as u32));
-            } else {
-                is_dup[block] = true;
-                has_dup = true;
+        if Some(block) != entry
+            && let Some(kind) = leaf_kind(func, block)
+        {
+            let slot = &mut canonical[kind as usize];
+            match *slot {
+                None => *slot = Some(Block(block as u32)),
+                Some(canon) => {
+                    dup_canon[block] = Some(canon);
+                    has_dup = true;
+                }
             }
         }
     }
-    let Some(canon) = canonical.filter(|_| has_dup) else {
+    if !has_dup {
         return false;
-    };
+    }
     let mut changed = false;
     let mut kept_dup = vec![false; func.blocks.len()];
     for inst in &mut func.insts {
-        changed |= redirect_trap_op(&mut inst.op, &is_dup, canon, &mut kept_dup);
+        changed |= redirect_leaf_op(&mut inst.op, &dup_canon, &mut kept_dup);
     }
-    for (block, dup) in is_dup.into_iter().enumerate() {
-        if dup && !kept_dup[block] {
+    for (block, canon) in dup_canon.into_iter().enumerate() {
+        if canon.is_some() && !kept_dup[block] {
             func.blocks[block].insts.clear();
             changed = true;
         }
