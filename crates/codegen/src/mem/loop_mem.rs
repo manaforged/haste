@@ -1,5 +1,5 @@
 use crate::cfg::{Cfg, Loop};
-use crate::ir::{Binary, Block, Convert, Function, Inst, Op, StackSlot, Type, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, Op, SigRef, StackSlot, Type, Value};
 
 use super::{MemBase, MemLoc, MemRoot, Provenance, in_range, is_atomic_barrier, may_alias};
 
@@ -308,6 +308,23 @@ impl WriteRanges {
     }
 }
 
+#[derive(Default)]
+struct ParamMask(u64, bool);
+
+impl ParamMask {
+    fn set(&mut self, p: u16) {
+        if p < 64 {
+            self.0 |= 1_u64 << p;
+        } else {
+            self.1 = true;
+        }
+    }
+
+    fn get(&self, p: u16) -> bool {
+        if p < 64 { (self.0 & (1_u64 << p)) != 0 } else { self.1 }
+    }
+}
+
 pub(crate) struct LoopMem {
     pub writes: bool,
     pub unknown_mem_writes: bool,
@@ -317,6 +334,9 @@ pub(crate) struct LoopMem {
     pub(crate) block_copies: bool,
     slot_writes: WriteRanges,
     param_writes: WriteRanges,
+    calls_write_noalias: ParamMask,
+    calls_read_noalias: ParamMask,
+    head_noalias_before_unknown: u64,
     copy_locs: Vec<MemLoc>,
 }
 
@@ -341,14 +361,69 @@ impl LoopMem {
             block_copies: false,
             slot_writes: WriteRanges::new(func.slots.len()),
             param_writes: WriteRanges::new(func.signature.params.len()),
+            calls_write_noalias: ParamMask::default(),
+            calls_read_noalias: ParamMask::default(),
+            head_noalias_before_unknown: 0,
             copy_locs: Vec::new(),
         };
         for inst in (0..each.body.len()).filter(|b| each.body[*b]).flat_map(|b| &func.blocks[b].insts) {
             fx.analyze_op(func, prov, &func.insts[inst.index()].op);
         }
+        for &inst in &func.blocks[each.head.index()].insts {
+            let data = &func.insts[inst.index()];
+            if fx.record_head_noalias(func, prov, &data.op, data.result) {
+                break;
+            }
+        }
         fx.slot_writes.sort();
         fx.param_writes.sort();
         fx
+    }
+
+    fn head_touches_noalias(&self, p: u16) -> bool {
+        p < 64 && (self.head_noalias_before_unknown & (1_u64 << p)) != 0
+    }
+
+    fn mark_head_noalias(&mut self, root: MemRoot) {
+        if let MemRoot::NoAliasParam(p) = root
+            && p < 64
+        {
+            self.head_noalias_before_unknown |= 1_u64 << p;
+        }
+    }
+
+    fn record_head_noalias(&mut self, func: &Function, prov: &Provenance, op: &Op, res: Option<Value>) -> bool {
+        if is_atomic_barrier(op) || matches!(op, Op::Call { .. } | Op::TryCall { .. }) {
+            return true;
+        }
+        match *op {
+            Op::Load(addr, off) => {
+                let bytes = res.map_or(1, |r| func.ty(r).bytes());
+                self.mark_head_noalias(prov.loc(addr, i64::from(off), bytes).root);
+            }
+            Op::Store(val, addr, off) => {
+                let root = prov.loc(addr, i64::from(off), func.ty(val).bytes()).root;
+                self.mark_head_noalias(root);
+                return !matches!(root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_));
+            }
+            Op::Move(dst, _, bytes) => return !matches!(prov.loc(dst, 0, bytes).root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_)),
+            Op::Copy(dst, _, _) => return !matches!(prov.loc(dst, 0, u32::MAX).root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_)),
+            _ => {}
+        }
+        false
+    }
+
+    fn record_call_noalias(&mut self, func: &Function, prov: &Provenance, sig: SigRef, args: &[Value]) {
+        let params = &func.sigs[sig.index()].params;
+        for (i, &arg) in args.iter().enumerate() {
+            if let Some(MemRoot::NoAliasParam(p)) = prov.param_roots.get(arg.index()).copied() {
+                self.calls_read_noalias.set(p);
+                if !params.get(i).is_some_and(|pa| pa.readonly) {
+                    self.calls_write_noalias.set(p);
+                    self.param_writes.clobber(usize::from(p));
+                }
+            }
+        }
     }
 
     fn analyze_op(&mut self, func: &Function, prov: &Provenance, op: &Op) {
@@ -376,6 +451,9 @@ impl LoopMem {
                 self.record_clobber_loc(dloc);
                 self.copy_locs.push(dloc);
                 self.copy_locs.push(prov.loc(src, 0, u32::MAX));
+            }
+            Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => {
+                self.record_call_noalias(func, prov, sig, args);
             }
             _ => {}
         }
@@ -464,9 +542,10 @@ impl LoopMem {
             Some((slo, shi)) => !self.param_writes.overlaps_span(usize::from(p), slo, shi),
             None => !self.param_writes.any(usize::from(p)),
         };
+        let unescaped_safe = prov.noalias_unescaped(p) && (self.head_touches_noalias(p) || !self.unknown_mem_writes);
         let readonly_ok = no_param_write && func.signature.params.get(usize::from(p)).is_some_and(|abi| abi.readonly);
-        let call_safe = no_param_write && prov.noalias_unescaped(p);
-        let root_ok = no_param_write && (prov.noalias_unescaped(p) || !self.unknown_mem_writes);
+        let call_safe = no_param_write && unescaped_safe && !self.calls_write_noalias.get(p);
+        let root_ok = no_param_write && (unescaped_safe || !self.unknown_mem_writes);
         (root_ok, trap_ok, readonly_ok, call_safe)
     }
 
@@ -587,17 +666,23 @@ fn collect_loop_accesses(cx: &PromoteCx<'_>) -> Vec<LoopAccess> {
     accesses
 }
 
+fn promote_safe(mem: &LoopMem, loc: MemLoc, prov: &Provenance) -> bool {
+    if mem.copy_locs.iter().any(|&cloc| may_alias(loc, cloc, prov)) {
+        return false;
+    }
+    match loc.root {
+        MemRoot::Slot(s) => !mem.calls || prov.slot_unescaped(s),
+        MemRoot::NoAliasParam(p) => {
+            (!mem.calls || (prov.noalias_unescaped(p) && !mem.calls_read_noalias.get(p)))
+                && (!mem.unknown_mem_writes || mem.head_touches_noalias(p))
+        }
+        _ => !mem.calls,
+    }
+}
+
 fn check_promote_key(mem: &LoopMem, cx: &PromoteCx<'_>, accesses: &[LoopAccess], sample: LoopAccess) -> Option<PromoteCand> {
     let (loc, ty) = (sample.loc, sample.ty);
-    if !(ty.is_small_int() || ty.is_float()) {
-        return None;
-    }
-    let safe_across_calls = match loc.root {
-        MemRoot::Slot(s) => cx.prov.slot_unescaped(s),
-        MemRoot::NoAliasParam(p) => cx.prov.noalias_unescaped(p),
-        _ => false,
-    };
-    if (mem.calls && !safe_across_calls) || mem.copy_locs.iter().any(|&cloc| may_alias(loc, cloc, cx.prov)) {
+    if !(ty.is_small_int() || ty.is_float()) || !promote_safe(mem, loc, cx.prov) {
         return None;
     }
     let offset = i32::try_from(loc.offset).ok()?;

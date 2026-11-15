@@ -1,11 +1,10 @@
+mod escape;
 mod loop_mem;
-
-use std::cell::OnceCell;
 
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::cfg::Cfg;
-use crate::ir::{AbiParam, ArgumentPurpose, Binary, Block, BlockData, Convert, Function, Inst, Op, StackSlot, Type, Value};
+use crate::ir::{AbiParam, Binary, Block, BlockData, Convert, Function, Inst, Op, StackSlot, Type, Value};
 pub(crate) use loop_mem::{LoopMem, PromoteBase, PromoteCand};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -52,7 +51,7 @@ impl MemLoc {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TrackRoot {
+pub(super) enum TrackRoot {
     Unset,
     Set(MemRoot),
     Conflict,
@@ -81,301 +80,12 @@ pub(crate) struct Provenance {
     pub spans: Vec<Option<(MemBase, i64, i64)>>,
 }
 
-struct UseCounts {
-    total: Vec<u32>,
-    safe: Vec<u32>,
-    ro_calls: Vec<u32>,
-}
-
-struct SlotEscapes {
-    unescaped: Vec<bool>,
-    call_readonly: Vec<bool>,
-    noalias: Vec<bool>,
-}
-
-impl SlotEscapes {
-    fn new(func: &Function) -> Self {
-        Self { unescaped: vec![true; func.slots.len()], call_readonly: vec![true; func.slots.len()], noalias: vec![false; func.signature.params.len()] }
-    }
-}
-
 fn slot_addresses(func: &Function) -> Vec<Option<(StackSlot, i32)>> {
     func.slot_offsets(|_| None)
         .0
         .into_iter()
         .map(|entry| entry.and_then(|(slot, off)| i32::try_from(off).ok().map(|o| (slot, o))))
         .collect()
-}
-
-fn finish_slot_escape(
-    func: &Function,
-    slots: &[Option<(StackSlot, i32)>],
-    tracked: &[TrackRoot],
-    counts: &UseCounts,
-    is_spill: Option<&[bool]>,
-) -> SlotEscapes {
-    let mut esc = SlotEscapes::new(func);
-    for (v, slot) in slots.iter().enumerate() {
-        let resolved = slot.map(|(s, _)| s).or(match tracked[v] {
-            TrackRoot::Set(MemRoot::Slot(s)) => Some(s),
-            _ => None,
-        });
-        if let Some(s) = resolved {
-            let spilled = is_spill.is_some_and(|sp| sp.get(v).copied().unwrap_or(false));
-            if spilled || counts.safe[v] != counts.total[v] {
-                esc.unescaped[s.index()] = false;
-            }
-            if spilled || counts.safe[v] + counts.ro_calls[v] != counts.total[v] {
-                esc.call_readonly[s.index()] = false;
-            }
-        }
-        if let TrackRoot::Set(MemRoot::NoAliasParam(p)) = tracked[v]
-            && counts.safe[v] != counts.total[v]
-        {
-            esc.noalias[usize::from(p)] = true;
-        }
-    }
-    esc
-}
-
-fn count_safe_args(func: &Function, target: Block, args: &[Value], tracked: &[TrackRoot], safe: &mut [u32]) {
-    for (&param, &arg) in func.blocks[target.index()].params.iter().zip(args) {
-        if let TrackRoot::Set(root) = tracked[param.index()]
-            && tracked[arg.index()] == TrackRoot::Set(root)
-        {
-            safe[arg.index()] += 1;
-        }
-    }
-}
-
-fn is_ptr_capable(ty: Type) -> bool {
-    matches!(ty, Type::I64 | Type::I128 | Type::Vec { .. })
-}
-
-fn non_ptr_values(func: &Function, cfg: &Cfg) -> Vec<bool> {
-    let n = func.types.len();
-    let mut non_ptr = vec![true; n];
-    for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
-            let op = &func.insts[inst.index()].op;
-            if matches!(op, Op::Icmp(..) | Op::Trapz(_)) {
-                continue;
-            }
-            op.for_operands(|v| non_ptr[v.index()] = false);
-        }
-    }
-    non_ptr
-}
-
-fn is_unknown_mem_op(op: &Op, slots: &[Option<(StackSlot, i32)>], tracked: &[TrackRoot]) -> bool {
-    let known = |v: Value| {
-        slots[v.index()].is_some()
-            || matches!(
-                tracked[v.index()],
-                TrackRoot::Set(MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::ReadonlyParam(_))
-            )
-    };
-    match *op {
-        Op::Load(addr, _) | Op::Store(_, addr, _) => !known(addr),
-        Op::Move(dst, src, _) | Op::Copy(dst, src, _) => !known(dst) || !known(src),
-        Op::Call { .. }
-        | Op::TryCall { .. }
-        | Op::AtomicLoad(_)
-        | Op::AtomicStore(..)
-        | Op::AtomicRmw(..)
-        | Op::AtomicCas(..)
-        | Op::Fence => true,
-        _ => false,
-    }
-}
-
-fn compute_block_danger(func: &Function, cfg: &Cfg, slots: &[Option<(StackSlot, i32)>], tracked: &[TrackRoot]) -> (Vec<bool>, Vec<bool>, Vec<usize>) {
-    let n = func.blocks.len();
-    let loops = cfg.loops();
-    let mut in_loop = vec![false; n];
-    for (i, &depth) in loops.depths.iter().enumerate() {
-        in_loop[i] = depth > 0;
-    }
-    let mut danger = vec![false; n];
-    let mut unknown_end = vec![0_usize; n];
-    let mut queue = Vec::new();
-    for &b in &cfg.rpo {
-        let bi = b.index();
-        unknown_end[bi] = func.blocks[bi].insts.iter().rposition(|&inst| is_unknown_mem_op(&func.insts[inst.index()].op, slots, tracked)).map_or(0, |pos| pos + 1);
-        if in_loop[bi] || unknown_end[bi] > 0 {
-            danger[bi] = true;
-            queue.push(b);
-        }
-    }
-    while let Some(b) = queue.pop() {
-        for &pred in cfg.preds_of(b) {
-            let pi = pred.index();
-            if !danger[pi] {
-                danger[pi] = true;
-                queue.push(pred);
-            }
-        }
-    }
-    (in_loop, danger, unknown_end)
-}
-
-fn post_call_safe(func: &Function, block: Block, pos: usize, in_loop: &[bool], danger: &[bool], unknown_end: &[usize]) -> bool {
-    if in_loop[block.index()] || unknown_end[block.index()] > pos + 1 {
-        return false;
-    }
-    let Some(term) = func.blocks[block.index()].insts.last() else { return false };
-    !func.insts[term.index()].op.targets().any(|t| danger[t.index()])
-}
-
-fn non_capturing_call_arg(
-    func: &Function,
-    in_loop: bool,
-    (is_const, non_ptr, tracked): (&[bool], &[bool], &[TrackRoot]),
-    (params, args, result, results): (&[AbiParam], &[Value], Option<Value>, &[Value]),
-    (arg_idx, p): (usize, u16),
-) -> bool {
-    let Some(pa) = params.get(arg_idx) else { return false };
-    if !pa.readonly && (in_loop || !pa.noalias) {
-        return false;
-    }
-    if params.iter().any(|param| param.purpose == ArgumentPurpose::StructReturn) {
-        return false;
-    }
-    for r in result.into_iter().chain(results.iter().copied()) {
-        if is_ptr_capable(func.ty(r)) && !non_ptr[r.index()] {
-            return false;
-        }
-    }
-    args.iter().enumerate().all(|(j, &other)| {
-        j == arg_idx
-            || is_const[other.index()]
-            || !is_ptr_capable(func.ty(other))
-            || params.get(j).is_some_and(|q| q.readonly && q.purpose == ArgumentPurpose::Normal)
-            || tracked[other.index()] == TrackRoot::Set(MemRoot::NoAliasParam(p))
-    })
-}
-
-fn classify_uses(
-    func: &Function,
-    cfg: &Cfg,
-    slots: &[Option<(StackSlot, i32)>],
-    tracked: &[TrackRoot],
-    is_spill: Option<&[bool]>,
-) -> SlotEscapes {
-    if func.slots.is_empty() && !func.signature.params.iter().any(|abi| abi.noalias) {
-        return SlotEscapes::new(func);
-    }
-    let n = func.types.len();
-    let mut is_const = vec![false; n];
-    for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
-            let data = &func.insts[inst.index()];
-            if let (&Op::Const(_), Some(res)) = (&data.op, data.result) {
-                is_const[res.index()] = true;
-            }
-        }
-    }
-    let non_ptr = OnceCell::new();
-    let (in_loop, danger, unknown_end) = compute_block_danger(func, cfg, slots, tracked);
-    let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], ro_calls: vec![0_u32; n] };
-    let mark_safe = |v: Value, safe: &mut [u32]| {
-        if slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(_)) {
-            safe[v.index()] += 1;
-        }
-    };
-    let mark_param_safe = |v: Value, safe: &mut [u32]| {
-        if slots[v.index()].is_none()
-            && matches!(tracked[v.index()], TrackRoot::Set(MemRoot::NoAliasParam(_) | MemRoot::ReadonlyParam(_)))
-        {
-            safe[v.index()] += 1;
-        }
-    };
-    for &b in &cfg.rpo {
-        for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
-            let data = &func.insts[inst.index()];
-            data.op.for_operands(|v| counts.total[v.index()] += 1);
-            match &data.op {
-                Op::Load(addr, _) => mark_safe(*addr, &mut counts.safe),
-                Op::Trapz(addr) => mark_param_safe(*addr, &mut counts.safe),
-                Op::Store(val, addr, _) if val != addr => mark_safe(*addr, &mut counts.safe),
-                Op::Move(dst, src, _) | Op::Copy(dst, src, _) => {
-                    mark_param_safe(*dst, &mut counts.safe);
-                    mark_param_safe(*src, &mut counts.safe);
-                }
-                Op::Binary(Binary::Iadd | Binary::Isub, a, b) => {
-                    if data.result.is_some_and(|r| slots[r.index()].is_some()) {
-                        let target = if slots[a.index()].is_some() { a } else { b };
-                        counts.safe[target.index()] += 1;
-                    } else if data.result.is_some_and(|r| matches!(tracked[r.index()], TrackRoot::Set(_))) {
-                        let target = if matches!(tracked[a.index()], TrackRoot::Set(_)) { a } else { b };
-                        counts.safe[target.index()] += 1;
-                    }
-                }
-                Op::Convert(Convert::Bitcast, x) if data.result.is_some_and(|r| matches!(tracked[r.index()], TrackRoot::Set(_))) => {
-                    counts.safe[x.index()] += 1;
-                }
-                Op::Select(_, a, b) => {
-                    if let Some(r) = data.result
-                        && let TrackRoot::Set(root) = tracked[r.index()]
-                    {
-                        for v in [a, b] {
-                            if tracked[v.index()] == TrackRoot::Set(root) {
-                                counts.safe[v.index()] += 1;
-                            }
-                        }
-                    }
-                }
-                Op::Icmp(_, a, b) => {
-                    for (v, other) in [(a, b), (b, a)] {
-                        let is_noalias = matches!(tracked[v.index()], TrackRoot::Set(MemRoot::NoAliasParam(_)));
-                        let same_or_const = (slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(_)))
-                            && (is_const[other.index()]
-                                || matches!((tracked[v.index()], tracked[other.index()]), (TrackRoot::Set(ra), TrackRoot::Set(rb)) if ra == rb));
-                        if is_noalias || same_or_const {
-                            counts.safe[v.index()] += 1;
-                        }
-                    }
-                }
-                Op::Jump(target, args) => count_safe_args(func, *target, args, tracked, &mut counts.safe),
-                Op::Brif(_, then_b, then_args, else_b, else_args) => {
-                    count_safe_args(func, *then_b, then_args, tracked, &mut counts.safe);
-                    count_safe_args(func, *else_b, else_args, tracked, &mut counts.safe);
-                }
-                Op::Call { sig, args, results, .. } => {
-                    let params = &func.sigs[sig.index()].params;
-                    let post_safe = post_call_safe(func, b, pos, &in_loop, &danger, &unknown_end);
-                    for (i, &arg) in args.iter().enumerate() {
-                        if params.get(i).is_some_and(|p| p.readonly) {
-                            counts.ro_calls[arg.index()] += 1;
-                        }
-                        if slots[arg.index()].is_none()
-                            && let TrackRoot::Set(MemRoot::NoAliasParam(p)) = tracked[arg.index()]
-                            && (post_safe || non_capturing_call_arg(func, in_loop[b.index()], (&is_const, non_ptr.get_or_init(|| non_ptr_values(func, cfg)), tracked), (params, args, data.result, results), (i, p)))
-                        {
-                            counts.safe[arg.index()] += 1;
-                        }
-                    }
-                }
-                Op::TryCall { sig, args, .. } => {
-                    let params = &func.sigs[sig.index()].params;
-                    let post_safe = post_call_safe(func, b, pos, &in_loop, &danger, &unknown_end);
-                    for (i, &arg) in args.iter().enumerate() {
-                        if params.get(i).is_some_and(|p| p.readonly) {
-                            counts.ro_calls[arg.index()] += 1;
-                        }
-                        if slots[arg.index()].is_none()
-                            && let TrackRoot::Set(MemRoot::NoAliasParam(_)) = tracked[arg.index()]
-                            && post_safe
-                        {
-                            counts.safe[arg.index()] += 1;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    finish_slot_escape(func, slots, tracked, &counts, is_spill)
 }
 
 fn step_track(op: &Op, ty: Type, tracked: &[TrackRoot]) -> TrackRoot {
@@ -546,7 +256,7 @@ impl Provenance {
     fn build(func: &Function, cfg: &Cfg, is_spill: Option<&[bool]>, affine: Option<Vec<(Value, i64)>>) -> Self {
         let slot_offsets = slot_addresses(func);
         let tracked = compute_tracked_roots(func, cfg);
-        let esc = classify_uses(func, cfg, &slot_offsets, &tracked, is_spill);
+        let esc = escape::classify_uses(func, cfg, &slot_offsets, &tracked, is_spill);
         let mut param_roots = vec![MemRoot::Unknown; func.types.len()];
         for (i, t) in tracked.iter().enumerate() {
             if let TrackRoot::Set(root) = *t {

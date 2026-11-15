@@ -309,6 +309,15 @@ fn is_silent_store(known: &KnownLoads, loc: MemLoc, ty: Type, value: Value, cons
     }
 }
 
+fn call_passes_noalias(op: &Op, prov: &Provenance, p: u16) -> bool {
+    match *op {
+        Op::Call { ref args, .. } | Op::TryCall { ref args, .. } => args
+            .iter()
+            .any(|arg| prov.param_roots.get(arg.index()).copied() == Some(MemRoot::NoAliasParam(p))),
+        _ => false,
+    }
+}
+
 /// Drops from `block` each load whose bytes `known` holds, recording its replacement in `subst`, eliminates dead overwritten stores, and leaves in `known` what memory holds at the block's end; returns `(changed, renamed)`.
 fn scan(
     func: &mut Function,
@@ -547,7 +556,9 @@ fn scan(
                     MemRoot::Slot(s) => state.prov.slot_unescaped(s),
                     MemRoot::NoAliasParam(p) => {
                         let cop = canon_move.as_ref().map_or(&func.insts[inst.index()].op, |(_, _, m)| m);
-                        !dom::clobbers_loc(func, cop, ploc, state.prov) && state.prov.noalias_unescaped(p)
+                        !call_passes_noalias(cop, state.prov, p)
+                            && !dom::clobbers_loc(func, cop, ploc, state.prov)
+                            && state.prov.noalias_unescaped(p)
                     }
                     _ => false,
                 };
