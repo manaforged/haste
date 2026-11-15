@@ -456,6 +456,19 @@ impl Emit<'_> {
         }
     }
 
+    /// Writes eight zero bytes to `to`, joined with the zero stores just before it through the scratch X2.
+    pub(super) fn zero_to(&mut self, to: Mem) {
+        if self.asm.store_zero(to, X2) {
+            self.clobber_xmm(X2);
+        }
+    }
+
+    /// Copies the eight bytes at `from` to `to` through rax.
+    pub(super) fn copy_word(&mut self, to: Mem, from: Mem) {
+        self.asm.load(Size::Q, Reg::Rax, from);
+        self.asm.store(Size::Q, to, Reg::Rax);
+    }
+
     /// Writes the eight (or sixteen) bytes of `value` to `to`, using rax as scratch; a float in a register writes the bytes of its type and a 16-byte vector goes through xmm2 in one store.
     pub(super) fn move_to(&mut self, to: Mem, value: Value) {
         let stack_home = self.frame_disp(to);
@@ -465,19 +478,13 @@ impl Emit<'_> {
                 self.zero_xmm(X2);
                 return self.store_xmm_home(to, X2, ty);
             }
-            Location::Imm(imm) => match i32::try_from(imm) {
-                Ok(small) => self.asm.store_imm(to, small),
-                Err(_) => {
-                    self.asm.mov_imm(Reg::Rax, imm);
-                    self.clobber_reg(Reg::Rax);
-                    self.asm.store(Size::Q, to, Reg::Rax);
-                }
-            },
+            Location::Imm(0) => self.zero_to(to),
+            Location::Imm(imm) if i32::try_from(imm).is_ok() => self.asm.store_imm_sized(Size::Q, to, imm as i32),
             Location::SlotAddr(sym) if !self.direct_calls => {
                 let at = self.asm.store_slot_reloc(to);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
             }
-            Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => {
+            Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => {
                 self.raw(Reg::Rax, value);
                 self.asm.store(Size::Q, to, Reg::Rax);
             }

@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use crate::ir::{Domain, Function, Op};
+use crate::ir::{Binary, Block, Domain, Function, Op};
+use crate::reloc::RuntimeSymbol;
 use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -140,7 +141,157 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
     changed
 }
 
-fn run_fixpoint(func: &mut Function, plan: &Plan) {
+struct PassState {
+    can_fill: bool,
+    fold_clean: bool,
+    merge_clean: bool,
+    loops_rev: Option<u32>,
+    has_loops: bool,
+}
+
+impl PassState {
+    fn new(func: &Function) -> Self {
+        Self {
+            can_fill: has_fill_ops(func),
+            fold_clean: false,
+            merge_clean: false,
+            loops_rev: None,
+            has_loops: false,
+        }
+    }
+
+    fn has_loops(&mut self, func: &Function) -> bool {
+        if self.loops_rev != Some(func.cfg_rev) {
+            self.loops_rev = Some(func.cfg_rev);
+            self.has_loops = detect_loops(func);
+        }
+        self.has_loops
+    }
+
+    fn after_pass(&mut self, func: &Function, pass: Pass, changed: Domain) {
+        if !changed.is_empty() {
+            self.fold_clean = false;
+            self.merge_clean = false;
+        }
+        if self.can_fill && matches!(pass, Pass::Fill | Pass::Fold) {
+            self.can_fill = has_fill_ops(func);
+        }
+    }
+}
+
+fn has_live_op(func: &Function, mut pred: impl FnMut(&Op) -> bool) -> bool {
+    func.blocks.iter().any(|block| block.insts.iter().any(|&inst| pred(&func.insts[inst.index()].op)))
+}
+
+fn has_fill_ops(func: &Function) -> bool {
+    has_live_op(func, |op| matches!(op, Op::Runtime(RuntimeSymbol::Memset) | Op::Copy(..)))
+}
+
+fn nth_target(op: &Op, idx: usize) -> Option<Block> {
+    match op {
+        Op::Jump(t, _) if idx == 0 => Some(*t),
+        Op::Brif(_, t, _, e, _) | Op::TryCall { normal: t, handler: e, .. } => match idx {
+            0 => Some(*t),
+            1 => Some(*e),
+            _ => None,
+        },
+        Op::BrTable(_, def, targets) => if idx == 0 { Some(*def) } else { targets.get(idx - 1).copied() },
+        _ => None,
+    }
+}
+
+fn has_small_cycle(func: &Function, entry: Block) -> bool {
+    let n = func.blocks.len();
+    if entry.index() >= n {
+        return false;
+    }
+    let mut state = [0_u8; 64];
+    let mut stack = [0_u8; 64];
+    let mut cursor = [0_usize; 64];
+    state[entry.index()] = 1;
+    stack[0] = entry.index() as u8;
+    let mut sp = 1_usize;
+    while sp > 0 {
+        let b = stack[sp - 1] as usize;
+        let idx = cursor[sp - 1];
+        let Some(target) = func.last(Block(b as u32)).and_then(|op| nth_target(op, idx)) else {
+            state[b] = 2;
+            sp -= 1;
+            continue;
+        };
+        cursor[sp - 1] = idx + 1;
+        let t = target.index();
+        if t < n {
+            if state[t] == 1 {
+                return true;
+            }
+            if state[t] == 0 {
+                state[t] = 1;
+                stack[sp] = t as u8;
+                cursor[sp] = 0;
+                sp += 1;
+            }
+        }
+    }
+    false
+}
+
+fn detect_loops(func: &Function) -> bool {
+    let Some(entry) = func.entry else { return false };
+    if func.blocks.len() <= 1 {
+        return func.successors(entry).any(|t| t == entry);
+    }
+    if func.blocks.len() <= 64 && !has_small_cycle(func, entry) {
+        return false;
+    }
+    !func.cfg().loops().list.is_empty()
+}
+
+fn check_cfg_pass(func: &Function, pass: Pass, state: &mut PassState) -> bool {
+    if matches!(pass, Pass::Thread | Pass::IfConv) {
+        return func.blocks.len() > 1;
+    }
+    if matches!(pass, Pass::Rotate | Pass::Unroll | Pass::Licm | Pass::Lsr) {
+        return state.has_loops(func);
+    }
+    pass != Pass::TailRec || !func.self_slots.is_empty()
+}
+
+fn should_run(func: &Function, pass: Pass, state: &mut PassState) -> bool {
+    let entry = func.entry.is_some();
+    let multi = func.blocks.len() > 1;
+    match pass {
+        Pass::Fill => state.can_fill,
+        Pass::Promote => entry && !func.slots.is_empty(),
+        Pass::Fold => entry && !state.fold_clean,
+        Pass::Merge => multi && !state.merge_clean,
+        Pass::Returns => func.coroutine.is_none() && multi,
+        Pass::Switch => func.coroutine.is_none() && has_live_op(func, |op| matches!(op, Op::Select(..) | Op::Brif(..) | Op::BrTable(..))),
+        _ => entry && func.coroutine.is_none() && check_cfg_pass(func, pass, state),
+    }
+}
+
+fn mark_dirty(rules: &[Rule], dirty: &mut [Domain; Pass::COUNT], source: Pass, changed: Domain) {
+    for other in rules {
+        if other.pass != source {
+            dirty[other.pass as usize] |= changed;
+        }
+    }
+    if source == Pass::Promote {
+        dirty[source as usize] |= changed;
+    }
+}
+
+fn run_step(func: &mut Function, plan: &Plan, state: &mut PassState, pass: Pass) -> Domain {
+    if !should_run(func, pass, state) {
+        return Domain::NONE;
+    }
+    let changed = run_pass(func, pass, plan.moves, plan.effort, plan.target);
+    state.after_pass(func, pass, changed);
+    changed
+}
+
+fn run_fixpoint(func: &mut Function, plan: &Plan, state: &mut PassState) {
     let mut dirty = [Domain::NONE; Pass::ALL.len()];
     for rule in plan.rules {
         dirty[rule.pass as usize] = rule.reads;
@@ -159,16 +310,9 @@ fn run_fixpoint(func: &mut Function, plan: &Plan) {
             dirty[idx] = Domain::NONE;
             remaining -= 1;
             ran = true;
-            let changed = run_pass(func, rule.pass, plan.moves, plan.effort, plan.target);
+            let changed = run_step(func, plan, state, rule.pass);
             if !changed.is_empty() {
-                for other in plan.rules {
-                    if other.pass != rule.pass {
-                        dirty[other.pass as usize] |= changed;
-                    }
-                }
-                if rule.pass == Pass::Promote {
-                    dirty[idx] |= changed;
-                }
+                mark_dirty(plan.rules, &mut dirty, rule.pass, changed);
             }
         }
         if !ran {
@@ -193,8 +337,28 @@ fn strip_assumes(func: &mut Function) -> bool {
     stripped
 }
 
+fn has_sinkable_compare(func: &Function) -> bool {
+    func.blocks.iter().any(|block| {
+        if block.insts.len() < 3 {
+            return false;
+        }
+        let Some(first_cmp) = block.insts[..block.insts.len() - 2]
+            .iter()
+            .position(|&inst| matches!(func.insts[inst.index()].op, Op::Icmp(..) | Op::Fcmp(..)))
+        else {
+            return false;
+        };
+        block.insts[first_cmp + 2..]
+            .iter()
+            .any(|&inst| matches!(func.insts[inst.index()].op, Op::Brif(..) | Op::Select(..)))
+    })
+}
+
 /// Moves each single-use compare read by a `Brif` or `Select` of its own block to sit directly before that reader.
 pub(crate) fn sink_compares(func: &mut Function) {
+    if !has_sinkable_compare(func) {
+        return;
+    }
     let uses = func.use_counts();
     for block in &mut func.blocks {
         let mut at = 0;
@@ -240,17 +404,22 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
             finish: FULL_FINISH,
         },
     };
-    for &pass in INIT {
-        run_pass(func, pass, plan.moves, plan.effort, plan.target);
-    }
-    run_fixpoint(func, &plan);
+    let mut state = PassState::new(func);
+    run_step(func, &plan, &mut state, INIT[0]);
+    let fold_init = run_step(func, &plan, &mut state, INIT[1]);
+    let merge_init = run_step(func, &plan, &mut state, INIT[2]);
+    state.fold_clean = fold_init.is_empty() && merge_init.is_empty();
+    state.merge_clean = merge_init.is_empty();
+    run_fixpoint(func, &plan, &mut state);
     if moves != promote::Moves::Guided && strip_assumes(func) {
-        run_fixpoint(func, &plan);
+        state.fold_clean = false;
+        state.merge_clean = false;
+        run_fixpoint(func, &plan, &mut state);
     }
     for &pass in plan.finish {
-        run_pass(func, pass, plan.moves, plan.effort, plan.target);
+        run_step(func, &plan, &mut state, pass);
     }
-    if moves != promote::Moves::Guided {
+    if moves != promote::Moves::Guided && has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
         crate::algebra::compare_offsets(func);
     }
     sink_compares(func);
