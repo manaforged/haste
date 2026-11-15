@@ -1,6 +1,6 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
 use super::{A, C, D, Emit, S, T};
-use crate::ir::{AtomicRmwOp, Binary, Op, Type, Unary, Value};
+use crate::ir::{AtomicRmwOp, Binary, Convert, IntCC, Op, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
@@ -200,8 +200,12 @@ impl Emit<'_> {
         }
         if ty == Type::I128 {
             let hi = if from.base == C { super::IP } else { C };
-            self.asm.load(Size::X, false, A, from);
-            self.asm.load(Size::X, false, hi, from.offset(8));
+            if Self::pair_disp_ok(from.disp) {
+                self.asm.ldp_offset(A, hi, from.base, from.disp);
+            } else {
+                self.asm.load(Size::X, false, hi, from.offset(8));
+                self.asm.load(Size::X, false, A, from);
+            }
             self.clobber_regs(&[A, hi]);
             self.put(result, A);
             self.put_high(result, hi);
@@ -223,11 +227,20 @@ impl Emit<'_> {
             return;
         }
         if ty == Type::I128 {
-            let hi = if to.base == C { super::IP } else { C };
-            self.raw(A, value);
-            self.high(hi, value);
-            self.asm.store(Size::X, to, A);
-            self.asm.store(Size::X, to.offset(8), hi);
+            let (lo, hi) = if self.plan.const_of(value) == Some(0) {
+                (ZR, ZR)
+            } else {
+                let hi = if to.base == C { super::IP } else { C };
+                self.raw(A, value);
+                self.high(hi, value);
+                (A, hi)
+            };
+            if Self::pair_disp_ok(to.disp) {
+                self.asm.stp_offset(lo, hi, to.base, to.disp);
+            } else {
+                self.asm.store(Size::X, to, lo);
+                self.asm.store(Size::X, to.offset(8), hi);
+            }
             return;
         }
         let source = self.store_src(value);
@@ -264,16 +277,29 @@ impl Emit<'_> {
         }
     }
 
+    fn elided_icmp_of(&self, condition: Value) -> Option<(IntCC, Value, Value)> {
+        if !self.plan.elided[condition.index()] {
+            return None;
+        }
+        match self.func.insts[self.defs[condition.index()]?.index()].op {
+            Op::Icmp(cc, a, b) => Some((cc, a, b)),
+            Op::Convert(Convert::Uextend, inner) if self.plan.elided[inner.index()] => {
+                match self.func.insts[self.defs[inner.index()]?.index()].op {
+                    Op::Icmp(cc, a, b) => Some((cc, a, b)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn select_cond(&mut self, condition: Value) -> Cond {
         if let Some((val, c)) = self.flags
             && val == condition
         {
             return c;
         }
-        if self.plan.elided[condition.index()]
-            && let Some(inst) = self.defs[condition.index()]
-            && let Op::Icmp(cc, a, b) = self.func.insts[inst.index()].op
-        {
+        if let Some((cc, a, b)) = self.elided_icmp_of(condition) {
             let c = self.compare(cc, a, b);
             self.flags = Some((condition, c));
             return c;
