@@ -1,4 +1,4 @@
-use super::asm::{FP, Mem, Reg, Size, Vreg};
+use super::asm::{Alu, ExtOp, FP, Mem, Reg, Size, Vreg, decode_sib};
 use super::{A, C, Emit, IP, V0};
 use crate::alloc::Location;
 use crate::frame::Ext;
@@ -43,12 +43,14 @@ impl Emit<'_> {
     pub(super) fn invalidate_spills(&mut self) {
         self.last_spill = [None; 4];
         self.last_fspill = None;
+        self.asm.clear_anchor();
     }
 
     pub(super) fn clobber_reg(&mut self, reg: Reg) {
         if reg == super::ZR {
             return;
         }
+        self.asm.clobber_anchor(reg);
         for slot in &mut self.last_spill {
             if slot.is_some_and(|(_, r)| r == reg) {
                 *slot = None;
@@ -146,7 +148,8 @@ impl Emit<'_> {
             SibBase::Frame(slot) => i64::from(self.frame.slots[slot.index()]) + i64::from(mode.disp) + i64::from(offset),
             SibBase::Value(_) => i64::from(mode.disp) + i64::from(offset),
         };
-        if total_disp != 0 || (mode.shift != 0 && (1u32 << mode.shift) != bytes) {
+        let (_, shift) = decode_sib(mode.shift);
+        if total_disp != 0 || (shift != 0 && (1u32 << shift) != bytes) {
             return None;
         }
         let base_reg = match mode.base {
@@ -164,7 +167,12 @@ impl Emit<'_> {
                 SibBase::Value(base) => (self.bits(base, scratch), mode.disp + offset),
             };
             let idx_reg = self.bits(mode.index, IP);
-            self.asm.add_shifted(scratch, base_reg, idx_reg, mode.shift);
+            let (ext, shift) = decode_sib(mode.shift);
+            if ext == ExtOp::Uxtx {
+                self.asm.add_shifted(scratch, base_reg, idx_reg, shift);
+            } else {
+                self.asm.alu_extended(Alu::Add, Size::X, ext, shift, scratch, base_reg, idx_reg);
+            }
             self.clobber_reg(scratch);
             return Mem::new(scratch, disp);
         }
@@ -318,6 +326,9 @@ impl Emit<'_> {
     }
 
     pub(super) fn put(&mut self, value: Value, reg: Reg) {
+        if reg != super::ZR {
+            self.asm.clobber_anchor(reg);
+        }
         match self.plan.location(value) {
             Location::Reg(location) => {
                 if location != reg {

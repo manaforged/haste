@@ -28,7 +28,7 @@ impl Emit<'_> {
             (false, true) => 0xD340_0000,
             (true, true) => 0x9340_0000,
         };
-        self.asm.word(base | u32::from(immr) << 16 | u32::from(imms) << 10 | u32::from(reg.0) << 5 | u32::from(dst.0));
+        self.asm.emit_gp(dst, base | u32::from(immr) << 16 | u32::from(imms) << 10 | u32::from(reg.0) << 5 | u32::from(dst.0));
     }
 
     pub(in crate::arm64) fn emit_tst(&mut self, x: Value, y: Value) {

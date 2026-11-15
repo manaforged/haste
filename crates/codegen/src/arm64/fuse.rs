@@ -71,7 +71,7 @@ fn ext_op_of(dst_ty: Type, src_ty: Type, signed: bool) -> Option<ExtOp> {
     }
 }
 
-fn ext_band_of(
+pub(super) fn ext_band_of(
     func: &Function,
     plan: &Plan<Reg>,
     dst_ty: Type,
@@ -441,21 +441,22 @@ fn fuse_shift_mask(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (&
     }
 }
 
-fn try_fuse_ext_operand(func: &Function, plan: &mut Plan<Reg>, info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, dst_ty): (usize, usize, Type), ext_val: Value) -> bool {
+fn try_fuse_ext_operand(func: &Function, plan: &mut Plan<Reg>, info @ (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, dst_ty): (usize, usize, Type), ext_val: Value) -> bool {
     let Some((epos, einst)) = local_single(plan, info, b_idx, pos, ext_val) else { return false };
     let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
-    let (mid, spos, ext_pos, inner) = match func.insts[einst.index()].op {
-        ref op if ext_from_op(func, plan, dst_ty, op, &def).is_some() => {
-            let Some((_, inner)) = ext_from_op(func, plan, dst_ty, op, &def) else { return false };
-            (None, None, epos, inner)
+    let (mid, spos, ext_pos, inner) = if let Some((_, inner)) = ext_from_op(func, plan, dst_ty, &func.insts[einst.index()].op, &def) {
+        (None, None, epos, inner)
+    } else {
+        let Some((Binary::Ishl, mid, imm)) = shift_parts(&func.insts[einst.index()].op, plan) else { return false };
+        if ((imm as u32) & (dst_ty.bits() - 1)) > 4 || uses[mid.index()] != 1 {
+            return false;
         }
-        ref op => {
-            let Some((Binary::Ishl, mid, imm)) = shift_parts(op, plan) else { return false };
-            if ((imm as u32) & (dst_ty.bits() - 1)) > 4 { return false; }
-            let Some((upos, uinst)) = local_single(plan, info, b_idx, epos, mid) else { return false };
-            let Some((_, inner)) = ext_from_op(func, plan, dst_ty, &func.insts[uinst.index()].op, &def) else { return false };
-            (Some(mid), Some(epos), upos, inner)
+        let Some((mb, upos, uinst)) = pos_of[mid.index()] else { return false };
+        if mb != b_idx || upos >= epos {
+            return false;
         }
+        let Some((_, inner)) = ext_from_op(func, plan, dst_ty, &func.insts[uinst.index()].op, &def) else { return false };
+        (Some(mid), Some(epos), upos, inner)
     };
     if !preserved(func, plan, b_idx, ext_pos, pos, spos, inner) {
         return false;

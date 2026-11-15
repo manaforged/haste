@@ -66,7 +66,7 @@ impl Emit<'_> {
     pub(super) fn umov_gpr(&mut self, size: u32, idx: u8, dst: Reg, src: Vreg) {
         let imm5 = (u32::from(idx) << (size + 1)) | (1 << size);
         let base = if size == 3 { 0x4E00_3C00 } else { 0x0E00_3C00 };
-        self.asm.word(base | (imm5 << 16) | u32::from(src.0) << 5 | u32::from(dst.0));
+        self.asm.emit_gp(dst, base | (imm5 << 16) | u32::from(src.0) << 5 | u32::from(dst.0));
     }
 
     pub(super) fn dup_scalar_elem(&mut self, size: u32, idx: u8, dst: Vreg, src: Vreg) {

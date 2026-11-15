@@ -32,7 +32,7 @@ impl Lower<'_, '_> {
                 if self.is_bitwise_int(element) {
                     let total = (count as u64).saturating_mul(self.cx.layout(element)?.size.bytes());
                     if total <= 16 {
-                        return Ok(self.equal_bytes_const((x, y), total));
+                        return self.equal_bytes_const((x, y), total);
                     }
                 }
                 let count = self.ins().iconst(Type::I64, count);
@@ -102,6 +102,16 @@ impl Lower<'_, '_> {
         Ok(all)
     }
 
+    fn load_wide_pair(&mut self, ptr: Value) -> (Value, Value, Option<u64>) {
+        let static_len = self.b.wide_const_len(ptr);
+        let data = self.ins().load(Type::I64, ptr, 0);
+        let len = match static_len.and_then(|n| i64::try_from(n).ok()) {
+            Some(n) => self.ins().iconst(Type::I64, n),
+            None => self.ins().load(Type::I64, ptr, 8),
+        };
+        (data, len, static_len)
+    }
+
     fn equal_pointee(&mut self, inner: Ty, x: Value, y: Value) -> Result<Value> {
         let element = match self.cx.types.kind(inner).clone() {
             Kind::Prim(Primitive::Str) => self.cx.types.intern(Kind::Prim(Primitive::U8)),
@@ -115,15 +125,20 @@ impl Lower<'_, '_> {
                 return self.equal(inner, left, right);
             }
         };
-        let (data_x, len_x) = (self.ins().load(Type::I64, x, 0), self.ins().load(Type::I64, x, 8));
-        let (data_y, len_y) = (self.ins().load(Type::I64, y, 0), self.ins().load(Type::I64, y, 8));
+        let (data_x, len_x, static_x) = self.load_wide_pair(x);
+        let (data_y, len_y, static_y) = self.load_wide_pair(y);
+        let elem_bytes = self.is_bitwise_int(element).then(|| self.cx.layout(element).map(|l| l.size.bytes())).transpose()?;
+        let static_bytes = static_y.or(static_x).zip(elem_bytes).and_then(|(c, b)| c.checked_mul(b)).filter(|&bytes| bytes <= 16);
         let same_len = self.ins().icmp(IntCC::Equal, len_x, len_y);
         let (check, done) = (self.b.create_block(), self.b.create_block());
         let res = self.b.append_block_param(done, Type::I8);
         let zero = self.ins().iconst(Type::I8, 0);
         self.brif(same_len, (check, &[]), (done, &[zero]));
         self.enter(check);
-        let items = self.equal_items(element, (data_x, data_y), len_y)?;
+        let items = match static_bytes {
+            Some(bytes) => self.equal_bytes_const((data_x, data_y), bytes)?,
+            None => self.equal_items(element, (data_x, data_y), len_y)?,
+        };
         self.jump(done, &[items]);
         self.enter(done);
         Ok(res)
@@ -159,15 +174,8 @@ impl Lower<'_, '_> {
         self.ins().icmp(IntCC::Equal, any, zero)
     }
 
-    fn equal_tail_pair(&mut self, ty: Type, bytes: i64, (x, y): (Value, Value), (off, len): (Value, Value)) -> Value {
-        let (px, py) = (self.ins().iadd(x, off), self.ins().iadd(y, off));
-        let end_off = self.ins().iadd_imm(len, -bytes);
-        let (ex, ey) = (self.ins().iadd(x, end_off), self.ins().iadd(y, end_off));
-        self.equal_pair_xor(ty, (px, py), 0, (ex, ey), 0)
-    }
-
-    pub(super) fn equal_bytes_const(&mut self, (x, y): (Value, Value), len: u64) -> Value {
-        match len {
+    pub(super) fn equal_bytes_const(&mut self, (x, y): (Value, Value), len: u64) -> Result<Value> {
+        let eq = match len {
             0 => self.ins().iconst(Type::I8, 1),
             1 => self.equal_load(Type::I8, (x, y), 0),
             2 => self.equal_load(Type::I16, (x, y), 0),
@@ -178,73 +186,28 @@ impl Lower<'_, '_> {
             9..=16 => self.equal_pair_xor(Type::I64, (x, y), 0, (x, y), (len - 8) as i32),
             _ => {
                 let count = self.ins().iconst(Type::I64, len as i64);
-                self.equal_bytes_runtime((x, y), count)
+                let order = self.compare_bytes((x, y), count)?;
+                self.ins().icmp_imm(IntCC::Equal, order, 0)
             }
-        }
+        };
+        Ok(eq)
     }
 
-    fn equal_bytes_runtime(&mut self, (x, y): (Value, Value), len: Value) -> Value {
-        let (head, body, tail) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
-        let (ge4, lt4, ge2, lt2, one_byte, done) = (
-            self.b.create_block(),
-            self.b.create_block(),
-            self.b.create_block(),
-            self.b.create_block(),
-            self.b.create_block(),
-            self.b.create_block(),
-        );
-        let off = self.b.append_block_param(head, Type::I64);
-        let res = self.b.append_block_param(done, Type::I8);
-        let zero64 = self.ins().iconst(Type::I64, 0);
-        let zero8 = self.ins().iconst(Type::I8, 0);
-        let one8 = self.ins().iconst(Type::I8, 1);
-        self.jump(head, &[zero64]);
-
-        self.enter(head);
-        let rem = self.ins().isub(len, off);
-        let has8 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, rem, 8);
-        self.brif(has8, (body, &[]), (tail, &[]));
-
-        self.enter(body);
-        let (px, py) = (self.ins().iadd(x, off), self.ins().iadd(y, off));
-        let eq8 = self.equal_load(Type::I64, (px, py), 0);
-        let next = self.ins().iadd_imm(off, 8);
-        self.brif(eq8, (head, &[next]), (done, &[zero8]));
-
-        self.enter(tail);
-        let has4 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, rem, 4);
-        self.brif(has4, (ge4, &[]), (lt4, &[]));
-
-        self.enter(ge4);
-        let eq4 = self.equal_tail_pair(Type::I32, 4, (x, y), (off, len));
-        self.jump(done, &[eq4]);
-
-        self.enter(lt4);
-        let has2 = self.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, rem, 2);
-        self.brif(has2, (ge2, &[]), (lt2, &[]));
-
-        self.enter(ge2);
-        let eq2 = self.equal_tail_pair(Type::I16, 2, (x, y), (off, len));
-        self.jump(done, &[eq2]);
-
-        self.enter(lt2);
-        let is_zero = self.ins().icmp_imm(IntCC::Equal, rem, 0);
-        self.brif(is_zero, (done, &[one8]), (one_byte, &[]));
-
-        self.enter(one_byte);
-        let (px, py) = (self.ins().iadd(x, off), self.ins().iadd(y, off));
-        let eq1 = self.equal_load(Type::I8, (px, py), 0);
-        self.jump(done, &[eq1]);
-
-        self.enter(done);
-        res
+    fn equal_bytes_runtime(&mut self, (x, y): (Value, Value), len: Value) -> Result<Value> {
+        if let Some(n) = self.b.const_int(len)
+            && (0..=16).contains(&n)
+        {
+            return self.equal_bytes_const((x, y), n as u64);
+        }
+        let order = self.compare_bytes((x, y), len)?;
+        Ok(self.ins().icmp_imm(IntCC::Equal, order, 0))
     }
 
     fn equal_items(&mut self, element: Ty, (x, y): (Value, Value), count: Value) -> Result<Value> {
         if self.is_bitwise_int(element) {
             let elem_size = self.cx.layout(element)?.size.bytes() as i64;
             let bytes = if elem_size == 1 { count } else { self.ins().imul_imm(count, elem_size) };
-            return Ok(self.equal_bytes_runtime((x, y), bytes));
+            return self.equal_bytes_runtime((x, y), bytes);
         }
         let size = self.cx.layout(element)?.size.bytes() as i64;
         let part = repr(self.cx, element)?;

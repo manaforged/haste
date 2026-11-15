@@ -27,11 +27,10 @@ impl Asm {
     /// Converts between the integer register and the float register of a conversion, 64-bit integers when `wide`.
     pub fn fconv(&mut self, op: Fconv, double: bool, wide: bool, int: Reg, float: Vreg) {
         let base = Self::precision(op as u32, double) | u32::from(wide) << 31;
-        let (dst, src) = match op {
-            Fconv::Scvtf | Fconv::Ucvtf => (u32::from(float.0), u32::from(int.0)),
-            Fconv::Fcvtzs | Fconv::Fcvtzu => (u32::from(int.0), u32::from(float.0)),
-        };
-        self.word(base | src << 5 | dst);
+        match op {
+            Fconv::Scvtf | Fconv::Ucvtf => self.word(base | u32::from(int.0) << 5 | u32::from(float.0)),
+            Fconv::Fcvtzs | Fconv::Fcvtzu => self.emit_gp(int, base | u32::from(float.0) << 5 | u32::from(int.0)),
+        }
     }
 
     pub fn fmov_reg(&mut self, _double: bool, dst: Vreg, src: Vreg) {
@@ -49,7 +48,7 @@ impl Asm {
 
     pub fn fmov_out(&mut self, double: bool, dst: Reg, src: Vreg) {
         let base = Self::precision(0x1E26_0000, double) | u32::from(double) << 31;
-        self.word(base | u32::from(src.0) << 5 | u32::from(dst.0));
+        self.emit_gp(dst, base | u32::from(src.0) << 5 | u32::from(dst.0));
     }
 
     pub fn fmov_to_float(&mut self, dst: Vreg, src: Reg) {
@@ -83,6 +82,6 @@ impl Asm {
     }
 
     pub fn umov_d1(&mut self, dst: Reg, src: Vreg) {
-        self.word(0x4E18_3C00 | u32::from(src.0) << 5 | u32::from(dst.0));
+        self.emit_gp(dst, 0x4E18_3C00 | u32::from(src.0) << 5 | u32::from(dst.0));
     }
 }

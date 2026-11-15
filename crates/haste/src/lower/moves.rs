@@ -89,8 +89,16 @@ impl Lower<'_, '_> {
             return self.may_alias_place(inner);
         }
         match *self.body.expr(expr) {
-            Expr::Block { label: Some(_), .. } | Expr::If(..) | Expr::Match(..) | Expr::Loop { .. } => true,
+            Expr::Block { label: Some(_), .. } | Expr::Loop { .. } => true,
             Expr::Block { tail: Some(tail), .. } => self.may_alias_place(tail),
+            Expr::If(_, then, otherwise) => self.may_alias_place(then) || otherwise.is_some_and(|alt| self.may_alias_place(alt)),
+            Expr::Match(_, arms) => self.body.list(arms).iter().any(|&at| self.may_alias_place(self.body.arms[at as usize].body)),
+            Expr::Field(base, _) | Expr::TupleField(base, _) => {
+                self.typed.exprs[base.0 as usize] == Ty::NONE
+                    || matches!(self.cx.types.kind(self.ty_of(base)), Kind::Ref(..) | Kind::Ptr(..))
+                    || self.cx.boxed(self.ty_of(base)).is_some()
+                    || self.may_alias_place(base)
+            }
             _ => self.is_place(expr),
         }
     }

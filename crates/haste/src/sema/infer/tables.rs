@@ -209,13 +209,28 @@ impl std::ops::DerefMut for Typed {
     }
 }
 
+fn non_vtable_coercion_calls(coercion: &Coercion) -> Box<dyn Iterator<Item = &Res> + '_> {
+    match coercion {
+        Coercion::Reify(res) => Box::new(std::iter::once(res)),
+        Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
+        Coercion::Vtable(_) | Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => Box::new(std::iter::empty()),
+    }
+}
+
 fn coercion_calls(coercion: &Coercion) -> Box<dyn Iterator<Item = &Res> + '_> {
     match coercion {
         Coercion::Vtable(vtable) => Box::new(vtable.calls().into_iter()),
-        Coercion::Reify(res) => Box::new(std::iter::once(res)),
-        Coercion::Len(_) | Coercion::Autos | Coercion::Upcast(_) => Box::new(std::iter::empty()),
-        Coercion::Deref(steps, _) => Box::new(steps.iter().filter_map(|(_, res)| res.as_ref())),
+        other => non_vtable_coercion_calls(other),
     }
+}
+
+fn body_calls(t: &BodyTables, include_vtable: bool) -> impl Iterator<Item = (ItemRef, Substs)> + '_ {
+    let loops = t.fors.values().flat_map(|each| [&each.into_iter, &each.next]);
+    let tries = t.tries.values().flat_map(|each| [&each.branch, &each.from_residual]);
+    let awaits = t.awaits.values().flat_map(|each| [&each.into_future, &each.poll]);
+    let coerced = t.coercions.values().flat_map(if include_vtable { coercion_calls } else { non_vtable_coercion_calls });
+    let direct = t.res.values().chain(t.pat_res.values()).chain(t.derefs.values()).chain(t.operators.values()).chain(t.try_blocks.values()).chain(t.box_frees.values());
+    direct.chain(loops).chain(tries).chain(awaits).chain(coerced).filter_map(res_fn)
 }
 
 fn shape_calls(shape: &Shape) -> Box<dyn Iterator<Item = &Res> + '_> {
@@ -247,6 +262,17 @@ impl Typed {
             LazyTables::Poly(poly) => poly.ensure_tables(types),
             LazyTables::CheckOnly(_) => panic!("check-only Typed cannot materialize BodyTables"),
         }
+    }
+
+    /// Returns the raw coercions and expression types, borrowing template tables when no coercions need instantiation.
+    pub fn raw_coercions_and_exprs(&self, types: &Types) -> (&PackedMap<ExprId, Coercion>, &[Ty]) {
+        let tables = match &self.tables {
+            LazyTables::Eager(tables) => tables,
+            LazyTables::Poly(poly) if !poly.summary.template.coercions.is_empty() => poly.ensure_tables(types),
+            LazyTables::Poly(poly) => &poly.summary.template,
+            LazyTables::CheckOnly(check) => &check.summary.template,
+        };
+        (&tables.coercions, &tables.exprs)
     }
 
     fn with_tables(&self, tables: Arc<BodyTables>) -> Self {
@@ -388,16 +414,24 @@ impl Typed {
         let drops = self.drops.iter().filter_map(res_fn);
         let shaped = shape_calls(&self.shape).filter_map(res_fn);
         match &self.tables {
-            LazyTables::Eager(t) => {
-                let loops = t.fors.values().flat_map(|each| [&each.into_iter, &each.next]);
-                let tries = t.tries.values().flat_map(|each| [&each.branch, &each.from_residual]);
-                let awaits = t.awaits.values().flat_map(|each| [&each.into_future, &each.poll]);
-                let coerced = t.coercions.values().flat_map(coercion_calls);
-                let direct = t.res.values().chain(t.pat_res.values()).chain(t.derefs.values()).chain(t.operators.values()).chain(t.try_blocks.values()).chain(t.box_frees.values());
-                Box::new(direct.chain(loops).chain(tries).chain(awaits).chain(coerced).filter_map(res_fn).chain(drops).chain(shaped))
-            }
+            LazyTables::Eager(t) => Box::new(body_calls(t, true).chain(drops).chain(shaped)),
             LazyTables::Poly(poly) => Box::new(poly.calls().chain(drops).chain(shaped)),
             LazyTables::CheckOnly(check) => Box::new(check.calls().chain(drops).chain(shaped)),
+        }
+    }
+
+    /// Visits all semantic callees of this body excluding `Coercion::Vtable` method and super edges.
+    pub fn non_vtable_callees(&self, types: &Types, mut on_callee: impl FnMut(ItemRef, Substs)) {
+        for (item, substs) in self.drops.iter().chain(shape_calls(&self.shape)).filter_map(res_fn) {
+            on_callee(item, substs);
+        }
+        match &self.tables {
+            LazyTables::Eager(t) => body_calls(t, false).for_each(|(i, s)| on_callee(i, s)),
+            LazyTables::Poly(poly) if poly.summary.template.coercions.values().any(|c| matches!(c, Coercion::Vtable(_))) => {
+                body_calls(poly.ensure_tables(types), false).for_each(|(i, s)| on_callee(i, s));
+            }
+            LazyTables::Poly(poly) => poly.calls().for_each(|(i, s)| on_callee(i, s)),
+            LazyTables::CheckOnly(check) => check.calls().for_each(|(i, s)| on_callee(i, s)),
         }
     }
 }
