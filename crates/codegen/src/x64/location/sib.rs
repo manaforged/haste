@@ -130,6 +130,15 @@ fn odd_group_ok(ctx: &FuseCtx<'_>, items: &[(Value, usize, Sib)], shift: u8, tot
     profitable && items.iter().all(|&(_, _, m)| !matches!(m.base, SibBase::Value(b) if ctx.plan.elided[b.index()] || ctx.plan.reg_of(b).is_none()))
 }
 
+fn group_disp_fits(items: &[(Value, usize, Sib)], ls_uses: &[Vec<(usize, usize, i32)>], disp_delta: i64) -> bool {
+    disp_delta == 0
+        || items.iter().all(|&(v, _, m)| {
+            let next = i64::from(m.disp) + disp_delta;
+            (-FOLD_LIMIT..=FOLD_LIMIT).contains(&next)
+                && ls_uses[v.index()].iter().all(|&(_, _, off)| (-FOLD_LIMIT..=FOLD_LIMIT).contains(&(next + i64::from(off))))
+        })
+}
+
 fn eval_sib_group(ctx: &FuseCtx<'_>, core: Value, items: &[(Value, usize, Sib)], ls_uses: &[Vec<(usize, usize, i32)>]) -> Option<SibUpgrade> {
     let (sb, spos, sinst) = ctx.pos_of[core.index()]?;
     if sb != ctx.b_idx || ctx.func.ty(core) != Type::I64 {
@@ -141,13 +150,36 @@ fn eval_sib_group(ctx: &FuseCtx<'_>, core: Value, items: &[(Value, usize, Sib)],
         return None;
     }
     let mut elide_pos = vec![(core, spos)];
-    let (idx, idx_start) = ctx.unwrap_uext(raw_idx, spos, total_mem > 1 || odd.is_some(), &mut elide_pos);
-    if !ctx.index_ok(idx) || !preserved(ctx.func, ctx.plan, ctx.b_idx, idx_start, max_end, &[spos, idx_start], idx) {
+    let (idx, disp_delta, idx_start) = if odd.is_some() {
+        let (idx, idx_start) = ctx.unwrap_uext(raw_idx, spos, true, &mut elide_pos);
+        (idx, 0_i64, idx_start)
+    } else {
+        let (idx, delta, idx_start) = ctx.unwrap_uext_const(raw_idx, spos, (shift, 0), total_mem > 1, &mut elide_pos);
+        if group_disp_fits(items, ls_uses, delta) {
+            (idx, delta, idx_start)
+        } else {
+            elide_pos.truncate(1);
+            let (idx, idx_start) = ctx.unwrap_uext(raw_idx, spos, total_mem > 1, &mut elide_pos);
+            (idx, 0_i64, idx_start)
+        }
+    };
+    let skip: Vec<usize> = elide_pos.iter().map(|&(_, p)| p).collect();
+    if !ctx.index_ok(idx) || !preserved(ctx.func, ctx.plan, ctx.b_idx, idx_start, max_end, &skip, idx) {
         return None;
     }
     let index = if odd.is_some() { core } else { idx };
-    let targets = items.iter().map(|&(v, _, m)| (v, Sib { index, shift, ..m })).collect();
+    let targets = items.iter().map(|&(v, _, m)| (v, Sib { index, shift, disp: (i64::from(m.disp) + disp_delta) as i32, ..m })).collect();
     Some(SibUpgrade { elide: elide_pos.into_iter().map(|(v, _)| v).collect(), targets })
+}
+
+fn uext_group_inner(ctx: &FuseCtx<'_>, sinst: Inst) -> Option<Value> {
+    let inner = match ctx.func.insts[sinst.index()].op {
+        Op::Convert(Convert::Uextend, inner) => inner,
+        Op::Convert(Convert::Sextend, inner) if ctx.nonneg_small(inner) => inner,
+        _ => return None,
+    };
+    let ty = ctx.func.ty(inner);
+    (ty.is_small_int() && ty.bytes() <= 4 && !ctx.plan.elided[inner.index()]).then_some(inner)
 }
 
 fn eval_uext_group(ctx: &FuseCtx<'_>, core: Value, items: &[(Value, usize, Sib)], ls_uses: &[Vec<(usize, usize, i32)>]) -> Option<SibUpgrade> {
@@ -155,21 +187,27 @@ fn eval_uext_group(ctx: &FuseCtx<'_>, core: Value, items: &[(Value, usize, Sib)]
     if sb != ctx.b_idx || ctx.func.ty(core) != Type::I64 {
         return None;
     }
-    let Op::Convert(Convert::Uextend, inner) = ctx.func.insts[sinst.index()].op else { return None };
-    if !ctx.func.ty(inner).is_small_int()
-        || ctx.func.ty(inner).bytes() > 4
-        || ctx.plan.elided[inner.index()]
-        || !ctx.plan.zero_ext[inner.index()]
-        || ctx.plan.reg_of(inner).is_none()
-    {
-        return None;
-    }
+    let inner = uext_group_inner(ctx, sinst)?;
     let (_, max_end) = group_mem_span(ctx, core, items, ls_uses)?;
-    if !preserved(ctx.func, ctx.plan, ctx.b_idx, spos, max_end, &[spos], inner) {
+    let mut elide_pos = vec![(core, spos)];
+    let (idx, disp_delta, idx_start) = match ctx.peel_small_chain(inner, spos, (0, 0), true, &mut elide_pos) {
+        Some((idx, delta, idx_start)) if ctx.plan.zero_ext[idx.index()] && ctx.plan.reg_of(idx).is_some() && group_disp_fits(items, ls_uses, delta) => {
+            (idx, delta, idx_start)
+        }
+        _ => {
+            elide_pos.truncate(1);
+            if !ctx.plan.zero_ext[inner.index()] || ctx.plan.reg_of(inner).is_none() {
+                return None;
+            }
+            (inner, 0, spos)
+        }
+    };
+    let skip: Vec<usize> = elide_pos.iter().map(|&(_, p)| p).collect();
+    if !preserved(ctx.func, ctx.plan, ctx.b_idx, idx_start, max_end, &skip, idx) {
         return None;
     }
-    let targets = items.iter().map(|&(v, _, m)| (v, Sib { index: inner, ..m })).collect();
-    Some(SibUpgrade { elide: vec![core], targets })
+    let targets = items.iter().map(|&(v, _, m)| (v, Sib { index: idx, disp: (i64::from(m.disp) + disp_delta) as i32, ..m })).collect();
+    Some(SibUpgrade { elide: elide_pos.into_iter().map(|(v, _)| v).collect(), targets })
 }
 
 pub(super) fn apply_sib_groups(

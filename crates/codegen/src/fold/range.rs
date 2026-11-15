@@ -1,5 +1,5 @@
-use super::{defs, extend};
-use crate::ir::{Binary, Function, Inst, IntCC, Op, Type, Value};
+use super::{defs, extend, known_bits};
+use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
 struct RangeState {
     defs: Vec<Option<Inst>>,
@@ -234,9 +234,140 @@ fn fuse_cmp_pair(is_and: bool, ty: Type, p1: (IntCC, i64), p2: (IntCC, i64)) -> 
     None
 }
 
-fn has_candidate_pair(func: &Function) -> bool {
+fn signed_max(ty: Type) -> u64 {
+    (1_u64 << (ty.bits() - 1)) - 1
+}
+
+fn shift_count(state: &RangeState, ty: Type, sh: Value) -> Option<u32> {
+    const_val(state, sh).map(|c| (c as u32) & (ty.bits() - 1))
+}
+
+fn pos_const(state: &RangeState, v: Value) -> Option<u64> {
+    const_val(state, v).map(|d| d as u64).filter(|&d| d > 0)
+}
+
+fn smax_u_bounds(sm: u64, w: u64, (l1, h1): (u64, u64), (l2, h2): (u64, u64)) -> (u64, u64) {
+    match (h1 <= sm, h2 <= sm) {
+        (true, true) => (l1.max(l2), h1.max(h2)),
+        (true, false) => (l1, sm),
+        (false, true) => (l2, sm),
+        (false, false) => (0, w),
+    }
+}
+
+fn shift_div_u_bounds(func: &Function, state: &RangeState, ty: Type, bin: Binary, (a, b): (Value, Value), depth: u8) -> (u64, u64) {
+    let w = ty.unsigned_max();
+    let (l1, h1) = u_bounds(func, state, a, depth + 1);
+    match bin {
+        Binary::Ushr => shift_count(state, ty, b).map_or((0, h1), |k| (l1 >> k, h1 >> k)),
+        Binary::Sshr => {
+            if h1 <= signed_max(ty) { shift_count(state, ty, b).map_or((0, h1), |k| (l1 >> k, h1 >> k)) } else { (0, w) }
+        }
+        Binary::Ishl => shift_count(state, ty, b)
+            .and_then(|k| h1.checked_shl(k).filter(|&m| m <= w).map(|m| (l1 << k, m)))
+            .map_or((0, w), |r| r),
+        Binary::Urem => (0, h1.min(pos_const(state, b).map_or(w, |d| d - 1))),
+        Binary::Udiv => pos_const(state, b).map_or((0, h1), |d| (l1 / d, h1 / d)),
+        Binary::Srem if h1 <= signed_max(ty) => {
+            let rem = const_val(state, b).map(|c| extend(c, ty, true).unsigned_abs()).filter(|&d| d > 0).map_or(w, |d| d - 1);
+            (0, h1.min(rem))
+        }
+        Binary::Sdiv if h1 <= signed_max(ty) => {
+            let (l2, h2) = u_bounds(func, state, b, depth + 1);
+            if h2 <= signed_max(ty) && l2 >= 1 { (l1 / h2, h1 / l2) } else { (0, w) }
+        }
+        _ => (0, w),
+    }
+}
+
+fn bin_u_bounds(func: &Function, state: &RangeState, ty: Type, bin: Binary, (a, b): (Value, Value), depth: u8) -> (u64, u64) {
+    if matches!(bin, Binary::Ushr | Binary::Sshr | Binary::Ishl | Binary::Urem | Binary::Udiv | Binary::Srem | Binary::Sdiv) {
+        return shift_div_u_bounds(func, state, ty, bin, (a, b), depth);
+    }
+    let w = ty.unsigned_max();
+    let ((l1, h1), (l2, h2)) = (u_bounds(func, state, a, depth + 1), u_bounds(func, state, b, depth + 1));
+    let sm = signed_max(ty);
+    match bin {
+        Binary::Iadd => h1.checked_add(h2).filter(|&h| h <= w).map_or((0, w), |h| (l1 + l2, h)),
+        Binary::Isub if l1 >= h2 => (l1 - h2, h1 - l2),
+        Binary::Imul => h1.checked_mul(h2).filter(|&h| h <= w).map_or((0, w), |h| (l1 * l2, h)),
+        Binary::Band => (0, h1.min(h2)),
+        Binary::Umin => (l1.min(l2), h1.min(h2)),
+        Binary::Umax => (l1.max(l2), h1.max(h2)),
+        Binary::Smin if h1 <= sm && h2 <= sm => (l1.min(l2), h1.min(h2)),
+        Binary::Smax => smax_u_bounds(sm, w, (l1, h1), (l2, h2)),
+        _ => (0, w),
+    }
+}
+
+fn op_u_bounds(func: &Function, state: &RangeState, v: Value, depth: u8) -> (u64, u64) {
+    let ty = func.ty(v);
+    let w = ty.unsigned_max();
+    let Some(inst) = def_inst(state, v) else { return (0, w) };
+    let sub = |u: Value| u_bounds(func, state, u, depth + 1);
+    match func.insts[inst.index()].op {
+        Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => (0, u64::from(ty.bits())),
+        Op::Select(_, a, b) => {
+            let ((l1, h1), (l2, h2)) = (sub(a), sub(b));
+            (l1.min(l2), h1.max(h2))
+        }
+        Op::Convert(Convert::Uextend, a) if func.ty(a).is_small_int() => {
+            let (l, h) = sub(a);
+            let aw = func.ty(a).unsigned_max();
+            (l.min(aw), h.min(aw))
+        }
+        Op::Convert(Convert::Sextend, a) if func.ty(a).is_small_int() => {
+            let (l, h) = sub(a);
+            if h <= signed_max(func.ty(a)) { (l, h) } else { (0, w) }
+        }
+        Op::Convert(Convert::Ireduce, a) if func.ty(a).is_small_int() => {
+            let (l, h) = sub(a);
+            if h <= w { (l, h) } else { (0, w) }
+        }
+        Op::Binary(bin, a, b) => bin_u_bounds(func, state, ty, bin, (a, b), depth),
+        _ => (0, w),
+    }
+}
+
+fn u_bounds(func: &Function, state: &RangeState, v: Value, depth: u8) -> (u64, u64) {
+    let ty = func.ty(v);
+    let w = ty.unsigned_max();
+    if !ty.is_small_int() {
+        return (0, w);
+    }
+    let (z, o) = known_bits(func, &|u| def_inst(state, u), &|u| const_val(state, u), v, depth);
+    let (bmin, bmax) = (o & w, !z & w);
+    if depth >= 6 || bmin == bmax {
+        return (bmin, bmax);
+    }
+    let (omin, omax) = op_u_bounds(func, state, v, depth);
+    (bmin.max(omin), bmax.min(omax))
+}
+
+fn try_fold_sext_to_uext(func: &mut Function, inst: Inst, state: &RangeState) -> bool {
+    let Op::Convert(Convert::Sextend, inner) = func.insts[inst.index()].op else {
+        return false;
+    };
+    let in_ty = func.ty(inner);
+    if !in_ty.is_small_int() || in_ty == Type::I64 {
+        return false;
+    }
+    if u_bounds(func, state, inner, 0).1 > signed_max(in_ty) {
+        return false;
+    }
+    func.insts[inst.index()].op = Op::Convert(Convert::Uextend, inner);
+    true
+}
+
+fn has_candidate(func: &Function) -> bool {
     let mut is_cmp = vec![false; func.types.len()];
     for data in func.blocks.iter().flat_map(|b| &b.insts).map(|i| &func.insts[i.index()]) {
+        if let Op::Convert(Convert::Sextend, inner) = data.op
+            && func.ty(inner).is_small_int()
+            && func.ty(inner) != Type::I64
+        {
+            return true;
+        }
         if let (&Op::Icmp(_, l, _), Some(res)) = (&data.op, data.result) && func.ty(l).is_small_int() {
             is_cmp[res.index()] = true;
         }
@@ -280,9 +411,9 @@ fn try_fold_cmp_pair(func: &mut Function, inst: Inst, state: &mut RangeState, ne
     true
 }
 
-/// Fuses each `and` or `or` of two single-use compares of one value against constants or masks into one compare.
+/// Fuses each `and` or `or` of two single-use compares of one value against constants or masks into one compare, and narrows provably non-negative `Sextend` to `Uextend`.
 pub(super) fn fold_range_checks(func: &mut Function) -> bool {
-    if !has_candidate_pair(func) {
+    if !has_candidate(func) {
         return false;
     }
     let mut consts = vec![None; func.types.len()];
@@ -297,7 +428,7 @@ pub(super) fn fold_range_checks(func: &mut Function) -> bool {
         let orig = std::mem::take(&mut func.blocks[b_idx].insts);
         let mut next = Vec::with_capacity(orig.len());
         for inst in orig {
-            if try_fold_cmp_pair(func, inst, &mut state, &mut next) || try_fold_mask_zero(func, inst, &mut state, &mut next) {
+            if try_fold_cmp_pair(func, inst, &mut state, &mut next) || try_fold_mask_zero(func, inst, &mut state, &mut next) || try_fold_sext_to_uext(func, inst, &state) {
                 changed = true;
             }
             next.push(inst);
