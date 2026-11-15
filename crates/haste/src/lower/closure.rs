@@ -3,8 +3,7 @@ use haste_codegen::{Coroutine, Type, Value};
 
 use crate::body::{Expr, ExprId, List};
 use crate::names::ItemRef;
-use crate::sema::infer::{By, Capture, Closure, ClosureBody, Res, Shape, needs_drop};
-use crate::sema::layout::field_offset;
+use crate::sema::infer::{By, Capture, ClosureBody, Res, Shape, needs_drop};
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Mut, Ty};
 
@@ -19,9 +18,6 @@ impl Lower<'_, '_> {
         let Some(env) = self.cx.closure_env(ty) else { bail!("a closure whose captures are not known") };
         let Some(closure) = self.typed.closures.get(&expr).cloned() else { bail!("a closure expression with no inferred closure") };
         let shape = repr(self.cx, env)?;
-        if !closure.coroutine && matches!(shape, Repr::Scalar(_)) && self.single_scalar_env(env, &closure, shape)? {
-            return self.single_scalar_value(&closure.captures);
-        }
         let Some(slot) = self.slot(shape) else {
             return Ok(None);
         };
@@ -37,35 +33,6 @@ impl Lower<'_, '_> {
             }
         }
         Ok(self.read(object))
-    }
-
-    fn single_scalar_value(&mut self, captures: &[Capture]) -> Result<Option<Value>> {
-        let mut single = None;
-        for capture in captures {
-            if let Some(value) = self.capture_value(capture)? {
-                single = Some(value);
-            }
-        }
-        Ok(single)
-    }
-
-    fn single_scalar_env(&mut self, env: Ty, closure: &Closure, shape: Repr) -> Result<bool> {
-        let layout = self.cx.layout(env)?;
-        let mut found = false;
-        for (index, capture) in closure.captures.iter().enumerate() {
-            let cap_repr = match capture.by {
-                By::Value => repr(self.cx, self.typed.locals[capture.local as usize].ty)?,
-                By::Ref | By::Mut => Repr::Scalar(Type::I64),
-            };
-            if matches!(cap_repr, Repr::Zst) {
-                continue;
-            }
-            if found || cap_repr != shape || field_offset(&layout, 0, index as u32) != 0 {
-                return Ok(false);
-            }
-            found = true;
-        }
-        Ok(found)
     }
 
     /// Initializes the state word to `Coroutine::UNRESUMED` and zeroes the frame pointer of the coroutine object at `object`, and gives the place and type of its captures.
@@ -158,12 +125,14 @@ impl Lower<'_, '_> {
             let values = self.args(args, values)?;
             return self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values);
         }
-        let values = self.callee_env(callee)?;
+        let callee_ty = self.ty_of(callee);
+        let by_value = self.cx.closure_consumes(callee_ty);
+        let values = self.callee_env(callee, by_value)?;
         let values = self.args(args, values)?;
         self.invoke(super::reloc::SiteOrigin::Table(crate::sema::infer::SiteKey::ExprRes(expr)), item, substs, values)
     }
 
-    pub(super) fn callee_env(&mut self, callee: ExprId) -> Result<Vec<Value>> {
+    pub(super) fn callee_env(&mut self, callee: ExprId, by_value: bool) -> Result<Vec<Value>> {
         let callee_ty = self.ty_of(callee);
         if !self.cx.closure_takes_env(callee_ty) {
             self.expr(callee)?;
@@ -177,38 +146,38 @@ impl Lower<'_, '_> {
         if self.cx.closure_consumes(callee_ty) && let Some((root, path)) = self.scrutinee_path(callee) {
             self.moved_out(root, &path)?;
         }
-        let env = match (place, self.needs_callee_snapshot(callee, callee_ty, place)?) {
+        let env = match (place, self.needs_callee_snapshot(callee, by_value, place)) {
             (Some(place), true) => self.snapshot_repr(place.repr, env),
             _ => env,
         };
         Ok(vec![env])
     }
 
-    fn needs_callee_snapshot(&mut self, callee: ExprId, callee_ty: Ty, place: Option<Place>) -> Result<bool> {
+    fn needs_callee_snapshot(&self, callee: ExprId, by_value: bool, place: Option<Place>) -> bool {
         let Some(place) = place else {
-            return Ok(false);
+            return false;
         };
-        if !self.cx.closure_consumes(callee_ty) || !matches!(place.repr, Repr::Mem { .. }) || !self.may_alias_place(callee) {
-            return Ok(false);
+        if !by_value || !matches!(place.repr, Repr::Mem { .. }) || !self.may_alias_place(callee) {
+            return false;
         }
-        Ok(!self.unaliased_once_local(callee, callee_ty)?)
+        !self.unaliased_once_local(callee)
     }
 
-    fn unaliased_once_local(&mut self, mut callee: ExprId, callee_ty: Ty) -> Result<bool> {
+    fn unaliased_once_local(&self, mut callee: ExprId) -> bool {
         while let Some(inner) = self.transparent(callee) {
             callee = inner;
         }
         let Some(&Res::Local(local)) = self.typed.res.get(&callee).filter(|_| matches!(*self.body.expr(callee), Expr::Path(_))) else {
-            return Ok(false);
+            return false;
         };
-        if !self.loops.is_empty() && !needs_drop(self.cx, callee_ty)? {
-            return Ok(false);
+        if !self.loops.is_empty() {
+            return false;
         }
         if self.typed.closures.values().any(|closure| closure.captures.iter().any(|cap| cap.local == local)) {
-            return Ok(false);
+            return false;
         }
         let uses = self.typed.res.iter().filter(|(_, res)| matches!(res, Res::Local(id) if *id == local)).count();
-        Ok(uses == 1)
+        uses == 1
     }
 
     /// Lowers the body of `Fn::call` or `FnMut::call_mut` at a closure: the call `res` of the closure's body with the fields of the argument tuple.
@@ -371,17 +340,18 @@ impl Lower<'_, '_> {
             }
             return Ok(());
         }
+        let val = self.eval_operand(tuple_expr)?;
+        if !self.open {
+            return Ok(());
+        }
         let tuple_ty = self.ty_of(tuple_expr);
         let Kind::Tuple(items) = *self.cx.types.kind(tuple_ty) else { bail!("closure arguments that are not a tuple") };
         let count = self.cx.types.substs(items).len() as u32;
-        if let Some(place) = self.place_or_temp(tuple_expr)? {
+        if let Some(place) = self.spill(val, tuple_ty)? {
             for index in 0..count {
                 let part = self.part_place(place, tuple_ty, (0, index))?;
                 values.extend(self.read(part));
             }
-        }
-        if let Some((root, path)) = self.scrutinee_path(tuple_expr) {
-            self.moved_out(root, &path)?;
         }
         Ok(())
     }

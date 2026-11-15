@@ -38,6 +38,7 @@ mod thread;
 pub mod trace;
 mod unroll;
 mod verify;
+mod wide;
 /// Defines an encoder's `value_op`, which emits a value operation through the encoder's method for its kind.
 macro_rules! value_op {
     () => {

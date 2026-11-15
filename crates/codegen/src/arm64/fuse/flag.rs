@@ -1,13 +1,16 @@
 use super::super::asm::Reg;
 use super::super::Location;
 use super::bits::can_elide_tst_band;
-use super::{alu_shift, cmn_parts, cmn_sum_parts, const_of, ext_parts, local_single, preserved, shift_parts, unwrap_elided_tst, zero_cmp_band};
+use super::{
+    alu_shift, cmn_parts, cmn_sum_parts, const_of, consumes_flag_only, def_entry, def_inst, ext_parts, local_single, preserves_flags, preserved, shift_parts,
+    unwrap_elided_tst, zero_cmp_band,
+};
 use crate::alloc::Plan;
 use crate::ir::{Convert, Function, Inst, IntCC, Op, Type, Value};
 
 fn peel_uext(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], val: Value) -> Value {
     if plan.elided[val.index()]
-        && let Some((_, _, inst)) = pos_of[val.index()]
+        && let Some((_, _, inst)) = def_entry(pos_of, val)
         && let Op::Convert(Convert::Uextend, inner) = func.insts[inst.index()].op
     {
         return inner;
@@ -25,7 +28,7 @@ fn cmp_shift_preserved(
     if !matches!(cmp_ty, Type::I32 | Type::I64) || !plan.elided[v.index()] {
         return false;
     }
-    let Some((_, _, inst)) = pos_of[v.index()] else {
+    let Some((_, _, inst)) = def_entry(pos_of, v) else {
         return false;
     };
     let Some((sop, mid, imm)) = shift_parts(&func.insts[inst.index()].op, plan) else {
@@ -49,7 +52,7 @@ fn cmp_operand_preserved(
     if !plan.elided[v.index()] {
         return preserved(func, plan, b_idx, start, pos, skip, v);
     }
-    let def = |val: Value| pos_of[val.index()].map(|(_, _, i)| i);
+    let def = |val| def_inst(pos_of, val);
     if let Some((_, _, inner)) = ext_parts(func, plan, cmp_ty, v, def) {
         return preserved(func, plan, b_idx, start, pos, skip, inner);
     }
@@ -63,7 +66,7 @@ fn cmp_operand_preserved(
 }
 
 fn tst_single_insn(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], (x, y): (Value, Value)) -> bool {
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     let ty = func.ty(x);
     let ty_mask = ty.unsigned_max();
     for (raw, mask) in [(x, y), (y, x)] {
@@ -103,7 +106,7 @@ fn try_cmp_preserved(
     if !cmp_ty.is_small_int() {
         return None;
     }
-    let def = |val: Value| pos_of[val.index()].map(|(_, _, i)| i);
+    let def = |val| def_inst(pos_of, val);
     if matches!(cc, IntCC::Equal | IntCC::NotEqual)
         && let Some((sa, sb)) = cmn_sum_parts(func, plan, (a, b), &def)
         && preserved(func, plan, b_idx, start, pos, skip, sa)
@@ -215,19 +218,10 @@ fn fits_consumer(func: &Function, plan: &Plan<Reg>, tail: &[Inst], res: Value) -
         if !matches!(nd.op, Op::Call { .. }) && nd.result.is_some_and(|r| plan.elided[r.index()]) {
             continue;
         }
-        let is_use = match &nd.op {
-            Op::Select(c, x, y) => *c == res && *x != res && *y != res,
-            Op::Brif(c, _, ta, _, ea) => *c == res && !ta.contains(&res) && !ea.contains(&res),
-            Op::Trapz(c) => *c == res,
-            _ => false,
-        };
-        if is_use {
+        if consumes_flag_only(&nd.op, res) {
             return true;
         }
-        if !matches!(
-            nd.op,
-            Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Load(..) | Op::Store(..) | Op::StackLoad(..) | Op::StackStore(..)
-        ) {
+        if !preserves_flags(&nd.op) {
             return false;
         }
     }

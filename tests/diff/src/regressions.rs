@@ -435,6 +435,20 @@ pub fn case_reg_closure_scalar_env(n: i64) -> i64 {
     r1 + r2 + pair_fn((acc, 2))
 }
 
+#[inline(never)]
+fn invoke_once_pair<G: FnOnce(String, CountDrop<'_>) -> i64>(g: G, s: String, d: CountDrop<'_>) -> i64 {
+    g(s, d)
+}
+
+pub fn case_reg_boxed_fnonce_tuple(n: i64) -> i64 {
+    let mut drops = 0_i64;
+    let out = {
+        let g = Box::new(move |s: String, guard: CountDrop<'_>| (s.len() as i64) + guard.1 + n);
+        invoke_once_pair(g, format!("val_{n}"), CountDrop(&mut drops, 100))
+    };
+    out * 1000 + drops
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_byval_pair", case_reg_byval_pair),
     ("case_reg_byval_string", case_reg_byval_string),
@@ -454,4 +468,5 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_peeled_nonzero_offset", case_reg_peeled_nonzero_offset),
     ("case_reg_pin_cond_drop", case_reg_pin_cond_drop),
     ("case_reg_closure_scalar_env", case_reg_closure_scalar_env),
+    ("case_reg_boxed_fnonce_tuple", case_reg_boxed_fnonce_tuple),
 ];

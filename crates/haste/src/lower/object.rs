@@ -12,6 +12,9 @@ use super::reloc::{RelocStep, reached_index_of};
 use super::stencil::{SymbolSource, VtableEntry, VtableId};
 use super::{Lower, Slots, Word};
 
+/// Number of leading header slots (`drop`, `size`, `align`) in every vtable.
+pub(crate) const VTABLE_HEADER: usize = 3;
+
 pub(super) fn build_vtable_id(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, vtable: &Vtable) -> Result<VtableId> {
     let layout = cx.layout(vtable.ty)?;
     let mut entries = vec![
@@ -70,7 +73,7 @@ impl Lower<'_, '_> {
         {
             let low = self.slots.low_entries();
             for (slot, entry) in entries.iter().enumerate() {
-                if (slot == 0 || slot >= 3)
+                if (slot == 0 || slot >= VTABLE_HEADER)
                     && let VtableEntry::Word(Word::Code(callee_idx)) = *entry
                 {
                     let slot_sym = self.push_reloc(SymbolSource::Slot(callee_idx), RelocStep::VtableSlot { expr, slot: slot as u16 });

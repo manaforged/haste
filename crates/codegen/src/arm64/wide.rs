@@ -1,33 +1,23 @@
 use super::asm::{Alu, Bits, Cond, Reg, Size, Vreg, ZR};
 use super::{A, C, D, Emit, S, T, V0, V1, WIDE_SCRATCH};
-use crate::ir::{Binary, IntCC, Op, Unary, Value};
+use crate::ir::{Binary, IntCC, Unary, Value};
 
 const E: Reg = WIDE_SCRATCH[0];
 const F: Reg = WIDE_SCRATCH[1];
 
-fn half_score((lo, hi): (Option<i64>, Option<i64>), zero_only: bool) -> u8 {
-    let hit = |v: Option<i64>| matches!(v, Some(0)) || (!zero_only && matches!(v, Some(-1)));
-    u8::from(hit(lo)) + u8::from(hit(hi))
-}
+use crate::wide::half_score;
 
 impl Emit<'_> {
     fn const_val(&self, v: Value) -> Option<i64> {
-        super::fuse::const_of(self.func, &self.plan, v, |x| self.defs[x.index()])
+        crate::wide::const_val(self.func, &self.plan, &self.defs, v)
     }
 
     fn const_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
-        if let Some(imm) = self.const_val(v) {
-            return (Some(imm), Some(imm >> 63));
-        }
-        let Some(inst) = self.defs[v.index()] else { return (None, None) };
-        match self.func.insts[inst.index()].op {
-            Op::Binary(Binary::Iconcat, lo, hi) => (self.const_val(lo), self.const_val(hi)),
-            _ => (None, None),
-        }
+        crate::wide::const_halves(self.func, &self.plan, &self.defs, v)
     }
 
     fn shift_const(&self, y: Value) -> Option<u8> {
-        self.const_halves(y).0.map(|imm| (imm & 127) as u8)
+        crate::wide::shift_const(self.func, &self.plan, &self.defs, y)
     }
 
     fn load_half(&mut self, high: bool, reg: Reg, value: Value) {

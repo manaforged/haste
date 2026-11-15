@@ -454,6 +454,7 @@ impl Asm {
         })).flatten()
     }
 
+    const MOVK: u32 = 0xF280_0000;
     fn try_emit_bitmask_imm(&mut self, dst: Reg, value: u64, ones: usize, zeros: usize) -> bool {
         if dst == ZR || ones >= 3 || zeros >= 3 { return false; }
         if let Some((size, bitmask)) = Self::single_bitmask_imm(value) {
@@ -463,7 +464,7 @@ impl Asm {
         let h = [value as u16, (value >> 16) as u16, (value >> 32) as u16, (value >> 48) as u16];
         if ones < 2 && zeros < 2 && let Some((bitmask, k, hw)) = (0..4).find_map(|k| Self::bitmask_movk_at(value, h, k)) {
             self.alu_bitmask(Alu::Orr, Size::X, bitmask, dst, ZR);
-            self.word(0xF280_0000 | ((k as u32) << 21) | (u32::from(hw) << 5) | u32::from(dst.0));
+            self.word(Self::MOVK | ((k as u32) << 21) | (u32::from(hw) << 5) | u32::from(dst.0));
             return true;
         }
         false
@@ -482,7 +483,7 @@ impl Asm {
             let word = match (first, inverted) {
                 (true, true) => 0x9280_0000 | shift | u32::from(!bits) << 5,
                 (true, false) => 0xD280_0000 | shift | u32::from(bits) << 5,
-                (false, _) => 0xF280_0000 | shift | u32::from(bits) << 5,
+                (false, _) => Self::MOVK | shift | u32::from(bits) << 5,
             };
             self.word(word | u32::from(dst.0));
             first = false;
@@ -512,7 +513,7 @@ impl Asm {
         let rd = u32::from(dst.0);
         for half in 0..4 {
             let bits = ((value >> (16 * half)) as u32) & 0xFFFF;
-            let base = if half == 0 { 0xD280_0000 } else { 0xF280_0000 | ((half as u32) << 21) };
+            let base = if half == 0 { 0xD280_0000 } else { Self::MOVK | ((half as u32) << 21) };
             self.word(base | (bits << 5) | rd);
         }
     }

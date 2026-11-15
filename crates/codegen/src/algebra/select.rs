@@ -2,7 +2,7 @@ use crate::cse::flip_int_cc;
 use crate::fold::{extend, non_null_at};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
-use super::icmp::{ADDR_SPAN, before, emit_cond_truth, null_test, three_way_non_zero};
+use super::icmp::{ADDR_SPAN, before, emit_cond_truth, null_test, offset_bound, three_way_non_zero};
 use super::RewriteCx;
 
 pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Value, t: Value, f: Value) -> Option<Op> {
@@ -134,48 +134,6 @@ fn cond_proves_nonzero(cx: &RewriteCx, (eff, a, b): (IntCC, Value, Value), v: Va
     })
 }
 
-fn cond_offset_bound(cx: &RewriteCx, v: Value, bound: Option<(Value, u64)>, depth: u8) -> u64 {
-    let ty = cx.func.ty(v);
-    if !ty.is_small_int() {
-        return u64::MAX;
-    }
-    let w = ty.unsigned_max();
-    let mut hi = w & !cx.known(v).0;
-    if let Some((bv, bmax)) = bound
-        && bv == v
-    {
-        hi = hi.min(bmax);
-    }
-    if depth >= 4 {
-        return hi;
-    }
-    let sub = match cx.op(v) {
-        Some(&Op::Convert(Convert::Uextend, a)) => cond_offset_bound(cx, a, bound, depth + 1),
-        Some(&Op::Binary(Binary::Band, a, b)) => {
-            cond_offset_bound(cx, a, bound, depth + 1).min(cond_offset_bound(cx, b, bound, depth + 1))
-        }
-        Some(&Op::Binary(Binary::Ishl, a, sh)) => cx
-            .sconst(sh)
-            .filter(|&k| (0..i64::from(ty.bits())).contains(&k))
-            .and_then(|k| cond_offset_bound(cx, a, bound, depth + 1).checked_mul(1_u64 << (k as u32)))
-            .filter(|&n| n <= w)
-            .unwrap_or(u64::MAX),
-        Some(&Op::Binary(Binary::Imul, a, b)) => [(a, b), (b, a)]
-            .into_iter()
-            .find_map(|(x, k)| {
-                let c = cx.uconst(k, ty)?;
-                cond_offset_bound(cx, x, bound, depth + 1).checked_mul(c).filter(|&n| n <= w)
-            })
-            .unwrap_or(u64::MAX),
-        Some(&Op::Binary(Binary::Iadd, a, b)) => cond_offset_bound(cx, a, bound, depth + 1)
-            .checked_add(cond_offset_bound(cx, b, bound, depth + 1))
-            .filter(|&n| n <= w)
-            .unwrap_or(u64::MAX),
-        _ => u64::MAX,
-    };
-    hi.min(sub)
-}
-
 fn peel_const_base(cx: &RewriteCx, mut v: Value) -> (Value, i64) {
     let mut disp = 0_i64;
     for _ in 0..4 {
@@ -270,7 +228,7 @@ fn add_non_zero(cx: &RewriteCx, (a, b): (Value, Value), outer_disp: i64, cmp: Op
         let (root, base_disp) = peel_const_base(cx, base);
         base_disp
             .checked_add(outer_disp)
-            .is_some_and(|disp| valid_ptr_span(cx, root, disp, cond_offset_bound(cx, off_v, bound, 0)))
+            .is_some_and(|disp| valid_ptr_span(cx, root, disp, offset_bound(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), off_v, (bound, 0))))
     })
 }
 

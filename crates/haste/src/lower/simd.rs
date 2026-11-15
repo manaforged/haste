@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, FloatCC, IntCC, Lane, ReduceOp, StackSlot, Target, Type, Value};
+use haste_codegen::{FloatCC, IntCC, Lane, ReduceOp, StackSlot, Type, Value};
 
 use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Lit, Pat, Stmt, Ty as BodyTy, UnOp};
 use crate::names::{Primitive, plain};
@@ -11,7 +11,7 @@ use crate::sema::ty::{Kind, Ty, int_info, mask as int_mask};
 
 use super::ops::{Num, compare, parse_float};
 use super::reloc::SiteOrigin;
-use super::{Lower, machine, repr};
+use super::{Lower, host_is_x64_or_arm64, machine, repr};
 
 mod fallback;
 mod lanes;
@@ -47,7 +47,7 @@ impl Lanes {
     }
 
     pub(super) fn widened(self) -> Option<(Self, Type)> {
-        if self.bytes() >= 8 || self.count <= 0 || !(self.count as u32).is_power_of_two() || !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+        if self.bytes() >= 8 || self.count <= 0 || !(self.count as u32).is_power_of_two() || !host_is_x64_or_arm64() {
             return None;
         }
         let w = Self { count: 8 / self.size, ..self };
@@ -56,7 +56,7 @@ impl Lanes {
 }
 
 pub(super) fn vec_type(lanes: &Lanes) -> Option<Type> {
-    if !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) {
+    if !host_is_x64_or_arm64() {
         return None;
     }
     let lane = Lane::from_type(lanes.machine)?;

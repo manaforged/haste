@@ -1,16 +1,14 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::lower::{VtableEntry, Word};
+use crate::lower::{VTABLE_HEADER, VtableEntry, Word};
 use crate::names::ItemRef;
 use crate::sema::Context;
-use crate::sema::infer::{Coercion, Res, Shape, Typed, Vtable};
+use crate::sema::infer::{Coercion, Res, Shape, Typed, Vtable, is_callable_lang};
 use crate::sema::reach::Reached;
 use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty, Types};
 
-const CALLABLE_LANGS: [&str; 6] = ["fn", "fn_mut", "fn_once", "async_fn", "async_fn_mut", "async_fn_once"];
 const OBJECT_DEPTH: usize = 6;
-const VTABLE_HEADER: usize = 3;
 
 /// Per-vtable slot liveness mask built from closed-world virtual call and upcast demand.
 pub(super) struct VtableMask {
@@ -302,7 +300,7 @@ impl<'a, 'b> RtaCollector<'a, 'b> {
         let (Ok(methods), Ok(supers)) = (self.cx.vtable_methods(tr), self.cx.vtable_supers(tr)) else {
             return false;
         };
-        let callable = self.cx.lang(tr).is_some_and(|tag| CALLABLE_LANGS.contains(&tag));
+        let callable = self.cx.lang(tr).is_some_and(is_callable_lang);
         self.demand.cands.extend(supers.iter().copied());
         self.layouts.insert(tr, TraitLayout { methods, supers, callable });
         self.cand_list.push(tr);

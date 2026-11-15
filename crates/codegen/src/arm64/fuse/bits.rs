@@ -1,5 +1,5 @@
 use super::super::asm::Reg;
-use super::{can_peel_uextend, const_of, local_single, preserved, shift_parts, zero_ext_loc};
+use super::{can_peel_uextend, const_of, def_entry, def_inst, local_single, preserved, shift_parts, zero_ext_loc};
 use crate::alloc::Plan;
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
@@ -197,7 +197,7 @@ fn check_bfx_src(
     let need = if bfx.insert { u32::from(bfx.width) } else { u32::from(bfx.lsb) + u32::from(bfx.width) };
     let ext_ok = |inner: Value| need <= func.ty(inner).bits() || zero_ext_loc(plan, inner);
     if let Some(band_v) = extra {
-        let (_, bpos, _) = pos_of[band_v.index()]?;
+        let (_, bpos, _) = def_entry(pos_of, band_v)?;
         return (bfx.src != res && preserved(func, plan, b_idx, bpos, pos, Some(spos), bfx.src)).then_some(false);
     }
     let peeled = !is_conv && can_peel_uextend(func, plan, info, (b_idx, spos, pos, Some(spos), res), (bfx.src, &ext_ok));
@@ -214,13 +214,13 @@ pub(super) fn try_fuse_bfx(
     (b_idx, pos, res): (usize, usize, Value),
     (op, x, y): (Binary, Value, Value),
 ) -> bool {
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
-    let mid_ok = |v: Value| uses[v.index()] == 1 && !plan.elided[v.index()] && pos_of[v.index()].is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos);
-    let inner_ok = |v: Value| uses[v.index()] == 1 && pos_of[v.index()].is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos);
+    let def = |v| def_inst(pos_of, v);
+    let mid_ok = |v: Value| uses[v.index()] == 1 && !plan.elided[v.index()] && def_entry(pos_of, v).is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos);
+    let inner_ok = |v: Value| uses[v.index()] == 1 && def_entry(pos_of, v).is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos);
     let Some((bfx, mid, extra)) = bfx_match(func, plan, (func.ty(res), op), (x, y), &def, (&mid_ok, &inner_ok)) else {
         return false;
     };
-    let Some((_, spos, min_inst)) = pos_of[mid.index()] else { return false };
+    let Some((_, spos, min_inst)) = def_entry(pos_of, mid) else { return false };
     let is_conv = matches!(func.insts[min_inst.index()].op, Op::Convert(..));
     let Some(peeled) = check_bfx_src(func, plan, info, (b_idx, pos, res, is_conv), (spos, extra, bfx)) else {
         return false;
@@ -331,7 +331,7 @@ fn live_root_preserved(
 ) -> bool {
     let mut cur = val;
     while plan.elided[cur.index()] {
-        let Some((_, _, inst)) = pos_of[cur.index()] else { return false };
+        let Some((_, _, inst)) = def_entry(pos_of, cur) else { return false };
         let Op::Convert(Convert::Uextend, inner) = func.insts[inst.index()].op else { return false };
         cur = inner;
     }
@@ -348,7 +348,7 @@ pub(super) fn try_fuse_conv_bfx(
     let Some((xpos, _)) = local_single(plan, info, b_idx, pos, x) else {
         return false;
     };
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     let ok = |v: Value| v == x;
     let Some(bfx) = conv_bfx_match(func, plan, (func.ty(res), conv), x, &def, &ok) else {
         return false;
@@ -471,7 +471,7 @@ fn extr_uext_ok(
     if !plan.elided[leaf.index()] {
         return None;
     }
-    let (hb, hpos, hinst) = pos_of[leaf.index()]?;
+    let (hb, hpos, hinst) = def_entry(pos_of, leaf)?;
     let Op::Convert(Convert::Uextend, inner) = func.insts[hinst.index()].op else {
         return None;
     };
@@ -491,7 +491,7 @@ fn extr_branch_ok(
     (leaf, extra, limit): (Value, Option<Value>, Option<u32>),
 ) -> Option<bool> {
     if let Some(ev) = extra && !plan.elided[ev.index()] {
-        let (eb, epos, _) = pos_of[ev.index()]?;
+        let (eb, epos, _) = def_entry(pos_of, ev)?;
         if eb != b_idx || epos >= branch_pos {
             return None;
         }
@@ -506,8 +506,8 @@ fn extr_branch_ok(
 }
 
 fn extr_pair_positions(pos_of: PosMap<'_>, b_idx: usize, pos: usize, (x, y): (Value, Value)) -> Option<(usize, usize)> {
-    let (xb, xpos, _) = pos_of[x.index()]?;
-    let (yb, ypos, _) = pos_of[y.index()]?;
+    let (xb, xpos, _) = def_entry(pos_of, x)?;
+    let (yb, ypos, _) = def_entry(pos_of, y)?;
     (xb == b_idx && yb == b_idx && xpos < pos && ypos < pos).then_some((xpos, ypos))
 }
 
@@ -524,7 +524,7 @@ pub(super) fn try_fuse_extr(
         return false;
     }
     let Some((xpos, ypos)) = extr_pair_positions(pos_of, b_idx, pos, (x, y)) else { return false };
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     let extra_ok = |v: Value| plan.elided[v.index()] || uses[v.index()] == 1;
     let Some((hi, he, lo, le, kr)) = extr_match(func, plan, func.ty(res), (x, y), &def, &extra_ok) else {
         return false;
@@ -613,7 +613,7 @@ pub(super) fn can_elide_band_bit(
     (x, y): (Value, Value),
 ) -> Option<Option<Value>> {
     let (mut val, mut bit) = single_bit_raw(func, plan, x, y)?;
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     if plan.elided[val.index()] {
         while plan.elided[val.index()] {
             (val, bit) = peel_bit_op(func, plan, val, bit, &def)?;
@@ -647,7 +647,7 @@ pub(super) fn can_elide_tst_band(
     {
         return true;
     }
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     let ty_mask = ty.unsigned_max();
     for (val, mask_val) in [(x, y), (y, x)] {
         if plan.elided[val.index()]

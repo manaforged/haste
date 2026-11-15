@@ -11,7 +11,7 @@ use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::adt::tag_type;
 use super::place::Place;
-use super::{Lower, Parts, Repr, indirect, passed_parts, repr};
+use super::{Lower, Parts, Repr, arch_is_x64_or_arm64, host_is_x64_or_arm64, indirect, passed_parts, repr};
 
 /// The machine values that a value of one type travels as in the platform convention, each with its byte offset inside the value.
 type Passed = Vec<(Type, i32)>;
@@ -363,7 +363,7 @@ fn simd_vec_type(element: &Scalar, count: impl FnOnce(Lane) -> u64) -> Option<Ty
 }
 
 fn simd_parts(element: &Scalar, count: BackendLaneCount, size: u64) -> Parts {
-    let native = matches!(Target::host().arch, Arch::X64 | Arch::Arm64);
+    let native = host_is_x64_or_arm64();
     let half = || simd_vec_type(element, |lane| u64::from(16 / lane.bytes())).filter(|_| native);
     match (simd_vec_type(element, |_| count.as_u64()).filter(|_| native), size) {
         (Some(ty), _) => Parts::One(ty),
@@ -489,7 +489,7 @@ fn x64_eightbytes(leaves: Option<&[(Type, i32)]>, size: u32) -> Passed {
 }
 
 fn simd_native_type(element: &Scalar, count: BackendLaneCount, size: u32, arch: Arch) -> Result<Type> {
-    if matches!(arch, Arch::X64 | Arch::Arm64)
+    if arch_is_x64_or_arm64(arch)
         && let Some(vec_ty) = simd_vec_type(element, |_| count.as_u64())
     {
         return Ok(vec_ty);

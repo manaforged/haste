@@ -328,7 +328,7 @@ impl Typed {
     /// The inferred type of expression `expr`, or `Ty::NONE` if absent.
     pub fn expr_ty(&self, types: &Types, expr: ExprId) -> Ty {
         match &self.tables {
-            LazyTables::Eager(tables) => tables.exprs[expr.0 as usize],
+            LazyTables::Eager(tables) => tables.exprs.get(expr.0 as usize).copied().unwrap_or(Ty::NONE),
             LazyTables::Poly(poly) => poly.expr_ty(types, expr),
             LazyTables::CheckOnly(_) => panic!("check-only Typed has no expr_ty"),
         }
@@ -362,6 +362,11 @@ impl Typed {
             LazyTables::Poly(poly) => poly.site_fn(key),
             LazyTables::CheckOnly(_) => panic!("check-only Typed has no site_fn"),
         }
+    }
+
+    /// The number of automatic dereference steps recorded for pattern `pat`.
+    pub(crate) fn pat_derefs(&self, pat: PatId) -> u32 {
+        self.pat_derefs.get(&pat).copied().unwrap_or(0)
     }
 
     /// The number of autoderef steps recorded for expression `expr`.

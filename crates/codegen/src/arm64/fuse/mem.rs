@@ -1,5 +1,5 @@
 use super::super::asm::{ExtOp, Reg, encode_sib};
-use super::{const_of, local_single, preserved, shift_parts, zero_ext_loc};
+use super::{const_of, def_entry, def_inst, local_single, preserved, shift_parts, zero_ext_loc};
 use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
 use crate::live::{Sib, SibBase};
@@ -114,7 +114,7 @@ fn unwrap_sib_op(
             }
         }
         Op::Binary(Binary::Band, a, b) => {
-            let def = |u: Value| pos_of[u.index()].map(|(_, _, i)| i);
+            let def = |u| def_inst(pos_of, u);
             let (ext, inner) = super::ext_band_of(func, plan, Type::I64, (a, b), &def)?;
             (ext == ExtOp::Uxtw).then_some((inner, ExtOp::Uxtw))
         }
@@ -132,7 +132,7 @@ fn unwrap_sib_ext(
     if uses[v.index()] != 1 || (!allow_elided && plan.elided[v.index()]) {
         return None;
     }
-    let (sb, epos, einst) = pos_of[v.index()]?;
+    let (sb, epos, einst) = def_entry(pos_of, v)?;
     if sb != b_idx || epos >= limit {
         return None;
     }
@@ -141,7 +141,7 @@ fn unwrap_sib_ext(
 }
 
 fn parse_iadd_const(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], (x, y): (Value, Value)) -> Option<(Value, i32)> {
-    let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+    let def = |v| def_inst(pos_of, v);
     for (val, c) in [(x, y), (y, x)] {
         if let Some(imm) = const_of(func, plan, c, def).and_then(|v| i32::try_from(v).ok()) {
             return Some((val, imm));
@@ -154,7 +154,7 @@ fn parse_sib_base_op(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize,
     match *op {
         Op::Binary(Binary::Iadd, x, y) => parse_iadd_const(func, plan, pos_of, (x, y)),
         Op::Binary(Binary::Isub, real, c) => {
-            let def = |v: Value| pos_of[v.index()].map(|(_, _, i)| i);
+            let def = |v| def_inst(pos_of, v);
             const_of(func, plan, c, def).and_then(|v| v.checked_neg()).and_then(|v| i32::try_from(v).ok()).map(|imm| (real, imm))
         }
         _ => None,
@@ -197,7 +197,7 @@ fn parse_sib_index(
     (b_idx, limit, allow_elided): (usize, usize, bool),
     rhs: Value,
 ) -> Option<(Value, ExtOp, i64, usize, [Option<Value>; 2])> {
-    if let Some((sb, spos, sinst)) = pos_of[rhs.index()]
+    if let Some((sb, spos, sinst)) = def_entry(pos_of, rhs)
         && sb == b_idx
         && spos < limit
         && let Some((Binary::Ishl, mid, shift)) = shift_parts(&func.insts[sinst.index()].op, plan)
@@ -477,7 +477,7 @@ fn try_fuse_splat_shuffle(
     if uses[src.index()] != 1 || plan.elided[src.index()] {
         return;
     }
-    let Some((_, _, ins_inst)) = pos_of[src.index()] else { return };
+    let Some((_, _, ins_inst)) = def_entry(pos_of, src) else { return };
     if let Op::Insert(_, scalar, idx) = func.insts[ins_inst.index()].op
         && usize::from(idx) == usize::from(first) % count_u
         && let Some(imm) = plan.const_of(scalar)
