@@ -99,7 +99,7 @@ pub(super) struct Lookups {
     pub(super) has_new_sysroot_summaries: Arc<AtomicBool>,
     pub(super) has_new_sysroot_instances: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
-    pub(super) sysroot_index: Arc<std::sync::OnceLock<Arc<summary::codec::SysrootIndex>>>,
+    pub(super) file_index: Arc<std::sync::OnceLock<Arc<summary::codec::FileIndex>>>,
     pub(super) skip_warm_sysroot_bodies: bool,
 }
 
@@ -141,7 +141,7 @@ impl Lookups {
                 has_new_sysroot_summaries: Arc::clone(&self.has_new_sysroot_summaries),
                 has_new_sysroot_instances: Arc::clone(&self.has_new_sysroot_instances),
                 substrate: self.substrate.clone(),
-                sysroot_index: Arc::clone(&self.sysroot_index),
+                file_index: Arc::clone(&self.file_index),
                 skip_warm_sysroot_bodies: self.skip_warm_sysroot_bodies,
                 ..Lookups::default()
             };
@@ -189,7 +189,7 @@ impl Lookups {
             *write_lock(&self.state.primitives) = None;
         }
         if reset_fixed {
-            self.sysroot_index = Arc::new(std::sync::OnceLock::new());
+            self.file_index = Arc::new(std::sync::OnceLock::new());
         }
         self.trait_calls.clear();
         self.assoc_types.clear();
@@ -202,7 +202,7 @@ impl Cache {
     /// Attaches a frozen sysroot substrate to serve pre-computed `PolySummary` entries.
     pub fn set_substrate(&mut self, substrate: Option<Arc<crate::substrate::Substrate>>) {
         self.lookups.substrate = substrate;
-        self.lookups.sysroot_index = Arc::new(std::sync::OnceLock::new());
+        self.lookups.file_index = Arc::new(std::sync::OnceLock::new());
     }
 
     /// Controls whether warm `.substrate` sysroot lookups eagerly parse bodies for macro expansion.
@@ -253,7 +253,7 @@ impl Cache {
     pub fn forget_lookups(&mut self) {
         self.lookups = Lookups {
             substrate: self.lookups.substrate.clone(),
-            sysroot_index: Arc::clone(&self.lookups.sysroot_index),
+            file_index: Arc::clone(&self.lookups.file_index),
             skip_warm_sysroot_bodies: self.lookups.skip_warm_sysroot_bodies,
             ..Lookups::default()
         };

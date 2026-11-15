@@ -15,40 +15,14 @@ use crate::sema::ty::{Kind, Mut, Ty, Types};
 
 use super::{CallOverride, ConstHole, OpCheck, PolyInst, PolyObligation, PolySummary};
 
+mod files;
+
+pub use files::FileIndex;
+pub(crate) use files::ItemRecord;
+use files::{read_items, write_items};
+
 const CODEC_MAGIC: [u8; 4] = *b"HPS1";
 const INST_MAGIC: [u8; 4] = *b"HFI1";
-
-/// Reverse lookup table mapping canonical sysroot item keys back to workspace `ItemRef`s.
-#[derive(Debug, Default)]
-pub struct SysrootIndex {
-    items: HashMap<u64, ItemRef>,
-}
-
-impl SysrootIndex {
-    /// Builds an index of all sysroot items in `outline` using `key_of`.
-    pub fn build(outline: &Outline, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Self {
-        let mut items = HashMap::default();
-        for (krate, tree) in outline.crates.iter().enumerate() {
-            if !tree.env.fixed {
-                continue;
-            }
-            for (file_idx, file) in tree.files.iter().enumerate() {
-                for item_idx in 0..file.items.items.len() {
-                    let item = ItemRef { krate: krate as u32, file: file_idx as u32, item: item_idx as u32 };
-                    if let Some(key) = key_of(outline, item) {
-                        items.insert(key, item);
-                    }
-                }
-            }
-        }
-        Self { items }
-    }
-
-    /// Resolves a canonical sysroot item key to its `ItemRef` in this workspace.
-    pub fn get(&self, key: u64) -> Option<ItemRef> {
-        self.items.get(&key).copied()
-    }
-}
 
 /// Encodes `summary` into a workspace-invariant byte vector, or `None` if it references non-sysroot items.
 pub fn encode_summary(outline: &Outline, types: &Types, summary: &PolySummary, mut key_of: impl FnMut(&Outline, ItemRef) -> Option<u64>) -> Result<Option<Vec<u8>>> {
@@ -57,10 +31,9 @@ pub fn encode_summary(outline: &Outline, types: &Types, summary: &PolySummary, m
     if enc.write_summary(&mut body, summary).is_none() {
         return Ok(None);
     }
-    let mut out = Vec::with_capacity(16 + enc.items.len() * 8 + enc.ty_buf.len() + body.len());
+    let mut out = Vec::with_capacity(16 + enc.items.len() * ItemRecord::LEN + enc.ty_buf.len() + body.len());
     out.extend_from_slice(&CODEC_MAGIC);
-    write_u32(&mut out, enc.items.len() as u32);
-    enc.items.iter().for_each(|&key| write_u64(&mut out, key));
+    write_items(&mut out, &enc.items);
     write_u32(&mut out, enc.ty_count);
     out.extend_from_slice(&enc.ty_buf);
     out.extend_from_slice(&body);
@@ -68,17 +41,12 @@ pub fn encode_summary(outline: &Outline, types: &Types, summary: &PolySummary, m
 }
 
 /// Decodes a frozen `PolySummary` from `bytes` into `types`, or `None` if any sysroot item is absent.
-pub fn decode_summary(index: &SysrootIndex, types: &Types, bytes: &[u8]) -> Result<Option<PolySummary>> {
+pub fn decode_summary(outline: &Outline, index: &FileIndex, types: &Types, bytes: &[u8]) -> Result<Option<PolySummary>> {
     let mut cur = Cursor { data: bytes, pos: 0 };
     if cur.take(4)? != CODEC_MAGIC {
         bail!("invalid poly summary magic");
     }
-    let item_count = cur.u32()? as usize;
-    let mut items = Vec::with_capacity(item_count);
-    for _ in 0..item_count {
-        let Some(item) = index.get(cur.u64()?) else { return Ok(None) };
-        items.push(item);
-    }
+    let Some(items) = read_items(&mut cur, outline, index)? else { return Ok(None) };
     let ty_count = cur.u32()? as usize;
     let mut tys = Vec::with_capacity(ty_count);
     for _ in 0..ty_count {
@@ -160,10 +128,9 @@ pub fn encode_instance(
     if enc.write_instance(&mut body, substs, inst, drops).is_none() {
         return Ok(None);
     }
-    let mut out = Vec::with_capacity(16 + enc.items.len() * 8 + enc.ty_buf.len() + body.len());
+    let mut out = Vec::with_capacity(16 + enc.items.len() * ItemRecord::LEN + enc.ty_buf.len() + body.len());
     out.extend_from_slice(&INST_MAGIC);
-    write_u32(&mut out, enc.items.len() as u32);
-    enc.items.iter().for_each(|&key| write_u64(&mut out, key));
+    write_items(&mut out, &enc.items);
     write_u32(&mut out, enc.ty_count);
     out.extend_from_slice(&enc.ty_buf);
     out.extend_from_slice(&body);
@@ -171,17 +138,12 @@ pub fn encode_instance(
 }
 
 /// Decodes a frozen concrete sysroot instance from `bytes`, returning `None` if `expected_substs` or any item mismatches.
-pub fn decode_instance(index: &SysrootIndex, types: &Types, expected_substs: Substs, bytes: &[u8]) -> Result<Option<FrozenInst>> {
+pub fn decode_instance(outline: &Outline, index: &FileIndex, types: &Types, expected_substs: Substs, bytes: &[u8]) -> Result<Option<FrozenInst>> {
     let mut cur = Cursor { data: bytes, pos: 0 };
     if cur.take(4)? != INST_MAGIC {
         bail!("invalid frozen instance magic");
     }
-    let item_count = cur.u32()? as usize;
-    let mut items = Vec::with_capacity(item_count);
-    for _ in 0..item_count {
-        let Some(item) = index.get(cur.u64()?) else { return Ok(None) };
-        items.push(item);
-    }
+    let Some(items) = read_items(&mut cur, outline, index)? else { return Ok(None) };
     let ty_count = cur.u32()? as usize;
     let mut tys = Vec::with_capacity(ty_count);
     for _ in 0..ty_count {
@@ -196,7 +158,7 @@ struct Encoder<'a, F> {
     types: &'a Types,
     key_of: &'a mut F,
     item_map: HashMap<ItemRef, u32>,
-    items: Vec<u64>,
+    items: Vec<ItemRecord>,
     ty_map: HashMap<Ty, u32>,
     ty_count: u32,
     ty_buf: Vec<u8>,
@@ -205,9 +167,9 @@ struct Encoder<'a, F> {
 impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
     fn item_id(&mut self, item: ItemRef) -> Option<u32> {
         if let Some(&idx) = self.item_map.get(&item) { return Some(idx); }
-        let key = (self.key_of)(self.outline, item)?;
+        let record = ItemRecord::of(self.outline, item, &mut *self.key_of)?;
         let idx = self.items.len() as u32;
-        self.items.push(key);
+        self.items.push(record);
         self.item_map.insert(item, idx);
         Some(idx)
     }

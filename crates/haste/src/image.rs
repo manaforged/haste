@@ -136,8 +136,7 @@ pub struct Image {
     wanted: Mutex<Vec<Instance>>,
     bodies: lower::Bodies,
     backend: ImageBackend,
-    sysroot_index: std::sync::OnceLock<crate::sema::summary::codec::SysrootIndex>,
-    fixed_index: std::sync::OnceLock<crate::sema::summary::codec::SysrootIndex>,
+    file_index: std::sync::OnceLock<crate::sema::summary::codec::FileIndex>,
 }
 
 pub(super) struct FrozenStencil {
@@ -205,14 +204,6 @@ impl Image {
         lock(aot).rodata.get(id.0 as usize).cloned()
     }
 
-    pub(super) fn sysroot_index_for(&self, outline: &crate::outline::Outline, include_deps: bool) -> &crate::sema::summary::codec::SysrootIndex {
-        if include_deps {
-            self.fixed_index.get_or_init(|| crate::sema::summary::codec::SysrootIndex::build(outline, crate::substrate::sysroot_item_key))
-        } else {
-            self.sysroot_index.get_or_init(|| crate::sema::summary::codec::SysrootIndex::build(outline, crate::substrate::sysroot_only_item_key))
-        }
-    }
-
     pub(super) fn encode_aot_reloc_plan(&self, outline: &crate::outline::Outline, types: &crate::sema::ty::Types, reached: &Reached, is_sysroot: bool, plan: &lower::RelocPlan) -> Option<Vec<u8>> {
         if !self.backend.is_aot() {
             return None;
@@ -225,7 +216,8 @@ impl Image {
         if !self.backend.is_aot() || bytes.is_empty() {
             return None;
         }
-        crate::substrate::relocs::decode_reloc_plan(types, reached, self, |inc| self.sysroot_index_for(outline, inc), is_sysroot, bytes).ok().flatten()
+        let index = self.file_index.get_or_init(|| crate::sema::summary::codec::FileIndex::build(outline));
+        crate::substrate::relocs::decode_reloc_plan(outline, types, reached, self, index, is_sysroot, bytes).ok().flatten()
     }
 }
 
@@ -404,8 +396,7 @@ impl Image {
             wanted: Mutex::default(),
             bodies: lower::Bodies::default(),
             backend: ImageBackend::from_mode(mode, reached.list.len()),
-            sysroot_index: std::sync::OnceLock::new(),
-            fixed_index: std::sync::OnceLock::new(),
+            file_index: std::sync::OnceLock::new(),
         })
     }
 

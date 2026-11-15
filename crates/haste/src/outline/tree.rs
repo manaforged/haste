@@ -29,12 +29,13 @@ pub struct File {
 struct Bodies {
     krate: u32,
     slots: Box<[OnceLock<Option<Box<Expansion>>>]>,
+    key: OnceLock<Option<u64>>,
     next: OnceLock<Box<Bodies>>,
 }
 
 impl Bodies {
     fn new(krate: u32, items: usize) -> Box<Bodies> {
-        Box::new(Bodies { krate, slots: (0..items).map(|_| OnceLock::new()).collect(), next: OnceLock::new() })
+        Box::new(Bodies { krate, slots: (0..items).map(|_| OnceLock::new()).collect(), key: OnceLock::new(), next: OnceLock::new() })
     }
 
     fn of(&self, krate: u32) -> Option<&Bodies> {
@@ -108,11 +109,19 @@ impl File {
 
     /// Records what reading the body of item `item` in crate `krate` found, unless a pass already did.
     pub fn set_expansion(&self, krate: u32, item: u32, found: Option<Box<Expansion>>) {
-        let items = self.items.items.len();
-        let bodies = self.bodies.get_or_init(|| Bodies::new(krate, items)).claim(krate, items);
-        if let Some(slot) = bodies.slots.get(item as usize) {
+        if let Some(slot) = self.claim(krate).slots.get(item as usize) {
             drop(slot.set(found));
         }
+    }
+
+    /// The identity key of this file in crate `krate`, made by `make` on first use and kept.
+    pub fn key(&self, krate: u32, make: impl FnOnce() -> Option<u64>) -> Option<u64> {
+        *self.claim(krate).key.get_or_init(make)
+    }
+
+    fn claim(&self, krate: u32) -> &Bodies {
+        let items = self.items.items.len();
+        self.bodies.get_or_init(|| Bodies::new(krate, items)).claim(krate, items)
     }
 }
 
