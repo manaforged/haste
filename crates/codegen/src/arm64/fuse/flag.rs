@@ -2,7 +2,7 @@ use super::super::asm::Reg;
 use super::super::Location;
 use super::bits::can_elide_tst_band;
 use super::{
-    alu_shift, cmn_parts, cmn_sum_parts, const_of, consumes_flag_only, def_entry, def_inst, ext_parts, local_single, preserves_flags, preserved, shift_parts,
+    alu_shift, cmn_parts, cmn_sum_parts, const_of, def_entry, def_inst, ext_parts, local_single, preserved, shift_parts,
     unwrap_elided_tst, zero_cmp_band,
 };
 use crate::alloc::Plan;
@@ -95,7 +95,7 @@ fn cmp_band_tst(
     ok.then_some(m)
 }
 
-fn try_cmp_preserved(
+pub(super) fn try_cmp_preserved(
     func: &Function,
     plan: &Plan<Reg>,
     info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
@@ -311,6 +311,51 @@ pub(super) fn fuse_fits(func: &Function, plan: &mut Plan<Reg>, uses: &[u32]) {
                 && matches!(plan.location(res), Location::Reg(_) | Location::Slot)
                 && func.ty(a).is_small_int()
                 && fits_consumer(func, plan, &block.insts[pos + 1..], res)
+            {
+                plan.fused[res.index()] = true;
+            }
+        }
+    }
+}
+
+pub(super) fn consumes_flag_only(op: &Op, res: Value) -> bool {
+    match op {
+        Op::Select(c, x, y) => *c == res && *x != res && *y != res,
+        Op::Brif(c, _, ta, _, ea) => *c == res && !ta.contains(&res) && !ea.contains(&res),
+        Op::Trapz(c) => *c == res,
+        _ => false,
+    }
+}
+
+pub(super) fn preserves_flags(op: &Op) -> bool {
+    matches!(op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Load(..) | Op::Store(..) | Op::StackLoad(..) | Op::StackStore(..))
+}
+
+pub(super) fn icmp_consumer(func: &Function, tail: &[Inst], res: Value) -> bool {
+    for &ni in tail {
+        let nd = &func.insts[ni.index()];
+        if consumes_flag_only(&nd.op, res) {
+            return true;
+        }
+        if !preserves_flags(&nd.op) {
+            return false;
+        }
+    }
+    false
+}
+
+pub(super) fn fuse_icmp_flags(func: &Function, plan: &mut Plan<Reg>, uses: &[u32]) {
+    for block in &func.blocks {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            let Op::Icmp(_, a, _) = data.op else { continue };
+            if uses[res.index()] == 1
+                && !plan.elided[res.index()]
+                && !plan.fused[res.index()]
+                && !plan.is_static(res)
+                && !func.ty(a).is_vector()
+                && icmp_consumer(func, &block.insts[pos + 1..], res)
             {
                 plan.fused[res.index()] = true;
             }

@@ -556,6 +556,7 @@ impl Asm {
         self.emit_gp(dst, sized(base, size) | u32::from(b.0) << 16 | (cond as u32) << 12 | u32::from(a.0) << 5 | u32::from(dst.0));
     }
 
+    pub(crate) fn ccmp(&mut self, neg: bool, size: Size, imm: bool, (cond, rn, op2, nzcv): (Cond, Reg, u8, u8)) { self.word(sized(if neg { 0xBA40_0000 } else { 0xFA40_0000 }, size) | u32::from(imm) << 11 | u32::from(op2 & 0x1F) << 16 | (cond as u32) << 12 | u32::from(rn.0) << 5 | u32::from(nzcv & 0xF)); }
     pub fn csel(&mut self, cond: Cond, dst: Reg, a: Reg, b: Reg) { self.cond_select(0x9A80_0000, Size::X, cond, dst, a, b); }
 
     pub fn csinc(&mut self, size: Size, cond: Cond, dst: Reg, a: Reg, b: Reg) { self.cond_select(0x9A80_0400, size, cond, dst, a, b); }

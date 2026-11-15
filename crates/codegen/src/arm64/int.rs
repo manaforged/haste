@@ -124,11 +124,11 @@ impl Emit<'_> {
         if signed { self.get(dst, val, Ext::Sign); } else { self.zext_get(dst, val); }
     }
 
-    fn src_opt(&mut self, val: Value, scratch: Reg, signed: bool) -> Reg {
+    pub(super) fn src_opt(&mut self, val: Value, scratch: Reg, signed: bool) -> Reg {
         if signed { self.src(val, scratch, Ext::Sign) } else { self.zext_src(val, scratch) }
     }
 
-    fn pair_opt(&mut self, x: Value, y: Value, signed: bool) -> (Reg, Reg) {
+    pub(super) fn pair_opt(&mut self, x: Value, y: Value, signed: bool) -> (Reg, Reg) {
         if signed { self.src_pair(x, y, Ext::Sign) } else { self.zext_pair(x, y) }
     }
 
@@ -252,6 +252,7 @@ impl Emit<'_> {
         if ty.is_vector() { self.invalidate_spills(); return self.vec_binary(op, x, y, result); }
         if ty.is_float() { self.invalidate_spills(); return self.float_binary(op, x, y, result); }
         if ty == Type::I128 { self.invalidate_spills(); return self.wide_binary(op, x, y, result); }
+        if matches!(op, Binary::Band | Binary::Bor) && self.try_emit_ccmp(op, (x, y), result) { return Ok(()); }
         let dst = self.dst(result);
         self.int_binary(op, (x, y), ty, dst)?;
         self.put(result, dst);
@@ -617,7 +618,7 @@ impl Emit<'_> {
         Some((a, b))
     }
 
-    fn cmp_arg(&mut self, val: Value, scratch: Reg, bytes: u32, signed: bool) -> Reg {
+    pub(super) fn cmp_arg(&mut self, val: Value, scratch: Reg, bytes: u32, signed: bool) -> Reg {
         if bytes >= 4 { self.bits(val, scratch) } else { self.src_opt(val, scratch, signed) }
     }
 

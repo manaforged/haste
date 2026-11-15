@@ -15,6 +15,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         return Domain::NONE;
     }
     let mut changed = crate::merge::lower_binary_br_tables(func);
+    changed |= crate::merge::fold_short_circuit_compares(func);
     changed |= inline_returns(func);
     if factor_tail_calls(func, changed) {
         changed = true;

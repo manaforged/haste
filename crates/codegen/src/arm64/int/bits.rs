@@ -3,7 +3,7 @@ use super::super::fuse::{Bfx, unwrap_elided_tst};
 use super::{A, C, Emit, add_imm_parts, cond, encode_bitmask_imm, swap_cond};
 use crate::alloc::Location;
 use crate::frame::Ext;
-use crate::ir::{Convert, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Convert, IntCC, Op, Type, Value};
 
 impl Emit<'_> {
     pub(super) fn emit_bfm(&mut self, bfx: Bfx, ty: Type, dst: Reg) {
@@ -120,4 +120,111 @@ impl Emit<'_> {
         }
         Ok(())
     }
+
+    fn elided_node(&self, val: Value) -> Option<&Op> {
+        (self.plan.elided[val.index()] && !self.plan.fused[val.index()])
+            .then(|| self.defs[val.index()])
+            .flatten()
+            .map(|inst| &self.func.insts[inst.index()].op)
+    }
+
+    fn plain_icmp(&self, val: Value) -> Option<(IntCC, Value, Value)> {
+        let &Op::Icmp(cc, a, b) = self.elided_node(val)? else { return None };
+        (self.ty(a).is_small_int() && !self.plan.elided[a.index()] && !self.plan.elided[b.index()]).then_some((cc, a, b))
+    }
+
+    fn any_icmp(&self, val: Value) -> Option<(IntCC, Value, Value)> {
+        let &Op::Icmp(cc, a, b) = self.elided_node(val)? else { return None };
+        self.ty(a).is_small_int().then_some((cc, a, b))
+    }
+
+    fn collect_ccmp_ops(&self, op: Binary, (x, y): (Value, Value)) -> Option<((IntCC, Value, Value), Vec<(Binary, IntCC, Value, Value)>)> {
+        let (mut cur_op, mut cur_x, mut cur_y) = (op, x, y);
+        let mut rev_tails = Vec::new();
+        while rev_tails.len() < 7 {
+            if let (Some(lx), Some(ly)) = (self.any_icmp(cur_x), self.any_icmp(cur_y)) {
+                let (head, tail) = if self.plain_icmp(cur_y).is_some() { (lx, ly) } else if self.plain_icmp(cur_x).is_some() { (ly, lx) } else { return None };
+                rev_tails.push((cur_op, tail.0, tail.1, tail.2));
+                rev_tails.reverse();
+                return Some((head, rev_tails));
+            }
+            if let Some((cc, a, b)) = self.plain_icmp(cur_y)
+                && let Some(&Op::Binary(nop @ (Binary::Band | Binary::Bor), nx, ny)) = self.elided_node(cur_x)
+            {
+                rev_tails.push((cur_op, cc, a, b));
+                (cur_op, cur_x, cur_y) = (nop, nx, ny);
+            } else if let Some((cc, a, b)) = self.plain_icmp(cur_x)
+                && let Some(&Op::Binary(nop @ (Binary::Band | Binary::Bor), nx, ny)) = self.elided_node(cur_y)
+            {
+                rev_tails.push((cur_op, cc, a, b));
+                (cur_op, cur_x, cur_y) = (nop, nx, ny);
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn emit_ccmp_leaf(&mut self, prev: Cond, op: Binary, (cc, a, b): (IntCC, Value, Value)) -> Cond {
+        let (guard, is_or) = match op {
+            Binary::Band => (prev, false),
+            _ => (prev.invert(), true),
+        };
+        let ty = self.ty(a);
+        let (bytes, signed) = (ty.bytes(), cc.is_signed());
+        let size = if bytes >= 8 { Size::X } else { Size::W };
+        let imm_pick = self
+            .plan
+            .const_of(b)
+            .and_then(|v| ccmp_imm_parts(ty, cc, v))
+            .map(|p| (a, p, cond(cc)))
+            .or_else(|| self.plan.const_of(a).and_then(|v| ccmp_imm_parts(ty, cc, v)).map(|p| (b, p, swap_cond(cond(cc)))));
+        let out = imm_pick.map_or_else(|| cond(cc), |(_, _, c)| c);
+        let nzcv = nzcv_for_false(if is_or { out.invert() } else { out });
+        if let Some((lhs, (neg, imm5), _)) = imm_pick {
+            let rn = self.cmp_arg(lhs, A, bytes, signed);
+            self.asm.ccmp(neg, size, true, (guard, rn, imm5, nzcv));
+        } else {
+            let (left, right) = if bytes >= 4 { self.bits_pair(a, b) } else { self.pair_opt(a, b, signed) };
+            self.asm.ccmp(false, size, false, (guard, left, right.0, nzcv));
+        }
+        out
+    }
+
+    pub(super) fn try_emit_ccmp(&mut self, op: Binary, (x, y): (Value, Value), result: Value) -> bool {
+        let Some((head, tails)) = self.collect_ccmp_ops(op, (x, y)) else { return false };
+        let mut cur = self.compare(head.0, head.1, head.2);
+        for (comb, cc, a, b) in tails {
+            cur = self.emit_ccmp_leaf(cur, comb, (cc, a, b));
+        }
+        self.last_cmp = None;
+        self.set_flag(result, cur);
+        true
+    }
+}
+
+const fn nzcv_for_false(c: Cond) -> u8 {
+    match c {
+        Cond::Ne | Cond::Gt => 4,
+        Cond::Lo | Cond::Ls => 2,
+        Cond::Pl => 8,
+        Cond::Vc | Cond::Ge => 1,
+        _ => 0,
+    }
+}
+
+fn ccmp_imm_parts(ty: Type, cc: IntCC, raw: i64) -> Option<(bool, u8)> {
+    let signed = cc.is_signed();
+    if signed || matches!(cc, IntCC::Equal | IntCC::NotEqual) {
+        let simm = crate::fold::extend(raw, ty, true);
+        if (0..=31).contains(&simm) {
+            return Some((false, simm as u8));
+        }
+        if (-31..=-1).contains(&simm) && (signed || ty.bytes() >= 4) {
+            return Some((true, (-simm) as u8));
+        }
+        return None;
+    }
+    let uimm = (raw as u64) & ty.unsigned_max();
+    (uimm <= 31).then_some((false, uimm as u8))
 }

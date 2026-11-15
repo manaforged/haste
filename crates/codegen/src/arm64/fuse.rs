@@ -1,5 +1,6 @@
 mod bfi;
 mod bits;
+mod ccmp;
 mod flag;
 mod mem;
 mod shift;
@@ -9,7 +10,7 @@ use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 pub(super) use bfi::bfi_parts;
 pub(super) use bits::{Bfx, bfx_parts, conv_bfx_parts, extr_parts, single_bit_mask, unwrap_elided_tst};
-use flag::{fuse_fits, fuse_icmp_selects, try_fuse_flag_operand, try_fuse_icmp_select};
+use flag::{fuse_fits, fuse_icmp_flags, fuse_icmp_selects, try_fuse_flag_operand, try_fuse_icmp_select};
 pub(super) use mem::{encode_neon_movi, madd_parts};
 use mem::try_fuse_vec_op;
 
@@ -552,43 +553,6 @@ fn fuse_icmp_operands(func: &Function, plan: &mut Plan<Reg>, info: (&[u32], &[Op
     }
 }
 
-pub(super) fn consumes_flag_only(op: &Op, res: Value) -> bool {
-    match op {
-        Op::Select(c, x, y) => *c == res && *x != res && *y != res,
-        Op::Brif(c, _, ta, _, ea) => *c == res && !ta.contains(&res) && !ea.contains(&res),
-        Op::Trapz(c) => *c == res,
-        _ => false,
-    }
-}
-
-pub(super) fn preserves_flags(op: &Op) -> bool {
-    matches!(op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Load(..) | Op::Store(..) | Op::StackLoad(..) | Op::StackStore(..))
-}
-
-fn icmp_consumer(func: &Function, tail: &[Inst], res: Value) -> bool {
-    for &ni in tail {
-        let nd = &func.insts[ni.index()];
-        if consumes_flag_only(&nd.op, res) { return true; }
-        if !preserves_flags(&nd.op) { return false; }
-    }
-    false
-}
-
-fn fuse_icmp_flags(func: &Function, plan: &mut Plan<Reg>, uses: &[u32]) {
-    for block in &func.blocks {
-        for (pos, &inst) in block.insts.iter().enumerate() {
-            let data = &func.insts[inst.index()];
-            let Some(res) = data.result else { continue };
-            let Op::Icmp(_, a, _) = data.op else { continue };
-            if uses[res.index()] == 1 && !plan.elided[res.index()] && !plan.fused[res.index()] && !plan.is_static(res)
-                && !func.ty(a).is_vector() && icmp_consumer(func, &block.insts[pos + 1..], res)
-            {
-                plan.fused[res.index()] = true;
-            }
-        }
-    }
-}
-
 fn fuse_int_flag_pair(
     func: &Function,
     plan: &mut Plan<Reg>,
@@ -765,4 +729,5 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
     fuse_icmp_flags(func, plan, &uses);
     bits::fuse_tst(func, plan, (&uses, &pos_of));
     fuse_fits(func, plan, &uses);
+    ccmp::fuse_ccmp(func, plan, (&uses, &pos_of));
 }
