@@ -37,16 +37,18 @@ impl Emit<'_> {
         self.clobber_xmm(xmm);
     }
 
+    fn bit_sign(&mut self, ty: Type, toggle: bool, reg: Reg) {
+        self.asm.encode(&[], ty == Type::F64, &[0x0F, 0xBA], if toggle { 7 } else { 6 }, reg.into(), false);
+        self.asm.bytes(&[ty.bits() as u8 - 1]);
+    }
+
     pub(super) fn float_unary(&mut self, op: Unary, x: Value, result: Value) -> Result<(), String> {
         let ty = self.ty(x);
         let mode = match op {
             Unary::Fneg | Unary::Fabs => {
                 self.raw(Reg::Rax, x);
-                let neg = op == Unary::Fneg;
-                let sign = ty.sign_bit();
-                self.asm.mov_imm(Reg::Rcx, if neg { sign } else { !sign });
-                self.asm.alu(if neg { Alu::Xor } else { Alu::And }, Reg::Rax, Reg::Rcx);
-                self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
+                self.bit_sign(ty, op == Unary::Fneg, Reg::Rax);
+                self.clobber_reg(Reg::Rax);
                 self.put(result, Reg::Rax);
                 return Ok(());
             }
@@ -109,6 +111,22 @@ impl Emit<'_> {
         self.asm.bind(skip);
     }
 
+    fn fminmax(&mut self, op: Binary, ty: Type, x: Value, y: Value, result: Value) {
+        let opcode = if op == Binary::Fmin { 0x5D } else { 0x5F };
+        let dst = self.xmm_of(result).unwrap_or(X2);
+        self.fget(X0, x);
+        self.fget(X1, y);
+        self.asm.movaps(dst, X0);
+        self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, X1);
+        let done = self.asm.label();
+        self.ucomi(ty, X1, X1);
+        self.asm.jcc(Cond::Np, done);
+        self.asm.movaps(dst, X0);
+        self.asm.bind(done);
+        self.clobber_xmms(&[X0, X1, dst]);
+        self.fput(result, dst);
+    }
+
     pub(super) fn float_binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {
         let ty = self.ty(x);
         let opcode = match op {
@@ -117,19 +135,7 @@ impl Emit<'_> {
             Binary::Fsub => 0x5C,
             Binary::Fdiv => 0x5E,
             Binary::Fmin | Binary::Fmax => {
-                let opcode = if op == Binary::Fmin { 0x5D } else { 0x5F };
-                let dst = self.xmm_of(result).unwrap_or(X2);
-                self.fget(X0, x);
-                self.fget(X1, y);
-                self.asm.movaps(dst, X0);
-                self.asm.sse(&[scalar(ty)], &[0x0F, opcode], dst.0, X1);
-                let done = self.asm.label();
-                self.ucomi(ty, X1, X1);
-                self.asm.jcc(Cond::Np, done);
-                self.asm.movaps(dst, X0);
-                self.asm.bind(done);
-                self.clobber_xmms(&[X0, X1, dst]);
-                self.fput(result, dst);
+                self.fminmax(op, ty, x, y, result);
                 return Ok(());
             }
             Binary::Fcopysign => {
@@ -161,6 +167,31 @@ impl Emit<'_> {
         Ok(())
     }
 
+    fn fma_reg(&mut self, value: Value, dst: Xmm, scratch: Xmm) -> Xmm {
+        match self.xmm_of(value) {
+            Some(r) if r != dst => r,
+            _ => {
+                self.fget(scratch, value);
+                scratch
+            }
+        }
+    }
+
+    fn fma_vex(&mut self, ops: [Value; 3], result: Value, is_vec: bool, is_f64: bool) {
+        let [a, b, c] = ops;
+        let dst = self.fdst(result);
+        let src_b = self.fma_reg(b, dst, X1);
+        let src_c: Rm = if !is_vec && self.xmm_of(c) != Some(dst) {
+            self.foperand(c, X2)
+        } else {
+            self.fma_reg(c, dst, X2).into()
+        };
+        self.fget(dst, a);
+        self.asm.vex_fma(is_vec, is_f64, (dst, src_b), src_c);
+        self.clobber_xmms(&[X1, X2, dst]);
+        self.fput(result, dst);
+    }
+
     pub(super) fn fma(&mut self, a: Value, b: Value, c: Value, result: Value) -> Result<(), String> {
         let ty = self.ty(a);
         let (is_vec, is_f64, lane) = match ty {
@@ -171,36 +202,15 @@ impl Emit<'_> {
             other => return Err(format!("Fma of {other:?}")),
         };
         if self.features.fma && self.features.avx {
-            let dst = self.fdst(result);
-            let src_b = match self.xmm_of(b) {
-                Some(r) if r != dst => r,
-                _ => {
-                    self.fget(X1, b);
-                    X1
-                }
-            };
-            let src_c: Rm = if !is_vec && self.xmm_of(c) != Some(dst) {
-                self.foperand(c, X2)
-            } else {
-                match self.xmm_of(c) {
-                    Some(r) if r != dst => r.into(),
-                    _ => {
-                        self.fget(X2, c);
-                        X2.into()
-                    }
-                }
-            };
-            self.fget(dst, a);
-            self.asm.vex_fma(is_vec, is_f64, (dst, src_b), src_c);
-            self.clobber_xmms(&[X1, X2, dst]);
-            self.fput(result, dst);
+            self.fma_vex([a, b, c], result, is_vec, is_f64);
             return Ok(());
         }
         let prefix: &[u8] = if is_vec { vec_prefix(lane) } else { &[scalar(ty)] };
         self.fget(X0, a);
-        let mul_src: Rm = if is_vec { self.fin(b, X1).into() } else { self.foperand(b, X1) };
+        let sse_arg = |this: &mut Self, v| if is_vec { this.fin(v, X1).into() } else { this.foperand(v, X1) };
+        let mul_src = sse_arg(self, b);
         self.asm.sse(prefix, &[0x0F, 0x59], X0.0, mul_src);
-        let add_src: Rm = if is_vec { self.fin(c, X1).into() } else { self.foperand(c, X1) };
+        let add_src = sse_arg(self, c);
         self.asm.sse(prefix, &[0x0F, 0x58], X0.0, add_src);
         self.clobber_xmms(&[X0, X1]);
         self.fput(result, X0);
@@ -210,12 +220,16 @@ impl Emit<'_> {
     fn copysign(&mut self, ty: Type, x: Value, y: Value, result: Value) {
         self.raw(Reg::Rax, x);
         self.raw(Reg::Rcx, y);
-        self.asm.mov_imm(Reg::Rdx, ty.sign_bit());
-        self.asm.alu(Alu::And, Reg::Rcx, Reg::Rdx);
-        self.asm.group3(Group3::Not, Reg::Rdx);
-        self.asm.alu(Alu::And, Reg::Rax, Reg::Rdx);
-        self.asm.alu(Alu::Or, Reg::Rax, Reg::Rcx);
-        self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx]);
+        self.bit_sign(ty, false, Reg::Rax);
+        if ty == Type::F64 {
+            self.asm.shift_imm(Size::Q, Shift::Shr, Reg::Rcx, 63);
+            self.asm.shift_imm(Size::Q, Shift::Shl, Reg::Rcx, 63);
+            self.asm.alu(Alu::Or, Reg::Rax, Reg::Rcx);
+        } else {
+            self.asm.alu_imm32(Alu::And, Reg::Rcx, i32::MIN);
+            self.asm.alu32(Alu::Or, Reg::Rax, Reg::Rcx);
+        }
+        self.clobber_regs(&[Reg::Rax, Reg::Rcx]);
         self.put(result, Reg::Rax);
     }
 
@@ -289,29 +303,42 @@ impl Emit<'_> {
                 self.clobber_xmms(&[X0, X1, X2]);
                 self.put(result, Reg::Rax);
             }
-            Convert::Bitcast if to.in_float_register() && self.ty(x).in_float_register() => {
-                let dst = self.fdst(result);
-                let src = self.fin(x, dst);
-                if dst != src {
-                    self.fmov(to, dst, src);
-                }
-                self.fput(result, dst);
-            }
-            Convert::Bitcast if to.in_float_register() => {
-                let dst = self.fdst(result);
-                self.get(Reg::Rax, x, Ext::Zero);
-                self.asm.movq_in(dst, Reg::Rax);
-                self.fput(result, dst);
-            }
-            Convert::Bitcast => {
-                let src = self.fin(x, X0);
-                let dst = self.dst(result);
-                self.asm.movq_out(dst, src);
-                self.put(result, dst);
-            }
+            Convert::Bitcast => self.bitcast(x, result),
             other => return Err(format!("{other:?} from {:?} to {to:?}", self.ty(x))),
         }
         Ok(())
+    }
+
+    fn bitcast(&mut self, x: Value, result: Value) {
+        let to = self.ty(result);
+        if to.in_float_register() && self.ty(x).in_float_register() {
+            let dst = self.fdst(result);
+            let src = self.fin(x, dst);
+            if dst != src {
+                self.fmov(to, dst, src);
+            }
+            self.fput(result, dst);
+        } else if to.in_float_register() {
+            let dst = self.fdst(result);
+            if self.const_of(x) == Some(0) {
+                self.zero_xmm(dst);
+            } else {
+                self.get(Reg::Rax, x, Ext::Zero);
+                let wide = to != Type::F32 && self.const_of(x).is_none_or(|c| (c as u64) > u64::from(u32::MAX));
+                self.emit_mov_xmm_gpr(dst, Reg::Rax, wide);
+                self.clobber_xmm(dst);
+            }
+            self.fput(result, dst);
+        } else {
+            let src = self.fin(x, X0);
+            let dst = self.dst(result);
+            if self.ty(x) == Type::F32 {
+                self.asm.movd_out(dst, src);
+            } else {
+                self.asm.movq_out(dst, src);
+            }
+            self.put(result, dst);
+        }
     }
 
     /// Converts unsigned `x` to a float of type `to` in `dst`.
