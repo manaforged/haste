@@ -10,17 +10,19 @@ machine code.
 
 ```bash
 cargo build --release -p haste
+./target/release/haste --version
 ./target/release/haste run examples/hello
-./target/release/haste --release build -o /tmp/hello examples/hello
+./target/release/haste --release build -o ./hello examples/hello
 ```
 
 If a workspace has no `Cargo.lock`, run `cargo generate-lockfile` in it first.
 `haste run` compiles functions the first time execution reaches them, and build
 scripts and procedural macros run inside haste. Unchanged build script outputs,
-macro expansions, and standard library summaries stay in `~/.cache/haste`,
-keyed by their inputs.
+macro expansions, standard library summaries, and compiled workspace stencils
+stay in `~/.cache/haste`, keyed by their inputs, so repeated builds rebuild
+only edited items and skip unchanged workspaces.
 
-haste is experimental. There is no release yet, and the command line can change.
+haste is experimental. There is no tagged release yet, and the command line can change.
 
 ## Commands
 
@@ -28,6 +30,7 @@ haste is experimental. There is no release yet, and the command line can change.
 haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] [-o PATH] build|test|run|serve|prep PATH [--] [ARGS...]
 haste [--jobs N] debug graph|outline|lazy|typeck|scope|items|expand|failures PATH [CRATE]
 haste [--release] debug code PATH DIR
+haste -V|--version | -h|--help
 ```
 
 | Command | Does |
@@ -41,6 +44,8 @@ haste [--release] debug code PATH DIR
 
 ### Options
 
+- `-V`, `--version`: Prints the compiler version and exits.
+- `-h`, `--help`: Prints command usage and exits.
 - `--jobs N`: Sets the worker thread or process count. Defaults to the cores available to the process.
 - `--release`: Enables full codegen optimization and release `cfg` settings.
 - `-o PATH`, `--output PATH`: Writes a standalone native executable (`haste build` only).
@@ -56,14 +61,19 @@ haste [--release] debug code PATH DIR
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `HASTE_HOME` | `$XDG_CACHE_HOME/haste`, else `~/.cache/haste` | Cache directory for build script outputs, macro expansions, and standard library summaries. |
+| `HASTE_HOME` | `$XDG_CACHE_HOME/haste`, else `~/.cache/haste` | Cache directory for build script outputs, macro expansions, standard library summaries, and compiled stencils. |
 | `HASTE_LIBRARY` | Newest `stable-*` `rust-src` `library` directory under `$RUSTUP_HOME` | Path to the Rust standard library `library/` source tree. |
-| `HASTE_NO_SUBSTRATE` | Unset (`0`) | Set to `1` to bypass the cached standard library substrate. |
+| `HASTE_NO_SUBSTRATE` | Unset (`0`) | Set to `1` to bypass the cached standard library and workspace substrate. |
+| `HASTE_NO_NOOP` | Unset (`0`) | Set to `1` to disable the unchanged-workspace skip check on one-shot `haste build`. |
 | `HASTE_X64_BASELINE` | Unset (`0`) | Set to `1` on x86-64 to disable host ISA feature detection beyond baseline SSE2. |
+| `HASTE_FN_ALIGN` | `64` | Function alignment in bytes (power of two, `>= 16`) for standalone AOT executables. |
 | `HASTE_DICT_MIN_BYTES` | `512` | Minimum generic body size in bytes before dictionary lowering is considered. |
 | `HASTE_DICT_MIN_FANOUT` | `8` | Minimum monomorphization fanout before sharing a dictionary body. |
 | `HASTE_JIT_TIER_UP` | `64` | Call count threshold before a hot dictionary function specializes in JIT mode (`0` disables tier-up). |
 | `HASTE_VERIFY_STENCIL` | Unset (`0`) | Set to `1` to verify stencil instantiations against concrete lowering. |
+| `HASTE_TRACE` | Unset (`0`) | Function substring filter (`1` matches all) for printing codegen pass summaries. |
+| `HASTE_TRACE_IR` | Unset (`0`) | Set to `1` with `HASTE_TRACE` to dump IR after each codegen pass. |
+| `HASTE_MISSED` | Unset (`0`) | Set to `1` to print aggregated codegen pass timings and stencil cache counters. |
 
 ## Check against rustc
 
