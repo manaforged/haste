@@ -4,10 +4,12 @@ mod coalesce;
 mod dom;
 mod join;
 mod pack;
+mod remat;
 
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 use dom::{BlockWrites, invalidate_preserving, record_base, write_preserving};
 use join::{BlockClobber, JoinCtx, SubwordPlan, const_eq_for_ty, eligible_join_preds, find_subword_source, for_edge_args, for_edge_args_mut, resolve_select_load, rodata_const, try_join_phi_forward};
+use remat::FarCseGuard;
 
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, TargetOpId, TinyArgs, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, compute_affine, may_alias};
@@ -309,7 +311,9 @@ fn scan(
     };
     let mut clobbers_seen = Vec::new();
     let (mut changed, mut renamed) = (false, false);
+    let mut guard = FarCseGuard::new(insts.len(), func.types.len());
     for inst in insts {
+        let kept_before = bufs.kept.len();
         if let Some((_, from, bytes)) = copy_len(&func.insts[inst.index()].op, state.consts) {
             if bytes > 0 {
                 let read_loc = addr_loc(state.prov, state.subst, from, 0, bytes);
@@ -337,7 +341,7 @@ fn scan(
         }
         match effect(func, state, inst) {
             Effect::Read(loc, ty, result) => {
-                let mut forwarded = known.get(loc.base, loc.offset, ty);
+                let (mut forwarded, skip_far) = guard.check_cse(&func.insts[inst.index()].op, ty, known.get(loc.base, loc.offset, ty));
                 if forwarded.is_none() {
                     if let Some(imm) = rodata_const(func, loc, ty) {
                         func.insts[inst.index()].op = Op::Const(imm);
@@ -368,12 +372,14 @@ fn scan(
                         }
                         known.remember(loc, ty, result);
                         changed = true;
-                    } else if forward_subword(func, state, &mut bufs.kept, known, inst, loc, ty)
-                        || forward_concat(func, state, &mut bufs.kept, known, inst, loc, ty)
+                    } else if !skip_far
+                        && (forward_subword(func, state, &mut bufs.kept, known, inst, loc, ty)
+                            || forward_concat(func, state, &mut bufs.kept, known, inst, loc, ty))
                     {
                         known.remember(loc, ty, result);
                         changed = true;
-                    } else if let Op::Load(addr, offset) = func.insts[inst.index()].op
+                    } else if !skip_far
+                        && let Op::Load(addr, offset) = func.insts[inst.index()].op
                         && ty != Type::I128
                         && let Some(&(c, ptr_a, ptr_b)) = state.selects.get(find(state.subst, addr).index()).and_then(Option::as_ref)
                         && !func.ty(c).is_vector()
@@ -390,7 +396,9 @@ fn scan(
                             known.remember(loc, ty, result);
                         }
                         changed = true;
-                    } else if let Some(fwd) = try_join_phi_forward(func, (block, inst, loc, ty, result), state, known, join, &clobbers_seen) {
+                    } else if !skip_far
+                        && let Some(fwd) = try_join_phi_forward(func, (block, inst, loc, ty, result), state, known, join, &clobbers_seen)
+                    {
                         forwarded = fwd;
                         changed = true;
                     } else {
@@ -411,6 +419,7 @@ fn scan(
                     }
                     renamed = true;
                     changed = true;
+                    guard.sync_kept(func, state.subst, &bufs.kept[kept_before..]);
                     continue;
                 }
             }
@@ -437,6 +446,7 @@ fn scan(
                         if ploc.base == loc.base && ploc.offset >= loc.offset && pend <= end {
                             if let Some(dead_store) = bufs.kept[kept_idx].take() {
                                 func.insts[dead_store.index()].op = Op::Trap;
+                                guard.on_drop_store();
                                 changed = true;
                             }
                             false
@@ -479,6 +489,7 @@ fn scan(
                 });
                 if let Some((0, _)) = canon_move {
                     bufs.kept.push(Some(inst));
+                    guard.sync_kept(func, state.subst, &bufs.kept[kept_before..]);
                     continue;
                 }
                 let clobber_op = match canon_move {
@@ -515,6 +526,7 @@ fn scan(
             Effect::None => {}
         }
         bufs.kept.push(Some(inst));
+        guard.sync_kept(func, state.subst, &bufs.kept[kept_before..]);
     }
     bases.retain(|&(base, _)| !known.entries_for(base).is_empty());
     func.blocks[block.index()].insts = bufs.kept.into_iter().flatten().collect();
@@ -773,5 +785,6 @@ pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
     if scan_changed {
         changed |= pack::coalesce_vec_rescan(func, &cfg, target);
     }
+    changed |= remat::split_long_loads(func, &prov);
     domain(changed)
 }
