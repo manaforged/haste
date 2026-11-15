@@ -54,8 +54,7 @@ impl Emit<'_> {
             }
             return;
         }
-        let left = if bits >= 32 { self.bits(x, A) } else { self.src(x, A, Ext::Zero) };
-        let right = if bits >= 32 { self.bits(y, C) } else { self.src(y, C, Ext::Zero) };
+        let (left, right) = if bits >= 32 { self.bits_pair(x, y) } else { self.src_pair(x, y, Ext::Zero) };
         self.asm.alu(Alu::Ands, size, ZR, left, right);
     }
 

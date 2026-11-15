@@ -8,6 +8,8 @@ use crate::sema::ty::{Kind, Ty};
 use super::place::{Base, Place};
 use super::{Lower, Repr, repr};
 
+const INLINE_EQ_BYTES: u64 = 32;
+
 impl Lower<'_, '_> {
     /// Whether the values `x` and `y` of `ty` are equal part by part, the way a literal or constant pattern compares them, as an 8-bit flag.
     pub(super) fn equal(&mut self, ty: Ty, x: Value, y: Value) -> Result<Value> {
@@ -27,17 +29,7 @@ impl Lower<'_, '_> {
 
     fn equal_parts(&mut self, ty: Ty, kind: Kind, x: Value, y: Value) -> Result<Value> {
         let fields = match kind {
-            Kind::Array(element, count) => {
-                let count = self.len(count)?;
-                if self.is_bitwise_int(element) {
-                    let total = (count as u64).saturating_mul(self.cx.layout(element)?.size.bytes());
-                    if total <= 16 {
-                        return self.equal_bytes_const((x, y), total);
-                    }
-                }
-                let count = self.ins().iconst(Type::I64, count);
-                return self.equal_items(element, (x, y), count);
-            }
+            Kind::Array(element, count) => return self.equal_array(element, count, (x, y)),
             Kind::Tuple(items) => self.cx.types.substs(items).to_vec(),
             Kind::Adt(item, args) => {
                 let slice = self.cx.types.substs(args).to_vec();
@@ -61,6 +53,18 @@ impl Lower<'_, '_> {
             all = self.ins().band(all, same);
         }
         Ok(all)
+    }
+
+    fn equal_array(&mut self, element: Ty, count: Ty, (x, y): (Value, Value)) -> Result<Value> {
+        let count = self.len(count)?;
+        if self.is_bitwise_int(element) {
+            let total = (count as u64).saturating_mul(self.cx.layout(element)?.size.bytes());
+            if total <= INLINE_EQ_BYTES {
+                return self.equal_bytes_const((x, y), total);
+            }
+        }
+        let count = self.ins().iconst(Type::I64, count);
+        self.equal_items(element, (x, y), count)
     }
 
     /// Whether the enum values at `x` and `y` of `ty`, whose variants hold the fields `variants`, hold the same variant with equal fields.
@@ -128,7 +132,7 @@ impl Lower<'_, '_> {
         let (data_x, len_x, static_x) = self.load_wide_pair(x);
         let (data_y, len_y, static_y) = self.load_wide_pair(y);
         let elem_bytes = self.is_bitwise_int(element).then(|| self.cx.layout(element).map(|l| l.size.bytes())).transpose()?;
-        let static_bytes = static_y.or(static_x).zip(elem_bytes).and_then(|(c, b)| c.checked_mul(b)).filter(|&bytes| bytes <= 16);
+        let static_bytes = static_y.or(static_x).zip(elem_bytes).and_then(|(c, b)| c.checked_mul(b)).filter(|&bytes| bytes <= INLINE_EQ_BYTES);
         let same_len = self.ins().icmp(IntCC::Equal, len_x, len_y);
         let (check, done) = (self.b.create_block(), self.b.create_block());
         let res = self.b.append_block_param(done, Type::I8);
@@ -166,10 +170,12 @@ impl Lower<'_, '_> {
         self.ins().bxor(a, b)
     }
 
-    fn equal_pair_xor(&mut self, ty: Type, (x0, y0): (Value, Value), off0: i32, (x1, y1): (Value, Value), off1: i32) -> Value {
-        let d0 = self.xor_load(ty, (x0, y0), off0);
-        let d1 = self.xor_load(ty, (x1, y1), off1);
-        let any = self.ins().bor(d0, d1);
+    fn equal_xors(&mut self, ty: Type, pair: (Value, Value), offsets: &[i32]) -> Value {
+        let mut any = self.xor_load(ty, pair, offsets[0]);
+        for &off in &offsets[1..] {
+            let next = self.xor_load(ty, pair, off);
+            any = self.ins().bor(any, next);
+        }
         let zero = self.ins().iconst(ty, 0);
         self.ins().icmp(IntCC::Equal, any, zero)
     }
@@ -179,11 +185,13 @@ impl Lower<'_, '_> {
             0 => self.ins().iconst(Type::I8, 1),
             1 => self.equal_load(Type::I8, (x, y), 0),
             2 => self.equal_load(Type::I16, (x, y), 0),
-            3 => self.equal_pair_xor(Type::I16, (x, y), 0, (x, y), 1),
+            3 => self.equal_xors(Type::I16, (x, y), &[0, 1]),
             4 => self.equal_load(Type::I32, (x, y), 0),
-            5..=7 => self.equal_pair_xor(Type::I32, (x, y), 0, (x, y), (len - 4) as i32),
+            5..=7 => self.equal_xors(Type::I32, (x, y), &[0, (len - 4) as i32]),
             8 => self.equal_load(Type::I64, (x, y), 0),
-            9..=16 => self.equal_pair_xor(Type::I64, (x, y), 0, (x, y), (len - 8) as i32),
+            9..=16 => self.equal_xors(Type::I64, (x, y), &[0, (len - 8) as i32]),
+            17..=24 => self.equal_xors(Type::I64, (x, y), &[0, 8, (len - 8) as i32]),
+            25..=32 => self.equal_xors(Type::I64, (x, y), &[0, 8, 16, (len - 8) as i32]),
             _ => {
                 let count = self.ins().iconst(Type::I64, len as i64);
                 let order = self.compare_bytes((x, y), count)?;
@@ -195,7 +203,8 @@ impl Lower<'_, '_> {
 
     fn equal_bytes_runtime(&mut self, (x, y): (Value, Value), len: Value) -> Result<Value> {
         if let Some(n) = self.b.const_int(len)
-            && (0..=16).contains(&n)
+            && n >= 0
+            && (n as u64) <= INLINE_EQ_BYTES
         {
             return self.equal_bytes_const((x, y), n as u64);
         }

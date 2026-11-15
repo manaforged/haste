@@ -1,93 +1,303 @@
 use super::{defs, extend};
 use crate::ir::{Binary, Function, Inst, IntCC, Op, Type, Value};
 
-fn cmp_const(func: &Function, defs: &[Option<Inst>], consts: &[Option<i64>], v: Value) -> Option<(IntCC, Value, i64)> {
-    let Op::Icmp(cc, l, r) = func.insts[defs.get(v.index()).copied().flatten()?.index()].op else { return None };
-    if !func.ty(l).is_small_int() { return None; }
-    consts.get(r.index()).copied().flatten().map(|c| (cc, l, c)).or_else(|| consts.get(l.index()).copied().flatten().map(|c| (crate::cse::flip_int_cc(cc), r, c)))
+struct RangeState {
+    defs: Vec<Option<Inst>>,
+    uses: Vec<u32>,
+    consts: Vec<Option<i64>>,
 }
 
-fn fuse_cmp_pair(is_and: bool, ty: Type, (cc1, c1): (IntCC, i64), (cc2, c2): (IntCC, i64)) -> Option<(Option<(Binary, i64)>, IntCC, i64)> {
-    let umax = ty.unsigned_max();
+fn def_inst(state: &RangeState, v: Value) -> Option<Inst> {
+    state.defs.get(v.index()).copied().flatten()
+}
+
+fn const_val(state: &RangeState, v: Value) -> Option<i64> {
+    state.consts.get(v.index()).copied().flatten()
+}
+
+fn cmp_const(func: &Function, state: &RangeState, v: Value) -> Option<(IntCC, Value, i64)> {
+    let Op::Icmp(cc, l, r) = func.insts[def_inst(state, v)?.index()].op else {
+        return None;
+    };
+    if !func.ty(l).is_small_int() {
+        return None;
+    }
+    const_val(state, r)
+        .map(|c| (cc, l, c))
+        .or_else(|| const_val(state, l).map(|c| (crate::cse::flip_int_cc(cc), r, c)))
+}
+
+fn band_args(func: &Function, state: &RangeState, v: Value, eq_cc: IntCC) -> Option<(Value, Value)> {
+    let Op::Icmp(cc, l, r) = func.insts[def_inst(state, v)?.index()].op else {
+        return None;
+    };
+    if cc != eq_cc {
+        return None;
+    }
+    let arg = match (const_val(state, l), const_val(state, r)) {
+        (_, Some(0)) => l,
+        (Some(0), _) => r,
+        _ => return None,
+    };
+    if state.uses.get(arg.index()).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+    let Op::Binary(Binary::Band, x, m) = func.insts[def_inst(state, arg)?.index()].op else {
+        return None;
+    };
+    func.ty(x).is_small_int().then_some((x, m))
+}
+
+fn shared_mask_pair(a: (Value, Value), b: (Value, Value)) -> Option<(Value, Value, Value)> {
+    if a.0 == b.0 {
+        Some((a.0, a.1, b.1))
+    } else if a.0 == b.1 {
+        Some((a.0, a.1, b.0))
+    } else if a.1 == b.0 {
+        Some((a.1, a.0, b.1))
+    } else if a.1 == b.1 {
+        Some((a.1, a.0, b.0))
+    } else {
+        None
+    }
+}
+
+fn try_fold_mask_zero(func: &mut Function, inst: Inst, state: &mut RangeState, next: &mut Vec<Inst>) -> bool {
+    let Op::Binary(op @ (Binary::Band | Binary::Bor), a, b) = func.insts[inst.index()].op else {
+        return false;
+    };
+    if state.uses[a.index()] != 1 || state.uses[b.index()] != 1 {
+        return false;
+    }
+    let eq_cc = if op == Binary::Band { IntCC::Equal } else { IntCC::NotEqual };
+    let (Some(p1), Some(p2)) = (band_args(func, state, a, eq_cc), band_args(func, state, b, eq_cc)) else {
+        return false;
+    };
+    let Some((x, m1, m2)) = shared_mask_pair(p1, p2) else {
+        return false;
+    };
+    let ty = func.ty(x);
+    let mask = match (const_val(state, m1), const_val(state, m2)) {
+        (Some(c1), Some(c2)) => {
+            let mv = func.value(ty);
+            let imm = c1 | c2;
+            state.consts.push(Some(extend(imm, ty, false)));
+            next.push(func.add(Op::Const(imm), Some(mv)));
+            mv
+        }
+        _ => {
+            let mv = func.value(ty);
+            state.consts.push(None);
+            next.push(func.add(Op::Binary(Binary::Bor, m1, m2), Some(mv)));
+            mv
+        }
+    };
+    let masked = func.value(ty);
+    let zero = func.value(ty);
+    state.consts.extend([None, Some(0)]);
+    next.push(func.add(Op::Binary(Binary::Band, x, mask), Some(masked)));
+    next.push(func.add(Op::Const(0), Some(zero)));
+    func.insts[inst.index()].op = Op::Icmp(eq_cc, masked, zero);
+    true
+}
+
+type FusedCmp = (Option<(Binary, i64)>, IntCC, i64);
+
+fn fuse_eq_pair(is_and: bool, ty: Type, u1: u64, u2: u64) -> Option<FusedCmp> {
     let eq_cc = if is_and { IntCC::NotEqual } else { IntCC::Equal };
-    if cc1 == eq_cc && cc2 == eq_cc {
-        let (u1, u2) = (extend(c1, ty, false) as u64, extend(c2, ty, false) as u64);
-        let (lo, hi) = if u1 <= u2 { (u1, u2) } else { (u2, u1) };
-        let diff = hi - lo;
-        return (diff != 0 && diff.is_power_of_two() && (lo & diff) == 0).then_some((Some((Binary::Bor, diff as i64)), eq_cc, hi as i64));
+    let out_cc = if is_and { IntCC::UnsignedGreaterThan } else { IntCC::UnsignedLessThanOrEqual };
+    let (lo, hi) = if u1 <= u2 { (u1, u2) } else { (u2, u1) };
+    if lo == hi {
+        return Some((None, eq_cc, lo as i64));
+    }
+    let umax = ty.unsigned_max();
+    if umax >= 2 && lo == 0 && hi == 1 {
+        return Some((None, out_cc, 1));
+    }
+    if umax >= 2 && hi - lo == 1 {
+        return Some((Some((Binary::Isub, lo as i64)), out_cc, 1));
+    }
+    if umax >= 2 && lo == 0 && hi == umax {
+        return Some((Some((Binary::Iadd, 1)), out_cc, 1));
+    }
+    let diff = hi - lo;
+    (diff.is_power_of_two() && (lo & diff) == 0).then_some((Some((Binary::Bor, diff as i64)), eq_cc, hi as i64))
+}
+
+fn unsigned_lo(is_and: bool, ty: Type, side: (IntCC, i64)) -> Option<u64> {
+    let umax = ty.unsigned_max();
+    match (is_and, side.0, extend(side.1, ty, false) as u64) {
+        (true, IntCC::UnsignedGreaterThanOrEqual, u) | (false, IntCC::UnsignedLessThan, u) => Some(u),
+        (true, IntCC::UnsignedGreaterThan, u) | (false, IntCC::UnsignedLessThanOrEqual, u) if u < umax => Some(u + 1),
+        _ => None,
+    }
+}
+
+fn unsigned_hi(is_and: bool, ty: Type, side: (IntCC, i64)) -> Option<u64> {
+    match (is_and, side.0, extend(side.1, ty, false) as u64) {
+        (true, IntCC::UnsignedLessThanOrEqual, u) | (false, IntCC::UnsignedGreaterThan, u) => Some(u),
+        (true, IntCC::UnsignedLessThan, u) | (false, IntCC::UnsignedGreaterThanOrEqual, u) if u > 0 => Some(u - 1),
+        _ => None,
+    }
+}
+
+fn fuse_unsigned_pair(is_and: bool, ty: Type, l: (IntCC, i64), h: (IntCC, i64)) -> Option<FusedCmp> {
+    let u_lo = unsigned_lo(is_and, ty, l)?;
+    let u_hi = unsigned_hi(is_and, ty, h)?;
+    if u_lo > u_hi || u_hi - u_lo >= ty.unsigned_max() {
+        return None;
+    }
+    if u_lo == u_hi {
+        let eq_cc = if is_and { IntCC::Equal } else { IntCC::NotEqual };
+        return Some((None, eq_cc, u_lo as i64));
     }
     let out_cc = if is_and { IntCC::UnsignedLessThanOrEqual } else { IntCC::UnsignedGreaterThan };
-    let (smin, smax) = if ty.bits() == 64 { (i64::MIN, i64::MAX) } else { (-(1_i64 << (ty.bits() - 1)), (1_i64 << (ty.bits() - 1)) - 1) };
-    for ((l_cc, lc), (h_cc, hc)) in [((cc1, c1), (cc2, c2)), ((cc2, c2), (cc1, c1))] {
-        let u_lo = match (is_and, l_cc, extend(lc, ty, false) as u64) {
-            (true, IntCC::UnsignedGreaterThanOrEqual, u) | (false, IntCC::UnsignedLessThan, u) => Some(u),
-            (true, IntCC::UnsignedGreaterThan, u) | (false, IntCC::UnsignedLessThanOrEqual, u) if u < umax => Some(u + 1),
-            _ => None,
-        };
-        let u_hi = match (is_and, h_cc, extend(hc, ty, false) as u64) {
-            (true, IntCC::UnsignedLessThanOrEqual, u) | (false, IntCC::UnsignedGreaterThan, u) => Some(u),
-            (true, IntCC::UnsignedLessThan, u) | (false, IntCC::UnsignedGreaterThanOrEqual, u) if u > 0 => Some(u - 1),
-            _ => None,
-        };
-        if let (Some(lo), Some(hi)) = (u_lo, u_hi) && lo <= hi && hi - lo < umax {
-            return Some(((lo != 0).then_some((Binary::Isub, lo as i64)), out_cc, (hi - lo) as i64));
-        }
-        let s_lo = match (is_and, l_cc, extend(lc, ty, true)) {
-            (true, IntCC::SignedGreaterThanOrEqual, s) | (false, IntCC::SignedLessThan, s) => Some(s),
-            (true, IntCC::SignedGreaterThan, s) | (false, IntCC::SignedLessThanOrEqual, s) if s < smax => Some(s + 1),
-            _ => None,
-        };
-        let s_hi = match (is_and, h_cc, extend(hc, ty, true)) {
-            (true, IntCC::SignedLessThanOrEqual, s) | (false, IntCC::SignedGreaterThan, s) => Some(s),
-            (true, IntCC::SignedLessThan, s) | (false, IntCC::SignedGreaterThanOrEqual, s) if s > smin => Some(s - 1),
-            _ => None,
-        };
-        if let (Some(lo), Some(hi)) = (s_lo, s_hi) && lo <= hi {
-            let (span, lo_u) = ((hi as u64).wrapping_sub(lo as u64) & umax, (lo as u64) & umax);
-            if span < umax { return Some(((lo_u != 0).then_some((Binary::Isub, lo_u as i64)), out_cc, span as i64)); }
+    Some(((u_lo != 0).then_some((Binary::Isub, u_lo as i64)), out_cc, (u_hi - u_lo) as i64))
+}
+
+fn fuse_signed_pair(is_and: bool, ty: Type, l: (IntCC, i64), h: (IntCC, i64)) -> Option<FusedCmp> {
+    let umax = ty.unsigned_max();
+    let (smin, smax) = if ty.bits() == 64 {
+        (i64::MIN, i64::MAX)
+    } else {
+        (-(1_i64 << (ty.bits() - 1)), (1_i64 << (ty.bits() - 1)) - 1)
+    };
+    let s_lo = match (is_and, l.0, extend(l.1, ty, true)) {
+        (true, IntCC::SignedGreaterThanOrEqual, s) | (false, IntCC::SignedLessThan, s) => Some(s),
+        (true, IntCC::SignedGreaterThan, s) | (false, IntCC::SignedLessThanOrEqual, s) if s < smax => Some(s + 1),
+        _ => None,
+    }?;
+    let s_hi = match (is_and, h.0, extend(h.1, ty, true)) {
+        (true, IntCC::SignedLessThanOrEqual, s) | (false, IntCC::SignedGreaterThan, s) => Some(s),
+        (true, IntCC::SignedLessThan, s) | (false, IntCC::SignedGreaterThanOrEqual, s) if s > smin => Some(s - 1),
+        _ => None,
+    }?;
+    if s_lo > s_hi {
+        return None;
+    }
+    let (span, lo_u) = ((s_hi as u64).wrapping_sub(s_lo as u64) & umax, (s_lo as u64) & umax);
+    if span >= umax {
+        return None;
+    }
+    if span == 0 {
+        let eq_cc = if is_and { IntCC::Equal } else { IntCC::NotEqual };
+        return Some((None, eq_cc, lo_u as i64));
+    }
+    let out_cc = if is_and { IntCC::UnsignedLessThanOrEqual } else { IntCC::UnsignedGreaterThan };
+    Some(((lo_u != 0).then_some((Binary::Isub, lo_u as i64)), out_cc, span as i64))
+}
+
+fn signed_zero_half(is_and: bool, ty: Type, s_side: (IntCC, i64)) -> Option<bool> {
+    match (is_and, s_side.0, extend(s_side.1, ty, true)) {
+        (true, IntCC::SignedGreaterThanOrEqual, 0)
+        | (true, IntCC::SignedGreaterThan, -1)
+        | (false, IntCC::SignedLessThan, 0)
+        | (false, IntCC::SignedLessThanOrEqual, -1) => Some(true),
+        (true, IntCC::SignedLessThan, 0)
+        | (true, IntCC::SignedLessThanOrEqual, -1)
+        | (false, IntCC::SignedGreaterThanOrEqual, 0)
+        | (false, IntCC::SignedGreaterThan, -1) => Some(false),
+        _ => None,
+    }
+}
+
+fn fuse_mixed_sign_pair(is_and: bool, ty: Type, s_side: (IntCC, i64), u_side: (IntCC, i64)) -> Option<FusedCmp> {
+    let umax = ty.unsigned_max();
+    if umax < 2 {
+        return None;
+    }
+    let smax = umax >> 1;
+    if signed_zero_half(is_and, ty, s_side)? {
+        let u_hi = unsigned_hi(is_and, ty, u_side)?;
+        let out_cc = if is_and { IntCC::UnsignedLessThanOrEqual } else { IntCC::UnsignedGreaterThan };
+        Some((None, out_cc, u_hi.min(smax) as i64))
+    } else {
+        let u_lo = unsigned_lo(is_and, ty, u_side)?;
+        let out_cc = if is_and { IntCC::UnsignedGreaterThanOrEqual } else { IntCC::UnsignedLessThan };
+        Some((None, out_cc, u_lo.max(smax + 1) as i64))
+    }
+}
+
+fn fuse_cmp_pair(is_and: bool, ty: Type, p1: (IntCC, i64), p2: (IntCC, i64)) -> Option<FusedCmp> {
+    let eq_cc = if is_and { IntCC::NotEqual } else { IntCC::Equal };
+    if p1.0 == eq_cc && p2.0 == eq_cc {
+        return fuse_eq_pair(is_and, ty, extend(p1.1, ty, false) as u64, extend(p2.1, ty, false) as u64);
+    }
+    for (l, h) in [(p1, p2), (p2, p1)] {
+        if let Some(res) = fuse_unsigned_pair(is_and, ty, l, h)
+            .or_else(|| fuse_signed_pair(is_and, ty, l, h))
+            .or_else(|| fuse_mixed_sign_pair(is_and, ty, l, h))
+        {
+            return Some(res);
         }
     }
     None
 }
 
-/// Fuses each `and` or `or` of two single-use compares of one value against constants into one range or mask compare.
-pub(super) fn fold_range_checks(func: &mut Function) -> bool {
-    let mut compare = vec![false; func.types.len()];
-    for data in func.blocks.iter().flat_map(|block| &block.insts).map(|inst| &func.insts[inst.index()]) {
-        if let (&Op::Icmp(_, l, _), Some(res)) = (&data.op, data.result) && func.ty(l).is_small_int() { compare[res.index()] = true; }
+fn has_candidate_pair(func: &Function) -> bool {
+    let mut is_cmp = vec![false; func.types.len()];
+    for data in func.blocks.iter().flat_map(|b| &b.insts).map(|i| &func.insts[i.index()]) {
+        if let (&Op::Icmp(_, l, _), Some(res)) = (&data.op, data.result) && func.ty(l).is_small_int() {
+            is_cmp[res.index()] = true;
+        }
     }
-    let pair = |inst: &Inst| matches!(func.insts[inst.index()].op, Op::Binary(Binary::Band | Binary::Bor, a, b) if compare[a.index()] && compare[b.index()]);
-    if !func.blocks.iter().flat_map(|block| &block.insts).any(pair) { return false; }
-    let (defs, uses) = (defs(func), func.use_counts());
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(func.insts[i.index()].op, Op::Binary(Binary::Band | Binary::Bor, a, b) if is_cmp[a.index()] && is_cmp[b.index()]))
+}
+
+fn try_fold_cmp_pair(func: &mut Function, inst: Inst, state: &mut RangeState, next: &mut Vec<Inst>) -> bool {
+    let Op::Binary(op @ (Binary::Band | Binary::Bor), a, b) = func.insts[inst.index()].op else {
+        return false;
+    };
+    if state.uses[a.index()] != 1 || state.uses[b.index()] != 1 {
+        return false;
+    }
+    let (Some((cc1, x1, c1)), Some((cc2, x2, c2))) = (cmp_const(func, state, a), cmp_const(func, state, b)) else {
+        return false;
+    };
+    if x1 != x2 {
+        return false;
+    }
+    let x_ty = func.ty(x1);
+    let Some((pre, out_cc, out_imm)) = fuse_cmp_pair(op == Binary::Band, x_ty, (cc1, c1), (cc2, c2)) else {
+        return false;
+    };
+    let lhs = if let Some((pre_op, pre_imm)) = pre {
+        let (c_pre, r_pre) = (func.value(x_ty), func.value(x_ty));
+        state.consts.extend([Some(extend(pre_imm, x_ty, false)), None]);
+        next.push(func.add(Op::Const(pre_imm), Some(c_pre)));
+        next.push(func.add(Op::Binary(pre_op, x1, c_pre), Some(r_pre)));
+        r_pre
+    } else {
+        x1
+    };
+    let c_out = func.value(x_ty);
+    state.consts.push(Some(extend(out_imm, x_ty, false)));
+    next.push(func.add(Op::Const(out_imm), Some(c_out)));
+    func.insts[inst.index()].op = Op::Icmp(out_cc, lhs, c_out);
+    true
+}
+
+/// Fuses each `and` or `or` of two single-use compares of one value against constants or masks into one compare.
+pub(super) fn fold_range_checks(func: &mut Function) -> bool {
+    if !has_candidate_pair(func) {
+        return false;
+    }
     let mut consts = vec![None; func.types.len()];
     for data in &func.insts {
         if let (&Op::Const(imm), Some(res)) = (&data.op, data.result) && func.ty(res).is_small_int() {
             consts[res.index()] = Some(extend(imm, func.ty(res), false));
         }
     }
+    let mut state = RangeState { defs: defs(func), uses: func.use_counts(), consts };
     let mut changed = false;
     for b_idx in 0..func.blocks.len() {
         let orig = std::mem::take(&mut func.blocks[b_idx].insts);
         let mut next = Vec::with_capacity(orig.len());
         for inst in orig {
-            if let Op::Binary(op @ (Binary::Band | Binary::Bor), a, b) = func.insts[inst.index()].op
-                && uses[a.index()] == 1 && uses[b.index()] == 1
-                && let (Some((cc1, x1, c1)), Some((cc2, x2, c2))) = (cmp_const(func, &defs, &consts, a), cmp_const(func, &defs, &consts, b))
-                && x1 == x2
-                && let Some((pre, out_cc, out_imm)) = fuse_cmp_pair(op == Binary::Band, func.ty(x1), (cc1, c1), (cc2, c2))
-            {
-                let x_ty = func.ty(x1);
-                let lhs = if let Some((pre_op, pre_imm)) = pre {
-                    let (c_pre, r_pre) = (func.value(x_ty), func.value(x_ty));
-                    consts.extend([Some(extend(pre_imm, x_ty, false)), None]);
-                    next.push(func.add(Op::Const(pre_imm), Some(c_pre)));
-                    next.push(func.add(Op::Binary(pre_op, x1, c_pre), Some(r_pre)));
-                    r_pre
-                } else { x1 };
-                let c_out = func.value(x_ty);
-                consts.push(Some(extend(out_imm, x_ty, false)));
-                next.push(func.add(Op::Const(out_imm), Some(c_out)));
-                func.insts[inst.index()].op = Op::Icmp(out_cc, lhs, c_out);
+            if try_fold_cmp_pair(func, inst, &mut state, &mut next) || try_fold_mask_zero(func, inst, &mut state, &mut next) {
                 changed = true;
             }
             next.push(inst);
