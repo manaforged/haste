@@ -82,6 +82,34 @@ fn ext_op_of(dst_ty: Type, src_ty: Type, signed: bool) -> Option<ExtOp> {
     }
 }
 
+pub(in crate::arm64) const fn width_mask(bits: u32) -> u64 {
+    if bits >= 64 { u64::MAX } else { (1_u64 << bits) - 1 }
+}
+
+pub(in crate::arm64) const fn narrow_mask_bits(mask: i64) -> Option<u32> {
+    match mask {
+        0xFF => Some(8),
+        0xFFFF => Some(16),
+        0xFFFF_FFFF => Some(32),
+        _ => None,
+    }
+}
+
+pub(in crate::arm64) const fn fits_width(val: i64, bits: u32, signed: bool) -> bool {
+    if bits == 0 || bits > 64 {
+        return false;
+    }
+    if bits == 64 {
+        return true;
+    }
+    if signed {
+        let shift = 64 - bits;
+        (val << shift) >> shift == val
+    } else {
+        (val as u64) <= width_mask(bits)
+    }
+}
+
 pub(super) fn ext_band_of(
     func: &Function,
     plan: &Plan<Reg>,
@@ -97,10 +125,10 @@ pub(super) fn ext_band_of(
         let Some(imm) = const_of(func, plan, m_val, def).map(|v| (v as u64) & mask) else {
             continue;
         };
-        let ext = match (dst_ty, imm) {
-            (Type::I32 | Type::I64, 0xFF) => Some(ExtOp::Uxtb),
-            (Type::I32 | Type::I64, 0xFFFF) => Some(ExtOp::Uxth),
-            (Type::I64, 0xFFFF_FFFF) => Some(ExtOp::Uxtw),
+        let ext = match (dst_ty, narrow_mask_bits(imm as i64)) {
+            (Type::I32 | Type::I64, Some(8)) => Some(ExtOp::Uxtb),
+            (Type::I32 | Type::I64, Some(16)) => Some(ExtOp::Uxth),
+            (Type::I64, Some(32)) => Some(ExtOp::Uxtw),
             _ => None,
         };
         if let Some(ext) = ext {

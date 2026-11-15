@@ -458,6 +458,42 @@ pub fn case_reg_boxed_fnonce_tuple(n: i64) -> i64 {
     out * 1000 + drops
 }
 
+static TAILREC_PTRS: [core::sync::atomic::AtomicUsize; 3] = [
+    core::sync::atomic::AtomicUsize::new(0),
+    core::sync::atomic::AtomicUsize::new(0),
+    core::sync::atomic::AtomicUsize::new(0),
+];
+
+#[inline(never)]
+fn stash_frame_slot(depth: usize, slot: &i64) {
+    if depth < 3 {
+        TAILREC_PTRS[depth].store(core::ptr::from_ref(slot) as usize, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[inline(never)]
+fn tailrec_escape_walk(depth: usize, seed: i64) -> i64 {
+    let local = match depth {
+        0 => seed + 3,
+        1 => seed + 7,
+        _ => seed + 10,
+    };
+    stash_frame_slot(depth, &local);
+    if depth == 2 {
+        let p0 = TAILREC_PTRS[0].load(core::sync::atomic::Ordering::SeqCst) as *const i64;
+        let p1 = TAILREC_PTRS[1].load(core::sync::atomic::Ordering::SeqCst) as *const i64;
+        let p2 = TAILREC_PTRS[2].load(core::sync::atomic::Ordering::SeqCst) as *const i64;
+        // SAFETY: `p0`, `p1`, and `p2` point to live `local` stack slots in frames 0, 1, and 2 unless tail-call loopification illegally reused a single slot.
+        unsafe { (*p0) * 100 + (*p1) * 10 + (*p2) }
+    } else {
+        tailrec_escape_walk(depth + 1, seed)
+    }
+}
+
+pub fn case_reg_tailrec_escape_helper(n: i64) -> i64 {
+    tailrec_escape_walk(0, black_box(n % 5))
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_byval_pair", case_reg_byval_pair),
     ("case_reg_byval_string", case_reg_byval_string),
@@ -478,4 +514,5 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_pin_cond_drop", case_reg_pin_cond_drop),
     ("case_reg_closure_scalar_env", case_reg_closure_scalar_env),
     ("case_reg_boxed_fnonce_tuple", case_reg_boxed_fnonce_tuple),
+    ("case_reg_tailrec_escape_helper", case_reg_tailrec_escape_helper),
 ];

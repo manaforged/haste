@@ -1,5 +1,5 @@
-use crate::ir::{Binary, Block, Convert, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, may_alias};
+use crate::ir::{Block, Convert, Function, Inst, Op, Type, Value};
+use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, is_hard_barrier, may_alias};
 use crate::merge::find;
 
 use super::coalesce::ScanBuf;
@@ -97,23 +97,6 @@ impl FarCseGuard {
 
 fn is_scalar_remat_ty(ty: Type) -> bool {
     ty.is_small_int() || ty.is_float()
-}
-
-fn is_hard_barrier(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Call { .. }
-            | Op::TryCall { .. }
-            | Op::AtomicLoad(_)
-            | Op::AtomicStore(..)
-            | Op::AtomicRmw(..)
-            | Op::AtomicCas(..)
-            | Op::Fence
-            | Op::Trap
-            | Op::Trapz(_)
-            | Op::Assume(_)
-            | Op::Binary(Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem, ..)
-    )
 }
 
 fn is_mem_write(op: &Op) -> bool {

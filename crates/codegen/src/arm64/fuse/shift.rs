@@ -1,8 +1,8 @@
 use super::super::asm::Reg;
 use super::bits::UseInfo;
 use super::{
-    alu_shift, can_peel_uextend, const_of, def_entry, def_inst, local_single, peel_other_uextend, preserved, shift_parts,
-    shift_uext_ok, zero_ext_loc,
+    alu_shift, can_peel_uextend, const_of, def_entry, def_inst, fits_width, local_single, peel_other_uextend,
+    preserved, shift_parts, shift_uext_ok, zero_ext_loc,
 };
 use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, Inst, InstData, Op, Type, Unary, Value};
@@ -138,15 +138,15 @@ fn high_bits_zero(
     let def = |v| def_inst(pos_of, v);
     let ty = func.ty(val);
     let (ty_bits, ty_mask) = (ty.bits(), ty.unsigned_max());
-    let u_mask = if u_bits >= 64 { u64::MAX } else { (1_u64 << u_bits) - 1 };
+    let fits_u = |c: i64| fits_width(((c as u64) & ty_mask) as i64, u_bits, false);
     if let Some(c) = const_of(func, plan, val, &def) {
-        return ((c as u64) & ty_mask) <= u_mask;
+        return fits_u(c);
     }
     let Some(inst) = def(val) else { return false };
     match func.insts[inst.index()].op {
         Op::Convert(Convert::Uextend, inner) => func.ty(inner).is_small_int() && func.ty(inner).bits() <= u_bits,
         Op::Binary(Binary::Band, a, b) => [a, b].into_iter().any(|mv| {
-            const_of(func, plan, mv, &def).is_some_and(|c| ((c as u64) & ty_mask) <= u_mask)
+            const_of(func, plan, mv, &def).is_some_and(fits_u)
         }),
         Op::Binary(Binary::Ushr, _, amt) => const_of(func, plan, amt, &def)
             .is_some_and(|c| ((c as u32) & (ty_bits - 1)) >= ty_bits - u_bits),

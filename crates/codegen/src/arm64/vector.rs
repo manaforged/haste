@@ -1,4 +1,8 @@
-use super::asm::{Bits, Cond, Fop, Funary, Reg, Size, Vreg, ZR};
+use super::asm::{Cond, Fop, Funary, Reg, Size, Vreg, ZR};
+use super::vector_ops::{
+    NEON_AND, NEON_BSL, NEON_DUP_GPR, NEON_DUP_GPR_2D, NEON_EOR, NEON_ORR, NEON_REV16, NEON_REV32, NEON_REV64, NEON_SMAX,
+    NEON_SMIN, NEON_SUB, NEON_SUB_1D, NEON_UMAX, NEON_UMIN, NEON_USHL, NEON_USHL_1D,
+};
 use super::{A, C, D, Emit, S, V0, V1};
 use crate::cse::flip_int_cc;
 use crate::ir::{Binary, Convert, FloatCC, IntCC, Lane, Op, ShuffleMask, Type, Unary, Value};
@@ -85,16 +89,18 @@ impl Emit<'_> {
         } else {
             if x == dst {
                 self.asm.vmov(V1, x);
+                self.clobber_vreg(V1);
                 x = V1;
             }
             if y == dst {
                 self.asm.vmov(V2, y);
+                self.clobber_vreg(V2);
                 y = V2;
             }
             self.asm.vmov(dst, mask);
             dst
         };
-        self.asm.vbit(0x2E60_1C00 | (q << 30), out, x, y);
+        self.asm.vbit(NEON_BSL | (q << 30), out, x, y);
     }
 
     fn splat_const(&self, value: Value) -> Option<i64> {
@@ -188,6 +194,7 @@ impl Emit<'_> {
             let mut s_hi = self.fin(hi, V1);
             if s_hi == dst {
                 self.asm.vmov(V2, s_hi);
+                self.clobber_vreg(V2);
                 s_hi = V2;
             }
             let s_lo = self.fin(lo, dst);
@@ -333,9 +340,9 @@ impl Emit<'_> {
                 self.asm.vmov(dst, src);
                 return;
             }
-            Lane::I16 => 0x0E20_1800,
-            Lane::I32 | Lane::F32 => 0x2E20_0800,
-            Lane::I64 | Lane::F64 => 0x0E20_0800,
+            Lane::I16 => NEON_REV16,
+            Lane::I32 | Lane::F32 => NEON_REV32,
+            Lane::I64 | Lane::F64 => NEON_REV64,
         };
         self.v_two(base | (spec.q << 30), dst, src);
     }
@@ -343,33 +350,13 @@ impl Emit<'_> {
     fn vec_clz(&mut self, spec: VecSpec, dst: Vreg, src: Vreg) {
         if spec.lane != Lane::I64 {
             self.v_two(0x2E20_4800 | (spec.q << 30) | (spec.size << 22), dst, src);
-            return;
-        }
-        self.asm.fmov_out(true, A, src);
-        self.asm.bits(Bits::Clz, A, A);
-        if spec.count == 2 {
-            self.asm.umov_d1(C, src);
-            self.asm.bits(Bits::Clz, C, C);
-        }
-        self.asm.fmov_in(true, dst, A);
-        if spec.count == 2 {
-            self.ins_gpr(dst, 3, 1, C);
+        } else {
+            self.vec_clz_or_ctz_i64(spec, false, dst, src);
         }
     }
 
     fn vec_ctz_i64(&mut self, spec: VecSpec, dst: Vreg, src: Vreg) {
-        self.asm.fmov_out(true, A, src);
-        self.asm.bits(Bits::Rbit, A, A);
-        self.asm.bits(Bits::Clz, A, A);
-        if spec.count == 2 {
-            self.asm.umov_d1(C, src);
-            self.asm.bits(Bits::Rbit, C, C);
-            self.asm.bits(Bits::Clz, C, C);
-        }
-        self.asm.fmov_in(true, dst, A);
-        if spec.count == 2 {
-            self.ins_gpr(dst, 3, 1, C);
-        }
+        self.vec_clz_or_ctz_i64(spec, true, dst, src);
     }
 
     pub(super) fn vec_binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {
@@ -380,18 +367,18 @@ impl Emit<'_> {
         match op {
             Binary::Band | Binary::Bor | Binary::Bxor => {
                 let base = match op {
-                    Binary::Band => 0x0E20_1C00,
-                    Binary::Bor => 0x0EA0_1C00,
-                    _ => 0x2E20_1C00,
+                    Binary::Band => NEON_AND,
+                    Binary::Bor => NEON_ORR,
+                    _ => NEON_EOR,
                 };
                 self.asm.vbit(base | (spec.q << 30), dst, a, b);
             }
             Binary::Iadd | Binary::Isub => {
                 let base = match (spec.is_1d(), op == Binary::Isub) {
                     (true, false) => 0x5EE0_8400,
-                    (true, true) => 0x7EE0_8400,
+                    (true, true) => NEON_SUB_1D,
                     (false, false) => 0x0E20_8400 | (spec.q << 30) | (spec.size << 22),
-                    (false, true) => 0x2E20_8400 | (spec.q << 30) | (spec.size << 22),
+                    (false, true) => NEON_SUB | (spec.q << 30) | (spec.size << 22),
                 };
                 self.asm.vbit(base, dst, a, b);
             }
@@ -407,6 +394,7 @@ impl Emit<'_> {
                     self.asm.umov_d1(C, b);
                     self.asm.madd(false, Size::X, S, (A, C), ZR);
                 }
+                self.clobber_regs(&[A, C, D, S]);
                 self.asm.fmov_in(true, dst, D);
                 if spec.count == 2 {
                     self.ins_gpr(dst, 3, 1, S);
@@ -414,10 +402,10 @@ impl Emit<'_> {
             }
             Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax if spec.lane != Lane::I64 => {
                 let base = match op {
-                    Binary::Smax => 0x0E20_6400,
-                    Binary::Smin => 0x0E20_6C00,
-                    Binary::Umax => 0x2E20_6400,
-                    _ => 0x2E20_6C00,
+                    Binary::Smax => NEON_SMAX,
+                    Binary::Smin => NEON_SMIN,
+                    Binary::Umax => NEON_UMAX,
+                    _ => NEON_UMIN,
                 };
                 self.asm.vbit(base | (spec.q << 30) | (spec.size << 22), dst, a, b);
             }
@@ -432,10 +420,11 @@ impl Emit<'_> {
                 let (t, f) = if matches!(op, Binary::Smax | Binary::Umax) { (a, b) } else { (b, a) };
                 if dst != a && dst != b {
                     self.asm.vbit(cmp, dst, a, b);
-                    self.asm.vbit(0x2E60_1C00 | (spec.q << 30), dst, t, f);
+                    self.asm.vbit(NEON_BSL | (spec.q << 30), dst, t, f);
                 } else {
+                    self.clobber_vreg(V2);
                     self.asm.vbit(cmp, V2, a, b);
-                    self.asm.vbit(0x2E60_1C00 | (spec.q << 30), V2, t, f);
+                    self.asm.vbit(NEON_BSL | (spec.q << 30), V2, t, f);
                     self.asm.vmov(dst, V2);
                 }
             }
@@ -445,14 +434,15 @@ impl Emit<'_> {
                 } else if let Some(imm) = self.splat_const(y) {
                     self.vec_shift_imm(spec, op, imm, dst, a);
                 } else if op == Binary::Ishl {
-                    let base = if spec.is_1d() { 0x7EE0_4400 } else { 0x2E20_4400 | (spec.q << 30) | (spec.size << 22) };
+                    let base = if spec.is_1d() { NEON_USHL_1D } else { NEON_USHL | (spec.q << 30) | (spec.size << 22) };
                     self.asm.vbit(base, dst, a, b);
                 } else {
+                    self.clobber_vreg(V2);
                     self.v_neg(spec, V2, b);
                     let base = match (spec.is_1d(), op == Binary::Sshr) {
-                        (true, false) => 0x7EE0_4400,
+                        (true, false) => NEON_USHL_1D,
                         (true, true) => 0x5EE0_4400,
-                        (false, false) => 0x2E20_4400 | (spec.q << 30) | (spec.size << 22),
+                        (false, false) => NEON_USHL | (spec.q << 30) | (spec.size << 22),
                         (false, true) => 0x0E20_4400 | (spec.q << 30) | (spec.size << 22),
                     };
                     self.asm.vbit(base, dst, a, V2);
@@ -461,8 +451,11 @@ impl Emit<'_> {
             Binary::Fcopysign => {
                 let sign = if spec.lane == Lane::F64 { i64::MIN } else { 0x8000_0000_u32 as i64 };
                 self.asm.mov_imm(A, sign);
+                self.clobber_reg(A);
+                self.clobber_vreg(V2);
+                self.clobber_vreg(V3);
                 let dup_imm5 = if spec.lane == Lane::F64 { 8 } else { 4 };
-                self.asm.word(0x4E00_0C00 | (dup_imm5 << 16) | u32::from(A.0) << 5 | u32::from(V2.0));
+                self.asm.word(NEON_DUP_GPR | (dup_imm5 << 16) | u32::from(A.0) << 5 | u32::from(V2.0));
                 self.asm.vmov(V3, a);
                 self.asm.vbit(0x2EA0_1C00 | (spec.q << 30), V3, b, V2);
                 self.asm.vmov(dst, V3);
@@ -506,10 +499,12 @@ impl Emit<'_> {
                 self.asm.vbit(0x2E20_1400 | (spec.q << 30) | (spec.size << 22), dst, a, b);
             }
             Binary::AvgRound => {
-                self.asm.vbit(0x0EA0_1C00 | (spec.q << 30), V2, a, b);
-                self.asm.vbit(0x2E20_1C00 | (spec.q << 30), V3, a, b);
+                self.clobber_vreg(V2);
+                self.clobber_vreg(V3);
+                self.asm.vbit(NEON_ORR | (spec.q << 30), V2, a, b);
+                self.asm.vbit(NEON_EOR | (spec.q << 30), V3, a, b);
                 self.vec_shift_imm(spec, Binary::Ushr, 1, V3, V3);
-                let sub = if spec.is_1d() { 0x7EE0_8400 } else { 0x2E20_8400 | (spec.q << 30) | (spec.size << 22) };
+                let sub = if spec.is_1d() { NEON_SUB_1D } else { NEON_SUB | (spec.q << 30) | (spec.size << 22) };
                 self.asm.vbit(sub, dst, V2, V3);
             }
             other => return Err(format!("{other:?} of a vector")),
@@ -529,6 +524,9 @@ impl Emit<'_> {
             self.asm.word(word);
         } else {
             let acc = if dst == va || dst == vb { V3 } else { dst };
+            if acc == V3 {
+                self.clobber_vreg(V3);
+            }
             self.asm.vmov(acc, vc);
             self.asm.vbit(0x0E20_CC00 | (spec.q << 30) | (spec.fsz() << 22), acc, va, vb);
             self.asm.vmov(dst, acc);
@@ -675,9 +673,13 @@ impl Emit<'_> {
         let a = self.fin(x, V0);
         let b = self.fin(y, V1);
         self.asm.csinv(Size::X, cond.invert(), A, ZR, ZR);
+        self.clobber_reg(A);
         let target = if dst != a && dst != b { dst } else { V3 };
-        self.asm.word(0x4E08_0C00 | u32::from(A.0) << 5 | u32::from(target.0));
-        self.asm.vbit(0x2E60_1C00 | (q << 30), target, a, b);
+        if target == V3 {
+            self.clobber_vreg(V3);
+        }
+        self.asm.word(NEON_DUP_GPR_2D | u32::from(A.0) << 5 | u32::from(target.0));
+        self.asm.vbit(NEON_BSL | (q << 30), target, a, b);
         self.asm.vmov(dst, target);
         self.fput(result, dst);
     }
@@ -771,12 +773,15 @@ impl Emit<'_> {
             Type::I64 => {
                 let dst = self.dst(result);
                 self.asm.fmov_out(true, dst, src);
+                self.clobber_reg(dst);
                 self.put(result, dst);
             }
             Type::I128 => {
                 self.asm.fmov_out(true, A, src);
+                self.clobber_reg(A);
                 self.put(result, A);
                 self.asm.umov_d1(A, src);
+                self.clobber_reg(A);
                 self.put_high(result, A);
             }
             _ => return Err(format!("bitcast from {from:?} to {to:?}")),

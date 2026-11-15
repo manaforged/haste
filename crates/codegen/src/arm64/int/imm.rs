@@ -1,3 +1,5 @@
+use crate::arm64::fuse::width_mask;
+
 pub(crate) fn add_imm_parts(sub: bool, imm: i64) -> Option<(bool, u32)> {
     let abs = imm.unsigned_abs();
     (abs < 4096 || (abs & 0xFFF == 0 && abs < (1 << 24))).then(|| (if imm < 0 { !sub } else { sub }, abs as u32))
@@ -17,7 +19,7 @@ pub(crate) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32
     while esize > 2 && w == w.rotate_right(esize / 2) {
         esize /= 2;
     }
-    let mask = if esize == 64 { u64::MAX } else { (1u64 << esize) - 1 };
+    let mask = width_mask(esize);
     let elem = w & mask;
     let ones = elem.count_ones();
     if ones == 0 || ones == esize {

@@ -1,6 +1,6 @@
 use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, may_alias};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, is_atomic_barrier, is_rodata, may_alias};
 use crate::merge::find;
 
 const MAX_MERGE_WALK: usize = 32;
@@ -43,19 +43,18 @@ pub(super) fn record_base(bases: &mut Vec<(MemBase, MemRoot)>, loc: MemLoc) {
 pub(super) fn loc_immutable(func: &Function, loc: MemLoc) -> bool {
     match loc.root {
         MemRoot::ReadonlyParam(_) => true,
-        MemRoot::Global(sym) => func.rodata_bytes.iter().any(|&(s, _)| s == sym),
+        MemRoot::Global(_) => is_rodata(func, loc),
         _ => false,
     }
 }
 
 /// Whether `op` may overwrite `loc`, treating immutable `.rodata` and non-atomic `ReadonlyParam` accesses as un-clobbered by calls or alien stores.
 pub(super) fn clobbers_loc(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance) -> bool {
-    if matches!(loc.root, MemRoot::Global(sym) if func.rodata_bytes.iter().any(|&(s, _)| s == sym)) {
+    if is_rodata(func, loc) {
         return false;
     }
     if matches!(loc.root, MemRoot::ReadonlyParam(_)) {
         return match *op {
-            Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence => true,
             Op::Store(val, addr, off) => {
                 let w = prov.loc(addr, i64::from(off), func.ty(val).bytes());
                 w.root == loc.root && may_alias(w, loc, prov)
@@ -65,7 +64,7 @@ pub(super) fn clobbers_loc(func: &Function, op: &Op, loc: MemLoc, prov: &Provena
                 w.root == loc.root && may_alias(w, loc, prov)
             }
             Op::Copy(dst, ..) => prov.loc(dst, 0, u32::MAX).root == loc.root,
-            _ => false,
+            _ => is_atomic_barrier(op),
         };
     }
     clobbers(func, op, loc, prov)

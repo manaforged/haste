@@ -1,7 +1,7 @@
 use crate::cfg::{Cfg, Loop};
 use crate::ir::{Binary, Block, Convert, Function, Inst, Op, StackSlot, Type, Value};
 
-use super::{MemBase, MemLoc, MemRoot, Provenance, may_alias};
+use super::{MemBase, MemLoc, MemRoot, Provenance, in_range, is_atomic_barrier, may_alias};
 
 pub(super) const SPAN_LIMIT: i64 = 1_i64 << 60;
 
@@ -352,7 +352,7 @@ impl LoopMem {
     }
 
     fn analyze_op(&mut self, func: &Function, prov: &Provenance, op: &Op) {
-        let is_atomic = matches!(op, Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence);
+        let is_atomic = is_atomic_barrier(op);
         let is_try_call = matches!(op, Op::TryCall { .. });
         let is_call = is_try_call || matches!(op, Op::Call { .. });
         self.calls |= is_call;
@@ -436,10 +436,7 @@ impl LoopMem {
         if let MemBase::Slot(slot) = base {
             return self.slot_load_ok(func, prov, slot, (lo, hi));
         }
-        let deref_ok = offset >= 0
-            && (offset as u64)
-                .checked_add(u64::from(width))
-                .is_some_and(|e| e <= u64::from(prov.ro_bytes.get(addr.index()).copied().unwrap_or(0)));
+        let deref_ok = in_range(i64::from(offset), width, prov.ro_bytes.get(addr.index()).copied().unwrap_or(0));
         if self.atomics {
             return false;
         }
@@ -451,10 +448,7 @@ impl LoopMem {
     }
 
     fn slot_root_ok(&self, func: &Function, prov: &Provenance, slot: StackSlot, loc: MemLoc) -> (bool, bool, bool, bool) {
-        let trap_ok = loc.offset >= 0
-            && (loc.offset as u64)
-                .checked_add(u64::from(loc.size))
-                .is_some_and(|e| e <= u64::from(func.slots[slot.index()].size));
+        let trap_ok = in_range(loc.offset, loc.size, func.slots[slot.index()].size);
         let slot_safe = prov.slot_unescaped(slot) || (prov.slot_call_readonly(slot) && !self.unknown_mem_writes);
         let no_write = !self.slot_writes.any(slot.index());
         let root_ok = (slot_safe || (!self.calls && !self.unknown_mem_writes)) && no_write;

@@ -7,8 +7,9 @@ use crate::merge::{find, identity, rename};
 
 const MAX_PHIS_PER_LOOP: usize = 4;
 
+/// Outgoing control-flow arm on a predecessor edge.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EdgeArm {
+pub(crate) enum EdgeArm {
     Jump,
     Then,
     Else,
@@ -99,8 +100,7 @@ impl<'a> State<'a> {
     }
 
     fn norm_cmp(&self, cc: IntCC, a: Value, b: Value, lhs: Value) -> Option<(IntCC, Value)> {
-        let (va, vb) = (self.value_of(a), self.value_of(b));
-        if va == lhs { Some((cc, vb)) } else if vb == lhs { Some((crate::cse::flip_int_cc(cc), va)) } else { None }
+        norm_cmp(cc, self.value_of(a), self.value_of(b), lhs)
     }
 
     fn grow_tables(&mut self, v: Value, inst: Option<Inst>, block: Option<Block>, imm: Option<i64>) {
@@ -148,7 +148,13 @@ impl<'a> State<'a> {
     }
 }
 
-fn edge_arg(func: &Function, pred: Block, arm: EdgeArm, idx: usize) -> Option<Value> {
+/// Reorients an integer comparison so `lhs` appears on the left-hand side when present.
+pub(crate) fn norm_cmp(cc: IntCC, a: Value, b: Value, lhs: Value) -> Option<(IntCC, Value)> {
+    if a == lhs { Some((cc, b)) } else if b == lhs { Some((crate::cse::flip_int_cc(cc), a)) } else { None }
+}
+
+/// Returns the `idx`-th edge argument passed along `arm` of `pred`'s terminator.
+pub(crate) fn edge_arg(func: &Function, pred: Block, arm: EdgeArm, idx: usize) -> Option<Value> {
     let last = *func.blocks[pred.index()].insts.last()?;
     let args = match (&func.insts[last.index()].op, arm) {
         (Op::Jump(_, args), EdgeArm::Jump) => args,
@@ -193,7 +199,7 @@ fn collect_head_edges(state: &State<'_>, each: &Loop) -> Option<Vec<(Block, Edge
         if !state.cfg.reachable.get(pred.index()).copied().unwrap_or(false) {
             return None;
         }
-        let inside = each.body.get(pred.index()).copied().unwrap_or(false);
+        let inside = is_in_loop(each, pred);
         match state.func.last(pred) {
             Some(Op::Jump(target, args)) if *target == each.head => {
                 if args.len() != param_len {
@@ -223,7 +229,8 @@ fn collect_head_edges(state: &State<'_>, each: &Loop) -> Option<Vec<(Block, Edge
     (has_outside && has_inside).then_some(edges)
 }
 
-fn is_in_loop(each: &Loop, blk: Block) -> bool {
+/// Whether block `blk` belongs to `each`'s loop body.
+pub(crate) fn is_in_loop(each: &Loop, blk: Block) -> bool {
     each.body.get(blk.index()).copied().unwrap_or(false)
 }
 
@@ -294,7 +301,7 @@ fn loop_addr_uses(state: &State<'_>, each: &Loop) -> Vec<u32> {
         }
     };
     for b in 0..state.func.blocks.len() {
-        if !each.body.get(b).copied().unwrap_or(false) {
+        if !is_in_loop(each, Block(b as u32)) {
             continue;
         }
         for &inst in &state.func.blocks[b].insts {
@@ -372,7 +379,7 @@ fn match_affine(state: &State<'_>, each: &Loop, ivs: &[IvInfo], raw: Value, dept
 
 fn is_outside_dom(state: &State<'_>, each: &Loop, val: Value) -> bool {
     let Some(def_blk) = state.def_blocks.get(val.index()).copied().flatten() else { return false };
-    !each.body.get(def_blk.index()).copied().unwrap_or(false) && state.cfg.dominates(def_blk, each.head)
+    !is_in_loop(each, def_blk) && state.cfg.dominates(def_blk, each.head)
 }
 
 fn is_invariant_base(state: &State<'_>, each: &Loop, base: Value) -> bool {

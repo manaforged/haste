@@ -685,9 +685,46 @@ fn call_writes_noalias(params: &[AbiParam], args: &[Value], prov: &Provenance, p
     })
 }
 
+/// Whether `loc` lies in a read-only global section (`func.rodata_bytes`).
+pub(crate) fn is_rodata(func: &Function, loc: MemLoc) -> bool {
+    matches!(loc.root, MemRoot::Global(sym) if func.rodata_bytes.iter().any(|&(s, _)| s == sym))
+}
+
+/// Whether `[off, off + bytes)` lies within `[0, size)` without underflow or overflow.
+pub(crate) fn in_range(off: i64, bytes: u32, size: u32) -> bool {
+    off >= 0 && (off as u64).checked_add(u64::from(bytes)).is_some_and(|end| end <= u64::from(size))
+}
+
+/// Whether `op` is a `StackStore` whose byte range in `slot` overlaps `[off, off + bytes)`.
+pub(crate) fn stack_store_overlaps(func: &Function, op: &Op, slot: StackSlot, (off, bytes): (i32, u32)) -> Option<bool> {
+    let Op::StackStore(val, wslot, woff) = *op else { return None };
+    Some(wslot == slot && MemLoc::slot(slot, i64::from(off), bytes).overlaps(MemLoc::slot(wslot, i64::from(woff), func.ty(val).bytes())))
+}
+
+/// Whether `op` is an atomic memory op or fence.
+pub(crate) fn is_atomic_barrier(op: &Op) -> bool {
+    matches!(op, Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence)
+}
+
+/// Whether `op` prevents hoisting, sinking, or rematerializing memory accesses across it.
+pub(crate) fn is_hard_barrier(op: &Op) -> bool {
+    is_atomic_barrier(op)
+        || matches!(op, Op::Call { .. } | Op::TryCall { .. } | Op::Trap | Op::Trapz(_) | Op::Assume(_)
+            | Op::Binary(Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem, ..))
+}
+
+fn stack_store_clobbers(func: &Function, op: &Op, (val, slot, off): (Value, StackSlot, i32), loc: MemLoc, prov: &Provenance) -> bool {
+    if let MemBase::Slot(lslot) = loc.base && loc.root == MemRoot::Slot(lslot)
+        && let Ok(loff) = i32::try_from(loc.offset) && let Some(hit) = stack_store_overlaps(func, op, lslot, (loff, loc.size))
+    {
+        return hit;
+    }
+    may_alias(MemLoc::slot(slot, i64::from(off), func.ty(val).bytes()), loc, prov)
+}
+
 pub(crate) fn clobbers(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance) -> bool {
     match *op {
-        Op::StackStore(val, slot, off) => may_alias(MemLoc::slot(slot, i64::from(off), func.ty(val).bytes()), loc, prov),
+        Op::StackStore(val, slot, off) => stack_store_clobbers(func, op, (val, slot, off), loc, prov),
         Op::Store(val, addr, off) => may_alias(prov.loc(addr, i64::from(off), func.ty(val).bytes()), loc, prov),
         Op::Move(dst, _, bytes) => may_alias(prov.loc(dst, 0, bytes), loc, prov),
         Op::Copy(dst, _, _) => {
@@ -701,8 +738,7 @@ pub(crate) fn clobbers(func: &Function, op: &Op, loc: MemLoc, prov: &Provenance)
             }
             _ => true,
         },
-        Op::AtomicLoad(_) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence => true,
-        _ => false,
+        _ => is_atomic_barrier(op),
     }
 }
 

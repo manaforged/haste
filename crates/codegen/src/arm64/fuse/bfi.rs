@@ -269,11 +269,14 @@ pub(super) fn try_fuse_bfi(
         && let Some((ypos, _)) = local_single(plan, info, b_idx, pos, y)
     {
         let (ty, def) = (func.ty(res), |v| def_inst(pos_of, v));
-        for (ca, cb, apos, bpos) in [(x, y, xpos, ypos), (y, x, ypos, xpos)] {
-            let Some((a, b, mid_opt, _, width)) = bfi_pair(func, plan, ty, (ca, cb), &def) else { continue };
-            if a == res || !preserved(func, plan, b_idx, apos, pos, Some(bpos), a) {
-                continue;
-            }
+        let chosen = match bfi_pair(func, plan, ty, (x, y), &def) {
+            Some(p) => Some((xpos, ypos, p)),
+            None => bfi_pair(func, plan, ty, (y, x), &def).map(|p| (ypos, xpos, p)),
+        };
+        if let Some((apos, bpos, (a, b, mid_opt, _, width))) = chosen
+            && a != res
+            && preserved(func, plan, b_idx, apos, pos, Some(bpos), a)
+        {
             let rhs_ok = match mid_opt {
                 Some(mid) => bfi_mid_root(func, plan, pos_of, (b_idx, apos, bpos, pos, res), (mid, b)),
                 None => bfi_root(func, plan, pos_of, (b_idx, bpos, pos, apos, width), b).is_some_and(|r| r != res),

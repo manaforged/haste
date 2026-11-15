@@ -537,12 +537,6 @@ fn factor_common_returns(func: &mut Function, cfg_dirty: bool) -> bool {
     changed
 }
 
-fn rename_value(func: &mut Function, from: Value, to: Value) {
-    for data in &mut func.insts {
-        data.op.map_operands(|v| if v == from { to } else { v });
-    }
-}
-
 struct JumpTailPlan {
     param_idx: usize,
     sig: TailOpSig,
@@ -621,7 +615,9 @@ fn apply_jump_tail_plan(func: &mut Function, target_idx: usize, preds: &[usize],
             args.extend(plan.param_cols.iter().map(|(_, col)| col[pred_pos]));
         }
     }
-    rename_value(func, old_param, new_res);
+    let mut subst = crate::merge::identity(func.types.len());
+    subst[old_param.index()] = new_res;
+    crate::merge::rename(func, &subst);
     prune_dead_consts(func, preds);
 }
 
