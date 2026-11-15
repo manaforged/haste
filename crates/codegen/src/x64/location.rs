@@ -3,6 +3,7 @@ mod patterns;
 
 pub(super) use fuse::fuse;
 pub(super) use patterns::{LEAF, Root, adc_plan, bextr_parts, shld_parts, unwrap_shift_mask};
+use patterns::odd_scale_source;
 
 use super::asm::{Alu, Mem, Reg, Rm, Shift, Size, Xmm};
 use super::float::{X2, scalar};
@@ -15,6 +16,12 @@ use crate::reloc::{RelocKind, StencilReloc};
 
 fn extend(imm: i64, ty: Type, ext: Ext) -> i64 {
     crate::fold::extend(imm, ty, matches!(ext, Ext::Sign))
+}
+
+const ODD_LEA_TAG: i32 = 0x4000_0000;
+
+fn odd_lea_key(x: Value, lea_scale: u8) -> Option<i32> {
+    i32::try_from(x.index()).ok().filter(|&i| i < (1 << 28)).map(|i| ODD_LEA_TAG | (i << 2) | i32::from(lea_scale & 3))
 }
 
 impl Emit<'_> {
@@ -120,16 +127,69 @@ impl Emit<'_> {
         self.address_in(addr, offset, Reg::Rcx, Reg::R11)
     }
 
+    fn load_odd_index(&mut self, dst: Reg, x: Value, lea_scale: u8) {
+        let key = odd_lea_key(x, lea_scale);
+        if let Some(cached) = key.and_then(|k| self.cached_spill_for(k, dst)) {
+            if cached != dst {
+                self.asm.mov(dst, cached);
+                self.clobber_reg(dst);
+            }
+            return;
+        }
+        let rx = match self.reg_of(x).filter(|&r| r != Reg::Rsp && (self.ty(x).bytes() >= 8 || self.plan.zero_ext[x.index()])) {
+            Some(r) => r,
+            None => {
+                self.get(dst, x, Ext::Zero);
+                dst
+            }
+        };
+        self.asm.lea(dst, Mem::sib(rx, rx, lea_scale, 0));
+        match key {
+            Some(k) if dst != Reg::R11 => self.record_spill(k, dst),
+            _ => self.clobber_reg(dst),
+        }
+    }
+
+    fn load_index(&mut self, dst: Reg, index: Value) {
+        if let Some((x, lea_scale)) = odd_scale_source(self.func, &self.plan, |v| self.defs[v.index()], index) {
+            self.load_odd_index(dst, x, lea_scale);
+        } else {
+            self.get(dst, index, Ext::Zero);
+        }
+    }
+
+    fn sib_slow(&mut self, base: Value, mode: Sib, disp: i32, (scratch, temp): (Reg, Reg)) -> Mem {
+        self.clear_flags();
+        self.load_index(scratch, mode.index);
+        if mode.shift > 0 {
+            self.asm.shift_imm(Size::Q, Shift::Shl, scratch, mode.shift);
+        }
+        match self.location(base) {
+            Location::Slot => self.asm.alu(Alu::Add, scratch, self.at(base)),
+            Location::Imm(imm) if i32::try_from(imm).is_ok() => self.asm.alu_imm(Alu::Add, scratch, imm as i32),
+            Location::Frame(slot, off) => {
+                self.asm.alu(Alu::Add, scratch, self.base);
+                self.asm.alu_imm(Alu::Add, scratch, self.frame.slots[slot.index()] + off + self.bias);
+            }
+            _ => {
+                self.raw(temp, base);
+                self.asm.alu(Alu::Add, scratch, temp);
+            }
+        }
+        self.clobber_reg(scratch);
+        Mem::new(scratch, disp)
+    }
+
     pub(super) fn sib_mem(&mut self, mode: Sib, offset: i32, scratch: Reg, temp: Reg) -> Mem {
         let idx_reg = self.reg_of(mode.index).filter(|_| self.ty(mode.index).bytes() >= 8 || self.plan.zero_ext[mode.index.index()]);
         match mode.base {
             SibBase::Frame(slot) => {
-                let disp = self.frame.slots[slot.index()] + mode.disp + offset;
+                let disp = self.frame.slots[slot.index()] + mode.disp + offset + self.bias;
                 match idx_reg {
-                    Some(idx) => Mem::sib(self.base, idx, mode.shift, disp + self.bias),
+                    Some(idx) => Mem::sib(self.base, idx, mode.shift, disp),
                     None => {
-                        self.get(scratch, mode.index, Ext::Zero);
-                        Mem::sib(self.base, scratch, mode.shift, disp + self.bias)
+                        self.load_index(scratch, mode.index);
+                        Mem::sib(self.base, scratch, mode.shift, disp)
                     }
                 }
             }
@@ -138,34 +198,14 @@ impl Emit<'_> {
                 match (self.reg_of(base), idx_reg) {
                     (Some(b), Some(idx)) => Mem::sib(b, idx, mode.shift, disp),
                     (Some(b), None) => {
-                        self.get(scratch, mode.index, Ext::Zero);
+                        self.load_index(scratch, mode.index);
                         Mem::sib(b, scratch, mode.shift, disp)
                     }
                     (None, Some(idx)) => {
                         self.raw(scratch, base);
                         Mem::sib(scratch, idx, mode.shift, disp)
                     }
-                    (None, None) => {
-                        self.clear_flags();
-                        self.get(scratch, mode.index, Ext::Zero);
-                        if mode.shift > 0 {
-                            self.asm.shift_imm(Size::Q, Shift::Shl, scratch, mode.shift);
-                        }
-                        match self.location(base) {
-                            Location::Slot => self.asm.alu(Alu::Add, scratch, self.at(base)),
-                            Location::Imm(imm) if i32::try_from(imm).is_ok() => self.asm.alu_imm(Alu::Add, scratch, imm as i32),
-                            Location::Frame(slot, off) => {
-                                self.asm.alu(Alu::Add, scratch, self.base);
-                                self.asm.alu_imm(Alu::Add, scratch, self.frame.slots[slot.index()] + off + self.bias);
-                            }
-                            _ => {
-                                self.raw(temp, base);
-                                self.asm.alu(Alu::Add, scratch, temp);
-                            }
-                        }
-                        self.clobber_reg(scratch);
-                        Mem::new(scratch, disp)
-                    }
+                    (None, None) => self.sib_slow(base, mode, disp, (scratch, temp)),
                 }
             }
         }
