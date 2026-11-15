@@ -116,7 +116,7 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Merge => merge::run(func),
         Pass::Promote => promote::step(func, moves),
         Pass::Cse => cse::run(func),
-        Pass::Loads => loads::run(func, target),
+        Pass::Loads => loads::run(func, moves == promote::Moves::Split, target),
         Pass::Thread => thread::run(func),
         Pass::IfConv => ifconv::run(func),
         Pass::Rotate => rotate::run(func),

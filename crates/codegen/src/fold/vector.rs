@@ -1,5 +1,5 @@
 use super::{Fold, binary, defs, extend, holds};
-use crate::ir::{Binary, Convert, Function, Inst, Lane, Op, ReduceOp, ShuffleMask, Type, Unary, Value};
+use crate::ir::{Binary, Convert, Function, Inst, IntCC, Lane, Op, ReduceOp, ShuffleMask, Type, Unary, Value};
 
 pub(super) fn rotate(ty: Type, value: u64, left: u32) -> i64 {
     match ty {
@@ -96,18 +96,13 @@ pub(super) fn fold_bitcast_loads(func: &mut Function) -> bool {
 fn trace_extract(fold: &Fold, func: &Function, mut vec: Value, mut idx: u8) -> Option<Value> {
     for _ in 0..16 {
         match *fold.def(func, vec)? {
+            Op::Convert(Convert::Bitcast, inner) if idx == 0 && func.ty(vec).vec_shape().is_some_and(|(l, _)| func.ty(inner) == l.to_type()) => return Some(inner),
             Op::Insert(_, val, at) if at == idx => return Some(val),
             Op::Insert(prev, _, _) => vec = prev,
             Op::Shuffle(a, b, ShuffleMask::Const(mask)) => {
                 let count = func.ty(a).vec_shape()?.1;
                 let sel = *mask.get(usize::from(idx))?;
-                if sel < count {
-                    (vec, idx) = (a, sel);
-                } else if sel < 2 * count {
-                    (vec, idx) = (b, sel - count);
-                } else {
-                    return None;
-                }
+                if sel < count { (vec, idx) = (a, sel); } else if sel < 2 * count { (vec, idx) = (b, sel - count); } else { return None; }
             }
             _ => return None,
         }
@@ -115,40 +110,91 @@ fn trace_extract(fold: &Fold, func: &Function, mut vec: Value, mut idx: u8) -> O
     None
 }
 
+fn splat_shuffle_ident(fold: &Fold, func: &Function, v: Value) -> bool {
+    let Some((&Op::Shuffle(a, b, ShuffleMask::Const(mask)), Some((_, count)))) = fold.def(func, v).map(|op| (op, func.ty(v).vec_shape())) else {
+        return false;
+    };
+    let c = usize::from(count);
+    let head = mask[0];
+    let same = fold.find(a) == fold.find(b);
+    usize::from(head) < 2 * c && mask[..c].iter().all(|&i| i == head || (same && i % count == head % count))
+}
+
+fn shuffle_identity(fold: &Fold, func: &Function, a: Value, b: Value, mask: [u8; 16]) -> Option<Value> {
+    let (_, count) = func.ty(a).vec_shape()?;
+    let c = usize::from(count);
+    let same_ab = fold.find(a) == fold.find(b);
+    if (0..count).all(|i| mask[usize::from(i)] == i || (same_ab && mask[usize::from(i)] == count + i)) {
+        return Some(a);
+    }
+    if !same_ab && (0..count).all(|i| mask[usize::from(i)] == count + i) {
+        return Some(b);
+    }
+    if mask[..c].iter().all(|&i| i < count || (same_ab && i < 2 * count)) && splat_shuffle_ident(fold, func, a) {
+        return Some(a);
+    }
+    (!same_ab && mask[..c].iter().all(|&i| i >= count && i < 2 * count) && splat_shuffle_ident(fold, func, b)).then_some(b)
+}
+
 pub(super) fn vec_identity(fold: &Fold, func: &Function, op: &Op) -> Option<Value> {
     match *op {
         Op::Extract(vec, idx) => trace_extract(fold, func, vec, idx),
-        Op::Shuffle(a, b, ShuffleMask::Const(mask)) => {
-            let (_, count) = func.ty(a).vec_shape()?;
-            let same_ab = fold.find(a) == fold.find(b);
-            if (0..count).all(|i| mask[usize::from(i)] == i || (same_ab && mask[usize::from(i)] == count + i)) {
-                Some(a)
-            } else if !same_ab && (0..count).all(|i| mask[usize::from(i)] == count + i) {
-                Some(b)
-            } else {
-                None
-            }
-        }
+        Op::Shuffle(a, b, ShuffleMask::Const(mask)) => shuffle_identity(fold, func, a, b, mask),
+        _ => None,
+    }
+}
+
+fn vec_zero_binary(func: &Function, fold: &Fold, kind: Binary, x: Value, y: Value) -> Option<Op> {
+    match kind {
+        Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat | Binary::AvgRound
+            if is_zero_bits(func, fold, x) && is_zero_bits(func, fold, y) => Some(Op::Const(0)),
+        _ if !func.ty(x).is_vector() => None,
+        Binary::Band | Binary::Imul | Binary::Umin if is_zero_bits(func, fold, x) || is_zero_bits(func, fold, y) => Some(Op::Const(0)),
+        Binary::Bxor | Binary::Isub | Binary::SsubSat | Binary::UsubSat if fold.find(x) == fold.find(y) => Some(Op::Const(0)),
+        Binary::UsubSat | Binary::Ishl | Binary::Ushr | Binary::Sshr if is_zero_bits(func, fold, x) => Some(Op::Const(0)),
+        _ => None,
+    }
+}
+
+fn vec_zero_icmp(func: &Function, fold: &Fold, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    if !func.ty(x).is_vector() {
+        return None;
+    }
+    let eq_false = fold.find(x) == fold.find(y)
+        && matches!(cc, IntCC::NotEqual | IntCC::SignedLessThan | IntCC::SignedGreaterThan | IntCC::UnsignedLessThan | IntCC::UnsignedGreaterThan);
+    let u_false = (cc == IntCC::UnsignedLessThan && is_zero_bits(func, fold, y))
+        || (cc == IntCC::UnsignedGreaterThan && is_zero_bits(func, fold, x));
+    (eq_false || u_false).then_some(Op::Const(0))
+}
+
+fn vec_zero_other(func: &Function, fold: &Fold, op: &Op) -> Option<Op> {
+    match *op {
+        Op::Unary(Unary::Ineg | Unary::Bswap | Unary::Bitrev | Unary::Popcnt | Unary::Fabs, x)
+            if func.ty(x).is_vector() && is_zero_bits(func, fold, x) => Some(Op::Const(0)),
+        Op::Select(_, x, y) if func.ty(x).is_vector() && is_zero_bits(func, fold, x) && is_zero_bits(func, fold, y) => Some(Op::Const(0)),
+        Op::Icmp(cc, x, y) => vec_zero_icmp(func, fold, cc, x, y),
+        Op::Convert(
+            Convert::Sextend | Convert::Uextend | Convert::Ireduce | Convert::NarrowSat { .. } | Convert::FromSint | Convert::FromUint | Convert::ToSintSat | Convert::ToUintSat,
+            x,
+        ) if func.ty(x).is_vector() && is_zero_bits(func, fold, x) => Some(Op::Const(0)),
+        _ => None,
+    }
+}
+
+fn vec_zero_bitcast(func: &Function, fold: &Fold, x: Value, res: Option<Value>) -> Option<Op> {
+    let ty = res.map(|r| func.ty(r))?;
+    if (ty.is_vector() || ty.is_small_int() || ty.is_float()) && is_zero_bits(func, fold, x) {
+        return Some(Op::Const(0));
+    }
+    match fold.def(func, x) {
+        Some(&Op::Convert(Convert::Bitcast, v)) if func.ty(fold.find(v)) != ty => Some(Op::Convert(Convert::Bitcast, fold.find(v))),
         _ => None,
     }
 }
 
 pub(super) fn vec_zero_fold(func: &Function, fold: &Fold, op: &Op, res: Option<Value>) -> Option<Op> {
     match *op {
-        Op::Convert(Convert::Bitcast, x) => {
-            if let Some(ty) = res.map(|r| func.ty(r))
-                && (ty.is_vector() || ty.is_small_int() || ty.is_float())
-                && is_zero_bits(func, fold, x)
-            {
-                return Some(Op::Const(0));
-            }
-            match (res.map(|r| func.ty(r)), fold.def(func, x)) {
-                (Some(ty), Some(&Op::Convert(Convert::Bitcast, v))) if func.ty(fold.find(v)) != ty => {
-                    Some(Op::Convert(Convert::Bitcast, fold.find(v)))
-                }
-                _ => None,
-            }
-        }
+        Op::Convert(Convert::Bitcast, x) => vec_zero_bitcast(func, fold, x, res),
         Op::Shuffle(a, b, ShuffleMask::Const(mask)) => {
             let count = func.ty(a).vec_shape()?.1;
             let (za, zb) = (is_zero_bits(func, fold, a), is_zero_bits(func, fold, b));
@@ -157,11 +203,8 @@ pub(super) fn vec_zero_fold(func: &Function, fold: &Fold, op: &Op, res: Option<V
         Op::Insert(vec, scalar, _) => (is_zero_bits(func, fold, vec) && is_zero_bits(func, fold, scalar)).then_some(Op::Const(0)),
         Op::Extract(vec, _) => is_zero_bits(func, fold, vec).then_some(Op::Const(0)),
         Op::Reduce(kind, vec) if !matches!(kind, ReduceOp::Fmin | ReduceOp::Fmax) => is_zero_bits(func, fold, vec).then_some(Op::Const(0)),
-        Op::Binary(Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat | Binary::AvgRound, x, y) => {
-            (is_zero_bits(func, fold, x) && is_zero_bits(func, fold, y)).then_some(Op::Const(0))
-        }
-        Op::Convert(Convert::NarrowSat { .. }, x) if func.ty(x).is_vector() => is_zero_bits(func, fold, x).then_some(Op::Const(0)),
-        _ => None,
+        Op::Binary(kind, x, y) => vec_zero_binary(func, fold, kind, x, y),
+        _ => vec_zero_other(func, fold, op),
     }
 }
 
@@ -281,11 +324,21 @@ impl<'a> ByteEval<'a> {
                 out[..eb].copy_from_slice(&vb[start..start + eb]);
                 out
             }
+            Op::Reduce(rop, vec) => {
+                let vb = self.eval(vec, depth);
+                let Some(imm) = eval_reduce_const(&vb, rop, self.func.ty(vec)) else { return [None; 16] };
+                let mut out = [None; 16];
+                let le = (imm as u64).to_le_bytes();
+                for (dst, &byte) in out[..ty.bytes() as usize].iter_mut().zip(&le) {
+                    *dst = Some(byte);
+                }
+                out
+            }
             Op::Unary(kind, x) => self.eval_vec_unary(kind, ty, x, depth),
             Op::Binary(kind, x, y) => self.eval_vec_binary(kind, ty, x, y, depth),
             Op::Icmp(cc, x, y) => self.eval_vec_icmp(cc, ty, x, y, depth),
             Op::Convert(kind, x) => self.eval_vec_convert(kind, ty, x, depth),
-            Op::Select(c, x, y) => self.eval_vec_select(ty, c, x, y, depth),
+            Op::Select(c, x, y) => self.eval_vec_select(ty, (c, x, y), depth),
             _ => [None; 16],
         }
     }
@@ -399,7 +452,7 @@ impl<'a> ByteEval<'a> {
         out
     }
 
-    fn eval_vec_select(&mut self, ty: Type, c: Value, x: Value, y: Value, depth: u8) -> [Option<u8>; 16] {
+    fn eval_vec_select(&mut self, ty: Type, (c, x, y): (Value, Value, Value), depth: u8) -> [Option<u8>; 16] {
         let Some((lane, count)) = ty.vec_shape() else { return [None; 16] };
         let Some((c_lane, c_count)) = self.func.ty(c).vec_shape() else { return [None; 16] };
         if count != c_count || c_lane != lane.int_mask() {
@@ -412,10 +465,11 @@ impl<'a> ByteEval<'a> {
             let range = i * eb..(i + 1) * eb;
             let all_ones = bc[range.clone()].iter().all(|&b| b == Some(0xFF));
             let all_zeros = bc[range.clone()].iter().all(|&b| b == Some(0));
-            if !all_ones && !all_zeros {
+            let same_arms = range.clone().all(|j| bx[j].is_some() && bx[j] == by[j]);
+            if !all_ones && !all_zeros && !same_arms {
                 return [None; 16];
             }
-            let src = if all_ones { &bx[range.clone()] } else { &by[range.clone()] };
+            let src = if all_zeros { &by[range.clone()] } else { &bx[range.clone()] };
             if src.iter().any(Option::is_none) {
                 return [None; 16];
             }
@@ -606,27 +660,69 @@ fn emit_canonical(func: &mut Function, inst: Inst, vec_ty: Type, bytes: &[u8; 16
     out.push(inst);
 }
 
-fn fold_const_vectors(func: &mut Function) -> bool {
-    let vector = |inst: &Inst| matches!(func.insts[inst.index()].op, Op::Extract(..)) || func.insts[inst.index()].result.is_some_and(|res| func.ty(res).is_valid_vec());
-    if !func.blocks.iter().flat_map(|b| &b.insts).any(vector) { return false; }
-    let defs = defs(func);
-    let mut eval = ByteEval::new(func, &defs);
-    let mut changed = false;
-    let mut extract_updates: Vec<(Inst, Op)> = Vec::new();
+fn reduce_step(op: ReduceOp, lane_ty: Type, acc: i64, v: i64) -> Option<i64> {
+    let u = |x| extend(x, lane_ty, false) as u64;
+    Some(match op {
+        ReduceOp::Add => extend(acc.wrapping_add(v), lane_ty, true),
+        ReduceOp::And => acc & v,
+        ReduceOp::Or => acc | v,
+        ReduceOp::Xor => acc ^ v,
+        ReduceOp::Smin => acc.min(v),
+        ReduceOp::Smax => acc.max(v),
+        ReduceOp::Umin => extend(u(acc).min(u(v)) as i64, lane_ty, true),
+        ReduceOp::Umax => extend(u(acc).max(u(v)) as i64, lane_ty, true),
+        ReduceOp::Fmin | ReduceOp::Fmax | ReduceOp::Movemask => return None,
+    })
+}
+
+fn eval_reduce_const(bytes: &[Option<u8>; 16], op: ReduceOp, vec_ty: Type) -> Option<i64> {
+    let (lane, count) = (vec_ty.bytes() <= 16).then(|| vec_ty.vec_shape()).flatten()?;
+    if !lane.is_int() {
+        return None;
+    }
+    if op == ReduceOp::Movemask {
+        let eb = lane.bytes() as usize;
+        let mut mask = 0_i64;
+        for i in 0..usize::from(count) {
+            mask |= i64::from((bytes[i * eb + eb - 1]? >> 7) & 1) << i;
+        }
+        return Some(extend(mask, Type::I32, true));
+    }
+    let lane_ty = lane.to_type();
+    let mut acc = read_lane(bytes, lane, 0)?;
+    for i in 1..usize::from(count) {
+        acc = reduce_step(op, lane_ty, acc, read_lane(bytes, lane, i)?)?;
+    }
+    Some(acc)
+}
+
+fn collect_scalar_folds(func: &Function, eval: &mut ByteEval) -> Vec<(Inst, Op)> {
+    let mut updates = Vec::new();
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         let data = &func.insts[inst.index()];
-        if let (Op::Extract(vec, lane_idx), Some(res)) = (&data.op, data.result)
-            && let Some((lane, count)) = func.ty(*vec).vec_shape()
-            && *lane_idx < count
-            && func.ty(*vec).bytes() <= 16
-            && (func.ty(res).is_small_int() || func.ty(res).is_float())
-        {
-            let vb = eval.eval(*vec, 0);
-            if let Some(imm) = read_lane(&vb, lane, usize::from(*lane_idx)) {
-                extract_updates.push((*inst, Op::Const(imm)));
+        let Some(res) = data.result else { continue };
+        match data.op {
+            Op::Extract(vec, lane_idx) if func.ty(vec).bytes() <= 16 && (func.ty(res).is_small_int() || func.ty(res).is_float()) => {
+                if let Some((lane, count)) = func.ty(vec).vec_shape()
+                    && lane_idx < count
+                    && let Some(imm) = read_lane(&eval.eval(vec, 0), lane, usize::from(lane_idx))
+                {
+                    updates.push((*inst, Op::Const(imm)));
+                }
             }
+            Op::Reduce(rop, vec) if func.ty(res).is_small_int() => {
+                let vb = eval.eval(vec, 0);
+                if let Some(imm) = eval_reduce_const(&vb, rop, func.ty(vec)) {
+                    updates.push((*inst, Op::Const(imm)));
+                }
+            }
+            _ => {}
         }
     }
+    updates
+}
+
+fn collect_known_vecs(func: &Function, eval: &mut ByteEval) -> Vec<Option<[u8; 16]>> {
     let mut known_vec: Vec<Option<[u8; 16]>> = vec![None; func.types.len()];
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         let Some(res) = func.insts[inst.index()].result else { continue };
@@ -636,27 +732,21 @@ fn fold_const_vectors(func: &mut Function) -> bool {
             known_vec[res.index()] = full_bytes(&bytes, ty.bytes() as usize);
         }
     }
-    for (inst, op) in extract_updates {
-        if func.insts[inst.index()].op != op {
-            func.insts[inst.index()].op = op;
-            changed = true;
-        }
-    }
-    let mut root = vec![false; func.types.len()];
-    let mut shift_rhs = vec![false; func.types.len()];
+    known_vec
+}
+
+fn rewrite_canonical_vecs(func: &mut Function, defs: &[Option<Inst>], known_vec: &[Option<[u8; 16]>]) -> bool {
+    let (mut root, mut shift_rhs) = (vec![false; func.types.len()], vec![false; func.types.len()]);
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         let data = &func.insts[inst.index()];
         if let Op::Binary(Binary::Ishl | Binary::Ushr | Binary::Sshr, _, rhs) = data.op {
             shift_rhs[rhs.index()] = true;
         }
         if !data.result.is_some_and(|r| known_vec[r.index()].is_some()) {
-            data.op.for_operands(|v| {
-                if known_vec[v.index()].is_some() {
-                    root[v.index()] = true;
-                }
-            });
+            data.op.for_operands(|v| root[v.index()] |= known_vec[v.index()].is_some());
         }
     }
+    let mut changed = false;
     for b in 0..func.blocks.len() {
         let orig = std::mem::take(&mut func.blocks[b].insts);
         let mut out = Vec::with_capacity(orig.len());
@@ -664,17 +754,35 @@ fn fold_const_vectors(func: &mut Function) -> bool {
             if let Some(res) = func.insts[inst.index()].result
                 && root[res.index()]
                 && let Some(bytes) = known_vec[res.index()]
+                && !is_canonical(func, defs, inst, func.ty(res), &bytes, shift_rhs[res.index()])
             {
-                let vec_ty = func.ty(res);
-                if !is_canonical(func, &defs, inst, vec_ty, &bytes, shift_rhs[res.index()]) {
-                    emit_canonical(func, inst, vec_ty, &bytes, shift_rhs[res.index()], &mut out);
-                    changed = true;
-                    continue;
-                }
+                emit_canonical(func, inst, func.ty(res), &bytes, shift_rhs[res.index()], &mut out);
+                changed = true;
+                continue;
             }
             out.push(inst);
         }
         func.blocks[b].insts = out;
     }
     changed
+}
+
+fn fold_const_vectors(func: &mut Function) -> bool {
+    let vector = |inst: &Inst| {
+        matches!(func.insts[inst.index()].op, Op::Extract(..) | Op::Reduce(..))
+            || func.insts[inst.index()].result.is_some_and(|res| func.ty(res).is_valid_vec())
+    };
+    if !func.blocks.iter().flat_map(|b| &b.insts).any(vector) { return false; }
+    let defs = defs(func);
+    let mut eval = ByteEval::new(func, &defs);
+    let scalar_updates = collect_scalar_folds(func, &mut eval);
+    let known_vec = collect_known_vecs(func, &mut eval);
+    let mut changed = false;
+    for (inst, op) in scalar_updates {
+        if func.insts[inst.index()].op != op {
+            func.insts[inst.index()].op = op;
+            changed = true;
+        }
+    }
+    changed | rewrite_canonical_vecs(func, &defs, &known_vec)
 }

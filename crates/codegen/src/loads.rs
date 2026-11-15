@@ -8,8 +8,8 @@ mod remat;
 
 use coalesce::{ScanBuf, slot_unescaped, try_coalesce_store};
 use dom::{BlockWrites, invalidate_preserving, record_base, write_preserving};
-use join::{BlockClobber, JoinCtx, SubwordPlan, const_eq_for_ty, eligible_join_preds, find_subword_source, for_edge_args, for_edge_args_mut, resolve_select_load, rodata_const, try_join_phi_forward};
-use remat::FarCseGuard;
+use join::{BlockClobber, JoinCtx, const_eq_for_ty, eligible_join_preds, for_edge_args, for_edge_args_mut, resolve_select_load, rodata_const, try_join_phi_forward};
+use remat::{FarCseGuard, SubwordAction, SubwordSlices, drop_covered_stores, drop_stores_if, resolve_subword_plan, sink_terminator_defs};
 
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, Lane, Op, ShuffleMask, StackSlot, TargetOpId, TinyArgs, Type, Value};
 use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, compute_affine, may_alias};
@@ -67,10 +67,12 @@ enum Effect {
 
 struct State<'a> {
     prov: &'a Provenance,
+    defs: &'a [Option<Inst>],
     selects: &'a [Option<(Value, Value, Value)>],
     consts: &'a mut Vec<Option<i64>>,
     subst: &'a mut Vec<Value>,
     target: &'a crate::Target,
+    post_inline: bool,
 }
 
 fn addr_loc(prov: &Provenance, subst: &[Value], addr: Value, offset: i32, size: u32) -> MemLoc {
@@ -134,15 +136,28 @@ fn emit_op(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Ins
     val
 }
 
-fn forward_subword(func: &mut Function, state: &mut State<'_>, kept: &mut Vec<Option<Inst>>, known: &KnownLoads, inst: Inst, loc: MemLoc, ty: Type) -> bool {
-    let Some((koff, kty, kval)) = find_subword_source(known, loc, ty) else {
-        return false;
-    };
-    let Some(plan) = SubwordPlan::new(loc.offset, ty, koff, kty, kval) else {
-        return false;
-    };
-    func.insts[inst.index()].op = plan.build_op(|op_ty, op| emit_op(func, state, kept, op_ty, op));
-    true
+fn forward_subword(
+    func: &mut Function,
+    state: &mut State<'_>,
+    kept: &mut Vec<Option<Inst>>,
+    ctx: (&KnownLoads, &SubwordSlices, &FarCseGuard),
+    (inst, loc, ty, result): (Inst, MemLoc, Type, Value),
+) -> Option<Option<Value>> {
+    let action = resolve_subword_plan(func, (inst, loc, ty), ctx, (state.post_inline, state.defs, state.subst, state.consts))?;
+    match action {
+        SubwordAction::Forwarded(val) => Some(Some(val)),
+        SubwordAction::Const(imm) => {
+            func.insts[inst.index()].op = Op::Const(imm);
+            if ty.is_small_int() {
+                state.consts[result.index()] = Some(imm);
+            }
+            Some(None)
+        }
+        SubwordAction::Plan(plan) => {
+            func.insts[inst.index()].op = plan.build_op(|op_ty, op| emit_op(func, state, kept, op_ty, op));
+            Some(None)
+        }
+    }
 }
 
 enum ConcatHalf {
@@ -312,6 +327,7 @@ fn scan(
     let mut clobbers_seen = Vec::new();
     let (mut changed, mut renamed) = (false, false);
     let mut guard = FarCseGuard::new(insts.len(), func.types.len());
+    let mut slices = SubwordSlices::new();
     for inst in insts {
         let kept_before = bufs.kept.len();
         if let Some((_, from, bytes)) = copy_len(&func.insts[inst.index()].op, state.consts) {
@@ -328,13 +344,16 @@ fn scan(
                     bufs.pending_stores.retain(|&(p, _)| ok(p));
                     bufs.const_stores.retain(|cs| ok(cs.loc));
                 }
-                Op::Trap | Op::Trapz(_) => {
+                Op::Trap | Op::Trapz(_) | Op::Assume(_) => {
                     bufs.pending_stores.retain(|&(ploc, _)| slot_unescaped(state.prov, ploc));
                     bufs.const_stores.retain(|cs| slot_unescaped(state.prov, cs.loc));
                 }
                 Op::TryCall { .. } => {
                     bufs.pending_stores.clear();
                     bufs.const_stores.clear();
+                }
+                Op::Return(..) if state.post_inline => {
+                    changed |= drop_stores_if(func, &mut bufs, &mut guard, |ploc| slot_unescaped(state.prov, ploc));
                 }
                 _ => {}
             }
@@ -373,9 +392,15 @@ fn scan(
                         known.remember(loc, ty, result);
                         changed = true;
                     } else if !skip_far
-                        && (forward_subword(func, state, &mut bufs.kept, known, inst, loc, ty)
-                            || forward_concat(func, state, &mut bufs.kept, known, inst, loc, ty))
+                        && let Some(sub_fwd) = forward_subword(func, state, &mut bufs.kept, (known, &slices, &guard), (inst, loc, ty, result))
                     {
+                        if let Some(val) = sub_fwd {
+                            forwarded = Some(val);
+                        } else {
+                            known.remember(loc, ty, result);
+                        }
+                        changed = true;
+                    } else if !skip_far && forward_concat(func, state, &mut bufs.kept, known, inst, loc, ty) {
                         known.remember(loc, ty, result);
                         changed = true;
                     } else if !skip_far
@@ -430,6 +455,10 @@ fn scan(
                     continue;
                 }
                 clobbers_seen.push(BlockClobber::Loc(loc));
+                if state.post_inline {
+                    slices.prune_on_write(func, state.prov, loc);
+                    slices.save_split_slices(known, state.subst, loc);
+                }
                 write_preserving(func, known, bases, loc, ty, value, state.prov);
                 record_base(bases, loc);
                 let safe_write = slot_unescaped(state.prov, loc);
@@ -437,26 +466,18 @@ fn scan(
                     !may_alias(loc, cs.loc, state.prov)
                         && (slot_unescaped(state.prov, cs.loc) || safe_write || cs.loc.base == loc.base)
                 });
-                let track = !matches!(loc.root, MemRoot::Slot(s) if !state.prov.slot_unescaped(s));
-                let mut push_loc = loc;
+                let track = state.post_inline || !matches!(loc.root, MemRoot::Slot(s) if !state.prov.slot_unescaped(s));
                 if track {
-                    let end = i128::from(loc.offset) + i128::from(loc.size);
-                    bufs.pending_stores.retain(|&(ploc, kept_idx)| {
-                        let pend = i128::from(ploc.offset) + i128::from(ploc.size);
-                        if ploc.base == loc.base && ploc.offset >= loc.offset && pend <= end {
-                            if let Some(dead_store) = bufs.kept[kept_idx].take() {
-                                func.insts[dead_store.index()].op = Op::Trap;
-                                guard.on_drop_store();
-                                changed = true;
-                            }
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                    if !state.post_inline {
+                        changed |= drop_covered_stores(func, &mut bufs, &mut guard, (loc, false));
+                    }
+                    let mut push_loc = loc;
                     if let Some(wide_loc) = try_coalesce_store(func, state, known, bases, &mut bufs, (inst, loc, ty, value)) {
                         push_loc = wide_loc;
                         changed = true;
+                    }
+                    if state.post_inline {
+                        changed |= drop_covered_stores(func, &mut bufs, &mut guard, (push_loc, true));
                     }
                     bufs.pending_stores.push((push_loc, bufs.kept.len()));
                 }
@@ -485,15 +506,15 @@ fn scan(
                             }
                         }
                     }
-                    (bytes, Op::Move(find(state.subst, dst), find(state.subst, src), bytes))
+                    (bytes, dst_loc, Op::Move(find(state.subst, dst), find(state.subst, src), bytes))
                 });
-                if let Some((0, _)) = canon_move {
+                if let Some((0, ..)) = canon_move {
                     bufs.kept.push(Some(inst));
                     guard.sync_kept(func, state.subst, &bufs.kept[kept_before..]);
                     continue;
                 }
                 let clobber_op = match canon_move {
-                    Some((_, ref m)) => m,
+                    Some((_, _, ref m)) => m,
                     None => {
                         clobbers_seen.push(match func.insts[inst.index()].op {
                             Op::Copy(dst, _, _) => BlockClobber::CopyLoc(addr_loc(state.prov, state.subst, dst, 0, u32::MAX)),
@@ -502,22 +523,32 @@ fn scan(
                         &func.insts[inst.index()].op
                     }
                 };
+                if state.post_inline {
+                    slices.on_unknown(func, clobber_op, state.prov);
+                }
                 invalidate_preserving(func, known, bases, clobber_op, state.prov);
-                if let Some((bytes, _)) = canon_move
-                    && let Some((dst_loc, copied)) = copy_remaps
-                    && let Some(dst_end) = dst_loc.offset.checked_add(i64::from(bytes))
-                    && known.entries_for(dst_loc.base).iter().all(|&(o, t, _)| {
-                        o.checked_add(i64::from(t.bytes())).is_some_and(|e| e <= dst_loc.offset) || o >= dst_end
-                    })
-                {
-                    for (dst_off, kty, kval) in copied {
-                        known.remember(MemLoc::new(dst_loc.root, dst_loc.base, dst_off, kty.bytes()), kty, kval);
+                if let Some((bytes, dst_loc, _)) = canon_move {
+                    if state.post_inline && bytes > 0 {
+                        changed |= drop_covered_stores(func, &mut bufs, &mut guard, (dst_loc, true));
                     }
-                    record_base(bases, dst_loc);
+                    if let Some((dst_loc, copied)) = copy_remaps
+                        && let Some(dst_end) = dst_loc.offset.checked_add(i64::from(bytes))
+                        && known.entries_for(dst_loc.base).iter().all(|&(o, t, _)| {
+                            o.checked_add(i64::from(t.bytes())).is_some_and(|e| e <= dst_loc.offset) || o >= dst_end
+                        })
+                    {
+                        for (dst_off, kty, kval) in copied {
+                            known.remember(MemLoc::new(dst_loc.root, dst_loc.base, dst_off, kty.bytes()), kty, kval);
+                        }
+                        record_base(bases, dst_loc);
+                    }
                 }
                 let keep_fn = |ploc: MemLoc| match ploc.root {
                     MemRoot::Slot(s) => state.prov.slot_unescaped(s),
-                    MemRoot::NoAliasParam(p) => !dom::clobbers_loc(func, clobber_op, ploc, state.prov) && state.prov.noalias_unescaped(p),
+                    MemRoot::NoAliasParam(p) => {
+                        let cop = canon_move.as_ref().map_or(&func.insts[inst.index()].op, |(_, _, m)| m);
+                        !dom::clobbers_loc(func, cop, ploc, state.prov) && state.prov.noalias_unescaped(p)
+                    }
                     _ => false,
                 };
                 bufs.pending_stores.retain(|&(ploc, _)| keep_fn(ploc));
@@ -671,71 +702,35 @@ fn fold_affine_mem(func: &mut Function, slots: &[Option<(StackSlot, i32)>], affi
     changed
 }
 
-fn for_term_args(op: &Op, mut f: impl FnMut(Value)) -> bool {
-    match op {
-        Op::Jump(_, args) => args.iter().for_each(|&v| f(v)),
-        Op::Brif(_, _, t_args, _, e_args) => t_args.iter().chain(e_args).for_each(|&v| f(v)),
-        _ => return false,
-    }
-    true
-}
-
-fn sink_terminator_defs(func: &mut Function) -> bool {
-    let uses = func.use_counts();
-    let mut fits_used = vec![false; func.types.len()];
-    for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-        if let Op::Fits(_, _, x, y) = func.insts[inst.index()].op {
-            fits_used[x.index()] = true;
-            fits_used[y.index()] = true;
+fn collect_scan_meta(
+    func: &Function,
+) -> Option<(Vec<Option<Inst>>, Vec<Option<i64>>, Vec<Option<(Value, Value, Value)>>)> {
+    let mut defs = vec![None; func.types.len()];
+    let mut consts = vec![None; func.types.len()];
+    let mut selects = vec![None; func.types.len()];
+    let mut accesses = false;
+    for (idx, data) in func.insts.iter().enumerate() {
+        if let Some(result) = data.result {
+            defs[result.index()] = Some(Inst(idx as u32));
+        }
+        match (&data.op, data.result) {
+            (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
+            (&Op::Select(c, a, b), Some(result)) => selects[result.index()] = Some((c, a, b)),
+            (op, _) if matches!(op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..)) => accesses = true,
+            _ => {}
         }
     }
-    let mut term_uses = vec![0_u32; func.types.len()];
-    let mut changed = false;
-    for b in 0..func.blocks.len() {
-        if func.blocks[b].insts.len() < 2 {
-            continue;
-        }
-        let Some(&last) = func.blocks[b].insts.last() else { continue };
-        if !for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] += 1) {
-            continue;
-        }
-        let insts = std::mem::take(&mut func.blocks[b].insts);
-        let len = insts.len();
-        let mut kept = Vec::with_capacity(len);
-        let mut sunk = Vec::new();
-        for &inst in &insts[..len - 1] {
-            let data = &func.insts[inst.index()];
-            if let Some(res) = data.result
-                && data.op.is_speculable()
-                && !fits_used[res.index()]
-                && term_uses[res.index()] > 0
-                && uses[res.index()] == term_uses[res.index()]
-            {
-                sunk.push(inst);
-            } else {
-                kept.push(inst);
-            }
-        }
-        if !sunk.is_empty() && sunk.iter().enumerate().any(|(idx, &inst)| insts[len - 1 - sunk.len() + idx] != inst) {
-            changed = true;
-        }
-        kept.extend(sunk);
-        kept.push(last);
-        func.blocks[b].insts = kept;
-        for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0);
-    }
-    changed
+    accesses.then_some((defs, consts, selects))
 }
 
 /// Replaces each load of bytes that an earlier access on every path to it read or wrote with no write of unknown reach between; returns the effect domains modified.
-pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
+pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target) -> Domain {
     if func.entry.is_none() || func.coroutine.is_some() {
         return Domain::NONE;
     }
     let domain = |changed: bool| if changed { Domain::MEM | Domain::VALUES } else { Domain::NONE };
     let (mut changed, affine) = eliminate_affine_block_params(func);
-    let is_access = |op: &Op| matches!(op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..));
-    if !func.insts.iter().any(|data| is_access(&data.op)) {
+    if !func.insts.iter().any(|d| matches!(d.op, Op::Load(..) | Op::StackLoad(..) | Op::Store(..) | Op::StackStore(..))) {
         changed |= sink_terminator_defs(func);
         return domain(changed);
     }
@@ -744,23 +739,12 @@ pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
     changed |= fold_affine_mem(func, &prov.slot_offsets, &prov.affine);
     changed |= pack::coalesce_loads(func, &prov, target);
     changed |= sink_terminator_defs(func);
-    let mut consts = vec![None; func.types.len()];
-    let mut selects = vec![None; func.types.len()];
-    let mut accesses = false;
-    for data in &func.insts {
-        match (&data.op, data.result) {
-            (&Op::Const(imm), Some(result)) => consts[result.index()] = Some(imm),
-            (&Op::Select(c, a, b), Some(result)) => selects[result.index()] = Some((c, a, b)),
-            (op, _) if is_access(op) => accesses = true,
-            _ => {}
-        }
-    }
-    if !accesses {
+    let Some((defs, mut consts, selects)) = collect_scan_meta(func) else {
         return domain(changed);
-    }
+    };
     let mut bw = BlockWrites::new(func, &cfg, &prov);
     let mut subst = identity(func.types.len());
-    let mut state = State { prov: &prov, selects: &selects, consts: &mut consts, subst: &mut subst, target };
+    let mut state = State { prov: &prov, defs: &defs, selects: &selects, consts: &mut consts, subst: &mut subst, target, post_inline };
     let (mut renamed, mut scan_changed) = (false, false);
     let mut def_blocks = func.def_blocks();
     let mut visited = vec![false; func.blocks.len()];

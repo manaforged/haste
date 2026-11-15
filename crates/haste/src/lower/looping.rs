@@ -3,7 +3,7 @@ use haste_codegen::{Block, IntCC, Type, Value};
 use rustc_abi::Variants;
 use rustc_index::Idx;
 
-use crate::body::{ExprId, List, PatId};
+use crate::body::{Expr, ExprId, List, Pat, PatId};
 use crate::names::{ItemRef, Primitive};
 use crate::sema::infer::{Res, SiteKey, Tried};
 use crate::sema::substs::Substs;
@@ -12,6 +12,15 @@ use crate::sema::ty::{Kind, Ty};
 use super::place::Place;
 use super::reloc::SiteOrigin;
 use super::{Loop, Lower, Repr, repr};
+
+fn range_cc(signed: bool, inclusive: bool) -> IntCC {
+    match (signed, inclusive) {
+        (true, false) => IntCC::SignedLessThan,
+        (false, false) => IntCC::UnsignedLessThan,
+        (true, true) => IntCC::SignedLessThanOrEqual,
+        (false, true) => IntCC::UnsignedLessThanOrEqual,
+    }
+}
 
 fn range_signed(prim: Primitive) -> Option<bool> {
     match prim {
@@ -26,18 +35,8 @@ impl Lower<'_, '_> {
     pub fn for_expr(&mut self, expr: ExprId, pat: PatId, iter: ExprId, (label, body): (Option<u32>, ExprId)) -> Result<Option<Value>> {
         let Some(each) = self.typed.fors.get(&expr).cloned() else { bail!("`for` loop has no iterator calls") };
         let (Res::Fn(into, into_substs), Res::Fn(next, next_substs)) = (each.into_iter, each.next) else { bail!("`for` loop calls are not functions") };
-        if let Kind::Adt(adt, args) = *self.cx.types.kind(each.iter)
-            && let Some(inclusive) = match self.cx.lang(adt) {
-                Some("Range") => Some(false),
-                Some("RangeInclusive") => Some(true),
-                _ => None,
-            }
-            && let [elem_ty] = *self.cx.types.substs(args)
-            && let Kind::Prim(prim) = *self.cx.types.kind(elem_ty)
-            && let Some(signed) = range_signed(prim)
-            && let Repr::Scalar(ir_ty) = repr(self.cx, elem_ty)?
-        {
-            return self.for_range(pat, iter, (each.iter, elem_ty), (signed, inclusive, prim == Primitive::Char, ir_ty), (label, body));
+        if let Some((elem_ty, signed, inclusive, is_char, ir_ty)) = self.range_spec(each.iter)? {
+            return self.for_range((pat, iter), (each.iter, elem_ty), (signed, inclusive, is_char, ir_ty), (label, body));
         }
         let value = self.expr(iter)?;
         let iterator = self.invoke(SiteOrigin::Table(SiteKey::ForInto(expr)), into, into_substs, value.into_iter().collect())?;
@@ -60,55 +59,101 @@ impl Lower<'_, '_> {
         self.loop_body((head, exit, depth), label, body)
     }
 
+    fn range_spec(&mut self, iter_ty: Ty) -> Result<Option<(Ty, bool, bool, bool, Type)>> {
+        let Kind::Adt(adt, args) = *self.cx.types.kind(iter_ty) else { return Ok(None) };
+        let Some(inclusive) = (match self.cx.lang(adt) {
+            Some("Range") => Some(false),
+            Some("RangeInclusive") => Some(true),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let [elem_ty] = *self.cx.types.substs(args) else { return Ok(None) };
+        let Kind::Prim(prim) = *self.cx.types.kind(elem_ty) else { return Ok(None) };
+        let Some(signed) = range_signed(prim) else { return Ok(None) };
+        let Repr::Scalar(ir_ty) = repr(self.cx, elem_ty)? else { return Ok(None) };
+        Ok(Some((elem_ty, signed, inclusive, prim == Primitive::Char, ir_ty)))
+    }
+
+    fn direct_range_bounds(&mut self, mut iter: ExprId, inclusive: bool) -> Result<Option<(Value, Value, Option<Value>)>> {
+        while let Expr::Paren(inner) = *self.body.expr(iter) {
+            if self.typed.coercions.contains_key(&iter) {
+                break;
+            }
+            iter = inner;
+        }
+        if self.typed.coercions.contains_key(&iter) {
+            return Ok(None);
+        }
+        let Expr::Range { from: Some(from), to: Some(to), inclusive: expr_inc } = *self.body.expr(iter) else { return Ok(None) };
+        if expr_inc != inclusive || !matches!(self.typed.res.get(&iter), Some(Res::Ctor(..))) {
+            return Ok(None);
+        }
+        let Some(fields) = self.typed.ranges.get(&iter).cloned() else { return Ok(None) };
+        if fields.as_ref() != [0, 1] && !(inclusive && fields.as_ref() == [0, 1, 2]) {
+            return Ok(None);
+        }
+        let Some(start) = self.eval_operand(from)? else { return Ok(None) };
+        let Some(end) = self.eval_operand(to)? else { return Ok(None) };
+        Ok(Some((start, end, inclusive.then(|| self.ins().iconst(Type::I8, 0)))))
+    }
+
+    fn range_bounds(&mut self, iter: ExprId, range_ty: Ty, inclusive: bool) -> Result<Option<(Value, Value, Option<Value>)>> {
+        if let Some(direct) = self.direct_range_bounds(iter, inclusive)? {
+            return Ok(Some(direct));
+        }
+        let Some(place) = self.place_or_temp(iter)? else { return Ok(None) };
+        let start_place = self.part_place(place, range_ty, (0, 0))?;
+        let Some(start) = self.read(start_place) else { bail!("range start has no value") };
+        let end_place = self.part_place(place, range_ty, (0, 1))?;
+        let Some(end) = self.read(end_place) else { bail!("range end has no value") };
+        let exhausted = if inclusive {
+            let ex_place = self.part_place(place, range_ty, (0, 2))?;
+            let Some(ex) = self.read(ex_place) else { bail!("range exhausted has no value") };
+            Some(ex)
+        } else {
+            None
+        };
+        Ok(Some((start, end, exhausted)))
+    }
+
+    fn range_loop_cond(&mut self, (cur, end): (Value, Value), cc: IntCC, done_place: Option<Place>) -> Result<Value> {
+        let in_bounds = self.ins().icmp(cc, cur, end);
+        let Some(done_place) = done_place else { return Ok(in_bounds) };
+        let Some(done) = self.read(done_place) else { bail!("range done has no value") };
+        let zero = self.ins().iconst(Type::I8, 0);
+        let not_done = self.ins().icmp(IntCC::Equal, done, zero);
+        Ok(self.ins().band(not_done, in_bounds))
+    }
+
     fn for_range(
         &mut self,
-        pat: PatId,
-        iter: ExprId,
+        (pat, iter): (PatId, ExprId),
         (range_ty, elem_ty): (Ty, Ty),
         (signed, inclusive, is_char, ir_ty): (bool, bool, bool, Type),
         (label, body): (Option<u32>, ExprId),
     ) -> Result<Option<Value>> {
-        let value = self.expr(iter)?;
-        let Some(place) = self.spill(value, range_ty)? else { bail!("range has no place") };
-        let start_place = self.part_place(place, range_ty, (0, 0))?;
-        let end_place = self.part_place(place, range_ty, (0, 1))?;
-        let Some(start) = self.read(start_place) else { bail!("range start has no value") };
-        let Some(end) = self.read(end_place) else { bail!("range end has no value") };
+        let Some((start, end, exhausted)) = self.range_bounds(iter, range_ty, inclusive)? else { return Ok(None) };
         let cur_repr = repr(self.cx, elem_ty)?;
         let Some(cur_slot) = self.slot(cur_repr) else { bail!("range element has no slot") };
         let cur_place = Place::slot(cur_slot, cur_repr);
         self.write(cur_place, start);
-        let done_place = if inclusive {
-            let ex_place = self.part_place(place, range_ty, (0, 2))?;
-            let Some(exhausted) = self.read(ex_place) else { bail!("range exhausted has no value") };
-            let done_repr = Repr::Scalar(Type::I8);
-            let Some(done_slot) = self.slot(done_repr) else { bail!("range done has no slot") };
-            let done_place = Place::slot(done_slot, done_repr);
-            self.write(done_place, exhausted);
-            Some(done_place)
-        } else {
-            None
-        };
+        let done_place = exhausted
+            .map(|exhausted| {
+                let done_repr = Repr::Scalar(Type::I8);
+                let Some(done_slot) = self.slot(done_repr) else { bail!("range done has no slot") };
+                let done_place = Place::slot(done_slot, done_repr);
+                self.write(done_place, exhausted);
+                Ok(done_place)
+            })
+            .transpose()?;
         let depth = self.owned.len();
         let (head, inner, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.jump(head, &[]);
         self.enter(head);
         let Some(cur) = self.read(cur_place) else { bail!("range cursor has no value") };
-        let cc = match (signed, inclusive) {
-            (true, false) => IntCC::SignedLessThan,
-            (false, false) => IntCC::UnsignedLessThan,
-            (true, true) => IntCC::SignedLessThanOrEqual,
-            (false, true) => IntCC::UnsignedLessThanOrEqual,
-        };
-        let in_bounds = self.ins().icmp(cc, cur, end);
-        let cond = if let Some(done_place) = done_place {
-            let Some(done) = self.read(done_place) else { bail!("range done has no value") };
-            let zero = self.ins().iconst(Type::I8, 0);
-            let not_done = self.ins().icmp(IntCC::Equal, done, zero);
-            self.ins().band(not_done, in_bounds)
-        } else {
-            in_bounds
-        };
+        let cc = range_cc(signed, inclusive);
+        let cond = self.range_loop_cond((cur, end), cc, done_place)?;
         self.brif(cond, (inner, &[]), (exit, &[]));
         self.enter(inner);
         if let Some(done_place) = done_place {
@@ -117,9 +162,16 @@ impl Lower<'_, '_> {
         }
         let next = self.next_range_elem(cur, ir_ty, is_char);
         self.write(cur_place, next);
-        let item = self.spill(Some(cur), elem_ty)?;
-        self.bind_matched(pat, item, None)?;
+        self.bind_range_item(pat, cur, elem_ty)?;
         self.loop_body((head, exit, depth), label, body)
+    }
+
+    fn bind_range_item(&mut self, pat: PatId, cur: Value, elem_ty: Ty) -> Result<()> {
+        if !matches!(*self.body.pat(pat), Pat::Wild) || self.typed.pat_res.contains_key(&pat) || self.typed.pat_derefs.get(&pat).copied().unwrap_or(0) != 0 {
+            let item = self.spill(Some(cur), elem_ty)?;
+            self.bind_matched(pat, item, None)?;
+        }
+        Ok(())
     }
 
     fn next_range_elem(&mut self, cur: Value, ir_ty: Type, is_char: bool) -> Value {

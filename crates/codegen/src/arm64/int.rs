@@ -64,6 +64,9 @@ impl Emit<'_> {
                 } else if matches!(bits, 32 | 64) && let Some((b, shift, imm)) = self.shifted_operand(Alu::Sub, ty, x) {
                     let right = self.bits(b, C);
                     self.emit_shifted(Alu::Sub, size, dst, ZR, (right, shift, imm));
+                } else if matches!(bits, 32 | 64) && let Some((a, b)) = super::fuse::mneg_parts(self.func, &self.plan, ty, x, |v| self.defs[v.index()]) {
+                    let (left, right) = self.bits_pair(a, b);
+                    self.asm.madd(true, size, dst, (left, right), ZR);
                 } else {
                     let reg = self.bits(x, A);
                     self.asm.alu(Alu::Sub, size, dst, ZR, reg);
@@ -115,21 +118,12 @@ impl Emit<'_> {
                     self.bits32(Bits::Rbit, dst, A);
                     self.bits32(Bits::Clz, dst, dst);
                 } else {
-                    let source = if bits < 64 {
-                        self.asm.mov_imm(C, 1 << bits);
-                        self.asm.alu(Alu::Orr, Size::X, A, reg, C);
-                        self.clobber_regs(&[A, C]);
-                        A
-                    } else { reg };
+                    let source = if bits < 64 { self.asm.mov_imm(C, 1 << bits); self.asm.alu(Alu::Orr, Size::X, A, reg, C); self.clobber_regs(&[A, C]); A } else { reg };
                     self.asm.bits(Bits::Rbit, dst, source);
                     self.asm.bits(Bits::Clz, dst, dst);
                 }
             }
-            Unary::Popcnt => {
-                let reg = self.src(x, A, Ext::Zero);
-                self.popcount(dst, reg);
-                self.clobber_vreg(V0);
-            }
+            Unary::Popcnt => { let reg = self.src(x, A, Ext::Zero); self.popcount(dst, reg); self.clobber_vreg(V0); }
             other => return Err(format!("{other:?} of an integer")),
         }
         Ok(())
@@ -248,6 +242,25 @@ impl Emit<'_> {
         super::fuse::const_of(self.func, &self.plan, val, |v| self.defs[v.index()])
     }
 
+    fn emit_bit_insert(&mut self, ty: Type, dst: Reg, (a, b, lsb, width): (Value, Value, u8, u8)) {
+        let size = if ty == Type::I64 { Size::X } else { Size::W };
+        let reg_bits: u8 = if size == Size::X { 64 } else { 32 };
+        let b_src = self.peel_uextend(b);
+        let rhs = if self.plan.reg_of(a) == Some(dst) {
+            self.bits(b_src, C)
+        } else if self.plan.reg_of(b_src) == Some(dst) {
+            self.asm.mov(C, dst);
+            self.clobber_reg(C);
+            self.raw(dst, a);
+            C
+        } else {
+            self.raw(dst, a);
+            self.bits(b_src, C)
+        };
+        let base = if size == Size::X { 0xB340_0000 } else { 0x3300_0000 };
+        self.asm.emit_gp(dst, base | u32::from((reg_bits - lsb) % reg_bits) << 16 | u32::from(width - 1) << 10 | u32::from(rhs.0) << 5 | u32::from(dst.0));
+    }
+
     fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<(), String> {
         let size = if ty == Type::I64 { Size::X } else { Size::W };
         if matches!(op, Binary::Band | Binary::Ishl | Binary::Ushr | Binary::Sshr)
@@ -264,6 +277,12 @@ impl Emit<'_> {
             {
                 let (left, right) = self.bits_pair(self.peel_uextend(hi), self.peel_uextend(lo));
                 self.asm.extr(size, dst, left, right, kr);
+                return Ok(());
+            }
+            if matches!(op, Binary::Bor | Binary::Bxor | Binary::Iadd)
+                && let Some(bfi) = super::fuse::bfi_parts(self.func, &self.plan, ty, (x, y), &|v| self.defs[v.index()])
+            {
+                self.emit_bit_insert(ty, dst, bfi);
                 return Ok(());
             }
             if alu == Alu::Add && matches!(ty, Type::I32 | Type::I64) {
@@ -307,7 +326,7 @@ impl Emit<'_> {
             }
             let shifted = self.shifted_operand(alu, ty, y).map(|s| (x, s)).or_else(|| (alu != Alu::Sub).then(|| self.shifted_operand(alu, ty, x).map(|s| (y, s))).flatten());
             if let Some((other, (b, shift, imm))) = shifted {
-                let (left, right) = self.bits_pair(self.peel_uextend(other), b);
+                let (left, right) = if alu == Alu::Sub && self.const_imm(other) == Some(0) { (ZR, self.bits(b, C)) } else { self.bits_pair(self.peel_uextend(other), b) };
                 self.emit_shifted(alu, size, dst, left, (right, shift, imm));
                 return Ok(());
             }
@@ -316,15 +335,7 @@ impl Emit<'_> {
                 && let Some((sub, a, b, c)) = super::fuse::madd_parts(self.func, &self.plan, ty, op, x, y, |v| self.defs[v.index()])
             {
                 let (left, right) = self.bits_pair(a, b);
-                let acc = if self.plan.const_of(c) == Some(0) {
-                    ZR
-                } else {
-                    let r = self.bits(c, IP);
-                    if r == IP {
-                        self.clobber_reg(IP);
-                    }
-                    r
-                };
+                let acc = if self.plan.const_of(c) == Some(0) { ZR } else { let r = self.bits(c, IP); if r == IP { self.clobber_reg(IP); } r };
                 self.asm.madd(sub, size, dst, (left, right), acc);
                 return Ok(());
             }
@@ -334,15 +345,18 @@ impl Emit<'_> {
                     (None, Some(imm)) => Some((y, imm)),
                     (None, None) => None,
                 };
-                if let Some((val, imm)) = imm_pair
-                    && let Some(bitmask) = encode_bitmask_imm(imm as u64, size == Size::X)
-                {
+                if let Some((val, imm)) = imm_pair && let Some(bitmask) = encode_bitmask_imm(imm as u64, size == Size::X) {
                     let left = self.bits(val, A);
                     self.asm.alu_bitmask(alu, size, bitmask, dst, left);
                     return Ok(());
                 }
             }
             if matches!(alu, Alu::Add | Alu::Sub) && self.emit_add_sub_imm(alu == Alu::Sub, (x, y), (ty, size), dst) {
+                return Ok(());
+            }
+            if alu == Alu::Sub && self.const_imm(x) == Some(0) {
+                let right = self.bits(y, C);
+                self.asm.alu(alu, size, dst, ZR, right);
                 return Ok(());
             }
             let (left, right) = self.bits_pair(x, y);
@@ -358,12 +372,7 @@ impl Emit<'_> {
             Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax => {
                 let signed = matches!(op, Binary::Smin | Binary::Smax);
                 let left = self.src(x, A, Ext::of(signed));
-                let cond = match op {
-                    Binary::Smin => Cond::Lt,
-                    Binary::Smax => Cond::Gt,
-                    Binary::Umin => Cond::Lo,
-                    _ => Cond::Hi,
-                };
+                let cond = match op { Binary::Smin => Cond::Lt, Binary::Smax => Cond::Gt, Binary::Umin => Cond::Lo, _ => Cond::Hi };
                 let right = if self.plan.const_of(y) == Some(0) {
                     self.asm.add_imm(true, true, Size::X, ZR, left, 0);
                     ZR
@@ -505,9 +514,7 @@ impl Emit<'_> {
         let signed = matches!(op, Binary::Sdiv | Binary::Srem);
         let (left, right) = self.src_pair(x, y, Ext::of(signed));
         let div = if signed { Alu::Sdiv } else { Alu::Udiv };
-        if matches!(op, Binary::Sdiv | Binary::Udiv) {
-            return self.asm.alu(div, Size::X, dst, left, right);
-        }
+        if matches!(op, Binary::Sdiv | Binary::Udiv) { return self.asm.alu(div, Size::X, dst, left, right); }
         let size = if self.ty(x).bits() <= 32 { Size::W } else { Size::X };
         self.asm.alu(div, Size::X, IP, left, right);
         self.asm.madd(true, size, dst, (IP, right), left);
@@ -516,60 +523,35 @@ impl Emit<'_> {
 
     fn multiply_high(&mut self, signed: bool, (x, y): (Value, Value), bits: u8, dst: Reg) {
         let (left, right) = self.src_pair(x, y, Ext::of(signed));
-        if bits == 64 {
-            self.asm.alu(if signed { Alu::Smulh } else { Alu::Umulh }, Size::X, dst, left, right);
-            return;
-        }
+        if bits == 64 { return self.asm.alu(if signed { Alu::Smulh } else { Alu::Umulh }, Size::X, dst, left, right); }
         self.asm.madd(false, Size::X, dst, (left, right), ZR);
-        if signed {
-            self.asm.asr_imm(dst, dst, bits);
-        } else {
-            self.asm.lsr_imm(dst, dst, bits);
-        }
+        if signed { self.asm.asr_imm(dst, dst, bits); } else { self.asm.lsr_imm(dst, dst, bits); }
     }
 
     fn unwrap_shift_mask(&self, y: Value, bits: u8) -> Value {
-        if bits < 32 || !self.plan.elided[y.index()] {
-            return y;
-        }
+        if bits < 32 || !self.plan.elided[y.index()] { return y; }
         let Some(inst) = self.defs[y.index()] else { return y };
         let Op::Binary(Binary::Band, a, b) = self.func.insts[inst.index()].op else { return y };
         let mask = u64::from(bits - 1);
         for (raw, m) in [(a, b), (b, a)] {
-            if let Some(imm) = self.const_imm(m)
-                && (imm as u64 & mask) == mask
-            {
-                return raw;
-            }
+            if let Some(imm) = self.const_imm(m) && (imm as u64 & mask) == mask { return raw; }
         }
         y
     }
 
     fn shift_by(&mut self, op: Binary, (x, y): (Value, Value), bits: u8, dst: Reg) {
-        let (ext, alu) = match op {
-            Binary::Ishl => (Ext::Zero, Alu::Lslv),
-            Binary::Ushr => (Ext::Zero, Alu::Lsrv),
-            _ => (Ext::Sign, Alu::Asrv),
-        };
+        let (ext, alu) = match op { Binary::Ishl => (Ext::Zero, Alu::Lslv), Binary::Ushr => (Ext::Zero, Alu::Lsrv), _ => (Ext::Sign, Alu::Asrv) };
         if let Some(count) = self.plan.const_of(y) {
             let value = if op == Binary::Ishl { self.bits(x, A) } else { self.src(x, A, ext) };
             let count = (count as u8) & (bits - 1);
-            if count == 0 {
-                self.asm.mov(dst, value);
-                return;
-            }
-            match alu {
-                Alu::Lslv => self.asm.lsl_imm(dst, value, count),
-                Alu::Lsrv => self.asm.lsr_imm(dst, value, count),
-                _ => self.asm.asr_imm(dst, value, count),
-            }
+            if count == 0 { self.asm.mov(dst, value); return; }
+            match alu { Alu::Lslv => self.asm.lsl_imm(dst, value, count), Alu::Lsrv => self.asm.lsr_imm(dst, value, count), _ => self.asm.asr_imm(dst, value, count) }
             return;
         }
         let y = self.unwrap_shift_mask(y, bits);
         if bits >= 32 {
             let (value, count) = self.bits_pair(x, y);
-            self.asm.alu(alu, if bits == 32 { Size::W } else { Size::X }, dst, value, count);
-            return;
+            return self.asm.alu(alu, if bits == 32 { Size::W } else { Size::X }, dst, value, count);
         }
         let value = if op == Binary::Ishl { self.bits(x, A) } else { self.src(x, A, ext) };
         let count = self.bits(y, C);
@@ -634,6 +616,64 @@ impl Emit<'_> {
         true
     }
 
+    fn cmp_fused(&mut self, cc: IntCC, (x, y): (Value, Value), (x_ty, size, signed): (Type, Size, bool)) -> Option<Cond> {
+        if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && let Some((a, b)) = super::fuse::cmn_sum_parts(self.func, &self.plan, (x, y), &|v| self.defs[v.index()])
+        {
+            let (left, right) = self.bits_pair(a, b);
+            self.asm.alu(Alu::Adds, size, ZR, left, right);
+            self.last_cmp = None;
+            return Some(cond(cc));
+        }
+        if matches!(x_ty, Type::I32 | Type::I64)
+            && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, y, |v| self.defs[v.index()])
+        {
+            let (left, right) = self.bits_pair(x, inner);
+            self.asm.alu_extended(Alu::Subs, size, ext_op, shift, ZR, left, right);
+            self.last_cmp = Some((size, x, y, signed));
+            return Some(cond(cc));
+        }
+        let (bytes, ext) = (x_ty.bytes(), Ext::of(signed));
+        if self.cmp_imm((x, y), (bytes, size, signed, ext)) { return Some(cond(cc)); }
+        if self.cmp_imm((y, x), (bytes, size, signed, ext)) { return Some(swap_cond(cond(cc))); }
+        if matches!(x_ty, Type::I32 | Type::I64)
+            && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, x, |v| self.defs[v.index()])
+        {
+            let (lhs, rhs) = self.bits_pair(y, inner);
+            self.asm.alu_extended(Alu::Subs, size, ext_op, shift, ZR, lhs, rhs);
+            self.last_cmp = None;
+            return Some(swap_cond(cond(cc)));
+        }
+        None
+    }
+
+    fn cmp_shift_cmn(&mut self, cc: IntCC, (x, y): (Value, Value), (x_ty, size, signed): (Type, Size, bool)) -> Option<Cond> {
+        if !matches!(x_ty, Type::I32 | Type::I64) { return None; }
+        if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && let Some((other, (rhs, shift))) = super::fuse::cmn_parts(self.func, &self.plan, x_ty, y, &|v: Value| self.defs[v.index()])
+                .map(|p| (x, p)).or_else(|| super::fuse::cmn_parts(self.func, &self.plan, x_ty, x, &|v: Value| self.defs[v.index()]).map(|p| (y, p)))
+        {
+            let (left, right) = self.bits_pair(other, rhs);
+            match shift {
+                Some((s, imm)) => self.emit_shifted(Alu::Adds, size, ZR, left, (right, s, imm)),
+                None => self.asm.alu(Alu::Adds, size, ZR, left, right),
+            }
+            self.last_cmp = None;
+            return Some(cond(cc));
+        }
+        if let Some((b, shift, imm)) = self.shifted_operand(Alu::Sub, x_ty, y) {
+            let (left, right) = self.bits_pair(self.peel_uextend(x), b);
+            self.emit_shifted(Alu::Subs, size, ZR, left, (right, shift, imm));
+            self.last_cmp = Some((size, x, y, signed));
+            return Some(cond(cc));
+        }
+        let (b, shift, imm) = self.shifted_operand(Alu::Sub, x_ty, x)?;
+        let (lhs, rhs) = self.bits_pair(self.peel_uextend(y), b);
+        self.emit_shifted(Alu::Subs, size, ZR, lhs, (rhs, shift, imm));
+        self.last_cmp = None;
+        Some(swap_cond(cond(cc)))
+    }
+
     pub(super) fn compare(&mut self, cc: IntCC, x: Value, y: Value) -> Cond {
         if matches!(cc, IntCC::Equal | IntCC::NotEqual)
             && let Some((a, b)) = self.elided_band_cmp(x, y)
@@ -642,32 +682,15 @@ impl Emit<'_> {
             self.last_cmp = None;
             return cond(cc);
         }
-        let bytes = self.ty(x).bytes();
+        let x_ty = self.ty(x);
+        let (bytes, signed) = (x_ty.bytes(), cc.is_signed());
         let size = if bytes >= 8 { Size::X } else { Size::W };
-        let signed = cc.is_signed();
         if self.last_cmp == Some((size, x, y, signed)) { return cond(cc); }
         if self.last_cmp == Some((size, y, x, signed)) { return swap_cond(cond(cc)); }
-        let ext = Ext::of(signed);
-        let x_ty = self.ty(x);
-        if matches!(x_ty, Type::I32 | Type::I64)
-            && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, y, |v| self.defs[v.index()])
-        {
-            let (left, right) = self.bits_pair(x, inner);
-            self.asm.alu_extended(Alu::Subs, size, ext_op, shift, ZR, left, right);
-            self.last_cmp = Some((size, x, y, signed));
-            return cond(cc);
+        if let Some(c) = self.cmp_fused(cc, (x, y), (x_ty, size, signed)).or_else(|| self.cmp_shift_cmn(cc, (x, y), (x_ty, size, signed))) {
+            return c;
         }
-        if self.cmp_imm((x, y), (bytes, size, signed, ext)) { return cond(cc); }
-        if self.cmp_imm((y, x), (bytes, size, signed, ext)) { return swap_cond(cond(cc)); }
-        if matches!(x_ty, Type::I32 | Type::I64)
-            && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, x, |v| self.defs[v.index()])
-        {
-            let (lhs, rhs) = self.bits_pair(y, inner);
-            self.asm.alu_extended(Alu::Subs, size, ext_op, shift, ZR, lhs, rhs);
-            self.last_cmp = None;
-            return swap_cond(cond(cc));
-        }
-        let (left, right) = if bytes >= 4 { self.bits_pair(x, y) } else { self.src_pair(x, y, ext) };
+        let (left, right) = if bytes >= 4 { self.bits_pair(x, y) } else { self.src_pair(x, y, Ext::of(signed)) };
         self.asm.alu(Alu::Subs, size, ZR, left, right);
         self.last_cmp = Some((size, x, y, signed));
         cond(cc)
@@ -743,10 +766,7 @@ impl Emit<'_> {
             Convert::Uextend | Convert::Sextend => self.emit_extend_conv(op, x, result),
             Convert::Ireduce => {
                 let dst = self.dst(result);
-                if self.plan.elided[x.index()]
-                    && let Some(inst) = self.defs[x.index()]
-                    && let Op::Binary(Binary::Ushr, val, amt) = self.func.insts[inst.index()].op
-                {
+                if self.plan.elided[x.index()] && let Some(inst) = self.defs[x.index()] && let Op::Binary(Binary::Ushr, val, amt) = self.func.insts[inst.index()].op {
                     self.shift_by(Binary::Ushr, (val, amt), self.ty(x).bits() as u8, dst);
                 } else {
                     self.raw(dst, x);
@@ -755,19 +775,13 @@ impl Emit<'_> {
                 Ok(())
             }
             Convert::NarrowSat { signed } => {
-                let src = self.src(x, A, Ext::Sign);
-                let dst = self.dst(result);
-                let to_bits = self.ty(result).bits();
-                let lo = if signed { -(1i64 << (to_bits - 1)) } else { 0 };
-                let hi = if signed { (1i64 << (to_bits - 1)) - 1 } else { (1i64 << to_bits) - 1 };
+                let (src, dst, to_bits) = (self.src(x, A, Ext::Sign), self.dst(result), self.ty(result).bits());
+                let (lo, hi) = if signed { (-(1i64 << (to_bits - 1)), (1i64 << (to_bits - 1)) - 1) } else { (0, (1i64 << to_bits) - 1) };
                 self.clamp_range(src, dst, lo, hi);
                 self.put(result, dst);
                 Ok(())
             }
-            _ => {
-                self.invalidate_spills();
-                self.float_convert(op, x, result)
-            }
+            _ => { self.invalidate_spills(); self.float_convert(op, x, result) }
         }
     }
 }
