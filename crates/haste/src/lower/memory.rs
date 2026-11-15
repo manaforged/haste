@@ -306,7 +306,11 @@ impl Lower<'_, '_> {
         match (which, ty, args) {
             (Intrinsic::CompareBytes, _, &[x, y, count]) => self.compare_bytes((x, y), count),
             (Intrinsic::RawEq, Some(ty), &[x, y]) => {
-                let size = self.layout_const(Intrinsic::SizeOf, ty)?;
+                let size = self.cx.layout(ty)?.size.bytes();
+                if size <= 16 {
+                    return Ok(self.equal_bytes_const((x, y), size));
+                }
+                let size = self.ins().iconst(Type::I64, size as i64);
                 let order = self.compare_bytes((x, y), size)?;
                 Ok(self.ins().icmp_imm(IntCC::Equal, order, 0))
             }
@@ -315,9 +319,38 @@ impl Lower<'_, '_> {
     }
 
     fn compare_bytes(&mut self, (x, y): (Value, Value), count: Value) -> Result<Value> {
+        let (nonempty, eq_first, tail, done) = (
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+        );
+        let res = self.b.append_block_param(done, Type::I32);
+        let zero = self.ins().iconst(Type::I32, 0);
+        let any = self.ins().icmp_imm(IntCC::NotEqual, count, 0);
+        self.brif(any, (nonempty, &[]), (done, &[zero]));
+
+        self.enter(nonempty);
+        let (a0, b0) = (self.ins().load(Type::I8, x, 0), self.ins().load(Type::I8, y, 0));
+        let (u0, v0) = (self.ins().uextend(Type::I32, a0), self.ins().uextend(Type::I32, b0));
+        let diff = self.ins().isub(u0, v0);
+        let diff_nz = self.ins().icmp_imm(IntCC::NotEqual, diff, 0);
+        self.brif(diff_nz, (done, &[diff]), (eq_first, &[]));
+
+        self.enter(eq_first);
+        let more = self.ins().icmp_imm(IntCC::UnsignedGreaterThan, count, 1);
+        self.brif(more, (tail, &[]), (done, &[zero]));
+
+        self.enter(tail);
+        let (x1, y1, rem) = (self.ins().iadd_imm(x, 1), self.ins().iadd_imm(y, 1), self.ins().iadd_imm(count, -1));
         let int = self.cx.types.prim(Primitive::I32);
-        let Some(order) = self.call_libc(RuntimeSymbol::Memcmp, vec![x, y, count], Some(int))? else { bail!("memcmp returned no value") };
-        Ok(order)
+        let Some(order) = self.call_libc(RuntimeSymbol::Memcmp, vec![x1, y1, rem], Some(int))? else {
+            bail!("memcmp returned no value")
+        };
+        self.jump(done, &[order]);
+
+        self.enter(done);
+        Ok(res)
     }
 
     pub(super) fn each(&mut self, count: Value, mut body: impl FnMut(&mut Self, Value)) {

@@ -68,14 +68,13 @@ impl Lower<'_, '_> {
         let whole = repr(self.cx, ty)?;
         let at = |base| Place { base: Base::Addr(base), offset: 0, repr: whole };
         let (left, right) = (self.discriminant_value(at(x), ty)?, self.discriminant_value(at(y), ty)?);
-        let same = self.ins().icmp(IntCC::Equal, left, right);
-        let all = self.b.create_stack_slot(1, 0);
-        self.ins().stack_store(same, all, 0);
+        let mut same = self.ins().icmp(IntCC::Equal, left, right);
         for (variant, fields) in variants.iter().enumerate().filter(|(_, fields)| !fields.is_empty()) {
             let Some(holds) = self.is_variant(Some(at(x)), ty, variant as u32)? else { continue };
             let (compare, next) = (self.b.create_block(), self.b.create_block());
+            let out = self.b.append_block_param(next, Type::I8);
             let both = self.ins().band(holds, same);
-            self.brif(both, (compare, &[]), (next, &[]));
+            self.brif(both, (compare, &[]), (next, &[same]));
             self.enter(compare);
             let mut equal = self.ins().iconst(Type::I8, 1);
             for (index, &field) in fields.iter().enumerate() {
@@ -84,11 +83,11 @@ impl Lower<'_, '_> {
                 let same_field = self.equal(field, left, right)?;
                 equal = self.ins().band(equal, same_field);
             }
-            self.ins().stack_store(equal, all, 0);
-            self.jump(next, &[]);
+            self.jump(next, &[equal]);
             self.enter(next);
+            same = out;
         }
-        Ok(self.ins().stack_load(Type::I8, all, 0))
+        Ok(same)
     }
 
     /// Whether the values at `x` and `y` of `ty`, a wide raw pointer, hold the same address and metadata.
@@ -167,7 +166,7 @@ impl Lower<'_, '_> {
         self.equal_pair_xor(ty, (px, py), 0, (ex, ey), 0)
     }
 
-    fn equal_bytes_const(&mut self, (x, y): (Value, Value), len: u64) -> Value {
+    pub(super) fn equal_bytes_const(&mut self, (x, y): (Value, Value), len: u64) -> Value {
         match len {
             0 => self.ins().iconst(Type::I8, 1),
             1 => self.equal_load(Type::I8, (x, y), 0),
@@ -242,8 +241,10 @@ impl Lower<'_, '_> {
     }
 
     fn equal_items(&mut self, element: Ty, (x, y): (Value, Value), count: Value) -> Result<Value> {
-        if self.is_byte(element) {
-            return Ok(self.equal_bytes_runtime((x, y), count));
+        if self.is_bitwise_int(element) {
+            let elem_size = self.cx.layout(element)?.size.bytes() as i64;
+            let bytes = if elem_size == 1 { count } else { self.ins().imul_imm(count, elem_size) };
+            return Ok(self.equal_bytes_runtime((x, y), bytes));
         }
         let size = self.cx.layout(element)?.size.bytes() as i64;
         let part = repr(self.cx, element)?;
