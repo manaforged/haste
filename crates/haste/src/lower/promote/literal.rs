@@ -14,13 +14,14 @@ use super::super::stencil::{RodataReloc, RodataTarget};
 /// The most bytes of a constant that lowering lays out from its literals.
 pub(super) const LITERAL_BYTES: usize = 1 << 21;
 
-const MAX_CONST_DEPTH: u32 = 16;
+pub(super) const MAX_CONST_DEPTH: u32 = 16;
 
 #[derive(Clone, Copy)]
 pub(super) struct Scope<'s> {
     pub(super) body: &'s Body,
     pub(super) src: &'s Source,
     pub(super) typed: &'s Typed,
+    pub(super) in_const: bool,
 }
 
 impl Lower<'_, '_> {
@@ -43,7 +44,10 @@ impl Lower<'_, '_> {
     fn write_blob(&mut self, scope: Scope<'_>, (expr, ty): (ExprId, Ty), at: usize, (out, relocs): (&mut [u8], &mut Vec<RodataReloc>), depth: u32) -> Option<()> {
         match scope.typed.coercions.get(&expr) {
             None => self.write_uncoerced(scope, (expr, ty), at, (out, relocs), depth),
-            Some(&Coercion::Len(len_ty)) => self.write_slice_coercion(scope, (expr, ty), len_ty, at, (out, relocs), depth),
+            Some(&Coercion::Len(len_ty)) => self
+                .write_slice_coercion(scope, (expr, ty), len_ty, at, (out, relocs), depth)
+                .or_else(|| self.eval_const_into(scope, (expr, ty), at, (out, relocs), depth)),
+            Some(Coercion::Deref(..)) => self.eval_const_into(scope, (expr, ty), at, (out, relocs), depth),
             Some(_) => None,
         }
     }
@@ -163,7 +167,9 @@ impl Lower<'_, '_> {
                     self.write_blob(scope, (item, *items.get(index as usize)?), at + field_offset(&layout, 0, index) as usize, (out, relocs), depth)
                 })
             }
-            (_, Kind::Adt(item, args)) => self.construct_blob(scope, (expr, ty), (item, args), at, (out, relocs), depth),
+            (_, Kind::Adt(item, args)) => self
+                .construct_blob(scope, (expr, ty), (item, args), at, (out, relocs), depth)
+                .or_else(|| self.eval_const_into(scope, (expr, ty), at, (out, relocs), depth)),
             (_, Kind::Prim(primitive)) => {
                 let size = match primitive {
                     Primitive::Bool => 1,
@@ -174,7 +180,7 @@ impl Lower<'_, '_> {
                 out.get_mut(at..at + size)?.copy_from_slice(&bits.to_le_bytes()[..size]);
                 Some(())
             }
-            _ => None,
+            _ => self.eval_const_into(scope, (expr, ty), at, (out, relocs), depth),
         }
     }
 
@@ -190,7 +196,7 @@ impl Lower<'_, '_> {
         let body = self.cx.body(source).ok()?;
         let root = body.root?;
         let src = self.cx.body_src(source);
-        self.write_blob(Scope { body: &body, src, typed: &const_typed }, (root, ty), at, (out, relocs), depth + 1)
+        self.write_blob(Scope { body: &body, src, typed: &const_typed, in_const: true }, (root, ty), at, (out, relocs), depth + 1)
     }
 
     fn construct_blob(&mut self, scope: Scope<'_>, (expr, ty): (ExprId, Ty), (item, args): (ItemRef, Substs), at: usize, (out, relocs): (&mut [u8], &mut Vec<RodataReloc>), depth: u32) -> Option<()> {
@@ -237,7 +243,7 @@ impl Lower<'_, '_> {
                     let body = self.cx.body(source).ok()?;
                     let root = body.root?;
                     let src = self.cx.body_src(source);
-                    return self.eval_scalar(Scope { body: &body, src, typed: &const_typed }, root, primitive, depth + 1);
+                    return self.eval_scalar(Scope { body: &body, src, typed: &const_typed, in_const: true }, root, primitive, depth + 1);
                 }
                 _ => return None,
             },
@@ -253,7 +259,7 @@ impl Lower<'_, '_> {
                 return cast_scalar(src_val, src_prim, primitive);
             }
             Expr::Binary(op, lhs, rhs) if !scope.typed.operators.contains_key(&expr) => return self.eval_binary(scope, op, lhs, rhs, primitive, depth),
-            _ => return None,
+            _ => return self.eval_const_scalar_fn(scope, expr, primitive, depth),
         };
         Some(int_info(primitive).map_or(value, |(bits, _)| value & mask(bits)))
     }
@@ -280,67 +286,76 @@ impl Lower<'_, '_> {
                 Some(u128::from(cmp_scalar(op, l, r, (bits, signed))))
             }
             BinOp::Shl | BinOp::Shr => {
-                let (bits, signed) = int_info(primitive)?;
                 let Kind::Prim(rp) = *self.cx.types.kind(scope.typed.expr_ty(&self.cx.types, rhs)) else { return None };
-                let (rbits, rsigned) = int_info(rp)?;
+                let rinfo = int_info(rp)?;
                 let l = self.eval_scalar(scope, lhs, primitive, depth)?;
                 let r = self.eval_scalar(scope, rhs, rp, depth)?;
-                let shift = if rsigned {
-                    u32::try_from(sign_extend(r, rbits)).ok()
-                } else {
-                    u32::try_from(r).ok()
-                }?;
-                if shift >= bits {
-                    return None;
-                }
-                match op {
-                    BinOp::Shl => Some((l << shift) & mask(bits)),
-                    _ if signed => Some(((sign_extend(l, bits) >> shift) as u128) & mask(bits)),
-                    _ => Some((l & mask(bits)) >> shift),
-                }
+                apply_shift(op, primitive, (l, r), rinfo)
             }
-            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                let (bits, _) = match primitive {
-                    Primitive::Bool => (1, false),
-                    _ => int_info(primitive)?,
-                };
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 let l = self.eval_scalar(scope, lhs, primitive, depth)?;
                 let r = self.eval_scalar(scope, rhs, primitive, depth)?;
-                let out = match op {
-                    BinOp::BitAnd => l & r,
-                    BinOp::BitOr => l | r,
-                    _ => l ^ r,
-                };
-                Some(out & mask(bits))
-            }
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                let (bits, signed) = int_info(primitive)?;
-                let l = self.eval_scalar(scope, lhs, primitive, depth)?;
-                let r = self.eval_scalar(scope, rhs, primitive, depth)?;
-                if signed {
-                    let (sa, sb) = (sign_extend(l, bits), sign_extend(r, bits));
-                    let res = match op {
-                        BinOp::Add => sa.checked_add(sb)?,
-                        BinOp::Sub => sa.checked_sub(sb)?,
-                        BinOp::Mul => sa.checked_mul(sb)?,
-                        BinOp::Div => sa.checked_div(sb)?,
-                        _ => sa.checked_rem(sb)?,
-                    };
-                    check_signed(res, bits)
-                } else {
-                    let res = match op {
-                        BinOp::Add => l.checked_add(r)?,
-                        BinOp::Sub => l.checked_sub(r)?,
-                        BinOp::Mul => l.checked_mul(r)?,
-                        BinOp::Div => l.checked_div(r)?,
-                        _ => l.checked_rem(r)?,
-                    };
-                    (res <= mask(bits)).then_some(res)
-                }
+                apply_int_binary(op, primitive, l, r)
             }
             _ => None,
         }
     }
+}
+
+pub(super) fn apply_shift(op: BinOp, primitive: Primitive, (l, r): (u128, u128), (rbits, rsigned): (u32, bool)) -> Option<u128> {
+    let (bits, signed) = int_info(primitive)?;
+    let shift = if rsigned { u32::try_from(sign_extend(r, rbits)).ok() } else { u32::try_from(r).ok() }?;
+    if shift >= bits {
+        return None;
+    }
+    match op {
+        BinOp::Shl => Some((l << shift) & mask(bits)),
+        _ if signed => Some(((sign_extend(l, bits) >> shift) as u128) & mask(bits)),
+        _ => Some((l & mask(bits)) >> shift),
+    }
+}
+
+pub(super) fn apply_int_binary(op: BinOp, primitive: Primitive, l: u128, r: u128) -> Option<u128> {
+    if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
+        let (bits, _) = if primitive == Primitive::Bool { (1, false) } else { int_info(primitive)? };
+        let out = match op {
+            BinOp::BitAnd => l & r,
+            BinOp::BitOr => l | r,
+            _ => l ^ r,
+        };
+        return Some(out & mask(bits));
+    }
+    let (bits, signed) = int_info(primitive)?;
+    if signed {
+        apply_checked_signed(op, bits, l, r)
+    } else {
+        apply_checked_unsigned(op, bits, l, r)
+    }
+}
+
+fn apply_checked_signed(op: BinOp, bits: u32, l: u128, r: u128) -> Option<u128> {
+    let (sa, sb) = (sign_extend(l, bits), sign_extend(r, bits));
+    let res = match op {
+        BinOp::Add => sa.checked_add(sb)?,
+        BinOp::Sub => sa.checked_sub(sb)?,
+        BinOp::Mul => sa.checked_mul(sb)?,
+        BinOp::Div => sa.checked_div(sb)?,
+        BinOp::Rem => sa.checked_rem(sb)?,
+        _ => return None,
+    };
+    check_signed(res, bits)
+}
+
+fn apply_checked_unsigned(op: BinOp, bits: u32, l: u128, r: u128) -> Option<u128> {
+    let res = match op {
+        BinOp::Add => l.checked_add(r)?,
+        BinOp::Sub => l.checked_sub(r)?,
+        BinOp::Mul => l.checked_mul(r)?,
+        BinOp::Div => l.checked_div(r)?,
+        BinOp::Rem => l.checked_rem(r)?,
+        _ => return None,
+    };
+    (res <= mask(bits)).then_some(res)
 }
 
 /// The variant `expr` constructs, with each field it gives by index, when it is a unit, tuple or struct constructor with no base.
@@ -360,7 +375,7 @@ fn constructor(scope: Scope<'_>, expr: ExprId) -> Option<(u32, Vec<(u32, ExprId)
     }
 }
 
-fn prim_info(prim: Primitive) -> Option<(u32, bool)> {
+pub(super) fn prim_info(prim: Primitive) -> Option<(u32, bool)> {
     match prim {
         Primitive::Bool => Some((1, false)),
         Primitive::Char => Some((32, false)),
@@ -368,7 +383,7 @@ fn prim_info(prim: Primitive) -> Option<(u32, bool)> {
     }
 }
 
-fn sign_extend(val: u128, bits: u32) -> i128 {
+pub(super) fn sign_extend(val: u128, bits: u32) -> i128 {
     let shift = 128 - bits;
     ((val << shift) as i128) >> shift
 }
@@ -382,7 +397,7 @@ fn check_signed(res: i128, bits: u32) -> Option<u128> {
     (res >= min && res <= max).then_some((res as u128) & mask(bits))
 }
 
-fn cast_scalar(src_val: u128, src_prim: Primitive, dst_prim: Primitive) -> Option<u128> {
+pub(super) fn cast_scalar(src_val: u128, src_prim: Primitive, dst_prim: Primitive) -> Option<u128> {
     if dst_prim == Primitive::Char {
         return matches!(src_prim, Primitive::U8 | Primitive::Char).then_some(src_val & 0xFFFF_FFFF);
     }
@@ -392,7 +407,7 @@ fn cast_scalar(src_val: u128, src_prim: Primitive, dst_prim: Primitive) -> Optio
     Some(bits & mask(dst_bits))
 }
 
-fn cmp_scalar(op: BinOp, l: u128, r: u128, (bits, signed): (u32, bool)) -> bool {
+pub(super) fn cmp_scalar(op: BinOp, l: u128, r: u128, (bits, signed): (u32, bool)) -> bool {
     if signed {
         let (sa, sb) = (sign_extend(l, bits), sign_extend(r, bits));
         match op {
