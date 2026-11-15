@@ -38,13 +38,82 @@ fn same_class<R>(regs: &Regs<R>, a: Type, b: Type) -> bool {
     reg_class(regs, a).is_some_and(|ca| reg_class(regs, b) == Some(ca))
 }
 
+struct ReuseCtx<'a, R: 'static> {
+    func: &'a Function,
+    regs: &'a Regs<R>,
+    locations: &'a [Location<R>],
+    live: &'a Live,
+    is_param: &'a [bool],
+}
+
+fn reuse_dies<R: 'static>(ctx: &ReuseCtx<'_, R>, result: Value, op: Value, end_at: u32) -> bool {
+    same_class(ctx.regs, ctx.func.ty(op), ctx.func.ty(result))
+        && ctx.live.last_end(op.index()) == Some(end_at)
+        && !overlaps(ctx.live.ranges_of(op.index()), ctx.live.ranges_of(result.index()))
+}
+
+fn prefers_y(is_param: &[bool], reuse: &[Option<Value>], x: Value, y: Value) -> bool {
+    is_param[y.index()] && !is_param[x.index()] && reuse[x.index()].is_none_or(|rx| !is_param[rx.index()])
+}
+
+fn followed_by_fits<R: 'static>(ctx: &ReuseCtx<'_, R>, block_idx: usize, at: usize, (op, x, y): (Binary, Value, Value)) -> bool {
+    let next = ctx.func.blocks[block_idx].insts.get(at + 1).map(|next| &ctx.func.insts[next.index()].op);
+    matches!(next, Some(Op::Fits(check, _, a, b)) if *check == op && (*a, *b) == (x, y))
+}
+
+fn binary_reuse_allowed<R: 'static>(ctx: &ReuseCtx<'_, R>, op: Binary, y: Value) -> (bool, bool) {
+    let imm_y = matches!(ctx.locations[y.index()], Location::Imm(_));
+    let can_x = in_place(op) || (is_shift(op) && (!ctx.regs.two_address || imm_y));
+    let can_y = is_commutative(op) || (!ctx.regs.two_address && (matches!(op, Binary::Isub) || is_shift(op)));
+    (can_x, can_y)
+}
+
+fn reuse_binary<R: 'static>(ctx: &ReuseCtx<'_, R>, reuse: &[Option<Value>], (block_idx, at, result): (usize, usize, Value), (op, x, y): (Binary, Value, Value), end_at: u32) -> Option<Value> {
+    if followed_by_fits(ctx, block_idx, at, (op, x, y)) {
+        return None;
+    }
+    let (can_x, can_y) = binary_reuse_allowed(ctx, op, y);
+    let dies_x = can_x && reuse_dies(ctx, result, x, end_at);
+    let dies_y = can_y && reuse_dies(ctx, result, y, end_at);
+    if dies_x && dies_y && is_commutative(op) && prefers_y(ctx.is_param, reuse, x, y) {
+        return Some(y);
+    }
+    dies_x.then_some(x).or_else(|| dies_y.then_some(y))
+}
+
+fn reuse_candidate<R: 'static>(ctx: &ReuseCtx<'_, R>, reuse: &[Option<Value>], (block_idx, at, result): (usize, usize, Value), end_at: u32) -> Option<Value> {
+    let data = &ctx.func.insts[ctx.func.blocks[block_idx].insts[at].index()];
+    match data.op {
+        Op::Binary(op, x, y) => reuse_binary(ctx, reuse, (block_idx, at, result), (op, x, y), end_at),
+        Op::Convert(Convert::Uextend | Convert::Sextend | Convert::Ireduce | Convert::Bitcast, x)
+            if reuse_dies(ctx, result, x, end_at) => Some(x),
+        Op::Unary(Unary::Ineg | Unary::Bnot | Unary::Bswap | Unary::Bitrev | Unary::Clz | Unary::Ctz | Unary::Fabs | Unary::Fneg | Unary::Sqrt, x)
+            if reuse_dies(ctx, result, x, end_at) => Some(x),
+        Op::Select(cond, x, y) => {
+            if x != cond && reuse_dies(ctx, result, x, end_at) {
+                let pick_y = !ctx.regs.two_address && y != cond && reuse_dies(ctx, result, y, end_at) && prefers_y(ctx.is_param, reuse, x, y);
+                Some(if pick_y { y } else { x })
+            } else {
+                (!ctx.regs.two_address && y != cond && reuse_dies(ctx, result, y, end_at)).then_some(y)
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Returns for each value a dying same-class operand whose register may be reused in place.
-pub(super) fn reusable<R>(func: &Function, regs: &Regs<R>, locations: &[Location<R>], live: &Live, elided: &[bool]) -> Vec<Option<Value>> {
-    let mut reuse = vec![None; func.types.len()];
+pub(super) fn reusable<R: 'static>(func: &Function, regs: &Regs<R>, locations: &[Location<R>], live: &Live, elided: &[bool]) -> Vec<Option<Value>> {
+    let mut is_param = vec![false; func.types.len()];
     for block in &func.blocks {
+        for &param in &block.params {
+            is_param[param.index()] = true;
+        }
+    }
+    let ctx = ReuseCtx { func, regs, locations, live, is_param: &is_param };
+    let mut reuse = vec![None; func.types.len()];
+    for (block_idx, block) in func.blocks.iter().enumerate() {
         for (at, inst) in block.insts.iter().enumerate() {
-            let data = &func.insts[inst.index()];
-            let Some(result) = data.result else { continue };
+            let Some(result) = func.insts[inst.index()].result else { continue };
             let rty = func.ty(result);
             if elided[result.index()] || reg_class(regs, rty).is_none() {
                 continue;
@@ -53,44 +122,7 @@ pub(super) fn reusable<R>(func: &Function, regs: &Regs<R>, locations: &[Location
             if def == 0 || live.ranges_of(result.index()).first().is_none_or(|r| r.start != def) {
                 continue;
             }
-            let end_at = def - 1;
-            let dies = |op: Value| {
-                same_class(regs, func.ty(op), rty)
-                    && live.last_end(op.index()) == Some(end_at)
-                    && !overlaps(live.ranges_of(op.index()), live.ranges_of(result.index()))
-            };
-            let chosen = match &data.op {
-                Op::Binary(op, x, y) => {
-                    let next = block.insts.get(at + 1).map(|next| &func.insts[next.index()].op);
-                    if matches!(next, Some(Op::Fits(check, _, a, b)) if check == op && (a, b) == (x, y)) {
-                        continue;
-                    }
-                    let can_x = in_place(*op) || (is_shift(*op) && (!regs.two_address || matches!(locations[y.index()], Location::Imm(_))));
-                    if can_x && dies(*x) {
-                        Some(*x)
-                    } else if (is_commutative(*op) || (!regs.two_address && (matches!(*op, Binary::Isub) || is_shift(*op)))) && dies(*y) {
-                        Some(*y)
-                    } else {
-                        None
-                    }
-                }
-                Op::Convert(Convert::Uextend | Convert::Sextend | Convert::Ireduce | Convert::Bitcast, x) if dies(*x) => Some(*x),
-                Op::Unary(
-                    Unary::Ineg | Unary::Bnot | Unary::Bswap | Unary::Bitrev | Unary::Clz | Unary::Ctz | Unary::Fabs | Unary::Fneg | Unary::Sqrt,
-                    x,
-                ) if dies(*x) => Some(*x),
-                Op::Select(cond, x, y) => {
-                    if *x != *cond && dies(*x) {
-                        Some(*x)
-                    } else if !regs.two_address && *y != *cond && dies(*y) {
-                        Some(*y)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            reuse[result.index()] = chosen;
+            reuse[result.index()] = reuse_candidate(&ctx, &reuse, (block_idx, at, result), def - 1);
         }
     }
     reuse
