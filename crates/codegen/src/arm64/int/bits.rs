@@ -1,8 +1,9 @@
-use super::super::asm::{Alu, Reg, Size, ZR};
+use super::super::asm::{Alu, Cond, Reg, Size, ZR};
 use super::super::fuse::{Bfx, unwrap_elided_tst};
-use super::{A, C, Emit, encode_bitmask_imm};
+use super::{A, C, Emit, add_imm_parts, cond, encode_bitmask_imm, swap_cond};
+use crate::alloc::Location;
 use crate::frame::Ext;
-use crate::ir::{Convert, Type, Value};
+use crate::ir::{Convert, IntCC, Op, Type, Value};
 
 impl Emit<'_> {
     pub(super) fn emit_bfm(&mut self, bfx: Bfx, ty: Type, dst: Reg) {
@@ -58,6 +59,37 @@ impl Emit<'_> {
         self.asm.alu(Alu::Ands, size, ZR, left, right);
     }
 
+    fn sload_op(&self, val: Value) -> Option<Op> {
+        match self.func.insts[self.defs[val.index()]?.index()].op {
+            Op::Load(addr, off) => Some(Op::Load(addr, off)),
+            Op::StackLoad(slot, off) => Some(Op::StackLoad(slot, off)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn cmp_sload(&mut self, cc: IntCC, x: Value, y: Value) -> Option<Cond> {
+        let ty = self.ty(x);
+        if !cc.is_signed() || !matches!(ty, Type::I8 | Type::I16) {
+            return None;
+        }
+        let (load, other, swapped) = [(x, y, false), (y, x, true)]
+            .into_iter()
+            .find(|&(l, o, _)| self.plan.elided[l.index()] && !self.plan.elided[o.index()])?;
+        let op = self.sload_op(load)?;
+        if let Some((sub, imm)) = self.plan.const_of(other).and_then(|v| add_imm_parts(true, crate::fold::extend(v, ty, true))) {
+            self.load_signed_reg(A, ty, &op);
+            self.asm.add_imm(sub, true, Size::W, ZR, A, imm);
+        } else if matches!(self.plan.location(other), Location::Reg(_)) {
+            self.load_signed_reg(A, ty, &op);
+            let right = self.src(other, C, Ext::Sign);
+            self.asm.alu(Alu::Subs, Size::W, ZR, A, right);
+        } else {
+            return None;
+        }
+        self.last_cmp = None;
+        Some(if swapped { swap_cond(cond(cc)) } else { cond(cc) })
+    }
+
     pub(super) fn emit_extend_conv(&mut self, op: Convert, x: Value, result: Value) -> Result<(), String> {
         let dst_ty = self.ty(result);
         let dst = self.dst(result);
@@ -66,6 +98,14 @@ impl Emit<'_> {
         {
             self.emit_bfm(bfx, dst_ty, dst);
             self.put(result, dst);
+            return Ok(());
+        }
+        if op == Convert::Sextend
+            && dst_ty != Type::I128
+            && self.plan.elided[x.index()]
+            && let Some(load_op) = self.sload_op(x)
+        {
+            self.load_signed(result, self.ty(x), &load_op);
             return Ok(());
         }
         let signed = op == Convert::Sextend;

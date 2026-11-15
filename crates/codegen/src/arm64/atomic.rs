@@ -83,20 +83,50 @@ impl Emit<'_> {
         Ok(())
     }
 
+    fn load_gp(&mut self, dst: Reg, ty: Type, signed: bool, op: &Op) {
+        let size = Size::of(ty.bytes());
+        match *op {
+            Op::Load(addr, off) => {
+                if let Some((base, index, shift)) = self.sib_indexed(addr, off, ty.bytes()) {
+                    self.asm.load_indexed(size, signed, dst, base, index, shift);
+                } else {
+                    let from = self.address(addr, off);
+                    self.asm.load(size, signed, dst, from);
+                }
+            }
+            Op::StackLoad(slot, off) => self.asm.load(size, signed, dst, self.slot(slot, off)),
+            _ => {}
+        }
+    }
+
+    pub(super) fn load_signed(&mut self, result: Value, src_ty: Type, op: &Op) {
+        let dst = self.dst(result);
+        self.load_gp(dst, src_ty, true, op);
+        self.put(result, dst);
+    }
+
+    pub(super) fn load_signed_reg(&mut self, dst: Reg, src_ty: Type, op: &Op) {
+        self.load_gp(dst, src_ty, true, op);
+        self.clobber_reg(dst);
+    }
+
     fn load_at(&mut self, result: Value, addr: Value, offset: i32) {
+        if self.plan.is_static(result) {
+            return;
+        }
         let ty = self.ty(result);
+        if ty != Type::I128 && !ty.in_float_register() {
+            let dst = self.dst(result);
+            self.load_gp(dst, ty, false, &Op::Load(addr, offset));
+            self.put(result, dst);
+            return;
+        }
         if ty != Type::I128
             && let Some((base, index, shift)) = self.sib_indexed(addr, offset, ty.bytes())
         {
-            if ty.in_float_register() {
-                let dst = self.fdst(result);
-                self.asm.vload_indexed(ty.bytes(), dst, base, index, shift);
-                self.fput(result, dst);
-            } else {
-                let dst = self.dst(result);
-                self.asm.load_indexed(Size::of(ty.bytes()), false, dst, base, index, shift);
-                self.put(result, dst);
-            }
+            let dst = self.fdst(result);
+            self.asm.vload_indexed(ty.bytes(), dst, base, index, shift);
+            self.fput(result, dst);
             return;
         }
         let from = self.address(addr, offset);
@@ -158,6 +188,9 @@ impl Emit<'_> {
     }
 
     fn read(&mut self, result: Value, from: Mem) {
+        if self.plan.is_static(result) {
+            return;
+        }
         let ty = self.ty(result);
         if ty.in_float_register() {
             let dst = self.fdst(result);

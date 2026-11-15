@@ -23,7 +23,7 @@ pub(super) fn cond(cc: IntCC) -> Cond {
     }
 }
 
-fn swap_cond(c: Cond) -> Cond {
+pub(super) fn swap_cond(c: Cond) -> Cond {
     match c {
         Cond::Lt => Cond::Gt, Cond::Le => Cond::Ge, Cond::Gt => Cond::Lt, Cond::Ge => Cond::Le,
         Cond::Lo => Cond::Hi, Cond::Ls => Cond::Hs, Cond::Hi => Cond::Lo, Cond::Hs => Cond::Ls,
@@ -691,7 +691,7 @@ impl Emit<'_> {
         let size = if bytes >= 8 { Size::X } else { Size::W };
         if self.last_cmp == Some((size, x, y, signed)) { return cond(cc); }
         if self.last_cmp == Some((size, y, x, signed)) { return swap_cond(cond(cc)); }
-        if let Some(c) = self.cmp_fused(cc, (x, y), (x_ty, size, signed)).or_else(|| self.cmp_shift_cmn(cc, (x, y), (x_ty, size, signed))) { return c; }
+        if let Some(c) = self.cmp_sload(cc, x, y).or_else(|| self.cmp_fused(cc, (x, y), (x_ty, size, signed))).or_else(|| self.cmp_shift_cmn(cc, (x, y), (x_ty, size, signed))) { return c; }
         let (left, right) = if bytes >= 4 { self.bits_pair(x, y) } else { self.pair_opt(x, y, signed) };
         self.asm.alu(Alu::Subs, size, ZR, left, right);
         self.last_cmp = Some((size, x, y, signed));

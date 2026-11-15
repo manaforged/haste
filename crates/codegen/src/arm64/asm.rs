@@ -573,8 +573,7 @@ impl Asm {
     }
 
     fn load_base(size: Size, signed: bool) -> u32 {
-        if size == Size::X { return 0xF840_0000; }
-        [0x3840_0000, 0x7840_0000, 0xB840_0000][size as usize] | (u32::from(signed) << 22)
+        Self::store_base(size) | if signed && size != Size::X { 0x80_0000 } else { 0x40_0000 }
     }
 
     fn store_base(size: Size) -> u32 {

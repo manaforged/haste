@@ -1,7 +1,7 @@
 use super::super::asm::{ExtOp, Reg, encode_sib};
 use super::{const_of, def_entry, def_inst, local_single, preserved, shift_parts, zero_ext_loc};
 use crate::alloc::{Location, Plan};
-use crate::ir::{Binary, Convert, Function, Inst, Lane, Op, ShuffleMask, StackSlot, Type, Value};
+use crate::ir::{Binary, Convert, Function, Inst, IntCC, Lane, Op, ShuffleMask, StackSlot, Type, Value};
 use crate::live::{Sib, SibBase};
 
 struct SibCand {
@@ -642,4 +642,82 @@ pub(super) fn try_fuse_vec_op(
         _ => return false,
     }
     true
+}
+
+fn is_sload_barrier(op: &Op) -> bool {
+    is_mem_barrier(op) || matches!(op, Op::Binary(Binary::Sdiv | Binary::Udiv | Binary::Srem | Binary::Urem, ..))
+}
+
+fn sload_addr_preserved(func: &Function, plan: &Plan<Reg>, (b_idx, lpos, cpos): (usize, usize, usize), op: &Op) -> bool {
+    let Op::Load(addr, _) = *op else { return matches!(op, Op::StackLoad(..)) };
+    let Some(sib) = plan.sib[addr.index()] else {
+        return !plan.elided[addr.index()] && preserved(func, plan, b_idx, lpos, cpos, None, addr);
+    };
+    let base_ok = match sib.base {
+        SibBase::Frame(_) => true,
+        SibBase::Value(b) => preserved(func, plan, b_idx, lpos, cpos, None, b),
+    };
+    base_ok && preserved(func, plan, b_idx, lpos, cpos, None, sib.index)
+}
+
+fn can_elide_sload(
+    func: &Function,
+    plan: &Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, cpos): (usize, usize),
+    val: Value,
+) -> bool {
+    if !matches!(plan.location(val), Location::Reg(_) | Location::Slot) {
+        return false;
+    }
+    let Some((lpos, linst)) = local_single(plan, info, b_idx, cpos, val) else {
+        return false;
+    };
+    let op = &func.insts[linst.index()].op;
+    sload_addr_preserved(func, plan, (b_idx, lpos, cpos), op)
+        && !func.blocks[b_idx].insts[lpos + 1..cpos].iter().any(|&i| is_sload_barrier(&func.insts[i.index()].op))
+}
+
+pub(super) fn try_fuse_sload_extend(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, res): (usize, usize, Value),
+    x: Value,
+) {
+    if matches!(func.ty(x), Type::I8 | Type::I16 | Type::I32)
+        && matches!(func.ty(res), Type::I16 | Type::I32 | Type::I64)
+        && can_elide_sload(func, plan, info, (b_idx, pos), x)
+    {
+        plan.elided[x.index()] = true;
+    }
+}
+
+fn icmp_sload_other_ok(plan: &Plan<Reg>, ty: Type, other: Value) -> bool {
+    if plan.elided[other.index()] {
+        return false;
+    }
+    if let Some(imm) = plan.const_of(other) {
+        return super::super::int::add_imm_parts(true, crate::fold::extend(imm, ty, true)).is_some();
+    }
+    matches!(plan.location(other), Location::Reg(r) if !matches!(r.0, 9 | 10 | 16 | 17 | 31))
+}
+
+pub(super) fn try_fuse_icmp_sload(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos): (usize, usize),
+    (cc, a, b): (IntCC, Value, Value),
+) {
+    let ty = func.ty(a);
+    if !cc.is_signed() || !matches!(ty, Type::I8 | Type::I16) {
+        return;
+    }
+    for (load, other) in [(a, b), (b, a)] {
+        if icmp_sload_other_ok(plan, ty, other) && can_elide_sload(func, plan, info, (b_idx, pos), load) {
+            plan.elided[load.index()] = true;
+            return;
+        }
+    }
 }

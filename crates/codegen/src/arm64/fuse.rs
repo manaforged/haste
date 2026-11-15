@@ -690,6 +690,24 @@ fn fuse_block_shift(
     }
 }
 
+fn fuse_block_icmp(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, res): (usize, usize, Value),
+    (cc, a, b): (IntCC, Value, Value),
+) {
+    try_fuse_icmp_select(func, plan, info, (b_idx, pos, res), (a, b));
+    if plan.elided[res.index()] {
+        return;
+    }
+    if matches!(func.ty(a), Type::I32 | Type::I64) {
+        fuse_icmp_operands(func, plan, info, (b_idx, pos, res), (cc, a, b));
+    } else if cc.is_signed() {
+        mem::try_fuse_icmp_sload(func, plan, info, (b_idx, pos), (cc, a, b));
+    }
+}
+
 fn fuse_block_inst(
     func: &Function,
     plan: &mut Plan<Reg>,
@@ -708,15 +726,12 @@ fn fuse_block_inst(
         }
         Op::Unary(uop, inner) => fuse_block_unary(func, plan, info, (b_idx, pos, res), (uop, inner)),
         Op::Convert(conv @ (Convert::Uextend | Convert::Sextend), inner) => {
-            bits::try_fuse_conv_bfx(func, plan, info, (b_idx, pos, res), (conv, inner));
-        }
-        Op::Convert(Convert::Ireduce, shr) => fuse_ireduce_ushr(func, plan, info, (b_idx, pos, res), shr),
-        Op::Icmp(cc, a, b) if func.ty(a).is_small_int() => {
-            try_fuse_icmp_select(func, plan, info, (b_idx, pos, res), (a, b));
-            if !plan.elided[res.index()] && matches!(func.ty(a), Type::I32 | Type::I64) {
-                fuse_icmp_operands(func, plan, info, (b_idx, pos, res), (cc, a, b));
+            if !bits::try_fuse_conv_bfx(func, plan, info, (b_idx, pos, res), (conv, inner)) && conv == Convert::Sextend {
+                mem::try_fuse_sload_extend(func, plan, info, (b_idx, pos, res), inner);
             }
         }
+        Op::Convert(Convert::Ireduce, shr) => fuse_ireduce_ushr(func, plan, info, (b_idx, pos, res), shr),
+        Op::Icmp(cc, a, b) if func.ty(a).is_small_int() => fuse_block_icmp(func, plan, info, (b_idx, pos, res), (cc, a, b)),
         Op::Binary(alu_op @ (Binary::Band | Binary::Bor | Binary::Bxor | Binary::Iadd | Binary::Isub), x, y)
             if func.ty(res).is_small_int() =>
         {
