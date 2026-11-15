@@ -163,6 +163,77 @@ pub(super) fn try_fuse_flag_operand(
     }
 }
 
+fn flag_ok(plan: &Plan<Reg>, val: Value) -> bool {
+    !plan.elided[val.index()] && !plan.fused[val.index()] && !plan.is_static(val)
+}
+
+fn icmp_select_root(
+    func: &Function,
+    plan: &Plan<Reg>,
+    uses: &[u32],
+    (b_idx, ipos, icmp_res): (usize, usize, Value),
+) -> Option<(Value, usize, Option<usize>)> {
+    if !flag_ok(plan, icmp_res) {
+        return None;
+    }
+    if uses[icmp_res.index()] != 1 {
+        return Some((icmp_res, ipos, None));
+    }
+    for (u_pos, &ni) in func.blocks[b_idx].insts.iter().enumerate().skip(ipos + 1) {
+        let ud = &func.insts[ni.index()];
+        if let Op::Convert(Convert::Uextend, inner) = ud.op
+            && inner == icmp_res
+            && let Some(uext) = ud.result
+            && flag_ok(plan, uext)
+            && func.ty(uext).is_small_int()
+        {
+            return Some((uext, u_pos, Some(u_pos)));
+        }
+        if matches!(ud.op, Op::Select(c, ..) if c == icmp_res) {
+            return Some((icmp_res, ipos, None));
+        }
+    }
+    None
+}
+
+fn find_select_consumers(
+    func: &Function,
+    (b_idx, start_pos): (usize, usize),
+    flag_val: Value,
+    total_uses: u32,
+) -> Option<(u32, usize, bool)> {
+    let insts = &func.blocks[b_idx].insts;
+    let (mut sels, mut brif, mut last_sel) = (0_u32, None, start_pos);
+    for (s_pos, &ni) in insts.iter().enumerate().skip(start_pos + 1) {
+        match &func.insts[ni.index()].op {
+            Op::Select(c, x, y) if *c == flag_val && *x != flag_val && *y != flag_val => {
+                sels += 1;
+                last_sel = s_pos;
+                if sels == total_uses {
+                    return Some((sels, last_sel, false));
+                }
+            }
+            Op::Brif(c, _, ta, _, ea)
+                if sels == 1 && total_uses == 2 && *c == flag_val && !ta.contains(&flag_val) && !ea.contains(&flag_val) =>
+            {
+                brif = Some(s_pos);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let b_pos = brif?;
+    insts[last_sel + 1..b_pos]
+        .iter()
+        .all(|&ni| preserves_flags(&func.insts[ni.index()].op))
+        .then_some((1, last_sel, true))
+}
+
+fn brif_band_conflict(plan: &Plan<Reg>, cc: IntCC, (a, b): (Value, Value)) -> bool {
+    matches!(cc, IntCC::Equal | IntCC::NotEqual)
+        && ((plan.const_of(b) == Some(0) && plan.elided[a.index()]) || (plan.const_of(a) == Some(0) && plan.elided[b.index()]))
+}
+
 pub(super) fn try_fuse_icmp_select(
     func: &Function,
     plan: &mut Plan<Reg>,
@@ -170,27 +241,27 @@ pub(super) fn try_fuse_icmp_select(
     (b_idx, pos, res): (usize, usize, Value),
     (a, b): (Value, Value),
 ) {
-    let cmp_uses = uses[res.index()];
-    if !(1..=2).contains(&cmp_uses) {
+    let Some((flag_val, search_pos, skip_pos)) = icmp_select_root(func, plan, uses, (b_idx, pos, res)) else {
+        return;
+    };
+    let flag_uses = uses[flag_val.index()];
+    if !(1..=2).contains(&flag_uses) {
         return;
     }
     let Op::Icmp(cc, _, _) = func.insts[func.blocks[b_idx].insts[pos].index()].op else {
         return;
     };
-    let (mut found, mut last_sel) = (0_u32, pos);
-    for (s_pos, &ni) in func.blocks[b_idx].insts.iter().enumerate().skip(pos + 1) {
-        if matches!(func.insts[ni.index()].op, Op::Select(c, x, y) if c == res && x != res && y != res) {
-            found += 1;
-            last_sel = s_pos;
-            if found == cmp_uses {
-                break;
-            }
-        }
+    let Some((cmp_count, last_sel, has_brif)) = find_select_consumers(func, (b_idx, search_pos), flag_val, flag_uses) else {
+        return;
+    };
+    if has_brif && skip_pos.is_none() && brif_band_conflict(plan, cc, (a, b)) {
+        return;
     }
-    if found == cmp_uses
-        && let Some(band) = try_cmp_preserved(func, plan, info, (b_idx, pos, last_sel, None), (cc, a, b, cmp_uses))
+    if let Some(band) = try_cmp_preserved(func, plan, info, (b_idx, pos, last_sel, skip_pos), (cc, a, b, cmp_count))
+        && (!has_brif || skip_pos.is_some() || band.is_none())
     {
         plan.elided[res.index()] = true;
+        plan.elided[flag_val.index()] = true;
         if let Some(m) = band {
             plan.elided[m.index()] = true;
         }
