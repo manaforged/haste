@@ -1,6 +1,7 @@
 use crate::ir::{AtomicRmwOp, Binary, Block, BlockData, Convert, FloatCC, Function, Inst, InstData, IntCC, Op, SigRef, Signature, SlotData, StackSlot, Type, Unary, Value};
 use crate::reloc::RuntimeSymbol;
 
+mod query;
 mod vector;
 
 fn cmp_result_ty(ty: Type) -> Type {
@@ -172,11 +173,6 @@ impl<'f> FunctionBuilder<'f> {
     pub fn ins(&mut self) -> Ins<'_> {
         let block = self.current.expect("a block is selected");
         Ins { func: self.func, block, incoming: &mut self.incoming }
-    }
-
-    /// Whether `value` was defined as an immediate constant in the current function.
-    pub fn is_const(&self, value: Value) -> bool {
-        self.func.insts.iter().rev().take(32).any(|d| d.result == Some(value) && matches!(d.op, Op::Const(_)))
     }
 }
 

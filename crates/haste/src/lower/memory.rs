@@ -307,18 +307,22 @@ impl Lower<'_, '_> {
             (Intrinsic::CompareBytes, _, &[x, y, count]) => self.compare_bytes((x, y), count),
             (Intrinsic::RawEq, Some(ty), &[x, y]) => {
                 let size = self.cx.layout(ty)?.size.bytes();
-                if size <= 16 {
-                    return Ok(self.equal_bytes_const((x, y), size));
-                }
-                let size = self.ins().iconst(Type::I64, size as i64);
-                let order = self.compare_bytes((x, y), size)?;
-                Ok(self.ins().icmp_imm(IntCC::Equal, order, 0))
+                self.equal_bytes_const((x, y), size)
             }
             _ => bail!("intrinsic {which:?} with {} arguments", args.len()),
         }
     }
 
-    fn compare_bytes(&mut self, (x, y): (Value, Value), count: Value) -> Result<Value> {
+    pub(super) fn compare_bytes(&mut self, (x, y): (Value, Value), count: Value) -> Result<Value> {
+        match self.b.const_int(count) {
+            Some(0) => return Ok(self.ins().iconst(Type::I32, 0)),
+            Some(1) => {
+                let (a0, b0) = (self.ins().load(Type::I8, x, 0), self.ins().load(Type::I8, y, 0));
+                let (u0, v0) = (self.ins().uextend(Type::I32, a0), self.ins().uextend(Type::I32, b0));
+                return Ok(self.ins().isub(u0, v0));
+            }
+            _ => {}
+        }
         let (nonempty, eq_first, tail, done) = (
             self.b.create_block(),
             self.b.create_block(),
