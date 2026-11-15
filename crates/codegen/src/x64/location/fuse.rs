@@ -1,6 +1,7 @@
 use super::patterns::{
-    FOLD_LIMIT, Root, SibMatch, adc_parts, bextr_parts, flag_cmp, is_zero_const, mid_preserves_flags, odd_scale_source, parked, scaled_op, shld_parts,
+    Root, adc_parts, bextr_parts, flag_cmp, is_zero_const, mid_preserves_flags, parked, shld_parts,
 };
+use super::sib::{apply_sib_groups, find_cand_sib, idx_source, sib_ok};
 use super::super::{FRAME_REGS, REGS};
 use super::super::asm::Reg;
 use super::super::atomic::uses_scratch;
@@ -26,7 +27,7 @@ fn scratches(func: &Function, data: &InstData, reg: Reg) -> bool {
     (wide && WIDE_SCRATCH.contains(&reg)) || ((wide || uses_scratch(func, &data.op)) && REGS.op_scratch.contains(&reg))
 }
 
-fn preserved(func: &Function, plan: &Plan<Reg>, b_idx: usize, start: usize, end: usize, skip: &[usize], val: Value) -> bool {
+pub(super) fn preserved(func: &Function, plan: &Plan<Reg>, b_idx: usize, start: usize, end: usize, skip: &[usize], val: Value) -> bool {
     if plan.elided[val.index()] {
         return false;
     }
@@ -90,20 +91,6 @@ fn zero_cmp_band(
     }
     let Op::Binary(Binary::Band, x, y) = func.insts[minst.index()].op else { return None };
     Some((masked, mpos, x, y))
-}
-
-fn sib_ok(ctx: &FuseCtx<'_>, m: &SibMatch, extra_skips: &[usize], end_pos: usize) -> bool {
-    let mut skip: Vec<usize> = m.elide.iter().map(|&(_, p)| p).collect();
-    skip.extend_from_slice(extra_skips);
-    let base_ok = match m.sib.base {
-        SibBase::Frame(_) => true,
-        SibBase::Value(base) => preserved(ctx.func, ctx.plan, ctx.b_idx, m.base_start, end_pos, &skip, base),
-    };
-    base_ok && preserved(ctx.func, ctx.plan, ctx.b_idx, m.idx_start, end_pos, &skip, m.sib.index)
-}
-
-fn idx_source(func: &Function, plan: &Plan<Reg>, defs: &[Option<Inst>], idx: Value) -> Value {
-    odd_scale_source(func, plan, |v| defs[v.index()], idx).map_or(idx, |(x, _)| x)
 }
 
 fn may_barrier_mem(op: &Op) -> bool {
@@ -187,139 +174,148 @@ fn iadd_sub_const(plan: &Plan<Reg>, op: &Op) -> Option<(Value, i64)> {
     }
 }
 
-fn collect_sib_chain(
-    ctx: &FuseCtx<'_>,
-    root: Value,
-    root_pos: usize,
-    ls_uses: &[Vec<(usize, usize, i32)>],
-    const_kids: &[Vec<(usize, usize, Value, i64)>],
-) -> Option<(Vec<(Value, usize, i64)>, usize, bool)> {
-    let (mut nodes, mut work) = (Vec::new(), vec![(root, 0_i64)]);
-    let (mut max_end, mut total_mem) = (0_usize, 0_usize);
-    while let Some((cur, delta)) = work.pop() {
-        let mut kids = 0_usize;
-        for &(kb, kpos, kid, kdelta) in &const_kids[cur.index()] {
-            if kb == ctx.b_idx && kpos > root_pos && !ctx.plan.elided[kid.index()] && ctx.plan.sib[kid.index()].is_none() {
-                let next = delta.checked_add(kdelta).filter(|d| (-FOLD_LIMIT..=FOLD_LIMIT).contains(d))?;
-                nodes.push((kid, kpos, next));
-                work.push((kid, next));
-                kids += 1;
-            }
-        }
-        if ctx.uses[cur.index()] as usize != ls_uses[cur.index()].len() + kids {
-            return None;
-        }
-        for &(ub, upos, _) in &ls_uses[cur.index()] {
-            if ub != ctx.b_idx || upos <= root_pos {
-                return None;
-            }
-            max_end = max_end.max(upos);
-        }
-        total_mem += ls_uses[cur.index()].len();
+fn cmp_band_arg_ok(ctx: &FuseCtx<'_>, (mpos, cpos, last_pos): (usize, usize, usize), u: Value) -> bool {
+    if !ctx.plan.elided[u.index()] {
+        return preserved(ctx.func, ctx.plan, ctx.b_idx, mpos, last_pos, &[cpos], u);
     }
-    (total_mem > 0 && max_end > root_pos).then_some((nodes, max_end, total_mem > 1))
+    ctx.pos_of[u.index()].is_some_and(|(lb, lpos, linst)| {
+        lb == ctx.b_idx
+            && lpos < mpos
+            && matches!(ctx.func.insts[linst.index()].op, Op::Load(..) | Op::StackLoad(..))
+            && load_fuses(ctx, lpos, last_pos, &[cpos])
+    })
 }
 
-fn chain_fits(disp: i32, root: Value, nodes: &[(Value, usize, i64)], ls_uses: &[Vec<(usize, usize, i32)>]) -> bool {
-    std::iter::once((root, 0_i64))
-        .chain(nodes.iter().map(|&(v, _, d)| (v, d)))
-        .all(|(v, d)| ls_uses[v.index()].iter().all(|&(_, _, off)| (-FOLD_LIMIT..=FOLD_LIMIT).contains(&(i64::from(disp) + d + i64::from(off)))))
-}
-
-fn find_cand_sib(
-    ctx: &FuseCtx<'_>,
-    (pos, addr): (usize, Value),
-    ls_uses: &[Vec<(usize, usize, i32)>],
-    const_kids: &[Vec<(usize, usize, Value, i64)>],
-) -> Option<(SibMatch, Vec<(Value, usize, i64)>)> {
-    if ctx.plan.elided[addr.index()] {
-        return None;
-    }
-    let (nodes, end_pos, multi_use) = collect_sib_chain(ctx, addr, pos, ls_uses, const_kids)?;
-    let m = ctx.match_sib(addr, pos, multi_use)?;
-    if !chain_fits(m.sib.disp, addr, &nodes, ls_uses) {
-        return None;
-    }
-    let mut skips = vec![pos];
-    skips.extend(nodes.iter().map(|&(_, p, _)| p));
-    sib_ok(ctx, &m, &skips, end_pos).then_some((m, nodes))
-}
-
-struct SibUpgrade {
-    elide: Vec<Value>,
-    targets: Vec<(Value, Sib)>,
-}
-
-fn collect_sib_groups(func: &Function, plan: &Plan<Reg>, b_idx: usize) -> Vec<(Value, Vec<(Value, usize, Sib)>)> {
-    let mut groups: Vec<(Value, Vec<(Value, usize, Sib)>)> = Vec::new();
-    for (pos, &inst) in func.blocks[b_idx].insts.iter().enumerate() {
-        let Some(res) = func.insts[inst.index()].result else { continue };
-        let Some(mode) = plan.sib[res.index()] else { continue };
-        if !plan.elided[res.index()] || mode.shift != 0 || plan.elided[mode.index.index()] {
-            continue;
-        }
-        if let Some((_, list)) = groups.iter_mut().find(|(k, _)| *k == mode.index) {
-            list.push((res, pos, mode));
-        } else {
-            groups.push((mode.index, vec![(res, pos, mode)]));
-        }
-    }
-    groups
-}
-
-fn group_mem_span(ctx: &FuseCtx<'_>, core: Value, items: &[(Value, usize, Sib)], ls_uses: &[Vec<(usize, usize, i32)>]) -> Option<(usize, usize)> {
-    let (mut direct, mut total_mem, mut max_end) = (0_usize, 0_usize, 0_usize);
-    for &(v, vpos, mode) in items {
-        if matches!(mode.base, SibBase::Value(b) if b == core) {
-            return None;
-        }
-        let (_, _, inst) = ctx.pos_of[v.index()]?;
-        ctx.func.insts[inst.index()].op.for_operands(|op_v| {
-            if op_v == core {
-                direct += 1;
-            }
-        });
-        for &(ub, upos, _) in &ls_uses[v.index()] {
-            if ub != ctx.b_idx || upos <= vpos {
-                return None;
-            }
-            max_end = max_end.max(upos);
-            total_mem += 1;
-        }
-    }
-    (direct == ctx.uses[core.index()] as usize && total_mem > 0).then_some((total_mem, max_end))
-}
-
-fn odd_group_ok(ctx: &FuseCtx<'_>, items: &[(Value, usize, Sib)], shift: u8, total_mem: usize) -> bool {
-    let profitable = (shift > 0 && total_mem <= 2) || (shift == 0 && total_mem == 1);
-    profitable && items.iter().all(|&(_, _, m)| !matches!(m.base, SibBase::Value(b) if ctx.plan.elided[b.index()] || ctx.plan.reg_of(b).is_none()))
-}
-
-fn eval_sib_group(ctx: &FuseCtx<'_>, core: Value, items: &[(Value, usize, Sib)], ls_uses: &[Vec<(usize, usize, i32)>]) -> Option<SibUpgrade> {
-    let (sb, spos, sinst) = ctx.pos_of[core.index()]?;
-    if sb != ctx.b_idx || ctx.func.ty(core) != Type::I64 {
-        return None;
-    }
-    let (raw_idx, shift, odd) = scaled_op(ctx.func, ctx.plan, sinst)?;
-    let (total_mem, max_end) = group_mem_span(ctx, core, items, ls_uses)?;
-    if odd.is_some() && !odd_group_ok(ctx, items, shift, total_mem) {
-        return None;
-    }
-    let mut elide_pos = vec![(core, spos)];
-    let (idx, idx_start) = ctx.unwrap_uext(raw_idx, spos, total_mem > 1 || odd.is_some(), &mut elide_pos);
-    if !ctx.index_ok(idx) || !preserved(ctx.func, ctx.plan, ctx.b_idx, idx_start, max_end, &[spos, idx_start], idx) {
-        return None;
-    }
-    let index = if odd.is_some() { core } else { idx };
-    let targets = items.iter().map(|&(v, _, m)| (v, Sib { index, shift, ..m })).collect();
-    Some(SibUpgrade { elide: elide_pos.into_iter().map(|(v, _)| v).collect(), targets })
-}
-
-fn cmp_operand_ok(ctx: &FuseCtx<'_>, cpos: usize, last_pos: usize, v: Value) -> bool {
+fn cmp_operand_ok(ctx: &FuseCtx<'_>, tst_end: &[Option<usize>], cpos: usize, last_pos: usize, v: Value) -> bool {
     if !ctx.plan.elided[v.index()] {
         return preserved(ctx.func, ctx.plan, ctx.b_idx, cpos, last_pos, &[], v);
     }
-    ctx.pos_of[v.index()].is_some_and(|(lb, lpos, _)| lb == ctx.b_idx && lpos < cpos && load_fuses(ctx, lpos, last_pos, &[]))
+    let Some((lb, lpos, linst)) = ctx.pos_of[v.index()] else { return false };
+    if lb != ctx.b_idx || lpos >= cpos {
+        return false;
+    }
+    match ctx.func.insts[linst.index()].op {
+        Op::Load(..) | Op::StackLoad(..) => load_fuses(ctx, lpos, last_pos, &[]),
+        Op::Binary(Binary::Band, x, y) if tst_end[v.index()].is_some() => {
+            [x, y].into_iter().all(|u| cmp_band_arg_ok(ctx, (lpos, cpos, last_pos), u))
+        }
+        _ => false,
+    }
+}
+
+fn push_branch_tst(
+    func: &Function,
+    plan: &Plan<Reg>,
+    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, cond_val): (usize, usize, Value),
+    out: &mut Vec<(usize, Value, Option<Value>)>,
+) {
+    if uses[cond_val.index()] != 1 || plan.elided[cond_val.index()] {
+        return;
+    }
+    let Some((cb, cpos, cinst)) = pos_of[cond_val.index()] else { return };
+    if cb != b_idx || cpos >= pos {
+        return;
+    }
+    match func.insts[cinst.index()].op {
+        Op::Binary(Binary::Band, x, y) if band_ok(func, plan, b_idx, (cpos, pos, &[]), (x, y)) => out.push((pos, cond_val, None)),
+        Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
+            if let Some((m, mpos, x, y)) = zero_cmp_band(func, plan, uses, pos_of, b_idx, lhs, rhs)
+                && mpos < cpos
+                && band_ok(func, plan, b_idx, (mpos, pos, &[cpos]), (x, y))
+            {
+                out.push((pos, cond_val, Some(m)));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn select_arg_ok(ctx: &FuseCtx<'_>, (start, pos, skip): (usize, usize, &[usize]), dst: Option<Reg>, v: Value) -> bool {
+    let folds = ctx.uses[v.index()] == 1
+        && !ctx.plan.elided[v.index()]
+        && ctx.func.ty(v).is_small_int()
+        && ctx.pos_of[v.index()].is_some_and(|(vb, lpos, linst)| {
+            vb == ctx.b_idx && matches!(ctx.func.insts[linst.index()].op, Op::Load(..) | Op::StackLoad(..)) && load_fuses(ctx, lpos, pos, skip)
+        });
+    (folds || preserved(ctx.func, ctx.plan, ctx.b_idx, start, pos, skip, v)) && dst.is_none_or(|d| !reads_reg(ctx, v, d))
+}
+
+fn elided_band_args(ctx: &FuseCtx<'_>, tst_end: &[Option<usize>], cc: IntCC, v: Value) -> Option<(usize, [Value; 2])> {
+    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) || !ctx.plan.elided[v.index()] || tst_end[v.index()].is_none() {
+        return None;
+    }
+    let (vb, mpos, minst) = ctx.pos_of[v.index()]?;
+    let Op::Binary(Binary::Band, bx, by) = ctx.func.insts[minst.index()].op else { return None };
+    (vb == ctx.b_idx).then_some((mpos, [bx, by]))
+}
+
+fn select_leaf_ok(ctx: &FuseCtx<'_>, tst_end: &[Option<usize>], (pos, skip): (usize, &[usize]), dst: Option<Reg>, leaf: Value) -> Option<Option<Value>> {
+    let (_, leaf_pos, leaf_inst) = ctx.pos_of[leaf.index()]?;
+    let Op::Icmp(cc, a, b) = ctx.func.insts[leaf_inst.index()].op else { return None };
+    let mut band = None;
+    for v in [a, b] {
+        if let Some((mpos, args)) = elided_band_args(ctx, tst_end, cc, v) {
+            if !args.into_iter().all(|u| select_arg_ok(ctx, (mpos, pos, skip), dst, u)) {
+                return None;
+            }
+            band = Some(v);
+        } else if !select_arg_ok(ctx, (leaf_pos, pos, skip), dst, v) {
+            return None;
+        }
+    }
+    Some(band)
+}
+
+fn apply_select_at(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    (uses, pos_of, defs): (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+    (b_idx, pos, inst): (usize, usize, Inst),
+    (tst_end, roots): (&mut [Option<usize>], &mut [Option<Root>]),
+) {
+    let data = &func.insts[inst.index()];
+    let (Op::Select(cond, x, y), Some(res)) = (&data.op, data.result) else { return };
+    let (first, second, table, nodes, other, dst) = {
+        let ctx = FuseCtx { func, plan, uses, pos_of, defs, b_idx };
+        let Some(tree) = ctx.cond_tree(*cond, pos) else { return };
+        let ([first, second], Location::Reg(dst)) = (&tree.leaves[..], plan.location(res)) else { return };
+        let other = if tree.table.count_ones() == 1 { *y } else { *x };
+        (*first, *second, tree.table, tree.nodes, other, dst)
+    };
+    if !func.ty(*x).is_small_int() || x == y || plan.reg_of(other) == Some(dst) {
+        return;
+    }
+    let skip: Vec<usize> = nodes.iter().map(|node| node.1).collect();
+    let bands = {
+        let ctx = FuseCtx { func, plan, uses, pos_of, defs, b_idx };
+        let Some(b1) = select_leaf_ok(&ctx, tst_end, (pos, &skip), None, first) else { return };
+        let Some(b2) = select_leaf_ok(&ctx, tst_end, (pos, &skip), Some(dst), second) else { return };
+        [b1, b2]
+    };
+    for &(v, ..) in &nodes {
+        plan.elided[v.index()] = true;
+    }
+    tst_end[first.index()] = Some(pos);
+    tst_end[second.index()] = Some(pos);
+    for b in bands.into_iter().flatten() {
+        tst_end[b.index()] = Some(pos);
+    }
+    roots[cond.index()] = Some((first, Some(second), table));
+}
+
+fn apply_select_trees(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    tables: (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+    tst_end: &mut [Option<usize>],
+    roots: &mut [Option<Root>],
+) {
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            apply_select_at(func, plan, tables, (b_idx, pos, inst), (tst_end, roots));
+        }
+    }
 }
 
 fn bnot_elided_ok(ctx: &FuseCtx<'_>, features: &Features, op: Binary, other: Value) -> bool {
@@ -416,32 +412,19 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         for (pos, &inst) in block.insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
             let Some(res) = data.result else {
-                if let Op::Brif(cond_val, ..) | Op::Trapz(cond_val) = data.op
-                    && uses[cond_val.index()] == 1
-                    && !plan.elided[cond_val.index()]
-                    && let Some((cb, cpos, cinst)) = pos_of[cond_val.index()]
-                    && cb == b_idx
-                    && cpos < pos
-                {
-                    match func.insts[cinst.index()].op {
-                        Op::Binary(Binary::Band, x, y) if band_ok(func, plan, b_idx, (cpos, pos, &[]), (x, y)) => {
-                            branch_tst.push((pos, cond_val, None));
-                        }
-                        Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
-                            if let Some((m, mpos, x, y)) = zero_cmp_band(func, plan, &uses, &pos_of, b_idx, lhs, rhs)
-                                && mpos < cpos
-                                && band_ok(func, plan, b_idx, (mpos, pos, &[cpos]), (x, y))
-                            {
-                                branch_tst.push((pos, cond_val, Some(m)));
-                            }
-                        }
-                        _ => {}
-                    }
+                if let Op::Brif(cond_val, ..) | Op::Trapz(cond_val) = data.op {
+                    push_branch_tst(func, plan, (&uses, &pos_of), (b_idx, pos, cond_val), &mut branch_tst);
                 }
                 continue;
             };
             let ty = func.ty(res);
             match data.op {
+                Op::Select(cond_val, x, y) if x != y && func.ty(cond_val).is_small_int() => {
+                    let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
+                    if ctx.cond_tree(cond_val, pos).is_none() {
+                        push_branch_tst(func, plan, (&uses, &pos_of), (b_idx, pos, cond_val), &mut branch_tst);
+                    }
+                }
                 Op::Binary(Binary::Band, x, y) if features.bmi1 && !plan.elided[res.index()] && ty.is_small_int() => {
                     for (cand, other) in [(x, y), (y, x)] {
                         if !plan.const_of(other).is_some_and(|m| matches!(m, 0xFF | 0xFFFF | 0xFFFF_FFFF))
@@ -606,18 +589,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             plan.elided[v.index()] = true;
         }
     }
-    for b_idx in 0..func.blocks.len() {
-        for (core, items) in collect_sib_groups(func, plan, b_idx) {
-            let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
-            let Some(up) = eval_sib_group(&ctx, core, &items, &ls_uses) else { continue };
-            for v in up.elide {
-                plan.elided[v.index()] = true;
-            }
-            for (v, sib) in up.targets {
-                plan.sib[v.index()] = Some(sib);
-            }
-        }
-    }
+    apply_sib_groups(func, plan, (&uses, &pos_of, &defs), &ls_uses);
     for &(b_idx, pos, res) in cand_sibs.iter().rev() {
         if plan.elided[res.index()] || uses[res.index()] == 0 || skip_flags[res.index()] {
             continue;
@@ -634,41 +606,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             }
         }
     }
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        for (pos, &inst) in block.insts.iter().enumerate() {
-            let data = &func.insts[inst.index()];
-            let (Op::Select(cond, x, y), Some(res)) = (&data.op, data.result) else { continue };
-            let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
-            let Some(tree) = ctx.cond_tree(*cond, pos) else { continue };
-            let ([first, second], Location::Reg(dst)) = (&tree.leaves[..], plan.location(res)) else { continue };
-            let other = if tree.table.count_ones() == 1 { *y } else { *x };
-            let skip: Vec<usize> = tree.nodes.iter().map(|node| node.1).collect();
-            let folds = |v: Value| {
-                uses[v.index()] == 1
-                    && !plan.elided[v.index()]
-                    && func.ty(v).is_small_int()
-                    && pos_of[v.index()].is_some_and(|(vb, lpos, linst)| {
-                        vb == b_idx && matches!(func.insts[linst.index()].op, Op::Load(..) | Op::StackLoad(..)) && load_fuses(&ctx, lpos, pos, &skip)
-                    })
-            };
-            let kept = |leaf: Value, free: bool| {
-                pos_of[leaf.index()].is_some_and(|(_, leaf_pos, leaf_inst)| {
-                    matches!(func.insts[leaf_inst.index()].op, Op::Icmp(_, a, b) if [a, b].into_iter().all(|v| {
-                        (folds(v) || preserved(func, plan, b_idx, leaf_pos, pos, &skip, v)) && (free || !reads_reg(&ctx, v, dst))
-                    }))
-                })
-            };
-            if !func.ty(*x).is_small_int() || x == y || plan.reg_of(other) == Some(dst) || !kept(*first, true) || !kept(*second, false) {
-                continue;
-            }
-            for &(v, ..) in &tree.nodes {
-                plan.elided[v.index()] = true;
-            }
-            tst_end[first.index()] = Some(pos);
-            tst_end[second.index()] = Some(pos);
-            roots[cond.index()] = Some((*first, Some(*second), tree.table));
-        }
-    }
+    apply_select_trees(func, plan, (&uses, &pos_of, &defs), &mut tst_end, &mut roots);
     for (b_idx, lpos, load_res) in cand_loads {
         let Some((ub, upos, uinst)) = use_of[load_res.index()] else { continue };
         if ub != b_idx || upos <= lpos {
@@ -744,7 +682,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
                 plan.fused[cmp_res.index()] = true;
             } else if let Op::Icmp(_, a, b) = data.op {
                 let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
-                if !parked(plan, cmp_res) && [a, b].into_iter().all(|v| cmp_operand_ok(&ctx, cpos, last_pos, v)) {
+                if !parked(plan, cmp_res) && [a, b].into_iter().all(|v| cmp_operand_ok(&ctx, &tst_end, cpos, last_pos, v)) {
                     plan.elided[cmp_res.index()] = true;
                 }
             }

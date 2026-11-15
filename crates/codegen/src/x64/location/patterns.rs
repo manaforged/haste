@@ -432,6 +432,18 @@ impl FuseCtx<'_> {
         !self.plan.elided[idx.index()] && !matches!(self.plan.location(idx), Location::Frame(..) | Location::Imm(..))
     }
 
+    fn peel_scaled(&self, raw_idx: Value, spos: usize, shift: u8, disp: i64) -> (Value, i64, usize, Vec<(Value, usize)>) {
+        let mut elide = Vec::new();
+        if let Some((core, off, pos)) = self.peel_const(raw_idx, spos, true, &mut elide)
+            && off != 0
+            && let Some(total) = off.checked_mul(1_i64 << shift).and_then(|d| disp.checked_add(d))
+            && (-FOLD_LIMIT..=FOLD_LIMIT).contains(&total)
+        {
+            return (core, total, pos, elide);
+        }
+        (raw_idx, disp, spos, Vec::new())
+    }
+
     fn parse_index(&self, v: Value, sum_pos: usize, scaled_only: bool, multi_use: bool) -> Option<(Value, u8, i64, usize, Vec<(Value, usize)>)> {
         let mut elide = Vec::new();
         let (core, disp, use_pos) = self.peel_const(v, sum_pos, true, &mut elide)?;
@@ -444,8 +456,10 @@ impl FuseCtx<'_> {
             && let Some((raw_idx, shift, None)) = scaled_op(self.func, self.plan, sinst)
         {
             elide.push((core, spos));
-            let (idx, idx_start) = self.unwrap_uext(raw_idx, spos, multi_use, &mut elide);
-            return self.index_ok(idx).then_some((idx, shift, disp, idx_start, elide));
+            let (idx_core, total_disp, idx_use_pos, scaled_elide) = self.peel_scaled(raw_idx, spos, shift, disp);
+            elide.extend(scaled_elide);
+            let (idx, idx_start) = self.unwrap_uext(idx_core, idx_use_pos, multi_use, &mut elide);
+            return self.index_ok(idx).then_some((idx, shift, total_disp, idx_start, elide));
         }
         if scaled_only {
             return None;

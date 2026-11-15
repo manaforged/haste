@@ -1,5 +1,6 @@
 mod fuse;
 mod patterns;
+mod sib;
 
 pub(super) use fuse::fuse;
 pub(super) use patterns::{LEAF, Root, adc_plan, bextr_parts, shld_parts, unwrap_shift_mask};
@@ -159,8 +160,17 @@ impl Emit<'_> {
     }
 
     fn sib_slow(&mut self, base: Value, mode: Sib, disp: i32, (scratch, temp): (Reg, Reg)) -> Mem {
-        self.clear_flags();
         self.load_index(scratch, mode.index);
+        if mode.shift > 0
+            && !matches!(self.location(base), Location::Slot | Location::Frame(..))
+            && !matches!(self.location(base), Location::Imm(imm) if i32::try_from(imm).is_ok())
+        {
+            self.raw(temp, base);
+            self.asm.lea(scratch, Mem::sib(temp, scratch, mode.shift, 0));
+            self.clobber_reg(scratch);
+            return Mem::new(scratch, disp);
+        }
+        self.clear_flags();
         if mode.shift > 0 {
             self.asm.shift_imm(Size::Q, Shift::Shl, scratch, mode.shift);
         }
