@@ -1,6 +1,5 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
 use super::{A, C, D, Emit, S, T};
-use crate::frame::Ext;
 use crate::ir::{AtomicRmwOp, Binary, Op, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -248,8 +247,10 @@ impl Emit<'_> {
         }
         self.flags = None;
         self.last_cmp = None;
-        let flag = self.src(condition, C, Ext::Zero);
-        self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+        if !self.tst_small_zero(condition) {
+            let flag = self.zext_src(condition, C);
+            self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+        }
         Cond::Ne
     }
 
@@ -266,6 +267,12 @@ impl Emit<'_> {
     fn select_const_pair(&mut self, cond: Cond, size: Size, dst: Reg, (x, y): (Value, Value), (kx, ky): (i64, i64)) {
         let (ux, uy) = (kx as u64, ky as u64);
         let mask = if size == Size::W { u32::MAX as u64 } else { u64::MAX };
+        if ux == 0 || uy == 0 {
+            self.select_csel(cond, dst, (x, y), (ux == 0, uy == 0));
+            return;
+        }
+        let prefer_y = self.plan.reg_of(x).is_none() && (self.plan.reg_of(y).is_some() || super::asm::Asm::mov_imm_is_single(ky));
+        let pick = |this: &mut Self| if prefer_y { (this.bits(y, C), cond.invert()) } else { (this.bits(x, A), cond) };
         if ((ux.wrapping_add(1)) & mask) == uy {
             let reg = self.bits(x, A);
             self.asm.csinc(size, cond, dst, reg, reg);
@@ -273,13 +280,13 @@ impl Emit<'_> {
             let reg = self.bits(y, C);
             self.asm.csinc(size, cond.invert(), dst, reg, reg);
         } else if (!ux & mask) == uy {
-            let reg = self.bits(x, A);
-            self.asm.csinv(size, cond, dst, reg, reg);
+            let (reg, c) = pick(self);
+            self.asm.csinv(size, c, dst, reg, reg);
         } else if (ux.wrapping_neg() & mask) == uy {
-            let reg = self.bits(x, A);
-            self.asm.csneg(size, cond, dst, reg, reg);
+            let (reg, c) = pick(self);
+            self.asm.csneg(size, c, dst, reg, reg);
         } else {
-            self.select_csel(cond, dst, (x, y), (kx == 0, ky == 0));
+            self.select_csel(cond, dst, (x, y), (false, false));
         }
     }
 
@@ -406,7 +413,7 @@ impl Emit<'_> {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
-        self.get(D, value, Ext::of(signed));
+        self.get_opt(D, value, signed);
         let again = self.asm.label();
         self.asm.bind(again);
         self.asm.load_acquire(true, size, A, S);
@@ -446,7 +453,7 @@ impl Emit<'_> {
     fn cas(&mut self, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
-        self.get(D, expected, Ext::Zero);
+        self.zext_get(D, expected);
         self.raw(C, replacement);
         let (again, done) = (self.asm.label(), self.asm.label());
         self.asm.bind(again);
