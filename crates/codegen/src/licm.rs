@@ -5,6 +5,8 @@ use crate::ir::{Block, BlockData, Domain, Function, Inst, Op, Type, Value};
 use crate::mem::{LoopMem, MemLoc, MemRoot, PromoteBase, PromoteCand, Provenance};
 use crate::merge::{find, identity, rename};
 
+mod reassoc;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SymVal {
     Phi,
@@ -475,7 +477,11 @@ const MAX_LOOP_VEC_LIVE: usize = 11;
 
 struct Invariants<'a> {
     prov: &'a Provenance,
-    is_const: &'a [bool],
+    is_const: &'a mut Vec<bool>,
+}
+
+fn always_executes_in_loop(cfg: &Cfg, each: &Loop, blk: Block) -> bool {
+    each.latches.iter().all(|&latch| cfg::dominates(&cfg.idom, blk, latch))
 }
 
 fn loop_live_counts(func: &Function, each: &Loop, is_const: &[bool], home: &[Option<Block>]) -> (usize, usize, Vec<u32>) {
@@ -518,10 +524,11 @@ fn hoist(
     cfg: &Cfg,
     each: &Loop,
     entry: Block,
-    inv: &Invariants<'_>,
+    inv: &mut Invariants<'_>,
     mem: &LoopMem,
-    home: &mut [Option<Block>],
+    home: &mut Vec<Option<Block>>,
 ) -> bool {
+    let reassociated = reassoc::reassociate_loop_adds(func, cfg, each, home, inv.is_const);
     let prov = inv.prov;
     let (gp_live, vec_live, loop_uses) = loop_live_counts(func, each, inv.is_const, home);
     let has_insert = (0..each.body.len())
@@ -540,6 +547,7 @@ fn hoist(
             continue;
         }
         let head = block == each.head.index();
+        let always_exec = always_executes_in_loop(cfg, each, blk);
         let insts = std::mem::take(&mut func.blocks[block].insts);
         let mut kept = Vec::with_capacity(insts.len());
         let mut head_prefix = head;
@@ -550,7 +558,7 @@ fn hoist(
             }
             let is_symbol = matches!(op, Op::Symbol(_));
             let static_loc = matches!(op, Op::StackAddr(..) | Op::SlotAddr(_));
-            let sym_ok = !mem.calls || hoisted_symbols < MAX_HOISTED_SYMBOLS;
+            let sym_ok = !mem.calls || (always_exec && hoisted_symbols < MAX_HOISTED_SYMBOLS);
             let res_ty = func.insts[inst.index()].result.map(|r| func.ty(r));
             let is_vec_mat = res_ty.is_some_and(Type::in_float_register)
                 && matches!(op, Op::Insert(..) | Op::Shuffle(..) | Op::Const(_) | Op::Load(..) | Op::StackLoad(..));
@@ -587,7 +595,7 @@ fn hoist(
         func.blocks[block].insts = kept;
     }
     if moved.is_empty() {
-        return false;
+        return reassociated;
     }
     let insts = &mut func.blocks[entry.index()].insts;
     let at = insts.len().saturating_sub(1);
@@ -619,7 +627,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             is_const[res.index()] = true;
         }
     }
-    let inv = Invariants { prov: &prov, is_const: &is_const };
+    let mut inv = Invariants { prov: &prov, is_const: &mut is_const };
     let mut dirty = Domain::NONE;
     for idx in 0..found.list.len() {
         let before = func.blocks.len();
@@ -662,7 +670,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             }
             mem = LoopMem::analyze(func, &found.list[idx], &prov);
         }
-        if hoist(func, &cfg, &found.list[idx], pre, &inv, &mem, &mut home) {
+        if hoist(func, &cfg, &found.list[idx], pre, &mut inv, &mem, &mut home) {
             dirty |= Domain::VALUES;
         }
     }
