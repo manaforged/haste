@@ -6,6 +6,8 @@ mod subword;
 mod join_slots;
 #[path = "promote/vec_slot.rs"]
 mod vec_slot;
+#[path = "promote/box_fwd.rs"]
+mod box_fwd;
 
 use crate::ir::{Binary, Block, Convert, Domain, Function, Inst, InstData, Op, StackSlot, Type, Value};
 use crate::split::{End, Layouts};
@@ -667,11 +669,17 @@ pub(crate) enum Moves {
     Words,
 }
 
+fn pre_split(func: &mut Function, moves: Moves) -> bool {
+    let joined = moves != Moves::Words && join_slots::run(func);
+    let forwarded = moves == Moves::Split && box_fwd::run(func);
+    joined || forwarded
+}
+
 pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
         return Domain::NONE;
     };
-    let join_changed = moves != Moves::Words && join_slots::run(func);
+    let join_changed = pre_split(func, moves);
     let mut scan = Scan::new(func);
     let mut splits = Vec::new();
     let mut copy_splits = Vec::new();

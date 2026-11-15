@@ -18,6 +18,8 @@ use super::reloc::{RelocStep, SiteOrigin, TyOrigin};
 use super::stencil::{Form, InlinedCallee, LowerMode, SymbolSource, resolve_inline};
 use super::{Loop, Lower, Parts, Repr, repr};
 
+const BOX_ZEROED_MIN: u32 = 64;
+
 /// What a call runs: code at an address, or reached function `index`, which may be copied inline.
 enum Callee {
     Code(Value),
@@ -264,6 +266,9 @@ impl Lower<'_, '_> {
             return Ok(self.slot(whole).and_then(|slot| self.read(Place::slot(slot, whole))));
         }
         if let Some(&Res::Fn(item, substs)) = self.typed.res.get(&expr) {
+            if let Some(res) = self.try_box_new_zeroed(expr, item, args)? {
+                return Ok(Some(res));
+            }
             return self.call_value((expr, callee), (item, substs), args);
         }
         let named = self.typed.res.get(&callee).filter(|_| self.body.names_callee(callee));
@@ -273,15 +278,101 @@ impl Lower<'_, '_> {
             Some(Res::Ctor(_, variant, _)) => return self.ctor_call(expr, variant, args),
             _ => return self.pointer_call(expr, callee, args),
         };
-        if self.tupled_closure_call(item, substs) {
-            let arg_list = self.body.list(args).to_vec();
-            let [f_expr, tuple_expr] = arg_list.as_slice() else { bail!("tupled closure call expects 2 arguments") };
-            let mut values = self.callee_env(ExprId(*f_expr), true)?;
-            self.untuple_arg(ExprId(*tuple_expr), &mut values)?;
-            return self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values);
+        if let Some(res) = self.named_fn_call((expr, callee), (item, substs), args)? {
+            return Ok(res);
         }
         let values = self.args(args, Vec::new())?;
         self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values)
+    }
+
+    fn named_fn_call(
+        &mut self,
+        (expr, callee): (ExprId, ExprId),
+        (item, substs): (ItemRef, Substs),
+        args: List,
+    ) -> Result<Option<Option<Value>>> {
+        if let Some(res) = self.try_box_new_zeroed(expr, item, args)? {
+            return Ok(Some(Some(res)));
+        }
+        if !self.tupled_closure_call(item, substs) {
+            return Ok(None);
+        }
+        let arg_list = self.body.list(args).to_vec();
+        let [f_expr, tuple_expr] = arg_list.as_slice() else { bail!("tupled closure call expects 2 arguments") };
+        let mut values = self.callee_env(ExprId(*f_expr), true)?;
+        self.untuple_arg(ExprId(*tuple_expr), &mut values)?;
+        self.invoke(SiteOrigin::Table(SiteKey::ExprRes(callee)), item, substs, values).map(Some)
+    }
+
+    fn try_box_new_zeroed(&mut self, expr: ExprId, item: ItemRef, args: List) -> Result<Option<Value>> {
+        if !self.open || self.cx.name(item) != "new" || self.cx.outline.roots[item.krate as usize].name != "alloc" {
+            return Ok(None);
+        }
+        let &[arg] = self.body.list(args) else { return Ok(None) };
+        let arg = ExprId(arg);
+        let box_ty = self.ty_of(expr);
+        let Some(inner_ty) = self.cx.boxed(box_ty) else { return Ok(None) };
+        if inner_ty != self.ty_of(arg) || self.typed.coercions.contains_key(&arg) {
+            return Ok(None);
+        }
+        let Repr::Mem { size, align, .. } = repr(self.cx, inner_ty)? else { return Ok(None) };
+        if size <= BOX_ZEROED_MIN || align >= 63 || !self.box_repr_ptr(box_ty)? || !self.is_zero_init_expr(arg)? {
+            return Ok(None);
+        }
+        let size_val = self.ins().iconst(Type::I64, i64::from(size));
+        let align_val = self.ins().iconst(Type::I64, 1_i64 << align);
+        let Some(ptr) = self.call_host(crate::host::HostSymbol::AllocZeroed, &[size_val, align_val], Some(Type::I64)) else {
+            return Ok(None);
+        };
+        self.ins().trapz(ptr);
+        self.received(box_ty, &[(Type::I64, 0)], &[ptr])
+    }
+
+    fn box_repr_ptr(&mut self, box_ty: Ty) -> Result<bool> {
+        Ok(matches!(
+            repr(self.cx, box_ty)?,
+            Repr::Scalar(Type::I64) | Repr::Mem { size: 8, parts: Parts::One(Type::I64), .. }
+        ))
+    }
+
+    fn is_zero_init_expr(&mut self, expr: ExprId) -> Result<bool> {
+        if self.typed.coercions.contains_key(&expr) {
+            return Ok(false);
+        }
+        let e = self.unwrap_expr(expr, true);
+        if self.typed.coercions.contains_key(&e) {
+            return Ok(false);
+        }
+        match *self.body.expr(e) {
+            Expr::Lit(..) => self.literal_is_zero(e),
+            Expr::Repeat(val, _) => self.is_zero_init_expr(val),
+            Expr::Array(items) | Expr::Tuple(items) => self.all_zero_init(items),
+            Expr::Struct { fields, base: None, rest: false, .. } => self.struct_zero_init(e, fields),
+            _ => Ok(false),
+        }
+    }
+
+    fn all_zero_init(&mut self, items: List) -> Result<bool> {
+        for item in self.body.list(items).to_vec() {
+            if !self.is_zero_init_expr(ExprId(item))? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn struct_zero_init(&mut self, expr: ExprId, fields: List) -> Result<bool> {
+        let Kind::Adt(adt, _) = *self.cx.types.kind(self.ty_of(expr)) else { return Ok(false) };
+        if self.cx.item(adt).1.kind != ItemKind::Struct {
+            return Ok(false);
+        }
+        for at in self.body.list(fields).to_vec() {
+            let val = self.body.fields[at as usize].value;
+            if !self.is_zero_init_expr(val)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn method(&mut self, expr: ExprId, receiver: ExprId, params: List) -> Result<Option<Value>> {
