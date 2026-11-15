@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{IntCC, RuntimeSymbol, Type, Value};
+use haste_codegen::{Arch, IntCC, RuntimeSymbol, Target, Type, Value};
 
 use crate::body::{BlockKind, Body, Expr, ExprId, List};
 use crate::sema::Context;
@@ -8,6 +8,25 @@ use crate::sema::ty::{Kind, Ty};
 
 use super::place::{Base, Place};
 use super::{Lower, Repr, repr};
+
+fn splat_multiplier(ty: Type) -> Option<u64> {
+    match ty {
+        Type::I8 => Some(0x0101_0101_0101_0101),
+        Type::I16 => Some(0x0001_0001_0001_0001),
+        Type::I32 => Some(0x0000_0001_0000_0001),
+        _ => None,
+    }
+}
+
+fn splat_word64(ty: Type, imm: i64) -> Option<u64> {
+    let bits = match ty {
+        Type::I8 => u64::from(imm as u8),
+        Type::I16 => u64::from(imm as u16),
+        Type::I32 => u64::from(imm as u32),
+        _ => return None,
+    };
+    splat_multiplier(ty).map(|mul| bits.wrapping_mul(mul))
+}
 
 /// Whether `expr` (or `callee`) resolves to `MaybeUninit::uninit()`.
 pub(super) fn is_maybe_uninit_fn(cx: &Context<'_>, typed: &Typed, expr: ExprId, callee: ExprId) -> bool {
@@ -57,17 +76,7 @@ impl Lower<'_, '_> {
         let n = self.len(count)?;
         let total_bytes = n * i64::from(stride);
         if n > 16 && part != Repr::Scalar(Type::I8) && total_bytes >= 32 && self.literal_is_zero(value)? {
-            let Some(slot) = self.slot(whole) else {
-                return Ok(None);
-            };
-            let base = Place::slot(slot, whole);
-            if self.open {
-                let dst = self.address(base);
-                let byte = self.ins().iconst(Type::I64, 0);
-                let len = self.ins().iconst(Type::I64, total_bytes);
-                self.call_libc(RuntimeSymbol::Memset, vec![dst, byte, len], None)?;
-            }
-            return Ok(self.read(base));
+            return self.zero_repeat(whole, total_bytes);
         }
         let value = if self.uninit_call(value) { None } else { self.expr(value)? };
         let Some(slot) = self.slot(whole) else {
@@ -77,26 +86,89 @@ impl Lower<'_, '_> {
         if let Some(val) = value
             && self.open
         {
-            if n <= 16 {
-                for at in 0..n as i32 {
-                    self.write(base.at(at * stride, part), val);
-                }
-            } else if part == Repr::Scalar(Type::I8) {
-                let dst = self.address(base);
-                let byte = self.ins().uextend(Type::I64, val);
-                let len = self.ins().iconst(Type::I64, total_bytes);
-                self.call_libc(RuntimeSymbol::Memset, vec![dst, byte, len], None)?;
-            } else {
-                let dst = self.address(base);
-                let count_val = self.ins().iconst(Type::I64, n);
-                self.each(count_val, |lower, idx| {
-                    let off = lower.ins().imul_imm(idx, i64::from(stride));
-                    let elem_addr = lower.ins().iadd(dst, off);
-                    lower.write(Place { base: Base::Addr(elem_addr), offset: 0, repr: part }, val);
-                });
-            }
+            self.fill_repeat(base, part, (n, stride, total_bytes), val)?;
         }
         Ok(self.read(base))
+    }
+
+    fn zero_repeat(&mut self, whole: Repr, total_bytes: i64) -> Result<Option<Value>> {
+        let Some(slot) = self.slot(whole) else {
+            return Ok(None);
+        };
+        let base = Place::slot(slot, whole);
+        if self.open {
+            let dst = self.address(base);
+            let byte = self.ins().iconst(Type::I64, 0);
+            let len = self.ins().iconst(Type::I64, total_bytes);
+            self.call_libc(RuntimeSymbol::Memset, vec![dst, byte, len], None)?;
+        }
+        Ok(self.read(base))
+    }
+
+    fn fill_repeat(&mut self, base: Place, part: Repr, (n, stride, total_bytes): (i64, i32, i64), val: Value) -> Result<()> {
+        if self.try_splat_repeat(base, part, (n, stride, total_bytes), val) {
+            return Ok(());
+        }
+        if n <= 16 {
+            for at in 0..n as i32 {
+                self.write(base.at(at * stride, part), val);
+            }
+            return Ok(());
+        }
+        let dst = self.address(base);
+        if part == Repr::Scalar(Type::I8) {
+            let byte = self.ins().uextend(Type::I64, val);
+            let len = self.ins().iconst(Type::I64, total_bytes);
+            self.call_libc(RuntimeSymbol::Memset, vec![dst, byte, len], None)?;
+            return Ok(());
+        }
+        let count_val = self.ins().iconst(Type::I64, n);
+        self.each(count_val, |lower, idx| {
+            let off = lower.ins().imul_imm(idx, i64::from(stride));
+            let elem_addr = lower.ins().iadd(dst, off);
+            lower.write(Place { base: Base::Addr(elem_addr), offset: 0, repr: part }, val);
+        });
+        Ok(())
+    }
+
+    fn try_splat_repeat(&mut self, base: Place, part: Repr, (n, stride, total_bytes): (i64, i32, i64), val: Value) -> bool {
+        let Repr::Scalar(elem_ty) = part else { return false };
+        let Some(mul) = splat_multiplier(elem_ty) else { return false };
+        if !matches!(Target::host().arch, Arch::X64 | Arch::Arm64) || stride != elem_ty.bytes() as i32 || total_bytes < 2 || total_bytes > 32 {
+            return false;
+        }
+        let total = total_bytes as usize;
+        if let Some(imm) = self.b.const_int(val)
+            && let Some(word64) = splat_word64(elem_ty, imm)
+        {
+            let mut c64 = None;
+            self.write_splat_chunks(base, total, val, |lower, ty| match ty {
+                Type::I64 => *c64.get_or_insert_with(|| lower.ins().iconst(Type::I64, word64 as i64)),
+                _ => lower.ins().iconst(ty, word64 as i64),
+            });
+            return true;
+        }
+        if n >= 8 && matches!(elem_ty, Type::I8 | Type::I16) {
+            let wide = self.ins().uextend(Type::I64, val);
+            let splat = self.ins().imul_imm(wide, mul as i64);
+            self.write_splat_chunks(base, total, val, |lower, ty| if ty == Type::I64 { splat } else { lower.ins().ireduce(ty, splat) });
+            return true;
+        }
+        false
+    }
+
+    fn write_splat_chunks(&mut self, base: Place, total: usize, orig: Value, mut chunk: impl FnMut(&mut Self, Type) -> Value) {
+        let mut off = 0usize;
+        for (size, ty) in [(8, Type::I64), (4, Type::I32), (2, Type::I16)] {
+            while total - off >= size {
+                let v = chunk(self, ty);
+                self.write(base.at(off as i32, Repr::Scalar(ty)), v);
+                off += size;
+            }
+        }
+        if off < total {
+            self.write(base.at(off as i32, Repr::Scalar(Type::I8)), orig);
+        }
     }
 
     /// Whether `expr` is `MaybeUninit::uninit()`, whose bytes are undefined, so a repeat or binding of it need not store them.
@@ -117,6 +189,9 @@ impl Lower<'_, '_> {
             return self.pointee_place(pointer, self.ty_of(expr)).map(Some);
         }
         let Some((place, ty)) = found else { return self.empty_index(expr, base, index) };
+        if let Kind::Array(_, count) = *self.cx.types.kind(ty) {
+            return self.array_index_place(place, count, index, self.ty_of(expr));
+        }
         let Some((data, len)) = self.data_len(Some(place), ty)? else {
             return Ok(None);
         };
@@ -125,6 +200,23 @@ impl Lower<'_, '_> {
         };
         self.check_bounds(at, len);
         self.element_place(data, at, self.ty_of(expr)).map(Some)
+    }
+
+    fn array_index_place(&mut self, place: Place, count: Ty, index: ExprId, elem_ty: Ty) -> Result<Option<Place>> {
+        let Some(at) = self.expr(index)? else { return Ok(None) };
+        let count = self.len(count)?;
+        let stride = self.cx.layout(elem_ty)?.size.bytes() as i64;
+        if let Some(idx) = self.b.const_int(at)
+            && (idx as u64) < (count as u64)
+            && let Some(off) = idx.checked_mul(stride).and_then(|o| i32::try_from(o).ok())
+            && place.offset.checked_add(off).is_some()
+        {
+            return Ok(Some(place.at(off, repr(self.cx, elem_ty)?)));
+        }
+        let len = self.ins().iconst(Type::I64, count);
+        self.check_bounds(at, len);
+        let data = self.address(place);
+        self.element_place(data, at, elem_ty).map(Some)
     }
 
     /// The place of element `index` of the array `base` that has no bytes: a dangling one past a bounds check, which rustc also keeps.
@@ -157,15 +249,32 @@ impl Lower<'_, '_> {
             return Ok(Some((data, self.ins().iconst(Type::I64, count))));
         }
         let Some(at) = place else { bail!("slice with no wide pointer") };
-        let wide = self.address(at);
-        Ok(Some((self.ins().load(Type::I64, wide, 0), self.ins().load(Type::I64, wide, 8))))
+        let (data, len) = match at.base {
+            Base::Slot(slot) => (self.ins().stack_load(Type::I64, slot, at.offset), self.ins().stack_load(Type::I64, slot, at.offset + 8)),
+            Base::Addr(wide) => {
+                let data = self.ins().load(Type::I64, wide, at.offset);
+                let len = match self.b.wide_const_len(wide).and_then(|n| i64::try_from(n).ok()).filter(|_| at.offset == 0) {
+                    Some(n) => self.ins().iconst(Type::I64, n),
+                    None => self.ins().load(Type::I64, wide, at.offset + 8),
+                };
+                (data, len)
+            }
+        };
+        Ok(Some((data, len)))
     }
 
     /// The place of element `index` of type `element` in the array data at `data`.
     pub(super) fn element_place(&mut self, data: Value, index: Value, element: Ty) -> Result<Place> {
         let stride = self.cx.layout(element)?.size.bytes() as i64;
+        if stride == 0 {
+            return Ok(Place { base: Base::Addr(data), offset: 0, repr: repr(self.cx, element)? });
+        }
+        if let Some(idx) = self.b.const_int(index)
+            && let Some(off) = idx.checked_mul(stride).and_then(|o| i32::try_from(o).ok())
+        {
+            return Ok(Place { base: Base::Addr(data), offset: off, repr: repr(self.cx, element)? });
+        }
         let address = match stride {
-            0 => data,
             1 => self.ins().iadd(data, index),
             s if s > 1 && (s as u64).is_power_of_two() => {
                 let shift = self.ins().iconst(Type::I64, i64::from((s as u64).trailing_zeros()));
