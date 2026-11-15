@@ -78,6 +78,7 @@ pub(crate) struct Provenance {
     pub symbol_defs: Vec<Option<u32>>,
     pub ro_bytes: Vec<u32>,
     pub affine: Vec<(Value, i64)>,
+    pub spans: Vec<Option<(MemBase, i64, i64)>>,
 }
 
 struct UseCounts {
@@ -566,6 +567,7 @@ impl Provenance {
             }
         }
         let affine = affine.unwrap_or_else(|| compute_affine(func));
+        let spans = loop_mem::compute_spans(func, cfg, &slot_offsets, &symbol_defs);
         Self {
             slot_offsets,
             unescaped_slots: esc.unescaped,
@@ -575,6 +577,7 @@ impl Provenance {
             symbol_defs,
             ro_bytes,
             affine,
+            spans,
         }
     }
 
@@ -621,6 +624,17 @@ impl Provenance {
         MemLoc::new(root, base, eff_off, size)
     }
 
+    pub(crate) fn loc_span(&self, loc: MemLoc) -> (MemBase, i128, i128) {
+        let size = i128::from(loc.size);
+        let off = i128::from(loc.offset);
+        if let MemBase::Addr(v) = loc.base
+            && let Some((base, blo, bhi)) = self.spans.get(v.index()).copied().flatten()
+        {
+            return (base, i128::from(blo) + off, i128::from(bhi) + off + size);
+        }
+        (loc.base, off, off + size)
+    }
+
     pub(crate) fn slot_unescaped(&self, slot: StackSlot) -> bool {
         self.unescaped_slots.get(slot.index()).copied().unwrap_or(false)
     }
@@ -639,8 +653,18 @@ impl Provenance {
 }
 
 pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
+    if a.size == 0 || b.size == 0 {
+        return false;
+    }
     if a.base == b.base {
         return a.overlaps(b);
+    }
+    if a.size != u32::MAX && b.size != u32::MAX {
+        let (ba, alo, ahi) = prov.loc_span(a);
+        let (bb, blo, bhi) = prov.loc_span(b);
+        if ba == bb {
+            return alo < bhi && blo < ahi;
+        }
     }
     match (a.root, b.root) {
         (MemRoot::Slot(sa), MemRoot::Slot(sb)) => sa == sb,

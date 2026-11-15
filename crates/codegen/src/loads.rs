@@ -730,7 +730,7 @@ pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
     let cfg = func.cfg();
     let prov = Provenance::with_affine(func, &cfg, affine);
     changed |= fold_affine_mem(func, &prov.slot_offsets, &prov.affine);
-    changed |= pack::coalesce_loads(func, &prov);
+    changed |= pack::coalesce_loads(func, &prov, target);
     changed |= sink_terminator_defs(func);
     let mut consts = vec![None; func.types.len()];
     let mut selects = vec![None; func.types.len()];
@@ -749,7 +749,7 @@ pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
     let mut bw = BlockWrites::new(func, &cfg, &prov);
     let mut subst = identity(func.types.len());
     let mut state = State { prov: &prov, selects: &selects, consts: &mut consts, subst: &mut subst, target };
-    let mut renamed = false;
+    let (mut renamed, mut scan_changed) = (false, false);
     let mut def_blocks = func.def_blocks();
     let mut visited = vec![false; func.blocks.len()];
     let mut known_out: Vec<KnownLoads> = (0..func.blocks.len()).map(|_| KnownLoads::new()).collect();
@@ -761,6 +761,7 @@ pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
         let (block_changed, block_renamed) = scan(func, block, &mut state, &mut known, &mut bases, &mut join);
         def_blocks.resize(func.types.len(), Some(block));
         visited[block.index()] = true;
+        scan_changed |= block_changed;
         changed |= block_changed;
         renamed |= block_renamed;
         known_out[block.index()] = known;
@@ -768,6 +769,9 @@ pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
     }
     if renamed {
         rename(func, state.subst);
+    }
+    if scan_changed {
+        changed |= pack::coalesce_vec_rescan(func, &cfg, target);
     }
     domain(changed)
 }
