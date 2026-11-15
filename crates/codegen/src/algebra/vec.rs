@@ -560,6 +560,7 @@ pub(super) fn simplify_vec_binary(cx: &mut RewriteCx, res: Option<Value>, bin: B
         Binary::Iadd | Binary::Isub => simplify_vec_add_sub(cx, res, res_v, bin, (a, b)),
         Binary::Imul | Binary::Ishl | Binary::Ushr | Binary::Sshr => simplify_vec_mul_shift(cx, res, res_v, bin, (a, b)),
         Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat => simplify_vec_sat(cx, res, res_v, bin, (a, b)),
-        _ => simplify_vec_minmax(cx, res, res_v, bin, (a, b)),
+        Binary::Umin | Binary::Umax | Binary::Smin | Binary::Smax => simplify_vec_minmax(cx, res, res_v, bin, (a, b)),
+        _ => None,
     }
 }
