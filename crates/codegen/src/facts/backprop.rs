@@ -1,7 +1,7 @@
 use crate::ir::{Binary, Convert, Function, Op, Type, Value};
 
 use super::rel::{Path, RelKind, UNSIGNED};
-use super::transfer::{transfer, unwrapped};
+use super::transfer::{transfer, unwrapped, valid};
 use super::{Fact, Ranges};
 
 const CHAIN_STEPS: usize = 4;
@@ -65,6 +65,30 @@ impl Path {
                     } else if self.is_no_wrap_add(ranges, ty, var, k_val, k) && merged.hi >= k {
                         self.add_with_backprop(func, ranges, var, Fact::range(merged.lo.saturating_sub(k), merged.hi - k), depth + 1);
                     }
+                }
+            }
+            Some(&Op::Select(cond, a, b)) => self.backprop_select(func, ranges, &merged, (cond, a, b), depth),
+            _ => {}
+        }
+    }
+
+    fn backprop_select(&mut self, func: &Function, ranges: &Ranges, merged: &Fact, (cond, a, b): (Value, Value, Value), depth: u8) {
+        let fc = self.fact(ranges, cond);
+        let a_fit = self.fact(ranges, a).meet(merged);
+        let b_fit = self.fact(ranges, b).meet(merged);
+        let (can_a, can_b) = (fc.hi != 0 && valid(&a_fit), fc.admits(0) && valid(&b_fit));
+        let cty = func.ty(cond);
+        match (can_a, can_b) {
+            (true, false) => {
+                self.add_with_backprop(func, ranges, a, a_fit, depth + 1);
+                if cty.is_small_int() {
+                    self.add_with_backprop(func, ranges, cond, Fact::range(1, cty.unsigned_max()), depth + 1);
+                }
+            }
+            (false, true) => {
+                self.add_with_backprop(func, ranges, b, b_fit, depth + 1);
+                if cty.is_small_int() {
+                    self.add_with_backprop(func, ranges, cond, Fact::range(0, 0), depth + 1);
                 }
             }
             _ => {}
