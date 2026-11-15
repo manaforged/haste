@@ -93,7 +93,7 @@ impl<'a> Context<'a> {
         self.store.lookups.reveals = table::Flight::default();
         self.store.lookups.futures.clear();
         self.store.lookups.forms.clear();
-        self.store.lookups.sysroot_index = Arc::new(std::sync::OnceLock::new());
+        self.store.lookups.file_index = Arc::new(std::sync::OnceLock::new());
         self.kids.clear();
         self.trait_members.clear();
         self.impl_members.clear();

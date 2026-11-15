@@ -145,16 +145,38 @@ pub fn item_key_with_crates(
     if (!krate.env.fixed && crate_hashes.is_none()) || (!include_deps && !krate.env.release) {
         return None;
     }
-    let root = outline.roots.get(item.krate as usize)?;
     let file = krate.files.get(item.file as usize)?;
-    if file.expanded && file.expand_origin == 0 {
-        return None;
-    }
+    let prefix = if krate.env.fixed { file_key(outline, item.krate, item.file)? } else { hash_file(outline, item.krate, file, crate_hashes)? };
     let (base_item, sub_idx) = match item.outer() {
         Some((outer, sub)) => (outer.item, Some(sub)),
         None => (item.item, None),
     };
     let entry = file.items.items.get(base_item as usize)?;
+    let mut hasher = FxHasher::default();
+    prefix.hash(&mut hasher);
+    item.item.hash(&mut hasher);
+    sub_idx.hash(&mut hasher);
+    entry.start.hash(&mut hasher);
+    entry.kind.hash(&mut hasher);
+    if let Some(name_tok) = entry.name {
+        file.source.text(name_tok).hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+/// Computes the identity key of file `file` of fixed crate `krate`, once per file, or `None` for local or unkeyed files.
+pub fn file_key(outline: &crate::outline::Outline, krate: u32, file: u32) -> Option<u64> {
+    let tree = outline.crates.get(krate as usize).filter(|tree| tree.env.fixed)?;
+    let at = tree.files.get(file as usize)?;
+    at.key(krate, || hash_file(outline, krate, at, None))
+}
+
+fn hash_file(outline: &crate::outline::Outline, idx: u32, file: &crate::outline::tree::File, crate_hashes: Option<&CrateHashes>) -> Option<u64> {
+    let krate = outline.crates.get(idx as usize)?;
+    let root = outline.roots.get(idx as usize)?;
+    if file.expanded && file.expand_origin == 0 {
+        return None;
+    }
     let base_dir = root.path.parent().unwrap_or(Path::new(""));
     let rel_path = file.source.path.strip_prefix(base_dir).unwrap_or(&file.source.path);
     let mut hasher = FxHasher::default();
@@ -162,9 +184,9 @@ pub fn item_key_with_crates(
     krate.env.overflow_checks().hash(&mut hasher);
     (crate::profile() == crate::outline::tree::Profile::Release).hash(&mut hasher);
     if !krate.env.fixed {
-        crate_hashes?.get(item.krate as usize)?.hash(&mut hasher);
+        crate_hashes?.get(idx as usize)?.hash(&mut hasher);
     } else if !krate.env.release {
-        let pin = outline.pins.get(item.krate as usize).copied().flatten()?;
+        let pin = outline.pins.get(idx as usize).copied().flatten()?;
         pin.hash(&mut hasher);
         krate.env.features.hash(&mut hasher);
         if let Some(script) = &krate.env.script {
@@ -183,13 +205,6 @@ pub fn item_key_with_crates(
         file.expand_origin.hash(&mut hasher);
         file.source.offset.hash(&mut hasher);
         file.source.text.hash(&mut hasher);
-    }
-    item.item.hash(&mut hasher);
-    sub_idx.hash(&mut hasher);
-    entry.start.hash(&mut hasher);
-    entry.kind.hash(&mut hasher);
-    if let Some(name_tok) = entry.name {
-        file.source.text(name_tok).hash(&mut hasher);
     }
     Some(hasher.finish())
 }

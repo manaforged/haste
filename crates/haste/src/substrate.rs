@@ -11,7 +11,7 @@ mod trim;
 
 pub use inline::{InlineKey, InlineShape};
 pub use keys::{
-    deps_key, deps_path, enabled, layer_item_key, sysroot_item_key, sysroot_only_item_key, target_hash, toolchain_key,
+    deps_key, deps_path, enabled, file_key, layer_item_key, sysroot_item_key, sysroot_only_item_key, target_hash, toolchain_key,
     toolchain_path, workspace_key, workspace_path,
 };
 
@@ -32,7 +32,7 @@ use haste_codegen::{Code, RelocKind, Site, StencilReloc};
 use consumers::{CONSUMER_REC_LEN, Consumer, KEPT_WORKSPACES};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 22;
+const VERSION: u32 = 23;
 const HEADER_LEN: usize = 72;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 72;

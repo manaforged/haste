@@ -14,7 +14,7 @@ use crate::outline::Outline;
 use crate::sema::infer::SiteKey;
 use crate::sema::reach::Reached;
 use crate::sema::substs::{ProjDef, Substs};
-use crate::sema::summary::codec::{Cursor, SysrootIndex, read_mut, write_u16, write_u32, write_u32s, write_u64, write_u128};
+use crate::sema::summary::codec::{Cursor, FileIndex, ItemRecord, read_mut, write_u16, write_u32, write_u32s, write_u64, write_u128};
 use crate::sema::ty::{Kind, Mut, Ty, Types};
 
 const PLAN_MAGIC: [u8; 4] = *b"HRP1";
@@ -60,13 +60,13 @@ where
     let mut steps_buf = Vec::new();
     enc.write_plan(&mut steps_buf, plan)?;
 
-    let mut out = Vec::with_capacity(32 + enc.items.len() * 12 + enc.ty_buf.len() + steps_buf.len());
+    let mut out = Vec::with_capacity(32 + enc.items.len() * (ItemRecord::LEN + 4) + enc.ty_buf.len() + steps_buf.len());
     out.extend_from_slice(&PLAN_MAGIC);
     out.push(u8::from(include_deps));
     write_u32(&mut out, u32::try_from(enc.items.len()).ok()?);
-    for (key, sub) in &enc.items {
-        write_u64(&mut out, *key);
-        write_u32(&mut out, *sub);
+    for &(record, sub) in &enc.items {
+        record.write(&mut out);
+        write_u32(&mut out, sub);
     }
     write_u32(&mut out, enc.ty_count);
     write_u32(&mut out, u32::try_from(enc.ty_buf.len()).ok()?);
@@ -80,11 +80,12 @@ where
 }
 
 /// Reconstructs a `RelocPlan` from `bytes` in `reached`, returning `None` cleanly if any dependency or item is absent.
-pub fn decode_reloc_plan<'a>(
+pub fn decode_reloc_plan(
+    outline: &Outline,
     types: &Types,
     reached: &Reached,
     slots: &dyn Slots,
-    index_for_scope: impl FnOnce(bool) -> &'a SysrootIndex,
+    index: &FileIndex,
     sysroot_only: bool,
     bytes: &[u8],
 ) -> Result<Option<RelocPlan>> {
@@ -96,13 +97,13 @@ pub fn decode_reloc_plan<'a>(
     if sysroot_only && include_deps {
         return Ok(None);
     }
-    let index = index_for_scope(include_deps);
+    let key_of = if include_deps { crate::substrate::sysroot_item_key } else { crate::substrate::sysroot_only_item_key };
     let item_count = cur.count()?;
     let mut items = Vec::with_capacity(item_count);
     for _ in 0..item_count {
-        let key = cur.u64()?;
+        let record = ItemRecord::read(&mut cur)?;
         let sub = cur.u32()?;
-        let Some(base) = index.get(key) else { return Ok(None) };
+        let Some(base) = index.resolve(outline, record, key_of) else { return Ok(None) };
         let item = if sub == 0 {
             base
         } else {
@@ -194,7 +195,7 @@ struct Encoder<'a, F, FR, FV> {
     rodata_of: &'a mut FR,
     vtable_of: &'a mut FV,
     item_map: HashMap<ItemRef, u32>,
-    items: Vec<(u64, u32)>,
+    items: Vec<(ItemRecord, u32)>,
     ty_map: HashMap<Ty, u32>,
     ty_count: u32,
     ty_buf: Vec<u8>,
@@ -247,9 +248,9 @@ where
             Some((outer, sub)) => (outer, sub.checked_add(1)?),
             None => (item, 0),
         };
-        let key = (self.key_of)(self.outline, base)?;
+        let record = ItemRecord::of(self.outline, base, &mut *self.key_of)?;
         let idx = u32::try_from(self.items.len()).ok()?;
-        self.items.push((key, sub));
+        self.items.push((record, sub));
         self.item_map.insert(item, idx);
         Some(idx)
     }

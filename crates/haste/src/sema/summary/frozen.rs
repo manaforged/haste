@@ -22,8 +22,12 @@ pub(in crate::sema) fn frozen_summary(cx: &mut Context<'_>, item: ItemRef) -> Op
     let substrate = cx.store.lookups.substrate.clone()?;
     let key = crate::substrate::sysroot_item_key(cx.outline, item)?;
     let bytes = substrate.summary(key)?;
-    let index = cx.store.lookups.sysroot_index.get_or_init(|| Arc::new(codec::SysrootIndex::build(cx.outline, crate::substrate::sysroot_item_key)));
-    codec::decode_summary(index, &cx.types, bytes).ok().flatten().map(Arc::new)
+    let index = file_index(cx);
+    codec::decode_summary(cx.outline, index, &cx.types, bytes).ok().flatten().map(Arc::new)
+}
+
+fn file_index<'a>(cx: &'a Context<'_>) -> &'a codec::FileIndex {
+    cx.store.lookups.file_index.get_or_init(|| Arc::new(codec::FileIndex::build(cx.outline)))
 }
 
 pub(super) fn frozen_instance(
@@ -41,9 +45,9 @@ pub(super) fn frozen_instance(
     let substrate = cx.store.lookups.substrate.clone()?;
     let item_key = crate::substrate::sysroot_item_key(cx.outline, instance.0)?;
     let substs_key = codec::substs_key(cx.outline, &cx.types, instance.1, crate::substrate::sysroot_item_key)?;
-    let index = cx.store.lookups.sysroot_index.get_or_init(|| Arc::new(codec::SysrootIndex::build(cx.outline, crate::substrate::sysroot_item_key)));
+    let index = file_index(cx);
     for bytes in substrate.instance_candidates(item_key, substs_key) {
-        if let Ok(Some(decoded)) = codec::decode_instance(index, &cx.types, instance.1, bytes) {
+        if let Ok(Some(decoded)) = codec::decode_instance(cx.outline, index, &cx.types, instance.1, bytes) {
             let inst = PolyInst {
                 args: instance.1,
                 summary: Arc::clone(summary),
