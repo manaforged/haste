@@ -73,10 +73,10 @@ impl Emit<'_> {
                 if let Some((a, b)) = super::fuse::eon_inner(self.func, &self.plan, x, |v| self.defs[v.index()]) {
                     let shifted = self.shifted_operand(Alu::Eon, ty, b).map(|s| (a, s)).or_else(|| self.shifted_operand(Alu::Eon, ty, a).map(|s| (b, s)));
                     if let Some((other, (rhs, shift, imm))) = shifted {
-                        let (left, right) = (self.bits(self.peel_uextend(other), A), self.bits(rhs, C));
+                        let (left, right) = self.bits_pair(self.peel_uextend(other), rhs);
                         self.emit_shifted(Alu::Eon, size, dst, left, (right, shift, imm));
                     } else {
-                        let (left, right) = (self.bits(self.peel_uextend(a), A), self.bits(self.peel_uextend(b), C));
+                        let (left, right) = self.bits_pair(self.peel_uextend(a), self.peel_uextend(b));
                         self.asm.alu(Alu::Eon, size, dst, left, right);
                     }
                 } else if let Some((b, shift, imm)) = self.shifted_operand(Alu::Orn, ty, x) {
@@ -262,8 +262,7 @@ impl Emit<'_> {
                 && self.plan.elided[y.index()]
                 && let Some((hi, lo, kr)) = super::fuse::extr_parts(self.func, &self.plan, ty, (x, y), &|v| self.defs[v.index()])
             {
-                let left = self.bits(self.peel_uextend(hi), A);
-                let right = self.bits(self.peel_uextend(lo), C);
+                let (left, right) = self.bits_pair(self.peel_uextend(hi), self.peel_uextend(lo));
                 self.asm.extr(size, dst, left, right, kr);
                 return Ok(());
             }
@@ -292,15 +291,13 @@ impl Emit<'_> {
                             .flatten()
                     });
                 if let Some((other, (ext_op, shift, inner))) = ext {
-                    let left = self.bits(other, A);
-                    let right = self.bits(inner, C);
+                    let (left, right) = self.bits_pair(other, inner);
                     self.asm.alu_extended(alu, size, ext_op, shift, dst, left, right);
                     return Ok(());
                 }
             }
             if let Some((not_alu, lhs, rhs, shifted)) = super::fuse::bnot_parts(self.func, &self.plan, ty, op, x, y, |v| self.defs[v.index()]) {
-                let left = self.bits(self.peel_uextend(lhs), A);
-                let right = self.bits(self.peel_uextend(rhs), C);
+                let (left, right) = self.bits_pair(self.peel_uextend(lhs), self.peel_uextend(rhs));
                 if let Some((shift, imm)) = shifted && imm != 0 {
                     self.asm.alu_shifted(not_alu, size, shift, imm, dst, left, right);
                 } else {
@@ -310,7 +307,7 @@ impl Emit<'_> {
             }
             let shifted = self.shifted_operand(alu, ty, y).map(|s| (x, s)).or_else(|| (alu != Alu::Sub).then(|| self.shifted_operand(alu, ty, x).map(|s| (y, s))).flatten());
             if let Some((other, (b, shift, imm))) = shifted {
-                let (left, right) = (self.bits(self.peel_uextend(other), A), self.bits(b, C));
+                let (left, right) = self.bits_pair(self.peel_uextend(other), b);
                 self.emit_shifted(alu, size, dst, left, (right, shift, imm));
                 return Ok(());
             }
@@ -318,8 +315,7 @@ impl Emit<'_> {
                 && matches!(ty, Type::I32 | Type::I64)
                 && let Some((sub, a, b, c)) = super::fuse::madd_parts(self.func, &self.plan, ty, op, x, y, |v| self.defs[v.index()])
             {
-                let left = self.bits(a, A);
-                let right = self.bits(b, C);
+                let (left, right) = self.bits_pair(a, b);
                 let acc = if self.plan.const_of(c) == Some(0) {
                     ZR
                 } else {
@@ -349,7 +345,7 @@ impl Emit<'_> {
             if matches!(alu, Alu::Add | Alu::Sub) && self.emit_add_sub_imm(alu == Alu::Sub, (x, y), (ty, size), dst) {
                 return Ok(());
             }
-            let (left, right) = (self.bits(x, A), self.bits(y, C));
+            let (left, right) = self.bits_pair(x, y);
             self.asm.alu(alu, size, dst, left, right);
             return Ok(());
         }
@@ -380,8 +376,7 @@ impl Emit<'_> {
             }
             Binary::SaddSat | Binary::UaddSat | Binary::SsubSat | Binary::UsubSat => self.sat_add_sub(op, (x, y), bits, dst),
             Binary::AvgRound => {
-                let left = self.src(x, A, Ext::Zero);
-                let right = self.src(y, C, Ext::Zero);
+                let (left, right) = self.src_pair(x, y, Ext::Zero);
                 self.asm.alu(Alu::Orr, Size::X, D, left, right);
                 self.asm.alu(Alu::Eor, Size::X, A, left, right);
                 self.asm.alu_shifted(Alu::Sub, Size::X, Shift::Lsr, 1, dst, D, A);
@@ -408,14 +403,14 @@ impl Emit<'_> {
         let signed = matches!(op, Binary::SaddSat | Binary::SsubSat);
         let sub = matches!(op, Binary::SsubSat | Binary::UsubSat);
         if sub && !signed {
-            let (left, right) = (self.src(x, A, Ext::Zero), self.src(y, C, Ext::Zero));
+            let (left, right) = self.src_pair(x, y, Ext::Zero);
             self.asm.alu(Alu::Subs, Size::X, D, left, right);
             self.asm.csel(Cond::Hs, dst, D, ZR);
             self.clobber_reg(D);
             return;
         }
         if bits < 64 {
-            let (left, right) = (self.src(x, A, Ext::of(signed)), self.src(y, C, Ext::of(signed)));
+            let (left, right) = self.src_pair(x, y, Ext::of(signed));
             self.asm.alu(if sub { Alu::Sub } else { Alu::Add }, Size::X, D, left, right);
             if signed {
                 let bound = 1i64 << (bits - 1);
@@ -428,7 +423,7 @@ impl Emit<'_> {
             }
             return;
         }
-        let (left, right) = (self.bits(x, A), self.bits(y, C));
+        let (left, right) = self.bits_pair(x, y);
         self.asm.alu(if sub { Alu::Subs } else { Alu::Adds }, Size::X, D, left, right);
         if signed {
             self.asm.mov_imm(A, i64::MIN);
@@ -483,8 +478,7 @@ impl Emit<'_> {
                 return lsl(&mut self.asm, dst, dst, shift);
             }
         }
-        let left = self.bits(x, A);
-        let right = self.bits(y, C);
+        let (left, right) = self.bits_pair(x, y);
         self.asm.madd(false, size, dst, (left, right), ZR);
     }
 
@@ -509,7 +503,7 @@ impl Emit<'_> {
 
     fn divide(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) {
         let signed = matches!(op, Binary::Sdiv | Binary::Srem);
-        let (left, right) = (self.src(x, A, Ext::of(signed)), self.src(y, C, Ext::of(signed)));
+        let (left, right) = self.src_pair(x, y, Ext::of(signed));
         let div = if signed { Alu::Sdiv } else { Alu::Udiv };
         if matches!(op, Binary::Sdiv | Binary::Udiv) {
             return self.asm.alu(div, Size::X, dst, left, right);
@@ -521,8 +515,7 @@ impl Emit<'_> {
     }
 
     fn multiply_high(&mut self, signed: bool, (x, y): (Value, Value), bits: u8, dst: Reg) {
-        let left = self.src(x, A, Ext::of(signed));
-        let right = self.src(y, C, Ext::of(signed));
+        let (left, right) = self.src_pair(x, y, Ext::of(signed));
         if bits == 64 {
             self.asm.alu(if signed { Alu::Smulh } else { Alu::Umulh }, Size::X, dst, left, right);
             return;
@@ -574,8 +567,7 @@ impl Emit<'_> {
         }
         let y = self.unwrap_shift_mask(y, bits);
         if bits >= 32 {
-            let value = self.bits(x, A);
-            let count = self.bits(y, C);
+            let (value, count) = self.bits_pair(x, y);
             self.asm.alu(alu, if bits == 32 { Size::W } else { Size::X }, dst, value, count);
             return;
         }
@@ -660,7 +652,7 @@ impl Emit<'_> {
         if matches!(x_ty, Type::I32 | Type::I64)
             && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, y, |v| self.defs[v.index()])
         {
-            let (left, right) = (self.bits(x, A), self.bits(inner, C));
+            let (left, right) = self.bits_pair(x, inner);
             self.asm.alu_extended(Alu::Subs, size, ext_op, shift, ZR, left, right);
             self.last_cmp = Some((size, x, y, signed));
             return cond(cc);
@@ -670,13 +662,12 @@ impl Emit<'_> {
         if matches!(x_ty, Type::I32 | Type::I64)
             && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, x, |v| self.defs[v.index()])
         {
-            let (lhs, rhs) = (self.bits(y, A), self.bits(inner, C));
+            let (lhs, rhs) = self.bits_pair(y, inner);
             self.asm.alu_extended(Alu::Subs, size, ext_op, shift, ZR, lhs, rhs);
             self.last_cmp = None;
             return swap_cond(cond(cc));
         }
-        let left = self.cmp_arg(x, A, bytes, ext);
-        let right = self.cmp_arg(y, C, bytes, ext);
+        let (left, right) = if bytes >= 4 { self.bits_pair(x, y) } else { self.src_pair(x, y, ext) };
         self.asm.alu(Alu::Subs, size, ZR, left, right);
         self.last_cmp = Some((size, x, y, signed));
         cond(cc)
@@ -714,13 +705,13 @@ impl Emit<'_> {
                     let left = self.bits(lhs, A);
                     self.asm.add_imm(eff_sub, true, size, reg, left, imm);
                 } else {
-                    let (left, right) = (self.bits(x, A), self.bits(y, C));
+                    let (left, right) = self.bits_pair(x, y);
                     self.asm.alu(if sub { Alu::Subs } else { Alu::Adds }, size, reg, left, right);
                 }
                 match (signed, sub) { (true, _) => Cond::Vc, (false, false) => Cond::Lo, (false, true) => Cond::Hs }
             }
             (Binary::Iadd | Binary::Isub | Binary::Imul, _) if bits < 64 => {
-                let (left, right) = (self.src(x, A, Ext::of(signed)), self.src(y, C, Ext::of(signed)));
+                let (left, right) = self.src_pair(x, y, Ext::of(signed));
                 match op {
                     Binary::Iadd => self.asm.alu(Alu::Add, Size::X, reg, left, right),
                     Binary::Isub => self.asm.alu(Alu::Sub, Size::X, reg, left, right),
@@ -731,7 +722,7 @@ impl Emit<'_> {
                 Cond::Eq
             }
             (Binary::Imul, _) => {
-                let (left, right) = (self.bits(x, A), self.bits(y, C));
+                let (left, right) = self.bits_pair(x, y);
                 self.asm.alu(if signed { Alu::Smulh } else { Alu::Umulh }, Size::X, T, left, right);
                 self.asm.madd(false, Size::X, reg, (left, right), ZR);
                 let expected = if signed { self.asm.asr_imm(A, reg, 63); A } else { ZR };

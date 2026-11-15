@@ -232,10 +232,39 @@ impl Emit<'_> {
         }
     }
 
+    fn get_slot(&mut self, reg: Reg, value: Value, (bytes, signed, full): (u32, bool, bool)) {
+        let disp = self.frame.values[value.index()];
+        debug_assert_ne!(disp, 0, "unhomed value {value:?} in get()");
+        if let Some(cached_reg) = self.cached_spill_for(disp, reg) {
+            if full {
+                if cached_reg != reg {
+                    self.asm.mov(reg, cached_reg);
+                    self.record_spill(disp, reg);
+                }
+            } else {
+                if cached_reg == super::ZR {
+                    self.asm.mov(reg, super::ZR);
+                } else {
+                    self.asm.extend(signed, bytes, reg, cached_reg);
+                }
+                self.clobber_reg(reg);
+            }
+        } else {
+            let at = self.frame_mem(disp);
+            self.asm.load(Size::of(bytes), signed && bytes < 8, reg, at);
+            if !signed || bytes >= 8 {
+                self.record_spill(disp, reg);
+            } else {
+                self.clobber_reg(reg);
+            }
+        }
+    }
+
     pub(super) fn get(&mut self, reg: Reg, value: Value, ext: Ext) {
         let ty = self.ty(value);
         let bytes = ty.bytes();
         let signed = matches!(ext, Ext::Sign);
+        let full = bytes >= 8 || (!signed && self.plan.zero_ext[value.index()]);
         match self.plan.location(value) {
             Location::Imm(imm) => {
                 self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed));
@@ -257,34 +286,20 @@ impl Emit<'_> {
                 self.asm.extend(signed, bytes, reg, reg);
                 self.clobber_reg(reg);
             }
-            Location::Slot => {
-                let disp = self.frame.values[value.index()];
-                debug_assert_ne!(disp, 0, "unhomed value {value:?} in get()");
-                if let Some(cached_reg) = self.cached_spill_for(disp, reg) {
-                    if bytes >= 8 {
-                        if cached_reg != reg {
-                            self.asm.mov(reg, cached_reg);
-                            self.record_spill(disp, reg);
-                        }
-                    } else {
-                        if cached_reg == super::ZR {
-                            self.asm.mov(reg, super::ZR);
-                        } else {
-                            self.asm.extend(signed, bytes, reg, cached_reg);
-                        }
-                        self.clobber_reg(reg);
-                    }
-                } else {
-                    let at = self.frame_mem(disp);
-                    self.asm.load(Size::of(bytes), signed && bytes < 8, reg, at);
-                    if bytes >= 8 {
-                        self.record_spill(disp, reg);
-                    } else {
-                        self.clobber_reg(reg);
-                    }
-                }
-            }
+            Location::Slot => self.get_slot(reg, value, (bytes, signed, full)),
         }
+    }
+
+    fn is_scratch(reg: Reg) -> bool {
+        matches!(reg, super::ZR | super::A | super::C | super::D | super::S | super::T | super::IP) || reg.0 == 17
+    }
+
+    fn borrowable(cached: Reg, scratch: Reg) -> bool {
+        !Self::is_scratch(cached)
+            || cached == scratch
+            || (cached != super::ZR
+                && ((scratch == super::C && cached == super::A)
+                    || (scratch == super::IP && (cached == super::A || cached == super::C))))
     }
 
     fn spill_borrow(&self, value: Value, scratch: Reg) -> Option<Reg> {
@@ -292,22 +307,69 @@ impl Emit<'_> {
             return None;
         };
         let disp = self.frame.values[value.index()];
-        let cached = self.cached_spill_for(disp, scratch)?;
-        let ok = cached == scratch
-            || (cached != super::ZR
-                && ((scratch == super::C && cached == super::A)
-                    || (scratch == super::IP && (cached == super::A || cached == super::C))));
-        ok.then_some(cached)
+        let mut fallback = None;
+        for (d, r) in self.last_spill.into_iter().flatten() {
+            if d == disp && Self::borrowable(r, scratch) {
+                if r == scratch {
+                    return Some(r);
+                }
+                if !Self::is_scratch(r) || fallback.is_none() {
+                    fallback = Some(r);
+                }
+            }
+        }
+        fallback
+    }
+
+    fn is_full(&self, value: Value, ext: Ext) -> bool {
+        self.ty(value).bytes() >= 8 || (matches!(ext, Ext::Zero) && self.plan.zero_ext[value.index()])
+    }
+
+    fn op_in_scratch(&self, value: Value, scratch: Reg, ext: Option<Ext>) -> bool {
+        ext.is_none_or(|e| self.is_full(value, e)) && self.spill_borrow(value, scratch) == Some(scratch)
+    }
+
+    fn op_ready(&self, value: Value, ext: Option<Ext>) -> bool {
+        ext.is_none_or(|e| self.is_full(value, e))
+            && (self.plan.reg_of(value).is_some() || self.spill_borrow(value, A).is_some())
+    }
+
+    fn resolve_op(&mut self, value: Value, scratch: Reg, ext: Option<Ext>) -> Reg {
+        match ext {
+            Some(e) => self.src(value, scratch, e),
+            None => self.bits(value, scratch),
+        }
+    }
+
+    fn resolve_pair(&mut self, x: Value, y: Value, ext: Option<Ext>) -> (Reg, Reg) {
+        if x == y {
+            let scratch = if self.op_ready(x, ext) || !self.op_in_scratch(x, C, ext) { A } else { C };
+            let reg = self.resolve_op(x, scratch, ext);
+            return (reg, reg);
+        }
+        let x_fast = self.op_ready(x, ext);
+        if !x_fast && self.op_in_scratch(x, C, ext) {
+            return (self.resolve_op(x, C, ext), self.resolve_op(y, A, ext));
+        }
+        if !x_fast && self.op_in_scratch(y, A, ext) {
+            let right = self.resolve_op(y, A, ext);
+            return (self.resolve_op(x, C, ext), right);
+        }
+        (self.resolve_op(x, A, ext), self.resolve_op(y, C, ext))
+    }
+
+    pub(super) fn bits_pair(&mut self, x: Value, y: Value) -> (Reg, Reg) {
+        self.resolve_pair(x, y, None)
+    }
+
+    pub(super) fn src_pair(&mut self, x: Value, y: Value, ext: Ext) -> (Reg, Reg) {
+        self.resolve_pair(x, y, Some(ext))
     }
 
     pub(super) fn src(&mut self, value: Value, scratch: Reg, ext: Ext) -> Reg {
-        let wide = self.ty(value).bytes() >= 8;
-        if let Some(reg) = self.plan.reg_of(value)
-            && (wide || (matches!(ext, Ext::Zero) && self.plan.zero_ext[value.index()]))
+        if self.is_full(value, ext)
+            && let Some(reg) = self.plan.reg_of(value).or_else(|| self.spill_borrow(value, scratch))
         {
-            return reg;
-        }
-        if wide && let Some(reg) = self.spill_borrow(value, scratch) {
             return reg;
         }
         self.get(scratch, value, ext);

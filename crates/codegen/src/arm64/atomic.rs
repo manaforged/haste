@@ -224,117 +224,139 @@ impl Emit<'_> {
         }
     }
 
+    fn select_cond(&mut self, condition: Value) -> Cond {
+        if let Some((val, c)) = self.flags
+            && val == condition
+        {
+            return c;
+        }
+        if self.plan.elided[condition.index()]
+            && let Some(inst) = self.defs[condition.index()]
+            && let Op::Icmp(cc, a, b) = self.func.insts[inst.index()].op
+        {
+            let c = self.compare(cc, a, b);
+            self.flags = Some((condition, c));
+            return c;
+        }
+        self.flags = None;
+        self.last_cmp = None;
+        let flag = self.src(condition, C, Ext::Zero);
+        self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
+        Cond::Ne
+    }
+
+    fn select_csel(&mut self, cond: Cond, dst: Reg, (x, y): (Value, Value), (xz, yz): (bool, bool)) {
+        let (left, right) = match (xz, yz) {
+            (true, true) => (ZR, ZR),
+            (true, false) => (ZR, self.bits(y, C)),
+            (false, true) => (self.bits(x, A), ZR),
+            (false, false) => self.bits_pair(x, y),
+        };
+        self.asm.csel(cond, dst, left, right);
+    }
+
+    fn select_const_pair(&mut self, cond: Cond, size: Size, dst: Reg, (x, y): (Value, Value), (kx, ky): (i64, i64)) {
+        let (ux, uy) = (kx as u64, ky as u64);
+        let mask = if size == Size::W { u32::MAX as u64 } else { u64::MAX };
+        if ((ux.wrapping_add(1)) & mask) == uy {
+            let reg = self.bits(x, A);
+            self.asm.csinc(size, cond, dst, reg, reg);
+        } else if ((uy.wrapping_add(1)) & mask) == ux {
+            let reg = self.bits(y, C);
+            self.asm.csinc(size, cond.invert(), dst, reg, reg);
+        } else if (!ux & mask) == uy {
+            let reg = self.bits(x, A);
+            self.asm.csinv(size, cond, dst, reg, reg);
+        } else if (ux.wrapping_neg() & mask) == uy {
+            let reg = self.bits(x, A);
+            self.asm.csneg(size, cond, dst, reg, reg);
+        } else {
+            self.select_csel(cond, dst, (x, y), (kx == 0, ky == 0));
+        }
+    }
+
+    fn select_int_pair(&mut self, cond: Cond, (ty, size): (Type, Size), dst: Reg, (x, y): (Value, Value), (kx, ky): (Option<i64>, Option<i64>)) {
+        if let (Some(kx), Some(ky)) = (kx, ky)
+            && matches!(ty, Type::I32 | Type::I64)
+        {
+            self.select_const_pair(cond, size, dst, (x, y), (kx, ky));
+        } else if let Some(kind) = self.select_transform(ty, y, x) {
+            let reg = self.bits(x, A);
+            self.emit_select_op(kind, size, cond, dst, reg);
+        } else if let Some(kind) = self.select_transform(ty, x, y) {
+            let reg = self.bits(y, C);
+            self.emit_select_op(kind, size, cond.invert(), dst, reg);
+        } else {
+            self.select_csel(cond, dst, (x, y), (kx == Some(0), ky == Some(0)));
+        }
+    }
+
+    fn select_word_special(&mut self, (cond, size, ty): (Cond, Size, Type), dst: Reg, (x, y): (Value, Value)) -> bool {
+        let uconst = |v: Value| self.plan.const_of(v).map(|imm| crate::fold::extend(imm, ty, false));
+        let sconst = |v: Value| self.plan.const_of(v).map(|imm| crate::fold::extend(imm, ty, true));
+        for ((keep, alt), c, scratch) in [((x, y), cond, A), ((y, x), cond.invert(), C)] {
+            let k = uconst(keep);
+            if sconst(alt) == Some(-1) {
+                let reg = if k == Some(0) { ZR } else { self.bits(keep, scratch) };
+                self.asm.csinv(size, c, dst, reg, ZR);
+                return true;
+            }
+            if uconst(alt) == Some(1) {
+                let reg = if k == Some(0) { ZR } else { self.bits(keep, scratch) };
+                self.asm.csinc(size, c, dst, reg, ZR);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn select_int(&mut self, cond: Cond, ty: Type, (x, y): (Value, Value), result: Value) {
+        let dst = self.dst(result);
+        let size = if ty == Type::I64 { Size::X } else { Size::W };
+        let uconst = |v: Value| self.plan.const_of(v).map(|imm| crate::fold::extend(imm, ty, false));
+        let (kx, ky) = (uconst(x), uconst(y));
+        match (kx, ky) {
+            (Some(1), Some(0)) => self.asm.cset(cond, dst),
+            (Some(0), Some(1)) => self.asm.cset(cond.invert(), dst),
+            _ if matches!(ty, Type::I32 | Type::I64) && self.select_word_special((cond, size, ty), dst, (x, y)) => {}
+            _ => self.select_int_pair(cond, (ty, size), dst, (x, y), (kx, ky)),
+        }
+        self.put(result, dst);
+    }
+
+    fn select_i128(&mut self, cond: Cond, x: Value, y: Value, result: Value) {
+        self.invalidate_spills();
+        self.raw(A, x);
+        self.raw(D, y);
+        self.asm.csel(cond, A, A, D);
+        self.put(result, A);
+        self.high(A, x);
+        self.high(D, y);
+        self.asm.csel(cond, A, A, D);
+        self.put_high(result, A);
+    }
+
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
         if self.ty(condition).is_vector() {
             self.invalidate_spills();
             self.vec_select_mask(condition, x, y, result);
             return;
         }
-        let cond = if let Some((val, c)) = self.flags
-            && val == condition
-        {
-            c
-        } else if self.plan.elided[condition.index()]
-            && let Some(inst) = self.defs[condition.index()]
-            && let Op::Icmp(cc, a, b) = self.func.insts[inst.index()].op
-        {
-            let c = self.compare(cc, a, b);
-            self.flags = Some((condition, c));
-            c
-        } else {
-            self.flags = None;
-            self.last_cmp = None;
-            let flag = self.src(condition, C, Ext::Zero);
-            self.asm.add_imm(true, true, Size::X, ZR, flag, 0);
-            Cond::Ne
-        };
+        let cond = self.select_cond(condition);
         let ty = self.ty(x);
         if ty.is_vector() {
             self.invalidate_spills();
             self.vec_select_cond(cond, x, y, result);
-            return;
-        }
-        if ty.is_float() {
+        } else if ty.is_float() {
             let (left, right) = (self.fin(x, super::V0), self.fin(y, super::V1));
             let dst = self.fdst(result);
             self.asm.fcsel(cond, ty == Type::F64, dst, left, right);
             self.fput(result, dst);
-            return;
+        } else if ty == Type::I128 {
+            self.select_i128(cond, x, y, result);
+        } else {
+            self.select_int(cond, ty, (x, y), result);
         }
-        if ty == Type::I128 {
-            self.invalidate_spills();
-            self.raw(A, x);
-            self.raw(D, y);
-            self.asm.csel(cond, A, A, D);
-            self.put(result, A);
-            self.high(A, x);
-            self.high(D, y);
-            self.asm.csel(cond, A, A, D);
-            self.put_high(result, A);
-            return;
-        }
-        let dst = self.dst(result);
-        let size = if ty == Type::I64 { Size::X } else { Size::W };
-        let word_ok = matches!(ty, Type::I32 | Type::I64);
-        let uconst = |v: Value| self.plan.const_of(v).map(|imm| crate::fold::extend(imm, ty, false));
-        let sconst = |v: Value| self.plan.const_of(v).map(|imm| crate::fold::extend(imm, ty, true));
-        match (uconst(x), uconst(y)) {
-            (Some(1), Some(0)) => self.asm.cset(cond, dst),
-            (Some(0), Some(1)) => self.asm.cset(cond.invert(), dst),
-            _ if word_ok && sconst(x) == Some(-1) && uconst(y) == Some(0) => self.asm.csinv(size, cond.invert(), dst, ZR, ZR),
-            _ if word_ok && uconst(x) == Some(0) && sconst(y) == Some(-1) => self.asm.csinv(size, cond, dst, ZR, ZR),
-            (kx, Some(1)) if word_ok => {
-                let left = if kx == Some(0) { ZR } else { self.bits(x, A) };
-                self.asm.csinc(size, cond, dst, left, ZR);
-            }
-            (Some(1), ky) if word_ok => {
-                let right = if ky == Some(0) { ZR } else { self.bits(y, C) };
-                self.asm.csinc(size, cond.invert(), dst, right, ZR);
-            }
-            (kx, _) if word_ok && sconst(y) == Some(-1) => {
-                let left = if kx == Some(0) { ZR } else { self.bits(x, A) };
-                self.asm.csinv(size, cond, dst, left, ZR);
-            }
-            (_, ky) if word_ok && sconst(x) == Some(-1) => {
-                let right = if ky == Some(0) { ZR } else { self.bits(y, C) };
-                self.asm.csinv(size, cond.invert(), dst, right, ZR);
-            }
-            (Some(kx), Some(ky)) if word_ok => {
-                let (ux, uy) = (kx as u64, ky as u64);
-                let mask = if size == Size::W { u32::MAX as u64 } else { u64::MAX };
-                if ((ux.wrapping_add(1)) & mask) == uy {
-                    let reg = self.bits(x, A);
-                    self.asm.csinc(size, cond, dst, reg, reg);
-                } else if ((uy.wrapping_add(1)) & mask) == ux {
-                    let reg = self.bits(y, C);
-                    self.asm.csinc(size, cond.invert(), dst, reg, reg);
-                } else if (!ux & mask) == uy {
-                    let reg = self.bits(x, A);
-                    self.asm.csinv(size, cond, dst, reg, reg);
-                } else if (ux.wrapping_neg() & mask) == uy {
-                    let reg = self.bits(x, A);
-                    self.asm.csneg(size, cond, dst, reg, reg);
-                } else {
-                    let left = if kx == 0 { ZR } else { self.bits(x, A) };
-                    let right = if ky == 0 { ZR } else { self.bits(y, C) };
-                    self.asm.csel(cond, dst, left, right);
-                }
-            }
-            (kx, ky) => {
-                if let Some(kind) = self.select_transform(ty, y, x) {
-                    let reg = self.bits(x, A);
-                    self.emit_select_op(kind, size, cond, dst, reg);
-                } else if let Some(kind) = self.select_transform(ty, x, y) {
-                    let reg = self.bits(y, C);
-                    self.emit_select_op(kind, size, cond.invert(), dst, reg);
-                } else {
-                    let left = if kx == Some(0) { ZR } else { self.bits(x, A) };
-                    let right = if ky == Some(0) { ZR } else { self.bits(y, C) };
-                    self.asm.csel(cond, dst, left, right);
-                }
-            }
-        }
-        self.put(result, dst);
     }
 
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
