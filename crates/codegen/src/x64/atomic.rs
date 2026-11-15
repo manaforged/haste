@@ -1,10 +1,10 @@
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Size, Xmm};
-use super::float::X1;
+use super::float::{X0, X1};
 use super::location::LEAF;
 use super::{Emit, int};
 use crate::alloc::Location;
 use crate::frame::{Emitter, Ext};
-use crate::ir::{AtomicRmwOp, Binary, Function, IntCC, Op, StackSlot, Type, Unary, Value};
+use crate::ir::{AtomicRmwOp, Binary, Function, IntCC, Op, ShuffleMask, StackSlot, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const MFENCE: [u8; 3] = [0x0F, 0xAE, 0xF0];
@@ -126,11 +126,14 @@ impl Emit<'_> {
 
     pub(super) fn memory_op(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
-            Op::Const(_) if result().is_ok_and(|result| self.ty(result).is_vector()) => {
+            Op::Const(_) if result().is_ok_and(|result| self.ty(result).is_vector()) => self.vector_zero(result()?),
+            Op::Const(0) if result().is_ok_and(|result| self.ty(result).is_float()) => {
                 let result = result()?;
-                self.invalidate_spills();
-                self.vector_zero(result);
-                self.invalidate_spills();
+                if !self.is_static(result) {
+                    let dst = self.fdst(result);
+                    self.zero_xmm(dst);
+                    self.fput(result, dst);
+                }
             }
             Op::Const(imm) => {
                 let result = result()?;
@@ -172,15 +175,35 @@ impl Emit<'_> {
             }
             Op::Select(condition, x, y) => self.select(*condition, *x, *y, result()?),
             Op::Shuffle(..) | Op::Extract(..) | Op::Insert(..) | Op::Reduce(..) | Op::TargetOp(..) => {
-                self.clear_flags();
-                let result = result()?;
-                self.invalidate_spills();
-                self.vector_op(op, result)?;
-                self.invalidate_spills();
+                self.emit_vector_op(op, result()?)?;
             }
             _ => return self.access(op, result),
         }
         Ok(())
+    }
+
+    fn emit_vector_op(&mut self, op: &Op, result: Value) -> Result<(), String> {
+        self.clear_flags();
+        self.last_fspill = None;
+        match op {
+            Op::TargetOp(..) | Op::Extract(..) => self.vector_op(op, result),
+            Op::Insert(..) => {
+                self.vector_op(op, result)?;
+                self.clobber_reg(Reg::Rax);
+                Ok(())
+            }
+            Op::Shuffle(a, _, ShuffleMask::Const(_)) if self.ty(*a).is_wide_vec() || self.features.ssse3 => {
+                self.vector_op(op, result)?;
+                self.clobber_reg(Reg::Rax);
+                Ok(())
+            }
+            _ => {
+                self.invalidate_spills();
+                self.vector_op(op, result)?;
+                self.invalidate_spills();
+                Ok(())
+            }
+        }
     }
 
     fn access(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
@@ -476,9 +499,12 @@ impl Emit<'_> {
     fn select(&mut self, condition: Value, x: Value, y: Value, result: Value) {
         let live_flags = self.flags.take();
         if self.ty(condition).is_vector() {
-            self.invalidate_spills();
+            self.flags = live_flags;
+            self.last_fspill = None;
             self.vector_select(condition, x, y, result);
-            self.invalidate_spills();
+            if !self.features.avx {
+                self.clobber_xmms(&[X0, X1]);
+            }
             return;
         }
         if x == y {
