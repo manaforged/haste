@@ -1,3 +1,4 @@
+mod bits;
 mod imm;
 
 use super::asm::{Alu, Bits, Cond, Reg, Shift, Size, ZR};
@@ -54,7 +55,7 @@ impl Emit<'_> {
 
     fn int_unary(&mut self, op: Unary, x: Value, ty: Type, dst: Reg) -> Result<(), String> {
         let bits = ty.bits() as u8;
-        let size = if bits == 32 { Size::W } else { Size::X };
+        let size = if bits <= 32 { Size::W } else { Size::X };
         match op {
             Unary::Ineg => {
                 if matches!(bits, 32 | 64) && let Some((cc, a, b)) = self.cinc_operand(x) {
@@ -72,10 +73,10 @@ impl Emit<'_> {
                 if let Some((a, b)) = super::fuse::eon_inner(self.func, &self.plan, x, |v| self.defs[v.index()]) {
                     let shifted = self.shifted_operand(Alu::Eon, ty, b).map(|s| (a, s)).or_else(|| self.shifted_operand(Alu::Eon, ty, a).map(|s| (b, s)));
                     if let Some((other, (rhs, shift, imm))) = shifted {
-                        let (left, right) = (self.bits(other, A), self.bits(rhs, C));
+                        let (left, right) = (self.bits(self.peel_uextend(other), A), self.bits(rhs, C));
                         self.emit_shifted(Alu::Eon, size, dst, left, (right, shift, imm));
                     } else {
-                        let (left, right) = (self.bits(a, A), self.bits(b, C));
+                        let (left, right) = (self.bits(self.peel_uextend(a), A), self.bits(self.peel_uextend(b), C));
                         self.asm.alu(Alu::Eon, size, dst, left, right);
                     }
                 } else if let Some((b, shift, imm)) = self.shifted_operand(Alu::Orn, ty, x) {
@@ -211,26 +212,19 @@ impl Emit<'_> {
     fn int_binary(&mut self, op: Binary, (x, y): (Value, Value), ty: Type, dst: Reg) -> Result<(), String> {
         let size = if ty == Type::I64 { Size::X } else { Size::W };
         if matches!(op, Binary::Band | Binary::Ishl | Binary::Ushr | Binary::Sshr)
-            && let Some((insert, signed, src, lsb, width)) = super::fuse::bfx_parts(self.func, &self.plan, ty, op, x, y, |v| self.defs[v.index()])
+            && let Some(bfx) = super::fuse::bfx_parts(self.func, &self.plan, ty, op, (x, y), &|v| self.defs[v.index()])
         {
-            let reg = self.bits(self.peel_uextend(src), A);
-            if !insert && lsb == 0 && u32::from(width) == ty.bits() {
-                if size == Size::W { self.asm.extend(false, 4, dst, reg); } else { self.asm.mov(dst, reg); }
-            } else {
-                let (immr, imms) = if insert { (ty.bits() as u8 - lsb, width - 1) } else { (lsb, lsb + width - 1) };
-                let base = match (signed, size == Size::X) { (false, false) => 0x5300_0000, (true, false) => 0x1300_0000, (false, true) => 0xD340_0000, (true, true) => 0x9340_0000 };
-                self.asm.word(base | u32::from(immr) << 16 | u32::from(imms) << 10 | u32::from(reg.0) << 5 | u32::from(dst.0));
-            }
+            self.emit_bfm(bfx, ty, dst);
             return Ok(());
         }
         if let Some(alu) = alu_of(op) {
             if matches!(op, Binary::Bor | Binary::Bxor | Binary::Iadd)
                 && self.plan.elided[x.index()]
                 && self.plan.elided[y.index()]
-                && let Some((hi, lo, kr)) = super::fuse::extr_parts(self.func, &self.plan, ty, x, y, |v| self.defs[v.index()])
+                && let Some((hi, lo, kr)) = super::fuse::extr_parts(self.func, &self.plan, ty, (x, y), &|v| self.defs[v.index()])
             {
                 let left = self.bits(self.peel_uextend(hi), A);
-                let right = self.bits(lo, C);
+                let right = self.bits(self.peel_uextend(lo), C);
                 self.asm.extr(size, dst, left, right, kr);
                 return Ok(());
             }
@@ -599,30 +593,18 @@ impl Emit<'_> {
         Some((a, b))
     }
 
-    pub(super) fn emit_tst(&mut self, x: Value, y: Value) {
-        let ty = self.ty(x);
-        let bits = ty.bits();
-        let size = if bits >= 64 { Size::X } else { Size::W };
-        let ty_mask = if bits == 64 { u64::MAX } else { (1_u64 << bits) - 1 };
-        let imm_pair = match (self.const_imm(y), self.const_imm(x)) {
-            (Some(imm), _) => Some((x, (imm as u64) & ty_mask)),
-            (None, Some(imm)) => Some((y, (imm as u64) & ty_mask)),
-            (None, None) => None,
+    fn cmp_arg(&mut self, val: Value, scratch: Reg, bytes: u32, ext: Ext) -> Reg {
+        if bytes >= 4 { self.bits(val, scratch) } else { self.src(val, scratch, ext) }
+    }
+
+    fn cmp_imm(&mut self, (lhs, rhs): (Value, Value), (bytes, size, signed, ext): (u32, Size, bool, Ext)) -> bool {
+        let Some((sub, imm)) = self.plan.const_of(rhs).and_then(|v| add_imm_parts(true, crate::fold::extend(v, self.ty(rhs), signed))) else {
+            return false;
         };
-        if let Some((val, imm)) = imm_pair {
-            let left = self.bits(val, A);
-            if let Some(bitmask) = encode_bitmask_imm(imm, size == Size::X) {
-                self.asm.alu_bitmask(Alu::Ands, size, bitmask, ZR, left);
-            } else {
-                self.asm.mov_imm(C, imm as i64);
-                self.asm.alu(Alu::Ands, size, ZR, left, C);
-                self.clobber_reg(C);
-            }
-            return;
-        }
-        let left = if bits >= 32 { self.bits(x, A) } else { self.src(x, A, Ext::Zero) };
-        let right = if bits >= 32 { self.bits(y, C) } else { self.src(y, C, Ext::Zero) };
-        self.asm.alu(Alu::Ands, size, ZR, left, right);
+        let reg = self.cmp_arg(lhs, A, bytes, ext);
+        self.asm.add_imm(sub, true, size, ZR, reg, imm);
+        self.last_cmp = Some((size, lhs, rhs, signed));
+        true
     }
 
     pub(super) fn compare(&mut self, cc: IntCC, x: Value, y: Value) -> Cond {
@@ -648,20 +630,8 @@ impl Emit<'_> {
             self.last_cmp = Some((size, x, y, signed));
             return cond(cc);
         }
-        let y_imm = self.plan.const_of(y).and_then(|imm| add_imm_parts(true, crate::fold::extend(imm, self.ty(y), signed)));
-        let x_imm = self.plan.const_of(x).and_then(|imm| add_imm_parts(true, crate::fold::extend(imm, self.ty(x), signed)));
-        let left = if bytes >= 4 { self.bits(x, A) } else { self.src(x, A, ext) };
-        if let Some((sub, imm)) = y_imm {
-            self.asm.add_imm(sub, true, size, ZR, left, imm);
-            self.last_cmp = Some((size, x, y, signed));
-            return cond(cc);
-        }
-        if let Some((sub, imm)) = x_imm {
-            let right = if bytes >= 4 { self.bits(y, A) } else { self.src(y, A, ext) };
-            self.asm.add_imm(sub, true, size, ZR, right, imm);
-            self.last_cmp = Some((size, y, x, signed));
-            return swap_cond(cond(cc));
-        }
+        if self.cmp_imm((x, y), (bytes, size, signed, ext)) { return cond(cc); }
+        if self.cmp_imm((y, x), (bytes, size, signed, ext)) { return swap_cond(cond(cc)); }
         if matches!(x_ty, Type::I32 | Type::I64)
             && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, x, |v| self.defs[v.index()])
         {
@@ -670,7 +640,8 @@ impl Emit<'_> {
             self.last_cmp = None;
             return swap_cond(cond(cc));
         }
-        let right = if bytes >= 4 { self.bits(y, C) } else { self.src(y, C, ext) };
+        let left = self.cmp_arg(x, A, bytes, ext);
+        let right = self.cmp_arg(y, C, bytes, ext);
         self.asm.alu(Alu::Subs, size, ZR, left, right);
         self.last_cmp = Some((size, x, y, signed));
         cond(cc)
@@ -742,22 +713,8 @@ impl Emit<'_> {
     pub(super) fn convert(&mut self, op: Convert, x: Value, result: Value) -> Result<(), String> {
         if self.plan.is_static(result) { return Ok(()); }
         if self.ty(x).is_vector() || self.ty(result).is_vector() { self.invalidate_spills(); return self.vec_convert(op, x, result); }
-        let wide = self.ty(result) == Type::I128;
         match op {
-            Convert::Uextend | Convert::Sextend => {
-                let signed = op == Convert::Sextend;
-                let dst = self.dst(result);
-                self.get(dst, x, Ext::of(signed));
-                self.put(result, dst);
-                if wide && signed {
-                    self.asm.asr_imm(C, dst, 63);
-                    self.put_high(result, C);
-                    self.clobber_reg(C);
-                } else if wide {
-                    self.put_high(result, ZR);
-                }
-                Ok(())
-            }
+            Convert::Uextend | Convert::Sextend => self.emit_extend_conv(op, x, result),
             Convert::Ireduce => {
                 let dst = self.dst(result);
                 if self.plan.elided[x.index()]

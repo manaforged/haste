@@ -279,24 +279,42 @@ impl Emit<'_> {
         }
     }
 
+    fn spill_borrow(&self, value: Value, scratch: Reg) -> Option<Reg> {
+        let Location::Slot = self.plan.location(value) else {
+            return None;
+        };
+        let disp = self.frame.values[value.index()];
+        let cached = self.cached_spill_for(disp, scratch)?;
+        let ok = cached == scratch
+            || (cached != super::ZR
+                && ((scratch == super::C && cached == super::A)
+                    || (scratch == super::IP && (cached == super::A || cached == super::C))));
+        ok.then_some(cached)
+    }
+
     pub(super) fn src(&mut self, value: Value, scratch: Reg, ext: Ext) -> Reg {
-        match self.plan.reg_of(value) {
-            Some(reg) if self.ty(value).bytes() >= 8 || (matches!(ext, Ext::Zero) && self.plan.zero_ext[value.index()]) => reg,
-            _ => {
-                self.get(scratch, value, ext);
-                scratch
-            }
+        let wide = self.ty(value).bytes() >= 8;
+        if let Some(reg) = self.plan.reg_of(value)
+            && (wide || (matches!(ext, Ext::Zero) && self.plan.zero_ext[value.index()]))
+        {
+            return reg;
         }
+        if wide && let Some(reg) = self.spill_borrow(value, scratch) {
+            return reg;
+        }
+        self.get(scratch, value, ext);
+        scratch
     }
 
     pub(super) fn bits(&mut self, value: Value, scratch: Reg) -> Reg {
-        match self.plan.reg_of(value) {
-            Some(reg) => reg,
-            None => {
-                self.raw(scratch, value);
-                scratch
-            }
+        if let Some(reg) = self.plan.reg_of(value) {
+            return reg;
         }
+        if let Some(reg) = self.spill_borrow(value, scratch) {
+            return reg;
+        }
+        self.raw(scratch, value);
+        scratch
     }
 
     pub(super) fn put(&mut self, value: Value, reg: Reg) {

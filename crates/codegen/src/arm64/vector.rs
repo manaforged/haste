@@ -104,10 +104,13 @@ impl Emit<'_> {
             let Type::Vec { count, .. } = self.ty(value) else { return None };
             let count = usize::from(count);
             let first = m[0];
-            if !m[..count].iter().all(|&x| x == first) {
+            if usize::from(first) >= 2 * count || !m[..count].iter().all(|&x| x == first) {
                 return None;
             }
             let src = if usize::from(first) < count { *a } else { *b };
+            if self.plan.const_of(src) == Some(0) {
+                return Some(0);
+            }
             cur = &self.func.insts[self.defs[src.index()]?.index()].op;
             if let Op::Insert(_, scalar, idx) = *cur
                 && usize::from(idx) == usize::from(first) % count
@@ -124,6 +127,115 @@ impl Emit<'_> {
         None
     }
 
+    fn splat_movi_word(&self, value: Value) -> Option<u32> {
+        let spec = VecSpec::of(self.ty(value)).ok()?;
+        let imm = self.splat_const(value)?;
+        super::fuse::encode_neon_movi(spec.q, super::fuse::splat_pattern64(spec.lane, imm))
+    }
+
+    fn unwrap_load_addr(&self, addr: Value, off: i32) -> (Value, i32) {
+        if self.plan.sib[addr.index()].is_none()
+            && self.plan.elided[addr.index()]
+            && let Some(inst) = self.defs[addr.index()]
+            && let Op::Binary(Binary::Iadd, base, c) = self.func.insts[inst.index()].op
+            && let Some(imm) = super::fuse::const_of(self.func, &self.plan, c, |v| self.defs[v.index()])
+            && let Some(sum) = i64::from(off).checked_add(imm).and_then(|v| i32::try_from(v).ok())
+        {
+            return (base, sum);
+        }
+        (addr, off)
+    }
+
+    fn emit_vload_from(&mut self, lo: Value, dst: Vreg) -> bool {
+        let Some(inst) = self.defs[lo.index()] else { return false };
+        match self.func.insts[inst.index()].op {
+            Op::Load(addr, off) => {
+                let (addr, off) = self.unwrap_load_addr(addr, off);
+                if let Some((base, index, shift)) = self.sib_indexed(addr, off, 16) {
+                    self.asm.vload_indexed(16, dst, base, index, shift);
+                } else {
+                    let mem = self.address(addr, off);
+                    self.asm.vload(16, dst, mem);
+                }
+                true
+            }
+            Op::StackLoad(slot, off) => {
+                let mem = self.slot(slot, off);
+                self.asm.vload(16, dst, mem);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn try_elided_insert_pair(&mut self, vec: Value, val: Value, idx: u8, result: Value) -> Result<bool, String> {
+        if !self.plan.elided[vec.index()] {
+            return Ok(false);
+        }
+        let Some(inst0) = self.defs[vec.index()] else { return Ok(false) };
+        let Op::Insert(_, val_a, lane_a) = self.func.insts[inst0.index()].op else { return Ok(false) };
+        let spec = VecSpec::of(self.ty(result))?;
+        if spec.count != 2 || !matches!(spec.lane, Lane::I64 | Lane::F64) || lane_a + idx != 1 {
+            return Ok(false);
+        }
+        let (lo, hi) = if lane_a == 0 { (val_a, val) } else { (val, val_a) };
+        let dst = self.fdst(result);
+        if self.plan.elided[lo.index()] && self.plan.elided[hi.index()] && self.emit_vload_from(lo, dst) {
+            self.fput(result, dst);
+            return Ok(true);
+        }
+        if spec.lane == Lane::F64 {
+            let mut s_hi = self.fin(hi, V1);
+            if s_hi == dst {
+                self.asm.vmov(V2, s_hi);
+                s_hi = V2;
+            }
+            let s_lo = self.fin(lo, dst);
+            self.asm.vmov(dst, s_lo);
+            self.ins_elem(dst, 3, 1, s_hi, 0);
+        } else {
+            if self.plan.const_of(lo) == Some(0) {
+                self.asm.veor_zero(dst);
+            } else {
+                let s_lo = self.bits(lo, A);
+                self.asm.fmov_in(true, dst, s_lo);
+            }
+            if self.plan.const_of(hi) != Some(0) {
+                let s_hi = self.bits(hi, C);
+                self.ins_gpr(dst, 3, 1, s_hi);
+            }
+        }
+        self.fput(result, dst);
+        Ok(true)
+    }
+
+    fn vec_insert_opt(&mut self, vec: Value, val: Value, idx: u8, result: Value) -> Result<(), String> {
+        if self.try_elided_insert_pair(vec, val, idx, result)? {
+            return Ok(());
+        }
+        let spec = VecSpec::of(self.ty(vec))?;
+        if spec.count == 1
+            && let Some(word) = self.splat_movi_word(result)
+        {
+            let dst = self.fdst(result);
+            self.asm.word(word | u32::from(dst.0));
+            self.fput(result, dst);
+            return Ok(());
+        }
+        if idx == 0 && self.plan.const_of(vec) == Some(0) && matches!(spec.lane, Lane::I32 | Lane::I64) {
+            let dst = self.fdst(result);
+            if self.plan.const_of(val) == Some(0) {
+                self.asm.veor_zero(dst);
+            } else {
+                let s = self.bits(val, A);
+                self.asm.fmov_in(spec.lane == Lane::I64, dst, s);
+            }
+            self.fput(result, dst);
+            return Ok(());
+        }
+        self.vec_insert(vec, val, idx, result)
+    }
+
     pub(super) fn vector_inst(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<bool, String> {
         match *op {
             Op::Const(0) if self.ty(result()?).is_vector() => {
@@ -134,9 +246,18 @@ impl Emit<'_> {
                     self.fput(res, dst);
                 }
             }
-            Op::Shuffle(a, b, mask) => self.vec_shuffle(a, b, mask, result()?)?,
+            Op::Shuffle(a, b, mask) => {
+                let res = result()?;
+                if let Some(word) = self.splat_movi_word(res) {
+                    let dst = self.fdst(res);
+                    self.asm.word(word | u32::from(dst.0));
+                    self.fput(res, dst);
+                } else {
+                    self.vec_shuffle(a, b, mask, res)?;
+                }
+            }
             Op::Extract(vec, idx) => self.vec_extract(vec, idx, result()?)?,
-            Op::Insert(vec, val, idx) => self.vec_insert(vec, val, idx, result()?)?,
+            Op::Insert(vec, val, idx) => self.vec_insert_opt(vec, val, idx, result()?)?,
             Op::Reduce(rop, vec) => self.vec_reduce(rop, vec, result()?)?,
             Op::TargetOp(id, args) => self.vec_target_op(id, args, result()?)?,
             _ => return Ok(false),
