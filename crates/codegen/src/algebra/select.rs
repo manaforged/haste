@@ -255,7 +255,6 @@ fn is_non_zero_under(cx: &RewriteCx, v: Value, cmp: Option<(IntCC, Value, Value)
     let Some(inst) = cx.def(core) else { return false };
     match cx.func.insts[inst.index()].op {
         Op::Binary(Binary::Iadd, a, b) => add_non_zero(cx, (a, b), outer_disp, cmp),
-        Op::Convert(Convert::Bitcast, a) if outer_disp == 0 && cx.func.ty(a).bytes() == ty.bytes() => is_non_zero_under(cx, a, cmp, depth + 1),
         Op::Convert(Convert::Uextend | Convert::Sextend, a) if outer_disp == 0 && cx.func.ty(a).is_small_int() => is_non_zero_under(cx, a, cmp, depth + 1),
         Op::Select(_, a, b) if outer_disp == 0 => is_non_zero_under(cx, a, cmp, depth + 1) && is_non_zero_under(cx, b, cmp, depth + 1),
         _ => false,

@@ -347,14 +347,18 @@ pub fn case_reg_vec_self_ops(n: i64) -> i64 {
 fn peeled_sextend_zero(flag: bool, y: i8) -> i64 {
     let t = ((y | 1) as i64).wrapping_add(1);
     let sel = if flag { t } else { 0 };
-    if sel != 0 { 100 } else { 200 }
+    let is_nz = (sel != 0) as i64;
+    let is_eq = (sel == 0) as i64;
+    (is_nz * 100 + is_eq * 10).wrapping_add(sel.wrapping_mul(3))
 }
 
 #[inline(never)]
 fn peeled_uextend_zero(flag: bool, y: u8) -> i64 {
     let t = ((y | 1) as u64).wrapping_sub(1);
     let sel = if flag { t } else { 0 };
-    if sel != 0 { 30 } else { 40 }
+    let is_nz = (sel != 0) as i64;
+    let is_eq = (sel == 0) as i64;
+    (is_nz * 100 + is_eq * 10).wrapping_add(sel.wrapping_mul(3) as i64)
 }
 
 #[inline(never)]
@@ -362,15 +366,19 @@ fn peeled_select_zero(flag: bool, inner: bool, a: i64, b: i64) -> i64 {
     let nz = if inner { a | 1 } else { b | 2 };
     let shifted = nz.wrapping_sub(1);
     let sel = if flag { shifted } else { 0 };
-    if sel != 0 { 5 } else { 9 }
+    let is_nz = (sel != 0) as i64;
+    let is_eq = (sel == 0) as i64;
+    (is_nz * 100 + is_eq * 10).wrapping_add(sel.wrapping_mul(3))
 }
 
 #[inline(never)]
-fn peeled_bitcast_zero(flag: bool, bits: u32) -> i64 {
-    let f = f32::from_bits(bits | 1);
-    let back = (f.to_bits() as i32).wrapping_sub(1);
-    let sel = if flag { back } else { 0 };
-    if sel != 0 { 1 } else { 2 }
+fn peeled_sextend_select_zero(flag: bool, inner: bool, a: i8, b: i8) -> i64 {
+    let picked = if inner { a | 1 } else { b | 2 };
+    let t = (picked as i64).wrapping_add(1);
+    let sel = if flag { t } else { 0 };
+    let is_nz = (sel != 0) as i64;
+    let is_eq = (sel == 0) as i64;
+    (is_nz * 100 + is_eq * 10).wrapping_add(sel.wrapping_mul(3))
 }
 
 pub fn case_reg_peeled_nonzero_offset(n: i64) -> i64 {
@@ -378,8 +386,9 @@ pub fn case_reg_peeled_nonzero_offset(n: i64) -> i64 {
     let b = peeled_sextend_zero(black_box(true), black_box(n as i8));
     let c = peeled_uextend_zero(black_box(true), black_box(0_u8));
     let d = peeled_select_zero(black_box(true), black_box(true), black_box(0), black_box(n));
-    let e = peeled_bitcast_zero(black_box(true), black_box(0_u32));
-    a + b + c + d + e
+    let e = peeled_sextend_select_zero(black_box(true), black_box(true), black_box(-1_i8), black_box(n as i8));
+    let f = peeled_sextend_select_zero(black_box(false), black_box(true), black_box(-1_i8), black_box(n as i8));
+    a.wrapping_add(b).wrapping_add(c).wrapping_add(d).wrapping_add(e).wrapping_add(f)
 }
 
 struct CountDrop<'a>(&'a mut i64, i64);
