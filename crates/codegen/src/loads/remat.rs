@@ -228,7 +228,7 @@ fn validate_cand(ctx: &ScanCtx<'_>, raw: &RawCand, uses: &[usize]) -> Option<Pla
     if ctx.scan.hard_barriers[first_far_use] != ctx.scan.hard_barriers[raw.def_pos + 1] {
         return None;
     }
-    if has_clobber_between(ctx, raw, first_far_use) || !ptr_live_at_or_past(ctx, raw.ptr, first_far_use) {
+    if has_clobber_between(ctx, raw, first_far_use) {
         return None;
     }
     Some(Plan { def_pos: raw.def_pos, orig_val: raw.val, ptr: raw.ptr, off: raw.off, ty: raw.ty, last_near_use, first_far_use })
@@ -315,29 +315,45 @@ fn apply_insertions(func: &mut Function, block: Block, insertions: Vec<Insertion
     func.blocks[block.index()].insts = out;
 }
 
+fn plan_survives(ctx: &ScanCtx<'_>, plans: &[Plan], i: usize) -> bool {
+    let plan = &plans[i];
+    if ptr_live_at_or_past(ctx, plan.ptr, plan.first_far_use) {
+        return true;
+    }
+    plans.iter().enumerate().any(|(j, other)| {
+        j != i
+            && other.orig_val != plan.orig_val
+            && other.ptr == plan.ptr
+            && plan.last_near_use.max(other.last_near_use) < plan.first_far_use.min(other.first_far_use)
+    })
+}
+
 fn plan_block(func: &Function, prov: &Provenance, all_uses: &[u32], insts: &[Inst]) -> Vec<Insertion> {
     let scan = scan_block(func, insts);
     if scan.raw_cands.is_empty() {
         return Vec::new();
     }
     let ctx = ScanCtx { func, prov, insts, all_uses, scan: &scan };
-    let plans: Vec<Plan> = scan
+    let mut plans: Vec<Plan> = scan
         .raw_cands
         .iter()
         .zip(&scan.cand_uses)
         .filter_map(|(raw, uses)| validate_cand(&ctx, raw, uses))
         .collect();
+    let keep: Vec<bool> = (0..plans.len()).map(|i| plan_survives(&ctx, &plans, i)).collect();
+    let mut idx = 0_usize;
+    plans.retain(|_| {
+        let ok = keep[idx];
+        idx += 1;
+        ok
+    });
     if plans.is_empty() {
         return Vec::new();
     }
     group_insertions(plans, &scan.def_prefix)
 }
 
-/// Splits long same-block scalar load live ranges across barrier-free instruction chasms by rematerializing before distant uses.
-pub(super) fn split_long_loads(func: &mut Function, prov: &Provenance) -> bool {
-    if !func.blocks.iter().any(|b| b.insts.len() >= MIN_BLOCK_INSTS) {
-        return false;
-    }
+fn split_long_loads_round(func: &mut Function, prov: &Provenance) -> bool {
     let all_uses = func.use_counts();
     let mut changed = false;
     for b_idx in 0..func.blocks.len() {
@@ -349,6 +365,22 @@ pub(super) fn split_long_loads(func: &mut Function, prov: &Provenance) -> bool {
             apply_insertions(func, Block(b_idx as u32), insertions);
             changed = true;
         }
+    }
+    changed
+}
+
+/// Splits long same-block scalar load live ranges across barrier-free instruction chasms by rematerializing before distant uses.
+pub(super) fn split_long_loads(func: &mut Function, prov: &Provenance) -> bool {
+    const MAX_SPLIT_ROUNDS: usize = 4;
+    if !func.blocks.iter().any(|b| b.insts.len() >= MIN_BLOCK_INSTS) {
+        return false;
+    }
+    let mut changed = false;
+    for _ in 0..MAX_SPLIT_ROUNDS {
+        if !split_long_loads_round(func, prov) {
+            break;
+        }
+        changed = true;
     }
     changed
 }
