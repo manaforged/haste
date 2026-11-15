@@ -188,6 +188,9 @@ fn plan_add_rewrite(ctx: &ReassocCtx<'_>, mut chain: AddChain, blk: Block, ty: T
     chain.terms.sort_by_key(|&(v, neg)| (term_rank(ctx, v), neg));
     let matched = masked_const != 0 && try_reuse_const_add(ctx, &mut chain, blk, masked_const);
     if matched {
+        if chain.terms.len() <= 1 {
+            return None;
+        }
         masked_const = 0;
         chain.terms.sort_by_key(|&(v, neg)| (term_rank(ctx, v), neg));
     }
