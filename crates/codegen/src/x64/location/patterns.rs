@@ -4,7 +4,7 @@ use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 use crate::live::{Sib, SibBase};
 
-pub(super) const FOLD_LIMIT: i64 = 1 << 24;
+pub(super) use crate::tailrec::FOLD_LIMIT;
 
 pub(super) struct SibMatch {
     pub(super) sib: Sib,
