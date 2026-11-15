@@ -1,7 +1,7 @@
 use super::asm::{Cond, Fop, Funary, Reg, Size, Vreg, ZR};
 use super::vector_ops::{
-    NEON_AND, NEON_BSL, NEON_DUP_GPR, NEON_DUP_GPR_2D, NEON_EOR, NEON_ORR, NEON_REV16, NEON_REV32, NEON_REV64, NEON_SMAX,
-    NEON_SMIN, NEON_SUB, NEON_SUB_1D, NEON_UMAX, NEON_UMIN, NEON_USHL, NEON_USHL_1D,
+    NEON_AND, NEON_BSL, NEON_DUP_GPR_2D, NEON_EOR, NEON_ORR, NEON_REV16, NEON_REV32, NEON_REV64, NEON_SMAX, NEON_SMIN, NEON_SUB, NEON_SUB_1D, NEON_UMAX,
+    NEON_UMIN, NEON_USHL, NEON_USHL_1D,
 };
 use super::{A, C, D, Emit, S, V0, V1};
 use crate::cse::flip_int_cc;
@@ -103,40 +103,61 @@ impl Emit<'_> {
         self.asm.vbit(NEON_BSL | (q << 30), out, x, y);
     }
 
-    fn splat_const(&self, value: Value) -> Option<i64> {
-        let inst = self.defs[value.index()]?;
-        let mut cur = &self.func.insts[inst.index()].op;
-        if let Op::Shuffle(a, b, ShuffleMask::Const(m)) = cur {
-            let Type::Vec { count, .. } = self.ty(value) else { return None };
-            let count = usize::from(count);
-            let first = m[0];
-            if usize::from(first) >= 2 * count || !m[..count].iter().all(|&x| x == first) {
-                return None;
-            }
-            let src = if usize::from(first) < count { *a } else { *b };
-            if self.plan.const_of(src) == Some(0) {
-                return Some(0);
-            }
-            cur = &self.func.insts[self.defs[src.index()]?.index()].op;
-            if let Op::Insert(_, scalar, idx) = *cur
-                && usize::from(idx) == usize::from(first) % count
-            {
-                return self.plan.const_of(scalar);
-            }
-            return None;
-        }
-        if let Op::Insert(_, scalar, 0) = *cur
-            && matches!(self.ty(value), Type::Vec { count: 1, .. })
-        {
-            return self.plan.const_of(scalar);
-        }
-        None
+    pub(super) fn const_bits(&self, val: Value) -> Option<i64> {
+        super::fuse::const_of(self.func, &self.plan, val, |v| self.defs[v.index()])
     }
 
-    fn splat_movi_word(&self, value: Value) -> Option<u32> {
-        let spec = VecSpec::of(self.ty(value)).ok()?;
-        let imm = self.splat_const(value)?;
-        super::fuse::encode_neon_movi(spec.q, super::fuse::splat_pattern64(spec.lane, imm))
+    fn eval_shuffle_bytes(&self, (a, b, m): (Value, Value, [u8; 16]), spec: VecSpec, depth: u8) -> [Option<u8>; 16] {
+        let (eb, count) = (spec.lane.bytes() as usize, usize::from(spec.count));
+        let (ba, bb, mut out) = (self.eval_vec_bytes(a, depth), self.eval_vec_bytes(b, depth), [None; 16]);
+        for (i, &sel) in m[..count].iter().enumerate() {
+            let src = if sel < spec.count { Some(&ba[usize::from(sel) * eb..]) } else if sel < 2 * spec.count { Some(&bb[usize::from(sel - spec.count) * eb..]) } else { None };
+            if let Some(s) = src { out[i * eb..(i + 1) * eb].copy_from_slice(&s[..eb]); }
+        }
+        out
+    }
+
+    fn eval_vec_bytes(&self, val: Value, depth: u8) -> [Option<u8>; 16] {
+        let ty = self.ty(val);
+        if let Some(imm) = self.const_bits(val) {
+            if ty.is_vector() { return if imm == 0 { [Some(0); 16] } else { [None; 16] }; }
+            let mut out = [None; 16];
+            if ty.is_small_int() || ty.is_float() {
+                for (dst, &byte) in out[..ty.bytes() as usize].iter_mut().zip(&(imm as u64).to_le_bytes()) { *dst = Some(byte); }
+            }
+            return out;
+        }
+        let Some(inst) = (depth > 0).then(|| self.defs[val.index()]).flatten() else { return [None; 16] };
+        match self.func.insts[inst.index()].op {
+            Op::Convert(Convert::Bitcast, inner) if self.ty(inner).bytes() == ty.bytes() => self.eval_vec_bytes(inner, depth - 1),
+            Op::Insert(vec, scalar, idx) => {
+                let Ok(spec) = VecSpec::of(ty) else { return [None; 16] };
+                if idx >= spec.count { return [None; 16]; }
+                let (mut out, sb, eb) = (self.eval_vec_bytes(vec, depth - 1), self.eval_vec_bytes(scalar, depth - 1), spec.lane.bytes() as usize);
+                out[usize::from(idx) * eb..usize::from(idx) * eb + eb].copy_from_slice(&sb[..eb]);
+                out
+            }
+            Op::Shuffle(a, b, ShuffleMask::Const(m)) => VecSpec::of(ty).map_or([None; 16], |spec| self.eval_shuffle_bytes((a, b, m), spec, depth - 1)),
+            _ => [None; 16],
+        }
+    }
+
+    pub(super) fn eval_vec_full(&self, val: Value) -> Option<(bool, u64, u64)> {
+        let (bytes, total, mut raw) = (self.eval_vec_bytes(val, 5), self.ty(val).bytes() as usize, [0_u8; 16]);
+        for (dst, &src) in raw[..total].iter_mut().zip(&bytes[..total]) { *dst = src?; }
+        Some((total == 16, u64::from_le_bytes(raw[..8].try_into().ok()?), u64::from_le_bytes(raw[8..].try_into().ok()?)))
+    }
+
+    pub(super) fn splat_const_lane(&self, val: Value) -> Option<i64> {
+        let Ok(spec) = VecSpec::of(self.ty(val)) else { return None };
+        let (full, lo, hi) = self.eval_vec_full(val)?;
+        let (eb, total, mut bytes, mut raw) = (spec.lane.bytes() as usize, if full { 16 } else { 8 }, [0_u8; 16], [0_u8; 8]);
+        bytes[..8].copy_from_slice(&lo.to_le_bytes());
+        bytes[8..].copy_from_slice(&hi.to_le_bytes());
+        let first = &bytes[..eb];
+        if (1..total / eb).any(|i| &bytes[i * eb..(i + 1) * eb] != first) { return None; }
+        raw[..eb].copy_from_slice(first);
+        Some(u64::from_le_bytes(raw) as i64)
     }
 
     fn unwrap_load_addr(&self, addr: Value, off: i32) -> (Value, i32) {
@@ -191,6 +212,9 @@ impl Emit<'_> {
             return Ok(true);
         }
         if spec.lane == Lane::F64 {
+            if self.try_emit_const_vec_imm(result) {
+                return Ok(true);
+            }
             let mut s_hi = self.fin(hi, V1);
             if s_hi == dst {
                 self.asm.vmov(V2, s_hi);
@@ -201,16 +225,7 @@ impl Emit<'_> {
             self.asm.vmov(dst, s_lo);
             self.ins_elem(dst, 3, 1, s_hi, 0);
         } else {
-            if self.plan.const_of(lo) == Some(0) {
-                self.asm.veor_zero(dst);
-            } else {
-                let s_lo = self.bits(lo, A);
-                self.asm.fmov_in(true, dst, s_lo);
-            }
-            if self.plan.const_of(hi) != Some(0) {
-                let s_hi = self.bits(hi, C);
-                self.ins_gpr(dst, 3, 1, s_hi);
-            }
+            self.emit_insert_i64_pair(dst, lo, hi);
         }
         self.fput(result, dst);
         Ok(true)
@@ -221,23 +236,7 @@ impl Emit<'_> {
             return Ok(());
         }
         let spec = VecSpec::of(self.ty(vec))?;
-        if spec.count == 1
-            && let Some(word) = self.splat_movi_word(result)
-        {
-            let dst = self.fdst(result);
-            self.asm.word(word | u32::from(dst.0));
-            self.fput(result, dst);
-            return Ok(());
-        }
-        if idx == 0 && self.plan.const_of(vec) == Some(0) && matches!(spec.lane, Lane::I32 | Lane::I64) {
-            let dst = self.fdst(result);
-            if self.plan.const_of(val) == Some(0) {
-                self.asm.veor_zero(dst);
-            } else {
-                let s = self.bits(val, A);
-                self.asm.fmov_in(spec.lane == Lane::I64, dst, s);
-            }
-            self.fput(result, dst);
+        if self.try_vec_insert_const(vec, val, idx, spec, result) {
             return Ok(());
         }
         self.vec_insert(vec, val, idx, result)
@@ -255,11 +254,7 @@ impl Emit<'_> {
             }
             Op::Shuffle(a, b, mask) => {
                 let res = result()?;
-                if let Some(word) = self.splat_movi_word(res) {
-                    let dst = self.fdst(res);
-                    self.asm.word(word | u32::from(dst.0));
-                    self.fput(res, dst);
-                } else {
+                if !self.try_emit_const_vec_imm(res) {
                     self.vec_shuffle(a, b, mask, res)?;
                 }
             }
@@ -429,9 +424,9 @@ impl Emit<'_> {
                 }
             }
             Binary::Ishl | Binary::Ushr | Binary::Sshr => {
-                if self.plan.const_of(y) == Some(0) {
+                if self.is_vec_zero(y) {
                     self.asm.vmov(dst, a);
-                } else if let Some(imm) = self.splat_const(y) {
+                } else if let Some(imm) = self.splat_const_lane(y) {
                     self.vec_shift_imm(spec, op, imm, dst, a);
                 } else if op == Binary::Ishl {
                     let base = if spec.is_1d() { NEON_USHL_1D } else { NEON_USHL | (spec.q << 30) | (spec.size << 22) };
@@ -448,18 +443,7 @@ impl Emit<'_> {
                     self.asm.vbit(base, dst, a, V2);
                 }
             }
-            Binary::Fcopysign => {
-                let sign = if spec.lane == Lane::F64 { i64::MIN } else { 0x8000_0000_u32 as i64 };
-                self.asm.mov_imm(A, sign);
-                self.clobber_reg(A);
-                self.clobber_vreg(V2);
-                self.clobber_vreg(V3);
-                let dup_imm5 = if spec.lane == Lane::F64 { 8 } else { 4 };
-                self.asm.word(NEON_DUP_GPR | (dup_imm5 << 16) | u32::from(A.0) << 5 | u32::from(V2.0));
-                self.asm.vmov(V3, a);
-                self.asm.vbit(0x2EA0_1C00 | (spec.q << 30), V3, b, V2);
-                self.asm.vmov(dst, V3);
-            }
+            Binary::Fcopysign => self.vec_fcopysign(spec, dst, a, b),
             Binary::Fadd | Binary::Fsub | Binary::Fmul | Binary::Fdiv | Binary::Fmin | Binary::Fmax if spec.is_1d() => match op {
                 Binary::Fadd => self.asm.fop(Fop::Add, true, dst, a, b),
                 Binary::Fsub => self.asm.fop(Fop::Sub, true, dst, a, b),
@@ -535,7 +519,7 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn vec_shift_imm(&mut self, spec: VecSpec, op: Binary, imm: i64, dst: Vreg, src: Vreg) {
+    pub(super) fn vec_shift_imm(&mut self, spec: VecSpec, op: Binary, imm: i64, dst: Vreg, src: Vreg) {
         let esize = spec.lane.bits();
         let shift = (imm as u32) & (esize - 1);
         if shift == 0 {
@@ -554,8 +538,8 @@ impl Emit<'_> {
         self.v_two(base | (enc_imm << 16), dst, src);
     }
 
-    fn is_vec_zero(&self, value: Value) -> bool {
-        self.plan.const_of(value) == Some(0) || self.splat_const(value) == Some(0)
+    pub(super) fn is_vec_zero(&self, value: Value) -> bool {
+        self.plan.const_of(value) == Some(0) || self.eval_vec_full(value).is_some_and(|(_, lo, hi)| lo == 0 && hi == 0)
     }
 
     pub(super) fn vec_icmp(&mut self, cc: IntCC, x: Value, y: Value, result: Value) -> Result<(), String> {
@@ -748,10 +732,7 @@ impl Emit<'_> {
                     let src = self.fin(x, dst);
                     self.asm.vmov(dst, src);
                 }
-                Type::I64 => {
-                    let src = self.bits(x, A);
-                    self.asm.fmov_in(true, dst, src);
-                }
+                Type::I64 => self.emit_vec_from_i64(dst, x),
                 Type::I128 => {
                     self.raw(A, x);
                     self.high(C, x);

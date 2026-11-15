@@ -384,7 +384,7 @@ fn byte_bitmask64(v: u64) -> Option<u8> {
     Some(mask)
 }
 
-pub(in super::super) fn splat_pattern64(lane: Lane, imm: i64) -> u64 {
+fn splat_pattern64(lane: Lane, imm: i64) -> u64 {
     let raw = imm as u64;
     match lane {
         Lane::I8 => u64::from(raw as u8) * 0x0101_0101_0101_0101,
