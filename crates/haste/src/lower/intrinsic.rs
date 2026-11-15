@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{AbiParam, CallConv, FloatCC, IntCC, Signature, Type, Value};
+use haste_codegen::{AbiParam, Arch, CallConv, FloatCC, IntCC, Signature, Target, Type, Value};
 
 use crate::body::BinOp;
 use crate::host::HostSymbol;
@@ -42,6 +42,12 @@ impl Lower<'_, '_> {
                 self.ins().assume(cond);
                 Ok(None)
             }
+            _ => self.extra_intrinsic(origin, which, substs, args),
+        }
+    }
+
+    fn extra_intrinsic(&mut self, origin: &SiteOrigin, which: Intrinsic, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+        match which {
             Intrinsic::CatchUnwind => self.catch_unwind(args).map(Some),
             Intrinsic::CallerLocation => self.caller_location().map(Some),
             Intrinsic::Cpuid => self.cpuid(args).map(Some),
@@ -53,6 +59,7 @@ impl Lower<'_, '_> {
             Intrinsic::Sqdmulh(ty) => self.sqdmulh_vec(ty, args).map(Some),
             Intrinsic::TargetOp { id, ty } => self.target_vector(id, ty, args).map(Some),
             Intrinsic::X86(x86) => self.host_vector(x86, args).map(Some),
+            Intrinsic::CompareBytes => self.compare_const_bytes(origin, substs, args),
             _ => self.memory_intrinsic(origin, which, substs, args),
         }
     }
@@ -121,6 +128,7 @@ impl Lower<'_, '_> {
         Ok(match (from, to, value) {
             (_, Repr::Zst, _) | (Repr::Zst, _, _) | (_, _, None) => None,
             (Repr::Scalar(a), Repr::Scalar(b), Some(value)) if a == b => Some(value),
+            (Repr::Scalar(a), Repr::Scalar(b), Some(value)) if can_bitcast(a, b) => Some(self.ins().bitcast(b, value)),
             (Repr::Mem { .. }, Repr::Mem { .. }, Some(address)) => Some(address),
             (Repr::Mem { .. }, Repr::Scalar(ty), Some(address)) => Some(self.ins().load(ty, address, 0)),
             (Repr::Scalar(ty), _, Some(value)) => {
@@ -179,9 +187,7 @@ impl Lower<'_, '_> {
         match whole {
             Repr::Zst => Ok(None),
             Repr::Scalar(_) => Ok(Some(self.ins().select(cond, yes, no))),
-            Repr::Mem { .. } => {
-                let layout = self.cx.layout(ty)?;
-                let parts = super::abi::copied_parts(&layout);
+            Repr::Mem { parts, .. } => {
                 let Some(slot) = self.slot(whole) else { return Ok(None) };
                 let out = self.ins().stack_addr(Type::I64, slot, 0);
                 let mut pick = |m: Type, at: i32| {
@@ -287,4 +293,28 @@ impl Lower<'_, '_> {
         let up = self.ins().fcmp(FloatCC::GreaterThanOrEqual, distance, half);
         Ok(self.ins().select(up, away, whole))
     }
+
+    fn compare_const_bytes(&mut self, origin: &SiteOrigin, substs: &[Ty], args: &[Value]) -> Result<Option<Value>> {
+        let &[x, y, count] = args else {
+            return self.memory_intrinsic(origin, Intrinsic::CompareBytes, substs, args);
+        };
+        let ty = match self.b.const_int(count) {
+            Some(2) if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Type::I16,
+            Some(4) if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Type::I32,
+            Some(8) if matches!(Target::host().arch, Arch::X64 | Arch::Arm64) => Type::I64,
+            _ => return self.memory_intrinsic(origin, Intrinsic::CompareBytes, substs, args),
+        };
+        let (a, b) = (self.ins().load(ty, x, 0), self.ins().load(ty, y, 0));
+        let (a, b) = (self.ins().bswap(a), self.ins().bswap(b));
+        let (lt, gt) = (self.ins().icmp(IntCC::UnsignedLessThan, a, b), self.ins().icmp(IntCC::UnsignedGreaterThan, a, b));
+        let diff = self.ins().isub(gt, lt);
+        Ok(Some(self.ins().sextend(Type::I32, diff)))
+    }
+}
+
+fn can_bitcast(a: Type, b: Type) -> bool {
+    a.bytes() == b.bytes()
+        && ((a.bytes() == 8 && (a.is_vector() || matches!(a, Type::F64 | Type::I64)) && (b.is_vector() || matches!(b, Type::F64 | Type::I64)))
+            || matches!((a, b), (Type::F32 | Type::I32, Type::F32 | Type::I32))
+            || (a.is_vector() && b.is_vector()))
 }
