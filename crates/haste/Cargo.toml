@@ -1,9 +1,10 @@
 [package]
 name = "haste"
-version = "0.0.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 publish = false
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow = "1"

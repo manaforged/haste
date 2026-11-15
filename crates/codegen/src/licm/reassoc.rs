@@ -352,14 +352,13 @@ pub(super) fn reassociate_loop_adds(
     is_const: &mut Vec<bool>,
 ) -> bool {
     let uses = func.use_counts();
-    let mut defs = vec![None; func.types.len()];
+    let defs = crate::fold::defs(func);
     let mut consts = vec![None; func.types.len()];
-    for (idx, data) in func.insts.iter().enumerate() {
-        if let Some(res) = data.result {
-            defs[res.index()] = Some(Inst(idx as u32));
-        }
-        if let (&Op::Const(imm), Some(res)) = (&data.op, data.result) {
-            consts[res.index()] = Some(imm);
+    for (idx, &inst) in defs.iter().enumerate() {
+        if let Some(inst) = inst
+            && let Op::Const(imm) = func.insts[inst.index()].op
+        {
+            consts[idx] = Some(imm);
         }
     }
     let rpo_rank = Cfg::ranks(&cfg.rpo, func.blocks.len());

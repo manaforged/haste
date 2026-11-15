@@ -1,8 +1,9 @@
 use crate::cse::flip_int_cc;
+use crate::fold::{extend, non_null_at};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
-use super::icmp::{ADDR_SPAN, three_way_non_zero};
-use super::{RewriteCx, is_non_null_addr};
+use super::icmp::{ADDR_SPAN, before, emit_cond_truth, null_test, three_way_non_zero};
+use super::RewriteCx;
 
 pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Value, t: Value, f: Value) -> Option<Op> {
     let given = (t, f);
@@ -55,21 +56,176 @@ pub(super) fn tested_select(cx: &RewriteCx, cond: Value) -> Option<(Value, bool)
     if !ty.is_small_int() || !cx.func.ty(test).is_small_int() {
         return None;
     }
-    if cx.uconst(f, ty) == Some(0) && is_non_zero(cx, t, 0) {
+    if cx.uconst(f, ty) == Some(0) && is_non_zero_under(cx, t, unwrap_cond_cmp(cx, test, true), 0) {
         Some((test, true))
-    } else if cx.uconst(t, ty) == Some(0) && is_non_zero(cx, f, 0) {
+    } else if cx.uconst(t, ty) == Some(0) && is_non_zero_under(cx, f, unwrap_cond_cmp(cx, test, false), 0) {
         Some((test, false))
     } else {
         None
     }
 }
 
-fn reach(cx: &RewriteCx, v: Value) -> u64 {
+fn unwrap_cond_cmp(cx: &RewriteCx, mut raw: Value, mut taken: bool) -> Option<(IntCC, Value, Value)> {
+    for _ in 0..4 {
+        raw = cx.unwrap_uextend(raw);
+        if let Some(&Op::Binary(Binary::Bxor, a, b)) = cx.op(raw)
+            && cx.func.ty(raw).is_small_int()
+        {
+            let next = [(a, b), (b, a)].into_iter().find_map(|(inner, mask)| {
+                (cx.uconst(mask, cx.func.ty(mask)) == Some(1) && cx.is_unit_bool(inner)).then_some(inner)
+            });
+            if let Some(inner) = next {
+                (raw, taken) = (inner, !taken);
+                continue;
+            }
+        }
+        break;
+    }
+    let &Op::Icmp(cc, a, b) = cx.op(raw)? else { return None };
+    cx.func.ty(a).is_small_int().then_some((if taken { cc } else { cc.inverse() }, a, b))
+}
+
+fn cond_upper_bound(cx: &RewriteCx, (eff, a, b): (IntCC, Value, Value)) -> Option<(Value, u64)> {
+    let ty = cx.func.ty(a);
+    let (w, sign) = (ty.unsigned_max(), 1_u64 << (ty.bits() - 1));
+    let non_neg = |v: Value| (cx.known(v).0 & sign) != 0;
+    for (norm, mut var, lim) in [(eff, a, b), (flip_int_cc(eff), b, a)] {
+        if cx.sconst(var).is_some() {
+            continue;
+        }
+        let lim_hi = w & !cx.known(lim).0;
+        let both_nn = non_neg(var) && non_neg(lim);
+        let bound = match norm {
+            IntCC::UnsignedLessThan => lim_hi.checked_sub(1),
+            IntCC::UnsignedLessThanOrEqual | IntCC::Equal => Some(lim_hi),
+            IntCC::SignedLessThan if both_nn => lim_hi.checked_sub(1),
+            IntCC::SignedLessThanOrEqual if both_nn => Some(lim_hi),
+            _ => None,
+        };
+        if let Some(mut hi) = bound {
+            while let Some(&Op::Convert(Convert::Uextend, inner)) = cx.op(var) {
+                if !cx.func.ty(inner).is_small_int() {
+                    break;
+                }
+                var = inner;
+                hi = hi.min(cx.func.ty(var).unsigned_max());
+            }
+            return Some((var, hi));
+        }
+    }
+    None
+}
+
+fn cond_proves_nonzero(cx: &RewriteCx, (eff, a, b): (IntCC, Value, Value), v: Value) -> bool {
+    let ty = cx.func.ty(a);
+    let sign = 1_u64 << (ty.bits() - 1);
+    [(eff, a, b), (flip_int_cc(eff), b, a)].into_iter().any(|(norm, var, lim)| {
+        let same = var == v || matches!(cx.op(var), Some(&Op::Convert(Convert::Uextend, inner)) if inner == v);
+        if !same {
+            return false;
+        }
+        match norm {
+            IntCC::UnsignedGreaterThan => true,
+            IntCC::NotEqual => cx.uconst(lim, ty) == Some(0),
+            IntCC::Equal | IntCC::UnsignedGreaterThanOrEqual => cx.known(lim).1 != 0,
+            IntCC::SignedGreaterThan => (cx.known(var).0 & sign) != 0 && (cx.known(lim).0 & sign) != 0,
+            _ => false,
+        }
+    })
+}
+
+fn cond_offset_bound(cx: &RewriteCx, v: Value, bound: Option<(Value, u64)>, depth: u8) -> u64 {
     let ty = cx.func.ty(v);
-    let bound = |x: Value| ty.unsigned_max() & !cx.known(x).0;
-    match cx.op(v) {
-        Some(&Op::Binary(Binary::Imul, x, y)) => [(x, y), (y, x)].into_iter().find_map(|(x, k)| bound(x).checked_mul(cx.uconst(k, ty)?)).unwrap_or(u64::MAX),
-        _ => bound(v),
+    if !ty.is_small_int() {
+        return u64::MAX;
+    }
+    let w = ty.unsigned_max();
+    let mut hi = w & !cx.known(v).0;
+    if let Some((bv, bmax)) = bound
+        && bv == v
+    {
+        hi = hi.min(bmax);
+    }
+    if depth >= 4 {
+        return hi;
+    }
+    let sub = match cx.op(v) {
+        Some(&Op::Convert(Convert::Uextend, a)) => cond_offset_bound(cx, a, bound, depth + 1),
+        Some(&Op::Binary(Binary::Band, a, b)) => {
+            cond_offset_bound(cx, a, bound, depth + 1).min(cond_offset_bound(cx, b, bound, depth + 1))
+        }
+        Some(&Op::Binary(Binary::Ishl, a, sh)) => cx
+            .sconst(sh)
+            .filter(|&k| (0..i64::from(ty.bits())).contains(&k))
+            .and_then(|k| cond_offset_bound(cx, a, bound, depth + 1).checked_mul(1_u64 << (k as u32)))
+            .filter(|&n| n <= w)
+            .unwrap_or(u64::MAX),
+        Some(&Op::Binary(Binary::Imul, a, b)) => [(a, b), (b, a)]
+            .into_iter()
+            .find_map(|(x, k)| {
+                let c = cx.uconst(k, ty)?;
+                cond_offset_bound(cx, x, bound, depth + 1).checked_mul(c).filter(|&n| n <= w)
+            })
+            .unwrap_or(u64::MAX),
+        Some(&Op::Binary(Binary::Iadd, a, b)) => cond_offset_bound(cx, a, bound, depth + 1)
+            .checked_add(cond_offset_bound(cx, b, bound, depth + 1))
+            .filter(|&n| n <= w)
+            .unwrap_or(u64::MAX),
+        _ => u64::MAX,
+    };
+    hi.min(sub)
+}
+
+fn peel_const_base(cx: &RewriteCx, mut v: Value) -> (Value, i64) {
+    let mut disp = 0_i64;
+    for _ in 0..4 {
+        match cx.op(v) {
+            Some(&Op::Convert(Convert::Bitcast, a)) if cx.func.ty(a) == cx.func.ty(v) => v = a,
+            Some(&Op::Binary(Binary::Iadd, a, b)) => {
+                let step = [(a, b), (b, a)].into_iter().find_map(|(base, k)| Some((base, disp.checked_add(cx.sconst(k)?)?)));
+                let Some((base, next)) = step else { break };
+                (v, disp) = (base, next);
+            }
+            Some(&Op::Binary(Binary::Isub, a, b)) => {
+                let Some(next) = cx.sconst(b).and_then(i64::checked_neg).and_then(|c| disp.checked_add(c)) else { break };
+                (v, disp) = (a, next);
+            }
+            _ => break,
+        }
+    }
+    (v, disp)
+}
+
+fn deref_span_covers(cx: &RewriteCx, root: Value, lo_disp: i64, hi_disp: i64) -> bool {
+    if cx.func.ty(root) != Type::I64 {
+        return false;
+    }
+    cx.out.iter().rev().take(64).any(|&inst| {
+        let data = &cx.func.insts[inst.index()];
+        let (addr, off, bytes) = match data.op {
+            Op::Load(addr, off) => (addr, off, data.result.map_or(0, |r| cx.func.ty(r).bytes())),
+            Op::Store(val, addr, off) => (addr, off, cx.func.ty(val).bytes()),
+            _ => return false,
+        };
+        let (aroot, adisp) = peel_const_base(cx, addr);
+        bytes != 0
+            && aroot == root
+            && adisp
+                .checked_add(i64::from(off))
+                .and_then(|lo| Some((lo, lo.checked_add(i64::from(bytes))?)))
+                .is_some_and(|(lo, hi)| lo <= lo_disp && hi_disp < hi)
+    })
+}
+
+fn valid_ptr_span(cx: &RewriteCx, root: Value, base_disp: i64, off_max: u64) -> bool {
+    let Ok(off_s) = i64::try_from(off_max) else { return false };
+    let Some(hi_disp) = base_disp.checked_add(off_s) else { return false };
+    match cx.op(root) {
+        Some(Op::StackAddr(..) | Op::SlotAddr(_)) => (-ADDR_SPAN..=ADDR_SPAN).contains(&base_disp) && (-ADDR_SPAN..=ADDR_SPAN).contains(&hi_disp),
+        Some(Op::Symbol(_)) => base_disp >= 0 && hi_disp <= ADDR_SPAN,
+        _ => cx.func.ty(root) == Type::I64
+            && ((base_disp >= 0 && (hi_disp as u64) < u64::from(entry_deref_bytes(cx, root)))
+                || deref_span_covers(cx, root, base_disp, hi_disp)),
     }
 }
 
@@ -105,28 +261,45 @@ fn entry_deref_bytes(cx: &RewriteCx, v: Value) -> u32 {
 }
 
 pub(super) fn is_non_zero(cx: &RewriteCx, v: Value, depth: u8) -> bool {
+    is_non_zero_under(cx, v, None, depth)
+}
+
+fn add_non_zero(cx: &RewriteCx, (a, b): (Value, Value), outer_disp: i64, cmp: Option<(IntCC, Value, Value)>) -> bool {
+    let bound = cmp.and_then(|c| cond_upper_bound(cx, c));
+    [(a, b), (b, a)].into_iter().any(|(base, off_v)| {
+        let (root, base_disp) = peel_const_base(cx, base);
+        base_disp
+            .checked_add(outer_disp)
+            .is_some_and(|disp| valid_ptr_span(cx, root, disp, cond_offset_bound(cx, off_v, bound, 0)))
+    })
+}
+
+fn known_non_zero(cx: &RewriteCx, v: Value, cmp: Option<(IntCC, Value, Value)>) -> bool {
+    non_null_at(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), before(cx), v)
+        || cx.known(v).1 != 0
+        || entry_deref_bytes(cx, v) > 0
+        || three_way_non_zero(cx, v)
+        || cmp.is_some_and(|c| cond_proves_nonzero(cx, c, v))
+}
+
+fn is_non_zero_under(cx: &RewriteCx, v: Value, cmp: Option<(IntCC, Value, Value)>, depth: u8) -> bool {
     let ty = cx.func.ty(v);
     if depth >= 4 || !ty.is_small_int() {
         return false;
     }
-    if is_non_null_addr(cx.func, &|x| cx.def(x), &|x| cx.sconst(x), v, 0) || cx.known(v).1 != 0 {
+    if known_non_zero(cx, v, cmp) {
         return true;
     }
-    if entry_deref_bytes(cx, v) > 0 || three_way_non_zero(cx, v) {
+    let (core, outer_disp) = peel_const_base(cx, v);
+    if outer_disp != 0 && valid_ptr_span(cx, core, outer_disp, 0) {
         return true;
     }
-    let Some(inst) = cx.def(v) else { return false };
+    let Some(inst) = cx.def(core) else { return false };
     match cx.func.insts[inst.index()].op {
-        Op::Binary(Binary::Iadd, a, b) => [(a, b), (b, a)].into_iter().any(|(base, off_v)| {
-            let fixed = matches!(cx.op(base), Some(Op::Symbol(_) | Op::SlotAddr(_)));
-            (fixed && reach(cx, off_v) <= ADDR_SPAN as u64)
-                || cx.sconst(off_v).is_some_and(|c| c >= 0 && (c as u64) < u64::from(entry_deref_bytes(cx, base)))
-        }),
-        Op::Convert(Convert::Bitcast, a) if cx.func.ty(a).bytes() == ty.bytes() => is_non_zero(cx, a, depth + 1),
-        Op::Convert(Convert::Uextend | Convert::Sextend, a) if cx.func.ty(a).is_small_int() => {
-            is_non_zero(cx, a, depth + 1)
-        }
-        Op::Select(_, a, b) => is_non_zero(cx, a, depth + 1) && is_non_zero(cx, b, depth + 1),
+        Op::Binary(Binary::Iadd, a, b) => add_non_zero(cx, (a, b), outer_disp, cmp),
+        Op::Convert(Convert::Bitcast, a) if cx.func.ty(a).bytes() == ty.bytes() => is_non_zero_under(cx, a, cmp, depth + 1),
+        Op::Convert(Convert::Uextend | Convert::Sextend, a) if cx.func.ty(a).is_small_int() => is_non_zero_under(cx, a, cmp, depth + 1),
+        Op::Select(_, a, b) => is_non_zero_under(cx, a, cmp, depth + 1) && is_non_zero_under(cx, b, cmp, depth + 1),
         _ => false,
     }
 }
@@ -222,6 +395,37 @@ fn eval_const_select_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: V
     None
 }
 
+#[derive(Clone, Copy)]
+enum ArmRel {
+    EqK,
+    NeqK,
+    Unknown,
+}
+
+fn cmp_target(cc: IntCC, ty: Type, k_s: i64) -> Option<(u64, bool)> {
+    match cc {
+        IntCC::Equal | IntCC::NotEqual => Some((extend(k_s, ty, false) as u64, cc == IntCC::Equal)),
+        _ => null_test(cc, ty, k_s).map(|bit| (0, !bit)),
+    }
+}
+
+fn classify_arm(cx: &RewriteCx, v: Value, ty: Type, k_u: u64, cmp: Option<(IntCC, Value, Value)>) -> ArmRel {
+    if let Some(c) = cx.uconst(v, ty) {
+        return if c == k_u { ArmRel::EqK } else { ArmRel::NeqK };
+    }
+    let (zeros, ones) = cx.known(v);
+    if (zeros | ones) == ty.unsigned_max() {
+        return if ones == k_u { ArmRel::EqK } else { ArmRel::NeqK };
+    }
+    if (ones & !k_u) != 0 || (zeros & k_u) != 0 {
+        return ArmRel::NeqK;
+    }
+    if k_u == 0 && is_non_zero_under(cx, v, cmp, 0) {
+        return ArmRel::NeqK;
+    }
+    ArmRel::Unknown
+}
+
 pub(super) fn eval_select_zero_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Option<Op>> {
     let ty = cx.func.ty(x);
     if !ty.is_small_int() || !res.is_some_and(|r| cx.func.ty(r) == Type::I8) {
@@ -231,38 +435,21 @@ pub(super) fn eval_select_zero_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: I
         return Some(folded);
     }
     for (norm, sel_val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
-        let Some(k) = cx.uconst(c_val, ty) else { continue };
-        let want_nonzero = match (norm, k) {
-            (IntCC::NotEqual | IntCC::UnsignedGreaterThan, 0) | (IntCC::UnsignedGreaterThanOrEqual, 1) => true,
-            (IntCC::Equal | IntCC::UnsignedLessThanOrEqual, 0) | (IntCC::UnsignedLessThan, 1) => false,
-            _ => continue,
-        };
+        let Some((k_u, want_match)) = cx.sconst(c_val).and_then(|k_s| cmp_target(norm, ty, k_s)) else { continue };
         let Some(sel_inst) = cx.def(sel_val) else { continue };
         let Op::Select(raw_cond, t_val, f_val) = cx.func.insts[sel_inst.index()].op else { continue };
-        let non_zero_arm = if cx.uconst(f_val, ty) == Some(0) && is_non_zero(cx, t_val, 0) {
-            Some(true)
-        } else if cx.uconst(t_val, ty) == Some(0) && is_non_zero(cx, f_val, 0) {
-            Some(false)
-        } else {
-            None
+        let t_cmp = (k_u == 0).then(|| unwrap_cond_cmp(cx, raw_cond, true)).flatten();
+        let f_cmp = (k_u == 0).then(|| unwrap_cond_cmp(cx, raw_cond, false)).flatten();
+        let out = match (classify_arm(cx, t_val, ty, k_u, t_cmp), classify_arm(cx, f_val, ty, k_u, f_cmp)) {
+            (ArmRel::EqK, ArmRel::EqK) => Some(Some(Op::Const(i64::from(want_match)))),
+            (ArmRel::NeqK, ArmRel::NeqK) => Some(Some(Op::Const(i64::from(!want_match)))),
+            (ArmRel::EqK, ArmRel::NeqK) => emit_cond_truth(cx, res, raw_cond, want_match),
+            (ArmRel::NeqK, ArmRel::EqK) => emit_cond_truth(cx, res, raw_cond, !want_match),
+            _ => None,
         };
-        let Some(true_is_nonzero) = non_zero_arm else { continue };
-        let cond = cx.unwrap_uextend(raw_cond);
-        let truth = want_nonzero == true_is_nonzero;
-        if cx.func.ty(cond) == Type::I8 && cx.is_unit_bool(cond) {
-            if truth {
-                cx.alias(res, cond);
-                return Some(None);
-            }
-            let one = cx.emit(Type::I8, Op::Const(1));
-            return Some(Some(Op::Binary(Binary::Bxor, cond, one)));
+        if let Some(folded) = out {
+            return Some(folded);
         }
-        let cond_ty = cx.func.ty(cond);
-        if !cond_ty.is_small_int() {
-            continue;
-        }
-        let zero = cx.emit(cond_ty, Op::Const(0));
-        return Some(Some(Op::Icmp(if truth { IntCC::NotEqual } else { IntCC::Equal }, cond, zero)));
     }
     None
 }

@@ -1,7 +1,15 @@
 use super::fits_mem_imm;
 use crate::cfg::Cfg;
-use crate::ir::{Binary, Block, Convert, Function, Inst, Op, StackSlot, Type, Unary, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, Op, StackSlot, TargetOpId, Type, Unary, Value};
 use crate::mem::{MemBase, MemLoc, Provenance};
+
+struct PackCtx<'a> {
+    func: &'a Function,
+    cfg: &'a Cfg,
+    prov: &'a Provenance,
+    consts: &'a [Option<i64>],
+    def_info: &'a [DefInfo],
+}
 
 const MAX_PRED_CHAIN: usize = 4;
 const MAX_ADDR_STEPS: usize = 16;
@@ -135,75 +143,82 @@ fn pred_chain(cfg: &Cfg, blk: Block) -> Vec<Block> {
     chain
 }
 
+fn push_leaf_load(
+    ctx: &PackCtx<'_>,
+    chain: &[Block],
+    val: Value,
+    (shift_byte, expect_bytes): (i64, u32),
+    (leaves, touched, key): (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>),
+) -> Option<()> {
+    let (lblk, lpos, linst) = ctx.def_info.get(val.index()).copied().flatten()?;
+    let blk_idx = chain.iter().position(|&b| b == lblk)?;
+    let ty = ctx.func.ty(val);
+    if ty.bytes() != expect_bytes {
+        return None;
+    }
+    let (loc, raw, addr_key, canon_off) = match ctx.func.insts[linst.index()].op {
+        Op::Load(addr, off) => {
+            let (ak, coff) = canonical_addr(ctx.func, ctx.prov, ctx.consts, ctx.def_info, addr, off)?;
+            (ctx.prov.loc(addr, i64::from(off), ty.bytes()), RawLoad::Addr(addr, off), ak, coff)
+        }
+        Op::StackLoad(slot, off) => {
+            let loc = MemLoc::slot(slot, i64::from(off), ty.bytes());
+            (loc, RawLoad::Stack, AddrKey::Slot(slot), loc.offset)
+        }
+        _ => return None,
+    };
+    match key {
+        None => *key = Some(addr_key),
+        Some(expected) if *expected != addr_key => return None,
+        _ => {}
+    }
+    touched.push(val);
+    leaves.push(Leaf { blk_idx, pos: lpos, loc, canon_off, raw, shift_byte, bytes: i64::from(expect_bytes) });
+    Some(())
+}
+
 fn collect_leaves(
-    func: &Function,
-    prov: &Provenance,
-    consts: &[Option<i64>],
-    def_info: &[DefInfo],
+    ctx: &PackCtx<'_>,
     chain: &[Block],
     val: Value,
     (leaves, touched, key): (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>),
 ) -> Option<()> {
-    let (_, _, inst) = def_info.get(val.index()).copied().flatten()?;
-    match func.insts[inst.index()].op {
+    let (_, _, inst) = ctx.def_info.get(val.index()).copied().flatten()?;
+    match ctx.func.insts[inst.index()].op {
         Op::Binary(Binary::Bor | Binary::Iadd, a, b) => {
             touched.push(val);
-            collect_leaves(func, prov, consts, def_info, chain, a, (leaves, touched, key))?;
-            collect_leaves(func, prov, consts, def_info, chain, b, (leaves, touched, key))
+            collect_leaves(ctx, chain, a, (leaves, touched, key))?;
+            collect_leaves(ctx, chain, b, (leaves, touched, key))
         }
         _ => {
             let mut cur = val;
             let mut shift_byte = 0_i64;
             let mut shift_ty_bytes: Option<i64> = None;
             loop {
-                let Some((_, _, linst)) = def_info.get(cur.index()).copied().flatten() else { return None };
-                match func.insts[linst.index()].op {
+                let Some((_, _, linst)) = ctx.def_info.get(cur.index()).copied().flatten() else { return None };
+                match ctx.func.insts[linst.index()].op {
                     Op::Convert(Convert::Uextend, inner) => {
                         touched.push(cur);
                         cur = inner;
                     }
                     Op::Binary(Binary::Ishl, inner, amt) if shift_ty_bytes.is_none() => {
-                        let imm = consts.get(amt.index()).copied().flatten()?;
+                        let imm = ctx.consts.get(amt.index()).copied().flatten()?;
                         if !(0..64).contains(&imm) || imm % 8 != 0 {
                             return None;
                         }
                         touched.push(cur);
                         shift_byte = imm / 8;
-                        shift_ty_bytes = Some(i64::from(func.ty(cur).bytes()));
+                        shift_ty_bytes = Some(i64::from(ctx.func.ty(cur).bytes()));
                         cur = inner;
                     }
                     _ => break,
                 }
             }
-            let (lblk, lpos, linst) = def_info.get(cur.index()).copied().flatten()?;
-            let blk_idx = chain.iter().position(|&b| b == lblk)?;
-            let load_ty = func.ty(cur);
-            if !matches!(load_ty, Type::I8 | Type::I16) {
+            let load_ty = ctx.func.ty(cur);
+            if !matches!(load_ty, Type::I8 | Type::I16 | Type::I32) || shift_ty_bytes.is_some_and(|st| shift_byte + i64::from(load_ty.bytes()) > st) {
                 return None;
             }
-            let load_bytes = i64::from(load_ty.bytes());
-            if shift_ty_bytes.is_some_and(|st| shift_byte + load_bytes > st) {
-                return None;
-            }
-            let (loc, raw, addr_key, canon_off) = match func.insts[linst.index()].op {
-                Op::Load(addr, off) => {
-                    let (ak, coff) = canonical_addr(func, prov, consts, def_info, addr, off)?;
-                    (prov.loc(addr, i64::from(off), load_ty.bytes()), RawLoad::Addr(addr, off), ak, coff)
-                }
-                Op::StackLoad(slot, off) => {
-                    let loc = MemLoc::slot(slot, i64::from(off), load_ty.bytes());
-                    (loc, RawLoad::Stack, AddrKey::Slot(slot), loc.offset)
-                }
-                _ => return None,
-            };
-            match key {
-                None => *key = Some(addr_key),
-                Some(expected) if *expected != addr_key => return None,
-                _ => {}
-            }
-            touched.push(cur);
-            leaves.push(Leaf { blk_idx, pos: lpos, loc, canon_off, raw, shift_byte, bytes: load_bytes });
-            Some(())
+            push_leaf_load(ctx, chain, cur, (shift_byte, load_ty.bytes()), (leaves, touched, key))
         }
     }
 }
@@ -235,37 +250,68 @@ fn has_clobber(
     false
 }
 
-fn build_pack(
-    func: &Function,
-    cfg: &Cfg,
-    prov: &Provenance,
-    consts: &[Option<i64>],
-    def_info: &[DefInfo],
-    chain: &[Block],
-    (root_pos, root_val, res_ty): (usize, Value, Type),
-) -> Option<PackPlan> {
-    let mut leaves = Vec::new();
-    let mut touched = Vec::new();
-    let mut addr_key = None;
-    collect_leaves(func, prov, consts, def_info, chain, root_val, (&mut leaves, &mut touched, &mut addr_key))?;
-    if leaves.len() < 2 || leaves.len() > 8 {
-        return None;
+fn build_wide_load(ctx: &PackCtx<'_>, root_blk: Block, root_pos: usize, first: Leaf, wide_ty: Type) -> Option<Op> {
+    match (first.loc.base, first.raw) {
+        (MemBase::Slot(slot), _) => Some(Op::StackLoad(slot, i32::try_from(first.loc.offset).ok()?)),
+        (_, RawLoad::Addr(addr, off)) if fits_mem_imm(wide_ty, i64::from(off)) => Some(Op::Load(addr, off)),
+        (MemBase::Addr(base), _)
+            if ctx.def_info.get(base.index()).copied().flatten().is_none_or(|(db, dp, _)| {
+                ctx.cfg.dominates(db, root_blk) && (db != root_blk || dp < root_pos)
+            }) =>
+        {
+            let off_i32 = i32::try_from(first.loc.offset).ok()?;
+            fits_mem_imm(wide_ty, first.loc.offset).then_some(Op::Load(base, off_i32))
+        }
+        _ => None,
     }
+}
+
+fn contiguous_leaves(leaves: &mut [Leaf], expected_bytes: Option<i64>) -> Option<i64> {
     leaves.sort_by_key(|l| l.canon_off);
-    let min_off = leaves[0].canon_off;
-    let total_w: i64 = leaves.iter().map(|l| l.bytes).sum();
-    if !matches!(total_w, 2 | 4 | 8) || total_w > i64::from(res_ty.bytes()) {
-        return None;
-    }
+    let min_off = leaves.first()?.canon_off;
     let mut cursor = min_off;
-    for l in &leaves {
-        if l.canon_off != cursor || l.shift_byte + l.bytes > total_w {
+    for l in leaves.iter() {
+        if l.canon_off != cursor {
             return None;
         }
         cursor += l.bytes;
     }
+    let total = cursor - min_off;
+    if expected_bytes.is_some_and(|want| want != total) {
+        return None;
+    }
+    Some(min_off)
+}
+
+fn finish_pack_plan(
+    ctx: &PackCtx<'_>,
+    chain: &[Block],
+    (root_pos, wide_ty, big_endian): (usize, Type, bool),
+    leaves: &[Leaf],
+    touched: Vec<Value>,
+) -> Option<PackPlan> {
+    let first = leaves[0];
+    let wide_op = build_wide_load(ctx, *chain.last()?, root_pos, first, wide_ty)?;
+    let wide_loc = MemLoc::new(first.loc.root, first.loc.base, first.loc.offset, wide_ty.bytes());
+    if has_clobber(ctx.func, ctx.prov, chain, leaves, root_pos, wide_loc) {
+        return None;
+    }
+    Some(PackPlan { wide_op, wide_ty, big_endian, touched })
+}
+
+fn build_pack(ctx: &PackCtx<'_>, chain: &[Block], (root_pos, root_val, res_ty): (usize, Value, Type)) -> Option<PackPlan> {
+    let (mut leaves, mut touched, mut addr_key) = (Vec::new(), Vec::new(), None);
+    collect_leaves(ctx, chain, root_val, (&mut leaves, &mut touched, &mut addr_key))?;
+    if !(2..=8).contains(&leaves.len()) {
+        return None;
+    }
+    let min_off = contiguous_leaves(&mut leaves, None)?;
+    let total_w: i64 = leaves.iter().map(|l| l.bytes).sum();
+    if !matches!(total_w, 2 | 4 | 8) || total_w > i64::from(res_ty.bytes()) || leaves.iter().any(|l| l.shift_byte + l.bytes > total_w) {
+        return None;
+    }
     let little = leaves.iter().all(|l| l.shift_byte == l.canon_off - min_off);
-    let big = !little && leaves.iter().all(|l| l.shift_byte == total_w - (l.canon_off - min_off) - l.bytes);
+    let big = !little && leaves.iter().all(|l| l.bytes == 1 && l.shift_byte == total_w - (l.canon_off - min_off) - 1);
     if !little && !big {
         return None;
     }
@@ -274,29 +320,98 @@ fn build_pack(
         4 => Type::I32,
         _ => Type::I64,
     };
-    let root_blk = *chain.last()?;
-    let first = leaves[0];
-    let wide_op = match (first.loc.base, first.raw) {
-        (MemBase::Slot(slot), _) => Op::StackLoad(slot, i32::try_from(first.loc.offset).ok()?),
-        (_, RawLoad::Addr(addr, off)) if fits_mem_imm(wide_ty, i64::from(off)) => Op::Load(addr, off),
-        (MemBase::Addr(base), _)
-            if def_info.get(base.index()).copied().flatten().is_none_or(|(db, dp, _)| {
-                cfg.dominates(db, root_blk) && (db != root_blk || dp < root_pos)
-            }) =>
+    finish_pack_plan(ctx, chain, (root_pos, wide_ty, big), &leaves, touched)
+}
+
+fn unwrap_bitcast_leaf(ctx: &PackCtx<'_>, mut val: Value, expect_bytes: u32, touched: &mut Vec<Value>) -> Value {
+    for _ in 0..4 {
+        let Some((_, _, inst)) = ctx.def_info.get(val.index()).copied().flatten() else { break };
+        if let Op::Convert(Convert::Bitcast, inner) = ctx.func.insts[inst.index()].op
+            && ctx.func.ty(inner).bytes() == expect_bytes
         {
-            let off_i32 = i32::try_from(first.loc.offset).ok()?;
-            if !fits_mem_imm(wide_ty, first.loc.offset) {
-                return None;
-            }
-            Op::Load(base, off_i32)
+            touched.push(val);
+            val = inner;
+            continue;
         }
-        _ => return None,
-    };
-    let wide_loc = MemLoc::new(first.loc.root, first.loc.base, first.loc.offset, total_w as u32);
-    if has_clobber(func, prov, chain, &leaves, root_pos, wide_loc) {
+        break;
+    }
+    val
+}
+
+fn collect_insert_leaves(
+    ctx: &PackCtx<'_>,
+    chain: &[Block],
+    (val, vec_ty, byte_base): (Value, Type, i64),
+    (leaves, touched, key): (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>),
+) -> Option<()> {
+    let (lane, count) = vec_ty.vec_shape()?;
+    let mut lanes = [None; 16];
+    let (mut cur, mut filled) = (val, 0_u8);
+    while filled < count {
+        let (blk, _, inst) = ctx.def_info.get(cur.index()).copied().flatten()?;
+        if !chain.contains(&blk) || ctx.func.ty(cur) != vec_ty {
+            return None;
+        }
+        let Op::Insert(prev, scalar, idx) = ctx.func.insts[inst.index()].op else { return None };
+        if usize::from(idx) >= usize::from(count) {
+            return None;
+        }
+        touched.push(cur);
+        if lanes[usize::from(idx)].is_none() {
+            lanes[usize::from(idx)] = Some(scalar);
+            filled += 1;
+        }
+        cur = prev;
+    }
+    if ctx.def_info.get(cur.index()).copied().flatten().is_some_and(|(b, _, inst)| chain.contains(&b) && matches!(ctx.func.insts[inst.index()].op, Op::Const(_))) {
+        touched.push(cur);
+    }
+    for (i, slot) in lanes[..usize::from(count)].iter().enumerate() {
+        let leaf = unwrap_bitcast_leaf(ctx, (*slot)?, lane.bytes(), touched);
+        push_leaf_load(ctx, chain, leaf, (byte_base + i as i64 * i64::from(lane.bytes()), lane.bytes()), (leaves, touched, key))?;
+    }
+    Some(())
+}
+
+fn collect_vec_source(
+    ctx: &PackCtx<'_>,
+    chain: &[Block],
+    (val, byte_base, expect_bytes): (Value, i64, u32),
+    out: (&mut Vec<Leaf>, &mut Vec<Value>, &mut Option<AddrKey>),
+) -> Option<()> {
+    let (leaves, touched, key) = out;
+    let cur = unwrap_bitcast_leaf(ctx, val, expect_bytes, touched);
+    if push_leaf_load(ctx, chain, cur, (byte_base, expect_bytes), (leaves, touched, key)).is_some() {
+        return Some(());
+    }
+    collect_insert_leaves(ctx, chain, (cur, ctx.func.ty(cur), byte_base), (leaves, touched, key))
+}
+
+fn build_vec_pack(ctx: &PackCtx<'_>, target: &crate::Target, chain: &[Block], (root_pos, root_val, res_ty): (usize, Value, Type)) -> Option<PackPlan> {
+    if !res_ty.is_vector() || !res_ty.is_register_vec(target) || !matches!(res_ty.bytes(), 16 | 32) {
         return None;
     }
-    Some(PackPlan { wide_op, wide_ty, big_endian: big, touched })
+    let (mut leaves, mut touched, mut key) = (Vec::new(), Vec::new(), None);
+    let inner = unwrap_bitcast_leaf(ctx, root_val, res_ty.bytes(), &mut touched);
+    let (blk, _, inst) = ctx.def_info.get(inner.index()).copied().flatten()?;
+    if !chain.contains(&blk) {
+        return None;
+    }
+    match (res_ty.bytes(), &ctx.func.insts[inst.index()].op) {
+        (16, Op::Insert(..)) => collect_insert_leaves(ctx, chain, (inner, ctx.func.ty(inner), 0), (&mut leaves, &mut touched, &mut key))?,
+        (32, Op::TargetOp(TargetOpId::X64Concat128, args)) if args.as_slice().len() == 2 => {
+            touched.push(inner);
+            let [low, high] = [args.as_slice()[0], args.as_slice()[1]];
+            collect_vec_source(ctx, chain, (low, 0, 16), (&mut leaves, &mut touched, &mut key))?;
+            collect_vec_source(ctx, chain, (high, 16, 16), (&mut leaves, &mut touched, &mut key))?;
+        }
+        _ => return None,
+    }
+    let min_off = contiguous_leaves(&mut leaves, Some(i64::from(res_ty.bytes())))?;
+    if !leaves.iter().all(|l| l.shift_byte == l.canon_off - min_off) {
+        return None;
+    }
+    finish_pack_plan(ctx, chain, (root_pos, res_ty, false), &leaves, touched)
 }
 
 fn sweep_dead(func: &mut Function, blk_idx: usize, dead_pool: &[bool], uses: &mut [u32], def_info: &mut [DefInfo]) {
@@ -325,10 +440,24 @@ fn sweep_dead(func: &mut Function, blk_idx: usize, dead_pool: &[bool], uses: &mu
     func.blocks[blk_idx].insts = live;
 }
 
-pub(super) fn coalesce_loads(func: &mut Function, prov: &Provenance) -> bool {
-    let cfg = func.cfg();
-    let mut consts = vec![None; func.types.len()];
-    let mut def_info: Vec<DefInfo> = vec![None; func.types.len()];
+pub(super) fn has_vec_pack_cand(func: &Function) -> bool {
+    func.insts.iter().any(|data| {
+        data.result.is_some_and(|r| func.ty(r).is_vector())
+            && matches!(data.op, Op::Insert(..) | Op::TargetOp(TargetOpId::X64Concat128, _))
+    })
+}
+
+struct PackTables {
+    consts: Vec<Option<i64>>,
+    def_info: Vec<DefInfo>,
+    uses: Vec<u32>,
+    dead_pool: Vec<bool>,
+    touched_blk: Vec<bool>,
+}
+
+fn build_pack_tables(func: &Function, cfg: &Cfg) -> PackTables {
+    let n = func.types.len();
+    let (mut consts, mut def_info) = (vec![None; n], vec![None; n]);
     for &blk in &cfg.rpo {
         for (pos, &inst) in func.blocks[blk.index()].insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
@@ -339,90 +468,158 @@ pub(super) fn coalesce_loads(func: &mut Function, prov: &Provenance) -> bool {
             }
         }
     }
-    let mut uses = func.use_counts();
-    let mut dead_pool = vec![false; func.types.len()];
-    let mut touched_blk = vec![false; func.blocks.len()];
-    let mut changed = false;
-    for &blk in &cfg.rpo {
-        let b_idx = blk.index();
-        let chain = pred_chain(&cfg, blk);
-        let insts = &func.blocks[b_idx].insts;
-        let mut consumed = vec![false; func.types.len()];
-        let mut plans: Vec<Option<(Value, Type, PackPlan)>> = (0..insts.len()).map(|_| None).collect();
-        let mut any_plan = false;
-        for (pos, &inst) in insts.iter().enumerate().rev() {
-            let data = &func.insts[inst.index()];
-            if let (Op::Binary(Binary::Bor | Binary::Iadd, ..), Some(res)) = (&data.op, data.result)
-                && !consumed[res.index()]
-            {
-                let res_ty = func.ty(res);
-                if matches!(res_ty, Type::I16 | Type::I32 | Type::I64)
-                    && let Some(plan) = build_pack(func, &cfg, prov, &consts, &def_info, &chain, (pos, res, res_ty))
-                {
-                    for &v in &plan.touched {
-                        if v != res {
-                            consumed[v.index()] = true;
-                        }
-                    }
-                    plans[pos] = Some((res, res_ty, plan));
-                    any_plan = true;
-                }
+    PackTables { consts, def_info, uses: func.use_counts(), dead_pool: vec![false; n], touched_blk: vec![false; func.blocks.len()] }
+}
+
+fn plan_one_pack(
+    ctx: &PackCtx<'_>,
+    target: Option<&crate::Target>,
+    chain: &[Block],
+    uses: &[u32],
+    (pos, inst): (usize, Inst),
+) -> Option<(Value, Type, PackPlan)> {
+    let data = &ctx.func.insts[inst.index()];
+    let res = data.result?;
+    let res_ty = ctx.func.ty(res);
+    let plan = match target {
+        None if matches!(data.op, Op::Binary(Binary::Bor | Binary::Iadd, ..)) && matches!(res_ty, Type::I16 | Type::I32 | Type::I64) => {
+            build_pack(ctx, chain, (pos, res, res_ty))
+        }
+        Some(tgt)
+            if matches!(data.op, Op::Insert(..) | Op::TargetOp(TargetOpId::X64Concat128, _))
+                || matches!(data.op, Op::Convert(Convert::Bitcast, x) if uses[x.index()] == 1) =>
+        {
+            build_vec_pack(ctx, tgt, chain, (pos, res, res_ty))
+        }
+        _ => None,
+    }?;
+    Some((res, res_ty, plan))
+}
+
+fn plan_block_packs(
+    ctx: &PackCtx<'_>,
+    target: Option<&crate::Target>,
+    blk: Block,
+    uses: &[u32],
+) -> (Vec<Option<(Value, Type, PackPlan)>>, bool) {
+    let chain = pred_chain(ctx.cfg, blk);
+    let insts = &ctx.func.blocks[blk.index()].insts;
+    let mut consumed = vec![false; ctx.func.types.len()];
+    let mut plans: Vec<Option<(Value, Type, PackPlan)>> = (0..insts.len()).map(|_| None).collect();
+    let mut any_plan = false;
+    for (pos, &inst) in insts.iter().enumerate().rev() {
+        let Some(res) = ctx.func.insts[inst.index()].result.filter(|r| !consumed[r.index()]) else { continue };
+        let Some((_, res_ty, p)) = plan_one_pack(ctx, target, &chain, uses, (pos, inst)) else { continue };
+        for &v in &p.touched {
+            if v != res && uses.get(v.index()).copied().unwrap_or(0) <= 1 {
+                consumed[v.index()] = true;
             }
         }
-        if !any_plan {
+        plans[pos] = Some((res, res_ty, p));
+        any_plan = true;
+    }
+    (plans, any_plan)
+}
+
+fn push_fresh_val(func: &mut Function, op: Op, ty: Type, out: &mut Vec<Inst>, t: &mut PackTables) -> Value {
+    let val = func.value(ty);
+    t.uses.push(1);
+    t.def_info.push(None);
+    t.dead_pool.push(false);
+    t.consts.push(None);
+    out.push(func.add(op, Some(val)));
+    val
+}
+
+fn emit_packed_inst(func: &mut Function, inst: Inst, res_ty: Type, plan: PackPlan, (out, t): (&mut Vec<Inst>, &mut PackTables)) {
+    if !plan.big_endian && plan.wide_ty == res_ty {
+        func.insts[inst.index()].op = plan.wide_op;
+        return;
+    }
+    let wide_val = push_fresh_val(func, plan.wide_op, plan.wide_ty, out, t);
+    let swapped = if plan.big_endian && plan.wide_ty == res_ty {
+        Op::Unary(Unary::Bswap, wide_val)
+    } else if plan.big_endian {
+        let bswapped = push_fresh_val(func, Op::Unary(Unary::Bswap, wide_val), plan.wide_ty, out, t);
+        Op::Convert(Convert::Uextend, bswapped)
+    } else {
+        Op::Convert(Convert::Uextend, wide_val)
+    };
+    func.insts[inst.index()].op = swapped;
+}
+
+fn mark_dead_touched(touched: &[Value], res: Value, t: &mut PackTables) {
+    for &v in touched {
+        if v == res {
             continue;
         }
-        let insts = std::mem::take(&mut func.blocks[b_idx].insts);
-        let mut out = Vec::with_capacity(insts.len());
-        for (pos, &inst) in insts.iter().enumerate() {
-            if let Some((res, res_ty, plan)) = plans[pos].take() {
-                func.insts[inst.index()].op.for_operands(|v| uses[v.index()] = uses[v.index()].saturating_sub(1));
-                for v in plan.touched {
-                    if v != res {
-                        dead_pool[v.index()] = true;
-                        if let Some((db, _, _)) = def_info[v.index()] {
-                            touched_blk[db.index()] = true;
-                        }
-                    }
-                }
-                if !plan.big_endian && plan.wide_ty == res_ty {
-                    func.insts[inst.index()].op = plan.wide_op;
-                } else {
-                    let wide_val = func.value(plan.wide_ty);
-                    uses.push(1);
-                    def_info.push(None);
-                    dead_pool.push(false);
-                    consts.push(None);
-                    out.push(func.add(plan.wide_op, Some(wide_val)));
-                    let swapped = if plan.big_endian && plan.wide_ty == res_ty {
-                        Op::Unary(Unary::Bswap, wide_val)
-                    } else if plan.big_endian {
-                        let bswapped = func.value(plan.wide_ty);
-                        uses.push(1);
-                        def_info.push(None);
-                        dead_pool.push(false);
-                        consts.push(None);
-                        out.push(func.add(Op::Unary(Unary::Bswap, wide_val), Some(bswapped)));
-                        Op::Convert(Convert::Uextend, bswapped)
-                    } else {
-                        Op::Convert(Convert::Uextend, wide_val)
-                    };
-                    func.insts[inst.index()].op = swapped;
-                }
-                changed = true;
-            }
-            out.push(inst);
+        t.dead_pool[v.index()] = true;
+        if let Some((db, _, _)) = t.def_info[v.index()] {
+            t.touched_blk[db.index()] = true;
         }
-        func.blocks[b_idx].insts = out;
-        touched_blk[b_idx] = true;
-        sweep_dead(func, b_idx, &dead_pool, &mut uses, &mut def_info);
+    }
+}
+
+fn apply_block_packs(
+    func: &mut Function,
+    b_idx: usize,
+    mut plans: Vec<Option<(Value, Type, PackPlan)>>,
+    t: &mut PackTables,
+) -> bool {
+    let insts = std::mem::take(&mut func.blocks[b_idx].insts);
+    let mut out = Vec::with_capacity(insts.len());
+    let mut changed = false;
+    for (pos, &inst) in insts.iter().enumerate() {
+        if let Some((res, res_ty, plan)) = plans[pos].take() {
+            func.insts[inst.index()].op.for_operands(|v| t.uses[v.index()] = t.uses[v.index()].saturating_sub(1));
+            mark_dead_touched(&plan.touched, res, t);
+            emit_packed_inst(func, inst, res_ty, plan, (&mut out, t));
+            changed = true;
+        }
+        out.push(inst);
+    }
+    func.blocks[b_idx].insts = out;
+    t.touched_blk[b_idx] = true;
+    sweep_dead(func, b_idx, &t.dead_pool, &mut t.uses, &mut t.def_info);
+    changed
+}
+
+pub(super) fn coalesce_vec_rescan(func: &mut Function, cfg: &Cfg, target: &crate::Target) -> bool {
+    if !has_vec_pack_cand(func) {
+        return false;
+    }
+    let prov = Provenance::new(func, cfg);
+    coalesce_loads(func, &prov, target)
+}
+
+fn run_pack_round(func: &mut Function, cfg: &Cfg, prov: &Provenance, target: Option<&crate::Target>, t: &mut PackTables) -> bool {
+    let mut changed = false;
+    for &blk in &cfg.rpo {
+        let (plans, any_plan) = {
+            let ctx = PackCtx { func, cfg, prov, consts: &t.consts, def_info: &t.def_info };
+            plan_block_packs(&ctx, target, blk, &t.uses)
+        };
+        if any_plan {
+            changed |= apply_block_packs(func, blk.index(), plans, t);
+        }
     }
     if changed {
         for &blk in cfg.rpo.iter().rev() {
-            if touched_blk[blk.index()] {
-                sweep_dead(func, blk.index(), &dead_pool, &mut uses, &mut def_info);
+            if t.touched_blk[blk.index()] {
+                sweep_dead(func, blk.index(), &t.dead_pool, &mut t.uses, &mut t.def_info);
             }
         }
+    }
+    changed
+}
+
+pub(super) fn coalesce_loads(func: &mut Function, prov: &Provenance, target: &crate::Target) -> bool {
+    let cfg = func.cfg();
+    let mut t = build_pack_tables(func, &cfg);
+    let mut changed = run_pack_round(func, &cfg, prov, None, &mut t);
+    if has_vec_pack_cand(func) {
+        t.touched_blk.fill(false);
+        changed |= run_pack_round(func, &cfg, prov, Some(target), &mut t);
     }
     changed
 }

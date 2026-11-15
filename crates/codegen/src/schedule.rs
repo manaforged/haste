@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use crate::ir::{Binary, Block, Domain, Function, Op};
-use crate::reloc::RuntimeSymbol;
 use crate::{Effort, cse, fill, fold, ifconv, licm, loads, lsr, merge, promote, returns, rotate, switch, tailrec, thread, unroll};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -142,7 +141,6 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
 }
 
 struct PassState {
-    can_fill: bool,
     fold_clean: bool,
     merge_clean: bool,
     loops_rev: Option<u32>,
@@ -150,9 +148,8 @@ struct PassState {
 }
 
 impl PassState {
-    fn new(func: &Function) -> Self {
+    fn new() -> Self {
         Self {
-            can_fill: has_fill_ops(func),
             fold_clean: false,
             merge_clean: false,
             loops_rev: None,
@@ -168,36 +165,16 @@ impl PassState {
         self.has_loops
     }
 
-    fn after_pass(&mut self, func: &Function, pass: Pass, changed: Domain) {
+    fn after_pass(&mut self, changed: Domain) {
         if !changed.is_empty() {
             self.fold_clean = false;
             self.merge_clean = false;
-        }
-        if self.can_fill && matches!(pass, Pass::Fill | Pass::Fold) {
-            self.can_fill = has_fill_ops(func);
         }
     }
 }
 
 fn has_live_op(func: &Function, mut pred: impl FnMut(&Op) -> bool) -> bool {
     func.blocks.iter().any(|block| block.insts.iter().any(|&inst| pred(&func.insts[inst.index()].op)))
-}
-
-fn has_fill_ops(func: &Function) -> bool {
-    has_live_op(func, |op| matches!(op, Op::Runtime(RuntimeSymbol::Memset) | Op::Copy(..)))
-}
-
-fn nth_target(op: &Op, idx: usize) -> Option<Block> {
-    match op {
-        Op::Jump(t, _) if idx == 0 => Some(*t),
-        Op::Brif(_, t, _, e, _) | Op::TryCall { normal: t, handler: e, .. } => match idx {
-            0 => Some(*t),
-            1 => Some(*e),
-            _ => None,
-        },
-        Op::BrTable(_, def, targets) => if idx == 0 { Some(*def) } else { targets.get(idx - 1).copied() },
-        _ => None,
-    }
 }
 
 fn has_small_cycle(func: &Function, entry: Block) -> bool {
@@ -214,7 +191,7 @@ fn has_small_cycle(func: &Function, entry: Block) -> bool {
     while sp > 0 {
         let b = stack[sp - 1] as usize;
         let idx = cursor[sp - 1];
-        let Some(target) = func.last(Block(b as u32)).and_then(|op| nth_target(op, idx)) else {
+        let Some(target) = func.successors(Block(b as u32)).nth(idx) else {
             state[b] = 2;
             sp -= 1;
             continue;
@@ -247,27 +224,15 @@ fn detect_loops(func: &Function) -> bool {
     !func.cfg().loops().list.is_empty()
 }
 
-fn check_cfg_pass(func: &Function, pass: Pass, state: &mut PassState) -> bool {
-    if matches!(pass, Pass::Thread | Pass::IfConv) {
-        return func.blocks.len() > 1;
-    }
-    if matches!(pass, Pass::Rotate | Pass::Unroll | Pass::Licm | Pass::Lsr) {
-        return state.has_loops(func);
-    }
-    pass != Pass::TailRec || !func.self_slots.is_empty()
-}
-
 fn should_run(func: &Function, pass: Pass, state: &mut PassState) -> bool {
-    let entry = func.entry.is_some();
     let multi = func.blocks.len() > 1;
     match pass {
-        Pass::Fill => state.can_fill,
-        Pass::Promote => entry && !func.slots.is_empty(),
-        Pass::Fold => entry && !state.fold_clean,
+        Pass::Fold => !state.fold_clean,
         Pass::Merge => multi && !state.merge_clean,
-        Pass::Returns => func.coroutine.is_none() && multi,
-        Pass::Switch => func.coroutine.is_none() && has_live_op(func, |op| matches!(op, Op::Select(..) | Op::Brif(..) | Op::BrTable(..))),
-        _ => entry && func.coroutine.is_none() && check_cfg_pass(func, pass, state),
+        Pass::Thread | Pass::IfConv | Pass::Returns => multi,
+        Pass::Switch => has_live_op(func, |op| matches!(op, Op::Select(..) | Op::Brif(..) | Op::BrTable(..))),
+        Pass::Rotate | Pass::Unroll | Pass::Licm | Pass::Lsr => state.has_loops(func),
+        Pass::Fill | Pass::Promote | Pass::Cse | Pass::Loads | Pass::TailRec => true,
     }
 }
 
@@ -287,7 +252,7 @@ fn run_step(func: &mut Function, plan: &Plan, state: &mut PassState, pass: Pass)
         return Domain::NONE;
     }
     let changed = run_pass(func, pass, plan.moves, plan.effort, plan.target);
-    state.after_pass(func, pass, changed);
+    state.after_pass(changed);
     changed
 }
 
@@ -404,7 +369,7 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
             finish: FULL_FINISH,
         },
     };
-    let mut state = PassState::new(func);
+    let mut state = PassState::new();
     run_step(func, &plan, &mut state, INIT[0]);
     let fold_init = run_step(func, &plan, &mut state, INIT[1]);
     let merge_init = run_step(func, &plan, &mut state, INIT[2]);

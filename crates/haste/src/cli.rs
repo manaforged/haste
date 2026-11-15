@@ -260,7 +260,7 @@ fn usage() -> String {
     let modes: Vec<&str> = crate::serve::MODES.into_iter().map(|(_, name)| name).chain(TOP_COMMANDS.into_iter().map(|(_, name)| name)).collect();
     let queries: Vec<&str> = QUERIES.into_iter().filter(|(q, _)| *q != Query::Code).map(|(_, name)| name).collect();
     format!(
-        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] [-o PATH] {} PATH [--] [ARGS...]\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR",
+        "usage: haste [--jobs N] [--release] [--prepared] [--prep-wait MS] [--perf-map] [--stats-json PATH] [-o PATH] {} PATH [--] [ARGS...]\n       haste [--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -313,8 +313,28 @@ fn parse(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<Command>
     Request::parse_mode(&word).map(Command::Request).with_context(usage)
 }
 
-fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter::Peekable<I>, stats: &mut Option<PathBuf>, out: &mut Option<PathBuf>) -> Result<()> {
+#[derive(Clone, Copy)]
+enum Meta {
+    Version,
+    Help,
+}
+
+impl Meta {
+    fn from_flag(flag: &str) -> Option<Self> {
+        match flag {
+            "-V" | "--version" => Some(Self::Version),
+            "-h" | "--help" => Some(Self::Help),
+            _ => None,
+        }
+    }
+}
+
+fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter::Peekable<I>, stats: &mut Option<PathBuf>, out: &mut Option<PathBuf>) -> Result<Option<Meta>> {
     while let Some(flag) = args.peek().and_then(|raw| raw.to_str()) {
+        if let Some(meta) = Meta::from_flag(flag) {
+            args.next();
+            return Ok(Some(meta));
+        }
         match flag {
             "--jobs" => {
                 args.next();
@@ -351,7 +371,7 @@ fn consume_options<I: Iterator<Item = std::ffi::OsString>>(args: &mut std::iter:
             _ => break,
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The glibc malloc settings haste runs with: transparent huge pages for the heap, and freed memory kept for reuse instead of returned to the kernel and faulted in again.
@@ -376,14 +396,20 @@ fn tune_malloc() {
     }
 }
 
-fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>, Option<PathBuf>)> {
+type ParsedInvocation = (Command, PathBuf, Vec<String>, Option<PathBuf>, Option<PathBuf>);
+
+fn parse_invocation() -> Result<std::result::Result<ParsedInvocation, Meta>> {
     let mut args = std::env::args_os().skip(1).peekable();
     let mut stats_json = None;
     let mut out = None;
-    consume_options(&mut args, &mut stats_json, &mut out)?;
+    if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
+        return Ok(Err(meta));
+    }
     let command = parse(&mut args)?;
     if matches!(command, Command::Request(Request::Build)) {
-        consume_options(&mut args, &mut stats_json, &mut out)?;
+        if let Some(meta) = consume_options(&mut args, &mut stats_json, &mut out)? {
+            return Ok(Err(meta));
+        }
     } else if stats_json.is_some() || out.is_some() {
         anyhow::bail!("--stats-json and -o are only supported with `haste build`");
     }
@@ -395,14 +421,27 @@ fn parse_invocation() -> Result<(Command, PathBuf, Vec<String>, Option<PathBuf>,
         Some((first, tail)) if first == "--" => tail.to_vec(),
         _ => rest,
     };
-    Ok((command, path, rest, stats_json, out))
+    Ok(Ok((command, path, rest, stats_json, out)))
+}
+
+fn print_meta(meta: Meta) {
+    match meta {
+        Meta::Version => println!("haste {}", env!("CARGO_PKG_VERSION")),
+        Meta::Help => println!("{}", usage()),
+    }
 }
 
 /// Runs the haste command line.
 pub fn main() -> Result<()> {
+    if let Some(meta) = std::env::args_os().nth(1).and_then(|a| a.to_str().and_then(Meta::from_flag)) {
+        return Ok(print_meta(meta));
+    }
     tune_malloc();
     crate::sema::evaluate::install(crate::image::evaluator);
-    let (command, path, rest, stats_json, out) = parse_invocation()?;
+    let (command, path, rest, stats_json, out) = match parse_invocation()? {
+        Ok(parsed) => parsed,
+        Err(meta) => return Ok(print_meta(meta)),
+    };
     match command {
         Command::Debug(Query::Items) => return print_items(&path),
         Command::Debug(Query::Expand) => return print_expanded(&path),

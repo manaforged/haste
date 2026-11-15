@@ -24,13 +24,81 @@ struct Cmp {
     k: i64,
 }
 
-fn stack_base(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, v: Value) -> bool {
-    let inner = match def_of(v).map(|inst| &func.insts[inst.index()].op) {
-        Some(Op::StackAddr(..) | Op::SlotAddr(_)) => return true,
-        Some(&Op::Convert(Convert::Bitcast, a)) if func.ty(a) == func.ty(v) => a,
-        _ => return false,
+fn stack_base(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, mut v: Value) -> bool {
+    for _ in 0..MAX_DEPTH {
+        match def_of(v).map(|inst| &func.insts[inst.index()].op) {
+            Some(Op::StackAddr(..) | Op::SlotAddr(_)) => return true,
+            Some(&Op::Convert(Convert::Bitcast, a)) if func.ty(a) == func.ty(v) => v = a,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn sym_offset_bound(
+    func: &Function,
+    def_of: &dyn Fn(Value) -> Option<Inst>,
+    known: &dyn Fn(Value) -> Option<i64>,
+    v: Value,
+    depth: u8,
+) -> u64 {
+    let ty = func.ty(v);
+    if !ty.is_small_int() {
+        return u64::MAX;
+    }
+    if let Some(c) = known(v) {
+        return extend(c, ty, false) as u64;
+    }
+    let w = ty.unsigned_max();
+    let bits_bound = w & !known_bits(func, def_of, known, v, 0).0;
+    if depth >= MAX_DEPTH {
+        return bits_bound;
+    }
+    let sub = match def_of(v).map(|inst| &func.insts[inst.index()].op) {
+        Some(&Op::Convert(Convert::Uextend, a)) => sym_offset_bound(func, def_of, known, a, depth + 1),
+        Some(&Op::Binary(Binary::Ishl, a, sh)) => known(sh)
+            .filter(|&k| (0..i64::from(ty.bits())).contains(&k))
+            .and_then(|k| sym_offset_bound(func, def_of, known, a, depth + 1).checked_mul(1_u64 << (k as u32)))
+            .filter(|&n| n <= w)
+            .unwrap_or(u64::MAX),
+        Some(&Op::Binary(Binary::Imul, a, b)) => [(a, b), (b, a)]
+            .into_iter()
+            .find_map(|(x, k)| {
+                let c = known(k).map(|imm| extend(imm, ty, false) as u64)?;
+                sym_offset_bound(func, def_of, known, x, depth + 1).checked_mul(c).filter(|&n| n <= w)
+            })
+            .unwrap_or(u64::MAX),
+        Some(&Op::Binary(Binary::Iadd, a, b)) => sym_offset_bound(func, def_of, known, a, depth + 1)
+            .checked_add(sym_offset_bound(func, def_of, known, b, depth + 1))
+            .filter(|&n| n <= w)
+            .unwrap_or(u64::MAX),
+        _ => u64::MAX,
     };
-    matches!(def_of(inner).map(|inst| &func.insts[inst.index()].op), Some(Op::StackAddr(..) | Op::SlotAddr(_)))
+    bits_bound.min(sub)
+}
+
+fn sym_base_disp(
+    func: &Function,
+    def_of: &dyn Fn(Value) -> Option<Inst>,
+    known: &dyn Fn(Value) -> Option<i64>,
+    v: Value,
+    depth: u8,
+) -> Option<u64> {
+    if depth >= MAX_DEPTH {
+        return None;
+    }
+    match def_of(v).map(|inst| &func.insts[inst.index()].op) {
+        Some(&Op::Symbol(_)) => Some(0),
+        Some(&Op::Convert(Convert::Bitcast, a)) if func.ty(a) == func.ty(v) => {
+            sym_base_disp(func, def_of, known, a, depth + 1)
+        }
+        Some(&Op::Binary(Binary::Iadd, a, b)) => [(a, b), (b, a)].into_iter().find_map(|(base, off)| {
+            sym_base_disp(func, def_of, known, base, depth + 1)?
+                .checked_add(sym_offset_bound(func, def_of, known, off, depth + 1))
+                .filter(|&sum| sum <= ADDR_SPAN as u64)
+        }),
+        _ => None,
+    }
 }
 
 /// Returns whether `v` denotes a guaranteed non-null stack, symbol, or slot address.
@@ -50,7 +118,9 @@ pub(crate) fn is_non_null_addr(
     };
     match func.insts[inst.index()].op {
         Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) => true,
-        Op::Binary(Binary::Iadd, a, b) => stack_disp(a, b) || stack_disp(b, a),
+        Op::Binary(Binary::Iadd, a, b) => {
+            stack_disp(a, b) || stack_disp(b, a) || sym_base_disp(func, def_of, known, v, depth).is_some()
+        }
         Op::Binary(Binary::Isub, a, b) => stack_disp(a, b),
         Op::Select(_, a, b) => {
             is_non_null_addr(func, def_of, known, a, depth + 1)
@@ -63,7 +133,7 @@ pub(crate) fn is_non_null_addr(
     }
 }
 
-fn null_test(cc: IntCC, ty: Type, k: i64) -> Option<bool> {
+pub(super) fn null_test(cc: IntCC, ty: Type, k: i64) -> Option<bool> {
     match (cc, extend(k, ty, false) as u64) {
         (IntCC::Equal, 0) | (IntCC::UnsignedLessThanOrEqual, 0) | (IntCC::UnsignedLessThan, 1) => Some(false),
         (IntCC::NotEqual, 0) | (IntCC::UnsignedGreaterThan, 0) | (IntCC::UnsignedGreaterThanOrEqual, 1) => Some(true),
@@ -71,7 +141,7 @@ fn null_test(cc: IntCC, ty: Type, k: i64) -> Option<bool> {
     }
 }
 
-fn before<'a>(cx: &'a RewriteCx) -> Before<'a> {
+pub(super) fn before<'a>(cx: &'a RewriteCx) -> Before<'a> {
     Before { prefix: &cx.out, block: None }
 }
 
@@ -336,6 +406,24 @@ fn eval_mixed(
     Some(emit_combo(cx, res, is_and, (c1, neg1), (c2, neg2)))
 }
 
+pub(super) fn emit_cond_truth(cx: &mut RewriteCx, res: Option<Value>, raw_cond: Value, truth: bool) -> Option<Option<Op>> {
+    let cond = cx.unwrap_uextend(raw_cond);
+    let cond_ty = cx.func.ty(cond);
+    if cond_ty == Type::I8 && cx.is_unit_bool(cond) {
+        if truth {
+            cx.alias(res, cond);
+            return Some(None);
+        }
+        let one = cx.emit(Type::I8, Op::Const(1));
+        return Some(Some(Op::Binary(Binary::Bxor, cond, one)));
+    }
+    if !cond_ty.is_small_int() {
+        return None;
+    }
+    let zero = cx.emit(cond_ty, Op::Const(0));
+    Some(Some(Op::Icmp(if truth { IntCC::NotEqual } else { IntCC::Equal }, cond, zero)))
+}
+
 fn eval_one(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, val: Value, k: i64) -> Option<Option<Op>> {
     let cmp = Cmp { cc, ty: cx.func.ty(val), k };
     let (core, mut steps) = peel_steps(cx, val);
@@ -349,22 +437,43 @@ fn eval_one(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, val: Value, k: i6
     if let (Some(ta), Some(tb)) = (ha, hb) && ta == tb {
         return Some(Some(Op::Const(i64::from(ta))));
     }
+    match (ha, hb) {
+        (Some(true), Some(false)) => return emit_cond_truth(cx, res, cond, true),
+        (Some(false), Some(true)) => return emit_cond_truth(cx, res, cond, false),
+        _ => {}
+    }
     if cx.func.ty(cond) != Type::I8 || !cx.is_unit_bool(cond) {
         return None;
     }
     match (ha, hb) {
-        (Some(true), Some(false)) => {
-            cx.alias(res, cond);
-            Some(None)
-        }
-        (Some(false), Some(true)) => {
-            let one = cx.emit(Type::I8, Op::Const(1));
-            Some(Some(Op::Binary(Binary::Bxor, cond, one)))
-        }
         (Some(ta), None) => eval_mixed(cx, res, (cond, ta, true), b, (&steps, cmp)),
         (None, Some(tb)) => eval_mixed(cx, res, (cond, tb, false), a, (&steps, cmp)),
         _ => None,
     }
+}
+
+fn eval_unit_cmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, val: Value, k: i64) -> Option<Option<Op>> {
+    let ty = cx.func.ty(val);
+    let (zeros, ones) = cx.known(val);
+    if (zeros | ones) == ty.unsigned_max() || (zeros | 1) != ty.unsigned_max() {
+        return None;
+    }
+    let (h0, h1) = (holds(cc, ty, 0, k), holds(cc, ty, 1, k));
+    if h0 == h1 {
+        return Some(Some(Op::Const(i64::from(h0))));
+    }
+    let base = cx.unwrap_uextend(val);
+    let bty = cx.func.ty(base);
+    if !h0 {
+        if bty == Type::I8 {
+            cx.alias(res, base);
+            return Some(None);
+        }
+        return Some(Some(Op::Convert(Convert::Ireduce, base)));
+    }
+    let low = if bty == Type::I8 { base } else { cx.emit(Type::I8, Op::Convert(Convert::Ireduce, base)) };
+    let one = cx.emit(Type::I8, Op::Const(1));
+    Some(Some(Op::Binary(Binary::Bxor, low, one)))
 }
 
 pub(super) fn eval_select(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y: Value) -> Option<Option<Op>> {
@@ -379,7 +488,7 @@ pub(super) fn eval_select(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: 
     }
     for (norm, val, c_val) in [(cc, x, y), (flip_int_cc(cc), y, x)] {
         if let Some(k) = cx.sconst(c_val)
-            && let Some(out) = eval_one(cx, res, norm, val, k)
+            && let Some(out) = eval_one(cx, res, norm, val, k).or_else(|| eval_unit_cmp(cx, res, norm, val, k))
         {
             return Some(out);
         }

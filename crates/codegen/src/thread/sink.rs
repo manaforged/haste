@@ -1,6 +1,6 @@
-use crate::cfg::Cfg;
+use crate::cfg::{Cfg, Loops};
 use crate::fold::for_edges;
-use crate::ir::{Block, Function, Inst, Op, Value};
+use crate::ir::{Block, BlockData, Domain, Function, Inst, Op, Value};
 
 use super::carry::Carry;
 use super::eval::{EvalState, ThreadCx, bind, lookup, lookup_const, seed_edge, step_inst};
@@ -225,4 +225,183 @@ pub(super) fn run(func: &mut Function, cx: &mut ThreadCx<'_>, graph: (&Cfg, &[Op
         }
     }
     changed
+}
+
+fn can_split_exit(func: &Function, cfg: &Cfg, uses: &[u32], block: Block, (target, args): (Block, &[Value])) -> bool {
+    if args.is_empty() || cfg.loops().depth_of(target) >= cfg.loops().depth_of(block) {
+        return false;
+    }
+    body(func, block).iter().any(|&inst| {
+        let data = &func.insts[inst.index()];
+        let Some(res) = data.result else { return false };
+        !matches!(data.op, Op::Const(_) | Op::StackAddr(..))
+            && data.op.is_speculable()
+            && uses[res.index()] > 0
+            && uses[res.index()] == args.iter().filter(|&&a| a == res).count() as u32
+    })
+}
+
+fn add_jump_block(func: &mut Function, target: Block, args: Vec<Value>) -> Block {
+    let split = Block(func.blocks.len() as u32);
+    let jump = func.add(Op::Jump(target, args), None);
+    func.blocks.push(BlockData { params: Vec::new(), insts: vec![jump] });
+    split
+}
+
+fn split_cold_loop_exits(func: &mut Function) -> bool {
+    let uses = func.use_counts();
+    let cfg = func.cfg().clone();
+    let orig_len = func.blocks.len();
+    let mut split_any = false;
+    for bi in 0..orig_len {
+        let block = Block(bi as u32);
+        if !cfg.reachable[bi] || cfg.loops().depth_of(block) == 0 {
+            continue;
+        }
+        let Some(&term) = func.blocks[bi].insts.last() else { continue };
+        let Op::Brif(cond, t_b, t_a, e_b, e_a) = func.insts[term.index()].op.clone() else { continue };
+        if t_b == e_b {
+            continue;
+        }
+        let (mut nt_b, mut nt_a, mut ne_b, mut ne_a) = (t_b, t_a, e_b, e_a);
+        let mut changed = false;
+        if can_split_exit(func, &cfg, &uses, block, (nt_b, &nt_a)) {
+            nt_b = add_jump_block(func, nt_b, std::mem::take(&mut nt_a));
+            changed = true;
+        }
+        if can_split_exit(func, &cfg, &uses, block, (ne_b, &ne_a)) {
+            ne_b = add_jump_block(func, ne_b, std::mem::take(&mut ne_a));
+            changed = true;
+        }
+        if changed {
+            func.insts[term.index()].op = Op::Brif(cond, nt_b, nt_a, ne_b, ne_a);
+            split_any = true;
+        }
+    }
+    split_any
+}
+
+fn loops_subset(loops: &Loops, inner: Block, outer: Block) -> bool {
+    loops.list.iter().all(|each| !each.body[inner.index()] || each.body[outer.index()])
+}
+
+fn non_trivial_op(op: &Op) -> bool {
+    !matches!(op, Op::Const(_) | Op::Select(..))
+}
+
+fn diamond_safe(func: &Function, cfg: &Cfg, (block, target): (Block, Block), (op, queued): (&Op, &[Inst])) -> bool {
+    if cfg.loops().depth_of(target) != cfg.loops().depth_of(block)
+        || cfg.pred_count(target) != 1
+        || !matches!(func.last(target), Some(Op::Jump(..)))
+        || !non_trivial_op(op)
+    {
+        return true;
+    }
+    let base = body(func, target).iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count();
+    let extra = queued.iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count();
+    base + extra < 6
+}
+
+fn pick_sink_target(func: &Function, cfg: &Cfg, block: Block, sites: &[(Inst, Block)], (op, moves): (&Op, &[Vec<Inst>])) -> Option<Block> {
+    let mut lca = sites.first()?.1;
+    for &(_, site) in sites {
+        if !cfg.reachable[site.index()] {
+            return None;
+        }
+        while !cfg.dominates(lca, site) {
+            lca = cfg.idom[lca.index()]?;
+        }
+    }
+    let mut target = lca;
+    while target != block && !loops_subset(cfg.loops(), target, block) {
+        target = cfg.idom[target.index()]?;
+    }
+    if target == block || !cfg.dominates(block, target) {
+        return None;
+    }
+    diamond_safe(func, cfg, (block, target), (op, &moves[target.index()])).then_some(target)
+}
+
+fn build_users(func: &Function) -> Vec<Vec<(Inst, Block)>> {
+    let mut users = vec![Vec::new(); func.types.len()];
+    for (bi, data) in func.blocks.iter().enumerate() {
+        let blk = Block(bi as u32);
+        for &inst in &data.insts {
+            func.insts[inst.index()].op.for_operands(|v| users[v.index()].push((inst, blk)));
+        }
+    }
+    users
+}
+
+fn flush_moves(func: &mut Function, block: Block, moves: &mut Vec<Inst>) {
+    if moves.is_empty() {
+        return;
+    }
+    let mut next: Vec<Inst> = moves.drain(..).rev().collect();
+    next.extend_from_slice(&func.blocks[block.index()].insts);
+    func.blocks[block.index()].insts = next;
+}
+
+fn sink_block(func: &mut Function, cfg: &Cfg, block: Block, users: &mut [Vec<(Inst, Block)>], moves: &mut [Vec<Inst>]) -> bool {
+    flush_moves(func, block, &mut moves[block.index()]);
+    let insts = func.blocks[block.index()].insts.clone();
+    let body_len = insts.len().saturating_sub(1);
+    if body_len == 0 {
+        return false;
+    }
+    let mut kept = vec![true; insts.len()];
+    let mut changed = false;
+    for pos in (0..body_len).rev() {
+        let inst = insts[pos];
+        let data = &func.insts[inst.index()];
+        let Some(res) = data.result else { continue };
+        if !data.op.is_speculable() {
+            continue;
+        }
+        let Some(target) = pick_sink_target(func, cfg, block, &users[res.index()], (&data.op, moves)) else {
+            continue;
+        };
+        kept[pos] = false;
+        moves[target.index()].push(inst);
+        data.op.for_operands(|v| {
+            for entry in &mut users[v.index()] {
+                if entry.0 == inst {
+                    entry.1 = target;
+                }
+            }
+        });
+        changed = true;
+    }
+    if changed {
+        let mut idx = 0;
+        func.blocks[block.index()].insts.retain(|_| {
+            let keep = kept[idx];
+            idx += 1;
+            keep
+        });
+    }
+    changed
+}
+
+fn sink_dominated(func: &mut Function) -> bool {
+    let cfg = func.cfg().clone();
+    let mut users = build_users(func);
+    let mut moves = vec![Vec::new(); func.blocks.len()];
+    let mut changed = false;
+    for &block in &cfg.rpo {
+        changed |= sink_block(func, &cfg, block, &mut users, &mut moves);
+    }
+    changed
+}
+
+pub(super) fn sink_cold(func: &mut Function) -> Domain {
+    let mut out = Domain::NONE;
+    if split_cold_loop_exits(func) {
+        func.bump_cfg();
+        out |= Domain::CFG | Domain::VALUES;
+    }
+    if sink_dominated(func) {
+        out |= Domain::VALUES;
+    }
+    out
 }

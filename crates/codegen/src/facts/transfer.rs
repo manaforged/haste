@@ -1,4 +1,4 @@
-use crate::ir::{Binary, Convert, Function, Op, Type, Value};
+use crate::ir::{Binary, Convert, Function, IntCC, Op, Type, Value};
 
 use super::{Fact, Ranges, compared_range, swapped, unsigned_order};
 
@@ -24,20 +24,82 @@ pub(super) fn transfer(func: &Function, ranges: &Ranges, op: &Op, ty: Type, of: 
     }
 }
 
+pub(super) fn valid(fact: &Fact) -> bool {
+    fact.lo < fact.hi || (fact.lo == fact.hi && fact.admits(fact.lo))
+}
+
+fn unwrap_cond(func: &Function, ranges: &Ranges, mut cond: Value, mut taken: bool) -> (Value, bool) {
+    for _ in 0..4 {
+        match ranges.op(func, cond) {
+            Some(&Op::Convert(Convert::Uextend, inner)) if func.ty(inner).is_small_int() => cond = inner,
+            Some(&Op::Binary(Binary::Bxor, a, b)) => {
+                let flipped = [(a, b), (b, a)].into_iter().find_map(|(inner, mask)| {
+                    (ranges.of(mask).exact() == Some(1) && ranges.of(inner).hi <= 1).then_some(inner)
+                });
+                let Some(inner) = flipped else { break };
+                cond = inner;
+                taken = !taken;
+            }
+            _ => break,
+        }
+    }
+    (cond, taken)
+}
+
+fn cond_bounds(
+    func: &Function,
+    (cc, p, _): (IntCC, Value, Value),
+    (left, right): (&Fact, &Fact),
+    taken: bool,
+) -> Option<Option<(Fact, Fact)>> {
+    let ty = func.ty(p);
+    let Some(order) = unsigned_order(cc, ty, left, right) else { return Some(None) };
+    let np = compared_range(order, ty, right, taken).map_or_else(|| left.clone(), |b| left.clone().meet(&b));
+    let nq = compared_range(swapped(order), ty, left, taken).map_or_else(|| right.clone(), |b| right.clone().meet(&b));
+    (valid(&np) && valid(&nq)).then_some(Some((np, nq)))
+}
+
+fn eval_under(
+    func: &Function,
+    ranges: &Ranges,
+    v: Value,
+    of: Of<'_>,
+    ((p, np), (q, nq), depth): ((Value, &Fact), (Value, &Fact), u8),
+) -> Fact {
+    if v == p {
+        return np.clone();
+    }
+    if v == q {
+        return nq.clone();
+    }
+    let base = of(v);
+    if depth >= 4 || !func.ty(v).is_small_int() {
+        return base;
+    }
+    let Some(op) = ranges.op(func, v).filter(|op| matches!(op, Op::Binary(..) | Op::Convert(..))) else {
+        return base;
+    };
+    let sub = |u: Value| eval_under(func, ranges, u, of, ((p, np), (q, nq), depth + 1));
+    base.meet(&transfer(func, ranges, op, func.ty(v), &sub))
+}
+
 /// The fact on `value` as the arm a select on `cond` yields when `cond` is `taken`: the arm's own fact, met with what the condition says of it on that side. `None` when the select never yields the arm.
-fn arm(func: &Function, ranges: &Ranges, (cond, value, taken): (Value, Value, bool), of: Of<'_>) -> Option<Fact> {
+fn arm(func: &Function, ranges: &Ranges, (raw_cond, value, raw_taken): (Value, Value, bool), of: Of<'_>) -> Option<Fact> {
     let mut fact = of(value);
+    let (cond, taken) = unwrap_cond(func, ranges, raw_cond, raw_taken);
     match ranges.op(func, cond) {
-        Some(&Op::Icmp(cc, p, q)) if (value == p || value == q) && func.ty(p).is_small_int() => {
-            let ty = func.ty(p);
+        Some(&Op::Icmp(cc, p, q)) if func.ty(p).is_small_int() => {
             let (left, right) = (of(p), of(q));
-            if let Some(order) = unsigned_order(cc, ty, &left, &right) {
-                if value == p && let Some(bound) = compared_range(order, ty, &right, taken) {
-                    fact = fact.meet(&bound);
-                }
-                if value == q && let Some(bound) = compared_range(swapped(order), ty, &left, taken) {
-                    fact = fact.meet(&bound);
-                }
+            if let Some((np, nq)) = cond_bounds(func, (cc, p, q), (&left, &right), taken)? {
+                fact = if value == p {
+                    np
+                } else if value == q {
+                    nq
+                } else if matches!(ranges.op(func, value), Some(Op::Binary(..) | Op::Convert(..))) {
+                    fact.meet(&eval_under(func, ranges, value, of, ((p, &np), (q, &nq), 0)))
+                } else {
+                    fact
+                };
             }
         }
         Some(&Op::Fits(op, false, p, q)) if taken && computes(ranges.op(func, value), op, p, q) => {
@@ -45,7 +107,7 @@ fn arm(func: &Function, ranges: &Ranges, (cond, value, taken): (Value, Value, bo
         }
         _ => {}
     }
-    (fact.lo <= fact.hi).then_some(fact)
+    valid(&fact).then_some(fact)
 }
 
 /// Whether `def` is `p op q`, in either operand order when `op` commutes.
