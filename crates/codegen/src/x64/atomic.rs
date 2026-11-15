@@ -530,15 +530,7 @@ impl Emit<'_> {
             return;
         }
         let dst = self.dst(result);
-        let val_of = |v| self.const_of(v).map(|imm| crate::fold::extend(imm, ty, false));
-        if let (Some(xv), Some(yv)) = (val_of(x), val_of(y))
-            && ((xv == 1 && yv == 0) || (xv == 0 && yv == 1))
-        {
-            self.asm.setcc(if xv == 1 { cond } else { cond.invert() }, dst);
-            self.asm.load(Size::B, dst, dst);
-            self.clobber_reg(dst);
-            self.put(result, dst);
-            self.flags = Some((condition, orig_cond));
+        if self.select_const_pair((condition, orig_cond), cond, (x, y), (ty, dst, result)) {
             return;
         }
         let (mut x, mut y) = (x, y);
@@ -552,6 +544,92 @@ impl Emit<'_> {
         self.asm.cmov(cond, dst, source);
         self.clobber_reg(dst);
         self.put(result, dst);
+    }
+
+    fn select_const_pair(
+        &mut self,
+        root: (Value, Cond),
+        cond: Cond,
+        values: (Value, Value),
+        target: (Type, Reg, Value),
+    ) -> bool {
+        let (x, y) = values;
+        let (ty, dst, result) = target;
+        let (Some(xv), Some(yv)) = (self.const_of(x), self.const_of(y)) else {
+            return false;
+        };
+        if !matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64) {
+            return false;
+        }
+        let xu = crate::fold::extend(xv, ty, false) as u64;
+        let yu = crate::fold::extend(yv, ty, false) as u64;
+        if (xu == 1 && yu == 0) || (xu == 0 && yu == 1) {
+            self.emit_setcc_byte(if xu == 1 { cond } else { cond.invert() }, dst);
+        } else if !self.select_const_lea(cond, (xu, yu), target) {
+            return false;
+        }
+        self.flags = Some(root);
+        self.clobber_reg(dst);
+        self.put(result, dst);
+        true
+    }
+
+    fn select_const_lea(
+        &mut self,
+        cond: Cond,
+        pair: (u64, u64),
+        target: (Type, Reg, Value),
+    ) -> bool {
+        let (xu, yu) = pair;
+        let (ty, dst, result) = target;
+        if dst == Reg::Rsp {
+            return false;
+        }
+        let mask = u64::MAX >> (64 - ty.bits());
+        let subword_zext = matches!(ty, Type::I8 | Type::I16) && self.plan.zero_ext[result.index()];
+        let Some((branch_cond, imm32, step)) = Self::match_select_lea(cond, (xu, yu), (ty, mask, subword_zext)) else {
+            return false;
+        };
+        let size = if ty == Type::I64 { Size::Q } else { Size::D };
+        let mem = match step {
+            1 => Mem::new(dst, imm32),
+            2 => Mem::sib(dst, dst, 0, imm32),
+            3 => Mem::sib(dst, dst, 1, imm32),
+            5 => Mem::sib(dst, dst, 2, imm32),
+            _ => Mem::sib(dst, dst, 3, imm32),
+        };
+        self.emit_setcc_byte(branch_cond, dst);
+        self.asm.lea_sized(size, dst, mem);
+        true
+    }
+
+    fn match_select_lea(
+        cond: Cond,
+        pair: (u64, u64),
+        info: (Type, u64, bool),
+    ) -> Option<(Cond, i32, u64)> {
+        let (xu, yu) = pair;
+        let (ty, mask, subword_zext) = info;
+        for step in [1_u64, 2, 3, 5, 9] {
+            for (branch_cond, small, hi) in [(cond, yu, xu), (cond.invert(), xu, yu)] {
+                if hi != (small.wrapping_add(step) & mask) {
+                    continue;
+                }
+                if subword_zext && small.checked_add(step).is_none_or(|top| top > mask) {
+                    continue;
+                }
+                let small_signed = if subword_zext { small as i64 } else { crate::fold::extend(small as i64, ty, true) };
+                if let Ok(imm32) = i32::try_from(small_signed) {
+                    return Some((branch_cond, imm32, step));
+                }
+            }
+        }
+        None
+    }
+
+    fn emit_setcc_byte(&mut self, cond: Cond, dst: Reg) {
+        self.asm.setcc(cond, dst);
+        self.asm.load(Size::B, dst, dst);
     }
 
     /// Leaves the old contents in rax.

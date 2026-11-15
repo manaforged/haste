@@ -154,8 +154,14 @@ impl Emit<'_> {
             self.sse_or_vex(&[0x66], &[0x0F, 0x76], (dst, dst, dst));
             return;
         }
-        self.asm.mov_imm(Reg::Rax, imm);
-        self.splat_scalar(lane, dst, Reg::Rax);
+        let (packed, emit_lane) = match lane {
+            Lane::I8 => (i64::from((imm as u8 as u32) * 0x0101_0101), Lane::I32),
+            Lane::I16 => (i64::from((imm as u16 as u32) * 0x0001_0001), Lane::I32),
+            Lane::I32 | Lane::F32 => (i64::from(imm as u32), Lane::I32),
+            Lane::I64 | Lane::F64 => (imm, Lane::I64),
+        };
+        self.asm.mov_imm(Reg::Rax, packed);
+        self.splat_scalar(emit_lane, dst, Reg::Rax);
     }
 
     pub(super) fn vector_unary(&mut self, op: Unary, x: Value, result: Value) -> Result<(), String> {
