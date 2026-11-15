@@ -557,8 +557,7 @@ impl Build {
         let target = crate::host_target();
         let store = bin.store.take().context("the binary's inference store is in use")?;
         let mut cx = sema::Context::new(&self.compilation.outline, &self.compilation.names, store);
-        let reached = &bin.reached;
-        let exe = bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]), &mut |index| reached.list.get(index).map_or_else(|| format!("fn{index}"), |((item, _), _)| cx.qualified(*item)));
+        let exe = bin.image.to_aot(&target, (bin.roots[0], bin.roots[1]), &mut cx, &bin.reached);
         bin.store = Some(cx.release().0);
         exe?.write(path)?;
         eprintln!("built {} ({} functions reached, {:.1} ms)", path.display(), bin.reached.list.len(), started.elapsed().as_secs_f64() * 1e3);
