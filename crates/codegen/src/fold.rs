@@ -562,14 +562,16 @@ impl Fold {
         Some(i64::from(holds(*cc, func.ty(*x), value(*x)?, value(*y)?)))
     }
 
-    /// Replaces each block parameter that every reachable edge gives one value, other than itself.
+    /// Replaces each block parameter that every reachable edge gives one value, other than itself, or the value of an earlier parameter of its block.
     fn params(&mut self, func: &Function, reachable: &[bool], pinned: &[bool]) -> bool {
         for param in func.blocks.iter().flat_map(|block| &block.params) {
             self.incoming[param.index()] = None;
             self.mixed[param.index()] = false;
         }
+        let mut into: Vec<Vec<&[Value]>> = vec![Vec::new(); func.blocks.len()];
         for (block, _) in reachable.iter().enumerate().filter(|(_, live)| **live) {
             for_edges(func, block, |target, args| {
+                if func.blocks[target.index()].params.len() > 1 { into[target.index()].push(args); }
                 for (param, arg) in func.blocks[target.index()].params.iter().zip(args) {
                     let arg = self.find(*arg);
                     match self.incoming[param.index()] {
@@ -582,13 +584,32 @@ impl Fold {
             });
         }
         let mut changed = false;
-        for (_, data) in func.blocks.iter().enumerate().filter(|(block, _)| reachable[*block] && !pinned[*block]) {
+        for (block, data) in func.blocks.iter().enumerate().filter(|(block, _)| reachable[*block] && !pinned[*block]) {
             for param in &data.params {
                 if let (Some(value), false) = (self.incoming[param.index()], self.mixed[param.index()]) && self.subst[param.index()] == *param {
                     self.subst[param.index()] = value;
                     changed = true;
                 }
             }
+            changed |= self.twins(func, &data.params, &into[block]);
+        }
+        changed
+    }
+
+    /// Replaces each parameter that every edge `edges` lists gives the value of an earlier parameter of its block, or the pair of the two themselves, by that earlier parameter.
+    fn twins(&mut self, func: &Function, params: &[Value], edges: &[&[Value]]) -> bool {
+        let mut changed = false;
+        for later in 1..params.len() {
+            let twin = params[later];
+            if edges.is_empty() || self.subst[twin.index()] != twin { continue; }
+            let same = |at: usize| {
+                let first = params[at];
+                self.subst[first.index()] == first && func.ty(first) == func.ty(twin) && edges.iter().all(|args| match (args.get(at), args.get(later)) {
+                    (Some(x), Some(y)) => { let pair = (self.find(*x), self.find(*y)); pair.0 == pair.1 || pair == (first, twin) }
+                    _ => false,
+                })
+            };
+            if let Some(at) = (0..later).find(|&at| same(at)) { self.subst[twin.index()] = params[at]; changed = true; }
         }
         changed
     }
