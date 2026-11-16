@@ -316,3 +316,30 @@ pub(crate) fn preheader(func: &mut Function, cfg: &Cfg, each: &Loop) -> Option<B
     func.bump_cfg();
     Some(pre)
 }
+
+/// Undoes each `(preheader, head)` that `preheader` made and that still only jumps on to its head with its own parameters, and returns whether any made one stays.
+pub(crate) fn drop_bare_preheaders(func: &mut Function, made: &[(Block, Block)]) -> bool {
+    let bare: Vec<(Block, Block)> = made
+        .iter()
+        .copied()
+        .filter(|&(pre, head)| {
+            let data = &func.blocks[pre.index()];
+            matches!(data.insts[..], [jump] if matches!(&func.insts[jump.index()].op, Op::Jump(target, args) if *target == head && *args == data.params))
+        })
+        .collect();
+    if bare.is_empty() {
+        return !made.is_empty();
+    }
+    for block in 0..func.blocks.len() {
+        let Some(&last) = func.blocks[block].insts.last() else { continue };
+        func.insts[last.index()].op.map_targets(|target| bare.iter().find(|&&(pre, _)| pre == target).map_or(target, |&(_, head)| head));
+    }
+    for &(pre, _) in bare.iter().rev() {
+        func.blocks[pre.index()].insts.drain(..).for_each(|inst| func.insts[inst.index()].op = Op::Trap);
+        if pre.index() + 1 == func.blocks.len() {
+            func.blocks.pop();
+        }
+    }
+    func.bump_cfg();
+    bare.len() < made.len()
+}

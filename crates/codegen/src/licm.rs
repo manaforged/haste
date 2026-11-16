@@ -733,11 +733,12 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     }
     let mut inv = Invariants { prov: &prov, is_const: &mut is_const };
     let mut dirty = Domain::NONE;
+    let mut made = Vec::new();
     for idx in 0..found.list.len() {
         let before = func.blocks.len();
         let Some(pre) = cfg::preheader(func, &cfg, &found.list[idx]) else { continue };
         if func.blocks.len() > before {
-            dirty |= Domain::CFG;
+            made.push((pre, found.list[idx].head));
             home.resize(func.types.len(), Some(pre));
             let head_idx = found.list[idx].head.index();
             let mut pre_preds = Vec::new();
@@ -778,11 +779,14 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             dirty |= Domain::VALUES;
         }
     }
-    if dirty.contains(Domain::CFG) {
+    if !made.is_empty() || dirty.contains(Domain::CFG) {
         func.bump_cfg();
     }
     if unswitch(func) {
         dirty |= Domain::CFG | Domain::VALUES;
+    }
+    if cfg::drop_bare_preheaders(func, &made) {
+        dirty |= Domain::CFG;
     }
     dirty
 }
