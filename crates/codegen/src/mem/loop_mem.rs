@@ -341,6 +341,10 @@ pub(crate) struct LoopMem {
     copy_locs: Vec<MemLoc>,
 }
 
+fn is_unknown_write(root: MemRoot) -> bool {
+    !matches!(root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::UniqueHeap)
+}
+
 fn entry_param(func: &Function, param: u16) -> Option<Value> {
     let entry = func.entry?;
     func.blocks[entry.index()].params.get(usize::from(param)).copied()
@@ -406,10 +410,10 @@ impl LoopMem {
             Op::Store(val, addr, off) => {
                 let root = prov.loc(addr, i64::from(off), func.ty(val).bytes()).root;
                 self.mark_head_noalias(root);
-                return !matches!(root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::UniqueHeap);
+                return is_unknown_write(root);
             }
-            Op::Move(dst, _, bytes) => return !matches!(prov.loc(dst, 0, bytes).root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::UniqueHeap),
-            Op::Copy(dst, _, _) => return !matches!(prov.loc(dst, 0, u32::MAX).root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::UniqueHeap),
+            Op::Move(dst, _, bytes) => return is_unknown_write(prov.loc(dst, 0, bytes).root),
+            Op::Copy(dst, _, _) => return is_unknown_write(prov.loc(dst, 0, u32::MAX).root),
             _ => {}
         }
         false

@@ -67,13 +67,7 @@ fn count_safe_args(func: &Function, target: Block, args: &[Value], tracked: &[Tr
 }
 
 fn is_unknown_mem_op(op: &Op, slots: &[Option<(StackSlot, i32)>], tracked: &[TrackRoot]) -> bool {
-    let known = |v: Value| {
-        slots[v.index()].is_some()
-            || matches!(
-                tracked[v.index()],
-                TrackRoot::Set(MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::ReadonlyParam(_) | MemRoot::UniqueHeap)
-            )
-    };
+    let known = |v: Value| slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(root) if root.is_identified());
     match *op {
         Op::Load(addr, _) | Op::Store(_, addr, _) => !known(addr),
         Op::Move(dst, src, _) | Op::Copy(dst, src, _) => !known(dst) || !known(src),
@@ -121,8 +115,12 @@ fn post_call_safe(func: &Function, block: Block, pos: usize, in_loop: &[bool], d
     !func.insts[term.index()].op.targets().any(|t| danger[t.index()])
 }
 
+fn is_rooted(v: Value, slots: &[Option<(StackSlot, i32)>], tracked: &[TrackRoot]) -> bool {
+    slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(_))
+}
+
 fn mark_safe(v: Value, slots: &[Option<(StackSlot, i32)>], tracked: &[TrackRoot], safe: &mut [u32]) {
-    if slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(_)) {
+    if is_rooted(v, slots, tracked) {
         safe[v.index()] += 1;
     }
 }
@@ -144,7 +142,7 @@ fn classify_icmp(
 ) {
     for (v, other) in [(a, b), (b, a)] {
         let is_noalias = matches!(tracked[v.index()], TrackRoot::Set(MemRoot::NoAliasParam(_)));
-        let same_or_const = (slots[v.index()].is_some() || matches!(tracked[v.index()], TrackRoot::Set(_)))
+        let same_or_const = is_rooted(v, slots, tracked)
             && (is_const[other.index()]
                 || matches!((tracked[v.index()], tracked[other.index()]), (TrackRoot::Set(ra), TrackRoot::Set(rb)) if ra == rb));
         if is_noalias || same_or_const {

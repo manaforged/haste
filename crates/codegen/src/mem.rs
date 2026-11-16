@@ -17,6 +17,13 @@ pub(crate) enum MemRoot {
     Unknown,
 }
 
+impl MemRoot {
+    /// Whether the root names one known object: a stack slot, a noalias or readonly parameter, or a unique heap allocation.
+    pub(crate) fn is_identified(&self) -> bool {
+        matches!(self, Self::Slot(_) | Self::NoAliasParam(_) | Self::ReadonlyParam(_) | Self::UniqueHeap)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum MemBase {
     Slot(StackSlot),
