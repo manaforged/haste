@@ -57,6 +57,13 @@ impl Body {
     }
 }
 
+impl BlockKind {
+    /// Whether this block introduces a plain value scope rather than a `try`, `async`, `gen`, or `const` boundary.
+    pub fn is_plain_scope(self) -> bool {
+        matches!(self, Self::Plain | Self::Expansion | Self::Unsafe)
+    }
+}
+
 /// What a body is parsed with besides its tokens: the block each macro call became, and the environment that `#[cfg]` attributes read.
 #[derive(Clone, Copy, Default)]
 pub struct Config<'a> {

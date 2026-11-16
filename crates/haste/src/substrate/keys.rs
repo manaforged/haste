@@ -316,24 +316,13 @@ fn hash_sysroot_roots(roots: Vec<PathBuf>, hasher: &mut FxHasher) {
             }
         }
     }
-    let dirs: Vec<_> = work.iter().enumerate().filter(|(_, (_, s))| s.is_none()).map(|(i, (p, _))| (i, p.as_path())).collect();
-    let (workers, next) = (crate::jobs().min(dirs.len()), std::sync::atomic::AtomicUsize::new(0));
+    let dirs: Vec<(usize, &Path)> = work.iter().enumerate().filter(|(_, (_, s))| s.is_none()).map(|(i, (p, _))| (i, p.as_path())).collect();
     let mut chunks = vec![Vec::new(); work.len()];
-    let drain = || {
-        let mut local = Vec::new();
-        while let Some(&(slot, dir)) = dirs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-            let mut items = Vec::new();
-            walk_sysroot_dir(dir, &mut items);
-            local.push((slot, items));
-        }
-        local
-    };
-    let done = if workers > 1 {
-        std::thread::scope(|s| (0..workers).map(|_| s.spawn(drain)).collect::<Vec<_>>().into_iter().flat_map(|h| h.join().unwrap_or_default()).collect())
-    } else {
-        drain()
-    };
-    for (slot, items) in done {
+    for (slot, items) in crate::sync::parallel_map(dirs, |(slot, dir)| {
+        let mut items = Vec::new();
+        walk_sysroot_dir(dir, &mut items);
+        (slot, items)
+    }) {
         chunks[slot] = items;
     }
     for (i, (path, stamp)) in work.into_iter().enumerate() {

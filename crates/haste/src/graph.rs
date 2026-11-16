@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
@@ -238,42 +237,11 @@ fn load_package(entry: Locked, registries: &[PathBuf], paths: &BTreeMap<String, 
 }
 
 fn load_packages(locked: Vec<Locked>, registries: &[PathBuf], paths: &BTreeMap<String, PathBuf>) -> Result<(Vec<Package>, Vec<Option<anyhow::Error>>)> {
-    let total = locked.len();
-    let workers = crate::jobs().min(total).max(1);
-    let mut results: Vec<Option<Result<(Package, Option<anyhow::Error>)>>> = (0..total).map(|_| None).collect();
-    if workers <= 1 {
-        for (idx, entry) in locked.into_iter().enumerate() {
-            results[idx] = Some(load_package(entry, registries, paths));
-        }
-    } else {
-        let queue = Mutex::new(locked.into_iter().enumerate());
-        let worker = || {
-            let mut out = Vec::new();
-            loop {
-                let next = crate::sync::lock(&queue).next();
-                let Some((idx, entry)) = next else { break };
-                out.push((idx, load_package(entry, registries, paths)));
-            }
-            out
-        };
-        let chunks = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..workers - 1).map(|_| scope.spawn(&worker)).collect();
-            let mut all = worker();
-            for handle in handles {
-                if let Ok(chunk) = handle.join() {
-                    all.extend(chunk);
-                }
-            }
-            all
-        });
-        for (idx, res) in chunks {
-            results[idx] = Some(res);
-        }
-    }
-    let mut packages = Vec::with_capacity(total);
-    let mut missing = Vec::with_capacity(total);
-    for (idx, slot) in results.into_iter().enumerate() {
-        let (pkg, err) = slot.unwrap_or_else(|| Err(anyhow::anyhow!("graph worker failed for package {idx}")))?;
+    let results = crate::sync::parallel_map(locked, |entry| load_package(entry, registries, paths));
+    let mut packages = Vec::with_capacity(results.len());
+    let mut missing = Vec::with_capacity(results.len());
+    for res in results {
+        let (pkg, err) = res?;
         packages.push(pkg);
         missing.push(err);
     }

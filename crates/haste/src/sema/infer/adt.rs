@@ -334,7 +334,7 @@ impl<'a> Infer<'_, 'a> {
         let slice = self.cx.types.substs(args).to_vec();
         let field = self.adt_fields(item, &slice)?[0][index as usize];
         if !self.has_vars(ty) && !self.has_params(ty) {
-            self.cx.layout(ty).ok();
+            drop(self.cx.layout(ty));
         }
         Ok(field)
     }

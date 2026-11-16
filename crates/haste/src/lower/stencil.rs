@@ -585,8 +585,6 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         Shape::Anon(anon) => anon.arena.clone(),
         Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) => Arena::Body(Arc::default()),
     };
-    let src = cx.body_src(source);
-    let overflow_checks = cx.outline.crates[source.krate as usize].env.overflow_checks();
     let mut sig = if is_static(cx, *item) { signature_of(cx, None, [])? } else { signature(cx, typed)? };
     if mode == LowerMode::Dict {
         sig.params.push(AbiParam::special(Type::I64, ArgumentPurpose::Dict));
@@ -596,36 +594,7 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
     let mut relocs = Vec::new();
     let mut reloc_plan = Vec::new();
     let cycle = {
-        let mut lower = Lower {
-            cx,
-            reached,
-            slots,
-            inline,
-            body: arena.body(),
-            src,
-            typed,
-            b,
-            locals: vec![None; typed.locals.len()],
-            loops: Vec::new(),
-            try_exits: Vec::new(),
-            open: true,
-            dead: None,
-            sret: None,
-            dict_param: None,
-            mode,
-            relocs: &mut relocs,
-            reloc_plan: &mut reloc_plan,
-            promoted_seq: 0,
-            cycle_root: usize::MAX,
-            owned: Vec::new(),
-            flags: Vec::new(),
-            moved: Default::default(),
-            extended: Default::default(),
-            pending: Vec::new(),
-            index,
-            resume: None,
-            overflow_checks,
-        };
+        let mut lower = Lower::new(cx, (reached, slots, inline), (index, source, arena.body(), typed), (b, mode), (&mut relocs, &mut reloc_plan));
         lower.run()?;
         lower.cycle_root
     };

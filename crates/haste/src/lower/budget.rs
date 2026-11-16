@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use haste_codegen::{Function, FunctionBuilder, Type, Value};
 
-use crate::body::{BinOp, BlockKind, Body, Expr, ExprId, Pat, PatId, Stmt, UnOp};
+use crate::body::{BinOp, Body, Expr, ExprId, Pat, PatId, Stmt, UnOp};
 use crate::names::ItemRef;
 use crate::sema::Context;
 use crate::sema::infer::{Res, Shape, Typed, needs_drop};
@@ -292,11 +292,7 @@ fn peel_block(body: &Body, mut expr: ExprId) -> ExprId {
     loop {
         match *body.expr(expr) {
             Expr::Paren(inner) => expr = inner,
-            Expr::Block { stmts, tail: Some(tail), label: None, kind }
-                if body.list(stmts).is_empty() && matches!(kind, BlockKind::Plain | BlockKind::Expansion | BlockKind::Unsafe) =>
-            {
-                expr = tail;
-            }
+            Expr::Block { stmts, tail: Some(tail), label: None, kind } if body.list(stmts).is_empty() && kind.is_plain_scope() => expr = tail,
             _ => return expr,
         }
     }
@@ -351,7 +347,7 @@ fn pure_data(cx: &mut Context<'_>, body: &Body, typed: &Typed, expr: ExprId, rem
             no_drop(cx, typed, expr) && body.list(fields).iter().all(|&at| pure_expr(cx, body, typed, body.fields[at as usize].value, rem))
         }
         Expr::Call(callee, args) => pure_ctor_call(cx, body, typed, (expr, callee, args), rem),
-        Expr::Block { stmts, tail, label: None, kind } if matches!(kind, BlockKind::Plain | BlockKind::Expansion | BlockKind::Unsafe) => {
+        Expr::Block { stmts, tail, label: None, kind } if kind.is_plain_scope() => {
             pure_tail(cx, body, typed, (body.list(stmts), tail), rem)
         }
         Expr::If(cond, then_e, Some(else_e)) => {
@@ -414,7 +410,7 @@ fn pure_tail(cx: &mut Context<'_>, body: &Body, typed: &Typed, (stmts, tail): (&
 fn always_returns(body: &Body, expr: ExprId) -> bool {
     match *body.expr(peel_block(body, expr)) {
         Expr::Return(_) => true,
-        Expr::Block { stmts, tail, label: None, kind } if matches!(kind, BlockKind::Plain | BlockKind::Expansion | BlockKind::Unsafe) => {
+        Expr::Block { stmts, tail, label: None, kind } if kind.is_plain_scope() => {
             body.list(stmts).iter().any(|&s| matches!(body.stmts[s as usize], Stmt::Expr(e, _) if always_returns(body, e)))
                 || tail.is_some_and(|t| always_returns(body, t))
         }
@@ -454,7 +450,7 @@ fn root_stmts_tail(body: &Body, root: ExprId) -> (Vec<u32>, Option<ExprId>) {
     loop {
         match *body.expr(cur) {
             Expr::Paren(inner) => cur = inner,
-            Expr::Block { stmts, tail, label: None, kind } if matches!(kind, BlockKind::Plain | BlockKind::Expansion | BlockKind::Unsafe) => {
+            Expr::Block { stmts, tail, label: None, kind } if kind.is_plain_scope() => {
                 prelude.extend_from_slice(body.list(stmts));
                 let Some(next) = tail else { return (prelude, None); };
                 if prelude.is_empty() || matches!(*body.expr(next), Expr::Block { .. } | Expr::Paren(_)) {
@@ -541,15 +537,7 @@ fn lower_pure_ok(lower: &Lower<'_, '_>) -> bool {
 }
 
 fn emit_partial(lower: &mut Lower<'_, '_>, index: usize, split: &FastSplit) -> Result<bool> {
-    let entry = lower.b.create_block();
-    lower.b.append_block_params_for_function_params(entry);
-    let entry_params = lower.b.block_params(entry).to_vec();
-    lower.b.switch_to_block(entry);
-    let (prologue, start) = (lower.b.create_block(), lower.b.create_block());
-    lower.jump(prologue, &[]);
-    lower.b.switch_to_block(start);
-    lower.moved = lower.moved_paths()?;
-    lower.declare_params(entry)?;
+    let (prologue, start, entry_params) = lower.begin_entry()?;
     for &stmt in &split.prelude {
         lower.stmt(lower.body.stmts[stmt as usize])?;
     }
@@ -573,49 +561,16 @@ fn emit_partial(lower: &mut Lower<'_, '_>, index: usize, split: &FastSplit) -> R
         return Ok(false);
     }
     emit_slow_call(lower, index, &entry_params);
-    lower.enter(prologue);
-    lower.jump(start, &[]);
-    lower.close();
-    lower.seal();
+    lower.finish_prologue(prologue, start);
     Ok(true)
 }
 
 fn lower_partial_func(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, (index, item, typed, body, split): (usize, ItemRef, &Typed, &Body, &FastSplit)) -> Result<Option<(Function, Vec<SymbolSource>, Vec<RelocStep>)>> {
     let mut func = Function::new(signature(cx, typed)?);
     let (mut relocs, mut reloc_plan) = (Vec::new(), Vec::new());
-    let src = cx.body_src(item);
-    let overflow_checks = cx.outline.crates[item.krate as usize].env.overflow_checks();
     let built = {
-        let mut lower = Lower {
-            cx,
-            reached,
-            slots,
-            inline,
-            body,
-            src,
-            typed,
-            b: FunctionBuilder::new(&mut func),
-            locals: vec![None; typed.locals.len()],
-            loops: Vec::new(),
-            try_exits: Vec::new(),
-            open: true,
-            dead: None,
-            sret: None,
-            dict_param: None,
-            mode: LowerMode::Stencil,
-            relocs: &mut relocs,
-            reloc_plan: &mut reloc_plan,
-            promoted_seq: 0,
-            cycle_root: usize::MAX,
-            owned: Vec::new(),
-            flags: Vec::new(),
-            moved: Default::default(),
-            extended: Default::default(),
-            pending: Vec::new(),
-            index,
-            resume: None,
-            overflow_checks,
-        };
+        let b = FunctionBuilder::new(&mut func);
+        let mut lower = Lower::new(cx, (reached, slots, inline), (index, item, body, typed), (b, LowerMode::Stencil), (&mut relocs, &mut reloc_plan));
         emit_partial(&mut lower, index, split)?
     };
     let ok = built && reloc_plan.iter().all(|step| matches!(step, RelocStep::Const(_)));
@@ -632,7 +587,10 @@ fn partial_body(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), 
     let typed: &Typed = &typed;
     let Shape::Body = typed.shape else { return Ok(None) };
     let body = cx.body(*item)?;
-    let Some(split) = body.root.and_then(|root| fast_split(cx, &body, typed, root)) else {
+    let Some(root) = body.root.filter(|root| !typed.closures.get(root).is_some_and(|closure| closure.coroutine)) else {
+        return Ok(None);
+    };
+    let Some(split) = fast_split(cx, &body, typed, root) else {
         return Ok(None);
     };
     let Some(footprint) = resolve_partial_fp(cx, (reached, slots), inline, index, fp)? else {

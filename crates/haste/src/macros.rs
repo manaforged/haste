@@ -209,7 +209,7 @@ fn apply(compilation: &mut Compilation, bound: &[Bound], outputs: Vec<Result<Str
     let Compilation { outline, names, .. } = compilation;
     let to_parse: Vec<(std::path::PathBuf, Result<String, String>)> =
         bound.iter().zip(outputs).map(|(call, output)| (site_path(&call.site), output)).collect();
-    let parsed = parallel_map(to_parse, |(path, output)| output.and_then(|text| Source::parse(path, text).map_err(|error| format!("{error:#}"))));
+    let parsed = crate::sync::parallel_map(to_parse, |(path, output)| output.and_then(|text| Source::parse(path, text).map_err(|error| format!("{error:#}"))));
     let mut by_crate: HashMap<usize, Vec<(usize, Source, String)>> = HashMap::default();
     let mut stale = Vec::new();
     for (call, parsed) in bound.iter().zip(parsed) {
@@ -357,7 +357,7 @@ fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) ->
             checks.push((at, key));
         }
     }
-    for (at, kept) in parallel_map(checks, |(at, key)| (at, key.kept())) {
+    for (at, kept) in crate::sync::parallel_map(checks, |(at, key)| (at, key.kept())) {
         results[at] = kept;
     }
     let missing: Vec<usize> = (0..bound.len()).filter(|&at| results[at].is_none()).collect();
@@ -440,29 +440,4 @@ fn macro_graph_stamp(outline: &Outline, roots: &[usize]) -> u64 {
         }
     }
     hasher.finish()
-}
-
-fn parallel_map<T: Send, R: Send>(mut items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
-    let workers = crate::jobs().min(items.len());
-    if items.len() < 4 || workers <= 1 {
-        return items.into_iter().map(work).collect();
-    }
-    let chunk = items.len().div_ceil(workers);
-    let mut batches = Vec::with_capacity(workers);
-    while !items.is_empty() {
-        batches.push(items.split_off(items.len().saturating_sub(chunk)));
-    }
-    batches.reverse();
-    let mut slots: Vec<Vec<R>> = (0..batches.len()).map(|_| Vec::new()).collect();
-    if let Some((first_batch, rest_batches)) = batches.split_first_mut()
-        && let Some((first_slot, rest_slots)) = slots.split_first_mut()
-    {
-        std::thread::scope(|scope| {
-            for (batch, slot) in rest_batches.iter_mut().zip(rest_slots.iter_mut()) {
-                scope.spawn(|| *slot = std::mem::take(batch).into_iter().map(&work).collect());
-            }
-            *first_slot = std::mem::take(first_batch).into_iter().map(&work).collect();
-        });
-    }
-    slots.into_iter().flatten().collect()
 }

@@ -53,7 +53,7 @@ use rustc_hash::FxHashMap as HashMap;
 use anyhow::{Result, bail};
 
 use crate::body::sig::Signature;
-use crate::body::{BlockKind, Body, Expr, ExprId, PatId};
+use crate::body::{Body, Expr, ExprId, PatId};
 use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::source::Source;
 
@@ -651,7 +651,7 @@ impl Infer<'_, '_> {
     fn branch_ends(&self, expr: ExprId) -> Option<Vec<ExprId>> {
         match *self.body.expr(expr) {
             Expr::Paren(inner) => Some(vec![inner]),
-            Expr::Block { tail: Some(tail), label: None, kind: BlockKind::Plain | BlockKind::Expansion | BlockKind::Unsafe, .. } => Some(vec![tail]),
+            Expr::Block { tail: Some(tail), label: None, kind, .. } if kind.is_plain_scope() => Some(vec![tail]),
             Expr::If(_, then, Some(otherwise)) => Some(vec![then, otherwise]),
             Expr::Match(_, arms) => Some(self.body.list(arms).iter().map(|&at| self.body.arms[at as usize].body).collect()),
             _ => None,

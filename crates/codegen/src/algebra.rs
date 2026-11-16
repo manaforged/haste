@@ -21,7 +21,7 @@ impl<'a> RewriteCx<'a> {
     fn sconst(&self, v: Value) -> Option<i64> { self.consts.get(v.index()).copied().flatten() }
     fn uconst(&self, v: Value, ty: Type) -> Option<u64> { self.sconst(v).map(|c| extend(c, ty, false) as u64) }
     fn known(&self, v: Value) -> (u64, u64) { crate::fold::known_bits(self.func, &|x| self.def(x), &|x| self.sconst(x), v, 0) }
-    fn op(&self, v: Value) -> Option<&Op> { self.def(v).map(|inst| &self.func.insts[inst.index()].op) }
+    fn op(&self, v: Value) -> Option<&Op> { op_of(self.func, |x| self.def(x), v) }
     fn count(&self, sh: Value, ty: Type) -> Option<u32> { self.sconst(sh).map(|imm| (imm as u32) & (ty.bits() - 1)) }
     fn single_use(&self, v: Value) -> bool { self.uses.get(v.index()).copied().unwrap_or(1) <= 1 }
     fn is_unit_bool(&self, v: Value) -> bool { let t = self.func.ty(v); t.is_small_int() && (self.known(v).0 & (t.unsigned_max() & !1)) == (t.unsigned_max() & !1) }
@@ -49,9 +49,41 @@ impl<'a> RewriteCx<'a> {
         self.func.ty(src) == ty && (active & mask) == active
     }
 
-    fn unwrap_uextend(&self, mut v: Value) -> Value {
-        while let Some(inst) = self.def(v) && let Op::Convert(Convert::Uextend, inner) = self.func.insts[inst.index()].op { v = inner; }
-        v
+    fn unwrap_uextend(&self, v: Value) -> Value {
+        peel_uext(self.func, |x| self.def(x), v)
+    }
+}
+
+pub(super) fn op_of<'f>(func: &'f Function, def_of: impl Fn(Value) -> Option<Inst>, v: Value) -> Option<&'f Op> {
+    def_of(v).map(|inst| &func.insts[inst.index()].op)
+}
+
+pub(super) fn peel_uextend(mut v: Value, step: impl Fn(Value) -> Option<Value>) -> Value {
+    while let Some(inner) = step(v) {
+        v = inner;
+    }
+    v
+}
+
+pub(super) fn peel_uext(func: &Function, def_of: impl Fn(Value) -> Option<Inst>, v: Value) -> Value {
+    peel_uextend(v, |u| match op_of(func, &def_of, u) {
+        Some(&Op::Convert(Convert::Uextend, inner)) => Some(inner),
+        _ => None,
+    })
+}
+
+pub(super) fn const_u128(func: &Function, def_of: impl Fn(Value) -> Option<Inst>, ty: Type, v: Value) -> Option<u128> {
+    match *op_of(func, &def_of, v)? {
+        Op::Const(imm) => Some(if ty.is_small_int() {
+            u128::from(extend(imm, ty, false) as u64)
+        } else {
+            u128::from(u64::try_from(imm).ok()?)
+        }),
+        Op::Binary(Binary::Iconcat, lo, hi) if ty == Type::I128 => match (op_of(func, &def_of, lo), op_of(func, &def_of, hi)) {
+            (Some(&Op::Const(l)), Some(&Op::Const(h))) => Some(u128::from(l as u64) | (u128::from(h as u64) << 64)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

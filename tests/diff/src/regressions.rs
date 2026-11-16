@@ -722,6 +722,47 @@ pub fn case_reg_noalias_call_stash(seed: i64) -> i64 {
     i64::from(d1 * 100 + d2 * 10 + val)
 }
 
+static PROMOTED_SLICE: &[i64] = &[11, 23, 37, 53];
+const CONST_SLICE: &[i64] = &[19, 29, 41, 61];
+
+const fn const_slice_at(idx: usize) -> i64 {
+    CONST_SLICE[idx]
+}
+
+#[repr(C)]
+struct InnerOffset(u16, u64);
+
+#[repr(C)]
+struct OuterOffset {
+    flag: u8,
+    pair: InnerOffset,
+}
+
+#[derive(Clone, Copy)]
+struct FieldWrap<T> {
+    head: u8,
+    val: T,
+}
+
+#[inline(never)]
+fn read_field_wrap<T: Copy>(w: FieldWrap<T>) -> T {
+    w.val
+}
+
+pub fn case_reg_const_slice_and_field_layout(seed: i64) -> i64 {
+    let idx = (seed.unsigned_abs() as usize) % PROMOTED_SLICE.len();
+    let compiled = const { const_slice_at(1) + (&[5_i64, 9, 14])[2] };
+    let runtime_static = PROMOTED_SLICE[black_box(idx)] + (&[4_i64, 8, 12, 16])[black_box(idx)];
+    let mono = FieldWrap { head: 3, val: seed + const_slice_at(idx) };
+    let generic = FieldWrap { head: 5, val: mono.val * 2 };
+    let off = core::mem::offset_of!(OuterOffset, pair.1) as i64;
+    let mut opt_some = black_box(Some((7_u32, seed)));
+    let opt_none = black_box(None::<(u32, i64)>);
+    let mut none_mut = black_box(None::<(u32, i64)>);
+    let slice_sum = opt_some.as_slice().first().map_or(0, |p| i64::from(p.0) + p.1) + opt_none.as_slice().len() as i64 + opt_some.as_mut_slice().len() as i64 + none_mut.as_mut_slice().len() as i64;
+    compiled + runtime_static + i64::from(mono.head) + read_field_wrap(generic) + off + slice_sum
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_byval_pair", case_reg_byval_pair),
     ("case_reg_byval_string", case_reg_byval_string),
@@ -749,4 +790,5 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_try_tuple_intvar_err", case_reg_try_tuple_intvar_err),
     ("case_reg_ishl_range_overflow", case_reg_ishl_range_overflow),
     ("case_reg_noalias_call_stash", case_reg_noalias_call_stash),
+    ("case_reg_const_slice_and_field_layout", case_reg_const_slice_and_field_layout),
 ];
