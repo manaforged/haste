@@ -271,8 +271,9 @@ fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, St
     Ok(outgoing)
 }
 
-fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
+fn present(func: &Function, fused: &[bool]) -> (Vec<bool>, Vec<bool>) {
     let (mut values, mut slots) = (vec![false; func.types.len()], vec![false; func.slots.len()]);
+    let mut flags = Vec::new();
     for block in &func.blocks {
         block.params.iter().for_each(|param| values[param.index()] = true);
         for inst in &block.insts {
@@ -282,8 +283,14 @@ fn present(func: &Function) -> (Vec<bool>, Vec<bool>) {
             if let Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) = data.op {
                 slots[slot.index()] = true;
             }
+            if let (Op::Icmp(..) | Op::Fits(..) | Op::Fcmp(..), Some(result)) = (&data.op, data.result)
+                && fused.get(result.index()) == Some(&true)
+            {
+                flags.push(result);
+            }
         }
     }
+    flags.into_iter().for_each(|value| values[value.index()] = false);
     (values, slots)
 }
 
@@ -301,11 +308,11 @@ pub(crate) fn terminator_edges<'a>(op: &'a Op, mut f: impl FnMut(Block, &'a [Val
 pub(crate) fn layout<R: Copy + PartialEq>(
     func: &Function,
     (saves, float_saves): (Vec<R>, Vec<u8>),
-    (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
+    (locations, shared, homed, elided, fused): (&[Location<R>], &[Option<u32>], &[bool], &[bool], &[bool]),
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<Frame<R>, String> {
     let outgoing = needs(func, classify)?;
-    let (present, addressed) = present(func);
+    let (present, addressed) = present(func, fused);
     let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
     let mut values = vec![0; func.types.len()];
     let mut homes: Vec<i32> = Vec::new();
@@ -381,7 +388,7 @@ fn build_frame<R: Copy + PartialEq>(
     abi: &Abi<R>,
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<(Frame<R>, bool), String> {
-    let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided), classify)?;
+    let frame = layout(func, (saves, float_saves), (&plan.locations, &plan.shared, &plan.homed, &plan.elided, &plan.fused), classify)?;
     let stack_params = abi.params.iter().any(|loc| matches!(loc, Loc::Stack(_) | Loc::Struct(..)));
     let framed = framed(func, &frame, stack_params);
     Ok((frame, framed))

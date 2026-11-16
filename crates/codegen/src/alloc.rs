@@ -298,17 +298,21 @@ fn through<R>(func: &Function, locations: &[Location<R>], census: &Uses, elided:
                 Location::Imm(at) => i32::try_from(at).ok().filter(|at| *at > 0).map(CallTarget::Abs),
                 Location::SlotAddr(sym) => Some(CallTarget::Slot(sym)),
                 _ => None,
-            };
+            }
+            .map(|target| (target, *addr));
         }
     }
+    let mut left = census.uses.clone();
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         if let Op::Call { callee, args, .. } | Op::TryCall { callee, args, .. } = &func.insts[inst.index()].op
             && census.uses[callee.index()] == 1
             && !args.contains(callee)
-            && let Some(target) = loads[callee.index()]
+            && let Some((target, addr)) = loads[callee.index()]
         {
             through[callee.index()] = Some(target);
             elided[callee.index()] = true;
+            left[addr.index()] = left[addr.index()].saturating_sub(1);
+            elided[addr.index()] |= left[addr.index()] == 0;
         }
     }
     through
