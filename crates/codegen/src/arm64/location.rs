@@ -144,20 +144,26 @@ impl Emit<'_> {
 
     pub(super) fn sib_indexed(&mut self, addr: Value, offset: i32, bytes: u32) -> Option<(Reg, Reg, u8)> {
         let mode = self.plan.sib[addr.index()]?;
-        let total_disp = match mode.base {
-            SibBase::Frame(slot) => i64::from(self.frame.slots[slot.index()]) + i64::from(mode.disp) + i64::from(offset),
-            SibBase::Value(_) => i64::from(mode.disp) + i64::from(offset),
-        };
         let (_, shift) = decode_sib(mode.shift);
-        if total_disp != 0 || (shift != 0 && (1u32 << shift) != bytes) {
+        if shift != 0 && (1u32 << shift) != bytes {
             return None;
         }
+        let disp = i64::from(mode.disp) + i64::from(offset);
         let base_reg = match mode.base {
-            SibBase::Frame(_) => FP,
-            SibBase::Value(base) => self.bits(base, C),
+            SibBase::Frame(slot) => self.frame_base(disp + i64::from(self.frame.slots[slot.index()])),
+            SibBase::Value(base) if disp == 0 => self.bits(base, C),
+            SibBase::Value(_) => return None,
         };
         let idx_reg = self.bits(mode.index, IP);
         Some((base_reg, idx_reg, mode.shift))
+    }
+
+    fn frame_base(&mut self, fp_disp: i64) -> Reg {
+        if fp_disp == 0 {
+            return FP;
+        }
+        self.add_const(C, FP, fp_disp);
+        C
     }
 
     pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg) -> Mem {
