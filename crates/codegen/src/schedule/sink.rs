@@ -5,6 +5,8 @@ use crate::fold::defs;
 use crate::ir::{Binary, Block, Convert, Function, Inst, Op, Type, Unary, Value};
 use crate::live::results;
 
+mod addr;
+
 struct DistMatch {
     op: Binary,
     common: Value,
@@ -762,7 +764,7 @@ fn bypass_two_use_adds_block(func: &mut Function, uses: &mut Vec<u32>, depth: &m
     func.blocks[bi].insts = rebuilt;
 }
 
-/// Factors single-use bitwise identities, balances addition trees by latency, and sinks deferred loads and pure scalar ops.
+/// Factors single-use bitwise identities, balances addition trees by latency, sinks deferred loads and pure scalar ops, and splits shared address sums.
 pub(crate) fn run(func: &mut Function, balance: bool) {
     factor_bitwise(func, balance);
     let mut uses = func.use_counts();
@@ -779,4 +781,5 @@ pub(crate) fn run(func: &mut Function, balance: bool) {
     for bi in 0..func.blocks.len() {
         sink_pure_block(func, &live_defs, &uses, bi);
     }
+    addr::split_address_sums(func);
 }
