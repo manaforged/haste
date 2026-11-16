@@ -2,7 +2,7 @@ mod fuse;
 mod patterns;
 mod sib;
 
-pub(super) use fuse::fuse;
+pub(super) use fuse::{fuse, narrows_exactly};
 pub(super) use patterns::{LEAF, Root, adc_plan, bextr_parts, shld_parts, unwrap_shift_mask};
 use patterns::odd_scale_source;
 

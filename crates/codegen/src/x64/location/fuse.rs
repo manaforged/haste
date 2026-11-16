@@ -361,6 +361,12 @@ fn load_elide_ok(ctx: &FuseCtx<'_>, features: &Features, linst: Inst, load_res: 
     }
 }
 
+/// Whether narrowing `x` to `to` drops only bits known to be zero, so the zero flag of `x` is the zero flag of the narrowed value.
+pub(in super::super) fn narrows_exactly(func: &Function, plan: &Plan<Reg>, def: &dyn Fn(Value) -> Option<Inst>, x: Value, to: Type) -> bool {
+    let (zeros, _) = crate::fold::known_bits(func, def, &|v| plan.const_of(v), x, 0);
+    func.ty(x).unsigned_max() & !to.unsigned_max() & !zeros == 0
+}
+
 pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &Features) -> Vec<Option<Root>> {
     let n = func.types.len();
     let mut roots = vec![None; n];
@@ -463,7 +469,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
                     if features.bmi1 {
                         cand_bextr.push((b_idx, pos, res, op, x, y));
                     }
-                    if op == Binary::Band {
+                    if op == Binary::Band || features.bmi1 {
                         cand_alu.push((b_idx, pos, res, op, x, y));
                     }
                 }
@@ -629,6 +635,9 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         if op == Binary::Band && [x, y].into_iter().any(|v| plan.const_of(v).is_some_and(|m| matches!(m, 0xFF | 0xFFFF | 0xFFFF_FFFF))) {
             continue;
         }
+        if op == Binary::Ushr && bextr_parts(func, plan, func.ty(res), op, (x, y), |v| plan.elided[v.index()], def_inst).is_none() {
+            continue;
+        }
         let shrink_safe = matches!(plan.location(res), Location::Reg(r) if !SAVED.contains(&r) && !FRAME_REGS.contains(&r))
             || (func.entry != Some(Block(b_idx as u32))
                 && !matches!(func.blocks[b_idx].insts.last().map(|i| &func.insts[i.index()].op), Some(Op::Return(_))));
@@ -636,6 +645,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             continue;
         }
         let insts = &func.blocks[b_idx].insts;
+        let mut zero = res;
         for &next_inst in &insts[pos + 1..] {
             let nd = &func.insts[next_inst.index()];
             if nd.result.is_some_and(|r| plan.elided[r.index()]) {
@@ -646,10 +656,17 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             if flagless {
                 continue;
             }
+            if let (&Op::Convert(Convert::Ireduce, src), Some(narrow)) = (&nd.op, nd.result)
+                && src == zero
+                && narrows_exactly(func, plan, &|v| defs[v.index()], res, func.ty(narrow))
+            {
+                zero = narrow;
+                continue;
+            }
             let zf_match = match nd.op {
-                Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) => c == res,
+                Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) => c == zero,
                 Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
-                    (lhs == res && is_zero_const(func, plan, rhs)) || (rhs == res && is_zero_const(func, plan, lhs))
+                    (lhs == zero && is_zero_const(func, plan, rhs)) || (rhs == zero && is_zero_const(func, plan, lhs))
                 }
                 _ => false,
             };

@@ -755,7 +755,8 @@ impl Emit<'_> {
                 Ok(())
             }
             Convert::Ireduce => {
-                self.flags = saved_flags;
+                let exact = saved_flags.is_some_and(|(value, _)| value == x) && super::location::narrows_exactly(self.func, &self.plan, &|v| self.defs[v.index()], x, self.ty(result));
+                self.flags = saved_flags.map(|(value, cond)| (if exact { result } else { value }, cond));
                 if matches!(self.location(result), Location::Slot)
                     && let Some(rx) = self.reg_of(x).or_else(|| self.cached_spill(x))
                 {
