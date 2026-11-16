@@ -1,5 +1,6 @@
 use crate::cfg::{self, Cfg, Loop};
 use crate::ir::{Block, BlockData, Domain, Function, Inst, Op, Value};
+use crate::merge::{identity, rename};
 use crate::unroll::remap_val;
 
 fn safe_head_inst(func: &Function, inst: Inst) -> bool {
@@ -246,7 +247,154 @@ fn rotate_one(func: &mut Function, cfg: &Cfg, each: &Loop) -> bool {
     true
 }
 
-/// Rotates top-tested loops with small pure headers so loop guards precede entry and latches end in a single branch.
+struct NestPlan {
+    head: Block,
+    inner: Vec<Block>,
+    fixed: u64,
+}
+
+fn has_bit(mask: u64, at: usize) -> bool {
+    mask >> at & 1 == 1
+}
+
+fn pass_mask(func: &Function, latch: Block, head: Block) -> u64 {
+    let params = &func.blocks[head.index()].params;
+    let arm = |target: Block, args: &[Value]| {
+        if target != head {
+            return u64::MAX;
+        }
+        params.iter().zip(args).enumerate().filter(|(_, (p, a))| p == a).fold(0_u64, |mask, (at, _)| mask | 1 << at)
+    };
+    match func.last(latch) {
+        Some(Op::Jump(t, ta)) => arm(*t, ta),
+        Some(Op::Brif(_, t, ta, f, fa)) => arm(*t, ta) & arm(*f, fa),
+        _ => 0,
+    }
+}
+
+fn find_nest(func: &Function, cfg: &Cfg, each: &Loop) -> Option<NestPlan> {
+    let head = each.head;
+    let params = &func.blocks[head.index()].params;
+    if each.latches.len() < 2 || params.is_empty() || params.len() > 64 || Some(head) == func.entry {
+        return None;
+    }
+    if !cfg.preds_of(head).iter().all(|&p| matches!(func.last(p), Some(Op::Jump(..) | Op::Brif(..)))) {
+        return None;
+    }
+    let masks: Vec<u64> = each.latches.iter().map(|&latch| pass_mask(func, latch, head)).collect();
+    let common = masks.iter().fold(u64::MAX, |acc, m| acc & m);
+    let covers = |s: u64| masks.iter().filter(|&&m| m & s == s).count();
+    let best = masks.iter().map(|m| m & !common).filter(|&s| s != 0).max_by_key(|&s| (covers(s), s.count_ones()))?;
+    let inner: Vec<Block> = each.latches.iter().zip(&masks).filter(|(_, m)| *m & best == best).map(|(latch, _)| *latch).collect();
+    let body = cfg::natural_loop(cfg, head, inner.clone()).body;
+    hoists_from(func, &body, params, best | common, best).then_some(NestPlan { head, inner, fixed: best | common })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Varies,
+    Fixed,
+    FromSplit,
+}
+
+fn hoists_from(func: &Function, body: &[bool], params: &[Value], fixed: u64, split: u64) -> bool {
+    let mut reach: Vec<Reach> = func.def_blocks().iter().map(|def| if def.is_some_and(|b| body[b.index()]) { Reach::Varies } else { Reach::Fixed }).collect();
+    for (at, &p) in params.iter().enumerate().filter(|(at, _)| has_bit(fixed, *at)) {
+        reach[p.index()] = if has_bit(split, at) { Reach::FromSplit } else { Reach::Fixed };
+    }
+    let insts: Vec<Inst> = (0..body.len()).filter(|&b| body[b]).flat_map(|b| func.blocks[b].insts.iter().copied()).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &inst in &insts {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result.filter(|r| reach[r.index()] == Reach::Varies && data.op.is_speculable()) else { continue };
+            let mut joined = Reach::Fixed;
+            data.op.for_operands(|v| {
+                joined = match (joined, reach[v.index()]) {
+                    (Reach::Varies, _) | (_, Reach::Varies) => Reach::Varies,
+                    (Reach::FromSplit, _) | (_, Reach::FromSplit) => Reach::FromSplit,
+                    _ => Reach::Fixed,
+                }
+            });
+            if joined == Reach::Varies {
+                continue;
+            }
+            if joined == Reach::FromSplit && !matches!(data.op, Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::Convert(..) | Op::Const(_)) {
+                return true;
+            }
+            reach[res.index()] = joined;
+            changed = true;
+        }
+    }
+    false
+}
+
+fn drop_fixed(args: &mut Vec<Value>, fixed: u64) {
+    let mut at = 0;
+    args.retain(|_| {
+        at += 1;
+        !has_bit(fixed, at - 1)
+    });
+}
+
+fn nest_one(func: &mut Function, cfg: &Cfg, plan: &NestPlan) {
+    let head = plan.head;
+    let params = func.blocks[head.index()].params.clone();
+    let outer_params: Vec<Value> = params.iter().map(|&p| func.value(func.ty(p))).collect();
+    let mut jump_args = outer_params.clone();
+    drop_fixed(&mut jump_args, plan.fixed);
+    let jump = func.add(Op::Jump(head, jump_args), None);
+    let outer = Block(func.blocks.len() as u32);
+    func.blocks.push(BlockData { params: outer_params.clone(), insts: vec![jump] });
+    let mut preds = cfg.preds_of(head).to_vec();
+    preds.sort_unstable_by_key(|b| b.index());
+    preds.dedup();
+    for pred in preds {
+        let Some(&last) = func.blocks[pred.index()].insts.last() else { continue };
+        let op = &mut func.insts[last.index()].op;
+        if !plan.inner.contains(&pred) {
+            op.map_targets(|t| if t == head { outer } else { t });
+            continue;
+        }
+        match op {
+            Op::Jump(t, ta) if *t == head => drop_fixed(ta, plan.fixed),
+            Op::Brif(_, t, ta, f, fa) => {
+                if *t == head {
+                    drop_fixed(ta, plan.fixed);
+                }
+                if *f == head {
+                    drop_fixed(fa, plan.fixed);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut subst = identity(func.types.len());
+    for (at, (&p, &q)) in params.iter().zip(&outer_params).enumerate() {
+        if has_bit(plan.fixed, at) {
+            subst[p.index()] = q;
+        }
+    }
+    rename(func, &subst);
+    drop_fixed(&mut func.blocks[head.index()].params, plan.fixed);
+}
+
+fn nest(func: &mut Function) -> bool {
+    let mut changed = false;
+    for _ in 0..64 {
+        let cfg = func.cfg();
+        let Some(plan) = cfg.loops().list.iter().find_map(|each| find_nest(&*func, &cfg, each)) else {
+            break;
+        };
+        nest_one(func, &cfg, &plan);
+        func.bump_cfg();
+        changed = true;
+    }
+    changed
+}
+
+/// Separates nested loops that share a header, then rotates top-tested loops with small pure headers so loop guards precede entry and latches end in a single branch.
 pub(crate) fn run(func: &mut Function) -> Domain {
     let Some(entry) = func.entry else {
         return Domain::NONE;
@@ -254,7 +402,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     if func.coroutine.is_some() {
         return Domain::NONE;
     }
-    let mut changed = false;
+    let mut changed = nest(func);
     for _ in 0..64 {
         let cfg = func.cfg();
         let loops = cfg.loops();

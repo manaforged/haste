@@ -257,19 +257,37 @@ impl Cfg {
     }
 }
 
-pub(crate) fn preheader(func: &mut Function, cfg: &Cfg, each: &Loop) -> Option<Block> {
-    if Some(each.head) == func.entry {
-        return None;
-    }
+fn outside_preds(cfg: &Cfg, each: &Loop) -> Vec<Block> {
     let mut outside = Vec::new();
     for &pred in cfg.preds_of(each.head) {
         if !each.body.get(pred.index()).copied().unwrap_or(false) && !outside.contains(&pred) {
             outside.push(pred);
         }
     }
-    if let [single] = outside[..]
-        && matches!(func.last(single), Some(Op::Jump(target, _)) if *target == each.head)
-    {
+    outside
+}
+
+fn sole_entry(func: &Function, each: &Loop, outside: &[Block]) -> Option<Block> {
+    match outside {
+        [single] if matches!(func.last(*single), Some(Op::Jump(target, _)) if *target == each.head) => Some(*single),
+        _ => None,
+    }
+}
+
+/// The block outside `each` whose jump is the loop's only entry, when one already exists.
+pub(crate) fn existing_preheader(func: &Function, cfg: &Cfg, each: &Loop) -> Option<Block> {
+    if Some(each.head) == func.entry {
+        return None;
+    }
+    sole_entry(func, each, &outside_preds(cfg, each))
+}
+
+pub(crate) fn preheader(func: &mut Function, cfg: &Cfg, each: &Loop) -> Option<Block> {
+    if Some(each.head) == func.entry {
+        return None;
+    }
+    let outside = outside_preds(cfg, each);
+    if let Some(single) = sole_entry(func, each, &outside) {
         return Some(single);
     }
     if outside.is_empty() || !outside.iter().all(|&pred| matches!(func.last(pred), Some(Op::Jump(..) | Op::Brif(..)))) {
