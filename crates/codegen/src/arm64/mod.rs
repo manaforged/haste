@@ -48,7 +48,7 @@ fn arm64_uses_scratch(func: &Function, op: &Op) -> bool {
 const REGS: Regs<Reg> = Regs {
     saved: &SAVED,
     saved_float: &SAVED_FLOAT,
-    leaf: &[Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(8), D, S, T, Reg(14), Reg(15)],
+    leaf: &[Reg(0), Reg(1), Reg(2), Reg(3), Reg(4), Reg(5), Reg(6), Reg(7), Reg(8), D, S, T, Reg(14), Reg(15), LR],
     wide_scratch: &WIDE_SCRATCH,
     op_scratch: &OP_SCRATCH,
     uses_scratch: arm64_uses_scratch,
@@ -94,6 +94,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     if dropped(&plan) != dropped_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, packing))?;
     }
+    framed |= plan.locations.iter().any(|loc| matches!(loc, Location::Reg(LR)));
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP]);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
