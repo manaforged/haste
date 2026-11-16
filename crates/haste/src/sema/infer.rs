@@ -641,7 +641,7 @@ impl Infer<'_, '_> {
         match self.coercion(found, expected)? {
             Some(coercion) => {
                 self.out.coercions.insert(expr, coercion);
-                Ok(())
+                self.settle_pending()
             }
             None => self.coerce(found, expected),
         }
