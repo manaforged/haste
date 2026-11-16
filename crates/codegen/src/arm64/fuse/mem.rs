@@ -721,3 +721,43 @@ pub(super) fn try_fuse_icmp_sload(
         }
     }
 }
+
+fn narrow_store_ok(func: &Function, plan: &Plan<Reg>, uses: &[u32], (b_idx, pos, res): (usize, usize, Value), inner: Value) -> bool {
+    if uses[res.index()] != 1
+        || plan.elided[res.index()]
+        || plan.deferred[res.index()]
+        || !func.ty(res).is_small_int()
+        || !func.ty(inner).is_small_int()
+        || !matches!(plan.location(inner), Location::Reg(_) | Location::Slot)
+    {
+        return false;
+    }
+    let insts = &func.blocks[b_idx].insts;
+    let store = insts
+        .iter()
+        .enumerate()
+        .skip(pos + 1)
+        .find_map(|(at, &inst)| matches!(func.insts[inst.index()].op, Op::Store(val, addr, _) if val == res && addr != res).then_some(at));
+    store.is_some_and(|at| super::elided_use_end(func, plan, insts, at, inner).is_some() && preserved(func, plan, b_idx, pos, at, None, inner))
+}
+
+pub(super) fn fuse_store_ireduce(func: &Function, plan: &mut Plan<Reg>, uses: &[u32]) {
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            if let (&Op::Convert(Convert::Ireduce, inner), Some(res)) = (&data.op, data.result)
+                && narrow_store_ok(func, plan, uses, (b_idx, pos, res), inner)
+            {
+                plan.elided[res.index()] = true;
+            }
+        }
+    }
+}
+
+/// The value whose register a store of `val` reads: the source of an elided `Ireduce`, else `val`.
+pub(in super::super) fn store_source(func: &Function, plan: &Plan<Reg>, val: Value, def: impl Fn(Value) -> Option<Inst>) -> Value {
+    match def(val).map(|inst| &func.insts[inst.index()].op) {
+        Some(&Op::Convert(Convert::Ireduce, inner)) if plan.elided[val.index()] => inner,
+        _ => val,
+    }
+}

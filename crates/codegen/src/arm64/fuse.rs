@@ -12,7 +12,7 @@ use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 pub(super) use bfi::bfi_parts;
 pub(super) use bits::{Bfx, bfx_parts, conv_bfx_parts, extr_parts, single_bit_mask, unwrap_elided_tst};
 use flag::{fuse_fits, fuse_icmp_flags, fuse_icmp_selects, try_fuse_flag_operand, try_fuse_icmp_select};
-pub(super) use mem::{encode_neon_movi, madd_parts};
+pub(super) use mem::{encode_neon_movi, madd_parts, store_source};
 use mem::try_fuse_vec_op;
 pub(super) use sign::sign_bit_test;
 
@@ -761,4 +761,5 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
     bits::fuse_tst(func, plan, (&uses, &pos_of));
     fuse_fits(func, plan, &uses);
     ccmp::fuse_ccmp(func, plan, (&uses, &pos_of));
+    mem::fuse_store_ireduce(func, plan, &uses);
 }

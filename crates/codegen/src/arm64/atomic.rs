@@ -250,7 +250,10 @@ impl Emit<'_> {
     fn store_src(&mut self, value: Value) -> Reg {
         match self.plan.const_of(value) {
             Some(0) => ZR,
-            _ => self.bits(value, A),
+            _ => {
+                let source = super::fuse::store_source(self.func, &self.plan, value, |v| self.defs[v.index()]);
+                self.bits(source, A)
+            }
         }
     }
 
