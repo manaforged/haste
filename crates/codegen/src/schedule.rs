@@ -304,7 +304,8 @@ fn strip_assumes(func: &mut Function) -> bool {
     stripped
 }
 
-fn is_condition(func: &Function, inst: Inst) -> bool {
+/// Whether `inst` computes a branch condition: a compare, or an `I8` and/or of conditions.
+pub(crate) fn is_condition(func: &Function, inst: Inst) -> bool {
     let data = &func.insts[inst.index()];
     matches!(data.op, Op::Icmp(..) | Op::Fcmp(..))
         || (matches!(data.op, Op::Binary(Binary::Band | Binary::Bor, ..)) && data.result.is_some_and(|r| func.ty(r) == Type::I8))

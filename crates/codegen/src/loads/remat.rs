@@ -667,13 +667,20 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
         if !for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] += 1) {
             continue;
         }
+        let cond = match func.insts[last.index()].op {
+            Op::Brif(c, ..) if uses[c.index()] == 1 => Some(c),
+            _ => None,
+        };
         let insts = std::mem::take(&mut func.blocks[b].insts);
         let len = insts.len();
         let mut kept = Vec::with_capacity(len);
         let mut sunk = Vec::new();
+        let mut tail = None;
         for &inst in &insts[..len - 1] {
             let data = &func.insts[inst.index()];
-            if let Some(res) = data.result
+            if data.result.is_some() && data.result == cond && crate::schedule::is_condition(func, inst) {
+                tail = Some(inst);
+            } else if let Some(res) = data.result
                 && data.op.is_speculable()
                 && !fits_used[res.index()]
                 && term_uses[res.index()] > 0
@@ -684,11 +691,10 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
                 kept.push(inst);
             }
         }
-        if !sunk.is_empty() && sunk.iter().enumerate().any(|(idx, &inst)| insts[len - 1 - sunk.len() + idx] != inst) {
-            changed = true;
-        }
         kept.extend(sunk);
+        kept.extend(tail);
         kept.push(last);
+        changed |= kept != insts;
         func.blocks[b].insts = kept;
         for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0);
     }
