@@ -104,6 +104,14 @@ pub trait Slots {
     fn vtable_entries(&self, _id: VtableId) -> Option<Vec<VtableEntry>> {
         None
     }
+    /// Encodes `plan` into substrate bytes, toolchain items only when `is_sysroot`, or `None` when this image keeps no plans across builds.
+    fn encode_plan(&self, _cx: &Context<'_>, _reached: &Reached, _is_sysroot: bool, _plan: &RelocPlan) -> Option<Vec<u8>> {
+        None
+    }
+    /// Decodes plan bytes that `encode_plan` wrote, or `None` when they do not resolve in this image.
+    fn decode_plan(&self, _cx: &Context<'_>, _reached: &Reached, _is_sysroot: bool, _bytes: &[u8]) -> Option<RelocPlan> {
+        None
+    }
     /// Resolves a symbolic relocation entry to its concrete 64-bit value in this image.
     fn resolve_symbol(&self, sym: &SymbolSource) -> u64 {
         match *sym {

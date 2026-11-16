@@ -341,6 +341,14 @@ impl Slots for Image {
     fn resolve_symbol(&self, sym: &lower::SymbolSource) -> u64 {
         self.symbol_value(sym)
     }
+
+    fn encode_plan(&self, cx: &Context<'_>, reached: &Reached, is_sysroot: bool, plan: &lower::RelocPlan) -> Option<Vec<u8>> {
+        self.encode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, plan)
+    }
+
+    fn decode_plan(&self, cx: &Context<'_>, reached: &Reached, is_sysroot: bool, bytes: &[u8]) -> Option<lower::RelocPlan> {
+        self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, bytes)
+    }
 }
 
 pub(super) fn resolve_host_symbol(cx: &Context<'_>, item: crate::names::ItemRef) -> Result<(HostSymbol, usize), String> {

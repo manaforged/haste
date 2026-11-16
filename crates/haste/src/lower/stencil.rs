@@ -163,9 +163,14 @@ pub(super) enum Tally {
     Flush,
     Retry,
     Compact,
+    Disk,
+    Stale,
 }
 
-const TALLY_NAMES: [&str; 11] = ["template_hit", "template_miss", "template_simplify", "template_raced", "unstored_cycle", "unstored_deferred", "devirt_simplify", "trim_partial", "trim_full", "compact_retry", "compact_fit"];
+const TALLY_NAMES: [&str; 13] = [
+    "template_hit", "template_miss", "template_simplify", "template_raced", "unstored_cycle", "unstored_deferred", "devirt_simplify", "trim_partial", "trim_full", "compact_retry", "compact_fit",
+    "template_disk", "template_stale",
+];
 static TALLIES: [AtomicUsize; TALLY_NAMES.len()] = [const { AtomicUsize::new(0) }; TALLY_NAMES.len()];
 
 fn tally(kind: Tally) {
@@ -487,6 +492,13 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     if servable && let Some(shape) = disk.as_ref().and_then(persist::Disk::hit) {
         return Ok((shape.map(|(returns, height, size)| (footprint, Found::Shape(returns, height, size))), fp_cycle));
     }
+    if !shape_only && fp_cycle > depth && let Some(disk) = &disk && let Some(mut found) = disk.template(cx, (reached, slots)) {
+        if quiet.holds(cx, slots) {
+            slots.bodies().bump_transient();
+            found = slots.bodies().templates.get_or_insert_with(key, || found);
+        }
+        return Ok((found.map(|t| (footprint, Found::Body(t, None))), fp_cycle));
+    }
     let mut lowered = lower_template(cx, (reached, slots), inline, index, (limit, quiet))?;
     let over = !key.compact && inline.host.retry && matches!(lowered, Some((Err(Miss::Over), ..)));
     let roomy = if over { super::budget::compact_limit(cx, reached, index, limit) } else { None };
@@ -500,7 +512,7 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     let ir_sz = inline.max_callee_size;
     let Some((fit, relocs, reloc_plan, ir_cycle)) = lowered else {
         if let Some(disk) = disk {
-            disk.settle(None, false, servable && quiet.holds(cx, slots));
+            disk.settle(cx, (reached, slots), None, (false, servable && quiet.holds(cx, slots)));
         }
         return Ok((None, fp_cycle));
     };
@@ -532,7 +544,7 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
         tally(Tally::Deferred);
     }
     if let Some(disk) = disk {
-        disk.settle(template.as_deref().map(InlineTemplate::shape), stored, servable && calm);
+        disk.settle(cx, (reached, slots), template.as_deref(), (stored, servable && calm));
     }
     Ok((template.map(|t| (footprint, Found::Body(t, Some(relocs)))), cycle))
 }
