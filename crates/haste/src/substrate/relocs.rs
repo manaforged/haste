@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
+use rustc_hash::FxHashMap;
 
 use crate::body::{ExprId, PatId};
 use crate::host::{HostSymbol, MathSymbol, X86Symbol};
@@ -168,7 +169,7 @@ pub fn decode_reloc_plan(
         vtables.push(slots.vtable_id(&entries));
     }
 
-    let dec = Decoder { types, reached, items: &items, tys: &tys, rodatas: &rodatas, vtables: &vtables };
+    let mut dec = Decoder { types, reached, items: &items, tys: &tys, rodatas: &rodatas, vtables: &vtables, bytes, seen: Seen::default() };
     let Some(plan) = dec.read_plan(&mut cur)? else { return Ok(None) };
     if cur.pos != bytes.len() {
         bail!("trailing bytes in portable reloc plan");
@@ -457,9 +458,33 @@ struct Decoder<'a> {
     tys: &'a [Ty],
     rodatas: &'a [RodataId],
     vtables: &'a [VtableId],
+    bytes: &'a [u8],
+    seen: Seen<'a>,
 }
 
-impl Decoder<'_> {
+/// Inline subplans already decoded from one plan, keyed by their encoded bytes.
+#[derive(Default)]
+struct Seen<'a> {
+    long: FxHashMap<[u8; 8], Vec<(&'a [u8], Arc<RelocPlan>)>>,
+    short: Vec<(&'a [u8], Arc<RelocPlan>)>,
+}
+
+impl<'a> Seen<'a> {
+    fn find(&self, rest: &[u8]) -> Option<(usize, Arc<RelocPlan>)> {
+        let bucket = rest.first_chunk::<8>().and_then(|prefix| self.long.get(prefix));
+        self.short.iter().chain(bucket.into_iter().flatten()).find(|(enc, _)| rest.starts_with(enc)).map(|(enc, plan)| (enc.len(), Arc::clone(plan)))
+    }
+
+    fn insert(&mut self, enc: &'a [u8], plan: &Arc<RelocPlan>) {
+        let entry = (enc, Arc::clone(plan));
+        match enc.first_chunk::<8>() {
+            Some(prefix) => self.long.entry(*prefix).or_default().push(entry),
+            None => self.short.push(entry),
+        }
+    }
+}
+
+impl<'a> Decoder<'a> {
     fn item_at(&self, id: u32) -> Result<ItemRef> {
         self.items.get(id as usize).copied().context("reloc plan item out of bounds")
     }
@@ -470,7 +495,7 @@ impl Decoder<'_> {
         Ok(resolve_reached(self.reached, (item, substs)))
     }
 
-    fn read_plan(&self, cur: &mut Cursor<'_>) -> Result<Option<RelocPlan>> {
+    fn read_plan(&mut self, cur: &mut Cursor<'_>) -> Result<Option<RelocPlan>> {
         let count = cur.count()?;
         let mut steps = Vec::with_capacity(count);
         for _ in 0..count {
@@ -480,7 +505,19 @@ impl Decoder<'_> {
         Ok(Some(RelocPlan::from_vec(steps)))
     }
 
-    fn read_step(&self, cur: &mut Cursor<'_>) -> Result<Option<RelocStep>> {
+    fn read_subplan(&mut self, cur: &mut Cursor<'_>) -> Result<Option<Arc<RelocPlan>>> {
+        let (start, bytes) = (cur.pos, self.bytes);
+        if let Some((len, plan)) = self.seen.find(bytes.get(start..).context("reloc subplan out of bounds")?) {
+            cur.take(len)?;
+            return Ok(Some(plan));
+        }
+        let Some(plan) = self.read_plan(cur)? else { return Ok(None) };
+        let plan = Arc::new(plan);
+        self.seen.insert(&bytes[start..cur.pos], &plan);
+        Ok(Some(plan))
+    }
+
+    fn read_step(&mut self, cur: &mut Cursor<'_>) -> Result<Option<RelocStep>> {
         Ok(Some(match cur.u8()? {
             0 => {
                 let Some(sym) = self.read_symbol(cur)? else { return Ok(None) };
@@ -492,8 +529,8 @@ impl Decoder<'_> {
             4 => RelocStep::SiteSlot(self.read_site_origin(cur)?),
             5 => {
                 let origin = self.read_site_origin(cur)?;
-                let Some(plan) = self.read_plan(cur)? else { return Ok(None) };
-                RelocStep::SiteInline { origin, plan: Arc::new(plan) }
+                let Some(plan) = self.read_subplan(cur)? else { return Ok(None) };
+                RelocStep::SiteInline { origin, plan }
             }
             6 => RelocStep::TypeId(self.read_ty_origin(cur)?),
             7 => RelocStep::TypeName(self.read_ty_origin(cur)?),
