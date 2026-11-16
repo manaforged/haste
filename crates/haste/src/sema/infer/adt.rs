@@ -377,6 +377,11 @@ pub fn field_types(cx: &mut super::super::Context<'_>, item: ItemRef, args: &[Ty
     if args.iter().any(|&a| cx.types.has_var_flag(a)) {
         bail!("cannot compute fields of open inference variable outside Infer");
     }
+    if !args.iter().any(|&a| cx.types.has_params(a))
+        && let Some(found) = cx.store.lookups.fields.get(&cx.types.adt(item, args))
+    {
+        return Ok(found);
+    }
     super::detached(cx, item, |infer| infer.adt_fields(item, args))
 }
 

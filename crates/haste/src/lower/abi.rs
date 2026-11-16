@@ -3,10 +3,13 @@ use haste_codegen::{AbiParam, Arch, ArgumentPurpose, CallConv, Lane, Signature, 
 use rustc_abi::{BackendLaneCount, BackendRepr, FieldsShape, Float, Primitive, Scalar, TargetDataLayout, Variants};
 use rustc_index::Idx;
 
+use crate::names::ItemRef;
 use crate::sema::Context;
 use crate::sema::impls::Head;
 use crate::sema::infer::{Shape, Typed, field_types};
 use crate::sema::layout::{Layout, field_offset, target};
+use crate::sema::substs::Substs;
+use crate::sema::table::Table;
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::adt::tag_type;
@@ -171,53 +174,130 @@ fn pointee_bytes(cx: &mut Context<'_>, ty: Ty) -> Option<u32> {
 }
 
 fn is_unpin_like(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
-    if depth > 8 || ty == Ty::NONE || cx.types.has_params(ty) {
-        return false;
-    }
-    match *cx.types.kind(ty) {
-        Kind::Closure(..) => cx.ensure_closure(ty).is_none_or(|info| !info.closure.coroutine),
-        Kind::Adt(item, args) => {
-            if cx.types.substs_have_params(args) || cx.lang(item) == Some("unsafe_pinned") {
-                return false;
-            }
-            if let Some(unpin) = cx.lang_item("unpin")
-                && cx.negative_impl(unpin, Head::Adt(item), &[item.krate, unpin.krate])
-            {
-                return false;
-            }
-            let slice = cx.types.substs(args).to_vec();
-            let Ok(variants) = field_types(cx, item, &slice) else {
-                return false;
-            };
-            variants.iter().flatten().all(|&field| is_unpin_like(cx, field, depth + 1))
-        }
-        Kind::Pat(inner, ..) | Kind::Array(inner, _) => is_unpin_like(cx, inner, depth + 1),
-        Kind::Tuple(items) => cx.types.substs(items).to_vec().into_iter().all(|t| is_unpin_like(cx, t, depth + 1)),
-        Kind::Param(_) | Kind::Proj(_) | Kind::Dyn(..) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
-        _ => true,
-    }
+    auto_reach(cx, Auto::Unpin, ty, depth).holds
 }
 
 pub(crate) fn is_freeze_ty(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
-    if depth > 16 || ty == Ty::NONE || cx.types.has_params(ty) {
-        return false;
-    }
-    match *cx.types.kind(ty) {
-        Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_) => true,
-        Kind::Pat(base, ..) | Kind::Array(base, _) | Kind::Slice(base) => is_freeze_ty(cx, base, depth + 1),
-        Kind::Tuple(substs) => cx.types.substs(substs).to_vec().into_iter().all(|t| is_freeze_ty(cx, t, depth + 1)),
-        Kind::Adt(item, substs) => {
-            if cx.types.substs_have_params(substs) || matches!(cx.lang(item), Some("unsafe_cell" | "unsafe_pinned")) {
-                return false;
-            }
-            let args = cx.types.substs(substs).to_vec();
-            let Ok(variants) = field_types(cx, item, &args) else {
-                return false;
-            };
-            variants.iter().flatten().all(|&field| is_freeze_ty(cx, field, depth + 1))
+    auto_reach(cx, Auto::Freeze, ty, depth).holds
+}
+
+/// An auto trait whose structural answer the store keeps per type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Auto {
+    Unpin,
+    Freeze,
+}
+
+impl Auto {
+    const fn cap(self) -> u32 {
+        match self {
+            Auto::Unpin => 8,
+            Auto::Freeze => 16,
         }
-        Kind::Closure(..) | Kind::Dyn(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
     }
+
+    fn memo<'c>(self, cx: &'c Context<'_>) -> &'c Table<Ty, (bool, u32)> {
+        match self {
+            Auto::Unpin => cx.store().unpins(),
+            Auto::Freeze => cx.store().freezes(),
+        }
+    }
+}
+
+/// Whether an auto trait holds for a type, how many levels below it the answer looked, and whether the answer is final rather than cut off by the depth cap or a part not yet known.
+#[derive(Clone, Copy)]
+struct Reach {
+    holds: bool,
+    height: u32,
+    exact: bool,
+}
+
+impl Reach {
+    const UNKNOWN: Reach = Reach { holds: false, height: 0, exact: false };
+
+    const fn known(holds: bool) -> Self {
+        Self { holds, height: 0, exact: true }
+    }
+
+    fn join(&mut self, part: Reach) -> bool {
+        self.height = self.height.max(part.height + 1);
+        self.exact &= part.exact;
+        self.holds &= part.holds;
+        part.holds
+    }
+}
+
+fn auto_reach(cx: &mut Context<'_>, auto: Auto, ty: Ty, depth: u32) -> Reach {
+    if depth > auto.cap() {
+        return Reach::UNKNOWN;
+    }
+    if ty == Ty::NONE || cx.types.has_params(ty) {
+        return Reach::known(false);
+    }
+    if let Some((holds, height)) = auto.memo(cx).get(&ty)
+        && depth + height <= auto.cap()
+    {
+        return Reach { holds, height, exact: true };
+    }
+    let found = auto_parts(cx, auto, ty, depth);
+    if found.exact {
+        auto.memo(cx).insert(ty, (found.holds, found.height));
+    }
+    found
+}
+
+fn auto_parts(cx: &mut Context<'_>, auto: Auto, ty: Ty, depth: u32) -> Reach {
+    let mut out = Reach::known(true);
+    match *cx.types.kind(ty) {
+        Kind::Pat(inner, ..) | Kind::Array(inner, _) => {
+            out.join(auto_reach(cx, auto, inner, depth + 1));
+        }
+        Kind::Slice(inner) if auto == Auto::Freeze => {
+            out.join(auto_reach(cx, auto, inner, depth + 1));
+        }
+        Kind::Tuple(items) => {
+            for at in 0..cx.types.substs(items).len() {
+                let part = cx.types.substs(items)[at];
+                if !out.join(auto_reach(cx, auto, part, depth + 1)) {
+                    break;
+                }
+            }
+        }
+        Kind::Adt(item, args) => return adt_reach(cx, auto, (item, args), depth),
+        Kind::Closure(..) if auto == Auto::Unpin => {
+            return cx.ensure_closure(ty).map_or(Reach { holds: true, ..Reach::UNKNOWN }, |info| Reach::known(!info.closure.coroutine));
+        }
+        Kind::Closure(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Dyn(..) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return Reach::known(false),
+        _ => {}
+    }
+    out
+}
+
+fn adt_reach(cx: &mut Context<'_>, auto: Auto, (item, args): (ItemRef, Substs), depth: u32) -> Reach {
+    if cx.types.substs_have_params(args) {
+        return Reach::known(false);
+    }
+    let blocked = match auto {
+        Auto::Unpin => {
+            cx.lang(item) == Some("unsafe_pinned")
+                || cx.lang_item("unpin").is_some_and(|unpin| cx.negative_impl(unpin, Head::Adt(item), &[item.krate, unpin.krate]))
+        }
+        Auto::Freeze => matches!(cx.lang(item), Some("unsafe_cell" | "unsafe_pinned")),
+    };
+    if blocked {
+        return Reach::known(false);
+    }
+    let slice = cx.types.substs(args).to_vec();
+    let Ok(variants) = field_types(cx, item, &slice) else {
+        return Reach::UNKNOWN;
+    };
+    let mut out = Reach::known(true);
+    for &field in variants.iter().flatten() {
+        if !out.join(auto_reach(cx, auto, field, depth + 1)) {
+            break;
+        }
+    }
+    out
 }
 
 pub(super) fn scalar_type(dl: &TargetDataLayout, scalar: &Scalar) -> Result<Type> {
@@ -412,7 +492,7 @@ fn collect_leaves(cx: &mut Context<'_>, ty: Ty, base: i32, out: &mut Passed) -> 
     }
 }
 
-fn collect_tuple_leaves(cx: &mut Context<'_>, items: crate::sema::substs::Substs, layout: &Layout, base: i32, out: &mut Passed) -> Result<bool> {
+fn collect_tuple_leaves(cx: &mut Context<'_>, items: Substs, layout: &Layout, base: i32, out: &mut Passed) -> Result<bool> {
     for (i, field) in cx.types.substs(items).to_vec().into_iter().enumerate() {
         if !collect_leaves(cx, field, base + layout.fields.offset(i).bytes() as i32, out)? {
             return Ok(false);
@@ -421,7 +501,7 @@ fn collect_tuple_leaves(cx: &mut Context<'_>, items: crate::sema::substs::Substs
     Ok(true)
 }
 
-fn collect_adt_leaves(cx: &mut Context<'_>, (item, args): (crate::names::ItemRef, crate::sema::substs::Substs), layout: &Layout, base: i32, out: &mut Passed) -> Result<bool> {
+fn collect_adt_leaves(cx: &mut Context<'_>, (item, args): (ItemRef, Substs), layout: &Layout, base: i32, out: &mut Passed) -> Result<bool> {
     let Variants::Single { index } = layout.variants else { return Ok(false) };
     let slice = cx.types.substs(args).to_vec();
     let fields = field_types(cx, item, &slice)?[index.index()].clone();

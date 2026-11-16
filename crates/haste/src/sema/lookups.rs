@@ -83,6 +83,8 @@ pub(super) struct Lookups {
     pub(super) discriminants: Table<ItemRef, Arc<[i128]>>,
     pub(super) state: Arc<OutlineState>,
     pub(super) drops: Table<ty::Ty, bool>,
+    pub(super) unpins: Table<ty::Ty, (bool, u32)>,
+    pub(super) freezes: Table<ty::Ty, (bool, u32)>,
     pub(super) glues: Table<ty::Ty, Option<infer::Res>>,
     pub(super) fields: Table<ty::Ty, infer::Fields>,
     pub(super) forms: Table<(infer::Form, usize), Option<infer::Fields>>,
@@ -129,6 +131,8 @@ impl Lookups {
                 discriminants: std::mem::take(&mut self.discriminants),
                 state: Arc::clone(&self.state),
                 drops: std::mem::take(&mut self.drops),
+                unpins: std::mem::take(&mut self.unpins),
+                freezes: std::mem::take(&mut self.freezes),
                 glues: std::mem::take(&mut self.glues),
                 fields: std::mem::take(&mut self.fields),
                 forms: self.forms.retained(|_, found| found.is_some()),
@@ -214,6 +218,16 @@ impl Cache {
     pub fn has_new_sysroot_summaries(&self) -> bool {
         self.lookups.has_new_sysroot_summaries.load(std::sync::atomic::Ordering::Relaxed)
             || self.lookups.has_new_sysroot_instances.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether each type is structurally `Unpin`, with the depth its answer looked below it.
+    pub(crate) fn unpins(&self) -> &Table<ty::Ty, (bool, u32)> {
+        &self.lookups.unpins
+    }
+
+    /// Whether each type is structurally `Freeze`, with the depth its answer looked below it.
+    pub(crate) fn freezes(&self) -> &Table<ty::Ty, (bool, u32)> {
+        &self.lookups.freezes
     }
 
     /// Returns the attached frozen sysroot substrate, if any.
@@ -305,6 +319,8 @@ impl Cache {
 impl Lookups {
     fn forget_edited<F: Fn(ItemRef) -> bool>(&mut self, edited: Edited<'_>, naming: &mut Naming<'_, F>, mine: &F, block_kept: &dyn Fn(&impls::ImplRef) -> bool) {
         self.drops.retain(|ty, _| !naming.names(*ty));
+        self.unpins.retain(|ty, _| !naming.names(*ty));
+        self.freezes.retain(|ty, _| !naming.names(*ty));
         self.glues.retain(|ty, _| !naming.names(*ty));
         self.fields.retain(|ty, _| !naming.names(*ty));
         self.forms.retain(|(form, _), found| {
