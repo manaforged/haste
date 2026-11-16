@@ -1,9 +1,9 @@
 use super::super::asm::{Alu, Cond, Reg, Size, ZR};
 use super::super::fuse::{Bfx, unwrap_elided_tst};
 use super::{A, C, Emit, add_imm_parts, cond, encode_bitmask_imm, swap_cond};
-use crate::alloc::Location;
+use crate::alloc::{Location, Plan};
 use crate::frame::Ext;
-use crate::ir::{Binary, Convert, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Convert, Function, IntCC, Op, Type, Value};
 
 impl Emit<'_> {
     pub(super) fn emit_bfm(&mut self, bfx: Bfx, ty: Type, dst: Reg) {
@@ -157,43 +157,6 @@ impl Emit<'_> {
             .map(|inst| &self.func.insts[inst.index()].op)
     }
 
-    fn plain_icmp(&self, val: Value) -> Option<(IntCC, Value, Value)> {
-        let &Op::Icmp(cc, a, b) = self.elided_node(val)? else { return None };
-        (self.ty(a).is_small_int() && !self.plan.elided[a.index()] && !self.plan.elided[b.index()]).then_some((cc, a, b))
-    }
-
-    fn any_icmp(&self, val: Value) -> Option<(IntCC, Value, Value)> {
-        let &Op::Icmp(cc, a, b) = self.elided_node(val)? else { return None };
-        self.ty(a).is_small_int().then_some((cc, a, b))
-    }
-
-    fn collect_ccmp_ops(&self, op: Binary, (x, y): (Value, Value)) -> Option<((IntCC, Value, Value), Vec<(Binary, IntCC, Value, Value)>)> {
-        let (mut cur_op, mut cur_x, mut cur_y) = (op, x, y);
-        let mut rev_tails = Vec::new();
-        while rev_tails.len() < 7 {
-            if let (Some(lx), Some(ly)) = (self.any_icmp(cur_x), self.any_icmp(cur_y)) {
-                let (head, tail) = if self.plain_icmp(cur_y).is_some() { (lx, ly) } else if self.plain_icmp(cur_x).is_some() { (ly, lx) } else { return None };
-                rev_tails.push((cur_op, tail.0, tail.1, tail.2));
-                rev_tails.reverse();
-                return Some((head, rev_tails));
-            }
-            if let Some((cc, a, b)) = self.plain_icmp(cur_y)
-                && let Some(&Op::Binary(nop @ (Binary::Band | Binary::Bor), nx, ny)) = self.elided_node(cur_x)
-            {
-                rev_tails.push((cur_op, cc, a, b));
-                (cur_op, cur_x, cur_y) = (nop, nx, ny);
-            } else if let Some((cc, a, b)) = self.plain_icmp(cur_x)
-                && let Some(&Op::Binary(nop @ (Binary::Band | Binary::Bor), nx, ny)) = self.elided_node(cur_y)
-            {
-                rev_tails.push((cur_op, cc, a, b));
-                (cur_op, cur_x, cur_y) = (nop, nx, ny);
-            } else {
-                return None;
-            }
-        }
-        None
-    }
-
     fn emit_ccmp_leaf(&mut self, prev: Cond, op: Binary, (cc, a, b): (IntCC, Value, Value)) -> Cond {
         let (guard, is_or) = match op {
             Binary::Band => (prev, false),
@@ -221,10 +184,13 @@ impl Emit<'_> {
     }
 
     pub(super) fn try_emit_ccmp(&mut self, op: Binary, (x, y): (Value, Value), result: Value) -> bool {
-        let Some((head, tails)) = self.collect_ccmp_ops(op, (x, y)) else { return false };
-        let mut cur = self.compare(head.0, head.1, head.2);
-        for (comb, cc, a, b) in tails {
-            cur = self.emit_ccmp_leaf(cur, comb, (cc, a, b));
+        let Some(chain) = self.plan.ccmp_chain(self.func, (op, x, y, ()), |(), v| self.elided_node(v).map(|node| (node, ()))) else {
+            return false;
+        };
+        let Some((head, tails)) = chain.leaves.split_first() else { return false };
+        let mut cur = self.compare(head.cc, head.a, head.b);
+        for t in tails {
+            cur = self.emit_ccmp_leaf(cur, t.op, (t.cc, t.a, t.b));
         }
         self.last_cmp = None;
         self.set_flag(result, cur);
@@ -256,4 +222,85 @@ fn ccmp_imm_parts(ty: Type, cc: IntCC, raw: i64) -> Option<(bool, u8)> {
     }
     let uimm = (raw as u64) & ty.unsigned_max();
     (uimm <= 31).then_some((false, uimm as u8))
+}
+
+fn cmp_imm_fits(ty: Type, cc: IntCC, raw: i64) -> bool {
+    let fits = |signed: bool| add_imm_parts(true, crate::fold::extend(raw, ty, signed)).is_some();
+    fits(cc.is_signed()) || (matches!(cc, IntCC::Equal | IntCC::NotEqual) && fits(true))
+}
+
+const MAX_CCMP_LEAVES: usize = 8;
+
+#[derive(Clone, Copy)]
+pub(in crate::arm64) struct CcmpLeaf<C> {
+    pub(in crate::arm64) op: Binary,
+    pub(in crate::arm64) cc: IntCC,
+    pub(in crate::arm64) a: Value,
+    pub(in crate::arm64) b: Value,
+    pub(in crate::arm64) val: Value,
+    pub(in crate::arm64) at: C,
+}
+
+pub(in crate::arm64) struct CcmpChain<C> {
+    pub(in crate::arm64) leaves: Vec<CcmpLeaf<C>>,
+    pub(in crate::arm64) joins: Vec<Value>,
+}
+
+impl Plan<Reg> {
+    pub(in crate::arm64) fn plain_pair(&self, a: Value, b: Value) -> bool {
+        !self.elided[a.index()] && !self.elided[b.index()]
+    }
+
+    fn ccmp_leaf<C>(&self, func: &Function, op: Binary, val: Value, (node, at): (&Op, C)) -> Option<CcmpLeaf<C>> {
+        let &Op::Icmp(cc, a, b) = node else { return None };
+        func.ty(a).is_small_int().then_some(CcmpLeaf { op, cc, a, b, val, at })
+    }
+
+    fn ccmp_head_gain<C>(&self, func: &Function, leaf: &CcmpLeaf<C>) -> bool {
+        let ty = func.ty(leaf.a);
+        let consts = [leaf.b, leaf.a].map(|v| self.const_of(v));
+        let tail_imm = consts.iter().flatten().any(|&raw| ccmp_imm_parts(ty, leaf.cc, raw).is_some());
+        !tail_imm && consts.iter().flatten().any(|&raw| cmp_imm_fits(ty, leaf.cc, raw))
+    }
+
+    fn ccmp_head_first<C: Copy>(&self, func: &Function, mut chain: CcmpChain<C>) -> CcmpChain<C> {
+        let first = chain.leaves[0];
+        if !self.plain_pair(first.a, first.b) || self.ccmp_head_gain(func, &first) {
+            return chain;
+        }
+        if let Some(k) = chain.leaves[1..].iter().take_while(|l| l.op == first.op).position(|l| self.ccmp_head_gain(func, l)) {
+            chain.leaves.swap(0, k + 1);
+        }
+        chain
+    }
+
+    pub(in crate::arm64) fn ccmp_chain<'f, C: Copy>(
+        &self,
+        func: &'f Function,
+        (mut op, mut x, mut y, mut at): (Binary, Value, Value, C),
+        node: impl Fn(C, Value) -> Option<(&'f Op, C)>,
+    ) -> Option<CcmpChain<C>> {
+        let (mut leaves, mut joins) = (Vec::new(), Vec::new());
+        while leaves.len() + 1 < MAX_CCMP_LEAVES {
+            let (nx, ny) = (node(at, x)?, node(at, y)?);
+            let (lx, ly) = (self.ccmp_leaf(func, op, x, nx), self.ccmp_leaf(func, op, y, ny));
+            let plain = |l: &Option<CcmpLeaf<C>>| l.as_ref().is_some_and(|l| self.plain_pair(l.a, l.b));
+            if let (Some(hx), Some(hy)) = (lx, ly) {
+                let pair = if plain(&ly) { [hy, hx] } else if plain(&lx) { [hx, hy] } else { return None };
+                leaves.extend(pair);
+                leaves.reverse();
+                return Some(self.ccmp_head_first(func, CcmpChain { leaves, joins }));
+            }
+            let (tail, next_val, next) = match (lx, ly) {
+                (_, Some(t)) if plain(&ly) => (t, x, nx),
+                (Some(t), _) if plain(&lx) => (t, y, ny),
+                _ => return None,
+            };
+            let (&Op::Binary(next_op @ (Binary::Band | Binary::Bor), nx2, ny2), next_at) = next else { return None };
+            leaves.push(tail);
+            joins.push(next_val);
+            (op, x, y, at) = (next_op, nx2, ny2, next_at);
+        }
+        None
+    }
 }

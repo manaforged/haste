@@ -4,19 +4,7 @@ use super::{def_entry, local_single};
 use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Function, Inst, IntCC, Op, Value};
 
-const MAX_CHAIN: usize = 8;
-
-struct Leaf {
-    pos: usize,
-    val: Value,
-    cc: IntCC,
-    a: Value,
-    b: Value,
-}
-
-fn plain_operands(plan: &Plan<Reg>, a: Value, b: Value) -> bool {
-    !plan.elided[a.index()] && !plan.elided[b.index()]
-}
+type Leaf = (usize, IntCC, Value, Value);
 
 fn safe_scratch_op(func: &Function, op: &Op) -> bool {
     matches!(op, Op::Const(_) | Op::StackAddr(..) | Op::FramePointer)
@@ -63,11 +51,11 @@ fn val_preserved(func: &Function, plan: &Plan<Reg>, chain: &[Value], (b_idx, sta
     (start + 1..end).all(|pos| !inst_clobbers_val(func, plan, chain, target, func.blocks[b_idx].insts[pos]))
 }
 
-fn tail_preserved(func: &Function, plan: &Plan<Reg>, chain: &[Value], (b_idx, root_pos): (usize, usize), leaf: &Leaf) -> bool {
-    func.ty(leaf.a).is_small_int()
-        && plain_operands(plan, leaf.a, leaf.b)
-        && val_preserved(func, plan, chain, (b_idx, leaf.pos, root_pos), leaf.a)
-        && val_preserved(func, plan, chain, (b_idx, leaf.pos, root_pos), leaf.b)
+fn tail_preserved(func: &Function, plan: &Plan<Reg>, chain: &[Value], (b_idx, root_pos): (usize, usize), (pos, _, a, b): Leaf) -> bool {
+    func.ty(a).is_small_int()
+        && plan.plain_pair(a, b)
+        && val_preserved(func, plan, chain, (b_idx, pos, root_pos), a)
+        && val_preserved(func, plan, chain, (b_idx, pos, root_pos), b)
 }
 
 fn already_elided_tst_ok(
@@ -75,14 +63,12 @@ fn already_elided_tst_ok(
     plan: &Plan<Reg>,
     pos_of: &[Option<(usize, usize, Inst)>],
     (b_idx, root_pos): (usize, usize),
-    leaf: &Leaf,
+    (pos, cc, a, b): Leaf,
 ) -> bool {
-    if !matches!(leaf.cc, IntCC::Equal | IntCC::NotEqual) {
+    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) {
         return false;
     }
-    let Some(m) = (plan.const_of(leaf.b) == Some(0))
-        .then_some(leaf.a)
-        .or_else(|| (plan.const_of(leaf.a) == Some(0)).then_some(leaf.b))
+    let Some(m) = (plan.const_of(b) == Some(0)).then_some(a).or_else(|| (plan.const_of(a) == Some(0)).then_some(b))
     else {
         return false;
     };
@@ -90,7 +76,7 @@ fn already_elided_tst_ok(
         return false;
     }
     let Some((mb, mpos, minst)) = def_entry(pos_of, m) else { return false };
-    if mb != b_idx || mpos >= leaf.pos {
+    if mb != b_idx || mpos >= pos {
         return false;
     }
     let Op::Binary(Binary::Band, bx, by) = func.insts[minst.index()].op else { return false };
@@ -103,14 +89,14 @@ fn head_band(
     info @ (_, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
     (b_idx, root_pos): (usize, usize),
     chain: &[Value],
-    head: &Leaf,
+    head @ (pos, cc, a, b): Leaf,
 ) -> Option<Option<Value>> {
     if tail_preserved(func, plan, chain, (b_idx, root_pos), head)
         || already_elided_tst_ok(func, plan, pos_of, (b_idx, root_pos), head)
     {
         return Some(None);
     }
-    try_cmp_preserved(func, plan, info, (b_idx, head.pos, root_pos, None), (head.cc, head.a, head.b, 1))
+    try_cmp_preserved(func, plan, info, (b_idx, pos, root_pos, None), (cc, a, b, 1))
 }
 
 fn local_child(
@@ -123,43 +109,6 @@ fn local_child(
     (!plan.fused[val.index()] && !plan.is_static(val) && func.ty(val).is_small_int())
         .then(|| local_single(plan, info, b_idx, limit, val))
         .flatten()
-}
-
-fn as_leaf(func: &Function, pos: usize, val: Value, inst: Inst) -> Option<Leaf> {
-    let Op::Icmp(cc, a, b) = func.insts[inst.index()].op else { return None };
-    func.ty(a).is_small_int().then_some(Leaf { pos, val, cc, a, b })
-}
-
-fn collect_chain(
-    func: &Function,
-    plan: &Plan<Reg>,
-    info: (&[u32], &[Option<(usize, usize, Inst)>]),
-    (b_idx, pos, x, y): (usize, usize, Value, Value),
-) -> Option<(Vec<Value>, Leaf, Vec<Leaf>)> {
-    let (mut cur_pos, mut cur_x, mut cur_y) = (pos, x, y);
-    let (mut chain, mut tails) = (Vec::new(), Vec::new());
-    while tails.len() + 1 < MAX_CHAIN {
-        let (xp, xi) = local_child(func, plan, info, (b_idx, cur_pos), cur_x)?;
-        let (yp, yi) = local_child(func, plan, info, (b_idx, cur_pos), cur_y)?;
-        if let (Some(lx), Some(ly)) = (as_leaf(func, xp, cur_x, xi), as_leaf(func, yp, cur_y, yi)) {
-            let (head, tail) = if plain_operands(plan, ly.a, ly.b) { (lx, ly) } else { (ly, lx) };
-            chain.push(head.val);
-            chain.push(tail.val);
-            tails.push(tail);
-            return Some((chain, head, tails));
-        }
-        let (next_val, next_pos, next_inst, tail) = match (as_leaf(func, xp, cur_x, xi), as_leaf(func, yp, cur_y, yi)) {
-            (_, Some(ly)) if plain_operands(plan, ly.a, ly.b) => (cur_x, xp, xi, ly),
-            (Some(lx), _) if plain_operands(plan, lx.a, lx.b) => (cur_y, yp, yi, lx),
-            _ => return None,
-        };
-        let Op::Binary(Binary::Band | Binary::Bor, nx, ny) = func.insts[next_inst.index()].op else { return None };
-        chain.push(tail.val);
-        chain.push(next_val);
-        tails.push(tail);
-        (cur_pos, cur_x, cur_y) = (next_pos, nx, ny);
-    }
-    None
 }
 
 fn branch_or_trap_only(func: &Function, tail: &[Inst], res: Value) -> bool {
@@ -184,7 +133,7 @@ fn try_fuse_root(
     (b_idx, pos, res): (usize, usize, Value),
     (op, x, y): (Binary, Value, Value),
 ) {
-    if !matches!(op, Binary::Band | Binary::Bor) || plan.fused[res.index()] || plan.is_static(res) {
+    if !matches!(op, Binary::Band | Binary::Bor) || plan.fused[res.index()] || plan.location(res).is_static() {
         return;
     }
     let tail = &func.blocks[b_idx].insts[pos + 1..];
@@ -192,11 +141,16 @@ fn try_fuse_root(
     if already_elided && (op != Binary::Band || uses[res.index()] != 1 || !branch_or_trap_only(func, tail, res)) {
         return;
     }
-    let Some((chain, head, tails)) = collect_chain(func, plan, info, (b_idx, pos, x, y)) else { return };
-    if !tails.iter().all(|t| tail_preserved(func, plan, &chain, (b_idx, pos), t)) {
+    let view: &Plan<Reg> = plan;
+    let node = |limit: usize, v: Value| local_child(func, view, info, (b_idx, limit), v).map(|(at, inst)| (&func.insts[inst.index()].op, at));
+    let Some(found) = view.ccmp_chain(func, (op, x, y, pos), node) else { return };
+    let chain: Vec<Value> = found.leaves.iter().map(|l| l.val).chain(found.joins.iter().copied()).collect();
+    let mut leaves = found.leaves.iter().map(|l| (l.at, l.cc, l.a, l.b));
+    let Some(head) = leaves.next() else { return };
+    if !leaves.all(|t| tail_preserved(func, plan, &chain, (b_idx, pos), t)) {
         return;
     }
-    let Some(band) = head_band(func, plan, info, (b_idx, pos), &chain, &head) else { return };
+    let Some(band) = head_band(func, plan, info, (b_idx, pos), &chain, head) else { return };
     let fuse_flags = already_elided || (uses[res.index()] == 1 && icmp_consumer(func, tail, res));
     for v in chain {
         plan.elided[v.index()] = true;
