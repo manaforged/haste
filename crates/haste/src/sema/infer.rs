@@ -46,7 +46,7 @@ pub use path::{parse_int, segments};
 pub use scope::{Form, type_params};
 pub use select::header_bound_traits;
 pub use tables::{BodyTables, LazyTables, SiteKey, SyntaxTables, Typed};
-pub(super) use tables::recount_call_sites;
+pub(super) use tables::{CallSites, recount_call_sites};
 
 use rustc_hash::FxHashMap as HashMap;
 

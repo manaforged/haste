@@ -502,24 +502,52 @@ impl Typed {
     }
 }
 
-/// Recomputes saturating (`0 / 1 / >=2`) direct call-site counts per reached index, clamping pinned roots and indirect targets to `2`.
-pub fn recount_call_sites(len: usize, settled: impl Fn(usize) -> bool, calls: &[Vec<usize>], indirect: &[Vec<usize>], pinned: &[bool], out: &mut Vec<u8>) {
-    out.clear();
-    out.resize(len, 0);
-    for (at, &pin) in pinned.iter().enumerate() {
-        if pin {
-            out[at] = 2;
+/// Exact direct and indirect call-site counts per reached index, kept in step with the settled entries and read as saturating `0 / 1 / >=2` sites.
+#[derive(Default)]
+pub struct CallSites {
+    direct: Vec<u32>,
+    indirect: Vec<u32>,
+    counted: Vec<bool>,
+    sites: Vec<u8>,
+}
+
+impl CallSites {
+    /// The saturating call-site count of reached index `index`, `2` for pinned roots and indirect targets.
+    pub fn get(&self, index: usize) -> Option<u8> {
+        self.sites.get(index).copied()
+    }
+
+    /// Withdraws the counted edges of `indices`, whose `calls` and `indirect` lists the caller is about to overwrite.
+    pub fn retract(&mut self, indices: &[usize], calls: &[Vec<usize>], indirect: &[Vec<usize>]) {
+        for &at in indices {
+            if self.counted.get(at) == Some(&true) {
+                self.shift(at, (calls, indirect), false);
+            }
         }
     }
-    for at in 0..len {
-        if !settled(at) {
-            continue;
-        }
+
+    fn shift(&mut self, at: usize, (calls, indirect): (&[Vec<usize>], &[Vec<usize>]), add: bool) {
         for &c in &calls[at] {
-            out[c] = out[c].saturating_add(1).min(2);
+            self.direct[c] = if add { self.direct[c] + 1 } else { self.direct[c] - 1 };
         }
         for &c in &indirect[at] {
-            out[c] = 2;
+            self.indirect[c] = if add { self.indirect[c] + 1 } else { self.indirect[c] - 1 };
+        }
+        self.counted[at] = add;
+    }
+}
+
+/// Brings `out` to the saturating (`0 / 1 / >=2`) direct call-site counts of the settled entries, clamping pinned roots and indirect targets to `2`, recounting only entries whose settled state changed.
+pub fn recount_call_sites(len: usize, settled: impl Fn(usize) -> bool, calls: &[Vec<usize>], indirect: &[Vec<usize>], pinned: &[bool], out: &mut CallSites) {
+    out.direct.resize(len, 0);
+    out.indirect.resize(len, 0);
+    out.counted.resize(len, false);
+    for at in 0..len {
+        let now = settled(at);
+        if out.counted[at] != now {
+            out.shift(at, (calls, indirect), now);
         }
     }
+    out.sites.clear();
+    out.sites.extend((0..len).map(|c| if pinned.get(c) == Some(&true) || out.indirect[c] > 0 { 2 } else { out.direct[c].min(2) as u8 }));
 }

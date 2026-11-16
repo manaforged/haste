@@ -44,7 +44,7 @@ pub struct Reached {
     pub unlaid: Vec<String>,
     calls: Vec<Vec<usize>>,
     indirect: Vec<Vec<usize>>,
-    call_sites: Vec<u8>,
+    call_sites: super::infer::CallSites,
     pinned: Vec<bool>,
     states: Vec<ReachedEntry>,
     untyped_count: usize,
@@ -133,7 +133,7 @@ impl Reached {
 
     /// Whether reached function `index` has exactly one static direct call site and no indirect or root entry.
     pub(crate) fn is_sole_called(&self, index: usize) -> bool {
-        self.call_sites.get(index).copied() == Some(1)
+        self.call_sites.get(index) == Some(1)
     }
 
     fn pin_roots(&mut self, roots: &[Instance]) {
@@ -146,6 +146,7 @@ impl Reached {
     fn link(&mut self, indices: &[usize]) {
         self.calls.resize(self.list.len(), Vec::new());
         self.indirect.resize(self.list.len(), Vec::new());
+        self.call_sites.retract(indices, &self.calls, &self.indirect);
         let workers = crate::jobs().min(indices.len() / 256);
         let edges = |at: usize| self.list[at].1.as_ref().map(|t| t.collect_link_edges(&self.index)).unwrap_or_default();
         if workers <= 1 {
