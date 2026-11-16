@@ -6,6 +6,7 @@ use crate::live::{Live, Range, overlaps};
 
 mod choose;
 mod place;
+mod recolor;
 use choose::choose_free;
 pub(crate) use place::scratch_clobbers;
 use place::{apply_demote, evict_slot, find_demote_free, find_relocate, leaf_park_cost, slot_accepts, victim_slot_unweighted};
@@ -41,6 +42,12 @@ pub(super) struct Pool<F> {
     pub(super) passed: Vec<Option<(F, bool)>>,
     clobbers: Vec<Vec<Range>>,
     slot_clobber: Vec<u8>,
+}
+
+impl<F: PartialEq> Pool<F> {
+    pub(super) fn slot_of(&self, reg: F) -> Option<usize> {
+        self.regs.iter().position(|r| *r == reg)
+    }
 }
 
 impl<F> Pool<F> {
@@ -107,7 +114,7 @@ fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, poo
     let entry = func.entry.map_or(&[][..], |entry| &func.blocks[entry.index()].params[..]);
     for (value, arrival) in entry.iter().zip(&class.arrivals) {
         if let [reg] = arrival[..]
-            && let Some(slot) = out.regs.iter().position(|r| *r == reg)
+            && let Some(slot) = out.slot_of(reg)
             && !out.is_saved[slot]
             && pooled[value.index()]
         {
@@ -119,10 +126,7 @@ fn pool<F: Copy + PartialEq>(func: &Function, class: &Class<F>, live: &Live, poo
     }
     for (v, entry) in class.passed.iter().enumerate() {
         out.passed[v] = entry.filter(|(reg, _)| {
-            out.regs
-                .iter()
-                .position(|r| *r == *reg)
-                .is_some_and(|slot| !out.is_saved[slot] && !out.slot_clobbered(slot, live.ranges_of(v)))
+            out.slot_of(*reg).is_some_and(|slot| !out.is_saved[slot] && !out.slot_clobbered(slot, live.ranges_of(v)))
         });
     }
     out
@@ -488,6 +492,7 @@ fn allocate_weighted<F: Copy + PartialEq>(func: &Function, live: &Live, pool: &P
             }
         }
     }
+    recolor::Join { func, live, pool, hints, back_partners: &back_partners, reverse_reuse: &reverse_reuse }.join_back_args(&mut slots, &mut homes);
     let used = (0..pool.regs.len()).filter(|&s| pool.is_saved[s] && !slots.is_empty(s)).map(|s| pool.regs[s]).collect();
     (homes, used)
 }
@@ -502,7 +507,7 @@ pub(crate) fn allocate<F: Copy + PartialEq>(func: &Function, live: &Live, class:
     let mut slots = SlotSet::new(pool.regs.len());
     for (v, reg) in pool.kept.iter().enumerate() {
         if let Some(reg) = *reg
-            && let Some(slot) = pool.regs.iter().position(|r| *r == reg)
+            && let Some(slot) = pool.slot_of(reg)
         {
             homes[v] = Some(reg);
             holders[slot].push(v);
