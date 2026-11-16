@@ -6,12 +6,12 @@ pub(super) use fuse::{fuse, narrows_exactly};
 pub(super) use patterns::{LEAF, Root, adc_plan, bextr_parts, shld_parts, unwrap_shift_mask};
 use patterns::odd_scale_source;
 
-use super::asm::{Alu, Mem, Reg, Rm, Shift, Size, Xmm};
+use super::asm::{Alu, Asm, Mem, Reg, Rm, Shift, Size, Xmm};
 use super::float::{X2, scalar};
 use super::Emit;
 use crate::alloc::Location;
 use crate::fold::fits_imm32;
-use crate::frame::{Emitter, Ext};
+use crate::frame::{ArgStep, Emitter, Ext};
 use crate::ir::{Op, Type, Value};
 use crate::live::{Sib, SibBase};
 use crate::reloc::{RelocKind, StencilReloc};
@@ -126,7 +126,20 @@ impl Emit<'_> {
 
     /// The memory at `addr + offset`: relative to the frame base for a frame address, to the location register of `addr`, or through rcx.
     pub(super) fn address(&mut self, addr: Value, offset: i32) -> Mem {
-        self.address_in(addr, offset, Reg::Rcx, Reg::R11)
+        self.address_in(addr, offset, Reg::Rcx, None)
+    }
+
+    /// Runs `emit` with the constant `base` in `temp`, or in r11 kept on the stack around it when no temporary is free.
+    fn with_base(&mut self, temp: Option<Reg>, base: Value, emit: impl FnOnce(&mut Asm, Reg)) {
+        let reg = temp.unwrap_or(Reg::R11);
+        if temp.is_none() {
+            self.asm.push(Reg::R11);
+        }
+        self.raw(reg, base);
+        emit(&mut self.asm, reg);
+        if temp.is_none() {
+            self.asm.pop(Reg::R11);
+        }
     }
 
     fn load_odd_index(&mut self, dst: Reg, x: Value, lea_scale: u8) {
@@ -160,14 +173,13 @@ impl Emit<'_> {
         }
     }
 
-    fn sib_slow(&mut self, base: Value, mode: Sib, disp: i32, (scratch, temp): (Reg, Reg)) -> Mem {
+    fn sib_slow(&mut self, base: Value, mode: Sib, disp: i32, (scratch, temp): (Reg, Option<Reg>)) -> Mem {
         self.load_index(scratch, mode.index);
         if mode.shift > 0
             && !matches!(self.location(base), Location::Slot | Location::Frame(..))
             && !matches!(self.location(base), Location::Imm(imm) if fits_imm32(imm))
         {
-            self.raw(temp, base);
-            self.asm.lea(scratch, Mem::sib(temp, scratch, mode.shift, 0));
+            self.with_base(temp, base, |asm, reg| asm.lea(scratch, Mem::sib(reg, scratch, mode.shift, 0)));
             self.clobber_reg(scratch);
             return Mem::new(scratch, disp);
         }
@@ -182,16 +194,13 @@ impl Emit<'_> {
                 self.asm.alu(Alu::Add, scratch, self.base);
                 self.asm.alu_imm(Alu::Add, scratch, self.frame.slots[slot.index()] + off + self.bias);
             }
-            _ => {
-                self.raw(temp, base);
-                self.asm.alu(Alu::Add, scratch, temp);
-            }
+            _ => self.with_base(temp, base, |asm, reg| asm.alu(Alu::Add, scratch, reg)),
         }
         self.clobber_reg(scratch);
         Mem::new(scratch, disp)
     }
 
-    pub(super) fn sib_mem(&mut self, mode: Sib, offset: i32, scratch: Reg, temp: Reg) -> Mem {
+    pub(super) fn sib_mem(&mut self, mode: Sib, offset: i32, scratch: Reg, temp: Option<Reg>) -> Mem {
         let idx_reg = self.reg_of(mode.index).filter(|_| self.ty(mode.index).bytes() >= 8 || self.plan.zero_ext[mode.index.index()]);
         match mode.base {
             SibBase::Frame(slot) => {
@@ -222,7 +231,7 @@ impl Emit<'_> {
         }
     }
 
-    pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg, temp: Reg) -> Mem {
+    pub(super) fn address_in(&mut self, addr: Value, offset: i32, scratch: Reg, temp: Option<Reg>) -> Mem {
         if self.plan.elided[addr.index()]
             && let Some(mode) = self.plan.sib[addr.index()]
         {
@@ -472,7 +481,7 @@ impl Emit<'_> {
         }
     }
 
-    /// A register or memory operand that holds `value`, using r11 when `value` has no register or stack home.
+    /// A register or memory operand that holds `value`, using rcx when `value` has no register or stack home.
     pub(super) fn operand(&mut self, value: Value) -> Rm {
         if let Some(mem) = self.elided_mem(value) {
             return mem.into();
@@ -481,9 +490,85 @@ impl Emit<'_> {
             Location::Reg(reg) => reg.into(),
             Location::Slot => self.cached_spill(value).map_or_else(|| Rm::from(self.at(value)), Rm::from),
             _ => {
-                self.raw(Reg::R11, value);
-                Reg::R11.into()
+                self.raw(Reg::Rcx, value);
+                Reg::Rcx.into()
             }
+        }
+    }
+
+    /// Whether reading `value` as an operand writes rcx: an elided load addresses through it, and a constant or address without a register or stack home lands in it.
+    pub(super) fn reads_through_rcx(&self, value: Value) -> bool {
+        self.has_elided_mem(value) || !matches!(self.location(value), Location::Reg(_) | Location::Slot)
+    }
+
+    /// `source` and the first of rax and rcx that neither it nor `dst` reads, loading `value` into `dst`, or rax, when `source` reads both.
+    pub(super) fn spare(&mut self, dst: Option<Reg>, value: Value, source: Rm) -> (Rm, Reg) {
+        let reads = |reg: Reg| match source {
+            Rm::Reg(r) => r == reg as u8,
+            Rm::Mem(mem) => mem.base == reg || mem.index.is_some_and(|(index, _)| index == reg),
+        };
+        if let Some(free) = [Reg::Rax, Reg::Rcx].into_iter().find(|&reg| Some(reg) != dst && !reads(reg)) {
+            return (source, free);
+        }
+        let into = dst.unwrap_or(Reg::Rax);
+        self.raw(into, value);
+        (into.into(), if into == Reg::Rax { Reg::Rcx } else { Reg::Rax })
+    }
+
+    /// Loads `value` into rax and then runs `fill`, which loads `dst` without writing rax; when `dst` is rax, runs `fill` first and loads `value` into rcx. Returns the register that holds `value`.
+    pub(super) fn beside(&mut self, dst: Reg, value: Value, fill: impl FnOnce(&mut Self)) -> Reg {
+        if dst == Reg::Rax {
+            fill(self);
+            self.raw(Reg::Rcx, value);
+            return Reg::Rcx;
+        }
+        self.raw(Reg::Rax, value);
+        fill(self);
+        Reg::Rax
+    }
+
+    /// Runs one step of a parallel move between integer registers, saving through `scratch`, or through the stack when no register is free.
+    pub(super) fn int_step(&mut self, step: ArgStep<Reg>, scratch: Option<Reg>) {
+        match (step, scratch) {
+            (ArgStep::Move(src, dst), _) => self.asm.mov(dst, src),
+            (ArgStep::Save(src), Some(reg)) => self.asm.mov(reg, src),
+            (ArgStep::Save(src), None) => self.asm.push(src),
+            (ArgStep::Restore(dst), Some(reg)) => self.asm.mov(dst, reg),
+            (ArgStep::Restore(dst), None) => self.asm.pop(dst),
+            (ArgStep::Load(val, dst), _) => self.raw(dst, val),
+        }
+        match step {
+            ArgStep::Move(_, reg) | ArgStep::Restore(reg) => self.clobber_reg(reg),
+            ArgStep::Save(_) => scratch.into_iter().for_each(|reg| self.clobber_reg(reg)),
+            ArgStep::Load(..) => {}
+        }
+    }
+
+    /// Holds `arg` in edge scratch `index` while a block's parameters move: rcx for the first, the top of the stack for the second.
+    pub(super) fn save_edge(&mut self, index: usize, arg: Value) {
+        if index == 0 {
+            return self.raw(Reg::Rcx, arg);
+        }
+        self.raw(Reg::Rax, arg);
+        self.asm.push(Reg::Rax);
+        self.shift_base(8);
+    }
+
+    /// Writes edge scratch `index`, which `save_edge` filled, into `param`.
+    pub(super) fn restore_edge(&mut self, index: usize, param: Value) {
+        if index == 0 {
+            return self.put(param, Reg::Rcx);
+        }
+        self.asm.pop(Reg::Rax);
+        self.shift_base(-8);
+        self.clobber_reg(Reg::Rax);
+        self.put(param, Reg::Rax);
+    }
+
+    /// Keeps frame addresses right while `by` bytes sit pushed on a frame addressed from rsp.
+    fn shift_base(&mut self, by: i32) {
+        if self.base == Reg::Rsp {
+            self.bias += by;
         }
     }
 

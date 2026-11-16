@@ -112,7 +112,7 @@ impl Emit<'_> {
         }
     }
 
-    /// `op` of the 64 bits of `src` into `dst`, with 64 leading or trailing zeros for zero; without the host instruction it uses r11 and rsi, where no value lives.
+    /// `op` of the 64 bits of `src` into `dst`, with 64 leading or trailing zeros for zero; without the host instruction a population count uses r11 and rsi, which the allocator keeps free across it.
     pub(super) fn count(&mut self, op: Count, dst: Reg, src: impl Into<Rm>) {
         let src = src.into();
         let fast = match op {
@@ -129,12 +129,14 @@ impl Emit<'_> {
             Count::Tzcnt => false,
         };
         self.asm.bit_scan(reverse, dst, src);
-        self.asm.mov_imm(Reg::R11, if reverse { 127 } else { 64 });
-        self.asm.cmov(Cond::E, dst, Reg::R11);
+        let found = self.asm.label();
+        self.asm.jcc(Cond::Ne, found);
+        self.asm.mov_imm(dst, if reverse { 127 } else { 64 });
+        self.asm.bind(found);
         if reverse {
             self.asm.alu_imm(Alu::Xor, dst, 63);
         }
-        self.clobber_regs(&[dst, Reg::R11]);
+        self.clobber_reg(dst);
     }
 
     pub(super) fn binary(&mut self, op: Binary, x: Value, y: Value, result: Value) -> Result<(), String> {
@@ -180,7 +182,7 @@ impl Emit<'_> {
             && let Some(mode) = self.plan.sib[result.index()]
         {
             self.flags = saved_flags;
-            let mem = self.sib_mem(mode, 0, Reg::Rcx, Reg::R11);
+            let mem = self.sib_mem(mode, 0, Reg::Rcx, Some(dst));
             self.asm.lea(dst, mem);
             return Ok(dst);
         }
@@ -195,14 +197,18 @@ impl Emit<'_> {
             let size = if ty == Type::I32 { Size::D } else { Size::Q };
             let is_shrd = self.reg_of(lo) == Some(dst);
             let src = if is_shrd { hi } else { lo };
-            let src_reg = self.reg_of(src).or_else(|| self.cached_beside(src, hi)).filter(|&reg| reg != dst).unwrap_or_else(|| {
-                self.raw(Reg::R11, src);
-                Reg::R11
-            });
+            let held = self.reg_of(src).or_else(|| self.cached_beside(src, hi)).filter(|&reg| reg != dst);
             if is_shrd {
+                let src_reg = held.unwrap_or_else(|| self.beside(dst, src, |_| {}));
                 self.asm.shrd_imm(size, dst, src_reg, r);
             } else {
-                self.raw(dst, hi);
+                let src_reg = match held {
+                    Some(reg) => {
+                        self.raw(dst, hi);
+                        reg
+                    }
+                    None => self.beside(dst, src, |this| this.raw(dst, hi)),
+                };
                 self.asm.shld_imm(size, dst, src_reg, l);
             }
             return Ok(dst);
@@ -231,8 +237,10 @@ impl Emit<'_> {
                 self.raw(dst, src);
                 dst.into()
             };
-            self.asm.mov_imm(Reg::R11, ctrl);
-            self.asm.bextr(size, dst, source, Reg::R11);
+            let (source, held) = self.spare(Some(dst), src, source);
+            self.asm.mov_imm(held, ctrl);
+            self.clobber_reg(held);
+            self.asm.bextr(size, dst, source, held);
             if self.plan.fused[result.index()] {
                 self.flags = Some((result, Cond::Ne));
             }
@@ -508,11 +516,10 @@ impl Emit<'_> {
         let y = super::location::unwrap_shift_mask(self.func, &self.plan, &self.defs, y, result, ty.bits());
         if self.features.bmi2 && matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr) {
             if matches!(ty, Type::I8 | Type::I16) {
-                self.raw(Reg::R11, y);
-                self.asm.alu_imm32(Alu::And, Reg::R11, ty.bits() as i32 - 1);
-                self.clobber_reg(Reg::R11);
-                load_x(self, dst, need_ext);
-                self.asm.shiftx(Size::Q, shift, dst, dst, Reg::R11);
+                let count = self.beside(dst, y, |this| load_x(this, dst, need_ext));
+                self.asm.alu_imm32(Alu::And, count, ty.bits() as i32 - 1);
+                self.clobber_reg(count);
+                self.asm.shiftx(Size::Q, shift, dst, dst, count);
                 return dst;
             }
             self.vex_gpr(y, x, dst, |asm, cnt, src| asm.shiftx(size, shift, dst, src, cnt));
@@ -535,22 +542,21 @@ impl Emit<'_> {
             emit(&mut self.asm, reg, source);
         } else if self.has_elided_mem(rm_val) {
             let source = self.operand(rm_val);
-            self.raw(Reg::R11, vvvv);
-            emit(&mut self.asm, Reg::R11, source);
+            self.raw(Reg::Rax, vvvv);
+            emit(&mut self.asm, Reg::Rax, source);
         } else if !matches!(self.location(rm_val), Location::Reg(_) | Location::Slot) {
-            self.raw(dst, rm_val);
-            self.raw(Reg::R11, vvvv);
-            emit(&mut self.asm, Reg::R11, dst.into());
+            let count = self.beside(dst, vvvv, |this| this.raw(dst, rm_val));
+            emit(&mut self.asm, count, dst.into());
         } else {
-            self.raw(Reg::R11, vvvv);
+            self.raw(Reg::Rax, vvvv);
             let source = self.operand(rm_val);
-            emit(&mut self.asm, Reg::R11, source);
+            emit(&mut self.asm, Reg::Rax, source);
         }
     }
 
-    /// The cached spill register of `value` when it survives reading `other`: not the rcx or r11 scratch an elided load of `other` builds its address in.
+    /// The cached spill register of `value` when it survives reading `other`: not the rcx that reading `other` may write.
     fn cached_beside(&self, value: Value, other: Value) -> Option<Reg> {
-        self.cached_spill(value).filter(|&reg| !(self.has_elided_mem(other) && matches!(reg, Reg::Rcx | Reg::R11)))
+        self.cached_spill(value).filter(|&reg| !(reg == Reg::Rcx && self.reads_through_rcx(other)))
     }
 
     pub(super) fn elided_band_cmp(&self, x: Value, y: Value) -> Option<(Value, Value)> {
@@ -585,14 +591,17 @@ impl Emit<'_> {
             if let Some((tsz, timm)) = imm_sz {
                 let source = self.operand(val);
                 self.asm.test_imm_sized(tsz, source, timm);
-            } else if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
-                let source = self.operand(val);
-                self.asm.mov_imm(Reg::R11, imm);
-                self.asm.test_sized(Size::Q, source, Reg::R11);
             } else {
-                self.raw(Reg::Rax, val);
-                self.asm.mov_imm(Reg::R11, imm);
-                self.asm.test_sized(Size::Q, Reg::Rax, Reg::R11);
+                let source = if matches!(self.location(val), Location::Reg(_) | Location::Slot) || self.has_elided_mem(val) {
+                    self.operand(val)
+                } else {
+                    self.raw(Reg::Rax, val);
+                    Reg::Rax.into()
+                };
+                let (source, wide) = self.spare(None, val, source);
+                self.asm.mov_imm(wide, imm);
+                self.clobber_reg(wide);
+                self.asm.test_sized(Size::Q, source, wide);
             }
             return;
         }
@@ -621,7 +630,7 @@ impl Emit<'_> {
             self.asm.alu_imm_sized(size, Alu::Cmp, rm, imm);
             return;
         }
-        let left = self.reg_of(x).or_else(|| y.map_or_else(|| self.cached_spill(x), |yv| self.cached_beside(x, yv))).unwrap_or_else(|| {
+        let left = self.reg_of(x).or_else(|| y.filter(|&yv| self.imm_sized(yv, size).is_none()).map_or_else(|| self.cached_spill(x), |yv| self.cached_beside(x, yv))).unwrap_or_else(|| {
             self.raw(Reg::Rax, x);
             Reg::Rax
         });

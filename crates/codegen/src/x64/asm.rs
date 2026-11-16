@@ -670,6 +670,11 @@ impl Asm {
         self.code.push(0x50 + (reg as u8 & 7));
     }
 
+    pub fn pop(&mut self, reg: Reg) {
+        self.rex(false, 0, 0, reg as u8, false);
+        self.code.push(0x58 + (reg as u8 & 7));
+    }
+
     /// `call` through the eight bytes at the 32-bit absolute address `at`.
     pub fn call_absolute(&mut self, at: i32) {
         self.code.extend([0xFF, 0x14, 0x25]);

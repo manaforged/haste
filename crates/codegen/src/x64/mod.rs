@@ -28,9 +28,9 @@ use crate::{Code, Site};
 const REGS: Regs<Reg> = Regs {
     saved: &SAVED,
     saved_float: &[],
-    leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10, Reg::Rdx],
+    leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10, Reg::Rdx, Reg::R11],
     wide_scratch: &wide::WIDE_SCRATCH,
-    op_scratch: &[Reg::Rsi, Reg::Rdx],
+    op_scratch: &[Reg::Rsi, Reg::Rdx, Reg::R11],
     uses_scratch: atomic::uses_scratch,
     dict: Some(Reg::R10),
     float: &float::POOL,
@@ -50,7 +50,7 @@ fn imm_store(imm: i64) -> u64 {
 }
 
 const REGS_WIN64: Regs<Reg> = Regs {
-    leaf: &[Reg::R9, Reg::R8, Reg::R10, Reg::Rdx],
+    leaf: &[Reg::R9, Reg::R8, Reg::R10, Reg::Rdx, Reg::R11],
     ..REGS
 };
 
@@ -458,13 +458,12 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
-        let int_scratch = [Reg::R11, Reg::Rcx];
         let float_scratch = [Xmm(0), Xmm(1)];
         for step in edge_steps(self.func, &self.plan.locations, &self.frame.values, args, &self.func.blocks[block.index()].params) {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
-                Step::Save(arg, EdgeScratch::Int(i)) => self.raw(int_scratch[i], arg),
-                Step::Restore(EdgeScratch::Int(i), param) => self.put(param, int_scratch[i]),
+                Step::Save(arg, EdgeScratch::Int(i)) => self.save_edge(i, arg),
+                Step::Restore(EdgeScratch::Int(i), param) => self.restore_edge(i, param),
                 Step::Save(arg, EdgeScratch::Float(i)) => self.fget(float_scratch[i], arg),
                 Step::Restore(EdgeScratch::Float(i), param) => self.fput(param, float_scratch[i]),
                 Step::Save(arg, EdgeScratch::Stack(i)) => self.move_to(self.frame_mem(self.frame.edge_slot(i)), arg),
@@ -485,8 +484,8 @@ impl Emit<'_> {
         self.asm.jcc(Cond::Ae, self.blocks[self.func.jump_target(default).index()]);
         let table = self.asm.label();
         self.asm.lea_rip(Reg::Rcx, table);
-        self.asm.load_signed(Size::D, Reg::R11, Mem::sib(Reg::Rcx, Reg::Rax, 2, 0));
-        self.asm.alu(Alu::Add, Reg::Rcx, Reg::R11);
+        self.asm.load_signed(Size::D, Reg::Rax, Mem::sib(Reg::Rcx, Reg::Rax, 2, 0));
+        self.asm.alu(Alu::Add, Reg::Rcx, Reg::Rax);
         self.asm.jmp_reg(Reg::Rcx);
         while self.asm.pos() & 3 != 0 {
             self.asm.bytes(&[0xCC]);
@@ -499,7 +498,7 @@ impl Emit<'_> {
 
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {
         let returns = self.abi.returns.clone();
-        self.move_locs(values, &returns, Reg::R11);
+        self.move_locs(values, &returns, None);
         let func = self.func;
         let entry = func.entry.map(|block| &func.blocks[block.index()].params);
         let sret = self.func.signature.params.iter().position(|param| param.purpose == ArgumentPurpose::StructReturn);
@@ -516,7 +515,7 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn move_locs(&mut self, values: &[Value], locs: &[Loc], scratch: Reg) -> usize {
+    fn move_locs(&mut self, values: &[Value], locs: &[Loc], scratch: Option<Reg>) -> usize {
         let float_targets: Vec<(Value, u8)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Float(xmm) = loc { Some((val, xmm)) } else { None }).collect();
         for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
             self.float_step(step);
@@ -526,17 +525,7 @@ impl Emit<'_> {
         }
         let int_targets: Vec<(Value, Reg)> = values.iter().zip(locs).filter_map(|(&val, &loc)| if let Loc::Int(reg) = loc { Some((val, reg)) } else { None }).collect();
         for step in arg_steps(&int_targets, |v| self.reg_of(v)) {
-            match step {
-                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
-                ArgStep::Save(src) => self.asm.mov(scratch, src),
-                ArgStep::Restore(dst) => self.asm.mov(dst, scratch),
-                ArgStep::Load(val, dst) => self.raw(dst, val),
-            }
-            match step {
-                ArgStep::Move(_, reg) | ArgStep::Restore(reg) => self.clobber_reg(reg),
-                ArgStep::Save(_) => self.clobber_reg(scratch),
-                ArgStep::Load(..) => {}
-            }
+            self.int_step(step, scratch);
         }
         for (&val, &loc) in values.iter().zip(locs) {
             if let Loc::Pair(low, high) = loc {
@@ -562,12 +551,7 @@ impl Emit<'_> {
             self.float_step(step);
         }
         for step in reg_steps(int_pairs) {
-            match step {
-                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
-                ArgStep::Save(src) => self.asm.mov(Reg::R11, src),
-                ArgStep::Restore(dst) => self.asm.mov(dst, Reg::R11),
-                ArgStep::Load(..) => {}
-            }
+            self.int_step(step, None);
         }
     }
 
@@ -607,18 +591,13 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
-        let target = if direct.is_none() {
-            match self.reg_of(callee).filter(|reg| SAVED.contains(reg)) {
-                Some(reg) => reg,
-                None => {
-                    self.raw(Reg::R11, callee);
-                    Reg::R11
-                }
-            }
-        } else {
-            Reg::R11
-        };
-        let float_count = self.move_locs(args, &abi.params, Reg::Rax);
+        let held = self.reg_of(callee).filter(|reg| SAVED.contains(reg));
+        let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
+        if direct.is_none() && held.is_none() {
+            values.push(callee);
+            locs.push(Loc::Int(Reg::R11));
+        }
+        let float_count = self.move_locs(&values, &locs, Some(Reg::Rax));
         let func = self.func;
         self.leave_wide(&func.sigs[sig.index()].params);
         if self.abi_kind == CallAbi::SysV && self.func.sigs[sig.index()].params.iter().any(|param| param.purpose == ArgumentPurpose::Variadic) {
@@ -634,7 +613,7 @@ impl Emit<'_> {
                 let at = self.asm.call_slot_reloc();
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
             }
-            None => self.asm.call(target),
+            None => self.asm.call(held.unwrap_or(Reg::R11)),
         }
         self.invalidate_spills();
         Ok(abi)
