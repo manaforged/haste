@@ -123,7 +123,7 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Unroll => unroll::run(func),
         Pass::Licm => licm::run(func),
         Pass::Lsr => lsr::run(func),
-        Pass::Switch => switch::run(func),
+        Pass::Switch => switch::run(func, target),
         Pass::Returns => returns::run(func),
         Pass::TailRec => {
             let did = tailrec::run(func, target);

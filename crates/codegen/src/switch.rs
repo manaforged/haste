@@ -1,6 +1,7 @@
 mod bitmask;
 mod emit;
 mod lut;
+mod member;
 mod select;
 mod tree;
 
@@ -532,7 +533,7 @@ fn clear_blocks(func: &mut Function, blocks: &[usize], hoisted: &[Inst], cleared
     }
 }
 
-fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), mut ch: Chain, cleared: &mut [bool]) -> bool {
+fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), mut ch: Chain, (cleared, flag_chain): (&mut [bool], bool)) -> bool {
     let ty = func.ty(ch.val);
     let single_mod = ch.arms.len() == 1 && ch.two_block_arms == 1 && ch.arms[0].range.lo > ch.arms[0].range.hi;
     let mut runs = if single_mod { Vec::new() } else { build_runs(func, info, ty, &ch.arms) };
@@ -544,8 +545,9 @@ fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), m
         cleared[b0] = true;
         return true;
     }
-    if !single_mod {
-        let covered: u64 = runs.iter().map(|r| r.hi.saturating_sub(r.lo).saturating_add(1)).sum();
+    let covered: u64 = runs.iter().map(|r| r.hi.saturating_sub(r.lo).saturating_add(1)).sum();
+    let members = (flag_chain && !single_mod).then(|| member::member_values(func, info, ty, (&runs, covered))).flatten();
+    if !single_mod && members.is_none() {
         if covered < 4 && ch.two_block_arms == 0 && runs.len() >= ch.arms.len() && !can_bitmask_runs(func, info, ty, &runs) {
             return false;
         }
@@ -562,6 +564,8 @@ fn rewrite_chain(func: &mut Function, info: &Info, (b0, last0): (usize, Inst), m
     if single_mod {
         let r = ch.arms[0].range;
         emit_sub_range(func, Some((b0, last0)), (ch.val, ty), (r.s_lo, r.s_hi.abs_diff(r.s_lo)), (&ch.arms[0].hit, default_blk));
+    } else if let Some((&head, rest)) = members.as_deref().and_then(<[u64]>::split_first) {
+        member::emit_member(func, (b0, last0), (ch.val, ty), (head, rest), (&runs[0].hit, default_blk));
     } else if !try_signed_br_table(func, (b0, last0), (ch.val, ty), &ch.arms, (default_blk, &mut cache)) {
         emit_node(func, info, Some((b0, last0)), (ch.val, ty), &runs, (default_blk, &mut cache));
     }
@@ -608,12 +612,13 @@ fn try_rewrite_br_table(func: &mut Function, info: &Info, (b0, last0): (usize, I
     true
 }
 
-pub(crate) fn run(func: &mut Function) -> Domain {
+pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
     if func.coroutine.is_some() { return Domain::NONE; }
     let mut info = analyze(func);
     let initial_blocks = func.blocks.len();
     let mut cleared = vec![false; initial_blocks];
     let mut changed = false;
+    let flag_chain = target.arch == crate::target::Arch::Arm64;
     for b0 in 0..initial_blocks {
         changed |= select::try_rewrite_select_trees(func, &info, b0);
     }
@@ -632,7 +637,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             continue;
         }
         if let Some(ch) = collect_chain(func, &info, b0, &cleared)
-            && rewrite_chain(func, &info, (b0, last0), ch, &mut cleared)
+            && rewrite_chain(func, &info, (b0, last0), ch, (&mut cleared, flag_chain))
         {
             changed = true;
             continue;
