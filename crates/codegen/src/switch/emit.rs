@@ -38,28 +38,30 @@ pub(super) fn push_node(func: &mut Function, at: Option<(usize, Inst)>, insts: V
     }
 }
 
-fn finish_br_table(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Type), (min, signed): (i64, bool), (default_blk, table): (Block, Vec<Block>)) -> Block {
-    let mut insts = Vec::with_capacity(4);
-    let idx = if min == 0 && !signed {
+const GUARD_MIN: u64 = 0x80;
+const GUARD_RUNS: usize = 4;
+
+fn widen_sub(func: &mut Function, insts: &mut Vec<Inst>, (v, ty): (Value, Type), (to, signed): (Type, bool), base: i64) -> Value {
+    let wide = if ty == to {
         v
     } else {
-        let v64 = if ty == Type::I64 {
-            v
-        } else {
-            let conv = if signed { Convert::Sextend } else { Convert::Uextend };
-            let res = func.value(Type::I64);
-            insts.push(func.add(Op::Convert(conv, v), Some(res)));
-            res
-        };
-        if min == 0 {
-            v64
-        } else {
-            let (min_val, sub) = (func.value(Type::I64), func.value(Type::I64));
-            insts.push(func.add(Op::Const(min), Some(min_val)));
-            insts.push(func.add(Op::Binary(Binary::Isub, v64, min_val), Some(sub)));
-            sub
-        }
+        let conv = if signed { Convert::Sextend } else { Convert::Uextend };
+        let res = func.value(to);
+        insts.push(func.add(Op::Convert(conv, v), Some(res)));
+        res
     };
+    if base == 0 {
+        return wide;
+    }
+    let (base_c, sub) = (func.value(to), func.value(to));
+    insts.push(func.add(Op::Const(extend(base, to, true)), Some(base_c)));
+    insts.push(func.add(Op::Binary(Binary::Isub, wide, base_c), Some(sub)));
+    sub
+}
+
+fn finish_br_table(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Type), (min, signed): (i64, bool), (default_blk, table): (Block, Vec<Block>)) -> Block {
+    let mut insts = Vec::with_capacity(4);
+    let idx = if min == 0 && !signed { v } else { widen_sub(func, &mut insts, (v, ty), (Type::I64, signed), min) };
     insts.push(func.add(Op::BrTable(idx, default_blk, table), None));
     push_node(func, at, insts)
 }
@@ -143,14 +145,14 @@ fn find_cluster(runs: &[Run]) -> Option<(usize, usize)> {
 }
 
 pub(super) fn emit_sub_range(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Type), (lo, span): (i64, u64), (hit, otherwise): (&Edge, Block)) -> Block {
-    let (lo_c, diff, span_c, le) = (func.value(ty), func.value(ty), func.value(ty), func.value(Type::I8));
-    let insts = vec![
-        func.add(Op::Const(extend(lo, ty, true)), Some(lo_c)),
-        func.add(Op::Binary(Binary::Isub, v, lo_c), Some(diff)),
-        func.add(Op::Const(extend(span as i64, ty, true)), Some(span_c)),
-        func.add(Op::Icmp(IntCC::UnsignedLessThanOrEqual, diff, span_c), Some(le)),
-        func.add(Op::Brif(le, hit.block, hit.args.clone(), otherwise, Vec::new()), None),
-    ];
+    let lo_u = extend(lo, ty, false) as u64;
+    let to = if ty.bits() < 32 && lo_u.checked_add(span).is_some_and(|top| top <= ty.unsigned_max()) { Type::I32 } else { ty };
+    let mut insts = Vec::with_capacity(6);
+    let diff = widen_sub(func, &mut insts, (v, ty), (to, false), lo_u as i64);
+    let (span_c, le) = (func.value(to), func.value(Type::I8));
+    insts.push(func.add(Op::Const(extend(span as i64, to, true)), Some(span_c)));
+    insts.push(func.add(Op::Icmp(IntCC::UnsignedLessThanOrEqual, diff, span_c), Some(le)));
+    insts.push(func.add(Op::Brif(le, hit.block, hit.args.clone(), otherwise, Vec::new()), None));
     push_node(func, at, insts)
 }
 
@@ -162,11 +164,11 @@ fn emit_run_check(func: &mut Function, at: Option<(usize, Inst)>, (v, ty, (lo, h
         let jump = func.add(Op::Jump(run.hit.block, run.hit.args.clone()), None);
         return push_node(func, at, vec![jump]);
     }
-    let u_max = ty.unsigned_max();
-    if run.lo > 0 && run.hi < u_max && run.lo != run.hi {
+    let (floor, ceil) = if lo >= GUARD_MIN { (lo, hi) } else { (0, ty.unsigned_max()) };
+    if run.lo > floor && run.hi < ceil && run.lo != run.hi {
         return emit_sub_range(func, at, (v, ty), (run.lo as i64, run.hi - run.lo), (&run.hit, otherwise));
     }
-    let (cc, imm) = match (run.lo == run.hi, run.lo == 0) {
+    let (cc, imm) = match (run.lo == run.hi, run.lo <= floor) {
         (true, _) => (IntCC::Equal, run.lo),
         (false, true) => (IntCC::UnsignedLessThanOrEqual, run.hi),
         (false, false) => (IntCC::UnsignedGreaterThanOrEqual, run.lo),
@@ -196,6 +198,15 @@ fn emit_within(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, 
         }
         return finish_br_table(func, at, (v, ty), (min as i64, false), (default_blk, table));
     }
+    if lo == 0 && runs.len() >= GUARD_RUNS && runs[0].lo >= GUARD_MIN {
+        let min = runs[0].lo;
+        let rest = emit_tree(func, info, None, (v, ty, (min, hi)), runs, (default_blk, cache));
+        return emit_split(func, at, (v, ty), min, (default_blk, rest));
+    }
+    emit_tree(func, info, at, (v, ty, (lo, hi)), runs, (default_blk, cache))
+}
+
+fn emit_tree(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, ty, (lo, hi)): (Value, Type, (u64, u64)), runs: &[Run], (default_blk, cache): (Block, &mut Cache)) -> Block {
     if runs.len() <= 2 {
         let rest = if runs[0].lo <= lo { runs[0].hi.saturating_add(1) } else { lo };
         let otherwise = if runs.len() == 2 { emit_within(func, info, None, (v, ty, (rest, hi)), &runs[1..], (default_blk, cache)) } else { default_blk };
@@ -209,6 +220,10 @@ fn emit_within(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, 
     let split = runs[mid].lo;
     let left = emit_within(func, info, None, (v, ty, (lo, split - 1)), &runs[..mid], (default_blk, cache));
     let right = emit_within(func, info, None, (v, ty, (split, hi)), &runs[mid..], (default_blk, cache));
+    emit_split(func, at, (v, ty), split, (left, right))
+}
+
+fn emit_split(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Type), split: u64, (left, right): (Block, Block)) -> Block {
     let (pivot, lt) = (func.value(ty), func.value(Type::I8));
     let insts = vec![
         func.add(Op::Const(extend(split as i64, ty, true)), Some(pivot)),
