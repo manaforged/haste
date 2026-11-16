@@ -1,11 +1,12 @@
 mod demote;
 mod hints;
+mod walk;
 
 use crate::cfg::{Cfg, Loops};
-use crate::fold::{constant, holds};
+use crate::fold::{constant, fits_imm32, holds};
 use crate::frame::{Abi, Loc};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, FloatCC, Function, Inst, Op, Signature, StackSlot, Type, Value};
-use crate::live::{Live, Sib, SibBase, for_effective_operands, live, results};
+use crate::live::{Live, Sib, SibBase, live, results};
 use crate::park::{Class, Hints, ParkReg, allocate};
 
 pub(crate) struct Regs<R: 'static> {
@@ -430,66 +431,6 @@ fn block_weights(depths: &[u32], slow: &[bool]) -> Vec<u64> {
     depths.iter().zip(slow).map(|(&depth, &slow)| (LOOP_WEIGHT.pow(depth.min(MAX_DEPTH)) / if slow { SLOW_SHARE } else { 1 }).max(1)).collect()
 }
 
-fn weights(func: &Function, blocks: &[u64], sib: &[Option<Sib>], elided: &[bool]) -> Vec<u64> {
-    let mut weight = vec![0_u64; func.types.len()];
-    for (block, data) in func.blocks.iter().enumerate() {
-        let each = blocks[block];
-        for inst in &data.insts {
-            let data = &func.insts[inst.index()];
-            if data.result.is_some_and(|res| elided[res.index()]) {
-                continue;
-            }
-            for_effective_operands(data, sib, elided, |value| weight[value.index()] += each);
-            results(data).for_each(|value| weight[value.index()] += each);
-        }
-    }
-    weight
-}
-
-fn edge_hints(func: &Function, cfg: Option<&Cfg>, order: &[Block], blocks: Option<&[u64]>) -> (Option<Vec<Vec<Value>>>, Vec<(usize, usize)>) {
-    let rank = cfg.is_none().then(|| Cfg::ranks(order, func.blocks.len()));
-    let is_back = |src: Block, target: Block| match (cfg, rank.as_deref()) {
-        (Some(cfg), _) => cfg.reachable[src.index()] && cfg.dominates(target, src),
-        (None, Some(rank)) => rank[src.index()] != usize::MAX && rank[target.index()] <= rank[src.index()],
-        (None, None) => target.index() <= src.index(),
-    };
-    let mut incoming = vec![0_u32; func.types.len()];
-    if let Some(entry) = func.entry {
-        func.blocks[entry.index()].params.iter().for_each(|p| incoming[p.index()] += 1);
-    }
-    let mut edges: Vec<(bool, u64, usize, usize)> = Vec::new();
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        let (src, weight) = (Block(b_idx as u32), blocks.map_or(1, |w| w[b_idx]));
-        for inst in &block.insts {
-            let op = &func.insts[inst.index()].op;
-            if let Op::TryCall { handler, .. } = *op {
-                func.blocks[handler.index()].params.iter().for_each(|p| incoming[p.index()] += 1);
-            }
-            crate::frame::terminator_edges(op, &mut |target: Block, args: &[Value]| {
-                let back = is_back(src, target);
-                for (&param, &arg) in func.blocks[target.index()].params.iter().zip(args) {
-                    incoming[param.index()] += 1;
-                    if (cfg.is_some() || back) && param != arg {
-                        edges.push((back, weight, param.index(), arg.index()));
-                    }
-                }
-            });
-        }
-    }
-    edges.sort_unstable_by_key(|&(back, weight, p, a)| (std::cmp::Reverse((back, weight)), p, a));
-    let mut back_args = Vec::new();
-    let mut out = cfg.is_some().then(|| vec![Vec::new(); func.types.len()]);
-    for (back, _, p, a) in edges {
-        if (back || incoming[p] == 1) && !back_args.contains(&(p, a)) { back_args.push((p, a)); }
-        if let Some(partners) = out.as_mut() {
-            let (pv, av) = (Value(p as u32), Value(a as u32));
-            if !partners[p].contains(&av) { partners[p].push(av); }
-            if !partners[a].contains(&pv) { partners[a].push(pv); }
-        }
-    }
-    (out, back_args)
-}
-
 fn place<R, F>(locations: &mut [Location<R>], homes: Vec<Option<F>>, wrap: impl Fn(F) -> Location<R>) {
     for (location, home) in locations.iter_mut().zip(homes) {
         if let Some(reg) = home {
@@ -514,12 +455,12 @@ fn expensive_i64_const(imm: i64, two_address: bool) -> bool {
 }
 
 fn x64_alu_imm(ty: Type, imm: i64) -> bool {
-    ty == Type::I32 || i32::try_from(imm).is_ok()
+    ty == Type::I32 || fits_imm32(imm)
 }
 
 fn x64_inline_imm(op: &Op, ty: Type, rhs: bool, imm: i64) -> bool {
     match op {
-        Op::Icmp(..) => ty != Type::I64 || i32::try_from(imm).is_ok(),
+        Op::Icmp(..) => ty != Type::I64 || fits_imm32(imm),
         Op::Binary(Binary::Iadd | Binary::Bor | Binary::Bxor, ..) => x64_alu_imm(ty, imm),
         Op::Binary(Binary::Band, ..) => x64_alu_imm(ty, imm) || (rhs && imm == 0xFFFF_FFFF),
         Op::Binary(Binary::Isub, ..) => rhs && x64_alu_imm(ty, imm),
@@ -576,7 +517,7 @@ fn scan_const_op<R>(
             let mul_imm = matches!(op, Op::Binary(Binary::Imul, ..)) && two_address;
             for v in [x, y] {
                 if let Location::Imm(imm) = locations[v.index()] {
-                    if pow2_ok && ((imm > 0 && imm.count_ones() == 1) || (mul_imm && i32::try_from(imm).is_ok())) { must_stay_imm[v.index()] = true; }
+                    if pow2_ok && ((imm > 0 && imm.count_ones() == 1) || (mul_imm && fits_imm32(imm))) { must_stay_imm[v.index()] = true; }
                     else if two_address && in_loop && outer(v) { loop_mat[v.index()] += 1; }
                 }
             }
@@ -591,7 +532,7 @@ fn scan_const_op<R>(
         }
         Op::Store(val, ..) | Op::StackStore(val, ..) if in_loop => {
             if let Location::Imm(imm) = locations[val.index()] {
-                if two_address && (func.ty(val).bytes() < 8 || i32::try_from(imm).is_ok()) { must_stay_imm[val.index()] = true; }
+                if two_address && (func.ty(val).bytes() < 8 || fits_imm32(imm)) { must_stay_imm[val.index()] = true; }
                 else if two_address && imm != 0 && outer(val) { loop_mat[val.index()] += 1; }
             }
         }
@@ -692,8 +633,8 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let floats: Vec<bool> = (0..count).map(|value| candidates[value] && !fused[value] && (func.types[value].is_float() || (regs.vectors && func.types[value].is_vector()))).collect();
     let reuse = hints::reusable(func, regs, &locations, &live, &elided);
     let blocks = cfg.as_deref().zip(loops).map(|(cfg, loops)| block_weights(&loops.depths, &slow_blocks(func, cfg, loops)));
-    let weights = blocks.as_deref().map(|blocks| weights(func, blocks, &sib, &elided));
-    let (partners, back_args) = edge_hints(func, cfg.as_deref(), order, blocks.as_deref());
+    let weights = blocks.as_deref().map(|blocks| walk::weights(func, blocks, &sib, &elided));
+    let (partners, back_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref());
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
     let hints = Hints {
         reuse: &reuse,

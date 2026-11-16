@@ -10,6 +10,7 @@ use super::asm::{Alu, Mem, Reg, Rm, Shift, Size, Xmm};
 use super::float::{X2, scalar};
 use super::Emit;
 use crate::alloc::Location;
+use crate::fold::fits_imm32;
 use crate::frame::{Emitter, Ext};
 use crate::ir::{Op, Type, Value};
 use crate::live::{Sib, SibBase};
@@ -163,7 +164,7 @@ impl Emit<'_> {
         self.load_index(scratch, mode.index);
         if mode.shift > 0
             && !matches!(self.location(base), Location::Slot | Location::Frame(..))
-            && !matches!(self.location(base), Location::Imm(imm) if i32::try_from(imm).is_ok())
+            && !matches!(self.location(base), Location::Imm(imm) if fits_imm32(imm))
         {
             self.raw(temp, base);
             self.asm.lea(scratch, Mem::sib(temp, scratch, mode.shift, 0));
@@ -176,7 +177,7 @@ impl Emit<'_> {
         }
         match self.location(base) {
             Location::Slot => self.asm.alu(Alu::Add, scratch, self.at(base)),
-            Location::Imm(imm) if i32::try_from(imm).is_ok() => self.asm.alu_imm(Alu::Add, scratch, imm as i32),
+            Location::Imm(imm) if fits_imm32(imm) => self.asm.alu_imm(Alu::Add, scratch, imm as i32),
             Location::Frame(slot, off) => {
                 self.asm.alu(Alu::Add, scratch, self.base);
                 self.asm.alu_imm(Alu::Add, scratch, self.frame.slots[slot.index()] + off + self.bias);
@@ -529,7 +530,7 @@ impl Emit<'_> {
                 return self.store_xmm_home(to, X2, ty);
             }
             Location::Imm(0) => self.zero_to(to),
-            Location::Imm(imm) if i32::try_from(imm).is_ok() => self.asm.store_imm_sized(Size::Q, to, imm as i32),
+            Location::Imm(imm) if fits_imm32(imm) => self.asm.store_imm_sized(Size::Q, to, imm as i32),
             Location::SlotAddr(sym) if !self.direct_calls => {
                 let at = self.asm.store_slot_reloc(to);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));

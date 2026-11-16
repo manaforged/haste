@@ -11,6 +11,11 @@ pub(crate) fn extend(imm: i64, ty: Type, signed: bool) -> i64 {
     if signed { imm << shift >> shift } else { ((imm as u64) << shift >> shift) as i64 }
 }
 
+/// Whether `imm` fits a sign-extended 32-bit immediate.
+pub(crate) fn fits_imm32(imm: i64) -> bool {
+    i32::try_from(imm).is_ok()
+}
+
 /// Whether `cc` holds between the constants `x` and `y` of type `ty`.
 pub(crate) fn holds(cc: IntCC, ty: Type, x: i64, y: i64) -> bool {
     let (x, y) = (extend(x, ty, cc.is_signed()), extend(y, ty, cc.is_signed()));

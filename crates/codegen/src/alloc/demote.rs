@@ -1,43 +1,35 @@
-use crate::color::Webs;
-use crate::frame::terminator_edges;
+use crate::color::{Webs, shareable};
 use crate::ir::{Function, Op, Value};
 use crate::live::{Live, Sib, for_effective_operands};
 
 use super::Location;
+use super::walk::{edge_copies, weighted};
 
 /// Each copy a block edge makes, as its source block's weight, the parameter and the argument, and which blocks take parameters other than from block edges.
 fn copies(func: &Function, blocks: &[u64]) -> (Vec<(u64, usize, usize)>, Vec<bool>) {
-    let mut copies = Vec::new();
     let mut fixed = vec![false; func.blocks.len()];
     if let Some(entry) = func.entry {
         fixed[entry.index()] = true;
     }
-    for (at, data) in func.blocks.iter().enumerate() {
-        for inst in &data.insts {
-            let op = &func.insts[inst.index()].op;
-            if !matches!(op, Op::Jump(..) | Op::Brif(..)) {
-                op.targets().for_each(|target| fixed[target.index()] = true);
-            }
-            terminator_edges(op, |target, args| {
-                copies.extend(func.blocks[target.index()].params.iter().zip(args).map(|(param, arg)| (blocks[at], param.index(), arg.index())));
-            });
+    for inst in func.blocks.iter().flat_map(|data| &data.insts) {
+        let op = &func.insts[inst.index()].op;
+        if !matches!(op, Op::Jump(..) | Op::Brif(..)) {
+            op.targets().for_each(|target| fixed[target.index()] = true);
         }
     }
+    let mut copies = Vec::new();
+    edge_copies(func, Some(blocks), |_, weight, _, pairs| copies.extend(pairs.map(|(param, arg)| (weight, param.index(), arg.index()))));
     (copies, fixed)
 }
 
 /// The block-weighted count of reads of each value other than block edge copies.
 fn reads(func: &Function, blocks: &[u64], sib: &[Option<Sib>], elided: &[bool]) -> Vec<u64> {
     let mut reads = vec![0_u64; func.types.len()];
-    for (at, data) in func.blocks.iter().enumerate() {
-        let weight = blocks[at];
-        for inst in &data.insts {
-            let data = &func.insts[inst.index()];
-            match data.op {
-                Op::Jump(..) => {}
-                Op::Brif(condition, ..) => reads[condition.index()] += weight,
-                _ => for_effective_operands(data, sib, elided, |value| reads[value.index()] += weight),
-            }
+    for (weight, data) in weighted(func, blocks) {
+        match data.op {
+            Op::Jump(..) => {}
+            Op::Brif(condition, ..) => reads[condition.index()] += weight,
+            _ => for_effective_operands(data, sib, elided, |value| reads[value.index()] += weight),
         }
     }
     reads
@@ -53,7 +45,7 @@ pub(super) fn webs<R: Copy + PartialEq>(
     locations: &mut [Location<R>],
 ) -> Webs {
     let count = func.types.len();
-    let memory = |locations: &[Location<R>], value: usize| !deferred[value] && matches!(locations[value], Location::Slot) && live.bounds(value).is_some();
+    let memory = |locations: &[Location<R>], value: usize| shareable(live, locations, deferred, value);
     let joins = |locations: &[Location<R>], webs: &Webs, value: usize, partner: usize| {
         memory(locations, partner) && func.types[partner] == func.types[value] && webs.fits(live, value, partner)
     };

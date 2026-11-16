@@ -44,8 +44,13 @@ impl Webs {
     }
 }
 
+/// Whether `value` takes a frame home that a web may share: it lives in the frame, is not kept alone, and is live somewhere.
+pub(crate) fn shareable<R>(live: &Live, locations: &[Location<R>], alone: &[bool], value: usize) -> bool {
+    !alone[value] && matches!(locations[value], Location::Slot) && live.bounds(value).is_some()
+}
+
 pub(crate) fn share<R>(func: &Function, live: &Live, locations: &[Location<R>], alone: &[bool], webs: &Webs) -> Vec<Option<u32>> {
-    let memory = |value: usize| !alone[value] && matches!(locations[value], Location::Slot);
+    let memory = |value: usize| shareable(live, locations, alone, value);
     let span = |root: usize| {
         webs.members(root).iter().filter(|&&value| memory(value)).filter_map(|&value| live.bounds(value)).reduce(|(start, end), (s, e)| (start.min(s), end.max(e)))
     };
@@ -55,7 +60,7 @@ pub(crate) fn share<R>(func: &Function, live: &Live, locations: &[Location<R>], 
     let mut sizes: Vec<u32> = Vec::new();
     let mut holders: Vec<Vec<usize>> = Vec::new();
     for (start, _, root) in units {
-        let members: Vec<usize> = webs.members(root).iter().copied().filter(|&value| memory(value) && live.bounds(value).is_some()).collect();
+        let members: Vec<usize> = webs.members(root).iter().copied().filter(|&value| memory(value)).collect();
         let size = round(func.types[root].bytes(), WORD);
         let clear = |list: &[usize]| list.iter().all(|&other| members.iter().all(|&value| !overlaps(live.ranges_of(other), live.ranges_of(value))));
         let mut chosen = None;
