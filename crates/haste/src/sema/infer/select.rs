@@ -16,10 +16,13 @@ use super::scope::{Frame, named_args, type_params};
 /// An impl that a trait obligation picked, with its type arguments.
 pub type Picked = (ImplRef, Vec<Ty>);
 
-/// What trying one impl left: its variable bindings, and the projections and obligations it deferred.
+/// What trying one impl left: sparse variable updates, appended variables, diverging marks, and deferred work.
 #[derive(Clone)]
 pub(super) struct Vars {
-    bound: Vec<Option<Ty>>,
+    base_len: usize,
+    updates: Vec<(u32, Option<Ty>)>,
+    added: Vec<Option<Ty>>,
+    diverges: Vec<u32>,
     projections: Vec<super::project::Projection>,
     obligations: Vec<(ItemRef, Vec<Ty>)>,
 }
@@ -140,9 +143,10 @@ impl<'a> Infer<'_, 'a> {
             let obligations = self.obligations.split_off(mark.2.min(self.obligations.len()));
             match applies {
                 Ok(Some(impl_args)) => {
-                    let bound = self.vars.clone();
+                    let base_len = mark.0.0;
+                    let (updates, added, diverges) = self.capture_var_delta(mark.0);
                     self.rollback_vars(mark.0);
-                    found.push(((block, impl_args), Vars { bound, projections, obligations }));
+                    found.push(((block, impl_args), Vars { base_len, updates, added, diverges, projections, obligations }));
                 }
                 Ok(None) => self.rollback_vars(mark.0),
                 Err(err) => {
@@ -156,15 +160,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// Takes on the bindings and deferred work of the impl trial `vars`.
     pub(super) fn adopt(&mut self, vars: Vars) {
-        if self.trail_depth > 0 {
-            let shared = self.vars.len().min(vars.bound.len());
-            for i in 0..shared {
-                if self.vars[i] != vars.bound[i] {
-                    self.var_trail.push((i as u32, self.vars[i]));
-                }
-            }
-        }
-        self.vars = vars.bound;
+        self.apply_var_delta(vars.base_len, &vars.updates, &vars.added, &vars.diverges);
         self.projections.extend(vars.projections);
         self.obligations.extend(vars.obligations);
     }
@@ -197,15 +193,19 @@ impl<'a> Infer<'_, 'a> {
 
     /// Whether every impl in `found` sets the trait arguments `args` alike, so that specialization, not inference, picks among them.
     fn same_trait_args(&mut self, found: &[(Picked, Vars)], args: &[Ty]) -> bool {
-        let saved = self.vars.clone();
-        let mut each = found.iter().map(|(_, vars)| {
-            self.vars = vars.bound.clone();
-            args.iter().map(|&arg| self.substitute(arg)).collect::<Vec<Ty>>()
-        });
-        let first = each.next();
-        let same = each.all(|other| Some(&other) == first.as_ref());
-        self.vars = saved;
-        same
+        let mut first: Option<Vec<Ty>> = None;
+        for (_, vars) in found {
+            let mark = self.mark_vars();
+            self.apply_var_delta(vars.base_len, &vars.updates, &vars.added, &vars.diverges);
+            let sub: Vec<Ty> = args.iter().map(|&arg| self.substitute(arg)).collect();
+            self.rollback_vars(mark);
+            match &first {
+                None => first = Some(sub),
+                Some(prev) if *prev != sub => return false,
+                _ => {}
+            }
+        }
+        true
     }
 
     fn most_specialized(&mut self, found: Vec<(Picked, Vars)>) -> Result<Vec<(Picked, Vars)>> {
@@ -285,8 +285,10 @@ impl<'a> Infer<'_, 'a> {
         Ok(found)
     }
     fn blanket(&mut self, block: ImplRef) -> Result<bool> {
-        let (args, self_ty) = self.fresh_impl(block)?;
-        Ok(args.contains(&self_ty))
+        self.probe(|infer| {
+            let (args, self_ty) = infer.fresh_impl(block)?;
+            Ok(args.contains(&self_ty))
+        })
     }
 
     /// The crates whose impls of `of` may apply to `self_ty` at `args`: the trait's, each named type's, and the body's own while a type is still unknown, since an impl there may name the type it becomes.
