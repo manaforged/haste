@@ -265,8 +265,8 @@ fn shift_div_u_bounds(func: &Function, state: &RangeState, ty: Type, bin: Binary
             if h1 <= signed_max(ty) { shift_count(state, ty, b).map_or((0, h1), |k| (l1 >> k, h1 >> k)) } else { (0, w) }
         }
         Binary::Ishl => shift_count(state, ty, b)
-            .and_then(|k| h1.checked_shl(k).filter(|&m| m <= w).map(|m| (l1 << k, m)))
-            .map_or((0, w), |r| r),
+            .filter(|&k| h1 <= (w >> k))
+            .map_or((0, w), |k| (l1 << k, h1 << k)),
         Binary::Urem => (0, h1.min(pos_const(state, b).map_or(w, |d| d - 1))),
         Binary::Udiv => pos_const(state, b).map_or((0, h1), |d| (l1 / d, h1 / d)),
         Binary::Srem if h1 <= signed_max(ty) => {

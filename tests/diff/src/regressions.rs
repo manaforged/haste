@@ -648,6 +648,63 @@ pub fn case_reg_try_diverging_err(seed: i64) -> i64 {
     acc
 }
 
+#[inline(never)]
+fn ishl_range_overflow(c: bool, y: u64) -> i64 {
+    let x = if c { 1_u64 << 63 } else { y & 0x7FFF_FFFF };
+    ((x << 1) as i32) as i64
+}
+
+pub fn case_reg_ishl_range_overflow(seed: i64) -> i64 {
+    let base = 0x7FFF_FFFF_u64.wrapping_sub((seed.unsigned_abs() % 3) as u64);
+    ishl_range_overflow(false, black_box(base)) * 10 + ishl_range_overflow(true, black_box(base))
+}
+
+static NOALIAS_STASH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline(never)]
+fn stash_noalias_mut(p: &mut i32) {
+    NOALIAS_STASH.store(core::ptr::from_mut(p) as usize, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[inline(never)]
+fn bump_noalias_stashed() {
+    let raw = NOALIAS_STASH.load(core::sync::atomic::Ordering::SeqCst) as *mut i32;
+    if !raw.is_null() {
+        // SAFETY: `raw` points to the caller's live `val` stack slot for the duration of `case_reg_noalias_call_stash`.
+        unsafe { *raw += 1; }
+    }
+}
+
+#[inline(never)]
+fn noalias_stash_straight(p: &mut i32) -> i32 {
+    stash_noalias_mut(p);
+    let a = *p;
+    bump_noalias_stashed();
+    let b = *p;
+    b - a
+}
+
+#[inline(never)]
+fn noalias_stash_loop(p: &mut i32, n: usize) -> i32 {
+    let mut s = 0_i32;
+    for _ in 0..n {
+        stash_noalias_mut(p);
+        let a = *p;
+        bump_noalias_stashed();
+        let b = *p;
+        s += b - a;
+    }
+    s
+}
+
+pub fn case_reg_noalias_call_stash(seed: i64) -> i64 {
+    let mut val = (seed as i32).wrapping_mul(3);
+    let d1 = noalias_stash_straight(&mut val);
+    let d2 = noalias_stash_loop(&mut val, 3);
+    NOALIAS_STASH.store(0, core::sync::atomic::Ordering::SeqCst);
+    i64::from(d1 * 100 + d2 * 10 + val)
+}
+
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_byval_pair", case_reg_byval_pair),
     ("case_reg_byval_string", case_reg_byval_string),
@@ -672,4 +729,6 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_arm64_signed_load_icmp", case_reg_arm64_signed_load_icmp),
     ("case_reg_autoderef_borrow_var", case_reg_autoderef_borrow_var),
     ("case_reg_try_diverging_err", case_reg_try_diverging_err),
+    ("case_reg_ishl_range_overflow", case_reg_ishl_range_overflow),
+    ("case_reg_noalias_call_stash", case_reg_noalias_call_stash),
 ];
