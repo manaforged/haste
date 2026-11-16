@@ -221,6 +221,10 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.asm.bind(self.blocks[block.index()]);
     }
 
+    fn bind_entry(&mut self, block: Block) {
+        self.asm.bind(self.blocks[block.index()]);
+    }
+
     fn deferred_prologue(&self) -> bool {
         self.shrink.is_some()
     }
@@ -568,7 +572,10 @@ impl Emit<'_> {
         }
         for step in reg_steps(float_pairs) {
             match step {
-                ArgStep::Move(src, dst) => self.asm.vmov(Vreg(dst), Vreg(src)),
+                ArgStep::Move(src, dst) => {
+                    self.asm.vmov(Vreg(dst), Vreg(src));
+                    self.clobber_vreg(Vreg(dst));
+                }
                 ArgStep::Save(src) => {
                     self.asm.add_imm(true, false, Size::X, SP, SP, 16);
                     self.sp_bias += 16;
@@ -578,15 +585,25 @@ impl Emit<'_> {
                     self.asm.vload(16, Vreg(dst), Mem::new(SP, 0));
                     self.asm.add_imm(false, false, Size::X, SP, SP, 16);
                     self.sp_bias -= 16;
+                    self.clobber_vreg(Vreg(dst));
                 }
                 ArgStep::Load(..) => {}
             }
         }
         for step in reg_steps(int_pairs) {
             match step {
-                ArgStep::Move(src, dst) => self.asm.mov(dst, src),
-                ArgStep::Save(src) => self.asm.mov(A, src),
-                ArgStep::Restore(dst) => self.asm.mov(dst, A),
+                ArgStep::Move(src, dst) => {
+                    self.asm.mov(dst, src);
+                    self.clobber_reg(dst);
+                }
+                ArgStep::Save(src) => {
+                    self.asm.mov(A, src);
+                    self.clobber_reg(A);
+                }
+                ArgStep::Restore(dst) => {
+                    self.asm.mov(dst, A);
+                    self.clobber_reg(dst);
+                }
                 ArgStep::Load(..) => {}
             }
         }
@@ -686,8 +703,8 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
         self.arguments(sig, callee, args)
     }
     fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
-        self.store_locs(values, locs);
         self.invalidate_spills();
+        self.store_locs(values, locs);
     }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
     fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, Mem::new(FP, INCOMING + offset as i32)); }

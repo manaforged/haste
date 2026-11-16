@@ -541,6 +541,10 @@ pub(crate) trait Emitter<'a>: Sized {
     fn pos(&self) -> u32;
     fn finish(self) -> Result<crate::Code, String>;
 
+    fn bind_entry(&mut self, block: Block) {
+        self.bind_block(block);
+    }
+
     fn deferred_prologue(&self) -> bool {
         false
     }
@@ -575,6 +579,10 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: Block) -> Resul
     Ok(())
 }
 
+fn entry_has_preds(func: &Function, order: &[Block], entry: Block) -> bool {
+    order.iter().any(|&b| func.successors(b).any(|s| func.jump_target(s) == entry))
+}
+
 pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<crate::Code, String> {
     let func = emit.func();
     let entry = func.entry.ok_or("the function has no entry block")?;
@@ -583,12 +591,17 @@ pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<
         emit.prologue();
     }
     emit.intake(entry)?;
+    let fallthrough_entry = !entry_has_preds(func, order, entry);
     for (index, &block) in order.iter().enumerate() {
         let next_blk = order.get(index + 1).copied().filter(|&nb| !emit.blocks_fallthrough_to(nb));
         emit.set_next(next_blk);
         emit.before_block_bind(block)?;
         starts.push(emit.pos());
-        emit.bind_block(block);
+        if index == 0 && block == entry && fallthrough_entry {
+            emit.bind_entry(block);
+        } else {
+            emit.bind_block(block);
+        }
         emit.on_block_bound(block)?;
         emit_body(&mut emit, block)?;
     }
