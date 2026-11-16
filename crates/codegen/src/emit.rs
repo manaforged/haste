@@ -250,7 +250,7 @@ pub(crate) fn emit_call<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     args: &[Value],
     results: &[Value],
 ) -> Result<(), String> {
-    let parked = emit.plan().parked_at(inst).to_vec();
+    let parked: Vec<_> = emit.plan().parked_at(inst).iter().filter(|(value, _, _)| !emit.plan().elided[value.index()]).copied().collect();
     for &(value, reg, _) in &parked {
         emit.park_spill(value, reg);
         emit.plan_mut().locations[value.index()] = Location::Slot;

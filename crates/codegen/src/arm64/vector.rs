@@ -358,6 +358,11 @@ impl Emit<'_> {
         let spec = VecSpec::of(self.ty(x))?;
         let dst = self.fdst(result);
         let a = self.fin(x, V0);
+        if matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr) && let Some(imm) = self.splat_const_lane(y) {
+            self.vec_shift_imm(spec, op, imm, dst, a);
+            self.fput(result, dst);
+            return Ok(());
+        }
         let b = self.fin(y, V1);
         match op {
             Binary::Band | Binary::Bor | Binary::Bxor => {
@@ -424,11 +429,7 @@ impl Emit<'_> {
                 }
             }
             Binary::Ishl | Binary::Ushr | Binary::Sshr => {
-                if self.is_vec_zero(y) {
-                    self.asm.vmov(dst, a);
-                } else if let Some(imm) = self.splat_const_lane(y) {
-                    self.vec_shift_imm(spec, op, imm, dst, a);
-                } else if op == Binary::Ishl {
+                if op == Binary::Ishl {
                     let base = if spec.is_1d() { NEON_USHL_1D } else { NEON_USHL | (spec.q << 30) | (spec.size << 22) };
                     self.asm.vbit(base, dst, a, b);
                 } else {

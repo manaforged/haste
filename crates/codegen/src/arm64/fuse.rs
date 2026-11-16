@@ -5,6 +5,7 @@ mod flag;
 mod mem;
 mod shift;
 mod sign;
+mod vconst;
 
 use super::asm::{Alu, ExtOp, Reg, Shift};
 use crate::alloc::{Location, Plan};
@@ -757,6 +758,7 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>) {
             }
         }
     }
+    vconst::elide_vec_consts(func, plan, &pos_of);
     fuse_icmp_selects(func, plan, (&uses, &pos_of));
     fuse_icmp_flags(func, plan, &uses);
     bits::fuse_tst(func, plan, (&uses, &pos_of));
