@@ -16,7 +16,8 @@ use super::{Infer, Res};
 /// The interned segments of `path` in `arena`, whether it starts with `::`, and the crate a leading `$crate` names.
 pub fn segments(symbols: &Symbols, src: &Source, arena: &Body, path: PathId) -> (Vec<Sym>, bool, Option<u32>) {
     let path = arena.path(path);
-    let segments: Vec<Sym> = arena.list(path.segments).iter().map(|&at| symbols.intern(plain(src.text(arena.segments[at as usize].name)))).collect();
+    let syms = arena.syms(symbols, src);
+    let segments: Vec<Sym> = arena.list(path.segments).iter().map(|&at| syms[at as usize]).collect();
     let first = arena.list(path.segments).first().map(|&at| arena.segments[at as usize].name).unwrap_or(0);
     let dollar = first.checked_sub(1).and_then(|at| src.dollar(at));
     (segments, path.global, dollar)

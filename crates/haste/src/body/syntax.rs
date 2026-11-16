@@ -276,4 +276,6 @@ pub struct Body {
     pub root: Option<ExprId>,
     /// The function's parameter patterns, parsed into this arena when one of them is more than a name.
     pub fn_params: Vec<PatId>,
+    /// The interned name of each segment, filled on the first call to `Body::syms`.
+    pub(super) syms: std::sync::OnceLock<Box<[crate::names::Sym]>>,
 }
