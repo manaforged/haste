@@ -30,7 +30,7 @@ pub(crate) fn lower(func: &mut Function) {
                 at += 1;
             }
             if let Some(helper) = helper(func, &consts, &func.insts[inst.index()]) {
-                let sig = signature(func, &helper);
+                let sig = signature(func, &helper.args, helper.result);
                 let callee = func.value(Type::I64);
                 let runtime = func.add(Op::Runtime(helper.symbol), Some(callee));
                 func.blocks[block].insts.insert(at, runtime);
@@ -56,10 +56,11 @@ fn helper(func: &Function, consts: &[Option<i64>], data: &InstData) -> Option<He
     Some(Helper { symbol, args, result: data.result })
 }
 
-fn signature(func: &mut Function, helper: &Helper) -> SigRef {
+/// Adds the platform C signature that takes `args` and returns `result` to `func`.
+pub(crate) fn signature(func: &mut Function, args: &[Value], result: Option<Value>) -> SigRef {
     let mut signature = Signature::new(CallConv::Native);
-    signature.params = helper.args.iter().map(|arg| AbiParam::new(func.ty(*arg))).collect();
-    signature.returns = helper.result.iter().map(|result| AbiParam::new(func.ty(*result))).collect();
+    signature.params = args.iter().map(|arg| AbiParam::new(func.ty(*arg))).collect();
+    signature.returns = result.iter().map(|result| AbiParam::new(func.ty(*result))).collect();
     func.sigs.push(signature);
     SigRef(func.sigs.len() as u32 - 1)
 }

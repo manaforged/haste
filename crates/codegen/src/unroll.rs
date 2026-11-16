@@ -1,8 +1,11 @@
+mod count;
+mod memset;
 mod region;
 
 use crate::cfg::{Cfg, Loop};
 use crate::fold::{evaluate_wrapped, extend};
 use crate::ir::{Binary, Block, BlockData, Domain, Function, Inst, IntCC, Op, Type, Value};
+use count::{Counted, counted, head_defs, outside_preds, stride_const};
 
 const MAX_FULL_TRIPS: usize = 64;
 const MAX_FULL_INSTS: usize = 1024;
@@ -197,19 +200,6 @@ fn unroll_self(
     true
 }
 
-fn match_iv_step(func: &Function, b: usize, body_insts: &[Inst], back_args: &[Value], iv_next: Value) -> Option<(usize, Value)> {
-    let iv_inst = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(iv_next))?;
-    let Op::Binary(Binary::Iadd, p, q) = func.insts[iv_inst.index()].op else { return None };
-    for (cand_iv, cand_stride) in [(p, q), (q, p)] {
-        if let Some(idx) = func.blocks[b].params.iter().position(|&param| param == cand_iv)
-            && back_args[idx] == iv_next
-        {
-            return Some((idx, cand_stride));
-        }
-    }
-    None
-}
-
 fn unroll_self_dynamic(
     func: &mut Function,
     cfg: &Cfg,
@@ -233,18 +223,8 @@ fn unroll_self_dynamic(
     if body_insts.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Trap | Op::Trapz(..) | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence)) {
         return false;
     }
-    let mut head_defs = vec![false; func.types.len()];
-    for &p in &func.blocks[b].params {
-        head_defs[p.index()] = true;
-    }
-    for &i in &body_insts {
-        if let Some(r) = func.insts[i.index()].result {
-            head_defs[r.index()] = true;
-        }
-    }
-    let outside: Vec<usize> = (0..func.blocks.len())
-        .filter(|&p| p != b && func.successors(Block(p as u32)).any(|t| t == head))
-        .collect();
+    let head_defs = head_defs(func, b, &body_insts);
+    let outside = outside_preds(func, b);
     if outside.len() != 1 {
         return false;
     }
@@ -264,44 +244,12 @@ fn unroll_self_dynamic(
             return false;
         }
     }
-    let cond_inst = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(cond));
-    let Some(cond_inst) = cond_inst else { return false };
-    let Op::Icmp(cc, lhs, rhs) = func.insts[cond_inst.index()].op else { return false };
-    let eff_cc = if back_on_true { cc } else { cc.inverse() };
-    let (cmp_cc, is_ne, iv_cmp, limit) = match eff_cc {
-        IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => (eff_cc, false, lhs, rhs),
-        IntCC::UnsignedGreaterThan => (IntCC::UnsignedLessThan, false, rhs, lhs),
-        IntCC::UnsignedGreaterThanOrEqual => (IntCC::UnsignedLessThanOrEqual, false, rhs, lhs),
-        IntCC::NotEqual if !head_defs[rhs.index()] => (IntCC::UnsignedLessThan, true, lhs, rhs),
-        IntCC::NotEqual if !head_defs[lhs.index()] => (IntCC::UnsignedLessThan, true, rhs, lhs),
-        _ => return false,
-    };
-    let iv_ty = func.ty(iv_cmp);
-    if !matches!(iv_ty, Type::I32 | Type::I64) || head_defs[limit.index()] {
+    let Some(Counted { cmp_cc, is_ne, iv_ty, limit, iv_idx, stride, bias }) =
+        counted(func, b, &body_insts, (cond, back_on_true), back_args, &head_defs, global_consts)
+    else {
         return false;
-    }
-    let bias_cap = if iv_ty == Type::I32 { 1_i64 << 28 } else { 1_i64 << 30 };
-    let stride_const = |s: Value| global_consts[s.index()].filter(|&c| c > 0 && c <= (1_i64 << 24) && (!is_ne || c == 1));
-    let mut matched = match_iv_step(func, b, &body_insts, back_args, iv_cmp)
-        .filter(|&(_, stride)| !head_defs[stride.index()] || stride_const(stride).is_some())
-        .map(|(idx, stride)| (idx, stride, 0_i64));
-    if matched.is_none()
-        && let Some(cmp_add) = body_insts.iter().copied().find(|&i| func.insts[i.index()].result == Some(iv_cmp))
-        && let Op::Binary(Binary::Iadd, p, q) = func.insts[cmp_add.index()].op
-    {
-        for (cand_next, cand_bias) in [(p, q), (q, p)] {
-            if let Some(bias) = global_consts[cand_bias.index()]
-                && (0..bias_cap).contains(&bias)
-                && let Some((idx, stride)) = match_iv_step(func, b, &body_insts, back_args, cand_next)
-                && (!head_defs[stride.index()] || stride_const(stride).is_some())
-            {
-                matched = Some((idx, stride, bias));
-                break;
-            }
-        }
-    }
-    let Some((iv_idx, stride, bias)) = matched else { return false };
-    let const_stride = stride_const(stride);
+    };
+    let const_stride = stride_const(global_consts, stride, is_ne);
     let factor = if inst_count <= 16 { 4_i64 } else { 2_i64 };
     let param_tys: Vec<Type> = func.blocks[b].params.iter().map(|&p| func.ty(p)).collect();
     let guard_params: Vec<Value> = param_tys.iter().map(|&ty| func.value(ty)).collect();
@@ -737,9 +685,11 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             {
                 let (cond, t_blk, t_args, f_blk, f_args) = (*cond, *t_blk, t_args.clone(), *f_blk, f_args.clone());
                 if t_blk == head {
-                    unroll_self(func, &cfg, b, cond, true, t_args, f_blk, f_args, &global_consts)
+                    memset::run(func, b, (cond, true), &t_args, (f_blk, &f_args), &global_consts)
+                        || unroll_self(func, &cfg, b, cond, true, t_args, f_blk, f_args, &global_consts)
                 } else if f_blk == head {
-                    unroll_self(func, &cfg, b, cond, false, f_args, t_blk, t_args, &global_consts)
+                    memset::run(func, b, (cond, false), &f_args, (t_blk, &t_args), &global_consts)
+                        || unroll_self(func, &cfg, b, cond, false, f_args, t_blk, t_args, &global_consts)
                 } else {
                     false
                 }
