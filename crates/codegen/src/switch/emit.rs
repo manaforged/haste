@@ -4,7 +4,9 @@ use crate::ir::{Binary, Block, BlockData, Convert, Function, Inst, IntCC, Op, Ty
 use super::bitmask::try_emit_bitmask_runs;
 use super::{Arm, Edge, Info, Run};
 
-pub(super) fn forward_cached(func: &mut Function, cache: &mut Vec<((Block, Vec<Value>), Block)>, target: Block, args: Vec<Value>) -> Block {
+pub(super) type Cache = Vec<((Block, Vec<Value>), Block)>;
+
+pub(super) fn forward_cached(func: &mut Function, cache: &mut Cache, target: Block, args: Vec<Value>) -> Block {
     let target = if args.is_empty() { func.jump_target(target) } else { target };
     if args.is_empty() && func.blocks[target.index()].params.is_empty() {
         return target;
@@ -89,7 +91,7 @@ pub(super) fn try_signed_br_table(
     at: (usize, Inst),
     (v, ty): (Value, Type),
     arms: &[Arm],
-    (default_blk, cache): (Block, &mut Vec<((Block, Vec<Value>), Block)>),
+    (default_blk, cache): (Block, &mut Cache),
 ) -> bool {
     let Some((s_min, s_len)) = signed_table_bounds(arms) else { return false };
     let (mut table, mut filled, mut covered) = (vec![default_blk; s_len], vec![false; s_len], 0_u64);
@@ -152,12 +154,15 @@ pub(super) fn emit_sub_range(func: &mut Function, at: Option<(usize, Inst)>, (v,
     push_node(func, at, insts)
 }
 
-fn emit_run_check(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Value, Type), run: &Run, otherwise: Block) -> Block {
-    let u_max = ty.unsigned_max();
-    if run.lo == 0 && run.hi == u_max {
+fn emit_run_check(func: &mut Function, at: Option<(usize, Inst)>, (v, ty, (lo, hi)): (Value, Type, (u64, u64)), run: &Run, (otherwise, cache): (Block, &mut Cache)) -> Block {
+    if run.lo <= lo && run.hi >= hi {
+        if at.is_none() {
+            return forward_cached(func, cache, run.hit.block, run.hit.args.clone());
+        }
         let jump = func.add(Op::Jump(run.hit.block, run.hit.args.clone()), None);
         return push_node(func, at, vec![jump]);
     }
+    let u_max = ty.unsigned_max();
     if run.lo > 0 && run.hi < u_max && run.lo != run.hi {
         return emit_sub_range(func, at, (v, ty), (run.lo as i64, run.hi - run.lo), (&run.hit, otherwise));
     }
@@ -175,7 +180,11 @@ fn emit_run_check(func: &mut Function, at: Option<(usize, Inst)>, (v, ty): (Valu
     push_node(func, at, insts)
 }
 
-pub(super) fn emit_node(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, ty): (Value, Type), runs: &[Run], (default_blk, cache): (Block, &mut Vec<((Block, Vec<Value>), Block)>)) -> Block {
+pub(super) fn emit_node(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, ty): (Value, Type), runs: &[Run], (default_blk, cache): (Block, &mut Cache)) -> Block {
+    emit_within(func, info, at, (v, ty, (0, ty.unsigned_max())), runs, (default_blk, cache))
+}
+
+fn emit_within(func: &mut Function, info: &Info, at: Option<(usize, Inst)>, (v, ty, (lo, hi)): (Value, Type, (u64, u64)), runs: &[Run], (default_blk, cache): (Block, &mut Cache)) -> Block {
     if let Some(blk) = try_emit_bitmask_runs(func, info, at, (v, ty), runs, (default_blk, cache)) {
         return blk;
     }
@@ -188,19 +197,21 @@ pub(super) fn emit_node(func: &mut Function, info: &Info, at: Option<(usize, Ins
         return finish_br_table(func, at, (v, ty), (min as i64, false), (default_blk, table));
     }
     if runs.len() <= 2 {
-        let otherwise = if runs.len() == 2 { emit_node(func, info, None, (v, ty), &runs[1..], (default_blk, cache)) } else { default_blk };
-        return emit_run_check(func, at, (v, ty), &runs[0], otherwise);
+        let rest = if runs[0].lo <= lo { runs[0].hi.saturating_add(1) } else { lo };
+        let otherwise = if runs.len() == 2 { emit_within(func, info, None, (v, ty, (rest, hi)), &runs[1..], (default_blk, cache)) } else { default_blk };
+        return emit_run_check(func, at, (v, ty, (lo, hi)), &runs[0], (otherwise, cache));
     }
     let mid = match find_cluster(runs) {
         Some((start, _)) if start > 0 => start,
         Some((_, end)) => end,
         None => runs.len() / 2,
     };
-    let left = emit_node(func, info, None, (v, ty), &runs[..mid], (default_blk, cache));
-    let right = emit_node(func, info, None, (v, ty), &runs[mid..], (default_blk, cache));
+    let split = runs[mid].lo;
+    let left = emit_within(func, info, None, (v, ty, (lo, split - 1)), &runs[..mid], (default_blk, cache));
+    let right = emit_within(func, info, None, (v, ty, (split, hi)), &runs[mid..], (default_blk, cache));
     let (pivot, lt) = (func.value(ty), func.value(Type::I8));
     let insts = vec![
-        func.add(Op::Const(extend(runs[mid].lo as i64, ty, true)), Some(pivot)),
+        func.add(Op::Const(extend(split as i64, ty, true)), Some(pivot)),
         func.add(Op::Icmp(IntCC::UnsignedLessThan, v, pivot), Some(lt)),
         func.add(Op::Brif(lt, left, Vec::new(), right, Vec::new()), None),
     ];

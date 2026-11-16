@@ -1,6 +1,6 @@
 use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Value};
 
-use super::emit::{can_br_table, emit_node, push_node};
+use super::emit::{Cache, can_br_table, emit_node, push_node};
 use super::{Arm, Edge, Info, Range, Run, intersect_ranges, match_test, range_fits, range_of_test, same_edge};
 
 #[derive(Clone, Copy)]
@@ -304,7 +304,7 @@ pub(super) fn try_emit_bitmask_runs(
     at: Option<(usize, Inst)>,
     (v, ty): (Value, Type),
     runs: &[Run],
-    (default_blk, cache): (Block, &mut Vec<((Block, Vec<Value>), Block)>),
+    (default_blk, cache): (Block, &mut Cache),
 ) -> Option<Block> {
     let (plan, hit, rest) = find_bitmask_target(func, info, ty, runs)?;
     let otherwise = if rest.is_empty() {
