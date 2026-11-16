@@ -1,5 +1,5 @@
 use crate::cse::flip_int_cc;
-use crate::fold::{extend, non_null_at};
+use crate::fold::{extend, known_bits, non_null_at};
 use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 
 use super::icmp::{ADDR_SPAN, before, emit_cond_truth, null_test, offset_bound, three_way_non_zero};
@@ -25,19 +25,73 @@ pub(super) fn simplify_select(cx: &mut RewriteCx, res: Option<Value>, cond: Valu
         cx.alias(res, t);
         return None;
     }
-    if res.is_some_and(|r| cx.func.ty(r) == Type::I8) && cx.func.ty(inner) == Type::I8 && cx.is_unit_bool(inner) {
-        match (cx.uconst(t, Type::I8), cx.uconst(f, Type::I8)) {
-            (Some(1), Some(0)) => {
-                cx.alias(res, inner);
-                return None;
-            }
-            (Some(1), _) if cx.is_unit_bool(f) => return Some(Op::Binary(Binary::Bor, inner, f)),
-            (_, Some(0)) if cx.is_unit_bool(t) => return Some(Op::Binary(Binary::Band, inner, t)),
-            (Some(0), Some(1)) => return Some(Op::Binary(Binary::Bxor, inner, f)),
-            _ => {}
-        }
+    if let Some(op) = simplify_unit_bool_select(cx, res, inner, t, f) {
+        return op;
     }
-    (inner != cond || (t, f) != given).then_some(Op::Select(inner, t, f))
+    fold_ord_select_cmp(cx, inner, t, f).or_else(|| (inner != cond || (t, f) != given).then_some(Op::Select(inner, t, f)))
+}
+
+fn simplify_unit_bool_select(cx: &mut RewriteCx, res: Option<Value>, inner: Value, t: Value, f: Value) -> Option<Option<Op>> {
+    if !res.is_some_and(|r| cx.func.ty(r) == Type::I8) || cx.func.ty(inner) != Type::I8 || !cx.is_unit_bool(inner) {
+        return None;
+    }
+    match (cx.uconst(t, Type::I8), cx.uconst(f, Type::I8)) {
+        (Some(1), Some(0)) => { cx.alias(res, inner); Some(None) }
+        (Some(1), _) if cx.is_unit_bool(f) => Some(Some(Op::Binary(Binary::Bor, inner, f))),
+        (_, Some(0)) if cx.is_unit_bool(t) => Some(Some(Op::Binary(Binary::Band, inner, t))),
+        (Some(0), Some(1)) => Some(Some(Op::Binary(Binary::Bxor, inner, f))),
+        _ => None,
+    }
+}
+
+fn peel_uext_icmp(cx: &RewriteCx, ty: Type, v: Value) -> Option<(IntCC, Value, Value)> {
+    let target = if ty == Type::I8 { v } else if let Some(&Op::Convert(Convert::Uextend, i)) = cx.op(v) { i } else { return None };
+    if cx.func.ty(target) != Type::I8 { return None; }
+    let &Op::Icmp(cc, a, b) = cx.op(target)? else { return None };
+    cx.func.ty(a).is_small_int().then_some((cc, a, b))
+}
+
+fn peel_base_icmp(cx: &RewriteCx, ty: Type, v: Value) -> Option<(Option<Value>, IntCC, Value, Value)> {
+    if let Some((cc, a, b)) = peel_uext_icmp(cx, ty, v) { return Some((None, cc, a, b)); }
+    let &Op::Binary(Binary::Iadd, lhs, rhs) = cx.op(v)? else { return None };
+    [(lhs, rhs), (rhs, lhs)].into_iter().find_map(|(base, cv)| peel_uext_icmp(cx, ty, cv).map(|(cc, a, b)| (Some(base), cc, a, b)))
+}
+
+fn peel_base_add_01(cx: &RewriteCx, ty: Type, base_opt: Option<Value>, v: Value) -> Option<u64> {
+    let Some(base) = base_opt else { return cx.uconst(v, ty).filter(|&k| k <= 1) };
+    if v == base { return Some(0); }
+    let &Op::Binary(Binary::Iadd, p, q) = cx.op(v)? else { return None };
+    [(p, q), (q, p)].into_iter().find_map(|(b, k)| (b == base).then(|| cx.uconst(k, ty).filter(|&u| u <= 1)).flatten())
+}
+
+fn collapse_ord_cc(cc: IntCC, eq_add: u64) -> Option<IntCC> {
+    match (cc, eq_add) {
+        (IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual, 1) => Some(IntCC::SignedLessThanOrEqual),
+        (IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual, 1) => Some(IntCC::UnsignedLessThanOrEqual),
+        (IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual, 1) => Some(IntCC::SignedGreaterThanOrEqual),
+        (IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual, 1) => Some(IntCC::UnsignedGreaterThanOrEqual),
+        (IntCC::SignedLessThan | IntCC::SignedLessThanOrEqual, 0) => Some(IntCC::SignedLessThan),
+        (IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual, 0) => Some(IntCC::UnsignedLessThan),
+        (IntCC::SignedGreaterThan | IntCC::SignedGreaterThanOrEqual, 0) => Some(IntCC::SignedGreaterThan),
+        (IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual, 0) => Some(IntCC::UnsignedGreaterThan),
+        _ => None,
+    }
+}
+
+fn fold_ord_select_cmp(cx: &mut RewriteCx, cond: Value, t: Value, f: Value) -> Option<Op> {
+    let ty = cx.func.ty(t);
+    let &Op::Icmp(cond_cc @ (IntCC::Equal | IntCC::NotEqual), x, y) = cx.op(cond)? else { return None };
+    if !ty.is_small_int() || !cx.func.ty(x).is_small_int() { return None; }
+    let (eq_arm, ne_arm) = if cond_cc == IntCC::Equal { (t, f) } else { (f, t) };
+    let (base_opt, cmp_cc, cx0, cy0) = peel_base_icmp(cx, ty, ne_arm)?;
+    if !((cx0 == x && cy0 == y) || (cx0 == y && cy0 == x)) { return None; }
+    let new_cc = collapse_ord_cc(cmp_cc, peel_base_add_01(cx, ty, base_opt, eq_arm)?)?;
+    let cmp_op = Op::Icmp(new_cc, cx0, cy0);
+    if base_opt.is_none() && ty == Type::I8 { return Some(cmp_op); }
+    let cmp_val = cx.emit(Type::I8, cmp_op);
+    let Some(base) = base_opt else { return Some(Op::Convert(Convert::Uextend, cmp_val)) };
+    let uext = if ty == Type::I8 { cmp_val } else { cx.emit(ty, Op::Convert(Convert::Uextend, cmp_val)) };
+    Some(Op::Binary(Binary::Iadd, base, uext))
 }
 
 fn opposite(cx: &RewriteCx, a: Value, b: Value) -> bool {
@@ -561,15 +615,106 @@ fn fold_bxor_brif(func: &mut Function, facts: &BoolFacts, out: &mut Vec<Inst>, i
     false
 }
 
-/// Folds `x ^ 1` / `x ^ y` in `select` and `brif` conditions and sinks single-use compares toward their branch.
+fn tag_cond_info(facts: &BoolFacts, func: &Function, param_of: &[Option<(usize, usize)>], b_idx: usize, cond: Value) -> Option<(usize, Value, u64, bool)> {
+    let inner = facts.unwrap_uext(cond);
+    if let Some((cc @ (IntCC::Equal | IntCC::NotEqual), x, y)) = facts.compares[inner.index()] {
+        return [(x, y), (y, x)].into_iter().find_map(|(p, c)| {
+            let (pb, ti) = param_of.get(p.index()).copied().flatten()?;
+            let imm = facts.consts[c.index()]?;
+            (pb == b_idx && func.ty(p).is_small_int()).then(|| (ti, p, extend(imm, func.ty(p), false) as u64, cc == IntCC::Equal))
+        });
+    }
+    let (pb, ti) = param_of.get(inner.index()).copied().flatten()?;
+    (pb == b_idx && func.ty(inner).is_small_int()).then_some((ti, inner, 0, false))
+}
+
+fn push_edge(edges: &mut Vec<(Value, Value)>, args: &[Value], (tag_idx, val_idx): (usize, usize)) -> bool {
+    let (Some(&ta), Some(&va)) = (args.get(tag_idx), args.get(val_idx)) else { return false };
+    edges.push((ta, va));
+    true
+}
+
+fn push_edge_pair(edges: &mut Vec<(Value, Value)>, b_idx: usize, op: &Op, idx: (usize, usize)) -> bool {
+    match op {
+        Op::Jump(t, args) if t.index() == b_idx => push_edge(edges, args, idx),
+        Op::Brif(_, tb, ta, eb, ea) => (tb.index() != b_idx || push_edge(edges, ta, idx)) && (eb.index() != b_idx || push_edge(edges, ea, idx)),
+        Op::TryCall { normal, handler, .. } => normal.index() != b_idx && handler.index() != b_idx,
+        Op::BrTable(_, d, ts) => d.index() != b_idx && ts.iter().all(|t| t.index() != b_idx),
+        _ => true,
+    }
+}
+
+fn incoming_pair_edges(func: &Function, b_idx: usize, self_last: Option<Inst>, tag_idx: usize, val_idx: usize) -> Option<Vec<(Value, Value)>> {
+    let mut edges = Vec::new();
+    for (pb, block) in func.blocks.iter().enumerate() {
+        let Some(last) = (if pb == b_idx { self_last } else { block.insts.last().copied() }) else { continue };
+        if !push_edge_pair(&mut edges, b_idx, &func.insts[last.index()].op, (tag_idx, val_idx)) { return None; }
+    }
+    (edges.len() >= 2).then_some(edges)
+}
+
+fn edge_matches_correlated(func: &Function, facts: &BoolFacts, defs: &[Option<Inst>], (tag_ty, val_ty, match_u, k_u, val_takes_eq): (Type, Type, u64, u64, bool), (tag_arg, val_arg): (Value, Value)) -> bool {
+    let tag_const = facts.consts[tag_arg.index()].map(|c| extend(c, tag_ty, false) as u64);
+    let proven_val_arm = if val_takes_eq {
+        tag_const == Some(match_u)
+    } else if tag_const.is_some_and(|u| u != match_u) {
+        true
+    } else {
+        let (kz, ko) = known_bits(func, &|v| defs.get(v.index()).copied().flatten(), &|v| facts.consts.get(v.index()).copied().flatten(), tag_arg, 0);
+        let mask = tag_ty.unsigned_max() as u64;
+        ((ko & mask) & !match_u) != 0 || ((kz & mask) & match_u) != 0
+    };
+    proven_val_arm || (tag_const.is_some_and(|u| (u == match_u) == !val_takes_eq) && facts.consts[val_arg.index()].is_some_and(|vc| extend(vc, val_ty, false) as u64 == k_u))
+}
+
+fn correlated_select_target(func: &Function, facts: &BoolFacts, param_of: &[Option<(usize, usize)>], defs: &mut Option<Vec<Option<Inst>>>, (b_idx, self_last, cond, t, f): (usize, Option<Inst>, Value, Value, Value)) -> Option<Value> {
+    if Some(b_idx) == func.entry.map(|e| e.index()) { return None; }
+    let (tag_idx, tag_phi, match_u, eq_means_true) = tag_cond_info(facts, func, param_of, b_idx, cond)?;
+    let (val_phi, val_idx, k_val, val_on_true) = [(t, f, true), (f, t, false)].into_iter().find_map(|(v, k, on_t)| {
+        let (pb, vi) = param_of.get(v.index()).copied().flatten()?;
+        facts.consts[k.index()]?;
+        (pb == b_idx && vi != tag_idx).then_some((v, vi, k, on_t))
+    })?;
+    let val_ty = func.ty(val_phi);
+    if !val_ty.is_small_int() { return None; }
+    let k_u = extend(facts.consts[k_val.index()]?, val_ty, false) as u64;
+    let edges = incoming_pair_edges(func, b_idx, self_last, tag_idx, val_idx)?;
+    let defs_ref = defs.get_or_insert_with(|| crate::fold::defs(func));
+    let spec = (func.ty(tag_phi), val_ty, match_u, k_u, val_on_true == eq_means_true);
+    edges.iter().all(|&edge| edge_matches_correlated(func, facts, defs_ref, spec, edge)).then_some(val_phi)
+}
+
+fn fold_correlated_select(func: &Function, facts: &BoolFacts, param_of: &[Option<(usize, usize)>], (defs, subst): (&mut Option<Vec<Option<Inst>>>, &mut Vec<Value>), (b_idx, self_last, inst): (usize, Option<Inst>, Inst)) -> bool {
+    let Op::Select(c, t, f) = func.insts[inst.index()].op else { return false };
+    let Some(res) = func.insts[inst.index()].result else { return false };
+    let (c, t, f) = if subst.is_empty() { (c, t, f) } else { (crate::merge::find(subst, c), crate::merge::find(subst, t), crate::merge::find(subst, f)) };
+    let Some(target) = correlated_select_target(func, facts, param_of, defs, (b_idx, self_last, c, t, f)) else { return false };
+    if subst.is_empty() { *subst = (0..func.types.len()).map(|i| Value(i as u32)).collect(); }
+    subst[res.index()] = crate::merge::find(subst, target);
+    true
+}
+
+/// Folds `x ^ 1` / `x ^ y` in `select` and `brif` conditions, eliminates correlated join-param selects, and sinks single-use compares toward their branch.
 pub(crate) fn fold_bxor_conds(func: &mut Function) -> bool {
     let facts = BoolFacts::collect(func);
-    let mut changed = false;
+    let mut param_of = vec![None; func.types.len()];
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        if Some(b_idx) != func.entry.map(|e| e.index()) { block.params.iter().enumerate().for_each(|(p_idx, &p)| param_of[p.index()] = Some((b_idx, p_idx))); }
+    }
+    let (mut changed, mut defs, mut subst) = (false, None, Vec::new());
     for b_idx in 0..func.blocks.len() {
         let insts = std::mem::take(&mut func.blocks[b_idx].insts);
+        let self_last = insts.last().copied();
         let mut out = Vec::with_capacity(insts.len());
-        for inst in insts { changed |= fold_bxor_select(func, &facts, &mut out, inst) || fold_bxor_brif(func, &facts, &mut out, inst); out.push(inst); }
+        for inst in insts {
+            changed |= fold_bxor_select(func, &facts, &mut out, inst) || fold_bxor_brif(func, &facts, &mut out, inst);
+            if !fold_correlated_select(func, &facts, &param_of, (&mut defs, &mut subst), (b_idx, self_last, inst)) { out.push(inst); }
+        }
         func.blocks[b_idx].insts = out;
+    }
+    if !subst.is_empty() {
+        func.blocks.iter().flat_map(|b| &b.insts).for_each(|inst| func.insts[inst.index()].op.map_operands(|v| crate::merge::find(&subst, v)));
+        changed = true;
     }
     if changed { crate::schedule::sink_compares(func); }
     changed

@@ -623,6 +623,7 @@ impl Emit<'_> {
     }
 
     fn cmp_imm(&mut self, (lhs, rhs): (Value, Value), (bytes, size, cc): (u32, Size, IntCC)) -> bool {
+        if self.plan.elided[lhs.index()] { return false; }
         let signed = cc.is_signed();
         let Some((sub, imm)) = self.plan.const_of(rhs).and_then(|v| add_imm_parts(true, crate::fold::extend(v, self.ty(rhs), signed))) else { return false };
         if imm == 0 && matches!(cc, IntCC::Equal | IntCC::NotEqual) && self.tst_small_zero(lhs) {
@@ -643,7 +644,7 @@ impl Emit<'_> {
             return Some(cond(cc));
         }
         if matches!(x_ty, Type::I32 | Type::I64) && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, y, |v| self.defs[v.index()]) {
-            let (left, right) = self.bits_pair(x, inner);
+            let (left, right) = self.bits_pair(self.peel_uextend(x), inner);
             self.asm.alu_extended(Alu::Subs, size, ext_op, shift, ZR, left, right);
             self.last_cmp = Some((size, x, y, signed));
             return Some(cond(cc));
@@ -652,9 +653,9 @@ impl Emit<'_> {
         if self.cmp_imm((x, y), (bytes, size, cc)) { return Some(cond(cc)); }
         if self.cmp_imm((y, x), (bytes, size, cc)) { return Some(swap_cond(cond(cc))); }
         if matches!(x_ty, Type::I32 | Type::I64) && let Some((ext_op, shift, inner)) = super::fuse::ext_parts(self.func, &self.plan, x_ty, x, |v| self.defs[v.index()]) {
-            let (lhs, rhs) = self.bits_pair(y, inner);
+            let (lhs, rhs) = self.bits_pair(self.peel_uextend(y), inner);
             self.asm.alu_extended(Alu::Subs, size, ext_op, shift, ZR, lhs, rhs);
-            self.last_cmp = None;
+            self.last_cmp = Some((size, y, x, signed));
             return Some(swap_cond(cond(cc)));
         }
         None
@@ -677,7 +678,7 @@ impl Emit<'_> {
         let (b, shift, imm) = self.shifted_operand(Alu::Sub, x_ty, x)?;
         let (lhs, rhs) = self.bits_pair(self.peel_uextend(y), b);
         self.emit_shifted(Alu::Subs, size, ZR, lhs, (rhs, shift, imm));
-        self.last_cmp = None;
+        self.last_cmp = Some((size, y, x, signed));
         Some(swap_cond(cond(cc)))
     }
 

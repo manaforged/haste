@@ -37,7 +37,10 @@ fn multi_shift_icmp(
     alu_shift(false, ty, sop, imm)?;
     let other = if a == shift_val { b } else { a };
     let def = |v| def_inst(pos_of, v);
-    (!plan.elided[other.index()] && const_of(func, plan, other, &def).is_none()).then_some(None)
+    (!plan.elided[other.index()]
+        && matches!(plan.location(other), Location::Reg(_) | Location::Slot)
+        && const_of(func, plan, other, &def).is_none())
+    .then_some(Some(other))
 }
 
 fn multi_shift_consumer(

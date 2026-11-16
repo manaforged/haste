@@ -39,17 +39,9 @@ fn norm_strict(cc: IntCC, x: Value, y: Value) -> Option<(Value, Value, bool, boo
     }
 }
 
-fn match_base_ord(cx: &RewriteCx, v: Value) -> Option<ThreeWay> {
-    let ty = cx.func.ty(v);
-    if !ty.is_small_int() {
-        return None;
-    }
-    let inst = cx.def(v)?;
-    let Op::Binary(Binary::Isub, pos, neg) = cx.func.insts[inst.index()].op else {
-        return None;
-    };
-    let (p_cc, p_x, p_y) = unwrap_bool_cmp(cx, pos)?;
-    let (n_cc, n_x, n_y) = unwrap_bool_cmp(cx, neg)?;
+fn complementary_strict(cx: &RewriteCx, x: Value, y: Value) -> Option<(Value, Value, bool, bool)> {
+    let (p_cc, p_x, p_y) = unwrap_bool_cmp(cx, x)?;
+    let (n_cc, n_x, n_y) = unwrap_bool_cmp(cx, y)?;
     let (a, b, signed, pos_is_gt) = norm_strict(p_cc, p_x, p_y)?;
     let (na, nb, n_signed, neg_is_gt) = norm_strict(n_cc, n_x, n_y)?;
     if signed != n_signed || cx.func.ty(a) != cx.func.ty(na) {
@@ -57,12 +49,105 @@ fn match_base_ord(cx: &RewriteCx, v: Value) -> Option<ThreeWay> {
     }
     let same_opposite = na == a && nb == b && neg_is_gt == !pos_is_gt;
     let swapped_same = na == b && nb == a && neg_is_gt == pos_is_gt;
-    if !same_opposite && !swapped_same {
+    (same_opposite || swapped_same).then_some((a, b, signed, pos_is_gt))
+}
+
+pub(super) fn eval_complementary_cmp(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) {
         return None;
     }
-    let neg_one = extend(-1, ty, true);
-    let vals = if pos_is_gt { [neg_one, 0, 1] } else { [1, 0, neg_one] };
-    Some(ThreeWay { a, b, signed, vals })
+    let (a, b, _, _) = complementary_strict(cx, x, y)?;
+    Some(Op::Icmp(cc, a, b))
+}
+
+fn unwrap_bool_xor1(cx: &RewriteCx, v: Value) -> (Value, bool) {
+    if let Some(&Op::Binary(Binary::Bxor, x, y)) = cx.op(v)
+        && cx.func.ty(v).is_small_int()
+        && let Some((inner, _)) = [(x, y), (y, x)].into_iter().find(|&(i, m)| cx.sconst(m) == Some(1) && cx.is_unit_bool(i))
+    {
+        return (inner, true);
+    }
+    (v, false)
+}
+
+fn cc_mask(cc: IntCC) -> u8 {
+    match cc {
+        IntCC::Equal => 2,
+        IntCC::NotEqual => 5,
+        IntCC::SignedLessThan | IntCC::UnsignedLessThan => 1,
+        IntCC::SignedLessThanOrEqual | IntCC::UnsignedLessThanOrEqual => 3,
+        IntCC::SignedGreaterThan | IntCC::UnsignedGreaterThan => 4,
+        IntCC::SignedGreaterThanOrEqual | IntCC::UnsignedGreaterThanOrEqual => 6,
+    }
+}
+
+fn cmp_mask(cx: &RewriteCx, v: Value, (a, b, signed): (Value, Value, bool)) -> Option<u8> {
+    let (cur, invert) = unwrap_bool_xor1(cx, v);
+    let (raw_cc, x, y) = unwrap_bool_cmp(cx, cur)?;
+    if !matches!(raw_cc, IntCC::Equal | IntCC::NotEqual) && raw_cc.is_signed() != signed {
+        return None;
+    }
+    let cc = if (x, y) == (a, b) { raw_cc } else if (x, y) == (b, a) { flip_int_cc(raw_cc) } else { return None };
+    Some(if invert { cc_mask(cc) ^ 7 } else { cc_mask(cc) })
+}
+
+fn first_ordered_cmp(cx: &RewriteCx, v: Value, depth: u8) -> Option<(Value, Value, bool)> {
+    if depth > 2 {
+        return None;
+    }
+    if let Some((cc, x, y)) = unwrap_bool_cmp(cx, v)
+        && !matches!(cc, IntCC::Equal | IntCC::NotEqual)
+    {
+        return Some((x, y, cc.is_signed()));
+    }
+    let inst = cx.def(v)?;
+    let Op::Select(c, t, f) = cx.func.insts[inst.index()].op else {
+        return None;
+    };
+    first_ordered_cmp(cx, c, depth + 1)
+        .or_else(|| first_ordered_cmp(cx, t, depth + 1))
+        .or_else(|| first_ordered_cmp(cx, f, depth + 1))
+}
+
+fn eval_ord_node(cx: &RewriteCx, ty: Type, v: Value, key: (Value, Value, bool), depth: u8) -> Option<[i64; 3]> {
+    if let Some(k) = cx.sconst(v) {
+        return Some([extend(k, ty, true); 3]);
+    }
+    if let Some(m) = cmp_mask(cx, v, key) {
+        return Some([i64::from((m & 1) != 0), i64::from((m & 2) != 0), i64::from((m & 4) != 0)]);
+    }
+    if depth < 2
+        && let Some(inst) = cx.def(v)
+        && let Op::Select(c, t, f) = cx.func.insts[inst.index()].op
+    {
+        let m = cmp_mask(cx, c, key)?;
+        let tv = eval_ord_node(cx, ty, t, key, depth + 1)?;
+        let fv = eval_ord_node(cx, ty, f, key, depth + 1)?;
+        return Some([0, 1, 2].map(|i| if (m & (1 << i)) != 0 { tv[i] } else { fv[i] }));
+    }
+    None
+}
+
+fn match_base_ord(cx: &RewriteCx, v: Value) -> Option<ThreeWay> {
+    let ty = cx.func.ty(v);
+    if !ty.is_small_int() {
+        return None;
+    }
+    let inst = cx.def(v)?;
+    match cx.func.insts[inst.index()].op {
+        Op::Binary(Binary::Isub, pos, neg) => {
+            let (a, b, signed, pos_is_gt) = complementary_strict(cx, pos, neg)?;
+            let neg_one = extend(-1, ty, true);
+            let vals = if pos_is_gt { [neg_one, 0, 1] } else { [1, 0, neg_one] };
+            Some(ThreeWay { a, b, signed, vals })
+        }
+        Op::Select(..) => {
+            let key @ (a, b, signed) = first_ordered_cmp(cx, v, 0)?;
+            let vals = eval_ord_node(cx, ty, v, key, 0)?;
+            Some(ThreeWay { a, b, signed, vals })
+        }
+        _ => None,
+    }
 }
 
 fn match_three_way(cx: &RewriteCx, v: Value, depth: u8) -> Option<ThreeWay> {
