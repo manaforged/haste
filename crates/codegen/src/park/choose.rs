@@ -1,7 +1,11 @@
-use crate::ir::Value;
+use crate::ir::{Function, Value};
 use crate::live::{Live, Range, overlaps};
 
-use super::{Hints, Pool, crosses_call, crosses_ranges, parks, slot_free};
+use super::{BackIndex, Hints, Pool, SlotSet, crosses_call, crosses_ranges, parks, slot_free, try_place_weighted};
+
+fn reuse_pair(hints: &Hints, reverse_reuse: &[Option<Value>], value: usize) -> [Option<Value>; 2] {
+    [hints.reuse[value], reverse_reuse.get(value).copied().flatten()]
+}
 
 fn pick_slot<F: Copy + PartialEq>(
     pool: &Pool<F>,
@@ -82,7 +86,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         .filter(|p| !back_partners.contains(p))
         .filter_map(unalloc_info)
         .collect();
-    let unalloc_reuse: Vec<(usize, bool, u32)> = [hints.reuse[value], reverse_reuse.get(value).copied().flatten()]
+    let unalloc_reuse: Vec<(usize, bool, u32)> = reuse_pair(hints, reverse_reuse, value)
         .into_iter()
         .flatten()
         .map(|p| p.index())
@@ -96,7 +100,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
     let compat_back = |s: usize| all_fit(&unalloc_back, s);
     let compat_fwd = |s: usize| all_fit(&unalloc_fwd, s);
     let compat_reuse = |s: usize| all_fit(&unalloc_reuse, s);
-    for op in [hints.reuse[value], reverse_reuse.get(value).copied().flatten()].into_iter().flatten() {
+    for op in reuse_pair(hints, reverse_reuse, value).into_iter().flatten() {
         let Some(reg) = homes[op.index()] else { continue };
         let Some(s) = pool.regs.iter().position(|r| *r == reg) else { continue };
         let suits_reuse = if has_free_saved { suits_direct(s) } else { suits_any(s) };
@@ -150,7 +154,7 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
         {
             return Some(s);
         }
-        let p_reuse = [hints.reuse[p], reverse_reuse.get(p).copied().flatten()];
+        let p_reuse = reuse_pair(hints, reverse_reuse, p);
         for q in hints
             .partners
             .map_or(&[][..], |m| &m[p][..])
@@ -211,5 +215,31 @@ pub(super) fn choose_free<F: Copy + PartialEq>(
             .or_else(|| (!wide_val).then(|| try_pick(false, &|s| pool.is_saved[s])).flatten())
             .or_else(|| try_pick(true, &|s| !pool.is_saved[s]))
             .or_else(|| (!wide_val).then(|| try_pick(true, &|s| pool.is_saved[s])).flatten())
+    }
+}
+
+/// Places the unhomed reuse partners of a just-placed value in its register now, when that is their own current choice.
+pub(super) fn place_reuse_chain<'a, F: Copy + PartialEq>(
+    ctx: (&Function, &'a Live, &Pool<F>),
+    weighted: (&Hints, &[u64]),
+    index: (&[Vec<usize>], &[Option<Value>], &BackIndex),
+    (slots, homes): (&mut SlotSet, &mut [Option<F>]),
+    (reserved, scratch_holders, query_ranges): (&mut Vec<F>, &mut Vec<Vec<usize>>, &mut Vec<(usize, &'a [Range])>),
+    (pooled, value): (&[bool], usize),
+) {
+    let (_, _, pool) = ctx;
+    let (hints, _) = weighted;
+    let (_, reverse_reuse, _) = index;
+    let Some(slot) = homes[value].and_then(|reg| pool.regs.iter().position(|r| *r == reg)) else { return };
+    let mut queue = vec![value];
+    while let Some(cur) = queue.pop() {
+        for next in reuse_pair(hints, reverse_reuse, cur).into_iter().flatten().map(|v| v.index()) {
+            if pooled.get(next) == Some(&true)
+                && homes[next].is_none()
+                && try_place_weighted(ctx, weighted, index, (&mut *slots, &mut *homes), (&mut *reserved, &mut *scratch_holders, &mut *query_ranges), (next, Some(slot))).0
+            {
+                queue.push(next);
+            }
+        }
     }
 }
