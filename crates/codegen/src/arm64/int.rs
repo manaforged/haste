@@ -624,9 +624,12 @@ impl Emit<'_> {
 
     fn cmp_imm(&mut self, (lhs, rhs): (Value, Value), (bytes, size, cc): (u32, Size, IntCC)) -> bool {
         if self.plan.elided[lhs.index()] { return false; }
-        let signed = cc.is_signed();
-        let Some((sub, imm)) = self.plan.const_of(rhs).and_then(|v| add_imm_parts(true, crate::fold::extend(v, self.ty(rhs), signed))) else { return false };
-        if imm == 0 && matches!(cc, IntCC::Equal | IntCC::NotEqual) && self.tst_small_zero(lhs) {
+        let Some(raw) = self.plan.const_of(rhs) else { return false };
+        let rhs_ty = self.ty(rhs);
+        let parts = |signed: bool| add_imm_parts(true, crate::fold::extend(raw, rhs_ty, signed)).map(|p| (signed, p));
+        let eq = matches!(cc, IntCC::Equal | IntCC::NotEqual);
+        let Some((signed, (sub, imm))) = parts(cc.is_signed()).or_else(|| eq.then(|| parts(true)).flatten()) else { return false };
+        if imm == 0 && eq && self.tst_small_zero(lhs) {
             self.last_cmp = None;
             return true;
         }
