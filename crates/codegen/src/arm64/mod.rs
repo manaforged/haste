@@ -403,7 +403,9 @@ impl Emit<'_> {
                 Some(v0) => asm.fldp_offset(Vreg(a), Vreg(v0), FP, disp),
                 None => asm.vload(8, Vreg(a), Mem::new(FP, disp)),
             });
-            self.asm.mov_sp(SP, FP);
+            if self.frame.size > 0 {
+                self.asm.mov_sp(SP, FP);
+            }
             self.asm.ldp_post(FP, LR, SP, 16);
         }
         self.asm.ret();

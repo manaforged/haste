@@ -274,8 +274,12 @@ fn needs<R>(func: &Function, classify: &impl Fn(&Signature) -> Result<Abi<R>, St
 fn present(func: &Function, fused: &[bool]) -> (Vec<bool>, Vec<bool>) {
     let (mut values, mut slots) = (vec![false; func.types.len()], vec![false; func.slots.len()]);
     let mut flags = Vec::new();
-    for block in &func.blocks {
-        block.params.iter().for_each(|param| values[param.index()] = true);
+    let cfg = func.cfg();
+    for (at, block) in func.blocks.iter().enumerate() {
+        let entered = func.entry == Some(Block(at as u32)) || cfg.pred_count(Block(at as u32)) != 0;
+        if entered {
+            block.params.iter().for_each(|param| values[param.index()] = true);
+        }
         for inst in &block.insts {
             let data = &func.insts[inst.index()];
             data.op.for_operands(|value| values[value.index()] = true);
