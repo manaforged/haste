@@ -653,6 +653,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     let weights = blocks.as_deref().map(|blocks| walk::weights(func, blocks, &sib, &elided));
     let (partners, back_args) = walk::edge_hints(func, cfg.as_deref(), order, blocks.as_deref(), !regs.two_address);
     let park = blocks.as_deref().filter(|_| regs.park).map(|blocks| live.sites.iter().map(|(_, block)| blocks[block.index()]).collect::<Vec<u64>>());
+    let copies = if regs.two_address { hints::extend_copies(func, &live, &zero_ext, &ints) } else { Vec::new() };
     let hints = Hints {
         reuse: &reuse,
         weights: weights.as_deref(),
@@ -660,6 +661,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
         back_args: &back_args,
         park: park.as_deref(),
         two_address: regs.two_address,
+        copies: &copies,
     };
     let (passed_ints, passed_floats) = passed(func, classify);
     let (homes, used) = allocate(func, &live, &int_class(func, regs, (order, copied, &elided), params, passed_ints), &ints, &hints);

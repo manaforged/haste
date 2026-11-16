@@ -178,6 +178,14 @@ pub(crate) fn overlaps(a: &[Range], b: &[Range]) -> bool {
     false
 }
 
+/// Whether each range of `inner` lies inside one range of `outer`.
+pub(crate) fn covers(outer: &[Range], inner: &[Range]) -> bool {
+    inner.iter().all(|r| {
+        let at = outer.partition_point(|o| o.end < r.start);
+        outer.get(at).is_some_and(|o| o.start <= r.start && r.end <= o.end)
+    })
+}
+
 struct Sets {
     words: usize,
     bits: Vec<u64>,

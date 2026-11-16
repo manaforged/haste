@@ -1,5 +1,6 @@
 use crate::ir::{Binary, Block, Convert, Function, Op, Type, Unary, Value};
-use crate::live::{Live, overlaps};
+use crate::live::{Live, covers, overlaps};
+use crate::park::crosses_ranges;
 
 use super::{Location, Regs, Uses, registered};
 
@@ -126,6 +127,28 @@ pub(super) fn reusable<R: 'static>(func: &Function, regs: &Regs<R>, locations: &
         }
     }
     reuse
+}
+
+/// Each zero-extension of a value with clean upper bits that stays live through it and no call, as (copy, source): the two hold the same register bits.
+pub(super) fn extend_copies(func: &Function, live: &Live, zero_ext: &[bool], pooled: &[bool]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &inst in func.blocks.iter().flat_map(|block| &block.insts) {
+        let data = &func.insts[inst.index()];
+        let (Op::Convert(Convert::Uextend, source), Some(copy)) = (&data.op, data.result) else { continue };
+        let (copy, source) = (copy.index(), source.index());
+        let ranges = live.ranges_of(copy);
+        if pooled[copy]
+            && pooled[source]
+            && zero_ext[source]
+            && func.types[copy].bytes() <= 8
+            && !ranges.is_empty()
+            && !crosses_ranges(&live.calls, ranges)
+            && covers(live.ranges_of(source), ranges)
+        {
+            out.push((copy, source));
+        }
+    }
+    out
 }
 
 /// Computes which small integer values already have zero-extended upper bits in 64-bit registers.

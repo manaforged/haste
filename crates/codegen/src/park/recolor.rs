@@ -52,4 +52,18 @@ impl<F: Copy + PartialEq> Join<'_, F> {
             }
         }
     }
+
+    /// Gives each zero-extension copy its source's register, which holds the same bits for as long as the copy lives.
+    pub(super) fn share_copies(&self, slots: &mut SlotSet, homes: &mut [Option<F>]) {
+        for &(copy, source) in self.hints.copies {
+            let Some(reg) = homes[source] else { continue };
+            if homes[copy] == Some(reg) {
+                continue;
+            }
+            if let Some(from) = homes[copy].and_then(|old| self.pool.slot_of(old)) {
+                slots.remove(from, self.live.ranges_of(copy), copy);
+            }
+            homes[copy] = Some(reg);
+        }
+    }
 }
