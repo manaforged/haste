@@ -128,6 +128,31 @@ impl Infer<'_, '_> {
         }
         Ok(None)
     }
+}
+
+pub(super) type DeferredSnap = (
+    Vec<(ItemRef, Vec<Ty>)>,
+    Vec<super::project::Projection>,
+    Option<(PolyPhase, usize)>,
+);
+
+impl Infer<'_, '_> {
+    pub(super) fn save_deferred(&self) -> DeferredSnap {
+        (
+            self.obligations.clone(),
+            self.projections.clone(),
+            self.poly.as_ref().map(|p| (p.phase, p.obligations.len())),
+        )
+    }
+
+    pub(super) fn restore_deferred(&mut self, (obligations, projections, poly): DeferredSnap) {
+        self.obligations = obligations;
+        self.projections = projections;
+        if let (Some(state), Some((phase, len))) = (&mut self.poly, poly) {
+            state.phase = phase;
+            state.obligations.truncate(len);
+        }
+    }
 
     fn deref_step_fits(&mut self, ty: Ty, to: Ty) -> bool {
         if ty == to {
@@ -136,9 +161,8 @@ impl Infer<'_, '_> {
         if !self.has_vars(to) || self.obligations.is_empty() {
             return self.trial_unify(ty, to);
         }
-        let saved_obligations = self.obligations.clone();
-        let saved_projections = self.projections.clone();
-        let saved_poly = self.poly.as_ref().map(|p| (p.phase, p.obligations.len()));
+        let saved = self.save_deferred();
+        let saved_poly = saved.2;
         let stuck_before = self.stuck_obligations();
         let ok = self.probe(|infer| {
             if !infer.unifies(ty, to) {
@@ -152,12 +176,7 @@ impl Infer<'_, '_> {
             });
             !hit_fallback && infer.stuck_obligations() <= stuck_before
         });
-        self.obligations = saved_obligations;
-        self.projections = saved_projections;
-        if let (Some(poly), Some((phase, len))) = (&mut self.poly, saved_poly) {
-            poly.phase = phase;
-            poly.obligations.truncate(len);
-        }
+        self.restore_deferred(saved);
         ok
     }
 

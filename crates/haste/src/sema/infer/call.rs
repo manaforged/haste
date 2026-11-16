@@ -156,17 +156,20 @@ impl Infer<'_, '_> {
         if !matches!(self.cx.types.kind(self.resolve(param)), Kind::Var(_)) {
             return Ok(());
         }
-        let fits = self.trial(|infer| {
+        let saved = self.save_deferred();
+        let res = self.trial(|infer| {
             infer.obligations.push(entry);
             if infer.settle_obligations().is_err() || matches!(infer.cx.types.kind(infer.resolve(param)), Kind::Var(_)) {
                 return Ok(None);
             }
             Ok(infer.coerces_to(found, param).then_some(()))
-        })?;
-        if fits.is_some() {
+        });
+        if matches!(res, Ok(Some(()))) {
             *held = None;
+        } else {
+            self.restore_deferred(saved);
         }
-        Ok(())
+        res.map(drop)
     }
 
     /// Gives back an obligation that `hold_open_obligation` took and settles what it now decides.
