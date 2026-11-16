@@ -345,52 +345,43 @@ fn is_aggregate(cx: &Context<'_>, ty: Ty) -> bool {
     ty != Ty::NONE && matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..))
 }
 
+fn has_closure(types: &Types, ty: Ty) -> bool {
+    let kind = types.kind(ty);
+    matches!(kind, Kind::Closure(..)) || kind.children(types).any(|child| has_closure(types, child))
+}
+
 fn owned_tys(summary: &PolySummary) -> impl Iterator<Item = Ty> + '_ {
-    summary.locals.iter().map(|l| l.ty).chain(summary.template.owned_tys())
+    summary.locals.iter().map(|l| l.ty).chain(summary.ret).chain(summary.template.owned_tys())
 }
 
 fn lay_out_fixed(cx: &mut Context<'_>, summary: &PolySummary) {
     let fixed = summary.template.closures.is_empty().then(|| owned_tys(summary));
     for ty in fixed.into_iter().flatten() {
-        if is_aggregate(cx, ty) && !cx.types.has_params(ty) {
-            drop(cx.layout(ty));
-        }
+        if is_aggregate(cx, ty) && !cx.types.has_params(ty) && !cx.types.has_var_flag(ty) { cx.layout(ty).ok(); }
     }
 }
 
+fn record_drop_ty(cx: &mut Context<'_>, ty: Ty, fixed_drops: &mut Vec<Res>, drop_tys: &mut Vec<Ty>) -> Result<()> {
+    if cx.types.has_var_flag(ty) || has_closure(&cx.types, ty) { return Ok(()); }
+    if !cx.types.has_params(ty) {
+        if is_aggregate(cx, ty) { cx.layout(ty).ok(); }
+        fixed_drops.extend(super::infer::glue_call(cx, ty)?);
+    } else if !matches!(cx.types.kind(ty), Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_)) {
+        drop_tys.push(ty);
+    }
+    Ok(())
+}
+
 fn extract_drops_and_tys(cx: &mut Context<'_>, summary: &mut PolySummary) -> Result<()> {
-    if summary.template.closures.is_empty() {
-        let mut seen_drop = HashSet::default();
-        let mut fixed_drops = Vec::new();
-        let mut drop_tys = Vec::new();
-        for ty in owned_tys(summary) {
-            if ty == Ty::NONE || !seen_drop.insert(ty) {
-                continue;
-            }
-            if !cx.types.has_params(ty) {
-                if is_aggregate(cx, ty) {
-                    drop(cx.layout(ty));
-                }
-                if let Some(call) = super::infer::glue_call(cx, ty)? {
-                    fixed_drops.push(call);
-                }
-            } else if !matches!(cx.types.kind(ty), Kind::Prim(_) | Kind::Ref(..) | Kind::Ptr(..) | Kind::FnDef(..) | Kind::FnPtr(..) | Kind::Never | Kind::Value(_)) {
-                drop_tys.push(ty);
-            }
-        }
-        summary.fixed_drops = fixed_drops.into_boxed_slice();
-        summary.drop_tys = drop_tys.into_boxed_slice();
+    let mut seen = HashSet::default();
+    let (mut fixed_drops, mut drop_tys, mut parametric_tys) = (Vec::new(), Vec::new(), Vec::new());
+    for ty in owned_tys(summary) {
+        if ty == Ty::NONE || !seen.insert(ty) { continue; }
+        record_drop_ty(cx, ty, &mut fixed_drops, &mut drop_tys)?;
+        if cx.types.has_params(ty) { parametric_tys.push(ty); }
     }
-    let mut seen_param = HashSet::default();
-    let mut parametric_tys = Vec::new();
-    let tpl = &summary.template;
-    let flow_tys = tpl.fors.values().flat_map(|f| [f.iter, f.option]).chain(tpl.tries.values().map(|t| t.flow)).chain(tpl.awaits.values().flat_map(|a| [a.future, a.polled]));
-    let all_tys = summary.locals.iter().map(|l| l.ty).chain(summary.ret).chain(tpl.pats.values().copied()).chain(tpl.exprs.iter().copied()).chain(flow_tys);
-    for ty in all_tys {
-        if ty != Ty::NONE && cx.types.has_params(ty) && seen_param.insert(ty) {
-            parametric_tys.push(ty);
-        }
-    }
+    summary.fixed_drops = fixed_drops.into_boxed_slice();
+    summary.drop_tys = drop_tys.into_boxed_slice();
     summary.parametric_tys = parametric_tys.into_boxed_slice();
     Ok(())
 }
