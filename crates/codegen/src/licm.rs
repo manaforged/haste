@@ -564,7 +564,11 @@ fn hoist(
             });
             let adds_gp = !frees_operand && !matches!(op, Op::Const(_)) && res_ty.is_some_and(|ty| !ty.in_float_register());
             let gp_ok = !(adds_gp && op.is_speculable() && gp_live + hoisted_gp >= MAX_LOOP_GP_LIVE)
-                && !(adds_gp && mem.unique_heap_writes && matches!(op, Op::Load(..)) && gp_live + hoisted_gp >= 12);
+                && !(adds_gp
+                    && mem.unique_heap_writes
+                    && matches!(op, Op::Load(..))
+                    && gp_live + hoisted_gp >= 12
+                    && !mem.hoists_past_heap_writes(func, prov, head_prefix, inst));
             if movable && vec_ok && gp_ok && operands_invariant && let Some(res) = func.insts[inst.index()].result {
                 hoisted_gp += usize::from(adds_gp);
                 if is_symbol {

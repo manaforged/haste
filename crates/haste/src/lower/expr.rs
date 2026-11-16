@@ -197,7 +197,8 @@ impl Lower<'_, '_> {
     }
 
     fn field_value(&mut self, expr: ExprId) -> Result<Option<Value>> {
-        let value = self.place_of(expr)?.and_then(|place| self.read(place));
+        let ty = self.ty_of(expr);
+        let value = self.place_of(expr)?.and_then(|place| self.read_typed(place, ty));
         if let Some((root, path)) = self.move_path(expr)
             && crate::sema::infer::needs_drop(self.cx, self.ty_of(expr))?
         {

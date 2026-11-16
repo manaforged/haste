@@ -4,7 +4,7 @@ const UNIQUE_PTR: u8 = 1;
 const UNPREDICTABLE: u8 = 2;
 
 impl Function {
-    /// Marks `value` as a pointer loaded from an owned `Box` heap allocation.
+    /// Marks `value` as a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.
     pub fn mark_unique_ptr(&mut self, value: Value) {
         self.set_flags(value, UNIQUE_PTR);
     }
@@ -14,7 +14,7 @@ impl Function {
         self.set_flags(value, UNPREDICTABLE);
     }
 
-    /// Whether `value` is a pointer loaded from an owned `Box` heap allocation.
+    /// Whether `value` is a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.
     pub(crate) fn is_unique_ptr(&self, value: Value) -> bool {
         self.flags(value) & UNIQUE_PTR != 0
     }

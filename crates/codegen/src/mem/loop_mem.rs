@@ -342,7 +342,7 @@ pub(crate) struct LoopMem {
 }
 
 fn is_unknown_write(root: MemRoot) -> bool {
-    !matches!(root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::UniqueHeap)
+    !matches!(root, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::UniqueHeap(_))
 }
 
 fn entry_param(func: &Function, param: u16) -> Option<Value> {
@@ -482,17 +482,15 @@ impl LoopMem {
         match loc.root {
             MemRoot::Slot(s) => self.slot_writes.clobber(s.index()),
             MemRoot::NoAliasParam(p) => self.param_writes.clobber(usize::from(p)),
-            MemRoot::UniqueHeap => self.unique_heap_writes = true,
+            MemRoot::UniqueHeap(_) => self.unique_heap_writes = true,
             _ => self.unknown_mem_writes = true,
         }
     }
 
-    fn slot_load_ok(&self, func: &Function, prov: &Provenance, slot: StackSlot, span: (i128, i128)) -> bool {
+    fn slot_load_ok(&self, func: &Function, prov: &Provenance, slot: StackSlot, span: (i128, i128), unknown: bool) -> bool {
         let (lo, hi) = span;
         let end_ok = lo >= 0 && hi <= i128::from(func.slots[slot.index()].size);
-        let mut_ok = prov.slot_unescaped(slot)
-            || (prov.slot_call_readonly(slot) && !self.unknown_mem_writes)
-            || (!self.calls && !self.unknown_mem_writes);
+        let mut_ok = prov.slot_unescaped(slot) || (prov.slot_call_readonly(slot) && !unknown) || (!self.calls && !unknown);
         let no_write = i64::try_from(lo)
             .ok()
             .zip(i64::try_from(hi).ok())
@@ -501,46 +499,62 @@ impl LoopMem {
     }
 
     pub(crate) fn can_hoist_load(&self, func: &Function, prov: &Provenance, head_prefix: bool, inst: Inst) -> bool {
+        self.load_hoists(func, prov, (head_prefix, self.unknown_mem_writes), inst)
+    }
+
+    /// Whether the load at `inst` hoists even when the loop's unique heap writes count as unknown writes.
+    pub(crate) fn hoists_past_heap_writes(&self, func: &Function, prov: &Provenance, head_prefix: bool, inst: Inst) -> bool {
+        self.load_hoists(func, prov, (head_prefix, self.unknown_mem_writes || self.unique_heap_writes), inst)
+    }
+
+    fn load_hoists(&self, func: &Function, prov: &Provenance, mode: (bool, bool), inst: Inst) -> bool {
         let data = &func.insts[inst.index()];
         let Some(res) = data.result else { return false };
         let width = func.ty(res).bytes();
         match data.op {
             Op::StackLoad(slot, offset) => {
                 let lo = i128::from(offset);
-                self.slot_load_ok(func, prov, slot, (lo, lo + i128::from(width)))
+                self.slot_load_ok(func, prov, slot, (lo, lo + i128::from(width)), mode.1)
             }
-            Op::Load(addr, offset) => self.can_hoist_mem_load(func, prov, head_prefix, (addr, offset, width)),
+            Op::Load(addr, offset) => self.can_hoist_mem_load(func, prov, mode, (addr, offset, width)),
             _ => false,
         }
     }
 
-    fn can_hoist_mem_load(&self, func: &Function, prov: &Provenance, head_prefix: bool, load: (Value, i32, u32)) -> bool {
-        let (addr, offset, width) = load;
+    fn can_hoist_mem_load(&self, func: &Function, prov: &Provenance, mode: (bool, bool), load: (Value, i32, u32)) -> bool {
+        let ((head_prefix, unknown), (addr, offset, width)) = (mode, load);
         let loc = prov.loc(addr, i64::from(offset), width);
         let (base, lo, hi) = prov.loc_span(loc);
         if let MemBase::Slot(slot) = base {
-            return self.slot_load_ok(func, prov, slot, (lo, hi));
+            return self.slot_load_ok(func, prov, slot, (lo, hi), unknown);
         }
         let deref_ok = in_range(i64::from(offset), width, prov.ro_bytes.get(addr.index()).copied().unwrap_or(0));
         if self.atomics {
             return false;
         }
-        let (root_ok, trap_ok, readonly_ok, call_safe) = self.root_load_ok(func, prov, loc, (base, lo, hi));
+        let (root_ok, trap_ok, readonly_ok, call_safe) = self.root_load_ok(func, prov, loc, (base, lo, hi), unknown);
         if !(head_prefix || deref_ok || trap_ok) {
             return false;
         }
         readonly_ok || call_safe || (!self.calls && (!self.writes || root_ok))
     }
 
-    fn slot_root_ok(&self, func: &Function, prov: &Provenance, slot: StackSlot, loc: MemLoc) -> (bool, bool, bool, bool) {
+    fn slot_root_ok(&self, func: &Function, prov: &Provenance, slot: StackSlot, loc: MemLoc, unknown: bool) -> (bool, bool, bool, bool) {
         let trap_ok = in_range(loc.offset, loc.size, func.slots[slot.index()].size);
-        let slot_safe = prov.slot_unescaped(slot) || (prov.slot_call_readonly(slot) && !self.unknown_mem_writes);
+        let slot_safe = prov.slot_unescaped(slot) || (prov.slot_call_readonly(slot) && !unknown);
         let no_write = !self.slot_writes.any(slot.index());
-        let root_ok = (slot_safe || (!self.calls && !self.unknown_mem_writes)) && no_write;
+        let root_ok = (slot_safe || (!self.calls && !unknown)) && no_write;
         (root_ok, trap_ok, false, slot_safe && no_write)
     }
 
-    fn noalias_load_ok(&self, func: &Function, prov: &Provenance, p: u16, span: (MemBase, i128, i128)) -> (bool, bool, bool, bool) {
+    fn noalias_load_ok(
+        &self,
+        func: &Function,
+        prov: &Provenance,
+        p: u16,
+        span: (MemBase, i128, i128),
+        unknown: bool,
+    ) -> (bool, bool, bool, bool) {
         let (base, lo, hi) = span;
         let is_entry = entry_param(func, p).is_some_and(|ep| base == MemBase::Addr(ep));
         let trap_ok = is_entry && param_span_deref_ok(func, p, (lo, hi));
@@ -549,18 +563,25 @@ impl LoopMem {
             Some((slo, shi)) => !self.param_writes.overlaps_span(usize::from(p), slo, shi),
             None => !self.param_writes.any(usize::from(p)),
         };
-        let unescaped_safe = prov.noalias_unescaped(p) && (self.head_touches_noalias(p) || !self.unknown_mem_writes);
+        let unescaped_safe = prov.noalias_unescaped(p) && (self.head_touches_noalias(p) || !unknown);
         let readonly_ok = no_param_write && func.signature.params.get(usize::from(p)).is_some_and(|abi| abi.readonly);
         let call_safe = no_param_write && unescaped_safe && !self.calls_write_noalias.get(p);
-        let root_ok = no_param_write && (unescaped_safe || !self.unknown_mem_writes);
+        let root_ok = no_param_write && (unescaped_safe || !unknown);
         (root_ok, trap_ok, readonly_ok, call_safe)
     }
 
-    fn root_load_ok(&self, func: &Function, prov: &Provenance, loc: MemLoc, span: (MemBase, i128, i128)) -> (bool, bool, bool, bool) {
+    fn root_load_ok(
+        &self,
+        func: &Function,
+        prov: &Provenance,
+        loc: MemLoc,
+        span: (MemBase, i128, i128),
+        unknown: bool,
+    ) -> (bool, bool, bool, bool) {
         let (base, lo, hi) = span;
         match loc.root {
-            MemRoot::Slot(slot) => self.slot_root_ok(func, prov, slot, loc),
-            MemRoot::NoAliasParam(p) => self.noalias_load_ok(func, prov, p, span),
+            MemRoot::Slot(slot) => self.slot_root_ok(func, prov, slot, loc, unknown),
+            MemRoot::NoAliasParam(p) => self.noalias_load_ok(func, prov, p, span, unknown),
             MemRoot::ReadonlyParam(p) => {
                 let is_entry = entry_param(func, p).is_some_and(|ep| base == MemBase::Addr(ep));
                 (true, is_entry && param_span_deref_ok(func, p, (lo, hi)), true, false)

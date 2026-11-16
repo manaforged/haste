@@ -13,14 +13,14 @@ pub(crate) enum MemRoot {
     NoAliasParam(u16),
     ReadonlyParam(u16),
     Global(u32),
-    UniqueHeap,
+    UniqueHeap(Option<Value>),
     Unknown,
 }
 
 impl MemRoot {
     /// Whether the root names one known object: a stack slot, a noalias or readonly parameter, or a unique heap allocation.
     pub(crate) fn is_identified(&self) -> bool {
-        matches!(self, Self::Slot(_) | Self::NoAliasParam(_) | Self::ReadonlyParam(_) | Self::UniqueHeap)
+        matches!(self, Self::Slot(_) | Self::NoAliasParam(_) | Self::ReadonlyParam(_) | Self::UniqueHeap(_))
     }
 }
 
@@ -70,7 +70,15 @@ impl TrackRoot {
         match (self, other) {
             (Self::Unset, x) | (x, Self::Unset) => x,
             (Self::Set(a), Self::Set(b)) if a == b => Self::Set(a),
+            (Self::Set(MemRoot::UniqueHeap(_)), Self::Set(MemRoot::UniqueHeap(_))) => Self::Set(MemRoot::UniqueHeap(None)),
             _ => Self::Conflict,
+        }
+    }
+
+    fn across_edge(self) -> Self {
+        match self {
+            Self::Set(MemRoot::UniqueHeap(Some(_))) => Self::Set(MemRoot::UniqueHeap(None)),
+            other => other,
         }
     }
 }
@@ -123,7 +131,7 @@ fn join_track_args(tracked: &mut [TrackRoot], blocks: &[BlockData], target: Bloc
     let mut changed = false;
     for (&param, &arg) in blocks[target.index()].params.iter().zip(args) {
         if arg != param {
-            let next = tracked[param.index()].join(tracked[arg.index()]);
+            let next = tracked[param.index()].join(tracked[arg.index()].across_edge());
             if next != tracked[param.index()] {
                 tracked[param.index()] = next;
                 changed = true;
@@ -153,12 +161,16 @@ fn is_derived_i64(op: &Op, ty: Type) -> bool {
     ty == Type::I64 && matches!(op, Op::Convert(Convert::Bitcast, _) | Op::Binary(Binary::Iadd | Binary::Isub, ..) | Op::Select(..))
 }
 
-fn track_def(func: &Function, inst: Inst, tracked: &mut [TrackRoot]) -> bool {
+fn track_def(func: &Function, inst: Inst, tracked: &mut [TrackRoot], affine: &[(Value, i64)]) -> bool {
     let data = &func.insts[inst.index()];
     let Some(res) = data.result else { return false };
     let ty = func.ty(res);
     let next = if ty == Type::I64 && func.is_unique_ptr(res) {
-        TrackRoot::Set(MemRoot::UniqueHeap)
+        let owner = match data.op {
+            Op::Load(addr, _) => affine.get(addr.index()).map(|&(root, _)| root),
+            _ => None,
+        };
+        TrackRoot::Set(MemRoot::UniqueHeap(owner))
     } else {
         step_track(&data.op, ty, tracked)
     };
@@ -175,7 +187,7 @@ fn track_edges(func: &Function, inst: Inst, tracked: &mut [TrackRoot]) -> bool {
     }
 }
 
-fn compute_tracked_roots(func: &Function, cfg: &Cfg) -> Vec<TrackRoot> {
+fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) -> Vec<TrackRoot> {
     let mut tracked = vec![TrackRoot::Unset; func.types.len()];
     seed_entry_roots(func, cfg, &mut tracked);
     let mut steps = Vec::new();
@@ -183,7 +195,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg) -> Vec<TrackRoot> {
     for &b in &cfg.rpo {
         let insts = &func.blocks[b.index()].insts;
         for &inst in insts {
-            changed |= track_def(func, inst, &mut tracked);
+            changed |= track_def(func, inst, &mut tracked, affine);
             let data = &func.insts[inst.index()];
             if data.result.is_some_and(|res| is_derived_i64(&data.op, func.ty(res))) {
                 steps.push((inst, false));
@@ -200,7 +212,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg) -> Vec<TrackRoot> {
     while changed && rounds < 64 {
         changed = false;
         for &(inst, edges) in &steps {
-            changed |= if edges { track_edges(func, inst, &mut tracked) } else { track_def(func, inst, &mut tracked) };
+            changed |= if edges { track_edges(func, inst, &mut tracked) } else { track_def(func, inst, &mut tracked, affine) };
         }
         rounds += 1;
     }
@@ -267,7 +279,8 @@ pub(crate) fn compute_affine(func: &Function) -> Vec<(Value, i64)> {
 
 impl Provenance {
     fn build(func: &Function, cfg: &Cfg, is_spill: Option<&[bool]>, affine: Option<Vec<(Value, i64)>>) -> Self {
-        let tracked = compute_tracked_roots(func, cfg);
+        let affine = affine.unwrap_or_else(|| compute_affine(func));
+        let tracked = compute_tracked_roots(func, cfg, &affine);
         let mut prov = Self::from_roots(func, cfg, &tracked, affine);
         let esc = escape::classify_uses(func, cfg, &prov.slot_offsets, &tracked, is_spill);
         prov.unescaped_slots = esc.unescaped;
@@ -277,7 +290,7 @@ impl Provenance {
         prov
     }
 
-    fn from_roots(func: &Function, cfg: &Cfg, tracked: &[TrackRoot], affine: Option<Vec<(Value, i64)>>) -> Self {
+    fn from_roots(func: &Function, cfg: &Cfg, tracked: &[TrackRoot], affine: Vec<(Value, i64)>) -> Self {
         let slot_offsets = slot_addresses(func);
         let mut param_roots = vec![MemRoot::Unknown; func.types.len()];
         for (i, t) in tracked.iter().enumerate() {
@@ -298,13 +311,14 @@ impl Provenance {
                 ro_bytes[param.index()] = abi.deref_bytes;
             }
         }
-        let affine = affine.unwrap_or_else(|| compute_affine(func));
         Self { slot_offsets, param_roots, symbol_defs, ro_bytes, affine, ..Self::default() }
     }
 
     /// The address facts alone, for `loc` and `ro_bytes`: no escape classification and no loop spans.
     pub(crate) fn addresses(func: &Function, cfg: &Cfg) -> Self {
-        Self::from_roots(func, cfg, &compute_tracked_roots(func, cfg), None)
+        let affine = compute_affine(func);
+        let tracked = compute_tracked_roots(func, cfg, &affine);
+        Self::from_roots(func, cfg, &tracked, affine)
     }
 
     pub(crate) fn new(func: &Function, cfg: &Cfg) -> Self {
@@ -398,8 +412,10 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
         (MemRoot::Global(ga), MemRoot::Global(gb)) => ga == gb,
         (MemRoot::NoAliasParam(_), MemRoot::Slot(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_))
         | (MemRoot::Slot(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_), MemRoot::NoAliasParam(_))
-        | (MemRoot::UniqueHeap, MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_))
-        | (MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_), MemRoot::UniqueHeap) => false,
+        | (MemRoot::UniqueHeap(_), MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_))
+        | (MemRoot::Slot(_) | MemRoot::NoAliasParam(_) | MemRoot::Global(_) | MemRoot::ReadonlyParam(_), MemRoot::UniqueHeap(_)) => false,
+        (MemRoot::UniqueHeap(Some(owner)), _) if b.base == MemBase::Addr(owner) => false,
+        (_, MemRoot::UniqueHeap(Some(owner))) if a.base == MemBase::Addr(owner) => false,
         (MemRoot::NoAliasParam(p), MemRoot::Unknown) | (MemRoot::Unknown, MemRoot::NoAliasParam(p)) => !prov.noalias_unescaped(p),
         (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => !prov.slot_unescaped(s),
         _ => true,

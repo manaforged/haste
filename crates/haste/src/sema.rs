@@ -297,6 +297,12 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Whether `ty` is `core::ptr::Unique`, the owning pointer inside `Box` and `Vec`.
+    pub fn is_unique(&mut self, ty: ty::Ty) -> bool {
+        let ty::Kind::Adt(item, _) = *self.types.kind(ty) else { return false };
+        self.name(item) == "Unique" && self.qualified(item) == "core::ptr::unique::Unique"
+    }
+
     /// Whether a call of the closure type `ty` consumes the closure, because its body moves a captured value out.
     pub fn closure_consumes(&self, ty: ty::Ty) -> bool {
         self.store.closures.get(&ty).is_some_and(|info| info.closure.consumes)

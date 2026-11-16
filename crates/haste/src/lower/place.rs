@@ -45,6 +45,18 @@ impl Lower<'_, '_> {
         }
     }
 
+    /// Reads `place` of type `ty`; a sized `Unique` comes back in a fresh frame slot, its pointer marked as owning a heap allocation.
+    pub fn read_typed(&mut self, place: Place, ty: Ty) -> Option<Value> {
+        if !matches!(place.repr, Repr::Mem { size: 8, parts: Parts::One(Type::I64), .. }) || !self.cx.is_unique(ty) {
+            return self.read(place);
+        }
+        let pointer = self.read(place.at(0, Repr::Scalar(Type::I64)))?;
+        self.b.func.mark_unique_ptr(pointer);
+        let slot = self.slot(place.repr)?;
+        self.write(Place::slot(slot, Repr::Scalar(Type::I64)), pointer);
+        Some(self.address(Place::slot(slot, place.repr)))
+    }
+
     /// Stores `value` into `place`, copying the bytes of a memory value.
     pub fn write(&mut self, place: Place, value: Value) {
         match (place.repr, place.base) {
