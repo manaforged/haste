@@ -145,7 +145,7 @@ impl Lower<'_, '_> {
         match *self.body.expr(expr) {
             Expr::Tuple(list) => self.tuple(expr, list),
             Expr::Closure { .. } => self.closure(expr),
-            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner) => match self.const_rodata_expr(inner)? {
+            Expr::Ref { expr: inner, mutable: false, raw: false } if self.promotable(inner) => match self.materialize_const_expr(inner, (false, true))? {
                 Some(addr) => Ok(Some(addr)),
                 None => self.promoted(inner),
             },

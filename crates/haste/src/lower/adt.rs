@@ -258,7 +258,7 @@ impl Lower<'_, '_> {
     /// Lowers the struct literal `expr` with field initializers `fields`.
     pub fn struct_literal(&mut self, expr: ExprId, fields: List, base: Option<ExprId>) -> Result<Option<Value>> {
         if base.is_none()
-            && let Some(addr) = self.materialize_const_expr(expr, true)?
+            && let Some(addr) = self.materialize_const_expr(expr, (true, false))?
         {
             return Ok(Some(addr));
         }
@@ -289,7 +289,7 @@ impl Lower<'_, '_> {
 
     /// Lowers a call of the tuple constructor of variant `variant` with `args`.
     pub fn ctor_call(&mut self, expr: ExprId, variant: u32, args: List) -> Result<Option<Value>> {
-        if let Some(addr) = self.materialize_const_expr(expr, true)? {
+        if let Some(addr) = self.materialize_const_expr(expr, (true, false))? {
             return Ok(Some(addr));
         }
         let mut values = Vec::new();
@@ -303,16 +303,17 @@ impl Lower<'_, '_> {
 impl<'l, 'a> Lower<'l, 'a> {
     /// Materializes a pure scalar aggregate expression of at least 8 bytes into `.rodata` when immutable.
     pub(super) fn const_rodata_expr(&mut self, expr: ExprId) -> Result<Option<Value>> {
-        self.materialize_const_expr(expr, false)
+        self.materialize_const_expr(expr, (false, false))
     }
 
-    fn materialize_const_expr(&mut self, expr: ExprId, allow_slot: bool) -> Result<Option<Value>> {
+    /// Materializes the pure value `expr` into `.rodata` when immutable: an aggregate of at least 8 bytes, or also a scalar that a shared reference has `borrowed`, in generic code too.
+    pub(super) fn materialize_const_expr(&mut self, expr: ExprId, (allow_slot, borrowed): (bool, bool)) -> Result<Option<Value>> {
         let lent_mut = self.expr_lent_mutably(expr);
         if (!allow_slot && lent_mut) || !self.open {
             return Ok(None);
         }
         let ty = self.ty_of(expr);
-        let Some(size) = self.rodata_aggregate_size(ty)? else {
+        let Some(size) = self.rodata_size(ty, borrowed)? else {
             return Ok(None);
         };
         let in_generic = !self.cx.types.substs(self.reached.list[self.index].0.1).is_empty();
@@ -351,7 +352,7 @@ impl<'l, 'a> Lower<'l, 'a> {
             return Ok(None);
         }
         let ty = self.ty_of(expr);
-        let Some(size) = self.rodata_aggregate_size(ty)? else {
+        let Some(size) = self.rodata_size(ty, false)? else {
             return Ok(None);
         };
         let in_generic = !self.cx.types.substs(self.reached.list[self.index].0.1).is_empty();
@@ -366,18 +367,16 @@ impl<'l, 'a> Lower<'l, 'a> {
         Ok(Some(self.emit_const_rodata(&bytes)))
     }
 
-    fn rodata_aggregate_size(&mut self, ty: Ty) -> Result<Option<usize>> {
+    fn rodata_size(&mut self, ty: Ty, scalar: bool) -> Result<Option<usize>> {
         if ty == Ty::NONE || self.cx.types.has_params(ty) {
             return Ok(None);
         }
-        let Repr::Mem { size, align, .. } = repr(self.cx, ty)? else {
-            return Ok(None);
+        let (size, align) = match repr(self.cx, ty)? {
+            Repr::Mem { size, align, .. } if size >= 8 => (size as usize, align),
+            Repr::Scalar(machine) if scalar => (machine.bytes() as usize, 0),
+            _ => return Ok(None),
         };
-        let size = size as usize;
-        if size < 8 || align > 4 || size > CONST_RODATA_MAX_BYTES {
-            return Ok(None);
-        }
-        if !super::is_freeze_ty(self.cx, ty, 0) || needs_drop(self.cx, ty)? {
+        if align > 4 || size > CONST_RODATA_MAX_BYTES || !super::is_freeze_ty(self.cx, ty, 0) || needs_drop(self.cx, ty)? {
             return Ok(None);
         }
         Ok(Some(size))
