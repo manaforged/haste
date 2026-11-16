@@ -550,21 +550,20 @@ fn plan_has_calls(plan: &RelocPlan) -> bool {
 fn lower_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<Option<Lowered>> {
     let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
     Ok(quiet.lowered(slots, lowered)?.map(|(func, relocs, plan, cycle)| {
-        let leaf = !plan_has_calls(&plan);
-        (simplify_inline(func, limit, leaf), relocs, plan, cycle)
+        let limit = if plan_has_calls(&plan) { limit } else { super::budget::leaf_limit(cx, reached, index, limit) };
+        (simplify_inline(func, limit), relocs, plan, cycle)
     }))
 }
 
-fn simplify_inline(mut func: Function, limit: usize, leaf: bool) -> std::result::Result<(Arc<Function>, bool), Miss> {
-    let effective_limit = if leaf { super::budget::leaf_limit(limit) } else { limit };
-    if func.is_coroutine() || func.size() > effective_limit.saturating_mul(6).max(1600) {
+fn simplify_inline(mut func: Function, limit: usize) -> std::result::Result<(Arc<Function>, bool), Miss> {
+    if func.is_coroutine() || func.size() > limit.saturating_mul(6).max(1600) {
         return Err(Miss::Shape);
     }
     simplify_tallied(&mut func, Tally::Built);
     if !func.can_inline() {
         return Err(Miss::Shape);
     }
-    if func.inline_size() > effective_limit {
+    if func.inline_size() > limit {
         return Err(Miss::Over);
     }
     let returns = func.has_return();

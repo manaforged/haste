@@ -43,6 +43,8 @@ const CYCLE_BUDGET: usize = 12;
 
 const SOLE_INLINE_INSTS: usize = 1600;
 
+const SOLE_LEAF_INSTS: usize = 4096;
+
 const SOLE_OUTLINE: usize = 64;
 
 const FAST_PATH_MAX_EXPRS: usize = 32;
@@ -91,6 +93,10 @@ fn hint(cx: &Context<'_>, item: ItemRef) -> Hint {
 
 fn is_leaf_body(body: &crate::body::Body) -> bool {
     !body.exprs.iter().any(|expr| matches!(expr, Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } | Expr::Await(..) | Expr::Yield(..)))
+}
+
+fn is_sole_leaf(reached: &Reached, index: usize, body: &Body, hint: Hint) -> bool {
+    hint == Hint::Default && release() && reached.is_sole_called(index) && is_leaf_body(body)
 }
 
 fn is_cold_or_never(cx: &Context<'_>, reached: &Reached, item: ItemRef, substs: Substs) -> bool {
@@ -143,7 +149,7 @@ fn allowed_cold(cx: &Context<'_>, reached: &Reached, typed: &Typed, body: &Body,
     cold < cap && (lenient || cold < 2 || body.exprs.len() <= 80)
 }
 
-fn body_budget(cx: &Context<'_>, item: ItemRef, body: &Body, hint: Hint) -> Option<usize> {
+fn body_budget(cx: &Context<'_>, item: ItemRef, body: &Body, (hint, sole_leaf): (Hint, bool)) -> Option<usize> {
     let (budget, release) = (budget(), release());
     let env_release = cx.outline.crates[item.krate as usize].env.release;
     match hint {
@@ -155,7 +161,7 @@ fn body_budget(cx: &Context<'_>, item: ItemRef, body: &Body, hint: Hint) -> Opti
             (body.exprs.len() <= max_exprs).then_some(inst_limit)
         }
         Hint::Default => {
-            let max_exprs = if release && is_leaf_body(body) { budget.exprs * 2 } else { budget.exprs };
+            let max_exprs = if sole_leaf { SOLE_LEAF_INSTS } else if release && is_leaf_body(body) { budget.exprs * 2 } else { budget.exprs };
             (body.exprs.len() <= max_exprs).then_some(budget.insts)
         }
     }
@@ -181,7 +187,8 @@ pub(super) fn inline_limit(cx: &mut Context<'_>, reached: &Reached, index: usize
         return Some(budget().insts);
     }
     let body = cx.body(*item).ok()?;
-    allowed_cold(cx, reached, typed, &body, hint).then(|| body_budget(cx, *item, &body, hint)).flatten()
+    let sole_leaf = is_sole_leaf(reached, index, &body, hint);
+    allowed_cold(cx, reached, typed, &body, hint).then(|| body_budget(cx, *item, &body, (hint, sole_leaf))).flatten()
 }
 
 pub(super) fn cycle_limit(cx: &mut Context<'_>, reached: &Reached, index: usize) -> Option<usize> {
@@ -192,9 +199,17 @@ pub(super) fn cycle_limit(cx: &mut Context<'_>, reached: &Reached, index: usize)
     short.then_some(CYCLE_BUDGET)
 }
 
-/// The limit a leaf body of `limit` is measured against under the release profile: half as much again, up to the `#[inline]` budget.
-pub(super) fn leaf_limit(limit: usize) -> usize {
-    if release() { limit.saturating_add(limit / 2).min(budget().inline_insts).max(limit) } else { limit }
+/// The limit a call-free body of reached function `index` under `limit` is measured against under the release profile: `SOLE_LEAF_INSTS` for a loop-free default body with one call site, else half as much again up to the `#[inline]` budget.
+pub(super) fn leaf_limit(cx: &mut Context<'_>, reached: &Reached, index: usize, limit: usize) -> usize {
+    if !release() {
+        return limit;
+    }
+    let sole_leaf = limit == budget().insts
+        && body_item(reached, index).is_some_and(|item| {
+            let hint = hint(cx, item);
+            cx.body(item).is_ok_and(|body| is_sole_leaf(reached, index, &body, hint))
+        });
+    if sole_leaf { SOLE_LEAF_INSTS } else { limit.saturating_add(limit / 2).min(budget().inline_insts).max(limit) }
 }
 
 fn body_item(reached: &Reached, index: usize) -> Option<ItemRef> {
