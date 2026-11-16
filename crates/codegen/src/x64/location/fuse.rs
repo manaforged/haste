@@ -595,15 +595,10 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             continue;
         }
         let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
-        let Some(m) = ctx.match_sib(res, pos, false) else { continue };
-        if m.elide.is_empty() && !matches!(m.sib.base, SibBase::Frame(_)) {
-            continue;
-        }
-        if sib_ok(&ctx, &m, &[], pos) {
-            plan.sib[res.index()] = Some(m.sib);
-            for (v, _) in m.elide {
-                plan.elided[v.index()] = true;
-            }
+        let Some(m) = ctx.sib_matches(res, pos, false).find(|m| (!m.elide.is_empty() || matches!(m.sib.base, SibBase::Frame(_))) && sib_ok(&ctx, m, &[], pos)) else { continue };
+        plan.sib[res.index()] = Some(m.sib);
+        for (v, _) in m.elide {
+            plan.elided[v.index()] = true;
         }
     }
     apply_select_trees(func, plan, (&uses, &pos_of, &defs), &mut tst_end, &mut roots);

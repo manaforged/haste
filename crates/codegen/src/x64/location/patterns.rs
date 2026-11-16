@@ -653,7 +653,7 @@ impl FuseCtx<'_> {
         })
     }
 
-    pub(super) fn match_sib(&self, root: Value, root_pos: usize, multi_use: bool) -> Option<SibMatch> {
+    fn sib_sum(&self, root: Value, root_pos: usize) -> Option<(Vec<(Value, usize)>, usize, i64, Value, Value)> {
         if self.plan.elided[root.index()] || self.plan.is_static(root) || self.func.ty(root) != Type::I64 {
             return None;
         }
@@ -670,10 +670,21 @@ impl FuseCtx<'_> {
             elide.push((sum_node, sum_pos));
         }
         let Op::Binary(Binary::Iadd, left, right) = self.func.insts[sinst.index()].op else { return None };
-        [(left, right), (right, left)]
-            .into_iter()
-            .find_map(|pair| self.try_sib_pair(&elide, (sum_pos, outer_disp), pair, true, multi_use))
-            .or_else(|| [(left, right), (right, left)].into_iter().find_map(|pair| self.try_sib_pair(&elide, (sum_pos, outer_disp), pair, false, multi_use)))
+        Some((elide, sum_pos, outer_disp, left, right))
+    }
+
+    /// Each base-plus-index form of `root`, scaled-index forms first, in both operand orders.
+    pub(super) fn sib_matches(&self, root: Value, root_pos: usize, multi_use: bool) -> impl Iterator<Item = SibMatch> + '_ {
+        self.sib_sum(root, root_pos).into_iter().flat_map(move |(elide, sum_pos, outer_disp, left, right)| {
+            [true, false]
+                .into_iter()
+                .flat_map(move |scaled_only| [(left, right), (right, left)].into_iter().map(move |pair| (scaled_only, pair)))
+                .filter_map(move |(scaled_only, pair)| self.try_sib_pair(&elide, (sum_pos, outer_disp), pair, scaled_only, multi_use))
+        })
+    }
+
+    pub(super) fn match_sib(&self, root: Value, root_pos: usize, multi_use: bool) -> Option<SibMatch> {
+        self.sib_matches(root, root_pos, multi_use).next()
     }
 }
 
