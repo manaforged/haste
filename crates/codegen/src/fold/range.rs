@@ -1,5 +1,6 @@
 use super::{defs, extend, known_bits};
-use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
+use crate::cfg::Cfg;
+use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
 struct RangeState {
     defs: Vec<Option<Inst>>,
@@ -306,6 +307,10 @@ fn op_u_bounds(func: &Function, state: &RangeState, v: Value, depth: u8) -> (u64
     let Some(inst) = def_inst(state, v) else { return (0, w) };
     let sub = |u: Value| u_bounds(func, state, u, depth + 1);
     match func.insts[inst.index()].op {
+        Op::Unary(Unary::Bnot, a) if func.ty(a).is_small_int() => {
+            let (l, h) = sub(a);
+            (w - h.min(w), w - l.min(w))
+        }
         Op::Unary(Unary::Clz | Unary::Ctz | Unary::Popcnt, _) => (0, u64::from(ty.bits())),
         Op::Select(_, a, b) => {
             let ((l1, h1), (l2, h2)) = (sub(a), sub(b));
@@ -344,19 +349,244 @@ fn u_bounds(func: &Function, state: &RangeState, v: Value, depth: u8) -> (u64, u
     (bmin.max(omin), bmax.min(omax))
 }
 
+fn sext_candidate(func: &Function, inst: Inst) -> Option<(Value, Value, u64)> {
+    let data = &func.insts[inst.index()];
+    let (Op::Convert(Convert::Sextend, inner), Some(res)) = (&data.op, data.result) else {
+        return None;
+    };
+    let (in_ty, out_ty) = (func.ty(*inner), func.ty(res));
+    if !in_ty.is_small_int() || in_ty == Type::I64 || !out_ty.is_small_int() || out_ty.bits() <= in_ty.bits() {
+        return None;
+    }
+    Some((res, *inner, 1_u64 << (in_ty.bits() - 1)))
+}
+
 fn try_fold_sext_to_uext(func: &mut Function, inst: Inst, state: &RangeState) -> bool {
-    let Op::Convert(Convert::Sextend, inner) = func.insts[inst.index()].op else {
+    let Some((_, inner, sign_bit)) = sext_candidate(func, inst) else {
         return false;
     };
-    let in_ty = func.ty(inner);
-    if !in_ty.is_small_int() || in_ty == Type::I64 {
-        return false;
-    }
-    if u_bounds(func, state, inner, 0).1 > signed_max(in_ty) {
+    if u_bounds(func, state, inner, 0).1 >= sign_bit {
         return false;
     }
     func.insts[inst.index()].op = Op::Convert(Convert::Uextend, inner);
     true
+}
+
+#[derive(Clone, Copy)]
+struct UseSite {
+    block: Block,
+    pos: usize,
+    inst: Inst,
+    branch_target: Option<Block>,
+}
+
+struct GuardCtx {
+    cfg: Cfg,
+    def_blocks: Vec<Option<Block>>,
+    uses: Vec<Vec<UseSite>>,
+    has_traps: Vec<bool>,
+}
+
+impl GuardCtx {
+    fn new(func: &Function) -> Self {
+        let cfg = Cfg::new(func);
+        let def_blocks = func.def_blocks();
+        let mut uses = vec![Vec::new(); func.types.len()];
+        let mut has_traps = vec![false; func.blocks.len()];
+        for (b_idx, block_data) in func.blocks.iter().enumerate() {
+            if !cfg.reachable[b_idx] {
+                continue;
+            }
+            let block = Block(b_idx as u32);
+            for (pos, &inst) in block_data.insts.iter().enumerate() {
+                let op = &func.insts[inst.index()].op;
+                if matches!(op, Op::Trapz(_) | Op::Assume(_)) {
+                    has_traps[b_idx] = true;
+                }
+                record_uses(op, block, pos, inst, &mut uses);
+            }
+        }
+        Self { cfg, def_blocks, uses, has_traps }
+    }
+}
+
+fn record_uses(op: &Op, block: Block, pos: usize, inst: Inst, uses: &mut [Vec<UseSite>]) {
+    if let Op::Brif(cond, tb, ta, eb, ea) = op {
+        uses[cond.index()].push(UseSite { block, pos, inst, branch_target: None });
+        for v in ta {
+            uses[v.index()].push(UseSite { block, pos, inst, branch_target: Some(*tb) });
+        }
+        for v in ea {
+            uses[v.index()].push(UseSite { block, pos, inst, branch_target: Some(*eb) });
+        }
+        return;
+    }
+    op.for_operands(|v| uses[v.index()].push(UseSite { block, pos, inst, branch_target: None }));
+}
+
+fn guard_proves_cmp(cc: IntCC, c_u: u64, sign_bit: u64) -> bool {
+    match cc {
+        IntCC::UnsignedLessThan => c_u <= sign_bit,
+        IntCC::UnsignedLessThanOrEqual | IntCC::Equal => c_u < sign_bit,
+        _ => false,
+    }
+}
+
+fn cmp_operand_const(func: &Function, state: &RangeState, inst: Inst, res: Value) -> Option<(IntCC, u64)> {
+    let Op::Icmp(cc, l, r) = func.insts[inst.index()].op else {
+        return None;
+    };
+    let (cc, other) = if l == res {
+        (cc, r)
+    } else if r == res {
+        (crate::cse::flip_int_cc(cc), l)
+    } else {
+        return None;
+    };
+    if other == res {
+        return None;
+    }
+    let c = const_val(state, other)?;
+    Some((cc, extend(c, func.ty(res), false) as u64))
+}
+
+fn is_sign_inv_cmp(func: &Function, state: &RangeState, inst: Inst, res: Value, sign_bit: u64) -> bool {
+    cmp_operand_const(func, state, inst, res)
+        .is_some_and(|(cc, c_u)| guard_proves_cmp(cc, c_u, sign_bit) || guard_proves_cmp(cc.inverse(), c_u, sign_bit))
+}
+
+fn bool_xor_inner(func: &Function, state: &RangeState, a: Value, b: Value) -> Option<Value> {
+    [(a, b), (b, a)]
+        .into_iter()
+        .find_map(|(inner, one)| (const_val(state, one) == Some(1) && u_bounds(func, state, inner, 0).1 <= 1).then_some(inner))
+}
+
+fn guard_proves(func: &Function, state: &RangeState, (cond, taken, depth): (Value, bool, u8), res: Value, sign_bit: u64) -> bool {
+    if cond == res {
+        return !taken;
+    }
+    if depth >= 4 {
+        return false;
+    }
+    let Some(inst) = def_inst(state, cond) else {
+        return false;
+    };
+    match func.insts[inst.index()].op {
+        Op::Icmp(..) => cmp_operand_const(func, state, inst, res).is_some_and(|(cc, c_u)| {
+            let eff = if taken { cc } else { cc.inverse() };
+            guard_proves_cmp(eff, c_u, sign_bit)
+        }),
+        Op::Convert(Convert::Uextend, inner) if func.ty(inner).is_small_int() => {
+            guard_proves(func, state, (inner, taken, depth + 1), res, sign_bit)
+        }
+        Op::Binary(Binary::Bxor, a, b) => {
+            bool_xor_inner(func, state, a, b).is_some_and(|inner| guard_proves(func, state, (inner, !taken, depth + 1), res, sign_bit))
+        }
+        Op::Binary(Binary::Band, a, b) if taken => {
+            guard_proves(func, state, (a, true, depth + 1), res, sign_bit) || guard_proves(func, state, (b, true, depth + 1), res, sign_bit)
+        }
+        Op::Binary(Binary::Bor, a, b) if !taken => {
+            guard_proves(func, state, (a, false, depth + 1), res, sign_bit) || guard_proves(func, state, (b, false, depth + 1), res, sign_bit)
+        }
+        _ => false,
+    }
+}
+
+fn single_pred_guard(func: &Function, state: &RangeState, cfg: &Cfg, block: Block, (res, sign_bit): (Value, u64)) -> bool {
+    let Some(pred) = cfg.single_pred(block) else {
+        return false;
+    };
+    if pred == block || !cfg.reachable[pred.index()] {
+        return false;
+    }
+    let Some(&term) = func.blocks[pred.index()].insts.last() else {
+        return false;
+    };
+    let Op::Brif(cond, tb, _, eb, _) = func.insts[term.index()].op else {
+        return false;
+    };
+    tb != eb && guard_proves(func, state, (cond, block == tb, 0), res, sign_bit)
+}
+
+fn block_has_trap_guard(func: &Function, state: &RangeState, ctx: &GuardCtx, (block, limit): (Block, usize), (res, sign_bit): (Value, u64)) -> bool {
+    if !ctx.has_traps[block.index()] {
+        return false;
+    }
+    func.blocks[block.index()].insts[..limit].iter().any(|&inst| {
+        matches!(func.insts[inst.index()].op, Op::Trapz(cond) | Op::Assume(cond) if guard_proves(func, state, (cond, true, 0), res, sign_bit))
+    })
+}
+
+fn brif_edge_guarded(func: &Function, state: &RangeState, site: UseSite, (res, sign_bit): (Value, u64)) -> bool {
+    let Some(edge_dest) = site.branch_target else {
+        return false;
+    };
+    let Op::Brif(cond, tb, _, eb, _) = func.insts[site.inst.index()].op else {
+        return false;
+    };
+    tb != eb && guard_proves(func, state, (cond, edge_dest == tb, 0), res, sign_bit)
+}
+
+fn is_guarded_use(func: &Function, state: &RangeState, ctx: &GuardCtx, site: UseSite, (def_block, target): (Block, (Value, u64))) -> bool {
+    if brif_edge_guarded(func, state, site, target)
+        || block_has_trap_guard(func, state, ctx, (site.block, site.pos), target)
+        || (site.block != def_block && single_pred_guard(func, state, &ctx.cfg, site.block, target))
+    {
+        return true;
+    }
+    let mut anc = site.block;
+    while anc != def_block {
+        let Some(parent) = ctx.cfg.idom[anc.index()] else {
+            return false;
+        };
+        if parent == anc {
+            return false;
+        }
+        anc = parent;
+        if anc != def_block && single_pred_guard(func, state, &ctx.cfg, anc, target) {
+            return true;
+        }
+        let len = func.blocks[anc.index()].insts.len();
+        if block_has_trap_guard(func, state, ctx, (anc, len), target) {
+            return true;
+        }
+    }
+    false
+}
+
+fn can_narrow_guarded(func: &Function, state: &RangeState, ctx: &GuardCtx, (res, sign_bit): (Value, u64)) -> bool {
+    let Some(def_block) = ctx.def_blocks[res.index()] else {
+        return false;
+    };
+    ctx.uses[res.index()]
+        .iter()
+        .all(|&site| is_sign_inv_cmp(func, state, site.inst, res, sign_bit) || is_guarded_use(func, state, ctx, site, (def_block, (res, sign_bit))))
+}
+
+fn fold_guarded_sext(func: &mut Function, state: &mut RangeState) -> bool {
+    let has_sext = func.blocks.iter().flat_map(|b| &b.insts).any(|&inst| sext_candidate(func, inst).is_some());
+    if !has_sext {
+        return false;
+    }
+    state.defs = defs(func);
+    let ctx = GuardCtx::new(func);
+    let mut changed = false;
+    for b_idx in 0..func.blocks.len() {
+        if !ctx.cfg.reachable[b_idx] {
+            continue;
+        }
+        for pos in 0..func.blocks[b_idx].insts.len() {
+            let inst = func.blocks[b_idx].insts[pos];
+            let Some((res, inner, sign_bit)) = sext_candidate(func, inst) else {
+                continue;
+            };
+            if can_narrow_guarded(func, state, &ctx, (res, sign_bit)) {
+                func.insts[inst.index()].op = Op::Convert(Convert::Uextend, inner);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn has_candidate(func: &Function) -> bool {
@@ -435,5 +665,6 @@ pub(super) fn fold_range_checks(func: &mut Function) -> bool {
         }
         func.blocks[b_idx].insts = next;
     }
+    changed |= fold_guarded_sext(func, &mut state);
     changed
 }
