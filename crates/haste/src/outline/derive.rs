@@ -41,6 +41,9 @@ const DERIVES: [(&str, Derive, &str); 9] = [
     ("Default", Derive::Default, "default::Default"),
 ];
 
+/// The path under the core crate of the marker that `#[derive(Clone, Copy)]` also implements on a type without type parameters, so that the standard library's specializations copy its values as bytes.
+const TRIVIAL_CLONE: &str = "clone::TrivialClone";
+
 /// The derives that the attributes `attrs` in `src` ask for, through every `cfg_attr` whose predicate `holds`: the builtin ones, and the paths from first to last token of the others.
 pub fn derives(src: &Source, attrs: &[Attr], holds: &dyn Fn(&Cfg) -> bool, into: &mut (Vec<Derive>, Vec<(u32, u32)>)) {
     for attr in attrs {
@@ -84,11 +87,16 @@ pub fn expand(src: &Source, item: &Item, (wanted, holder): (&[Derive], u32), env
     let union = item.kind == ItemKind::Union;
     let mut writer = Writer { src, name: src.text(name).to_owned(), is_enum: item.kind == ItemKind::Enum, repr: repr(src, &item.attrs, env), def, holder, out: Tokens::default() };
     for &derive in wanted {
-        writer.header(derive);
+        writer.header(DERIVES.iter().find(|(_, each, _)| *each == derive).map_or("", |(.., path)| path));
         let body = writer.method(derive, simple || union)?;
         writer.text("{");
         writer.text(&body);
         writer.text("}");
+    }
+    if simple && wanted.contains(&Derive::Clone) {
+        writer.text("unsafe");
+        writer.header(TRIVIAL_CLONE);
+        writer.text("{}");
     }
     writer.out.finish(src.path.clone())
 }
@@ -123,8 +131,7 @@ impl Writer<'_> {
         self.out.space();
     }
 
-    fn header(&mut self, derive: Derive) {
-        let path = DERIVES.iter().find(|(_, each, _)| *each == derive).map_or("", |(.., path)| path);
+    fn header(&mut self, path: &str) {
         let params = self.def.generics.params.clone();
         self.text("impl <");
         params.iter().for_each(|param| {
