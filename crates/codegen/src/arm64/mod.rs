@@ -455,6 +455,14 @@ impl Emit<'_> {
         if self.plan.elided[condition.index()]
             && let Some(inst) = self.defs[condition.index()]
         {
+            if let Op::Icmp(cc, lhs, rhs) = self.func.insts[inst.index()].op
+                && !matches!(self.flags, Some((v, _)) if v == condition)
+                && let Some((val, bit, set)) = fuse::sign_bit_test(self.func, &self.plan, (cc, lhs, rhs), &|v: Value| self.defs[v.index()])
+            {
+                let reg = self.bits(val, A);
+                self.asm.tbz(set ^ invert, reg, bit, label);
+                return;
+            }
             let band_branch = match self.func.insts[inst.index()].op {
                 Op::Binary(Binary::Band, x, y) => Some((x, y, !invert)),
                 Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), lhs, rhs) => {

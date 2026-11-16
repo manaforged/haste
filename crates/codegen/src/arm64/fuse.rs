@@ -4,6 +4,7 @@ mod ccmp;
 mod flag;
 mod mem;
 mod shift;
+mod sign;
 
 use super::asm::{Alu, ExtOp, Reg, Shift};
 use crate::alloc::{Location, Plan};
@@ -13,6 +14,7 @@ pub(super) use bits::{Bfx, bfx_parts, conv_bfx_parts, extr_parts, single_bit_mas
 use flag::{fuse_fits, fuse_icmp_flags, fuse_icmp_selects, try_fuse_flag_operand, try_fuse_icmp_select};
 pub(super) use mem::{encode_neon_movi, madd_parts};
 use mem::try_fuse_vec_op;
+pub(super) use sign::sign_bit_test;
 
 pub(super) fn def_entry(pos_of: &[Option<(usize, usize, Inst)>], val: Value) -> Option<(usize, usize, Inst)> {
     pos_of.get(val.index()).and_then(|&entry| entry)
