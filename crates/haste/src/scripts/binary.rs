@@ -49,8 +49,28 @@ impl Binaries {
         if executable.is_file() { Kept::Executable(executable) } else { Kept::Failed }
     }
 
+    /// Compiles the scripts `scripts`, each a unit and the crate of its `main`, ahead of time into the store in a detached process that outlives this one, so no run waits on the compile; the keeper lets go of this process's unit locks `locks`.
+    pub(super) fn keep_detached(&self, workspace: &Workspace, compilation: &mut Compilation, scripts: &[(usize, usize)], locks: &mut HashMap<usize, store::Lock>) -> anyhow::Result<()> {
+        if scripts.is_empty() {
+            return Ok(());
+        }
+        let child = crate::image::fork_child(|| {
+            locks.clear();
+            let keeper = crate::image::fork_child(|| {
+                detach();
+                let kept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scripts.iter().filter(|&&(unit, krate)| self.keep(workspace, compilation, unit, krate).is_err()).count()));
+                i32::from(!matches!(kept, Ok(0)))
+            });
+            i32::from(keeper.is_err())
+        })?;
+        match crate::image::wait(child) {
+            0 => Ok(()),
+            status => anyhow::bail!("the keeper did not start: status {status}"),
+        }
+    }
+
     /// Compiles the script of `unit`, whose `main` is in crate `krate`, ahead of time into the store under its key, or marks that it does not compile, holding the unit's lock.
-    pub(super) fn keep(&self, workspace: &Workspace, compilation: &mut Compilation, unit: usize, krate: usize) -> std::io::Result<()> {
+    fn keep(&self, workspace: &Workspace, compilation: &mut Compilation, unit: usize, krate: usize) -> std::io::Result<()> {
         let Some(&key) = self.keys.get(&unit) else { return Ok(()) };
         let _lock = store::lock(workspace, unit)?;
         let dir = store::dir(workspace, unit);
@@ -64,6 +84,38 @@ impl Binaries {
             Err(_) => store::remove(&staged)?,
         }
         store::write_new(&dir.join(KEY), key_text(key))
+    }
+}
+
+/// Detaches this forked keeper from the session and from every pipe and socket it shares with its parent, so neither a terminal signal nor a reader waiting for end of file ties the two together.
+fn detach() {
+    let shared: Vec<i32> = std::fs::read_dir("/dev/fd").map(|dir| dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok()).collect()).unwrap_or_default();
+    for fd in shared.into_iter().filter(|&fd| fd > 2) {
+        // SAFETY: fstat writes only into the zeroed local `stat`; a descriptor that is not open fails without effect.
+        let mode = unsafe {
+            let mut stat = std::mem::zeroed::<libc::stat>();
+            if libc::fstat(fd, &mut stat) != 0 {
+                continue;
+            }
+            stat.st_mode & libc::S_IFMT
+        };
+        if mode == libc::S_IFIFO || mode == libc::S_IFSOCK {
+            // SAFETY: fd is a pipe or socket this keeper inherited and never uses; closing it drops only this process's reference.
+            unsafe { libc::close(fd) };
+        }
+    }
+    // SAFETY: setsid, open and dup2 take only the static NUL-terminated path and descriptors of this process; 0, 1 and 2 then point at /dev/null.
+    unsafe {
+        libc::setsid();
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if null >= 0 {
+            for fd in 0..3 {
+                libc::dup2(null, fd);
+            }
+            if null > 2 {
+                libc::close(null);
+            }
+        }
     }
 }
 

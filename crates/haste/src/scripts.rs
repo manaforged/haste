@@ -315,7 +315,7 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
         targets,
         owners,
         dag,
-        locks,
+        locks: &mut *locks,
         entries: entries_map,
         ready,
         waiting,
@@ -330,13 +330,9 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
     };
     image::serve(&mut compilation, &crate::macros::load, &mut demand, &mut driver)?;
     let Runs { outcome, reran, .. } = driver;
-    for &(unit, krate) in &scripts {
-        if reran.contains(&unit)
-            && outcome.iter().any(|(at, result)| *at == unit && result.is_ok())
-            && let Err(error) = binaries.keep(workspace, &mut compilation, unit, krate)
-        {
-            eprintln!("cannot keep the executable of {}'s build script: {error}", package_name(workspace, unit));
-        }
+    let rerun: Vec<(usize, usize)> = scripts.into_iter().filter(|(unit, _)| reran.contains(unit) && outcome.iter().any(|(at, result)| at == unit && result.is_ok())).collect();
+    if let Err(error) = binaries.keep_detached(workspace, &mut compilation, &rerun, locks) {
+        eprintln!("cannot keep the executables of build scripts: {error}");
     }
     Ok(outcome)
 }
