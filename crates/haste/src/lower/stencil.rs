@@ -308,7 +308,7 @@ fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slot
 }
 
 fn limit_flags(cx: &mut Context<'_>, reached: &Reached, (bodies, inline): (&Bodies, &Inline), index: usize, limit: usize) -> Option<(usize, bool, bool)> {
-    let cap = if bodies.is_cyclic(cx, reached, index) {
+    let cap = if !reached.is_sole_called(index) && bodies.is_cyclic(cx, reached, index) {
         let host = inline.stack.last().copied().filter(|&host| host >= index);
         if host.is_some_and(|host| bodies.is_cyclic(cx, reached, host)) {
             return None;
