@@ -220,11 +220,11 @@ impl Infer<'_, '_> {
 
     pub(super) fn header_bounds(&mut self, (param, ty): (&str, Ty), keep: &mut dyn FnMut(&mut Self, ItemRef) -> Result<bool>, first: bool) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let mut found = Vec::new();
-        for (header, src) in self.headers()? {
+        for (header, src, home) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
-            let done = self.in_source(src, |infer| {
+            let done = self.in_source_home(src, home, |infer| {
                 for bound in named_bounds(arena, src, (generics, predicates), param) {
-                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else {
+                    let Some((of, path)) = infer.bound_trait_at(arena, bound, home) else {
                         continue;
                     };
                     if keep(infer, of)? {
@@ -246,11 +246,11 @@ impl Infer<'_, '_> {
     /// The trait bounds that the where-clauses of the frame's headers put on types other than one parameter, such as `<I::Item as Edge>::Id: Into<Ix>`, each with `Self` first.
     pub(super) fn type_bounds(&mut self) -> Result<Vec<(ItemRef, Vec<Ty>)>> {
         let mut found = Vec::new();
-        for (header, src) in self.headers()? {
+        for (header, src, home) in self.headers()? {
             let (arena, _, predicates) = header.parts();
-            self.in_source(src, |infer| {
+            self.in_source_home(src, home, |infer| {
                 for (ty, bound) in infer.typed_predicates(arena, src, predicates) {
-                    let Some((of, path)) = infer.bound_trait_at(arena, bound, infer.home) else {
+                    let Some((of, path)) = infer.bound_trait_at(arena, bound, home) else {
                         continue;
                     };
                     found.push((of, std::iter::once(ty).chain(infer.bound_args(of, arena, path, ty)?).collect()));

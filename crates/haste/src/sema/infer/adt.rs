@@ -263,16 +263,46 @@ impl<'a> Infer<'_, 'a> {
         if self.poly.is_some() && self.has_params(current) {
             return self.poly_offset_of(expr, current, fields);
         }
-        let mut offset = 0;
-        for &at in self.body.list(fields) {
-            for name in self.src.text(at).split('.').map(plain) {
-                let (index, field) = self.field_at(current, name)?;
-                offset += crate::sema::layout::field_offset(&*self.cx.layout(current)?, 0, index) as u64;
-                current = field;
-            }
+        let segments: Vec<&'a str> = self.body.list(fields).iter().flat_map(|&at| self.src.text(at).split('.').map(plain)).collect();
+        let (mut offset, mut at) = (0u64, 0usize);
+        while at < segments.len() {
+            let (used, step, field) = self.offset_step(current, &segments, at)?;
+            offset += step as u64;
+            current = field;
+            at += used;
         }
         self.out.offsets.insert(expr, offset);
         Ok(self.cx.types.prim(crate::names::Primitive::Usize))
+    }
+
+    fn offset_step(&mut self, current: Ty, segments: &[&str], at: usize) -> Result<(usize, i32, Ty)> {
+        let resolved = self.resolve(current);
+        if let Kind::Adt(item, args) = *self.cx.types.kind(resolved)
+            && self.cx.item(item).1.kind == ItemKind::Enum
+        {
+            let variant_name = segments[at];
+            let Some(&field_name) = segments.get(at + 1) else {
+                bail!("offset_of on enum {} needs a field after variant `{variant_name}`", self.cx.name(item));
+            };
+            let (variant, index, field) = self.enum_field_at(item, args, variant_name, field_name)?;
+            let step = crate::sema::layout::field_offset(&*self.cx.layout(current)?, variant, index);
+            return Ok((2, step, field));
+        }
+        let (index, field) = self.field_at(current, segments[at])?;
+        let step = crate::sema::layout::field_offset(&*self.cx.layout(current)?, 0, index);
+        Ok((1, step, field))
+    }
+
+    fn enum_field_at(&mut self, item: ItemRef, args: Substs, variant_name: &str, field_name: &str) -> Result<(u32, u32, Ty)> {
+        let Some(variant) = self.variant_named(item, variant_name)? else {
+            bail!("no variant `{variant_name}` on {}", self.cx.name(item));
+        };
+        let Some(index) = self.field_index(item, variant, field_name)? else {
+            bail!("no field `{field_name}` on {}::{variant_name}", self.cx.name(item));
+        };
+        let slice = self.cx.types.substs(args).to_vec();
+        let field = self.adt_fields(item, &slice)?[variant as usize][index as usize];
+        Ok((variant, index, field))
     }
 
     pub(super) fn field_at(&mut self, ty: Ty, name: &str) -> Result<(u32, Ty)> {
@@ -302,7 +332,11 @@ impl<'a> Infer<'_, 'a> {
         let Some(index) = self.field_index(item, 0, name)? else { bail!("no field `{name}` on {}", self.cx.name(item)) };
         self.out.fields.insert(expr, index);
         let slice = self.cx.types.substs(args).to_vec();
-        Ok(self.adt_fields(item, &slice)?[0][index as usize])
+        let field = self.adt_fields(item, &slice)?[0][index as usize];
+        if !self.has_vars(ty) && !self.has_params(ty) {
+            self.cx.layout(ty).ok();
+        }
+        Ok(field)
     }
 }
 

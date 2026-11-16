@@ -649,6 +649,23 @@ pub fn case_reg_try_diverging_err(seed: i64) -> i64 {
 }
 
 #[inline(never)]
+fn run_try_tuple_intvar(x: i64) -> Result<i64, (u8, usize)> {
+    let v = (x >= 0).then_some(x * 3 + 1).ok_or((0, 0))?;
+    Ok(v)
+}
+
+pub fn case_reg_try_tuple_intvar_err(seed: i64) -> i64 {
+    let mut acc = 0_i64;
+    for k in -4..4 {
+        match run_try_tuple_intvar(black_box(seed + k)) {
+            Ok(v) => acc += v,
+            Err((a, b)) => acc -= (a as i64) + (b as i64) + 10,
+        }
+    }
+    acc
+}
+
+#[inline(never)]
 fn ishl_range_overflow(c: bool, y: u64) -> i64 {
     let x = if c { 1_u64 << 63 } else { y & 0x7FFF_FFFF };
     ((x << 1) as i32) as i64
@@ -729,6 +746,7 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_reg_arm64_signed_load_icmp", case_reg_arm64_signed_load_icmp),
     ("case_reg_autoderef_borrow_var", case_reg_autoderef_borrow_var),
     ("case_reg_try_diverging_err", case_reg_try_diverging_err),
+    ("case_reg_try_tuple_intvar_err", case_reg_try_tuple_intvar_err),
     ("case_reg_ishl_range_overflow", case_reg_ishl_range_overflow),
     ("case_reg_noalias_call_stash", case_reg_noalias_call_stash),
 ];

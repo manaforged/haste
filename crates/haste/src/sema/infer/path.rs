@@ -473,10 +473,11 @@ impl<'a> Infer<'_, 'a> {
             return Ok(None);
         }
         let alias = self.cx.alias_def(member)?;
+        let home = self.cx.module_of(member)?;
         let src = &self.cx.file(member).source;
         let outer = self.generics.len();
         self.generics.extend(alias.params.iter().map(|param| src.text(param.name)).zip(own.iter().copied()));
-        let found = self.in_source(src, |infer| infer.lower_ty(&alias.arena, alias.ty));
+        let found = self.in_source_home(src, home, |infer| infer.lower_ty(&alias.arena, alias.ty));
         self.generics.truncate(outer);
         found.map(Some)
     }

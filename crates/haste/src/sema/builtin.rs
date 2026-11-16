@@ -125,6 +125,7 @@ const SYSCALL_CLOBBERS: [&str; 2] = ["rcx", "r11"];
 #[derive(Clone, Copy)]
 enum Instruction<'a> {
     Barrier,
+    Fence,
     Syscall,
     LockNot(u32),
     Divide(u32),
@@ -136,6 +137,7 @@ pub fn asm(src: &Source, templates: &[String], operands: &[(u32, u32)], out: &mu
     let text = templates.iter().map(|template| strip_comments(template)).collect::<Vec<_>>().join("\n");
     match instruction(&text) {
         Some(Instruction::Barrier) => asm_barrier(src, operands, out),
+        Some(Instruction::Fence) => asm_fence(src, operands, out),
         Some(Instruction::Syscall) => asm_syscall(src, operands, out),
         Some(Instruction::LockNot(bits)) => asm_lock_not(src, operands, bits, out),
         Some(Instruction::Divide(bits)) => asm_divide(src, operands, bits, out),
@@ -150,6 +152,7 @@ fn instruction(text: &str) -> Option<Instruction<'_>> {
     let placeholder = |word: &str| word.starts_with('{') && word.ends_with('}');
     match words.as_slice() {
         all if all.iter().all(|word| placeholder(word)) => Some(Instruction::Barrier),
+        ["dsb", "sy", "isb"] | ["dmb" | "dsb", _] | ["isb"] => Some(Instruction::Fence),
         ["syscall"] => Some(Instruction::Syscall),
         ["lock", "not", width, "ptr", "[{0}]"] => Some(Instruction::LockNot(memory_bits(width)?)),
         ["div", "{0:r}"] => Some(Instruction::Divide(64)),
@@ -197,6 +200,17 @@ fn asm_barrier(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()
         }
     }
     out.lexed("()");
+    Ok(())
+}
+
+/// The expansion of a memory or instruction fence `asm!` with zero value operands: a sequentially consistent atomic fence.
+fn asm_fence(src: &Source, args: &[(u32, u32)], out: &mut Tokens) -> Result<()> {
+    for &(from, to) in args {
+        if src.text(from) != "options" {
+            bail!("inline assembly operand `{}` is not supported", src.spelled((from, to)));
+        }
+    }
+    out.lexed("::core::sync::atomic::fence(::core::sync::atomic::Ordering::SeqCst)");
     Ok(())
 }
 

@@ -139,14 +139,27 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
+    fn settle_projection_loop(&mut self) -> Result<()> {
+        for _ in 0..crate::RECURSION_LIMIT {
+            let before = (self.projections.len(), self.obligations.len(), self.bound_vars());
+            self.settle_projections()?;
+            self.settle_obligations()?;
+            let stalled = self.projections.len() >= before.0
+                && self.obligations.len() >= before.1
+                && self.bound_vars() == before.2;
+            if self.obligations.is_empty() || stalled {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn settle_initial_passes(&mut self) -> Result<()> {
-        self.settle_projections()?;
-        self.settle_obligations()?;
-        self.settle_projections()?;
+        self.settle_projection_loop()?;
         self.settle_opaques(true)?;
         self.settle_awaits()?;
         self.settle_operators(false)?;
-        self.settle_obligations()?;
+        self.settle_projection_loop()?;
         self.settle_casts(false)
     }
 
@@ -175,22 +188,13 @@ impl Infer<'_, '_> {
     }
 
     fn settle_final_passes(&mut self) -> Result<()> {
-        self.fall_back_numbers()?;
         self.fall_back_residuals()?;
+        self.settle_projection_loop()?;
+        self.fall_back_numbers()?;
         self.fall_back_diverging()?;
         self.settle_obligations()?;
         self.settle_operators(true)?;
-        for _ in 0..crate::RECURSION_LIMIT {
-            let before = (self.projections.len(), self.obligations.len(), self.bound_vars());
-            self.settle_projections()?;
-            self.settle_obligations()?;
-            let stalled = self.projections.len() >= before.0
-                && self.obligations.len() >= before.1
-                && self.bound_vars() == before.2;
-            if self.obligations.is_empty() || stalled {
-                break;
-            }
-        }
+        self.settle_projection_loop()?;
         self.settle_casts(true)?;
         self.settle_captures()
     }

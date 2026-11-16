@@ -192,7 +192,7 @@ pub(super) fn try_cached_instantiate(
                 resolve_proj_substs(cx, &args, &mut projs, ob_args, 0)?;
             }
         }
-        for &ty in summary.layout_tys.iter().chain(&summary.drop_tys).chain(summary.ret.as_slice()) {
+        for &ty in summary.layout_tys.iter().chain(&summary.drop_tys).chain(summary.ret.iter()) {
             resolve_proj_ty(cx, &args, &mut projs, ty, 0)?;
         }
     } else {

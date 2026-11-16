@@ -222,11 +222,11 @@ impl<'a> Infer<'_, 'a> {
     }
 
     /// The callable trait and function pointer type that a callable bound on the outer parameter `name` spells in a header of the frame.
-    pub(super) fn header_callable_bound(&mut self, name: &str, home: ModRef) -> Result<Option<(ItemRef, Ty)>> {
-        for (header, src) in self.headers()? {
+    pub(super) fn header_callable_bound(&mut self, name: &str, _home: ModRef) -> Result<Option<(ItemRef, Ty)>> {
+        for (header, src, home) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
             for bound in super::scope::named_bounds(arena, src, (generics, predicates), name) {
-                if let Some(hint) = self.in_source(src, |infer| infer.callable_bound(arena, home, bound))? {
+                if let Some(hint) = self.in_source_home(src, home, |infer| infer.callable_bound(arena, home, bound))? {
                     return Ok(Some(hint));
                 }
             }

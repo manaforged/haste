@@ -324,7 +324,7 @@ impl Infer<'_, '_> {
             while at < self.operands.len() {
                 let (expr, op, operands, out) = self.operands[at];
                 let compound = matches!(self.body.expr(expr), Expr::AssignOp(..));
-                if if compound { self.unknown_left(operands.0) } else { self.pending(op, operands)? } {
+                if if compound { self.unknown_operand(operands.0) } else { self.pending(op, operands)? } {
                     at += 1;
                     continue;
                 }
@@ -347,15 +347,15 @@ impl Infer<'_, '_> {
         }
     }
 
-    /// Whether operator `op` on `left` and `right` must wait to pick its impl: the left operand is a variable or a reference to one, or several impls fit only because an operand is an untyped number.
     fn pending(&mut self, op: BinOp, (left, right): (Ty, Ty)) -> Result<bool> {
-        if self.unknown_left(left) {
+        if self.unknown_operand(left) {
             return Ok(true);
         }
-        let left_num_var = matches!(self.cx.types.kind(self.resolve(left)), Kind::IntVar(_) | Kind::FloatVar(_));
+        let left_num_var = self.is_num_var(left);
+        let right_num_var = self.is_num_var(right);
+        let right_unknown = !self.builtin_left(op, left) && self.unknown_operand(right);
         let right_adt_or_ref = matches!(self.cx.types.kind(self.resolve(right)), Kind::Ref(..) | Kind::Adt(..));
-        let right_num_var = matches!(self.cx.types.kind(self.resolve(right)), Kind::IntVar(_) | Kind::FloatVar(_));
-        if (self.builtin_left(op, left) && !right_adt_or_ref) || (!left_num_var && !right_num_var) {
+        if (self.builtin_left(op, left) && !right_adt_or_ref) || (!left_num_var && !right_num_var && !right_unknown) {
             return Ok(false);
         }
         let Some((lang, _)) = operator_trait(op) else { return Ok(false) };
@@ -363,11 +363,18 @@ impl Infer<'_, '_> {
         Ok(!self.probe(|infer| infer.select_or_assume(of, left, &[right]).unwrap_or(false)))
     }
 
-    /// Whether the left operand `left` is a variable or a reference to one, so no operator impl can be picked for it yet.
-    fn unknown_left(&self, left: Ty) -> bool {
-        match self.cx.types.kind(self.resolve(left)) {
+    fn unknown_operand(&self, ty: Ty) -> bool {
+        match self.cx.types.kind(self.resolve(ty)) {
             Kind::Var(_) => true,
-            Kind::Ref(_, inner) => matches!(self.cx.types.kind(self.resolve(*inner)), Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)),
+            Kind::Ref(_, inner) => self.unknown_operand(*inner) || self.is_num_var(*inner),
+            _ => false,
+        }
+    }
+
+    fn is_num_var(&self, ty: Ty) -> bool {
+        match self.cx.types.kind(self.resolve(ty)) {
+            Kind::IntVar(_) | Kind::FloatVar(_) => true,
+            Kind::Ref(_, inner) => self.is_num_var(*inner),
             _ => false,
         }
     }

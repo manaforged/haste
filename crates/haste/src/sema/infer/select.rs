@@ -757,11 +757,10 @@ impl<'a> Infer<'_, 'a> {
         {
             direct.push(of);
         }
-        let home = self.home;
-        for (header, src) in self.headers()? {
+        for (header, src, home) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
             let bounds: Vec<u32> = type_params(generics).flat_map(|g| arena.list(g.bounds).iter().copied()).chain(predicates.iter().flat_map(|p| arena.list(p.bounds).iter().copied())).collect();
-            let found = self.in_source(src, |inner| Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>()))?;
+            let found = self.in_source_home(src, home, |inner| Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>()))?;
             direct.extend(found);
         }
         self.implied_traits(direct)

@@ -154,6 +154,13 @@ fn zonk_offset_holes(infer: &mut Infer<'_, '_>, raw: Vec<ConstHole>) -> Vec<Cons
         .collect()
 }
 
+fn peel_pointer_aggregate(types: &Types, mut ty: Ty) -> Option<Ty> {
+    while let Kind::Ref(_, next) | Kind::Ptr(_, next) = *types.kind(ty) {
+        ty = next;
+    }
+    matches!(types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..)).then_some(ty)
+}
+
 fn collect_layouts_and_consts(
     cx: &Context<'_>,
     typed: &Typed,
@@ -164,6 +171,13 @@ fn collect_layouts_and_consts(
     let mut push_layout = |ty: Ty| {
         if ty != Ty::NONE && cx.types.has_params(ty) && layout_seen.insert(ty) {
             layout_tys.push(ty);
+        }
+        if ty != Ty::NONE
+            && let Some(inner) = peel_pointer_aggregate(&cx.types, ty)
+            && cx.types.has_params(inner)
+            && layout_seen.insert(inner)
+        {
+            layout_tys.push(inner);
         }
     };
     for hole in const_holes.iter() {
@@ -290,10 +304,9 @@ impl Infer<'_, '_> {
     fn collect_header_env(&mut self) -> Result<()> {
         let params = self.generics.clone();
         let self_ty = self.self_ty;
-        for (header, src) in self.headers()? {
+        for (header, src, home) in self.headers()? {
             let (arena, generics, predicates) = header.parts();
-            self.in_source(src, |infer| {
-                let home = infer.home;
+            self.in_source_home(src, home, |infer| {
                 for &(name, ty) in &params {
                     for bound in named_bounds(arena, src, (generics, predicates), name) {
                         infer.note_maybe_unsized(arena, home, bound, ty);
@@ -751,11 +764,7 @@ impl Infer<'_, '_> {
         let mut steps = Vec::new();
         for &at in self.body.list(fields) {
             for name in self.src.text(at).split('.').map(plain) {
-                if matches!(self.cx.types.kind(self.resolve(current)), Kind::Param(_) | Kind::Proj(_)) {
-                    self.poly_fallback();
-                    bail!("offset_of on open parameter");
-                }
-                let (index, field) = self.field_at(current, name)?;
+                let (index, field) = self.poly_offset_step(current, name)?;
                 steps.push((current, index));
                 current = field;
             }
@@ -764,5 +773,20 @@ impl Infer<'_, '_> {
             poly.offset_holes.push(ConstHole::OffsetOf { expr, steps: steps.into_boxed_slice() });
         }
         Ok(self.cx.types.prim(Primitive::Usize))
+    }
+
+    fn poly_offset_step(&mut self, current: Ty, name: &str) -> Result<(u32, Ty)> {
+        let kind = self.cx.types.kind(self.resolve(current)).clone();
+        if matches!(kind, Kind::Param(_) | Kind::Proj(_)) {
+            self.poly_fallback();
+            bail!("offset_of on open parameter");
+        }
+        if let Kind::Adt(item, _) = kind
+            && self.cx.item(item).1.kind == ItemKind::Enum
+        {
+            self.poly_fallback();
+            bail!("offset_of on enum variant");
+        }
+        self.field_at(current, name)
     }
 }

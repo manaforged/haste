@@ -218,9 +218,10 @@ impl Lower<'_, '_> {
 
     /// Writes `value`, the value of the static that this function initializes, into the static's cell, and returns.
     pub fn fill_static(&mut self, value: Option<Value>) -> Result<()> {
-        let ((item, substs), ty) = (self.reached.list[self.index].0, self.typed.ret_ty());
-        if self.open && crate::prep::static_address(self.cx, item).is_none() && self.static_rodata_blob(item, substs, ty)?.is_none() {
-            let place = self.static_place((item, substs), ty)?;
+        let (item, ty) = (self.reached.list[self.index].0.0, self.typed.ret_ty());
+        if self.open && crate::prep::static_address(self.cx, item).is_none() {
+            let (address, _) = self.static_cell(self.index, ty)?;
+            let place = Place { base: Base::Addr(address), offset: 0, repr: repr(self.cx, ty)? };
             if let Some(value) = value {
                 self.write(place, value);
             }
