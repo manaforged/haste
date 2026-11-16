@@ -57,7 +57,7 @@ impl Symbols {
 
     /// The symbol of `name`, adding it when it is new.
     pub fn intern(&self, name: &str) -> Sym {
-        Sym(self.inner.intern(name, |text| Box::leak(text.into())))
+        Sym(self.inner.intern(name, |text, _| Box::leak(text.into())))
     }
 
     /// The text of `sym`.

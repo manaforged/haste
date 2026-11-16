@@ -276,10 +276,10 @@ impl Types {
     }
 
     fn intern_slow(&self, kind: Kind) -> Ty {
-        let flag = self.kind_flags(&kind);
-        let id = self.inner.intern(&kind, Kind::clone);
-        self.flags.set(id as usize, flag);
-        Ty(id)
+        Ty(self.inner.intern(&kind, |kind, id| {
+            self.flags.set(id as usize, self.kind_flags(kind));
+            kind.clone()
+        }))
     }
 
     /// The shape of `ty`.

@@ -100,7 +100,8 @@ impl<K, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Default for 
 }
 
 impl<K: Eq + Hash + Clone, const SHARDS: usize, const SLAB: usize, const SLABS: usize> Interner<K, SHARDS, SLAB, SLABS> {
-    pub(crate) fn intern<Q>(&self, key: &Q, make: impl FnOnce(&Q) -> K) -> u32
+    /// The id of `key`, calling `make` with the new id under the shard's write lock, before the id is visible, when `key` is new.
+    pub(crate) fn intern<Q>(&self, key: &Q, make: impl FnOnce(&Q, u32) -> K) -> u32
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -114,7 +115,7 @@ impl<K: Eq + Hash + Clone, const SHARDS: usize, const SLAB: usize, const SLABS: 
             return id;
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let owned = make(key);
+        let owned = make(key, id);
         self.slabs.set(id as usize, owned.clone());
         write.insert(owned, id);
         id
