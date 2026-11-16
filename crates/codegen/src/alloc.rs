@@ -24,6 +24,8 @@ pub(crate) struct Regs<R: 'static> {
     pub two_address: bool,
     pub park: bool,
     pub fold_sib: bool,
+    /// The backend zero-extends 8- and 16-bit call results at the call.
+    pub call_zext: bool,
     /// The instructions that store a constant into a frame home.
     pub imm_store: fn(i64) -> u64,
 }
@@ -616,7 +618,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     consts(func, regs.absolute_calls, &mut locations);
     statics(func, &mut locations);
     let census = census(func);
-    let zero_ext = hints::zero_ext(func, &locations, &census);
+    let zero_ext = hints::zero_ext(func, &locations, &census, regs.call_zext);
     let (sib, mut elided) = if regs.fold_sib { sib_addrs(func, &locations, &census, &zero_ext, regs.two_address) } else { (vec![None; count], vec![false; count]) };
     let through = if regs.absolute_calls { through(func, &locations, &census, &mut elided) } else { vec![None; count] };
     let cfg = weighed.then(|| func.cfg());

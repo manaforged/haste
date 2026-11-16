@@ -129,7 +129,7 @@ pub(super) fn reusable<R: 'static>(func: &Function, regs: &Regs<R>, locations: &
 }
 
 /// Computes which small integer values already have zero-extended upper bits in 64-bit registers.
-pub(super) fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &Uses) -> Vec<bool> {
+pub(super) fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &Uses, call_zext: bool) -> Vec<bool> {
     let count = func.types.len();
     let (mut out, mut incoming) = (vec![false; count], vec![Some(Vec::new()); count]);
     if let Some(entry) = func.entry {
@@ -150,7 +150,8 @@ pub(super) fn zero_ext<R>(func: &Function, locations: &[Location<R>], census: &U
     }
     for (v, ty) in func.types.iter().enumerate() {
         let single_def = census.def_inst[v].is_some_and(|d| func.insts[d.index()].result == Some(Value(v as u32)));
-        out[v] = ty.is_small_int() && (single_def || incoming[v].as_ref().is_some_and(|l| !l.is_empty()));
+        let narrow_call = call_zext && matches!(ty, Type::I8 | Type::I16) && census.def_inst[v].is_some_and(|d| matches!(func.insts[d.index()].op, Op::Call { .. }));
+        out[v] = ty.is_small_int() && (single_def || narrow_call || incoming[v].as_ref().is_some_and(|l| !l.is_empty()));
     }
     let const_val = |v: Value| match locations[v.index()] {
         Location::Imm(imm) => Some(imm),

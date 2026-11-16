@@ -40,6 +40,7 @@ const REGS: Regs<Reg> = Regs {
     two_address: true,
     park: true,
     fold_sib: true,
+    call_zext: false,
     imm_store,
 };
 

@@ -60,6 +60,7 @@ const REGS: Regs<Reg> = Regs {
     two_address: false,
     park: true,
     fold_sib: true,
+    call_zext: true,
     imm_store,
 };
 
@@ -579,7 +580,15 @@ impl Emit<'_> {
     fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
         let mut float_pairs = Vec::new();
         let mut int_pairs = Vec::new();
+        let mut narrow = Vec::new();
         for (&value, &loc) in values.iter().zip(locs) {
+            let bytes = self.ty(value).bytes();
+            if let Loc::Int(src) = loc && bytes < 8 && self.plan.zero_ext[value.index()] {
+                match self.plan.location(value) {
+                    Location::Reg(dst) if dst != src => narrow.push((dst, bytes)),
+                    _ => self.asm.extend(false, bytes, src, src),
+                }
+            }
             match (loc, self.plan.location(value)) {
                 (Loc::Float(src), Location::Float(dst)) => float_pairs.push((src, dst)),
                 (Loc::Int(src), Location::Reg(dst)) => int_pairs.push((src, dst)),
@@ -606,10 +615,11 @@ impl Emit<'_> {
                 ArgStep::Load(..) => {}
             }
         }
+        let width = |dst: Reg| narrow.iter().find(|&&(reg, _)| reg == dst).map_or(8, |&(_, bytes)| bytes);
         for step in reg_steps(int_pairs) {
             match step {
                 ArgStep::Move(src, dst) => {
-                    self.asm.mov(dst, src);
+                    self.asm.extend(false, width(dst), dst, src);
                     self.clobber_reg(dst);
                 }
                 ArgStep::Save(src) => {
@@ -617,7 +627,7 @@ impl Emit<'_> {
                     self.clobber_reg(A);
                 }
                 ArgStep::Restore(dst) => {
-                    self.asm.mov(dst, A);
+                    self.asm.extend(false, width(dst), dst, A);
                     self.clobber_reg(dst);
                 }
                 ArgStep::Load(..) => {}
