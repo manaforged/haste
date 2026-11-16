@@ -138,6 +138,10 @@ fn binary(func: &Function, ranges: &Ranges, op: Binary, (x, y): (Value, Value), 
     let full = || Fact::full(ty);
     match op {
         Binary::Band => Fact::range(0, of(x).hi.min(of(y).hi)),
+        Binary::Bor => {
+            let (a, b) = (of(x), of(y));
+            added(ty, &a, &b).map_or_else(full, |sum| Fact::range(a.lo.max(b.lo), sum.hi))
+        }
         Binary::Ushr => shift_count(ty, &of(y)).map_or_else(full, |shift| {
             let inner = of(x);
             Fact::range(inner.lo >> shift, inner.hi >> shift)
@@ -174,7 +178,10 @@ fn binary(func: &Function, ranges: &Ranges, op: Binary, (x, y): (Value, Value), 
                 return Fact::range(lo, hi);
             }
             let (a, b) = (of(x), of(y));
-            if a.lo >= b.hi { Fact::range(a.lo - b.hi, a.hi - b.lo) } else { full() }
+            if a.lo >= b.hi {
+                return Fact::range(a.lo - b.hi, a.hi - b.lo);
+            }
+            b.exact().and_then(|k| added(ty, &a, &Fact::constant(ty, k.wrapping_neg() as i64))).unwrap_or_else(full)
         }
         _ => full(),
     }
