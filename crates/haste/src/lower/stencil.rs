@@ -151,7 +151,7 @@ const MAX_INLINE_HEIGHT: u8 = 10;
 pub(super) type InlineMeta = (ItemRef, FootprintId, bool, u8, u16);
 
 #[derive(Clone, Copy)]
-enum Tally {
+pub(super) enum Tally {
     Hit,
     Miss,
     Built,
@@ -172,7 +172,7 @@ fn tally(kind: Tally) {
     TALLIES[kind as usize].fetch_add(1, Ordering::Relaxed);
 }
 
-fn simplify_tallied(func: &mut Function, kind: Tally) {
+pub(super) fn simplify_tallied(func: &mut Function, kind: Tally) {
     tally(kind);
     haste_codegen::simplify(func, crate::profile().into());
 }
@@ -182,6 +182,7 @@ fn simplify_tallied(func: &mut Function, kind: Tally) {
 pub struct Bodies {
     pub(super) plans: Table<(ItemRef, Option<ExprId>), Arc<BodyFootprintPlan>>,
     inlined: Table<usize, Option<Arc<InlinedCallee>>>,
+    pub(super) partial: Table<(usize, bool), Option<Arc<InlinedCallee>>>,
     inline_meta: Table<usize, Option<InlineMeta>>,
     templates: Table<TemplateKey, Option<Arc<InlineTemplate>>>,
     cyclic: RwLock<FxHashMap<usize, cycles::CycleState>>,
@@ -203,6 +204,7 @@ impl Bodies {
         self.transient_entries.store(0, Ordering::Relaxed);
         self.evict_cursor.store(0, Ordering::Relaxed);
         self.inlined.clear();
+        self.partial.clear();
         self.inline_meta.clear();
         self.templates.clear();
     }
@@ -227,6 +229,7 @@ impl Bodies {
         for offset in 0..TRIM_SHARDS {
             let shard = (start + offset) % crate::sema::table::SHARDS;
             removed += self.inlined.clear_shard(shard);
+            removed += self.partial.clear_shard(shard);
             removed += self.inline_meta.clear_shard(shard);
         }
         self.plans.clear_shard((start / TRIM_SHARDS) % crate::sema::table::SHARDS);
@@ -241,7 +244,7 @@ impl Bodies {
         }
     }
 
-    fn bump_transient(&self) {
+    pub(super) fn bump_transient(&self) {
         self.transient_entries.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -392,13 +395,18 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
     Ok((record_meta_height(inline, meta), cycle))
 }
 
+fn finish_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, (index, callee, cycle): (usize, Option<Arc<InlinedCallee>>, usize)) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
+    let callee = super::budget::maybe_partial(cx, (reached, slots), inline, (index, callee))?;
+    Ok((record_callee_height(inline, callee), cycle))
+}
+
 pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, compact): (usize, bool)) -> Result<(Option<Arc<InlinedCallee>>, usize)> {
     let bodies = slots.bodies();
     let Some((limit, standard, neg_valid)) = limit_flags(cx, reached, (bodies, &*inline), index, limit) else {
         return Ok((None, usize::MAX));
     };
     if !compact && let Some((callee, _, cycle)) = cached_inline(bodies, inline, index, (neg_valid, false)) {
-        return Ok((record_callee_height(inline, callee), cycle));
+        return finish_inline(cx, (reached, slots), inline, (index, callee, cycle));
     }
     let item = reached.list[index].0.0;
     let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, false, compact))?;
@@ -415,28 +423,28 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
         if cycle > depth && quiet.holds(cx, slots) {
             bodies.bump_transient();
             let stored = bodies.inlined.get_or_insert_with(index, || result);
-            return Ok((record_callee_height(inline, stored), cycle));
+            return finish_inline(cx, (reached, slots), inline, (index, stored, cycle));
         }
         inline.local.insert(index, (result.clone(), if cycle < depth { cycle } else { usize::MAX }));
     }
-    Ok((record_callee_height(inline, result), cycle))
+    finish_inline(cx, (reached, slots), inline, (index, result, cycle))
 }
 
-struct Quiet {
+pub(super) struct Quiet {
     wanted: usize,
     sema: (usize, usize),
 }
 
 impl Quiet {
-    fn mark(cx: &Context<'_>, slots: &dyn Slots) -> Self {
+    pub(super) fn mark(cx: &Context<'_>, slots: &dyn Slots) -> Self {
         Self { wanted: slots.wanted_len(), sema: cx.quiet_mark() }
     }
 
-    fn holds(&self, cx: &Context<'_>, slots: &dyn Slots) -> bool {
+    pub(super) fn holds(&self, cx: &Context<'_>, slots: &dyn Slots) -> bool {
         slots.wanted_len() == self.wanted && cx.quiet_mark() == self.sema
     }
 
-    fn lowered<T>(&self, slots: &dyn Slots, result: Result<T>) -> Result<Option<T>> {
+    pub(super) fn lowered<T>(&self, slots: &dyn Slots, result: Result<T>) -> Result<Option<T>> {
         match result {
             Ok(out) => Ok(Some(out)),
             Err(err) if slots.wanted_len() > self.wanted => Err(err),
@@ -760,7 +768,7 @@ impl Lower<'_, '_> {
         self.emit_reloc(src, step, false, false)
     }
 
-    fn emit_reloc(&mut self, src: SymbolSource, step: RelocStep, self_call: bool, low_slot: bool) -> Value {
+    pub(super) fn emit_reloc(&mut self, src: SymbolSource, step: RelocStep, self_call: bool, low_slot: bool) -> Value {
         let idx = self.push_reloc(src, step);
         if self_call {
             self.b.func.add_self_slot(idx);
