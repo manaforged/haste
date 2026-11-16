@@ -364,7 +364,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn pos(&self) -> u32 { self.asm.pos() }
 
-    fn finish(mut self) -> Result<Code, String> {
+    fn finish(mut self, _starts: &mut [u32]) -> Result<Code, String> {
         self.asm.maybe_island()?;
         if let Some(label) = self.trap_label.take() {
             self.asm.bind(label);

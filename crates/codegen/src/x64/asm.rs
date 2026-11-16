@@ -1,3 +1,7 @@
+mod relax;
+
+use relax::{Disp, Fixup};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub(crate) enum Reg {
@@ -208,7 +212,7 @@ pub(crate) struct Asm {
     pub code: Vec<u8>,
     pub avx: bool,
     labels: Vec<Option<u32>>,
-    pub(super) fixups: Vec<(u32, Label)>,
+    pub(super) fixups: Vec<Fixup>,
     pub(super) table_fixups: Vec<(u32, Label, Label)>,
     pub(super) tail: Option<super::imm::Tail>,
 }
@@ -717,19 +721,19 @@ impl Asm {
         self.labels[label.0 as usize] = Some(self.pos());
     }
 
-    fn fixup(&mut self, label: Label) {
-        self.fixups.push((self.pos(), label));
+    fn fixup(&mut self, label: Label, disp: Disp) {
+        self.fixups.push(Fixup { at: self.pos(), label, disp });
         self.code.extend([0; 4]);
     }
 
     pub fn jmp(&mut self, label: Label) {
         self.code.push(0xE9);
-        self.fixup(label);
+        self.fixup(label, Disp::Jmp);
     }
 
     pub fn jcc(&mut self, cond: Cond, label: Label) {
         self.code.extend([0x0F, 0x80 + cond as u8]);
-        self.fixup(label);
+        self.fixup(label, Disp::Jcc);
     }
 
     fn lea_rip_head(&mut self, dst: Reg) -> u32 {
@@ -741,7 +745,7 @@ impl Asm {
 
     pub fn lea_rip(&mut self, dst: Reg, label: Label) {
         self.lea_rip_head(dst);
-        self.fixup(label);
+        self.fixup(label, Disp::Rip);
     }
 
     pub fn lea_rip_reloc(&mut self, dst: Reg) -> u32 {
@@ -753,22 +757,5 @@ impl Asm {
     pub fn table_entry(&mut self, base: Label, target: Label) {
         self.table_fixups.push((self.pos(), base, target));
         self.code.extend([0; 4]);
-    }
-
-    pub fn finish(mut self) -> Result<Vec<u8>, String> {
-        for (at, label) in std::mem::take(&mut self.fixups) {
-            let target = self.labels[label.0 as usize].ok_or("a jump to a label that was never placed")?;
-            let relative = target as i64 - (at as i64 + 4);
-            let at = at as usize;
-            self.code[at..at + 4].copy_from_slice(&(relative as i32).to_le_bytes());
-        }
-        for (at, base, target) in std::mem::take(&mut self.table_fixups) {
-            let base = self.labels[base.0 as usize].ok_or("a jump table without a base label")?;
-            let target = self.labels[target.0 as usize].ok_or("a jump to a label that was never placed")?;
-            let relative = target as i64 - base as i64;
-            let at = at as usize;
-            self.code[at..at + 4].copy_from_slice(&(relative as i32).to_le_bytes());
-        }
-        Ok(self.code)
     }
 }

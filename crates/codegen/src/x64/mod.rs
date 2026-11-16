@@ -329,12 +329,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn pos(&self) -> u32 { self.asm.pos() }
 
-    fn finish(mut self) -> Result<Code, String> {
+    fn finish(mut self, starts: &mut [u32]) -> Result<Code, String> {
         if let Some(label) = self.trap_label {
             self.asm.bind(label);
             self.ud2();
         }
         emit_stubs(&mut self)?;
+        self.asm.relax().apply(starts, &mut self.sites, &mut self.relocs);
         Ok(Code { bytes: self.asm.finish()?, sites: self.sites, relocs: self.relocs, loops: Vec::new() })
     }
 }

@@ -546,7 +546,8 @@ pub(crate) trait Emitter<'a>: Sized {
     fn inst(&mut self, inst: Inst) -> Result<(), String>;
     fn trap(&mut self);
     fn pos(&self) -> u32;
-    fn finish(self) -> Result<crate::Code, String>;
+    /// Finishes the code and moves `starts`, offsets taken while emitting, to where they land in it.
+    fn finish(self, starts: &mut [u32]) -> Result<crate::Code, String>;
 
     fn bind_entry(&mut self, block: Block) {
         self.bind_block(block);
@@ -613,7 +614,7 @@ pub(crate) fn drive<'a, E: Emitter<'a>>(mut emit: E, order: &[Block]) -> Result<
         emit_body(&mut emit, block)?;
     }
     starts.push(emit.pos());
-    let mut code = emit.finish()?;
+    let mut code = emit.finish(&mut starts)?;
     code.loops = crate::emit::loop_spans(func, order, &starts);
     Ok(code)
 }
