@@ -1,20 +1,22 @@
-use std::sync::{Arc, RwLock};
-
-use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use crate::names::ItemRef;
-use crate::sync::{read_lock, shard_index, write_lock};
+use crate::sync::Interner;
 
 use super::table::SHARDS;
 use super::ty::Ty;
 
-fn pack_handle(shard: usize, index: usize) -> u32 {
-    (((index as u32) << 5) | (shard as u32)) + 1
+const SUBSTS_SLAB: usize = 65_536;
+const SUBSTS_SLABS: usize = 256;
+const PROJ_SLAB: usize = 4_096;
+const PROJ_SLABS: usize = 4_096;
+
+fn handle(id: u32) -> u32 {
+    id + 1
 }
 
-fn unpack_handle(raw: u32) -> Option<(usize, usize)> {
-    let raw = raw.checked_sub(1)?;
-    Some(((raw as usize) & (SHARDS - 1), (raw >> 5) as usize))
+fn slot(handle: u32) -> Option<u32> {
+    handle.checked_sub(1)
 }
 
 /// An interned slice of type arguments.
@@ -31,37 +33,10 @@ impl Substs {
     }
 }
 
-#[derive(Default)]
-struct Shard {
-    map: FxHashMap<&'static [Ty], Substs>,
-    entries: Vec<*const [Ty]>,
-}
-
-// SAFETY: `Ty` is `Copy + Send + Sync`, and every pointer in `entries` owns an immutable heap slice freed only in `Shard::drop`.
-unsafe impl Send for Shard {}
-// SAFETY: `Shard` shares slice pointers only behind `&[Ty]` after `RwLock` synchronization.
-unsafe impl Sync for Shard {}
-
-impl Drop for Shard {
-    fn drop(&mut self) {
-        self.map.clear();
-        for ptr in self.entries.drain(..) {
-            // SAFETY: Each pointer in `entries` was created once by `Box::into_raw` in `SubstsPool::intern` and is dropped once here.
-            unsafe { drop(Box::from_raw(ptr as *mut [Ty])) };
-        }
-    }
-}
-
-/// A sharded thread-safe interner of `[Ty]` slices.
-#[derive(Clone)]
+/// A sharded thread-safe interner of `[Ty]` slices with lock-free reads.
+#[derive(Clone, Default)]
 pub struct SubstsPool {
-    shards: Arc<[RwLock<Shard>; SHARDS]>,
-}
-
-impl Default for SubstsPool {
-    fn default() -> Self {
-        Self { shards: Arc::new(std::array::from_fn(|_| RwLock::new(Shard::default()))) }
-    }
+    inner: Arc<Interner<Arc<[Ty]>, SHARDS, SUBSTS_SLAB, SUBSTS_SLABS>>,
 }
 
 impl SubstsPool {
@@ -70,34 +45,13 @@ impl SubstsPool {
         if slice.is_empty() {
             return Substs::EMPTY;
         }
-        let shard_idx = shard_index::<_, SHARDS>(slice);
-        let lock = &self.shards[shard_idx];
-        let guard = read_lock(lock);
-        if let Some(&id) = guard.map.get(slice) {
-            return id;
-        }
-        drop(guard);
-        let mut guard = write_lock(lock);
-        if let Some(&id) = guard.map.get(slice) {
-            return id;
-        }
-        let id = Substs(pack_handle(shard_idx, guard.entries.len()));
-        let boxed: Box<[Ty]> = slice.into();
-        let raw: *const [Ty] = Box::into_raw(boxed);
-        // SAFETY: `raw` points to a heap allocation that stays immutable and alive until `Shard::drop`.
-        let key: &'static [Ty] = unsafe { &*raw };
-        guard.entries.push(raw);
-        guard.map.insert(key, id);
-        id
+        Substs(handle(self.inner.intern(slice, |slice, _| Arc::from(slice))))
     }
 
     /// The slice of type arguments that `id` names.
     pub fn get(&self, id: Substs) -> &[Ty] {
-        let Some((shard_idx, index)) = unpack_handle(id.0) else { return &[] };
-        let guard = read_lock(&self.shards[shard_idx]);
-        let Some(&ptr) = guard.entries.get(index) else { return &[] };
-        // SAFETY: `ptr` belongs to `self.shards`, whose `Arc` outlives `&self`, and its `[Ty]` elements never mutate.
-        unsafe { &*ptr }
+        let Some(slot) = slot(id.0) else { return &[] };
+        self.inner.get(slot)
     }
 
     /// Maps `f` across `id`, reusing `id` without allocating when every element is unchanged.
@@ -134,49 +88,21 @@ pub struct ProjDef {
     pub own: Substs,
 }
 
-#[derive(Default)]
-struct ProjShard {
-    map: FxHashMap<ProjDef, ProjId>,
-    entries: Vec<ProjDef>,
-}
-
-/// A sharded thread-safe interner of associated type projections.
-#[derive(Clone)]
+/// A sharded thread-safe interner of associated type projections with lock-free reads.
+#[derive(Clone, Default)]
 pub struct ProjPool {
-    shards: Arc<[RwLock<ProjShard>; SHARDS]>,
-}
-
-impl Default for ProjPool {
-    fn default() -> Self {
-        Self { shards: Arc::new(std::array::from_fn(|_| RwLock::new(ProjShard::default()))) }
-    }
+    inner: Arc<Interner<ProjDef, SHARDS, PROJ_SLAB, PROJ_SLABS>>,
 }
 
 impl ProjPool {
     /// Interns `def` and returns its handle.
     pub fn intern(&self, def: ProjDef) -> ProjId {
-        let shard_idx = shard_index::<_, SHARDS>(&def);
-        let lock = &self.shards[shard_idx];
-        let guard = read_lock(lock);
-        if let Some(&id) = guard.map.get(&def) {
-            return id;
-        }
-        drop(guard);
-        let mut guard = write_lock(lock);
-        if let Some(&id) = guard.map.get(&def) {
-            return id;
-        }
-        let id = ProjId(pack_handle(shard_idx, guard.entries.len()));
-        guard.entries.push(def);
-        guard.map.insert(def, id);
-        id
+        ProjId(handle(self.inner.intern(&def, |def, _| *def)))
     }
 
     /// The projection definition that `id` names.
     pub fn get(&self, id: ProjId) -> ProjDef {
-        let (shard_idx, index) = unpack_handle(id.0).unwrap_or((0, 0));
-        let guard = read_lock(&self.shards[shard_idx]);
-        guard.entries[index]
+        *self.inner.get(slot(id.0).expect("interned projection"))
     }
 }
 
